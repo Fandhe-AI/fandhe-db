@@ -70,8 +70,12 @@ pub(crate) const MAX_VISIBLE_ROWS: usize = 100_000;
 /// （codex-review 指摘・PR #153）。総走査行数にも明示的な上限を設け、超過時は
 /// 部分結果を返さず [`TenantError::TooManyRowsScanned`] で fail-closed に拒否する。
 ///
+/// 本定数は**ハード上限 兼 既定値**。実効値は `EngineCore::scan_limits`
+/// （[`crate::scan_limits::ScanLimits`]。起動時 CLI `--max-scanned-rows`、Issue #1549）
+/// で、ハード上限以下へ下げる方向にのみ設定できる。
+///
 /// `pub(crate)`: `sql::parser::MAX_PARTITIONED_SCAN_BUDGET_ROWS`（分割実行 DML の
-/// 総走査予算）が同じ定数を参照する。`MAX_DML_ROW_LIMIT` は Issue #1517 で
+/// 総走査予算）と `scan_limits` のハード上限が同じ定数を参照する。`MAX_DML_ROW_LIMIT` は Issue #1517 で
 /// 独立定数になったため参照しない。
 pub(crate) const MAX_SCANNED_ROWS: usize = 1_000_000;
 
@@ -177,6 +181,19 @@ pub fn visible_rows(
     table: &str,
     ctx: &PolicyContext,
 ) -> Result<Vec<Row>, TenantError> {
+    visible_rows_with_scan_limit(storage, table, ctx, MAX_SCANNED_ROWS)
+}
+
+/// [`visible_rows`] の総走査行数上限を呼び出し元が指定する版（Issue #1549）。
+/// `core.rs` の辞書スナップショット構築が `EngineCore::scan_limits`（起動時 CLI
+/// `--max-scanned-rows`）を渡す。`max_scanned_rows` は `scan_limits` の検証済み値
+/// （ハード上限 [`MAX_SCANNED_ROWS`] 以下）を想定し、それ以外の挙動は [`visible_rows`] と同一。
+pub fn visible_rows_with_scan_limit(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    max_scanned_rows: usize,
+) -> Result<Vec<Row>, TenantError> {
     let mut out = Vec::new();
     // カーソルは行ストアの物理キーと同じ `(tenant_id, id)` 形（TABLE-12）。`id` 単独では
     // 再開位置を表現できず、テナントをまたぐ走査で行を取りこぼす。
@@ -189,9 +206,9 @@ pub fn visible_rows(
             break;
         }
         scanned = scanned.saturating_add(page.len());
-        if scanned > MAX_SCANNED_ROWS {
+        if scanned > max_scanned_rows {
             return Err(TenantError::TooManyRowsScanned {
-                max: MAX_SCANNED_ROWS,
+                max: max_scanned_rows,
             });
         }
         for row in page {
@@ -351,7 +368,8 @@ pub enum TenantWriteError {
     /// 判断。この上限は他テナントのデータ量に一切依存しない。`write_txn` は
     /// commit せず破棄する（行・台帳とも痕跡ゼロ）ため `54000`
     /// （`PayloadTooLarge`）へ写像する。
-    TooManyRowsScanned,
+    /// `max` は超過時点の実効上限（`--max-scanned-rows` の設定値。Issue #1549）。
+    TooManyRowsScanned { max: usize },
     /// `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。いずれも TABLE-16・
     /// TASK-204）を宣言したテーブルへの書き込みがテナント内一意性制約に違反した
     /// （`constraint::enforce_unique_keys_in_txn`）。
@@ -530,7 +548,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::ReturningProjectionFailed(_) => ErrorClass::InternalError,
             TenantWriteError::ReturningProjectionTooLarge(_) => ErrorClass::PayloadTooLarge,
             TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
-            TenantWriteError::TooManyRowsScanned => ErrorClass::PayloadTooLarge,
+            TenantWriteError::TooManyRowsScanned { .. } => ErrorClass::PayloadTooLarge,
             TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
             TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
             // 内側の `SqlSurfaceError`（`sql::allowlist`）が既に
@@ -590,8 +608,8 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::CapturedRowDecodeFailed(_) => {
                 write!(f, "tenant write captured row decode failed")
             }
-            TenantWriteError::TooManyRowsScanned => {
-                write!(f, "too many rows scanned: limit={MAX_SCANNED_ROWS}")
+            TenantWriteError::TooManyRowsScanned { max } => {
+                write!(f, "too many rows scanned: limit={max}")
             }
             TenantWriteError::UniqueViolation => write!(f, "unique constraint violation"),
             // 制約名のみを含む固定文言（行の値・id・テナントは含めない。
@@ -651,7 +669,7 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::CapturedRowDecodeFailed(_) => {
                 f.write_str("CapturedRowDecodeFailed(<redacted>)")
             }
-            TenantWriteError::TooManyRowsScanned => f.write_str("TooManyRowsScanned"),
+            TenantWriteError::TooManyRowsScanned { .. } => f.write_str("TooManyRowsScanned"),
             TenantWriteError::UniqueViolation => f.write_str("UniqueViolation"),
             TenantWriteError::CheckViolation { .. } => f.write_str("CheckViolation(<redacted>)"),
             TenantWriteError::CheckEvaluationFailed(_) => {
@@ -3810,6 +3828,7 @@ fn enumerate_dml_candidates<E>(
     ctx: &PolicyContext,
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
     predicate: &mut impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<Vec<u64>, PredicateDmlError<E>> {
     let mut candidate_ids: Vec<u64> = Vec::new();
@@ -3844,12 +3863,14 @@ fn enumerate_dml_candidates<E>(
         }
 
         scanned = scanned.saturating_add(1);
-        if scanned > MAX_SCANNED_ROWS {
+        if scanned > max_scanned_rows {
             // 部分結果を返さず fail-closed に拒否する（`visible_rows` と同じ判断）。
             // 呼び出し元（`delete_rows_where_unchecked`／`update_rows_where_unchecked`）
             // は `write_txn` を commit せず破棄するため、行・台帳のいずれにも
             // 痕跡が残らない。
-            return Err(dml_write_err(TenantWriteError::TooManyRowsScanned));
+            return Err(dml_write_err(TenantWriteError::TooManyRowsScanned {
+                max: max_scanned_rows,
+            }));
         }
         let buf = v.value();
 
@@ -3929,6 +3950,7 @@ pub(crate) fn delete_rows_where_unchecked<E>(
     expected_schema: Option<&crate::catalog::TableSchema>,
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     delete_rows_where_impl(
@@ -3940,6 +3962,7 @@ pub(crate) fn delete_rows_where_unchecked<E>(
         expected_schema,
         needs_embedding,
         limit,
+        max_scanned_rows,
         predicate,
         None,
     )
@@ -3964,6 +3987,7 @@ pub(crate) fn delete_rows_where_capturing_unchecked<E>(
     expected_schema: Option<&crate::catalog::TableSchema>,
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     project: &mut ReturningProjectFn<'_>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
@@ -3976,6 +4000,7 @@ pub(crate) fn delete_rows_where_capturing_unchecked<E>(
         expected_schema,
         needs_embedding,
         limit,
+        max_scanned_rows,
         predicate,
         Some(project),
     )
@@ -3993,6 +4018,7 @@ fn delete_rows_where_impl<E>(
     expected_schema: Option<&crate::catalog::TableSchema>,
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
@@ -4021,8 +4047,14 @@ fn delete_rows_where_impl<E>(
             let row_table = write_txn
                 .open_table(user_rows_table_def(&row_table_name))
                 .map_err(|e| dml_write_err(map_row_table_error(e)))?;
-            let candidate_ids =
-                enumerate_dml_candidates(&row_table, ctx, needs_embedding, limit, &mut predicate)?;
+            let candidate_ids = enumerate_dml_candidates(
+                &row_table,
+                ctx,
+                needs_embedding,
+                limit,
+                max_scanned_rows,
+                &mut predicate,
+            )?;
             (candidate_ids, schema)
         };
 
@@ -4094,6 +4126,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
     assignments: &[(usize, crate::row_codec::Value)],
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     update_rows_where_impl(
@@ -4107,6 +4140,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
         assignments,
         needs_embedding,
         limit,
+        max_scanned_rows,
         predicate,
         None,
     )
@@ -4129,6 +4163,7 @@ pub(crate) fn update_rows_where_capturing_unchecked<E>(
     assignments: &[(usize, crate::row_codec::Value)],
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     project: &mut ReturningProjectFn<'_>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
@@ -4143,6 +4178,7 @@ pub(crate) fn update_rows_where_capturing_unchecked<E>(
         assignments,
         needs_embedding,
         limit,
+        max_scanned_rows,
         predicate,
         Some(project),
     )
@@ -4162,6 +4198,7 @@ fn update_rows_where_impl<E>(
     assignments: &[(usize, crate::row_codec::Value)],
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
@@ -4201,8 +4238,14 @@ fn update_rows_where_impl<E>(
             let row_table = write_txn
                 .open_table(user_rows_table_def(&row_table_name))
                 .map_err(|e| dml_write_err(map_row_table_error(e)))?;
-            let candidate_ids =
-                enumerate_dml_candidates(&row_table, ctx, needs_embedding, limit, &mut predicate)?;
+            let candidate_ids = enumerate_dml_candidates(
+                &row_table,
+                ctx,
+                needs_embedding,
+                limit,
+                max_scanned_rows,
+                &mut predicate,
+            )?;
             (candidate_ids, schema)
         };
 
@@ -4614,6 +4657,8 @@ pub(crate) struct ReplaceByTextKey<'a> {
     /// 台帳への記録指示（TASK-93・RECOVER-2）。行の削除・挿入と同一 write
     /// トランザクション内で適用される。
     pub ledger_write: LedgerWrite<'a>,
+    /// 置換前走査の総走査行数上限（`EngineCore::scan_limits`。Issue #1549）。
+    pub max_scanned_rows: usize,
 }
 
 pub(crate) fn replace_typed_rows_by_text_key(
@@ -4631,6 +4676,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
         content_hash_body,
         content_hash_template_values,
         ledger_write,
+        max_scanned_rows,
     } = req;
     validate_identifier(table)?;
     target.with_txn(|write_txn| {
@@ -4714,9 +4760,9 @@ pub(crate) fn replace_typed_rows_by_text_key(
                     let (_key_tenant, id) = k.value();
                     let raw = v.value();
                     scanned_count = scanned_count.saturating_add(1);
-                    if scanned_count > MAX_SCANNED_ROWS {
+                    if scanned_count > max_scanned_rows {
                         return Err(TenantWriteError::Storage(StorageError::Codec(format!(
-                            "too many rows scanned for replace: max {MAX_SCANNED_ROWS}"
+                            "too many rows scanned for replace: max {max_scanned_rows}"
                         ))));
                     }
                     // embedding は比較に不要なため、metadata（スカラー列ペイロード）のみを
@@ -5084,6 +5130,14 @@ mod tests {
             "tenant-a ctx must see its own row and the other tenant's Public row, \
              but not the other tenant's Private row"
         );
+
+        // Issue #1549: 走査行数上限を呼び出し元が指定できる。総走査 3 行（全テナント）に
+        // 対し、上限ちょうど（3）は成功し、下回る（2）は設定値入りで拒否される。
+        assert!(visible_rows_with_scan_limit(&storage, "docs", &ctx, 3).is_ok());
+        match visible_rows_with_scan_limit(&storage, "docs", &ctx, 2) {
+            Err(TenantError::TooManyRowsScanned { max }) => assert_eq!(max, 2),
+            other => panic!("expected TooManyRowsScanned, got {other:?}"),
+        }
     }
 
     // 対象ビヘイビア: TABLE-11。`verify_hits` は可視集合外の id を fail-closed に拒否する。
@@ -5227,6 +5281,7 @@ mod tests {
             WriteTarget::Autocommit(&storage),
             &ctx,
             ReplaceByTextKey {
+                max_scanned_rows: MAX_SCANNED_ROWS,
                 table: "docs",
                 key_column: "path",
                 key_value: "other.txt",
@@ -5245,6 +5300,7 @@ mod tests {
             WriteTarget::Autocommit(&storage),
             &ctx,
             ReplaceByTextKey {
+                max_scanned_rows: MAX_SCANNED_ROWS,
                 table: "docs",
                 key_column: "path",
                 key_value: "note.txt",
@@ -5266,6 +5322,7 @@ mod tests {
             WriteTarget::Autocommit(&storage),
             &ctx,
             ReplaceByTextKey {
+                max_scanned_rows: MAX_SCANNED_ROWS,
                 table: "docs",
                 key_column: "path",
                 key_value: "note.txt",
@@ -5328,6 +5385,7 @@ mod tests {
             WriteTarget::Autocommit(&storage),
             &ctx_b,
             ReplaceByTextKey {
+                max_scanned_rows: MAX_SCANNED_ROWS,
                 table: "docs",
                 key_column: "path",
                 key_value: "shared.txt",
@@ -5346,6 +5404,7 @@ mod tests {
             WriteTarget::Autocommit(&storage),
             &ctx_a,
             ReplaceByTextKey {
+                max_scanned_rows: MAX_SCANNED_ROWS,
                 table: "docs",
                 key_column: "path",
                 key_value: "shared.txt",
@@ -5383,6 +5442,7 @@ mod tests {
             WriteTarget::Autocommit(&storage),
             &ctx,
             ReplaceByTextKey {
+                max_scanned_rows: MAX_SCANNED_ROWS,
                 table: "docs",
                 key_column: "path",
                 key_value: "absent.txt",
@@ -5420,6 +5480,7 @@ mod tests {
             WriteTarget::Autocommit(&storage),
             &ctx,
             ReplaceByTextKey {
+                max_scanned_rows: MAX_SCANNED_ROWS,
                 table: "docs",
                 key_column: "path",
                 key_value: "a.txt",
@@ -5715,6 +5776,7 @@ mod tests {
             WriteTarget::Autocommit(&storage),
             &a,
             ReplaceByTextKey {
+                max_scanned_rows: MAX_SCANNED_ROWS,
                 table: "docs",
                 key_column: "path",
                 key_value: "nonexistent-key",
@@ -5750,6 +5812,7 @@ mod tests {
             WriteTarget::Autocommit(&storage),
             &a,
             ReplaceByTextKey {
+                max_scanned_rows: MAX_SCANNED_ROWS,
                 table: file_table,
                 key_column: "path",
                 key_value: "note.txt",
@@ -6041,6 +6104,7 @@ mod tests {
             &assignments,
             false,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
+            MAX_SCANNED_ROWS,
             never_matches,
         )
         .expect_err("oversized SET value must be rejected even when zero rows would match");
@@ -6071,6 +6135,7 @@ mod tests {
             &ok_assignments,
             false,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
+            MAX_SCANNED_ROWS,
             never_matches,
         )
         .expect(
@@ -6138,6 +6203,7 @@ mod tests {
             &assignments,
             false,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
+            MAX_SCANNED_ROWS,
             match_all,
         )
         .expect_err("decode failure on stored data must not succeed");
@@ -6246,6 +6312,7 @@ mod tests {
             &assignments,
             false,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
+            MAX_SCANNED_ROWS,
             match_lang_ja,
         )
         .expect("predicate UPDATE on a table without a VECTOR column should succeed");
@@ -6464,6 +6531,7 @@ mod tests {
                 &assignments,
                 assignments.iter().any(|(idx, _)| *idx == 0),
                 Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
+                MAX_SCANNED_ROWS,
                 match_only_target_id,
             )
             .unwrap_or_else(|e| match e {
@@ -6698,6 +6766,7 @@ mod tests {
             &resend_assignments,
             true,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
+            MAX_SCANNED_ROWS,
             match_target,
         )
         .expect_err(
@@ -6750,6 +6819,7 @@ mod tests {
             &mismatched_assignments,
             true,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
+            MAX_SCANNED_ROWS,
             match_target2,
         )
         .expect_err("content-mismatched resend must still be rejected");
@@ -7072,6 +7142,7 @@ mod tests {
             &assignments,
             false,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
+            MAX_SCANNED_ROWS,
             matches_seeded_id,
         )
         .expect_err(
@@ -7416,6 +7487,7 @@ mod tests {
             WriteTarget::Autocommit(&storage),
             &ctx,
             ReplaceByTextKey {
+                max_scanned_rows: MAX_SCANNED_ROWS,
                 table: "typed_docs",
                 key_column: "path",
                 key_value: "c.txt",
@@ -7758,6 +7830,7 @@ mod tests {
             None,
             false,
             None,
+            MAX_SCANNED_ROWS,
             |_c| Ok(true),
             &mut project,
         );
@@ -7784,6 +7857,7 @@ mod tests {
             None,
             false,
             None,
+            MAX_SCANNED_ROWS,
             |_c| Ok(true),
         );
         assert!(
@@ -7818,6 +7892,7 @@ mod tests {
             &assignments,
             false,
             None,
+            MAX_SCANNED_ROWS,
             |_c| Ok(true),
             &mut project,
         );
@@ -7844,6 +7919,7 @@ mod tests {
             &assignments,
             false,
             None,
+            MAX_SCANNED_ROWS,
             |_c| Ok(true),
         );
         assert!(matches!(
@@ -8482,6 +8558,7 @@ mod tests {
                 None,
                 false,
                 Some(std::num::NonZeroUsize::new(100).expect("nonzero")),
+                MAX_SCANNED_ROWS,
                 |_c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(true) },
             );
             assert!(

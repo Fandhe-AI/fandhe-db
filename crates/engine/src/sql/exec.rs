@@ -4002,7 +4002,7 @@ pub(crate) fn map_write_error(
         // 指摘・Issue #871）。`_` 節（`XX000`）へ丸めると、一致件数上限超過
         // （`PredicateDmlOutcome::LimitExceeded` 由来の `54000`）と別コードに
         // なってしまい、クライアントが同種の「上限超過」を判別できなくなる。
-        TenantWriteError::TooManyRowsScanned => {
+        TenantWriteError::TooManyRowsScanned { .. } => {
             SqlSurfaceError::payload_too_large("too many rows scanned")
         }
         // `FOREIGN KEY` の参照アクション（`CASCADE`・`SET NULL`・`SET DEFAULT`。
@@ -4074,6 +4074,7 @@ pub(crate) fn map_write_error(
 /// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
 /// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_predicate_delete`] と
 /// ビット同一の挙動を保つ。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_predicate_delete_in(
     target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
@@ -4082,6 +4083,7 @@ pub(crate) fn execute_predicate_delete_in(
     schema: &TableSchema,
     content_hash_value: &crate::recovery::content_hash::ContentHash,
     max_affected_rows: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
     let rows_affected = execute_predicate_delete_inner(
         target,
@@ -4091,6 +4093,7 @@ pub(crate) fn execute_predicate_delete_in(
         schema,
         content_hash_value,
         max_affected_rows,
+        max_scanned_rows,
         None,
     )?;
     Ok(DeleteOutcome { rows_affected })
@@ -4114,6 +4117,7 @@ pub(crate) fn execute_predicate_delete_returning(
     schema: &TableSchema,
     content_hash_value: &crate::recovery::content_hash::ContentHash,
     max_affected_rows: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
     returning: &[crate::sql::parser::ProjectedColumn],
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     let columns = crate::sql::returning::column_meta(returning, schema)?;
@@ -4128,6 +4132,7 @@ pub(crate) fn execute_predicate_delete_returning(
         schema,
         content_hash_value,
         max_affected_rows,
+        max_scanned_rows,
         Some(&mut project),
     )?;
     drop(project);
@@ -4232,6 +4237,7 @@ fn execute_predicate_delete_inner(
     schema: &TableSchema,
     content_hash_value: &crate::recovery::content_hash::ContentHash,
     max_affected_rows: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
     project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
 ) -> Result<u64, SqlSurfaceError> {
     let ledger_write = ledger_mode
@@ -4257,6 +4263,7 @@ fn execute_predicate_delete_inner(
                 Some(schema),
                 needs_embedding,
                 limit,
+                max_scanned_rows,
                 predicate,
             ),
             Some(project) => crate::tenant::delete_rows_where_capturing_unchecked(
@@ -4268,6 +4275,7 @@ fn execute_predicate_delete_inner(
                 Some(schema),
                 needs_embedding,
                 limit,
+                max_scanned_rows,
                 predicate,
                 project,
             ),
@@ -4325,6 +4333,7 @@ pub(crate) fn execute_predicate_update_in(
     // Issue #997: `EngineCore::dml_limits.max_affected_rows`（起動時 CLI 設定値・
     // 既定 `None`＝上限なし）。[`execute_predicate_delete`] のドキュメント参照。
     max_affected_rows: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let rows_affected = execute_predicate_update_inner(
         target,
@@ -4335,6 +4344,7 @@ pub(crate) fn execute_predicate_update_in(
         content_hash_value,
         legacy_hashes,
         max_affected_rows,
+        max_scanned_rows,
         None,
     )?;
     Ok(UpdateOutcome { rows_affected })
@@ -4353,6 +4363,7 @@ pub(crate) fn execute_predicate_update_returning(
     content_hash_value: &crate::recovery::content_hash::ContentHash,
     legacy_hashes: &[crate::recovery::content_hash::ContentHash],
     max_affected_rows: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
     returning: &[crate::sql::parser::ProjectedColumn],
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     let columns = crate::sql::returning::column_meta(returning, schema)?;
@@ -4368,6 +4379,7 @@ pub(crate) fn execute_predicate_update_returning(
         content_hash_value,
         legacy_hashes,
         max_affected_rows,
+        max_scanned_rows,
         Some(&mut project),
     )?;
     drop(project);
@@ -4390,6 +4402,7 @@ fn execute_predicate_update_inner(
     content_hash_value: &crate::recovery::content_hash::ContentHash,
     legacy_hashes: &[crate::recovery::content_hash::ContentHash],
     max_affected_rows: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
     project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
 ) -> Result<u64, SqlSurfaceError> {
     let ledger_write = ledger_mode
@@ -4417,6 +4430,7 @@ fn execute_predicate_update_inner(
                 bound.assignments(),
                 needs_embedding,
                 limit,
+                max_scanned_rows,
                 predicate,
             ),
             Some(project) => crate::tenant::update_rows_where_capturing_unchecked(
@@ -4430,6 +4444,7 @@ fn execute_predicate_update_inner(
                 bound.assignments(),
                 needs_embedding,
                 limit,
+                max_scanned_rows,
                 predicate,
                 project,
             ),
@@ -5006,6 +5021,7 @@ fn execute_upsert_inner(
 /// 置換書き込みは呼び出し元（`sql::transaction`）が保持する共有 write トランザクションへ行い
 /// commit しない。`storage` はチャンク化段階のスキーマ取得用（トランザクション内は DDL 不可・
 /// 単一ライタ保持のためスキーマは BEGIN 以降不変）。`Autocommit` は従来どおり 1 文 1 トランザクション。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_file_insert(
     target: crate::tenant::WriteTarget<'_>,
     storage: &crate::storage::Storage,
@@ -5014,6 +5030,7 @@ pub(crate) fn execute_file_insert(
     config: &crate::incremental::IncrementalConfig,
     bound: &crate::sql::parser::BoundFileInsert,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    max_scanned_rows: usize,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
     // 行形 `INSERT`（[`execute_insert`]）と同一の契約で `operation_id` を解決し、
     // 台帳書き込み指示（`LedgerWrite`）へ写像する（TASK-93・RECOVER-2）。
@@ -5045,6 +5062,7 @@ pub(crate) fn execute_file_insert(
         config,
         &input,
         ledger_write,
+        max_scanned_rows,
     )
     .map_err(map_incremental_error)?;
 

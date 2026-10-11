@@ -9,8 +9,9 @@
 //! 上限・複数行 `VALUES` の 1 文あたり行数上限は**既定で無効（上限なし）**と
 //! する。プロセス全体に対して起動時 CLI フラグで明示指定した場合のみ有効に
 //! なる（セッション・テナント単位の設定は対象外）。資源上限は既存の
-//! SQL 文長上限・1 文あたり総走査行数上限（`engine::tenant::MAX_SCANNED_ROWS`）
-//! で引き続き担保し、これらは変更しない
+//! SQL 文長上限・1 文あたり総走査行数上限（`engine::tenant::MAX_SCANNED_ROWS`。
+//! `--max-scanned-rows` で下げる方向のみ設定可、既定はハード上限。
+//! `scan_limits_opt`）で引き続き担保する
 //! （[`engine::sql::parser::DmlLimits`] ドキュメント・`docs/design/
 //! predicate-dml-exec.md` §6 参照）。
 //!

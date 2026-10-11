@@ -3303,7 +3303,8 @@ fn bind_set_assignments(
 /// `EngineCore::open()` 等・`--max-dml-affected-rows` 未指定の構成では、従来
 /// 1,000 件超過で拒否していた述語形 UPDATE／DELETE が成功するようになる）。
 /// 資源上限は本上限に代わって [`crate::tenant::MAX_SCANNED_ROWS`]（1 文あたり
-/// 総走査行数上限。`limit` の設定有無に関わらず常に適用）が引き続き担保する
+/// 総走査行数上限。`limit` の設定有無に関わらず常に適用。実効値は
+/// `--max-scanned-rows`〔`crate::scan_limits::ScanLimits`〕で下げられる）が引き続き担保する
 /// （`docs/design/predicate-dml-exec.md` §6 参照）。
 ///
 /// 束縛段階では対象行数が確定しないため、実行結線（`sql/exec.rs` の
@@ -3416,7 +3417,8 @@ pub fn validate_dml_row_limit(
 /// いずれも既定値（[`Default`] 実装）は `None`（上限なし）で、
 /// `EngineCore::with_dml_limits` を呼ばない既存の構築経路（`EngineCore::open` 等）
 /// も同じ既定のまま不変。資源上限は [`crate::tenant::MAX_SCANNED_ROWS`]（総走査
-/// 行数上限。両フィールドの設定有無に関わらず常に適用）・SQL 文長上限
+/// 行数上限。両フィールドの設定有無に関わらず常に適用。実効値は
+/// `--max-scanned-rows` で下げられる）・SQL 文長上限
 /// （`sql::lexer` の入力長上限）・wire 1 メッセージ上限（`wire-server::limits`）・
 /// 一括投入上限（`crate::batch_limits::BatchLimits`）が引き続き担保する。
 #[derive(Debug, Clone, Copy, Default)]

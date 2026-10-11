@@ -120,6 +120,15 @@
 //! `EngineCore::with_schema_limits` へ 1 回だけ注入する
 //! （`docs/design/schema-limits-cli.md`）。
 //!
+//! `--max-scanned-rows`（Issue #1549。SQL-46）: 1 文あたりの総走査行数上限
+//! （範囲 `1`〜`1,000,000`）を、プロセス全体に対して起動時に**下げる方向だけ**設定
+//! できる opt-in 注入点（未指定は現行のハード上限と同値＝挙動不変）。原子経路の
+//! 述語形 `UPDATE`／`DELETE`・辞書スナップショット・ファイル形 `INSERT` の置換走査に
+//! 効き、分割実行 DML の `--partitioned-dml-scan-budget` とは連動しない。範囲外・
+//! 非数値・値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::scan_limits_opt::resolve` に一本化し、`EngineCore::with_scan_limits`
+//! へ 1 回だけ注入する（`docs/design/scan-limits-cli.md`）。
+//!
 //! `--max-dml-affected-rows`／`--max-insert-rows`（Issue #997。オーナー判断の
 //! 改訂・2026-09-27。前回のオーナー判断を置き換え）: 述語形 `UPDATE`／
 //! `DELETE` の 1 文あたり影響行数上限・複数行 `VALUES` の 1 文あたり行数上限
@@ -134,8 +143,9 @@
 //! 起動エラー。値の解決は `wire_server::dml_limits_opt::resolve` に一本化し、
 //! `EngineCore::with_dml_limits` へ 1 回だけ注入する（`docs/design/
 //! predicate-dml-exec.md` §6 参照）。上限を指定しない場合でも、既存の
-//! SQL 文長上限・1 文あたり総走査行数上限（`MAX_SCANNED_ROWS`）は変更しない
-//! ため資源上限は引き続き機能する。複数行 `VALUES` は本上限に加えて独立した
+//! SQL 文長上限・1 文あたり総走査行数上限（`MAX_SCANNED_ROWS`。既定はハード上限で、
+//! `--max-scanned-rows` により下げる方向にのみ設定できる）が機能するため資源上限は
+//! 引き続き機能する。複数行 `VALUES` は本上限に加えて独立した
 //! 別上限 `batch_limits.max_files_per_batch`（既定 64。Issue #860）も通るため、
 //! `--max-insert-rows` を明示指定した値・または未指定時の既定（上限なし）が
 //! 64 超であっても、`--batch-max-files`（下記）または環境変数
@@ -319,6 +329,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_table_columns_raw: Option<String> = None;
     let mut max_array_elements_raw: Option<String> = None;
     let mut max_enum_labels_raw: Option<String> = None;
+    let mut max_scanned_rows_raw: Option<String> = None;
     let mut partitioned_chunk_rows_raw: Option<String> = None;
     let mut partitioned_scan_budget_raw: Option<String> = None;
     let mut partitioned_max_hold_ms_raw: Option<String> = None;
@@ -654,6 +665,26 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_enum_labels_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::scan_limits_opt::MAX_SCANNED_ROWS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::scan_limits_opt::MAX_SCANNED_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1549: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_scanned_rows_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::scan_limits_opt::MAX_SCANNED_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_scanned_rows_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::dml_limits_opt::PARTITIONED_CHUNK_ROWS_FLAG => {
@@ -1094,6 +1125,17 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1549: 1 文あたりの総走査行数上限を bind・ユーザーストア読込より前に解決する
+    // （fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
+    // `ScanLimits::default()`＝ハード上限＝現行挙動。
+    let scan_limits = match wire_server::scan_limits_opt::resolve(max_scanned_rows_raw.as_deref()) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid scan limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1128・#1129: 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間・
     // 同時実行数・中断記録数の上限）を
     // bind・ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は
@@ -1496,6 +1538,9 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #1548: 未指定でも常に呼ぶ（`schema_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_schema_limits(schema_limits);
+    // Issue #1549: 未指定でも常に呼ぶ（`scan_limits` は既定まで解決済み。既定は
+    // ハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_scan_limits(scan_limits);
     // Issue #1128: 未指定でも常に呼ぶ（既定は `PartitionedDmlLimits::default()`）。
     core = core.with_partitioned_dml_limits(partitioned_dml_limits);
     // Issue #1166: 未指定でも常に呼ぶ（`batch_limits` は既定・環境変数まで

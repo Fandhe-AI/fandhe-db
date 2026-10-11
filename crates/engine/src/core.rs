@@ -1142,6 +1142,11 @@ pub struct EngineCore {
     /// 差し替えは [`Self::with_schema_limits`] のみ（起動時 1 回）。定義が増える DDL の
     /// 実行段（`sql::ddl`）にだけ効き、永続化済みデータの読み出しには効かない。
     schema_limits: crate::schema_limits::SchemaLimits,
+    /// 1 文あたりの総走査行数上限（Issue #1549。起動時 CLI `--max-scanned-rows`）。
+    /// 差し替えは [`Self::with_scan_limits`] のみ（起動時 1 回）。原子経路の述語形
+    /// UPDATE／DELETE の候補列挙・辞書スナップショット構築・ファイル形 INSERT の
+    /// 置換走査に効く。分割実行 DML の走査予算とは連動しない。
+    scan_limits: crate::scan_limits::ScanLimits,
     /// 述語形 UPDATE／DELETE の分割実行（Issue #1128・ADR `docs/design/partitioned-dml.md`
     /// §15.2）のチャンク幅・走査予算・writer 保持時間。差し替えは
     /// [`Self::with_partitioned_dml_limits`] のみ（起動時に 1 回）。
@@ -2046,6 +2051,7 @@ impl EngineCore {
             transaction_limits: crate::sql::transaction::TransactionLimits::default(),
             dml_limits: crate::sql::parser::DmlLimits::default(),
             schema_limits: crate::schema_limits::SchemaLimits::default(),
+            scan_limits: crate::scan_limits::ScanLimits::default(),
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
@@ -2270,6 +2276,19 @@ impl EngineCore {
         self.schema_limits
     }
 
+    /// 総走査行数上限（[`crate::scan_limits::ScanLimits`]）を差し替えたビルダーを返す
+    /// （Issue #1549）。`wire-server` の起動時 CLI フラグ `--max-scanned-rows` からのみ
+    /// 呼ぶ。未呼び出しならハード上限と同値の既定（現行挙動）。
+    pub fn with_scan_limits(mut self, limits: crate::scan_limits::ScanLimits) -> Self {
+        self.scan_limits = limits;
+        self
+    }
+
+    /// 現在の総走査行数上限（Issue #1549）。
+    pub fn scan_limits(&self) -> crate::scan_limits::ScanLimits {
+        self.scan_limits
+    }
+
     /// 分割実行 DML の設定（[`crate::sql::parser::PartitionedDmlLimits`]）を差し替えた
     /// ビルダーを返す。`wire-server` の起動時 CLI フラグ（プロセス全体・1 回限り）から
     /// のみ呼ぶ。未呼び出しなら既定値（ADR §15.2）。
@@ -2451,28 +2470,31 @@ impl EngineCore {
             let (path_idx, body_idx) = dictionary_required_columns(&schema)
                 .map_err(|msg| CoreError::from(CatalogError::Invalid(msg)))?;
 
-            let rows =
-                crate::tenant::visible_rows(&self.storage, table, ctx).map_err(|e| match e {
-                    crate::tenant::TenantError::Catalog(e) => CoreError::from(e),
-                    // 走査量上限超過は他テナントの存在情報を含まない固定メッセージへ
-                    // 丸める（`TenantError` 自体が既にその契約を満たすが、
-                    // `CoreError` 側の型に昇格し直す。security.md「エラー・ログ
-                    // 経由で他テナントのデータ・存在情報を漏らさない」）。
-                    crate::tenant::TenantError::TooManyVisibleRows { .. }
-                    | crate::tenant::TenantError::TooManyRowsScanned { .. } => {
-                        CoreError::from(CatalogError::Invalid(
-                            "too many rows to build dictionary snapshot".to_string(),
-                        ))
-                    }
-                    // `verify_hits` 専用の variant で `visible_rows` からは返らない
-                    // 防御的分岐。
-                    crate::tenant::TenantError::HitOutsideVisibleSet => {
-                        CoreError::from(CatalogError::Invalid(
-                            "unexpected tenant boundary error while building dictionary snapshot"
-                                .to_string(),
-                        ))
-                    }
-                })?;
+            let rows = crate::tenant::visible_rows_with_scan_limit(
+                &self.storage,
+                table,
+                ctx,
+                self.scan_limits.max_scanned_rows(),
+            )
+            .map_err(|e| match e {
+                crate::tenant::TenantError::Catalog(e) => CoreError::from(e),
+                // 走査量上限超過は他テナントの存在情報を含まない固定メッセージへ
+                // 丸める（`TenantError` 自体が既にその契約を満たすが、
+                // `CoreError` 側の型に昇格し直す。security.md「エラー・ログ
+                // 経由で他テナントのデータ・存在情報を漏らさない」）。
+                crate::tenant::TenantError::TooManyVisibleRows { .. }
+                | crate::tenant::TenantError::TooManyRowsScanned { .. } => CoreError::from(
+                    CatalogError::Invalid("too many rows to build dictionary snapshot".to_string()),
+                ),
+                // `verify_hits` 専用の variant で `visible_rows` からは返らない
+                // 防御的分岐。
+                crate::tenant::TenantError::HitOutsideVisibleSet => {
+                    CoreError::from(CatalogError::Invalid(
+                        "unexpected tenant boundary error while building dictionary snapshot"
+                            .to_string(),
+                    ))
+                }
+            })?;
 
             // 行走査完了後の実世代を確認する。`schema`/`built_generation` 取得後
             // かつ `visible_rows` の走査完了前に書き込みがコミットされていると、
@@ -2624,7 +2646,7 @@ impl EngineCore {
                 let (key_tenant, id) = k.value();
                 let raw = v.value();
                 scanned = scanned.saturating_add(1);
-                if scanned > crate::tenant::MAX_SCANNED_ROWS {
+                if scanned > self.scan_limits.max_scanned_rows() {
                     return Err(invalid("too many rows to build dictionary snapshot"));
                 }
                 let (row_tenant, visibility) =
@@ -8428,6 +8450,7 @@ impl EngineCore {
                     &self.incremental_config,
                     &bound,
                     self.ledger_mode,
+                    self.scan_limits.max_scanned_rows(),
                 )
             }
             // `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・
@@ -8691,6 +8714,7 @@ impl EngineCore {
             schema,
             &content_hash_value,
             self.dml_limits.max_affected_rows,
+            self.scan_limits.max_scanned_rows(),
         )
     }
 
@@ -8956,6 +8980,7 @@ impl EngineCore {
             &schema,
             &content_hash_value,
             self.dml_limits.max_affected_rows,
+            self.scan_limits.max_scanned_rows(),
             &returning,
         )
     }
@@ -9251,6 +9276,7 @@ impl EngineCore {
                     &content_hash_value,
                     &legacy_hashes,
                     self.dml_limits.max_affected_rows,
+                    self.scan_limits.max_scanned_rows(),
                     &returning,
                 )
             }
@@ -9291,6 +9317,7 @@ impl EngineCore {
             &content_hash_value,
             legacy_hashes,
             self.dml_limits.max_affected_rows,
+            self.scan_limits.max_scanned_rows(),
         )
     }
 
@@ -9535,6 +9562,7 @@ impl EngineCore {
             &self.incremental_config,
             &self.batch_limits,
             items,
+            self.scan_limits.max_scanned_rows(),
         )
         .map_err(crate::sql::exec::map_batch_incremental_error)?;
 
