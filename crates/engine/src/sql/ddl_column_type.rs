@@ -688,6 +688,7 @@ mod tests {
             assert_eq!(e.wire_code(), "42601", "{raw}");
         }
     }
+
     #[test]
     fn alias_array_elements_resolve() {
         let (ty, _) = parse_type("INT4[]").expect("valid");

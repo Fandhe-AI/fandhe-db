@@ -1138,7 +1138,8 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
 ///
 /// Issue #2303: 未確定型（`0A000` 拒否。TABLE-30・TABLE-31 ポインタ）の綴りも同じ理由で
 /// 加える。Issue #2304 の `FLOAT`（`FLOAT(p)` の先頭語。`BOOL`・`TIMESTAMP` は
-/// [`RESERVED_TYPE_NAMES`] に既にある）も同じ理由で加える。同名 ENUM を作っても以後どの DDL からも参照できず、後続で受理へ切り替えた際に
+/// [`RESERVED_TYPE_NAMES`] に既にある）も同じ理由で加える。
+/// 同名 ENUM を作っても以後どの DDL からも参照できず、後続で受理へ切り替えた際に
 /// 黙って組み込み型へ解決されるため。
 const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &[
     "int4",

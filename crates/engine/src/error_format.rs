@@ -82,8 +82,8 @@ macro_rules! define_error_classes {
 /// テストがこの集合に載っていない `wire_code` の重複だけを偶発的な乖離として
 /// 検出する。共有は 3 組: `23502`（`MissingOperationId` / `NotNullViolation`）と
 /// `23505`（`UniqueViolation` / `DuplicateOperationId`。台帳由来の重複を行制約
-/// 由来と `code` ラベルで区別する。Issue #1180・RECOVER-12・ERR-6）と`22023`（`OperationIdContentMismatch` /
-/// `InvalidParameterValue`。Issue #2304）。
+/// 由来と `code` ラベルで区別する。Issue #1180・RECOVER-12・ERR-6）と
+/// `22023`（`OperationIdContentMismatch` / `InvalidParameterValue`。Issue #2304）。
 ///
 /// 本体は `#[cfg(test)]` の単体テストからのみ参照される（`pub(crate)` のため
 /// integration test crate からは到達できない）。通常ビルドでは未参照のため
@@ -341,7 +341,8 @@ impl ErrorClass {
     /// [`SHARED_WIRE_CODES`] に載る `wire_code`（`23502`・`23505`・`22023`）は複数分類が
     /// 共有するため、本関数は [`ErrorClass::ALL`] の宣言順で最初に一致した分類
     /// （`23502` は [`ErrorClass::MissingOperationId`]、`23505` は
-    /// [`ErrorClass::UniqueViolation`]、`22023` は [`ErrorClass::OperationIdContentMismatch`]）を返す。この関数は
+    /// [`ErrorClass::UniqueViolation`]、`22023` は
+    /// [`ErrorClass::OperationIdContentMismatch`]）を返す。この関数は
     /// HTTP ステータス射影の往復確認（同じ `wire_code` は同じステータスへ写像
     /// される）にのみ使われ、応答本文の `code` ラベルは各エラー型の
     /// `error_class()` が直接返す分類から得るため、共有コードの逆引きが
