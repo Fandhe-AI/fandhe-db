@@ -3461,6 +3461,74 @@ mod tests {
         );
     }
 
+    /// golden 固定（SQL-42・Issue #1521）: lexer が `%`／単独 `#` を字句化しても、
+    /// 変更前に受理していた述語形 DELETE の `for_delete_where` ハッシュがバイト単位で
+    /// 不変であることを固定する。ハッシュ入力は検証済み AST（トークン列ではない）で、
+    /// 文字列リテラル内の `%`／`#` は従来から `StringLiteral` の中身のため影響しない。
+    /// 定数が変わった場合は「バグを直した」のではなく「永続化済み台帳エントリとの
+    /// 互換性を壊した」ことを意味するため、字句化変更前の実装から採取した値のまま
+    /// 更新しない。
+    #[test]
+    fn for_delete_where_hash_is_golden_across_percent_hash_lexing() {
+        use crate::recovery::required_op_id::LedgerMode;
+        use crate::sql::allowlist::{
+            validate_delete_statement, DeleteStatement, StructuralOnlyLookup,
+        };
+        use crate::sql::udf_call::UdfRegistry;
+
+        fn to_hex(bytes: &[u8; 32]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        fn hash_of(sql: &str) -> String {
+            let stmt = validate_delete_statement(
+                sql,
+                &StructuralOnlyLookup,
+                LedgerMode::CompareOnlyWithoutLedger,
+            )
+            .expect("accepted before and after the change");
+            let DeleteStatement::Predicate(p) = stmt else {
+                panic!("predicate form expected");
+            };
+            let h =
+                for_delete_where("t", &p.where_predicates, &UdfRegistry::default()).expect("hash");
+            to_hex(h.as_bytes())
+        }
+
+        assert_eq!(
+            hash_of("DELETE FROM t WHERE lang = 'a%b#c'"),
+            "1a830b482924535449bc04c6bfa4bdfee58f0ab7f2dee5264fc5113988b704b4"
+        );
+        assert_eq!(
+            hash_of("DELETE FROM t WHERE lang = 'ja'"),
+            "9bd67532985a7f63681e25149ccf7967c91a5f18cb7b723ef60d785b0ec0bf61"
+        );
+        assert_eq!(
+            hash_of("DELETE FROM t WHERE id > 0 AND lang = 'x%'"),
+            "b1d897040fbfae1b772bfcdfebb963d1ed630d90c963337c4686fbb3ca6f9fad"
+        );
+    }
+
+    /// SQL-42・Issue #1521: 文字列リテラルの外の `%`／単独 `#` を含む DELETE は
+    /// 構文段で `42601` となり、ハッシュ計算（`for_*_where`）へ到達しない。
+    #[test]
+    fn percent_and_hash_outside_literals_are_rejected_before_hashing() {
+        use crate::recovery::required_op_id::LedgerMode;
+        use crate::sql::allowlist::{validate_delete_statement, StructuralOnlyLookup};
+
+        for sql in [
+            "DELETE FROM t WHERE n % 2 = 0",
+            "DELETE FROM t WHERE n # 1 = 0",
+            "DELETE FROM t WHERE id = 1 %",
+        ] {
+            let err = validate_delete_statement(
+                sql,
+                &StructuralOnlyLookup,
+                LedgerMode::CompareOnlyWithoutLedger,
+            )
+            .expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+        }
+    }
     // --- SQL-24（TASK-208 ポインタ）: IN / BETWEEN / IS NULL / NOT のハッシュ --
 
     fn hash_for(predicate: crate::sql::allowlist::WherePredicate) -> ContentHash {
