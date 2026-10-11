@@ -39,7 +39,7 @@ pub(super) fn key_class(ty: Option<&ColumnType>) -> Result<JoinKeyClass, SqlSurf
     match ty {
         None => Ok(JoinKeyClass::Integer),
         Some(ColumnType::Integer) | Some(ColumnType::BigInt) => Ok(JoinKeyClass::Integer),
-        Some(ColumnType::Text) => Ok(JoinKeyClass::Text),
+        Some(ColumnType::Text | ColumnType::Varchar) => Ok(JoinKeyClass::Text),
         Some(ColumnType::Boolean) => Ok(JoinKeyClass::Bool),
         Some(ColumnType::Date) => Ok(JoinKeyClass::Date),
         Some(ColumnType::Timestamp) => Ok(JoinKeyClass::Timestamp),
@@ -127,7 +127,7 @@ pub(crate) fn cmp_class(ty: Option<&ColumnType>) -> Option<CmpClass> {
         Some(ColumnType::Integer) | Some(ColumnType::BigInt) => Some(CmpClass::Integer),
         Some(ColumnType::Real) | Some(ColumnType::Double) => Some(CmpClass::Float),
         Some(ColumnType::Numeric { .. }) => Some(CmpClass::Numeric),
-        Some(ColumnType::Text) => Some(CmpClass::Text),
+        Some(ColumnType::Text | ColumnType::Varchar) => Some(CmpClass::Text),
         Some(ColumnType::Boolean) => Some(CmpClass::Bool),
         Some(ColumnType::Date) => Some(CmpClass::Date),
         Some(ColumnType::Timestamp) => Some(CmpClass::Timestamp),
@@ -271,7 +271,7 @@ pub(crate) fn cell_scalar<'a>(
     };
     Ok(match (ty, cell) {
         (_, Cell::Null) => None,
-        (ColumnType::Text, Cell::Text(s)) => Some(ScalarRef::Text(s)),
+        (ColumnType::Text | ColumnType::Varchar, Cell::Text(s)) => Some(ScalarRef::Text(s)),
         (ColumnType::Enum(_), Cell::Text(s)) => Some(ScalarRef::Enum(s)),
         (ColumnType::Integer, Cell::SignedInteger(v)) => Some(ScalarRef::Integer(
             i32::try_from(*v).map_err(|_| bug("INTEGER value out of range"))?,

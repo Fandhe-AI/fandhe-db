@@ -304,7 +304,7 @@ fn bare_bool_leaf_positions(tokens: &[Token]) -> Vec<usize> {
 }
 
 /// [`demote_unneeded_quoted_bool_words`] の位置判定（`tokens[i]` が真偽語）。
-fn quoted_bool_word_in_leaf_position(tokens: &[Token], i: usize) -> bool {
+pub(crate) fn quoted_bool_word_in_leaf_position(tokens: &[Token], i: usize) -> bool {
     // 直前: 連続する `(` を数えつつ読み戻し、先頭が WHERE／AND／OR／NOT かを見る。
     // この `(` 群（opens 個）が葉自身を包む述語グループで、直後の最初の opens 個の `)` が
     // それに対応する。それを超える `)` は外側の構造（CTE・サブクエリ）を閉じる境界であり、

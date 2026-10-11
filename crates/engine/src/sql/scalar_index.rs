@@ -1012,7 +1012,7 @@ impl ScalarIndex {
             match &column.ty {
                 // ENUM 列は TEXT と同じ辞書表現を共有する（Issue #890 D3。
                 // ラベルは短いため平均値長ゲートで除外されることは実質ない）。
-                ColumnType::Text | ColumnType::Enum(_) => {
+                ColumnType::Text | ColumnType::Varchar | ColumnType::Enum(_) => {
                     // `acc` は 1 行につき列あたり高々 1 値しか追加されないため
                     // `row_count` が確保上限になる。倍増などの成長戦略による
                     // 余剰確保を避けるため、行走査を始める前に必要量ちょうどを

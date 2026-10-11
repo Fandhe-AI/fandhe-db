@@ -90,7 +90,7 @@ pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfac
         ))
     })?;
     match &column.ty {
-        ColumnType::Text => Ok(idx),
+        ColumnType::Text | ColumnType::Varchar => Ok(idx),
         // F10（Issue #882 計画）: `body` 列に REAL/DOUBLE が宣言されるのは
         // 通常あり得ないが、VECTOR 列と同じ「TEXT 列でない」拒否へ合流させる
         // （BOOLEAN も同様。Issue #883）。

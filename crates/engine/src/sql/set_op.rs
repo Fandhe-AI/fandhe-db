@@ -170,7 +170,7 @@ fn columns_compatible(a: &ColumnMeta, b: &ColumnMeta) -> bool {
     match (a, b) {
         (ColumnMeta::Id, ColumnMeta::Id) => true,
         _ => match (static_type(a), static_type(b)) {
-            (Some(ta), Some(tb)) => ta == tb,
+            (Some(ta), Some(tb)) => ta.same_value_domain(tb),
             _ => false,
         },
     }

@@ -942,7 +942,7 @@ pub(crate) fn add_column_default(
     literal: &InsertLiteral,
 ) -> Result<ColumnDefault, SqlSurfaceError> {
     let kind = match ty {
-        ColumnType::Text => "text",
+        ColumnType::Text | ColumnType::Varchar => "text",
         ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Real

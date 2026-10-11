@@ -98,7 +98,7 @@ impl ScoringBoost {
                 SqlSurfaceError::invalid_input(format!("unknown column: {}", self.column))
             })?;
         match &column.ty {
-            ColumnType::Text => {}
+            ColumnType::Text | ColumnType::Varchar => {}
             ColumnType::Vector(_)
             | ColumnType::Integer
             | ColumnType::BigInt

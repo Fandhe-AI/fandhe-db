@@ -2958,7 +2958,7 @@ fn project_rows(
                         ColumnType::Vector(_) => {
                             cells.push(Cell::Vector(try_clone_embedding(embedding)?))
                         }
-                        ColumnType::Text => match decoded.get(*index) {
+                        ColumnType::Text | ColumnType::Varchar => match decoded.get(*index) {
                             Some(Value::Text(t)) => cells.push(Cell::Text(try_clone_text(t)?)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Integer(_))
