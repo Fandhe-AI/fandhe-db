@@ -23,12 +23,19 @@
 //!    対象外——`WHERE` 節の外側にはこのパターンを一切適用しない）
 //! 5. `INSERT ... VALUES ($1, $2, ...)`（複数行含む。`VALUES` 節内の `(`/`,` と
 //!    `,`/`)` に挟まれた位置のみ。行の括弧の直下＝深さ 1 の要素単独位置に限る。
-//!    `upper($1)`・`1 + $1` 等の式の内側は Issue #1546 の担当で `42601`）
+//!    `upper($1)`・`1 + $1` 等の式の内側はパターン 7）
 //! 6. `UPDATE <表> SET <列> = $n [, <列> = $m ...]`（Issue #1544・SQL-45 のポインタ。
 //!    先頭語が `UPDATE` の文の `SET` 節の内側、括弧深さ 0 の `(SET|,) <列> = $n (,|節末)` の
-//!    形＝右辺全体が `$n` 単独の位置のみ。`a = a + $1`・`upper($1)`・`f(x, b = $1)` の
-//!    ように式の内側に置いた `$n` は Issue #1546 の担当で `42601`。
+//!    形＝右辺全体が `$n` 単独の位置のみ。`a = a + $1`・`upper($1)` のように式の内側に
+//!    置いた `$n` はパターン 7。
 //!    `INSERT ... ON CONFLICT ... DO UPDATE SET` は先頭語が `INSERT` のため対象外）
+//! 7. 式の内側の `$n`（Issue #1546・SQL-45 期待欄 (6)・WIRE-12 のポインタ）。パターン 5 の
+//!    VALUES 要素、パターン 6 の SET 右辺のうち `$n` 単独ではないもの
+//!    （`n = n + $1`・`s = upper($1)`・`VALUES (1 + $1)`・`CASE WHEN m = $1 ...`）。
+//!    本モジュールは式セグメント（[`ExprSegment`]）の切り出しと構造上の受理だけを担い、
+//!    `$n` の型は `sql::param_infer` が演算の相手・関数引数・兄弟枝から推論する
+//!    （推論できない `$n` は Parse で `42P18`）。SET 右辺の節末は深さ 0 の `WHERE`／
+//!    `RETURNING`／`USING OPERATION_ID|PLAN`。
 //!
 //! `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
 //! `ON CONFLICT ... DO UPDATE SET a = $n`・hybrid 関数
@@ -359,78 +366,116 @@ fn values_region_bounds(tokens: &[Token]) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// `VALUES` 節の行グループを 1 パスで前向きに走査し、「行の括弧の直下（深さ
-/// ちょうど 1）にある要素単独の `$n`」のトークン添字から行内の列序数への表を
-/// 返す（Issue #1543・SQL-45 のポインタ）。式の内側（`upper($1)`・`1 + $1`・
-/// `(($1))`）は深さまたは前後トークンで外れて表に載らず `42601` で拒否される
-/// （式内 `$n` は別 Issue の担当）。位置判定と型推論の双方が本表を 1 度だけ
-/// 構築して共有する（`$n` ごとの再走査による二次時間の CPU 増幅を避ける）。
+/// 式セグメントの帰属先（代入先の列、または VALUES 行内の列序数）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExprTarget {
+    /// `UPDATE ... SET <列> = <式>` の代入先列名。
+    Set(String),
+    /// `INSERT ... VALUES` の行内序数（0 始まり。列リストの添字に対応）。
+    Insert(usize),
+}
+
+/// 式内 `$n`（パターン 7。Issue #1546・SQL-45 期待欄 (6) のポインタ）を含む
+/// SET 右辺／VALUES 要素のトークン範囲 `[start, end)`。右辺・要素が `$n` 単独のもの
+/// （パターン 5・6）は含まない。`sql::param_infer` が範囲ごとに 1 度だけ式を解析して
+/// `$n` の型を推論する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExprSegment {
+    pub(crate) target: ExprTarget,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+/// `VALUES` 節の行グループを 1 パスで前向きに走査し、(a) 「行の括弧の直下（深さ
+/// ちょうど 1）にある要素単独の `$n`」のトークン添字から行内の列序数への表（パターン 5。
+/// Issue #1543・SQL-45 のポインタ）と、(b) 要素が `$n` 単独ではないが `$n` を含むもの
+/// （`upper($1)`・`1 + $1`・`(($1))`。パターン 7、Issue #1546）の式セグメントを返す。
+/// 位置判定と型推論の双方が本結果を 1 度だけ構築して共有する（`$n` ごとの再走査による
+/// 二次時間の CPU 増幅を避ける）。要素の境界は深さ 1 の `,`／行の閉じ括弧で決まる。
 /// 行の並びが途中で崩れた場合は、それまでに閉じた行の分だけを返す（fail-closed）。
-fn values_param_slots(tokens: &[Token], start: usize, end: usize) -> HashMap<usize, usize> {
+fn values_param_slots(
+    tokens: &[Token],
+    start: usize,
+    end: usize,
+) -> (HashMap<usize, usize>, Vec<ExprSegment>) {
     let mut table: HashMap<usize, usize> = HashMap::new();
+    let mut segments: Vec<ExprSegment> = Vec::new();
     let end = end.min(tokens.len());
     let Some(mut pos) = start.checked_add(1) else {
-        return table;
+        return (table, segments);
     };
     loop {
         if pos >= end || !matches!(tokens.get(pos), Some(Token::Punct('('))) {
-            return table;
+            return (table, segments);
         }
         let mut depth: usize = 0;
         let mut commas: usize = 0;
+        let mut elem_start = pos.saturating_add(1);
         let mut k = pos;
-        let mut found: Vec<(usize, usize)> = Vec::new();
+        let mut row_slots: Vec<(usize, usize)> = Vec::new();
+        let mut row_segments: Vec<ExprSegment> = Vec::new();
+        // 要素 `[elem_start, elem_end)` を確定させる（`$n` 単独ならパターン 5、
+        // `$n` を含む式ならパターン 7 のセグメント）。
+        let mut close_element = |elem_start: usize, elem_end: usize, ordinal: usize| {
+            let Some(slice) = tokens.get(elem_start..elem_end) else {
+                return;
+            };
+            if matches!(slice, [Token::Param(_)]) {
+                row_slots.push((elem_start, ordinal));
+            } else if slice.iter().any(|t| matches!(t, Token::Param(_))) {
+                row_segments.push(ExprSegment {
+                    target: ExprTarget::Insert(ordinal),
+                    start: elem_start,
+                    end: elem_end,
+                });
+            }
+        };
         let row_close = loop {
             if k >= end {
-                return table;
+                return (table, segments);
             }
             let Some(tok) = tokens.get(k) else {
-                return table;
+                return (table, segments);
             };
             match tok {
                 Token::Punct('(') | Token::Punct('[') => depth += 1,
                 Token::Punct(')') | Token::Punct(']') => {
                     let Some(d) = depth.checked_sub(1) else {
-                        return table;
+                        return (table, segments);
                     };
                     depth = d;
                     if depth == 0 {
+                        close_element(elem_start, k, commas);
                         break k;
                     }
                 }
-                Token::Punct(',') if depth == 1 => commas += 1,
-                Token::Param(_) if depth == 1 => {
-                    let prev_ok = matches!(
-                        k.checked_sub(1).and_then(|j| tokens.get(j)),
-                        Some(Token::Punct('(')) | Some(Token::Punct(','))
-                    );
-                    let next_ok = matches!(
-                        tokens.get(k + 1),
-                        Some(Token::Punct(')')) | Some(Token::Punct(','))
-                    );
-                    if prev_ok && next_ok {
-                        found.push((k, commas));
-                    }
+                Token::Punct(',') if depth == 1 => {
+                    close_element(elem_start, k, commas);
+                    commas += 1;
+                    elem_start = k.saturating_add(1);
                 }
                 _ => {}
             }
             k += 1;
         };
-        table.extend(found);
+        table.extend(row_slots);
+        segments.extend(row_segments);
         // 次の行（`, (`）へ進む。それ以外で行の並びは終わり。
         if matches!(tokens.get(row_close + 1), Some(Token::Punct(',')))
             && matches!(tokens.get(row_close + 2), Some(Token::Punct('(')))
         {
             pos = row_close + 2;
         } else {
-            return table;
+            return (table, segments);
         }
     }
 }
 
-/// パターン 6（`UPDATE ... SET`）の受理範囲 `(SET の位置, 節末の位置)` を返す。
+/// パターン 6・7（`UPDATE ... SET`）の受理範囲 `(SET の位置, 節末の位置)` を返す。
 /// 先頭語が `UPDATE`・3 番目のトークンが `SET` の文に限る（表名の直後の固定位置。
-/// 表名が `set` でも誤認しない）。節末は最初の `WHERE` キーワード（無ければ文末）。
+/// 表名が `set` でも誤認しない）。節末は、括弧深さ 0 で最初に現れる `WHERE` キーワードまたは
+/// 後続の実句境界（`RETURNING`／`USING OPERATION_ID|PLAN`。[`is_where_clause_boundary`] が
+/// 判定する。列名・関数名としての出現は境界にしない）。無ければ文末。
 /// `INSERT ... ON CONFLICT ... DO UPDATE SET` は先頭語が `INSERT` のため `None`。
 fn set_region(tokens: &[Token]) -> Option<(usize, usize)> {
     if !ident_eq_ignore_case(tokens.first(), "UPDATE")
@@ -438,63 +483,152 @@ fn set_region(tokens: &[Token]) -> Option<(usize, usize)> {
     {
         return None;
     }
+    let mut depth: usize = 0;
     let end = tokens
         .iter()
         .enumerate()
         .skip(3)
-        .find_map(|(idx, t)| {
-            matches!(t, Token::Keyword(crate::sql::lexer::Keyword::Where)).then_some(idx)
+        .find_map(|(idx, t)| match t {
+            Token::Punct('(') | Token::Punct('[') => {
+                depth = depth.saturating_add(1);
+                None
+            }
+            Token::Punct(')') | Token::Punct(']') => {
+                depth = depth.saturating_sub(1);
+                None
+            }
+            Token::Keyword(crate::sql::lexer::Keyword::Where) if depth == 0 => Some(idx),
+            Token::Ident(name)
+                if depth == 0
+                    && (name.eq_ignore_ascii_case("RETURNING")
+                        || name.eq_ignore_ascii_case("USING"))
+                    && is_where_clause_boundary(tokens, idx) =>
+            {
+                Some(idx)
+            }
+            _ => None,
         })
         .unwrap_or(tokens.len());
     Some((2, end))
 }
 
-/// `SET` 節を 1 パスで前向きに走査し、「括弧深さ 0 の `(SET|,) <列> = $n (,|節末)`」
-/// の `$n` のトークン添字から対象列名への表を返す（Issue #1544・SQL-45 のポインタ）。
-/// 右辺全体が `$n` 単独の位置だけが載り、式の内側（`a + $1`・`upper($1)`・
-/// `f(x, b = $1)`）は表に載らず `42601` で拒否される（式内 `$n` は Issue #1546 の担当）。
-/// 位置判定と型推論の双方が本表を共有する（`$n` ごとの再走査による二次時間を避ける）。
-fn set_param_slots(tokens: &[Token], start: usize, end: usize) -> HashMap<usize, String> {
+/// `SET` 節を 1 パスで前向きに走査し、括弧深さ 0 の `(SET|,) <列> = <右辺>` ごとに
+/// 右辺（次の深さ 0 の `,` または節末まで）を切り出す。右辺全体が `$n` 単独の位置は
+/// `$n` のトークン添字から対象列名への表（パターン 6。Issue #1544・SQL-45 のポインタ）、
+/// `$n` を含むそれ以外の右辺（`a + $1`・`upper($1)`・`CASE ... END`）は式セグメント
+/// （パターン 7。Issue #1546）として返す。代入先の列は `(SET|,) <列> =` の境界でだけ
+/// 確定するため、右辺の中の `=`（`CASE WHEN m = $1 ...`）で列を取り違えない。
+/// 位置判定と型推論の双方が本結果を共有する（`$n` ごとの再走査による二次時間を避ける）。
+fn set_param_slots(
+    tokens: &[Token],
+    start: usize,
+    end: usize,
+) -> (HashMap<usize, String>, Vec<ExprSegment>) {
     let mut table: HashMap<usize, String> = HashMap::new();
+    let mut segments: Vec<ExprSegment> = Vec::new();
     let end = end.min(tokens.len());
     let mut depth: usize = 0;
+    // 現在の代入の (列名, 右辺開始位置)。
+    let mut current: Option<(String, usize)> = None;
     let mut k = start;
     while k < end {
-        match tokens.get(k) {
-            Some(Token::Punct('(') | Token::Punct('[')) => depth = depth.saturating_add(1),
-            Some(Token::Punct(')') | Token::Punct(']')) => depth = depth.saturating_sub(1),
-            Some(Token::Ident(_)) if depth == 0 && k == start => {
-                set_slot_at(tokens, k, end, &mut table);
+        let is_separator = match tokens.get(k) {
+            Some(Token::Punct('(') | Token::Punct('[')) => {
+                depth = depth.saturating_add(1);
+                false
             }
-            Some(Token::Punct(',')) if depth == 0 => {
-                set_slot_at(tokens, k, end, &mut table);
+            Some(Token::Punct(')') | Token::Punct(']')) => {
+                depth = depth.saturating_sub(1);
+                false
             }
-            _ => {}
+            Some(Token::Ident(_)) if depth == 0 && k == start => true,
+            Some(Token::Punct(',')) if depth == 0 => true,
+            _ => false,
+        };
+        if is_separator {
+            close_set_assignment(tokens, current.take(), k, &mut table, &mut segments);
+            if let (Some(Token::Ident(col) | Token::QuotedNull(col)), Some(Token::Punct('='))) =
+                (tokens.get(k + 1), tokens.get(k + 2))
+            {
+                current = Some((col.clone(), k + 3));
+            }
         }
         k += 1;
     }
-    table
+    close_set_assignment(tokens, current.take(), end, &mut table, &mut segments);
+    (table, segments)
 }
 
-/// [`set_param_slots`] の 1 候補判定（`tokens[sep]` は `SET` または深さ 0 の `,`）。
-fn set_slot_at(tokens: &[Token], sep: usize, end: usize, table: &mut HashMap<usize, String>) {
-    let (
-        Some(Token::Ident(col) | Token::QuotedNull(col)),
-        Some(Token::Punct('=')),
-        Some(Token::Param(_)),
-    ) = (
-        tokens.get(sep + 1),
-        tokens.get(sep + 2),
-        tokens.get(sep + 3),
-    )
-    else {
+/// [`set_param_slots`] の 1 代入の確定（右辺 `[rhs_start, rhs_end)`）。
+fn close_set_assignment(
+    tokens: &[Token],
+    current: Option<(String, usize)>,
+    rhs_end: usize,
+    table: &mut HashMap<usize, String>,
+    segments: &mut Vec<ExprSegment>,
+) {
+    let Some((col, rhs_start)) = current else {
         return;
     };
-    let next = sep + 4;
-    let terminated = next >= end || matches!(tokens.get(next), Some(Token::Punct(',')));
-    if terminated {
-        table.insert(sep + 3, col.clone());
+    let Some(slice) = tokens.get(rhs_start..rhs_end) else {
+        return;
+    };
+    if matches!(slice, [Token::Param(_)]) {
+        table.insert(rhs_start, col);
+    } else if slice.iter().any(|t| matches!(t, Token::Param(_))) {
+        segments.push(ExprSegment {
+            target: ExprTarget::Set(col),
+            start: rhs_start,
+            end: rhs_end,
+        });
     }
+}
+
+/// `$n` の位置判定表（パターン 5〜7）。[`validate_param_positions`] と
+/// [`infer_param_positions`] が共有する（境界判定がずれる余地をなくす）。
+struct ParamLayout {
+    /// パターン 5: `$n` のトークン添字 → VALUES 行内の列序数。
+    values_slots: HashMap<usize, usize>,
+    /// パターン 6: `$n` のトークン添字 → 代入先列名。
+    set_slots: HashMap<usize, String>,
+    /// パターン 7: `$n` を含む式セグメント（トークン添字の昇順・互いに重ならない）。
+    segments: Vec<ExprSegment>,
+}
+
+impl ParamLayout {
+    fn build(tokens: &[Token]) -> Self {
+        let (values_slots, mut segments) = match values_region_bounds(tokens) {
+            Some((start, end)) => values_param_slots(tokens, start, end),
+            None => (HashMap::new(), Vec::new()),
+        };
+        let (set_slots, set_segments) = match set_region(tokens) {
+            Some((start, end)) => set_param_slots(tokens, start, end),
+            None => (HashMap::new(), Vec::new()),
+        };
+        // INSERT と UPDATE の領域は排他（先頭語が異なる）。
+        segments.extend(set_segments);
+        Self {
+            values_slots,
+            set_slots,
+            segments,
+        }
+    }
+
+    /// トークン添字 `i` を含む式セグメントの添字（無ければ `None`）。
+    /// セグメントは昇順・非重複のため二分探索で引く。
+    fn segment_index_at(&self, i: usize) -> Option<usize> {
+        let idx = self.segments.partition_point(|seg| seg.end <= i);
+        self.segments
+            .get(idx)
+            .filter(|seg| seg.start <= i && i < seg.end)
+            .map(|_| idx)
+    }
+}
+
+/// パターン 7 の式セグメント（`sql::param_infer` が型推論に使う）を返す。
+/// [`infer_param_positions`] の `ParamPosition::InExpr(i)` の `i` は本戻り値の添字。
+pub(crate) fn expr_param_segments(tokens: &[Token]) -> Vec<ExprSegment> {
+    ParamLayout::build(tokens).segments
 }
 
 /// `tokens` 中の `Token::Param` がすべて許可位置に収まっていることを検証し、
@@ -555,13 +689,6 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         ));
     }
 
-    // パターン 5（INSERT VALUES）の受理範囲は [`values_region_bounds`] が単一
-    // 情報源として判定する（型推論 [`infer_param_positions`] と共有する）。
-    let (values_region, values_region_end) = match values_region_bounds(tokens) {
-        Some((start, end)) => (Some(start), Some(end)),
-        None => (None, None),
-    };
-
     // パターン 4（WHERE 等価）の受理範囲は [`where_region`] が単一情報源として
     // 判定する（[`where_equality_literal_is_param`] も同じ境界判定を再利用し、
     // 両関数間で境界判定がずれる余地をなくす）。`SET`（statement 全体）である
@@ -571,17 +698,9 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         None => (None, None),
     };
 
-    // パターン 6（UPDATE ... SET）も 1 パスの表で判定する（`$n` ごとの再走査をしない）。
-    let set_slots = match set_region(tokens) {
-        Some((start, end)) => set_param_slots(tokens, start, end),
-        None => HashMap::new(),
-    };
-
-    // VALUES 領域は 1 パスで表を作り、`$n` ごとに再走査しない（二次時間防止）。
-    let values_slots = match values_region {
-        Some(start) => values_param_slots(tokens, start, values_region_end.unwrap_or(tokens.len())),
-        None => HashMap::new(),
-    };
+    // パターン 5〜7（INSERT VALUES・UPDATE SET）は 1 パスの表で判定する
+    // （`$n` ごとの再走査をしない。二次時間防止）。
+    let layout = ParamLayout::build(tokens);
 
     let mut max_index: u16 = 0;
     for (i, token) in tokens.iter().enumerate() {
@@ -617,17 +736,22 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         });
 
         // パターン 5: `INSERT ... VALUES (...)` の行内リテラル位置。
-        let is_insert_value = values_slots.contains_key(&i);
+        let is_insert_value = layout.values_slots.contains_key(&i);
 
         // パターン 6: `UPDATE ... SET <col> = $n`（右辺全体が `$n` 単独の位置のみ）。
-        let is_update_set_value = set_slots.contains_key(&i);
+        let is_update_set_value = layout.set_slots.contains_key(&i);
+
+        // パターン 7: SET 右辺／VALUES 要素の式の内側（Issue #1546）。型を決められない
+        // 場合の `42P18` は Parse の型推論段が返す（ここは構造上の受理だけを判定する）。
+        let is_in_expr = layout.segment_index_at(i).is_some();
 
         if !(is_distance
             || is_using_plan
             || is_operation_id
             || is_where_equality
             || is_insert_value
-            || is_update_set_value)
+            || is_update_set_value
+            || is_in_expr)
         {
             return Err(SqlSurfaceError::unsupported(format!(
                 "parameter placeholder ${n} is not supported at this position"
@@ -657,6 +781,9 @@ pub(crate) enum ParamPosition {
     InsertValue(usize),
     /// `UPDATE ... SET <列> = $n` の対象列名（Issue #1544）。
     SetColumn(String),
+    /// `UPDATE ... SET` 右辺／`INSERT ... VALUES` 要素の式の内側（Issue #1546）。
+    /// 値は [`expr_param_segments`] が返すセグメントの添字。
+    InExpr(usize),
 }
 
 /// `$n` の型公告（`ParameterDescription` の OID 決定と、バイナリ受理可否の
@@ -805,14 +932,7 @@ fn boolean_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceE
 pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<Vec<ParamPosition>> {
     let mut out: Vec<Vec<ParamPosition>> = vec![Vec::new(); usize::from(param_count)];
     let where_bounds = where_region(tokens);
-    let values_slots = match values_region_bounds(tokens) {
-        Some((start, end)) => values_param_slots(tokens, start, end),
-        None => HashMap::new(),
-    };
-    let set_slots = match set_region(tokens) {
-        Some((start, end)) => set_param_slots(tokens, start, end),
-        None => HashMap::new(),
-    };
+    let layout = ParamLayout::build(tokens);
     for (i, token) in tokens.iter().enumerate() {
         let Token::Param(n) = token else { continue };
         let Some(slot) = usize::from(*n).checked_sub(1).and_then(|k| out.get_mut(k)) else {
@@ -824,12 +944,16 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
             slot.push(ParamPosition::Vector);
             continue;
         }
-        if let Some(commas) = values_slots.get(&i) {
+        if let Some(commas) = layout.values_slots.get(&i) {
             slot.push(ParamPosition::InsertValue(*commas));
             continue;
         }
-        if let Some(col) = set_slots.get(&i) {
+        if let Some(col) = layout.set_slots.get(&i) {
             slot.push(ParamPosition::SetColumn(col.clone()));
+            continue;
+        }
+        if let Some(seg) = layout.segment_index_at(i) {
+            slot.push(ParamPosition::InExpr(seg));
             continue;
         }
         if let Some((start, end)) = where_bounds {
@@ -1300,7 +1424,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_param_inside_insert_values_expression() {
+    fn accepts_param_inside_insert_values_expression() {
+        // Issue #1546: 式の内側の `$n` も構造上は受理する（型は推論段が決める）。
         for sql in [
             "INSERT INTO t (id, a) VALUES (1, upper($1)) USING OPERATION_ID 'op-1'",
             "INSERT INTO t (id, a) VALUES (1, round(1, $1)) USING OPERATION_ID 'op-1'",
@@ -1308,8 +1433,34 @@ mod tests {
             "INSERT INTO t (id, a) VALUES (1, 1 + $1) USING OPERATION_ID 'op-1'",
             "INSERT INTO t (id, a) VALUES (1, 1), (2, ($1)) USING OPERATION_ID 'op-1'",
         ] {
-            assert!(positions(sql).is_err(), "{sql}");
+            assert_eq!(positions(sql).unwrap(), 1, "{sql}");
         }
+    }
+
+    #[test]
+    fn insert_values_expression_segments_carry_the_ordinal() {
+        let tokens = lexer::tokenize_with_params(
+            "INSERT INTO t (id, a, b) VALUES ($1, 1 + $2, upper($3)), (2, $4, ($5)) USING OPERATION_ID 'op-1'",
+        )
+        .unwrap();
+        let segs = expr_param_segments(&tokens);
+        let targets: Vec<ExprTarget> = segs.iter().map(|s| s.target.clone()).collect();
+        assert_eq!(
+            targets,
+            vec![
+                ExprTarget::Insert(1),
+                ExprTarget::Insert(2),
+                ExprTarget::Insert(2)
+            ]
+        );
+        // `$1`・`$4` は要素単独（パターン 5）で式セグメントに載らない。
+        let pos = positions_of(
+            "INSERT INTO t (id, a, b) VALUES ($1, 1 + $2, upper($3)), (2, $4, ($5)) USING OPERATION_ID 'op-1'",
+        );
+        assert_eq!(pos[0], vec![ParamPosition::InsertValue(0)]);
+        assert_eq!(pos[1], vec![ParamPosition::InExpr(0)]);
+        assert_eq!(pos[3], vec![ParamPosition::InsertValue(1)]);
+        assert_eq!(pos[4], vec![ParamPosition::InExpr(2)]);
     }
 
     #[test]
@@ -1403,13 +1554,58 @@ mod tests {
     }
 
     #[test]
-    fn rejects_update_set_position_inside_expression() {
-        // 式の内側の `$n` は Issue #1546 の担当（従来どおり `42601`）。
-        assert!(positions("UPDATE documents SET n = n + $1 WHERE id = 1").is_err());
-        assert!(positions("UPDATE documents SET n = $1 + 1 WHERE id = 1").is_err());
-        assert!(positions("UPDATE documents SET n = ($1) WHERE id = 1").is_err());
-        assert!(positions("UPDATE documents SET lang = upper($1) WHERE id = 1").is_err());
-        assert!(positions("UPDATE documents SET n = f(x, b = $1) WHERE id = 1").is_err());
+    fn accepts_update_set_position_inside_expression() {
+        // Issue #1546: 式の内側の `$n` も構造上は受理する（型は推論段が決める）。
+        for sql in [
+            "UPDATE documents SET n = n + $1 WHERE id = 1",
+            "UPDATE documents SET n = $1 + 1 WHERE id = 1",
+            "UPDATE documents SET n = ($1) WHERE id = 1",
+            "UPDATE documents SET lang = upper($1) WHERE id = 1",
+            "UPDATE documents SET n = CASE WHEN m = $1 THEN 1 ELSE n END WHERE id = 1",
+            // WHERE の無い UPDATE の RETURNING／USING 句も節末として切り出す。
+            "UPDATE documents SET n = n + $1 RETURNING n",
+            "UPDATE documents SET n = n + $1 USING OPERATION_ID $2",
+        ] {
+            assert!(positions(sql).is_ok(), "{sql}");
+        }
+        assert_eq!(
+            positions("UPDATE documents SET n = n + $1 USING OPERATION_ID $2").unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn set_expression_segments_split_on_assignment_boundaries() {
+        // 右辺内の `=` では代入先の列が切り替わらず、深さ 0 の `,` で右辺が区切られる。
+        let tokens = lexer::tokenize_with_params(
+            "UPDATE documents SET n = CASE WHEN m = $1 THEN 1 ELSE 0 END, lang = upper($2), body = $3 RETURNING n",
+        )
+        .unwrap();
+        let segs = expr_param_segments(&tokens);
+        let targets: Vec<ExprTarget> = segs.iter().map(|s| s.target.clone()).collect();
+        assert_eq!(
+            targets,
+            vec![
+                ExprTarget::Set("n".to_string()),
+                ExprTarget::Set("lang".to_string())
+            ]
+        );
+        // `body = $3`（パターン 6）は式セグメントにならず、RETURNING 以降は範囲外。
+        let pos = positions_of(
+            "UPDATE documents SET n = CASE WHEN m = $1 THEN 1 ELSE 0 END, lang = upper($2), body = $3 RETURNING n",
+        );
+        assert_eq!(pos[2], vec![ParamPosition::SetColumn("body".to_string())]);
+    }
+
+    #[test]
+    fn still_rejects_expression_params_outside_set_and_values_regions() {
+        // ON CONFLICT ... DO UPDATE SET は別担当（`42601` のまま）。
+        assert!(positions(
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + $1 USING OPERATION_ID 'a'"
+        )
+        .is_err());
+        // RETURNING 以降の `$n` は SET 節の範囲外。
+        assert!(positions("UPDATE documents SET n = 1 RETURNING n + $1").is_err());
     }
 
     #[test]

@@ -92,7 +92,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 47;
+    count = 48;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -332,6 +332,13 @@ define_error_classes! {
     /// 必ず `OperationIdContentMismatch` より後に宣言する。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidParameterValue`] の写像。
     InvalidParameterValue => ("22023", "INVALID_PARAMETER_VALUE"),
+    /// 拡張クエリプロトコルの Parse で `$n` の型を文脈から決められない（`42P18`。
+    /// Issue #1546・SQL-45 期待欄 (6)・WIRE-12・ERR-6 のポインタ）。`UPDATE ... SET` 右辺・
+    /// `INSERT ... VALUES` 要素の式内に置いた `$n` が、演算の相手・代入先の列・関数引数の
+    /// いずれからも型を導けない場合に返す。構文の形だけで判定し、表・列の存在には依存しない
+    /// （存在オラクルを作らない）。[`crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype`]
+    /// の写像。
+    IndeterminateDatatype => ("42P18", "INDETERMINATE_DATATYPE"),
 }
 
 impl ErrorClass {

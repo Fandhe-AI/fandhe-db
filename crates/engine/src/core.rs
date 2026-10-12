@@ -72,6 +72,32 @@ use redb::ReadableDatabase;
 /// 共有するため `pub(crate)`（二重定義しない）。
 pub(crate) const MAX_SEARCH_K: usize = 10_000;
 
+/// `INSERT INTO <表> ( <列> {, <列>} ) VALUES` の表名と列リストをトークン列から読む
+/// （Issue #1546。`parse_sql_prepared` が構造検証 parse より前に型を引くために使う）。
+/// 形が崩れている場合は `None`（型は未解決＝`Text` へ倒れ、構文エラーは後続の parse が返す）。
+fn insert_target_from_tokens(tokens: &[crate::sql::lexer::Token]) -> Option<(String, Vec<String>)> {
+    use crate::sql::lexer::Token;
+    let is_word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+    if !is_word(tokens.first(), "INSERT") || !is_word(tokens.get(1), "INTO") {
+        return None;
+    }
+    let Some(Token::Ident(table) | Token::QuotedNull(table)) = tokens.get(2) else {
+        return None;
+    };
+    if !matches!(tokens.get(3), Some(Token::Punct('('))) {
+        return None;
+    }
+    let mut columns: Vec<String> = Vec::new();
+    for t in tokens.iter().skip(4) {
+        match t {
+            Token::Ident(c) | Token::QuotedNull(c) => columns.push(c.clone()),
+            Token::Punct(',') => {}
+            _ => break,
+        }
+    }
+    Some((table.clone(), columns))
+}
+
 /// トークン列のうち括弧深さ 0 で最初の `FROM` の添字を返す（Issue #1188）。`EXTRACT(field
 /// FROM src)` の括弧内 `FROM` をテーブル名の手掛かりと取り違えないための走査で、
 /// prepared statement のパラメータ型推論（`EngineCore::prepare_*`）が呼ぶ。
@@ -3878,26 +3904,33 @@ impl EngineCore {
         // 消えるため、置換後トークン列からは判定できない）。
         let order_by_distance_literal_is_param =
             crate::sql::params::order_by_distance_literal_is_param(&tokens);
-        // Issue #1342: 2 段 parse。文字列ダミーで構造検証・型推論（INSERT の列
-        // 対応付けに `dummy_parsed` が要る）を行い、推論型から置換リテラル種別を
-        // 導出する。数値・真偽値スロットがあれば型付きダミーで再 parse して
-        // `dummy_parsed` を差し替える。等価述語のダミーフラグは種別確定後に求める
-        // （非 String 種別は `WherePredicate::Equality` にならず序数に数えない）。
-        let string_dummy_parsed =
-            self.parse_tokens(crate::sql::params::substitute_dummy(&tokens))?;
-        let param_types = self.infer_param_types(&tokens, param_count, &string_dummy_parsed);
+        // Issue #1342・#1546: 型推論（カタログとトークン列だけで決まる）を先に行い、
+        // 確定した置換リテラル種別の型付きダミーで 1 回だけ構造検証 parse する。
+        // 式内 `$n`（`1 + $1` 等）は文字列ダミーでは定数畳み込み／束縛の型検査に落ちるため、
+        // 推論を parse より前に置く。推論不能（`42P18`）のときだけ、構文エラー（`42601`）を
+        // 先に返す（PostgreSQL と同じ優先順位）ため文字列ダミーで parse を試す。
+        let param_types = match self.infer_param_types(&tokens, param_count) {
+            Ok(types) => types,
+            Err(e @ crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype { .. }) => {
+                if let Err(syntax) =
+                    self.parse_tokens(crate::sql::params::substitute_dummy(&tokens))
+                {
+                    if syntax.wire_code() == "42601" {
+                        return Err(syntax);
+                    }
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         let kinds: Vec<crate::sql::params::ParamLiteralKind> =
             param_types.iter().map(|t| t.literal_kind()).collect();
+        // 等価述語のダミーフラグは種別確定後に求める（非 String 種別は
+        // `WherePredicate::Equality` にならず序数に数えない）。
         let where_equality_dummy_flags =
             crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds);
-        let dummy_parsed = if kinds
-            .iter()
-            .any(|k| *k != crate::sql::params::ParamLiteralKind::String)
-        {
-            self.parse_tokens(crate::sql::params::substitute_dummy_typed(&tokens, &kinds))?
-        } else {
-            string_dummy_parsed
-        };
+        let dummy_parsed =
+            self.parse_tokens(crate::sql::params::substitute_dummy_typed(&tokens, &kinds))?;
         Ok(PreparedSql {
             tokens,
             param_count,
@@ -3914,18 +3947,26 @@ impl EngineCore {
     /// 値の検証には影響しない）。同じ番号が複数位置に現れて食い違う場合は、
     /// 1 つでもベクトル位置があれば `VectorText`（バイナリ不可側へ倒す）、
     /// それ以外は `Text`。
+    ///
+    /// Issue #1546: `UPDATE ... SET` 右辺・`INSERT ... VALUES` 要素の式内 `$n` は
+    /// `sql::param_infer` が演算の相手・関数引数・兄弟枝から推論する。`INSERT` の
+    /// 表名・列リストは検証済み構文木ではなくトークン列から読む（推論を構造検証 parse の
+    /// 前に行うため）。型が決められない `$n`（全出現が推論不能）は
+    /// [`crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype`]（`42P18`）。
+    /// 判定は構文の形だけで決まり、表・列の存在には依存しない（存在オラクルを作らない）。
     fn infer_param_types(
         &self,
         tokens: &[crate::sql::lexer::Token],
         param_count: u16,
-        dummy_parsed: &ParsedSql,
-    ) -> Vec<crate::sql::params::PreparedParamType> {
+    ) -> Result<Vec<crate::sql::params::PreparedParamType>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        use crate::sql::allowlist::SqlSurfaceError;
         use crate::sql::exec::ColumnMeta;
         use crate::sql::lexer::Token;
-        use crate::sql::params::{ParamPosition, PreparedParamType};
+        use crate::sql::param_infer::ParamInference;
+        use crate::sql::params::{ExprTarget, ParamPosition, PreparedParamType};
 
-        // WHERE 等価位置の列を引くテーブル名（トークン列から。INSERT は
-        // 検証済みの `table_name` を使う）。
+        // WHERE 等価位置の列を引くテーブル名（トークン列から）。
         let where_table: Option<String> = match tokens.first() {
             Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UPDATE") => match tokens.get(1) {
                 Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
@@ -3938,6 +3979,9 @@ impl EngineCore {
                 _ => None,
             }),
         };
+        // `INSERT INTO <表> ( <列> {, <列>} ) VALUES`（構文は `Parser::parse_insert` が
+        // 保証する形。ここでは型の引き当てだけに使い、崩れていれば未解決として扱う）。
+        let insert_target: Option<(String, Vec<String>)> = insert_target_from_tokens(tokens);
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
             if column == "id" {
                 return Some(PreparedParamType::Column(ColumnMeta::Id));
@@ -3950,54 +3994,98 @@ impl EngineCore {
             }))
         };
 
-        crate::sql::params::infer_param_positions(tokens, param_count)
-            .into_iter()
-            .map(|positions| {
-                let mut resolved: Vec<PreparedParamType> = Vec::new();
-                for pos in &positions {
-                    let ty = match pos {
-                        ParamPosition::Vector => PreparedParamType::VectorText,
-                        ParamPosition::Text => PreparedParamType::Text,
-                        ParamPosition::WhereColumn(col) => where_table
-                            .as_deref()
-                            .and_then(|t| column_type(t, col))
-                            .unwrap_or(PreparedParamType::Text),
-                        ParamPosition::SetColumn(col) => where_table
-                            .as_deref()
-                            .and_then(|t| column_type(t, col))
-                            .unwrap_or(PreparedParamType::Text),
-                        ParamPosition::InsertValue(k) => match dummy_parsed {
-                            ParsedSql::Insert(ins) => ins
-                                .columns
-                                .get(*k)
-                                .and_then(|col| column_type(&ins.table_name, col))
-                                .unwrap_or(PreparedParamType::Text),
-                            _ => PreparedParamType::Text,
-                        },
-                    };
-                    resolved.push(ty);
+        // 式内 `$n`（パターン 7）の推論結果を、番号ごとに集める。
+        let segments = crate::sql::params::expr_param_segments(tokens);
+        let mut expr_results: Vec<Vec<ParamInference>> = vec![Vec::new(); usize::from(param_count)];
+        for seg in &segments {
+            let (table, root_col, for_set): (Option<&str>, Option<&str>, bool) = match &seg.target {
+                ExprTarget::Set(col) => (where_table.as_deref(), Some(col.as_str()), true),
+                ExprTarget::Insert(k) => (
+                    insert_target.as_ref().map(|(t, _)| t.as_str()),
+                    insert_target
+                        .as_ref()
+                        .and_then(|(_, cols)| cols.get(*k))
+                        .map(String::as_str),
+                    false,
+                ),
+            };
+            let root_type = table.zip(root_col).and_then(|(t, c)| column_type(t, c));
+            let lookup = |name: &str| table.and_then(|t| column_type(t, name));
+            for (n, inferred) in
+                crate::sql::param_infer::infer_segment(tokens, seg, for_set, root_type, &lookup)?
+            {
+                if let Some(slot) = usize::from(n)
+                    .checked_sub(1)
+                    .and_then(|k| expr_results.get_mut(k))
+                {
+                    slot.push(inferred);
                 }
-                match resolved.split_first() {
-                    None => PreparedParamType::Text,
-                    Some((first, rest)) => {
-                        // 同一種別（Integer／Float／Boolean）の数値・真偽値スロットは列名・
-                        // 型が異なっても統合する（`n = $1 AND m = $1` で Text へ
-                        // 後退させない。PR #1372 レビュー指摘）。
-                        let first_kind = first.literal_kind();
-                        if rest.iter().all(|t| t == first)
-                            || (first_kind != crate::sql::params::ParamLiteralKind::String
-                                && rest.iter().all(|t| t.literal_kind() == first_kind))
-                        {
-                            first.clone()
-                        } else if resolved.contains(&PreparedParamType::VectorText) {
-                            PreparedParamType::VectorText
-                        } else {
-                            PreparedParamType::Text
-                        }
+            }
+        }
+
+        let mut out: Vec<PreparedParamType> = Vec::with_capacity(usize::from(param_count));
+        for (idx, positions) in crate::sql::params::infer_param_positions(tokens, param_count)
+            .into_iter()
+            .enumerate()
+        {
+            let mut resolved: Vec<PreparedParamType> = Vec::new();
+            for pos in &positions {
+                let ty = match pos {
+                    ParamPosition::Vector => PreparedParamType::VectorText,
+                    ParamPosition::Text => PreparedParamType::Text,
+                    ParamPosition::WhereColumn(col) => where_table
+                        .as_deref()
+                        .and_then(|t| column_type(t, col))
+                        .unwrap_or(PreparedParamType::Text),
+                    ParamPosition::SetColumn(col) => where_table
+                        .as_deref()
+                        .and_then(|t| column_type(t, col))
+                        .unwrap_or(PreparedParamType::Text),
+                    ParamPosition::InsertValue(k) => insert_target
+                        .as_ref()
+                        .and_then(|(table, cols)| {
+                            cols.get(*k).and_then(|col| column_type(table, col))
+                        })
+                        .unwrap_or(PreparedParamType::Text),
+                    // 式内の出現は下で `expr_results` から合流させる。
+                    ParamPosition::InExpr(_) => continue,
+                };
+                resolved.push(ty);
+            }
+            // 式内の出現。推論不能の出現は無視し、全出現が推論不能のときだけ `42P18`。
+            let mut expr_indeterminate = false;
+            for inferred in expr_results.get(idx).map(Vec::as_slice).unwrap_or_default() {
+                match inferred {
+                    ParamInference::Known(t) => resolved.push(t.clone()),
+                    ParamInference::Unresolved => resolved.push(PreparedParamType::Text),
+                    ParamInference::Indeterminate => expr_indeterminate = true,
+                }
+            }
+            if resolved.is_empty() && expr_indeterminate {
+                let param = u16::try_from(idx.saturating_add(1)).unwrap_or(u16::MAX);
+                return Err(SqlSurfaceError::IndeterminateDatatype { param });
+            }
+            out.push(match resolved.split_first() {
+                None => PreparedParamType::Text,
+                Some((first, rest)) => {
+                    // 同一種別（Integer／Float／Boolean）の数値・真偽値スロットは列名・
+                    // 型が異なっても統合する（`n = $1 AND m = $1` で Text へ
+                    // 後退させない。PR #1372 レビュー指摘）。
+                    let first_kind = first.literal_kind();
+                    if rest.iter().all(|t| t == first)
+                        || (first_kind != crate::sql::params::ParamLiteralKind::String
+                            && rest.iter().all(|t| t.literal_kind() == first_kind))
+                    {
+                        first.clone()
+                    } else if resolved.contains(&PreparedParamType::VectorText) {
+                        PreparedParamType::VectorText
+                    } else {
+                        PreparedParamType::Text
                     }
                 }
-            })
-            .collect()
+            });
+        }
+        Ok(out)
     }
 
     /// Bind（拡張クエリプロトコルの 'B' 種別。Issue #935・WIRE-12・TASK-217）:
