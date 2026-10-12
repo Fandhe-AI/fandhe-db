@@ -238,7 +238,7 @@ fn alter_type_error_contract() {
         // 未登録 ENUM 型名。
         (
             "ALTER TABLE docs ALTER COLUMN note TYPE no_such_enum",
-            "42601",
+            "42704",
         ),
         // 予約名。
         ("ALTER TABLE docs ALTER COLUMN id TYPE TEXT", "42601"),
