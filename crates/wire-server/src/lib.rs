@@ -137,6 +137,7 @@ pub mod group_by_limits_opt;
 pub mod handshake;
 pub mod hnsw_scope_opt;
 pub mod http;
+pub mod join_limits_opt;
 pub mod limits;
 pub mod protocol_dispatch;
 pub(crate) mod response_buffer;
