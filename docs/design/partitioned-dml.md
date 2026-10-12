@@ -56,7 +56,7 @@
 - **writer の占有**: redb の writer はプロセス内で 1 つで、全テナントが共有する（`explicit-transaction.md` §1・
   `storage/writer_gate.rs`）。
   1 文の DML が writer を握る時間に上限はなく、全走査と適用が終わるまで他テナントの書き込みは
-  writer gate で待つ（待機上限 30 秒を超えると `55P03`。`explicit-transaction.md` §2・§5）。
+  writer gate で待つ（待機上限 30 秒（`--write-lock-wait-ms` で変更可）を超えると `55P03`。`explicit-transaction.md` §2・§5）。
 - **メモリ**: 現行の実行器は候補 id をすべて `Vec<u64>` に集めてから適用する。
 
 単一トランザクションの肥大化と writer の長時間占有を避けるため、原子性を持たない分割実行
