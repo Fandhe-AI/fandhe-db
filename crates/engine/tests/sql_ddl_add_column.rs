@@ -14,7 +14,7 @@
 //! `EngineCore::from_storage` は `Storage` の所有権を奪うため（テスト用の
 //! アクセサは存在しない）、列追加の成否は `catalog::Storage::get_table_schema`
 //! による直接検査ではなく、SQL 経由の観測可能な効果（列参照の成否・値の
-//! 往復・「未知の列」エラー〔`22000`〕の有無）で検証する。
+//! 往復・「未知の列」エラー〔`42703`〕の有無）で検証する。
 
 use engine::catalog::{ColumnDef, ColumnType};
 use engine::core::EngineCore;
@@ -123,12 +123,12 @@ fn count_star(core: &EngineCore, ctx: &PolicyContext, table: &str) -> u64 {
 }
 
 /// `column` が現在のスキーマに存在するかを、SQL 経由の「未知の列」エラー
-/// （`22000`）の有無で判定する（直接のスキーマ検査 API はテストから使えない
+/// （`42703`）の有無で判定する（直接のスキーマ検査 API はテストから使えない
 /// ため。モジュールドキュメント参照）。
 fn column_exists(core: &EngineCore, ctx: &PolicyContext, table: &str, column: &str) -> bool {
     match core.execute_sql(ctx, &format!("SELECT {column} FROM {table} LIMIT 1")) {
         Ok(_) => true,
-        Err(e) if e.wire_code() == "22000" => false,
+        Err(e) if e.wire_code() == "42703" => false,
         Err(e) => panic!("unexpected error while probing column {column:?}: {e}"),
     }
 }

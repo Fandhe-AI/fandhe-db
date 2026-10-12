@@ -715,7 +715,7 @@ fn using_plan_rejects_unknown_projection_column_before_invoking_query_planner() 
             "SELECT no_such_column FROM docs USING PLAN('find content') LIMIT 10",
         )
         .expect_err("unknown projected column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
     assert_eq!(
         planner.call_count(),
         0,
@@ -742,7 +742,7 @@ fn using_plan_rejects_unknown_where_column_before_invoking_query_planner() {
             "SELECT id FROM docs WHERE no_such_column = 'x' USING PLAN('find content') LIMIT 10",
         )
         .expect_err("unknown WHERE column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
     assert_eq!(
         planner.call_count(),
         0,

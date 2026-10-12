@@ -464,7 +464,7 @@ fn cte_aggregate_main_query_rejects_columns_hidden_by_the_cte() {
     ] {
         let err = query_err(&core, "alice", sql);
         assert!(
-            matches!(err, SqlSurfaceError::InvalidInput { .. }),
+            matches!(err, SqlSurfaceError::UndefinedColumn { .. }),
             "sql={sql} err={err:?}"
         );
     }

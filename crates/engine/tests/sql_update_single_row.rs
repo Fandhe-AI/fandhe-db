@@ -543,7 +543,7 @@ fn set_unknown_column_is_rejected_with_22000() {
             &format!("UPDATE {TABLE} SET ghost = 'x' WHERE id = 1 USING OPERATION_ID 'op-ghost'"),
         )
         .expect_err("unknown column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 }
 
 /// `SET id = ...` は疑似列の書き換えのため `42601`。

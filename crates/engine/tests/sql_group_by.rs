@@ -464,7 +464,7 @@ fn rejects_group_by_on_vector_column_and_unknown_column() {
     let err = core
         .execute_sql(&ctx, "SELECT ghost, COUNT(*) FROM docs GROUP BY ghost")
         .expect_err("GROUP BY on an unknown column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 }
 
 #[test]
@@ -1071,6 +1071,6 @@ fn ambiguous_output_name_in_having_and_order_by_is_42702() {
         "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang HAVING zz > 0",
     ] {
         let err = core.execute_sql(&ctx, sql).expect_err("unknown name");
-        assert_eq!(err.wire_code(), "22000", "sql={sql:?} err={err:?}");
+        assert_eq!(err.wire_code(), "42703", "sql={sql:?} err={err:?}");
     }
 }

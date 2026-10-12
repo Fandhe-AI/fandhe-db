@@ -457,7 +457,17 @@ fn sort_unknown_and_vector_columns_reject_with_22000() {
         );
         let resp = query_as_alice(addr, body.as_bytes());
         assert_eq!(resp.status, 400, "column={column} body={resp:?}");
-        assert_eq!(http_common::wire_code_of(&resp), "22000", "column={column}");
+        // 未知列は 42703、VECTOR 列（並べ替え不能な型）は 22000。
+        let expected = if column == "does_not_exist" {
+            "42703"
+        } else {
+            "22000"
+        };
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            expected,
+            "column={column}"
+        );
     }
 }
 

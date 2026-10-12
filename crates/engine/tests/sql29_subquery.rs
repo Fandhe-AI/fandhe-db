@@ -418,8 +418,7 @@ fn in_subquery_unknown_column_with_empty_inner_result_is_rejected() {
     );
     assert!(matches!(
         &err,
-        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
-            if detail.contains("unknown column")
+        engine::sql::allowlist::SqlSurfaceError::UndefinedColumn { .. }
     ));
 }
 
@@ -442,8 +441,7 @@ fn in_subquery_unknown_column_with_null_only_inner_result_is_rejected() {
     );
     assert!(matches!(
         &err,
-        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
-            if detail.contains("unknown column")
+        engine::sql::allowlist::SqlSurfaceError::UndefinedColumn { .. }
     ));
 }
 
@@ -965,8 +963,7 @@ fn exists_subquery_unknown_column_projection_is_rejected_without_visible_rows() 
     );
     assert!(matches!(
         &err,
-        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
-            if detail.contains("unknown column")
+        engine::sql::allowlist::SqlSurfaceError::UndefinedColumn { .. }
     ));
 }
 
@@ -989,8 +986,7 @@ fn exists_subquery_unknown_column_projection_is_rejected_with_visible_rows() {
     );
     assert!(matches!(
         &err,
-        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
-            if detail.contains("unknown column")
+        engine::sql::allowlist::SqlSurfaceError::UndefinedColumn { .. }
     ));
 }
 
@@ -1461,7 +1457,11 @@ fn not_in_subquery_static_validation_is_independent_of_row_count() {
     ] {
         let err = expect_error_code(&core, &ctx, &sql);
         assert!(
-            matches!(err, engine::sql::allowlist::SqlSurfaceError::InvalidInput { .. }),
+            matches!(
+                err,
+                engine::sql::allowlist::SqlSurfaceError::InvalidInput { .. }
+                    | engine::sql::allowlist::SqlSurfaceError::UndefinedColumn { .. }
+            ),
             "sql={sql} err={err:?}"
         );
     }

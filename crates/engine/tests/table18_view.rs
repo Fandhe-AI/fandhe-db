@@ -358,7 +358,7 @@ fn view_column_scope_rejects_unknown_column() {
 
     let err = scan(&core, "alice", "SELECT body FROM id_only LIMIT 10")
         .expect_err("body is not exposed by id_only");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 }
 
 /// ビュー越しの列スコープ検査は式項目（TASK-79・SQL-9 の `SelectItem::Expr`）が
@@ -389,7 +389,7 @@ fn view_column_scope_rejects_expr_item_referencing_hidden_column() {
         "SELECT vec_norm(embedding) FROM id_only LIMIT 10",
     )
     .expect_err("embedding is not exposed by id_only, even inside an expression item");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 }
 
 /// ビュー越しの列スコープ検査は式述語（`WherePredicate::Expression`）が隠れた
@@ -418,7 +418,7 @@ fn view_column_scope_rejects_expression_predicate_referencing_hidden_column() {
         "SELECT id FROM id_only WHERE vec_norm(embedding) > 0 LIMIT 10",
     )
     .expect_err("embedding is not exposed by id_only, even inside a WHERE expression predicate");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 }
 
 /// ネストしたビューの列スコープ検査（レビュー指摘対応）: 内側ビューが列を
@@ -453,10 +453,10 @@ fn nested_view_star_inherits_inner_column_restriction() {
     // へは到達できない。
     let err = scan(&core, "alice", "SELECT body FROM id_only_wrapped LIMIT 10")
         .expect_err("body must stay hidden through the outer * wrapper");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
     let err = scan(&core, "alice", "SELECT lang FROM id_only_wrapped LIMIT 10")
         .expect_err("lang must stay hidden through the outer * wrapper");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 
     // 内側ビューが公開する `id` は引き続き参照でき、結果は内側ビューを直接
     // 引いた場合と一致する。
@@ -498,7 +498,7 @@ fn nested_view_explicit_column_not_exposed_by_inner_is_rejected() {
 
     let err = scan(&core, "alice", "SELECT body FROM leaky LIMIT 10")
         .expect_err("body is not exposed by the inner view id_only");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 }
 
 /// ネストしたビューの列スコープ検査: 外側ビュー自身の `WHERE` 述語が内側
@@ -531,7 +531,7 @@ fn nested_view_where_predicate_not_exposed_by_inner_is_rejected() {
 
     let err = scan(&core, "alice", "SELECT id FROM probe LIMIT 10")
         .expect_err("probe's own WHERE references body, which id_only does not expose");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 }
 
 // --- 受入基準 3: ネスト深さ上限 ----------------------------------------------
@@ -985,7 +985,7 @@ fn aggregate_over_view_rejects_hidden_columns() {
         "SELECT DISTINCT body FROM v",
     ] {
         let err = scan(&core, "alice", sql).expect_err(sql);
-        assert_eq!(err.wire_code(), "22000", "sql={sql}");
+        assert_eq!(err.wire_code(), "42703", "sql={sql}");
     }
     // 公開列のみなら通る。
     scan(&core, "alice", "SELECT lang, COUNT(*) FROM v GROUP BY lang").expect("visible columns");
@@ -1148,7 +1148,7 @@ fn buffered_view_rejects_unsupported_outer_forms_and_chaining() {
         assert_eq!(err.wire_code(), "42601", "sql={sql}");
     }
     let err = scan(&core, "alice", "SELECT nope FROM top_ja LIMIT 5").expect_err("unknown col");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
     let err = scan(&core, "alice", "SELECT * FROM top_ja LIMIT 0").expect_err("limit 0");
     assert_eq!(err.wire_code(), "22000");
 
@@ -2015,7 +2015,7 @@ fn buffered_view_outer_order_by_is_stable_and_resolves_only_exposed_columns() {
         "SELECT * FROM ja_bodies WHERE nope = 'x' LIMIT 5",
         "SELECT * FROM ja_bodies ORDER BY nope LIMIT 5",
     ] {
-        assert_eq!(err_code(&core, "alice", sql), "22000", "sql={sql}");
+        assert_eq!(err_code(&core, "alice", sql), "42703", "sql={sql}");
     }
     // 結果列名が重複する本文（JOIN の `*`）では曖昧な名前は 42702。
     for sql in [

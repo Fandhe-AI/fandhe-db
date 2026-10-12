@@ -418,7 +418,7 @@ fn returning_with_unknown_column_fails_the_transaction_closed() {
     let code = tx.err_code(
         "UPDATE docs SET n = 99 WHERE id = 1 RETURNING no_such_col USING OPERATION_ID 'u1'",
     );
-    assert_eq!(code, "22000");
+    assert_eq!(code, "42703");
     assert_eq!(tx.status(), TransactionStatus::Failed);
     tx.ok("ROLLBACK");
     assert_eq!(
@@ -630,7 +630,7 @@ fn upsert_returning_fails_closed_and_fails_the_transaction() {
         "INSERT INTO docs (id, n, tag) VALUES (5, 50, 'x') \
          ON CONFLICT (id) DO NOTHING RETURNING nope USING OPERATION_ID 'u2'",
     );
-    assert_eq!(code, "22000");
+    assert_eq!(code, "42703");
     assert_eq!(tx.status(), TransactionStatus::Failed);
     tx.ok("ROLLBACK");
     assert_eq!(ids(&core, &ctx("alice"), "docs").len(), 3);

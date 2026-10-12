@@ -370,7 +370,7 @@ fn string_group_by_rejections_keep_wire_codes() {
     let (core, _guard) = new_core();
     let addr = spawn(Arc::clone(&core));
     for (extra, code) in [
-        (r#","group_by":"nope""#, "22000"),
+        (r#","group_by":"nope""#, "42703"),
         (r#","group_by":"embedding""#, "22000"),
         (r#","group_by":"""#, "42601"),
         (r#","group_by":"do cs""#, "42601"),
@@ -428,7 +428,7 @@ fn malformed_sort_is_rejected_without_echoing_input() {
         ),
         (
             r#","group_by":"lang","sort":[{"column":"secret_col","dir":"asc"}]"#.to_string(),
-            "22000",
+            "42703",
         ),
         (format!(r#","group_by":"lang","sort":[{key},{key}]"#), "200"),
         (format!(r#","group_by":"lang","sort":[{nine}]"#), "54000"),

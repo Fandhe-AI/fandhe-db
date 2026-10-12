@@ -305,7 +305,7 @@ fn explicit_columns_selection_and_validation() {
         br#"{"op":"scan","table":"docs","limit":10,"columns":["score"]}"#,
     );
     assert_eq!(score_resp.status, 400, "body={score_resp:?}");
-    assert_eq!(http_common::wire_code_of(&score_resp), "22000");
+    assert_eq!(http_common::wire_code_of(&score_resp), "42703");
 
     let empty_resp = query(
         addr,

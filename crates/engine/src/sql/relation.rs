@@ -236,9 +236,7 @@ impl<'a> BindingScope<'a> {
                     .ok_or_else(|| SqlSurfaceError::undefined_table(qualifier))?;
                 let (_, schema) = &self.relations[position];
                 self.resolve_in_relation(position, schema, column.name())
-                    .ok_or_else(|| {
-                        SqlSurfaceError::invalid_input(format!("unknown column: {}", column.name()))
-                    })
+                    .ok_or_else(|| SqlSurfaceError::undefined_column(column.name()))
             }
             None => {
                 let mut found: Option<ResolvedColumn> = None;
@@ -252,9 +250,7 @@ impl<'a> BindingScope<'a> {
                         found = Some(resolved);
                     }
                 }
-                found.ok_or_else(|| {
-                    SqlSurfaceError::invalid_input(format!("unknown column: {}", column.name()))
-                })
+                found.ok_or_else(|| SqlSurfaceError::undefined_column(column.name()))
             }
         }
     }
@@ -409,7 +405,7 @@ mod tests {
         let scope = BindingScope::new(vec![(TableRef::new("a"), &a)]).expect("scope");
 
         let err = scope.resolve(&ColumnRef::unqualified("nope")).unwrap_err();
-        assert_eq!(err.error_class().wire_code(), "22000");
+        assert_eq!(err.error_class().wire_code(), "42703");
     }
 
     #[test]

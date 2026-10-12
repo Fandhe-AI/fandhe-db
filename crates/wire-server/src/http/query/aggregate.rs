@@ -811,7 +811,7 @@ mod tests {
             r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"sum","column":"nope"}]}"#
         );
         let err = bind(&v, &schema(), &udfs()).expect_err("unknown column must be rejected");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -915,7 +915,7 @@ mod tests {
             assert_eq!(err.wire_code(), "42601", "gb={gb}");
         }
         let err = bind_json(&agg_json(r#","group_by":"nope""#)).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -1004,7 +1004,7 @@ mod tests {
             r#","group_by":"lang","sort":[{"column":"nope","dir":"asc"}]"#,
         ))
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
         // 既定名 `count` が複数一致する `sort` は曖昧（Issue #1270・42702）。
         let err = bind_json(
             r#"{"op":"aggregate","table":"docs",
@@ -1086,7 +1086,11 @@ mod tests {
             );
             let err = bind(&v, &schema(), &udfs())
                 .expect_err("unorderable second group_by column must be rejected");
-            assert_eq!(err.wire_code(), "22000", "column={column}");
+            assert_eq!(
+                err.wire_code(),
+                if column == "nope" { "42703" } else { "22000" },
+                "column={column}"
+            );
         }
     }
 
@@ -1239,7 +1243,11 @@ mod tests {
             );
             let err = bind(&v, &schema(), &udfs())
                 .expect_err("unorderable group_by column must be rejected");
-            assert_eq!(err.wire_code(), "22000", "column={column}");
+            assert_eq!(
+                err.wire_code(),
+                if column == "nope" { "42703" } else { "22000" },
+                "column={column}"
+            );
         }
     }
 

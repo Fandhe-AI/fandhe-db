@@ -258,7 +258,11 @@ fn group_by_rejects_unsupported_key_types_with_22000() {
                 &format!("SELECT {key}, COUNT(*) FROM {TABLE} GROUP BY {key}"),
             )
             .expect_err("unsupported key must be rejected");
-        assert_eq!(err.wire_code(), "22000", "{key}");
+        assert_eq!(
+            err.wire_code(),
+            if key == "nope" { "42703" } else { "22000" },
+            "{key}"
+        );
     }
 }
 

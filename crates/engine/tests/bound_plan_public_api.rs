@@ -967,7 +967,7 @@ fn with_order_by_rejects_unknown_column_and_vector_column_with_22000() {
     }];
     let err = bind_scan_via_with_order_by(&schema, &unknown_column, 5)
         .expect_err("unknown column should be rejected");
-    assert_eq!(err.wire_code(), "22000", "err={err:?}");
+    assert_eq!(err.wire_code(), "42703", "err={err:?}");
 
     // `embedding` は VECTOR 列（並べ替え不能。SQL-25 (a) と同じ判断）。
     let vector_column = [ScalarOrderKey {

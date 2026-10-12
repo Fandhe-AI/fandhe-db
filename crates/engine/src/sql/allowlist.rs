@@ -636,9 +636,10 @@ pub enum SqlSurfaceError {
     /// `DOUBLE` 単独も含む。ERR-6: `42704`）。`name` はクライアントが指定した綴りのみで、
     /// 既存の ENUM 型名・ラベル・テナント情報は含めない（fail-closed）。
     UndefinedType { name: String },
-    /// 索引 DDL が参照した列が対象テーブルに存在しない（TASK-206・INDEX-7、
-    /// Issue #908。[`crate::catalog::CatalogError::ColumnNotFound`] の写像。
-    /// ERR-6: `42703`）。
+    /// 索引 DDL が参照した列が対象テーブルに存在しない、または FROM ありの SELECT／DML が
+    /// 参照した列がスキーマに存在しない（TASK-206・INDEX-7、Issue #908、Issue #2332。
+    /// DDL 側は [`crate::catalog::CatalogError::ColumnNotFound`] の写像。ERR-6: `42703`）。
+    /// `name` はクライアントが指定した綴りのみ（他テナント・候補列名は含めない）。
     UndefinedColumn { name: String },
     /// `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が宣言する述語を、書き込もう
     /// とした行の値が満たさない。ERR-6: `23514`。
@@ -725,6 +726,15 @@ impl SqlSurfaceError {
     pub(crate) fn transaction_feature_not_supported(detail: impl Into<String>) -> Self {
         SqlSurfaceError::TransactionFeatureNotSupported {
             detail: truncate_for_error(&detail.into()),
+        }
+    }
+
+    /// 未定義列参照（`42703`）を作る共通コンストラクタ。parser・udf_call・declarative_filter・
+    /// view 等の列束縛箇所から呼ばれ、従来 `22000` で返していた未知列を ERR-2 の決定的分類へ揃える
+    /// （Issue #2332）。識別子は `truncate_for_error` で切り詰め、他の情報は加えない。
+    pub(crate) fn undefined_column(name: impl Into<String>) -> Self {
+        SqlSurfaceError::UndefinedColumn {
+            name: truncate_for_error(&name.into()),
         }
     }
 
@@ -20267,7 +20277,7 @@ mod tests {
             &lookup,
         )
         .expect_err("column outside CTE's exposed set must be rejected");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -20284,14 +20294,14 @@ mod tests {
             &lookup,
         )
         .expect_err("unreferenced CTE projecting a column outside its FROM's exposed set must be rejected");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
 
         let err = validate_sql(
             "WITH x AS (SELECT id FROM documents), unused AS (SELECT id FROM x WHERE body = 'y') SELECT * FROM documents LIMIT 10",
             &lookup,
         )
         .expect_err("unreferenced CTE filtering on a column outside its FROM's exposed set must be rejected");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     /// `table_columns` を実装するフェイク（PR #1100 追加レビュー指摘の
@@ -20335,14 +20345,14 @@ mod tests {
             &lookup,
         )
         .expect_err("unreferenced CTE projecting an unknown real table column must be rejected");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
 
         let err = validate_sql(
             "WITH unused AS (SELECT id FROM documents WHERE missing = 'y') SELECT id FROM documents LIMIT 1",
             &lookup,
         )
         .expect_err("unreferenced CTE filtering on an unknown real table column must be rejected");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
