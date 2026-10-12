@@ -88,6 +88,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-subquery-depth <1-4>] [--max-subquery-executions <1-16>] \
   [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] \
   [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
+  [--write-lock-wait-ms <100-60000>] \
   [--partitioned-dml-chunk-rows <1-1000000>] [--partitioned-dml-scan-budget <1-1000000>] \
   [--partitioned-dml-max-hold-ms <100-5000>] \
   [--partitioned-dml-max-jobs-per-tenant <1-64>] [--partitioned-dml-max-jobs <1-64>] \
@@ -353,6 +354,12 @@ CTE 連鎖の深さの上限を、プロセス全体に対して起動時に**�
 従来と同じ `54000` です（拡張プロトコルでは Describe は成功し Execute で拒否されます）。範囲外・非数値・値欠落・
 2 回目以降の重複指定は fail-closed で起動エラーです。上限を引き上げることはできません
 （詳細: [docs/design/join-limits-cli.md](docs/design/join-limits-cli.md)）。
+
+`--write-lock-wait-ms <N>`（既定 30,000・範囲 `100`〜`60,000` ミリ秒）（Issue #1554・SQL-46）は、書き込みロック
+（単一ライタ）の待機上限を、プロセス全体に対して起動時に設定します（未指定は現行の 30 秒で、挙動は変わりません）。
+超過時の SQLSTATE は従来と同じ `55P03` です。autocommit の書き込み・明示トランザクションの `BEGIN`・分割実行 DML の
+チャンクに効き、SQL 表層と NoSQL（HTTP）表層の両方が対象です。範囲外・非数値・値欠落・2 回目以降の重複指定は
+fail-closed で起動エラーです。環境変数は設けません（詳細: [docs/design/write-lock-wait-cli.md](docs/design/write-lock-wait-cli.md)）。
 
 `--auth-method`（Issue #940・WIRE-18・TASK-222）は SQL 表層の SASL 認証方式を
 選ぶ opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス

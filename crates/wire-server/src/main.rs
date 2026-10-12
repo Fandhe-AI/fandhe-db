@@ -150,6 +150,15 @@
 //! 一本化し、`EngineCore::with_join_limits` へ 1 回だけ注入する
 //! （`docs/design/join-limits-cli.md`）。
 //!
+//! `--write-lock-wait-ms`（Issue #1554。SQL-46）: 書き込みロック（単一ライタ）の待機上限を
+//! ミリ秒（`100`〜`60000`。既定 `30000`）で、プロセス全体に対して起動時に設定できる
+//! opt-in 注入点（未指定は現行の 30 秒と同値＝挙動不変）。超過は従来どおり `55P03`。
+//! autocommit 書き込み・明示トランザクションの `BEGIN`・分割実行 DML のチャンクに効く。
+//! 範囲外・非数値・値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::write_lock_wait_opt::resolve` に一本化し、
+//! `EngineCore::with_write_lock_wait` へ 1 回だけ注入する
+//! （`docs/design/write-lock-wait-cli.md`）。
+//!
 //! `--max-dml-affected-rows`／`--max-insert-rows`（Issue #997。オーナー判断の
 //! 改訂・2026-09-27。前回のオーナー判断を置き換え）: 述語形 `UPDATE`／
 //! `DELETE` の 1 文あたり影響行数上限・複数行 `VALUES` の 1 文あたり行数上限
@@ -358,6 +367,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_join_relations_raw: Option<String> = None;
     let mut max_join_input_rows_raw: Option<String> = None;
     let mut max_join_output_rows_raw: Option<String> = None;
+    let mut write_lock_wait_raw: Option<String> = None;
     let mut partitioned_chunk_rows_raw: Option<String> = None;
     let mut partitioned_scan_budget_raw: Option<String> = None;
     let mut partitioned_max_hold_ms_raw: Option<String> = None;
@@ -813,6 +823,26 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_cte_nesting_depth_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::write_lock_wait_opt::FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::write_lock_wait_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1554: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if write_lock_wait_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::write_lock_wait_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                write_lock_wait_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::join_limits_opt::MAX_JOIN_RELATIONS_FLAG => {
@@ -1363,6 +1393,17 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1554: 書き込みロック待機上限を bind・ユーザーストア読込より前に解決する
+    // （fail-closed）。未指定は `DEFAULT_WRITE_LOCK_WAIT`＝現行挙動。
+    let write_lock_wait =
+        match wire_server::write_lock_wait_opt::resolve(write_lock_wait_raw.as_deref()) {
+            Ok(wait) => wait,
+            Err(e) => {
+                engine::log_stderr!("wire-server: invalid write lock wait configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
     // Issue #1128・#1129: 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間・
     // 同時実行数・中断記録数の上限）を
     // bind・ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は
@@ -1773,6 +1814,9 @@ fn run_server(args: &[String]) -> ExitCode {
     core = core.with_nesting_limits(nesting_limits);
     // Issue #1551: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
     core = core.with_join_limits(join_limits);
+    // Issue #1554: 未指定でも常に呼ぶ（既定は `DEFAULT_WRITE_LOCK_WAIT` で、未注入と
+    // 挙動がビット同一）。
+    core = core.with_write_lock_wait(write_lock_wait);
     // Issue #1128: 未指定でも常に呼ぶ（既定は `PartitionedDmlLimits::default()`）。
     core = core.with_partitioned_dml_limits(partitioned_dml_limits);
     // Issue #1166: 未指定でも常に呼ぶ（`batch_limits` は既定・環境変数まで

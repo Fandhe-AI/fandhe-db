@@ -2249,13 +2249,27 @@ impl EngineCore {
     /// 返す（[`Self::with_batch_limits`] と同じ流儀。未呼び出しなら
     /// `TransactionLimits::default()`）。書き込みロック待ちの上限
     /// （`55P03` を返すまでの時間）は独立に `Storage::with_write_lock_wait` で
-    /// 設定する（`Storage` を構築する側の責務）。
+    /// 設定する（`Storage` 構築側、または [`Self::with_write_lock_wait`]）。
     pub fn with_transaction_limits(
         mut self,
         limits: crate::sql::transaction::TransactionLimits,
     ) -> Self {
         self.transaction_limits = limits;
         self
+    }
+
+    /// 書き込みロック待機上限（超過は `55P03`）を差し替えたビルダーを返す（Issue #1554・
+    /// SQL-46 ポインタ）。`wire-server` の起動時 CLI `--write-lock-wait-ms` からプロセス
+    /// 全体で 1 回だけ設定する契約。範囲検証は `storage::validate_write_lock_wait_ms`。
+    /// セッション・テナント単位で差し替える経路は設けない。
+    pub fn with_write_lock_wait(mut self, wait: std::time::Duration) -> Self {
+        self.storage.set_write_lock_wait(wait);
+        self
+    }
+
+    /// 現在の書き込みロック待機上限（読み取り専用。`Storage` は外へ出さない）。
+    pub fn write_lock_wait(&self) -> std::time::Duration {
+        self.storage.write_lock_wait()
     }
 
     /// 述語形 UPDATE/DELETE の 1 文あたり影響行数上限・複数行 `VALUES` の

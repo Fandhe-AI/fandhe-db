@@ -202,6 +202,8 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
   - `Failed`・`Idle` はライタを保持しないため切り詰めない。
 - `lock_wait`（他セッションが writer gate を待つ上限）: **30 秒**
   （`Storage::DEFAULT_WRITE_LOCK_WAIT`。既存 `READ_TIMEOUT` と同じ値）。
+  起動時 CLI `--write-lock-wait-ms`（`100`〜`60000` ms）で変更できる（Issue #1554。
+  [write-lock-wait-cli.md](write-lock-wait-cli.md)）。
   超過時は `55P03`。
 
 ### 6. トランザクション内の読み取り（未 commit 変更の反映。Issue #1179）
