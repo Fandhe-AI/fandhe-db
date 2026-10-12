@@ -1365,17 +1365,24 @@ self_test() {
 
 real_check() {
   local build_target_dir="${TARGET_DIR}"
-  local deps_dir="${build_target_dir}/release/deps"
+  # `.s` の出力先は cargo のバージョンで異なる（stable は `release/deps/`、
+  # cargo 1.100 beta 以降は build-dir レイアウトの `release/build/<pkg>/<hash>/out/`）。
+  # どちらでも拾えるよう profile ディレクトリ全体を探索範囲にする。
+  local profile_dir="${build_target_dir}/release"
   local cargo_target_flag=()
   local host
   host="$(rustc -vV | sed -n 's/^host: //p')"
   if [ "${TARGET}" != "${host}" ]; then
     cargo_target_flag=(--target "${TARGET}")
-    deps_dir="${build_target_dir}/${TARGET}/release/deps"
+    profile_dir="${build_target_dir}/${TARGET}/release"
   fi
 
   mkdir -p "${build_target_dir}"
-  rm -f "${deps_dir}"/engine-*.s
+  # 旧レイアウト・新レイアウトのどちらに残留した `.s` も削除し、
+  # 後段の「ちょうど 1 個」判定が過去ビルドの残骸で崩れないようにする。
+  if [ -d "${profile_dir}" ]; then
+    find "${profile_dir}" -type f -name 'engine-*.s' -delete
+  fi
 
   # `.s` を削除しても、cargo のフィンガープリントが「最新」と判断すれば
   # rustc は再起動されず `.s` が再生成されない（F2）。`cargo clean -p fandhe-db-engine`
@@ -1391,11 +1398,11 @@ real_check() {
   fi
 
   local matches
-  matches="$(find "${deps_dir}" -maxdepth 1 -name 'engine-*.s' 2>/dev/null)"
+  matches="$(find "${profile_dir}" -type f -name 'engine-*.s' 2>/dev/null)"
   local count
   count="$(echo "${matches}" | grep -c . || true)"
   if [ -z "${matches}" ] || [ "${count}" -ne 1 ]; then
-    echo "ERROR: expected exactly one engine-*.s under ${deps_dir}, found ${count}" >&2
+    echo "ERROR: expected exactly one engine-*.s under ${profile_dir}, found ${count}" >&2
     return 1
   fi
 
