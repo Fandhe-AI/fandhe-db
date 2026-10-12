@@ -85,6 +85,13 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--batch-max-files <1-1000000>] \
   [--max-table-columns <1-256>] [--max-array-elements <1-1024>] [--max-enum-labels <1-256>] \
   [--max-scanned-rows <1-1000000>] \
+  [--max-group-by-columns <1-8>] [--max-groups <1-10000>] \
+  [--max-subquery-depth <1-4>] [--max-subquery-executions <1-16>] \
+  [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] \
+  [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
+  [--max-result-rows <1-100000>] \
+  [--write-lock-wait-ms <100-60000>] \
+  [--max-transaction-duration-ms <100-60000>] [--max-transaction-statements <1-10000>] \
   [--partitioned-dml-chunk-rows <1-1000000>] [--partitioned-dml-scan-budget <1-1000000>] \
   [--partitioned-dml-max-hold-ms <100-5000>] \
   [--partitioned-dml-max-jobs-per-tenant <1-64>] [--partitioned-dml-max-jobs <1-64>] \
@@ -332,6 +339,56 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 副作用を残しません。分割実行 DML の `--partitioned-dml-scan-budget` とは連動しません（組合せでも起動は
 拒否しません）。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです。上限を
 引き上げることはできません（詳細: [docs/design/scan-limits-cli.md](docs/design/scan-limits-cli.md)）。
+
+`--max-group-by-columns <N>`（既定 8・範囲 `1`〜`8`）・`--max-groups <N>`（既定 10,000・範囲 `1`〜`10,000`）
+（Issue #1550・SQL-46）は、`GROUP BY` のキー列数と 1 クエリが生成できるグループ数の上限を、プロセス全体に
+対して起動時に**下げる方向だけ**設定します（未指定は現行のハード上限と同じ値で、挙動は変わりません）。
+設定値は集計の実行段（単一表・`SELECT DISTINCT`・集合演算の集計枝・ビュー・JOIN の集計・`DECLARE CURSOR` の
+内側）に効き、超過時の SQLSTATE は従来と同じ `54000` です。集計の `LIMIT` の範囲とウィンドウ関数の
+パーティション上限はハード上限のままです。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で
+起動エラーです。上限を引き上げることはできません
+（詳細: [docs/design/group-by-limits-cli.md](docs/design/group-by-limits-cli.md)）。
+
+`--max-subquery-depth <N>`（既定 4・範囲 `1`〜`4`）・`--max-subquery-executions <N>`（既定 16・範囲 `1`〜`16`）・
+`--max-cte-definitions <N>`（既定 16・範囲 `1`〜`16`）・`--max-cte-nesting-depth <N>`（既定 4・範囲 `1`〜`4`）
+（Issue #1552・SQL-46）は、サブクエリの入れ子深さ・1 文あたりの内側サブクエリ実行回数・CTE 定義数・
+CTE 連鎖の深さの上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は現行のハード上限と
+同じ値で、挙動は変わりません）。設定値は構文解析段とサブクエリ解決段に効き、超過時の SQLSTATE は従来と
+同じ `54000` です。保存済みビュー本文の再検証はハード上限のままなので、上限を下げて再起動しても既存ビューは
+参照できます。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです。上限を引き上げる
+ことはできません（詳細: [docs/design/nesting-limits-cli.md](docs/design/nesting-limits-cli.md)）。
+
+`--max-join-relations <N>`（既定 8・範囲 `2`〜`8`）・`--max-join-input-rows <N>`（既定 100,000・範囲 `1`〜`100,000`）・
+`--max-join-output-rows <N>`（既定 100,000・範囲 `1`〜`100,000`）（Issue #1551・SQL-46）は、JOIN のリレーション数・
+1 辺の可視入力行数・結合の出力行数の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します
+（未指定は現行のハード上限と同じ値で、挙動は変わりません）。設定値は JOIN の実行段にだけ効き、超過時の SQLSTATE は
+従来と同じ `54000` です（拡張プロトコルでは Describe は成功し Execute で拒否されます）。範囲外・非数値・値欠落・
+2 回目以降の重複指定は fail-closed で起動エラーです。上限を引き上げることはできません
+（詳細: [docs/design/join-limits-cli.md](docs/design/join-limits-cli.md)）。
+
+`--max-result-rows <N>`（既定 10,000・範囲 `1`〜`100,000`）（Issue #1555・SQL-34／SQL-46）は、明示 `LIMIT` の
+範囲上限（従来のコンパイル時定数 10,000）を、プロセス全体に対して起動時に**上げ下げ両方向**へ設定します
+（未指定は従来の 10,000 と同じ値で、挙動は変わりません）。設定値は走査・kNN の `LIMIT k`・`FETCH n`・集合演算全体と
+JOIN 文の `LIMIT`・NoSQL の `limit` の範囲判定にだけ効き、超過時の SQLSTATE は従来と同じ `22000` です。
+`OFFSET` の範囲や集合演算の枝行数・サブクエリ内側行数などの他の上限とは連動しません。範囲外・非数値・値欠落・
+2 回目以降の重複指定は fail-closed で起動エラーです。`LIMIT` 省略時の結果行数上限（`54000`）が導入される際は、
+同じフラグを共有します（詳細: [docs/design/result-limits-cli.md](docs/design/result-limits-cli.md)）。
+
+`--write-lock-wait-ms <N>`（既定 30,000・範囲 `100`〜`60,000` ミリ秒）（Issue #1554・SQL-46）は、書き込みロック
+（単一ライタ）の待機上限を、プロセス全体に対して起動時に設定します（未指定は現行の 30 秒で、挙動は変わりません）。
+超過時の SQLSTATE は従来と同じ `55P03` です。autocommit の書き込み・明示トランザクションの `BEGIN`・分割実行 DML の
+チャンクに効き、SQL 表層と NoSQL（HTTP）表層の両方が対象です。範囲外・非数値・値欠落・2 回目以降の重複指定は
+fail-closed で起動エラーです。環境変数は設けません（詳細: [docs/design/write-lock-wait-cli.md](docs/design/write-lock-wait-cli.md)）。
+
+`--max-transaction-duration-ms <N>`（既定 20000・範囲 `100`〜`60000` ミリ秒）・`--max-transaction-statements <N>`
+（既定 1,000・範囲 `1`〜`10,000`）（Issue #1553・SQL-46）は、トランザクションの最大持続時間と最大文数を、
+プロセス全体に対して起動時に設定します（未指定は現行の既定値で、挙動は変わりません。兄弟フラグと違い既定の
+上下どちらへも設定できますが、ハード上限〔60 秒・10,000 文〕は超えられません）。設定値は明示トランザクションと
+暗黙トランザクション（`BEGIN` を含まない複数文メッセージ）の両方に効き、超過時の SQLSTATE は従来と同じ
+`54000` です。持続時間を 30 秒より長く明示指定すると、書き込みロック待ち上限（30 秒）を超えるため、長い
+トランザクションが書き手を握っている間にほかのセッションの書き込みが `55P03` を受け得る旨の `WARNING` 行を
+起動ログに出します。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです
+（詳細: [docs/design/transaction-limits-cli.md](docs/design/transaction-limits-cli.md)）。
 
 `--auth-method`（Issue #940・WIRE-18・TASK-222）は SQL 表層の SASL 認証方式を
 選ぶ opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス

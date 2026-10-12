@@ -143,8 +143,9 @@ fn arithmetic_and_date_expressions_evaluate() {
     let _g = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     let r = run(&core, &ctx, "SELECT 1+1");
-    assert_eq!(col(&r, 0).1, Some(&ColumnType::Double));
-    assert_eq!(single_cell(&r), &Cell::Float(2.0));
+    // Issue #1539・SQL-42: 整数リテラル同士の算術は PostgreSQL と同じ int4。
+    assert_eq!(col(&r, 0).1, Some(&ColumnType::Integer));
+    assert_eq!(single_cell(&r), &Cell::SignedInteger(2));
     let d = run(&core, &ctx, "SELECT DATE '2024-01-02'");
     assert_eq!(col(&d, 0).1, Some(&ColumnType::Date));
     assert!(matches!(single_cell(&d), Cell::Date(_)));
@@ -153,6 +154,27 @@ fn arithmetic_and_date_expressions_evaluate() {
         run(&core, &ctx, "SELECT 1+1"),
         run(&core, &ctx, "SELECT 1+1")
     );
+}
+
+#[test]
+fn integer_arithmetic_follows_postgres_types_and_errors() {
+    let (core, path) = core_with_table("sql43-intarith", false);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    // 整数除算は 0 方向への切り捨て（int4）。
+    let r = run(&core, &ctx, "SELECT 7/2");
+    assert_eq!(col(&r, 0).1, Some(&ColumnType::Integer));
+    assert_eq!(single_cell(&r), &Cell::SignedInteger(3));
+    let r = run(&core, &ctx, "SELECT (7/2)*2");
+    assert_eq!(single_cell(&r), &Cell::SignedInteger(6));
+    // int4 を超える結果は bigint ではなく 22003（PostgreSQL と同じ）。
+    let e = core
+        .execute_sql_in_session(&ctx, &mut SessionState::default(), "SELECT 2147483647+1")
+        .expect_err("int4 overflow must be rejected");
+    assert_eq!(e.wire_code(), "22003");
+    // 小数リテラルが混ざる算術は従来どおり double precision。
+    let r = run(&core, &ctx, "SELECT 1+1.5");
+    assert_eq!(col(&r, 0).1, Some(&ColumnType::Double));
 }
 
 #[test]

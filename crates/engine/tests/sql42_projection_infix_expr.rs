@@ -56,6 +56,19 @@ fn floats(r: &QueryResult, idx: usize) -> Vec<f64> {
         .collect()
 }
 
+/// `id` 昇順で `idx` 番目のセルを整数として集める（Issue #1539: 整数算術の結果は
+/// `Cell::SignedInteger`）。
+fn ints(r: &QueryResult, idx: usize) -> Vec<i64> {
+    let mut rows: Vec<_> = r.rows.iter().collect();
+    rows.sort_by_key(|row| row.id);
+    rows.iter()
+        .map(|row| match &row.cells[idx] {
+            Cell::SignedInteger(i) => *i,
+            other => panic!("expected SignedInteger, got {other:?}"),
+        })
+        .collect()
+}
+
 fn setup() -> (EngineCore, PolicyContext, CleanupGuard) {
     let path = unique_db_path("sql42-projection-infix");
     let storage = Storage::open(&path).expect("open storage");
@@ -96,21 +109,21 @@ fn setup() -> (EngineCore, PolicyContext, CleanupGuard) {
 fn accepts_top_level_arithmetic() {
     let (core, ctx, _g) = setup();
     let r = run(&core, &ctx, "SELECT n+1 AS m FROM t LIMIT 10");
-    assert_eq!(floats(&r, 0), vec![2.0, 3.0, 4.0]);
+    assert_eq!(ints(&r, 0), vec![2, 3, 4]);
     let r = run(&core, &ctx, "SELECT (n+1)*2 AS m FROM t LIMIT 10");
-    assert_eq!(floats(&r, 0), vec![4.0, 6.0, 8.0]);
+    assert_eq!(ints(&r, 0), vec![4, 6, 8]);
     let r = run(&core, &ctx, "SELECT -n AS m FROM t LIMIT 10");
-    assert_eq!(floats(&r, 0), vec![-1.0, -2.0, -3.0]);
+    assert_eq!(ints(&r, 0), vec![-1, -2, -3]);
     let r = run(&core, &ctx, "SELECT -n*2 AS m FROM t LIMIT 10");
-    assert_eq!(floats(&r, 0), vec![-2.0, -4.0, -6.0]);
+    assert_eq!(ints(&r, 0), vec![-2, -4, -6]);
     let r = run(&core, &ctx, "SELECT abs(n)+1 AS m FROM t LIMIT 10");
     assert_eq!(floats(&r, 0), vec![2.0, 3.0, 4.0]);
     let r = run(&core, &ctx, "SELECT id * 2 AS m FROM t LIMIT 10");
     assert_eq!(floats(&r, 0), vec![2.0, 4.0, 6.0]);
     let r = run(&core, &ctx, "SELECT t.n + 1 AS m FROM t LIMIT 10");
-    assert_eq!(floats(&r, 0), vec![2.0, 3.0, 4.0]);
+    assert_eq!(ints(&r, 0), vec![2, 3, 4]);
     let r = run(&core, &ctx, "SELECT id, n+1 AS m FROM t LIMIT 10");
-    assert_eq!(floats(&r, 1), vec![2.0, 3.0, 4.0]);
+    assert_eq!(ints(&r, 1), vec![2, 3, 4]);
 }
 
 #[test]
@@ -121,9 +134,9 @@ fn accepts_in_search_select() {
         &ctx,
         "SELECT n+1 AS m FROM t ORDER BY embedding <=> '[0.1,0.1]' LIMIT 10",
     );
-    let mut v = floats(&r, 0);
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    assert_eq!(v, vec![2.0, 3.0, 4.0]);
+    let mut v = ints(&r, 0);
+    v.sort_unstable();
+    assert_eq!(v, vec![2, 3, 4]);
 }
 
 #[test]
@@ -161,7 +174,6 @@ fn rejects_runtime_and_type_errors() {
 fn unsupported_forms_stay_rejected() {
     let (core, ctx, _g) = setup();
     for sql in [
-        "SELECT (n) AS x FROM t LIMIT 10",
         "SELECT n % 2 FROM t LIMIT 10",
         "SELECT 'a' + n FROM t LIMIT 10",
         "SELECT n + FROM t LIMIT 10",
@@ -186,6 +198,6 @@ fn unsupported_forms_stay_rejected() {
 fn tenant_boundary_holds() {
     let (core, ctx, _g) = setup();
     let r = run(&core, &ctx, "SELECT n+1 AS m FROM t LIMIT 10");
-    assert!(floats(&r, 0).iter().all(|v| *v < 100.0));
+    assert!(ints(&r, 0).iter().all(|v| *v < 100));
     assert_eq!(r.rows.len(), 3);
 }

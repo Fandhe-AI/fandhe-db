@@ -116,8 +116,9 @@ impl BinaryFormatError {
     /// 意図的な拒否として `0A000`（`FeatureNotSupported`）に写像する。
     ///
     /// PostgreSQL 本体は不正な format code 値を `22023` で返すが、本リポの
-    /// `ErrorClass::OperationIdContentMismatch` は `22023` を専有しており
-    /// 意味が異なるため、`ErrorClass` を増やさず本モジュールの fail-closed
+    /// `22023` は ERR-3 の `ErrorClass::OperationIdContentMismatch` と型名引数範囲外の
+    /// `ErrorClass::InvalidParameterValue`（Issue #2304）が用いており、format code
+    /// 不正とは意味が異なるため、本モジュールの fail-closed
     /// 方針（構文違反は `08P01`）に寄せる（設計判断の詳細は
     /// `docs/design/wire-binary-format.md` 参照）。
     pub const fn error_class(self) -> ErrorClass {
@@ -485,6 +486,8 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
         ColumnMeta::Scalar { ty, .. } => scalar_type_binary_support(ty),
         ColumnMeta::Computed { ty: Some(ty), .. } => scalar_type_binary_support(ty),
         ColumnMeta::Computed { ty: None, .. } => false,
+        // 別名付き `id` は numeric 公告（バイナリ非対応。`Id` と同じ）。
+        ColumnMeta::AliasedId { .. } => column_wire_type(meta).supports_binary(),
     }
 }
 
@@ -529,7 +532,7 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
 #[deny(clippy::wildcard_enum_match_arm)]
 pub(crate) fn column_wire_type(meta: &ColumnMeta) -> WireType {
     match meta {
-        ColumnMeta::Id => WireType::Numeric, // u64 全域を表現するため int8 ではなく numeric
+        ColumnMeta::Id | ColumnMeta::AliasedId { .. } => WireType::Numeric, // u64 全域を表現するため int8 ではなく numeric
         ColumnMeta::Scalar { ty, .. } => scalar_wire_type(ty),
         // Issue #1173: 集計結果・式列は束縛時に確定した静的型の写像を共有する
         // （`Scalar` と同じ OID）。静的型を持たない列（ベクトル式）は `text`。
@@ -581,7 +584,7 @@ pub(crate) fn column_name(meta: &ColumnMeta) -> &str {
     match meta {
         ColumnMeta::Id => "id",
         ColumnMeta::Scalar { name, .. } => name.as_str(),
-        ColumnMeta::Computed { name, .. } => name.as_str(),
+        ColumnMeta::Computed { name, .. } | ColumnMeta::AliasedId { name } => name.as_str(),
     }
 }
 

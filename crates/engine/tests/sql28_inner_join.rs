@@ -278,7 +278,9 @@ fn col_name(m: &engine::sql::exec::ColumnMeta) -> String {
     use engine::sql::exec::ColumnMeta;
     match m {
         ColumnMeta::Id => "id".to_string(),
-        ColumnMeta::Scalar { name, .. } | ColumnMeta::Computed { name, .. } => name.clone(),
+        ColumnMeta::Scalar { name, .. }
+        | ColumnMeta::Computed { name, .. }
+        | ColumnMeta::AliasedId { name } => name.clone(),
     }
 }
 

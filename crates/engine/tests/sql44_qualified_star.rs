@@ -190,10 +190,12 @@ fn sql44_qualified_id_pseudo_column_matches_plain() {
         "SELECT x.id FROM docs x LIMIT 5",
         "SELECT id FROM docs LIMIT 5",
     );
-    // AS 別名は #1537／#1540 の担当。受理された後は assert_same へ切り替える。
-    assert_eq!(
-        code(&core, &ctx, "SELECT x.id AS i FROM docs x LIMIT 5"),
-        code(&core, &ctx, "SELECT id AS i FROM docs LIMIT 5")
+    // Issue #1540（SQL-42）: 疑似列 `id` への AS 別名は修飾の有無で同じ結果になる。
+    assert_same(
+        &core,
+        &ctx,
+        "SELECT x.id AS i FROM docs x LIMIT 5",
+        "SELECT id AS i FROM docs LIMIT 5",
     );
 }
 

@@ -406,6 +406,23 @@ pub(crate) fn check_aggregate_columns_within_view(
                         .unwrap_or_else(|| agg.func.default_alias().to_string()),
                 );
             }
+            // Issue #1541: 集計式項目は、式中の集計呼び出しの引数と集計の外の裸識別子の
+            // 双方を公開列に限定する（非公開列を式経由で参照させない）。
+            AggregateSelectItem::Expr {
+                expr, aggregates, ..
+            } => {
+                for agg in aggregates {
+                    if let AggregateArg::Expr(e) = &agg.arg {
+                        expr_columns_within(columns, e)?;
+                    }
+                }
+                for c in crate::sql::allowlist::expr_bare_idents(expr) {
+                    if !columns.iter().any(|vc| vc == &c) {
+                        return Err(unknown(&c));
+                    }
+                }
+                effective_names.push(item.effective_name());
+            }
         }
     }
     if let Some(gb) = group_by {

@@ -435,7 +435,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 46);
+const _: () = assert!(ErrorClass::ALL.len() == 47);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -443,11 +443,16 @@ const _: () = assert!(ErrorClass::ALL.len() == 46);
 /// 「`wire_code` からの厳密往復」を免除する（`EXPECTED_STATUS` は wire_code
 /// 単位の一意テーブルのままで、共有側は同じステータスのためテーブル自体は
 /// 増やさない）。
-const SHARED_WIRE_CODE_CLASSES: [(ErrorClass, ErrorClass); 2] = [
+const SHARED_WIRE_CODE_CLASSES: [(ErrorClass, ErrorClass); 3] = [
     (ErrorClass::NotNullViolation, ErrorClass::MissingOperationId),
     (
         ErrorClass::DuplicateOperationId,
         ErrorClass::UniqueViolation,
+    ),
+    // `22023`（Issue #2304）。逆引きは ERR-3 の分類へ固定される。
+    (
+        ErrorClass::InvalidParameterValue,
+        ErrorClass::OperationIdContentMismatch,
     ),
 ];
 
