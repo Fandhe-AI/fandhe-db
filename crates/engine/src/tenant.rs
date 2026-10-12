@@ -3839,6 +3839,10 @@ fn enumerate_dml_candidates<E>(
     max_scanned_rows: usize,
     predicate: &mut impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<Vec<u64>, PredicateDmlError<E>> {
+    // 書き込み経路でも読み取り経路（`visible_rows_with_scan_limit`）と同じく
+    // `ScanLimits` で飽和させる（fail-closed）。`usize::MAX` 等が直接渡されても
+    // `saturating_add` の飽和で上限が効かなくなる迂回を防ぐ（Issue #1549）。
+    let max_scanned_rows = crate::scan_limits::ScanLimits::new(max_scanned_rows).max_scanned_rows();
     let mut candidate_ids: Vec<u64> = Vec::new();
     let mut embedding_scratch: Vec<f32> = Vec::new();
     // 総走査行数（対象テナント所有行のみを対象に加算する）。`visible_rows` の
@@ -4686,6 +4690,8 @@ pub(crate) fn replace_typed_rows_by_text_key(
         ledger_write,
         max_scanned_rows,
     } = req;
+    // 置換前走査の上限も `ScanLimits` で飽和させる（`usize::MAX` による迂回防止）。
+    let max_scanned_rows = crate::scan_limits::ScanLimits::new(max_scanned_rows).max_scanned_rows();
     validate_identifier(table)?;
     target.with_txn(|write_txn| {
         // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。クロージャ内で
