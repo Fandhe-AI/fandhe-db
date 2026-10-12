@@ -636,6 +636,10 @@ pub enum SqlSurfaceError {
     /// Issue #908。[`crate::catalog::CatalogError::ColumnNotFound`] の写像。
     /// ERR-6: `42703`）。
     UndefinedColumn { name: String },
+    /// `FROM` なし `SELECT` の列参照（SQL-43・Issue #2328。`const_select` の束縛段が
+    /// 返す）。ERR-6: `42703`。`FROM` なしでは参照可能な表が無く全識別子が一律に
+    /// 未定義のため存在情報を示さないが、識別子名は応答へ含めない固定文言とする。
+    ColumnReferenceWithoutFrom,
     /// `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が宣言する述語を、書き込もう
     /// とした行の値が満たさない。ERR-6: `23514`。
     /// [`crate::tenant::TenantWriteError::CheckViolation`] の写像。制約名のみを
@@ -1007,7 +1011,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::NotNullViolation { .. } => ErrorClass::NotNullViolation,
             SqlSurfaceError::UniqueViolation => ErrorClass::UniqueViolation,
             SqlSurfaceError::UndefinedObject { .. } => ErrorClass::UndefinedObject,
-            SqlSurfaceError::UndefinedColumn { .. } => ErrorClass::UndefinedColumn,
+            SqlSurfaceError::UndefinedColumn { .. }
+            | SqlSurfaceError::ColumnReferenceWithoutFrom => ErrorClass::UndefinedColumn,
             SqlSurfaceError::CheckViolation { .. } => ErrorClass::CheckViolation,
             SqlSurfaceError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             SqlSurfaceError::InvalidForeignKey { .. } => ErrorClass::InvalidForeignKey,
@@ -1192,6 +1197,13 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::UndefinedColumn { name } => {
                 write!(f, "column does not exist: {name}")
+            }
+            // 識別子名を補間しない固定文言（Issue #2328）。
+            SqlSurfaceError::ColumnReferenceWithoutFrom => {
+                write!(
+                    f,
+                    "column references are not allowed in a SELECT without FROM"
+                )
             }
             // 制約名のみを含む固定文言（行の値・id・テナントは含めない。
             // security.md P0。`TenantWriteError::CheckViolation` と同じ文言）。

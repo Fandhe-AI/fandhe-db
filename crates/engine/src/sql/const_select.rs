@@ -8,8 +8,9 @@
 //! （#1532）の担当。
 //!
 //! テーブル・ストレージ・RLS 述語のいずれにも触れないため、他テナントのデータや
-//! 存在情報に依存する経路が無い。列参照は常に同一の固定文言で `42601` とし、
-//! 識別子名・テーブル名をエラーに含めない（fail-closed）。
+//! 存在情報に依存する経路が無い。列参照は常に同一の固定文言で `42703`（Issue #2328。
+//! `FROM` なしでは全識別子が一律に未定義）とし、識別子名・テーブル名をエラーに含めない
+//! （fail-closed）。集計は `42601` のまま。
 
 use crate::catalog::ColumnType;
 use crate::sql::allowlist::{
@@ -65,9 +66,7 @@ fn reject_non_constant(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_) => Ok(()),
-        Expr::Ident(_) => Err(SqlSurfaceError::unsupported(
-            "column references are not allowed in a SELECT without FROM",
-        )),
+        Expr::Ident(_) => Err(SqlSurfaceError::ColumnReferenceWithoutFrom),
         Expr::Call { name, args } => {
             if is_aggregate_function_name(name) {
                 return Err(SqlSurfaceError::unsupported(
