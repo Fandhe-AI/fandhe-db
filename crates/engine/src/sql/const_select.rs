@@ -9,7 +9,7 @@
 //!
 //! `WHERE`／`LIMIT`／`OFFSET`（Issue #2329）は PostgreSQL と同じくダミー入力 1 行への
 //! 絞り込みとして扱い、結果は 0 行か 1 行になる。`WHERE` は定数条件のみ（偽・`NULL` は
-//! 0 行、非真偽型は `42804`）、`LIMIT`／`OFFSET` の負値は実行時に `2201W`／`2201X`。
+//! 0 行、非真偽型は `42804`）、`LIMIT`／`OFFSET` の負値は実行時に `22000`。
 //! 投影は絞り込み結果に関わらず全項目を評価し、エラー有無がフィルタに左右されない
 //! ようにする（`--max-search-k` 上限は適用しない。結果が最大 1 行のため）。
 //!
@@ -230,10 +230,12 @@ pub fn bind(
 pub fn execute(bound: &BoundConstSelect) -> Result<QueryResult, SqlSurfaceError> {
     // 負値は実行時に拒否する（PostgreSQL と同じく Describe は成功し Execute で失敗）。
     if bound.limit.is_some_and(|l| l < 0) {
-        return Err(SqlSurfaceError::invalid_row_count_in_limit_clause());
+        return Err(SqlSurfaceError::invalid_input("LIMIT must not be negative"));
     }
     if bound.offset.is_some_and(|o| o < 0) {
-        return Err(SqlSurfaceError::invalid_row_count_in_result_offset_clause());
+        return Err(SqlSurfaceError::invalid_input(
+            "OFFSET must not be negative",
+        ));
     }
     let passes = match &bound.where_clause {
         None => true,

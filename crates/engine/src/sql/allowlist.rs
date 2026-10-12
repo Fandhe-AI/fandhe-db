@@ -484,12 +484,6 @@ pub enum SqlSurfaceError {
     /// `wire_code` は ERR-3 の [`SqlSurfaceError::OperationIdContentMismatch`] と共有するが、
     /// `code` ラベル（`INVALID_PARAMETER_VALUE`）と文言で区別する。
     InvalidParameterValue { detail: &'static str },
-    /// `FROM` なし SELECT の `LIMIT` が負値（`2201W`。SQL-43・Issue #2329）。固定文言で
-    /// 入力値を含めない。実行時（`sql::const_select::execute`）に検出する。
-    InvalidRowCountInLimitClause,
-    /// `FROM` なし SELECT の `OFFSET` が負値（`2201X`。SQL-43・Issue #2329）。
-    /// [`SqlSurfaceError::InvalidRowCountInLimitClause`] と同じ契約。
-    InvalidRowCountInResultOffsetClause,
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
     /// スカラー／ベクトル算術式評価（SQL-26）の非有限値化（Issue #1163）にも使う。
@@ -856,16 +850,6 @@ impl SqlSurfaceError {
         }
     }
 
-    /// `pub(crate)`: `FROM` なし SELECT の負の `LIMIT`（`2201W`。Issue #2329）。
-    pub(crate) fn invalid_row_count_in_limit_clause() -> Self {
-        SqlSurfaceError::InvalidRowCountInLimitClause
-    }
-
-    /// `pub(crate)`: `FROM` なし SELECT の負の `OFFSET`（`2201X`。Issue #2329）。
-    pub(crate) fn invalid_row_count_in_result_offset_clause() -> Self {
-        SqlSurfaceError::InvalidRowCountInResultOffsetClause
-    }
-
     /// `pub(crate)`: 式評価器（`sql::udf_call`・`sql::numeric_fn`）が 0 除算を
     /// 報告するために使う（Issue #1163・SQL-26）。
     pub(crate) fn division_by_zero(detail: impl Into<String>) -> Self {
@@ -997,12 +981,6 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DivisionByZero { .. } => ErrorClass::DivisionByZero,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
-            SqlSurfaceError::InvalidRowCountInLimitClause => {
-                ErrorClass::InvalidRowCountInLimitClause
-            }
-            SqlSurfaceError::InvalidRowCountInResultOffsetClause => {
-                ErrorClass::InvalidRowCountInResultOffsetClause
-            }
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidDatetimeFormat { .. } => ErrorClass::InvalidDatetimeFormat,
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
@@ -1101,13 +1079,6 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             // 接頭辞なしで固定文言をそのまま出す（PostgreSQL と同じ文言。値は埋め込まない）。
             SqlSurfaceError::InvalidParameterValue { detail } => f.write_str(detail),
-            // 固定の英語文言（入力値を含めない。Issue #2329）。
-            SqlSurfaceError::InvalidRowCountInLimitClause => {
-                f.write_str("LIMIT must not be negative")
-            }
-            SqlSurfaceError::InvalidRowCountInResultOffsetClause => {
-                f.write_str("OFFSET must not be negative")
-            }
             SqlSurfaceError::DatetimeFieldOverflow { detail } => {
                 write!(f, "datetime field overflow: {detail}")
             }
@@ -1898,12 +1869,12 @@ impl ValidatedConstSelect {
         self.where_clause.as_ref()
     }
 
-    /// `LIMIT` の値（符号付き。負値の拒否は実行時 `2201W`。Issue #2329）。
+    /// `LIMIT` の値（符号付き。負値の拒否は実行時 `22000`。Issue #2329）。
     pub fn limit(&self) -> Option<i64> {
         self.limit
     }
 
-    /// `OFFSET` の値（符号付き。負値の拒否は実行時 `2201X`。Issue #2329）。
+    /// `OFFSET` の値（符号付き。負値の拒否は実行時 `22000`。Issue #2329）。
     pub fn offset(&self) -> Option<i64> {
         self.offset
     }
@@ -6559,7 +6530,7 @@ impl<'a> Parser<'a> {
 
     /// `FROM` なし SELECT の `LIMIT`／`OFFSET` の値（`['-'] <整数リテラル>`）を符号付き
     /// `i64` で読む（Issue #2329）。小数・指数・`ALL`・`NULL`・式・`$n` と `i64` 範囲外は
-    /// `42601`。負値の拒否（`2201W`／`2201X`）は実行時（`sql::const_select`）。結果は
+    /// `42601`。負値の拒否（`22000`）は実行時（`sql::const_select`）。結果は
     /// 最大 1 行のため値の大きさは資源消費に影響しない。
     fn parse_const_row_count(&mut self, clause: &str) -> Result<i64, SqlSurfaceError> {
         let negative = if matches!(self.peek(), Some(Token::Punct('-'))) {
@@ -6583,7 +6554,7 @@ impl<'a> Parser<'a> {
         }
         // 符号付きの文字列として一括で解釈する。絶対値を先に `i64` へ読むと
         // `i64::MIN`（`-9223372036854775808`）が範囲外になり `42601` で弾かれてしまう
-        // （契約は Describe 成功・Execute で `2201W`／`2201X`）。
+        // （契約は Describe 成功・Execute で `22000`）。
         let signed = if negative { format!("-{raw}") } else { raw };
         signed
             .parse::<i64>()

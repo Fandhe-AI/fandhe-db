@@ -1102,7 +1102,7 @@ Date: <IMF-fixdate>
 
 「1 つの `wire_code` → 常に 1 つの HTTP ステータス」の方向にのみ 1:1 の射影
 であり、逆方向（ステータス → `wire_code`）は 1:1 ではない（例えば `400` は
-29 分類が共有する）。
+27 分類が共有する）。
 
 | `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
 | --- | --- | --- | --- | --- |
@@ -1113,8 +1113,6 @@ Date: <IMF-fixdate>
 | `22007` | `INVALID_DATETIME_FORMAT` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの書式違反（`insert`／`update`／`filter`。Issue #1187） |
 | `22008` | `DATETIME_FIELD_OVERFLOW` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正（`update` の `set` 経由） |
 | `22012` | `DIVISION_BY_ZERO` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約（TABLE-16・TASK-204）の式評価での 0 除算 |
-| `2201W` | `INVALID_ROW_COUNT_IN_LIMIT_CLAUSE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`FROM` なし SELECT の負の `LIMIT` は SQL 表層専用。SQL-43・Issue #2329） |
-| `2201X` | `INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`FROM` なし SELECT の負の `OFFSET` は SQL 表層専用。SQL-43・Issue #2329） |
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
 | `22023` | `INVALID_PARAMETER_VALUE` | 400 | Bad Request | 型名の引数が範囲外（`FLOAT(p)` の精度。SQL 表層の DDL 専用で、NoSQL の `op` 語彙からは到達しない。Issue #2304） |
 | `22P02` | `INVALID_TEXT_REPRESENTATION` | 400 | Bad Request | 値の形式不正: ENUM 列の語彙外ラベル・INTEGER／BIGINT 列への小数／指数表記・BYTEA の不正 base64・NUMERIC／配列／JSON 列の形式不正（`insert`／`update`／`filter`。Issue #1187） |
@@ -1156,7 +1154,7 @@ Date: <IMF-fixdate>
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 18 分類（`2201W`・`2201X`・`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
+到達不能な 16 分類（`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
 `42809`・`42703`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する

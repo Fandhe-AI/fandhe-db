@@ -429,16 +429,16 @@ fn negative_limit_offset_rejected_at_execution() {
     let (core, path) = core_with_table("sql43-neg", false);
     let _g = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
-    assert_eq!(wire_code_of(&core, &ctx, "SELECT 1 LIMIT -1"), "2201W");
-    assert_eq!(wire_code_of(&core, &ctx, "SELECT 1 OFFSET -1"), "2201X");
+    assert_eq!(wire_code_of(&core, &ctx, "SELECT 1 LIMIT -1"), "22000");
+    assert_eq!(wire_code_of(&core, &ctx, "SELECT 1 OFFSET -1"), "22000");
     // i64::MIN も構文は通り、実行時に負値として拒否される。MIN-1・MAX+1 は構文段階の 42601。
     assert_eq!(
         wire_code_of(&core, &ctx, "SELECT 1 LIMIT -9223372036854775808"),
-        "2201W"
+        "22000"
     );
     assert_eq!(
         wire_code_of(&core, &ctx, "SELECT 1 OFFSET -9223372036854775808"),
-        "2201X"
+        "22000"
     );
     for sql in [
         "SELECT 1 LIMIT -9223372036854775809",

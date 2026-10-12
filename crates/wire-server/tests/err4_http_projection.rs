@@ -277,11 +277,9 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 46] = [
+const EXPECTED_STATUS: [(&str, u16); 44] = [
     ("22000", 400),
     ("22012", 400),
-    ("2201W", 400),
-    ("2201X", 400),
     ("21000", 400),
     ("28P01", 401),
     ("28000", 401),
@@ -437,7 +435,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 49);
+const _: () = assert!(ErrorClass::ALL.len() == 47);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。

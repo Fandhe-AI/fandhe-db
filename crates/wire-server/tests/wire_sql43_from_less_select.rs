@@ -352,8 +352,8 @@ fn simple_where_limit_offset_select_zero_or_one_row() {
 fn simple_negative_limit_offset_and_non_boolean_where_are_rejected() {
     let (mut s, _g) = connect();
     for (sql, code) in [
-        ("SELECT 1 LIMIT -1", "2201W"),
-        ("SELECT 1 OFFSET -1", "2201X"),
+        ("SELECT 1 LIMIT -1", "22000"),
+        ("SELECT 1 OFFSET -1", "22000"),
         ("SELECT 1 WHERE 1", "42804"),
     ] {
         send_simple_query(&mut s, sql);
@@ -415,5 +415,5 @@ fn extended_negative_limit_fails_at_execute_and_recovers() {
     send(&mut s, b'E', &execute_body("", 0));
     expect(&mut s, b'1');
     expect(&mut s, b'2');
-    assert_eq!(expect_error_then_recover(&mut s), "2201W");
+    assert_eq!(expect_error_then_recover(&mut s), "22000");
 }
