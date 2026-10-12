@@ -84,6 +84,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--batch-max-files <1-1000000>] \
   [--max-table-columns <1-256>] [--max-array-elements <1-1024>] [--max-enum-labels <1-256>] \
+  [--max-scanned-rows <1-1000000>] \
   [--max-group-by-columns <1-8>] [--max-groups <1-10000>] \
   [--max-subquery-depth <1-4>] [--max-subquery-executions <1-16>] \
   [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] \
@@ -330,6 +331,14 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 配列の `[N]` 宣言は `42601` です。`<型>[]`（要素数省略）は設定値を要素数上限にします。範囲外・非数値・
 値欠落・2 回目以降の重複指定は fail-closed で起動エラーです。上限を引き上げることはできません
 （詳細: [docs/design/schema-limits-cli.md](docs/design/schema-limits-cli.md)）。
+
+`--max-scanned-rows <N>`（既定・ハード上限 1,000,000・範囲 `1`〜`1,000,000`）（Issue #1549・SQL-46）は、
+1 文あたりの総走査行数上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は
+現行のハード上限と同じ値で、挙動は変わりません）。述語形 `UPDATE`／`DELETE` の候補列挙・辞書
+スナップショット構築・ファイル形 `INSERT` の置換前走査に効き、超過時は従来と同じ `54000` で拒否して
+副作用を残しません。分割実行 DML の `--partitioned-dml-scan-budget` とは連動しません（組合せでも起動は
+拒否しません）。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです。上限を
+引き上げることはできません（詳細: [docs/design/scan-limits-cli.md](docs/design/scan-limits-cli.md)）。
 
 `--max-group-by-columns <N>`（既定 8・範囲 `1`〜`8`）・`--max-groups <N>`（既定 10,000・範囲 `1`〜`10,000`）
 （Issue #1550・SQL-46）は、`GROUP BY` のキー列数と 1 クエリが生成できるグループ数の上限を、プロセス全体に

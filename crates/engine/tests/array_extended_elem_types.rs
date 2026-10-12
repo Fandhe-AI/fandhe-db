@@ -341,7 +341,7 @@ fn add_column_accepts_new_element_types_and_alter_column_type_still_rejects_arra
     ] {
         ok(&core, sql);
     }
-    assert_eq!(code(&core, "ALTER TABLE a ADD COLUMN x no_such[]"), "42601");
+    assert_eq!(code(&core, "ALTER TABLE a ADD COLUMN x no_such[]"), "42704");
     assert_eq!(
         code(&core, "ALTER TABLE a ADD COLUMN x NUMERIC(5,9)[]"),
         "42601"
@@ -386,8 +386,8 @@ fn ddl_permission_gate_precedes_enum_array_type_resolution() {
             .unwrap_err();
         assert_eq!(err.wire_code(), "42501", "{sql}");
     }
-    // 権限があっても未登録の ENUM 要素型は 42601。
-    assert_eq!(code(&core, "CREATE TABLE p (m no_such_type[])"), "42601");
+    // 権限があっても未登録の ENUM 要素型は 42704。
+    assert_eq!(code(&core, "CREATE TABLE p (m no_such_type[])"), "42704");
 }
 
 /// 集合演算（`UNION`）の行キーも値等価の正準ペイロードを使う（Issue #1357 D4）。

@@ -638,6 +638,10 @@ pub enum SqlSurfaceError {
     /// Issue #908。[`crate::catalog::CatalogError::IndexNotFound`] の写像。
     /// ERR-6: `42704`）。
     UndefinedObject { name: String },
+    /// 型名解決表に無く、ENUM 型としても未登録の型名を指定した（TABLE-29、Issue #2306。
+    /// `DOUBLE` 単独も含む。ERR-6: `42704`）。`name` はクライアントが指定した綴りのみで、
+    /// 既存の ENUM 型名・ラベル・テナント情報は含めない（fail-closed）。
+    UndefinedType { name: String },
     /// 索引 DDL が参照した列が対象テーブルに存在しない（TASK-206・INDEX-7、
     /// Issue #908。[`crate::catalog::CatalogError::ColumnNotFound`] の写像。
     /// ERR-6: `42703`）。
@@ -1029,6 +1033,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::NotNullViolation { .. } => ErrorClass::NotNullViolation,
             SqlSurfaceError::UniqueViolation => ErrorClass::UniqueViolation,
             SqlSurfaceError::UndefinedObject { .. } => ErrorClass::UndefinedObject,
+            SqlSurfaceError::UndefinedType { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::UndefinedColumn { .. } => ErrorClass::UndefinedColumn,
             SqlSurfaceError::CheckViolation { .. } => ErrorClass::CheckViolation,
             SqlSurfaceError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
@@ -1218,6 +1223,9 @@ impl std::fmt::Display for SqlSurfaceError {
             // 名前はクライアント自身が指定した識別子（`UndefinedTable` と同じ扱い）。
             SqlSurfaceError::UndefinedObject { name } => {
                 write!(f, "index does not exist: {name}")
+            }
+            SqlSurfaceError::UndefinedType { name } => {
+                write!(f, "type does not exist: {name}")
             }
             SqlSurfaceError::UndefinedColumn { name } => {
                 write!(f, "column does not exist: {name}")

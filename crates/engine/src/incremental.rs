@@ -317,6 +317,7 @@ fn embed_and_write_phase(
     input: &BoundFileIndexInput<'_>,
     chunked: ChunkedFile,
     ledger_write: crate::recovery::ledger::LedgerWrite<'_>,
+    max_scanned_rows: usize,
 ) -> Result<IndexOutcome, IncrementalError> {
     let ChunkedFile {
         chunks,
@@ -394,6 +395,7 @@ fn embed_and_write_phase(
             content_hash_body: input.body,
             content_hash_template_values: input.template_values,
             ledger_write,
+            max_scanned_rows,
         },
     )?;
     let write_elapsed = write_start.elapsed();
@@ -419,6 +421,7 @@ fn embed_and_write_phase(
 ///
 /// 実体は [`chunk_phase`] → [`embed_and_write_phase`] を直列に呼ぶだけ（TASK-122 で
 /// バッチ経路 [`index_file_batch`] と共通化するために分割。挙動は分割前と同一）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn index_file(
     target: crate::tenant::WriteTarget<'_>,
     storage: &Storage,
@@ -427,9 +430,18 @@ pub(crate) fn index_file(
     config: &IncrementalConfig,
     input: &BoundFileIndexInput<'_>,
     ledger_write: crate::recovery::ledger::LedgerWrite<'_>,
+    max_scanned_rows: usize,
 ) -> Result<IndexOutcome, IncrementalError> {
     let chunked = chunk_phase(storage, embedder.dim(), config, input)?;
-    embed_and_write_phase(target, ctx, embedder, input, chunked, ledger_write)
+    embed_and_write_phase(
+        target,
+        ctx,
+        embedder,
+        input,
+        chunked,
+        ledger_write,
+        max_scanned_rows,
+    )
 }
 
 /// [`index_file_batch`] の失敗理由。バッチ全体に対する上限超過（[`batch_limits`]・
@@ -513,6 +525,7 @@ pub(crate) fn index_file_batch(
     config: &IncrementalConfig,
     limits: &crate::batch_limits::BatchLimits,
     items: Vec<BatchFileIndexItem<'_>>,
+    max_scanned_rows: usize,
 ) -> Result<Vec<IndexOutcome>, BatchIncrementalError> {
     // ①②③: バッチの解析段階（チャンク化・埋め込み・write トランザクションより前）。
     let shapes: Vec<(usize, usize)> = items
@@ -563,6 +576,7 @@ pub(crate) fn index_file_batch(
             &item.input,
             chunked,
             item.ledger_write,
+            max_scanned_rows,
         )
         .map_err(|e| BatchIncrementalError::Item { index, source: e })?;
         outcomes.push(outcome);

@@ -1064,14 +1064,14 @@ fn alter_table_add_column_numeric_and_enum_succeed() {
     assert_eq!(query(&session, numeric).status, 200);
 
     // ENUM 型は事前登録が無いため、実行段（`Storage::get_enum_type`）が
-    // 未定義の型名として `42601`（SQL 表層 `ALTER TABLE ADD COLUMN <col>
+    // 未定義の型名として `42704`（SQL 表層 `ALTER TABLE ADD COLUMN <col>
     // <未知の識別子>` と同一の分類。ENUM 型名の存在確認は engine 側の実行段
     // が担う）を返す。少なくとも `0A000` へ落ちず engine まで到達したことを
     // 固定する（構造検証段〔wire 側〕とカタログ照会段〔engine 側〕のどちらの
     // `42601` かは区別しないが、いずれも SQL 表層とパリティが取れている）。
     let enum_col = br#"{"op":"alter_table","table":"docs","add_column":{"name":"kind","type":"enum","enum_type":"my_enum"}}"#;
     let resp = query(&session, enum_col);
-    assert_eq!(http_common::wire_code_of(&resp), "42601", "got: {resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "42704", "got: {resp:?}");
 }
 
 #[test]
@@ -1844,7 +1844,12 @@ fn create_table_new_types_error_classification_matches_sql() {
         );
         assert_eq!(
             ClassifiedError::wire_code(&sql_err),
-            "42601",
+            // 未登録の ENUM 型名は 42704、それ以外は 42601（Issue #2306）。
+            if sql_decl.contains("nosuch") {
+                "42704"
+            } else {
+                "42601"
+            },
             "sql {sql_decl}"
         );
     }
