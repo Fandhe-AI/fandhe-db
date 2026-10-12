@@ -54,12 +54,12 @@ use engine::sql::allowlist::{validate_using_plan_question, SqlSurfaceError};
 use engine::sql::exec::QueryResult;
 use engine::sql::explain::ExplainShape;
 use engine::sql::mode::SessionState;
-use engine::sql::parser::validate_search_limit;
+use engine::sql::parser::validate_search_limit_with;
 
 use super::ident::{self, InvalidIdentifier};
 use super::response::{self, ResponseEncodeError};
 use super::schema::{SchemaError, Validated};
-use super::search::{bind_search, bind_vector_statement, BoundSearch, SearchError};
+use super::search::{bind_search_with_limits, bind_vector_statement, BoundSearch, SearchError};
 use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
 
@@ -218,7 +218,7 @@ pub fn execute(
         let session = SessionState::default();
         let result =
             core.explain_bound_search_in_session(ctx, &session, table, |schema, udfs| {
-                bind_vector_statement(validated, schema, udfs)
+                bind_vector_statement(validated, schema, udfs, &core.result_limits())
             })?;
         return Ok(result);
     }
@@ -231,7 +231,7 @@ pub fn execute(
     }
 
     let limit_raw = validated.required_u32("limit")?;
-    validate_search_limit(limit_raw)?;
+    validate_search_limit_with(limit_raw, &core.result_limits())?;
 
     // `mode` は識別子形状検査を含め一切ここでは検証しない（codex-review
     // P1 指摘対応・PR #828）。ここで形状検査だけでも先に行うと、テーブル
@@ -258,7 +258,7 @@ pub fn execute(
             // 両方欠落の判定を `bind_search` 自身のテーブル解決後へ委ねるのと
             // 同じ設計）。
             question.ok_or(ExplainError::ExplainRequiresPlan)?;
-            match bind_search(validated, schema, udfs)? {
+            match bind_search_with_limits(validated, schema, udfs, &core.result_limits())? {
                 BoundSearch::Plan(plan) => {
                     // Issue #945・NOSQL-14: NoSQL 表層の `plan` 検索経路も
                     // `filter` の範囲比較・IN・OR 拡張を受けるため、式述語・

@@ -2184,12 +2184,23 @@ pub fn bind(
 /// 写像（`http::query::scan`）も同一ロジックを再利用する（第 2 の実装を
 /// 作らない）。
 pub fn validate_search_limit(raw: u32) -> Result<usize, SqlSurfaceError> {
+    validate_search_limit_with(raw, &crate::result_limits::ResultLimits::default())
+}
+
+/// [`validate_search_limit`] の設定値付き版（Issue #1555・SQL-34）。範囲上限は
+/// `limits.max_result_rows()`（起動時 CLI `--max-result-rows`。既定は従来の 10,000）。
+/// 下限（`LIMIT 0` 拒否）・エラー分類（`22000`）は既定版と同一で、メッセージの範囲表示だけが
+/// 設定値に追随する。`EngineCore` の束縛経路と NoSQL 表層（`limit`）が共有する単一実装。
+pub fn validate_search_limit_with(
+    raw: u32,
+    limits: &crate::result_limits::ResultLimits,
+) -> Result<usize, SqlSurfaceError> {
     let limit = usize::try_from(raw)
         .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed LIMIT value: {raw}")))?;
-    if limit == 0 || limit > crate::core::MAX_SEARCH_K {
+    let max = limits.max_result_rows();
+    if limit == 0 || limit > max {
         return Err(SqlSurfaceError::invalid_input(format!(
-            "LIMIT {limit} out of range (must be 1..={})",
-            crate::core::MAX_SEARCH_K
+            "LIMIT {limit} out of range (must be 1..={max})"
         )));
     }
     Ok(limit)
@@ -2249,6 +2260,24 @@ pub fn bind_in_session(
     session_mode: Option<SearchMode>,
     udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundStatement, SqlSurfaceError> {
+    bind_in_session_with_limits(
+        stmt,
+        schema,
+        session_mode,
+        udfs,
+        &crate::result_limits::ResultLimits::default(),
+    )
+}
+
+/// [`bind_in_session`] の `LIMIT` 範囲設定付き版（Issue #1555・SQL-34）。
+/// `EngineCore` が自身の [`crate::result_limits::ResultLimits`] を渡して呼ぶ。
+pub(crate) fn bind_in_session_with_limits(
+    stmt: &ValidatedStatement,
+    schema: &TableSchema,
+    session_mode: Option<SearchMode>,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    result_limits: &crate::result_limits::ResultLimits,
+) -> Result<BoundStatement, SqlSurfaceError> {
     let query_mode = match &stmt.search_mode {
         Some(literal) => Some(SearchMode::parse_literal(literal)?),
         None => None,
@@ -2268,7 +2297,7 @@ pub fn bind_in_session(
 
     let ranking = bind_ranking(&stmt.order_by, schema, true)?;
 
-    let limit = validate_search_limit(stmt.limit)?;
+    let limit = validate_search_limit_with(stmt.limit, result_limits)?;
 
     // Issue #353: `expr_filters` を束縛時に 1 回だけステップ列コンパイルする
     // （行ループでの再帰評価をなくす）。`expr_filters` と要素数・評価順が
@@ -2324,6 +2353,7 @@ pub(crate) fn bind_projection_for_describe(
     udfs: &crate::sql::udf_call::UdfRegistry,
     validate_vector_literal: bool,
     dummy_equality_flags: &[bool],
+    result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
     if let Some(literal) = &stmt.search_mode {
         SearchMode::parse_literal(literal)?;
@@ -2342,7 +2372,7 @@ pub(crate) fn bind_projection_for_describe(
         )?;
 
     let _ranking = bind_ranking(&stmt.order_by, schema, validate_vector_literal)?;
-    let _limit = validate_search_limit(stmt.limit)?;
+    let _limit = validate_search_limit_with(stmt.limit, result_limits)?;
 
     Ok(projection)
 }
@@ -6779,7 +6809,13 @@ pub fn bind_scan(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundScan, SqlSurfaceError> {
-    bind_scan_with_dummy_flags(stmt, schema, udfs, &[])
+    bind_scan_with_dummy_flags(
+        stmt,
+        schema,
+        udfs,
+        &[],
+        &crate::result_limits::ResultLimits::default(),
+    )
 }
 
 /// [`bind_scan`] の本体（crate 内限定。Issue #935・WIRE-12・TASK-217）。
@@ -6790,6 +6826,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     dummy_equality_flags: &[bool],
+    result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<BoundScan, SqlSurfaceError> {
     // Issue #1352: 投影位置のスカラーサブクエリは `core.rs` の `Statement::Scan`
     // アームが解決・合流してから束縛へ渡す（解決済みの文は項目を空にして渡す）。
@@ -6852,7 +6889,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
             dummy_equality_flags,
         )?;
 
-    let limit = validate_search_limit(stmt.limit())?;
+    let limit = validate_search_limit_with(stmt.limit(), result_limits)?;
     // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は `LIMIT` と同じ束縛段で検証する
     // （構文段の許可リストは値の上限を持たない生値のまま通すため）。
     let offset = validate_search_offset(stmt.offset())?;

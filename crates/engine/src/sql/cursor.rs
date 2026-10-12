@@ -215,7 +215,10 @@ pub(crate) fn validate_declare_tokens_structure_only(
 ///
 /// 先頭トークンが `FETCH`（大小無視）であることは呼び出し元
 /// （`core.rs::parse_tokens`）が確認済みの前提。
-pub(crate) fn validate_fetch_tokens(tokens: &[Token]) -> Result<CursorStatement, SqlSurfaceError> {
+pub(crate) fn validate_fetch_tokens(
+    tokens: &[Token],
+    result_limits: &crate::result_limits::ResultLimits,
+) -> Result<CursorStatement, SqlSurfaceError> {
     let rest = tokens.split_first().map_or(&[][..], |(_, tail)| tail);
     let rest = match rest.split_first() {
         Some((Token::Ident(w), tail)) if w.eq_ignore_ascii_case("FORWARD") => tail,
@@ -230,7 +233,7 @@ pub(crate) fn validate_fetch_tokens(tokens: &[Token]) -> Result<CursorStatement,
     let raw: u32 = raw_count
         .parse()
         .map_err(|_| SqlSurfaceError::unsupported(format!("malformed FETCH count: {raw_count}")))?;
-    let count = crate::sql::parser::validate_search_limit(raw)?;
+    let count = crate::sql::parser::validate_search_limit_with(raw, result_limits)?;
     let rest = match rest.split_first() {
         Some((Token::Keyword(Keyword::From), tail)) => tail,
         _ => return Err(SqlSurfaceError::unsupported("expected FROM")),
@@ -559,7 +562,8 @@ mod tests {
 
     #[test]
     fn fetch_accepts_optional_forward_and_rejects_other_forms() {
-        let stmt = validate_fetch_tokens(&tokens_of("FETCH 10 FROM c")).expect("accepted");
+        let stmt = validate_fetch_tokens(&tokens_of("FETCH 10 FROM c"), &Default::default())
+            .expect("accepted");
         assert_eq!(
             stmt,
             CursorStatement::Fetch {
@@ -567,7 +571,9 @@ mod tests {
                 count: 10
             }
         );
-        let stmt = validate_fetch_tokens(&tokens_of("FETCH FORWARD 10 FROM c")).expect("accepted");
+        let stmt =
+            validate_fetch_tokens(&tokens_of("FETCH FORWARD 10 FROM c"), &Default::default())
+                .expect("accepted");
         assert_eq!(
             stmt,
             CursorStatement::Fetch {
@@ -582,7 +588,8 @@ mod tests {
             "FETCH BACKWARD 1 FROM c",
             "FETCH 0 FROM c",
         ] {
-            let err = validate_fetch_tokens(&tokens_of(sql)).expect_err("rejected");
+            let err =
+                validate_fetch_tokens(&tokens_of(sql), &Default::default()).expect_err("rejected");
             assert!(matches!(err.wire_code(), "42601" | "22000"));
         }
     }

@@ -43,7 +43,7 @@ use crate::sql::udf_call::UdfRegistry;
 /// 重複除去を伴う演算（`UNION`／`INTERSECT`／`EXCEPT`）の行キー集合の基数上限
 /// （実装既定値。`core::MAX_SEARCH_K` と同値）。超過は `54000`。合成結果の行数
 /// 上限も同じ定数を共有する（重複除去後の行数は必ずこの値以下になる）。
-const MAX_SET_OP_ROWS: usize = crate::core::MAX_SEARCH_K;
+const MAX_SET_OP_ROWS: usize = 10_000;
 
 /// 集合演算文全体（全枝の走査・合成・行キー生成）で共有する累計バイト予算
 /// （PR #1105 レビュー指摘対応）。各枝を独立に
@@ -673,6 +673,7 @@ fn eval_tree(
 /// アーム・session-less `execute_sql` の同アームから呼ばれる）。`schemas` は
 /// 呼び出し元が単一の `read_txn`（同一スナップショット）上で解決済みのものを
 /// 渡す（`EngineCore::read_txn_with_schemas`）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute(
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
@@ -682,8 +683,11 @@ pub(crate) fn execute(
     limit: Option<u32>,
     // Issue #1550: 集計形の枝へ渡す `GROUP BY` の列数・グループ数上限（`EngineCore` 保持）。
     group_limits: crate::group_by_limits::GroupByLimits,
+    // Issue #1555: 全体 `LIMIT` の範囲上限（`EngineCore` 保持。枝行数上限
+    // `MAX_SET_OP_ROWS` とは連動しない）。
+    result_limits: crate::result_limits::ResultLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    execute_with_budget(
+    execute_with_budget_and_result_limits(
         read_txn,
         ctx,
         schemas,
@@ -692,6 +696,7 @@ pub(crate) fn execute(
         limit,
         crate::arena::MAX_ARENA_TOTAL_BYTES,
         group_limits,
+        &result_limits,
     )
 }
 
@@ -700,6 +705,7 @@ pub(crate) fn execute(
 /// （[`crate::arena::MAX_ARENA_TOTAL_BYTES`]）を渡すだけの薄いラッパーで、
 /// 小さい上限を注入できる回帰テスト（本モジュール内の `tests`）専用に分離して
 /// いる（`sql::scan::execute_scan`／`execute_scan_with_budget` と同じ設計判断）。
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_with_budget(
     read_txn: &impl crate::storage::read_source::ReadSource,
@@ -711,13 +717,42 @@ pub(crate) fn execute_with_budget(
     budget_cap: usize,
     group_limits: crate::group_by_limits::GroupByLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    // PR #1105 レビュー指摘対応: 全体 `LIMIT` の範囲検証（`1..=MAX_SEARCH_K`）を
+    execute_with_budget_and_result_limits(
+        read_txn,
+        ctx,
+        schemas,
+        tree,
+        udfs,
+        limit,
+        budget_cap,
+        group_limits,
+        &crate::result_limits::ResultLimits::default(),
+    )
+}
+
+/// [`execute_with_budget`] の本体（Issue #1555: 全体 `LIMIT` の範囲上限を注入できる版）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_with_budget_and_result_limits(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    schemas: &HashMap<String, TableSchema>,
+    tree: &SetTree,
+    udfs: &UdfRegistry,
+    limit: Option<u32>,
+    budget_cap: usize,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    result_limits: &crate::result_limits::ResultLimits,
+) -> Result<QueryResult, SqlSurfaceError> {
+    // PR #1105 レビュー指摘対応: 全体 `LIMIT` の範囲検証（`1..=設定値`）を
     // 全枝の走査・合成より前に行う（[`describe_columns`] と同じ検証を共有し、
     // Execute／Describe の受理・拒否を一致させる。従来は `eval_tree` 完了後の
     // 切り詰め直前でのみ検証しており、範囲外の `LIMIT` でも全枝を走査・合成し
     // 終えてから拒否していた）。
     let validated_limit = match limit {
-        Some(n) => Some(crate::sql::parser::validate_search_limit(n)?),
+        Some(n) => Some(crate::sql::parser::validate_search_limit_with(
+            n,
+            result_limits,
+        )?),
         None => None,
     };
     // PR #1105 レビュー指摘対応: 列数・列型整合（`DatatypeMismatch`・`42804`）を
@@ -760,9 +795,10 @@ pub(crate) fn describe_columns(
     udfs: &UdfRegistry,
     dummy_equality_flags: &[bool],
     limit: Option<u32>,
+    result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
     if let Some(n) = limit {
-        crate::sql::parser::validate_search_limit(n)?;
+        crate::sql::parser::validate_search_limit_with(n, result_limits)?;
     }
     Ok(describe_tree(schemas, tree, udfs, dummy_equality_flags)?.0)
 }
@@ -786,6 +822,9 @@ fn describe_tree(
                 schema,
                 udfs,
                 dummy_equality_flags,
+                // 枝の `LIMIT` は枝行数上限（`MAX_SET_OP_ROWS`）側で扱う独立上限のため
+                // 既定値のまま（設定値とは連動させない。SQL-46 (6)）。
+                &crate::result_limits::ResultLimits::default(),
             )?;
             let columns = crate::sql::describe::projected_columns(bound.projection(), schema);
             let has_vector = columns_have_vector(&columns);
@@ -1034,6 +1073,7 @@ mod tests {
             &udfs,
             Some(0),
             crate::group_by_limits::GroupByLimits::default(),
+            crate::result_limits::ResultLimits::default(),
         )
         .expect_err("LIMIT 0 must be rejected before any branch is scanned");
         assert_eq!(err.wire_code(), "22000");
@@ -1046,6 +1086,7 @@ mod tests {
             &udfs,
             Some(crate::core::MAX_SEARCH_K as u32 + 1),
             crate::group_by_limits::GroupByLimits::default(),
+            crate::result_limits::ResultLimits::default(),
         )
         .expect_err("LIMIT over MAX_SEARCH_K must be rejected before any branch is scanned");
         assert_eq!(err.wire_code(), "22000");
@@ -1059,7 +1100,7 @@ mod tests {
         let schemas: HashMap<String, TableSchema> = HashMap::new();
         let udfs = UdfRegistry::default();
 
-        let err = describe_columns(&schemas, &tree, &udfs, &[], Some(0))
+        let err = describe_columns(&schemas, &tree, &udfs, &[], Some(0), &Default::default())
             .expect_err("LIMIT 0 must be rejected by describe_columns");
         assert_eq!(err.wire_code(), "22000");
 
@@ -1069,6 +1110,7 @@ mod tests {
             &udfs,
             &[],
             Some(crate::core::MAX_SEARCH_K as u32 + 1),
+            &Default::default(),
         )
         .expect_err("LIMIT over MAX_SEARCH_K must be rejected by describe_columns");
         assert_eq!(err.wire_code(), "22000");

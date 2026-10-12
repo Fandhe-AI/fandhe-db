@@ -68,6 +68,8 @@ pub(crate) struct JoinLimits {
     /// JOIN のリレーション数上限（Issue #1551。既定は `sql::relation::MAX_TABLE_REFS`。
     /// 超過は実行段で `54000`）。
     pub(crate) max_relations: usize,
+    /// 文の `LIMIT` の範囲上限（Issue #1555。既定は従来の 10,000。超過は `22000`）。
+    pub(crate) max_result_rows: usize,
 }
 
 impl Default for JoinLimits {
@@ -79,6 +81,7 @@ impl Default for JoinLimits {
             max_groups: crate::sql::group_by::MAX_GROUPS,
             max_group_by_columns: crate::sql::allowlist::MAX_GROUP_BY_COLUMNS,
             max_relations: crate::sql::relation::MAX_TABLE_REFS,
+            max_result_rows: crate::result_limits::DEFAULT_MAX_RESULT_ROWS,
         }
     }
 }
@@ -169,7 +172,15 @@ fn bind_side_scans(
 ) -> Result<Vec<crate::sql::parser::BoundScan>, SqlSurfaceError> {
     let mut out = Vec::with_capacity(plan.scans.len());
     for (scan, schema) in plan.scans.iter().zip(plan.schemas.iter()) {
-        let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(scan, schema, udfs, &[])?;
+        // 側スキャンの `LIMIT` は直後に `scan_limit` へ差し替える内部値のため既定の範囲検証のまま
+        // （文の `LIMIT` は `validate_limit_offset` が設定値で判定する）。
+        let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
+            scan,
+            schema,
+            udfs,
+            &[],
+            &crate::result_limits::ResultLimits::default(),
+        )?;
         bound.limit = scan_limit;
         out.push(bound);
     }
@@ -180,10 +191,12 @@ fn bind_side_scans(
 /// 集計形は省略可（`None` は無制限）。
 fn validate_limit_offset(
     validated: &ValidatedJoin,
+    max_result_rows: usize,
 ) -> Result<(Option<usize>, usize), SqlSurfaceError> {
+    let result_limits = crate::result_limits::ResultLimits::new(max_result_rows);
     let limit = validated
         .limit
-        .map(crate::sql::parser::validate_search_limit)
+        .map(|raw| crate::sql::parser::validate_search_limit_with(raw, &result_limits))
         .transpose()?;
     let offset = crate::sql::parser::validate_search_offset(validated.offset)?;
     Ok((limit, offset))
@@ -193,6 +206,7 @@ fn validate_limit_offset(
 /// の `Statement::Join` アーム・session-less `execute_sql` の同アームから
 /// 呼ばれる）。`schemas` は呼び出し元が単一の `read_txn`（同一スナップショット）
 /// 上で解決済みのものを渡す（`EngineCore::read_txn_with_schemas`）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute(
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
@@ -203,6 +217,8 @@ pub(crate) fn execute(
     group_limits: crate::group_by_limits::GroupByLimits,
     // Issue #1551: リレーション数・入出力行数の起動時設定（`EngineCore` 保持）。
     join_limits: crate::join_limits::JoinSizeLimits,
+    // Issue #1555: 文の `LIMIT` の範囲上限（`EngineCore` 保持）。
+    result_limits: crate::result_limits::ResultLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
     execute_with_limits(
         read_txn,
@@ -216,6 +232,7 @@ pub(crate) fn execute(
             max_input_rows: join_limits.max_input_rows(),
             max_output_rows: join_limits.max_output_rows(),
             max_relations: join_limits.max_relations(),
+            max_result_rows: result_limits.max_result_rows(),
             ..JoinLimits::default()
         },
     )
@@ -236,7 +253,7 @@ pub(crate) fn execute_with_limits(
     // `LIMIT`／`OFFSET` の範囲検証（`22000`）を行う（束縛エラー優先。Describe と
     // 同じ判断順序）。
     let bound = bind_side_scans(&plan, udfs, limits.max_input_rows.saturating_add(1))?;
-    let (limit, offset) = validate_limit_offset(validated)?;
+    let (limit, offset) = validate_limit_offset(validated, limits.max_result_rows)?;
     // Issue #1551: 起動時設定のリレーション数上限（データ非依存。走査より前に判定する）。
     if validated.relations.len() > limits.max_relations {
         return Err(SqlSurfaceError::payload_too_large(format!(
@@ -392,13 +409,14 @@ pub(crate) fn describe_columns(
     schemas: &HashMap<String, TableSchema>,
     validated: &ValidatedJoin,
     udfs: &UdfRegistry,
+    result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
     let plan = build_plan(schemas, validated, udfs)?;
     // 走査せずに束縛だけ行い、WHERE リテラルの型検証を Execute と同じ判定
     // 基準で確定させる（Describe は本体を実行しない契約）。束縛完了を
     // `LIMIT`／`OFFSET` 検証より前に行う（束縛エラー優先。Execute と同じ順序）。
     bind_side_scans(&plan, udfs, 1)?;
-    validate_limit_offset(validated)?;
+    validate_limit_offset(validated, result_limits.max_result_rows())?;
     Ok(plan.column_metas())
 }
 
@@ -700,6 +718,7 @@ mod tests {
             &udfs,
             crate::group_by_limits::GroupByLimits::default(),
             crate::join_limits::JoinSizeLimits::default(),
+            crate::result_limits::ResultLimits::default(),
         )
         .expect("small rows must fit the default budget");
         assert_eq!(result.rows.len(), 1);
@@ -842,6 +861,7 @@ mod tests {
             &udfs,
             crate::group_by_limits::GroupByLimits::default(),
             crate::join_limits::JoinSizeLimits::default(),
+            crate::result_limits::ResultLimits::default(),
         )
         .expect("join on real id/xx columns should succeed");
         assert_eq!(
@@ -996,6 +1016,7 @@ mod tests {
             &udfs,
             crate::group_by_limits::GroupByLimits::default(),
             crate::join_limits::JoinSizeLimits::default(),
+            crate::result_limits::ResultLimits::default(),
         )
         .expect("LEFT JOIN with a predicate on the missing side should succeed");
         assert_eq!(
@@ -1126,6 +1147,7 @@ mod tests {
             &udfs,
             crate::group_by_limits::GroupByLimits::default(),
             crate::join_limits::JoinSizeLimits::default(),
+            crate::result_limits::ResultLimits::default(),
         )
         .expect("full join");
         let rendered: Vec<String> = result

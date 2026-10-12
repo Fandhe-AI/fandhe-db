@@ -75,7 +75,7 @@ use engine::sql::allowlist::{Projection, ScalarOrderKey, SqlSurfaceError, MAX_SC
 use engine::sql::exec::QueryResult;
 use engine::sql::mode::SessionState;
 use engine::sql::parser::{
-    bind_projection, validate_search_limit, validate_search_offset, BoundScan,
+    bind_projection, validate_search_limit_with, validate_search_offset, BoundScan,
 };
 use engine::sql::udf_call::{UdfRegistry, MAX_EXPR_NODES};
 
@@ -325,7 +325,10 @@ impl<'a> PreparedScan<'a> {
     /// [`build_sort`]）。未知テーブルへの要求でも `limit`／`offset`／
     /// `columns`／`sort` の構文エラーを先に確定させて構わない（SQL 表層の
     /// 許可リスト検証段と同じ判定順序の思想）。
-    fn prepare(validated: &'a Validated<'_>) -> Result<Self, ScanError> {
+    fn prepare(
+        validated: &'a Validated<'_>,
+        limits: &engine::result_limits::ResultLimits,
+    ) -> Result<Self, ScanError> {
         let table = validated.required_str("table")?;
         // `search`／`aggregate` と同じ識別子形状検査を engine のスキーマ
         // 解決（`resolve_scan_input`）より前に適用する（cursor[bot] 指摘。
@@ -334,7 +337,7 @@ impl<'a> PreparedScan<'a> {
         // 打ち切る）。
         ident::check_identifier(table)?;
         let raw_limit = validated.required_number("limit")?;
-        let limit = validate_search_limit(limit_to_u32(raw_limit)?)?;
+        let limit = validate_search_limit_with(limit_to_u32(raw_limit)?, limits)?;
         // `offset`（Issue #947・NOSQL-15）は任意キー。省略時は 0（no-op。
         // SQL 表層の bare `LIMIT n`〔`OFFSET` 省略〕と同じ意味）。
         let offset = match validated.optional_number("offset")? {
@@ -396,7 +399,7 @@ pub fn execute(
         return Err(ScanError::ExplainNotSupported);
     }
 
-    let prepared = PreparedScan::prepare(validated)?;
+    let prepared = PreparedScan::prepare(validated, &core.result_limits())?;
     let session = SessionState::default();
     let result =
         core.execute_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {
@@ -414,7 +417,7 @@ pub fn explain(
     ctx: &PolicyContext,
     validated: &Validated<'_>,
 ) -> Result<QueryResult, ScanError> {
-    let prepared = PreparedScan::prepare(validated)?;
+    let prepared = PreparedScan::prepare(validated, &core.result_limits())?;
     let session = SessionState::default();
     let result =
         core.explain_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {

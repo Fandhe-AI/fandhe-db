@@ -182,6 +182,7 @@ pub(crate) fn pre_check_bindable(
 /// 意図的に読まない。ソフトブースト（`hybrid::apply_soft_boost`、TASK-111）を
 /// `sql::exec` の融合段へ接続する結線は本タスク（TASK-77）のスコープ外（後続タスク
 /// の管轄）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bind_expansion(
     stmt: &ValidatedStatement,
     schema: &TableSchema,
@@ -190,6 +191,7 @@ pub(crate) fn bind_expansion(
     query_vector: Vec<f32>,
     udfs: &crate::sql::udf_call::UdfRegistry,
     resolved_mode: crate::sql::mode::ResolvedMode,
+    result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<BoundStatement, SqlSurfaceError> {
     let text_column_index = body_column_index(schema)?;
 
@@ -239,7 +241,7 @@ pub(crate) fn bind_expansion(
     // （[`parser::validate_search_limit`]）を既に一度通しているが、本関数は
     // `pub(crate)` として他呼び出し元（単体テスト等）からも呼ばれうるため、
     // ここでも検証する（多層防御。codex-review P1 指摘対応、PR #266）。
-    let limit = parser::validate_search_limit(stmt.limit())?;
+    let limit = parser::validate_search_limit_with(stmt.limit(), result_limits)?;
 
     let query_text = expanded_query_text(question, expansion);
 
@@ -333,6 +335,7 @@ mod tests {
             vec![0.1, 0.2],
             &crate::sql::udf_call::UdfRegistry::default(),
             crate::sql::mode::resolve_mode(None, None),
+            &crate::result_limits::ResultLimits::default(),
         )
         .expect("bind_expansion should succeed with a body column present");
 
@@ -379,6 +382,7 @@ mod tests {
             vec![0.1, 0.2],
             &crate::sql::udf_call::UdfRegistry::default(),
             crate::sql::mode::resolve_mode(None, None),
+            &crate::result_limits::ResultLimits::default(),
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "22000");
@@ -410,6 +414,7 @@ mod tests {
             vec![0.1, 0.2, 0.3],
             &crate::sql::udf_call::UdfRegistry::default(),
             crate::sql::mode::resolve_mode(None, None),
+            &crate::result_limits::ResultLimits::default(),
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "22000");
