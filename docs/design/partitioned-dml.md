@@ -50,7 +50,7 @@
 `multi-row-dml-operation-id.md` §6）。影響行数上限は Issue #997 で既定無効になった
 （`predicate-dml-exec.md` §6）が、大量行の更新・削除には次の制約が残る。
 
-- **走査上限**: 1 文あたりの総走査行数上限 `tenant::MAX_SCANNED_ROWS`（1,000,000）は常に
+- **走査上限**: 1 文あたりの総走査行数上限 `tenant::MAX_SCANNED_ROWS`（1,000,000。Issue #1549 の `--max-scanned-rows` は原子経路の実効値だけを下げ、チャンク予算とは連動しない）は常に
   適用される。対象テナントの所有行が 100 万行を超えるテーブルでは、述語にほとんど一致しなく
   ても 1 文で処理できず `54000` になる。
 - **writer の占有**: redb の writer はプロセス内で 1 つで、全テナントが共有する（`explicit-transaction.md` §1・
