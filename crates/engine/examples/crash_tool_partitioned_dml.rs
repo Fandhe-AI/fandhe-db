@@ -24,7 +24,12 @@
 //! 変更済み行の tag が NULL になる。`finish` の不一致検査で `SET tag = 'NULL'`（文字列）が
 //! 同一 operation_id で `22023` になること（NULL と `'NULL'` が crash 後の台帳でも別 hash）を確かめる。
 //!
-//! サブコマンド（`<mode>` は `delete`・`update`・`update-null`。それ以外は exit 2）:
+//! `update-expr` モード（Issue #1545・SQL-45・RECOVER-10）は `SET tag = 'done', n = n + 1` の
+//! 分割実行で、変更済み行は `n == id + 1` になる。非冪等な式なので、チャンク単位のカーソル再開や
+//! 再送で二重適用（`n == id + 2`）が起きれば破損として検出される。`finish` の不一致検査では
+//! 式だけを `n + 2` に替えた文が crash 後に台帳から読み戻した hash でも `22023` になることを確かめる。
+//!
+//! サブコマンド（`<mode>` は `delete`・`update`・`update-null`・`update-expr`。それ以外は exit 2）:
 //! - `init <db> <mode>`: テーブル作成・テナント A/B へ投入。`SEEDED rows=<n>` を出力。
 //! - `write <db> <mode>`: 分割実行を発行し進捗を `PROGRESS status=<s> rows=<n>` で出力。
 //!   完了後（`DONE`／`ALREADY_COMPLETED`）は kill を待って sleep し続ける（exit 137 の契約を
@@ -78,6 +83,8 @@ enum Mode {
     Update,
     /// `SET tag = NULL`（Issue #1525）。変更済み行は tag が NULL になる。
     UpdateNull,
+    /// `SET tag = 'done', n = n + 1`（Issue #1545）。変更済み行は `n == id + 1` になる。
+    UpdateExpr,
 }
 
 /// NULL の tag セルを `read_rows` 上で表す番兵（シードされる tag は `x`／`y` のみで衝突しない）。
@@ -89,7 +96,17 @@ impl Mode {
             "delete" => Some(Mode::Delete),
             "update" => Some(Mode::Update),
             "update-null" => Some(Mode::UpdateNull),
+            "update-expr" => Some(Mode::UpdateExpr),
             _ => None,
+        }
+    }
+
+    /// 変更済み行（`done_tag` が付いた行）の期待 `n`。`UpdateExpr` だけが `id + 1`、
+    /// それ以外のモードは `n` を触らないため `id` のまま。
+    fn expected_changed_n(self, id: u64) -> i64 {
+        match self {
+            Mode::UpdateExpr => id as i64 + 1,
+            _ => id as i64,
         }
     }
 
@@ -104,6 +121,9 @@ impl Mode {
             Mode::UpdateNull => format!(
                 "UPDATE docs SET tag = NULL WHERE tag = 'x' USING OPERATION_ID '{JOB_OP}' PARTITIONED CHUNK {CHUNK}"
             ),
+            Mode::UpdateExpr => format!(
+                "UPDATE docs SET tag = 'done', n = n + 1 WHERE tag = 'x' USING OPERATION_ID '{JOB_OP}' PARTITIONED CHUNK {CHUNK}"
+            ),
         }
     }
 
@@ -111,7 +131,7 @@ impl Mode {
     fn done_tag(self) -> Option<&'static str> {
         match self {
             Mode::Delete => None,
-            Mode::Update => Some("done"),
+            Mode::Update | Mode::UpdateExpr => Some("done"),
             Mode::UpdateNull => Some(NULL_TAG),
         }
     }
@@ -129,6 +149,10 @@ impl Mode {
             Mode::UpdateNull => format!(
                 "UPDATE docs SET tag = 'NULL' WHERE tag = 'x' USING OPERATION_ID '{JOB_OP}' PARTITIONED CHUNK {CHUNK}"
             ),
+            // 述語・SET 列は同じで、式だけを `n + 2` に替えた文（22023 になるはず）。
+            Mode::UpdateExpr => format!(
+                "UPDATE docs SET tag = 'done', n = n + 2 WHERE tag = 'x' USING OPERATION_ID '{JOB_OP}' PARTITIONED CHUNK {CHUNK}"
+            ),
         }
     }
 
@@ -144,6 +168,9 @@ impl Mode {
             Mode::UpdateNull => {
                 format!("UPDATE docs SET tag = NULL WHERE tag = 'x' USING OPERATION_ID '{JOB_OP}'")
             }
+            Mode::UpdateExpr => format!(
+                "UPDATE docs SET tag = 'done', n = n + 1 WHERE tag = 'x' USING OPERATION_ID '{JOB_OP}'"
+            ),
         }
     }
 }
@@ -153,12 +180,12 @@ fn main() {
     let (sub, path, mode) = match (args.next(), args.next(), args.next()) {
         (Some(s), Some(p), Some(m)) => (s, p, m),
         _ => {
-            eprintln!("usage: crash_tool_partitioned_dml <init|write|verify|finish> <db_path> <delete|update|update-null>");
+            eprintln!("usage: crash_tool_partitioned_dml <init|write|verify|finish> <db_path> <delete|update|update-null|update-expr>");
             std::process::exit(2);
         }
     };
     let Some(mode) = Mode::parse(&mode) else {
-        eprintln!("ERROR: unknown mode (expected delete|update|update-null)");
+        eprintln!("ERROR: unknown mode (expected delete|update|update-null|update-expr)");
         std::process::exit(2);
     };
     let code = match sub.as_str() {
@@ -452,7 +479,7 @@ fn verify(path: &str, mode: Mode) -> Result<(String, i64), String> {
             .copied()
             .filter(|id| !rows.contains_key(id))
             .collect(),
-        Mode::Update | Mode::UpdateNull => matching
+        Mode::Update | Mode::UpdateNull | Mode::UpdateExpr => matching
             .iter()
             .copied()
             .filter(|id| rows.get(id).map(|(t, _)| t.as_str()) == mode.done_tag())
@@ -461,11 +488,12 @@ fn verify(path: &str, mode: Mode) -> Result<(String, i64), String> {
     // 一致行は「未変更」か「変更済み」のどちらかで、内容も整合している。
     for id in &matching {
         if changed.contains(id) {
-            // UPDATE 済み行は tag だけが変わり n は不変（n == id）であること。
-            // 更新済み行の n 破損を見逃さない（DELETE の変更済み行は存在しない）。
+            // UPDATE 済み行は tag が変わり、n は `expected_changed_n`（`update-expr` 以外は
+            // 不変の n == id、`update-expr` は n == id + 1）であること。更新済み行の n 破損
+            // （`update-expr` の二重適用を含む）を見逃さない（DELETE の変更済み行は存在しない）。
             if let Some(done) = mode.done_tag() {
                 match rows.get(id) {
-                    Some((tag, n)) if tag == done && *n == *id as i64 => {}
+                    Some((tag, n)) if tag == done && *n == mode.expected_changed_n(*id) => {}
                     other => {
                         return Err(format!("updated row {id} is corrupted: {other:?}"));
                     }
@@ -549,9 +577,9 @@ fn finish(path: &str, mode: Mode) -> Result<i64, String> {
         match (mode, matching, rows.get(&id)) {
             (Mode::Delete, true, None) => {}
             (Mode::Delete, true, Some(_)) => return Err(format!("row {id} was not deleted")),
-            (Mode::Update | Mode::UpdateNull, true, Some((t, n)))
-                if Some(t.as_str()) == mode.done_tag() && *n == id as i64 => {}
-            (Mode::Update | Mode::UpdateNull, true, other) => {
+            (Mode::Update | Mode::UpdateNull | Mode::UpdateExpr, true, Some((t, n)))
+                if Some(t.as_str()) == mode.done_tag() && *n == mode.expected_changed_n(id) => {}
+            (Mode::Update | Mode::UpdateNull | Mode::UpdateExpr, true, other) => {
                 return Err(format!("row {id} not updated: {other:?}"))
             }
             (_, false, Some((t, n))) if t == "y" && *n == id as i64 => {}

@@ -113,6 +113,13 @@ SET 句の（列名, 値）ペアを**宣言順のまま**（呼び出し元は�
   `22023`。NULL を含まない入力のバイト列は変更前と同一（golden テストで固定）。
   INSERT 系が NULL を除外するのは「明示 NULL と列省略の格納結果が同じ」ためで、
   UPDATE では意味が違うので別扱い
+- SET 右辺に式を含む文（Issue #1544・#1545・SQL-45 ポインタ）: リテラルだけの
+  `for_update_columns`（バイト列不変）とは別ドメインの `OpTag::UpdateColumnsExpr`（13）と
+  `for_update_columns_with_exprs` を使う。各割当は印 1 バイト（`0`＝値・`1`＝式）の後に
+  本体を置き、式は `push_set_expr`（構文木＋数値リテラルの整数分類。詳細は
+  [multi-row-dml-operation-id.md](multi-row-dml-operation-id.md) のタグ表追補）で直列化する。
+  新ドメインで過去の記録が無いため legacy hash は持たない。式違いは `22023`、同一文は
+  `23505`。レイアウトは golden、SQL 経路は `sql45_update_set_expr_resend.rs` で固定
 - 同一 `operation_id` を INSERT で使った後に UPDATE で再利用 → `22023`
   （`OpTag::Insert`／`OpTag::UpdateColumns` の分離により実質的な内容一致でも
   必ず内容不一致として拒否される）
