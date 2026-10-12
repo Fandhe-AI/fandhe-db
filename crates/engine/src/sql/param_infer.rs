@@ -133,6 +133,11 @@ fn promote(lhs: PreparedParamType, rhs: PreparedParamType) -> PreparedParamType 
             _ => None,
         }
     }
+    // 対象外型（DATE／TIMESTAMP の `VectorText`）は昇格で落とさず伝播させ、
+    // 入れ子の算術でも `assign` の `0A000` に到達させる。
+    if lhs == PreparedParamType::VectorText || rhs == PreparedParamType::VectorText {
+        return PreparedParamType::VectorText;
+    }
     match (rank(&lhs), rank(&rhs)) {
         (Some(l), Some(r)) if r > l => rhs,
         _ => lhs,
@@ -230,12 +235,22 @@ impl Inferrer<'_> {
     /// 兄弟式のうち型が決まるもの（最初の `Known`）。決まらず未解決があれば `Unresolved`。
     fn sibling_type<'e>(&self, exprs: impl Iterator<Item = &'e Expr>) -> Ty {
         let mut unresolved = false;
+        let mut first: Option<PreparedParamType> = None;
         for e in exprs {
             match self.type_of(e) {
-                Ty::Known(t) => return Ty::Known(t),
+                // 対象外型は他の兄弟より優先して伝播させる（`0A000` で fail-closed）。
+                Ty::Known(PreparedParamType::VectorText) => {
+                    return Ty::Known(PreparedParamType::VectorText)
+                }
+                Ty::Known(t) => {
+                    first.get_or_insert(t);
+                }
                 Ty::Unresolved => unresolved = true,
                 Ty::Untyped => {}
             }
+        }
+        if let Some(t) = first {
+            return Ty::Known(t);
         }
         if unresolved {
             Ty::Unresolved

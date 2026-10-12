@@ -3912,6 +3912,9 @@ impl EngineCore {
         let param_types = match self.infer_param_types(&tokens, param_count) {
             Ok(types) => types,
             Err(e @ crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype { .. }) => {
+                // 文字列ダミーの定数畳み込みで型エラーになっても途中終了しないよう、
+                // 構文エラー以外を無視して文全体を走査する。
+                let _guard = crate::sql::const_expr::defer_all_non_syntax_errors();
                 if let Err(syntax) =
                     self.parse_tokens(crate::sql::params::substitute_dummy(&tokens))
                 {
@@ -3932,9 +3935,14 @@ impl EngineCore {
         // 仮値での定数畳み込みは値依存エラー（0 除算等）を Bind まで遅延する
         // （`VALUES (1, 10 / $1)` の実値を Bind で受けるため。Parse は構造と型だけ検証）。
         let dummy_tokens = crate::sql::params::substitute_dummy_typed(&tokens, &kinds);
-        let dummy_parsed = if param_count > 0 {
-            crate::sql::const_expr::with_deferred_value_errors(|| self.parse_tokens(dummy_tokens))?
-        } else {
+        let dummy_parsed = {
+            let positions: Vec<usize> = tokens
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| matches!(t, crate::sql::lexer::Token::Param(_)))
+                .map(|(i, _)| i)
+                .collect();
+            let _guard = crate::sql::const_expr::defer_param_value_errors(positions);
             self.parse_tokens(dummy_tokens)?
         };
         Ok(PreparedSql {

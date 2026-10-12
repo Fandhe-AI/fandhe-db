@@ -347,3 +347,57 @@ fn date_literal_neighbor_is_rejected_with_0a000() {
     expect_kind(&mut s, b'Z');
     assert_alive(&mut s);
 }
+/// Parse の `E` 応答に `code` が含まれ、Sync で回復して接続が継続することを確認する。
+fn assert_parse_error(s: &mut Stream, sql: &str, code: &str) {
+    send_length_prefixed_message(s, b'P', &parse_msg("", sql));
+    let body = expect_kind(s, b'E');
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains(code), "{sql}: {text:?}");
+    send_length_prefixed_message(s, b'S', b"");
+    expect_kind(s, b'Z');
+    assert_alive(s);
+}
+
+#[test]
+fn values_unary_minus_param_is_inferred_and_bound() {
+    let (core, _g) = new_core();
+    let mut s = connect(core.clone());
+    let sql = "INSERT INTO t (id, n) VALUES (6, -$1) USING OPERATION_ID $2";
+    assert_eq!(describe_oids(&mut s, sql), vec![OID_INT4, OID_TEXT]);
+    let tag = run(&mut s, sql, &[0], &[b"7", b"m-1"]).expect("bind");
+    assert!(tag.starts_with("INSERT"), "{tag}");
+    assert!(matches!(cell(&core, "n", 6), Cell::SignedInteger(-7)));
+}
+
+#[test]
+fn syntax_error_precedes_42p18_even_when_constant_folding_would_fail() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    assert_parse_error(
+        &mut s,
+        "INSERT INTO t (id, n) VALUES (1, $1 + $2) USING OPERATION_ID 'x' garbage",
+        "42601",
+    );
+}
+
+#[test]
+fn constant_division_by_zero_is_not_deferred_by_other_params() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    assert_parse_error(
+        &mut s,
+        "INSERT INTO t (id, n) VALUES (7, 10 / 0) USING OPERATION_ID $1",
+        "22012",
+    );
+}
+
+#[test]
+fn nested_date_arithmetic_is_rejected_with_0a000() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    assert_parse_error(
+        &mut s,
+        "UPDATE t SET n = $1 + (1 + DATE '2024-01-01') WHERE id = 1 USING OPERATION_ID 'x'",
+        "0A000",
+    );
+}

@@ -209,7 +209,8 @@ prepared_params.rs` で固定）。
 - エラー文言には `$n` の番号だけを含める（値・表の存在情報は含めない）
 - 既知の PG 差分: Parse の宣言 OID は engine に渡らないため、宣言があっても推論不能なら `42P18`。
   小数リテラルとの演算は `DOUBLE`（PG は numeric）。`-$1` は `0 - $1` に脱糖されるため
-  `INTEGER`（PG では曖昧）。`ON CONFLICT ... DO UPDATE SET` の式と `$n` は別担当（`42601` のまま）
+  `INTEGER`（PG では曖昧）。`INSERT ... VALUES` の `-$1` に負の実値を Bind すると `- -n` となり
+  `42601` で fail-closed（既存の二重マイナス拒否と同じ契約）。`ON CONFLICT ... DO UPDATE SET` の式と `$n` は別担当（`42601` のまま）
 
 ## 値の形式（型付き置換。Issue #1342）
 

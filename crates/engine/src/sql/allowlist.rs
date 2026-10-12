@@ -6518,6 +6518,7 @@ impl<'a> Parser<'a> {
             }
             self.pos = start;
         }
+        let span_start = self.pos;
         let saved = self.expr_node_budget;
         self.expr_node_budget = MAX_EXPR_NODES;
         // 定数式では NULL を既定で有効化する（引用された "null" は quoted_null で
@@ -6528,7 +6529,7 @@ impl<'a> Parser<'a> {
         let parsed = self.parse_value_expr_with_null_context(0, true);
         self.const_expr_null_args = prev_null_args;
         self.expr_node_budget = saved;
-        crate::sql::const_expr::fold_const_literal_deferrable(&parsed?)
+        crate::sql::const_expr::fold_const_literal_deferrable(&parsed?, span_start..self.pos)
     }
 
     /// `UPDATE ... SET <col> = <右辺>` の右辺の入口（Issue #1544・SQL-45 のポインタ）。
@@ -12727,6 +12728,9 @@ pub(crate) fn parse_param_inference_expr(
         p.parse_value_expr(0)?
     } else {
         p.const_expr_null_args = true;
+        // 推論専用: `-$1` は置換後の通常 parse では `- <数値>` の符号付きリテラルとして
+        // 受理されるが、推論時は `$1` が識別子のため単項マイナスを許可して脱糖させる。
+        p.allow_unary_minus = true;
         p.parse_value_expr_with_null_context(0, true)?
     };
     p.expect_end_of_statement()?;
