@@ -50,9 +50,18 @@ const MAX_ARRAY_LITERAL_BYTES: usize = 4 * 1024 * 1024;
 /// 結果列型 `result_ty`（`Integer`／`BigInt`／`Real` など。`None` は型を公告できない
 /// VECTOR）を追加した。`ty` は評価器の静的型のまま、RowDescription の型 OID とセル
 /// 表現は `result_ty` から決める（式投影の整数算術を PostgreSQL と同じ int4／int8 にする）。
+///
+/// **Issue #1540（SQL-42）で追加した破壊的変更（BREAKING CHANGE）**: `AliasedId` variant を
+/// 追加した（疑似列 `id` への `AS` 別名。値は `Id` と同じ行キーで、結果列名だけが別名）。
+/// 実在列への別名は `Column` の `name` に別名を載せて表す。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProjectedColumn {
     Id,
+    /// 別名付きの疑似列 `id`（Issue #1540）。結果列メタは `Id` と同じ numeric 公告で
+    /// 名前だけ `name`（JOIN 経路の `meta_with_alias` と同じ写像）。
+    AliasedId {
+        name: String,
+    },
     Column {
         index: usize,
         name: String,
@@ -1318,24 +1327,7 @@ pub fn bind_projection(
         Projection::Columns(names) => {
             let mut cols = Vec::with_capacity(names.len());
             for name in names {
-                // カタログ上の実カラムを疑似列 `id` より優先して照合する（Issue #56
-                // レビュー指摘対応: 以前は `name == "id"` を先に判定していたため、
-                // スキーマが `id` という実カラムを持っていても常に行キー疑似列へ
-                // マップされ、実カラムの値を `SELECT id` で取得する経路がなかった）。
-                if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
-                    cols.push(ProjectedColumn::Column {
-                        index,
-                        name: name.clone(),
-                    });
-                    continue;
-                }
-                if name == "id" {
-                    cols.push(ProjectedColumn::Id);
-                    continue;
-                }
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "unknown column: {name}"
-                )));
+                cols.push(resolve_projected_column(name, name, schema)?);
             }
             Ok(cols)
         }
@@ -1344,20 +1336,16 @@ pub fn bind_projection(
             for item in items {
                 match item {
                     crate::sql::allowlist::SelectItem::Column(name) => {
-                        if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
-                            cols.push(ProjectedColumn::Column {
-                                index,
-                                name: name.clone(),
-                            });
-                            continue;
-                        }
-                        if name == "id" {
-                            cols.push(ProjectedColumn::Id);
-                            continue;
-                        }
-                        return Err(SqlSurfaceError::invalid_input(format!(
-                            "unknown column: {name}"
-                        )));
+                        cols.push(resolve_projected_column(name, name, schema)?);
+                    }
+                    // Issue #1540（SQL-42）: 別名付きの列参照は式評価器を通さず、列と同じ
+                    // 値・型のまま出力名だけ別名にする（式評価器を通すと INTEGER が
+                    // float8 になる等、型・値が変わるため）。ノード予算も消費しない。
+                    crate::sql::allowlist::SelectItem::Expr {
+                        expr: Expr::Ident(name),
+                        alias: Some(alias),
+                    } => {
+                        cols.push(resolve_projected_column(name, alias, schema)?);
                     }
                     crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
                         let (bound, ty, result_ty) = crate::sql::udf_call::bind_projection_expr(
@@ -1379,6 +1367,38 @@ pub fn bind_projection(
             Ok(cols)
         }
     }
+}
+
+/// 列参照 `name` を投影列へ解決する（[`bind_projection`] の `Columns`／`Items` 共通。
+/// Issue #1540〔SQL-42〕で別名付き列のために切り出した）。`output_name` は結果列名
+/// （別名なしは `name` と同じ）。カタログ上の実カラムを疑似列 `id` より優先し、どちらにも
+/// 当たらなければ `22000`（fail-closed。文言には利用者が書いた名前だけを含める）。
+fn resolve_projected_column(
+    name: &str,
+    output_name: &str,
+    schema: &TableSchema,
+) -> Result<ProjectedColumn, SqlSurfaceError> {
+    // カタログ上の実カラムを疑似列 `id` より優先して照合する（Issue #56
+    // レビュー指摘対応: 以前は `name == "id"` を先に判定していたため、スキーマが
+    // `id` という実カラムを持っていても常に行キー疑似列へマップされていた）。
+    if let Some(index) = schema.columns.iter().position(|c| c.name == name) {
+        return Ok(ProjectedColumn::Column {
+            index,
+            name: output_name.to_string(),
+        });
+    }
+    if name == "id" {
+        return Ok(if output_name == name {
+            ProjectedColumn::Id
+        } else {
+            ProjectedColumn::AliasedId {
+                name: output_name.to_string(),
+            }
+        });
+    }
+    Err(SqlSurfaceError::invalid_input(format!(
+        "unknown column: {name}"
+    )))
 }
 
 /// `WHERE` 句の許可述語列（[`WherePredicate`]）を束縛する共通ヘルパー
@@ -6137,13 +6157,31 @@ fn order_kind_for_expr_type(
     }
 }
 
+/// 広域取得 `ORDER BY` の 1 キー分の解決結果（Issue #1540・SQL-42）。
+/// [`resolve_scan_order_aliases`] が SELECT リストの別名を解決した後の形で、
+/// [`bind_scan_order_keys`] が束縛する。
+enum ResolvedScanOrderKey<'a> {
+    /// 別名に当たらなかった、または別名が列・疑似列 `id` を指す元のキー（列名は基底名に
+    /// 置き換え済み）。従来どおり [`bind_scalar_order_by`]／[`bind_expr`] で束縛する。
+    Plain(std::borrow::Cow<'a, crate::sql::allowlist::ScanOrderKey>),
+    /// 別名が投影の式項目を指す。束縛済み投影の式（`ProjectedColumn::Computed`）を
+    /// そのまま並べ替え式に使い、出力値と並べ替え値の意味論を一致させる。
+    ProjectedExpr {
+        expr: crate::sql::udf_call::BoundExpr,
+        ty: crate::sql::udf_call::ExprType,
+        descending: bool,
+    },
+}
+
 /// 式キーを含む広域取得 `ORDER BY`（[`crate::sql::allowlist::ScanOrderKey`]）を束縛する
 /// （Issue #1188・SQL-26）。列名キーは [`bind_scalar_order_by`] を共有し、式キーは
 /// [`crate::sql::udf_call::bind_expr`]（未知関数・型不整合・未知列は既存の束縛エラー）で
 /// 束縛してステップ列へコンパイルする。戻り値の第 2 要素が
-/// [`BoundOrderTarget::Expr`] の添字先。
+/// [`BoundOrderTarget::Expr`] の添字先。Issue #1540（SQL-42）で、別名解決済みキー
+/// （[`ResolvedScanOrderKey`]）を受け取る形に広げた。別名の式は束縛済みの式を再利用し、
+/// ノード予算を再消費しない。
 fn bind_scan_order_keys(
-    keys: &[crate::sql::allowlist::ScanOrderKey],
+    keys: &[ResolvedScanOrderKey<'_>],
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
@@ -6153,23 +6191,155 @@ fn bind_scan_order_keys(
     let mut exprs = Vec::new();
     for key in keys {
         match key {
-            ScanOrderKey::Column(k) => {
-                bound.extend(bind_scalar_order_by(std::slice::from_ref(k), schema)?);
-            }
-            ScanOrderKey::Expr { expr, descending } => {
-                let (be, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
-                let kind = order_kind_for_expr_type(ty)?;
-                let program = crate::sql::expr_program::ExprProgram::compile(&be);
+            ResolvedScanOrderKey::Plain(k) => match k.as_ref() {
+                ScanOrderKey::Column(k) => {
+                    bound.extend(bind_scalar_order_by(std::slice::from_ref(k), schema)?);
+                }
+                ScanOrderKey::Expr { expr, descending } => {
+                    let (be, ty) =
+                        crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+                    let kind = order_kind_for_expr_type(ty)?;
+                    let program = crate::sql::expr_program::ExprProgram::compile(&be);
+                    bound.push(BoundOrderKey {
+                        target: BoundOrderTarget::Expr(exprs.len()),
+                        kind,
+                        descending: *descending,
+                    });
+                    exprs.push((be, program));
+                }
+            },
+            ResolvedScanOrderKey::ProjectedExpr {
+                expr,
+                ty,
+                descending,
+            } => {
+                let kind = order_kind_for_expr_type(*ty)?;
+                let program = crate::sql::expr_program::ExprProgram::compile(expr);
                 bound.push(BoundOrderKey {
                     target: BoundOrderTarget::Expr(exprs.len()),
                     kind,
                     descending: *descending,
                 });
-                exprs.push((be, program));
+                exprs.push((expr.clone(), program));
             }
         }
     }
     Ok((bound, exprs))
+}
+
+/// 広域取得の `ORDER BY` キーのうち、SELECT リストの明示別名を参照するものを解決する
+/// （Issue #1540・SQL-42。[`bind_scan_with_dummy_flags`] から呼ばれる）。
+///
+/// 規則（PostgreSQL の出力名解決に合わせ、別名に当たらない文は従来と同一にする）:
+/// 1. 対象は裸名キー（`ScanOrderKey::Column`）のみ。式キーの中の識別子は入力列だけで解決する
+/// 2. キー名が明示別名（`SelectItem::Expr { alias: Some(_) }`）のどれかに一致したときだけ
+///    別名解決に入る（別名なしの文・別名に当たらないキーは変更しない）
+/// 3. 候補は出力名がキー名に一致する全項目（明示別名＋別名なしの裸の列項目）。全候補が同じ
+///    対象（同じ基底列名・構文上等しい式）を指すなら解決し、異なる対象が複数あれば
+///    `42702`（`ambiguous_column`。文言は名前のみ）
+/// 4. 列・`id` への別名は基底列名へ置き換えて従来の束縛へ、式への別名は束縛済み投影の式を使う
+/// 5. 別名は実在列名より優先する（JOIN 経路・PostgreSQL と同じ）
+///
+/// `has_windows` のとき、式への別名はウィンドウ経路が式キーを持てないため `42601`。
+/// `bound_projection` は `Projection::Items` の項目と 1 対 1 に並ぶ束縛結果。
+fn resolve_scan_order_aliases<'a>(
+    projection: &Projection,
+    bound_projection: &[ProjectedColumn],
+    keys: Vec<std::borrow::Cow<'a, crate::sql::allowlist::ScanOrderKey>>,
+    has_windows: bool,
+) -> Result<Vec<ResolvedScanOrderKey<'a>>, SqlSurfaceError> {
+    use crate::sql::allowlist::{ScalarOrderKey, ScanOrderKey, SelectItem};
+    let Projection::Items(items) = projection else {
+        return Ok(keys.into_iter().map(ResolvedScanOrderKey::Plain).collect());
+    };
+    // 出力名の対象: 基底列名（列・`id`）か、束縛済み投影の式項目。
+    enum Target<'e> {
+        Base(&'e str),
+        Expr(usize, &'e Expr),
+    }
+    let output: Vec<Option<(&str, Target<'_>)>> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| match item {
+            SelectItem::Column(name) => Some((name.as_str(), Target::Base(name.as_str()))),
+            SelectItem::Expr {
+                expr: Expr::Ident(base),
+                alias: Some(alias),
+            } => Some((alias.as_str(), Target::Base(base.as_str()))),
+            SelectItem::Expr {
+                expr,
+                alias: Some(alias),
+            } => Some((alias.as_str(), Target::Expr(i, expr))),
+            SelectItem::Expr { alias: None, .. } => None,
+        })
+        .collect();
+    let has_explicit = |name: &str| {
+        items
+            .iter()
+            .any(|item| matches!(item, SelectItem::Expr { alias: Some(a), .. } if a == name))
+    };
+    let same_target = |a: &Target<'_>, b: &Target<'_>| match (a, b) {
+        (Target::Base(x), Target::Base(y)) => x == y,
+        (Target::Expr(_, x), Target::Expr(_, y)) => x == y,
+        _ => false,
+    };
+
+    let mut resolved = Vec::with_capacity(keys.len());
+    for key in keys {
+        let ScanOrderKey::Column(k) = key.as_ref() else {
+            resolved.push(ResolvedScanOrderKey::Plain(key));
+            continue;
+        };
+        if !has_explicit(&k.column) {
+            resolved.push(ResolvedScanOrderKey::Plain(key));
+            continue;
+        }
+        let mut candidates = output
+            .iter()
+            .flatten()
+            .filter(|(name, _)| *name == k.column.as_str())
+            .map(|(_, t)| t);
+        let Some(first) = candidates.next() else {
+            resolved.push(ResolvedScanOrderKey::Plain(key));
+            continue;
+        };
+        if candidates.any(|t| !same_target(first, t)) {
+            return Err(SqlSurfaceError::ambiguous_column(k.column.clone()));
+        }
+        match first {
+            Target::Base(base) => {
+                resolved.push(ResolvedScanOrderKey::Plain(std::borrow::Cow::Owned(
+                    ScanOrderKey::Column(ScalarOrderKey {
+                        column: (*base).to_string(),
+                        descending: k.descending,
+                    }),
+                )));
+            }
+            Target::Expr(i, _) => {
+                if has_windows {
+                    return Err(SqlSurfaceError::unsupported(
+                        "expression ORDER BY keys are not supported with window functions",
+                    ));
+                }
+                match bound_projection.get(*i) {
+                    Some(ProjectedColumn::Computed { expr, ty, .. }) => {
+                        resolved.push(ResolvedScanOrderKey::ProjectedExpr {
+                            expr: expr.clone(),
+                            ty: *ty,
+                            descending: k.descending,
+                        });
+                    }
+                    _ => {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "ORDER BY alias does not map to a computed projection"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 impl BoundScan {
@@ -6690,11 +6860,30 @@ pub(crate) fn bind_scan_with_dummy_flags(
     // Issue #915・SQL-25: スカラー ORDER BY の列名解決・比較規約の割り当て。
     // Issue #1188・SQL-26: 式キーを含む場合は `order_keys` が正本（`order_by` は空）。
     // 式のノード予算は `WHERE`・投影と同じ `node_budget` を共有する。
-    let (order_by, order_exprs) = if stmt.order_keys.is_empty() {
-        (bind_scalar_order_by(stmt.order_by(), schema)?, Vec::new())
-    } else {
-        bind_scan_order_keys(&stmt.order_keys, schema, udfs, &mut node_budget)?
-    };
+    // Issue #1540・SQL-42: SELECT リストの明示別名を参照するキーは先に解決する
+    // （別名に当たらない文は従来と同一の束縛結果になる）。
+    let raw_keys: Vec<std::borrow::Cow<'_, crate::sql::allowlist::ScanOrderKey>> =
+        if stmt.order_keys.is_empty() {
+            stmt.order_by()
+                .iter()
+                .map(|k| {
+                    std::borrow::Cow::Owned(crate::sql::allowlist::ScanOrderKey::Column(k.clone()))
+                })
+                .collect()
+        } else {
+            stmt.order_keys
+                .iter()
+                .map(std::borrow::Cow::Borrowed)
+                .collect()
+        };
+    let resolved_keys = resolve_scan_order_aliases(
+        stmt.projection(),
+        &projection,
+        raw_keys,
+        !stmt.window_items.is_empty(),
+    )?;
+    let (order_by, order_exprs) =
+        bind_scan_order_keys(&resolved_keys, schema, udfs, &mut node_budget)?;
 
     // Issue #353 と同じく、`expr_filters` を束縛時に 1 回だけステップ列コンパイル
     // する（行ループでの再帰評価をなくす）。

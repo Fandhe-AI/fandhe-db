@@ -315,13 +315,9 @@ impl<'a, 'b> Binder<'a, 'b> {
                 name: a.clone(),
                 ty,
             },
-            ColumnMeta::Id => ColumnMeta::Computed {
-                name: a.clone(),
-                ty: Some(ColumnType::Numeric {
-                    precision: 20,
-                    scale: 0,
-                }),
-            },
+            ColumnMeta::Id | ColumnMeta::AliasedId { .. } => {
+                crate::sql::exec::aliased_id_column_meta(a)
+            }
             ColumnMeta::Computed { ty, .. } => ColumnMeta::Computed {
                 name: a.clone(),
                 ty,

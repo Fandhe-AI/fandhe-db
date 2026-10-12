@@ -246,6 +246,12 @@ pub enum Cell {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnMeta {
     Id,
+    /// 別名付き疑似列 `id`（Issue #1540・SQL-42 の査読対応）。wire 上の型は `Id` と同じ
+    /// numeric で公告するが、サブクエリの値族判定では別名なしの `Id` と同じ整数族として
+    /// 扱うため、`Computed { Numeric }` とは別 variant で由来を保持する。
+    AliasedId {
+        name: String,
+    },
     Scalar {
         name: String,
         ty: ColumnType,
@@ -273,6 +279,22 @@ pub(crate) fn computed_column_meta(name: &str, result_ty: &Option<ColumnType>) -
     ColumnMeta::Computed {
         name: name.to_string(),
         ty: result_ty.clone(),
+    }
+}
+
+/// [`ColumnMeta::AliasedId`] が wire 上・型比較で公告する静的型（疑似列 `id` と同じ numeric）。
+pub(crate) static ALIASED_ID_TYPE: ColumnType = ColumnType::Numeric {
+    precision: 20,
+    scale: 0,
+};
+
+/// 別名付き疑似列 `id`（`ProjectedColumn::AliasedId`。Issue #1540・SQL-42）の結果列メタ。
+/// `ColumnMeta::Id` は名前を持てないため、専用の [`ColumnMeta::AliasedId`] で別名を公告する
+/// （wire 上の型 OID は `Id` と同じ numeric。サブクエリの値族判定では整数族を維持する。
+/// JOIN 経路の `meta_with_alias` と同じ写像。通常 SELECT・スキャン・Describe が共有する）。
+pub(crate) fn aliased_id_column_meta(name: &str) -> ColumnMeta {
+    ColumnMeta::AliasedId {
+        name: name.to_string(),
     }
 }
 
@@ -944,7 +966,9 @@ pub(crate) fn execute_statement_with_cache(
             // （`BoundExpr::TextColumnRef`）を持ちうるため、その列だけは下で
             // 個別に追加する（この `filter_map` 自体は単一列版のみを返せるため
             // `None` のまま素通しし、複数列を返せる下のループへ委ねる）。
-            ProjectedColumn::Id | ProjectedColumn::Computed { .. } => None,
+            ProjectedColumn::Id
+            | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::Computed { .. } => None,
         })
         .collect();
     for col in &bound.projection {
@@ -2555,6 +2579,7 @@ pub(crate) fn execute_statement_with_cache(
         .iter()
         .map(|col| match col {
             ProjectedColumn::Id => ColumnMeta::Id,
+            ProjectedColumn::AliasedId { name } => crate::sql::exec::aliased_id_column_meta(name),
             ProjectedColumn::Column { index, name } => ColumnMeta::Scalar {
                 name: name.clone(),
                 ty: schema
@@ -2864,7 +2889,9 @@ fn project_rows(
             ProjectedColumn::Computed { expr, .. } => {
                 Some(crate::sql::expr_program::ExprProgram::compile(expr))
             }
-            ProjectedColumn::Id | ProjectedColumn::Column { .. } => None,
+            ProjectedColumn::Id
+            | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::Column { .. } => None,
         })
         .collect();
     let mut expr_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
@@ -2973,7 +3000,9 @@ fn project_rows(
         let mut cells = Vec::with_capacity(projection.len());
         for (col_idx, col) in projection.iter().enumerate() {
             match col {
-                ProjectedColumn::Id => cells.push(Cell::Integer(id)),
+                ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {
+                    cells.push(Cell::Integer(id))
+                }
                 ProjectedColumn::Column { index, .. } => {
                     let column =
                         schema

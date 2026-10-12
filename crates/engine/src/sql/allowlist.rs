@@ -1550,6 +1550,10 @@ pub enum SelectItem {
     /// 関数呼び出しを頂点に持つ式項目（TASK-79・SQL-9: 宣言的 UDF・組み込み関数の
     /// 結果列位置での呼び出し）。`alias` 省略時の列名は `sql::parser` が関数名から
     /// 導出する。
+    ///
+    /// Issue #1540（SQL-42）契約: `expr` が [`Expr::Ident`] で `alias` が `Some` の項目は
+    /// 「別名付きの列参照（実在列または疑似列 `id`）」を表す。値と型は別名なしの列と
+    /// 同一で、式評価器を通さない（`sql::parser::bind_projection` が特別扱いする）。
     Expr { expr: Expr, alias: Option<String> },
 }
 
@@ -3850,7 +3854,18 @@ impl<'a> Parser<'a> {
                 } else if next_is_op {
                     self.parse_projection_infix(0)?
                 } else {
-                    return Ok(SelectItem::Column(self.expect_ident()?));
+                    let col = self.expect_ident()?;
+                    // Issue #1540（SQL-42）: 裸の列・疑似列 `id` への `AS` 別名。
+                    // 別名なしは従来どおり `Column`（`Projection::Columns` を保つ）。
+                    if self.peek_ident_matches("AS") {
+                        self.advance();
+                        let alias = self.expect_ident()?;
+                        return Ok(SelectItem::Expr {
+                            expr: Expr::Ident(col),
+                            alias: Some(alias),
+                        });
+                    }
+                    return Ok(SelectItem::Column(col));
                 }
             }
             Some(Token::Punct('(' | '-')) | Some(Token::Number(_)) => {
@@ -3860,14 +3875,11 @@ impl<'a> Parser<'a> {
         };
         let has_alias = self.peek_ident_matches("AS");
         // `(n)` ≡ `n`: 別名なしの括弧付き裸識別子は列項目へ戻す（`Projection::Columns` を保つ）。
-        // 列への別名は別 Issue の担当のため fail-closed で拒否する。
+        // 別名付きは Issue #1540（SQL-42）の契約どおり `Expr::Ident` ＋ `alias` で返す。
         if let Expr::Ident(name) = &expr {
-            if has_alias {
-                return Err(SqlSurfaceError::unsupported(
-                    "column alias is not supported for a parenthesized column",
-                ));
+            if !has_alias {
+                return Ok(SelectItem::Column(name.clone()));
             }
-            return Ok(SelectItem::Column(name.clone()));
         }
         let alias = if has_alias {
             self.advance();
@@ -19279,9 +19291,51 @@ mod tests {
 
     #[test]
     fn projection_infix_rejections() {
-        for list in ["(n) AS x", "n % 2", "'a' + n", "n +", "(n"] {
+        for list in ["n % 2", "'a' + n", "n +", "(n"] {
             let r = scan_items(list);
             assert_eq!(r.expect_err(list).wire_code(), "42601", "{list}");
+        }
+    }
+
+    /// Issue #1540・SQL-42: 列・疑似列 `id`・括弧付き列への `AS` 別名は
+    /// `Expr::Ident` ＋ `alias` で表し、別名のない列は従来どおり `Columns` に残る。
+    #[test]
+    fn column_alias_is_an_ident_expr_with_alias() {
+        let items =
+            select_expr_items(&scan_items("id AS i, n+1 AS m, (n) AS x, n AS a").expect("ok"));
+        let alias_of = |item: &SelectItem| match item {
+            SelectItem::Expr {
+                expr: Expr::Ident(name),
+                alias: Some(alias),
+            } => Some((name.clone(), alias.clone())),
+            _ => None,
+        };
+        assert_eq!(
+            alias_of(&items[0]),
+            Some(("id".to_string(), "i".to_string()))
+        );
+        assert_eq!(alias_of(&items[1]), None);
+        assert_eq!(
+            alias_of(&items[2]),
+            Some(("n".to_string(), "x".to_string()))
+        );
+        assert_eq!(
+            alias_of(&items[3]),
+            Some(("n".to_string(), "a".to_string()))
+        );
+        // 別名なしのリストは `Columns` のまま。
+        let plain = scan_items("id, n").expect("ok");
+        assert!(matches!(plain.projection, Projection::Columns(_)));
+        // 列名が `as` の既存形は別名構文と取り違えない。
+        let as_col = scan_items("as, n").expect("ok");
+        assert!(matches!(as_col.projection, Projection::Columns(_)));
+        // 予約語の別名・暗黙の別名は従来どおり `42601`。
+        for list in ["n AS", "n m", "n AS FROM"] {
+            assert_eq!(
+                scan_items(list).expect_err(list).wire_code(),
+                "42601",
+                "{list}"
+            );
         }
     }
 

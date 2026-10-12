@@ -64,7 +64,9 @@ use super::window::{window_result_type, CellWindowEvaluator};
 fn column_name(meta: &ColumnMeta) -> &str {
     match meta {
         ColumnMeta::Id => "id",
-        ColumnMeta::Scalar { name, .. } | ColumnMeta::Computed { name, .. } => name,
+        ColumnMeta::Scalar { name, .. }
+        | ColumnMeta::Computed { name, .. }
+        | ColumnMeta::AliasedId { name } => name,
     }
 }
 
@@ -354,6 +356,7 @@ fn evaluable_type(meta: &ColumnMeta) -> Option<&ColumnType> {
     static ID_TYPE: ColumnType = ColumnType::BigInt;
     let ty = match meta {
         ColumnMeta::Id => &ID_TYPE,
+        ColumnMeta::AliasedId { .. } => &crate::sql::exec::ALIASED_ID_TYPE,
         ColumnMeta::Scalar { ty, .. } => ty,
         ColumnMeta::Computed { ty: Some(ty), .. } => ty,
         ColumnMeta::Computed { ty: None, .. } => return None,
@@ -523,6 +526,7 @@ fn plan_order(
         };
         let class = match body_columns.get(index).ok_or_else(internal_error)? {
             ColumnMeta::Id => cmp_class(None),
+            ColumnMeta::AliasedId { .. } => cmp_class(Some(&crate::sql::exec::ALIASED_ID_TYPE)),
             ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
                 cmp_class(Some(ty))
             }

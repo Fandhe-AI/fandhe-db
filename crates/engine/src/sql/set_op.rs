@@ -164,6 +164,7 @@ fn columns_compatible(a: &ColumnMeta, b: &ColumnMeta) -> bool {
         match m {
             ColumnMeta::Scalar { ty, .. } => Some(ty),
             ColumnMeta::Computed { ty: Some(ty), .. } => Some(ty),
+            ColumnMeta::AliasedId { .. } => Some(&crate::sql::exec::ALIASED_ID_TYPE),
             ColumnMeta::Id | ColumnMeta::Computed { ty: None, .. } => None,
         }
     }

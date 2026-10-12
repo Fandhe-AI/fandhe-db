@@ -144,6 +144,10 @@ pub(crate) fn column_meta(
         .iter()
         .map(|col| match col {
             ProjectedColumn::Id => Ok(ColumnMeta::Id),
+            // RETURNING は式・別名付き項目（`Projection::Items`）を構文段で拒否するため到達しない。
+            ProjectedColumn::AliasedId { .. } => Err(SqlSurfaceError::Internal {
+                detail: "aliased id is not supported in RETURNING".to_string(),
+            }),
             ProjectedColumn::Column { index, name } => {
                 let ty = schema
                     .columns
@@ -182,6 +186,11 @@ pub(crate) fn project_row(
     for col in projection {
         let cell = match col {
             ProjectedColumn::Id => Cell::Integer(id),
+            ProjectedColumn::AliasedId { .. } => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "aliased id is not supported in RETURNING".to_string(),
+                });
+            }
             ProjectedColumn::Column { index, .. } => match values.get(*index) {
                 Some(Value::Null) => Cell::Null,
                 Some(Value::Text(s)) => Cell::Text(try_alloc_text_for_budget(
