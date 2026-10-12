@@ -195,7 +195,8 @@ fn scalar_to_value(ty: &ColumnType, v: f64) -> Option<Result<Value, SqlSurfaceEr
         }
         ColumnType::Real => {
             let r = v as f32;
-            if v.is_finite() && r.is_finite() {
+            // 非ゼロ値が 0 に丸められる（アンダーフロー）場合も `scalar_float::parse_real` と同じく拒否する。
+            if v.is_finite() && r.is_finite() && !(v != 0.0 && r == 0.0) {
                 Ok(Value::Real(r))
             } else {
                 Err(out_of_range("real"))
@@ -359,6 +360,14 @@ mod tests {
         assert_eq!(eval("n", &half, &row(5)).unwrap(), Value::Integer(2));
         // 7 / 2.0 = 3.5 -> 4
         assert_eq!(eval("n", &half, &row(7)).unwrap(), Value::Integer(4));
+    }
+
+    #[test]
+    fn real_target_rejects_nonzero_underflow() {
+        let r = scalar_to_value(&ColumnType::Real, 1.0e-50).expect("numeric target");
+        assert_eq!(r.expect_err("underflow").wire_code(), "22003");
+        let r = scalar_to_value(&ColumnType::Real, 0.0).expect("numeric target");
+        assert_eq!(r.expect("zero ok"), Value::Real(0.0));
     }
 
     #[test]
