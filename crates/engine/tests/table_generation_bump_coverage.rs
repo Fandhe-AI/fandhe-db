@@ -388,7 +388,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 戻さない）。`USING PLAN` の世代照合が見る対象は行・カタログの変更だけなのでバンプ不要。
     // 実行器側（`tenant/partitioned_dml.rs::finalize_cancel`）と `CANCEL PARTITIONED DML`
     // 文（`sql/partitioned.rs::execute_cancel`）の 2 箇所。
-    ("tenant/partitioned_dml.rs", 254),
+    // Issue #1544（`Kind::Update` への `set_exprs` 追加）で行が移動したための追随（旧: 254）。
+    ("tenant/partitioned_dml.rs", 261),
     ("sql/partitioned.rs", 333),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
@@ -416,7 +417,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1179: 全書き込み経路（INSERT・UPSERT・UPDATE・DELETE）が `with_txn` へ
     // 集約され、`f` のクロージャ内で `bump_table_generation_in_txn` を呼んでから
     // `TxnEffect::Wrote` を返す構造になった（回帰ではなく構造変更への追随。旧: 453・466）。
-    ("tenant.rs", 493),
+    // Issue #2328 等の base 取り込みと Issue #1544 の追加で行が移動したための追随（旧: 493）。
+    ("tenant.rs", 503),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

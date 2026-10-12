@@ -1030,6 +1030,7 @@ mod tests {
             &ctx("tenant-a"),
             1,
             &[(0, Value::Text("b".to_string()))],
+            &[],
             LedgerWrite::Disabled,
             None,
         )
