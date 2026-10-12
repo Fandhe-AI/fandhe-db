@@ -12131,7 +12131,8 @@ fn validate_select_statement(
                     .where_predicates
                     .iter()
                     .try_for_each(check_buffered_outer_pred)?;
-                super::parser::validate_search_limit(shape.limit)?;
+                // `LIMIT` の範囲は構文段では検査しない（設定値を持たないため）。
+                // `EngineCore::check_buffered_outer_limit` が設定値で検査する（Issue #1555）。
                 super::parser::validate_search_offset(shape.offset)?;
                 return Ok(Statement::BufferedView(ValidatedBufferedView {
                     view_name,

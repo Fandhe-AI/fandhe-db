@@ -4050,6 +4050,7 @@ impl EngineCore {
             &prepared.dummy_parsed,
             prepared.order_by_distance_literal_is_param,
             &prepared.where_equality_dummy_flags,
+            &self.result_limits,
         )
     }
 
@@ -4866,7 +4867,7 @@ impl EngineCore {
         // `dummy_equality_flags = &[]`）。ダミー値専用の縮退は
         // `describe_prepared_in_session` のみが使う（PR #1012 レビュー指摘
         // 対応。詳細は同メソッドのコメント参照）。
-        self.describe_parsed_in_session_impl(session, parsed, false, &[])
+        self.describe_parsed_in_session_impl(session, parsed, false, &[], &self.result_limits)
     }
 
     /// [`Self::describe_parsed_in_session`] のトランザクション対応版
@@ -4932,6 +4933,7 @@ impl EngineCore {
         parsed: &ParsedSql,
         skip_vector_literal_validation: bool,
         dummy_equality_flags: &[bool],
+        limits: &crate::result_limits::ResultLimits,
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
         use crate::sql::allowlist::{DeleteStatement, Statement, ValidatedUpdateForm};
@@ -5050,7 +5052,7 @@ impl EngineCore {
                     &schema,
                     session.udfs(),
                     dummy_equality_flags,
-                    &self.result_limits,
+                    limits,
                 )?;
                 // SQL-30・TASK-214（Issue #930）: ウィンドウ項目を含む広域取得の
                 // Describe 列は `scan_columns` が実行時（`sql::window::
@@ -5071,7 +5073,7 @@ impl EngineCore {
                     session.udfs(),
                     dummy_equality_flags,
                     validated.limit,
-                    &self.result_limits,
+                    limits,
                 )?;
                 Ok(Some(columns))
             }
@@ -5086,7 +5088,7 @@ impl EngineCore {
                     &schemas,
                     validated,
                     session.udfs(),
-                    &self.result_limits,
+                    limits,
                 )?;
                 Ok(Some(columns))
             }
@@ -5102,6 +5104,9 @@ impl EngineCore {
                     &body_parsed,
                     skip_vector_literal_validation,
                     &[],
+                    // 本文の `LIMIT` は外側の設定値と連動させず独立した既定値で検証する
+                    // （result-limits-cli.md の「内側 LIMIT は連動しない」）。
+                    &crate::result_limits::ResultLimits::default(),
                 )?;
                 match body_columns {
                     Some(cols) => {
@@ -5165,7 +5170,7 @@ impl EngineCore {
                         session.udfs(),
                         !skip_vector_literal_validation,
                         dummy_equality_flags,
-                        &self.result_limits,
+                        limits,
                     )?;
                     Ok(Some(crate::sql::describe::projected_columns(
                         &projection,
@@ -5538,6 +5543,20 @@ impl EngineCore {
         stmt: crate::sql::allowlist::Statement,
         read_txn: &R,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.execute_read_statement_with_limits(ctx, session, stmt, read_txn, self.result_limits)
+    }
+
+    /// [`Self::execute_read_statement`] の本体。明示 `LIMIT` の範囲上限を引数で受ける
+    /// （Issue #1555）。評価後射影形ビューの本文は外側の設定値と連動させず、
+    /// 独立した既定値で実行するために分離している。
+    fn execute_read_statement_with_limits<R: crate::storage::read_source::ReadSource>(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        stmt: crate::sql::allowlist::Statement,
+        read_txn: &R,
+        limits: crate::result_limits::ResultLimits,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // TABLE-15・Issue #1363: スナップショット確定後・スキーマ解決前の同期点
         // （feature 限定。既定ビルドでは消える）。
         #[cfg(feature = "test-sync-points")]
@@ -5551,7 +5570,7 @@ impl EngineCore {
                     &schema,
                     session.search_mode(),
                     session.udfs(),
-                    &self.result_limits,
+                    &limits,
                 )?;
                 let result = self.run_select_plan(read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
@@ -5616,7 +5635,7 @@ impl EngineCore {
                     &schema,
                     session.udfs(),
                     &[],
-                    &self.result_limits,
+                    &limits,
                 )?;
                 let resolved_items = crate::sql::subquery::resolve_scalar_projection_items(
                     &projection_items,
@@ -5649,7 +5668,7 @@ impl EngineCore {
                     session.udfs(),
                     validated.limit,
                     self.group_by_limits,
-                    self.result_limits,
+                    limits,
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -5664,7 +5683,7 @@ impl EngineCore {
                     session.udfs(),
                     self.group_by_limits,
                     self.join_limits,
-                    self.result_limits,
+                    limits,
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -5677,7 +5696,13 @@ impl EngineCore {
             crate::sql::allowlist::Statement::BufferedView(validated) => {
                 self.check_buffered_outer_limit(&validated)?;
                 let body = (*validated.body).clone();
-                match self.execute_read_statement(ctx, session, body, read_txn)? {
+                match self.execute_read_statement_with_limits(
+                    ctx,
+                    session,
+                    body,
+                    read_txn,
+                    crate::result_limits::ResultLimits::default(),
+                )? {
                     crate::sql::SqlOutcome::Query(result) => {
                         // Issue #1360: 外側の WHERE・ORDER BY・射影・LIMIT/OFFSET は
                         // 評価済みの本文結果に対する後処理（Describe と同じ

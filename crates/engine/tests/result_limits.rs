@@ -257,3 +257,31 @@ fn bound_plan_entry_rechecks_against_configured_limit() {
         .expect_err("limit above the configured range must be rejected");
     assert_eq!(err.wire_code(), "22000");
 }
+
+/// 上げた設定でも評価後射影形ビューの外側 `LIMIT` が構文段の既定値で先に拒否されない。
+#[test]
+fn raised_limit_accepts_buffered_view_outer_limit_above_default() {
+    let path = unique_db_path("result-limits-raised-view");
+    let _guard = CleanupGuard(path.clone());
+    let core = core_with(&path, Some(MAX_RESULT_ROWS_HARD_CAP));
+    ok(&core, "CREATE VIEW v AS SELECT id FROM docs LIMIT 3");
+    assert_boundary(&core, MAX_RESULT_ROWS_HARD_CAP, |n| {
+        format!("SELECT id FROM v LIMIT {n}")
+    });
+}
+
+/// ビュー本文の内側 `LIMIT` は外側の設定値と連動せず、既定値（10,000）で独立に検証される
+/// （実行・Describe の両方）。
+#[test]
+fn lowered_limit_does_not_apply_to_view_body_limit() {
+    let path = unique_db_path("result-limits-view-body");
+    let _guard = CleanupGuard(path.clone());
+    let core = core_with(&path, None);
+    ok(&core, "CREATE VIEW v AS SELECT id FROM docs LIMIT 100");
+    let core = core.with_result_limits(ResultLimits::new(50));
+    ok(&core, "SELECT id FROM v LIMIT 10");
+    let parsed = core.parse_sql("SELECT id FROM v LIMIT 10").expect("parse");
+    let session = SessionState::default();
+    core.describe_parsed_in_session(&session, &parsed)
+        .expect("describe must not apply the outer setting to the view body");
+}
