@@ -156,7 +156,7 @@ fn eval_node(expr: &Expr) -> Option<ExprValue<'static>> {
     let mut budget = MAX_EXPR_NODES;
     // 裸の NULL を含む式は型付き NULL へ畳んでから束縛し、短絡判定に使えるようにする。
     let folded = propagate_null(expr).ok()?;
-    let (bound, _ty) = bind_const_expr(&folded, &registry, &mut budget).ok()?;
+    let (bound, _ty, _) = bind_const_expr(&folded, &registry, &mut budget).ok()?;
     eval(&bound, 0, &[]).ok()
 }
 
@@ -167,7 +167,7 @@ fn check_node_value(expr: &Expr, enabled: bool) -> Result<(), SqlSurfaceError> {
     }
     let registry = UdfRegistry::default();
     let mut budget = MAX_EXPR_NODES;
-    let Ok((bound, _ty)) = bind_const_expr(expr, &registry, &mut budget) else {
+    let Ok((bound, _ty, _)) = bind_const_expr(expr, &registry, &mut budget) else {
         return Ok(());
     };
     if let Ok(ExprValue::Scalar(v)) = eval(&bound, 0, &[]) {
@@ -285,7 +285,7 @@ fn fold_null_binary(
             let registry = UdfRegistry::default();
             let mut budget = MAX_EXPR_NODES;
             match bind_const_expr(&probe, &registry, &mut budget) {
-                Ok((_, ty)) => {
+                Ok((_, ty, _)) => {
                     return if ln.is_some() && rn.is_some() {
                         typed_null(ty)
                     } else {
@@ -421,7 +421,7 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
     let expr = &propagated;
     let registry = UdfRegistry::default();
     let mut budget = MAX_EXPR_NODES;
-    let (bound, _ty) = bind_const_expr(expr, &registry, &mut budget)?;
+    let (bound, _ty, _) = bind_const_expr(expr, &registry, &mut budget)?;
     if crate::sql::udf_call::references_embedding(&bound) || matches!(bound, BoundExpr::IdRef) {
         return Err(SqlSurfaceError::Internal {
             detail: "constant expression resolved to a row reference".to_string(),
@@ -490,8 +490,13 @@ mod tests {
             fold_const_literal(&call("upper", vec![Expr::String("a".into())])).unwrap(),
             InsertLiteral::String("A".into())
         );
+        // 整数同士の除算は整数除算（main の型付き算術。PostgreSQL と同じ）、小数を含めば小数。
         assert_eq!(
             fold_const_literal(&bin(BinOp::Div, num("1"), num("2"))).unwrap(),
+            InsertLiteral::Number("0".into())
+        );
+        assert_eq!(
+            fold_const_literal(&bin(BinOp::Div, num("1.0"), num("2"))).unwrap(),
             InsertLiteral::Number("0.5".into())
         );
         assert_eq!(

@@ -76,8 +76,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （旧: 652／683）。
     // Issue #1179（`storage::read_source` モジュール宣言の追加）で行番号が移動したための追随（旧: 804／835）。
     // Issue #1128（`begin_partitioned_chunk_txn` の追加）で行番号が移動したための追随（旧: 820／851）。
-    ("storage.rs", 875),
-    ("storage.rs", 906),
+    ("storage.rs", 930),
+    ("storage.rs", 961),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 201),
     ("txn.rs", 372),
@@ -191,7 +191,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8275）。
     // Issue #1427（CHECK 参照列の拡大変換受理。`catalog.rs` に行が追加）で追随（旧: 8395）。
     // Issue #1436（連鎖本文の式述語の保留・再検証。`catalog.rs` に行が追加）で一括追随（旧: 8458/8539/8670/8703）。
-    ("catalog.rs", 8538),
+    // Issue #1548（`ArrayType::with_max_len`・`alter_table_add_column_with_limit`。`catalog.rs` に行が追加）で一括追随（+30 行。旧: 8538/8619/8758/8791）。
+    ("catalog.rs", 8568),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -250,7 +251,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1364（名前付き主キー・カタログ v13。`catalog.rs` に行が追加）で追随（旧: 7892）。
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8356）。
     // Issue #1427（CHECK 参照列の拡大変換受理。`catalog.rs` に行が追加）で追随（旧: 8476）。
-    ("catalog.rs", 8619),
+    ("catalog.rs", 8649),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -302,7 +303,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8459）。
     // Issue #1427（CHECK 参照列の拡大変換受理。`catalog.rs` に行が追加）で追随（旧: 8607）。
     // Issue #1436（連鎖本文の式述語の保留・再検証。`catalog.rs` に行が追加）で追随（旧: 8670）。
-    ("catalog.rs", 8758),
+    ("catalog.rs", 8788),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -359,7 +360,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8492）。
     // Issue #1427（CHECK 参照列の拡大変換受理。`catalog.rs` に行が追加）で追随（旧: 8640）。
     // Issue #1436（同上）で追随（旧: 8703）。
-    ("catalog.rs", 8791),
+    ("catalog.rs", 8821),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_
@@ -378,7 +379,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1175（暗黙トランザクション）で `commit` 本体を共通関数 `commit_active` へ
     // 抽出し、Issue #1179 で COMMIT 時の遅延 FK 検査対象を dirty テーブル（世代の変化
     // から検出）へ拡張したことでさらに移動（旧: 330）。書き込み内容・commit の意味は不変。
-    ("sql/transaction.rs", 793),
+    // Issue #1553（明示トランザクションの最大時間・最大文数の CLI 設定化）の行追加でさらに移動（旧: 793）。
+    ("sql/transaction.rs", 866),
     // Issue #1129（分割実行 DML の取り消し）: 取り消し済み記録への縮小（`partitioned_job::
     // cancel_in_txn`）はジョブ表（`PARTITIONED_JOB_TABLE`・索引表）だけを書き、
     // `CATALOG_TABLE`／`user_rows/{table}` のいずれにも触れない（commit 済みチャンクの行は

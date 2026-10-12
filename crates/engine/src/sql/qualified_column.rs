@@ -17,6 +17,11 @@
 //! - 関数名位置（直後が `(`）・`AS` の直後・`::` の直後・`EXTRACT(` 直後のフィールド名は
 //!   列参照ではないため書き換えない。
 //!
+//! `t.*`（Issue #1536）: [`Token::QualifiedStar`] も同じ公開名照合で扱い、選択リスト項目の
+//! 位置（直前 `SELECT`／`,`／`DISTINCT`／`ALL`、直後 `FROM`／`,`）に限り `Punct('*')` へ
+//! 置き換える（以降は `SELECT *` と同一の AST）。それ以外の位置は `42601`、不一致の修飾子は
+//! `42P01`。
+//!
 //! 走査は反復処理（再帰なし）で、入れ子は `MAX_SUBQUERY_DEPTH` で打ち切る。修飾が無ければ
 //! 借用を返し確保を増やさない。untrusted 入力経路のため添字アクセスは使わない。
 
@@ -54,10 +59,12 @@ struct ScopeInfo {
 pub(crate) fn normalize_single_table_qualifiers(
     tokens: &[Token],
 ) -> Result<Cow<'_, [Token]>, SqlSurfaceError> {
-    if !tokens
-        .iter()
-        .any(|t| matches!(t, Token::QualifiedIdent { .. }))
-    {
+    if !tokens.iter().any(|t| {
+        matches!(
+            t,
+            Token::QualifiedIdent { .. } | Token::QualifiedStar { .. }
+        )
+    }) {
         return Ok(Cow::Borrowed(tokens));
     }
     let mut scopes = collect_scopes(tokens);
@@ -83,6 +90,30 @@ pub(crate) fn normalize_single_table_qualifiers(
         if scopes.get(next_scope).is_some_and(|s| s.start == i) {
             active.push(next_scope);
             next_scope += 1;
+        }
+        if let Token::QualifiedStar { qualifier } = tok {
+            let Some(&cur) = active.last() else { continue };
+            let Some(info) = scopes.get(cur).and_then(|s| s.info.as_ref()) else {
+                continue;
+            };
+            if !in_range(info.proj, i) && !in_range(info.tail, i) {
+                continue;
+            }
+            if !info.from_ref.matches_qualifier(qualifier) {
+                return Err(mismatched_qualifier_error(&scopes, cur, qualifier));
+            }
+            // 置き換え後の `*` が非修飾の文法で選択リスト項目になる位置に限る
+            // （それ以外は乗算・`COUNT(*)` 等への再解釈を防ぐため明示拒否）。
+            if !in_range(info.proj, i) || !is_select_item_star_position(tokens, i) {
+                return Err(SqlSurfaceError::unsupported(
+                    "qualified star is only supported as a select list item",
+                ));
+            }
+            let buf = out.get_or_insert_with(|| tokens.to_vec());
+            if let Some(slot) = buf.get_mut(i) {
+                *slot = Token::Punct('*');
+            }
+            continue;
         }
         let Token::QualifiedIdent { qualifier, name } = tok else {
             continue;
@@ -139,25 +170,47 @@ pub(crate) fn normalize_single_table_qualifiers(
             }
             continue;
         }
-        // 外側スコープの公開名に一致する修飾は相関参照（未対応）。
-        let mut anc = scopes.get(cur).and_then(|s| s.parent);
-        while let Some(a) = anc {
-            let s = scopes.get(a);
-            if let Some(ai) = s.and_then(|s| s.info.as_ref()) {
-                if ai.from_ref.matches_qualifier(qualifier) {
-                    return Err(SqlSurfaceError::unsupported(
-                        "correlated column reference to an outer query is not supported",
-                    ));
-                }
-            }
-            anc = s.and_then(|s| s.parent);
-        }
-        return Err(SqlSurfaceError::undefined_table(qualifier.clone()));
+        return Err(mismatched_qualifier_error(&scopes, cur, qualifier));
     }
     Ok(match out {
         Some(v) => Cow::Owned(v),
         None => Cow::Borrowed(tokens),
     })
+}
+
+/// FROM の公開名に一致しない修飾子のエラー。外側スコープの公開名に一致すれば相関参照
+/// （未対応・`42601`）、それ以外は `42P01`（カタログは照会しない）。
+fn mismatched_qualifier_error(scopes: &[Scope], cur: usize, qualifier: &str) -> SqlSurfaceError {
+    let mut anc = scopes.get(cur).and_then(|s| s.parent);
+    while let Some(a) = anc {
+        let s = scopes.get(a);
+        if let Some(ai) = s.and_then(|s| s.info.as_ref()) {
+            if ai.from_ref.matches_qualifier(qualifier) {
+                return SqlSurfaceError::unsupported(
+                    "correlated column reference to an outer query is not supported",
+                );
+            }
+        }
+        anc = s.and_then(|s| s.parent);
+    }
+    SqlSurfaceError::undefined_table(qualifier.to_string())
+}
+
+/// `*` が選択リスト項目の位置か（直前が `SELECT`／`,`／`DISTINCT`／`ALL`、直後が
+/// `FROM`／`,`）。`t.*` を `Punct('*')` へ置き換えてよい位置の判定（Issue #1536）。
+fn is_select_item_star_position(tokens: &[Token], i: usize) -> bool {
+    let prev_ok = match i.checked_sub(1).and_then(|p| tokens.get(p)) {
+        Some(Token::Keyword(Keyword::Select)) | Some(Token::Punct(',')) => true,
+        Some(Token::Ident(w)) => {
+            w.eq_ignore_ascii_case("DISTINCT") || w.eq_ignore_ascii_case("ALL")
+        }
+        _ => false,
+    };
+    let next_ok = matches!(
+        tokens.get(i.wrapping_add(1)),
+        Some(Token::Keyword(Keyword::From)) | Some(Token::Punct(','))
+    );
+    prev_ok && next_ok
 }
 
 /// 直後のトークンにより `DATE '...'`／`TIMESTAMP '...'` の型付きリテラル、または
@@ -400,10 +453,12 @@ mod tests {
     }
 
     fn has_qualified(sql: &str) -> bool {
-        norm(sql)
-            .expect("normalize")
-            .iter()
-            .any(|t| matches!(t, Token::QualifiedIdent { .. }))
+        norm(sql).expect("normalize").iter().any(|t| {
+            matches!(
+                t,
+                Token::QualifiedIdent { .. } | Token::QualifiedStar { .. }
+            )
+        })
     }
 
     #[test]
@@ -570,5 +625,51 @@ mod tests {
     #[test]
     fn tokens_after_limit_are_not_rewritten() {
         assert!(has_qualified("SELECT id FROM docs x LIMIT 1 OFFSET x.y"));
+    }
+
+    #[test]
+    fn qualified_star_rewrites_to_plain_star() {
+        for (q, p) in [
+            (
+                "SELECT x.* FROM docs x LIMIT 1",
+                "SELECT * FROM docs x LIMIT 1",
+            ),
+            (
+                "SELECT docs.* FROM docs LIMIT 1",
+                "SELECT * FROM docs LIMIT 1",
+            ),
+            (
+                "SELECT DISTINCT x.* FROM docs x",
+                "SELECT DISTINCT * FROM docs x",
+            ),
+        ] {
+            assert_eq!(norm(q).expect("ok"), tokenize(p).expect("lex"), "{q}");
+        }
+    }
+
+    #[test]
+    fn qualified_star_mismatch_and_bad_positions() {
+        assert_eq!(code("SELECT zzz.* FROM docs LIMIT 1"), "42P01");
+        assert_eq!(code("SELECT docs.* FROM docs x LIMIT 1"), "42P01");
+        assert_eq!(code("SELECT x.* FROM docs x WHERE x.* = 1"), "42601");
+        assert_eq!(code("SELECT x.id FROM docs x ORDER BY x.*"), "42601");
+        assert_eq!(code("SELECT COUNT(x.*) FROM docs x"), "42601");
+        assert_eq!(code("SELECT x.* + 1 FROM docs x"), "42601");
+        assert_eq!(
+            code("SELECT id FROM docs x WHERE id IN (SELECT x.* FROM docs y)"),
+            "42601"
+        );
+    }
+
+    #[test]
+    fn qualified_star_left_in_opaque_scopes() {
+        assert!(has_qualified(
+            "SELECT x.* FROM docs x JOIN langs y ON x.id = y.id LIMIT 1"
+        ));
+        assert!(has_qualified(
+            "SELECT x.* FROM docs x UNION SELECT * FROM docs"
+        ));
+        assert!(has_qualified("SELECT x.* FROM docs x, langs y"));
+        assert!(has_qualified("SELECT id FROM docs x LIMIT 1 OFFSET x.*"));
     }
 }

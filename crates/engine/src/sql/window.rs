@@ -819,7 +819,7 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
                     needs_embedding = true;
                 }
             }
-            ProjectedColumn::Id => {}
+            ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {}
         }
     }
     if !bound.metadata_filters().is_empty() {

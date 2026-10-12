@@ -109,6 +109,76 @@
 //! で拒否される既定）。値の解決は `ddl_permission_opt::parse`・
 //! `UserStore::with_ddl_allowed_users` に一本化する。
 //!
+//! `--max-table-columns`／`--max-array-elements`／`--max-enum-labels`（Issue #1548。
+//! SQL-46）: 1 テーブルの列数（`1`〜`256`）・配列列 1 個の要素数（`1`〜`1024`）・
+//! ENUM 型 1 個のラベル数（`1`〜`256`）の上限を、プロセス全体に対して起動時に
+//! **下げる方向だけ**設定できる opt-in 注入点（未指定は現行のハード上限と同値＝
+//! 挙動不変）。設定値は定義が増える DDL（`CREATE TABLE`・`ADD COLUMN`・
+//! `CREATE TYPE`）にだけ効き、永続化済みスキーマの読み出しには効かない。
+//! 範囲外・非数値・値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::schema_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_schema_limits` へ 1 回だけ注入する
+//! （`docs/design/schema-limits-cli.md`）。
+//!
+//! `--max-group-by-columns`／`--max-groups`（Issue #1550。SQL-46）: `GROUP BY` の
+//! キー列数（`1`〜`8`）・1 クエリが生成できるグループ数（`1`〜`10000`）の上限を、
+//! プロセス全体に対して起動時に**下げる方向だけ**設定できる opt-in 注入点（未指定は
+//! 現行のハード上限と同値＝挙動不変）。設定値は集計の実行段（単一表・`SELECT DISTINCT`・
+//! 集合演算の集計枝・ビュー・JOIN）にだけ効き、超過は従来どおり `54000`。範囲外・
+//! 非数値・値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::group_by_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_group_by_limits` へ 1 回だけ注入する
+//! （`docs/design/group-by-limits-cli.md`）。
+//!
+//! `--max-subquery-depth`／`--max-subquery-executions`／`--max-cte-definitions`／
+//! `--max-cte-nesting-depth`（Issue #1552。SQL-46）: サブクエリの入れ子深さ（`1`〜`4`）・
+//! 1 文あたりの内側サブクエリ実行回数（`1`〜`16`）・CTE 定義数（`1`〜`16`）・CTE 連鎖深さ
+//! （`1`〜`4`）の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定できる opt-in
+//! 注入点（未指定は現行のハード上限と同値＝挙動不変）。設定値は構文解析段とサブクエリ解決段に
+//! 効き、超過は従来どおり `54000`（格納済みビュー本文の再パースはハード上限のまま）。範囲外・
+//! 非数値・値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::nesting_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_nesting_limits` へ 1 回だけ注入する
+//! （`docs/design/nesting-limits-cli.md`）。
+//!
+//! `--max-join-relations`／`--max-join-input-rows`／`--max-join-output-rows`（Issue #1551。
+//! SQL-46）: JOIN のリレーション数（`2`〜`8`）・1 辺の可視入力行数（`1`〜`100000`）・
+//! 結合の出力行数（`1`〜`100000`）の上限を、プロセス全体に対して起動時に**下げる方向だけ**
+//! 設定できる opt-in 注入点（未指定は現行のハード上限と同値＝挙動不変）。設定値は JOIN の
+//! 実行段にだけ効き、超過は従来どおり `54000`。範囲外・非数値・値欠落・重複指定は
+//! いずれも fail-closed で起動エラー。値の解決は `wire_server::join_limits_opt::resolve` に
+//! 一本化し、`EngineCore::with_join_limits` へ 1 回だけ注入する
+//! （`docs/design/join-limits-cli.md`）。
+//!
+//! `--max-result-rows`（Issue #1555。SQL-34・SQL-46）: 明示 `LIMIT` の範囲上限
+//! （`1`〜`100000`・既定 10000）を、プロセス全体に対して起動時に**上げ下げ両方向**へ設定できる
+//! opt-in 注入点（未指定は従来の 10000 と同値＝挙動不変）。走査・kNN の `LIMIT k`・`FETCH n`・
+//! 集合演算全体／JOIN 文の `LIMIT`・NoSQL の `limit` の範囲判定にだけ効き、超過は従来どおり
+//! `22000`。`OFFSET` や他の内部上限とは連動しない。範囲外・非数値・値欠落・重複指定は
+//! いずれも fail-closed で起動エラー。値の解決は `wire_server::result_limits_opt::resolve` に
+//! 一本化し、`EngineCore::with_result_limits` へ 1 回だけ注入する
+//! （`docs/design/result-limits-cli.md`）。
+//!
+//! `--write-lock-wait-ms`（Issue #1554。SQL-46）: 書き込みロック（単一ライタ）の待機上限を
+//! ミリ秒（`100`〜`60000`。既定 `30000`）で、プロセス全体に対して起動時に設定できる
+//! opt-in 注入点（未指定は現行の 30 秒と同値＝挙動不変）。超過は従来どおり `55P03`。
+//! autocommit 書き込み・明示トランザクションの `BEGIN`・分割実行 DML のチャンクに効く。
+//! 範囲外・非数値・値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::write_lock_wait_opt::resolve` に一本化し、
+//! `EngineCore::with_write_lock_wait` へ 1 回だけ注入する
+//! （`docs/design/write-lock-wait-cli.md`）。
+//!
+//! `--max-transaction-duration-ms`／`--max-transaction-statements`（Issue #1553。SQL-46）:
+//! 明示トランザクション（暗黙トランザクションにも同じ値が効く）の最大持続時間
+//! （`100`〜`60000` ミリ秒・既定 20000）と最大文数（`1`〜`10000`・既定 1000）を、
+//! プロセス全体に対して起動時に設定できる opt-in 注入点（未指定は現行の既定と同値＝挙動不変。
+//! 兄弟フラグと違い既定の上下どちらへも設定できる）。超過は従来どおり `54000`。範囲外・
+//! 非数値・値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::transaction_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_transaction_limits` へ 1 回だけ注入する。明示指定した持続時間が書き込み
+//! ロック待ち上限（30 秒）を超える場合は起動ログに `WARNING` 行を出す
+//! （`docs/design/transaction-limits-cli.md`）。
+//!
 //! `--max-dml-affected-rows`／`--max-insert-rows`（Issue #997。オーナー判断の
 //! 改訂・2026-09-27。前回のオーナー判断を置き換え）: 述語形 `UPDATE`／
 //! `DELETE` の 1 文あたり影響行数上限・複数行 `VALUES` の 1 文あたり行数上限
@@ -305,6 +375,22 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_dml_affected_rows_raw: Option<String> = None;
     let mut max_insert_rows_raw: Option<String> = None;
     let mut batch_max_files_raw: Option<String> = None;
+    let mut max_table_columns_raw: Option<String> = None;
+    let mut max_array_elements_raw: Option<String> = None;
+    let mut max_enum_labels_raw: Option<String> = None;
+    let mut max_group_by_columns_raw: Option<String> = None;
+    let mut max_groups_raw: Option<String> = None;
+    let mut max_subquery_depth_raw: Option<String> = None;
+    let mut max_subquery_executions_raw: Option<String> = None;
+    let mut max_cte_definitions_raw: Option<String> = None;
+    let mut max_cte_nesting_depth_raw: Option<String> = None;
+    let mut max_join_relations_raw: Option<String> = None;
+    let mut max_join_input_rows_raw: Option<String> = None;
+    let mut max_join_output_rows_raw: Option<String> = None;
+    let mut max_result_rows_raw: Option<String> = None;
+    let mut write_lock_wait_raw: Option<String> = None;
+    let mut max_transaction_duration_ms_raw: Option<String> = None;
+    let mut max_transaction_statements_raw: Option<String> = None;
     let mut partitioned_chunk_rows_raw: Option<String> = None;
     let mut partitioned_scan_budget_raw: Option<String> = None;
     let mut partitioned_max_hold_ms_raw: Option<String> = None;
@@ -580,6 +666,326 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 batch_max_files_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::schema_limits_opt::MAX_TABLE_COLUMNS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::schema_limits_opt::MAX_TABLE_COLUMNS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1548: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_table_columns_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::schema_limits_opt::MAX_TABLE_COLUMNS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_table_columns_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::schema_limits_opt::MAX_ARRAY_ELEMENTS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::schema_limits_opt::MAX_ARRAY_ELEMENTS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1548: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_array_elements_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::schema_limits_opt::MAX_ARRAY_ELEMENTS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_array_elements_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::schema_limits_opt::MAX_ENUM_LABELS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::schema_limits_opt::MAX_ENUM_LABELS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1548: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_enum_labels_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::schema_limits_opt::MAX_ENUM_LABELS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_enum_labels_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::group_by_limits_opt::MAX_GROUP_BY_COLUMNS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::group_by_limits_opt::MAX_GROUP_BY_COLUMNS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1550: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_group_by_columns_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::group_by_limits_opt::MAX_GROUP_BY_COLUMNS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_group_by_columns_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::group_by_limits_opt::MAX_GROUPS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::group_by_limits_opt::MAX_GROUPS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1550: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_groups_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::group_by_limits_opt::MAX_GROUPS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_groups_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::nesting_limits_opt::MAX_SUBQUERY_DEPTH_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::nesting_limits_opt::MAX_SUBQUERY_DEPTH_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1552: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_subquery_depth_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::nesting_limits_opt::MAX_SUBQUERY_DEPTH_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_subquery_depth_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::nesting_limits_opt::MAX_SUBQUERY_EXECUTIONS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::nesting_limits_opt::MAX_SUBQUERY_EXECUTIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1552: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_subquery_executions_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::nesting_limits_opt::MAX_SUBQUERY_EXECUTIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_subquery_executions_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::nesting_limits_opt::MAX_CTE_DEFINITIONS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::nesting_limits_opt::MAX_CTE_DEFINITIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1552: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_cte_definitions_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::nesting_limits_opt::MAX_CTE_DEFINITIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_cte_definitions_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::nesting_limits_opt::MAX_CTE_NESTING_DEPTH_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::nesting_limits_opt::MAX_CTE_NESTING_DEPTH_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1552: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_cte_nesting_depth_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::nesting_limits_opt::MAX_CTE_NESTING_DEPTH_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_cte_nesting_depth_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::write_lock_wait_opt::FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::write_lock_wait_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1554: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if write_lock_wait_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::write_lock_wait_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                write_lock_wait_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::join_limits_opt::MAX_JOIN_RELATIONS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::join_limits_opt::MAX_JOIN_RELATIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1551: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_join_relations_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::join_limits_opt::MAX_JOIN_RELATIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_join_relations_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::join_limits_opt::MAX_JOIN_INPUT_ROWS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::join_limits_opt::MAX_JOIN_INPUT_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1551: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_join_input_rows_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::join_limits_opt::MAX_JOIN_INPUT_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_join_input_rows_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::join_limits_opt::MAX_JOIN_OUTPUT_ROWS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::join_limits_opt::MAX_JOIN_OUTPUT_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1551: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_join_output_rows_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::join_limits_opt::MAX_JOIN_OUTPUT_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_join_output_rows_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::result_limits_opt::MAX_RESULT_ROWS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::result_limits_opt::MAX_RESULT_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1555: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_result_rows_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::result_limits_opt::MAX_RESULT_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_result_rows_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::transaction_limits_opt::MAX_TRANSACTION_DURATION_MS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::transaction_limits_opt::MAX_TRANSACTION_DURATION_MS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1553: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_transaction_duration_ms_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::transaction_limits_opt::MAX_TRANSACTION_DURATION_MS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_transaction_duration_ms_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::transaction_limits_opt::MAX_TRANSACTION_STATEMENTS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::transaction_limits_opt::MAX_TRANSACTION_STATEMENTS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1553: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_transaction_statements_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::transaction_limits_opt::MAX_TRANSACTION_STATEMENTS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_transaction_statements_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::dml_limits_opt::PARTITIONED_CHUNK_ROWS_FLAG => {
@@ -1003,6 +1409,110 @@ fn run_server(args: &[String]) -> ExitCode {
         engine::log_stderr!("warning: {old} is no longer read; use {new}");
     }
 
+    // Issue #1548: スキーマ定義系 3 上限（列数・配列要素数・ENUM ラベル数）を bind・
+    // ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は listen へ
+    // 進まず起動エラー）。未指定は `SchemaLimits::default()`＝ハード上限＝現行挙動。
+    let schema_limits = match wire_server::schema_limits_opt::resolve(
+        wire_server::schema_limits_opt::SchemaLimitsRawFlags {
+            max_table_columns: max_table_columns_raw.as_deref(),
+            max_array_elements: max_array_elements_raw.as_deref(),
+            max_enum_labels: max_enum_labels_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid schema limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #1550: `GROUP BY` の列数・グループ数上限を bind・ユーザーストア読込より前に
+    // 解決する（fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
+    // `GroupByLimits::default()`＝ハード上限＝現行挙動。
+    let group_by_limits = match wire_server::group_by_limits_opt::resolve(
+        wire_server::group_by_limits_opt::GroupByLimitsRawFlags {
+            max_group_by_columns: max_group_by_columns_raw.as_deref(),
+            max_groups: max_groups_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid group by limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #1552: サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限を bind・
+    // ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は listen へ進まず
+    // 起動エラー）。未指定は `NestingLimits::default()`＝ハード上限＝現行挙動。
+    let nesting_limits = match wire_server::nesting_limits_opt::resolve(
+        wire_server::nesting_limits_opt::NestingLimitsRawFlags {
+            max_subquery_depth: max_subquery_depth_raw.as_deref(),
+            max_subquery_executions: max_subquery_executions_raw.as_deref(),
+            max_cte_definitions: max_cte_definitions_raw.as_deref(),
+            max_cte_nesting_depth: max_cte_nesting_depth_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid nesting limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #1551: JOIN のリレーション数・入出力行数上限を bind・ユーザーストア読込より前に
+    // 解決する（fail-closed）。未指定は `JoinSizeLimits::default()`＝ハード上限＝現行挙動。
+    let join_limits = match wire_server::join_limits_opt::resolve(
+        wire_server::join_limits_opt::JoinLimitsRawFlags {
+            max_relations: max_join_relations_raw.as_deref(),
+            max_input_rows: max_join_input_rows_raw.as_deref(),
+            max_output_rows: max_join_output_rows_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid join limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #1555: 明示 `LIMIT` の範囲上限を bind・ユーザーストア読込より前に解決する
+    // （fail-closed）。未指定は `ResultLimits::default()`＝従来の 10,000＝現行挙動。
+    let result_limits =
+        match wire_server::result_limits_opt::resolve(max_result_rows_raw.as_deref()) {
+            Ok(limits) => limits,
+            Err(e) => {
+                engine::log_stderr!("wire-server: invalid result limit configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    // Issue #1554: 書き込みロック待機上限を bind・ユーザーストア読込より前に解決する
+    // （fail-closed）。未指定は `DEFAULT_WRITE_LOCK_WAIT`＝現行挙動。
+    let write_lock_wait =
+        match wire_server::write_lock_wait_opt::resolve(write_lock_wait_raw.as_deref()) {
+            Ok(wait) => wait,
+            Err(e) => {
+                engine::log_stderr!("wire-server: invalid write lock wait configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    // Issue #1553: 明示トランザクションの最大持続時間・最大文数を bind・ユーザーストア読込より
+    // 前に解決する（fail-closed）。未指定は `TransactionLimits::default()`＝現行挙動。
+    let transaction_limits = match wire_server::transaction_limits_opt::resolve(
+        wire_server::transaction_limits_opt::TransactionLimitsRawFlags {
+            max_duration_ms: max_transaction_duration_ms_raw.as_deref(),
+            max_statements: max_transaction_statements_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid transaction limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1128・#1129: 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間・
     // 同時実行数・中断記録数の上限）を
     // bind・ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は
@@ -1402,6 +1912,24 @@ fn run_server(args: &[String]) -> ExitCode {
     // `Option` 分岐は不要——`with_dml_limits` は `DmlLimits::default()` を渡しても
     // 既存挙動とビット同一）。
     core = core.with_dml_limits(dml_limits);
+    // Issue #1548: 未指定でも常に呼ぶ（`schema_limits` は既定まで解決済み。既定は
+    // ハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_schema_limits(schema_limits);
+    // Issue #1550: 未指定でも常に呼ぶ（`group_by_limits` は既定まで解決済み。既定は
+    // ハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_group_by_limits(group_by_limits);
+    // Issue #1552: 未指定でも常に呼ぶ（`nesting_limits` は既定まで解決済み。既定は
+    // ハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_nesting_limits(nesting_limits);
+    // Issue #1551: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_join_limits(join_limits);
+    // Issue #1555: 未指定でも常に呼ぶ（既定は従来の 10,000 と同値で、未注入と挙動が同一）。
+    core = core.with_result_limits(result_limits);
+    // Issue #1554: 未指定でも常に呼ぶ（既定は `DEFAULT_WRITE_LOCK_WAIT` で、未注入と
+    // 挙動がビット同一）。
+    core = core.with_write_lock_wait(write_lock_wait);
+    // Issue #1553: 未指定でも常に呼ぶ（既定は `TransactionLimits::default()` で、未注入と挙動が同一）。
+    core = core.with_transaction_limits(transaction_limits);
     // Issue #1128: 未指定でも常に呼ぶ（既定は `PartitionedDmlLimits::default()`）。
     core = core.with_partitioned_dml_limits(partitioned_dml_limits);
     // Issue #1166: 未指定でも常に呼ぶ（`batch_limits` は既定・環境変数まで
@@ -1457,6 +1985,19 @@ fn run_server(args: &[String]) -> ExitCode {
     // ドキュメント参照）。
     if let Some(warning) =
         wire_server::dml_limits_opt::insert_rows_cap_warning(&dml_limits, &batch_limits)
+    {
+        engine::log_stderr!("wire-server: WARNING: {warning}");
+    }
+
+    // Issue #1553: 明示指定した最大持続時間が書き込みロック待ち上限を超える場合、ほかの
+    // セッションの書き込みが `55P03` を受け得るため `WARNING` 行で知らせる（エラーにはしない。
+    // `transaction_limits_opt::duration_over_write_lock_wait_warning` ドキュメント参照）。
+    if let Some(warning) =
+        wire_server::transaction_limits_opt::duration_over_write_lock_wait_warning(
+            &transaction_limits,
+            max_transaction_duration_ms_raw.is_some(),
+            write_lock_wait,
+        )
     {
         engine::log_stderr!("wire-server: WARNING: {warning}");
     }

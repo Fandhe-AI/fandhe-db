@@ -931,6 +931,13 @@ pub fn decode_bind_values(
                     )
                 })?
             }
+            Token::QualifiedStar { qualifier } => {
+                qualifier.len().checked_add(2).ok_or_else(|| {
+                    SqlSurfaceError::payload_too_large(
+                        "substituted parameter payload size overflowed",
+                    )
+                })?
+            }
             Token::Keyword(_)
             | Token::Punct(_)
             | Token::DistanceOp
