@@ -92,7 +92,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 47;
+    count = 49;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -297,6 +297,13 @@ define_error_classes! {
     /// 式評価の 0 除算（`22012`、Issue #1163・SQL-26・ERR-2）。
     /// [`crate::sql::allowlist::SqlSurfaceError::DivisionByZero`] の写像。
     DivisionByZero => ("22012", "DIVISION_BY_ZERO"),
+    /// `FROM` なし SELECT の負の `LIMIT`（`2201W`。SQL-43・Issue #2329）。SQL 表層専用で
+    /// NoSQL 表層からは到達しない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidRowCountInLimitClause`] の写像。
+    InvalidRowCountInLimitClause => ("2201W", "INVALID_ROW_COUNT_IN_LIMIT_CLAUSE"),
+    /// `FROM` なし SELECT の負の `OFFSET`（`2201X`。SQL-43・Issue #2329）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidRowCountInResultOffsetClause`] の写像。
+    InvalidRowCountInResultOffsetClause => ("2201X", "INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE"),
     /// `ALTER TABLE ... ADD CONSTRAINT` の CHECK・FOREIGN KEY の明示名が既存の
     /// 制約名と衝突した（`42710`、Issue #1195・TABLE-22・ERR-6）。
     /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateObject`] の写像。

@@ -7,18 +7,25 @@
 //! Describe（`describe_parsed_in_session`）。wire-server への接続確認は別 Issue
 //! （#1532）の担当。
 //!
+//! `WHERE`／`LIMIT`／`OFFSET`（Issue #2329）は PostgreSQL と同じくダミー入力 1 行への
+//! 絞り込みとして扱い、結果は 0 行か 1 行になる。`WHERE` は定数条件のみ（偽・`NULL` は
+//! 0 行、非真偽型は `42804`）、`LIMIT`／`OFFSET` の負値は実行時に `2201W`／`2201X`。
+//! 投影は絞り込み結果に関わらず全項目を評価し、エラー有無がフィルタに左右されない
+//! ようにする（`--max-search-k` 上限は適用しない。結果が最大 1 行のため）。
+//!
 //! テーブル・ストレージ・RLS 述語のいずれにも触れないため、他テナントのデータや
 //! 存在情報に依存する経路が無い。列参照は常に同一の固定文言で `42601` とし、
 //! 識別子名・テーブル名をエラーに含めない（fail-closed）。
 
 use crate::catalog::ColumnType;
 use crate::sql::allowlist::{
-    is_aggregate_function_name, ConstSelectItem, SqlSurfaceError, ValidatedConstSelect,
+    is_aggregate_function_name, ConstSelectCondition, ConstSelectItem, SqlSurfaceError,
+    ValidatedConstSelect,
 };
 use crate::sql::exec::{scalar_cell_for, Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::udf_call::{
-    bind_const_expr, classify_integer_literal, eval, into_owned_vector, BoundExpr, Expr, ExprValue,
-    NumericKind, UdfRegistry, MAX_EXPR_NODES,
+    bind_const_expr, classify_integer_literal, eval, into_owned_vector, BoundExpr, Expr, ExprType,
+    ExprValue, NumericKind, UdfRegistry, MAX_EXPR_NODES,
 };
 
 /// 束縛済みの 1 項目。
@@ -47,6 +54,17 @@ impl BoundConstItem {
 #[derive(Debug, Clone)]
 pub struct BoundConstSelect {
     items: Vec<BoundConstItem>,
+    where_clause: Option<BoundCondition>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// 束縛済みの `WHERE` 条件。リテラルは束縛時に確定し、式は実行時に評価する。
+#[derive(Debug, Clone)]
+enum BoundCondition {
+    /// `Some(b)` は真偽リテラル、`None` は `NULL`。
+    Const(Option<bool>),
+    Expr(BoundExpr),
 }
 
 impl BoundConstSelect {
@@ -154,6 +172,9 @@ pub fn bind(
         .items()
         .iter()
         .try_for_each(|i| reject_non_constant(i.expr()))?;
+    if let Some(ConstSelectCondition::Expr(e)) = validated.where_clause() {
+        reject_non_constant(e)?;
+    }
     let mut budget = MAX_EXPR_NODES;
     let mut items = Vec::with_capacity(validated.items().len());
     for item in validated.items() {
@@ -177,12 +198,52 @@ pub fn bind(
         };
         items.push(bound);
     }
-    Ok(BoundConstSelect { items })
+    let where_clause = match validated.where_clause() {
+        None => None,
+        Some(ConstSelectCondition::Bool(b)) => Some(BoundCondition::Const(Some(*b))),
+        Some(ConstSelectCondition::Null) => Some(BoundCondition::Const(None)),
+        Some(ConstSelectCondition::Expr(e)) => {
+            let (bound, ty, _) = bind_const_expr(e, registry, &mut budget)?;
+            if ty != ExprType::Bool {
+                return Err(SqlSurfaceError::datatype_mismatch(
+                    "argument of WHERE must be type boolean",
+                ));
+            }
+            Some(BoundCondition::Expr(bound))
+        }
+    };
+    Ok(BoundConstSelect {
+        items,
+        where_clause,
+        limit: validated.limit(),
+        offset: validated.offset(),
+    })
 }
 
 /// 束縛済みの定数式 SELECT を評価し、1 行の結果を返す。評価エラー（0 除算等）は
 /// そのまま伝播する（fail-closed）。
 pub fn execute(bound: &BoundConstSelect) -> Result<QueryResult, SqlSurfaceError> {
+    // 負値は実行時に拒否する（PostgreSQL と同じく Describe は成功し Execute で失敗）。
+    if bound.limit.is_some_and(|l| l < 0) {
+        return Err(SqlSurfaceError::invalid_row_count_in_limit_clause());
+    }
+    if bound.offset.is_some_and(|o| o < 0) {
+        return Err(SqlSurfaceError::invalid_row_count_in_result_offset_clause());
+    }
+    let passes = match &bound.where_clause {
+        None => true,
+        Some(BoundCondition::Const(v)) => v.unwrap_or(false),
+        Some(BoundCondition::Expr(expr)) => match eval(expr, 0, &[])? {
+            ExprValue::Bool(b) => b,
+            ExprValue::Null => false,
+            // 束縛段で Bool 型を保証済み。到達不能だが panic せず fail-closed に倒す。
+            _ => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "WHERE did not evaluate to boolean".to_string(),
+                })
+            }
+        },
+    };
     let mut cells = Vec::with_capacity(bound.items.len());
     for item in &bound.items {
         match item {
@@ -203,13 +264,19 @@ pub fn execute(bound: &BoundConstSelect) -> Result<QueryResult, SqlSurfaceError>
             }
         }
     }
-    Ok(QueryResult {
-        columns: bound.columns(),
-        rows: vec![ResultRow {
+    let selected = passes && bound.offset.unwrap_or(0) == 0 && bound.limit.is_none_or(|l| l > 0);
+    let rows = if selected {
+        vec![ResultRow {
             id: 0,
             score: 0.0,
             cells,
-        }],
+        }]
+    } else {
+        Vec::new()
+    };
+    Ok(QueryResult {
+        columns: bound.columns(),
+        rows,
     })
 }
 

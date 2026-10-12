@@ -281,3 +281,85 @@ fn simple_column_reference_is_rejected() {
     expect_error_response_with_sqlstate(&mut s, "42601");
     read_ready_for_query(&mut s);
 }
+/// 0 行結果（RowDescription のみ・DataRow なし・`SELECT 0`）を読み、ReadyForQuery が `I` で
+/// あることを確認する（Issue #2329・SQL-43）。
+fn expect_simple_zero_rows(s: &mut TcpStream, sql: &str) {
+    send_simple_query(s, sql);
+    assert_eq!(
+        read_row_description_with_types(s),
+        vec![("?column?".to_string(), 23, 4)]
+    );
+    assert_eq!(read_command_complete(s), "SELECT 0");
+    assert_eq!(read_ready_for_query_status(s), b'I');
+}
+
+#[test]
+fn simple_where_limit_offset_select_zero_or_one_row() {
+    let (mut s, _g) = connect();
+    expect_simple_zero_rows(&mut s, "SELECT 1 WHERE false");
+    expect_simple_zero_rows(&mut s, "SELECT 1 OFFSET 1");
+    for sql in ["SELECT 1 WHERE true", "SELECT 1 LIMIT 1 OFFSET 0"] {
+        send_simple_query(&mut s, sql);
+        assert_eq!(
+            read_row_description_with_types(&mut s),
+            vec![("?column?".to_string(), 23, 4)]
+        );
+        assert_eq!(read_data_row(&mut s), vec![Some("1".to_string())]);
+        assert_eq!(read_command_complete(&mut s), "SELECT 1");
+        assert_eq!(read_ready_for_query_status(&mut s), b'I');
+    }
+}
+
+#[test]
+fn simple_negative_limit_offset_and_non_boolean_where_are_rejected() {
+    let (mut s, _g) = connect();
+    for (sql, code) in [
+        ("SELECT 1 LIMIT -1", "2201W"),
+        ("SELECT 1 OFFSET -1", "2201X"),
+        ("SELECT 1 WHERE 1", "42804"),
+    ] {
+        send_simple_query(&mut s, sql);
+        expect_error_response_with_sqlstate(&mut s, code);
+        read_ready_for_query(&mut s);
+    }
+    // セッションは継続する。
+    expect_simple_zero_rows(&mut s, "SELECT 1 LIMIT 0");
+}
+
+#[test]
+fn extended_limit_zero_describes_columns_and_returns_no_rows() {
+    let (mut s, _g) = connect();
+    send(&mut s, b'P', &parse_body("s0", "SELECT 1 LIMIT 0", 0));
+    send(&mut s, b'D', &describe_body(b'S', "s0"));
+    send(&mut s, b'S', b"");
+    expect(&mut s, b'1');
+    expect(&mut s, b't');
+    assert_eq!(
+        parse_row_description(&expect(&mut s, b'T')),
+        vec![("?column?".to_string(), 23, 4, 0)]
+    );
+    assert_eq!(expect(&mut s, b'Z'), [b'I']);
+
+    send(&mut s, b'B', &bind_body("", "s0"));
+    send(&mut s, b'D', &describe_body(b'P', ""));
+    send(&mut s, b'E', &execute_body("", 0));
+    send(&mut s, b'S', b"");
+    expect(&mut s, b'2');
+    assert_eq!(
+        parse_row_description(&expect(&mut s, b'T')),
+        vec![("?column?".to_string(), 23, 4, 0)]
+    );
+    assert_eq!(cstr_tag(&expect(&mut s, b'C')), "SELECT 0");
+    assert_eq!(expect(&mut s, b'Z'), [b'I']);
+}
+
+#[test]
+fn extended_negative_limit_fails_at_execute_and_recovers() {
+    let (mut s, _g) = connect();
+    send(&mut s, b'P', &parse_body("", "SELECT 1 LIMIT -1", 0));
+    send(&mut s, b'B', &bind_body("", ""));
+    send(&mut s, b'E', &execute_body("", 0));
+    expect(&mut s, b'1');
+    expect(&mut s, b'2');
+    assert_eq!(expect_error_then_recover(&mut s), "2201W");
+}

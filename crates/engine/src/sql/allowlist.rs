@@ -484,6 +484,12 @@ pub enum SqlSurfaceError {
     /// `wire_code` は ERR-3 の [`SqlSurfaceError::OperationIdContentMismatch`] と共有するが、
     /// `code` ラベル（`INVALID_PARAMETER_VALUE`）と文言で区別する。
     InvalidParameterValue { detail: &'static str },
+    /// `FROM` なし SELECT の `LIMIT` が負値（`2201W`。SQL-43・Issue #2329）。固定文言で
+    /// 入力値を含めない。実行時（`sql::const_select::execute`）に検出する。
+    InvalidRowCountInLimitClause,
+    /// `FROM` なし SELECT の `OFFSET` が負値（`2201X`。SQL-43・Issue #2329）。
+    /// [`SqlSurfaceError::InvalidRowCountInLimitClause`] と同じ契約。
+    InvalidRowCountInResultOffsetClause,
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
     /// スカラー／ベクトル算術式評価（SQL-26）の非有限値化（Issue #1163）にも使う。
@@ -842,6 +848,16 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `FROM` なし SELECT の負の `LIMIT`（`2201W`。Issue #2329）。
+    pub(crate) fn invalid_row_count_in_limit_clause() -> Self {
+        SqlSurfaceError::InvalidRowCountInLimitClause
+    }
+
+    /// `pub(crate)`: `FROM` なし SELECT の負の `OFFSET`（`2201X`。Issue #2329）。
+    pub(crate) fn invalid_row_count_in_result_offset_clause() -> Self {
+        SqlSurfaceError::InvalidRowCountInResultOffsetClause
+    }
+
     /// `pub(crate)`: 式評価器（`sql::udf_call`・`sql::numeric_fn`）が 0 除算を
     /// 報告するために使う（Issue #1163・SQL-26）。
     pub(crate) fn division_by_zero(detail: impl Into<String>) -> Self {
@@ -973,6 +989,12 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DivisionByZero { .. } => ErrorClass::DivisionByZero,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
+            SqlSurfaceError::InvalidRowCountInLimitClause => {
+                ErrorClass::InvalidRowCountInLimitClause
+            }
+            SqlSurfaceError::InvalidRowCountInResultOffsetClause => {
+                ErrorClass::InvalidRowCountInResultOffsetClause
+            }
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidDatetimeFormat { .. } => ErrorClass::InvalidDatetimeFormat,
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
@@ -1069,6 +1091,13 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             // 接頭辞なしで固定文言をそのまま出す（PostgreSQL と同じ文言。値は埋め込まない）。
             SqlSurfaceError::InvalidParameterValue { detail } => f.write_str(detail),
+            // 固定の英語文言（入力値を含めない。Issue #2329）。
+            SqlSurfaceError::InvalidRowCountInLimitClause => {
+                f.write_str("LIMIT must not be negative")
+            }
+            SqlSurfaceError::InvalidRowCountInResultOffsetClause => {
+                f.write_str("OFFSET must not be negative")
+            }
             SqlSurfaceError::DatetimeFieldOverflow { detail } => {
                 write!(f, "datetime field overflow: {detail}")
             }
@@ -1833,6 +1862,9 @@ pub(crate) const MAX_CONST_SELECT_ITEMS: usize = 1024;
 #[non_exhaustive]
 pub struct ValidatedConstSelect {
     pub(crate) items: Vec<ConstSelectItem>,
+    pub(crate) where_clause: Option<ConstSelectCondition>,
+    pub(crate) limit: Option<i64>,
+    pub(crate) offset: Option<i64>,
 }
 
 impl ValidatedConstSelect {
@@ -1840,6 +1872,35 @@ impl ValidatedConstSelect {
     pub fn items(&self) -> &[ConstSelectItem] {
         &self.items
     }
+
+    /// `WHERE` 条件（Issue #2329）。無ければ `None`。
+    pub fn where_clause(&self) -> Option<&ConstSelectCondition> {
+        self.where_clause.as_ref()
+    }
+
+    /// `LIMIT` の値（符号付き。負値の拒否は実行時 `2201W`。Issue #2329）。
+    pub fn limit(&self) -> Option<i64> {
+        self.limit
+    }
+
+    /// `OFFSET` の値（符号付き。負値の拒否は実行時 `2201X`。Issue #2329）。
+    pub fn offset(&self) -> Option<i64> {
+        self.offset
+    }
+}
+
+/// `FROM` なし SELECT の `WHERE` 条件（SQL-43・Issue #2329）。`TRUE`／`FALSE`／`NULL`
+/// は構文段で畳み込み（式木へ variant を足さず、SQL-41 の `WHERE TRUE` 畳み込みと
+/// 同じ方針）、それ以外は式として束縛段（`sql::const_select`）が型検査する。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ConstSelectCondition {
+    /// 真偽リテラル `TRUE`／`FALSE`。
+    Bool(bool),
+    /// `NULL` リテラル（偽と同じく 0 行）。
+    Null,
+    /// 比較などの定数式（束縛段で真偽型を要求する）。
+    Expr(Expr),
 }
 
 /// [`ValidatedConstSelect`] の 1 項目（式と任意の `AS` 別名）。
@@ -6342,9 +6403,11 @@ impl<'a> Parser<'a> {
         Ok(Some(order))
     }
 
-    /// `SELECT <式>[ AS <別名>][, ...][;]`（`FROM` なし。SQL-43・Issue #1531）を解析する。
-    /// `SELECT *`・`WHERE`／`LIMIT` 等の余剰トークン・空リスト・末尾カンマはすべて
-    /// `42601`（fail-closed）。列参照・集計の拒否は束縛段の責務（構文木だけでは
+    /// `SELECT <式>[ AS <別名>][, ...] [WHERE <条件>] [LIMIT <n>] [OFFSET <m>][;]`
+    /// （`FROM` なし。SQL-43・Issue #1531・#2329）を解析する。句の順序は固定で、
+    /// `SELECT *`・`AND`／`OR` 等を含む条件・`OFFSET` を `LIMIT` より前に置く形・
+    /// `GROUP BY`／`HAVING`／`ORDER BY`・空リスト・末尾カンマはすべて `42601`
+    /// （fail-closed）。列参照・集計の拒否は束縛段の責務（構文木だけでは
     /// 関数名の意味が確定しないため）。項目数は `MAX_CONST_SELECT_ITEMS` で有界化する。
     fn parse_const_select(&mut self) -> Result<ValidatedConstSelect, SqlSurfaceError> {
         self.expect_keyword(Keyword::Select)?;
@@ -6374,8 +6437,104 @@ impl<'a> Parser<'a> {
             }
             break;
         }
+        let where_clause = if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
+            self.advance();
+            Some(self.parse_const_select_condition()?)
+        } else {
+            None
+        };
+        let limit = if matches!(self.peek(), Some(Token::Keyword(Keyword::Limit))) {
+            self.advance();
+            Some(self.parse_const_row_count("LIMIT")?)
+        } else {
+            None
+        };
+        let offset = if self.peek_ident_matches("OFFSET") {
+            self.advance();
+            Some(self.parse_const_row_count("OFFSET")?)
+        } else {
+            None
+        };
         self.expect_end_of_statement()?;
-        Ok(ValidatedConstSelect { items })
+        Ok(ValidatedConstSelect {
+            items,
+            where_clause,
+            limit,
+            offset,
+        })
+    }
+
+    /// `FROM` なし SELECT の `WHERE` 条件を読む（Issue #2329）。`TRUE`／`FALSE`／`NULL`
+    /// は直後が句境界（文末・`;`・`LIMIT`・`OFFSET`）のときだけリテラルとして畳み、
+    /// それ以外は値式＋任意の比較演算子 1 つの式にする（`AND`／`OR` 等は呼び出し元の
+    /// `expect_end_of_statement` が `42601` で拒否する）。
+    fn parse_const_select_condition(&mut self) -> Result<ConstSelectCondition, SqlSurfaceError> {
+        if let Some(Token::Ident(w)) = self.peek() {
+            let literal = if w.eq_ignore_ascii_case("TRUE") {
+                Some(ConstSelectCondition::Bool(true))
+            } else if w.eq_ignore_ascii_case("FALSE") {
+                Some(ConstSelectCondition::Bool(false))
+            } else if w.eq_ignore_ascii_case("NULL") {
+                Some(ConstSelectCondition::Null)
+            } else {
+                None
+            };
+            if let Some(lit) = literal {
+                let at_boundary = match self.tokens.get(self.pos.saturating_add(1)) {
+                    None | Some(Token::Punct(';')) | Some(Token::Keyword(Keyword::Limit)) => true,
+                    Some(Token::Ident(n)) => n.eq_ignore_ascii_case("OFFSET"),
+                    _ => false,
+                };
+                if at_boundary {
+                    self.advance();
+                    return Ok(lit);
+                }
+            }
+        }
+        let lhs = self.parse_value_expr(0)?;
+        if matches!(
+            self.peek(),
+            Some(Token::Punct('>' | '<' | '=') | Token::Ge | Token::Le)
+        ) {
+            let op = self.expect_cmp_op()?;
+            let rhs = self.parse_value_expr(0)?;
+            return Ok(ConstSelectCondition::Expr(Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            }));
+        }
+        Ok(ConstSelectCondition::Expr(lhs))
+    }
+
+    /// `FROM` なし SELECT の `LIMIT`／`OFFSET` の値（`['-'] <整数リテラル>`）を符号付き
+    /// `i64` で読む（Issue #2329）。小数・指数・`ALL`・`NULL`・式・`$n` と `i64` 範囲外は
+    /// `42601`。負値の拒否（`2201W`／`2201X`）は実行時（`sql::const_select`）。結果は
+    /// 最大 1 行のため値の大きさは資源消費に影響しない。
+    fn parse_const_row_count(&mut self, clause: &str) -> Result<i64, SqlSurfaceError> {
+        let negative = if matches!(self.peek(), Some(Token::Punct('-'))) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let raw = match self.advance() {
+            Some(Token::Number(n)) => n.clone(),
+            _ => {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "{clause} requires an integer literal"
+                )))
+            }
+        };
+        if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "malformed {clause} value: {raw}"
+            )));
+        }
+        let magnitude: i64 = raw
+            .parse()
+            .map_err(|_| SqlSurfaceError::unsupported(format!("{clause} value is out of range")))?;
+        Ok(if negative { -magnitude } else { magnitude })
     }
 
     /// 省略可能な単一末尾セミコロンの後に余剰トークンがあれば複数 statement と
@@ -13290,6 +13449,37 @@ pub(crate) fn validate_update_form_tokens(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn const_select_where_limit_offset_parse_shapes() {
+        use super::*;
+        let parse = |sql: &str| -> Result<ValidatedConstSelect, SqlSurfaceError> {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            Parser::new(&tokens).parse_const_select()
+        };
+        let v = parse("SELECT 1 WHERE TRUE;").expect("where true");
+        assert_eq!(v.where_clause(), Some(&ConstSelectCondition::Bool(true)));
+        let v = parse("SELECT 1 WHERE NULL LIMIT 1").expect("where null");
+        assert_eq!(v.where_clause(), Some(&ConstSelectCondition::Null));
+        assert_eq!(v.limit(), Some(1));
+        let v = parse("SELECT 1 WHERE 1 = 1 OFFSET 0").expect("cmp");
+        assert!(matches!(
+            v.where_clause(),
+            Some(ConstSelectCondition::Expr(_))
+        ));
+        assert_eq!(v.offset(), Some(0));
+        let v = parse("SELECT 1 LIMIT -1").expect("negative parses");
+        assert_eq!(v.limit(), Some(-1));
+        for bad in [
+            "SELECT 1 LIMIT 1.5",
+            "SELECT 1 LIMIT ALL",
+            "SELECT 1 OFFSET 1 LIMIT 1",
+            "SELECT 1 WHERE 1=1 AND 2=2",
+            "SELECT 1 LIMIT 99999999999999999999",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
     use super::*;
     use std::collections::HashSet;
 
