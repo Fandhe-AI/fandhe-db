@@ -396,8 +396,30 @@ fn negative_limit_offset_rejected_at_execution() {
     let ctx = ctx_for("tenant-a");
     assert_eq!(wire_code_of(&core, &ctx, "SELECT 1 LIMIT -1"), "2201W");
     assert_eq!(wire_code_of(&core, &ctx, "SELECT 1 OFFSET -1"), "2201X");
+    // i64::MIN も構文は通り、実行時に負値として拒否される。MIN-1・MAX+1 は構文段階の 42601。
+    assert_eq!(
+        wire_code_of(&core, &ctx, "SELECT 1 LIMIT -9223372036854775808"),
+        "2201W"
+    );
+    assert_eq!(
+        wire_code_of(&core, &ctx, "SELECT 1 OFFSET -9223372036854775808"),
+        "2201X"
+    );
+    for sql in [
+        "SELECT 1 LIMIT -9223372036854775809",
+        "SELECT 1 OFFSET -9223372036854775809",
+        "SELECT 1 LIMIT 9223372036854775808",
+        "SELECT 1 OFFSET 9223372036854775808",
+    ] {
+        assert_eq!(wire_code_of(&core, &ctx, sql), "42601", "{sql}");
+    }
     // Describe は評価しないので成功し、実行時にだけ失敗する。
-    for sql in ["SELECT 1 LIMIT -1", "SELECT 1 WHERE 1/0 = 1"] {
+    for sql in [
+        "SELECT 1 LIMIT -1",
+        "SELECT 1 LIMIT -9223372036854775808",
+        "SELECT 1 OFFSET -9223372036854775808",
+        "SELECT 1 WHERE 1/0 = 1",
+    ] {
         let parsed = core.parse_sql(sql).expect("parse");
         let cols = core
             .describe_parsed_in_session(&SessionState::default(), &parsed)

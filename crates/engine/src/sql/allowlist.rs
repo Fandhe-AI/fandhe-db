@@ -6560,10 +6560,13 @@ impl<'a> Parser<'a> {
                 "malformed {clause} value: {raw}"
             )));
         }
-        let magnitude: i64 = raw
-            .parse()
-            .map_err(|_| SqlSurfaceError::unsupported(format!("{clause} value is out of range")))?;
-        Ok(if negative { -magnitude } else { magnitude })
+        // 符号付きの文字列として一括で解釈する。絶対値を先に `i64` へ読むと
+        // `i64::MIN`（`-9223372036854775808`）が範囲外になり `42601` で弾かれてしまう
+        // （契約は Describe 成功・Execute で `2201W`／`2201X`）。
+        let signed = if negative { format!("-{raw}") } else { raw };
+        signed
+            .parse::<i64>()
+            .map_err(|_| SqlSurfaceError::unsupported(format!("{clause} value is out of range")))
     }
 
     /// 省略可能な単一末尾セミコロンの後に余剰トークンがあれば複数 statement と
@@ -13545,7 +13548,18 @@ mod tests {
         assert_eq!(v.offset(), Some(0));
         let v = parse("SELECT 1 LIMIT -1").expect("negative parses");
         assert_eq!(v.limit(), Some(-1));
+        // i64 境界: MIN は構文として受理し、MIN-1・MAX+1 は拒否する。
+        let v = parse("SELECT 1 LIMIT -9223372036854775808").expect("limit i64::MIN");
+        assert_eq!(v.limit(), Some(i64::MIN));
+        let v = parse("SELECT 1 OFFSET -9223372036854775808").expect("offset i64::MIN");
+        assert_eq!(v.offset(), Some(i64::MIN));
+        let v = parse("SELECT 1 LIMIT 9223372036854775807").expect("limit i64::MAX");
+        assert_eq!(v.limit(), Some(i64::MAX));
         for bad in [
+            "SELECT 1 LIMIT -9223372036854775809",
+            "SELECT 1 OFFSET -9223372036854775809",
+            "SELECT 1 LIMIT 9223372036854775808",
+            "SELECT 1 OFFSET 9223372036854775808",
             "SELECT 1 LIMIT 1.5",
             "SELECT 1 LIMIT ALL",
             "SELECT 1 OFFSET 1 LIMIT 1",
