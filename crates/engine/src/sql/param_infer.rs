@@ -180,16 +180,21 @@ impl Inferrer<'_> {
             Expr::Number(raw) => Ty::Known(number_type(raw)),
             Expr::String(_) => Ty::Known(PreparedParamType::Text),
             Expr::Ident(name) => {
-                if as_param(expr).is_some() || name.eq_ignore_ascii_case("null") {
+                if as_param(expr).is_some() {
                     return Ty::Untyped;
                 }
-                if name.eq_ignore_ascii_case("true") || name.eq_ignore_ascii_case("false") {
+                // 実列名を先に引く（列名が `null`／`true`／`false` と衝突しても列として扱う）。
+                // 列に解決できない予約語リテラルだけを型なしとして扱う。
+                if let Some(ty) = (self.column_type)(name) {
+                    return Ty::Known(ty);
+                }
+                if name.eq_ignore_ascii_case("null")
+                    || name.eq_ignore_ascii_case("true")
+                    || name.eq_ignore_ascii_case("false")
+                {
                     return Ty::Untyped;
                 }
-                match (self.column_type)(name) {
-                    Some(ty) => Ty::Known(ty),
-                    None => Ty::Unresolved,
-                }
+                Ty::Unresolved
             }
             Expr::Call { name, .. } => builtin_return_type(name),
             Expr::Binary { op, lhs, rhs } => {
@@ -214,7 +219,11 @@ impl Inferrer<'_> {
             Expr::Coalesce(args) => self.sibling_type(args.iter()),
             Expr::NullIf(a, b) => self.sibling_type([a.as_ref(), b.as_ref()].into_iter()),
             Expr::Null => Ty::Untyped,
-            Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => Ty::Unresolved,
+            // DATE／TIMESTAMP は式内 `$n` の対象外型。`Text` へ倒さず `assign` の
+            // 対象外型判定（`0A000`）に落として fail-closed にする。
+            Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => {
+                Ty::Known(PreparedParamType::VectorText)
+            }
         }
     }
 

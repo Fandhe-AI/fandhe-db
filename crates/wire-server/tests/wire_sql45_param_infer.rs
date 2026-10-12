@@ -316,3 +316,34 @@ fn indeterminate_params_fail_parse_with_42p18_and_the_connection_survives() {
         assert_alive(&mut s);
     }
 }
+
+#[test]
+fn values_division_by_param_defers_value_errors_to_bind() {
+    let (core, _g) = new_core();
+    let mut s = connect(core.clone());
+    let sql = "INSERT INTO t (id, n) VALUES (5, 10 / $1) USING OPERATION_ID $2";
+    // Parse は構造と型だけ検証し、仮値 0 による 22012 を返さない。
+    assert_eq!(describe_oids(&mut s, sql), vec![OID_INT4, OID_TEXT]);
+    let tag = run(&mut s, sql, &[0], &[b"2", b"d-1"]).expect("bind");
+    assert!(tag.starts_with("INSERT"), "{tag}");
+    assert!(matches!(cell(&core, "n", 5), Cell::SignedInteger(5)));
+    // 実値 0 は Bind で 22012。
+    let err = run(&mut s, sql, &[0], &[b"0", b"d-2"]).expect_err("div by zero");
+    assert_eq!(err, "22012");
+    assert_alive(&mut s);
+}
+
+#[test]
+fn date_literal_neighbor_is_rejected_with_0a000() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    let sql =
+        "UPDATE t SET s = COALESCE($1, DATE '2024-01-01') WHERE id = 1 USING OPERATION_ID 'x'";
+    send_length_prefixed_message(&mut s, b'P', &parse_msg("", sql));
+    let body = expect_kind(&mut s, b'E');
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("0A000"), "{text:?}");
+    send_length_prefixed_message(&mut s, b'S', b"");
+    expect_kind(&mut s, b'Z');
+    assert_alive(&mut s);
+}

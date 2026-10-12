@@ -6528,7 +6528,7 @@ impl<'a> Parser<'a> {
         let parsed = self.parse_value_expr_with_null_context(0, true);
         self.const_expr_null_args = prev_null_args;
         self.expr_node_budget = saved;
-        crate::sql::const_expr::fold_const_literal(&parsed?)
+        crate::sql::const_expr::fold_const_literal_deferrable(&parsed?)
     }
 
     /// `UPDATE ... SET <col> = <右辺>` の右辺の入口（Issue #1544・SQL-45 のポインタ）。

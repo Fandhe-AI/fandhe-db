@@ -18,6 +18,36 @@ use crate::sql::udf_call::{
     UdfRegistry, MAX_EXPR_NODES,
 };
 
+thread_local! {
+    /// Parse 時の構造検証（パラメータ仮値での parse）中だけ立つフラグ（Issue #1546）。
+    /// 仮値 `0` で評価した値依存エラー（0 除算・範囲外）は実値で再評価される Bind まで
+    /// 遅延するため、このフラグが立つ間は [`fold_const_literal_deferrable`] が握りつぶす。
+    static DEFER_VALUE_ERRORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f` の実行中、仮値評価による値依存エラー（`22012`・`22003`）を Bind まで遅延する。
+/// `engine` の Parse 経路（`parse_sql_prepared`。`$n` を含む文の構造検証）専用。
+/// 戻り値の構文木は Describe 用の構造確認にだけ使い、実行には使わない。
+pub(crate) fn with_deferred_value_errors<T>(f: impl FnOnce() -> T) -> T {
+    let prev = DEFER_VALUE_ERRORS.with(|c| c.replace(true));
+    let out = f();
+    DEFER_VALUE_ERRORS.with(|c| c.set(prev));
+    out
+}
+
+/// [`fold_const_literal`] の Parse 時構造検証版。遅延モード中で値依存エラーなら
+/// プレースホルダ数値を返す（型・構文系エラーは従来どおり返す）。
+pub(crate) fn fold_const_literal_deferrable(expr: &Expr) -> Result<InsertLiteral, SqlSurfaceError> {
+    match fold_const_literal(expr) {
+        Err(SqlSurfaceError::DivisionByZero { .. } | SqlSurfaceError::NumericOutOfRange { .. })
+            if DEFER_VALUE_ERRORS.with(|c| c.get()) =>
+        {
+            Ok(InsertLiteral::Number("0".to_string()))
+        }
+        other => other,
+    }
+}
+
 /// f64 が整数を正確に表現できる上限（2^53）。
 const MAX_EXACT_F64: f64 = 9_007_199_254_740_992.0;
 

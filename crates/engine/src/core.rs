@@ -3929,8 +3929,14 @@ impl EngineCore {
         // `WherePredicate::Equality` にならず序数に数えない）。
         let where_equality_dummy_flags =
             crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds);
-        let dummy_parsed =
-            self.parse_tokens(crate::sql::params::substitute_dummy_typed(&tokens, &kinds))?;
+        // 仮値での定数畳み込みは値依存エラー（0 除算等）を Bind まで遅延する
+        // （`VALUES (1, 10 / $1)` の実値を Bind で受けるため。Parse は構造と型だけ検証）。
+        let dummy_tokens = crate::sql::params::substitute_dummy_typed(&tokens, &kinds);
+        let dummy_parsed = if param_count > 0 {
+            crate::sql::const_expr::with_deferred_value_errors(|| self.parse_tokens(dummy_tokens))?
+        } else {
+            self.parse_tokens(dummy_tokens)?
+        };
         Ok(PreparedSql {
             tokens,
             param_count,
