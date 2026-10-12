@@ -403,3 +403,168 @@ fn undefined_type_error_is_identical_across_tenants_and_leaks_nothing() {
         }
     }
 }
+/// Issue #2304（TABLE-29）: `BOOL`・`FLOAT`・`FLOAT(p)`・`TIMESTAMP WITHOUT TIME ZONE` が
+/// CREATE TABLE・ADD COLUMN で正規型として永続化される。
+#[test]
+fn issue_2304_aliases_persist_as_canonical_types() {
+    let (path, _g, core) = open("ta-2304-persist");
+    let mut s = allowed();
+    run(
+        &core,
+        &mut s,
+        "CREATE TABLE a (embedding VECTOR(2) NOT NULL, c1 BOOL, c2 FLOAT, c3 FLOAT(24), c4 FLOAT(25), c5 float(53), \
+         c6 TIMESTAMP WITHOUT TIME ZONE, c7 bool[], c8 FLOAT(1))",
+    )
+    .expect("create alias table");
+    run(
+        &core,
+        &mut s,
+        "CREATE TABLE b (embedding VECTOR(2) NOT NULL, c1 BOOLEAN, c2 DOUBLE PRECISION, c3 REAL, c4 DOUBLE PRECISION, \
+         c5 DOUBLE PRECISION, c6 TIMESTAMP, c7 BOOLEAN[], c8 REAL)",
+    )
+    .expect("create canonical table");
+    run(
+        &core,
+        &mut s,
+        "ALTER TABLE a ADD COLUMN c9 timestamp without time zone",
+    )
+    .expect("add column");
+    run(&core, &mut s, "ALTER TABLE a ADD COLUMN c10 FLOAT(30)").expect("add float");
+    drop(core);
+    let storage = Storage::open(&path).expect("reopen");
+    let a = storage.get_table_schema("a").expect("schema a");
+    let b = storage.get_table_schema("b").expect("schema b");
+    for (x, y) in a.columns.iter().zip(b.columns.iter()) {
+        assert_eq!(x.ty, y.ty, "column {}", x.name);
+    }
+    let ty_of = |n: &str| {
+        a.columns
+            .iter()
+            .find(|c| c.name == n)
+            .expect("col")
+            .ty
+            .clone()
+    };
+    assert!(matches!(ty_of("c9"), ColumnType::Timestamp));
+    assert!(matches!(ty_of("c10"), ColumnType::Double));
+}
+
+/// `FLOAT`／`FLOAT(53)` への ALTER は REAL 列からの拡大として成功し、
+/// `BOOL`・`FLOAT(24)`・`TIMESTAMP WITHOUT TIME ZONE` は正規名と同じ wire_code で拒否される。
+#[test]
+fn issue_2304_alter_column_type_matches_canonical_names() {
+    let (path, _g, core) = open("ta-2304-alter");
+    let mut s = allowed();
+    run(
+        &core,
+        &mut s,
+        "CREATE TABLE t (embedding VECTOR(2) NOT NULL, r1 REAL, r2 REAL, b BOOLEAN, \
+         f REAL, ts TIMESTAMP)",
+    )
+    .expect("create");
+    run(&core, &mut s, "ALTER TABLE t ALTER COLUMN r1 TYPE FLOAT").expect("float");
+    run(
+        &core,
+        &mut s,
+        "ALTER TABLE t ALTER COLUMN r2 TYPE FLOAT(53)",
+    )
+    .expect("float(53)");
+    for (alias, canonical, col) in [
+        ("BOOL", "BOOLEAN", "b"),
+        ("FLOAT(24)", "REAL", "f"),
+        ("TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP", "ts"),
+    ] {
+        let a = err(
+            &core,
+            &mut s,
+            &format!("ALTER TABLE t ALTER COLUMN {col} TYPE {alias}"),
+        );
+        let c = err(
+            &core,
+            &mut s,
+            &format!("ALTER TABLE t ALTER COLUMN {col} TYPE {canonical}"),
+        );
+        assert_eq!(a.wire_code(), c.wire_code(), "{alias}");
+    }
+    drop(core);
+    assert!(matches!(column_type(&path, "t", "r1"), ColumnType::Double));
+    assert!(matches!(column_type(&path, "t", "r2"), ColumnType::Double));
+    assert!(matches!(column_type(&path, "t", "f"), ColumnType::Real));
+}
+
+/// `FLOAT(0)`・`FLOAT(54)` は 3 経路とも `22023`・固定文言で、副作用はなく、
+/// DDL 権限の有無にかかわらず構文段で決まる。
+#[test]
+fn issue_2304_float_precision_out_of_range_is_22023_without_side_effects() {
+    let (path, _g, core) = open("ta-2304-22023");
+    let mut s = allowed();
+    run(
+        &core,
+        &mut s,
+        "CREATE TABLE t (embedding VECTOR(2) NOT NULL, a REAL)",
+    )
+    .expect("create");
+    let cases = [
+        (
+            "FLOAT(0)",
+            "precision for type float must be at least 1 bit",
+        ),
+        (
+            "FLOAT(54)",
+            "precision for type float must be less than 54 bits",
+        ),
+        (
+            "FLOAT(99999999999)",
+            "precision for type float must be less than 54 bits",
+        ),
+    ];
+    for (ty, msg) in cases {
+        let paths = [
+            format!("CREATE TABLE u (a {ty})"),
+            format!("ALTER TABLE t ADD COLUMN b {ty}"),
+            format!("ALTER TABLE t ALTER COLUMN a TYPE {ty}"),
+        ];
+        for sql in paths {
+            let e = err(&core, &mut s, &sql);
+            assert_eq!(e.wire_code(), "22023", "{sql}");
+            assert_eq!(e.to_string(), msg, "{sql}");
+        }
+    }
+    let mut denied = SessionState::default();
+    assert_eq!(
+        err(&core, &mut denied, "CREATE TABLE u (a FLOAT(0))").wire_code(),
+        "22023"
+    );
+    assert_eq!(
+        err(&core, &mut denied, "CREATE TABLE u (a FLOAT)").wire_code(),
+        "42501"
+    );
+    for sql in ["CREATE TABLE u (a FLOAT())", "CREATE TABLE u (a FLOAT(-1))"] {
+        assert_eq!(err(&core, &mut s, sql).wire_code(), "42601", "{sql}");
+    }
+    drop(core);
+    let storage = Storage::open(&path).expect("reopen");
+    assert!(storage.get_table_schema("u").is_err());
+    let schema = storage.get_table_schema("t").expect("schema");
+    assert!(schema.columns.iter().all(|c| c.name != "b"));
+    let a = schema.columns.iter().find(|c| c.name == "a").expect("a");
+    assert!(matches!(a.ty, ColumnType::Real));
+}
+
+/// 既存 ENUM との衝突防止: `CREATE TYPE float`・`bool` は作成できない。拒否の
+/// `wire_code` は既存の予約名（`boolean`）の拒否と同一である。
+#[test]
+fn issue_2304_create_type_rejects_float_and_bool() {
+    let (path, _g, core) = open("ta-2304-enum");
+    let mut s = allowed();
+    let reserved = err(&core, &mut s, "CREATE TYPE boolean AS ENUM ('a')").wire_code();
+    for name in ["float", "FLOAT", "bool", "timestamp"] {
+        let sql = format!("CREATE TYPE {name} AS ENUM ('a')");
+        assert_eq!(err(&core, &mut s, &sql).wire_code(), reserved, "{sql}");
+    }
+    drop(core);
+    let storage = Storage::open(&path).expect("reopen");
+    for name in ["float", "bool", "timestamp"] {
+        assert!(storage.get_enum_type(name).is_err(), "{name}");
+    }
+}

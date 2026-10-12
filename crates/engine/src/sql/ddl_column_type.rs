@@ -286,6 +286,12 @@ enum TypeNameKind {
     Alias(fn() -> SqlColumnTypeName),
     /// `DOUBLE PRECISION`（2 語必須。`DOUBLE` 単独は構文段 `42704`。Issue #2306）。
     DoublePrecision,
+    /// `FLOAT`／`FLOAT(p)`（Issue #2304。TABLE-29）。`p` が `1..=24` は `REAL`、`25..=53` と
+    /// 精度なしは `DOUBLE PRECISION`、範囲外は構文段 `22023`。綴りを保持する別名（同名 ENUM
+    /// との衝突検出のため）。
+    Float,
+    /// `TIMESTAMP [WITHOUT TIME ZONE]`（Issue #2304）。`WITHOUT` が続けば `TIME ZONE` を必須とする。
+    Timestamp,
     /// `VECTOR(N)`。
     Vector,
     /// `NUMERIC(p,s)`／`DECIMAL(p,s)`。
@@ -321,15 +327,14 @@ const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
     ("FLOAT4", TypeNameKind::Alias(|| SqlColumnTypeName::Real)),
     ("FLOAT8", TypeNameKind::Alias(|| SqlColumnTypeName::Double)),
     ("DOUBLE", TypeNameKind::DoublePrecision),
+    ("FLOAT", TypeNameKind::Float),
+    ("BOOL", TypeNameKind::Direct(|| SqlColumnTypeName::Boolean)),
     (
         "BOOLEAN",
         TypeNameKind::Direct(|| SqlColumnTypeName::Boolean),
     ),
     ("DATE", TypeNameKind::Direct(|| SqlColumnTypeName::Date)),
-    (
-        "TIMESTAMP",
-        TypeNameKind::Direct(|| SqlColumnTypeName::Timestamp),
-    ),
+    ("TIMESTAMP", TypeNameKind::Timestamp),
     ("BYTEA", TypeNameKind::Direct(|| SqlColumnTypeName::Bytea)),
     ("JSON", TypeNameKind::Direct(|| SqlColumnTypeName::Json)),
     ("JSONB", TypeNameKind::Direct(|| SqlColumnTypeName::Jsonb)),
@@ -412,6 +417,18 @@ fn parse_base_type_name(
                 _ => Err(SqlSurfaceError::UndefinedType { name }),
             }
         }
+        TypeNameKind::Float => parse_float_type(name, tokens, pos),
+        TypeNameKind::Timestamp => {
+            if matches!(
+                tokens.get(*pos),
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("WITHOUT")
+            ) {
+                *pos += 1;
+                expect_contextual_keyword(tokens, pos, "TIME")?;
+                expect_contextual_keyword(tokens, pos, "ZONE")?;
+            }
+            Ok(SqlColumnTypeName::Timestamp)
+        }
         TypeNameKind::Vector => {
             expect_punct(tokens, pos, '(')?;
             let dim = expect_strict_u32(tokens, pos)?;
@@ -446,6 +463,50 @@ fn parse_base_type_name(
     }
 }
 
+/// `FLOAT`／`FLOAT(p)` の解析（[`parse_base_type_name`] の下請け。Issue #2304・TABLE-29）。
+///
+/// 精度 `p` は untrusted な SQL トークンで、`u32` を超えてあふれる数字列も「54 以上」として
+/// `22023` にする。先頭ゼロ・小数・符号・空・閉じ括弧の欠落は NUMERIC と同じく `42601`。
+/// 判定は構文段（書き込みトランザクション開始前・カタログ参照なし）で行うため副作用はない。
+fn parse_float_type(
+    name: String,
+    tokens: &[Token],
+    pos: &mut usize,
+) -> Result<SqlColumnTypeName, SqlSurfaceError> {
+    if !matches!(tokens.get(*pos), Some(Token::Punct('('))) {
+        return Ok(alias_type(name, SqlColumnTypeName::Double));
+    }
+    *pos += 1;
+    let precision = match tokens.get(*pos) {
+        Some(Token::Number(s)) => {
+            if !s.bytes().all(|b| b.is_ascii_digit()) || (s.len() > 1 && s.starts_with('0')) {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "malformed numeric literal: {s:?}"
+                )));
+            }
+            // u32 をあふれる数字列は範囲外（54 以上）として扱う。
+            s.parse::<u32>().unwrap_or(u32::MAX)
+        }
+        other => {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "expected a numeric literal, got {other:?}"
+            )));
+        }
+    };
+    *pos += 1;
+    expect_punct(tokens, pos, ')')?;
+    match precision {
+        0 => Err(SqlSurfaceError::InvalidParameterValue {
+            detail: "precision for type float must be at least 1 bit",
+        }),
+        1..=24 => Ok(alias_type(name, SqlColumnTypeName::Real)),
+        25..=53 => Ok(alias_type(name, SqlColumnTypeName::Double)),
+        _ => Err(SqlSurfaceError::InvalidParameterValue {
+            detail: "precision for type float must be less than 54 bits",
+        }),
+    }
+}
+
 fn expect_ident(tokens: &[Token], pos: &mut usize) -> Result<String, SqlSurfaceError> {
     match tokens.get(*pos) {
         Some(Token::Ident(s) | Token::QuotedNull(s)) => {
@@ -454,6 +515,24 @@ fn expect_ident(tokens: &[Token], pos: &mut usize) -> Result<String, SqlSurfaceE
         }
         other => Err(SqlSurfaceError::unsupported(format!(
             "expected a type name, got {other:?}"
+        ))),
+    }
+}
+
+/// 文脈依存キーワード（`TIME`／`ZONE` 等）を 1 語消費する。`TIMESTAMP WITHOUT TIME ZONE`
+/// の解析（Issue #2304）で使う。不一致は構文段 `0A000`。
+fn expect_contextual_keyword(
+    tokens: &[Token],
+    pos: &mut usize,
+    word: &str,
+) -> Result<(), SqlSurfaceError> {
+    match tokens.get(*pos) {
+        Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word) => {
+            *pos += 1;
+            Ok(())
+        }
+        other => Err(SqlSurfaceError::unsupported(format!(
+            "expected {word}, got {other:?}"
         ))),
     }
 }
@@ -585,6 +664,78 @@ mod tests {
             let (ty, consumed) = parse_type(raw).expect("valid");
             assert!(!matches!(ty, SqlColumnTypeName::Enum(_)), "for {raw:?}");
             assert_eq!(consumed, 1, "for {raw:?}");
+        }
+    }
+
+    /// Issue #2304（TABLE-29）: `BOOL`・`FLOAT`・`FLOAT(p)`・`TIMESTAMP WITHOUT TIME ZONE`。
+    #[test]
+    fn issue_2304_aliases_resolve_to_canonical_targets() {
+        for raw in ["BOOL", "bool"] {
+            assert_eq!(
+                parse_type(raw).expect("valid"),
+                (SqlColumnTypeName::Boolean, 1)
+            );
+        }
+        for (raw, target, consumed) in [
+            ("FLOAT", SqlColumnTypeName::Double, 1),
+            ("float", SqlColumnTypeName::Double, 1),
+            ("FLOAT(1)", SqlColumnTypeName::Real, 4),
+            ("FLOAT(24)", SqlColumnTypeName::Real, 4),
+            ("FLOAT(25)", SqlColumnTypeName::Double, 4),
+            ("FLOAT(53)", SqlColumnTypeName::Double, 4),
+        ] {
+            let (ty, n) = parse_type(raw).expect("valid");
+            assert_eq!(n, consumed, "{raw}");
+            assert_eq!(alias_spelling(&ty), raw.get(..5), "{raw}");
+            assert!(
+                matches!(ty, SqlColumnTypeName::Alias { target: ref t, .. } if **t == target),
+                "{raw}: {ty:?}"
+            );
+        }
+        let (ty, n) = parse_type("TimeStamp Without Time Zone").expect("valid");
+        assert_eq!((ty, n), (SqlColumnTypeName::Timestamp, 4));
+        assert_eq!(parse_type("TIMESTAMP").expect("valid").1, 1);
+        for raw in ["TIMESTAMP WITHOUT TIME ZONE[]", "FLOAT(24)[3]", "BOOL[]"] {
+            let (ty, _) = parse_type(raw).expect("valid");
+            assert!(matches!(ty, SqlColumnTypeName::Array { .. }), "{raw}");
+        }
+    }
+
+    #[test]
+    fn issue_2304_float_precision_out_of_range_is_22023() {
+        for (raw, msg) in [
+            (
+                "FLOAT(0)",
+                "precision for type float must be at least 1 bit",
+            ),
+            (
+                "FLOAT(54)",
+                "precision for type float must be less than 54 bits",
+            ),
+            (
+                "FLOAT(99999999999)",
+                "precision for type float must be less than 54 bits",
+            ),
+        ] {
+            let e = parse_type(raw).expect_err(raw);
+            assert_eq!(e.wire_code(), "22023", "{raw}");
+            assert_eq!(e.to_string(), msg, "{raw}");
+        }
+    }
+
+    #[test]
+    fn issue_2304_malformed_float_and_timestamp_are_42601() {
+        for raw in [
+            "FLOAT()",
+            "FLOAT(-1)",
+            "FLOAT(1.5)",
+            "FLOAT(024)",
+            "FLOAT(24",
+            "TIMESTAMP WITHOUT",
+            "TIMESTAMP WITHOUT TIME",
+        ] {
+            let e = parse_type(raw).expect_err(raw);
+            assert_eq!(e.wire_code(), "42601", "{raw}");
         }
     }
 
