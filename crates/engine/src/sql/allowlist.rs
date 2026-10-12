@@ -36,6 +36,8 @@ const MAX_ERROR_DETAIL_LEN: usize = crate::error_format::MAX_MESSAGE_LEN;
 /// （Issue #927・SQL-29 (a)・TASK-213。実装既定値）。`Parser::subquery_ctx` の
 /// 深さがこれを超える箇所を構文解析段で `54000` へ落とし、`sql::subquery` の
 /// 解決（再帰的な内側実行）がスタック・実行コストとも定数段に収まるようにする。
+/// Issue #1552: 本定数は**ハード上限（＝既定値）**で、運用者は起動時に
+/// [`crate::nesting_limits::NestingLimits`] で下げられる（引き上げは不可）。
 pub(crate) const MAX_SUBQUERY_DEPTH: usize = 4;
 
 /// `CREATE TABLE` の列定義が受理する列型キーワード（[`Parser::parse_create_table_column`]
@@ -3486,6 +3488,10 @@ struct Parser<'a> {
     /// トップレベル呼び出し（`parse_select_shape`/`parse_aggregate_shape` の
     /// 呼び出し元）だけが `Some(0)` を設定する。
     subquery_ctx: Option<usize>,
+    /// サブクエリ深さ・CTE 定義数の実効上限（Issue #1552）。`Parser::new` の既定は
+    /// ハード上限と同値で、セッション SQL のパース入口だけが
+    /// [`Self::with_nesting_limits`] で起動時設定値へ差し替える。
+    nesting_limits: crate::nesting_limits::NestingLimits,
     /// `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）の現在の
     /// 入れ子段数。[`enter_case_nesting`]／[`Self::exit_case_nesting`] が
     /// 対で管理する（構文段の計測。束縛段の独立検査は `udf_call::BindEnv::
@@ -3574,6 +3580,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             expr_node_budget: MAX_EXPR_NODES,
             subquery_ctx: None,
+            nesting_limits: crate::nesting_limits::NestingLimits::default(),
             case_nesting: 0,
             allow_null_literal: false,
             allow_unary_minus: false,
@@ -3602,6 +3609,13 @@ impl<'a> Parser<'a> {
         self
     }
 
+    /// 入れ子系上限の実効値を差し替える（Issue #1552）。起動時設定
+    /// （[`crate::nesting_limits::NestingLimits`]）を持つ入口だけが呼ぶ。
+    fn with_nesting_limits(mut self, limits: crate::nesting_limits::NestingLimits) -> Self {
+        self.nesting_limits = limits;
+        self
+    }
+
     /// `IN (SELECT ...)`／`EXISTS (SELECT ...)` を検出した位置で呼ぶ。現在の
     /// 文脈が許可されていなければ `42601`、許可されていても深さ上限
     /// （[`MAX_SUBQUERY_DEPTH`]）を超えるなら `54000`。返り値は新設する
@@ -3613,10 +3627,11 @@ impl<'a> Parser<'a> {
         })?;
         let next_depth = ctx_depth
             .checked_add(1)
-            .filter(|d| *d <= MAX_SUBQUERY_DEPTH);
+            .filter(|d| *d <= self.nesting_limits.max_subquery_depth());
         next_depth.ok_or_else(|| {
             SqlSurfaceError::payload_too_large(format!(
-                "subquery nesting exceeds limit {MAX_SUBQUERY_DEPTH}"
+                "subquery nesting exceeds limit {}",
+                self.nesting_limits.max_subquery_depth()
             ))
         })
     }
@@ -8219,7 +8234,10 @@ impl<'a> Parser<'a> {
             let body = parse_view_body(inner)?;
             super::cte::check_no_duplicate_name(&ctes, &name)?;
             ctes.push(super::cte::CteDef { name, body });
-            super::cte::check_definition_count(ctes.len())?;
+            super::cte::check_definition_count(
+                ctes.len(),
+                self.nesting_limits.max_cte_definitions(),
+            )?;
             // `split_parenthesized` はスライスのみを返す（`Parser` の内部位置を
             // 持たない）ため、残りトークン数から `self.pos` を復元する。`after`
             // は構造的に `self.tokens` の suffix であり `after.len()` は
@@ -10289,7 +10307,13 @@ fn parse_set_branch(
     let branch_end = set_branch_end(&p.tokens, branch_start);
     if let Some(slice) = p.tokens.get(branch_start..branch_end) {
         if looks_like_aggregate_select(slice) {
-            let shape = parse_aggregate_shape(slice, None, true, false)?;
+            let shape = parse_aggregate_shape(
+                slice,
+                None,
+                true,
+                false,
+                crate::nesting_limits::NestingLimits::default(),
+            )?;
             p.pos = branch_end;
             return build_set_aggregate_branch(shape, lookup);
         }
@@ -10484,10 +10508,21 @@ fn parse_set_limited_branch(
     lookup: &impl TableLookup,
 ) -> Result<SetTree, SqlSurfaceError> {
     if looks_like_aggregate_select(slice) {
-        let shape = parse_aggregate_shape(slice, None, true, false)?;
+        let shape = parse_aggregate_shape(
+            slice,
+            None,
+            true,
+            false,
+            crate::nesting_limits::NestingLimits::default(),
+        )?;
         return build_set_aggregate_branch(shape, lookup);
     }
-    let shape = match parse_select_shape(slice, None, true)? {
+    let shape = match parse_select_shape(
+        slice,
+        None,
+        true,
+        crate::nesting_limits::NestingLimits::default(),
+    )? {
         ParsedSelect::Scan(shape) => shape,
         ParsedSelect::Search(_) => {
             return Err(SqlSurfaceError::unsupported(
@@ -10747,8 +10782,9 @@ fn parse_select_shape(
     tokens: &[Token],
     subquery_ctx: Option<usize>,
     reject_from_alias: bool,
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<ParsedSelect, SqlSurfaceError> {
-    let mut p = Parser::new(tokens);
+    let mut p = Parser::new(tokens).with_nesting_limits(limits);
     p.reject_from_alias = reject_from_alias;
     if let Some(depth) = subquery_ctx {
         p = p.with_subquery_ctx(depth);
@@ -11021,8 +11057,9 @@ fn parse_aggregate_shape(
     subquery_ctx: Option<usize>,
     reject_from_alias: bool,
     allow_expr_items: bool,
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<ParsedAggregateShape, SqlSurfaceError> {
-    let mut p = Parser::new(tokens);
+    let mut p = Parser::new(tokens).with_nesting_limits(limits);
     p.reject_from_alias = reject_from_alias;
     // Issue #1541: 集計式項目はトップレベル文だけが受理する（呼び出し元が判定して渡す）。
     p.allow_aggregate_expr_items = allow_expr_items;
@@ -11326,9 +11363,10 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
 pub(crate) fn validate_sql_with_subquery_ctx(
     sql: &str,
     lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<Statement, SqlSurfaceError> {
     let tokens = lexer::tokenize(sql)?;
-    validate_sql_tokens_with_subquery_ctx(&tokens, lookup, 0)
+    validate_sql_tokens_with_subquery_ctx_limits(&tokens, lookup, 0, limits)
 }
 
 /// [`validate_sql`] の本体（Issue #939・WIRE-17。COPY プロトコル対応の一環）。
@@ -11538,19 +11576,59 @@ pub(crate) fn validate_sql_tokens(
     tokens: &[Token],
     lookup: &impl TableLookup,
 ) -> Result<Statement, SqlSurfaceError> {
-    validate_sql_tokens_impl(tokens, lookup, None)
+    validate_sql_tokens_impl(
+        tokens,
+        lookup,
+        None,
+        crate::nesting_limits::NestingLimits::default(),
+    )
+}
+
+/// [`validate_sql_tokens`] の入れ子系上限指定版（サブクエリ文脈なし。Issue #1552）。
+/// `DECLARE CURSOR ... FOR WITH ...` のように、サブクエリは許可しないが CTE 定義数・
+/// CTE 連鎖深さの起動時設定値（[`crate::nesting_limits::NestingLimits`]）を効かせたい
+/// 入口（`sql::cursor`）が呼ぶ。
+pub(crate) fn validate_sql_tokens_with_limits(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<Statement, SqlSurfaceError> {
+    validate_sql_tokens_impl(tokens, lookup, None, limits)
 }
 
 /// [`validate_sql_tokens`] のサブクエリ許可版（Issue #927・TASK-213）。
 /// `depth` は現在位置の入れ子深さ（`sql::subquery::resolve_where_predicates`
 /// が内側 `Statement::Scan` を再検証する際に 1 つ進めて渡す。トップレベルは
 /// [`validate_sql_with_subquery_ctx`] が 0 を渡す）。
+///
+/// 本関数は入れ子系上限を**ハード上限（`NestingLimits::default()`）**で判定する。
+/// 格納済みビュー本文の構造検証・参照時の再検証（`classify_view_body`・
+/// `check_body_subquery`）専用で、起動時に上限を下げて再起動しても既存ビューの
+/// 定義検証が壊れないようにする（Issue #1552 D6）。セッション SQL は
+/// [`validate_sql_tokens_with_subquery_ctx_limits`] を使う。
 pub(crate) fn validate_sql_tokens_with_subquery_ctx(
     tokens: &[Token],
     lookup: &impl TableLookup,
     depth: usize,
 ) -> Result<Statement, SqlSurfaceError> {
-    validate_sql_tokens_impl(tokens, lookup, Some(depth))
+    validate_sql_tokens_with_subquery_ctx_limits(
+        tokens,
+        lookup,
+        depth,
+        crate::nesting_limits::NestingLimits::default(),
+    )
+}
+
+/// [`validate_sql_tokens_with_subquery_ctx`] の入れ子系上限指定版（Issue #1552）。
+/// `EngineCore` のセッション SQL パース入口と `sql::subquery` の内側再検証が、
+/// 起動時設定値を渡して呼ぶ。
+pub(crate) fn validate_sql_tokens_with_subquery_ctx_limits(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    depth: usize,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<Statement, SqlSurfaceError> {
+    validate_sql_tokens_impl(tokens, lookup, Some(depth), limits)
 }
 
 /// [`validate_sql_tokens`]／[`validate_sql_tokens_with_subquery_ctx`] が共有する
@@ -11562,6 +11640,7 @@ fn validate_sql_tokens_impl(
     tokens: &[Token],
     lookup: &impl TableLookup,
     subquery_ctx: Option<usize>,
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<Statement, SqlSurfaceError> {
     // `SET`・`CREATE` は字句解析段階のキーワードではなく `Ident` のため
     // （TASK-161・SQL-12 修正と同方針）、statement 先頭という文脈でのみ大文字小文字を
@@ -11607,7 +11686,7 @@ fn validate_sql_tokens_impl(
         // SELECT／集計 SELECT）でのみサブクエリを解決できるようにする
         // （`EXPLAIN` 経由の呼び出しは常に `None` を渡す。後述）。
         Some(Token::Keyword(Keyword::Select)) => {
-            validate_select_statement(tokens, lookup, subquery_ctx)
+            validate_select_statement(tokens, lookup, subquery_ctx, limits)
         }
         // TASK-213・SQL-29 (b)・RLS-10 (b)（Issue #928）: 非再帰 CTE。CTE は
         // 「クエリの中だけで有効な名前なしビュー」として、`sql::cte::
@@ -11622,7 +11701,7 @@ fn validate_sql_tokens_impl(
         // 先頭トークンで振り分けるため、本アームには到達しない
         // （out-of-scope。Issue #928 対象外事項）。
         _ if is_with_statement => {
-            let mut p = Parser::new(tokens);
+            let mut p = Parser::new(tokens).with_nesting_limits(limits);
             let ctes = p.parse_with_clause()?;
             // Issue #1535: 主クエリも通常 SELECT と同じ修飾列正規化を通す（CTE 定義本体は対象外）。
             let main_normalized =
@@ -11665,9 +11744,15 @@ fn validate_sql_tokens_impl(
             let main = if is_distinct_modifier(main_tokens, 1) {
                 MainShape::Aggregate(parse_distinct_shape(main_tokens)?)
             } else if main_is_aggregate_select {
-                MainShape::Aggregate(parse_aggregate_shape(main_tokens, None, false, false)?)
+                MainShape::Aggregate(parse_aggregate_shape(
+                    main_tokens,
+                    None,
+                    false,
+                    false,
+                    limits,
+                )?)
             } else {
-                match parse_select_shape(main_tokens, None, false)? {
+                match parse_select_shape(main_tokens, None, false, limits)? {
                     ParsedSelect::Scan(shape) => MainShape::Scan(shape),
                     ParsedSelect::Search(_) => {
                         return Err(SqlSurfaceError::unsupported(
@@ -11723,6 +11808,7 @@ fn validate_sql_tokens_impl(
                     idx,
                     &def.body.table_name,
                     0,
+                    limits.max_cte_nesting_depth(),
                     &mut budget,
                 )?;
                 let (base_table, view_columns): (&str, Option<Vec<String>>) = match &resolved {
@@ -11761,6 +11847,7 @@ fn validate_sql_tokens_impl(
                 ctes.len(),
                 &main_table_name,
                 0,
+                limits.max_cte_nesting_depth(),
                 &mut budget,
             )?;
             match main {
@@ -11818,7 +11905,7 @@ fn validate_sql_tokens_impl(
             // 文脈に含めない（`docs/design/sql-subquery.md` 参照。`subquery_ctx`
             // に `None` を渡し、`IN (SELECT ...)`／`EXISTS (SELECT ...)` は
             // 通常どおり `Parser::require_subquery_depth` が `42601` で拒否する）。
-            let target = match validate_select_statement(rest, lookup, None)? {
+            let target = match validate_select_statement(rest, lookup, None, limits)? {
                 Statement::Select(v) => ExplainTarget::Search(v),
                 Statement::Aggregate(v) => ExplainTarget::Aggregate(v),
                 // SQL-30・TASK-214（Issue #930）: `EXPLAIN` はウィンドウ関数に
@@ -11908,6 +11995,7 @@ fn validate_select_statement(
     tokens: &[Token],
     lookup: &impl TableLookup,
     subquery_ctx: Option<usize>,
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<Statement, SqlSurfaceError> {
     // SQL-43（Issue #1531）: 括弧の深さ 0 に `FROM` が無い `SELECT` は定数式 SELECT。
     // 既存形（`FROM` あり）では常に偽で、以降の振り分けに一切影響しない。
@@ -11989,6 +12077,7 @@ fn validate_select_statement(
             subquery_ctx,
             false,
             subquery_ctx.is_none_or(|d| d == 0),
+            limits,
         )?;
         let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
         return aggregate_statement_from_resolved(
@@ -11999,7 +12088,7 @@ fn validate_select_statement(
             shape.group_by,
         );
     }
-    match parse_select_shape(tokens, subquery_ctx, false)? {
+    match parse_select_shape(tokens, subquery_ctx, false, limits)? {
         ParsedSelect::Search(shape) => {
             let exists = lookup.table_exists(&shape.table_name)?;
             if !exists {

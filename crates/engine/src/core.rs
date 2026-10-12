@@ -1146,6 +1146,10 @@ pub struct EngineCore {
     /// [`Self::with_group_by_limits`] のみ（起動時 1 回）。集計の実行段
     /// （単一表・集合演算枝・サブクエリ内側・ビュー外側・JOIN）にだけ効く。
     group_by_limits: crate::group_by_limits::GroupByLimits,
+    /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限（Issue #1552）。
+    /// 差し替えは [`Self::with_nesting_limits`] のみ（起動時 1 回）。構文解析段と
+    /// サブクエリ解決段にだけ効き、格納済みビュー本文の再パースはハード上限のまま。
+    nesting_limits: crate::nesting_limits::NestingLimits,
     /// 述語形 UPDATE／DELETE の分割実行（Issue #1128・ADR `docs/design/partitioned-dml.md`
     /// §15.2）のチャンク幅・走査予算・writer 保持時間。差し替えは
     /// [`Self::with_partitioned_dml_limits`] のみ（起動時に 1 回）。
@@ -2051,6 +2055,7 @@ impl EngineCore {
             dml_limits: crate::sql::parser::DmlLimits::default(),
             schema_limits: crate::schema_limits::SchemaLimits::default(),
             group_by_limits: crate::group_by_limits::GroupByLimits::default(),
+            nesting_limits: crate::nesting_limits::NestingLimits::default(),
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
@@ -2287,6 +2292,20 @@ impl EngineCore {
     /// 現在の `GROUP BY` 上限（Issue #1550）。
     pub fn group_by_limits(&self) -> crate::group_by_limits::GroupByLimits {
         self.group_by_limits
+    }
+
+    /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限
+    /// （[`crate::nesting_limits::NestingLimits`]）を差し替えたビルダーを返す（Issue #1552）。
+    /// `wire-server` の起動時 CLI フラグ（`--max-subquery-depth` 等）からのみ呼ぶ。
+    /// 未呼び出しならハード上限と同値の既定（現行挙動）。
+    pub fn with_nesting_limits(mut self, limits: crate::nesting_limits::NestingLimits) -> Self {
+        self.nesting_limits = limits;
+        self
+    }
+
+    /// 現在の入れ子系上限（Issue #1552）。
+    pub fn nesting_limits(&self) -> crate::nesting_limits::NestingLimits {
+        self.nesting_limits
     }
 
     /// 分割実行 DML の設定（[`crate::sql::parser::PartitionedDmlLimits`]）を差し替えた
@@ -2927,7 +2946,11 @@ impl EngineCore {
         // 異なるエラーコードを返す非決定的な契約になっていた。fail-closed の観点でも
         // エラー契約は入力の意味論的妥当性に関わらず一貫させるべきであり、statement
         // 種別のみで判定する）。
-        match crate::sql::allowlist::validate_sql_with_subquery_ctx(sql, &self.storage)? {
+        match crate::sql::allowlist::validate_sql_with_subquery_ctx(
+            sql,
+            &self.storage,
+            self.nesting_limits,
+        )? {
             crate::sql::allowlist::Statement::SetSearchMode { .. } => {
                 Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                     "SET search_mode requires a session-aware entry point",
@@ -3499,7 +3522,10 @@ impl EngineCore {
             // カタログ照会（テーブル存在確認）は意図的にここでは行わない
             // （`sql::cursor::validate_declare_tokens_structure_only` 参照。
             // PR #1049 レビュー指摘 P1 対応）。
-            let stmt = crate::sql::cursor::validate_declare_tokens_structure_only(&tokens)?;
+            let stmt = crate::sql::cursor::validate_declare_tokens_structure_only(
+                &tokens,
+                self.nesting_limits,
+            )?;
             return Ok(ParsedSql::Cursor(stmt));
         }
 
@@ -3615,10 +3641,11 @@ impl EngineCore {
             return Ok(ParsedSql::AlterTable(stmt));
         }
 
-        let stmt = crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx(
+        let stmt = crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
             &tokens,
             &self.storage,
             0,
+            self.nesting_limits,
         )?;
         Ok(ParsedSql::Statement(stmt))
     }
@@ -4573,8 +4600,11 @@ impl EngineCore {
                 // （基底テーブル＋ビュー由来述語。RLS は後段の実行経路が参照
                 // セッション自身の `ctx` で暗黙適用する）が適用される。
                 // `table` はビュー展開後の基底テーブル名。
-                let (inner, _table) =
-                    crate::sql::cursor::validate_declare_inner(query, &self.storage)?;
+                let (inner, _table) = crate::sql::cursor::validate_declare_inner(
+                    query,
+                    &self.storage,
+                    self.nesting_limits,
+                )?;
                 let registry = txn.cursors_mut().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -5423,7 +5453,7 @@ impl EngineCore {
                 // （`IN (SELECT ...)`／`EXISTS (SELECT ...)`）を、外側と同じ
                 // `PolicyContext`・同じ `read_txn`（同一スナップショット）で
                 // 解決する（`sql::subquery` モジュールドキュメント参照）。
-                let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
+                let mut subquery_budget = self.nesting_limits.max_subquery_executions();
                 let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
@@ -5433,6 +5463,7 @@ impl EngineCore {
                     &self.storage,
                     session.udfs(),
                     self.group_by_limits,
+                    self.nesting_limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
@@ -5450,7 +5481,7 @@ impl EngineCore {
             crate::sql::allowlist::Statement::Scan(mut validated) => {
                 let schema = table_schema_in(read_txn, &validated.table_name)?;
                 // `Statement::Aggregate` と同じ理由・同じ経路でサブクエリを解決する。
-                let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
+                let mut subquery_budget = self.nesting_limits.max_subquery_executions();
                 let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
@@ -5460,6 +5491,7 @@ impl EngineCore {
                     &self.storage,
                     session.udfs(),
                     self.group_by_limits,
+                    self.nesting_limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
@@ -5478,6 +5510,7 @@ impl EngineCore {
                     &self.storage,
                     session.udfs(),
                     self.group_by_limits,
+                    self.nesting_limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;

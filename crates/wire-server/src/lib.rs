@@ -138,6 +138,7 @@ pub mod handshake;
 pub mod hnsw_scope_opt;
 pub mod http;
 pub mod limits;
+pub mod nesting_limits_opt;
 pub mod protocol_dispatch;
 pub(crate) mod response_buffer;
 pub mod result_encoder;
