@@ -159,6 +159,15 @@
 //! 一本化し、`EngineCore::with_result_limits` へ 1 回だけ注入する
 //! （`docs/design/result-limits-cli.md`）。
 //!
+//! `--write-lock-wait-ms`（Issue #1554。SQL-46）: 書き込みロック（単一ライタ）の待機上限を
+//! ミリ秒（`100`〜`60000`。既定 `30000`）で、プロセス全体に対して起動時に設定できる
+//! opt-in 注入点（未指定は現行の 30 秒と同値＝挙動不変）。超過は従来どおり `55P03`。
+//! autocommit 書き込み・明示トランザクションの `BEGIN`・分割実行 DML のチャンクに効く。
+//! 範囲外・非数値・値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::write_lock_wait_opt::resolve` に一本化し、
+//! `EngineCore::with_write_lock_wait` へ 1 回だけ注入する
+//! （`docs/design/write-lock-wait-cli.md`）。
+//!
 //! `--max-transaction-duration-ms`／`--max-transaction-statements`（Issue #1553。SQL-46）:
 //! 明示トランザクション（暗黙トランザクションにも同じ値が効く）の最大持続時間
 //! （`100`〜`60000` ミリ秒・既定 20000）と最大文数（`1`〜`10000`・既定 1000）を、
@@ -379,6 +388,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_join_input_rows_raw: Option<String> = None;
     let mut max_join_output_rows_raw: Option<String> = None;
     let mut max_result_rows_raw: Option<String> = None;
+    let mut write_lock_wait_raw: Option<String> = None;
     let mut max_transaction_duration_ms_raw: Option<String> = None;
     let mut max_transaction_statements_raw: Option<String> = None;
     let mut partitioned_chunk_rows_raw: Option<String> = None;
@@ -836,6 +846,26 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_cte_nesting_depth_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::write_lock_wait_opt::FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::write_lock_wait_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1554: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if write_lock_wait_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::write_lock_wait_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                write_lock_wait_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::join_limits_opt::MAX_JOIN_RELATIONS_FLAG => {
@@ -1457,6 +1487,17 @@ fn run_server(args: &[String]) -> ExitCode {
             }
         };
 
+    // Issue #1554: 書き込みロック待機上限を bind・ユーザーストア読込より前に解決する
+    // （fail-closed）。未指定は `DEFAULT_WRITE_LOCK_WAIT`＝現行挙動。
+    let write_lock_wait =
+        match wire_server::write_lock_wait_opt::resolve(write_lock_wait_raw.as_deref()) {
+            Ok(wait) => wait,
+            Err(e) => {
+                engine::log_stderr!("wire-server: invalid write lock wait configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
     // Issue #1553: 明示トランザクションの最大持続時間・最大文数を bind・ユーザーストア読込より
     // 前に解決する（fail-closed）。未指定は `TransactionLimits::default()`＝現行挙動。
     let transaction_limits = match wire_server::transaction_limits_opt::resolve(
@@ -1884,6 +1925,9 @@ fn run_server(args: &[String]) -> ExitCode {
     core = core.with_join_limits(join_limits);
     // Issue #1555: 未指定でも常に呼ぶ（既定は従来の 10,000 と同値で、未注入と挙動が同一）。
     core = core.with_result_limits(result_limits);
+    // Issue #1554: 未指定でも常に呼ぶ（既定は `DEFAULT_WRITE_LOCK_WAIT` で、未注入と
+    // 挙動がビット同一）。
+    core = core.with_write_lock_wait(write_lock_wait);
     // Issue #1553: 未指定でも常に呼ぶ（既定は `TransactionLimits::default()` で、未注入と挙動が同一）。
     core = core.with_transaction_limits(transaction_limits);
     // Issue #1128: 未指定でも常に呼ぶ（既定は `PartitionedDmlLimits::default()`）。
@@ -1952,7 +1996,7 @@ fn run_server(args: &[String]) -> ExitCode {
         wire_server::transaction_limits_opt::duration_over_write_lock_wait_warning(
             &transaction_limits,
             max_transaction_duration_ms_raw.is_some(),
-            engine::storage::DEFAULT_WRITE_LOCK_WAIT,
+            write_lock_wait,
         )
     {
         engine::log_stderr!("wire-server: WARNING: {warning}");

@@ -89,6 +89,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] \
   [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
   [--max-result-rows <1-100000>] \
+  [--write-lock-wait-ms <100-60000>] \
   [--max-transaction-duration-ms <100-60000>] [--max-transaction-statements <1-10000>] \
   [--partitioned-dml-chunk-rows <1-1000000>] [--partitioned-dml-scan-budget <1-1000000>] \
   [--partitioned-dml-max-hold-ms <100-5000>] \
@@ -363,6 +364,12 @@ JOIN 文の `LIMIT`・NoSQL の `limit` の範囲判定にだけ効き、超過�
 `OFFSET` の範囲や集合演算の枝行数・サブクエリ内側行数などの他の上限とは連動しません。範囲外・非数値・値欠落・
 2 回目以降の重複指定は fail-closed で起動エラーです。`LIMIT` 省略時の結果行数上限（`54000`）が導入される際は、
 同じフラグを共有します（詳細: [docs/design/result-limits-cli.md](docs/design/result-limits-cli.md)）。
+
+`--write-lock-wait-ms <N>`（既定 30,000・範囲 `100`〜`60,000` ミリ秒）（Issue #1554・SQL-46）は、書き込みロック
+（単一ライタ）の待機上限を、プロセス全体に対して起動時に設定します（未指定は現行の 30 秒で、挙動は変わりません）。
+超過時の SQLSTATE は従来と同じ `55P03` です。autocommit の書き込み・明示トランザクションの `BEGIN`・分割実行 DML の
+チャンクに効き、SQL 表層と NoSQL（HTTP）表層の両方が対象です。範囲外・非数値・値欠落・2 回目以降の重複指定は
+fail-closed で起動エラーです。環境変数は設けません（詳細: [docs/design/write-lock-wait-cli.md](docs/design/write-lock-wait-cli.md)）。
 
 `--max-transaction-duration-ms <N>`（既定 20000・範囲 `100`〜`60000` ミリ秒）・`--max-transaction-statements <N>`
 （既定 1,000・範囲 `1`〜`10,000`）（Issue #1553・SQL-46）は、トランザクションの最大持続時間と最大文数を、

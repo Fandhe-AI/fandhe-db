@@ -153,3 +153,4 @@ pub mod tls;
 pub mod tls_opt;
 pub mod transaction_limits_opt;
 pub mod wire_stream;
+pub mod write_lock_wait_opt;
