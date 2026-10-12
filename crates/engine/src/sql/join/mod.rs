@@ -52,16 +52,7 @@ use crate::sql::udf_call::UdfRegistry;
 
 use plan::{build_plan, JoinPlan, Shape};
 
-/// JOIN 1 辺（可視かつ WHERE に一致する行）の行数上限（実装既定値。Issue #925
-/// §2.4）。無制限 `Vec` 確保を避ける（security.md「不安全な設計」対応）。
-/// 超過検出のため走査自体は `MAX_JOIN_INPUT_ROWS + 1` を上限に行い、超えたら
-/// `54000`。
-pub(crate) const MAX_JOIN_INPUT_ROWS: usize = 100_000;
-
-/// `LIMIT` 適用前の結合カーディナリティ（一致ペア数）の上限（実装既定値。
-/// Issue #925 §2.4）。`LIMIT`／`OFFSET` の値によらず、結合の各段で判定する
-/// （PR #1105 の教訓に沿った単純な規則）。超過は `54000`。
-pub(crate) const MAX_JOIN_OUTPUT_ROWS: usize = 100_000;
+pub(crate) use crate::join_limits::{MAX_JOIN_INPUT_ROWS, MAX_JOIN_OUTPUT_ROWS};
 
 /// テスト専用に上限を差し替えられるようにした構造体（`sql::scan::execute_scan`／
 /// `sql::set_op::execute_with_budget` と同じ設計判断）。
@@ -74,6 +65,9 @@ pub(crate) struct JoinLimits {
     /// 集計形の `GROUP BY` キー列数上限（Issue #1550。既定は
     /// `sql::allowlist::MAX_GROUP_BY_COLUMNS`。超過は実行段で `54000`）。
     pub(crate) max_group_by_columns: usize,
+    /// JOIN のリレーション数上限（Issue #1551。既定は `sql::relation::MAX_TABLE_REFS`。
+    /// 超過は実行段で `54000`）。
+    pub(crate) max_relations: usize,
 }
 
 impl Default for JoinLimits {
@@ -84,6 +78,7 @@ impl Default for JoinLimits {
             budget_cap: crate::arena::MAX_ARENA_TOTAL_BYTES,
             max_groups: crate::sql::group_by::MAX_GROUPS,
             max_group_by_columns: crate::sql::allowlist::MAX_GROUP_BY_COLUMNS,
+            max_relations: crate::sql::relation::MAX_TABLE_REFS,
         }
     }
 }
@@ -206,6 +201,8 @@ pub(crate) fn execute(
     udfs: &UdfRegistry,
     // Issue #1550: 集計形の `GROUP BY` 列数・グループ数の起動時設定（`EngineCore` 保持）。
     group_limits: crate::group_by_limits::GroupByLimits,
+    // Issue #1551: リレーション数・入出力行数の起動時設定（`EngineCore` 保持）。
+    join_limits: crate::join_limits::JoinSizeLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
     execute_with_limits(
         read_txn,
@@ -216,6 +213,9 @@ pub(crate) fn execute(
         &JoinLimits {
             max_groups: group_limits.max_groups(),
             max_group_by_columns: group_limits.max_group_by_columns(),
+            max_input_rows: join_limits.max_input_rows(),
+            max_output_rows: join_limits.max_output_rows(),
+            max_relations: join_limits.max_relations(),
             ..JoinLimits::default()
         },
     )
@@ -237,6 +237,14 @@ pub(crate) fn execute_with_limits(
     // 同じ判断順序）。
     let bound = bind_side_scans(&plan, udfs, limits.max_input_rows.saturating_add(1))?;
     let (limit, offset) = validate_limit_offset(validated)?;
+    // Issue #1551: 起動時設定のリレーション数上限（データ非依存。走査より前に判定する）。
+    if validated.relations.len() > limits.max_relations {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "too many tables in JOIN: {} exceeds limit {}",
+            validated.relations.len(),
+            limits.max_relations
+        )));
+    }
     // Issue #1550: 起動時設定の `GROUP BY` 列数上限。データに依存しない判定なので走査より前に行う。
     if let Shape::Aggregate(agg) = &plan.shape {
         if agg.keys.len() > limits.max_group_by_columns {
@@ -691,6 +699,7 @@ mod tests {
             &validated,
             &udfs,
             crate::group_by_limits::GroupByLimits::default(),
+            crate::join_limits::JoinSizeLimits::default(),
         )
         .expect("small rows must fit the default budget");
         assert_eq!(result.rows.len(), 1);
@@ -832,6 +841,7 @@ mod tests {
             &validated,
             &udfs,
             crate::group_by_limits::GroupByLimits::default(),
+            crate::join_limits::JoinSizeLimits::default(),
         )
         .expect("join on real id/xx columns should succeed");
         assert_eq!(
@@ -985,6 +995,7 @@ mod tests {
             &validated,
             &udfs,
             crate::group_by_limits::GroupByLimits::default(),
+            crate::join_limits::JoinSizeLimits::default(),
         )
         .expect("LEFT JOIN with a predicate on the missing side should succeed");
         assert_eq!(
@@ -1114,6 +1125,7 @@ mod tests {
             &validated,
             &udfs,
             crate::group_by_limits::GroupByLimits::default(),
+            crate::join_limits::JoinSizeLimits::default(),
         )
         .expect("full join");
         let rendered: Vec<String> = result

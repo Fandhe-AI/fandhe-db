@@ -1150,6 +1150,9 @@ pub struct EngineCore {
     /// 差し替えは [`Self::with_nesting_limits`] のみ（起動時 1 回）。構文解析段と
     /// サブクエリ解決段にだけ効き、格納済みビュー本文の再パースはハード上限のまま。
     nesting_limits: crate::nesting_limits::NestingLimits,
+    /// JOIN のリレーション数・入出力行数の上限（Issue #1551）。差し替えは
+    /// [`Self::with_join_limits`] のみ（起動時 1 回）。JOIN の実行段（`sql::join`）にだけ効く。
+    join_limits: crate::join_limits::JoinSizeLimits,
     /// 述語形 UPDATE／DELETE の分割実行（Issue #1128・ADR `docs/design/partitioned-dml.md`
     /// §15.2）のチャンク幅・走査予算・writer 保持時間。差し替えは
     /// [`Self::with_partitioned_dml_limits`] のみ（起動時に 1 回）。
@@ -2056,6 +2059,7 @@ impl EngineCore {
             schema_limits: crate::schema_limits::SchemaLimits::default(),
             group_by_limits: crate::group_by_limits::GroupByLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
+            join_limits: crate::join_limits::JoinSizeLimits::default(),
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
@@ -2306,6 +2310,20 @@ impl EngineCore {
     /// 現在の入れ子系上限（Issue #1552）。
     pub fn nesting_limits(&self) -> crate::nesting_limits::NestingLimits {
         self.nesting_limits
+    }
+
+    /// JOIN のリレーション数・入出力行数上限（[`crate::join_limits::JoinSizeLimits`]）を
+    /// 差し替えたビルダーを返す（Issue #1551）。`wire-server` の起動時 CLI フラグ
+    /// （`--max-join-relations`・`--max-join-input-rows`・`--max-join-output-rows`）からのみ
+    /// 呼ぶ。未呼び出しならハード上限と同値の既定（現行挙動）。
+    pub fn with_join_limits(mut self, limits: crate::join_limits::JoinSizeLimits) -> Self {
+        self.join_limits = limits;
+        self
+    }
+
+    /// 現在の JOIN 上限（Issue #1551）。
+    pub fn join_limits(&self) -> crate::join_limits::JoinSizeLimits {
+        self.join_limits
     }
 
     /// 分割実行 DML の設定（[`crate::sql::parser::PartitionedDmlLimits`]）を差し替えた
@@ -5546,6 +5564,7 @@ impl EngineCore {
                     &validated,
                     session.udfs(),
                     self.group_by_limits,
+                    self.join_limits,
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }

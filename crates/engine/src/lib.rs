@@ -250,6 +250,7 @@ pub mod hnsw;
 pub mod hybrid;
 pub mod incremental;
 pub mod isa;
+pub mod join_limits;
 pub mod json;
 pub mod kernel;
 pub(crate) mod key_index;

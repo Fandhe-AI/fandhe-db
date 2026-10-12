@@ -87,6 +87,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-group-by-columns <1-8>] [--max-groups <1-10000>] \
   [--max-subquery-depth <1-4>] [--max-subquery-executions <1-16>] \
   [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] \
+  [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
   [--partitioned-dml-chunk-rows <1-1000000>] [--partitioned-dml-scan-budget <1-1000000>] \
   [--partitioned-dml-max-hold-ms <100-5000>] \
   [--partitioned-dml-max-jobs-per-tenant <1-64>] [--partitioned-dml-max-jobs <1-64>] \
@@ -344,6 +345,14 @@ CTE 連鎖の深さの上限を、プロセス全体に対して起動時に**�
 同じ `54000` です。保存済みビュー本文の再検証はハード上限のままなので、上限を下げて再起動しても既存ビューは
 参照できます。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです。上限を引き上げる
 ことはできません（詳細: [docs/design/nesting-limits-cli.md](docs/design/nesting-limits-cli.md)）。
+
+`--max-join-relations <N>`（既定 8・範囲 `2`〜`8`）・`--max-join-input-rows <N>`（既定 100,000・範囲 `1`〜`100,000`）・
+`--max-join-output-rows <N>`（既定 100,000・範囲 `1`〜`100,000`）（Issue #1551・SQL-46）は、JOIN のリレーション数・
+1 辺の可視入力行数・結合の出力行数の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します
+（未指定は現行のハード上限と同じ値で、挙動は変わりません）。設定値は JOIN の実行段にだけ効き、超過時の SQLSTATE は
+従来と同じ `54000` です（拡張プロトコルでは Describe は成功し Execute で拒否されます）。範囲外・非数値・値欠落・
+2 回目以降の重複指定は fail-closed で起動エラーです。上限を引き上げることはできません
+（詳細: [docs/design/join-limits-cli.md](docs/design/join-limits-cli.md)）。
 
 `--auth-method`（Issue #940・WIRE-18・TASK-222）は SQL 表層の SASL 認証方式を
 選ぶ opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス
