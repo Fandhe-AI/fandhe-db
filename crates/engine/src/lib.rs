@@ -254,6 +254,7 @@ pub mod join_limits;
 pub mod json;
 pub mod kernel;
 pub(crate) mod key_index;
+pub mod nesting_limits;
 pub mod numeric;
 pub mod parallel_search;
 pub mod policy;

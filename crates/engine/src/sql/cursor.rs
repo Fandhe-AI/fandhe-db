@@ -110,6 +110,7 @@ fn expect_contextual_ident<'a>(
 pub(crate) fn validate_declare_tokens(
     tokens: &[Token],
     lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<CursorStatement, SqlSurfaceError> {
     let rest = tokens.split_first().map_or(&[][..], |(_, tail)| tail);
     let (name_token, rest) = rest
@@ -123,7 +124,7 @@ pub(crate) fn validate_declare_tokens(
     let rest = expect_contextual_ident(rest, "FOR")?;
     // 構造検証のみ（結果の `Statement` は保持しない。実カタログでの再検証は
     // `Active` 内の実行時に [`validate_declare_inner`] で行う）。
-    validate_declare_inner(rest, lookup)?;
+    validate_declare_inner(rest, lookup, limits)?;
     Ok(CursorStatement::Declare {
         name,
         query: rest.to_vec(),
@@ -149,13 +150,14 @@ pub(crate) fn validate_declare_tokens(
 pub(crate) fn validate_declare_inner(
     query: &[Token],
     lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<(Statement, String), SqlSurfaceError> {
     if query.is_empty() {
         return Err(SqlSurfaceError::unsupported(
             "DECLARE requires a query after FOR",
         ));
     }
-    let inner = crate::sql::allowlist::validate_sql_tokens(query, lookup)?;
+    let inner = crate::sql::allowlist::validate_sql_tokens_with_limits(query, lookup, limits)?;
     let table = match &inner {
         Statement::Aggregate(v) => v.table_name().to_string(),
         Statement::Scan(v) => v.table_name().to_string(),
@@ -200,8 +202,9 @@ impl TableLookup for AlwaysExistsLookup {
 /// `read_txn_with_schema`／`bind_scan`／`bind_aggregate` が列を解決する）。
 pub(crate) fn validate_declare_tokens_structure_only(
     tokens: &[Token],
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<CursorStatement, SqlSurfaceError> {
-    validate_declare_tokens(tokens, &AlwaysExistsLookup)
+    validate_declare_tokens(tokens, &AlwaysExistsLookup, limits)
 }
 
 /// `FETCH [FORWARD] <n> FROM <name>`（規範形のみ。`IN`／`ALL`／`NEXT`／
@@ -497,13 +500,18 @@ mod tests {
         let stmt = validate_declare_tokens(
             &tokens_of("DECLARE c CURSOR FOR SELECT id FROM documents LIMIT 10"),
             &FakeCatalog,
+            crate::nesting_limits::NestingLimits::default(),
         )
         .expect("scan form accepted");
         match stmt {
             CursorStatement::Declare { name, query } => {
                 assert_eq!(name, "c");
-                let (inner, table) =
-                    validate_declare_inner(&query, &FakeCatalog).expect("inner revalidates");
+                let (inner, table) = validate_declare_inner(
+                    &query,
+                    &FakeCatalog,
+                    crate::nesting_limits::NestingLimits::default(),
+                )
+                .expect("inner revalidates");
                 assert!(matches!(inner, Statement::Scan(_)));
                 assert_eq!(table, "documents");
             }
@@ -513,6 +521,7 @@ mod tests {
         let stmt = validate_declare_tokens(
             &tokens_of("DECLARE c2 CURSOR FOR SELECT COUNT(*) AS n FROM documents"),
             &FakeCatalog,
+            crate::nesting_limits::NestingLimits::default(),
         )
         .expect("aggregate form accepted");
         assert!(matches!(stmt, CursorStatement::Declare { .. }));
@@ -525,6 +534,7 @@ mod tests {
                 "DECLARE c CURSOR FOR SELECT id FROM documents ORDER BY embedding <=> '[1.0]' LIMIT 10",
             ),
             &FakeCatalog,
+            crate::nesting_limits::NestingLimits::default(),
         )
         .expect_err("vector ranking SELECT must be rejected");
         assert_eq!(err.wire_code(), "42601");
@@ -537,7 +547,12 @@ mod tests {
             "DECLARE c BINARY CURSOR FOR SELECT id FROM documents LIMIT 1",
             "DECLARE c INSENSITIVE CURSOR FOR SELECT id FROM documents LIMIT 1",
         ] {
-            let err = validate_declare_tokens(&tokens_of(sql), &FakeCatalog).expect_err("rejected");
+            let err = validate_declare_tokens(
+                &tokens_of(sql),
+                &FakeCatalog,
+                crate::nesting_limits::NestingLimits::default(),
+            )
+            .expect_err("rejected");
             assert_eq!(err.wire_code(), "42601");
         }
     }

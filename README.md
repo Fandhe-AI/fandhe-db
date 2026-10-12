@@ -85,6 +85,8 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--batch-max-files <1-1000000>] \
   [--max-table-columns <1-256>] [--max-array-elements <1-1024>] [--max-enum-labels <1-256>] \
   [--max-group-by-columns <1-8>] [--max-groups <1-10000>] \
+  [--max-subquery-depth <1-4>] [--max-subquery-executions <1-16>] \
+  [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] \
   [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
   [--partitioned-dml-chunk-rows <1-1000000>] [--partitioned-dml-scan-budget <1-1000000>] \
   [--partitioned-dml-max-hold-ms <100-5000>] \
@@ -334,6 +336,15 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 パーティション上限はハード上限のままです。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で
 起動エラーです。上限を引き上げることはできません
 （詳細: [docs/design/group-by-limits-cli.md](docs/design/group-by-limits-cli.md)）。
+
+`--max-subquery-depth <N>`（既定 4・範囲 `1`〜`4`）・`--max-subquery-executions <N>`（既定 16・範囲 `1`〜`16`）・
+`--max-cte-definitions <N>`（既定 16・範囲 `1`〜`16`）・`--max-cte-nesting-depth <N>`（既定 4・範囲 `1`〜`4`）
+（Issue #1552・SQL-46）は、サブクエリの入れ子深さ・1 文あたりの内側サブクエリ実行回数・CTE 定義数・
+CTE 連鎖の深さの上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は現行のハード上限と
+同じ値で、挙動は変わりません）。設定値は構文解析段とサブクエリ解決段に効き、超過時の SQLSTATE は従来と
+同じ `54000` です。保存済みビュー本文の再検証はハード上限のままなので、上限を下げて再起動しても既存ビューは
+参照できます。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです。上限を引き上げる
+ことはできません（詳細: [docs/design/nesting-limits-cli.md](docs/design/nesting-limits-cli.md)）。
 
 `--max-join-relations <N>`（既定 8・範囲 `2`〜`8`）・`--max-join-input-rows <N>`（既定 100,000・範囲 `1`〜`100,000`）・
 `--max-join-output-rows <N>`（既定 100,000・範囲 `1`〜`100,000`）（Issue #1551・SQL-46）は、JOIN のリレーション数・

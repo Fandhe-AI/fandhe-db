@@ -130,6 +130,17 @@
 //! `EngineCore::with_group_by_limits` へ 1 回だけ注入する
 //! （`docs/design/group-by-limits-cli.md`）。
 //!
+//! `--max-subquery-depth`／`--max-subquery-executions`／`--max-cte-definitions`／
+//! `--max-cte-nesting-depth`（Issue #1552。SQL-46）: サブクエリの入れ子深さ（`1`〜`4`）・
+//! 1 文あたりの内側サブクエリ実行回数（`1`〜`16`）・CTE 定義数（`1`〜`16`）・CTE 連鎖深さ
+//! （`1`〜`4`）の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定できる opt-in
+//! 注入点（未指定は現行のハード上限と同値＝挙動不変）。設定値は構文解析段とサブクエリ解決段に
+//! 効き、超過は従来どおり `54000`（格納済みビュー本文の再パースはハード上限のまま）。範囲外・
+//! 非数値・値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::nesting_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_nesting_limits` へ 1 回だけ注入する
+//! （`docs/design/nesting-limits-cli.md`）。
+//!
 //! `--max-join-relations`／`--max-join-input-rows`／`--max-join-output-rows`（Issue #1551。
 //! SQL-46）: JOIN のリレーション数（`2`〜`8`）・1 辺の可視入力行数（`1`〜`100000`）・
 //! 結合の出力行数（`1`〜`100000`）の上限を、プロセス全体に対して起動時に**下げる方向だけ**
@@ -340,6 +351,10 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_enum_labels_raw: Option<String> = None;
     let mut max_group_by_columns_raw: Option<String> = None;
     let mut max_groups_raw: Option<String> = None;
+    let mut max_subquery_depth_raw: Option<String> = None;
+    let mut max_subquery_executions_raw: Option<String> = None;
+    let mut max_cte_definitions_raw: Option<String> = None;
+    let mut max_cte_nesting_depth_raw: Option<String> = None;
     let mut max_join_relations_raw: Option<String> = None;
     let mut max_join_input_rows_raw: Option<String> = None;
     let mut max_join_output_rows_raw: Option<String> = None;
@@ -718,6 +733,86 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_groups_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::nesting_limits_opt::MAX_SUBQUERY_DEPTH_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::nesting_limits_opt::MAX_SUBQUERY_DEPTH_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1552: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_subquery_depth_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::nesting_limits_opt::MAX_SUBQUERY_DEPTH_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_subquery_depth_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::nesting_limits_opt::MAX_SUBQUERY_EXECUTIONS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::nesting_limits_opt::MAX_SUBQUERY_EXECUTIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1552: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_subquery_executions_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::nesting_limits_opt::MAX_SUBQUERY_EXECUTIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_subquery_executions_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::nesting_limits_opt::MAX_CTE_DEFINITIONS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::nesting_limits_opt::MAX_CTE_DEFINITIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1552: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_cte_definitions_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::nesting_limits_opt::MAX_CTE_DEFINITIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_cte_definitions_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::nesting_limits_opt::MAX_CTE_NESTING_DEPTH_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::nesting_limits_opt::MAX_CTE_NESTING_DEPTH_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1552: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_cte_nesting_depth_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::nesting_limits_opt::MAX_CTE_NESTING_DEPTH_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_cte_nesting_depth_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::join_limits_opt::MAX_JOIN_RELATIONS_FLAG => {
@@ -1234,6 +1329,24 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1552: サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限を bind・
+    // ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は listen へ進まず
+    // 起動エラー）。未指定は `NestingLimits::default()`＝ハード上限＝現行挙動。
+    let nesting_limits = match wire_server::nesting_limits_opt::resolve(
+        wire_server::nesting_limits_opt::NestingLimitsRawFlags {
+            max_subquery_depth: max_subquery_depth_raw.as_deref(),
+            max_subquery_executions: max_subquery_executions_raw.as_deref(),
+            max_cte_definitions: max_cte_definitions_raw.as_deref(),
+            max_cte_nesting_depth: max_cte_nesting_depth_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid nesting limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1551: JOIN のリレーション数・入出力行数上限を bind・ユーザーストア読込より前に
     // 解決する（fail-closed）。未指定は `JoinSizeLimits::default()`＝ハード上限＝現行挙動。
     let join_limits = match wire_server::join_limits_opt::resolve(
@@ -1655,6 +1768,9 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #1550: 未指定でも常に呼ぶ（`group_by_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_group_by_limits(group_by_limits);
+    // Issue #1552: 未指定でも常に呼ぶ（`nesting_limits` は既定まで解決済み。既定は
+    // ハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_nesting_limits(nesting_limits);
     // Issue #1551: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
     core = core.with_join_limits(join_limits);
     // Issue #1128: 未指定でも常に呼ぶ（既定は `PartitionedDmlLimits::default()`）。

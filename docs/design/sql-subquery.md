@@ -97,6 +97,10 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 
 ### 上限（DoS 対策）
 
+以下のネスト深さ・実行回数の定数は**ハード上限（＝既定値）**で、起動フラグ
+`--max-subquery-depth`・`--max-subquery-executions` により下げられる
+（Issue #1552。[nesting-limits-cli.md](nesting-limits-cli.md)）。
+
 - ネスト深さ: `sql::allowlist::MAX_SUBQUERY_DEPTH` = 4（構文解析段で検査。
   実装既定値）。
 - 1 文あたりの内側クエリ実行回数: `sql::subquery::MAX_SUBQUERY_EXECUTIONS`

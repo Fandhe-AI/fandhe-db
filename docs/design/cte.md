@@ -42,7 +42,9 @@ WITH <name> AS (SELECT <* | 列名リスト> FROM <table | view | cte> [WHERE <�
   `AS NOT MATERIALIZED`・CTE 名の重複・データ変更 CTE（`WITH x AS (DELETE
   ...)` 等。body が `SELECT` 以外は受理しない）はいずれも `42601`。
 - 定義数上限（`MAX_CTE_DEFINITIONS = 16`）・連鎖の深さ上限
-  （`MAX_CTE_NESTING_DEPTH = 4`）の超過はいずれも `54000`。加えて、CTE 名の
+  （`MAX_CTE_NESTING_DEPTH = 4`）はハード上限（＝既定値）で、起動フラグ
+  `--max-cte-definitions`・`--max-cte-nesting-depth` により下げられる
+  （Issue #1552。[nesting-limits-cli.md](nesting-limits-cli.md)）。超過はいずれも `54000`。加えて、CTE 名の
   解決回数を「1 回のトップレベル呼び出し（1 つの CTE 定義の事前検証、または
   主クエリの解決）」単位でリセットするカウンタ（`MAX_CTE_REFERENCES = 32`。
   将来 JOIN が入ることに備えた明示的な上限）も超過時は同じく `54000`。この
