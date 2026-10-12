@@ -3398,6 +3398,9 @@ struct Parser<'a> {
     /// 引数など）では `false` のままとし、`NULL` は列名としての後方互換を
     /// 優先して裸の識別子（`Expr::Ident`）へ解析する。
     allow_null_literal: bool,
+    /// 定数式（INSERT VALUES・列 `DEFAULT`）の解析中だけ立ち、関数引数の `NULL` を
+    /// `NULL` 定数として受理する（Issue #1543。他文脈の関数引数は従来どおり列参照）。
+    const_expr_null_args: bool,
     /// `CHECK ( ... )` 本体（TABLE-16）を解析中かどうか（Issue #1184）。`true` の間は
     /// `NOT ( ... )`・裸の `NOT <式比較>`・数値の `IN`／`BETWEEN` を従来どおり
     /// `42601` にする（脱糖後の形が `check_constraint` の許可形と区別できず、
@@ -3452,6 +3455,7 @@ impl<'a> Parser<'a> {
             subquery_ctx: None,
             case_nesting: 0,
             allow_null_literal: false,
+            const_expr_null_args: false,
             in_check_body: false,
             max_insert_rows: None,
             from_ref: None,
@@ -5709,7 +5713,8 @@ impl<'a> Parser<'a> {
         // （他の通常関数は従来どおり `false` のまま。`NULL` 許可の対象を
         // 安易に広げると他関数のエラーコード契約が変わるため、`CONCAT` に
         // 限定するスコープにする）。
-        let allow_null_for_this_call = name.eq_ignore_ascii_case("concat");
+        let allow_null_for_this_call =
+            name.eq_ignore_ascii_case("concat") || self.const_expr_null_args;
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
             args.push(
@@ -6067,7 +6072,11 @@ impl<'a> Parser<'a> {
         self.expr_node_budget = MAX_EXPR_NODES;
         // 定数式では NULL を既定で有効化する（引用された "null" は quoted_null で
         // 列参照のまま区別される）。
+        // 関数引数の `NULL` も列参照ではなく `NULL` 定数として解析する
+        // （型は `const_expr::fold_null_call` が決める）。
+        let prev_null_args = std::mem::replace(&mut self.const_expr_null_args, true);
         let parsed = self.parse_value_expr_with_null_context(0, true);
+        self.const_expr_null_args = prev_null_args;
         self.expr_node_budget = saved;
         crate::sql::const_expr::fold_const_literal(&parsed?)
     }

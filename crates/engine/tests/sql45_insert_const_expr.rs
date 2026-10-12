@@ -145,3 +145,48 @@ fn column_references_and_boundaries_are_rejected() {
         .unwrap_err();
     assert_eq!(err.wire_code(), "42601");
 }
+
+/// レビュー指摘: NULL 伝播は反対側の評価エラーを消さず、関数引数の NULL も定数として扱う。
+#[test]
+fn null_operand_keeps_eval_errors_and_function_null_args() {
+    let (core, path, mut session) = setup("sql45-null-err");
+    let _guard = CleanupGuard(path);
+    let cols = "id, embedding, n";
+    for (i, v) in ["NULL + (1/0)", "(1/0) * NULL", "COALESCE(NULL + (1/0), 5)"]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            insert(
+                &core,
+                cols,
+                &format!("(1, {VEC}, {v})"),
+                &format!("op-e{i}")
+            )
+            .unwrap_err(),
+            "22012",
+            "{v}"
+        );
+    }
+    // 選ばれない分岐の評価エラーは従来どおり出ない。
+    insert(
+        &core,
+        "id, embedding, t",
+        &format!("(1, {VEC}, upper(NULL))"),
+        "op-1",
+    )
+    .expect("upper(NULL) is NULL");
+    insert(
+        &core,
+        cols,
+        &format!("(2, {VEC}, COALESCE(abs(NULL), CASE WHEN 1 = 1 THEN 3 ELSE NULL + (1/0) END))"),
+        "op-2",
+    )
+    .expect("function NULL arg and unselected branch");
+    let rows = select(
+        &core,
+        &mut session,
+        "SELECT n FROM docs WHERE id = 2 LIMIT 10",
+    );
+    assert!(dbg(&rows[0][0]).contains('3'), "{:?}", rows[0][0]);
+}

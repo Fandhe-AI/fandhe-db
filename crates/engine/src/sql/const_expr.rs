@@ -236,21 +236,6 @@ fn null_kind(e: &Expr) -> Option<Option<ExprType>> {
     }
 }
 
-/// 型 `ty` のプレースホルダ（探査式用。評価はしない）。
-fn placeholder(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
-    Ok(match ty {
-        ExprType::Scalar => Expr::Number("0".to_string()),
-        ExprType::Text => Expr::String(String::new()),
-        ExprType::Date => Expr::DateLiteral(0),
-        ExprType::Timestamp => Expr::TimestampLiteral(0),
-        ExprType::Bool | ExprType::Vector => {
-            return Err(SqlSurfaceError::datatype_mismatch(
-                "unsupported operand type for NULL in a constant expression",
-            ))
-        }
-    })
-}
-
 /// `NULL` オペランドの型候補（`NULL` 側の位置に置いて束縛を試す順序。算術で曖昧な
 /// `NULL + 1` は PostgreSQL と同様に Scalar を優先する）。
 const NULL_OPERAND_CANDIDATES: [ExprType; 4] = [
@@ -260,10 +245,28 @@ const NULL_OPERAND_CANDIDATES: [ExprType; 4] = [
     ExprType::Timestamp,
 ];
 
-/// `NULL` を含む二項演算を、演算子の型規則に従って型付き `NULL` へ畳む。
-/// `NULL` 側のオペランド位置を保ったまま型候補を順に置き換えた探査式を束縛し
-/// （非 `NULL` 側は式そのものを使うため、その側の束縛エラーも fail-closed に伝播する）、
-/// 最初に束縛できた組の結果型を採る。1 つも束縛できなければ最初のエラーを返す。
+/// 関数呼び出しの `NULL` 引数に対する型候補の組み合わせ試行回数の上限（DoS 防止）。
+const MAX_NULL_ARG_PROBES: usize = 256;
+
+/// 1 オペランドが取りうる置換候補。非 `NULL` は式そのもの、型既知の `NULL` は
+/// 型付き `NULL`、裸の `NULL` は型候補ごとの型付き `NULL`。
+fn operand_options(e: &Expr, k: Option<Option<ExprType>>) -> Vec<Expr> {
+    match k {
+        None => vec![e.clone()],
+        Some(Some(t)) => typed_null(t).into_iter().collect(),
+        Some(None) => NULL_OPERAND_CANDIDATES
+            .iter()
+            .filter_map(|t| typed_null(*t).ok())
+            .collect(),
+    }
+}
+
+/// `NULL` を含む二項演算を、演算子の型規則に従って束縛可能な式へ置き換える。
+/// `NULL` 側のオペランド位置を保ったまま型付き `NULL` 候補を順に束縛し、最初に束縛できた
+/// 組を採る。両辺が `NULL` なら結果型の型付き `NULL` へ畳む。非 `NULL` 側がある場合は
+/// 式を残し、最終評価で非 `NULL` 側の評価エラー（`1/0` の `22012` 等）を `NULL` より
+/// 優先して伝播させる（PostgreSQL と同じ。選ばれない CASE／COALESCE 枝では評価されない
+/// ため短絡も保たれる）。1 つも束縛できなければ最初のエラーを返す。
 fn fold_null_binary(
     op: BinOp,
     l: &Expr,
@@ -271,31 +274,24 @@ fn fold_null_binary(
     ln: Option<Option<ExprType>>,
     rn: Option<Option<ExprType>>,
 ) -> Result<Expr, SqlSurfaceError> {
-    let side_options = |e: &Expr, k: Option<Option<ExprType>>| -> Vec<Option<Expr>> {
-        match k {
-            None => vec![Some(e.clone())],
-            Some(Some(t)) => vec![placeholder(t).ok()],
-            Some(None) => NULL_OPERAND_CANDIDATES
-                .iter()
-                .map(|t| placeholder(*t).ok())
-                .collect(),
-        }
-    };
     let mut first_err: Option<SqlSurfaceError> = None;
-    for lo in side_options(l, ln) {
-        for ro in side_options(r, rn) {
-            let (Some(lhs), Some(rhs)) = (lo.clone(), ro) else {
-                continue;
-            };
+    for lhs in operand_options(l, ln) {
+        for rhs in operand_options(r, rn) {
             let probe = Expr::Binary {
                 op,
-                lhs: Box::new(lhs),
+                lhs: Box::new(lhs.clone()),
                 rhs: Box::new(rhs),
             };
             let registry = UdfRegistry::default();
             let mut budget = MAX_EXPR_NODES;
             match bind_const_expr(&probe, &registry, &mut budget) {
-                Ok((_, ty)) => return typed_null(ty),
+                Ok((_, ty)) => {
+                    return if ln.is_some() && rn.is_some() {
+                        typed_null(ty)
+                    } else {
+                        Ok(probe)
+                    };
+                }
                 Err(e) => {
                     first_err.get_or_insert(e);
                 }
@@ -305,6 +301,61 @@ fn fold_null_binary(
     Err(first_err.unwrap_or_else(|| {
         SqlSurfaceError::datatype_mismatch("NULL operand type cannot be resolved")
     }))
+}
+
+/// 裸の `NULL` 引数を持つ関数呼び出しへ型付き `NULL` を割り当てる。まず元の呼び出しが
+/// そのまま束縛できれば（`CONCAT` 等）変更しない。束縛できなければ裸の `NULL` 位置ごとに
+/// 型候補を順に試し（組み合わせ数は [`MAX_NULL_ARG_PROBES`] で打ち切る）、最初に束縛
+/// できた組を採る。他の引数は式のまま残すため、その評価エラーは最終評価で伝播する。
+fn fold_null_call(name: &str, args: Vec<Expr>) -> Result<Expr, SqlSurfaceError> {
+    let try_bind = |args: &[Expr]| {
+        let probe = Expr::Call {
+            name: name.to_string(),
+            args: args.to_vec(),
+        };
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        bind_const_expr(&probe, &registry, &mut budget).map(|_| probe)
+    };
+    if !args.iter().any(|a| matches!(a, Expr::Null)) {
+        return Ok(Expr::Call {
+            name: name.to_string(),
+            args,
+        });
+    }
+    let first_err = match try_bind(&args) {
+        Ok(p) => return Ok(p),
+        Err(e) => e,
+    };
+    let options: Vec<Vec<Expr>> = args
+        .iter()
+        .map(|a| operand_options(a, null_kind(a)))
+        .collect();
+    let mut idx = vec![0usize; args.len()];
+    for _ in 0..MAX_NULL_ARG_PROBES {
+        let cand: Option<Vec<Expr>> = idx
+            .iter()
+            .zip(&options)
+            .map(|(i, o)| o.get(*i).cloned())
+            .collect();
+        if let Some(Ok(p)) = cand.map(|c| try_bind(&c)) {
+            return Ok(p);
+        }
+        // 位取りの繰り上げで次の組み合わせへ進む（全て回りきったら終了）。
+        let mut pos = 0;
+        loop {
+            let Some(slot) = idx.get_mut(pos) else {
+                return Err(first_err);
+            };
+            *slot += 1;
+            if options.get(pos).is_some_and(|o| *slot < o.len()) {
+                break;
+            }
+            *slot = 0;
+            pos += 1;
+        }
+    }
+    Err(first_err)
 }
 
 /// 算術・比較の直接オペランドに `NULL` を持つ二項演算を型付き `NULL` へ畳む
@@ -327,10 +378,10 @@ fn propagate_null(expr: &Expr) -> Result<Expr, SqlSurfaceError> {
                 }
             }
         }
-        Expr::Call { name, args } => Expr::Call {
-            name: name.clone(),
-            args: args.iter().map(propagate_null).collect::<Result<_, _>>()?,
-        },
+        Expr::Call { name, args } => fold_null_call(
+            name,
+            args.iter().map(propagate_null).collect::<Result<_, _>>()?,
+        )?,
         Expr::Coalesce(args) => {
             Expr::Coalesce(args.iter().map(propagate_null).collect::<Result<_, _>>()?)
         }
@@ -658,5 +709,39 @@ mod tests {
         );
         // 評価される枝では従来どおり 22003。
         assert!(fold_const_literal(&Expr::Coalesce(vec![Expr::Null, big()])).is_err());
+    }
+
+    #[test]
+    fn null_operand_propagates_other_side_eval_error() {
+        let div0 = || bin(BinOp::Div, num("1"), num("0"));
+        for e in [
+            bin(BinOp::Add, Expr::Null, div0()),
+            bin(BinOp::Mul, div0(), Expr::Null),
+            Expr::Coalesce(vec![bin(BinOp::Add, Expr::Null, div0()), num("5")]),
+        ] {
+            assert!(
+                matches!(
+                    fold_const_literal(&e),
+                    Err(SqlSurfaceError::DivisionByZero { .. })
+                ),
+                "{e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn null_function_args_fold_to_null() {
+        assert_eq!(
+            fold_const_literal(&call("upper", vec![Expr::Null])).unwrap(),
+            InsertLiteral::Null
+        );
+        assert_eq!(
+            fold_const_literal(&call("abs", vec![Expr::Null])).unwrap(),
+            InsertLiteral::Null
+        );
+        assert!(matches!(
+            fold_const_literal(&call("abs", vec![bin(BinOp::Div, num("1"), num("0"))])),
+            Err(SqlSurfaceError::DivisionByZero { .. })
+        ));
     }
 }
