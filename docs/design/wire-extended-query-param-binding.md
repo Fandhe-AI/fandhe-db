@@ -145,7 +145,7 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
 4. `WHERE <列> = $n`（トップレベル `WHERE` 節内側の等価条件のみ。`LIKE`・式
    比較・BOOLEAN 列条件は対象外）
 5. `INSERT ... VALUES ($1, $2, ...)`（複数行含む。`VALUES` 節内の行リテラル
-   位置のみ）
+   位置のみ。行の括弧の直下の要素単独位置に限り、`upper($1)`・`1 + $1` 等の式の内側は `42601`。Issue #1543・#1546）
 
 `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
 `UPDATE ... SET a = $n`・`ON CONFLICT ... DO UPDATE SET a = $n`・hybrid 関数
