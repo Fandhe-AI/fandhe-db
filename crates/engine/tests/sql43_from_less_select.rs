@@ -178,19 +178,29 @@ fn integer_arithmetic_follows_postgres_types_and_errors() {
 }
 
 #[test]
-fn rejects_column_references_with_uniform_code() {
+fn rejects_column_references_as_undefined_column() {
     let (core, path) = core_with_table("sql43-colref", true);
     let _g = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
+    // `SELECT *` は構文段で 42601 のまま。
+    assert_eq!(wire_code_of(&core, &ctx, "SELECT *"), "42601");
+    // 列参照は FROM なしでは全識別子が一律に未定義 → 42703（Issue #2328）。
     for sql in [
-        "SELECT *",
+        "SELECT x",
+        "SELECT 1 + x",
         "SELECT id",
         "SELECT lang",
         "SELECT nonexistent_col",
         "SELECT 1 + lang",
+        "SELECT lower(x)",
     ] {
-        assert_eq!(wire_code_of(&core, &ctx, sql), "42601", "{sql}");
+        assert_eq!(wire_code_of(&core, &ctx, sql), "42703", "{sql}");
     }
+    // 裸の NULL/TRUE/FALSE は値位置で識別子として扱われ、列参照と同じ 42703 になる
+    // （受理は後続。設計 doc の対象外を参照）。
+    assert_eq!(wire_code_of(&core, &ctx, "SELECT NULL"), "42703");
+    // 集計判定が引数の再帰より先。
+    assert_eq!(wire_code_of(&core, &ctx, "SELECT count(x)"), "42601");
     // 実在列と非実在列で応答（コード・メッセージ）が同一。
     let msg = |sql: &str| {
         core.execute_sql_in_session(&ctx, &mut SessionState::default(), sql)
@@ -199,6 +209,8 @@ fn rejects_column_references_with_uniform_code() {
     };
     assert_eq!(msg("SELECT lang"), msg("SELECT nonexistent_col"));
     assert!(!msg("SELECT lang").contains("lang"));
+    assert!(!msg("SELECT zzq_ident").contains("zzq_ident"));
+    assert!(!msg("SELECT 1 + zzq_ident").contains("zzq_ident"));
 }
 
 #[test]
@@ -225,7 +237,6 @@ fn rejects_aggregates_and_trailing_clauses() {
         "SELECT 1 WHERE",
         "SELECT 1 LIMIT",
         "SELECT 1 FROM",
-        "SELECT NULL",
         "SELECT $1",
         "SELECT 1 UNION SELECT 2",
         "SELECT 1; SELECT 2",
@@ -238,6 +249,26 @@ fn rejects_aggregates_and_trailing_clauses() {
         assert!(
             matches!(code, "42601" | "0A000"),
             "{sql:?} should be rejected fail-closed, got {code}"
+        );
+    }
+}
+
+/// 引用 `"NULL"` は NULL リテラルではなく識別子（列参照）として扱われ、
+/// `FROM` なしでは 0 行ではなく拒否される（Issue #2329 レビュー指摘）。
+#[test]
+fn quoted_null_in_where_is_not_a_null_literal() {
+    let (core, path) = core_with_table("sql43-qnull", true);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    for sql in [
+        "SELECT 1 WHERE \"NULL\"",
+        "SELECT 1 WHERE \"null\" LIMIT 1",
+        "SELECT 1 WHERE \"NULL\" OFFSET 0",
+    ] {
+        let code = wire_code_of(&core, &ctx, sql);
+        assert!(
+            matches!(code, "42601" | "42703"),
+            "{sql:?} should be rejected as a column reference, got {code}"
         );
     }
 }

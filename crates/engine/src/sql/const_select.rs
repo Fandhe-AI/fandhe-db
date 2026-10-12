@@ -14,8 +14,9 @@
 //! ようにする（`--max-search-k` 上限は適用しない。結果が最大 1 行のため）。
 //!
 //! テーブル・ストレージ・RLS 述語のいずれにも触れないため、他テナントのデータや
-//! 存在情報に依存する経路が無い。列参照は常に同一の固定文言で `42601` とし、
-//! 識別子名・テーブル名をエラーに含めない（fail-closed）。
+//! 存在情報に依存する経路が無い。列参照は常に同一の固定文言で `42703`（Issue #2328。
+//! `FROM` なしでは全識別子が一律に未定義）とし、識別子名・テーブル名をエラーに含めない
+//! （fail-closed）。集計は `42601` のまま。
 
 use crate::catalog::ColumnType;
 use crate::sql::allowlist::{
@@ -83,14 +84,18 @@ fn reject_non_constant(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_) => Ok(()),
-        Expr::Ident(_) => Err(SqlSurfaceError::unsupported(
-            "column references are not allowed in a SELECT without FROM",
-        )),
+        Expr::Ident(_) => Err(SqlSurfaceError::ColumnReferenceWithoutFrom),
         Expr::Call { name, args } => {
             if is_aggregate_function_name(name) {
                 return Err(SqlSurfaceError::unsupported(
                     "aggregate functions require a FROM clause",
                 ));
+            }
+            // テナント変数の上書き（RLS-6）に使われうる `set_config` は引数の検査より先に
+            // 構文拒否（`42601`）で固定する。引数中の `false` 等が列参照扱いで `42703` に
+            // なると RLS-6 の拒否契約（`42601`）が崩れるため。
+            if name.eq_ignore_ascii_case("set_config") {
+                return Err(SqlSurfaceError::unsupported("set_config is not supported"));
             }
             args.iter().try_for_each(reject_non_constant)
         }

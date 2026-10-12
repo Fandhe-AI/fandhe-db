@@ -125,6 +125,20 @@ fn error_sqlstate(body: &[u8]) -> String {
     panic!("no SQLSTATE field");
 }
 
+/// ErrorResponse の `M`（メッセージ）フィールドを取り出す。
+fn error_message(body: &[u8]) -> String {
+    let mut pos = 0;
+    while pos < body.len() && body[pos] != 0 {
+        let code = body[pos];
+        let end = body[pos + 1..].iter().position(|b| *b == 0).unwrap() + pos + 1;
+        if code == b'M' {
+            return String::from_utf8(body[pos + 1..end].to_vec()).unwrap();
+        }
+        pos = end + 1;
+    }
+    panic!("no message field");
+}
+
 /// 拡張クエリのエラー後に Sync で回復し、続けて `SELECT 1` が通ることを確認する。
 fn expect_error_then_recover(stream: &mut TcpStream) -> String {
     let code = error_sqlstate(&expect(stream, b'E'));
@@ -275,10 +289,34 @@ fn extended_rejects_param_placeholder_and_recovers() {
 }
 
 #[test]
-fn simple_column_reference_is_rejected() {
+fn simple_column_reference_is_rejected_as_undefined_column() {
     let (mut s, _g) = connect();
-    send_simple_query(&mut s, "SELECT x");
-    expect_error_response_with_sqlstate(&mut s, "42601");
+    for sql in ["SELECT x", "SELECT 1 + zzq_ident"] {
+        send_simple_query(&mut s, sql);
+        let body = expect(&mut s, b'E');
+        assert_eq!(error_sqlstate(&body), "42703", "{sql}");
+        // 識別子名をメッセージへ含めない（Issue #2328）。
+        assert!(!error_message(&body).contains("zzq_ident"), "{sql}");
+        read_ready_for_query(&mut s);
+    }
+}
+
+#[test]
+fn extended_rejects_column_reference_and_recovers() {
+    let (mut s, _g) = connect();
+    // 束縛は Parse 後の Describe で行われるため、ParseComplete の後に E が返る。
+    send(&mut s, b'P', &parse_body("", "SELECT 1 + zzq_ident", 0));
+    send(&mut s, b'D', &describe_body(b'S', ""));
+    send(&mut s, b'S', b"");
+    expect(&mut s, b'1');
+    let body = expect(&mut s, b'E');
+    assert_eq!(error_sqlstate(&body), "42703");
+    assert!(!error_message(&body).contains("zzq_ident"));
+    assert_eq!(expect(&mut s, b'Z'), [b'I']);
+    send_simple_query(&mut s, "SELECT 1");
+    read_row_description(&mut s);
+    read_data_row(&mut s);
+    read_command_complete(&mut s);
     read_ready_for_query(&mut s);
 }
 /// 0 行結果（RowDescription のみ・DataRow なし・`SELECT 0`）を読み、ReadyForQuery が `I` で
