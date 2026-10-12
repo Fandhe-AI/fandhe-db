@@ -31,6 +31,12 @@ fn expected_types() -> Vec<(&'static str, i32, i16)> {
         ("e", 701, 8),
         ("f", 25, -1),
         ("g", 20, 8),
+        // Issue #2304: BOOL・FLOAT・FLOAT(24)・FLOAT(53)・TIMESTAMP WITHOUT TIME ZONE。
+        ("h", 16, 1),
+        ("i", 701, 8),
+        ("j", 700, 4),
+        ("k", 701, 8),
+        ("l", 1114, 8),
     ]
 }
 
@@ -46,7 +52,8 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     session.allow_ddl();
     for sql in [
         "CREATE TABLE p (embedding VECTOR(2) NOT NULL, a INT, b INT4, c INT8, d FLOAT4, \
-         e FLOAT8, f INT4[], g INTEGER)",
+         e FLOAT8, f INT4[], g INTEGER, h BOOL, i FLOAT, j FLOAT(24), k FLOAT(53), \
+         l TIMESTAMP WITHOUT TIME ZONE)",
         "ALTER TABLE p ALTER COLUMN g TYPE INT8",
     ] {
         core.execute_sql_in_session(&ctx, &mut session, sql)
@@ -62,7 +69,10 @@ fn alias_columns_announce_canonical_oids_and_typlen() {
     let addr = spawn_server_with_engine(&users_path, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
-    send_simple_query(&mut stream, "SELECT a, b, c, d, e, f, g FROM p LIMIT 10");
+    send_simple_query(
+        &mut stream,
+        "SELECT a, b, c, d, e, f, g, h, i, j, k, l FROM p LIMIT 10",
+    );
     let columns = read_row_description_with_types(&mut stream);
     let expected = expected_types();
     assert_eq!(columns.len(), expected.len());

@@ -74,6 +74,8 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // Issue #1404・SQL-29・ERR-4: スカラーサブクエリの 2 行以上返却（`21000`）も入力起因の拒否。
         | ErrorClass::CardinalityViolation
         | ErrorClass::OperationIdContentMismatch
+        // Issue #2304: `FLOAT(p)` の精度範囲外（`22023`）。入力値起因の拒否として 400。
+        | ErrorClass::InvalidParameterValue
         | ErrorClass::MissingOperationId
         | ErrorClass::DatetimeFieldOverflow
         | ErrorClass::InvalidDatetimeFormat
@@ -151,7 +153,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 46] = [
+    const EXPECTED: [(ErrorClass, u16); 47] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -198,6 +200,7 @@ mod tests {
         (ErrorClass::UndefinedFunction, 400),
         (ErrorClass::DuplicateFunction, 400),
         (ErrorClass::AmbiguousColumn, 400),
+        (ErrorClass::InvalidParameterValue, 400),
     ];
 
     #[test]

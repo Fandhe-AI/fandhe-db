@@ -1193,7 +1193,7 @@ fn type_name_aliases_are_rejected_in_type_and_enum_type_without_side_effects() {
     let (core, _guard) = new_core();
     let session = ddl_session(core);
     let mut cases = Vec::new();
-    for alias in ["int", "int4", "int8", "float4", "float8"] {
+    for alias in ["int", "int4", "int8", "float4", "float8", "bool", "float"] {
         cases.push(format!(
             r#"{{"op":"create_table","table":"docs","columns":[{{"name":"a","type":"{alias}"}}]}}"#
         ));

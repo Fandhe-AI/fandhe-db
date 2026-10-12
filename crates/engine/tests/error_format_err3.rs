@@ -64,9 +64,9 @@ fn row<'a>(embedding: &'a [f32], metadata: &'a [u8]) -> RowInput<'a> {
     }
 }
 
-// --- (b) 排他性: `22023` は `OperationIdContentMismatch` 以外のどの分類の
-//     `wire_code` とも一致しない（`ErrorClass::ALL` の全走査。特に `23505`
-//     〔`UniqueViolation`〕でないことを明示する）。ERR-3 の確定契約そのもの。 --------
+// --- (b) 排他性: `22023` は `23505`（`UniqueViolation`）等の重複拒否系とは
+//     一致しない。`22023` は Issue #2304 以降 `InvalidParameterValue` と共有するが、
+//     `from_wire_code` は ERR-3 の分類へ戻り、`code` ラベルと文言で区別される。 --------
 
 #[test]
 fn err3_content_mismatch_wire_code_is_exclusive_to_its_own_class() {
