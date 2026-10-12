@@ -284,7 +284,7 @@ enum TypeNameKind {
     Direct(fn() -> SqlColumnTypeName),
     /// 綴りを保持する別名（実行段が同名 ENUM との衝突検出に使う。Issue #1528）。
     Alias(fn() -> SqlColumnTypeName),
-    /// `DOUBLE PRECISION`（2 語必須。`DOUBLE` 単独は構文段 `42601`）。
+    /// `DOUBLE PRECISION`（2 語必須。`DOUBLE` 単独は構文段 `42704`。Issue #2306）。
     DoublePrecision,
     /// `FLOAT`／`FLOAT(p)`（Issue #2304。TABLE-29）。`p` が `1..=24` は `REAL`、`25..=53` と
     /// 精度なしは `DOUBLE PRECISION`、範囲外は構文段 `22023`。綴りを保持する別名（同名 ENUM
@@ -310,7 +310,7 @@ enum TypeNameKind {
 }
 
 /// 型名解決表。先頭語（大小無視）で引く。表に無い識別子は ENUM 型名候補
-/// （`42704` 化は #2306）。ポインタ: TABLE-29・TABLE-30・TABLE-31。
+/// （実行段で未登録なら `42704`。Issue #2306）。ポインタ: TABLE-29・TABLE-30・TABLE-31。
 /// 全行の先頭語は `allowlist::CREATE_TABLE_COLUMN_TYPE_KEYWORDS` にも載せる契約
 /// （単体テストがドリフトを検出する）。
 const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
@@ -387,7 +387,8 @@ fn reject_length_modifier(tokens: &[Token], pos: usize) -> Result<(), SqlSurface
 /// TABLE-30・TABLE-31、Issue #1528・#2303）。未確定型（`INT2`／`SMALLINT`・`VARCHAR`／
 /// `CHARACTER VARYING`・`CHAR`／`CHARACTER`）はカタログを参照しない静的判定で、構文段で
 /// 両綴りとも同一の `0A000` を返す（書き込みトランザクション開始前のため副作用なし）。
-/// `DOUBLE` 単独は従来どおり構文段 `42601`。
+/// `DOUBLE` 単独は構文段 `42704`。表に無い識別子は ENUM 型名候補として
+/// 実行段で解決し、未登録は `42704`（Issue #2306）。
 fn parse_base_type_name(
     tokens: &[Token],
     pos: &mut usize,
@@ -406,8 +407,15 @@ fn parse_base_type_name(
         TypeNameKind::Direct(make) => Ok(make()),
         TypeNameKind::Alias(make) => Ok(alias_type(name, make())),
         TypeNameKind::DoublePrecision => {
-            expect_contextual_keyword(tokens, pos, "PRECISION")?;
-            Ok(SqlColumnTypeName::Double)
+            // `DOUBLE` 単独（`PRECISION` が続かない）は未定義の型名として `42704`
+            // （Issue #2306）。次トークンは消費せず、カタログ非依存の静的判定で返す。
+            match tokens.get(*pos) {
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("PRECISION") => {
+                    *pos += 1;
+                    Ok(SqlColumnTypeName::Double)
+                }
+                _ => Err(SqlSurfaceError::UndefinedType { name }),
+            }
         }
         TypeNameKind::Float => parse_float_type(name, tokens, pos),
         TypeNameKind::Timestamp => {
@@ -511,6 +519,8 @@ fn expect_ident(tokens: &[Token], pos: &mut usize) -> Result<String, SqlSurfaceE
     }
 }
 
+/// 文脈依存キーワード（`TIME`／`ZONE` 等）を 1 語消費する。`TIMESTAMP WITHOUT TIME ZONE`
+/// の解析（Issue #2304）で使う。不一致は構文段 `0A000`。
 fn expect_contextual_keyword(
     tokens: &[Token],
     pos: &mut usize,
@@ -834,8 +844,10 @@ mod tests {
 
     #[test]
     fn rejects_double_without_precision() {
-        assert!(parse_type("DOUBLE").is_err());
-        assert!(parse_type("DOUBLE FLOAT").is_err());
+        for sql in ["DOUBLE", "double", "DOUBLE FLOAT"] {
+            let err = parse_type(sql).expect_err("must reject");
+            assert_eq!(err.wire_code(), "42704", "{sql}");
+        }
     }
 
     #[test]

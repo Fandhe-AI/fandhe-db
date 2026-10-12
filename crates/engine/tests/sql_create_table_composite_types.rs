@@ -105,9 +105,14 @@ fn create_table_declares_array_enum_and_scalar_columns_and_round_trips() {
 fn unknown_and_invalid_types_are_rejected_with_42601() {
     let (_p, _g, core) = open("ct-composite-unknown");
     let mut s = allowed();
+    // 未登録の ENUM 型名は 42704（Issue #2306）。
     for sql in [
         "CREATE TABLE t (a no_such_type)",
         "CREATE TABLE t (a no_such_type[])",
+    ] {
+        assert_eq!(code(&core, &mut s, sql), "42704", "{sql}");
+    }
+    for sql in [
         "CREATE TABLE t (a INTEGER[0])",
         "CREATE TABLE t (a INTEGER[1025])",
         "CREATE TABLE t (a INTEGER[][])",
@@ -193,7 +198,7 @@ fn add_column_accepts_array_columns_and_rejects_invalid_ones() {
         run(&core, &mut s, sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     }
     for (sql, expected) in [
-        ("ALTER TABLE t ADD COLUMN x no_such[]", "42601"),
+        ("ALTER TABLE t ADD COLUMN x no_such[]", "42704"),
         ("ALTER TABLE t ADD COLUMN x VECTOR(2)[]", "42601"),
         ("ALTER TABLE t ADD COLUMN x INTEGER[0]", "42601"),
         ("ALTER TABLE t ADD COLUMN x INTEGER[2000]", "42601"),

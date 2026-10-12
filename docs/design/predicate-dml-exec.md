@@ -176,7 +176,8 @@ Issue #997 でこれを解消した。オーナー判断は本 Issue の実装�
   fail-closed で拒否する）。セッション・テナント単位の設定は対象外。
 - **資源上限**: 上限を明示指定しない場合でも、既存の SQL 文長上限
   （`sql::lexer` の入力長上限）・1 文あたり総走査行数上限
-  （`crate::tenant::MAX_SCANNED_ROWS`＝1,000,000）は変更せず、引き続き資源
+  （`crate::tenant::MAX_SCANNED_ROWS`＝1,000,000。Issue #1549 以降は `--max-scanned-rows` で
+  ハード上限以下へ下げる設定が可能、既定は不変。`docs/design/scan-limits-cli.md`）は引き続き資源
   枯渇（計算量 DoS）を防ぐ役割を担う。
 - **契約は不変**: 上限を設定して超過した場合の `54000`
   （`SqlSurfaceError::PayloadTooLarge`）・副作用ゼロ（RECOVER-11）は変えない。

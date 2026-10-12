@@ -242,7 +242,7 @@ fn type_names_are_case_sensitive() {
     run(&core, &mut s, "CREATE TYPE Mood AS ENUM ('a')").expect("create type");
     assert_eq!(
         code(&core, &mut s, "ALTER TABLE t ADD COLUMN c mood"),
-        "42601"
+        "42704"
     );
 }
 

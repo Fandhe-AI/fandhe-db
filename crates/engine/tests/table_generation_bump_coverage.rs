@@ -417,8 +417,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1179: 全書き込み経路（INSERT・UPSERT・UPDATE・DELETE）が `with_txn` へ
     // 集約され、`f` のクロージャ内で `bump_table_generation_in_txn` を呼んでから
     // `TxnEffect::Wrote` を返す構造になった（回帰ではなく構造変更への追随。旧: 453・466）。
-    // Issue #1544（SET 右辺式の `set_exprs` 引数・評価関数の追加）で行が移動したための追随（旧: 467）。
-    ("tenant.rs", 477),
+    // Issue #2328 等の base 取り込みと Issue #1544 の追加で行が移動したための追随（旧: 493）。
+    ("tenant.rs", 503),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

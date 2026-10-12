@@ -632,7 +632,8 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 （SQL の `<要素型>[N]`。`max_len` 省略は `[]`）。`element_type` は上記のうち
 `array` 以外の型名で、要素型のパラメータ（`precision`／`scale`／`enum_type`）は
 通常の型と同じキーで渡す。`max_len` が 0・1024 超、要素型が `vector`、
-入れ子配列、未登録の ENUM 型名は `42601`（SQL と同じ分類）。型と無関係な
+入れ子配列といった配列の構造エラーは引き続き `42601`。`42704` に変わるのは
+未登録の ENUM 型名だけである（SQL と同じ分類。Issue #2306）。型と無関係な
 パラメータ（配列でない型への `element_type`／`max_len` 等）も黙って無視せず `42601`。
 配列要素数の上限超過の書き込みは `54000`（HTTP 413）。
 
@@ -1126,7 +1127,7 @@ Date: <IMF-fixdate>
 | `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`・`ALTER TABLE ADD COLUMN` は op 許可リスト外。後述） |
 | `42702` | `AMBIGUOUS_COLUMN` | 400 | Bad Request | `aggregate.sort` が複数一致する出力名を参照したとき到達可能（Issue #1270）。`INNER JOIN`〔SQL-28・RLS-10、Issue #925〕は NoSQL 表層の op 語彙に無い。後述 |
 | `42703` | `UNDEFINED_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE INDEX` は op 許可リスト外。後述） |
-| `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP INDEX` は op 許可リスト外。後述） |
+| `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | 未登録の ENUM 型名（`create_table`／`alter_table`。Issue #2306）で到達可能。`DROP INDEX` 由来は op 許可リスト外 |
 | `42710` | `DUPLICATE_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`ALTER TABLE ... ADD CONSTRAINT` は SQL 表層専用。後述） |
 | `42723` | `DUPLICATE_FUNCTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE FUNCTION` は SQL 表層専用。後述） |
 | `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CASE`／`COALESCE`／`NULLIF`・集合演算・`INNER JOIN` の結合キー型不一致〔SQL-28・RLS-10、Issue #925〕・式層の演算子／関数引数の型不一致〔Issue #1186〕のいずれも SQL 表層専用。後述） |
@@ -1153,8 +1154,8 @@ Date: <IMF-fixdate>
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 17 分類（`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
-`42809`・`42703`・`42704`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 16 分類（`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
+`42809`・`42703`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
@@ -1196,7 +1197,7 @@ TASK-205、Issue #909）は SQL 表層専用の DDL で、NoSQL `op` 許可リ�
 `view` 相当の語彙が無いため `42P07`（名前衝突を `CREATE TABLE` と共有）・
 `2BP01`・`42809` も同様に到達不能。`CREATE INDEX`／`DROP INDEX`（INDEX-7・
 SQL-23・TASK-206、Issue #908）も SQL 表層専用の DDL で、`42P07`（名前衝突を
-共有）・`42703`・`42704` は同様に到達不能。`FOREIGN KEY`（TABLE-17・TASK-205、
+共有）・`42703` は同様に到達不能（`42704` は未登録 ENUM 型名から到達可能。Issue #2306）。`FOREIGN KEY`（TABLE-17・TASK-205、
 Issue #907）は SQL 表層の `CREATE TABLE` に加え、NoSQL `create_table` からも
 参照アクション込みで宣言できる（Issue #1148）ため、宣言時検査の `42830`・
 連鎖適用後の `23503`・連鎖上限超過の `54000` のいずれも到達する（上表。
