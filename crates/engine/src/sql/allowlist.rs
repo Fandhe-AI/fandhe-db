@@ -3575,6 +3575,10 @@ struct Parser<'a> {
     /// UDF 本体・ORDER BY 式キーと共有されており、それらの一般単項マイナスは従来どおり
     /// `42601` で拒否する契約（fail-closed）を保つため、既定は `false`。
     allow_unary_minus: bool,
+    /// 符号付き数値リテラル `+` + Number を式項として受理してよい文脈かどうか
+    /// （Issue #1544）。`UPDATE ... SET` 右辺の式解析中だけ `true` にする。
+    /// `const_expr_null_args` を立てない SET 経路でも `+5 + 1`・`(+5)` を解析するため。
+    allow_plus_number: bool,
     /// `CHECK ( ... )` 本体（TABLE-16）を解析中かどうか（Issue #1184）。`true` の間は
     /// `NOT ( ... )`・裸の `NOT <式比較>`・数値の `IN`／`BETWEEN` を従来どおり
     /// `42601` にする（脱糖後の形が `check_constraint` の許可形と区別できず、
@@ -3646,6 +3650,7 @@ impl<'a> Parser<'a> {
             allow_null_literal: false,
             const_expr_null_args: false,
             allow_unary_minus: false,
+            allow_plus_number: false,
             in_check_body: false,
             max_insert_rows: None,
             from_ref: None,
@@ -5760,7 +5765,7 @@ impl<'a> Parser<'a> {
             // 続く形（`+1+1`）を式パーサでも解析できるよう 1 ノードの数値へ畳む。
             // `+col`・`+(expr)` は従来どおり既定分岐で `42601`（fail-closed）。
             Some(Token::Punct('+'))
-                if self.const_expr_null_args
+                if (self.const_expr_null_args || self.allow_plus_number)
                     && matches!(self.tokens.get(self.pos + 1), Some(Token::Number(_))) =>
             {
                 self.advance();
@@ -6546,8 +6551,10 @@ impl<'a> Parser<'a> {
         self.expr_node_budget = MAX_EXPR_NODES;
         // `-a`（単項マイナス）は式解析中だけ許可する（`0 - a` へ脱糖される）。
         let prev_minus = std::mem::replace(&mut self.allow_unary_minus, true);
+        let prev_plus = std::mem::replace(&mut self.allow_plus_number, true);
         let parsed = self.parse_value_expr(0);
         self.allow_unary_minus = prev_minus;
+        self.allow_plus_number = prev_plus;
         self.expr_node_budget = saved;
         Ok(SetValue::Expr(parsed?))
     }
@@ -15818,6 +15825,9 @@ mod tests {
             ("-n", false),
             ("(5)", false),
             ("5 + 0", false),
+            ("+5 + 1", false),
+            ("+1 * n", false),
+            ("(+5)", false),
             ("CASE WHEN n > 1 THEN 1 ELSE 2 END", false),
         ] {
             let a = parse(rhs).unwrap_or_else(|e| panic!("{rhs}: {e:?}"));
