@@ -285,3 +285,39 @@ fn lowered_limit_does_not_apply_to_view_body_limit() {
     core.describe_parsed_in_session(&session, &parsed)
         .expect("describe must not apply the outer setting to the view body");
 }
+
+/// 利用者が明示した `LIMIT 4294967295` は内部の「LIMIT なし」値と同一視されず、
+/// 設定上限で検査される（評価後射影形ビュー外側。実行・Describe の両方）。
+#[test]
+fn explicit_u32_max_view_outer_limit_is_rejected() {
+    let path = unique_db_path("result-limits-view-u32max");
+    let _guard = CleanupGuard(path.clone());
+    let core = core_with(&path, None);
+    ok(&core, "CREATE VIEW v AS SELECT id FROM docs LIMIT 3");
+    let core = core.with_result_limits(ResultLimits::new(50));
+    assert_eq!(code(&core, "SELECT id FROM v LIMIT 4294967295"), "22000");
+    let parsed = core
+        .parse_sql("SELECT id FROM v LIMIT 4294967295")
+        .expect("parse");
+    let session = SessionState::default();
+    let err = core
+        .describe_parsed_in_session(&session, &parsed)
+        .expect_err("describe must reject an explicit LIMIT above the setting");
+    assert_eq!(err.wire_code(), "22000");
+}
+
+/// ビュー連鎖の内側 `LIMIT` は設定値を下げても既定値で独立に検証される。
+#[test]
+fn lowered_limit_does_not_apply_to_nested_view_body_limit() {
+    let path = unique_db_path("result-limits-nested-view");
+    let _guard = CleanupGuard(path.clone());
+    let core = core_with(&path, None);
+    ok(&core, "CREATE VIEW v1 AS SELECT id FROM docs LIMIT 100");
+    ok(&core, "CREATE VIEW v2 AS SELECT id FROM v1 LIMIT 100");
+    let core = core.with_result_limits(ResultLimits::new(50));
+    ok(&core, "SELECT id FROM v2 LIMIT 10");
+    let parsed = core.parse_sql("SELECT id FROM v2 LIMIT 10").expect("parse");
+    let session = SessionState::default();
+    core.describe_parsed_in_session(&session, &parsed)
+        .expect("describe must not apply the setting to nested view bodies");
+}

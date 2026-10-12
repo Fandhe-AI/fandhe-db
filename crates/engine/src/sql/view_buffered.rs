@@ -917,6 +917,7 @@ mod tests {
                 order_keys: Vec::new(),
                 window_items: Vec::new(),
                 limit,
+                limit_explicit: true,
                 offset,
             })),
         }
@@ -1298,6 +1299,7 @@ mod tests {
                 order_keys: keys,
                 window_items: vec![],
                 limit: 10,
+                limit_explicit: true,
                 offset: 0,
             })),
         };

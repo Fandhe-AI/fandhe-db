@@ -2368,17 +2368,17 @@ impl EngineCore {
     }
 
     /// 評価後射影形ビューの外側 `LIMIT`（行形のみ）を設定値の範囲で再検査する
-    /// （Issue #1555）。構文段（`sql::allowlist`）は設定値を持たず既定の 10,000 で検査
-    /// 済みのため、設定を下げた構成で既定値の範囲を通す fail-open を防ぐ。
+    /// （Issue #1555）。構文段（`sql::allowlist`）は設定値を持たないため範囲検査をここへ
+    /// 一任する。`limits` は呼び出し段の上限（ビュー本文の再帰先では既定値）。
     fn check_buffered_outer_limit(
-        &self,
         validated: &crate::sql::allowlist::ValidatedBufferedView,
+        limits: &crate::result_limits::ResultLimits,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-        // `u32::MAX` はビュー連鎖の素通し外側（`LIMIT` 指定なし＝無制限。構文段が
-        // 生成する内部値で、利用者が書いた `LIMIT` は構文段で 10,000 以下に限られる）。
+        // 利用者が明示した `LIMIT` は値が `u32::MAX` でも必ず検査する。`limit_explicit`
+        // が false のものはビュー連鎖の素通し外側（`LIMIT` なし＝無制限）で検査対象外。
         if let crate::sql::allowlist::BufferedOuter::Rows(rows) = &validated.outer {
-            if rows.limit != u32::MAX {
-                crate::sql::parser::validate_search_limit_with(rows.limit, &self.result_limits)?;
+            if rows.limit_explicit {
+                crate::sql::parser::validate_search_limit_with(rows.limit, limits)?;
             }
         }
         Ok(())
@@ -5095,7 +5095,7 @@ impl EngineCore {
             // Issue #1192（TABLE-18）: 評価後射影形ビュー。本文の結果列を
             // （本文は実行せずに）導出し、外側の射影だけを適用する。
             ParsedSql::Statement(Statement::BufferedView(validated)) => {
-                self.check_buffered_outer_limit(validated)?;
+                Self::check_buffered_outer_limit(validated, limits)?;
                 let body_parsed = ParsedSql::Statement((*validated.body).clone());
                 // 本文は永続化済みで `$n` を含まないため、外側の `$n` 置換に
                 // 位置対応するダミーフラグは渡さない（本文の ENUM 検証を省略しない）。
@@ -5694,7 +5694,7 @@ impl EngineCore {
             // だけを適用する。作成者の可視性は引き継がれない（`ctx` は参照者の
             // もの）。第 2 の実行器は作らない。
             crate::sql::allowlist::Statement::BufferedView(validated) => {
-                self.check_buffered_outer_limit(&validated)?;
+                Self::check_buffered_outer_limit(&validated, &limits)?;
                 let body = (*validated.body).clone();
                 match self.execute_read_statement_with_limits(
                     ctx,
