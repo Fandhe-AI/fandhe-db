@@ -201,7 +201,7 @@ PostgreSQL 互換の `CREATE TABLE`（件数なし）。
    未解決マーカー（`EnumTypeDef::unresolved`）として運ぶ。要素が ENUM 型名候補の配列
    （Issue #1357）も、未解決マーカーを持つ `ArrayType::new_enum` を列型として仮置きする。
 2. DDL 権限ゲート（`42501`）を通過した後、`sql::ddl::execute_create_table` が ENUM 型名を
-   `Storage::get_enum_type` で解決する。未登録は `42601`（型の存在有無は権限のない
+   `Storage::get_enum_type` で解決する。未登録は `42704`（Issue #2306 で `42601` から変更）（型の存在有無は権限のない
    セッションには見えない）。要素が ENUM の配列も同じ経路で登録済みの語彙へ差し替える。
 3. 解決後の列型で `DEFAULT` を束縛検証する（ENUM の語彙外は `22P02`）。
 4. `Storage::create_table`（書き込みトランザクション内で型名を再解決する）。解決から

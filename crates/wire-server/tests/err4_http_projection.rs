@@ -898,7 +898,8 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         ErrorClass::NoActiveSqlTransaction,
         ErrorClass::InFailedSqlTransaction,
         // TASK-206・INDEX-7・SQL-23（Issue #908）: 索引 DDL は SQL 表層専用。
-        ErrorClass::UndefinedObject,
+        // （`UndefinedObject`〔`42704`〕は Issue #2306 で未登録 ENUM 型名から到達可能に
+        // なったため外した。固定は `err4_f_undefined_type_reachable_via_nosql_create_table`）
         ErrorClass::UndefinedColumn,
         // `DatatypeMismatch`（`42804`）は 2 つの発生源を共有する:
         // `CASE`/`COALESCE`/`NULLIF` の型不一致（SQL-26・Issue #921。NoSQL
@@ -1089,6 +1090,21 @@ fn err4_f_invalid_foreign_key_reachable_via_nosql_create_table() {
     ]}"#;
     let resp = query_as_alice(addr, child);
     assert_projected(&resp, "42830");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
+}
+
+/// `42704`（`UndefinedObject`。TABLE-29、Issue #2306）は NoSQL `create_table` の未登録
+/// ENUM 型名から到達可能。応答には指定した型名のみを含み、テナントを含めない。
+#[test]
+fn err4_f_undefined_type_reachable_via_nosql_create_table() {
+    let (core, _guard) = new_core();
+    let addr = spawn_with_ddl(core);
+
+    let body = br#"{"op":"create_table","table":"t","columns":[
+        {"name":"c","type":"enum","enum_type":"nosuch"}
+    ]}"#;
+    let resp = query_as_alice(addr, body);
+    assert_projected(&resp, "42704");
     http_common::assert_message_does_not_echo(&resp, "tenant-a");
 }
 

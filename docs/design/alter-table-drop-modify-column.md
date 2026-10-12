@@ -207,8 +207,8 @@ SQL-23・ERR-6・NOSQL-13）。
   無視）は構造検証段で `42601`（カタログ非照会のため存在オラクルにならない）。
 - **判定順序**: 構文検証 → DDL 権限ゲート（`42501`）→ テーブル存在確認
   （`42P01`／`42809`）→（ALTER TYPE のみ）目標型解決 → engine の単一 write txn。
-- **エラー写像**: 列なし `42703`／VECTOR 列・保護列・最後の 1 列・NUMERIC 範囲不正・
-  未登録 ENUM `42601`／PK・UNIQUE・FK 参照列（DROP COLUMN のみ）・CHECK 参照列 `2BP01`／非互換な型変更
+- **エラー写像**: 列なし `42703`／VECTOR 列・保護列・最後の 1 列・NUMERIC 範囲不正は
+  既存どおり `42601`（構造エラー群）、未登録 ENUM 型名のみ `42704`（Issue #2306）／PK・UNIQUE・FK 参照列（DROP COLUMN のみ）・CHECK 参照列 `2BP01`／非互換な型変更
   `42804`／ロック待機超過 `55P03`。新しい `wire_code`・`ErrorClass` は追加しない。
 - **ALTER TYPE の engine 側**: `Storage::alter_table_alter_column_type`（crate 内部）が
   目標の precision/scale を受け取り、単一 write txn 内で判定する（表層で事前に読んだ

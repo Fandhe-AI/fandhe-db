@@ -474,7 +474,6 @@ fn malformed_syntax_variants_are_rejected_with_42601() {
         format!("ALTER TABLE {TABLE} ADD COLUMN note NUMERIC(0,0)"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note NUMERIC(39,0)"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note NUMERIC(5,6)"),
-        format!("ALTER TABLE {TABLE} ADD COLUMN note DOUBLE"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note VECTOR()"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT; SELECT 1"),
     ] {
@@ -613,7 +612,7 @@ fn permission_denial_precedes_view_detection() {
 }
 
 #[test]
-fn unregistered_enum_type_name_is_rejected_with_42601() {
+fn unregistered_enum_type_name_is_rejected_with_42704() {
     let (core, path) = new_core_with_table();
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
@@ -623,7 +622,15 @@ fn unregistered_enum_type_name_is_rejected_with_42601() {
         &format!("ALTER TABLE {TABLE} ADD COLUMN feeling unregistered_mood"),
     )
     .expect_err("unregistered ENUM type name must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(err.wire_code(), "42704");
+    // `DOUBLE` 単独も未定義の型名として 42704（Issue #2306）。
+    let err = alter_table(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN note DOUBLE"),
+    )
+    .expect_err("DOUBLE without PRECISION must be rejected");
+    assert_eq!(err.wire_code(), "42704");
 }
 
 // --- EXPLAIN との相互排他 -------------------------------------------------
@@ -1239,7 +1246,7 @@ fn enum_default_type_check_errors() {
         ("m2 mood DEFAULT true".to_string(), "42601"),
         ("m3 mood DEFAULT 'angry'".to_string(), "22P02"),
         ("m4 mood DEFAULT 'HAPPY'".to_string(), "22P02"),
-        ("m5 nosuchtype DEFAULT 'x'".to_string(), "42601"),
+        ("m5 nosuchtype DEFAULT 'x'".to_string(), "42704"),
         (too_long, "54000"),
     ] {
         let err = add_column(&core, &decl).expect_err(&decl[..decl.len().min(40)]);
