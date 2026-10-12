@@ -89,6 +89,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] \
   [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
   [--write-lock-wait-ms <100-60000>] \
+  [--max-transaction-duration-ms <100-60000>] [--max-transaction-statements <1-10000>] \
   [--partitioned-dml-chunk-rows <1-1000000>] [--partitioned-dml-scan-budget <1-1000000>] \
   [--partitioned-dml-max-hold-ms <100-5000>] \
   [--partitioned-dml-max-jobs-per-tenant <1-64>] [--partitioned-dml-max-jobs <1-64>] \
@@ -360,6 +361,16 @@ CTE 連鎖の深さの上限を、プロセス全体に対して起動時に**�
 超過時の SQLSTATE は従来と同じ `55P03` です。autocommit の書き込み・明示トランザクションの `BEGIN`・分割実行 DML の
 チャンクに効き、SQL 表層と NoSQL（HTTP）表層の両方が対象です。範囲外・非数値・値欠落・2 回目以降の重複指定は
 fail-closed で起動エラーです。環境変数は設けません（詳細: [docs/design/write-lock-wait-cli.md](docs/design/write-lock-wait-cli.md)）。
+
+`--max-transaction-duration-ms <N>`（既定 20000・範囲 `100`〜`60000` ミリ秒）・`--max-transaction-statements <N>`
+（既定 1,000・範囲 `1`〜`10,000`）（Issue #1553・SQL-46）は、トランザクションの最大持続時間と最大文数を、
+プロセス全体に対して起動時に設定します（未指定は現行の既定値で、挙動は変わりません。兄弟フラグと違い既定の
+上下どちらへも設定できますが、ハード上限〔60 秒・10,000 文〕は超えられません）。設定値は明示トランザクションと
+暗黙トランザクション（`BEGIN` を含まない複数文メッセージ）の両方に効き、超過時の SQLSTATE は従来と同じ
+`54000` です。持続時間を 30 秒より長く明示指定すると、書き込みロック待ち上限（30 秒）を超えるため、長い
+トランザクションが書き手を握っている間にほかのセッションの書き込みが `55P03` を受け得る旨の `WARNING` 行を
+起動ログに出します。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです
+（詳細: [docs/design/transaction-limits-cli.md](docs/design/transaction-limits-cli.md)）。
 
 `--auth-method`（Issue #940・WIRE-18・TASK-222）は SQL 表層の SASL 認証方式を
 選ぶ opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス

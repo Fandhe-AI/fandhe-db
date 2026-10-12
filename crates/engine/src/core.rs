@@ -2250,6 +2250,9 @@ impl EngineCore {
     /// `TransactionLimits::default()`）。書き込みロック待ちの上限
     /// （`55P03` を返すまでの時間）は独立に `Storage::with_write_lock_wait` で
     /// 設定する（`Storage` 構築側、または [`Self::with_write_lock_wait`]）。
+    /// wire-server の起動時 CLI
+    /// （`--max-transaction-duration-ms`・`--max-transaction-statements`。Issue #1553）
+    /// からは、範囲検証済みの値が 1 回だけ注入される。
     pub fn with_transaction_limits(
         mut self,
         limits: crate::sql::transaction::TransactionLimits,
