@@ -19888,6 +19888,14 @@ mod tests {
         );
         let err = validate_sql(&sql_over, &lookup).expect_err("must exceed CTE definition limit");
         assert_eq!(err.wire_code(), "54000");
+        // 実効上限（既定ではハード上限）がメッセージに含まれる（Issue #1552 D8）。
+        assert!(
+            err.to_string().contains(&format!(
+                "exceeds limit {}",
+                crate::sql::cte::MAX_CTE_DEFINITIONS
+            )),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
@@ -19936,6 +19944,13 @@ mod tests {
         let sql_over = format!("WITH {} SELECT * FROM c{depth} LIMIT 10", defs.join(", "));
         let err = validate_sql(&sql_over, &lookup).expect_err("must exceed CTE nesting depth");
         assert_eq!(err.wire_code(), "54000");
+        assert!(
+            err.to_string().contains(&format!(
+                "exceeds limit {}",
+                crate::sql::cte::MAX_CTE_NESTING_DEPTH
+            )),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
