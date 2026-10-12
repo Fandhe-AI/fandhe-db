@@ -42,6 +42,7 @@ use crate::catalog::{
     AlterCheckError, CatalogError, ColumnDef, ColumnDefault, ColumnType, IndexDef, IndexKind,
     TableSchema, MAX_COLUMN_DEFAULT_LEN,
 };
+use crate::schema_limits::SchemaLimits;
 use crate::sql::allowlist::{
     InsertLiteral, SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
     ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnType,
@@ -50,7 +51,7 @@ use crate::sql::allowlist::{
     ValidatedDropTable, ValidatedDropType, ValidatedDropView,
 };
 use crate::sql::ddl_column_type::{
-    alias_spelling, to_static_column_type, SqlColumnTypeName, StaticColumnType,
+    alias_spelling, to_static_column_type_with_array_default, SqlColumnTypeName, StaticColumnType,
 };
 use crate::sql::mode::SessionState;
 use crate::storage::Storage;
@@ -90,7 +91,17 @@ pub struct CreateTableOutcome {}
 pub(crate) fn execute_create_table(
     storage: &Storage,
     validated: &ValidatedCreateTable,
+    limits: &SchemaLimits,
 ) -> Result<CreateTableOutcome, SqlSurfaceError> {
+    // 起動時設定 `--max-table-columns`（Issue #1548）。構文段の上限（ハード上限）は
+    // 変えず、定義が増えるここでだけ設定値と比較する（decode 経路には入れない）。
+    // カタログを参照しない判定のため存在オラクルにならず、storage 呼び出しより前に
+    // 行うことで従来と同じ `54000` に揃える。
+    if validated.columns.len() > limits.max_table_columns() {
+        return Err(SqlSurfaceError::payload_too_large(
+            "too many columns in CREATE TABLE",
+        ));
+    }
     // ENUM 列（構文段は未解決マーカー）を登録済みの型定義へ差し替える。型の存在確認は
     // DDL 権限ゲート（`core.rs` の `require_ddl_permission`）の後のここでのみ行い、
     // 未登録は `ADD COLUMN` と同じ `42704`（Issue #2306）。解決から `create_table` までの間に
@@ -100,6 +111,19 @@ pub(crate) fn execute_create_table(
     }
     let mut columns = validated.columns.clone();
     for column in &mut columns {
+        // 配列列の要素数上限（Issue #1548）。`[]` 省略列は設定値で組み直し、明示 `[N]` は
+        // 設定値を超えたら `42601`（既存の範囲外 `[N]` と同じ分類）。
+        if let ColumnType::Array(array_ty) = &column.ty {
+            let max = limits.max_array_elements();
+            if validated.array_len_defaulted.contains(&column.name) {
+                let rebuilt = array_ty.with_max_len(max).map_err(|e| {
+                    SqlSurfaceError::unsupported(format!("invalid array type: {e}"))
+                })?;
+                column.ty = ColumnType::Array(rebuilt);
+            } else if array_ty.max_len() > max {
+                return Err(array_len_over_limit(max, array_ty.max_len()));
+            }
+        }
         if let ColumnType::Enum(def) = &column.ty {
             column.ty = ColumnType::Enum(resolve_enum_type(storage, def.name())?);
         } else if let ColumnType::Array(array_ty) = &column.ty {
@@ -362,6 +386,7 @@ pub enum AlterTableAction {
 pub(crate) fn execute_alter_table_add_column(
     storage: &Storage,
     stmt: &ValidatedAlterTableAddColumn,
+    limits: &SchemaLimits,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     match storage.get_table_schema(&stmt.table_name) {
         Ok(_) => {}
@@ -370,7 +395,7 @@ pub(crate) fn execute_alter_table_add_column(
         }
         Err(other) => return Err(map_add_column_error(other)),
     }
-    let ty = resolve_column_type(storage, &stmt.column_type)?;
+    let ty = resolve_column_type(storage, &stmt.column_type, limits)?;
     let default = match &stmt.default {
         None => None,
         Some(literal) => Some(add_column_default(&stmt.column_name, &ty, literal)?),
@@ -383,7 +408,7 @@ pub(crate) fn execute_alter_table_add_column(
         column = column.with_default(default);
     }
     storage
-        .alter_table_add_column(&stmt.table_name, column)
+        .alter_table_add_column_with_limit(&stmt.table_name, column, limits.max_table_columns())
         .map_err(|e| match e {
             CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
             other => map_add_column_error(other),
@@ -551,10 +576,11 @@ pub(crate) fn execute_alter_table_add_check(
 pub(crate) fn execute_alter_table(
     storage: &Storage,
     validated: &crate::sql::allowlist::ValidatedAlterTable,
+    limits: &SchemaLimits,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     match validated {
         crate::sql::allowlist::ValidatedAlterTable::AddColumn(stmt) => {
-            execute_alter_table_add_column(storage, stmt)
+            execute_alter_table_add_column(storage, stmt, limits)
         }
         crate::sql::allowlist::ValidatedAlterTable::AddUnique(stmt) => {
             execute_alter_table_add_unique(storage, stmt)
@@ -572,7 +598,7 @@ pub(crate) fn execute_alter_table(
             execute_alter_table_drop_column(storage, stmt)
         }
         crate::sql::allowlist::ValidatedAlterTable::AlterColumnType(stmt) => {
-            execute_alter_table_alter_column_type(storage, stmt)
+            execute_alter_table_alter_column_type(storage, stmt, limits)
         }
         crate::sql::allowlist::ValidatedAlterTable::AddPrimaryKey(stmt) => {
             execute_alter_table_add_primary_key(storage, stmt)
@@ -739,9 +765,10 @@ pub(crate) fn execute_alter_table_drop_column(
 pub(crate) fn execute_alter_table_alter_column_type(
     storage: &Storage,
     stmt: &ValidatedAlterTableAlterColumnType,
+    limits: &SchemaLimits,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     ensure_table_exists(storage, &stmt.table_name)?;
-    let target = resolve_alter_target_type(storage, &stmt.column_type)?;
+    let target = resolve_alter_target_type(storage, &stmt.column_type, limits)?;
     storage
         .alter_table_alter_column_type(&stmt.table_name, &stmt.column_name, &target)
         .map_err(|e| match e {
@@ -776,10 +803,11 @@ fn ensure_table_exists(storage: &Storage, table_name: &str) -> Result<(), SqlSur
 fn resolve_alter_target_type(
     storage: &Storage,
     ty: &SqlColumnTypeName,
+    limits: &SchemaLimits,
 ) -> Result<ColumnType, SqlSurfaceError> {
     match ty {
         SqlColumnTypeName::Vector(dim) => Ok(ColumnType::Vector(*dim)),
-        other => resolve_column_type(storage, other),
+        other => resolve_column_type(storage, other, limits),
     }
 }
 
@@ -871,6 +899,7 @@ fn undefined_table_or_view(storage: &Storage, name: &str) -> SqlSurfaceError {
 fn resolve_column_type(
     storage: &Storage,
     ty: &SqlColumnTypeName,
+    limits: &SchemaLimits,
 ) -> Result<ColumnType, SqlSurfaceError> {
     // 既存行が埋め込みバイトを持たないテーブルへの VECTOR 列追加は、
     // arena 構築・KNN・HNSW 各経路の安全性が未検証のため常に拒否する
@@ -883,7 +912,17 @@ fn resolve_column_type(
     if let Some(alias) = alias_spelling(ty) {
         reject_alias_enum_collision(storage, alias)?;
     }
-    match to_static_column_type(ty)? {
+    // 明示 `[N]` が起動時設定 `--max-array-elements`（Issue #1548）を超える宣言は
+    // `42601`。`[]` 省略は設定値を既定の要素数にする。
+    if let SqlColumnTypeName::Array {
+        max_len: Some(n), ..
+    } = ty
+    {
+        if *n > limits.max_array_elements() {
+            return Err(array_len_over_limit(limits.max_array_elements(), *n));
+        }
+    }
+    match to_static_column_type_with_array_default(ty, limits.max_array_elements())? {
         StaticColumnType::Resolved(t) => Ok(t),
         StaticColumnType::EnumCandidate(name) => {
             Ok(ColumnType::Enum(resolve_enum_type(storage, &name)?))
@@ -897,6 +936,15 @@ fn resolve_column_type(
             Ok(ColumnType::Array(array))
         }
     }
+}
+
+/// 配列の要素数宣言が設定上限を超えたときの `42601`（Issue #1548）。文言は
+/// `ArrayType::new` の範囲外エラー（`invalid array type: ...`）と同じ形に揃え、
+/// 既定（設定値＝ハード上限）では従来と同一になる。
+fn array_len_over_limit(max: u32, got: u32) -> SqlSurfaceError {
+    SqlSurfaceError::unsupported(format!(
+        "invalid array type: array max_len must be within 1..={max}, got {got}"
+    ))
 }
 
 /// ENUM 型名を `Storage::get_enum_type` で解決する。未登録は `42704`
@@ -1296,7 +1344,13 @@ pub struct DropTypeOutcome {}
 pub(crate) fn execute_create_type(
     storage: &Storage,
     validated: &ValidatedCreateType,
+    limits: &SchemaLimits,
 ) -> Result<CreateTypeOutcome, SqlSurfaceError> {
+    // 起動時設定 `--max-enum-labels`（Issue #1548）。storage 側の `CatalogError::Invalid`
+    // は `42601` に写像されるため、構文段と同じ `54000` を保つにはここで先に判定する。
+    if validated.labels().len() > limits.max_enum_labels() {
+        return Err(SqlSurfaceError::payload_too_large("too many enum labels"));
+    }
     storage
         .create_enum_type(validated.name(), validated.labels().to_vec())
         .map_err(map_create_type_error)?;
@@ -1431,6 +1485,7 @@ mod tests {
         let validated = ValidatedCreateTable {
             primary_key_name: None,
             alias_type_names: Vec::new(),
+            array_len_defaulted: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -1442,7 +1497,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
         };
-        execute_create_table(&storage, &validated).expect("create table");
+        execute_create_table(&storage, &validated, &SchemaLimits::default()).expect("create table");
         storage
             .create_view("v_docs", "docs", "SELECT * FROM docs")
             .expect("create view");
@@ -1586,6 +1641,7 @@ mod tests {
         let validated = ValidatedCreateTable {
             primary_key_name: None,
             alias_type_names: Vec::new(),
+            array_len_defaulted: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new(
@@ -1600,7 +1656,8 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
         };
-        execute_create_table(&storage, &validated).expect("create table must succeed");
+        execute_create_table(&storage, &validated, &SchemaLimits::default())
+            .expect("create table must succeed");
         let schema = storage.get_table_schema("docs").expect("schema must exist");
         assert_eq!(schema.columns.len(), 2);
     }
@@ -1611,6 +1668,7 @@ mod tests {
         let validated = ValidatedCreateTable {
             primary_key_name: None,
             alias_type_names: Vec::new(),
+            array_len_defaulted: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -1622,8 +1680,9 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
         };
-        execute_create_table(&storage, &validated).expect("first create must succeed");
-        let err = execute_create_table(&storage, &validated)
+        execute_create_table(&storage, &validated, &SchemaLimits::default())
+            .expect("first create must succeed");
+        let err = execute_create_table(&storage, &validated, &SchemaLimits::default())
             .expect_err("second create with same name must fail");
         assert!(matches!(err, SqlSurfaceError::DuplicateTable { .. }));
         assert_eq!(err.wire_code(), "42P07");
@@ -1635,6 +1694,7 @@ mod tests {
         let validated = ValidatedCreateTable {
             primary_key_name: None,
             alias_type_names: Vec::new(),
+            array_len_defaulted: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new("a", crate::catalog::ColumnType::Vector(4), false),
@@ -1645,7 +1705,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
         };
-        let err = execute_create_table(&storage, &validated)
+        let err = execute_create_table(&storage, &validated, &SchemaLimits::default())
             .expect_err("two VECTOR columns must be rejected");
         assert_eq!(err.wire_code(), "42601");
     }

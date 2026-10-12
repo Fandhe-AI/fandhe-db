@@ -15,14 +15,11 @@ use crate::catalog::ColumnType;
 use crate::sql::allowlist::{
     is_aggregate_function_name, ConstSelectItem, SqlSurfaceError, ValidatedConstSelect,
 };
-use crate::sql::exec::{computed_column_meta, Cell, ColumnMeta, QueryResult, ResultRow};
+use crate::sql::exec::{scalar_cell_for, Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::udf_call::{
-    bind_const_expr, eval, into_owned_vector, BoundExpr, Expr, ExprValue, UdfRegistry,
-    MAX_EXPR_NODES,
+    bind_const_expr, classify_integer_literal, eval, into_owned_vector, BoundExpr, Expr, ExprValue,
+    NumericKind, UdfRegistry, MAX_EXPR_NODES,
 };
-
-/// 別名・既定名を持たない定数項目の列名（PostgreSQL 互換）。
-const ANONYMOUS_COLUMN_NAME: &str = "?column?";
 
 /// 束縛済みの 1 項目。
 #[derive(Debug, Clone)]
@@ -30,7 +27,11 @@ enum BoundConstItem {
     /// リテラル定数（束縛時に型とセルが確定する）。
     Literal { meta: ColumnMeta, cell: Cell },
     /// 式（実行時に評価する。型は束縛時に `meta` へ確定済み）。
-    Expr { meta: ColumnMeta, expr: BoundExpr },
+    Expr {
+        meta: ColumnMeta,
+        expr: BoundExpr,
+        result_ty: Option<ColumnType>,
+    },
 }
 
 impl BoundConstItem {
@@ -101,23 +102,19 @@ fn reject_non_constant(expr: &Expr) -> Result<(), SqlSurfaceError> {
 /// 整数形（先頭 `-` 任意＋数字のみ）は i32／i64 に収まる最小の整数型、それ以外
 /// （小数・指数・i64 超）は厳密な `numeric` にする。
 fn literal_number(raw: &str, name: &str) -> Result<(ColumnMeta, Cell), SqlSurfaceError> {
-    let digits = raw.strip_prefix('-').unwrap_or(raw);
-    let is_integer_form = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
-    if is_integer_form {
-        if let Ok(v) = raw.parse::<i64>() {
-            let ty = if i32::try_from(v).is_ok() {
-                ColumnType::Integer
-            } else {
-                ColumnType::BigInt
-            };
-            return Ok((
-                ColumnMeta::Computed {
-                    name: name.to_string(),
-                    ty: Some(ty),
-                },
-                Cell::SignedInteger(v),
-            ));
-        }
+    if let Some((v, kind)) = classify_integer_literal(raw) {
+        let ty = if kind == NumericKind::Int4 {
+            ColumnType::Integer
+        } else {
+            ColumnType::BigInt
+        };
+        return Ok((
+            ColumnMeta::Computed {
+                name: name.to_string(),
+                ty: Some(ty),
+            },
+            Cell::SignedInteger(v),
+        ));
     }
     match crate::numeric::parse_literal_exact(raw) {
         Ok(d) => Ok((
@@ -144,12 +141,7 @@ fn item_name(item: &ConstSelectItem) -> String {
     if let Some(alias) = item.alias() {
         return alias.to_string();
     }
-    match item.expr() {
-        Expr::Call { .. } | Expr::Case { .. } | Expr::Coalesce(_) | Expr::NullIf(..) => {
-            crate::sql::parser::default_expr_alias(item.expr())
-        }
-        _ => ANONYMOUS_COLUMN_NAME.to_string(),
-    }
+    crate::sql::parser::default_expr_alias(item.expr())
 }
 
 /// 定数式 SELECT を束縛する。禁止検査（列参照・集計）を全項目に先に適用してから
@@ -172,10 +164,14 @@ pub fn bind(
                 BoundConstItem::Literal { meta, cell }
             }
             expr => {
-                let (bound, ty) = bind_const_expr(expr, registry, &mut budget)?;
+                let (bound, _ty, result_ty) = bind_const_expr(expr, registry, &mut budget)?;
                 BoundConstItem::Expr {
-                    meta: computed_column_meta(&name, ty),
+                    meta: ColumnMeta::Computed {
+                        name,
+                        ty: result_ty.clone(),
+                    },
                     expr: bound,
+                    result_ty,
                 }
             }
         };
@@ -191,9 +187,11 @@ pub fn execute(bound: &BoundConstSelect) -> Result<QueryResult, SqlSurfaceError>
     for item in &bound.items {
         match item {
             BoundConstItem::Literal { cell, .. } => cells.push(cell.clone()),
-            BoundConstItem::Expr { expr, .. } => {
+            BoundConstItem::Expr {
+                expr, result_ty, ..
+            } => {
                 let cell = match eval(expr, 0, &[])? {
-                    ExprValue::Scalar(f) => Cell::Float(f),
+                    ExprValue::Scalar(f) => scalar_cell_for(f, result_ty.as_ref())?,
                     ExprValue::Bool(b) => Cell::Bool(b),
                     ExprValue::Text(t) => Cell::Text(t.into_owned()),
                     ExprValue::Date(d) => Cell::Date(d),

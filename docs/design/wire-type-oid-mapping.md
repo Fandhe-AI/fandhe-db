@@ -126,6 +126,7 @@ engine の `ColumnMeta::Computed` に静的な結果型 `ty: Option<ColumnType>`
 | `MIN／MAX(DATE／TIMESTAMP／TEXT)` | `Date`（1082）／`Timestamp`（1114）／`Text`（25） |
 | `GROUP BY` キー | キー列の型の写像（Issue #1407。`TEXT` は `Text`〔25〕、`INTEGER` は `Integer`〔23〕など。疑似列 `id` は `Numeric`〔1700〕） |
 | 式列（スカラー式／比較式／TEXT・DATE・TIMESTAMP 式） | `Double`（701）／`Boolean`（16）／`Text`／`Date`／`Timestamp` |
+| 投影位置の `+ - * /`（Issue #1539・SQL-42） | 両オペランドが整数形リテラル／`INTEGER`／`BIGINT` 列／入れ子の整数算術なら `Integer`（23。i32 同士）または `BigInt`（20。混在・i64）、両方 `REAL` 列なら `Real`（700）、それ以外（小数リテラル・`DOUBLE` 列・疑似列 `id`・関数・`CASE` など）は `Double`（701）。整数除算は 0 方向への切り捨て、溢れは `22003`、0 除算は `22012`。TEXT オペランドは `42883`。整数形リテラル単独の投影は `Integer`／`BigInt`。別名なしの列名は `?column?`。`engine::sql::udf_call::expr_result_column_type` が唯一の写像 |
 | ベクトル式・`EXPLAIN` の `QUERY PLAN` | 型なし（ベクトル式）は `text`。`QUERY PLAN` は `Text` |
 | ウィンドウ関数の結果列（Issue #1344） | 順位関数（`ROW_NUMBER`／`RANK`／`DENSE_RANK`）と `COUNT` は `int8`（20）。`SUM`／`AVG`／`MIN`／`MAX` は集計式と同じ規則（`aggregate_result_type`）で決まる型。実行経路と Describe は `window_result_type` を共有する |
 

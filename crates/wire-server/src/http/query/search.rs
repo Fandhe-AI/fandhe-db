@@ -51,7 +51,7 @@ use engine::sql::allowlist::{validate_using_plan_question, SqlSurfaceError};
 use engine::sql::mode::{self, SearchMode, SessionState};
 use engine::sql::parser::{
     bind_body_text_column, bind_column_projection, bind_vector_values, require_vector_column,
-    validate_search_limit, BoundStatement, ProjectedColumn, Ranking,
+    validate_search_limit_with, BoundStatement, ProjectedColumn, Ranking,
 };
 use engine::sql::plan::EvaluationOrder;
 
@@ -337,10 +337,26 @@ pub fn bind_search(
     schema: &TableSchema,
     udfs: &engine::sql::udf_call::UdfRegistry,
 ) -> Result<BoundSearch, SearchError> {
+    bind_search_with_limits(
+        validated,
+        schema,
+        udfs,
+        &engine::result_limits::ResultLimits::default(),
+    )
+}
+
+/// [`bind_search`] の `limit` 範囲設定付き版（Issue #1555・SQL-34）。`limits` は
+/// `EngineCore::result_limits()`（起動時 CLI `--max-result-rows`）を渡す。
+pub fn bind_search_with_limits(
+    validated: &Validated<'_>,
+    schema: &TableSchema,
+    udfs: &engine::sql::udf_call::UdfRegistry,
+    limits: &engine::result_limits::ResultLimits,
+) -> Result<BoundSearch, SearchError> {
     let table = validated.required_str("table")?;
     ident::check_identifier(table)?;
     let limit_raw = validated.required_u32("limit")?;
-    let limit = validate_search_limit(limit_raw)?;
+    let limit = validate_search_limit_with(limit_raw, limits)?;
     let explain = validated.optional_bool("explain")?.unwrap_or(false);
 
     let vector_items = validated.optional_array("vector")?;
@@ -497,8 +513,9 @@ pub(crate) fn bind_vector_statement(
     validated: &Validated<'_>,
     schema: &TableSchema,
     udfs: &engine::sql::udf_call::UdfRegistry,
+    limits: &engine::result_limits::ResultLimits,
 ) -> Result<BoundStatement, SqlSurfaceError> {
-    match bind_search(validated, schema, udfs).map_err(to_sql_surface_error)? {
+    match bind_search_with_limits(validated, schema, udfs, limits).map_err(to_sql_surface_error)? {
         BoundSearch::Vector(stmt) => Ok(stmt),
         // `execute`（通常実行）側の対称コメント参照: `explain::execute` は
         // `vector` 指定であることを呼び出し前に確定させているため、この
@@ -595,7 +612,7 @@ pub fn execute(
         // 生 `u32` を受け取り、内部で `validate_search_limit` を通す（多層
         // 防御としてここでも一度通し、範囲外を engine 呼び出し前に拒否する。
         // `bind_search`〔schema 依存の束縛〕側でも同じ検証が再度行われる）。
-        validate_search_limit(limit_raw)?;
+        validate_search_limit_with(limit_raw, &engine.result_limits())?;
         // `mode` の識別子形状検査・`SearchMode::parse_literal` はここでは
         // 行わない（cursor[bot] 指摘対応・PR #827）。以前はここで先に解析
         // していたため、テーブル未存在＋ `mode` 値不正の要求で `42P01` より
@@ -613,8 +630,13 @@ pub fn execute(
             question,
             mode_literal,
             limit_raw,
-            |schema, udfs| match bind_search(validated, schema, udfs)
-                .map_err(to_sql_surface_error)?
+            |schema, udfs| match bind_search_with_limits(
+                validated,
+                schema,
+                udfs,
+                &engine.result_limits(),
+            )
+            .map_err(to_sql_surface_error)?
             {
                 BoundSearch::Plan(plan) => {
                     let (metadata_filters, expr_filters, or_filters) =
@@ -638,7 +660,7 @@ pub fn execute(
     } else {
         let result =
             engine.execute_bound_search_in_session(ctx, &session, table, |schema, udfs| {
-                bind_vector_statement(validated, schema, udfs)
+                bind_vector_statement(validated, schema, udfs, &engine.result_limits())
             })?;
         Ok(result)
     }

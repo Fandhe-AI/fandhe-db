@@ -191,6 +191,50 @@ const MAX_BATCH_LOG_ROWS: usize = 1_000_000;
 /// （`55P03`）を返すまでの時間）。
 pub const DEFAULT_WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// CLI（`wire-server --write-lock-wait-ms`）で設定できる書き込みロック待機上限の下限
+/// （ミリ秒。Issue #1554・SQL-46 ポインタ。**暫定値でオーナー確認待ち**）。0 は
+/// 「待たない」「無制限」のどちらにも読めるため受け付けない。
+pub const MIN_WRITE_LOCK_WAIT_MS: u64 = 100;
+
+/// CLI で設定できる書き込みロック待機上限のハード上限（ミリ秒。Issue #1554。
+/// **暫定値でオーナー確認待ち**）。待機中は接続ハンドラのスレッドと同時接続枠を占有する
+/// ため、DoS の境界としてここで頭打ちにする。他の定数を参照しない独立リテラル
+/// （#1517 の方針）。60 秒なら `Instant::now() + timeout`（`writer_gate`）は
+/// オーバーフローしない。
+pub const MAX_WRITE_LOCK_WAIT_MS: u64 = 60_000;
+
+/// [`validate_write_lock_wait_ms`] が範囲外を拒否したときのエラー（Display は英語で
+/// 値と範囲だけを出す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteLockWaitOutOfRange {
+    pub value: u64,
+}
+
+impl std::fmt::Display for WriteLockWaitOutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "value {} is out of range {MIN_WRITE_LOCK_WAIT_MS}..={MAX_WRITE_LOCK_WAIT_MS}",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for WriteLockWaitOutOfRange {}
+
+/// 書き込みロック待機上限（ミリ秒）の範囲検証の単一情報源（Issue #1554）。
+/// wire-server の `write_lock_wait_opt` が数値へパースした後に呼ぶ。文字列パースは
+/// 呼び出し側の責務。範囲外は fail-closed で拒否する。
+pub fn validate_write_lock_wait_ms(
+    value: u64,
+) -> std::result::Result<std::time::Duration, WriteLockWaitOutOfRange> {
+    if (MIN_WRITE_LOCK_WAIT_MS..=MAX_WRITE_LOCK_WAIT_MS).contains(&value) {
+        Ok(std::time::Duration::from_millis(value))
+    } else {
+        Err(WriteLockWaitOutOfRange { value })
+    }
+}
+
 /// 永続化層の公開エラー型。`redb` の複数のエラー型（`DatabaseError` 等）はすべて
 /// `redb::Error` へ変換可能なため、それを内部に保持して一本化する。
 /// ライブラリコードとして panic せず、すべての失敗を `Result` で返す
@@ -741,12 +785,23 @@ impl Storage {
         &self.partitioned_jobs
     }
 
-    /// 書き込みロック待ちの上限（[`Self::writer_gate`]）を明示指定する（トランザクション
-    /// 上限を短くしたテスト・opt-in CLI 用）。既定値（[`DEFAULT_WRITE_LOCK_WAIT`]）を
+    /// 書き込みロック待ちの上限（[`Self::writer_gate`]）を明示指定する（短くしたテスト用。
+    /// 範囲検査はしない）。CLI 経路は `EngineCore::with_write_lock_wait` と
+    /// [`validate_write_lock_wait_ms`] を通る。既定値（[`DEFAULT_WRITE_LOCK_WAIT`]）を
     /// 使う場合は呼ぶ必要がない。
     pub fn with_write_lock_wait(mut self, wait: std::time::Duration) -> Self {
-        self.write_lock_wait = wait;
+        self.set_write_lock_wait(wait);
         self
+    }
+
+    /// 待機上限の差し替え（`EngineCore::with_write_lock_wait` から所有権を保ったまま使う）。
+    pub(crate) fn set_write_lock_wait(&mut self, wait: std::time::Duration) {
+        self.write_lock_wait = wait;
+    }
+
+    /// 現在の書き込みロック待機上限（読み取りのみ）。
+    pub fn write_lock_wait(&self) -> std::time::Duration {
+        self.write_lock_wait
     }
 
     /// 書き込みトランザクション生成の choke point（Issue #849）。
@@ -1759,6 +1814,37 @@ pub(crate) fn decode_row_for_key(key_tenant: &str, id: u64, raw: &[u8]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_lock_wait_validation_boundaries() {
+        assert!(validate_write_lock_wait_ms(0).is_err());
+        assert!(validate_write_lock_wait_ms(MIN_WRITE_LOCK_WAIT_MS - 1).is_err());
+        assert_eq!(
+            validate_write_lock_wait_ms(MIN_WRITE_LOCK_WAIT_MS),
+            Ok(std::time::Duration::from_millis(100))
+        );
+        assert_eq!(
+            validate_write_lock_wait_ms(MAX_WRITE_LOCK_WAIT_MS),
+            Ok(std::time::Duration::from_secs(60))
+        );
+        assert!(validate_write_lock_wait_ms(MAX_WRITE_LOCK_WAIT_MS + 1).is_err());
+        assert!(validate_write_lock_wait_ms(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn default_write_lock_wait_is_30s_and_within_range() {
+        assert_eq!(DEFAULT_WRITE_LOCK_WAIT, std::time::Duration::from_secs(30));
+        let ms = DEFAULT_WRITE_LOCK_WAIT.as_millis() as u64;
+        assert!((MIN_WRITE_LOCK_WAIT_MS..=MAX_WRITE_LOCK_WAIT_MS).contains(&ms));
+    }
+
+    #[test]
+    fn write_lock_wait_out_of_range_display_shows_only_value_and_range() {
+        assert_eq!(
+            WriteLockWaitOutOfRange { value: 99 }.to_string(),
+            "value 99 is out of range 100..=60000"
+        );
+    }
 
     fn sample_row(embedding: &[f32], metadata: &[u8]) -> Vec<u8> {
         sample_row_with_rls("tenant-a", Visibility::Public, embedding, metadata)

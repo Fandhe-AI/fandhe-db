@@ -171,22 +171,24 @@ fn try_alloc_bytes_for_budget(
 
 // `pool_depth = bound.limit.max(DEFAULT_HYBRID_POOL_DEPTH)` が常に
 // `hybrid::RrfConfig::new` の検証（`1..=hybrid::MAX_POOL_DEPTH`）を通過するのは、
-// `bound.limit` の上限（`core::MAX_SEARCH_K`。`sql::parser::bind` が検証済み）が
+// `bound.limit` の上限（設定可能なハード上限 `MAX_RESULT_ROWS_HARD_CAP`。`sql::parser::bind` が
+// 設定値 `<=` ハード上限で検証済み。Issue #1555）が
 // `hybrid::MAX_POOL_DEPTH` を超えない場合に限る。両定数は独立に管理されているため、
 // 片方だけの変更でこの前提が崩れないようコンパイル時に固定する
 // （`row_codec.rs`・`catalog.rs` の既存 `const _: () = assert!(...)` と同方針）。
 const _: () = assert!(
-    core::MAX_SEARCH_K <= hybrid::MAX_POOL_DEPTH,
-    "sql::exec's hybrid pool_depth derivation assumes core::MAX_SEARCH_K <= hybrid::MAX_POOL_DEPTH"
+    crate::result_limits::MAX_RESULT_ROWS_HARD_CAP <= hybrid::MAX_POOL_DEPTH,
+    "sql::exec's hybrid pool_depth derivation assumes MAX_RESULT_ROWS_HARD_CAP <= hybrid::MAX_POOL_DEPTH"
 );
 
 // `precision` 時の `k_eff`（SCALAR 事前フィルタ経路: `bound.limit.max(2)`。
 // SCALAR 事後フィルタ経路: `arena.ids().len().clamp(2, core::MAX_SEARCH_K)`。
-// いずれも「`LIMIT 1` でも Top-2 を取得する」ための下限が `2`）が常に
-// `core::MAX_SEARCH_K` の範囲内に収まることをコンパイル時に固定する
-// （`bound.limit` は `sql::parser::bind` が `1..=core::MAX_SEARCH_K` を検証済み、
-// 事後フィルタ経路は `.min(core::MAX_SEARCH_K)` で明示的にクランプ済みのため、
-// `k_eff` が `MAX_SEARCH_K` を超えるのは `MAX_SEARCH_K < 2` の場合のみ）。
+// いずれも「`LIMIT 1` でも Top-2 を取得する」ための下限が `2`）の事後フィルタ側が
+// `core::MAX_SEARCH_K`（内部固定の防御上限。明示 `LIMIT` の設定値とは連動しない。
+// Issue #1555）の範囲内に収まることをコンパイル時に固定する
+// （事後フィルタ経路は `.clamp(2, core::MAX_SEARCH_K)` で明示的にクランプ済みのため、
+// `MAX_SEARCH_K < 2` でない限り下限と矛盾しない。事前フィルタ経路の `bound.limit` は
+// 設定値 `<=` `MAX_RESULT_ROWS_HARD_CAP` で、上の assert により RRF 設定にも収まる）。
 const _: () = assert!(
     2 <= core::MAX_SEARCH_K,
     "sql::exec's precision k_eff derivation assumes core::MAX_SEARCH_K >= 2"
@@ -246,6 +248,12 @@ pub enum Cell {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnMeta {
     Id,
+    /// 別名付き疑似列 `id`（Issue #1540・SQL-42 の査読対応）。wire 上の型は `Id` と同じ
+    /// numeric で公告するが、サブクエリの値族判定では別名なしの `Id` と同じ整数族として
+    /// 扱うため、`Computed { Numeric }` とは別 variant で由来を保持する。
+    AliasedId {
+        name: String,
+    },
     Scalar {
         name: String,
         ty: ColumnType,
@@ -260,27 +268,69 @@ pub enum ColumnMeta {
     },
 }
 
-/// 束縛済み式の静的型から式列の [`ColumnMeta`] を作る（Issue #1173）。
+/// 式列の [`ColumnMeta`] を作る（Issue #1173・#1539）。
 ///
 /// 通常 SELECT 投影（`execute_statement`）・スキャン投影（`sql::scan`）・
-/// Describe（`sql::describe::projected_columns`）が共有する唯一の写像。式列の
-/// 実行時セルは `Cell::Float`（`Scalar`）・`Cell::Bool`・`Cell::Text`・
-/// `Cell::Date`・`Cell::Timestamp` になるため、それぞれ `DOUBLE PRECISION`・
-/// `BOOLEAN`・`TEXT`・`DATE`・`TIMESTAMP` として公告する。`Vector` 式は
-/// 静的な `ColumnType` を持たない（`VECTOR(N)` の次元が式から決まらない）ため
-/// `None`（wire では text フォールバック）にする。
-pub(crate) fn computed_column_meta(name: &str, ty: udf_call::ExprType) -> ColumnMeta {
-    let ty = match ty {
-        udf_call::ExprType::Scalar => Some(ColumnType::Double),
-        udf_call::ExprType::Bool => Some(ColumnType::Boolean),
-        udf_call::ExprType::Text => Some(ColumnType::Text),
-        udf_call::ExprType::Date => Some(ColumnType::Date),
-        udf_call::ExprType::Timestamp => Some(ColumnType::Timestamp),
-        udf_call::ExprType::Vector => None,
-    };
+/// Describe（`sql::describe::projected_columns`）が共有する唯一の写像。型は束縛時に
+/// 確定した結果列型 `result_ty`（[`crate::sql::udf_call::expr_result_column_type`]。
+/// 整数算術は `Integer`／`BigInt`、単精度は `Real`、それ以外は `Double`・`Boolean`・
+/// `Text`・`Date`・`Timestamp`）をそのまま公告する。`None`（`Vector` 式）は静的な
+/// `ColumnType` を持たない（`VECTOR(N)` の次元が式から決まらない）ため wire では text
+/// フォールバックになる。実行時セルは [`scalar_cell_for`] が同じ `result_ty` から作る。
+pub(crate) fn computed_column_meta(name: &str, result_ty: &Option<ColumnType>) -> ColumnMeta {
     ColumnMeta::Computed {
         name: name.to_string(),
-        ty,
+        ty: result_ty.clone(),
+    }
+}
+
+/// [`ColumnMeta::AliasedId`] が wire 上・型比較で公告する静的型（疑似列 `id` と同じ numeric）。
+pub(crate) static ALIASED_ID_TYPE: ColumnType = ColumnType::Numeric {
+    precision: 20,
+    scale: 0,
+};
+
+/// 別名付き疑似列 `id`（`ProjectedColumn::AliasedId`。Issue #1540・SQL-42）の結果列メタ。
+/// `ColumnMeta::Id` は名前を持てないため、専用の [`ColumnMeta::AliasedId`] で別名を公告する
+/// （wire 上の型 OID は `Id` と同じ numeric。サブクエリの値族判定では整数族を維持する。
+/// JOIN 経路の `meta_with_alias` と同じ写像。通常 SELECT・スキャン・Describe が共有する）。
+pub(crate) fn aliased_id_column_meta(name: &str) -> ColumnMeta {
+    ColumnMeta::AliasedId {
+        name: name.to_string(),
+    }
+}
+
+/// 式のスカラー評価値（f64）を結果列型に合わせたセルへ変換する（Issue #1539・SQL-42）。
+/// `Integer`／`BigInt` は整数値を `Cell::SignedInteger` に、それ以外は従来どおり
+/// `Cell::Float`。整数列型で値が整数でない・範囲外なのは束縛段の不変条件違反なので
+/// `Internal`（fail-closed。panic しない）。通常 SELECT・スキャン・`FROM` なし SELECT の
+/// 3 経路が共有する。
+pub(crate) fn scalar_cell_for(
+    v: f64,
+    result_ty: Option<&ColumnType>,
+) -> Result<Cell, SqlSurfaceError> {
+    const EXACT_MAX: f64 = 9_007_199_254_740_992.0; // 2^53
+    let invariant = |detail: &str| SqlSurfaceError::Internal {
+        detail: detail.to_string(),
+    };
+    match result_ty {
+        Some(ColumnType::Integer) => {
+            if v.is_finite() && v.fract() == 0.0 && v.abs() <= f64::from(i32::MAX) + 1.0 {
+                let i = i32::try_from(v as i64)
+                    .map_err(|_| invariant("integer projection value is out of range"))?;
+                Ok(Cell::SignedInteger(i64::from(i)))
+            } else {
+                Err(invariant("integer projection value is not an int4"))
+            }
+        }
+        Some(ColumnType::BigInt) => {
+            if v.is_finite() && v.fract() == 0.0 && v.abs() <= EXACT_MAX {
+                Ok(Cell::SignedInteger(v as i64))
+            } else {
+                Err(invariant("bigint projection value is not an exact int8"))
+            }
+        }
+        _ => Ok(Cell::Float(v)),
     }
 }
 
@@ -918,7 +968,9 @@ pub(crate) fn execute_statement_with_cache(
             // （`BoundExpr::TextColumnRef`）を持ちうるため、その列だけは下で
             // 個別に追加する（この `filter_map` 自体は単一列版のみを返せるため
             // `None` のまま素通しし、複数列を返せる下のループへ委ねる）。
-            ProjectedColumn::Id | ProjectedColumn::Computed { .. } => None,
+            ProjectedColumn::Id
+            | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::Computed { .. } => None,
         })
         .collect();
     for col in &bound.projection {
@@ -2529,6 +2581,7 @@ pub(crate) fn execute_statement_with_cache(
         .iter()
         .map(|col| match col {
             ProjectedColumn::Id => ColumnMeta::Id,
+            ProjectedColumn::AliasedId { name } => crate::sql::exec::aliased_id_column_meta(name),
             ProjectedColumn::Column { index, name } => ColumnMeta::Scalar {
                 name: name.clone(),
                 ty: schema
@@ -2537,7 +2590,9 @@ pub(crate) fn execute_statement_with_cache(
                     .map(|c| c.ty.clone())
                     .unwrap_or(ColumnType::Text),
             },
-            ProjectedColumn::Computed { name, ty, .. } => computed_column_meta(name, *ty),
+            ProjectedColumn::Computed {
+                name, result_ty, ..
+            } => computed_column_meta(name, result_ty),
         })
         .collect();
 
@@ -2836,7 +2891,9 @@ fn project_rows(
             ProjectedColumn::Computed { expr, .. } => {
                 Some(crate::sql::expr_program::ExprProgram::compile(expr))
             }
-            ProjectedColumn::Id | ProjectedColumn::Column { .. } => None,
+            ProjectedColumn::Id
+            | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::Column { .. } => None,
         })
         .collect();
     let mut expr_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
@@ -2945,7 +3002,9 @@ fn project_rows(
         let mut cells = Vec::with_capacity(projection.len());
         for (col_idx, col) in projection.iter().enumerate() {
             match col {
-                ProjectedColumn::Id => cells.push(Cell::Integer(id)),
+                ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {
+                    cells.push(Cell::Integer(id))
+                }
                 ProjectedColumn::Column { index, .. } => {
                     let column =
                         schema
@@ -3265,7 +3324,7 @@ fn project_rows(
                         },
                     }
                 }
-                ProjectedColumn::Computed { .. } => {
+                ProjectedColumn::Computed { result_ty, .. } => {
                     // TASK-79（SQL-9）: 結果列位置の式項目。候補選択と同一スナップショット
                     // の `id`・embedding で評価する（投影段は再取得を行わない既存契約と
                     // 同方針）。評価エラーはクエリ全体の失敗として fail-closed に伝播する
@@ -3280,7 +3339,9 @@ fn project_rows(
                                 .to_string(),
                         })?;
                     match program.eval(id, embedding, &row_scalars, &mut expr_scratch)? {
-                        udf_call::ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
+                        udf_call::ExprValue::Scalar(v) => {
+                            cells.push(scalar_cell_for(v, result_ty.as_ref())?)
+                        }
                         udf_call::ExprValue::Vector(v) => {
                             // Issue #352: `VectorRef` 単体評価は行データを借用する
                             // だけになった（確保ゼロ）ため、応答行として行データより

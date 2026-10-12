@@ -1147,7 +1147,7 @@ fn hybrid_recall_large_scale_regression() {
 /// ため、密側の再取得進行はこのラッパ経由でのみテストから観測できる
 /// （`hybrid.rs::MAX_FETCH_K` は `pub(crate)` のため本クレート外の統合テストからは
 /// 参照できない。可視集合サイズ [`LARGE_NUM_DOCS`] への到達有無で代用する:
-/// 本フィクスチャでは `MAX_FETCH_K`〔`MAX_POOL_DEPTH * 4` = 40,000〕が可視集合
+/// 本フィクスチャでは `MAX_FETCH_K`〔`MAX_POOL_DEPTH * 4` = 400,000〕が可視集合
 /// サイズ〔20,000〕を上回るため、再取得ループの実質的な上限は可視集合サイズで
 /// 頭打ちになる）。挙動そのものは変えない（`search` は無条件に `inner` へ委譲）。
 struct MaxKTrackingProvider {
