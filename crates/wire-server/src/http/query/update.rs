@@ -84,7 +84,7 @@ use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::recovery::required_op_id::OperationId;
-use engine::sql::allowlist::{InsertLiteral, SqlSurfaceError, ValidatedUpdate};
+use engine::sql::allowlist::{InsertLiteral, SetValue, SqlSurfaceError, ValidatedUpdate};
 use engine::sql::exec::UpdateOutcome;
 use engine::sql::parser::bind_update;
 
@@ -304,7 +304,12 @@ pub fn execute(
             table,
             Some(&operation_id),
             |schema| {
-                let assignments = map_set_assignments_for_engine(set, schema)?;
+                // NoSQL 表層の SET 値は常に平易なリテラル（式は SQL 表層のみ。
+                // Issue #1544 で `ValidatedUpdate::assignments` が `SetValue` になったため包む）。
+                let assignments = map_set_assignments_for_engine(set, schema)?
+                    .into_iter()
+                    .map(|(name, literal)| (name, SetValue::Literal(literal)))
+                    .collect();
                 let stmt = ValidatedUpdate {
                     table_name: table.to_string(),
                     assignments,

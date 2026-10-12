@@ -146,20 +146,27 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
    比較・BOOLEAN 列条件は対象外）
 5. `INSERT ... VALUES ($1, $2, ...)`（複数行含む。`VALUES` 節内の行リテラル
    位置のみ。行の括弧の直下の要素単独位置に限り、`upper($1)`・`1 + $1` 等の式の内側は `42601`。Issue #1543・#1546）
+6. `UPDATE <表> SET <列> = $n [, <列> = $m ...]`（先頭語が `UPDATE` の文の `SET`
+   節で、括弧深さ 0 の `(SET|,) <列> = $n (,|節末)` の形＝右辺全体が `$n` 単独の
+   位置のみ。`a = a + $1`・`upper($1)`・`f(x, b = $1)` 等の式の内側は `42601`。
+   式内 `$n` の型推論と `42P18` は Issue #1546 の担当。`$n` の型は対象列の型
+   〔`WhereColumn` と同じ列型解決〕。Issue #1544・SQL-45 のポインタ。位置判定と
+   型推論は `sql::params::set_param_slots` の 1 パスの表を共有する）
 
 `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
-`UPDATE ... SET a = $n`・`ON CONFLICT ... DO UPDATE SET a = $n`・hybrid 関数
+`ON CONFLICT ... DO UPDATE SET a = $n`・hybrid 関数
 引数（`HYBRID_RRF(col, $n, ...)`）・非等価比較（`id > $n` 等）はいずれも
 `sql::params::validate_param_positions` の位置判定に含めておらず、構造的に
 `42601` へ落ちる（`sql::params` の単体テスト・`crates/engine/tests/
 prepared_params.rs` で固定）。
 
-`WHERE` 節内の等価条件（パターン 4）と `SET`／`ON CONFLICT ... DO UPDATE SET`
-（拒否対象）は同じ `Ident '=' $n` の字面を持つため、`WHERE` キーワードの
-出現位置を境界とする範囲判定でのみ区別する（`UPDATE ... SET a = $n` の `SET`
-節は `WHERE` キーワードより前に現れるため対象外、`UPDATE ... SET a = 'x'
-WHERE b = $n` の `WHERE` 節内の等価条件は受理——後者は述語形 UPDATE／DELETE の
-`WHERE` にも同じ判定がそのまま適用される）。
+`WHERE` 節内の等価条件（パターン 4）と `SET`（パターン 6）は同じ
+`Ident '=' $n` の字面を持つため、`WHERE` キーワードの出現位置を境界とする範囲判定で
+区別する（`UPDATE ... SET a = $n` の `SET` 節は `WHERE` キーワードより前に現れ、
+パターン 6 の表で判定する。`UPDATE ... SET a = 'x' WHERE b = $n` の `WHERE` 節内の
+等価条件はパターン 4 で受理——後者は述語形 UPDATE／DELETE の `WHERE` にも同じ判定が
+そのまま適用される）。`ON CONFLICT ... DO UPDATE SET` は先頭語が `INSERT` のため
+パターン 6 の対象外（拒否のまま）。
 
 ## 値の形式（型付き置換。Issue #1342）
 
@@ -264,8 +271,8 @@ WHERE b = $n` の `WHERE` 節内の等価条件は受理——後者は述語形
   解消済み。
 - NULL パラメータ値の意味論的な位置別処理（`USING OPERATION_ID $n` へ NULL を
   「省略と同義」として通す等）。
-- 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較・`UPDATE ... SET
-  col = $n`・`ON CONFLICT ... SET`・hybrid 関数引数・`LIKE $n`）。
+- 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較・`ON CONFLICT ... SET`・
+  hybrid 関数引数・`LIKE $n`。`UPDATE ... SET col = $n` は Issue #1544 で受理済み）。
 - 層 B（psycopg 3／node pg／psql 実クライアントでの `make e2e-three-client`
   相当）→ **Issue #1176 で実施済み**（`crates/wire-server/tests/
   three_client_extended_e2e.rs`。`docs/design/three-client-e2e-harness.md`

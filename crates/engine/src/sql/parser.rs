@@ -3102,6 +3102,12 @@ pub struct BoundUpdate {
     /// SET 句の (`schema.columns` の列インデックス, 束縛済み値) 対応。宣言順を
     /// 保持する（並べ替えない）。
     pub assignments: Vec<(usize, crate::row_codec::Value)>,
+    /// SET 句のうち右辺が式のもの（Issue #1544・SQL-45 のポインタ）の
+    /// (`schema.columns` の列インデックス, 束縛済み式) 対応。`assignments`（リテラル）と
+    /// 合わせて SET 句全体になり、同じ列は両方に現れない（重複列は束縛段が拒否済み）。
+    /// 式は `tenant` の read-merge-write 段で**更新前の行値**に対して評価する。
+    /// **BREAKING CHANGE**（Issue #1544）: フィールドを追加した。
+    pub set_exprs: Vec<(usize, crate::sql::set_expr::BoundSetExpr)>,
     /// TASK-92（RECOVER-1）: [`ValidatedUpdate::operation_id`] をそのまま素通しする。
     /// `LedgerMode::Ledgered`（既定）では `sql::allowlist::validate_update` が既に
     /// `None` を `23502` で拒否済みのため常に `Some`。`CompareOnlyWithoutLedger`
@@ -3142,7 +3148,7 @@ pub fn bind_update(
     stmt: &crate::sql::allowlist::ValidatedUpdate,
     schema: &TableSchema,
 ) -> Result<BoundUpdate, SqlSurfaceError> {
-    let assignments = bind_set_assignments(&stmt.assignments, schema)?;
+    let (assignments, set_exprs) = bind_set_assignments(&stmt.assignments, schema)?;
 
     let id: u64 = stmt.id_literal.parse().map_err(|_| {
         SqlSurfaceError::invalid_input(format!("malformed id value: {}", stmt.id_literal))
@@ -3152,6 +3158,7 @@ pub fn bind_update(
         table: stmt.table_name.clone(),
         id,
         assignments,
+        set_exprs,
         operation_id: stmt.operation_id.clone(),
     })
 }
@@ -3161,14 +3168,26 @@ pub fn bind_update(
 /// Issue #869 で [`bind_update`] から抽出）。検出する違反・拒否コードは
 /// [`bind_update`] のドキュメントに記載のとおり（疑似列・RLS 内部列の SET 対象化は
 /// `42601`、それ以外の意味論的不正は `22000`）。
+///
+/// 右辺が式（[`crate::sql::allowlist::SetValue::Expr`]。Issue #1544・SQL-45 のポインタ）の
+/// 項は `sql::set_expr::bind_set_expr` で静的に型照合して第 2 要素へ分け、リテラル項は
+/// 従来の分岐で第 1 要素へ束縛する（疑似列・重複・未知列の判定順序は共通）。
+#[allow(clippy::type_complexity)]
 fn bind_set_assignments(
-    assignments: &[(String, InsertLiteral)],
+    assignments: &[(String, crate::sql::allowlist::SetValue)],
     schema: &TableSchema,
-) -> Result<Vec<(usize, crate::row_codec::Value)>, SqlSurfaceError> {
+) -> Result<
+    (
+        Vec<(usize, crate::row_codec::Value)>,
+        Vec<(usize, crate::sql::set_expr::BoundSetExpr)>,
+    ),
+    SqlSurfaceError,
+> {
     let mut seen_columns: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut bound: Vec<(usize, crate::row_codec::Value)> = Vec::with_capacity(assignments.len());
+    let mut bound_exprs: Vec<(usize, crate::sql::set_expr::BoundSetExpr)> = Vec::new();
 
-    for (name, literal) in assignments {
+    for (name, set_value) in assignments {
         if name == "id" || name == "tenant_id" || name == "visibility" {
             return Err(SqlSurfaceError::unsupported(format!(
                 "column {name:?} cannot be targeted by SET"
@@ -3188,6 +3207,16 @@ fn bind_set_assignments(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+        let literal = match set_value {
+            crate::sql::allowlist::SetValue::Literal(literal) => literal,
+            crate::sql::allowlist::SetValue::Expr(expr) => {
+                bound_exprs.push((
+                    col_idx,
+                    crate::sql::set_expr::bind_set_expr(name, expr, column, schema)?,
+                ));
+                continue;
+            }
+        };
         let value = match (&column.ty, literal) {
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
@@ -3353,7 +3382,7 @@ fn bind_set_assignments(
         bound.push((col_idx, value));
     }
 
-    Ok(bound)
+    Ok((bound, bound_exprs))
 }
 
 /// 1 文の `UPDATE`／`DELETE`（述語形。SQL-19・SQL-20 系）が変更してよい行数の
@@ -3744,6 +3773,8 @@ pub struct BoundPredicateUpdate {
     /// SET 句の (`schema.columns` の列インデックス, 束縛済み値) 対応。宣言順を
     /// 保持する（[`BoundUpdate::assignments`] と同じ契約）。
     pub(crate) assignments: Vec<(usize, crate::row_codec::Value)>,
+    /// SET 句のうち右辺が式のもの（[`BoundUpdate::set_exprs`] と同じ契約。Issue #1544）。
+    pub(crate) set_exprs: Vec<(usize, crate::sql::set_expr::BoundSetExpr)>,
     /// SCALAR 段で適用するメタデータフィルタ一覧（等価・前方一致、TASK-147・EXT-3）。
     pub(crate) metadata_filters: Vec<MetadataFilter>,
     /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済み。
@@ -3769,9 +3800,11 @@ impl BoundPredicateUpdate {
     /// 場合は、[`bind_update_form`] と同じ検証（SET／述語／`operation_id`）を
     /// 必ず実施したうえで [`BoundPredicateUpdate`] を返す**別の**公開 API を
     /// 新設し、本 `new` はその内部実装としてのみ使うこと。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         table: String,
         assignments: Vec<(usize, crate::row_codec::Value)>,
+        set_exprs: Vec<(usize, crate::sql::set_expr::BoundSetExpr)>,
         metadata_filters: Vec<MetadataFilter>,
         expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
         or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
@@ -3780,6 +3813,7 @@ impl BoundPredicateUpdate {
         Self {
             table,
             assignments,
+            set_exprs,
             metadata_filters,
             expr_filters,
             or_filters,
@@ -3795,6 +3829,12 @@ impl BoundPredicateUpdate {
     /// SET 句の (列インデックス, 束縛済み値) 対応（宣言順）。
     pub fn assignments(&self) -> &[(usize, crate::row_codec::Value)] {
         &self.assignments
+    }
+
+    /// SET 句のうち右辺が式のもの（`WHERE` 適用後の各行で更新前の行値に対して評価する。
+    /// Issue #1544・SQL-45 のポインタ）。
+    pub(crate) fn set_exprs(&self) -> &[(usize, crate::sql::set_expr::BoundSetExpr)] {
+        &self.set_exprs
     }
 
     /// SCALAR 段で適用するメタデータフィルタ一覧。
@@ -3869,7 +3909,7 @@ pub(crate) fn bind_predicate_update(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundPredicateUpdate, SqlSurfaceError> {
-    let assignments = bind_set_assignments(&predicate.assignments, schema)?;
+    let (assignments, set_exprs) = bind_set_assignments(&predicate.assignments, schema)?;
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
@@ -3903,6 +3943,7 @@ pub(crate) fn bind_predicate_update(
     Ok(BoundPredicateUpdate::new(
         predicate.table_name.clone(),
         assignments,
+        set_exprs,
         metadata_filters,
         expr_filters,
         or_filters,
@@ -8698,6 +8739,7 @@ mod tests {
         let bound = BoundPredicateUpdate::new(
             "documents".to_string(),
             vec![(1, crate::row_codec::Value::Text("x".to_string()))],
+            vec![],
             vec![],
             vec![],
             vec![],

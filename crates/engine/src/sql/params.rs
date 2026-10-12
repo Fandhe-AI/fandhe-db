@@ -24,9 +24,14 @@
 //! 5. `INSERT ... VALUES ($1, $2, ...)`（複数行含む。`VALUES` 節内の `(`/`,` と
 //!    `,`/`)` に挟まれた位置のみ。行の括弧の直下＝深さ 1 の要素単独位置に限る。
 //!    `upper($1)`・`1 + $1` 等の式の内側は Issue #1546 の担当で `42601`）
+//! 6. `UPDATE <表> SET <列> = $n [, <列> = $m ...]`（Issue #1544・SQL-45 のポインタ。
+//!    先頭語が `UPDATE` の文の `SET` 節の内側、括弧深さ 0 の `(SET|,) <列> = $n (,|節末)` の
+//!    形＝右辺全体が `$n` 単独の位置のみ。`a = a + $1`・`upper($1)`・`f(x, b = $1)` の
+//!    ように式の内側に置いた `$n` は Issue #1546 の担当で `42601`。
+//!    `INSERT ... ON CONFLICT ... DO UPDATE SET` は先頭語が `INSERT` のため対象外）
 //!
 //! `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
-//! `UPDATE ... SET a = $n`・`ON CONFLICT ... DO UPDATE SET a = $n`・hybrid 関数
+//! `ON CONFLICT ... DO UPDATE SET a = $n`・hybrid 関数
 //! 引数（`HYBRID_RRF(col, $n, ...)`）・非等価比較（`id > $n` 等）はいずれも
 //! スコープ外として `42601` で拒否する（後続 Issue へ申し送り。詳細は
 //! `docs/design/wire-extended-query-param-binding.md` 参照）。
@@ -423,6 +428,75 @@ fn values_param_slots(tokens: &[Token], start: usize, end: usize) -> HashMap<usi
     }
 }
 
+/// パターン 6（`UPDATE ... SET`）の受理範囲 `(SET の位置, 節末の位置)` を返す。
+/// 先頭語が `UPDATE`・3 番目のトークンが `SET` の文に限る（表名の直後の固定位置。
+/// 表名が `set` でも誤認しない）。節末は最初の `WHERE` キーワード（無ければ文末）。
+/// `INSERT ... ON CONFLICT ... DO UPDATE SET` は先頭語が `INSERT` のため `None`。
+fn set_region(tokens: &[Token]) -> Option<(usize, usize)> {
+    if !ident_eq_ignore_case(tokens.first(), "UPDATE")
+        || !ident_eq_ignore_case(tokens.get(2), "SET")
+    {
+        return None;
+    }
+    let end = tokens
+        .iter()
+        .enumerate()
+        .skip(3)
+        .find_map(|(idx, t)| {
+            matches!(t, Token::Keyword(crate::sql::lexer::Keyword::Where)).then_some(idx)
+        })
+        .unwrap_or(tokens.len());
+    Some((2, end))
+}
+
+/// `SET` 節を 1 パスで前向きに走査し、「括弧深さ 0 の `(SET|,) <列> = $n (,|節末)`」
+/// の `$n` のトークン添字から対象列名への表を返す（Issue #1544・SQL-45 のポインタ）。
+/// 右辺全体が `$n` 単独の位置だけが載り、式の内側（`a + $1`・`upper($1)`・
+/// `f(x, b = $1)`）は表に載らず `42601` で拒否される（式内 `$n` は Issue #1546 の担当）。
+/// 位置判定と型推論の双方が本表を共有する（`$n` ごとの再走査による二次時間を避ける）。
+fn set_param_slots(tokens: &[Token], start: usize, end: usize) -> HashMap<usize, String> {
+    let mut table: HashMap<usize, String> = HashMap::new();
+    let end = end.min(tokens.len());
+    let mut depth: usize = 0;
+    let mut k = start;
+    while k < end {
+        match tokens.get(k) {
+            Some(Token::Punct('(') | Token::Punct('[')) => depth = depth.saturating_add(1),
+            Some(Token::Punct(')') | Token::Punct(']')) => depth = depth.saturating_sub(1),
+            Some(Token::Ident(_)) if depth == 0 && k == start => {
+                set_slot_at(tokens, k, end, &mut table);
+            }
+            Some(Token::Punct(',')) if depth == 0 => {
+                set_slot_at(tokens, k, end, &mut table);
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    table
+}
+
+/// [`set_param_slots`] の 1 候補判定（`tokens[sep]` は `SET` または深さ 0 の `,`）。
+fn set_slot_at(tokens: &[Token], sep: usize, end: usize, table: &mut HashMap<usize, String>) {
+    let (
+        Some(Token::Ident(col) | Token::QuotedNull(col)),
+        Some(Token::Punct('=')),
+        Some(Token::Param(_)),
+    ) = (
+        tokens.get(sep + 1),
+        tokens.get(sep + 2),
+        tokens.get(sep + 3),
+    )
+    else {
+        return;
+    };
+    let next = sep + 4;
+    let terminated = next >= end || matches!(tokens.get(next), Some(Token::Punct(',')));
+    if terminated {
+        table.insert(sep + 3, col.clone());
+    }
+}
+
 /// `tokens` 中の `Token::Param` がすべて許可位置に収まっていることを検証し、
 /// 文が要求するパラメータ数（最大の `$n` 番号。1 始まり。`$n` が 1 つも
 /// 無ければ 0）を返す。
@@ -497,6 +571,12 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         None => (None, None),
     };
 
+    // パターン 6（UPDATE ... SET）も 1 パスの表で判定する（`$n` ごとの再走査をしない）。
+    let set_slots = match set_region(tokens) {
+        Some((start, end)) => set_param_slots(tokens, start, end),
+        None => HashMap::new(),
+    };
+
     // VALUES 領域は 1 パスで表を作り、`$n` ごとに再走査しない（二次時間防止）。
     let values_slots = match values_region {
         Some(start) => values_param_slots(tokens, start, values_region_end.unwrap_or(tokens.len())),
@@ -539,11 +619,15 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         // パターン 5: `INSERT ... VALUES (...)` の行内リテラル位置。
         let is_insert_value = values_slots.contains_key(&i);
 
+        // パターン 6: `UPDATE ... SET <col> = $n`（右辺全体が `$n` 単独の位置のみ）。
+        let is_update_set_value = set_slots.contains_key(&i);
+
         if !(is_distance
             || is_using_plan
             || is_operation_id
             || is_where_equality
-            || is_insert_value)
+            || is_insert_value
+            || is_update_set_value)
         {
             return Err(SqlSurfaceError::unsupported(format!(
                 "parameter placeholder ${n} is not supported at this position"
@@ -571,6 +655,8 @@ pub(crate) enum ParamPosition {
     WhereColumn(String),
     /// `INSERT ... VALUES` の行内 ordinal（0 始まり。列リストの添字に対応）。
     InsertValue(usize),
+    /// `UPDATE ... SET <列> = $n` の対象列名（Issue #1544）。
+    SetColumn(String),
 }
 
 /// `$n` の型公告（`ParameterDescription` の OID 決定と、バイナリ受理可否の
@@ -723,6 +809,10 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
         Some((start, end)) => values_param_slots(tokens, start, end),
         None => HashMap::new(),
     };
+    let set_slots = match set_region(tokens) {
+        Some((start, end)) => set_param_slots(tokens, start, end),
+        None => HashMap::new(),
+    };
     for (i, token) in tokens.iter().enumerate() {
         let Token::Param(n) = token else { continue };
         let Some(slot) = usize::from(*n).checked_sub(1).and_then(|k| out.get_mut(k)) else {
@@ -736,6 +826,10 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
         }
         if let Some(commas) = values_slots.get(&i) {
             slot.push(ParamPosition::InsertValue(*commas));
+            continue;
+        }
+        if let Some(col) = set_slots.get(&i) {
+            slot.push(ParamPosition::SetColumn(col.clone()));
             continue;
         }
         if let Some((start, end)) = where_bounds {
@@ -1296,8 +1390,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_update_set_position() {
-        assert!(positions("UPDATE documents SET lang = $1 WHERE id = 1").is_err());
+    fn accepts_update_set_position() {
+        // Issue #1544: 右辺全体が `$n` 単独の位置は受理する。
+        assert_eq!(
+            positions("UPDATE documents SET lang = $1 WHERE id = 1").unwrap(),
+            1
+        );
+        assert_eq!(
+            positions("UPDATE documents SET lang = $1, body = $2 WHERE id = $3").unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn rejects_update_set_position_inside_expression() {
+        // 式の内側の `$n` は Issue #1546 の担当（従来どおり `42601`）。
+        assert!(positions("UPDATE documents SET n = n + $1 WHERE id = 1").is_err());
+        assert!(positions("UPDATE documents SET n = $1 + 1 WHERE id = 1").is_err());
+        assert!(positions("UPDATE documents SET n = ($1) WHERE id = 1").is_err());
+        assert!(positions("UPDATE documents SET lang = upper($1) WHERE id = 1").is_err());
+        assert!(positions("UPDATE documents SET n = f(x, b = $1) WHERE id = 1").is_err());
+    }
+
+    #[test]
+    fn set_position_infers_target_column() {
+        let pos = positions_of("UPDATE documents SET lang = $1, body = $2 WHERE id = $3");
+        assert_eq!(pos[0], vec![ParamPosition::SetColumn("lang".to_string())]);
+        assert_eq!(pos[1], vec![ParamPosition::SetColumn("body".to_string())]);
+        assert_eq!(pos[2], vec![ParamPosition::WhereColumn("id".to_string())]);
     }
 
     #[test]

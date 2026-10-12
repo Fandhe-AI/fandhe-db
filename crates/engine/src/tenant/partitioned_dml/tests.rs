@@ -244,6 +244,7 @@ fn update_completes_and_leaves_non_matching_rows() {
         None,
         Kind::Update {
             assignments: &assignments,
+            set_exprs: &[],
         },
         match_x as Pred,
         &mut real_hooks(None),
@@ -1033,6 +1034,7 @@ fn unique_violation_rolls_back_only_the_failing_chunk() {
         None,
         Kind::Update {
             assignments: &assignments,
+            set_exprs: &[],
         },
         match_x as Pred,
         &mut real_hooks(None),

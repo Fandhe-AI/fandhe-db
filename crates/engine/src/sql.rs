@@ -165,6 +165,7 @@ pub(crate) mod ddl_column_type;
 /// SQL テキスト経由束縛と同一の実行意味論を共有する。第 2 の評価器を作らない）。
 pub mod declarative_predicate;
 pub(crate) mod describe;
+pub(crate) mod set_expr;
 // `SELECT DISTINCT`・`COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）が共有する
 // 正準キー化・予算管理。`allowlist`（構文の脱糖先）と `aggregate`／`group_by`
 // （`Accumulator::CountDistinct` の予算管理）の双方から参照される。

@@ -3940,6 +3940,10 @@ impl EngineCore {
                             .as_deref()
                             .and_then(|t| column_type(t, col))
                             .unwrap_or(PreparedParamType::Text),
+                        ParamPosition::SetColumn(col) => where_table
+                            .as_deref()
+                            .and_then(|t| column_type(t, col))
+                            .unwrap_or(PreparedParamType::Text),
                         ParamPosition::InsertValue(k) => match dummy_parsed {
                             ParsedSql::Insert(ins) => ins
                                 .columns
@@ -7665,6 +7669,11 @@ impl EngineCore {
         // 判定 5: engine 内部でのみ検証済み `ValidatedPredicateUpdate` を構築する
         // （`pub(crate)` フィールドは同一クレート内の struct リテラルで構築可能。
         // `#[non_exhaustive]` はクレート外からの構築のみを禁じる）。
+        // NoSQL 表層の SET 値は常に平易なリテラル（式は SQL 表層のみ。Issue #1544）。
+        let assignments = assignments
+            .into_iter()
+            .map(|(name, literal)| (name, crate::sql::allowlist::SetValue::Literal(literal)))
+            .collect();
         let validated = crate::sql::allowlist::ValidatedPredicateUpdate {
             table_name: table.to_string(),
             assignments,
@@ -7777,6 +7786,11 @@ impl EngineCore {
         reject_unsupported_predicate_dml_forms(&where_predicates)?;
         drop(read_txn);
 
+        // NoSQL 表層の SET 値は常に平易なリテラル（式は SQL 表層のみ。Issue #1544）。
+        let assignments = assignments
+            .into_iter()
+            .map(|(name, literal)| (name, crate::sql::allowlist::SetValue::Literal(literal)))
+            .collect();
         let validated = crate::sql::allowlist::ValidatedPredicateUpdate {
             table_name: table.to_string(),
             assignments,
@@ -9014,7 +9028,7 @@ impl EngineCore {
         limits: &crate::sql::parser::PartitionedDmlLimits,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let bound = crate::sql::parser::bind_predicate_update(stmt, schema, udfs)?;
-        let assignment_refs: Vec<(&str, &crate::sql::allowlist::InsertLiteral)> = stmt
+        let assignment_refs: Vec<(&str, &crate::sql::allowlist::SetValue)> = stmt
             .assignments()
             .iter()
             .map(|(name, literal)| (name.as_str(), literal))
@@ -9096,7 +9110,7 @@ impl EngineCore {
                 let schema = self.load_table_schema_for_dml(stmt.table_name())?;
                 let udfs = session.udfs();
                 crate::sql::parser::bind_predicate_update(stmt, &schema, udfs)?;
-                let assignment_refs: Vec<(&str, &crate::sql::allowlist::InsertLiteral)> = stmt
+                let assignment_refs: Vec<(&str, &crate::sql::allowlist::SetValue)> = stmt
                     .assignments()
                     .iter()
                     .map(|(name, literal)| (name.as_str(), literal))
@@ -9394,7 +9408,7 @@ impl EngineCore {
     > {
         let predicate = crate::sql::parser::bind_predicate_update(validated, schema, udfs)?;
 
-        let assignment_refs: Vec<(&str, &crate::sql::allowlist::InsertLiteral)> = validated
+        let assignment_refs: Vec<(&str, &crate::sql::allowlist::SetValue)> = validated
             .assignments()
             .iter()
             .map(|(name, literal)| (name.as_str(), literal))
