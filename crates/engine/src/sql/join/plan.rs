@@ -1030,6 +1030,12 @@ fn build_aggregate_shape(
                 return Err(SqlSurfaceError::ambiguous_column(h.item_name.as_str()))
             }
             (Some(i), None) => i,
+            // どの出力名にも一致しない＝未定義列（Issue #2332: 単一テーブル経路の
+            // `resolve_group_reference` と同じ 42703）。キー名だけに一致する場合は従来どおり
+            // 「集計項目でない」型不整合（22000）。
+            (None, _) if !key_hit => {
+                return Err(SqlSurfaceError::undefined_column(h.item_name.as_str()))
+            }
             (None, _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "HAVING target {:?} is not an aggregate item",

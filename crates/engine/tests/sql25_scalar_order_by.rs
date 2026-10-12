@@ -602,7 +602,7 @@ fn explain_error_codes_match_non_explain() {
     let core = new_core(storage);
 
     for (body, code) in [
-        ("SELECT id FROM docs ORDER BY nope LIMIT 5", "22000"),
+        ("SELECT id FROM docs ORDER BY nope LIMIT 5", "42703"),
         ("SELECT id FROM docs ORDER BY embedding LIMIT 5", "22000"),
         (
             "SELECT id FROM docs ORDER BY score, score, score, score, score, score, score, score, score LIMIT 5",
@@ -623,7 +623,7 @@ fn explain_error_codes_match_non_explain() {
     }
 }
 
-/// 未知列・`VECTOR` 列は `22000`。
+/// 未知列は `42703`、`VECTOR` 列は `22000`。
 #[test]
 fn unknown_and_vector_columns_are_rejected_with_22000() {
     let path = unique_db_path("order-reject-22000");
@@ -637,7 +637,7 @@ fn unknown_and_vector_columns_are_rejected_with_22000() {
         &core,
         &ctx,
         "SELECT id FROM docs ORDER BY nope LIMIT 5",
-        "22000",
+        "42703",
     );
     expect_sqlstate(
         &core,

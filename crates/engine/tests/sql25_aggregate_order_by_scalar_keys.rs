@@ -462,7 +462,7 @@ fn aggregate_order_by_rejects_unsupported_forms_and_unknown_names() {
             &ctx,
             "SELECT n, COUNT(*) AS c FROM t GROUP BY n ORDER BY c, nope"
         ),
-        "22000"
+        "42703"
     );
 }
 
@@ -643,7 +643,7 @@ fn group_by_vector_column_and_unknown_column_stay_rejected() {
     );
     assert_eq!(
         run_err(&core, &ctx, "SELECT ghost, COUNT(*) FROM t GROUP BY ghost"),
-        "22000"
+        "42703"
     );
 }
 

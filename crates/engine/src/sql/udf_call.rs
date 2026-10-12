@@ -1959,9 +1959,7 @@ fn bind_expr_in(
             if name == "id" {
                 return Ok((BoundExpr::IdRef, ExprType::Scalar));
             }
-            Err(SqlSurfaceError::invalid_input(format!(
-                "unknown column: {name}"
-            )))
+            Err(SqlSurfaceError::undefined_column(name))
         }
         Expr::Call { name, args } => bind_call(name, args, env, node_budget),
         Expr::Binary { op, lhs, rhs } => {

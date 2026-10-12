@@ -93,9 +93,7 @@ pub(crate) fn resolve_projection(
                         found = Some(i);
                     }
                 }
-                let idx = found.ok_or_else(|| SqlSurfaceError::InvalidInput {
-                    detail: format!("unknown column: {name}"),
-                })?;
+                let idx = found.ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
                 let meta = body_columns.get(idx).cloned().ok_or_else(internal_error)?;
                 indices.push(idx);
                 metas.push(meta);
@@ -515,9 +513,7 @@ fn plan_order(
                 found = Some(i);
             }
         }
-        let index = found.ok_or_else(|| SqlSurfaceError::InvalidInput {
-            detail: format!("unknown column: {}", key.column),
-        })?;
+        let index = found.ok_or_else(|| SqlSurfaceError::undefined_column(&key.column))?;
         let unsupported = || {
             SqlSurfaceError::invalid_input(format!(
                 "unsupported ORDER BY column type: {}",
@@ -971,7 +967,7 @@ mod tests {
     fn unknown_column_is_22000() {
         let p = Projection::Columns(vec!["nope".to_string()]);
         let err = run(result(), &view(p, vec![], vec![], 1, 0)).err().unwrap();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -1014,7 +1010,7 @@ mod tests {
             let err = run(result(), &view(Projection::All, preds, vec![], 10, 0))
                 .err()
                 .unwrap();
-            assert_eq!(err.wire_code(), "22000", "column={col}");
+            assert_eq!(err.wire_code(), "42703", "column={col}");
         }
     }
 
@@ -1052,7 +1048,7 @@ mod tests {
         let err = run(r, &view(Projection::All, preds, vec![], 10, 0))
             .err()
             .unwrap();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -1124,7 +1120,7 @@ mod tests {
             )
             .err()
             .unwrap();
-            assert_eq!(err.wire_code(), "22000", "column={col}");
+            assert_eq!(err.wire_code(), "42703", "column={col}");
         }
         // ORDER BY は LIMIT の前に適用される。
         let out = run(
@@ -1263,7 +1259,7 @@ mod tests {
         for col in ["id", "nope"] {
             let v = agg_view(vec![agg_item(AggregateFunc::Count, Some(col))], vec![]);
             let err = run(result(), &v).err().unwrap();
-            assert_eq!(err.wire_code(), "22000", "column={col}");
+            assert_eq!(err.wire_code(), "42703", "column={col}");
         }
     }
 
@@ -1309,6 +1305,6 @@ mod tests {
         let err = run(result(), &mk(vec![expr_key("id", false)]))
             .err()
             .unwrap();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 }

@@ -335,7 +335,7 @@ fn wire_buffered_view_outer_forms_and_chain() {
     assert_eq!(read_command_complete(&mut alice), "SELECT 1");
     read_ready_for_query(&mut alice);
 
-    // ErrorResponse の SQLSTATE（接続は維持される）: 非公開の物理キーは 22000、未対応の外側の形は
+    // ErrorResponse の SQLSTATE（接続は維持される）: 非公開の物理キーは 42703、未対応の外側の形は
     // 42601。
     send_simple_query(
         &mut alice,
@@ -344,7 +344,7 @@ fn wire_buffered_view_outer_forms_and_chain() {
     let _tag = read_command_complete(&mut alice);
     read_ready_for_query(&mut alice);
     send_simple_query(&mut alice, "SELECT COUNT(id) FROM no_id");
-    expect_error_response_with_sqlstate(&mut alice, "22000");
+    expect_error_response_with_sqlstate(&mut alice, "42703");
     read_ready_for_query(&mut alice);
     send_simple_query(&mut alice, "SELECT lower(lang) FROM top_docs LIMIT 5");
     expect_error_response_with_sqlstate(&mut alice, "42601");

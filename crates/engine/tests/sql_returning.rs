@@ -1284,7 +1284,7 @@ fn dml_returning_unknown_column_is_rejected_before_write() {
     ] {
         let err = run(&core, &alice, &mut session, &sql)
             .expect_err("unknown RETURNING column must be rejected");
-        assert_eq!(err.wire_code(), "22000", "{sql}");
+        assert_eq!(err.wire_code(), "42703", "{sql}");
     }
     assert_eq!(count_star(&core, &alice, TABLE), 1);
     let readback = core

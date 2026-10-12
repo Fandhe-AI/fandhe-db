@@ -669,7 +669,7 @@ fn rejects_unknown_column_in_projection() {
         &core,
         "tenant-a",
         "SELECT documents.nope FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
-        "22000",
+        "42703",
     );
 }
 

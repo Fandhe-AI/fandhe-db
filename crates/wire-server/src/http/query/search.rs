@@ -1023,7 +1023,7 @@ mod tests {
         );
         let validated = SEARCH_SCHEMA.validate(&value).expect("must validate shape");
         let err = bind_search(&validated, &schema_without_body, &udfs()).expect_err("must reject");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]

@@ -1026,7 +1026,7 @@ mod tests {
         let schema = schema_of(&v);
         let err = validate_and_build(&schema, &v.checks).expect_err("must reject");
         // 未知列は既存の WHERE 束縛エラー（`22000`）のまま。
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]

@@ -36,7 +36,7 @@
 //! 相関サブクエリ（内側が外側の列を非修飾名で参照する形）は束縛前の静的走査で
 //! `42601` にする（PostgreSQL の名前解決順と同じく、内側スキーマに無く外側の
 //! いずれかのスコープに有る列名を相関参照とみなす。どこにも無い名前は従来どおり
-//! 内側の束縛が `22000`〔unknown column〕で拒否する）。外側スコープは
+//! 内側の束縛が `42703`〔未定義列。Issue #2332〕で拒否する）。外側スコープは
 //! `outer_scopes`（末尾が直近の外側）としてネストの深さ分を引き回す。
 //!
 //! NULL 規則（三値論理。RLS 境界内＝可視行のみから決まる）:
@@ -1077,7 +1077,7 @@ fn inner_value_family(meta: &ColumnMeta) -> Option<SubqueryValueFamily> {
 
 /// `<column> [NOT] IN (SELECT ...)` の対象列 `column` を `outer_schema`（この
 /// サブクエリを含む文自身のテーブルのスキーマ）に対して検証し、列型（疑似列 `id` は
-/// 型なし＝`None`）と値族を返す。存在しない列は `22000`（`unknown column`。通常の
+/// 型なし＝`None`）と値族を返す。存在しない列は `42703`（未定義列。通常の
 /// `WHERE` 等価述語束縛と同じ文言・`wire_code`）、`IN` で扱えない型（`VECTOR`・配列・
 /// JSON）は同じく `22000` で拒否する。
 ///
@@ -1096,9 +1096,7 @@ fn validate_in_target_column<'a>(
         if column == "id" {
             return Ok((None, SubqueryValueFamily::Integer));
         }
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "unknown column: {column}"
-        )));
+        return Err(SqlSurfaceError::undefined_column(column));
     };
     match family_of_type(&column_def.ty) {
         Some(family) => Ok((Some(&column_def.ty), family)),
@@ -1733,9 +1731,7 @@ fn scalar_target_column<'a>(
             })?,
         )),
         None if column == "id" => Ok((None, SubqueryValueFamily::Integer)),
-        None => Err(SqlSurfaceError::invalid_input(format!(
-            "unknown column: {column}"
-        ))),
+        None => Err(SqlSurfaceError::undefined_column(column)),
     }
 }
 

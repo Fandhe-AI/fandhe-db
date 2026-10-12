@@ -64,8 +64,8 @@
 //!   委譲する
 //!
 //! 未知列は列名だけで完結する判定のため値の種類に関わらず
-//! `DeclarativeFilter::equals(column, "")` を engine へ渡し「unknown
-//! column」（`22000`）を得る（`bind_impl` が値の解釈より先に列解決を行う
+//! `DeclarativeFilter::equals(column, "")` を engine へ渡し「未定義
+//! 列」（`42703`）を得る（`bind_impl` が値の解釈より先に列解決を行う
 //! 契約に依拠）。
 //!
 //! `or` グループ内で RLS 述語名（`visible`／`visible()`）を指定することは
@@ -613,7 +613,7 @@ fn declare_leaf(
     schema: &TableSchema,
 ) -> Result<Vec<DeclarativePredicate>, FilterError> {
     let Some(col) = schema.columns.iter().find(|c| c.name == column) else {
-        // 未知列は op・値によらず engine の「unknown column」（`22000`）へ委譲する
+        // 未知列は op・値によらず engine の未定義列（`42703`）へ委譲する
         // （`not`／`ne` を通しても分類は変わらない）。
         return Ok(vec![DeclarativePredicate::Leaf(DeclarativeFilter::equals(
             column, "",
@@ -1376,7 +1376,7 @@ fn where_predicates_for_leaf(
     budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, FilterError> {
     let Some(col) = schema.columns.iter().find(|c| c.name == column) else {
-        // 未知列は filter 全体の事前検証が `22000` で拒否済みのため到達しない
+        // 未知列は filter 全体の事前検証が `42703` で拒否済みのため到達しない
         // （fail-closed フォールバック）。
         return Err(FilterError::Bind(SqlSurfaceError::Internal {
             detail: "unexpected unknown column after successful filter bind".to_string(),
@@ -1547,7 +1547,7 @@ fn where_predicates_for_node(
 ///
 /// 手順: (1) [`map_filter_items`] で形・語彙・RLS 述語名・上限を検査、(2) `search` と
 /// 同じ経路（[`declare_node`] → [`declarative_predicate::bind_declarative_predicates`]）で
-/// filter 全体を束縛して検証（型不一致 `42601`・未知列／非対応列 `22000` を `search` と同じ
+/// filter 全体を束縛して検証（型不一致 `42601`・未知列 `42703`・非対応列 `22000` を `search` と同じ
 /// 分類にする。engine は最終的に SQL の束縛器で再束縛する）、(3) [`where_predicates_for_node`]
 /// で構文形へ変換。述語形 DML の `content_hash`
 /// （[`engine::recovery::content_hash::for_update_where`]・`for_delete_where`）は束縛前の
@@ -1955,7 +1955,7 @@ mod tests {
     #[test]
     fn bind_filter_rejects_unknown_column() {
         let err = bind(r#"[{"column":"nope","op":"eq","value":"x"}]"#).expect_err("must reject");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -2353,7 +2353,7 @@ mod tests {
     fn unknown_column_is_rejected_before_where_predicate_mapping() {
         let items = filter_items(r#"[{"column":"missing","op":"eq","value":"x"}]"#);
         let err = bind_filter_where_predicates(&items, &predicate_schema()).expect_err("reject");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]

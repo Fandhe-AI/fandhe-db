@@ -424,7 +424,7 @@ fn outer_forms_reject_unexposed_id_unknown_and_vector_columns() {
         "SELECT DISTINCT embedding FROM with_vec",
     ] {
         let err = run(&core, "alice", sql).expect_err(sql);
-        assert_eq!(err.wire_code(), "22000", "sql={sql}");
+        assert_eq!(err.wire_code(), "42703", "sql={sql}");
     }
 }
 
@@ -546,9 +546,9 @@ fn chained_views_match_oracle_per_tenant() {
     }
     // 単純形の段が公開しない列は外側から参照できない（`22000`）。
     let err = run(&core, "alice", "SELECT body FROM v_simple LIMIT 1").expect_err("hidden col");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
     let err = run(&core, "alice", "SELECT COUNT(body) FROM v_s2").expect_err("hidden col");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
     // Describe は Execute と一致する（本文は実行しない）。
     for sql in [
         "SELECT id FROM v_simple LIMIT 10",
@@ -763,7 +763,7 @@ fn outer_window_functions_match_oracle_per_tenant() {
         "SELECT lang, ROW_NUMBER() OVER (ORDER BY nope) FROM no_id_w LIMIT 5",
     ] {
         let err = run(&core, "alice", sql).expect_err(sql);
-        assert_eq!(err.wire_code(), "22000", "sql={sql}");
+        assert_eq!(err.wire_code(), "42703", "sql={sql}");
     }
     // ウィンドウ別名を非公開の物理キー `id` と同名にしても、`WHERE`／`ORDER BY` で `id` を
     // 解決できるようにはならない（絞り込み・並べ替えの oracle にならない）。
@@ -774,7 +774,7 @@ fn outer_window_functions_match_oracle_per_tenant() {
         ),
         (
             "SELECT lang, ROW_NUMBER() OVER () AS id FROM no_id_w ORDER BY id LIMIT 5",
-            "22000",
+            "42703",
         ),
     ] {
         let err = run(&core, "alice", sql).expect_err(sql);
@@ -1056,7 +1056,7 @@ fn chained_body_expression_predicates_fail_closed() {
     )
     .expect("created; rejected at reference time");
     let err = run(&core, "alice", "SELECT * FROM no_id_w LIMIT 1").expect_err("hidden id");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 }
 
 /// Issue #1436: 式述語つきの連鎖ビューは再オープン後も同じ結果で参照できる。

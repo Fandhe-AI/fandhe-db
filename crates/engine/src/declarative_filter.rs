@@ -667,12 +667,11 @@ impl DeclarativeFilter {
             .columns
             .iter()
             .position(|c| c.name == self.column)
-            .ok_or_else(|| {
-                SqlSurfaceError::invalid_input(format!("unknown column: {}", self.column))
-            })?;
-        let column = schema.columns.get(column_index).ok_or_else(|| {
-            SqlSurfaceError::invalid_input(format!("unknown column: {}", self.column))
-        })?;
+            .ok_or_else(|| SqlSurfaceError::undefined_column(&self.column))?;
+        let column = schema
+            .columns
+            .get(column_index)
+            .ok_or_else(|| SqlSurfaceError::undefined_column(&self.column))?;
         let op = bind_filter_op(
             &self.op,
             &self.column,
@@ -1769,7 +1768,7 @@ mod tests {
         let err = DeclarativeFilter::equals("nope", "x")
             .bind(&schema())
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
