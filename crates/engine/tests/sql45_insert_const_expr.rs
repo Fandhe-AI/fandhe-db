@@ -190,3 +190,34 @@ fn null_operand_keeps_eval_errors_and_function_null_args() {
     );
     assert!(dbg(&rows[0][0]).contains('3'), "{:?}", rows[0][0]);
 }
+
+/// 単項 `+` 付き数値・`POSITION` の NULL 引数・`CASE WHEN` の NULL オペランドが
+/// 定数式として畳み込まれる（レビュー指摘対応）。
+#[test]
+fn unary_plus_position_null_and_case_when_null_fold() {
+    let (core, path, _session) = setup("sql45-plus-null");
+    let _guard = CleanupGuard(path);
+    let cols = "id, embedding, n";
+    for (i, v) in [
+        "+1+1",
+        "2*+1",
+        "(+1)+1",
+        "POSITION(NULL IN 'x')",
+        "CASE WHEN NULL = 1 THEN 2 ELSE 3 END",
+    ]
+    .iter()
+    .enumerate()
+    {
+        insert(
+            &core,
+            cols,
+            &format!("({}, {VEC}, {v})", i + 1),
+            &format!("op-p{i}"),
+        )
+        .unwrap_or_else(|e| panic!("{v}: {e}"));
+    }
+    assert_eq!(
+        insert(&core, cols, &format!("(9, {VEC}, +n)"), "op-p9").unwrap_err(),
+        "42601"
+    );
+}

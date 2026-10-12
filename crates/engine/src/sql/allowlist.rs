@@ -5701,6 +5701,23 @@ impl<'a> Parser<'a> {
                 self.consume_expr_node()?;
                 Ok(Expr::Number(format!("-{n}")))
             }
+            // Issue #1543: 定数式文脈（INSERT VALUES・DEFAULT）限定の符号付き数値
+            // リテラル `+` + Number。`expect_literal` が受理する `+1` の後に演算子が
+            // 続く形（`+1+1`）を式パーサでも解析できるよう 1 ノードの数値へ畳む。
+            // `+col`・`+(expr)` は従来どおり既定分岐で `42601`（fail-closed）。
+            Some(Token::Punct('+'))
+                if self.const_expr_null_args
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Number(_))) =>
+            {
+                self.advance();
+                let Some(Token::Number(n)) = self.advance().cloned() else {
+                    return Err(SqlSurfaceError::unsupported(
+                        "expected numeric literal after '+'",
+                    ));
+                };
+                self.consume_expr_node()?;
+                Ok(Expr::Number(n))
+            }
             // Issue #1538・SQL-42: 投影項目の式モード限定の一般単項マイナス。新しい `Expr`
             // variant を増やさず `0 - operand` へ脱糖する（VECTOR・DATE は `bind_binary` の
             // 型規則で `42804` に倒れる）。operand は primary のため `-n*2` は `(-n)*2`。
@@ -5839,9 +5856,12 @@ impl<'a> Parser<'a> {
             // `Expr::Null` の束縛が許可される 3 箇所に含まれないため、`NULL` は
             // ここでは常に列参照として解析する（`allow_null_literal` を強制的に
             // false にする。[`Self::allow_null_literal`] 参照）。
-            let lhs = self.parse_value_expr_with_null_context(depth + 1, false)?;
+            // 定数式文脈（INSERT VALUES・DEFAULT。Issue #1543）に限り `NULL` を
+            // 定数として解析する（`CASE WHEN NULL = 1 ...`）。
+            let when_null = self.const_expr_null_args;
+            let lhs = self.parse_value_expr_with_null_context(depth + 1, when_null)?;
             let op = self.expect_cmp_op()?;
-            let rhs = self.parse_value_expr_with_null_context(depth + 1, false)?;
+            let rhs = self.parse_value_expr_with_null_context(depth + 1, when_null)?;
             let cond = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
@@ -5977,7 +5997,9 @@ impl<'a> Parser<'a> {
             // 引数は `allow_null_literal` を強制的に `false` へ戻す設計との
             // 不整合）。`parse_value_expr_with_null_context` で明示的に `false`
             // を指定し、他の通常引数と同じ扱いに揃える。
-            let needle = self.parse_value_expr_with_null_context(depth + 1, false)?;
+            // 定数式文脈（Issue #1543）では通常関数と同じく `NULL` 引数を定数として扱う。
+            let pos_null = self.const_expr_null_args;
+            let needle = self.parse_value_expr_with_null_context(depth + 1, pos_null)?;
             match self.peek() {
                 Some(Token::Ident(kw)) if kw.eq_ignore_ascii_case("in") => {
                     self.advance();
@@ -5988,7 +6010,7 @@ impl<'a> Parser<'a> {
                     )))
                 }
             }
-            let haystack = self.parse_value_expr_with_null_context(depth + 1, false)?;
+            let haystack = self.parse_value_expr_with_null_context(depth + 1, pos_null)?;
             self.expect_punct(')')?;
             self.consume_expr_node()?;
             return Ok(Expr::Call {
