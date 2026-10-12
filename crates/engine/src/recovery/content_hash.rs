@@ -4421,8 +4421,8 @@ mod tests {
             .collect();
         for i in 0..hashes.len() {
             for j in (i + 1)..hashes.len() {
-                for path in 0..3 {
-                    assert_ne!(hashes[i][path], hashes[j][path], "binop {i} vs {j}");
+                for (path, (a, b)) in hashes[i].iter().zip(hashes[j].iter()).enumerate() {
+                    assert_ne!(a, b, "binop {i} vs {j}: path {path}");
                 }
             }
         }
