@@ -238,7 +238,10 @@ fn projection_subquery_static_and_context_rejections() {
         format!("SELECT name FROM {ITEMS} UNION ALL SELECT (SELECT name FROM {REFS} LIMIT 1) FROM {ITEMS}"),
     ] {
         let c = code(&core, &ctx, &sql);
-        assert!(c == "42601" || c == "22000", "sql={sql} code={c}");
+        assert!(
+            c == "42601" || c == "22000" || c == "42703",
+            "sql={sql} code={c}"
+        );
     }
     // ビュー本体: DDL 権限ゲート（42501）を通した上で形の拒否を確認する。
     let mut ddl_session = SessionState::default();
@@ -260,7 +263,7 @@ fn projection_subquery_static_and_context_rejections() {
             &ctx,
             &format!("SELECT (SELECT nope FROM {REFS} LIMIT 1) FROM {ITEMS} LIMIT 10")
         ),
-        "22000"
+        "42703"
     );
     let deep = format!(
         "SELECT (SELECT qty FROM {REFS} WHERE qty IN (SELECT qty FROM {REFS} WHERE qty IN \
@@ -366,10 +369,10 @@ fn projection_subquery_static_errors_win_over_deferred_runtime_error() {
     let overflow = format!("qty = (SELECT SUM(qty) FROM {REFS} WHERE qty > 100)");
     let inner_static = format!("(SELECT name FROM {REFS} WHERE nope = 1 AND {overflow} LIMIT 1)");
     let q = format!("SELECT name, {inner_static} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
-    assert_eq!(code(&core, &ctx, &q), "22000");
+    assert_eq!(code(&core, &ctx, &q), "42703");
     let inner = format!("(SELECT name FROM {REFS} WHERE {overflow} LIMIT 1)");
     let outer_static = format!("SELECT nope, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
-    assert_eq!(code(&core, &ctx, &outer_static), "22000");
+    assert_eq!(code(&core, &ctx, &outer_static), "42703");
 }
 
 /// 入れ子 WHERE のスカラーサブクエリが 2 行以上を返す `21000` も、外側 0 行なら発生せず、
@@ -430,10 +433,10 @@ fn projection_subquery_static_errors_win_over_deferred_cardinality() {
     let multi = format!("qty = (SELECT qty FROM {REFS} LIMIT 10)");
     let inner_static = format!("(SELECT name FROM {REFS} WHERE nope = 1 AND {multi} LIMIT 1)");
     let q = format!("SELECT name, {inner_static} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
-    assert_eq!(code(&core, &ctx, &q), "22000");
+    assert_eq!(code(&core, &ctx, &q), "42703");
     let inner = format!("(SELECT name FROM {REFS} WHERE {multi} LIMIT 1)");
     let outer_static = format!("SELECT nope, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
-    assert_eq!(code(&core, &ctx, &outer_static), "22000");
+    assert_eq!(code(&core, &ctx, &outer_static), "42703");
 }
 
 /// 先行サブクエリが 21000 でも、後続サブクエリの静的エラー（未知テーブル・未知列）は
@@ -650,7 +653,15 @@ fn projection_subquery_static_target_error_wins_over_multi_row_inner() {
         for inner in &inners {
             let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
             let c = code(&core, &ctx, &none);
-            assert_eq!(c, "22000", "{inner}");
+            assert_eq!(
+                c,
+                if pred.starts_with("nope") {
+                    "42703"
+                } else {
+                    "22000"
+                },
+                "{inner}"
+            );
             let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
             assert_eq!(code(&core, &ctx, &some), c, "{inner}");
         }
@@ -684,7 +695,15 @@ fn projection_subquery_static_target_error_wins_over_nested_inner_cardinality() 
         for inner in &inners {
             let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
             let c = code(&core, &ctx, &none);
-            assert_eq!(c, "22000", "{inner}");
+            assert_eq!(
+                c,
+                if pred.starts_with("nope") {
+                    "42703"
+                } else {
+                    "22000"
+                },
+                "{inner}"
+            );
             let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
             assert_eq!(code(&core, &ctx, &some), c, "{inner}");
         }
@@ -705,9 +724,9 @@ fn projection_subquery_or_leaf_static_error_wins_over_cardinality() {
         "(SELECT name FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) OR nope = 1 LIMIT 1)"
     );
     let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
-    assert_eq!(code(&core, &ctx, &none), "22000");
+    assert_eq!(code(&core, &ctx, &none), "42703");
     let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
-    assert_eq!(code(&core, &ctx, &some), "22000");
+    assert_eq!(code(&core, &ctx, &some), "42703");
 }
 
 /// 先頭で 21000 を起こし後続に多数のサブクエリ述語を置いても、エラー経路の静的検証は
@@ -755,14 +774,14 @@ fn projection_subquery_static_error_after_budget_sized_predicates_is_reported() 
             "qty = (SELECT qty FROM no_such_table LIMIT 1)".to_string(),
             "42P01",
         ),
-        (format!("qty = (SELECT nope FROM {REFS} LIMIT 1)"), "22000"),
+        (format!("qty = (SELECT nope FROM {REFS} LIMIT 1)"), "42703"),
         (
             format!("name IN (SELECT qty FROM {REFS} LIMIT 10)"),
             "22000",
         ),
         (
             format!("EXISTS (SELECT qty FROM {REFS} WHERE nope = 1 LIMIT 1)"),
-            "22000",
+            "42703",
         ),
     ];
     for (bad, expected) in &bads {
@@ -797,7 +816,7 @@ fn projection_subquery_static_error_inside_exists_wins_over_nested_cardinality()
     );
     let inner = format!("(SELECT name FROM {REFS} WHERE {exists} LIMIT 1)");
     let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
-    assert_eq!(code(&core, &ctx, &none), "22000");
+    assert_eq!(code(&core, &ctx, &none), "42703");
     let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
-    assert_eq!(code(&core, &ctx, &some), "22000");
+    assert_eq!(code(&core, &ctx, &some), "42703");
 }

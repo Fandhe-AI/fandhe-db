@@ -116,7 +116,7 @@ fn drop_column_succeeds_and_column_disappears() {
     let err = core
         .execute_sql(&ctx(), &format!("SELECT note FROM {TABLE} LIMIT 1"))
         .expect_err("dropped column must be unknown");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
     let rows = core
         .execute_sql(&ctx(), &format!("SELECT qty FROM {TABLE} LIMIT 10"))
         .expect("select qty");

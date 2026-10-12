@@ -1079,7 +1079,7 @@ fn scalar_order_by_with_window_rejects_unsupported_combinations() {
         &core,
         &ctx,
         "SELECT id, ROW_NUMBER() OVER () FROM docs ORDER BY nope LIMIT 10",
-        "22000",
+        "42703",
     );
     // キー 9 個。
     expect_rejected(

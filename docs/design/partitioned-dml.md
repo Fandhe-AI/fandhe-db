@@ -364,6 +364,9 @@ UPDATE／DELETE を kill するシナリオはない（F14）。
 - **#1131 の結論**: `crash_tool_partitioned_dml`・`scripts/crash_test_partitioned_dml.sh`・Makefile ターゲット
   `crash-test-partitioned-dml` を追加した。全体で 1 秒前後（既定 2 セット）と短いため `make ci` と ci.yml の
   独立ジョブに入れた。既存の crash-test 系は変更していない。
+  その後 `update-null`（Issue #1525）・`update-expr`（Issue #1545。`SET n = n + 1` の二重適用検出と
+  式違い再送の `22023`）モードを追加し、既定は 4 セット（セット番号 mod 4 で
+  delete／update／update-null／update-expr）。
 
 ## 10. 論点 8: NoSQL 表層とのパリティ
 

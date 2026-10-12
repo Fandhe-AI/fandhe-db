@@ -273,7 +273,7 @@ fn unknown_and_non_alias_order_by_unchanged() {
     let (core, ctx, _g) = setup();
     assert_eq!(
         code(&core, &ctx, "SELECT n AS x FROM t ORDER BY nope LIMIT 10"),
-        "22000"
+        "42703"
     );
     // 別名のない文は従来どおり入力列で解決する。
     assert_eq!(

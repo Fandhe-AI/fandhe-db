@@ -963,7 +963,7 @@ fn scalar_order_by_aggregate_explain_error_codes_match_non_explain() {
         ),
         (
             "SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang ORDER BY c, nope".into(),
-            "22000",
+            "42703",
         ),
         (nine_keys, "54000"),
         (

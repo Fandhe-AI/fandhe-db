@@ -485,9 +485,15 @@ fn type_mismatches_are_rejected_with_22000() {
     ];
     for body in cases {
         let resp = query_as_alice(addr, body);
+        // 未知列（`nope`）は 42703、型不正（VECTOR・HAVING の型不整合）は 22000。
+        let expected = if String::from_utf8_lossy(body).contains(r#""nope""#) {
+            "42703"
+        } else {
+            "22000"
+        };
         assert_eq!(
             http_common::wire_code_of(&resp),
-            "22000",
+            expected,
             "body={} resp={resp:?}",
             String::from_utf8_lossy(body)
         );

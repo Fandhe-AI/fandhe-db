@@ -436,7 +436,7 @@ fn bound_aggregate_item_bind_rejects_unknown_column() {
         &schema_val,
     )
     .expect_err("unknown column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 }
 
 // --- Issue #769・TASK-186・NOSQL-5: `BoundAggregate::new_grouped`
@@ -559,7 +559,11 @@ fn bound_aggregate_new_grouped_rejects_non_text_group_by_column() {
             &schema_val,
         )
         .expect_err("non-TEXT group by column must be rejected");
-        assert_eq!(err.wire_code(), "22000", "column={column}");
+        assert_eq!(
+            err.wire_code(),
+            if column == "nope" { "42703" } else { "22000" },
+            "column={column}"
+        );
     }
     // Issue #1185: 疑似列 `id` はグループキーとして受理される。
     BoundAggregate::new_grouped(

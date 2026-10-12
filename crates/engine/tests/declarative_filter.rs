@@ -418,7 +418,7 @@ fn ext3_rejects_vector_column_and_unknown_column_with_22000() {
             "SELECT * FROM docs WHERE nope = 'x' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
         )
         .expect_err("equality against an unknown column must be rejected");
-    assert_eq!(unknown_col.wire_code(), "22000");
+    assert_eq!(unknown_col.wire_code(), "42703");
 }
 
 // --- EXT-3: 未対応の LIKE 形状は 42601 -----------------------------------------------

@@ -354,7 +354,7 @@ fn unknown_column_is_rejected_with_22000() {
 
     let body = br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"sum","column":"nope"}]}"#;
     let resp = query_as_alice(addr, body);
-    assert_eq!(http_common::wire_code_of(&resp), "22000", "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "42703", "resp={resp:?}");
 }
 
 #[test]

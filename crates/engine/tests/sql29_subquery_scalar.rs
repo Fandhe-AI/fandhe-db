@@ -388,7 +388,7 @@ fn scalar_static_validation_and_unsupported_forms() {
         // 値族の不一致（TEXT 列と整数）。行数に依存しない。
         (format!("SELECT id FROM {ITEMS} WHERE name = (SELECT qty FROM {REFS} LIMIT 1) LIMIT 100"), "22000"),
         // 未知の対象列。
-        (format!("SELECT id FROM {ITEMS} WHERE nope = (SELECT qty FROM {REFS} LIMIT 1) LIMIT 100"), "22000"),
+        (format!("SELECT id FROM {ITEMS} WHERE nope = (SELECT qty FROM {REFS} LIMIT 1) LIMIT 100"), "42703"),
         // 逆向き比較・式への埋め込み・投影位置の式内への埋め込み
         // （項目全体の投影位置サブクエリは Issue #1352 で対応。`sql29_projection_subquery.rs`）。
         (format!("SELECT id FROM {ITEMS} WHERE (SELECT qty FROM {REFS} LIMIT 1) < qty LIMIT 100"), "42601"),
@@ -472,7 +472,7 @@ fn correlated_subqueries_are_rejected_with_42601() {
         &ctx,
         &format!("SELECT id FROM {ITEMS} WHERE qty IN (SELECT qty FROM {REFS} WHERE label = nowhere LIMIT 10) LIMIT 100"),
     );
-    assert_eq!(code, "22000");
+    assert_eq!(code, "42703");
     // 内外に同名の列がある場合は内側を優先して受理する（`name` は両方に有る）。
     assert_eq!(
         ids(

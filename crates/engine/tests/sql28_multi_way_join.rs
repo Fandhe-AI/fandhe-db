@@ -877,7 +877,7 @@ fn aggregate_type_and_name_errors_use_the_single_table_classification() {
     assert_rejected(
         &core,
         &format!("SELECT dept.dname, COUNT(*) AS n {base} GROUP BY dept.dname HAVING zz > 1"),
-        "22000",
+        "42703",
     );
     // 同名の集計項目が複数ある別名は、ORDER BY・HAVING とも曖昧として拒否する
     // （先頭の集計値へ黙って解決しない。単一テーブル集計と同じ 42702。Issue #1270）。
@@ -901,7 +901,7 @@ fn aggregate_type_and_name_errors_use_the_single_table_classification() {
     assert_rejected(
         &core,
         &format!("SELECT dept.dname, COUNT(*) AS n {base} GROUP BY dept.dname ORDER BY zz"),
-        "22000",
+        "42703",
     );
     assert_rejected(
         &core,
@@ -1253,8 +1253,8 @@ fn group_reference_resolution_matches_between_single_table_and_join() {
         Case {
             select: "{k}, COUNT(*) AS n",
             name: "zz",
-            having: "22000",
-            order: "22000",
+            having: "42703",
+            order: "42703",
         },
     ];
     for c in &cases {

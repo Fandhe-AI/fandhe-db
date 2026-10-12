@@ -354,7 +354,15 @@ fn scan_order_by_expression_error_contract() {
         "SELECT id FROM docs ORDER BY lower(nosuchcol) LIMIT 3",
         "SELECT id FROM docs ORDER BY vec_div(embedding, 2) LIMIT 3",
     ] {
-        assert_eq!(run_err(&core, &ctx, sql), "22000", "{sql}");
+        assert_eq!(
+            run_err(&core, &ctx, sql),
+            if sql.contains("nosuchcol") {
+                "42703"
+            } else {
+                "22000"
+            },
+            "{sql}"
+        );
     }
     // 未知の関数名は構文エラー（42601）にはならず束縛段で拒否される。
     let unknown = run_err(
@@ -462,7 +470,7 @@ fn scan_order_by_expression_respects_view_column_scope() {
             "SELECT title FROM v ORDER BY lower(lang) LIMIT 3",
         )
         .expect_err("hidden column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 }
 
 // ---------- GROUP BY 集計の HAVING／ORDER BY 式 ----------
@@ -555,7 +563,7 @@ fn having_and_order_by_expression_error_contract() {
         format!("{AGG} HAVING lower(title) = 'a'"),
         format!("{AGG} ORDER BY lower(title)"),
     ] {
-        assert_eq!(run_err(&core, &ctx, &sql), "22000", "{sql}");
+        assert_eq!(run_err(&core, &ctx, &sql), "42703", "{sql}");
     }
     // 出力名が複数一致する識別子は式形でも 42702（Issue #1270）。未知名は上で 22000。
     for tail in ["ORDER BY abs(t)", "HAVING abs(t) > 0"] {
@@ -812,7 +820,7 @@ fn expression_order_by_and_having_over_views() {
     ] {
         assert_eq!(
             session_err(&core, &ctx, &mut session, sql),
-            "22000",
+            "42703",
             "{sql}"
         );
     }

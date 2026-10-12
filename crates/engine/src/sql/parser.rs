@@ -1028,12 +1028,12 @@ pub(crate) fn text_column_index(
         .columns
         .iter()
         .position(|c| c.name == name)
-        .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))
+        .ok_or_else(|| SqlSurfaceError::undefined_column(name))
         .and_then(|idx| {
             let column = schema
                 .columns
                 .get(idx)
-                .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+                .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
             match &column.ty {
                 ColumnType::Text | ColumnType::Varchar => Ok(idx),
                 ColumnType::Vector(_)
@@ -1066,7 +1066,7 @@ pub(crate) fn text_column_index(
 /// NoSQL 表層に式項目（UDF 呼び出し）は存在しないため空の
 /// [`crate::sql::udf_call::UdfRegistry`] で足りる（`bind_projection` が返す
 /// [`ProjectedColumn::Computed`] へは到達しない）。実カラム優先・疑似列
-/// `id`・未知列 `22000` の判定規則は SQL 表層と完全に共有する
+/// `id`・未知列 `42703` の判定規則は SQL 表層と完全に共有する
 /// （第 2 の実行器を作らない方針）。
 pub fn bind_column_projection(
     columns: Option<&[String]>,
@@ -1200,9 +1200,7 @@ fn bind_ranking(
                 .columns
                 .iter()
                 .position(|c| &c.name == column)
-                .ok_or_else(|| {
-                    SqlSurfaceError::invalid_input(format!("unknown column: {column}"))
-                })?;
+                .ok_or_else(|| SqlSurfaceError::undefined_column(column))?;
             if column_idx != vec_idx {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {column:?} is not the table's VECTOR column"
@@ -1240,9 +1238,7 @@ fn bind_ranking(
                 .columns
                 .iter()
                 .position(|c| c.name == *vec_col)
-                .ok_or_else(|| {
-                    SqlSurfaceError::invalid_input(format!("unknown column: {vec_col}"))
-                })?;
+                .ok_or_else(|| SqlSurfaceError::undefined_column(vec_col))?;
             if vec_col_idx != vec_idx {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {vec_col:?} is not the table's VECTOR column"
@@ -1396,9 +1392,7 @@ fn resolve_projected_column(
             }
         });
     }
-    Err(SqlSurfaceError::invalid_input(format!(
-        "unknown column: {name}"
-    )))
+    Err(SqlSurfaceError::undefined_column(name))
 }
 
 /// `WHERE` 句の許可述語列（[`WherePredicate`]）を束縛する共通ヘルパー
@@ -1471,7 +1465,7 @@ fn declarative_leaf_to_filter(
             // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の `=` は
             // 算術を持たない宣言的経路（レーン B。TABLE-13・TASK-199、
             // Issue #891）へ振り分ける。列が未知の場合（後続の `bind_all`
-            // が「unknown column」で拒否する既存契約）はそのまま
+            // が未定義列（`42703`）で拒否する既存契約）はそのまま
             // `DeclarativeFilter::equals` へ流し、挙動を変えない。
             let column_ty = schema
                 .columns
@@ -2781,11 +2775,11 @@ fn bind_insert_row(
             .columns
             .iter()
             .position(|c| &c.name == name)
-            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+            .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let column = schema
             .columns
             .get(col_idx)
-            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+            .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let value = match (&column.ty, literal) {
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
@@ -3120,9 +3114,9 @@ pub struct BoundUpdate {
 /// `Storage::get_table_schema` で取得済みのものを渡す想定（`bind_insert` と同じ
 /// 契約）。
 ///
-/// 検出する違反はすべて [`SqlSurfaceError::InvalidInput`]（`22000`）:
+/// 検出する違反はすべて [`SqlSurfaceError::InvalidInput`]（`22000`。未知の列名のみ `42703`）:
 /// SET 対象列に疑似列 `id`・RLS 内部列 `tenant_id`／`visibility` を指定（構造上
-/// スキーマに存在しない列だが、`22000`「unknown column」ではなく専用の判定を
+/// スキーマに存在しない列だが、`42703`「未定義列」ではなく専用の判定を
 /// 先に行い `42601` で拒否する。下記参照）・SET 内の列名重複・未知の列名・
 /// 列型とリテラル種別の不一致（`VECTOR` 列に数値、`TEXT` 列にベクトルリテラルを
 /// 渡す等）・`id` 値が `u64` として解釈不能（範囲外を含む）。ベクトルリテラル
@@ -3202,11 +3196,11 @@ fn bind_set_assignments(
             .columns
             .iter()
             .position(|c| &c.name == name)
-            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+            .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let column = schema
             .columns
             .get(col_idx)
-            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+            .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let literal = match set_value {
             crate::sql::allowlist::SetValue::Literal(literal) => literal,
             crate::sql::allowlist::SetValue::Expr(expr) => {
@@ -4351,11 +4345,11 @@ fn bind_upsert_assignments(
             .columns
             .iter()
             .position(|c| &c.name == name)
-            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+            .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let column = schema
             .columns
             .get(col_idx)
-            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+            .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
 
         let bound_value = match value {
             UpsertValue::Excluded(src) => {
@@ -4368,12 +4362,11 @@ fn bind_upsert_assignments(
                     .columns
                     .iter()
                     .position(|c| &c.name == src)
-                    .ok_or_else(|| {
-                        SqlSurfaceError::invalid_input(format!("unknown column: {src}"))
-                    })?;
-                let src_column = schema.columns.get(src_idx).ok_or_else(|| {
-                    SqlSurfaceError::invalid_input(format!("unknown column: {src}"))
-                })?;
+                    .ok_or_else(|| SqlSurfaceError::undefined_column(src))?;
+                let src_column = schema
+                    .columns
+                    .get(src_idx)
+                    .ok_or_else(|| SqlSurfaceError::undefined_column(src))?;
                 if !src_column.ty.same_value_domain(&column.ty) {
                     return Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} and EXCLUDED.{src} have mismatched types"
@@ -4583,11 +4576,11 @@ fn bind_file_insert(
             .columns
             .iter()
             .position(|c| &c.name == name)
-            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+            .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let column = schema
             .columns
             .get(col_idx)
-            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+            .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let value = match (&column.ty, literal) {
             (ColumnType::Text | ColumnType::Varchar, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
@@ -5596,9 +5589,7 @@ fn resolve_aggregate_input(
                     _ => Ok(AggregateInput::IdU64),
                 };
             }
-            Err(SqlSurfaceError::invalid_input(format!(
-                "unknown column: {name}"
-            )))
+            Err(SqlSurfaceError::undefined_column(name))
         }
         AggregateArg::Expr(expr) => {
             let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
@@ -5730,9 +5721,7 @@ fn resolve_count_distinct_input(
             if name == "id" {
                 return Ok(AggregateInput::IdU64);
             }
-            Err(SqlSurfaceError::invalid_input(format!(
-                "unknown column: {name}"
-            )))
+            Err(SqlSurfaceError::undefined_column(name))
         }
         AggregateArg::Expr(expr) => {
             let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
@@ -6205,10 +6194,7 @@ fn bind_scalar_order_by(
             });
             continue;
         }
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "unknown column: {}",
-            key.column
-        )));
+        return Err(SqlSurfaceError::undefined_column(&key.column));
     }
     Ok(bound)
 }
@@ -6644,9 +6630,7 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
     if name == "id" {
         return Ok(WindowKeyRef::Id);
     }
-    Err(SqlSurfaceError::invalid_input(format!(
-        "unknown column: {name}"
-    )))
+    Err(SqlSurfaceError::undefined_column(name))
 }
 
 /// [`crate::sql::allowlist::WindowSelectItem`] を `schema`・UDF レジストリ `udfs`
@@ -6992,8 +6976,8 @@ pub(crate) fn bind_scan_with_dummy_flags(
 /// `GROUP BY` 列名を `schema` と照合しグループキー（[`BoundOrderKey`]）へ解決する
 /// （TASK-167・SQL-14。Issue #1185・SQL-25 (d) で `TEXT` 限定を外した）。
 /// 実カラムを疑似列 `id` より優先して照合し（[`bind_scalar_order_by`] と同じ規則）、
-/// 並べ替え不能な型（`VECTOR`・`ARRAY`・`BYTEA`・`JSON`／`JSONB`）と未知列は型不整合
-/// `22000` で拒否する。SQL テキスト経由の [`bind_group_by_clause`] と直接構築経由の
+/// 並べ替え不能な型（`VECTOR`・`ARRAY`・`BYTEA`・`JSON`／`JSONB`）は型不整合
+/// `22000`、未知列は未定義列 `42703`（Issue #2332）で拒否する。SQL テキスト経由の [`bind_group_by_clause`] と直接構築経由の
 /// [`BoundAggregate::new_grouped_by_columns`]（TASK-186・NOSQL-5）が共有する単一実装。
 fn resolve_group_by_key(
     schema: &TableSchema,
@@ -7020,7 +7004,9 @@ fn resolve_group_by_key(
             descending: false,
         });
     }
-    Err(reject())
+    // スキーマ実列でも `id` でもない＝未定義列（Issue #2332: `42703`）。
+    // 型が並べ替え不能な実列（VECTOR 等）の `22000` とは分類を分ける。
+    Err(SqlSurfaceError::undefined_column(column))
 }
 
 /// `HAVING` が数値比較できる集計結果を指しているかを検証する（TASK-167・
@@ -7065,7 +7051,7 @@ pub(crate) fn check_having_target_is_numeric(
 /// SQL テキスト経由の [`bind_group_by_clause`] と、直接構築経由の
 /// [`BoundAggregate::with_group_order_by`]（Issue #1198・NOSQL-15）が共有する
 /// 単一実装。`key_names` は宣言順の `GROUP BY` 列名、`group_key_aliases` は
-/// SELECT リスト側のキー別名（直接構築経路では空）。一致 0 件は `22000`、複数一致
+/// SELECT リスト側のキー別名（直接構築経路では空）。一致 0 件は未定義列 `42703`（Issue #2332。JOIN 経路のスカラー ORDER BY と分類を揃える）、複数一致
 /// （重複した集計名・キー別名の重複・キーと集計項目の衝突）は `42702`
 /// （Issue #1270・SQL-28／ERR-6。エコーするのは呼び出し元が識別子形状検査済みの名前のみ）。
 fn resolve_group_reference<S: AsRef<str>>(
@@ -7094,9 +7080,7 @@ fn resolve_group_reference<S: AsRef<str>>(
     match (key_matches.as_slice(), item_matches.as_slice()) {
         ([key_idx], []) => Ok(OrderTarget::GroupKey(*key_idx)),
         ([], [idx]) => Ok(OrderTarget::Aggregate(*idx)),
-        ([], []) => Err(SqlSurfaceError::invalid_input(format!(
-            "unknown GROUP BY reference: {name}"
-        ))),
+        ([], []) => Err(SqlSurfaceError::undefined_column(name)),
         _ => Err(SqlSurfaceError::ambiguous_column(name)),
     }
 }
@@ -7121,7 +7105,7 @@ fn bind_group_by_clause(
     node_budget: &mut usize,
 ) -> Result<BoundGroupBy, SqlSurfaceError> {
     // GROUP BY 列は並べ替え可能な型の列か疑似列 `id` のみ許可する（VECTOR 等・
-    // 未知列は型不整合 `22000`。Issue #1185・SQL-25 (d)）。SQL テキスト経由・
+    // 未知列は `42703`、型不整合は `22000`。Issue #1185・SQL-25 (d)）。SQL テキスト経由・
     // 直接構築経由（[`BoundAggregate::new_grouped_by_columns`]・TASK-186・
     // NOSQL-5）が [`resolve_group_by_key`] を共有する。
     let mut keys = Vec::with_capacity(clause.columns.len());
@@ -7809,7 +7793,7 @@ mod tests {
         let err =
             bind_sql("SELECT nope FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5")
                 .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -7882,7 +7866,7 @@ mod tests {
             "SELECT * FROM documents WHERE nope = 'x' ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     // --- bind: C3（RLS。`visible()` の有無だけを観測する） --------------------------
@@ -8136,7 +8120,7 @@ mod tests {
             "INSERT INTO documents (id, embedding, nope) VALUES (1, '[0.1,0.2,0.3]', 'x') USING OPERATION_ID 'op-0001'",
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -8315,7 +8299,7 @@ mod tests {
             "DELETE FROM documents WHERE ghost = 'x' USING OPERATION_ID 'op-0001'",
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -8546,7 +8530,7 @@ mod tests {
             "UPDATE documents SET ghost = 'x' WHERE id = 1 USING OPERATION_ID 'op-0001'",
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -9225,7 +9209,7 @@ mod tests {
     #[test]
     fn binds_unknown_column_as_invalid_input() {
         let err = bind_aggregate_sql("SELECT SUM(ghost) FROM documents").unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -9418,7 +9402,7 @@ mod tests {
         let unknown = grouped_direct(&["lang"])
             .with_group_order_by(&[sort_key("nope", false)], &docs_schema())
             .unwrap_err();
-        assert_eq!(unknown.wire_code(), "22000");
+        assert_eq!(unknown.wire_code(), "42703");
         let many: Vec<_> = (0..=crate::sql::allowlist::MAX_SCALAR_ORDER_KEYS)
             .map(|_| sort_key("lang", false))
             .collect();
@@ -9533,7 +9517,7 @@ mod tests {
     fn bind_column_projection_rejects_unknown_column() {
         let names = vec!["nope".to_string()];
         let err = bind_column_projection(Some(&names), &docs_schema()).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     // --- bind_vector_values（Issue #763・NOSQL-2） ------------------------------
@@ -9598,7 +9582,7 @@ mod tests {
             ],
         );
         let err = bind_body_text_column(&schema).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]

@@ -266,7 +266,7 @@ fn wire17_copy_from_stdin_unknown_column_is_rejected_before_copy_in_response() {
         &mut stream,
         "COPY docs (id, embedding, alng) FROM STDIN USING OPERATION_ID 'wire-copy-unknown-col'",
     );
-    expect_error_response_with_sqlstate(&mut stream, "22000");
+    expect_error_response_with_sqlstate(&mut stream, "42703");
     read_ready_for_query(&mut stream);
 
     send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");

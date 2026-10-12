@@ -152,7 +152,7 @@ fn create_table_rejects_check_referencing_unknown_column() {
             "CREATE TABLE docs (body TEXT, CHECK (missing = 'x'))",
         )
         .expect_err("unknown column reference must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 }
 
 #[test]

@@ -402,7 +402,7 @@ fn rls6_disallowed_sql_forms_rejected() {
     let err = core
         .execute_sql(&ctx, &sql_unknown_column)
         .expect_err("should be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42703");
 
     for sql in [
         "SET search_path = tenant_b",
