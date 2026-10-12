@@ -178,6 +178,8 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 - `max_duration`（`BEGIN` からの経過時間の上限）: **20 秒**
 - `max_statements`（トランザクション内の文数の上限）: **1,000**
 - 超過時は `54000`（`PayloadTooLarge`）で `Failed` へ遷移する。
+- 起動時 CLI（`--max-transaction-duration-ms`・`--max-transaction-statements`。Issue #1553）で
+  設定できる。範囲・ハード上限は [transaction-limits-cli.md](transaction-limits-cli.md) 参照。
 - `max_duration` は文の実行時・`COMMIT` 時に検査するほか、wire 層
   （`handshake::post_auth_loop`）が要求を受け取るたびに
   `SessionTransaction::release_if_expired` で検査する。期限を過ぎていれば、
@@ -408,7 +410,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   明示ブロックへ昇格させる PostgreSQL の意味論（`INSERT; BEGIN; ...`）は対象外。
 - savepoint、分離レベルの指定、`START TRANSACTION`／`END`／`ABORT` などの別名。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
-- 上限の既定値（20 秒・1,000 件・30 秒）の確定 → オーナー判断。
+- 上限の既定値（20 秒・1,000 件・30 秒）と CLI のハード上限（60 秒・10,000 件。Issue #1553 で暫定採用）の確定 → オーナー判断。
 
 ## カーソルとの関係
 

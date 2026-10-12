@@ -150,6 +150,17 @@
 //! 一本化し、`EngineCore::with_join_limits` へ 1 回だけ注入する
 //! （`docs/design/join-limits-cli.md`）。
 //!
+//! `--max-transaction-duration-ms`／`--max-transaction-statements`（Issue #1553。SQL-46）:
+//! 明示トランザクション（暗黙トランザクションにも同じ値が効く）の最大持続時間
+//! （`100`〜`60000` ミリ秒・既定 20000）と最大文数（`1`〜`10000`・既定 1000）を、
+//! プロセス全体に対して起動時に設定できる opt-in 注入点（未指定は現行の既定と同値＝挙動不変。
+//! 兄弟フラグと違い既定の上下どちらへも設定できる）。超過は従来どおり `54000`。範囲外・
+//! 非数値・値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::transaction_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_transaction_limits` へ 1 回だけ注入する。明示指定した持続時間が書き込み
+//! ロック待ち上限（30 秒）を超える場合は起動ログに `WARNING` 行を出す
+//! （`docs/design/transaction-limits-cli.md`）。
+//!
 //! `--max-dml-affected-rows`／`--max-insert-rows`（Issue #997。オーナー判断の
 //! 改訂・2026-09-27。前回のオーナー判断を置き換え）: 述語形 `UPDATE`／
 //! `DELETE` の 1 文あたり影響行数上限・複数行 `VALUES` の 1 文あたり行数上限
@@ -358,6 +369,8 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_join_relations_raw: Option<String> = None;
     let mut max_join_input_rows_raw: Option<String> = None;
     let mut max_join_output_rows_raw: Option<String> = None;
+    let mut max_transaction_duration_ms_raw: Option<String> = None;
+    let mut max_transaction_statements_raw: Option<String> = None;
     let mut partitioned_chunk_rows_raw: Option<String> = None;
     let mut partitioned_scan_budget_raw: Option<String> = None;
     let mut partitioned_max_hold_ms_raw: Option<String> = None;
@@ -875,6 +888,46 @@ fn run_server(args: &[String]) -> ExitCode {
                 max_join_output_rows_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::transaction_limits_opt::MAX_TRANSACTION_DURATION_MS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::transaction_limits_opt::MAX_TRANSACTION_DURATION_MS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1553: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_transaction_duration_ms_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::transaction_limits_opt::MAX_TRANSACTION_DURATION_MS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_transaction_duration_ms_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::transaction_limits_opt::MAX_TRANSACTION_STATEMENTS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::transaction_limits_opt::MAX_TRANSACTION_STATEMENTS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1553: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_transaction_statements_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::transaction_limits_opt::MAX_TRANSACTION_STATEMENTS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_transaction_statements_raw = Some(v.clone());
+                i += 2;
+            }
             wire_server::dml_limits_opt::PARTITIONED_CHUNK_ROWS_FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!(
@@ -1363,6 +1416,21 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1553: 明示トランザクションの最大持続時間・最大文数を bind・ユーザーストア読込より
+    // 前に解決する（fail-closed）。未指定は `TransactionLimits::default()`＝現行挙動。
+    let transaction_limits = match wire_server::transaction_limits_opt::resolve(
+        wire_server::transaction_limits_opt::TransactionLimitsRawFlags {
+            max_duration_ms: max_transaction_duration_ms_raw.as_deref(),
+            max_statements: max_transaction_statements_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid transaction limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1128・#1129: 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間・
     // 同時実行数・中断記録数の上限）を
     // bind・ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は
@@ -1773,6 +1841,8 @@ fn run_server(args: &[String]) -> ExitCode {
     core = core.with_nesting_limits(nesting_limits);
     // Issue #1551: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
     core = core.with_join_limits(join_limits);
+    // Issue #1553: 未指定でも常に呼ぶ（既定は `TransactionLimits::default()` で、未注入と挙動が同一）。
+    core = core.with_transaction_limits(transaction_limits);
     // Issue #1128: 未指定でも常に呼ぶ（既定は `PartitionedDmlLimits::default()`）。
     core = core.with_partitioned_dml_limits(partitioned_dml_limits);
     // Issue #1166: 未指定でも常に呼ぶ（`batch_limits` は既定・環境変数まで
@@ -1828,6 +1898,19 @@ fn run_server(args: &[String]) -> ExitCode {
     // ドキュメント参照）。
     if let Some(warning) =
         wire_server::dml_limits_opt::insert_rows_cap_warning(&dml_limits, &batch_limits)
+    {
+        engine::log_stderr!("wire-server: WARNING: {warning}");
+    }
+
+    // Issue #1553: 明示指定した最大持続時間が書き込みロック待ち上限を超える場合、ほかの
+    // セッションの書き込みが `55P03` を受け得るため `WARNING` 行で知らせる（エラーにはしない。
+    // `transaction_limits_opt::duration_over_write_lock_wait_warning` ドキュメント参照）。
+    if let Some(warning) =
+        wire_server::transaction_limits_opt::duration_over_write_lock_wait_warning(
+            &transaction_limits,
+            max_transaction_duration_ms_raw.is_some(),
+            engine::storage::DEFAULT_WRITE_LOCK_WAIT,
+        )
     {
         engine::log_stderr!("wire-server: WARNING: {warning}");
     }
