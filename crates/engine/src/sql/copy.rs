@@ -555,7 +555,7 @@ fn bind_copy_record(
             }
             Some(s) => match &column.ty {
                 ColumnType::Vector(dim) => Value::Vector(parse_vector_literal(s, *dim)?),
-                ColumnType::Text => Value::Text(s.clone()),
+                ColumnType::Text | ColumnType::Varchar => Value::Text(s.clone()),
                 ColumnType::Boolean => Value::Bool(parse_copy_boolean(s, name)?),
                 ColumnType::Array(array_ty) => Value::Array(parse_array_literal(s, array_ty)?),
                 ColumnType::Bytea => bind_bytea_literal(s, name)?,

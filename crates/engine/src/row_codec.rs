@@ -1572,7 +1572,7 @@ pub fn encode_row(
                 buf.push(PRESENCE_NULL);
             }
             Value::Text(text) => {
-                if !matches!(column.ty, ColumnType::Text) {
+                if !column.ty.is_text_like() {
                     return Err(RowCodecError::Invalid(format!(
                         "column {:?} expects a non-Text value, got Text",
                         column.name
@@ -1640,6 +1640,7 @@ pub fn encode_row(
                 let def = match &column.ty {
                     ColumnType::Enum(def) => def,
                     ColumnType::Text
+                    | ColumnType::Varchar
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Vector(_)
@@ -1682,6 +1683,7 @@ pub fn encode_row(
                 let expected_dim = match &column.ty {
                     ColumnType::Vector(dim) => *dim,
                     ColumnType::Text
+                    | ColumnType::Varchar
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Real
@@ -1788,6 +1790,7 @@ pub fn encode_row(
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
                     ColumnType::Text
+                    | ColumnType::Varchar
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Vector(_)
@@ -1846,6 +1849,7 @@ pub fn encode_row(
                         scale
                     }
                     ColumnType::Text
+                    | ColumnType::Varchar
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Real
@@ -2062,7 +2066,7 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                 values.push(Value::Null);
             }
             PRESENCE_VALUE => match &column.ty {
-                ColumnType::Text | ColumnType::Enum(_) => {
+                ColumnType::Text | ColumnType::Varchar | ColumnType::Enum(_) => {
                     let len_bytes = buf
                         .get(
                             offset..offset.checked_add(4).ok_or_else(|| {
@@ -2588,7 +2592,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.push(PRESENCE_NULL);
             }
             Value::Text(text) => {
-                if !matches!(column.ty, ColumnType::Text) {
+                if !column.ty.is_text_like() {
                     return Err(RowCodecError::Invalid(format!(
                         "column {:?} expects a non-Text value, got Text",
                         column.name
@@ -2655,6 +2659,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 let def = match &column.ty {
                     ColumnType::Enum(def) => def,
                     ColumnType::Text
+                    | ColumnType::Varchar
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Vector(_)
@@ -2772,6 +2777,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
                     ColumnType::Text
+                    | ColumnType::Varchar
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Vector(_)
@@ -2847,6 +2853,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 let (precision, scale) = match column.ty {
                     ColumnType::Numeric { precision, scale } => (precision, scale),
                     ColumnType::Text
+                    | ColumnType::Varchar
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Real
@@ -2916,6 +2923,7 @@ fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) ->
             }
         }
         ColumnType::Text
+        | ColumnType::Varchar
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Vector(_)
@@ -3090,7 +3098,7 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_NULL);
                 }
                 Value::Text(text) => {
-                    if !matches!(column.ty, ColumnType::Text) {
+                    if !column.ty.is_text_like() {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Text value, got Text",
                             column.name
@@ -3140,6 +3148,7 @@ pub(crate) fn merge_encode_scalar_columns(
                     let def = match &column.ty {
                         ColumnType::Enum(def) => def,
                         ColumnType::Text
+                        | ColumnType::Varchar
                         | ColumnType::Integer
                         | ColumnType::BigInt
                         | ColumnType::Vector(_)
@@ -3246,6 +3255,7 @@ pub(crate) fn merge_encode_scalar_columns(
                     let array_ty = match &column.ty {
                         ColumnType::Array(array_ty) => array_ty,
                         ColumnType::Text
+                        | ColumnType::Varchar
                         | ColumnType::Integer
                         | ColumnType::BigInt
                         | ColumnType::Vector(_)
@@ -3284,6 +3294,7 @@ pub(crate) fn merge_encode_scalar_columns(
                     let (precision, scale) = match column.ty {
                         ColumnType::Numeric { precision, scale } => (precision, scale),
                         ColumnType::Text
+                        | ColumnType::Varchar
                         | ColumnType::Integer
                         | ColumnType::BigInt
                         | ColumnType::Real
@@ -3345,7 +3356,7 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_NULL);
                 }
                 Some(ScalarRef::Text(text)) => {
-                    if !matches!(column.ty, ColumnType::Text) {
+                    if !column.ty.is_text_like() {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Text existing value, got Text",
                             column.name
@@ -3693,7 +3704,9 @@ pub(crate) fn default_scalar<'a>(
         }
     }
     match (default, ty) {
-        (ColumnDefault::Text(s), ColumnType::Text) => Ok(ScalarRef::Text(s.as_str())),
+        (ColumnDefault::Text(s), ColumnType::Text | ColumnType::Varchar) => {
+            Ok(ScalarRef::Text(s.as_str()))
+        }
         (ColumnDefault::Number(n), ColumnType::Integer) => n
             .parse::<i32>()
             .map(ScalarRef::Integer)
@@ -4087,7 +4100,10 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
-                ColumnType::Text | ColumnType::Vector(_) | ColumnType::Enum(_) => {
+                ColumnType::Text
+                | ColumnType::Varchar
+                | ColumnType::Vector(_)
+                | ColumnType::Enum(_) => {
                     let len_bytes = buf
                         .get(
                             offset..offset.checked_add(4).ok_or_else(|| {

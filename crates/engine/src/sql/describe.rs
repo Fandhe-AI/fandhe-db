@@ -35,6 +35,7 @@ pub(crate) fn projected_columns(
         .iter()
         .map(|col| match col {
             ProjectedColumn::Id => ColumnMeta::Id,
+            ProjectedColumn::AliasedId { name } => crate::sql::exec::aliased_id_column_meta(name),
             ProjectedColumn::Column { index, name } => ColumnMeta::Scalar {
                 name: name.clone(),
                 ty: schema
@@ -43,9 +44,9 @@ pub(crate) fn projected_columns(
                     .map(|c| c.ty.clone())
                     .unwrap_or(ColumnType::Text),
             },
-            ProjectedColumn::Computed { name, ty, .. } => {
-                crate::sql::exec::computed_column_meta(name, *ty)
-            }
+            ProjectedColumn::Computed {
+                name, result_ty, ..
+            } => crate::sql::exec::computed_column_meta(name, result_ty),
         })
         .collect()
 }

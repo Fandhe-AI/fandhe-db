@@ -45,9 +45,23 @@ const MAX_ARRAY_LITERAL_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// **Issue #1173 で追加した破壊的変更（BREAKING CHANGE）**: `Computed` variant に
 /// 束縛済み式の静的型 `ty` を追加した（結果列メタの型 OID の根拠）。
+///
+/// **Issue #1539（SQL-42）で追加した破壊的変更（BREAKING CHANGE）**: `Computed` variant に
+/// 結果列型 `result_ty`（`Integer`／`BigInt`／`Real` など。`None` は型を公告できない
+/// VECTOR）を追加した。`ty` は評価器の静的型のまま、RowDescription の型 OID とセル
+/// 表現は `result_ty` から決める（式投影の整数算術を PostgreSQL と同じ int4／int8 にする）。
+///
+/// **Issue #1540（SQL-42）で追加した破壊的変更（BREAKING CHANGE）**: `AliasedId` variant を
+/// 追加した（疑似列 `id` への `AS` 別名。値は `Id` と同じ行キーで、結果列名だけが別名）。
+/// 実在列への別名は `Column` の `name` に別名を載せて表す。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProjectedColumn {
     Id,
+    /// 別名付きの疑似列 `id`（Issue #1540）。結果列メタは `Id` と同じ numeric 公告で
+    /// 名前だけ `name`（JOIN 経路の `meta_with_alias` と同じ写像）。
+    AliasedId {
+        name: String,
+    },
     Column {
         index: usize,
         name: String,
@@ -57,6 +71,7 @@ pub enum ProjectedColumn {
         name: String,
         expr: crate::sql::udf_call::BoundExpr,
         ty: crate::sql::udf_call::ExprType,
+        result_ty: Option<crate::catalog::ColumnType>,
     },
 }
 
@@ -518,6 +533,7 @@ pub(crate) fn bind_integer_literal(
             },
         },
         ColumnType::Text
+        | ColumnType::Varchar
         | ColumnType::Vector(_)
         | ColumnType::Real
         | ColumnType::Double
@@ -627,6 +643,7 @@ pub(crate) fn bind_datetime_literal(
             }
         },
         ColumnType::Text
+        | ColumnType::Varchar
         | ColumnType::Real
         | ColumnType::Double
         | ColumnType::Vector(_)
@@ -969,6 +986,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .find_map(|(idx, c)| match &c.ty {
             ColumnType::Vector(dim) => Some((idx, *dim)),
             ColumnType::Text
+            | ColumnType::Varchar
             | ColumnType::Integer
             | ColumnType::BigInt
             | ColumnType::Real
@@ -1017,7 +1035,7 @@ pub(crate) fn text_column_index(
                 .get(idx)
                 .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
             match &column.ty {
-                ColumnType::Text => Ok(idx),
+                ColumnType::Text | ColumnType::Varchar => Ok(idx),
                 ColumnType::Vector(_)
                 | ColumnType::Integer
                 | ColumnType::BigInt
@@ -1271,9 +1289,13 @@ pub(crate) fn default_expr_alias(expr: &Expr) -> String {
         Expr::Case { .. } => "case".to_string(),
         Expr::Coalesce(_) => "coalesce".to_string(),
         Expr::NullIf(..) => "nullif".to_string(),
-        _ => "expr".to_string(),
+        // PostgreSQL の既定列名（Issue #1539・SQL-42。従来は `expr`）。
+        _ => ANONYMOUS_COLUMN_NAME.to_string(),
     }
 }
+
+/// 別名・既定名を持たない式項目の列名（PostgreSQL 互換。`sql::const_select` と共有）。
+pub(crate) const ANONYMOUS_COLUMN_NAME: &str = "?column?";
 
 /// SELECT リストの許可形状（[`Projection`]）を束縛する共通ヘルパー（TASK-77・
 /// SQL-5 で `bind_in_session` から切り出した。`USING PLAN` 経路（`sql::using_plan`）も
@@ -1305,24 +1327,7 @@ pub fn bind_projection(
         Projection::Columns(names) => {
             let mut cols = Vec::with_capacity(names.len());
             for name in names {
-                // カタログ上の実カラムを疑似列 `id` より優先して照合する（Issue #56
-                // レビュー指摘対応: 以前は `name == "id"` を先に判定していたため、
-                // スキーマが `id` という実カラムを持っていても常に行キー疑似列へ
-                // マップされ、実カラムの値を `SELECT id` で取得する経路がなかった）。
-                if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
-                    cols.push(ProjectedColumn::Column {
-                        index,
-                        name: name.clone(),
-                    });
-                    continue;
-                }
-                if name == "id" {
-                    cols.push(ProjectedColumn::Id);
-                    continue;
-                }
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "unknown column: {name}"
-                )));
+                cols.push(resolve_projected_column(name, name, schema)?);
             }
             Ok(cols)
         }
@@ -1331,29 +1336,30 @@ pub fn bind_projection(
             for item in items {
                 match item {
                     crate::sql::allowlist::SelectItem::Column(name) => {
-                        if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
-                            cols.push(ProjectedColumn::Column {
-                                index,
-                                name: name.clone(),
-                            });
-                            continue;
-                        }
-                        if name == "id" {
-                            cols.push(ProjectedColumn::Id);
-                            continue;
-                        }
-                        return Err(SqlSurfaceError::invalid_input(format!(
-                            "unknown column: {name}"
-                        )));
+                        cols.push(resolve_projected_column(name, name, schema)?);
+                    }
+                    // Issue #1540（SQL-42）: 別名付きの列参照は式評価器を通さず、列と同じ
+                    // 値・型のまま出力名だけ別名にする（式評価器を通すと INTEGER が
+                    // float8 になる等、型・値が変わるため）。ノード予算も消費しない。
+                    crate::sql::allowlist::SelectItem::Expr {
+                        expr: Expr::Ident(name),
+                        alias: Some(alias),
+                    } => {
+                        cols.push(resolve_projected_column(name, alias, schema)?);
                     }
                     crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
-                        let (bound, ty) =
-                            crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+                        let (bound, ty, result_ty) = crate::sql::udf_call::bind_projection_expr(
+                            expr,
+                            schema,
+                            udfs,
+                            node_budget,
+                        )?;
                         let name = alias.clone().unwrap_or_else(|| default_expr_alias(expr));
                         cols.push(ProjectedColumn::Computed {
                             name,
                             expr: bound,
                             ty,
+                            result_ty,
                         });
                     }
                 }
@@ -1361,6 +1367,38 @@ pub fn bind_projection(
             Ok(cols)
         }
     }
+}
+
+/// 列参照 `name` を投影列へ解決する（[`bind_projection`] の `Columns`／`Items` 共通。
+/// Issue #1540〔SQL-42〕で別名付き列のために切り出した）。`output_name` は結果列名
+/// （別名なしは `name` と同じ）。カタログ上の実カラムを疑似列 `id` より優先し、どちらにも
+/// 当たらなければ `22000`（fail-closed。文言には利用者が書いた名前だけを含める）。
+fn resolve_projected_column(
+    name: &str,
+    output_name: &str,
+    schema: &TableSchema,
+) -> Result<ProjectedColumn, SqlSurfaceError> {
+    // カタログ上の実カラムを疑似列 `id` より優先して照合する（Issue #56
+    // レビュー指摘対応: 以前は `name == "id"` を先に判定していたため、スキーマが
+    // `id` という実カラムを持っていても常に行キー疑似列へマップされていた）。
+    if let Some(index) = schema.columns.iter().position(|c| c.name == name) {
+        return Ok(ProjectedColumn::Column {
+            index,
+            name: output_name.to_string(),
+        });
+    }
+    if name == "id" {
+        return Ok(if output_name == name {
+            ProjectedColumn::Id
+        } else {
+            ProjectedColumn::AliasedId {
+                name: output_name.to_string(),
+            }
+        });
+    }
+    Err(SqlSurfaceError::invalid_input(format!(
+        "unknown column: {name}"
+    )))
 }
 
 /// `WHERE` 句の許可述語列（[`WherePredicate`]）を束縛する共通ヘルパー
@@ -1639,7 +1677,7 @@ fn text_range_compare_as_expr(
     let is_text = schema
         .columns
         .iter()
-        .any(|c| &c.name == column && matches!(c.ty, ColumnType::Text));
+        .any(|c| &c.name == column && c.ty.is_text_like());
     if !is_text {
         return None;
     }
@@ -2146,12 +2184,23 @@ pub fn bind(
 /// 写像（`http::query::scan`）も同一ロジックを再利用する（第 2 の実装を
 /// 作らない）。
 pub fn validate_search_limit(raw: u32) -> Result<usize, SqlSurfaceError> {
+    validate_search_limit_with(raw, &crate::result_limits::ResultLimits::default())
+}
+
+/// [`validate_search_limit`] の設定値付き版（Issue #1555・SQL-34）。範囲上限は
+/// `limits.max_result_rows()`（起動時 CLI `--max-result-rows`。既定は従来の 10,000）。
+/// 下限（`LIMIT 0` 拒否）・エラー分類（`22000`）は既定版と同一で、メッセージの範囲表示だけが
+/// 設定値に追随する。`EngineCore` の束縛経路と NoSQL 表層（`limit`）が共有する単一実装。
+pub fn validate_search_limit_with(
+    raw: u32,
+    limits: &crate::result_limits::ResultLimits,
+) -> Result<usize, SqlSurfaceError> {
     let limit = usize::try_from(raw)
         .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed LIMIT value: {raw}")))?;
-    if limit == 0 || limit > crate::core::MAX_SEARCH_K {
+    let max = limits.max_result_rows();
+    if limit == 0 || limit > max {
         return Err(SqlSurfaceError::invalid_input(format!(
-            "LIMIT {limit} out of range (must be 1..={})",
-            crate::core::MAX_SEARCH_K
+            "LIMIT {limit} out of range (must be 1..={max})"
         )));
     }
     Ok(limit)
@@ -2211,6 +2260,24 @@ pub fn bind_in_session(
     session_mode: Option<SearchMode>,
     udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundStatement, SqlSurfaceError> {
+    bind_in_session_with_limits(
+        stmt,
+        schema,
+        session_mode,
+        udfs,
+        &crate::result_limits::ResultLimits::default(),
+    )
+}
+
+/// [`bind_in_session`] の `LIMIT` 範囲設定付き版（Issue #1555・SQL-34）。
+/// `EngineCore` が自身の [`crate::result_limits::ResultLimits`] を渡して呼ぶ。
+pub(crate) fn bind_in_session_with_limits(
+    stmt: &ValidatedStatement,
+    schema: &TableSchema,
+    session_mode: Option<SearchMode>,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    result_limits: &crate::result_limits::ResultLimits,
+) -> Result<BoundStatement, SqlSurfaceError> {
     let query_mode = match &stmt.search_mode {
         Some(literal) => Some(SearchMode::parse_literal(literal)?),
         None => None,
@@ -2230,7 +2297,7 @@ pub fn bind_in_session(
 
     let ranking = bind_ranking(&stmt.order_by, schema, true)?;
 
-    let limit = validate_search_limit(stmt.limit)?;
+    let limit = validate_search_limit_with(stmt.limit, result_limits)?;
 
     // Issue #353: `expr_filters` を束縛時に 1 回だけステップ列コンパイルする
     // （行ループでの再帰評価をなくす）。`expr_filters` と要素数・評価順が
@@ -2286,6 +2353,7 @@ pub(crate) fn bind_projection_for_describe(
     udfs: &crate::sql::udf_call::UdfRegistry,
     validate_vector_literal: bool,
     dummy_equality_flags: &[bool],
+    result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
     if let Some(literal) = &stmt.search_mode {
         SearchMode::parse_literal(literal)?;
@@ -2304,7 +2372,7 @@ pub(crate) fn bind_projection_for_describe(
         )?;
 
     let _ranking = bind_ranking(&stmt.order_by, schema, validate_vector_literal)?;
-    let _limit = validate_search_limit(stmt.limit)?;
+    let _limit = validate_search_limit_with(stmt.limit, result_limits)?;
 
     Ok(projection)
 }
@@ -2730,11 +2798,11 @@ fn bind_insert_row(
                     "column {name:?} expects a vector literal, got a non-vector literal"
                 )))
             }
-            (ColumnType::Text, InsertLiteral::String(s)) => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
             (
-                ColumnType::Text,
+                ColumnType::Text | ColumnType::Varchar,
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -2937,6 +3005,7 @@ pub(crate) fn bind_json_literal(
             crate::json::canonicalize_jsonb_text(s).map_err(|e| json_column_error(e, s))?
         }
         ColumnType::Text
+        | ColumnType::Varchar
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Vector(_)
@@ -3139,11 +3208,11 @@ fn bind_set_assignments(
                     "column {name:?} is a VECTOR column and cannot be set to NULL"
                 )))
             }
-            (ColumnType::Text, InsertLiteral::String(s)) => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
             (
-                ColumnType::Text,
+                ColumnType::Text | ColumnType::Varchar,
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -4262,7 +4331,7 @@ fn bind_upsert_assignments(
                 let src_column = schema.columns.get(src_idx).ok_or_else(|| {
                     SqlSurfaceError::invalid_input(format!("unknown column: {src}"))
                 })?;
-                if src_column.ty != column.ty {
+                if !src_column.ty.same_value_domain(&column.ty) {
                     return Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} and EXCLUDED.{src} have mismatched types"
                     )));
@@ -4282,10 +4351,10 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a vector literal, got a non-vector literal"
                         )))
                     }
-                    (ColumnType::Text, InsertLiteral::String(s)) => {
+                    (ColumnType::Text | ColumnType::Varchar, InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Text(s.clone())
                     }
-                    (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                    (ColumnType::Text | ColumnType::Varchar, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a text literal, got a non-text literal"
                         )))
@@ -4449,6 +4518,8 @@ fn bind_file_insert(
         .iter()
         .position(|c| c.name == "body")
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no body column"))?;
+    // ファイル形式 INSERT の `path`／`body` は documents テーブルの構造契約（TASK-109・PLAN-5）
+    // のため TEXT 限定。VARCHAR は意図的に非対象（Issue #2305）。
     match schema.columns.get(path_column_index) {
         Some(c) if matches!(c.ty, ColumnType::Text) => {}
         _ => return Err(SqlSurfaceError::invalid_input("path column must be Text")),
@@ -4475,10 +4546,10 @@ fn bind_file_insert(
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
         let value = match (&column.ty, literal) {
-            (ColumnType::Text, InsertLiteral::String(s)) => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
-            (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a non-text literal"
                 )))
@@ -4486,7 +4557,7 @@ fn bind_file_insert(
             // `InsertLiteral::Vector`（Issue #896 レビュー指摘・PR #1038）は
             // NoSQL 表層専用であり、ファイル形 `INSERT` の VALUES 構文からは
             // 構築されない到達不能パス（match の網羅性のためだけの分岐）。
-            (ColumnType::Text, InsertLiteral::Vector(_)) => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::Vector(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a vector literal"
                 )))
@@ -4495,10 +4566,10 @@ fn bind_file_insert(
             // `INSERT` の VALUES 構文からは構築されない到達不能パス（match の
             // 網羅性のためだけの分岐）。到達した場合も明示 NULL の確定契約
             // （TABLE-16。nullable なら NULL・非 nullable なら `23502`）へ倒す。
-            (ColumnType::Text, InsertLiteral::Null) if column.nullable => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::Null) if column.nullable => {
                 crate::row_codec::Value::Null
             }
-            (ColumnType::Text, InsertLiteral::Null) => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::Null) => {
                 return Err(SqlSurfaceError::not_null_violation(name.clone()))
             }
             // `bind_insert_form` の判別規則により VECTOR 列名は列リストに含まれない
@@ -4869,6 +4940,26 @@ pub(crate) enum ProjectionColumn {
     GroupKey { key_index: usize, name: String },
     /// `items[item_index]` の集計結果。
     Aggregate { item_index: usize, name: String },
+    /// 集計結果を葉とする算術式の投影項目（Issue #1541・SQL-42 (5) のポインタ）。`program` は
+    /// 「グループ出力行ビュー」（`GROUP BY` キー〔`keys`〕→ 集計項目〔`items`。式中の集計呼び出し
+    /// 用の内部項目を含む〕の順の列。HAVING／ORDER BY の式と同じ添字系列）を行スカラーとして
+    /// 評価する投影モードのステップ列。`result_ty` は RowDescription に公告する結果列型
+    /// （`ColumnMeta::Computed`）、`mask` は評価前に値化する行ビュー列（未参照の列の変換
+    /// エラーで無関係な式が失敗しないようにする）。`name` は別名、省略時は `?column?`。
+    Expr {
+        program: crate::sql::expr_program::ExprProgram,
+        name: String,
+        result_ty: Option<ColumnType>,
+        mask: Vec<bool>,
+    },
+}
+
+/// 集計式項目の内部集計（式中の集計呼び出し）に付ける項目名。利用者が書ける識別子では
+/// ありえない先頭の制御文字を含むため、`HAVING`／`ORDER BY` の名前解決
+/// （[`resolve_group_reference`]）が可視項目と取り違えたり曖昧エラー（`42702`）を誘発したり
+/// しない（Issue #1541）。
+fn hidden_aggregate_name(item_index: usize) -> String {
+    format!("\u{1}hidden{item_index}")
 }
 
 /// HAVING 述語 1 つを束縛した形（TASK-167・SQL-14）。`item_index` は
@@ -5362,12 +5453,15 @@ fn resolve_aggregate_input(
                 .find(|(_, c)| &c.name == name)
             {
                 return match (&column.ty, func) {
-                    (ColumnType::Text, AggregateFunc::Sum | AggregateFunc::Avg) => {
-                        Err(SqlSurfaceError::undefined_function(format!(
-                            "column {name:?} is TEXT and cannot be used with SUM/AVG"
-                        )))
+                    (
+                        ColumnType::Text | ColumnType::Varchar,
+                        AggregateFunc::Sum | AggregateFunc::Avg,
+                    ) => Err(SqlSurfaceError::undefined_function(format!(
+                        "column {name:?} is TEXT and cannot be used with SUM/AVG"
+                    ))),
+                    (ColumnType::Text | ColumnType::Varchar, _) => {
+                        Ok(AggregateInput::TextColumn(index))
                     }
-                    (ColumnType::Text, _) => Ok(AggregateInput::TextColumn(index)),
                     (ColumnType::Vector(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::VectorColumnPresence)
                     }
@@ -5561,7 +5655,7 @@ fn resolve_count_distinct_input(
                 .find(|(_, c)| &c.name == name)
             {
                 return match &column.ty {
-                    ColumnType::Text => Ok(AggregateInput::TextColumn(index)),
+                    ColumnType::Text | ColumnType::Varchar => Ok(AggregateInput::TextColumn(index)),
                     ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with COUNT(DISTINCT ...)"
                     ))),
@@ -5685,6 +5779,14 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
     // （`group_by_columns` の添字）に付けられたエイリアスかを保持するため
     // `Vec<(usize, String)>` にする）。
     let mut group_key_aliases: Vec<(usize, String)> = Vec::new();
+    // 集計式項目（Issue #1541）。`GROUP BY` キー確定後に束縛するため位置と材料を保持する。
+    struct PendingProjectionExpr<'a> {
+        position: usize,
+        expr: &'a Expr,
+        hidden_items: Vec<usize>,
+        name: String,
+    }
+    let mut pending_exprs: Vec<PendingProjectionExpr<'_>> = Vec::new();
     for item in stmt.items() {
         match item {
             AggregateSelectItem::Aggregate(item) => {
@@ -5735,6 +5837,42 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                 }
                 projection.push(ProjectionColumn::GroupKey { key_index, name });
             }
+            // Issue #1541: 集計式項目。式中の集計呼び出しは、可視項目と同じ入力解決を通した
+            // 内部集計項目として `items` へ積む（WHERE／RLS を適用する走査・アキュムレータを
+            // 共有し、別経路を作らない）。式本体は `GROUP BY` キーの解決後（下）に束縛する。
+            AggregateSelectItem::Expr {
+                expr,
+                aggregates,
+                alias,
+            } => {
+                let mut hidden = Vec::with_capacity(aggregates.len());
+                for agg in aggregates {
+                    let input = if agg.distinct {
+                        resolve_count_distinct_input(&agg.arg, schema, udfs, &mut node_budget)?
+                    } else {
+                        resolve_aggregate_input(agg.func, &agg.arg, schema, udfs, &mut node_budget)?
+                    };
+                    let item_index = items.len();
+                    items.push(BoundAggregateItem {
+                        func: agg.func,
+                        input,
+                        name: hidden_aggregate_name(item_index),
+                        distinct: agg.distinct,
+                    });
+                    hidden.push(item_index);
+                }
+                pending_exprs.push(PendingProjectionExpr {
+                    position: projection.len(),
+                    expr,
+                    hidden_items: hidden,
+                    name: alias.clone().unwrap_or_else(|| "?column?".to_string()),
+                });
+                // 式の束縛後に差し替える一時項目（差し替え漏れは下で `Internal`）。
+                projection.push(ProjectionColumn::Aggregate {
+                    item_index: usize::MAX,
+                    name: String::new(),
+                });
+            }
         }
     }
 
@@ -5759,6 +5897,33 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
         )?),
     };
 
+    // Issue #1541: 集計式項目を投影モードで束縛する（`GROUP BY` キー列は束縛済みの
+    // `group_by.keys`。`GROUP BY` なしは空）。
+    if !pending_exprs.is_empty() {
+        let keys: &[BoundOrderKey] = group_by.as_ref().map(|g| g.keys.as_slice()).unwrap_or(&[]);
+        for pending in pending_exprs {
+            let (program, result_ty, mask) = bind_aggregate_projection_expr(
+                pending.expr,
+                &pending.hidden_items,
+                group_by_columns,
+                keys,
+                schema,
+                &items,
+                udfs,
+                &mut node_budget,
+            )?;
+            let slot = projection.get_mut(pending.position).ok_or_else(|| {
+                crate::sql::aggregate::accumulator_bug("projection expression slot out of bounds")
+            })?;
+            *slot = ProjectionColumn::Expr {
+                program,
+                name: pending.name,
+                result_ty,
+                mask,
+            };
+        }
+    }
+
     // Issue #353: `BoundStatement` と同じく `expr_filters` を束縛時に 1 回だけ
     // ステップ列コンパイルする。
     let expr_filter_programs = expr_filters
@@ -5777,6 +5942,64 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
         projection,
         group_by,
     })
+}
+
+/// 集計式項目 1 つ（[`ProjectionColumn::Expr`]）を束縛する（Issue #1541・SQL-42 (5)）。
+/// 式中の識別子は構文段が「集計呼び出しの内部名」か「`GROUP BY` 列名」に限定済みで、
+/// それぞれ行ビューの合成列（`__ga<j>`／`__gk<i>`）へ置換してから投影モード
+/// （[`crate::sql::udf_call::bind_projection_expr`]）で束縛する。HAVING／ORDER BY 用の
+/// [`resolve_group_reference`] は集計項目の実効名も解決してしまう（`SELECT sum(n) AS s, s+1`
+/// が通ってしまう）ため使わない。どちらにも当たらない識別子は構文段の不変条件違反として
+/// `Internal`（fail-closed）。行ビューの列型は結果型に精密な型を使い
+/// （`MIN/MAX(int4)` → `Integer` 等）、PostgreSQL と同じ整数・単精度・倍精度の結果型を得る。
+#[allow(clippy::too_many_arguments)]
+fn bind_aggregate_projection_expr(
+    expr: &Expr,
+    hidden_items: &[usize],
+    group_by_columns: &[String],
+    keys: &[BoundOrderKey],
+    schema: &TableSchema,
+    items: &[BoundAggregateItem],
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<
+    (
+        crate::sql::expr_program::ExprProgram,
+        Option<ColumnType>,
+        Vec<bool>,
+    ),
+    SqlSurfaceError,
+> {
+    let resolve = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
+        if let Some(j) = crate::sql::allowlist::aggregate_placeholder_index(name) {
+            return hidden_items
+                .get(j)
+                .map(|idx| OrderTarget::Aggregate(*idx))
+                .ok_or_else(|| {
+                    crate::sql::aggregate::accumulator_bug("aggregate placeholder out of range")
+                });
+        }
+        group_by_columns
+            .iter()
+            .position(|c| c == name)
+            .map(OrderTarget::GroupKey)
+            .ok_or_else(|| {
+                crate::sql::aggregate::accumulator_bug(
+                    "aggregate expression column does not match a GROUP BY column",
+                )
+            })
+    };
+    let rewritten = rewrite_group_row_idents(expr, &resolve)?;
+    let view_schema = group_row_schema(schema, keys, items, true);
+    let (bound, _ty, result_ty) =
+        crate::sql::udf_call::bind_projection_expr(&rewritten, &view_schema, udfs, node_budget)?;
+    let mut mask = vec![false; keys.len().saturating_add(items.len())];
+    crate::sql::udf_call::mark_referenced_scalar_columns(&bound, &mut mask);
+    Ok((
+        crate::sql::expr_program::ExprProgram::compile(&bound),
+        result_ty,
+        mask,
+    ))
 }
 
 /// 束縛済みの広域取得（ソートなしのフィルタ取得）`SELECT` 文（Issue #454）。
@@ -5882,7 +6105,7 @@ pub(crate) struct BoundOrderKey {
 /// SQL-25 (c) で `VECTOR` への `DISTINCT` を `22000` とするのと同じ判断）。
 fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
     match ty {
-        ColumnType::Text => Some(OrderKind::Bytes),
+        ColumnType::Text | ColumnType::Varchar => Some(OrderKind::Bytes),
         ColumnType::Integer | ColumnType::BigInt | ColumnType::Date | ColumnType::Timestamp => {
             Some(OrderKind::SignedInt)
         }
@@ -5964,13 +6187,31 @@ fn order_kind_for_expr_type(
     }
 }
 
+/// 広域取得 `ORDER BY` の 1 キー分の解決結果（Issue #1540・SQL-42）。
+/// [`resolve_scan_order_aliases`] が SELECT リストの別名を解決した後の形で、
+/// [`bind_scan_order_keys`] が束縛する。
+enum ResolvedScanOrderKey<'a> {
+    /// 別名に当たらなかった、または別名が列・疑似列 `id` を指す元のキー（列名は基底名に
+    /// 置き換え済み）。従来どおり [`bind_scalar_order_by`]／[`bind_expr`] で束縛する。
+    Plain(std::borrow::Cow<'a, crate::sql::allowlist::ScanOrderKey>),
+    /// 別名が投影の式項目を指す。束縛済み投影の式（`ProjectedColumn::Computed`）を
+    /// そのまま並べ替え式に使い、出力値と並べ替え値の意味論を一致させる。
+    ProjectedExpr {
+        expr: crate::sql::udf_call::BoundExpr,
+        ty: crate::sql::udf_call::ExprType,
+        descending: bool,
+    },
+}
+
 /// 式キーを含む広域取得 `ORDER BY`（[`crate::sql::allowlist::ScanOrderKey`]）を束縛する
 /// （Issue #1188・SQL-26）。列名キーは [`bind_scalar_order_by`] を共有し、式キーは
 /// [`crate::sql::udf_call::bind_expr`]（未知関数・型不整合・未知列は既存の束縛エラー）で
 /// 束縛してステップ列へコンパイルする。戻り値の第 2 要素が
-/// [`BoundOrderTarget::Expr`] の添字先。
+/// [`BoundOrderTarget::Expr`] の添字先。Issue #1540（SQL-42）で、別名解決済みキー
+/// （[`ResolvedScanOrderKey`]）を受け取る形に広げた。別名の式は束縛済みの式を再利用し、
+/// ノード予算を再消費しない。
 fn bind_scan_order_keys(
-    keys: &[crate::sql::allowlist::ScanOrderKey],
+    keys: &[ResolvedScanOrderKey<'_>],
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
@@ -5980,23 +6221,155 @@ fn bind_scan_order_keys(
     let mut exprs = Vec::new();
     for key in keys {
         match key {
-            ScanOrderKey::Column(k) => {
-                bound.extend(bind_scalar_order_by(std::slice::from_ref(k), schema)?);
-            }
-            ScanOrderKey::Expr { expr, descending } => {
-                let (be, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
-                let kind = order_kind_for_expr_type(ty)?;
-                let program = crate::sql::expr_program::ExprProgram::compile(&be);
+            ResolvedScanOrderKey::Plain(k) => match k.as_ref() {
+                ScanOrderKey::Column(k) => {
+                    bound.extend(bind_scalar_order_by(std::slice::from_ref(k), schema)?);
+                }
+                ScanOrderKey::Expr { expr, descending } => {
+                    let (be, ty) =
+                        crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+                    let kind = order_kind_for_expr_type(ty)?;
+                    let program = crate::sql::expr_program::ExprProgram::compile(&be);
+                    bound.push(BoundOrderKey {
+                        target: BoundOrderTarget::Expr(exprs.len()),
+                        kind,
+                        descending: *descending,
+                    });
+                    exprs.push((be, program));
+                }
+            },
+            ResolvedScanOrderKey::ProjectedExpr {
+                expr,
+                ty,
+                descending,
+            } => {
+                let kind = order_kind_for_expr_type(*ty)?;
+                let program = crate::sql::expr_program::ExprProgram::compile(expr);
                 bound.push(BoundOrderKey {
                     target: BoundOrderTarget::Expr(exprs.len()),
                     kind,
                     descending: *descending,
                 });
-                exprs.push((be, program));
+                exprs.push((expr.clone(), program));
             }
         }
     }
     Ok((bound, exprs))
+}
+
+/// 広域取得の `ORDER BY` キーのうち、SELECT リストの明示別名を参照するものを解決する
+/// （Issue #1540・SQL-42。[`bind_scan_with_dummy_flags`] から呼ばれる）。
+///
+/// 規則（PostgreSQL の出力名解決に合わせ、別名に当たらない文は従来と同一にする）:
+/// 1. 対象は裸名キー（`ScanOrderKey::Column`）のみ。式キーの中の識別子は入力列だけで解決する
+/// 2. キー名が明示別名（`SelectItem::Expr { alias: Some(_) }`）のどれかに一致したときだけ
+///    別名解決に入る（別名なしの文・別名に当たらないキーは変更しない）
+/// 3. 候補は出力名がキー名に一致する全項目（明示別名＋別名なしの裸の列項目）。全候補が同じ
+///    対象（同じ基底列名・構文上等しい式）を指すなら解決し、異なる対象が複数あれば
+///    `42702`（`ambiguous_column`。文言は名前のみ）
+/// 4. 列・`id` への別名は基底列名へ置き換えて従来の束縛へ、式への別名は束縛済み投影の式を使う
+/// 5. 別名は実在列名より優先する（JOIN 経路・PostgreSQL と同じ）
+///
+/// `has_windows` のとき、式への別名はウィンドウ経路が式キーを持てないため `42601`。
+/// `bound_projection` は `Projection::Items` の項目と 1 対 1 に並ぶ束縛結果。
+fn resolve_scan_order_aliases<'a>(
+    projection: &Projection,
+    bound_projection: &[ProjectedColumn],
+    keys: Vec<std::borrow::Cow<'a, crate::sql::allowlist::ScanOrderKey>>,
+    has_windows: bool,
+) -> Result<Vec<ResolvedScanOrderKey<'a>>, SqlSurfaceError> {
+    use crate::sql::allowlist::{ScalarOrderKey, ScanOrderKey, SelectItem};
+    let Projection::Items(items) = projection else {
+        return Ok(keys.into_iter().map(ResolvedScanOrderKey::Plain).collect());
+    };
+    // 出力名の対象: 基底列名（列・`id`）か、束縛済み投影の式項目。
+    enum Target<'e> {
+        Base(&'e str),
+        Expr(usize, &'e Expr),
+    }
+    let output: Vec<Option<(&str, Target<'_>)>> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| match item {
+            SelectItem::Column(name) => Some((name.as_str(), Target::Base(name.as_str()))),
+            SelectItem::Expr {
+                expr: Expr::Ident(base),
+                alias: Some(alias),
+            } => Some((alias.as_str(), Target::Base(base.as_str()))),
+            SelectItem::Expr {
+                expr,
+                alias: Some(alias),
+            } => Some((alias.as_str(), Target::Expr(i, expr))),
+            SelectItem::Expr { alias: None, .. } => None,
+        })
+        .collect();
+    let has_explicit = |name: &str| {
+        items
+            .iter()
+            .any(|item| matches!(item, SelectItem::Expr { alias: Some(a), .. } if a == name))
+    };
+    let same_target = |a: &Target<'_>, b: &Target<'_>| match (a, b) {
+        (Target::Base(x), Target::Base(y)) => x == y,
+        (Target::Expr(_, x), Target::Expr(_, y)) => x == y,
+        _ => false,
+    };
+
+    let mut resolved = Vec::with_capacity(keys.len());
+    for key in keys {
+        let ScanOrderKey::Column(k) = key.as_ref() else {
+            resolved.push(ResolvedScanOrderKey::Plain(key));
+            continue;
+        };
+        if !has_explicit(&k.column) {
+            resolved.push(ResolvedScanOrderKey::Plain(key));
+            continue;
+        }
+        let mut candidates = output
+            .iter()
+            .flatten()
+            .filter(|(name, _)| *name == k.column.as_str())
+            .map(|(_, t)| t);
+        let Some(first) = candidates.next() else {
+            resolved.push(ResolvedScanOrderKey::Plain(key));
+            continue;
+        };
+        if candidates.any(|t| !same_target(first, t)) {
+            return Err(SqlSurfaceError::ambiguous_column(k.column.clone()));
+        }
+        match first {
+            Target::Base(base) => {
+                resolved.push(ResolvedScanOrderKey::Plain(std::borrow::Cow::Owned(
+                    ScanOrderKey::Column(ScalarOrderKey {
+                        column: (*base).to_string(),
+                        descending: k.descending,
+                    }),
+                )));
+            }
+            Target::Expr(i, _) => {
+                if has_windows {
+                    return Err(SqlSurfaceError::unsupported(
+                        "expression ORDER BY keys are not supported with window functions",
+                    ));
+                }
+                match bound_projection.get(*i) {
+                    Some(ProjectedColumn::Computed { expr, ty, .. }) => {
+                        resolved.push(ResolvedScanOrderKey::ProjectedExpr {
+                            expr: expr.clone(),
+                            ty: *ty,
+                            descending: k.descending,
+                        });
+                    }
+                    _ => {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "ORDER BY alias does not map to a computed projection"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 impl BoundScan {
@@ -6202,7 +6575,7 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
         .find(|(_, c)| c.name == name)
     {
         let kind = match &column.ty {
-            ColumnType::Text => WindowKeyKind::Text,
+            ColumnType::Text | ColumnType::Varchar => WindowKeyKind::Text,
             ColumnType::Integer => WindowKeyKind::Integer,
             ColumnType::BigInt => WindowKeyKind::BigInt,
             ColumnType::Real => WindowKeyKind::Real,
@@ -6436,7 +6809,13 @@ pub fn bind_scan(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundScan, SqlSurfaceError> {
-    bind_scan_with_dummy_flags(stmt, schema, udfs, &[])
+    bind_scan_with_dummy_flags(
+        stmt,
+        schema,
+        udfs,
+        &[],
+        &crate::result_limits::ResultLimits::default(),
+    )
 }
 
 /// [`bind_scan`] の本体（crate 内限定。Issue #935・WIRE-12・TASK-217）。
@@ -6447,6 +6826,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     dummy_equality_flags: &[bool],
+    result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<BoundScan, SqlSurfaceError> {
     // Issue #1352: 投影位置のスカラーサブクエリは `core.rs` の `Statement::Scan`
     // アームが解決・合流してから束縛へ渡す（解決済みの文は項目を空にして渡す）。
@@ -6509,7 +6889,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
             dummy_equality_flags,
         )?;
 
-    let limit = validate_search_limit(stmt.limit())?;
+    let limit = validate_search_limit_with(stmt.limit(), result_limits)?;
     // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は `LIMIT` と同じ束縛段で検証する
     // （構文段の許可リストは値の上限を持たない生値のまま通すため）。
     let offset = validate_search_offset(stmt.offset())?;
@@ -6517,11 +6897,30 @@ pub(crate) fn bind_scan_with_dummy_flags(
     // Issue #915・SQL-25: スカラー ORDER BY の列名解決・比較規約の割り当て。
     // Issue #1188・SQL-26: 式キーを含む場合は `order_keys` が正本（`order_by` は空）。
     // 式のノード予算は `WHERE`・投影と同じ `node_budget` を共有する。
-    let (order_by, order_exprs) = if stmt.order_keys.is_empty() {
-        (bind_scalar_order_by(stmt.order_by(), schema)?, Vec::new())
-    } else {
-        bind_scan_order_keys(&stmt.order_keys, schema, udfs, &mut node_budget)?
-    };
+    // Issue #1540・SQL-42: SELECT リストの明示別名を参照するキーは先に解決する
+    // （別名に当たらない文は従来と同一の束縛結果になる）。
+    let raw_keys: Vec<std::borrow::Cow<'_, crate::sql::allowlist::ScanOrderKey>> =
+        if stmt.order_keys.is_empty() {
+            stmt.order_by()
+                .iter()
+                .map(|k| {
+                    std::borrow::Cow::Owned(crate::sql::allowlist::ScanOrderKey::Column(k.clone()))
+                })
+                .collect()
+        } else {
+            stmt.order_keys
+                .iter()
+                .map(std::borrow::Cow::Borrowed)
+                .collect()
+        };
+    let resolved_keys = resolve_scan_order_aliases(
+        stmt.projection(),
+        &projection,
+        raw_keys,
+        !stmt.window_items.is_empty(),
+    )?;
+    let (order_by, order_exprs) =
+        bind_scan_order_keys(&resolved_keys, schema, udfs, &mut node_budget)?;
 
     // Issue #353 と同じく、`expr_filters` を束縛時に 1 回だけステップ列コンパイル
     // する（行ループでの再帰評価をなくす）。
@@ -6730,7 +7129,7 @@ fn bind_group_by_clause(
     // 従来の `resolve_target` と同じ規則（キー名・キーの別名・集計項目名。未知は `22000`・曖昧は `42702`）で
     // 解決してから合成列名へ置換するため、`id` 等の疑似列やベースの列が黙って参照される
     // ことはない。
-    let view_schema = group_row_schema(schema, &keys, items);
+    let view_schema = group_row_schema(schema, &keys, items, false);
     let mut group_row_mask = vec![false; keys.len().saturating_add(items.len())];
     let mut having_exprs = Vec::with_capacity(clause.having_exprs.len());
     for pred in &clause.having_exprs {
@@ -6838,6 +7237,18 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
     }
 }
 
+/// 投影式（Issue #1541）が参照する行ビューの集計列型。実セルの型と 1 対 1 の
+/// [`crate::sql::aggregate::aggregate_result_type`] をそのまま使う。ただし `NUMERIC`
+/// （`SUM/MIN/MAX` の疑似列 `id` を含む）と型を決められない組み合わせは `BYTEA` にし、
+/// 束縛が「式で使えない列」として `22000` で拒否する（`NUMERIC` の算術を `f64` で黙って
+/// 近似しない。fail-closed）。
+fn projection_row_column_type(item: &BoundAggregateItem) -> ColumnType {
+    match crate::sql::aggregate::aggregate_result_type(item.func, &item.input) {
+        Some(ColumnType::Numeric { .. }) | None => ColumnType::Bytea,
+        Some(ty) => ty,
+    }
+}
+
 /// グループ出力行ビューの合成スキーマ（Issue #1188・SQL-26）。列は `GROUP BY` キー
 /// （`__gk<i>`）→ 集計項目（`__ga<j>`）の順で、`HAVING`／`ORDER BY` の式束縛
 /// （[`crate::sql::udf_call::bind_expr`]）と実行時の行スカラービュー
@@ -6848,13 +7259,16 @@ fn group_row_schema(
     schema: &TableSchema,
     keys: &[BoundOrderKey],
     items: &[BoundAggregateItem],
+    precise: bool,
 ) -> TableSchema {
     let mut columns = Vec::with_capacity(keys.len().saturating_add(items.len()));
     for (i, key) in keys.iter().enumerate() {
         let ty = match key.target {
             BoundOrderTarget::Column(index) => match schema.columns.get(index).map(|c| &c.ty) {
-                Some(ColumnType::Integer | ColumnType::BigInt) => ColumnType::BigInt,
-                Some(ColumnType::Real | ColumnType::Double) => ColumnType::Double,
+                // `precise`（投影式。Issue #1541）は整数・単精度の列型を保ち、PostgreSQL と
+                // 同じ結果型の算術（`g + 1` → int4 等）を得る。
+                Some(ColumnType::Integer | ColumnType::BigInt) if !precise => ColumnType::BigInt,
+                Some(ColumnType::Real | ColumnType::Double) if !precise => ColumnType::Double,
                 Some(ColumnType::Enum(_)) => ColumnType::Text,
                 Some(other) => other.clone(),
                 None => ColumnType::Bytea,
@@ -6865,11 +7279,12 @@ fn group_row_schema(
         columns.push(ColumnDef::new(format!("__gk{i}"), ty, true));
     }
     for (j, item) in items.iter().enumerate() {
-        columns.push(ColumnDef::new(
-            format!("__ga{j}"),
-            aggregate_result_column_type(item),
-            true,
-        ));
+        let ty = if precise {
+            projection_row_column_type(item)
+        } else {
+            aggregate_result_column_type(item)
+        };
+        columns.push(ColumnDef::new(format!("__ga{j}"), ty, true));
     }
     TableSchema::new("__group_row", columns)
 }

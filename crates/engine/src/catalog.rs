@@ -369,6 +369,7 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
     matches!(
         ty,
         ColumnType::Text
+            | ColumnType::Varchar
             | ColumnType::Enum(_)
             | ColumnType::Date
             | ColumnType::Timestamp
@@ -1037,11 +1038,13 @@ const _: () = assert!(
 
 /// 1 テーブルが持てる列数の上限。カタログ値のデコード時、この値を超える宣言列数は
 /// アロケーション前に拒否する（.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
-/// 列数上限の唯一の定義（Issue #1518）。`pub(crate)` なのは、SQL 構文段
+/// 列数上限の唯一の定義（Issue #1518）。SQL 構文段
 /// （`sql::allowlist` の INSERT・COPY・CREATE TABLE・CREATE INDEX の列リスト上限）と
 /// EXPLAIN のビットセット長（`sql::explain`・Issue #1066）がこの値から導出・直接参照
-/// するため。別名定数やリテラルの 256 を新設しない。
-pub(crate) const MAX_COLUMN_COUNT: usize = 256;
+/// する。別名定数やリテラルの 256 を新設しない。`pub` なのは起動時設定
+/// （[`crate::schema_limits`]・Issue #1548）の範囲検証と結合テストが参照するため
+/// （設定できるのはこの値以下への引き下げだけ）。
+pub const MAX_COLUMN_COUNT: usize = 256;
 
 /// `PRIMARY KEY` に宣言できる列数の上限（TABLE-16・TASK-204、Issue #903）。
 /// PostgreSQL の索引キー列数慣習（32）に合わせた本リポの実装既定値。デコード時、
@@ -1514,6 +1517,12 @@ fn map_tenant_write_error_to_alter_check(e: crate::tenant::TenantWriteError) -> 
 pub enum ColumnType {
     /// 可変長テキスト列。
     Text,
+    /// 長さ制限のない `character varying`（`VARCHAR`／`CHARACTER VARYING`、
+    /// TABLE-31・Issue #2305）。値表現・比較・関数・索引・正準キーは [`ColumnType::Text`]
+    /// と共有し、違いはカタログタグ（`varchar`）と wire 公告型（OID 1043・
+    /// typmod -1）だけ。TEXT と同値扱いにすべき判定は [`Self::is_text_like`]／
+    /// [`Self::same_value_domain`] を使う。`VARCHAR(n)` は構文段で `0A000` 拒否する。
+    Varchar,
     /// 固定次元の埋め込み列（`VECTOR(N)`、TABLE-1）。0 と `MAX_VECTOR_DIM` 超過は
     /// encode・decode 両側で拒否する。
     Vector(u32),
@@ -1571,6 +1580,20 @@ pub enum ColumnType {
 }
 
 impl ColumnType {
+    /// 値表現が TEXT と同一の型（`Text`／`Varchar`）かどうか（Issue #2305）。
+    /// 値の codec・比較・LIKE・関数引数など「TEXT 列として扱ってよい」判定の
+    /// 共通入口で、`matches!(ty, ColumnType::Text)` の置き換え先。
+    pub fn is_text_like(&self) -> bool {
+        matches!(self, ColumnType::Text | ColumnType::Varchar)
+    }
+
+    /// 2 つの列型が同じ値ドメイン（比較・代入・集合演算で相互運用してよい）か
+    /// どうか。完全一致に加え、TEXT 系（`Text`／`Varchar`）同士を同値とみなす
+    /// （Issue #2305）。
+    pub fn same_value_domain(&self, other: &ColumnType) -> bool {
+        self == other || (self.is_text_like() && other.is_text_like())
+    }
+
     /// `VECTOR` 列かどうか（`matches!(ty, ColumnType::Vector(_))` の言い換え。
     /// Issue #880 D9）。
     pub fn is_vector(&self) -> bool {
@@ -1594,6 +1617,7 @@ impl ColumnType {
         matches!(
             self,
             ColumnType::Text
+                | ColumnType::Varchar
                 | ColumnType::Integer
                 | ColumnType::BigInt
                 | ColumnType::Boolean
@@ -1657,7 +1681,11 @@ impl ColumnType {
 
     pub(crate) fn unique_key_tag(&self) -> u8 {
         match self {
-            ColumnType::Text => 1,
+            // `Varchar` は TEXT と正準キーのバイト列が同一のため同じタグを共有する
+            // （Issue #2305。新型には未使用タグを採番する規則の意図的な例外）。共有に
+            // より TEXT↔VARCHAR の PK／FK 照合で recode が不要になり、ALTER COLUMN
+            // TYPE でも `user_uniq`・`key_index` を失効させずに済む。
+            ColumnType::Text | ColumnType::Varchar => 1,
             ColumnType::Integer => 2,
             ColumnType::BigInt => 3,
             ColumnType::Boolean => 4,
@@ -1688,6 +1716,7 @@ impl ColumnType {
     fn catalog_fields(&self) -> (&'static str, String) {
         match self {
             ColumnType::Text => ("text", "-".to_string()),
+            ColumnType::Varchar => ("varchar", "-".to_string()),
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
             ColumnType::Integer => ("integer", "-".to_string()),
             ColumnType::BigInt => ("bigint", "-".to_string()),
@@ -1756,6 +1785,14 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::BigInt)
+            }
+            "varchar" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "varchar column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Varchar)
             }
             "real" => {
                 if param != "-" {
@@ -2846,6 +2883,18 @@ impl ArrayType {
         self.elem
     }
 
+    /// 要素型・語彙を保ったまま要素数上限だけを差し替えた配列型を返す（Issue #1548。
+    /// 起動時設定 `--max-array-elements` で `[]` 省略列の上限を組み直す実行段用）。
+    /// 範囲外（`1..=MAX_ARRAY_ELEMENTS` 外）は [`Self::new`] と同じく `Err`。
+    pub fn with_max_len(&self, max_len: u32) -> Result<Self> {
+        Self::check_max_len(max_len)?;
+        Ok(Self {
+            elem: self.elem,
+            max_len,
+            enum_def: self.enum_def.clone(),
+        })
+    }
+
     pub fn max_len(&self) -> u32 {
         self.max_len
     }
@@ -2994,6 +3043,7 @@ impl ColumnDefault {
             (
                 ColumnDefault::Text(_),
                 ColumnType::Text
+                    | ColumnType::Varchar
                     | ColumnType::Date
                     | ColumnType::Timestamp
                     | ColumnType::Uuid
@@ -3922,6 +3972,7 @@ impl TableSchema {
         self.columns.iter().find_map(|c| match &c.ty {
             ColumnType::Vector(dim) => Some(*dim),
             ColumnType::Text
+            | ColumnType::Varchar
             | ColumnType::Integer
             | ColumnType::BigInt
             | ColumnType::Real
@@ -4585,7 +4636,12 @@ fn resolve_foreign_key_target(
         let child_ty = child_type(child_name)?;
         let integer_widened = matches!(child_ty, ColumnType::Integer | ColumnType::BigInt)
             && matches!(parent_ty, ColumnType::Integer | ColumnType::BigInt);
-        if !integer_widened && child_ty.catalog_fields() != parent_ty.catalog_fields() {
+        // TEXT と VARCHAR は値表現・正準キーが同一のため組を許す（Issue #2305）。
+        let text_family = child_ty.is_text_like() && parent_ty.is_text_like();
+        if !integer_widened
+            && !text_family
+            && child_ty.catalog_fields() != parent_ty.catalog_fields()
+        {
             return Err(CatalogError::InvalidForeignKey(format!(
                 "foreign key column {child_name} and referenced column {parent_name} are of incompatible types"
             )));
@@ -7255,7 +7311,23 @@ impl Storage {
     ///   存在しない）。将来導入する場合は補完専用の値を分離する必要がある
     ///
     /// 対象テーブル不存在・列名重複も `Err`。
-    pub fn alter_table_add_column(&self, table_name: &str, mut column: ColumnDef) -> Result<()> {
+    pub fn alter_table_add_column(&self, table_name: &str, column: ColumnDef) -> Result<()> {
+        self.alter_table_add_column_with_limit(table_name, column, MAX_COLUMN_COUNT)
+    }
+
+    /// [`Self::alter_table_add_column`] の列数上限を引数化した版（Issue #1548。起動時設定
+    /// `--max-table-columns` の注入点）。物理スロット数（生存列＋墓標）が
+    /// `max_columns.min(MAX_COLUMN_COUNT)` 以上なら、write txn 内で
+    /// [`CatalogError::TooManyColumns`] を返す（並行 ADD COLUMN による TOCTOU を避ける）。
+    /// 上限は定義が増える本操作にだけ効かせ、decode・`validate_schema` には入れない
+    /// （既存テーブルが設定値を超える列数を持っていても読み出せるようにする）。
+    pub fn alter_table_add_column_with_limit(
+        &self,
+        table_name: &str,
+        mut column: ColumnDef,
+        max_columns: usize,
+    ) -> Result<()> {
+        let max_columns = max_columns.min(MAX_COLUMN_COUNT);
         validate_identifier(table_name)?;
         validate_column(&column)?;
         if crate::row_codec::validate_column_default(&column).is_err() {
@@ -7323,7 +7395,7 @@ impl Storage {
             // 合算して判定する）。
             // 上限超過は `Invalid` と区別した `TooManyColumns` で返す（Issue #900。
             // SQL 表層 `ALTER TABLE ADD COLUMN` が `54000` へ写像するため）。
-            if schema.physical_slot_count() >= MAX_COLUMN_COUNT {
+            if schema.physical_slot_count() >= max_columns {
                 return Err(CatalogError::TooManyColumns {
                     count: schema.physical_slot_count().saturating_add(1),
                 });
@@ -8262,7 +8334,8 @@ impl Storage {
     /// カタログのみ書き換え）と、全テナントの既存行を同一 write txn 内で再エンコード
     /// する `INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`（Issue #1361。
     /// [`crate::column_rewrite`]。PK／UNIQUE／FOREIGN KEY の構成列も受理し、型タグ付きの
-    /// 索引〔`user_uniq`・`key_index`〕は同一 txn 内で失効させる。Issue #1402）で、それ以外（VECTOR 次元変更・同一型・縮小・
+    /// 索引〔`user_uniq`・`key_index`〕は同一 txn 内で失効させる。Issue #1402）と、
+    /// カタログのタグだけを書き換える `TEXT`↔`VARCHAR`（Issue #2305）で、それ以外（VECTOR 次元変更・同一型・縮小・
     /// scale 変更・異種型・`INTEGER`→`DOUBLE PRECISION` 等）はすべて
     /// `IncompatibleTypeChange`。成功時は世代を bump して索引キャッシュを失効させる。
     ///
@@ -8290,6 +8363,12 @@ impl Storage {
                     scale: s1,
                 },
             ) if s0 == s1 && p1 > p0 => Ok((target.clone(), None)),
+            // TEXT と VARCHAR は行バイト列・正準キーとも同一表現のため、カタログのタグだけを
+            // 書き換える（行の書き換えも `user_uniq`・`key_index` の失効も不要。
+            // 世代 bump は共通本体が行う。Issue #2305）。
+            (ColumnType::Text, ColumnType::Varchar) | (ColumnType::Varchar, ColumnType::Text) => {
+                Ok((target.clone(), None))
+            }
             (ColumnType::Integer, ColumnType::BigInt) => Ok((
                 target.clone(),
                 Some(crate::column_rewrite::WideningKind::IntegerToBigInt),

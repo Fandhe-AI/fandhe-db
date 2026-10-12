@@ -176,8 +176,81 @@ enum TxnState<'e> {
 /// 持続時間・文数の上限超過時のエラー文言（`54000`）。
 const LIMIT_EXCEEDED_MESSAGE: &str = "transaction exceeded duration or statement limit";
 
+/// 明示トランザクションの最大持続時間（ミリ秒）の下限（Issue #1553・SQL-46 のポインタ）。
+pub const MIN_TRANSACTION_DURATION_MS: u64 = 100;
+/// 最大持続時間（ミリ秒）の既定値（`TransactionLimits::default()` と同値）。
+pub const DEFAULT_TRANSACTION_DURATION_MS: u64 = 20_000;
+/// 最大持続時間（ミリ秒）のハード上限。単一ライタを握る時間の上限として、書き込みロック
+/// 待ち上限の既定（30 秒）の 2 倍を暫定採用する（オーナー確認待ち。
+/// `docs/design/transaction-limits-cli.md`）。
+pub const MAX_TRANSACTION_DURATION_MS: u64 = 60_000;
+
+/// 最大文数の下限。
+pub const MIN_TRANSACTION_STATEMENTS: u32 = 1;
+/// 最大文数の既定値（`TransactionLimits::default()` と同値）。
+pub const DEFAULT_TRANSACTION_STATEMENTS: u32 = 1_000;
+/// 最大文数のハード上限（既定の 10 倍。暫定・オーナー確認待ち）。
+pub const MAX_TRANSACTION_STATEMENTS: u32 = 10_000;
+
+/// トランザクション上限設定値が範囲外であることを表すエラー（Issue #1553）。
+/// 文言は項目名・入力値・範囲だけを含む（テナントやデータの情報は含めない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionLimitOutOfRange {
+    pub item: &'static str,
+    pub value: u64,
+    pub min: u64,
+    pub max: u64,
+}
+
+impl std::fmt::Display for TransactionLimitOutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} value {} is out of range {}..={}",
+            self.item, self.value, self.min, self.max
+        )
+    }
+}
+
+impl std::error::Error for TransactionLimitOutOfRange {}
+
+/// 最大持続時間（ミリ秒）を検証して [`Duration`] にする。範囲検証の単一情報源
+/// （wire-server の `transaction_limits_opt` が CLI 文字列を厳密パースして呼ぶ）。
+pub fn validate_max_transaction_duration_ms(
+    value: u64,
+) -> Result<Duration, TransactionLimitOutOfRange> {
+    if (MIN_TRANSACTION_DURATION_MS..=MAX_TRANSACTION_DURATION_MS).contains(&value) {
+        Ok(Duration::from_millis(value))
+    } else {
+        Err(TransactionLimitOutOfRange {
+            item: "max transaction duration (ms)",
+            value,
+            min: MIN_TRANSACTION_DURATION_MS,
+            max: MAX_TRANSACTION_DURATION_MS,
+        })
+    }
+}
+
+/// 最大文数を検証して `u32` にする（範囲検証の単一情報源。`u32` に収まらない値も範囲外）。
+pub fn validate_max_transaction_statements(value: u64) -> Result<u32, TransactionLimitOutOfRange> {
+    let out_of_range = || TransactionLimitOutOfRange {
+        item: "max transaction statements",
+        value,
+        min: u64::from(MIN_TRANSACTION_STATEMENTS),
+        max: u64::from(MAX_TRANSACTION_STATEMENTS),
+    };
+    let v = u32::try_from(value).map_err(|_| out_of_range())?;
+    if (MIN_TRANSACTION_STATEMENTS..=MAX_TRANSACTION_STATEMENTS).contains(&v) {
+        Ok(v)
+    } else {
+        Err(out_of_range())
+    }
+}
+
 /// トランザクションの持続時間・文数の上限（実装既定値。spec 由来の数値ではない。
-/// `docs/design/explicit-transaction.md` 参照）。
+/// `docs/design/explicit-transaction.md` 参照）。明示・暗黙（WIRE-16）の両方に効く。
+/// 起動時 CLI（Issue #1553）からの設定は `validate_*` を通した値だけを
+/// `EngineCore::with_transaction_limits` で注入する。
 #[derive(Debug, Clone, Copy)]
 pub struct TransactionLimits {
     pub max_duration: Duration,
@@ -187,8 +260,8 @@ pub struct TransactionLimits {
 impl Default for TransactionLimits {
     fn default() -> Self {
         Self {
-            max_duration: Duration::from_secs(20),
-            max_statements: 1_000,
+            max_duration: Duration::from_millis(DEFAULT_TRANSACTION_DURATION_MS),
+            max_statements: DEFAULT_TRANSACTION_STATEMENTS,
         }
     }
 }
@@ -821,6 +894,42 @@ fn map_write_lock_err(e: crate::storage::StorageError) -> SqlSurfaceError {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn limits_default_matches_constants() {
+        let d = TransactionLimits::default();
+        assert_eq!(d.max_duration, Duration::from_secs(20));
+        assert_eq!(d.max_statements, 1_000);
+    }
+
+    #[test]
+    fn validate_duration_boundaries() {
+        assert_eq!(
+            validate_max_transaction_duration_ms(100),
+            Ok(Duration::from_millis(100))
+        );
+        assert_eq!(
+            validate_max_transaction_duration_ms(60_000),
+            Ok(Duration::from_secs(60))
+        );
+        for bad in [0, 99, 60_001, u64::MAX] {
+            assert!(validate_max_transaction_duration_ms(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn validate_statements_boundaries() {
+        assert_eq!(validate_max_transaction_statements(1), Ok(1));
+        assert_eq!(validate_max_transaction_statements(10_000), Ok(10_000));
+        for bad in [0, 10_001, u64::from(u32::MAX) + 1, u64::MAX] {
+            assert!(validate_max_transaction_statements(bad).is_err(), "{bad}");
+        }
+        let e = validate_max_transaction_statements(0).expect_err("zero");
+        assert_eq!(
+            e.to_string(),
+            "max transaction statements value 0 is out of range 1..=10000"
+        );
+    }
     use super::*;
 
     fn tokens_of(sql: &str) -> Vec<Token> {

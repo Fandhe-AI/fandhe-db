@@ -23,11 +23,13 @@
 use super::allowlist::{ParsedViewBody, Projection, SqlSurfaceError, TableLookup};
 use super::view::{check_columns_within_view, resolve_from, Resolved};
 
-/// CTE の定義数上限（超過は `54000`。SQL-29 (b) の受入基準 3）。
+/// CTE の定義数の**ハード上限（＝既定値）**（超過は `54000`。SQL-29 (b) の受入基準 3）。
+/// Issue #1552: 運用者は起動時に [`crate::nesting_limits::NestingLimits`] で下げられる。
 pub(crate) const MAX_CTE_DEFINITIONS: usize = 16;
 
 /// CTE→CTE の連鎖の深さ上限（`catalog::MAX_VIEW_NESTING_DEPTH` と同じ値。
 /// 連鎖の先がビューに到達した後は既存の VIEW ネスト上限がそのまま効く）。
+/// **ハード上限（＝既定値）**で、Issue #1552 により起動時に下げられる。
 pub(crate) const MAX_CTE_NESTING_DEPTH: u32 = 4;
 
 /// CTE 名の解決回数（1 回の [`resolve_relation`] 呼び出し系列の中で名前が
@@ -95,12 +97,18 @@ pub(crate) fn resolve_relation(
     visible_upto: usize,
     name: &str,
     depth: u32,
+    max_depth: usize,
     budget: &mut ResolveBudget,
 ) -> Result<Resolved, SqlSurfaceError> {
-    if depth > MAX_CTE_NESTING_DEPTH {
-        return Err(SqlSurfaceError::payload_too_large(
-            "CTE nesting depth exceeds limit",
-        ));
+    // `max_depth` は起動時設定値（Issue #1552。呼び出し元は
+    // `NestingLimits::max_cte_nesting_depth`）。変換不能ならハード上限へ倒す（fail-closed）。
+    let max_depth = u32::try_from(max_depth)
+        .unwrap_or(MAX_CTE_NESTING_DEPTH)
+        .min(MAX_CTE_NESTING_DEPTH);
+    if depth > max_depth {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "CTE nesting depth exceeds limit {max_depth}"
+        )));
     }
 
     // 後ろ（最も内側で定義された CTE）から順に名前を照合する。`visible_upto`
@@ -120,8 +128,11 @@ pub(crate) fn resolve_relation(
             idx,
             &def.body.table_name,
             depth.checked_add(1).ok_or_else(|| {
-                SqlSurfaceError::payload_too_large("CTE nesting depth exceeds limit")
+                SqlSurfaceError::payload_too_large(format!(
+                    "CTE nesting depth exceeds limit {max_depth}"
+                ))
             })?,
+            max_depth_usize(max_depth),
             budget,
         )?;
         return compose(inner, def);
@@ -177,12 +188,21 @@ fn compose(inner: Resolved, def: &CteDef) -> Result<Resolved, SqlSurfaceError> {
     })
 }
 
+/// [`resolve_relation`] の再帰呼び出しへ上限を引き継ぐための `u32`→`usize` 変換
+/// （変換不能は起こり得ないが、失敗時は 0＝最も厳しい側へ倒す）。
+fn max_depth_usize(max_depth: u32) -> usize {
+    usize::try_from(max_depth).unwrap_or(0)
+}
+
 /// 定義数の上限を検査する（`sql::allowlist::parse_with_clause` から呼ばれる）。
-pub(crate) fn check_definition_count(count: usize) -> Result<(), SqlSurfaceError> {
-    if count > MAX_CTE_DEFINITIONS {
-        return Err(SqlSurfaceError::payload_too_large(
-            "CTE definition count exceeds limit",
-        ));
+/// `limit` は起動時設定値（Issue #1552。ハード上限 [`MAX_CTE_DEFINITIONS`] 以下）で、
+/// 超過は `54000`。ハード上限を超える値が渡されても、ハード上限で頭打ちにする。
+pub(crate) fn check_definition_count(count: usize, limit: usize) -> Result<(), SqlSurfaceError> {
+    let effective = limit.min(MAX_CTE_DEFINITIONS);
+    if count > effective {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "CTE definition count exceeds limit {effective}"
+        )));
     }
     Ok(())
 }

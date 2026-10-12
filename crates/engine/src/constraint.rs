@@ -1284,7 +1284,9 @@ pub(crate) fn recode_key_for_types(
             .get(pos..payload_end)
             .ok_or("canonical key component exceeds the key length")?;
         pos = payload_end;
-        if src == dst {
+        // TEXT と VARCHAR は正準キーのバイト列（タグ含む）が同一のため読み替え不要
+        // （`ColumnType::unique_key_tag` が同一タグを共有する。Issue #2305）。
+        if src == dst || (src.is_text_like() && dst.is_text_like()) {
             out.extend_from_slice(component);
             continue;
         }

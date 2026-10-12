@@ -338,9 +338,10 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
         // 式項目・集計結果（`Computed`）は wire 側が Issue #1173 で型付き OID を
         // 公告するようになっても、NOSQL-11 の契約に従い `"text"` 固定を維持する
         // （wire 側との意図的な非対称。モジュール doc 参照）。
-        ColumnMeta::Computed { .. } => "text",
+        ColumnMeta::Computed { .. } | ColumnMeta::AliasedId { .. } => "text",
         ColumnMeta::Scalar { ty, .. } => match ty {
             ColumnType::Text => "text",
+            ColumnType::Varchar => "varchar",
             ColumnType::Vector(_) => "vector",
             ColumnType::Integer => "integer",
             ColumnType::BigInt => "bigint",

@@ -36,6 +36,8 @@ const MAX_ERROR_DETAIL_LEN: usize = crate::error_format::MAX_MESSAGE_LEN;
 /// （Issue #927・SQL-29 (a)・TASK-213。実装既定値）。`Parser::subquery_ctx` の
 /// 深さがこれを超える箇所を構文解析段で `54000` へ落とし、`sql::subquery` の
 /// 解決（再帰的な内側実行）がスタック・実行コストとも定数段に収まるようにする。
+/// Issue #1552: 本定数は**ハード上限（＝既定値）**で、運用者は起動時に
+/// [`crate::nesting_limits::NestingLimits`] で下げられる（引き上げは不可）。
 pub(crate) const MAX_SUBQUERY_DEPTH: usize = 4;
 
 /// `CREATE TABLE` の列定義が受理する列型キーワード（[`Parser::parse_create_table_column`]
@@ -66,7 +68,8 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "UUID",
     "NUMERIC",
     "DECIMAL",
-    // 定める ID が未確定で `0A000` 拒否する型名（Issue #2303。TABLE-30・TABLE-31）。
+    // 定める ID が未確定、または長さ指定付きで `0A000` 拒否する型名（Issue #2303・#2305。
+    // 長さなし `VARCHAR`／`CHARACTER VARYING` は受理する。TABLE-30・TABLE-31）。
     // 解決表（`ddl_column_type::TYPE_NAME_TABLE`）の全行を載せる契約。
     "INT2",
     "SMALLINT",
@@ -1560,6 +1563,10 @@ pub enum SelectItem {
     /// 関数呼び出しを頂点に持つ式項目（TASK-79・SQL-9: 宣言的 UDF・組み込み関数の
     /// 結果列位置での呼び出し）。`alias` 省略時の列名は `sql::parser` が関数名から
     /// 導出する。
+    ///
+    /// Issue #1540（SQL-42）契約: `expr` が [`Expr::Ident`] で `alias` が `Some` の項目は
+    /// 「別名付きの列参照（実在列または疑似列 `id`）」を表す。値と型は別名なしの列と
+    /// 同一で、式評価器を通さない（`sql::parser::bind_projection` が特別扱いする）。
     Expr { expr: Expr, alias: Option<String> },
 }
 
@@ -1913,8 +1920,12 @@ pub(crate) struct BufferedRows {
     pub(crate) order_keys: Vec<ScanOrderKey>,
     /// ウィンドウ項目（Issue #1411）。
     pub(crate) window_items: Vec<WindowSelectItem>,
-    /// 外側 `LIMIT`（範囲検証済み）。
+    /// 外側 `LIMIT`（`limit_explicit` が true のとき利用者が書いた値。範囲は
+    /// `EngineCore` が設定値で検査する）。
     pub(crate) limit: u32,
+    /// 利用者が `LIMIT` を明示したか。false は連鎖の素通し外側（`LIMIT` なし＝無制限で
+    /// `limit` は `u32::MAX`）。明示値は `u32::MAX` でも必ず設定上限で検査する（Issue #1555）。
+    pub(crate) limit_explicit: bool,
     /// 外側 `OFFSET`（範囲検証済み。既定 0）。
     pub(crate) offset: u32,
 }
@@ -2381,6 +2392,100 @@ pub enum AggregateSelectItem {
         column: String,
         alias: Option<String>,
     },
+    /// 集計結果を葉とする算術式の投影項目（Issue #1541・SQL-42 (5) のポインタ。
+    /// `sum(n)+1`・`count(*)*2` など）。`expr` 中の集計関数呼び出しは `aggregates`
+    /// （出現順）へ抽出済みで、式木側には利用者が識別子として書けない内部名
+    /// （[`aggregate_placeholder`]）の `Expr::Ident` が代わりに置かれる。これにより
+    /// 公開 AST の式型 [`Expr`] を拡張せず、集計経路に変更を閉じ込める。式中の
+    /// 残りの裸識別子は `GROUP BY` 列と同名であることを [`parse_aggregate_shape`] が
+    /// 検査済み（不一致・`GROUP BY` なしは `42601`）。評価はグループ確定後
+    /// （`sql::group_by` の投影段）に行う。`alias` 省略時の列名は `?column?`。
+    Expr {
+        expr: Expr,
+        aggregates: Vec<AggregateItem>,
+        alias: Option<String>,
+    },
+}
+
+/// 集計式項目（[`AggregateSelectItem::Expr`]）内で集計呼び出しの代わりに置く内部名の接頭辞。
+/// 先頭の制御文字は字句解析器が受理する識別子（`[A-Za-z_][A-Za-z0-9_]*`。二重引用符形も同じ
+/// 制約）では生成できないため、利用者の列名・`GROUP BY` 列名・別名と衝突・すり替えが起きない。
+const AGG_PLACEHOLDER_PREFIX: &str = "\u{1}agg";
+
+/// `j` 番目の集計呼び出しの内部名（[`AggregateSelectItem::Expr`]）。
+pub(crate) fn aggregate_placeholder(j: usize) -> String {
+    format!("{AGG_PLACEHOLDER_PREFIX}{j}")
+}
+
+/// 内部名から集計呼び出しの添字を取り出す。内部名でなければ `None`。
+pub(crate) fn aggregate_placeholder_index(name: &str) -> Option<usize> {
+    name.strip_prefix(AGG_PLACEHOLDER_PREFIX)?.parse().ok()
+}
+
+/// 集計式項目の式中の裸識別子（内部名を除く。名前順）。
+pub(crate) fn expr_bare_idents(expr: &Expr) -> Vec<String> {
+    let mut idents = std::collections::HashSet::new();
+    super::parser::collect_expr_idents(expr, &mut idents);
+    let mut v: Vec<String> = idents
+        .into_iter()
+        .filter(|n| aggregate_placeholder_index(n).is_none())
+        .collect();
+    v.sort();
+    v
+}
+
+impl AggregateSelectItem {
+    /// この項目が参照する表の列名を `out` へ集める（ビューの公開列検査・相関参照検査・
+    /// 評価後射影形ビューの参照列収集が共有する単一実装）。集計式項目は、式中の裸識別子
+    /// （内部名を除く）と各集計呼び出しの引数の識別子を必ず含める（列の公開範囲検査から
+    /// 漏れると非公開列を式経由で参照できてしまうため。security.md「アクセス制御の不備」）。
+    pub(crate) fn collect_referenced_idents(&self, out: &mut std::collections::HashSet<String>) {
+        let agg_args = |agg: &AggregateItem, out: &mut std::collections::HashSet<String>| {
+            if let AggregateArg::Expr(e) = &agg.arg {
+                super::parser::collect_expr_idents(e, out);
+            }
+        };
+        match self {
+            AggregateSelectItem::GroupKey { column, .. } => {
+                out.insert(column.clone());
+            }
+            AggregateSelectItem::Aggregate(agg) => agg_args(agg, out),
+            AggregateSelectItem::Expr {
+                expr, aggregates, ..
+            } => {
+                for agg in aggregates {
+                    agg_args(agg, out);
+                }
+                out.extend(expr_bare_idents(expr));
+            }
+        }
+    }
+
+    /// SELECT リスト上の実効名（`HAVING`／`ORDER BY` の参照名・出力列名）。集計式項目は
+    /// 別名、なければ PostgreSQL の既定列名 `?column?`。
+    pub(crate) fn effective_name(&self) -> String {
+        match self {
+            AggregateSelectItem::GroupKey { column, alias } => {
+                alias.clone().unwrap_or_else(|| column.clone())
+            }
+            AggregateSelectItem::Aggregate(agg) => agg
+                .alias
+                .clone()
+                .unwrap_or_else(|| agg.func.default_alias().to_string()),
+            AggregateSelectItem::Expr { alias, .. } => {
+                alias.clone().unwrap_or_else(|| "?column?".to_string())
+            }
+        }
+    }
+
+    /// この項目が占める集計項目枠数（[`MAX_AGGREGATE_ITEMS`] の判定用。保守的に
+    /// 項目自身 1 ＋式中の集計呼び出し数で数える）。
+    fn slot_count(&self) -> usize {
+        match self {
+            AggregateSelectItem::Expr { aggregates, .. } => 1usize.saturating_add(aggregates.len()),
+            _ => 1,
+        }
+    }
 }
 
 /// `HAVING` 述語 1 つ（TASK-167・SQL-14）。左辺は SELECT リストに現れる集計項目の
@@ -2607,6 +2712,8 @@ struct ParsedCreateTableColumn {
     references_name: Option<String>,
     /// 列型に現れた型名エイリアスの原文の綴り（Issue #1528）。
     alias_type_name: Option<String>,
+    /// 配列型で要素数 `[N]` が省略された（`<型>[]`）場合 true（Issue #1548）。
+    array_len_defaulted: bool,
 }
 
 /// `REFERENCES` 句（列制約・表制約の双方で共有。TABLE-17・TASK-205、
@@ -2893,6 +3000,10 @@ pub struct ValidatedCreateTable {
     /// 列型に現れた型名エイリアス（`INT4` 等。配列要素を含む）の原文の綴り（宣言順。
     /// Issue #1528）。実行段が既存の同綴り ENUM 型との衝突を拒否するために使う。
     pub alias_type_names: Vec<String>,
+    /// 要素数 `[N]` を省略した配列列（`<型>[]`）の列名（宣言順。Issue #1548）。構文段は
+    /// 省略時に `MAX_ARRAY_ELEMENTS` を埋めるため、実行段（`sql::ddl::execute_create_table`）
+    /// が起動時設定 `--max-array-elements` で要素数上限を組み直すための補助情報。
+    pub array_len_defaulted: Vec<String>,
     /// `PRIMARY KEY` 宣言列名（宣言順。TABLE-16・TASK-204、Issue #903）。
     /// 未宣言（`id` 暗黙主キーのまま）は `None`。`PRIMARY KEY (id)`（`id` 単独）
     /// は暗黙主キーの明示宣言として受理したうえで `None` へ正規化する
@@ -3392,6 +3503,10 @@ struct Parser<'a> {
     /// トップレベル呼び出し（`parse_select_shape`/`parse_aggregate_shape` の
     /// 呼び出し元）だけが `Some(0)` を設定する。
     subquery_ctx: Option<usize>,
+    /// サブクエリ深さ・CTE 定義数の実効上限（Issue #1552）。`Parser::new` の既定は
+    /// ハード上限と同値で、セッション SQL のパース入口だけが
+    /// [`Self::with_nesting_limits`] で起動時設定値へ差し替える。
+    nesting_limits: crate::nesting_limits::NestingLimits,
     /// `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）の現在の
     /// 入れ子段数。[`enter_case_nesting`]／[`Self::exit_case_nesting`] が
     /// 対で管理する（構文段の計測。束縛段の独立検査は `udf_call::BindEnv::
@@ -3408,6 +3523,12 @@ struct Parser<'a> {
     /// 引数など）では `false` のままとし、`NULL` は列名としての後方互換を
     /// 優先して裸の識別子（`Expr::Ident`）へ解析する。
     allow_null_literal: bool,
+    /// 単項マイナス（`-<primary>`）を `0 - <primary>` へ脱糖して受理してよい文脈かどうか
+    /// （Issue #1538・SQL-42）。単一テーブル SELECT の投影項目（[`Self::parse_select_item`]
+    /// の式モード）の解析中だけ `true` にする。`parse_primary_expr` は WHERE・CHECK 本体・
+    /// UDF 本体・ORDER BY 式キーと共有されており、それらの一般単項マイナスは従来どおり
+    /// `42601` で拒否する契約（fail-closed）を保つため、既定は `false`。
+    allow_unary_minus: bool,
     /// `CHECK ( ... )` 本体（TABLE-16）を解析中かどうか（Issue #1184）。`true` の間は
     /// `NOT ( ... )`・裸の `NOT <式比較>`・数値の `IN`／`BETWEEN` を従来どおり
     /// `42601` にする（脱糖後の形が `check_constraint` の許可形と区別できず、
@@ -3433,6 +3554,20 @@ struct Parser<'a> {
     /// `true` の間は単一テーブル FROM の別名を `42601` で拒否する（集合演算の枝が
     /// 既存の SELECT／集計パーサーを再利用するため、別名を枝へ持ち込ませない。Issue #1534）。
     reject_from_alias: bool,
+    /// 集計 SELECT リストで集計結果どうし・定数との算術式項目（[`AggregateSelectItem::Expr`]。
+    /// Issue #1541）を受理してよい文脈かどうか。トップレベル文（サブクエリ深さ 0）の
+    /// [`parse_aggregate_shape`] だけが `true` にする。CTE 本体・集合演算の枝・
+    /// サブクエリ内部・ビュー本体は既定の `false` のまま従来どおり `42601` で拒否する
+    /// （それらの経路は式項目の評価・列公開範囲検査を持たないため fail-closed）。
+    allow_aggregate_expr_items: bool,
+    /// 集計式項目の式モード解析中に、式の途中に現れた集計関数呼び出しを溜める先。
+    /// `Some` の間だけ [`Self::parse_call_expr`] が集計関数名を受理し、内部名の
+    /// `Expr::Ident` に置き換えて返す。`None`（既定）では従来どおり `42601`
+    /// （WHERE・CHECK・UDF 本体・集計引数内の入れ子集計など）。
+    agg_calls: Option<Vec<AggregateItem>>,
+    /// SELECT リストで既に確定した項目が占める集計項目枠数（[`AggregateSelectItem::slot_count`]
+    /// の合計）。式中の集計呼び出しを溜める前に [`MAX_AGGREGATE_ITEMS`] を検査するための基点。
+    agg_slots_used: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -3460,12 +3595,17 @@ impl<'a> Parser<'a> {
             pos: 0,
             expr_node_budget: MAX_EXPR_NODES,
             subquery_ctx: None,
+            nesting_limits: crate::nesting_limits::NestingLimits::default(),
             case_nesting: 0,
             allow_null_literal: false,
+            allow_unary_minus: false,
             in_check_body: false,
             max_insert_rows: None,
             from_ref: None,
             reject_from_alias: false,
+            allow_aggregate_expr_items: false,
+            agg_calls: None,
+            agg_slots_used: 0,
         }
     }
 
@@ -3484,6 +3624,13 @@ impl<'a> Parser<'a> {
         self
     }
 
+    /// 入れ子系上限の実効値を差し替える（Issue #1552）。起動時設定
+    /// （[`crate::nesting_limits::NestingLimits`]）を持つ入口だけが呼ぶ。
+    fn with_nesting_limits(mut self, limits: crate::nesting_limits::NestingLimits) -> Self {
+        self.nesting_limits = limits;
+        self
+    }
+
     /// `IN (SELECT ...)`／`EXISTS (SELECT ...)` を検出した位置で呼ぶ。現在の
     /// 文脈が許可されていなければ `42601`、許可されていても深さ上限
     /// （[`MAX_SUBQUERY_DEPTH`]）を超えるなら `54000`。返り値は新設する
@@ -3495,10 +3642,11 @@ impl<'a> Parser<'a> {
         })?;
         let next_depth = ctx_depth
             .checked_add(1)
-            .filter(|d| *d <= MAX_SUBQUERY_DEPTH);
+            .filter(|d| *d <= self.nesting_limits.max_subquery_depth());
         next_depth.ok_or_else(|| {
             SqlSurfaceError::payload_too_large(format!(
-                "subquery nesting exceeds limit {MAX_SUBQUERY_DEPTH}"
+                "subquery nesting exceeds limit {}",
+                self.nesting_limits.max_subquery_depth()
             ))
         })
     }
@@ -3689,51 +3837,103 @@ impl<'a> Parser<'a> {
         Ok(Projection::Items(items))
     }
 
-    /// SELECT リストの 1 項目。次のトークンが `ident '('` なら式項目（関数呼び出し。
-    /// 続けて `AS <alias>` を任意で受理する）、それ以外は従来どおり裸の列名として
-    /// 受理する。
+    /// SELECT リストの 1 項目。`parse_select_list`／`parse_select_list_with_windows` から
+    /// 呼ばれ、束縛は `sql::parser::bind_projection` → `udf_call::bind_expr` が担う。
+    /// 先頭トークンで分岐する（Issue #1538・SQL-42）。`CASE WHEN`・関数呼び出し
+    /// （`ident '('`）・数値・`(`・`-`、および `ident` 直後の `+ - * /` は式項目として
+    /// 既存の式文法へ委譲し（任意で `AS <alias>`）、それ以外は従来どおり裸の列名とする。
+    /// 文字列リテラル始まり・`NULL` 等は式トリガーに含めない（従来どおり `42601`）。
+    /// 関数始まりは頭を従来と同じ深さで読み、直後が算術演算子のときだけ中置式へ継続する
+    /// ため、`MAX_EXPR_DEPTH` 境界の既存入力の挙動は変わらない。
     fn parse_select_item(&mut self) -> Result<SelectItem, SqlSurfaceError> {
-        if let Some(Token::Ident(name)) = self.peek() {
-            let name = name.clone();
-            // `CASE`（対象ビヘイビア: SQL-26。Issue #921）は `ident '('` 形では
-            // なく頂点に来るため、次が `'('` かに加えて大小無視で照合する。ただし
-            // `WHEN` を伴わない `CASE` は式ではなく既存の列名 `case` の参照
-            // （`SELECT case FROM t` 等）でありうるため、`DISTINCT`／`LIKE` と
-            // 同じ文脈的キーワードの判定方針（1 トークン先読み）で「次が `WHEN`
-            // であるときのみ」式として扱う（codex-review 指摘対応: 先読み無しでは
-            // 既存の列名 `case` の SELECT が構文エラー化する破壊的変更になる）。
-            // `NULL` は後続トークンによる曖昧性解消ができない（`SELECT null FROM t`
-            // は「列 `null` の参照」と「NULL リテラルの投影」のどちらも構文上
-            // 同一の形になる）ため、列名としての後方互換を優先し、ここでは式
-            // トリガーに含めない（`NULL` リテラルは `CASE`／`COALESCE`／`NULLIF`
-            // の内側など `parse_primary_expr` 経由の文脈では従来どおり使える）。
-            let starts_case =
-                name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
-            let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
-            let is_extract_syntax = starts_call && name.eq_ignore_ascii_case("extract");
-            if starts_case || starts_call {
-                let expr = if starts_case {
-                    self.parse_value_expr(0)?
-                } else {
+        let mut is_extract_syntax = false;
+        let expr = match self.peek().cloned() {
+            Some(Token::Ident(name)) => {
+                // `WHEN` を伴わない `CASE` は既存の列名 `case` でありうるため 1 トークン
+                // 先読みする。`NULL` は列名との曖昧性を解消できないので式トリガーにしない。
+                let starts_case =
+                    name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
+                let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
+                let next_is_op = matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Punct('+' | '-' | '*' | '/'))
+                );
+                if starts_case {
+                    self.parse_projection_infix(0)?
+                } else if starts_call {
+                    is_extract_syntax = name.eq_ignore_ascii_case("extract");
                     self.advance();
-                    self.parse_call_expr(name, 0)?
-                };
-                let alias = if self.peek_ident_matches("AS") {
-                    self.advance();
-                    Some(self.expect_ident()?)
-                } else if is_extract_syntax
-                    && matches!(&expr, Expr::Call { name, .. } if name == "date_part")
-                {
-                    // Issue #1188: EXTRACT 構文は `date_part` へ脱糖されるが、PostgreSQL 互換の
-                    // 既定列名は `extract`（明示の `date_part(...)` は `date_part` のまま）。
-                    Some("extract".to_string())
+                    // 関数の引数内の単項マイナスも、先頭が関数でない場合（`1+abs(-n)`・
+                    // `(abs(-n)+1)`）と同じ契約にそろえる。エラー時も必ず元の値へ戻す。
+                    let prev = self.allow_unary_minus;
+                    self.allow_unary_minus = true;
+                    let head = self.parse_call_expr(name, 0);
+                    self.allow_unary_minus = prev;
+                    let head = head?;
+                    if matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+                        // `parse_value_expr(0)` と同じ段位（add=0・mul=1・primary=2）で継続する。
+                        self.allow_unary_minus = true;
+                        let r = self
+                            .parse_mul_rest(head, 1)
+                            .and_then(|m| self.parse_add_rest(m, 0));
+                        self.allow_unary_minus = prev;
+                        r?
+                    } else {
+                        head
+                    }
+                } else if next_is_op {
+                    self.parse_projection_infix(0)?
                 } else {
-                    None
-                };
-                return Ok(SelectItem::Expr { expr, alias });
+                    let col = self.expect_ident()?;
+                    // Issue #1540（SQL-42）: 裸の列・疑似列 `id` への `AS` 別名。
+                    // 別名なしは従来どおり `Column`（`Projection::Columns` を保つ）。
+                    if self.peek_ident_matches("AS") {
+                        self.advance();
+                        let alias = self.expect_ident()?;
+                        return Ok(SelectItem::Expr {
+                            expr: Expr::Ident(col),
+                            alias: Some(alias),
+                        });
+                    }
+                    return Ok(SelectItem::Column(col));
+                }
+            }
+            Some(Token::Punct('(' | '-')) | Some(Token::Number(_)) => {
+                self.parse_projection_infix(0)?
+            }
+            _ => return Ok(SelectItem::Column(self.expect_ident()?)),
+        };
+        let has_alias = self.peek_ident_matches("AS");
+        // `(n)` ≡ `n`: 別名なしの括弧付き裸識別子は列項目へ戻す（`Projection::Columns` を保つ）。
+        // 別名付きは Issue #1540（SQL-42）の契約どおり `Expr::Ident` ＋ `alias` で返す。
+        if let Expr::Ident(name) = &expr {
+            if !has_alias {
+                return Ok(SelectItem::Column(name.clone()));
             }
         }
-        Ok(SelectItem::Column(self.expect_ident()?))
+        let alias = if has_alias {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else if is_extract_syntax
+            && matches!(&expr, Expr::Call { name, .. } if name == "date_part")
+        {
+            // Issue #1188: EXTRACT 構文は `date_part` へ脱糖されるが、PostgreSQL 互換の
+            // 既定列名は `extract`（明示の `date_part(...)` は `date_part` のまま）。
+            Some("extract".to_string())
+        } else {
+            None
+        };
+        Ok(SelectItem::Expr { expr, alias })
+    }
+
+    /// 投影項目の式モード解析。[`Self::allow_unary_minus`] を解析中だけ立て、エラー時も
+    /// 必ず元の値へ戻す（WHERE 等の単項マイナス拒否契約へ漏らさない）。
+    fn parse_projection_infix(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        let prev = self.allow_unary_minus;
+        self.allow_unary_minus = true;
+        let r = self.parse_value_expr(depth);
+        self.allow_unary_minus = prev;
+        r
     }
 
     /// SQL-30・TASK-214（Issue #930）: 広域取得（`ParsedSelect::Scan`）専用の SELECT
@@ -4001,7 +4201,26 @@ impl<'a> Parser<'a> {
     /// では `42601`（SQL-25 (c) の対象は `COUNT` のみ）。
     fn parse_aggregate_item(&mut self) -> Result<AggregateItem, SqlSurfaceError> {
         let name = self.expect_ident()?;
-        let func = AggregateFunc::from_name(&name).ok_or_else(|| {
+        let mut item = self.parse_aggregate_call_after_name(&name)?;
+        item.alias = if self.peek_ident_matches("AS") {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        Ok(item)
+    }
+
+    /// 集計関数名を読み終えた位置（次が `'('`）から `'(' [DISTINCT] ('*' | <expr>) ')'` までを
+    /// 読む（`AS` 別名は読まない。[`Self::parse_aggregate_item`] が別名を足し、集計式項目
+    /// 〔Issue #1541〕は式中の呼び出しとして別名なしで使う）。引数の解析中は集計呼び出しの
+    /// 収集と単項マイナス拡張を無効にし、引数文法を従来と完全に同一に保つ（入れ子集計
+    /// `sum(count(*))` は従来どおり `42601`）。
+    fn parse_aggregate_call_after_name(
+        &mut self,
+        name: &str,
+    ) -> Result<AggregateItem, SqlSurfaceError> {
+        let func = AggregateFunc::from_name(name).ok_or_else(|| {
             SqlSurfaceError::unsupported(format!("unsupported aggregate function: {name}"))
         })?;
         self.expect_punct('(')?;
@@ -4039,22 +4258,98 @@ impl<'a> Parser<'a> {
                     "aggregate function requires exactly one argument",
                 ));
             }
-            let expr = self.parse_value_expr(0)?;
-            AggregateArg::Expr(expr)
+            let saved_calls = self.agg_calls.take();
+            let saved_minus = self.allow_unary_minus;
+            self.allow_unary_minus = false;
+            let parsed = self.parse_value_expr(0);
+            self.allow_unary_minus = saved_minus;
+            self.agg_calls = saved_calls;
+            AggregateArg::Expr(parsed?)
         };
         self.expect_punct(')')?;
+        Ok(AggregateItem {
+            func,
+            arg,
+            alias: None,
+            distinct,
+        })
+    }
+
+    /// 式モード解析中（[`Self::agg_calls`] が `Some`）に現れた集計関数呼び出しを読み、
+    /// 内部名の `Expr::Ident` に置き換える（Issue #1541）。項目枠数は集計呼び出しを溜める
+    /// **前**に検査する（1 項目へ多数の集計を詰めてアキュムレータを無制限に確保させる
+    /// DoS の防止。超過は `54000`）。
+    fn parse_embedded_aggregate_call(&mut self, name: &str) -> Result<Expr, SqlSurfaceError> {
+        let used = self
+            .agg_slots_used
+            .saturating_add(self.agg_calls.as_ref().map_or(0, Vec::len));
+        check_aggregate_item_count(used.saturating_add(2))?;
+        let item = self.parse_aggregate_call_after_name(name)?;
+        self.consume_expr_node()?;
+        let calls = self
+            .agg_calls
+            .as_mut()
+            .ok_or_else(|| SqlSurfaceError::unsupported("aggregate call is not allowed here"))?;
+        let j = calls.len();
+        calls.push(item);
+        Ok(Expr::Ident(aggregate_placeholder(j)))
+    }
+
+    /// 集計式項目（[`AggregateSelectItem::Expr`]）を読む。`head` は式の先頭にある集計呼び出し
+    /// （読み済み。`None` なら先頭から式として読む）。式文法は投影項目の式モードと同じ
+    /// （`add → mul → primary` ＋ 単項マイナス）で、式中の集計関数呼び出しは
+    /// [`Self::parse_embedded_aggregate_call`] が収集する。集計呼び出しを 1 つも含まない
+    /// 式（`g * 2` 等）は本 Issue の対象外として `42601`。
+    fn parse_aggregate_expr_item(
+        &mut self,
+        head: Option<AggregateItem>,
+    ) -> Result<AggregateSelectItem, SqlSurfaceError> {
+        let saved_calls = self.agg_calls.take();
+        let saved_minus = self.allow_unary_minus;
+        self.agg_calls = Some(Vec::new());
+        self.allow_unary_minus = true;
+        let parsed = self.parse_aggregate_expr_body(head);
+        let calls = self.agg_calls.take();
+        self.agg_calls = saved_calls;
+        self.allow_unary_minus = saved_minus;
+        let expr = parsed?;
+        let aggregates = calls.unwrap_or_default();
+        if aggregates.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "arithmetic expression in aggregate SELECT list requires an aggregate function call",
+            ));
+        }
         let alias = if self.peek_ident_matches("AS") {
             self.advance();
             Some(self.expect_ident()?)
         } else {
             None
         };
-        Ok(AggregateItem {
-            func,
-            arg,
+        Ok(AggregateSelectItem::Expr {
+            expr,
+            aggregates,
             alias,
-            distinct,
         })
+    }
+
+    fn parse_aggregate_expr_body(
+        &mut self,
+        head: Option<AggregateItem>,
+    ) -> Result<Expr, SqlSurfaceError> {
+        match head {
+            Some(item) => {
+                check_aggregate_item_count(self.agg_slots_used.saturating_add(2))?;
+                self.consume_expr_node()?;
+                if let Some(calls) = self.agg_calls.as_mut() {
+                    calls.push(item);
+                }
+                let lhs = Expr::Ident(aggregate_placeholder(0));
+                // `parse_value_expr(0)` と同じ段位（add=0・mul=1・primary=2）で継続する。
+                let mul = self.parse_mul_rest(lhs, 1)?;
+                self.parse_add_rest(mul, 0)
+            }
+            None => self.parse_value_expr(0),
+        }
     }
 
     /// 集計 SELECT リストの 1 項目（TASK-167・SQL-14 で拡張）。次のトークンが
@@ -4069,7 +4364,32 @@ impl<'a> Parser<'a> {
             if is_aggregate_function_name(name)
                 && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
             {
-                return Ok(AggregateSelectItem::Aggregate(self.parse_aggregate_item()?));
+                if !self.allow_aggregate_expr_items {
+                    return Ok(AggregateSelectItem::Aggregate(self.parse_aggregate_item()?));
+                }
+                // Issue #1541: 集計呼び出しの直後が算術演算子なら集計式項目、それ以外は
+                // 従来の集計項目（AST・既定列名は不変）。
+                let name = self.expect_ident()?;
+                let mut head = self.parse_aggregate_call_after_name(&name)?;
+                if matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+                    return self.parse_aggregate_expr_item(Some(head));
+                }
+                head.alias = if self.peek_ident_matches("AS") {
+                    self.advance();
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                return Ok(AggregateSelectItem::Aggregate(head));
+            }
+            // 裸識別子の直後が算術演算子（`g + sum(n)` 等）は式モード。
+            if self.allow_aggregate_expr_items
+                && matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Punct('+' | '-' | '*' | '/'))
+                )
+            {
+                return self.parse_aggregate_expr_item(None);
             }
         }
         let column = self.expect_ident()?;
@@ -4508,8 +4828,10 @@ impl<'a> Parser<'a> {
         leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         // Issue #1534・SQL-44 ポインタ: 単一テーブル FROM の公開名（別名があれば別名）に
-        // 一致しない修飾子は `42P01`。一致する修飾列参照の受理は #1535 が本フックを
-        // 「修飾子を剥がして非修飾列として処理」へ差し替えるまで従来どおり `42601`。
+        // 一致しない修飾子は `42P01`。通常 SELECT 系は #1535 の `sql::qualified_column`
+        // 正規化がパース前に修飾子を解消するため、本フックは正規化を適用しない経路
+        // （集合演算の枝等）と、正規化が書き換えない位置（関数名形等）の残りの規則として
+        // 働く。照合規則の実体は `TableRef::ensure_qualifier` 一本（ここに新規ロジックを足さない）。
         if let (Some(from_ref), Some(Token::QualifiedIdent { qualifier, .. })) =
             (self.from_ref.as_ref(), self.peek())
         {
@@ -5283,7 +5605,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_add_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
-        let mut lhs = self.parse_mul_expr(depth + 1)?;
+        let lhs = self.parse_mul_expr(depth + 1)?;
+        self.parse_add_rest(lhs, depth)
+    }
+
+    /// 加減算ループ（`+ -`）。左辺を解析済みの状態から継続できるよう分離している。
+    /// [`Self::parse_add_expr`] と、先頭の関数呼び出しを先に読み終えた投影項目
+    /// （[`Self::parse_select_item`]。深さ会計を従来から変えないため）から呼ばれる。
+    fn parse_add_rest(&mut self, mut lhs: Expr, depth: usize) -> Result<Expr, SqlSurfaceError> {
         loop {
             let op = match self.peek() {
                 Some(Token::Punct('+')) => BinOp::Add,
@@ -5303,7 +5632,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_mul_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
-        let mut lhs = self.parse_primary_expr(depth + 1)?;
+        let lhs = self.parse_primary_expr(depth + 1)?;
+        self.parse_mul_rest(lhs, depth)
+    }
+
+    /// 乗除算ループ（`* /`）。[`Self::parse_add_rest`] と同じ理由で左辺解析済みから継続できる。
+    fn parse_mul_rest(&mut self, mut lhs: Expr, depth: usize) -> Result<Expr, SqlSurfaceError> {
         loop {
             let op = match self.peek() {
                 Some(Token::Punct('*')) => BinOp::Mul,
@@ -5371,6 +5705,21 @@ impl<'a> Parser<'a> {
                 };
                 self.consume_expr_node()?;
                 Ok(Expr::Number(format!("-{n}")))
+            }
+            // Issue #1538・SQL-42: 投影項目の式モード限定の一般単項マイナス。新しい `Expr`
+            // variant を増やさず `0 - operand` へ脱糖する（VECTOR・DATE は `bind_binary` の
+            // 型規則で `42804` に倒れる）。operand は primary のため `-n*2` は `(-n)*2`。
+            // `0` リテラルと `Binary` の 2 ノードを課金し、ノード予算を迂回させない。
+            Some(Token::Punct('-')) if self.allow_unary_minus => {
+                self.advance();
+                let operand = self.parse_primary_expr(depth + 1)?;
+                self.consume_expr_node()?;
+                self.consume_expr_node()?;
+                Ok(Expr::Binary {
+                    op: BinOp::Sub,
+                    lhs: Box::new(Expr::Number("0".to_string())),
+                    rhs: Box::new(operand),
+                })
             }
             // Issue #919・SQL-26: 文字列リテラルを式項として受理する。値は字句段で
             // 既にクォート解除済み（`Token::StringLiteral`）。PostgreSQL の
@@ -5609,6 +5958,10 @@ impl<'a> Parser<'a> {
             return self.parse_nullif_expr(depth);
         }
         if is_aggregate_function_name(&name) {
+            // Issue #1541: 集計式項目の式モード中だけ、式の途中の集計呼び出しを受理する。
+            if self.agg_calls.is_some() {
+                return self.parse_embedded_aggregate_call(&name);
+            }
             return Err(SqlSurfaceError::unsupported(format!(
                 "aggregate function {name} is only allowed as a top-level SELECT item"
             )));
@@ -6842,6 +7195,7 @@ impl<'a> Parser<'a> {
         self.expect_punct('(')?;
         let mut columns: Vec<ColumnDef> = Vec::new();
         let mut alias_type_names: Vec<String> = Vec::new();
+        let mut array_len_defaulted: Vec<String> = Vec::new();
         // `PRIMARY KEY` 宣言（列制約・表制約のいずれか一方のみ。TABLE-16・
         // TASK-204、Issue #903）。列名の存在検証・`id` 混在検査・nullable の
         // 強制は列リスト全体の構文判定を終えた後（このループを抜けた後）に
@@ -7017,6 +7371,9 @@ impl<'a> Parser<'a> {
                     foreign_keys.push(fk);
                 }
                 alias_type_names.extend(parsed.alias_type_name);
+                if parsed.array_len_defaulted {
+                    array_len_defaulted.push(parsed.column.name.clone());
+                }
                 columns.push(parsed.column);
             }
             if matches!(self.peek(), Some(Token::Punct(','))) {
@@ -7087,6 +7444,7 @@ impl<'a> Parser<'a> {
             table_name,
             columns,
             alias_type_names,
+            array_len_defaulted,
             primary_key,
             unique_constraints,
             checks,
@@ -7242,6 +7600,10 @@ impl<'a> Parser<'a> {
             crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut self.pos)?;
         let alias_type_name =
             crate::sql::ddl_column_type::alias_spelling(&type_name).map(str::to_string);
+        let array_len_defaulted = matches!(
+            type_name,
+            crate::sql::ddl_column_type::SqlColumnTypeName::Array { max_len: None, .. }
+        );
         let static_ty = crate::sql::ddl_column_type::to_static_column_type(&type_name)?;
         let ty = match static_ty {
             StaticColumnType::Resolved(t) => t,
@@ -7371,6 +7733,7 @@ impl<'a> Parser<'a> {
             references,
             references_name,
             alias_type_name,
+            array_len_defaulted,
         })
     }
 
@@ -7886,7 +8249,10 @@ impl<'a> Parser<'a> {
             let body = parse_view_body(inner)?;
             super::cte::check_no_duplicate_name(&ctes, &name)?;
             ctes.push(super::cte::CteDef { name, body });
-            super::cte::check_definition_count(ctes.len())?;
+            super::cte::check_definition_count(
+                ctes.len(),
+                self.nesting_limits.max_cte_definitions(),
+            )?;
             // `split_parenthesized` はスライスのみを返す（`Parser` の内部位置を
             // 持たない）ため、残りトークン数から `self.pos` を復元する。`after`
             // は構造的に `self.tokens` の suffix であり `after.len()` は
@@ -8290,6 +8656,7 @@ pub(crate) fn buffered_layer_statement(
             order_keys: Vec::new(),
             window_items: Vec::new(),
             limit: u32::MAX,
+            limit_explicit: false,
             offset: 0,
         })),
     }))
@@ -8343,12 +8710,17 @@ fn check_body_aggregate(
     out: &mut Vec<String>,
 ) -> Result<(), SqlSurfaceError> {
     for item in &v.items {
-        if let AggregateSelectItem::Aggregate(agg) = item {
-            if let AggregateArg::Expr(e) = &agg.arg {
-                if !matches!(e, Expr::Ident(_)) {
-                    return Err(body_form_unsupported());
+        match item {
+            AggregateSelectItem::Aggregate(agg) => {
+                if let AggregateArg::Expr(e) = &agg.arg {
+                    if !matches!(e, Expr::Ident(_)) {
+                        return Err(body_form_unsupported());
+                    }
                 }
             }
+            // Issue #1541: 集計式項目はビュー本体には含めさせない（fail-closed）。
+            AggregateSelectItem::Expr { .. } => return Err(body_form_unsupported()),
+            AggregateSelectItem::GroupKey { .. } => {}
         }
     }
     push_relation(out, &v.table_name);
@@ -9042,7 +9414,7 @@ const MAX_SET_OP_BRANCHES: usize = 16;
 /// `UNION`／`INTERSECT`/`EXCEPT` は [`Keyword`] 化しない（`lexer` モジュール
 /// ドキュメントと同じ理由。既存の列名・テーブル名としての用法を壊さないため）。
 /// 大文字小文字を区別せず [`Token::Ident`] を照合する。
-fn is_set_operator_ident(name: &str) -> bool {
+pub(super) fn is_set_operator_ident(name: &str) -> bool {
     name.eq_ignore_ascii_case("UNION")
         || name.eq_ignore_ascii_case("INTERSECT")
         || name.eq_ignore_ascii_case("EXCEPT")
@@ -9059,7 +9431,7 @@ fn is_set_operator_ident(name: &str) -> bool {
 /// 呼び出し）の呼び出し括弧まで集合演算の枝開始と誤検出し、UDF 呼び出しが
 /// 集合演算枝の解析経路（`Computed` 投影項目を拒否する）に誤って回されてしまう
 /// （Issue #929 最終レビュー指摘の回帰）。
-fn set_operator_is_followed_by_branch(tokens: &[Token], op_idx: usize) -> bool {
+pub(super) fn set_operator_is_followed_by_branch(tokens: &[Token], op_idx: usize) -> bool {
     let branch_starts_at = |idx: usize| -> bool {
         match tokens.get(idx) {
             Some(Token::Keyword(Keyword::Select)) => true,
@@ -9123,6 +9495,17 @@ fn is_single_table_reserved_word(w: &str) -> bool {
     is_join_reserved_word(w) || is_set_operator_ident(w)
 }
 
+/// `FROM` 直後のトークン列から `<table> [[AS] alias]` を試し解析し、`TableRef` と
+/// 消費トークン数を返す（解析不能なら `None`）。`sql::qualified_column` が修飾列参照の
+/// 正規化前に FROM の公開名を先読みするための入口で、別名・予約語の規則を
+/// [`Parser::parse_from_table_ref`]（Issue #1534）に一本化する（第 2 の実装を持たない）。
+pub(super) fn probe_from_table_ref(tokens: &[Token]) -> Option<(TableRef, usize)> {
+    let mut p = Parser::new(tokens);
+    p.parse_from_table_ref().ok()?;
+    let consumed = p.pos;
+    p.from_ref.take().map(|r| (r, consumed))
+}
+
 /// JOIN 構文かどうかをバックトラックせず先読みだけで判定する（Issue #925
 /// §2.2・#926）。`validate_sql_tokens_impl` の集計・`DISTINCT`・集合演算の判定
 /// より前に呼ぶ。括弧深さ 0 の最初の `FROM` の直後が `<ident> [[AS] <alias>]
@@ -9150,7 +9533,7 @@ pub(crate) fn looks_like_join(tokens: &[Token]) -> bool {
 
 /// `FROM` 直後（`idx`）から見て、`<ident> [[AS] <alias>] JOIN...` の並びかどうかを
 /// 判定する（[`looks_like_join`] 参照）。
-fn from_clause_starts_join(tokens: &[Token], idx: usize) -> bool {
+pub(super) fn from_clause_starts_join(tokens: &[Token], idx: usize) -> bool {
     if !matches!(tokens.get(idx), Some(Token::Ident(_))) {
         return false;
     }
@@ -9940,7 +10323,13 @@ fn parse_set_branch(
     let branch_end = set_branch_end(&p.tokens, branch_start);
     if let Some(slice) = p.tokens.get(branch_start..branch_end) {
         if looks_like_aggregate_select(slice) {
-            let shape = parse_aggregate_shape(slice, None, true)?;
+            let shape = parse_aggregate_shape(
+                slice,
+                None,
+                true,
+                false,
+                crate::nesting_limits::NestingLimits::default(),
+            )?;
             p.pos = branch_end;
             return build_set_aggregate_branch(shape, lookup);
         }
@@ -10135,10 +10524,21 @@ fn parse_set_limited_branch(
     lookup: &impl TableLookup,
 ) -> Result<SetTree, SqlSurfaceError> {
     if looks_like_aggregate_select(slice) {
-        let shape = parse_aggregate_shape(slice, None, true)?;
+        let shape = parse_aggregate_shape(
+            slice,
+            None,
+            true,
+            false,
+            crate::nesting_limits::NestingLimits::default(),
+        )?;
         return build_set_aggregate_branch(shape, lookup);
     }
-    let shape = match parse_select_shape(slice, None, true)? {
+    let shape = match parse_select_shape(
+        slice,
+        None,
+        true,
+        crate::nesting_limits::NestingLimits::default(),
+    )? {
         ParsedSelect::Scan(shape) => shape,
         ParsedSelect::Search(_) => {
             return Err(SqlSurfaceError::unsupported(
@@ -10398,8 +10798,9 @@ fn parse_select_shape(
     tokens: &[Token],
     subquery_ctx: Option<usize>,
     reject_from_alias: bool,
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<ParsedSelect, SqlSurfaceError> {
-    let mut p = Parser::new(tokens);
+    let mut p = Parser::new(tokens).with_nesting_limits(limits);
     p.reject_from_alias = reject_from_alias;
     if let Some(depth) = subquery_ctx {
         p = p.with_subquery_ctx(depth);
@@ -10671,9 +11072,13 @@ fn parse_aggregate_shape(
     tokens: &[Token],
     subquery_ctx: Option<usize>,
     reject_from_alias: bool,
+    allow_expr_items: bool,
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<ParsedAggregateShape, SqlSurfaceError> {
-    let mut p = Parser::new(tokens);
+    let mut p = Parser::new(tokens).with_nesting_limits(limits);
     p.reject_from_alias = reject_from_alias;
+    // Issue #1541: 集計式項目はトップレベル文だけが受理する（呼び出し元が判定して渡す）。
+    p.allow_aggregate_expr_items = allow_expr_items;
     if let Some(depth) = subquery_ctx {
         p = p.with_subquery_ctx(depth);
     }
@@ -10681,7 +11086,10 @@ fn parse_aggregate_shape(
     p.expect_keyword(Keyword::Select)?;
     let mut items = vec![p.parse_aggregate_select_item()?];
     while matches!(p.peek(), Some(Token::Punct(','))) {
-        if items.len() >= MAX_AGGREGATE_ITEMS {
+        // 項目枠数（集計式項目は式中の集計呼び出しぶんも数える。Issue #1541）で上限を
+        // 判定する。式中の集計呼び出しの収集前検査は `parse_embedded_aggregate_call`。
+        p.agg_slots_used = items.iter().map(AggregateSelectItem::slot_count).sum();
+        if p.agg_slots_used >= MAX_AGGREGATE_ITEMS {
             return Err(SqlSurfaceError::payload_too_large(
                 "too many aggregate items",
             ));
@@ -10689,13 +11097,16 @@ fn parse_aggregate_shape(
         p.advance();
         items.push(p.parse_aggregate_select_item()?);
     }
+    check_aggregate_item_count(items.iter().map(AggregateSelectItem::slot_count).sum())?;
     // SELECT リストに集計項目が 1 つも無い（`GroupKey` のみ、いわゆる
     // `SELECT DISTINCT` 相当）形は許可しない（TASK-167・SQL-14 の受理形は集計
-    // 結果を持つ行のみを対象とする）。
-    if !items
-        .iter()
-        .any(|i| matches!(i, AggregateSelectItem::Aggregate(_)))
-    {
+    // 結果を持つ行のみを対象とする）。集計式項目は構文上 1 つ以上の集計呼び出しを持つ。
+    if !items.iter().any(|i| {
+        matches!(
+            i,
+            AggregateSelectItem::Aggregate(_) | AggregateSelectItem::Expr { .. }
+        )
+    }) {
         return Err(SqlSurfaceError::unsupported(
             "aggregate SELECT list requires at least one aggregate item",
         ));
@@ -10719,12 +11130,26 @@ fn parse_aggregate_shape(
         // `GroupKey` 項目（下の `else` 分岐）はいずれも許可リスト外として
         // `42601` に落とす。
         for item in &items {
-            if let AggregateSelectItem::GroupKey { column: c, .. } = item {
-                if !columns.contains(c) {
-                    return Err(SqlSurfaceError::unsupported(format!(
-                        "SELECT list bare identifier {c:?} does not match any GROUP BY column {columns:?}"
-                    )));
+            match item {
+                AggregateSelectItem::GroupKey { column: c, .. } => {
+                    if !columns.contains(c) {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "SELECT list bare identifier {c:?} does not match any GROUP BY column {columns:?}"
+                        )));
+                    }
                 }
+                // Issue #1541: 集計式項目の集計の外の裸識別子も `GroupKey` と同じ規則
+                // （`GROUP BY` 列と同名であること）。SQL-14 の拒否契約（42601）を維持する。
+                AggregateSelectItem::Expr { expr, .. } => {
+                    for c in expr_bare_idents(expr) {
+                        if !columns.contains(&c) {
+                            return Err(SqlSurfaceError::unsupported(format!(
+                                "SELECT list expression column {c:?} outside an aggregate does not match any GROUP BY column {columns:?}"
+                            )));
+                        }
+                    }
+                }
+                AggregateSelectItem::Aggregate(_) => {}
             }
         }
         let (having, having_exprs) = if matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("HAVING"))
@@ -10763,6 +11188,14 @@ fn parse_aggregate_shape(
             .iter()
             .any(|i| matches!(i, AggregateSelectItem::GroupKey { .. }))
         {
+            return Err(SqlSurfaceError::unsupported(
+                "bare column reference in aggregate SELECT list requires GROUP BY",
+            ));
+        }
+        if items.iter().any(|i| match i {
+            AggregateSelectItem::Expr { expr, .. } => !expr_bare_idents(expr).is_empty(),
+            _ => false,
+        }) {
             return Err(SqlSurfaceError::unsupported(
                 "bare column reference in aggregate SELECT list requires GROUP BY",
             ));
@@ -10946,9 +11379,10 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
 pub(crate) fn validate_sql_with_subquery_ctx(
     sql: &str,
     lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<Statement, SqlSurfaceError> {
     let tokens = lexer::tokenize(sql)?;
-    validate_sql_tokens_with_subquery_ctx(&tokens, lookup, 0)
+    validate_sql_tokens_with_subquery_ctx_limits(&tokens, lookup, 0, limits)
 }
 
 /// [`validate_sql`] の本体（Issue #939・WIRE-17。COPY プロトコル対応の一環）。
@@ -11112,14 +11546,23 @@ fn aggregate_statement_from_resolved(
 ) -> Result<Statement, SqlSurfaceError> {
     if let super::view::Resolved::Buffered { view_name, body } = resolved {
         for item in &items {
-            if let AggregateSelectItem::Aggregate(agg) = item {
-                if let AggregateArg::Expr(e) = &agg.arg {
-                    if !matches!(e, Expr::Ident(_)) {
-                        return Err(SqlSurfaceError::unsupported(
-                            "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
-                        ));
+            match item {
+                AggregateSelectItem::Aggregate(agg) => {
+                    if let AggregateArg::Expr(e) = &agg.arg {
+                        if !matches!(e, Expr::Ident(_)) {
+                            return Err(SqlSurfaceError::unsupported(
+                                "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
+                            ));
+                        }
                     }
                 }
+                // Issue #1541: 評価後射影形ビューへの外側集計では集計式項目を評価しない（fail-closed）。
+                AggregateSelectItem::Expr { .. } => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
+                    ));
+                }
+                AggregateSelectItem::GroupKey { .. } => {}
             }
         }
         where_predicates
@@ -11149,19 +11592,59 @@ pub(crate) fn validate_sql_tokens(
     tokens: &[Token],
     lookup: &impl TableLookup,
 ) -> Result<Statement, SqlSurfaceError> {
-    validate_sql_tokens_impl(tokens, lookup, None)
+    validate_sql_tokens_impl(
+        tokens,
+        lookup,
+        None,
+        crate::nesting_limits::NestingLimits::default(),
+    )
+}
+
+/// [`validate_sql_tokens`] の入れ子系上限指定版（サブクエリ文脈なし。Issue #1552）。
+/// `DECLARE CURSOR ... FOR WITH ...` のように、サブクエリは許可しないが CTE 定義数・
+/// CTE 連鎖深さの起動時設定値（[`crate::nesting_limits::NestingLimits`]）を効かせたい
+/// 入口（`sql::cursor`）が呼ぶ。
+pub(crate) fn validate_sql_tokens_with_limits(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<Statement, SqlSurfaceError> {
+    validate_sql_tokens_impl(tokens, lookup, None, limits)
 }
 
 /// [`validate_sql_tokens`] のサブクエリ許可版（Issue #927・TASK-213）。
 /// `depth` は現在位置の入れ子深さ（`sql::subquery::resolve_where_predicates`
 /// が内側 `Statement::Scan` を再検証する際に 1 つ進めて渡す。トップレベルは
 /// [`validate_sql_with_subquery_ctx`] が 0 を渡す）。
+///
+/// 本関数は入れ子系上限を**ハード上限（`NestingLimits::default()`）**で判定する。
+/// 格納済みビュー本文の構造検証・参照時の再検証（`classify_view_body`・
+/// `check_body_subquery`）専用で、起動時に上限を下げて再起動しても既存ビューの
+/// 定義検証が壊れないようにする（Issue #1552 D6）。セッション SQL は
+/// [`validate_sql_tokens_with_subquery_ctx_limits`] を使う。
 pub(crate) fn validate_sql_tokens_with_subquery_ctx(
     tokens: &[Token],
     lookup: &impl TableLookup,
     depth: usize,
 ) -> Result<Statement, SqlSurfaceError> {
-    validate_sql_tokens_impl(tokens, lookup, Some(depth))
+    validate_sql_tokens_with_subquery_ctx_limits(
+        tokens,
+        lookup,
+        depth,
+        crate::nesting_limits::NestingLimits::default(),
+    )
+}
+
+/// [`validate_sql_tokens_with_subquery_ctx`] の入れ子系上限指定版（Issue #1552）。
+/// `EngineCore` のセッション SQL パース入口と `sql::subquery` の内側再検証が、
+/// 起動時設定値を渡して呼ぶ。
+pub(crate) fn validate_sql_tokens_with_subquery_ctx_limits(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    depth: usize,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<Statement, SqlSurfaceError> {
+    validate_sql_tokens_impl(tokens, lookup, Some(depth), limits)
 }
 
 /// [`validate_sql_tokens`]／[`validate_sql_tokens_with_subquery_ctx`] が共有する
@@ -11173,6 +11656,7 @@ fn validate_sql_tokens_impl(
     tokens: &[Token],
     lookup: &impl TableLookup,
     subquery_ctx: Option<usize>,
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<Statement, SqlSurfaceError> {
     // `SET`・`CREATE` は字句解析段階のキーワードではなく `Ident` のため
     // （TASK-161・SQL-12 修正と同方針）、statement 先頭という文脈でのみ大文字小文字を
@@ -11218,7 +11702,7 @@ fn validate_sql_tokens_impl(
         // SELECT／集計 SELECT）でのみサブクエリを解決できるようにする
         // （`EXPLAIN` 経由の呼び出しは常に `None` を渡す。後述）。
         Some(Token::Keyword(Keyword::Select)) => {
-            validate_select_statement(tokens, lookup, subquery_ctx)
+            validate_select_statement(tokens, lookup, subquery_ctx, limits)
         }
         // TASK-213・SQL-29 (b)・RLS-10 (b)（Issue #928）: 非再帰 CTE。CTE は
         // 「クエリの中だけで有効な名前なしビュー」として、`sql::cte::
@@ -11233,9 +11717,12 @@ fn validate_sql_tokens_impl(
         // 先頭トークンで振り分けるため、本アームには到達しない
         // （out-of-scope。Issue #928 対象外事項）。
         _ if is_with_statement => {
-            let mut p = Parser::new(tokens);
+            let mut p = Parser::new(tokens).with_nesting_limits(limits);
             let ctes = p.parse_with_clause()?;
-            let main_tokens = p.remaining();
+            // Issue #1535: 主クエリも通常 SELECT と同じ修飾列正規化を通す（CTE 定義本体は対象外）。
+            let main_normalized =
+                super::qualified_column::normalize_single_table_qualifiers(p.remaining())?;
+            let main_tokens: &[Token] = &main_normalized;
 
             if !matches!(main_tokens.first(), Some(Token::Keyword(Keyword::Select))) {
                 return Err(SqlSurfaceError::unsupported(
@@ -11273,9 +11760,15 @@ fn validate_sql_tokens_impl(
             let main = if is_distinct_modifier(main_tokens, 1) {
                 MainShape::Aggregate(parse_distinct_shape(main_tokens)?)
             } else if main_is_aggregate_select {
-                MainShape::Aggregate(parse_aggregate_shape(main_tokens, None, false)?)
+                MainShape::Aggregate(parse_aggregate_shape(
+                    main_tokens,
+                    None,
+                    false,
+                    false,
+                    limits,
+                )?)
             } else {
-                match parse_select_shape(main_tokens, None, false)? {
+                match parse_select_shape(main_tokens, None, false, limits)? {
                     ParsedSelect::Scan(shape) => MainShape::Scan(shape),
                     ParsedSelect::Search(_) => {
                         return Err(SqlSurfaceError::unsupported(
@@ -11331,6 +11824,7 @@ fn validate_sql_tokens_impl(
                     idx,
                     &def.body.table_name,
                     0,
+                    limits.max_cte_nesting_depth(),
                     &mut budget,
                 )?;
                 let (base_table, view_columns): (&str, Option<Vec<String>>) = match &resolved {
@@ -11369,6 +11863,7 @@ fn validate_sql_tokens_impl(
                 ctes.len(),
                 &main_table_name,
                 0,
+                limits.max_cte_nesting_depth(),
                 &mut budget,
             )?;
             match main {
@@ -11426,7 +11921,7 @@ fn validate_sql_tokens_impl(
             // 文脈に含めない（`docs/design/sql-subquery.md` 参照。`subquery_ctx`
             // に `None` を渡し、`IN (SELECT ...)`／`EXISTS (SELECT ...)` は
             // 通常どおり `Parser::require_subquery_depth` が `42601` で拒否する）。
-            let target = match validate_select_statement(rest, lookup, None)? {
+            let target = match validate_select_statement(rest, lookup, None, limits)? {
                 Statement::Select(v) => ExplainTarget::Search(v),
                 Statement::Aggregate(v) => ExplainTarget::Aggregate(v),
                 // SQL-30・TASK-214（Issue #930）: `EXPLAIN` はウィンドウ関数に
@@ -11516,6 +12011,7 @@ fn validate_select_statement(
     tokens: &[Token],
     lookup: &impl TableLookup,
     subquery_ctx: Option<usize>,
+    limits: crate::nesting_limits::NestingLimits,
 ) -> Result<Statement, SqlSurfaceError> {
     // SQL-43（Issue #1531）: 括弧の深さ 0 に `FROM` が無い `SELECT` は定数式 SELECT。
     // 既存形（`FROM` あり）では常に偽で、以降の振り分けに一切影響しない。
@@ -11524,6 +12020,11 @@ fn validate_select_statement(
         let validated = p.parse_const_select()?;
         return Ok(Statement::ConstSelect(validated));
     }
+    // Issue #1535・SQL-44 ポインタ: 単一テーブル FROM の公開名で修飾された列参照
+    // （`t.col`）を非修飾へ 1 対 1 で正規化する。以降の先読み・パースはすべて
+    // 正規化後のトークン列を見る（`sql::qualified_column` 参照）。
+    let normalized = super::qualified_column::normalize_single_table_qualifiers(tokens)?;
+    let tokens: &[Token] = &normalized;
     // TASK-166（SQL-13）: `SELECT` の直後（2 番目・3 番目のトークン）が
     // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
     // 以外は既存の検索 SELECT 形状（[`parse_select_shape`]）へ分岐する。バック
@@ -11587,7 +12088,13 @@ fn validate_select_statement(
         );
     }
     if is_aggregate_select {
-        let shape = parse_aggregate_shape(tokens, subquery_ctx, false)?;
+        let shape = parse_aggregate_shape(
+            tokens,
+            subquery_ctx,
+            false,
+            subquery_ctx.is_none_or(|d| d == 0),
+            limits,
+        )?;
         let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
         return aggregate_statement_from_resolved(
             shape.table_name,
@@ -11597,7 +12104,7 @@ fn validate_select_statement(
             shape.group_by,
         );
     }
-    match parse_select_shape(tokens, subquery_ctx, false)? {
+    match parse_select_shape(tokens, subquery_ctx, false, limits)? {
         ParsedSelect::Search(shape) => {
             let exists = lookup.table_exists(&shape.table_name)?;
             if !exists {
@@ -11640,7 +12147,8 @@ fn validate_select_statement(
                     .where_predicates
                     .iter()
                     .try_for_each(check_buffered_outer_pred)?;
-                super::parser::validate_search_limit(shape.limit)?;
+                // `LIMIT` の範囲は構文段では検査しない（設定値を持たないため）。
+                // `EngineCore::check_buffered_outer_limit` が設定値で検査する（Issue #1555）。
                 super::parser::validate_search_offset(shape.offset)?;
                 return Ok(Statement::BufferedView(ValidatedBufferedView {
                     view_name,
@@ -11652,6 +12160,7 @@ fn validate_select_statement(
                         order_keys: shape.order_keys,
                         window_items: shape.window_items,
                         limit: shape.limit,
+                        limit_explicit: true,
                         offset: shape.offset,
                     })),
                 }));
@@ -16679,7 +17188,96 @@ mod tests {
             AggregateSelectItem::GroupKey { .. } => {
                 panic!("expected an aggregate item, got a GroupKey item")
             }
+            AggregateSelectItem::Expr { .. } => {
+                panic!("expected an aggregate item, got an expression item")
+            }
         }
+    }
+
+    /// Issue #1541（SQL-42 (5) のポインタ）: 集計呼び出しの直後の算術演算子で集計式項目になり、
+    /// 式中の集計呼び出しは内部名へ置換されて `aggregates` に出現順で抽出される。
+    #[test]
+    fn aggregate_arithmetic_item_extracts_calls_into_placeholders() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT sum(n)+1, count(*)*2 AS c, max(a)-min(a) FROM documents",
+            &lookup,
+        );
+        assert_eq!(agg.items().len(), 3);
+        match &agg.items()[0] {
+            AggregateSelectItem::Expr {
+                expr,
+                aggregates,
+                alias,
+            } => {
+                assert_eq!(aggregates.len(), 1);
+                assert_eq!(aggregates[0].func, AggregateFunc::Sum);
+                assert_eq!(*alias, None);
+                assert!(matches!(
+                    expr,
+                    Expr::Binary { op: BinOp::Add, lhs, .. }
+                        if matches!(&**lhs, Expr::Ident(n) if aggregate_placeholder_index(n) == Some(0))
+                ));
+            }
+            other => panic!("expected an expression item, got {other:?}"),
+        }
+        match &agg.items()[1] {
+            AggregateSelectItem::Expr { alias, .. } => assert_eq!(alias.as_deref(), Some("c")),
+            other => panic!("expected an expression item, got {other:?}"),
+        }
+        match &agg.items()[2] {
+            AggregateSelectItem::Expr { aggregates, .. } => {
+                let funcs: Vec<_> = aggregates.iter().map(|a| a.func).collect();
+                assert_eq!(funcs, vec![AggregateFunc::Max, AggregateFunc::Min]);
+            }
+            other => panic!("expected an expression item, got {other:?}"),
+        }
+    }
+
+    /// 従来形（集計単独・別名付き・`GROUP BY` 列）の AST は集計式項目の追加で変わらない。
+    #[test]
+    fn aggregate_arithmetic_keeps_plain_item_shapes() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate("SELECT sum(n) AS s, count(*) FROM documents", &lookup);
+        assert!(agg
+            .items()
+            .iter()
+            .all(|i| matches!(i, AggregateSelectItem::Aggregate(_))));
+        assert_eq!(expect_agg_item(&agg.items()[0]).alias.as_deref(), Some("s"));
+        let agg = expect_aggregate(
+            "SELECT lang, count(*) FROM documents GROUP BY lang",
+            &lookup,
+        );
+        assert!(matches!(
+            agg.items()[0],
+            AggregateSelectItem::GroupKey { .. }
+        ));
+    }
+
+    /// 集計式項目でも `GROUP BY` 外の列・`GROUP BY` なしの裸列・入れ子集計は `42601`、
+    /// 1 項目への過剰な集計詰め込みは `54000`。内部名は利用者の識別子と衝突しない。
+    #[test]
+    fn aggregate_arithmetic_rejections_and_limits() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT sum(n)+m FROM documents",
+            "SELECT lang, sum(n)+m FROM documents GROUP BY lang",
+            "SELECT sum(count(*))+1 FROM documents",
+            "SELECT lang+lang FROM documents GROUP BY lang",
+            "SELECT sum(n)+1 FROM documents WHERE count(*) > 1",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+        let many = vec!["count(*)"; 40].join("+");
+        let err = validate_sql(&format!("SELECT {many} FROM documents"), &lookup)
+            .expect_err("too many aggregate calls");
+        assert_eq!(err.wire_code(), "54000");
+        let lexed = crate::sql::lexer::tokenize("SELECT \"\u{1}agg0\" FROM documents");
+        assert!(
+            lexed.is_err(),
+            "placeholder-like identifiers cannot be written"
+        );
     }
 
     #[test]
@@ -18684,6 +19282,183 @@ mod tests {
         }
     }
 
+    /// Issue #1538・SQL-42: 投影項目の中置式の AST 形・既存投影の不変・拒否形。
+    fn scan_items(select_list: &str) -> Result<ValidatedStatement, SqlSurfaceError> {
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(
+            &format!(
+                "SELECT {select_list} FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
+            ),
+            &lookup,
+        )
+    }
+
+    fn first_expr(select_list: &str) -> Expr {
+        let stmt = scan_items(select_list).expect("accepted");
+        match select_expr_items(&stmt).remove(0) {
+            SelectItem::Expr { expr, .. } => expr,
+            other => panic!("expected Expr item, got {other:?}"),
+        }
+    }
+
+    fn bin(op: BinOp, l: Expr, r: Expr) -> Expr {
+        Expr::Binary {
+            op,
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        }
+    }
+
+    fn num(n: &str) -> Expr {
+        Expr::Number(n.to_string())
+    }
+
+    fn ident(n: &str) -> Expr {
+        Expr::Ident(n.to_string())
+    }
+
+    #[test]
+    fn projection_infix_ast_shapes() {
+        assert_eq!(
+            first_expr("n+1*2"),
+            bin(BinOp::Add, ident("n"), bin(BinOp::Mul, num("1"), num("2")))
+        );
+        assert_eq!(
+            first_expr("(n+1)*2"),
+            bin(BinOp::Mul, bin(BinOp::Add, ident("n"), num("1")), num("2"))
+        );
+        assert_eq!(
+            first_expr("n-1-1"),
+            bin(BinOp::Sub, bin(BinOp::Sub, ident("n"), num("1")), num("1"))
+        );
+        assert_eq!(
+            first_expr("-n*2"),
+            bin(BinOp::Mul, bin(BinOp::Sub, num("0"), ident("n")), num("2"))
+        );
+        assert_eq!(
+            first_expr("- -n"),
+            bin(BinOp::Sub, num("0"), bin(BinOp::Sub, num("0"), ident("n")))
+        );
+        assert!(matches!(
+            first_expr("abs(n)+1"),
+            Expr::Binary { op: BinOp::Add, .. }
+        ));
+        assert!(matches!(
+            first_expr("CASE WHEN n > 1 THEN 1 ELSE 0 END * 2"),
+            Expr::Binary { op: BinOp::Mul, .. }
+        ));
+    }
+
+    #[test]
+    fn projection_infix_keeps_existing_projections() {
+        let stmt = scan_items("n, lang").expect("accepted");
+        assert!(matches!(stmt.projection, Projection::Columns(_)));
+        let stmt = scan_items("(n)").expect("accepted");
+        assert!(matches!(&stmt.projection, Projection::Columns(c) if c == &["n".to_string()]));
+        assert!(matches!(first_expr("abs(n)"), Expr::Call { .. }));
+        for col in ["case", "null"] {
+            let stmt = scan_items(col).expect("accepted");
+            assert!(matches!(stmt.projection, Projection::Columns(_)), "{col}");
+        }
+        // EXTRACT の既定別名は頂点が date_part のときだけ付く。
+        let stmt = scan_items("extract(year FROM at)").expect("accepted");
+        assert!(matches!(
+            select_expr_items(&stmt).remove(0),
+            SelectItem::Expr { alias: Some(a), .. } if a == "extract"
+        ));
+        let stmt = scan_items("extract(year FROM at) + 1").expect("accepted");
+        assert!(matches!(
+            select_expr_items(&stmt).remove(0),
+            SelectItem::Expr { alias: None, .. }
+        ));
+    }
+
+    /// 先頭が関数でも、引数内の単項マイナスの受理可否が `1+abs(-n)`・括弧付きと一致する。
+    #[test]
+    fn projection_leading_call_accepts_unary_minus_in_args() {
+        let a = first_expr("abs(-n)+1");
+        let b = first_expr("(abs(-n)+1)");
+        assert_eq!(a, b);
+        let c = first_expr("1+abs(-n)");
+        assert_eq!(
+            c,
+            bin(
+                BinOp::Add,
+                num("1"),
+                match &a {
+                    Expr::Binary { lhs, .. } => (**lhs).clone(),
+                    other => panic!("unexpected {other:?}"),
+                }
+            )
+        );
+        assert!(scan_items("abs(-n)").is_ok());
+        // 解析後は元の契約へ戻る（WHERE 側の単項マイナス拒否は別経路）。
+        assert!(scan_items("abs(n)+1").is_ok());
+    }
+
+    #[test]
+    fn projection_infix_rejections() {
+        for list in ["n % 2", "'a' + n", "n +", "(n"] {
+            let r = scan_items(list);
+            assert_eq!(r.expect_err(list).wire_code(), "42601", "{list}");
+        }
+    }
+
+    /// Issue #1540・SQL-42: 列・疑似列 `id`・括弧付き列への `AS` 別名は
+    /// `Expr::Ident` ＋ `alias` で表し、別名のない列は従来どおり `Columns` に残る。
+    #[test]
+    fn column_alias_is_an_ident_expr_with_alias() {
+        let items =
+            select_expr_items(&scan_items("id AS i, n+1 AS m, (n) AS x, n AS a").expect("ok"));
+        let alias_of = |item: &SelectItem| match item {
+            SelectItem::Expr {
+                expr: Expr::Ident(name),
+                alias: Some(alias),
+            } => Some((name.clone(), alias.clone())),
+            _ => None,
+        };
+        assert_eq!(
+            alias_of(&items[0]),
+            Some(("id".to_string(), "i".to_string()))
+        );
+        assert_eq!(alias_of(&items[1]), None);
+        assert_eq!(
+            alias_of(&items[2]),
+            Some(("n".to_string(), "x".to_string()))
+        );
+        assert_eq!(
+            alias_of(&items[3]),
+            Some(("n".to_string(), "a".to_string()))
+        );
+        // 別名なしのリストは `Columns` のまま。
+        let plain = scan_items("id, n").expect("ok");
+        assert!(matches!(plain.projection, Projection::Columns(_)));
+        // 列名が `as` の既存形は別名構文と取り違えない。
+        let as_col = scan_items("as, n").expect("ok");
+        assert!(matches!(as_col.projection, Projection::Columns(_)));
+        // 予約語の別名・暗黙の別名は従来どおり `42601`。
+        for list in ["n AS", "n m", "n AS FROM"] {
+            assert_eq!(
+                scan_items(list).expect_err(list).wire_code(),
+                "42601",
+                "{list}"
+            );
+        }
+    }
+
+    /// 関数始まりの深さ会計が変わらないこと（受理上限と超過時 `54000`）。
+    #[test]
+    fn projection_function_nesting_depth_boundary_is_stable() {
+        let nest = |k: usize| format!("{}n{}", "abs(".repeat(k), ")".repeat(k));
+        let max_ok = (1..60)
+            .take_while(|k| scan_items(&nest(*k)).is_ok())
+            .last()
+            .expect("some depth accepted");
+        assert_eq!(max_ok, 10);
+        let err = scan_items(&nest(max_ok + 1)).expect_err("over limit");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
     #[test]
     fn accepts_search_case_expr_as_select_item() {
         let lookup = catalog_with(&["documents"]);
@@ -19131,6 +19906,14 @@ mod tests {
         );
         let err = validate_sql(&sql_over, &lookup).expect_err("must exceed CTE definition limit");
         assert_eq!(err.wire_code(), "54000");
+        // 実効上限（既定ではハード上限）がメッセージに含まれる（Issue #1552 D8）。
+        assert!(
+            err.to_string().contains(&format!(
+                "exceeds limit {}",
+                crate::sql::cte::MAX_CTE_DEFINITIONS
+            )),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
@@ -19179,6 +19962,13 @@ mod tests {
         let sql_over = format!("WITH {} SELECT * FROM c{depth} LIMIT 10", defs.join(", "));
         let err = validate_sql(&sql_over, &lookup).expect_err("must exceed CTE nesting depth");
         assert_eq!(err.wire_code(), "54000");
+        assert!(
+            err.to_string().contains(&format!(
+                "exceeds limit {}",
+                crate::sql::cte::MAX_CTE_NESTING_DEPTH
+            )),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]

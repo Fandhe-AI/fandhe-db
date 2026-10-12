@@ -68,10 +68,13 @@ use std::fmt;
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};
 use crate::sparse::{ScoredDoc, SparseError, SparseIndex};
 
-/// 検索プールの深さ・k の上限。`core.rs::MAX_SEARCH_K`（同じく 10_000）と同桁を採用し、
+/// 検索プールの深さ・k の上限。明示 `LIMIT` の設定可能なハード上限
+/// （`result_limits::MAX_RESULT_ROWS_HARD_CAP`＝100_000。Issue #1555）と同値のリテラルで、
+/// 設定値を上限まで上げても `bound.limit` が `RrfConfig::new` の検証を通るようにする。
+/// 他定数への参照では連動させず（SQL-46 (6)）、`exec.rs` のコンパイル時 assert で関係を固定する。
 /// 未検証の巨大な値がそのままアロケーションサイズへ伝播することを防ぐ
 /// （coding-rust.md「無制限確保禁止」）。
-pub(crate) const MAX_POOL_DEPTH: usize = 10_000;
+pub(crate) const MAX_POOL_DEPTH: usize = 100_000;
 
 /// [`hybrid_search_boosted`] の境界同点グループ完全化（Issue #310・Issue #320）が
 /// 再取得（`fetch_k` を倍増しての再フェッチ）で終端確定を試みる際の `fetch_k` 上限
@@ -1063,7 +1066,7 @@ const MAX_BOOST_AMOUNT: f64 = 1.0;
 /// 実用上の意味はなく、無制限確保を許すだけの安全弁として不要に緩い
 /// （`MAX_BOOST_IDS` 自体は素朴な安全弁であり、実プールの厳密な上限に追従させる
 /// 必要はない）。
-pub const MAX_BOOST_IDS: usize = MAX_POOL_DEPTH;
+pub const MAX_BOOST_IDS: usize = 10_000;
 
 /// `cfg`（[`RrfConfig`]）だけから、実際の融合プールの分布を見ずに算出できる
 /// ソフトブースト加点合計の**緩い**（＝安全側に大きすぎることはあっても小さすぎ

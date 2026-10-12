@@ -75,9 +75,8 @@
 use std::collections::HashSet;
 
 use super::allowlist::{
-    AggregateArg, AggregateSelectItem, CompareOp, Projection, ScalarSubqueryItem, ScalarSubqueryOp,
-    SelectItem, SqlSurfaceError, Statement, TableLookup, ValidatedAggregate, ValidatedScan,
-    WherePredicate,
+    CompareOp, Projection, ScalarSubqueryItem, ScalarSubqueryOp, SelectItem, SqlSurfaceError,
+    Statement, TableLookup, ValidatedAggregate, ValidatedScan, WherePredicate,
 };
 use super::exec::{Cell, ColumnMeta};
 use super::lexer::Token;
@@ -88,7 +87,8 @@ use crate::policy::PolicyContext;
 /// 1 文（トップレベル実行 1 回）あたりに実行できる内側サブクエリの総数
 /// （実装既定値。Issue #927・TASK-213。ネスト深さ上限
 /// [`super::allowlist::MAX_SUBQUERY_DEPTH`] と組み合わせて評価コストを
-/// 有界にする）。
+/// 有界にする）。Issue #1552: 本定数は**ハード上限（＝既定値）**で、運用者は起動時に
+/// [`crate::nesting_limits::NestingLimits`] で下げられる（引き上げは不可）。
 pub(crate) const MAX_SUBQUERY_EXECUTIONS: usize = 16;
 
 /// 1 文（トップレベル実行 1 回。ネストしたサブクエリを含む）あたりに
@@ -127,7 +127,9 @@ const MAX_INT_NOT_IN_VALUES: usize = crate::declarative_filter::MAX_IN_LIST_ITEM
 /// （[`execute_inner_query`]）は、内側クエリ自身のスキーマを末尾へ積んで渡す。
 ///
 /// `budget` は呼び出し階層全体（ネストしたサブクエリを含む）で共有する残り
-/// 実行回数。呼び出し元は [`MAX_SUBQUERY_EXECUTIONS`] で初期化する。
+/// 実行回数。呼び出し元は起動時設定値 `NestingLimits::max_subquery_executions`
+/// （ハード上限 [`MAX_SUBQUERY_EXECUTIONS`] 以下）で初期化する。
+/// `nesting_limits` は内側クエリの再検証（サブクエリ深さ・CTE 上限）に使う（Issue #1552）。
 /// `in_value_budget` も同様に共有する、`IN` 展開で生成できる残り distinct 値数。
 /// 呼び出し元は [`MAX_SUBQUERY_IN_VALUES`] で初期化する。
 #[allow(clippy::too_many_arguments)]
@@ -138,6 +140,8 @@ pub(crate) fn resolve_where_predicates(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
@@ -154,6 +158,8 @@ pub(crate) fn resolve_where_predicates(
                         ctx,
                         lookup,
                         udfs,
+                        group_limits,
+                        nesting_limits,
                         budget,
                         in_value_budget,
                     )?);
@@ -175,6 +181,8 @@ pub(crate) fn resolve_where_predicates(
                     ctx,
                     lookup,
                     udfs,
+                    group_limits,
+                    nesting_limits,
                     budget,
                     in_value_budget,
                 )?);
@@ -191,6 +199,8 @@ pub(crate) fn resolve_where_predicates(
                     ctx,
                     lookup,
                     udfs,
+                    group_limits,
+                    nesting_limits,
                     budget,
                     in_value_budget,
                 )?;
@@ -220,6 +230,8 @@ pub(crate) fn resolve_where_predicates(
                     ctx,
                     lookup,
                     udfs,
+                    group_limits,
+                    nesting_limits,
                     budget,
                     in_value_budget,
                 )?);
@@ -242,6 +254,8 @@ pub(crate) fn resolve_where_predicates(
                         ctx,
                         lookup,
                         udfs,
+                        group_limits,
+                        nesting_limits,
                         budget,
                         in_value_budget,
                     )?);
@@ -260,6 +274,8 @@ pub(crate) fn resolve_where_predicates(
                         ctx,
                         lookup,
                         udfs,
+                        group_limits,
+                        nesting_limits,
                         budget,
                         in_value_budget,
                     )?;
@@ -330,16 +346,7 @@ fn scan_referenced_columns(validated: &ValidatedScan) -> HashSet<String> {
 fn aggregate_referenced_columns(validated: &ValidatedAggregate) -> HashSet<String> {
     let mut cols = HashSet::new();
     for item in &validated.items {
-        match item {
-            AggregateSelectItem::Aggregate(agg) => {
-                if let AggregateArg::Expr(expr) = &agg.arg {
-                    super::parser::collect_expr_idents(expr, &mut cols);
-                }
-            }
-            AggregateSelectItem::GroupKey { column, .. } => {
-                cols.insert(column.clone());
-            }
-        }
+        item.collect_referenced_idents(&mut cols);
     }
     if let Some(group_by) = &validated.group_by {
         cols.extend(group_by.columns.iter().cloned());
@@ -406,6 +413,8 @@ fn execute_inner_query(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
@@ -419,6 +428,8 @@ fn execute_inner_query(
         ctx,
         lookup,
         udfs,
+        group_limits,
+        nesting_limits,
         budget,
         in_value_budget,
         &mut meta_sink,
@@ -439,18 +450,25 @@ fn execute_inner_query_with_meta(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
     *budget = budget.checked_sub(1).ok_or_else(|| {
         SqlSurfaceError::payload_too_large(format!(
-            "subquery execution count exceeds limit {MAX_SUBQUERY_EXECUTIONS}"
+            "subquery execution count exceeds limit {}",
+            nesting_limits.max_subquery_executions()
         ))
     })?;
 
-    let stmt =
-        super::allowlist::validate_sql_tokens_with_subquery_ctx(inner_tokens, lookup, depth)?;
+    let stmt = super::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
+        inner_tokens,
+        lookup,
+        depth,
+        nesting_limits,
+    )?;
     let result = match (stmt, intent) {
         (Statement::Scan(validated), _) => execute_inner_scan_statement(
             validated,
@@ -460,6 +478,8 @@ fn execute_inner_query_with_meta(
             ctx,
             lookup,
             udfs,
+            group_limits,
+            nesting_limits,
             budget,
             in_value_budget,
             meta_sink,
@@ -474,6 +494,8 @@ fn execute_inner_query_with_meta(
             ctx,
             lookup,
             udfs,
+            group_limits,
+            nesting_limits,
             budget,
             in_value_budget,
             meta_sink,
@@ -596,6 +618,8 @@ fn execute_inner_scan_statement(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
@@ -616,6 +640,8 @@ fn execute_inner_scan_statement(
         ctx,
         lookup,
         udfs,
+        group_limits,
+        nesting_limits,
         budget,
         in_value_budget,
     ) {
@@ -635,6 +661,7 @@ fn execute_inner_scan_statement(
                         read_txn,
                         lookup,
                         udfs,
+                        nesting_limits,
                     )?;
                 }
                 validated.where_predicates = static_validation_predicates(&original_preds);
@@ -687,6 +714,8 @@ fn execute_inner_aggregate_statement(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
@@ -703,6 +732,8 @@ fn execute_inner_aggregate_statement(
         ctx,
         lookup,
         udfs,
+        group_limits,
+        nesting_limits,
         budget,
         in_value_budget,
     ) {
@@ -716,6 +747,7 @@ fn execute_inner_aggregate_statement(
                     read_txn,
                     lookup,
                     udfs,
+                    nesting_limits,
                 )?;
             }
             validated.where_predicates = static_validation_predicates(&original_preds);
@@ -726,7 +758,7 @@ fn execute_inner_aggregate_statement(
     };
     let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
     *meta_sink = Some(super::describe::aggregate_columns(&bound, &inner_schema)?);
-    super::aggregate::execute_aggregate_with_cache(
+    super::aggregate::execute_aggregate_with_group_limits(
         read_txn,
         ctx,
         &inner_schema,
@@ -735,6 +767,7 @@ fn execute_inner_aggregate_statement(
         None,
         None,
         None,
+        group_limits,
     )
 }
 
@@ -764,12 +797,20 @@ fn static_validate_subquery_predicates(
     read_txn: &impl crate::storage::read_source::ReadSource,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    nesting_limits: crate::nesting_limits::NestingLimits,
 ) -> Result<(), SqlSurfaceError> {
     for pred in preds {
         match pred {
             WherePredicate::Or(branches) => {
                 for branch in branches {
-                    static_validate_subquery_predicates(branch, chain, read_txn, lookup, udfs)?;
+                    static_validate_subquery_predicates(
+                        branch,
+                        chain,
+                        read_txn,
+                        lookup,
+                        udfs,
+                        nesting_limits,
+                    )?;
                 }
             }
             WherePredicate::Not(inner) => static_validate_subquery_predicates(
@@ -778,6 +819,7 @@ fn static_validate_subquery_predicates(
                 read_txn,
                 lookup,
                 udfs,
+                nesting_limits,
             )?,
             WherePredicate::InSubquery {
                 column,
@@ -793,6 +835,7 @@ fn static_validate_subquery_predicates(
                     read_txn,
                     lookup,
                     udfs,
+                    nesting_limits,
                 )?;
                 let [inner_meta] = meta.as_slice() else {
                     return Err(SqlSurfaceError::unsupported(
@@ -816,6 +859,7 @@ fn static_validate_subquery_predicates(
                     read_txn,
                     lookup,
                     udfs,
+                    nesting_limits,
                 )?;
             }
             WherePredicate::ScalarSubqueryCompare {
@@ -833,6 +877,7 @@ fn static_validate_subquery_predicates(
                     read_txn,
                     lookup,
                     udfs,
+                    nesting_limits,
                 )?;
                 let [inner_meta] = meta.as_slice() else {
                     return Err(SqlSurfaceError::unsupported(
@@ -852,6 +897,7 @@ fn static_validate_subquery_predicates(
 /// [`execute_inner_query_with_meta`] と同じ静的検証（構文・文の形・相関参照・投影列数・
 /// 入れ子 WHERE の再帰的な静的検証・束縛）にかけ、投影列メタデータを返す。
 /// 実行回数予算は消費しない（呼び出し元の契約参照）。
+#[allow(clippy::too_many_arguments)]
 fn static_validate_inner_query(
     inner_tokens: &[Token],
     depth: usize,
@@ -860,9 +906,14 @@ fn static_validate_inner_query(
     read_txn: &impl crate::storage::read_source::ReadSource,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    nesting_limits: crate::nesting_limits::NestingLimits,
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
-    let stmt =
-        super::allowlist::validate_sql_tokens_with_subquery_ctx(inner_tokens, lookup, depth)?;
+    let stmt = super::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
+        inner_tokens,
+        lookup,
+        depth,
+        nesting_limits,
+    )?;
     match (stmt, intent) {
         (Statement::Scan(mut validated), _) => {
             let inner_schema = inner_scan_prechecks(&validated, intent, outer_scopes, read_txn)?;
@@ -874,6 +925,7 @@ fn static_validate_inner_query(
                 read_txn,
                 lookup,
                 udfs,
+                nesting_limits,
             )?;
             validated.where_predicates = static_validation_predicates(&validated.where_predicates);
             match intent {
@@ -913,6 +965,7 @@ fn static_validate_inner_query(
                 read_txn,
                 lookup,
                 udfs,
+                nesting_limits,
             )?;
             validated.where_predicates = static_validation_predicates(&validated.where_predicates);
             let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
@@ -994,7 +1047,9 @@ impl SubqueryValueFamily {
 /// 列型から値族を判定する。対応外（`VECTOR`・配列・JSON 等）は `None`。
 fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
     match ty {
-        ColumnType::Text | ColumnType::Enum(_) => Some(SubqueryValueFamily::Text),
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Enum(_) => {
+            Some(SubqueryValueFamily::Text)
+        }
         ColumnType::Boolean => Some(SubqueryValueFamily::Boolean),
         ColumnType::Date => Some(SubqueryValueFamily::Date),
         ColumnType::Timestamp => Some(SubqueryValueFamily::Timestamp),
@@ -1013,7 +1068,7 @@ fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
 /// 束縛時に確定した静的型（Issue #1173）があればそれ、無ければ `None`。
 fn inner_value_family(meta: &ColumnMeta) -> Option<SubqueryValueFamily> {
     match meta {
-        ColumnMeta::Id => Some(SubqueryValueFamily::Integer),
+        ColumnMeta::Id | ColumnMeta::AliasedId { .. } => Some(SubqueryValueFamily::Integer),
         ColumnMeta::Scalar { ty, .. } => family_of_type(ty),
         ColumnMeta::Computed { ty: Some(ty), .. } => family_of_type(ty),
         ColumnMeta::Computed { ty: None, .. } => None,
@@ -1084,6 +1139,8 @@ fn resolve_in_subquery(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
@@ -1097,6 +1154,8 @@ fn resolve_in_subquery(
         ctx,
         lookup,
         udfs,
+        group_limits,
+        nesting_limits,
         budget,
         in_value_budget,
         &mut meta_sink,
@@ -1430,6 +1489,8 @@ pub(crate) fn resolve_scalar_projection_items(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<Vec<ResolvedScalarItem>, SqlSurfaceError> {
@@ -1445,6 +1506,8 @@ pub(crate) fn resolve_scalar_projection_items(
             ctx,
             lookup,
             udfs,
+            group_limits,
+            nesting_limits,
             budget,
             in_value_budget,
             &mut meta_sink,
@@ -1523,13 +1586,9 @@ fn alias_scalar_meta(inner_meta: &ColumnMeta, alias: Option<&String>) -> ColumnM
             name: alias.clone(),
             ty: ty.clone(),
         },
-        (ColumnMeta::Id, Some(alias)) => ColumnMeta::Computed {
-            name: alias.clone(),
-            ty: Some(crate::catalog::ColumnType::Numeric {
-                precision: 20,
-                scale: 0,
-            }),
-        },
+        (ColumnMeta::Id | ColumnMeta::AliasedId { .. }, Some(alias)) => {
+            crate::sql::exec::aliased_id_column_meta(alias)
+        }
     }
 }
 
@@ -1699,6 +1758,8 @@ fn resolve_scalar_compare(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<WherePredicate, SqlSurfaceError> {
@@ -1712,6 +1773,8 @@ fn resolve_scalar_compare(
         ctx,
         lookup,
         udfs,
+        group_limits,
+        nesting_limits,
         budget,
         in_value_budget,
         &mut meta_sink,
@@ -1929,6 +1992,8 @@ fn resolve_exists_subquery(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<bool, SqlSurfaceError> {
@@ -1941,6 +2006,8 @@ fn resolve_exists_subquery(
         ctx,
         lookup,
         udfs,
+        group_limits,
+        nesting_limits,
         budget,
         in_value_budget,
     )?;
@@ -2079,6 +2146,8 @@ mod tests {
             &ctx,
             &storage,
             &udfs,
+            crate::group_by_limits::GroupByLimits::default(),
+            crate::nesting_limits::NestingLimits::default(),
             &mut budget,
             &mut in_value_budget,
         )
@@ -2132,6 +2201,8 @@ mod tests {
             &ctx,
             &storage,
             &udfs,
+            crate::group_by_limits::GroupByLimits::default(),
+            crate::nesting_limits::NestingLimits::default(),
             &mut budget,
             &mut in_value_budget,
         )

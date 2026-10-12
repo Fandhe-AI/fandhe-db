@@ -55,6 +55,7 @@ fn enum_labels() -> Vec<String> {
 fn type_label(ty: &ColumnType) -> &'static str {
     match ty {
         ColumnType::Text => "text",
+        ColumnType::Varchar => "varchar",
         ColumnType::Vector(_) => "vector",
         ColumnType::Integer => "integer",
         ColumnType::BigInt => "bigint",
@@ -96,6 +97,7 @@ fn array_elem_label(elem: &ArrayElemType) -> &'static str {
 fn all_type_labels() -> BTreeSet<&'static str> {
     BTreeSet::from([
         "text",
+        "varchar",
         "vector",
         "integer",
         "bigint",
@@ -153,6 +155,8 @@ fn full_row_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> Ta
                 true,
             ),
             ColumnDef::new("c_uuid", ColumnType::Uuid, true),
+            // 末尾に置いて既存の列位置（`c_vector` 挿入位置など）を動かさない。
+            ColumnDef::new("c_varchar", ColumnType::Varchar, true),
         ],
     )
 }
@@ -209,6 +213,8 @@ fn representative_scalar_values() -> Vec<Value> {
         // 宣言しているため、scale を列宣言に一致させる。
         Value::Numeric(Decimal::from_parts(1_234_560_000, 10).expect("decimal")),
         Value::Uuid(Uuid::from_bytes([0x11; 16])),
+        // `c_varchar`（TEXT と同一表現。Issue #2305）。
+        Value::Text("varchar value".to_string()),
     ]
 }
 
@@ -701,7 +707,7 @@ fn encode_row_rejects_value_variant_mismatch_for_every_type() {
     let _guard = CleanupGuard(path);
     let schema = full_row_schema(def);
     let wrong_value_for = |label: &str| -> Value {
-        if label == "text" {
+        if label == "text" || label == "varchar" {
             Value::Integer(1)
         } else {
             Value::Text("wrong-type".to_string())

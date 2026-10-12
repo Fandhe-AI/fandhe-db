@@ -46,8 +46,8 @@ use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::row_codec::ScalarRef;
 
 use super::allowlist::{
-    AggregateArg, AggregateSelectItem, BufferedOuter, BufferedRows, Projection, ScalarOrderKey,
-    ScanOrderKey, SqlSurfaceError, ValidatedAggregate, ValidatedBufferedView, ValidatedScan,
+    AggregateArg, BufferedOuter, BufferedRows, Projection, ScalarOrderKey, ScanOrderKey,
+    SqlSurfaceError, ValidatedAggregate, ValidatedBufferedView, ValidatedScan,
 };
 use super::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use super::expr_program::StackValue;
@@ -64,7 +64,9 @@ use super::window::{window_result_type, CellWindowEvaluator};
 fn column_name(meta: &ColumnMeta) -> &str {
     match meta {
         ColumnMeta::Id => "id",
-        ColumnMeta::Scalar { name, .. } | ColumnMeta::Computed { name, .. } => name,
+        ColumnMeta::Scalar { name, .. }
+        | ColumnMeta::Computed { name, .. }
+        | ColumnMeta::AliasedId { name } => name,
     }
 }
 
@@ -295,16 +297,7 @@ fn plan_aggregate(
     let mut idents = HashSet::new();
     super::parser::collect_where_predicate_idents(&agg.where_predicates, &mut idents);
     for item in &agg.items {
-        match item {
-            AggregateSelectItem::Aggregate(a) => {
-                if let AggregateArg::Expr(e) = &a.arg {
-                    super::parser::collect_expr_idents(e, &mut idents);
-                }
-            }
-            AggregateSelectItem::GroupKey { column, .. } => {
-                idents.insert(column.clone());
-            }
-        }
+        item.collect_referenced_idents(&mut idents);
     }
     if let Some(gb) = &agg.group_by {
         for c in &gb.columns {
@@ -363,6 +356,7 @@ fn evaluable_type(meta: &ColumnMeta) -> Option<&ColumnType> {
     static ID_TYPE: ColumnType = ColumnType::BigInt;
     let ty = match meta {
         ColumnMeta::Id => &ID_TYPE,
+        ColumnMeta::AliasedId { .. } => &crate::sql::exec::ALIASED_ID_TYPE,
         ColumnMeta::Scalar { ty, .. } => ty,
         ColumnMeta::Computed { ty: Some(ty), .. } => ty,
         ColumnMeta::Computed { ty: None, .. } => return None,
@@ -532,6 +526,7 @@ fn plan_order(
         };
         let class = match body_columns.get(index).ok_or_else(internal_error)? {
             ColumnMeta::Id => cmp_class(None),
+            ColumnMeta::AliasedId { .. } => cmp_class(Some(&crate::sql::exec::ALIASED_ID_TYPE)),
             ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
                 cmp_class(Some(ty))
             }
@@ -648,10 +643,11 @@ fn order_val<'a>(cell: &'a Cell, class: &CmpClass) -> Result<Option<CmpVal<'a>>,
 pub(crate) fn apply_outer(
     result: QueryResult,
     plan: &OuterPlan,
+    group_limits: crate::group_by_limits::GroupByLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
     match &plan.kind {
         OuterKind::Rows(rows) => apply_rows(result, rows, &plan.columns),
-        OuterKind::Aggregate(agg) => apply_aggregate(result, agg),
+        OuterKind::Aggregate(agg) => apply_aggregate(result, agg, group_limits),
     }
 }
 
@@ -730,11 +726,13 @@ fn apply_rows(
 fn apply_aggregate(
     result: QueryResult,
     plan: &AggregatePlan,
+    group_limits: crate::group_by_limits::GroupByLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
     let mut acc = super::group_by::GroupedRowAccumulator::new(
         &plan.bound,
         &plan.schema,
         super::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+        group_limits,
     )?;
     let mut scratch: Vec<StackValue> = Vec::new();
     for row in &result.rows {
@@ -865,7 +863,9 @@ fn reorder(rows: Vec<ResultRow>, idx: &[usize]) -> Result<Vec<ResultRow>, SqlSur
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::allowlist::{AggregateFunc, AggregateItem, Statement, WherePredicate};
+    use crate::sql::allowlist::{
+        AggregateFunc, AggregateItem, AggregateSelectItem, Statement, WherePredicate,
+    };
     use crate::sql::udf_call::{BinOp, Expr};
 
     fn text_col(name: &str) -> ColumnMeta {
@@ -917,6 +917,7 @@ mod tests {
                 order_keys: Vec::new(),
                 window_items: Vec::new(),
                 limit,
+                limit_explicit: true,
                 offset,
             })),
         }
@@ -924,7 +925,7 @@ mod tests {
 
     fn run(r: QueryResult, v: &ValidatedBufferedView) -> Result<QueryResult, SqlSurfaceError> {
         let plan = plan_outer(&r.columns, v, &UdfRegistry::default())?;
-        apply_outer(r, &plan)
+        apply_outer(r, &plan, crate::group_by_limits::GroupByLimits::default())
     }
 
     /// `count >= n`（整数の比較はパーサーが式述語として生成する）。
@@ -1298,6 +1299,7 @@ mod tests {
                 order_keys: keys,
                 window_items: vec![],
                 limit: 10,
+                limit_explicit: true,
                 offset: 0,
             })),
         };

@@ -573,6 +573,24 @@ pub enum BuiltinFn {
     /// 解決できない。`bind_call`／`bind_binary` が `date_part`／`date_trunc` の
     /// `DATE` 引数、および `DATE`／`TIMESTAMP` 比較の `DATE` 側に挿入する）。
     DateToTimestamp,
+    /// 投影位置の整数／単精度の型付き算術（`+ - * /`）を表す内部専用関数（名前では
+    /// 解決できない。Issue #1539・SQL-42。`bind_expr_in` の `Expr::Binary` 腕が
+    /// 投影モード〔[`BindEnv::typed_arith`]〕のときだけ挿入する）。整数除算の切り捨て
+    /// と checked オーバーフロー（`22003`）をノード単位で行うため、f64 一括計算では
+    /// なく専用の演算ノードにしている（`(7/2)*2` が PostgreSQL と同じく 6 になる）。
+    TypedArith(BinOp, NumericKind),
+}
+
+/// 型付き算術（[`BuiltinFn::TypedArith`]）の結果種別。`float8` は既存の
+/// [`BoundExpr::Binary`] で表すためここには含めない（Issue #1539・SQL-42）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericKind {
+    /// `integer`（`int4`。OID 23）。
+    Int4,
+    /// `bigint`（`int8`。OID 20）。
+    Int8,
+    /// `real`（`float4`。OID 700）。
+    Float4,
 }
 
 /// `name` が組み込み関数（[`BuiltinFn`]）の名前かどうかを判定する。`pub(crate)`:
@@ -705,6 +723,7 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::DatePart(_) => (&[ExprType::Timestamp], ExprType::Scalar),
         BuiltinFn::DateTrunc(_) => (&[ExprType::Timestamp], ExprType::Timestamp),
         BuiltinFn::DateToTimestamp => (&[ExprType::Date], ExprType::Timestamp),
+        BuiltinFn::TypedArith(_, _) => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
     }
 }
 
@@ -749,6 +768,9 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         // 実行時に評価される。対象外事項として `docs/design/
         // datetime-scalar-functions.md` に記録）。
         BuiltinFn::DatePart(_) | BuiltinFn::DateTrunc(_) | BuiltinFn::DateToTimestamp => false,
+        // Issue #1539・SQL-42: 型付き算術は `Binary` と同じく `Scalar` を返す純関数で、
+        // 0 除算・オーバーフローは defer-on-error（畳み込み失敗時は実行時に評価）。
+        BuiltinFn::TypedArith(_, _) => true,
     }
 }
 
@@ -1133,6 +1155,12 @@ struct BindEnv<'a> {
     /// ネストと呼び出し先本体のネストが合算され、構文段の計測値（各文が個別に
     /// 見た字面上のネスト）をすり抜けうるため（[`enter_case_nesting`] 参照）。
     case_nesting: usize,
+    /// 投影モード（Issue #1539・SQL-42）。`true` のとき、`+ - * /` の両オペランドが
+    /// 整数／単精度と判定できれば [`BuiltinFn::TypedArith`] で束縛し、結果型を
+    /// PostgreSQL に揃える。`SELECT` 投影項目と `FROM` なし SELECT の入口
+    /// （[`bind_projection_expr`]・[`bind_const_expr`]）だけが立て、`WHERE`／
+    /// `ORDER BY`／`CHECK`／UDF 本体は従来の f64 意味論のまま（`false`）。
+    typed_arith: bool,
 }
 
 /// 展開済み [`BoundExpr`] のノード数を数える。UDF 連鎖のパラメータ参照展開時に
@@ -1425,8 +1453,102 @@ pub fn bind_expr(
         params: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
+        typed_arith: false,
     };
     bind_expr_in(expr, &mut env, node_budget)
+}
+
+/// 投影項目の式を束縛し、結果の列型も返す（Issue #1539・SQL-42。`sql::parser::
+/// bind_projection` の `SelectItem::Expr` 分岐から呼ばれる）。[`bind_expr`] との違いは
+/// 投影モード（[`BindEnv::typed_arith`]）で束縛する点と、第 3 要素として RowDescription
+/// に載せる結果列型（`None` は型を公告できない VECTOR）を返す点。
+pub(crate) fn bind_projection_expr(
+    expr: &Expr,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    let mut env = BindEnv {
+        schema: Some(schema),
+        params: std::collections::HashMap::new(),
+        registry,
+        case_nesting: 0,
+        typed_arith: true,
+    };
+    let (bound, ty) = bind_expr_in(expr, &mut env, node_budget)?;
+    let col = expr_result_column_type(expr, &bound, ty);
+    Ok((bound, ty, col))
+}
+
+/// 束縛済み式の結果列型（RowDescription の型 OID の元）を決める唯一の場所
+/// （Issue #1539・SQL-42）。型付き算術の根は `Integer`／`BigInt`／`Real`、整数リテラル
+/// 単独は `Integer`／`BigInt`、それ以外は [`ExprType`] の既存写像
+/// （`Scalar` → `Double`、`Bool` → `Boolean`、`Text` → `Text`、`Date`、`Timestamp`、
+/// `Vector` → `None`）。
+pub(crate) fn expr_result_column_type(
+    expr: &Expr,
+    bound: &BoundExpr,
+    ty: ExprType,
+) -> Option<ColumnType> {
+    if let BoundExpr::Builtin {
+        f: BuiltinFn::TypedArith(_, kind),
+        ..
+    } = bound
+    {
+        return Some(match kind {
+            NumericKind::Int4 => ColumnType::Integer,
+            NumericKind::Int8 => ColumnType::BigInt,
+            NumericKind::Float4 => ColumnType::Real,
+        });
+    }
+    if let Expr::Number(raw) = expr {
+        if let Some((_, kind)) = classify_projection_integer_literal(raw) {
+            return Some(match kind {
+                NumericKind::Int8 => ColumnType::BigInt,
+                _ => ColumnType::Integer,
+            });
+        }
+    }
+    column_type_for_expr_type(ty)
+}
+
+/// [`ExprType`] から結果列型への既存写像（`sql::exec::computed_column_meta` と共有）。
+pub(crate) fn column_type_for_expr_type(ty: ExprType) -> Option<ColumnType> {
+    match ty {
+        ExprType::Scalar => Some(ColumnType::Double),
+        ExprType::Bool => Some(ColumnType::Boolean),
+        ExprType::Text => Some(ColumnType::Text),
+        ExprType::Date => Some(ColumnType::Date),
+        ExprType::Timestamp => Some(ColumnType::Timestamp),
+        ExprType::Vector => None,
+    }
+}
+
+/// 整数形の数値リテラル（先頭 `-` 任意＋数字のみ）を i64 と最小の整数型
+/// （i32 に収まれば `Int4`、そうでなければ `Int8`）へ分類する。整数形でない・
+/// i64 を超える場合は `None`。`sql::const_select` のリテラル型付けと投影の
+/// 型付き算術が同じ判定を共有する（第 2 の実装を作らない。Issue #1539）。
+pub(crate) fn classify_integer_literal(raw: &str) -> Option<(i64, NumericKind)> {
+    let digits = raw.strip_prefix('-').unwrap_or(raw);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let v = raw.parse::<i64>().ok()?;
+    let kind = if i32::try_from(v).is_ok() {
+        NumericKind::Int4
+    } else {
+        NumericKind::Int8
+    };
+    Some((v, kind))
+}
+
+/// 投影の型付き算術・結果型で使う整数リテラル分類。[`classify_integer_literal`] に加え、
+/// 投影の評価値は f64 で運ばれ 2^53 を超える整数を厳密に保てないため、|v| > 2^53 の
+/// リテラルは整数扱いにせず従来どおり倍精度（`None`）へ落とす（丸めて誤値を返さない。
+/// 既知の PG 差分として文書化。Issue #1539）。
+fn classify_projection_integer_literal(raw: &str) -> Option<(i64, NumericKind)> {
+    let (v, kind) = classify_integer_literal(raw)?;
+    (v.unsigned_abs() <= TYPED_INT_EXACT_MAX as u64).then_some((v, kind))
 }
 
 /// 列参照を持たない文脈（`FROM` なし定数式 SELECT。SQL-43・Issue #1531）で式を束縛する。
@@ -1437,14 +1559,18 @@ pub(crate) fn bind_const_expr(
     expr: &Expr,
     registry: &UdfRegistry,
     node_budget: &mut usize,
-) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    // Issue #1539・SQL-42: `FROM` なし SELECT も投影と同じ型規則（整数算術は int4／int8）。
     let mut env = BindEnv {
         schema: None,
         params: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
+        typed_arith: true,
     };
-    bind_expr_in(expr, &mut env, node_budget)
+    let (bound, ty) = bind_expr_in(expr, &mut env, node_budget)?;
+    let col = expr_result_column_type(expr, &bound, ty);
+    Ok((bound, ty, col))
 }
 
 /// [`BindEnv::case_nesting`] を 1 段進め、[`MAX_CASE_NESTING`] を超えないか検査する
@@ -1780,7 +1906,7 @@ fn bind_expr_in(
                     // 使えるようにする。値は行コンテキスト（`eval_with_scalars` の
                     // `row_scalars`）から解決し、nullable 列の実 NULL は
                     // `ExprValue::Null` として伝播する（AC1・AC2）。
-                    ColumnType::Text => Ok((BoundExpr::TextColumnRef { index }, ExprType::Text)),
+                    ColumnType::Text | ColumnType::Varchar => Ok((BoundExpr::TextColumnRef { index }, ExprType::Text)),
                     // Issue #1183・SQL-24・SQL-26・TABLE-13 ポインタ: 数値 4 型
                     // （INTEGER／BIGINT／REAL／DOUBLE）の列参照を `WHERE`／投影／
                     // `CHECK` で共通に解禁する（#1075 の CHECK 専用 opt-in を撤廃）。
@@ -1874,6 +2000,25 @@ fn bind_expr_in(
             }
             let (l, lt) = bind_expr_in(lhs, env, node_budget)?;
             let (r, rt) = bind_expr_in(rhs, env, node_budget)?;
+            // Issue #1539・SQL-42: 投影モードの `Scalar` 同士の算術は、オペランドの数値
+            // 種別（整数／単精度／倍精度）から結果型を PostgreSQL に揃える。
+            if env.typed_arith
+                && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+                && lt == ExprType::Scalar
+                && rt == ExprType::Scalar
+            {
+                let lk = numeric_kind(lhs, &l, env);
+                let rk = numeric_kind(rhs, &r, env);
+                if let Some(kind) = combine_numeric_kind(lk, rk) {
+                    return Ok((
+                        BoundExpr::Builtin {
+                            f: BuiltinFn::TypedArith(*op, kind),
+                            args: vec![l, r],
+                        },
+                        ExprType::Scalar,
+                    ));
+                }
+            }
             bind_binary(*op, l, lt, r, rt)
         }
         // `Expr::Null` は `CASE` の THEN/ELSE・`COALESCE`／`NULLIF` の引数の 3 箇所
@@ -1895,10 +2040,51 @@ fn bind_expr_in(
     }
 }
 
+/// 型付き算術のオペランドの数値種別（Issue #1539・SQL-42）。`None` は倍精度扱い
+/// （小数リテラル・疑似列 `id`・関数・`CASE` など。現状の f64 意味論のまま = フェイル
+/// セーフ）。整数リテラルは `expr`（字面）から、列参照は束縛済みの `ColumnRef` と
+/// スキーマから、入れ子の型付き算術はそのノードの種別から決める。O(1)。
+fn numeric_kind(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> Option<NumericKind> {
+    if let Expr::Number(raw) = expr {
+        return classify_projection_integer_literal(raw).map(|(_, k)| k);
+    }
+    match bound {
+        BoundExpr::ColumnRef { index } => {
+            let column = env.schema?.columns.get(*index)?;
+            match column.ty {
+                ColumnType::Integer => Some(NumericKind::Int4),
+                ColumnType::BigInt => Some(NumericKind::Int8),
+                ColumnType::Real => Some(NumericKind::Float4),
+                _ => None,
+            }
+        }
+        BoundExpr::Builtin {
+            f: BuiltinFn::TypedArith(_, k),
+            ..
+        } => Some(*k),
+        _ => None,
+    }
+}
+
+/// 二項算術の結果種別（PostgreSQL の演算子解決に合わせる）。`None` は倍精度
+/// （既存の [`BoundExpr::Binary`] で束縛する）。`real + integer` は PostgreSQL でも
+/// 暗黙キャスト候補のうち numeric カテゴリの優先型 float8 が選ばれ
+/// `double precision` になるため、`(Float4, Int*)` は意図的に `None`（倍精度）とする。
+fn combine_numeric_kind(l: Option<NumericKind>, r: Option<NumericKind>) -> Option<NumericKind> {
+    use NumericKind::{Float4, Int4, Int8};
+    match (l?, r?) {
+        (Int4, Int4) => Some(Int4),
+        (Int4 | Int8, Int4 | Int8) => Some(Int8),
+        (Float4, Float4) => Some(Float4),
+        _ => None,
+    }
+}
+
 /// 列の型名（エラーメッセージ用。リテラル本文は含めない）。
 fn column_type_label(ty: &ColumnType) -> &'static str {
     match ty {
         ColumnType::Text => "text",
+        ColumnType::Varchar => "character varying",
         ColumnType::Vector(_) => "vector",
         ColumnType::Integer => "integer",
         ColumnType::BigInt => "bigint",
@@ -2151,6 +2337,7 @@ fn bind_binary(
             (ExprType::Date, ExprType::Date) if op == BinOp::Sub => {
                 Ok((mk(op, l, r), ExprType::Scalar))
             }
+            (ExprType::Text, _) | (_, ExprType::Text) => Err(text_arithmetic_error()),
             _ => Err(SqlSurfaceError::datatype_mismatch(
                 "'+'/'-' require both operands to be scalar, or a DATE combined with a day-count scalar",
             )),
@@ -2160,6 +2347,7 @@ fn bind_binary(
             (ExprType::Vector, ExprType::Scalar) | (ExprType::Scalar, ExprType::Vector) => {
                 Ok((mk(op, l, r), ExprType::Vector))
             }
+            (ExprType::Text, _) | (_, ExprType::Text) => Err(text_arithmetic_error()),
             _ => Err(SqlSurfaceError::datatype_mismatch(
                 "'*' requires scalar operands, or one vector and one scalar operand",
             )),
@@ -2167,6 +2355,7 @@ fn bind_binary(
         BinOp::Div => match (lt, rt) {
             (ExprType::Scalar, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Scalar)),
             (ExprType::Vector, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Vector)),
+            (ExprType::Text, _) | (_, ExprType::Text) => Err(text_arithmetic_error()),
             _ => Err(SqlSurfaceError::datatype_mismatch(
                 "'/' requires scalar operands, or a vector divided by a scalar",
             )),
@@ -2196,6 +2385,12 @@ fn bind_binary(
             )),
         },
     }
+}
+
+/// TEXT を算術オペランドに取ったときのエラー（Issue #1539・SQL-42。PostgreSQL の
+/// `operator does not exist` 相当で `42883`。値・列名は含めない固定文言）。
+fn text_arithmetic_error() -> SqlSurfaceError {
+    SqlSurfaceError::undefined_function("operator does not exist: arithmetic on text operand")
 }
 
 /// `DATE` 値を深夜 0 時の `TIMESTAMP` へ暗黙昇格する（`BuiltinFn::DateToTimestamp`
@@ -2326,6 +2521,8 @@ fn bind_call(
             // 後、呼び出し元の CASE/COALESCE/NULLIF と本体側のそれが合算される
             // ことを構造的に保証する。`enter_case_nesting` docs 参照）。
             case_nesting: env.case_nesting,
+            // UDF 本体は従来の f64 意味論のまま（Issue #1539。投影モードは本体へ伝播しない）。
+            typed_arith: false,
         };
         return bind_expr_in(&def.body, &mut inner_env, node_budget);
     }
@@ -3159,6 +3356,94 @@ pub(crate) fn apply_builtin<'a>(
             let d = take_date_arg(args, 0)?;
             Ok(ExprValue::Timestamp(datetime_fn::date_to_timestamp(d)))
         }
+        BuiltinFn::TypedArith(op, kind) => {
+            let a = take_scalar_arg(args, 0)?;
+            let b = take_scalar_arg(args, 1)?;
+            typed_arith(op, kind, a, b).map(ExprValue::Scalar)
+        }
+    }
+}
+
+/// f64 で運ばれる整数値の厳密性の上限（2^53）。
+const TYPED_INT_EXACT_MAX: i64 = 1 << 53;
+
+/// [`BuiltinFn::TypedArith`] の評価本体（Issue #1539・SQL-42）。`Int4`／`Int8` は
+/// オペランドを i64 へ戻して `checked_*` で計算し、溢れは `22003`、0 除算は `22012`。
+/// 整数除算は 0 方向への切り捨て（PostgreSQL と同じ）。`Float4` は f64 で 1 演算して
+/// から f32 へ丸め、非有限・アンダーフローを `22003` にする。オペランドが整数でない・
+/// 2^53 を超える場合は束縛段の不変条件違反として `Internal`（fail-closed。panic しない）。
+fn typed_arith(op: BinOp, kind: NumericKind, a: f64, b: f64) -> Result<f64, SqlSurfaceError> {
+    match kind {
+        NumericKind::Int4 | NumericKind::Int8 => {
+            let (x, y) = (exact_int(a)?, exact_int(b)?);
+            let r = match op {
+                BinOp::Add => x.checked_add(y),
+                BinOp::Sub => x.checked_sub(y),
+                BinOp::Mul => x.checked_mul(y),
+                BinOp::Div => {
+                    if y == 0 {
+                        return Err(SqlSurfaceError::division_by_zero("/"));
+                    }
+                    x.checked_div(y)
+                }
+                BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "comparison operator in typed arithmetic evaluation".to_string(),
+                    });
+                }
+            };
+            let label = if kind == NumericKind::Int4 {
+                "integer out of range"
+            } else {
+                "bigint out of range"
+            };
+            let r = r.ok_or_else(|| SqlSurfaceError::numeric_out_of_range(label))?;
+            let in_range = if kind == NumericKind::Int4 {
+                i32::try_from(r).is_ok()
+            } else {
+                r.unsigned_abs() <= TYPED_INT_EXACT_MAX as u64
+            };
+            if !in_range {
+                return Err(SqlSurfaceError::numeric_out_of_range(label));
+            }
+            Ok(r as f64)
+        }
+        NumericKind::Float4 => {
+            let r = match op {
+                BinOp::Add => a + b,
+                BinOp::Sub => a - b,
+                BinOp::Mul => a * b,
+                BinOp::Div => {
+                    if b == 0.0 {
+                        return Err(SqlSurfaceError::division_by_zero("/"));
+                    }
+                    a / b
+                }
+                BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "comparison operator in typed arithmetic evaluation".to_string(),
+                    });
+                }
+            };
+            let r32 = r as f32;
+            let underflow = r32 == 0.0 && r != 0.0 && matches!(op, BinOp::Mul | BinOp::Div);
+            if !r32.is_finite() || underflow {
+                return Err(SqlSurfaceError::numeric_out_of_range("real out of range"));
+            }
+            Ok(f64::from(r32))
+        }
+    }
+}
+
+/// f64 で運ばれた整数値を i64 へ戻す。整数でない・|v| > 2^53 は束縛段の不変条件違反
+/// （[`typed_arith`] の呼び出し元は整数型のオペランドしか渡さない）として `Internal`。
+fn exact_int(v: f64) -> Result<i64, SqlSurfaceError> {
+    if v.is_finite() && v.fract() == 0.0 && v.abs() <= TYPED_INT_EXACT_MAX as f64 {
+        Ok(v as i64)
+    } else {
+        Err(SqlSurfaceError::Internal {
+            detail: "typed integer arithmetic received a non-integer operand".to_string(),
+        })
     }
 }
 
@@ -4159,6 +4444,7 @@ mod tests {
             BuiltinFn::Mod,
             BuiltinFn::Power,
             BuiltinFn::Sqrt,
+            BuiltinFn::TypedArith(BinOp::Add, NumericKind::Int4),
         ] {
             let (params, _) = builtin_signature(f);
             assert!(
@@ -4937,5 +5223,35 @@ mod tests {
             else_result: Some(Box::new(call("g", vec![]))),
         };
         assert_eq!(first_non_builtin_call(&else_case), Some("g"));
+    }
+
+    /// Issue #1539・SQL-42: 型付き算術の checked 演算・切り捨て除算・丸めを固定する。
+    #[test]
+    fn typed_arith_follows_postgres_integer_and_real_semantics() {
+        use NumericKind::{Float4, Int4, Int8};
+        let ok = |op, k, a, b| typed_arith(op, k, a, b).expect("should succeed");
+        let code = |op, k, a, b| {
+            typed_arith(op, k, a, b)
+                .unwrap_err()
+                .wire_code()
+                .to_string()
+        };
+        assert_eq!(ok(BinOp::Div, Int4, 7.0, 2.0), 3.0);
+        assert_eq!(ok(BinOp::Div, Int4, -7.0, 2.0), -3.0);
+        assert_eq!(ok(BinOp::Sub, Int4, 0.0, 2147483647.0), -2147483647.0);
+        assert_eq!(code(BinOp::Add, Int4, 2147483647.0, 1.0), "22003");
+        assert_eq!(code(BinOp::Sub, Int4, -2147483648.0, 1.0), "22003");
+        assert_eq!(code(BinOp::Div, Int4, -2147483648.0, -1.0), "22003");
+        assert_eq!(code(BinOp::Div, Int4, 1.0, 0.0), "22012");
+        // int8 は i32 を超えても良いが 2^53 を超える結果は fail-closed。
+        assert_eq!(ok(BinOp::Mul, Int8, 2147483648.0, 2.0), 4294967296.0);
+        assert_eq!(code(BinOp::Mul, Int8, 4503599627370497.0, 2.0), "22003");
+        // 整数でないオペランドは不変条件違反（panic せず Internal = XX000）。
+        assert_eq!(code(BinOp::Add, Int4, 1.5, 1.0), "XX000");
+        // float4: f32 へ丸め、溢れ・アンダーフローは 22003。
+        assert_eq!(ok(BinOp::Add, Float4, 1.5, 2.25), 3.75);
+        assert_eq!(code(BinOp::Mul, Float4, 3.0e38, 10.0), "22003");
+        assert_eq!(code(BinOp::Mul, Float4, 1.0e-30, 1.0e-30), "22003");
+        assert_eq!(code(BinOp::Div, Float4, 1.0, 0.0), "22012");
     }
 }

@@ -89,6 +89,15 @@ pub enum Token {
         qualifier: String,
         name: String,
     },
+    /// 修飾ワイルドカード `t.*`（SQL-44 ポインタ、Issue #1536）。空白を挟まず `.` の直後が
+    /// `*` の場合のみ生成する（`t .*`・`t. *`・予約語の修飾子・`a.b.*` は従来どおり
+    /// `LexError`）。消費するのは `sql::qualified_column` の正規化器だけで、FROM の公開名に
+    /// 一致し選択リスト項目の位置にある場合に限り `Punct('*')` へ 1 対 1 で置き換える。
+    /// 正規化されなかった `QualifiedStar` は `allowlist::Parser` が知らないトークンとして
+    /// `42601` で拒否する（fail-closed）。
+    QualifiedStar {
+        qualifier: String,
+    },
     /// 拡張クエリプロトコルのパラメータプレースホルダ `$n`（1 始まり。
     /// Issue #935・WIRE-12・TASK-217）。既定の [`tokenize`] は本トークンを一切
     /// 生成せず、`$` を引き続き「未対応文字」として拒否する
@@ -194,6 +203,10 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
                 out.push_str(qualifier);
                 out.push('.');
                 out.push_str(name);
+            }
+            Token::QualifiedStar { qualifier } => {
+                out.push_str(qualifier);
+                out.push_str(".*");
             }
             Token::QuotedNull(s) => {
                 out.push('"');
@@ -304,7 +317,7 @@ fn bare_bool_leaf_positions(tokens: &[Token]) -> Vec<usize> {
 }
 
 /// [`demote_unneeded_quoted_bool_words`] の位置判定（`tokens[i]` が真偽語）。
-fn quoted_bool_word_in_leaf_position(tokens: &[Token], i: usize) -> bool {
+pub(crate) fn quoted_bool_word_in_leaf_position(tokens: &[Token], i: usize) -> bool {
     // 直前: 連続する `(` を数えつつ読み戻し、先頭が WHERE／AND／OR／NOT かを見る。
     // この `(` 群（opens 個）が葉自身を包む述語グループで、直後の最初の opens 個の `)` が
     // それに対応する。それを超える `)` は外側の構造（CTE・サブクエリ）を閉じる境界であり、
@@ -676,6 +689,11 @@ fn tokenize_impl(
                     let mut dot_lookahead = rest.char_indices();
                     if matches!(dot_lookahead.next(), Some((_, '.'))) {
                         let name_start_in_rest = dot_lookahead.next();
+                        if matches!(name_start_in_rest, Some((_, '*'))) {
+                            tokens.push(Token::QualifiedStar { qualifier: word });
+                            advance_to(&mut chars, next_offset + 2);
+                            continue;
+                        }
                         if matches!(name_start_in_rest, Some((_, nc)) if nc.is_ascii_alphabetic() || nc == '_')
                         {
                             let name_start = next_offset + 1;
@@ -1142,6 +1160,39 @@ mod tests {
         assert!(tokenize("a.").is_err());
         assert!(tokenize("a. b").is_err());
         assert!(tokenize("a.b.c").is_err());
+    }
+
+    #[test]
+    fn qualified_star_lexes_and_rejects_malformed_forms() {
+        // Issue #1536・SQL-44: 空白を挟まない `t.*` のみ受理する。
+        let q = |s: &str| Token::QualifiedStar {
+            qualifier: s.to_string(),
+        };
+        assert_eq!(tokenize("t.*").expect("lex"), vec![q("t")]);
+        assert_eq!(
+            tokenize("SELECT t.* FROM t").expect("lex"),
+            vec![
+                Token::Keyword(Keyword::Select),
+                q("t"),
+                Token::Keyword(Keyword::From),
+                Token::Ident("t".to_string()),
+            ]
+        );
+        assert!(tokenize("a.b.*").is_err());
+        assert!(tokenize("t .*").is_err());
+        assert!(tokenize("t. *").is_err());
+        assert!(tokenize("select.*").is_err());
+        assert_eq!(
+            tokenize("t.**").expect("lex"),
+            vec![q("t"), Token::Punct('*')]
+        );
+        assert_eq!(tokenize("t.*/* c */").expect("lex"), vec![q("t")]);
+        // render_tokens の往復で同じトークン列に戻る。
+        let toks = tokenize("SELECT t.* FROM t").expect("lex");
+        assert_eq!(
+            tokenize(&render_tokens(&toks).expect("render")).expect("lex"),
+            toks
+        );
     }
 
     #[test]

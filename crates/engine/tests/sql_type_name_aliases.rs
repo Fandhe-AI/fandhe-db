@@ -122,9 +122,10 @@ fn unsettled_type_names_are_rejected_with_0a000_without_side_effects() {
         "CREATE TABLE t (a INT2)",
         "CREATE TABLE t (a int2)",
         "CREATE TABLE t (a SMALLINT)",
-        "CREATE TABLE t (a VARCHAR)",
         "CREATE TABLE t (a VARCHAR(10))",
         "CREATE TABLE t (a CHARACTER VARYING(10))",
+        "CREATE TABLE t (a VARCHAR[])",
+        "CREATE TABLE t (a CHARACTER VARYING[3])",
         "CREATE TABLE t (a CHAR)",
         "CREATE TABLE t (a CHAR(1))",
         "CREATE TABLE t (a CHARACTER(1))",
@@ -186,11 +187,22 @@ fn unsettled_spellings_match_on_every_ddl_path_and_leave_schema() {
 fn ddl_permission_gate_precedes_runtime_resolution_but_not_syntax_rejection() {
     let (_p, _g, core) = open("ta-permission");
     let mut denied = SessionState::default();
-    for sql in ["CREATE TABLE t (a INT4)", "CREATE TABLE t (a mood)"] {
+    for sql in [
+        "CREATE TABLE t (a INT4)",
+        "CREATE TABLE t (a mood)",
+        // 長さなし VARCHAR は実行段で解決されるため権限ゲートが先（Issue #2305）。
+        "CREATE TABLE t (a VARCHAR)",
+        "CREATE TABLE t (a CHARACTER VARYING)",
+    ] {
         assert_eq!(err(&core, &mut denied, sql).wire_code(), "42501", "{sql}");
     }
     let mut ok = allowed();
-    for sql in ["CREATE TABLE t (a INT2)", "CREATE TABLE t (a SMALLINT)"] {
+    for sql in [
+        "CREATE TABLE t (a INT2)",
+        "CREATE TABLE t (a SMALLINT)",
+        "CREATE TABLE t (a VARCHAR(10))",
+        "CREATE TABLE t (a CHARACTER VARYING(10))",
+    ] {
         assert_eq!(err(&core, &mut denied, sql).wire_code(), "0A000", "{sql}");
         assert_eq!(err(&core, &mut ok, sql).wire_code(), "0A000", "{sql}");
     }
@@ -458,13 +470,16 @@ fn issue_2304_float_precision_out_of_range_is_22023_without_side_effects() {
     assert!(matches!(a.ty, ColumnType::Real));
 }
 
-/// 既存 ENUM との衝突防止: `CREATE TYPE float`・`bool` は作成できない。
+/// 既存 ENUM との衝突防止: `CREATE TYPE float`・`bool` は作成できない。拒否の
+/// `wire_code` は既存の予約名（`boolean`）の拒否と同一である。
 #[test]
 fn issue_2304_create_type_rejects_float_and_bool() {
     let (path, _g, core) = open("ta-2304-enum");
     let mut s = allowed();
+    let reserved = err(&core, &mut s, "CREATE TYPE boolean AS ENUM ('a')").wire_code();
     for name in ["float", "FLOAT", "bool", "timestamp"] {
-        let _ = err(&core, &mut s, &format!("CREATE TYPE {name} AS ENUM ('a')"));
+        let sql = format!("CREATE TYPE {name} AS ENUM ('a')");
+        assert_eq!(err(&core, &mut s, &sql).wire_code(), reserved, "{sql}");
     }
     drop(core);
     let storage = Storage::open(&path).expect("reopen");

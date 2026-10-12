@@ -499,9 +499,9 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
         PreparedParamType::Column(meta) => match meta {
             // `id` は宣言 0（実効 1700=NUMERIC）をバイナリ非対応とする。
             ColumnMeta::Id => int_kind(effective_oid),
-            ColumnMeta::Computed { .. } => BinaryParam::Unsupported,
+            ColumnMeta::Computed { .. } | ColumnMeta::AliasedId { .. } => BinaryParam::Unsupported,
             ColumnMeta::Scalar { ty, .. } => match ty {
-                ColumnType::Text => text_like(),
+                ColumnType::Text | ColumnType::Varchar => text_like(),
                 ColumnType::Integer | ColumnType::BigInt => int_kind(effective_oid),
                 ColumnType::Real => only(700, BinaryParam::Float4),
                 ColumnType::Double => only(701, BinaryParam::Float8),
@@ -619,7 +619,9 @@ impl PreparedStatementStore {
 /// 変わらない契約——PostgreSQL の「bind snapshots the plan」と同じ動作）。
 enum PortalBody {
     Empty,
-    Parsed(ParsedSql),
+    /// `ParsedSql` は大きい列挙体のため Box で包み、`Empty` との大きさの差を抑える
+    /// （clippy `large_enum_variant`）。
+    Parsed(Box<ParsedSql>),
 }
 
 /// portal が保持する未送出行と、完了時に使う `CommandComplete` タグの組み立て
@@ -1632,7 +1634,7 @@ fn handle_bind_body(
             let columns = engine
                 .describe_parsed_in_txn(session, txn, &bound)
                 .map_err(HandlerError::Sql)?;
-            (PortalBody::Parsed(bound), columns)
+            (PortalBody::Parsed(Box::new(bound)), columns)
         }
         PreparedStatement::Parsed(parsed) => {
             let parsed = parsed.clone();
@@ -1642,7 +1644,7 @@ fn handle_bind_body(
             let columns = engine
                 .describe_parsed_in_txn(session, txn, &parsed)
                 .map_err(HandlerError::Sql)?;
-            (PortalBody::Parsed(parsed), columns)
+            (PortalBody::Parsed(Box::new(parsed)), columns)
         }
     };
 
@@ -1766,10 +1768,12 @@ fn portal_is_exempt_while_failed(state: &ExtendedQueryState, portal_name: &str) 
     match state.portals.get(portal_name) {
         Some(portal) => match &portal.body {
             PortalBody::Empty => true,
-            PortalBody::Parsed(ParsedSql::Transaction(
-                engine::sql::transaction::TxnControl::Rollback,
-            )) => matches!(portal.state, PortalState::Ready),
-            PortalBody::Parsed(_) => false,
+            PortalBody::Parsed(parsed) => {
+                matches!(
+                    **parsed,
+                    ParsedSql::Transaction(engine::sql::transaction::TxnControl::Rollback)
+                ) && matches!(portal.state, PortalState::Ready)
+            }
         },
         None => false,
     }
@@ -1848,7 +1852,7 @@ fn execute_portal<'e, S: WireStream>(
                 .get(portal_name)
                 .ok_or(HandlerError::UnknownPortal)?;
             let parsed = match &portal.body {
-                PortalBody::Parsed(parsed) => parsed.clone(),
+                PortalBody::Parsed(parsed) => (**parsed).clone(),
                 // 呼び出し元が関数冒頭で `Empty` を判定・早期 return 済みの
                 // はずだが、内部状態機械の不変条件が将来の変更で崩れた場合に
                 // 備えて panic ではなく fail-closed な内部エラーへ倒す

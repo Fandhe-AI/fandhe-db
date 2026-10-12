@@ -167,9 +167,11 @@ pub(crate) fn extract_order_value_ref<'a>(
         .get(index)
         .ok_or_else(|| scan_bug("order key column index out of range"))?;
     match (&column.ty, key.kind, value) {
-        (ColumnType::Text, OrderKind::Bytes, row_codec::ScalarRef::Text(t)) => {
-            Ok(Some(ScalarKeyRef::Bytes(t.as_bytes())))
-        }
+        (
+            ColumnType::Text | ColumnType::Varchar,
+            OrderKind::Bytes,
+            row_codec::ScalarRef::Text(t),
+        ) => Ok(Some(ScalarKeyRef::Bytes(t.as_bytes()))),
         (ColumnType::Integer, OrderKind::SignedInt, row_codec::ScalarRef::Integer(v)) => {
             Ok(Some(ScalarKeyRef::SignedInt(i64::from(*v))))
         }
@@ -335,9 +337,11 @@ pub(crate) fn order_value_to_cell(
     use crate::sql::exec::Cell;
     match (value, ty) {
         (OrderValue::Id(v), None) => Ok(Cell::Integer(*v)),
-        (OrderValue::Bytes(b), Some(ColumnType::Text)) => String::from_utf8(b.clone())
-            .map(Cell::Text)
-            .map_err(|_| scan_bug("group key TEXT value is not valid UTF-8")),
+        (OrderValue::Bytes(b), Some(ColumnType::Text | ColumnType::Varchar)) => {
+            String::from_utf8(b.clone())
+                .map(Cell::Text)
+                .map_err(|_| scan_bug("group key TEXT value is not valid UTF-8"))
+        }
         (OrderValue::SignedInt(v), Some(ColumnType::Integer | ColumnType::BigInt)) => {
             Ok(Cell::SignedInteger(*v))
         }

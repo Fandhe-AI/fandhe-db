@@ -13,11 +13,30 @@
 - 解決規則は `sql::relation::TableRef::matches_qualifier`／`ensure_qualifier` に一本化し、JOIN の `BindingScope::resolve` と共有する。公開名は別名があれば別名、無ければテーブル名。
 - 修飾子が公開名に一致しない場合は `42P01`。カタログを照会せず入力された修飾子のみを返すため、別テーブルの存在オラクルにならない（fail-closed）。
 
+## 修飾列参照の受理（Issue #1535）
+
+`sql::qualified_column::normalize_single_table_qualifiers` が、`validate_select_statement`（トップレベル SELECT・`EXPLAIN`・カーソル・`COPY (SELECT) TO`・サブクエリ内側の再検証）と CTE 主クエリの入口で、構文解析の前に 1 回だけ走る。FROM の公開名に一致する `Token::QualifiedIdent` を `Token::Ident(name)` へ 1 対 1 で置き換えるため、修飾あり・なしで AST・行・列名・エラーコードが一致する（トークン数不変）。
+
+- スコープ: 先頭 `SELECT` と各 `( SELECT ...)`。直近のスコープの FROM 参照から照合する（内側優先）。FROM 参照の読み取りは `Parser::parse_from_table_ref` を試し解析に使い、別名規則を二重化しない。
+- 書き換え区間: 投影と、FROM 参照以降〜`LIMIT`／`;`／`USING PLAN|MODE`／`HINT ORDER` の手前。関数名形（直後が `(`）・`AS` 直後・`::` 直後・`EXTRACT(` 直後は列参照ではないため残す。
+- 不一致は `42P01`（カタログ非照会）。外側スコープの公開名に一致する修飾（相関）は `42601`。
+- 不透明スコープ（FROM なし・スキーマ修飾 FROM・JOIN・カンマ結合・集合演算・深さ超過・解析不能）は書き換えず、従来のパーサー判定に委ねる。
+- 適用しない経路: 集合演算の枝、JOIN（`BindingScope`）、VIEW 本体、CTE 定義本体、DML、INSERT、CHECK。
+- content_hash は DML 台帳専用で SELECT 経路では計算しない。正規化は DML に適用しないため入力は不変。
+- `x.id` は非修飾 `id` と同じ扱いになる。
+
 ## 判定順
 
-SELECT リストは FROM より前に読まれるため、`SELECT t.id FROM t AS x` は従来どおり `42601`。WHERE 葉の先頭位置の修飾子不一致は、後続の文法誤りより先に `42P01` になりうる。
+正規化はパースより前に走るため、修飾子の不一致による `42P01` は後続の文法誤りによる `42601` より先に返りうる。非修飾の適用外経路（集合演算の枝等）では、WHERE 葉の先頭位置のみ `Parser::parse_where_leaf` のフックが同じ規則を担う。
 
 ## 申し送り
 
-- #1535: `Parser::parse_where_leaf` 先頭のフックで「一致時 `42601`」を「修飾子を剥がして非修飾列として処理」へ差し替え、投影・ORDER BY・GROUP BY の修飾も受理する。
-- #1536: `t.*` と id 修飾。
+- AS 別名（`t.id AS i` 等）は #1537・#1540 の担当（現状は非修飾と同じ `42601`）。
+
+## `t.*`（Issue #1536）
+
+- lexer は空白を挟まない `t.*` を `Token::QualifiedStar` にする（予約語の修飾子・`t .*`・`a.b.*` は従来どおり字句エラー）。
+- 正規化器は FROM の公開名に一致し、かつ選択リスト項目の位置（直前 `SELECT`／`,`／`DISTINCT`／`ALL`、直後 `FROM`／`,`）にある場合に限り `Punct('*')` へ 1 対 1 で置き換える。以降は `SELECT *` と同一の AST（`id` 疑似列が先頭）。
+- 不一致の修飾子は `42P01`（外側スコープの公開名なら `42601`）。一致しても上記以外の位置（WHERE・ORDER BY・関数引数・演算子の隣）は乗算等への再解釈を避けるため `42601`。
+- `t.*, col` の混在は非修飾の `*, col` と同じく未対応。JOIN・集合演算・DML・VIEW 本体・RETURNING は対象外（正規化されない `QualifiedStar` はパーサーが `42601` で拒否）。
+- テスト: `crates/engine/tests/sql44_qualified_star.rs`。

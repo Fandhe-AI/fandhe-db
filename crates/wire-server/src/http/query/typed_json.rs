@@ -357,7 +357,7 @@ pub fn map_json_to_literal(
     // いた。契約確定までは安全側として従来の拒否を維持し、他の型
     // （nullable 判定を `bind_update` へ委譲する設計自体）には影響しない。
     match (&column.ty, raw) {
-        (ColumnType::Text, JsonValue::Null) => {
+        (ColumnType::Text | ColumnType::Varchar, JsonValue::Null) => {
             return Err(TypedJsonError::LegacyMismatch(
                 "TEXT column value must be a JSON string",
             ))
@@ -375,7 +375,7 @@ pub fn map_json_to_literal(
     match &column.ty {
         // TEXT は Issue #896 以前から対応済みの旧来型のため、値・型不一致は
         // `LegacyMismatch`（`22000`）のまま維持する（`nosql-api.md` の既存契約）。
-        ColumnType::Text => match raw {
+        ColumnType::Text | ColumnType::Varchar => match raw {
             JsonValue::String(s) => Ok(InsertLiteral::String(s.clone())),
             _ => Err(TypedJsonError::LegacyMismatch(
                 "TEXT column value must be a JSON string",
