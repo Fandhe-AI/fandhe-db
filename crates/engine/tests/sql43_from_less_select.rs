@@ -247,7 +247,7 @@ fn rejects_aggregates_and_trailing_clauses() {
     ] {
         let code = wire_code_of(&core, &ctx, sql);
         assert!(
-            matches!(code, "42601" | "0A000"),
+            matches!(code, "42601" | "42703" | "0A000"),
             "{sql:?} should be rejected fail-closed, got {code}"
         );
     }

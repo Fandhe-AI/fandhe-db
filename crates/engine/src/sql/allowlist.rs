@@ -1946,7 +1946,7 @@ impl ConstSelectItem {
 /// `tokens`（先頭は `SELECT`）に、括弧の深さ 0 の `FROM` が無ければ真（SQL-43）。
 /// 括弧内の `FROM`（サブクエリ等）は深さ > 0 のため数えない。深さの計算は
 /// `saturating` 演算（untrusted 入力で巻き戻らない）。
-fn is_from_less_select(tokens: &[Token]) -> bool {
+pub(crate) fn is_from_less_select(tokens: &[Token]) -> bool {
     let mut depth: usize = 0;
     for tok in tokens {
         match tok {

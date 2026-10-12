@@ -3519,7 +3519,15 @@ impl EngineCore {
                 Some(crate::sql::lexer::Token::Ident(second)),
             ) if head.eq_ignore_ascii_case("EXPLAIN") && second.eq_ignore_ascii_case("UPDATE")
         );
-        let tokens = if literal_sensitive_head {
+        // FROM なし SELECT の `WHERE "NULL"` は NULL リテラルではなく列参照として扱う
+        // 必要がある（Issue #2329）ため、引用情報をこの文種に限り保持する。
+        let from_less_select_head = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Keyword(
+                crate::sql::lexer::Keyword::Select
+            ))
+        ) && crate::sql::allowlist::is_from_less_select(&tokens);
+        let tokens = if literal_sensitive_head || from_less_select_head {
             tokens
         } else {
             crate::sql::lexer::demote_quoted_null(tokens)
