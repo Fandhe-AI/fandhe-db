@@ -135,6 +135,9 @@ pub(crate) fn update_rows_where_partitioned_unchecked<E>(
     content_hash_value: &content_hash::ContentHash,
     expected_schema: Option<&crate::catalog::TableSchema>,
     assignments: &[(usize, crate::row_codec::Value)],
+    // SET 右辺が式の項（Issue #1544・SQL-45 のポインタ）。適用段（原子経路と共有）が
+    // 行ごとに更新前の値で評価するため、チャンク境界をまたいでも各行に 1 回だけ適用される。
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
     needs_embedding: bool,
     limits: &PartitionedDmlLimits,
     max_affected_total: Option<NonZeroUsize>,
@@ -150,7 +153,10 @@ pub(crate) fn update_rows_where_partitioned_unchecked<E>(
         needs_embedding,
         limits,
         max_affected_total,
-        Kind::Update { assignments },
+        Kind::Update {
+            assignments,
+            set_exprs,
+        },
         predicate,
         &mut Hooks::production(),
     )
@@ -162,6 +168,7 @@ enum Kind<'a> {
     Delete,
     Update {
         assignments: &'a [(usize, crate::row_codec::Value)],
+        set_exprs: &'a [(usize, crate::sql::set_expr::BoundSetExpr)],
     },
 }
 
@@ -386,8 +393,14 @@ fn chunk_loop<E>(
                 )));
             }
         }
-        if let Kind::Update { assignments } = kind {
+        if let Kind::Update {
+            assignments,
+            set_exprs,
+        } = kind
+        {
             validate_set_assignments(&schema, assignments).map_err(w)?;
+            // 式項は束縛時スキーマの列 index に結び付く（`expected_schema` 必須）。
+            require_expected_schema_for_set_exprs(set_exprs, expected_schema).map_err(w)?;
         }
 
         // ジョブ記録の照合。最初のチャンクは再送判定、以降はメモリ上の状態との一致確認。
@@ -502,13 +515,17 @@ fn chunk_loop<E>(
                 None,
                 Some(&mut stop_by_hold),
             ),
-            Kind::Update { assignments } => apply_predicate_update_in_txn::<E>(
+            Kind::Update {
+                assignments,
+                set_exprs,
+            } => apply_predicate_update_in_txn::<E>(
                 &write_txn,
                 table,
                 ctx,
                 &schema,
                 &candidates,
                 assignments,
+                set_exprs,
                 fk_mode,
                 None,
                 Some(&mut stop_by_hold),

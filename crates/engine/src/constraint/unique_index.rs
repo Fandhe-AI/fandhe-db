@@ -980,6 +980,7 @@ mod tests {
             &ctx,
             1,
             &[(0, Value::Null)],
+            &[],
             ledger_write,
             None,
         )

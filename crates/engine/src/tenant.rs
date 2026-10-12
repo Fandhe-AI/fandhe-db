@@ -407,6 +407,16 @@ pub enum TenantWriteError {
     /// 再束縛失敗（漂流）は本 variant ではなく引き続き
     /// [`TenantWriteError::Catalog`]（`CorruptSchema`。`XX000`）が担う。
     CheckEvaluationFailed(SqlSurfaceError),
+    /// `UPDATE ... SET <col> = <式>` の右辺式の評価・列型への変換が失敗した、または
+    /// 式を含む SET の `content_hash` を計算できなかった（Issue #1544・SQL-45 のポインタ。
+    /// 0 除算 `22012`・範囲外 `22003`・NOT NULL 列への NULL `23502` 等）。
+    /// [`TenantWriteError::CheckEvaluationFailed`] と同じく内側の [`SqlSurfaceError`] を
+    /// そのまま保持して通常の式評価と同じ `wire_code` で返す。評価は所有・可視と確定した
+    /// 自テナントの行に対してだけ行うため、他テナントの存在オラクルにならない。
+    /// `Display`／`Debug` は行の値を含めない。
+    /// **BREAKING CHANGE**（Issue #1544）: variant を追加した（本 enum は
+    /// `#[non_exhaustive]` ではないため網羅的 `match` の下流は追随が必要）。
+    SetExpressionEvaluationFailed(SqlSurfaceError),
     /// `FOREIGN KEY` 制約（TABLE-17・TASK-205、Issue #907）の参照整合性違反
     /// （`23503`）: 参照元の書き込みで参照先の値の組が同一テナント内に存在しない、
     /// または参照先の削除・更新・TRUNCATE・置換で参照元の行が残る。一意性制約と
@@ -566,6 +576,9 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::CheckEvaluationFailed(inner) => {
                 crate::error_format::ClassifiedError::error_class(inner)
             }
+            TenantWriteError::SetExpressionEvaluationFailed(inner) => {
+                crate::error_format::ClassifiedError::error_class(inner)
+            }
             TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             TenantWriteError::ReferentialActionLimitExceeded => ErrorClass::PayloadTooLarge,
             TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
@@ -632,6 +645,9 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::CheckEvaluationFailed(inner) => {
                 write!(f, "{}", inner.client_message())
             }
+            TenantWriteError::SetExpressionEvaluationFailed(inner) => {
+                write!(f, "{}", inner.client_message())
+            }
             TenantWriteError::ForeignKeyViolation => {
                 write!(f, "foreign key constraint violation")
             }
@@ -682,6 +698,9 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::CheckViolation { .. } => f.write_str("CheckViolation(<redacted>)"),
             TenantWriteError::CheckEvaluationFailed(_) => {
                 f.write_str("CheckEvaluationFailed(<redacted>)")
+            }
+            TenantWriteError::SetExpressionEvaluationFailed(_) => {
+                f.write_str("SetExpressionEvaluationFailed(<redacted>)")
             }
             TenantWriteError::ForeignKeyViolation => f.write_str("ForeignKeyViolation"),
             TenantWriteError::ReferentialActionLimitExceeded => {
@@ -2876,12 +2895,81 @@ pub(crate) fn merge_row_for_update(
     Ok((embedding, metadata))
 }
 
+/// [`merge_row_for_update`] の SET 右辺式対応版（Issue #1544・SQL-45 のポインタ）。
+/// `set_exprs` の各式を**更新前の行**（`existing` の埋め込みとスカラー列）に対して
+/// すべて先に評価し、リテラル項 `assignments` と合わせた全項を [`validate_set_assignments`]
+/// で再検証（評価後の TEXT 長・スカラー累計ペイロード上限が `repeat` 等で迂回されない
+/// ようにする）してから [`merge_row_for_update`] へ渡す。他の SET の更新後の値は
+/// 式から見えない（`SET a = 1, b = a` の `b` は更新前の `a`。PostgreSQL と同じ意味論）。
+///
+/// 呼び出し元（`update_row_columns_capturing_unchecked`・`apply_predicate_update_in_txn`）は
+/// 所有・可視と確定した行に対してだけ呼ぶ契約（テナント境界の順序契約）。`set_exprs` が
+/// 空なら [`merge_row_for_update`] と同一の挙動（評価も再検証も行わない）。
+/// 束縛済み式は列 index でスキーマに結び付いているため、`expected_schema` による
+/// 束縛時スキーマとの同一性確認が前提（各呼び出し元が式を持つのに `expected_schema` が
+/// 無い場合は拒否する。[`require_expected_schema_for_set_exprs`]）。
+fn merge_row_for_update_set(
+    schema: &crate::catalog::TableSchema,
+    existing: crate::storage::Row,
+    id: u64,
+    assignments: &[(usize, crate::row_codec::Value)],
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
+) -> Result<(Vec<f32>, Vec<u8>), TenantWriteError> {
+    if set_exprs.is_empty() {
+        return Ok(merge_row_for_update(schema, existing, assignments)?);
+    }
+    let mut resolved: Vec<(usize, crate::row_codec::Value)> = Vec::new();
+    resolved
+        .try_reserve_exact(assignments.len().saturating_add(set_exprs.len()))
+        .map_err(|_| {
+            TenantWriteError::Catalog(CatalogError::Invalid(
+                "failed to reserve SET assignment buffer".to_string(),
+            ))
+        })?;
+    resolved.extend(assignments.iter().cloned());
+    {
+        let scanned = crate::row_codec::scan_scalar_columns(schema, &existing.metadata)
+            .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+        for (idx, set) in set_exprs {
+            let value = crate::sql::set_expr::eval_set_expr_to_value(
+                set,
+                id,
+                &existing.embedding,
+                &scanned,
+            )
+            .map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
+            resolved.push((*idx, value));
+        }
+    }
+    validate_set_assignments(schema, &resolved)?;
+    Ok(merge_row_for_update(schema, existing, &resolved)?)
+}
+
+/// 式を含む SET が束縛時のスキーマに結び付いていることを保証する（Issue #1544）。
+/// 束縛済み式は列 index で参照するため、`expected_schema` が無い（束縛時スキーマとの
+/// 照合ができない）呼び出しは fail-closed に `Internal` 相当で拒否する。
+fn require_expected_schema_for_set_exprs(
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
+    expected_schema: Option<&crate::catalog::TableSchema>,
+) -> Result<(), TenantWriteError> {
+    if !set_exprs.is_empty() && expected_schema.is_none() {
+        return Err(TenantWriteError::SetExpressionEvaluationFailed(
+            SqlSurfaceError::Internal {
+                detail: "SET expression requires the bound table schema".to_string(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn update_row_columns_unchecked(
     target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
     assignments: &[(usize, crate::row_codec::Value)],
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<usize, TenantWriteError> {
@@ -2891,6 +2979,7 @@ pub(crate) fn update_row_columns_unchecked(
         ctx,
         id,
         assignments,
+        set_exprs,
         ledger_write,
         expected_schema,
         None,
@@ -2915,6 +3004,9 @@ pub(crate) fn update_row_columns_capturing_unchecked(
     ctx: &PolicyContext,
     id: u64,
     assignments: &[(usize, crate::row_codec::Value)],
+    // SET 右辺が式の項（Issue #1544・SQL-45 のポインタ）。空ならリテラルだけの従来挙動
+    // （ビット同一）。評価は所有・可視と確定した行に対してだけ行う。
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
     mut project: Option<&mut ReturningProjectFn<'_>>,
@@ -2942,6 +3034,9 @@ pub(crate) fn update_row_columns_capturing_unchecked(
             // （述語形 [`update_rows_where_unchecked`] と共有。codex-review P1 指摘・
             // PR #993 系・Issue #871）。
             validate_set_assignments(&schema, assignments)?;
+            // 式項の束縛は列 index でスキーマに結び付く（上の `expected` 照合が前提）。
+            // 式項の静的な型照合は束縛段（`sql::set_expr::bind_set_expr`）で完了済み。
+            require_expected_schema_for_set_exprs(set_exprs, expected_schema)?;
 
             // `(スキーマ列 index, 列名, 値)` の順で構築し、ハッシュ計算前に列
             // index でソートして宣言順非依存にする（下記コメント参照）。列 index の
@@ -3021,15 +3116,63 @@ pub(crate) fn update_row_columns_capturing_unchecked(
             // NULL 除外の旧レイアウト用 legacy hash は意図して渡さない（NULL を含まない
             // 入力では新旧が同一バイト列で、渡すと内容違いの再送が `23505` に化けるため。
             // 詳細は `for_update_columns` のドキュメント）。
-            let content_hash = content_hash::for_update_columns(id, &named_columns)?;
-            let legacy_hash = content_hash::for_update_columns(id, &declared_order_columns)?;
+            //
+            // SET 右辺に式を含む場合（Issue #1544・SQL-45 のポインタ）は、式の構文木を含む
+            // 別ドメインのハッシュ（`for_update_columns_with_exprs`）を使う。入力は要求由来の
+            // 構文木だけで評価結果・DB の現在状態に依存しない（同じ文の再送は `23505`、
+            // 式違いは `22023`）。新ドメインのため legacy 互換ハッシュは渡さない。
+            // リテラルだけの SET は従来の経路のままバイト列不変。
+            let (content_hash, legacy_hashes): (_, Vec<content_hash::ContentHash>) = if set_exprs
+                .is_empty()
+            {
+                let content_hash = content_hash::for_update_columns(id, &named_columns)?;
+                let legacy_hash = content_hash::for_update_columns(id, &declared_order_columns)?;
+                (content_hash, vec![legacy_hash])
+            } else {
+                let mut items: Vec<(usize, &str, content_hash::UpdateColumnHashItem<'_>)> =
+                    Vec::with_capacity(assignments.len().saturating_add(set_exprs.len()));
+                for (idx, value) in assignments {
+                    let column = schema.columns.get(*idx).ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "SET column index out of range for the current table schema"
+                                .to_string(),
+                        ))
+                    })?;
+                    items.push((
+                        *idx,
+                        column.name.as_str(),
+                        content_hash::UpdateColumnHashItem::Value(value),
+                    ));
+                }
+                for (idx, set) in set_exprs {
+                    let column = schema.columns.get(*idx).ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "SET column index out of range for the current table schema"
+                                .to_string(),
+                        ))
+                    })?;
+                    items.push((
+                        *idx,
+                        column.name.as_str(),
+                        content_hash::UpdateColumnHashItem::Expr(set.source()),
+                    ));
+                }
+                items.sort_by_key(|(idx, _, _)| *idx);
+                let ordered: Vec<(&str, content_hash::UpdateColumnHashItem<'_>)> = items
+                    .into_iter()
+                    .map(|(_, name, item)| (name, item))
+                    .collect();
+                let content_hash = content_hash::for_update_columns_with_exprs(id, &ordered)
+                    .map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
+                (content_hash, Vec::new())
+            };
             ledger::record_in_txn_accepting(
                 write_txn,
                 ctx.tenant_id(),
                 table,
                 ledger_write,
                 &content_hash,
-                &[legacy_hash],
+                &legacy_hashes,
             )?;
 
             let row_table_name = user_rows_table_name(table);
@@ -3130,7 +3273,8 @@ pub(crate) fn update_row_columns_capturing_unchecked(
                             pre_images.record(id, old_values);
                         }
                     }
-                    let (embedding, metadata) = merge_row_for_update(&schema, row, assignments)?;
+                    let (embedding, metadata) =
+                        merge_row_for_update_set(&schema, row, id, assignments, set_exprs)?;
                     let row_input = RowInput {
                         tenant_id: ctx.tenant_id(),
                         visibility,
@@ -3176,7 +3320,11 @@ pub(crate) fn update_row_columns_capturing_unchecked(
                 // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・
                 // TASK-205、Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ
                 // 検査。永続キー索引の差分は直前の同期をそのまま再利用する）。
-                let updated_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
+                let updated_columns: Vec<usize> = assignments
+                    .iter()
+                    .map(|(idx, _)| *idx)
+                    .chain(set_exprs.iter().map(|(idx, _)| *idx))
+                    .collect();
                 crate::constraint::enforce_referencing_rows_in_txn(
                     write_txn,
                     table,
@@ -4136,6 +4284,8 @@ pub(crate) fn update_rows_where_unchecked<E>(
     legacy_hashes: &[content_hash::ContentHash],
     expected_schema: Option<&crate::catalog::TableSchema>,
     assignments: &[(usize, crate::row_codec::Value)],
+    // SET 右辺が式の項（Issue #1544・SQL-45 のポインタ）。空ならリテラルだけの従来挙動。
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
@@ -4150,6 +4300,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
         legacy_hashes,
         expected_schema,
         assignments,
+        set_exprs,
         needs_embedding,
         limit,
         max_scanned_rows,
@@ -4173,6 +4324,7 @@ pub(crate) fn update_rows_where_capturing_unchecked<E>(
     legacy_hashes: &[content_hash::ContentHash],
     expected_schema: Option<&crate::catalog::TableSchema>,
     assignments: &[(usize, crate::row_codec::Value)],
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
@@ -4188,6 +4340,7 @@ pub(crate) fn update_rows_where_capturing_unchecked<E>(
         legacy_hashes,
         expected_schema,
         assignments,
+        set_exprs,
         needs_embedding,
         limit,
         max_scanned_rows,
@@ -4208,6 +4361,7 @@ fn update_rows_where_impl<E>(
     legacy_hashes: &[content_hash::ContentHash],
     expected_schema: Option<&crate::catalog::TableSchema>,
     assignments: &[(usize, crate::row_codec::Value)],
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
@@ -4235,6 +4389,10 @@ fn update_rows_where_impl<E>(
             // 適用ループ内にしか無いと、一致行 0 件のまま台帳記録・`UPDATE 0` 成功が
             // 通ってしまい、同じ `operation_id` が正当な後続再送に使えなくなる）。
             validate_set_assignments(&schema, assignments).map_err(dml_write_err)?;
+            // 式項は束縛時スキーマの列 index に結び付く（Issue #1544）。静的な型照合は
+            // 束縛段で完了済み。値依存の検証は候補行の適用段（所有・可視の行のみ）で行う。
+            require_expected_schema_for_set_exprs(set_exprs, expected_schema)
+                .map_err(dml_write_err)?;
 
             ledger::record_in_txn_accepting(
                 write_txn,
@@ -4277,6 +4435,7 @@ fn update_rows_where_impl<E>(
             &schema,
             &candidate_ids,
             assignments,
+            set_exprs,
             target.fk_check_mode(),
             project,
             None,
@@ -4415,6 +4574,7 @@ fn apply_predicate_update_in_txn<E>(
     schema: &crate::catalog::TableSchema,
     candidate_ids: &[u64],
     assignments: &[(usize, crate::row_codec::Value)],
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
     fk_mode: crate::constraint::FkCheckMode,
     mut project: Option<&mut ReturningProjectFn<'_>>,
     mut should_stop: Option<&mut dyn FnMut() -> bool>,
@@ -4474,7 +4634,8 @@ fn apply_predicate_update_in_txn<E>(
             // 借用版デコードによるピーク確保回避・SET 列重複時の意味論
             // （先勝ち）などの設計判断は同関数のドキュメント参照）。
             let (embedding_value, metadata) =
-                merge_row_for_update(schema, existing, assignments).map_err(dml_write_err)?;
+                merge_row_for_update_set(schema, existing, *id, assignments, set_exprs)
+                    .map_err(dml_write_err)?;
             let row = RowInput {
                 tenant_id: ctx.tenant_id(),
                 // 既存行の可視性を保持する（SET で触れない列と同じ扱い）。
@@ -4521,7 +4682,11 @@ fn apply_predicate_update_in_txn<E>(
         // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・TASK-205、
         // Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ検査。永続
         // キー索引の差分は直前の同期をそのまま再利用する）。
-        let updated_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
+        let updated_columns: Vec<usize> = assignments
+            .iter()
+            .map(|(idx, _)| *idx)
+            .chain(set_exprs.iter().map(|(idx, _)| *idx))
+            .collect();
         crate::constraint::enforce_referencing_rows_in_txn(
             write_txn,
             table,
@@ -5753,6 +5918,7 @@ mod tests {
             // `decode_scalar_columns` を要する列指定更新の対象には使えない。
             3,
             &[(0, crate::row_codec::Value::Vector(vec![5.0, 5.0]))],
+            &[],
             ledger_write,
             None,
         )
@@ -5775,6 +5941,7 @@ mod tests {
             &a,
             999,
             &[(0, crate::row_codec::Value::Vector(vec![6.0, 6.0]))],
+            &[],
             ledger_write_zero,
             None,
         )
@@ -5930,6 +6097,7 @@ mod tests {
             &a,
             1,
             &assignments,
+            &[],
             LedgerWrite::Record(&op_existing),
             None,
         )
@@ -5943,6 +6111,7 @@ mod tests {
             &a,
             999,
             &assignments,
+            &[],
             LedgerWrite::Record(&op_missing),
             None,
         )
@@ -6048,6 +6217,7 @@ mod tests {
             &a,
             1,
             &assignments,
+            &[],
             LedgerWrite::Record(&op_existing),
             None,
         )
@@ -6066,6 +6236,7 @@ mod tests {
             &a,
             999,
             &assignments,
+            &[],
             LedgerWrite::Record(&op_missing),
             None,
         )
@@ -6124,6 +6295,7 @@ mod tests {
             &[],
             None,
             &assignments,
+            &[],
             false,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             MAX_SCANNED_ROWS,
@@ -6155,6 +6327,7 @@ mod tests {
             &[],
             None,
             &ok_assignments,
+            &[],
             false,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             MAX_SCANNED_ROWS,
@@ -6223,6 +6396,7 @@ mod tests {
             &[],
             None,
             &assignments,
+            &[],
             false,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             MAX_SCANNED_ROWS,
@@ -6332,6 +6506,7 @@ mod tests {
             &[],
             None,
             &assignments,
+            &[],
             false,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             MAX_SCANNED_ROWS,
@@ -6551,6 +6726,7 @@ mod tests {
                 &[],
                 None,
                 &assignments,
+                &[],
                 assignments.iter().any(|(idx, _)| *idx == 0),
                 Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
                 MAX_SCANNED_ROWS,
@@ -6661,6 +6837,7 @@ mod tests {
             &a,
             1,
             &resend_assignments,
+            &[],
             LedgerWrite::Record(&legacy_op),
             None,
         )
@@ -6686,6 +6863,7 @@ mod tests {
             &a,
             1,
             &mismatched_assignments,
+            &[],
             LedgerWrite::Record(&legacy_op),
             None,
         )
@@ -6729,8 +6907,10 @@ mod tests {
 
         let schema = file_schema("docs");
         let registry = UdfRegistry::default();
-        let vector_literal = InsertLiteral::String("[1,2]".to_string());
-        let literal_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &vector_literal)];
+        let vector_literal =
+            crate::sql::allowlist::SetValue::Literal(InsertLiteral::String("[1,2]".to_string()));
+        let literal_assignments: [(&str, &crate::sql::allowlist::SetValue); 1] =
+            [("embedding", &vector_literal)];
 
         // 正規化前のコードが実際に記録したであろうハッシュ（タグ 1・生テキスト）。
         let legacy_hash = crate::recovery::content_hash::for_update_where_legacy_text_vector(
@@ -6786,6 +6966,7 @@ mod tests {
             std::slice::from_ref(&legacy_hash),
             None,
             &resend_assignments,
+            &[],
             true,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             MAX_SCANNED_ROWS,
@@ -6807,8 +6988,9 @@ mod tests {
         // `22023` 契約を弱めていないことの確認）。同一 `operation_id` で
         // 異なる値（`[9,9]`）を送るため、正準・legacy 両ハッシュとも
         // 「その内容」から計算し直す（実運用の呼び出し元と同じ手順）。
-        let mismatched_literal = InsertLiteral::String("[9,9]".to_string());
-        let mismatched_literal_assignments: [(&str, &InsertLiteral); 1] =
+        let mismatched_literal =
+            crate::sql::allowlist::SetValue::Literal(InsertLiteral::String("[9,9]".to_string()));
+        let mismatched_literal_assignments: [(&str, &crate::sql::allowlist::SetValue); 1] =
             [("embedding", &mismatched_literal)];
         let mismatched_canonical_hash = crate::recovery::content_hash::for_update_where(
             "docs",
@@ -6839,6 +7021,7 @@ mod tests {
             std::slice::from_ref(&mismatched_legacy_hash),
             None,
             &mismatched_assignments,
+            &[],
             true,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             MAX_SCANNED_ROWS,
@@ -6912,6 +7095,7 @@ mod tests {
             &ctx_visible,
             1,
             &assignments,
+            &[],
             LedgerWrite::Record(&op_visible),
             None,
         )
@@ -6940,6 +7124,7 @@ mod tests {
             &ctx_invisible,
             1,
             &assignments,
+            &[],
             LedgerWrite::Record(&op_invisible),
             None,
         )
@@ -7036,6 +7221,7 @@ mod tests {
             &ctx_visible,
             1,
             &assignments,
+            &[],
             LedgerWrite::Record(&op_visible),
             None,
         )
@@ -7064,6 +7250,7 @@ mod tests {
             &ctx_invisible,
             1,
             &assignments,
+            &[],
             LedgerWrite::Record(&op_invisible),
             None,
         )
@@ -7086,6 +7273,7 @@ mod tests {
             &ctx_visible,
             999,
             &assignments,
+            &[],
             LedgerWrite::Record(&op_missing),
             None,
         )
@@ -7162,6 +7350,7 @@ mod tests {
             &[],
             None,
             &assignments,
+            &[],
             false,
             Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             MAX_SCANNED_ROWS,
@@ -7283,6 +7472,7 @@ mod tests {
             &ctx_invisible,
             1,
             &assignments,
+            &[],
             LedgerWrite::Record(&op_invisible),
             None,
         )
@@ -7912,6 +8102,7 @@ mod tests {
             &[],
             None,
             &assignments,
+            &[],
             false,
             None,
             MAX_SCANNED_ROWS,
@@ -7939,6 +8130,7 @@ mod tests {
             &[],
             None,
             &assignments,
+            &[],
             false,
             None,
             MAX_SCANNED_ROWS,
@@ -7970,6 +8162,7 @@ mod tests {
             &ctx,
             1,
             &assignments,
+            &[],
             ledger(),
             None,
             Some(&mut project),
@@ -7986,6 +8179,7 @@ mod tests {
             &ctx,
             1,
             &assignments,
+            &[],
             ledger(),
             None,
         );
@@ -8017,6 +8211,7 @@ mod tests {
             &ctx,
             42,
             &assignments,
+            &[],
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
             Some(&mut project),

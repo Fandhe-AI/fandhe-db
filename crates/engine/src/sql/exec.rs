@@ -3841,6 +3841,11 @@ pub(crate) fn execute_delete_returning_in(
 /// SQL 表層経由（`core.rs`）では `sql::allowlist::validate_update` の事前検査が
 /// 同じ判定を本関数の呼び出し前に既に行っているため通常は到達しないが、
 /// `execute_insert`／`execute_truncate` と同じく本関数単体でも fail-closed を保つ。
+///
+/// 本関数は束縛時のスキーマ（`expected_schema`）を持たないため、SET 右辺に式
+/// （[`crate::sql::parser::BoundUpdate::set_exprs`]。Issue #1544・SQL-45 のポインタ）を含む `bound` は
+/// 列 index の対応を確認できず `XX000` で拒否する（fail-closed）。式付き UPDATE は
+/// `core::EngineCore` の SQL 入口（束縛時のスキーマを渡す）から実行する。
 pub fn execute_update(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
@@ -3892,6 +3897,7 @@ pub(crate) fn execute_update_with_schema_in(
         ctx,
         bound.id,
         &bound.assignments,
+        &bound.set_exprs,
         ledger_write,
         expected_schema,
     )
@@ -3955,6 +3961,7 @@ pub(crate) fn execute_update_returning_in(
         ctx,
         bound.id,
         &bound.assignments,
+        &bound.set_exprs,
         ledger_write,
         Some(schema),
         Some(&mut project),
@@ -4025,6 +4032,9 @@ pub(crate) fn map_write_error(
         // 変換不要（`tenant::TenantWriteError::CheckEvaluationFailed` のドキュ
         // メント参照）。
         TenantWriteError::CheckEvaluationFailed(inner) => inner,
+        // SET 右辺式の評価エラー（Issue #1544・SQL-45 のポインタ）も内側の
+        // `SqlSurfaceError` を透過する（通常の式評価と同じ `wire_code`）。
+        TenantWriteError::SetExpressionEvaluationFailed(inner) => inner,
         // `FOREIGN KEY` 制約違反（`23503`。TABLE-17・TASK-205、Issue #907）。`_` 節
         // （`XX000`）へ丸めると、クライアントが参照整合性違反をサーバー内部事象と
         // 取り違える。値・参照先の有無の理由を含まない固定文言。
@@ -4489,6 +4499,7 @@ fn execute_predicate_update_inner(
                 legacy_hashes,
                 Some(schema),
                 bound.assignments(),
+                bound.set_exprs(),
                 needs_embedding,
                 limit,
                 max_scanned_rows,
@@ -4503,6 +4514,7 @@ fn execute_predicate_update_inner(
                 legacy_hashes,
                 Some(schema),
                 bound.assignments(),
+                bound.set_exprs(),
                 needs_embedding,
                 limit,
                 max_scanned_rows,
@@ -4616,6 +4628,7 @@ pub(crate) fn execute_predicate_update_partitioned(
                 content_hash_value,
                 Some(schema),
                 bound.assignments(),
+                bound.set_exprs(),
                 needs_embedding,
                 limits,
                 max_affected_rows,
