@@ -73,6 +73,12 @@ fn reject_non_constant(expr: &Expr) -> Result<(), SqlSurfaceError> {
                     "aggregate functions require a FROM clause",
                 ));
             }
+            // テナント変数の上書き（RLS-6）に使われうる `set_config` は引数の検査より先に
+            // 構文拒否（`42601`）で固定する。引数中の `false` 等が列参照扱いで `42703` に
+            // なると RLS-6 の拒否契約（`42601`）が崩れるため。
+            if name.eq_ignore_ascii_case("set_config") {
+                return Err(SqlSurfaceError::unsupported("set_config is not supported"));
+            }
             args.iter().try_for_each(reject_non_constant)
         }
         Expr::Binary { lhs, rhs, .. } => {
