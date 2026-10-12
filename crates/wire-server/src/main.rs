@@ -1953,7 +1953,7 @@ fn run_server(args: &[String]) -> ExitCode {
         wire_server::transaction_limits_opt::duration_over_write_lock_wait_warning(
             &transaction_limits,
             max_transaction_duration_ms_raw.is_some(),
-            engine::storage::DEFAULT_WRITE_LOCK_WAIT,
+            write_lock_wait,
         )
     {
         engine::log_stderr!("wire-server: WARNING: {warning}");
