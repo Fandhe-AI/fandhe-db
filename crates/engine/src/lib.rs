@@ -262,6 +262,7 @@ pub mod precision;
 pub mod query_planner;
 pub mod recovery;
 pub mod rerank;
+pub mod result_limits;
 pub mod rls;
 pub mod row_codec;
 pub mod scalar_float;

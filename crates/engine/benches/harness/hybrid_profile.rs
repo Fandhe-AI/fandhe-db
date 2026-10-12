@@ -938,7 +938,7 @@ pub fn render_memory_line(
 /// 側が変わっても自動追従しない。ドリフトは
 /// `max_pool_depth_mirror_matches_rrf_config_bounds`（`hybrid_profile_accept.rs`）
 /// が `RrfConfig::new` の受理境界（`1..=MAX_POOL_DEPTH`）との突き合わせで検知する。
-pub const MAX_POOL_DEPTH_MIRROR: usize = 10_000;
+pub const MAX_POOL_DEPTH_MIRROR: usize = 100_000;
 
 /// `hybrid.rs::MAX_FETCH_K`（`MAX_POOL_DEPTH * 4`）の鏡像（導出式ごと転記）。
 pub const MAX_FETCH_K_MIRROR: usize = MAX_POOL_DEPTH_MIRROR * 4;

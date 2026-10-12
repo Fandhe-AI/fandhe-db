@@ -88,6 +88,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-subquery-depth <1-4>] [--max-subquery-executions <1-16>] \
   [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] \
   [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
+  [--max-result-rows <1-100000>] \
   [--write-lock-wait-ms <100-60000>] \
   [--max-transaction-duration-ms <100-60000>] [--max-transaction-statements <1-10000>] \
   [--partitioned-dml-chunk-rows <1-1000000>] [--partitioned-dml-scan-budget <1-1000000>] \
@@ -355,6 +356,14 @@ CTE 連鎖の深さの上限を、プロセス全体に対して起動時に**�
 従来と同じ `54000` です（拡張プロトコルでは Describe は成功し Execute で拒否されます）。範囲外・非数値・値欠落・
 2 回目以降の重複指定は fail-closed で起動エラーです。上限を引き上げることはできません
 （詳細: [docs/design/join-limits-cli.md](docs/design/join-limits-cli.md)）。
+
+`--max-result-rows <N>`（既定 10,000・範囲 `1`〜`100,000`）（Issue #1555・SQL-34／SQL-46）は、明示 `LIMIT` の
+範囲上限（従来のコンパイル時定数 10,000）を、プロセス全体に対して起動時に**上げ下げ両方向**へ設定します
+（未指定は従来の 10,000 と同じ値で、挙動は変わりません）。設定値は走査・kNN の `LIMIT k`・`FETCH n`・集合演算全体と
+JOIN 文の `LIMIT`・NoSQL の `limit` の範囲判定にだけ効き、超過時の SQLSTATE は従来と同じ `22000` です。
+`OFFSET` の範囲や集合演算の枝行数・サブクエリ内側行数などの他の上限とは連動しません。範囲外・非数値・値欠落・
+2 回目以降の重複指定は fail-closed で起動エラーです。`LIMIT` 省略時の結果行数上限（`54000`）が導入される際は、
+同じフラグを共有します（詳細: [docs/design/result-limits-cli.md](docs/design/result-limits-cli.md)）。
 
 `--write-lock-wait-ms <N>`（既定 30,000・範囲 `100`〜`60,000` ミリ秒）（Issue #1554・SQL-46）は、書き込みロック
 （単一ライタ）の待機上限を、プロセス全体に対して起動時に設定します（未指定は現行の 30 秒で、挙動は変わりません）。

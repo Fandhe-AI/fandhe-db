@@ -171,22 +171,24 @@ fn try_alloc_bytes_for_budget(
 
 // `pool_depth = bound.limit.max(DEFAULT_HYBRID_POOL_DEPTH)` が常に
 // `hybrid::RrfConfig::new` の検証（`1..=hybrid::MAX_POOL_DEPTH`）を通過するのは、
-// `bound.limit` の上限（`core::MAX_SEARCH_K`。`sql::parser::bind` が検証済み）が
+// `bound.limit` の上限（設定可能なハード上限 `MAX_RESULT_ROWS_HARD_CAP`。`sql::parser::bind` が
+// 設定値 `<=` ハード上限で検証済み。Issue #1555）が
 // `hybrid::MAX_POOL_DEPTH` を超えない場合に限る。両定数は独立に管理されているため、
 // 片方だけの変更でこの前提が崩れないようコンパイル時に固定する
 // （`row_codec.rs`・`catalog.rs` の既存 `const _: () = assert!(...)` と同方針）。
 const _: () = assert!(
-    core::MAX_SEARCH_K <= hybrid::MAX_POOL_DEPTH,
-    "sql::exec's hybrid pool_depth derivation assumes core::MAX_SEARCH_K <= hybrid::MAX_POOL_DEPTH"
+    crate::result_limits::MAX_RESULT_ROWS_HARD_CAP <= hybrid::MAX_POOL_DEPTH,
+    "sql::exec's hybrid pool_depth derivation assumes MAX_RESULT_ROWS_HARD_CAP <= hybrid::MAX_POOL_DEPTH"
 );
 
 // `precision` 時の `k_eff`（SCALAR 事前フィルタ経路: `bound.limit.max(2)`。
 // SCALAR 事後フィルタ経路: `arena.ids().len().clamp(2, core::MAX_SEARCH_K)`。
-// いずれも「`LIMIT 1` でも Top-2 を取得する」ための下限が `2`）が常に
-// `core::MAX_SEARCH_K` の範囲内に収まることをコンパイル時に固定する
-// （`bound.limit` は `sql::parser::bind` が `1..=core::MAX_SEARCH_K` を検証済み、
-// 事後フィルタ経路は `.min(core::MAX_SEARCH_K)` で明示的にクランプ済みのため、
-// `k_eff` が `MAX_SEARCH_K` を超えるのは `MAX_SEARCH_K < 2` の場合のみ）。
+// いずれも「`LIMIT 1` でも Top-2 を取得する」ための下限が `2`）の事後フィルタ側が
+// `core::MAX_SEARCH_K`（内部固定の防御上限。明示 `LIMIT` の設定値とは連動しない。
+// Issue #1555）の範囲内に収まることをコンパイル時に固定する
+// （事後フィルタ経路は `.clamp(2, core::MAX_SEARCH_K)` で明示的にクランプ済みのため、
+// `MAX_SEARCH_K < 2` でない限り下限と矛盾しない。事前フィルタ経路の `bound.limit` は
+// 設定値 `<=` `MAX_RESULT_ROWS_HARD_CAP` で、上の assert により RRF 設定にも収まる）。
 const _: () = assert!(
     2 <= core::MAX_SEARCH_K,
     "sql::exec's precision k_eff derivation assumes core::MAX_SEARCH_K >= 2"

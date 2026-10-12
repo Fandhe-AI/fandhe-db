@@ -1909,8 +1909,12 @@ pub(crate) struct BufferedRows {
     pub(crate) order_keys: Vec<ScanOrderKey>,
     /// ウィンドウ項目（Issue #1411）。
     pub(crate) window_items: Vec<WindowSelectItem>,
-    /// 外側 `LIMIT`（範囲検証済み）。
+    /// 外側 `LIMIT`（`limit_explicit` が true のとき利用者が書いた値。範囲は
+    /// `EngineCore` が設定値で検査する）。
     pub(crate) limit: u32,
+    /// 利用者が `LIMIT` を明示したか。false は連鎖の素通し外側（`LIMIT` なし＝無制限で
+    /// `limit` は `u32::MAX`）。明示値は `u32::MAX` でも必ず設定上限で検査する（Issue #1555）。
+    pub(crate) limit_explicit: bool,
     /// 外側 `OFFSET`（範囲検証済み。既定 0）。
     pub(crate) offset: u32,
 }
@@ -8641,6 +8645,7 @@ pub(crate) fn buffered_layer_statement(
             order_keys: Vec::new(),
             window_items: Vec::new(),
             limit: u32::MAX,
+            limit_explicit: false,
             offset: 0,
         })),
     }))
@@ -12131,7 +12136,8 @@ fn validate_select_statement(
                     .where_predicates
                     .iter()
                     .try_for_each(check_buffered_outer_pred)?;
-                super::parser::validate_search_limit(shape.limit)?;
+                // `LIMIT` の範囲は構文段では検査しない（設定値を持たないため）。
+                // `EngineCore::check_buffered_outer_limit` が設定値で検査する（Issue #1555）。
                 super::parser::validate_search_offset(shape.offset)?;
                 return Ok(Statement::BufferedView(ValidatedBufferedView {
                     view_name,
@@ -12143,6 +12149,7 @@ fn validate_select_statement(
                         order_keys: shape.order_keys,
                         window_items: shape.window_items,
                         limit: shape.limit,
+                        limit_explicit: true,
                         offset: shape.offset,
                     })),
                 }));

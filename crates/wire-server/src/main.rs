@@ -150,6 +150,15 @@
 //! 一本化し、`EngineCore::with_join_limits` へ 1 回だけ注入する
 //! （`docs/design/join-limits-cli.md`）。
 //!
+//! `--max-result-rows`（Issue #1555。SQL-34・SQL-46）: 明示 `LIMIT` の範囲上限
+//! （`1`〜`100000`・既定 10000）を、プロセス全体に対して起動時に**上げ下げ両方向**へ設定できる
+//! opt-in 注入点（未指定は従来の 10000 と同値＝挙動不変）。走査・kNN の `LIMIT k`・`FETCH n`・
+//! 集合演算全体／JOIN 文の `LIMIT`・NoSQL の `limit` の範囲判定にだけ効き、超過は従来どおり
+//! `22000`。`OFFSET` や他の内部上限とは連動しない。範囲外・非数値・値欠落・重複指定は
+//! いずれも fail-closed で起動エラー。値の解決は `wire_server::result_limits_opt::resolve` に
+//! 一本化し、`EngineCore::with_result_limits` へ 1 回だけ注入する
+//! （`docs/design/result-limits-cli.md`）。
+//!
 //! `--write-lock-wait-ms`（Issue #1554。SQL-46）: 書き込みロック（単一ライタ）の待機上限を
 //! ミリ秒（`100`〜`60000`。既定 `30000`）で、プロセス全体に対して起動時に設定できる
 //! opt-in 注入点（未指定は現行の 30 秒と同値＝挙動不変）。超過は従来どおり `55P03`。
@@ -378,6 +387,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_join_relations_raw: Option<String> = None;
     let mut max_join_input_rows_raw: Option<String> = None;
     let mut max_join_output_rows_raw: Option<String> = None;
+    let mut max_result_rows_raw: Option<String> = None;
     let mut write_lock_wait_raw: Option<String> = None;
     let mut max_transaction_duration_ms_raw: Option<String> = None;
     let mut max_transaction_statements_raw: Option<String> = None;
@@ -918,6 +928,26 @@ fn run_server(args: &[String]) -> ExitCode {
                 max_join_output_rows_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::result_limits_opt::MAX_RESULT_ROWS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::result_limits_opt::MAX_RESULT_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1555: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_result_rows_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::result_limits_opt::MAX_RESULT_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_result_rows_raw = Some(v.clone());
+                i += 2;
+            }
             wire_server::transaction_limits_opt::MAX_TRANSACTION_DURATION_MS_FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!(
@@ -1446,6 +1476,17 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1555: 明示 `LIMIT` の範囲上限を bind・ユーザーストア読込より前に解決する
+    // （fail-closed）。未指定は `ResultLimits::default()`＝従来の 10,000＝現行挙動。
+    let result_limits =
+        match wire_server::result_limits_opt::resolve(max_result_rows_raw.as_deref()) {
+            Ok(limits) => limits,
+            Err(e) => {
+                engine::log_stderr!("wire-server: invalid result limit configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
     // Issue #1554: 書き込みロック待機上限を bind・ユーザーストア読込より前に解決する
     // （fail-closed）。未指定は `DEFAULT_WRITE_LOCK_WAIT`＝現行挙動。
     let write_lock_wait =
@@ -1882,6 +1923,8 @@ fn run_server(args: &[String]) -> ExitCode {
     core = core.with_nesting_limits(nesting_limits);
     // Issue #1551: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
     core = core.with_join_limits(join_limits);
+    // Issue #1555: 未指定でも常に呼ぶ（既定は従来の 10,000 と同値で、未注入と挙動が同一）。
+    core = core.with_result_limits(result_limits);
     // Issue #1554: 未指定でも常に呼ぶ（既定は `DEFAULT_WRITE_LOCK_WAIT` で、未注入と
     // 挙動がビット同一）。
     core = core.with_write_lock_wait(write_lock_wait);

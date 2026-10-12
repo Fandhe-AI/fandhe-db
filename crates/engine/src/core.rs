@@ -63,7 +63,10 @@ use crate::search_engine;
 use crate::storage::{Row, Storage, StorageError};
 use redb::ReadableDatabase;
 
-/// 検索 `k` の上限。上限検証前にアロケーションへ使わないための防御的定数
+/// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
+/// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は
+/// `OFFSET`・集合演算の枝行数・サブクエリ内側行数など他の内部上限として固定のまま残す。
+/// 上限検証前にアロケーションへ使わないための防御的定数
 /// （security.md「不安全な設計｜無制限リソース確保（DoS）」対応。`catalog.rs::MAX_LIST_TABLES`
 /// と同程度の桁に揃える）。`rls.rs`（TASK-133）の `PrefilterIndex::search` も同一の上限を
 /// 共有するため `pub(crate)`（二重定義しない）。
@@ -1153,6 +1156,10 @@ pub struct EngineCore {
     /// JOIN のリレーション数・入出力行数の上限（Issue #1551）。差し替えは
     /// [`Self::with_join_limits`] のみ（起動時 1 回）。JOIN の実行段（`sql::join`）にだけ効く。
     join_limits: crate::join_limits::JoinSizeLimits,
+    /// 明示 `LIMIT` の範囲上限（Issue #1555）。差し替えは [`Self::with_result_limits`]
+    /// のみ（起動時 1 回）。文の `LIMIT`・`FETCH n`・集合演算／JOIN 文の `LIMIT` の
+    /// 範囲判定にだけ効き、`OFFSET`・枝行数・サブクエリ内側行数の上限とは連動しない。
+    result_limits: crate::result_limits::ResultLimits,
     /// 述語形 UPDATE／DELETE の分割実行（Issue #1128・ADR `docs/design/partitioned-dml.md`
     /// §15.2）のチャンク幅・走査予算・writer 保持時間。差し替えは
     /// [`Self::with_partitioned_dml_limits`] のみ（起動時に 1 回）。
@@ -2060,6 +2067,7 @@ impl EngineCore {
             group_by_limits: crate::group_by_limits::GroupByLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             join_limits: crate::join_limits::JoinSizeLimits::default(),
+            result_limits: crate::result_limits::ResultLimits::default(),
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
@@ -2341,6 +2349,54 @@ impl EngineCore {
     /// 現在の JOIN 上限（Issue #1551）。
     pub fn join_limits(&self) -> crate::join_limits::JoinSizeLimits {
         self.join_limits
+    }
+
+    /// 束縛済み計画の `LIMIT` を設定値の範囲で再検査する（Issue #1555 の多層防御）。
+    /// NoSQL 表層などが既定値（10,000）で束縛した計画を渡した場合でも、設定を下げた構成で
+    /// 既定の範囲を通す fail-open を防ぐ。エラー分類は束縛段と同じ `22000`。
+    fn check_bound_limit(
+        &self,
+        limit: usize,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let max = self.result_limits.max_result_rows();
+        if limit > max {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                format!("LIMIT {limit} out of range (must be 1..={max})"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 評価後射影形ビューの外側 `LIMIT`（行形のみ）を設定値の範囲で再検査する
+    /// （Issue #1555）。構文段（`sql::allowlist`）は設定値を持たないため範囲検査をここへ
+    /// 一任する。`limits` は呼び出し段の上限（ビュー本文の再帰先では既定値）。
+    fn check_buffered_outer_limit(
+        validated: &crate::sql::allowlist::ValidatedBufferedView,
+        limits: &crate::result_limits::ResultLimits,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        // 利用者が明示した `LIMIT` は値が `u32::MAX` でも必ず検査する。`limit_explicit`
+        // が false のものはビュー連鎖の素通し外側（`LIMIT` なし＝無制限）で検査対象外。
+        if let crate::sql::allowlist::BufferedOuter::Rows(rows) = &validated.outer {
+            if rows.limit_explicit {
+                crate::sql::parser::validate_search_limit_with(rows.limit, limits)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 明示 `LIMIT` の範囲上限（[`crate::result_limits::ResultLimits`]）を差し替えた
+    /// ビルダーを返す（Issue #1555）。`wire-server` の起動時 CLI フラグ
+    /// （`--max-result-rows`）からのみ呼ぶ。未呼び出しなら従来定数と同値の既定
+    /// （現行挙動）。
+    pub fn with_result_limits(mut self, limits: crate::result_limits::ResultLimits) -> Self {
+        self.result_limits = limits;
+        self
+    }
+
+    /// 現在の結果行数系上限（Issue #1555）。NoSQL 表層の `limit` 検証や、後続の
+    /// 結果行数上限の適用が参照する。
+    pub fn result_limits(&self) -> crate::result_limits::ResultLimits {
+        self.result_limits
     }
 
     /// 分割実行 DML の設定（[`crate::sql::parser::PartitionedDmlLimits`]）を差し替えた
@@ -3569,7 +3625,7 @@ impl EngineCore {
             Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("FETCH")
         );
         if is_fetch_statement {
-            let stmt = crate::sql::cursor::validate_fetch_tokens(&tokens)?;
+            let stmt = crate::sql::cursor::validate_fetch_tokens(&tokens, &self.result_limits)?;
             return Ok(ParsedSql::Cursor(stmt));
         }
 
@@ -3994,6 +4050,7 @@ impl EngineCore {
             &prepared.dummy_parsed,
             prepared.order_by_distance_literal_is_param,
             &prepared.where_equality_dummy_flags,
+            &self.result_limits,
         )
     }
 
@@ -4583,7 +4640,13 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         if let crate::sql::allowlist::Statement::Scan(validated) = inner {
             let schema = table_schema_in(read_txn, &validated.table_name)?;
-            let bound = crate::sql::parser::bind_scan(validated, &schema, session.udfs())?;
+            let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                validated,
+                &schema,
+                session.udfs(),
+                &[],
+                &self.result_limits,
+            )?;
             let result = crate::sql::scan::execute_scan_with_budget(
                 read_txn,
                 ctx,
@@ -4804,7 +4867,7 @@ impl EngineCore {
         // `dummy_equality_flags = &[]`）。ダミー値専用の縮退は
         // `describe_prepared_in_session` のみが使う（PR #1012 レビュー指摘
         // 対応。詳細は同メソッドのコメント参照）。
-        self.describe_parsed_in_session_impl(session, parsed, false, &[])
+        self.describe_parsed_in_session_impl(session, parsed, false, &[], &self.result_limits)
     }
 
     /// [`Self::describe_parsed_in_session`] のトランザクション対応版
@@ -4870,6 +4933,7 @@ impl EngineCore {
         parsed: &ParsedSql,
         skip_vector_literal_validation: bool,
         dummy_equality_flags: &[bool],
+        limits: &crate::result_limits::ResultLimits,
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
         use crate::sql::allowlist::{DeleteStatement, Statement, ValidatedUpdateForm};
@@ -4988,6 +5052,7 @@ impl EngineCore {
                     &schema,
                     session.udfs(),
                     dummy_equality_flags,
+                    limits,
                 )?;
                 // SQL-30・TASK-214（Issue #930）: ウィンドウ項目を含む広域取得の
                 // Describe 列は `scan_columns` が実行時（`sql::window::
@@ -5008,6 +5073,7 @@ impl EngineCore {
                     session.udfs(),
                     dummy_equality_flags,
                     validated.limit,
+                    limits,
                 )?;
                 Ok(Some(columns))
             }
@@ -5018,13 +5084,18 @@ impl EngineCore {
             ParsedSql::Statement(Statement::Join(validated)) => {
                 let table_names = crate::sql::join::collect_join_tables(validated);
                 let (_read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
-                let columns =
-                    crate::sql::join::describe_columns(&schemas, validated, session.udfs())?;
+                let columns = crate::sql::join::describe_columns(
+                    &schemas,
+                    validated,
+                    session.udfs(),
+                    limits,
+                )?;
                 Ok(Some(columns))
             }
             // Issue #1192（TABLE-18）: 評価後射影形ビュー。本文の結果列を
             // （本文は実行せずに）導出し、外側の射影だけを適用する。
             ParsedSql::Statement(Statement::BufferedView(validated)) => {
+                Self::check_buffered_outer_limit(validated, limits)?;
                 let body_parsed = ParsedSql::Statement((*validated.body).clone());
                 // 本文は永続化済みで `$n` を含まないため、外側の `$n` 置換に
                 // 位置対応するダミーフラグは渡さない（本文の ENUM 検証を省略しない）。
@@ -5033,6 +5104,9 @@ impl EngineCore {
                     &body_parsed,
                     skip_vector_literal_validation,
                     &[],
+                    // 本文の `LIMIT` は外側の設定値と連動させず独立した既定値で検証する
+                    // （result-limits-cli.md の「内側 LIMIT は連動しない」）。
+                    &crate::result_limits::ResultLimits::default(),
                 )?;
                 match body_columns {
                     Some(cols) => {
@@ -5096,6 +5170,7 @@ impl EngineCore {
                         session.udfs(),
                         !skip_vector_literal_validation,
                         dummy_equality_flags,
+                        limits,
                     )?;
                     Ok(Some(crate::sql::describe::projected_columns(
                         &projection,
@@ -5249,6 +5324,7 @@ impl EngineCore {
                                 planned.query_vector,
                                 udfs,
                                 planned.resolved_mode,
+                                &self.result_limits,
                             )
                         },
                     )?;
@@ -5334,7 +5410,10 @@ impl EngineCore {
                         }
                     })?;
 
-                    crate::sql::parser::validate_search_limit(validated.limit())?;
+                    crate::sql::parser::validate_search_limit_with(
+                        validated.limit(),
+                        &self.result_limits,
+                    )?;
 
                     // `USING MODE` リテラルの解析は `run_explain_plan` に委譲し、
                     // ここでは行わない（cursor[bot] Bugbot 指摘対応・Issue #765
@@ -5464,6 +5543,20 @@ impl EngineCore {
         stmt: crate::sql::allowlist::Statement,
         read_txn: &R,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.execute_read_statement_with_limits(ctx, session, stmt, read_txn, self.result_limits)
+    }
+
+    /// [`Self::execute_read_statement`] の本体。明示 `LIMIT` の範囲上限を引数で受ける
+    /// （Issue #1555）。評価後射影形ビューの本文は外側の設定値と連動させず、
+    /// 独立した既定値で実行するために分離している。
+    fn execute_read_statement_with_limits<R: crate::storage::read_source::ReadSource>(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        stmt: crate::sql::allowlist::Statement,
+        read_txn: &R,
+        limits: crate::result_limits::ResultLimits,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // TABLE-15・Issue #1363: スナップショット確定後・スキーマ解決前の同期点
         // （feature 限定。既定ビルドでは消える）。
         #[cfg(feature = "test-sync-points")]
@@ -5472,11 +5565,12 @@ impl EngineCore {
         match stmt {
             crate::sql::allowlist::Statement::Select(validated) => {
                 let schema = table_schema_in(read_txn, &validated.table_name)?;
-                let bound = crate::sql::parser::bind_in_session(
+                let bound = crate::sql::parser::bind_in_session_with_limits(
                     &validated,
                     &schema,
                     session.search_mode(),
                     session.udfs(),
+                    &limits,
                 )?;
                 let result = self.run_select_plan(read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
@@ -5536,7 +5630,13 @@ impl EngineCore {
                 let projection_items = std::mem::take(&mut validated.scalar_subquery_items);
                 // 外側の静的な束縛・検証を内側の実行より先に行う（外側の誤りが内側の
                 // 可視データに依存するエラーで覆われないようにする）。
-                let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
+                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                    &validated,
+                    &schema,
+                    session.udfs(),
+                    &[],
+                    &limits,
+                )?;
                 let resolved_items = crate::sql::subquery::resolve_scalar_projection_items(
                     &projection_items,
                     &[&schema],
@@ -5568,6 +5668,7 @@ impl EngineCore {
                     session.udfs(),
                     validated.limit,
                     self.group_by_limits,
+                    limits,
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -5582,6 +5683,7 @@ impl EngineCore {
                     session.udfs(),
                     self.group_by_limits,
                     self.join_limits,
+                    limits,
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -5592,8 +5694,15 @@ impl EngineCore {
             // だけを適用する。作成者の可視性は引き継がれない（`ctx` は参照者の
             // もの）。第 2 の実行器は作らない。
             crate::sql::allowlist::Statement::BufferedView(validated) => {
+                Self::check_buffered_outer_limit(&validated, &limits)?;
                 let body = (*validated.body).clone();
-                match self.execute_read_statement(ctx, session, body, read_txn)? {
+                match self.execute_read_statement_with_limits(
+                    ctx,
+                    session,
+                    body,
+                    read_txn,
+                    crate::result_limits::ResultLimits::default(),
+                )? {
                     crate::sql::SqlOutcome::Query(result) => {
                         // Issue #1360: 外側の WHERE・ORDER BY・射影・LIMIT/OFFSET は
                         // 評価済みの本文結果に対する後処理（Describe と同じ
@@ -5742,7 +5851,7 @@ impl EngineCore {
         // `LIMIT` の範囲検証（codex-review P1 指摘対応、PR #266 の踏襲）:
         // 高コスト処理・DB I/O より前に完結させる（untrusted 入力による
         // リソース増幅の防止。`bind` 側の検証は多層防御として残る）。
-        crate::sql::parser::validate_search_limit(limit)?;
+        crate::sql::parser::validate_search_limit_with(limit, &self.result_limits)?;
 
         // I/O（LLM 呼び出し）前のスキーマ取得。計画開始時のテーブル世代も
         // ここで記録する（対象テーブル限定化の理由は
@@ -5863,6 +5972,7 @@ impl EngineCore {
                 "bound search plan targets a different table than requested",
             ));
         }
+        self.check_bound_limit(bound.limit())?;
         self.run_select_plan(&read_txn, ctx, &schema, &bound)
     }
 
@@ -5915,7 +6025,8 @@ impl EngineCore {
         // テーブル解決後に初めて解析することで、テーブル未存在＋ mode 値不正の
         // 要求で `42P01` が優先される SQL テキスト経由と同一の fail-closed
         // 順序を保つ。
-        let validated_limit = crate::sql::parser::validate_search_limit(limit)?;
+        let validated_limit =
+            crate::sql::parser::validate_search_limit_with(limit, &self.result_limits)?;
         crate::sql::allowlist::validate_using_plan_question(question)?;
 
         self.run_using_plan_select(
@@ -6505,11 +6616,12 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-        let bound = crate::sql::parser::bind_in_session(
+        let bound = crate::sql::parser::bind_in_session_with_limits(
             validated,
             &schema,
             session.search_mode(),
             session.udfs(),
+            &self.result_limits,
         )?;
         Ok(crate::sql::SqlOutcome::Explain(
             self.search_explain_from_bound(&read_txn, &schema, &bound),
@@ -6724,7 +6836,13 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-        let _bound = crate::sql::parser::bind_scan(validated, &schema, session.udfs())?;
+        let _bound = crate::sql::parser::bind_scan_with_dummy_flags(
+            validated,
+            &schema,
+            session.udfs(),
+            &[],
+            &self.result_limits,
+        )?;
         Ok(crate::sql::SqlOutcome::Explain(Self::scan_explain_result()))
     }
 
@@ -6828,6 +6946,7 @@ impl EngineCore {
                 "bound scan plan targets a different table than requested",
             ));
         }
+        self.check_bound_limit(bound.limit())?;
         self.run_scan_plan(&read_txn, ctx, &schema, &bound)
     }
 
@@ -6913,6 +7032,7 @@ impl EngineCore {
                 "bound search plan targets a different table than requested",
             ));
         }
+        self.check_bound_limit(bound.limit())?;
         Ok(self.search_explain_from_bound(&read_txn, &schema, &bound))
     }
 
@@ -6945,6 +7065,7 @@ impl EngineCore {
                 "bound scan plan targets a different table than requested",
             ));
         }
+        self.check_bound_limit(bound.limit())?;
         Ok(Self::scan_explain_result())
     }
 
@@ -7195,7 +7316,13 @@ impl EngineCore {
             }
             crate::sql::allowlist::CopyStatement::To(v) => {
                 let (read_txn, schema) = self.read_txn_with_schema(v.inner.table_name())?;
-                let bound = crate::sql::parser::bind_scan(&v.inner, &schema, session.udfs())?;
+                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                    &v.inner,
+                    &schema,
+                    session.udfs(),
+                    &[],
+                    &self.result_limits,
+                )?;
                 let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
                 Ok(CopyPlan::To(v.format, result))
             }
@@ -7257,7 +7384,13 @@ impl EngineCore {
                     }
                 })?;
                 let schema = table_schema_in(write_txn, v.inner.table_name())?;
-                let bound = crate::sql::parser::bind_scan(&v.inner, &schema, session.udfs())?;
+                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                    &v.inner,
+                    &schema,
+                    session.udfs(),
+                    &[],
+                    &self.result_limits,
+                )?;
                 let result = self.run_scan_plan(write_txn, ctx, &schema, &bound)?;
                 return Ok(CopyPlan::To(v.format, result));
             }
@@ -11028,6 +11161,7 @@ mod tests {
             planned.query_vector,
             session.udfs(),
             planned.resolved_mode,
+            &crate::result_limits::ResultLimits::default(),
         )
         .expect("bind_expansion should succeed against the post-I/O schema");
 
