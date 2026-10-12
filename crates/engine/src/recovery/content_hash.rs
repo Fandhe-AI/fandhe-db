@@ -987,7 +987,7 @@ pub(crate) fn for_update_columns_with_exprs(
             }
             UpdateColumnHashItem::Expr(expr) => {
                 b.push_u8(1);
-                push_dml_expr(&mut b, expr, None)?;
+                push_set_expr(&mut b, expr)?;
             }
         }
     }
@@ -1312,7 +1312,7 @@ fn push_dml_assignments(
             SetValue::Literal(literal) => literal,
             SetValue::Expr(expr) => {
                 b.push_u8(6);
-                push_dml_expr(b, expr, None)?;
+                push_set_expr(b, expr)?;
                 continue;
             }
         };
@@ -1702,6 +1702,55 @@ fn f64_round_trips_decimal(v: f64, raw: &str) -> bool {
         (Some(a), Some(b)) => a == b,
         _ => false,
     }
+}
+
+/// `UPDATE ... SET` 右辺の式を直列化する（Issue #1544）。[`push_dml_expr`] は数値
+/// リテラルを f64 へ正規化するため `2` と `2.0` が同一バイト列になるが、SET の束縛段
+/// （`bind_projection_expr`）は字面から整数算術（`n / 2` は整数除算）と倍精度算術
+/// （`n / 2.0`）を区別する。式違いを同一ハッシュ（再送扱いの `23505`）にしないよう、
+/// 構文木の直列化に続けて、前置き順の各数値リテラルの整数分類（0=整数形でない・
+/// 1=int4・2=int8）を追記する。WHERE 経路の既存ハッシュは変えない。
+fn push_set_expr(
+    b: &mut HashInputBuilder,
+    expr: &crate::sql::udf_call::Expr,
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    use crate::sql::udf_call::{Expr, NumericKind};
+
+    push_dml_expr(b, expr, None)?;
+    fn walk(b: &mut HashInputBuilder, expr: &Expr) {
+        match expr {
+            Expr::Number(raw) => {
+                b.push_u8(match crate::sql::udf_call::classify_integer_literal(raw) {
+                    None => 0,
+                    Some((_, NumericKind::Int4)) => 1,
+                    Some(_) => 2,
+                });
+            }
+            Expr::Call { args, .. } | Expr::Coalesce(args) => {
+                args.iter().for_each(|a| walk(b, a));
+            }
+            Expr::Binary { lhs, rhs, .. } | Expr::NullIf(lhs, rhs) => {
+                walk(b, lhs);
+                walk(b, rhs);
+            }
+            Expr::Case { whens, else_result } => {
+                for (c, r) in whens {
+                    walk(b, c);
+                    walk(b, r);
+                }
+                if let Some(e) = else_result {
+                    walk(b, e);
+                }
+            }
+            Expr::String(_)
+            | Expr::Ident(_)
+            | Expr::Null
+            | Expr::DateLiteral(_)
+            | Expr::TimestampLiteral(_) => {}
+        }
+    }
+    walk(b, expr);
+    Ok(())
 }
 
 /// `Expr` をタグ付き前置順で直列化する（ADR §4.4）。`params` が `Some` の場合、
@@ -3880,6 +3929,23 @@ mod tests {
         .expect("push numeric");
         let h4 = b4.finish();
         assert_ne!(h1, h4, "differing scale must not collapse to the same hash");
+    }
+
+    /// Issue #1544（codex P1）: SET 右辺の `n / 2` と `n / 2.0` は束縛段で整数除算と
+    /// 倍精度除算に分かれるため、content hash も区別する（同一なら再送扱いになる）。
+    #[test]
+    fn update_set_expr_hash_distinguishes_integer_and_decimal_literal() {
+        use crate::sql::udf_call::{BinOp, Expr};
+        let div = |lit: &str| Expr::Binary {
+            op: BinOp::Div,
+            lhs: Box::new(Expr::Ident("n".to_string())),
+            rhs: Box::new(Expr::Number(lit.to_string())),
+        };
+        let hash = |e: &Expr| {
+            for_update_columns_with_exprs(1, &[("n", UpdateColumnHashItem::Expr(e))]).expect("hash")
+        };
+        assert_ne!(hash(&div("2")), hash(&div("2.0")));
+        assert_eq!(hash(&div("2")), hash(&div("2")));
     }
 
     /// Issue #1430（codex P1）: f64 で往復できる数値リテラル（小数・指数表記・先頭ドット
