@@ -3535,6 +3535,9 @@ struct Parser<'a> {
     /// 引数など）では `false` のままとし、`NULL` は列名としての後方互換を
     /// 優先して裸の識別子（`Expr::Ident`）へ解析する。
     allow_null_literal: bool,
+    /// 定数式（INSERT VALUES・列 `DEFAULT`）の解析中だけ立ち、関数引数の `NULL` を
+    /// `NULL` 定数として受理する（Issue #1543。他文脈の関数引数は従来どおり列参照）。
+    const_expr_null_args: bool,
     /// 単項マイナス（`-<primary>`）を `0 - <primary>` へ脱糖して受理してよい文脈かどうか
     /// （Issue #1538・SQL-42）。単一テーブル SELECT の投影項目（[`Self::parse_select_item`]
     /// の式モード）の解析中だけ `true` にする。`parse_primary_expr` は WHERE・CHECK 本体・
@@ -3610,6 +3613,7 @@ impl<'a> Parser<'a> {
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             case_nesting: 0,
             allow_null_literal: false,
+            const_expr_null_args: false,
             allow_unary_minus: false,
             in_check_body: false,
             max_insert_rows: None,
@@ -5682,7 +5686,9 @@ impl<'a> Parser<'a> {
             // の後方互換を優先し、下の一般識別子分岐へフォールスルーして列参照
             // （`Expr::Ident`）として扱う。
             Some(Token::Ident(name))
-                if name.eq_ignore_ascii_case("NULL") && self.allow_null_literal =>
+                if name.eq_ignore_ascii_case("NULL")
+                    && self.allow_null_literal
+                    && !self.quoted_null.contains(&self.pos) =>
             {
                 self.advance();
                 self.consume_expr_node()?;
@@ -5717,6 +5723,23 @@ impl<'a> Parser<'a> {
                 };
                 self.consume_expr_node()?;
                 Ok(Expr::Number(format!("-{n}")))
+            }
+            // Issue #1543: 定数式文脈（INSERT VALUES・DEFAULT）限定の符号付き数値
+            // リテラル `+` + Number。`expect_literal` が受理する `+1` の後に演算子が
+            // 続く形（`+1+1`）を式パーサでも解析できるよう 1 ノードの数値へ畳む。
+            // `+col`・`+(expr)` は従来どおり既定分岐で `42601`（fail-closed）。
+            Some(Token::Punct('+'))
+                if self.const_expr_null_args
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Number(_))) =>
+            {
+                self.advance();
+                let Some(Token::Number(n)) = self.advance().cloned() else {
+                    return Err(SqlSurfaceError::unsupported(
+                        "expected numeric literal after '+'",
+                    ));
+                };
+                self.consume_expr_node()?;
+                Ok(Expr::Number(n))
             }
             // Issue #1538・SQL-42: 投影項目の式モード限定の一般単項マイナス。新しい `Expr`
             // variant を増やさず `0 - operand` へ脱糖する（VECTOR・DATE は `bind_binary` の
@@ -5856,9 +5879,12 @@ impl<'a> Parser<'a> {
             // `Expr::Null` の束縛が許可される 3 箇所に含まれないため、`NULL` は
             // ここでは常に列参照として解析する（`allow_null_literal` を強制的に
             // false にする。[`Self::allow_null_literal`] 参照）。
-            let lhs = self.parse_value_expr_with_null_context(depth + 1, false)?;
+            // 定数式文脈（INSERT VALUES・DEFAULT。Issue #1543）に限り `NULL` を
+            // 定数として解析する（`CASE WHEN NULL = 1 ...`）。
+            let when_null = self.const_expr_null_args;
+            let lhs = self.parse_value_expr_with_null_context(depth + 1, when_null)?;
             let op = self.expect_cmp_op()?;
-            let rhs = self.parse_value_expr_with_null_context(depth + 1, false)?;
+            let rhs = self.parse_value_expr_with_null_context(depth + 1, when_null)?;
             let cond = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
@@ -5994,7 +6020,9 @@ impl<'a> Parser<'a> {
             // 引数は `allow_null_literal` を強制的に `false` へ戻す設計との
             // 不整合）。`parse_value_expr_with_null_context` で明示的に `false`
             // を指定し、他の通常引数と同じ扱いに揃える。
-            let needle = self.parse_value_expr_with_null_context(depth + 1, false)?;
+            // 定数式文脈（Issue #1543）では通常関数と同じく `NULL` 引数を定数として扱う。
+            let pos_null = self.const_expr_null_args;
+            let needle = self.parse_value_expr_with_null_context(depth + 1, pos_null)?;
             match self.peek() {
                 Some(Token::Ident(kw)) if kw.eq_ignore_ascii_case("in") => {
                     self.advance();
@@ -6005,7 +6033,7 @@ impl<'a> Parser<'a> {
                     )))
                 }
             }
-            let haystack = self.parse_value_expr_with_null_context(depth + 1, false)?;
+            let haystack = self.parse_value_expr_with_null_context(depth + 1, pos_null)?;
             self.expect_punct(')')?;
             self.consume_expr_node()?;
             return Ok(Expr::Call {
@@ -6080,7 +6108,8 @@ impl<'a> Parser<'a> {
         // （他の通常関数は従来どおり `false` のまま。`NULL` 許可の対象を
         // 安易に広げると他関数のエラーコード契約が変わるため、`CONCAT` に
         // 限定するスコープにする）。
-        let allow_null_for_this_call = name.eq_ignore_ascii_case("concat");
+        let allow_null_for_this_call =
+            name.eq_ignore_ascii_case("concat") || self.const_expr_null_args;
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
             args.push(
@@ -6404,10 +6433,57 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// `INSERT ... VALUES` の要素と列制約 `DEFAULT` の値位置の入口（Issue #1543・
+    /// SQL-45 のポインタ）。平易なリテラルは [`Self::expect_literal`] と同一の結果を
+    /// 返し、列参照を含まない式（算術・組み込み関数・CASE／COALESCE／NULLIF・
+    /// `DATE '...'` 等）は構文解析後に `sql::const_expr::fold_const_literal` で
+    /// [`InsertLiteral`] へ畳み込む。`UPDATE ... SET`／UPSERT の `SET` は本入口を
+    /// 使わず `expect_literal` のまま（別 Issue の担当）。
+    ///
+    /// 式は要素ごとに木が破棄されるため、ノード予算は要素単位で
+    /// [`MAX_EXPR_NODES`] へ戻す（文ごとの共有予算では多行 VALUES が偽の `54000` に
+    /// なる）。文全体の大きさは字句解析の入力長上限が抑える。
+    fn expect_literal_or_const_expr(&mut self) -> Result<InsertLiteral, SqlSurfaceError> {
+        let is_expr_start = match self.peek() {
+            Some(Token::Punct('(')) => true,
+            Some(Token::Ident(s)) => {
+                let plain_keyword = !self.quoted_null.contains(&self.pos)
+                    && (s.eq_ignore_ascii_case("true")
+                        || s.eq_ignore_ascii_case("false")
+                        || s.eq_ignore_ascii_case("null"));
+                !plain_keyword
+            }
+            _ => false,
+        };
+        if !is_expr_start {
+            let start = self.pos;
+            let lit = self.expect_literal()?;
+            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+                return Ok(lit);
+            }
+            self.pos = start;
+        }
+        let saved = self.expr_node_budget;
+        self.expr_node_budget = MAX_EXPR_NODES;
+        // 定数式では NULL を既定で有効化する（引用された "null" は quoted_null で
+        // 列参照のまま区別される）。
+        // 関数引数の `NULL` も列参照ではなく `NULL` 定数として解析する
+        // （型は `const_expr::fold_null_call` が決める）。
+        let prev_null_args = std::mem::replace(&mut self.const_expr_null_args, true);
+        let parsed = self.parse_value_expr_with_null_context(0, true);
+        self.const_expr_null_args = prev_null_args;
+        self.expr_node_budget = saved;
+        crate::sql::const_expr::fold_const_literal(&parsed?)
+    }
+
     /// リテラル 1 要素（文字列・数値・`true`/`false`・大小無視の `NULL`・符号付き
     /// 数値のみ。関数呼び出し・括弧等は許可リスト外）。INSERT の VALUES 要素・
     /// `UPDATE ... SET`・`ON CONFLICT ... DO UPDATE SET`・列制約 `DEFAULT` の
-    /// 値位置から呼ばれる単一の入口（Issue #1523・#1524・SQL-41）。`NULL` は
+    /// 値位置から呼ばれる単一の入口（Issue #1523・#1524・SQL-41）。
+    ///
+    /// INSERT VALUES・列 `DEFAULT` は定数式を受理する
+    /// [`Self::expect_literal_or_const_expr`] 経由（Issue #1543）で、本関数は
+    /// 平易なリテラルの解析を担う。`NULL` は
     /// `InsertLiteral::Null` を返し、nullable 判定（`23502`）は束縛段
     /// （`sql::parser` の `bind_*`）が担う。`DEFAULT NULL` だけは呼び出し元
     /// （[`Parser::parse_column_constraints`]）が「既定値なし」へ正規化する。
@@ -6653,13 +6729,13 @@ impl<'a> Parser<'a> {
         columns: &[String],
     ) -> Result<Vec<InsertLiteral>, SqlSurfaceError> {
         self.expect_punct('(')?;
-        let mut values = vec![self.expect_literal()?];
+        let mut values = vec![self.expect_literal_or_const_expr()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
             if values.len() >= MAX_COLUMN_COUNT {
                 return Err(SqlSurfaceError::unsupported("too many INSERT values"));
             }
-            values.push(self.expect_literal()?);
+            values.push(self.expect_literal_or_const_expr()?);
         }
         self.expect_punct(')')?;
 
@@ -8149,7 +8225,7 @@ impl<'a> Parser<'a> {
                 // `DEFAULT NULL` は既定値の宣言なしと同義（PostgreSQL も NULL 定数の
                 // 既定値は保存しない）。以降の束縛・カタログ・fast default は
                 // `InsertLiteral::Null` を受け取らない（Issue #1524・SQL-41）。
-                match self.expect_literal()? {
+                match self.expect_literal_or_const_expr()? {
                     InsertLiteral::Null => {}
                     lit => default = Some(lit),
                 }
@@ -15340,12 +15416,13 @@ mod tests {
     #[test]
     fn insert_values_reject_non_null_identifiers_and_signed_null() {
         let lookup = catalog_with(&["documents"]);
-        for lit in ["foo", "-NULL", "+NULL"] {
+        // 裸の識別子は列参照として 42703（Issue #1543・SQL-45 のポインタ）。
+        for (lit, code) in [("foo", "42703"), ("-NULL", "42601"), ("+NULL", "42601")] {
             let sql = format!(
                 "INSERT INTO documents (id, lang) VALUES (1, {lit}) USING OPERATION_ID 'op-null-3'"
             );
             let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
-            assert_eq!(err.wire_code(), "42601", "{sql}");
+            assert_eq!(err.wire_code(), code, "{sql}");
         }
         let err = validate_insert(
             "INSERT INTO documents (id, lang) VALUES (NULL) USING OPERATION_ID 'op-null-4'",
@@ -15435,14 +15512,14 @@ mod tests {
             LedgerMode::Ledgered,
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        assert_eq!(err.wire_code(), "42703");
         let tokens = crate::sql::lexer::tokenize_marked("DEFAULT \"NULL\"").expect("tokenize");
         assert_eq!(
             Parser::new(&tokens)
                 .parse_column_constraints()
                 .unwrap_err()
                 .wire_code(),
-            "42601"
+            "42703"
         );
     }
 
@@ -15503,9 +15580,107 @@ mod tests {
         ] {
             assert_eq!(parse(sql).unwrap_err().wire_code(), "42601", "{sql}");
         }
-        for sql in ["DEFAULT -NULL", "DEFAULT foo"] {
+        assert_eq!(parse("DEFAULT -NULL").unwrap_err().wire_code(), "42601");
+        // 列参照は 42703（Issue #1543・SQL-45 のポインタ）。
+        assert_eq!(parse("DEFAULT foo").unwrap_err().wire_code(), "42703");
+    }
+
+    /// `DEFAULT` と VALUES の定数式（Issue #1543・SQL-45 のポインタ）。
+    #[test]
+    fn const_expr_default_and_values() {
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            Parser::new(&tokens).parse_column_constraints()
+        };
+        let c = parse("DEFAULT 1+1").unwrap();
+        assert_eq!(c.default, Some(InsertLiteral::Number("2".to_string())));
+        let c = parse("DEFAULT upper('a') NOT NULL UNIQUE").unwrap();
+        assert_eq!(c.default, Some(InsertLiteral::String("A".to_string())));
+        assert!(c.not_null && c.unique);
+        assert_eq!(parse("DEFAULT NULLIF(1,1)").unwrap().default, None);
+        assert_eq!(
+            parse("DEFAULT -5").unwrap().default,
+            Some(InsertLiteral::Number("-5".into()))
+        );
+        assert_eq!(
+            parse("DEFAULT +1").unwrap().default,
+            Some(InsertLiteral::Number("+1".into()))
+        );
+        assert_eq!(
+            parse("DEFAULT true").unwrap().default,
+            Some(InsertLiteral::Bool(true))
+        );
+        for sql in [
+            "DEFAULT CURRENT_TIMESTAMP",
+            "DEFAULT now()",
+            "DEFAULT -(1+2)",
+        ] {
             assert_eq!(parse(sql).unwrap_err().wire_code(), "42601", "{sql}");
         }
+        assert_eq!(parse("DEFAULT n + 1").unwrap_err().wire_code(), "42703");
+        // NULL は定数式の内部でも受理する（算術では NULL 伝播）。引用された "null" は
+        // 列参照のまま 42703。
+        assert_eq!(parse("DEFAULT (NULL)").unwrap().default, None);
+        assert_eq!(parse("DEFAULT NULL + 1").unwrap().default, None);
+        let marked = crate::sql::lexer::tokenize_marked("DEFAULT (\"null\")").expect("tokenize");
+        assert_eq!(
+            Parser::new(&marked)
+                .parse_column_constraints()
+                .unwrap_err()
+                .wire_code(),
+            "42703"
+        );
+        assert_eq!(
+            parse("DEFAULT 9007199254740992 + 1 - 9007199254740992")
+                .unwrap_err()
+                .wire_code(),
+            "22003"
+        );
+
+        let lookup = catalog_with(&["documents"]);
+        let ok = validate_insert(
+            "INSERT INTO documents (id, body) VALUES (1+1, upper('a')), (3, 'x') \
+             USING OPERATION_ID 'op-ce-1'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap();
+        assert_eq!(
+            ok.rows[0],
+            vec![
+                InsertLiteral::Number("2".into()),
+                InsertLiteral::String("A".into())
+            ]
+        );
+        let nulls = validate_insert(
+            "INSERT INTO documents (id, body) VALUES (1, (NULL)), (2, NULL + 1) \
+             USING OPERATION_ID 'op-ce-null'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap();
+        assert_eq!(nulls.rows[0][1], InsertLiteral::Null);
+        assert_eq!(nulls.rows[1][1], InsertLiteral::Null);
+        let many = format!(
+            "INSERT INTO documents (id) VALUES {} USING OPERATION_ID 'op-ce-2'",
+            vec!["(1+1)"; 600].join(", ")
+        );
+        validate_insert(&many, &lookup, LedgerMode::Ledgered).unwrap();
+        let err = validate_insert(
+            "INSERT INTO documents (id, body) VALUES (1, n) USING OPERATION_ID 'op-ce-3'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42703");
+        // UPDATE SET は式を受理しない（別 Issue の担当）。
+        let err = validate_update(
+            "UPDATE documents SET body = 1+1 WHERE id = 1 USING OPERATION_ID 'op-ce-4'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
