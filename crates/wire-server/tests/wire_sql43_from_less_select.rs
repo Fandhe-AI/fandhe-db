@@ -364,6 +364,22 @@ fn simple_negative_limit_offset_and_non_boolean_where_are_rejected() {
     expect_simple_zero_rows(&mut s, "SELECT 1 LIMIT 0");
 }
 
+/// 引用付き `"true"`／`"false"` は OFFSET 直前でも真偽リテラルではなく列参照として
+/// 拒否される（Issue #2329 レビュー指摘。リテラル扱いせず fail-closed の `42601`）。
+#[test]
+fn simple_quoted_bool_word_before_offset_is_rejected_as_column() {
+    let (mut s, _g) = connect();
+    for sql in [
+        "SELECT 1 WHERE \"true\" OFFSET 0",
+        "SELECT 1 WHERE \"TRUE\" OFFSET 0",
+        "SELECT 1 WHERE \"false\" OFFSET 0",
+    ] {
+        send_simple_query(&mut s, sql);
+        expect_error_response_with_sqlstate(&mut s, "42601");
+        read_ready_for_query(&mut s);
+    }
+}
+
 #[test]
 fn extended_limit_zero_describes_columns_and_returns_no_rows() {
     let (mut s, _g) = connect();

@@ -264,6 +264,10 @@ fn quoted_null_in_where_is_not_a_null_literal() {
         "SELECT 1 WHERE \"NULL\"",
         "SELECT 1 WHERE \"null\" LIMIT 1",
         "SELECT 1 WHERE \"NULL\" OFFSET 0",
+        "SELECT 1 WHERE \"true\" OFFSET 0",
+        "SELECT 1 WHERE \"TRUE\" OFFSET 0",
+        "SELECT 1 WHERE \"false\" OFFSET 0",
+        "SELECT 1 WHERE \"TRUE\" LIMIT 1 OFFSET 0",
     ] {
         let code = wire_code_of(&core, &ctx, sql);
         assert!(

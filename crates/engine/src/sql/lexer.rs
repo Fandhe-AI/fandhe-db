@@ -367,6 +367,7 @@ pub(crate) fn quoted_bool_word_in_leaf_position(tokens: &[Token], i: usize) -> b
             "RETURNING",
             "GROUP",
             "HAVING",
+            "OFFSET",
             "OR",
             "UNION",
             "INTERSECT",
