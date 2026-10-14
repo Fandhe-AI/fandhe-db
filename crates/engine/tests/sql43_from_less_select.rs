@@ -58,6 +58,18 @@ fn wire_code_of(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> &'static s
     }
 }
 
+/// 実行時エラーの `(wire_code, Display, クライアント応答文言)` を返す。
+fn error_texts(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    sql: &str,
+) -> (&'static str, String, String) {
+    match core.execute_sql_in_session(ctx, &mut SessionState::default(), sql) {
+        Ok(o) => panic!("{sql:?} should be rejected, got {o:?}"),
+        Err(e) => (e.wire_code(), e.to_string(), e.client_message()),
+    }
+}
+
 fn single_cell(r: &QueryResult) -> &Cell {
     assert_eq!(r.rows.len(), 1, "exactly one row");
     r.rows[0].cells.first().expect("one cell")
@@ -224,8 +236,18 @@ fn rejects_aggregates_and_trailing_clauses() {
         "SELECT lower(count(1))",
         "SELECT",
         "SELECT 1,",
-        "SELECT 1 WHERE true",
-        "SELECT 1 LIMIT 1",
+        "SELECT 1 WHERE 1=1 AND 2=2",
+        "SELECT 1 GROUP BY 1",
+        "SELECT 1 HAVING true",
+        "SELECT 1 ORDER BY 1",
+        "SELECT 1 OFFSET 1 LIMIT 1",
+        "SELECT 1 LIMIT ALL",
+        "SELECT 1 LIMIT 1.5",
+        "SELECT 1 LIMIT $1",
+        "SELECT 1 WHERE count(*) = 1",
+        "SELECT 1 WHERE lang = 'en'",
+        "SELECT 1 WHERE",
+        "SELECT 1 LIMIT",
         "SELECT 1 FROM",
         "SELECT $1",
         "SELECT 1 UNION SELECT 2",
@@ -237,8 +259,32 @@ fn rejects_aggregates_and_trailing_clauses() {
     ] {
         let code = wire_code_of(&core, &ctx, sql);
         assert!(
-            matches!(code, "42601" | "0A000"),
+            matches!(code, "42601" | "42703" | "0A000"),
             "{sql:?} should be rejected fail-closed, got {code}"
+        );
+    }
+}
+
+/// 引用 `"NULL"` は NULL リテラルではなく識別子（列参照）として扱われ、
+/// `FROM` なしでは 0 行ではなく拒否される（Issue #2329 レビュー指摘）。
+#[test]
+fn quoted_null_in_where_is_not_a_null_literal() {
+    let (core, path) = core_with_table("sql43-qnull", true);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    for sql in [
+        "SELECT 1 WHERE \"NULL\"",
+        "SELECT 1 WHERE \"null\" LIMIT 1",
+        "SELECT 1 WHERE \"NULL\" OFFSET 0",
+        "SELECT 1 WHERE \"true\" OFFSET 0",
+        "SELECT 1 WHERE \"TRUE\" OFFSET 0",
+        "SELECT 1 WHERE \"false\" OFFSET 0",
+        "SELECT 1 WHERE \"TRUE\" LIMIT 1 OFFSET 0",
+    ] {
+        let code = wire_code_of(&core, &ctx, sql);
+        assert!(
+            matches!(code, "42601" | "42703"),
+            "{sql:?} should be rejected as a column reference, got {code}"
         );
     }
 }
@@ -327,6 +373,175 @@ fn works_in_transaction_and_for_any_tenant() {
         .expect("const select in txn")
     {
         SqlOutcome::Query(r) => assert_eq!(single_cell(&r), &Cell::SignedInteger(42)),
+        other => panic!("expected Query, got {other:?}"),
+    }
+    core.execute_sql_in_txn(&ctx_a, &mut session, &mut txn, "COMMIT")
+        .expect("COMMIT");
+}
+
+fn row_count(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> usize {
+    run(core, ctx, sql).rows.len()
+}
+
+#[test]
+fn where_filters_to_zero_or_one_row() {
+    let (core, path) = core_with_table("sql43-where", false);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    for sql in [
+        "SELECT 1 WHERE false",
+        "SELECT 1 WHERE NULL",
+        "SELECT 1 WHERE 1 = 2",
+    ] {
+        assert_eq!(row_count(&core, &ctx, sql), 0, "{sql}");
+    }
+    for sql in [
+        "SELECT 1 WHERE true",
+        "SELECT 1 WHERE TRUE;",
+        "SELECT 1 WHERE 1 = 1",
+        "SELECT 1 WHERE 'a' = 'a'",
+    ] {
+        assert_eq!(row_count(&core, &ctx, sql), 1, "{sql}");
+    }
+    // 0 行でも列メタデータは 1 行時と同一。
+    assert_eq!(
+        run(&core, &ctx, "SELECT 1 WHERE false").columns,
+        run(&core, &ctx, "SELECT 1").columns
+    );
+}
+
+#[test]
+fn limit_offset_select_zero_or_one_row() {
+    let (core, path) = core_with_table("sql43-limoff", false);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    for sql in [
+        "SELECT 1 LIMIT 0",
+        "SELECT 1 OFFSET 1",
+        "SELECT 1 LIMIT 1 OFFSET 1",
+        // `-0` は 0 として扱う（負値ではない）。
+        "SELECT 1 LIMIT -0",
+    ] {
+        assert_eq!(row_count(&core, &ctx, sql), 0, "{sql}");
+    }
+    for sql in [
+        "SELECT 1 LIMIT 1",
+        "SELECT 1 LIMIT 1 OFFSET 0",
+        "SELECT 1 LIMIT 5",
+        "SELECT 1 WHERE true LIMIT 1 OFFSET 0",
+        "SELECT 1 OFFSET 0",
+    ] {
+        assert_eq!(row_count(&core, &ctx, sql), 1, "{sql}");
+    }
+    assert_eq!(row_count(&core, &ctx, "SELECT 1 WHERE false LIMIT 1"), 0);
+}
+
+#[test]
+fn negative_limit_offset_rejected_at_execution() {
+    let (core, path) = core_with_table("sql43-neg", false);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    assert_eq!(wire_code_of(&core, &ctx, "SELECT 1 LIMIT -1"), "22000");
+    assert_eq!(wire_code_of(&core, &ctx, "SELECT 1 OFFSET -1"), "22000");
+    // 文言は Display・クライアント応答とも接頭辞なしの固定文言（設計文書どおり）。
+    for (sql, msg) in [
+        ("SELECT 1 LIMIT -1", "LIMIT must not be negative"),
+        ("SELECT 1 OFFSET -1", "OFFSET must not be negative"),
+        (
+            "SELECT 1 LIMIT -9223372036854775808",
+            "LIMIT must not be negative",
+        ),
+    ] {
+        let (code, display, client) = error_texts(&core, &ctx, sql);
+        assert_eq!(code, "22000", "{sql}");
+        assert_eq!(display, msg, "{sql}");
+        assert_eq!(client, msg, "{sql}");
+    }
+    // i64::MIN も構文は通り、実行時に負値として拒否される。MIN-1・MAX+1 は構文段階の 42601。
+    assert_eq!(
+        wire_code_of(&core, &ctx, "SELECT 1 LIMIT -9223372036854775808"),
+        "22000"
+    );
+    assert_eq!(
+        wire_code_of(&core, &ctx, "SELECT 1 OFFSET -9223372036854775808"),
+        "22000"
+    );
+    for sql in [
+        "SELECT 1 LIMIT -9223372036854775809",
+        "SELECT 1 OFFSET -9223372036854775809",
+        "SELECT 1 LIMIT 9223372036854775808",
+        "SELECT 1 OFFSET 9223372036854775808",
+    ] {
+        assert_eq!(wire_code_of(&core, &ctx, sql), "42601", "{sql}");
+    }
+    // Describe は評価しないので成功し、実行時にだけ失敗する。
+    for sql in [
+        "SELECT 1 LIMIT -1",
+        "SELECT 1 LIMIT -9223372036854775808",
+        "SELECT 1 OFFSET -9223372036854775808",
+        "SELECT 1 WHERE 1/0 = 1",
+    ] {
+        let parsed = core.parse_sql(sql).expect("parse");
+        let cols = core
+            .describe_parsed_in_session(&SessionState::default(), &parsed)
+            .expect("describe must not evaluate")
+            .expect("columns");
+        assert_eq!(cols.len(), 1);
+    }
+    assert_eq!(wire_code_of(&core, &ctx, "SELECT 1 WHERE 1/0 = 1"), "22012");
+    // 評価順の固定: 投影は WHERE の結果に関わらず評価される。
+    assert_eq!(wire_code_of(&core, &ctx, "SELECT 1/0 WHERE false"), "22012");
+}
+
+#[test]
+fn where_non_boolean_is_datatype_mismatch() {
+    let (core, path) = core_with_table("sql43-nonbool", false);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    for sql in [
+        "SELECT 1 WHERE 1",
+        "SELECT 1 WHERE 'x'",
+        "SELECT 1 WHERE 1+1",
+    ] {
+        assert_eq!(wire_code_of(&core, &ctx, sql), "42804", "{sql}");
+    }
+}
+
+#[test]
+fn where_column_reference_uniform_error() {
+    let (core, path) = core_with_table("sql43-wherecol", true);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    let msg = |sql: &str| {
+        core.execute_sql_in_session(&ctx, &mut SessionState::default(), sql)
+            .expect_err("rejected")
+            .to_string()
+    };
+    assert_eq!(
+        msg("SELECT 1 WHERE lang = 'en'"),
+        msg("SELECT 1 WHERE nosuch = 'en'")
+    );
+    assert!(!msg("SELECT 1 WHERE lang = 'en'").contains("lang"));
+}
+
+#[test]
+fn where_limit_work_in_transaction_and_for_any_tenant() {
+    let (core, path) = core_with_table("sql43-wheretxn", true);
+    let _g = CleanupGuard(path);
+    let ctx_a = ctx_for("tenant-a");
+    let ctx_b = ctx_for("tenant-b");
+    for sql in ["SELECT 1 WHERE false", "SELECT 1 LIMIT 1"] {
+        assert_eq!(run(&core, &ctx_a, sql), run(&core, &ctx_b, sql), "{sql}");
+    }
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx_a, &mut session, &mut txn, "BEGIN")
+        .expect("BEGIN");
+    match core
+        .execute_sql_in_txn(&ctx_a, &mut session, &mut txn, "SELECT 1 WHERE false")
+        .expect("const select in txn")
+    {
+        SqlOutcome::Query(r) => assert!(r.rows.is_empty()),
         other => panic!("expected Query, got {other:?}"),
     }
     core.execute_sql_in_txn(&ctx_a, &mut session, &mut txn, "COMMIT")
