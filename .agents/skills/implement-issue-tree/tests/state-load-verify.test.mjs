@@ -16,6 +16,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs'
+import { trackTmp } from './lib/tmp-track.mjs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -35,7 +36,7 @@ const driverPart = source.slice(markerIndex)
 
 globalThis.args = { parent: 1 }
 
-const sliceDir = mkdtempSync(join(tmpdir(), 'implement-issue-tree-state-verify-'))
+const sliceDir = trackTmp(mkdtempSync(join(tmpdir(), 'implement-issue-tree-state-verify-')))
 const slicePath = join(sliceDir, 'implement-issue-tree-state-verify-defs.mjs')
 const SLICE_EXPORTS = [
   'sha256Hex',
@@ -109,6 +110,28 @@ test('canonicalJson はキー昇順・空白なし・DEL を \\u007f へエス�
   const jqOut = '{"n":[1,-2,0,123456789],"o":{"a":{"c":{},"d":[]},"b":1},"s":"a\\u007fb\\u0001\\u001f\\t\\n\\\\\\" é😀/<>&","t":true,"z":null,"キー":"値"}'
   assert.equal(canonicalJson(v), jqOut)
   assert.equal(sha256Hex(canonicalJson(v)), 'e145292f5956db2bc57183b563ea1fc2d14fed1cb5f16f5a1a6eefc68a7e6c2f')
+})
+
+// closedCleanupTried（Issue #632）は項目の中の入れ子オブジェクト。読込スキーマは項目の値を制約せず（additionalProperties: true）、
+// 照合は項目全体を再帰的にキー整列して hash するため、入れ子のキー順が読込側と検証側で違っても一致する（既存挙動の固定）。
+// 期待値は jq 1.8.1 で `echo '<項目>' | jq -jcS . | shasum -a 256` を実行した値。
+const TRIED_ITEM_HASH = '2b5527904fa6d3005874418620ed534f903315c9398a6f3bb46ab16d4462829d'
+const triedItem = (order) => (order === 'asc'
+  ? { branch: 'feat/9-x', closedCleanupTried: { pr: 9, reason: 'retained', worktree: '/r/wt/a' }, pr: 9, status: 'blocked', worktree: '/r/wt/a' }
+  : { status: 'blocked', pr: 9, branch: 'feat/9-x', worktree: '/r/wt/a', closedCleanupTried: { worktree: '/r/wt/a', reason: 'retained', pr: 9 } })
+
+test('closedCleanupTried を持つ項目: 入れ子のキー順に依らず jq -jcS と同じ hash になり、読込・照合で採用される', () => {
+  for (const order of ['asc', 'file']) {
+    assert.equal(sha256Hex(canonicalJson(triedItem(order))), TRIED_ITEM_HASH, order)
+    const r = verifyLoadedItems({ 9: triedItem(order) }, { fileExists: true, hashes: { 9: TRIED_ITEM_HASH } })
+    assert.equal(r.verified, true, order)
+    assert.deepEqual(r.adopted[9].closedCleanupTried, { pr: 9, reason: 'retained', worktree: '/r/wt/a' })
+  }
+  // 読込側が入れ子を落とした項目は hash が合わず採用しない（記録が黙って消えない）
+  const { closedCleanupTried: _dropped, ...stripped } = triedItem('file')
+  const r = verifyLoadedItems({ 9: stripped }, { fileExists: true, hashes: { 9: TRIED_ITEM_HASH } })
+  assert.equal(r.verified, false)
+  assert.deepEqual(r.unverified, ['9'])
 })
 
 test('verifyLoadedItems: 実ファイルと同一の items は全件採用し verified: true', () => {
@@ -284,6 +307,18 @@ test('loadState: 実ファイルと一致する items は採用し、高水位�
   await assert.rejects(() => loadState(), /成立しなかったため停止した/)
 })
 
+test('loadState: closedCleanupTried を持つ項目（読込側が入れ子のキー順を変えて返す）も採用し verified: true', async () => {
+  const hashes = { 9: TRIED_ITEM_HASH }
+  installAgentStub((opts) =>
+    opts.label === 'state:load'
+      ? loadResult({ 9: triedItem('file') })
+      : { fileExists: true, hashes, keysSha256: keysOf(hashes), keysCount: 1, highWaterBytes: 0, highWaterVersion: 0 })
+  const r = await loadState()
+  assert.equal(r.verified, true)
+  assert.deepEqual(r.unverified, [])
+  assert.deepEqual(r.items[9].closedCleanupTried, { pr: 9, reason: 'retained', worktree: '/r/wt/a' })
+})
+
 test('loadState: 既存ファイルの照合が成立しない（検証が haiku / sonnet とも未返却）ならランを停止する', async () => {
   installAgentStub((opts) => (opts.label === 'state:load' ? loadResult(sampleItems) : null))
   await assert.rejects(() => loadState(), (err) => {
@@ -407,7 +442,8 @@ test('loadState: 再取得プロンプトには数値キー以外（__proto__・
     return { items: {} }
   })
   await loadState().catch(() => {})
-  assert.ok(fills.every((p) => !p.includes('rm -rf') && !p.includes('__proto__')))
+  // 共通規則（TEMP_FILE_POLICY）自体が「rm -rf の対象にしない」と書くため、注入した値そのもので判定する。
+  assert.ok(fills.every((p) => !p.includes('1; rm -rf x') && !p.includes('__proto__')))
 })
 
 test('loadState: 全件が初回で返れば再取得エージェントは起動しない（回帰）', async () => {
@@ -445,8 +481,11 @@ test('mergeVerifyPrompt は headRefName・baseRefName・closingIssuesReferences 
 
 test('monitorPrompt 手順 1 は PR 照合不一致で MERGED でも ready にせず blocked / unbound を返させる', () => {
   const p = monitorPrompt({ number: 365 }, { prNumber: 1366, branch: 'feat/365-bar' }, [], true, false)
-  const step1 = p.slice(p.indexOf('1. まず gh pr view'), p.indexOf('\n', p.indexOf('1. まず gh pr view')))
-  assert.ok(step1.includes('--json state,headRefOid,mergeable,headRefName,baseRefName,closingIssuesReferences,isCrossRepository'))
+  // #603 第 2 弾: 手順 1 の gh pr view は observe-pr.sh --mode pr へ移った（取得項目 headRefName・baseRefName・
+  // closingIssuesReferences・isCrossRepository の照合は observe-pr.test.mjs の 'pr:' テスト群が bound として固定する）
+  const step1 = p.slice(p.indexOf('\n1. ') + 1, p.indexOf('\n1c. '))
+  assert.match(step1, /observe-pr\.sh --nonce \S+ --mode pr --pr 1366 --base main --branch feat\/365-bar --issue 365/)
+  assert.ok(step1.includes('bound が 0'))
   assert.ok(step1.includes('baseRefName が "main" でない'))
   assert.ok(step1.includes('"feat/365-bar" と完全一致しない'))
   assert.ok(step1.includes('#365 を含まない'))
@@ -629,7 +668,7 @@ test('駆動部: stopUnverified と dispatch 前の state-unverified は同じ�
 
 test('駆動部: merged 受理（already-merged を含む）は PR 照合を要求し、opt-in 前の MERGED 確認も照合する', () => {
   assert.match(driverPart, /const verifyBindIssue = prBindingProblem\(item\.number, impl\.branch, v\)/)
-  assert.match(driverPart, /if \(!\(verifyStateOk && verifyHeadOk && !verifyBindIssue\)\) \{/)
+  assert.match(driverPart, /if \(!\(verifyStateOk && verifyHeadOk && !verifyBindIssue && gateCheck\.ok\)\) \{/)
 })
 
 test('駆動部: opt-in 前の MERGED 確認で PR 照合が不一致なら state を問わず blocked で終端する（allowMerge へ fail-open しない）', () => {

@@ -251,7 +251,7 @@ fn syntactic_normalizations_and_assignment_order_are_pinned() {
         code(&core, "alice", &stmt("pred", "n = ABS(n)", "norm-2")),
         "23505"
     );
-    // 識別子は大文字小文字を区別し、`N` は未知の列として束縛段で拒否される（42703。Issue #2339 以降）。
+    // 識別子は大文字小文字を区別し、`N` は未知の列として束縛段で拒否される（42703）。
     // 台帳照合に到達しないため、hash 側の大文字小文字の区別は単体テストで固定する。
     ok(&core, "alice", &stmt("pred", "n = n + 3", "norm-3"));
     assert_eq!(
