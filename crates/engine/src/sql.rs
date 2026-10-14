@@ -187,6 +187,7 @@ pub mod lexer;
 pub mod mode;
 pub(crate) mod numeric_fn;
 pub(crate) mod order_value;
+pub(crate) mod param_infer;
 pub mod params;
 pub mod parser;
 pub mod partitioned;

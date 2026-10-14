@@ -448,11 +448,201 @@ fn extended_query_accepts_whole_value_param_only() {
         .expect("execute");
     assert_eq!(affected(outcome), 1);
     assert_eq!(int_of(&core, "alice", "n", 1), 77);
+}
 
-    // 式の内側の `$n` は Issue #1546 の担当（Parse で `42601`）。
-    let err = core
+/// Parse → Bind → Execute を通し、実行結果の影響行数を返す。
+fn exec_prepared(core: &EngineCore, tenant: &str, sql: &str, values: &[&str]) -> u64 {
+    let prepared = core
+        .parse_sql_prepared(sql)
+        .unwrap_or_else(|e| panic!("{sql} must parse, got {e:?}"));
+    let binds: Vec<Option<Vec<u8>>> = values.iter().map(|v| Some(v.as_bytes().to_vec())).collect();
+    let parsed = core
+        .bind_prepared(&prepared, &binds)
+        .unwrap_or_else(|e| panic!("{sql} must bind, got {e:?}"));
+    let mut session = SessionState::default();
+    affected(
+        core.execute_parsed_in_session(&ctx(tenant), &mut session, &parsed)
+            .unwrap_or_else(|e| panic!("{sql} must execute, got {e:?}")),
+    )
+}
+
+fn parse_code(core: &EngineCore, sql: &str) -> String {
+    core.parse_sql_prepared(sql)
+        .map(|_| panic!("{sql} must fail to parse"))
+        .unwrap_err()
+        .wire_code()
+        .to_string()
+}
+
+/// Issue #1546: SET 右辺の式内 `$n` は演算の相手の列の型として公告され、Bind／Execute が通る。
+#[test]
+fn extended_query_infers_param_types_inside_set_expressions() {
+    use engine::catalog::ColumnType;
+    use engine::sql::exec::ColumnMeta;
+    use engine::sql::params::PreparedParamType;
+
+    let (core, _g) = setup("sql45-upd-expr-infer", None);
+
+    let prepared = core
+        .parse_sql_prepared("UPDATE docs SET n = n + $1 WHERE id = $2 USING OPERATION_ID $3")
+        .expect("expression $n in SET is accepted");
+    assert_eq!(prepared.param_count(), 3);
+    assert!(matches!(
+        prepared.param_types().first(),
+        Some(PreparedParamType::Column(ColumnMeta::Scalar {
+            ty: ColumnType::Integer,
+            ..
+        }))
+    ));
+    assert_eq!(
+        exec_prepared(
+            &core,
+            "alice",
+            "UPDATE docs SET n = n + $1 WHERE id = $2 USING OPERATION_ID $3",
+            &["5", "1", "e-1"],
+        ),
+        1
+    );
+    assert_eq!(int_of(&core, "alice", "n", 1), 15);
+    // 負値（`n + -3`）も通る。
+    assert_eq!(
+        exec_prepared(
+            &core,
+            "alice",
+            "UPDATE docs SET n = n + $1 WHERE id = $2 USING OPERATION_ID $3",
+            &["-3", "1", "e-2"],
+        ),
+        1
+    );
+    assert_eq!(int_of(&core, "alice", "n", 1), 12);
+
+    // 関数引数（テキスト）・CASE の兄弟枝・演算の左右どちらでも型が決まる。
+    let prepared = core
+        .parse_sql_prepared("UPDATE docs SET t = upper($1) WHERE id = $2 USING OPERATION_ID $3")
+        .expect("upper($1)");
+    assert_eq!(
+        prepared.param_types().first(),
+        Some(&PreparedParamType::Text)
+    );
+    assert_eq!(
+        exec_prepared(
+            &core,
+            "alice",
+            "UPDATE docs SET t = upper($1) WHERE id = $2 USING OPERATION_ID $3",
+            &["zz", "2", "e-3"],
+        ),
+        1
+    );
+    assert_eq!(text_of(&core, "alice", "t", 2), "ZZ");
+    assert_eq!(
+        exec_prepared(
+            &core,
+            "alice",
+            "UPDATE docs SET n = CASE WHEN m = $1 THEN $2 ELSE n END WHERE id = $3 \
+             USING OPERATION_ID $4",
+            &["3", "99", "3", "e-4"],
+        ),
+        1
+    );
+    assert_eq!(int_of(&core, "alice", "n", 3), 99);
+    assert_eq!(
+        exec_prepared(
+            &core,
+            "alice",
+            "UPDATE docs SET n = $1 * 2 WHERE id = $2 USING OPERATION_ID $3",
+            &["7", "2", "e-5"],
+        ),
+        1
+    );
+    assert_eq!(int_of(&core, "alice", "n", 2), 14);
+
+    // 不正な値は型検査で `22P02`（式経路でも同じ）。
+    let prepared = core
         .parse_sql_prepared("UPDATE docs SET n = n + $1 WHERE id = 1 USING OPERATION_ID 'x'")
+        .expect("parse");
+    let err = core
+        .bind_prepared(&prepared, &[Some(b"abc".to_vec())])
         .map(|_| ())
         .unwrap_err();
-    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(err.wire_code(), "22P02");
+}
+
+/// Issue #1546: 型を決められない `$n` は Parse で `42P18`。構文エラーは先に報告され、
+/// 表・列の有無で応答コードは変わらない。
+#[test]
+fn extended_query_rejects_indeterminate_set_params_with_42p18() {
+    let (core, _g) = setup("sql45-upd-expr-42p18", None);
+    for sql in [
+        "UPDATE docs SET n = $1 + $2 WHERE id = 1 USING OPERATION_ID 'x'",
+        "UPDATE docs SET n = COALESCE($1, $2) WHERE id = 1 USING OPERATION_ID 'x'",
+        "UPDATE docs SET n = abs($1) WHERE id = 1 USING OPERATION_ID 'x'",
+        // 存在しない表・列でも判定（構文の形だけ）は変わらない。
+        "UPDATE no_such SET n = $1 + $2 WHERE id = 1 USING OPERATION_ID 'x'",
+    ] {
+        assert_eq!(parse_code(&core, sql), "42P18", "{sql}");
+    }
+    // 相手が列参照なら、表・列が存在しなくても `42P18` にはならない（Text に倒れ、
+    // 既存の構造検証・束縛段のエラー〔`42P01` 等〕がそのまま返る）。
+    assert_eq!(
+        parse_code(
+            &core,
+            "UPDATE no_such SET n = n + $1 WHERE id = 1 USING OPERATION_ID 'x'"
+        ),
+        "42P01"
+    );
+    assert!(core
+        .parse_sql_prepared("UPDATE docs SET n = no_col + $1 WHERE id = 1 USING OPERATION_ID 'x'")
+        .is_ok());
+    // 構文エラーは `42P18` より先に返る。
+    assert_eq!(
+        parse_code(
+            &core,
+            "UPDATE docs SET n = $1 + $2 + + WHERE id = 1 USING OPERATION_ID 'x'"
+        ),
+        "42601"
+    );
+    // 式の中で扱えない型（BOOLEAN）は fail-closed の `0A000`。
+    assert_eq!(
+        parse_code(
+            &core,
+            "UPDATE docs SET n = CASE WHEN flag = $1 THEN 1 ELSE 0 END WHERE id = 1 \
+             USING OPERATION_ID 'x'"
+        ),
+        "0A000"
+    );
+    // ON CONFLICT ... DO UPDATE SET の式内 `$n` は別担当（`42601` のまま）。
+    assert_eq!(
+        parse_code(
+            &core,
+            "INSERT INTO docs (id, n) VALUES (9, 1) ON CONFLICT (id) DO UPDATE SET n = n + $1 \
+             USING OPERATION_ID 'x'"
+        ),
+        "42601"
+    );
+}
+
+/// Issue #1546: 式経路でも `operation_id` の内容照合は置換後の文で行われる。
+#[test]
+fn extended_query_expression_resend_is_matched_on_the_substituted_statement() {
+    let (core, _g) = setup("sql45-upd-expr-ledger", None);
+    let sql = "UPDATE docs SET n = n + $1 WHERE id = 1 USING OPERATION_ID 'resend-1'";
+    assert_eq!(exec_prepared(&core, "alice", sql, &["5"]), 1);
+    assert_eq!(int_of(&core, "alice", "n", 1), 15);
+
+    let run_bound = |value: &str| {
+        let prepared = core.parse_sql_prepared(sql).expect("parse");
+        let parsed = core
+            .bind_prepared(&prepared, &[Some(value.as_bytes().to_vec())])
+            .expect("bind");
+        let mut session = SessionState::default();
+        core.execute_parsed_in_session(&ctx("alice"), &mut session, &parsed)
+            .map(|_| ())
+            .unwrap_err()
+            .wire_code()
+            .to_string()
+    };
+    // 同じ値の再送は内容一致、異なる値は内容不一致。
+    assert_eq!(run_bound("5"), "23505");
+    assert_eq!(run_bound("6"), "22023");
+    assert_eq!(int_of(&core, "alice", "n", 1), 15);
 }

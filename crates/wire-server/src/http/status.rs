@@ -76,6 +76,8 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::OperationIdContentMismatch
         // Issue #2304: `FLOAT(p)` の精度範囲外（`22023`）。入力値起因の拒否として 400。
         | ErrorClass::InvalidParameterValue
+        // Issue #1546: `$n` の型を決められない（`42P18`）も入力起因の拒否として 400。
+        | ErrorClass::IndeterminateDatatype
         | ErrorClass::MissingOperationId
         | ErrorClass::DatetimeFieldOverflow
         | ErrorClass::InvalidDatetimeFormat
@@ -154,7 +156,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 47] = [
+    const EXPECTED: [(ErrorClass, u16); 48] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -202,6 +204,7 @@ mod tests {
         (ErrorClass::DuplicateFunction, 400),
         (ErrorClass::AmbiguousColumn, 400),
         (ErrorClass::InvalidParameterValue, 400),
+        (ErrorClass::IndeterminateDatatype, 400),
     ];
 
     #[test]

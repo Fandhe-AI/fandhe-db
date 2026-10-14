@@ -18,6 +18,107 @@ use crate::sql::udf_call::{
     UdfRegistry, MAX_EXPR_NODES,
 };
 
+/// 仮値評価で起きたエラーの遅延方針（Issue #1546）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeferMode {
+    /// 遅延しない（通常の parse。simple-query の畳み込みもこちら）。
+    Off,
+    /// `$n` を含む要素の値依存エラー（`22012`・`22003`）だけを Bind まで遅延する。
+    Values,
+    /// 構文確認専用。構文エラー（`42601`）以外はすべて握りつぶして最後まで走査する。
+    Structural,
+}
+
+#[derive(Clone)]
+struct DeferState {
+    mode: DeferMode,
+    /// 仮値置換後のトークン列で、元が `$n` だった位置（置換は 1 対 1 のため添字が一致する）。
+    param_positions: Vec<usize>,
+}
+
+thread_local! {
+    /// Parse 時の構造検証（パラメータ仮値での parse）中だけ有効になる遅延状態。
+    /// 復元は [`DeferGuard`] の Drop が担い、panic 時も確実に元へ戻る（fail-closed）。
+    static DEFER_STATE: std::cell::RefCell<DeferState> = const {
+        std::cell::RefCell::new(DeferState { mode: DeferMode::Off, param_positions: Vec::new() })
+    };
+}
+
+/// [`DEFER_STATE`] を元の状態へ戻す RAII ガード（panic 時も Drop で復元する）。
+pub(crate) struct DeferGuard {
+    prev: Option<DeferState>,
+}
+
+impl Drop for DeferGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            // thread-local 破棄後の Drop 等で失敗しても何もしない（`try_with`）。
+            let _ = DEFER_STATE.try_with(|c| {
+                if let Ok(mut st) = c.try_borrow_mut() {
+                    *st = prev;
+                }
+            });
+        }
+    }
+}
+
+fn enter(mode: DeferMode, param_positions: Vec<usize>) -> DeferGuard {
+    let prev = DEFER_STATE.with(|c| {
+        c.replace(DeferState {
+            mode,
+            param_positions,
+        })
+    });
+    DeferGuard { prev: Some(prev) }
+}
+
+/// 仮値評価による `$n` 由来の値依存エラー（`22012`・`22003`）を Bind まで遅延する区間を
+/// 開始する。`engine` の Parse 経路（`parse_sql_prepared`。`$n` を含む文の構造検証）専用。
+/// `param_positions` は仮値置換前のトークン列で `$n` だった位置。戻り値のガードが生きている
+/// 間だけ有効で、Drop（panic 含む）で必ず元へ戻る。
+pub(crate) fn defer_param_value_errors(param_positions: Vec<usize>) -> DeferGuard {
+    enter(DeferMode::Values, param_positions)
+}
+
+/// 構文確認専用の区間を開始する。構文エラー（`42601`）以外の畳み込みエラーを無視して
+/// 文全体を走査する（`42P18` より先に構文エラーを返す契約のため）。
+pub(crate) fn defer_all_non_syntax_errors() -> DeferGuard {
+    enter(DeferMode::Structural, Vec::new())
+}
+
+/// [`fold_const_literal`] の Parse 時構造検証版。`tokens` 内の位置範囲 `span` が要素の
+/// トークン範囲。遅延モードでは、`Values` なら `span` が `$n` を含むときの値依存エラー、
+/// `Structural` なら構文エラー以外のすべてを、プレースホルダ数値で置き換える。
+pub(crate) fn fold_const_literal_deferrable(
+    expr: &Expr,
+    span: std::ops::Range<usize>,
+) -> Result<InsertLiteral, SqlSurfaceError> {
+    match fold_const_literal(expr) {
+        Err(e) => {
+            let defer = DEFER_STATE.with(|c| {
+                let st = c.borrow();
+                match st.mode {
+                    DeferMode::Off => false,
+                    DeferMode::Values => {
+                        matches!(
+                            e,
+                            SqlSurfaceError::DivisionByZero { .. }
+                                | SqlSurfaceError::NumericOutOfRange { .. }
+                        ) && st.param_positions.iter().any(|p| span.contains(p))
+                    }
+                    DeferMode::Structural => e.wire_code() != "42601",
+                }
+            });
+            if defer {
+                Ok(InsertLiteral::Number("0".to_string()))
+            } else {
+                Err(e)
+            }
+        }
+        ok => ok,
+    }
+}
+
 /// f64 が整数を正確に表現できる上限（2^53）。
 const MAX_EXACT_F64: f64 = 9_007_199_254_740_992.0;
 

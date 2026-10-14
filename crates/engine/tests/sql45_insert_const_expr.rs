@@ -221,3 +221,71 @@ fn unary_plus_position_null_and_case_when_null_fold() {
         "42601"
     );
 }
+/// Issue #1546: VALUES 要素の式内 `$n` は演算の相手・関数引数から型が決まり、
+/// Parse → Bind → Execute で定数畳み込みを経て格納される。決められない `$n` は `42P18`。
+#[test]
+fn extended_query_infers_param_types_inside_values_expressions() {
+    use engine::catalog::ColumnType;
+    use engine::sql::exec::ColumnMeta;
+    use engine::sql::params::PreparedParamType;
+
+    let (core, path, mut session) = setup("sql45-values-param");
+    let _guard = CleanupGuard(path);
+    let sql = "INSERT INTO docs (id, embedding, n, t) VALUES (1, $1, 1 + $2, upper($3)) \
+               USING OPERATION_ID $4";
+    let prepared = core.parse_sql_prepared(sql).expect("parse");
+    assert_eq!(prepared.param_count(), 4);
+    assert!(matches!(
+        prepared.param_types().get(1),
+        Some(PreparedParamType::Column(ColumnMeta::Scalar {
+            ty: ColumnType::Integer,
+            ..
+        }))
+    ));
+    assert_eq!(
+        prepared.param_types().get(2),
+        Some(&PreparedParamType::Text)
+    );
+    let values = [
+        Some(b"[0.1,0.2,0.3,0.4]".to_vec()),
+        Some(b"41".to_vec()),
+        Some(b"zz".to_vec()),
+        Some(b"op-p1".to_vec()),
+    ];
+    let parsed = core.bind_prepared(&prepared, &values).expect("bind");
+    core.execute_parsed_in_session(&ctx(), &mut session, &parsed)
+        .expect("execute");
+    let rows = select(&core, &mut session, "SELECT n, t FROM docs LIMIT 10");
+    assert_eq!(rows.len(), 1);
+    assert!(dbg(&rows[0][0]).contains("42"), "{:?}", rows[0][0]);
+    assert!(dbg(&rows[0][1]).contains("ZZ"), "{:?}", rows[0][1]);
+
+    // 不正な整数は式経路でも `22P02`。
+    let bad = [
+        Some(b"[0.1,0.2,0.3,0.4]".to_vec()),
+        Some(b"x".to_vec()),
+        Some(b"a".to_vec()),
+        Some(b"op-p2".to_vec()),
+    ];
+    assert_eq!(
+        core.bind_prepared(&prepared, &bad)
+            .map(|_| ())
+            .unwrap_err()
+            .wire_code(),
+        "22P02"
+    );
+
+    for sql in [
+        "INSERT INTO docs (id, n) VALUES (2, $1 + $2) USING OPERATION_ID 'x'",
+        "INSERT INTO docs (id, n) VALUES (2, COALESCE($1, $2)) USING OPERATION_ID 'x'",
+    ] {
+        assert_eq!(
+            core.parse_sql_prepared(sql)
+                .map(|_| ())
+                .unwrap_err()
+                .wire_code(),
+            "42P18",
+            "{sql}"
+        );
+    }
+}

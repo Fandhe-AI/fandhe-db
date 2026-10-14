@@ -484,6 +484,10 @@ pub enum SqlSurfaceError {
     /// `wire_code` は ERR-3 の [`SqlSurfaceError::OperationIdContentMismatch`] と共有するが、
     /// `code` ラベル（`INVALID_PARAMETER_VALUE`）と文言で区別する。
     InvalidParameterValue { detail: &'static str },
+    /// `$n` の型を文脈から決められない（`42P18`。Issue #1546・SQL-45 期待欄 (6)・WIRE-12 の
+    /// ポインタ）。`param` は 1 始まりの `$n` 番号で、エラー文言には番号だけを含める
+    /// （値・表の存在情報は含めない）。
+    IndeterminateDatatype { param: u16 },
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
     /// スカラー／ベクトル算術式評価（SQL-26）の非有限値化（Issue #1163）にも使う。
@@ -991,6 +995,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DivisionByZero { .. } => ErrorClass::DivisionByZero,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
+            SqlSurfaceError::IndeterminateDatatype { .. } => ErrorClass::IndeterminateDatatype,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidDatetimeFormat { .. } => ErrorClass::InvalidDatetimeFormat,
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
@@ -1089,6 +1094,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             // 接頭辞なしで固定文言をそのまま出す（PostgreSQL と同じ文言。値は埋め込まない）。
             SqlSurfaceError::InvalidParameterValue { detail } => f.write_str(detail),
+            SqlSurfaceError::IndeterminateDatatype { param } => {
+                write!(f, "could not determine data type of parameter ${param}")
+            }
             SqlSurfaceError::DatetimeFieldOverflow { detail } => {
                 write!(f, "datetime field overflow: {detail}")
             }
@@ -6510,6 +6518,7 @@ impl<'a> Parser<'a> {
             }
             self.pos = start;
         }
+        let span_start = self.pos;
         let saved = self.expr_node_budget;
         self.expr_node_budget = MAX_EXPR_NODES;
         // 定数式では NULL を既定で有効化する（引用された "null" は quoted_null で
@@ -6520,7 +6529,7 @@ impl<'a> Parser<'a> {
         let parsed = self.parse_value_expr_with_null_context(0, true);
         self.const_expr_null_args = prev_null_args;
         self.expr_node_budget = saved;
-        crate::sql::const_expr::fold_const_literal(&parsed?)
+        crate::sql::const_expr::fold_const_literal_deferrable(&parsed?, span_start..self.pos)
     }
 
     /// `UPDATE ... SET <col> = <右辺>` の右辺の入口（Issue #1544・SQL-45 のポインタ）。
@@ -12696,6 +12705,36 @@ pub(crate) fn validate_insert_tokens_with_limit(
         returning: shape.returning,
         on_conflict: shape.on_conflict,
     })
+}
+
+/// 式内 `$n` の型推論（Issue #1546・SQL-45 のポインタ）専用の式解析入口。
+/// `sql::param_infer` が、`$n` を予約済みの擬似識別子へ置き換えた SET 右辺／VALUES 要素の
+/// トークン列を渡し、構文木 [`Expr`] を得るために呼ぶ。実行・束縛の経路には使わない
+/// （実際の解析は置換後トークン列に対する通常の入口が担い、第 2 の実行器を作らない）。
+///
+/// `for_set` が真なら `UPDATE ... SET` 右辺の入口（[`Parser::expect_literal_or_set_expr`]）、
+/// 偽なら `INSERT ... VALUES` 要素の入口（[`Parser::expect_literal_or_const_expr`]）と
+/// 同じ文法フラグで解析する。定数畳み込みはしない（畳み込みは `$n` の型を決めた後の
+/// 通常 parse が担う）。ノード予算・深さ上限は通常の入口と同じ。末尾に余剰トークンが
+/// 残る形は `42601`。
+pub(crate) fn parse_param_inference_expr(
+    tokens: &[Token],
+    for_set: bool,
+) -> Result<Expr, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let parsed = if for_set {
+        p.allow_unary_minus = true;
+        p.allow_plus_number = true;
+        p.parse_value_expr(0)?
+    } else {
+        p.const_expr_null_args = true;
+        // 推論専用: `-$1` は置換後の通常 parse では `- <数値>` の符号付きリテラルとして
+        // 受理されるが、推論時は `$1` が識別子のため単項マイナスを許可して脱糖させる。
+        p.allow_unary_minus = true;
+        p.parse_value_expr_with_null_context(0, true)?
+    };
+    p.expect_end_of_statement()?;
+    Ok(parsed)
 }
 
 /// TRUNCATE 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を
