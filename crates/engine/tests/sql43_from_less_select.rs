@@ -58,6 +58,18 @@ fn wire_code_of(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> &'static s
     }
 }
 
+/// 実行時エラーの `(wire_code, Display, クライアント応答文言)` を返す。
+fn error_texts(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    sql: &str,
+) -> (&'static str, String, String) {
+    match core.execute_sql_in_session(ctx, &mut SessionState::default(), sql) {
+        Ok(o) => panic!("{sql:?} should be rejected, got {o:?}"),
+        Err(e) => (e.wire_code(), e.to_string(), e.client_message()),
+    }
+}
+
 fn single_cell(r: &QueryResult) -> &Cell {
     assert_eq!(r.rows.len(), 1, "exactly one row");
     r.rows[0].cells.first().expect("one cell")
@@ -431,6 +443,20 @@ fn negative_limit_offset_rejected_at_execution() {
     let ctx = ctx_for("tenant-a");
     assert_eq!(wire_code_of(&core, &ctx, "SELECT 1 LIMIT -1"), "22000");
     assert_eq!(wire_code_of(&core, &ctx, "SELECT 1 OFFSET -1"), "22000");
+    // 文言は Display・クライアント応答とも接頭辞なしの固定文言（設計文書どおり）。
+    for (sql, msg) in [
+        ("SELECT 1 LIMIT -1", "LIMIT must not be negative"),
+        ("SELECT 1 OFFSET -1", "OFFSET must not be negative"),
+        (
+            "SELECT 1 LIMIT -9223372036854775808",
+            "LIMIT must not be negative",
+        ),
+    ] {
+        let (code, display, client) = error_texts(&core, &ctx, sql);
+        assert_eq!(code, "22000", "{sql}");
+        assert_eq!(display, msg, "{sql}");
+        assert_eq!(client, msg, "{sql}");
+    }
     // i64::MIN も構文は通り、実行時に負値として拒否される。MIN-1・MAX+1 は構文段階の 42601。
     assert_eq!(
         wire_code_of(&core, &ctx, "SELECT 1 LIMIT -9223372036854775808"),

@@ -230,12 +230,10 @@ pub fn bind(
 pub fn execute(bound: &BoundConstSelect) -> Result<QueryResult, SqlSurfaceError> {
     // 負値は実行時に拒否する（PostgreSQL と同じく Describe は成功し Execute で失敗）。
     if bound.limit.is_some_and(|l| l < 0) {
-        return Err(SqlSurfaceError::invalid_input("LIMIT must not be negative"));
+        return Err(SqlSurfaceError::negative_row_count("LIMIT"));
     }
     if bound.offset.is_some_and(|o| o < 0) {
-        return Err(SqlSurfaceError::invalid_input(
-            "OFFSET must not be negative",
-        ));
+        return Err(SqlSurfaceError::negative_row_count("OFFSET"));
     }
     let passes = match &bound.where_clause {
         None => true,

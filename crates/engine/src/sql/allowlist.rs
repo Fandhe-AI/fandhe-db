@@ -444,6 +444,12 @@ pub enum SqlSurfaceError {
     /// 非有限値・次元不一致、`LIMIT` 範囲外、hybrid の 2 引数形（実行不能）等。ERR-2:
     /// `22000`）。
     InvalidInput { detail: String },
+    /// 定数式 SELECT（`sql::const_select`）の負の `LIMIT`／`OFFSET`（`22000`。Issue #2329）。
+    /// `InvalidInput` と同じ分類だが、`docs/design/sql-from-less-select.md` の固定文言
+    /// （`LIMIT must not be negative`／`OFFSET must not be negative`）を接頭辞なしで
+    /// 返すため独立 variant とする。`clause` は呼び出し側が渡す静的文字列（"LIMIT"／"OFFSET"）
+    /// のみで、untrusted 入力は含まない。
+    NegativeRowCount { clause: &'static str },
     /// スカラーサブクエリが 2 行以上を返した（`21000`。Issue #1404・SQL-29・ERR-6）。
     /// fail-closed で先頭行は採用しない。行数は自テナントの可視行だけで決まり、
     /// 固定文言のため行の値・他テナントの情報は含まない。
@@ -816,6 +822,12 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `sql::const_select::execute` が負の `LIMIT`／`OFFSET`（`22000`）を
+    /// 固定文言で報告するために使う（Issue #2329）。
+    pub(crate) fn negative_row_count(clause: &'static str) -> Self {
+        SqlSurfaceError::NegativeRowCount { clause }
+    }
+
     /// `pub(crate)`: `sql::subquery` がスカラーサブクエリの 2 行以上返却（`21000`）を
     /// 報告するために使う（Issue #1404）。
     pub(crate) fn cardinality_violation() -> Self {
@@ -971,7 +983,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::UnsupportedSyntax { .. } => ErrorClass::UnsupportedSqlSyntax,
             SqlSurfaceError::UndefinedTable { .. } => ErrorClass::TableNotFound,
             SqlSurfaceError::Internal { .. } => ErrorClass::InternalError,
-            SqlSurfaceError::InvalidInput { .. } => ErrorClass::InvalidInput,
+            SqlSurfaceError::InvalidInput { .. } | SqlSurfaceError::NegativeRowCount { .. } => {
+                ErrorClass::InvalidInput
+            }
             SqlSurfaceError::CardinalityViolation => ErrorClass::CardinalityViolation,
             SqlSurfaceError::PayloadTooLarge { .. } => ErrorClass::PayloadTooLarge,
             SqlSurfaceError::MissingOperationId => ErrorClass::MissingOperationId,
@@ -1045,6 +1059,9 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::UndefinedTable { name } => write!(f, "undefined table: {name}"),
             SqlSurfaceError::Internal { detail } => write!(f, "internal error: {detail}"),
             SqlSurfaceError::InvalidInput { detail } => write!(f, "invalid input: {detail}"),
+            SqlSurfaceError::NegativeRowCount { clause } => {
+                write!(f, "{clause} must not be negative")
+            }
             SqlSurfaceError::CardinalityViolation => write!(
                 f,
                 "more than one row returned by a subquery used as an expression"
