@@ -989,14 +989,50 @@ pub mod isa_probe {
 }
 RUST
 
-  # pass (Issue #511): `isa.rs::neon_block4::dot_block4_neon` と同型の実装
-  # （`vsetq_lane_f32` 構築＋`vfmaq_f32`＋`&mut f32` 出力）。禁止 0 件かつ
-  # `fmla v.4s` が実際に emit されることを確認する。
+  # pass (Issue #511・#2346): `isa/neon_block4.rs::dot_block4_neon` と同型の実装
+  # （`load4` の `vsetq_lane_f32` 構築＋4 行分 `vfmaq_f32`＋`lane_sum4`＋全行の端数和＋
+  # `&mut f32` 出力）。禁止 0 件かつ `fmla v.4s` が実際に emit されることを確認する。
+  # 4 行すべてをループ本体・端数和・出力で使う構造まで実カーネルと揃える。行 1〜3 を
+  # 未使用にすると、beta の rustc が 4 行分の zip 長さ（min）計算を SLP ベクトル化し
+  # `ld1 {v.d}[1]` を出して誤検出する（Issue #2346。スライス長の読み出しでありデータ
+  # レーン構築ではない）。
   cat > "${dir}/fx_pass_block4_neon.rs" <<'RUST'
 use std::arch::aarch64::*;
 
 pub mod isa_probe {
     use super::*;
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn load4(c: &[f32; 4]) -> float32x4_t {
+        let [c0, c1, c2, c3] = *c;
+        let v = vdupq_n_f32(0.0);
+        let v = vsetq_lane_f32::<0>(c0, v);
+        let v = vsetq_lane_f32::<1>(c1, v);
+        let v = vsetq_lane_f32::<2>(c2, v);
+        vsetq_lane_f32::<3>(c3, v)
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn lane_sum4(v: float32x4_t) -> f32 {
+        let l0 = vgetq_lane_f32::<0>(v);
+        let l1 = vgetq_lane_f32::<1>(v);
+        let l2 = vgetq_lane_f32::<2>(v);
+        let l3 = vgetq_lane_f32::<3>(v);
+        let mut sum = -0.0f32;
+        sum += l0;
+        sum += l1;
+        sum += l2;
+        sum += l3;
+        sum
+    }
+
+    #[inline(always)]
+    fn tail_sum(a_rem: &[f32], b_rem: &[f32]) -> f32 {
+        a_rem.iter().zip(b_rem.iter()).map(|(x, y)| x * y).sum()
+    }
+
     #[target_feature(enable = "neon")]
     #[inline(never)]
     pub unsafe fn dot_block4_neon(
@@ -1020,41 +1056,17 @@ pub mod isa_probe {
         let mut a3 = vdupq_n_f32(0.0);
 
         for ((((qk, x0), x1), x2), x3) in qc.iter().zip(c0).zip(c1).zip(c2).zip(c3) {
-            let [q0, q1, q2, q3] = *qk;
-            let vq = vdupq_n_f32(0.0);
-            let vq = vsetq_lane_f32::<0>(q0, vq);
-            let vq = vsetq_lane_f32::<1>(q1, vq);
-            let vq = vsetq_lane_f32::<2>(q2, vq);
-            let vq = vsetq_lane_f32::<3>(q3, vq);
-
-            let [x00, x01, x02, x03] = *x0;
-            let vx0 = vdupq_n_f32(0.0);
-            let vx0 = vsetq_lane_f32::<0>(x00, vx0);
-            let vx0 = vsetq_lane_f32::<1>(x01, vx0);
-            let vx0 = vsetq_lane_f32::<2>(x02, vx0);
-            let vx0 = vsetq_lane_f32::<3>(x03, vx0);
-            a0 = vfmaq_f32(a0, vx0, vq);
-
-            let _ = (x1, x2, x3);
+            let vq = load4(qk);
+            a0 = vfmaq_f32(a0, load4(x0), vq);
+            a1 = vfmaq_f32(a1, load4(x1), vq);
+            a2 = vfmaq_f32(a2, load4(x2), vq);
+            a3 = vfmaq_f32(a3, load4(x3), vq);
         }
 
-        let l0 = vgetq_lane_f32::<0>(a0);
-        let l1 = vgetq_lane_f32::<1>(a0);
-        let l2 = vgetq_lane_f32::<2>(a0);
-        let l3 = vgetq_lane_f32::<3>(a0);
-        let mut sum = -0.0f32;
-        sum += l0;
-        sum += l1;
-        sum += l2;
-        sum += l3;
-        let rem: f32 = t0.iter().zip(qr.iter()).map(|(x, y)| x * y).sum();
-        *out0 = sum + rem;
-        *out1 = *out0;
-        *out2 = *out0;
-        *out3 = *out0;
-        let _ = t1;
-        let _ = t2;
-        let _ = t3;
+        *out0 = lane_sum4(a0) + tail_sum(t0, qr);
+        *out1 = lane_sum4(a1) + tail_sum(t1, qr);
+        *out2 = lane_sum4(a2) + tail_sum(t2, qr);
+        *out3 = lane_sum4(a3) + tail_sum(t3, qr);
     }
 }
 RUST
@@ -1365,17 +1377,24 @@ self_test() {
 
 real_check() {
   local build_target_dir="${TARGET_DIR}"
-  local deps_dir="${build_target_dir}/release/deps"
+  # `.s` の出力先は cargo のバージョンで異なる（stable は `release/deps/`、
+  # cargo 1.100 beta 以降は build-dir レイアウトの `release/build/<pkg>/<hash>/out/`）。
+  # どちらでも拾えるよう profile ディレクトリ全体を探索範囲にする。
+  local profile_dir="${build_target_dir}/release"
   local cargo_target_flag=()
   local host
   host="$(rustc -vV | sed -n 's/^host: //p')"
   if [ "${TARGET}" != "${host}" ]; then
     cargo_target_flag=(--target "${TARGET}")
-    deps_dir="${build_target_dir}/${TARGET}/release/deps"
+    profile_dir="${build_target_dir}/${TARGET}/release"
   fi
 
   mkdir -p "${build_target_dir}"
-  rm -f "${deps_dir}"/engine-*.s
+  # 旧レイアウト・新レイアウトのどちらに残留した `.s` も削除し、
+  # 後段の「ちょうど 1 個」判定が過去ビルドの残骸で崩れないようにする。
+  if [ -d "${profile_dir}" ]; then
+    find "${profile_dir}" -type f -name 'engine-*.s' -delete
+  fi
 
   # `.s` を削除しても、cargo のフィンガープリントが「最新」と判断すれば
   # rustc は再起動されず `.s` が再生成されない（F2）。`cargo clean -p fandhe-db-engine`
@@ -1391,11 +1410,11 @@ real_check() {
   fi
 
   local matches
-  matches="$(find "${deps_dir}" -maxdepth 1 -name 'engine-*.s' 2>/dev/null)"
+  matches="$(find "${profile_dir}" -type f -name 'engine-*.s' 2>/dev/null)"
   local count
   count="$(echo "${matches}" | grep -c . || true)"
   if [ -z "${matches}" ] || [ "${count}" -ne 1 ]; then
-    echo "ERROR: expected exactly one engine-*.s under ${deps_dir}, found ${count}" >&2
+    echo "ERROR: expected exactly one engine-*.s under ${profile_dir}, found ${count}" >&2
     return 1
   fi
 

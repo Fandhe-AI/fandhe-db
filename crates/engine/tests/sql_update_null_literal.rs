@@ -337,7 +337,9 @@ fn rls_other_tenant_row_is_untouched_and_error_is_row_independent() {
 }
 
 /// 二重引用符識別子 `"NULL"` は NULL 定数として受理しない（Issue #1524 レビュー指摘）。
-/// `42601` で拒否され、対象行を含むどの行も変化しない。
+/// SET 右辺が式を受理する（Issue #1544・SQL-45）ようになったため、`"NULL"` は列参照として
+/// 解析され、そのような列は無いので `42703`（未定義列。Issue #2332）で拒否される。対象行を含むどの行も
+/// 変化しない。
 #[test]
 fn quoted_null_identifier_is_rejected_and_row_unchanged() {
     let (core, _g) = setup("upd-null-quoted");
@@ -347,7 +349,7 @@ fn quoted_null_identifier_is_rejected_and_row_unchanged() {
             "alice",
             "UPDATE docs SET lang = \"NULL\" WHERE id = 1 USING OPERATION_ID 'q1'",
         ),
-        "42601"
+        "42703"
     );
     assert!(is_text(&cell_of(&core, "alice", "lang", 1), "ja"));
     assert!(is_text(&cell_of(&core, "alice", "lang", 2), "ja"));
@@ -375,8 +377,8 @@ fn same_operation_id_with_different_null_assignment_is_content_mismatch() {
 }
 
 /// `EXPLAIN UPDATE ... PARTITIONED` でも引用付き `"NULL"` は NULL 定数として受理せず
-/// `42601`（実行時の UPDATE と同じ契約。Issue #1524 レビュー指摘）。引用なしの `NULL` は
-/// 従来どおり EXPLAIN を受理する。
+/// 列参照として束縛を試みて `42703`（実行時の UPDATE と同じ契約。Issue #1524 レビュー指摘、
+/// Issue #1544 で `42601` から変更）。引用なしの `NULL` は従来どおり EXPLAIN を受理する。
 #[test]
 fn explain_partitioned_update_distinguishes_quoted_null() {
     let (core, _g) = setup("upd-null-explain");
@@ -387,7 +389,7 @@ fn explain_partitioned_update_distinguishes_quoted_null() {
             "EXPLAIN UPDATE docs SET lang = \"NULL\" WHERE id > 0 \
              USING OPERATION_ID 'ex-q' PARTITIONED",
         ),
-        "42601"
+        "42703"
     );
     assert!(matches!(
         ok(

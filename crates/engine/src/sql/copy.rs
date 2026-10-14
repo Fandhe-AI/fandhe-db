@@ -537,11 +537,11 @@ fn bind_copy_record(
             .columns
             .iter()
             .position(|c| &c.name == name)
-            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+            .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let column = schema
             .columns
             .get(col_idx)
-            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+            .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let value = match field {
             None => {
                 // 明示的な `\N`（COPY テキスト形式の NULL マーカー）は
@@ -729,9 +729,7 @@ impl CopyInSession {
                 continue;
             }
             if !schema.columns.iter().any(|c| &c.name == name) {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "unknown column: {name}"
-                )));
+                return Err(SqlSurfaceError::undefined_column(name));
             }
         }
         for column in &schema.columns {

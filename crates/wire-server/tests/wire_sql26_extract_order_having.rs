@@ -555,7 +555,15 @@ fn simple_unsupported_forms_return_exact_sqlstate_and_session_continues() {
         format!("{AGG} HAVING abs(id) > 1"),
         format!("{AGG} HAVING lower(title) = 'a'"),
     ] {
-        assert_simple_error(&mut s, &sql, "22000");
+        // 未知列（`nosuchcol`・`title`・集計文脈の `id`）は 42703、VECTOR 式などの型不正は 22000。
+        let expected =
+            if sql.contains("nosuchcol") || sql.contains("abs(id)") || sql.contains("lower(title)")
+            {
+                "42703"
+            } else {
+                "22000"
+            };
+        assert_simple_error(&mut s, &sql, expected);
     }
 
     // 評価時エラー（0 除算）。
@@ -700,13 +708,13 @@ fn extended_unsupported_forms_return_exact_sqlstate_and_recover() {
         &mut s,
         "SELECT id FROM docs WHERE d = $1 ORDER BY lower(nosuchcol) LIMIT 3",
         &["2021-01-11"],
-        "22000",
+        "42703",
     );
     assert_extended_error(
         &mut s,
         "SELECT lang, COUNT(*) AS c FROM docs WHERE lang = $1 GROUP BY lang HAVING abs(id) > 1",
         &["ja"],
-        "22000",
+        "42703",
     );
 }
 

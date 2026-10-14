@@ -344,9 +344,12 @@ fn execute_bound_delete_in_session_returns_zero_rows_for_missing_id() {
     assert_eq!(outcome.rows_affected, 0);
 }
 
-/// `ValidatedUpdate::assignments` 用の `InsertLiteral::String` を構築する薄い
-/// ヘルパー（`engine::sql::allowlist::InsertLiteral` はテスト対象クレートの
-/// 型そのもの。本ファイル内で複数回使うための命名の重複回避）。
-fn engine_insert_literal_string(s: &str) -> engine::sql::allowlist::InsertLiteral {
-    engine::sql::allowlist::InsertLiteral::String(s.to_string())
+/// `ValidatedUpdate::assignments` 用の `SetValue::Literal(InsertLiteral::String)` を構築する
+/// 薄いヘルパー（`engine::sql::allowlist::InsertLiteral` はテスト対象クレートの
+/// 型そのもの。本ファイル内で複数回使うための命名の重複回避。Issue #1544 で
+/// SET 右辺の型が `SetValue` になったため包む）。
+fn engine_insert_literal_string(s: &str) -> engine::sql::allowlist::SetValue {
+    engine::sql::allowlist::SetValue::Literal(engine::sql::allowlist::InsertLiteral::String(
+        s.to_string(),
+    ))
 }

@@ -94,9 +94,7 @@ impl ScoringBoost {
             .columns
             .iter()
             .find(|c| c.name == self.column)
-            .ok_or_else(|| {
-                SqlSurfaceError::invalid_input(format!("unknown column: {}", self.column))
-            })?;
+            .ok_or_else(|| SqlSurfaceError::undefined_column(&self.column))?;
         match &column.ty {
             ColumnType::Text | ColumnType::Varchar => {}
             ColumnType::Vector(_)
@@ -311,7 +309,7 @@ mod tests {
         let err = ScoringBoost::equals("missing", "doc", 0.001)
             .bind(&schema())
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]

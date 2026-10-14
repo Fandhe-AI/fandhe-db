@@ -301,9 +301,7 @@ pub(crate) fn check_columns_within_view(
         Projection::Columns(cols) => {
             for c in cols {
                 if !columns.iter().any(|vc| vc == c) {
-                    return Err(SqlSurfaceError::InvalidInput {
-                        detail: format!("unknown column: {c}"),
-                    });
+                    return Err(SqlSurfaceError::undefined_column(c));
                 }
             }
         }
@@ -312,9 +310,7 @@ pub(crate) fn check_columns_within_view(
                 match item {
                     SelectItem::Column(c) => {
                         if !columns.iter().any(|vc| vc == c) {
-                            return Err(SqlSurfaceError::InvalidInput {
-                                detail: format!("unknown column: {c}"),
-                            });
+                            return Err(SqlSurfaceError::undefined_column(c));
                         }
                     }
                     SelectItem::Expr { expr, .. } => expr_columns_within(columns, expr)?,
@@ -331,9 +327,7 @@ pub(crate) fn check_columns_within_view(
     // scalar-order-by-scan.md` に記録する）。
     for key in order_by {
         if !columns.iter().any(|vc| vc == &key.column) {
-            return Err(SqlSurfaceError::InvalidInput {
-                detail: format!("unknown column: {}", key.column),
-            });
+            return Err(SqlSurfaceError::undefined_column(&key.column));
         }
     }
     Ok(())
@@ -353,9 +347,7 @@ pub(crate) fn check_order_exprs_within_view(
         match key {
             ScanOrderKey::Column(k) => {
                 if !columns.iter().any(|vc| vc == &k.column) {
-                    return Err(SqlSurfaceError::InvalidInput {
-                        detail: format!("unknown column: {}", k.column),
-                    });
+                    return Err(SqlSurfaceError::undefined_column(&k.column));
                 }
             }
             ScanOrderKey::Expr { expr, .. } => expr_columns_within(columns, expr)?,
@@ -384,9 +376,7 @@ pub(crate) fn check_aggregate_columns_within_view(
     let Some(columns) = view_columns else {
         return Ok(());
     };
-    let unknown = |c: &str| SqlSurfaceError::InvalidInput {
-        detail: format!("unknown column: {c}"),
-    };
+    let unknown = |c: &str| SqlSurfaceError::undefined_column(c);
     let mut effective_names: Vec<String> = Vec::new();
     for item in items {
         match item {
@@ -482,9 +472,7 @@ fn check_predicate_columns_within(
         _ => {
             if let Some(c) = predicate_column(pred) {
                 if !columns.iter().any(|vc| vc == c) {
-                    return Err(SqlSurfaceError::InvalidInput {
-                        detail: format!("unknown column: {c}"),
-                    });
+                    return Err(SqlSurfaceError::undefined_column(c));
                 }
             }
             Ok(())
@@ -504,9 +492,7 @@ fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurface
             if columns.iter().any(|vc| vc == name) {
                 Ok(())
             } else {
-                Err(SqlSurfaceError::InvalidInput {
-                    detail: format!("unknown column: {name}"),
-                })
+                Err(SqlSurfaceError::undefined_column(name))
             }
         }
         Expr::Call { args, .. } => {
@@ -565,23 +551,17 @@ pub(crate) fn check_window_columns_within_view(
     for item in window_items {
         for col in &item.partition_by {
             if !columns.iter().any(|vc| vc == col) {
-                return Err(SqlSurfaceError::InvalidInput {
-                    detail: format!("unknown column: {col}"),
-                });
+                return Err(SqlSurfaceError::undefined_column(col));
             }
         }
         for (col, _) in &item.order_by {
             if !columns.iter().any(|vc| vc == col) {
-                return Err(SqlSurfaceError::InvalidInput {
-                    detail: format!("unknown column: {col}"),
-                });
+                return Err(SqlSurfaceError::undefined_column(col));
             }
         }
         if let Some(AggregateArg::Expr(Expr::Ident(name))) = &item.arg {
             if !columns.iter().any(|vc| vc == name) {
-                return Err(SqlSurfaceError::InvalidInput {
-                    detail: format!("unknown column: {name}"),
-                });
+                return Err(SqlSurfaceError::undefined_column(name));
             }
         }
     }
@@ -647,7 +627,7 @@ mod tests {
             &[],
         )
         .expect_err("NOT-wrapped reference to a hidden column must be rejected");
-        assert!(matches!(err, SqlSurfaceError::InvalidInput { .. }));
+        assert!(matches!(err, SqlSurfaceError::UndefinedColumn { .. }));
     }
 
     /// 固定のビュー定義群を返すテスト用 lookup（テーブルは `docs` のみ）。
@@ -763,7 +743,7 @@ mod tests {
             agg.where_predicates(),
         )
         .expect_err("hidden column through NOT");
-        assert!(matches!(err, SqlSurfaceError::InvalidInput { .. }));
+        assert!(matches!(err, SqlSurfaceError::UndefinedColumn { .. }));
         // 公開列のみ（`s` は SELECT リスト項目名）なら通る。
         check_aggregate_columns_within_view(Some(&cols), agg.items(), agg.group_by(), &[])
             .expect("visible columns and item alias");

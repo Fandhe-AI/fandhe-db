@@ -309,7 +309,7 @@ fn err2_classification_boundary_syntax_vs_value_vs_protocol() {
         "SELECT * FROM documents ORDER BY nonexistent_column <=> '[0.1,0.2,0.3]' LIMIT 3";
     let e3 = core.execute_sql(&ctx, value_sql).expect_err("rejected");
     let e4 = core.execute_sql(&ctx, value_sql).expect_err("rejected");
-    assert_eq!(e3.wire_code(), "22000");
+    assert_eq!(e3.wire_code(), "42703");
     assert_eq!(e3.wire_code(), e4.wire_code());
 
     // (c) 未存在テーブル → テーブル不在分類（42P01）。

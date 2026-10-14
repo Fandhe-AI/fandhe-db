@@ -569,7 +569,13 @@ Issue #871（述語つき UPDATE/DELETE の実行結線）は自動運転モー�
   同一のまま変更しない。
 - **割当リテラルのタグ表（追補）**: `String`＝1（`VECTOR` 以外の列）・
   `Number`＝2・`Bool`＝3・`Null`＝4・`Vector`＝5（NoSQL 由来、および
-  `VECTOR` 列への `String` の正準形。Issue #1061）。
+  `VECTOR` 列への `String` の正準形。Issue #1061）。`SetValue::Expr`（SET 右辺の式。
+  Issue #1544・SQL-45 ポインタ）は別タグ 6＋`push_dml_expr` の構文木直列化＋前置き順の
+  各数値リテラルの整数分類 1 バイト（0＝整数形でない・1＝int4・2＝int8）。整数分類を
+  足すのは、束縛段が `n / 2`（整数除算）と `n / 2.0`（倍精度除算）を区別するため。
+  WHERE 経路の hash とリテラルだけの SET の hash は不変。レイアウトは Issue #1545 の
+  golden テスト（`set_expr_hash_layouts_are_golden`）で固定し、式 variant・`BinOp` 全種を
+  単一行・述語形・分割実行の 3 経路で別 hash になることを網羅テストで確認している。
 - **fail-closed**: `VECTOR` 列への `String` のパースに失敗した場合は
   `Err`（`sql::parser::parse_vector_literal` が返す `22000`／`54000`）を
   そのまま返す。タグ 1（生テキスト）へはフォールバックしない。

@@ -271,7 +271,7 @@ fn internal_aggregates_are_invisible_to_having_and_order_by() {
             &ctx,
             "SELECT sum(n)+1 FROM t GROUP BY g HAVING sum > 1"
         ),
-        "22000"
+        "42703"
     );
     // 可視の `sum(n)` と併存しても、HAVING／ORDER BY は可視項目へ一意に解決する。
     let r = run(
@@ -369,9 +369,9 @@ fn view_public_columns_scope_covers_expression_items() {
     let r = run(&core, &ctx, "SELECT sum(n)+1 FROM v_pub");
     assert_eq!(row_cells(&r), vec![vec![Cell::SignedInteger(14)]]);
     // 非公開列 `m` を式内の集計引数・集計の外の参照に使うことは公開列スコープ違反（22000）。
-    assert_eq!(code(&core, &ctx, "SELECT sum(m)+1 FROM v_pub"), "22000");
+    assert_eq!(code(&core, &ctx, "SELECT sum(m)+1 FROM v_pub"), "42703");
     assert_eq!(
         code(&core, &ctx, "SELECT m, sum(n)+m FROM v_pub GROUP BY m"),
-        "22000"
+        "42703"
     );
 }

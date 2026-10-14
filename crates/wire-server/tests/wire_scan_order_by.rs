@@ -130,14 +130,14 @@ fn mixing_scalar_order_by_with_vector_ranking_rejects_with_42601() {
     read_ready_for_query(&mut stream);
 }
 
-/// Issue #915: 未知列は `22000`。
+/// Issue #915: 未知列は `42703`。
 #[test]
-fn unknown_order_by_column_rejects_with_22000() {
+fn unknown_order_by_column_rejects_with_42703() {
     let (core, _guard) = new_core_scan_docs();
     let (mut stream, _users_path) = spawn_with_alice(core);
 
     send_simple_query(&mut stream, "SELECT id FROM docs ORDER BY nope LIMIT 5");
-    expect_error_response_with_sqlstate(&mut stream, "22000");
+    expect_error_response_with_sqlstate(&mut stream, "42703");
     read_ready_for_query(&mut stream);
 }
 /// Issue #1189: スカラー `ORDER BY` 付き広域取得の `EXPLAIN` は本体を実行せず

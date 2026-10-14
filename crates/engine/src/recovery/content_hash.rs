@@ -127,6 +127,10 @@ enum OpTag {
     /// 分割実行版の述語つき `DELETE ... WHERE` 用（Issue #1127。ADR 同上）。
     /// [`for_delete_where_partitioned`] ドキュメント参照。
     DeleteWherePartitioned = 12,
+    /// 単一行 `id` 指定形 `UPDATE` のうち、SET 右辺に式（Issue #1544・SQL-45 のポインタ）を
+    /// 含むもの用。リテラルだけの SET（[`OpTag::UpdateColumns`]）とは別ドメインに分離し、
+    /// 既存の台帳エントリのバイト列を変えない。[`for_update_columns_with_exprs`] 参照。
+    UpdateColumnsExpr = 13,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -948,6 +952,48 @@ pub(crate) fn for_update_columns(
     Ok(b.finish())
 }
 
+/// [`for_update_columns_with_exprs`] の 1 割当ぶんの値側（Issue #1544・SQL-45 のポインタ）。
+pub(crate) enum UpdateColumnHashItem<'a> {
+    /// 束縛済みのリテラル値（[`for_update_columns`] と同じ [`push_value`] 規則）。
+    Value(&'a Value),
+    /// SET 右辺の式の構文木（[`push_dml_expr`] 規則。評価前の要求由来の入力のみ）。
+    Expr(&'a crate::sql::udf_call::Expr),
+}
+
+/// 単一行 `id` 指定形 `UPDATE` のうち SET 右辺に式を含むもの（Issue #1544・SQL-45 の
+/// ポインタ）の内容照合ハッシュ。リテラルだけの SET は従来どおり [`for_update_columns`]
+/// （バイト列不変）を使い、式を 1 つでも含む場合のみ本関数（別タグ
+/// [`OpTag::UpdateColumnsExpr`]）を使う。入力は `id` と、`columns`（呼び出し元が
+/// スキーマ列順へ正規化して渡す）の (列名, 値または式) 列だけで、DB の現在状態・評価結果には
+/// 依存しない。各割当は印 1 バイト（`0` = 値 → [`push_value`]、`1` = 式 →
+/// [`push_dml_expr`]）の後に本体を置く。新しいドメインで過去の記録が無いため legacy 版は
+/// 持たない。式違いの網羅テスト・crash-test は Issue #1545 の担当（本 Issue は
+/// fail-closed に必要な最小の直列化）。
+pub(crate) fn for_update_columns_with_exprs(
+    id: u64,
+    columns: &[(&str, UpdateColumnHashItem<'_>)],
+) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
+    let mut b = HashInputBuilder::new(OpTag::UpdateColumnsExpr);
+    b.push_u64(id);
+    let column_count = u32::try_from(columns.len()).map_err(|_| dml_hash_field_too_large())?;
+    b.push_raw(&column_count.to_le_bytes());
+    for (name, item) in columns {
+        b.push_bytes(name.as_bytes())
+            .map_err(|_| dml_hash_field_too_large())?;
+        match item {
+            UpdateColumnHashItem::Value(value) => {
+                b.push_u8(0);
+                push_value(&mut b, value).map_err(|_| dml_hash_field_too_large())?;
+            }
+            UpdateColumnHashItem::Expr(expr) => {
+                b.push_u8(1);
+                push_set_expr(&mut b, expr)?;
+            }
+        }
+    }
+    Ok(b.finish())
+}
+
 /// `replace_typed_rows_by_text_key`（ファイル形 `INSERT` の置換経路）用（TASK-101
 /// 対象経路 6）。入力: `(key_column, key_value, visibility, path, body,
 /// template_columns)`。削除対象集合・採番される id 等の DB 状態由来の値に加え、
@@ -1051,7 +1097,7 @@ fn dml_hash_field_too_large() -> crate::sql::allowlist::SqlSurfaceError {
 /// `SqlSurfaceError::unsupported`（許可形状外・`42601`）へ写像する。
 pub(crate) fn for_update_where(
     table: &str,
-    assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+    assignments: &[(&str, &crate::sql::allowlist::SetValue)],
     where_predicates: &[crate::sql::allowlist::WherePredicate],
     udf_registry: &crate::sql::udf_call::UdfRegistry,
     // Issue #1061: `SET` 割当のうち `VECTOR` 列を対象とする `InsertLiteral::String`
@@ -1074,7 +1120,7 @@ pub(crate) fn for_update_where(
 fn update_where_with_tag(
     tag: OpTag,
     table: &str,
-    assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+    assignments: &[(&str, &crate::sql::allowlist::SetValue)],
     where_predicates: &[crate::sql::allowlist::WherePredicate],
     udf_registry: &crate::sql::udf_call::UdfRegistry,
     schema: &crate::catalog::TableSchema,
@@ -1097,7 +1143,7 @@ fn update_where_with_tag(
 // 分割実行（core.rs の分割実行 form）が呼ぶ。
 pub(crate) fn for_update_where_partitioned(
     table: &str,
-    assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+    assignments: &[(&str, &crate::sql::allowlist::SetValue)],
     where_predicates: &[crate::sql::allowlist::WherePredicate],
     udf_registry: &crate::sql::udf_call::UdfRegistry,
     schema: &crate::catalog::TableSchema,
@@ -1121,7 +1167,7 @@ pub(crate) fn for_update_where_partitioned(
 /// `legacy_hashes` へだけ渡す（保存対象の正準ハッシュは常に [`for_update_where`]）。
 pub(crate) fn for_update_where_legacy_text_vector(
     table: &str,
-    assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+    assignments: &[(&str, &crate::sql::allowlist::SetValue)],
     where_predicates: &[crate::sql::allowlist::WherePredicate],
     udf_registry: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
@@ -1148,15 +1194,19 @@ pub(crate) fn for_update_where_legacy_text_vector(
 /// 必要がある（該当割当が無ければ正準ハッシュと旧レイアウトのハッシュは
 /// 常に一致するため、legacy 側の計算・受理は不要）。
 pub(crate) fn needs_legacy_vector_hash(
-    assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+    assignments: &[(&str, &crate::sql::allowlist::SetValue)],
     schema: &crate::catalog::TableSchema,
 ) -> bool {
-    assignments.iter().any(|(name, literal)| {
-        matches!(literal, crate::sql::allowlist::InsertLiteral::String(_))
-            && schema
-                .columns
-                .iter()
-                .any(|c| &c.name == name && matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
+    assignments.iter().any(|(name, value)| {
+        matches!(
+            value,
+            crate::sql::allowlist::SetValue::Literal(crate::sql::allowlist::InsertLiteral::String(
+                _
+            ))
+        ) && schema
+            .columns
+            .iter()
+            .any(|c| &c.name == name && matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
     })
 }
 
@@ -1241,17 +1291,31 @@ enum DmlVectorRepr {
 /// 生テキストで連結する（ビット同一）。
 fn push_dml_assignments(
     b: &mut HashInputBuilder,
-    assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+    assignments: &[(&str, &crate::sql::allowlist::SetValue)],
     repr: DmlVectorRepr,
     schema: &crate::catalog::TableSchema,
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-    use crate::sql::allowlist::InsertLiteral;
+    use crate::sql::allowlist::{InsertLiteral, SetValue};
 
     let count = u32::try_from(assignments.len()).map_err(|_| dml_hash_field_too_large())?;
     b.push_raw(&count.to_le_bytes());
-    for (name, literal) in assignments {
+    for (name, value) in assignments {
         b.push_bytes(name.as_bytes())
             .map_err(|_| dml_hash_field_too_large())?;
+        // 式（Issue #1544・SQL-45 のポインタ）はタグ 6 ＋ 構文木の直列化
+        // （[`push_dml_expr`]。`WHERE` の式述語と同じ規則）。ハッシュ入力は要求由来の
+        // 構文木だけで、評価結果・DB の現在状態には依存しない（同じ文の再送は評価値が
+        // 変わっていても同一ハッシュ＝`23505`、式違いは別ハッシュ＝`22023`）。式は組み込み
+        // 関数に限る（束縛段が UDF を拒否済み）ため UDF 閉包の直列化は不要。
+        // タグ 1〜5 は下のリテラル用に使用済みで、6 は本 builder で未使用だった。
+        let literal = match value {
+            SetValue::Literal(literal) => literal,
+            SetValue::Expr(expr) => {
+                b.push_u8(6);
+                push_set_expr(b, expr)?;
+                continue;
+            }
+        };
         match literal {
             InsertLiteral::String(s) => {
                 let vector_dim = if repr == DmlVectorRepr::Canonical {
@@ -1638,6 +1702,55 @@ fn f64_round_trips_decimal(v: f64, raw: &str) -> bool {
         (Some(a), Some(b)) => a == b,
         _ => false,
     }
+}
+
+/// `UPDATE ... SET` 右辺の式を直列化する（Issue #1544）。[`push_dml_expr`] は数値
+/// リテラルを f64 へ正規化するため `2` と `2.0` が同一バイト列になるが、SET の束縛段
+/// （`bind_projection_expr`）は字面から整数算術（`n / 2` は整数除算）と倍精度算術
+/// （`n / 2.0`）を区別する。式違いを同一ハッシュ（再送扱いの `23505`）にしないよう、
+/// 構文木の直列化に続けて、前置き順の各数値リテラルの整数分類（0=整数形でない・
+/// 1=int4・2=int8）を追記する。WHERE 経路の既存ハッシュは変えない。
+fn push_set_expr(
+    b: &mut HashInputBuilder,
+    expr: &crate::sql::udf_call::Expr,
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    use crate::sql::udf_call::{Expr, NumericKind};
+
+    push_dml_expr(b, expr, None)?;
+    fn walk(b: &mut HashInputBuilder, expr: &Expr) {
+        match expr {
+            Expr::Number(raw) => {
+                b.push_u8(match crate::sql::udf_call::classify_integer_literal(raw) {
+                    None => 0,
+                    Some((_, NumericKind::Int4)) => 1,
+                    Some(_) => 2,
+                });
+            }
+            Expr::Call { args, .. } | Expr::Coalesce(args) => {
+                args.iter().for_each(|a| walk(b, a));
+            }
+            Expr::Binary { lhs, rhs, .. } | Expr::NullIf(lhs, rhs) => {
+                walk(b, lhs);
+                walk(b, rhs);
+            }
+            Expr::Case { whens, else_result } => {
+                for (c, r) in whens {
+                    walk(b, c);
+                    walk(b, r);
+                }
+                if let Some(e) = else_result {
+                    walk(b, e);
+                }
+            }
+            Expr::String(_)
+            | Expr::Ident(_)
+            | Expr::Null
+            | Expr::DateLiteral(_)
+            | Expr::TimestampLiteral(_) => {}
+        }
+    }
+    walk(b, expr);
+    Ok(())
 }
 
 /// `Expr` をタグ付き前置順で直列化する（ADR §4.4）。`params` が `Some` の場合、
@@ -3096,7 +3209,7 @@ mod tests {
 
     #[test]
     fn for_update_where_rejects_where_referencing_wasm_udf() {
-        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::allowlist::{InsertLiteral, SetValue};
         use crate::sql::udf_call::{define_wasm_function, Expr, UdfRegistry};
         use std::sync::Arc;
 
@@ -3108,8 +3221,8 @@ mod tests {
             name: "wasm_fn".to_string(),
             args: vec![Expr::Ident("id".to_string())],
         });
-        let value = InsertLiteral::String("ja".to_string());
-        let assignments: [(&str, &InsertLiteral); 1] = [("lang", &value)];
+        let value = SetValue::Literal(InsertLiteral::String("ja".to_string()));
+        let assignments: [(&str, &SetValue); 1] = [("lang", &value)];
         let schema = crate::catalog::TableSchema::new("t", Vec::new());
 
         let err = for_update_where("t", &assignments, &[predicate], &registry, &schema)
@@ -3138,7 +3251,7 @@ mod tests {
     /// `content_hash` になること（正準化の主目的）。
     #[test]
     fn for_update_where_vector_string_and_vector_literal_match_across_surfaces() {
-        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::allowlist::{InsertLiteral, SetValue};
         use crate::sql::udf_call::UdfRegistry;
 
         let schema = vector_dml_test_schema();
@@ -3146,8 +3259,8 @@ mod tests {
         let predicate =
             where_predicate_id_gt_zero(crate::sql::udf_call::Expr::Ident("id".to_string()));
 
-        let sql_literal = InsertLiteral::String("[1,2,3]".to_string());
-        let sql_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &sql_literal)];
+        let sql_literal = SetValue::Literal(InsertLiteral::String("[1,2,3]".to_string()));
+        let sql_assignments: [(&str, &SetValue); 1] = [("embedding", &sql_literal)];
         let sql_hash = for_update_where(
             "t",
             &sql_assignments,
@@ -3157,8 +3270,8 @@ mod tests {
         )
         .expect("SQL-form VECTOR string assignment must hash successfully");
 
-        let nosql_literal = InsertLiteral::Vector(vec![1.0, 2.0, 3.0]);
-        let nosql_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &nosql_literal)];
+        let nosql_literal = SetValue::Literal(InsertLiteral::Vector(vec![1.0, 2.0, 3.0]));
+        let nosql_assignments: [(&str, &SetValue); 1] = [("embedding", &nosql_literal)];
         let nosql_hash =
             for_update_where("t", &nosql_assignments, &[predicate], &registry, &schema)
                 .expect("NoSQL-form VECTOR literal assignment must hash successfully");
@@ -3174,7 +3287,7 @@ mod tests {
     /// いずれも同一 `f32` 列にパースされるため同一ハッシュになる。
     #[test]
     fn for_update_where_vector_string_hash_is_unaffected_by_literal_spelling() {
-        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::allowlist::{InsertLiteral, SetValue};
         use crate::sql::udf_call::UdfRegistry;
 
         let schema = vector_dml_test_schema();
@@ -3183,8 +3296,8 @@ mod tests {
             where_predicate_id_gt_zero(crate::sql::udf_call::Expr::Ident("id".to_string()));
 
         let hash_for = |literal: &str| -> ContentHash {
-            let value = InsertLiteral::String(literal.to_string());
-            let assignments: [(&str, &InsertLiteral); 1] = [("embedding", &value)];
+            let value = SetValue::Literal(InsertLiteral::String(literal.to_string()));
+            let assignments: [(&str, &SetValue); 1] = [("embedding", &value)];
             for_update_where(
                 "t",
                 &assignments,
@@ -3205,7 +3318,7 @@ mod tests {
     /// REAL／DOUBLE の `canonicalize_*` と異なり符号付きゼロを正規化しない）。
     #[test]
     fn for_update_where_vector_negative_zero_is_preserved_and_distinct_from_positive_zero() {
-        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::allowlist::{InsertLiteral, SetValue};
         use crate::sql::udf_call::UdfRegistry;
 
         let schema = vector_dml_test_schema();
@@ -3213,8 +3326,8 @@ mod tests {
         let predicate =
             where_predicate_id_gt_zero(crate::sql::udf_call::Expr::Ident("id".to_string()));
 
-        let neg_zero_string = InsertLiteral::String("[-0,1,2]".to_string());
-        let neg_zero_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &neg_zero_string)];
+        let neg_zero_string = SetValue::Literal(InsertLiteral::String("[-0,1,2]".to_string()));
+        let neg_zero_assignments: [(&str, &SetValue); 1] = [("embedding", &neg_zero_string)];
         let neg_zero_hash = for_update_where(
             "t",
             &neg_zero_assignments,
@@ -3224,9 +3337,8 @@ mod tests {
         )
         .expect("negative-zero vector literal must hash successfully");
 
-        let neg_zero_vector = InsertLiteral::Vector(vec![-0.0, 1.0, 2.0]);
-        let neg_zero_vector_assignments: [(&str, &InsertLiteral); 1] =
-            [("embedding", &neg_zero_vector)];
+        let neg_zero_vector = SetValue::Literal(InsertLiteral::Vector(vec![-0.0, 1.0, 2.0]));
+        let neg_zero_vector_assignments: [(&str, &SetValue); 1] = [("embedding", &neg_zero_vector)];
         let neg_zero_vector_hash = for_update_where(
             "t",
             &neg_zero_vector_assignments,
@@ -3237,8 +3349,8 @@ mod tests {
         .expect("negative-zero Vector literal must hash successfully");
         assert_eq!(neg_zero_hash, neg_zero_vector_hash);
 
-        let pos_zero_string = InsertLiteral::String("[0,1,2]".to_string());
-        let pos_zero_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &pos_zero_string)];
+        let pos_zero_string = SetValue::Literal(InsertLiteral::String("[0,1,2]".to_string()));
+        let pos_zero_assignments: [(&str, &SetValue); 1] = [("embedding", &pos_zero_string)];
         let pos_zero_hash =
             for_update_where("t", &pos_zero_assignments, &[predicate], &registry, &schema)
                 .expect("positive-zero vector literal must hash successfully");
@@ -3251,7 +3363,7 @@ mod tests {
     /// (d) 異なる値は不一致になる。
     #[test]
     fn for_update_where_vector_string_hash_differs_for_different_values() {
-        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::allowlist::{InsertLiteral, SetValue};
         use crate::sql::udf_call::UdfRegistry;
 
         let schema = vector_dml_test_schema();
@@ -3259,8 +3371,8 @@ mod tests {
         let predicate =
             where_predicate_id_gt_zero(crate::sql::udf_call::Expr::Ident("id".to_string()));
 
-        let a = InsertLiteral::String("[1,2,3]".to_string());
-        let a_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &a)];
+        let a = SetValue::Literal(InsertLiteral::String("[1,2,3]".to_string()));
+        let a_assignments: [(&str, &SetValue); 1] = [("embedding", &a)];
         let a_hash = for_update_where(
             "t",
             &a_assignments,
@@ -3270,8 +3382,8 @@ mod tests {
         )
         .expect("well-formed vector literal must hash successfully");
 
-        let b = InsertLiteral::String("[1,2,4]".to_string());
-        let b_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &b)];
+        let b = SetValue::Literal(InsertLiteral::String("[1,2,4]".to_string()));
+        let b_assignments: [(&str, &SetValue); 1] = [("embedding", &b)];
         let b_hash = for_update_where("t", &b_assignments, &[predicate], &registry, &schema)
             .expect("well-formed vector literal must hash successfully");
 
@@ -3286,7 +3398,7 @@ mod tests {
     /// 無いことを保証する。
     #[test]
     fn for_update_where_non_vector_assignment_hash_is_unaffected_by_normalization() {
-        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::allowlist::{InsertLiteral, SetValue};
         use crate::sql::udf_call::UdfRegistry;
 
         let schema = vector_dml_test_schema();
@@ -3294,8 +3406,8 @@ mod tests {
         let predicate =
             where_predicate_id_gt_zero(crate::sql::udf_call::Expr::Ident("id".to_string()));
 
-        let value = InsertLiteral::String("en".to_string());
-        let assignments: [(&str, &InsertLiteral); 1] = [("lang", &value)];
+        let value = SetValue::Literal(InsertLiteral::String("en".to_string()));
+        let assignments: [(&str, &SetValue); 1] = [("lang", &value)];
 
         let canonical_hash = for_update_where(
             "t",
@@ -3336,13 +3448,13 @@ mod tests {
     /// 一致することを固定する。
     #[test]
     fn for_update_where_legacy_text_vector_reproduces_pre_normalization_layout() {
-        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::allowlist::{InsertLiteral, SetValue};
         use crate::sql::udf_call::UdfRegistry;
 
         let registry = UdfRegistry::default();
 
-        let value = InsertLiteral::String("[1,2,3]".to_string());
-        let assignments: [(&str, &InsertLiteral); 1] = [("embedding", &value)];
+        let value = SetValue::Literal(InsertLiteral::String("[1,2,3]".to_string()));
+        let assignments: [(&str, &SetValue); 1] = [("embedding", &value)];
         let legacy_hash = for_update_where_legacy_text_vector("t", &assignments, &[], &registry)
             .expect("legacy-mode vector-column string assignment must hash successfully");
 
@@ -3360,7 +3472,7 @@ mod tests {
     /// なり、タグ 1 へフォールバックしない（fail-closed）。
     #[test]
     fn for_update_where_vector_string_dimension_mismatch_is_rejected_fail_closed() {
-        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::allowlist::{InsertLiteral, SetValue};
         use crate::sql::udf_call::UdfRegistry;
 
         let schema = vector_dml_test_schema();
@@ -3368,8 +3480,8 @@ mod tests {
         let predicate =
             where_predicate_id_gt_zero(crate::sql::udf_call::Expr::Ident("id".to_string()));
 
-        let value = InsertLiteral::String("[1,2]".to_string());
-        let assignments: [(&str, &InsertLiteral); 1] = [("embedding", &value)];
+        let value = SetValue::Literal(InsertLiteral::String("[1,2]".to_string()));
+        let assignments: [(&str, &SetValue); 1] = [("embedding", &value)];
         let err = for_update_where("t", &assignments, &[predicate], &registry, &schema)
             .expect_err("dimension-mismatched vector literal must be rejected");
         assert_eq!(err.wire_code(), "22000");
@@ -3378,23 +3490,23 @@ mod tests {
     /// (h) `needs_legacy_vector_hash` の真偽判定。
     #[test]
     fn needs_legacy_vector_hash_detects_vector_column_string_assignments_only() {
-        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::allowlist::{InsertLiteral, SetValue};
 
         let schema = vector_dml_test_schema();
 
-        let vector_string = InsertLiteral::String("[1,2,3]".to_string());
-        let with_vector_string: [(&str, &InsertLiteral); 1] = [("embedding", &vector_string)];
+        let vector_string = SetValue::Literal(InsertLiteral::String("[1,2,3]".to_string()));
+        let with_vector_string: [(&str, &SetValue); 1] = [("embedding", &vector_string)];
         assert!(needs_legacy_vector_hash(&with_vector_string, &schema));
 
-        let vector_literal = InsertLiteral::Vector(vec![1.0, 2.0, 3.0]);
-        let with_vector_literal: [(&str, &InsertLiteral); 1] = [("embedding", &vector_literal)];
+        let vector_literal = SetValue::Literal(InsertLiteral::Vector(vec![1.0, 2.0, 3.0]));
+        let with_vector_literal: [(&str, &SetValue); 1] = [("embedding", &vector_literal)];
         assert!(
             !needs_legacy_vector_hash(&with_vector_literal, &schema),
             "NoSQL 由来の Vector リテラルは正準・legacy 両方でタグ 5 のため不要"
         );
 
-        let text_only = InsertLiteral::String("en".to_string());
-        let with_text_only: [(&str, &InsertLiteral); 1] = [("lang", &text_only)];
+        let text_only = SetValue::Literal(InsertLiteral::String("en".to_string()));
+        let with_text_only: [(&str, &SetValue); 1] = [("lang", &text_only)];
         assert!(!needs_legacy_vector_hash(&with_text_only, &schema));
     }
 
@@ -3819,6 +3931,23 @@ mod tests {
         assert_ne!(h1, h4, "differing scale must not collapse to the same hash");
     }
 
+    /// Issue #1544（codex P1）: SET 右辺の `n / 2` と `n / 2.0` は束縛段で整数除算と
+    /// 倍精度除算に分かれるため、content hash も区別する（同一なら再送扱いになる）。
+    #[test]
+    fn update_set_expr_hash_distinguishes_integer_and_decimal_literal() {
+        use crate::sql::udf_call::{BinOp, Expr};
+        let div = |lit: &str| Expr::Binary {
+            op: BinOp::Div,
+            lhs: Box::new(Expr::Ident("n".to_string())),
+            rhs: Box::new(Expr::Number(lit.to_string())),
+        };
+        let hash = |e: &Expr| {
+            for_update_columns_with_exprs(1, &[("n", UpdateColumnHashItem::Expr(e))]).expect("hash")
+        };
+        assert_ne!(hash(&div("2")), hash(&div("2.0")));
+        assert_eq!(hash(&div("2")), hash(&div("2")));
+    }
+
     /// Issue #1430（codex P1）: f64 で往復できる数値リテラル（小数・指数表記・先頭ドット
     /// 形を含む）は従来どおりタグ 1＋f64 ビット列で直列化され、既存の台帳ハッシュを変えない。
     /// f64 で往復できない十進値（`1` と `1.0000000000000001` 等）と 2^53 超の整数は
@@ -3873,7 +4002,9 @@ mod tests {
         let registry = UdfRegistry::default();
         let predicates = partitioned_test_predicates();
         let schema = crate::catalog::TableSchema::new(String::new(), Vec::new());
-        let literal = crate::sql::allowlist::InsertLiteral::String("x".to_string());
+        let literal = crate::sql::allowlist::SetValue::Literal(
+            crate::sql::allowlist::InsertLiteral::String("x".to_string()),
+        );
         let assignments = [("title", &literal)];
 
         let atomic_del = for_delete_where("t", &predicates, &registry).expect("hash");
@@ -3915,5 +4046,426 @@ mod tests {
         expected_part.push_bytes(b"t").expect("push");
         push_dml_where_predicates(&mut expected_part, &predicates, &registry).expect("push");
         assert_eq!(part_del, expected_part.finish());
+    }
+
+    // --- Issue #1544: SET 右辺式の content_hash（SQL-45 のポインタ） ------------
+
+    fn set_expr_add(col: &str, n: &str) -> crate::sql::allowlist::SetValue {
+        use crate::sql::udf_call::{BinOp, Expr};
+        crate::sql::allowlist::SetValue::Expr(Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident(col.to_string())),
+            rhs: Box::new(Expr::Number(n.to_string())),
+        })
+    }
+
+    /// リテラルだけの SET を含む述語形 UPDATE のハッシュは、`SetValue` 導入前と同じ
+    /// バイト列（件数・列名・種別タグ 2・生数値）を手組みした参照と一致する。
+    #[test]
+    fn predicate_update_hash_with_literal_set_keeps_the_legacy_byte_layout() {
+        use crate::sql::allowlist::{InsertLiteral, SetValue};
+        use crate::sql::udf_call::UdfRegistry;
+        let registry = UdfRegistry::default();
+        let schema = crate::catalog::TableSchema::new(String::new(), Vec::new());
+        let predicates = partitioned_test_predicates();
+        let value = SetValue::Literal(InsertLiteral::Number("5".to_string()));
+        let hash =
+            for_update_where("t", &[("n", &value)], &predicates, &registry, &schema).expect("hash");
+
+        let mut expected = HashInputBuilder::new(OpTag::UpdateWhere);
+        expected.push_bytes(b"t").expect("push");
+        expected.push_raw(&1u32.to_le_bytes());
+        expected.push_bytes(b"n").expect("push");
+        expected.push_u8(2);
+        expected.push_bytes(b"5").expect("push");
+        push_dml_where_predicates(&mut expected, &predicates, &registry).expect("push");
+        assert_eq!(hash, expected.finish());
+    }
+
+    /// 式の SET はタグ 6 ＋構文木の直列化で、式違い・リテラルとの違いが別ハッシュになり、
+    /// 同じ式は決定的に同一ハッシュになる（評価結果・DB 状態に依存しない）。
+    #[test]
+    fn predicate_update_hash_distinguishes_expressions() {
+        use crate::sql::allowlist::{InsertLiteral, SetValue};
+        use crate::sql::udf_call::UdfRegistry;
+        let registry = UdfRegistry::default();
+        let schema = crate::catalog::TableSchema::new(String::new(), Vec::new());
+        let predicates = partitioned_test_predicates();
+        let hash_of = |v: &SetValue| {
+            for_update_where("t", &[("n", v)], &predicates, &registry, &schema).expect("hash")
+        };
+        let plus1 = set_expr_add("n", "1");
+        let plus2 = set_expr_add("n", "2");
+        assert_eq!(hash_of(&plus1), hash_of(&set_expr_add("n", "1")));
+        assert_ne!(hash_of(&plus1), hash_of(&plus2));
+        assert_ne!(
+            hash_of(&set_expr_add("n", "1")),
+            hash_of(&set_expr_add("m", "1"))
+        );
+        let literal = SetValue::Literal(InsertLiteral::Number("1".to_string()));
+        assert_ne!(hash_of(&plus1), hash_of(&literal));
+        // 分割実行版は別ドメイン。
+        let part =
+            for_update_where_partitioned("t", &[("n", &plus1)], &predicates, &registry, &schema)
+                .expect("hash");
+        assert_ne!(hash_of(&plus1), part);
+        // 式を含む SET に旧 VECTOR 文字列互換ハッシュは不要。
+        assert!(!needs_legacy_vector_hash(&[("n", &plus1)], &schema));
+    }
+
+    /// 単一行形の式入りハッシュは専用ドメインで、リテラルだけの `for_update_columns`
+    /// とは別ハッシュ。式・値・列の違いを区別し、決定的。
+    #[test]
+    fn single_row_update_hash_with_exprs_is_a_separate_deterministic_domain() {
+        use crate::sql::udf_call::{BinOp, Expr};
+        let add = |n: &str| Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("n".to_string())),
+            rhs: Box::new(Expr::Number(n.to_string())),
+        };
+        let e1 = add("1");
+        let e2 = add("2");
+        let v = Value::Text("x".to_string());
+        let h = |cols: &[(&str, UpdateColumnHashItem<'_>)]| {
+            for_update_columns_with_exprs(7, cols).expect("hash")
+        };
+        let base = h(&[("n", UpdateColumnHashItem::Expr(&e1))]);
+        assert_eq!(base, h(&[("n", UpdateColumnHashItem::Expr(&e1))]));
+        assert_ne!(base, h(&[("n", UpdateColumnHashItem::Expr(&e2))]));
+        assert_ne!(base, h(&[("m", UpdateColumnHashItem::Expr(&e1))]));
+        assert_ne!(
+            base,
+            h(&[
+                ("n", UpdateColumnHashItem::Expr(&e1)),
+                ("t", UpdateColumnHashItem::Value(&v)),
+            ])
+        );
+        assert_ne!(
+            for_update_columns_with_exprs(8, &[("n", UpdateColumnHashItem::Expr(&e1))])
+                .expect("hash"),
+            base
+        );
+        // 値と式はドメイン（タグ）が違うため、リテラルだけの既存ハッシュとは一致しない。
+        let literal_only = for_update_columns(7, &[("t", &v)]).expect("hash");
+        assert_ne!(literal_only, h(&[("t", UpdateColumnHashItem::Value(&v))]));
+    }
+    // --- Issue #1545: SET 式 content_hash の golden 固定と網羅（SQL-45／RECOVER-10 のポインタ） ---
+
+    fn to_hex_1545(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// golden 固定（Issue #1545）: Issue #1544 で導入した SET 式のレイアウト
+    /// （単一行形の別ドメイン・述語形／分割実行形のタグ 6＋整数分類サフィックス）を
+    /// バイト単位で固定する。#1544 のマージ以降に台帳へ記録されたエントリの再送が
+    /// `22023` に化けないよう、ずれた場合は永続化済み台帳との互換を壊したことを意味する。
+    #[test]
+    fn set_expr_hash_layouts_are_golden() {
+        use crate::sql::udf_call::UdfRegistry;
+        let registry = UdfRegistry::default();
+        let schema = crate::catalog::TableSchema::new(String::new(), Vec::new());
+        let predicates = partitioned_test_predicates();
+
+        let e = match set_expr_add("n", "1") {
+            crate::sql::allowlist::SetValue::Expr(e) => e,
+            _ => unreachable!("set_expr_add returns an expression"),
+        };
+        let t = Value::Text("x".to_string());
+        let single = for_update_columns_with_exprs(
+            7,
+            &[
+                ("n", UpdateColumnHashItem::Expr(&e)),
+                ("t", UpdateColumnHashItem::Value(&t)),
+            ],
+        )
+        .expect("hash");
+        assert_eq!(
+            to_hex_1545(single.as_bytes()),
+            "d755f2f64231835c62078b362f8399dcf109e7bdf3f4da8fd0d2c6c4ca1259d3",
+            "single-row expression layout changed"
+        );
+
+        let expr_set = set_expr_add("n", "1");
+        let atomic = for_update_where("t", &[("n", &expr_set)], &predicates, &registry, &schema)
+            .expect("hash");
+        assert_eq!(
+            to_hex_1545(atomic.as_bytes()),
+            "0dcf2548053d364bcfb033107ddbbae506c319f5f1891b6666071852b6a6707d",
+            "predicate-form expression layout changed"
+        );
+        let part =
+            for_update_where_partitioned("t", &[("n", &expr_set)], &predicates, &registry, &schema)
+                .expect("hash");
+        assert_eq!(
+            to_hex_1545(part.as_bytes()),
+            "b7e5e4dea88c084a5ae8ba55d462914526bcd1a0f3441c5a081399d8fdd8c385",
+            "partitioned expression layout changed"
+        );
+
+        let lit = crate::sql::allowlist::SetValue::Literal(
+            crate::sql::allowlist::InsertLiteral::Number("5".to_string()),
+        );
+        let lit_hash =
+            for_update_where("t", &[("n", &lit)], &predicates, &registry, &schema).expect("hash");
+        assert_eq!(
+            to_hex_1545(lit_hash.as_bytes()),
+            "497255c42dc3a05b11941596adcec788339d1cd2c0b35766f1758585a1e97833",
+            "literal-only predicate update layout changed"
+        );
+    }
+
+    fn ident(n: &str) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::Ident(n.to_string())
+    }
+    fn num(n: &str) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::Number(n.to_string())
+    }
+    fn text(s: &str) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::String(s.to_string())
+    }
+    fn bin(
+        op: crate::sql::udf_call::BinOp,
+        l: crate::sql::udf_call::Expr,
+        r: crate::sql::udf_call::Expr,
+    ) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::Binary {
+            op,
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        }
+    }
+    fn call(name: &str, args: Vec<crate::sql::udf_call::Expr>) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::Call {
+            name: name.to_string(),
+            args,
+        }
+    }
+
+    /// 単一行形・述語形・分割実行形の 3 経路で同じ式のハッシュを計算する。
+    fn set_expr_hashes(e: &crate::sql::udf_call::Expr) -> [ContentHash; 3] {
+        use crate::sql::allowlist::SetValue;
+        use crate::sql::udf_call::UdfRegistry;
+        let registry = UdfRegistry::default();
+        let schema = crate::catalog::TableSchema::new(String::new(), Vec::new());
+        let predicates = partitioned_test_predicates();
+        let sv = SetValue::Expr(e.clone());
+        [
+            for_update_columns_with_exprs(1, &[("n", UpdateColumnHashItem::Expr(e))])
+                .expect("hash"),
+            for_update_where("t", &[("n", &sv)], &predicates, &registry, &schema).expect("hash"),
+            for_update_where_partitioned("t", &[("n", &sv)], &predicates, &registry, &schema)
+                .expect("hash"),
+        ]
+    }
+
+    /// 式 variant ごとの「別 hash」網羅（Issue #1545・AC1）。式違いを同一 hash にすると
+    /// 再送判定が `23505` で黙って成功してしまうため、全 variant を 3 経路で区別する。
+    #[test]
+    fn set_expr_hash_distinguishes_every_expression_variant() {
+        use crate::sql::udf_call::{BinOp, Expr};
+        let n = || ident("n");
+        let m = || ident("m");
+        let when_gt = |k: &str, r: &str| (bin(BinOp::Gt, n(), num(k)), num(r));
+        let cases: Vec<(&str, Expr, Expr)> = vec![
+            (
+                "column",
+                bin(BinOp::Add, n(), num("1")),
+                bin(BinOp::Add, m(), num("1")),
+            ),
+            (
+                "operand order",
+                bin(BinOp::Sub, n(), m()),
+                bin(BinOp::Sub, m(), n()),
+            ),
+            (
+                "association",
+                bin(BinOp::Mul, bin(BinOp::Add, n(), m()), num("2")),
+                bin(BinOp::Add, n(), bin(BinOp::Mul, m(), num("2"))),
+            ),
+            (
+                "number value",
+                bin(BinOp::Add, n(), num("1")),
+                bin(BinOp::Add, n(), num("2")),
+            ),
+            (
+                "int vs decimal",
+                bin(BinOp::Div, n(), num("2")),
+                bin(BinOp::Div, n(), num("2.0")),
+            ),
+            (
+                "int4 vs int8 boundary",
+                bin(BinOp::Add, n(), num("2147483647")),
+                bin(BinOp::Add, n(), num("2147483648")),
+            ),
+            (
+                "function name",
+                call("abs", vec![n()]),
+                call("ceil", vec![n()]),
+            ),
+            (
+                "function arg order",
+                call("round", vec![n(), num("1")]),
+                call("round", vec![num("1"), n()]),
+            ),
+            (
+                "function arg count",
+                call("abs", vec![n()]),
+                call("abs", vec![n(), n()]),
+            ),
+            (
+                "string literal",
+                call("upper", vec![text("a")]),
+                call("upper", vec![text("b")]),
+            ),
+            ("null vs quoted ident", Expr::Null, ident("NULL")),
+            (
+                "expr vs literal",
+                bin(BinOp::Add, num("5"), num("0")),
+                num("5"),
+            ),
+            (
+                "date vs timestamp",
+                Expr::DateLiteral(0),
+                Expr::TimestampLiteral(0),
+            ),
+            ("date value", Expr::DateLiteral(0), Expr::DateLiteral(1)),
+            (
+                "case when order",
+                Expr::Case {
+                    whens: vec![when_gt("1", "1"), when_gt("2", "2")],
+                    else_result: None,
+                },
+                Expr::Case {
+                    whens: vec![when_gt("2", "2"), when_gt("1", "1")],
+                    else_result: None,
+                },
+            ),
+            (
+                "case else presence",
+                Expr::Case {
+                    whens: vec![when_gt("1", "1")],
+                    else_result: None,
+                },
+                Expr::Case {
+                    whens: vec![when_gt("1", "1")],
+                    else_result: Some(Box::new(num("0"))),
+                },
+            ),
+            (
+                "case then value",
+                Expr::Case {
+                    whens: vec![when_gt("1", "1")],
+                    else_result: Some(Box::new(num("0"))),
+                },
+                Expr::Case {
+                    whens: vec![when_gt("1", "2")],
+                    else_result: Some(Box::new(num("0"))),
+                },
+            ),
+            (
+                "coalesce order",
+                Expr::Coalesce(vec![n(), m()]),
+                Expr::Coalesce(vec![m(), n()]),
+            ),
+            (
+                "nullif swap",
+                Expr::NullIf(Box::new(n()), Box::new(m())),
+                Expr::NullIf(Box::new(m()), Box::new(n())),
+            ),
+            (
+                "coalesce vs nullif",
+                Expr::Coalesce(vec![n(), m()]),
+                Expr::NullIf(Box::new(n()), Box::new(m())),
+            ),
+            (
+                "identifier case",
+                bin(BinOp::Add, ident("N"), num("1")),
+                bin(BinOp::Add, n(), num("1")),
+            ),
+            (
+                "beyond 2^53 integer vs decimal spelling",
+                bin(BinOp::Add, n(), num("9007199254740993")),
+                bin(BinOp::Add, n(), num("9007199254740993.0")),
+            ),
+        ];
+        for (label, a, b) in &cases {
+            let ha = set_expr_hashes(a);
+            let hb = set_expr_hashes(b);
+            let ha2 = set_expr_hashes(a);
+            for path in 0..3 {
+                assert_ne!(ha[path], hb[path], "{label}: path {path} must differ");
+                assert_eq!(ha[path], ha2[path], "{label}: deterministic");
+            }
+        }
+    }
+
+    /// `BinOp` の全 variant が互いに異なる hash になる（`dml_binop_tag` の単射性のピン留め。
+    /// variant 追加時のタグ付け忘れを検出する）。
+    #[test]
+    fn set_expr_hash_distinguishes_every_binop() {
+        use crate::sql::udf_call::BinOp;
+        let ops = [
+            BinOp::Add,
+            BinOp::Sub,
+            BinOp::Mul,
+            BinOp::Div,
+            BinOp::Gt,
+            BinOp::Lt,
+            BinOp::Ge,
+            BinOp::Le,
+            BinOp::Eq,
+        ];
+        let hashes: Vec<_> = ops
+            .iter()
+            .map(|op| set_expr_hashes(&bin(*op, ident("n"), ident("m"))))
+            .collect();
+        for i in 0..hashes.len() {
+            for j in (i + 1)..hashes.len() {
+                for (path, (a, b)) in hashes[i].iter().zip(hashes[j].iter()).enumerate() {
+                    assert_ne!(a, b, "binop {i} vs {j}: path {path}");
+                }
+            }
+        }
+    }
+
+    /// 関数名は小文字化して直列化されるため、大文字小文字違いは同一 hash（評価も同一なので
+    /// 許容する挙動のピン留め）。`+1`／`-n` の構文段正規化は統合テスト
+    /// （`sql45_update_set_expr_resend.rs`）で SQL 経路として固定する。
+    #[test]
+    fn set_expr_hash_ignores_function_name_case() {
+        let a = call("ABS", vec![ident("n")]);
+        let b = call("abs", vec![ident("n")]);
+        assert_eq!(set_expr_hashes(&a), set_expr_hashes(&b));
+    }
+
+    /// 経路間のドメイン分離: 同じ式でも単一行形・述語形・分割実行形は互いに別 hash。
+    #[test]
+    fn set_expr_hash_paths_are_separate_domains() {
+        let h = set_expr_hashes(&bin(crate::sql::udf_call::BinOp::Add, ident("n"), num("1")));
+        assert_ne!(h[0], h[1]);
+        assert_ne!(h[1], h[2]);
+        assert_ne!(h[0], h[2]);
+    }
+
+    /// 割当の個数が違えば別 hash（式 1 項と、式 1 項＋リテラル 1 項）。
+    #[test]
+    fn set_expr_hash_distinguishes_assignment_count() {
+        use crate::sql::allowlist::{InsertLiteral, SetValue};
+        use crate::sql::udf_call::UdfRegistry;
+        let registry = UdfRegistry::default();
+        let schema = crate::catalog::TableSchema::new(String::new(), Vec::new());
+        let predicates = partitioned_test_predicates();
+        let e = set_expr_add("n", "1");
+        let lit = SetValue::Literal(InsertLiteral::String("x".to_string()));
+        let one = for_update_where("t", &[("n", &e)], &predicates, &registry, &schema).expect("h");
+        let two = for_update_where(
+            "t",
+            &[("n", &e), ("t", &lit)],
+            &predicates,
+            &registry,
+            &schema,
+        )
+        .expect("h");
+        assert_ne!(one, two);
     }
 }

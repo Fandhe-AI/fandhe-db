@@ -642,9 +642,10 @@ pub enum SqlSurfaceError {
     /// `DOUBLE` 単独も含む。ERR-6: `42704`）。`name` はクライアントが指定した綴りのみで、
     /// 既存の ENUM 型名・ラベル・テナント情報は含めない（fail-closed）。
     UndefinedType { name: String },
-    /// 索引 DDL が参照した列が対象テーブルに存在しない（TASK-206・INDEX-7、
-    /// Issue #908。[`crate::catalog::CatalogError::ColumnNotFound`] の写像。
-    /// ERR-6: `42703`）。
+    /// 索引 DDL が参照した列が対象テーブルに存在しない、または FROM ありの SELECT／DML が
+    /// 参照した列がスキーマに存在しない（TASK-206・INDEX-7、Issue #908、Issue #2332。
+    /// DDL 側は [`crate::catalog::CatalogError::ColumnNotFound`] の写像。ERR-6: `42703`）。
+    /// `name` はクライアントが指定した綴りのみ（他テナント・候補列名は含めない）。
     UndefinedColumn { name: String },
     /// `FROM` なし `SELECT` の列参照（SQL-43・Issue #2328。`const_select` の束縛段が
     /// 返す）。ERR-6: `42703`。`FROM` なしでは参照可能な表が無く全識別子が一律に
@@ -735,6 +736,15 @@ impl SqlSurfaceError {
     pub(crate) fn transaction_feature_not_supported(detail: impl Into<String>) -> Self {
         SqlSurfaceError::TransactionFeatureNotSupported {
             detail: truncate_for_error(&detail.into()),
+        }
+    }
+
+    /// 未定義列参照（`42703`）を作る共通コンストラクタ。parser・udf_call・declarative_filter・
+    /// view 等の列束縛箇所から呼ばれ、従来 `22000` で返していた未知列を ERR-2 の決定的分類へ揃える
+    /// （Issue #2332）。識別子は `truncate_for_error` で切り詰め、他の情報は加えない。
+    pub(crate) fn undefined_column(name: impl Into<String>) -> Self {
+        SqlSurfaceError::UndefinedColumn {
+            name: truncate_for_error(&name.into()),
         }
     }
 
@@ -3485,12 +3495,33 @@ pub enum ValidatedAlterTable {
     AddPrimaryKey(ValidatedAlterTableAddPrimaryKey),
 }
 
+/// `UPDATE ... SET <col> = <右辺>` の右辺 1 個ぶんの構文表現（Issue #1544・SQL-45 の
+/// ポインタ）。平易なリテラルは従来どおり [`InsertLiteral`]（`content_hash` のバイト列が
+/// 従来と一致する前提）、列参照・算術・組み込み関数を含む式は構文木 [`Expr`] のまま
+/// 保持する。式は行ごとに**更新前の行値**に対して評価する必要があるため、構文段では
+/// 畳み込まず `sql::parser::bind_set_assignments`（意味論的束縛）と `tenant` の
+/// read-merge-write 段が評価を担う。
+///
+/// **BREAKING CHANGE**（Issue #1544）: [`ValidatedUpdate::assignments`]・
+/// [`ValidatedPredicateUpdate::assignments`] の要素型を `InsertLiteral` から本型へ
+/// 変更した。NoSQL 表層など `InsertLiteral` を直接渡していた呼び出し元は
+/// [`SetValue::Literal`] で包む。
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetValue {
+    /// 平易なリテラル（`SET a = 5`・`SET a = NULL`・`SET a = 'x'` 等）。
+    Literal(InsertLiteral),
+    /// 式（`SET a = a + 1`・`SET t = upper(t)` 等）。
+    Expr(Expr),
+}
+
 /// 許可形状の構造判定を通過した UPDATE 文（SQL-17、TASK-191）。`ValidatedInsert` と
 /// 同様、本モジュールが保証するのはここまでの構造情報のみで、列名・値の意味論的
 /// 妥当性は検証しない（`sql::parser::bind_update` の責務）。
 ///
-/// 受理する形は `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE id = <n>
-/// USING OPERATION_ID '<id>' [;]` の単一行・id 指定形のみ（述語形 WHERE・複数テーブル・
+/// 受理する形は `UPDATE <table> SET <col> = <右辺>[, <col> = <右辺>]* WHERE id = <n>
+/// USING OPERATION_ID '<id>' [;]` の単一行・id 指定形のみ（`<右辺>` は平易なリテラルまたは
+/// 列参照・算術・組み込み関数等の式。[`SetValue`]、Issue #1544・SQL-45 のポインタ。
+/// 述語形 WHERE・複数テーブル・
 /// サブクエリは許可リスト外。`RETURNING` はセッション経路
 /// （`validate_update_form_tokens`）でのみ受理し、非セッション入口
 /// `validate_update_tokens` は `42601` 拒否する〔Issue #873・#1182・SQL-21〕）。
@@ -3498,9 +3529,11 @@ pub enum ValidatedAlterTable {
 pub struct ValidatedUpdate {
     /// UPDATE に指定され、カタログ存在確認を通過したテーブル名。
     pub table_name: String,
-    /// SET 句の (列名, リテラル) 対応。宣言順を保持する（`bind_update` の出力順・
+    /// SET 句の (列名, 右辺) 対応。宣言順を保持する（`bind_update` の出力順・
     /// 将来の `operation_id` 内容照合の正規化基準になるため並べ替えない）。
-    pub assignments: Vec<(String, InsertLiteral)>,
+    /// 右辺は平易なリテラルまたは式（[`SetValue`]。Issue #1544・SQL-45 のポインタ）。
+    /// **BREAKING CHANGE**（Issue #1544）: 要素型を `InsertLiteral` から変更した。
+    pub assignments: Vec<(String, SetValue)>,
     /// `WHERE id = <n>` の生数値文字列。範囲検証は `sql::parser::bind_update` が行う。
     pub id_literal: String,
     /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-17）。句の欠落・明示
@@ -3601,6 +3634,10 @@ struct Parser<'a> {
     /// UDF 本体・ORDER BY 式キーと共有されており、それらの一般単項マイナスは従来どおり
     /// `42601` で拒否する契約（fail-closed）を保つため、既定は `false`。
     allow_unary_minus: bool,
+    /// 符号付き数値リテラル `+` + Number を式項として受理してよい文脈かどうか
+    /// （Issue #1544）。`UPDATE ... SET` 右辺の式解析中だけ `true` にする。
+    /// `const_expr_null_args` を立てない SET 経路でも `+5 + 1`・`(+5)` を解析するため。
+    allow_plus_number: bool,
     /// `CHECK ( ... )` 本体（TABLE-16）を解析中かどうか（Issue #1184）。`true` の間は
     /// `NOT ( ... )`・裸の `NOT <式比較>`・数値の `IN`／`BETWEEN` を従来どおり
     /// `42601` にする（脱糖後の形が `check_constraint` の許可形と区別できず、
@@ -3672,6 +3709,7 @@ impl<'a> Parser<'a> {
             allow_null_literal: false,
             const_expr_null_args: false,
             allow_unary_minus: false,
+            allow_plus_number: false,
             in_check_body: false,
             max_insert_rows: None,
             from_ref: None,
@@ -5786,7 +5824,7 @@ impl<'a> Parser<'a> {
             // 続く形（`+1+1`）を式パーサでも解析できるよう 1 ノードの数値へ畳む。
             // `+col`・`+(expr)` は従来どおり既定分岐で `42601`（fail-closed）。
             Some(Token::Punct('+'))
-                if self.const_expr_null_args
+                if (self.const_expr_null_args || self.allow_plus_number)
                     && matches!(self.tokens.get(self.pos + 1), Some(Token::Number(_))) =>
             {
                 self.advance();
@@ -6596,8 +6634,9 @@ impl<'a> Parser<'a> {
     /// SQL-45 のポインタ）。平易なリテラルは [`Self::expect_literal`] と同一の結果を
     /// 返し、列参照を含まない式（算術・組み込み関数・CASE／COALESCE／NULLIF・
     /// `DATE '...'` 等）は構文解析後に `sql::const_expr::fold_const_literal` で
-    /// [`InsertLiteral`] へ畳み込む。`UPDATE ... SET`／UPSERT の `SET` は本入口を
-    /// 使わず `expect_literal` のまま（別 Issue の担当）。
+    /// [`InsertLiteral`] へ畳み込む。`UPDATE ... SET` は
+    /// [`Self::expect_literal_or_set_expr`]（Issue #1544）、UPSERT の `DO UPDATE SET` は
+    /// 本入口を使わず `expect_literal` のまま（別 Issue の担当）。
     ///
     /// 式は要素ごとに木が破棄されるため、ノード予算は要素単位で
     /// [`MAX_EXPR_NODES`] へ戻す（文ごとの共有予算では多行 VALUES が偽の `54000` に
@@ -6633,6 +6672,52 @@ impl<'a> Parser<'a> {
         self.const_expr_null_args = prev_null_args;
         self.expr_node_budget = saved;
         crate::sql::const_expr::fold_const_literal(&parsed?)
+    }
+
+    /// `UPDATE ... SET <col> = <右辺>` の右辺の入口（Issue #1544・SQL-45 のポインタ）。
+    /// 平易なリテラル（直後が `+ - * /` でないもの）は従来どおり [`Self::expect_literal`]
+    /// と同一の [`SetValue::Literal`] を返す（`content_hash` が従来とバイト単位で一致する
+    /// 前提）。列参照・算術・組み込み関数・`CASE` 等を含む式は構文木のまま
+    /// [`SetValue::Expr`] で返し、型照合と行ごとの評価は束縛段（`sql::set_expr`）と
+    /// `tenant` の read-merge-write 段が担う。
+    ///
+    /// INSERT VALUES 用の [`Self::expect_literal_or_const_expr`] とは異なり
+    /// `const_expr_null_args` を立てない（関数引数の裸の `NULL` は列参照扱いのまま。
+    /// 既知の PG 差分）。ノード予算は右辺ごとに [`MAX_EXPR_NODES`] へ戻す。
+    fn expect_literal_or_set_expr(&mut self) -> Result<SetValue, SqlSurfaceError> {
+        let is_expr_start = match self.peek() {
+            Some(Token::Punct('(')) => true,
+            // `-a` のように `-` の直後が数値でない形は式（単項マイナスの脱糖）。
+            Some(Token::Punct('-')) => {
+                !matches!(self.tokens.get(self.pos + 1), Some(Token::Number(_)))
+            }
+            Some(Token::Ident(s)) => {
+                let plain_keyword = !self.quoted_null.contains(&self.pos)
+                    && (s.eq_ignore_ascii_case("true")
+                        || s.eq_ignore_ascii_case("false")
+                        || s.eq_ignore_ascii_case("null"));
+                !plain_keyword
+            }
+            _ => false,
+        };
+        if !is_expr_start {
+            let start = self.pos;
+            let lit = self.expect_literal()?;
+            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+                return Ok(SetValue::Literal(lit));
+            }
+            self.pos = start;
+        }
+        let saved = self.expr_node_budget;
+        self.expr_node_budget = MAX_EXPR_NODES;
+        // `-a`（単項マイナス）は式解析中だけ許可する（`0 - a` へ脱糖される）。
+        let prev_minus = std::mem::replace(&mut self.allow_unary_minus, true);
+        let prev_plus = std::mem::replace(&mut self.allow_plus_number, true);
+        let parsed = self.parse_value_expr(0);
+        self.allow_unary_minus = prev_minus;
+        self.allow_plus_number = prev_plus;
+        self.expr_node_budget = saved;
+        Ok(SetValue::Expr(parsed?))
     }
 
     /// リテラル 1 要素（文字列・数値・`true`/`false`・大小無視の `NULL`・符号付き
@@ -6988,8 +7073,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE <where_form>
-    /// [RETURNING <投影>] USING OPERATION_ID '<id>' [;]` を受理する。`WHERE`
+    /// `UPDATE <table> SET <col> = <右辺>[, <col> = <右辺>]* WHERE <where_form>
+    /// [RETURNING <投影>] USING OPERATION_ID '<id>' [;]` を受理する（`<右辺>` は
+    /// リテラルまたは式。[`Self::expect_literal_or_set_expr`]）。`WHERE`
     /// 句は [`Self::parse_update_where`] が単一行・id 指定形（SQL-17、
     /// TASK-191）と述語形（SQL-19、TASK-192）を振り分ける（[`UpdateWhereForm`]
     /// のドキュメント参照）。`RETURNING`（Issue #873・SQL-21）は構造として
@@ -7093,11 +7179,13 @@ impl<'a> Parser<'a> {
     }
 
     /// UPDATE の SET 句の 1 要素（`<col> = <lit>`）を構造パースする。
-    fn parse_update_assignment(&mut self) -> Result<(String, InsertLiteral), SqlSurfaceError> {
+    ///
+    /// 右辺は [`Self::expect_literal_or_set_expr`]（Issue #1544・SQL-45 のポインタ）。
+    fn parse_update_assignment(&mut self) -> Result<(String, SetValue), SqlSurfaceError> {
         let column = self.expect_ident()?;
         self.expect_punct('=')?;
-        let literal = self.expect_literal()?;
-        Ok((column, literal))
+        let value = self.expect_literal_or_set_expr()?;
+        Ok((column, value))
     }
 
     /// `RETURNING <投影>`（Issue #873・SQL-21）の構造パースのみを行う。書き込み系
@@ -13297,7 +13385,7 @@ enum UpdateWhereForm {
 /// 存在確認前の中間結果（SQL-17・SQL-19、TASK-191・TASK-192）。
 struct ParsedUpdateShape {
     table_name: String,
-    assignments: Vec<(String, InsertLiteral)>,
+    assignments: Vec<(String, SetValue)>,
     where_form: UpdateWhereForm,
     operation_id: Option<OperationId>,
     returning: Option<Projection>,
@@ -13333,9 +13421,9 @@ struct ParsedUpdateShape {
 pub struct ValidatedPredicateUpdate {
     /// UPDATE に指定され、カタログ存在確認を通過したテーブル名。
     pub(crate) table_name: String,
-    /// SET 句の (列名, リテラル) 対応。宣言順を保持する（[`ValidatedUpdate::assignments`]
-    /// と同じ契約）。
-    pub(crate) assignments: Vec<(String, InsertLiteral)>,
+    /// SET 句の (列名, 右辺) 対応。宣言順を保持する（[`ValidatedUpdate::assignments`]
+    /// と同じ契約。右辺は [`SetValue`]）。
+    pub(crate) assignments: Vec<(String, SetValue)>,
     /// `WHERE` 句に含まれる述語（`AND` 結合順）。`SELECT`（[`ValidatedStatement::
     /// where_predicates`]）と同一の許可形状を再利用する。
     pub(crate) where_predicates: Vec<WherePredicate>,
@@ -13356,8 +13444,9 @@ impl ValidatedPredicateUpdate {
         &self.table_name
     }
 
-    /// SET 句の (列名, リテラル) 対応（宣言順）。
-    pub fn assignments(&self) -> &[(String, InsertLiteral)] {
+    /// SET 句の (列名, 右辺) 対応（宣言順。Issue #1544 で右辺を [`SetValue`] へ拡張した
+    /// **BREAKING CHANGE**）。
+    pub fn assignments(&self) -> &[(String, SetValue)] {
         &self.assignments
     }
 
@@ -15646,7 +15735,7 @@ mod tests {
             let stmt = validate_update(&sql, &lookup, LedgerMode::Ledgered).expect("SET NULL");
             assert_eq!(
                 stmt.assignments,
-                vec![("lang".to_string(), InsertLiteral::Null)]
+                vec![("lang".to_string(), SetValue::Literal(InsertLiteral::Null))]
             );
         }
         let stmt = validate_insert(
@@ -15676,8 +15765,21 @@ mod tests {
             let sql = format!(
                 "UPDATE documents SET lang = {lit} WHERE id = 1 USING OPERATION_ID 'op-null-7'"
             );
-            let err = validate_update(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
-            assert_eq!(err.wire_code(), "42601", "{sql}");
+            // UPDATE SET の右辺は式を受理する（Issue #1544・SQL-45 のポインタ）ため、
+            // `+NULL` 以外は構造検証を通り、列参照形（`-NULL` は `0 - NULL`、`foo` は列参照）の
+            // 意味論的な拒否は束縛段（`sql::set_expr`）が担う。
+            let update_result = validate_update(&sql, &lookup, LedgerMode::Ledgered);
+            if lit == "+NULL" {
+                assert_eq!(update_result.unwrap_err().wire_code(), "42601", "{sql}");
+            } else {
+                assert!(
+                    matches!(
+                        update_result.expect("structure ok").assignments.as_slice(),
+                        [(_, SetValue::Expr(_))]
+                    ),
+                    "{sql}"
+                );
+            }
             let sql = format!(
                 "INSERT INTO documents (id, lang) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE \
                  SET lang = {lit} USING OPERATION_ID 'op-null-8'"
@@ -15692,13 +15794,21 @@ mod tests {
     #[test]
     fn quoted_null_is_not_a_null_literal() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_update(
+        // UPDATE SET の引用付き `"NULL"` は NULL 定数ではなく列参照として解析する
+        // （Issue #1544。NULL 定数にならないことが本テストの契約。列の実在は束縛段が判定）。
+        let stmt = validate_update(
             "UPDATE documents SET lang = \"NULL\" WHERE id = 1 USING OPERATION_ID 'op-q-1'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("structure ok");
+        assert_eq!(
+            stmt.assignments,
+            vec![(
+                "lang".to_string(),
+                SetValue::Expr(Expr::Ident("NULL".to_string()))
+            )]
+        );
         let err = validate_insert(
             "INSERT INTO documents (id, lang) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET \
              lang = \"null\" USING OPERATION_ID 'op-q-2'",
@@ -15755,7 +15865,10 @@ mod tests {
         .expect("quoted null table and column names in UPDATE");
         assert_eq!(
             stmt.assignments,
-            vec![("null".to_string(), InsertLiteral::String("x".to_string()))]
+            vec![(
+                "null".to_string(),
+                SetValue::Literal(InsertLiteral::String("x".to_string()))
+            )]
         );
     }
     /// `DEFAULT NULL` は受理して既定値なし（`default: None`）へ正規化し、重複 `DEFAULT`
@@ -15874,9 +15987,91 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "42703");
-        // UPDATE SET は式を受理しない（別 Issue の担当）。
-        let err = validate_update(
+        // UPDATE SET は構文木のまま式を受理する（Issue #1544。型照合・評価は束縛段以降）。
+        let stmt = validate_update(
             "UPDATE documents SET body = 1+1 WHERE id = 1 USING OPERATION_ID 'op-ce-4'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("structure ok");
+        assert!(matches!(
+            stmt.assignments.as_slice(),
+            [(_, SetValue::Expr(Expr::Binary { .. }))]
+        ));
+    }
+
+    /// `UPDATE ... SET` の右辺は平易なリテラルなら従来どおり `SetValue::Literal`
+    /// （`content_hash` が不変の前提）、列参照・算術・組み込み関数・単項マイナスは
+    /// `SetValue::Expr`（Issue #1544・SQL-45 のポインタ）。
+    #[test]
+    fn update_set_accepts_literal_and_expression_forms() {
+        let lookup = catalog_with(&["documents"]);
+        let parse = |rhs: &str| {
+            validate_update(
+                &format!(
+                    "UPDATE documents SET n = {rhs} WHERE id = 1 USING OPERATION_ID 'op-se-1'"
+                ),
+                &lookup,
+                LedgerMode::Ledgered,
+            )
+            .map(|u| u.assignments)
+        };
+        for (rhs, expect_literal) in [
+            ("5", true),
+            ("-5", true),
+            ("'x'", true),
+            ("true", true),
+            ("NULL", true),
+            ("n + 1", false),
+            ("m", false),
+            ("upper(t)", false),
+            ("-n", false),
+            ("(5)", false),
+            ("5 + 0", false),
+            ("+5 + 1", false),
+            ("+1 * n", false),
+            ("(+5)", false),
+            ("CASE WHEN n > 1 THEN 1 ELSE 2 END", false),
+        ] {
+            let a = parse(rhs).unwrap_or_else(|e| panic!("{rhs}: {e:?}"));
+            assert_eq!(a.len(), 1, "{rhs}");
+            assert_eq!(
+                matches!(a[0].1, SetValue::Literal(_)),
+                expect_literal,
+                "{rhs}: {:?}",
+                a[0].1
+            );
+        }
+        assert_eq!(
+            parse("5").unwrap()[0].1,
+            SetValue::Literal(InsertLiteral::Number("5".to_string()))
+        );
+        // 構造として受理しない形は従来どおり `42601`。
+        for rhs in ["+n", "n +", "n + (", "1 2"] {
+            assert_eq!(parse(rhs).unwrap_err().wire_code(), "42601", "{rhs}");
+        }
+    }
+
+    /// 式の複数 SET・述語形でも構文木のまま保持し、宣言順を保つ。
+    /// `ON CONFLICT ... DO UPDATE SET` の式は引き続き対象外（`42601`）。
+    #[test]
+    fn update_set_expressions_in_predicate_form_and_upsert_stays_rejected() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_update_form(
+            "UPDATE documents SET a = 1, b = a + 1 WHERE lang = 'ja' USING OPERATION_ID 'op-se-2'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("predicate form with expression");
+        let ValidatedUpdateForm::Predicate(p) = stmt else {
+            panic!("expected predicate form");
+        };
+        assert_eq!(p.assignments().len(), 2);
+        assert!(matches!(p.assignments()[0].1, SetValue::Literal(_)));
+        assert!(matches!(p.assignments()[1].1, SetValue::Expr(_)));
+        let err = validate_insert(
+            "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET \
+             n = n + 1 USING OPERATION_ID 'op-se-3'",
             &lookup,
             LedgerMode::Ledgered,
         )
@@ -18560,7 +18755,10 @@ mod tests {
         assert_eq!(stmt.table_name, "documents");
         assert_eq!(
             stmt.assignments,
-            vec![("lang".to_string(), InsertLiteral::String("en".to_string()))]
+            vec![(
+                "lang".to_string(),
+                SetValue::Literal(InsertLiteral::String("en".to_string()))
+            )]
         );
         assert_eq!(stmt.id_literal, "1");
         assert_eq!(
@@ -18581,8 +18779,14 @@ mod tests {
         assert_eq!(
             stmt.assignments,
             vec![
-                ("body".to_string(), InsertLiteral::String("x".to_string())),
-                ("lang".to_string(), InsertLiteral::String("ja".to_string())),
+                (
+                    "body".to_string(),
+                    SetValue::Literal(InsertLiteral::String("x".to_string()))
+                ),
+                (
+                    "lang".to_string(),
+                    SetValue::Literal(InsertLiteral::String("ja".to_string()))
+                ),
             ]
         );
     }
@@ -20472,7 +20676,7 @@ mod tests {
             &lookup,
         )
         .expect_err("column outside CTE's exposed set must be rejected");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -20489,14 +20693,14 @@ mod tests {
             &lookup,
         )
         .expect_err("unreferenced CTE projecting a column outside its FROM's exposed set must be rejected");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
 
         let err = validate_sql(
             "WITH x AS (SELECT id FROM documents), unused AS (SELECT id FROM x WHERE body = 'y') SELECT * FROM documents LIMIT 10",
             &lookup,
         )
         .expect_err("unreferenced CTE filtering on a column outside its FROM's exposed set must be rejected");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     /// `table_columns` を実装するフェイク（PR #1100 追加レビュー指摘の
@@ -20540,14 +20744,14 @@ mod tests {
             &lookup,
         )
         .expect_err("unreferenced CTE projecting an unknown real table column must be rejected");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
 
         let err = validate_sql(
             "WITH unused AS (SELECT id FROM documents WHERE missing = 'y') SELECT id FROM documents LIMIT 1",
             &lookup,
         )
         .expect_err("unreferenced CTE filtering on an unknown real table column must be rejected");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
