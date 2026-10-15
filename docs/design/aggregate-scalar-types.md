@@ -36,7 +36,15 @@
 
 ### D2: `SUM(INTEGER/BIGINT)` — 確定時判定による `22003`
 
-結果は `Cell::SignedInteger(i64)`（`BIGINT` 相当）。累積は `i128` の
+> **Issue #2271（TABLE-13・TASK-330 ポインタ）による改訂**: `SUM(BIGINT)` の結果は
+> `numeric(38,0)`（`Cell::Numeric`、OID 1700）になり、`i64` を超える和もエラーにせず値で返す
+> （`Accumulator::BigIntSum`）。`22003` は 38 桁超過のみ。`SUM(INTEGER)` は従来どおり `bigint` で、
+> 以下の確定時判定が適用される。単純形 `HAVING`・`ORDER BY` は厳密比較（`i128`）で互換を保つ。
+> 式内（投影式・`HAVING` 式・`ORDER BY` 式）の `SUM(BIGINT)` は numeric 算術未対応のため `22000` で
+> 拒否し（算術は #1810 の範囲）、バイナリ結果形式は numeric 非対応（WIRE-14）のため `0A000` になる。
+> スカラーサブクエリは scale 0 の numeric と整数列の比較を許可する。
+
+`SUM(INTEGER)` の結果は `Cell::SignedInteger(i64)`（`BIGINT` 相当）。累積は `i128` の
 `checked_add`（`i128` 自体の桁あふれも `22003`）で行い、`Accumulator::finish`
 の確定時に初めて `i64::try_from` を検査する。
 

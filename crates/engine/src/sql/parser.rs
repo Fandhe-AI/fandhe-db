@@ -4932,7 +4932,7 @@ pub(crate) enum AggregateInput {
     /// `INTEGER` 列の裸の列参照（`schema.columns` の添字）。`COUNT`/`SUM`/
     /// `AVG`/`MIN`/`MAX` のすべてで使う（TABLE-13・TASK-196、Issue #881・
     /// #892）。`SUM` の結果は `i128` 累積・確定時に `i64` へ収まるか検査する
-    /// （D2。`Accumulator::IntSum`）。
+    /// （D2。`Accumulator::IntSum`）。`BIGINT` 列の `SUM` は numeric で返す（Issue #2271）。
     IntegerColumn(usize),
     /// `SMALLINT` 列の裸の列参照。受理範囲・累積方式は `IntegerColumn` と共有する
     /// （値表現が同一〔`ScalarRef::Integer`〕）。結果型のみ異なり、`SUM` は bigint、
@@ -7249,6 +7249,8 @@ fn resolve_group_by_key(
 /// `DATE`/`TIMESTAMP` の `MIN`/`MAX`（`Cell::Date`/`Cell::Timestamp`）は
 /// 黙って `false` へ縮退させず、`TEXT` と同じく型不整合 `22000` で拒否する
 /// （`COUNT` はいずれの列型でも結果が `Cell::Integer` になるため対象外）。
+/// `SUM(<BIGINT>)`（Issue #2271。scale 0 の `Cell::Numeric`）は
+/// [`crate::sql::group_by::having_matches`] が厳密比較に対応しているため対象に含めない。
 pub(crate) fn check_having_target_is_numeric(
     item: &BoundAggregateItem,
     target_name: &str,
@@ -7461,6 +7463,11 @@ fn bind_group_by_clause(
     })
 }
 
+/// 式（`HAVING`／`ORDER BY`）内で扱えない集計結果型を表す番兵の列型（`BYTEA`）。
+/// 式束縛が「式内で使えない列」として `22000` で拒否するため、`NUMERIC` 結果（`SUM(BIGINT)`・
+/// `AVG(NUMERIC)` 等）や型を決められない組み合わせをこの値で表現する（fail-closed）。
+const EXPR_UNSUPPORTED_COLUMN_TYPE: ColumnType = ColumnType::Bytea;
+
 /// 集計項目の結果セルに対応する静的な列型（Issue #1188。グループ出力行ビューの合成列型）。
 /// 実行時のセル variant（`Accumulator::finish`）と対応させる: `COUNT`・`id` 系は
 /// `Cell::Integer(u64)`／整数列は `Cell::SignedInteger` → `BIGINT`、浮動小数・`AVG`・式入力は
@@ -7471,10 +7478,15 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
     match item.func {
         AggregateFunc::Count => ColumnType::BigInt,
         AggregateFunc::Avg => match item.input {
-            AggregateInput::NumericColumn { .. } => ColumnType::Bytea,
+            AggregateInput::NumericColumn { .. } => EXPR_UNSUPPORTED_COLUMN_TYPE,
             _ => ColumnType::Double,
         },
         AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => match &item.input {
+            // Issue #2271（TABLE-13）: `SUM(BIGINT)` は `Cell::Numeric` を返すため、
+            // 式内では扱えない列（`BYTEA`）として `22000` で拒否する。
+            AggregateInput::BigIntColumn(_) if matches!(item.func, AggregateFunc::Sum) => {
+                EXPR_UNSUPPORTED_COLUMN_TYPE
+            }
             AggregateInput::IdU64
             | AggregateInput::IntegerColumn(_)
             | AggregateInput::SmallIntColumn(_)
@@ -7485,7 +7497,7 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
             AggregateInput::TextColumn(_) => ColumnType::Text,
             AggregateInput::DateColumn(_) => ColumnType::Date,
             AggregateInput::TimestampColumn(_) => ColumnType::Timestamp,
-            _ => ColumnType::Bytea,
+            _ => EXPR_UNSUPPORTED_COLUMN_TYPE,
         },
     }
 }

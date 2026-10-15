@@ -104,10 +104,10 @@ fn insert_null_row(core: &EngineCore, ctx: &PolicyContext, id: u64, lang: &str, 
     .expect("insert with all-NULL optional columns should succeed");
 }
 
-// --- 22003: SUM(INTEGER/BIGINT) の桁あふれ ----------------------------------
+// --- SUM(BIGINT) は numeric(38,0)（Issue #2271・TABLE-13・TASK-330） ---------
 
 #[test]
-fn sum_bigint_overflow_is_22003() {
+fn sum_bigint_beyond_i64_returns_numeric_instead_of_22003() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -141,10 +141,16 @@ fn sum_bigint_overflow_is_22003() {
         "op-2",
     );
 
-    let err = core
+    // i64::MAX + 1 は i64 を超えるが、numeric として厳密な値を返す。
+    let result = core
         .execute_sql(&alice, &format!("SELECT SUM(b) FROM {TABLE}"))
-        .unwrap_err();
-    assert_eq!(err.wire_code(), "22003");
+        .expect("SUM(BIGINT) beyond i64 must return numeric");
+    assert_eq!(
+        result.rows[0].cells,
+        vec![Cell::Numeric(
+            Decimal::from_parts(i128::from(i64::MAX) + 1, 0).unwrap()
+        )]
+    );
 }
 
 /// `SUM(INTEGER)` は `i32` の範囲を超えても、`BIGINT` 相当（`i64`）に収まれば
@@ -237,7 +243,12 @@ fn sum_bigint_transient_overflow_of_partial_sum_still_succeeds_if_final_value_fi
     let result = core
         .execute_sql(&alice, &format!("SELECT SUM(b) FROM {TABLE}"))
         .expect("transient overflow of the partial sum must not fail if the final value fits");
-    assert_eq!(result.rows[0].cells, vec![Cell::SignedInteger(i64::MAX)]);
+    assert_eq!(
+        result.rows[0].cells,
+        vec![Cell::Numeric(
+            Decimal::from_parts(i128::from(i64::MAX), 0).unwrap()
+        )]
+    );
 }
 
 // --- 22003: SUM/AVG(NUMERIC) の 38 桁上限 -----------------------------------
@@ -806,4 +817,476 @@ fn scalar_index_warm_path_sum_matches_full_scan_oracle() {
             .expect("WHERE lang = 'ja' with SUM(n) must succeed on both cold and hot runs");
         assert_eq!(result.rows[0].cells, vec![Cell::SignedInteger(9)]);
     }
+}
+// --- Issue #2271: SUM(BIGINT) → numeric(38,0)（TABLE-13・SQL-13・SQL-30・TASK-330）---
+
+fn dec0(v: i128) -> Cell {
+    Cell::Numeric(Decimal::from_parts(v, 0).unwrap())
+}
+
+fn insert_b(core: &EngineCore, ctx: &PolicyContext, id: u64, lang: &str, n: i32, b: i64) {
+    insert_full_row(
+        core,
+        ctx,
+        id,
+        lang,
+        n,
+        b,
+        1.0,
+        1.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        &format!("op-b-{id}"),
+    );
+}
+
+/// 結果列の静的型は `numeric(38,0)`、`SUM(INTEGER)` は `bigint` のまま。
+/// 負方向（`i64::MIN` 2 行）も i64 を超えて厳密に返す。
+#[test]
+fn sum_bigint_column_type_is_numeric_and_integer_stays_bigint() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert_b(&core, &alice, 1, "ja", 1, i64::MIN);
+    insert_b(&core, &alice, 2, "ja", 2, i64::MIN);
+
+    let result = core
+        .execute_sql(&alice, &format!("SELECT SUM(b), SUM(n) FROM {TABLE}"))
+        .expect("SUM(BIGINT) below i64::MIN must return numeric");
+    assert_eq!(
+        result.rows[0].cells,
+        vec![dec0(2 * i128::from(i64::MIN)), Cell::SignedInteger(3)]
+    );
+    let tys: Vec<_> = result
+        .columns
+        .iter()
+        .map(|c| match c {
+            engine::sql::exec::ColumnMeta::Computed { ty, .. } => ty.clone(),
+            other => panic!("unexpected column meta {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        tys,
+        vec![
+            Some(ColumnType::Numeric {
+                precision: 38,
+                scale: 0
+            }),
+            Some(ColumnType::BigInt)
+        ]
+    );
+}
+
+/// 空集合と NULL のみは NULL。
+#[test]
+fn sum_bigint_of_empty_and_null_only_is_null() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let empty = core
+        .execute_sql(&alice, &format!("SELECT SUM(b) FROM {TABLE}"))
+        .unwrap();
+    assert_eq!(empty.rows[0].cells, vec![Cell::Null]);
+    insert_null_row(&core, &alice, 1, "ja", "op-null-1");
+    let nulls = core
+        .execute_sql(&alice, &format!("SELECT SUM(b) FROM {TABLE}"))
+        .unwrap();
+    assert_eq!(nulls.rows[0].cells, vec![Cell::Null]);
+}
+
+/// GROUP BY・単純形 HAVING（i64 超の閾値を厳密比較）・ORDER BY が numeric で動く。
+#[test]
+fn sum_bigint_group_by_having_and_order_by_use_exact_numeric() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert_b(&core, &alice, 1, "big", 1, i64::MAX);
+    insert_b(&core, &alice, 2, "big", 1, i64::MAX);
+    insert_b(&core, &alice, 3, "small", 1, 5);
+
+    let r = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT lang, SUM(b) AS s FROM {TABLE} GROUP BY lang ORDER BY s DESC"),
+        )
+        .unwrap();
+    assert_eq!(
+        r.rows.iter().map(|x| x.cells.clone()).collect::<Vec<_>>(),
+        vec![
+            vec![
+                Cell::Text("big".to_string()),
+                dec0(2 * i128::from(i64::MAX))
+            ],
+            vec![Cell::Text("small".to_string()), dec0(5)],
+        ]
+    );
+
+    // 閾値を超えた（i64 超の和を持つ）グループだけが残る。
+    let r = core
+        .execute_sql(
+            &alice,
+            &format!(
+                "SELECT lang, SUM(b) AS s FROM {TABLE} GROUP BY lang \
+                 HAVING s > 9000000000000000"
+            ),
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].cells[0], Cell::Text("big".to_string()));
+
+    let r = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT lang, SUM(b) AS s FROM {TABLE} GROUP BY lang HAVING s <= 5"),
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].cells[0], Cell::Text("small".to_string()));
+}
+
+/// 式内での SUM(BIGINT) は numeric 算術未対応のため fail-closed（22000）。
+#[test]
+fn sum_bigint_inside_expression_is_rejected_fail_closed() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert_b(&core, &alice, 1, "ja", 1, 1);
+    let err = core
+        .execute_sql(&alice, &format!("SELECT SUM(b) + 1 FROM {TABLE}"))
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22000");
+}
+
+/// ウィンドウ関数の SUM(BIGINT) も numeric（i64 超の累積も値を返す）。
+#[test]
+fn sum_bigint_window_returns_numeric_beyond_i64() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert_b(&core, &alice, 1, "ja", 1, i64::MAX);
+    insert_b(&core, &alice, 2, "ja", 1, i64::MAX);
+    let r = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id, SUM(b) OVER () FROM {TABLE} LIMIT 10"),
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 2);
+    for row in &r.rows {
+        assert_eq!(row.cells[1], dec0(2 * i128::from(i64::MAX)));
+    }
+}
+
+/// RLS: 他テナントの行は和に入らない。
+#[test]
+fn sum_bigint_excludes_other_tenant_rows() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let bob = ctx_for("bob");
+    insert_b(&core, &alice, 1, "ja", 1, 10);
+    insert_b(&core, &bob, 2, "ja", 1, i64::MAX);
+    let r = core
+        .execute_sql(&alice, &format!("SELECT SUM(b) FROM {TABLE}"))
+        .unwrap();
+    assert_eq!(r.rows[0].cells, vec![dec0(10)]);
+}
+/// 浮動小数列（REAL/DOUBLE）と `SUM(BIGINT)`（scale 0 numeric）のスカラー
+/// サブクエリ比較は、変更前と同じく数値族間比較として受理される（Issue #2271）。
+#[test]
+fn float_column_compares_with_sum_bigint_scalar_subquery() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert_full_row(
+        &core,
+        &alice,
+        1,
+        "ja",
+        1,
+        10,
+        5.0,
+        5.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-1",
+    );
+    insert_full_row(
+        &core,
+        &alice,
+        2,
+        "ja",
+        1,
+        20,
+        50.0,
+        50.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-2",
+    );
+    // SUM(b) = 30
+    for col in ["r", "d"] {
+        let r = core
+            .execute_sql(
+                &alice,
+                &format!(
+                    "SELECT id FROM {TABLE} WHERE {col} < (SELECT SUM(b) FROM {TABLE}) LIMIT 10"
+                ),
+            )
+            .expect("float column vs SUM(BIGINT) must be accepted");
+        assert_eq!(r.rows.len(), 1, "{col}");
+    }
+}
+
+/// `IN`／`NOT IN` の内側に集計（`SUM(BIGINT)`）は元々置けない（42601）。SUM の戻り値型
+/// 変更（Issue #2271）の前後で挙動が変わらないことを固定する。
+#[test]
+fn in_subquery_with_sum_bigint_stays_unsupported() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    for kw in ["IN", "NOT IN"] {
+        let err = core
+            .execute_sql(
+                &alice,
+                &format!("SELECT id FROM {TABLE} WHERE b {kw} (SELECT SUM(b) FROM {TABLE} LIMIT 10) LIMIT 10"),
+            )
+            .expect_err("aggregate inside IN subquery is unsupported");
+        assert_eq!(err.wire_code(), "42601", "{kw}");
+    }
+}
+
+/// 整数列・浮動小数列の `IN`／`NOT IN` は、内側が scale 0 の numeric（`SUM(BIGINT)` と
+/// 同じ型）でも受理され、numeric 比較の意味論で照合する（Issue #2271）。
+#[test]
+fn in_and_not_in_accept_scale0_numeric_inner_column() {
+    let path = unique_db_path("aggregate-scale0-in");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("b", ColumnType::BigInt, true),
+                ColumnDef::new("d", ColumnType::Double, true),
+                ColumnDef::new(
+                    "q",
+                    ColumnType::Numeric {
+                        precision: 38,
+                        scale: 0,
+                    },
+                    true,
+                ),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let alice = ctx_for("alice");
+    // (id, b, d, q): q は b と一致する行（id 1）・しない行（id 2）・NULL（id 3）・
+    // i64 を超える numeric（id 4。どの b・d とも一致しない）。
+    for (id, b, d, q) in [
+        (1, "10", "10.0", "10"),
+        (2, "20", "25.0", "11"),
+        (3, "30", "30.0", "NULL"),
+        (4, "40", "40.0", "99999999999999999999"),
+    ] {
+        core.execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO t (id, embedding, b, d, q) VALUES \
+                 ({id}, '[0.1,0.2]', {b}, {d}, {q}) USING OPERATION_ID 'op-{id}'"
+            ),
+        )
+        .expect("insert");
+    }
+    let ids = |sql: &str| -> Vec<u64> {
+        let r = core.execute_sql(&alice, sql).expect("must be accepted");
+        let mut v: Vec<u64> = r
+            .rows
+            .iter()
+            .map(|row| match &row.cells[0] {
+                Cell::Integer(n) => *n,
+                other => panic!("unexpected cell {other:?}"),
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    let nn = "SELECT q FROM t WHERE q IS NOT NULL LIMIT 10";
+    // 整数列 IN: q の集合は {10, 11, 99999999999999999999}
+    assert_eq!(
+        ids(&format!("SELECT id FROM t WHERE b IN ({nn}) LIMIT 10")),
+        vec![1]
+    );
+    assert_eq!(
+        ids(&format!("SELECT id FROM t WHERE b NOT IN ({nn}) LIMIT 10")),
+        vec![2, 3, 4]
+    );
+    // 浮動小数列 IN／NOT IN
+    assert_eq!(
+        ids(&format!("SELECT id FROM t WHERE d IN ({nn}) LIMIT 10")),
+        vec![1]
+    );
+    assert_eq!(
+        ids(&format!("SELECT id FROM t WHERE d NOT IN ({nn}) LIMIT 10")),
+        vec![2, 3, 4]
+    );
+    // 内側に NULL を含む NOT IN は、真になる行が無い（IN は一致行のみ）。
+    let with_null = "SELECT q FROM t LIMIT 10";
+    assert_eq!(
+        ids(&format!(
+            "SELECT id FROM t WHERE b NOT IN ({with_null}) LIMIT 10"
+        )),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        ids(&format!(
+            "SELECT id FROM t WHERE d NOT IN ({with_null}) LIMIT 10"
+        )),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        ids(&format!(
+            "SELECT id FROM t WHERE b IN ({with_null}) LIMIT 10"
+        )),
+        vec![1]
+    );
+    // スカラー比較: i64 を超える numeric との厳密比較（int_compare の範囲外写像）。
+    assert_eq!(
+        ids("SELECT id FROM t WHERE b < (SELECT q FROM t WHERE id = 4 LIMIT 1) LIMIT 10"),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(
+        ids("SELECT id FROM t WHERE b = (SELECT q FROM t WHERE id = 4 LIMIT 1) LIMIT 10"),
+        Vec::<u64>::new()
+    );
+}
+
+/// 整数列と `SUM(BIGINT)` のスカラー比較は、`i64` を超える合計でも厳密に比べる。
+#[test]
+fn integer_column_compares_with_huge_sum_bigint_scalar_subquery() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    // 列値は式評価器の正確表現範囲（2^53 未満）に収め、合計だけ i64 を超えさせる
+    // ことはできないため 2^54 近傍（2^53 を超える numeric）で厳密比較を確認する。
+    insert_b(&core, &alice, 1, "ja", 1, 9_007_199_254_740_991);
+    insert_b(&core, &alice, 2, "ja", 1, 9_007_199_254_740_991);
+    let lt = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE b < (SELECT SUM(b) FROM {TABLE}) LIMIT 10"),
+        )
+        .expect("accepted");
+    assert_eq!(lt.rows.len(), 2);
+    let eq = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE b = (SELECT SUM(b) FROM {TABLE}) LIMIT 10"),
+        )
+        .expect("accepted");
+    assert_eq!(eq.rows.len(), 0);
+}
+
+/// 2^53 を超える `SUM(BIGINT)` と REAL／DOUBLE 列のスカラー比較は、float8 と numeric の
+/// 比較として受理される（`22003` にならない。Issue #2271。Cursor Bugbot 指摘の回帰）。
+#[test]
+fn float_column_compares_with_sum_bigint_beyond_2_pow_53() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    // 列値は 2^53 未満。3 行の合計 27_000_000_000_000_000 は 2^53 を超える。
+    for (id, r, d) in [(1, 1.0, 1.0), (2, 3.0e16, 3.0e16), (3, 2.0e16, 2.0e16)] {
+        insert_full_row(
+            &core,
+            &alice,
+            id,
+            "ja",
+            1,
+            9_000_000_000_000_000,
+            r,
+            d,
+            "1.00",
+            "2024-01-01",
+            "2024-01-01 00:00:00",
+            &format!("op-{id}"),
+        );
+    }
+    let count = |sql: String| core.execute_sql(&alice, &sql).expect("accepted").rows.len();
+    for col in ["r", "d"] {
+        let q = |op: &str| {
+            format!("SELECT id FROM {TABLE} WHERE {col} {op} (SELECT SUM(b) FROM {TABLE}) LIMIT 10")
+        };
+        assert_eq!(count(q("<")), 2, "{col} <");
+        assert_eq!(count(q(">")), 1, "{col} >");
+        assert_eq!(count(q("<>")), 3, "{col} <>");
+    }
+}
+
+/// scale 0 の numeric 列が 2^53 を超える値を持つとき、REAL／DOUBLE 列との
+/// IN／NOT IN も受理される（float8 へ丸めて比較する）。
+#[test]
+fn float_column_in_and_not_in_with_scale0_numeric_beyond_2_pow_53() {
+    let path = unique_db_path("aggregate-scale0-big-in");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("d", ColumnType::Double, true),
+                ColumnDef::new("r", ColumnType::Real, true),
+                ColumnDef::new(
+                    "q",
+                    ColumnType::Numeric {
+                        precision: 38,
+                        scale: 0,
+                    },
+                    true,
+                ),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let alice = ctx_for("alice");
+    for (id, d, r, q) in [
+        (1, "1.0e16", "1.0", "10000000000000000"),
+        (2, "2.0", "2.0", "10000000000000001"),
+    ] {
+        core.execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO t (id, embedding, d, r, q) VALUES \
+                 ({id}, '[0.1,0.2]', {d}, {r}, {q}) USING OPERATION_ID 'op-{id}'"
+            ),
+        )
+        .expect("insert");
+    }
+    let count = |sql: &str| core.execute_sql(&alice, sql).expect("accepted").rows.len();
+    let inner = "SELECT q FROM t LIMIT 10";
+    for col in ["d", "r"] {
+        let hits = count(&format!(
+            "SELECT id FROM t WHERE {col} IN ({inner}) LIMIT 10"
+        ));
+        let miss = count(&format!(
+            "SELECT id FROM t WHERE {col} NOT IN ({inner}) LIMIT 10"
+        ));
+        assert_eq!(hits + miss, 2, "{col}");
+    }
+    // 1.0e16 は numeric 10000000000000000 と float8 として等しい。
+    assert_eq!(
+        count(&format!("SELECT id FROM t WHERE d IN ({inner}) LIMIT 10")),
+        1
+    );
+    assert_eq!(
+        count("SELECT id FROM t WHERE d < (SELECT q FROM t WHERE id = 2 LIMIT 1) LIMIT 10"),
+        1
+    );
 }

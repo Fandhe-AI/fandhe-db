@@ -1221,7 +1221,11 @@ mod tests {
         // `count` 列は 0..5（合計 10）。`COUNT` 列の `Cell::Integer(u64)` は BIGINT へ正規化される。
         assert_eq!(
             out.rows[0].cells,
-            vec![Cell::Integer(5), Cell::SignedInteger(10)]
+            vec![
+                Cell::Integer(5),
+                // Issue #2271: `SUM(BIGINT)` は scale 0 の numeric。
+                Cell::Numeric(crate::numeric::Decimal::from_parts(10, 0).unwrap())
+            ]
         );
         assert_eq!(out.columns.len(), 2);
     }

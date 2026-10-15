@@ -843,7 +843,7 @@ fn static_validate_subquery_predicates(
                     ));
                 };
                 let (_, family) = validate_in_target_column(column, owner_schema(chain)?)?;
-                if inner_value_family(inner_meta) != Some(family) {
+                if !in_family_compatible(inner_meta, family) {
                     return Err(in_family_mismatch(column));
                 }
             }
@@ -1114,6 +1114,18 @@ fn validate_in_target_column<'a>(
     }
 }
 
+/// `IN`／`NOT IN` の内側投影列が対象列の値族と比較可能か。値族の完全一致に加え、
+/// scale 0 の `NUMERIC`（`SUM(BIGINT)` 等。Issue #2271）は整数・浮動小数列の対象と
+/// 比較できる（PostgreSQL と同じ。従来受理していた比較を `SUM` の戻り値型変更で
+/// 拒否しない）。実行時のセル取り出しは [`resolve_in_subquery`] が担う。
+fn in_family_compatible(inner_meta: &ColumnMeta, family: SubqueryValueFamily) -> bool {
+    inner_value_family(inner_meta) == Some(family)
+        || (matches!(
+            family,
+            SubqueryValueFamily::Integer | SubqueryValueFamily::Float
+        ) && is_scale0_numeric_meta(inner_meta))
+}
+
 /// `IN` の内側投影列と対象列の値族不一致の静的エラー（`resolve_in_subquery` 用）。
 fn in_family_mismatch(column: &str) -> SqlSurfaceError {
     SqlSurfaceError::invalid_input(format!(
@@ -1174,7 +1186,7 @@ fn resolve_in_subquery(
             if is_deferrable_runtime_error(&e) {
                 let (_, family) = validate_in_target_column(column, owner_schema(outer_scopes)?)?;
                 if let Some([inner_meta]) = meta_sink.as_deref() {
-                    if inner_value_family(inner_meta) != Some(family) {
+                    if !in_family_compatible(inner_meta, family) {
                         return Err(in_family_mismatch(column));
                     }
                 }
@@ -1199,7 +1211,7 @@ fn resolve_in_subquery(
         .ok_or_else(|| SqlSurfaceError::Internal {
             detail: "subquery result missing projected column metadata".to_string(),
         })?;
-    if inner_value_family(inner_meta) != Some(family) {
+    if !in_family_compatible(inner_meta, family) {
         return Err(in_family_mismatch(column));
     }
 
@@ -1245,6 +1257,9 @@ fn resolve_in_subquery(
                 // 疑似列 `id` は `u64` 全域を取り得るため、`i128` で保持して落とさない
                 // （`i64` 超の値も等価比較の対象とする。範囲外の写像は `int_compare` が担う）。
                 Cell::Integer(n) => ints.push(i128::from(*n)),
+                // scale 0 の numeric（`SUM(BIGINT)`。Issue #2271）は `i128` の厳密値として
+                // 保持し、`i64` 超でも誤った一致・不一致を出さない。
+                Cell::Numeric(d) if d.scale() == 0 => ints.push(d.unscaled()),
                 _ => return Err(unexpected_cell_type()),
             },
             SubqueryValueFamily::Float => match cell {
@@ -1258,6 +1273,12 @@ fn resolve_in_subquery(
                     return Err(SqlSurfaceError::invalid_input(
                         "subquery returned a non-finite number",
                     ))
+                }
+                // scale 0 の numeric（Issue #2271）は float8 へ写して比較する
+                // （PostgreSQL の float8 × numeric 比較と同じく numeric 側を float8 へ変換）。
+                Cell::Numeric(d) if d.scale() == 0 => {
+                    let f = d.unscaled() as f64;
+                    floats.push(if f == 0.0 { 0.0 } else { f });
                 }
                 _ => return Err(unexpected_cell_type()),
             },
@@ -1686,6 +1707,16 @@ fn number_cell_text(cell: &Cell) -> Result<String, SqlSurfaceError> {
     match cell {
         Cell::Integer(n) => Ok(n.to_string()),
         Cell::SignedInteger(n) => Ok(n.to_string()),
+        // scale 0 の numeric（`SUM(BIGINT)`。Issue #2271）を浮動小数列との比較用に写す。
+        // 2^53 以上は正確表現ガードに拒否されるため小数点付きで表す。
+        Cell::Numeric(d) if d.scale() == 0 => {
+            let n = d.unscaled();
+            if n.unsigned_abs() >= 9_007_199_254_740_992 {
+                Ok(format!("{n}.0"))
+            } else {
+                Ok(n.to_string())
+            }
+        }
         // 2^53 以上の整数値は全桁の整数リテラルになり、式束縛の正確表現ガード
         // （`parse_number_literal`）に拒否されるため、小数点付きで表す。
         Cell::Float(f)
@@ -1701,6 +1732,16 @@ fn number_cell_text(cell: &Cell) -> Result<String, SqlSurfaceError> {
     }
 }
 
+/// 内側投影列が scale 0 の `NUMERIC`（`SUM(BIGINT)` 等。整数として厳密に扱える）か。
+fn is_scale0_numeric_meta(meta: &ColumnMeta) -> bool {
+    match meta {
+        ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
+            matches!(ty, ColumnType::Numeric { scale: 0, .. })
+        }
+        _ => false,
+    }
+}
+
 /// スカラーサブクエリ比較の内側投影列の値族が対象列の値族と比較可能かを検証する
 /// （数値族どうしは可。内側の結果行数・値に依存しない静的検証）。
 fn check_scalar_family_compatible(
@@ -1709,7 +1750,16 @@ fn check_scalar_family_compatible(
     target_family: SubqueryValueFamily,
 ) -> Result<(), SqlSurfaceError> {
     let compatible = match inner_value_family(inner_meta) {
-        Some(inner) => inner == target_family || (inner.is_number() && target_family.is_number()),
+        Some(inner) => {
+            inner == target_family
+                || (inner.is_number() && target_family.is_number())
+                // Issue #2271（TABLE-13）: `SUM(BIGINT)` は scale 0 の numeric。整数列との
+                // 比較は PostgreSQL と同じく許可し、実行時は `i128` の厳密比較で行う。
+                || (matches!(
+                    target_family,
+                    SubqueryValueFamily::Integer | SubqueryValueFamily::Float
+                ) && is_scale0_numeric_meta(inner_meta))
+        }
         None => false,
     };
     if !compatible {
@@ -1878,12 +1928,15 @@ fn scalar_literal_predicate(
             }
         }
         SubqueryValueFamily::Integer
-            if matches!(cell, Cell::Integer(_) | Cell::SignedInteger(_)) =>
+            if matches!(cell, Cell::Integer(_) | Cell::SignedInteger(_))
+                || matches!(cell, Cell::Numeric(d) if d.scale() == 0) =>
         {
             // 整数列 × 整数セルは `2^53` 超でも比較できるよう `int_compare` へ写像する。
+            // scale 0 の numeric（`SUM(BIGINT)`。Issue #2271）も同じ経路で厳密に比べる。
             let n: i128 = match cell {
                 Cell::Integer(u) => i128::from(*u),
                 Cell::SignedInteger(i) => i128::from(*i),
+                Cell::Numeric(d) => d.unscaled(),
                 _ => return Err(unexpected_cell_type()),
             };
             Ok(match op {

@@ -696,7 +696,12 @@ fn sum_over_numeric_like_types_computes_correct_totals_and_null_group_is_null() 
     ));
     let rows = row_map(&result, 0);
     for id in [1u64, 2, 3] {
-        assert_eq!(cell_signed(&rows[&id][1]), 600, "SUM(c_big) id {id}");
+        // Issue #2271（TABLE-13）: `SUM(BIGINT)` は scale 0 の numeric。
+        assert_eq!(
+            rows[&id][1],
+            Cell::Numeric(engine::numeric::Decimal::from_parts(600, 0).unwrap()),
+            "SUM(c_big) id {id}"
+        );
         assert_eq!(cell_float(&rows[&id][2]), 7.5, "SUM(c_real) id {id}");
         assert_eq!(cell_float(&rows[&id][3]), 61.5, "SUM(c_double) id {id}");
         assert_eq!(

@@ -602,10 +602,16 @@ pub(crate) enum Accumulator {
     /// `MIN(<TEXT 列>)`。バイト順比較（`str::lt`/`str::gt`）。
     TextMin(Option<String>),
     TextMax(Option<String>),
-    /// `SUM(<INTEGER>/<BIGINT>)`（Issue #892・D2）。`i128` の `checked_add` で
+    /// `SUM(<INTEGER>)`（Issue #892・D2）。`i128` の `checked_add` で
     /// 正確に累積し、`finish` で `i64` 範囲を検査する（部分和が一時的に
     /// `i64` を超えても最終値が収まれば成功する契約のため、確定時に検査する）。
+    /// 結果は `bigint`（`Cell::SignedInteger`）。
     IntSum(Option<i128>),
+    /// `SUM(<BIGINT>)`（Issue #2271。TABLE-13・TASK-330 のポインタ）。累積は
+    /// [`Accumulator::IntSum`] と同じ `i128` で、`finish` は `i64` へ縮めず
+    /// scale 0 の `Cell::Numeric` を返す（結果型は `numeric(38,0)`）。
+    /// 和が 38 桁を超える場合のみ `22003`（fail-closed）。
+    BigIntSum(Option<i128>),
     /// `AVG(<INTEGER>/<BIGINT>)`（D3）。合計は `i128` で正確に保持し、`finish`
     /// で `f64` 化して除算する（結果は `Cell::Float`。DOUBLE PRECISION 相当）。
     IntAvg {
@@ -732,13 +738,12 @@ impl Accumulator {
             (Min, AggregateInput::TextColumn(_)) => Accumulator::TextMin(None),
             (Max, AggregateInput::TextColumn(_)) => Accumulator::TextMax(None),
             // Issue #892（D2）: `INTEGER`/`BIGINT` 列。`SUM`/`AVG` は `i128` で
-            // 正確に累積し、確定時（`finish`）に `i64` 範囲を検査する。
-            (
-                Sum,
-                AggregateInput::IntegerColumn(_)
-                | AggregateInput::SmallIntColumn(_)
-                | AggregateInput::BigIntColumn(_),
-            ) => Accumulator::IntSum(None),
+            // 正確に累積する。`SUM(INTEGER/SMALLINT)` は確定時（`finish`）に `i64` 範囲を
+            // 検査し、`SUM(BIGINT)` は numeric で返す（Issue #2271）。
+            (Sum, AggregateInput::IntegerColumn(_) | AggregateInput::SmallIntColumn(_)) => {
+                Accumulator::IntSum(None)
+            }
+            (Sum, AggregateInput::BigIntColumn(_)) => Accumulator::BigIntSum(None),
             (
                 Avg,
                 AggregateInput::IntegerColumn(_)
@@ -1509,7 +1514,7 @@ impl Accumulator {
                 })?;
                 Ok(())
             }
-            Accumulator::IntSum(s) => {
+            Accumulator::IntSum(s) | Accumulator::BigIntSum(s) => {
                 let widened = i128::from(value);
                 let next = match s {
                     None => widened,
@@ -1758,6 +1763,21 @@ impl Accumulator {
                         )
                     })?;
                     Cell::SignedInteger(narrowed)
+                }
+            },
+            // Issue #2271（TABLE-13）: `SUM(BIGINT)` は `numeric(38,0)`。`i64` を
+            // 超える和も値として返し、38 桁超過のみ `22003`。
+            Accumulator::BigIntSum(s) => match s {
+                None => Cell::Null,
+                Some(sum) => {
+                    let decimal = crate::numeric::Decimal::from_parts(sum, 0)
+                        .map_err(|_| accumulator_bug("SUM(BIGINT) produced an invalid scale"))?;
+                    if !decimal.fits_precision(crate::numeric::MAX_PRECISION) {
+                        return Err(SqlSurfaceError::numeric_out_of_range(
+                            "SUM(BIGINT) exceeds the maximum supported precision",
+                        ));
+                    }
+                    Cell::Numeric(decimal)
                 }
             },
             Accumulator::IntAvg { sum, count } => match sum {
@@ -2414,12 +2434,14 @@ pub(crate) fn aggregate_result_type(
             scale: 0,
         },
         (Avg, AggregateInput::IdU64) => ColumnType::Double,
-        (
-            Sum,
-            AggregateInput::IntegerColumn(_)
-            | AggregateInput::SmallIntColumn(_)
-            | AggregateInput::BigIntColumn(_),
-        ) => ColumnType::BigInt,
+        (Sum, AggregateInput::IntegerColumn(_) | AggregateInput::SmallIntColumn(_)) => {
+            ColumnType::BigInt
+        }
+        // Issue #2271（TABLE-13）: `sum(int8)` は PostgreSQL と同じく numeric。
+        (Sum, AggregateInput::BigIntColumn(_)) => ColumnType::Numeric {
+            precision: crate::numeric::MAX_PRECISION,
+            scale: 0,
+        },
         (
             Avg,
             AggregateInput::IntegerColumn(_)
@@ -3891,6 +3913,49 @@ mod tests {
         acc.observe_int(Some(1)).unwrap();
         acc.observe_int(Some(-1)).unwrap();
         assert_eq!(acc.finish().unwrap(), Cell::SignedInteger(i64::MAX));
+    }
+
+    #[test]
+    fn bigint_sum_finish_returns_numeric_beyond_i64() {
+        // Issue #2271（TABLE-13）: i64 を超える和も numeric(38,0) として返す。
+        let mut acc = Accumulator::BigIntSum(None);
+        acc.observe_int(Some(i64::MAX)).unwrap();
+        acc.observe_int(Some(i64::MAX)).unwrap();
+        assert_eq!(
+            acc.finish().unwrap(),
+            Cell::Numeric(
+                crate::numeric::Decimal::from_parts(2 * i128::from(i64::MAX), 0).unwrap()
+            )
+        );
+        assert_eq!(Accumulator::BigIntSum(None).finish().unwrap(), Cell::Null);
+    }
+
+    #[test]
+    fn bigint_sum_finish_rejects_more_than_38_digits() {
+        // 38 桁ちょうどは成功し、39 桁は 22003（fail-closed）。
+        let max38 = 10i128.pow(38) - 1;
+        assert!(Accumulator::BigIntSum(Some(max38)).finish().is_ok());
+        assert!(Accumulator::BigIntSum(Some(-max38)).finish().is_ok());
+        let err = Accumulator::BigIntSum(Some(max38 + 1))
+            .finish()
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22003");
+    }
+
+    #[test]
+    fn bigint_sum_result_type_is_numeric_38_0() {
+        use crate::catalog::ColumnType;
+        assert_eq!(
+            aggregate_result_type(AggregateFunc::Sum, &AggregateInput::BigIntColumn(0)),
+            Some(ColumnType::Numeric {
+                precision: 38,
+                scale: 0
+            })
+        );
+        assert_eq!(
+            aggregate_result_type(AggregateFunc::Sum, &AggregateInput::IntegerColumn(0)),
+            Some(ColumnType::BigInt)
+        );
     }
 
     #[test]
