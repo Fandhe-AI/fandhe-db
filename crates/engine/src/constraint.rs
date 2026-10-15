@@ -1292,6 +1292,20 @@ pub(crate) fn recode_key_for_types(
             out.extend_from_slice(component);
             continue;
         }
+        // `CHAR(n)` が絡む組（TABLE-31・Issue #1567）。保存形は n 文字へ空白詰めした値のため、
+        // 型が異なる境界では末尾空白を除いて読み替える。
+        let char_involved =
+            matches!(src, ColumnType::Bpchar(_)) || matches!(dst, ColumnType::Bpchar(_));
+        let text_side = |t: &ColumnType| t.is_text_like() || matches!(t, ColumnType::Bpchar(_));
+        if char_involved && text_side(src) && text_side(dst) {
+            if tag != src.unique_key_tag() {
+                return Err("foreign key columns have incompatible key types");
+            }
+            if !recode_char_component(&mut out, payload, src, dst)? {
+                return Ok(None);
+            }
+            continue;
+        }
         let both_integer = src.integer_rank().is_some() && dst.integer_rank().is_some();
         if !both_integer || tag != src.unique_key_tag() {
             return Err("foreign key columns have incompatible key types");
@@ -1327,6 +1341,70 @@ pub(crate) fn recode_key_for_types(
         return Err("trailing bytes after the last canonical key component");
     }
     Ok(Some(out))
+}
+
+/// [`recode_key_for_types`] の `CHAR(n)` 成分の読み替え（TABLE-31・Issue #1567）。
+/// 値を `dst` の表現で `out` へ追記して `Ok(true)`、`dst` に収まらず対応する値が構造的に
+/// 存在し得ない場合は `Ok(false)`（`out` は呼び出し元が破棄する）。payload が UTF-8 で
+/// なければ内部矛盾として `Err`（fail-closed）。
+///
+/// - 参照元が `CHAR` なら末尾の U+0020 を除く（`bpchar`→`text` 変換と同じ rtrim）。
+/// - 参照先が `CHAR(m)` なら m 文字へ空白詰めする。m 文字を超える値、および詰め後が
+///   [`crate::row_codec::MAX_TEXT_FIELD_LEN`] を超える値は保存できないため `Ok(false)`
+///   （確保の前に検査する。DoS 防止）。
+/// - `TEXT`／`VARCHAR` → `CHAR` は、末尾が U+0020 の値を `Ok(false)` にする。`bpchar`→`text`
+///   は必ず rtrim するため、末尾空白を持つ親値に一致する `CHAR` の子は存在しない。この規則は
+///   参照先（親）→参照元（子）の向きでだけ到達する前提（逆向きの組は
+///   [`ColumnType::fk_types_compatible`] が宣言時と ALTER 時に拒否する）。
+/// - `VARCHAR(k)` へ向かう値が k 文字を超えるときは `Ok(false)`。
+fn recode_char_component(
+    out: &mut Vec<u8>,
+    payload: &[u8],
+    src: &ColumnType,
+    dst: &ColumnType,
+) -> Result<bool, &'static str> {
+    let text = std::str::from_utf8(payload).map_err(|_| "CHAR key component is not valid UTF-8")?;
+    let src_char = matches!(src, ColumnType::Bpchar(_));
+    let value = if src_char {
+        text.trim_end_matches(' ')
+    } else {
+        text
+    };
+    let chars = value.chars().count();
+    let pad = match dst {
+        ColumnType::Bpchar(m) => {
+            if !src_char && text.ends_with(' ') {
+                return Ok(false);
+            }
+            let m = usize::try_from(*m).map_err(|_| "CHAR length overflow")?;
+            if chars > m {
+                return Ok(false);
+            }
+            m - chars
+        }
+        ColumnType::Varchar(Some(k)) => {
+            let k = usize::try_from(*k).map_err(|_| "VARCHAR length overflow")?;
+            if chars > k {
+                return Ok(false);
+            }
+            0
+        }
+        _ => 0,
+    };
+    let total = value
+        .len()
+        .checked_add(pad)
+        .ok_or("canonical key length overflow")?;
+    let limit = usize::try_from(crate::row_codec::MAX_TEXT_FIELD_LEN).unwrap_or(usize::MAX);
+    if total > limit {
+        return Ok(false);
+    }
+    let total_u32 = u32::try_from(total).map_err(|_| "canonical key length overflow")?;
+    out.push(ColumnType::Text.unique_key_tag());
+    out.extend_from_slice(&total_u32.to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+    out.extend(std::iter::repeat_n(b' ', pad));
+    Ok(true)
 }
 
 /// 1 個の `FOREIGN KEY` について、参照元列・参照先列の型の並びを保持し、
@@ -1406,10 +1484,16 @@ impl<'a> FkKeyRecoder<'a> {
         if self.identical {
             return Ok(values);
         }
+        let parent_is_char: Vec<bool> = self
+            .parent
+            .iter()
+            .map(|t| matches!(t, ColumnType::Bpchar(_)))
+            .collect();
         values
             .into_iter()
             .zip(self.child.iter())
-            .map(|(value, child_ty)| match (value, child_ty) {
+            .enumerate()
+            .map(|(idx, (value, child_ty))| match (value, child_ty) {
                 (Value::Integer(v), ColumnType::BigInt) => Ok(Value::BigInt(i64::from(v))),
                 (Value::BigInt(v), ColumnType::Integer) => i32::try_from(v)
                     .map(Value::Integer)
@@ -1421,6 +1505,27 @@ impl<'a> FkKeyRecoder<'a> {
                 (Value::BigInt(v), ColumnType::SmallInt) => i16::try_from(v)
                     .map(|v| Value::Integer(i32::from(v)))
                     .map_err(|_| TenantWriteError::ForeignKeyViolation),
+                // 参照元が `CHAR(n)` のとき、参照先の値を rtrim（参照先が `CHAR` の場合）して
+                // n 文字へ空白詰めする（TABLE-31・Issue #1567）。n 文字に収まらない値・詰め後が
+                // 上限を超える値は fail-closed で `ForeignKeyViolation`（PostgreSQL は 22001。
+                // 専用 variant は公開 enum の破壊的変更になるためスコープ外・実装記録に明記）。
+                (Value::Text(s), ColumnType::Bpchar(_)) => {
+                    let limit =
+                        usize::try_from(crate::row_codec::MAX_TEXT_FIELD_LEN).unwrap_or(usize::MAX);
+                    let parent_char = parent_is_char.get(idx).copied().unwrap_or(false);
+                    // `TEXT`／`VARCHAR` の参照先で末尾が空白の値は、`CHAR` の子と一致し得ない。
+                    if !parent_char && s.ends_with(' ') {
+                        return Err(TenantWriteError::ForeignKeyViolation);
+                    }
+                    let trimmed = if parent_char {
+                        s.trim_end_matches(' ')
+                    } else {
+                        s.as_str()
+                    };
+                    crate::row_codec::fit_pad_char_length(child_ty, trimmed, limit)
+                        .map(|padded| Value::Text(padded.into_owned()))
+                        .map_err(|_| TenantWriteError::ForeignKeyViolation)
+                }
                 (other, _) => Ok(other),
             })
             .collect()
@@ -4508,6 +4613,67 @@ mod tests {
         assert_eq!(
             recode_key_for_types(&key, &tys, &tys),
             Ok(Some(key.clone()))
+        );
+    }
+
+    /// `CHAR(n)` が絡む読み替え（TABLE-31・Issue #1567）: 詰め直し・rtrim・範囲外・末尾空白付きの
+    /// TEXT 値・不正 UTF-8・上限超過。
+    #[test]
+    fn recode_char_pairs() {
+        let c3 = ColumnType::Bpchar(3);
+        let c5 = ColumnType::Bpchar(5);
+        let text = ColumnType::Text;
+        let vc2 = ColumnType::Varchar(Some(2));
+        let key = |s: &str| canon(&[ScalarRef::Text(s)]);
+        // CHAR(3) <-> CHAR(5)。
+        assert_eq!(
+            recode_key_for_types(&key("ab "), &[&c3], &[&c5]),
+            Ok(Some(key("ab   ")))
+        );
+        assert_eq!(
+            recode_key_for_types(&key("ab   "), &[&c5], &[&c3]),
+            Ok(Some(key("ab ")))
+        );
+        // 参照先 CHAR(3) に収まらない値は None。
+        assert_eq!(
+            recode_key_for_types(&key("abcd "), &[&c5], &[&c3]),
+            Ok(None)
+        );
+        // CHAR -> TEXT は rtrim。VARCHAR(2) に収まらなければ None。
+        assert_eq!(
+            recode_key_for_types(&key("ab "), &[&c3], &[&text]),
+            Ok(Some(key("ab")))
+        );
+        assert_eq!(
+            recode_key_for_types(&key("ab "), &[&c3], &[&vc2]),
+            Ok(Some(key("ab")))
+        );
+        assert_eq!(recode_key_for_types(&key("abc"), &[&c3], &[&vc2]), Ok(None));
+        // TEXT -> CHAR: 詰める。末尾空白付きの値・n 超過は None。
+        assert_eq!(
+            recode_key_for_types(&key("ab"), &[&text], &[&c3]),
+            Ok(Some(key("ab ")))
+        );
+        assert_eq!(
+            recode_key_for_types(&key("ab "), &[&text], &[&c3]),
+            Ok(None)
+        );
+        assert_eq!(
+            recode_key_for_types(&key("abcd"), &[&text], &[&c3]),
+            Ok(None)
+        );
+        // 不正な UTF-8 は内部矛盾として Err。
+        let mut bad = vec![ColumnType::Text.unique_key_tag()];
+        bad.extend_from_slice(&2u32.to_be_bytes());
+        bad.extend_from_slice(&[0xff, 0xfe]);
+        assert!(recode_key_for_types(&bad, &[&c3], &[&text]).is_err());
+        // 型タグが想定と違う成分は Err。
+        assert!(recode_key_for_types(&canon(&[ScalarRef::Integer(1)]), &[&c3], &[&c5]).is_err());
+        // 詰め後が TEXT 上限を超える値は None（確保しない）。
+        let huge = ColumnType::Bpchar(crate::row_codec::MAX_TEXT_FIELD_LEN + 1);
+        assert_eq!(
+            recode_key_for_types(&key("a"), &[&text], &[&huge]),
+            Ok(None)
         );
     }
 

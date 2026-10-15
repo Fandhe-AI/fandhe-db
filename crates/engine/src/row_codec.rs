@@ -3069,6 +3069,28 @@ pub(crate) fn fit_pad_char_length<'a>(
     }
 }
 
+/// `ALTER COLUMN ... TYPE` の文字列系の型変換（`TEXT`／`VARCHAR`／`VARCHAR(n)`／`CHAR(n)` の
+/// 相互変換。TABLE-19・TABLE-31・Issue #1567）で 1 値を `to` の格納形へ変換する。
+/// 変換元が `CHAR(n)` なら先に末尾の U+0020 を除き（`bpchar`→`text` と同じ rtrim）、
+/// その後 [`fit_pad_char_length`] で書き込み経路（Issue #1564）と同じ規則
+/// （超過部分が半角空白のみなら切り詰め・それ以外は `22001`・`CHAR` は空白詰め・
+/// 詰め後が `limit` 超なら `54000`）を適用する。`catalog::alter_column_type_with` の
+/// 行走査（[`crate::column_rewrite`]）と DEFAULT 変換が共有する単一の変換点で、
+/// 値は返り値にもエラーにも含めない（エラーは型と n だけの固定文言）。
+pub(crate) fn convert_char_family<'a>(
+    from: &ColumnType,
+    to: &ColumnType,
+    text: &'a str,
+    limit: usize,
+) -> std::result::Result<std::borrow::Cow<'a, str>, CharLengthExceeded> {
+    let source = if matches!(from, ColumnType::Bpchar(_)) {
+        text.trim_end_matches(' ')
+    } else {
+        text
+    };
+    fit_pad_char_length(to, source, limit)
+}
+
 /// [`fit_pad_char_length`] を `Value::Text` へその場適用する（切り詰め・空白詰め）。
 pub(crate) fn normalize_char_length_value(
     column: &crate::catalog::ColumnDef,
@@ -4758,6 +4780,30 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
 mod tests {
     use super::*;
     use crate::catalog::ColumnDef;
+
+    /// `convert_char_family`（TABLE-19・TABLE-31・Issue #1567）の変換行列。
+    #[test]
+    fn convert_char_family_matrix() {
+        let lim = MAX_TEXT_FIELD_LEN as usize;
+        let c3 = ColumnType::Bpchar(3);
+        let c5 = ColumnType::Bpchar(5);
+        let v2 = ColumnType::Varchar(Some(2));
+        let text = ColumnType::Text;
+        // 変換元が CHAR なら先に rtrim する。
+        assert_eq!(convert_char_family(&c5, &text, "ab   ", lim).unwrap(), "ab");
+        assert_eq!(convert_char_family(&c5, &c3, "ab   ", lim).unwrap(), "ab ");
+        assert_eq!(convert_char_family(&c3, &c5, "ab ", lim).unwrap(), "ab   ");
+        // rtrim 後も超過すれば 22001 相当（固定文言）。
+        let e = convert_char_family(&c5, &c3, "abcd ", lim).unwrap_err();
+        assert_eq!(e.to_string(), "value too long for type character(3)");
+        // TEXT の超過部分が空白のみなら切り詰め、それ以外は拒否。
+        assert_eq!(convert_char_family(&text, &v2, "ab  ", lim).unwrap(), "ab");
+        assert!(convert_char_family(&text, &v2, "abc", lim).is_err());
+        // 詰め後が上限を超える場合は確保せずに拒否。
+        let huge = ColumnType::Bpchar(MAX_TEXT_FIELD_LEN + 1);
+        let e = convert_char_family(&text, &huge, "a", lim).unwrap_err();
+        assert!(e.to_string().contains("engine text field limit"));
+    }
 
     /// `fit_pad_char_length`（TABLE-31・Issue #1566）: 空白詰め・マルチバイト・上限超過・素通し。
     #[test]

@@ -769,4 +769,4 @@ NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応�
 
 ## Issue #1566 追記: CHAR(n) の空白詰めと bpchar 比較
 
-- 保存形は n 文字へ半角空白で詰めた値、比較・GROUP BY・ORDER BY・索引キーは末尾の半角空白を除いた値（TABLE-31）。`is_text_like`／`same_value_domain` は広げず、各 match 腕で Bpchar を個別に扱う（FK・ALTER・PK は #1567 まで拒否のまま）。詳細は `docs/design/implementation-status.md` の Issue #1566 の項を参照。
+- 保存形は n 文字へ半角空白で詰めた値、比較・GROUP BY・ORDER BY・索引キーは末尾の半角空白を除いた値（TABLE-31）。`is_text_like`／`same_value_domain` は広げず、各 match 腕で Bpchar を個別に扱う（FK・ALTER・PK・UNIQUE は #1567 で解禁。正準キーはタグ 1 を TEXT と共有し FK の型照合は `fk_types_compatible` に集約）。詳細は `docs/design/implementation-status.md` の Issue #1566・#1567 の項を参照。
