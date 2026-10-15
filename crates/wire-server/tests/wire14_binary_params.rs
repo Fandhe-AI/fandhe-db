@@ -40,6 +40,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             vec![
                 ColumnDef::new("embedding", ColumnType::Vector(2), false),
                 ColumnDef::new("n", ColumnType::Integer, true),
+                ColumnDef::new("s", ColumnType::SmallInt, true),
                 ColumnDef::new("b", ColumnType::BigInt, true),
                 ColumnDef::new("r", ColumnType::Real, true),
                 ColumnDef::new("d", ColumnType::Double, true),
@@ -63,8 +64,8 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
         Box::new(CpuScalarProvider),
     ));
     let sql = format!(
-        "INSERT INTO t (id, embedding, n, b, r, d, flag, blob, uid) VALUES \
-         (1, '[1,0]', 7, 9000000000, 0.25, 1.5, true, '\\x00ff10', '{UID_TEXT}') USING OPERATION_ID 'seed-1'"
+        "INSERT INTO t (id, embedding, n, s, b, r, d, flag, blob, uid) VALUES \
+         (1, '[1,0]', 7, 300, 9000000000, 0.25, 1.5, true, '\\x00ff10', '{UID_TEXT}') USING OPERATION_ID 'seed-1'"
     );
     let mut session = engine::sql::mode::SessionState::default();
     core.execute_sql_in_session(
@@ -451,13 +452,30 @@ fn unsupported_slots_are_0a000_and_checked_before_lengths() {
         let o = query(&mut s, sql, &[], &[1], &[Some(b"1")]);
         expect_err(o, "0A000", &mut s);
     }
-    // 宣言 int2 は互換表外。
-    let o = query(
+    // 宣言 int2 は拡大方向の変換として INTEGER スロットで受理する（TABLE-30・Issue #1561）。
+    let text = query(
+        &mut s,
+        "SELECT id FROM t WHERE n = $1 LIMIT 5",
+        &[21],
+        &[0],
+        &[Some(b"7")],
+    );
+    let bin = query(
         &mut s,
         "SELECT id FROM t WHERE n = $1 LIMIT 5",
         &[21],
         &[1],
         &[Some(&[0, 7])],
+    );
+    assert_eq!(text, bin);
+    assert_eq!(bin.expect("int2 into integer").0.len(), 1);
+    // 互換表に載らない宣言 OID（float4）は INTEGER スロットで 0A000 のまま。
+    let o = query(
+        &mut s,
+        "SELECT id FROM t WHERE n = $1 LIMIT 5",
+        &[700],
+        &[1],
+        &[Some(&[0, 0, 0, 7])],
     );
     expect_err(o, "0A000", &mut s);
     // 非対応スロット（price）と長さ不正スロット（n）が混在 → 0A000 が先。
@@ -510,4 +528,49 @@ fn tenant_boundary_holds_for_binary_params() {
         &[Some(&[0u8; 3])],
     );
     expect_err(o, "08P01", &mut bob);
+}
+
+/// SMALLINT スロット（TABLE-30・WIRE-12/14・Issue #1561）: int2 バイナリ ≡ テキスト、
+/// 長さ不正は 08P01、より広い宣言 OID の範囲外値は engine が 22003 で拒否し副作用なし。
+#[test]
+fn smallint_slot_binary_params() {
+    let (core, _g) = new_core();
+    let mut s = connect(spawn(core), "alice");
+    let sql = "SELECT id FROM t WHERE s = $1 LIMIT 5";
+    // 宣言 0（推論 int2）・宣言 21 の int2 バイナリは text と同一応答。
+    for declared in [&[][..], &[21]] {
+        let text = query(&mut s, sql, declared, &[0], &[Some(b"300")]);
+        let bin = query(&mut s, sql, declared, &[1], &[Some(&300i16.to_be_bytes())]);
+        assert_eq!(text, bin, "declared {declared:?}");
+        assert_eq!(bin.expect("hit").0.len(), 1);
+    }
+    // 負値・極値も復号できる（ヒットしないが応答は text と一致）。
+    for v in [i16::MIN, -1, i16::MAX] {
+        let text = query(&mut s, sql, &[21], &[0], &[Some(v.to_string().as_bytes())]);
+        let bin = query(&mut s, sql, &[21], &[1], &[Some(&v.to_be_bytes())]);
+        assert_eq!(text, bin, "v={v}");
+    }
+    // 宣言 int4 の範囲内の値は text と同一応答。
+    let text = query(&mut s, sql, &[23], &[0], &[Some(b"300")]);
+    let bin = query(&mut s, sql, &[23], &[1], &[Some(&i4(300))]);
+    assert_eq!(text, bin);
+    // 長さ不正（1 バイト・3 バイト）は 08P01 で接続は維持される。
+    for bad in [&[1u8][..], &[0, 0, 1][..]] {
+        let o = query(&mut s, sql, &[21], &[1], &[Some(bad)]);
+        expect_err(o, "08P01", &mut s);
+    }
+    // 範囲外の広い値の INSERT は 22003・副作用なし（宣言 int4／int8）。
+    let ins = "INSERT INTO t (id, embedding, s) VALUES (2, '[0,1]', $1) USING OPERATION_ID 'oor-1'";
+    let o = query(&mut s, ins, &[23], &[1], &[Some(&i4(32768))]);
+    expect_err(o, "22003", &mut s);
+    let o = query(
+        &mut s,
+        ins,
+        &[20],
+        &[1],
+        &[Some(&(-32769i64).to_be_bytes())],
+    );
+    expect_err(o, "22003", &mut s);
+    let o = query(&mut s, "SELECT id FROM t LIMIT 5", &[], &[], &[]);
+    assert_eq!(o.expect("count").0.len(), 1, "no side effect");
 }

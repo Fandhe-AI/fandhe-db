@@ -639,6 +639,7 @@ fn base_type_tokens(
 
     match ty {
         "text" => simple(&["TEXT"]),
+        "smallint" => simple(&["SMALLINT"]),
         "integer" => simple(&["INTEGER"]),
         "bigint" => simple(&["BIGINT"]),
         "real" => simple(&["REAL"]),
@@ -1281,6 +1282,7 @@ mod tests {
         ("c BIGINT", r#"{"name":"c","type":"bigint"}"#),
         ("c REAL", r#"{"name":"c","type":"real"}"#),
         ("c DOUBLE PRECISION", r#"{"name":"c","type":"double"}"#),
+        ("c SMALLINT", r#"{"name":"c","type":"smallint"}"#),
         ("c BOOLEAN", r#"{"name":"c","type":"boolean"}"#),
         ("c DATE", r#"{"name":"c","type":"date"}"#),
         ("c TIMESTAMP", r#"{"name":"c","type":"timestamp"}"#),
