@@ -502,3 +502,26 @@ fn extended_aggregate_describe_matches_binary_execution() {
     assert_eq!(cstr_tag(&expect(&mut s, b'C')), "SELECT 1");
     assert_eq!(expect(&mut s, b'Z'), [b'I']);
 }
+
+/// Issue #2331: FROM なし `HAVING` は 1 グループへの条件で、偽なら 0 行、型エラーは回復可能。
+#[test]
+fn simple_having_filters_the_single_group() {
+    let (mut s, _g) = connect();
+    expect_simple_aggregate_row(
+        &mut s,
+        "SELECT 1 HAVING true",
+        &[("?column?", 23, 4)],
+        &[Some("1")],
+    );
+    expect_simple_zero_rows(&mut s, "SELECT 1 HAVING false");
+    expect_simple_aggregate_row(
+        &mut s,
+        "SELECT count(*) WHERE false HAVING count(*) = 0",
+        &[("count", 20, 8)],
+        &[Some("0")],
+    );
+    send_simple_query(&mut s, "SELECT 1 HAVING 1");
+    expect_error_response_with_sqlstate(&mut s, "42804");
+    read_ready_for_query(&mut s);
+    expect_simple_zero_rows(&mut s, "SELECT 1 HAVING NULL");
+}
