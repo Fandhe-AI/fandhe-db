@@ -275,7 +275,7 @@ pub(super) fn bind_json_fn(
 }
 
 fn make(kind: JsonFnKind, args: Vec<BoundExpr>, arg_kinds: Vec<JsonArgKind>) -> BoundExpr {
-    BoundExpr::JsonFn(Box::new(BoundJsonFn {
+    BoundExpr::JsonTextFn(Box::new(BoundJsonFn {
         kind,
         args,
         arg_kinds,

@@ -463,9 +463,10 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::Coalesce(_)
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
-        | BoundExpr::JsonFn(_)
+        | BoundExpr::JsonTextFn(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::JsonAccess { .. }
+        | BoundExpr::JsonFn { .. }
         | BoundExpr::JsonPredicate { .. }
         | BoundExpr::NullIf { .. } => None,
     }
@@ -552,9 +553,10 @@ fn compile_node(
         }
         BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
-        | BoundExpr::JsonFn(_)
+        | BoundExpr::JsonTextFn(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::JsonAccess { .. }
+        | BoundExpr::JsonFn { .. }
         | BoundExpr::JsonPredicate { .. } => {
             steps.push(ExprStep::JsonSubtree(Box::new(expr.clone())));
             *current_depth += 1;

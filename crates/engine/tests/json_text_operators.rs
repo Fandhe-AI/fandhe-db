@@ -476,10 +476,15 @@ fn bare_null_literal_arguments_are_accepted_by_json_functions() {
 fn unsupported_positions_fail_closed_with_fixed_codes() {
     let (core, path, alice) = seeded();
     let _guard = CleanupGuard(path);
-    // FROM なしの SELECT（定数式）は未対応（0A000）。
+    // FROM なしの SELECT（定数式）は jsonb 関数（#1599）と同じ経路で評価できる。
     assert_eq!(
-        code_sql(&core, &alice, "SELECT json_build_object('a', 1)"),
-        "0A000"
+        core.execute_sql(&alice, "SELECT json_build_object('a', 1)")
+            .expect("constant json function should succeed")
+            .rows
+            .first()
+            .and_then(|r| r.cells.first())
+            .cloned(),
+        Some(json("{\"a\" : 1}"))
     );
     // json 式の GROUP BY・DISTINCT・集計引数は構文段で受理されない（42601）。
     for sql in [
