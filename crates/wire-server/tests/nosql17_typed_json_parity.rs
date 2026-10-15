@@ -61,6 +61,7 @@ fn schema(name: &str) -> TableSchema {
                 true,
             ),
             ColumnDef::new("flag", ColumnType::Boolean, true),
+            ColumnDef::new("sm", ColumnType::SmallInt, true),
             ColumnDef::new("day", ColumnType::Date, true),
             ColumnDef::new("at", ColumnType::Timestamp, true),
             ColumnDef::new("ext", ColumnType::Uuid, true),
@@ -1093,4 +1094,109 @@ fn other_tenant_rows_never_leak_into_scan_or_aggregate() {
     assert!(bob_body.contains("bob-only"), "{bob_body}");
     assert!(!bob_body.contains("2024-02-29"), "{bob_body}");
     assert!(!bob_body.contains("12345678-9abc"), "{bob_body}");
+}
+
+/// Issue #1561（TABLE-30・NOSQL-17）: SMALLINT 列の insert／scan／filter が SQL 表層と
+/// 一致し、範囲外は 22003・小数は 22P02・型不一致は拒否され副作用が無い。
+#[test]
+fn smallint_binding_matches_sql() {
+    let (core, _g) = new_core();
+    let addr = spawn(Arc::clone(&core));
+    for (i, v) in [-32768i32, 0, 32767].into_iter().enumerate() {
+        let id = 300 + i as u64;
+        let resp = alice(
+            addr,
+            &format!(
+                r#"{{"op":"insert","table":"{NOSQL_TABLE}","rows":[{{"id":{id},"embedding":[0.5,0.25],"lang":"ja","sm":{v}}}],"operation_id":"sm-nosql-{id}"}}"#
+            ),
+        );
+        assert_eq!(resp.status, 200, "{resp:?}");
+        sql_exec(
+            &core,
+            "tenant-a",
+            &format!(
+                "INSERT INTO {SQL_TABLE} (id, embedding, lang, sm) VALUES \
+                 ({id}, '[0.5,0.25]', 'ja', {v}) USING OPERATION_ID 'sm-sql-{id}'"
+            ),
+        );
+    }
+    let scan = |t: &str| {
+        format!(
+            r#"{{"op":"scan","table":"{t}","columns":["id","sm"],"sort":[{{"column":"id","dir":"asc"}}],"limit":100}}"#
+        )
+    };
+    let a = body_utf8(&alice(addr, &scan(NOSQL_TABLE)));
+    assert_eq!(a, body_utf8(&alice(addr, &scan(SQL_TABLE))));
+    assert_eq!(
+        a,
+        sql_oracle_body(
+            &core,
+            "tenant-a",
+            &format!("SELECT id, sm FROM {NOSQL_TABLE} ORDER BY id ASC LIMIT 100")
+        )
+    );
+    assert!(a.contains(r#""type":"smallint""#), "{a}");
+    assert!(a.contains("-32768") && a.contains("32767"), "{a}");
+
+    // 拒否: 範囲外・小数・指数・文字列。
+    let before = count_rows(addr, NOSQL_TABLE);
+    for (i, (json, sql_val)) in [
+        ("40000", "40000"),
+        ("-32769", "-32769"),
+        ("1.5", "1.5"),
+        ("1e3", "1e3"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = insert_one(addr, &format!(r#""sm":{json}"#), &format!("sm-rej-{i}"));
+        let sql_code = sql_oracle_err(
+            &core,
+            "tenant-a",
+            &format!(
+                "INSERT INTO {SQL_TABLE} (id, embedding, lang, sm) VALUES \
+                 (100, '[0.5,0.25]', 'ja', {sql_val}) USING OPERATION_ID 'sm-rej-sql-{i}'"
+            ),
+        );
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            sql_code,
+            "{json}: {resp:?}"
+        );
+        assert!(resp.status >= 400, "{json}");
+    }
+    let resp = insert_one(addr, r#""sm":"5""#, "sm-rej-str");
+    assert!(resp.status >= 400, "{resp:?}");
+    assert_eq!(count_rows(addr, NOSQL_TABLE), before);
+
+    // filter の各レーン（eq／範囲／between／in）が SQL の WHERE と一致し、行を実際に選ぶ。
+    let aggs = r#"{"fn":"count","column":"*"}"#;
+    let cases: [(&str, &str, u32); 4] = [
+        (
+            r#"{"column":"sm","op":"eq","value":32767}"#,
+            "sm = 32767",
+            1,
+        ),
+        (r#"{"column":"sm","op":"lt","value":1}"#, "sm < 1", 2),
+        (
+            r#"{"column":"sm","op":"between","value":[-1,40]}"#,
+            "sm >= -1 AND sm <= 40",
+            1,
+        ),
+        (
+            r#"{"column":"sm","op":"in","value":[0,32767]}"#,
+            "sm = 0 OR sm = 32767",
+            2,
+        ),
+    ];
+    for (filter, where_sql, expected) in cases {
+        let body = assert_aggregate_parity(
+            &core,
+            addr,
+            aggs,
+            &format!(r#","filter":[{filter}]"#),
+            &format!("SELECT COUNT(*) FROM {{T}} WHERE {where_sql}"),
+        );
+        assert!(body.contains(&format!("[[{expected}]")), "{filter}: {body}");
+    }
 }
