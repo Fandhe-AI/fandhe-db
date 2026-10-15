@@ -338,7 +338,8 @@ fn value_plain_text(kind: &JsonArgKind, v: &ExprValue<'_>) -> Result<String, Sql
         (JsonArgKind::Bool, ExprValue::Bool(b)) => Ok(b.to_string()),
         (JsonArgKind::Date, ExprValue::Date(d)) => Ok(crate::datetime::format_date(*d)),
         (JsonArgKind::Timestamp, ExprValue::Timestamp(t)) => {
-            Ok(crate::datetime::format_timestamp(*t))
+            // 値位置と同じ ISO 8601（`T` 区切り）に揃える。
+            Ok(crate::json::json_timestamp_text(*t))
         }
         _ => Err(internal("json function argument type mismatch")),
     }
@@ -397,7 +398,7 @@ fn value_to_json(
         }
         (JsonArgKind::Timestamp, ExprValue::Timestamp(t)) => {
             // PostgreSQL の json は ISO 8601（日付と時刻の区切りは `T`）。
-            let text = crate::datetime::format_timestamp(*t).replacen(' ', "T", 1);
+            let text = crate::json::json_timestamp_text(*t);
             push_checked(out, &format!("\"{text}\""))
         }
         _ => Err(internal("json function argument type mismatch")),
@@ -590,6 +591,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "\"x\\\"y\"");
+    }
+
+    #[test]
+    fn timestamp_object_key_uses_iso8601_t_separator() {
+        let key = value_plain_text(&JsonArgKind::Timestamp, &ExprValue::Timestamp(0)).unwrap();
+        assert_eq!(key, "1970-01-01T00:00:00");
     }
 
     #[test]
