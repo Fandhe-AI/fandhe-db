@@ -387,6 +387,60 @@ pub fn spawn_server_with_engine(
     addr
 }
 
+/// `accept_loop_with_session_limits` 経由でサーバースレッドを起動する（Issue #2455。
+/// ポインタ: WIRE-25）。接続数・読み取りタイムアウト・セッション単位上限を設定値で
+/// 注入し、呼び出し側が `ConnectionLimiter` のクローンで `active()` を観測できる
+/// ようにする（`--max-connections` 等の解決値が `main.rs` から渡る経路の in-process 版）。
+pub fn spawn_server_with_engine_and_limits(
+    users_path: &std::path::Path,
+    engine: std::sync::Arc<engine::core::EngineCore>,
+    max_connections: usize,
+    read_timeout: Duration,
+    session_limits: wire_server::limits::SessionLimits,
+) -> (std::net::SocketAddr, ConnectionLimiter) {
+    let store = Arc::new(UserStore::load_from_file(users_path).expect("valid user store"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let limiter = ConnectionLimiter::new(max_connections);
+    let limiter_for_loop = limiter.clone();
+
+    std::thread::spawn(move || {
+        wire_server::server::accept_loop_with_session_limits(
+            listener,
+            store,
+            Some(engine),
+            None,
+            wire_server::tls_opt::TlsMode::Allow,
+            limiter_for_loop,
+            read_timeout,
+            session_limits,
+        );
+    });
+
+    (addr, limiter)
+}
+
+/// `limiter.active()` がちょうど `expected` になるまでポーリングで待つ
+/// （固定 sleep に頼らない同期。超過していれば即失敗）。
+pub fn wait_for_active_exact(limiter: &ConnectionLimiter, expected: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let active = limiter.active();
+        assert!(
+            active <= expected || Instant::now() < deadline,
+            "active permits {active} exceeded expected {expected}"
+        );
+        if active == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected} active permits, got {active}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// 簡易クエリ（'Q'）1 文を送る（UTF-8 テキストのみを想定。`sql` は呼び出し側の
 /// リテラル文字列を渡す前提で、NUL 混入検証は wire-server 側のテストが別途担う）。
 pub fn send_simple_query(stream: &mut TcpStream, sql: &str) {

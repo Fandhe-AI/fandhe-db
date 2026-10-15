@@ -379,6 +379,52 @@ fn read_timeout_is_restored_to_connection_setting_after_tls_handshake() {
     );
 }
 
+/// SQL-TLS: ハンドシェイク途中（TLS レコードヘッダの先頭だけ送って黙る）のクライアントが、
+/// 固定の長い期限ではなく**設定値**の読み取りタイムアウト（300ms）で切断されること
+/// （Issue #2455。ポインタ: WIRE-25・WIRE-5。`perform_server_handshake_with_timeout` への
+/// 接続設定値の受け渡し）。
+#[test]
+fn stalled_tls_handshake_is_closed_at_configured_read_timeout() {
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_tls_server_with_read_timeout(&users_path, Duration::from_millis(300));
+
+    let mut socket = TcpStream::connect(addr).expect("connect");
+    write_ssl_request(&mut socket);
+    assert_eq!(read_exact_n(&mut socket, 1), b"S");
+
+    // TLS レコードヘッダ（handshake・TLS1.2 互換版・長さ）の先頭 3 バイトだけ送って黙る。
+    socket
+        .write_all(&[0x16, 0x03, 0x01])
+        .expect("send partial record header");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set client read timeout");
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 256];
+    let mut closed = false;
+    for _ in 0..64 {
+        match socket.read(&mut buf) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            // 切断前の TLS alert 等は許容し、最終的な EOF/RST を待つ。
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                closed = true;
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(closed, "stalled handshake must be closed by the server");
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "handshake stall was not bounded by the configured read timeout: {:?}",
+        start.elapsed()
+    );
+}
+
 /// 1 接続だけを受け付け、`handle_connection_with_options`（TLS opt-in）の
 /// 戻り値を `JoinHandle` で返す。上位 wire 層が切断を静かに扱う（panic・
 /// エラー終了しない）ことを戻り値で直接検証するためのヘルパー。
