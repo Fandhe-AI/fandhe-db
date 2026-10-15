@@ -376,6 +376,7 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid
             | ColumnType::Bytea
+            | ColumnType::SmallInt
             | ColumnType::Integer
             | ColumnType::BigInt
             | ColumnType::Real
@@ -1531,7 +1532,8 @@ pub enum ColumnType {
     /// [`ColumnType::Integer`] と共有し、違いはカタログタグ（`smallint`）と値の範囲
     /// （`-32768..=32767`）だけ。範囲は束縛段（`sql::parser::bind_integer_literal`）で
     /// `22003` として検査し、行 codec が encode／decode 両側でバックストップとして再検証する。
-    /// 述語・集計・二次索引・拡大変換・wire OID 21 は兄弟 Issue（#1559・#1560・#1561）で解禁する。
+    /// 述語・集計・ORDER BY／GROUP BY・二次索引は Issue #1559 で解禁済み。拡大変換・wire OID 21 は
+    /// 兄弟 Issue（#1560・#1561）、PK／UNIQUE は未解禁（fail-closed）。
     SmallInt,
     /// 符号付き 32 ビット整数列（`INTEGER`、TABLE-13・TASK-196。Issue #881）。
     Integer,

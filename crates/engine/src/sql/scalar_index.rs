@@ -1037,13 +1037,9 @@ impl ScalarIndex {
                 // `TEXT`／`ENUM`／レーン B の予約がすべて終わった後に
                 // 後置で予約する（`deferred_lane_a`。列ループの後ろの
                 // 「レーン A の後置予約」参照）。
-                // `SMALLINT` 列は述語・二次索引を兄弟 Issue（#1559）で解禁するまで索引化しない
-                // （Issue #1558。`None` の列は呼び出し側で全走査へ縮退する）。
-                ColumnType::SmallInt => {
-                    per_column.push(None);
-                    per_column_typed.push(None);
-                }
-                ColumnType::Integer | ColumnType::BigInt => {
+                // `SMALLINT` も INTEGER と値表現が同一（`ScalarRef::Integer`）で、`I64` 順序索引
+                // （負数を含め順序保存）へ拡張して構築する（Issue #1559・TABLE-30 ポインタ）。
+                ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => {
                     per_column.push(None);
                     per_column_typed.push(None);
                     deferred_lane_a.push((col_index, false));

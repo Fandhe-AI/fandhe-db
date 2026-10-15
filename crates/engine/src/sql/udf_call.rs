@@ -1912,15 +1912,13 @@ fn bind_expr_in(
                     // `CHECK` で共通に解禁する（#1075 の CHECK 専用 opt-in を撤廃）。
                     // 値は行スカラービュー（`row_scalars`）から解決し、評価時の
                     // 精度超過（BIGINT の |v| > 2^53）は `22003` で fail-closed。
-                    ColumnType::Integer
+                    // SMALLINT は INTEGER と値表現が同一（`ScalarRef::Integer`）のため同じ腕で
+                    // 解禁する（Issue #1559・TABLE-30 ポインタ）。
+                    ColumnType::SmallInt
+                    | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Real
                     | ColumnType::Double => Ok((BoundExpr::ColumnRef { index }, ExprType::Scalar)),
-                    // SMALLINT 列の式内参照は兄弟 Issue（#1559）で解禁する。それまでは
-                    // INTEGER と同じ腕へ黙って入れず fail-closed に拒否する（Issue #1558）。
-                    ColumnType::SmallInt => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} cannot be used in an expression (SMALLINT columns are not supported yet)"
-                    ))),
                     ColumnType::Boolean => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BOOLEAN columns are not supported)"
                     ))),
@@ -2055,7 +2053,8 @@ fn numeric_kind(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> Option<Num
         BoundExpr::ColumnRef { index } => {
             let column = env.schema?.columns.get(*index)?;
             match column.ty {
-                ColumnType::Integer => Some(NumericKind::Int4),
+                // int2 は int4 として扱う（結果型が integer になる既知の差分は #1560 で扱う）。
+                ColumnType::SmallInt | ColumnType::Integer => Some(NumericKind::Int4),
                 ColumnType::BigInt => Some(NumericKind::Int8),
                 ColumnType::Real => Some(NumericKind::Float4),
                 _ => None,
@@ -2271,7 +2270,7 @@ fn bind_unknown_literal_against(
     let out_of_range =
         || SqlSurfaceError::numeric_out_of_range("numeric literal is out of range for the operand");
     let text = match column_ty {
-        Some(ColumnType::Integer) | Some(ColumnType::BigInt) => {
+        Some(ColumnType::SmallInt) | Some(ColumnType::Integer) | Some(ColumnType::BigInt) => {
             let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
             let v: i64 = trimmed.parse().map_err(|e: std::num::ParseIntError| {
                 use std::num::IntErrorKind::{NegOverflow, PosOverflow};
@@ -2281,6 +2280,9 @@ fn bind_unknown_literal_against(
                 }
             })?;
             if matches!(column_ty, Some(ColumnType::Integer)) && i32::try_from(v).is_err() {
+                return Err(out_of_range());
+            }
+            if matches!(column_ty, Some(ColumnType::SmallInt)) && i16::try_from(v).is_err() {
                 return Err(out_of_range());
             }
             v.to_string()

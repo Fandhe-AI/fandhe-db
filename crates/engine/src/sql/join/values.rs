@@ -124,7 +124,9 @@ pub(crate) enum CmpClass {
 pub(crate) fn cmp_class(ty: Option<&ColumnType>) -> Option<CmpClass> {
     match ty {
         None => Some(CmpClass::Integer),
-        Some(ColumnType::Integer) | Some(ColumnType::BigInt) => Some(CmpClass::Integer),
+        Some(ColumnType::SmallInt) | Some(ColumnType::Integer) | Some(ColumnType::BigInt) => {
+            Some(CmpClass::Integer)
+        }
         Some(ColumnType::Real) | Some(ColumnType::Double) => Some(CmpClass::Float),
         Some(ColumnType::Numeric { .. }) => Some(CmpClass::Numeric),
         Some(ColumnType::Text | ColumnType::Varchar) => Some(CmpClass::Text),
@@ -273,6 +275,9 @@ pub(crate) fn cell_scalar<'a>(
         (_, Cell::Null) => None,
         (ColumnType::Text | ColumnType::Varchar, Cell::Text(s)) => Some(ScalarRef::Text(s)),
         (ColumnType::Enum(_), Cell::Text(s)) => Some(ScalarRef::Enum(s)),
+        (ColumnType::SmallInt, Cell::SignedInteger(v)) => Some(ScalarRef::Integer(i32::from(
+            i16::try_from(*v).map_err(|_| bug("SMALLINT value out of range"))?,
+        ))),
         (ColumnType::Integer, Cell::SignedInteger(v)) => Some(ScalarRef::Integer(
             i32::try_from(*v).map_err(|_| bug("INTEGER value out of range"))?,
         )),

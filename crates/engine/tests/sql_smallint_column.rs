@@ -2,9 +2,9 @@
 //!
 //! production 経路（`EngineCore::execute_sql_in_session`）で、(1) 型がカタログへ永続化され再オープン
 //! 後も復元されること、(2) INSERT・UPDATE SET・UPSERT・COPY・列 DEFAULT の値束縛が
-//! `-32768..=32767` 外を `22003` で拒否し副作用を残さないこと、(3) 兄弟 Issue（#1559・#1560・
-//! #1561）が担当する機能（述語・集計・索引・PK／UNIQUE・型変更）が暫定で fail-closed に拒否される
-//! こと、を固定する。(3) は兄弟 Issue で解禁する際に反転する前提の暫定挙動である。
+//! `-32768..=32767` 外を `22003` で拒否し副作用を残さないこと、(3) 未解禁の機能
+//! （PK／UNIQUE・型変更・配列）が fail-closed に拒否されること、を固定する。述語・集計・索引は
+//! Issue #1559 で解禁済み（`sql_smallint_query.rs`）。
 
 use engine::catalog::ColumnType;
 use engine::core::EngineCore;
@@ -206,33 +206,17 @@ fn upsert_is_range_checked_on_both_sides() {
     assert!(rows(&core, "SELECT id, n FROM t LIMIT 10")[0].contains("SignedInteger(5)"));
 }
 
-/// 兄弟 Issue（#1559・#1560）が解禁するまでの暫定挙動: INTEGER 扱いで黙って通さず拒否する。
+/// 兄弟 Issue（#1560 等）や未解禁の機能は INTEGER 扱いで黙って通さず fail-closed に拒否する。
+/// 述語・集計・ORDER BY／GROUP BY・SET 式は #1559 で解禁済み（`sql_smallint_query.rs`）。
 #[test]
-fn features_owned_by_sibling_issues_are_rejected_fail_closed() {
+fn features_not_yet_enabled_are_rejected_fail_closed() {
     let (_p, _g, core) = open("si-failclosed");
     ok(&core, "CREATE TABLE t (n SMALLINT, m INTEGER)");
     ok(
         &core,
         "INSERT INTO t (id, n, m) VALUES (1, 5, 5) USING OPERATION_ID 'i1'",
     );
-    // 同形の INTEGER 列 `m` への問い合わせは通る（拒否理由が構文ではなく SMALLINT であること）。
-    for sql in [
-        "SELECT id, m FROM t WHERE m = 5 LIMIT 10",
-        "SELECT SUM(m) FROM t",
-        "SELECT m, COUNT(*) FROM t GROUP BY m LIMIT 10",
-        "SELECT id, m FROM t ORDER BY m LIMIT 10",
-    ] {
-        ok(&core, sql);
-    }
     for (sql, want) in [
-        ("SELECT id, n FROM t WHERE n = 1 LIMIT 10", "22000"),
-        ("SELECT SUM(n) FROM t", "42883"),
-        ("SELECT n, COUNT(*) FROM t GROUP BY n LIMIT 10", "22000"),
-        ("SELECT id, n FROM t ORDER BY n LIMIT 10", "22000"),
-        (
-            "UPDATE t SET n = n + 1 WHERE id = 1 USING OPERATION_ID 'u1'",
-            "0A000",
-        ),
         ("CREATE TABLE p (n SMALLINT PRIMARY KEY)", "42601"),
         ("CREATE TABLE u (n SMALLINT UNIQUE)", "42601"),
         ("ALTER TABLE t ALTER COLUMN n TYPE INTEGER", "42804"),
