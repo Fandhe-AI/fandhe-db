@@ -761,7 +761,8 @@ pub(crate) fn execute_alter_table_drop_column(
 /// 未登録 ENUM は `42601`）→ `catalog::Storage::alter_table_alter_column_type`
 /// （単一 write txn 内で NUMERIC 範囲検証〔`42601`〕→ 列・型互換性判定〔`42804`〕→
 /// 拡大変換なら全テナント既存行の再エンコード〔Issue #1361。PK／UNIQUE／FK 列も受理し
-/// 索引を失効させる。Issue #1402〕）。
+/// 索引を失効させる。Issue #1402〕。文字列系の縮小・`CHAR(n)` 変換は超過行を `22001`・重複を
+/// `23505`・FK 違反を `23503`／`42804` で拒否し表は不変。Issue #1567））。
 pub(crate) fn execute_alter_table_alter_column_type(
     storage: &Storage,
     stmt: &ValidatedAlterTableAlterColumnType,
