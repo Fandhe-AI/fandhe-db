@@ -225,6 +225,8 @@ fn is_json_operator_token(token: &Token) -> bool {
             | Token::ArrowText
             | Token::HashArrow
             | Token::HashArrowText
+            | Token::HashMinus
+            | Token::Concat
             | Token::JsonContains
             | Token::JsonContainedBy
             | Token::JsonExists
@@ -5858,6 +5860,8 @@ impl<'a> Parser<'a> {
                 Some(Token::ArrowText) => JsonAccessOp::GetText,
                 Some(Token::HashArrow) => JsonAccessOp::Path,
                 Some(Token::HashArrowText) => JsonAccessOp::PathText,
+                Some(Token::HashMinus) => JsonAccessOp::DeletePath,
+                Some(Token::Concat) => JsonAccessOp::Concat,
                 Some(Token::JsonContains) => JsonAccessOp::Contains,
                 Some(Token::JsonContainedBy) => JsonAccessOp::ContainedBy,
                 Some(Token::JsonExists) => JsonAccessOp::Exists,
@@ -15337,9 +15341,8 @@ mod tests {
         assert_rejected_as_syntax_error(
             "SELECT * FROM documents WHERE lang::text = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
         );
-        assert_rejected_as_syntax_error(
-            "SELECT * FROM documents WHERE lang || 'a' = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
-        );
+        // `||` は Issue #2181 で構文段が受理するようになった（jsonb 以外への適用は束縛段が
+        // `0A000`／`42883` で拒否する。`tests/json_modify_operators.rs`）。
     }
 
     /// Issue #1596（TABLE-25）: パス演算子は構文段で受理され、PostgreSQL と同じ優先順位
@@ -15444,6 +15447,72 @@ mod tests {
                 op: JsonAccessOp::Exists,
                 ..
             })]
+        ));
+    }
+
+    /// Issue #2181（TABLE-25）: `||`・`#-` は `->` と同じ段（左結合）、`-` は加減算の段のまま
+    /// `Binary Sub` として生成され、`d - 'a' -> 'b'` は `(d - 'a') -> 'b'` になる。
+    #[test]
+    fn json_modify_operators_have_postgres_precedence() {
+        use crate::sql::udf_call::JsonAccessOp;
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        // `d || '{}' -> 'a' = 'x'` は `((d || '{}') -> 'a') = 'x'`。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE d || '{{}}' -> 'a' = 'x' {tail}"
+        ));
+        let [WherePredicate::Expression(Expr::Binary {
+            op: BinOp::Eq, lhs, ..
+        })] = preds.as_slice()
+        else {
+            panic!("unexpected shape {preds:?}");
+        };
+        let Expr::JsonAccess {
+            op: JsonAccessOp::Get,
+            lhs: inner,
+            ..
+        } = lhs.as_ref()
+        else {
+            panic!("expected -> at the top, got {lhs:?}");
+        };
+        assert!(matches!(
+            inner.as_ref(),
+            Expr::JsonAccess {
+                op: JsonAccessOp::Concat,
+                ..
+            }
+        ));
+        // `d - 'a' -> 'b' = 'x'` は `((d - 'a') -> 'b') = 'x'`。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE d - 'a' -> 'b' = 'x' {tail}"
+        ));
+        let [WherePredicate::Expression(Expr::Binary { lhs, .. })] = preds.as_slice() else {
+            panic!("unexpected shape {preds:?}");
+        };
+        let Expr::JsonAccess {
+            op: JsonAccessOp::Get,
+            lhs: inner,
+            ..
+        } = lhs.as_ref()
+        else {
+            panic!("expected -> at the top, got {lhs:?}");
+        };
+        assert!(matches!(
+            inner.as_ref(),
+            Expr::Binary { op: BinOp::Sub, .. }
+        ));
+        // `d #- '{a}' = 'x'` は `#-` を値式として比較する。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE d #- '{{a}}' = 'x' {tail}"
+        ));
+        let [WherePredicate::Expression(Expr::Binary { lhs, .. })] = preds.as_slice() else {
+            panic!("unexpected shape {preds:?}");
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            Expr::JsonAccess {
+                op: JsonAccessOp::DeletePath,
+                ..
+            }
         ));
     }
 

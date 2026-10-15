@@ -2063,6 +2063,10 @@ fn push_dml_expr(
                 crate::sql::udf_call::JsonAccessOp::Exists => 7,
                 crate::sql::udf_call::JsonAccessOp::ExistsAny => 8,
                 crate::sql::udf_call::JsonAccessOp::ExistsAll => 9,
+                // Issue #2181: 連結・パス削除演算子。既存の 1〜9 は不変。`jsonb - x` は
+                // 既存の `Binary Sub` のハッシュで区別される。
+                crate::sql::udf_call::JsonAccessOp::Concat => 10,
+                crate::sql::udf_call::JsonAccessOp::DeletePath => 11,
             });
             push_dml_expr(b, lhs, params)?;
             push_dml_expr(b, rhs, params)?;
@@ -4838,6 +4842,39 @@ mod tests {
                 "json contains vs path",
                 json_access(crate::sql::udf_call::JsonAccessOp::Contains, n(), text("a")),
                 json_access(crate::sql::udf_call::JsonAccessOp::Get, n(), text("a")),
+            ),
+            // Issue #2181: 連結・パス削除演算子も種別・左右で区別される（下位タグ 10・11）。
+            (
+                "json concat vs contains",
+                json_access(crate::sql::udf_call::JsonAccessOp::Concat, n(), text("{}")),
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::Contains,
+                    n(),
+                    text("{}"),
+                ),
+            ),
+            (
+                "json delete_path vs path",
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::DeletePath,
+                    n(),
+                    text("{a}"),
+                ),
+                json_access(crate::sql::udf_call::JsonAccessOp::Path, n(), text("{a}")),
+            ),
+            (
+                "json concat vs delete_path",
+                json_access(crate::sql::udf_call::JsonAccessOp::Concat, n(), text("{a}")),
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::DeletePath,
+                    n(),
+                    text("{a}"),
+                ),
+            ),
+            (
+                "json concat operand swap",
+                json_access(crate::sql::udf_call::JsonAccessOp::Concat, n(), m()),
+                json_access(crate::sql::udf_call::JsonAccessOp::Concat, m(), n()),
             ),
             (
                 "json operand swap",
