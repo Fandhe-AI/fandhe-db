@@ -6510,6 +6510,10 @@ impl<'a> Parser<'a> {
                 if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") {
                     return true;
                 }
+                // 引用なしの括弧なし SQL 値関数（SQL-37・Issue #1586）は式キー。
+                if self.is_value_function_keyword_at(self.pos) {
+                    return true;
+                }
                 // Issue #1597: `ORDER BY docb -> 'k'` のように識別子の直後に jsonb パス演算子が
                 // 続く形も式キー（列名キーでは `->` を解釈できない）。
                 if matches!(
@@ -9421,7 +9425,11 @@ pub(crate) fn render_view_body(body: &ParsedViewBody) -> String {
     let mut out = String::from("SELECT ");
     match &body.projection {
         Projection::All => out.push('*'),
-        Projection::Columns(cols) => out.push_str(&cols.join(", ")),
+        Projection::Columns(cols) => {
+            // SQL 値関数予約語と同名の列は引用付きで保存する（SQL-37・Issue #1586）。
+            let rendered: Vec<String> = cols.iter().map(|c| render_column_name(c)).collect();
+            out.push_str(&rendered.join(", "));
+        }
         // `parse_view_body` が構造的に拒否するため到達しない。
         Projection::Items(_) => out.push('*'),
     }
@@ -9447,7 +9455,10 @@ fn escape_string_literal(s: &str) -> String {
 /// 列名をビュー正規化 SQL 用に描画する。`true`／`false` と大小無視で一致する列名は
 /// 引用付きで出力し、再解析時に真偽リテラル（Issue #1526）へ化けて意味が変わるのを防ぐ。
 fn render_column_name(column: &str) -> String {
-    if column.eq_ignore_ascii_case("true") || column.eq_ignore_ascii_case("false") {
+    if column.eq_ignore_ascii_case("true")
+        || column.eq_ignore_ascii_case("false")
+        || ValueFunctionKind::from_keyword(column).is_some()
+    {
         format!("\"{column}\"")
     } else {
         column.to_string()
@@ -18978,6 +18989,19 @@ mod tests {
         ] {
             let err = validate_sql(sql, &lookup).expect_err("must be rejected");
             assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+        }
+    }
+
+    /// SQL-37・Issue #1586: 括弧なし時刻関数は ORDER BY でも式キーとして解析される
+    /// （列 `created` のみのカタログでも 42703 にならない）。
+    #[test]
+    fn order_by_accepts_bare_value_function_as_expression_key() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT id FROM documents ORDER BY CURRENT_TIMESTAMP LIMIT 10",
+            "SELECT id FROM documents ORDER BY id, current_date DESC LIMIT 10",
+        ] {
+            validate_sql(sql, &lookup).unwrap_or_else(|e| panic!("sql={sql:?} err={e:?}"));
         }
     }
 

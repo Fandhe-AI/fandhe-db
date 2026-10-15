@@ -749,6 +749,21 @@ mod tests {
             .expect("visible columns and item alias");
     }
 
+    /// 値関数予約語と同名の列は引用付きで保存・再解析され、旧版の未引用保存本文も列参照へ戻る
+    /// （SQL-37・Issue #1586）。
+    #[test]
+    fn value_function_named_column_survives_view_storage() {
+        let tokens = lexer::tokenize("SELECT \"current_date\", id FROM q").expect("tokenize");
+        let parsed = parse_view_body(&tokens).expect("parse");
+        let rendered = render_view_body(&parsed);
+        assert!(rendered.contains("\"current_date\""), "rendered={rendered}");
+        let retokens = lexer::tokenize_stored_view_body(&rendered).expect("retokenize");
+        assert_eq!(parse_view_body(&retokens).expect("reparse"), parsed);
+        let legacy = lexer::tokenize_stored_view_body("SELECT current_date, id FROM q")
+            .expect("legacy tokenize");
+        assert_eq!(parse_view_body(&legacy).expect("legacy parse"), parsed);
+    }
+
     /// render_view_body → 再トークン化 → parse_view_body が元と等価な AST を
     /// 復元することを固定する（TABLE-18・SQL-23・TASK-205、Issue #909 の
     /// round-trip 契約）。

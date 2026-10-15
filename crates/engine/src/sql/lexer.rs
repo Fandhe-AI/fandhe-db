@@ -276,6 +276,16 @@ pub(crate) const STORED_BODY_BOOL_LITERAL_MARKER: &str = "/*fandhe:bool-literal*
 /// 呼び出し元は `sql::view`（参照時）・カタログのビュー本文検査・作成時の自己検証。
 pub(crate) fn tokenize_stored_view_body(input: &str) -> Result<Vec<Token>, LexError> {
     let mut tokens = tokenize(input)?;
+    // 旧版は `"current_date"` 等の列参照を引用なしで保存した（SQL-37・Issue #1586）。新版の
+    // 保存本文は列名位置で必ず引用付きにするため、未引用の値関数予約語は旧形式の列参照として
+    // 引用付きトークンへ戻す（再解析で式項へ化けて保存済みビューが壊れるのを防ぐ）。
+    for slot in tokens.iter_mut() {
+        if let Token::Ident(w) = slot {
+            if is_value_function_keyword(w) {
+                *slot = Token::QuotedNull(std::mem::take(w));
+            }
+        }
+    }
     if input.starts_with(STORED_BODY_BOOL_LITERAL_MARKER) {
         return Ok(tokens);
     }
