@@ -876,3 +876,23 @@ fn truncation_message_does_not_reflect_values() {
     assert!(msg.contains("character varying(3)"), "{msg}");
     assert!(!msg.contains("secretvalue"), "{msg}");
 }
+
+/// CHAR(n) 列への SET 式代入は束縛段で受理され、評価結果が空白詰めされて保存される
+/// （TABLE-31・Issue #1566）。
+#[test]
+fn char_column_accepts_set_expression_and_pads() {
+    let (_p, _g, core) = open("cl-set-expr");
+    ok(&core, "CREATE TABLE t (c CHAR(3))");
+    ok(
+        &core,
+        "INSERT INTO t (id, c) VALUES (1, 'AB') USING OPERATION_ID 'o1'",
+    );
+    ok(
+        &core,
+        "UPDATE t SET c = lower(c) WHERE id = 1 USING OPERATION_ID 'o2'",
+    );
+    assert_eq!(
+        texts(&core, "SELECT c FROM t WHERE id = 1 LIMIT 10"),
+        vec![Some("ab ".to_string())]
+    );
+}

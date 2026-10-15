@@ -78,6 +78,7 @@ pub(crate) fn bind_set_expr(
         | ColumnType::Double
         | ColumnType::Text
         | ColumnType::Varchar(_)
+        | ColumnType::Bpchar(_)
         | ColumnType::Boolean
         | ColumnType::Date
         | ColumnType::Timestamp => {}
@@ -101,8 +102,10 @@ pub(crate) fn bind_set_expr(
                 | ColumnType::Real
                 | ColumnType::Double,
             ExprType::Scalar
-        ) | (ColumnType::Text | ColumnType::Varchar(_), ExprType::Text)
-            | (ColumnType::Boolean, ExprType::Bool)
+        ) | (
+            ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
+            ExprType::Text
+        ) | (ColumnType::Boolean, ExprType::Bool)
             | (ColumnType::Date, ExprType::Date)
             | (ColumnType::Timestamp, ExprType::Timestamp | ExprType::Date)
     );
