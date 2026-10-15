@@ -2088,6 +2088,11 @@ fn bind_expr_any(
                     | ColumnType::BigInt
                     | ColumnType::Real
                     | ColumnType::Double => Ok((BoundExpr::ColumnRef { index }, ExprType::Scalar)),
+                    // SMALLINT 列の式内参照は兄弟 Issue（#1559）で解禁する。それまでは
+                    // INTEGER と同じ腕へ黙って入れず fail-closed に拒否する（Issue #1558）。
+                    ColumnType::SmallInt => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (SMALLINT columns are not supported yet)"
+                    ))),
                     ColumnType::Boolean => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BOOLEAN columns are not supported)"
                     ))),
@@ -2396,6 +2401,7 @@ fn column_type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Text => "text",
         ColumnType::Varchar => "character varying",
         ColumnType::Vector(_) => "vector",
+        ColumnType::SmallInt => "smallint",
         ColumnType::Integer => "integer",
         ColumnType::BigInt => "bigint",
         ColumnType::Real => "real",

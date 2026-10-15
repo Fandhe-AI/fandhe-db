@@ -223,6 +223,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         ColumnType::Vector(_) => needs_embedding = true,
                         ColumnType::Text
                         | ColumnType::Varchar
+                        | ColumnType::SmallInt
                         | ColumnType::Integer
                         | ColumnType::BigInt
                         | ColumnType::Real
@@ -688,7 +689,7 @@ fn build_projected_cells(
                             })
                         }
                     },
-                    ColumnType::Integer => match scanned.get(*index) {
+                    ColumnType::SmallInt | ColumnType::Integer => match scanned.get(*index) {
                         Some(Some(row_codec::ScalarRef::Integer(v))) => {
                             cells.push(Cell::SignedInteger(i64::from(*v)))
                         }

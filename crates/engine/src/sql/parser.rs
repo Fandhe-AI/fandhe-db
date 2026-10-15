@@ -476,7 +476,7 @@ fn bind_vector_literal_values(
     Ok(crate::row_codec::Value::Vector(values.to_vec()))
 }
 
-/// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）向けの数値リテラル
+/// `SMALLINT`／`INTEGER`／`BIGINT` 列（Issue #881・#1558・TABLE-13・TASK-196）向けの数値リテラル
 /// 束縛。`literal` は `InsertLiteral::Number`（`allowlist::expect_literal` が
 /// 単項マイナスを正規化済み）のみを受理し、`InsertLiteral::String` は
 /// `22P02`（PG 互換の暗黙変換は行わない設計判断。分類のみ PostgreSQL の入力関数に
@@ -506,6 +506,21 @@ pub(crate) fn bind_integer_literal(
         }
     };
     match ty {
+        // `SMALLINT` は値表現を INTEGER と共有する（`Value::Integer`。Issue #1558）。
+        // `i16` で解析することで範囲外（`-32768..=32767` の外）を束縛段で `22003` にする。
+        ColumnType::SmallInt => match raw.parse::<i16>() {
+            Ok(v) => Ok(crate::row_codec::Value::Integer(i32::from(v))),
+            Err(e) => match e.kind() {
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                    Err(SqlSurfaceError::numeric_out_of_range(format!(
+                        "value out of range for SMALLINT column {name:?}"
+                    )))
+                }
+                _ => Err(SqlSurfaceError::invalid_text_representation(format!(
+                    "invalid input syntax for integer column {name:?}"
+                ))),
+            },
+        },
         ColumnType::Integer => match raw.parse::<i32>() {
             Ok(v) => Ok(crate::row_codec::Value::Integer(v)),
             Err(e) => match e.kind() {
@@ -647,6 +662,7 @@ pub(crate) fn bind_datetime_literal(
         | ColumnType::Real
         | ColumnType::Double
         | ColumnType::Vector(_)
+        | ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Boolean
@@ -987,6 +1003,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             ColumnType::Vector(dim) => Some((idx, *dim)),
             ColumnType::Text
             | ColumnType::Varchar
+            | ColumnType::SmallInt
             | ColumnType::Integer
             | ColumnType::BigInt
             | ColumnType::Real
@@ -1037,6 +1054,7 @@ pub(crate) fn text_column_index(
             match &column.ty {
                 ColumnType::Text | ColumnType::Varchar => Ok(idx),
                 ColumnType::Vector(_)
+                | ColumnType::SmallInt
                 | ColumnType::Integer
                 | ColumnType::BigInt
                 | ColumnType::Real
@@ -2816,7 +2834,7 @@ fn bind_insert_row(
                 )))
             }
             (
-                ColumnType::Integer | ColumnType::BigInt,
+                ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt,
                 InsertLiteral::Number(_)
                 | InsertLiteral::String(_)
                 | InsertLiteral::Bool(_)
@@ -3001,6 +3019,7 @@ pub(crate) fn bind_json_literal(
         }
         ColumnType::Text
         | ColumnType::Varchar
+        | ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Vector(_)
@@ -3255,7 +3274,7 @@ fn bind_set_assignments(
                 )))
             }
             (
-                ColumnType::Integer | ColumnType::BigInt,
+                ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt,
                 InsertLiteral::Number(_)
                 | InsertLiteral::String(_)
                 | InsertLiteral::Bool(_)
@@ -4409,7 +4428,7 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a boolean literal (true/false)"
                         )))
                     }
-                    (ColumnType::Integer | ColumnType::BigInt, InsertLiteral::Number(_) | InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                    (ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt, InsertLiteral::Number(_) | InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         bind_integer_literal(name, column.ty.clone(), literal)?
                     }
                     (ColumnType::Real, InsertLiteral::Number(n)) => {
@@ -4622,7 +4641,7 @@ fn bind_file_insert(
             // typed INSERT/UPDATE/UPSERT 向けの `bind_integer_literal` をファイル形へ
             // 露出させない。当初この分岐だけ他の非 TEXT 型より緩く受理していたのを
             // codex/review・Cursor 指摘で是正）。
-            (ColumnType::Integer | ColumnType::BigInt, _) => {
+            (ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt, _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: INTEGER/BIGINT column is not supported for file-form INSERT"
                 )))
@@ -5510,6 +5529,12 @@ fn resolve_aggregate_input(
                     // `INTEGER`／`BIGINT` 列は `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
                     // のすべてで受理する（TABLE-13・TASK-196、Issue #881・
                     // #892）。
+                    // `SMALLINT` 列の集計（結果型 sum→bigint 等を含む）は兄弟 Issue（#1559）で
+                    // 解禁する。INTEGER 列として黙って集計せず fail-closed に拒否する
+                    // （Issue #1558）。
+                    (ColumnType::SmallInt, _) => Err(SqlSurfaceError::undefined_function(format!(
+                        "column {name:?} is SMALLINT and cannot be used in aggregates yet"
+                    ))),
                     (ColumnType::Integer, _) => Ok(AggregateInput::IntegerColumn(index)),
                     (ColumnType::BigInt, _) => Ok(AggregateInput::BigIntColumn(index)),
                     // `REAL`／`DOUBLE PRECISION` 列も同様にすべての集計関数を
@@ -5694,6 +5719,10 @@ fn resolve_count_distinct_input(
                     ColumnType::Text | ColumnType::Varchar => Ok(AggregateInput::TextColumn(index)),
                     ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with COUNT(DISTINCT ...)"
+                    ))),
+                    // SMALLINT は #1559 で解禁するまで拒否（Issue #1558）。
+                    ColumnType::SmallInt => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is SMALLINT and cannot be used with COUNT(DISTINCT ...) yet"
                     ))),
                     ColumnType::Integer => Ok(AggregateInput::IntegerColumn(index)),
                     ColumnType::BigInt => Ok(AggregateInput::BigIntColumn(index)),
@@ -6149,7 +6178,10 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         ColumnType::Numeric { .. } => Some(OrderKind::Numeric),
         ColumnType::Uuid => Some(OrderKind::Uuid),
         ColumnType::Enum(_) => Some(OrderKind::Enum),
-        ColumnType::Vector(_)
+        // SMALLINT の ORDER BY／GROUP BY キーは兄弟 Issue（#1559）で解禁する。それまでは
+        // 並べ替え不能として `None`（呼び出し元が `22000` へ写像。Issue #1558）。
+        ColumnType::SmallInt
+        | ColumnType::Vector(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -6621,7 +6653,9 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
             ColumnType::Timestamp => WindowKeyKind::Timestamp,
             ColumnType::Numeric { .. } => WindowKeyKind::Numeric,
             ColumnType::Uuid => WindowKeyKind::Uuid,
-            ColumnType::Vector(_)
+            // SMALLINT は #1559 で解禁するまで window キーにできない（Issue #1558）。
+            ColumnType::SmallInt
+            | ColumnType::Vector(_)
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json

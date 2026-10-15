@@ -521,6 +521,9 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Numeric { .. }
         | ColumnType::Date
         | ColumnType::Timestamp => false,
+        // SMALLINT のバイナリ結果（int2）は兄弟 Issue（#1561）で対応する。公告 OID が
+        // 暫定で int4 のため、int4 バイナリを返さず fail-closed に非対応とする（Issue #1558）。
+        ColumnType::SmallInt => false,
     }
 }
 
@@ -561,7 +564,12 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         engine::catalog::ColumnType::Varchar => WireType::Varchar,
         engine::catalog::ColumnType::Vector(_) => WireType::Text,
         engine::catalog::ColumnType::Boolean => WireType::Bool,
-        engine::catalog::ColumnType::Integer => WireType::Int4,
+        // SMALLINT は暫定で int4（OID 23）を公告する（Issue #1558）。値は
+        // `Cell::SignedInteger` のため text 形式は正しく描画される。int2（OID 21・
+        // typlen 2）への切替とバイナリ入出力は兄弟 Issue（#1561）で行う。
+        engine::catalog::ColumnType::SmallInt | engine::catalog::ColumnType::Integer => {
+            WireType::Int4
+        }
         engine::catalog::ColumnType::BigInt => WireType::Int8,
         engine::catalog::ColumnType::Real => WireType::Float4,
         engine::catalog::ColumnType::Double => WireType::Float8,
@@ -1290,6 +1298,9 @@ mod tests {
         };
         let cases: Vec<(Option<ColumnType>, i32, i16)> = vec![
             (Some(ColumnType::BigInt), 20, 8),
+            // SMALLINT は暫定で int4 を公告する（Issue #1558）。int2（OID 21・typlen 2）への
+            // 切替は Issue #1561 で本行を更新する。
+            (Some(ColumnType::SmallInt), 23, 4),
             (Some(ColumnType::Integer), 23, 4),
             (Some(ColumnType::Real), 700, 4),
             (Some(ColumnType::Double), 701, 8),
@@ -1317,6 +1328,10 @@ mod tests {
         // fail-closed のまま（Issue #1407）。
         assert!(column_binary_support(&computed(Some(ColumnType::BigInt))));
         assert!(!column_binary_support(&computed(None)));
+        // SMALLINT のバイナリ結果は int2 対応（#1561）まで fail-closed（Issue #1558）。
+        assert!(!column_binary_support(&computed(Some(
+            ColumnType::SmallInt
+        ))));
         assert!(!column_binary_support(&computed(Some(
             ColumnType::Numeric {
                 precision: 38,

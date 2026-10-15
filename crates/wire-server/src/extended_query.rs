@@ -508,7 +508,10 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 ColumnType::Boolean => only(16, BinaryParam::Bool),
                 ColumnType::Bytea => only(17, BinaryParam::Bytea),
                 ColumnType::Uuid => only(2950, BinaryParam::Uuid),
-                ColumnType::Vector(_)
+                // SMALLINT のバイナリ param（int2＝OID 21）は兄弟 Issue（#1561）で対応する。
+                // それまでは fail-closed に非対応とする（text 形式は engine 側で範囲検査）。
+                ColumnType::SmallInt
+                | ColumnType::Vector(_)
                 | ColumnType::Numeric { .. }
                 | ColumnType::Date
                 | ColumnType::Timestamp

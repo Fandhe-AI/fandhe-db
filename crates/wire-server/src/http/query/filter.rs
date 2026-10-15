@@ -701,6 +701,11 @@ fn declare_between(
         }
         // 数値 4 型は SQL の数値リテラル `BETWEEN` の展開（`>= low AND <= high`）と
         // 同じ式レーンの 2 述語へ写す（Issue #1183 の `eq`／範囲比較と同じ束縛経路）。
+        // SMALLINT の NoSQL 型束縛は兄弟 Issue（#1561）で解禁する。それまでは fail-closed
+        // に拒否する（Issue #1558）。以降の eq／範囲／in の各分岐も同じ。
+        ColumnType::SmallInt => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+            "SMALLINT column is not supported on the NoSQL surface yet",
+        ))),
         ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
             Ok(vec![
                 numeric_expr_predicate(column, CompareOp::Ge, low, "range")?,
@@ -854,6 +859,9 @@ fn declare_eq(
             ))),
         },
         // Issue #1183: 数値 4 型は式レーンで束縛する（SQL の式述語と同じ経路）。
+        ColumnType::SmallInt => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+            "SMALLINT column is not supported on the NoSQL surface yet",
+        ))),
         ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
             numeric_expr_predicate(column, CompareOp::Eq, value, "eq")
         }
@@ -939,6 +947,9 @@ fn declare_range(
             ))),
         },
         // Issue #1183: 数値 4 型は式レーンで束縛する（`declare_eq` と同じ）。
+        ColumnType::SmallInt => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+            "SMALLINT column is not supported on the NoSQL surface yet",
+        ))),
         ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
             numeric_expr_predicate(column, cmp, value, "range")
         }
@@ -1117,6 +1128,9 @@ fn declare_in(
         // 数値 4 型は SQL の数値リテラル `col IN (1, 2)` の脱糖（`col = 1 OR col = 2`。
         // 要素 1 個なら平坦化）と同形の式レーンへ写す（Issue #1356。各分岐は
         // `eq` と同じ式述語）。要素は JSON 数値のみ。
+        ColumnType::SmallInt => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+            "SMALLINT column is not supported on the NoSQL surface yet",
+        ))),
         ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
             let mut branches = Vec::with_capacity(items.len());
             for item in items {

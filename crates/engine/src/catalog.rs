@@ -1526,6 +1526,13 @@ pub enum ColumnType {
     /// 固定次元の埋め込み列（`VECTOR(N)`、TABLE-1）。0 と `MAX_VECTOR_DIM` 超過は
     /// encode・decode 両側で拒否する。
     Vector(u32),
+    /// 符号付き 16 ビット整数列（`SMALLINT`／`INT2`、TABLE-30・Issue #1558）。
+    /// 値表現（[`crate::row_codec::Value::Integer`]・行ペイロードの `i32 LE` 5 バイト）は
+    /// [`ColumnType::Integer`] と共有し、違いはカタログタグ（`smallint`）と値の範囲
+    /// （`-32768..=32767`）だけ。範囲は束縛段（`sql::parser::bind_integer_literal`）で
+    /// `22003` として検査し、行 codec が encode／decode 両側でバックストップとして再検証する。
+    /// 述語・集計・二次索引・拡大変換・wire OID 21 は兄弟 Issue（#1559・#1560・#1561）で解禁する。
+    SmallInt,
     /// 符号付き 32 ビット整数列（`INTEGER`、TABLE-13・TASK-196。Issue #881）。
     Integer,
     /// 符号付き 64 ビット整数列（`BIGINT`、TABLE-13・TASK-196。Issue #881）。
@@ -1687,6 +1694,10 @@ impl ColumnType {
             // TYPE でも `user_uniq`・`key_index` を失効させずに済む。
             ColumnType::Text | ColumnType::Varchar => 1,
             ColumnType::Integer => 2,
+            // `SmallInt` は INTEGER と値表現（`Value::Integer`）が同一で、正準キーは値ベース
+            // （`push_canonical_component`）のため同じタグ 2 を共有する（Issue #1558。新型には
+            // 未使用タグを採番する規則の意図的な例外）。PK／UNIQUE 宣言は未解禁（fail-closed）。
+            ColumnType::SmallInt => 2,
             ColumnType::BigInt => 3,
             ColumnType::Boolean => 4,
             ColumnType::Date => 5,
@@ -1718,6 +1729,7 @@ impl ColumnType {
             ColumnType::Text => ("text", "-".to_string()),
             ColumnType::Varchar => ("varchar", "-".to_string()),
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
+            ColumnType::SmallInt => ("smallint", "-".to_string()),
             ColumnType::Integer => ("integer", "-".to_string()),
             ColumnType::BigInt => ("bigint", "-".to_string()),
             ColumnType::Real => ("real", "-".to_string()),
@@ -1769,6 +1781,14 @@ impl ColumnType {
                 })?;
                 validate_vector_dim(dim)?;
                 Ok(ColumnType::Vector(dim))
+            }
+            "smallint" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "smallint column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::SmallInt)
             }
             "integer" => {
                 if param != "-" {
@@ -3054,7 +3074,8 @@ impl ColumnDefault {
                     | ColumnType::Array(_),
             ) | (
                 ColumnDefault::Number(_),
-                ColumnType::Integer
+                ColumnType::SmallInt
+                    | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Real
                     | ColumnType::Double
@@ -3973,6 +3994,7 @@ impl TableSchema {
             ColumnType::Vector(dim) => Some(*dim),
             ColumnType::Text
             | ColumnType::Varchar
+            | ColumnType::SmallInt
             | ColumnType::Integer
             | ColumnType::BigInt
             | ColumnType::Real
