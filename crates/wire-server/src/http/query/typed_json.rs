@@ -395,6 +395,10 @@ pub fn map_json_to_literal(
                 "BOOLEAN column value must be a JSON boolean",
             )),
         },
+        // TIME の NoSQL 型束縛は #1571 で解禁する（Issue #1569。fail-closed）。
+        ColumnType::Time => Err(TypedJsonError::TypeMismatch(
+            "TIME column is not supported on the NoSQL surface yet",
+        )),
         // SMALLINT は INTEGER／BIGINT と同じ規則で束縛し、範囲検査は engine の
         // `bind_integer_literal` に一本化する（TABLE-30・NOSQL-17・Issue #1561）。
         ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => match raw {

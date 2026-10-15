@@ -145,6 +145,13 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             out.push('"');
             Ok(())
         }
+        // TIME は `HH:MM:SS[.ffffff]` の JSON 文字列（Issue #1569）。
+        Cell::Time(micros) => {
+            out.push('"');
+            escape_json_string_into(out, &engine::datetime::format_time(*micros));
+            out.push('"');
+            Ok(())
+        }
         Cell::Text(s) => {
             out.push('"');
             escape_json_string_into(out, s);
@@ -356,6 +363,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
             ColumnType::Boolean => "boolean",
             ColumnType::Date => "date",
             ColumnType::Timestamp => "timestamp",
+            ColumnType::Time => "time",
             ColumnType::Numeric { .. } => "numeric",
             ColumnType::Uuid => "uuid",
             ColumnType::Bytea => "bytea",
@@ -1207,5 +1215,24 @@ mod tests {
             .collect();
         let expected: Vec<f64> = values.iter().map(|f| *f as f64).collect();
         assert_eq!(numbers, expected);
+    }
+
+    /// Issue #1569: TIME 列は JSON 文字列（`HH:MM:SS[.ffffff]`）・型名 `"time"`。
+    #[test]
+    fn time_cell_is_a_json_string_and_column_type_is_time() {
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Scalar {
+                name: "t".to_string(),
+                ty: ColumnType::Time,
+            }],
+            rows: vec![
+                row(vec![Cell::Time(86_399_999_999)]),
+                row(vec![Cell::Time(86_400_000_000)]),
+            ],
+        };
+        let body = encode(&result).expect("encode");
+        assert!(body.contains("\"time\""), "{body}");
+        assert!(body.contains("\"23:59:59.999999\""), "{body}");
+        assert!(body.contains("\"24:00:00\""), "{body}");
     }
 }

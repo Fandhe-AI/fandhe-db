@@ -233,6 +233,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::Boolean
                         | ColumnType::Date
                         | ColumnType::Timestamp
+                        | ColumnType::Time
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -748,6 +749,15 @@ fn build_projected_cells(
                             Some(None) | None => cells.push(Cell::Null),
                         }
                     }
+                    ColumnType::Time => match scanned.get(*index) {
+                        Some(Some(row_codec::ScalarRef::Time(t))) => cells.push(Cell::Time(*t)),
+                        Some(Some(_)) => {
+                            return Err(scan_bug(
+                                "TIME column scan yielded a non-Time scalar value",
+                            ))
+                        }
+                        Some(None) | None => cells.push(Cell::Null),
+                    },
                     ColumnType::Array(_) => match scanned.get(*index) {
                         Some(Some(row_codec::ScalarRef::Array(array_ref))) => {
                             let value = try_alloc_array_for_budget(

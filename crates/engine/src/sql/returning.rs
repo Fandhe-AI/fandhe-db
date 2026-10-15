@@ -212,6 +212,7 @@ pub(crate) fn project_row(
                 Some(Value::Bool(b)) => Cell::Bool(*b),
                 Some(Value::Date(d)) => Cell::Date(*d),
                 Some(Value::Timestamp(t)) => Cell::Timestamp(*t),
+                Some(Value::Time(t)) => Cell::Time(*t),
                 Some(Value::Array(array_value)) => Cell::Array(try_clone_array_for_budget(
                     array_value,
                     budget,

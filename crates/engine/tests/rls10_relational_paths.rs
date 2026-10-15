@@ -1113,9 +1113,9 @@ mod data_dependent_canaries {
         assert_eq!(err.wire_code(), "54000", "positive control err={err:?}");
     }
 
-    /// `BIGINT` `SUM` は `i128` の `checked_add` で厳密に演算し、桁あふれは
-    /// `22003`（`NumericOutOfRange`）。他テナントの Private 行が `i64::MAX`
-    /// 近傍の値を持っていても、閲覧テナントの `SUM` 結果は不変。
+    /// `BIGINT` `SUM` は `i128` の `checked_add` で厳密に演算し、`numeric(38,0)` で
+    /// 返す（Issue #2271）。他テナントの Private 行が `i64::MAX` 近傍の値を持っていても、
+    /// 閲覧テナントの `SUM` 結果は不変。
     #[test]
     fn bigint_sum_overflow_is_invariant_to_other_tenant_flood() {
         let sql = format!("SELECT SUM(score) FROM {CANARY_DOCS}");
@@ -1195,10 +1195,18 @@ mod data_dependent_canaries {
         insert_canary_doc(&storage_positive, TENANT_A, 2, Visibility::Public, "ja", 1);
         let core_positive = new_core(storage_positive);
         let mut session = SessionState::default();
-        let err = core_positive
-            .execute_sql_in_session(&ctx_for(TENANT_A, true), &mut session, &sql)
-            .expect_err("own-tenant SUM overflow must be rejected (positive control)");
-        assert_eq!(err.wire_code(), "22003", "positive control err={err:?}");
+        let positive = expect_query(
+            core_positive
+                .execute_sql_in_session(&ctx_for(TENANT_A, true), &mut session, &sql)
+                .expect("own-tenant SUM beyond i64 must return numeric (positive control)"),
+        );
+        assert_eq!(
+            positive.rows[0].cells,
+            vec![engine::sql::exec::Cell::Numeric(
+                engine::numeric::Decimal::from_parts(i128::from(i64::MAX) + 1, 0).unwrap()
+            )],
+            "positive control"
+        );
     }
 }
 

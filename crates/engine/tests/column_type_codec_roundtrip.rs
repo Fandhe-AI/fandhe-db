@@ -66,6 +66,7 @@ fn type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Boolean => "boolean",
         ColumnType::Date => "date",
         ColumnType::Timestamp => "timestamp",
+        ColumnType::Time => "time",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",
@@ -110,6 +111,7 @@ fn all_type_labels() -> BTreeSet<&'static str> {
         "boolean",
         "date",
         "timestamp",
+        "time",
         "array",
         "bytea",
         "json",
@@ -165,6 +167,7 @@ fn full_row_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> Ta
             // 長さ付き（Issue #1563）。
             ColumnDef::new("c_varchar_n", ColumnType::Varchar(Some(16)), true),
             ColumnDef::new("c_bpchar", ColumnType::Bpchar(8), true),
+            ColumnDef::new("c_time", ColumnType::Time, true),
         ],
     )
 }
@@ -229,6 +232,8 @@ fn representative_scalar_values() -> Vec<Value> {
         Value::Text("varchar(16) value".chars().take(16).collect()),
         // `CHAR(8)` は n 文字へ空白詰め済みの値だけを保存する（TABLE-31・Issue #1566）。
         Value::Text("bpchar  ".to_string()),
+        // `c_time`（0 時起点のマイクロ秒。Issue #1569）。
+        Value::Time(engine::datetime::TIME_MAX_MICROS),
     ]
 }
 
@@ -591,6 +596,54 @@ fn timestamp_roundtrips_min_and_max_micros() {
         ColumnType::Timestamp,
         Value::Timestamp(TIMESTAMP_MAX_MICROS),
     );
+}
+
+/// TIME は `00:00:00`・`23:59:59.999999`・`24:00:00` の境界値を往復でき、範囲外は
+/// encode でも decode でも拒否する（Issue #1569・TABLE-32 ポインタ）。
+#[test]
+fn time_roundtrips_boundaries_and_rejects_out_of_range() {
+    for v in [
+        engine::datetime::TIME_MIN_MICROS,
+        engine::datetime::TIME_MAX_MICROS - 1,
+        engine::datetime::TIME_MAX_MICROS,
+    ] {
+        roundtrip_single(ColumnType::Time, Value::Time(v));
+    }
+    let schema = single_col_schema(ColumnType::Time);
+    for v in [
+        engine::datetime::TIME_MIN_MICROS - 1,
+        engine::datetime::TIME_MAX_MICROS + 1,
+        i64::MIN,
+        i64::MAX,
+    ] {
+        assert!(matches!(
+            encode_row(&schema, "tenant-a", Visibility::Public, &[Value::Time(v)]),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+    // TIMESTAMP 値を TIME 列へ書くことはできない（型取り違えの拒否）。
+    assert!(matches!(
+        encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Timestamp(0)]
+        ),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // TIMESTAMP 列で書いた範囲外バイトを TIME 列として読むと decode が拒否する。
+    let ts_schema = single_col_schema(ColumnType::Timestamp);
+    let bytes = encode_row(
+        &ts_schema,
+        "tenant-a",
+        Visibility::Public,
+        &[Value::Timestamp(engine::datetime::TIME_MAX_MICROS + 1)],
+    )
+    .expect("encode timestamp");
+    assert!(matches!(
+        decode_row(&schema, &bytes),
+        Err(RowCodecError::Invalid(_))
+    ));
 }
 
 #[test]

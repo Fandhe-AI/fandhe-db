@@ -1,4 +1,5 @@
-//! `DATE`／`TIMESTAMP` 列型（TABLE-13・TASK-197。Issue #884）のリテラル解析・
+//! `DATE`／`TIMESTAMP`／`TIME` 列型（TABLE-13・TASK-197。Issue #884。TIME は
+//! TABLE-32・Issue #1569）のリテラル解析・
 //! 内部表現変換・投影テキスト整形を集約する単一情報源。
 //!
 //! 責務境界: `catalog`（列型宣言）・`row_codec`（行バイト表現の encode/decode）・
@@ -30,6 +31,13 @@ pub const TIMESTAMP_MIN_MICROS: i64 = DATE_MIN_DAYS as i64 * MICROS_PER_DAY;
 
 /// `TIMESTAMP` の最大値（`9999-12-31 23:59:59.999999`）をマイクロ秒で表した値。
 pub const TIMESTAMP_MAX_MICROS: i64 = DATE_MAX_DAYS as i64 * MICROS_PER_DAY + (MICROS_PER_DAY - 1);
+
+/// `TIME` の最小値（`00:00:00`）を 0 時起点のマイクロ秒で表した値（Issue #1569）。
+pub const TIME_MIN_MICROS: i64 = 0;
+
+/// `TIME` の最大値（`24:00:00`。両端を含む）を 0 時起点のマイクロ秒で表した値。
+/// `24:00:00` を受理する（TABLE-32）ため上端は `MICROS_PER_DAY` そのもの。
+pub const TIME_MAX_MICROS: i64 = MICROS_PER_DAY;
 
 /// リテラル文字列の受理上限バイト長。`TIMESTAMP` の最長形（`999999-12-31
 /// 23:59:59.999999` 相当）に十分な余裕を持たせつつ、パース前の早期拒否で
@@ -125,6 +133,13 @@ pub fn validate_date_days(days: i32) -> bool {
 /// かどうか。[`validate_date_days`] と同じ理由で decode 側から使う。
 pub fn validate_timestamp_micros(micros: i64) -> bool {
     (TIMESTAMP_MIN_MICROS..=TIMESTAMP_MAX_MICROS).contains(&micros)
+}
+
+/// `micros`（0 時起点のマイクロ秒）が `TIME` の受理範囲（`00:00:00`〜`24:00:00`。
+/// 両端を含む）内かどうか。decode 側（`row_codec`）でも壊れたバイト列を
+/// 有効値として表に出さないよう再検証に使う（Issue #1569）。
+pub fn validate_time_micros(micros: i64) -> bool {
+    (TIME_MIN_MICROS..=TIME_MAX_MICROS).contains(&micros)
 }
 
 /// バイト列中の `start..start+len` が ASCII 数字のみで構成されるかを検証し、
@@ -354,6 +369,109 @@ pub fn parse_timestamp(s: &str) -> Result<i64, DateTimeLiteralError> {
     Ok(total_micros)
 }
 
+/// `TIME` リテラル（`HH:MM[:SS[.f+]]`）を解析し、0 時起点のマイクロ秒（`i64`）へ
+/// 変換する（TABLE-32・Issue #1569）。HH・MM・SS は 2 桁の ASCII 数字固定。
+/// 端数は 7 桁目で丸め（0.5 は 0 から遠い側）、8 桁目以降は数字確認のみで捨てる。
+/// 丸めた後で範囲（`00:00:00`〜`24:00:00`）を判定する。`sql::parser` 等が
+/// `Format` を `22007`、`Overflow` を `22008` へ写像する。
+pub fn parse_time(s: &str) -> Result<i64, DateTimeLiteralError> {
+    if s.len() > MAX_DATETIME_LITERAL_LEN {
+        return Err(DateTimeLiteralError::Format(
+            "TIME literal exceeds the maximum length".to_string(),
+        ));
+    }
+    if !s.is_ascii() {
+        return Err(DateTimeLiteralError::Format(
+            "TIME literal must be ASCII".to_string(),
+        ));
+    }
+    let bytes = s.as_bytes();
+    let (hour, after_hour) = parse_ascii_digits(bytes, 0, 2)
+        .ok_or_else(|| DateTimeLiteralError::Format("expected HH in TIME literal".to_string()))?;
+    if bytes.get(after_hour) != Some(&b':') {
+        return Err(DateTimeLiteralError::Format(
+            "expected ':' after hour".to_string(),
+        ));
+    }
+    let (minute, after_min) = parse_ascii_digits(bytes, after_hour + 1, 2)
+        .ok_or_else(|| DateTimeLiteralError::Format("expected MM in TIME literal".to_string()))?;
+    let mut second: u32 = 0;
+    let mut frac_micros: i64 = 0;
+    let mut cursor = after_min;
+    if bytes.get(cursor) == Some(&b':') {
+        let (sec, after_sec) = parse_ascii_digits(bytes, cursor + 1, 2).ok_or_else(|| {
+            DateTimeLiteralError::Format("expected SS in TIME literal".to_string())
+        })?;
+        second = sec;
+        cursor = after_sec;
+        if bytes.get(cursor) == Some(&b'.') {
+            let frac_start = cursor + 1;
+            let mut frac_len = 0usize;
+            while bytes
+                .get(frac_start + frac_len)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                frac_len += 1;
+            }
+            if frac_len == 0 {
+                return Err(DateTimeLiteralError::Format(
+                    "expected at least one digit after '.'".to_string(),
+                ));
+            }
+            // 先頭 6 桁をマイクロ秒、7 桁目を丸め桁として使う。8 桁目以降は
+            // 値に影響させない（累積オーバーフロー防止）。
+            let mut micros: i64 = 0;
+            for i in 0..6usize {
+                let digit = bytes
+                    .get(frac_start + i)
+                    .filter(|b| b.is_ascii_digit())
+                    .map_or(0, |b| i64::from(b - b'0'));
+                micros = micros * 10 + digit;
+            }
+            let round_digit = if frac_len >= 7 {
+                bytes.get(frac_start + 6).map_or(0, |b| b - b'0')
+            } else {
+                0
+            };
+            if round_digit >= 5 {
+                micros += 1;
+            }
+            frac_micros = micros;
+            cursor = frac_start + frac_len;
+        }
+    }
+    if cursor != bytes.len() {
+        return Err(DateTimeLiteralError::Format(
+            "TIME literal has trailing characters".to_string(),
+        ));
+    }
+    if hour > 24 {
+        return Err(DateTimeLiteralError::Overflow(format!(
+            "hour {hour} is out of range 00..=24"
+        )));
+    }
+    if minute > 59 {
+        return Err(DateTimeLiteralError::Overflow(format!(
+            "minute {minute} is out of range 00..=59"
+        )));
+    }
+    if second > 59 {
+        return Err(DateTimeLiteralError::Overflow(format!(
+            "second {second} is out of range 00..=59"
+        )));
+    }
+    let total = i64::from(hour) * 3_600_000_000
+        + i64::from(minute) * 60_000_000
+        + i64::from(second) * 1_000_000
+        + frac_micros;
+    if !validate_time_micros(total) {
+        return Err(DateTimeLiteralError::Overflow(
+            "time value is out of the range 00:00:00..=24:00:00".to_string(),
+        ));
+    }
+    Ok(total)
+}
+
 /// `DATE` の内部表現（1970-01-01 起点の日数）を PostgreSQL 互換の既定出力
 /// 形式（`YYYY-MM-DD`。年は常に 4 桁ゼロ埋め）へ整形する。`days` は
 /// [`validate_date_days`] 済みであることを前提とする（範囲外値を渡した場合の
@@ -373,14 +491,23 @@ pub fn format_timestamp(micros: i64) -> String {
     let day_micros = micros.rem_euclid(MICROS_PER_DAY);
     let days_i32 = i32::try_from(days).unwrap_or(if days < 0 { i32::MIN } else { i32::MAX });
     let date_part = format_date(days_i32);
+    let mut out = String::with_capacity(26);
+    out.push_str(&date_part);
+    out.push(' ');
+    write_time_of_day(&mut out, day_micros);
+    out
+}
+
+/// 0 時起点のマイクロ秒を `HH:MM:SS[.ffffff]`（端数 0 なら省略・末尾 0 削除）で
+/// `out` へ追記する。`format_timestamp`／`format_time` の共通実装。
+fn write_time_of_day(out: &mut String, day_micros: i64) {
     let hour = day_micros / 3_600_000_000;
     let rem = day_micros % 3_600_000_000;
     let minute = rem / 60_000_000;
     let rem = rem % 60_000_000;
     let second = rem / 1_000_000;
     let frac = rem % 1_000_000;
-    let mut out = String::with_capacity(26);
-    let _ = write!(out, "{date_part} {hour:02}:{minute:02}:{second:02}");
+    let _ = write!(out, "{hour:02}:{minute:02}:{second:02}");
     if frac != 0 {
         let mut frac_str = format!("{frac:06}");
         while frac_str.ends_with('0') {
@@ -388,6 +515,13 @@ pub fn format_timestamp(micros: i64) -> String {
         }
         let _ = write!(out, ".{frac_str}");
     }
+}
+
+/// `TIME` の内部表現（0 時起点のマイクロ秒）を `HH:MM:SS[.ffffff]` へ整形する。
+/// `MICROS_PER_DAY` は `24:00:00` と出す（Issue #1569）。
+pub fn format_time(micros: i64) -> String {
+    let mut out = String::with_capacity(15);
+    write_time_of_day(&mut out, micros.clamp(TIME_MIN_MICROS, TIME_MAX_MICROS));
     out
 }
 
@@ -621,5 +755,66 @@ mod tests {
         assert!(validate_timestamp_micros(TIMESTAMP_MAX_MICROS));
         assert!(!validate_timestamp_micros(TIMESTAMP_MIN_MICROS - 1));
         assert!(!validate_timestamp_micros(TIMESTAMP_MAX_MICROS + 1));
+    }
+
+    #[test]
+    fn time_roundtrip_and_boundaries() {
+        assert_eq!(parse_time("00:00:00"), Ok(0));
+        assert_eq!(parse_time("23:59:59.999999"), Ok(MICROS_PER_DAY - 1));
+        assert_eq!(parse_time("24:00:00"), Ok(MICROS_PER_DAY));
+        assert_eq!(parse_time("12:30"), Ok(45_000_000_000));
+        for v in [0, 1, 500_000, MICROS_PER_DAY - 1, MICROS_PER_DAY] {
+            assert_eq!(parse_time(&format_time(v)), Ok(v));
+        }
+        assert_eq!(format_time(MICROS_PER_DAY), "24:00:00");
+        assert_eq!(format_time(MICROS_PER_DAY - 1), "23:59:59.999999");
+        assert_eq!(format_time(500_000), "00:00:00.5");
+    }
+
+    #[test]
+    fn time_rounding_then_range() {
+        assert_eq!(parse_time("12:00:00.1234565"), Ok(43_200_123_457));
+        assert_eq!(parse_time("12:00:00.1234564999"), Ok(43_200_123_456));
+        assert_eq!(parse_time("23:59:59.9999995"), Ok(MICROS_PER_DAY));
+        assert_eq!(parse_time("24:00:00.0000004"), Ok(MICROS_PER_DAY));
+        assert!(matches!(
+            parse_time("24:00:00.000001"),
+            Err(DateTimeLiteralError::Overflow(_))
+        ));
+    }
+
+    #[test]
+    fn time_error_classification() {
+        for s in ["24:00:00.000001", "25:00", "12:60", "12:00:60", "24:01"] {
+            assert!(
+                matches!(parse_time(s), Err(DateTimeLiteralError::Overflow(_))),
+                "{s}"
+            );
+        }
+        for s in [
+            "",
+            "abc",
+            "12:00:00+09",
+            " 12:00",
+            "1:2:3",
+            "12:00 PM",
+            "12",
+            "12:00:",
+            "12:00:00.",
+            "12:00.5",
+            "12:00:00x",
+            "allballs",
+            "１２:00",
+        ] {
+            assert!(
+                matches!(parse_time(s), Err(DateTimeLiteralError::Format(_))),
+                "{s}"
+            );
+        }
+        let long = format!("12:00:00.{}", "1".repeat(60));
+        assert!(matches!(
+            parse_time(&long),
+            Err(DateTimeLiteralError::Format(_))
+        ));
     }
 }

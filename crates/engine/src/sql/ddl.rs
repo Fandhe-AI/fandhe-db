@@ -1055,6 +1055,7 @@ pub(crate) fn add_column_default(
         ColumnType::Enum(_) => "enum",
         ColumnType::Uuid => "uuid",
         ColumnType::Timestamp => "timestamp",
+        ColumnType::Time => "time",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
         ColumnType::Bytea => "bytea",
@@ -1086,6 +1087,7 @@ pub(crate) fn add_column_default(
                 || kind == "array"
                 || kind == "date"
                 || kind == "timestamp"
+                || kind == "time"
                 || kind == "uuid"
                 || kind == "enum"
                 || kind == "json" =>

@@ -2809,6 +2809,29 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (crate::catalog::ColumnType::Time, crate::row_codec::Value::Time(micros)) => {
+                // TIME 値は行コーデック上 9 バイト固定（`row_codec::SCALAR_TIME_ENTRY_LEN`）。
+                // Rust API から直接渡された範囲外値も対象行の探索より前に拒否する多層防御を
+                // 置く（Issue #1569）。
+                if !crate::datetime::validate_time_micros(*micros) {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "SET value out of range for TIME column".to_string(),
+                    )));
+                }
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_TIME_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             (crate::catalog::ColumnType::Array(array_ty), crate::row_codec::Value::Array(av)) => {
                 // 配列 SET 値のフレーム長検証（対象行の探索より前に行う。
                 // Issue #888・D-A3。`row_codec::scalar_array_entry_len` を
@@ -2964,6 +2987,7 @@ fn validate_set_assignments(
                 | crate::catalog::ColumnType::Boolean
                 | crate::catalog::ColumnType::Date
                 | crate::catalog::ColumnType::Timestamp
+                | crate::catalog::ColumnType::Time
                 | crate::catalog::ColumnType::Array(_)
                 | crate::catalog::ColumnType::Bytea
                 | crate::catalog::ColumnType::Json
@@ -3003,6 +3027,7 @@ fn validate_set_assignments(
             | (crate::catalog::ColumnType::Boolean, _)
             | (crate::catalog::ColumnType::Date, _)
             | (crate::catalog::ColumnType::Timestamp, _)
+            | (crate::catalog::ColumnType::Time, _)
             | (crate::catalog::ColumnType::Array(_), _)
             | (crate::catalog::ColumnType::Bytea, _)
             | (crate::catalog::ColumnType::Json, _)

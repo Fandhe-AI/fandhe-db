@@ -317,7 +317,8 @@ fn outer_aggregate_over_aggregate_body_view() {
         assert_eq!(
             cells(&r),
             vec![vec![
-                Cell::SignedInteger(sum as i64),
+                // Issue #2271: `SUM(BIGINT)` は scale 0 の numeric。
+                Cell::Numeric(engine::numeric::Decimal::from_parts(i128::from(sum), 0).unwrap()),
                 Cell::SignedInteger(*counts.iter().max().expect("groups") as i64),
                 Cell::SignedInteger(*counts.iter().min().expect("groups") as i64),
                 int(counts.len() as u64)
@@ -540,7 +541,9 @@ fn chained_views_match_oracle_per_tenant() {
         let r = run(&core, tenant, "SELECT SUM(n) FROM v_agg").expect("v_agg");
         assert_eq!(
             cells(&r),
-            vec![vec![Cell::SignedInteger(total)]],
+            vec![vec![Cell::Numeric(
+                engine::numeric::Decimal::from_parts(i128::from(total), 0).unwrap()
+            )]],
             "tenant={tenant}"
         );
     }

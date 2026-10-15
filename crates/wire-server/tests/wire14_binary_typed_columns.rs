@@ -561,9 +561,9 @@ fn aggregate_columns_binary_matches_text() {
     let (mut s, _g, _) = connect("alice", "correct-horse");
     let rows = assert_binary_matches_text(
         &mut s,
-        "SELECT COUNT(*) AS c, SUM(n) AS s_n, SUM(b) AS s_b, AVG(n) AS a_n, MIN(n) AS m_n, \
+        "SELECT COUNT(*) AS c, SUM(n) AS s_n, AVG(n) AS a_n, MIN(n) AS m_n, \
          MAX(b) AS x_b, SUM(r) AS s_r, AVG(d) AS a_d FROM t",
-        &[20, 20, 20, 701, 23, 20, 700, 701],
+        &[20, 20, 701, 23, 20, 700, 701],
     );
     // COUNT(*) は alice の 3 行（tenant-b の Private 行は含まない）。
     assert_eq!(rows[0][0].as_deref(), Some(&3i64.to_be_bytes()[..]));
@@ -621,6 +621,8 @@ fn unsupported_computed_columns_binary_request_is_0a000_and_connection_survives(
         "SELECT MIN(day) AS m FROM t",
         "SELECT MAX(ts) AS m FROM t",
         "SELECT SUM(price) AS m FROM t",
+        // Issue #2271: `SUM(BIGINT)` は numeric のためバイナリ非対応（WIRE-14）。
+        "SELECT SUM(b) AS m FROM t",
         "SELECT vec_div(embedding, 2.0) AS half FROM t LIMIT 10",
         "SELECT day, COUNT(*) AS c FROM t GROUP BY day LIMIT 10",
         "SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn, MIN(day) OVER () AS m FROM t LIMIT 10",

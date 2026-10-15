@@ -561,6 +561,7 @@ pub(crate) fn bind_integer_literal(
         | ColumnType::Boolean
         | ColumnType::Date
         | ColumnType::Timestamp
+        | ColumnType::Time
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -663,6 +664,21 @@ pub(crate) fn bind_datetime_literal(
                 )))
             }
         },
+        // TIME 列（TABLE-32・Issue #1569）。書式違反は `22007`、範囲外は `22008` へ
+        // DATE／TIMESTAMP と同じ写像で返す。
+        ColumnType::Time => match crate::datetime::parse_time(literal) {
+            Ok(micros) => Ok(crate::row_codec::Value::Time(micros)),
+            Err(crate::datetime::DateTimeLiteralError::Format(detail)) => {
+                Err(SqlSurfaceError::invalid_datetime_format(format!(
+                    "column {column_name:?}: {detail}"
+                )))
+            }
+            Err(crate::datetime::DateTimeLiteralError::Overflow(detail)) => {
+                Err(SqlSurfaceError::datetime_field_overflow(format!(
+                    "column {column_name:?}: {detail}"
+                )))
+            }
+        },
         ColumnType::Text
         | ColumnType::Varchar(_)
         | ColumnType::Bpchar(_)
@@ -680,10 +696,10 @@ pub(crate) fn bind_datetime_literal(
         | ColumnType::Numeric { .. }
         | ColumnType::Enum(_)
         | ColumnType::Uuid => {
-            // 呼び出し元（3 経路の `match (column.ty, literal)`）は Date/Timestamp
+            // 呼び出し元（3 経路の `match (column.ty, literal)`）は Date/Timestamp/Time
             // の腕でのみこの関数を呼ぶ契約のため到達しない（fail-closed の保険腕）。
             Err(SqlSurfaceError::invalid_input(format!(
-                "column {column_name:?} is not a DATE/TIMESTAMP column"
+                "column {column_name:?} is not a DATE/TIMESTAMP/TIME column"
             )))
         }
     }
@@ -1019,6 +1035,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             | ColumnType::Boolean
             | ColumnType::Date
             | ColumnType::Timestamp
+            | ColumnType::Time
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
@@ -1070,6 +1087,7 @@ pub(crate) fn text_column_index(
                 | ColumnType::Boolean
                 | ColumnType::Date
                 | ColumnType::Timestamp
+                | ColumnType::Time
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
@@ -2749,6 +2767,7 @@ pub(crate) fn bind_column_default(
             ScalarRef::Enum(s) => Ok(Value::Enum(s.to_string())),
             ScalarRef::Uuid(u) => Ok(Value::Uuid(u)),
             ScalarRef::Timestamp(t) => Ok(Value::Timestamp(t)),
+            ScalarRef::Time(t) => Ok(Value::Time(t)),
             ScalarRef::Json(j) => Ok(Value::Json(j.to_string())),
             _ => Err(SqlSurfaceError::invalid_input(format!(
                 "column {:?} DEFAULT is not compatible with its type",
@@ -2949,6 +2968,17 @@ fn bind_insert_row(
                     "column {name:?} expects a TIMESTAMP literal (YYYY-MM-DD HH:MM:SS)"
                 )))
             }
+            (ColumnType::Time, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::Time, s)?
+            }
+            (
+                ColumnType::Time,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a TIME literal (HH:MM:SS)"
+                )))
+            }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Array(parse_array_literal(s, array_ty)?)
             }
@@ -3096,6 +3126,7 @@ pub(crate) fn bind_json_literal(
         | ColumnType::Boolean
         | ColumnType::Date
         | ColumnType::Timestamp
+        | ColumnType::Time
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -3395,6 +3426,17 @@ fn bind_set_assignments(
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a TIMESTAMP literal (YYYY-MM-DD HH:MM:SS)"
+                )))
+            }
+            (ColumnType::Time, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::Time, s)?
+            }
+            (
+                ColumnType::Time,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a TIME literal (HH:MM:SS)"
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -4542,6 +4584,14 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a TIMESTAMP literal (YYYY-MM-DD HH:MM:SS)"
                         )))
                     }
+                    (ColumnType::Time, InsertLiteral::String(s)) => {
+                        bind_datetime_literal(name, ColumnType::Time, s)?
+                    }
+                    (ColumnType::Time, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a TIME literal (HH:MM:SS)"
+                        )))
+                    }
                     (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Array(parse_array_literal(s, array_ty)?)
                     }
@@ -4743,6 +4793,11 @@ fn bind_file_insert(
                     "column {name:?}: DATE/TIMESTAMP column is not supported for file-form INSERT"
                 )))
             }
+            (ColumnType::Time, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: TIME column is not supported for file-form INSERT"
+                )))
+            }
             // 配列列（TABLE-14・Issue #888）も BOOLEAN と同じく対象外として拒否する。
             (ColumnType::Array(_), _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -4877,7 +4932,7 @@ pub(crate) enum AggregateInput {
     /// `INTEGER` 列の裸の列参照（`schema.columns` の添字）。`COUNT`/`SUM`/
     /// `AVG`/`MIN`/`MAX` のすべてで使う（TABLE-13・TASK-196、Issue #881・
     /// #892）。`SUM` の結果は `i128` 累積・確定時に `i64` へ収まるか検査する
-    /// （D2。`Accumulator::IntSum`）。
+    /// （D2。`Accumulator::IntSum`）。`BIGINT` 列の `SUM` は numeric で返す（Issue #2271）。
     IntegerColumn(usize),
     /// `SMALLINT` 列の裸の列参照。受理範囲・累積方式は `IntegerColumn` と共有する
     /// （値表現が同一〔`ScalarRef::Integer`〕）。結果型のみ異なり、`SUM` は bigint、
@@ -5650,6 +5705,10 @@ fn resolve_aggregate_input(
                     (ColumnType::Timestamp, _) => Err(SqlSurfaceError::undefined_function(
                         format!("column {name:?} is TIMESTAMP and cannot be used with SUM/AVG"),
                     )),
+                    // `TIME` 列の集計は #1570 で解禁する（Issue #1569。fail-closed）。
+                    (ColumnType::Time, _) => Err(SqlSurfaceError::undefined_function(format!(
+                        "column {name:?} is TIME and cannot be used in aggregates yet"
+                    ))),
                     (ColumnType::Array(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::ArrayColumn(index))
                     }
@@ -5820,6 +5879,9 @@ fn resolve_count_distinct_input(
                     ColumnType::Boolean => Ok(AggregateInput::BooleanColumn(index)),
                     ColumnType::Date => Ok(AggregateInput::DateColumn(index)),
                     ColumnType::Timestamp => Ok(AggregateInput::TimestampColumn(index)),
+                    ColumnType::Time => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is TIME and cannot be used with COUNT(DISTINCT ...) yet"
+                    ))),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is ARRAY and cannot be used with COUNT(DISTINCT ...)"
                     ))),
@@ -6280,7 +6342,9 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         ColumnType::Numeric { .. } => Some(OrderKind::Numeric),
         ColumnType::Uuid => Some(OrderKind::Uuid),
         ColumnType::Enum(_) => Some(OrderKind::Enum),
-        ColumnType::Vector(_)
+        // `TIME` の並べ替えは #1570 で解禁する（Issue #1569。fail-closed）。
+        ColumnType::Time
+        | ColumnType::Vector(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -6772,7 +6836,8 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
             ColumnType::Timestamp => WindowKeyKind::Timestamp,
             ColumnType::Numeric { .. } => WindowKeyKind::Numeric,
             ColumnType::Uuid => WindowKeyKind::Uuid,
-            ColumnType::Vector(_)
+            ColumnType::Time
+            | ColumnType::Vector(_)
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
@@ -7190,6 +7255,8 @@ fn resolve_group_by_key(
 /// `DATE`/`TIMESTAMP` の `MIN`/`MAX`（`Cell::Date`/`Cell::Timestamp`）は
 /// 黙って `false` へ縮退させず、`TEXT` と同じく型不整合 `22000` で拒否する
 /// （`COUNT` はいずれの列型でも結果が `Cell::Integer` になるため対象外）。
+/// `SUM(<BIGINT>)`（Issue #2271。scale 0 の `Cell::Numeric`）は
+/// [`crate::sql::group_by::having_matches`] が厳密比較に対応しているため対象に含めない。
 pub(crate) fn check_having_target_is_numeric(
     item: &BoundAggregateItem,
     target_name: &str,
@@ -7402,6 +7469,11 @@ fn bind_group_by_clause(
     })
 }
 
+/// 式（`HAVING`／`ORDER BY`）内で扱えない集計結果型を表す番兵の列型（`BYTEA`）。
+/// 式束縛が「式内で使えない列」として `22000` で拒否するため、`NUMERIC` 結果（`SUM(BIGINT)`・
+/// `AVG(NUMERIC)` 等）や型を決められない組み合わせをこの値で表現する（fail-closed）。
+const EXPR_UNSUPPORTED_COLUMN_TYPE: ColumnType = ColumnType::Bytea;
+
 /// 集計項目の結果セルに対応する静的な列型（Issue #1188。グループ出力行ビューの合成列型）。
 /// 実行時のセル variant（`Accumulator::finish`）と対応させる: `COUNT`・`id` 系は
 /// `Cell::Integer(u64)`／整数列は `Cell::SignedInteger` → `BIGINT`、浮動小数・`AVG`・式入力は
@@ -7412,10 +7484,15 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
     match item.func {
         AggregateFunc::Count => ColumnType::BigInt,
         AggregateFunc::Avg => match item.input {
-            AggregateInput::NumericColumn { .. } => ColumnType::Bytea,
+            AggregateInput::NumericColumn { .. } => EXPR_UNSUPPORTED_COLUMN_TYPE,
             _ => ColumnType::Double,
         },
         AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => match &item.input {
+            // Issue #2271（TABLE-13）: `SUM(BIGINT)` は `Cell::Numeric` を返すため、
+            // 式内では扱えない列（`BYTEA`）として `22000` で拒否する。
+            AggregateInput::BigIntColumn(_) if matches!(item.func, AggregateFunc::Sum) => {
+                EXPR_UNSUPPORTED_COLUMN_TYPE
+            }
             AggregateInput::IdU64
             | AggregateInput::IntegerColumn(_)
             | AggregateInput::SmallIntColumn(_)
@@ -7426,7 +7503,7 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
             AggregateInput::TextColumn(_) => ColumnType::Text,
             AggregateInput::DateColumn(_) => ColumnType::Date,
             AggregateInput::TimestampColumn(_) => ColumnType::Timestamp,
-            _ => ColumnType::Bytea,
+            _ => EXPR_UNSUPPORTED_COLUMN_TYPE,
         },
     }
 }
