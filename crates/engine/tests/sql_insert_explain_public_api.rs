@@ -59,6 +59,7 @@ fn bound_insert(id: u64, op_id: &str) -> BoundInsert {
             Value::Text("ja".to_string()),
         ],
         operation_id: Some(OperationId::parse(op_id).expect("valid operation_id")),
+        volatile_default_columns: Vec::new(),
     }
 }
 
@@ -127,6 +128,7 @@ fn execute_insert_rejects_missing_operation_id_under_ledgered() {
             Value::Text("ja".to_string()),
         ],
         operation_id: None,
+        volatile_default_columns: Vec::new(),
     };
 
     let err = execute_insert(&storage, &ctx_a, &bound, LedgerMode::Ledgered)
@@ -201,6 +203,7 @@ fn execute_insert_compare_only_mode_skips_ledger() {
             Value::Text("ja".to_string()),
         ],
         operation_id: None,
+        volatile_default_columns: Vec::new(),
     };
 
     // `LedgerMode::CompareOnlyWithoutLedger` は `EngineCore::with_ledger_mode`

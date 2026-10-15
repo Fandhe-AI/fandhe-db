@@ -227,6 +227,7 @@ jobs:
   # --------------------------------------------------
   # チャンクごとに commit する分割実行を SIGKILL し、再起動後のチャンク原子性・前方一致・
   # ちょうど 1 回・台帳エントリを検証する（scripts/crash_test_partitioned_dml.sh）。
+  # update-now モード（Issue #1587）は SET at = now() の固定時刻が kill・再起動後も全行で同じ値であることを検証する。
   # 既存の crash-test 系と同じ理由で独立ジョブとし、actions/checkout は SHA 固定で参照する。
   # private submodule（docs/spec）は取得しない。
   crash-test-partitioned-dml:
