@@ -394,6 +394,7 @@ TABLE-14・TASK-198（Issue #889。関連: NOSQL-8・NOSQL-17）で `ColumnType:
   `extract_path_text`。ステップ数上限は `MAX_JSON_DEPTH` と同値）のみを
   追加し、SQL・NoSQL 表層への構文露出は行わない（`doc -> 'a'` は引き続き
   `42601`）。露出は spec ID 付与後の別 Issue へ申し送る。
+  式評価器への写像の設計は [json-expr-type-mapping.md](json-expr-type-mapping.md)（Issue #1595）。
 - wire-server: SQL 表層のテキスト表現は格納テキストをそのまま出力する
   （`JSON` は入力テキスト保持・`JSONB` は正規化済みテキストのため、いずれも
   再シリアライズしない）。NoSQL 表層（`insert.rs`／`update.rs`）は JSON
