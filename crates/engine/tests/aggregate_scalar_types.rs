@@ -1192,3 +1192,103 @@ fn integer_column_compares_with_huge_sum_bigint_scalar_subquery() {
         .expect("accepted");
     assert_eq!(eq.rows.len(), 0);
 }
+
+/// 2^53 を超える `SUM(BIGINT)` と REAL／DOUBLE 列のスカラー比較は、float8 と numeric の
+/// 比較として受理される（`22003` にならない。Issue #2271。Cursor Bugbot 指摘の回帰）。
+#[test]
+fn float_column_compares_with_sum_bigint_beyond_2_pow_53() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    // 列値は 2^53 未満。3 行の合計 27_000_000_000_000_000 は 2^53 を超える。
+    for (id, r, d) in [(1, 1.0, 1.0), (2, 3.0e16, 3.0e16), (3, 2.0e16, 2.0e16)] {
+        insert_full_row(
+            &core,
+            &alice,
+            id,
+            "ja",
+            1,
+            9_000_000_000_000_000,
+            r,
+            d,
+            "1.00",
+            "2024-01-01",
+            "2024-01-01 00:00:00",
+            &format!("op-{id}"),
+        );
+    }
+    let count = |sql: String| core.execute_sql(&alice, &sql).expect("accepted").rows.len();
+    for col in ["r", "d"] {
+        let q = |op: &str| {
+            format!("SELECT id FROM {TABLE} WHERE {col} {op} (SELECT SUM(b) FROM {TABLE}) LIMIT 10")
+        };
+        assert_eq!(count(q("<")), 2, "{col} <");
+        assert_eq!(count(q(">")), 1, "{col} >");
+        assert_eq!(count(q("<>")), 3, "{col} <>");
+    }
+}
+
+/// scale 0 の numeric 列が 2^53 を超える値を持つとき、REAL／DOUBLE 列との
+/// IN／NOT IN も受理される（float8 へ丸めて比較する）。
+#[test]
+fn float_column_in_and_not_in_with_scale0_numeric_beyond_2_pow_53() {
+    let path = unique_db_path("aggregate-scale0-big-in");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("d", ColumnType::Double, true),
+                ColumnDef::new("r", ColumnType::Real, true),
+                ColumnDef::new(
+                    "q",
+                    ColumnType::Numeric {
+                        precision: 38,
+                        scale: 0,
+                    },
+                    true,
+                ),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let alice = ctx_for("alice");
+    for (id, d, r, q) in [
+        (1, "1.0e16", "1.0", "10000000000000000"),
+        (2, "2.0", "2.0", "10000000000000001"),
+    ] {
+        core.execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO t (id, embedding, d, r, q) VALUES \
+                 ({id}, '[0.1,0.2]', {d}, {r}, {q}) USING OPERATION_ID 'op-{id}'"
+            ),
+        )
+        .expect("insert");
+    }
+    let count = |sql: &str| core.execute_sql(&alice, sql).expect("accepted").rows.len();
+    let inner = "SELECT q FROM t LIMIT 10";
+    for col in ["d", "r"] {
+        let hits = count(&format!(
+            "SELECT id FROM t WHERE {col} IN ({inner}) LIMIT 10"
+        ));
+        let miss = count(&format!(
+            "SELECT id FROM t WHERE {col} NOT IN ({inner}) LIMIT 10"
+        ));
+        assert_eq!(hits + miss, 2, "{col}");
+    }
+    // 1.0e16 は numeric 10000000000000000 と float8 として等しい。
+    assert_eq!(
+        count(&format!("SELECT id FROM t WHERE d IN ({inner}) LIMIT 10")),
+        1
+    );
+    assert_eq!(
+        count(&format!(
+            "SELECT id FROM t WHERE d < (SELECT q FROM t WHERE id = 2 LIMIT 1) LIMIT 10"
+        )),
+        1
+    );
+}
