@@ -91,6 +91,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
   [--max-result-rows <1-100000>] \
   [--write-lock-wait-ms <100-60000>] \
+  [--read-timeout-secs <1-600>] [--max-connections <1-256>] [--max-prepared-statements <1-1024>] \
   [--max-transaction-duration-ms <100-60000>] [--max-transaction-statements <1-10000>] \
   [--partitioned-dml-chunk-rows <1-1000000>] [--partitioned-dml-scan-budget <1-1000000>] \
   [--partitioned-dml-max-hold-ms <100-5000>] \
@@ -379,6 +380,13 @@ JOIN 文の `LIMIT`・NoSQL の `limit` の範囲判定にだけ効き、超過�
 超過時の SQLSTATE は従来と同じ `55P03` です。autocommit の書き込み・明示トランザクションの `BEGIN`・分割実行 DML の
 チャンクに効き、SQL 表層と NoSQL（HTTP）表層の両方が対象です。範囲外・非数値・値欠落・2 回目以降の重複指定は
 fail-closed で起動エラーです。環境変数は設けません（詳細: [docs/design/write-lock-wait-cli.md](docs/design/write-lock-wait-cli.md)）。
+
+`--read-timeout-secs <N>`（既定 30・範囲 `1`〜`600` 秒）・`--max-connections <N>`（既定 64・範囲 `1`〜`256`）・
+`--max-prepared-statements <N>`（既定 64・範囲 `1`〜`1,024`。名前付きのみ数え、無名は数えない）（Issue #2454・WIRE-25）は、
+読み取りタイムアウト・同時接続数上限・接続あたりの prepared statement 保持件数上限を、プロセス全体に対して起動時に設定します
+（未指定は現行値で、挙動は変わりません）。SQL 表層と NoSQL（HTTP）表層で同じ値を共有し、超過時の応答（`53300`・`54000`）は
+従来と同じです。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです。書き込みロック待機
+（`--write-lock-wait-ms`）とは連動しません。サーバー側からの keepalive は送りません。範囲は CLI 設計メモ（#2453）の確定値です。
 
 `--max-transaction-duration-ms <N>`（既定 20000・範囲 `100`〜`60000` ミリ秒）・`--max-transaction-statements <N>`
 （既定 1,000・範囲 `1`〜`10,000`）（Issue #1553・SQL-46）は、トランザクションの最大持続時間と最大文数を、

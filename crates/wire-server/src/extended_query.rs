@@ -125,8 +125,7 @@ use crate::error_response;
 use crate::framing::{self, FrameError};
 use crate::limits::{
     MAX_BOUND_PARAM_BYTES_PER_SESSION, MAX_PORTALS_PER_SESSION, MAX_PREPARED_SQL_BYTES_PER_SESSION,
-    MAX_PREPARED_STATEMENTS_PER_SESSION, MAX_RESPONSE_BUFFER_BYTES, MAX_STATEMENT_NAME_LEN,
-    MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION,
+    MAX_RESPONSE_BUFFER_BYTES, MAX_STATEMENT_NAME_LEN, MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION,
 };
 use crate::result_encoder;
 use crate::wire_stream::WireStream;
@@ -555,6 +554,10 @@ fn int_kind(effective_oid: i32) -> BinaryParam {
 pub(crate) struct PreparedStatementStore {
     statements: std::collections::HashMap<String, (PreparedStatement, usize)>,
     total_sql_bytes: usize,
+    /// 名前付きステートメント件数の上限。既定は
+    /// [`crate::limits::MAX_PREPARED_STATEMENTS_PER_SESSION`]、`--max-prepared-statements`
+    /// （Issue #2454・WIRE-25 ポインタ）で起動時に上書きされる。
+    max_named: usize,
 }
 
 /// 保持上限超過・構造違反。
@@ -567,10 +570,18 @@ enum StoreError {
 }
 
 impl PreparedStatementStore {
+    /// 既定上限での構築（本番経路は `with_*` を使うためテスト専用）。
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_max_named(crate::limits::MAX_PREPARED_STATEMENTS_PER_SESSION)
+    }
+
+    /// 名前付きステートメント件数の上限を指定して構築する（Issue #2454）。
+    pub(crate) fn with_max_named(max_named: usize) -> Self {
         PreparedStatementStore {
             statements: std::collections::HashMap::new(),
             total_sql_bytes: 0,
+            max_named,
         }
     }
 
@@ -595,7 +606,7 @@ impl PreparedStatementStore {
             // 参照）。`statements.len()` には無名分も含まれるため、名前付き
             // （非空キー）のみを数え上げて判定する。
             let named_count = self.statements.keys().filter(|k| !k.is_empty()).count();
-            if named_count >= MAX_PREPARED_STATEMENTS_PER_SESSION {
+            if named_count >= self.max_named {
                 return Err(StoreError::TooManyStatements);
             }
         }
@@ -901,9 +912,17 @@ pub(crate) struct ExtendedQueryState {
 }
 
 impl ExtendedQueryState {
+    /// 既定上限での構築（本番経路は `with_*` を使うためテスト専用）。
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_session_limits(crate::limits::SessionLimits::default())
+    }
+
+    /// 起動時 CLI で解決済みの接続単位上限（Issue #2454）を適用して構築する。
+    /// `handshake::run_authenticated_session` が接続ごとに 1 回だけ呼ぶ。
+    pub(crate) fn with_session_limits(limits: crate::limits::SessionLimits) -> Self {
         ExtendedQueryState {
-            statements: PreparedStatementStore::new(),
+            statements: PreparedStatementStore::with_max_named(limits.max_prepared_statements),
             portals: PortalStore::new(),
             ignore_till_sync: false,
         }
@@ -2421,6 +2440,7 @@ pub(crate) fn handle_flush<S: WireStream>(stream: &mut S) -> io::Result<LoopSign
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::MAX_PREPARED_STATEMENTS_PER_SESSION;
 
     #[test]
     fn parse_parse_body_decodes_name_query_and_zero_params() {
@@ -2710,6 +2730,26 @@ mod tests {
             validate_format_codes(&[0, -1], 2),
             Err(HandlerError::InvalidParamFormatCode)
         ));
+    }
+
+    /// Issue #2454（WIRE-25 ポインタ）: 件数上限は構築時の値に従い、無名は数えない。
+    #[test]
+    fn store_honors_configured_named_limit() {
+        let mut store = PreparedStatementStore::with_max_named(2);
+        for name in ["a", "b"] {
+            store
+                .insert(name.to_string(), 1, PreparedStatement::Empty)
+                .expect("within configured limit");
+        }
+        store
+            .insert(String::new(), 1, PreparedStatement::Empty)
+            .expect("anonymous is not counted");
+        let result = store.insert("c".to_string(), 1, PreparedStatement::Empty);
+        assert!(matches!(result, Err(StoreError::TooManyStatements)));
+        let state = ExtendedQueryState::with_session_limits(crate::limits::SessionLimits {
+            max_prepared_statements: 1,
+        });
+        assert_eq!(state.statements.max_named, 1);
     }
 
     #[test]

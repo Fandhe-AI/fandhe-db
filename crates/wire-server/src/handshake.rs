@@ -1113,7 +1113,29 @@ pub fn handle_connection_with_tls_mode(
     tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
     mode: TlsMode,
 ) -> io::Result<()> {
-    handle_connection_inner_with_tls(stream, store, engine, tls, mode)
+    handle_connection_inner_with_tls(
+        stream,
+        store,
+        engine,
+        tls,
+        mode,
+        crate::limits::SessionLimits::default(),
+    )
+}
+
+/// 起動時 CLI で解決済みの接続単位上限（[`crate::limits::SessionLimits`]。Issue #2454・
+/// WIRE-25 ポインタ）を適用する公開入口。`server::accept_loop_with_session_limits` の
+/// 接続スレッドから呼ばれる。[`handle_connection_with_tls_mode`] は
+/// `SessionLimits::default()`（従来のコンパイル時定数）でこの経路と同一動作になる。
+pub fn handle_connection_with_session_limits(
+    stream: TcpStream,
+    store: &UserStore,
+    engine: Option<&engine::core::EngineCore>,
+    tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
+    mode: TlsMode,
+    session_limits: crate::limits::SessionLimits,
+) -> io::Result<()> {
+    handle_connection_inner_with_tls(stream, store, engine, tls, mode, session_limits)
 }
 
 /// 認証の結果（成功時の `PolicyContext`、または失敗〔`ErrorResponse` は
@@ -1344,7 +1366,14 @@ fn handle_connection_inner(
 ) -> io::Result<()> {
     // `tls: None` のため `mode` は意味を持たない（`handle_connection_inner_with_tls`
     // ドキュメント参照）。既存呼び出し元とのビット単位互換のため `Allow` を渡す。
-    handle_connection_inner_with_tls(stream, store, engine, None, TlsMode::Allow)
+    handle_connection_inner_with_tls(
+        stream,
+        store,
+        engine,
+        None,
+        TlsMode::Allow,
+        crate::limits::SessionLimits::default(),
+    )
 }
 
 /// [`negotiate_startup_or_upgrade`] の戻り値。
@@ -1449,6 +1478,7 @@ fn run_authenticated_session<S: WireStream>(
     store: &UserStore,
     engine: Option<&engine::core::EngineCore>,
     username: String,
+    session_limits: crate::limits::SessionLimits,
 ) -> io::Result<()> {
     let outcome = match authenticate(stream, store, &username) {
         Ok(o) => o,
@@ -1511,7 +1541,8 @@ fn run_authenticated_session<S: WireStream>(
     // 接続単位の Parse 済みステートメント・portal 保持（Issue #933・#934・
     // TASK-71・WIRE-11）。`session` と同じく接続終了で破棄し、接続間・
     // テナント間で共有しない（`extended_query` モジュールドキュメント参照）。
-    let mut extended = crate::extended_query::ExtendedQueryState::new();
+    let mut extended =
+        crate::extended_query::ExtendedQueryState::with_session_limits(session_limits);
 
     match post_auth_loop(stream, &ctx, engine, &mut session, &mut txn, &mut extended) {
         Ok(()) => Ok(()),
@@ -1533,20 +1564,23 @@ fn handle_connection_inner_with_tls(
     engine: Option<&engine::core::EngineCore>,
     tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
     mode: TlsMode,
+    session_limits: crate::limits::SessionLimits,
 ) -> io::Result<()> {
     let Some(tls_config) = tls else {
         let username = match negotiate_startup(&mut stream) {
             Ok(u) => u,
             Err(e) => return respond_and_close(&mut stream, e, "invalid startup packet"),
         };
-        return run_authenticated_session(&mut stream, store, engine, username);
+        return run_authenticated_session(&mut stream, store, engine, username, session_limits);
     };
 
     match negotiate_startup_or_upgrade(&mut stream, mode) {
         Ok(PreTlsOutcome::Ready(username)) => {
-            run_authenticated_session(&mut stream, store, engine, username)
+            run_authenticated_session(&mut stream, store, engine, username, session_limits)
         }
-        Ok(PreTlsOutcome::UpgradeTls) => handle_tls_upgrade(stream, store, engine, tls_config),
+        Ok(PreTlsOutcome::UpgradeTls) => {
+            handle_tls_upgrade(stream, store, engine, tls_config, session_limits)
+        }
         Ok(PreTlsOutcome::PlaintextRejected) => respond_and_close(
             &mut stream,
             HandshakeError::Protocol("plaintext startup rejected (tls-mode=require)"),
@@ -1564,6 +1598,7 @@ fn handle_tls_upgrade(
     store: &UserStore,
     engine: Option<&engine::core::EngineCore>,
     tls_config: Arc<crate::tls::server_handshake::TlsServerConfig>,
+    session_limits: crate::limits::SessionLimits,
 ) -> io::Result<()> {
     // `'S'`（受理）を返す。以後のバイト列は TLS レコードとして扱われる。
     write_all(&mut stream, b"S")?;
@@ -1578,18 +1613,25 @@ fn handle_tls_upgrade(
     let saved_read_timeout = stream.read_timeout()?;
     let saved_write_timeout = stream.write_timeout()?;
 
-    let session =
-        match crate::tls::server_handshake::perform_server_handshake(&mut stream, tls_config) {
-            Ok(session) => session,
-            Err(_e) => {
-                // alert の送出・切断は driver 側が既に行っている
-                // （`perform_server_handshake_with` のドキュメント参照）。
-                // ErrorResponse は送らない（TLS ハンドシェイクの失敗は
-                // ERR-1/2/4 の wire_code 写像の対象外。
-                // `docs/design/tls-wire-connection.md` 参照）。
-                return Err(io::Error::other("TLS handshake failed"));
-            }
-        };
+    // ハンドシェイクの絶対期限も接続の読み取りタイムアウト設定値へ追従させる
+    // （Issue #2454。`--read-timeout-secs` を短縮してもハンドシェイク中に既定 30 秒の
+    // 占有窓が残らないようにする）。未設定（`None`）は従来の既定値。
+    let handshake_timeout = saved_read_timeout.unwrap_or(crate::limits::READ_TIMEOUT);
+    let session = match crate::tls::server_handshake::perform_server_handshake_with_timeout(
+        &mut stream,
+        tls_config,
+        handshake_timeout,
+    ) {
+        Ok(session) => session,
+        Err(_e) => {
+            // alert の送出・切断は driver 側が既に行っている
+            // （`perform_server_handshake_with` のドキュメント参照）。
+            // ErrorResponse は送らない（TLS ハンドシェイクの失敗は
+            // ERR-1/2/4 の wire_code 写像の対象外。
+            // `docs/design/tls-wire-connection.md` 参照）。
+            return Err(io::Error::other("TLS handshake failed"));
+        }
+    };
 
     if stream.set_read_timeout(saved_read_timeout).is_err()
         || stream.set_write_timeout(saved_write_timeout).is_err()
@@ -1610,7 +1652,8 @@ fn handle_tls_upgrade(
         }
     };
 
-    let result = run_authenticated_session(&mut tls_stream, store, engine, username);
+    let result =
+        run_authenticated_session(&mut tls_stream, store, engine, username, session_limits);
     tls_stream.graceful_close();
     result
 }

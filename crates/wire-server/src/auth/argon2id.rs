@@ -78,7 +78,7 @@ pub const MAX_SALT_LEN: usize = 64;
 
 /// 同時に実行してよい Argon2id KDF（[`hash_raw`]）呼び出し数の上限。1 回の
 /// `hash_raw` は最大 [`MAX_M_COST_KIB`]（256 MiB）を確保しうるため、上限なしに
-/// 同時実行を許すと、最大同時接続数（`limits::MAX_CONNECTIONS` = 64）
+/// 同時実行を許すと、最大同時接続数（`limits::MAX_CONNECTIONS` の既定値）
 /// に比例して理論上 64 接続 × 256 MiB = 16 GiB の同時確保が起こりうる
 /// （review 指摘）。最悪ケースの累積メモリ = `MAX_CONCURRENT_ARGON2_KDF` ×
 /// `MAX_M_COST_KIB`（8 × 256 MiB = 2 GiB）に抑える。上限超過時は
