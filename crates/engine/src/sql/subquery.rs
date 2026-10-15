@@ -1060,7 +1060,9 @@ fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
             Some(SubqueryValueFamily::Integer)
         }
         ColumnType::Real | ColumnType::Double => Some(SubqueryValueFamily::Float),
-        ColumnType::Vector(_)
+        // `TIME` のサブクエリ比較は #1570 で解禁する（Issue #1569。fail-closed）。
+        ColumnType::Time
+        | ColumnType::Vector(_)
         | ColumnType::Array(_)
         | ColumnType::Json
         | ColumnType::Jsonb

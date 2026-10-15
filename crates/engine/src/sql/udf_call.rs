@@ -2509,6 +2509,10 @@ fn bind_expr_any(
                         BoundExpr::TimestampColumnRef { index },
                         ExprType::Timestamp,
                     )),
+                    // `TIME` 列の式内参照は #1570 で解禁する（Issue #1569。fail-closed）。
+                    ColumnType::Time => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (TIME columns are not supported)"
+                    ))),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (ARRAY columns are not supported)"
                     ))),
@@ -3055,6 +3059,7 @@ fn column_type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Boolean => "boolean",
         ColumnType::Date => "date",
         ColumnType::Timestamp => "timestamp",
+        ColumnType::Time => "time",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",

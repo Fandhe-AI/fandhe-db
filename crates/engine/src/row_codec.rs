@@ -178,6 +178,10 @@ pub enum Value {
     /// 日時列の値（TABLE-13・TASK-197、Issue #884）。1970-01-01 00:00:00
     /// 起点のマイクロ秒（`i64`、タイムゾーンなし）。
     Timestamp(i64),
+    /// 時刻列の値（TABLE-32・Issue #1569）。0 時起点のマイクロ秒（`i64`、タイムゾーン
+    /// なし。範囲は `00:00:00`〜`24:00:00` の両端を含む）。`Timestamp` と別 variant に
+    /// するのは、日時として誤って投影・比較されないようにするため（fail-closed）。
+    Time(i64),
     /// 配列列の値（TABLE-14・TASK-198、Issue #888）。要素型ごとに variant を
     /// 分けることで、同一列の要素がすべて同じ型であることを型で保証する
     /// （`ColumnType::Array` の `ArrayElemType` と対応させる）。
@@ -449,6 +453,8 @@ pub enum ScalarRef<'a> {
     /// 日時列（TABLE-13・TASK-197、Issue #884）。1970-01-01 00:00:00 起点の
     /// マイクロ秒（タイムゾーンなし）。
     Timestamp(i64),
+    /// 時刻列（TABLE-32・Issue #1569）。0 時起点のマイクロ秒。
+    Time(i64),
     /// 配列列の借用結果（Issue #888）。構造・UTF-8・要素上限はすべて走査時に
     /// 検証済みで、[`ArrayRef::to_value`] は追加のエラー処理なしに複製できる。
     Array(ArrayRef<'a>),
@@ -494,6 +500,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bool(_)
             | ScalarRef::Date(_)
             | ScalarRef::Timestamp(_)
+            | ScalarRef::Time(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -513,6 +520,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Double(_)
             | ScalarRef::Date(_)
             | ScalarRef::Timestamp(_)
+            | ScalarRef::Time(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -534,6 +542,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Double(_)
             | ScalarRef::Bool(_)
             | ScalarRef::Timestamp(_)
+            | ScalarRef::Time(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -555,6 +564,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Double(_)
             | ScalarRef::Bool(_)
             | ScalarRef::Date(_)
+            | ScalarRef::Time(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -579,6 +589,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bool(_)
             | ScalarRef::Date(_)
             | ScalarRef::Timestamp(_)
+            | ScalarRef::Time(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -604,6 +615,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bool(_)
             | ScalarRef::Date(_)
             | ScalarRef::Timestamp(_)
+            | ScalarRef::Time(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -631,6 +643,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bool(_)
             | ScalarRef::Date(_)
             | ScalarRef::Timestamp(_)
+            | ScalarRef::Time(_)
             | ScalarRef::Array(_)
             | ScalarRef::Json(_)
             | ScalarRef::Enum(_)
@@ -654,6 +667,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Bool(_)
             | ScalarRef::Date(_)
             | ScalarRef::Timestamp(_)
+            | ScalarRef::Time(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -756,6 +770,10 @@ pub(crate) const SCALAR_DATE_ENTRY_LEN: u32 = 5;
 /// `TIMESTAMP` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込み
 /// バイト数（presence(1) + 値(8, LE i64)。Issue #884）。
 pub(crate) const SCALAR_TIMESTAMP_ENTRY_LEN: u32 = 9;
+
+/// `TIME` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + 値(8, LE i64)。Issue #1569。`TIMESTAMP` と同じ枠）。
+pub(crate) const SCALAR_TIME_ENTRY_LEN: u32 = 9;
 
 /// 配列列のフレーム flags バイト（NULL 要素なし）。ペイロードは要素列のみ。
 const ARRAY_FLAGS_NONE: u8 = 0x00;
@@ -1673,6 +1691,7 @@ pub fn encode_row(
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
+                    | ColumnType::Time
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -1717,6 +1736,7 @@ pub fn encode_row(
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
+                    | ColumnType::Time
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -1812,6 +1832,22 @@ pub fn encode_row(
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&micros.to_le_bytes());
             }
+            Value::Time(micros) => {
+                if !matches!(column.ty, ColumnType::Time) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Time value, got Time",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_time_micros(*micros) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: time value out of range: {micros}",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&micros.to_le_bytes());
+            }
             Value::Array(array_value) => {
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
@@ -1827,6 +1863,7 @@ pub fn encode_row(
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
+                    | ColumnType::Time
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
@@ -1888,6 +1925,7 @@ pub fn encode_row(
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
+                    | ColumnType::Time
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -2059,6 +2097,7 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         Some(ScalarRef::Enum(t)) => Value::Enum(t.to_string()),
                         Some(ScalarRef::Uuid(u)) => Value::Uuid(u),
                         Some(ScalarRef::Timestamp(t)) => Value::Timestamp(t),
+                        Some(ScalarRef::Time(t)) => Value::Time(t),
                         Some(ScalarRef::Json(t)) => Value::Json(t.to_string()),
                         _ => {
                             return Err(RowCodecError::Invalid(format!(
@@ -2375,6 +2414,34 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         )
                     })?;
                     values.push(Value::Timestamp(micros));
+                }
+                ColumnType::Time => {
+                    let micros_bytes = buf
+                        .get(
+                            offset..offset.checked_add(8).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before time value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at time value field".to_string(),
+                            )
+                        })?;
+                    let micros_arr: [u8; 8] = micros_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("time value field is not 8 bytes".to_string())
+                    })?;
+                    let micros = i64::from_le_bytes(micros_arr);
+                    if !crate::datetime::validate_time_micros(micros) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "time value {micros} is out of the representable range"
+                        )));
+                    }
+                    offset = offset.checked_add(8).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after time value field".to_string())
+                    })?;
+                    values.push(Value::Time(micros));
                 }
                 ColumnType::Array(array_ty) => {
                     let (array_ref, new_offset) =
@@ -2708,6 +2775,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
+                    | ColumnType::Time
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -2813,6 +2881,23 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&micros.to_le_bytes());
             }
+            Value::Time(micros) => {
+                if !matches!(column.ty, ColumnType::Time) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Time value, got Time",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_time_micros(*micros) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: time value out of range: {micros}",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_TIME_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&micros.to_le_bytes());
+            }
             Value::Array(array_value) => {
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
@@ -2828,6 +2913,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
+                    | ColumnType::Time
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
@@ -2906,6 +2992,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
+                    | ColumnType::Time
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -3174,6 +3261,7 @@ fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) ->
         | ColumnType::Boolean
         | ColumnType::Date
         | ColumnType::Timestamp
+        | ColumnType::Time
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -3402,6 +3490,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Boolean
                         | ColumnType::Date
                         | ColumnType::Timestamp
+                        | ColumnType::Time
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -3496,6 +3585,23 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_VALUE);
                     buf.extend_from_slice(&micros.to_le_bytes());
                 }
+                Value::Time(micros) => {
+                    if !matches!(column.ty, ColumnType::Time) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Time value, got Time",
+                            column.name
+                        )));
+                    }
+                    if !crate::datetime::validate_time_micros(*micros) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: time value out of range: {micros}",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_TIME_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&micros.to_le_bytes());
+                }
                 Value::Array(array_value) => {
                     let array_ty = match &column.ty {
                         ColumnType::Array(array_ty) => array_ty,
@@ -3511,6 +3617,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Boolean
                         | ColumnType::Date
                         | ColumnType::Timestamp
+                        | ColumnType::Time
                         | ColumnType::Bytea
                         | ColumnType::Json
                         | ColumnType::Jsonb
@@ -3552,6 +3659,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Boolean
                         | ColumnType::Date
                         | ColumnType::Timestamp
+                        | ColumnType::Time
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -3685,6 +3793,11 @@ pub(crate) fn merge_encode_scalar_columns(
                 }
                 Some(ScalarRef::Timestamp(micros)) => {
                     reserve(&mut buf, SCALAR_TIMESTAMP_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&micros.to_le_bytes());
+                }
+                Some(ScalarRef::Time(micros)) => {
+                    reserve(&mut buf, SCALAR_TIME_ENTRY_LEN)?;
                     buf.push(PRESENCE_VALUE);
                     buf.extend_from_slice(&micros.to_le_bytes());
                 }
@@ -4033,6 +4146,17 @@ pub(crate) fn default_scalar<'a>(
                 }
             }
         }
+        // `TIME` 列も `datetime::parse_time`（INSERT のリテラル束縛と同じ閉じた文法）で
+        // 解釈する（Issue #1569）。
+        (ColumnDefault::Text(s), ColumnType::Time) => match crate::datetime::parse_time(s) {
+            Ok(micros) => Ok(ScalarRef::Time(micros)),
+            Err(crate::datetime::DateTimeLiteralError::Format(_)) => {
+                Err(DefaultBindError::DatetimeFormat)
+            }
+            Err(crate::datetime::DateTimeLiteralError::Overflow(_)) => {
+                Err(DefaultBindError::DatetimeOverflow)
+            }
+        },
         // `JSON` 列の既定値は文字列リテラルの原文を保持し、構文だけを共有検証
         // （`json::validate_json_column_text`）で確認する（Issue #1337）。
         (ColumnDefault::Text(s), ColumnType::Json) => {
@@ -4606,6 +4730,38 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
+                ColumnType::Time => {
+                    let micros_bytes = buf
+                        .get(
+                            offset..offset.checked_add(8).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before time value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at time value field".to_string(),
+                            )
+                        })?;
+                    let micros_arr: [u8; 8] = micros_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("time value field is not 8 bytes".to_string())
+                    })?;
+                    let micros = i64::from_le_bytes(micros_arr);
+                    if !crate::datetime::validate_time_micros(micros) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "time value {micros} is out of the representable range"
+                        )));
+                    }
+                    offset = offset.checked_add(8).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after time value field".to_string())
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Time(micros)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
                 ColumnType::Json | ColumnType::Jsonb => {
                     // フレーミング・UTF-8 検証は TEXT と共有する（Issue #889 D2）。
                     // 格納時（encode 経路）に構文検証・正規化済みのため、ここでは
@@ -4696,6 +4852,7 @@ pub fn scalar_refs_as_text<'a>(scanned: &[Option<ScalarRef<'a>>]) -> Vec<Option<
             | Some(ScalarRef::Bool(_))
             | Some(ScalarRef::Date(_))
             | Some(ScalarRef::Timestamp(_))
+            | Some(ScalarRef::Time(_))
             | Some(ScalarRef::Array(_))
             | Some(ScalarRef::Bytes(_))
             | Some(ScalarRef::Json(_))
@@ -4750,6 +4907,7 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
             Some(ScalarRef::Bool(b)) => values.push(Value::Bool(b)),
             Some(ScalarRef::Date(days)) => values.push(Value::Date(days)),
             Some(ScalarRef::Timestamp(micros)) => values.push(Value::Timestamp(micros)),
+            Some(ScalarRef::Time(micros)) => values.push(Value::Time(micros)),
             Some(ScalarRef::Array(array_ref)) => {
                 values.push(Value::Array(array_ref.to_value()?));
             }

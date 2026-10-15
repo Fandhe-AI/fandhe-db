@@ -565,7 +565,7 @@ fn bind_copy_record(
                 ColumnType::Bytea => bind_bytea_literal(s, name)?,
                 ColumnType::Enum(def) => bind_enum_literal(def, s, name)?,
                 ColumnType::Json | ColumnType::Jsonb => bind_json_literal(s, &column.ty, name)?,
-                ColumnType::Date | ColumnType::Timestamp => {
+                ColumnType::Date | ColumnType::Timestamp | ColumnType::Time => {
                     bind_datetime_literal(name, column.ty.clone(), s)?
                 }
                 ColumnType::Uuid => bind_uuid_literal(s, name)?,
@@ -673,6 +673,8 @@ fn bound_insert_byte_len(bound: &BoundInsert) -> Result<usize, SqlSurfaceError> 
             // chunk_limits` と同一の判定対象量定義）。
             Value::Date(_) => 4,
             Value::Timestamp(_) => 8,
+            // TIME 値は行コーデック上 8 バイト固定（Issue #1569）。
+            Value::Time(_) => 8,
             // NUMERIC／UUID 値は行コーデック上いずれも 16 バイト固定
             // （`core.rs::validate_insert_batch_byte_and_chunk_limits` と
             // 同一の判定対象量定義。Issue #885・#887）。

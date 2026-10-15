@@ -916,6 +916,9 @@ pub(crate) fn push_canonical_component(
             ColumnType::Timestamp.unique_key_tag(),
             &t.to_be_bytes(),
         ),
+        // TIME は PK／UNIQUE 非許可（Issue #1569。#1570 で解禁）。到達しない契約の腕で、
+        // 到達した場合は fail-closed に拒否する。
+        ScalarRef::Time(_) => return Err("unique key column does not support TIME"),
         ScalarRef::Bytes(b) => push_len_prefixed(out, ColumnType::Bytea.unique_key_tag(), b),
         ScalarRef::Uuid(u) => {
             push_len_prefixed(out, ColumnType::Uuid.unique_key_tag(), u.as_bytes())
@@ -1029,6 +1032,7 @@ pub(crate) fn unique_key_from_values(
             Value::Bool(b) => ScalarRef::Bool(*b),
             Value::Date(d) => ScalarRef::Date(*d),
             Value::Timestamp(t) => ScalarRef::Timestamp(*t),
+            Value::Time(t) => ScalarRef::Time(*t),
             Value::Bytes(b) => ScalarRef::Bytes(b.as_slice()),
             Value::Enum(s) => ScalarRef::Enum(s.as_str()),
             Value::Uuid(u) => ScalarRef::Uuid(*u),
@@ -1891,6 +1895,7 @@ fn value_as_scalar_ref(value: &crate::row_codec::Value) -> Option<ScalarRef<'_>>
         | Value::Double(_)
         | Value::Array(_)
         | Value::Json(_)
+        | Value::Time(_)
         | Value::Numeric(_) => None,
     }
 }

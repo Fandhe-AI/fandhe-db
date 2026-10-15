@@ -156,3 +156,16 @@ build`（production の既定入口）は `DATE`／`TIMESTAMP` を常に構築�
 ## Issue #896 追記
 
 NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応・`columns[].type` の型名整備は Issue #896（NOSQL-17）で実施済み。詳細は `docs/design/nosql-typed-json-binding.md` 参照。
+
+## Issue #1569 追記: TIME 列型
+
+`TIME [WITHOUT TIME ZONE]` を独立の `ColumnType::Time` として追加した（TABLE-32・親 #1568 のポインタ。第 1 段）。
+
+- **内部表現**: 0 時起点のマイクロ秒 `i64`。受理範囲は `00:00:00`〜`24:00:00`（両端を含む。`24:00:00` は受理、`24:00:00.000001` は `22008`）。カタログタグは `time`（`param` は `-` 固定）。値は `Value::Time`／`ScalarRef::Time`／`Cell::Time` の専用 variant とし、TIMESTAMP の variant を流用しない（日時として誤投影・誤比較される fail-open を防ぐ）。行バイトは presence + `i64 LE`（9 バイト。`SCALAR_TIME_ENTRY_LEN`）で、encode・decode・scan のすべてで `validate_time_micros` により範囲を再検証する。`content_hash` は未使用のタグ 16 を採番した。
+- **閉じた文法**: `HH:MM[:SS[.f+]]`。HH・MM・SS は 2 桁 ASCII 数字固定。前後空白・TZ 接尾辞・AM/PM・特殊語・非 ASCII・長さ超過は `22007`、範囲外は `22008`（DATE／TIMESTAMP と同じ写像）。
+- **丸め**: 端数は 7 桁目で丸め（0.5 は 0 から遠い側）、8 桁目以降は数字確認のみで捨てる。丸めた後に範囲を判定する（`23:59:59.9999995` は `24:00:00` として受理）。PostgreSQL は浮動小数の丸めを使うため、0.5 ちょうどの境界は乖離しうる。
+- **PostgreSQL との乖離**: 秒 60 を繰り上げず `22008` で拒否する（TIMESTAMP の D-5 と同じ）。TZ 接尾辞・AM/PM・1 桁の時は受理しない。
+- **整形**: `HH:MM:SS[.ffffff]`（端数 0 なら省略、末尾の 0 は削る）。端数の整形は `format_timestamp` と共通ヘルパーを共有する。
+- **型名**: `TIME`・`TIME WITHOUT TIME ZONE` は受理。`TIME(p)`・`TIME WITH TIME ZONE`・`TIMETZ`・`time[]` は構文段で `0A000`。`TIME` は綴りを保持する別名として返し、同名 ENUM との衝突を実行段が検出する。`time`・`timetz` は `CREATE_ONLY_RESERVED_TYPE_NAMES` へ追加した（`RESERVED_TYPE_NAMES` へは足さない）。
+- **暫定挙動（兄弟 Issue で解禁・反転する前提）**: WHERE・式・集計・`GROUP BY`・`ORDER BY`・`DISTINCT`・window・JOIN キー・サブクエリ比較・集合演算・SET 式・二次索引・PK／UNIQUE／FK・`ALTER COLUMN TYPE`（TIME との相互変換）は既存の拒否コードで fail-closed。wire は RowDescription が暫定で text（OID 25）・バイナリ非対応、NoSQL は型束縛・フィルタとも拒否（応答の型名のみ `"time"`）。
+- **対象外**: 述語・集計・索引・EXTRACT・型付きリテラル式 `TIME '...'`（#1570）、wire OID 1083・バイナリ入出力・NoSQL 型束縛（#1571）、`TIME(p)` の保存精度（兄弟 Issue に担当なし。要確認）、`time[]`（OID 1183）。

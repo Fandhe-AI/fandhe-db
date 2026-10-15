@@ -8254,6 +8254,8 @@ impl EngineCore {
                     // （Issue #884・D-3）。
                     crate::row_codec::Value::Date(_) => 4,
                     crate::row_codec::Value::Timestamp(_) => 8,
+                    // TIME 値は行コーデック上 8 バイト固定（Issue #1569）。
+                    crate::row_codec::Value::Time(_) => 8,
                     // 配列値（Issue #888）は実際の行コーデック（`row_codec::
                     // scalar_array_entry_len`）が書き込むフレーム込みの全
                     // エンコード長をそのまま使う（presence(1)・flags(1)・

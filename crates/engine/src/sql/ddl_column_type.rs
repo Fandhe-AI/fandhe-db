@@ -82,6 +82,7 @@ pub(crate) fn to_static_column_type_with_array_default(
         SqlColumnTypeName::Boolean => ColumnType::Boolean,
         SqlColumnTypeName::Date => ColumnType::Date,
         SqlColumnTypeName::Timestamp => ColumnType::Timestamp,
+        SqlColumnTypeName::Time => ColumnType::Time,
         SqlColumnTypeName::Bytea => ColumnType::Bytea,
         SqlColumnTypeName::Json => ColumnType::Json,
         SqlColumnTypeName::Jsonb => ColumnType::Jsonb,
@@ -131,6 +132,12 @@ pub(crate) fn to_static_column_type_with_array_default(
                 ColumnType::Double => ArrayElemType::Double,
                 ColumnType::Date => ArrayElemType::Date,
                 ColumnType::Timestamp => ArrayElemType::Timestamp,
+                // `time[]` は別 OID（1183）のため拒否する（Issue #1569。`smallint[]` と同じ理由）。
+                ColumnType::Time => {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "this array element type is not supported yet".to_string(),
+                    })
+                }
                 ColumnType::Uuid => ArrayElemType::Uuid,
                 ColumnType::Numeric { precision, scale } => {
                     ArrayElemType::Numeric { precision, scale }
@@ -201,6 +208,9 @@ pub enum SqlColumnTypeName {
     Boolean,
     Date,
     Timestamp,
+    /// `TIME`／`TIME WITHOUT TIME ZONE`（TABLE-32・Issue #1569）。`TIME(p)`・
+    /// `TIME WITH TIME ZONE`・`TIMETZ` は構文段で `0A000` のため本 variant には到達しない。
+    Time,
     Bytea,
     Json,
     Jsonb,
@@ -306,6 +316,10 @@ enum TypeNameKind {
     Float,
     /// `TIMESTAMP [WITHOUT TIME ZONE]`（Issue #2304）。`WITHOUT` が続けば `TIME ZONE` を必須とする。
     Timestamp,
+    /// `TIME [WITHOUT TIME ZONE]`（Issue #1569。TABLE-32）。`WITH TIME ZONE` と `(p)` は
+    /// `0A000`（保存精度 p を持たないため丸めを守れず、fail-closed）。綴りを保持する別名
+    /// として返す（`TIME` は予約型名でなく既存 ENUM 名と衝突し得るため、実行段が検出する）。
+    Time,
     /// `VECTOR(N)`。
     Vector,
     /// `NUMERIC(p,s)`／`DECIMAL(p,s)`。
@@ -319,6 +333,9 @@ enum TypeNameKind {
     /// `CHARACTER [VARYING]` の先頭語。直後が `VARYING` なら `VARCHAR` と同じ扱い、
     /// `VARYING` なしは `CHAR(n)` と同じ扱い。
     Character,
+    /// 列型として未対応の綴り（`0A000`）。正規名でメッセージを組み立てる（Issue #1569 の
+    /// `TIMETZ`）。
+    Unsettled { canonical: &'static str },
 }
 
 /// 型名解決表。先頭語（大小無視）で引く。表に無い識別子は ENUM 型名候補
@@ -347,6 +364,14 @@ const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
     ),
     ("DATE", TypeNameKind::Direct(|| SqlColumnTypeName::Date)),
     ("TIMESTAMP", TypeNameKind::Timestamp),
+    ("TIME", TypeNameKind::Time),
+    // `TIMETZ`（`TIME WITH TIME ZONE` の別綴り）は列型として未対応（Issue #1569）。
+    (
+        "TIMETZ",
+        TypeNameKind::Unsettled {
+            canonical: "time with time zone",
+        },
+    ),
     ("BYTEA", TypeNameKind::Direct(|| SqlColumnTypeName::Bytea)),
     ("JSON", TypeNameKind::Direct(|| SqlColumnTypeName::Json)),
     ("JSONB", TypeNameKind::Direct(|| SqlColumnTypeName::Jsonb)),
@@ -363,6 +388,13 @@ const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
     ("CHAR", TypeNameKind::Char),
     ("CHARACTER", TypeNameKind::Character),
 ];
+
+/// 未確定型の `0A000`。メッセージは正規名のみで組み立て、綴り（別名）に依らず同一にする。
+fn unsettled_type_error(canonical: &str) -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: format!("type {canonical} is not supported yet"),
+    }
+}
 
 /// 長さなしの `CHAR`／`CHARACTER` の `0A000`（PG では `CHAR(1)`。本 Issue の対象外。Issue #1563）。
 /// メッセージは綴りに依らず同一にする。
@@ -465,6 +497,22 @@ fn parse_base_type_name(
             }
             Ok(SqlColumnTypeName::Timestamp)
         }
+        TypeNameKind::Time => {
+            match tokens.get(*pos) {
+                Some(Token::Punct('(')) => return Err(unsettled_type_error("time(p)")),
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("WITH") => {
+                    return Err(unsettled_type_error("time with time zone"));
+                }
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("WITHOUT") => {
+                    *pos += 1;
+                    expect_contextual_keyword(tokens, pos, "TIME")?;
+                    expect_contextual_keyword(tokens, pos, "ZONE")?;
+                }
+                _ => {}
+            }
+            Ok(alias_type(name, SqlColumnTypeName::Time))
+        }
+        TypeNameKind::Unsettled { canonical } => Err(unsettled_type_error(canonical)),
         TypeNameKind::Vector => {
             expect_punct(tokens, pos, '(')?;
             let dim = expect_strict_u32(tokens, pos)?;

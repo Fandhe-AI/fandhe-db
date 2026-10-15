@@ -1145,8 +1145,10 @@ impl ScalarIndex {
                 // 前方一致・範囲述語を持たないため同じく非索引化（判断根拠は
                 // `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
                 // `VECTOR` 列も従来どおり索引対象外。
+                // `TIME` 列も索引対象外（Issue #1569。#1570 で解禁する）。
                 ColumnType::Vector(_)
                 | ColumnType::Boolean
+                | ColumnType::Time
                 | ColumnType::Array(_)
                 | ColumnType::Json
                 | ColumnType::Jsonb => {
