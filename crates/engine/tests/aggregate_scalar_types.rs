@@ -1058,3 +1058,137 @@ fn in_subquery_with_sum_bigint_stays_unsupported() {
         assert_eq!(err.wire_code(), "42601", "{kw}");
     }
 }
+
+/// 整数列・浮動小数列の `IN`／`NOT IN` は、内側が scale 0 の numeric（`SUM(BIGINT)` と
+/// 同じ型）でも受理され、numeric 比較の意味論で照合する（Issue #2271）。
+#[test]
+fn in_and_not_in_accept_scale0_numeric_inner_column() {
+    let path = unique_db_path("aggregate-scale0-in");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("b", ColumnType::BigInt, true),
+                ColumnDef::new("d", ColumnType::Double, true),
+                ColumnDef::new(
+                    "q",
+                    ColumnType::Numeric {
+                        precision: 38,
+                        scale: 0,
+                    },
+                    true,
+                ),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let alice = ctx_for("alice");
+    // (id, b, d, q): q は b と一致する行（id 1）・しない行（id 2）・NULL（id 3）・
+    // i64 を超える numeric（id 4。どの b・d とも一致しない）。
+    for (id, b, d, q) in [
+        (1, "10", "10.0", "10"),
+        (2, "20", "25.0", "11"),
+        (3, "30", "30.0", "NULL"),
+        (4, "40", "40.0", "99999999999999999999"),
+    ] {
+        core.execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO t (id, embedding, b, d, q) VALUES \
+                 ({id}, '[0.1,0.2]', {b}, {d}, {q}) USING OPERATION_ID 'op-{id}'"
+            ),
+        )
+        .expect("insert");
+    }
+    let ids = |sql: &str| -> Vec<u64> {
+        let r = core.execute_sql(&alice, sql).expect("must be accepted");
+        let mut v: Vec<u64> = r
+            .rows
+            .iter()
+            .map(|row| match &row.cells[0] {
+                Cell::Integer(n) => *n,
+                other => panic!("unexpected cell {other:?}"),
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    let nn = "SELECT q FROM t WHERE q IS NOT NULL LIMIT 10";
+    // 整数列 IN: q の集合は {10, 11, 99999999999999999999}
+    assert_eq!(
+        ids(&format!("SELECT id FROM t WHERE b IN ({nn}) LIMIT 10")),
+        vec![1]
+    );
+    assert_eq!(
+        ids(&format!("SELECT id FROM t WHERE b NOT IN ({nn}) LIMIT 10")),
+        vec![2, 3, 4]
+    );
+    // 浮動小数列 IN／NOT IN
+    assert_eq!(
+        ids(&format!("SELECT id FROM t WHERE d IN ({nn}) LIMIT 10")),
+        vec![1]
+    );
+    assert_eq!(
+        ids(&format!("SELECT id FROM t WHERE d NOT IN ({nn}) LIMIT 10")),
+        vec![2, 3, 4]
+    );
+    // 内側に NULL を含む NOT IN は、真になる行が無い（IN は一致行のみ）。
+    let with_null = "SELECT q FROM t LIMIT 10";
+    assert_eq!(
+        ids(&format!(
+            "SELECT id FROM t WHERE b NOT IN ({with_null}) LIMIT 10"
+        )),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        ids(&format!(
+            "SELECT id FROM t WHERE d NOT IN ({with_null}) LIMIT 10"
+        )),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        ids(&format!(
+            "SELECT id FROM t WHERE b IN ({with_null}) LIMIT 10"
+        )),
+        vec![1]
+    );
+    // スカラー比較: i64 を超える numeric との厳密比較（int_compare の範囲外写像）。
+    assert_eq!(
+        ids("SELECT id FROM t WHERE b < (SELECT q FROM t WHERE id = 4 LIMIT 1) LIMIT 10"),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(
+        ids("SELECT id FROM t WHERE b = (SELECT q FROM t WHERE id = 4 LIMIT 1) LIMIT 10"),
+        Vec::<u64>::new()
+    );
+}
+
+/// 整数列と `SUM(BIGINT)` のスカラー比較は、`i64` を超える合計でも厳密に比べる。
+#[test]
+fn integer_column_compares_with_huge_sum_bigint_scalar_subquery() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    // 列値は式評価器の正確表現範囲（2^53 未満）に収め、合計だけ i64 を超えさせる
+    // ことはできないため 2^54 近傍（2^53 を超える numeric）で厳密比較を確認する。
+    insert_b(&core, &alice, 1, "ja", 1, 9_007_199_254_740_991);
+    insert_b(&core, &alice, 2, "ja", 1, 9_007_199_254_740_991);
+    let lt = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE b < (SELECT SUM(b) FROM {TABLE}) LIMIT 10"),
+        )
+        .expect("accepted");
+    assert_eq!(lt.rows.len(), 2);
+    let eq = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE b = (SELECT SUM(b) FROM {TABLE}) LIMIT 10"),
+        )
+        .expect("accepted");
+    assert_eq!(eq.rows.len(), 0);
+}

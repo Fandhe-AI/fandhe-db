@@ -843,7 +843,7 @@ fn static_validate_subquery_predicates(
                     ));
                 };
                 let (_, family) = validate_in_target_column(column, owner_schema(chain)?)?;
-                if inner_value_family(inner_meta) != Some(family) {
+                if !in_family_compatible(inner_meta, family) {
                     return Err(in_family_mismatch(column));
                 }
             }
@@ -1112,6 +1112,18 @@ fn validate_in_target_column<'a>(
     }
 }
 
+/// `IN`／`NOT IN` の内側投影列が対象列の値族と比較可能か。値族の完全一致に加え、
+/// scale 0 の `NUMERIC`（`SUM(BIGINT)` 等。Issue #2271）は整数・浮動小数列の対象と
+/// 比較できる（PostgreSQL と同じ。従来受理していた比較を `SUM` の戻り値型変更で
+/// 拒否しない）。実行時のセル取り出しは [`resolve_in_subquery`] が担う。
+fn in_family_compatible(inner_meta: &ColumnMeta, family: SubqueryValueFamily) -> bool {
+    inner_value_family(inner_meta) == Some(family)
+        || (matches!(
+            family,
+            SubqueryValueFamily::Integer | SubqueryValueFamily::Float
+        ) && is_scale0_numeric_meta(inner_meta))
+}
+
 /// `IN` の内側投影列と対象列の値族不一致の静的エラー（`resolve_in_subquery` 用）。
 fn in_family_mismatch(column: &str) -> SqlSurfaceError {
     SqlSurfaceError::invalid_input(format!(
@@ -1172,7 +1184,7 @@ fn resolve_in_subquery(
             if is_deferrable_runtime_error(&e) {
                 let (_, family) = validate_in_target_column(column, owner_schema(outer_scopes)?)?;
                 if let Some([inner_meta]) = meta_sink.as_deref() {
-                    if inner_value_family(inner_meta) != Some(family) {
+                    if !in_family_compatible(inner_meta, family) {
                         return Err(in_family_mismatch(column));
                     }
                 }
@@ -1197,7 +1209,7 @@ fn resolve_in_subquery(
         .ok_or_else(|| SqlSurfaceError::Internal {
             detail: "subquery result missing projected column metadata".to_string(),
         })?;
-    if inner_value_family(inner_meta) != Some(family) {
+    if !in_family_compatible(inner_meta, family) {
         return Err(in_family_mismatch(column));
     }
 
@@ -1243,6 +1255,9 @@ fn resolve_in_subquery(
                 // 疑似列 `id` は `u64` 全域を取り得るため、`i128` で保持して落とさない
                 // （`i64` 超の値も等価比較の対象とする。範囲外の写像は `int_compare` が担う）。
                 Cell::Integer(n) => ints.push(i128::from(*n)),
+                // scale 0 の numeric（`SUM(BIGINT)`。Issue #2271）は `i128` の厳密値として
+                // 保持し、`i64` 超でも誤った一致・不一致を出さない。
+                Cell::Numeric(d) if d.scale() == 0 => ints.push(d.unscaled()),
                 _ => return Err(unexpected_cell_type()),
             },
             SubqueryValueFamily::Float => match cell {
@@ -1256,6 +1271,12 @@ fn resolve_in_subquery(
                     return Err(SqlSurfaceError::invalid_input(
                         "subquery returned a non-finite number",
                     ))
+                }
+                // scale 0 の numeric（Issue #2271）は float8 へ写して比較する
+                // （PostgreSQL の float8 × numeric 比較と同じく numeric 側を float8 へ変換）。
+                Cell::Numeric(d) if d.scale() == 0 => {
+                    let f = d.unscaled() as f64;
+                    floats.push(if f == 0.0 { 0.0 } else { f });
                 }
                 _ => return Err(unexpected_cell_type()),
             },
