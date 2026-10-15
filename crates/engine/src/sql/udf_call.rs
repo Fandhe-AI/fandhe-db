@@ -2660,8 +2660,20 @@ fn bind_expr_any(
         Expr::Binary { op, lhs, rhs } => {
             // Issue #2181: 左辺が jsonb の `-` は削除演算子（キー・添字）。それ以外の左辺は
             // 従来の算術経路のまま（既存の算術の挙動を変えない）。
-            if *op == BinOp::Sub && is_json_expr(lhs, env) {
-                return bind_json_delete(lhs, rhs, env, node_budget);
+            // AST 形で判定できる左辺（jsonb／json 列・パス／連結／削除演算子）は先に振り分ける。
+            // 関数呼び出し（`jsonb_build_object(..)` 等）の左辺は AST からは型が分からないため、
+            // 左辺を 1 度だけ束縛して得た [`ExprType`] で振り分ける（`||` の `bind_expr_any` と同方式。
+            // jsonb 以外は束縛済みの左辺を算術経路へ引き継ぎ、従来の挙動と fail-closed を保つ）。
+            let mut prebound_lhs: Option<(BoundExpr, ExprType)> = None;
+            if *op == BinOp::Sub {
+                if is_json_expr(lhs, env) {
+                    return bind_json_delete(lhs, rhs, env, node_budget);
+                }
+                let (l, lt) = bind_expr_any(lhs, env, node_budget)?;
+                if lt == ExprType::Json {
+                    return bind_json_delete_bound(l, rhs, env, node_budget);
+                }
+                prebound_lhs = Some((l, lt));
             }
             if matches!(
                 op,
@@ -2702,7 +2714,9 @@ fn bind_expr_any(
                 op,
                 BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq
             );
-            let (l, lt) = if is_comparison {
+            let (l, lt) = if let Some(pre) = prebound_lhs {
+                pre
+            } else if is_comparison {
                 bind_expr_any(lhs, env, node_budget)?
             } else {
                 bind_expr_in(lhs, env, node_budget)?
@@ -3154,6 +3168,36 @@ fn bind_json_delete(
     if l_ty != ExprType::Json {
         return Err(operator_missing());
     }
+    bind_json_delete_rhs(l, rhs, env, node_budget)
+}
+
+/// 左辺を束縛済みの `jsonb - ...`（関数呼び出し等 AST 形で判定できない左辺。Issue #2181）。
+fn bind_json_delete_bound(
+    l: BoundExpr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if CHECK_BINDING.with(std::cell::Cell::get) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "JSON operators are not supported in a CHECK constraint".to_string(),
+        });
+    }
+    bind_json_delete_rhs(l, rhs, env, node_budget)
+}
+
+/// `jsonb - text`／`jsonb - integer` の右辺の束縛と型振り分け（[`bind_json_delete`] の後半）。
+fn bind_json_delete_rhs(
+    l: BoundExpr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let operator_missing = || {
+        SqlSurfaceError::undefined_function(
+            "operator does not exist: the operand types do not match the - operator",
+        )
+    };
     let subscript_is_int4 = is_int4_expr(rhs, env);
     let saved_typed_arith = env.typed_arith;
     if subscript_is_int4 {

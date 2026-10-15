@@ -488,3 +488,37 @@ fn dml_where_with_modify_operators_acts_on_matching_rows_and_resend_is_content_c
     assert_eq!(matching(&core, &alice, "docb ? 'k'"), vec![1]);
     assert_eq!(matching(&core, &alice, "docb ? 'j'"), Vec::<u64>::new());
 }
+
+/// 左辺が jsonb を返す関数呼び出しの `-` も削除演算子として扱う（束縛後の型で振り分ける）。
+/// 非 jsonb の左辺は従来の算術経路のまま（fail-closed）。
+#[test]
+fn delete_accepts_jsonb_function_call_lhs() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed(&core, &alice, &[Some(r#"{"a":1,"b":{"a":2}}"#)]);
+    assert_eq!(
+        cell(&core, &alice, "jsonb_build_object('a', 1, 'b', 2) - 'a'", 1),
+        json(r#"{"b":2}"#)
+    );
+    assert_eq!(
+        cell(&core, &alice, "jsonb_build_array(1, 2) - 0", 1),
+        json("[2]")
+    );
+    assert_eq!(
+        cell(&core, &alice, "to_jsonb(docb) - 'a'", 1),
+        json(r#"{"b":{"a":2}}"#)
+    );
+    assert_eq!(
+        cell(&core, &alice, "jsonb_extract_path(docb, 'b') - 'a'", 1),
+        json("{}")
+    );
+    // 非 jsonb の左辺は算術のまま。
+    assert_eq!(cell(&core, &alice, "5 - 2", 1), Cell::SignedInteger(3));
+    assert!(core
+        .execute_sql(
+            &alice,
+            &format!("SELECT lower('A') - 1 FROM {TABLE} WHERE id = 1 LIMIT 1")
+        )
+        .is_err());
+}
