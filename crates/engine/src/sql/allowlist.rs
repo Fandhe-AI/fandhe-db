@@ -212,6 +212,10 @@ fn is_where_group_operator_token(token: &Token) -> bool {
             | Token::Punct('-')
             | Token::Punct('*')
             | Token::Punct('/')
+            | Token::Arrow
+            | Token::ArrowText
+            | Token::HashArrow
+            | Token::HashArrowText
     )
 }
 
@@ -15122,6 +15126,39 @@ mod tests {
             panic!("expected -> below, got {inner:?}");
         };
         assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+    }
+
+    /// Bugbot 指摘: 括弧付き値式の直後にパス演算子が続く `(d -> 'a') ->> 'b' = 'x'` が
+    /// BOOLEAN グループと誤分類されず、括弧なしと同じ木になる（NOT 前置の経路も含む）。
+    #[test]
+    fn parenthesized_json_path_chain_parses_as_value_group() {
+        use crate::sql::udf_call::JsonAccessOp;
+        for sql_op in ["->", "->>", "#>", "#>>"] {
+            let preds = where_predicates_for(&format!(
+                "SELECT * FROM documents WHERE (d -> 'a') {sql_op} 'b' = 'x' ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            ));
+            let [WherePredicate::Expression(Expr::Binary {
+                op: BinOp::Eq, lhs, ..
+            })] = preds.as_slice()
+            else {
+                panic!("expected a single comparison for {sql_op}, got {preds:?}");
+            };
+            let Expr::JsonAccess { lhs: inner, .. } = lhs.as_ref() else {
+                panic!("expected json access at the top, got {lhs:?}");
+            };
+            assert!(matches!(
+                inner.as_ref(),
+                Expr::JsonAccess {
+                    op: JsonAccessOp::Get,
+                    ..
+                }
+            ));
+        }
+        // AND の後ろ（先頭以外の述語位置）でも同様。
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE id = 1 AND (d -> 'a') ->> 'b' = 'x' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(preds.len(), 2);
     }
 
     /// `#>`／`#>>` もトークンから演算子種別へ写像される。
