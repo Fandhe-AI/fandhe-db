@@ -1223,7 +1223,19 @@ fn validate_closed_expr(
             // ここを素通りすると `CREATE FUNCTION f() AS vec_norm()` のような
             // 引数数不一致の関数本体が「定義時検証」という公開契約に反して登録
             // されてしまう（呼び出し時の `bind_call` 側の検査だけでは間に合わない）。
-            if name.eq_ignore_ascii_case("concat") {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "now" | "transaction_timestamp" | "statement_timestamp"
+            ) {
+                // 現在時刻関数（SQL-37・Issue #1586）は 0 引数の組み込み。`clock_timestamp` は
+                // 下の `builtin_from_name` 分岐で解決される。
+                if !args.is_empty() {
+                    return Err(SqlSurfaceError::undefined_function(format!(
+                        "function {name} expects 0 argument(s), got {}",
+                        args.len()
+                    )));
+                }
+            } else if name.eq_ignore_ascii_case("concat") {
                 if args.is_empty() {
                     return Err(SqlSurfaceError::undefined_function(
                         "function concat expects at least 1 argument, got 0",

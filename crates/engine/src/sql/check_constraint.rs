@@ -27,7 +27,7 @@ use crate::catalog::{CheckConstraint, TableSchema};
 use crate::declarative_filter::MetadataFilter;
 use crate::sql::allowlist::{ParsedCheck, SqlSurfaceError, WherePredicate};
 use crate::sql::expr_program::{ExprProgram, StackValue};
-use crate::sql::udf_call::{self, Expr, ExprValue};
+use crate::sql::udf_call::{self, Expr, ExprValue, ValueFunctionKind};
 use crate::tenant::TenantWriteError;
 
 /// `predicates` を `sql::allowlist::Parser::parse_where`／`parse_check_body` と
@@ -148,7 +148,16 @@ fn render_expr(expr: &Expr) -> String {
         // （`'` → `''`）で往復可能にレンダリングする（`parse(render(x)) == x`
         // 契約。`escape_literal` は同モジュールの既存ヘルパーを共有する）。
         Expr::String(s) => format!("'{}'", escape_literal(s)),
-        Expr::Ident(name) => name.clone(),
+        // 時刻の SQL 値関数予約語（`current_date` 等）と同名の列は、再解析で
+        // `Expr::ValueFunction` に化けないよう二重引用符付きで出す（SQL-37・Issue #1586）。
+        // 予約語以外は従来どおり引用なし（既存の保存形式との互換維持）。
+        Expr::Ident(name) => {
+            if ValueFunctionKind::from_keyword(name).is_some() {
+                format!("\"{name}\"")
+            } else {
+                name.clone()
+            }
+        }
         // 時刻の値関数は CHECK 本体で `42601` として拒否される（SQL-37・TABLE-16。
         // `udf_call::first_non_builtin_call`）ため通常は到達しないが、網羅のため往復できる形で出す。
         Expr::ValueFunction { kind, precision } => match precision {
