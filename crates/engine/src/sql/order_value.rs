@@ -40,6 +40,9 @@ pub(crate) enum OrderValue {
     Uuid(crate::uuid::Uuid),
     /// `ENUM`（宣言順のラベル添字）。
     EnumOrdinal(usize),
+    /// `JSONB`（[`crate::json::jsonb_sort_key`] のバイト列。辞書順が jsonb の全順序。
+    /// Issue #1597）。
+    JsonbKey(Vec<u8>),
 }
 
 /// `f64` 比較（NaN はすべての非 NaN より大きく NaN 同士は等しい。`-0.0 == 0.0` は
@@ -69,6 +72,7 @@ pub(crate) fn compare_order_values(a: &OrderValue, b: &OrderValue) -> Ordering {
         (OrderValue::Numeric(x), OrderValue::Numeric(y)) => crate::numeric::cmp_exact(x, y),
         (OrderValue::Uuid(x), OrderValue::Uuid(y)) => x.cmp(y),
         (OrderValue::EnumOrdinal(x), OrderValue::EnumOrdinal(y)) => x.cmp(y),
+        (OrderValue::JsonbKey(x), OrderValue::JsonbKey(y)) => x.cmp(y),
         _ => Ordering::Equal,
     }
 }
@@ -122,6 +126,8 @@ pub(crate) enum ScalarKeyRef<'a> {
     Numeric(crate::numeric::Decimal),
     Uuid(crate::uuid::Uuid),
     EnumOrdinal(usize),
+    /// [`OrderValue::JsonbKey`] の借用版（Issue #1597）。
+    JsonbKey(&'a [u8]),
 }
 
 /// 可視行 1 件から `bound.order_by` の各キーの実行時比較値を、複製せず
@@ -237,6 +243,16 @@ pub(crate) fn scalar_key_ref_to_owned(
             owned.extend_from_slice(b);
             OrderValue::Bytes(owned)
         }
+        ScalarKeyRef::JsonbKey(b) => {
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(b.len())
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve order key jsonb field: {e}"),
+                })?;
+            owned.extend_from_slice(b);
+            OrderValue::JsonbKey(owned)
+        }
         ScalarKeyRef::SignedInt(v) => OrderValue::SignedInt(v),
         ScalarKeyRef::Float(v) => OrderValue::Float(v),
         ScalarKeyRef::Bool(v) => OrderValue::Bool(v),
@@ -287,6 +303,7 @@ pub(crate) fn compare_ref_and_owned_values(a: &ScalarKeyRef<'_>, b: &OrderValue)
         (ScalarKeyRef::Numeric(x), OrderValue::Numeric(y)) => crate::numeric::cmp_exact(x, y),
         (ScalarKeyRef::Uuid(x), OrderValue::Uuid(y)) => x.cmp(y),
         (ScalarKeyRef::EnumOrdinal(x), OrderValue::EnumOrdinal(y)) => x.cmp(y),
+        (ScalarKeyRef::JsonbKey(x), OrderValue::JsonbKey(y)) => (*x).cmp(y.as_slice()),
         _ => Ordering::Equal,
     }
 }
@@ -304,6 +321,7 @@ impl OrderValue {
             OrderValue::Numeric(v) => ScalarKeyRef::Numeric(*v),
             OrderValue::Uuid(v) => ScalarKeyRef::Uuid(*v),
             OrderValue::EnumOrdinal(v) => ScalarKeyRef::EnumOrdinal(*v),
+            OrderValue::JsonbKey(b) => ScalarKeyRef::JsonbKey(b.as_slice()),
         }
     }
 }
@@ -322,6 +340,7 @@ pub(crate) fn compare_key_refs(a: &ScalarKeyRef<'_>, b: &ScalarKeyRef<'_>) -> Or
         (ScalarKeyRef::Numeric(x), ScalarKeyRef::Numeric(y)) => crate::numeric::cmp_exact(x, y),
         (ScalarKeyRef::Uuid(x), ScalarKeyRef::Uuid(y)) => x.cmp(y),
         (ScalarKeyRef::EnumOrdinal(x), ScalarKeyRef::EnumOrdinal(y)) => x.cmp(y),
+        (ScalarKeyRef::JsonbKey(x), ScalarKeyRef::JsonbKey(y)) => x.cmp(y),
         _ => Ordering::Equal,
     }
 }
@@ -363,6 +382,8 @@ pub(crate) fn order_value_to_cell(
             .get(*i)
             .map(|label| Cell::Text(label.clone()))
             .ok_or_else(|| scan_bug("group key ENUM ordinal out of range")),
+        // jsonb はグループキーにならない（GROUP BY・DISTINCT は対象外）。
+        (OrderValue::JsonbKey(_), _) => Err(scan_bug("jsonb value used as a group key")),
         _ => Err(scan_bug("group key value/column type mismatch")),
     }
 }
@@ -388,6 +409,11 @@ pub(crate) fn expr_value_to_key_ref<'v>(
             Ok(Some(ScalarKeyRef::SignedInt(i64::from(*d))))
         }
         (ExprValue::Timestamp(t), OrderKind::SignedInt) => Ok(Some(ScalarKeyRef::SignedInt(*t))),
+        // jsonb はソートキーを呼び出し元が先に作って借用させる（[`expr_value_to_jsonb_key`]）。
+        // ここへ到達するのは配線不備のみ。
+        (ExprValue::Json(_), OrderKind::Jsonb) => Err(scan_bug(
+            "jsonb order key must be converted with expr_value_to_jsonb_key",
+        )),
         _ => Err(scan_bug("expression order key value/kind mismatch")),
     }
 }
@@ -398,8 +424,26 @@ pub(crate) fn expr_value_to_order_value(
     value: &crate::sql::udf_call::ExprValue<'_>,
     kind: OrderKind,
 ) -> Result<Option<OrderValue>, SqlSurfaceError> {
+    if kind == OrderKind::Jsonb {
+        return Ok(expr_value_to_jsonb_key(value)?.map(OrderValue::JsonbKey));
+    }
     match expr_value_to_key_ref(value, kind)? {
         Some(r) => Ok(Some(scalar_key_ref_to_owned(r)?)),
         None => Ok(None),
+    }
+}
+
+/// jsonb 式キーの評価結果から、並べ替え用のソートキー（[`crate::json::jsonb_sort_key`]）を
+/// 作る（Issue #1597・TABLE-25）。比較器は失敗しない関数のため、キーは抽出時（ここ）に
+/// 1 回だけ作り、格納値の破損・長さ超過はこの段で fail-closed に返す。`Null` は `None`
+/// （NULL 位置規約は比較器が適用）。jsonb 以外の値は束縛の不変条件違反として `Internal`。
+pub(crate) fn expr_value_to_jsonb_key(
+    value: &crate::sql::udf_call::ExprValue<'_>,
+) -> Result<Option<Vec<u8>>, SqlSurfaceError> {
+    use crate::sql::udf_call::ExprValue;
+    match value {
+        ExprValue::Null => Ok(None),
+        ExprValue::Json(text) => crate::sql::udf_call::jsonb_sort_key_for_eval(text).map(Some),
+        _ => Err(scan_bug("expression order key value/kind mismatch")),
     }
 }
