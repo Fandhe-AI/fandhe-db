@@ -991,3 +991,5 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **対象外**: 評価器と `2203x` 系エラー（#2184）、`jsonpath` 型の入出力（正規化テキスト出力）、`22P05` の `ErrorClass`、`like_regex` の実装、メソッド精度引数の範囲検査（評価時）。依存・CI 構成の変更なし。
 
 - Issue #1608（TABLE-28。ICU 照合データとして icu_collator の承認資料）: `docs/design/icu-collator-adoption.md` を ADR として作成し、2026-10-15 にオーナーが推奨案を承認した（Accepted。記録: Issue #1608 のコメント）。承認範囲は `icu_collator = "=2.3.1"`（`compiled_data`）の非 optional 追加、`icu_collator_data = "=2.3.0"` の直接 exact pin、許可リストでの照合名解決（未知は `42704`）、`compiled_data` での開始、ライセンス Unicode-3.0 の受け入れ。`icu_locale_core` など上記以外の直接依存の追加と版の変更は承認範囲外で、必要になれば #2189 で止めて改めて承認を得る。本 Issue は docs のみの変更で、依存・`deny.toml`・コードは変更していない。依存の実追加は #2189、比較・ソートキーは #2190、照合込み索引は #2191。**対象外**: 依存追加と `make deny`（#2189）、照合の実装（#2190）、照合込み索引（#2191）。
+
+- Issue #2453（docs(design)。WIRE-25・WIRE-5・SQL-46 ポインタ。詳細は [connection-limits-cli.md](connection-limits-cli.md)）: 読み取りタイムアウト・最大接続数・prepared statement 件数の起動フラグ（`--read-timeout-secs` 1〜600・`--max-connections` 1〜256・`--max-prepared-statements` 1〜1024。既定は従来の 30 秒・64・64）を設計メモに記録した。ハード上限は暫定でオーナー確認待ち。`READ_TIMEOUT` の連動箇所（TLS ハンドシェイク復元値・HTTP 要求期限・明示トランザクション）を洗い出し、書き込みロック待機とは連動させない。コード変更なし（実装は #2454、テストは #2455）。
