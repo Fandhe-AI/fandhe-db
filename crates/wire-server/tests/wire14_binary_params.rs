@@ -48,6 +48,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ColumnDef::new("blob", ColumnType::Bytea, true),
                 ColumnDef::new("uid", ColumnType::Uuid, true),
                 ColumnDef::new("day", ColumnType::Date, true),
+                ColumnDef::new("tm", ColumnType::Time, true),
                 ColumnDef::new(
                     "price",
                     ColumnType::Numeric {
@@ -573,4 +574,87 @@ fn smallint_slot_binary_params() {
     expect_err(o, "22003", &mut s);
     let o = query(&mut s, "SELECT id FROM t LIMIT 5", &[], &[], &[]);
     assert_eq!(o.expect("count").0.len(), 1, "no side effect");
+}
+
+/// TIME スロットのバイナリ param（TABLE-32・WIRE-14・Issue #1571）。バイナリ ≡ テキスト、
+/// 長さ不正 `08P01`、範囲外 `22008`（丸めず副作用なし）、宣言 OID 不一致 `0A000`、
+/// テキストの書式不正 `22007`・範囲外 `22008` の回帰、テナント境界。
+#[test]
+fn time_slot_binary_params() {
+    let (core, _g) = new_core();
+    let mut s = connect(spawn(core.clone()), "alice");
+    let sel = "SELECT id FROM t WHERE tm IS NOT NULL LIMIT 20";
+    // バイナリ INSERT ≡ テキスト INSERT（宣言 0・宣言 1083。境界値を含む）。
+    let cases: [(i64, &str); 3] = [
+        (0, "00:00:00"),
+        (86_399_999_999, "23:59:59.999999"),
+        (86_400_000_000, "24:00:00"),
+    ];
+    for (i, (micros, text)) in cases.iter().enumerate() {
+        for (j, declared) in [&[][..], &[1083]].into_iter().enumerate() {
+            let id_bin = 100 + (i * 10 + j * 2) as i32;
+            let id_txt = id_bin + 1;
+            let ins = |id: i32| {
+                format!(
+                    "INSERT INTO t (id, embedding, tm) VALUES ({id}, '[0,1]', $1) USING OPERATION_ID 'tm-{id}'"
+                )
+            };
+            let o = query(
+                &mut s,
+                &ins(id_bin),
+                declared,
+                &[1],
+                &[Some(&micros.to_be_bytes())],
+            );
+            assert!(o.is_ok(), "binary insert {micros}: {o:?}");
+            let o = query(
+                &mut s,
+                &ins(id_txt),
+                declared,
+                &[0],
+                &[Some(text.as_bytes())],
+            );
+            assert!(o.is_ok(), "text insert {text}: {o:?}");
+            // 同じ値で読み戻した text 表現が一致する。
+            let mut by = |id: i32| {
+                query(
+                    &mut s,
+                    &format!("SELECT tm FROM t WHERE id = {id} LIMIT 1"),
+                    &[],
+                    &[],
+                    &[],
+                )
+            };
+            assert_eq!(by(id_bin), by(id_txt), "micros {micros}");
+        }
+    }
+    let before = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
+    // 長さ不正（7・9 バイト）は 08P01。接続は維持される。
+    let ins =
+        "INSERT INTO t (id, embedding, tm) VALUES (900, '[0,1]', $1) USING OPERATION_ID 'tm-bad'";
+    for bad in [&[0u8; 7][..], &[0u8; 9][..]] {
+        let o = query(&mut s, ins, &[1083], &[1], &[Some(bad)]);
+        expect_err(o, "08P01", &mut s);
+    }
+    // 範囲外（丸めて受理しない）は 22008・副作用なし。
+    for bad in [-1i64, 86_400_000_001, i64::MIN, i64::MAX] {
+        let o = query(&mut s, ins, &[1083], &[1], &[Some(&bad.to_be_bytes())]);
+        expect_err(o, "22008", &mut s);
+    }
+    // 宣言 OID 不一致のバイナリは 0A000。
+    for declared in [20, 1114, 25] {
+        let o = query(&mut s, ins, &[declared], &[1], &[Some(&0i64.to_be_bytes())]);
+        expect_err(o, "0A000", &mut s);
+    }
+    // テキスト形式の書式不正は 22007、範囲外は 22008（engine 経路の回帰）。
+    let o = query(&mut s, ins, &[], &[0], &[Some(b"not-a-time")]);
+    expect_err(o, "22007", &mut s);
+    let o = query(&mut s, ins, &[], &[0], &[Some(b"24:00:00.000001")]);
+    expect_err(o, "22008", &mut s);
+    let after = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
+    assert_eq!(before, after, "no side effect");
+    // テナント境界: bob から alice の TIME 行は見えない。
+    let mut b = connect(spawn(core), "bob");
+    let o = query(&mut b, sel, &[], &[], &[]);
+    assert_eq!(o.expect("bob rows").0.len(), 0);
 }
