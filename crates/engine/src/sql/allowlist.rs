@@ -6052,7 +6052,16 @@ impl<'a> Parser<'a> {
                     (Some(Token::Punct('(')), Some(Token::Number(n)), Some(Token::Punct(')')))
                         if kind.accepts_precision() =>
                     {
-                        n.parse::<u8>().ok().map(Some)
+                        // 範囲外・非整数の数値トークン（`256`・`6.0` 等）も精度引数として扱い、
+                        // 0..=255 の範囲外精度（束縛時の 22023）と同じ分類へ揃える。
+                        match n.parse::<u8>() {
+                            Ok(p) => Some(Some(p)),
+                            Err(_) => {
+                                return Err(SqlSurfaceError::InvalidParameterValue {
+                                    detail: "timestamp precision must be between 0 and 6",
+                                });
+                            }
+                        }
                     }
                     (Some(Token::Punct('(')), _, _) => None,
                     _ => Some(None),

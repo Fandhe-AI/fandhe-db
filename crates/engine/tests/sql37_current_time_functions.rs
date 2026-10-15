@@ -216,6 +216,13 @@ fn current_date_is_a_date_and_precision_form_rounds() {
         ),
         "22023"
     );
+    // u8 超の整数・非整数の数値トークンも同じ 22023（関数呼び出し形へ落とさない）。
+    for sql in [
+        "SELECT CURRENT_TIMESTAMP(256) FROM events WHERE id = 1 LIMIT 10",
+        "SELECT LOCALTIMESTAMP(6.0) FROM events WHERE id = 1 LIMIT 10",
+    ] {
+        assert_eq!(code(&core, sql), "22023", "{sql}");
+    }
 }
 
 #[test]
