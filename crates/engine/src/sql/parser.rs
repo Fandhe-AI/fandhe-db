@@ -4782,7 +4782,7 @@ pub(crate) enum AggregateInput {
     /// `INTEGER` 列の裸の列参照（`schema.columns` の添字）。`COUNT`/`SUM`/
     /// `AVG`/`MIN`/`MAX` のすべてで使う（TABLE-13・TASK-196、Issue #881・
     /// #892）。`SUM` の結果は `i128` 累積・確定時に `i64` へ収まるか検査する
-    /// （D2。`Accumulator::IntSum`）。
+    /// （D2。`Accumulator::IntSum`）。`BIGINT` 列の `SUM` は numeric で返す（Issue #2271）。
     IntegerColumn(usize),
     /// `BIGINT` 列の裸の列参照。`IntegerColumn` と同じ受理範囲・累積方式を
     /// 共有する（`ScalarRef::BigInt` からそのまま `i64` を取り出す点のみが
@@ -7024,6 +7024,8 @@ fn resolve_group_by_key(
 /// `DATE`/`TIMESTAMP` の `MIN`/`MAX`（`Cell::Date`/`Cell::Timestamp`）は
 /// 黙って `false` へ縮退させず、`TEXT` と同じく型不整合 `22000` で拒否する
 /// （`COUNT` はいずれの列型でも結果が `Cell::Integer` になるため対象外）。
+/// `SUM(<BIGINT>)`（Issue #2271。scale 0 の `Cell::Numeric`）は
+/// [`crate::sql::group_by::having_matches`] が厳密比較に対応しているため対象に含めない。
 pub(crate) fn check_having_target_is_numeric(
     item: &BoundAggregateItem,
     target_name: &str,
@@ -7250,6 +7252,11 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
             _ => ColumnType::Double,
         },
         AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => match &item.input {
+            // Issue #2271（TABLE-13）: `SUM(BIGINT)` は `Cell::Numeric` を返すため、
+            // 式内では扱えない列（`BYTEA`）として `22000` で拒否する。
+            AggregateInput::BigIntColumn(_) if matches!(item.func, AggregateFunc::Sum) => {
+                ColumnType::Bytea
+            }
             AggregateInput::IdU64
             | AggregateInput::IntegerColumn(_)
             | AggregateInput::BigIntColumn(_) => ColumnType::BigInt,

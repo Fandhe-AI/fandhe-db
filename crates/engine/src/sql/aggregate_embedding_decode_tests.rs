@@ -183,7 +183,8 @@ fn expected_plain(col: &str, func: &str) -> String {
             "SignedInteger(20)",
         ),
         "bi" => (
-            "SignedInteger(300)",
+            // Issue #2271（TABLE-13）: `SUM(BIGINT)` は numeric(38,0)。
+            "Numeric(Decimal { unscaled: 300, scale: 0 })",
             "Float(150.0)",
             "SignedInteger(100)",
             "SignedInteger(200)",

@@ -338,22 +338,29 @@ fn projection_subquery_runtime_error_is_deferred_until_outer_has_rows() {
     assert_eq!(code(&core, &ctx, &some), "22003");
 }
 
+/// Issue #2271（TABLE-13・TASK-330）: `SUM(BIGINT)` は numeric(38,0) で返る。scale 0 の
+/// numeric は入れ子 WHERE の整数列との比較で厳密に照合される（PostgreSQL と同じく許可）。
 #[test]
-fn projection_subquery_nested_where_runtime_error_is_deferred() {
+fn projection_subquery_nested_where_sum_bigint_numeric_compares_with_integer_column() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     seed(&core, &ctx);
-    ins(&core, &ctx, REFS, 5, "big1", Some(i64::MAX));
-    ins(&core, &ctx, REFS, 6, "big2", Some(i64::MAX));
-    // 入れ子 WHERE サブクエリ内の数値あふれ（22003）も、外側 0 行なら発生しない。
+    ins(&core, &ctx, REFS, 5, "a", Some(600));
+    ins(&core, &ctx, REFS, 6, "b", Some(700));
+    ins(&core, &ctx, REFS, 7, "hit", Some(1300));
     let inner = format!(
-        "(SELECT name FROM {REFS} WHERE qty = (SELECT SUM(qty) FROM {REFS} WHERE qty > 100) LIMIT 1)"
+        "(SELECT name FROM {REFS} WHERE qty = (SELECT SUM(qty) FROM {REFS} WHERE qty > 500 AND qty < 1000) LIMIT 1)"
     );
     let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
     assert!(run(&core, &ctx, &none).rows.is_empty());
     let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
-    assert_eq!(code(&core, &ctx, &some), "22003");
+    let r = run(&core, &ctx, &some);
+    assert!(!r.rows.is_empty());
+    assert!(r
+        .rows
+        .iter()
+        .all(|row| row.cells[1] == Cell::Text("hit".to_string())));
 }
 
 /// 入れ子 WHERE の実行時エラーを遅延しても、同じ WHERE の静的な誤り（未知列）と
@@ -551,7 +558,11 @@ fn projection_subquery_deferred_error_keeps_static_column_type() {
         none.columns[1],
         ColumnMeta::Computed {
             name: "s".to_string(),
-            ty: Some(ColumnType::BigInt),
+            // Issue #2271（TABLE-13）: `SUM(BIGINT)` は numeric(38,0)。
+            ty: Some(ColumnType::Numeric {
+                precision: 38,
+                scale: 0,
+            }),
         }
     );
 }

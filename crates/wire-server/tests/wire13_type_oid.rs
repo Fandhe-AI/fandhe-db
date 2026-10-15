@@ -285,7 +285,8 @@ fn expected_aggregate_oids() -> Vec<(&'static str, i32)> {
     vec![
         ("c_all", 20),
         ("s_n", 20),
-        ("s_b", 20),
+        // Issue #2271（TABLE-13）: `SUM(BIGINT)` は numeric(OID 1700)。
+        ("s_b", 1700),
         ("a_n", 701),
         ("m_n", 23),
         ("x_b", 20),
@@ -321,6 +322,8 @@ fn aggregate_and_expression_columns_announce_typed_oids() {
     // 値: 1 行のみ（tenant-a の Private 行）。`SUM(REAL)` は real で、`1.5` は
     // f32 の最短往復表記で出る。
     assert_eq!(row.first().cloned().flatten().as_deref(), Some("1"));
+    // numeric(38,0) のテキスト表現（桁区切り・指数なし）。
+    assert_eq!(row.get(2).cloned().flatten().as_deref(), Some("9000000000"));
     assert_eq!(row.get(6).cloned().flatten().as_deref(), Some("1.5"));
     assert_eq!(row.get(8).cloned().flatten().as_deref(), Some("1.5"));
     let _tag = read_command_complete(&mut stream);
@@ -400,7 +403,8 @@ fn expected_window_oids() -> Vec<(&'static str, i32)> {
         ("drk", 20),
         ("c_all", 20),
         ("s_n", 20),
-        ("s_b", 20),
+        // Issue #2271（TABLE-13）: `SUM(BIGINT)` は numeric(OID 1700)。
+        ("s_b", 1700),
         ("a_n", 701),
         ("m_n", 23),
         ("x_b", 20),

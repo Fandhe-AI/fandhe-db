@@ -233,8 +233,9 @@ fn item_name(item: &ConstSelectItem) -> String {
 }
 
 /// 集計の結果型表（Issue #2330。PostgreSQL 17 準拠。`FROM` あり側の
-/// `aggregate_result_type` は `avg(int)`→`double`・`sum(int8)`→`bigint` のままで、
-/// 是正は TASK-330 のポインタ。本経路は先に PG の型へそろえるため一時的に食い違う）。
+/// `aggregate_result_type` は `sum(int8)`→`numeric` へ是正済み（Issue #2271）だが、
+/// `avg(int)`→`double` のままで、是正は TASK-330 のポインタ。本経路は先に PG の型へ
+/// そろえるため AVG のみ一時的に食い違う）。
 /// `arg_ty` は引数の型（`count(*)`・型不明は `None`）。非対応の組は暗黙変換せず `42883`。
 /// `avg(整数)` の numeric は scale 16 で公告し、値も同 scale で返す（PG は 20 桁。
 /// 表示桁の完全一致は対象外）。

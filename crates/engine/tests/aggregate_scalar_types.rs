@@ -104,10 +104,10 @@ fn insert_null_row(core: &EngineCore, ctx: &PolicyContext, id: u64, lang: &str, 
     .expect("insert with all-NULL optional columns should succeed");
 }
 
-// --- 22003: SUM(INTEGER/BIGINT) の桁あふれ ----------------------------------
+// --- SUM(BIGINT) は numeric(38,0)（Issue #2271・TABLE-13・TASK-330） ---------
 
 #[test]
-fn sum_bigint_overflow_is_22003() {
+fn sum_bigint_beyond_i64_returns_numeric_instead_of_22003() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -141,10 +141,16 @@ fn sum_bigint_overflow_is_22003() {
         "op-2",
     );
 
-    let err = core
+    // i64::MAX + 1 は i64 を超えるが、numeric として厳密な値を返す。
+    let result = core
         .execute_sql(&alice, &format!("SELECT SUM(b) FROM {TABLE}"))
-        .unwrap_err();
-    assert_eq!(err.wire_code(), "22003");
+        .expect("SUM(BIGINT) beyond i64 must return numeric");
+    assert_eq!(
+        result.rows[0].cells,
+        vec![Cell::Numeric(
+            Decimal::from_parts(i128::from(i64::MAX) + 1, 0).unwrap()
+        )]
+    );
 }
 
 /// `SUM(INTEGER)` は `i32` の範囲を超えても、`BIGINT` 相当（`i64`）に収まれば
@@ -237,7 +243,12 @@ fn sum_bigint_transient_overflow_of_partial_sum_still_succeeds_if_final_value_fi
     let result = core
         .execute_sql(&alice, &format!("SELECT SUM(b) FROM {TABLE}"))
         .expect("transient overflow of the partial sum must not fail if the final value fits");
-    assert_eq!(result.rows[0].cells, vec![Cell::SignedInteger(i64::MAX)]);
+    assert_eq!(
+        result.rows[0].cells,
+        vec![Cell::Numeric(
+            Decimal::from_parts(i128::from(i64::MAX), 0).unwrap()
+        )]
+    );
 }
 
 // --- 22003: SUM/AVG(NUMERIC) の 38 桁上限 -----------------------------------
@@ -806,4 +817,178 @@ fn scalar_index_warm_path_sum_matches_full_scan_oracle() {
             .expect("WHERE lang = 'ja' with SUM(n) must succeed on both cold and hot runs");
         assert_eq!(result.rows[0].cells, vec![Cell::SignedInteger(9)]);
     }
+}
+// --- Issue #2271: SUM(BIGINT) → numeric(38,0)（TABLE-13・SQL-13・SQL-30・TASK-330）---
+
+fn dec0(v: i128) -> Cell {
+    Cell::Numeric(Decimal::from_parts(v, 0).unwrap())
+}
+
+fn insert_b(core: &EngineCore, ctx: &PolicyContext, id: u64, lang: &str, n: i32, b: i64) {
+    insert_full_row(
+        core,
+        ctx,
+        id,
+        lang,
+        n,
+        b,
+        1.0,
+        1.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        &format!("op-b-{id}"),
+    );
+}
+
+/// 結果列の静的型は `numeric(38,0)`、`SUM(INTEGER)` は `bigint` のまま。
+/// 負方向（`i64::MIN` 2 行）も i64 を超えて厳密に返す。
+#[test]
+fn sum_bigint_column_type_is_numeric_and_integer_stays_bigint() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert_b(&core, &alice, 1, "ja", 1, i64::MIN);
+    insert_b(&core, &alice, 2, "ja", 2, i64::MIN);
+
+    let result = core
+        .execute_sql(&alice, &format!("SELECT SUM(b), SUM(n) FROM {TABLE}"))
+        .expect("SUM(BIGINT) below i64::MIN must return numeric");
+    assert_eq!(
+        result.rows[0].cells,
+        vec![dec0(2 * i128::from(i64::MIN)), Cell::SignedInteger(3)]
+    );
+    let tys: Vec<_> = result
+        .columns
+        .iter()
+        .map(|c| match c {
+            engine::sql::exec::ColumnMeta::Computed { ty, .. } => ty.clone(),
+            other => panic!("unexpected column meta {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        tys,
+        vec![
+            Some(ColumnType::Numeric {
+                precision: 38,
+                scale: 0
+            }),
+            Some(ColumnType::BigInt)
+        ]
+    );
+}
+
+/// 空集合と NULL のみは NULL。
+#[test]
+fn sum_bigint_of_empty_and_null_only_is_null() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let empty = core
+        .execute_sql(&alice, &format!("SELECT SUM(b) FROM {TABLE}"))
+        .unwrap();
+    assert_eq!(empty.rows[0].cells, vec![Cell::Null]);
+    insert_null_row(&core, &alice, 1, "ja", "op-null-1");
+    let nulls = core
+        .execute_sql(&alice, &format!("SELECT SUM(b) FROM {TABLE}"))
+        .unwrap();
+    assert_eq!(nulls.rows[0].cells, vec![Cell::Null]);
+}
+
+/// GROUP BY・単純形 HAVING（i64 超の閾値を厳密比較）・ORDER BY が numeric で動く。
+#[test]
+fn sum_bigint_group_by_having_and_order_by_use_exact_numeric() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert_b(&core, &alice, 1, "big", 1, i64::MAX);
+    insert_b(&core, &alice, 2, "big", 1, i64::MAX);
+    insert_b(&core, &alice, 3, "small", 1, 5);
+
+    let r = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT lang, SUM(b) AS s FROM {TABLE} GROUP BY lang ORDER BY s DESC"),
+        )
+        .unwrap();
+    assert_eq!(
+        r.rows.iter().map(|x| x.cells.clone()).collect::<Vec<_>>(),
+        vec![
+            vec![
+                Cell::Text("big".to_string()),
+                dec0(2 * i128::from(i64::MAX))
+            ],
+            vec![Cell::Text("small".to_string()), dec0(5)],
+        ]
+    );
+
+    // 閾値を超えた（i64 超の和を持つ）グループだけが残る。
+    let r = core
+        .execute_sql(
+            &alice,
+            &format!(
+                "SELECT lang, SUM(b) AS s FROM {TABLE} GROUP BY lang \
+                 HAVING s > 9000000000000000"
+            ),
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].cells[0], Cell::Text("big".to_string()));
+
+    let r = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT lang, SUM(b) AS s FROM {TABLE} GROUP BY lang HAVING s <= 5"),
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].cells[0], Cell::Text("small".to_string()));
+}
+
+/// 式内での SUM(BIGINT) は numeric 算術未対応のため fail-closed（22000）。
+#[test]
+fn sum_bigint_inside_expression_is_rejected_fail_closed() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert_b(&core, &alice, 1, "ja", 1, 1);
+    let err = core
+        .execute_sql(&alice, &format!("SELECT SUM(b) + 1 FROM {TABLE}"))
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22000");
+}
+
+/// ウィンドウ関数の SUM(BIGINT) も numeric（i64 超の累積も値を返す）。
+#[test]
+fn sum_bigint_window_returns_numeric_beyond_i64() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert_b(&core, &alice, 1, "ja", 1, i64::MAX);
+    insert_b(&core, &alice, 2, "ja", 1, i64::MAX);
+    let r = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id, SUM(b) OVER () FROM {TABLE} LIMIT 10"),
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 2);
+    for row in &r.rows {
+        assert_eq!(row.cells[1], dec0(2 * i128::from(i64::MAX)));
+    }
+}
+
+/// RLS: 他テナントの行は和に入らない。
+#[test]
+fn sum_bigint_excludes_other_tenant_rows() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let bob = ctx_for("bob");
+    insert_b(&core, &alice, 1, "ja", 1, 10);
+    insert_b(&core, &bob, 2, "ja", 1, i64::MAX);
+    let r = core
+        .execute_sql(&alice, &format!("SELECT SUM(b) FROM {TABLE}"))
+        .unwrap();
+    assert_eq!(r.rows[0].cells, vec![dec0(10)]);
 }

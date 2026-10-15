@@ -439,3 +439,57 @@ fn tenant_a_count_does_not_include_tenant_b_private_row() {
     assert!(!body_utf8(&resp).contains("tenant-a"));
     assert!(!body_utf8(&resp).contains("tenant-b"));
 }
+/// Issue #2271（TABLE-13・TASK-330・NOSQL-4）: BIGINT 列の `sum` は numeric で、和が
+/// `i64` を超えても `22003` にならず丸めない JSON number で返る。SQL 表層と本文が一致する
+/// （`columns[].type` は `Computed` 列の既存仕様どおり `text`）。
+#[test]
+fn sum_bigint_column_returns_numeric_beyond_i64_matching_sql() {
+    let path = temp_db::unique_db_path("nosql4-aggregate-bigint");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            TABLE,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("b", ColumnType::BigInt, true),
+            ],
+        ))
+        .expect("create table");
+    let ctx_a = ctx_for("tenant-a");
+    for id in 1..=2u64 {
+        let op_id =
+            engine::recovery::required_op_id::OperationId::parse(&format!("bigint-op-{id}"))
+                .expect("valid operation_id");
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx_a,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![id as f32, 0.0]),
+                Value::Text("ja".to_string()),
+                Value::BigInt(i64::MAX),
+            ],
+            &op_id,
+        )
+        .expect("insert row");
+    }
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addr = spawn(Arc::clone(&core));
+
+    let body = r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"sum","column":"b"}]}"#;
+    let resp = query_as_alice(addr, body.as_bytes());
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let text = body_utf8(&resp);
+    assert_eq!(text, sql_oracle_body(&core, "SELECT SUM(b) FROM docs"));
+    assert!(
+        text.contains("18446744073709551614"),
+        "sum beyond i64 must not be rounded: {text}"
+    );
+}

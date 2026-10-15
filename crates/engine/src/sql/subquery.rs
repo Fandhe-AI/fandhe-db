@@ -1693,6 +1693,16 @@ fn number_cell_text(cell: &Cell) -> Result<String, SqlSurfaceError> {
     }
 }
 
+/// 内側投影列が scale 0 の `NUMERIC`（`SUM(BIGINT)` 等。整数として厳密に扱える）か。
+fn is_scale0_numeric_meta(meta: &ColumnMeta) -> bool {
+    match meta {
+        ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
+            matches!(ty, ColumnType::Numeric { scale: 0, .. })
+        }
+        _ => false,
+    }
+}
+
 /// スカラーサブクエリ比較の内側投影列の値族が対象列の値族と比較可能かを検証する
 /// （数値族どうしは可。内側の結果行数・値に依存しない静的検証）。
 fn check_scalar_family_compatible(
@@ -1701,7 +1711,14 @@ fn check_scalar_family_compatible(
     target_family: SubqueryValueFamily,
 ) -> Result<(), SqlSurfaceError> {
     let compatible = match inner_value_family(inner_meta) {
-        Some(inner) => inner == target_family || (inner.is_number() && target_family.is_number()),
+        Some(inner) => {
+            inner == target_family
+                || (inner.is_number() && target_family.is_number())
+                // Issue #2271（TABLE-13）: `SUM(BIGINT)` は scale 0 の numeric。整数列との
+                // 比較は PostgreSQL と同じく許可し、実行時は `i128` の厳密比較で行う。
+                || (target_family == SubqueryValueFamily::Integer
+                    && is_scale0_numeric_meta(inner_meta))
+        }
         None => false,
     };
     if !compatible {
@@ -1870,12 +1887,15 @@ fn scalar_literal_predicate(
             }
         }
         SubqueryValueFamily::Integer
-            if matches!(cell, Cell::Integer(_) | Cell::SignedInteger(_)) =>
+            if matches!(cell, Cell::Integer(_) | Cell::SignedInteger(_))
+                || matches!(cell, Cell::Numeric(d) if d.scale() == 0) =>
         {
             // 整数列 × 整数セルは `2^53` 超でも比較できるよう `int_compare` へ写像する。
+            // scale 0 の numeric（`SUM(BIGINT)`。Issue #2271）も同じ経路で厳密に比べる。
             let n: i128 = match cell {
                 Cell::Integer(u) => i128::from(*u),
                 Cell::SignedInteger(i) => i128::from(*i),
+                Cell::Numeric(d) => d.unscaled(),
                 _ => return Err(unexpected_cell_type()),
             };
             Ok(match op {

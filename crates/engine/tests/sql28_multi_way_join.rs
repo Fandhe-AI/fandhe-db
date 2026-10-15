@@ -226,6 +226,7 @@ fn render(cell: &Cell) -> String {
         Cell::Text(s) => s.clone(),
         Cell::Integer(v) => v.to_string(),
         Cell::SignedInteger(v) => v.to_string(),
+        Cell::Numeric(d) => d.to_string(),
         Cell::Bool(b) => b.to_string(),
         Cell::Float(f) => format!("{f}"),
         other => format!("{other:?}"),
