@@ -24,6 +24,8 @@
 //!   `VECTOR` 独自のバイナリ表現は定義しないため引き続き text 固定・受入基準 3）
 //! - `ColumnMeta::Scalar{ty: Boolean}` → `bool`（OID 16, typlen 1。値は `t`/`f`。
 //!   WIRE-13・TASK-200・Issue #895）
+//! - `ColumnMeta::Scalar{ty: SmallInt}` → `int2`（OID 21, typlen 2。TABLE-30・
+//!   Issue #1561。バイナリは 2 バイト BE）
 //! - `ColumnMeta::Scalar{ty: Integer}` → `int4`（OID 23, typlen 4。TABLE-13・
 //!   TASK-196・Issue #881・#903 レビュー指摘。`Cell::SignedInteger` が送出する
 //!   10進テキストは `int4` の表現とそのまま一致する）
@@ -55,7 +57,7 @@
 //!
 //! バイナリ形式（format code 1・WIRE-14・TASK-218・Issue #936）: 列ごとに
 //! テキスト／バイナリを要求できる（PostgreSQL の Bind 規則。[`ResultFormats`]）。
-//! 対応型は `TEXT`（UTF-8 生バイト）と、Issue #1172 で追加した `INTEGER`・
+//! 対応型は `TEXT`（UTF-8 生バイト）と、Issue #1172 で追加した `SMALLINT`・`INTEGER`・
 //! `BIGINT`・`REAL`・`DOUBLE PRECISION`・`BOOLEAN`・`BYTEA`・`UUID`（PostgreSQL の
 //! send 形式。`Computed{ty: Some(t)}`〔集計・式列・ウィンドウ関数の結果列〕も `t` が
 //! 対応型ならバイナリ可。Issue #1407。結線は
@@ -214,6 +216,11 @@ pub fn validate_binary_formats(
 /// （[`text`]）に加え、数値・真偽値・bytea・uuid（Issue #1172）を
 /// [`super::encode_data_row_into_with_columns`] が結線する。
 pub mod binary {
+    /// `int2` のバイナリ表現（2 バイト・ビッグエンディアン 2 の補数。TABLE-30・WIRE-14）。
+    pub fn int2(v: i16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+
     /// `int4` のバイナリ表現（4 バイト・ビッグエンディアン 2 の補数）。
     pub fn int4(v: i32) -> [u8; 4] {
         v.to_be_bytes()
@@ -331,6 +338,9 @@ wire_type_enum! {
         /// TABLE-31・Issue #2305）。値表現は `Text` と同一（UTF-8 恒等のバイナリ送出を含む）で、
         /// 公告する OID（1043）と型名（`varchar`）だけが異なる。
         Varchar,
+        /// `ColumnMeta::Scalar{ty: SmallInt}`（`SMALLINT`／`INT2`。TABLE-30・WIRE-13・
+        /// Issue #1561）。`i16` 全域を表現する。
+        Int2,
         /// `ColumnMeta::Scalar{ty: Integer}`（`INTEGER`。TABLE-13・TASK-196・
         /// Issue #881・#903 レビュー指摘）。`i32` 全域を表現する。
         Int4,
@@ -379,6 +389,7 @@ impl WireType {
             WireType::Numeric => 1700,
             WireType::Text => 25,
             WireType::Varchar => 1043,
+            WireType::Int2 => 21,
             WireType::Int4 => 23,
             WireType::Int8 => 20,
             WireType::Bool => 16,
@@ -402,6 +413,7 @@ impl WireType {
             | WireType::Bytea
             | WireType::Json
             | WireType::Jsonb => -1,
+            WireType::Int2 => 2,
             WireType::Int4 | WireType::Float4 | WireType::Date => 4,
             WireType::Int8 | WireType::Float8 | WireType::Timestamp => 8,
             WireType::Bool => 1,
@@ -416,6 +428,7 @@ impl WireType {
             WireType::Numeric => "numeric",
             WireType::Text => "text",
             WireType::Varchar => "varchar",
+            WireType::Int2 => "int2",
             WireType::Int4 => "int4",
             WireType::Int8 => "int8",
             WireType::Bool => "bool",
@@ -458,7 +471,8 @@ impl WireType {
             // 数値・真偽値・bytea・uuid は PostgreSQL の send 形式（ネット
             // ワークバイトオーダー）でバイナリ対応する（WIRE-14・TASK-218・
             // Issue #1172）。DataRow への結線は `encode_binary_cell`。
-            WireType::Int4
+            WireType::Int2
+            | WireType::Int4
             | WireType::Int8
             | WireType::Bool
             | WireType::Float4
@@ -501,6 +515,7 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
     match ty {
         ColumnType::Text
         | ColumnType::Varchar
+        | ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Boolean
@@ -521,9 +536,6 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Numeric { .. }
         | ColumnType::Date
         | ColumnType::Timestamp => false,
-        // SMALLINT のバイナリ結果（int2）は兄弟 Issue（#1561）で対応する。公告 OID が
-        // 暫定で int4 のため、int4 バイナリを返さず fail-closed に非対応とする（Issue #1558）。
-        ColumnType::SmallInt => false,
     }
 }
 
@@ -564,12 +576,10 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         engine::catalog::ColumnType::Varchar => WireType::Varchar,
         engine::catalog::ColumnType::Vector(_) => WireType::Text,
         engine::catalog::ColumnType::Boolean => WireType::Bool,
-        // SMALLINT は暫定で int4（OID 23）を公告する（Issue #1558）。値は
-        // `Cell::SignedInteger` のため text 形式は正しく描画される。int2（OID 21・
-        // typlen 2）への切替とバイナリ入出力は兄弟 Issue（#1561）で行う。
-        engine::catalog::ColumnType::SmallInt | engine::catalog::ColumnType::Integer => {
-            WireType::Int4
-        }
+        // SMALLINT は int2（OID 21・typlen 2。TABLE-30・Issue #1561）。値は
+        // `Cell::SignedInteger`（text／バイナリとも i16 範囲内）。
+        engine::catalog::ColumnType::SmallInt => WireType::Int2,
+        engine::catalog::ColumnType::Integer => WireType::Int4,
         engine::catalog::ColumnType::BigInt => WireType::Int8,
         engine::catalog::ColumnType::Real => WireType::Float4,
         engine::catalog::ColumnType::Double => WireType::Float8,
@@ -955,6 +965,11 @@ fn encode_binary_cell(
         (WireType::Text | WireType::Varchar, Cell::Text(s)) => {
             push_len_prefixed(out, binary::text(s))
         }
+        // i16 に収まらない値は engine の範囲強制の内部不整合なので fail-closed（`XX000`）。
+        (WireType::Int2, Cell::SignedInteger(v)) => {
+            let v = i16::try_from(*v).map_err(|_| EncodeError)?;
+            push_fixed(out, wire_type, &binary::int2(v))
+        }
         (WireType::Int4, Cell::SignedInteger(v)) => {
             let v = i32::try_from(*v).map_err(|_| EncodeError)?;
             push_fixed(out, wire_type, &binary::int4(v))
@@ -1298,9 +1313,7 @@ mod tests {
         };
         let cases: Vec<(Option<ColumnType>, i32, i16)> = vec![
             (Some(ColumnType::BigInt), 20, 8),
-            // SMALLINT は暫定で int4 を公告する（Issue #1558）。int2（OID 21・typlen 2）への
-            // 切替は Issue #1561 で本行を更新する。
-            (Some(ColumnType::SmallInt), 23, 4),
+            (Some(ColumnType::SmallInt), 21, 2),
             (Some(ColumnType::Integer), 23, 4),
             (Some(ColumnType::Real), 700, 4),
             (Some(ColumnType::Double), 701, 8),
@@ -1328,10 +1341,7 @@ mod tests {
         // fail-closed のまま（Issue #1407）。
         assert!(column_binary_support(&computed(Some(ColumnType::BigInt))));
         assert!(!column_binary_support(&computed(None)));
-        // SMALLINT のバイナリ結果は int2 対応（#1561）まで fail-closed（Issue #1558）。
-        assert!(!column_binary_support(&computed(Some(
-            ColumnType::SmallInt
-        ))));
+        assert!(column_binary_support(&computed(Some(ColumnType::SmallInt))));
         assert!(!column_binary_support(&computed(Some(
             ColumnType::Numeric {
                 precision: 38,
@@ -1897,6 +1907,14 @@ mod tests {
     // --- binary モジュール（golden バイト列。WIRE-14）---
 
     #[test]
+    fn binary_int2_golden_bytes() {
+        assert_eq!(binary::int2(i16::MIN), [0x80, 0x00]);
+        assert_eq!(binary::int2(-1), [0xff, 0xff]);
+        assert_eq!(binary::int2(0), [0x00, 0x00]);
+        assert_eq!(binary::int2(i16::MAX), [0x7f, 0xff]);
+    }
+
+    #[test]
     fn binary_int4_golden_bytes() {
         assert_eq!(binary::int4(1), [0x00, 0x00, 0x00, 0x01]);
         assert_eq!(binary::int4(-1), [0xff, 0xff, 0xff, 0xff]);
@@ -2222,7 +2240,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 14);
+        assert_eq!(WireType::ALL.len(), 15);
     }
 
     /// `PostgreSQL` 組み込みカタログの公開値（`pg_type.oid`／`typlen`／
@@ -2231,10 +2249,11 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 14] = [
+        let expected: [(WireType, i32, i16, &str); 15] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
+            (WireType::Int2, 21, 2, "int2"),
             (WireType::Int4, 23, 4, "int4"),
             (WireType::Int8, 20, 8, "int8"),
             (WireType::Bool, 16, 1, "bool"),
@@ -2708,6 +2727,7 @@ mod tests {
                 t,
                 WireType::Text
                     | WireType::Varchar
+                    | WireType::Int2
                     | WireType::Int4
                     | WireType::Int8
                     | WireType::Bool
