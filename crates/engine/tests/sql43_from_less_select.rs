@@ -211,8 +211,8 @@ fn rejects_column_references_as_undefined_column() {
     // 裸の NULL/TRUE/FALSE は値位置で識別子として扱われ、列参照と同じ 42703 になる
     // （受理は後続。設計 doc の対象外を参照）。
     assert_eq!(wire_code_of(&core, &ctx, "SELECT NULL"), "42703");
-    // 集計判定が引数の再帰より先。
-    assert_eq!(wire_code_of(&core, &ctx, "SELECT count(x)"), "42601");
+    // 集計の引数も列参照として一律に 42703（Issue #2330。識別子名は含めない）。
+    assert_eq!(wire_code_of(&core, &ctx, "SELECT count(x)"), "42703");
     // 実在列と非実在列で応答（コード・メッセージ）が同一。
     let msg = |sql: &str| {
         core.execute_sql_in_session(&ctx, &mut SessionState::default(), sql)
@@ -223,6 +223,7 @@ fn rejects_column_references_as_undefined_column() {
     assert!(!msg("SELECT lang").contains("lang"));
     assert!(!msg("SELECT zzq_ident").contains("zzq_ident"));
     assert!(!msg("SELECT 1 + zzq_ident").contains("zzq_ident"));
+    assert!(!msg("SELECT count(zzq_ident)").contains("zzq_ident"));
 }
 
 #[test]
@@ -231,9 +232,11 @@ fn rejects_aggregates_and_trailing_clauses() {
     let _g = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     for sql in [
-        "SELECT count(*)",
-        "SELECT sum(1)",
         "SELECT lower(count(1))",
+        "SELECT count(*) + 1",
+        "SELECT sum(count(*))",
+        "SELECT sum(*)",
+        "SELECT coalesce(max(1), 0)",
         "SELECT",
         "SELECT 1,",
         "SELECT 1 WHERE 1=1 AND 2=2",
@@ -546,4 +549,129 @@ fn where_limit_work_in_transaction_and_for_any_tenant() {
     }
     core.execute_sql_in_txn(&ctx_a, &mut session, &mut txn, "COMMIT")
         .expect("COMMIT");
+}
+
+fn agg_row(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    sql: &str,
+) -> (Vec<Cell>, Vec<Option<ColumnType>>) {
+    let r = run(core, ctx, sql);
+    assert_eq!(r.rows.len(), 1, "{sql}: exactly one row");
+    let tys = (0..r.columns.len())
+        .map(|i| col(&r, i).1.cloned())
+        .collect();
+    (r.rows[0].cells.clone(), tys)
+}
+
+/// Issue #2330: `GROUP BY` なしの集計は入力 0 行でも 1 行を返し、結果型は PG 準拠。
+#[test]
+fn aggregates_without_from_return_one_row_with_pg_types() {
+    let (core, path) = core_with_table("sql43-agg", false);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    let big = Some(ColumnType::BigInt);
+    let (c, t) = agg_row(&core, &ctx, "SELECT count(*) WHERE false");
+    assert_eq!((c, t), (vec![Cell::SignedInteger(0)], vec![big.clone()]));
+    let (c, _) = agg_row(&core, &ctx, "SELECT count(*)");
+    assert_eq!(c, vec![Cell::SignedInteger(1)]);
+    assert_eq!(col(&run(&core, &ctx, "SELECT count(*)"), 0).0, "count");
+    assert_eq!(col(&run(&core, &ctx, "SELECT max(2) AS m"), 0).0, "m");
+    let (c, t) = agg_row(&core, &ctx, "SELECT sum(1) WHERE false");
+    assert_eq!((c, t), (vec![Cell::Null], vec![big.clone()]));
+    let (c, t) = agg_row(&core, &ctx, "SELECT max(2)");
+    assert_eq!(
+        (c, t),
+        (
+            vec![Cell::SignedInteger(2)],
+            vec![Some(ColumnType::Integer)]
+        )
+    );
+    let (c, t) = agg_row(&core, &ctx, "SELECT 1, count(*) WHERE false");
+    assert_eq!(
+        (c, t),
+        (
+            vec![Cell::SignedInteger(1), Cell::SignedInteger(0)],
+            vec![Some(ColumnType::Integer), big.clone()]
+        )
+    );
+    // LIMIT/OFFSET は出力行に適用する。
+    assert_eq!(row_count(&core, &ctx, "SELECT count(*) LIMIT 0"), 0);
+    assert_eq!(row_count(&core, &ctx, "SELECT count(*) OFFSET 1"), 0);
+    assert_eq!(
+        row_count(&core, &ctx, "SELECT count(*) WHERE false LIMIT 1"),
+        1
+    );
+    // count(式) は非 NULL の入力行数。
+    for (sql, n) in [
+        ("SELECT count(1)", 1),
+        ("SELECT count(1) WHERE NULL", 0),
+        ("SELECT count(nullif(1,1))", 0),
+        ("SELECT count(DISTINCT coalesce(1, 2))", 1),
+    ] {
+        assert_eq!(
+            agg_row(&core, &ctx, sql).0,
+            vec![Cell::SignedInteger(n)],
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        agg_row(&core, &ctx, "SELECT sum(nullif(1,1))").0,
+        vec![Cell::Null]
+    );
+    // 型表。
+    let numeric = |sql: &str| {
+        matches!(
+            agg_row(&core, &ctx, sql).1[0],
+            Some(ColumnType::Numeric { .. })
+        )
+    };
+    for sql in [
+        "SELECT sum(5000000000)",
+        "SELECT avg(1)",
+        "SELECT avg(1.5)",
+        "SELECT sum(1.5)",
+        "SELECT max(1.5)",
+    ] {
+        assert!(numeric(sql), "{sql}");
+    }
+    assert_eq!(
+        agg_row(&core, &ctx, "SELECT sum(5000000000)").0,
+        vec![Cell::Numeric(
+            engine::numeric::Decimal::from_parts(5_000_000_000, 0).expect("dec")
+        )]
+    );
+    assert_eq!(
+        agg_row(&core, &ctx, "SELECT min('a')").1,
+        vec![Some(ColumnType::Text)]
+    );
+    assert_eq!(
+        agg_row(&core, &ctx, "SELECT min('a')").0,
+        vec![Cell::Text("a".to_string())]
+    );
+    assert_eq!(agg_row(&core, &ctx, "SELECT avg(2 / 1.0e0)").1.len(), 1);
+    // 非対応の引数型は暗黙変換せず 42883。
+    for sql in ["SELECT sum('a')", "SELECT avg('a')"] {
+        assert_eq!(wire_code_of(&core, &ctx, sql), "42883", "{sql}");
+    }
+    // 別テナントでも同一結果。
+    let ctx_b = ctx_for("tenant-b");
+    assert_eq!(
+        agg_row(&core, &ctx_b, "SELECT count(*) WHERE false").0,
+        vec![Cell::SignedInteger(0)]
+    );
+}
+
+#[test]
+fn aggregate_describe_matches_execute() {
+    let (core, path) = core_with_table("sql43-agg-describe", false);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    let sql = "SELECT count(*) AS c, sum(1) AS s, max(2) AS m, avg(1) AS a";
+    let parsed = core.parse_sql(sql).expect("parse");
+    let described = core
+        .describe_parsed_in_session(&SessionState::default(), &parsed)
+        .expect("describe")
+        .expect("columns");
+    assert_eq!(described, run(&core, &ctx, sql).columns);
 }

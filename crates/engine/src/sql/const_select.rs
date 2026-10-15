@@ -16,12 +16,20 @@
 //! テーブル・ストレージ・RLS 述語のいずれにも触れないため、他テナントのデータや
 //! 存在情報に依存する経路が無い。列参照は常に同一の固定文言で `42703`（Issue #2328。
 //! `FROM` なしでは全識別子が一律に未定義）とし、識別子名・テーブル名をエラーに含めない
-//! （fail-closed）。集計は `42601` のまま。
+//! （fail-closed）。
+//!
+//! トップレベルの集計項目（`count(*)`・`sum(<式>)` 等。Issue #2330）は、`GROUP BY` なしの
+//! 集計として入力（ダミー 1 行を `WHERE` で絞った 0 か 1 行）を畳み込み、集計を 1 つでも含む
+//! 文は常に 1 行を出す（`LIMIT`／`OFFSET` は出力行に適用）。`FROM` あり側の集計実行
+//! （`sql::aggregate`）には依存せず、入力が高々 1 行であることを使って直接評価する。結果型は
+//! PostgreSQL 準拠（`sum(int4)`→`bigint` 等。型表は [`const_aggregate_result_type`]）。
+//! 集計を含む式・`WHERE` 内の集計・入れ子集計は構文段で `42601`。
 
 use crate::catalog::ColumnType;
+use crate::sql::aggregate::numeric_avg_result_scale;
 use crate::sql::allowlist::{
-    is_aggregate_function_name, ConstSelectCondition, ConstSelectItem, SqlSurfaceError,
-    ValidatedConstSelect,
+    is_aggregate_function_name, AggregateArg, AggregateFunc, AggregateItem, ConstSelectCondition,
+    ConstSelectItem, SqlSurfaceError, ValidatedConstSelect,
 };
 use crate::sql::exec::{scalar_cell_for, Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::udf_call::{
@@ -40,12 +48,34 @@ enum BoundConstItem {
         expr: BoundExpr,
         result_ty: Option<ColumnType>,
     },
+    /// トップレベルの集計項目（Issue #2330）。型は束縛時に `meta` へ確定済み。
+    Aggregate {
+        meta: ColumnMeta,
+        func: AggregateFunc,
+        arg: BoundAggArg,
+    },
+}
+
+/// 束縛済みの集計引数。
+#[derive(Debug, Clone)]
+enum BoundAggArg {
+    /// `count(*)`。
+    Star,
+    /// 数値リテラル引数（束縛時に型とセルが確定する）。
+    Literal { cell: Cell, ty: ColumnType },
+    /// 式引数（`WHERE` の結果に関わらず常に評価する）。
+    Expr {
+        expr: BoundExpr,
+        ty: Option<ColumnType>,
+    },
 }
 
 impl BoundConstItem {
     fn meta(&self) -> &ColumnMeta {
         match self {
-            BoundConstItem::Literal { meta, .. } | BoundConstItem::Expr { meta, .. } => meta,
+            BoundConstItem::Literal { meta, .. }
+            | BoundConstItem::Expr { meta, .. }
+            | BoundConstItem::Aggregate { meta, .. } => meta,
         }
     }
 }
@@ -58,6 +88,8 @@ pub struct BoundConstSelect {
     where_clause: Option<BoundCondition>,
     limit: Option<i64>,
     offset: Option<i64>,
+    /// 集計項目を 1 つでも含む（`GROUP BY` なしの集計文は入力 0 行でも 1 行を出す）。
+    has_aggregate: bool,
 }
 
 /// 束縛済みの `WHERE` 条件。リテラルは束縛時に確定し、式は実行時に評価する。
@@ -86,6 +118,8 @@ fn reject_non_constant(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::TimestampLiteral(_) => Ok(()),
         Expr::Ident(_) => Err(SqlSurfaceError::ColumnReferenceWithoutFrom),
         Expr::Call { name, args } => {
+            // 集計項目はトップレベルのみ構文段が受理し、束縛段は引数だけをこの検査へ
+            // 渡すため、ここへ届く集計名は防御線（到達しない想定）。
             if is_aggregate_function_name(name) {
                 return Err(SqlSurfaceError::unsupported(
                     "aggregate functions require a FROM clause",
@@ -159,12 +193,166 @@ fn literal_number(raw: &str, name: &str) -> Result<(ColumnMeta, Cell), SqlSurfac
     }
 }
 
-/// 項目の列名: `AS` 別名 → 既存の既定名（関数呼び出し・`CASE` 等）→ `?column?`。
+/// 項目の列名: `AS` 別名 → 集計の既定名（`count` 等）→ 既存の既定名（関数呼び出し・
+/// `CASE` 等）→ `?column?`。
 fn item_name(item: &ConstSelectItem) -> String {
     if let Some(alias) = item.alias() {
         return alias.to_string();
     }
+    if let Some(agg) = item.aggregate() {
+        return agg.func.default_alias().to_string();
+    }
     crate::sql::parser::default_expr_alias(item.expr())
+}
+
+/// 集計の結果型表（Issue #2330。PostgreSQL 17 準拠。`FROM` あり側の
+/// `aggregate_result_type` は `avg(int)`→`double`・`sum(int8)`→`bigint` のままで、
+/// 是正は TASK-330 のポインタ。本経路は先に PG の型へそろえるため一時的に食い違う）。
+/// `arg_ty` は引数の型（`count(*)`・型不明は `None`）。非対応の組は暗黙変換せず `42883`。
+/// `avg(整数)` の numeric は scale 16 で公告し、値も同 scale で返す（PG は 20 桁。
+/// 表示桁の完全一致は対象外）。
+fn const_aggregate_result_type(
+    func: AggregateFunc,
+    arg_ty: Option<&ColumnType>,
+) -> Result<ColumnType, SqlSurfaceError> {
+    use crate::numeric::MAX_PRECISION;
+    let unsupported = || {
+        SqlSurfaceError::undefined_function(format!(
+            "function {}(argument type) does not exist",
+            func.default_alias()
+        ))
+    };
+    if func == AggregateFunc::Count {
+        return Ok(ColumnType::BigInt);
+    }
+    let ty = arg_ty.ok_or_else(unsupported)?;
+    match (func, ty) {
+        (AggregateFunc::Sum, ColumnType::Integer) => Ok(ColumnType::BigInt),
+        (AggregateFunc::Sum, ColumnType::BigInt) => Ok(ColumnType::Numeric {
+            precision: MAX_PRECISION,
+            scale: 0,
+        }),
+        (AggregateFunc::Sum, ColumnType::Numeric { scale, .. }) => Ok(ColumnType::Numeric {
+            precision: MAX_PRECISION,
+            scale: *scale,
+        }),
+        (AggregateFunc::Sum, ColumnType::Real) => Ok(ColumnType::Real),
+        (AggregateFunc::Sum, ColumnType::Double) => Ok(ColumnType::Double),
+        (AggregateFunc::Avg, ColumnType::Integer | ColumnType::BigInt) => Ok(ColumnType::Numeric {
+            precision: MAX_PRECISION,
+            scale: AVG_INT_SCALE,
+        }),
+        (AggregateFunc::Avg, ColumnType::Numeric { precision, scale }) => Ok(ColumnType::Numeric {
+            precision: MAX_PRECISION,
+            scale: numeric_avg_result_scale(*precision, *scale),
+        }),
+        (AggregateFunc::Avg, ColumnType::Real | ColumnType::Double) => Ok(ColumnType::Double),
+        (
+            AggregateFunc::Min | AggregateFunc::Max,
+            ColumnType::Integer
+            | ColumnType::BigInt
+            | ColumnType::Numeric { .. }
+            | ColumnType::Real
+            | ColumnType::Double
+            | ColumnType::Text
+            | ColumnType::Date
+            | ColumnType::Timestamp,
+        ) => Ok(ty.clone()),
+        _ => Err(unsupported()),
+    }
+}
+
+/// `avg(integer|bigint)` の numeric 結果の scale。
+const AVG_INT_SCALE: u8 = 16;
+
+/// 集計項目を束縛する（引数の型付けと結果列メタの確定）。
+fn bind_aggregate_item(
+    agg: &AggregateItem,
+    name: String,
+    registry: &UdfRegistry,
+    budget: &mut usize,
+) -> Result<BoundConstItem, SqlSurfaceError> {
+    let (arg, arg_ty) = match &agg.arg {
+        AggregateArg::Star => (BoundAggArg::Star, None),
+        AggregateArg::Expr(Expr::Number(raw)) => {
+            let (meta, cell) = literal_number(raw, "")?;
+            let ColumnMeta::Computed { ty: Some(ty), .. } = meta else {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "numeric literal has no type".to_string(),
+                });
+            };
+            (
+                BoundAggArg::Literal {
+                    cell,
+                    ty: ty.clone(),
+                },
+                Some(ty),
+            )
+        }
+        AggregateArg::Expr(e) => {
+            let (bound, _ty, result_ty) = bind_const_expr(e, registry, budget)?;
+            (
+                BoundAggArg::Expr {
+                    expr: bound,
+                    ty: result_ty.clone(),
+                },
+                result_ty,
+            )
+        }
+    };
+    let result = const_aggregate_result_type(agg.func, arg_ty.as_ref())?;
+    Ok(BoundConstItem::Aggregate {
+        meta: ColumnMeta::Computed {
+            name,
+            ty: Some(result),
+        },
+        func: agg.func,
+        arg,
+    })
+}
+
+/// 評価結果 [`ExprValue`] を応答セルへ変換する（式項目・集計引数で共有）。
+fn expr_value_to_cell(v: ExprValue<'_>, ty: Option<&ColumnType>) -> Result<Cell, SqlSurfaceError> {
+    Ok(match v {
+        ExprValue::Scalar(f) => scalar_cell_for(f, ty)?,
+        ExprValue::Bool(b) => Cell::Bool(b),
+        ExprValue::Text(t) => Cell::Text(t.into_owned()),
+        ExprValue::Date(d) => Cell::Date(d),
+        ExprValue::Timestamp(t) => Cell::Timestamp(t),
+        ExprValue::Null => Cell::Null,
+        ExprValue::Vector(v) => Cell::Vector(into_owned_vector(v)?),
+    })
+}
+
+fn numeric_cell(unscaled: i128, scale: u8) -> Result<Cell, SqlSurfaceError> {
+    crate::numeric::Decimal::from_parts(unscaled, scale)
+        .map(Cell::Numeric)
+        .map_err(|_| SqlSurfaceError::numeric_out_of_range("numeric value is out of range"))
+}
+
+/// 入力が 1 行（引数値 `cell` が非 NULL）のときの集計値。入力 0 行・引数 NULL は呼び出し元が
+/// `NULL` にする。`arg_ty` は引数の型（結果型の表 [`const_aggregate_result_type`] と対）。
+fn single_row_aggregate(
+    func: AggregateFunc,
+    arg_ty: Option<&ColumnType>,
+    cell: Cell,
+) -> Result<Cell, SqlSurfaceError> {
+    match (func, arg_ty, cell) {
+        // `sum(bigint)` は numeric（scale 0）。
+        (AggregateFunc::Sum, Some(ColumnType::BigInt), Cell::SignedInteger(v)) => {
+            numeric_cell(i128::from(v), 0)
+        }
+        (AggregateFunc::Avg, _, Cell::SignedInteger(v)) => {
+            let u =
+                crate::numeric::avg_unscaled(i128::from(v), 1, 0, AVG_INT_SCALE).map_err(|_| {
+                    SqlSurfaceError::numeric_out_of_range("numeric value is out of range")
+                })?;
+            numeric_cell(u, AVG_INT_SCALE)
+        }
+        // numeric の avg は入力 1 行なら値そのもの（結果 scale は入力 scale 以上で、
+        // リテラル引数では一致する）。
+        (_, _, c) => Ok(c),
+    }
 }
 
 /// 定数式 SELECT を束縛する。禁止検査（列参照・集計）を全項目に先に適用してから
@@ -176,7 +364,14 @@ pub fn bind(
     validated
         .items()
         .iter()
-        .try_for_each(|i| reject_non_constant(i.expr()))?;
+        .try_for_each(|i| match i.aggregate() {
+            // 集計項目は内部名の `expr` ではなく引数だけを検査する（`count(x)` は `42703`）。
+            Some(agg) => match &agg.arg {
+                AggregateArg::Star => Ok(()),
+                AggregateArg::Expr(e) => reject_non_constant(e),
+            },
+            None => reject_non_constant(i.expr()),
+        })?;
     if let Some(ConstSelectCondition::Expr(e)) = validated.where_clause() {
         reject_non_constant(e)?;
     }
@@ -185,6 +380,14 @@ pub fn bind(
     for item in validated.items() {
         let name = item_name(item);
         let bound = match item.expr() {
+            _ if item.aggregate().is_some() => {
+                let Some(agg) = item.aggregate() else {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "aggregate item vanished".to_string(),
+                    });
+                };
+                bind_aggregate_item(agg, name, registry, &mut budget)?
+            }
             Expr::Number(raw) => {
                 let (meta, cell) = literal_number(raw, &name)?;
                 BoundConstItem::Literal { meta, cell }
@@ -222,6 +425,7 @@ pub fn bind(
         where_clause,
         limit: validated.limit(),
         offset: validated.offset(),
+        has_aggregate: validated.items().iter().any(|i| i.aggregate().is_some()),
     })
 }
 
@@ -255,21 +459,38 @@ pub fn execute(bound: &BoundConstSelect) -> Result<QueryResult, SqlSurfaceError>
             BoundConstItem::Literal { cell, .. } => cells.push(cell.clone()),
             BoundConstItem::Expr {
                 expr, result_ty, ..
-            } => {
-                let cell = match eval(expr, 0, &[])? {
-                    ExprValue::Scalar(f) => scalar_cell_for(f, result_ty.as_ref())?,
-                    ExprValue::Bool(b) => Cell::Bool(b),
-                    ExprValue::Text(t) => Cell::Text(t.into_owned()),
-                    ExprValue::Date(d) => Cell::Date(d),
-                    ExprValue::Timestamp(t) => Cell::Timestamp(t),
-                    ExprValue::Null => Cell::Null,
-                    ExprValue::Vector(v) => Cell::Vector(into_owned_vector(v)?),
+            } => cells.push(expr_value_to_cell(eval(expr, 0, &[])?, result_ty.as_ref())?),
+            BoundConstItem::Aggregate { func, arg, .. } => {
+                // 入力行数: ダミー 1 行が `WHERE` を通れば 1、そうでなければ 0。
+                let n: i64 = i64::from(passes);
+                // 引数は `WHERE` の結果に関わらず評価する（エラー有無をフィルタに左右させない）。
+                let (value, arg_ty) = match arg {
+                    BoundAggArg::Star => (None, None),
+                    BoundAggArg::Literal { cell, ty } => (Some(cell.clone()), Some(ty)),
+                    BoundAggArg::Expr { expr, ty, .. } => (
+                        Some(expr_value_to_cell(eval(expr, 0, &[])?, ty.as_ref())?),
+                        ty.as_ref(),
+                    ),
+                };
+                let non_null = value.as_ref().map_or(n, |c| i64::from(*c != Cell::Null)) * n;
+                let cell = if *func == AggregateFunc::Count {
+                    Cell::SignedInteger(non_null)
+                } else if non_null == 0 {
+                    Cell::Null
+                } else {
+                    let v = value.ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "aggregate argument is missing".to_string(),
+                    })?;
+                    single_row_aggregate(*func, arg_ty, v)?
                 };
                 cells.push(cell);
             }
         }
     }
-    let selected = passes && bound.offset.unwrap_or(0) == 0 && bound.limit.is_none_or(|l| l > 0);
+    // 集計を含む文は入力 0 行でも 1 行を出す（`GROUP BY` なし）。含まない文は `WHERE` 通過が必要。
+    let produces_row = bound.has_aggregate || passes;
+    let selected =
+        produces_row && bound.offset.unwrap_or(0) == 0 && bound.limit.is_none_or(|l| l > 0);
     let rows = if selected {
         vec![ResultRow {
             id: 0,

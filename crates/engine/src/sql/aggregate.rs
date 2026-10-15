@@ -1836,7 +1836,7 @@ impl Accumulator {
 /// （38 桁）以内に収まるよう最大 16 桁まで拡張する
 /// （`max(s, min(16, MAX_PRECISION - (p - s)))`）。`p >= s` は列宣言時の
 /// カタログ検証済み契約。
-fn numeric_avg_result_scale(precision: u8, scale: u8) -> u8 {
+pub(crate) fn numeric_avg_result_scale(precision: u8, scale: u8) -> u8 {
     let integer_digits = precision.saturating_sub(scale);
     let budget = crate::numeric::MAX_PRECISION.saturating_sub(integer_digits);
     scale.max(budget.min(16))

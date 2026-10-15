@@ -417,3 +417,88 @@ fn extended_negative_limit_fails_at_execute_and_recovers() {
     expect(&mut s, b'2');
     assert_eq!(expect_error_then_recover(&mut s), "22000");
 }
+
+/// 簡易クエリで 1 行の集計結果（列名・型 OID・typlen・text 値）を検証する。
+fn expect_simple_aggregate_row(
+    s: &mut TcpStream,
+    sql: &str,
+    fields: &[(&str, i32, i16)],
+    values: &[Option<&str>],
+) {
+    send_simple_query(s, sql);
+    let expected_fields: Vec<(String, i32, i16)> = fields
+        .iter()
+        .map(|(n, oid, len)| (n.to_string(), *oid, *len))
+        .collect();
+    assert_eq!(read_row_description_with_types(s), expected_fields, "{sql}");
+    let expected_values: Vec<Option<String>> =
+        values.iter().map(|v| v.map(str::to_string)).collect();
+    assert_eq!(read_data_row(s), expected_values, "{sql}");
+    assert_eq!(read_command_complete(s), "SELECT 1");
+    assert_eq!(read_ready_for_query_status(s), b'I');
+}
+
+/// Issue #2330: FROM なし集計は入力 0 行でも 1 行を返し、型 OID は PG と一致する。
+#[test]
+fn simple_aggregates_return_one_row_with_pg_oids() {
+    let (mut s, _g) = connect();
+    expect_simple_aggregate_row(
+        &mut s,
+        "SELECT count(*) WHERE false",
+        &[("count", 20, 8)],
+        &[Some("0")],
+    );
+    expect_simple_aggregate_row(&mut s, "SELECT count(*)", &[("count", 20, 8)], &[Some("1")]);
+    expect_simple_aggregate_row(
+        &mut s,
+        "SELECT sum(1) WHERE false",
+        &[("sum", 20, 8)],
+        &[None],
+    );
+    expect_simple_aggregate_row(&mut s, "SELECT max(2)", &[("max", 23, 4)], &[Some("2")]);
+    expect_simple_aggregate_row(
+        &mut s,
+        "SELECT 1, count(*) WHERE false",
+        &[("?column?", 23, 4), ("count", 20, 8)],
+        &[Some("1"), Some("0")],
+    );
+    // numeric は text 結果形式（バイナリ表現は未対応で fail-closed）。
+    expect_simple_aggregate_row(
+        &mut s,
+        "SELECT sum(5000000000)",
+        &[("sum", 1700, -1)],
+        &[Some("5000000000")],
+    );
+    expect_simple_aggregate_row(
+        &mut s,
+        "SELECT avg(1)",
+        &[("avg", 1700, -1)],
+        &[Some("1.0000000000000000")],
+    );
+}
+
+/// 集計の statement Describe と実行時 RowDescription（binary 要求）が一致し、int8 が 8 バイトで返る。
+#[test]
+fn extended_aggregate_describe_matches_binary_execution() {
+    let (mut s, _g) = connect();
+    send(&mut s, b'P', &parse_body("s0", "SELECT count(*)", 0));
+    send(&mut s, b'D', &describe_body(b'S', "s0"));
+    send(&mut s, b'S', b"");
+    expect(&mut s, b'1');
+    expect(&mut s, b't');
+    let stmt_fields = parse_row_description(&expect(&mut s, b'T'));
+    assert_eq!(stmt_fields, vec![("count".to_string(), 20, 8, 0)]);
+    assert_eq!(expect(&mut s, b'Z'), [b'I']);
+
+    send(&mut s, b'B', &bind_body_result_format("", "s0", 1));
+    send(&mut s, b'D', &describe_body(b'P', ""));
+    send(&mut s, b'E', &execute_body("", 0));
+    send(&mut s, b'S', b"");
+    expect(&mut s, b'2');
+    let portal_fields = parse_row_description(&expect(&mut s, b'T'));
+    assert_eq!(portal_fields, vec![("count".to_string(), 20, 8, 1)]);
+    let row = parse_data_row(&expect(&mut s, b'D'));
+    assert_eq!(row, vec![Some(vec![0, 0, 0, 0, 0, 0, 0, 1])]);
+    assert_eq!(cstr_tag(&expect(&mut s, b'C')), "SELECT 1");
+    assert_eq!(expect(&mut s, b'Z'), [b'I']);
+}
