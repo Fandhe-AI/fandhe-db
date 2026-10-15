@@ -6432,8 +6432,9 @@ impl<'a> Parser<'a> {
         // （他の通常関数は従来どおり `false` のまま。`NULL` 許可の対象を
         // 安易に広げると他関数のエラーコード契約が変わるため、`CONCAT` に
         // 限定するスコープにする）。
-        // jsonb 関数（Issue #1599）は CHECK 本体では未対応（jsonb 演算子と同じ `0A000`）。
-        // 引数の裸の `NULL` は jsonb 関数の型規則（strict／JSON の `null`）で扱うため受理する。
+        // `json_*`／`to_json`（Issue #2180）・jsonb 関数（Issue #1599）も同様に裸の `NULL` を
+        // NULL リテラルとして受理する（新設の関数で、`NULL` という名前の列を渡す後方互換の制約が無い）。
+        // jsonb 関数は CHECK 本体では未対応（jsonb 演算子と同じ `0A000`）。
         let is_json_fn_call = crate::sql::udf_call::json_fn_from_name(&name).is_some()
             || crate::sql::udf_call::is_deferred_json_srf_name(&name);
         if is_json_fn_call && self.in_check_body {
@@ -6441,8 +6442,10 @@ impl<'a> Parser<'a> {
                 detail: "jsonb functions are not supported in a CHECK constraint".to_string(),
             });
         }
-        let allow_null_for_this_call =
-            name.eq_ignore_ascii_case("concat") || self.const_expr_null_args || is_json_fn_call;
+        let allow_null_for_this_call = name.eq_ignore_ascii_case("concat")
+            || self.const_expr_null_args
+            || is_json_fn_call
+            || crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase());
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
             args.push(

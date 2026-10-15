@@ -183,6 +183,7 @@ pub(crate) mod hnsw_hybrid;
 /// `core.rs::EngineCore` の SQL 実行経路から呼ばれる（`sql::set_op` と同じ
 /// 構成）。
 pub(crate) mod join;
+pub(crate) mod json_fn;
 pub mod lexer;
 pub mod mode;
 pub(crate) mod numeric_fn;

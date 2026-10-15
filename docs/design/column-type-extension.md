@@ -398,6 +398,10 @@ TABLE-14・TASK-198（Issue #889。関連: NOSQL-8・NOSQL-17）で `ColumnType:
   - Issue #1596（TABLE-25）で `jsonb` 列に限りパス演算子 `->` `->>` `#>` `#>>` を構文段・
     束縛段・評価器に開放した（`json` 列は 0A000、非 jsonb の左辺は 42883）。上記の
     Rust API（`JsonPath`／`extract_path`）は変更していない。
+  - Issue #2180（TABLE-25）で `json` 列にもパス演算子と `json_*` 関数を開放した。`json` の
+    式結果は入力の**部分テキスト**（空白・数値表記・キー順を保つ）で、`jsonb` の正規化値とは
+    別の式型（`ExprType::JsonText`）で運ぶ。詳細は
+    [json-expr-type-mapping.md](json-expr-type-mapping.md)。
 - wire-server: SQL 表層のテキスト表現は格納テキストをそのまま出力する
   （`JSON` は入力テキスト保持・`JSONB` は正規化済みテキストのため、いずれも
   再シリアライズしない）。NoSQL 表層（`insert.rs`／`update.rs`）は JSON
@@ -422,6 +426,12 @@ TABLE-14・TASK-198（Issue #889。関連: NOSQL-8・NOSQL-17）で `ColumnType:
   意味論から外れるため採らない（層 B テスト
   `wire_json_column.rs::json_operation_id_resend_via_nosql_after_sql_seed_is_content_mismatch_when_whitespace_differs`
   で契約を固定）。
+  - **Issue #2180 追記（重複キーと応答の関係）**: `json` 列は重複キーを受理して原文のまま
+    格納する（`jsonb` は従来どおり `22P02`）。重複キーの値は最後のものが有効で、SQL 表層の
+    `SELECT doc` は原文を返し、`->`・`#>` などの式結果は原文の部分テキスト、NoSQL 表層の
+    応答は共有パーサーで後勝ちに再パースして正規形で出力する（重複キーは最後の値へ畳まれる。
+    生テキストは連結しない）。等価判定（UNIQUE・`WHERE doc = '...'`・`IN`）も最後の値で行う。
+    要素数の上限は重複を含む生のメンバー数で判定する。
 - 対象外（申し送り）: RowDescription の OID 拡張（`json` 114／`jsonb` 3802。
   既存の `WireType::Text`〔OID 25〕のまま。#895）、NoSQL の既存型統一・
   `columns[].type`（#896）、`22P02` の新設（#897・TASK-227）、`WHERE` 述語

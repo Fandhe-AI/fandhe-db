@@ -507,6 +507,16 @@ pub enum BoundExpr {
     JsonbColumnRef {
         index: usize,
     },
+    /// nullable `json`（原文保存）列の参照（Issue #2180・TABLE-25）。値は
+    /// [`ExprValue::JsonText`]（格納テキストの借用。空白・キー順・重複キーを保持）で、
+    /// 消費できるのはパス演算子の左辺・`json_*` 関数の引数・投影だけ（それ以外は
+    /// `reject_json_operand`／比較系の `42883` で拒否する）。
+    JsonColumnRef {
+        index: usize,
+    },
+    /// `json_*` 関数・`to_json`・`json_build_*` の束縛結果（Issue #2180。束縛・評価は
+    /// `sql::json_fn`）。
+    JsonTextFn(Box<crate::sql::json_fn::BoundJsonFn>),
     /// jsonb として解釈済みの文字列リテラル（Issue #1597・TABLE-25）。jsonb 式と比較される
     /// 型なし文字列リテラル（PostgreSQL の unknown 型）を [`bind_jsonb_literal`] が
     /// 解析・正規化した結果で、正規化済み JSON テキストを保持する。
@@ -668,6 +678,10 @@ impl PartialEq for BoundExpr {
             (BoundExpr::JsonbColumnRef { index: a }, BoundExpr::JsonbColumnRef { index: b }) => {
                 a == b
             }
+            (BoundExpr::JsonColumnRef { index: a }, BoundExpr::JsonColumnRef { index: b }) => {
+                a == b
+            }
+            (BoundExpr::JsonTextFn(a), BoundExpr::JsonTextFn(b)) => a == b,
             (
                 BoundExpr::JsonAccess {
                     lhs: la,
@@ -776,6 +790,10 @@ pub enum ExprType {
     /// jsonb 値（Issue #1596・TABLE-25）。消費できるのは投影・比較・ORDER BY・JSON 演算子の
     /// オペランド・jsonb 関数（Issue #1599）の引数だけで、算術・集計・関数引数・`CASE` 等・代入は `0A000` で拒否する（Issue #1597）。
     Json,
+    /// `json`（原文保存）値（Issue #2180・TABLE-25）。値は入力の部分テキストをそのまま
+    /// 保持する。比較・並べ替え・グループ化には演算子が無い（`42883`）。算術・集計・
+    /// `CASE` 等・代入は `0A000` で拒否する。
+    JsonText,
 }
 
 /// 評価結果の値。
@@ -802,6 +820,10 @@ pub enum ExprValue<'a> {
     /// jsonb 値の正規化テキスト（Issue #1596・TABLE-25。`write_canonical` 済み）。
     /// 列参照は借用、パス演算子の結果は所有。
     Json(Cow<'a, str>),
+    /// `json`（原文保存）値の原文テキスト（Issue #2180・TABLE-25）。列参照は借用、
+    /// 取り出し・`json_build_*` の結果は所有。[`ExprValue::Json`]（jsonb の正規化テキスト）
+    /// とは別 variant にして、型の取り違え（原文と正規形）を型で防ぐ。
+    JsonText(Cow<'a, str>),
     /// SQL の NULL（Issue #919・SQL-26、AC2 と Issue #921・SQL-26 の共有
     /// variant）。nullable TEXT 列参照・strict な関数への NULL 入力、および
     /// `CASE`／`COALESCE`／`NULLIF` の評価結果から生じる。呼び出し元
@@ -942,6 +964,7 @@ pub(crate) fn is_builtin_function_name(name: &str) -> bool {
     builtin_from_name(name).is_some()
         || is_variadic_or_overloaded_builtin_name(name)
         || is_current_time_function_name(name)
+        || crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase())
         || json_fn_from_name(name).is_some()
         || is_deferred_json_srf_name(name)
 }
@@ -993,7 +1016,7 @@ pub(crate) fn is_current_time_function_name(name: &str) -> bool {
 /// 網羅し `_ =>` を置かない（variant 追加時にコンパイルエラーで検査漏れに気づく。
 /// fail-closed）。再帰の深さは構文段の式ネスト上限で抑えられる。
 pub(crate) fn first_non_builtin_call(expr: &Expr) -> Option<&str> {
-    first_non_builtin_call_with(expr, false)
+    first_non_builtin_call_with(expr, false, false)
 }
 
 /// [`first_non_builtin_call`] の本体。`allow_current_time` が真のときだけ現在時刻関数
@@ -1001,7 +1024,11 @@ pub(crate) fn first_non_builtin_call(expr: &Expr) -> Option<&str> {
 /// トランザクション固定の時刻だけを受理するスコープ（[`time_fn::ClockPolicy::TxnFixedOnly`]）の
 /// 中でのみ真にする（`sql::set_expr`。SQL-37・Issue #1587）。`statement_timestamp()`・
 /// `clock_timestamp()` はここでは通し、束縛段（`reject_non_txn_fixed_clock`）が `0A000` にする。
-pub(crate) fn first_non_builtin_call_with(expr: &Expr, allow_current_time: bool) -> Option<&str> {
+pub(crate) fn first_non_builtin_call_with(
+    expr: &Expr,
+    allow_current_time: bool,
+    allow_json_fns: bool,
+) -> Option<&str> {
     match expr {
         Expr::Number(_)
         | Expr::Ident(_)
@@ -1010,32 +1037,38 @@ pub(crate) fn first_non_builtin_call_with(expr: &Expr, allow_current_time: bool)
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_) => None,
         Expr::Call { name, args } => {
+            // `json_*`／`to_json`（Issue #2180）は json 型の式を要し、CHECK 本体・連鎖ビュー本文には
+            // json 列参照を置けないため、時刻関数と同じく禁止要素として報告する（`42601`）。
             if !is_builtin_function_name(name)
                 || (!allow_current_time && is_current_time_function_name(name))
+                || (!allow_json_fns
+                    && crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase()))
             {
                 return Some(name.as_str());
             }
             args.iter()
-                .find_map(|a| first_non_builtin_call_with(a, allow_current_time))
+                .find_map(|a| first_non_builtin_call_with(a, allow_current_time, allow_json_fns))
         }
         Expr::Binary { lhs, rhs, .. }
         | Expr::NullIf(lhs, rhs)
-        | Expr::JsonAccess { lhs, rhs, .. } => first_non_builtin_call_with(lhs, allow_current_time)
-            .or_else(|| first_non_builtin_call_with(rhs, allow_current_time)),
+        | Expr::JsonAccess { lhs, rhs, .. } => {
+            first_non_builtin_call_with(lhs, allow_current_time, allow_json_fns)
+                .or_else(|| first_non_builtin_call_with(rhs, allow_current_time, allow_json_fns))
+        }
         Expr::Case { whens, else_result } => whens
             .iter()
             .find_map(|(c, r)| {
-                first_non_builtin_call_with(c, allow_current_time)
-                    .or_else(|| first_non_builtin_call_with(r, allow_current_time))
+                first_non_builtin_call_with(c, allow_current_time, allow_json_fns)
+                    .or_else(|| first_non_builtin_call_with(r, allow_current_time, allow_json_fns))
             })
             .or_else(|| {
-                else_result
-                    .as_deref()
-                    .and_then(|e| first_non_builtin_call_with(e, allow_current_time))
+                else_result.as_deref().and_then(|e| {
+                    first_non_builtin_call_with(e, allow_current_time, allow_json_fns)
+                })
             }),
         Expr::Coalesce(args) => args
             .iter()
-            .find_map(|a| first_non_builtin_call_with(a, allow_current_time)),
+            .find_map(|a| first_non_builtin_call_with(a, allow_current_time, allow_json_fns)),
         // 現在時刻関数（SQL-37・Issue #1586）は組み込みだが、CHECK（TABLE-16）・連鎖ビュー本文
         // （TABLE-18）では決定的でないため禁止要素として報告する（`42601`）。
         Expr::ValueFunction { kind, .. } => {
@@ -1477,6 +1510,12 @@ fn validate_closed_expr(
                         args.len()
                     )));
                 }
+            } else if crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase()) {
+                // json 型の式を要する関数（Issue #2180）。関数本体は列参照を持てず json 型の
+                // 引数も存在しないため、定義時に fail-closed で拒否する。
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "JSON functions are not supported in a function body".to_string(),
+                });
             } else if name.eq_ignore_ascii_case("concat") {
                 if args.is_empty() {
                     return Err(SqlSurfaceError::undefined_function(
@@ -1589,7 +1628,7 @@ fn validate_closed_expr(
 /// 束縛環境: 列参照の解決元（`SELECT`/`WHERE` の式では `Some(schema)`、UDF 本体の
 /// 展開中は `None` に切り替わりパラメータ参照だけを解決する）と、パラメータ名 →
 /// 既に束縛済みの実引数式（インライン展開用）の対応表。
-struct BindEnv<'a> {
+pub(super) struct BindEnv<'a> {
     schema: Option<&'a TableSchema>,
     params: std::collections::HashMap<String, (BoundExpr, ExprType)>,
     registry: &'a UdfRegistry,
@@ -1644,6 +1683,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
         | BoundExpr::JsonbColumnRef { .. }
+        | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => 1,
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
@@ -1660,6 +1700,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
                     other => other.expr().map_or(0, count_bound_nodes),
                 }
         }
+        BoundExpr::JsonTextFn(f) => 1 + f.args.iter().map(count_bound_nodes).sum::<usize>(),
         BoundExpr::JsonModify { lhs, rhs, .. } => {
             1 + count_bound_nodes(lhs)
                 + match rhs {
@@ -1713,6 +1754,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
         | BoundExpr::JsonbColumnRef { .. }
+        | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => 0,
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
@@ -1725,6 +1767,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         BoundExpr::JsonPredicate { lhs, rhs, .. } => {
             max_bound_case_nesting(lhs).max(rhs.expr().map_or(0, max_bound_case_nesting))
         }
+        BoundExpr::JsonTextFn(f) => f.args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
         BoundExpr::JsonModify { lhs, rhs, .. } => {
             max_bound_case_nesting(lhs).max(rhs.expr().map_or(0, max_bound_case_nesting))
         }
@@ -1776,6 +1819,7 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::JsonbColumnRef { .. }
+        | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => false,
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
@@ -1788,6 +1832,7 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         BoundExpr::JsonPredicate { lhs, rhs, .. } => {
             references_embedding(lhs) || rhs.expr().is_some_and(references_embedding)
         }
+        BoundExpr::JsonTextFn(f) => f.args.iter().any(references_embedding),
         BoundExpr::JsonModify { lhs, rhs, .. } => {
             references_embedding(lhs) || rhs.expr().is_some_and(references_embedding)
         }
@@ -1819,6 +1864,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::DateColumnRef { index }
         | BoundExpr::TimestampColumnRef { index }
         | BoundExpr::JsonbColumnRef { index }
+        | BoundExpr::JsonColumnRef { index }
         | BoundExpr::ColumnRef { index } => visit(*index),
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             visit_referenced_scalar_columns(lhs, visit);
@@ -1847,6 +1893,11 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::VectorRef
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => {}
+        BoundExpr::JsonTextFn(f) => {
+            for a in &f.args {
+                visit_referenced_scalar_columns(a, visit);
+            }
+        }
         BoundExpr::Builtin { args, .. }
         | BoundExpr::WasmCall { args, .. }
         | BoundExpr::JsonFn { args, .. } => {
@@ -1899,6 +1950,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::DateColumnRef { index }
         | BoundExpr::TimestampColumnRef { index }
         | BoundExpr::JsonbColumnRef { index }
+        | BoundExpr::JsonColumnRef { index }
         | BoundExpr::ColumnRef { index } => {
             if let Some(slot) = mask.get_mut(*index) {
                 *slot = true;
@@ -1950,6 +2002,15 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         // 明示ループで全引数を必ず走査する（`references_embedding` の `any`
         // 使用とは異なり、ここでは「1 つでも該当するか」だけでなく「該当する
         // 添字をすべて `mask` へ反映する」副作用が主目的）。
+        BoundExpr::JsonTextFn(f) => {
+            let mut any = false;
+            for a in &f.args {
+                if mark_referenced_scalar_columns(a, mask) {
+                    any = true;
+                }
+            }
+            any
+        }
         BoundExpr::Builtin { args, .. }
         | BoundExpr::WasmCall { args, .. }
         | BoundExpr::JsonFn { args, .. } => {
@@ -2140,6 +2201,12 @@ pub(crate) fn expr_result_column_type(
             });
         }
     }
+    // `json_array_length` は int4（Issue #2180）。
+    if let BoundExpr::JsonTextFn(f) = bound {
+        if f.result_is_int4() {
+            return Some(ColumnType::Integer);
+        }
+    }
     column_type_for_expr_type(ty)
 }
 
@@ -2174,6 +2241,7 @@ pub(crate) fn column_type_for_expr_type(ty: ExprType) -> Option<ColumnType> {
         ExprType::Date => Some(ColumnType::Date),
         ExprType::Timestamp => Some(ColumnType::Timestamp),
         ExprType::Json => Some(ColumnType::Jsonb),
+        ExprType::JsonText => Some(ColumnType::Json),
         ExprType::Vector => None,
     }
 }
@@ -2264,7 +2332,7 @@ where
 /// `Expr::Null` はここでのみ特別扱いし、型が未確定のまま [`BoundExpr::Null`] を
 /// 返す（`Ok` 側の `None` が「型未確定」を表す）。呼び出し元がすべての兄弟枝の
 /// 型を突き合わせて単一化する。
-fn bind_null_aware(
+pub(super) fn bind_null_aware(
     expr: &Expr,
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
@@ -2469,12 +2537,20 @@ fn reject_json_operand(ty: ExprType) -> Result<(), SqlSurfaceError> {
                 .to_string(),
         });
     }
+    // `json` 値（Issue #2180）は比較・並べ替えの演算子を持たない（`42883` は比較・
+    // ORDER BY・GROUP BY の各束縛が返す）。それ以外の位置は fail-closed に `0A000`。
+    if ty == ExprType::JsonText {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "a json value can only be projected or used with a JSON path operator or json function"
+                .to_string(),
+        });
+    }
     Ok(())
 }
 
 /// [`bind_expr_in`] の本体。jsonb 型の結果を返しうる（投影・パス演算子の左辺は
 /// この関数を直接呼び、それ以外の消費側は [`bind_expr_in`] 経由で jsonb を拒否する）。
-fn bind_expr_any(
+pub(super) fn bind_expr_any(
     expr: &Expr,
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
@@ -2637,9 +2713,10 @@ fn bind_expr_any(
                     // `reject_json_operand` が `0A000` で拒否する）。`json`（原文保存）列は
                     // 意味論が別 Issue のため従来どおり拒否する。
                     ColumnType::Jsonb => Ok((BoundExpr::JsonbColumnRef { index }, ExprType::Json)),
-                    ColumnType::Json => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} cannot be used in an expression (JSON columns are not supported)"
-                    ))),
+                    // Issue #2180・TABLE-25: `json`（原文保存）列は `ExprType::JsonText` として
+                    // 受理する。消費できるのはパス演算子の左辺・`json_*` 関数・投影だけで、
+                    // 比較等は `42883`、算術・CASE 等は `0A000` で拒否する。
+                    ColumnType::Json => Ok((BoundExpr::JsonColumnRef { index }, ExprType::JsonText)),
                     ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (ENUM columns are not supported)"
                     ))),
@@ -2676,6 +2753,14 @@ fn bind_expr_any(
                 let (l, lt) = bind_expr_any(lhs, env, node_budget)?;
                 if lt == ExprType::Json {
                     return bind_json_delete_bound(l, rhs, env, node_budget);
+                }
+                // json（原文保存）の結果（`json_build_object(..)` 等）に `-` は無い。json 列・
+                // パス演算子の左辺（`is_json_expr` 側）と同じく 42883 に揃え、算術経路の
+                // 42804 へ落とさない。
+                if lt == ExprType::JsonText {
+                    return Err(SqlSurfaceError::undefined_function(
+                        "operator does not exist: the operand types do not match the - operator",
+                    ));
                 }
                 prebound_lhs = Some((l, lt));
             }
@@ -2850,6 +2935,8 @@ fn is_int4_expr(expr: &Expr, env: &BindEnv<'_>) -> bool {
             lhs,
             rhs,
         } => is_int4_expr(lhs, env) && is_int4_expr(rhs, env),
+        // `json_array_length` の戻り型は int4（Issue #2180）。
+        Expr::Call { name, .. } => name.eq_ignore_ascii_case("json_array_length"),
         _ => false,
     }
 }
@@ -2891,26 +2978,23 @@ fn bind_json_access(
                     })?;
                     (BoundExpr::JsonbColumnRef { index }, ExprType::Json)
                 }
-                Some((_, c)) if matches!(c.ty, ColumnType::Json) => {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "JSON path operators on a json column are not supported; use jsonb"
-                            .to_string(),
-                    })
+                Some((index, c)) if matches!(c.ty, ColumnType::Json) => {
+                    *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
+                        SqlSurfaceError::payload_too_large("expression is too large")
+                    })?;
+                    (BoundExpr::JsonColumnRef { index }, ExprType::JsonText)
                 }
                 _ => bind_expr_in(lhs, env, node_budget)?,
             }
         }
         _ => bind_expr_any(lhs, env, node_budget)?,
     };
-    if l_ty != ExprType::Json {
+    if l_ty != ExprType::Json && l_ty != ExprType::JsonText {
         return Err(operator_missing());
     }
     let as_text = matches!(op, JsonAccessOp::GetText | JsonAccessOp::PathText);
-    let result_ty = if as_text {
-        ExprType::Text
-    } else {
-        ExprType::Json
-    };
+    // `->`／`#>` の結果型は左辺と同じ（jsonb は正規化値、json は原文の部分テキスト）。
+    let result_ty = if as_text { ExprType::Text } else { l_ty };
     let rhs_bound = match op {
         JsonAccessOp::Get | JsonAccessOp::GetText => {
             // 添字が int4 式なら、WHERE／UPDATE／DELETE 等の非投影経路でも投影経路と同じ
@@ -2997,7 +3081,13 @@ fn bind_json_concat_operand(
             }
         }
     }
-    bind_expr_any(expr, env, node_budget)
+    // json 値（関数結果・パス演算子の結果）も json 列と同じく text 連結に当たるため `0A000`
+    // に揃える（PR #2390 指摘。型で 42883／0A000 が割れないようにする）。
+    let (bound, ty) = bind_expr_any(expr, env, node_budget)?;
+    if ty == ExprType::JsonText {
+        return Err(concat_not_supported());
+    }
+    Ok((bound, ty))
 }
 
 fn concat_not_supported() -> SqlSurfaceError {
@@ -3385,7 +3475,11 @@ fn bind_json_predicate(
 /// （小数リテラル・疑似列 `id`・関数・`CASE` など。現状の f64 意味論のまま = フェイル
 /// セーフ）。整数リテラルは `expr`（字面）から、列参照は束縛済みの `ColumnRef` と
 /// スキーマから、入れ子の型付き算術はそのノードの種別から決める。O(1)。
-fn numeric_kind(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> Option<NumericKind> {
+pub(super) fn numeric_kind(
+    expr: &Expr,
+    bound: &BoundExpr,
+    env: &BindEnv<'_>,
+) -> Option<NumericKind> {
     if let Expr::Number(raw) = expr {
         return classify_projection_integer_literal(raw).map(|(_, k)| k);
     }
@@ -3404,6 +3498,8 @@ fn numeric_kind(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> Option<Num
             f: BuiltinFn::TypedArith(_, k),
             ..
         } => Some(*k),
+        // `json_array_length` は int4（Issue #2180）。整数除算・添字の型解決に反映する。
+        BoundExpr::JsonTextFn(f) if f.result_is_int4() => Some(NumericKind::Int4),
         // `jsonb_array_length` は int4 なので、算術でも整数演算に解決する（Issue #1599）。
         BoundExpr::JsonFn {
             f: JsonFnKind::ArrayLength,
@@ -3859,6 +3955,13 @@ fn bind_json_any_arg(
             detail: "a vector value cannot be converted to jsonb".to_string(),
         });
     }
+    // json 型の式全般（演算子結果・`json_*` 結果を含む）は評価時に内部エラーになるため、
+    // 束縛時にクライアント向けの `0A000` で拒否する。
+    if ty == ExprType::JsonText {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "a json value cannot be converted to jsonb here; use a jsonb value".to_string(),
+        });
+    }
     Ok(bound)
 }
 fn bind_binary(
@@ -3971,6 +4074,9 @@ fn bind_call(
         ));
     }
     let lower_name = name.to_ascii_lowercase();
+    if crate::sql::json_fn::is_json_fn_name(&lower_name) {
+        return crate::sql::json_fn::bind_json_fn(&lower_name, args, env, node_budget);
+    }
     if lower_name == "concat" {
         return bind_concat(args, env, node_budget);
     }
@@ -4477,12 +4583,13 @@ fn eval_json_access<'a>(
     embedding: &'a [f32],
     row_scalars: &'a [Option<ScalarRef<'a>>],
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
-    let stored = match eval_with_scalars(lhs, id, embedding, row_scalars)? {
-        ExprValue::Json(j) => j,
+    let (stored, original_text) = match eval_with_scalars(lhs, id, embedding, row_scalars)? {
+        ExprValue::Json(j) => (j, false),
+        ExprValue::JsonText(j) => (j, true),
         ExprValue::Null => return Ok(ExprValue::Null),
         _ => {
             return Err(SqlSurfaceError::Internal {
-                detail: "JSON path operator left operand is not a jsonb value".to_string(),
+                detail: "JSON path operator left operand is not a json or jsonb value".to_string(),
             })
         }
     };
@@ -4514,6 +4621,40 @@ fn eval_json_access<'a>(
         },
         JsonAccessRhs::Path(_) => None,
     };
+    if original_text {
+        // `json`（原文保存）: 部分テキストを原文のまま返す（Issue #2180）。
+        let found = match rhs {
+            JsonAccessRhs::Path(path) => crate::json_text::json_text_get_path(&stored, path),
+            _ => match &step {
+                Some(crate::json::JsonAccessStep::Key(k)) => {
+                    crate::json_text::json_text_get_field(&stored, k)
+                }
+                Some(crate::json::JsonAccessStep::Index(i)) => {
+                    crate::json_text::json_text_get_index(&stored, *i)
+                }
+                None => return Ok(ExprValue::Null),
+            },
+        }
+        .map_err(|_| SqlSurfaceError::Internal {
+            detail: "stored json value could not be parsed".to_string(),
+        })?;
+        let Some(span) = found else {
+            return Ok(ExprValue::Null);
+        };
+        if as_text {
+            return Ok(
+                match crate::json_text::json_text_as_text(span).map_err(|_| {
+                    SqlSurfaceError::Internal {
+                        detail: "stored json value could not be parsed".to_string(),
+                    }
+                })? {
+                    Some(t) => ExprValue::Text(Cow::Owned(t)),
+                    None => ExprValue::Null,
+                },
+            );
+        }
+        return Ok(ExprValue::JsonText(Cow::Owned(span.to_string())));
+    }
     let result = match rhs {
         JsonAccessRhs::Path(path) => crate::json::jsonb_access_path(&stored, path, as_text),
         _ => match step {
@@ -4731,6 +4872,12 @@ fn json_value_from_expr_value(
                 detail: "a vector value cannot be converted to jsonb".to_string(),
             })
         }
+        // json（原文保存型）は束縛段で jsonb 関数の引数から弾かれる（42883）ため到達しない。
+        ExprValue::JsonText(_) => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "json text value reached a jsonb function".to_string(),
+            })
+        }
     })
 }
 
@@ -4746,9 +4893,11 @@ fn json_object_key(v: &ExprValue<'_>) -> Result<String, SqlSurfaceError> {
         ExprValue::Scalar(n) => Ok(crate::json::json_number_key_text(*n)),
         ExprValue::Date(d) => Ok(crate::datetime::format_date(*d)),
         ExprValue::Timestamp(t) => Ok(crate::json::json_timestamp_text(*t)),
-        ExprValue::Json(_) | ExprValue::Vector(_) => Err(SqlSurfaceError::InvalidParameterValue {
-            detail: "key value must be scalar, not array, composite, or json",
-        }),
+        ExprValue::Json(_) | ExprValue::JsonText(_) | ExprValue::Vector(_) => {
+            Err(SqlSurfaceError::InvalidParameterValue {
+                detail: "key value must be scalar, not array, composite, or json",
+            })
+        }
     }
 }
 
@@ -5013,6 +5162,19 @@ pub(crate) fn eval_with_scalars<'a>(
                     .to_string(),
             }),
         },
+        BoundExpr::JsonColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "JSON column reference is outside the decoded row scalar view".to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Json(text))) => Ok(ExprValue::JsonText(Cow::Borrowed(text))),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "JSON column reference resolved to a non-JSON row scalar value".to_string(),
+            }),
+        },
+        BoundExpr::JsonTextFn(f) => {
+            crate::sql::json_fn::eval_json_fn(f, id, embedding, row_scalars)
+        }
         BoundExpr::JsonbLiteral(text) => Ok(ExprValue::Json(Cow::Owned(text.clone()))),
         BoundExpr::JsonAccess { lhs, rhs, as_text } => {
             eval_json_access(lhs, rhs, *as_text, id, embedding, row_scalars)

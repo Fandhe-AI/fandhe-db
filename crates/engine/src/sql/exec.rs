@@ -3413,6 +3413,11 @@ fn project_rows(
                         // jsonb パス演算子 `->`／`#>` の結果（Issue #1596・TABLE-25）。
                         // jsonb 列の直接投影と同じ `Cell::Json`（text 形式で OID 3802）。
                         udf_call::ExprValue::Json(j) => cells.push(Cell::Json(try_clone_text(&j)?)),
+                        // `json`（原文保存）式の結果（Issue #2180）。`json` 列の直接投影と同じ
+                        // `Cell::Json`（結果列型が `Json` のため text 形式で OID 114）。
+                        udf_call::ExprValue::JsonText(j) => {
+                            cells.push(Cell::Json(try_clone_text(&j)?))
+                        }
                     }
                 }
             }

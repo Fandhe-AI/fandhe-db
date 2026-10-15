@@ -14,8 +14,8 @@
 
 use crate::sql::allowlist::{InsertLiteral, SqlSurfaceError};
 use crate::sql::udf_call::{
-    bind_const_expr, eval, first_non_builtin_call, BinOp, BoundExpr, Expr, ExprType, ExprValue,
-    UdfRegistry, MAX_EXPR_NODES,
+    bind_const_expr, eval, first_non_builtin_call_with, BinOp, BoundExpr, Expr, ExprType,
+    ExprValue, UdfRegistry, MAX_EXPR_NODES,
 };
 
 /// 仮値評価で起きたエラーの遅延方針（Issue #1546）。
@@ -307,9 +307,9 @@ fn typed_null(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
         ExprType::Text => twin(Expr::String(String::new())),
         ExprType::Date => twin(Expr::DateLiteral(0)),
         ExprType::Timestamp => twin(Expr::TimestampLiteral(0)),
-        ExprType::Json => {
+        ExprType::Json | ExprType::JsonText => {
             return Err(SqlSurfaceError::unsupported(
-                "a jsonb value is not allowed in a constant expression",
+                "a json value is not allowed in a constant expression",
             ))
         }
         ExprType::Bool => Expr::Case {
@@ -527,7 +527,7 @@ fn propagate_null(expr: &Expr) -> Result<Expr, SqlSurfaceError> {
 /// 列参照を含まない式を評価して [`InsertLiteral`] へ畳み込む。
 pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfaceError> {
     prescan(expr)?;
-    if first_non_builtin_call(expr).is_some() {
+    if first_non_builtin_call_with(expr, false, true).is_some() {
         return Err(SqlSurfaceError::unsupported(
             "only built-in functions are allowed in a constant expression",
         ));
@@ -578,8 +578,8 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         ExprValue::Vector(_) => Err(SqlSurfaceError::Internal {
             detail: "constant expression produced a vector".to_string(),
         }),
-        ExprValue::Json(_) => Err(SqlSurfaceError::unsupported(
-            "a jsonb value is not allowed in a constant expression",
+        ExprValue::Json(_) | ExprValue::JsonText(_) => Err(SqlSurfaceError::unsupported(
+            "a json value is not allowed in a constant expression",
         )),
     }
 }

@@ -187,7 +187,10 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             // なりうる）。再パース失敗は格納契約違反（`row_codec` の encode
             // チョークポイントが常に検証済みテキストのみを格納する契約に反する）
             // であり内部エラー（`XX000`）として fail-closed に扱う。
-            let value = engine::json::parse_json(text).map_err(|_| ResponseEncodeError)?;
+            // `json` 列は重複キーを原文のまま格納しうる（Issue #2180）ため後勝ちで読み、
+            // 応答は重複キーを最後の値へ畳んだ正規形にする（生テキストは連結しない）。
+            let value = engine::json::parse_json_with(text, engine::json::DuplicateKeys::LastWins)
+                .map_err(|_| ResponseEncodeError)?;
             engine::json::write_canonical(&value, out);
             Ok(())
         }
@@ -295,7 +298,8 @@ fn write_array(
         // JSON／JSONB 要素は再パース＋`write_canonical` で埋め込み、格納テキストを
         // 生連結しない（`Cell::Json` と同じ安全側の設計）。再パース失敗は fail-closed。
         ArrayValue::Json(items) | ArrayValue::Jsonb(items) => each(out, items, |out, text| {
-            let value = engine::json::parse_json(text).map_err(|_| ResponseEncodeError)?;
+            let value = engine::json::parse_json_with(text, engine::json::DuplicateKeys::LastWins)
+                .map_err(|_| ResponseEncodeError)?;
             engine::json::write_canonical(&value, out);
             Ok(())
         })?,
