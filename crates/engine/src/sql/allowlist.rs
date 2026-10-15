@@ -10134,17 +10134,24 @@ pub(crate) fn looks_like_join(tokens: &[Token]) -> bool {
 /// `FROM` 直後（`idx`）から見て、`<ident> [[AS] <alias>] JOIN...` の並びかどうかを
 /// 判定する（[`looks_like_join`] 参照）。
 pub(super) fn from_clause_starts_join(tokens: &[Token], idx: usize) -> bool {
-    if !matches!(tokens.get(idx), Some(Token::Ident(_))) {
+    // 引用付きの値関数予約語名（`"current_date"` 等）は QuotedNull で残るため、
+    // 表名・別名位置では識別子として受理する（Issue #1586）。
+    if !matches!(
+        tokens.get(idx),
+        Some(Token::Ident(_) | Token::QuotedNull(_))
+    ) {
         return false;
     }
     let mut i = idx + 1;
     if matches!(tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("AS")) {
         i += 1;
-        if !matches!(tokens.get(i), Some(Token::Ident(_))) {
+        if !matches!(tokens.get(i), Some(Token::Ident(_) | Token::QuotedNull(_))) {
             return false;
         }
         i += 1;
-    } else if matches!(tokens.get(i), Some(Token::Ident(w)) if !is_join_reserved_word(w)) {
+    } else if matches!(tokens.get(i), Some(Token::QuotedNull(_)))
+        || matches!(tokens.get(i), Some(Token::Ident(w)) if !is_join_reserved_word(w))
+    {
         i += 1;
     }
     is_join_keyword_at(tokens, i)
@@ -19057,6 +19064,20 @@ mod tests {
         assert!(!normalized
             .iter()
             .any(|t| matches!(t, Token::Ident(n) if n == "current_date")));
+    }
+
+    /// SQL-37・Issue #1586（PR #2382 指摘）: 引用付き値関数予約語名の表名・別名でも
+    /// JOIN の先読みが成立する（`QuotedNull` を識別子として受理する）。
+    #[test]
+    fn join_lookahead_accepts_quoted_value_function_names() {
+        for sql in [
+            "SELECT * FROM \"current_date\" a JOIN events b ON a.id = b.id LIMIT 10",
+            "SELECT * FROM events \"current_date\" JOIN events2 b ON events.id = b.id LIMIT 10",
+            "SELECT * FROM events AS \"current_date\" JOIN events2 b ON events.id = b.id LIMIT 10",
+        ] {
+            let tokens = lexer::tokenize_marked(sql).expect("lex");
+            assert!(looks_like_join(&tokens), "sql={sql:?}");
+        }
     }
 
     #[test]
