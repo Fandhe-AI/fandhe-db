@@ -870,6 +870,15 @@ pub(crate) fn is_current_time_function_name(name: &str) -> bool {
 /// 網羅し `_ =>` を置かない（variant 追加時にコンパイルエラーで検査漏れに気づく。
 /// fail-closed）。再帰の深さは構文段の式ネスト上限で抑えられる。
 pub(crate) fn first_non_builtin_call(expr: &Expr) -> Option<&str> {
+    first_non_builtin_call_with(expr, false)
+}
+
+/// [`first_non_builtin_call`] の本体。`allow_current_time` が真のときだけ現在時刻関数
+/// （`now()` 等・括弧なし値関数）を禁止要素として報告しない。分割実行 DML の `SET` 右辺が、
+/// トランザクション固定の時刻だけを受理するスコープ（[`time_fn::ClockPolicy::TxnFixedOnly`]）の
+/// 中でのみ真にする（`sql::set_expr`。SQL-37・Issue #1587）。`statement_timestamp()`・
+/// `clock_timestamp()` はここでは通し、束縛段（`reject_non_txn_fixed_clock`）が `0A000` にする。
+pub(crate) fn first_non_builtin_call_with(expr: &Expr, allow_current_time: bool) -> Option<&str> {
     match expr {
         Expr::Number(_)
         | Expr::Ident(_)
@@ -878,24 +887,41 @@ pub(crate) fn first_non_builtin_call(expr: &Expr) -> Option<&str> {
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_) => None,
         Expr::Call { name, args } => {
-            if !is_builtin_function_name(name) || is_current_time_function_name(name) {
+            if !is_builtin_function_name(name)
+                || (!allow_current_time && is_current_time_function_name(name))
+            {
                 return Some(name.as_str());
             }
-            args.iter().find_map(first_non_builtin_call)
+            args.iter()
+                .find_map(|a| first_non_builtin_call_with(a, allow_current_time))
         }
         Expr::Binary { lhs, rhs, .. }
         | Expr::NullIf(lhs, rhs)
-        | Expr::JsonAccess { lhs, rhs, .. } => {
-            first_non_builtin_call(lhs).or_else(|| first_non_builtin_call(rhs))
-        }
+        | Expr::JsonAccess { lhs, rhs, .. } => first_non_builtin_call_with(lhs, allow_current_time)
+            .or_else(|| first_non_builtin_call_with(rhs, allow_current_time)),
         Expr::Case { whens, else_result } => whens
             .iter()
-            .find_map(|(c, r)| first_non_builtin_call(c).or_else(|| first_non_builtin_call(r)))
-            .or_else(|| else_result.as_deref().and_then(first_non_builtin_call)),
-        Expr::Coalesce(args) => args.iter().find_map(first_non_builtin_call),
+            .find_map(|(c, r)| {
+                first_non_builtin_call_with(c, allow_current_time)
+                    .or_else(|| first_non_builtin_call_with(r, allow_current_time))
+            })
+            .or_else(|| {
+                else_result
+                    .as_deref()
+                    .and_then(|e| first_non_builtin_call_with(e, allow_current_time))
+            }),
+        Expr::Coalesce(args) => args
+            .iter()
+            .find_map(|a| first_non_builtin_call_with(a, allow_current_time)),
         // 現在時刻関数（SQL-37・Issue #1586）は組み込みだが、CHECK（TABLE-16）・連鎖ビュー本文
         // （TABLE-18）では決定的でないため禁止要素として報告する（`42601`）。
-        Expr::ValueFunction { kind, .. } => Some(kind.as_sql()),
+        Expr::ValueFunction { kind, .. } => {
+            if allow_current_time {
+                None
+            } else {
+                Some(kind.as_sql())
+            }
+        }
     }
 }
 
@@ -2507,10 +2533,24 @@ fn bind_expr_any(
 /// 文脈。INSERT／UPDATE／DELETE／COPY／CHECK／DEFAULT／VIEW 本文等）は `0A000` で拒否する
 /// （SQL-37・Issue #1586。許可リスト型の fail-closed）。
 fn require_clock(env: &BindEnv<'_>) -> Result<StatementClock, SqlSurfaceError> {
+    // 分割実行 DML が「時刻値関数を含む文か」を判定するための印（`time_fn::ClockScope::was_used`）。
+    time_fn::mark_clock_used();
     env.clock
         .ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
             detail: "current time functions are not supported in this context".to_string(),
         })
+}
+
+/// 「トランザクション固定のみ」スコープ（分割実行 DML。[`time_fn::ClockPolicy::TxnFixedOnly`]）で
+/// `statement_timestamp()`・`clock_timestamp()` を `0A000` にする（再開時に値を再現できないため
+/// fail-closed。SQL-37・RECOVER-11・Issue #1587。書き込み側の対応は #2188）。
+fn reject_non_txn_fixed_clock(name: &str) -> Result<(), SqlSurfaceError> {
+    if time_fn::current_clock_policy() == time_fn::ClockPolicy::TxnFixedOnly {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!("{name}() is not supported in a partitioned statement"),
+        });
+    }
+    Ok(())
 }
 
 /// 括弧なし値関数（`CURRENT_TIMESTAMP`・`CURRENT_DATE`・`LOCALTIMESTAMP`）を束縛時に確定した
@@ -3330,12 +3370,15 @@ fn bind_call(
                 ));
             }
             "statement_timestamp" => {
+                reject_non_txn_fixed_clock(&lower_name)?;
                 return Ok((
                     BoundExpr::Timestamp(clock.stmt_start_micros),
                     ExprType::Timestamp,
                 ));
             }
-            _ => {}
+            _ => {
+                reject_non_txn_fixed_clock(&lower_name)?;
+            }
         }
     }
 

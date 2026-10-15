@@ -140,7 +140,8 @@ fn column_references_and_boundaries_are_rejected() {
         .execute_sql_in_session(
             &ctx(),
             &mut session,
-            "CREATE TABLE bad2 (embedding VECTOR(4), n TIMESTAMP DEFAULT now())",
+            // 単独の `now()` は時刻 DEFAULT（Issue #1587）として受理されるが、定数式の中の時刻関数は拒否する。
+            "CREATE TABLE bad2 (embedding VECTOR(4), n TIMESTAMP DEFAULT now() + 1)",
         )
         .unwrap_err();
     assert_eq!(err.wire_code(), "42601");

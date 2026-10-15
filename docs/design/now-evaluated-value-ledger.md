@@ -182,3 +182,53 @@ RECOVER-14・RECOVER-15 の機能は未実装。実装時は評価済みの値�
 - コード実装（上表の各 Issue）、TIMESTAMPTZ と TimeZone、変更ログ・レプリケーション、全行書き換えの ADD COLUMN 経路。
 - spec 側への確認事項: 親 #1584／#2188 の「評価済み値を台帳に保存して再送時に返す」という表現と、本設計
   （台帳はトランザクション開始時刻のみ、評価値は行に残し、再送は `23505`）の対応づけ。D10 の既存行の値の扱い。
+
+### #1587 での実装メモ
+
+本 Issue で実装した範囲と、設計から一部変えた点を記録する（ポインタ: SQL-37・RECOVER-10・RECOVER-11・
+RECOVER-12・TABLE-16・TASK-248）。
+
+- **D9（DEFAULT now()）**: `ColumnDefault::CurrentTime(TimeDefault)` とカタログタグ `c` を追加（公開 enum への
+  variant 追加＝BREAKING）。`TimeDefault` は構文形（`Now`・`TransactionTimestamp`・`CurrentTimestamp(p)`・
+  `LocalTimestamp(p)`・`CurrentDate`）の許可リストで、本体は正準形テキスト（`now`・`current_timestamp:3` 等）を
+  16 進化して保存する。decode は許可リスト外・精度 0〜6 の範囲外・非正準な精度表記を `Invalid` で拒否する。
+  受理するのは列の `DEFAULT` が式全体で単独の時刻関数である場合に限り（`now() + 1`・CAST 等は従来どおり
+  `42601`）、`TIMESTAMP` 系は `TIMESTAMP` 列、`CURRENT_DATE` は `DATE` 列のみ（不一致は定数 DEFAULT と同じ
+  `42601`）。`statement_timestamp()`・`clock_timestamp()` の DEFAULT は `0A000`（#2188）。`CURRENT_TIME`・
+  `LOCALTIME` は従来どおり `42601`。
+  - 評価は INSERT の省略列補完（`fill_omitted_columns`）だけが行う。評価時刻は `core.rs` の INSERT 入口が
+    `time_fn::DefaultClockScope`（式束縛用の `ClockScope` とは別スロット）で渡す。COPY は行ごとの束縛が
+    複数メッセージにまたがるため `CopyInSession` が開始時に確定した時刻を保持する。時刻が無い文脈
+    （ファイル形 INSERT・FK の `SET DEFAULT`・読み出し時補完）は共通関数（`bind_column_default`）が既定で
+    `0A000`／`Incompatible` にする。
+  - FK の `ON DELETE／UPDATE SET DEFAULT` が時刻 DEFAULT 列を対象にする宣言は、`CREATE TABLE`・
+    `ALTER TABLE ADD FOREIGN KEY` の両方で `sql::ddl` が `0A000` で拒否する（カタログ層にも多層防御として
+    `42830` の検査がある）。
+  - `ALTER COLUMN SET DEFAULT` は構文自体が存在しない（`ALTER COLUMN TYPE` は整数の拡大・縮小のみで時刻列は
+    対象外）ため、拒否の実装は不要。
+- **D10（ADD COLUMN ... DEFAULT now()）**: 既定の拒否（`0A000`。従来は `42601`）を実装。fast default
+  （ADD COLUMN 時に評価した値を既存行の補完値として固定する案）は後続 Issue。
+- **D2（INSERT 系ハッシュ）**: `OpTag::InsertExpr`（14）・`InsertBatchExpr`（15）・`UpsertExpr`（16）を追加。
+  揮発性 DEFAULT を適用した列が 1 つでもある文だけがこの別ドメインを使い、無い文のハッシュは既存関数のまま
+  バイト不変（golden テスト `typed_insert_and_upsert_layouts_without_volatile_defaults_are_golden`）。
+  行レイアウトは `id` → `visibility` → ベクトル → 列数（`Value::Null` 除外後）→ 列ごとに「列名・種別バイト・本体」。
+  種別 `0` は値、種別 `1` は VALUES 内の式用に番号だけ予約（#2188 まで到達しない）、種別 `2` は揮発性
+  DEFAULT（構文形を式タグ 3／13 で直列化）。`BoundInsert::volatile_default_columns`（公開フィールドの追加＝
+  BREAKING）が適用列を運ぶ。
+- **D6（分割実行 DML の固定時刻）**: ジョブ記録を版 2 にし、**`Running` だけ**が固定時刻（`i64` LE）を持つ
+  （設計は `Cancelled`／`Completed` も持つとしていたが、再開しない状態で時刻は使わないため v1 のまま。
+  差分として記録する）。時刻値関数を含まない文は従来どおり v1 のバイト列。時刻値関数の有無は AST の網羅走査では
+  なく、`ClockScope` が束縛中に時刻を要求したか（`was_used`）で判定する（判定漏れが fail-closed になる）。
+  実行の流れは「仮の固定時刻で束縛 → 含む文なら同じキーの `Running` 記録（ハッシュ一致）の固定時刻を読み、
+  異なれば記録の値で束縛し直す → 実行器が最初のチャンクの write txn 内で記録の値との一致を再検査（不一致は
+  `StateConflict`）→ 記録の作成時に固定時刻を永続化し、以降は変更不可」。固定時刻を持たない記録（v1）への
+  時刻つき再開は `ContentMismatch`（`22023`）。受理するのは分割実行 UPDATE の SET・WHERE と分割実行
+  DELETE の WHERE の、トランザクション固定の関数（`now()`・`transaction_timestamp()`・`CURRENT_*`・
+  `LOCALTIMESTAMP`）のみ。`statement_timestamp()`・`clock_timestamp()` は `0A000`。原子版の
+  `UPDATE SET now()` は従来どおり `42601`（#2188）。
+- **D4（台帳 v3）・D5**: 対象外（#2188）。台帳（`recovery/ledger.rs`）は変更しない。#1587 の実装により、
+  INSERT 系の再送一貫性は台帳値の拡張なしで成立する（ハッシュが構文形から計算され、再送は評価前に `23505`
+  で止まるため）。D4 で「API 形は #1587 で決める」としていた点は、`txn_start` を台帳へ記録する必要が
+  #1587 の範囲では生じなかったため、#2188 で決める（推奨: `LedgerEntryInput { hash, evaluated_at }` の導入）。
+- **spec 側への確認事項**: Issue の「確定時刻を台帳に保持」という表現と、本実装（INSERT 系は構文ハッシュで
+  再送を `23505` にし評価値は行に残す、分割実行はジョブ記録に固定時刻を持つ。台帳 v3 は #2188）の対応づけ。

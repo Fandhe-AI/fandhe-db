@@ -1541,7 +1541,9 @@ fn timestamp_not_null_outcome_is_independent_of_rows_and_tenants() {
     ));
 }
 
-/// 揮発性の既定値（`CURRENT_TIMESTAMP`・`now()`）は読み出し時補完と両立しないため拒否する。
+/// 揮発性の既定値（`CURRENT_TIMESTAMP`・`now()`）は読み出し時補完と両立しないため拒否する
+/// （Issue #1587・設計 D10。列 DEFAULT 自体は CREATE TABLE で受理されるようになったため、
+/// ADD COLUMN は未対応を示す `0A000`。既存行の補完値を固定する fast default は後続 Issue）。
 #[test]
 fn timestamp_volatile_default_is_rejected() {
     let (core, path) = new_core_with_table();
@@ -1551,7 +1553,7 @@ fn timestamp_volatile_default_is_rejected() {
         "ts TIMESTAMP DEFAULT now()",
     ] {
         let err = add_column(&core, decl).expect_err(decl);
-        assert_eq!(err.wire_code(), "42601", "{decl}: {err:?}");
+        assert_eq!(err.wire_code(), "0A000", "{decl}: {err:?}");
         assert!(!column_exists(&core, &ctx("owner"), TABLE, "ts"), "{decl}");
     }
 }
