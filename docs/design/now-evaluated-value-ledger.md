@@ -15,16 +15,16 @@
 
 現在時刻関数（`now()`・`CURRENT_TIMESTAMP` 等）は未実装で、呼び出しは `42883`、
 `INSERT VALUES`・`DEFAULT` では `42601` で拒否される（[datetime-scalar-functions.md](datetime-scalar-functions.md)
-「NOW() と決定性」）。SQL-37 の改訂でこれらを受理する方針になったため、実装 Issue
+「NOW() と決定性」）。これらを受理する実装 Issue
 （#1586 式評価器・#1587 DEFAULT now() と再送一貫性・#2188 statement／clock_timestamp と台帳記録）
-の前提として、次の 3 点を本書で確定する。
+の前提として、公開済みの既存コードの構造に対する実装設計（SQL-37 はポインタ参照のみ）を本書で記録する。
+次の 3 点が対象である。
 
 1. 評価済みの時刻値を台帳へどう保存するか
 2. `content_hash` への影響
 3. 再送（同一 `operation_id`）・クラッシュ復旧・分割実行 DML での一貫性
 
-評価時点は PostgreSQL と同じとする。`now()`・`CURRENT_TIMESTAMP`・`transaction_timestamp()` は
-トランザクション開始時刻、`statement_timestamp()` は文開始時刻、`clock_timestamp()` は呼び出し時刻。
+各関数の評価時点は PostgreSQL の公開ドキュメントに従う。ビヘイビアの契約は spec（上記ポインタ）を正とし、本書は契約の再掲を行わない。
 
 ## 2. 公開コードの現状（設計の前提）
 
