@@ -36,11 +36,19 @@ pub(crate) enum BinaryParam {
     Bytea,
     /// uuid（16 バイト）。
     Uuid,
+    /// time（0 時起点マイクロ秒の 8 バイト BE。TABLE-32・Issue #1571）。
+    Time,
 }
 
-/// バイナリ値の長さが型の受信形式と合わない（`08P01`）。
+/// バイナリ値の復号失敗。長さ不正は `08P01`、TIME の範囲外は `22008`
+/// （`extended_query` が別々の `HandlerError` へ写す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BinaryParamError;
+pub(crate) enum BinaryParamError {
+    /// 長さが型の受信形式と合わない。
+    InvalidLength,
+    /// 値が型の許容範囲外（TIME のみ。Issue #1571）。
+    OutOfRange,
+}
 
 /// float を PostgreSQL のテキスト入力が受理する表記へ変換する（有限値は最短往復桁）。
 fn float_text<T: std::fmt::Display>(v: &T, nan: bool, inf: bool, neg: bool) -> String {
@@ -61,40 +69,49 @@ fn float_text<T: std::fmt::Display>(v: &T, nan: bool, inf: bool, neg: bool) -> S
 /// `Unsupported` は呼び出し側が事前に弾く契約だが、念のため拒否する（fail-closed）。
 pub(crate) fn decode_to_text(kind: BinaryParam, raw: &[u8]) -> Result<Vec<u8>, BinaryParamError> {
     let text = match kind {
-        BinaryParam::Unsupported => return Err(BinaryParamError),
+        BinaryParam::Unsupported => return Err(BinaryParamError::InvalidLength),
         BinaryParam::Utf8Identity => return Ok(raw.to_vec()),
         BinaryParam::Int2 => {
-            let b = <[u8; 2]>::try_from(raw).map_err(|_| BinaryParamError)?;
+            let b = <[u8; 2]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
             i16::from_be_bytes(b).to_string()
         }
         BinaryParam::Int4 => {
-            let b = <[u8; 4]>::try_from(raw).map_err(|_| BinaryParamError)?;
+            let b = <[u8; 4]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
             i32::from_be_bytes(b).to_string()
         }
         BinaryParam::Int8 => {
-            let b = <[u8; 8]>::try_from(raw).map_err(|_| BinaryParamError)?;
+            let b = <[u8; 8]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
             i64::from_be_bytes(b).to_string()
         }
         BinaryParam::Float4 => {
-            let b = <[u8; 4]>::try_from(raw).map_err(|_| BinaryParamError)?;
+            let b = <[u8; 4]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
             let v = f32::from_bits(u32::from_be_bytes(b));
             float_text(&v, v.is_nan(), v.is_infinite(), v.is_sign_negative())
         }
         BinaryParam::Float8 => {
-            let b = <[u8; 8]>::try_from(raw).map_err(|_| BinaryParamError)?;
+            let b = <[u8; 8]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
             let v = f64::from_bits(u64::from_be_bytes(b));
             float_text(&v, v.is_nan(), v.is_infinite(), v.is_sign_negative())
         }
         BinaryParam::Bool => {
             // PostgreSQL の `boolrecv` と同じく 0 以外は真。
-            let [b] = <[u8; 1]>::try_from(raw).map_err(|_| BinaryParamError)?;
+            let [b] = <[u8; 1]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
             if b != 0 { "t" } else { "f" }.to_string()
         }
         BinaryParam::Uuid => {
-            let b = <[u8; 16]>::try_from(raw).map_err(|_| BinaryParamError)?;
+            let b = <[u8; 16]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
             engine::uuid::Uuid::from_bytes(b).to_string()
         }
         BinaryParam::Bytea => engine::bytea::format_hex_text(raw),
+        BinaryParam::Time => {
+            let b = <[u8; 8]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
+            let v = i64::from_be_bytes(b);
+            // `format_time` は範囲外を丸めるため、整形前に必ず範囲を検査する（fail-closed）。
+            if !engine::datetime::validate_time_micros(v) {
+                return Err(BinaryParamError::OutOfRange);
+            }
+            engine::datetime::format_time(v)
+        }
     };
     Ok(text.into_bytes())
 }
@@ -162,6 +179,23 @@ mod tests {
         );
     }
 
+    /// TIME は 0 時起点 µs の 8 バイト BE。境界値は `parse_time` で元の値へ戻り、
+    /// 範囲外は丸めずに `OutOfRange` で拒否する（Issue #1571）。
+    #[test]
+    fn time_round_trips_and_rejects_out_of_range() {
+        for v in [0i64, 1, 86_399_999_999, 86_400_000_000] {
+            let t = dec(BinaryParam::Time, &binary::time(v));
+            assert_eq!(engine::datetime::parse_time(&t).ok(), Some(v), "{t}");
+        }
+        for v in [-1i64, 86_400_000_001, i64::MIN, i64::MAX] {
+            assert_eq!(
+                decode_to_text(BinaryParam::Time, &binary::time(v)),
+                Err(BinaryParamError::OutOfRange),
+                "{v}"
+            );
+        }
+    }
+
     #[test]
     fn utf8_identity_passes_through() {
         assert_eq!(dec(BinaryParam::Utf8Identity, "あ".as_bytes()), "あ");
@@ -169,7 +203,7 @@ mod tests {
 
     #[test]
     fn wrong_lengths_are_rejected() {
-        let cases: [(BinaryParam, usize); 7] = [
+        let cases: [(BinaryParam, usize); 8] = [
             (BinaryParam::Int2, 2),
             (BinaryParam::Int4, 4),
             (BinaryParam::Int8, 8),
@@ -177,19 +211,20 @@ mod tests {
             (BinaryParam::Float8, 8),
             (BinaryParam::Bool, 1),
             (BinaryParam::Uuid, 16),
+            (BinaryParam::Time, 8),
         ];
         for (kind, n) in cases {
             for len in [n - 1, n + 1] {
                 assert_eq!(
                     decode_to_text(kind, &vec![0u8; len]),
-                    Err(BinaryParamError),
+                    Err(BinaryParamError::InvalidLength),
                     "{kind:?} len {len}"
                 );
             }
         }
         assert_eq!(
             decode_to_text(BinaryParam::Unsupported, &[]),
-            Err(BinaryParamError)
+            Err(BinaryParamError::InvalidLength)
         );
     }
 }

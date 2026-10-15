@@ -64,6 +64,7 @@ fn schema(name: &str) -> TableSchema {
             ),
             ColumnDef::new("flag", ColumnType::Boolean, true),
             ColumnDef::new("sm", ColumnType::SmallInt, true),
+            ColumnDef::new("tm", ColumnType::Time, true),
             ColumnDef::new("day", ColumnType::Date, true),
             ColumnDef::new("at", ColumnType::Timestamp, true),
             ColumnDef::new("ext", ColumnType::Uuid, true),
@@ -1219,6 +1220,84 @@ fn smallint_binding_matches_sql() {
         );
         assert!(body.contains(&format!("[[{expected}]")), "{filter}: {body}");
     }
+}
+
+/// Issue #1571（TABLE-32・NOSQL-17）: TIME 列の insert／scan が SQL 表層と一致し、
+/// 型不一致は 42601・書式不正は 22007・範囲外は 22008 で副作用が無い。filter は fail-closed。
+#[test]
+fn time_binding_matches_sql() {
+    let (core, _g) = new_core();
+    let addr = spawn(Arc::clone(&core));
+    for (i, v) in ["00:00:00", "23:59:59.999999", "24:00:00"]
+        .into_iter()
+        .enumerate()
+    {
+        let id = 400 + i as u64;
+        let resp = alice(
+            addr,
+            &format!(
+                r#"{{"op":"insert","table":"{NOSQL_TABLE}","rows":[{{"id":{id},"embedding":[0.5,0.25],"lang":"ja","tm":"{v}"}}],"operation_id":"tm-nosql-{id}"}}"#
+            ),
+        );
+        assert_eq!(resp.status, 200, "{resp:?}");
+        sql_exec(
+            &core,
+            "tenant-a",
+            &format!(
+                "INSERT INTO {SQL_TABLE} (id, embedding, lang, tm) VALUES \
+                 ({id}, '[0.5,0.25]', 'ja', '{v}') USING OPERATION_ID 'tm-sql-{id}'"
+            ),
+        );
+    }
+    let scan = |t: &str| {
+        format!(
+            r#"{{"op":"scan","table":"{t}","columns":["id","tm"],"sort":[{{"column":"id","dir":"asc"}}],"limit":100}}"#
+        )
+    };
+    let a = body_utf8(&alice(addr, &scan(NOSQL_TABLE)));
+    assert_eq!(a, body_utf8(&alice(addr, &scan(SQL_TABLE))));
+    assert_eq!(
+        a,
+        sql_oracle_body(
+            &core,
+            "tenant-a",
+            &format!("SELECT id, tm FROM {NOSQL_TABLE} ORDER BY id ASC LIMIT 100")
+        )
+    );
+    assert!(a.contains(r#""type":"time""#), "{a}");
+    assert!(
+        a.contains("23:59:59.999999") && a.contains("24:00:00"),
+        "{a}"
+    );
+
+    // 拒否: JSON 数値・真偽値は 42601、書式不正は 22007、範囲外は 22008（副作用なし）。
+    let before = count_rows(addr, NOSQL_TABLE);
+    for (i, (json, want)) in [
+        ("5", "42601"),
+        ("true", "42601"),
+        (r#""not-a-time""#, "22007"),
+        (r#""25:00""#, "22008"),
+        (r#""24:00:00.000001""#, "22008"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = insert_one(addr, &format!(r#""tm":{json}"#), &format!("tm-rej-{i}"));
+        assert_eq!(http_common::wire_code_of(&resp), want, "{json}: {resp:?}");
+        assert!(resp.status >= 400, "{json}");
+    }
+    assert_eq!(count_rows(addr, NOSQL_TABLE), before);
+
+    // filter は述語の解禁（Issue #1570）まで fail-closed のまま。
+    let resp = alice(
+        addr,
+        &agg_body(
+            NOSQL_TABLE,
+            r#"{"fn":"count","column":"*"}"#,
+            r#","filter":[{"column":"tm","op":"eq","value":"00:00:00"}]"#,
+        ),
+    );
+    assert!(resp.status >= 400, "{resp:?}");
 }
 
 /// `VARCHAR(n)` 列への NoSQL `insert`／`update` の長さ超過は `22001`（HTTP 400）で副作用なし。

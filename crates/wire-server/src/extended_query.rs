@@ -514,6 +514,8 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 ColumnType::Boolean => only(16, BinaryParam::Bool),
                 ColumnType::Bytea => only(17, BinaryParam::Bytea),
                 ColumnType::Uuid => only(2950, BinaryParam::Uuid),
+                // TIME スロットは time（OID 1083）のみバイナリ受理（TABLE-32・Issue #1571）。
+                ColumnType::Time => only(1083, BinaryParam::Time),
                 // CHAR(n) スロット（bpchar＝OID 1042）。値は engine のリテラル置換経路を通り、
                 // 非 NULL 書き込みの可否は engine 側の契約に従う（Issue #1565）。
                 ColumnType::Bpchar(_) => {
@@ -527,7 +529,6 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 | ColumnType::Numeric { .. }
                 | ColumnType::Date
                 | ColumnType::Timestamp
-                | ColumnType::Time
                 | ColumnType::Json
                 | ColumnType::Jsonb
                 | ColumnType::Array(_)
@@ -965,6 +966,11 @@ enum HandlerError {
     InvalidBinaryParam {
         index: usize,
     },
+    /// バイナリ形式の TIME 値が範囲 `00:00:00`〜`24:00:00` の外（`22008`。Issue #1571。
+    /// `index` は 1 始まりの `$n` 番号で、値は含めない）。
+    BinaryParamOutOfRange {
+        index: usize,
+    },
     /// 結果 format code の解決・事前検査で生じたエラー（WIRE-14。
     /// `result_encoder::BinaryFormatError` をそのまま分類し直したもの）。
     BinaryFormat(result_encoder::BinaryFormatError),
@@ -1018,6 +1024,7 @@ impl HandlerError {
             HandlerError::FormatCodeCountMismatch => ErrorClass::ProtocolViolation,
             HandlerError::BinaryFormatUnsupported => ErrorClass::FeatureNotSupported,
             HandlerError::InvalidBinaryParam { .. } => ErrorClass::ProtocolViolation,
+            HandlerError::BinaryParamOutOfRange { .. } => ErrorClass::DatetimeFieldOverflow,
             HandlerError::BinaryFormat(e) => e.error_class(),
             HandlerError::ResultTypeChanged => ErrorClass::FeatureNotSupported,
             HandlerError::SuspendedBytesExceeded => ErrorClass::PayloadTooLarge,
@@ -1083,6 +1090,9 @@ impl HandlerError {
             }
             HandlerError::InvalidBinaryParam { index } => {
                 format!("incorrect binary data format in bind parameter ${index}")
+            }
+            HandlerError::BinaryParamOutOfRange { index } => {
+                format!("time value out of range in bind parameter ${index}")
             }
             HandlerError::BinaryFormat(result_encoder::BinaryFormatError::FormatCountMismatch) => {
                 "format code count does not match the parameter or result count".to_string()
@@ -1631,10 +1641,18 @@ fn handle_bind_body(
                 let mut out = Vec::with_capacity(msg.param_values.len());
                 for (i, (value, slot)) in msg.param_values.iter().zip(slots).enumerate() {
                     let v = match value {
-                        Some(raw) if code_of(i) == 1 => Some(
-                            binary_param::decode_to_text(slot.binary, raw)
-                                .map_err(|_| HandlerError::InvalidBinaryParam { index: i + 1 })?,
-                        ),
+                        Some(raw) if code_of(i) == 1 => {
+                            Some(binary_param::decode_to_text(slot.binary, raw).map_err(
+                                |e| match e {
+                                    binary_param::BinaryParamError::InvalidLength => {
+                                        HandlerError::InvalidBinaryParam { index: i + 1 }
+                                    }
+                                    binary_param::BinaryParamError::OutOfRange => {
+                                        HandlerError::BinaryParamOutOfRange { index: i + 1 }
+                                    }
+                                },
+                            )?)
+                        }
                         other => other.clone(),
                     };
                     out.push(v);

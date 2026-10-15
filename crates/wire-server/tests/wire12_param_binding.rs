@@ -71,6 +71,7 @@ fn open_storage() -> (Storage, temp_db::CleanupGuard) {
                 ),
                 ColumnDef::new("dt", ColumnType::Date, true),
                 ColumnDef::new("ts", ColumnType::Timestamp, true),
+                ColumnDef::new("tm", ColumnType::Time, true),
                 ColumnDef::new("u", ColumnType::Uuid, true),
                 ColumnDef::new("bin", ColumnType::Bytea, true),
             ],
@@ -912,6 +913,8 @@ fn seven_type_slots_report_column_oids() {
         ("num", 1700),
         ("dt", 1082),
         ("ts", 1114),
+        // TIME スロットは time（OID 1083。TABLE-32・Issue #1571）。
+        ("tm", 1083),
         ("u", 2950),
         ("bin", 17),
     ] {

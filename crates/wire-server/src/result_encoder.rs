@@ -39,6 +39,8 @@
 //! - `ColumnMeta::Scalar{ty: Double}` → `float8`（OID 701, typlen 8。同上）
 //! - `ColumnMeta::Scalar{ty: Date}` → `date`（OID 1082, typlen 4。同上）
 //! - `ColumnMeta::Scalar{ty: Timestamp}` → `timestamp`（OID 1114, typlen 8。同上）
+//! - `ColumnMeta::Scalar{ty: Time}` → `time`（OID 1083, typlen 8。TABLE-32・WIRE-13・
+//!   WIRE-14・Issue #1571。バイナリは 0 時起点マイクロ秒の 8 バイト BE 整数）
 //! - `ColumnMeta::Scalar{ty: Bytea}` → `bytea`（OID 17, typlen -1。同上）
 //! - `ColumnMeta::Scalar{ty: Uuid}` → `uuid`（OID 2950, typlen 16。同上）
 //! - `ColumnMeta::Scalar{ty: Json}` → `json`（OID 114, typlen -1。同上）
@@ -225,6 +227,12 @@ pub mod binary {
         v.to_be_bytes()
     }
 
+    /// `time` のバイナリ表現（0 時起点マイクロ秒の 8 バイト・ビッグエンディアン。
+    /// PostgreSQL の `time_send` と同形。TABLE-32・WIRE-14・Issue #1571）。
+    pub fn time(v: i64) -> [u8; 8] {
+        v.to_be_bytes()
+    }
+
     /// `int4` のバイナリ表現（4 バイト・ビッグエンディアン 2 の補数）。
     pub fn int4(v: i32) -> [u8; 4] {
         v.to_be_bytes()
@@ -370,6 +378,9 @@ wire_type_enum! {
         /// `ColumnMeta::Scalar{ty: Timestamp}`（同上）。テキスト表現は
         /// `engine::datetime` の ISO 表記（`YYYY-MM-DD HH:MM:SS[.ffffff]`）。
         Timestamp,
+        /// `ColumnMeta::Scalar{ty: Time}`（TABLE-32・WIRE-13・WIRE-14・Issue #1571）。
+        /// テキスト表現は `HH:MM:SS[.ffffff]`、バイナリは 0 時起点マイクロ秒の 8 バイト BE。
+        Time,
         /// `ColumnMeta::Scalar{ty: Bytea}`（TABLE-13・TASK-197・Issue #886・
         /// WIRE-13・TASK-200・Issue #895）。テキスト表現は `\x` + 小文字 16 進
         /// （`engine::bytea::format_hex_text`。PostgreSQL 既定の `bytea_output=hex`
@@ -406,6 +417,7 @@ impl WireType {
             WireType::Float8 => 701,
             WireType::Date => 1082,
             WireType::Timestamp => 1114,
+            WireType::Time => 1083,
             WireType::Bytea => 17,
             WireType::Uuid => 2950,
             WireType::Json => 114,
@@ -425,7 +437,7 @@ impl WireType {
             | WireType::Jsonb => -1,
             WireType::Int2 => 2,
             WireType::Int4 | WireType::Float4 | WireType::Date => 4,
-            WireType::Int8 | WireType::Float8 | WireType::Timestamp => 8,
+            WireType::Int8 | WireType::Float8 | WireType::Timestamp | WireType::Time => 8,
             WireType::Bool => 1,
             WireType::Uuid => 16,
         }
@@ -447,6 +459,7 @@ impl WireType {
             WireType::Float8 => "float8",
             WireType::Date => "date",
             WireType::Timestamp => "timestamp",
+            WireType::Time => "time",
             WireType::Bytea => "bytea",
             WireType::Uuid => "uuid",
             WireType::Json => "json",
@@ -489,7 +502,9 @@ impl WireType {
             | WireType::Float4
             | WireType::Float8
             | WireType::Bytea
-            | WireType::Uuid => true,
+            | WireType::Uuid
+            // `time` は 0 時起点 µs の 8 バイト BE（Issue #1571）。
+            | WireType::Time => true,
             // `DATE`／`TIMESTAMP`／`JSON`／`JSONB` は WIRE-14 の非対応型のまま
             // fail-closed で `0A000` に拒否する。
             WireType::Date | WireType::Timestamp | WireType::Json | WireType::Jsonb => false,
@@ -518,7 +533,7 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
 
 /// `ColumnType` 1 個がバイナリ形式に対応するか（`Scalar`／`Computed{ty: Some}` の共有判定。
 /// WIRE-14・TASK-218・Issue #1172・#1407）。対応型は `TEXT`・`INTEGER`・`BIGINT`・`REAL`・
-/// `DOUBLE PRECISION`・`BOOLEAN`・`BYTEA`・`UUID`。値の実体（`Cell`）との整合は
+/// `DOUBLE PRECISION`・`BOOLEAN`・`BYTEA`・`UUID`・`TIME`。値の実体（`Cell`）との整合は
 /// `encode_binary_cell` が検査する。
 #[deny(clippy::wildcard_enum_match_arm)]
 fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
@@ -534,7 +549,8 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Real
         | ColumnType::Double
         | ColumnType::Bytea
-        | ColumnType::Uuid => scalar_wire_type(ty).supports_binary(),
+        | ColumnType::Uuid
+        | ColumnType::Time => scalar_wire_type(ty).supports_binary(),
         // `VECTOR` は公告 OID が `text` でも値の実体がベクトルのため、独自の
         // バイナリ表現は定義せず `0A000` で拒否する（WIRE-14 決定）。
         // `ENUM`・`ARRAY` は専用 OID を持たない据え置き判断（Issue #895）、
@@ -547,8 +563,7 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Jsonb
         | ColumnType::Numeric { .. }
         | ColumnType::Date
-        | ColumnType::Timestamp
-        | ColumnType::Time => false,
+        | ColumnType::Timestamp => false,
     }
 }
 
@@ -647,10 +662,8 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         engine::catalog::ColumnType::Double => WireType::Float8,
         engine::catalog::ColumnType::Date => WireType::Date,
         engine::catalog::ColumnType::Timestamp => WireType::Timestamp,
-        // TIME は暫定で text（OID 25）を公告する（Issue #1569）。値は `Cell::Time` で
-        // text 形式は `format_time` により正しく描画される。time（OID 1083・typlen 8）への
-        // 切替とバイナリ入出力は兄弟 Issue（#1571）で行う。
-        engine::catalog::ColumnType::Time => WireType::Text,
+        // TIME は time（OID 1083・typlen 8。TABLE-32・Issue #1571）。
+        engine::catalog::ColumnType::Time => WireType::Time,
         engine::catalog::ColumnType::Bytea => WireType::Bytea,
         engine::catalog::ColumnType::Uuid => WireType::Uuid,
         engine::catalog::ColumnType::Json => WireType::Json,
@@ -1061,6 +1074,14 @@ fn encode_binary_cell(
         (WireType::Bool, Cell::Bool(b)) => push_fixed(out, wire_type, &binary::bool_(*b)),
         (WireType::Bytea, Cell::Bytes(b)) => push_len_prefixed(out, binary::bytea(b)),
         (WireType::Uuid, Cell::Uuid(u)) => push_fixed(out, wire_type, &binary::uuid(*u.as_bytes())),
+        // 範囲外は engine の範囲強制の内部不整合。`format_time` 系と違い黙って丸めず
+        // fail-closed（`XX000`）にする（Issue #1571）。
+        (WireType::Time, Cell::Time(m)) => {
+            if !engine::datetime::validate_time_micros(*m) {
+                return Err(EncodeError);
+            }
+            push_fixed(out, wire_type, &binary::time(*m))
+        }
         // 型と Cell の不一致、および非対応型（事前検査
         // `validate_binary_formats` で拒否済みの多層防御）は fail-closed。
         _ => Err(EncodeError),
@@ -1390,6 +1411,7 @@ mod tests {
             (Some(ColumnType::Varchar(None)), 1043, -1),
             (Some(ColumnType::Date), 1082, 4),
             (Some(ColumnType::Timestamp), 1114, 8),
+            (Some(ColumnType::Time), 1083, 8),
             (
                 Some(ColumnType::Numeric {
                     precision: 38,
@@ -2308,7 +2330,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 16);
+        assert_eq!(WireType::ALL.len(), 17);
     }
 
     /// `PostgreSQL` 組み込みカタログの公開値（`pg_type.oid`／`typlen`／
@@ -2317,7 +2339,7 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 16] = [
+        let expected: [(WireType, i32, i16, &str); 17] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
@@ -2330,6 +2352,7 @@ mod tests {
             (WireType::Float8, 701, 8, "float8"),
             (WireType::Date, 1082, 4, "date"),
             (WireType::Timestamp, 1114, 8, "timestamp"),
+            (WireType::Time, 1083, 8, "time"),
             (WireType::Bytea, 17, -1, "bytea"),
             (WireType::Uuid, 2950, 16, "uuid"),
             (WireType::Json, 114, -1, "json"),
@@ -2805,6 +2828,7 @@ mod tests {
                     | WireType::Float8
                     | WireType::Bytea
                     | WireType::Uuid
+                    | WireType::Time
             );
             assert_eq!(t.supports_binary(), expected, "{t:?}");
         }
@@ -2883,17 +2907,20 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// Issue #1569: TIME は暫定で text（OID 25）を公告し、値は `HH:MM:SS[.ffffff]` で
-    /// 出力する。バイナリ結果は #1571 まで fail-closed に非対応。
+    /// Issue #1571: TIME は time（OID 1083・typlen 8）を公告し、text は `HH:MM:SS[.ffffff]`、
+    /// バイナリは 0 時起点 µs の 8 バイト BE で出す。範囲外の `Cell::Time` は fail-closed。
     #[test]
-    fn time_column_is_advertised_as_text_with_formatted_text_and_no_binary() {
+    fn time_column_is_advertised_as_time_with_text_and_binary() {
         use engine::catalog::ColumnType;
         let meta = ColumnMeta::Scalar {
             name: "t".to_string(),
             ty: ColumnType::Time,
         };
-        assert_eq!(column_wire_type(&meta), WireType::Text);
-        assert!(!column_binary_support(&meta));
+        assert_eq!(column_wire_type(&meta), WireType::Time);
+        assert_eq!(column_wire_type(&meta).oid(), 1083);
+        assert!(column_binary_support(&meta));
+        let columns = vec![meta.clone()];
+        validate_binary_formats(&columns, &[FormatCode::Binary]).expect("binary ok");
         for (micros, want) in [
             (0, "00:00:00"),
             (86_399_999_999, "23:59:59.999999"),
@@ -2903,9 +2930,16 @@ mod tests {
                 cell_to_text_for_column(&meta, &Cell::Time(micros)).expect("text"),
                 Some(want.to_string())
             );
+            let mut out = Vec::new();
+            encode_binary_cell(Some(WireType::Time), &Cell::Time(micros), &mut out).unwrap();
+            let mut want_bytes = 8i32.to_be_bytes().to_vec();
+            want_bytes.extend_from_slice(&micros.to_be_bytes());
+            assert_eq!(out, want_bytes);
         }
-        let columns = vec![meta];
-        let err = validate_binary_formats(&columns, &[FormatCode::Binary]).unwrap_err();
-        assert_eq!(err, BinaryFormatError::UnsupportedType { column_index: 0 });
+        for bad in [-1, 86_400_000_001, i64::MIN, i64::MAX] {
+            let mut out = vec![9u8];
+            assert!(encode_binary_cell(Some(WireType::Time), &Cell::Time(bad), &mut out).is_err());
+            assert_eq!(out, vec![9u8], "失敗時は何も書かない");
+        }
     }
 }
