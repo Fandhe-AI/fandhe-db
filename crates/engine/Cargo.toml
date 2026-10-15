@@ -54,6 +54,20 @@ wgpu = { version = "=30.0.1", default-features = false, features = [
     "wgsl",
 ] }
 
+# Issue #2189（TABLE-28 ICU 照合。ビヘイビア ID のポインタのみ）: ICU4X の pure Rust 照合実装。
+# **オーナー承認済み: 2026-10-15。承認記録は Issue #1608 のコメント、および
+# `docs/design/icu-collator-adoption.md`（Accepted）**。
+#   - クレート: icu_collator = "=2.3.1"（default features = compiled_data）
+#   - 目的: `und-x-icu` 等の ICU 照合比較・ソートキー（#2190 で使い始める。本 Issue は依存の導入のみ）
+#   - ライセンス: Unicode-3.0（`deny.toml` の allow list に登録済み）
+#   - 非 optional の理由: feature ゲートを作るとビルド構成で照合結果が変わる経路になるため
+# .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
+icu_collator = "=2.3.1"
+# 照合データ版を固定して照合順序を安定させるための pin 専用（承認済み）。
+# engine のコードから直接 `use` しない。ビルド時に環境変数 `ICU4X_DATA_DIR` を設定すると
+# 別データに差し替わるため、CI・release・開発環境では設定しないこと。
+icu_collator_data = "=2.3.0"
+
 # Issue #333（SEARCH-7 方式変更。クロスエンコーダ型リランカーの導入）:
 # `rerank::CrossEncoderReranker`（`rerank.rs`）が呼ぶ実 ONNX 推論バックエンド
 # （`src/rerank/cross_encoder_onnx.rs`。`cross-encoder` feature 限定）用の依存。
