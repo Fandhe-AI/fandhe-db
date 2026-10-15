@@ -387,6 +387,11 @@ pub fn map_json_to_literal(
                 "BOOLEAN column value must be a JSON boolean",
             )),
         },
+        // SMALLINT の NoSQL 型束縛は兄弟 Issue（#1561）で解禁する。それまでは
+        // INTEGER へ黙って流さず fail-closed に拒否する（Issue #1558）。
+        ColumnType::SmallInt => Err(TypedJsonError::TypeMismatch(
+            "SMALLINT column is not supported on the NoSQL surface yet",
+        )),
         ColumnType::Integer | ColumnType::BigInt => match raw {
             JsonValue::Number(n @ (JsonNumber::PosInt(_) | JsonNumber::NegInt(_))) => {
                 Ok(InsertLiteral::Number(number_literal_text(n)))

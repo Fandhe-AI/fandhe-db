@@ -343,6 +343,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
             ColumnType::Text => "text",
             ColumnType::Varchar => "varchar",
             ColumnType::Vector(_) => "vector",
+            ColumnType::SmallInt => "smallint",
             ColumnType::Integer => "integer",
             ColumnType::BigInt => "bigint",
             ColumnType::Real => "real",

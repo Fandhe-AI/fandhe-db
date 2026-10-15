@@ -3039,7 +3039,7 @@ fn project_rows(
                                 })
                             }
                         },
-                        ColumnType::Integer => match decoded.get(*index) {
+                        ColumnType::SmallInt | ColumnType::Integer => match decoded.get(*index) {
                             Some(Value::Integer(v)) => {
                                 cells.push(Cell::SignedInteger(i64::from(*v)))
                             }

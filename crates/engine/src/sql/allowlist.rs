@@ -80,7 +80,7 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
 
 /// `raw` が `CREATE TABLE` の列型キーワードかを判定する（Issue #1529・TABLE-29）。
 /// 大小無視で、型名エイリアス `INT`・`INT4`・`INT8`・`FLOAT4`・`FLOAT8` と
-/// 未確定型 `INT2`・`SMALLINT`・`VARCHAR`・`CHAR`・`CHARACTER` を含む。
+/// `INT2`・`SMALLINT`（Issue #1558）・`VARCHAR`・`CHAR`・`CHARACTER` を含む。
 /// `CHECK` 制約名の衝突判定と、wire-server の NoSQL DDL が `enum_type` に予約型名を
 /// 渡させないためのガードの双方から呼ばれ、語彙のドリフトを防ぐ単一情報源となる。
 pub fn is_column_type_keyword(raw: &str) -> bool {
