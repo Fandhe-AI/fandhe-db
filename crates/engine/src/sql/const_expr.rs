@@ -162,8 +162,9 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
                 Err(SqlSurfaceError::UndefinedColumn { name: name.clone() })
             }
         }
-        // SQL-37（Issue #1586）: 現在時刻関数は書き込み側の台帳 v3（#2188）・INSERT 系ハッシュ
-        // （#1587）が揃うまで定数式（INSERT VALUES 等）で受理しない（`42601`）。
+        // SQL-37（Issue #1586・#1587）: 現在時刻関数は、INSERT VALUES 内の式を台帳 v3（#2188）で
+        // 扱えるようになるまで定数式で受理しない（`42601`）。列 `DEFAULT now()` 系（#1587）は
+        // この定数式経路ではなく `sql::allowlist` の時刻 DEFAULT 専用経路が受理する。
         Expr::ValueFunction { .. } => Err(SqlSurfaceError::unsupported(
             "volatile or session-dependent value is not allowed in a constant expression",
         )),

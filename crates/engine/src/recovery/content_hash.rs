@@ -131,6 +131,14 @@ enum OpTag {
     /// 含むもの用。リテラルだけの SET（[`OpTag::UpdateColumns`]）とは別ドメインに分離し、
     /// 既存の台帳エントリのバイト列を変えない。[`for_update_columns_with_exprs`] 参照。
     UpdateColumnsExpr = 13,
+    /// 揮発性 DEFAULT（`DEFAULT now()` 系。SQL-37・Issue #1587）を省略列へ適用した単一行
+    /// INSERT 用。揮発性 DEFAULT を含まない INSERT（[`OpTag::Insert`]）とは別ドメインに分離し、
+    /// 既存の台帳エントリのバイト列を変えない。[`for_typed_insert_expr`] 参照。
+    InsertExpr = 14,
+    /// 揮発性 DEFAULT を適用した行を含むバッチ INSERT 用。[`for_typed_insert_batch_expr`] 参照。
+    InsertBatchExpr = 15,
+    /// 揮発性 DEFAULT を適用した行を含む UPSERT 用。[`for_typed_upsert_expr`] 参照。
+    UpsertExpr = 16,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -771,6 +779,57 @@ pub(crate) enum UpsertHashTarget<'a> {
     Unique(&'a [&'a str]),
 }
 
+/// [`for_typed_upsert`]・[`for_typed_upsert_expr`] が共有する UPSERT の衝突対象・
+/// 衝突分岐部のレイアウト（action tag → DO UPDATE の割当 → UNIQUE 対象列）。
+/// 既存の [`for_typed_upsert`] の出力バイト列は本関数への切り出し前後で不変
+/// （golden テスト `for_typed_upsert_*_layout_is_stable` で固定）。
+fn push_upsert_header(
+    b: &mut HashInputBuilder,
+    target: &UpsertHashTarget<'_>,
+    action: &UpsertHashAction<'_>,
+) -> Result<(), StorageError> {
+    // UNIQUE 対象は action tag を `2`／`3` へずらすことで、`(id)` 対象と
+    // 同一の action・`VALUES` でも先頭バイトの時点でハッシュが分岐する。
+    let action_tag_base: u8 = match target {
+        UpsertHashTarget::RowId => 0,
+        UpsertHashTarget::Unique(_) => 2,
+    };
+    match action {
+        UpsertHashAction::DoNothing => b.push_u8(action_tag_base),
+        UpsertHashAction::DoUpdate(assignments) => {
+            b.push_u8(action_tag_base + 1);
+            let count = u32::try_from(assignments.len()).map_err(|_| {
+                StorageError::Codec("content hash upsert assignment count too large".to_string())
+            })?;
+            b.push_raw(&count.to_le_bytes());
+            for (name, value) in assignments.iter() {
+                b.push_bytes(name.as_bytes())?;
+                match value {
+                    UpsertAssignmentHashValue::Excluded(src) => {
+                        b.push_u8(0);
+                        b.push_bytes(src.as_bytes())?;
+                    }
+                    UpsertAssignmentHashValue::Literal(v) => {
+                        b.push_u8(1);
+                        push_value(b, v)?;
+                    }
+                }
+            }
+        }
+    }
+    if let UpsertHashTarget::Unique(columns) = target {
+        let count = u32::try_from(columns.len()).map_err(|_| {
+            StorageError::Codec("content hash upsert target column count too large".to_string())
+        })?;
+        b.push_raw(&count.to_le_bytes());
+        for name in *columns {
+            b.push_bytes(name.as_bytes())?;
+        }
+    }
+
+    Ok(())
+}
+
 /// `tenant::upsert_typed_rows_unchecked` 用（SQL-20・TASK-193、Issue #872）。
 /// `INSERT ... ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...` を単一の
 /// 「新規挿入かもしれないし更新かもしれない」操作として、[`OpTag::Upsert`]
@@ -807,44 +866,7 @@ pub(crate) fn for_typed_upsert(
     rows: &[TypedInsertBatchRow<'_>],
 ) -> Result<ContentHash, StorageError> {
     let mut b = HashInputBuilder::new(OpTag::Upsert);
-    // UNIQUE 対象は action tag を `2`／`3` へずらすことで、`(id)` 対象と
-    // 同一の action・`VALUES` でも先頭バイトの時点でハッシュが分岐する。
-    let action_tag_base: u8 = match target {
-        UpsertHashTarget::RowId => 0,
-        UpsertHashTarget::Unique(_) => 2,
-    };
-    match action {
-        UpsertHashAction::DoNothing => b.push_u8(action_tag_base),
-        UpsertHashAction::DoUpdate(assignments) => {
-            b.push_u8(action_tag_base + 1);
-            let count = u32::try_from(assignments.len()).map_err(|_| {
-                StorageError::Codec("content hash upsert assignment count too large".to_string())
-            })?;
-            b.push_raw(&count.to_le_bytes());
-            for (name, value) in assignments.iter() {
-                b.push_bytes(name.as_bytes())?;
-                match value {
-                    UpsertAssignmentHashValue::Excluded(src) => {
-                        b.push_u8(0);
-                        b.push_bytes(src.as_bytes())?;
-                    }
-                    UpsertAssignmentHashValue::Literal(v) => {
-                        b.push_u8(1);
-                        push_value(&mut b, v)?;
-                    }
-                }
-            }
-        }
-    }
-    if let UpsertHashTarget::Unique(columns) = target {
-        let count = u32::try_from(columns.len()).map_err(|_| {
-            StorageError::Codec("content hash upsert target column count too large".to_string())
-        })?;
-        b.push_raw(&count.to_le_bytes());
-        for name in *columns {
-            b.push_bytes(name.as_bytes())?;
-        }
-    }
+    push_upsert_header(&mut b, target, action)?;
 
     let count = u32::try_from(rows.len())
         .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
@@ -862,6 +884,148 @@ pub(crate) fn for_typed_upsert(
         })?;
         b.push_raw(&non_null_columns.to_le_bytes());
         push_named_scalar_columns(&mut b, columns)?;
+    }
+    Ok(b.finish())
+}
+
+/// 揮発性 DEFAULT（`DEFAULT now()` 系）を含み得る INSERT 系ハッシュの 1 列分の材料
+/// （SQL-37・TABLE-16・Issue #1587、設計 D2）。
+pub(crate) enum HashColumnInput<'a> {
+    /// 束縛済みの値（種別バイト `0`。[`push_value`]。`Value::Null` は従来どおり除外）。
+    Value(&'a Value),
+    /// 省略列へ適用した揮発性 DEFAULT（種別バイト `2`）。評価値ではなく DEFAULT の構文形を
+    /// ハッシュする。同じ文の再送は評価時刻によらず同一ハッシュになる（設計 D1）。
+    VolatileDefault(crate::catalog::TimeDefault),
+}
+
+/// [`for_typed_insert_batch_expr`]・[`for_typed_upsert_expr`]・`tenant.rs` が共有する
+/// 1 行分のハッシュ材料（[`TypedInsertBatchRow`] の列を [`HashColumnInput`] にしたもの）。
+pub(crate) type TypedInsertExprBatchRow<'a> = (
+    u64,
+    Visibility,
+    &'a [f32],
+    &'a [(&'a str, HashColumnInput<'a>)],
+);
+
+/// 時刻 DEFAULT を `push_dml_expr` が直列化できる式（構文形）へ写す。`now()`・
+/// `transaction_timestamp()` は `Expr::Call`（タグ 3）、キーワード形は
+/// `Expr::ValueFunction`（タグ 13）。`now()` と `CURRENT_TIMESTAMP` は別の形のまま保つ
+/// （設計 D3）。
+fn time_default_expr(time: crate::catalog::TimeDefault) -> crate::sql::udf_call::Expr {
+    use crate::catalog::TimeDefault;
+    use crate::sql::udf_call::{Expr, ValueFunctionKind};
+    match time {
+        TimeDefault::Now => Expr::Call {
+            name: "now".to_string(),
+            args: Vec::new(),
+        },
+        TimeDefault::TransactionTimestamp => Expr::Call {
+            name: "transaction_timestamp".to_string(),
+            args: Vec::new(),
+        },
+        TimeDefault::CurrentTimestamp(precision) => Expr::ValueFunction {
+            kind: ValueFunctionKind::CurrentTimestamp,
+            precision,
+        },
+        TimeDefault::LocalTimestamp(precision) => Expr::ValueFunction {
+            kind: ValueFunctionKind::LocalTimestamp,
+            precision,
+        },
+        TimeDefault::CurrentDate => Expr::ValueFunction {
+            kind: ValueFunctionKind::CurrentDate,
+            precision: None,
+        },
+    }
+}
+
+/// 揮発性 DEFAULT を含み得る INSERT 系の 1 行分レイアウト（[`for_typed_insert_expr`]・
+/// [`for_typed_insert_batch_expr`]・[`for_typed_upsert_expr`] が共有）。
+///
+/// `id` → `visibility` → [`push_vector`] → 列数（`Value::Null` 除外後。LE u32）→ 列ごとに
+/// 「列名 → 種別バイト → 本体」。種別 `0` は値（[`push_value`]）、種別 `1` は
+/// VALUES 内の式用に番号だけ予約（#2188 まで到達しない）、種別 `2` は揮発性 DEFAULT
+/// （構文形を `push_dml_expr` で直列化）。列数プレフィクスは単一行でも常に置く
+/// （[`for_typed_insert_batch`] の行境界曖昧性回避と同じ理由で、全 `*Expr` 形に共通のレイアウトにする）。
+fn push_expr_row(
+    b: &mut HashInputBuilder,
+    id: u64,
+    visibility: Visibility,
+    embedding: &[f32],
+    columns: &[(&str, HashColumnInput<'_>)],
+) -> Result<(), StorageError> {
+    b.push_u64(id);
+    b.push_u8(visibility.to_byte());
+    push_vector(b, embedding)?;
+    let written = columns
+        .iter()
+        .filter(|(_, c)| !matches!(c, HashColumnInput::Value(Value::Null)))
+        .count();
+    let written = u32::try_from(written)
+        .map_err(|_| StorageError::Codec("content hash row column count too large".to_string()))?;
+    b.push_raw(&written.to_le_bytes());
+    for (name, column) in columns {
+        match column {
+            HashColumnInput::Value(Value::Null) => {}
+            HashColumnInput::Value(v) => {
+                b.push_bytes(name.as_bytes())?;
+                b.push_u8(0);
+                push_value(b, v)?;
+            }
+            HashColumnInput::VolatileDefault(time) => {
+                b.push_bytes(name.as_bytes())?;
+                b.push_u8(2);
+                push_dml_expr(b, &time_default_expr(*time), None).map_err(|_| {
+                    StorageError::Codec("content hash default expression too large".to_string())
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 揮発性 DEFAULT を適用した単一行 INSERT 用（SQL-37・TABLE-16・Issue #1587、設計 D2）。
+/// 操作種別タグは [`OpTag::InsertExpr`]。揮発性 DEFAULT を含まない INSERT は
+/// [`for_typed_insert`]（バイト不変）を使う。
+pub(crate) fn for_typed_insert_expr(
+    id: u64,
+    visibility: Visibility,
+    embedding: &[f32],
+    columns: &[(&str, HashColumnInput<'_>)],
+) -> Result<ContentHash, StorageError> {
+    let mut b = HashInputBuilder::new(OpTag::InsertExpr);
+    push_expr_row(&mut b, id, visibility, embedding, columns)?;
+    Ok(b.finish())
+}
+
+/// 揮発性 DEFAULT を適用した行を含むバッチ INSERT 用（[`OpTag::InsertBatchExpr`]）。
+/// 件数プレフィクスに続けて行ごとに [`push_expr_row`] を連結する。
+pub(crate) fn for_typed_insert_batch_expr(
+    rows: &[TypedInsertExprBatchRow<'_>],
+) -> Result<ContentHash, StorageError> {
+    let count = u32::try_from(rows.len())
+        .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
+    let mut b = HashInputBuilder::new(OpTag::InsertBatchExpr);
+    b.push_raw(&count.to_le_bytes());
+    for (id, visibility, embedding, columns) in rows {
+        push_expr_row(&mut b, *id, *visibility, embedding, columns)?;
+    }
+    Ok(b.finish())
+}
+
+/// 揮発性 DEFAULT を適用した行を含む UPSERT 用（[`OpTag::UpsertExpr`]）。衝突対象・衝突分岐は
+/// [`for_typed_upsert`] と同じ [`push_upsert_header`]、行は [`push_expr_row`]。
+pub(crate) fn for_typed_upsert_expr(
+    target: &UpsertHashTarget<'_>,
+    action: &UpsertHashAction<'_>,
+    rows: &[TypedInsertExprBatchRow<'_>],
+) -> Result<ContentHash, StorageError> {
+    let mut b = HashInputBuilder::new(OpTag::UpsertExpr);
+    push_upsert_header(&mut b, target, action)?;
+    let count = u32::try_from(rows.len())
+        .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
+    b.push_raw(&count.to_le_bytes());
+    for (id, visibility, embedding, columns) in rows {
+        push_expr_row(&mut b, *id, *visibility, embedding, columns)?;
     }
     Ok(b.finish())
 }
@@ -1930,6 +2094,186 @@ fn dml_binop_tag(op: crate::sql::udf_call::BinOp) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 揮発性 DEFAULT 形（`*Expr`）のハッシュは構文形で決まり、評価値に依存しない
+    /// （SQL-37・Issue #1587、設計 D1・D2・D3）。`now()` と `CURRENT_TIMESTAMP` は別内容、
+    /// DEFAULT 適用と明示値は別内容、精度違いも別内容、従来形とは別ドメイン。
+    #[test]
+    fn typed_insert_expr_hashes_syntactic_forms_not_values() {
+        use crate::catalog::TimeDefault;
+        let embedding = [1.0_f32, 0.0];
+        let lang = Value::Text("ja".to_string());
+        let at_value = Value::Timestamp(1_000_000);
+        let hash_with = |time: TimeDefault| {
+            let cols = [
+                ("lang", HashColumnInput::Value(&lang)),
+                ("at", HashColumnInput::VolatileDefault(time)),
+            ];
+            for_typed_insert_expr(1, Visibility::Private, &embedding, &cols).expect("hash")
+        };
+        // 同じ構文形は同一ハッシュ（再送で評価時刻が違っても変わらない）。
+        assert_eq!(hash_with(TimeDefault::Now), hash_with(TimeDefault::Now));
+        // 形が違えば別内容。
+        let forms = [
+            TimeDefault::Now,
+            TimeDefault::TransactionTimestamp,
+            TimeDefault::CurrentTimestamp(None),
+            TimeDefault::CurrentTimestamp(Some(3)),
+            TimeDefault::CurrentTimestamp(Some(4)),
+            TimeDefault::LocalTimestamp(None),
+            TimeDefault::CurrentDate,
+        ];
+        for (i, a) in forms.iter().enumerate() {
+            for b in forms.iter().skip(i + 1) {
+                assert_ne!(hash_with(*a), hash_with(*b), "{a:?} vs {b:?}");
+            }
+        }
+        // DEFAULT 適用と、列を明示した値（評価値と同じ値でも）は別内容。
+        let explicit_cols = [
+            ("lang", HashColumnInput::Value(&lang)),
+            ("at", HashColumnInput::Value(&at_value)),
+        ];
+        let explicit = for_typed_insert_expr(1, Visibility::Private, &embedding, &explicit_cols)
+            .expect("hash");
+        assert_ne!(explicit, hash_with(TimeDefault::Now));
+        // 従来形（`InsertExpr` ではない）とは別ドメイン。値だけの列でも同一にならない。
+        let plain_cols: [(&str, &Value); 2] = [("lang", &lang), ("at", &at_value)];
+        let plain =
+            for_typed_insert(1, Visibility::Private, &embedding, &plain_cols).expect("hash");
+        assert_ne!(explicit, plain);
+        // 列名が違えば別内容。
+        let renamed = [
+            ("lang", HashColumnInput::Value(&lang)),
+            ("at2", HashColumnInput::VolatileDefault(TimeDefault::Now)),
+        ];
+        assert_ne!(
+            for_typed_insert_expr(1, Visibility::Private, &embedding, &renamed).expect("hash"),
+            hash_with(TimeDefault::Now)
+        );
+        // `Value::Null` は従来どおり除外される（列数にも数えない）。
+        let with_null = [
+            ("lang", HashColumnInput::Value(&lang)),
+            ("note", HashColumnInput::Value(&Value::Null)),
+            ("at", HashColumnInput::VolatileDefault(TimeDefault::Now)),
+        ];
+        assert_eq!(
+            for_typed_insert_expr(1, Visibility::Private, &embedding, &with_null).expect("hash"),
+            hash_with(TimeDefault::Now)
+        );
+    }
+
+    /// バッチ・UPSERT の `*Expr` 形は、単一行形・従来形・互いに別ドメインで、行境界を
+    /// 再解釈されない（行ごとの列数プレフィクス）。
+    #[test]
+    fn batch_and_upsert_expr_layouts_are_distinct_domains() {
+        use crate::catalog::TimeDefault;
+        let embedding = [1.0_f32];
+        let lang = Value::Text("ja".to_string());
+        let cols = [
+            ("lang", HashColumnInput::Value(&lang)),
+            ("at", HashColumnInput::VolatileDefault(TimeDefault::Now)),
+        ];
+        let no_cols: [(&str, HashColumnInput<'_>); 0] = [];
+        let rows: [TypedInsertExprBatchRow<'_>; 2] = [
+            (1, Visibility::Private, &embedding, &cols),
+            (2, Visibility::Private, &embedding, &cols),
+        ];
+        let batch = for_typed_insert_batch_expr(&rows).expect("hash");
+        let single =
+            for_typed_insert_expr(1, Visibility::Private, &embedding, &cols).expect("hash");
+        assert_ne!(batch, single);
+        let upsert = for_typed_upsert_expr(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
+        assert_ne!(upsert, batch);
+        let upsert_update = for_typed_upsert_expr(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoUpdate(&[(
+                "lang".to_string(),
+                UpsertAssignmentHashValue::Excluded("lang"),
+            )]),
+            &rows,
+        )
+        .expect("hash");
+        assert_ne!(upsert, upsert_update);
+        // 行数・列配置が違う 2 バッチは衝突しない。
+        let rows_b: [TypedInsertExprBatchRow<'_>; 2] = [
+            (1, Visibility::Private, &embedding, &no_cols),
+            (2, Visibility::Private, &embedding, &cols),
+        ];
+        assert_ne!(for_typed_insert_batch_expr(&rows_b).expect("hash"), batch);
+    }
+
+    /// golden 固定（Issue #1587）: 揮発性 DEFAULT 対応（`*Expr` 形の追加）の前後で、
+    /// 時刻 DEFAULT を含まない INSERT／バッチ INSERT／UPSERT のハッシュがバイト単位で
+    /// 不変であることを固定する（永続化済み台帳エントリとの再送互換。設計 D2）。
+    /// 定数は変更前の実装から採取した値のまま更新しない。
+    #[test]
+    fn typed_insert_and_upsert_layouts_without_volatile_defaults_are_golden() {
+        fn to_hex(bytes: &[u8; 32]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let embedding = [1.0_f32, 0.0, 0.0];
+        let lang = Value::Text("ja".to_string());
+        let n = Value::Integer(7);
+        let cols: [(&str, &Value); 2] = [("lang", &lang), ("n", &n)];
+        let single = for_typed_insert(5, Visibility::Private, &embedding, &cols).unwrap();
+        assert_eq!(
+            to_hex(single.as_bytes()),
+            "0d2cd88969886745f828ec0fd258cd9b70bc103d1734be838d1d1c4950849e82"
+        );
+        let rows: [TypedInsertBatchRow<'_>; 2] = [
+            (1, Visibility::Private, &embedding, &cols),
+            (2, Visibility::Private, &embedding, &cols),
+        ];
+        let batch = for_typed_insert_batch(&rows).unwrap();
+        assert_eq!(
+            to_hex(batch.as_bytes()),
+            "e248cff6c14fdba4a73e14042316db92bb22f2b346f7f21dbaf3b81a76cb5f1f"
+        );
+        let u = ["lang"];
+        let up_unique_nothing = for_typed_upsert(
+            &UpsertHashTarget::Unique(&u),
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .unwrap();
+        assert_eq!(
+            to_hex(up_unique_nothing.as_bytes()),
+            "a2df5ca6d84166d24a5a1c09bd221f50157ea8f901fa7418100d87c8ce67dce5"
+        );
+        let new_lang = Value::Text("en".to_string());
+        let assignments = [
+            (
+                "lang".to_string(),
+                UpsertAssignmentHashValue::Literal(&new_lang),
+            ),
+            ("n".to_string(), UpsertAssignmentHashValue::Excluded("n")),
+        ];
+        let up_unique_update = for_typed_upsert(
+            &UpsertHashTarget::Unique(&u),
+            &UpsertHashAction::DoUpdate(&assignments),
+            &rows,
+        )
+        .unwrap();
+        assert_eq!(
+            to_hex(up_unique_update.as_bytes()),
+            "168fd2500ab4fe671a362585a2837edb6ad86700787685e5ec4ee58bcc2a7e3d"
+        );
+        let up_rowid_update = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoUpdate(&assignments),
+            &rows,
+        )
+        .unwrap();
+        assert_eq!(
+            to_hex(up_rowid_update.as_bytes()),
+            "dbce4de35815ad0850535db0fec3b402bd3561480a61d713c475fdd5b72f41da"
+        );
+    }
 
     // 操作種別が違えば同じフィールド列でも異なるハッシュになる（連結曖昧性排除の
     // ピン留め）。

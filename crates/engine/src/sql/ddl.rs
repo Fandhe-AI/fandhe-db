@@ -142,9 +142,14 @@ pub(crate) fn execute_create_table(
     // 不正リテラル等を永続化前に SQLSTATE 付きで拒否する）。
     for column in &columns {
         if let Some(default) = &column.default {
-            crate::sql::parser::bind_column_default(column, default)?;
+            // 時刻 DEFAULT は評価せず（型適合は構文段・`validate_schema` が検査済み）、
+            // `bind_column_default` へ流さない（あちらは定数 DEFAULT 専用）。
+            if !matches!(default, ColumnDefault::CurrentTime(_)) {
+                crate::sql::parser::bind_column_default(column, default)?;
+            }
         }
     }
+    reject_time_default_set_default(&columns, &validated.foreign_keys)?;
     let mut schema = TableSchema::new(validated.table_name.clone(), columns);
     // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`validated.primary_key` は
     // `sql::allowlist::finalize_primary_key` が `id` 単独宣言を `None` へ既に
@@ -625,7 +630,12 @@ pub(crate) fn execute_alter_table_add_foreign_key(
     stmt: &crate::sql::allowlist::ValidatedAlterTableAddForeignKey,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     match storage.get_table_schema(&stmt.table_name) {
-        Ok(_) => {}
+        Ok(schema) => {
+            reject_time_default_set_default(
+                &schema.columns,
+                std::slice::from_ref(&stmt.foreign_key),
+            )?;
+        }
         Err(CatalogError::TableNotFound(_)) => {
             return Err(undefined_table_or_view(storage, &stmt.table_name));
         }
@@ -976,6 +986,50 @@ fn resolve_enum_type(
         },
         other => map_add_column_error(other),
     })
+}
+
+/// 時刻 DEFAULT 列を `ON DELETE／UPDATE SET DEFAULT` の対象にする FK 宣言を `0A000` で
+/// 拒否する（SQL-37・Issue #1587、設計 D9。連鎖更新は台帳へ記録する主体の文が無く、
+/// 評価時刻を再送で再現できないため fail-closed）。`CREATE TABLE`・`ALTER TABLE ADD FOREIGN
+/// KEY` の両方が呼ぶ。参照元列が存在しない場合は後段の検証が従来どおり判定するため無視する。
+fn reject_time_default_set_default(
+    columns: &[ColumnDef],
+    foreign_keys: &[crate::catalog::ForeignKeyDef],
+) -> Result<(), SqlSurfaceError> {
+    for fk in foreign_keys {
+        if !fk.uses_set_default() {
+            continue;
+        }
+        let has_time_default = fk.columns().iter().any(|name| {
+            columns.iter().any(|c| {
+                &c.name == name && matches!(c.default, Some(ColumnDefault::CurrentTime(_)))
+            })
+        });
+        if has_time_default {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "SET DEFAULT referential action on a column with a time function DEFAULT is not supported".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// 時刻値関数の `DEFAULT`（`DEFAULT now()` 系。SQL-37・TABLE-16・Issue #1587）を
+/// 列型との適合だけ検査して [`ColumnDefault::CurrentTime`] にする（評価しない。評価は
+/// INSERT の省略列補完のみ）。`TIMESTAMP` 系関数は `TIMESTAMP` 列、`CURRENT_DATE` は
+/// `DATE` 列に限る。不一致は定数 DEFAULT の型不一致と同じ `42601`。
+pub(crate) fn time_column_default(
+    column_name: &str,
+    ty: &ColumnType,
+    time: crate::catalog::TimeDefault,
+) -> Result<ColumnDefault, SqlSurfaceError> {
+    if time.compatible_with(ty) {
+        Ok(ColumnDefault::CurrentTime(time))
+    } else {
+        Err(SqlSurfaceError::unsupported(format!(
+            "column {column_name:?} DEFAULT time function does not match the column type"
+        )))
+    }
 }
 
 /// `ADD COLUMN` の `DEFAULT` リテラルを列型に応じた [`ColumnDefault`] へ変換する

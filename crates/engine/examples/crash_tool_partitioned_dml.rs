@@ -29,7 +29,13 @@
 //! 再送で二重適用（`n == id + 2`）が起きれば破損として検出される。`finish` の不一致検査では
 //! 式だけを `n + 2` に替えた文が crash 後に台帳から読み戻した hash でも `22023` になることを確かめる。
 //!
-//! サブコマンド（`<mode>` は `delete`・`update`・`update-null`・`update-expr`。それ以外は exit 2）:
+//! `update-now` モード（Issue #1587・SQL-37・RECOVER-11・RECOVER-12。設計 D6）は
+//! `SET tag = 'done', at = now()` の分割実行で、ジョブ開始時に確定した固定時刻をジョブ記録へ
+//! 永続化する。kill・再起動・再送をまたいでも、変更済み行の `at` はすべて同じ 1 値（NULL でない）で、
+//! 未変更行の `at` は NULL のままであることを `verify`・`finish` で検証する。`finish` の不一致検査では
+//! `now()` を `CURRENT_TIMESTAMP` に替えた文（構文形が違う）が `22023` になることも確かめる。
+//!
+//! サブコマンド（`<mode>` は `delete`・`update`・`update-null`・`update-expr`・`update-now`。それ以外は exit 2）:
 //! - `init <db> <mode>`: テーブル作成・テナント A/B へ投入。`SEEDED rows=<n>` を出力。
 //! - `write <db> <mode>`: 分割実行を発行し進捗を `PROGRESS status=<s> rows=<n>` で出力。
 //!   完了後（`DONE`／`ALREADY_COMPLETED`）は kill を待って sleep し続ける（exit 137 の契約を
@@ -85,6 +91,8 @@ enum Mode {
     UpdateNull,
     /// `SET tag = 'done', n = n + 1`（Issue #1545）。変更済み行は `n == id + 1` になる。
     UpdateExpr,
+    /// `SET tag = 'done', at = now()`（Issue #1587）。変更済み行の `at` は全行で同じ時刻になる。
+    UpdateNow,
 }
 
 /// NULL の tag セルを `read_rows` 上で表す番兵（シードされる tag は `x`／`y` のみで衝突しない）。
@@ -97,6 +105,7 @@ impl Mode {
             "update" => Some(Mode::Update),
             "update-null" => Some(Mode::UpdateNull),
             "update-expr" => Some(Mode::UpdateExpr),
+            "update-now" => Some(Mode::UpdateNow),
             _ => None,
         }
     }
@@ -124,6 +133,9 @@ impl Mode {
             Mode::UpdateExpr => format!(
                 "UPDATE docs SET tag = 'done', n = n + 1 WHERE tag = 'x' USING OPERATION_ID '{JOB_OP}' PARTITIONED CHUNK {CHUNK}"
             ),
+            Mode::UpdateNow => format!(
+                "UPDATE docs SET tag = 'done', at = now() WHERE tag = 'x' USING OPERATION_ID '{JOB_OP}' PARTITIONED CHUNK {CHUNK}"
+            ),
         }
     }
 
@@ -131,7 +143,7 @@ impl Mode {
     fn done_tag(self) -> Option<&'static str> {
         match self {
             Mode::Delete => None,
-            Mode::Update | Mode::UpdateExpr => Some("done"),
+            Mode::Update | Mode::UpdateExpr | Mode::UpdateNow => Some("done"),
             Mode::UpdateNull => Some(NULL_TAG),
         }
     }
@@ -153,6 +165,10 @@ impl Mode {
             Mode::UpdateExpr => format!(
                 "UPDATE docs SET tag = 'done', n = n + 2 WHERE tag = 'x' USING OPERATION_ID '{JOB_OP}' PARTITIONED CHUNK {CHUNK}"
             ),
+            // `now()` を `CURRENT_TIMESTAMP` に替えただけの文（構文形が違うため 22023 になるはず）。
+            Mode::UpdateNow => format!(
+                "UPDATE docs SET tag = 'done', at = CURRENT_TIMESTAMP WHERE tag = 'x' USING OPERATION_ID '{JOB_OP}' PARTITIONED CHUNK {CHUNK}"
+            ),
         }
     }
 
@@ -171,6 +187,11 @@ impl Mode {
             Mode::UpdateExpr => format!(
                 "UPDATE docs SET tag = 'done', n = n + 1 WHERE tag = 'x' USING OPERATION_ID '{JOB_OP}'"
             ),
+            // 原子版の `SET at = now()` は未対応（42601）のため、時刻を含まない通常 DML で
+            // 同じ operation_id の衝突（内容不一致 22023）を確かめる。
+            Mode::UpdateNow => format!(
+                "UPDATE docs SET tag = 'done' WHERE tag = 'x' USING OPERATION_ID '{JOB_OP}'"
+            ),
         }
     }
 }
@@ -180,12 +201,14 @@ fn main() {
     let (sub, path, mode) = match (args.next(), args.next(), args.next()) {
         (Some(s), Some(p), Some(m)) => (s, p, m),
         _ => {
-            eprintln!("usage: crash_tool_partitioned_dml <init|write|verify|finish> <db_path> <delete|update|update-null|update-expr>");
+            eprintln!("usage: crash_tool_partitioned_dml <init|write|verify|finish> <db_path> <delete|update|update-null|update-expr|update-now>");
             std::process::exit(2);
         }
     };
     let Some(mode) = Mode::parse(&mode) else {
-        eprintln!("ERROR: unknown mode (expected delete|update|update-null|update-expr)");
+        eprintln!(
+            "ERROR: unknown mode (expected delete|update|update-null|update-expr|update-now)"
+        );
         std::process::exit(2);
     };
     let code = match sub.as_str() {
@@ -296,7 +319,7 @@ fn init(path: &str) -> Result<(), String> {
     core.execute_sql_in_session(
         &ctx("crash-pdml-sys")?,
         &mut session,
-        "CREATE TABLE docs (tag TEXT, n BIGINT)",
+        "CREATE TABLE docs (tag TEXT, n BIGINT, at TIMESTAMP)",
     )
     .map_err(|e| format!("create table failed: {e}"))?;
     seed_tenant(&core, TENANT_A, ROWS_A)?;
@@ -414,6 +437,64 @@ fn tag_n(cells: &[Cell]) -> Result<(String, i64), String> {
     }
 }
 
+/// `(id -> at)`（`at` が NULL の行は `None`）。
+fn read_at(core: &EngineCore, tenant: &str) -> Result<BTreeMap<u64, Option<i64>>, String> {
+    let q = match sql(
+        core,
+        tenant,
+        &format!("SELECT id, at FROM docs LIMIT {SCAN_LIMIT}"),
+    )? {
+        SqlOutcome::Query(q) => q,
+        other => return Err(format!("unexpected SELECT outcome: {other:?}")),
+    };
+    let mut out = BTreeMap::new();
+    for r in &q.rows {
+        let at = r.cells.iter().find_map(|c| match c {
+            Cell::Timestamp(t) => Some(Some(*t)),
+            Cell::Null => Some(None),
+            _ => None,
+        });
+        match at {
+            Some(a) => {
+                out.insert(r.id, a);
+            }
+            None => return Err(format!("unexpected at cells: {:?}", r.cells)),
+        }
+    }
+    Ok(out)
+}
+
+/// `update-now` の固定時刻の検査（設計 D6）。変更済み行の `at` はすべて NULL でない同じ 1 値、
+/// 未変更行の `at` は NULL のまま（kill・再起動・再送をまたいでも再評価で値が割れない）。
+fn check_fixed_time(
+    core: &EngineCore,
+    changed: &BTreeSet<u64>,
+    ids: impl Iterator<Item = u64>,
+) -> Result<(), String> {
+    let ats = read_at(core, TENANT_A)?;
+    let mut seen: Option<i64> = None;
+    for id in ids {
+        let at = ats.get(&id).copied().flatten();
+        if changed.contains(&id) {
+            let Some(at) = at else {
+                return Err(format!("changed row {id} has a NULL at"));
+            };
+            match seen {
+                None => seen = Some(at),
+                Some(first) if first == at => {}
+                Some(first) => {
+                    return Err(format!(
+                        "fixed time broken: row {id} has at={at}, expected {first}"
+                    ))
+                }
+            }
+        } else if at.is_some() {
+            return Err(format!("unchanged row {id} has a non-NULL at"));
+        }
+    }
+    Ok(())
+}
+
 fn initial_tag(id: u64) -> &'static str {
     if id.is_multiple_of(2) {
         "x"
@@ -479,7 +560,7 @@ fn verify(path: &str, mode: Mode) -> Result<(String, i64), String> {
             .copied()
             .filter(|id| !rows.contains_key(id))
             .collect(),
-        Mode::Update | Mode::UpdateNull | Mode::UpdateExpr => matching
+        Mode::Update | Mode::UpdateNull | Mode::UpdateExpr | Mode::UpdateNow => matching
             .iter()
             .copied()
             .filter(|id| rows.get(id).map(|(t, _)| t.as_str()) == mode.done_tag())
@@ -517,6 +598,9 @@ fn verify(path: &str, mode: Mode) -> Result<(String, i64), String> {
         return Err(
             "changed set is not a prefix of the matching ids (forward-match broken)".to_string(),
         );
+    }
+    if mode == Mode::UpdateNow {
+        check_fixed_time(&core, &changed, 0..ROWS_A)?;
     }
     // チャンク原子性（主）: |D| == SHOW の処理済み件数。
     if d as i64 != rows_shown {
@@ -577,14 +661,21 @@ fn finish(path: &str, mode: Mode) -> Result<i64, String> {
         match (mode, matching, rows.get(&id)) {
             (Mode::Delete, true, None) => {}
             (Mode::Delete, true, Some(_)) => return Err(format!("row {id} was not deleted")),
-            (Mode::Update | Mode::UpdateNull | Mode::UpdateExpr, true, Some((t, n)))
-                if Some(t.as_str()) == mode.done_tag() && *n == mode.expected_changed_n(id) => {}
-            (Mode::Update | Mode::UpdateNull | Mode::UpdateExpr, true, other) => {
+            (
+                Mode::Update | Mode::UpdateNull | Mode::UpdateExpr | Mode::UpdateNow,
+                true,
+                Some((t, n)),
+            ) if Some(t.as_str()) == mode.done_tag() && *n == mode.expected_changed_n(id) => {}
+            (Mode::Update | Mode::UpdateNull | Mode::UpdateExpr | Mode::UpdateNow, true, other) => {
                 return Err(format!("row {id} not updated: {other:?}"))
             }
             (_, false, Some((t, n))) if t == "y" && *n == id as i64 => {}
             (_, false, other) => return Err(format!("non-matching row {id} changed: {other:?}")),
         }
+    }
+    if mode == Mode::UpdateNow {
+        let all_matching: BTreeSet<u64> = (0..ROWS_A).filter(|id| id % 2 == 0).collect();
+        check_fixed_time(&core, &all_matching, 0..ROWS_A)?;
     }
     if recorded(&core, TENANT_A)? != LedgerLookup::Recorded {
         return Err("ledger entry missing after completion".to_string());

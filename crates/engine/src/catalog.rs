@@ -3079,17 +3079,94 @@ fn array_param_enum_name(param: &str) -> Result<Option<&str>> {
 /// `Text` は SQL 文字列リテラルの原文を保持する。`TEXT` 列ではそのまま値になり、
 /// `DATE`／`TIMESTAMP`／`UUID` 列（Issue #1279・#1280・#1281）では `row_codec::default_scalar` が
 /// 列型に従って解釈し、`ENUM` 列（Issue #1282）では語彙に含まれるラベルかを照合する。
-/// 新 variant
-/// を足さず、`compatible_with`・`column_default_compatible_with_tag`・
-/// `row_codec::default_scalar`・`sql::ddl::add_column_default` の対応表へ同じ形で
-/// 腕を足して拡張する（公開 enum の variant 追加による破壊的変更とカタログ符号化の
-/// 変更を避ける）。
+/// 定数 DEFAULT は新 variant を足さず、`compatible_with`・
+/// `column_default_compatible_with_tag`・`row_codec::default_scalar`・
+/// `sql::ddl::add_column_default` の対応表へ同じ形で腕を足して拡張する。
+/// 例外として時刻値関数の DEFAULT（`DEFAULT now()` 系。SQL-37・TABLE-16・Issue #1587、
+/// 設計 D9）だけは評価時刻に依存する揮発性 DEFAULT のため専用 variant
+/// [`ColumnDefault::CurrentTime`] とカタログタグ `c` を持つ（公開 enum への variant 追加は
+/// 破壊的変更）。この variant は構文形のまま保存し、INSERT の省略列補完
+/// （`sql::parser::fill_omitted_columns`）だけが評価する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnDefault {
     /// 文字列リテラルの原文（`TEXT` 値、または型付き列で列型に従い解釈される）。
     Text(String),
     Number(String),
     Bool(bool),
+    /// 時刻値関数の DEFAULT（構文形。評価は INSERT 時のトランザクション開始時刻）。
+    CurrentTime(TimeDefault),
+}
+
+/// [`ColumnDefault::CurrentTime`] が受理する時刻値関数の構文形（許可リスト。
+/// SQL-37・Issue #1587）。`now()` と `CURRENT_TIMESTAMP` は評価値が同じでも別の形として
+/// 保持する（内容照合ハッシュは構文形から計算するため。設計 D1・D3）。
+/// `Option<u8>` は小数秒精度 `(p)`（0〜6。範囲外は decode・構文検証で拒否）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeDefault {
+    /// `now()`。
+    Now,
+    /// `transaction_timestamp()`。
+    TransactionTimestamp,
+    /// `CURRENT_TIMESTAMP[(p)]`。
+    CurrentTimestamp(Option<u8>),
+    /// `LOCALTIMESTAMP[(p)]`。
+    LocalTimestamp(Option<u8>),
+    /// `CURRENT_DATE`。
+    CurrentDate,
+}
+
+impl TimeDefault {
+    /// 受理する列型（`TIMESTAMP` 系関数は `TIMESTAMP` 列、`CURRENT_DATE` は `DATE` 列）。
+    pub(crate) fn compatible_with(self, ty: &ColumnType) -> bool {
+        match self {
+            TimeDefault::CurrentDate => matches!(ty, ColumnType::Date),
+            _ => matches!(ty, ColumnType::Timestamp),
+        }
+    }
+
+    /// 列タグ文字列版（[`column_default_compatible_with_tag`] 用）。
+    fn compatible_with_tag(self, tag: &str) -> bool {
+        match self {
+            TimeDefault::CurrentDate => tag == "date",
+            _ => tag == "timestamp",
+        }
+    }
+
+    /// カタログ保存用の正準テキスト（許可リスト。16 進化前の本体）。
+    pub(crate) fn canonical_text(self) -> String {
+        match self {
+            TimeDefault::Now => "now".to_string(),
+            TimeDefault::TransactionTimestamp => "transaction_timestamp".to_string(),
+            TimeDefault::CurrentDate => "current_date".to_string(),
+            TimeDefault::CurrentTimestamp(None) => "current_timestamp".to_string(),
+            TimeDefault::CurrentTimestamp(Some(p)) => format!("current_timestamp:{p}"),
+            TimeDefault::LocalTimestamp(None) => "localtimestamp".to_string(),
+            TimeDefault::LocalTimestamp(Some(p)) => format!("localtimestamp:{p}"),
+        }
+    }
+
+    /// [`TimeDefault::canonical_text`] の逆変換。許可リスト外・精度範囲外は `None`。
+    pub(crate) fn from_canonical_text(text: &str) -> Option<TimeDefault> {
+        let (head, precision) = match text.split_once(':') {
+            Some((h, p)) => {
+                let p: u8 = p.parse().ok()?;
+                // 正準形（先頭ゼロ・符号なし）だけを受理する。
+                if p > 6 || p.to_string() != text.split_once(':')?.1 {
+                    return None;
+                }
+                (h, Some(p))
+            }
+            None => (text, None),
+        };
+        match (head, precision) {
+            ("now", None) => Some(TimeDefault::Now),
+            ("transaction_timestamp", None) => Some(TimeDefault::TransactionTimestamp),
+            ("current_date", None) => Some(TimeDefault::CurrentDate),
+            ("current_timestamp", p) => Some(TimeDefault::CurrentTimestamp(p)),
+            ("localtimestamp", p) => Some(TimeDefault::LocalTimestamp(p)),
+            _ => None,
+        }
+    }
 }
 
 /// [`ColumnDefault`] 1 個ぶんのカタログテキスト表現（未加工の値本体）の
@@ -3137,7 +3214,7 @@ impl ColumnDefault {
                     | ColumnType::Double
                     | ColumnType::Numeric { .. },
             ) | (ColumnDefault::Bool(_), ColumnType::Boolean)
-        )
+        ) || matches!(self, ColumnDefault::CurrentTime(t) if t.compatible_with(ty))
     }
 
     /// カタログテキスト形式（v5）の `default` フィールドへ符号化する。
@@ -3149,6 +3226,7 @@ impl ColumnDefault {
         let (tag, raw): (char, String) = match self {
             ColumnDefault::Text(s) => ('s', s.clone()),
             ColumnDefault::Number(s) => ('n', s.clone()),
+            ColumnDefault::CurrentTime(t) => ('c', t.canonical_text()),
             ColumnDefault::Bool(b) => {
                 return Ok(if *b { "t".to_string() } else { "f".to_string() })
             }
@@ -3199,6 +3277,13 @@ impl ColumnDefault {
         match tag {
             's' => Ok(Some(ColumnDefault::Text(text))),
             'n' => Ok(Some(ColumnDefault::Number(text))),
+            // 時刻 DEFAULT は許可リストの正準形だけを受理する（未知の形・精度範囲外は
+            // fail-closed。SQL-37・Issue #1587）。
+            'c' => TimeDefault::from_canonical_text(&text)
+                .map(|t| Some(ColumnDefault::CurrentTime(t)))
+                .ok_or_else(|| {
+                    CatalogError::Invalid("unknown time column default form".to_string())
+                }),
             other => Err(CatalogError::Invalid(format!(
                 "unknown column default tag: {other:?}"
             ))),
@@ -3617,6 +3702,13 @@ impl ForeignKeyDef {
         self.match_type = match_type;
         self.deferrability = deferrability;
         self
+    }
+
+    /// `ON DELETE`／`ON UPDATE` のいずれかが `SET DEFAULT` か（時刻 DEFAULT 列との
+    /// 組み合わせ検査用。SQL-37・Issue #1587、設計 D9）。
+    pub(crate) fn uses_set_default(&self) -> bool {
+        matches!(self.on_delete, ReferentialAction::SetDefault)
+            || matches!(self.on_update, ReferentialAction::SetDefault)
     }
 
     /// 参照元（このスキーマ側）の列名（宣言順）。
@@ -4652,6 +4744,15 @@ fn validate_referential_action_declaration(schema: &TableSchema, fk: &ForeignKey
         if uses_set_null && !column.nullable {
             return Err(CatalogError::InvalidForeignKey(format!(
                 "column {name} is NOT NULL and cannot use the SET NULL referential action"
+            )));
+        }
+        // 時刻 DEFAULT 列は SET DEFAULT の対象にできない（連鎖更新には台帳へ記録する
+        // 主体の文が無く、評価時刻を再送で再現できないため。SQL-37・Issue #1587、設計 D9）。
+        // SQL 表層は `sql::ddl` が先に `0A000` で拒否するため、ここは Rust API・decode の
+        // 多層防御（fail-closed）。
+        if uses_set_default && matches!(column.default, Some(ColumnDefault::CurrentTime(_))) {
+            return Err(CatalogError::InvalidForeignKey(format!(
+                "column {name} has a time function DEFAULT and cannot use the SET DEFAULT referential action"
             )));
         }
         if uses_set_default && !column.nullable && column.default.is_none() {
@@ -7452,6 +7553,14 @@ impl Storage {
         let max_columns = max_columns.min(MAX_COLUMN_COUNT);
         validate_identifier(table_name)?;
         validate_column(&column)?;
+        // 時刻値関数の DEFAULT は既存行の補完値を固定できず、読み出し時補完が常に失敗して
+        // テーブルを読めなくするため、Rust API 直接呼び出しでも拒否する（多層防御。SQL 表層は
+        // `sql::allowlist` が `0A000` で先に拒否する。SQL-37・Issue #1587、設計 D10）。
+        if matches!(column.default, Some(ColumnDefault::CurrentTime(_))) {
+            return Err(CatalogError::Invalid(
+                "time function DEFAULT is not supported in ALTER TABLE ADD COLUMN".to_string(),
+            ));
+        }
         if crate::row_codec::validate_column_default(&column).is_err() {
             return Err(CatalogError::Invalid(
                 "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT".to_string(),
@@ -10217,7 +10326,7 @@ fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> boo
             ColumnDefault::Number(_),
             "integer" | "bigint" | "real" | "double" | "numeric"
         ) | (ColumnDefault::Bool(_), "boolean")
-    )
+    ) || matches!(default, ColumnDefault::CurrentTime(t) if t.compatible_with_tag(tag))
 }
 
 /// ENUM 型 `type_name` を参照する列を持つテーブル名の一覧を列挙する
@@ -10464,6 +10573,98 @@ mod tests {
     // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
     // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+    /// 時刻 DEFAULT（SQL-37・TABLE-16・Issue #1587）のカタログ往復。許可リストの全形が
+    /// タグ `c` で往復し、`compatible_with`・タグ版の整合判定が列型と一致する。
+    #[test]
+    fn time_default_roundtrips_and_is_type_checked() {
+        let forms = [
+            TimeDefault::Now,
+            TimeDefault::TransactionTimestamp,
+            TimeDefault::CurrentTimestamp(None),
+            TimeDefault::CurrentTimestamp(Some(0)),
+            TimeDefault::CurrentTimestamp(Some(6)),
+            TimeDefault::LocalTimestamp(None),
+            TimeDefault::LocalTimestamp(Some(3)),
+            TimeDefault::CurrentDate,
+        ];
+        for form in forms {
+            let default = ColumnDefault::CurrentTime(form);
+            let field = default.encode_catalog_field().expect("encode");
+            assert!(field.starts_with('c'), "{field}");
+            assert_eq!(
+                ColumnDefault::decode_catalog_field(&field).expect("decode"),
+                Some(default.clone())
+            );
+            let (ok_ty, ok_tag, bad_ty, bad_tag) = if form == TimeDefault::CurrentDate {
+                (ColumnType::Date, "date", ColumnType::Timestamp, "timestamp")
+            } else {
+                (ColumnType::Timestamp, "timestamp", ColumnType::Date, "date")
+            };
+            assert!(default.compatible_with(&ok_ty));
+            assert!(column_default_compatible_with_tag(&default, ok_tag));
+            assert!(!default.compatible_with(&bad_ty));
+            assert!(!column_default_compatible_with_tag(&default, bad_tag));
+            assert!(!default.compatible_with(&ColumnType::Text));
+        }
+    }
+
+    /// Rust API の `alter_table_add_column` も時刻 DEFAULT を拒否する（既存行の補完値を
+    /// 固定できず、受理するとテーブルが読めなくなるため。設計 D10）。
+    #[test]
+    fn alter_table_add_column_rejects_time_default() {
+        let path = unique_db_path("catalog-add-column-time-default");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "t",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+        let column = ColumnDef::new("at", ColumnType::Timestamp, true)
+            .with_default(ColumnDefault::CurrentTime(TimeDefault::Now));
+        let err = storage
+            .alter_table_add_column("t", column)
+            .expect_err("time DEFAULT must be rejected");
+        assert!(matches!(err, CatalogError::Invalid(_)), "{err:?}");
+        // 列は追加されない。
+        let schema = storage.get_table_schema("t").expect("schema");
+        assert_eq!(schema.columns.len(), 1);
+    }
+
+    /// 未知の形・精度範囲外・非正準な精度・不正 16 進は fail-closed（`Invalid`）。
+    #[test]
+    fn time_default_decode_rejects_unknown_forms() {
+        let hex = |raw: &str| {
+            let mut out = String::from("c");
+            for b in raw.as_bytes() {
+                out.push_str(&hex_encode_byte(*b));
+            }
+            out
+        };
+        for bad in [
+            "",
+            "now:1",
+            "clock_timestamp",
+            "statement_timestamp",
+            "current_timestamp:7",
+            "current_timestamp:",
+            "current_timestamp:03",
+            "current_timestamp:+3",
+            "current_date:1",
+            "localtime",
+            "NOW",
+            "now()",
+        ] {
+            assert!(
+                ColumnDefault::decode_catalog_field(&hex(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(ColumnDefault::decode_catalog_field("czz").is_err());
+        assert!(ColumnDefault::decode_catalog_field("c").is_err());
+    }
 
     /// 循環したビューカタログ（a -> b -> a）でも `exposed_columns_of_view` が
     /// スタックを使い果たさず `CorruptSchema` を返すこと（反復＋visited 集合）。
