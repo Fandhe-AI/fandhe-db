@@ -244,6 +244,24 @@ fn bounded_varchar_behaves_like_text_for_predicates_and_keys() {
     ok(&core, "CREATE INDEX t_v ON t (v)");
 }
 
+/// `CHAR VARYING`／`CHAR VARYING(n)` は `CHARACTER VARYING` と同じ VARCHAR の綴り。
+/// `VARYING` を伴わない bare `CHAR` は従来どおり `0A000`。
+#[test]
+fn char_varying_is_accepted_as_varchar_and_bare_char_stays_rejected() {
+    let (path, _g, core) = open("cl-char-varying");
+    ok(
+        &core,
+        "CREATE TABLE t (a CHAR VARYING(6), b char varying, c CHAR(2))",
+    );
+    drop(core);
+    assert_eq!(column_type(&path, "t", "a"), ColumnType::Varchar(Some(6)));
+    assert_eq!(column_type(&path, "t", "b"), ColumnType::Varchar(None));
+    assert_eq!(column_type(&path, "t", "c"), ColumnType::Bpchar(2));
+
+    let (_p2, _g2, core) = open("cl-char-bare");
+    assert_eq!(code(&core, "CREATE TABLE u (a CHAR)"), "0A000");
+}
+
 /// `CHAR(n)` は意味論（空白詰め・bpchar 比較）が未確定の間、非 NULL の書き込み・述語・索引・
 /// 制約を拒否する。NULL の書き込みと `SELECT *` は成功する（Issue #1566／#1567 が解禁する）。
 #[test]

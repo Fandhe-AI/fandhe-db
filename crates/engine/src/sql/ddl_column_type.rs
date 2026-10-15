@@ -483,11 +483,9 @@ fn parse_base_type_name(
             let len = parse_optional_char_length(tokens, pos)?;
             Ok(alias_type(name, SqlColumnTypeName::Varchar(len)))
         }
-        TypeNameKind::Char => match parse_optional_char_length(tokens, pos)? {
-            Some(n) => Ok(alias_type(name, SqlColumnTypeName::Bpchar(n))),
-            None => Err(bare_char_error()),
-        },
-        TypeNameKind::Character => {
+        // `CHAR VARYING` は `CHARACTER VARYING` と同じ標準綴り（VARCHAR）。`VARYING` が
+        // 続かない場合のみ bare CHAR（n 無し）拒否・`CHAR(n)` の既存挙動を維持する。
+        TypeNameKind::Char | TypeNameKind::Character => {
             let varying = matches!(
                 tokens.get(*pos),
                 Some(Token::Ident(s)) if s.eq_ignore_ascii_case("VARYING")
