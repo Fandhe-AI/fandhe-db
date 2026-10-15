@@ -210,6 +210,20 @@ fn json_functions_return_postgres_values() {
         cell(&core, &alice, "json_array_length(doc -> 'zz')"),
         Cell::Null
     );
+    // json_array_length は int4: 整数除算（3 / 2 = 1）として評価される（Issue #2180）。
+    assert_eq!(
+        cell(&core, &alice, "json_array_length('[1,[2,3],null]') / 2"),
+        Cell::SignedInteger(1)
+    );
+    // int4 式として添字に使える。
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            "(doc -> 'a') -> (json_array_length(doc -> 'a') - 2)"
+        ),
+        cell(&core, &alice, "(doc -> 'a') -> 0")
+    );
 
     assert_eq!(
         cell(&core, &alice, "json_extract_path(doc, 'o', 'x')"),

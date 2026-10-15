@@ -2677,6 +2677,8 @@ fn is_int4_expr(expr: &Expr, env: &BindEnv<'_>) -> bool {
             lhs,
             rhs,
         } => is_int4_expr(lhs, env) && is_int4_expr(rhs, env),
+        // `json_array_length` の戻り型は int4（Issue #2180）。
+        Expr::Call { name, .. } => name.eq_ignore_ascii_case("json_array_length"),
         _ => false,
     }
 }
@@ -2978,6 +2980,8 @@ pub(super) fn numeric_kind(
             f: BuiltinFn::TypedArith(_, k),
             ..
         } => Some(*k),
+        // `json_array_length` は int4（Issue #2180）。整数除算・添字の型解決に反映する。
+        BoundExpr::JsonFn(f) if f.result_is_int4() => Some(NumericKind::Int4),
         _ => None,
     }
 }
