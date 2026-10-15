@@ -211,7 +211,7 @@ fn nosql_read_timeout_closes_idle_connection_at_configured_value_without_bytes()
     assert_eof(&mut stream, Duration::from_secs(3));
 }
 
-/// B6 + B7（SQL）: 認証後のアイドルが設定値 1 秒で応答なしに切断される。設定値より短い
+/// B6 + B7（SQL）: 認証後のアイドルが設定値 3 秒で応答なしに切断される。設定値より短い
 /// 間隔で通信し続ける接続は、合計で設定値を超えても切断されない。
 #[test]
 fn sql_read_timeout_closes_idle_session_at_configured_value_and_spares_active_one() {
@@ -224,26 +224,33 @@ fn sql_read_timeout_closes_idle_session_at_configured_value_and_spares_active_on
         &users_path,
         core,
         8,
-        Duration::from_secs(1),
+        Duration::from_secs(3),
         SessionLimits::default(),
     );
 
     let mut idle = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
     let mut active = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
 
-    assert_silent_and_open(&mut idle, Duration::from_millis(400));
-
-    // 0.5 秒間隔で合計 1.5 秒（設定値 1 秒超）通信を続けても切断されない。
-    for _ in 0..3 {
-        std::thread::sleep(Duration::from_millis(500));
-        send_simple_query(&mut active, "SELECT id FROM documents LIMIT 1");
+    // 認証（Argon2）完了後に keep-alive を数え始めるため、idle の観測より前に active へ
+    // 最初のクエリを送る。待機は設定値 3 秒の 1/3 以下（1 秒）の間隔で、余裕を 1.5 秒以上取る。
+    let query_and_drain = |stream: &mut TcpStream| {
+        send_simple_query(stream, "SELECT id FROM documents LIMIT 1");
         loop {
-            let (kind, _) = read_message(&mut active);
+            let (kind, _) = read_message(stream);
             if kind == b'Z' {
                 break;
             }
         }
+    };
+    query_and_drain(&mut active);
+    assert_silent_and_open(&mut idle, Duration::from_millis(1500));
+
+    // 1 秒間隔で合計 3 秒以上（設定値 3 秒に到達）通信を続けても切断されない。
+    for _ in 0..4 {
+        query_and_drain(&mut active);
+        std::thread::sleep(Duration::from_secs(1));
     }
+    query_and_drain(&mut active);
 
     // 無通信の接続は設定値を過ぎると 0 バイトのまま EOF になる（3 秒以内）。
     let elapsed = assert_eof(&mut idle, Duration::from_secs(3));
