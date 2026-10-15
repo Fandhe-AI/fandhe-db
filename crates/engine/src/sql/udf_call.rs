@@ -4364,35 +4364,41 @@ fn eval_json_fn<'a>(
                     detail: "argument list must have even number of elements",
                 });
             }
-            // 重複キーは後の値が勝つため、入力総量は出力サイズの下限にならない。上書きされた値を
-            // 保持せず、最終的に残るエントリのサイズ（キー + text/jsonb 値の長さ）の総和で
-            // 上限を検査する（保持中のメモリは常に上限以下）。
+            // 重複キーは後の値が勝つため、入力総量は出力サイズの下限にならない。先に全キーを
+            // 評価して「キー → 最後の値の位置」を確定し（NULL／非スカラーのキーは上書きされる
+            // ペアでも拒否する）、最終的に残るエントリだけをサイズ検査・パースする。
+            let pairs = values.as_chunks::<2>().0;
+            let mut last: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for (i, [k, v]) in pairs.iter().enumerate() {
+                if matches!(v, ExprValue::Vector(_)) {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "a vector value cannot be converted to jsonb".to_string(),
+                    });
+                }
+                last.insert(json_object_key(k)?, i);
+            }
             let mut map = std::collections::BTreeMap::new();
             let mut retained = 0usize;
-            for [k, v] in values.as_chunks::<2>().0 {
-                let key = json_object_key(k)?;
+            for (key, i) in last {
+                let Some([_, v]) = pairs.get(i) else {
+                    return Err(internal("object entry index out of range"));
+                };
                 let vlen = match v {
                     ExprValue::Text(t) => t.len(),
                     ExprValue::Json(j) => j.len(),
                     _ => 0,
                 };
                 let entry_len = key.len().saturating_add(vlen);
-                // 単一エントリが単独で上限超過なら、パース前に拒否する。
-                if entry_len > crate::json::MAX_JSON_FIELD_LEN {
-                    return Err(SqlSurfaceError::payload_too_large(
-                        "jsonb result exceeds the allowed size",
-                    ));
-                }
-                let parsed = json_value_from_expr_value(v)?;
-                if let Some((_, old_len)) = map.insert(key, (parsed, entry_len)) {
-                    retained = retained.saturating_sub(old_len);
-                }
                 retained = retained.saturating_add(entry_len);
+                // 最終エントリの総量が上限超過なら、パース前に拒否する。
                 if retained > crate::json::MAX_JSON_FIELD_LEN {
                     return Err(SqlSurfaceError::payload_too_large(
                         "jsonb result exceeds the allowed size",
                     ));
                 }
+                let parsed = json_value_from_expr_value(v)?;
+                map.insert(key, (parsed, entry_len));
             }
             let map = map.into_iter().map(|(k, (v, _))| (k, v)).collect();
             let text = crate::json::serialize_jsonb_bounded(&crate::json::JsonValue::Object(map))

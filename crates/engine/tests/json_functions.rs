@@ -715,3 +715,23 @@ fn build_object_size_check_uses_retained_entries_after_duplicate_keys() {
         "54000"
     );
 }
+
+#[test]
+fn build_object_overwrites_distinct_keys_after_large_values() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    // 異なる 5 キーに巨大値を置いた後、同じ 5 キーを小さな値で上書きすれば最終結果は小さく成功する。
+    let big = format!("[\"{}\"]", "x".repeat(1_000_000));
+    seed(&core, &alice, &[Some(&big)]);
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            "jsonb_build_object('a', docb, 'b', docb, 'c', docb, 'd', docb, 'e', docb, \
+             'a', 0, 'b', 0, 'c', 0, 'd', 0, 'e', 0)",
+            1
+        ),
+        json("{\"a\":0,\"b\":0,\"c\":0,\"d\":0,\"e\":0}")
+    );
+}
