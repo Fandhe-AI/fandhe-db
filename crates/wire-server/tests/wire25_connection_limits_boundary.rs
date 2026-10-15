@@ -228,11 +228,25 @@ fn sql_read_timeout_closes_idle_session_at_configured_value_and_spares_active_on
         SessionLimits::default(),
     );
 
-    let mut idle = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    // Argon2 検証・KDF セマフォ待ちが idle 側の read timeout に混入しないよう、active を先に
+    // 認証し、idle の認証完了直後を時間基準（idle_started）にする。
     let mut active = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    let idle = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let idle_started = Instant::now();
+    // idle の EOF 到達時刻を別スレッドで観測する（main 側の待機で EOF が先に届いていても、
+    // 切断時刻そのものを測れるようにするため）。0 バイト以外が届いたら不合格。
+    let mut idle_reader = idle.try_clone().expect("clone idle stream");
+    idle_reader
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .expect("set idle read timeout");
+    let idle_watcher = std::thread::spawn(move || {
+        let mut buf = [0u8; 16];
+        let result = idle_reader.read(&mut buf);
+        (result, Instant::now())
+    });
 
     // 認証（Argon2）完了後に keep-alive を数え始めるため、idle の観測より前に active へ
-    // 最初のクエリを送る。待機は設定値 3 秒の 1/3 以下（1 秒）の間隔で、余裕を 1.5 秒以上取る。
+    // 最初のクエリを送る。通信間隔は設定値 3 秒の 1/3 以下（1 秒）にして余裕を取る。
     let query_and_drain = |stream: &mut TcpStream| {
         send_simple_query(stream, "SELECT id FROM documents LIMIT 1");
         loop {
@@ -243,7 +257,6 @@ fn sql_read_timeout_closes_idle_session_at_configured_value_and_spares_active_on
         }
     };
     query_and_drain(&mut active);
-    assert_silent_and_open(&mut idle, Duration::from_millis(1500));
 
     // 1 秒間隔で合計 3 秒以上（設定値 3 秒に到達）通信を続けても切断されない。
     for _ in 0..4 {
@@ -252,11 +265,22 @@ fn sql_read_timeout_closes_idle_session_at_configured_value_and_spares_active_on
     }
     query_and_drain(&mut active);
 
-    // 無通信の接続は設定値を過ぎると 0 バイトのまま EOF になる（3 秒以内）。
-    let elapsed = assert_eof(&mut idle, Duration::from_secs(3));
+    // 無通信の接続は設定値を過ぎると 0 バイトのまま EOF になる。時間基準は probe・待機より前の
+    // idle 認証完了時点とし、設定値以上（スケジューリング誤差の下限余裕 0.5 秒）かつ設定値に
+    // 余裕 1.5 秒を足した値以下で切断されることを確かめる（実際は 5 秒で切る実装も検出する）。
+    let (read_result, closed_at) = idle_watcher.join().expect("idle watcher thread");
+    match read_result {
+        Ok(0) => {}
+        other => panic!("expected EOF without any bytes on the idle session, got {other:?}"),
+    }
+    let since_idle_start = closed_at.duration_since(idle_started);
     assert!(
-        elapsed < Duration::from_secs(3),
-        "idle session must be closed at the configured value, took {elapsed:?}"
+        since_idle_start >= Duration::from_millis(2500),
+        "idle session closed too early, took {since_idle_start:?} from idle start"
+    );
+    assert!(
+        since_idle_start <= Duration::from_millis(4500),
+        "idle session must be closed at the configured value, took {since_idle_start:?} from idle start"
     );
 }
 
