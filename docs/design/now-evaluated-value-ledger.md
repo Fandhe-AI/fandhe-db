@@ -85,24 +85,18 @@
 - 時刻値関数を評価した書き込み（式・揮発性 DEFAULT の適用を含む）に限り v3 を書く。それ以外は v2 のまま
   で、既存バイト列とテストを不変に保つ。
 - 照合（`23505`／`22023`）はハッシュだけで行い、時刻は使わない。v2 と v3 は相互にハッシュで照合できる。
-- 記録する値は評価に用いたトランザクション開始時刻 1 つ（1 エントリ＝1 文）。autocommit では文開始時刻と
-  一致し、分割実行は明示トランザクション内で拒否されるため常にこの条件を満たす。
-- 再送時は `23505` を返すだけで再評価・再書き込みしない。行には初回 commit の評価済み値が残るため、
-  初回の値の再現は行の値で満たされる。
+- 記録する値・再送時の応答の詳細は spec ポインタ（SQL-37・RECOVER-10〜12）を正とし、本書では再掲しない。
 - API 形（`Option<TxnStartMicros>` の追加か `LedgerEntryInput { hash, evaluated_at }` の導入か）は #1587 で決める。
 - ダウングレード: v3 を書いた DB を旧バイナリで読むと `XX000`（fail-closed）。移行処理は入れず既知の制約とする。
 
 ### D5. clock_timestamp()
 
-呼び出しごとの値は行の値としてのみ残し、台帳にはトランザクション開始時刻だけを入れる。ハッシュは構文形のため
-再送は `23505` で冪等性を保つ。「台帳付き書き込みでの clock_timestamp を拒否する」案は PostgreSQL と
-意味が外れるため採らない。
+扱いは spec ポインタ（SQL-37）を正とする。ハッシュは構文形（D1）のため、評価値の揺れは照合に影響しない。
 
 ### D6. 分割実行 DML
 
 ジョブ記録を版 2 にし、`Running`／`Cancelled`／`Completed` に `fixed_time i64` を持たせる。値はジョブ開始時
-（初回チャンク）に確定・永続化し、再開したチャンクは永続化済みの値を使う。WHERE／SET の `now()` は全チャンクで
-同一、クラッシュ後も不変で、完了時の台帳 v3 にも同じ値を記録する。版 1 のジョブ記録は時刻を持たないため、
+に確定・永続化し、再開時は永続化済みの値を使う（契約の詳細は spec ポインタ SQL-37・RECOVER-11 を正とする）。版 1 のジョブ記録は時刻を持たないため、
 時刻値関数を含む再開要求は `22023`（fail-closed）。
 
 ### D7. 評価コンテキスト
@@ -129,7 +123,8 @@ TIMESTAMPTZ／TimeZone（TABLE-32・TABLE-33）が未実装の間は `ExprType::
 | COPY の省略列補完 | `copy.rs` から同じ `fill_omitted_columns` | 上と同じ（評価値は行へ、列名と評価前の DEFAULT 式をハッシュ側へ渡す）。台帳は COPY の `operation_id` に記録する |
 | 文書取り込み（ファイル INSERT）の省略列補完 | `parser.rs` の `bind_file_insert`（`fill_omitted_columns` を通らず専用ループで `bind_column_default` を直接呼ぶ） | 初期実装は時刻 DEFAULT を評価せず `0A000` で拒否（fail-closed）。評価コンテキストを渡し台帳へ記録する対応は後続 Issue で、`fill_omitted_columns` と同じ評価関数へ寄せて行う |
 | FK の `ON DELETE／UPDATE SET DEFAULT` | `constraint.rs` の `apply_referential_action` | 参照アクションは親の文に連鎖した子行の書き換えで、台帳に記録する主体の文が無い。初期実装は時刻 DEFAULT 列が SET DEFAULT の対象になる FK の宣言・実行を `0A000` で拒否（fail-closed）。値を黙って NULL や定数へ差し替えない |
-| DDL 時の DEFAULT 検証 | `ddl.rs`（`CREATE TABLE`・`ALTER COLUMN SET DEFAULT`） | 評価せず型適合だけを検査する。時刻 DEFAULT は列型が時刻型であることを確認する |
+| `CREATE TABLE` の DEFAULT 検証 | `ddl.rs` | 評価せず型適合だけを検査する。時刻 DEFAULT は列型が時刻型であることを確認する |
+| `ALTER COLUMN SET DEFAULT` | `ddl.rs` | 初期実装は時刻 DEFAULT への変更を `0A000` で拒否（fail-closed）。`row_codec::column_default_scalar_for_read` が現在の `column.default` を既存行の補完にも使うため、定数 DEFAULT 付き列を時刻 DEFAULT へ変えると既存行の補完値が時刻式に置き換わり、読み出し失敗や値の変動を起こす。既存行用の固定補完値を挿入用 DEFAULT と分離する対応は D10 と同じ判断項目として後続 Issue（#1587）で扱い、分離できた時点で受理へ切り替える |
 
 拒否は新しい `bind_column_default` 呼び出し側ではなく、時刻 DEFAULT variant を受けた時点の共通関数で
 未対応経路のコンテキストが無いことを検出して行い、経路の追加で拒否が抜けないようにする（既定が拒否の fail-closed）。
@@ -148,9 +143,9 @@ RECOVER-14・RECOVER-15 の機能は未実装。実装時は評価済みの値�
 ### D12. テスト方針（後続 Issue への要求）
 
 - golden: 時刻値関数を含まない INSERT／UPSERT／DML のハッシュがバイト不変であること。式タグ 13 と `InsertExpr` 系のレイアウト。
-- 結合: 同じ文の再送が時刻によらず `23505` で行の値が初回と一致。形の違う文（`now()` と `CURRENT_TIMESTAMP`、精度違い）が `22023`。
-  トランザクション内で `now()` 不変。分割実行のクラッシュ再開後も値が同一（`crash_test_partitioned_dml` に now モード追加）。
-  台帳 v3 のデコードと長さ不正・未知版の fail-closed。テナント独立。
+- 結合: spec ポインタ（SQL-37）のビヘイビアに対応づけた再送・形違い・トランザクション内・分割実行クラッシュ再開
+  （`crash_test_partitioned_dml` に now モード追加）の各ケース。台帳 v3 のデコードと長さ不正・未知版の fail-closed。テナント独立。
+  `ALTER COLUMN SET DEFAULT` の時刻 DEFAULT 拒否（`0A000`）。
 
 ## 4. セキュリティ・安全性
 
