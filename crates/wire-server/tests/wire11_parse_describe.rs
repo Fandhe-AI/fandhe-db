@@ -34,6 +34,7 @@ use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::storage::Storage;
+use wire_server::limits::MAX_PREPARED_STATEMENTS_PER_SESSION;
 
 use common::*;
 
@@ -465,14 +466,18 @@ fn exceeding_named_statement_limit_returns_54000_and_recovers() {
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
     let sql = "SELECT id FROM documents LIMIT 1";
-    for i in 0..64 {
+    for i in 0..MAX_PREPARED_STATEMENTS_PER_SESSION {
         let name = format!("s{i}");
         send_length_prefixed_message(&mut stream, b'P', &parse_body(&name, sql, 0));
         let (kind, _) = read_message(&mut stream);
         assert_eq!(kind, b'1', "statement {i} should be accepted");
     }
 
-    send_length_prefixed_message(&mut stream, b'P', &parse_body("s64", sql, 0));
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body(&format!("s{MAX_PREPARED_STATEMENTS_PER_SESSION}"), sql, 0),
+    );
     assert_error_then_recovers(&mut stream, "54000");
 }
 
