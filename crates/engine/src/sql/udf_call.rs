@@ -271,6 +271,9 @@ pub enum Expr {
     /// `TIMESTAMP '<literal>'`（[`Expr::DateLiteral`] と同じ理由。値は
     /// `crate::datetime::parse_timestamp` の解析結果＝マイクロ秒）。
     TimestampLiteral(i64),
+    /// `TIME '<literal>'`（[`Expr::DateLiteral`] と同じ理由。値は
+    /// `crate::datetime::parse_time` の解析結果＝0 時起点のマイクロ秒。Issue #1570）。
+    TimeLiteral(i64),
     /// jsonb の演算子（パス取得 `->` `->>` `#>` `#>>`・包含 `@>` `<@`・存在 `?` `?|` `?&`。
     /// 対象ビヘイビア: TABLE-25。Issue #1596・#1598）。構文段（`allowlist::Parser::parse_json_access_expr`）が
     /// PostgreSQL と同じ優先順位（加減算より弱く比較より強い）・左結合で生成する。
@@ -483,6 +486,8 @@ pub enum BoundExpr {
     Date(i32),
     /// `TIMESTAMP` 定数（マイクロ秒。[`BoundExpr::Date`] 参照）。
     Timestamp(i64),
+    /// `TIME` 定数（0 時起点のマイクロ秒。Issue #1570）。
+    Time(i64),
     /// nullable `DATE` 列の参照。`index` は `TextColumnRef` と同じ論理列
     /// インデックス系列（`schema.columns` 添字）。値は行スカラー値
     /// （[`eval_with_scalars`] の `row_scalars`）から解決する。
@@ -491,6 +496,10 @@ pub enum BoundExpr {
     },
     /// nullable `TIMESTAMP` 列の参照（[`BoundExpr::DateColumnRef`] 参照）。
     TimestampColumnRef {
+        index: usize,
+    },
+    /// nullable `TIME` 列の参照（[`BoundExpr::DateColumnRef`] 参照。Issue #1570）。
+    TimeColumnRef {
         index: usize,
     },
     /// nullable な数値列（INTEGER/BIGINT/REAL/DOUBLE）の参照（Issue #1075・
@@ -657,6 +666,10 @@ impl PartialEq for BoundExpr {
             }
             (BoundExpr::Date(a), BoundExpr::Date(b)) => a == b,
             (BoundExpr::Timestamp(a), BoundExpr::Timestamp(b)) => a == b,
+            (BoundExpr::Time(a), BoundExpr::Time(b)) => a == b,
+            (BoundExpr::TimeColumnRef { index: a }, BoundExpr::TimeColumnRef { index: b }) => {
+                a == b
+            }
             (BoundExpr::DateColumnRef { index: a }, BoundExpr::DateColumnRef { index: b }) => {
                 a == b
             }
@@ -773,6 +786,8 @@ pub enum ExprType {
     Date,
     /// `TIMESTAMP` 値（[`ExprType::Date`] 参照）。
     Timestamp,
+    /// `TIME` 値（0 時起点のマイクロ秒。Issue #1570）。
+    Time,
     /// jsonb 値（Issue #1596・TABLE-25）。消費できるのは投影・比較・ORDER BY・JSON 演算子の
     /// オペランド・jsonb 関数（Issue #1599）の引数だけで、算術・集計・関数引数・`CASE` 等・代入は `0A000` で拒否する（Issue #1597）。
     Json,
@@ -799,6 +814,8 @@ pub enum ExprValue<'a> {
     Date(i32),
     /// `TIMESTAMP` 値（マイクロ秒。[`ExprValue::Date`] 参照）。
     Timestamp(i64),
+    /// `TIME` 値（0 時起点のマイクロ秒。`0..=86_400_000_000`。Issue #1570）。
+    Time(i64),
     /// jsonb 値の正規化テキスト（Issue #1596・TABLE-25。`write_canonical` 済み）。
     /// 列参照は借用、パス演算子の結果は所有。
     Json(Cow<'a, str>),
@@ -891,6 +908,10 @@ pub enum BuiltinFn {
     /// src)`（対象ビヘイビア: SQL-26。Issue #920）。`field` は束縛時に解決済み
     /// （`bind_call` 参照。実行時の引数は `src` 1 個のみ）。
     DatePart(DatePartField),
+    /// `date_part(field: Text, src: Time) -> Scalar`／`EXTRACT(field FROM time)`（Issue #1570）。
+    /// `date_part` は暦計算で `24:00:00` が日付境界へ折り返すため別 variant にする。`field` は
+    /// 束縛時に `datetime_fn::time_supports_field` で検証済み。
+    TimePart(DatePartField),
     /// `date_trunc(unit: Text, src: Timestamp) -> Timestamp`（`field` と同じく
     /// `unit` は束縛時に解決済み）。
     DateTrunc(DateTruncUnit),
@@ -1008,7 +1029,8 @@ pub(crate) fn first_non_builtin_call_with(expr: &Expr, allow_current_time: bool)
         | Expr::String(_)
         | Expr::Null
         | Expr::DateLiteral(_)
-        | Expr::TimestampLiteral(_) => None,
+        | Expr::TimestampLiteral(_)
+        | Expr::TimeLiteral(_) => None,
         Expr::Call { name, args } => {
             if !is_builtin_function_name(name)
                 || (!allow_current_time && is_current_time_function_name(name))
@@ -1132,6 +1154,7 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         // `BuiltinFn` のペイロードとして束縛時に解決済みのため実行時引数には
         // 含まれない（§2-4）。
         BuiltinFn::DatePart(_) => (&[ExprType::Timestamp], ExprType::Scalar),
+        BuiltinFn::TimePart(_) => (&[ExprType::Time], ExprType::Scalar),
         BuiltinFn::DateTrunc(_) => (&[ExprType::Timestamp], ExprType::Timestamp),
         BuiltinFn::DateToTimestamp => (&[ExprType::Date], ExprType::Timestamp),
         BuiltinFn::BpcharToText => (&[ExprType::Text], ExprType::Text),
@@ -1182,6 +1205,7 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         // 実行時に評価される。対象外事項として `docs/design/
         // datetime-scalar-functions.md` に記録）。
         BuiltinFn::DatePart(_)
+        | BuiltinFn::TimePart(_)
         | BuiltinFn::DateTrunc(_)
         | BuiltinFn::DateToTimestamp
         | BuiltinFn::BpcharToText => false,
@@ -1580,7 +1604,7 @@ fn validate_closed_expr(
             validate_closed_expr(lhs, params, registry, node_budget)?;
             validate_closed_expr(rhs, params, registry, node_budget)
         }
-        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => Ok(()),
+        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) | Expr::TimeLiteral(_) => Ok(()),
         // 時刻の値関数は呼び出し側の文脈（読み取り文）の時刻へ展開時に束縛される。
         Expr::ValueFunction { .. } => Ok(()),
     }
@@ -1637,8 +1661,10 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::TextColumnRef { .. }
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
+        | BoundExpr::Time(_)
         | BoundExpr::DateColumnRef { .. }
         | BoundExpr::TimestampColumnRef { .. }
+        | BoundExpr::TimeColumnRef { .. }
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
@@ -1706,8 +1732,10 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::TextColumnRef { .. }
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
+        | BoundExpr::Time(_)
         | BoundExpr::DateColumnRef { .. }
         | BoundExpr::TimestampColumnRef { .. }
+        | BoundExpr::TimeColumnRef { .. }
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
@@ -1770,8 +1798,10 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         | BoundExpr::TextColumnRef { .. }
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
+        | BoundExpr::Time(_)
         | BoundExpr::DateColumnRef { .. }
         | BoundExpr::TimestampColumnRef { .. }
+        | BoundExpr::TimeColumnRef { .. }
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
@@ -1818,6 +1848,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         BoundExpr::TextColumnRef { index }
         | BoundExpr::DateColumnRef { index }
         | BoundExpr::TimestampColumnRef { index }
+        | BoundExpr::TimeColumnRef { index }
         | BoundExpr::JsonbColumnRef { index }
         | BoundExpr::ColumnRef { index } => visit(*index),
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
@@ -1842,6 +1873,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::Text(_)
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
+        | BoundExpr::Time(_)
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
@@ -1898,6 +1930,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         BoundExpr::TextColumnRef { index }
         | BoundExpr::DateColumnRef { index }
         | BoundExpr::TimestampColumnRef { index }
+        | BoundExpr::TimeColumnRef { index }
         | BoundExpr::JsonbColumnRef { index }
         | BoundExpr::ColumnRef { index } => {
             if let Some(slot) = mask.get_mut(*index) {
@@ -1909,6 +1942,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::Text(_)
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
+        | BoundExpr::Time(_)
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
@@ -2173,6 +2207,7 @@ pub(crate) fn column_type_for_expr_type(ty: ExprType) -> Option<ColumnType> {
         ExprType::Text => Some(ColumnType::Text),
         ExprType::Date => Some(ColumnType::Date),
         ExprType::Timestamp => Some(ColumnType::Timestamp),
+        ExprType::Time => Some(ColumnType::Time),
         ExprType::Json => Some(ColumnType::Jsonb),
         ExprType::Vector => None,
     }
@@ -2407,10 +2442,15 @@ fn bind_nullif(
         for t in [lhs_t, rhs_t].into_iter().flatten() {
             if !matches!(
                 t,
-                ExprType::Scalar | ExprType::Text | ExprType::Date | ExprType::Timestamp
+                ExprType::Scalar
+                    | ExprType::Text
+                    | ExprType::Date
+                    | ExprType::Timestamp
+                    | ExprType::Time
             ) {
                 return Err(SqlSurfaceError::DatatypeMismatch {
-                    detail: "NULLIF arguments must be scalar, text, date, or timestamp".to_string(),
+                    detail: "NULLIF arguments must be scalar, text, date, timestamp, or time"
+                        .to_string(),
                 });
             }
         }
@@ -2622,10 +2662,9 @@ fn bind_expr_any(
                         BoundExpr::TimestampColumnRef { index },
                         ExprType::Timestamp,
                     )),
-                    // `TIME` 列の式内参照は #1570 で解禁する（Issue #1569。fail-closed）。
-                    ColumnType::Time => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} cannot be used in an expression (TIME columns are not supported)"
-                    ))),
+                    // `TIME` 列の式内参照（Issue #1570。EXTRACT／date_part・比較の前提）。
+                    // 値は行スカラービューから解決し、実 NULL は `ExprValue::Null` として伝播する。
+                    ColumnType::Time => Ok((BoundExpr::TimeColumnRef { index }, ExprType::Time)),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (ARRAY columns are not supported)"
                     ))),
@@ -2767,6 +2806,7 @@ fn bind_expr_any(
         // 値を保持しているため、束縛段では単に値を引き継ぐだけでよい。
         Expr::DateLiteral(days) => Ok((BoundExpr::Date(*days), ExprType::Date)),
         Expr::TimestampLiteral(micros) => Ok((BoundExpr::Timestamp(*micros), ExprType::Timestamp)),
+        Expr::TimeLiteral(micros) => Ok((BoundExpr::Time(*micros), ExprType::Time)),
         Expr::JsonAccess { op, lhs, rhs } => bind_json_access(*op, lhs, rhs, env, node_budget),
         Expr::ValueFunction { kind, precision } => bind_value_function(*kind, *precision, env),
     }
@@ -3609,6 +3649,19 @@ fn bind_unknown_literal_against(
     if other_ty == ExprType::Json {
         return bind_jsonb_literal(s);
     }
+    // `TIME` 式と比較される型なし文字列リテラルは TIME として解析する（PostgreSQL と同じ
+    // 解決。Issue #1570）。エラーにリテラル本文は含めない（`bind_datetime_literal` と同じ写像）。
+    if other_ty == ExprType::Time {
+        return match crate::datetime::parse_time(s) {
+            Ok(micros) => Ok((BoundExpr::Time(micros), ExprType::Time)),
+            Err(crate::datetime::DateTimeLiteralError::Format(_)) => Err(
+                SqlSurfaceError::invalid_datetime_format("invalid input syntax for type time"),
+            ),
+            Err(crate::datetime::DateTimeLiteralError::Overflow(_)) => Err(
+                SqlSurfaceError::datetime_field_overflow("time field value out of range"),
+            ),
+        };
+    }
     if other_ty != ExprType::Scalar {
         // 相手が `CHAR(n)` 列参照（`BpcharToText`）なら、型なし文字列リテラルは bpchar として
         // 解決され末尾の半角空白が比較に影響しない（TABLE-31・Issue #1566）。
@@ -3923,6 +3976,9 @@ fn bind_binary(
             (ExprType::Date, ExprType::Date) | (ExprType::Timestamp, ExprType::Timestamp) => {
                 Ok((mk(op, l, r), ExprType::Bool))
             }
+            // `TIME` 同士の比較（0 時起点のマイクロ秒の全順序。Issue #1570）。PostgreSQL に
+            // `TIME`⋈`TIMESTAMP`／`DATE` の暗黙変換は無いため、混在は下の腕で `42883`。
+            (ExprType::Time, ExprType::Time) => Ok((mk(op, l, r), ExprType::Bool)),
             // `DATE` ⋈ `TIMESTAMP` は `DATE` 側を深夜 0 時の `TIMESTAMP` へ
             // 暗黙昇格してから比較する（PostgreSQL 互換。§2-3）。
             (ExprType::Date, ExprType::Timestamp) => {
@@ -3937,7 +3993,7 @@ fn bind_binary(
             // Issue #1408・SQL-24・ERR-2: 比較演算子が存在しない型の組（PostgreSQL の
             // `operator does not exist`）は `42883`（従来は `42804`）。算術腕は据え置き。
             _ => Err(SqlSurfaceError::undefined_function(
-                "operator does not exist: comparison operands must be both scalar, both text, both date/timestamp, or both jsonb",
+                "operator does not exist: comparison operands must be both scalar, both text, both date/timestamp, both time, or both jsonb",
             )),
         },
     }
@@ -4321,6 +4377,34 @@ fn bind_date_part_or_trunc(
         }
     };
     let (src_bound, src_ty) = bind_null_aware(src_arg, env, node_budget)?;
+    // `TIME` 入力（Issue #1570）。`date_part` は時刻成分と `epoch` だけを `TimePart` で受理し、
+    // 日付由来の field は PostgreSQL と同じく `0A000`（束縛時に拒否して行ごとの評価へ持ち込まない）。
+    // `date_trunc(text, time)` は PostgreSQL に存在しないため `42883`。
+    if src_ty == Some(ExprType::Time) {
+        if lower_name != "date_part" {
+            return Err(SqlSurfaceError::undefined_function(
+                "function date_trunc(text, time) does not exist",
+            ));
+        }
+        let Some(field_name) = field_name else {
+            return Ok((BoundExpr::Null, result_ty));
+        };
+        let field = DatePartField::from_name(&field_name).ok_or_else(|| {
+            SqlSurfaceError::invalid_input(format!("unknown date_part field: {field_name}"))
+        })?;
+        if !datetime_fn::time_supports_field(field) {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: format!("date_part unit {field_name:?} is not supported for type time"),
+            });
+        }
+        return Ok((
+            BoundExpr::Builtin {
+                f: BuiltinFn::TimePart(field),
+                args: vec![src_bound],
+            },
+            result_ty,
+        ));
+    }
     let src = match src_ty {
         Some(ExprType::Timestamp) => src_bound,
         Some(ExprType::Date) => wrap_date_to_timestamp(src_bound),
@@ -4725,6 +4809,7 @@ fn json_value_from_expr_value(
         ExprValue::Text(t) => JsonValue::String(t.to_string()),
         ExprValue::Date(d) => crate::json::json_value_from_date(*d),
         ExprValue::Timestamp(t) => crate::json::json_value_from_timestamp(*t),
+        ExprValue::Time(t) => JsonValue::String(crate::datetime::format_time(*t)),
         ExprValue::Json(j) => crate::json::parse_jsonb_for_build(j).map_err(json_build_error)?,
         ExprValue::Vector(_) => {
             return Err(SqlSurfaceError::FeatureNotSupported {
@@ -4746,6 +4831,7 @@ fn json_object_key(v: &ExprValue<'_>) -> Result<String, SqlSurfaceError> {
         ExprValue::Scalar(n) => Ok(crate::json::json_number_key_text(*n)),
         ExprValue::Date(d) => Ok(crate::datetime::format_date(*d)),
         ExprValue::Timestamp(t) => Ok(crate::json::json_timestamp_text(*t)),
+        ExprValue::Time(t) => Ok(crate::datetime::format_time(*t)),
         ExprValue::Json(_) | ExprValue::Vector(_) => Err(SqlSurfaceError::InvalidParameterValue {
             detail: "key value must be scalar, not array, composite, or json",
         }),
@@ -4959,6 +5045,7 @@ pub(crate) fn eval_with_scalars<'a>(
         BoundExpr::Text(s) => Ok(ExprValue::Text(Cow::Owned(s.clone()))),
         BoundExpr::Date(d) => Ok(ExprValue::Date(*d)),
         BoundExpr::Timestamp(t) => Ok(ExprValue::Timestamp(*t)),
+        BoundExpr::Time(t) => Ok(ExprValue::Time(*t)),
         BoundExpr::TextColumnRef { index } => match row_scalars.get(*index) {
             None => Err(SqlSurfaceError::Internal {
                 detail: "TEXT column reference is outside the decoded row scalar view".to_string(),
@@ -4992,6 +5079,16 @@ pub(crate) fn eval_with_scalars<'a>(
             Some(Some(_)) => Err(SqlSurfaceError::Internal {
                 detail: "TIMESTAMP column reference resolved to a non-TIMESTAMP row scalar value"
                     .to_string(),
+            }),
+        },
+        BoundExpr::TimeColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "TIME column reference is outside the decoded row scalar view".to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Time(t))) => Ok(ExprValue::Time(*t)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "TIME column reference resolved to a non-TIME row scalar value".to_string(),
             }),
         },
         BoundExpr::ColumnRef { index } => match row_scalars.get(*index) {
@@ -5203,6 +5300,13 @@ pub(crate) fn eval_nullif<'a>(
                 Ok(ExprValue::Null)
             } else {
                 Ok(ExprValue::Timestamp(a))
+            }
+        }
+        (ExprValue::Time(a), ExprValue::Time(b)) => {
+            if a == b {
+                Ok(ExprValue::Null)
+            } else {
+                Ok(ExprValue::Time(a))
             }
         }
         _ => Err(SqlSurfaceError::Internal {
@@ -5425,6 +5529,13 @@ pub(crate) fn apply_builtin<'a>(
             let t = take_timestamp_arg(args, 0)?;
             finite_scalar(datetime_fn::date_part(field, t), "date_part")
         }
+        BuiltinFn::TimePart(field) => {
+            let t = take_time_arg(args, 0)?;
+            let v = datetime_fn::time_part(field, t).ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "date_part field is not supported for TIME at evaluation time".to_string(),
+            })?;
+            finite_scalar(v, "date_part")
+        }
         BuiltinFn::DateTrunc(unit) => {
             let t = take_timestamp_arg(args, 0)?;
             datetime_fn::date_trunc(unit, t).map(ExprValue::Timestamp)
@@ -5616,6 +5727,19 @@ fn take_date_arg(args: &mut [Option<ExprValue<'_>>], idx: usize) -> Result<i32, 
     }
 }
 
+/// `args[idx]` を `Time` として取り出す（[`take_date_arg`] 参照。Issue #1570）。
+fn take_time_arg(args: &mut [Option<ExprValue<'_>>], idx: usize) -> Result<i64, SqlSurfaceError> {
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::Time(t)) => Ok(t),
+        Some(_) => Err(SqlSurfaceError::Internal {
+            detail: "function argument type mismatch at evaluation time".to_string(),
+        }),
+        None => Err(SqlSurfaceError::Internal {
+            detail: "missing function argument at evaluation time".to_string(),
+        }),
+    }
+}
+
 /// `args[idx]` を `Timestamp` として取り出す（[`take_date_arg`] 参照）。
 fn take_timestamp_arg(
     args: &mut [Option<ExprValue<'_>>],
@@ -5739,6 +5863,7 @@ pub(crate) fn eval_binary<'a>(
             (ExprValue::Timestamp(a), ExprValue::Timestamp(b)) => {
                 Ok(ExprValue::Bool(compare(op, a, b)?))
             }
+            (ExprValue::Time(a), ExprValue::Time(b)) => Ok(ExprValue::Bool(compare(op, a, b)?)),
             // Issue #1597・TABLE-25: jsonb 同士の比較。両辺をバイト比較可能なソートキーへ
             // 変換して比較する（格納値が壊れていれば誤順序へ縮退せず fail-closed）。
             (ExprValue::Json(a), ExprValue::Json(b)) => {

@@ -6055,10 +6055,12 @@ impl<'a> Parser<'a> {
             // 保持しない）。
             Some(Token::Ident(name))
                 if (name.eq_ignore_ascii_case("DATE")
-                    || name.eq_ignore_ascii_case("TIMESTAMP"))
+                    || name.eq_ignore_ascii_case("TIMESTAMP")
+                    || name.eq_ignore_ascii_case("TIME"))
                     && matches!(self.tokens.get(self.pos + 1), Some(Token::StringLiteral(_))) =>
             {
                 let is_date = name.eq_ignore_ascii_case("DATE");
+                let is_time = name.eq_ignore_ascii_case("TIME");
                 self.advance();
                 let literal = match self.advance() {
                     Some(Token::StringLiteral(s)) => s.clone(),
@@ -6069,7 +6071,19 @@ impl<'a> Parser<'a> {
                     }
                 };
                 self.consume_expr_node()?;
-                if is_date {
+                if is_time {
+                    // `TIME '<literal>'`（Issue #1570）。列名 `time` は直後が文字列
+                    // リテラルのときだけ型付きリテラルとして扱うため壊れない。
+                    match crate::datetime::parse_time(&literal) {
+                        Ok(micros) => Ok(Expr::TimeLiteral(micros)),
+                        Err(DateTimeLiteralError::Format(detail)) => {
+                            Err(SqlSurfaceError::invalid_datetime_format(detail))
+                        }
+                        Err(DateTimeLiteralError::Overflow(detail)) => {
+                            Err(SqlSurfaceError::datetime_field_overflow(detail))
+                        }
+                    }
+                } else if is_date {
                     match crate::datetime::parse_date(&literal) {
                         Ok(days) => Ok(Expr::DateLiteral(days)),
                         Err(DateTimeLiteralError::Format(detail)) => {
@@ -11805,7 +11819,8 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         | Expr::Ident(_)
         | Expr::Null
         | Expr::DateLiteral(_)
-        | Expr::TimestampLiteral(_) => false,
+        | Expr::TimestampLiteral(_)
+        | Expr::TimeLiteral(_) => false,
         // 括弧なし値関数（Issue #1586）は関数呼び出しと同様に従来形では書けない式。
         Expr::ValueFunction { .. } => true,
     }

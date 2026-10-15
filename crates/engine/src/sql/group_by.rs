@@ -1252,6 +1252,7 @@ fn cmp_cell_values(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         (Cell::SignedInteger(x), Cell::SignedInteger(y)) => x.cmp(y),
         (Cell::Date(x), Cell::Date(y)) => x.cmp(y),
         (Cell::Timestamp(x), Cell::Timestamp(y)) => x.cmp(y),
+        (Cell::Time(x), Cell::Time(y)) => x.cmp(y),
         // `NUMERIC` は同一列由来なら常に同じ scale を持つ（`Accumulator`
         // 各 variant が列の scale をそのまま保持する契約）。scale が一致しない
         // 組み合わせは到達しない想定の防御的フォールバックとして Equal を返す
@@ -2222,6 +2223,7 @@ fn expr_value_to_cell(
         ExprValue::Text(t) => Cell::Text(t.into_owned()),
         ExprValue::Date(d) => Cell::Date(d),
         ExprValue::Timestamp(t) => Cell::Timestamp(t),
+        ExprValue::Time(t) => Cell::Time(t),
         ExprValue::Null => Cell::Null,
         ExprValue::Json(_) => {
             return Err(accumulator_bug(
@@ -2604,8 +2606,8 @@ pub(crate) fn cell_to_scalar_ref(
         Cell::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
         Cell::Numeric(d) => Some(row_codec::ScalarRef::Numeric(*d)),
         Cell::Uuid(u) => Some(row_codec::ScalarRef::Uuid(*u)),
-        // `TIME` セルの式利用は #1570 で解禁する（Issue #1569。fail-closed）。
-        Cell::Vector(_) | Cell::Array(_) | Cell::Bytes(_) | Cell::Json(_) | Cell::Time(_) => {
+        Cell::Time(t) => Some(row_codec::ScalarRef::Time(*t)),
+        Cell::Vector(_) | Cell::Array(_) | Cell::Bytes(_) | Cell::Json(_) => {
             return Err(accumulator_bug(
                 "group row cell type is not usable in an expression",
             ))

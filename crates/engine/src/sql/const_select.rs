@@ -139,6 +139,7 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
+        | Expr::TimeLiteral(_)
         | Expr::ValueFunction { .. } => Ok(()),
         Expr::Ident(n) if allow_placeholders && aggregate_placeholder_index(n).is_some() => Ok(()),
         Expr::Ident(_) => Err(SqlSurfaceError::ColumnReferenceWithoutFrom),
@@ -410,6 +411,7 @@ fn expr_value_to_cell(v: ExprValue<'_>, ty: Option<&ColumnType>) -> Result<Cell,
         ExprValue::Text(t) => Cell::Text(t.into_owned()),
         ExprValue::Date(d) => Cell::Date(d),
         ExprValue::Timestamp(t) => Cell::Timestamp(t),
+        ExprValue::Time(t) => Cell::Time(t),
         ExprValue::Null => Cell::Null,
         ExprValue::Vector(v) => Cell::Vector(into_owned_vector(v)?),
         ExprValue::Json(j) => Cell::Json(j.into_owned()),

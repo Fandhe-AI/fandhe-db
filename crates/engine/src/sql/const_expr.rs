@@ -145,7 +145,8 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::String(_)
         | Expr::Null
         | Expr::DateLiteral(_)
-        | Expr::TimestampLiteral(_) => Ok(()),
+        | Expr::TimestampLiteral(_)
+        | Expr::TimeLiteral(_) => Ok(()),
         Expr::Ident(name) => {
             if VALUE_FUNCTION_NAMES
                 .iter()
@@ -218,6 +219,7 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::Ident(_)
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
+        | Expr::TimeLiteral(_)
         | Expr::ValueFunction { .. } => Ok(()),
         Expr::Call { args, .. } => {
             args.iter().try_for_each(check_intermediate_precision)?;
@@ -307,6 +309,7 @@ fn typed_null(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
         ExprType::Text => twin(Expr::String(String::new())),
         ExprType::Date => twin(Expr::DateLiteral(0)),
         ExprType::Timestamp => twin(Expr::TimestampLiteral(0)),
+        ExprType::Time => twin(Expr::TimeLiteral(0)),
         ExprType::Json => {
             return Err(SqlSurfaceError::unsupported(
                 "a jsonb value is not allowed in a constant expression",
@@ -345,6 +348,7 @@ fn null_kind(e: &Expr) -> Option<Option<ExprType>> {
             Expr::String(s) if s.is_empty() => Some(Some(ExprType::Text)),
             Expr::DateLiteral(0) => Some(Some(ExprType::Date)),
             Expr::TimestampLiteral(0) => Some(Some(ExprType::Timestamp)),
+            Expr::TimeLiteral(0) => Some(Some(ExprType::Time)),
             _ => None,
         },
         Expr::Case { whens, else_result } if else_result.is_none() && whens.len() == 1 => {
@@ -360,11 +364,12 @@ fn null_kind(e: &Expr) -> Option<Option<ExprType>> {
 
 /// `NULL` オペランドの型候補（`NULL` 側の位置に置いて束縛を試す順序。算術で曖昧な
 /// `NULL + 1` は PostgreSQL と同様に Scalar を優先する）。
-const NULL_OPERAND_CANDIDATES: [ExprType; 4] = [
+const NULL_OPERAND_CANDIDATES: [ExprType; 5] = [
     ExprType::Scalar,
     ExprType::Text,
     ExprType::Date,
     ExprType::Timestamp,
+    ExprType::Time,
 ];
 
 /// 関数呼び出しの `NULL` 引数に対する型候補の組み合わせ試行回数の上限（DoS 防止）。
@@ -575,6 +580,7 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         ExprValue::Null => Ok(InsertLiteral::Null),
         ExprValue::Date(d) => Ok(InsertLiteral::String(crate::datetime::format_date(d))),
         ExprValue::Timestamp(t) => Ok(InsertLiteral::String(crate::datetime::format_timestamp(t))),
+        ExprValue::Time(t) => Ok(InsertLiteral::String(crate::datetime::format_time(t))),
         ExprValue::Vector(_) => Err(SqlSurfaceError::Internal {
             detail: "constant expression produced a vector".to_string(),
         }),

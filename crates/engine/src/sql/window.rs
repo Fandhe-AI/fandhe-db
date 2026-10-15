@@ -188,6 +188,7 @@ enum WindowKeyValue {
     Boolean(bool),
     Date(i32),
     Timestamp(i64),
+    Time(i64),
     Numeric(crate::numeric::Decimal),
     Uuid(crate::uuid::Uuid),
 }
@@ -210,6 +211,7 @@ enum WindowInputValue {
     Double(Option<f64>),
     Date(Option<i32>),
     Timestamp(Option<i64>),
+    Time(Option<i64>),
     Numeric(Option<crate::numeric::Decimal>),
     /// `BOOLEAN`／`ARRAY`／`BYTEA`／`JSON`／`JSONB`／`ENUM`／`UUID` 列の裸参照
     /// （いずれも `COUNT` 限定。`Accumulator::observe` はこれらの型で値の中身を
@@ -889,6 +891,7 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
                 | AggregateInput::BooleanColumn(index)
                 | AggregateInput::DateColumn(index)
                 | AggregateInput::TimestampColumn(index)
+                | AggregateInput::TimeColumn(index)
                 | AggregateInput::ArrayColumn(index)
                 | AggregateInput::ByteaColumn(index)
                 | AggregateInput::JsonColumn(index)
@@ -983,6 +986,11 @@ fn extract_window_key(
             }
         },
         (WindowKeyKind::Timestamp, None) => None,
+        (WindowKeyKind::Time, Some(v)) => match v.as_time() {
+            Some(t) => Some(WindowKeyValue::Time(t)),
+            None => return Err(window_bug("TIME key scan yielded a non-Time scalar value")),
+        },
+        (WindowKeyKind::Time, None) => None,
         (WindowKeyKind::Numeric, Some(v)) => match v.as_numeric() {
             Some(d) => Some(WindowKeyValue::Numeric(d)),
             None => {
@@ -1057,6 +1065,14 @@ fn extract_window_input(
             })?)),
             None => WindowInputValue::Timestamp(None),
         },
+        AggregateInput::TimeColumn(index) => {
+            match scanned.get(*index).copied().flatten() {
+                Some(v) => WindowInputValue::Time(Some(v.as_time().ok_or_else(|| {
+                    window_bug("TIME input scan yielded a non-Time scalar value")
+                })?)),
+                None => WindowInputValue::Time(None),
+            }
+        }
         AggregateInput::NumericColumn { index, .. } => match scanned.get(*index).copied().flatten()
         {
             Some(v) => WindowInputValue::Numeric(Some(v.as_numeric().ok_or_else(|| {
@@ -1159,6 +1175,10 @@ fn partition_key_bytes(keys: &[Option<WindowKeyValue>]) -> Vec<u8> {
                 out.push(9);
                 out.extend_from_slice(&v.to_be_bytes());
             }
+            Some(WindowKeyValue::Time(v)) => {
+                out.push(13);
+                out.extend_from_slice(&v.to_be_bytes());
+            }
             Some(WindowKeyValue::Numeric(d)) => {
                 out.push(10);
                 out.extend_from_slice(&d.unscaled().to_be_bytes());
@@ -1224,6 +1244,7 @@ fn cmp_window_key_value(a: &WindowKeyValue, b: &WindowKeyValue) -> std::cmp::Ord
         (WindowKeyValue::Boolean(x), WindowKeyValue::Boolean(y)) => x.cmp(y),
         (WindowKeyValue::Date(x), WindowKeyValue::Date(y)) => x.cmp(y),
         (WindowKeyValue::Timestamp(x), WindowKeyValue::Timestamp(y)) => x.cmp(y),
+        (WindowKeyValue::Time(x), WindowKeyValue::Time(y)) => x.cmp(y),
         (WindowKeyValue::Numeric(x), WindowKeyValue::Numeric(y)) => crate::numeric::cmp_exact(x, y),
         (WindowKeyValue::Uuid(x), WindowKeyValue::Uuid(y)) => x.as_bytes().cmp(y.as_bytes()),
         _ => Ordering::Equal,
@@ -1556,6 +1577,10 @@ fn observe_window_row(
         }
         (AggregateInput::TimestampColumn(index), WindowInputValue::Timestamp(v)) => {
             let scanned = build_scanned(*index, v.map(row_codec::ScalarRef::Timestamp));
+            acc.observe(input, id, &no_vector, &scanned, scratch)
+        }
+        (AggregateInput::TimeColumn(index), WindowInputValue::Time(v)) => {
+            let scanned = build_scanned(*index, v.map(row_codec::ScalarRef::Time));
             acc.observe(input, id, &no_vector, &scanned, scratch)
         }
         (AggregateInput::NumericColumn { index, .. }, WindowInputValue::Numeric(v)) => {

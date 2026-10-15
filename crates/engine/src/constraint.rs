@@ -916,7 +916,7 @@ pub(crate) fn push_canonical_component(
             ColumnType::Timestamp.unique_key_tag(),
             &t.to_be_bytes(),
         ),
-        // TIME は PK／UNIQUE 非許可（Issue #1569。#1570 で解禁）。到達しない契約の腕で、
+        // TIME は PK／UNIQUE 非許可（Issue #1569。担当 Issue 未定の fail-closed）。到達しない契約の腕で、
         // 到達した場合は fail-closed に拒否する。
         ScalarRef::Time(_) => return Err("unique key column does not support TIME"),
         ScalarRef::Bytes(b) => push_len_prefixed(out, ColumnType::Bytea.unique_key_tag(), b),

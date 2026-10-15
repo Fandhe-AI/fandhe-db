@@ -173,3 +173,7 @@ is_not_masked_out` で分岐内参照のみの回帰を固定する）。
 - NoSQL（HTTP）表層での日時関数対応。
 - `DATE`／`TIMESTAMP` 列型の `CREATE TABLE` SQL DDL 経由の宣言（現状は
   Rust API 経由のみ。既存の Issue #884 のスコープ外事項がそのまま残る）。
+
+## Issue #1570 追記: TIME 入力
+
+`date_part`／`EXTRACT` は `TIME` 入力を `BuiltinFn::TimePart`（`datetime_fn::time_part`）で受理する。受理 field は `hour`・`minute`・`second`・`milliseconds`・`microseconds`・`epoch`。`24:00:00` は hour=24・minute=0・second=0・epoch=86400。日付由来の field（`year`・`month`・`day`・`dow`・`doy`・`week` 等）は束縛時に `0A000`、`date_trunc(text, time)` は `42883`、未知の field は従来どおり `22000`。NULL の strict 伝播は DATE／TIMESTAMP と同じ。

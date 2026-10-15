@@ -574,6 +574,28 @@ impl<'a> ScalarRef<'a> {
         }
     }
 
+    /// `TIME` 列の内部表現（0 時起点のマイクロ秒。`0..=86_400_000_000`）。
+    /// `Time` 以外は `None`（同上、fail-closed。Issue #1570）。
+    pub fn as_time(&self) -> Option<i64> {
+        match self {
+            ScalarRef::Time(t) => Some(*t),
+            ScalarRef::Text(_)
+            | ScalarRef::Integer(_)
+            | ScalarRef::BigInt(_)
+            | ScalarRef::Real(_)
+            | ScalarRef::Double(_)
+            | ScalarRef::Bool(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Enum(_)
+            | ScalarRef::Numeric(_)
+            | ScalarRef::Uuid(_) => None,
+        }
+    }
+
     /// NUMERIC 前提の消費側（TABLE-13〔検討中〕・TASK-197、Issue #885）が
     /// `Text`/`Integer`/`BigInt`/`Bool`/`Array`/`Bytes`/`Json`/`Enum` を
     /// 取り違えないよう、`Numeric` 以外は `None` を返す（fail-closed。

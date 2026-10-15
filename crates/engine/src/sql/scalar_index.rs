@@ -540,6 +540,15 @@ fn push_typed_value(accum: &mut OrderedColumnIndex, value: &ScalarRef<'_>, slot:
             acc.push((*v, slot));
             true
         }
+        // `TIME` は 0 時起点のマイクロ秒（`0..=86_400_000_000`）で `2^53` より遥かに
+        // 小さいが、範囲外の値は防御的に「索引対象外」へ縮退する（Issue #1570）。
+        (OrderedColumnIndex::I64(acc), ScalarRef::Time(v)) => {
+            if !(0..=crate::datetime::MICROS_PER_DAY).contains(v) {
+                return false;
+            }
+            acc.push((*v, slot));
+            true
+        }
         (OrderedColumnIndex::F64Sortable(acc), ScalarRef::Real(v)) => {
             let widened = normalize_zero(f64::from(*v));
             if !widened.is_finite() {
@@ -1047,7 +1056,7 @@ impl ScalarIndex {
                     per_column_typed.push(None);
                     deferred_lane_a.push((col_index, false));
                 }
-                // `DATE`／`TIMESTAMP` 列（レーン B:
+                // `DATE`／`TIMESTAMP`／`TIME` 列（レーン B:
                 // `declarative_filter::FilterOp::TypedCompare`。Issue #891・
                 // TASK-199 で production 結線済み）は `i64` へ昇格した
                 // 順序索引（`OrderedColumnIndex::I64`。Issue #893）で扱い、
@@ -1055,7 +1064,7 @@ impl ScalarIndex {
                 // `TIMESTAMP` は行走査中に `2^53` を超える値が 1 件でも見つかった
                 // 時点で列単位に `None` へ縮退する（モジュールドキュメント
                 // 「`MAX_EXACT_TYPED_I64_ABS`」参照）。
-                ColumnType::Date | ColumnType::Timestamp => {
+                ColumnType::Date | ColumnType::Timestamp | ColumnType::Time => {
                     per_column.push(None);
                     let entry_size = std::mem::size_of::<(i64, u32)>();
                     let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
@@ -1145,10 +1154,8 @@ impl ScalarIndex {
                 // 前方一致・範囲述語を持たないため同じく非索引化（判断根拠は
                 // `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
                 // `VECTOR` 列も従来どおり索引対象外。
-                // `TIME` 列も索引対象外（Issue #1569。#1570 で解禁する）。
                 ColumnType::Vector(_)
                 | ColumnType::Boolean
-                | ColumnType::Time
                 | ColumnType::Array(_)
                 | ColumnType::Json
                 | ColumnType::Jsonb => {
@@ -1806,6 +1813,10 @@ impl ScalarIndex {
                 range_slots(pairs, lower, upper)
             }
             (OrderedColumnIndex::I64(pairs), TypedLiteral::Timestamp(t)) => {
+                let (lower, upper) = exact_i64_bounds(op, *t);
+                range_slots(pairs, lower, upper)
+            }
+            (OrderedColumnIndex::I64(pairs), TypedLiteral::Time(t)) => {
                 let (lower, upper) = exact_i64_bounds(op, *t);
                 range_slots(pairs, lower, upper)
             }

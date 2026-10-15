@@ -270,13 +270,6 @@ fn check_branch_type_compatibility(
             )));
         }
     }
-    // `TIME` 列は演算種別・行数・値に依らず列型で拒否する（Issue #1569。#1570 で解禁まで
-    // fail-closed。`row_key` のセル値分岐だけでは UNION ALL・空入力・全 NULL が通るため）。
-    if columns_have_time(l_columns) || columns_have_time(r_columns) {
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "TIME columns are not supported in set operations yet".to_string(),
-        });
-    }
     let dedup_needed = !matches!(op, SetOperator::UnionAll);
     if dedup_needed && (l_has_vector || r_has_vector) {
         return Err(SqlSurfaceError::invalid_input(
@@ -284,15 +277,6 @@ fn check_branch_type_compatibility(
         ));
     }
     Ok(())
-}
-
-/// 列メタに `TIME` 型の列（`Scalar`／型確定済みの `Computed`）が含まれるか。
-fn columns_have_time(columns: &[ColumnMeta]) -> bool {
-    columns.iter().any(|c| match c {
-        ColumnMeta::Scalar { ty, .. } => matches!(ty, ColumnType::Time),
-        ColumnMeta::Computed { ty, .. } => matches!(ty, Some(ColumnType::Time)),
-        _ => false,
-    })
 }
 
 fn columns_have_vector(columns: &[ColumnMeta]) -> bool {
@@ -366,11 +350,10 @@ fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
                 out.push(5);
                 out.extend_from_slice(&v.to_be_bytes());
             }
-            // `TIME` の集合演算・重複除去は #1570 で解禁する（Issue #1569。fail-closed）。
-            Cell::Time(_) => {
-                return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "TIME columns are not supported in set operations yet".to_string(),
-                });
+            // `TIME`（Issue #1570）。0 時起点のマイクロ秒を型タグ 13 で単射に符号化する。
+            Cell::Time(t) => {
+                out.push(13);
+                out.extend_from_slice(&t.to_be_bytes());
             }
             Cell::Date(d) => {
                 out.push(6);
@@ -479,12 +462,8 @@ fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
                     .saturating_add(4)
                     .saturating_add(len_prefixed_total_len(payload_len)?)
             }
-            // `row_key` と同じ理由で拒否する（Issue #1569）。
-            Cell::Time(_) => {
-                return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "TIME columns are not supported in set operations yet".to_string(),
-                });
-            }
+            // 型タグ 1 byte ＋ `i64` の 8 byte（`row_key` の `Cell::Time`。Issue #1570）。
+            Cell::Time(_) => 1 + 8,
             // §2.2 の型検証で本来到達しない（`row_key` と同じ防御的拒否）。
             Cell::Vector(_) => {
                 return Err(SqlSurfaceError::Internal {
