@@ -166,14 +166,19 @@ pub(crate) fn serve_connection<H: RequestHandler>(
 /// `RejectWorkerLimiter` は本関数の呼び出し 1 回＝1 スレッドで既に有界化
 /// 済みのため、ハンドシェイク自体の絶対期限（`HANDSHAKE_READ_TIMEOUT`。
 /// `serve_tls_connection` と同じ）がそのままこの拒否ワーカーの専有時間の
-/// 上限になる。
+/// 上限になる（`read_timeout` は `--read-timeout-secs` 由来で、ハンドシェイク
+/// の絶対期限として渡す）。
 ///
 /// 先頭 1 バイトの `peek` には [`crate::limits::REJECT_TLS_PROBE_TIMEOUT`]
 /// を読み取りタイムアウトとして適用する（`RejectWorkerLimiter` の枠を
 /// 無期限に占有しない。`peek` が `Ok(0)`／`Err`（タイムアウト超過含む）の
 /// 場合は TLS ハンドシェイクをしていないクライアントへ応答を書く根拠が
 /// 無いため、`serve_connection` と同じく応答を書かずに閉じる）。
-pub(crate) fn reject_or_close_over_limit(stream: TcpStream, config: Arc<TlsServerConfig>) {
+pub(crate) fn reject_or_close_over_limit(
+    stream: TcpStream,
+    config: Arc<TlsServerConfig>,
+    read_timeout: Duration,
+) {
     if stream
         .set_read_timeout(Some(crate::limits::REJECT_TLS_PROBE_TIMEOUT))
         .is_err()
@@ -197,7 +202,9 @@ pub(crate) fn reject_or_close_over_limit(stream: TcpStream, config: Arc<TlsServe
             }
             Some(byte) => match classify_first_byte(*byte) {
                 FirstByte::Plain => conn::reject_too_many_connections(stream),
-                FirstByte::Tls => reject_over_limit_after_tls_handshake(stream, config),
+                FirstByte::Tls => {
+                    reject_over_limit_after_tls_handshake(stream, config, read_timeout)
+                }
             },
         },
     }
@@ -219,9 +226,19 @@ pub(crate) fn reject_or_close_over_limit(stream: TcpStream, config: Arc<TlsServe
 /// `LINGER_DRAIN_TIMEOUT` を大幅に超えて専有され続けうる（トリクル攻撃で
 /// 拒否ワーカーの有界性が崩れる。TLS-7 が検証する `DeadlineStream` の
 /// 契約と同じ理由）。
-fn reject_over_limit_after_tls_handshake(mut stream: TcpStream, config: Arc<TlsServerConfig>) {
-    let session = match crate::tls::server_handshake::perform_server_handshake(&mut stream, config)
-    {
+fn reject_over_limit_after_tls_handshake(
+    mut stream: TcpStream,
+    config: Arc<TlsServerConfig>,
+    read_timeout: Duration,
+) {
+    // ハンドシェイクの絶対期限は `--read-timeout-secs` 由来の `read_timeout` に
+    // 追従させる（固定 30s 定数に依存すると、短く設定しても拒否ワーカーの枠が
+    // 長く専有される。`serve_tls_connection` と同じ方針）。
+    let session = match crate::tls::server_handshake::perform_server_handshake_with_timeout(
+        &mut stream,
+        config,
+        read_timeout,
+    ) {
         Ok(session) => session,
         Err(_e) => return,
     };
@@ -257,8 +274,12 @@ fn serve_tls_connection<H: RequestHandler>(
         }
     };
 
-    let session = match crate::tls::server_handshake::perform_server_handshake(&mut stream, config)
-    {
+    // ハンドシェイクの絶対期限も `--read-timeout-secs` の設定値へ追従させる（Issue #2454）。
+    let session = match crate::tls::server_handshake::perform_server_handshake_with_timeout(
+        &mut stream,
+        config,
+        read_timeout,
+    ) {
         Ok(session) => session,
         Err(_e) => {
             // alert の送出・切断は driver 側が既に行っている

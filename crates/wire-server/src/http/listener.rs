@@ -238,7 +238,7 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
                     if let Err(e) = std::thread::Builder::new().spawn(move || {
                         let _reject_permit = reject_permit;
                         if let Some(config) = tls_config_for_reject {
-                            tls_transport::reject_or_close_over_limit(stream, config);
+                            tls_transport::reject_or_close_over_limit(stream, config, read_timeout);
                         } else {
                             conn::reject_too_many_connections(stream);
                         }

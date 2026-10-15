@@ -124,6 +124,7 @@ pub fn accept_loop_with_limiter(
         crate::tls_opt::TlsMode::Allow,
         limiter,
         read_timeout,
+        crate::limits::SessionLimits::default(),
     )
 }
 
@@ -147,6 +148,7 @@ pub fn accept_loop_with_engine(
         crate::tls_opt::TlsMode::Allow,
         limiter,
         read_timeout,
+        crate::limits::SessionLimits::default(),
     )
 }
 
@@ -195,9 +197,46 @@ pub fn accept_loop_with_tls_mode(
     limiter: ConnectionLimiter,
     read_timeout: Duration,
 ) {
-    accept_loop_inner(listener, store, engine, tls, mode, limiter, read_timeout)
+    accept_loop_inner(
+        listener,
+        store,
+        engine,
+        tls,
+        mode,
+        limiter,
+        read_timeout,
+        crate::limits::SessionLimits::default(),
+    )
 }
 
+/// 起動時 CLI（Issue #2454。`--max-prepared-statements`）で解決済みの
+/// [`crate::limits::SessionLimits`] を接続ごとのセッションへ注入する accept ループ。
+/// `main.rs` が SQL 表層で呼ぶ。既存の `accept_loop_with_*` は
+/// `SessionLimits::default()` でこの経路と同一動作になる。
+#[allow(clippy::too_many_arguments)]
+pub fn accept_loop_with_session_limits(
+    listener: TcpListener,
+    store: Arc<UserStore>,
+    engine: Option<Arc<EngineCore>>,
+    tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
+    mode: crate::tls_opt::TlsMode,
+    limiter: ConnectionLimiter,
+    read_timeout: Duration,
+    session_limits: crate::limits::SessionLimits,
+) {
+    accept_loop_inner(
+        listener,
+        store,
+        engine,
+        tls,
+        mode,
+        limiter,
+        read_timeout,
+        session_limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn accept_loop_inner(
     listener: TcpListener,
     store: Arc<UserStore>,
@@ -206,6 +245,7 @@ fn accept_loop_inner(
     mode: crate::tls_opt::TlsMode,
     limiter: ConnectionLimiter,
     read_timeout: Duration,
+    session_limits: crate::limits::SessionLimits,
 ) {
     // 拒否応答ワーカースレッドの有界化専用リミッター（`limiter` とは別枠。
     // review 是正: 拒否経路の無制限 `thread::spawn` による DoS 対策）。
@@ -302,17 +342,24 @@ fn accept_loop_inner(
             // ビット単位で従来と同一の平文経路を維持する（受入基準 2。`mode` は
             // `tls` が `None` の間は意味を持たない）。
             let result = match (&engine, &tls) {
-                (_, Some(_)) => crate::handshake::handle_connection_with_tls_mode(
+                (_, Some(_)) => crate::handshake::handle_connection_with_session_limits(
                     stream,
                     &store,
                     engine.as_deref(),
                     tls,
                     mode,
+                    session_limits,
                 ),
-                (Some(engine), None) => {
-                    crate::handshake::handle_connection_with_engine(stream, &store, engine)
-                }
-                (None, None) => crate::handshake::handle_connection_bounded(stream, &store),
+                // 平文経路は `mode`（`tls` が `None` の間は意味を持たない）を `Allow` で
+                // 渡す既存と同一動作（`handle_connection_inner`）に `session_limits` だけを足す。
+                (_, None) => crate::handshake::handle_connection_with_session_limits(
+                    stream,
+                    &store,
+                    engine.as_deref(),
+                    None,
+                    crate::tls_opt::TlsMode::Allow,
+                    session_limits,
+                ),
             };
             if let Err(e) = result {
                 engine::log_stderr!("wire-server: connection error: {e}");

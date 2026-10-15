@@ -168,6 +168,15 @@
 //! 一本化し、`EngineCore::with_result_limits` へ 1 回だけ注入する
 //! （`docs/design/result-limits-cli.md`）。
 //!
+//! `--read-timeout-secs <1-600>`・`--max-connections <1-256>`・
+//! `--max-prepared-statements <1-1024>`（Issue #2454。WIRE-25 ポインタ。範囲は
+//! CLI 設計メモ #2453 の確定値）: 読み取りタイムアウト（既定 30 秒）・同時接続数上限
+//! （既定 64）・接続あたりの名前付き prepared statement 件数上限（既定 64）を起動時に
+//! 設定する。SQL 表層・NoSQL（HTTP）表層で同じ値を共有し、範囲外・非数値・値欠落・
+//! 重複指定は起動エラー（fail-closed）。解決は
+//! `wire_server::connection_limits_opt::resolve` に一本化し、書き込みロック待機
+//! （`--write-lock-wait-ms`）とは連動しない。
+//!
 //! `--write-lock-wait-ms`（Issue #1554。SQL-46）: 書き込みロック（単一ライタ）の待機上限を
 //! ミリ秒（`100`〜`60000`。既定 `30000`）で、プロセス全体に対して起動時に設定できる
 //! opt-in 注入点（未指定は現行の 30 秒と同値＝挙動不変）。超過は従来どおり `55P03`。
@@ -400,6 +409,9 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_join_output_rows_raw: Option<String> = None;
     let mut max_result_rows_raw: Option<String> = None;
     let mut write_lock_wait_raw: Option<String> = None;
+    let mut read_timeout_secs_raw: Option<String> = None;
+    let mut max_connections_raw: Option<String> = None;
+    let mut max_prepared_statements_raw: Option<String> = None;
     let mut max_transaction_duration_ms_raw: Option<String> = None;
     let mut max_transaction_statements_raw: Option<String> = None;
     let mut partitioned_chunk_rows_raw: Option<String> = None;
@@ -897,6 +909,66 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 write_lock_wait_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::connection_limits_opt::READ_TIMEOUT_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::connection_limits_opt::READ_TIMEOUT_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #2454: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if read_timeout_secs_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::connection_limits_opt::READ_TIMEOUT_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                read_timeout_secs_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::connection_limits_opt::MAX_CONNECTIONS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::connection_limits_opt::MAX_CONNECTIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #2454: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_connections_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::connection_limits_opt::MAX_CONNECTIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_connections_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::connection_limits_opt::MAX_PREPARED_STATEMENTS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::connection_limits_opt::MAX_PREPARED_STATEMENTS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #2454: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_prepared_statements_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::connection_limits_opt::MAX_PREPARED_STATEMENTS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_prepared_statements_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::join_limits_opt::MAX_JOIN_RELATIONS_FLAG => {
@@ -1529,6 +1601,23 @@ fn run_server(args: &[String]) -> ExitCode {
             }
         };
 
+    // Issue #2454: 読み取りタイムアウト・最大接続数・prepared statement 件数上限を
+    // bind・ユーザーストア読込より前に解決する（fail-closed）。未指定は現行の既定値
+    // （`ConnectionLimits::default()`）。書き込みロック待機（SQL-46）とは独立。
+    let connection_limits = match wire_server::connection_limits_opt::resolve(
+        wire_server::connection_limits_opt::ConnectionLimitsRawFlags {
+            read_timeout_secs: read_timeout_secs_raw.as_deref(),
+            max_connections: max_connections_raw.as_deref(),
+            max_prepared_statements: max_prepared_statements_raw.as_deref(),
+        },
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid connection limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1554: 書き込みロック待機上限を bind・ユーザーストア読込より前に解決する
     // （fail-closed）。未指定は `DEFAULT_WRITE_LOCK_WAIT`＝現行挙動。
     let write_lock_wait =
@@ -2104,7 +2193,8 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #743: 同時接続数リミッターは `match surface` の前に 1 回だけ
     // 構築し、選ばれた表層のループへ渡す（1 プロセス 1 表層のため、同じ
     // 構築箇所・同じ定数・同じ型＝共有リミッターという契約を満たす）。
-    let limiter = limits::ConnectionLimiter::new(limits::MAX_CONNECTIONS);
+    let limiter = limits::ConnectionLimiter::new(connection_limits.max_connections);
+    let read_timeout = connection_limits.read_timeout;
     match surface {
         wire_server::surface::Surface::Sql => {
             // Issue #967: TLS 有効時は `accept_loop_with_tls_mode` へ切り替える
@@ -2114,23 +2204,27 @@ fn run_server(args: &[String]) -> ExitCode {
             // を呼び、既存経路とビット同一のまま維持する。
             match (&tls_config, &tls_options) {
                 (Some(cfg), Some((_, _, mode, _))) => {
-                    server::accept_loop_with_tls_mode(
+                    server::accept_loop_with_session_limits(
                         listener,
                         store,
                         Some(core),
                         Some(Arc::clone(cfg)),
                         *mode,
                         limiter,
-                        limits::READ_TIMEOUT,
+                        read_timeout,
+                        connection_limits.session,
                     );
                 }
                 _ => {
-                    server::accept_loop_with_engine(
+                    server::accept_loop_with_session_limits(
                         listener,
                         store,
-                        core,
+                        Some(core),
+                        None,
+                        wire_server::tls_opt::TlsMode::Allow,
                         limiter,
-                        limits::READ_TIMEOUT,
+                        read_timeout,
+                        connection_limits.session,
                     );
                 }
             }
@@ -2161,7 +2255,7 @@ fn run_server(args: &[String]) -> ExitCode {
                     wire_server::http::listener::accept_loop_with_router_tls(
                         listener,
                         limiter,
-                        limits::READ_TIMEOUT,
+                        read_timeout,
                         router,
                         Arc::clone(cfg),
                         *mode,
@@ -2171,7 +2265,7 @@ fn run_server(args: &[String]) -> ExitCode {
                     wire_server::http::listener::accept_loop_with_router(
                         listener,
                         limiter,
-                        limits::READ_TIMEOUT,
+                        read_timeout,
                         router,
                     );
                 }

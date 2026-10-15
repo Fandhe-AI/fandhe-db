@@ -814,3 +814,59 @@ fn tls_trickle_within_one_record_is_bounded_by_absolute_read_deadline() {
         "absolute read deadline was not enforced over TLS trickle: elapsed={elapsed:?}"
     );
 }
+
+/// Issue #2454（レビュー指摘是正）: 上限超過の TLS 接続に対する拒否経路の
+/// ハンドシェイクも `--read-timeout-secs` 由来の期限に従うこと。固定の
+/// `HANDSHAKE_READ_TIMEOUT`（30s）のままだと、ClientHello を途中まで
+/// 送って黙るクライアントに `RejectWorkerLimiter` の枠が 30s 専有される。
+#[test]
+fn over_limit_tls_reject_handshake_honors_configured_read_timeout() {
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "wire-server-http10-tls-r2454-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos(),
+        next_fixture_seq()
+    ));
+    std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
+    let users_path = fixture_dir.join("users.txt");
+    write_user_store_with_alice(&users_path);
+
+    let limiter = ConnectionLimiter::new(1);
+    let addr = spawn_router_listener_tls_with_limiter_and_read_timeout(
+        &users_path,
+        TlsMode::Allow,
+        limiter.clone(),
+        Duration::from_millis(300),
+    );
+
+    // 1 本目: 枠を保持し続ける。
+    let _holder = connect_tls(addr);
+    wait_for_permit_active(&limiter);
+
+    // 2 本目: TLS レコードの先頭 3 バイトだけ送って沈黙する。
+    let mut socket = TcpStream::connect(addr).expect("connect");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set read timeout");
+    socket
+        .write_all(&[0x16, 0x03, 0x01])
+        .expect("write partial record header");
+
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 64];
+    loop {
+        match socket.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "reject-path handshake ignored the configured read timeout: elapsed={elapsed:?}"
+    );
+}

@@ -366,6 +366,96 @@ pub fn reject_too_many_connections(mut stream: TcpStream, max: usize) {
 /// 拒否する。本リポの実装既定値（spec は数値までは定めない）。
 pub const MAX_PREPARED_STATEMENTS_PER_SESSION: usize = 64;
 
+/// 接続単位の動作上限のうち、起動時 CLI（`--max-prepared-statements`）で変更できるもの。
+///
+/// `main.rs` が [`crate::connection_limits_opt::resolve`] で 1 回だけ解決し、
+/// `server::accept_loop_with_session_limits` → `handshake::
+/// handle_connection_with_session_limits` → `extended_query::ExtendedQueryState::
+/// with_session_limits` へ値渡し（`Copy`）で届ける。セッション変数・SQL・
+/// NoSQL 要求・テナント資格情報からは変更できない（テナント境界を跨ぐ設定経路を
+/// 作らない）。`Default` は従来のコンパイル時定数と一致し、未指定時の挙動を変えない。
+/// 対応: Issue #2454（ポインタ: WIRE-25・WIRE-11）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionLimits {
+    /// 接続あたりの名前付き prepared statement 保持件数の上限
+    /// （無名は数えない。超過は `54000`）。
+    pub max_prepared_statements: usize,
+}
+
+impl Default for SessionLimits {
+    fn default() -> Self {
+        Self {
+            max_prepared_statements: MAX_PREPARED_STATEMENTS_PER_SESSION,
+        }
+    }
+}
+
+/// `--read-timeout-secs` の下限（秒）。0 は `set_read_timeout(Some(ZERO))` が
+/// Unix でエラーになり接続処理が成立しないうえ、「無制限」「無効」のどちらにも読めるため
+/// 受理しない（`docs/design/connection-limits-cli.md` D1・D4。WIRE-25 ポインタ）。
+pub const MIN_READ_TIMEOUT_SECS: u64 = 1;
+
+/// `--read-timeout-secs` のハード上限（秒。10 分）。個々の読み取りの待機上限であり、
+/// 接続枠（OS スレッド 1 本）の無通信保持時間を有界にする（同 D3）。
+pub const MAX_READ_TIMEOUT_SECS: u64 = 600;
+
+/// `--max-connections` の下限（同 D4）。
+pub const MIN_MAX_CONNECTIONS: u64 = 1;
+
+/// `--max-connections` のハード上限（同 D3）。1 接続は OS スレッド 1 本と接続ごとの
+/// 有界バッファで構成され、最悪常駐量は 1 接続あたり約 28〜30 MiB。256 接続で最悪約
+/// 7.5 GiB となるため、これを超える設定は受理しない。
+pub const MAX_MAX_CONNECTIONS: u64 = 256;
+
+/// `--max-prepared-statements` の下限（同 D4）。
+pub const MIN_MAX_PREPARED_STATEMENTS: u64 = 1;
+
+/// `--max-prepared-statements` のハード上限（同 D3）。SQL の累計バイト上限
+/// （[`MAX_PREPARED_SQL_BYTES_PER_SESSION`]）は別に掛かるため、件数側は
+/// 1 件ごとのメタデータ（HashMap エントリ・解析済み AST）のオーバーヘッドで決める。
+pub const MAX_MAX_PREPARED_STATEMENTS: u64 = 1024;
+
+fn check_range(name: &str, v: u64, min: u64, max: u64) -> Result<(), String> {
+    if v < min || v > max {
+        return Err(format!("{name} must be between {min} and {max}, got {v}"));
+    }
+    Ok(())
+}
+
+/// `--read-timeout-secs` の値を範囲検証して [`Duration`] へ変換する。
+/// 範囲検証後に [`Duration::from_secs`] で構築するため、換算でオーバーフローしない。
+pub fn validate_read_timeout_secs(v: u64) -> Result<Duration, String> {
+    check_range(
+        "read timeout (secs)",
+        v,
+        MIN_READ_TIMEOUT_SECS,
+        MAX_READ_TIMEOUT_SECS,
+    )?;
+    Ok(Duration::from_secs(v))
+}
+
+/// `--max-connections` の値を範囲検証して `usize` へ変換する。
+pub fn validate_max_connections(v: u64) -> Result<usize, String> {
+    check_range(
+        "max connections",
+        v,
+        MIN_MAX_CONNECTIONS,
+        MAX_MAX_CONNECTIONS,
+    )?;
+    usize::try_from(v).map_err(|_| format!("max connections out of range: {v}"))
+}
+
+/// `--max-prepared-statements` の値を範囲検証して `usize` へ変換する。
+pub fn validate_max_prepared_statements(v: u64) -> Result<usize, String> {
+    check_range(
+        "max prepared statements",
+        v,
+        MIN_MAX_PREPARED_STATEMENTS,
+        MAX_MAX_PREPARED_STATEMENTS,
+    )?;
+    usize::try_from(v).map_err(|_| format!("max prepared statements out of range: {v}"))
+}
+
 /// ステートメント名の最大バイト長（Issue #933）。PostgreSQL の `NAMEDATALEN`
 /// （64。末尾 NUL 込み）と揃え、識別子として通用する実用上の長さに抑える。
 pub const MAX_STATEMENT_NAME_LEN: usize = 63;
