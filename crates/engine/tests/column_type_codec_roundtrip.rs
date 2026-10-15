@@ -227,7 +227,8 @@ fn representative_scalar_values() -> Vec<Value> {
         Value::Integer(-32768),
         // `c_varchar_n`・`c_bpchar`（TEXT と同一フレーム。Issue #1563）。
         Value::Text("varchar(16) value".chars().take(16).collect()),
-        Value::Text("bpchar".to_string()),
+        // `CHAR(8)` は n 文字へ空白詰め済みの値だけを保存する（TABLE-31・Issue #1566）。
+        Value::Text("bpchar  ".to_string()),
     ]
 }
 
@@ -436,8 +437,26 @@ fn char_length_types_roundtrip_boundaries_and_reject_overflow() {
         roundtrip_single(ty.clone(), Value::Text("abc".to_string()));
         // 3 文字・9 バイト。
         roundtrip_single(ty.clone(), Value::Text("日本語".to_string()));
-        roundtrip_single(ty.clone(), Value::Text(String::new()));
         let schema = single_col_schema(ty.clone());
+        if matches!(ty, ColumnType::Bpchar(_)) {
+            // `CHAR(n)` は空白詰め済み（ちょうど n 文字）でなければ codec が拒否する
+            // （書き込み経路の正規化漏れを永続化させない最後の砦。Issue #1566）。
+            for unpadded in ["", "ab", "日本"] {
+                let result = encode_row(
+                    &schema,
+                    "tenant-a",
+                    Visibility::Public,
+                    &[Value::Text(unpadded.to_string())],
+                );
+                assert!(
+                    matches!(result, Err(RowCodecError::Invalid(_))),
+                    "{ty:?} must reject unpadded {unpadded:?}"
+                );
+            }
+            roundtrip_single(ty.clone(), Value::Text("ab ".to_string()));
+        } else {
+            roundtrip_single(ty.clone(), Value::Text(String::new()));
+        }
         for over in ["abcd", "日本語!"] {
             let result = encode_row(
                 &schema,

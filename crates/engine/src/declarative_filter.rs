@@ -678,7 +678,11 @@ impl DeclarativeFilter {
             &column.ty,
             skip_enum_label_validation,
         )?;
-        Ok(MetadataFilter { column_index, op })
+        Ok(MetadataFilter {
+            column_index,
+            op,
+            bpchar: matches!(column.ty, ColumnType::Bpchar(_)),
+        })
     }
 }
 
@@ -720,7 +724,7 @@ fn bind_filter_op(
             // TEXT と同じ辞書を共有するため、この等価意味論のまま
             // 索引経由の候補削減を信頼できる）。
             match ty {
-                ColumnType::Text | ColumnType::Varchar(_) => {}
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {}
                 ColumnType::Enum(def) => {
                     // `skip_enum_label_validation` が `true` の場合、この値は
                     // `sql::params::substitute_dummy` が生成した固定ダミー
@@ -751,7 +755,6 @@ fn bind_filter_op(
                 | ColumnType::Json
                 | ColumnType::Jsonb
                 | ColumnType::Numeric { .. }
-                | ColumnType::Bpchar(_)
                 | ColumnType::Uuid => {
                     return Err(SqlSurfaceError::invalid_input(format!(
                         "column {column_name:?} is not a TEXT column"
@@ -759,7 +762,13 @@ fn bind_filter_op(
                 }
             }
             check_literal_len(value)?;
-            FilterOp::Equals(value.clone())
+            // `CHAR(n)` はリテラル側も末尾空白を除いて比較する。n 超過でもエラーにせず
+            // 「一致しない」とする（詰めは行わないので確保は発生しない。TABLE-31・Issue #1566）。
+            if matches!(ty, ColumnType::Bpchar(_)) {
+                FilterOp::Equals(value.trim_end_matches(' ').to_string())
+            } else {
+                FilterOp::Equals(value.clone())
+            }
         }
         FilterOp::StartsWith(prefix) => {
             if !ty.is_text_like() {
@@ -888,11 +897,16 @@ fn bind_filter_op(
                 )));
             }
             match ty {
-                ColumnType::Text | ColumnType::Varchar(_) => {
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
+                    let rtrim = matches!(ty, ColumnType::Bpchar(_));
                     let mut bound = Vec::with_capacity(values.len());
                     for v in values {
                         check_literal_len(v)?;
-                        bound.push(v.clone());
+                        bound.push(if rtrim {
+                            v.trim_end_matches(' ').to_string()
+                        } else {
+                            v.clone()
+                        });
                     }
                     bound.sort();
                     bound.dedup();
@@ -1409,6 +1423,10 @@ pub fn parse_like_pattern(pattern: &str) -> Result<CompiledLike, SqlSurfaceError
 pub struct MetadataFilter {
     column_index: usize,
     op: FilterOp,
+    /// 対象列が `CHAR(n)`（bpchar）のとき true。比較は末尾の半角空白（U+0020 のみ）を
+    /// 意味のないものとして扱うため、評価時に列値を rtrim してから `op` を適用する
+    /// （束縛時にリテラル側も rtrim 済み。TABLE-31・Issue #1566）。
+    bpchar: bool,
 }
 
 impl MetadataFilter {
@@ -1434,6 +1452,7 @@ impl MetadataFilter {
     /// ではない。呼び出し元は従来どおり `OR` 群のまま残す＝fail-closed）。
     pub(crate) fn from_bound_text_in(
         column_index: usize,
+        bpchar: bool,
         mut values: Vec<String>,
     ) -> Option<MetadataFilter> {
         values.sort();
@@ -1444,13 +1463,24 @@ impl MetadataFilter {
         Some(MetadataFilter {
             column_index,
             op: FilterOp::InText(values),
+            bpchar,
         })
+    }
+
+    /// 対象列が `CHAR(n)`（rtrim 比較）か。`OR` 群の畳み込み（`sql::where_tree`）が
+    /// 同じ比較意味論の述語だけを 1 本の `IN` へ畳むために参照する。
+    pub(crate) fn is_bpchar(&self) -> bool {
+        self.bpchar
     }
 
     /// 単体テスト用に束縛済みフィルタを直接組み立てる。
     #[cfg(test)]
     pub(crate) fn for_test(column_index: usize, op: FilterOp) -> MetadataFilter {
-        MetadataFilter { column_index, op }
+        MetadataFilter {
+            column_index,
+            op,
+            bpchar: false,
+        }
     }
 
     /// `value`（対象列の値。`None` は NULL）がこのフィルタに一致するかを PG 互換の
@@ -1469,6 +1499,13 @@ impl MetadataFilter {
     /// UNKNOWN と FALSE を区別できず、型不一致行が `NOT` 越しに誤って真になる
     /// ——fail-open——おそれがある）。
     pub(crate) fn eval(&self, value: Option<ScalarRef<'_>>) -> Option<bool> {
+        if self.bpchar {
+            // `CHAR(n)` は保存形（n 文字へ空白詰め）の末尾空白を比較から除く。
+            // `Not` を含む全 op がこの正規化後の値を見る（TABLE-31・Issue #1566）。
+            if let Some(ScalarRef::Text(t)) = value {
+                return self.op.eval(Some(ScalarRef::Text(t.trim_end_matches(' '))));
+            }
+        }
         self.op.eval(value)
     }
 }
@@ -1579,14 +1616,15 @@ mod tests {
 
     #[test]
     fn from_bound_text_in_sorts_dedups_and_bounds() {
-        let f = MetadataFilter::from_bound_text_in(3, vec!["b".into(), "a".into(), "a".into()])
-            .unwrap();
+        let f =
+            MetadataFilter::from_bound_text_in(3, false, vec!["b".into(), "a".into(), "a".into()])
+                .unwrap();
         assert_eq!(f.column_index(), 3);
         assert!(matches!(f.op(), FilterOp::InText(v) if v == &["a".to_string(), "b".to_string()]));
-        assert!(MetadataFilter::from_bound_text_in(0, vec![]).is_none());
+        assert!(MetadataFilter::from_bound_text_in(0, false, vec![]).is_none());
         let n = |k: usize| (0..k).map(|i| format!("v{i:04}")).collect::<Vec<_>>();
-        assert!(MetadataFilter::from_bound_text_in(0, n(MAX_IN_LIST_ITEMS)).is_some());
-        assert!(MetadataFilter::from_bound_text_in(0, n(MAX_IN_LIST_ITEMS + 1)).is_none());
+        assert!(MetadataFilter::from_bound_text_in(0, false, n(MAX_IN_LIST_ITEMS)).is_some());
+        assert!(MetadataFilter::from_bound_text_in(0, false, n(MAX_IN_LIST_ITEMS + 1)).is_none());
     }
 
     use super::*;

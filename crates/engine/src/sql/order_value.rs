@@ -178,6 +178,11 @@ pub(crate) fn extract_order_value_ref<'a>(
             OrderKind::Bytes,
             row_codec::ScalarRef::Text(t),
         ) => Ok(Some(ScalarKeyRef::Bytes(t.as_bytes()))),
+        // `CHAR(n)` は保存形（n 文字へ空白詰め）の末尾の半角空白を除いた値で比較する
+        // （TABLE-31・Issue #1566）。
+        (ColumnType::Bpchar(_), OrderKind::Bpchar, row_codec::ScalarRef::Text(t)) => Ok(Some(
+            ScalarKeyRef::Bytes(t.trim_end_matches(' ').as_bytes()),
+        )),
         (
             ColumnType::SmallInt | ColumnType::Integer,
             OrderKind::SignedInt,
@@ -362,6 +367,24 @@ pub(crate) fn order_value_to_cell(
             String::from_utf8(b.clone())
                 .map(Cell::Text)
                 .map_err(|_| scan_bug("group key TEXT value is not valid UTF-8"))
+        }
+        // `CHAR(n)` のグループキーは rtrim 済みなので、出力時に n 文字へ詰め直す。保存形が
+        // ちょうど n 文字（≤ MAX_TEXT_FIELD_LEN）のため、詰め後の長さは元の行の長さを超えない
+        // （TABLE-31・Issue #1566）。
+        (OrderValue::Bytes(b), Some(ColumnType::Bpchar(n))) => {
+            let mut s = String::from_utf8(b.clone())
+                .map_err(|_| scan_bug("group key CHAR value is not valid UTF-8"))?;
+            let chars = s.chars().count();
+            let pad = usize::try_from(*n)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(chars);
+            if s.len().saturating_add(pad) > crate::row_codec::MAX_TEXT_FIELD_LEN as usize {
+                return Err(scan_bug(
+                    "group key CHAR value exceeds the text field limit",
+                ));
+            }
+            s.extend(std::iter::repeat_n(' ', pad));
+            Ok(Cell::Text(s))
         }
         (OrderValue::SignedInt(v), Some(ColumnType::Integer | ColumnType::BigInt)) => {
             Ok(Cell::SignedInteger(*v))

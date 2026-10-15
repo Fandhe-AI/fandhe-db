@@ -568,15 +568,6 @@ pub(crate) fn bind_integer_literal(
     }
 }
 
-/// `CHAR(n)` 列への非 NULL 値の書き込みを拒否する `0A000`（TABLE-31・Issue #1563）。
-/// 空白詰め・bpchar 比較（Issue #1566）が入るまで、意味論が未確定の書き込みを
-/// fail-closed に塞ぐ。INSERT・UPDATE SET・UPSERT・NoSQL 書き込みが共有する。
-pub(crate) fn bpchar_write_unsupported(column: &str) -> SqlSurfaceError {
-    SqlSurfaceError::FeatureNotSupported {
-        detail: format!("writing to character(n) column {column:?} is not supported yet"),
-    }
-}
-
 /// `REAL`／`DOUBLE PRECISION` 列（TABLE-13・TASK-196）のリテラル束縛を 1 箇所へ
 /// 集約するヘルパー（F7・Issue #882 計画）。`raw`（`InsertLiteral::Number` の
 /// 生テキスト。負号は `expect_literal` が既に前置済み）を
@@ -1700,10 +1691,9 @@ fn text_range_compare_as_expr(
         },
         _ => return None,
     };
-    let is_text = schema
-        .columns
-        .iter()
-        .any(|c| &c.name == column && c.ty.is_text_like());
+    let is_text = schema.columns.iter().any(|c| {
+        &c.name == column && (c.ty.is_text_like() || matches!(c.ty, ColumnType::Bpchar(_)))
+    });
     if !is_text {
         return None;
     }
@@ -2676,8 +2666,10 @@ pub(crate) fn bind_text_literal(
     ty: &ColumnType,
     s: &str,
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    // `CHAR(n)` は n 文字まで半角空白で詰めて保存する（TABLE-31・Issue #1566）。
+    let limit = usize::try_from(crate::row_codec::MAX_TEXT_FIELD_LEN).unwrap_or(usize::MAX);
     Ok(crate::row_codec::Value::Text(
-        crate::row_codec::fit_char_length(ty, s)?.to_string(),
+        crate::row_codec::fit_pad_char_length(ty, s, limit)?.into_owned(),
     ))
 }
 
@@ -2711,9 +2703,7 @@ pub(crate) fn bind_column_default(
     match crate::row_codec::default_scalar(&column.ty, default) {
         Ok(scalar) => match scalar {
             // 旧形式で保存された既定値でも n 超過を書き込ませない（冪等。Issue #1564）。
-            ScalarRef::Text(s) => Ok(Value::Text(
-                crate::row_codec::fit_char_length(&column.ty, s)?.to_string(),
-            )),
+            ScalarRef::Text(s) => bind_text_literal(&column.ty, s),
             ScalarRef::Integer(v) => Ok(Value::Integer(v)),
             ScalarRef::BigInt(v) => Ok(Value::BigInt(v)),
             ScalarRef::Real(v) => Ok(Value::Real(v)),
@@ -2845,17 +2835,11 @@ fn bind_insert_row(
                 )))
             }
             (
-                ColumnType::Bpchar(_),
-                InsertLiteral::String(_)
-                | InsertLiteral::Number(_)
-                | InsertLiteral::Bool(_)
-                | InsertLiteral::Vector(_),
-            ) => return Err(bpchar_write_unsupported(name)),
-            (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::String(s)) => {
-                bind_text_literal(&column.ty, s)?
-            }
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
+                InsertLiteral::String(s),
+            ) => bind_text_literal(&column.ty, s)?,
             (
-                ColumnType::Text | ColumnType::Varchar(_),
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -3293,17 +3277,11 @@ fn bind_set_assignments(
                 )))
             }
             (
-                ColumnType::Bpchar(_),
-                InsertLiteral::String(_)
-                | InsertLiteral::Number(_)
-                | InsertLiteral::Bool(_)
-                | InsertLiteral::Vector(_),
-            ) => return Err(bpchar_write_unsupported(name)),
-            (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::String(s)) => {
-                bind_text_literal(&column.ty, s)?
-            }
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
+                InsertLiteral::String(s),
+            ) => bind_text_literal(&column.ty, s)?,
             (
-                ColumnType::Text | ColumnType::Varchar(_),
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -4455,13 +4433,10 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a vector literal, got a non-vector literal"
                         )))
                     }
-                    (ColumnType::Bpchar(_), InsertLiteral::String(_) | InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
-                        return Err(bpchar_write_unsupported(name))
-                    }
-                    (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::String(s)) => {
+                    (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::String(s)) => {
                         bind_text_literal(&column.ty, s)?
                     }
-                    (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                    (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a text literal, got a non-text literal"
                         )))
@@ -4653,13 +4628,10 @@ fn bind_file_insert(
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let value = match (&column.ty, literal) {
-            (ColumnType::Bpchar(_), InsertLiteral::String(_) | InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
-                return Err(bpchar_write_unsupported(name))
-            }
-            (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::String(s)) => {
+            (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::String(s)) => {
                 bind_text_literal(&column.ty, s)?
             }
-            (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a non-text literal"
                 )))
@@ -4667,7 +4639,7 @@ fn bind_file_insert(
             // `InsertLiteral::Vector`（Issue #896 レビュー指摘・PR #1038）は
             // NoSQL 表層専用であり、ファイル形 `INSERT` の VALUES 構文からは
             // 構築されない到達不能パス（match の網羅性のためだけの分岐）。
-            (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::Vector(_)) => {
+            (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::Vector(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a vector literal"
                 )))
@@ -5582,8 +5554,15 @@ fn resolve_aggregate_input(
                     (ColumnType::Text | ColumnType::Varchar(_), _) => {
                         Ok(AggregateInput::TextColumn(index))
                     }
+                    // `COUNT(<CHAR 列>)` は NULL でない行を数えるだけで、保存形（n 文字へ空白詰め）の
+                    // まま TEXT 列と同じ経路で数えられる。`MIN`／`MAX` は rtrim 順序での集約が
+                    // 必要なため後続課題とし、`SUM`／`AVG` と合わせて拒否のまま残す
+                    // （TABLE-31・Issue #1566）。
+                    (ColumnType::Bpchar(_), AggregateFunc::Count) => {
+                        Ok(AggregateInput::TextColumn(index))
+                    }
                     (ColumnType::Bpchar(_), _) => Err(SqlSurfaceError::undefined_function(
-                        format!("column {name:?} is CHAR and cannot be used in an aggregate yet"),
+                        format!("column {name:?} is CHAR and cannot be used with SUM/AVG/MIN/MAX"),
                     )),
                     (ColumnType::Vector(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::VectorColumnPresence)
@@ -5783,9 +5762,9 @@ fn resolve_count_distinct_input(
                     ColumnType::Text | ColumnType::Varchar(_) => {
                         Ok(AggregateInput::TextColumn(index))
                     }
-                    ColumnType::Bpchar(_) => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} is CHAR and cannot be used with COUNT(DISTINCT ...) yet"
-                    ))),
+                    // 同じ列の保存形はすべて n 文字へ詰め済みのため、バイト等価が bpchar 等価と
+                    // 一致する（TABLE-31・Issue #1566）。
+                    ColumnType::Bpchar(_) => Ok(AggregateInput::TextColumn(index)),
                     ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with COUNT(DISTINCT ...)"
                     ))),
@@ -6205,6 +6184,11 @@ pub(crate) enum OrderKind {
     Id,
     /// `TEXT`（バイト列順。実装既定値として C collation とみなす）。
     Bytes,
+    /// `CHAR(n)`（bpchar。末尾の半角空白を除いたバイト列順。PostgreSQL の bpchar 比較と
+    /// 同じく末尾空白を意味のないものとして扱う。TABLE-31・Issue #1566）。キーは
+    /// [`OrderKind::Bytes`] と同じ `ScalarKeyRef::Bytes` だが、辞書索引から供給される単一
+    /// TEXT キー経路（[`crate::sql::group_by::single_text_key_column`]）には載せない。
+    Bpchar,
     /// `INTEGER`／`BIGINT`／`DATE`／`TIMESTAMP`（いずれも符号付き整数として
     /// 全順序を持つ内部表現。§比較規約）。
     SignedInt,
@@ -6240,6 +6224,7 @@ pub(crate) struct BoundOrderKey {
 fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
     match ty {
         ColumnType::Text | ColumnType::Varchar(_) => Some(OrderKind::Bytes),
+        ColumnType::Bpchar(_) => Some(OrderKind::Bpchar),
         ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
@@ -6254,8 +6239,7 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
-        | ColumnType::Jsonb
-        | ColumnType::Bpchar(_) => None,
+        | ColumnType::Jsonb => None,
     }
 }
 

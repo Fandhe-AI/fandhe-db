@@ -80,6 +80,27 @@ fn select_count(core: &EngineCore, sql: &str) -> usize {
         .len()
 }
 
+fn texts(core: &EngineCore, sql: &str) -> Vec<Option<String>> {
+    core.execute_sql(&ctx_of("alice"), sql)
+        .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"))
+        .rows
+        .iter()
+        .map(|r| match r.cells.first() {
+            Some(engine::sql::exec::Cell::Text(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ids(core: &EngineCore, sql: &str) -> Vec<u64> {
+    core.execute_sql(&ctx_of("alice"), sql)
+        .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"))
+        .rows
+        .iter()
+        .map(|r| r.id)
+        .collect()
+}
+
 /// 受け入れ条件 1: 再起動後も長さと種別（varying か fixed か）が復元される。
 #[test]
 fn length_and_kind_are_restored_after_reopen() {
@@ -290,58 +311,322 @@ fn char_varying_is_accepted_as_varchar_and_bare_char_stays_rejected() {
     assert_eq!(code(&core, "CREATE TABLE u (a CHAR)"), "0A000");
 }
 
-/// `CHAR(n)` は意味論（空白詰め・bpchar 比較）が未確定の間、非 NULL の書き込み・述語・索引・
-/// 制約を拒否する。NULL の書き込みと `SELECT *` は成功する（Issue #1566／#1567 が解禁する）。
+/// `CHAR(n)` の書き込みは n 文字へ半角空白で詰めて保存され、SELECT は詰めた値を返す
+/// （TABLE-31・Issue #1566）。マルチバイトは文字数で詰める。
 #[test]
-fn char_columns_fail_closed_until_bpchar_semantics_land() {
-    let (_p, _g, core) = open("cl-bpchar-closed");
+fn char_values_are_blank_padded_on_write() {
+    let (_p, _g, core) = open("cl-bpchar-pad");
     ok(&core, "CREATE TABLE t (c CHAR(3), n INT)");
+    ok(
+        &core,
+        "INSERT INTO t (id, c, n) VALUES (1, 'a', 1) USING OPERATION_ID 'o1'",
+    );
+    ok(
+        &core,
+        "INSERT INTO t (id, c, n) VALUES (2, '日', 2) USING OPERATION_ID 'o2'",
+    );
+    ok(
+        &core,
+        "INSERT INTO t (id, c, n) VALUES (3, 'abc', 3) USING OPERATION_ID 'o3'",
+    );
+    ok(
+        &core,
+        "INSERT INTO t (id, c, n) VALUES (4, NULL, 4) USING OPERATION_ID 'o4'",
+    );
+    ok(
+        &core,
+        "INSERT INTO t (id, n) VALUES (5, 5) USING OPERATION_ID 'o5'",
+    );
+    let got = texts(&core, "SELECT c FROM t ORDER BY id LIMIT 10");
+    assert_eq!(
+        got,
+        vec![
+            Some("a  ".to_string()),
+            Some("日  ".to_string()),
+            Some("abc".to_string()),
+            None,
+            None
+        ]
+    );
+    // UPDATE（リテラル・式）・UPSERT も詰めて保存する。
+    ok(
+        &core,
+        "UPDATE t SET c = 'z' WHERE id = 1 USING OPERATION_ID 'o6'",
+    );
+    assert_eq!(
+        texts(&core, "SELECT c FROM t WHERE id = 1 LIMIT 10"),
+        vec![Some("z  ".to_string())]
+    );
+    ok(
+        &core,
+        "INSERT INTO t (id, c, n) VALUES (3, 'q', 9) ON CONFLICT (id) DO UPDATE SET c = 'y' \
+         USING OPERATION_ID 'o7'",
+    );
+    assert_eq!(
+        texts(&core, "SELECT c FROM t WHERE id = 3 LIMIT 10"),
+        vec![Some("y  ".to_string())]
+    );
+    // n 超過は従来どおり 22001。超過部分が空白のみなら切り詰めてから詰める。
     assert_eq!(
         code(
             &core,
-            "INSERT INTO t (id, c, n) VALUES (1, 'ab', 1) USING OPERATION_ID 'o1'"
+            "INSERT INTO t (id, c, n) VALUES (7, 'abcd', 7) USING OPERATION_ID 'o8'"
         ),
-        "0A000"
+        "22001"
     );
     ok(
         &core,
-        "INSERT INTO t (id, c, n) VALUES (2, NULL, 2) USING OPERATION_ID 'o2'",
+        "INSERT INTO t (id, c, n) VALUES (8, 'ab    ', 8) USING OPERATION_ID 'o9'",
+    );
+    assert_eq!(
+        texts(&core, "SELECT c FROM t WHERE id = 8 LIMIT 10"),
+        vec![Some("ab ".to_string())]
+    );
+}
+
+/// 受け入れ条件 1・2: 末尾の半角空白は比較で意味を持たず、索引の有無で結果が一致する。
+#[test]
+fn char_comparison_ignores_trailing_spaces_with_and_without_index() {
+    for indexed in [false, true] {
+        let (_p, _g, core) = open(if indexed {
+            "cl-bpchar-cmp-ix"
+        } else {
+            "cl-bpchar-cmp"
+        });
+        ok(&core, "CREATE TABLE t (c CHAR(3), n INT)");
+        if indexed {
+            ok(&core, "CREATE INDEX t_c ON t (c)");
+        }
+        for (i, v) in ["a", "ab", "abc", "b"].iter().enumerate() {
+            ok(
+                &core,
+                &format!(
+                    "INSERT INTO t (id, c, n) VALUES ({}, '{v}', {}) USING OPERATION_ID 'o{i}'",
+                    i + 1,
+                    i + 1
+                ),
+            );
+        }
+        for lit in ["a", "a  ", "a "] {
+            assert_eq!(
+                ids(
+                    &core,
+                    &format!("SELECT id FROM t WHERE c = '{lit}' LIMIT 10")
+                ),
+                vec![1],
+                "indexed={indexed} {lit:?}"
+            );
+        }
+        assert_eq!(
+            ids(&core, "SELECT id FROM t WHERE c = 'abcd' LIMIT 10"),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            ids(
+                &core,
+                "SELECT id FROM t WHERE c IN ('a ', 'b') ORDER BY id LIMIT 10"
+            ),
+            vec![1, 4]
+        );
+        assert_eq!(
+            ids(
+                &core,
+                "SELECT id FROM t WHERE c NOT IN ('a ', 'b') ORDER BY id LIMIT 10"
+            ),
+            vec![2, 3]
+        );
+        assert_eq!(
+            ids(
+                &core,
+                "SELECT id FROM t WHERE c <> 'a' ORDER BY id LIMIT 10"
+            ),
+            vec![2, 3, 4]
+        );
+        assert_eq!(
+            ids(
+                &core,
+                "SELECT id FROM t WHERE c = 'a' OR c = 'b ' ORDER BY id LIMIT 10"
+            ),
+            vec![1, 4]
+        );
+        // 範囲比較（式レーン）。
+        assert_eq!(
+            ids(&core, "SELECT id FROM t WHERE c < 'b' ORDER BY id LIMIT 10"),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            ids(
+                &core,
+                "SELECT id FROM t WHERE c >= 'ab  ' ORDER BY id LIMIT 10"
+            ),
+            vec![2, 3, 4]
+        );
+        // UPDATE・DELETE の後も一致する。
+        ok(
+            &core,
+            "UPDATE t SET c = 'x' WHERE id = 1 USING OPERATION_ID 'u1'",
+        );
+        assert_eq!(
+            ids(&core, "SELECT id FROM t WHERE c = 'x  ' LIMIT 10"),
+            vec![1]
+        );
+        assert_eq!(
+            ids(&core, "SELECT id FROM t WHERE c = 'a' LIMIT 10"),
+            Vec::<u64>::new()
+        );
+        ok(&core, "DELETE FROM t WHERE id = 2 USING OPERATION_ID 'd1'");
+        assert_eq!(
+            ids(&core, "SELECT id FROM t WHERE c = 'ab' LIMIT 10"),
+            Vec::<u64>::new()
+        );
+    }
+}
+
+/// 式レーン: CHAR 列は TEXT へ変換した値（末尾空白なし）として振る舞う。
+#[test]
+fn char_in_expressions_behaves_as_trimmed_text() {
+    let (_p, _g, core) = open("cl-bpchar-expr");
+    ok(&core, "CREATE TABLE t (c CHAR(5), v TEXT)");
+    ok(
+        &core,
+        "INSERT INTO t (id, c, v) VALUES (1, 'ab', 'ab') USING OPERATION_ID 'o1'",
     );
     ok(
         &core,
-        "INSERT INTO t (id, n) VALUES (3, 3) USING OPERATION_ID 'o3'",
+        "INSERT INTO t (id, c, v) VALUES (2, 'ab', 'ab ') USING OPERATION_ID 'o2'",
     );
-    assert_eq!(select_count(&core, "SELECT * FROM t LIMIT 10"), 2);
-    assert_eq!(select_count(&core, "SELECT id, c FROM t LIMIT 10"), 2);
+    assert_eq!(
+        ids(
+            &core,
+            "SELECT id FROM t WHERE length(c) = 2 ORDER BY id LIMIT 10"
+        ),
+        vec![1, 2]
+    );
+    assert_eq!(
+        ids(&core, "SELECT id FROM t WHERE c = v ORDER BY id LIMIT 10"),
+        vec![1]
+    );
+    assert_eq!(
+        texts(&core, "SELECT concat(c, 'x') FROM t WHERE id = 1 LIMIT 10"),
+        vec![Some("abx".to_string())]
+    );
+}
+
+/// GROUP BY・DISTINCT・COUNT(DISTINCT)・ORDER BY は rtrim 比較で、出力は詰めた値。
+#[test]
+fn char_group_by_distinct_and_order_by_use_rtrim_semantics() {
+    let (_p, _g, core) = open("cl-bpchar-group");
+    ok(&core, "CREATE TABLE t (c CHAR(3))");
+    for (i, v) in ["a", "a ", "a  ", "b", "a\t"].iter().enumerate() {
+        ok(
+            &core,
+            &format!(
+                "INSERT INTO t (id, c) VALUES ({}, '{v}') USING OPERATION_ID 'o{i}'",
+                i + 1
+            ),
+        );
+    }
+    let r = core
+        .execute_sql(
+            &ctx_of("alice"),
+            "SELECT c, count(*) FROM t GROUP BY c ORDER BY c LIMIT 10",
+        )
+        .expect("group by");
+    assert_eq!(r.rows.len(), 3);
+    let keys: Vec<String> = r
+        .rows
+        .iter()
+        .filter_map(|row| match row.cells.first() {
+            Some(engine::sql::exec::Cell::Text(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    // rtrim 比較順: 'a' < 'a\t' < 'b'。出力は n 文字へ詰めた値。
+    assert_eq!(
+        keys,
+        vec!["a  ".to_string(), "a\t ".to_string(), "b  ".to_string()]
+    );
+    assert_eq!(select_count(&core, "SELECT DISTINCT c FROM t LIMIT 10"), 3);
+    let r = core
+        .execute_sql(&ctx_of("alice"), "SELECT count(DISTINCT c) FROM t")
+        .expect("count distinct");
+    assert_eq!(
+        r.rows.first().and_then(|row| row.cells.first()),
+        Some(&engine::sql::exec::Cell::Integer(3))
+    );
+    assert_eq!(
+        ids(&core, "SELECT id FROM t ORDER BY c, id LIMIT 10"),
+        vec![1, 2, 3, 5, 4]
+    );
+}
+
+/// 今回も拒否のまま残す形（PK／UNIQUE／LIKE／JOIN／MIN・MAX 等）は fail-closed。
+#[test]
+fn char_unsupported_forms_stay_fail_closed() {
+    let (_p, _g, core) = open("cl-bpchar-closed");
+    ok(&core, "CREATE TABLE t (c CHAR(3), n INT)");
+    ok(
+        &core,
+        "INSERT INTO t (id, c, n) VALUES (1, 'ab', 1) USING OPERATION_ID 'o1'",
+    );
     for sql in [
-        "SELECT id FROM t WHERE c = 'ab' LIMIT 10",
-        "SELECT id FROM t ORDER BY c LIMIT 10",
-        "SELECT c, count(*) FROM t GROUP BY c LIMIT 10",
+        "SELECT id FROM t WHERE c LIKE 'a%' LIMIT 10",
         "SELECT max(c) FROM t",
+        "SELECT min(c) FROM t",
     ] {
         assert!(
             exec_as("alice", &core, sql).is_err(),
-            "{sql} must be rejected while CHAR(n) semantics are unsettled"
+            "{sql} must be rejected while it is out of scope"
         );
     }
-    assert_eq!(
-        code(
-            &core,
-            "UPDATE t SET c = 'ab' WHERE id = 2 USING OPERATION_ID 'o4'"
-        ),
-        "0A000"
-    );
     for sql in [
         "CREATE TABLE p (c CHAR(3) PRIMARY KEY)",
         "CREATE TABLE p (c CHAR(3) UNIQUE)",
-        "CREATE INDEX t_c ON t (c)",
     ] {
         assert!(
             exec_as("alice", &core, sql).is_err(),
             "{sql} must be rejected"
         );
     }
-    assert!(exec_as("alice", &core, "CREATE TABLE d (c CHAR(3) DEFAULT 'ab')").is_err());
+}
+
+/// DEFAULT は n 文字へ詰めた形で保持され、ADD COLUMN の補完行も詰めた値になる。
+#[test]
+fn char_default_is_padded() {
+    let (_p, _g, core) = open("cl-bpchar-default");
+    ok(&core, "CREATE TABLE t (n INT, c CHAR(3) DEFAULT 'a')");
+    ok(
+        &core,
+        "INSERT INTO t (id, n) VALUES (1, 1) USING OPERATION_ID 'o1'",
+    );
+    assert_eq!(
+        texts(&core, "SELECT c FROM t WHERE id = 1 LIMIT 10"),
+        vec![Some("a  ".to_string())]
+    );
+    ok(&core, "ALTER TABLE t ADD COLUMN d CHAR(2) DEFAULT 'x'");
+    assert_eq!(
+        texts(&core, "SELECT d FROM t WHERE id = 1 LIMIT 10"),
+        vec![Some("x ".to_string())]
+    );
+    assert_eq!(
+        code(&core, "CREATE TABLE u (c CHAR(3) DEFAULT 'abcd')"),
+        "22001"
+    );
+}
+
+/// 詰め後の長さがエンジンの TEXT 上限を超える CHAR(n) は 54000 で、表は変わらない。
+#[test]
+fn char_padding_beyond_engine_text_limit_is_rejected() {
+    let (_p, _g, core) = open("cl-bpchar-limit");
+    ok(&core, "CREATE TABLE t (c CHAR(10485760))");
+    assert_eq!(
+        code(
+            &core,
+            "INSERT INTO t (id, c) VALUES (1, 'a') USING OPERATION_ID 'o1'"
+        ),
+        "54000"
+    );
+    assert_eq!(select_count(&core, "SELECT id FROM t LIMIT 10"), 0);
 }
 
 /// 長さ付き型が絡む `ALTER COLUMN TYPE` は既存行が n を超える状態を作りうるため拒否する

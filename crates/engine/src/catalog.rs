@@ -370,6 +370,7 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
         ty,
         ColumnType::Text
             | ColumnType::Varchar(_)
+            | ColumnType::Bpchar(_)
             | ColumnType::Enum(_)
             | ColumnType::Date
             | ColumnType::Timestamp
@@ -1038,8 +1039,9 @@ const _: () = assert!(
 );
 
 /// `VARCHAR(n)`／`CHAR(n)` の n の上限（文字数。TABLE-31・Issue #1563）。n は文字数との
-/// 比較にだけ使い、アロケーション量には使わない。`CHAR(n)` の空白詰め（Issue #1566）で
-/// n 文字を確保する経路は、応答バッファ上限の内側で行うこと。
+/// 比較にだけ使い、アロケーション量には使わない。`CHAR(n)` の空白詰め（Issue #1566）は
+/// 確保の前に詰め後のバイト長を `MAX_TEXT_FIELD_LEN`（DEFAULT は `MAX_COLUMN_DEFAULT_LEN`）
+/// で検査し、超過は `54000` で拒否する（`row_codec::fit_pad_char_length`）。
 pub const MAX_CHAR_TYPE_LENGTH: u32 = 10_485_760;
 
 /// 1 テーブルが持てる列数の上限。カタログ値のデコード時、この値を超える宣言列数は
@@ -1548,9 +1550,10 @@ pub enum ColumnType {
     Varchar(Option<u32>),
     /// `character(n)`（`CHAR(n)`／`CHARACTER(n)`、TABLE-31・Issue #1563）。n は
     /// `1..=`[`MAX_CHAR_TYPE_LENGTH`]。カタログタグは `bpchar`（`"char"` 1 バイト型とは別物）。
-    /// 空白詰め・末尾空白を無視する比較は Issue #1566、FK・索引・UNIQUE・ALTER TYPE は
-    /// Issue #1567 の担当で、それまでは非 NULL 値の書き込み・述語・索引・制約を fail-closed に
-    /// 拒否する（[`Self::is_text_like`] は `false`）。投影は TEXT と同じセルで返す。
+    /// 保存形は n 文字へ半角空白で詰めた値で、`=`／`IN`／`<`・`GROUP BY`／`ORDER BY`／
+    /// `DISTINCT`・スカラー索引は末尾の半角空白を無視して比較する（Issue #1566）。FK・UNIQUE・
+    /// PK・ALTER TYPE は Issue #1567 の担当で、それまでは fail-closed に拒否する
+    /// （[`Self::is_text_like`] は `false`。個別の腕で Bpchar を扱う）。投影は TEXT と同じセルで返す。
     Bpchar(u32),
     /// 固定次元の埋め込み列（`VECTOR(N)`、TABLE-1）。0 と `MAX_VECTOR_DIM` 超過は
     /// encode・decode 両側で拒否する。
@@ -3120,6 +3123,7 @@ impl ColumnDefault {
                 ColumnDefault::Text(_),
                 ColumnType::Text
                     | ColumnType::Varchar(_)
+                    | ColumnType::Bpchar(_)
                     | ColumnType::Date
                     | ColumnType::Timestamp
                     | ColumnType::Uuid
@@ -4320,6 +4324,16 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
                 if u32::try_from(s.chars().count()).map_or(true, |len| len > *n) {
                     return Err(CatalogError::Invalid(format!(
                         "column {:?} has a DEFAULT longer than its declared length",
+                        column.name
+                    )));
+                }
+            }
+            // `CHAR(n)` の既定値は n 文字へ空白詰め済みの形で保持する（保持値＝格納形。
+            // TABLE-31・Issue #1566）。詰め前の値は DDL 段が詰めてから渡す最後の砦。
+            if let (ColumnType::Bpchar(n), ColumnDefault::Text(s)) = (&column.ty, default) {
+                if !matches!(u32::try_from(s.chars().count()), Ok(len) if len == *n) {
+                    return Err(CatalogError::Invalid(format!(
+                        "column {:?} has a DEFAULT that is not blank-padded to its declared length",
                         column.name
                     )));
                 }

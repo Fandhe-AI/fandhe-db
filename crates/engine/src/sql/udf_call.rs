@@ -660,6 +660,11 @@ pub enum BuiltinFn {
     /// 解決できない。`bind_call`／`bind_binary` が `date_part`／`date_trunc` の
     /// `DATE` 引数、および `DATE`／`TIMESTAMP` 比較の `DATE` 側に挿入する）。
     DateToTimestamp,
+    /// `CHAR(n)` 列参照を TEXT として扱うための内部専用関数（名前では解決できない）。
+    /// 保存形（n 文字へ空白詰め）から末尾の半角空白（U+0020 のみ）を除く。PostgreSQL の
+    /// bpchar→text 変換と同じで、`length`／`lower`／`||`／TEXT 列との比較が末尾空白を
+    /// 無視した値で動く。`bind_expr_in` の列参照腕だけが挿入する（TABLE-31・Issue #1566）。
+    BpcharToText,
     /// 投影位置の整数／単精度の型付き算術（`+ - * /`）を表す内部専用関数（名前では
     /// 解決できない。Issue #1539・SQL-42。`bind_expr_in` の `Expr::Binary` 腕が
     /// 投影モード〔[`BindEnv::typed_arith`]〕のときだけ挿入する）。整数除算の切り捨て
@@ -815,6 +820,7 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::DatePart(_) => (&[ExprType::Timestamp], ExprType::Scalar),
         BuiltinFn::DateTrunc(_) => (&[ExprType::Timestamp], ExprType::Timestamp),
         BuiltinFn::DateToTimestamp => (&[ExprType::Date], ExprType::Timestamp),
+        BuiltinFn::BpcharToText => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::TypedArith(_, _) => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
     }
 }
@@ -859,7 +865,10 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         // ため同様に対象外とする。正しさには影響しない（defer-on-error で
         // 実行時に評価される。対象外事項として `docs/design/
         // datetime-scalar-functions.md` に記録）。
-        BuiltinFn::DatePart(_) | BuiltinFn::DateTrunc(_) | BuiltinFn::DateToTimestamp => false,
+        BuiltinFn::DatePart(_)
+        | BuiltinFn::DateTrunc(_)
+        | BuiltinFn::DateToTimestamp
+        | BuiltinFn::BpcharToText => false,
         // Issue #1539・SQL-42: 型付き算術は `Binary` と同じく `Scalar` を返す純関数で、
         // 0 除算・オーバーフローは defer-on-error（畳み込み失敗時は実行時に評価）。
         BuiltinFn::TypedArith(_, _) => true,
@@ -2124,10 +2133,15 @@ fn bind_expr_any(
                     | ColumnType::BigInt
                     | ColumnType::Real
                     | ColumnType::Double => Ok((BoundExpr::ColumnRef { index }, ExprType::Scalar)),
-                    // `CHAR(n)` の式内参照は bpchar 比較（Issue #1566）まで fail-closed に拒否する。
-                    ColumnType::Bpchar(_) => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} cannot be used in an expression (CHAR columns are not supported yet)"
-                    ))),
+                    // `CHAR(n)` の式内参照は TEXT へ変換した値（末尾の半角空白を除く）として
+                    // 扱う（PostgreSQL の bpchar→text 変換と同じ。TABLE-31・Issue #1566）。
+                    ColumnType::Bpchar(_) => Ok((
+                        BoundExpr::Builtin {
+                            f: BuiltinFn::BpcharToText,
+                            args: vec![BoundExpr::TextColumnRef { index }],
+                        },
+                        ExprType::Text,
+                    )),
                     ColumnType::Boolean => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BOOLEAN columns are not supported)"
                     ))),
@@ -2620,6 +2634,20 @@ fn bind_unknown_literal_against(
         return bind_jsonb_literal(s);
     }
     if other_ty != ExprType::Scalar {
+        // 相手が `CHAR(n)` 列参照（`BpcharToText`）なら、型なし文字列リテラルは bpchar として
+        // 解決され末尾の半角空白が比較に影響しない（TABLE-31・Issue #1566）。
+        if matches!(
+            other,
+            BoundExpr::Builtin {
+                f: BuiltinFn::BpcharToText,
+                ..
+            }
+        ) {
+            return Ok((
+                BoundExpr::Text(s.trim_end_matches(' ').to_string()),
+                ExprType::Text,
+            ));
+        }
         return Ok((BoundExpr::Text(s.to_string()), ExprType::Text));
     }
     let column_ty = match other {
@@ -3826,6 +3854,14 @@ pub(crate) fn apply_builtin<'a>(
             let d = take_date_arg(args, 0)?;
             Ok(ExprValue::Timestamp(datetime_fn::date_to_timestamp(d)))
         }
+        BuiltinFn::BpcharToText => match take_text_or_null_arg(args, 0)? {
+            None => Ok(ExprValue::Null),
+            Some(Cow::Borrowed(s)) => Ok(ExprValue::Text(Cow::Borrowed(s.trim_end_matches(' ')))),
+            Some(Cow::Owned(mut s)) => {
+                s.truncate(s.trim_end_matches(' ').len());
+                Ok(ExprValue::Text(Cow::Owned(s)))
+            }
+        },
         BuiltinFn::TypedArith(op, kind) => {
             let a = take_scalar_arg(args, 0)?;
             let b = take_scalar_arg(args, 1)?;

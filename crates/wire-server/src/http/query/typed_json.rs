@@ -381,10 +381,14 @@ pub fn map_json_to_literal(
                 "TEXT column value must be a JSON string",
             )),
         },
-        // CHAR(n) の NoSQL 型束縛は bpchar の意味論（Issue #1566）まで fail-closed に拒否する。
-        ColumnType::Bpchar(_) => Err(TypedJsonError::TypeMismatch(
-            "CHAR column is not supported on the NoSQL surface yet",
-        )),
+        // CHAR(n) は JSON 文字列だけを受け付け、n 文字への空白詰めと n 超過の 22001 は
+        // engine の束縛段が担う（TABLE-31・Issue #1566）。
+        ColumnType::Bpchar(_) => match raw {
+            JsonValue::String(s) => Ok(InsertLiteral::String(s.clone())),
+            _ => Err(TypedJsonError::TypeMismatch(
+                "CHAR column value must be a JSON string",
+            )),
+        },
         ColumnType::Boolean => match raw {
             JsonValue::Bool(b) => Ok(InsertLiteral::Bool(*b)),
             _ => Err(TypedJsonError::TypeMismatch(
