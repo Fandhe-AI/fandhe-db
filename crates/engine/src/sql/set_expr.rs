@@ -71,7 +71,8 @@ pub(crate) fn bind_set_expr(
     }
     // 式を受理しない列型。リテラル経路（`bind_set_assignments` の既存分岐）は無変更。
     match &column.ty {
-        ColumnType::Integer
+        ColumnType::SmallInt
+        | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Real
         | ColumnType::Double
@@ -94,7 +95,11 @@ pub(crate) fn bind_set_expr(
     let assignable = matches!(
         (&column.ty, ty),
         (
-            ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double,
+            ColumnType::SmallInt
+                | ColumnType::Integer
+                | ColumnType::BigInt
+                | ColumnType::Real
+                | ColumnType::Double,
             ExprType::Scalar
         ) | (ColumnType::Text | ColumnType::Varchar, ExprType::Text)
             | (ColumnType::Boolean, ExprType::Bool)
@@ -172,6 +177,18 @@ fn scalar_to_value(ty: &ColumnType, v: f64) -> Option<Result<Value, SqlSurfaceEr
     let out_of_range =
         |what: &str| SqlSurfaceError::numeric_out_of_range(format!("{what} out of range"));
     Some(match ty {
+        ColumnType::SmallInt => {
+            if !v.is_finite() {
+                return Some(Err(out_of_range("smallint")));
+            }
+            let r = v.round_ties_even();
+            if r < f64::from(i16::MIN) || r > f64::from(i16::MAX) {
+                Err(out_of_range("smallint"))
+            } else {
+                // 範囲検査済み。値表現は INTEGER と共有（`Value::Integer`）。
+                Ok(Value::Integer(i32::from(r as i16)))
+            }
+        }
         ColumnType::Integer => {
             if !v.is_finite() {
                 return Some(Err(out_of_range("integer")));
@@ -380,5 +397,17 @@ mod tests {
         assert_eq!(r.expect_err("beyond i32").wire_code(), "22003");
         let r = scalar_to_value(&ColumnType::Integer, 2.5).expect("numeric target");
         assert_eq!(r.expect("ok"), Value::Integer(2));
+    }
+
+    #[test]
+    fn smallint_target_is_range_checked() {
+        let r = scalar_to_value(&ColumnType::SmallInt, 32768.0).expect("numeric target");
+        assert_eq!(r.expect_err("beyond i16").wire_code(), "22003");
+        let r = scalar_to_value(&ColumnType::SmallInt, -32769.0).expect("numeric target");
+        assert_eq!(r.expect_err("below i16").wire_code(), "22003");
+        let r = scalar_to_value(&ColumnType::SmallInt, -32768.0).expect("numeric target");
+        assert_eq!(r.expect("ok"), Value::Integer(-32768));
+        let r = scalar_to_value(&ColumnType::SmallInt, f64::NAN).expect("numeric target");
+        assert_eq!(r.expect_err("non-finite").wire_code(), "22003");
     }
 }

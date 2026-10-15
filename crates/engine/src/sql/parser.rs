@@ -1750,7 +1750,11 @@ fn numeric_column_string_leaf_as_predicates(
         &c.name == column
             && matches!(
                 c.ty,
-                ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double
+                ColumnType::SmallInt
+                    | ColumnType::Integer
+                    | ColumnType::BigInt
+                    | ColumnType::Real
+                    | ColumnType::Double
             )
     });
     // 疑似列 `id`（スキーマに実カラム `id` が無い場合のみ。実カラム優先は
@@ -4804,6 +4808,10 @@ pub(crate) enum AggregateInput {
     /// #892）。`SUM` の結果は `i128` 累積・確定時に `i64` へ収まるか検査する
     /// （D2。`Accumulator::IntSum`）。
     IntegerColumn(usize),
+    /// `SMALLINT` 列の裸の列参照。受理範囲・累積方式は `IntegerColumn` と共有する
+    /// （値表現が同一〔`ScalarRef::Integer`〕）。結果型のみ異なり、`SUM` は bigint、
+    /// `MIN`/`MAX` は smallint（Issue #1559・TABLE-30 ポインタ）。
+    SmallIntColumn(usize),
     /// `BIGINT` 列の裸の列参照。`IntegerColumn` と同じ受理範囲・累積方式を
     /// 共有する（`ScalarRef::BigInt` からそのまま `i64` を取り出す点のみが
     /// 異なる）。
@@ -5529,12 +5537,9 @@ fn resolve_aggregate_input(
                     // `INTEGER`／`BIGINT` 列は `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
                     // のすべてで受理する（TABLE-13・TASK-196、Issue #881・
                     // #892）。
-                    // `SMALLINT` 列の集計（結果型 sum→bigint 等を含む）は兄弟 Issue（#1559）で
-                    // 解禁する。INTEGER 列として黙って集計せず fail-closed に拒否する
-                    // （Issue #1558）。
-                    (ColumnType::SmallInt, _) => Err(SqlSurfaceError::undefined_function(format!(
-                        "column {name:?} is SMALLINT and cannot be used in aggregates yet"
-                    ))),
+                    // `SMALLINT` 列も全集計を受理する（Issue #1559・TABLE-30 ポインタ）。
+                    // 結果型（sum→bigint・min/max→smallint）を区別するため専用 variant。
+                    (ColumnType::SmallInt, _) => Ok(AggregateInput::SmallIntColumn(index)),
                     (ColumnType::Integer, _) => Ok(AggregateInput::IntegerColumn(index)),
                     (ColumnType::BigInt, _) => Ok(AggregateInput::BigIntColumn(index)),
                     // `REAL`／`DOUBLE PRECISION` 列も同様にすべての集計関数を
@@ -5720,10 +5725,7 @@ fn resolve_count_distinct_input(
                     ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with COUNT(DISTINCT ...)"
                     ))),
-                    // SMALLINT は #1559 で解禁するまで拒否（Issue #1558）。
-                    ColumnType::SmallInt => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} is SMALLINT and cannot be used with COUNT(DISTINCT ...) yet"
-                    ))),
+                    ColumnType::SmallInt => Ok(AggregateInput::SmallIntColumn(index)),
                     ColumnType::Integer => Ok(AggregateInput::IntegerColumn(index)),
                     ColumnType::BigInt => Ok(AggregateInput::BigIntColumn(index)),
                     ColumnType::Real => Ok(AggregateInput::RealColumn(index)),
@@ -6170,18 +6172,17 @@ pub(crate) struct BoundOrderKey {
 fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
     match ty {
         ColumnType::Text | ColumnType::Varchar => Some(OrderKind::Bytes),
-        ColumnType::Integer | ColumnType::BigInt | ColumnType::Date | ColumnType::Timestamp => {
-            Some(OrderKind::SignedInt)
-        }
+        ColumnType::SmallInt
+        | ColumnType::Integer
+        | ColumnType::BigInt
+        | ColumnType::Date
+        | ColumnType::Timestamp => Some(OrderKind::SignedInt),
         ColumnType::Real | ColumnType::Double => Some(OrderKind::Float),
         ColumnType::Boolean => Some(OrderKind::Bool),
         ColumnType::Numeric { .. } => Some(OrderKind::Numeric),
         ColumnType::Uuid => Some(OrderKind::Uuid),
         ColumnType::Enum(_) => Some(OrderKind::Enum),
-        // SMALLINT の ORDER BY／GROUP BY キーは兄弟 Issue（#1559）で解禁する。それまでは
-        // 並べ替え不能として `None`（呼び出し元が `22000` へ写像。Issue #1558）。
-        ColumnType::SmallInt
-        | ColumnType::Vector(_)
+        ColumnType::Vector(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -6644,7 +6645,7 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
     {
         let kind = match &column.ty {
             ColumnType::Text | ColumnType::Varchar => WindowKeyKind::Text,
-            ColumnType::Integer => WindowKeyKind::Integer,
+            ColumnType::SmallInt | ColumnType::Integer => WindowKeyKind::Integer,
             ColumnType::BigInt => WindowKeyKind::BigInt,
             ColumnType::Real => WindowKeyKind::Real,
             ColumnType::Double => WindowKeyKind::Double,
@@ -6653,9 +6654,7 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
             ColumnType::Timestamp => WindowKeyKind::Timestamp,
             ColumnType::Numeric { .. } => WindowKeyKind::Numeric,
             ColumnType::Uuid => WindowKeyKind::Uuid,
-            // SMALLINT は #1559 で解禁するまで window キーにできない（Issue #1558）。
-            ColumnType::SmallInt
-            | ColumnType::Vector(_)
+            ColumnType::Vector(_)
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
@@ -7293,6 +7292,7 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
         AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => match &item.input {
             AggregateInput::IdU64
             | AggregateInput::IntegerColumn(_)
+            | AggregateInput::SmallIntColumn(_)
             | AggregateInput::BigIntColumn(_) => ColumnType::BigInt,
             AggregateInput::RealColumn(_)
             | AggregateInput::DoubleColumn(_)

@@ -70,7 +70,8 @@ fn is_supported_in_expr(ty: &PreparedParamType) -> bool {
         PreparedParamType::Column(ColumnMeta::Id) => true,
         PreparedParamType::Column(ColumnMeta::Scalar { ty, .. }) => matches!(
             ty,
-            ColumnType::Integer
+            ColumnType::SmallInt
+                | ColumnType::Integer
                 | ColumnType::BigInt
                 | ColumnType::Real
                 | ColumnType::Double
@@ -124,6 +125,7 @@ fn promote(lhs: PreparedParamType, rhs: PreparedParamType) -> PreparedParamType 
         match ty {
             PreparedParamType::Column(ColumnMeta::Id) => Some(2),
             PreparedParamType::Column(ColumnMeta::Scalar { ty, .. }) => match ty {
+                ColumnType::SmallInt => Some(0),
                 ColumnType::Integer => Some(1),
                 ColumnType::BigInt => Some(2),
                 ColumnType::Real => Some(3),
