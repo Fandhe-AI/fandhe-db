@@ -1883,7 +1883,7 @@ pub enum Statement {
 pub(crate) const MAX_CONST_SELECT_ITEMS: usize = 1024;
 
 /// `FROM` なし定数式 SELECT（[`Statement::ConstSelect`]。SQL-43・Issue #1531）の
-/// 構文検証済み形。列参照・集計の禁止は束縛段（`sql::const_select::bind`）が担う。
+/// 構文検証済み形。列参照の禁止は束縛段（`sql::const_select::bind`）が担う。
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ValidatedConstSelect {
@@ -1935,12 +1935,21 @@ pub enum ConstSelectCondition {
 pub struct ConstSelectItem {
     pub(crate) expr: Expr,
     pub(crate) alias: Option<String>,
+    /// トップレベルの集計項目（`count(*)`・`sum(<式>)` 等。SQL-43・Issue #2330）なら
+    /// その呼び出し。`expr` は内部名の `Expr::Ident`（[`aggregate_placeholder`]）になる。
+    pub(crate) aggregate: Option<AggregateItem>,
 }
 
 impl ConstSelectItem {
-    /// 項目の式。
+    /// 項目の式。集計項目（[`Self::aggregate`] が `Some`）では利用者が書けない内部名を
+    /// 返すため、呼び出し側は先に `aggregate()` を確認すること。
     pub fn expr(&self) -> &Expr {
         &self.expr
+    }
+
+    /// 集計項目ならその呼び出し（Issue #2330）。通常の式項目は `None`。
+    pub fn aggregate(&self) -> Option<&AggregateItem> {
+        self.aggregate.as_ref()
     }
 
     /// `AS` で明示された別名。
@@ -6486,11 +6495,12 @@ impl<'a> Parser<'a> {
         Ok(Some(order))
     }
 
-    /// `SELECT <式>[ AS <別名>][, ...] [WHERE <条件>] [LIMIT <n>] [OFFSET <m>][;]`
+    /// `SELECT <式>|<集計呼び出し>[ AS <別名>][, ...] [WHERE <条件>] [LIMIT <n>] [OFFSET <m>][;]`
     /// （`FROM` なし。SQL-43・Issue #1531・#2329）を解析する。句の順序は固定で、
     /// `SELECT *`・`AND`／`OR` 等を含む条件・`OFFSET` を `LIMIT` より前に置く形・
     /// `GROUP BY`／`HAVING`／`ORDER BY`・空リスト・末尾カンマはすべて `42601`
-    /// （fail-closed）。列参照・集計の拒否は束縛段の責務（構文木だけでは
+    /// （fail-closed）。トップレベルの集計項目（Issue #2330）だけを受理し、
+    /// 集計を含む式・入れ子集計は `42601`。列参照の拒否は束縛段の責務（構文木だけでは
     /// 関数名の意味が確定しないため）。項目数は `MAX_CONST_SELECT_ITEMS` で有界化する。
     fn parse_const_select(&mut self) -> Result<ValidatedConstSelect, SqlSurfaceError> {
         self.expect_keyword(Keyword::Select)?;
@@ -6506,14 +6516,35 @@ impl<'a> Parser<'a> {
                     "too many items in the SELECT list",
                 ));
             }
-            let expr = self.parse_value_expr(0)?;
+            // トップレベルの集計呼び出し（Issue #2330）。式中の集計は `agg_calls` が `None`
+            // のため従来どおり `parse_call_expr` が `42601` で拒否する。
+            let agg_name = match (self.peek(), self.tokens.get(self.pos.saturating_add(1))) {
+                (Some(Token::Ident(n)), Some(Token::Punct('(')))
+                    if is_aggregate_function_name(n) =>
+                {
+                    Some(n.clone())
+                }
+                _ => None,
+            };
+            let (expr, aggregate) = if let Some(name) = agg_name {
+                self.advance();
+                let call = self.parse_aggregate_call_after_name(&name)?;
+                self.consume_expr_node()?;
+                (Expr::Ident(aggregate_placeholder(0)), Some(call))
+            } else {
+                (self.parse_value_expr(0)?, None)
+            };
             let alias = if self.peek_ident_matches("AS") {
                 self.advance();
                 Some(self.expect_ident()?)
             } else {
                 None
             };
-            items.push(ConstSelectItem { expr, alias });
+            items.push(ConstSelectItem {
+                expr,
+                alias,
+                aggregate,
+            });
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
                 continue;
@@ -13665,6 +13696,31 @@ pub(crate) fn validate_update_form_tokens(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn const_select_top_level_aggregate_items_parse_shapes() {
+        use super::*;
+        let parse = |sql: &str| -> Result<ValidatedConstSelect, SqlSurfaceError> {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            Parser::new(&tokens).parse_const_select()
+        };
+        let v = parse("SELECT count(*)").expect("count star");
+        assert!(v.items()[0].aggregate().is_some());
+        let v = parse("SELECT count(*) AS c, 1").expect("mixed");
+        assert!(v.items()[0].aggregate().is_some());
+        assert!(v.items()[1].aggregate().is_none());
+        let v = parse("SELECT sum(1) WHERE false LIMIT 1").expect("with clauses");
+        assert!(v.items()[0].aggregate().is_some());
+        for bad in [
+            "SELECT count(*) + 1",
+            "SELECT lower(count(1))",
+            "SELECT sum(count(*))",
+            "SELECT 1 WHERE count(*) = 1",
+            "SELECT sum(*)",
+        ] {
+            assert!(parse(bad).is_err(), "{bad} must stay rejected");
+        }
+    }
+
     #[test]
     fn const_select_where_limit_offset_parse_shapes() {
         use super::*;
