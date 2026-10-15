@@ -3014,6 +3014,11 @@ fn numeric_kind(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> Option<Num
             f: BuiltinFn::TypedArith(_, k),
             ..
         } => Some(*k),
+        // `jsonb_array_length` は int4 なので、算術でも整数演算に解決する（Issue #1599）。
+        BoundExpr::JsonFn {
+            f: JsonFnKind::ArrayLength,
+            ..
+        } => Some(NumericKind::Int4),
         _ => None,
     }
 }
@@ -4359,13 +4364,37 @@ fn eval_json_fn<'a>(
                     detail: "argument list must have even number of elements",
                 });
             }
-            check_json_build_input_size(&values)?;
+            // 重複キーは後の値が勝つため、入力総量は出力サイズの下限にならない。上書きされた値を
+            // 保持せず、最終的に残るエントリのサイズ（キー + text/jsonb 値の長さ）の総和で
+            // 上限を検査する（保持中のメモリは常に上限以下）。
             let mut map = std::collections::BTreeMap::new();
+            let mut retained = 0usize;
             for [k, v] in values.as_chunks::<2>().0 {
                 let key = json_object_key(k)?;
-                // 重複キーは後の値が勝つ（PostgreSQL と同じ）。
-                map.insert(key, json_value_from_expr_value(v)?);
+                let vlen = match v {
+                    ExprValue::Text(t) => t.len(),
+                    ExprValue::Json(j) => j.len(),
+                    _ => 0,
+                };
+                let entry_len = key.len().saturating_add(vlen);
+                // 単一エントリが単独で上限超過なら、パース前に拒否する。
+                if entry_len > crate::json::MAX_JSON_FIELD_LEN {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "jsonb result exceeds the allowed size",
+                    ));
+                }
+                let parsed = json_value_from_expr_value(v)?;
+                if let Some((_, old_len)) = map.insert(key, (parsed, entry_len)) {
+                    retained = retained.saturating_sub(old_len);
+                }
+                retained = retained.saturating_add(entry_len);
+                if retained > crate::json::MAX_JSON_FIELD_LEN {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "jsonb result exceeds the allowed size",
+                    ));
+                }
             }
+            let map = map.into_iter().map(|(k, (v, _))| (k, v)).collect();
             let text = crate::json::serialize_jsonb_bounded(&crate::json::JsonValue::Object(map))
                 .map_err(json_build_error)?;
             Ok(ExprValue::Json(Cow::Owned(text)))

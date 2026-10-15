@@ -673,3 +673,45 @@ fn other_tenants_rows_never_affect_results_or_errors() {
     assert_eq!(e.wire_code(), "22023");
     assert!(!e.to_string().contains("alice-secret"));
 }
+
+#[test]
+fn jsonb_array_length_participates_in_integer_arithmetic() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed(&core, &alice, &[Some("[1,2,3]")]);
+    // int4 なので整数除算（1）。倍精度除算（1.5）にならない。
+    assert_eq!(
+        cell(&core, &alice, "jsonb_array_length(docb) / 2", 1),
+        Cell::SignedInteger(1)
+    );
+}
+
+#[test]
+fn build_object_size_check_uses_retained_entries_after_duplicate_keys() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    // 約 1 MB の jsonb を上書きしても、最終的に残るのは小さな値のみで成功する。
+    let big = format!("[\"{}\"]", "x".repeat(1_000_000));
+    seed(&core, &alice, &[Some(&big)]);
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            "jsonb_build_object('k', docb, 'k', docb, 'k', docb, 'k', docb, 'k', 0)",
+            1
+        ),
+        json("{\"k\":0}")
+    );
+    // 最終的に残る値の総量が上限を超えるときは 54000。
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "jsonb_build_object('a', docb, 'b', docb, 'c', docb, 'd', docb, 'e', docb)",
+            1
+        ),
+        "54000"
+    );
+}
