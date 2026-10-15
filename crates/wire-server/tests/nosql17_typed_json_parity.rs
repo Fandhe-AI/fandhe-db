@@ -44,6 +44,7 @@ use wire_server::http::session::store::SessionStore;
 
 const NOSQL_TABLE: &str = "docs_nosql";
 const SQL_TABLE: &str = "docs_sql";
+const VARCHAR_TABLE: &str = "docs_vc";
 
 /// 新型を全て含むスキーマ（`docs_nosql`・`docs_sql` で同一定義）。
 fn schema(name: &str) -> TableSchema {
@@ -140,6 +141,15 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     storage
         .create_table(&schema(SQL_TABLE))
         .expect("create sql table");
+    storage
+        .create_table(&TableSchema::new(
+            VARCHAR_TABLE,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("vc", ColumnType::Varchar(Some(3)), true),
+            ],
+        ))
+        .expect("create varchar table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     (Arc::new(core), guard)
 }
@@ -1199,4 +1209,42 @@ fn smallint_binding_matches_sql() {
         );
         assert!(body.contains(&format!("[[{expected}]")), "{filter}: {body}");
     }
+}
+
+/// `VARCHAR(n)` 列への NoSQL `insert`／`update` の長さ超過は `22001`（HTTP 400）で副作用なし。
+/// 超過部分が半角空白のみなら n 文字へ切り詰めて受理する（TABLE-31・Issue #1564）。
+#[test]
+fn varchar_over_length_is_22001_and_trailing_spaces_are_truncated() {
+    let (core, _g) = new_core();
+    let addr = spawn(Arc::clone(&core));
+    let ins = |id: u64, v: &str, op: &str| {
+        alice(
+            addr,
+            &format!(
+                r#"{{"op":"insert","table":"{VARCHAR_TABLE}","rows":[{{"id":{id},"embedding":[0.5,0.25],"vc":"{v}"}}],"operation_id":"{op}"}}"#
+            ),
+        )
+    };
+    let resp = ins(1, "abcd", "vc-1");
+    assert_eq!(http_common::wire_code_of(&resp), "22001", "{resp:?}");
+    assert_eq!(resp.status, 400, "{resp:?}");
+    assert!(!body_utf8(&resp).contains("abcd"), "{resp:?}");
+    assert_eq!(ins(2, "abc  ", "vc-2").status, 200);
+    let upd = |v: &str, op: &str| {
+        alice(
+            addr,
+            &format!(
+                r#"{{"op":"update","table":"{VARCHAR_TABLE}","set":{{"vc":"{v}"}},"where":{{"id":2}},"operation_id":"{op}"}}"#
+            ),
+        )
+    };
+    let resp = upd("wxyz", "vc-3");
+    assert_eq!(http_common::wire_code_of(&resp), "22001", "{resp:?}");
+    assert_eq!(resp.status, 400, "{resp:?}");
+    assert_eq!(upd("xyz ", "vc-4").status, 200);
+    let scan = body_utf8(&alice(
+        addr,
+        &format!(r#"{{"op":"scan","table":"{VARCHAR_TABLE}","columns":["id","vc"],"limit":10}}"#),
+    ));
+    assert!(scan.contains("xyz") && !scan.contains("abc"), "{scan}");
 }
