@@ -422,6 +422,10 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
   `NULL`・非 nullable なら `23502`（`NOT_NULL_VIOLATION`）。明示 `null` は
   `DEFAULT` の有無に関わらず、nullable なら `NULL`・非 nullable なら
   `23502`（`NOT_NULL_VIOLATION`。旧 `22000` から契約変更）
+- `VARCHAR(n)` 列（SQL DDL で作成）への `insert`／`update` で文字数（UTF-8 コードポイント数）が
+  n を超える値は `22001`（`code`=`STRING_DATA_RIGHT_TRUNCATION`、HTTP `400`。TABLE-31・Issue #1564）で
+  文全体を拒否し副作用を残さない。超過部分が半角空白（U+0020）のみなら n 文字へ切り詰めて受理する
+  （タブ・全角空白は対象外）。エラー文言は型と n だけで値を含まない
 - 未知キー・次元不一致・型不一致は `22000`（新型の型不一致は `42601`。上記参照）
 - 同一 `operation_id` の再送: 内容が一致すれば `23505`（`code`=`DUPLICATE_OPERATION_ID`）、不一致なら `22023`
   （台帳照合。TASK-101・RECOVER-10 の再送判定を透過する）
@@ -1109,6 +1113,7 @@ Date: <IMF-fixdate>
 | `08P01` | `PROTOCOL_VIOLATION` | 400 | Bad Request | 要求行・ヘッダ形状違反、未知ターゲットへのアクセス |
 | `21000` | `CARDINALITY_VIOLATION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（スカラーサブクエリは SQL 表層専用。後述） |
 | `22000` | `INVALID_INPUT` | 400 | Bad Request | `op` 別スキーマ検証での値の型・形状不正 |
+| `22001` | `STRING_DATA_RIGHT_TRUNCATION` | 400 | Bad Request | `VARCHAR(n)` 列への書き込みで文字数が n を超過（Issue #1564。超過部分が半角空白のみなら切り詰めて受理） |
 | `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー、`CHECK` 制約式の数値あふれ、`BIGINT` が `f64` で正確に表せない値（絶対値が 2^53 超）の拒否 |
 | `22007` | `INVALID_DATETIME_FORMAT` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの書式違反（`insert`／`update`／`filter`。Issue #1187） |
 | `22008` | `DATETIME_FIELD_OVERFLOW` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正（`update` の `set` 経由） |

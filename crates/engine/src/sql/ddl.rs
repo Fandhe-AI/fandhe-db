@@ -1038,7 +1038,12 @@ pub(crate) fn add_column_default(
             if s.len() > MAX_COLUMN_DEFAULT_LEN {
                 return Err(default_too_long(column_name));
             }
-            Ok(ColumnDefault::Text(s.clone()))
+            // `VARCHAR(n)` の既定値は定義時に n 文字へ収める（超過は `22001` で DDL を拒否。
+            // 超過部分が半角空白のみなら切り詰めて保存する。TABLE-31・Issue #1564）。
+            // PostgreSQL は INSERT 時に判定するが、ADD COLUMN では既存行が既定値を読むため
+            // 格納不変条件を保つ目的で定義時に fail-closed とする。
+            let stored = crate::row_codec::fit_char_length(ty, s)?;
+            Ok(ColumnDefault::Text(stored.to_string()))
         }
         // `JSONB` は DDL 時に正規化した形で保持する（読み出し時補完が借用で返せるよう、
         // 保持値＝格納形とする。Issue #1337）。エラー文言に値は含めない。

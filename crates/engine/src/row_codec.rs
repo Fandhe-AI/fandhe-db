@@ -2953,11 +2953,83 @@ fn is_text_frame_type(ty: &ColumnType) -> bool {
     ty.is_text_like() || matches!(ty, ColumnType::Bpchar(_))
 }
 
+/// `VARCHAR(n)`／`CHAR(n)` 列の文字数上限超過（`22001`。TABLE-31・Issue #1564）。
+/// 束縛段・DDL の既定値・SET 式評価が [`fit_char_length`] の失敗として返し、
+/// [`crate::sql::allowlist::SqlSurfaceError::StringDataRightTruncation`] へ写像する。
+/// 文言は型と n だけの固定文言で、値・列名・テナントは含めない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CharLengthExceeded {
+    /// `CHAR(n)` なら true（文言を `character(n)` にする）。
+    bpchar: bool,
+    n: u32,
+}
+
+impl std::fmt::Display for CharLengthExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.bpchar {
+            write!(f, "value too long for type character({})", self.n)
+        } else {
+            write!(f, "value too long for type character varying({})", self.n)
+        }
+    }
+}
+
+impl From<CharLengthExceeded> for crate::sql::allowlist::SqlSurfaceError {
+    fn from(e: CharLengthExceeded) -> Self {
+        crate::sql::allowlist::SqlSurfaceError::string_data_right_truncation(e.to_string())
+    }
+}
+
+/// `VARCHAR(n)`／`CHAR(n)` へ書き込む文字列を n 文字へ収める（TABLE-31・Issue #1564）。
+/// 収まる値はそのまま、n 文字を超える部分がすべて半角空白（U+0020 のみ。タブ・改行・
+/// 全角空白は対象外）なら n 文字へ切り詰めて返し、それ以外は [`CharLengthExceeded`]。
+/// `Varchar(None)`・`Text` 等の他の型は素通しする。SQL 束縛段・COPY・DDL の既定値・
+/// SET 式評価・UPSERT の `EXCLUDED` 代入が共有する判定で、codec の
+/// [`check_varchar_length`]（切り詰めなしの最後の砦）の手前で使う。
+pub(crate) fn fit_char_length<'a>(
+    ty: &ColumnType,
+    text: &'a str,
+) -> std::result::Result<&'a str, CharLengthExceeded> {
+    let (n, bpchar) = match ty {
+        ColumnType::Varchar(Some(n)) => (*n, false),
+        ColumnType::Bpchar(n) => (*n, true),
+        _ => return Ok(text),
+    };
+    let err = CharLengthExceeded { bpchar, n };
+    let limit = usize::try_from(n).unwrap_or(usize::MAX);
+    // バイト数が n 以下なら文字数も n 以下（巨大文字列の走査を避ける）。
+    if text.len() <= limit {
+        return Ok(text);
+    }
+    let Some((idx, _)) = text.char_indices().nth(limit) else {
+        return Ok(text);
+    };
+    match (text.get(idx..), text.get(..idx)) {
+        (Some(rest), Some(head)) if rest.bytes().all(|b| b == b' ') => Ok(head),
+        _ => Err(err),
+    }
+}
+
+/// [`fit_char_length`] を `Value::Text` へその場適用する（切り詰めが必要なときだけ短縮）。
+pub(crate) fn normalize_char_length_value(
+    column: &crate::catalog::ColumnDef,
+    value: &mut Value,
+) -> std::result::Result<(), CharLengthExceeded> {
+    if let Value::Text(t) = value {
+        let fitted_len = fit_char_length(&column.ty, t)?.len();
+        if fitted_len < t.len() && t.is_char_boundary(fitted_len) {
+            t.truncate(fitted_len);
+        }
+    }
+    Ok(())
+}
+
 /// `VARCHAR(n)`／`CHAR(n)` 列への書き込みで、文字数（バイト数ではない）が n を超える値を
 /// 拒否する（TABLE-31・Issue #1563）。SQL・COPY・NoSQL・UPSERT・INSERT…SELECT・
 /// FK CASCADE の書き込みはすべて encode 系を通るため、ここが長さ超過を永続化させない
-/// 単一のチョークポイントになる。束縛段での `22001` 分類と末尾空白の切り詰め許容は
-/// Issue #1564 の担当で、それまでは `RowCodecError::Invalid` として fail-closed に拒否する。
+/// 最後の砦になる。`22001` 分類と末尾空白の切り詰め許容は束縛段の [`fit_char_length`]
+/// （Issue #1564）が担い、ここは切り詰めなしの厳格判定のまま
+/// `RowCodecError::Invalid` として fail-closed に拒否する。
 /// エラーには列名だけを含め、値は反射しない。
 pub(crate) fn check_varchar_length(column: &crate::catalog::ColumnDef, text: &str) -> Result<()> {
     let n = match &column.ty {
@@ -4600,6 +4672,35 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
 mod tests {
     use super::*;
     use crate::catalog::ColumnDef;
+
+    /// `fit_char_length`（TABLE-31・Issue #1564）: 境界・マルチバイト・空白切り詰め・素通し。
+    #[test]
+    fn fit_char_length_rules() {
+        let v3 = ColumnType::Varchar(Some(3));
+        assert_eq!(fit_char_length(&v3, "abc"), Ok("abc"));
+        assert_eq!(fit_char_length(&v3, "日本語"), Ok("日本語"));
+        assert!(fit_char_length(&v3, "日本語x").is_err());
+        assert_eq!(fit_char_length(&v3, "abc   "), Ok("abc"));
+        assert_eq!(fit_char_length(&v3, "ab  "), Ok("ab "));
+        assert!(fit_char_length(&v3, "ab c").is_err());
+        assert!(fit_char_length(&v3, "abc\t").is_err());
+        assert!(fit_char_length(&v3, "abc\u{3000}").is_err());
+        assert_eq!(
+            fit_char_length(&ColumnType::Text, "abcdefgh"),
+            Ok("abcdefgh")
+        );
+        assert_eq!(
+            fit_char_length(&ColumnType::Varchar(None), "abcdefgh"),
+            Ok("abcdefgh")
+        );
+        let e = fit_char_length(&ColumnType::Bpchar(2), "abc").unwrap_err();
+        assert_eq!(e.to_string(), "value too long for type character(2)");
+        let e = fit_char_length(&v3, "secret").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "value too long for type character varying(3)"
+        );
+    }
 
     fn text_vector_schema() -> TableSchema {
         TableSchema::new(

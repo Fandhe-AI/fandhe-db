@@ -2670,6 +2670,19 @@ pub(crate) fn fill_omitted_columns(
     Ok(())
 }
 
+/// 文字列リテラルを TEXT／`VARCHAR(n)` 列の [`crate::row_codec::Value::Text`] へ束縛する
+/// （TABLE-31・Issue #1564）。n 文字超過は `22001`、超過部分が半角空白のみなら n 文字へ
+/// 切り詰める。INSERT・UPDATE SET・UPSERT・COPY・ファイル形 INSERT の束縛段が共有し、
+/// `$n`（拡張クエリ）・NoSQL の値束縛もここを通る。
+pub(crate) fn bind_text_literal(
+    ty: &ColumnType,
+    s: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    Ok(crate::row_codec::Value::Text(
+        crate::row_codec::fit_char_length(ty, s)?.to_string(),
+    ))
+}
+
 /// [`ColumnDefault`] を実際の列型の [`crate::row_codec::Value`] へ束縛する
 /// （TABLE-16・TASK-204、Issue #904）。カタログ層
 /// （`catalog::ColumnDefault::compatible_with`。`validate_schema` 経由で
@@ -2699,7 +2712,10 @@ pub(crate) fn bind_column_default(
     }
     match crate::row_codec::default_scalar(&column.ty, default) {
         Ok(scalar) => match scalar {
-            ScalarRef::Text(s) => Ok(Value::Text(s.to_string())),
+            // 旧形式で保存された既定値でも n 超過を書き込ませない（冪等。Issue #1564）。
+            ScalarRef::Text(s) => Ok(Value::Text(
+                crate::row_codec::fit_char_length(&column.ty, s)?.to_string(),
+            )),
             ScalarRef::Integer(v) => Ok(Value::Integer(v)),
             ScalarRef::BigInt(v) => Ok(Value::BigInt(v)),
             ScalarRef::Real(v) => Ok(Value::Real(v)),
@@ -2838,7 +2854,7 @@ fn bind_insert_row(
                 | InsertLiteral::Vector(_),
             ) => return Err(bpchar_write_unsupported(name)),
             (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Text(s.clone())
+                bind_text_literal(&column.ty, s)?
             }
             (
                 ColumnType::Text | ColumnType::Varchar(_),
@@ -3286,7 +3302,7 @@ fn bind_set_assignments(
                 | InsertLiteral::Vector(_),
             ) => return Err(bpchar_write_unsupported(name)),
             (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Text(s.clone())
+                bind_text_literal(&column.ty, s)?
             }
             (
                 ColumnType::Text | ColumnType::Varchar(_),
@@ -4445,7 +4461,7 @@ fn bind_upsert_assignments(
                         return Err(bpchar_write_unsupported(name))
                     }
                     (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::String(s)) => {
-                        crate::row_codec::Value::Text(s.clone())
+                        bind_text_literal(&column.ty, s)?
                     }
                     (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
@@ -4643,7 +4659,7 @@ fn bind_file_insert(
                 return Err(bpchar_write_unsupported(name))
             }
             (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Text(s.clone())
+                bind_text_literal(&column.ty, s)?
             }
             (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(

@@ -448,6 +448,9 @@ pub enum SqlSurfaceError {
     /// 非有限値・次元不一致、`LIMIT` 範囲外、hybrid の 2 引数形（実行不能）等。ERR-2:
     /// `22000`）。
     InvalidInput { detail: String },
+    /// `VARCHAR(n)`／`CHAR(n)` 列への書き込みで文字数が n を超えた（`22001`。TABLE-31・
+    /// ERR-6・Issue #1564）。`detail` は型と n だけの固定文言で、値・行・テナントを含めない。
+    StringDataRightTruncation { detail: String },
     /// 定数式 SELECT（`sql::const_select`）の負の `LIMIT`／`OFFSET`（`22000`。Issue #2329）。
     /// `InvalidInput` と同じ分類だが、`docs/design/sql-from-less-select.md` の固定文言
     /// （`LIMIT must not be negative`／`OFFSET must not be negative`）を接頭辞なしで
@@ -840,6 +843,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: 文字列書き込み経路の長さ超過（`22001`。Issue #1564）を報告する。
+    /// `detail` は [`crate::row_codec::CharLengthExceeded`] の固定文言（値を含まない）。
+    pub(crate) fn string_data_right_truncation(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::StringDataRightTruncation {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::const_select::execute` が負の `LIMIT`／`OFFSET`（`22000`）を
     /// 固定文言で報告するために使う（Issue #2329）。
     pub(crate) fn negative_row_count(clause: &'static str) -> Self {
@@ -1004,6 +1015,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InvalidInput { .. } | SqlSurfaceError::NegativeRowCount { .. } => {
                 ErrorClass::InvalidInput
             }
+            SqlSurfaceError::StringDataRightTruncation { .. } => {
+                ErrorClass::StringDataRightTruncation
+            }
             SqlSurfaceError::CardinalityViolation => ErrorClass::CardinalityViolation,
             SqlSurfaceError::PayloadTooLarge { .. } => ErrorClass::PayloadTooLarge,
             SqlSurfaceError::MissingOperationId => ErrorClass::MissingOperationId,
@@ -1078,6 +1092,7 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::UndefinedTable { name } => write!(f, "undefined table: {name}"),
             SqlSurfaceError::Internal { detail } => write!(f, "internal error: {detail}"),
             SqlSurfaceError::InvalidInput { detail } => write!(f, "invalid input: {detail}"),
+            SqlSurfaceError::StringDataRightTruncation { detail } => write!(f, "{detail}"),
             SqlSurfaceError::NegativeRowCount { clause } => {
                 write!(f, "{clause} must not be negative")
             }

@@ -1,5 +1,5 @@
 //! `VARCHAR(n)`／`CHAR(n)` の宣言（`ColumnType::Varchar(Some(n))`・`ColumnType::Bpchar(n)`）の
-//! 結合テスト。ポインタ: TABLE-31・Issue #1563（兄弟: #1564 長さ超過 22001・#1565 wire typmod・
+//! 結合テスト。ポインタ: TABLE-31・Issue #1563・#1564（長さ超過 22001・空白の切り詰め。兄弟: #1565 wire typmod・
 //! #1566 CHAR の空白詰めと比較・#1567 ALTER TYPE／FK／索引／UNIQUE）。
 //!
 //! production 経路（`EngineCore::execute_sql_in_session`）で、(1) 長さと種別がカタログ param として
@@ -8,7 +8,7 @@
 //! 倒れていること、を固定する。
 
 use engine::catalog::ColumnType;
-use engine::core::EngineCore;
+use engine::core::{CopyPlan, EngineCore};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::allowlist::SqlSurfaceError;
@@ -174,9 +174,8 @@ fn maximum_length_is_accepted() {
     assert_eq!(column_type(&path, "t", "b"), ColumnType::Bpchar(10_485_760));
 }
 
-/// n 超過の書き込みは永続化されない（codec のバックストップ）。長さは文字数で数える。
-/// 現状のコードは codec エラーの写像値を固定する。束縛段での `22001` 分類と末尾空白の
-/// 切り詰め許容は Issue #1564 の担当で、その Issue がこの期待値を更新する。
+/// n 超過の書き込みは束縛段で `22001` になり永続化されない。長さは文字数で数える
+/// （Issue #1564。codec は最後の砦）。
 #[test]
 fn over_length_writes_are_rejected_and_not_persisted() {
     let (_p, _g, core) = open("cl-overflow");
@@ -198,15 +197,16 @@ fn over_length_writes_are_rejected_and_not_persisted() {
         &core,
         "INSERT INTO t (id, v) VALUES (4, 'abcd') USING OPERATION_ID 'o4'",
     );
-    assert_eq!(c, "22000");
+    assert_eq!(c, "22001");
     assert_eq!(select_count(&core, "SELECT id FROM t LIMIT 10"), 3);
-    // UPDATE の SET でも超過は拒否され、既存行は不変。
-    assert!(exec_as(
-        "alice",
-        &core,
-        "UPDATE t SET v = 'abcd' WHERE id = 1 USING OPERATION_ID 'o5'"
-    )
-    .is_err());
+    // UPDATE の SET でも超過は 22001 で拒否され、既存行は不変。
+    assert_eq!(
+        code(
+            &core,
+            "UPDATE t SET v = 'abcd' WHERE id = 1 USING OPERATION_ID 'o5'"
+        ),
+        "22001"
+    );
     assert_eq!(
         select_count(&core, "SELECT id FROM t WHERE v = 'abc' LIMIT 10"),
         1
@@ -223,12 +223,13 @@ fn over_length_update_set_is_rejected_even_with_zero_matching_rows() {
         &core,
         "INSERT INTO t (id, v) VALUES (1, 'abc') USING OPERATION_ID 'o1'",
     );
-    assert!(exec_as(
-        "alice",
-        &core,
-        "UPDATE t SET v = 'abcd' WHERE id = 999 USING OPERATION_ID 'o2'"
-    )
-    .is_err());
+    assert_eq!(
+        code(
+            &core,
+            "UPDATE t SET v = 'abcd' WHERE id = 999 USING OPERATION_ID 'o2'"
+        ),
+        "22001"
+    );
     // 拒否で operation_id が消費されていなければ、同 ID で有効な更新が成功する。
     ok(
         &core,
@@ -375,12 +376,10 @@ fn alter_column_type_with_bounded_types_is_incompatible() {
 fn varchar_default_longer_than_length_is_rejected() {
     let (path, _g, core) = open("cl-default");
     ok(&core, "CREATE TABLE ok_t (v VARCHAR(3) DEFAULT 'abc')");
-    assert!(exec_as(
-        "alice",
-        &core,
-        "CREATE TABLE bad_t (v VARCHAR(3) DEFAULT 'abcd')"
-    )
-    .is_err());
+    assert_eq!(
+        code(&core, "CREATE TABLE bad_t (v VARCHAR(3) DEFAULT 'abcd')"),
+        "22001"
+    );
     drop(core);
     assert!(table_exists(&path, "ok_t"));
     assert!(!table_exists(&path, "bad_t"));
@@ -399,4 +398,196 @@ fn errors_do_not_leak_tenant_information() {
         !msg.contains("alice") && !msg.contains("bob") && !msg.contains("secret_t"),
         "{msg}"
     );
+}
+
+fn count_where(core: &EngineCore, table: &str, v: &str) -> usize {
+    select_count(
+        core,
+        &format!("SELECT id FROM {table} WHERE v = '{v}' LIMIT 10"),
+    )
+}
+
+/// 超過部分が半角空白のみなら n 文字へ切り詰めて受理する（INSERT・UPDATE・UPSERT。
+/// タブ・全角空白は対象外）。
+#[test]
+fn trailing_spaces_beyond_length_are_truncated() {
+    let (_p, _g, core) = open("cl-trim");
+    ok(&core, "CREATE TABLE t (v VARCHAR(3))");
+    ok(
+        &core,
+        "INSERT INTO t (id, v) VALUES (1, 'abc   ') USING OPERATION_ID 'o1'",
+    );
+    assert_eq!(count_where(&core, "t", "abc"), 1);
+    ok(
+        &core,
+        "INSERT INTO t (id, v) VALUES (2, 'x') USING OPERATION_ID 'o2'",
+    );
+    ok(
+        &core,
+        "UPDATE t SET v = 'xyz  ' WHERE id = 2 USING OPERATION_ID 'o3'",
+    );
+    assert_eq!(count_where(&core, "t", "xyz"), 1);
+    ok(
+        &core,
+        "INSERT INTO t (id, v) VALUES (3, 'pqr  ') ON CONFLICT (id) DO UPDATE SET v = 'zzz   ' \
+         USING OPERATION_ID 'o4'",
+    );
+    assert_eq!(count_where(&core, "t", "pqr"), 1);
+    ok(
+        &core,
+        "INSERT INTO t (id, v) VALUES (3, 'q') ON CONFLICT (id) DO UPDATE SET v = 'zzz   ' \
+         USING OPERATION_ID 'o5'",
+    );
+    assert_eq!(count_where(&core, "t", "zzz"), 1);
+    // 空白以外が超過部分に含まれる・空白以外の空白類は 22001。
+    for lit in ["ab c", "abc\t", "abc\u{3000}", "abc  d"] {
+        let sql = format!("INSERT INTO t (id, v) VALUES (9, '{lit}') USING OPERATION_ID 'o9'");
+        assert_eq!(code(&core, &sql), "22001", "{lit:?}");
+    }
+    assert_eq!(select_count(&core, "SELECT id FROM t LIMIT 10"), 3);
+}
+
+/// SET 式の評価結果・UPSERT の DO UPDATE（リテラル・EXCLUDED）の超過は 22001 で全行不変。
+#[test]
+fn runtime_evaluated_assignments_are_rejected_with_22001() {
+    let (_p, _g, core) = open("cl-runtime");
+    ok(&core, "CREATE TABLE t (v VARCHAR(3), w TEXT)");
+    ok(
+        &core,
+        "INSERT INTO t (id, v, w) VALUES (1, 'abc', 'longtext') USING OPERATION_ID 'o1'",
+    );
+    assert_eq!(
+        code(
+            &core,
+            "UPDATE t SET v = upper(w) WHERE id = 1 USING OPERATION_ID 'o2'"
+        ),
+        "22001"
+    );
+    assert_eq!(
+        code(
+            &core,
+            "INSERT INTO t (id, v, w) VALUES (1, 'a', 'longtext') ON CONFLICT (id) \
+             DO UPDATE SET v = EXCLUDED.w USING OPERATION_ID 'o3'"
+        ),
+        "22001"
+    );
+    assert_eq!(
+        code(
+            &core,
+            "INSERT INTO t (id, v, w) VALUES (1, 'a', 'b') ON CONFLICT (id) \
+             DO UPDATE SET v = 'toolong' USING OPERATION_ID 'o4'"
+        ),
+        "22001"
+    );
+    assert_eq!(
+        code(
+            &core,
+            "INSERT INTO t (id, v, w) VALUES (2, 'toolong', 'b') ON CONFLICT (id) \
+             DO UPDATE SET v = 'ok' USING OPERATION_ID 'o5'"
+        ),
+        "22001"
+    );
+    assert_eq!(select_count(&core, "SELECT id FROM t LIMIT 10"), 1);
+    assert_eq!(count_where(&core, "t", "abc"), 1);
+}
+
+/// COPY FROM は 1 行でも超過すると 22001 で全体を拒否（0 行）。空白のみの超過は切り詰める。
+#[test]
+fn copy_from_over_length_is_rejected_atomically() {
+    let (_p, _g, core) = open("cl-copy");
+    ok(&core, "CREATE TABLE t (v VARCHAR(3))");
+    let run = |sql: &str, payload: &[u8]| {
+        let policy = ctx_of("alice");
+        let session = SessionState::default();
+        let plan = core.begin_copy(&policy, &session, sql)?;
+        let mut cs = match plan {
+            CopyPlan::From(s) => s,
+            CopyPlan::To(..) => panic!("expected COPY FROM"),
+        };
+        cs.feed(payload)?;
+        let batch = cs.finish()?;
+        core.commit_copy_in(&policy, batch)
+    };
+    let err = run(
+        "COPY t (id, v) FROM STDIN USING OPERATION_ID 'c1'",
+        b"1\tabc\n2\tabcd\n",
+    )
+    .expect_err("over-length COPY must fail");
+    assert_eq!(err.wire_code(), "22001");
+    assert_eq!(select_count(&core, "SELECT id FROM t LIMIT 10"), 0);
+    run(
+        "COPY t (id, v) FROM STDIN USING OPERATION_ID 'c2'",
+        b"1\tabc  \n",
+    )
+    .expect("trailing spaces are truncated");
+    assert_eq!(count_where(&core, "t", "abc"), 1);
+}
+
+/// DEFAULT: 超過は DDL ごと 22001 で不変、空白のみの超過は切り詰めて保存され補完行に使われる。
+#[test]
+fn defaults_are_checked_at_definition_time() {
+    let (path, _g, core) = open("cl-default22001");
+    assert_eq!(
+        code(&core, "CREATE TABLE a (v VARCHAR(3) DEFAULT 'abcd')"),
+        "22001"
+    );
+    ok(&core, "CREATE TABLE t (id2 INT)");
+    assert_eq!(
+        code(
+            &core,
+            "ALTER TABLE t ADD COLUMN v VARCHAR(3) DEFAULT 'abcd'"
+        ),
+        "22001"
+    );
+    ok(
+        &core,
+        "CREATE TABLE b (n INT, v VARCHAR(3) DEFAULT 'ab   ')",
+    );
+    ok(
+        &core,
+        "INSERT INTO b (id, n) VALUES (1, 1) USING OPERATION_ID 'o1'",
+    );
+    assert_eq!(count_where(&core, "b", "ab "), 1);
+    drop(core);
+    assert!(!table_exists(&path, "a"));
+}
+
+/// 明示トランザクション内の超過でも 22001 になり、その文の副作用は残らない。
+#[test]
+fn over_length_in_explicit_transaction_leaves_no_side_effect() {
+    let (_p, _g, core) = open("cl-txn");
+    ok(&core, "CREATE TABLE t (v VARCHAR(3))");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    let ctx = ctx_of("alice");
+    core.execute_sql_in_txn(&ctx, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let e = core
+        .execute_sql_in_txn(
+            &ctx,
+            &mut session,
+            &mut txn,
+            "INSERT INTO t (id, v) VALUES (1, 'abcd') USING OPERATION_ID 'o1'",
+        )
+        .expect_err("must fail");
+    assert_eq!(e.wire_code(), "22001");
+    let _ = core.execute_sql_in_txn(&ctx, &mut session, &mut txn, "ROLLBACK");
+    assert_eq!(select_count(&core, "SELECT id FROM t LIMIT 10"), 0);
+}
+
+/// 22001 の文言は型と n だけの固定文言で、値を含まない。
+#[test]
+fn truncation_message_does_not_reflect_values() {
+    let (_p, _g, core) = open("cl-msg");
+    ok(&core, "CREATE TABLE t (v VARCHAR(3))");
+    let e = exec_as(
+        "alice",
+        &core,
+        "INSERT INTO t (id, v) VALUES (1, 'secretvalue') USING OPERATION_ID 'o1'",
+    )
+    .expect_err("must fail");
+    assert_eq!(e.wire_code(), "22001");
+    let msg = e.to_string();
+    assert!(msg.contains("character varying(3)"), "{msg}");
+    assert!(!msg.contains("secretvalue"), "{msg}");
 }

@@ -555,7 +555,9 @@ fn bind_copy_record(
             }
             Some(s) => match &column.ty {
                 ColumnType::Vector(dim) => Value::Vector(parse_vector_literal(s, *dim)?),
-                ColumnType::Text | ColumnType::Varchar(_) => Value::Text(s.clone()),
+                ColumnType::Text | ColumnType::Varchar(_) => {
+                    crate::sql::parser::bind_text_literal(&column.ty, s)?
+                }
                 // `CHAR(n)` への非 NULL 書き込みは空白詰め・bpchar 比較（Issue #1566）まで
                 // fail-closed に拒否する。
                 ColumnType::Bpchar(_) => {

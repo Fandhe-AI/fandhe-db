@@ -92,11 +92,15 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 48;
+    count = 49;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
     InvalidInput => ("22000", "INVALID_INPUT"),
+    /// `VARCHAR(n)`／`CHAR(n)` 列への書き込みで文字数が n を超えた（`22001`。
+    /// TABLE-31・ERR-6・Issue #1564）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::StringDataRightTruncation`] の写像。
+    StringDataRightTruncation => ("22001", "STRING_DATA_RIGHT_TRUNCATION"),
     /// 認証資格情報が無効（`28P01`）。wire-server の `auth::SQLSTATE_INVALID_PASSWORD`
     /// に対応する分類（engine 側に発生経路はなく、写像の集約のみ）。
     AuthInvalid => ("28P01", "AUTH_INVALID"),

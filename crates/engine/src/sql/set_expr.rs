@@ -145,7 +145,11 @@ pub(crate) fn eval_set_expr_to_value<'a>(
         }
         ExprValue::Scalar(v) => scalar_to_value(&set.target_ty, v).ok_or_else(internal)?,
         ExprValue::Text(t) => match &set.target_ty {
-            ColumnType::Text | ColumnType::Varchar(_) => Ok(Value::Text(t.into_owned())),
+            // `VARCHAR(n)` の n 超過は `22001`（超過部分が半角空白のみなら切り詰め。
+            // TABLE-31・Issue #1564）。行ごとの評価結果にしか値が決まらないためここで判定する。
+            ColumnType::Text | ColumnType::Varchar(_) => Ok(Value::Text(
+                crate::row_codec::fit_char_length(&set.target_ty, &t)?.to_string(),
+            )),
             _ => Err(internal()),
         },
         ExprValue::Bool(b) => match &set.target_ty {
