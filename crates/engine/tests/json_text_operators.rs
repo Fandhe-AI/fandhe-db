@@ -302,10 +302,10 @@ fn json_function_errors_use_postgres_sqlstates() {
     assert_eq!(code(&core, &alice, "json_array_length(doc)"), "22023");
     assert_eq!(code(&core, &alice, "json_array_length('1')"), "22023");
     assert_eq!(code(&core, &alice, "json_build_object('a')"), "22023");
-    // NULL のキーは拒否する（PostgreSQL は 22004。分類追加までは 22023）。
+    // NULL のキーは 22004（jsonb_build_object と同じ分類）。
     assert_eq!(
         code(&core, &alice, "json_build_object(doc ->> 'zz', 1)"),
-        "22023"
+        "22004"
     );
     assert_eq!(code(&core, &alice, "json_build_object(doc, 1)"), "22023");
     // 引数個数・型の不一致は `42883`。
@@ -396,6 +396,28 @@ fn json_values_have_no_comparison_or_ordering_and_cannot_be_consumed_elsewhere()
     assert_eq!(code(&core, &alice, "length(doc -> 'a')"), "0A000");
 }
 
+/// 回帰（PR #2390 指摘）: json 関数の結果（`ExprType::JsonText`）に対する演算子は、json 列・
+/// `doc -> 'a'` と同じ表層のエラーになる（`-` が算術経路の 42804 へ落ちない）。
+#[test]
+fn json_function_results_reject_jsonb_operators_like_json_columns() {
+    let (core, path, alice) = seeded();
+    let _guard = CleanupGuard(path);
+    let results = [
+        "json_build_object('a', 1)",
+        "to_json(1)",
+        "json_extract_path(doc, 'a')",
+    ];
+    let operators = ["- 'a'", "- 1", "#- '{a}'", "|| '{}'", "? 'a'", "@> '{}'"];
+    for result in results {
+        for op in operators {
+            let via_function = code(&core, &alice, &format!("{result} {op}"));
+            let via_column = code(&core, &alice, &format!("doc {op}"));
+            assert_eq!(via_function, via_column, "{result} {op}");
+        }
+        assert_eq!(code(&core, &alice, &format!("{result} - 'a'")), "42883");
+    }
+}
+
 #[test]
 fn existing_declarative_equality_path_is_unchanged() {
     let (core, path, alice) = seeded();
@@ -468,8 +490,8 @@ fn bare_null_literal_arguments_are_accepted_by_json_functions() {
         cell(&core, &alice, "json_build_object('a', NULL)"),
         json(r#"{"a" : null}"#)
     );
-    // NULL のキーは拒否する（PostgreSQL は 22004。分類追加までは 22023）。
-    assert_eq!(code(&core, &alice, "json_build_object(NULL, 1)"), "22023");
+    // NULL のキーは 22004（jsonb_build_object と同じ分類。回帰: 以前は 22023）。
+    assert_eq!(code(&core, &alice, "json_build_object(NULL, 1)"), "22004");
 }
 
 #[test]

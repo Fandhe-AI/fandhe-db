@@ -156,9 +156,8 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   演算子が無い）。json 列そのものの GROUP BY・DISTINCT は従来どおり `22000`（PostgreSQL は `42883`。差分）。
   json 式（`doc -> 'a'`）の GROUP BY・DISTINCT・集計引数は構文段で受理されず `42601`。算術・関数引数（json 関数以外）・`CASE` 等・代入は jsonb と同じ `0A000`。
   `json_extract_path` のパス要素 0 個は `42883`。`json_array_length` の非配列は `22023`、
-  `json_build_object` の引数個数が奇数・キーが json は `22023`。キーが NULL の場合の
-  PostgreSQL の SQLSTATE は `22004` だが、分類が未実装のため `22023` で拒否する
-  （差分。分類追加は別途）。
+  `json_build_object` の引数個数が奇数・キーが json は `22023`、キーが NULL は `22004`
+  （`jsonb_build_object` と同じ分類）。
 - 既存の宣言的な等価（`WHERE doc = '...'`・`IN`・`IS NULL`）は式レーンへ流さず従来どおり
   （重複キーは後勝ちで等価判定する）。
 - 関数引数の裸の `NULL` は NULL リテラルとして受理する（`json_*`・`to_json` に限る。strict な関数は NULL、
@@ -170,6 +169,33 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   `$n` の型推論、jsonb の出力書式を PostgreSQL に揃えること（`to_json(jsonb)` の埋め込みが
   `{"a":1}` で PostgreSQL の `{"a": 1}` と異なる）、2^53 を超える BIGINT の `to_json`
   （式評価器のスカラーが f64 であることによる既存の制約）、NoSQL の filter へのパス演算子。
+
+## Issue #2183 での変更（jsonpath の字句・構文解析器）
+
+- `engine::json::jsonpath::parse_jsonpath`（`crates/engine/src/json/jsonpath.rs` と
+  `jsonpath/{ast,lexer,parser}.rs`）を追加した（TABLE-25 ポインタ）。jsonpath 文字列から AST
+  （`SqlJsonPath`）を作るところまでが責務で、SQL 表層への配線・評価・`jsonpath` 型の入出力は
+  後続の #2184〜#2187 が担う（呼び出し元はまだ無いため `lib.rs` の公開面・core API は不変）。
+- 受理文法は PostgreSQL 17 に合わせた。`lax`／`strict`、アクセサ（`.key`・`.*`・`.**{a to b}`・
+  `[..]`・`?(..)`）、項目メソッド、算術・比較・論理演算、`exists`・`starts with`・`is unknown`、
+  `$var`、基数つき整数・`_` 区切りの数値、文字列のエスケープとサロゲート対を扱う。式と述語は別
+  カテゴリで、`&&`・`||`・`!`・比較の両辺の種別違反は構文エラーにする。`@` はフィルタの外、`last`
+  は添字の外でエラー。数値リテラルは任意精度の 10 進テキストで保持し、連続アクセサは平坦な
+  `ops` に畳む。
+- 受理・拒否と SQLSTATE の一致は `crates/engine/tests/jsonpath_parse.rs` の表（PostgreSQL 17 で
+  採取した約 700 ケース）で固定した。
+- エラーの SQLSTATE: 構文違反全般は `42601`、空入力・対でないサロゲートは `22P02`、`**{n}` の
+  int4 範囲外は `22003`、`like_regex` は `0A000`、上限超過は `54000`。エラー文に入力の断片は含めない。
+- 意図的な差分:
+  - 上限を設けた（PostgreSQL には無い）。入力 65,536 バイト、括弧・フィルタ・単項・添字式の入れ子
+    64 段、数値リテラル 1,024 バイト、式木の高さ 1,024。いずれも上限ちょうどは受理し、超過は `54000`。
+  - `like_regex` は構文を解析したうえで一律 `0A000`（正規表現の依存が未承認）。不正な正規表現を
+    `2201B` にする PostgreSQL とは異なる。
+  - `\u0000`・`\x00` は PostgreSQL では `22P05`。対応する `ErrorClass` が無いため暫定で `22P02`。
+  - 識別子の直後の `/*` は PostgreSQL では識別子を黙って捨てる癖があり、本実装は `42601` で拒否する。
+- 対象外・申し送り: 評価器と `2203x` 系エラー（#2184）、`jsonpath` 型の正規化テキスト出力、`22P05` の
+  `ErrorClass` 追加（jsonpath を SQL 表層から呼べる時点で wire-server の HTTP 写像と合わせて行う）、
+  `like_regex` の実装、`decimal`／`time` 系メソッドの精度の範囲検査（評価時）。
 
 ## 設計判断の所在
 
@@ -190,7 +216,7 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 | 連結・削除演算子（実装済み） | #2181 |
 | JSON スカラー関数（実装済み） | #1599 |
 | JSON 集合返却関数（SRF 基盤待ち） | #2220 |
-| jsonpath | #2183〜#2187 |
+| jsonpath（字句・構文解析器は #2183 で実装済み） | #2183〜#2187 |
 | 索引 | #2204 |
 
 ## 対象外・申し送り

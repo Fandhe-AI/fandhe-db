@@ -211,3 +211,9 @@ matches_legacy_encoder`）で固定している。シグネチャは
   テキスト形式でも公告 OID が `25` から列型の OID に変わる（破壊的変更）。
 - **検証**: 層 A は `wire14_binary_typed_columns.rs`、層 B は
   `three_client_extended_e2e.rs::computed_columns_binary_results_match_text_results`。
+
+## Issue #1571 追記（TIME のバイナリ入出力・TABLE-32・WIRE-14 ポインタ）
+
+- 結果: `TIME` 列（`Computed{ty: Some(Time)}` を含む）は OID 1083・typlen 8 で公告し、バイナリは 0 時起点マイクロ秒の 8 バイト BE（PostgreSQL の `time_send` と同形）。範囲 `00:00:00`〜`24:00:00` の外の `Cell::Time` は黙って丸めず `XX000` で fail-closed
+- param: `TIME` スロットは宣言 OID 1083（推論含む）のみバイナリを受理し、それ以外の宣言は `0A000`。8 バイト以外は `08P01`、範囲外は `22008`（値は応答に含めない）。復号後は正規テキストにして engine の束縛経路へ渡す（テキストで送った場合と同一）
+- `DATE`／`TIMESTAMP` は従来どおり非対応（`0A000`）

@@ -2754,6 +2754,14 @@ pub(super) fn bind_expr_any(
                 if lt == ExprType::Json {
                     return bind_json_delete_bound(l, rhs, env, node_budget);
                 }
+                // json（原文保存）の結果（`json_build_object(..)` 等）に `-` は無い。json 列・
+                // パス演算子の左辺（`is_json_expr` 側）と同じく 42883 に揃え、算術経路の
+                // 42804 へ落とさない。
+                if lt == ExprType::JsonText {
+                    return Err(SqlSurfaceError::undefined_function(
+                        "operator does not exist: the operand types do not match the - operator",
+                    ));
+                }
                 prebound_lhs = Some((l, lt));
             }
             if matches!(
@@ -3073,7 +3081,13 @@ fn bind_json_concat_operand(
             }
         }
     }
-    bind_expr_any(expr, env, node_budget)
+    // json 値（関数結果・パス演算子の結果）も json 列と同じく text 連結に当たるため `0A000`
+    // に揃える（PR #2390 指摘。型で 42883／0A000 が割れないようにする）。
+    let (bound, ty) = bind_expr_any(expr, env, node_budget)?;
+    if ty == ExprType::JsonText {
+        return Err(concat_not_supported());
+    }
+    Ok((bound, ty))
 }
 
 fn concat_not_supported() -> SqlSurfaceError {

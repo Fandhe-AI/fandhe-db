@@ -701,7 +701,8 @@ fn declare_between(
         }
         // 数値型（SMALLINT 含む）は SQL の数値リテラル `BETWEEN` の展開（`>= low AND <= high`）と
         // 同じ式レーンの 2 述語へ写す（Issue #1183 の `eq`／範囲比較と同じ束縛経路）。
-        // TIME の NoSQL 型束縛は #1571 で解禁する（Issue #1569。fail-closed）。
+        // TIME の述語は engine の述語解禁（Issue #1570）の後に解禁する（現状は fail-closed。
+        // insert／update の型束縛は typed_json 側で Issue #1571 により対応済み）。
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
@@ -863,7 +864,8 @@ fn declare_eq(
                 "eq filter value for a NUMERIC column must be a JSON number or numeric string",
             ))),
         },
-        // TIME の NoSQL 型束縛は #1571 で解禁する（Issue #1569。fail-closed）。
+        // TIME の述語は engine の述語解禁（Issue #1570）の後に解禁する（現状は fail-closed。
+        // insert／update の型束縛は typed_json 側で Issue #1571 により対応済み）。
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
@@ -954,7 +956,8 @@ fn declare_range(
                 "range filter value for a NUMERIC column must be a JSON number or numeric string",
             ))),
         },
-        // TIME の NoSQL 型束縛は #1571 で解禁する（Issue #1569。fail-closed）。
+        // TIME の述語は engine の述語解禁（Issue #1570）の後に解禁する（現状は fail-closed。
+        // insert／update の型束縛は typed_json 側で Issue #1571 により対応済み）。
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
@@ -1141,7 +1144,8 @@ fn declare_in(
         // 数値型（SMALLINT 含む）は SQL の数値リテラル `col IN (1, 2)` の脱糖（`col = 1 OR col = 2`。
         // 要素 1 個なら平坦化）と同形の式レーンへ写す（Issue #1356。各分岐は
         // `eq` と同じ式述語）。要素は JSON 数値のみ。
-        // TIME の NoSQL 型束縛は #1571 で解禁する（Issue #1569。fail-closed）。
+        // TIME の述語は engine の述語解禁（Issue #1570）の後に解禁する（現状は fail-closed。
+        // insert／update の型束縛は typed_json 側で Issue #1571 により対応済み）。
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),

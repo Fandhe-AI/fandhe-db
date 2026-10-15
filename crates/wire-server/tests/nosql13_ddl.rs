@@ -745,6 +745,42 @@ fn create_table_smallint_column_binds_range_and_rejects_array_element() {
     assert_eq!(http_common::wire_code_of(&arr), "0A000", "got: {arr:?}");
 }
 
+/// Issue #1571（TABLE-32・NOSQL-13）: `create_table`／`add_column` の型名 `"time"` が受理され、
+/// 範囲外・書式不正は拒否、配列要素型としての `"time"` は 0A000 のまま（副作用なし）。
+#[test]
+fn create_table_time_column_binds_and_rejects_array_element() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let resp = query(
+        &session,
+        br#"{"op":"create_table","table":"tm","columns":[
+        {"name":"embedding","type":"vector","dim":2},
+        {"name":"t","type":"time","nullable":true}
+    ]}"#,
+    );
+    assert_eq!(resp.status, 200, "got: {resp:?}");
+    let ok = query(
+        &session,
+        br#"{"op":"insert","table":"tm","rows":[{"id":1,"embedding":[0.1,0.2],"t":"24:00:00"}],"operation_id":"tm-1"}"#,
+    );
+    assert_eq!(ok.status, 200, "got: {ok:?}");
+    let oor = query(
+        &session,
+        br#"{"op":"insert","table":"tm","rows":[{"id":2,"embedding":[0.1,0.2],"t":"24:00:01"}],"operation_id":"tm-2"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&oor), "22008", "got: {oor:?}");
+    let add = query(
+        &session,
+        br#"{"op":"alter_table","table":"tm","add_column":{"name":"t2","type":"time"}}"#,
+    );
+    assert_eq!(add.status, 200, "got: {add:?}");
+    let arr = query(
+        &session,
+        br#"{"op":"create_table","table":"tm2","columns":[{"name":"a","type":"array","element_type":"time","max_len":4}]}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&arr), "0A000", "got: {arr:?}");
+}
+
 // --- CHECK 制約（Issue #1199・NOSQL-13・TABLE-16。SQL 表層と同じ engine の
 // 検査点が違反を `23514`／HTTP 409 で拒否することを固定する） -------------
 

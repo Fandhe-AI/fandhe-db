@@ -244,6 +244,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ColumnDef::new("tags", ColumnType::Array(tags), true),
                 ColumnDef::new("mood", ColumnType::Enum(mood), true),
                 ColumnDef::new("s", ColumnType::SmallInt, true),
+                ColumnDef::new("tm", ColumnType::Time, true),
             ],
         ))
         .expect("create table");
@@ -263,6 +264,13 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             1 => Value::Integer(-1),
             2 => Value::Integer(i32::from(i16::MIN)),
             3 => Value::Integer(i32::from(i16::MAX)),
+            _ => Value::Null,
+        });
+        // TIME 列 `tm`（Issue #1571）: 境界値と NULL（id 1: 0・id 2: 23:59:59.999999・id 3: 24:00:00）。
+        row.push(match id {
+            1 => Value::Time(0),
+            2 => Value::Time(86_399_999_999),
+            3 => Value::Time(86_400_000_000),
             _ => Value::Null,
         });
         engine::tenant::insert_typed_row(&storage, "t", &ctx, id, Visibility::Private, &row, &op)
@@ -675,4 +683,47 @@ fn smallint_binary_respects_tenant_boundary() {
     let (_, rows) = run(&mut s, "SELECT s FROM t LIMIT 10", &[1]);
     assert_eq!(rows.len(), 1, "bob sees only his own row");
     assert_eq!(rows[0][0], None);
+}
+
+/// TIME 列（TABLE-32・WIRE-14・Issue #1571）: バイナリ結果は 0 時起点 µs の 8 バイト BE で、
+/// text 形式の値と一致する。NULL は NULL のまま。text/binary 混在も列単位で効く。
+#[test]
+fn time_column_binary_result_matches_text_and_golden_bytes() {
+    let (mut s, _g, _) = connect("alice", "correct-horse");
+    let cases: [(i32, Option<(i64, &str)>); 3] = [
+        (1, Some((0, "00:00:00"))),
+        (2, Some((86_399_999_999, "23:59:59.999999"))),
+        (3, Some((86_400_000_000, "24:00:00"))),
+    ];
+    for (id, want) in cases {
+        let sql = format!("SELECT tm FROM t WHERE id = {id} LIMIT 10");
+        let (_, text_rows) = run(&mut s, &sql, &[0]);
+        let (bf, bin_rows) = run(&mut s, &sql, &[1]);
+        assert_eq!(bf, vec![1]);
+        match want {
+            Some((micros, text)) => {
+                assert_eq!(text_rows[0][0].as_deref(), Some(text.as_bytes()), "id={id}");
+                assert_eq!(
+                    bin_rows[0][0].as_deref(),
+                    Some(&micros.to_be_bytes()[..]),
+                    "id={id}"
+                );
+            }
+            None => unreachable!("NULL は下の tenant-b 行で検証する"),
+        }
+    }
+    // NULL は両形式とも NULL（tenant-b の id 10 は `tm` が NULL）。
+    let (mut b, _gb, _) = connect("bob", "battery-staple");
+    let sql = "SELECT tm FROM t WHERE id = 10 LIMIT 10";
+    let (_, text_rows) = run(&mut b, sql, &[0]);
+    let (_, bin_rows) = run(&mut b, sql, &[1]);
+    assert_eq!(text_rows[0][0], None);
+    assert_eq!(bin_rows[0][0], None);
+    let (fmts, rows) = run(&mut s, "SELECT tm, n FROM t WHERE id = 2 LIMIT 10", &[1, 0]);
+    assert_eq!(fmts, vec![1, 0]);
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some(&86_399_999_999i64.to_be_bytes()[..])
+    );
+    assert_eq!(rows[0][1].as_deref(), Some(&b"-2147483648"[..]));
 }

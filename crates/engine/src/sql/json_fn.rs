@@ -419,7 +419,7 @@ fn finish(out: String) -> Result<ExprValue<'static>, SqlSurfaceError> {
 
 /// `json` 関数の評価（`eval_with_scalars` から呼ばれる）。strict な関数（typeof・
 /// array_length・extract_path*・to_json）は NULL 入力で NULL。`json_build_*` は NULL を
-/// `null` として書く（キーの NULL は `22023`）。
+/// `null` として書く（キーの NULL は `22004`）。
 pub(crate) fn eval_json_fn<'a>(
     f: &BoundJsonFn,
     id: u64,
@@ -516,7 +516,7 @@ pub(crate) fn eval_json_fn<'a>(
                 first = false;
                 let key = eval_with_scalars(ka, id, embedding, row_scalars)?;
                 if matches!(key, ExprValue::Null) {
-                    return Err(SqlSurfaceError::InvalidParameterValue {
+                    return Err(SqlSurfaceError::NullValueNotAllowed {
                         detail: "null value not allowed for object key",
                     });
                 }

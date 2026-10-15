@@ -16,6 +16,11 @@
 //! リテラルの RFC 8259 準拠の厳格化を行った（先頭ゼロ・小数部/指数部の数字欠落等
 //! を拒否）。[`JsonError`] は [`crate::error_format::ClassifiedError`] を実装し、
 //! `wire_code()` で `42601`（`UnsupportedSqlSyntax`）を返す。
+//!
+//! Issue #2183（TABLE-25 ポインタ）で SQL/JSON path の字句・構文解析器を子モジュール
+//! [`jsonpath`] として追加した（`#>` 用の [`JsonPath`] とは別物）。
+
+pub mod jsonpath;
 
 use std::collections::{BTreeMap, HashSet};
 
