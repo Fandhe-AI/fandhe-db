@@ -471,6 +471,11 @@ pub(crate) struct ParamSlot {
 /// 0（未指定）・25（text）・1043（varchar）。
 const TEXT_LIKE_DECLARED_OIDS: [i32; 3] = [0, 25, 1043];
 
+/// `CHAR(n)`（bpchar）スロットが受理する宣言 OID。上記に加えて 1042（bpchar）。
+/// text／varchar スロットでは 1042 を受理しない: PostgreSQL では bpchar→text キャストで
+/// 末尾空白が落ちるため、UTF-8 恒等で受けると値の意味が変わる（fail-closed。Issue #1565）。
+const BPCHAR_SLOT_DECLARED_OIDS: [i32; 4] = [0, 25, 1043, 1042];
+
 /// 推論スロット型と実効 OID（宣言 OID が 0 以外ならそれ、0 なら推論 OID）から
 /// バイナリ復号種別を決める（Issue #1345）。推論型との互換表に載らない組み合わせは
 /// すべて `Unsupported`（fail-closed）。PostgreSQL の暗黙キャスト（float4→float8 等）より意図的に厳しい: 値の意味が暗黙キャストと変わりうる
@@ -509,9 +514,16 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 ColumnType::Boolean => only(16, BinaryParam::Bool),
                 ColumnType::Bytea => only(17, BinaryParam::Bytea),
                 ColumnType::Uuid => only(2950, BinaryParam::Uuid),
-                // CHAR(n) の param 型（bpchar＝OID 1042）は Issue #1565 で対応する。
-                ColumnType::Bpchar(_)
-                | ColumnType::Vector(_)
+                // CHAR(n) スロット（bpchar＝OID 1042）。値は engine のリテラル置換経路を通り、
+                // 非 NULL 書き込みの可否は engine 側の契約に従う（Issue #1565）。
+                ColumnType::Bpchar(_) => {
+                    if BPCHAR_SLOT_DECLARED_OIDS.contains(&declared_oid) {
+                        BinaryParam::Utf8Identity
+                    } else {
+                        BinaryParam::Unsupported
+                    }
+                }
+                ColumnType::Vector(_)
                 | ColumnType::Numeric { .. }
                 | ColumnType::Date
                 | ColumnType::Timestamp
@@ -3022,5 +3034,32 @@ mod tests {
         store.discard_retained_outside_generation(None);
         assert!(store.get("kept_same").is_none());
         assert!(store.get("fresh_other").is_some());
+    }
+
+    /// CHAR(n) スロットは宣言 OID 0・25・1043・1042 のバイナリを UTF-8 恒等で受理し、
+    /// text／varchar スロットでの宣言 1042 は fail-closed（Issue #1565）。
+    #[test]
+    fn binary_param_kind_bpchar_slot_accepts_1042_but_text_slot_does_not() {
+        use engine::catalog::ColumnType;
+        let slot = |ty: ColumnType| {
+            PreparedParamType::Column(ColumnMeta::Scalar {
+                name: "c".to_string(),
+                ty,
+            })
+        };
+        let is_utf8 = |k: BinaryParam| matches!(k, BinaryParam::Utf8Identity);
+        let bp = slot(ColumnType::Bpchar(5));
+        for declared in [0, 25, 1043, 1042] {
+            assert!(
+                is_utf8(binary_param_kind(&bp, declared, 1042)),
+                "{declared}"
+            );
+        }
+        assert!(!is_utf8(binary_param_kind(&bp, 23, 23)));
+        for ty in [ColumnType::Text, ColumnType::Varchar(Some(5))] {
+            let sl = slot(ty);
+            assert!(!is_utf8(binary_param_kind(&sl, 1042, 1042)));
+            assert!(is_utf8(binary_param_kind(&sl, 1043, 1043)));
+        }
     }
 }
