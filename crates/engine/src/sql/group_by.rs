@@ -2543,7 +2543,9 @@ fn group_row_scalars<'a>(
 /// [`crate::sql::udf_call::id_as_finite_scalar`]）に限り受け付け、超える値は黙って丸めず
 /// 同じ `22000` で拒否する（`i64` 範囲外の値も同じ扱い）。
 /// 参照されない列（`group_row_mask` が偽）はそもそも本関数を通らない。
-fn cell_to_scalar_ref(cell: &Cell) -> Result<Option<row_codec::ScalarRef<'_>>, SqlSurfaceError> {
+pub(crate) fn cell_to_scalar_ref(
+    cell: &Cell,
+) -> Result<Option<row_codec::ScalarRef<'_>>, SqlSurfaceError> {
     Ok(match cell {
         Cell::Null => None,
         Cell::Integer(v) => {

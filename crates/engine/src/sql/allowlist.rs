@@ -1889,6 +1889,8 @@ pub(crate) const MAX_CONST_SELECT_ITEMS: usize = 1024;
 pub struct ValidatedConstSelect {
     pub(crate) items: Vec<ConstSelectItem>,
     pub(crate) where_clause: Option<ConstSelectCondition>,
+    /// `HAVING` 句（Issue #2331）。あれば集計問い合わせ（1 グループ）として扱う。
+    pub(crate) having: Option<ConstSelectHaving>,
     pub(crate) limit: Option<i64>,
     pub(crate) offset: Option<i64>,
 }
@@ -1902,6 +1904,11 @@ impl ValidatedConstSelect {
     /// `WHERE` 条件（Issue #2329）。無ければ `None`。
     pub fn where_clause(&self) -> Option<&ConstSelectCondition> {
         self.where_clause.as_ref()
+    }
+
+    /// `HAVING` 句（Issue #2331）。無ければ `None`。
+    pub fn having(&self) -> Option<&ConstSelectHaving> {
+        self.having.as_ref()
     }
 
     /// `LIMIT` の値（符号付き。負値の拒否は実行時 `22000`。Issue #2329）。
@@ -1927,6 +1934,28 @@ pub enum ConstSelectCondition {
     Null,
     /// 比較などの定数式（束縛段で真偽型を要求する）。
     Expr(Expr),
+}
+
+/// `FROM` なし SELECT の `HAVING` 句（SQL-43・Issue #2331）。`GROUP BY` なしの 1 グループに
+/// 対する条件で、条件中の集計呼び出しは内部名（[`aggregate_placeholder`]）の識別子に
+/// 置き換えられ、`aggregates[j]` が内部名 `j` の呼び出しに対応する。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ConstSelectHaving {
+    pub(crate) condition: ConstSelectCondition,
+    pub(crate) aggregates: Vec<AggregateItem>,
+}
+
+impl ConstSelectHaving {
+    /// 条件（集計は内部名の識別子）。
+    pub fn condition(&self) -> &ConstSelectCondition {
+        &self.condition
+    }
+
+    /// 条件中の集計呼び出し（内部名の添字順）。
+    pub fn aggregates(&self) -> &[AggregateItem] {
+        &self.aggregates
+    }
 }
 
 /// [`ValidatedConstSelect`] の 1 項目（式と任意の `AS` 別名）。
@@ -6495,10 +6524,10 @@ impl<'a> Parser<'a> {
         Ok(Some(order))
     }
 
-    /// `SELECT <式>|<集計呼び出し>[ AS <別名>][, ...] [WHERE <条件>] [LIMIT <n>] [OFFSET <m>][;]`
-    /// （`FROM` なし。SQL-43・Issue #1531・#2329）を解析する。句の順序は固定で、
+    /// `SELECT <式>|<集計呼び出し>[ AS <別名>][, ...] [WHERE <条件>] [HAVING <条件>] [LIMIT <n>] [OFFSET <m>][;]`
+    /// （`FROM` なし。SQL-43・Issue #1531・#2329・#2331）を解析する。句の順序は固定で、
     /// `SELECT *`・`AND`／`OR` 等を含む条件・`OFFSET` を `LIMIT` より前に置く形・
-    /// `GROUP BY`／`HAVING`／`ORDER BY`・空リスト・末尾カンマはすべて `42601`
+    /// `GROUP BY`／`ORDER BY`・空リスト・末尾カンマはすべて `42601`
     /// （fail-closed）。トップレベルの集計項目（Issue #2330）だけを受理し、
     /// 集計を含む式・入れ子集計は `42601`。列参照の拒否は束縛段の責務（構文木だけでは
     /// 関数名の意味が確定しないため）。項目数は `MAX_CONST_SELECT_ITEMS` で有界化する。
@@ -6553,7 +6582,13 @@ impl<'a> Parser<'a> {
         }
         let where_clause = if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
             self.advance();
-            Some(self.parse_const_select_condition()?)
+            Some(self.parse_const_select_condition(false)?)
+        } else {
+            None
+        };
+        let having = if self.peek_ident_matches("HAVING") {
+            self.advance();
+            Some(self.parse_const_select_having()?)
         } else {
             None
         };
@@ -6573,16 +6608,40 @@ impl<'a> Parser<'a> {
         Ok(ValidatedConstSelect {
             items,
             where_clause,
+            having,
             limit,
             offset,
         })
     }
 
-    /// `FROM` なし SELECT の `WHERE` 条件を読む（Issue #2329）。`TRUE`／`FALSE`／`NULL`
-    /// は直後が句境界（文末・`;`・`LIMIT`・`OFFSET`）のときだけリテラルとして畳み、
-    /// それ以外は値式＋任意の比較演算子 1 つの式にする（`AND`／`OR` 等は呼び出し元の
-    /// `expect_end_of_statement` が `42601` で拒否する）。
-    fn parse_const_select_condition(&mut self) -> Result<ConstSelectCondition, SqlSurfaceError> {
+    /// `HAVING` 条件（Issue #2331）を読む。条件中の集計呼び出しは `agg_calls` へ収集し
+    /// （枠数上限は `parse_embedded_aggregate_call` が溜める前に検査する）、解析の成否に
+    /// 関わらず `agg_calls`／`agg_slots_used` を元へ戻す。`WHERE` では `agg_calls` が
+    /// `None` のままなので集計は従来どおり `42601`。
+    fn parse_const_select_having(&mut self) -> Result<ConstSelectHaving, SqlSurfaceError> {
+        let saved_calls = self.agg_calls.take();
+        let saved_slots = self.agg_slots_used;
+        self.agg_calls = Some(Vec::new());
+        self.agg_slots_used = 0;
+        let parsed = self.parse_const_select_condition(true);
+        let calls = self.agg_calls.take();
+        self.agg_calls = saved_calls;
+        self.agg_slots_used = saved_slots;
+        Ok(ConstSelectHaving {
+            condition: parsed?,
+            aggregates: calls.unwrap_or_default(),
+        })
+    }
+
+    /// `FROM` なし SELECT の `WHERE`／`HAVING` 条件を読む（Issue #2329・#2331）。
+    /// `TRUE`／`FALSE`／`NULL` は直後が句境界（文末・`;`・`LIMIT`・`OFFSET`、`WHERE` では
+    /// 加えて `HAVING`）のときだけリテラルとして畳み、それ以外は値式＋任意の比較演算子
+    /// 1 つの式にする（`AND`／`OR` 等は呼び出し元の `expect_end_of_statement` が
+    /// `42601` で拒否する）。
+    fn parse_const_select_condition(
+        &mut self,
+        is_having: bool,
+    ) -> Result<ConstSelectCondition, SqlSurfaceError> {
         if let Some(Token::Ident(w)) = self.peek() {
             let literal = if w.eq_ignore_ascii_case("TRUE") {
                 Some(ConstSelectCondition::Bool(true))
@@ -6597,7 +6656,10 @@ impl<'a> Parser<'a> {
             if let Some(lit) = literal {
                 let at_boundary = match self.tokens.get(self.pos.saturating_add(1)) {
                     None | Some(Token::Punct(';')) | Some(Token::Keyword(Keyword::Limit)) => true,
-                    Some(Token::Ident(n)) => n.eq_ignore_ascii_case("OFFSET"),
+                    Some(Token::Ident(n)) => {
+                        n.eq_ignore_ascii_case("OFFSET")
+                            || (!is_having && n.eq_ignore_ascii_case("HAVING"))
+                    }
                     _ => false,
                 };
                 if at_boundary {
@@ -13761,6 +13823,41 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn const_select_having_parse_shapes() {
+        use super::*;
+        let parse = |sql: &str| -> Result<ValidatedConstSelect, SqlSurfaceError> {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            Parser::new(&tokens).parse_const_select()
+        };
+        let v = parse("SELECT 1 HAVING true").expect("having true");
+        let h = v.having().expect("having");
+        assert_eq!(h.condition(), &ConstSelectCondition::Bool(true));
+        assert!(h.aggregates().is_empty());
+        let v = parse("SELECT 1 WHERE true HAVING true LIMIT 1 OFFSET 0").expect("all clauses");
+        assert_eq!(v.where_clause(), Some(&ConstSelectCondition::Bool(true)));
+        assert!(v.having().is_some());
+        let v = parse("SELECT count(*) WHERE false HAVING count(*) = 0").expect("agg having");
+        let h = v.having().expect("having");
+        assert_eq!(h.aggregates().len(), 1);
+        assert!(matches!(h.condition(), ConstSelectCondition::Expr(_)));
+        let v = parse("SELECT 1 HAVING coalesce(max(1), 0) > 0").expect("embedded");
+        assert_eq!(v.having().expect("having").aggregates().len(), 1);
+        for bad in [
+            "SELECT 1 HAVING true WHERE true",
+            "SELECT 1 LIMIT 1 HAVING true",
+            "SELECT 1 HAVING",
+            "SELECT 1 HAVING true AND true",
+            "SELECT 1 HAVING sum(count(*)) > 0",
+            "SELECT 1 WHERE count(*) = 1",
+            "SELECT 1 GROUP BY 1 HAVING true",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        let many = format!("SELECT 1 HAVING {} > 0", vec!["count(*)"; 40].join(" + "));
+        assert!(parse(&many).is_err());
     }
 
     use super::*;

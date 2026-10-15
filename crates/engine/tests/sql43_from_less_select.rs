@@ -241,7 +241,6 @@ fn rejects_aggregates_and_trailing_clauses() {
         "SELECT 1,",
         "SELECT 1 WHERE 1=1 AND 2=2",
         "SELECT 1 GROUP BY 1",
-        "SELECT 1 HAVING true",
         "SELECT 1 ORDER BY 1",
         "SELECT 1 OFFSET 1 LIMIT 1",
         "SELECT 1 LIMIT ALL",
@@ -674,4 +673,113 @@ fn aggregate_describe_matches_execute() {
         .expect("describe")
         .expect("columns");
     assert_eq!(described, run(&core, &ctx, sql).columns);
+}
+#[test]
+fn having_filters_the_single_group() {
+    let (core, path) = core_with_table("sql43-having", false);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    for (sql, rows) in [
+        ("SELECT 1 HAVING true", 1),
+        ("SELECT 1 HAVING false", 0),
+        ("SELECT 1 HAVING NULL", 0),
+        ("SELECT 1 HAVING 1 = 1", 1),
+        ("SELECT 1 WHERE false HAVING true", 1),
+        ("SELECT 1 WHERE true HAVING true LIMIT 1 OFFSET 0", 1),
+        ("SELECT 1 HAVING count(*) = 1", 1),
+        ("SELECT 1 WHERE false HAVING count(*) = 1", 0),
+        ("SELECT count(*) WHERE false HAVING count(*) = 0", 1),
+        ("SELECT 1 HAVING max(2) > 1", 1),
+        ("SELECT 1 HAVING min('a') = 'a'", 1),
+        ("SELECT count(*) HAVING count(*) = 1 LIMIT 0", 0),
+        ("SELECT count(*) HAVING count(*) = 1 OFFSET 1", 0),
+        ("SELECT 1 HAVING coalesce(max(1), 0) > 0", 1),
+    ] {
+        assert_eq!(row_count(&core, &ctx, sql), rows, "{sql}");
+    }
+    let r = run(
+        &core,
+        &ctx,
+        "SELECT count(*) WHERE false HAVING count(*) = 0",
+    );
+    assert_eq!(col(&r, 0), ("count", Some(&ColumnType::BigInt)));
+    assert_eq!(*single_cell(&r), Cell::SignedInteger(0));
+    let r = run(&core, &ctx, "SELECT 1 HAVING true");
+    assert_eq!(*single_cell(&r), Cell::SignedInteger(1));
+}
+
+#[test]
+fn having_rejections_are_fail_closed() {
+    let (core, path) = core_with_table("sql43-having-err", false);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    for (sql, code) in [
+        ("SELECT 1 HAVING true WHERE true", "42601"),
+        ("SELECT 1 LIMIT 1 HAVING true", "42601"),
+        ("SELECT 1 HAVING", "42601"),
+        ("SELECT 1 HAVING true AND true", "42601"),
+        ("SELECT 1 HAVING sum(count(*)) > 0", "42601"),
+        ("SELECT 1 WHERE count(*) = 1", "42601"),
+        ("SELECT 1 GROUP BY 1 HAVING true", "42601"),
+        ("SELECT 1 HAVING 1", "42804"),
+        ("SELECT 1 HAVING count(*)", "42804"),
+        ("SELECT 1 HAVING x = 1", "42703"),
+        ("SELECT 1 HAVING count(x) > 0", "42703"),
+        ("SELECT 1 HAVING id = 1", "42703"),
+        ("SELECT 1 HAVING sum(5000000000) > 0", "42601"),
+        ("SELECT 1 HAVING avg(1) > 0", "42601"),
+        ("SELECT 1 HAVING sum(1.5) > 0", "42601"),
+        ("SELECT 1 / 0 HAVING false", "22012"),
+        ("SELECT 1 HAVING 1 / 0 = 1", "22012"),
+        ("SELECT 1 HAVING set_config('a', 'b', false) = 'b'", "42601"),
+    ] {
+        assert_eq!(wire_code_of(&core, &ctx, sql), code, "{sql}");
+    }
+    let (_, display, client) = error_texts(&core, &ctx, "SELECT 1 HAVING secret_col = 1");
+    assert!(!display.contains("secret_col") && !client.contains("secret_col"));
+    // 件数上限（溜める前に検査）。
+    let big = format!(
+        "SELECT 1 HAVING {} > 0",
+        (0..40).map(|_| "count(*)").collect::<Vec<_>>().join(" + ")
+    );
+    assert_eq!(wire_code_of(&core, &ctx, &big), "54000");
+}
+
+#[test]
+fn having_describe_and_tenant_independence() {
+    let (core, path) = core_with_table("sql43-having-describe", false);
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    let sql = "SELECT count(*) WHERE false HAVING count(*) = 0";
+    let parsed = core.parse_sql(sql).expect("parse");
+    let described = core
+        .describe_parsed_in_session(&SessionState::default(), &parsed)
+        .expect("describe")
+        .expect("columns");
+    assert_eq!(described, run(&core, &ctx, sql).columns);
+    // Describe は評価しない（0 除算でも成功）。型エラーは Describe でも返る。
+    let div = core.parse_sql("SELECT 1 HAVING 1 / 0 = 1").expect("parse");
+    assert!(core
+        .describe_parsed_in_session(&SessionState::default(), &div)
+        .is_ok());
+    let bad = core.parse_sql("SELECT 1 HAVING 1");
+    let code = match bad {
+        Err(e) => e.wire_code(),
+        Ok(p) => core
+            .describe_parsed_in_session(&SessionState::default(), &p)
+            .expect_err("type error")
+            .wire_code(),
+    };
+    assert_eq!(code, "42804");
+    assert_eq!(row_count(&core, &ctx_for("tenant-b"), sql), 1);
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx, &mut session, &mut txn, "BEGIN")
+        .expect("BEGIN");
+    assert!(matches!(
+        core.execute_sql_in_txn(&ctx, &mut session, &mut txn, "SELECT 1 HAVING true"),
+        Ok(SqlOutcome::Query(r)) if r.rows.len() == 1
+    ));
+    core.execute_sql_in_txn(&ctx, &mut session, &mut txn, "COMMIT")
+        .expect("COMMIT");
 }

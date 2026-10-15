@@ -909,3 +909,5 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **結合**: `crates/engine/tests/sql45_update_set_expr_resend.rs`。単一行・述語形・`RETURNING`・分割実行の再送（`23505`・二重適用なし）と式違い（`22023`・副作用なし）、`n / 2` と `n / 2.0`、CASE／COALESCE／NULLIF の構造、割当順序（単一行形は列順へ正規化されるため同一内容、述語形は宣言順のまま別内容）、`+1`・関数名大文字小文字の正規化、原子版と分割実行版の取り違え、0 行更新と存在しない行・他テナント行の応答同一性、テナント独立、再オープン後の再送。識別子の大文字小文字違いは束縛段が未知の列として先に拒否する（`22000`）ため、hash 側の区別は単体テストで固定。
 - **crash test**: `crash_test_partitioned_dml` に `update-expr` モード（`SET tag = 'done', n = n + 1`。変更済み行は `n == id + 1`、二重適用は破損として検出。式を `n + 2` に替えた再送が crash 後の台帳でも `22023`）を追加し、既定を 4 セットにした。Issue 本文の `scripts/crash_test.sh` は Storage 層のツール（SQL・operation_id 台帳を通らない）のため、SQL と台帳を通る分割実行ハーネスへ追加した。
 - **対象外**: 式内 `$n` の型推論と `42P18`（#1546）、UPSERT `ON CONFLICT DO UPDATE SET` の式、`crash_test.sh` の SQL 対応、同一列の複数回 SET の拒否。
+
+**Issue #2331（feat(engine): FROM なし SELECT で HAVING を受理する。SQL-43 ポインタ。詳細は [sql-from-less-select.md](sql-from-less-select.md)）**: `WHERE` の後・`LIMIT` の前の `HAVING <条件>` を `GROUP BY` なしの 1 グループへの条件として受理し、集計を含む式も書ける。`HAVING` があれば集計項目が無くても 1 グループ扱い（偽・`NULL` は 0 行）。結果型が `numeric` の集計の `HAVING` での使用は `42601`。
