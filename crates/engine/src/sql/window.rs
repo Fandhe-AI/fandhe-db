@@ -895,6 +895,7 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
                 | AggregateInput::EnumColumn(index)
                 | AggregateInput::UuidColumn(index)
                 | AggregateInput::IntegerColumn(index)
+                | AggregateInput::SmallIntColumn(index)
                 | AggregateInput::BigIntColumn(index)
                 | AggregateInput::RealColumn(index)
                 | AggregateInput::DoubleColumn(index),
@@ -1020,11 +1021,13 @@ fn extract_window_input(
                 .map(aggregate::try_clone_str)
                 .transpose()?,
         ),
-        AggregateInput::IntegerColumn(index) => match scanned.get(*index).copied().flatten() {
-            Some(row_codec::ScalarRef::Integer(v)) => WindowInputValue::Integer(Some(v)),
-            Some(_) => return Err(window_bug("INTEGER input scan type mismatch")),
-            None => WindowInputValue::Integer(None),
-        },
+        AggregateInput::IntegerColumn(index) | AggregateInput::SmallIntColumn(index) => {
+            match scanned.get(*index).copied().flatten() {
+                Some(row_codec::ScalarRef::Integer(v)) => WindowInputValue::Integer(Some(v)),
+                Some(_) => return Err(window_bug("INTEGER input scan type mismatch")),
+                None => WindowInputValue::Integer(None),
+            }
+        }
         AggregateInput::BigIntColumn(index) => match scanned.get(*index).copied().flatten() {
             Some(row_codec::ScalarRef::BigInt(v)) => WindowInputValue::BigInt(Some(v)),
             Some(_) => return Err(window_bug("BIGINT input scan type mismatch")),
@@ -1528,7 +1531,10 @@ fn observe_window_row(
             let scanned = build_scanned(*index, v.as_deref().map(row_codec::ScalarRef::Text));
             acc.observe(input, id, &no_vector, &scanned, scratch)
         }
-        (AggregateInput::IntegerColumn(index), WindowInputValue::Integer(v)) => {
+        (
+            AggregateInput::IntegerColumn(index) | AggregateInput::SmallIntColumn(index),
+            WindowInputValue::Integer(v),
+        ) => {
             let scanned = build_scanned(*index, v.map(row_codec::ScalarRef::Integer));
             acc.observe(input, id, &no_vector, &scanned, scratch)
         }

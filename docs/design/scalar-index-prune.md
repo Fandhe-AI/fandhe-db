@@ -508,3 +508,10 @@ TEXT／BYTEA と同じ既知の乖離で結果の正しさには影響しない�
 
 `IN`／`NOT IN` の和集合計算、列同士の比較、算術式を含む
 式、選択度閾値の数値列専用調整。
+
+### SMALLINT 列の合流（Issue #1559・TABLE-30 ポインタ）
+
+`SMALLINT` 列は INTEGER と値表現が同一（`ScalarRef::Integer`）のため、レーン A の
+`OrderedColumnIndex::I64` へ `i64` に拡張して構築する（負数を含め順序保存）。照会側
+（`numeric_column_candidates`・`numeric_i64_bounds`）は型によらず動き、`CREATE INDEX` の
+宣言対象にも含める。

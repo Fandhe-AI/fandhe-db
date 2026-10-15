@@ -1056,15 +1056,11 @@ fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
         ColumnType::Numeric { .. } => Some(SubqueryValueFamily::Numeric),
         ColumnType::Uuid => Some(SubqueryValueFamily::Uuid),
         ColumnType::Bytea => Some(SubqueryValueFamily::Bytea),
-        ColumnType::Integer | ColumnType::BigInt => Some(SubqueryValueFamily::Integer),
+        ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => {
+            Some(SubqueryValueFamily::Integer)
+        }
         ColumnType::Real | ColumnType::Double => Some(SubqueryValueFamily::Float),
-        // SMALLINT 列の比較・IN は兄弟 Issue（#1559・#1560）で解禁する。それまでは
-        // INTEGER 族へ黙って入れず対応外（呼び出し元が `22000` で拒否）とする（Issue #1558）。
-        ColumnType::SmallInt
-        | ColumnType::Vector(_)
-        | ColumnType::Array(_)
-        | ColumnType::Json
-        | ColumnType::Jsonb => None,
+        ColumnType::Vector(_) | ColumnType::Array(_) | ColumnType::Json | ColumnType::Jsonb => None,
     }
 }
 

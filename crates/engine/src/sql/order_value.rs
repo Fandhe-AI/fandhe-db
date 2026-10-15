@@ -172,9 +172,11 @@ pub(crate) fn extract_order_value_ref<'a>(
             OrderKind::Bytes,
             row_codec::ScalarRef::Text(t),
         ) => Ok(Some(ScalarKeyRef::Bytes(t.as_bytes()))),
-        (ColumnType::Integer, OrderKind::SignedInt, row_codec::ScalarRef::Integer(v)) => {
-            Ok(Some(ScalarKeyRef::SignedInt(i64::from(*v))))
-        }
+        (
+            ColumnType::SmallInt | ColumnType::Integer,
+            OrderKind::SignedInt,
+            row_codec::ScalarRef::Integer(v),
+        ) => Ok(Some(ScalarKeyRef::SignedInt(i64::from(*v)))),
         (ColumnType::BigInt, OrderKind::SignedInt, row_codec::ScalarRef::BigInt(v)) => {
             Ok(Some(ScalarKeyRef::SignedInt(*v)))
         }
@@ -345,6 +347,9 @@ pub(crate) fn order_value_to_cell(
         (OrderValue::SignedInt(v), Some(ColumnType::Integer | ColumnType::BigInt)) => {
             Ok(Cell::SignedInteger(*v))
         }
+        (OrderValue::SignedInt(v), Some(ColumnType::SmallInt)) => i16::try_from(*v)
+            .map(|_| Cell::SignedInteger(*v))
+            .map_err(|_| scan_bug("group key SMALLINT value out of range")),
         (OrderValue::SignedInt(v), Some(ColumnType::Date)) => i32::try_from(*v)
             .map(Cell::Date)
             .map_err(|_| scan_bug("group key DATE value out of range")),
