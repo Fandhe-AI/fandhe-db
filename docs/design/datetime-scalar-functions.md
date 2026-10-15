@@ -113,6 +113,9 @@ builtin_name` に追加する（`round` と同じ流儀）。
 関数はすべて純粋関数で時計を読まないため、`now` という名前の UDF があっても
 決定性は崩れない）。
 
+> 改訂注記: SQL-37 の改訂で、これらは受理する方針へ変更された。設計は
+> [now-evaluated-value-ledger.md](now-evaluated-value-ledger.md)、実装は #1586・#1587・#2188。
+
 ### UDF 予約名
 
 `date_part`・`date_trunc` は `is_builtin_function_name` 経由で予約名になる。
