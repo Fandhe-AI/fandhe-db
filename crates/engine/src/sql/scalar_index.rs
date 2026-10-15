@@ -1012,7 +1012,10 @@ impl ScalarIndex {
             match &column.ty {
                 // ENUM 列は TEXT と同じ辞書表現を共有する（Issue #890 D3。
                 // ラベルは短いため平均値長ゲートで除外されることは実質ない）。
-                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Enum(_) => {
+                ColumnType::Text
+                | ColumnType::Varchar(_)
+                | ColumnType::Bpchar(_)
+                | ColumnType::Enum(_) => {
                     // `acc` は 1 行につき列あたり高々 1 値しか追加されないため
                     // `row_count` が確保上限になる。倍増などの成長戦略による
                     // 余剰確保を避けるため、行走査を始める前に必要量ちょうどを
@@ -1143,7 +1146,6 @@ impl ScalarIndex {
                 // `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
                 // `VECTOR` 列も従来どおり索引対象外。
                 ColumnType::Vector(_)
-                | ColumnType::Bpchar(_)
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
                 | ColumnType::Json
@@ -1316,6 +1318,16 @@ impl ScalarIndex {
                 // 両者を同じ辞書表現として扱う（Issue #890 D3）。
                 let Some(v) = v.as_dictionary_text() else {
                     continue;
+                };
+                // `CHAR(n)` 列の辞書キーは末尾の半角空白を除いた形にする（比較側のリテラルも
+                // 束縛時に rtrim 済みで、索引あり・なしの結果が一致する。TABLE-31・Issue #1566）。
+                let v = if matches!(
+                    schema.columns.get(col_index).map(|c| &c.ty),
+                    Some(ColumnType::Bpchar(_))
+                ) {
+                    v.trim_end_matches(' ')
+                } else {
+                    v
                 };
                 let v_len = v.len();
                 let (Some(&running), Some(&nonnull)) = (

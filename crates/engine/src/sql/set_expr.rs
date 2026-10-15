@@ -78,6 +78,7 @@ pub(crate) fn bind_set_expr(
         | ColumnType::Double
         | ColumnType::Text
         | ColumnType::Varchar(_)
+        | ColumnType::Bpchar(_)
         | ColumnType::Boolean
         | ColumnType::Date
         | ColumnType::Timestamp => {}
@@ -101,8 +102,10 @@ pub(crate) fn bind_set_expr(
                 | ColumnType::Real
                 | ColumnType::Double,
             ExprType::Scalar
-        ) | (ColumnType::Text | ColumnType::Varchar(_), ExprType::Text)
-            | (ColumnType::Boolean, ExprType::Bool)
+        ) | (
+            ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
+            ExprType::Text
+        ) | (ColumnType::Boolean, ExprType::Bool)
             | (ColumnType::Date, ExprType::Date)
             | (ColumnType::Timestamp, ExprType::Timestamp | ExprType::Date)
     );
@@ -147,9 +150,10 @@ pub(crate) fn eval_set_expr_to_value<'a>(
         ExprValue::Text(t) => match &set.target_ty {
             // `VARCHAR(n)` の n 超過は `22001`（超過部分が半角空白のみなら切り詰め。
             // TABLE-31・Issue #1564）。行ごとの評価結果にしか値が決まらないためここで判定する。
-            ColumnType::Text | ColumnType::Varchar(_) => Ok(Value::Text(
-                crate::row_codec::fit_char_length(&set.target_ty, &t)?.to_string(),
-            )),
+            ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
+                // `CHAR(n)` は空白詰めして保存する（TABLE-31・Issue #1566）。
+                crate::sql::parser::bind_text_literal(&set.target_ty, &t)
+            }
             _ => Err(internal()),
         },
         ExprValue::Bool(b) => match &set.target_ty {
