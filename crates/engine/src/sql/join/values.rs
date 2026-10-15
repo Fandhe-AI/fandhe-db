@@ -38,7 +38,9 @@ pub(super) enum JoinKeyClass {
 pub(super) fn key_class(ty: Option<&ColumnType>) -> Result<JoinKeyClass, SqlSurfaceError> {
     match ty {
         None => Ok(JoinKeyClass::Integer),
-        Some(ColumnType::Integer) | Some(ColumnType::BigInt) => Ok(JoinKeyClass::Integer),
+        Some(ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt) => {
+            Ok(JoinKeyClass::Integer)
+        }
         Some(ColumnType::Text | ColumnType::Varchar) => Ok(JoinKeyClass::Text),
         Some(ColumnType::Boolean) => Ok(JoinKeyClass::Bool),
         Some(ColumnType::Date) => Ok(JoinKeyClass::Date),

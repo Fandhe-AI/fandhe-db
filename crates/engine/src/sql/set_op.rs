@@ -171,10 +171,49 @@ fn columns_compatible(a: &ColumnMeta, b: &ColumnMeta) -> bool {
     match (a, b) {
         (ColumnMeta::Id, ColumnMeta::Id) => true,
         _ => match (static_type(a), static_type(b)) {
-            (Some(ta), Some(tb)) => ta.same_value_domain(tb),
+            // 整数型（SMALLINT／INTEGER／BIGINT）は PostgreSQL 同様に相互に互換とし、結果列は
+            // 広い方へ拡大する（[`merge_columns`]。Issue #1560）。
+            (Some(ta), Some(tb)) => {
+                ta.same_value_domain(tb)
+                    || (ta.integer_rank().is_some() && tb.integer_rank().is_some())
+            }
             _ => false,
         },
     }
+}
+
+/// 型整合済みの 2 枝の結果列メタを合成する。名前・由来（`Scalar`／`Computed`）は左に
+/// 揃え、整数型どうしは広い方の型へ拡大する（RowDescription の型と実行結果の型を
+/// そろえる。セルは `Cell::SignedInteger` で型をまたいで共通。Issue #1560）。
+fn merge_columns(left: &[ColumnMeta], right: &[ColumnMeta]) -> Vec<ColumnMeta> {
+    fn int_ty(m: &ColumnMeta) -> Option<&ColumnType> {
+        match m {
+            ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
+                ty.integer_rank().map(|_| ty)
+            }
+            _ => None,
+        }
+    }
+    left.iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let widened = match (int_ty(l), right.get(i).and_then(int_ty)) {
+                (Some(a), Some(b)) => ColumnType::widest_integer(a, b),
+                _ => None,
+            };
+            match (l, widened) {
+                (ColumnMeta::Scalar { name, .. }, Some(ty)) => ColumnMeta::Scalar {
+                    name: name.clone(),
+                    ty,
+                },
+                (ColumnMeta::Computed { name, .. }, Some(ty)) => ColumnMeta::Computed {
+                    name: name.clone(),
+                    ty: Some(ty),
+                },
+                _ => l.clone(),
+            }
+        })
+        .collect()
 }
 
 /// 2 枝の列数・列型整合を検証する（SQL-29 (c) §2.2）。列数不一致・列型不一致は
@@ -540,7 +579,7 @@ fn validate_tree_types(
                 l_has_vector,
                 r_has_vector,
             )?;
-            Ok((l_columns, l_has_vector))
+            Ok((merge_columns(&l_columns, &r_columns), l_has_vector))
         }
     }
 }
@@ -660,7 +699,7 @@ fn eval_tree(
             };
 
             Ok(EvalOutcome {
-                columns: l.columns,
+                columns: merge_columns(&l.columns, &r.columns),
                 rows,
                 has_vector: l.has_vector,
             })
@@ -859,7 +898,7 @@ fn describe_tree(
                 l_has_vector,
                 r_has_vector,
             )?;
-            Ok((l_columns, l_has_vector))
+            Ok((merge_columns(&l_columns, &r_columns), l_has_vector))
         }
     }
 }

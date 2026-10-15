@@ -250,7 +250,27 @@ TABLE-12）。物理フレーム幅が変わる（presence 1 + 4 → presence 1 
   実体化される。`REAL DEFAULT 0.1` を DOUBLE へ拡大すると既存行は `f64::from(0.1f32)`、
   拡大後に列を省略した INSERT は `0.1f64` になる（観測可能な差としてテストで固定）。
 - **失効**: 既存の世代 bump により索引・アリーナ等のテーブル世代キャッシュが失効する。
-- **範囲外のまま `42804`**: 縮小・同一型・`INTEGER → DOUBLE PRECISION`・`REAL → BIGINT` 等。
+- **範囲外のまま `42804`**: `BIGINT → INTEGER` などの縮小（TABLE-40 の担当）・同一型・`INTEGER → DOUBLE PRECISION`・`REAL → BIGINT` 等。
+
+### SMALLINT の変換（Issue #1560）
+
+ポインタ: TABLE-30・TABLE-19・TABLE-40。変換計画（`catalog::AlterPlan`）は次の 4 種。
+
+| 変換 | 計画 | 行 | `user_uniq`／`key_index` |
+| ---- | ---- | -- | ------------------------ |
+| `SMALLINT → INTEGER` | 再タグ付け（カタログのみ） | 不変（presence + `i32 LE` が同一） | 失効しない（タグ 2 を共有） |
+| `SMALLINT → BIGINT` | 全行を再エンコード | 書き換え | 失効させる（タグ 2 → 3） |
+| `INTEGER → SMALLINT` | 範囲検証のみ（全行を走査） | 不変 | 失効しない |
+| `BIGINT → SMALLINT` | 検証しつつ再エンコード | 書き換え | 失効させる（タグ 3 → 2） |
+
+- **縮小の範囲**: SMALLINT への縮小に限って受理する。それ以外の縮小は従来どおり `42804`。
+- **範囲外は `22003`**: 全テナント・全可視性の行を対象に検証する（可視集合に絞ると不可視行の
+  範囲外値を見逃し、読み出し時の decode 失敗を招く）。1 行でも範囲外なら固定文言
+  （`smallint out of range`。値・テナント・行 id を含めない）で失敗し、commit しないので
+  カタログ・行・索引・世代のいずれにも痕跡が残らない。破損（`XX000`）とは別の結果として扱う。
+- **列 DEFAULT**: 縮小時は DEFAULT も `i16` の範囲内であること（`ADD COLUMN ... NOT NULL DEFAULT`
+  の列は既存行にバイトが無く、行の走査だけでは見逃すため）。
+- **CHECK 依存**: 値を変えない整数型の変換として受理し、再コンパイルと全行再検証を通す。
 
 ## スコープ外・後続 Issue
 

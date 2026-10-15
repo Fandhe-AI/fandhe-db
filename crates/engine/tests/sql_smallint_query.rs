@@ -3,8 +3,7 @@
 //!
 //! 同じ値を持つ INTEGER 列 `m` と Rust 側 i16 オラクルの突き合わせで、二次索引経路と
 //! 全走査（`id + 0 > 0` 追加で索引を無効化）の完全一致、負数・境界値・NULL の並び順、
-//! 他テナント Private 行の非漏えい（RLS）を固定する。AVG の numeric 化は #2270、型をまたぐ算術・
-//! 比較は #1560 の担当で、本テストは現状の公告型（AVG は INTEGER 列と同じ型）を固定する。
+//! 他テナント Private 行の非漏えい（RLS）を固定する。AVG の numeric 化は #2270 の担当で、本テストは現状の公告型（AVG は INTEGER 列と同じ型）を固定する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -443,8 +442,26 @@ fn arithmetic_projection_and_subquery_comparison() {
         &core,
         &format!("SELECT n + 1 FROM {TABLE} WHERE id = 1 LIMIT 1"),
     );
-    // int2 同士の算術結果型は #1560 で見直す。現状は integer。
+    // smallint + int4 リテラルは PostgreSQL でも integer。
     assert_eq!(computed_types(&r), vec![Some(ColumnType::Integer)]);
+    // smallint 同士は smallint（Issue #1560）。i16 の溢れは 22003（id 7 は 32767）。
+    let r = run(
+        &core,
+        &format!("SELECT n + n FROM {TABLE} WHERE id = 3 LIMIT 1"),
+    );
+    assert_eq!(computed_types(&r), vec![Some(ColumnType::SmallInt)]);
+    let r = run(
+        &core,
+        &format!("SELECT n + m FROM {TABLE} WHERE id = 3 LIMIT 1"),
+    );
+    assert_eq!(computed_types(&r), vec![Some(ColumnType::Integer)]);
+    let e = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            &format!("SELECT n + n FROM {TABLE} WHERE id = 7 LIMIT 1"),
+        )
+        .expect_err("smallint overflow");
+    assert_eq!(e.wire_code(), "22003");
 
     let sub = run(
         &core,

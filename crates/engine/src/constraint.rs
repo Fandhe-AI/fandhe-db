@@ -1245,7 +1245,9 @@ fn push_required_key(
 ///
 /// - 位置ごとに型が等しい成分はそのままコピーする（型が全位置で等しければ入力を
 ///   そのまま返す高速経路）。
-/// - `INTEGER`／`BIGINT` 同士の成分は値を保って再エンコードする。`target` の値域に
+/// - 整数型（`SMALLINT`／`INTEGER`／`BIGINT`）同士の成分は値を保って再エンコードする
+///   （`SMALLINT` と `INTEGER` はタグ・payload が同じだが、`SMALLINT` へ向かう場合は
+///   `i16` の範囲を検査するため恒等扱いにしない。Issue #1560）。`target` の値域に
 ///   収まらない値は `Ok(None)`（その列にその値を持つ行は構造的に存在し得ない）。
 /// - 上記以外の型の組・成分数や長さの不整合・末尾の余りは内部矛盾として `Err`
 ///   （fail-closed）。`REAL`／`DOUBLE PRECISION` は FK 列になれないため対象外。
@@ -1290,13 +1292,12 @@ pub(crate) fn recode_key_for_types(
             out.extend_from_slice(component);
             continue;
         }
-        let both_integer = matches!(src, ColumnType::Integer | ColumnType::BigInt)
-            && matches!(dst, ColumnType::Integer | ColumnType::BigInt);
+        let both_integer = src.integer_rank().is_some() && dst.integer_rank().is_some();
         if !both_integer || tag != src.unique_key_tag() {
             return Err("foreign key columns have incompatible key types");
         }
         let value: i64 = match src {
-            ColumnType::Integer => {
+            ColumnType::SmallInt | ColumnType::Integer => {
                 let raw: [u8; 4] = payload
                     .try_into()
                     .map_err(|_| "INTEGER key component has an unexpected length")?;
@@ -1310,6 +1311,10 @@ pub(crate) fn recode_key_for_types(
             }
         };
         let scalar = match dst {
+            ColumnType::SmallInt => match i16::try_from(value) {
+                Ok(v) => ScalarRef::Integer(i32::from(v)),
+                Err(_) => return Ok(None),
+            },
             ColumnType::Integer => match i32::try_from(value) {
                 Ok(v) => ScalarRef::Integer(v),
                 Err(_) => return Ok(None),
@@ -1408,6 +1413,13 @@ impl<'a> FkKeyRecoder<'a> {
                 (Value::Integer(v), ColumnType::BigInt) => Ok(Value::BigInt(i64::from(v))),
                 (Value::BigInt(v), ColumnType::Integer) => i32::try_from(v)
                     .map(Value::Integer)
+                    .map_err(|_| TenantWriteError::ForeignKeyViolation),
+                // 参照元が SMALLINT のとき `i16` に収まらない値は fail-closed（Issue #1560）。
+                (Value::Integer(v), ColumnType::SmallInt) => i16::try_from(v)
+                    .map(|v| Value::Integer(i32::from(v)))
+                    .map_err(|_| TenantWriteError::ForeignKeyViolation),
+                (Value::BigInt(v), ColumnType::SmallInt) => i16::try_from(v)
+                    .map(|v| Value::Integer(i32::from(v)))
                     .map_err(|_| TenantWriteError::ForeignKeyViolation),
                 (other, _) => Ok(other),
             })
@@ -4515,6 +4527,44 @@ mod tests {
             ScalarRef::BigInt(i64::from(i32::MAX) + 1),
         ]);
         assert_eq!(recode_key_for_types(&wide, &dst, &src), Ok(None));
+    }
+
+    /// SMALLINT は INTEGER とタグ・payload が同じだが、SMALLINT へ向かう場合は `i16` を検査する
+    /// （恒等扱いにしない。Issue #1560）。
+    #[test]
+    fn recode_smallint_pairs_check_range_and_reject_unknown_pairs() {
+        let small = ColumnType::SmallInt;
+        let int = ColumnType::Integer;
+        let big = ColumnType::BigInt;
+        let k = |v: i32| canon(&[ScalarRef::Integer(v)]);
+        let kb = |v: i64| canon(&[ScalarRef::BigInt(v)]);
+        assert_eq!(
+            recode_key_for_types(&k(7), &[&small], &[&int]),
+            Ok(Some(k(7)))
+        );
+        assert_eq!(
+            recode_key_for_types(&k(-32768), &[&int], &[&small]),
+            Ok(Some(k(-32768)))
+        );
+        assert_eq!(
+            recode_key_for_types(&k(32768), &[&int], &[&small]),
+            Ok(None)
+        );
+        assert_eq!(
+            recode_key_for_types(&kb(40000), &[&big], &[&small]),
+            Ok(None)
+        );
+        assert_eq!(
+            recode_key_for_types(&kb(-5), &[&big], &[&small]),
+            Ok(Some(k(-5)))
+        );
+        assert_eq!(
+            recode_key_for_types(&k(5), &[&small], &[&big]),
+            Ok(Some(kb(5)))
+        );
+        // 型タグと型の不一致・整数以外との組は内部矛盾として Err。
+        assert!(recode_key_for_types(&kb(5), &[&small], &[&int]).is_err());
+        assert!(recode_key_for_types(&k(5), &[&small], &[&ColumnType::Text]).is_err());
     }
 
     #[test]

@@ -186,9 +186,12 @@ pub(crate) fn parent_id_key_bytes(
     use crate::catalog::ColumnType;
     use crate::row_codec::ScalarRef;
     let scalar = match column_ty {
+        ColumnType::SmallInt => i16::try_from(id)
+            .ok()
+            .map(|v| ScalarRef::Integer(i32::from(v))),
         ColumnType::Integer => i32::try_from(id).ok().map(ScalarRef::Integer),
         ColumnType::BigInt => i64::try_from(id).ok().map(ScalarRef::BigInt),
-        // `validate_foreign_keys` が `id` 参照の子列を `INTEGER`／`BIGINT` に
+        // `validate_foreign_keys` が `id` 参照の子列を整数型（SMALLINT／INTEGER／BIGINT）に
         // 限定するため到達しない内部矛盾。
         _ => {
             return Err(internal(
