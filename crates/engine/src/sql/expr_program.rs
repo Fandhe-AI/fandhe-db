@@ -461,6 +461,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::JsonAccess { .. }
         | BoundExpr::JsonFn { .. }
         | BoundExpr::JsonPredicate { .. }
+        | BoundExpr::JsonModify { .. }
         | BoundExpr::NullIf { .. } => None,
     }
 }
@@ -548,7 +549,8 @@ fn compile_node(
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::JsonAccess { .. }
         | BoundExpr::JsonFn { .. }
-        | BoundExpr::JsonPredicate { .. } => {
+        | BoundExpr::JsonPredicate { .. }
+        | BoundExpr::JsonModify { .. } => {
             steps.push(ExprStep::JsonSubtree(Box::new(expr.clone())));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);

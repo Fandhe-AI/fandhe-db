@@ -64,6 +64,9 @@ pub enum Token {
     HashArrow,
     /// `#>>`（最長一致で `#>` より優先。SQL-42・Issue #1520）。
     HashArrowText,
+    /// `#-`（jsonb のパス削除。TABLE-25・Issue #2181）。`#--` は PostgreSQL と同じく
+    /// `#` と行コメントに分ける。
+    HashMinus,
     /// `@>`（jsonb 包含。TABLE-25・Issue #1598）。単独の `@`・`@?`・`@@` は未対応文字のまま。
     JsonContains,
     /// `<@`（jsonb 被包含。TABLE-25・Issue #1598）。
@@ -207,6 +210,7 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
             Token::ArrowText => out.push_str("->>"),
             Token::HashArrow => out.push_str("#>"),
             Token::HashArrowText => out.push_str("#>>"),
+            Token::HashMinus => out.push_str("#-"),
             Token::JsonContains => out.push_str("@>"),
             Token::JsonContainedBy => out.push_str("<@"),
             Token::JsonExists => out.push('?'),
@@ -555,6 +559,15 @@ fn tokenize_impl(
                 }
                 chars = lookahead;
                 continue;
+            }
+            // `#-`（Issue #2181）。直後が `-` なら `#--` なので行コメントへ譲る。
+            if matches!(lookahead.peek(), Some(&(_, '-'))) {
+                lookahead.next();
+                if !matches!(lookahead.peek(), Some(&(_, '-'))) {
+                    tokens.push(Token::HashMinus);
+                    chars = lookahead;
+                    continue;
+                }
             }
         }
         // `@>`（jsonb 包含。Issue #1598）。単独の `@`・`@?`・`@@` は未対応文字として拒否する
@@ -1430,6 +1443,17 @@ mod tests {
     #[test]
     fn rejects_unterminated_string_literal() {
         assert!(tokenize("'abc").is_err());
+    }
+
+    /// TABLE-25・Issue #2181: `#-` の字句化。`#--` は `#` と行コメントに分かれる。
+    #[test]
+    fn hash_minus_operator_lexes_with_comment_boundary() {
+        use Token::*;
+        assert_eq!(toks("a #- b"), vec![ident("a"), HashMinus, ident("b")]);
+        assert_eq!(toks("a#-b"), vec![ident("a"), HashMinus, ident("b")]);
+        assert_eq!(toks("a #-- b"), vec![ident("a"), Punct('#')]);
+        assert_eq!(toks("a || b")[1], Concat);
+        assert!(render_tokens(&toks("a #- b")).unwrap().contains("#-"));
     }
 
     /// TABLE-25・Issue #1598: jsonb 包含・存在演算子の字句化（最長一致・境界）。
