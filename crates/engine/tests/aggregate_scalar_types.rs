@@ -1286,9 +1286,7 @@ fn float_column_in_and_not_in_with_scale0_numeric_beyond_2_pow_53() {
         1
     );
     assert_eq!(
-        count(&format!(
-            "SELECT id FROM t WHERE d < (SELECT q FROM t WHERE id = 2 LIMIT 1) LIMIT 10"
-        )),
+        count("SELECT id FROM t WHERE d < (SELECT q FROM t WHERE id = 2 LIMIT 1) LIMIT 10"),
         1
     );
 }
