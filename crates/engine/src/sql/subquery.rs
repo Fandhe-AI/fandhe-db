@@ -1678,6 +1678,16 @@ fn number_cell_text(cell: &Cell) -> Result<String, SqlSurfaceError> {
     match cell {
         Cell::Integer(n) => Ok(n.to_string()),
         Cell::SignedInteger(n) => Ok(n.to_string()),
+        // scale 0 の numeric（`SUM(BIGINT)`。Issue #2271）を浮動小数列との比較用に写す。
+        // 2^53 以上は正確表現ガードに拒否されるため小数点付きで表す。
+        Cell::Numeric(d) if d.scale() == 0 => {
+            let n = d.unscaled();
+            if n.unsigned_abs() >= 9_007_199_254_740_992 {
+                Ok(format!("{n}.0"))
+            } else {
+                Ok(n.to_string())
+            }
+        }
         // 2^53 以上の整数値は全桁の整数リテラルになり、式束縛の正確表現ガード
         // （`parse_number_literal`）に拒否されるため、小数点付きで表す。
         Cell::Float(f)
@@ -1716,8 +1726,10 @@ fn check_scalar_family_compatible(
                 || (inner.is_number() && target_family.is_number())
                 // Issue #2271（TABLE-13）: `SUM(BIGINT)` は scale 0 の numeric。整数列との
                 // 比較は PostgreSQL と同じく許可し、実行時は `i128` の厳密比較で行う。
-                || (target_family == SubqueryValueFamily::Integer
-                    && is_scale0_numeric_meta(inner_meta))
+                || (matches!(
+                    target_family,
+                    SubqueryValueFamily::Integer | SubqueryValueFamily::Float
+                ) && is_scale0_numeric_meta(inner_meta))
         }
         None => false,
     };

@@ -992,3 +992,51 @@ fn sum_bigint_excludes_other_tenant_rows() {
         .unwrap();
     assert_eq!(r.rows[0].cells, vec![dec0(10)]);
 }
+/// 浮動小数列（REAL/DOUBLE）と `SUM(BIGINT)`（scale 0 numeric）のスカラー
+/// サブクエリ比較は、変更前と同じく数値族間比較として受理される（Issue #2271）。
+#[test]
+fn float_column_compares_with_sum_bigint_scalar_subquery() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert_full_row(
+        &core,
+        &alice,
+        1,
+        "ja",
+        1,
+        10,
+        5.0,
+        5.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-1",
+    );
+    insert_full_row(
+        &core,
+        &alice,
+        2,
+        "ja",
+        1,
+        20,
+        50.0,
+        50.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-2",
+    );
+    // SUM(b) = 30
+    for col in ["r", "d"] {
+        let r = core
+            .execute_sql(
+                &alice,
+                &format!(
+                    "SELECT id FROM {TABLE} WHERE {col} < (SELECT SUM(b) FROM {TABLE}) LIMIT 10"
+                ),
+            )
+            .expect("float column vs SUM(BIGINT) must be accepted");
+        assert_eq!(r.rows.len(), 1, "{col}");
+    }
+}
