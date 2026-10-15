@@ -473,8 +473,7 @@ const TEXT_LIKE_DECLARED_OIDS: [i32; 3] = [0, 25, 1043];
 
 /// 推論スロット型と実効 OID（宣言 OID が 0 以外ならそれ、0 なら推論 OID）から
 /// バイナリ復号種別を決める（Issue #1345）。推論型との互換表に載らない組み合わせは
-/// すべて `Unsupported`（fail-closed）。PostgreSQL の暗黙キャスト（int2→int4、
-/// float4→float8 等）より意図的に厳しい: 値の意味が暗黙キャストと変わりうる
+/// すべて `Unsupported`（fail-closed）。PostgreSQL の暗黙キャスト（float4→float8 等）より意図的に厳しい: 値の意味が暗黙キャストと変わりうる
 /// 組み合わせを受理しない。
 #[deny(clippy::wildcard_enum_match_arm)]
 fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i32) -> BinaryParam {
@@ -502,17 +501,16 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
             ColumnMeta::Computed { .. } | ColumnMeta::AliasedId { .. } => BinaryParam::Unsupported,
             ColumnMeta::Scalar { ty, .. } => match ty {
                 ColumnType::Text | ColumnType::Varchar(_) => text_like(),
-                ColumnType::Integer | ColumnType::BigInt => int_kind(effective_oid),
+                ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => {
+                    int_kind(effective_oid)
+                }
                 ColumnType::Real => only(700, BinaryParam::Float4),
                 ColumnType::Double => only(701, BinaryParam::Float8),
                 ColumnType::Boolean => only(16, BinaryParam::Bool),
                 ColumnType::Bytea => only(17, BinaryParam::Bytea),
                 ColumnType::Uuid => only(2950, BinaryParam::Uuid),
-                // SMALLINT のバイナリ param（int2＝OID 21）は兄弟 Issue（#1561）で対応する。
-                // それまでは fail-closed に非対応とする（text 形式は engine 側で範囲検査）。
                 // CHAR(n) の param 型（bpchar＝OID 1042）は Issue #1565 で対応する。
                 ColumnType::Bpchar(_)
-                | ColumnType::SmallInt
                 | ColumnType::Vector(_)
                 | ColumnType::Numeric { .. }
                 | ColumnType::Date
@@ -526,9 +524,11 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
     }
 }
 
-/// 整数スロットの実効 OID から復号種別を選ぶ（int4=23・int8=20 のみ）。
+/// 整数スロットの実効 OID から復号種別を選ぶ（int2=21・int4=23・int8=20 のみ）。
+/// 範囲外の値（SMALLINT スロットへの広い整数等）は engine の束縛段が `22003` で拒否する。
 fn int_kind(effective_oid: i32) -> BinaryParam {
     match effective_oid {
+        21 => BinaryParam::Int2,
         23 => BinaryParam::Int4,
         20 => BinaryParam::Int8,
         _ => BinaryParam::Unsupported,

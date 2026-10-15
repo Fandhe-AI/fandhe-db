@@ -20,6 +20,8 @@ pub(crate) enum BinaryParam {
     Unsupported,
     /// text 系スロット。受信バイト列を UTF-8 の恒等表現としてそのまま渡す。
     Utf8Identity,
+    /// int2（2 バイト。TABLE-30・Issue #1561）。
+    Int2,
     /// int4（4 バイト）。
     Int4,
     /// int8（8 バイト）。
@@ -61,6 +63,10 @@ pub(crate) fn decode_to_text(kind: BinaryParam, raw: &[u8]) -> Result<Vec<u8>, B
     let text = match kind {
         BinaryParam::Unsupported => return Err(BinaryParamError),
         BinaryParam::Utf8Identity => return Ok(raw.to_vec()),
+        BinaryParam::Int2 => {
+            let b = <[u8; 2]>::try_from(raw).map_err(|_| BinaryParamError)?;
+            i16::from_be_bytes(b).to_string()
+        }
         BinaryParam::Int4 => {
             let b = <[u8; 4]>::try_from(raw).map_err(|_| BinaryParamError)?;
             i32::from_be_bytes(b).to_string()
@@ -104,6 +110,9 @@ mod tests {
 
     #[test]
     fn ints_round_trip_including_extremes() {
+        for v in [0, 1, -1, i16::MIN, i16::MAX] {
+            assert_eq!(dec(BinaryParam::Int2, &binary::int2(v)), v.to_string());
+        }
         for v in [0, 1, -1, i32::MIN, i32::MAX] {
             assert_eq!(dec(BinaryParam::Int4, &binary::int4(v)), v.to_string());
         }
@@ -160,7 +169,8 @@ mod tests {
 
     #[test]
     fn wrong_lengths_are_rejected() {
-        let cases: [(BinaryParam, usize); 6] = [
+        let cases: [(BinaryParam, usize); 7] = [
+            (BinaryParam::Int2, 2),
             (BinaryParam::Int4, 4),
             (BinaryParam::Int8, 8),
             (BinaryParam::Float4, 4),

@@ -32,7 +32,7 @@
 //! 返る。`"op":"not"` は語彙外で `42601`）。`like` は `%`・`_`・`\` をワイルドカード
 //! とエスケープとして解釈する（`prefix` はリテラルの前方一致のまま）。
 //! `between` は `DATE`／`TIMESTAMP`／`UUID`／`BYTEA`／`NUMERIC`（宣言的レーン）と
-//! 数値 4 型（`>= low AND <= high` の式レーン 2 述語。SQL の数値リテラル
+//! 数値型（SMALLINT 含む）（`>= low AND <= high` の式レーン 2 述語。SQL の数値リテラル
 //! `BETWEEN` の展開と同じ）を受理し、`TEXT` 等は SQL と同じく engine の
 //! `22000` へ委譲する。
 //!
@@ -699,19 +699,18 @@ fn declare_between(
             };
             Ok(leaf(numeric_text(low)?, numeric_text(high)?))
         }
-        // 数値 4 型は SQL の数値リテラル `BETWEEN` の展開（`>= low AND <= high`）と
+        // 数値型（SMALLINT 含む）は SQL の数値リテラル `BETWEEN` の展開（`>= low AND <= high`）と
         // 同じ式レーンの 2 述語へ写す（Issue #1183 の `eq`／範囲比較と同じ束縛経路）。
-        // SMALLINT の NoSQL 型束縛は兄弟 Issue（#1561）で解禁する。それまでは fail-closed
-        // に拒否する（Issue #1558）。以降の eq／範囲／in の各分岐も同じ。
-        ColumnType::SmallInt => Err(FilterError::Value(TypedJsonError::TypeMismatch(
-            "SMALLINT column is not supported on the NoSQL surface yet",
-        ))),
-        ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
-            Ok(vec![
-                numeric_expr_predicate(column, CompareOp::Ge, low, "range")?,
-                numeric_expr_predicate(column, CompareOp::Le, high, "range")?,
-            ])
-        }
+        // SMALLINT も同じ式レーンで束縛する（TABLE-30・NOSQL-17・Issue #1561）。範囲外は
+        // engine が `22003` を返す。以降の eq／範囲／in の各分岐も同じ。
+        ColumnType::SmallInt
+        | ColumnType::Integer
+        | ColumnType::BigInt
+        | ColumnType::Real
+        | ColumnType::Double => Ok(vec![
+            numeric_expr_predicate(column, CompareOp::Ge, low, "range")?,
+            numeric_expr_predicate(column, CompareOp::Le, high, "range")?,
+        ]),
         // TEXT／ENUM／BOOLEAN／VECTOR／ARRAY／JSON／JSONB は SQL の
         // `col BETWEEN 'a' AND 'b'` と同じく engine の「BETWEEN 非対応列」判定
         // （`22000`）へ委譲する。
@@ -863,13 +862,12 @@ fn declare_eq(
                 "eq filter value for a NUMERIC column must be a JSON number or numeric string",
             ))),
         },
-        // Issue #1183: 数値 4 型は式レーンで束縛する（SQL の式述語と同じ経路）。
-        ColumnType::SmallInt => Err(FilterError::Value(TypedJsonError::TypeMismatch(
-            "SMALLINT column is not supported on the NoSQL surface yet",
-        ))),
-        ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
-            numeric_expr_predicate(column, CompareOp::Eq, value, "eq")
-        }
+        // Issue #1183: 数値型（SMALLINT 含む）は式レーンで束縛する（SQL の式述語と同じ経路）。
+        ColumnType::SmallInt
+        | ColumnType::Integer
+        | ColumnType::BigInt
+        | ColumnType::Real
+        | ColumnType::Double => numeric_expr_predicate(column, CompareOp::Eq, value, "eq"),
         // SQL 表層にも eq レーンが無い列型は、従来どおり engine 側の
         // 「`TEXT` 列でない」判定（`22000`）へ委譲する（legacy 互換）。
         ColumnType::Vector(_) => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::equals(
@@ -955,13 +953,12 @@ fn declare_range(
                 "range filter value for a NUMERIC column must be a JSON number or numeric string",
             ))),
         },
-        // Issue #1183: 数値 4 型は式レーンで束縛する（`declare_eq` と同じ）。
-        ColumnType::SmallInt => Err(FilterError::Value(TypedJsonError::TypeMismatch(
-            "SMALLINT column is not supported on the NoSQL surface yet",
-        ))),
-        ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
-            numeric_expr_predicate(column, cmp, value, "range")
-        }
+        // Issue #1183: 数値型（SMALLINT 含む）は式レーンで束縛する（`declare_eq` と同じ）。
+        ColumnType::SmallInt
+        | ColumnType::Integer
+        | ColumnType::BigInt
+        | ColumnType::Real
+        | ColumnType::Double => numeric_expr_predicate(column, cmp, value, "range"),
         // Issue #1183: TEXT の範囲比較は式レーン（TEXT×TEXT のバイト順比較。
         // SQL の `lang < 'b'` の束縛結果と同一）へ渡す。
         ColumnType::Text | ColumnType::Varchar(_) => match value {
@@ -1138,13 +1135,14 @@ fn declare_in(
                 column, values,
             )))
         }
-        // 数値 4 型は SQL の数値リテラル `col IN (1, 2)` の脱糖（`col = 1 OR col = 2`。
+        // 数値型（SMALLINT 含む）は SQL の数値リテラル `col IN (1, 2)` の脱糖（`col = 1 OR col = 2`。
         // 要素 1 個なら平坦化）と同形の式レーンへ写す（Issue #1356。各分岐は
         // `eq` と同じ式述語）。要素は JSON 数値のみ。
-        ColumnType::SmallInt => Err(FilterError::Value(TypedJsonError::TypeMismatch(
-            "SMALLINT column is not supported on the NoSQL surface yet",
-        ))),
-        ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
+        ColumnType::SmallInt
+        | ColumnType::Integer
+        | ColumnType::BigInt
+        | ColumnType::Real
+        | ColumnType::Double => {
             let mut branches = Vec::with_capacity(items.len());
             for item in items {
                 branches.push(vec![numeric_expr_predicate(
@@ -1338,7 +1336,7 @@ fn where_predicate_for(
     }
 }
 
-/// 数値 4 型の式述語 `<col> <op> <number>` を 1 個組み立てる（SQL の
+/// 数値型（SMALLINT 含む）の式述語 `<col> <op> <number>` を 1 個組み立てる（SQL の
 /// `Parser::numeric_comparison` と同じ 3 ノードを式ノード予算へ課金する。枯渇は `54000`）。
 /// `value` は JSON 数値のみ（事前検証済みの契約。違反は `Internal` で fail-closed）。
 fn numeric_where_expr(
@@ -1369,11 +1367,15 @@ fn internal_shape_error() -> FilterError {
     })
 }
 
-/// 列型が数値 4 型（式レーン）か。
+/// 列型が数値型（SMALLINT 含む）（式レーン）か。
 fn is_numeric_expr_column(ty: &ColumnType) -> bool {
     matches!(
         ty,
-        ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double
+        ColumnType::SmallInt
+            | ColumnType::Integer
+            | ColumnType::BigInt
+            | ColumnType::Real
+            | ColumnType::Double
     )
 }
 
@@ -1391,7 +1393,7 @@ fn syntax_compare_op(cmp: CompareOp) -> Option<SyntaxCompareOp> {
 
 /// 述語形 DML の葉 1 個（`ne` を除く全 op）を、SQL の同じ述語を構文解析した結果と
 /// 同一の `WherePredicate` 列へ写す（[`bind_filter_where_predicates`] の変換段）。
-/// 数値 4 型の `eq`・範囲比較は式述語、`between` は `>= low AND <= high` の 2 述語、
+/// 数値型（SMALLINT 含む）の `eq`・範囲比較は式述語、`between` は `>= low AND <= high` の 2 述語、
 /// `in` は `Or([col = n1], [col = n2], ...)`（1 要素なら平坦化）へ展開する（SQL の
 /// 数値リテラル `IN`／`BETWEEN` の脱糖と同形）。それ以外の列型の範囲比較は
 /// `Compare{value}`、`in` は `InList{values}`（値は `eq` と同じ文字列リテラル形）。
@@ -1899,7 +1901,7 @@ mod tests {
         assert_eq!(bound.metadata_filters().len(), 1);
     }
 
-    /// Issue #1356: 数値 4 型の `in` は SQL の数値リテラル `IN` と同形の式レーンへ写る。
+    /// Issue #1356: 数値型（SMALLINT 含む）の `in` は SQL の数値リテラル `IN` と同形の式レーンへ写る。
     #[test]
     fn in_on_integer_column_binds_to_expression_lane() {
         let b = bind(r#"[{"column":"count","op":"in","value":[1,2]}]"#).expect("in int");
@@ -2644,7 +2646,7 @@ mod tests {
                 values: vec![col("a"), col("b")],
             }]
         );
-        // 数値 4 型: 範囲比較・`between`・`in`・`ne`。
+        // 数値型（SMALLINT 含む）: 範囲比較・`between`・`in`・`ne`。
         assert_eq!(
             map(r#"[{"column":"count","op":"lt","value":5}]"#).expect("num lt"),
             vec![num_expr("count", BinOp::Lt, "5")]
