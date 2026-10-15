@@ -200,6 +200,11 @@ fn merge_columns(left: &[ColumnMeta], right: &[ColumnMeta]) -> Vec<ColumnMeta> {
             _ => None,
         }
     }
+    // `CHAR(n)` は `is_text_like` に含まれないが、異型合成では長さを外す対象に含める
+    // （現状の型整合判定は Bpchar の異型を拒否するため防御的な備え。#1566 の書き込み解禁後も安全側）。
+    fn textish(t: &ColumnType) -> bool {
+        t.is_text_like() || matches!(t, ColumnType::Bpchar(_))
+    }
     left.iter()
         .enumerate()
         .map(|(i, l)| {
@@ -209,9 +214,12 @@ fn merge_columns(left: &[ColumnMeta], right: &[ColumnMeta]) -> Vec<ColumnMeta> {
                 // 右枝が長い値を返しうるため、左の `VARCHAR(n)` のままだと wire 層が
                 // 過小な typmod を公告してしまう（Issue #1565・fail-closed で長さなし）。
                 _ => match (static_ty(l), right.get(i).and_then(static_ty)) {
-                    (Some(a), Some(b)) if a.is_text_like() && b.is_text_like() && a != b => {
+                    (Some(a), Some(b)) if textish(a) && textish(b) && a != b => {
                         Some(match a {
                             ColumnType::Varchar(_) => ColumnType::Varchar(None),
+                            // 左が `CHAR(n)` の場合も右枝が長い値を返しうるため、長さなしの
+                            // TEXT へ落とす（OID 1042 ＋ 過小 typmod の公告を防ぐ）。
+                            ColumnType::Bpchar(_) => ColumnType::Text,
                             other => other.clone(),
                         })
                     }
@@ -1312,5 +1320,8 @@ mod tests {
             Varchar(Some(10))
         );
         assert_eq!(merged_ty(Bpchar(5), Bpchar(5)), Bpchar(5));
+        assert_eq!(merged_ty(Bpchar(5), Bpchar(10)), Text);
+        assert_eq!(merged_ty(Bpchar(5), Text), Text);
+        assert_eq!(merged_ty(Bpchar(5), Varchar(None)), Text);
     }
 }
