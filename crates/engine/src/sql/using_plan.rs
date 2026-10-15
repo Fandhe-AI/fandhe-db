@@ -95,6 +95,7 @@ pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfac
         // 通常あり得ないが、VECTOR 列と同じ「TEXT 列でない」拒否へ合流させる
         // （BOOLEAN も同様。Issue #883）。
         ColumnType::Vector(_)
+        | ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Real

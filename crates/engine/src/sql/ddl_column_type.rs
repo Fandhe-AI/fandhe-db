@@ -71,6 +71,7 @@ pub(crate) fn to_static_column_type_with_array_default(
     let resolved = match ty {
         SqlColumnTypeName::Text => ColumnType::Text,
         SqlColumnTypeName::Varchar => ColumnType::Varchar,
+        SqlColumnTypeName::SmallInt => ColumnType::SmallInt,
         SqlColumnTypeName::Integer => ColumnType::Integer,
         SqlColumnTypeName::BigInt => ColumnType::BigInt,
         SqlColumnTypeName::Real => ColumnType::Real,
@@ -110,6 +111,12 @@ pub(crate) fn to_static_column_type_with_array_default(
                 // `varchar[]` は別 OID（1015）のため Text へ写さず拒否する（Issue #2305。
                 // 写すと型の区別が失われ、後で受理へ広げたときに不可逆になる）。
                 ColumnType::Varchar => {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "this array element type is not supported yet".to_string(),
+                    })
+                }
+                // `smallint[]` は別 OID（1005）のため拒否する（Issue #1558。`varchar[]` と同じ理由）。
+                ColumnType::SmallInt => {
                     return Err(SqlSurfaceError::FeatureNotSupported {
                         detail: "this array element type is not supported yet".to_string(),
                     })
@@ -179,6 +186,8 @@ pub enum SqlColumnTypeName {
     /// 長さなしの `VARCHAR`／`CHARACTER VARYING`（TABLE-31・Issue #2305）。
     /// `VARCHAR(n)` は構文段で `0A000` のため本 variant には到達しない。
     Varchar,
+    /// `SMALLINT`／別名 `INT2`（TABLE-30・Issue #1558）。
+    SmallInt,
     Integer,
     BigInt,
     Real,
@@ -300,7 +309,7 @@ enum TypeNameKind {
     /// 長さ指定付きは `0A000`（型修飾子と長さ検査は後続フェーズ。Issue #2305）。
     /// 綴りを保持する別名として返す（同名 ENUM との衝突検出に使う。Issue #1528）。
     Varchar,
-    /// 定める ID が未確定のため受理しない型。`canonical` は正規名で、綴りに依らず
+    /// 定める ID が未確定のため受理しない型（現状は `CHAR`）。`canonical` は正規名で、綴りに依らず
     /// 同一の `0A000` メッセージを組み立てるために使う（Issue #2303）。
     Unsettled { canonical: &'static str },
     /// `CHARACTER [VARYING]` の先頭語。直後が `VARYING` なら `VARCHAR` と同じ扱い
@@ -342,17 +351,10 @@ const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
     ("VECTOR", TypeNameKind::Vector),
     ("NUMERIC", TypeNameKind::Numeric),
     ("DECIMAL", TypeNameKind::Numeric),
-    (
-        "INT2",
-        TypeNameKind::Unsettled {
-            canonical: "smallint",
-        },
-    ),
+    ("INT2", TypeNameKind::Alias(|| SqlColumnTypeName::SmallInt)),
     (
         "SMALLINT",
-        TypeNameKind::Unsettled {
-            canonical: "smallint",
-        },
+        TypeNameKind::Direct(|| SqlColumnTypeName::SmallInt),
     ),
     ("VARCHAR", TypeNameKind::Varchar),
     (
@@ -384,7 +386,7 @@ fn reject_length_modifier(tokens: &[Token], pos: usize) -> Result<(), SqlSurface
 ///
 /// 型名 → 列型の対応は [`TYPE_NAME_TABLE`] に一本化されており、`CREATE TABLE`・
 /// `ADD COLUMN`・`ALTER COLUMN TYPE`・配列要素が共有する（ポインタ: TABLE-29・
-/// TABLE-30・TABLE-31、Issue #1528・#2303）。未確定型（`INT2`／`SMALLINT`・`VARCHAR`／
+/// TABLE-30・TABLE-31、Issue #1528・#2303）。未確定型（`VARCHAR(n)`・
 /// `CHARACTER VARYING`・`CHAR`／`CHARACTER`）はカタログを参照しない静的判定で、構文段で
 /// 両綴りとも同一の `0A000` を返す（書き込みトランザクション開始前のため副作用なし）。
 /// `DOUBLE` 単独は構文段 `42704`。表に無い識別子は ENUM 型名候補として
@@ -756,10 +758,6 @@ mod tests {
     #[test]
     fn unsettled_type_names_are_rejected_with_0a000_in_both_spellings() {
         for raw in [
-            "INT2",
-            "int2",
-            "SMALLINT",
-            "smallint",
             "VARCHAR(10)",
             "varchar (10)",
             "CHARACTER VARYING(10)",
@@ -769,20 +767,37 @@ mod tests {
             "CHAR(1)",
             "CHARACTER",
             "CHARACTER(3)",
-            "INT2[]",
-            "SMALLINT[3]",
         ] {
             let e = parse_type(raw).expect_err(raw);
             assert_eq!(e.wire_code(), "0A000", "for {raw:?}");
         }
         for (a, b) in [
-            ("INT2", "SMALLINT"),
             ("VARCHAR(10)", "CHARACTER VARYING(10)"),
             ("CHAR(1)", "CHARACTER(1)"),
         ] {
             let (ea, eb) = (parse_type(a).unwrap_err(), parse_type(b).unwrap_err());
             assert_eq!(ea.wire_code(), eb.wire_code());
             assert_eq!(ea.to_string(), eb.to_string(), "{a} vs {b}");
+        }
+    }
+
+    /// `SMALLINT`／`INT2` は両綴りとも `SmallInt` として受理する（Issue #1558）。
+    #[test]
+    fn smallint_spellings_are_accepted() {
+        for raw in ["SMALLINT", "smallint", "INT2", "int2"] {
+            let (ty, pos) = parse_type(raw).expect(raw);
+            assert_eq!(pos, 1);
+            assert_eq!(
+                to_static_column_type(&ty).expect("static"),
+                StaticColumnType::Resolved(ColumnType::SmallInt),
+                "for {raw:?}"
+            );
+        }
+        // 配列要素としては別 OID のため拒否する（構文は通り、静的写像で 0A000）。
+        for raw in ["INT2[]", "SMALLINT[3]"] {
+            let (ty, _) = parse_type(raw).expect(raw);
+            let e = to_static_column_type(&ty).expect_err(raw);
+            assert_eq!(e.wire_code(), "0A000", "for {raw:?}");
         }
     }
 

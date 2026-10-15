@@ -812,7 +812,7 @@ impl PreparedParamType {
         matches!(self.literal_kind(), ParamLiteralKind::String)
     }
 
-    /// 置換リテラル種別（[`ParamLiteralKind`]）を導出する。`Id`・`INTEGER`・
+    /// 置換リテラル種別（[`ParamLiteralKind`]）を導出する。`Id`・`SMALLINT`・`INTEGER`・
     /// `BIGINT` は `Integer`、`REAL`・`DOUBLE` は `Float`、`BOOLEAN` は `Boolean`、それ以外は `String`。
     pub(crate) fn literal_kind(&self) -> ParamLiteralKind {
         use crate::catalog::ColumnType;
@@ -820,7 +820,9 @@ impl PreparedParamType {
         match self {
             PreparedParamType::Column(ColumnMeta::Id) => ParamLiteralKind::Integer,
             PreparedParamType::Column(ColumnMeta::Scalar { ty, .. }) => match ty {
-                ColumnType::Integer | ColumnType::BigInt => ParamLiteralKind::Integer,
+                ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => {
+                    ParamLiteralKind::Integer
+                }
                 ColumnType::Real | ColumnType::Double => ParamLiteralKind::Float,
                 ColumnType::Boolean => ParamLiteralKind::Boolean,
                 _ => ParamLiteralKind::String,

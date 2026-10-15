@@ -1500,6 +1500,27 @@ pub struct DecodedRow {
     pub values: Vec<Value>,
 }
 
+/// `Value::Integer`／`ScalarRef::Integer`（`i32` 表現）を `ty` の列へ書いてよいかの判定。
+/// `INTEGER` は常に可、`SMALLINT` は `i16` 範囲内のみ可（Issue #1558。値表現を INTEGER と
+/// 共有するため、範囲は束縛段〔`sql::parser::bind_integer_literal`〕に加えここでも
+/// encode／decode 両側のバックストップとして強制する。範囲外バイトの永続化・投影を防ぐ
+/// fail-closed）。他の列型は型不一致として不可。
+fn integer_value_fits(ty: &ColumnType, v: i32) -> bool {
+    match ty {
+        ColumnType::Integer => true,
+        ColumnType::SmallInt => i16::try_from(v).is_ok(),
+        _ => false,
+    }
+}
+
+/// 読み出した行バイト上の `SMALLINT` 値が `i16` 範囲外だった場合のエラー（破損行の
+/// fail-closed 拒否）。列名のみを含め値は反射しない。
+fn smallint_range_error(column_name: &str) -> RowCodecError {
+    RowCodecError::Invalid(format!(
+        "column {column_name:?} holds an out-of-range SMALLINT value"
+    ))
+}
+
 /// [`TableSchema`] の列定義（列順・型・nullable）に従い、行データをバイト列へ
 /// エンコードする（TABLE-7）。`values` はスキーマの列順に対応させる。
 ///
@@ -1641,6 +1662,7 @@ pub fn encode_row(
                     ColumnType::Enum(def) => def,
                     ColumnType::Text
                     | ColumnType::Varchar
+                    | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Vector(_)
@@ -1684,6 +1706,7 @@ pub fn encode_row(
                     ColumnType::Vector(dim) => *dim,
                     ColumnType::Text
                     | ColumnType::Varchar
+                    | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Real
@@ -1725,9 +1748,9 @@ pub fn encode_row(
                 }
             }
             Value::Integer(v) => {
-                if !matches!(column.ty, ColumnType::Integer) {
+                if !integer_value_fits(&column.ty, *v) {
                     return Err(RowCodecError::Invalid(format!(
-                        "column {:?} expects a non-Integer value, got Integer",
+                        "column {:?} expects a non-Integer value, got Integer (type mismatch or SMALLINT out of range)",
                         column.name
                     )));
                 }
@@ -1791,6 +1814,7 @@ pub fn encode_row(
                     ColumnType::Array(array_ty) => array_ty,
                     ColumnType::Text
                     | ColumnType::Varchar
+                    | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Vector(_)
@@ -1850,6 +1874,7 @@ pub fn encode_row(
                     }
                     ColumnType::Text
                     | ColumnType::Varchar
+                    | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Real
@@ -2233,7 +2258,7 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     offset = vector_end;
                     values.push(Value::Vector(vector));
                 }
-                ColumnType::Integer => {
+                ColumnType::SmallInt | ColumnType::Integer => {
                     let field_end = offset.checked_add(4).ok_or_else(|| {
                         RowCodecError::Invalid("offset overflow after integer field".to_string())
                     })?;
@@ -2244,7 +2269,11 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         RowCodecError::Invalid("integer field is not 4 bytes".to_string())
                     })?;
                     offset = field_end;
-                    values.push(Value::Integer(i32::from_le_bytes(arr)));
+                    let v = i32::from_le_bytes(arr);
+                    if !integer_value_fits(&column.ty, v) {
+                        return Err(smallint_range_error(&column.name));
+                    }
+                    values.push(Value::Integer(v));
                 }
                 ColumnType::BigInt => {
                     let field_end = offset.checked_add(8).ok_or_else(|| {
@@ -2660,6 +2689,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     ColumnType::Enum(def) => def,
                     ColumnType::Text
                     | ColumnType::Varchar
+                    | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Vector(_)
@@ -2707,9 +2737,9 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 )))
             }
             Value::Integer(v) => {
-                if !matches!(column.ty, ColumnType::Integer) {
+                if !integer_value_fits(&column.ty, *v) {
                     return Err(RowCodecError::Invalid(format!(
-                        "column {:?} expects a non-Integer value, got Integer",
+                        "column {:?} expects a non-Integer value, got Integer (type mismatch or SMALLINT out of range)",
                         column.name
                     )));
                 }
@@ -2778,6 +2808,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     ColumnType::Array(array_ty) => array_ty,
                     ColumnType::Text
                     | ColumnType::Varchar
+                    | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Vector(_)
@@ -2854,6 +2885,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     ColumnType::Numeric { precision, scale } => (precision, scale),
                     ColumnType::Text
                     | ColumnType::Varchar
+                    | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Real
@@ -2924,6 +2956,7 @@ fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) ->
         }
         ColumnType::Text
         | ColumnType::Varchar
+        | ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Vector(_)
@@ -3149,6 +3182,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         ColumnType::Enum(def) => def,
                         ColumnType::Text
                         | ColumnType::Varchar
+                        | ColumnType::SmallInt
                         | ColumnType::Integer
                         | ColumnType::BigInt
                         | ColumnType::Vector(_)
@@ -3185,9 +3219,9 @@ pub(crate) fn merge_encode_scalar_columns(
                     )))
                 }
                 Value::Integer(v) => {
-                    if !matches!(column.ty, ColumnType::Integer) {
+                    if !integer_value_fits(&column.ty, *v) {
                         return Err(RowCodecError::Invalid(format!(
-                            "column {:?} expects a non-Integer value, got Integer",
+                            "column {:?} expects a non-Integer value, got Integer (type mismatch or SMALLINT out of range)",
                             column.name
                         )));
                     }
@@ -3256,6 +3290,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         ColumnType::Array(array_ty) => array_ty,
                         ColumnType::Text
                         | ColumnType::Varchar
+                        | ColumnType::SmallInt
                         | ColumnType::Integer
                         | ColumnType::BigInt
                         | ColumnType::Vector(_)
@@ -3295,6 +3330,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         ColumnType::Numeric { precision, scale } => (precision, scale),
                         ColumnType::Text
                         | ColumnType::Varchar
+                        | ColumnType::SmallInt
                         | ColumnType::Integer
                         | ColumnType::BigInt
                         | ColumnType::Real
@@ -3365,7 +3401,7 @@ pub(crate) fn merge_encode_scalar_columns(
                     write_text(&mut buf, &mut reserve, text.as_bytes())?;
                 }
                 Some(ScalarRef::Integer(v)) => {
-                    if !matches!(column.ty, ColumnType::Integer) {
+                    if !integer_value_fits(&column.ty, v) {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Integer existing value, got Integer",
                             column.name
@@ -3707,6 +3743,10 @@ pub(crate) fn default_scalar<'a>(
         (ColumnDefault::Text(s), ColumnType::Text | ColumnType::Varchar) => {
             Ok(ScalarRef::Text(s.as_str()))
         }
+        (ColumnDefault::Number(n), ColumnType::SmallInt) => n
+            .parse::<i16>()
+            .map(|v| ScalarRef::Integer(i32::from(v)))
+            .map_err(|e| int_err(&e)),
         (ColumnDefault::Number(n), ColumnType::Integer) => n
             .parse::<i32>()
             .map(ScalarRef::Integer)
@@ -4169,7 +4209,7 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
-                ColumnType::Integer => {
+                ColumnType::SmallInt | ColumnType::Integer => {
                     let field_end = offset.checked_add(4).ok_or_else(|| {
                         RowCodecError::Invalid("offset overflow after integer field".to_string())
                     })?;
@@ -4183,6 +4223,9 @@ fn scan_scalar_columns_validated<'a>(
                     })?;
                     offset = field_end;
                     let v = i32::from_le_bytes(arr);
+                    if !integer_value_fits(column.ty, v) {
+                        return Err(smallint_range_error(column.name));
+                    }
                     if wanted {
                         sink(col_index, Some(ScalarRef::Integer(v)))?;
                     } else {
@@ -5372,6 +5415,80 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    // --- SMALLINT（Issue #1558・TABLE-30）。値表現は INTEGER と共有し範囲だけ i16 ----
+
+    fn smallint_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("s", ColumnType::SmallInt, false),
+                ColumnDef::new("sn", ColumnType::SmallInt, true),
+            ],
+        )
+    }
+
+    /// `smallint_schema` と同じ行レイアウトを持つ INTEGER 版（範囲外バイトを作るために使う）。
+    fn integer_twin_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("s", ColumnType::Integer, false),
+                ColumnDef::new("sn", ColumnType::Integer, true),
+            ],
+        )
+    }
+
+    #[test]
+    fn smallint_roundtrips_boundaries_through_row_and_scalar_payloads() {
+        let schema = smallint_schema();
+        for v in [i32::from(i16::MIN), 0, i32::from(i16::MAX)] {
+            let values = vec![Value::Integer(v), Value::Null];
+            let encoded =
+                encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+            assert_eq!(
+                decode_row(&schema, &encoded).expect("decode").values,
+                values
+            );
+            let buf = encode_scalar_columns(&schema, &values).expect("scalar encode");
+            assert_eq!(
+                scan_scalar_columns(&schema, &buf).expect("scan"),
+                vec![Some(ScalarRef::Integer(v)), None]
+            );
+        }
+    }
+
+    #[test]
+    fn smallint_encode_rejects_out_of_range_values() {
+        let schema = smallint_schema();
+        for v in [i32::from(i16::MAX) + 1, i32::from(i16::MIN) - 1, i32::MAX] {
+            let values = vec![Value::Integer(v), Value::Null];
+            assert!(matches!(
+                encode_row(&schema, "tenant-a", Visibility::Public, &values),
+                Err(RowCodecError::Invalid(_))
+            ));
+            assert!(matches!(
+                encode_scalar_columns(&schema, &values),
+                Err(RowCodecError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn smallint_decode_and_scan_reject_out_of_range_bytes() {
+        let wide = integer_twin_schema();
+        let values = vec![Value::Integer(40_000), Value::Null];
+        let encoded = encode_row(&wide, "tenant-a", Visibility::Public, &values).expect("encode");
+        assert!(matches!(
+            decode_row(&smallint_schema(), &encoded),
+            Err(RowCodecError::Invalid(_))
+        ));
+        let buf = encode_scalar_columns(&wide, &values).expect("scalar encode");
+        assert!(matches!(
+            scan_scalar_columns(&smallint_schema(), &buf),
+            Err(RowCodecError::Invalid(_))
+        ));
     }
 
     fn array_schema() -> TableSchema {

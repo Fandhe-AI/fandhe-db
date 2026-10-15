@@ -2453,10 +2453,22 @@ fn validate_set_assignments(
                     ))));
                 }
             }
-            (crate::catalog::ColumnType::Integer, crate::row_codec::Value::Integer(_)) => {
+            (
+                crate::catalog::ColumnType::SmallInt | crate::catalog::ColumnType::Integer,
+                crate::row_codec::Value::Integer(v),
+            ) => {
                 // 固定幅（presence(1) + 本体(4)）のため、事前検証は累計バイト
                 // 予算への計上だけでよい（値域は束縛段
-                // `sql::parser::bind_integer_literal` が既に検証済み）。
+                // `sql::parser::bind_integer_literal` が既に検証済み）。`SMALLINT` は
+                // 値表現を INTEGER と共有するため、Rust API から直接渡された範囲外値も
+                // 対象行の探索より前に拒否する多層防御を置く（Issue #1558）。
+                if matches!(column.ty, crate::catalog::ColumnType::SmallInt)
+                    && i16::try_from(*v).is_err()
+                {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "SET value out of range for SMALLINT column".to_string(),
+                    )));
+                }
                 set_text_payload_total = set_text_payload_total
                     .checked_add(crate::row_codec::SCALAR_INT4_ENTRY_LEN)
                     .ok_or_else(|| {
@@ -2762,6 +2774,7 @@ fn validate_set_assignments(
             (
                 crate::catalog::ColumnType::Text
                 | crate::catalog::ColumnType::Varchar
+                | crate::catalog::ColumnType::SmallInt
                 | crate::catalog::ColumnType::Integer
                 | crate::catalog::ColumnType::BigInt
                 | crate::catalog::ColumnType::Real
@@ -2799,6 +2812,7 @@ fn validate_set_assignments(
             (crate::catalog::ColumnType::Vector(_), _)
             | (crate::catalog::ColumnType::Text, _)
             | (crate::catalog::ColumnType::Varchar, _)
+            | (crate::catalog::ColumnType::SmallInt, _)
             | (crate::catalog::ColumnType::Integer, _)
             | (crate::catalog::ColumnType::BigInt, _)
             | (crate::catalog::ColumnType::Real, _)
