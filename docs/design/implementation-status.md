@@ -911,3 +911,7 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **対象外**: 式内 `$n` の型推論と `42P18`（#1546）、UPSERT `ON CONFLICT DO UPDATE SET` の式、`crash_test.sh` の SQL 対応、同一列の複数回 SET の拒否。
 
 **Issue #2331（feat(engine): FROM なし SELECT で HAVING を受理する。SQL-43 ポインタ。詳細は [sql-from-less-select.md](sql-from-less-select.md)）**: `WHERE` の後・`LIMIT` の前の `HAVING <条件>` を `GROUP BY` なしの 1 グループへの条件として受理し、集計を含む式も書ける。`HAVING` があれば集計項目が無くても 1 グループ扱い（偽・`NULL` は 0 行）。結果型が `numeric` の集計の `HAVING` での使用は `42601`。
+
+**Issue #1595（docs(design): JSON 演算子・関数・jsonpath の ExprType への写像を設計する。TABLE-25・TABLE-14 ポインタ。詳細は [json-expr-type-mapping.md](json-expr-type-mapping.md)）**: `ExprType::Json`／`Jsonb` の追加、値表現、字句・優先順位、型解決、jsonpath、比較順序、上限（`54000`）を決定 D1〜D12 として担当 Issue 対応表付きで記録。ドキュメントのみの変更でコードは変更しない。
+
+- **対象外**: コード実装（兄弟 Issue）、jsonb 出力形式の PostgreSQL 17 との差の是正、`jsonb_agg` の担当未割当、SRF 基盤（#2220）。
