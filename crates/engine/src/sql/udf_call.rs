@@ -2239,16 +2239,6 @@ fn is_int4_expr(expr: &Expr, env: &BindEnv<'_>) -> bool {
     }
 }
 
-/// 式木に除算が含まれるか（`->`／`->>` の添字右辺を非投影モードで拒否する判定用）。
-fn contains_div(expr: &Expr) -> bool {
-    match expr {
-        Expr::Binary { op, lhs, rhs } => {
-            matches!(op, BinOp::Div) || contains_div(lhs) || contains_div(rhs)
-        }
-        _ => false,
-    }
-}
-
 /// jsonb パス取得演算子（`->` `->>` `#>` `#>>`。対象ビヘイビア: TABLE-25。Issue #1596）
 /// の束縛。左辺は jsonb 列の参照または入れ子のパス演算子のみ（それ以外は `42883`、
 /// `json` 列は原文保持の意味論が別 Issue のため `0A000`）。右辺は演算子ごとに型規則で
@@ -2302,20 +2292,20 @@ fn bind_json_access(
     };
     let rhs_bound = match op {
         JsonAccessOp::Get | JsonAccessOp::GetText => {
-            let (r_bound, r_ty) = bind_expr_in(rhs, env, node_budget)?;
+            // 添字が int4 式なら、WHERE／UPDATE／DELETE 等の非投影経路でも投影経路と同じ
+            // 型付き整数演算（中間 int4 あふれは 22003・整数除算は切り捨て）で束縛し、
+            // 経路間で評価結果が食い違わないようにする（f64 評価だと中間あふれを見逃す）。
+            let subscript_is_int4 = is_int4_expr(rhs, env);
+            let saved_typed_arith = env.typed_arith;
+            if subscript_is_int4 {
+                env.typed_arith = true;
+            }
+            let bound = bind_expr_in(rhs, env, node_budget);
+            env.typed_arith = saved_typed_arith;
+            let (r_bound, r_ty) = bound?;
             match r_ty {
                 ExprType::Text => JsonAccessRhs::Key(Box::new(r_bound)),
-                ExprType::Scalar if is_int4_expr(rhs, env) => {
-                    // 非投影モード（WHERE 等）は整数除算の切り捨てを挿入せず f64 除算になり、
-                    // PostgreSQL の添字と食い違う（`n/2` が 1.5 になり 22003）ため fail-closed で拒否する。
-                    if !env.typed_arith && contains_div(rhs) {
-                        return Err(SqlSurfaceError::FeatureNotSupported {
-                            detail: "integer division in a JSON subscript is supported only in the select list"
-                                .to_string(),
-                        });
-                    }
-                    JsonAccessRhs::Index(Box::new(r_bound))
-                }
+                ExprType::Scalar if subscript_is_int4 => JsonAccessRhs::Index(Box::new(r_bound)),
                 _ => return Err(operator_missing()),
             }
         }

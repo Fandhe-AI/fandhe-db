@@ -248,8 +248,6 @@ fn jsonb_values_are_rejected_where_they_cannot_be_consumed_yet() {
         format!("SELECT id FROM {TABLE} WHERE docb -> 'a' = docb -> 'b' LIMIT 10"),
         format!("SELECT id FROM {TABLE} WHERE docb -> 'a' = 'x' LIMIT 10"),
         format!("SELECT COUNT(docb -> 'k') FROM {TABLE}"),
-        // 非投影モードでは整数除算の切り捨てが入らないため、添字右辺の除算は拒否する。
-        format!("SELECT id FROM {TABLE} WHERE docb -> n/2 ->> 'x' = 'y' LIMIT 10"),
         format!("SELECT lower(docb -> 'k') FROM {TABLE} LIMIT 10"),
         format!("SELECT COALESCE(docb -> 'k', docb -> 'a') FROM {TABLE} LIMIT 10"),
     ] {
@@ -397,4 +395,56 @@ fn dml_paths_evaluate_path_operators_and_resend_is_content_checked() {
             .wire_code(),
         "22023"
     );
+}
+
+/// 添字の整数演算は WHERE／UPDATE／DELETE でも投影と同じ型付き演算（int4 中間あふれは 22003）。
+#[test]
+fn subscript_integer_arithmetic_matches_between_projection_and_filters() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert(&core, &alice, 1, "k", r#"'["a","x"]'"#, 1);
+    let expr = "docb ->> (n + 2147483647 - 2147483647)";
+
+    assert_eq!(
+        code(
+            &core,
+            &alice,
+            &format!("SELECT {expr} FROM {TABLE} WHERE id = 1 LIMIT 1")
+        ),
+        "22003"
+    );
+    assert_eq!(
+        code(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE {expr} = 'x' LIMIT 1")
+        ),
+        "22003"
+    );
+    for (sql, op) in [
+        (
+            format!(
+                "UPDATE {TABLE} SET lang = 'z' WHERE {expr} = 'x' USING OPERATION_ID 'sub-upd'"
+            ),
+            "upd",
+        ),
+        (
+            format!("DELETE FROM {TABLE} WHERE {expr} = 'x' USING OPERATION_ID 'sub-del'"),
+            "del",
+        ),
+    ] {
+        let err = core
+            .execute_sql_in_session(&alice, &mut SessionState::default(), &sql)
+            .expect_err(op);
+        assert_eq!(err.wire_code(), "22003", "{op}");
+    }
+    // 範囲内の整数除算は WHERE でも切り捨てで投影と一致する（n=1 -> 1/2=0 -> "a"）。
+    let r = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE docb ->> (n / 2) = 'a' LIMIT 1"),
+        )
+        .expect("integer division in a filter subscript");
+    assert_eq!(r.rows.len(), 1);
 }
