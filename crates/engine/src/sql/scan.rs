@@ -891,6 +891,16 @@ fn build_projected_cells(
                     // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有
                     // 契約: NULL は `Cell::Null` へ写像する。
                     ExprValue::Null => cells.push(Cell::Null),
+                    // jsonb パス演算子 `->`／`#>` の結果（Issue #1596・TABLE-25）。
+                    // TEXT 結果と同じ累計バイト予算に計上する（行数分の蓄積で予算を
+                    // 回避させない）。
+                    ExprValue::Json(j) => {
+                        cells.push(Cell::Json(try_alloc_text_for_budget(
+                            &j,
+                            byte_budget,
+                            max_result_bytes,
+                        )?));
+                    }
                 }
             }
         }

@@ -2186,6 +2186,11 @@ fn expr_value_to_cell(
         ExprValue::Date(d) => Cell::Date(d),
         ExprValue::Timestamp(t) => Cell::Timestamp(t),
         ExprValue::Null => Cell::Null,
+        ExprValue::Json(_) => {
+            return Err(accumulator_bug(
+                "aggregate projection expression produced a jsonb value",
+            ))
+        }
         ExprValue::Vector(_) => {
             return Err(accumulator_bug(
                 "aggregate projection expression produced a vector",

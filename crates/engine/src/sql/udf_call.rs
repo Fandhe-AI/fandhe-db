@@ -270,6 +270,41 @@ pub enum Expr {
     /// `TIMESTAMP '<literal>'`（[`Expr::DateLiteral`] と同じ理由。値は
     /// `crate::datetime::parse_timestamp` の解析結果＝マイクロ秒）。
     TimestampLiteral(i64),
+    /// jsonb のパス取得演算子 `->` `->>` `#>` `#>>`（対象ビヘイビア: TABLE-25。
+    /// Issue #1596）。構文段（`allowlist::Parser::parse_json_access_expr`）が
+    /// PostgreSQL と同じ優先順位（加減算より弱く比較より強い）・左結合で生成する。
+    /// [`BinOp`] とは別 variant にして、索引計画・宣言的述語・CHECK 等が
+    /// 算術・比較の網羅 match へ誤って流し込まないようにする。
+    JsonAccess {
+        op: JsonAccessOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+}
+
+/// jsonb パス取得演算子の種別（[`Expr::JsonAccess`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonAccessOp {
+    /// `->`（右辺はキーまたは添字。結果は jsonb）。
+    Get,
+    /// `->>`（右辺はキーまたは添字。結果は text）。
+    GetText,
+    /// `#>`（右辺は text[] リテラル。結果は jsonb）。
+    Path,
+    /// `#>>`（右辺は text[] リテラル。結果は text）。
+    PathText,
+}
+
+impl JsonAccessOp {
+    /// 演算子の SQL 表記（CHECK／ビューの render・エラーメッセージ用）。
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            JsonAccessOp::Get => "->",
+            JsonAccessOp::GetText => "->>",
+            JsonAccessOp::Path => "#>",
+            JsonAccessOp::PathText => "#>>",
+        }
+    }
 }
 
 /// 束縛済み（列参照・関数呼び出しの解決、UDF 本体のインライン展開が完了した）式。
@@ -369,6 +404,32 @@ pub enum BoundExpr {
     ColumnRef {
         index: usize,
     },
+    /// nullable `jsonb` 列の参照（Issue #1596・TABLE-25）。パス演算子の左辺の位置
+    /// （[`BoundExpr::JsonAccess::lhs`]）でのみ生成され、それ以外の位置での jsonb 列参照は
+    /// 従来どおり束縛段が `22000` で拒否する。`index` は `TextColumnRef` と同じ論理列
+    /// インデックス系列。マスク外参照は実 NULL と取り違えず `Internal` で拒否する。
+    JsonbColumnRef {
+        index: usize,
+    },
+    /// パス取得演算子の束縛結果（Issue #1596・TABLE-25）。`lhs` は jsonb を返す式
+    /// （[`BoundExpr::JsonbColumnRef`] または入れ子の `JsonAccess`）。右辺の種別
+    /// （キー／添字／パス）は束縛時に確定している。`as_text` が真なら `->>`／`#>>`。
+    JsonAccess {
+        lhs: Box<BoundExpr>,
+        rhs: JsonAccessRhs,
+        as_text: bool,
+    },
+}
+
+/// [`BoundExpr::JsonAccess`] の右辺（束縛時に種別を確定済み）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonAccessRhs {
+    /// `->`／`->>` のキー（text を返す式）。
+    Key(Box<BoundExpr>),
+    /// `->`／`->>` の添字（int4 を返す式。負値は末尾から数える）。
+    Index(Box<BoundExpr>),
+    /// `#>`／`#>>` のパス（束縛時に解析・検証済みの text[] リテラル。`None` は NULL 要素）。
+    Path(Vec<Option<String>>),
 }
 
 impl PartialEq for BoundExpr {
@@ -389,6 +450,21 @@ impl PartialEq for BoundExpr {
                 BoundExpr::TimestampColumnRef { index: b },
             ) => a == b,
             (BoundExpr::ColumnRef { index: a }, BoundExpr::ColumnRef { index: b }) => a == b,
+            (BoundExpr::JsonbColumnRef { index: a }, BoundExpr::JsonbColumnRef { index: b }) => {
+                a == b
+            }
+            (
+                BoundExpr::JsonAccess {
+                    lhs: la,
+                    rhs: ra,
+                    as_text: ta,
+                },
+                BoundExpr::JsonAccess {
+                    lhs: lb,
+                    rhs: rb,
+                    as_text: tb,
+                },
+            ) => la == lb && ra == rb && ta == tb,
             (BoundExpr::IdRef, BoundExpr::IdRef) => true,
             (
                 BoundExpr::IdCompare { op: oa, value: va },
@@ -454,6 +530,9 @@ pub enum ExprType {
     Date,
     /// `TIMESTAMP` 値（[`ExprType::Date`] 参照）。
     Timestamp,
+    /// jsonb 値（Issue #1596・TABLE-25）。消費できるのは投影とパス演算子の左辺だけで、
+    /// 比較・順序・集計・関数引数・代入は #1597 まで `0A000` で拒否する。
+    Json,
 }
 
 /// 評価結果の値。
@@ -477,6 +556,9 @@ pub enum ExprValue<'a> {
     Date(i32),
     /// `TIMESTAMP` 値（マイクロ秒。[`ExprValue::Date`] 参照）。
     Timestamp(i64),
+    /// jsonb 値の正規化テキスト（Issue #1596・TABLE-25。`write_canonical` 済み）。
+    /// 列参照は借用、パス演算子の結果は所有。
+    Json(Cow<'a, str>),
     /// SQL の NULL（Issue #919・SQL-26、AC2 と Issue #921・SQL-26 の共有
     /// variant）。nullable TEXT 列参照・strict な関数への NULL 入力、および
     /// `CASE`／`COALESCE`／`NULLIF` の評価結果から生じる。呼び出し元
@@ -627,7 +709,9 @@ pub(crate) fn first_non_builtin_call(expr: &Expr) -> Option<&str> {
             }
             args.iter().find_map(first_non_builtin_call)
         }
-        Expr::Binary { lhs, rhs, .. } | Expr::NullIf(lhs, rhs) => {
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::NullIf(lhs, rhs)
+        | Expr::JsonAccess { lhs, rhs, .. } => {
             first_non_builtin_call(lhs).or_else(|| first_non_builtin_call(rhs))
         }
         Expr::Case { whens, else_result } => whens
@@ -1018,6 +1102,11 @@ fn validate_closed_expr(
     match expr {
         Expr::Number(_) => Ok(()),
         Expr::String(_) => Ok(()),
+        // jsonb パス演算子は列参照を要するため、列参照を持てない関数本体では常に未対応
+        // （Issue #1596。jsonb 値を受け取る関数引数型も存在しない）。
+        Expr::JsonAccess { .. } => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "JSON path operators are not supported in a function body".to_string(),
+        }),
         Expr::Ident(name) => {
             // `params` は `define_function` で正規化済み（小文字）。本体側の参照は
             // 引用なし識別子として書かれた原文字列のままなので、比較のたびに同じ
@@ -1195,7 +1284,15 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
+        | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::Null => 1,
+        BoundExpr::JsonAccess { lhs, rhs, .. } => {
+            1 + count_bound_nodes(lhs)
+                + match rhs {
+                    JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) => count_bound_nodes(e),
+                    JsonAccessRhs::Path(p) => p.len(),
+                }
+        }
         BoundExpr::Builtin { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
         BoundExpr::Binary { lhs, rhs, .. } => 1 + count_bound_nodes(lhs) + count_bound_nodes(rhs),
         BoundExpr::WasmCall { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
@@ -1239,7 +1336,15 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
+        | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::Null => 0,
+        BoundExpr::JsonAccess { lhs, rhs, .. } => {
+            let r = match rhs {
+                JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) => max_bound_case_nesting(e),
+                JsonAccessRhs::Path(_) => 0,
+            };
+            max_bound_case_nesting(lhs).max(r)
+        }
         BoundExpr::Builtin { args, .. } => {
             args.iter().map(max_bound_case_nesting).max().unwrap_or(0)
         }
@@ -1287,7 +1392,15 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
+        | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::Null => false,
+        BoundExpr::JsonAccess { lhs, rhs, .. } => {
+            references_embedding(lhs)
+                || match rhs {
+                    JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) => references_embedding(e),
+                    JsonAccessRhs::Path(_) => false,
+                }
+        }
         BoundExpr::Builtin { args, .. } => args.iter().any(references_embedding),
         BoundExpr::Binary { lhs, rhs, .. } => {
             references_embedding(lhs) || references_embedding(rhs)
@@ -1313,7 +1426,14 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         BoundExpr::TextColumnRef { index }
         | BoundExpr::DateColumnRef { index }
         | BoundExpr::TimestampColumnRef { index }
+        | BoundExpr::JsonbColumnRef { index }
         | BoundExpr::ColumnRef { index } => visit(*index),
+        BoundExpr::JsonAccess { lhs, rhs, .. } => {
+            visit_referenced_scalar_columns(lhs, visit);
+            if let JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) = rhs {
+                visit_referenced_scalar_columns(e, visit);
+            }
+        }
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
         | BoundExpr::Date(_)
@@ -1371,6 +1491,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         BoundExpr::TextColumnRef { index }
         | BoundExpr::DateColumnRef { index }
         | BoundExpr::TimestampColumnRef { index }
+        | BoundExpr::JsonbColumnRef { index }
         | BoundExpr::ColumnRef { index } => {
             if let Some(slot) = mask.get_mut(*index) {
                 *slot = true;
@@ -1385,6 +1506,17 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
         | BoundExpr::Null => false,
+        // 左辺の jsonb 列と、キー／添字の式が参照する列を両方マスクへ反映する
+        // （取りこぼすとマスク外参照＝実 NULL の誤判定になるため全て走査する）。
+        BoundExpr::JsonAccess { lhs, rhs, .. } => {
+            let mut any = mark_referenced_scalar_columns(lhs, mask);
+            if let JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) = rhs {
+                if mark_referenced_scalar_columns(e, mask) {
+                    any = true;
+                }
+            }
+            any
+        }
         // `any`/`fold` は短絡評価となり、先頭の一致以降の引数をマークし損ねる
         // （複数引数が別々の TEXT 列を参照しうる。例: `concat(a, b)`）ため、
         // 明示ループで全引数を必ず走査する（`references_embedding` の `any`
@@ -1468,6 +1600,20 @@ pub(crate) fn bind_projection_expr(
     registry: &UdfRegistry,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    let r = bind_projection_expr_json_ok(expr, schema, registry, node_budget)?;
+    reject_json_operand(r.1)?;
+    Ok(r)
+}
+
+/// [`bind_projection_expr`] の jsonb 結果許容版（Issue #1596）。投影項目
+/// （`sql::parser::bind_projection`）だけが使い、HAVING／ORDER BY 等の他の呼び出し元は
+/// jsonb 結果を `0A000` で拒否する [`bind_projection_expr`] を使う。
+pub(crate) fn bind_projection_expr_json_ok(
+    expr: &Expr,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
@@ -1475,7 +1621,7 @@ pub(crate) fn bind_projection_expr(
         case_nesting: 0,
         typed_arith: true,
     };
-    let (bound, ty) = bind_expr_in(expr, &mut env, node_budget)?;
+    let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
     let col = expr_result_column_type(expr, &bound, ty);
     Ok((bound, ty, col))
 }
@@ -1520,6 +1666,7 @@ pub(crate) fn column_type_for_expr_type(ty: ExprType) -> Option<ColumnType> {
         ExprType::Text => Some(ColumnType::Text),
         ExprType::Date => Some(ColumnType::Date),
         ExprType::Timestamp => Some(ColumnType::Timestamp),
+        ExprType::Json => Some(ColumnType::Jsonb),
         ExprType::Vector => None,
     }
 }
@@ -1799,6 +1946,31 @@ fn bind_expr_in(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let (bound, ty) = bind_expr_any(expr, env, node_budget)?;
+    reject_json_operand(ty)?;
+    Ok((bound, ty))
+}
+
+/// jsonb 値（[`ExprType::Json`]）を消費できない位置（比較・算術・関数引数・`CASE`／
+/// `COALESCE`／`NULLIF`・述語・集計・順序・代入）へ流れた場合の `0A000`（Issue #1596。
+/// 型の比較・順序・出力形式は #1597 の担当のため、それまで fail-closed に拒否する）。
+fn reject_json_operand(ty: ExprType) -> Result<(), SqlSurfaceError> {
+    if ty == ExprType::Json {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "a jsonb value can only be projected or used as the left operand of a JSON path operator"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// [`bind_expr_in`] の本体。jsonb 型の結果を返しうる（投影・パス演算子の左辺は
+/// この関数を直接呼び、それ以外の消費側は [`bind_expr_in`] 経由で jsonb を拒否する）。
+fn bind_expr_any(
+    expr: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
     *node_budget = node_budget
         .checked_sub(1)
         .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
@@ -2038,7 +2210,137 @@ fn bind_expr_in(
         // 値を保持しているため、束縛段では単に値を引き継ぐだけでよい。
         Expr::DateLiteral(days) => Ok((BoundExpr::Date(*days), ExprType::Date)),
         Expr::TimestampLiteral(micros) => Ok((BoundExpr::Timestamp(*micros), ExprType::Timestamp)),
+        Expr::JsonAccess { op, lhs, rhs } => bind_json_access(*op, lhs, rhs, env, node_budget),
     }
+}
+
+/// `expr` が PostgreSQL の int4 になる式（int4 範囲の整数リテラル・INTEGER 列・
+/// それらの四則演算）かを AST から判定する（`->`／`->>` の添字右辺の型規則。D6）。
+fn is_int4_expr(expr: &Expr, env: &BindEnv<'_>) -> bool {
+    match expr {
+        Expr::Number(raw) => matches!(
+            classify_projection_integer_literal(raw),
+            Some((_, NumericKind::Int4))
+        ),
+        Expr::Ident(name) => env.schema.is_some_and(|sc| {
+            sc.columns
+                .iter()
+                .find(|c| &c.name == name)
+                .is_some_and(|c| matches!(c.ty, ColumnType::Integer))
+        }),
+        Expr::Binary {
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div,
+            lhs,
+            rhs,
+        } => is_int4_expr(lhs, env) && is_int4_expr(rhs, env),
+        _ => false,
+    }
+}
+
+/// jsonb パス取得演算子（`->` `->>` `#>` `#>>`。対象ビヘイビア: TABLE-25。Issue #1596）
+/// の束縛。左辺は jsonb 列の参照または入れ子のパス演算子のみ（それ以外は `42883`、
+/// `json` 列は原文保持の意味論が別 Issue のため `0A000`）。右辺は演算子ごとに型規則で
+/// キー・添字・パスへ確定させ、評価時に型を再判定しない。
+fn bind_json_access(
+    op: JsonAccessOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let operator_missing = || {
+        SqlSurfaceError::undefined_function(format!(
+            "operator does not exist: the operand types do not match the {} operator",
+            op.as_sql()
+        ))
+    };
+    // 左辺。jsonb 列は裸の識別子のときだけここで束縛する（それ以外の位置での jsonb 列参照は
+    // 従来どおり束縛段が 22000 で拒否する）。
+    let (l_bound, l_ty) = match lhs {
+        Expr::Ident(name) if !env.params.contains_key(name.to_ascii_lowercase().as_str()) => {
+            let column = env
+                .schema
+                .and_then(|sc| sc.columns.iter().enumerate().find(|(_, c)| &c.name == name));
+            match column {
+                Some((index, c)) if matches!(c.ty, ColumnType::Jsonb) => {
+                    *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
+                        SqlSurfaceError::payload_too_large("expression is too large")
+                    })?;
+                    (BoundExpr::JsonbColumnRef { index }, ExprType::Json)
+                }
+                Some((_, c)) if matches!(c.ty, ColumnType::Json) => {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "JSON path operators on a json column are not supported; use jsonb"
+                            .to_string(),
+                    })
+                }
+                _ => bind_expr_in(lhs, env, node_budget)?,
+            }
+        }
+        _ => bind_expr_any(lhs, env, node_budget)?,
+    };
+    if l_ty != ExprType::Json {
+        return Err(operator_missing());
+    }
+    let as_text = matches!(op, JsonAccessOp::GetText | JsonAccessOp::PathText);
+    let result_ty = if as_text {
+        ExprType::Text
+    } else {
+        ExprType::Json
+    };
+    let rhs_bound = match op {
+        JsonAccessOp::Get | JsonAccessOp::GetText => {
+            // 添字が int4 式なら、WHERE／UPDATE／DELETE 等の非投影経路でも投影経路と同じ
+            // 型付き整数演算（中間 int4 あふれは 22003・整数除算は切り捨て）で束縛し、
+            // 経路間で評価結果が食い違わないようにする（f64 評価だと中間あふれを見逃す）。
+            let subscript_is_int4 = is_int4_expr(rhs, env);
+            let saved_typed_arith = env.typed_arith;
+            if subscript_is_int4 {
+                env.typed_arith = true;
+            }
+            let bound = bind_expr_in(rhs, env, node_budget);
+            env.typed_arith = saved_typed_arith;
+            let (r_bound, r_ty) = bound?;
+            match r_ty {
+                ExprType::Text => JsonAccessRhs::Key(Box::new(r_bound)),
+                ExprType::Scalar if subscript_is_int4 => JsonAccessRhs::Index(Box::new(r_bound)),
+                _ => return Err(operator_missing()),
+            }
+        }
+        JsonAccessOp::Path | JsonAccessOp::PathText => {
+            let Expr::String(literal) = rhs else {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "the right operand of #> and #>> must be a text[] literal".to_string(),
+                });
+            };
+            *node_budget = node_budget
+                .checked_sub(1)
+                .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+            let array_ty = crate::catalog::ArrayType::new(
+                crate::catalog::ArrayElemType::Text,
+                crate::catalog::MAX_ARRAY_ELEMENTS,
+            )
+            .map_err(|_| SqlSurfaceError::Internal {
+                detail: "text[] type construction failed".to_string(),
+            })?;
+            match crate::sql::parser::parse_array_literal(literal, array_ty)? {
+                crate::row_codec::ArrayValue::Text(items) => JsonAccessRhs::Path(items),
+                _ => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "text[] literal parsed to a non-text array".to_string(),
+                    })
+                }
+            }
+        }
+    };
+    Ok((
+        BoundExpr::JsonAccess {
+            lhs: Box::new(l_bound),
+            rhs: rhs_bound,
+            as_text,
+        },
+        result_ty,
+    ))
 }
 
 /// 型付き算術のオペランドの数値種別（Issue #1539・SQL-42）。`None` は倍精度扱い
@@ -2873,6 +3175,71 @@ pub(crate) fn numeric_scalar_from_ref(v: &ScalarRef<'_>) -> Result<f64, SqlSurfa
     }
 }
 
+/// パス取得演算子の評価（Issue #1596・TABLE-25）。左辺・キー・添字のいずれかが NULL なら
+/// 結果は NULL。キー不在・範囲外・容器の型不一致も NULL（`json::jsonb_access*`）。
+/// 格納値のパース失敗は格納契約違反のため固定文言の `Internal`（行の値は含めない）。
+fn eval_json_access<'a>(
+    lhs: &BoundExpr,
+    rhs: &JsonAccessRhs,
+    as_text: bool,
+    id: u64,
+    embedding: &'a [f32],
+    row_scalars: &'a [Option<ScalarRef<'a>>],
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    let stored = match eval_with_scalars(lhs, id, embedding, row_scalars)? {
+        ExprValue::Json(j) => j,
+        ExprValue::Null => return Ok(ExprValue::Null),
+        _ => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "JSON path operator left operand is not a jsonb value".to_string(),
+            })
+        }
+    };
+    let step = match rhs {
+        JsonAccessRhs::Key(e) => match eval_with_scalars(e, id, embedding, row_scalars)? {
+            ExprValue::Text(k) => Some(crate::json::JsonAccessStep::Key(k.into_owned())),
+            ExprValue::Null => None,
+            _ => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "JSON path operator key is not a text value".to_string(),
+                })
+            }
+        },
+        JsonAccessRhs::Index(e) => match eval_with_scalars(e, id, embedding, row_scalars)? {
+            ExprValue::Scalar(v) => {
+                if v.fract() != 0.0 || v < f64::from(i32::MIN) || v > f64::from(i32::MAX) {
+                    return Err(SqlSurfaceError::numeric_out_of_range(
+                        "JSON array subscript is out of range for integer",
+                    ));
+                }
+                Some(crate::json::JsonAccessStep::Index(v as i32))
+            }
+            ExprValue::Null => None,
+            _ => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "JSON path operator subscript is not a numeric value".to_string(),
+                })
+            }
+        },
+        JsonAccessRhs::Path(_) => None,
+    };
+    let result = match rhs {
+        JsonAccessRhs::Path(path) => crate::json::jsonb_access_path(&stored, path, as_text),
+        _ => match step {
+            Some(step) => crate::json::jsonb_access(&stored, &step, as_text),
+            None => return Ok(ExprValue::Null),
+        },
+    }
+    .map_err(|_| SqlSurfaceError::Internal {
+        detail: "stored jsonb value could not be parsed".to_string(),
+    })?;
+    Ok(match result {
+        None => ExprValue::Null,
+        Some(text) if as_text => ExprValue::Text(Cow::Owned(text)),
+        Some(text) => ExprValue::Json(Cow::Owned(text)),
+    })
+}
+
 pub fn eval<'a>(
     expr: &BoundExpr,
     id: u64,
@@ -2953,6 +3320,20 @@ pub(crate) fn eval_with_scalars<'a>(
             Some(None) => Ok(ExprValue::Null),
             Some(Some(v)) => numeric_scalar_from_ref(v).map(ExprValue::Scalar),
         },
+        BoundExpr::JsonbColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "JSONB column reference is outside the decoded row scalar view".to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Json(text))) => Ok(ExprValue::Json(Cow::Borrowed(text))),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "JSONB column reference resolved to a non-JSON row scalar value"
+                    .to_string(),
+            }),
+        },
+        BoundExpr::JsonAccess { lhs, rhs, as_text } => {
+            eval_json_access(lhs, rhs, *as_text, id, embedding, row_scalars)
+        }
         BoundExpr::IdRef => id_as_finite_scalar(id).map(ExprValue::Scalar),
         BoundExpr::IdCompare { op, value } => Ok(ExprValue::Bool(id_compare(*op, id, *value))),
         BoundExpr::VectorRef => {

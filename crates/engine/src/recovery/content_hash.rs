@@ -1610,7 +1610,7 @@ fn collect_referenced_udfs(
             }
             Ok(())
         }
-        Expr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
             collect_referenced_udfs(lhs, udf_registry, out)?;
             collect_referenced_udfs(rhs, udf_registry, out)
         }
@@ -1729,7 +1729,9 @@ fn push_set_expr(
             Expr::Call { args, .. } | Expr::Coalesce(args) => {
                 args.iter().for_each(|a| walk(b, a));
             }
-            Expr::Binary { lhs, rhs, .. } | Expr::NullIf(lhs, rhs) => {
+            Expr::Binary { lhs, rhs, .. }
+            | Expr::NullIf(lhs, rhs)
+            | Expr::JsonAccess { lhs, rhs, .. } => {
                 walk(b, lhs);
                 walk(b, rhs);
             }
@@ -1878,6 +1880,21 @@ fn push_dml_expr(
             b.push_u8(10);
             b.push_u8(1);
             b.push_raw(&micros.to_le_bytes());
+        }
+        // タグ 12（対象ビヘイビア: TABLE-25。Issue #1596。ADR §4.4 タグ表に追記）。
+        // 演算子種別（`->` `->>` `#>` `#>>`）を 1 バイトで区別してから左辺・右辺を
+        // 前置順に直列化する。演算子種別や左右の入れ替えで衝突させない
+        // （RECOVER-10: 内容が異なる DML は異なるハッシュを持つ）。既存タグは不変。
+        Expr::JsonAccess { op, lhs, rhs } => {
+            b.push_u8(12);
+            b.push_u8(match op {
+                crate::sql::udf_call::JsonAccessOp::Get => 1,
+                crate::sql::udf_call::JsonAccessOp::GetText => 2,
+                crate::sql::udf_call::JsonAccessOp::Path => 3,
+                crate::sql::udf_call::JsonAccessOp::PathText => 4,
+            });
+            push_dml_expr(b, lhs, params)?;
+            push_dml_expr(b, rhs, params)?;
         }
     }
     Ok(())
@@ -4234,6 +4251,17 @@ mod tests {
             rhs: Box::new(r),
         }
     }
+    fn json_access(
+        op: crate::sql::udf_call::JsonAccessOp,
+        l: crate::sql::udf_call::Expr,
+        r: crate::sql::udf_call::Expr,
+    ) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::JsonAccess {
+            op,
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        }
+    }
     fn call(name: &str, args: Vec<crate::sql::udf_call::Expr>) -> crate::sql::udf_call::Expr {
         crate::sql::udf_call::Expr::Call {
             name: name.to_string(),
@@ -4381,6 +4409,32 @@ mod tests {
                 "identifier case",
                 bin(BinOp::Add, ident("N"), num("1")),
                 bin(BinOp::Add, n(), num("1")),
+            ),
+            // Issue #1596（TABLE-25）: jsonb パス演算子は演算子種別・左右の入れ替え・
+            // 右辺の値で区別される（タグ 12）。
+            (
+                "json op kind get vs get_text",
+                json_access(crate::sql::udf_call::JsonAccessOp::Get, n(), text("k")),
+                json_access(crate::sql::udf_call::JsonAccessOp::GetText, n(), text("k")),
+            ),
+            (
+                "json op kind path vs path_text",
+                json_access(crate::sql::udf_call::JsonAccessOp::Path, n(), text("{k}")),
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::PathText,
+                    n(),
+                    text("{k}"),
+                ),
+            ),
+            (
+                "json rhs value",
+                json_access(crate::sql::udf_call::JsonAccessOp::Get, n(), text("a")),
+                json_access(crate::sql::udf_call::JsonAccessOp::Get, n(), text("b")),
+            ),
+            (
+                "json operand swap",
+                json_access(crate::sql::udf_call::JsonAccessOp::Get, n(), m()),
+                json_access(crate::sql::udf_call::JsonAccessOp::Get, m(), n()),
             ),
             (
                 "beyond 2^53 integer vs decimal spelling",

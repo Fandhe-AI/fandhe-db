@@ -395,6 +395,9 @@ TABLE-14・TASK-198（Issue #889。関連: NOSQL-8・NOSQL-17）で `ColumnType:
   追加し、SQL・NoSQL 表層への構文露出は行わない（`doc -> 'a'` は引き続き
   `42601`）。露出は spec ID 付与後の別 Issue へ申し送る。
   式評価器への写像の設計は [json-expr-type-mapping.md](json-expr-type-mapping.md)（Issue #1595）。
+  - Issue #1596（TABLE-25）で `jsonb` 列に限りパス演算子 `->` `->>` `#>` `#>>` を構文段・
+    束縛段・評価器に開放した（`json` 列は 0A000、非 jsonb の左辺は 42883）。上記の
+    Rust API（`JsonPath`／`extract_path`）は変更していない。
 - wire-server: SQL 表層のテキスト表現は格納テキストをそのまま出力する
   （`JSON` は入力テキスト保持・`JSONB` は正規化済みテキストのため、いずれも
   再シリアライズしない）。NoSQL 表層（`insert.rs`／`update.rs`）は JSON
