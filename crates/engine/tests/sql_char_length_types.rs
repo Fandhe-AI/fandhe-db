@@ -213,6 +213,33 @@ fn over_length_writes_are_rejected_and_not_persisted() {
     );
 }
 
+/// 一致行 0 件の UPDATE でも n 超過の SET 値は対象行探索前に拒否され、
+/// `operation_id` を消費しない（同じ ID で有効な値を再送できる）。
+#[test]
+fn over_length_update_set_is_rejected_even_with_zero_matching_rows() {
+    let (_p, _g, core) = open("cl-update-zero");
+    ok(&core, "CREATE TABLE t (v VARCHAR(3))");
+    ok(
+        &core,
+        "INSERT INTO t (id, v) VALUES (1, 'abc') USING OPERATION_ID 'o1'",
+    );
+    assert!(exec_as(
+        "alice",
+        &core,
+        "UPDATE t SET v = 'abcd' WHERE id = 999 USING OPERATION_ID 'o2'"
+    )
+    .is_err());
+    // 拒否で operation_id が消費されていなければ、同 ID で有効な更新が成功する。
+    ok(
+        &core,
+        "UPDATE t SET v = 'xyz' WHERE id = 1 USING OPERATION_ID 'o2'",
+    );
+    assert_eq!(
+        select_count(&core, "SELECT id FROM t WHERE v = 'xyz' LIMIT 10"),
+        1
+    );
+}
+
 /// `VARCHAR(n)` は TEXT と同じ述語・索引・PK 経路で扱える（値表現を共有するため）。
 #[test]
 fn bounded_varchar_behaves_like_text_for_predicates_and_keys() {

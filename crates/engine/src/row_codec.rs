@@ -2959,7 +2959,7 @@ fn is_text_frame_type(ty: &ColumnType) -> bool {
 /// 単一のチョークポイントになる。束縛段での `22001` 分類と末尾空白の切り詰め許容は
 /// Issue #1564 の担当で、それまでは `RowCodecError::Invalid` として fail-closed に拒否する。
 /// エラーには列名だけを含め、値は反射しない。
-fn check_varchar_length(column: &crate::catalog::ColumnDef, text: &str) -> Result<()> {
+pub(crate) fn check_varchar_length(column: &crate::catalog::ColumnDef, text: &str) -> Result<()> {
     let n = match &column.ty {
         ColumnType::Varchar(Some(n)) | ColumnType::Bpchar(n) => *n,
         _ => return Ok(()),
