@@ -509,6 +509,39 @@ pub fn read_row_description_with_types(stream: &mut TcpStream) -> Vec<(String, i
     columns
 }
 
+/// `RowDescription`（'T'）を読み、列名・型 OID・typlen・typmod の 4 つ組を返す
+/// （`read_row_description_with_types` の typmod 付き版。Issue #1565）。
+pub fn read_row_description_with_typmods(stream: &mut TcpStream) -> Vec<(String, i32, i16, i32)> {
+    let mut header = [0u8; 1];
+    stream.read_exact(&mut header).expect("read type");
+    assert_eq!(header[0], b'T', "expected RowDescription");
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read len");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).expect("read body");
+
+    let field_count = i16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut pos = 2usize;
+    let mut columns = Vec::with_capacity(field_count);
+    for _ in 0..field_count {
+        let nul = body[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .expect("nul-terminated column name");
+        let name = std::str::from_utf8(&body[pos..pos + nul])
+            .expect("utf8 column name")
+            .to_string();
+        pos += nul + 1 + 4 + 2; // name nul, table oid, attnum
+        let oid = i32::from_be_bytes(body[pos..pos + 4].try_into().expect("oid"));
+        let typlen = i16::from_be_bytes(body[pos + 4..pos + 6].try_into().expect("typlen"));
+        let typmod = i32::from_be_bytes(body[pos + 6..pos + 10].try_into().expect("typmod"));
+        pos += 4 + 2 + 4 + 2; // oid, typlen, typmod, format
+        columns.push((name, oid, typlen, typmod));
+    }
+    columns
+}
+
 /// `DataRow`（'D'）を 1 行読み、各セルを `Option<String>`（`NULL` は `None`）として
 /// 返す。
 pub fn read_data_row(stream: &mut TcpStream) -> Vec<Option<String>> {

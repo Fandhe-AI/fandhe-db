@@ -194,12 +194,29 @@ fn merge_columns(left: &[ColumnMeta], right: &[ColumnMeta]) -> Vec<ColumnMeta> {
             _ => None,
         }
     }
+    fn static_ty(m: &ColumnMeta) -> Option<&ColumnType> {
+        match m {
+            ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => Some(ty),
+            _ => None,
+        }
+    }
     left.iter()
         .enumerate()
         .map(|(i, l)| {
             let widened = match (int_ty(l), right.get(i).and_then(int_ty)) {
                 (Some(a), Some(b)) => ColumnType::widest_integer(a, b),
-                _ => None,
+                // TEXT 系どうしで型が食い違う合成は、左の型の長さ指定を外す。
+                // 右枝が長い値を返しうるため、左の `VARCHAR(n)` のままだと wire 層が
+                // 過小な typmod を公告してしまう（Issue #1565・fail-closed で長さなし）。
+                _ => match (static_ty(l), right.get(i).and_then(static_ty)) {
+                    (Some(a), Some(b)) if a.is_text_like() && b.is_text_like() && a != b => {
+                        Some(match a {
+                            ColumnType::Varchar(_) => ColumnType::Varchar(None),
+                            other => other.clone(),
+                        })
+                    }
+                    _ => None,
+                },
             };
             match (l, widened) {
                 (ColumnMeta::Scalar { name, .. }, Some(ty)) => ColumnMeta::Scalar {
@@ -1264,5 +1281,36 @@ mod tests {
             computed_len, actual_len,
             "row_key_len must predict the exact byte length row_key allocates"
         );
+    }
+
+    fn scalar(ty: ColumnType) -> ColumnMeta {
+        ColumnMeta::Scalar {
+            name: "c".to_string(),
+            ty,
+        }
+    }
+
+    fn merged_ty(l: ColumnType, r: ColumnType) -> ColumnType {
+        match merge_columns(&[scalar(l)], &[scalar(r)]).remove(0) {
+            ColumnMeta::Scalar { ty, .. } => ty,
+            other => panic!("unexpected meta: {other:?}"),
+        }
+    }
+
+    /// TEXT 系の異型合成は長さ指定を外し、同型は保持する（Issue #1565）。
+    #[test]
+    fn merge_columns_drops_varchar_length_on_mismatch() {
+        use ColumnType::{Bpchar, Text, Varchar};
+        assert_eq!(
+            merged_ty(Varchar(Some(10)), Varchar(Some(20))),
+            Varchar(None)
+        );
+        assert_eq!(merged_ty(Varchar(Some(10)), Text), Varchar(None));
+        assert_eq!(merged_ty(Text, Varchar(Some(5))), Text);
+        assert_eq!(
+            merged_ty(Varchar(Some(10)), Varchar(Some(10))),
+            Varchar(Some(10))
+        );
+        assert_eq!(merged_ty(Bpchar(5), Bpchar(5)), Bpchar(5));
     }
 }
