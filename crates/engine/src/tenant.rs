@@ -414,6 +414,8 @@ pub enum TenantWriteError {
     /// そのまま保持して通常の式評価と同じ `wire_code` で返す。評価は所有・可視と確定した
     /// 自テナントの行に対してだけ行うため、他テナントの存在オラクルにならない。
     /// `Display`／`Debug` は行の値を含めない。
+    /// `UPSERT ... DO UPDATE SET` の右辺（`EXCLUDED` を含む）の列型への変換と、
+    /// `VARCHAR(n)` の長さ超過（`22001`。TABLE-31・Issue #1564）もこの variant で返す。
     /// **BREAKING CHANGE**（Issue #1544）: variant を追加した（本 enum は
     /// `#[non_exhaustive]` ではないため網羅的 `match` の下流は追随が必要）。
     SetExpressionEvaluationFailed(SqlSurfaceError),
@@ -2006,7 +2008,7 @@ fn upsert_typed_rows_impl(
                                 // `updated` カウント・テーブル世代だけが進み、実際には
                                 // 適用されなかった SET が適用されたかのような不整合が
                                 // 生じる）。
-                                let new_value = match value {
+                                let mut new_value = match value {
                                     UpsertSetValue::Excluded(src_idx) => {
                                         values.get(*src_idx).cloned().ok_or_else(|| {
                                             CatalogError::Invalid(
@@ -2017,6 +2019,18 @@ fn upsert_typed_rows_impl(
                                     }
                                     UpsertSetValue::Literal(v) => (*v).clone(),
                                 };
+                                // `EXCLUDED.<列>` 等、値が実行時にしか決まらない代入の
+                                // `VARCHAR(n)` 長さ検証（`22001`。TABLE-31・Issue #1564）。
+                                // encode・commit の前に返すため txn は abort し副作用は残らない。
+                                if let Some(column) = schema.columns.get(*col_idx) {
+                                    crate::row_codec::normalize_char_length_value(
+                                        column,
+                                        &mut new_value,
+                                    )
+                                    .map_err(|e| {
+                                        TenantWriteError::SetExpressionEvaluationFailed(e.into())
+                                    })?;
+                                }
                                 if Some(*col_idx) == vector_idx {
                                     match new_value {
                                         crate::row_codec::Value::Vector(v) => embedding_value = v,
@@ -2427,8 +2441,10 @@ fn validate_set_assignments(
                 // `VARCHAR(n)`／`CHAR(n)` の文字数上限も codec と同じ判定で先に拒否し、
                 // 一致行 0 件の `UPDATE 0` 成功（`operation_id` 消費）に分岐させない
                 // （Issue #1563・codex-review P1 指摘）。
-                crate::row_codec::check_varchar_length(column, t)
-                    .map_err(|e| TenantWriteError::Catalog(CatalogError::Invalid(e.to_string())))?;
+                // 束縛段（`sql::parser::bind_text_literal`）が正規化済みのため、ここは
+                // Rust API 直呼びに対する多層防御（`22001`。Issue #1564）。
+                crate::row_codec::fit_char_length(&column.ty, t)
+                    .map_err(|e| TenantWriteError::SetExpressionEvaluationFailed(e.into()))?;
                 let text_len = u32::try_from(t.len()).map_err(|_| {
                     TenantWriteError::Catalog(CatalogError::Invalid(format!(
                         "text field too long: {} bytes",

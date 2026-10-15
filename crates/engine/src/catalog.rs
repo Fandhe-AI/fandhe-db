@@ -1543,8 +1543,8 @@ pub enum ColumnType {
     /// 値表現・比較・関数・索引・正準キーは [`ColumnType::Text`] と共有し、違いはカタログ
     /// タグ（`varchar`。param は `-` または 10 進の n）と wire 公告型（OID 1043）だけ。
     /// TEXT と同値扱いにすべき判定は [`Self::is_text_like`]／[`Self::same_value_domain`] を使う。
-    /// n 超過の書き込みは行 codec の encode がバックストップとして拒否する（束縛段での
-    /// `22001` 分類は Issue #1564、wire typmod は Issue #1565）。
+    /// n 超過の書き込みは束縛段が `22001` で拒否し（超過部分が半角空白のみなら n 文字へ
+    /// 切り詰め。Issue #1564）、行 codec の encode は最後の砦として拒否する（wire typmod は Issue #1565）。
     Varchar(Option<u32>),
     /// `character(n)`（`CHAR(n)`／`CHARACTER(n)`、TABLE-31・Issue #1563）。n は
     /// `1..=`[`MAX_CHAR_TYPE_LENGTH`]。カタログタグは `bpchar`（`"char"` 1 バイト型とは別物）。
@@ -4315,7 +4315,7 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
                 )));
             }
             // `VARCHAR(n)` の既定値は文字数が n 以下であること（超過した既定値は INSERT のたびに
-            // 長さ超過になるため定義時に拒否する。コードの精緻化は Issue #1564）。
+            // 長さ超過になるため定義時に拒否する。通常は DDL 段の `22001`〔Issue #1564〕が先に弾く最後の砦）。
             if let (ColumnType::Varchar(Some(n)), ColumnDefault::Text(s)) = (&column.ty, default) {
                 if u32::try_from(s.chars().count()).map_or(true, |len| len > *n) {
                     return Err(CatalogError::Invalid(format!(
