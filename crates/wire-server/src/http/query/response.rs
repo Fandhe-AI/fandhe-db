@@ -341,7 +341,8 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
         ColumnMeta::Computed { .. } | ColumnMeta::AliasedId { .. } => "text",
         ColumnMeta::Scalar { ty, .. } => match ty {
             ColumnType::Text => "text",
-            ColumnType::Varchar => "varchar",
+            ColumnType::Varchar(_) => "varchar",
+            ColumnType::Bpchar(_) => "bpchar",
             ColumnType::Vector(_) => "vector",
             ColumnType::SmallInt => "smallint",
             ColumnType::Integer => "integer",

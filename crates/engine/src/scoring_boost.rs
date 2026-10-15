@@ -96,7 +96,7 @@ impl ScoringBoost {
             .find(|c| c.name == self.column)
             .ok_or_else(|| SqlSurfaceError::undefined_column(&self.column))?;
         match &column.ty {
-            ColumnType::Text | ColumnType::Varchar => {}
+            ColumnType::Text | ColumnType::Varchar(_) => {}
             ColumnType::Vector(_)
             | ColumnType::SmallInt
             | ColumnType::Integer
@@ -112,6 +112,7 @@ impl ScoringBoost {
             | ColumnType::Jsonb
             | ColumnType::Enum(_)
             | ColumnType::Numeric { .. }
+            | ColumnType::Bpchar(_)
             | ColumnType::Uuid => {
                 // F10（Issue #882 計画）: REAL/DOUBLE 列は VECTOR 列と同じ
                 // 「TEXT 列でない」拒否腕へ合流させる（対応は #891 へ申し送り）。

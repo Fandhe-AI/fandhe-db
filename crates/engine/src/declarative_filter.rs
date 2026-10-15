@@ -720,7 +720,7 @@ fn bind_filter_op(
             // TEXT と同じ辞書を共有するため、この等価意味論のまま
             // 索引経由の候補削減を信頼できる）。
             match ty {
-                ColumnType::Text | ColumnType::Varchar => {}
+                ColumnType::Text | ColumnType::Varchar(_) => {}
                 ColumnType::Enum(def) => {
                     // `skip_enum_label_validation` が `true` の場合、この値は
                     // `sql::params::substitute_dummy` が生成した固定ダミー
@@ -751,6 +751,7 @@ fn bind_filter_op(
                 | ColumnType::Json
                 | ColumnType::Jsonb
                 | ColumnType::Numeric { .. }
+                | ColumnType::Bpchar(_)
                 | ColumnType::Uuid => {
                     return Err(SqlSurfaceError::invalid_input(format!(
                         "column {column_name:?} is not a TEXT column"
@@ -887,7 +888,7 @@ fn bind_filter_op(
                 )));
             }
             match ty {
-                ColumnType::Text | ColumnType::Varchar => {
+                ColumnType::Text | ColumnType::Varchar(_) => {
                     let mut bound = Vec::with_capacity(values.len());
                     for v in values {
                         check_literal_len(v)?;

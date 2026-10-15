@@ -77,7 +77,7 @@ pub(crate) fn bind_set_expr(
         | ColumnType::Real
         | ColumnType::Double
         | ColumnType::Text
-        | ColumnType::Varchar
+        | ColumnType::Varchar(_)
         | ColumnType::Boolean
         | ColumnType::Date
         | ColumnType::Timestamp => {}
@@ -101,7 +101,7 @@ pub(crate) fn bind_set_expr(
                 | ColumnType::Real
                 | ColumnType::Double,
             ExprType::Scalar
-        ) | (ColumnType::Text | ColumnType::Varchar, ExprType::Text)
+        ) | (ColumnType::Text | ColumnType::Varchar(_), ExprType::Text)
             | (ColumnType::Boolean, ExprType::Bool)
             | (ColumnType::Date, ExprType::Date)
             | (ColumnType::Timestamp, ExprType::Timestamp | ExprType::Date)
@@ -145,7 +145,7 @@ pub(crate) fn eval_set_expr_to_value<'a>(
         }
         ExprValue::Scalar(v) => scalar_to_value(&set.target_ty, v).ok_or_else(internal)?,
         ExprValue::Text(t) => match &set.target_ty {
-            ColumnType::Text | ColumnType::Varchar => Ok(Value::Text(t.into_owned())),
+            ColumnType::Text | ColumnType::Varchar(_) => Ok(Value::Text(t.into_owned())),
             _ => Err(internal()),
         },
         ExprValue::Bool(b) => match &set.target_ty {

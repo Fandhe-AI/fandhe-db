@@ -1047,7 +1047,7 @@ impl SubqueryValueFamily {
 /// 列型から値族を判定する。対応外（`VECTOR`・配列・JSON 等）は `None`。
 fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
     match ty {
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Enum(_) => {
+        ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Enum(_) => {
             Some(SubqueryValueFamily::Text)
         }
         ColumnType::Boolean => Some(SubqueryValueFamily::Boolean),
@@ -1060,7 +1060,11 @@ fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
             Some(SubqueryValueFamily::Integer)
         }
         ColumnType::Real | ColumnType::Double => Some(SubqueryValueFamily::Float),
-        ColumnType::Vector(_) | ColumnType::Array(_) | ColumnType::Json | ColumnType::Jsonb => None,
+        ColumnType::Vector(_)
+        | ColumnType::Array(_)
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Bpchar(_) => None,
     }
 }
 

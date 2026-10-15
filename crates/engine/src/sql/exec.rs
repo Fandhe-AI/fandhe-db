@@ -3017,28 +3017,30 @@ fn project_rows(
                         ColumnType::Vector(_) => {
                             cells.push(Cell::Vector(try_clone_embedding(embedding)?))
                         }
-                        ColumnType::Text | ColumnType::Varchar => match decoded.get(*index) {
-                            Some(Value::Text(t)) => cells.push(Cell::Text(try_clone_text(t)?)),
-                            Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Integer(_))
-                            | Some(Value::BigInt(_))
-                            | Some(Value::Vector(_))
-                            | Some(Value::Real(_))
-                            | Some(Value::Double(_))
-                            | Some(Value::Bool(_))
-                            | Some(Value::Date(_))
-                            | Some(Value::Timestamp(_))
-                            | Some(Value::Array(_))
-                            | Some(Value::Bytes(_))
-                            | Some(Value::Json(_))
-                            | Some(Value::Enum(_))
-                            | Some(Value::Numeric(_))
-                            | Some(Value::Uuid(_)) => {
-                                return Err(SqlSurfaceError::Internal {
-                                    detail: "scalar payload type mismatch".to_string(),
-                                })
+                        ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
+                            match decoded.get(*index) {
+                                Some(Value::Text(t)) => cells.push(Cell::Text(try_clone_text(t)?)),
+                                Some(Value::Null) | None => cells.push(Cell::Null),
+                                Some(Value::Integer(_))
+                                | Some(Value::BigInt(_))
+                                | Some(Value::Vector(_))
+                                | Some(Value::Real(_))
+                                | Some(Value::Double(_))
+                                | Some(Value::Bool(_))
+                                | Some(Value::Date(_))
+                                | Some(Value::Timestamp(_))
+                                | Some(Value::Array(_))
+                                | Some(Value::Bytes(_))
+                                | Some(Value::Json(_))
+                                | Some(Value::Enum(_))
+                                | Some(Value::Numeric(_))
+                                | Some(Value::Uuid(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
                             }
-                        },
+                        }
                         ColumnType::SmallInt | ColumnType::Integer => match decoded.get(*index) {
                             Some(Value::Integer(v)) => {
                                 cells.push(Cell::SignedInteger(i64::from(*v)))

@@ -514,7 +514,7 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
     use engine::catalog::ColumnType;
     match ty {
         ColumnType::Text
-        | ColumnType::Varchar
+        | ColumnType::Varchar(_)
         | ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
@@ -536,6 +536,9 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Numeric { .. }
         | ColumnType::Date
         | ColumnType::Timestamp => false,
+        // CHAR(n) は公告 OID が暫定で text のため、バイナリ結果は fail-closed に非対応とする
+        // （OID 1042 とともに Issue #1565 で扱う）。
+        ColumnType::Bpchar(_) => false,
     }
 }
 
@@ -573,7 +576,10 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         // ドキュメント参照）。`ARRAY`・`ENUM` は専用 OID を持たない据え置き
         // 判断のため引き続き `text` を公告する。`VECTOR` も同様。
         engine::catalog::ColumnType::Text => WireType::Text,
-        engine::catalog::ColumnType::Varchar => WireType::Varchar,
+        engine::catalog::ColumnType::Varchar(_) => WireType::Varchar,
+        // CHAR(n) は暫定で text（OID 25）を公告する（Issue #1563）。OID 1042 と typmod は
+        // Issue #1565 で行う。長さ付き VARCHAR(n) の typmod も同 Issue（現状は -1）。
+        engine::catalog::ColumnType::Bpchar(_) => WireType::Text,
         engine::catalog::ColumnType::Vector(_) => WireType::Text,
         engine::catalog::ColumnType::Boolean => WireType::Bool,
         // SMALLINT は int2（OID 21・typlen 2。TABLE-30・Issue #1561）。値は
@@ -1319,7 +1325,7 @@ mod tests {
             (Some(ColumnType::Double), 701, 8),
             (Some(ColumnType::Boolean), 16, 1),
             (Some(ColumnType::Text), 25, -1),
-            (Some(ColumnType::Varchar), 1043, -1),
+            (Some(ColumnType::Varchar(None)), 1043, -1),
             (Some(ColumnType::Date), 1082, 4),
             (Some(ColumnType::Timestamp), 1114, 8),
             (
@@ -2661,10 +2667,10 @@ mod tests {
         let mut a = Vec::new();
         let mut b = Vec::new();
         one_computed_binary(T::Text, Cell::Text("héllo".to_string()), &mut a).unwrap();
-        one_computed_binary(T::Varchar, Cell::Text("héllo".to_string()), &mut b).unwrap();
+        one_computed_binary(T::Varchar(None), Cell::Text("héllo".to_string()), &mut b).unwrap();
         assert_eq!(a, b);
         let mut out = b"KEEP".to_vec();
-        assert!(one_computed_binary(T::Varchar, Cell::SignedInteger(1), &mut out).is_err());
+        assert!(one_computed_binary(T::Varchar(None), Cell::SignedInteger(1), &mut out).is_err());
         assert_eq!(out, b"KEEP");
     }
 
