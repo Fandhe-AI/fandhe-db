@@ -404,10 +404,11 @@ fn value_to_json(
     }
 }
 
-/// 組み立てた出力を検証する。埋め込んだ json／jsonb を含めて格納時と同じ深さ・要素数の
-/// 上限に収まらなければ `54000`（そのまま格納・再パースできない値を作らない）。
-fn finish(out: String, embeds_json: bool) -> Result<ExprValue<'static>, SqlSurfaceError> {
-    if embeds_json && validate_json_column_text(&out).is_err() {
+/// 組み立てた出力を検証する。json／jsonb の埋め込みの有無に関わらず、格納時と同じ
+/// 深さ・要素数・文字列長の上限に収まらなければ `54000`（そのまま格納・再パースできない
+/// 値を作らない。text 由来の長大な文字列も対象）。
+fn finish(out: String) -> Result<ExprValue<'static>, SqlSurfaceError> {
+    if validate_json_column_text(&out).is_err() {
         return Err(SqlSurfaceError::payload_too_large(
             "json value exceeds the allowed nesting depth or size",
         ));
@@ -487,27 +488,24 @@ pub(crate) fn eval_json_fn<'a>(
             }
             let mut out = String::new();
             value_to_json(kind, &v, &mut out)?;
-            finish(out, matches!(kind, JsonArgKind::Json | JsonArgKind::Jsonb))
+            finish(out)
         }
         JsonFnKind::BuildArray => {
             let mut out = String::new();
             push_checked(&mut out, "[")?;
-            let mut embeds = false;
             for (i, (a, kind)) in f.args.iter().zip(f.arg_kinds.iter()).enumerate() {
                 if i > 0 {
                     push_checked(&mut out, ", ")?;
                 }
-                embeds |= matches!(kind, JsonArgKind::Json | JsonArgKind::Jsonb);
                 let v = eval_with_scalars(a, id, embedding, row_scalars)?;
                 value_to_json(kind, &v, &mut out)?;
             }
             push_checked(&mut out, "]")?;
-            finish(out, embeds)
+            finish(out)
         }
         JsonFnKind::BuildObject => {
             let mut out = String::new();
             push_checked(&mut out, "{")?;
-            let mut embeds = false;
             let mut pairs = f.args.iter().zip(f.arg_kinds.iter());
             let mut first = true;
             while let (Some((ka, kk)), Some((va, vk))) = (pairs.next(), pairs.next()) {
@@ -529,12 +527,11 @@ pub(crate) fn eval_json_fn<'a>(
                 crate::json::write_canonical_string(&key_text, &mut quoted);
                 push_checked(&mut out, &quoted)?;
                 push_checked(&mut out, " : ")?;
-                embeds |= matches!(vk, JsonArgKind::Json | JsonArgKind::Jsonb);
                 let v = eval_with_scalars(va, id, embedding, row_scalars)?;
                 value_to_json(vk, &v, &mut out)?;
             }
             push_checked(&mut out, "}")?;
-            finish(out, embeds)
+            finish(out)
         }
     }
 }
@@ -601,5 +598,17 @@ mod tests {
         assert!(int_text(f64::INFINITY).is_err());
         assert!(int_text(9.3e18).is_err());
         assert_eq!(int_text(-7.0).unwrap(), "-7");
+    }
+
+    #[test]
+    fn finish_rejects_overlong_string_without_embedded_json() {
+        // text 由来の文字列が MAX_JSON_STRING_CHARS を超えるとき、生成段階で 54000 になる。
+        let out = format!(
+            "[\"{}\"]",
+            "a".repeat(crate::json::MAX_JSON_STRING_CHARS + 1)
+        );
+        assert!(out.len() <= MAX_JSON_FIELD_LEN);
+        assert!(finish(out).is_err());
+        assert!(finish("[\"ok\"]".to_string()).is_ok());
     }
 }
