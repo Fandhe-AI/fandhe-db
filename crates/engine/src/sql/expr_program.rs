@@ -457,6 +457,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::Case { .. }
         | BoundExpr::Coalesce(_)
         | BoundExpr::JsonbColumnRef { .. }
+        | BoundExpr::JsonbLiteral(_)
         | BoundExpr::JsonAccess { .. }
         | BoundExpr::NullIf { .. } => None,
     }
@@ -541,7 +542,9 @@ fn compile_node(
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);
         }
-        BoundExpr::JsonbColumnRef { .. } | BoundExpr::JsonAccess { .. } => {
+        BoundExpr::JsonbColumnRef { .. }
+        | BoundExpr::JsonbLiteral(_)
+        | BoundExpr::JsonAccess { .. } => {
             steps.push(ExprStep::JsonSubtree(Box::new(expr.clone())));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);

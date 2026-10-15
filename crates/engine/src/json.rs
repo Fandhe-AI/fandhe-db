@@ -1196,6 +1196,186 @@ pub(crate) fn jsonb_access_path(
     Ok(render_access_result(cur, as_text))
 }
 
+// ---- jsonb の全順序（Issue #1597・TABLE-25 ポインタ）----
+
+/// 入れ子の値のタグ（順位は PostgreSQL の jsonb btree 順序: Null < String < Number <
+/// Bool < Array < Object）。
+const SK_NULL: u8 = 1;
+const SK_STRING: u8 = 2;
+const SK_NUMBER: u8 = 3;
+const SK_BOOL: u8 = 4;
+const SK_ARRAY: u8 = 5;
+const SK_OBJECT: u8 = 6;
+/// 最上位のタグ（オブジェクトが配列・スカラーより大きい）。
+const SK_TOP_ARRAY_OR_SCALAR: u8 = 1;
+const SK_TOP_OBJECT: u8 = 2;
+
+/// ソートキー長の上限（入力長に対する倍率）。1 入力バイトが生む最大のキー長
+/// （`[` 1 バイト → タグ + 要素数 5 バイト等）に十分な余裕を持たせた DoS 防止の天井。
+const SORT_KEY_EXPANSION: usize = 8;
+
+/// jsonb 正規化テキスト `canonical` から、バイト列の辞書順比較が PostgreSQL 17 の jsonb
+/// btree 順序と一致するソートキーを作る（jsonb の全順序の唯一の定義。WHERE の比較・
+/// ORDER BY の双方がこのキーを使う。呼び出し元は `sql::udf_call::eval_binary` と
+/// `sql::scan` の式キー抽出）。キーが等しいことは [`canonical_equality_text`] が等しい
+/// ことと一致する不変条件を持つ。
+///
+/// 順序の要点: 型順位 Object > Array > Bool > Number > String > Null、要素数・ペア数の
+/// 少ない方が小さい、オブジェクトは PostgreSQL の格納順（キーのバイト長の昇順、同長は
+/// バイト順）で「キー → 値」を順に比較、数値は 10 進の厳密比較（f64 を経由しない）、
+/// 文字列はバイト順。最上位の `[]` が全スカラーより小さい等の PostgreSQL の特異点も
+/// 再現する。格納値が壊れている場合は fail-closed に `Invalid`、入力・キーが上限を
+/// 超える場合は `TooLong`。
+pub(crate) fn jsonb_sort_key(canonical: &str) -> Result<Vec<u8>, JsonColumnError> {
+    if canonical.len() > MAX_JSON_FIELD_LEN {
+        return Err(JsonColumnError::TooLong);
+    }
+    let value = parse_json(canonical).map_err(|_| JsonColumnError::Invalid)?;
+    let limit = canonical
+        .len()
+        .saturating_mul(SORT_KEY_EXPANSION)
+        .saturating_add(64);
+    let mut out: Vec<u8> = Vec::new();
+    match &value {
+        JsonValue::Object(map) => {
+            out.push(SK_TOP_OBJECT);
+            sk_push_count(map.len(), &mut out)?;
+            sk_push_pairs(map, &mut out, limit)?;
+        }
+        JsonValue::Array(items) => {
+            out.push(SK_TOP_ARRAY_OR_SCALAR);
+            sk_push_count(items.len(), &mut out)?;
+            out.push(1);
+            for item in items {
+                sk_push_value(item, &mut out, limit)?;
+            }
+        }
+        scalar => {
+            out.push(SK_TOP_ARRAY_OR_SCALAR);
+            sk_push_count(1, &mut out)?;
+            out.push(0);
+            sk_push_value(scalar, &mut out, limit)?;
+        }
+    }
+    Ok(out)
+}
+
+/// これから `extra` バイト書く前に上限と確保可否を検査する（fail-closed）。
+fn sk_check_limit(out: &mut Vec<u8>, extra: usize, limit: usize) -> Result<(), JsonColumnError> {
+    if out.len().saturating_add(extra) > limit {
+        return Err(JsonColumnError::TooLong);
+    }
+    out.try_reserve(extra).map_err(|_| JsonColumnError::TooLong)
+}
+
+fn sk_push_count(n: usize, out: &mut Vec<u8>) -> Result<(), JsonColumnError> {
+    let n = u32::try_from(n).map_err(|_| JsonColumnError::TooLong)?;
+    out.try_reserve(4).map_err(|_| JsonColumnError::TooLong)?;
+    out.extend_from_slice(&n.to_be_bytes());
+    Ok(())
+}
+
+/// 文字列本体を順序保存で書く（0x00 → 0x00 0xFF、終端 0x00 0x00）。
+fn sk_push_string(s: &str, out: &mut Vec<u8>, limit: usize) -> Result<(), JsonColumnError> {
+    sk_check_limit(out, s.len().saturating_mul(2).saturating_add(2), limit)?;
+    for &b in s.as_bytes() {
+        out.push(b);
+        if b == 0 {
+            out.push(0xFF);
+        }
+    }
+    out.extend_from_slice(&[0, 0]);
+    Ok(())
+}
+
+fn sk_push_pairs(
+    map: &BTreeMap<String, JsonValue>,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), JsonColumnError> {
+    // PostgreSQL の格納順（キーのバイト長 → バイト順）。BTreeMap はバイト順のため並べ直す。
+    let mut pairs: Vec<(&String, &JsonValue)> = Vec::new();
+    pairs
+        .try_reserve(map.len())
+        .map_err(|_| JsonColumnError::TooLong)?;
+    pairs.extend(map.iter());
+    pairs.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(b.0)));
+    for (k, v) in pairs {
+        sk_push_string(k, out, limit)?;
+        sk_push_value(v, out, limit)?;
+    }
+    Ok(())
+}
+
+fn sk_push_value(v: &JsonValue, out: &mut Vec<u8>, limit: usize) -> Result<(), JsonColumnError> {
+    sk_check_limit(out, 8, limit)?;
+    match v {
+        JsonValue::Null => out.push(SK_NULL),
+        JsonValue::String(s) => {
+            out.push(SK_STRING);
+            sk_push_string(s, out, limit)?;
+        }
+        JsonValue::Number(n) => {
+            out.push(SK_NUMBER);
+            sk_push_number(n, out, limit)?;
+        }
+        JsonValue::Bool(b) => {
+            out.push(SK_BOOL);
+            out.push(u8::from(*b));
+        }
+        JsonValue::Array(items) => {
+            out.push(SK_ARRAY);
+            sk_push_count(items.len(), out)?;
+            for item in items {
+                sk_push_value(item, out, limit)?;
+            }
+        }
+        JsonValue::Object(map) => {
+            out.push(SK_OBJECT);
+            sk_push_count(map.len(), out)?;
+            sk_push_pairs(map, out, limit)?;
+        }
+    }
+    Ok(())
+}
+
+/// 数値を厳密な 10 進のまま順序保存で書く。種別（負 0x00・ゼロ 0x01・正 0x02）の後に、
+/// 本体（調整指数 E〔値 = 0.仮数 × 10^E〕・仮数の数字・終端 0x00）を置き、負の場合は
+/// 本体の全バイトを反転する。E は桁数が任意の符号付き整数のため「符号・桁数・数字」で
+/// 符号化し、E が負なら桁数と数字を反転する。
+fn sk_push_number(n: &JsonNumber, out: &mut Vec<u8>, limit: usize) -> Result<(), JsonColumnError> {
+    let (neg, mantissa, exp_neg, exp_digits) = normalize_json_number(n)?;
+    if mantissa == "0" {
+        out.push(1);
+        return Ok(());
+    }
+    let mant_len = mantissa.len().to_string();
+    let (e_neg, e_digits) = signed_decimal_add(exp_neg, &exp_digits, false, &mant_len);
+    sk_check_limit(out, mantissa.len() + e_digits.len() + 16, limit)?;
+    let mut body: Vec<u8> = Vec::new();
+    body.try_reserve(mantissa.len() + e_digits.len() + 8)
+        .map_err(|_| JsonColumnError::TooLong)?;
+    let digit_count = u32::try_from(e_digits.len()).map_err(|_| JsonColumnError::Invalid)?;
+    if e_neg {
+        body.push(0);
+        body.extend_from_slice(&(!digit_count).to_be_bytes());
+        body.extend(e_digits.bytes().map(|b| !b));
+    } else {
+        body.push(1);
+        body.extend_from_slice(&digit_count.to_be_bytes());
+        body.extend_from_slice(e_digits.as_bytes());
+    }
+    body.extend_from_slice(mantissa.as_bytes());
+    body.push(0);
+    if neg {
+        out.push(0);
+        out.extend(body.iter().map(|b| !b));
+    } else {
+        out.push(2);
+        out.extend_from_slice(&body);
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1858,5 +2038,119 @@ mod tests {
         let oversized = format!("[{}", "1".repeat(MAX_JSON_FIELD_LEN));
         let err = canonical_equality_text(&oversized).unwrap_err();
         assert_eq!(err, JsonColumnError::TooLong);
+    }
+
+    // ---- jsonb_sort_key（Issue #1597）----
+
+    fn sk(s: &str) -> Vec<u8> {
+        jsonb_sort_key(s).unwrap()
+    }
+
+    /// `ascending` が狭義単調増加（隣接ペアが全て `<`）であることを確認する。
+    fn assert_strictly_ascending(ascending: &[&str]) {
+        for w in ascending.windows(2) {
+            assert!(sk(w[0]) < sk(w[1]), "{} < {} must hold", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn sort_key_type_rank_nested_and_top_level() {
+        // 入れ子: Null < String < Number < Bool < Array < Object。
+        assert_strictly_ascending(&[
+            "[null]", r#"["a"]"#, "[0]", "[false]", "[true]", "[[]]", "[{}]",
+        ]);
+        // 最上位の特異点: [] は全スカラーより小さく、[1] > 5、オブジェクトが最大。
+        assert_strictly_ascending(&[
+            "[]", "null", r#""""#, "0", "false", "true", "[null]", "[1]", "[1,2]", "{}",
+        ]);
+        assert!(sk("[1]") > sk("5"));
+        assert!(sk("[1,2]") > sk("5"));
+        assert!(sk(r#"{"a":1}"#) > sk("[1,2,3]"));
+    }
+
+    #[test]
+    fn sort_key_counts_and_key_storage_order() {
+        assert!(sk("[1,2]") > sk("[9]"));
+        assert!(sk(r#"{"a":1,"b":1}"#) > sk(r#"{"z":9}"#));
+        // キーはバイト長 → バイト順の格納順で比較される。
+        assert!(sk(r#"{"aa":1,"c":1}"#) > sk(r#"{"b":1,"d":1}"#));
+        assert!(sk(r#"{"a":1}"#) < sk(r#"{"a":2}"#));
+    }
+
+    #[test]
+    fn sort_key_numbers_are_exact_decimals() {
+        assert_strictly_ascending(&[
+            "-1e3", "-2", "-0.5", "-1e-9", "0", "1e-9", "0.5", "1", "1.5", "2", "10", "1e20",
+            "1e400",
+        ]);
+        assert_eq!(sk("1"), sk("1.0"));
+        assert_eq!(sk("1"), sk("1e0"));
+        assert_eq!(sk("1"), sk("10e-1"));
+        assert_eq!(sk("0"), sk("-0"));
+        assert_eq!(sk("0"), sk("0.0e5"));
+        // f64 に収まらない精度差も区別する。
+        assert!(sk("9007199254740993") > sk("9007199254740992"));
+        assert!(sk("1e999999999999999999999") > sk("1e99999999999999999999"));
+        assert!(sk("1e-999999999999999999999") < sk("1e-99999999999999999999"));
+    }
+
+    #[test]
+    fn sort_key_strings_are_byte_ordered_with_prefix_rule() {
+        assert_strictly_ascending(&[r#""""#, r#""a""#, r#""a\u0000""#, r#""a\u0000b""#, r#""b""#]);
+        assert_strictly_ascending(&[r#"["a"]"#, r#"["a","b"]"#]);
+        assert_strictly_ascending(&[r#"["a","z"]"#, r#"["a\u0000","z"]"#]);
+    }
+
+    #[test]
+    fn sort_key_equality_agrees_with_canonical_equality_text() {
+        let fixtures = [
+            "null",
+            "true",
+            "false",
+            "0",
+            "-0",
+            "1",
+            "1.0",
+            "10e-1",
+            "1e0",
+            "-1",
+            "-1.5e0",
+            "2",
+            "1e20",
+            r#""""#,
+            r#""a""#,
+            r#""1""#,
+            "[]",
+            "[1]",
+            "[1.0]",
+            "[1,2]",
+            "[[1]]",
+            "{}",
+            r#"{"a":1}"#,
+            r#"{"a":1.0}"#,
+            r#"{"a":1,"b":[1]}"#,
+            r#"{"b":[1.0],"a":10e-1}"#,
+            r#"{"aa":1,"c":1}"#,
+            r#"{"b":1,"d":1}"#,
+            r#"{"a":null}"#,
+        ];
+        for a in fixtures {
+            for b in fixtures {
+                let keys_eq = sk(a) == sk(b);
+                let canon_eq =
+                    canonical_equality_text(a).unwrap() == canonical_equality_text(b).unwrap();
+                assert_eq!(keys_eq, canon_eq, "{a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn sort_key_rejects_invalid_and_oversized_input() {
+        assert_eq!(jsonb_sort_key("{").unwrap_err(), JsonColumnError::Invalid);
+        let oversized = format!("\"{}\"", "a".repeat(MAX_JSON_FIELD_LEN));
+        assert_eq!(
+            jsonb_sort_key(&oversized).unwrap_err(),
+            JsonColumnError::TooLong
+        );
     }
 }

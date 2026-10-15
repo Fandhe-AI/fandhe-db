@@ -232,8 +232,9 @@ fn operand_type_rules_map_to_fixed_sqlstates() {
     // `#>` の右辺は text[] リテラルのみ。形式不正は 22P02。
     assert_eq!(code(&core, &alice, &sel("docb #> 'a'")), "22P02");
     assert_eq!(code(&core, &alice, &sel("docb #> lang")), "0A000");
-    // jsonb 列の裸の参照は従来どおり式では使えない（22000）。
-    assert_eq!(code(&core, &alice, &sel("vec_norm(docb)")), "22000");
+    // jsonb 列の裸の参照は式の中で受理されるが、関数引数としては消費できない（Issue #1597。
+    // これまでの 22000 から 0A000 へ変わる）。
+    assert_eq!(code(&core, &alice, &sel("vec_norm(docb)")), "0A000");
 }
 
 #[test]
@@ -243,25 +244,15 @@ fn jsonb_values_are_rejected_where_they_cannot_be_consumed_yet() {
     let alice = ctx_for("alice");
     insert(&core, &alice, 1, "k", DOC, 0);
 
-    // 比較・ORDER BY・集計・関数引数・COALESCE は #1597 まで 0A000。
+    // 集計・関数引数・COALESCE・算術は引き続き 0A000（比較と ORDER BY は Issue #1597 で対応）。
     for sql in [
-        format!("SELECT id FROM {TABLE} WHERE docb -> 'a' = docb -> 'b' LIMIT 10"),
-        format!("SELECT id FROM {TABLE} WHERE docb -> 'a' = 'x' LIMIT 10"),
+        format!("SELECT id FROM {TABLE} WHERE (docb -> 'k') + 1 = 2 LIMIT 10"),
         format!("SELECT COUNT(docb -> 'k') FROM {TABLE}"),
         format!("SELECT lower(docb -> 'k') FROM {TABLE} LIMIT 10"),
         format!("SELECT COALESCE(docb -> 'k', docb -> 'a') FROM {TABLE} LIMIT 10"),
     ] {
         assert_eq!(code(&core, &alice, &sql), "0A000", "{sql}");
     }
-    // ORDER BY の式キーはパス演算子を構文段で受理しない（fail-closed）。
-    assert_eq!(
-        code(
-            &core,
-            &alice,
-            &format!("SELECT id FROM {TABLE} ORDER BY docb -> 'k' LIMIT 10")
-        ),
-        "42601"
-    );
     let err = core
         .execute_sql_in_session(
             &alice,
@@ -447,4 +438,267 @@ fn subscript_integer_arithmetic_matches_between_projection_and_filters() {
         )
         .expect("integer division in a filter subscript");
     assert_eq!(r.rows.len(), 1);
+}
+
+// ---- Issue #1597: jsonb の比較・述語・ORDER BY ----
+
+fn ids(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> Vec<u64> {
+    let result = core
+        .execute_sql(ctx, sql)
+        .unwrap_or_else(|e| panic!("{sql} should succeed: {}", e.wire_code()));
+    result
+        .rows
+        .iter()
+        .map(|r| match &r.cells[0] {
+            Cell::Integer(v) => *v,
+            Cell::SignedInteger(v) => u64::try_from(*v).expect("non-negative"),
+            other => panic!("unexpected id cell {other:?}"),
+        })
+        .collect()
+}
+
+fn seed(core: &EngineCore, ctx: &PolicyContext, docs: &[&str]) {
+    for (i, d) in docs.iter().enumerate() {
+        insert(core, ctx, (i + 1) as u64, "k", &format!("'{d}'"), 0);
+    }
+}
+
+#[test]
+fn where_equality_against_a_jsonb_literal_uses_value_equality() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed(
+        &core,
+        &alice,
+        &[
+            r#"{"k":1}"#,
+            r#"{"k":1.0}"#,
+            r#"{"k":10e-1}"#,
+            r#"{"k":"1"}"#,
+            r#"{"k":null}"#,
+            r#"{"x":1}"#,
+            r#"{"k":[1]}"#,
+        ],
+    );
+    let q = |w: &str| {
+        ids(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE {w} LIMIT 100"),
+        )
+    };
+    // 受け入れ基準: 数値の値としての等価（1 = 1.0 = 10e-1）、文字列 "1" は別。
+    let mut got = q("docb -> 'k' = '1'");
+    got.sort();
+    assert_eq!(got, vec![1, 2, 3]);
+    assert_eq!(q("'1' = docb -> 'k'").len(), 3);
+    // キー不在（SQL の NULL）は除外され、JSON の null は 'null' に一致する。
+    assert_eq!(q("docb -> 'k' = 'null'"), vec![5]);
+    assert_eq!(q(r#"docb -> 'k' = '"1"'"#), vec![4]);
+    assert_eq!(q("docb -> 'k' = '[1.0]'"), vec![7]);
+    // jsonb 同士の比較と NOT。
+    assert_eq!(q("docb -> 'k' = docb -> 'k'").len(), 6);
+    let mut not_one = q("NOT (docb -> 'k' = '1')");
+    not_one.sort();
+    assert_eq!(not_one, vec![4, 5, 7]);
+}
+
+#[test]
+fn where_ordering_follows_the_jsonb_btree_order() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed(
+        &core,
+        &alice,
+        &[
+            r#"{"k":null}"#,
+            r#"{"k":"a"}"#,
+            r#"{"k":2}"#,
+            r#"{"k":true}"#,
+            r#"{"k":[1]}"#,
+            r#"{"k":{"a":1}}"#,
+        ],
+    );
+    let q = |w: &str| {
+        let mut v = ids(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE {w} LIMIT 100"),
+        );
+        v.sort();
+        v
+    };
+    // 型順位: Object > Array > Boolean > Number > String > Null。
+    assert_eq!(q("docb -> 'k' > '2'"), vec![4, 5, 6]);
+    assert_eq!(q("docb -> 'k' >= '2'"), vec![3, 4, 5, 6]);
+    assert_eq!(q("docb -> 'k' < '2'"), vec![1, 2]);
+    assert_eq!(q("docb -> 'k' <= '2'"), vec![1, 2, 3]);
+    assert_eq!(q("docb -> 'k' < '{}'"), vec![1, 2, 3, 4, 5]);
+    // 数値の厳密比較（f64 に収まらない差）。
+    assert_eq!(q("docb -> 'k' < '2.0000000000000000000001'"), vec![1, 2, 3]);
+}
+
+#[test]
+fn comparison_operand_errors_use_fixed_sqlstates() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed(&core, &alice, &[r#"{"k":1}"#]);
+    let w = |p: &str| format!("SELECT id FROM {TABLE} WHERE {p} LIMIT 10");
+    assert_eq!(code(&core, &alice, &w("docb -> 'k' = lang")), "42883");
+    assert_eq!(code(&core, &alice, &w("docb -> 'k' = 1")), "42883");
+    assert_eq!(code(&core, &alice, &w("(docb -> 'k') + 1 = 2")), "0A000");
+    // 不正な JSON リテラル（長さ超過の 54000 は json::jsonb_sort_key の単体テストで固定）。
+    assert_eq!(code(&core, &alice, &w("docb -> 'k' = 'x'")), "22P02");
+    assert_eq!(code(&core, &alice, &w("docb -> 'k' = '{'")), "22P02");
+}
+
+#[test]
+fn order_by_jsonb_keys_expression_column_and_alias() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    // id 1..=7: 型順位が混在する値と、キー不在の行（SQL の NULL）。
+    seed(
+        &core,
+        &alice,
+        &[
+            r#"{"k":{"a":1}}"#,
+            r#"{"k":"b"}"#,
+            r#"{"k":null}"#,
+            r#"{"x":0}"#,
+            r#"{"k":[1,2]}"#,
+            r#"{"k":10}"#,
+            r#"{"k":true}"#,
+        ],
+    );
+    let asc = vec![3, 2, 6, 7, 5, 1, 4];
+    let mut desc: Vec<u64> = asc.clone();
+    desc.reverse();
+    // 昇順は NULL が末尾（4）、降順は先頭。
+    assert_eq!(
+        ids(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TABLE} ORDER BY docb -> 'k' LIMIT 100")
+        ),
+        asc
+    );
+    assert_eq!(
+        ids(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TABLE} ORDER BY docb -> 'k' DESC LIMIT 100")
+        ),
+        vec![4, 1, 5, 7, 6, 2, 3]
+    );
+    // LIMIT 付き（ヒープ経路）と全件の先頭が一致する。
+    assert_eq!(
+        ids(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TABLE} ORDER BY docb -> 'k' LIMIT 3")
+        ),
+        vec![3, 2, 6]
+    );
+    // jsonb の式項目を指す別名。
+    assert_eq!(
+        ids(
+            &core,
+            &alice,
+            &format!("SELECT id, docb -> 'k' AS v FROM {TABLE} ORDER BY v LIMIT 100")
+        ),
+        asc
+    );
+    // text 結果のパス演算子（バイト順）。
+    assert_eq!(
+        ids(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TABLE} ORDER BY docb ->> 'k', id LIMIT 100")
+        )
+        .len(),
+        7
+    );
+    // jsonb 列の裸のキー（オブジェクトはペア数 → 内容の順）。
+    let col_order = ids(
+        &core,
+        &alice,
+        &format!("SELECT id FROM {TABLE} ORDER BY docb, id LIMIT 100"),
+    );
+    assert_eq!(col_order.len(), 7);
+    // 2 キー目への同点解消。
+    assert_eq!(
+        ids(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TABLE} ORDER BY docb -> 'k' DESC, id DESC LIMIT 100")
+        ),
+        vec![4, 1, 5, 7, 6, 2, 3]
+    );
+}
+
+#[test]
+fn jsonb_expression_projection_returns_normalized_text() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert(&core, &alice, 1, "k", DOC, 0);
+    assert_eq!(cell(&core, &alice, "docb -> 'k' AS x"), json("1"));
+    assert_eq!(
+        cell(&core, &alice, "docb AS x"),
+        json(r#"{"a":{"b":[10,20,{"c":"x\ny"}]},"k":1,"n":null,"s":"str"}"#)
+    );
+}
+
+#[test]
+fn jsonb_order_and_predicates_respect_tenant_boundary() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let bob = ctx_for("bob");
+    insert(&core, &alice, 1, "k", r#"'{"k":"alice-secret"}'"#, 0);
+    let w = format!("SELECT id FROM {TABLE} WHERE docb -> 'k' = '\"alice-secret\"' LIMIT 10");
+    assert!(ids(&core, &bob, &w).is_empty());
+    assert_eq!(ids(&core, &alice, &w), vec![1]);
+    let o = format!("SELECT id FROM {TABLE} ORDER BY docb -> 'k' LIMIT 10");
+    assert!(ids(&core, &bob, &o).is_empty());
+    // エラー文言にも他テナントの値は現れない。
+    let err = core
+        .execute_sql(
+            &bob,
+            &format!("SELECT id FROM {TABLE} WHERE docb -> 'k' = 'alice-secret' LIMIT 10"),
+        )
+        .expect_err("invalid jsonb literal");
+    assert_eq!(err.wire_code(), "22P02");
+    assert!(!err.to_string().contains("alice-secret"));
+}
+
+#[test]
+fn dml_where_with_jsonb_comparison_is_content_checked_on_resend() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed(&core, &alice, &[r#"{"k":1}"#, r#"{"k":2}"#]);
+    let run = |sql: &str| core.execute_sql_in_session(&alice, &mut SessionState::default(), sql);
+    let upd = |lit: &str| {
+        format!("UPDATE {TABLE} SET n = 5 WHERE docb -> 'k' = '{lit}' USING OPERATION_ID 'upd-j'")
+    };
+    run(&upd("1")).expect("first update succeeds");
+    assert_eq!(
+        ids(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE n = 5 LIMIT 10")
+        ),
+        vec![1]
+    );
+    // 同じ内容の再送は 23505、jsonb リテラルだけが異なる再送は 22023。
+    assert_eq!(run(&upd("1")).expect_err("resend").wire_code(), "23505");
+    assert_eq!(
+        run(&upd("2")).expect_err("different content").wire_code(),
+        "22023"
+    );
 }

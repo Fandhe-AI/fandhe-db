@@ -6155,6 +6155,10 @@ pub(crate) enum OrderKind {
     Uuid,
     /// `ENUM`（宣言順のラベル添字。文字列順ではない）。
     Enum,
+    /// `JSONB`（Issue #1597・TABLE-25。[`crate::json::jsonb_sort_key`] のバイト列順）。
+    /// 式キー（jsonb 列の裸のキーも式として束縛する）専用で、GROUP BY・DISTINCT 用の
+    /// [`resolve_order_kind`] は返さない。
+    Jsonb,
 }
 
 /// スカラー `ORDER BY` の束縛済み 1 キー分（Issue #915・SQL-25）。
@@ -6249,10 +6253,8 @@ fn order_kind_for_expr_type(
         ExprType::Vector => Err(SqlSurfaceError::invalid_input(
             "unsupported ORDER BY expression type: VECTOR",
         )),
-        // jsonb の順序は #1597 の担当（Issue #1596）。それまで fail-closed。
-        ExprType::Json => Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "ORDER BY a jsonb expression is not supported".to_string(),
-        }),
+        // Issue #1597・TABLE-25: jsonb 式はソートキー（バイト列順）で並べ替える。
+        ExprType::Json => Ok(OrderKind::Jsonb),
     }
 }
 
@@ -6292,11 +6294,29 @@ fn bind_scan_order_keys(
         match key {
             ResolvedScanOrderKey::Plain(k) => match k.as_ref() {
                 ScanOrderKey::Column(k) => {
+                    // Issue #1597: jsonb 列の裸のキーは列比較器（`resolve_order_kind` は
+                    // GROUP BY・DISTINCT と共有で jsonb を返さない）ではなく、列参照の式キー
+                    // として登録し、行ごとにソートキーを作って並べ替える。
+                    if let Some(index) = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == k.column && matches!(c.ty, ColumnType::Jsonb))
+                    {
+                        let be = crate::sql::udf_call::BoundExpr::JsonbColumnRef { index };
+                        let program = crate::sql::expr_program::ExprProgram::compile(&be);
+                        bound.push(BoundOrderKey {
+                            target: BoundOrderTarget::Expr(exprs.len()),
+                            kind: OrderKind::Jsonb,
+                            descending: k.descending,
+                        });
+                        exprs.push((be, program));
+                        continue;
+                    }
                     bound.extend(bind_scalar_order_by(std::slice::from_ref(k), schema)?);
                 }
                 ScanOrderKey::Expr { expr, descending } => {
                     let (be, ty) =
-                        crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+                        crate::sql::udf_call::bind_order_expr(expr, schema, udfs, node_budget)?;
                     let kind = order_kind_for_expr_type(ty)?;
                     let program = crate::sql::expr_program::ExprProgram::compile(&be);
                     bound.push(BoundOrderKey {
@@ -6988,6 +7008,13 @@ pub(crate) fn bind_scan_with_dummy_flags(
     )?;
     let (order_by, order_exprs) =
         bind_scan_order_keys(&resolved_keys, schema, udfs, &mut node_budget)?;
+    // Issue #1597: ウィンドウ付き取得は式キーを持てない（行順をウィンドウ経路が別に計算する）
+    // ため、jsonb キーは誤順序で成功させず明示的に拒否する。
+    if !stmt.window_items.is_empty() && order_by.iter().any(|k| k.kind == OrderKind::Jsonb) {
+        return Err(SqlSurfaceError::unsupported(
+            "ORDER BY a jsonb value is not supported with window functions",
+        ));
+    }
 
     // Issue #353 と同じく、`expr_filters` を束縛時に 1 回だけステップ列コンパイル
     // する（行ループでの再帰評価をなくす）。
