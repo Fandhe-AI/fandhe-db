@@ -133,6 +133,9 @@ struct ActiveTxn<'e> {
     origin: TxnOrigin,
     write_txn: crate::storage::GatedWriteTxn,
     started_at: Instant,
+    /// トランザクション開始時刻（UTC マイクロ秒の壁時計。SQL-37・Issue #1586）。`now()` 系の
+    /// 値で、トランザクション内の全文で固定する（`started_at` は壁時計でないため別に持つ）。
+    txn_start_micros: i64,
     statements: u32,
     seen_operation_ids: HashSet<String>,
     written_tables: HashSet<String>,
@@ -297,6 +300,15 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
+    /// `Active` のときのトランザクション開始時刻（UTC マイクロ秒。`now()` 系の値。
+    /// SQL-37・Issue #1586。`core.rs` の `Active` 中の読み取り文が時刻を確定するために呼ぶ）。
+    pub(crate) fn txn_start_micros(&self) -> Option<i64> {
+        match &self.state {
+            TxnState::Active(active) => Some(active.txn_start_micros),
+            _ => None,
+        }
+    }
+
     /// `Active` なら true（`core.rs` の文実行前チェック用）。
     pub fn is_active(&self) -> bool {
         matches!(self.state, TxnState::Active(_))
@@ -428,6 +440,9 @@ impl<'e> SessionTransaction<'e> {
     ) -> Result<(), SqlSurfaceError> {
         match &self.state {
             TxnState::Idle => {
+                // 壁時計の読み取り失敗（範囲外）は write_txn を開く前に fail-closed で返す
+                // （状態は `Idle` のまま）。
+                let txn_start_micros = crate::sql::time_fn::now_micros()?;
                 let write_txn = storage
                     .begin_explicit_write_txn()
                     .map_err(map_write_lock_err)?;
@@ -453,6 +468,7 @@ impl<'e> SessionTransaction<'e> {
                     origin,
                     write_txn,
                     started_at: Instant::now(),
+                    txn_start_micros,
                     statements: 0,
                     seen_operation_ids: HashSet::new(),
                     written_tables: HashSet::new(),

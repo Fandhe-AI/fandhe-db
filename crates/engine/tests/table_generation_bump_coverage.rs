@@ -382,7 +382,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 抽出し、Issue #1179 で COMMIT 時の遅延 FK 検査対象を dirty テーブル（世代の変化
     // から検出）へ拡張したことでさらに移動（旧: 330）。書き込み内容・commit の意味は不変。
     // Issue #1553（明示トランザクションの最大時間・最大文数の CLI 設定化）の行追加でさらに移動（旧: 793）。
-    ("sql/transaction.rs", 866),
+    ("sql/transaction.rs", 882),
     // Issue #1129（分割実行 DML の取り消し）: 取り消し済み記録への縮小（`partitioned_job::
     // cancel_in_txn`）はジョブ表（`PARTITIONED_JOB_TABLE`・索引表）だけを書き、
     // `CATALOG_TABLE`／`user_rows/{table}` のいずれにも触れない（commit 済みチャンクの行は
