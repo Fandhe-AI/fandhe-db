@@ -204,6 +204,7 @@ pub(crate) mod sparse_cache;
 pub mod statement_splitter;
 pub(crate) mod string_fn;
 pub(crate) mod subquery;
+pub(crate) mod time_fn;
 pub mod transaction;
 pub mod udf_call;
 pub(crate) mod view;

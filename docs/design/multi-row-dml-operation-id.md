@@ -240,7 +240,9 @@ origin/main 取り込み時の是正: 並行実装していた Issue #921 のタ
 - `TimestampLiteral(micros)`＝タグ 10・型バイト `1`・`micros`（`i64`、LE）
 - `JsonAccess{op, lhs, rhs}`＝タグ 12・演算子種別 1 バイト（`->`=1・`->>`=2・`#>`=3・`#>>`=4・
   `@>`=5・`<@`=6・`?`=7・`?|`=8・`?&`=9）・`lhs`・`rhs`（Issue #1596・#1598。既存の種別は不変）
-- 予約: タグ 13＝時刻値関数のキーワード形（Issue #1585 の設計。導入は #1586。
+- `ValueFunction{kind, precision}`＝タグ 13・種別 1 バイト（`CURRENT_TIMESTAMP`=1・`CURRENT_DATE`=2・
+  `CURRENT_TIME`=3・`LOCALTIMESTAMP`=4・`LOCALTIME`=5）・精度の有無 1 バイト・精度 1 バイト（無ければ 0）
+  （Issue #1586 で導入。#1586 の時点では書き込み文が時刻関数を受理しないため DML のハッシュには現れない。
   [now-evaluated-value-ledger.md](now-evaluated-value-ledger.md)）
 
 型バイトで `DATE`／`TIMESTAMP` を区別するのは、同じ暦日を表す

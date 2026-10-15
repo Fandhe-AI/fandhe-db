@@ -1316,6 +1316,8 @@ pub(crate) fn default_expr_alias(expr: &Expr) -> String {
         Expr::Case { .. } => "case".to_string(),
         Expr::Coalesce(_) => "coalesce".to_string(),
         Expr::NullIf(..) => "nullif".to_string(),
+        // 括弧なし値関数の既定列名は小文字のキーワード名（SQL-37・Issue #1586）。
+        Expr::ValueFunction { kind, .. } => kind.as_sql().to_string(),
         // PostgreSQL の既定列名（Issue #1539・SQL-42。従来は `expr`）。
         _ => ANONYMOUS_COLUMN_NAME.to_string(),
     }
@@ -6906,9 +6908,9 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
         }
         // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は
         // 列参照を子に持ちうるため再帰的に集める（`sql::view::
-        // expr_columns_within` と同じ走査規則）。`Expr::Null` は列参照を
-        // 持たない。
-        Expr::Null => {}
+        // expr_columns_within` と同じ走査規則）。`Expr::Null`・括弧なし値関数
+        // （Issue #1586）は列参照を持たない。
+        Expr::Null | Expr::ValueFunction { .. } => {}
         Expr::Case { whens, else_result } => {
             for (cond, result) in whens {
                 collect_expr_idents(cond, out);
@@ -7473,7 +7475,8 @@ fn rewrite_group_row_idents(
         | Expr::String(_)
         | Expr::Null
         | Expr::DateLiteral(_)
-        | Expr::TimestampLiteral(_) => expr.clone(),
+        | Expr::TimestampLiteral(_)
+        | Expr::ValueFunction { .. } => expr.clone(),
         Expr::Call { name, args } => Expr::Call {
             name: name.clone(),
             args: args.iter().map(rec).collect::<Result<_, _>>()?,

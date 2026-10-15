@@ -807,18 +807,22 @@ fn chained_udf_parameter_doubling_is_rejected_before_expansion_blows_up() {
         );
     assert_eq!(err.wire_code(), "54000");
 }
-/// Issue #1186（対象ビヘイビア: SQL-26・ERR-6）: 非決定的関数 `now()` は受理せず、
+/// Issue #1586（対象ビヘイビア: SQL-37）: 現在時刻関数 `now()` は読み取り文で受理する
+/// （Issue #1186 の `42883` 拒否からの意図した変更）。非決定的な `random()` は従来どおり
 /// 未知関数と同じ `42883` で決定的に拒否する（2 回呼んでも同じコード）。
 #[test]
-fn non_deterministic_function_call_is_rejected_with_42883_deterministically() {
+fn now_is_accepted_and_random_is_rejected_with_42883_deterministically() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
     let sql = "SELECT now() FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1";
+    core.execute_sql_in_session(&ctx, &mut session, sql)
+        .expect("now() is accepted in a read statement");
+    let sql = "SELECT random() FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1";
     for _ in 0..2 {
         let err = core
             .execute_sql_in_session(&ctx, &mut session, sql)
-            .expect_err("now() must be rejected");
+            .expect_err("random() must be rejected");
         assert_eq!(err.wire_code(), "42883");
     }
 }

@@ -157,6 +157,17 @@ RECOVER-14・RECOVER-15 の機能は未実装。実装時は評価済みの値�
   列ごとの種別バイトと行ごとの列数プレフィクスで連結の曖昧性を排除する。
 - 依存: 追加しない。
 
+### #1586 での実装メモ
+
+- D3: 括弧なしのキーワード形は `Expr::ValueFunction`（式タグ 13）、関数形は既存の `Expr::Call`。引用付き識別子は
+  列参照のまま（字句段で印付け）。
+- D7: トランザクション開始時刻は `sql/transaction.rs` の `ActiveTxn` が保持する。文の時刻は `core.rs` の
+  読み取り文の入口が確定し、`sql/time_fn.rs` のスコープガードを保持している間だけ束縛が時刻関数を受理する
+  （既定は拒否。`SessionState`・`UdfRegistry` には載せない）。書き込み文・CHECK・DEFAULT・VIEW 本文は
+  スコープ外のため自動的に拒否側へ倒れる。
+- D8: 戻り値型は暫定の `TIMESTAMP`（wire の OID 1114）・`DATE`（1082）。PostgreSQL の `timestamptz`（1184）との
+  差は TIMESTAMPTZ 担当 Issue で解消する。
+
 ## 5. 後続 Issue との分担
 
 | Issue | 担当する決定 |

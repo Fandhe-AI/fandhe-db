@@ -283,6 +283,22 @@ fn demote_unneeded_quoted_bool_words(tokens: &mut [Token]) {
 /// 真偽リテラルとして保存した本文（マーカーあり）を保存形式の段階で区別する。
 pub(crate) const STORED_BODY_BOOL_LITERAL_MARKER: &str = "/*fandhe:bool-literal*/ ";
 
+/// 旧版が引用なしで保存した `"current_date"` 等の列参照を引用付きトークンへ戻す
+/// （SQL-37・Issue #1586）。新版の保存本文（ビュー・CHECK）は列名位置で必ず引用付きにし、
+/// 値関数そのものは保存しない（CHECK は値関数を禁止）ため、保存本文中の未引用の値関数
+/// 予約語は旧形式の列参照とみなしてよい。再解析で式項へ化けて保存済み定義が壊れるのを防ぐ。
+/// 呼び出し元は [`tokenize_stored_view_body`] と CHECK 述語の再パース
+/// （`sql::allowlist::parse_check_predicate_text`）。
+pub(crate) fn requote_legacy_value_function_columns(tokens: &mut [Token]) {
+    for slot in tokens.iter_mut() {
+        if let Token::Ident(w) = slot {
+            if is_value_function_keyword(w) {
+                *slot = Token::QuotedNull(std::mem::take(w));
+            }
+        }
+    }
+}
+
 /// 永続化ビュー本文を再解析用にトークン化する（Issue #1526・PR #2297 指摘）。
 /// 旧版は WHERE 述語葉位置の列参照 `"true"`／`"false"` を引用なしで保存した（単純形・
 /// 評価後射影形の双方）。マーカーなしの本文はこの旧形式として扱い、述語葉位置の未引用
@@ -291,6 +307,7 @@ pub(crate) const STORED_BODY_BOOL_LITERAL_MARKER: &str = "/*fandhe:bool-literal*
 /// 呼び出し元は `sql::view`（参照時）・カタログのビュー本文検査・作成時の自己検証。
 pub(crate) fn tokenize_stored_view_body(input: &str) -> Result<Vec<Token>, LexError> {
     let mut tokens = tokenize(input)?;
+    requote_legacy_value_function_columns(&mut tokens);
     if input.starts_with(STORED_BODY_BOOL_LITERAL_MARKER) {
         return Ok(tokens);
     }
@@ -403,6 +420,20 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     tokenize_impl(input, false, false)
 }
 
+/// 括弧なし SQL 値関数の予約語か（大小無視。SQL-37・Issue #1586。引用付きの同名識別子を
+/// 裸のキーワードと区別するために字句段で印付けする）。
+pub(crate) fn is_value_function_keyword(s: &str) -> bool {
+    [
+        "current_timestamp",
+        "current_date",
+        "current_time",
+        "localtimestamp",
+        "localtime",
+    ]
+    .iter()
+    .any(|k| s.eq_ignore_ascii_case(k))
+}
+
 /// [`tokenize`] と同一だが、二重引用符付き `NULL` を [`Token::QuotedNull`] として返す版
 /// （Issue #1524）。値位置で裸の `NULL` と引用付き `"NULL"` を区別する必要がある
 /// INSERT／UPDATE／CREATE TABLE／ALTER TABLE の許可リスト検証経路だけが使う。
@@ -412,13 +443,16 @@ pub fn tokenize_marked(input: &str) -> Result<Vec<Token>, LexError> {
     tokenize_impl(input, false, true)
 }
 
-/// [`Token::QuotedNull`] を `Token::Ident` へ戻す（引用情報を捨てる。`tokenize` の
-/// 出力と同一になる）。値位置の区別が不要な文種（SELECT・DDL 制御等）へ渡す前に使う。
+/// 引用付き `NULL` の [`Token::QuotedNull`] を `Token::Ident` へ戻す（引用情報を捨てる。
+/// 引用付きの SQL 値関数予約語は `QuotedNull` のまま残す）。値位置の区別が不要な文種（SELECT・DDL 制御等）へ渡す前に使う。
 pub fn demote_quoted_null(tokens: Vec<Token>) -> Vec<Token> {
     tokens
         .into_iter()
         .map(|t| match t {
-            Token::QuotedNull(s) => Token::Ident(s),
+            // 引用付きの SQL 値関数予約語（`"current_date"` 等。SQL-37・Issue #1586）は
+            // 引用情報を保持する（`Parser::new` が式項で列参照として扱うために必要。
+            // 引用付き `NULL` だけを `Ident` へ戻す）。
+            Token::QuotedNull(s) if !is_value_function_keyword(&s) => Token::Ident(s),
             other => other,
         })
         .collect()
@@ -600,7 +634,12 @@ fn tokenize_impl(
             }
             if content.eq_ignore_ascii_case("true") || content.eq_ignore_ascii_case("false") {
                 tokens.push(Token::QuotedBoolWord(content.to_string()));
-            } else if mark_quoted_null && content.eq_ignore_ascii_case("NULL") {
+            } else if (mark_quoted_null && content.eq_ignore_ascii_case("NULL"))
+                || is_value_function_keyword(content)
+            {
+                // 引用付きの `NULL`・SQL 値関数予約語（`"current_date"` 等。SQL-37・Issue #1586）は
+                // 裸のキーワードと区別するため専用トークンにする（`Parser::new` が `Ident` へ
+                // 戻しつつ位置を記録し、式項では列参照として扱う）。
                 tokens.push(Token::QuotedNull(content.to_string()));
             } else {
                 tokens.push(Token::Ident(content.to_string()));
