@@ -92,7 +92,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 49;
+    count = 50;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -344,6 +344,10 @@ define_error_classes! {
     /// （存在オラクルを作らない）。[`crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype`]
     /// の写像。
     IndeterminateDatatype => ("42P18", "INDETERMINATE_DATATYPE"),
+    /// NULL を許さない引数に NULL が渡された（`22004`。Issue #1599・TABLE-25 のポインタ）。
+    /// `jsonb_build_object` のキーが NULL の場合に返す。値・キー名は応答に含めない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::NullValueNotAllowed`] の写像。
+    NullValueNotAllowed => ("22004", "NULL_VALUE_NOT_ALLOWED"),
 }
 
 impl ErrorClass {

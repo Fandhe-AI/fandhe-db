@@ -41,9 +41,9 @@ use crate::sql::allowlist::{
 };
 use crate::sql::exec::{scalar_cell_for, Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::udf_call::{
-    bind_const_expr, bind_projection_expr, classify_integer_literal, eval, eval_with_scalars,
-    into_owned_vector, BoundExpr, Expr, ExprType, ExprValue, NumericKind, UdfRegistry,
-    MAX_EXPR_NODES,
+    bind_const_expr, bind_const_projection_expr, bind_projection_expr, classify_integer_literal,
+    eval, eval_with_scalars, into_owned_vector, BoundExpr, Expr, ExprType, ExprValue, NumericKind,
+    UdfRegistry, MAX_EXPR_NODES,
 };
 
 /// 束縛済みの 1 項目。
@@ -485,7 +485,8 @@ pub fn bind(
                 BoundConstItem::Literal { meta, cell }
             }
             expr => {
-                let (bound, _ty, result_ty) = bind_const_expr(expr, registry, &mut budget)?;
+                let (bound, _ty, result_ty) =
+                    bind_const_projection_expr(expr, registry, &mut budget)?;
                 BoundConstItem::Expr {
                     meta: ColumnMeta::Computed {
                         name,

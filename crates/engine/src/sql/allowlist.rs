@@ -515,6 +515,8 @@ pub enum SqlSurfaceError {
     /// ポインタ）。`param` は 1 始まりの `$n` 番号で、エラー文言には番号だけを含める
     /// （値・表の存在情報は含めない）。
     IndeterminateDatatype { param: u16 },
+    /// NULL を許さない引数への NULL（`22004`。Issue #1599。`jsonb_build_object` のキー）。
+    NullValueNotAllowed { detail: &'static str },
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
     /// スカラー／ベクトル算術式評価（SQL-26）の非有限値化（Issue #1163）にも使う。
@@ -1042,6 +1044,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
             SqlSurfaceError::IndeterminateDatatype { .. } => ErrorClass::IndeterminateDatatype,
+            SqlSurfaceError::NullValueNotAllowed { .. } => ErrorClass::NullValueNotAllowed,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidDatetimeFormat { .. } => ErrorClass::InvalidDatetimeFormat,
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
@@ -1144,6 +1147,7 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             // 接頭辞なしで固定文言をそのまま出す（PostgreSQL と同じ文言。値は埋め込まない）。
             SqlSurfaceError::InvalidParameterValue { detail } => f.write_str(detail),
+            SqlSurfaceError::NullValueNotAllowed { detail } => f.write_str(detail),
             SqlSurfaceError::IndeterminateDatatype { param } => {
                 write!(f, "could not determine data type of parameter ${param}")
             }
@@ -6422,8 +6426,17 @@ impl<'a> Parser<'a> {
         // （他の通常関数は従来どおり `false` のまま。`NULL` 許可の対象を
         // 安易に広げると他関数のエラーコード契約が変わるため、`CONCAT` に
         // 限定するスコープにする）。
+        // jsonb 関数（Issue #1599）は CHECK 本体では未対応（jsonb 演算子と同じ `0A000`）。
+        // 引数の裸の `NULL` は jsonb 関数の型規則（strict／JSON の `null`）で扱うため受理する。
+        let is_json_fn_call = crate::sql::udf_call::json_fn_from_name(&name).is_some()
+            || crate::sql::udf_call::is_deferred_json_srf_name(&name);
+        if is_json_fn_call && self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "jsonb functions are not supported in a CHECK constraint".to_string(),
+            });
+        }
         let allow_null_for_this_call =
-            name.eq_ignore_ascii_case("concat") || self.const_expr_null_args;
+            name.eq_ignore_ascii_case("concat") || self.const_expr_null_args || is_json_fn_call;
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
             args.push(
