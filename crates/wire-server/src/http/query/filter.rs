@@ -716,7 +716,8 @@ fn declare_between(
         // `col BETWEEN 'a' AND 'b'` と同じく engine の「BETWEEN 非対応列」判定
         // （`22000`）へ委譲する。
         ColumnType::Text
-        | ColumnType::Varchar
+        | ColumnType::Varchar(_)
+        | ColumnType::Bpchar(_)
         | ColumnType::Enum(_)
         | ColumnType::Boolean
         | ColumnType::Vector(_)
@@ -792,7 +793,7 @@ fn declare_eq(
         }));
     }
     match ty {
-        ColumnType::Text | ColumnType::Varchar => match value {
+        ColumnType::Text | ColumnType::Varchar(_) => match value {
             JsonValue::String(s) => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::equals(
                 column,
                 s.as_str(),
@@ -810,6 +811,10 @@ fn declare_eq(
                 "eq filter value for an ENUM column must be a JSON string",
             ))),
         },
+        // CHAR(n) の NoSQL 型束縛は bpchar の意味論（Issue #1566）まで fail-closed に拒否する。
+        ColumnType::Bpchar(_) => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+            "CHAR column is not supported on the NoSQL surface yet",
+        ))),
         ColumnType::Boolean => match value {
             JsonValue::Bool(b) => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::bool_equals(
                 column, *b,
@@ -908,6 +913,10 @@ fn declare_range(
     value: &JsonValue,
 ) -> Result<DeclarativePredicate, FilterError> {
     match ty {
+        // CHAR(n) の NoSQL 型束縛は bpchar の意味論（Issue #1566）まで fail-closed に拒否する。
+        ColumnType::Bpchar(_) => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+            "CHAR column is not supported on the NoSQL surface yet",
+        ))),
         ColumnType::Date | ColumnType::Timestamp | ColumnType::Uuid => match value {
             JsonValue::String(s) => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::compare(
                 column,
@@ -955,7 +964,7 @@ fn declare_range(
         }
         // Issue #1183: TEXT の範囲比較は式レーン（TEXT×TEXT のバイト順比較。
         // SQL の `lang < 'b'` の束縛結果と同一）へ渡す。
-        ColumnType::Text | ColumnType::Varchar => match value {
+        ColumnType::Text | ColumnType::Varchar(_) => match value {
             JsonValue::String(s) => Ok(DeclarativePredicate::Expr(Expr::Binary {
                 op: bin_op_for(cmp),
                 lhs: Box::new(Expr::Ident(column.to_string())),
@@ -1021,7 +1030,7 @@ fn declare_in(
     items: &[JsonValue],
 ) -> Result<DeclarativePredicate, FilterError> {
     match ty {
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Enum(_) => {
+        ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Enum(_) => {
             let mut values = Vec::with_capacity(items.len());
             for item in items {
                 match item {
@@ -1035,6 +1044,10 @@ fn declare_in(
                 column, values,
             )))
         }
+        // CHAR(n) の NoSQL 型束縛は bpchar の意味論（Issue #1566）まで fail-closed に拒否する。
+        ColumnType::Bpchar(_) => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+            "CHAR column is not supported on the NoSQL surface yet",
+        ))),
         ColumnType::Date | ColumnType::Timestamp | ColumnType::Uuid => {
             let mut values = Vec::with_capacity(items.len());
             for item in items {

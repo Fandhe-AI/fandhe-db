@@ -111,7 +111,7 @@ fn alias_declared_columns_round_trip_values() {
     assert_eq!(result.rows.len(), 1);
 }
 
-/// 未確定型（`VARCHAR(n)`・`CHAR`／`CHARACTER`・`SMALLINT[]` 等）は
+/// 未確定型（長さなし `CHAR`／`CHARACTER`・`varchar(n)[]`・`SMALLINT[]` 等）は
 /// `0A000` で拒否し、真に未知の型名・`DOUBLE` 単独は `42704`（Issue #2303・#2306。
 /// ポインタ: TABLE-29・TABLE-30・TABLE-31）。拒否後はテーブルが作られない。
 #[test]
@@ -121,13 +121,13 @@ fn unsettled_type_names_are_rejected_with_0a000_without_side_effects() {
     for sql in [
         "CREATE TABLE t (a INT2[])",
         "CREATE TABLE t (a SMALLINT[3])",
-        "CREATE TABLE t (a VARCHAR(10))",
-        "CREATE TABLE t (a CHARACTER VARYING(10))",
+        "CREATE TABLE t (a VARCHAR(10)[])",
+        "CREATE TABLE t (a CHARACTER VARYING(10)[])",
+        "CREATE TABLE t (a CHAR(3)[])",
         "CREATE TABLE t (a VARCHAR[])",
         "CREATE TABLE t (a CHARACTER VARYING[3])",
         "CREATE TABLE t (a CHAR)",
-        "CREATE TABLE t (a CHAR(1))",
-        "CREATE TABLE t (a CHARACTER(1))",
+        "CREATE TABLE t (a CHARACTER)",
     ] {
         assert_eq!(err(&core, &mut s, sql).wire_code(), "0A000", "{sql}");
     }
@@ -151,10 +151,8 @@ fn unsettled_spellings_match_on_every_ddl_path_and_leave_schema() {
     let (path, _g, core) = open("ta-unsettled-paths");
     let mut s = allowed();
     run(&core, &mut s, "CREATE TABLE t (a INT)").expect("create");
-    let pairs = [
-        ("VARCHAR(10)", "CHARACTER VARYING(10)"),
-        ("CHAR(1)", "CHARACTER(1)"),
-    ];
+    // 長さなしの CHAR／CHARACTER は PG では CHAR(1) だが本実装は未対応（Issue #1563 の対象外）。
+    let pairs = [("CHAR", "CHARACTER")];
     for (x, y) in pairs {
         let paths: [fn(&str) -> String; 3] = [
             |t| format!("CREATE TABLE u (a {t})"),
@@ -193,6 +191,11 @@ fn ddl_permission_gate_precedes_runtime_resolution_but_not_syntax_rejection() {
         // 長さなし VARCHAR は実行段で解決されるため権限ゲートが先（Issue #2305）。
         "CREATE TABLE t (a VARCHAR)",
         "CREATE TABLE t (a CHARACTER VARYING)",
+        // 長さ付き VARCHAR(n)／CHAR(n) も実行段で解決されるため権限ゲートが先（Issue #1563）。
+        "CREATE TABLE t (a VARCHAR(10))",
+        "CREATE TABLE t (a CHARACTER VARYING(10))",
+        "CREATE TABLE t (a CHAR(1))",
+        "CREATE TABLE t (a CHARACTER(1))",
     ] {
         assert_eq!(err(&core, &mut denied, sql).wire_code(), "42501", "{sql}");
     }
@@ -200,8 +203,8 @@ fn ddl_permission_gate_precedes_runtime_resolution_but_not_syntax_rejection() {
     for sql in [
         "CREATE TABLE t (a INT2[])",
         "CREATE TABLE t (a SMALLINT[3])",
-        "CREATE TABLE t (a VARCHAR(10))",
-        "CREATE TABLE t (a CHARACTER VARYING(10))",
+        "CREATE TABLE t (a CHAR)",
+        "CREATE TABLE t (a VARCHAR(10)[])",
     ] {
         assert_eq!(err(&core, &mut denied, sql).wire_code(), "0A000", "{sql}");
         assert_eq!(err(&core, &mut ok, sql).wire_code(), "0A000", "{sql}");
@@ -310,9 +313,14 @@ fn alter_column_type_alias_failures_match_canonical_and_leave_schema() {
     let canon = err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INTEGER").wire_code();
     let alias = err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INT4").wire_code();
     assert_eq!(canon, alias);
-    for ty in ["INT2[]", "SMALLINT[3]", "VARCHAR(10)"] {
+    for ty in ["INT2[]", "SMALLINT[3]", "CHAR", "VARCHAR(10)[]"] {
         let sql = format!("ALTER TABLE t ALTER COLUMN a TYPE {ty}");
         assert_eq!(err(&core, &mut s, &sql).wire_code(), "0A000", "{sql}");
+    }
+    // 長さ付き型への変更は構文を通り、INTEGER からは非互換変更（42804）で拒否する（Issue #1563）。
+    for ty in ["VARCHAR(10)", "CHAR(10)"] {
+        let sql = format!("ALTER TABLE t ALTER COLUMN a TYPE {ty}");
+        assert_eq!(err(&core, &mut s, &sql).wire_code(), "42804", "{sql}");
     }
     let mut denied = SessionState::default();
     assert_eq!(

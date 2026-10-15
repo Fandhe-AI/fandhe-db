@@ -501,7 +501,7 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
             ColumnMeta::Id => int_kind(effective_oid),
             ColumnMeta::Computed { .. } | ColumnMeta::AliasedId { .. } => BinaryParam::Unsupported,
             ColumnMeta::Scalar { ty, .. } => match ty {
-                ColumnType::Text | ColumnType::Varchar => text_like(),
+                ColumnType::Text | ColumnType::Varchar(_) => text_like(),
                 ColumnType::Integer | ColumnType::BigInt => int_kind(effective_oid),
                 ColumnType::Real => only(700, BinaryParam::Float4),
                 ColumnType::Double => only(701, BinaryParam::Float8),
@@ -510,7 +510,9 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 ColumnType::Uuid => only(2950, BinaryParam::Uuid),
                 // SMALLINT のバイナリ param（int2＝OID 21）は兄弟 Issue（#1561）で対応する。
                 // それまでは fail-closed に非対応とする（text 形式は engine 側で範囲検査）。
-                ColumnType::SmallInt
+                // CHAR(n) の param 型（bpchar＝OID 1042）は Issue #1565 で対応する。
+                ColumnType::Bpchar(_)
+                | ColumnType::SmallInt
                 | ColumnType::Vector(_)
                 | ColumnType::Numeric { .. }
                 | ColumnType::Date

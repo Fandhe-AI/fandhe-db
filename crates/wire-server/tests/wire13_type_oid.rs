@@ -104,7 +104,7 @@ fn new_core_typed_probe() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ),
                 ColumnDef::new("tags", ColumnType::Array(tags), false),
                 ColumnDef::new("mood", ColumnType::Enum(mood), false),
-                ColumnDef::new("vc", ColumnType::Varchar, false),
+                ColumnDef::new("vc", ColumnType::Varchar(None), false),
             ],
         ))
         .expect("create table");

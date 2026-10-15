@@ -168,7 +168,7 @@ pub(crate) fn extract_order_value_ref<'a>(
         .ok_or_else(|| scan_bug("order key column index out of range"))?;
     match (&column.ty, key.kind, value) {
         (
-            ColumnType::Text | ColumnType::Varchar,
+            ColumnType::Text | ColumnType::Varchar(_),
             OrderKind::Bytes,
             row_codec::ScalarRef::Text(t),
         ) => Ok(Some(ScalarKeyRef::Bytes(t.as_bytes()))),
@@ -339,7 +339,7 @@ pub(crate) fn order_value_to_cell(
     use crate::sql::exec::Cell;
     match (value, ty) {
         (OrderValue::Id(v), None) => Ok(Cell::Integer(*v)),
-        (OrderValue::Bytes(b), Some(ColumnType::Text | ColumnType::Varchar)) => {
+        (OrderValue::Bytes(b), Some(ColumnType::Text | ColumnType::Varchar(_))) => {
             String::from_utf8(b.clone())
                 .map(Cell::Text)
                 .map_err(|_| scan_bug("group key TEXT value is not valid UTF-8"))

@@ -369,7 +369,7 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
     matches!(
         ty,
         ColumnType::Text
-            | ColumnType::Varchar
+            | ColumnType::Varchar(_)
             | ColumnType::Enum(_)
             | ColumnType::Date
             | ColumnType::Timestamp
@@ -1037,6 +1037,11 @@ const _: () = assert!(
     "catalog::MAX_VECTOR_DIM must stay in sync with storage::MAX_EMBEDDING_DIM"
 );
 
+/// `VARCHAR(n)`／`CHAR(n)` の n の上限（文字数。TABLE-31・Issue #1563）。n は文字数との
+/// 比較にだけ使い、アロケーション量には使わない。`CHAR(n)` の空白詰め（Issue #1566）で
+/// n 文字を確保する経路は、応答バッファ上限の内側で行うこと。
+pub const MAX_CHAR_TYPE_LENGTH: u32 = 10_485_760;
+
 /// 1 テーブルが持てる列数の上限。カタログ値のデコード時、この値を超える宣言列数は
 /// アロケーション前に拒否する（.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
 /// 列数上限の唯一の定義（Issue #1518）。SQL 構文段
@@ -1533,12 +1538,20 @@ fn map_tenant_write_error_to_alter_check(e: crate::tenant::TenantWriteError) -> 
 pub enum ColumnType {
     /// 可変長テキスト列。
     Text,
-    /// 長さ制限のない `character varying`（`VARCHAR`／`CHARACTER VARYING`、
-    /// TABLE-31・Issue #2305）。値表現・比較・関数・索引・正準キーは [`ColumnType::Text`]
-    /// と共有し、違いはカタログタグ（`varchar`）と wire 公告型（OID 1043・
-    /// typmod -1）だけ。TEXT と同値扱いにすべき判定は [`Self::is_text_like`]／
-    /// [`Self::same_value_domain`] を使う。`VARCHAR(n)` は構文段で `0A000` 拒否する。
-    Varchar,
+    /// `character varying`（`VARCHAR`／`CHARACTER VARYING`、TABLE-31・Issue #2305・#1563）。
+    /// `None` は長さ制限なし、`Some(n)` は `VARCHAR(n)`（`1..=`[`MAX_CHAR_TYPE_LENGTH`] 文字）。
+    /// 値表現・比較・関数・索引・正準キーは [`ColumnType::Text`] と共有し、違いはカタログ
+    /// タグ（`varchar`。param は `-` または 10 進の n）と wire 公告型（OID 1043）だけ。
+    /// TEXT と同値扱いにすべき判定は [`Self::is_text_like`]／[`Self::same_value_domain`] を使う。
+    /// n 超過の書き込みは行 codec の encode がバックストップとして拒否する（束縛段での
+    /// `22001` 分類は Issue #1564、wire typmod は Issue #1565）。
+    Varchar(Option<u32>),
+    /// `character(n)`（`CHAR(n)`／`CHARACTER(n)`、TABLE-31・Issue #1563）。n は
+    /// `1..=`[`MAX_CHAR_TYPE_LENGTH`]。カタログタグは `bpchar`（`"char"` 1 バイト型とは別物）。
+    /// 空白詰め・末尾空白を無視する比較は Issue #1566、FK・索引・UNIQUE・ALTER TYPE は
+    /// Issue #1567 の担当で、それまでは非 NULL 値の書き込み・述語・索引・制約を fail-closed に
+    /// 拒否する（[`Self::is_text_like`] は `false`）。投影は TEXT と同じセルで返す。
+    Bpchar(u32),
     /// 固定次元の埋め込み列（`VECTOR(N)`、TABLE-1）。0 と `MAX_VECTOR_DIM` 超過は
     /// encode・decode 両側で拒否する。
     Vector(u32),
@@ -1608,7 +1621,7 @@ impl ColumnType {
     /// 値の codec・比較・LIKE・関数引数など「TEXT 列として扱ってよい」判定の
     /// 共通入口で、`matches!(ty, ColumnType::Text)` の置き換え先。
     pub fn is_text_like(&self) -> bool {
-        matches!(self, ColumnType::Text | ColumnType::Varchar)
+        matches!(self, ColumnType::Text | ColumnType::Varchar(_))
     }
 
     /// 2 つの列型が同じ値ドメイン（比較・代入・集合演算で相互運用してよい）か
@@ -1641,7 +1654,7 @@ impl ColumnType {
         matches!(
             self,
             ColumnType::Text
-                | ColumnType::Varchar
+                | ColumnType::Varchar(_)
                 | ColumnType::SmallInt
                 | ColumnType::Integer
                 | ColumnType::BigInt
@@ -1728,7 +1741,7 @@ impl ColumnType {
             // （Issue #2305。新型には未使用タグを採番する規則の意図的な例外）。共有に
             // より TEXT↔VARCHAR の PK／FK 照合で recode が不要になり、ALTER COLUMN
             // TYPE でも `user_uniq`・`key_index` を失効させずに済む。
-            ColumnType::Text | ColumnType::Varchar => 1,
+            ColumnType::Text | ColumnType::Varchar(_) => 1,
             ColumnType::Integer => 2,
             // `SmallInt` は INTEGER と値表現（`Value::Integer`）が同一で、正準キーは値ベース
             // （`push_canonical_component`）のため同じタグ 2 を共有する（Issue #1558。新型には
@@ -1747,7 +1760,7 @@ impl ColumnType {
             ColumnType::Numeric { .. } => Self::NUMERIC_UNIQUE_KEY_TAG,
             ColumnType::Json | ColumnType::Jsonb => 13,
             ColumnType::Array(_) => Self::ARRAY_UNIQUE_KEY_TAG,
-            ColumnType::Vector(_) => {
+            ColumnType::Vector(_) | ColumnType::Bpchar(_) => {
                 // 呼び出し元が `is_unique_constraint_allowed` の契約を破っている
                 // （非許可型からタグを取得しようとした）。永続化しない内部
                 // スクラッチ用の値のため panic ではなく判別可能な番兵を返し、
@@ -1764,7 +1777,9 @@ impl ColumnType {
     fn catalog_fields(&self) -> (&'static str, String) {
         match self {
             ColumnType::Text => ("text", "-".to_string()),
-            ColumnType::Varchar => ("varchar", "-".to_string()),
+            ColumnType::Varchar(None) => ("varchar", "-".to_string()),
+            ColumnType::Varchar(Some(n)) => ("varchar", n.to_string()),
+            ColumnType::Bpchar(n) => ("bpchar", n.to_string()),
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
             ColumnType::SmallInt => ("smallint", "-".to_string()),
             ColumnType::Integer => ("integer", "-".to_string()),
@@ -1844,13 +1859,17 @@ impl ColumnType {
                 Ok(ColumnType::BigInt)
             }
             "varchar" => {
-                if param != "-" {
-                    return Err(CatalogError::Invalid(format!(
-                        "varchar column must not declare a parameter: {param:?}"
-                    )));
+                if param == "-" {
+                    Ok(ColumnType::Varchar(None))
+                } else {
+                    Ok(ColumnType::Varchar(Some(parse_char_length_param(
+                        "varchar", param,
+                    )?)))
                 }
-                Ok(ColumnType::Varchar)
             }
+            "bpchar" => Ok(ColumnType::Bpchar(parse_char_length_param(
+                "bpchar", param,
+            )?)),
             "real" => {
                 if param != "-" {
                     return Err(CatalogError::Invalid(format!(
@@ -3100,7 +3119,7 @@ impl ColumnDefault {
             (
                 ColumnDefault::Text(_),
                 ColumnType::Text
-                    | ColumnType::Varchar
+                    | ColumnType::Varchar(_)
                     | ColumnType::Date
                     | ColumnType::Timestamp
                     | ColumnType::Uuid
@@ -4030,7 +4049,7 @@ impl TableSchema {
         self.columns.iter().find_map(|c| match &c.ty {
             ColumnType::Vector(dim) => Some(*dim),
             ColumnType::Text
-            | ColumnType::Varchar
+            | ColumnType::Varchar(_)
             | ColumnType::SmallInt
             | ColumnType::Integer
             | ColumnType::BigInt
@@ -4042,6 +4061,7 @@ impl TableSchema {
             | ColumnType::Bytea
             | ColumnType::Json
             | ColumnType::Jsonb
+            | ColumnType::Bpchar(_)
             | ColumnType::Enum(_)
             | ColumnType::Array(_)
             | ColumnType::Numeric { .. }
@@ -4135,6 +4155,35 @@ pub(crate) fn validate_identifier(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// `VARCHAR(n)`／`CHAR(n)` の n 検証（TABLE-31・Issue #1563）。0 と
+/// [`MAX_CHAR_TYPE_LENGTH`] 超過を encode・decode 両側で拒否する。
+pub(crate) fn validate_char_type_length(n: u32) -> Result<()> {
+    if n == 0 || n > MAX_CHAR_TYPE_LENGTH {
+        return Err(CatalogError::Invalid(format!(
+            "character type length must be between 1 and {MAX_CHAR_TYPE_LENGTH}"
+        )));
+    }
+    Ok(())
+}
+
+/// カタログ param の `VARCHAR(n)`／`CHAR(n)` 長さを復号する。10 進 ASCII 数字のみ受理し、
+/// 先頭ゼロ・符号・空・u32 あふれ・範囲外はすべて `Invalid`（正規形のみ許す）。
+fn parse_char_length_param(tag: &str, param: &str) -> Result<u32> {
+    let n: u32 = if !param.is_empty() && param.bytes().all(|b| b.is_ascii_digit()) {
+        param.parse().ok()
+    } else {
+        None
+    }
+    .ok_or_else(|| CatalogError::Invalid(format!("malformed {tag} length parameter")))?;
+    validate_char_type_length(n)?;
+    if n.to_string() != param {
+        return Err(CatalogError::Invalid(format!(
+            "non-canonical {tag} length parameter"
+        )));
+    }
+    Ok(n)
+}
+
 /// `VECTOR(N)` の次元数検証（TABLE-6）。0 と `MAX_VECTOR_DIM` 超過を拒否する。
 fn validate_vector_dim(dim: u32) -> Result<()> {
     if dim == 0 {
@@ -4212,6 +4261,9 @@ fn validate_column(column: &ColumnDef) -> Result<()> {
     if let ColumnType::Numeric { precision, scale } = column.ty {
         validate_numeric_precision_scale(precision, scale)?;
     }
+    if let ColumnType::Varchar(Some(n)) | ColumnType::Bpchar(n) = &column.ty {
+        validate_char_type_length(*n)?;
+    }
     Ok(())
 }
 
@@ -4261,6 +4313,16 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
                     "column {:?} has a DEFAULT that is not compatible with its type",
                     column.name
                 )));
+            }
+            // `VARCHAR(n)` の既定値は文字数が n 以下であること（超過した既定値は INSERT のたびに
+            // 長さ超過になるため定義時に拒否する。コードの精緻化は Issue #1564）。
+            if let (ColumnType::Varchar(Some(n)), ColumnDefault::Text(s)) = (&column.ty, default) {
+                if u32::try_from(s.chars().count()).map_or(true, |len| len > *n) {
+                    return Err(CatalogError::Invalid(format!(
+                        "column {:?} has a DEFAULT longer than its declared length",
+                        column.name
+                    )));
+                }
             }
             // JSON／JSONB の既定値は構文（JSONB は正規形も）を永続化前に検証する。
             // カタログ decode 側が同じ検証を必須とする（`decode_schema_body`）ため、
@@ -8429,7 +8491,10 @@ impl Storage {
             // TEXT と VARCHAR は行バイト列・正準キーとも同一表現のため、カタログのタグだけを
             // 書き換える（行の書き換えも `user_uniq`・`key_index` の失効も不要。
             // 世代 bump は共通本体が行う。Issue #2305）。
-            (ColumnType::Text, ColumnType::Varchar) | (ColumnType::Varchar, ColumnType::Text) => {
+            // 長さ付き（`Varchar(Some)`・`Bpchar`）が絡む組は既存行が n を超える状態を作りうる
+            // ため catch-all（`IncompatibleTypeChange`）に落とす（解禁は Issue #1567）。
+            (ColumnType::Text, ColumnType::Varchar(None))
+            | (ColumnType::Varchar(None), ColumnType::Text) => {
                 Ok((target.clone(), AlterPlan::CatalogOnly))
             }
             // 整数型（Issue #1560）。SMALLINT と INTEGER は行レイアウト（presence + i32 LE）・
@@ -10138,7 +10203,16 @@ fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> boo
         (default, tag),
         (
             ColumnDefault::Text(_),
-            "text" | "date" | "timestamp" | "uuid" | "enum" | "json" | "jsonb" | "bytea" | "array"
+            "text"
+                | "varchar"
+                | "date"
+                | "timestamp"
+                | "uuid"
+                | "enum"
+                | "json"
+                | "jsonb"
+                | "bytea"
+                | "array"
         ) | (
             ColumnDefault::Number(_),
             "integer" | "bigint" | "real" | "double" | "numeric"
@@ -12013,6 +12087,57 @@ mod tests {
             encoded,
             b"v2\ncols:3\nembedding:vector:3:0\nbody:text:-:0\ntag:text:-:1\n".to_vec()
         );
+    }
+
+    /// `VARCHAR(n)`／`CHAR(n)`（TABLE-31・Issue #1563）のカタログ param の往復と golden。
+    /// 長さなし `varchar:-` のバイト列は従来から不変であること、`bpchar` は新タグであることを固定する。
+    #[test]
+    fn encode_decode_roundtrips_char_length_columns() {
+        let schema = TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::new("a", ColumnType::Varchar(None), true),
+                ColumnDef::new("b", ColumnType::Varchar(Some(3)), true),
+                ColumnDef::new("c", ColumnType::Bpchar(10_485_760), true),
+            ],
+        );
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        assert_eq!(
+            encoded,
+            b"v2\ncols:3\na:varchar:-:1\nb:varchar:3:1\nc:bpchar:10485760:1\n".to_vec()
+        );
+        assert_eq!(decode_schema("t", &encoded).expect("decode"), schema);
+    }
+
+    /// 破損した長さ param（0・先頭ゼロ・上限超過・`bpchar:-`・空・複数値）は encode／decode
+    /// 両側で fail-closed に拒否する（Issue #1563）。
+    #[test]
+    fn corrupt_char_length_params_are_rejected() {
+        for bad in [
+            "varchar:0",
+            "varchar:03",
+            "varchar:10485761",
+            "varchar:4294967296",
+            "varchar:+3",
+            "bpchar:-",
+            "bpchar:",
+            "bpchar:0",
+            "varchar:3,4",
+        ] {
+            let body = format!("v2\ncols:1\na:{bad}:1\n");
+            assert!(
+                decode_schema("t", body.as_bytes()).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        for ty in [
+            ColumnType::Varchar(Some(0)),
+            ColumnType::Bpchar(0),
+            ColumnType::Varchar(Some(MAX_CHAR_TYPE_LENGTH + 1)),
+        ] {
+            let schema = TableSchema::new("t", vec![ColumnDef::new("a", ty.clone(), true)]);
+            assert!(encode_schema(&schema).is_err(), "{ty:?} must be rejected");
+        }
     }
 
     /// `REAL`／`DOUBLE PRECISION` 列（TABLE-13・TASK-196）のカタログ v2 往復を

@@ -22,7 +22,9 @@
 
 use super::allowlist::SqlSurfaceError;
 use super::lexer::Token;
-use crate::catalog::{ArrayElemType, ArrayType, ColumnType, MAX_ARRAY_ELEMENTS};
+use crate::catalog::{
+    ArrayElemType, ArrayType, ColumnType, MAX_ARRAY_ELEMENTS, MAX_CHAR_TYPE_LENGTH,
+};
 
 /// 構文木を、カタログを参照せずに可能な範囲で `ColumnType` へ写した結果
 /// （[`to_static_column_type`] の戻り値。Issue #1348）。
@@ -70,7 +72,8 @@ pub(crate) fn to_static_column_type_with_array_default(
 ) -> Result<StaticColumnType, SqlSurfaceError> {
     let resolved = match ty {
         SqlColumnTypeName::Text => ColumnType::Text,
-        SqlColumnTypeName::Varchar => ColumnType::Varchar,
+        SqlColumnTypeName::Varchar(len) => ColumnType::Varchar(*len),
+        SqlColumnTypeName::Bpchar(len) => ColumnType::Bpchar(*len),
         SqlColumnTypeName::SmallInt => ColumnType::SmallInt,
         SqlColumnTypeName::Integer => ColumnType::Integer,
         SqlColumnTypeName::BigInt => ColumnType::BigInt,
@@ -110,7 +113,7 @@ pub(crate) fn to_static_column_type_with_array_default(
                 ColumnType::Text => ArrayElemType::Text,
                 // `varchar[]` は別 OID（1015）のため Text へ写さず拒否する（Issue #2305。
                 // 写すと型の区別が失われ、後で受理へ広げたときに不可逆になる）。
-                ColumnType::Varchar => {
+                ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
                     return Err(SqlSurfaceError::FeatureNotSupported {
                         detail: "this array element type is not supported yet".to_string(),
                     })
@@ -183,9 +186,11 @@ fn array_size_error(e: crate::catalog::CatalogError) -> SqlSurfaceError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqlColumnTypeName {
     Text,
-    /// 長さなしの `VARCHAR`／`CHARACTER VARYING`（TABLE-31・Issue #2305）。
-    /// `VARCHAR(n)` は構文段で `0A000` のため本 variant には到達しない。
-    Varchar,
+    /// `VARCHAR`／`CHARACTER VARYING`（TABLE-31・Issue #2305・#1563）。`None` は長さなし、
+    /// `Some(n)` は `VARCHAR(n)`（n は `1..=MAX_CHAR_TYPE_LENGTH`。構文段で検証済み）。
+    Varchar(Option<u32>),
+    /// `CHAR(n)`／`CHARACTER(n)`（TABLE-31・Issue #1563）。長さなしの `CHAR` は構文段 `0A000`。
+    Bpchar(u32),
     /// `SMALLINT`／別名 `INT2`（TABLE-30・Issue #1558）。
     SmallInt,
     Integer,
@@ -305,16 +310,14 @@ enum TypeNameKind {
     Vector,
     /// `NUMERIC(p,s)`／`DECIMAL(p,s)`。
     Numeric,
-    /// `VARCHAR`。長さなしなら `ColumnType::Varchar` として受理し、直後が `(` の
-    /// 長さ指定付きは `0A000`（型修飾子と長さ検査は後続フェーズ。Issue #2305）。
-    /// 綴りを保持する別名として返す（同名 ENUM との衝突検出に使う。Issue #1528）。
+    /// `VARCHAR`／`VARCHAR(n)`（Issue #2305・#1563）。綴りを保持する別名として返す
+    /// （同名 ENUM との衝突検出に使う。Issue #1528）。
     Varchar,
-    /// 定める ID が未確定のため受理しない型（現状は `CHAR`）。`canonical` は正規名で、綴りに依らず
-    /// 同一の `0A000` メッセージを組み立てるために使う（Issue #2303）。
-    Unsettled { canonical: &'static str },
-    /// `CHARACTER [VARYING]` の先頭語。直後が `VARYING` なら `VARCHAR` と同じ扱い
-    /// （長さなしは受理、`(` 付きは `0A000`）、`VARYING` なしの `CHARACTER` は未確定のため
-    /// `0A000` で拒否する。
+    /// `CHAR(n)`（Issue #1563）。長さなしは PG では `CHAR(1)` だが本 Issue の対象外のため
+    /// `0A000`。綴りを保持する別名として返す。
+    Char,
+    /// `CHARACTER [VARYING]` の先頭語。直後が `VARYING` なら `VARCHAR` と同じ扱い、
+    /// `VARYING` なしは `CHAR(n)` と同じ扱い。
     Character,
 }
 
@@ -357,29 +360,60 @@ const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
         TypeNameKind::Direct(|| SqlColumnTypeName::SmallInt),
     ),
     ("VARCHAR", TypeNameKind::Varchar),
-    (
-        "CHAR",
-        TypeNameKind::Unsettled {
-            canonical: "character",
-        },
-    ),
+    ("CHAR", TypeNameKind::Char),
     ("CHARACTER", TypeNameKind::Character),
 ];
 
-/// 未確定型の `0A000`。メッセージは正規名のみで組み立て、綴り（別名）に依らず同一にする。
-fn unsettled_type_error(canonical: &str) -> SqlSurfaceError {
+/// 長さなしの `CHAR`／`CHARACTER` の `0A000`（PG では `CHAR(1)`。本 Issue の対象外。Issue #1563）。
+/// メッセージは綴りに依らず同一にする。
+fn bare_char_error() -> SqlSurfaceError {
     SqlSurfaceError::FeatureNotSupported {
-        detail: format!("type {canonical} is not supported yet"),
+        detail: "type character without a length is not supported yet".to_string(),
     }
 }
 
-/// `VARCHAR`／`CHARACTER VARYING` の直後に `(`（長さ指定）が続く場合の `0A000`
-/// （Issue #2305。メッセージは両綴りで同一）。
-fn reject_length_modifier(tokens: &[Token], pos: usize) -> Result<(), SqlSurfaceError> {
-    if matches!(tokens.get(pos), Some(Token::Punct('('))) {
-        return Err(unsettled_type_error("character varying"));
+/// 直後が `(` なら `(n)` を解析して `Some(n)`、なければ `None`（Issue #1563）。
+///
+/// n は untrusted な SQL トークン。u32 をあふれる数字列も上限超過として扱い、0・上限
+/// （`MAX_CHAR_TYPE_LENGTH`）超過はともに `22023`。先頭ゼロ・小数・符号・空・閉じ括弧の欠落は
+/// NUMERIC・FLOAT と同じ `42601`。原文の数字列はエラーに反射しない。判定は構文段
+/// （書き込みトランザクション開始前・カタログ非参照）で行うため副作用はない。
+fn parse_optional_char_length(
+    tokens: &[Token],
+    pos: &mut usize,
+) -> Result<Option<u32>, SqlSurfaceError> {
+    if !matches!(tokens.get(*pos), Some(Token::Punct('('))) {
+        return Ok(None);
     }
-    Ok(())
+    *pos += 1;
+    let n = match tokens.get(*pos) {
+        Some(Token::Number(s)) => {
+            if !s.bytes().all(|b| b.is_ascii_digit()) || (s.len() > 1 && s.starts_with('0')) {
+                return Err(SqlSurfaceError::unsupported(
+                    "malformed length for character type".to_string(),
+                ));
+            }
+            s.parse::<u32>().unwrap_or(u32::MAX)
+        }
+        other => {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "expected a numeric literal, got {other:?}"
+            )));
+        }
+    };
+    *pos += 1;
+    expect_punct(tokens, pos, ')')?;
+    if n == 0 {
+        return Err(SqlSurfaceError::InvalidParameterValue {
+            detail: "length for type character must be at least 1",
+        });
+    }
+    if n > MAX_CHAR_TYPE_LENGTH {
+        return Err(SqlSurfaceError::InvalidParameterValue {
+            detail: "length for type character cannot exceed 10485760",
+        });
+    }
+    Ok(Some(n))
 }
 
 /// 配列サフィックスを除いた基本型名 1 個の解析（[`parse_column_type_name`] の下請け）。
@@ -445,22 +479,28 @@ fn parse_base_type_name(
             expect_punct(tokens, pos, ')')?;
             Ok(SqlColumnTypeName::Numeric { precision, scale })
         }
-        TypeNameKind::Unsettled { canonical } => Err(unsettled_type_error(canonical)),
         TypeNameKind::Varchar => {
-            reject_length_modifier(tokens, *pos)?;
-            Ok(alias_type(name, SqlColumnTypeName::Varchar))
+            let len = parse_optional_char_length(tokens, pos)?;
+            Ok(alias_type(name, SqlColumnTypeName::Varchar(len)))
         }
+        TypeNameKind::Char => match parse_optional_char_length(tokens, pos)? {
+            Some(n) => Ok(alias_type(name, SqlColumnTypeName::Bpchar(n))),
+            None => Err(bare_char_error()),
+        },
         TypeNameKind::Character => {
             let varying = matches!(
                 tokens.get(*pos),
                 Some(Token::Ident(s)) if s.eq_ignore_ascii_case("VARYING")
             );
-            if !varying {
-                return Err(unsettled_type_error("character"));
+            if varying {
+                *pos += 1;
+                let len = parse_optional_char_length(tokens, pos)?;
+                return Ok(SqlColumnTypeName::Varchar(len));
             }
-            *pos += 1;
-            reject_length_modifier(tokens, *pos)?;
-            Ok(SqlColumnTypeName::Varchar)
+            match parse_optional_char_length(tokens, pos)? {
+                Some(n) => Ok(alias_type(name, SqlColumnTypeName::Bpchar(n))),
+                None => Err(bare_char_error()),
+            }
         }
     }
 }
@@ -755,29 +795,71 @@ mod tests {
         ));
     }
 
+    /// 長さなしの `CHAR`／`CHARACTER` は引き続き `0A000`（Issue #1563 の対象外）。
     #[test]
-    fn unsettled_type_names_are_rejected_with_0a000_in_both_spellings() {
-        for raw in [
-            "VARCHAR(10)",
-            "varchar (10)",
-            "CHARACTER VARYING(10)",
-            "character varying(10)",
-            "VARCHAR(10)[]",
-            "CHAR",
-            "CHAR(1)",
-            "CHARACTER",
-            "CHARACTER(3)",
-        ] {
+    fn bare_char_is_rejected_with_0a000_in_both_spellings() {
+        for raw in ["CHAR", "char", "CHARACTER", "character"] {
             let e = parse_type(raw).expect_err(raw);
             assert_eq!(e.wire_code(), "0A000", "for {raw:?}");
         }
-        for (a, b) in [
-            ("VARCHAR(10)", "CHARACTER VARYING(10)"),
-            ("CHAR(1)", "CHARACTER(1)"),
+        let (ea, eb) = (
+            parse_type("CHAR").unwrap_err(),
+            parse_type("CHARACTER").unwrap_err(),
+        );
+        assert_eq!(ea.to_string(), eb.to_string());
+    }
+
+    /// `VARCHAR(n)`／`CHAR(n)` は両綴りとも受理する（Issue #1563）。
+    #[test]
+    fn length_modified_char_types_are_accepted() {
+        for (raw, want) in [
+            ("VARCHAR(10)", ColumnType::Varchar(Some(10))),
+            ("varchar (10)", ColumnType::Varchar(Some(10))),
+            ("CHARACTER VARYING(3)", ColumnType::Varchar(Some(3))),
+            (
+                "character varying(10485760)",
+                ColumnType::Varchar(Some(10_485_760)),
+            ),
+            ("CHAR(5)", ColumnType::Bpchar(5)),
+            ("CHARACTER(1)", ColumnType::Bpchar(1)),
         ] {
-            let (ea, eb) = (parse_type(a).unwrap_err(), parse_type(b).unwrap_err());
-            assert_eq!(ea.wire_code(), eb.wire_code());
-            assert_eq!(ea.to_string(), eb.to_string(), "{a} vs {b}");
+            let (ty, _) = parse_type(raw).expect(raw);
+            assert_eq!(
+                to_static_column_type(&ty).expect("static"),
+                StaticColumnType::Resolved(want),
+                "for {raw:?}"
+            );
+        }
+    }
+
+    /// n=0・上限超過・u32 あふれは `22023`、形式不正は `42601`、配列要素は `0A000`。
+    #[test]
+    fn char_length_out_of_range_is_22023_and_malformed_is_42601() {
+        for raw in [
+            "VARCHAR(0)",
+            "CHAR(0)",
+            "VARCHAR(10485761)",
+            "CHARACTER(4294967296)",
+            "CHARACTER VARYING(99999999999999999999)",
+        ] {
+            let e = parse_type(raw).expect_err(raw);
+            assert_eq!(e.wire_code(), "22023", "for {raw:?}");
+            assert!(!e.to_string().contains("9999"), "must not echo input");
+        }
+        for raw in [
+            "VARCHAR()",
+            "VARCHAR(01)",
+            "CHAR(1.5)",
+            "CHAR(-1)",
+            "VARCHAR(3",
+        ] {
+            let e = parse_type(raw).expect_err(raw);
+            assert_eq!(e.wire_code(), "42601", "for {raw:?}");
+        }
+        for raw in ["VARCHAR(3)[]", "CHAR(3)[]"] {
+            let (ty, _) = parse_type(raw).expect(raw);
+            let e = to_static_column_type(&ty).expect_err(raw);
+            assert_eq!(e.wire_code(), "0A000", "for {raw:?}");
         }
     }
 
@@ -810,12 +892,12 @@ mod tests {
         assert_eq!(alias_spelling(&ty), Some("VARCHAR"));
         assert_eq!(
             to_static_column_type(&ty).expect("static"),
-            StaticColumnType::Resolved(ColumnType::Varchar)
+            StaticColumnType::Resolved(ColumnType::Varchar(None))
         );
         for raw in ["CHARACTER VARYING", "character varying"] {
             let (ty, pos) = parse_type(raw).expect(raw);
             assert_eq!(pos, 2, "for {raw:?}");
-            assert_eq!(ty, SqlColumnTypeName::Varchar, "for {raw:?}");
+            assert_eq!(ty, SqlColumnTypeName::Varchar(None), "for {raw:?}");
         }
     }
 

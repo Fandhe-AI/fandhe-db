@@ -2420,7 +2420,7 @@ fn validate_set_assignments(
                     .map_err(TenantWriteError::Catalog)?;
             }
             (
-                crate::catalog::ColumnType::Text | crate::catalog::ColumnType::Varchar,
+                crate::catalog::ColumnType::Text | crate::catalog::ColumnType::Varchar(_),
                 crate::row_codec::Value::Text(t),
             ) => {
                 // SET 値の TEXT 長上限検証（対象行の探索より前に行う）。
@@ -2773,7 +2773,8 @@ fn validate_set_assignments(
             // ここでも再検査する（`schema.columns` の型検証と同じ設計）。
             (
                 crate::catalog::ColumnType::Text
-                | crate::catalog::ColumnType::Varchar
+                | crate::catalog::ColumnType::Varchar(_)
+                | crate::catalog::ColumnType::Bpchar(_)
                 | crate::catalog::ColumnType::SmallInt
                 | crate::catalog::ColumnType::Integer
                 | crate::catalog::ColumnType::BigInt
@@ -2811,7 +2812,8 @@ fn validate_set_assignments(
             }
             (crate::catalog::ColumnType::Vector(_), _)
             | (crate::catalog::ColumnType::Text, _)
-            | (crate::catalog::ColumnType::Varchar, _)
+            | (crate::catalog::ColumnType::Varchar(_), _)
+            | (crate::catalog::ColumnType::Bpchar(_), _)
             | (crate::catalog::ColumnType::SmallInt, _)
             | (crate::catalog::ColumnType::Integer, _)
             | (crate::catalog::ColumnType::BigInt, _)

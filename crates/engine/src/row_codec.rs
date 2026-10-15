@@ -1593,12 +1593,13 @@ pub fn encode_row(
                 buf.push(PRESENCE_NULL);
             }
             Value::Text(text) => {
-                if !column.ty.is_text_like() {
+                if !is_text_frame_type(&column.ty) {
                     return Err(RowCodecError::Invalid(format!(
                         "column {:?} expects a non-Text value, got Text",
                         column.name
                     )));
                 }
+                check_varchar_length(column, text)?;
                 let text_bytes = text.as_bytes();
                 let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
                     RowCodecError::Invalid(format!(
@@ -1661,7 +1662,8 @@ pub fn encode_row(
                 let def = match &column.ty {
                     ColumnType::Enum(def) => def,
                     ColumnType::Text
-                    | ColumnType::Varchar
+                    | ColumnType::Varchar(_)
+                    | ColumnType::Bpchar(_)
                     | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
@@ -1705,7 +1707,8 @@ pub fn encode_row(
                 let expected_dim = match &column.ty {
                     ColumnType::Vector(dim) => *dim,
                     ColumnType::Text
-                    | ColumnType::Varchar
+                    | ColumnType::Varchar(_)
+                    | ColumnType::Bpchar(_)
                     | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
@@ -1813,7 +1816,8 @@ pub fn encode_row(
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
                     ColumnType::Text
-                    | ColumnType::Varchar
+                    | ColumnType::Varchar(_)
+                    | ColumnType::Bpchar(_)
                     | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
@@ -1873,7 +1877,8 @@ pub fn encode_row(
                         scale
                     }
                     ColumnType::Text
-                    | ColumnType::Varchar
+                    | ColumnType::Varchar(_)
+                    | ColumnType::Bpchar(_)
                     | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
@@ -2091,7 +2096,10 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                 values.push(Value::Null);
             }
             PRESENCE_VALUE => match &column.ty {
-                ColumnType::Text | ColumnType::Varchar | ColumnType::Enum(_) => {
+                ColumnType::Text
+                | ColumnType::Varchar(_)
+                | ColumnType::Bpchar(_)
+                | ColumnType::Enum(_) => {
                     let len_bytes = buf
                         .get(
                             offset..offset.checked_add(4).ok_or_else(|| {
@@ -2621,12 +2629,13 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.push(PRESENCE_NULL);
             }
             Value::Text(text) => {
-                if !column.ty.is_text_like() {
+                if !is_text_frame_type(&column.ty) {
                     return Err(RowCodecError::Invalid(format!(
                         "column {:?} expects a non-Text value, got Text",
                         column.name
                     )));
                 }
+                check_varchar_length(column, text)?;
                 let text_bytes = text.as_bytes();
                 let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
                     RowCodecError::Invalid(format!(
@@ -2688,7 +2697,8 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 let def = match &column.ty {
                     ColumnType::Enum(def) => def,
                     ColumnType::Text
-                    | ColumnType::Varchar
+                    | ColumnType::Varchar(_)
+                    | ColumnType::Bpchar(_)
                     | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
@@ -2807,7 +2817,8 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
                     ColumnType::Text
-                    | ColumnType::Varchar
+                    | ColumnType::Varchar(_)
+                    | ColumnType::Bpchar(_)
                     | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
@@ -2884,7 +2895,8 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 let (precision, scale) = match column.ty {
                     ColumnType::Numeric { precision, scale } => (precision, scale),
                     ColumnType::Text
-                    | ColumnType::Varchar
+                    | ColumnType::Varchar(_)
+                    | ColumnType::Bpchar(_)
                     | ColumnType::SmallInt
                     | ColumnType::Integer
                     | ColumnType::BigInt
@@ -2933,6 +2945,37 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
     Ok(buf)
 }
 
+/// 行バイト列上 TEXT フレームで格納する列型か（`Text`／`Varchar`／`Bpchar`）。
+/// `Bpchar` は SQL 束縛段が非 NULL 書き込みを `0A000` で塞ぐ間（Issue #1566 まで）も、
+/// codec 自体は後続 Issue が触らずに済むよう Text フレームを受理する（長さは
+/// [`check_varchar_length`] が n 以下に制限する）。
+fn is_text_frame_type(ty: &ColumnType) -> bool {
+    ty.is_text_like() || matches!(ty, ColumnType::Bpchar(_))
+}
+
+/// `VARCHAR(n)`／`CHAR(n)` 列への書き込みで、文字数（バイト数ではない）が n を超える値を
+/// 拒否する（TABLE-31・Issue #1563）。SQL・COPY・NoSQL・UPSERT・INSERT…SELECT・
+/// FK CASCADE の書き込みはすべて encode 系を通るため、ここが長さ超過を永続化させない
+/// 単一のチョークポイントになる。束縛段での `22001` 分類と末尾空白の切り詰め許容は
+/// Issue #1564 の担当で、それまでは `RowCodecError::Invalid` として fail-closed に拒否する。
+/// エラーには列名だけを含め、値は反射しない。
+fn check_varchar_length(column: &crate::catalog::ColumnDef, text: &str) -> Result<()> {
+    let n = match &column.ty {
+        ColumnType::Varchar(Some(n)) | ColumnType::Bpchar(n) => *n,
+        _ => return Ok(()),
+    };
+    // 文字数が n を超えうるのはバイト数が n を超える場合のみ。巨大文字列の全走査を避け、
+    // n+1 文字目の有無だけを調べる。
+    let limit = usize::try_from(n).unwrap_or(usize::MAX);
+    if text.len() > limit && text.chars().nth(limit).is_some() {
+        return Err(RowCodecError::Invalid(format!(
+            "value too long for column {:?} of type character({n})",
+            column.name
+        )));
+    }
+    Ok(())
+}
+
 /// `JSON`／`JSONB` 列の値検証（列型に応じた [`crate::json::validate_json_column_text`]／
 /// [`crate::json::canonicalize_jsonb_text`] の呼び分け）を [`encode_json_value`]・
 /// [`encode_scalar_columns`]・[`merge_encode_scalar_columns`] の 3 箇所で共有する。
@@ -2955,7 +2998,8 @@ fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) ->
             }
         }
         ColumnType::Text
-        | ColumnType::Varchar
+        | ColumnType::Varchar(_)
+        | ColumnType::Bpchar(_)
         | ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
@@ -3131,12 +3175,13 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_NULL);
                 }
                 Value::Text(text) => {
-                    if !column.ty.is_text_like() {
+                    if !is_text_frame_type(&column.ty) {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Text value, got Text",
                             column.name
                         )));
                     }
+                    check_varchar_length(column, text)?;
                     write_text(&mut buf, &mut reserve, text.as_bytes())?;
                 }
                 Value::Real(v) => {
@@ -3181,7 +3226,8 @@ pub(crate) fn merge_encode_scalar_columns(
                     let def = match &column.ty {
                         ColumnType::Enum(def) => def,
                         ColumnType::Text
-                        | ColumnType::Varchar
+                        | ColumnType::Varchar(_)
+                        | ColumnType::Bpchar(_)
                         | ColumnType::SmallInt
                         | ColumnType::Integer
                         | ColumnType::BigInt
@@ -3289,7 +3335,8 @@ pub(crate) fn merge_encode_scalar_columns(
                     let array_ty = match &column.ty {
                         ColumnType::Array(array_ty) => array_ty,
                         ColumnType::Text
-                        | ColumnType::Varchar
+                        | ColumnType::Varchar(_)
+                        | ColumnType::Bpchar(_)
                         | ColumnType::SmallInt
                         | ColumnType::Integer
                         | ColumnType::BigInt
@@ -3329,7 +3376,8 @@ pub(crate) fn merge_encode_scalar_columns(
                     let (precision, scale) = match column.ty {
                         ColumnType::Numeric { precision, scale } => (precision, scale),
                         ColumnType::Text
-                        | ColumnType::Varchar
+                        | ColumnType::Varchar(_)
+                        | ColumnType::Bpchar(_)
                         | ColumnType::SmallInt
                         | ColumnType::Integer
                         | ColumnType::BigInt
@@ -3392,7 +3440,7 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_NULL);
                 }
                 Some(ScalarRef::Text(text)) => {
-                    if !column.ty.is_text_like() {
+                    if !is_text_frame_type(&column.ty) {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Text existing value, got Text",
                             column.name
@@ -3740,7 +3788,7 @@ pub(crate) fn default_scalar<'a>(
         }
     }
     match (default, ty) {
-        (ColumnDefault::Text(s), ColumnType::Text | ColumnType::Varchar) => {
+        (ColumnDefault::Text(s), ColumnType::Text | ColumnType::Varchar(_)) => {
             Ok(ScalarRef::Text(s.as_str()))
         }
         (ColumnDefault::Number(n), ColumnType::SmallInt) => n
@@ -4141,7 +4189,8 @@ fn scan_scalar_columns_validated<'a>(
                     }
                 }
                 ColumnType::Text
-                | ColumnType::Varchar
+                | ColumnType::Varchar(_)
+                | ColumnType::Bpchar(_)
                 | ColumnType::Vector(_)
                 | ColumnType::Enum(_) => {
                     let len_bytes = buf

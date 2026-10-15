@@ -357,7 +357,7 @@ pub fn map_json_to_literal(
     // いた。契約確定までは安全側として従来の拒否を維持し、他の型
     // （nullable 判定を `bind_update` へ委譲する設計自体）には影響しない。
     match (&column.ty, raw) {
-        (ColumnType::Text | ColumnType::Varchar, JsonValue::Null) => {
+        (ColumnType::Text | ColumnType::Varchar(_), JsonValue::Null) => {
             return Err(TypedJsonError::LegacyMismatch(
                 "TEXT column value must be a JSON string",
             ))
@@ -375,12 +375,16 @@ pub fn map_json_to_literal(
     match &column.ty {
         // TEXT は Issue #896 以前から対応済みの旧来型のため、値・型不一致は
         // `LegacyMismatch`（`22000`）のまま維持する（`nosql-api.md` の既存契約）。
-        ColumnType::Text | ColumnType::Varchar => match raw {
+        ColumnType::Text | ColumnType::Varchar(_) => match raw {
             JsonValue::String(s) => Ok(InsertLiteral::String(s.clone())),
             _ => Err(TypedJsonError::LegacyMismatch(
                 "TEXT column value must be a JSON string",
             )),
         },
+        // CHAR(n) の NoSQL 型束縛は bpchar の意味論（Issue #1566）まで fail-closed に拒否する。
+        ColumnType::Bpchar(_) => Err(TypedJsonError::TypeMismatch(
+            "CHAR column is not supported on the NoSQL surface yet",
+        )),
         ColumnType::Boolean => match raw {
             JsonValue::Bool(b) => Ok(InsertLiteral::Bool(*b)),
             _ => Err(TypedJsonError::TypeMismatch(
