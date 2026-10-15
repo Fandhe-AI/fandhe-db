@@ -2443,8 +2443,15 @@ fn validate_set_assignments(
                 // （Issue #1563・codex-review P1 指摘）。
                 // 束縛段（`sql::parser::bind_text_literal`）が正規化済みのため、ここは
                 // Rust API 直呼びに対する多層防御（`22001`。Issue #1564）。
-                crate::row_codec::fit_char_length(&column.ty, t)
+                // 切り詰め結果は破棄せず、正規化前の値が codec と同じ厳格判定を通ることまで
+                // 要求する（末尾空白超過の未正規化値も探索前に一律拒否。fail-closed）。
+                let fitted = crate::row_codec::fit_char_length(&column.ty, t)
                     .map_err(|e| TenantWriteError::SetExpressionEvaluationFailed(e.into()))?;
+                if fitted.len() != t.len() {
+                    crate::row_codec::check_varchar_length(column, t).map_err(|e| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(e.to_string()))
+                    })?;
+                }
                 let text_len = u32::try_from(t.len()).map_err(|_| {
                     TenantWriteError::Catalog(CatalogError::Invalid(format!(
                         "text field too long: {} bytes",
@@ -8225,6 +8232,54 @@ mod tests {
             "台帳が巻き戻っていること: {retry:?}"
         );
         assert_eq!(embedding_of(&storage, &ctx, 1), Some(vec![5.0, 5.0]));
+    }
+
+    // Issue #1564: 束縛段を経由しない未正規化の VARCHAR(3) 値は、対象行の有無に関わらず
+    // 探索前に拒否される（UPDATE 0 成功・operation_id 消費に分岐させない）。
+    #[test]
+    fn update_rejects_unnormalized_varchar_before_row_lookup_without_consuming_op() {
+        let path = unique_db_path("update-varchar-unnormalized");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let table = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("name", ColumnType::Varchar(Some(3)), true),
+            ],
+        );
+        storage.create_table(&table).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op = OperationId::parse("test-op-upd-varchar").expect("valid operation_id");
+        let assignments = [(1usize, crate::row_codec::Value::Text("abc ".to_string()))];
+        let run = || {
+            update_row_columns_capturing_unchecked(
+                WriteTarget::Autocommit(&storage),
+                "docs",
+                &ctx,
+                42,
+                &assignments,
+                &[],
+                LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
+                None,
+                None,
+            )
+        };
+        assert!(run().is_err(), "未正規化値は対象行なしでも拒否");
+        // 拒否は operation_id を消費しない: 同じ id で正規化済み値の更新が成功扱いで通る。
+        let ok = [(1usize, crate::row_codec::Value::Text("abc".to_string()))];
+        let result = update_row_columns_capturing_unchecked(
+            WriteTarget::Autocommit(&storage),
+            "docs",
+            &ctx,
+            42,
+            &ok,
+            &[],
+            LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
+            None,
+            None,
+        );
+        assert!(matches!(result, Ok(0)), "op 未消費: {result:?}");
     }
 
     #[test]
