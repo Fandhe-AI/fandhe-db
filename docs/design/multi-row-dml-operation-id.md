@@ -238,8 +238,8 @@ origin/main 取り込み時の是正: 並行実装していた Issue #921 のタ
 
 - `DateLiteral(days)`＝タグ 10・型バイト `0`・`days`（`i32`、LE）
 - `TimestampLiteral(micros)`＝タグ 10・型バイト `1`・`micros`（`i64`、LE）
-- `JsonAccess{op, lhs, rhs}`＝タグ 12・演算子種別 1 バイト（`->`=1・`->>`=2・`#>`=3・`#>>`=4）・
-  `lhs`・`rhs`（Issue #1596。既存タグは不変）
+- `JsonAccess{op, lhs, rhs}`＝タグ 12・演算子種別 1 バイト（`->`=1・`->>`=2・`#>`=3・`#>>`=4・
+  `@>`=5・`<@`=6・`?`=7・`?|`=8・`?&`=9）・`lhs`・`rhs`（Issue #1596・#1598。既存の種別は不変）
 - 予約: タグ 13＝時刻値関数のキーワード形（Issue #1585 の設計。導入は #1586。
   [now-evaluated-value-ledger.md](now-evaluated-value-ledger.md)）
 

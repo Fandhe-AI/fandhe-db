@@ -17,7 +17,7 @@
 //! を拒否）。[`JsonError`] は [`crate::error_format::ClassifiedError`] を実装し、
 //! `wire_code()` で `42601`（`UnsupportedSqlSyntax`）を返す。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::error_format::{ClassifiedError, ErrorClass};
 
@@ -1195,6 +1195,196 @@ pub(crate) fn jsonb_access_path(
     }
     Ok(render_access_result(cur, as_text))
 }
+// ---- jsonb の包含・存在演算子（Issue #1598・TABLE-25 ポインタ）----
+
+/// 包含判定（`@>`／`<@`）の評価ステップ上限。容器 × 容器の総当たりが入力長の
+/// 二乗に膨らむ DoS を防ぐ天井で、超過は `TooLong`（`54000`）へ写像される。
+/// 深さ（[`MAX_JSON_DEPTH`]）・要素数（[`MAX_JSON_CONTAINER_ITEMS`]）の既存上限の
+/// 範囲では、スカラー要素は `HashSet` 引きで線形、容器要素のみが総当たりになる。
+pub(crate) const MAX_JSONB_CONTAINMENT_STEPS: usize = 4_000_000;
+
+/// 評価ステップの残量。`charge` が残量を超える課金を `TooLong` にする。
+struct ContainmentBudget {
+    remaining: usize,
+}
+
+impl ContainmentBudget {
+    fn charge(&mut self, n: usize) -> Result<(), JsonColumnError> {
+        self.remaining = self
+            .remaining
+            .checked_sub(n)
+            .ok_or(JsonColumnError::TooLong)?;
+        Ok(())
+    }
+}
+
+fn is_json_container(v: &JsonValue) -> bool {
+    matches!(v, JsonValue::Array(_) | JsonValue::Object(_))
+}
+
+/// スカラーの等価キー。数値は表記（`1`／`1.0`／`10e-1`）に依らず値で等しくなる
+/// （[`canonical_equality_text`] と同じ正規化。構造的な `==` は使わない）。
+fn scalar_equality_key(v: &JsonValue) -> Result<String, JsonColumnError> {
+    let mut out = String::new();
+    write_equality_canonical(v, &mut out)?;
+    Ok(out)
+}
+
+/// 同種の容器同士の包含（PostgreSQL の JsonbDeepContains に相当）。種別が異なれば false。
+fn deep_contains(
+    lhs: &JsonValue,
+    rhs: &JsonValue,
+    budget: &mut ContainmentBudget,
+) -> Result<bool, JsonColumnError> {
+    budget.charge(1)?;
+    match (lhs, rhs) {
+        (JsonValue::Object(l), JsonValue::Object(r)) => {
+            for (k, rv) in r {
+                budget.charge(1)?;
+                let Some(lv) = l.get(k) else {
+                    return Ok(false);
+                };
+                let ok = match (lv, rv) {
+                    (JsonValue::Array(_), JsonValue::Array(_))
+                    | (JsonValue::Object(_), JsonValue::Object(_)) => {
+                        deep_contains(lv, rv, budget)?
+                    }
+                    _ if is_json_container(lv) || is_json_container(rv) => false,
+                    _ => scalar_equality_key(lv)? == scalar_equality_key(rv)?,
+                };
+                if !ok {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (JsonValue::Array(l), JsonValue::Array(r)) => array_contains(l, r, budget),
+        _ => Ok(false),
+    }
+}
+
+/// 配列 ⊇ 配列。順序・重複は無視し、スカラーは左辺の同じ段のスカラー、容器は左辺の
+/// 同じ段の同種の容器のいずれかに（再帰的に）含まれることを要求する。
+fn array_contains(
+    l: &[JsonValue],
+    r: &[JsonValue],
+    budget: &mut ContainmentBudget,
+) -> Result<bool, JsonColumnError> {
+    let mut scalars: Option<HashSet<String>> = None;
+    for rv in r {
+        budget.charge(1)?;
+        if is_json_container(rv) {
+            let mut found = false;
+            for lv in l {
+                budget.charge(1)?;
+                if std::mem::discriminant(lv) == std::mem::discriminant(rv)
+                    && deep_contains(lv, rv, budget)?
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Ok(false);
+            }
+        } else {
+            if scalars.is_none() {
+                budget.charge(l.len())?;
+                let mut set = HashSet::new();
+                for lv in l.iter().filter(|v| !is_json_container(v)) {
+                    set.insert(scalar_equality_key(lv)?);
+                }
+                scalars = Some(set);
+            }
+            let key = scalar_equality_key(rv)?;
+            if !scalars.as_ref().is_some_and(|set| set.contains(&key)) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn parse_jsonb_operand(s: &str) -> Result<JsonValue, JsonColumnError> {
+    if s.len() > MAX_JSON_FIELD_LEN {
+        return Err(JsonColumnError::TooLong);
+    }
+    parse_json(s).map_err(|_| JsonColumnError::Invalid)
+}
+
+/// `container @> contained`（`<@` は呼び出し側が左右を入れ替える）。最上位の例外
+/// （配列 ⊇ スカラーは `[scalar]` とみなす。逆向きは false）を含む。呼び出し元は
+/// `sql::udf_call::eval_json_predicate`。ステップ上限超過は `TooLong`。
+pub(crate) fn jsonb_contains(container: &str, contained: &str) -> Result<bool, JsonColumnError> {
+    jsonb_contains_with_limit(container, contained, MAX_JSONB_CONTAINMENT_STEPS)
+}
+
+fn jsonb_contains_with_limit(
+    container: &str,
+    contained: &str,
+    max_steps: usize,
+) -> Result<bool, JsonColumnError> {
+    let l = parse_jsonb_operand(container)?;
+    let r = parse_jsonb_operand(contained)?;
+    let mut budget = ContainmentBudget {
+        remaining: max_steps,
+    };
+    match (&l, &r) {
+        (JsonValue::Object(_), JsonValue::Object(_))
+        | (JsonValue::Array(_), JsonValue::Array(_)) => deep_contains(&l, &r, &mut budget),
+        (JsonValue::Object(_), _) | (_, JsonValue::Object(_)) => Ok(false),
+        // 左辺が配列で右辺がスカラー: 右辺を単要素配列とみなす。
+        (JsonValue::Array(items), scalar) => {
+            array_contains(items, std::slice::from_ref(scalar), &mut budget)
+        }
+        // 左辺がスカラーで右辺が配列は成り立たない。スカラー同士は値の等価。
+        (_, JsonValue::Array(_)) => Ok(false),
+        (a, b) => Ok(scalar_equality_key(a)? == scalar_equality_key(b)?),
+    }
+}
+
+/// 最上位のキー集合（オブジェクトのキー・配列の文字列要素・最上位が文字列スカラー
+/// ならその値。値・入れ子のキーは対象外）。`?`／`?|`／`?&` が共有する。
+fn top_level_key_set(v: &JsonValue) -> HashSet<&str> {
+    match v {
+        JsonValue::Object(map) => map.keys().map(String::as_str).collect(),
+        JsonValue::Array(items) => items
+            .iter()
+            .filter_map(|i| match i {
+                JsonValue::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect(),
+        JsonValue::String(s) => std::iter::once(s.as_str()).collect(),
+        _ => HashSet::new(),
+    }
+}
+
+/// `stored ? key`。
+pub(crate) fn jsonb_exists(stored: &str, key: &str) -> Result<bool, JsonColumnError> {
+    let v = parse_jsonb_operand(stored)?;
+    Ok(top_level_key_set(&v).contains(key))
+}
+
+/// `stored ?| keys`。`keys` の NULL 要素は読み飛ばす。空（または NULL のみ）は false。
+pub(crate) fn jsonb_exists_any(
+    stored: &str,
+    keys: &[Option<String>],
+) -> Result<bool, JsonColumnError> {
+    let v = parse_jsonb_operand(stored)?;
+    let set = top_level_key_set(&v);
+    Ok(keys.iter().flatten().any(|k| set.contains(k.as_str())))
+}
+
+/// `stored ?& keys`。`keys` の NULL 要素は読み飛ばす。空（または NULL のみ）は true。
+pub(crate) fn jsonb_exists_all(
+    stored: &str,
+    keys: &[Option<String>],
+) -> Result<bool, JsonColumnError> {
+    let v = parse_jsonb_operand(stored)?;
+    let set = top_level_key_set(&v);
+    Ok(keys.iter().flatten().all(|k| set.contains(k.as_str())))
+}
 
 // ---- jsonb の全順序（Issue #1597・TABLE-25 ポインタ）----
 
@@ -1379,6 +1569,82 @@ fn sk_push_number(n: &JsonNumber, out: &mut Vec<u8>, limit: usize) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contains(a: &str, b: &str) -> bool {
+        jsonb_contains(a, b).unwrap()
+    }
+
+    #[test]
+    fn jsonb_contains_postgres_rules() {
+        assert!(contains("[1,2,3]", "[1,3]"));
+        assert!(contains("[1,2,3]", "[3,1]"));
+        assert!(contains("[1,2,3]", "[1,2,2]"));
+        assert!(!contains("[1,2,[1,3]]", "[1,3]"));
+        assert!(contains("[1,2,[1,3]]", "[[1,3]]"));
+        assert!(contains(
+            r#"{"product":"PostgreSQL","version":9.4,"jsonb":true}"#,
+            r#"{"version":9.4}"#
+        ));
+        assert!(!contains(r#"{"foo":{"bar":"baz"}}"#, r#"{"bar":"baz"}"#));
+        assert!(contains(r#"{"foo":{"bar":"baz"}}"#, r#"{"foo":{}}"#));
+        // 最上位の例外
+        assert!(contains(r#"["foo","bar"]"#, r#""bar""#));
+        assert!(!contains(r#""bar""#, r#"["bar"]"#));
+        assert!(contains(r#""foo""#, r#""foo""#));
+        assert!(!contains(r#""foo""#, r#""bar""#));
+        // 種別違い・入れ子
+        assert!(!contains(r#"{"a":[1,2]}"#, r#"{"a":1}"#));
+        assert!(contains(r#"[{"a":1,"b":2}]"#, r#"[{"a":1}]"#));
+        assert!(!contains(r#"[{"a":1}]"#, r#"[{"a":2}]"#));
+        // 空
+        assert!(contains("{}", "{}"));
+        assert!(contains("[1]", "[]"));
+        assert!(contains(r#"{"a":1}"#, "{}"));
+        assert!(!contains("[]", "{}"));
+        assert!(!contains("{}", "[]"));
+        assert!(!contains("[1]", "{}"));
+        // 数値の等価
+        assert!(contains("[1]", "[1.0]"));
+        assert!(contains(r#"{"a":1}"#, r#"{"a":10e-1}"#));
+        // null と配列内スカラーの段
+        assert!(contains("[null,1]", "[null]"));
+        assert!(!contains("[[1]]", "[1]"));
+    }
+
+    #[test]
+    fn jsonb_contains_step_limit_maps_to_too_long() {
+        let big = format!("[{}]", vec!["[1]"; 200].join(","));
+        let needle = format!("[{}]", vec!["[2]"; 200].join(","));
+        let err = jsonb_contains_with_limit(&big, &needle, 100).unwrap_err();
+        assert_eq!(err, JsonColumnError::TooLong);
+        assert!(!jsonb_contains_with_limit("[1]", "[2]", 50).unwrap());
+    }
+
+    #[test]
+    fn jsonb_contains_rejects_invalid_stored_value() {
+        assert_eq!(jsonb_contains("{", "{}"), Err(JsonColumnError::Invalid));
+    }
+
+    #[test]
+    fn jsonb_exists_family_postgres_rules() {
+        assert!(jsonb_exists(r#"["foo","bar","baz"]"#, "bar").unwrap());
+        assert!(jsonb_exists(r#"{"foo":"bar"}"#, "foo").unwrap());
+        assert!(!jsonb_exists(r#"{"foo":"bar"}"#, "bar").unwrap());
+        assert!(!jsonb_exists(r#"{"foo":{"bar":"baz"}}"#, "bar").unwrap());
+        assert!(jsonb_exists(r#""foo""#, "foo").unwrap());
+        assert!(!jsonb_exists("[1]", "1").unwrap());
+        let k = |v: &[Option<&str>]| -> Vec<Option<String>> {
+            v.iter().map(|o| o.map(str::to_string)).collect()
+        };
+        let doc = r#"{"a":1,"b":2}"#;
+        assert!(jsonb_exists_any(doc, &k(&[Some("b"), Some("c")])).unwrap());
+        assert!(!jsonb_exists_any(doc, &k(&[Some("c"), None])).unwrap());
+        assert!(!jsonb_exists_any(doc, &k(&[])).unwrap());
+        assert!(jsonb_exists_all(doc, &k(&[Some("a"), Some("b")])).unwrap());
+        assert!(!jsonb_exists_all(doc, &k(&[Some("a"), Some("c")])).unwrap());
+        assert!(jsonb_exists_all(doc, &k(&[Some("a"), None])).unwrap());
+        assert!(jsonb_exists_all(doc, &k(&[])).unwrap());
+    }
 
     #[test]
     fn jsonb_access_key_index_and_text_semantics() {
