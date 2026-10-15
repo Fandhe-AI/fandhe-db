@@ -162,6 +162,16 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
                 Err(SqlSurfaceError::UndefinedColumn { name: name.clone() })
             }
         }
+        // SQL-37（Issue #1586）: 現在時刻関数は書き込み側の台帳 v3（#2188）・INSERT 系ハッシュ
+        // （#1587）が揃うまで定数式（INSERT VALUES 等）で受理しない（`42601`）。
+        Expr::ValueFunction { .. } => Err(SqlSurfaceError::unsupported(
+            "volatile or session-dependent value is not allowed in a constant expression",
+        )),
+        Expr::Call { name, .. } if crate::sql::udf_call::is_current_time_function_name(name) => {
+            Err(SqlSurfaceError::unsupported(
+                "volatile or session-dependent value is not allowed in a constant expression",
+            ))
+        }
         Expr::Call { args, .. } => args.iter().try_for_each(prescan),
         Expr::Binary { lhs, rhs, .. }
         | Expr::NullIf(lhs, rhs)
@@ -206,7 +216,8 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::Null
         | Expr::Ident(_)
         | Expr::DateLiteral(_)
-        | Expr::TimestampLiteral(_) => Ok(()),
+        | Expr::TimestampLiteral(_)
+        | Expr::ValueFunction { .. } => Ok(()),
         Expr::Call { args, .. } => {
             args.iter().try_for_each(check_intermediate_precision)?;
             check_node_value(expr, true)

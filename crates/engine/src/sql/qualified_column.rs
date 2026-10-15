@@ -164,6 +164,11 @@ pub(crate) fn normalize_single_table_qualifiers(
                 }
                 *slot = if leaf {
                     Token::QuotedBoolWord(name.clone())
+                } else if crate::sql::lexer::is_value_function_keyword(name) {
+                    // `t.current_date` は列参照。`Ident` に落とすと式項で値関数
+                    // （今日の日付）へ化けるため、引用付き相当の `QuotedNull` を保つ
+                    // （SQL-37・Issue #1586。`Parser::new` が位置を記録し列参照として扱う）。
+                    Token::QuotedNull(name.clone())
                 } else {
                     Token::Ident(name.clone())
                 };

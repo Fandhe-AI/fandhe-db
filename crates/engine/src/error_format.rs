@@ -285,7 +285,8 @@ define_error_classes! {
     /// 演算子・関数引数、WHERE／filter の非 bool。Issue #1186）を共有する。
     /// [`crate::sql::allowlist::SqlSurfaceError::DatatypeMismatch`] の写像。
     DatatypeMismatch => ("42804", "DATATYPE_MISMATCH"),
-    /// 未知関数の呼び出し・未実装の非決定的関数（`now()` 等）・`DATE`／`TIMESTAMP`
+    /// 未知関数の呼び出し・未実装の非決定的関数（`random()` 等）・現在時刻関数への引数指定
+    /// （`now(1)`）・`DATE`／`TIMESTAMP`
     /// に対する `SUM`／`AVG`（`42883`。SQL-26・TABLE-13・ERR-6、Issue #1186）。
     /// [`crate::sql::allowlist::SqlSurfaceError::UndefinedFunction`] の写像。
     UndefinedFunction => ("42883", "UNDEFINED_FUNCTION"),

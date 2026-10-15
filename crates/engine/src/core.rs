@@ -1610,6 +1610,47 @@ pub enum ParsedSql {
     DropType(crate::sql::allowlist::ValidatedDropType),
 }
 
+/// 読み取り文（[`ParsedSql::Statement`]）だけが現在時刻関数を受理する束縛スコープを開く
+/// （SQL-37・Issue #1586。許可リスト型の fail-closed）。`txn_start_micros` は `Active`
+/// トランザクション中のトランザクション開始時刻（`None` は autocommit・Describe で、文の
+/// 開始時刻と同値）。INSERT／UPDATE／DELETE／COPY／DDL／カーソル等は `None` を返し、束縛が
+/// 時刻関数を `0A000`（定数式は `42601`）で拒否する。`ParsedSql` を網羅 `match` にして
+/// variant 追加時に判定漏れをコンパイルエラーで検出する。
+fn read_statement_clock_scope(
+    parsed: &ParsedSql,
+    txn_start_micros: Option<i64>,
+) -> Result<Option<crate::sql::time_fn::ClockScope>, crate::sql::allowlist::SqlSurfaceError> {
+    let is_read = match parsed {
+        ParsedSql::Statement(_) => true,
+        ParsedSql::Insert(_)
+        | ParsedSql::Truncate(_)
+        | ParsedSql::Delete(_)
+        | ParsedSql::Update(_)
+        | ParsedSql::Transaction(_)
+        | ParsedSql::DropTable(_)
+        | ParsedSql::CreateTable(_)
+        | ParsedSql::Cursor(_)
+        | ParsedSql::Partitioned(_)
+        | ParsedSql::AlterTable(_)
+        | ParsedSql::CreateView(_)
+        | ParsedSql::DropView(_)
+        | ParsedSql::CreateIndex(_)
+        | ParsedSql::DropIndex(_)
+        | ParsedSql::CreateType(_)
+        | ParsedSql::DropType(_) => false,
+    };
+    if !is_read {
+        return Ok(None);
+    }
+    let stmt_start_micros = crate::sql::time_fn::now_micros()?;
+    Ok(Some(crate::sql::time_fn::ClockScope::enter(
+        crate::sql::time_fn::StatementClock {
+            txn_start_micros: txn_start_micros.unwrap_or(stmt_start_micros),
+            stmt_start_micros,
+        },
+    )))
+}
+
 /// `read_txn`（確定済みスナップショットまたは明示トランザクションの書き込み
 /// トランザクション。[`crate::storage::read_source::ReadSource`]）から `table_name` の
 /// スキーマを取得する（[`EngineCore::read_txn_with_schema`] とエラー分類を共有する
@@ -4202,6 +4243,9 @@ impl EngineCore {
         session: &mut crate::sql::mode::SessionState,
         parsed: &ParsedSql,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // SQL-37（Issue #1586）: autocommit の読み取り文は文の開始時刻を `now()` 系の
+        // 値として確定する（`now()` と `statement_timestamp()` は同値）。
+        let _clock_scope = read_statement_clock_scope(parsed, None)?;
         match parsed {
             ParsedSql::Insert(stmt) => {
                 // Issue #933: Parse 時点のスキーマキャッシュ（`InsertSchemaLookup`）
@@ -4582,6 +4626,18 @@ impl EngineCore {
         parsed: &ParsedSql,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{SqlSurfaceError, Statement};
+
+        // SQL-37（Issue #1586）: 読み取り文は文の開始時刻とトランザクション開始時刻を確定する
+        // （`Active` なのに開始時刻が無い場合は fail-closed の `Internal`）。
+        let _clock_scope = read_statement_clock_scope(
+            parsed,
+            Some(
+                txn.txn_start_micros()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?,
+            ),
+        )?;
 
         // 注意（Issue #1182・#1272）: 明示トランザクション内の `RETURNING` は `INSERT`
         // （単一行・複数行）・`DELETE`・`UPDATE`（単一行・述語形）・UPSERT に対応する
@@ -5073,6 +5129,9 @@ impl EngineCore {
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
         use crate::sql::allowlist::{DeleteStatement, Statement, ValidatedUpdateForm};
+
+        // SQL-37（Issue #1586）: Describe も読み取り文の束縛を通る（値は型決定にしか使わない）。
+        let _clock_scope = read_statement_clock_scope(parsed, None)?;
 
         match parsed {
             ParsedSql::Insert(stmt) => {

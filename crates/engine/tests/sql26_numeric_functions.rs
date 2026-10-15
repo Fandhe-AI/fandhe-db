@@ -313,7 +313,7 @@ fn argument_type_mismatch_is_rejected_with_42804() {
 }
 
 #[test]
-fn calling_a_non_deterministic_function_is_rejected() {
+fn calling_an_unknown_non_deterministic_function_is_rejected() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
@@ -321,9 +321,9 @@ fn calling_a_non_deterministic_function_is_rejected() {
         .execute_sql_in_session(
             &ctx,
             &mut session,
-            "SELECT now() FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
+            "SELECT random() FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
         )
-        .expect_err("now() must be rejected (non-deterministic function)");
+        .expect_err("random() must be rejected (non-deterministic function)");
     assert_eq!(err.wire_code(), "42883");
 }
 
@@ -351,27 +351,29 @@ fn defining_a_udf_named_after_a_numeric_builtin_is_rejected() {
 }
 
 #[test]
-fn defining_and_calling_a_udf_named_after_a_non_deterministic_function_succeeds() {
-    // PR #1107 codex-review P1 是正: `now` 等の名前を UDF 予約名に含めると、
-    // これらの名前で登録・呼び出しできていた既存の宣言的 UDF が登録時に
-    // 拒否される破壊的変更になっていた。本 PR（数値関数のみ）は非決定的関数の
-    // 実装を含まないため予約化の理由がなく、従来どおり登録・呼び出しできる
-    // ことを固定する（予約化自体は日時スカラー関数群の後続作業で判断する。
-    // `docs/design/numeric-scalar-functions.md`「スコープ外・後続課題」参照）。
+fn defining_and_calling_a_udf_named_after_an_unimplemented_non_deterministic_function_succeeds() {
+    // PR #1107 codex-review P1 是正の維持: 未実装の非決定的関数名（`random`）は予約名に含めず、
+    // 従来どおり UDF として登録・呼び出せる。`now` は Issue #1586（SQL-37）で現在時刻関数
+    // （組み込み）になったため予約名となり、同名 UDF の定義は `42723`（BREAKING）。
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
 
-    core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION now(x) AS x")
-        .expect("CREATE FUNCTION now should succeed (not reserved by this Issue)");
+    let err = core
+        .execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION now(x) AS x")
+        .expect_err("now is reserved since Issue #1586");
+    assert_eq!(err.wire_code(), "42723");
+
+    core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION random(x) AS x")
+        .expect("CREATE FUNCTION random should succeed (not reserved)");
 
     let outcome = core
         .execute_sql_in_session(
             &ctx,
             &mut session,
-            "SELECT now(1.0) FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
+            "SELECT random(1.0) FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
         )
-        .expect("SELECT calling the now(x) UDF should succeed");
+        .expect("SELECT calling the random(x) UDF should succeed");
     let result = expect_query(outcome);
     assert_eq!(float_cell(&result.rows[0], 0), 1.0);
 }

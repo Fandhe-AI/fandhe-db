@@ -116,7 +116,7 @@ pub(crate) fn validate_declare_tokens(
     let (name_token, rest) = rest
         .split_first()
         .ok_or_else(|| SqlSurfaceError::unsupported("malformed DECLARE statement"))?;
-    let Token::Ident(raw_name) = name_token else {
+    let (Token::Ident(raw_name) | Token::QuotedNull(raw_name)) = name_token else {
         return Err(SqlSurfaceError::unsupported("malformed DECLARE statement"));
     };
     let name = validate_cursor_name(raw_name)?;
@@ -241,7 +241,7 @@ pub(crate) fn validate_fetch_tokens(
     let (name_token, rest) = rest
         .split_first()
         .ok_or_else(|| SqlSurfaceError::unsupported("malformed FETCH statement"))?;
-    let Token::Ident(raw_name) = name_token else {
+    let (Token::Ident(raw_name) | Token::QuotedNull(raw_name)) = name_token else {
         return Err(SqlSurfaceError::unsupported("malformed FETCH statement"));
     };
     let name = validate_cursor_name(raw_name)?;
@@ -260,7 +260,7 @@ pub(crate) fn validate_close_tokens(tokens: &[Token]) -> Result<CursorStatement,
     let (name_token, rest) = rest
         .split_first()
         .ok_or_else(|| SqlSurfaceError::unsupported("malformed CLOSE statement"))?;
-    let Token::Ident(raw_name) = name_token else {
+    let (Token::Ident(raw_name) | Token::QuotedNull(raw_name)) = name_token else {
         return Err(SqlSurfaceError::unsupported("malformed CLOSE statement"));
     };
     let name = validate_cursor_name(raw_name)?;
@@ -503,18 +503,15 @@ mod tests {
         let stmt = validate_declare_tokens(
             &tokens_of("DECLARE c CURSOR FOR SELECT id FROM documents LIMIT 10"),
             &FakeCatalog,
-            crate::nesting_limits::NestingLimits::default(),
+            Default::default(),
         )
         .expect("scan form accepted");
         match stmt {
             CursorStatement::Declare { name, query } => {
                 assert_eq!(name, "c");
-                let (inner, table) = validate_declare_inner(
-                    &query,
-                    &FakeCatalog,
-                    crate::nesting_limits::NestingLimits::default(),
-                )
-                .expect("inner revalidates");
+                let (inner, table) =
+                    validate_declare_inner(&query, &FakeCatalog, Default::default())
+                        .expect("inner revalidates");
                 assert!(matches!(inner, Statement::Scan(_)));
                 assert_eq!(table, "documents");
             }
@@ -524,7 +521,7 @@ mod tests {
         let stmt = validate_declare_tokens(
             &tokens_of("DECLARE c2 CURSOR FOR SELECT COUNT(*) AS n FROM documents"),
             &FakeCatalog,
-            crate::nesting_limits::NestingLimits::default(),
+            Default::default(),
         )
         .expect("aggregate form accepted");
         assert!(matches!(stmt, CursorStatement::Declare { .. }));
@@ -537,7 +534,7 @@ mod tests {
                 "DECLARE c CURSOR FOR SELECT id FROM documents ORDER BY embedding <=> '[1.0]' LIMIT 10",
             ),
             &FakeCatalog,
-            crate::nesting_limits::NestingLimits::default(),
+            Default::default(),
         )
         .expect_err("vector ranking SELECT must be rejected");
         assert_eq!(err.wire_code(), "42601");
@@ -550,12 +547,8 @@ mod tests {
             "DECLARE c BINARY CURSOR FOR SELECT id FROM documents LIMIT 1",
             "DECLARE c INSENSITIVE CURSOR FOR SELECT id FROM documents LIMIT 1",
         ] {
-            let err = validate_declare_tokens(
-                &tokens_of(sql),
-                &FakeCatalog,
-                crate::nesting_limits::NestingLimits::default(),
-            )
-            .expect_err("rejected");
+            let err = validate_declare_tokens(&tokens_of(sql), &FakeCatalog, Default::default())
+                .expect_err("rejected");
             assert_eq!(err.wire_code(), "42601");
         }
     }
@@ -592,6 +585,34 @@ mod tests {
                 validate_fetch_tokens(&tokens_of(sql), &Default::default()).expect_err("rejected");
             assert!(matches!(err.wire_code(), "42601" | "22000"));
         }
+    }
+
+    #[test]
+    fn quoted_value_function_names_are_accepted_as_cursor_names() {
+        // 引用付きの値関数予約語は demote_quoted_null 後も QuotedNull で残るため、
+        // カーソル名位置でも受理する（識別子としての従来挙動の維持）。
+        let toks = |sql: &str| {
+            crate::sql::lexer::demote_quoted_null(
+                crate::sql::lexer::tokenize_marked(sql).expect("tokenize"),
+            )
+        };
+        let stmt = validate_close_tokens(&toks("CLOSE \"current_date\"")).expect("close");
+        assert_eq!(
+            stmt,
+            CursorStatement::Close {
+                name: "current_date".to_string()
+            }
+        );
+        assert!(
+            validate_fetch_tokens(&toks("FETCH 1 FROM \"current_date\""), &Default::default())
+                .is_ok()
+        );
+        let declare = validate_declare_tokens(
+            &toks("DECLARE \"current_date\" CURSOR FOR SELECT COUNT(*) FROM documents"),
+            &FakeCatalog,
+            Default::default(),
+        );
+        assert!(declare.is_ok(), "{declare:?}");
     }
 
     #[test]

@@ -3044,6 +3044,14 @@ pub(crate) fn fit_pad_char_length<'a>(
     let chars = fitted.chars().count();
     let pad = n_usize.saturating_sub(chars);
     if pad == 0 {
+        // 空白を足さない経路でも上限超過（n 文字ちょうどで 4MiB 超等）を素通りさせない。
+        if fitted.len() > limit {
+            return Err(CharLengthExceeded {
+                bpchar: true,
+                n: *n,
+                pad_limit: true,
+            });
+        }
         return Ok(std::borrow::Cow::Borrowed(fitted));
     }
     match fitted.len().checked_add(pad) {
@@ -4748,6 +4756,11 @@ mod tests {
         assert_eq!(fit_pad_char_length(&c3, "ab    ", lim).unwrap(), "ab ");
         assert_eq!(fit_pad_char_length(&c3, "", lim).unwrap(), "   ");
         assert!(fit_pad_char_length(&c3, "abcd", lim).is_err());
+        // 空白を足さない（n 文字ちょうど）が上限を超える値も 54000 相当で拒否する。
+        let c1 = ColumnType::Bpchar(1);
+        let e = fit_pad_char_length(&c1, "日", 2).unwrap_err();
+        assert!(e.pad_limit);
+        assert_eq!(fit_pad_char_length(&c1, "a", 1).unwrap(), "a");
         // 詰め後が上限を超える場合は確保せずに 54000 相当で拒否する。
         let big = ColumnType::Bpchar(MAX_TEXT_FIELD_LEN + 1);
         let e = fit_pad_char_length(&big, "a", lim).unwrap_err();

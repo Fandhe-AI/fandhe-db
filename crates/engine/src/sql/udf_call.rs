@@ -29,6 +29,7 @@ use crate::row_codec::ScalarRef;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::datetime_fn::{self, DatePartField, DateTruncUnit};
 use crate::sql::string_fn;
+use crate::sql::time_fn::{self, StatementClock};
 use crate::wasm_udf::WasmUdfBackend;
 
 /// UDF 定義が持てるパラメータ数の上限（`54000` で拒否）。
@@ -280,6 +281,66 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    /// 括弧なしの SQL 値関数（`CURRENT_TIMESTAMP`・`CURRENT_DATE`・`LOCALTIMESTAMP` 等。
+    /// 対象ビヘイビア: SQL-37・Issue #1586）。構文段（`allowlist::Parser::parse_primary_expr`）が
+    /// **引用されていない**識別子の予約語一致でだけ生成する（引用識別子は列参照のまま）。
+    /// `precision` は `CURRENT_TIMESTAMP(p)` の小数秒桁数（括弧内が整数リテラル 1 個のとき）。
+    /// 関数形の `now()` 等は従来どおり [`Expr::Call`]。
+    ValueFunction {
+        kind: ValueFunctionKind,
+        precision: Option<u8>,
+    },
+}
+
+/// 括弧なし SQL 値関数の種別（[`Expr::ValueFunction`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueFunctionKind {
+    CurrentTimestamp,
+    CurrentDate,
+    CurrentTime,
+    LocalTimestamp,
+    LocalTime,
+}
+
+impl ValueFunctionKind {
+    /// 予約語（大文字小文字不問）から種別を引く。
+    pub fn from_keyword(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "current_timestamp" => Some(Self::CurrentTimestamp),
+            "current_date" => Some(Self::CurrentDate),
+            "current_time" => Some(Self::CurrentTime),
+            "localtimestamp" => Some(Self::LocalTimestamp),
+            "localtime" => Some(Self::LocalTime),
+            _ => None,
+        }
+    }
+
+    /// 小文字のキーワード表記（結果列名・CHECK／ビューの render 用。PostgreSQL の既定列名と同じ）。
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::CurrentTimestamp => "current_timestamp",
+            Self::CurrentDate => "current_date",
+            Self::CurrentTime => "current_time",
+            Self::LocalTimestamp => "localtimestamp",
+            Self::LocalTime => "localtime",
+        }
+    }
+
+    /// 精度指定（`(p)`）を取りうる種別か（`CURRENT_DATE` は取らない）。
+    pub fn accepts_precision(self) -> bool {
+        !matches!(self, Self::CurrentDate)
+    }
+
+    /// `content_hash` 用の安定した 1 バイト識別子（変更禁止）。
+    pub(crate) fn hash_tag(self) -> u8 {
+        match self {
+            Self::CurrentTimestamp => 1,
+            Self::CurrentDate => 2,
+            Self::CurrentTime => 3,
+            Self::LocalTimestamp => 4,
+            Self::LocalTime => 5,
+        }
+    }
 }
 
 /// jsonb パス取得演算子の種別（[`Expr::JsonAccess`]）。
@@ -671,6 +732,10 @@ pub enum BuiltinFn {
     /// と checked オーバーフロー（`22003`）をノード単位で行うため、f64 一括計算では
     /// なく専用の演算ノードにしている（`(7/2)*2` が PostgreSQL と同じく 6 になる）。
     TypedArith(BinOp, NumericKind),
+    /// `clock_timestamp() -> Timestamp`（呼び出しごとに壁時計を読む。SQL-37・Issue #1586）。
+    /// 他の時刻関数と違い束縛時に定数化せず、評価のたびに `sql::time_fn::now_micros` を呼ぶ。
+    /// 畳み込み・共通部分式の 1 回化の対象外（[`is_foldable_builtin`]）。
+    ClockTimestamp,
 }
 
 /// 型付き算術（[`BuiltinFn::TypedArith`]）の結果種別。`float8` は既存の
@@ -697,7 +762,19 @@ pub enum NumericKind {
 /// `Round1`／`Round2` へオーバーロード解決されるため [`builtin_from_name`] の
 /// 対象外だが、名前としては組み込み扱いにする必要があるためここで別途判定する。
 pub(crate) fn is_builtin_function_name(name: &str) -> bool {
-    builtin_from_name(name).is_some() || is_variadic_or_overloaded_builtin_name(name)
+    builtin_from_name(name).is_some()
+        || is_variadic_or_overloaded_builtin_name(name)
+        || is_current_time_function_name(name)
+}
+
+/// 現在時刻関数（関数形）の名前か（SQL-37・Issue #1586）。`now`・`transaction_timestamp`・
+/// `statement_timestamp`・`clock_timestamp`。CHECK・定数式（INSERT VALUES）・連鎖ビュー本文が
+/// 受理しない文脈で拒否判定に使う。
+pub(crate) fn is_current_time_function_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp"
+    )
 }
 
 /// 式木の中で最初に見つかった「組み込み関数以外の呼び出し」の関数名を返す
@@ -717,7 +794,7 @@ pub(crate) fn first_non_builtin_call(expr: &Expr) -> Option<&str> {
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_) => None,
         Expr::Call { name, args } => {
-            if !is_builtin_function_name(name) {
+            if !is_builtin_function_name(name) || is_current_time_function_name(name) {
                 return Some(name.as_str());
             }
             args.iter().find_map(first_non_builtin_call)
@@ -732,6 +809,9 @@ pub(crate) fn first_non_builtin_call(expr: &Expr) -> Option<&str> {
             .find_map(|(c, r)| first_non_builtin_call(c).or_else(|| first_non_builtin_call(r)))
             .or_else(|| else_result.as_deref().and_then(first_non_builtin_call)),
         Expr::Coalesce(args) => args.iter().find_map(first_non_builtin_call),
+        // 現在時刻関数（SQL-37・Issue #1586）は組み込みだが、CHECK（TABLE-16）・連鎖ビュー本文
+        // （TABLE-18）では決定的でないため禁止要素として報告する（`42601`）。
+        Expr::ValueFunction { kind, .. } => Some(kind.as_sql()),
     }
 }
 
@@ -757,6 +837,7 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "mod" => Some(BuiltinFn::Mod),
         "power" => Some(BuiltinFn::Power),
         "sqrt" => Some(BuiltinFn::Sqrt),
+        "clock_timestamp" => Some(BuiltinFn::ClockTimestamp),
         // `round` は arity オーバーロード（1 引数／2 引数）のため、名前だけでは
         // 一意に variant を決定できない。呼び出し元（`bind_call`・
         // `validate_closed_expr`）が引数個数を見て `Round1`／`Round2` を
@@ -822,6 +903,8 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::DateToTimestamp => (&[ExprType::Date], ExprType::Timestamp),
         BuiltinFn::BpcharToText => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::TypedArith(_, _) => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
+        // 戻り値型は TIMESTAMP（D8 の暫定。TIMESTAMPTZ 型の実装時に切り替える）。
+        BuiltinFn::ClockTimestamp => (&[], ExprType::Timestamp),
     }
 }
 
@@ -869,6 +952,8 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::DateTrunc(_)
         | BuiltinFn::DateToTimestamp
         | BuiltinFn::BpcharToText => false,
+        // 非決定的（呼び出しごとに値が変わる）ため畳み込まない（SQL-37・Issue #1586）。
+        BuiltinFn::ClockTimestamp => false,
         // Issue #1539・SQL-42: 型付き算術は `Binary` と同じく `Scalar` を返す純関数で、
         // 0 除算・オーバーフローは defer-on-error（畳み込み失敗時は実行時に評価）。
         BuiltinFn::TypedArith(_, _) => true,
@@ -1147,7 +1232,19 @@ fn validate_closed_expr(
             // ここを素通りすると `CREATE FUNCTION f() AS vec_norm()` のような
             // 引数数不一致の関数本体が「定義時検証」という公開契約に反して登録
             // されてしまう（呼び出し時の `bind_call` 側の検査だけでは間に合わない）。
-            if name.eq_ignore_ascii_case("concat") {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "now" | "transaction_timestamp" | "statement_timestamp"
+            ) {
+                // 現在時刻関数（SQL-37・Issue #1586）は 0 引数の組み込み。`clock_timestamp` は
+                // 下の `builtin_from_name` 分岐で解決される。
+                if !args.is_empty() {
+                    return Err(SqlSurfaceError::undefined_function(format!(
+                        "function {name} expects 0 argument(s), got {}",
+                        args.len()
+                    )));
+                }
+            } else if name.eq_ignore_ascii_case("concat") {
                 if args.is_empty() {
                     return Err(SqlSurfaceError::undefined_function(
                         "function concat expects at least 1 argument, got 0",
@@ -1245,6 +1342,8 @@ fn validate_closed_expr(
             validate_closed_expr(rhs, params, registry, node_budget)
         }
         Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => Ok(()),
+        // 時刻の値関数は呼び出し側の文脈（読み取り文）の時刻へ展開時に束縛される。
+        Expr::ValueFunction { .. } => Ok(()),
     }
 }
 
@@ -1267,6 +1366,10 @@ struct BindEnv<'a> {
     /// （[`bind_projection_expr`]・[`bind_const_expr`]）だけが立て、`WHERE`／
     /// `ORDER BY`／`CHECK`／UDF 本体は従来の f64 意味論のまま（`false`）。
     typed_arith: bool,
+    /// 読み取り文の入口が確定した時刻（SQL-37・Issue #1586。[`time_fn::current_clock`]）。
+    /// `None` の文脈では時刻関数を `0A000` で拒否する。UDF 本体の展開（`inner_env`）は
+    /// 呼び出し側の値を継承する。
+    clock: Option<StatementClock>,
 }
 
 /// 展開済み [`BoundExpr`] のノード数を数える。UDF 連鎖のパラメータ参照展開時に
@@ -1608,6 +1711,7 @@ pub fn bind_expr(
         registry,
         case_nesting: 0,
         typed_arith: false,
+        clock: time_fn::current_clock(),
     };
     bind_expr_in(expr, &mut env, node_budget)
 }
@@ -1642,6 +1746,7 @@ pub(crate) fn bind_projection_expr_json_ok(
         registry,
         case_nesting: 0,
         typed_arith: true,
+        clock: time_fn::current_clock(),
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
     let col = expr_result_column_type(expr, &bound, ty);
@@ -1663,6 +1768,7 @@ pub(crate) fn bind_order_expr(
         registry,
         case_nesting: 0,
         typed_arith: false,
+        clock: time_fn::current_clock(),
     };
     bind_expr_any(expr, &mut env, node_budget)
 }
@@ -1756,6 +1862,7 @@ pub(crate) fn bind_const_expr(
         registry,
         case_nesting: 0,
         typed_arith: true,
+        clock: time_fn::current_clock(),
     };
     let (bound, ty) = bind_expr_in(expr, &mut env, node_budget)?;
     let col = expr_result_column_type(expr, &bound, ty);
@@ -2279,6 +2386,52 @@ fn bind_expr_any(
         Expr::DateLiteral(days) => Ok((BoundExpr::Date(*days), ExprType::Date)),
         Expr::TimestampLiteral(micros) => Ok((BoundExpr::Timestamp(*micros), ExprType::Timestamp)),
         Expr::JsonAccess { op, lhs, rhs } => bind_json_access(*op, lhs, rhs, env, node_budget),
+        Expr::ValueFunction { kind, precision } => bind_value_function(*kind, *precision, env),
+    }
+}
+
+/// 時刻関数を束縛する文脈の確定時刻を取り出す。`None`（読み取り文の入口が時計を確定していない
+/// 文脈。INSERT／UPDATE／DELETE／COPY／CHECK／DEFAULT／VIEW 本文等）は `0A000` で拒否する
+/// （SQL-37・Issue #1586。許可リスト型の fail-closed）。
+fn require_clock(env: &BindEnv<'_>) -> Result<StatementClock, SqlSurfaceError> {
+    env.clock
+        .ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
+            detail: "current time functions are not supported in this context".to_string(),
+        })
+}
+
+/// 括弧なし値関数（`CURRENT_TIMESTAMP`・`CURRENT_DATE`・`LOCALTIMESTAMP`）を束縛時に確定した
+/// 定数へ解決する。`CURRENT_TIME`・`LOCALTIME` は TIME 型が未実装のため `0A000`。
+fn bind_value_function(
+    kind: ValueFunctionKind,
+    precision: Option<u8>,
+    env: &BindEnv<'_>,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    match kind {
+        ValueFunctionKind::CurrentTime | ValueFunctionKind::LocalTime => {
+            Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "TIME values are not supported".to_string(),
+            })
+        }
+        ValueFunctionKind::CurrentDate => {
+            let clock = require_clock(env)?;
+            let days = time_fn::micros_to_days(clock.txn_start_micros).ok_or_else(|| {
+                SqlSurfaceError::datetime_field_overflow("current date is out of range")
+            })?;
+            Ok((BoundExpr::Date(days), ExprType::Date))
+        }
+        ValueFunctionKind::CurrentTimestamp | ValueFunctionKind::LocalTimestamp => {
+            let clock = require_clock(env)?;
+            let micros = match precision {
+                None => clock.txn_start_micros,
+                Some(p) => time_fn::round_to_precision(clock.txn_start_micros, p).ok_or(
+                    SqlSurfaceError::InvalidParameterValue {
+                        detail: "timestamp precision must be between 0 and 6",
+                    },
+                )?,
+            };
+            Ok((BoundExpr::Timestamp(micros), ExprType::Timestamp))
+        }
     }
 }
 
@@ -2877,6 +3030,35 @@ fn bind_call(
         return bind_date_part_or_trunc(&lower_name, args, env, node_budget);
     }
 
+    // 現在時刻関数（SQL-37・Issue #1586）。引数を取らない（`now(1)` は arity 違反の `42883`）。
+    // `now`・`transaction_timestamp` は txn 開始時刻、`statement_timestamp` は文の開始時刻を
+    // 束縛時の定数にする。`clock_timestamp` は下の組み込み解決で `BuiltinFn::ClockTimestamp`
+    // （評価のたび壁時計を読む）になるが、時計の確定していない文脈では同じく拒否する。
+    if is_current_time_function_name(&lower_name) {
+        if !args.is_empty() {
+            return Err(SqlSurfaceError::undefined_function(format!(
+                "function {name} expects 0 argument(s), got {}",
+                args.len()
+            )));
+        }
+        let clock = require_clock(env)?;
+        match lower_name.as_str() {
+            "now" | "transaction_timestamp" => {
+                return Ok((
+                    BoundExpr::Timestamp(clock.txn_start_micros),
+                    ExprType::Timestamp,
+                ));
+            }
+            "statement_timestamp" => {
+                return Ok((
+                    BoundExpr::Timestamp(clock.stmt_start_micros),
+                    ExprType::Timestamp,
+                ));
+            }
+            _ => {}
+        }
+    }
+
     if let Some(builtin) = builtin_from_name(name) {
         let (param_types, ret) = builtin_signature(builtin);
         if args.len() != param_types.len() {
@@ -2941,6 +3123,8 @@ fn bind_call(
             case_nesting: env.case_nesting,
             // UDF 本体は従来の f64 意味論のまま（Issue #1539。投影モードは本体へ伝播しない）。
             typed_arith: false,
+            // 呼び出し側の確定時刻を継承する（本体中の時刻関数は呼び出し文の時刻で束縛される）。
+            clock: env.clock,
         };
         return bind_expr_in(&def.body, &mut inner_env, node_budget);
     }
@@ -3867,6 +4051,8 @@ pub(crate) fn apply_builtin<'a>(
             let b = take_scalar_arg(args, 1)?;
             typed_arith(op, kind, a, b).map(ExprValue::Scalar)
         }
+        // SQL-37（Issue #1586）: 評価のたびに壁時計を読む（束縛時に定数化しない）。
+        BuiltinFn::ClockTimestamp => time_fn::now_micros().map(ExprValue::Timestamp),
     }
 }
 
@@ -5242,18 +5428,14 @@ mod tests {
     }
 
     #[test]
-    fn defining_and_calling_a_udf_named_after_a_non_deterministic_function_succeeds() {
-        // PR #1107 codex-review P1 是正: `now`/`random` 等の名前を UDF 予約名に
-        // 含めると、これらの名前で登録・呼び出しできていた既存の宣言的 UDF が
-        // 登録時に拒否される破壊的変更になっていた（本 PR は数値関数のみを
-        // 対象とし、非決定的関数の実装は含まないため予約化の理由がない）。
-        // 数値関数の予約名（`round` 等）はそのまま維持しつつ、`now`／`random`／
-        // `current_timestamp` という名前の UDF が従来どおり登録・呼び出し
-        // できることを固定する。非決定的関数名の予約化は、日時スカラー関数群
-        // （`docs/design/numeric-scalar-functions.md`「スコープ外・後続課題」
-        // 参照）を実装する後続作業で spec の決定性要件と対にして判断する。
+    fn defining_and_calling_a_udf_named_after_an_unimplemented_non_deterministic_function_succeeds()
+    {
+        // PR #1107 codex-review P1 是正の維持: 未実装の非決定的関数名（`random`）や、
+        // 括弧付き呼び出しが `Expr::Call` のまま残る `current_timestamp` という名前の UDF は
+        // 従来どおり登録・呼び出せる。`now` 等の現在時刻関数名は Issue #1586（SQL-37）で
+        // 予約名になった（次のテスト）。
         let schema = schema_with_vector();
-        for name in ["now", "random", "current_timestamp"] {
+        for name in ["random", "current_timestamp"] {
             let mut registry = UdfRegistry::default();
             define_function(&mut registry, name, &[], &num("1.0"))
                 .unwrap_or_else(|e| panic!("definition of {name} should succeed, got {e:?}"));
@@ -5269,12 +5451,141 @@ mod tests {
     }
 
     #[test]
-    fn calling_a_non_deterministic_function_is_rejected_with_42883() {
+    fn current_time_function_names_are_reserved_for_udfs() {
+        // SQL-37・SQL-26（Issue #1586）: 同名 UDF の定義は `42723`。
+        for name in [
+            "now",
+            "transaction_timestamp",
+            "statement_timestamp",
+            "clock_timestamp",
+        ] {
+            let mut registry = UdfRegistry::default();
+            let err = define_function(&mut registry, name, &[], &num("1.0")).unwrap_err();
+            assert_eq!(err.wire_code(), "42723", "function name {name}");
+        }
+    }
+
+    #[test]
+    fn calling_an_unknown_non_deterministic_function_is_rejected_with_42883() {
         let schema = schema_with_vector();
         let registry = UdfRegistry::default();
         let mut budget = MAX_EXPR_NODES;
-        let err = bind_expr(&call("now", vec![]), &schema, &registry, &mut budget).unwrap_err();
+        let err = bind_expr(&call("random", vec![]), &schema, &registry, &mut budget).unwrap_err();
         assert_eq!(err.wire_code(), "42883");
+    }
+
+    #[test]
+    fn current_time_functions_without_a_clock_are_rejected_with_0a000() {
+        // 時計を確定していない文脈（INSERT・UPDATE・CHECK・DEFAULT 等）は fail-closed。
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        for name in [
+            "now",
+            "transaction_timestamp",
+            "statement_timestamp",
+            "clock_timestamp",
+        ] {
+            let mut budget = MAX_EXPR_NODES;
+            let err = bind_expr(&call(name, vec![]), &schema, &registry, &mut budget).unwrap_err();
+            assert_eq!(err.wire_code(), "0A000", "function name {name}");
+        }
+        let mut budget = MAX_EXPR_NODES;
+        let kw = Expr::ValueFunction {
+            kind: ValueFunctionKind::CurrentTimestamp,
+            precision: None,
+        };
+        let err = bind_expr(&kw, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn current_time_functions_bind_to_the_scope_clock() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let clock = StatementClock {
+            txn_start_micros: 1_700_000_123_456_789,
+            stmt_start_micros: 1_700_000_999_000_000,
+        };
+        let _scope = time_fn::ClockScope::enter(clock);
+        let bind = |e: Expr| {
+            let mut budget = MAX_EXPR_NODES;
+            bind_expr(&e, &schema, &registry, &mut budget)
+        };
+        for name in ["now", "transaction_timestamp"] {
+            let (b, ty) = bind(call(name, vec![])).expect("bind");
+            assert_eq!(b, BoundExpr::Timestamp(clock.txn_start_micros));
+            assert_eq!(ty, ExprType::Timestamp);
+        }
+        let (b, _) = bind(call("statement_timestamp", vec![])).expect("bind");
+        assert_eq!(b, BoundExpr::Timestamp(clock.stmt_start_micros));
+        let (b, ty) = bind(Expr::ValueFunction {
+            kind: ValueFunctionKind::CurrentTimestamp,
+            precision: Some(0),
+        })
+        .expect("bind");
+        assert_eq!(b, BoundExpr::Timestamp(1_700_000_123_000_000));
+        assert_eq!(ty, ExprType::Timestamp);
+        let (b, ty) = bind(Expr::ValueFunction {
+            kind: ValueFunctionKind::CurrentDate,
+            precision: None,
+        })
+        .expect("bind");
+        assert_eq!(
+            b,
+            BoundExpr::Date(
+                i32::try_from(clock.txn_start_micros / crate::datetime::MICROS_PER_DAY).unwrap()
+            )
+        );
+        assert_eq!(ty, ExprType::Date);
+        // 範囲外の精度は 22023、TIME 系は 0A000、引数付きは 42883。
+        let err = bind(Expr::ValueFunction {
+            kind: ValueFunctionKind::LocalTimestamp,
+            precision: Some(7),
+        })
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22023");
+        let err = bind(Expr::ValueFunction {
+            kind: ValueFunctionKind::CurrentTime,
+            precision: None,
+        })
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+        let err = bind(call("now", vec![num("1")])).unwrap_err();
+        assert_eq!(err.wire_code(), "42883");
+    }
+
+    #[test]
+    fn clock_timestamp_is_not_folded_and_is_evaluated_per_call() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let clock = StatementClock {
+            txn_start_micros: 1,
+            stmt_start_micros: 1,
+        };
+        let _scope = time_fn::ClockScope::enter(clock);
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, ty) = bind_expr(
+            &call("clock_timestamp", vec![]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("bind");
+        assert_eq!(ty, ExprType::Timestamp);
+        assert!(matches!(
+            bound,
+            BoundExpr::Builtin {
+                f: BuiltinFn::ClockTimestamp,
+                ..
+            }
+        ));
+        assert!(!is_foldable_builtin(BuiltinFn::ClockTimestamp));
+        let a = eval(&bound, 1, &[0.0, 0.0, 0.0]).expect("eval");
+        let b = eval(&bound, 1, &[0.0, 0.0, 0.0]).expect("eval");
+        let (ExprValue::Timestamp(a), ExprValue::Timestamp(b)) = (a, b) else {
+            panic!("expected timestamps");
+        };
+        assert!(a > clock.txn_start_micros && b >= a);
     }
 
     // --- CASE／COALESCE／NULLIF（対象ビヘイビア: SQL-26。Issue #921） ----------
