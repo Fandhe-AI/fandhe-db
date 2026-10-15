@@ -56,6 +56,7 @@ fn type_label(ty: &ColumnType) -> &'static str {
     match ty {
         ColumnType::Text => "text",
         ColumnType::Varchar => "varchar",
+        ColumnType::SmallInt => "smallint",
         ColumnType::Vector(_) => "vector",
         ColumnType::Integer => "integer",
         ColumnType::BigInt => "bigint",
@@ -98,6 +99,7 @@ fn all_type_labels() -> BTreeSet<&'static str> {
     BTreeSet::from([
         "text",
         "varchar",
+        "smallint",
         "vector",
         "integer",
         "bigint",
@@ -157,6 +159,7 @@ fn full_row_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> Ta
             ColumnDef::new("c_uuid", ColumnType::Uuid, true),
             // 末尾に置いて既存の列位置（`c_vector` 挿入位置など）を動かさない。
             ColumnDef::new("c_varchar", ColumnType::Varchar, true),
+            ColumnDef::new("c_smallint", ColumnType::SmallInt, true),
         ],
     )
 }
@@ -215,6 +218,8 @@ fn representative_scalar_values() -> Vec<Value> {
         Value::Uuid(Uuid::from_bytes([0x11; 16])),
         // `c_varchar`（TEXT と同一表現。Issue #2305）。
         Value::Text("varchar value".to_string()),
+        // `c_smallint`（INTEGER と同一表現で範囲だけ i16。Issue #1558）。
+        Value::Integer(-32768),
     ]
 }
 
@@ -413,6 +418,38 @@ fn integer_roundtrips_min_max_zero_neg1() {
     for v in [i32::MIN, i32::MAX, 0, -1] {
         roundtrip_single(ColumnType::Integer, Value::Integer(v));
     }
+}
+
+#[test]
+fn smallint_roundtrips_boundaries_and_rejects_out_of_range() {
+    for v in [-32768, 32767, 0, -1] {
+        roundtrip_single(ColumnType::SmallInt, Value::Integer(v));
+    }
+    let schema = single_col_schema(ColumnType::SmallInt);
+    for v in [32768, -32769, i32::MAX, i32::MIN] {
+        assert!(matches!(
+            encode_row(
+                &schema,
+                "tenant-a",
+                Visibility::Public,
+                &[Value::Integer(v)]
+            ),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+    // INTEGER 列で書いた範囲外バイトを SMALLINT 列として読むと decode が拒否する。
+    let wide = single_col_schema(ColumnType::Integer);
+    let bytes = encode_row(
+        &wide,
+        "tenant-a",
+        Visibility::Public,
+        &[Value::Integer(40_000)],
+    )
+    .expect("encode wide");
+    assert!(matches!(
+        decode_row(&schema, &bytes),
+        Err(RowCodecError::Invalid(_))
+    ));
 }
 
 #[test]

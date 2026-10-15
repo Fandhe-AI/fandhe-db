@@ -108,6 +108,98 @@ fn wire_text_select_returns_stored_text_and_round_trips() {
     common::read_ready_for_query(&mut alice);
 }
 
+/// Issue #1596（TABLE-25）: jsonb のパス演算子の結果列は、`->`・`#>` が jsonb（OID 3802）、
+/// `->>`・`#>>` が text（OID 25）として RowDescription に載り、値は text 形式で返る。
+#[test]
+fn wire_json_path_operators_advertise_jsonb_and_text_oids() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = common::spawn_server_with_engine(&users_path, core);
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    common::send_simple_query(
+        &mut alice,
+        r#"INSERT INTO docs (id, embedding, docb) VALUES (1, '[0.1,0.2,0.3]', '{"a":{"b":[1,"x"]}}') USING OPERATION_ID 'op-path-1'"#,
+    );
+    assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT docb -> 'a' AS j, docb -> 'a' ->> 'zz' AS t, docb #> '{a,b,1}' AS pj, docb #>> '{a,b,1}' AS pt \
+         FROM docs WHERE id = 1 LIMIT 1",
+    );
+    let columns = common::read_row_description_with_oids(&mut alice);
+    assert_eq!(
+        columns,
+        vec![
+            ("j".to_string(), 3802),
+            ("t".to_string(), 25),
+            ("pj".to_string(), 3802),
+            ("pt".to_string(), 25),
+        ]
+    );
+    let row = common::read_data_row(&mut alice);
+    assert_eq!(
+        row,
+        vec![
+            Some(r#"{"b":[1,"x"]}"#.to_string()),
+            None,
+            Some(r#""x""#.to_string()),
+            Some("x".to_string()),
+        ]
+    );
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+}
+
+/// Issue #1597（TABLE-25）: 簡易クエリで jsonb の述語（暗黙の jsonb リテラル解釈）と
+/// ORDER BY（式キー）が往復し、RowDescription は OID 3802・値は正規化テキストで返る。
+#[test]
+fn wire_jsonb_where_and_order_by_round_trip() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = common::spawn_server_with_engine(&users_path, core);
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    for (id, doc) in [
+        (1, r#"{"k":3}"#),
+        (2, r#"{"k":1.0}"#),
+        (3, r#"{"k":2}"#),
+        (4, r#"{"k":"s"}"#),
+    ] {
+        common::send_simple_query(
+            &mut alice,
+            &format!(
+                "INSERT INTO docs (id, embedding, docb) VALUES ({id}, '[0.1,0.2,0.3]', '{doc}') USING OPERATION_ID 'op-j-{id}'"
+            ),
+        );
+        assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+        common::read_ready_for_query(&mut alice);
+    }
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT docb -> 'k' AS v FROM docs WHERE docb -> 'k' >= '1' ORDER BY docb -> 'k' DESC LIMIT 10",
+    );
+    let columns = common::read_row_description_with_oids(&mut alice);
+    assert_eq!(columns, vec![("v".to_string(), 3802)]);
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        got.push(common::read_data_row(&mut alice));
+    }
+    assert_eq!(
+        got,
+        vec![
+            vec![Some("3".to_string())],
+            vec![Some("2".to_string())],
+            vec![Some("1.0".to_string())],
+        ]
+    );
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+}
+
 #[test]
 fn wire_text_null_and_json_null_literal_are_distinguishable() {
     let (core, _guard) = new_core();

@@ -1056,7 +1056,9 @@ fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
         ColumnType::Numeric { .. } => Some(SubqueryValueFamily::Numeric),
         ColumnType::Uuid => Some(SubqueryValueFamily::Uuid),
         ColumnType::Bytea => Some(SubqueryValueFamily::Bytea),
-        ColumnType::Integer | ColumnType::BigInt => Some(SubqueryValueFamily::Integer),
+        ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => {
+            Some(SubqueryValueFamily::Integer)
+        }
         ColumnType::Real | ColumnType::Double => Some(SubqueryValueFamily::Float),
         ColumnType::Vector(_) | ColumnType::Array(_) | ColumnType::Json | ColumnType::Jsonb => None,
     }

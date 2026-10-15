@@ -243,6 +243,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ),
                 ColumnDef::new("tags", ColumnType::Array(tags), true),
                 ColumnDef::new("mood", ColumnType::Enum(mood), true),
+                ColumnDef::new("s", ColumnType::SmallInt, true),
             ],
         ))
         .expect("create table");
@@ -257,6 +258,13 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
         while row.len() < 15 {
             row.push(Value::Null);
         }
+        // SMALLINT 列 `s`（Issue #1561）: 境界値と NULL（id 1: -1・id 2: 最小・id 3: 最大）。
+        row.push(match id {
+            1 => Value::Integer(-1),
+            2 => Value::Integer(i32::from(i16::MIN)),
+            3 => Value::Integer(i32::from(i16::MAX)),
+            _ => Value::Null,
+        });
         engine::tenant::insert_typed_row(&storage, "t", &ctx, id, Visibility::Private, &row, &op)
             .expect("insert");
     };
@@ -503,6 +511,7 @@ fn decode_by_oid(oid: u32, bytes: &[u8]) -> String {
             if bytes[0] == 1 { "t" } else { "f" }.to_string()
         }
         20 => i64::from_be_bytes(bytes.try_into().unwrap()).to_string(),
+        21 => i16::from_be_bytes(bytes.try_into().unwrap()).to_string(),
         23 => i32::from_be_bytes(bytes.try_into().unwrap()).to_string(),
         25 => String::from_utf8(bytes.to_vec()).unwrap(),
         700 => engine::scalar_float::format_real(f32::from_bits(u32::from_be_bytes(
@@ -637,4 +646,33 @@ fn computed_binary_results_respect_tenant_boundary() {
     let (_, _, rows) = run_with_oids(&mut s, "SELECT COUNT(*) OVER () AS c FROM t LIMIT 10", &[1]);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0].as_deref(), Some(&1i64.to_be_bytes()[..]));
+}
+
+/// Issue #1561（TABLE-30・WIRE-13/14）: SMALLINT 列は OID 21 で公告され、バイナリは
+/// 2 バイト BE（境界値・NULL・Computed の MIN/MAX を含む）。
+#[test]
+fn smallint_binary_two_bytes_matches_text() {
+    let (mut s, _g, _) = connect("alice", "correct-horse");
+    for id in [1, 2, 3] {
+        assert_binary_matches_text(
+            &mut s,
+            &format!("SELECT s, MIN(s) AS lo, MAX(s) AS hi FROM t WHERE id = {id} GROUP BY s"),
+            &[21, 21, 21],
+        );
+    }
+    let (_, rows) = run(&mut s, "SELECT s FROM t WHERE id = 3 LIMIT 10", &[1]);
+    assert_eq!(rows[0][0].as_deref(), Some(&[0x7f, 0xff][..]));
+    let (_, rows) = run(&mut s, "SELECT s FROM t WHERE id = 1 LIMIT 10", &[1]);
+    assert_eq!(rows[0][0].as_deref(), Some(&[0xff, 0xff][..]));
+    let (_, rows) = run(&mut s, "SELECT s FROM t WHERE id = 2 LIMIT 10", &[1]);
+    assert_eq!(rows[0][0].as_deref(), Some(&[0x80, 0x00][..]));
+}
+
+/// SMALLINT 列のバイナリ結果でも他テナントの行は見えない。
+#[test]
+fn smallint_binary_respects_tenant_boundary() {
+    let (mut s, _g, _) = connect("bob", "battery-staple");
+    let (_, rows) = run(&mut s, "SELECT s FROM t LIMIT 10", &[1]);
+    assert_eq!(rows.len(), 1, "bob sees only his own row");
+    assert_eq!(rows[0][0], None);
 }

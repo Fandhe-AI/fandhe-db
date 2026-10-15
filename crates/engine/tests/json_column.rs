@@ -431,7 +431,7 @@ fn where_json_equality_does_not_cross_tenants() {
 }
 
 #[test]
-fn json_path_operator_is_rejected_as_unsupported_syntax() {
+fn json_path_operator_on_a_json_column_is_rejected_as_unsupported() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -445,7 +445,9 @@ fn json_path_operator_is_rejected_as_unsupported_syntax() {
     let err = core
         .execute_sql(&alice, &format!("SELECT doc -> 'a' FROM {TABLE} LIMIT 10"))
         .unwrap_err();
-    assert_eq!(err.wire_code(), "42601");
+    // Issue #1596（TABLE-25）: パス演算子は jsonb 列だけを受理する。`json` 列（原文保持）は
+    // 別 Issue の担当のため、構文エラー（42601）ではなく未対応（0A000）で拒否する。
+    assert_eq!(err.wire_code(), "0A000");
 }
 
 #[test]

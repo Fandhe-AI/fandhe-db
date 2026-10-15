@@ -111,7 +111,7 @@ fn alias_declared_columns_round_trip_values() {
     assert_eq!(result.rows.len(), 1);
 }
 
-/// 未確定型（`INT2`／`SMALLINT`・`VARCHAR`／`CHARACTER VARYING`・`CHAR`／`CHARACTER`）は
+/// 未確定型（`VARCHAR(n)`・`CHAR`／`CHARACTER`・`SMALLINT[]` 等）は
 /// `0A000` で拒否し、真に未知の型名・`DOUBLE` 単独は `42704`（Issue #2303・#2306。
 /// ポインタ: TABLE-29・TABLE-30・TABLE-31）。拒否後はテーブルが作られない。
 #[test]
@@ -119,9 +119,8 @@ fn unsettled_type_names_are_rejected_with_0a000_without_side_effects() {
     let (path, _g, core) = open("ta-unsettled");
     let mut s = allowed();
     for sql in [
-        "CREATE TABLE t (a INT2)",
-        "CREATE TABLE t (a int2)",
-        "CREATE TABLE t (a SMALLINT)",
+        "CREATE TABLE t (a INT2[])",
+        "CREATE TABLE t (a SMALLINT[3])",
         "CREATE TABLE t (a VARCHAR(10))",
         "CREATE TABLE t (a CHARACTER VARYING(10))",
         "CREATE TABLE t (a VARCHAR[])",
@@ -153,7 +152,6 @@ fn unsettled_spellings_match_on_every_ddl_path_and_leave_schema() {
     let mut s = allowed();
     run(&core, &mut s, "CREATE TABLE t (a INT)").expect("create");
     let pairs = [
-        ("INT2", "SMALLINT"),
         ("VARCHAR(10)", "CHARACTER VARYING(10)"),
         ("CHAR(1)", "CHARACTER(1)"),
     ];
@@ -189,6 +187,8 @@ fn ddl_permission_gate_precedes_runtime_resolution_but_not_syntax_rejection() {
     let mut denied = SessionState::default();
     for sql in [
         "CREATE TABLE t (a INT4)",
+        "CREATE TABLE t (a INT2)",
+        "CREATE TABLE t (a SMALLINT)",
         "CREATE TABLE t (a mood)",
         // 長さなし VARCHAR は実行段で解決されるため権限ゲートが先（Issue #2305）。
         "CREATE TABLE t (a VARCHAR)",
@@ -198,8 +198,8 @@ fn ddl_permission_gate_precedes_runtime_resolution_but_not_syntax_rejection() {
     }
     let mut ok = allowed();
     for sql in [
-        "CREATE TABLE t (a INT2)",
-        "CREATE TABLE t (a SMALLINT)",
+        "CREATE TABLE t (a INT2[])",
+        "CREATE TABLE t (a SMALLINT[3])",
         "CREATE TABLE t (a VARCHAR(10))",
         "CREATE TABLE t (a CHARACTER VARYING(10))",
     ] {
@@ -310,7 +310,7 @@ fn alter_column_type_alias_failures_match_canonical_and_leave_schema() {
     let canon = err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INTEGER").wire_code();
     let alias = err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INT4").wire_code();
     assert_eq!(canon, alias);
-    for ty in ["INT2", "SMALLINT", "VARCHAR(10)"] {
+    for ty in ["INT2[]", "SMALLINT[3]", "VARCHAR(10)"] {
         let sql = format!("ALTER TABLE t ALTER COLUMN a TYPE {ty}");
         assert_eq!(err(&core, &mut s, &sql).wire_code(), "0A000", "{sql}");
     }

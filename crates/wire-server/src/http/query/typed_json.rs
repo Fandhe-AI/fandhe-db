@@ -387,7 +387,9 @@ pub fn map_json_to_literal(
                 "BOOLEAN column value must be a JSON boolean",
             )),
         },
-        ColumnType::Integer | ColumnType::BigInt => match raw {
+        // SMALLINT は INTEGER／BIGINT と同じ規則で束縛し、範囲検査は engine の
+        // `bind_integer_literal` に一本化する（TABLE-30・NOSQL-17・Issue #1561）。
+        ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => match raw {
             JsonValue::Number(n @ (JsonNumber::PosInt(_) | JsonNumber::NegInt(_))) => {
                 Ok(InsertLiteral::Number(number_literal_text(n)))
             }
@@ -401,7 +403,7 @@ pub fn map_json_to_literal(
                 Ok(InsertLiteral::Number(number_literal_text(n)))
             }
             _ => Err(TypedJsonError::TypeMismatch(
-                "INTEGER/BIGINT column value must be a JSON number",
+                "SMALLINT/INTEGER/BIGINT column value must be a JSON number",
             )),
         },
         ColumnType::Real | ColumnType::Double => match raw {

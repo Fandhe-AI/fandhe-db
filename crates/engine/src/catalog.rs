@@ -376,6 +376,7 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid
             | ColumnType::Bytea
+            | ColumnType::SmallInt
             | ColumnType::Integer
             | ColumnType::BigInt
             | ColumnType::Real
@@ -1482,6 +1483,21 @@ impl From<CatalogError> for AlterCheckError {
     }
 }
 
+/// 列型変更の実行計画（`alter_column_type_with` の `decide` が返す。Issue #1560）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlterPlan {
+    /// カタログのみ書き換える。値の意味が変わりうるため CHECK 依存列は拒否する
+    /// （NUMERIC 精度拡大・TEXT↔VARCHAR）。
+    CatalogOnly,
+    /// 値を変えない整数型の再タグ付け（`SMALLINT`→`INTEGER`）。行・索引は不変。
+    /// CHECK 依存列は受理し、再コンパイルと全行再検証を通す。
+    IntegerRetag,
+    /// 行を書き換えず `i16` の範囲だけを全行検証する（`INTEGER`→`SMALLINT`）。
+    ValidateSmallIntRange,
+    /// 全テナントの既存行を再エンコードする。
+    Rewrite(crate::column_rewrite::WideningKind),
+}
+
 /// [`crate::tenant::TenantWriteError`]（`CompiledChecks::compile`／
 /// [`crate::constraint::validate_existing_rows_for_check`] が返す）を
 /// [`AlterCheckError`] へ写像する（Issue #1068 設計 D4）。`CheckViolation`
@@ -1526,6 +1542,14 @@ pub enum ColumnType {
     /// 固定次元の埋め込み列（`VECTOR(N)`、TABLE-1）。0 と `MAX_VECTOR_DIM` 超過は
     /// encode・decode 両側で拒否する。
     Vector(u32),
+    /// 符号付き 16 ビット整数列（`SMALLINT`／`INT2`、TABLE-30・Issue #1558）。
+    /// 値表現（[`crate::row_codec::Value::Integer`]・行ペイロードの `i32 LE` 5 バイト）は
+    /// [`ColumnType::Integer`] と共有し、違いはカタログタグ（`smallint`）と値の範囲
+    /// （`-32768..=32767`）だけ。範囲は束縛段（`sql::parser::bind_integer_literal`）で
+    /// `22003` として検査し、行 codec が encode／decode 両側でバックストップとして再検証する。
+    /// 述語・集計・ORDER BY／GROUP BY・二次索引は Issue #1559 で解禁済み。拡大変換・wire OID 21 は
+    /// 兄弟 Issue #1561。PK／UNIQUE／FK・拡大変換・縮小（SMALLINT への縮小のみ）は Issue #1560 で解禁。
+    SmallInt,
     /// 符号付き 32 ビット整数列（`INTEGER`、TABLE-13・TASK-196。Issue #881）。
     Integer,
     /// 符号付き 64 ビット整数列（`BIGINT`、TABLE-13・TASK-196。Issue #881）。
@@ -1618,6 +1642,7 @@ impl ColumnType {
             self,
             ColumnType::Text
                 | ColumnType::Varchar
+                | ColumnType::SmallInt
                 | ColumnType::Integer
                 | ColumnType::BigInt
                 | ColumnType::Boolean
@@ -1627,6 +1652,24 @@ impl ColumnType {
                 | ColumnType::Bytea
                 | ColumnType::Enum(_)
         )
+    }
+
+    /// 整数型（`SmallInt`／`Integer`／`BigInt`）の幅の序列（0・1・2）。整数型以外は `None`。
+    /// FK の型照合・ALTER COLUMN TYPE・集合演算・`recode_key_for_types` が共有する単一の
+    /// 判定表（Issue #1560。第 2 の表を作らない）。
+    pub(crate) fn integer_rank(&self) -> Option<u8> {
+        match self {
+            ColumnType::SmallInt => Some(0),
+            ColumnType::Integer => Some(1),
+            ColumnType::BigInt => Some(2),
+            _ => None,
+        }
+    }
+
+    /// 整数型どうしの広い方の型（片方が整数型でなければ `None`）。
+    pub(crate) fn widest_integer(a: &ColumnType, b: &ColumnType) -> Option<ColumnType> {
+        let (ra, rb) = (a.integer_rank()?, b.integer_rank()?);
+        Some(if ra >= rb { a.clone() } else { b.clone() })
     }
 
     /// UNIQUE 制約（Issue #905・#1073）の参照列として宣言できる型かどうか
@@ -1687,6 +1730,11 @@ impl ColumnType {
             // TYPE でも `user_uniq`・`key_index` を失効させずに済む。
             ColumnType::Text | ColumnType::Varchar => 1,
             ColumnType::Integer => 2,
+            // `SmallInt` は INTEGER と値表現（`Value::Integer`）が同一で、正準キーは値ベース
+            // （`push_canonical_component`）のため同じタグ 2 を共有する（Issue #1558。新型には
+            // 未使用タグを採番する規則の意図的な例外）。共有により SMALLINT↔INTEGER の PK／FK
+            // 照合は recode 不要、ALTER COLUMN TYPE でも索引を失効させずに済む（Issue #1560）。
+            ColumnType::SmallInt => 2,
             ColumnType::BigInt => 3,
             ColumnType::Boolean => 4,
             ColumnType::Date => 5,
@@ -1718,6 +1766,7 @@ impl ColumnType {
             ColumnType::Text => ("text", "-".to_string()),
             ColumnType::Varchar => ("varchar", "-".to_string()),
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
+            ColumnType::SmallInt => ("smallint", "-".to_string()),
             ColumnType::Integer => ("integer", "-".to_string()),
             ColumnType::BigInt => ("bigint", "-".to_string()),
             ColumnType::Real => ("real", "-".to_string()),
@@ -1769,6 +1818,14 @@ impl ColumnType {
                 })?;
                 validate_vector_dim(dim)?;
                 Ok(ColumnType::Vector(dim))
+            }
+            "smallint" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "smallint column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::SmallInt)
             }
             "integer" => {
                 if param != "-" {
@@ -3054,7 +3111,8 @@ impl ColumnDefault {
                     | ColumnType::Array(_),
             ) | (
                 ColumnDefault::Number(_),
-                ColumnType::Integer
+                ColumnType::SmallInt
+                    | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Real
                     | ColumnType::Double
@@ -3973,6 +4031,7 @@ impl TableSchema {
             ColumnType::Vector(dim) => Some(*dim),
             ColumnType::Text
             | ColumnType::Varchar
+            | ColumnType::SmallInt
             | ColumnType::Integer
             | ColumnType::BigInt
             | ColumnType::Real
@@ -4467,12 +4526,13 @@ fn validate_foreign_keys(schema: &TableSchema, allow_unresolved: bool) -> Result
             // （カタログ decode 時にも再検証する多層防御）。
             if fk.references_parent_id() {
                 for name in &fk.columns {
-                    let is_integer = schema.columns.iter().any(|c| {
-                        &c.name == name && matches!(c.ty, ColumnType::Integer | ColumnType::BigInt)
-                    });
+                    let is_integer = schema
+                        .columns
+                        .iter()
+                        .any(|c| &c.name == name && c.ty.integer_rank().is_some());
                     if !is_integer {
                         return Err(CatalogError::InvalidForeignKey(format!(
-                            "column {name} must be INTEGER or BIGINT to reference id"
+                            "column {name} must be an integer type to reference id"
                         )));
                     }
                 }
@@ -4591,9 +4651,9 @@ fn resolve_foreign_key_target(
     .with_name(fk.name.clone());
     if resolved.references_parent_id() {
         for name in &resolved.columns {
-            if !matches!(child_type(name)?, ColumnType::Integer | ColumnType::BigInt) {
+            if child_type(name)?.integer_rank().is_none() {
                 return Err(CatalogError::InvalidForeignKey(format!(
-                    "column {name} must be INTEGER or BIGINT to reference id"
+                    "column {name} must be an integer type to reference id"
                 )));
             }
         }
@@ -4631,11 +4691,11 @@ fn resolve_foreign_key_target(
         // 型の同一性は型タグ＋パラメータ（`catalog_fields`。ENUM は型名を含む）で
         // 判定する。一意性検査と同じ正準キー（型タグ付き）で参照先を照合するため、
         // 型が異なる組は値が「等しく」見えても一致しない（黙って常に違反になる
-        // 宣言を受理しない）。例外は `INTEGER`／`BIGINT` の組で、実行時に
+        // 宣言を受理しない）。例外は整数型（`SMALLINT`／`INTEGER`／`BIGINT`）の組で、実行時に
         // `constraint::recode_key_for_types` が正準キーを読み替えるため受理する。
         let child_ty = child_type(child_name)?;
-        let integer_widened = matches!(child_ty, ColumnType::Integer | ColumnType::BigInt)
-            && matches!(parent_ty, ColumnType::Integer | ColumnType::BigInt);
+        let integer_widened =
+            child_ty.integer_rank().is_some() && parent_ty.integer_rank().is_some();
         // TEXT と VARCHAR は値表現・正準キーが同一のため組を許す（Issue #2305）。
         let text_family = child_ty.is_text_like() && parent_ty.is_text_like();
         if !integer_widened
@@ -8314,7 +8374,7 @@ impl Storage {
                     precision: new_precision,
                     scale: old_scale,
                 },
-                None,
+                AlterPlan::CatalogOnly,
             ))
         })
         .map_err(|e| match e {
@@ -8335,8 +8395,11 @@ impl Storage {
     /// する `INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`（Issue #1361。
     /// [`crate::column_rewrite`]。PK／UNIQUE／FOREIGN KEY の構成列も受理し、型タグ付きの
     /// 索引〔`user_uniq`・`key_index`〕は同一 txn 内で失効させる。Issue #1402）と、
-    /// カタログのタグだけを書き換える `TEXT`↔`VARCHAR`（Issue #2305）で、それ以外（VECTOR 次元変更・同一型・縮小・
-    /// scale 変更・異種型・`INTEGER`→`DOUBLE PRECISION` 等）はすべて
+    /// カタログのタグだけを書き換える `TEXT`↔`VARCHAR`（Issue #2305）、整数型の
+    /// `SMALLINT`→`INTEGER`（タグのみ）・`SMALLINT`→`BIGINT`（再エンコード）・
+    /// `INTEGER`→`SMALLINT`（全行の範囲検証のみ）・`BIGINT`→`SMALLINT`（検証しつつ再エンコード）
+    /// （Issue #1560。範囲外は固定文言の `22003` で表は不変）で、それ以外（VECTOR 次元変更・同一型・
+    /// `BIGINT`→`INTEGER` などの縮小・scale 変更・異種型・`INTEGER`→`DOUBLE PRECISION` 等）はすべて
     /// `IncompatibleTypeChange`。成功時は世代を bump して索引キャッシュを失効させる。
     ///
     /// [`Self::alter_table_widen_numeric_precision`] と異なり目標の scale を受け取り、
@@ -8362,20 +8425,35 @@ impl Storage {
                     precision: p1,
                     scale: s1,
                 },
-            ) if s0 == s1 && p1 > p0 => Ok((target.clone(), None)),
+            ) if s0 == s1 && p1 > p0 => Ok((target.clone(), AlterPlan::CatalogOnly)),
             // TEXT と VARCHAR は行バイト列・正準キーとも同一表現のため、カタログのタグだけを
             // 書き換える（行の書き換えも `user_uniq`・`key_index` の失効も不要。
             // 世代 bump は共通本体が行う。Issue #2305）。
             (ColumnType::Text, ColumnType::Varchar) | (ColumnType::Varchar, ColumnType::Text) => {
-                Ok((target.clone(), None))
+                Ok((target.clone(), AlterPlan::CatalogOnly))
             }
-            (ColumnType::Integer, ColumnType::BigInt) => Ok((
+            // 整数型（Issue #1560）。SMALLINT と INTEGER は行レイアウト（presence + i32 LE）・
+            // 正準キーのタグ（2）とも同一のため、SMALLINT→INTEGER はカタログのタグだけ、
+            // INTEGER→SMALLINT は範囲検証のみで行は書き換えない。BIGINT との間はフレーム幅と
+            // タグが変わるため書き換える。BIGINT→INTEGER など他の縮小は TABLE-40 の担当で
+            // 従来どおり拒否する。
+            (ColumnType::SmallInt, ColumnType::Integer) => {
+                Ok((target.clone(), AlterPlan::IntegerRetag))
+            }
+            (ColumnType::Integer, ColumnType::SmallInt) => {
+                Ok((target.clone(), AlterPlan::ValidateSmallIntRange))
+            }
+            (ColumnType::Integer | ColumnType::SmallInt, ColumnType::BigInt) => Ok((
                 target.clone(),
-                Some(crate::column_rewrite::WideningKind::IntegerToBigInt),
+                AlterPlan::Rewrite(crate::column_rewrite::WideningKind::IntegerToBigInt),
+            )),
+            (ColumnType::BigInt, ColumnType::SmallInt) => Ok((
+                target.clone(),
+                AlterPlan::Rewrite(crate::column_rewrite::WideningKind::BigIntToSmallInt),
             )),
             (ColumnType::Real, ColumnType::Double) => Ok((
                 target.clone(),
-                Some(crate::column_rewrite::WideningKind::RealToDouble),
+                AlterPlan::Rewrite(crate::column_rewrite::WideningKind::RealToDouble),
             )),
             (from, to) => {
                 let (from_tag, from_param) = from.catalog_fields();
@@ -8392,8 +8470,9 @@ impl Storage {
     /// 列型変更の共通本体。単一 write txn 内で 予約名拒否 → スキーマ decode →
     /// 列検索 → `decide` による新型決定（縮小・非互換は CHECK の有無にかかわらず
     /// `IncompatibleTypeChange`）→ CHECK 依存ゲート（`CHECK` 制約が参照する列は
-    /// 行の書き換えを伴う拡大変換〔`INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`〕
-    /// のみ受理し、NUMERIC 精度拡大など他は `DependentObjectsStillExist`。
+    /// 値を変えない整数型の変換・拡大変換〔`INTEGER`／`SMALLINT`→`BIGINT`・
+    /// `REAL`→`DOUBLE PRECISION`・`SMALLINT` との相互変換〕のみ受理し、NUMERIC 精度拡大など
+    /// 他は `DependentObjectsStillExist`（[`AlterPlan`]）。
     /// Issue #1427・TABLE-19・TABLE-16）→ （拡大変換のみ）全テナント既存行の
     /// 再エンコード（[`crate::column_rewrite`]。Issue #1361）と、PK／UNIQUE／FK
     /// 構成列の永続一意索引・キー索引の失効（正準キーが型ごとに異なり、古い索引が
@@ -8410,10 +8489,7 @@ impl Storage {
         &self,
         table_name: &str,
         column_name: &str,
-        decide: impl FnOnce(
-            &ColumnType,
-        )
-            -> Result<(ColumnType, Option<crate::column_rewrite::WideningKind>)>,
+        decide: impl FnOnce(&ColumnType) -> Result<(ColumnType, AlterPlan)>,
     ) -> std::result::Result<(), AlterCheckError> {
         validate_identifier(table_name)?;
         validate_identifier(column_name)?;
@@ -8444,27 +8520,55 @@ impl Storage {
                 .columns
                 .get_mut(logical_index)
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
-            let (new_ty, rewrite) = decide(&column.ty)?;
+            let (new_ty, plan) = decide(&column.ty)?;
+            // SMALLINT への縮小では列 DEFAULT も範囲内であること。`ADD COLUMN ... NOT NULL
+            // DEFAULT` の列は既存行にバイトが無く読み出し時に DEFAULT で補われるため、
+            // 行の走査だけでは範囲外の DEFAULT を見逃す（Issue #1560）。
+            if matches!(
+                plan,
+                AlterPlan::ValidateSmallIntRange
+                    | AlterPlan::Rewrite(crate::column_rewrite::WideningKind::BigIntToSmallInt)
+            ) {
+                if let Some(ColumnDefault::Number(raw) | ColumnDefault::Text(raw)) = &column.default
+                {
+                    if raw.trim().parse::<i16>().is_err() {
+                        return Err(AlterCheckError::Sql(SqlSurfaceError::numeric_out_of_range(
+                            "smallint out of range",
+                        )));
+                    }
+                }
+            }
             column.ty = new_ty;
             // `CHECK` 制約が参照する列の型変更は、評価結果が不変であることを論証できる
             // 拡大変換（`INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`）に限り受理する
             // （Issue #1427）。それ以外（NUMERIC 精度拡大）は述語の意味を黙って変えない
             // よう安全側で拒否する（`alter_table_drop_column` と同じ判断）。
             let check_dependent = schema_check_references_column(&old_schema, column_name);
-            match rewrite {
-                Some(crate::column_rewrite::WideningKind::IntegerToBigInt)
-                | Some(crate::column_rewrite::WideningKind::RealToDouble) => {}
-                None => {
-                    if check_dependent {
-                        return Err(CatalogError::DependentObjectsStillExist(
-                            column_name.to_string(),
-                        )
-                        .into());
-                    }
+            if matches!(plan, AlterPlan::CatalogOnly) && check_dependent {
+                return Err(
+                    CatalogError::DependentObjectsStillExist(column_name.to_string()).into(),
+                );
+            }
+            // 範囲外は破損と区別した固定文言の `22003`。値・テナント・行 id は載せない。
+            // ここで return すると txn は commit されず副作用はゼロ。
+            let out_of_range = || {
+                AlterCheckError::Sql(SqlSurfaceError::numeric_out_of_range(
+                    "smallint out of range",
+                ))
+            };
+            if matches!(plan, AlterPlan::ValidateSmallIntRange) {
+                let outcome = crate::column_rewrite::validate_rows_fit_smallint_in_txn(
+                    &write_txn,
+                    table_name,
+                    &old_schema,
+                    logical_index,
+                )?;
+                if outcome == crate::column_rewrite::RewriteOutcome::OutOfRange {
+                    return Err(out_of_range());
                 }
             }
-            if let Some(kind) = rewrite {
-                crate::column_rewrite::rewrite_rows_for_widening_in_txn(
+            if let AlterPlan::Rewrite(kind) = plan {
+                let outcome = crate::column_rewrite::rewrite_rows_for_widening_in_txn(
                     &write_txn,
                     table_name,
                     &old_schema,
@@ -8472,6 +8576,9 @@ impl Storage {
                     logical_index,
                     kind,
                 )?;
+                if outcome == crate::column_rewrite::RewriteOutcome::OutOfRange {
+                    return Err(out_of_range());
+                }
                 // 変更列が PK／UNIQUE／FOREIGN KEY の構成列なら、型タグ付きの正準キー
                 // （永続一意索引 `user_uniq/{table}`・キー索引 `key_index`）が旧型のまま
                 // 残り一意性・参照整合性検査をすり抜ける（fail-open）ため、同一 txn 内で
@@ -8495,6 +8602,8 @@ impl Storage {
                     table_name,
                     column_name,
                 )?;
+            }
+            if !matches!(plan, AlterPlan::CatalogOnly) {
                 // 変更列を参照する CHECK を新スキーマで再コンパイルし、全テナント・
                 // 全可視性の既存行を再検証する（多層防御。評価結果が変わらない前提を
                 // コードで担保する。違反は `23514`・評価エラーは透過、他は fail-closed）。
@@ -14440,6 +14549,82 @@ mod tests {
             storage.table_generation("docs").expect("generation"),
             generation
         );
+    }
+
+    /// SMALLINT↔INTEGER は行バイト列を一切書き換えない（タグ変更のみ。Issue #1560）。
+    /// INTEGER→SMALLINT は範囲外が 1 行でもあれば `22003` で失敗し、カタログ・行・世代に
+    /// 痕跡を残さない（他テナントの Private 行も検証対象）。
+    #[test]
+    fn alter_column_type_smallint_integer_retag_and_range_validation() {
+        let path = unique_db_path("smallint-retag-validate");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("n", ColumnType::SmallInt, true),
+                ],
+            ))
+            .expect("create table");
+        let put = |tenant: &str, vis: Visibility, id: u64, n: i32| {
+            storage
+                .insert_typed_row(
+                    "docs",
+                    id,
+                    tenant,
+                    vis,
+                    &[
+                        RowCodecValue::Vector(vec![1.0, 2.0]),
+                        RowCodecValue::Integer(n),
+                    ],
+                )
+                .expect("insert");
+        };
+        put("tenant-a", Visibility::Public, 1, 32767);
+        let before = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("row");
+        storage
+            .alter_table_alter_column_type("docs", "n", &ColumnType::Integer)
+            .expect("retag");
+        assert_eq!(
+            storage
+                .get_row_from_table("docs", "tenant-a", 1)
+                .expect("row"),
+            before,
+            "row bytes must be untouched"
+        );
+        // 範囲外の行は他テナントの Private 行にだけ置く。
+        put("tenant-b", Visibility::Private, 1, 40000);
+        let schema_before = storage.get_table_schema("docs").expect("schema");
+        let generation = storage.table_generation("docs").expect("generation");
+        let err = storage
+            .alter_table_alter_column_type("docs", "n", &ColumnType::SmallInt)
+            .expect_err("out of range");
+        match err {
+            AlterCheckError::Sql(e) => assert_eq!(e.wire_code(), "22003"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            storage.get_table_schema("docs").expect("schema"),
+            schema_before
+        );
+        assert_eq!(
+            storage.table_generation("docs").expect("generation"),
+            generation
+        );
+        // BIGINT→INTEGER は引き続き拒否（TABLE-40 の担当）。
+        storage
+            .alter_table_alter_column_type("docs", "n", &ColumnType::BigInt)
+            .expect("widen");
+        assert!(matches!(
+            storage.alter_table_alter_column_type("docs", "n", &ColumnType::Integer),
+            Err(AlterCheckError::Catalog(
+                CatalogError::IncompatibleTypeChange { .. }
+            ))
+        ));
     }
 
     /// 行ストア未作成（既存行 0 件）のテーブルでも拡大変換は成功する（Issue #1361）。

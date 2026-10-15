@@ -476,7 +476,7 @@ fn bind_vector_literal_values(
     Ok(crate::row_codec::Value::Vector(values.to_vec()))
 }
 
-/// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）向けの数値リテラル
+/// `SMALLINT`／`INTEGER`／`BIGINT` 列（Issue #881・#1558・TABLE-13・TASK-196）向けの数値リテラル
 /// 束縛。`literal` は `InsertLiteral::Number`（`allowlist::expect_literal` が
 /// 単項マイナスを正規化済み）のみを受理し、`InsertLiteral::String` は
 /// `22P02`（PG 互換の暗黙変換は行わない設計判断。分類のみ PostgreSQL の入力関数に
@@ -506,6 +506,21 @@ pub(crate) fn bind_integer_literal(
         }
     };
     match ty {
+        // `SMALLINT` は値表現を INTEGER と共有する（`Value::Integer`。Issue #1558）。
+        // `i16` で解析することで範囲外（`-32768..=32767` の外）を束縛段で `22003` にする。
+        ColumnType::SmallInt => match raw.parse::<i16>() {
+            Ok(v) => Ok(crate::row_codec::Value::Integer(i32::from(v))),
+            Err(e) => match e.kind() {
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                    Err(SqlSurfaceError::numeric_out_of_range(format!(
+                        "value out of range for SMALLINT column {name:?}"
+                    )))
+                }
+                _ => Err(SqlSurfaceError::invalid_text_representation(format!(
+                    "invalid input syntax for integer column {name:?}"
+                ))),
+            },
+        },
         ColumnType::Integer => match raw.parse::<i32>() {
             Ok(v) => Ok(crate::row_codec::Value::Integer(v)),
             Err(e) => match e.kind() {
@@ -647,6 +662,7 @@ pub(crate) fn bind_datetime_literal(
         | ColumnType::Real
         | ColumnType::Double
         | ColumnType::Vector(_)
+        | ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Boolean
@@ -987,6 +1003,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             ColumnType::Vector(dim) => Some((idx, *dim)),
             ColumnType::Text
             | ColumnType::Varchar
+            | ColumnType::SmallInt
             | ColumnType::Integer
             | ColumnType::BigInt
             | ColumnType::Real
@@ -1037,6 +1054,7 @@ pub(crate) fn text_column_index(
             match &column.ty {
                 ColumnType::Text | ColumnType::Varchar => Ok(idx),
                 ColumnType::Vector(_)
+                | ColumnType::SmallInt
                 | ColumnType::Integer
                 | ColumnType::BigInt
                 | ColumnType::Real
@@ -1344,12 +1362,13 @@ pub fn bind_projection(
                         cols.push(resolve_projected_column(name, alias, schema)?);
                     }
                     crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
-                        let (bound, ty, result_ty) = crate::sql::udf_call::bind_projection_expr(
-                            expr,
-                            schema,
-                            udfs,
-                            node_budget,
-                        )?;
+                        let (bound, ty, result_ty) =
+                            crate::sql::udf_call::bind_projection_expr_json_ok(
+                                expr,
+                                schema,
+                                udfs,
+                                node_budget,
+                            )?;
                         let name = alias.clone().unwrap_or_else(|| default_expr_alias(expr));
                         cols.push(ProjectedColumn::Computed {
                             name,
@@ -1731,7 +1750,11 @@ fn numeric_column_string_leaf_as_predicates(
         &c.name == column
             && matches!(
                 c.ty,
-                ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double
+                ColumnType::SmallInt
+                    | ColumnType::Integer
+                    | ColumnType::BigInt
+                    | ColumnType::Real
+                    | ColumnType::Double
             )
     });
     // 疑似列 `id`（スキーマに実カラム `id` が無い場合のみ。実カラム優先は
@@ -2815,7 +2838,7 @@ fn bind_insert_row(
                 )))
             }
             (
-                ColumnType::Integer | ColumnType::BigInt,
+                ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt,
                 InsertLiteral::Number(_)
                 | InsertLiteral::String(_)
                 | InsertLiteral::Bool(_)
@@ -3000,6 +3023,7 @@ pub(crate) fn bind_json_literal(
         }
         ColumnType::Text
         | ColumnType::Varchar
+        | ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Vector(_)
@@ -3254,7 +3278,7 @@ fn bind_set_assignments(
                 )))
             }
             (
-                ColumnType::Integer | ColumnType::BigInt,
+                ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt,
                 InsertLiteral::Number(_)
                 | InsertLiteral::String(_)
                 | InsertLiteral::Bool(_)
@@ -4408,7 +4432,7 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a boolean literal (true/false)"
                         )))
                     }
-                    (ColumnType::Integer | ColumnType::BigInt, InsertLiteral::Number(_) | InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                    (ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt, InsertLiteral::Number(_) | InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         bind_integer_literal(name, column.ty.clone(), literal)?
                     }
                     (ColumnType::Real, InsertLiteral::Number(n)) => {
@@ -4621,7 +4645,7 @@ fn bind_file_insert(
             // typed INSERT/UPDATE/UPSERT 向けの `bind_integer_literal` をファイル形へ
             // 露出させない。当初この分岐だけ他の非 TEXT 型より緩く受理していたのを
             // codex/review・Cursor 指摘で是正）。
-            (ColumnType::Integer | ColumnType::BigInt, _) => {
+            (ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt, _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: INTEGER/BIGINT column is not supported for file-form INSERT"
                 )))
@@ -4784,6 +4808,10 @@ pub(crate) enum AggregateInput {
     /// #892）。`SUM` の結果は `i128` 累積・確定時に `i64` へ収まるか検査する
     /// （D2。`Accumulator::IntSum`）。`BIGINT` 列の `SUM` は numeric で返す（Issue #2271）。
     IntegerColumn(usize),
+    /// `SMALLINT` 列の裸の列参照。受理範囲・累積方式は `IntegerColumn` と共有する
+    /// （値表現が同一〔`ScalarRef::Integer`〕）。結果型のみ異なり、`SUM` は bigint、
+    /// `MIN`/`MAX` は smallint（Issue #1559・TABLE-30 ポインタ）。
+    SmallIntColumn(usize),
     /// `BIGINT` 列の裸の列参照。`IntegerColumn` と同じ受理範囲・累積方式を
     /// 共有する（`ScalarRef::BigInt` からそのまま `i64` を取り出す点のみが
     /// 異なる）。
@@ -5509,6 +5537,9 @@ fn resolve_aggregate_input(
                     // `INTEGER`／`BIGINT` 列は `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
                     // のすべてで受理する（TABLE-13・TASK-196、Issue #881・
                     // #892）。
+                    // `SMALLINT` 列も全集計を受理する（Issue #1559・TABLE-30 ポインタ）。
+                    // 結果型（sum→bigint・min/max→smallint）を区別するため専用 variant。
+                    (ColumnType::SmallInt, _) => Ok(AggregateInput::SmallIntColumn(index)),
                     (ColumnType::Integer, _) => Ok(AggregateInput::IntegerColumn(index)),
                     (ColumnType::BigInt, _) => Ok(AggregateInput::BigIntColumn(index)),
                     // `REAL`／`DOUBLE PRECISION` 列も同様にすべての集計関数を
@@ -5638,7 +5669,8 @@ fn resolve_aggregate_input(
                 | ExprType::Bool
                 | ExprType::Text
                 | ExprType::Date
-                | ExprType::Timestamp => Err(SqlSurfaceError::invalid_input(
+                | ExprType::Timestamp
+                | ExprType::Json => Err(SqlSurfaceError::invalid_input(
                     "aggregate argument must evaluate to a scalar",
                 )),
             }
@@ -5693,6 +5725,7 @@ fn resolve_count_distinct_input(
                     ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with COUNT(DISTINCT ...)"
                     ))),
+                    ColumnType::SmallInt => Ok(AggregateInput::SmallIntColumn(index)),
                     ColumnType::Integer => Ok(AggregateInput::IntegerColumn(index)),
                     ColumnType::BigInt => Ok(AggregateInput::BigIntColumn(index)),
                     ColumnType::Real => Ok(AggregateInput::RealColumn(index)),
@@ -5745,7 +5778,8 @@ fn resolve_count_distinct_input(
                 | ExprType::Bool
                 | ExprType::Text
                 | ExprType::Date
-                | ExprType::Timestamp => Err(SqlSurfaceError::invalid_input(
+                | ExprType::Timestamp
+                | ExprType::Json => Err(SqlSurfaceError::invalid_input(
                     "aggregate argument must evaluate to a scalar",
                 )),
             }
@@ -6121,6 +6155,10 @@ pub(crate) enum OrderKind {
     Uuid,
     /// `ENUM`（宣言順のラベル添字。文字列順ではない）。
     Enum,
+    /// `JSONB`（Issue #1597・TABLE-25。[`crate::json::jsonb_sort_key`] のバイト列順）。
+    /// 式キー（jsonb 列の裸のキーも式として束縛する）専用で、GROUP BY・DISTINCT 用の
+    /// [`resolve_order_kind`] は返さない。
+    Jsonb,
 }
 
 /// スカラー `ORDER BY` の束縛済み 1 キー分（Issue #915・SQL-25）。
@@ -6138,9 +6176,11 @@ pub(crate) struct BoundOrderKey {
 fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
     match ty {
         ColumnType::Text | ColumnType::Varchar => Some(OrderKind::Bytes),
-        ColumnType::Integer | ColumnType::BigInt | ColumnType::Date | ColumnType::Timestamp => {
-            Some(OrderKind::SignedInt)
-        }
+        ColumnType::SmallInt
+        | ColumnType::Integer
+        | ColumnType::BigInt
+        | ColumnType::Date
+        | ColumnType::Timestamp => Some(OrderKind::SignedInt),
         ColumnType::Real | ColumnType::Double => Some(OrderKind::Float),
         ColumnType::Boolean => Some(OrderKind::Bool),
         ColumnType::Numeric { .. } => Some(OrderKind::Numeric),
@@ -6213,6 +6253,8 @@ fn order_kind_for_expr_type(
         ExprType::Vector => Err(SqlSurfaceError::invalid_input(
             "unsupported ORDER BY expression type: VECTOR",
         )),
+        // Issue #1597・TABLE-25: jsonb 式はソートキー（バイト列順）で並べ替える。
+        ExprType::Json => Ok(OrderKind::Jsonb),
     }
 }
 
@@ -6252,11 +6294,29 @@ fn bind_scan_order_keys(
         match key {
             ResolvedScanOrderKey::Plain(k) => match k.as_ref() {
                 ScanOrderKey::Column(k) => {
+                    // Issue #1597: jsonb 列の裸のキーは列比較器（`resolve_order_kind` は
+                    // GROUP BY・DISTINCT と共有で jsonb を返さない）ではなく、列参照の式キー
+                    // として登録し、行ごとにソートキーを作って並べ替える。
+                    if let Some(index) = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == k.column && matches!(c.ty, ColumnType::Jsonb))
+                    {
+                        let be = crate::sql::udf_call::BoundExpr::JsonbColumnRef { index };
+                        let program = crate::sql::expr_program::ExprProgram::compile(&be);
+                        bound.push(BoundOrderKey {
+                            target: BoundOrderTarget::Expr(exprs.len()),
+                            kind: OrderKind::Jsonb,
+                            descending: k.descending,
+                        });
+                        exprs.push((be, program));
+                        continue;
+                    }
                     bound.extend(bind_scalar_order_by(std::slice::from_ref(k), schema)?);
                 }
                 ScanOrderKey::Expr { expr, descending } => {
                     let (be, ty) =
-                        crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+                        crate::sql::udf_call::bind_order_expr(expr, schema, udfs, node_budget)?;
                     let kind = order_kind_for_expr_type(ty)?;
                     let program = crate::sql::expr_program::ExprProgram::compile(&be);
                     bound.push(BoundOrderKey {
@@ -6605,7 +6665,7 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
     {
         let kind = match &column.ty {
             ColumnType::Text | ColumnType::Varchar => WindowKeyKind::Text,
-            ColumnType::Integer => WindowKeyKind::Integer,
+            ColumnType::SmallInt | ColumnType::Integer => WindowKeyKind::Integer,
             ColumnType::BigInt => WindowKeyKind::BigInt,
             ColumnType::Real => WindowKeyKind::Real,
             ColumnType::Double => WindowKeyKind::Double,
@@ -6774,7 +6834,7 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
                 collect_expr_idents(arg, out);
             }
         }
-        Expr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
             collect_expr_idents(lhs, out);
             collect_expr_idents(rhs, out);
         }
@@ -6948,6 +7008,13 @@ pub(crate) fn bind_scan_with_dummy_flags(
     )?;
     let (order_by, order_exprs) =
         bind_scan_order_keys(&resolved_keys, schema, udfs, &mut node_budget)?;
+    // Issue #1597: ウィンドウ付き取得は式キーを持てない（行順をウィンドウ経路が別に計算する）
+    // ため、jsonb キーは誤順序で成功させず明示的に拒否する。
+    if !stmt.window_items.is_empty() && order_by.iter().any(|k| k.kind == OrderKind::Jsonb) {
+        return Err(SqlSurfaceError::unsupported(
+            "ORDER BY a jsonb value is not supported with window functions",
+        ));
+    }
 
     // Issue #353 と同じく、`expr_filters` を束縛時に 1 回だけステップ列コンパイル
     // する（行ループでの再帰評価をなくす）。
@@ -7264,6 +7331,7 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
             }
             AggregateInput::IdU64
             | AggregateInput::IntegerColumn(_)
+            | AggregateInput::SmallIntColumn(_)
             | AggregateInput::BigIntColumn(_) => ColumnType::BigInt,
             AggregateInput::RealColumn(_)
             | AggregateInput::DoubleColumn(_)
@@ -7370,6 +7438,11 @@ fn rewrite_group_row_idents(
                 Some(e) => Some(Box::new(rec(e)?)),
                 None => None,
             },
+        },
+        Expr::JsonAccess { op, lhs, rhs } => Expr::JsonAccess {
+            op: *op,
+            lhs: Box::new(rec(lhs)?),
+            rhs: Box::new(rec(rhs)?),
         },
         Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(rec).collect::<Result<_, _>>()?),
         Expr::NullIf(a, b) => Expr::NullIf(Box::new(rec(a)?), Box::new(rec(b)?)),

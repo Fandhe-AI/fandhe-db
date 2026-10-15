@@ -591,11 +591,13 @@ fn bind_copy_record(
                 // 直し、`InsertLiteral::String` 拒否（PG 互換の暗黙変換は
                 // 行わない設計判断）を経由させずに数値リテラル同等の検証
                 // （範囲外 `22003`・非整数形式 `22P02`）を適用する。
-                ColumnType::Integer | ColumnType::BigInt => bind_integer_literal(
-                    name,
-                    column.ty.clone(),
-                    &InsertLiteral::Number(s.clone()),
-                )?,
+                ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => {
+                    bind_integer_literal(
+                        name,
+                        column.ty.clone(),
+                        &InsertLiteral::Number(s.clone()),
+                    )?
+                }
             },
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {

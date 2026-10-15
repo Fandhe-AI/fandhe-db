@@ -1,8 +1,9 @@
-//! 列型の拡大変換（`INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`）に伴う
-//! 既存行の一括書き換え（TABLE-19・Issue #1361。ポインタ表記のみ）。
+//! 列型変換（`INTEGER`／`SMALLINT`→`BIGINT`・`REAL`→`DOUBLE PRECISION`・
+//! `BIGINT`→`SMALLINT`）に伴う既存行の一括書き換えと、`INTEGER`→`SMALLINT` の
+//! 範囲検証のみの走査（TABLE-19・TABLE-30・TABLE-40・Issue #1361・#1560。ポインタ表記のみ）。
 //!
 //! スカラー行ペイロード（`row_codec::encode_scalar_columns`）は列位置に依存する
-//! 固定形式で、この 2 変換は列のフレーム幅（presence 1 + 4 バイト → presence 1 +
+//! 固定形式で、拡大 2 変換と `BIGINT`→`SMALLINT` は列のフレーム幅（presence 1 + 4 バイト → presence 1 +
 //! 8 バイト）を変える。カタログだけを書き換えると既存行を誤読するため、
 //! `catalog::Storage::alter_table_alter_column_type` が呼び出し元の write txn 内で
 //! 本モジュールを呼び、全テナントの既存行を新スキーマで再エンコードする。
@@ -32,13 +33,35 @@ use crate::storage::{decode_row_for_key, encode_row, RowInput};
 /// キーだけを集めて走査を閉じてから書き換える（行サイズによらずメモリを抑える）。
 const REWRITE_BATCH_KEYS: usize = 1024;
 
-/// 行の書き換えを要する拡大変換の種別。
+/// 行の書き換えを要する型変換の種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WideningKind {
-    /// `INTEGER`（i32）→ `BIGINT`（i64）。
+    /// `INTEGER`（i32）または `SMALLINT`（i16。値表現は `Value::Integer` で共通）
+    /// → `BIGINT`（i64）。
     IntegerToBigInt,
+    /// `BIGINT`（i64）→ `SMALLINT`（i16）。全行が範囲内であることを検証しつつ書き換える
+    /// （範囲外が 1 行でもあれば [`RewriteOutcome::OutOfRange`]。Issue #1560）。
+    BigIntToSmallInt,
     /// `REAL`（f32）→ `DOUBLE PRECISION`（f64）。
     RealToDouble,
+}
+
+/// 走査・書き換えの結果。範囲外は破損（`CorruptSchema`・`XX000`）と区別するため
+/// エラーではなく別の結果として返し、呼び出し元が固定文言の `22003` へ写像する
+/// （値・テナント・行 id は載せない。呼び出し元は commit せず txn を破棄する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewriteOutcome {
+    Done,
+    OutOfRange,
+}
+
+/// 走査の動作。
+#[derive(Clone, Copy)]
+enum Mode {
+    Rewrite(WideningKind),
+    /// 行を書き換えず `SMALLINT` の範囲だけを検査する（`INTEGER`→`SMALLINT`。
+    /// 行のレイアウトと正準キーのタグが同一のためバイト列は不変）。
+    ValidateSmallInt,
 }
 
 fn corrupt(message: &'static str) -> CatalogError {
@@ -54,12 +77,49 @@ pub(crate) fn rewrite_rows_for_widening_in_txn(
     new_schema: &TableSchema,
     logical_index: usize,
     kind: WideningKind,
-) -> Result<(), CatalogError> {
+) -> Result<RewriteOutcome, CatalogError> {
+    scan_rows_in_txn(
+        write_txn,
+        table_name,
+        old_schema,
+        new_schema,
+        logical_index,
+        Mode::Rewrite(kind),
+    )
+}
+
+/// `INTEGER`→`SMALLINT` の縮小で、全テナント・全可視性の既存行が `i16` に収まるかを
+/// 検証する（行は書き換えない）。`PolicyContext` で絞ると不可視行の範囲外値を見逃し、
+/// 読み出し時の decode 失敗を招くため全行が対象。
+pub(crate) fn validate_rows_fit_smallint_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    old_schema: &TableSchema,
+    logical_index: usize,
+) -> Result<RewriteOutcome, CatalogError> {
+    scan_rows_in_txn(
+        write_txn,
+        table_name,
+        old_schema,
+        old_schema,
+        logical_index,
+        Mode::ValidateSmallInt,
+    )
+}
+
+fn scan_rows_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    old_schema: &TableSchema,
+    new_schema: &TableSchema,
+    logical_index: usize,
+    mode: Mode,
+) -> Result<RewriteOutcome, CatalogError> {
     let row_table_name = user_rows_table_name(table_name);
     let mut row_table = match write_txn.open_table(user_rows_table_def(&row_table_name)) {
         Ok(t) => t,
         // 行ストア未作成（既存行 0 件）。
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(RewriteOutcome::Done),
         Err(e) => return Err(map_row_table_error(e)),
     };
 
@@ -83,7 +143,7 @@ pub(crate) fn rewrite_rows_for_widening_in_txn(
             }
         }
         let Some(last) = keys.last().cloned() else {
-            return Ok(());
+            return Ok(RewriteOutcome::Done);
         };
         let full = keys.len() >= REWRITE_BATCH_KEYS;
 
@@ -99,9 +159,27 @@ pub(crate) fn rewrite_rows_for_widening_in_txn(
             let slot = values
                 .get_mut(logical_index)
                 .ok_or_else(|| corrupt("column index out of range during column rewrite"))?;
+            let kind = match mode {
+                Mode::ValidateSmallInt => {
+                    match slot {
+                        Value::Null => {}
+                        Value::Integer(i) if i16::try_from(*i).is_ok() => {}
+                        Value::Integer(_) => return Ok(RewriteOutcome::OutOfRange),
+                        _ => return Err(corrupt("unexpected value type during column rewrite")),
+                    }
+                    continue;
+                }
+                Mode::Rewrite(kind) => kind,
+            };
             *slot = match (kind, std::mem::replace(slot, Value::Null)) {
                 (_, Value::Null) => Value::Null,
                 (WideningKind::IntegerToBigInt, Value::Integer(i)) => Value::BigInt(i64::from(i)),
+                (WideningKind::BigIntToSmallInt, Value::BigInt(i)) => {
+                    match i32::try_from(i).ok().filter(|v| i16::try_from(*v).is_ok()) {
+                        Some(v) => Value::Integer(v),
+                        None => return Ok(RewriteOutcome::OutOfRange),
+                    }
+                }
                 (WideningKind::RealToDouble, Value::Real(r)) => {
                     Value::Double(crate::scalar_float::canonicalize_double(f64::from(r)))
                 }
@@ -120,7 +198,7 @@ pub(crate) fn rewrite_rows_for_widening_in_txn(
         }
 
         if !full {
-            return Ok(());
+            return Ok(RewriteOutcome::Done);
         }
         resume = Some(last);
     }

@@ -261,6 +261,7 @@ impl ReferencedColumns {
                 | AggregateInput::EnumColumn(index)
                 | AggregateInput::UuidColumn(index)
                 | AggregateInput::IntegerColumn(index)
+                | AggregateInput::SmallIntColumn(index)
                 | AggregateInput::BigIntColumn(index)
                 | AggregateInput::RealColumn(index)
                 | AggregateInput::DoubleColumn(index) => {
@@ -737,22 +738,33 @@ impl Accumulator {
             (Min, AggregateInput::TextColumn(_)) => Accumulator::TextMin(None),
             (Max, AggregateInput::TextColumn(_)) => Accumulator::TextMax(None),
             // Issue #892（D2）: `INTEGER`/`BIGINT` 列。`SUM`/`AVG` は `i128` で
-            // 正確に累積する。`SUM(INTEGER)` は確定時（`finish`）に `i64` 範囲を
+            // 正確に累積する。`SUM(INTEGER/SMALLINT)` は確定時（`finish`）に `i64` 範囲を
             // 検査し、`SUM(BIGINT)` は numeric で返す（Issue #2271）。
-            (Sum, AggregateInput::IntegerColumn(_)) => Accumulator::IntSum(None),
+            (Sum, AggregateInput::IntegerColumn(_) | AggregateInput::SmallIntColumn(_)) => {
+                Accumulator::IntSum(None)
+            }
             (Sum, AggregateInput::BigIntColumn(_)) => Accumulator::BigIntSum(None),
-            (Avg, AggregateInput::IntegerColumn(_) | AggregateInput::BigIntColumn(_)) => {
-                Accumulator::IntAvg {
-                    sum: None,
-                    count: 0,
-                }
-            }
-            (Min, AggregateInput::IntegerColumn(_) | AggregateInput::BigIntColumn(_)) => {
-                Accumulator::IntMin(None)
-            }
-            (Max, AggregateInput::IntegerColumn(_) | AggregateInput::BigIntColumn(_)) => {
-                Accumulator::IntMax(None)
-            }
+            (
+                Avg,
+                AggregateInput::IntegerColumn(_)
+                | AggregateInput::SmallIntColumn(_)
+                | AggregateInput::BigIntColumn(_),
+            ) => Accumulator::IntAvg {
+                sum: None,
+                count: 0,
+            },
+            (
+                Min,
+                AggregateInput::IntegerColumn(_)
+                | AggregateInput::SmallIntColumn(_)
+                | AggregateInput::BigIntColumn(_),
+            ) => Accumulator::IntMin(None),
+            (
+                Max,
+                AggregateInput::IntegerColumn(_)
+                | AggregateInput::SmallIntColumn(_)
+                | AggregateInput::BigIntColumn(_),
+            ) => Accumulator::IntMax(None),
             // Issue #892（D4）: `REAL`/`DOUBLE PRECISION` 列。`ScalarExpr` と
             // 同じ `f64` 累積アキュムレータを共有する（結果はどちらも
             // `Cell::Float`）。
@@ -897,7 +909,7 @@ impl Accumulator {
             // すべてを受理する（TABLE-13・TASK-196、Issue #881・#892）。`SUM`/
             // `AVG` は `i128` で累積し、確定時（`finish`）に `i64` 範囲を
             // 検査する（D2）。
-            AggregateInput::IntegerColumn(index) => {
+            AggregateInput::IntegerColumn(index) | AggregateInput::SmallIntColumn(index) => {
                 let value = match scanned.get(*index).copied().flatten() {
                     Some(row_codec::ScalarRef::Integer(v)) => Some(i64::from(v)),
                     Some(_) => {
@@ -1099,7 +1111,7 @@ impl Accumulator {
                 .flatten()
                 .and_then(|v| v.as_text())
                 .map(|s| s.as_bytes().to_vec()),
-            AggregateInput::IntegerColumn(index) => match scanned.get(*index).copied().flatten() {
+            AggregateInput::IntegerColumn(index) | AggregateInput::SmallIntColumn(index) => match scanned.get(*index).copied().flatten() {
                 Some(row_codec::ScalarRef::Integer(v)) => Some(v.to_be_bytes().to_vec()),
                 Some(_) => {
                     return Err(accumulator_bug(
@@ -2422,16 +2434,22 @@ pub(crate) fn aggregate_result_type(
             scale: 0,
         },
         (Avg, AggregateInput::IdU64) => ColumnType::Double,
-        (Sum, AggregateInput::IntegerColumn(_)) => ColumnType::BigInt,
+        (Sum, AggregateInput::IntegerColumn(_) | AggregateInput::SmallIntColumn(_)) => {
+            ColumnType::BigInt
+        }
         // Issue #2271（TABLE-13）: `sum(int8)` は PostgreSQL と同じく numeric。
         (Sum, AggregateInput::BigIntColumn(_)) => ColumnType::Numeric {
             precision: crate::numeric::MAX_PRECISION,
             scale: 0,
         },
-        (Avg, AggregateInput::IntegerColumn(_) | AggregateInput::BigIntColumn(_)) => {
-            ColumnType::Double
-        }
+        (
+            Avg,
+            AggregateInput::IntegerColumn(_)
+            | AggregateInput::SmallIntColumn(_)
+            | AggregateInput::BigIntColumn(_),
+        ) => ColumnType::Double,
         (Min | Max, AggregateInput::IntegerColumn(_)) => ColumnType::Integer,
+        (Min | Max, AggregateInput::SmallIntColumn(_)) => ColumnType::SmallInt,
         (Min | Max, AggregateInput::BigIntColumn(_)) => ColumnType::BigInt,
         // `SUM(REAL)` は PostgreSQL と同じく real（`Accumulator::RealSum`）。
         (Sum | Min | Max, AggregateInput::RealColumn(_)) => ColumnType::Real,

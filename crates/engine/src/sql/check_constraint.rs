@@ -149,6 +149,14 @@ fn render_expr(expr: &Expr) -> String {
         // 契約。`escape_literal` は同モジュールの既存ヘルパーを共有する）。
         Expr::String(s) => format!("'{}'", escape_literal(s)),
         Expr::Ident(name) => name.clone(),
+        // jsonb パス演算子（Issue #1596）。構文段が CHECK 本体での使用を `0A000` で拒否する
+        // ため通常は到達しないが、`Expr` の全 variant を網羅するため、往復できる丸括弧付きで出す。
+        Expr::JsonAccess { op, lhs, rhs } => format!(
+            "({} {} {})",
+            render_expr(lhs),
+            op.as_sql(),
+            render_expr(rhs)
+        ),
         // codex-review（Cursor Bugbot）P1 指摘対応: `POSITION` は組み込み関数の
         // 中で唯一カンマ区切りではない SQL 標準特殊構文（`POSITION(needle IN
         // haystack)`）を持つ（`sql::allowlist::Parser::parse_function_call_expr`
@@ -415,7 +423,7 @@ fn referenced_column_names(
                     collect_idents(arg, acc);
                 }
             }
-            Expr::Binary { lhs, rhs, .. } => {
+            Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
                 collect_idents(lhs, acc);
                 collect_idents(rhs, acc);
             }
