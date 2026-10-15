@@ -1040,3 +1040,21 @@ fn float_column_compares_with_sum_bigint_scalar_subquery() {
         assert_eq!(r.rows.len(), 1, "{col}");
     }
 }
+
+/// `IN`／`NOT IN` の内側に集計（`SUM(BIGINT)`）は元々置けない（42601）。SUM の戻り値型
+/// 変更（Issue #2271）の前後で挙動が変わらないことを固定する。
+#[test]
+fn in_subquery_with_sum_bigint_stays_unsupported() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    for kw in ["IN", "NOT IN"] {
+        let err = core
+            .execute_sql(
+                &alice,
+                &format!("SELECT id FROM {TABLE} WHERE b {kw} (SELECT SUM(b) FROM {TABLE} LIMIT 10) LIMIT 10"),
+            )
+            .expect_err("aggregate inside IN subquery is unsupported");
+        assert_eq!(err.wire_code(), "42601", "{kw}");
+    }
+}
