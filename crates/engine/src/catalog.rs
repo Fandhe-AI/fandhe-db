@@ -1163,6 +1163,9 @@ const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &[
     "varchar",
     "char",
     "character",
+    // Issue #1569（TABLE-32）。`TIME`・`TIMETZ` は型名解決表の語。
+    "time",
+    "timetz",
 ];
 
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、
@@ -1613,6 +1616,12 @@ pub enum ColumnType {
     /// （naive）値で、内部表現は 1970-01-01 00:00:00 起点のマイクロ秒（`i64`）。
     /// 値の解析・整形は [`crate::datetime`] へ委譲する。
     Timestamp,
+    /// 時刻列（`TIME [WITHOUT TIME ZONE]`、TABLE-32・Issue #1569）。タイムゾーンを
+    /// 持たず、内部表現は 0 時起点のマイクロ秒（`i64`。受理範囲 `00:00:00`〜
+    /// `24:00:00` の両端を含む）。カタログタグは `time`・param は `-` 固定。値の解析・
+    /// 整形は [`crate::datetime`] へ委譲する。PK・UNIQUE・索引・述語は #1570 まで
+    /// fail-closed。
+    Time,
     /// 可変長の同型スカラー配列列（`<スカラー型>[]`、TABLE-14・TASK-198、Issue #888）。
     /// 要素型・要素数上限は [`ArrayType`] が保持する。検索経路（KNN・hybrid・ANN・
     /// 二次索引・`EXPLAIN`）からは一貫して非対象として除外する（`VECTOR` 列との
@@ -1818,6 +1827,9 @@ impl ColumnType {
             ColumnType::Boolean => 4,
             ColumnType::Date => 5,
             ColumnType::Timestamp => 6,
+            // `Time` は PK／UNIQUE 非許可（Issue #1569。#1570 で解禁）。到達しない契約の
+            // ため `Vector` と同じ番兵 0 を返し、呼び出し元（`constraint.rs`）が拒否する。
+            ColumnType::Time => 0,
             ColumnType::Bytea => 7,
             ColumnType::Uuid => 8,
             ColumnType::Enum(_) => 9,
@@ -1855,6 +1867,7 @@ impl ColumnType {
             ColumnType::Boolean => ("boolean", "-".to_string()),
             ColumnType::Date => ("date", "-".to_string()),
             ColumnType::Timestamp => ("timestamp", "-".to_string()),
+            ColumnType::Time => ("time", "-".to_string()),
             ColumnType::Array(array_ty) => ("array", array_ty.catalog_param()),
             ColumnType::Bytea => ("bytea", "-".to_string()),
             ColumnType::Json => ("json", "-".to_string()),
@@ -1975,6 +1988,14 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::Timestamp)
+            }
+            "time" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "time column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Time)
             }
             "array" => Ok(ColumnType::Array(parse_array_param(param, resolve_enum)?)),
             "bytea" => {
@@ -3280,6 +3301,7 @@ impl ColumnDefault {
                     | ColumnType::Bpchar(_)
                     | ColumnType::Date
                     | ColumnType::Timestamp
+                    | ColumnType::Time
                     | ColumnType::Uuid
                     | ColumnType::Enum(_)
                     | ColumnType::Json
@@ -4238,6 +4260,7 @@ impl TableSchema {
             | ColumnType::Boolean
             | ColumnType::Date
             | ColumnType::Timestamp
+            | ColumnType::Time
             | ColumnType::Bytea
             | ColumnType::Json
             | ColumnType::Jsonb
@@ -10586,6 +10609,7 @@ fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> boo
                 | "varchar"
                 | "date"
                 | "timestamp"
+                | "time"
                 | "uuid"
                 | "enum"
                 | "json"

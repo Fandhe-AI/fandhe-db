@@ -106,6 +106,7 @@ impl ScoringBoost {
             | ColumnType::Boolean
             | ColumnType::Date
             | ColumnType::Timestamp
+            | ColumnType::Time
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json

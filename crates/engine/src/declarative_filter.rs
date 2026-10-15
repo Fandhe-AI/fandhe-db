@@ -750,6 +750,7 @@ fn bind_filter_op(
                 | ColumnType::Boolean
                 | ColumnType::Date
                 | ColumnType::Timestamp
+                | ColumnType::Time
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json

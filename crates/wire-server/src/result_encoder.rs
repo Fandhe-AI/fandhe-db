@@ -547,7 +547,8 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Jsonb
         | ColumnType::Numeric { .. }
         | ColumnType::Date
-        | ColumnType::Timestamp => false,
+        | ColumnType::Timestamp
+        | ColumnType::Time => false,
     }
 }
 
@@ -593,7 +594,8 @@ fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeE
         | ColumnType::Jsonb
         | ColumnType::Numeric { .. }
         | ColumnType::Date
-        | ColumnType::Timestamp => Ok(-1),
+        | ColumnType::Timestamp
+        | ColumnType::Time => Ok(-1),
     }
 }
 
@@ -645,6 +647,10 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         engine::catalog::ColumnType::Double => WireType::Float8,
         engine::catalog::ColumnType::Date => WireType::Date,
         engine::catalog::ColumnType::Timestamp => WireType::Timestamp,
+        // TIME は暫定で text（OID 25）を公告する（Issue #1569）。値は `Cell::Time` で
+        // text 形式は `format_time` により正しく描画される。time（OID 1083・typlen 8）への
+        // 切替とバイナリ入出力は兄弟 Issue（#1571）で行う。
+        engine::catalog::ColumnType::Time => WireType::Text,
         engine::catalog::ColumnType::Bytea => WireType::Bytea,
         engine::catalog::ColumnType::Uuid => WireType::Uuid,
         engine::catalog::ColumnType::Json => WireType::Json,
@@ -791,6 +797,8 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         // `timestamp`（1114）を公告する。WIRE-13・TASK-200・Issue #895）。
         Cell::Date(days) => Ok(Some(engine::datetime::format_date(*days))),
         Cell::Timestamp(micros) => Ok(Some(engine::datetime::format_timestamp(*micros))),
+        // TIME は `HH:MM:SS[.ffffff]` に整形する（Issue #1569。OID は暫定で text）。
+        Cell::Time(micros) => Ok(Some(engine::datetime::format_time(*micros))),
         Cell::Array(array_value) => Ok(Some(pg_array_text(array_value))),
         // `BYTEA` のテキスト表現は PostgreSQL 既定の `bytea_output=hex`（`\x` ＋
         // 小文字 16 進）と同形にする（B5・Issue #886）。
@@ -2873,5 +2881,31 @@ mod tests {
         one_computed_binary(T::Bpchar(5), Cell::Text("ab  ".to_string()), &mut a).unwrap();
         one_computed_binary(T::Text, Cell::Text("ab  ".to_string()), &mut b).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// Issue #1569: TIME は暫定で text（OID 25）を公告し、値は `HH:MM:SS[.ffffff]` で
+    /// 出力する。バイナリ結果は #1571 まで fail-closed に非対応。
+    #[test]
+    fn time_column_is_advertised_as_text_with_formatted_text_and_no_binary() {
+        use engine::catalog::ColumnType;
+        let meta = ColumnMeta::Scalar {
+            name: "t".to_string(),
+            ty: ColumnType::Time,
+        };
+        assert_eq!(column_wire_type(&meta), WireType::Text);
+        assert!(!column_binary_support(&meta));
+        for (micros, want) in [
+            (0, "00:00:00"),
+            (86_399_999_999, "23:59:59.999999"),
+            (86_400_000_000, "24:00:00"),
+        ] {
+            assert_eq!(
+                cell_to_text_for_column(&meta, &Cell::Time(micros)).expect("text"),
+                Some(want.to_string())
+            );
+        }
+        let columns = vec![meta];
+        let err = validate_binary_formats(&columns, &[FormatCode::Binary]).unwrap_err();
+        assert_eq!(err, BinaryFormatError::UnsupportedType { column_index: 0 });
     }
 }
