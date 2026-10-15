@@ -302,6 +302,11 @@ pub struct BoundInsert {
     /// `None` を `23502` で拒否済みのため常に `Some`。`CompareOnlyWithoutLedger`
     /// でのみ `None` になり得る。
     pub operation_id: Option<OperationId>,
+    /// 時刻値関数の `DEFAULT`（`DEFAULT now()` 系。SQL-37・TABLE-16・Issue #1587）を
+    /// 省略列へ適用した列の `schema.columns` 上の位置。`values` には評価済みの時刻が入るが、
+    /// 内容照合ハッシュは評価値ではなく列の DEFAULT 構文形から計算する（設計 D1・D2。
+    /// 再送で評価時刻が変わっても同一ハッシュにするため）。空なら従来どおり値だけでハッシュする。
+    pub volatile_default_columns: Vec<usize>,
 }
 
 /// 束縛済みの単一行・`id` 指定形 `DELETE` 文（SQL-18・TASK-191。#867 が
@@ -2637,13 +2642,29 @@ pub(crate) fn fill_omitted_columns(
     columns: &[ColumnDef],
     bound_values: &mut [crate::row_codec::Value],
     provided: &[bool],
-) -> Result<(), SqlSurfaceError> {
+    clock: Option<crate::sql::time_fn::StatementClock>,
+) -> Result<Vec<usize>, SqlSurfaceError> {
+    // 時刻 DEFAULT を適用した列の位置（内容照合ハッシュが評価値の代わりに DEFAULT 構文形を
+    // 使う対象。`BoundInsert::volatile_default_columns`）。
+    let mut volatile: Vec<usize> = Vec::new();
     for (idx, column) in columns.iter().enumerate() {
         let is_provided = provided.get(idx).copied().unwrap_or(false);
         if is_provided {
             continue;
         }
         match &column.default {
+            Some(ColumnDefault::CurrentTime(time)) => {
+                // 評価時刻の無い文脈は `0A000`（fail-closed。ファイル INSERT・FK の
+                // SET DEFAULT 等は `bind_column_default` 側で常に拒否される）。
+                let clock = clock.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
+                    detail: "time function DEFAULT is not supported in this context".to_string(),
+                })?;
+                let value = crate::sql::time_fn::eval_time_default(*time, &clock)?;
+                if let Some(slot) = bound_values.get_mut(idx) {
+                    *slot = value;
+                }
+                volatile.push(idx);
+            }
             Some(default) => {
                 let value = bind_column_default(column, default)?;
                 if let Some(slot) = bound_values.get_mut(idx) {
@@ -2657,7 +2678,7 @@ pub(crate) fn fill_omitted_columns(
             }
         }
     }
-    Ok(())
+    Ok(volatile)
 }
 
 /// 文字列リテラルを TEXT／`VARCHAR(n)` 列の [`crate::row_codec::Value::Text`] へ束縛する
@@ -2689,6 +2710,18 @@ pub(crate) fn bind_column_default(
     default: &ColumnDefault,
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {
     use crate::row_codec::{DefaultBindError, ScalarRef, Value};
+    // 時刻値関数の DEFAULT は評価時刻を要するため、この共通関数（定数 DEFAULT 専用）では
+    // 常に `0A000`（既定が拒否の fail-closed。INSERT の省略列補完は `fill_omitted_columns`
+    // が評価する。ファイル INSERT・FK の SET DEFAULT 等の新経路が追加されても拒否が抜けない。
+    // SQL-37・Issue #1587、設計 D9）。
+    if matches!(default, ColumnDefault::CurrentTime(_)) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!(
+                "column {:?} time function DEFAULT is not supported in this context",
+                column.name
+            ),
+        });
+    }
     // 変換本体は `row_codec::default_scalar`（既存行の読み出し時補完と
     // 共有する唯一の実装。Issue #1169）。ここでは SQLSTATE への写像のみ行う。
     // BYTEA は借用の `ScalarRef` で返せない（`default_scalar` は `Incompatible`）ため、
@@ -2987,13 +3020,21 @@ fn bind_insert_row(
         }
     }
 
-    fill_omitted_columns(&schema.columns, &mut bound_values, &provided)?;
+    // 時刻 DEFAULT の評価時刻は `core.rs` の INSERT 入口が `DefaultClockScope` で渡す
+    // （無ければ時刻 DEFAULT は `0A000`）。
+    let volatile_default_columns = fill_omitted_columns(
+        &schema.columns,
+        &mut bound_values,
+        &provided,
+        crate::sql::time_fn::current_default_clock(),
+    )?;
 
     Ok(BoundInsert {
         table: table_name.to_string(),
         id,
         values: bound_values,
         operation_id: operation_id.clone(),
+        volatile_default_columns,
     })
 }
 

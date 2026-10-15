@@ -21,8 +21,8 @@ use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::row_codec::{ScalarRef, Value};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::udf_call::{
-    bind_projection_expr, eval_with_scalars, first_non_builtin_call, BoundExpr, Expr, ExprType,
-    ExprValue, UdfRegistry, MAX_EXPR_NODES,
+    bind_projection_expr, eval_with_scalars, first_non_builtin_call_with, BoundExpr, Expr,
+    ExprType, ExprValue, UdfRegistry, MAX_EXPR_NODES,
 };
 
 /// f64 で整数を正確に表現できる上限（2^53）。これを超える BIGINT への代入は精度欠落の
@@ -64,7 +64,13 @@ pub(crate) fn bind_set_expr(
     column: &ColumnDef,
     schema: &TableSchema,
 ) -> Result<BoundSetExpr, SqlSurfaceError> {
-    if first_non_builtin_call(expr).is_some() {
+    // 現在時刻関数は、分割実行 DML がトランザクション固定の時刻だけを受理するスコープを
+    // 開いている間に限り SET 右辺で受理する（原子版の UPDATE SET は従来どおり 42601。
+    // SQL-37・Issue #1587。台帳 v3 を要する原子版は #2188）。
+    let allow_current_time = crate::sql::time_fn::current_clock().is_some()
+        && crate::sql::time_fn::current_clock_policy()
+            == crate::sql::time_fn::ClockPolicy::TxnFixedOnly;
+    if first_non_builtin_call_with(expr, allow_current_time).is_some() {
         return Err(SqlSurfaceError::unsupported(
             "only built-in functions are allowed in a SET expression",
         ));

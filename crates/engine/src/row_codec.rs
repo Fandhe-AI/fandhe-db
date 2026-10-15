@@ -3908,6 +3908,15 @@ pub(crate) fn validate_default(
         (crate::catalog::ColumnDefault::Text(s), ColumnType::Array(at)) => {
             parse_array_default(at, s).map(|_| ())
         }
+        // 時刻値関数の DEFAULT（SQL-37・Issue #1587）は値を評価せず、列型との適合だけを
+        // 検査する（評価は INSERT 時の `sql::parser::fill_omitted_columns` のみ）。
+        (crate::catalog::ColumnDefault::CurrentTime(t), _) => {
+            if t.compatible_with(ty) {
+                Ok(())
+            } else {
+                Err(DefaultBindError::Incompatible)
+            }
+        }
         _ => default_scalar(ty, default).map(|_| ()),
     }
 }
@@ -4039,6 +4048,11 @@ pub(crate) fn default_scalar<'a>(
                 _ => Err(DefaultBindError::Malformed),
             }
         }
+        // 時刻 DEFAULT は評価時刻に依存するため、固定値の補完（読み出し時補完・FK の
+        // SET DEFAULT・`bind_column_default`）には使えない。`Incompatible` で fail-closed
+        // にする（ADD COLUMN ... DEFAULT now() は DDL が `0A000` で拒否するため
+        // 読み出し時補完へは到達しない。設計 D9・D10）。
+        (ColumnDefault::CurrentTime(_), _) => Err(DefaultBindError::Incompatible),
         _ => Err(DefaultBindError::Incompatible),
     }
 }

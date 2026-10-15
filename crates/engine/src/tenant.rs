@@ -1109,6 +1109,79 @@ pub(crate) fn insert_rows_unchecked(
     })
 }
 
+/// 行ごとの「揮発性 DEFAULT（`DEFAULT now()` 系）を適用した列の位置」（SQL-37・TABLE-16・
+/// Issue #1587）。外側が空スライスなら全行が揮発性 DEFAULT なし（従来のハッシュ形）、
+/// 空でなければ `rows` と同じ長さで、行ごとに `sql::parser::BoundInsert::volatile_default_columns`
+/// を渡す。内容照合ハッシュは該当列を評価値ではなく DEFAULT の構文形でハッシュする（設計 D1・D2）。
+pub(crate) type VolatileDefaultColumns<'a> = &'a [&'a [usize]];
+
+/// `volatile` のいずれかの行が揮発性 DEFAULT を持つか。
+fn any_volatile_default(volatile: VolatileDefaultColumns<'_>) -> bool {
+    volatile.iter().any(|row| !row.is_empty())
+}
+
+/// 揮発性 DEFAULT を含み得る INSERT 系ハッシュ材料の 1 行分の列（非 `VECTOR` 列。スキーマ列順）を
+/// 組み立てる。`volatile`（束縛時の列位置）の列は、write トランザクション内で再取得した
+/// `schema` の DEFAULT が時刻 DEFAULT であることを確認し、評価値ではなく構文形を材料にする。
+/// 位置が範囲外・時刻 DEFAULT でない列を指す場合は束縛後にスキーマが変わったとみなし
+/// fail-closed で拒否する（`expected_schema` 一致検査が通る通常経路では到達しない）。
+fn named_expr_columns<'a>(
+    schema: &'a crate::catalog::TableSchema,
+    values: &'a [crate::row_codec::Value],
+    vector_idx: Option<usize>,
+    volatile: &[usize],
+) -> Result<Vec<(&'a str, content_hash::HashColumnInput<'a>)>, TenantWriteError> {
+    for &idx in volatile {
+        let is_time_default = matches!(
+            schema.columns.get(idx).and_then(|c| c.default.as_ref()),
+            Some(crate::catalog::ColumnDefault::CurrentTime(_))
+        );
+        if !is_time_default || Some(idx) == vector_idx {
+            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                "volatile DEFAULT column does not match the table schema".to_string(),
+            )));
+        }
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(schema.columns.len()).map_err(|_| {
+        TenantWriteError::Storage(StorageError::Codec(
+            "failed to reserve insert hash columns".to_string(),
+        ))
+    })?;
+    for (idx, column) in schema.columns.iter().enumerate() {
+        if Some(idx) == vector_idx || matches!(column.ty, crate::catalog::ColumnType::Vector(_)) {
+            continue;
+        }
+        if volatile.contains(&idx) {
+            if let Some(crate::catalog::ColumnDefault::CurrentTime(t)) = column.default.as_ref() {
+                out.push((
+                    column.name.as_str(),
+                    content_hash::HashColumnInput::VolatileDefault(*t),
+                ));
+            }
+        } else if let Some(value) = values.get(idx) {
+            out.push((
+                column.name.as_str(),
+                content_hash::HashColumnInput::Value(value),
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// 行ごとの揮発性 DEFAULT 列の指定が行数と整合するか（空は「全行なし」）。
+fn check_volatile_len(
+    volatile: VolatileDefaultColumns<'_>,
+    rows: usize,
+) -> Result<(), TenantWriteError> {
+    if !volatile.is_empty() && volatile.len() != rows {
+        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+            "volatile DEFAULT column list does not match the row count".to_string(),
+        )));
+    }
+    Ok(())
+}
+
 /// スキーマ列順の型付き値列から 1 行挿入する（`catalog.rs::Storage::insert_typed_row` の
 /// テナント境界付き版。TASK-95・対象ビヘイビア: RECOVER-4, TABLE-12）。
 ///
@@ -1141,6 +1214,7 @@ pub fn insert_typed_row(
         values,
         ledger_write,
         None,
+        &[],
     )
 }
 
@@ -1179,6 +1253,7 @@ pub(crate) fn insert_typed_row_unchecked(
     values: &[crate::row_codec::Value],
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
+    volatile_default_columns: &[usize],
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
     target.with_txn(|write_txn| {
@@ -1245,8 +1320,16 @@ pub(crate) fn insert_typed_row_unchecked(
             })
             .filter_map(|(idx, column)| values.get(idx).map(|value| (column.name.as_str(), value)))
             .collect();
-        let content_hash =
-            content_hash::for_typed_insert(id, visibility, embedding, &named_columns)?;
+        // 揮発性 DEFAULT（`DEFAULT now()` 系。SQL-37・Issue #1587）を適用した列があれば、
+        // 評価値ではなく DEFAULT の構文形をハッシュする別ドメイン（`InsertExpr`）を使う。
+        // 無ければ従来どおり（バイト不変）。
+        let content_hash = if volatile_default_columns.is_empty() {
+            content_hash::for_typed_insert(id, visibility, embedding, &named_columns)?
+        } else {
+            let expr_columns =
+                named_expr_columns(&schema, values, vector_idx, volatile_default_columns)?;
+            content_hash::for_typed_insert_expr(id, visibility, embedding, &expr_columns)?
+        };
         ledger::record_in_txn(
             write_txn,
             ctx.tenant_id(),
@@ -1302,6 +1385,7 @@ pub(crate) fn insert_typed_row_unchecked(
 /// write トランザクション内で再取得したスキーマの不一致を `22000` で拒否）。
 /// 詳細・不一致時の TOCTOU シナリオは [`insert_typed_row_unchecked`] の
 /// ドキュメント参照。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_typed_rows_unchecked(
     target: WriteTarget<'_>,
     table: &str,
@@ -1310,11 +1394,13 @@ pub(crate) fn insert_typed_rows_unchecked(
     rows: &[(u64, &[crate::row_codec::Value])],
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
+    volatile_default_columns: VolatileDefaultColumns<'_>,
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
     if rows.is_empty() {
         return Ok(());
     }
+    check_volatile_len(volatile_default_columns, rows.len())?;
 
     // バッチ内 id 重複検出（`insert_rows_unchecked` と同じ設計。確保はフォール
     // ブルにする。coding-rust.md）。
@@ -1364,7 +1450,17 @@ pub(crate) fn insert_typed_rows_unchecked(
                     "failed to reserve batch hash input".to_string(),
                 ))
             })?;
-            for (id, values) in rows {
+            // 揮発性 DEFAULT を適用した行があるバッチは、全行を `*Expr` 形（列ごとの種別バイト付き）
+            // でハッシュする（SQL-37・Issue #1587。無ければ従来形でバイト不変）。
+            let use_expr = any_volatile_default(volatile_default_columns);
+            type ExprHashRow<'a> = (
+                u64,
+                crate::storage::Visibility,
+                &'a [f32],
+                Vec<(&'a str, content_hash::HashColumnInput<'a>)>,
+            );
+            let mut expr_rows: Vec<ExprHashRow<'_>> = Vec::new();
+            for (row_idx, (id, values)) in rows.iter().enumerate() {
                 let embedding: &[f32] = match vector_idx {
                     Some(idx) => match values.get(idx) {
                         Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
@@ -1377,6 +1473,16 @@ pub(crate) fn insert_typed_rows_unchecked(
                     None => &[],
                 };
                 schema.validate_row_embedding_dim(embedding.len())?;
+                if use_expr {
+                    let row_volatile: &[usize] = volatile_default_columns
+                        .get(row_idx)
+                        .copied()
+                        .unwrap_or(&[]);
+                    let expr_columns =
+                        named_expr_columns(&schema, values, vector_idx, row_volatile)?;
+                    expr_rows.push((*id, visibility, embedding, expr_columns));
+                    continue;
+                }
                 let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
                     .columns
                     .iter()
@@ -1391,11 +1497,19 @@ pub(crate) fn insert_typed_rows_unchecked(
                     .collect();
                 hash_rows.push((*id, visibility, embedding, named_columns));
             }
-            let hash_input: Vec<content_hash::TypedInsertBatchRow<'_>> = hash_rows
-                .iter()
-                .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
-                .collect();
-            let content_hash = content_hash::for_typed_insert_batch(&hash_input)?;
+            let content_hash = if use_expr {
+                let expr_input: Vec<content_hash::TypedInsertExprBatchRow<'_>> = expr_rows
+                    .iter()
+                    .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
+                    .collect();
+                content_hash::for_typed_insert_batch_expr(&expr_input)?
+            } else {
+                let hash_input: Vec<content_hash::TypedInsertBatchRow<'_>> = hash_rows
+                    .iter()
+                    .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
+                    .collect();
+                content_hash::for_typed_insert_batch(&hash_input)?
+            };
             ledger::record_in_txn(
                 write_txn,
                 ctx.tenant_id(),
@@ -1553,6 +1667,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
     action: &UpsertAction<'_>,
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
+    volatile_default_columns: VolatileDefaultColumns<'_>,
 ) -> Result<UpsertOutcome, TenantWriteError> {
     upsert_typed_rows_impl(
         write_target,
@@ -1564,6 +1679,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
         action,
         ledger_write,
         expected_schema,
+        volatile_default_columns,
         None,
     )
 }
@@ -1586,6 +1702,7 @@ pub(crate) fn upsert_typed_rows_capturing_unchecked(
     action: &UpsertAction<'_>,
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
+    volatile_default_columns: VolatileDefaultColumns<'_>,
     project: &mut ReturningProjectFn<'_>,
 ) -> Result<UpsertOutcome, TenantWriteError> {
     upsert_typed_rows_impl(
@@ -1598,6 +1715,7 @@ pub(crate) fn upsert_typed_rows_capturing_unchecked(
         action,
         ledger_write,
         expected_schema,
+        volatile_default_columns,
         Some(project),
     )
 }
@@ -1625,12 +1743,14 @@ fn upsert_typed_rows_impl(
     action: &UpsertAction<'_>,
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
+    volatile_default_columns: VolatileDefaultColumns<'_>,
     mut project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<UpsertOutcome, TenantWriteError> {
     validate_identifier(table)?;
     if rows.is_empty() {
         return Ok(UpsertOutcome::default());
     }
+    check_volatile_len(volatile_default_columns, rows.len())?;
 
     // バッチ内 id 重複検出（`insert_typed_rows_unchecked` と同じ設計。呼び出し元
     // `sql::parser::bind_upsert_form` が束縛時点で既に `22000` として拒否済みの
@@ -1712,7 +1832,17 @@ fn upsert_typed_rows_impl(
                     "failed to reserve upsert batch hash input".to_string(),
                 ))
             })?;
-            for (id, values) in rows {
+            // 揮発性 DEFAULT を適用した行があれば全行を `*Expr` 形でハッシュする
+            // （`insert_typed_rows_unchecked` と同じ。SQL-37・Issue #1587）。
+            let use_expr = any_volatile_default(volatile_default_columns);
+            type ExprHashRow<'a> = (
+                u64,
+                crate::storage::Visibility,
+                &'a [f32],
+                Vec<(&'a str, content_hash::HashColumnInput<'a>)>,
+            );
+            let mut expr_rows: Vec<ExprHashRow<'_>> = Vec::new();
+            for (row_idx, (id, values)) in rows.iter().enumerate() {
                 let embedding: &[f32] = match vector_idx {
                     Some(idx) => match values.get(idx) {
                         Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
@@ -1725,6 +1855,16 @@ fn upsert_typed_rows_impl(
                     None => &[],
                 };
                 schema.validate_row_embedding_dim(embedding.len())?;
+                if use_expr {
+                    let row_volatile: &[usize] = volatile_default_columns
+                        .get(row_idx)
+                        .copied()
+                        .unwrap_or(&[]);
+                    let expr_columns =
+                        named_expr_columns(&schema, values, vector_idx, row_volatile)?;
+                    expr_rows.push((*id, insert_visibility, embedding, expr_columns));
+                    continue;
+                }
                 let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
                     .columns
                     .iter()
@@ -1740,6 +1880,10 @@ fn upsert_typed_rows_impl(
                 hash_rows.push((*id, insert_visibility, embedding, named_columns));
             }
             let hash_input: Vec<content_hash::TypedInsertBatchRow<'_>> = hash_rows
+                .iter()
+                .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
+                .collect();
+            let expr_input: Vec<content_hash::TypedInsertExprBatchRow<'_>> = expr_rows
                 .iter()
                 .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
                 .collect();
@@ -1819,8 +1963,11 @@ fn upsert_typed_rows_impl(
                     content_hash::UpsertHashTarget::Unique(&hash_target_columns)
                 }
             };
-            let content_hash_value =
-                content_hash::for_typed_upsert(&hash_target, &hash_action, &hash_input)?;
+            let content_hash_value = if use_expr {
+                content_hash::for_typed_upsert_expr(&hash_target, &hash_action, &expr_input)?
+            } else {
+                content_hash::for_typed_upsert(&hash_target, &hash_action, &hash_input)?
+            };
             ledger::record_in_txn(
                 write_txn,
                 ctx.tenant_id(),
@@ -7735,6 +7882,7 @@ mod tests {
             &[(5, &row_values([0.0, 2.0], "b.txt", "body-b"))],
             ledger_write,
             None,
+            &[],
         )
         .expect("insert_typed_rows_unchecked");
         expected += 1;
@@ -8011,6 +8159,7 @@ mod tests {
             &action,
             LedgerWrite::Disabled,
             None,
+            &[],
         );
         assert!(
             matches!(result, Err(TenantWriteError::Catalog(_))),
@@ -8346,6 +8495,7 @@ mod tests {
             &UpsertAction::DoNothing,
             ledger(),
             None,
+            &[],
             &mut project,
         );
         assert!(matches!(
@@ -8363,6 +8513,7 @@ mod tests {
             &UpsertAction::DoNothing,
             ledger(),
             None,
+            &[],
         );
         assert_eq!(
             retry.expect("台帳が巻き戻っていること"),
@@ -8389,6 +8540,7 @@ mod tests {
             &UpsertAction::DoUpdate(&assignments),
             ledger2(),
             None,
+            &[],
             &mut project,
         );
         assert!(matches!(
@@ -8475,6 +8627,7 @@ mod tests {
             action,
             ledger,
             None,
+            &[],
             &mut project,
         );
         *projected = count;
@@ -8647,6 +8800,7 @@ mod tests {
             &[(1, &seed)],
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
+            &[],
         )
         .expect("seed unique row");
         truncate_row_body(&storage, 1);
@@ -8710,6 +8864,7 @@ mod tests {
             &[(1, &seed)],
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
+            &[],
         )
         .expect("seed unique row");
 
@@ -8792,6 +8947,7 @@ mod tests {
             &[(1, &seed)],
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
+            &[],
         )
         .expect("seed unique row");
         truncate_row_body(&storage, 1);
@@ -8896,7 +9052,7 @@ mod tests {
         {
             let txn = storage.begin_write_txn().expect("txn");
             let key = JobKey::for_context(&ctx, "docs", &running);
-            record_chunk_progress_in_txn(&txn, &key, &job_hash, 1, 1, 10).expect("running");
+            record_chunk_progress_in_txn(&txn, &key, &job_hash, 1, 1, 10, None).expect("running");
             txn.commit_raw_for_test().expect("commit");
         }
         assert_rejected(&running);
@@ -8942,6 +9098,7 @@ mod tests {
                 1,
                 1,
                 10,
+                None,
             )
             .expect("running");
             txn.commit_raw_for_test().expect("commit");

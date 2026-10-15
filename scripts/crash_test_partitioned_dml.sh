@@ -6,16 +6,17 @@
 # チャンクごとに commit する分割実行（述語形 DELETE／UPDATE）を実行中のプロセスを SIGKILL
 # し、再オープン後に 9.3 節の 4 基準（チャンク原子性・前方一致・ちょうど 1 回・台帳エントリ）
 # を検証する。既存の crash-test 系（1 トランザクションの部分 commit が 0 件）とは別基準で、
-# それらは変更しない。セット番号 mod 4 で delete／update／update-null（SET NULL。Issue #1525）／update-expr（SET 式。Issue #1545）を順に通す。
+# それらは変更しない。セット番号 mod 5 で delete／update／update-null（SET NULL。Issue #1525）／update-expr（SET 式。Issue #1545）／
+# update-now（SET at = now()。固定時刻がジョブ記録に永続化され、kill・再起動後も全行で同じ値。Issue #1587）を順に通す。
 # Makefile の crash-test-partitioned-dml ターゲット・CI の同名ジョブから呼ばれる。
 #
-# 使い方: scripts/crash_test_partitioned_dml.sh [セット数（既定 4）] [反復回数（既定 10）]
+# 使い方: scripts/crash_test_partitioned_dml.sh [セット数（既定 5）] [反復回数（既定 10）]
 
 set -u
 
 # `kill -9` と `wait`（137）は set -e と相性が悪いため、結果は都度 fail-closed に明示チェックする。
 
-SETS="${1:-4}"
+SETS="${1:-5}"
 ITERATIONS="${2:-10}"
 if ! [[ "${SETS}" =~ ^[0-9]+$ ]] || [ "${SETS}" -lt 1 ]; then
   echo "ERROR: sets must be a positive integer, got: ${SETS}" >&2
@@ -55,11 +56,12 @@ completed=0
 
 for set_no in $(seq 1 "${SETS}"); do
   echo "### set ${set_no}/${SETS} ==="
-  case $((set_no % 4)) in
+  case $((set_no % 5)) in
     1) MODE="delete" ;;
     2) MODE="update" ;;
     3) MODE="update-null" ;;
-    *) MODE="update-expr" ;;
+    4) MODE="update-expr" ;;
+    *) MODE="update-now" ;;
   esac
 
   WORKDIR="$(mktemp -d)"

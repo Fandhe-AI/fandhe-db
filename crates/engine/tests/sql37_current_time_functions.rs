@@ -4,7 +4,7 @@
 //!
 //! `EngineCore::execute_sql_in_session`／`execute_sql_in_txn`（production 経路そのもの）で、
 //! トランザクション内固定・文ごと確定・呼び出しごと評価の 3 区分と、時計を確定しない書き込み系
-//! 文脈（INSERT／UPDATE／DELETE／CHECK／DEFAULT／VIEW 本文）の fail-closed 拒否を検証する。
+//! 文脈（INSERT VALUES／UPDATE／DELETE／CHECK／VIEW 本文。列 DEFAULT は #1587 で別スロットに受理）の fail-closed 拒否を検証する。
 //! 時刻の絶対値には依存せず、同値・単調性・型・エラーコードだけを見る（脆いテストにしない）。
 
 use std::time::Duration;
@@ -387,10 +387,9 @@ fn write_contexts_reject_time_functions_fail_closed() {
         )
         .expect_err("delete with now() in txn");
     assert_eq!(err.wire_code(), "0A000");
-    // DEFAULT・CHECK・VIEW 本文は 42601（SQL-37・TABLE-16・TABLE-18）。
+    // CHECK・VIEW 本文は 42601（SQL-37・TABLE-16・TABLE-18）。`DEFAULT now()` 系は Issue #1587 で
+    // 受理に変わった（`tests/sql37_default_now.rs`）。
     for sql in [
-        "CREATE TABLE t1 (embedding VECTOR(2), n TIMESTAMP DEFAULT now())",
-        "CREATE TABLE t2 (embedding VECTOR(2), n TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE t3 (embedding VECTOR(2), n TIMESTAMP, CHECK (n < now()))",
         "CREATE TABLE t4 (embedding VECTOR(2), n TIMESTAMP, CHECK (n < CURRENT_TIMESTAMP))",
         "CREATE VIEW v1 AS SELECT id, now() FROM events LIMIT 10",

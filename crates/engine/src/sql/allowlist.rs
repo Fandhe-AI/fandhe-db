@@ -2844,6 +2844,10 @@ impl ValidatedScan {
 struct ColumnConstraints {
     not_null: bool,
     default: Option<InsertLiteral>,
+    /// 時刻値関数の `DEFAULT`（`DEFAULT now()` 系。SQL-37・TABLE-16・Issue #1587）。
+    /// `default`（定数リテラル）とは排他。`CREATE TABLE` だけが受理し、
+    /// `ALTER TABLE ADD COLUMN` は `0A000`（設計 D10）。
+    time_default: Option<crate::catalog::TimeDefault>,
     unique: bool,
     /// 列制約 `CONSTRAINT <name> UNIQUE` の明示名（TABLE-22。Issue #1428）。
     unique_name: Option<String>,
@@ -7658,6 +7662,14 @@ impl<'a> Parser<'a> {
                         "UNIQUE is not supported in ALTER TABLE ADD COLUMN",
                     ));
                 }
+                // 時刻値関数の DEFAULT は既存行の補完値を固定できないため拒否する
+                // （fail-closed。設計 D10・SQL-37・Issue #1587）。
+                if constraints.time_default.is_some() {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "time function DEFAULT is not supported in ALTER TABLE ADD COLUMN"
+                            .to_string(),
+                    });
+                }
                 // `DEFAULT` を欠く `NOT NULL` は行の有無にかかわらず `42601` で拒否する
                 // （TABLE-16）。`NOT NULL DEFAULT NULL` は既定値なしに正規化されるため
                 // ここで同じく拒否される（Issue #1524・fail-closed）。カタログ・行を参照しない構造判定のため、存在オラクル・
@@ -8254,7 +8266,7 @@ impl<'a> Parser<'a> {
         let column = if let ColumnType::Vector(_) = ty {
             // `VECTOR` は常に非 nullable。`NOT NULL` の明示指定は冗長だが受理する
             // （`constraints.not_null` の値に関わらず `nullable = false` のまま）。
-            if constraints.default.is_some() {
+            if constraints.default.is_some() || constraints.time_default.is_some() {
                 return Err(SqlSurfaceError::unsupported(format!(
                     "column {name:?}: VECTOR columns do not support DEFAULT"
                 )));
@@ -8270,9 +8282,13 @@ impl<'a> Parser<'a> {
             // （`sql::ddl::add_column_default`）に一本化する。配列は種別・長さのみ検査し（Issue #1374）、
             // リテラル種別の不一致は `42601`、長さ超過は `54000`。ENUM の語彙照合は
             // 実行段（`bind_column_default`）と `Storage::create_table` が行う。
-            let default = match &constraints.default {
-                None => None,
-                Some(literal) => Some(crate::sql::ddl::add_column_default(&name, &ty, literal)?),
+            let default = match (&constraints.default, constraints.time_default) {
+                (None, None) => None,
+                (Some(literal), _) => {
+                    Some(crate::sql::ddl::add_column_default(&name, &ty, literal)?)
+                }
+                // 時刻 DEFAULT は評価せず列型との適合だけを検査する（SQL-37・Issue #1587）。
+                (None, Some(t)) => Some(crate::sql::ddl::time_column_default(&name, &ty, t)?),
             };
             let mut column = ColumnDef::new(name, ty, !constraints.not_null);
             if let Some(default) = default {
@@ -8711,6 +8727,7 @@ impl<'a> Parser<'a> {
     fn parse_column_constraints(&mut self) -> Result<ColumnConstraints, SqlSurfaceError> {
         let mut not_null = false;
         let mut default: Option<InsertLiteral> = None;
+        let mut time_default: Option<crate::catalog::TimeDefault> = None;
         // `DEFAULT NULL` は `default` を `None` のまま残すため、重複検出は専用フラグで行う。
         let mut seen_default = false;
         let mut unique = false;
@@ -8755,6 +8772,12 @@ impl<'a> Parser<'a> {
                     return Err(SqlSurfaceError::unsupported("duplicate DEFAULT constraint"));
                 }
                 seen_default = true;
+                // 時刻値関数の DEFAULT（SQL-37・Issue #1587）。式全体がこの形のときだけ
+                // 受理し、複合式（`now() + ...`・CAST 等）は従来の定数式経路へ流して拒否する。
+                if let Some(t) = self.try_parse_time_default()? {
+                    time_default = Some(t);
+                    continue;
+                }
                 // `DEFAULT NULL` は既定値の宣言なしと同義（PostgreSQL も NULL 定数の
                 // 既定値は保存しない）。以降の束縛・カタログ・fast default は
                 // `InsertLiteral::Null` を受け取らない（Issue #1524・SQL-41）。
@@ -8769,9 +8792,108 @@ impl<'a> Parser<'a> {
         Ok(ColumnConstraints {
             not_null,
             default,
+            time_default,
             unique,
             unique_name,
         })
+    }
+
+    /// `DEFAULT` 直後が時刻値関数の単独形か判定し、そうなら消費して返す（SQL-37・
+    /// TABLE-16・Issue #1587）。受理: `now()`・`transaction_timestamp()`・
+    /// `CURRENT_TIMESTAMP[(p)]`・`LOCALTIMESTAMP[(p)]`・`CURRENT_DATE`。
+    /// `statement_timestamp()`・`clock_timestamp()` は書き込み側が未対応のため `0A000`
+    /// （台帳 v3 の #2188 で扱う）。単独形でない場合（直後が演算子・`::` 等、引用付き識別子、
+    /// その他の識別子・関数）は何も消費せず `None` を返し、従来の定数式経路が
+    /// 従来どおりの SQLSTATE で判定する。精度は 0〜6 を構文段で検査する（範囲外は `22023`）。
+    fn try_parse_time_default(
+        &mut self,
+    ) -> Result<Option<crate::catalog::TimeDefault>, SqlSurfaceError> {
+        use crate::catalog::TimeDefault;
+        let pos = self.pos;
+        if self.quoted_null.contains(&pos) {
+            return Ok(None);
+        }
+        let Some(Token::Ident(name)) = self.tokens.get(pos) else {
+            return Ok(None);
+        };
+        let lower = name.to_ascii_lowercase();
+        let empty_call = matches!(
+            (self.tokens.get(pos + 1), self.tokens.get(pos + 2)),
+            (Some(Token::Punct('(')), Some(Token::Punct(')')))
+        );
+        let mut consumed = 0usize;
+        let mut parsed: Option<TimeDefault> = None;
+        if empty_call {
+            consumed = 3;
+            match lower.as_str() {
+                "now" => parsed = Some(TimeDefault::Now),
+                "transaction_timestamp" => parsed = Some(TimeDefault::TransactionTimestamp),
+                "statement_timestamp" | "clock_timestamp" => {
+                    // 末尾が単独形のときだけ 0A000。複合式は従来経路に任せる。
+                    if self.time_default_tail_is_terminal(pos + consumed) {
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "statement_timestamp() and clock_timestamp() are not \
+                                     supported as column DEFAULT"
+                                .to_string(),
+                        });
+                    }
+                    return Ok(None);
+                }
+                _ => consumed = 0,
+            }
+        }
+        if parsed.is_none() {
+            let Some(kind) = ValueFunctionKind::from_keyword(&lower) else {
+                return Ok(None);
+            };
+            let precision = match (
+                self.tokens.get(pos + 1),
+                self.tokens.get(pos + 2),
+                self.tokens.get(pos + 3),
+            ) {
+                (Some(Token::Punct('(')), Some(Token::Number(n)), Some(Token::Punct(')')))
+                    if kind.accepts_precision() =>
+                {
+                    consumed = 4;
+                    match n.parse::<u8>() {
+                        Ok(p) if p <= 6 => Some(p),
+                        _ => {
+                            return Err(SqlSurfaceError::InvalidParameterValue {
+                                detail: "timestamp precision must be between 0 and 6",
+                            })
+                        }
+                    }
+                }
+                (Some(Token::Punct('(')), _, _) => return Ok(None),
+                _ => {
+                    consumed = 1;
+                    None
+                }
+            };
+            parsed = match kind {
+                ValueFunctionKind::CurrentTimestamp => {
+                    Some(TimeDefault::CurrentTimestamp(precision))
+                }
+                ValueFunctionKind::LocalTimestamp => Some(TimeDefault::LocalTimestamp(precision)),
+                ValueFunctionKind::CurrentDate => Some(TimeDefault::CurrentDate),
+                // TIME 型は未実装のため従来の経路（0A000）に任せる。
+                ValueFunctionKind::CurrentTime | ValueFunctionKind::LocalTime => return Ok(None),
+            };
+        }
+        if !self.time_default_tail_is_terminal(pos + consumed) {
+            return Ok(None);
+        }
+        self.pos = pos + consumed;
+        Ok(parsed)
+    }
+
+    /// 時刻 DEFAULT の直後のトークンが「式の続き」でないか（`+ - * /`・`::`・`||`・
+    /// 比較演算子・`.` 付き等は続きとみなして `false`）。
+    fn time_default_tail_is_terminal(&self, at: usize) -> bool {
+        matches!(
+            self.tokens.get(at),
+            None | Some(Token::Punct(',' | ')' | ';')) | Some(Token::Ident(_))
+        )
     }
 
     /// `DROP TABLE <table> [;]` の単一テーブル形のみを受理する（SQL-23、
@@ -16447,6 +16569,76 @@ mod tests {
         assert_eq!(parse("DEFAULT foo").unwrap_err().wire_code(), "42703");
     }
 
+    /// 時刻値関数の `DEFAULT`（SQL-37・TABLE-16・Issue #1587）。単独形だけを時刻 DEFAULT として
+    /// 受理し、複合式・入れ子・未対応の関数は従来どおり拒否する。
+    #[test]
+    fn time_function_default_accepts_only_standalone_forms() {
+        use crate::catalog::TimeDefault;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            Parser::new(&tokens).parse_column_constraints()
+        };
+        for (sql, expected) in [
+            ("DEFAULT now()", TimeDefault::Now),
+            ("DEFAULT NOW ( )", TimeDefault::Now),
+            (
+                "DEFAULT transaction_timestamp()",
+                TimeDefault::TransactionTimestamp,
+            ),
+            (
+                "DEFAULT CURRENT_TIMESTAMP",
+                TimeDefault::CurrentTimestamp(None),
+            ),
+            (
+                "DEFAULT current_timestamp(3)",
+                TimeDefault::CurrentTimestamp(Some(3)),
+            ),
+            ("DEFAULT LOCALTIMESTAMP", TimeDefault::LocalTimestamp(None)),
+            (
+                "DEFAULT LOCALTIMESTAMP(0)",
+                TimeDefault::LocalTimestamp(Some(0)),
+            ),
+            ("DEFAULT CURRENT_DATE", TimeDefault::CurrentDate),
+        ] {
+            let c = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert_eq!(c.time_default, Some(expected), "{sql}");
+            assert_eq!(c.default, None, "{sql}");
+        }
+        // 後続の列制約と共存できる。
+        let c = parse("DEFAULT now() NOT NULL UNIQUE").unwrap();
+        assert_eq!(c.time_default, Some(TimeDefault::Now));
+        assert!(c.not_null && c.unique);
+        // 精度 7 は 22023、複合式・CAST・未対応関数は拒否、TIME 系（型未実装）は従来どおり 42601。
+        assert_eq!(
+            parse("DEFAULT CURRENT_TIMESTAMP(7)")
+                .unwrap_err()
+                .wire_code(),
+            "22023"
+        );
+        for (sql, code) in [
+            ("DEFAULT now() + 1", "42601"),
+            ("DEFAULT now()::text", "42601"),
+            ("DEFAULT now() || 'x'", "42601"),
+            ("DEFAULT CURRENT_TIMESTAMP + 1", "42601"),
+            ("DEFAULT statement_timestamp()", "0A000"),
+            ("DEFAULT clock_timestamp()", "0A000"),
+            ("DEFAULT CURRENT_TIME", "42601"),
+            ("DEFAULT LOCALTIME", "42601"),
+        ] {
+            assert_eq!(parse(sql).unwrap_err().wire_code(), code, "{sql}");
+        }
+        // 引用付き識別子は時刻 DEFAULT にしない（定数式経路が従来どおり拒否する）。
+        let marked =
+            crate::sql::lexer::tokenize_marked("DEFAULT \"current_timestamp\"").expect("tokenize");
+        assert_eq!(
+            Parser::new(&marked)
+                .parse_column_constraints()
+                .unwrap_err()
+                .wire_code(),
+            "42601"
+        );
+    }
+
     /// `DEFAULT` と VALUES の定数式（Issue #1543・SQL-45 のポインタ）。
     #[test]
     fn const_expr_default_and_values() {
@@ -16472,13 +16664,7 @@ mod tests {
             parse("DEFAULT true").unwrap().default,
             Some(InsertLiteral::Bool(true))
         );
-        for sql in [
-            "DEFAULT CURRENT_TIMESTAMP",
-            "DEFAULT now()",
-            "DEFAULT -(1+2)",
-        ] {
-            assert_eq!(parse(sql).unwrap_err().wire_code(), "42601", "{sql}");
-        }
+        assert_eq!(parse("DEFAULT -(1+2)").unwrap_err().wire_code(), "42601");
         assert_eq!(parse("DEFAULT n + 1").unwrap_err().wire_code(), "42703");
         // NULL は定数式の内部でも受理する（算術では NULL 伝播）。引用された "null" は
         // 列参照のまま 42703。

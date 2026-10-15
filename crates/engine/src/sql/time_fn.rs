@@ -8,8 +8,11 @@
 //! 呼び出し文脈: `core.rs` の読み取り文の実行入口（autocommit・明示／暗黙トランザクション・
 //! Describe）が文の先頭で時刻を確定し、[`ClockScope`] を保持している間だけ束縛が時刻関数を
 //! 受理する。スコープ外（INSERT／UPDATE／DELETE／COPY／CHECK／DEFAULT／VIEW 本文／NoSQL 等）は
-//! 既定の `None` のまま `0A000` で拒否される（許可リスト型の fail-closed。書き込み側は
-//! 台帳 v3〔#2188〕・INSERT 系ハッシュ〔#1587〕の実装まで受理しない）。
+//! 既定の `None` のまま `0A000` で拒否される（許可リスト型の fail-closed）。例外は 2 つ:
+//! 列 `DEFAULT now()` 系の評価（[`DefaultClockScope`]。INSERT の省略列補完専用の別スロット。
+//! Issue #1587）と、分割実行 DML の SET・WHERE（[`ClockPolicy::TxnFixedOnly`]。ジョブ開始時に
+//! 確定した固定時刻。設計 D6）。INSERT VALUES 内・原子版 UPDATE SET の時刻関数は台帳 v3
+//! （#2188）の実装まで受理しない。
 //!
 //! 時刻の運搬は `SessionState`／`UdfRegistry` に載せない（`session_at_begin` の clone・
 //! ROLLBACK 復元や `UdfRegistry` の等価比較の意味を崩さないため）。束縛は呼び出しスレッドで
@@ -31,21 +34,69 @@ pub(crate) struct StatementClock {
     pub(crate) stmt_start_micros: i64,
 }
 
+/// 式束縛スコープが受理する時刻関数の範囲（SQL-37・Issue #1587）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClockPolicy {
+    /// すべての時刻関数を受理する（読み取り文。既定）。
+    All,
+    /// トランザクション開始時刻で固定される関数（`now()`・`transaction_timestamp()`・
+    /// `CURRENT_*`・`LOCALTIMESTAMP`）だけを受理する。分割実行 DML（チャンクごとに commit
+    /// する非原子実行）が、ジョブ開始時に確定・永続化した時刻（設計 D6）で全チャンクを
+    /// 束縛するために使う。`statement_timestamp()`・`clock_timestamp()` は実行ごとに値が
+    /// 揺れて再開時に再現できないため `0A000` にする。
+    TxnFixedOnly,
+}
+
 thread_local! {
     /// 現在の束縛スコープの時刻。`None` は時刻関数を受理しない文脈（既定。fail-closed）。
     static CURRENT: Cell<Option<StatementClock>> = const { Cell::new(None) };
+    /// 現在の束縛スコープの受理範囲（[`ClockScope`] が設定。既定は [`ClockPolicy::All`]）。
+    static POLICY: Cell<ClockPolicy> = const { Cell::new(ClockPolicy::All) };
+    /// 列 `DEFAULT now()` 系の評価に使う時刻（INSERT の省略列補完専用）。式束縛用の
+    /// [`CURRENT`] とは別スロットにし、`INSERT VALUES` の式が意図せず時刻関数を受理しない
+    /// ようにする（INSERT VALUES 内の時刻関数は #2188 まで `42601`／`0A000` のまま）。
+    static DEFAULT_CLOCK: Cell<Option<StatementClock>> = const { Cell::new(None) };
+    /// 現在の [`ClockScope`] の確定時刻を束縛が実際に使ったか（`udf_call::require_clock` が立てる）。
+    /// 分割実行 DML が「時刻値関数を含む文か」を AST の網羅走査なしに判定するために使う
+    /// （束縛が時刻を要求した＝含む。判定漏れが fail-closed になる）。
+    static CLOCK_USED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// [`StatementClock`] を現スレッドの束縛スコープへ設定する RAII ガード。drop で直前の値へ戻す
 /// （入れ子・panic でも他文脈へ時刻が漏れない）。
 pub(crate) struct ClockScope {
     prev: Option<StatementClock>,
+    prev_policy: ClockPolicy,
+    prev_used: bool,
 }
 
 impl ClockScope {
     pub(crate) fn enter(clock: StatementClock) -> Self {
         let prev = CURRENT.with(|c| c.replace(Some(clock)));
-        ClockScope { prev }
+        let prev_policy = POLICY.with(|p| p.replace(ClockPolicy::All));
+        let prev_used = CLOCK_USED.with(|u| u.replace(false));
+        ClockScope {
+            prev,
+            prev_policy,
+            prev_used,
+        }
+    }
+
+    /// トランザクション固定の関数だけを受理するスコープ（[`ClockPolicy::TxnFixedOnly`]）。
+    pub(crate) fn enter_txn_fixed_only(clock: StatementClock) -> Self {
+        let prev = CURRENT.with(|c| c.replace(Some(clock)));
+        let prev_policy = POLICY.with(|p| p.replace(ClockPolicy::TxnFixedOnly));
+        let prev_used = CLOCK_USED.with(|u| u.replace(false));
+        ClockScope {
+            prev,
+            prev_policy,
+            prev_used,
+        }
+    }
+
+    /// このスコープの間に、束縛が確定時刻を実際に要求したか（時刻値関数を含む文か）。
+    pub(crate) fn was_used(&self) -> bool {
+        CLOCK_USED.with(|u| u.get())
     }
 }
 
@@ -53,6 +104,81 @@ impl Drop for ClockScope {
     fn drop(&mut self) {
         let prev = self.prev;
         CURRENT.with(|c| c.set(prev));
+        let prev_policy = self.prev_policy;
+        POLICY.with(|p| p.set(prev_policy));
+        let prev_used = self.prev_used;
+        CLOCK_USED.with(|u| u.set(prev_used));
+    }
+}
+
+/// 束縛が確定時刻を使ったことを記録する（`sql::udf_call` の時刻関数束縛が呼ぶ）。
+pub(crate) fn mark_clock_used() {
+    CLOCK_USED.with(|u| u.set(true));
+}
+
+/// 現スレッドの束縛スコープの受理範囲（`sql::udf_call` の `statement_timestamp()`・
+/// `clock_timestamp()` 束縛が読む）。
+pub(crate) fn current_clock_policy() -> ClockPolicy {
+    POLICY.with(|p| p.get())
+}
+
+/// 列 `DEFAULT` の評価時刻を現スレッドへ設定する RAII ガード（INSERT の束縛区間専用。
+/// `core.rs` の INSERT 入口・NoSQL insert の束縛クロージャが保持する。COPY は
+/// 行ごとの束縛が複数の wire メッセージにまたがるため、`CopyInSession` が時刻を保持して
+/// `fill_omitted_columns` へ明示的に渡す）。drop で直前の値へ戻す。
+pub(crate) struct DefaultClockScope {
+    prev: Option<StatementClock>,
+}
+
+impl DefaultClockScope {
+    pub(crate) fn enter(clock: StatementClock) -> Self {
+        let prev = DEFAULT_CLOCK.with(|c| c.replace(Some(clock)));
+        DefaultClockScope { prev }
+    }
+}
+
+impl Drop for DefaultClockScope {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        DEFAULT_CLOCK.with(|c| c.set(prev));
+    }
+}
+
+/// 現スレッドの列 `DEFAULT` 評価時刻（`sql::parser::bind_insert_row` が読む）。
+/// `None` は評価時刻が無い文脈で、時刻 DEFAULT は `0A000`（fail-closed）になる。
+pub(crate) fn current_default_clock() -> Option<StatementClock> {
+    DEFAULT_CLOCK.with(|c| c.get())
+}
+
+/// 時刻 DEFAULT を `clock`（トランザクション開始時刻）で値へ評価する（INSERT の省略列補完用。
+/// SQL-37・TABLE-16・Issue #1587）。`CURRENT_DATE` は日付、それ以外は `TIMESTAMP`
+/// （UTC マイクロ秒。精度指定は四捨五入。範囲外は `22008`）。
+pub(crate) fn eval_time_default(
+    time: crate::catalog::TimeDefault,
+    clock: &StatementClock,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    use crate::catalog::TimeDefault;
+    use crate::row_codec::Value;
+    let timestamp = |precision: Option<u8>| -> Result<Value, SqlSurfaceError> {
+        let micros = match precision {
+            None => clock.txn_start_micros,
+            Some(p) => round_to_precision(clock.txn_start_micros, p).ok_or(
+                SqlSurfaceError::InvalidParameterValue {
+                    detail: "timestamp precision must be between 0 and 6",
+                },
+            )?,
+        };
+        Ok(Value::Timestamp(micros))
+    };
+    match time {
+        TimeDefault::Now | TimeDefault::TransactionTimestamp => timestamp(None),
+        TimeDefault::CurrentTimestamp(p) | TimeDefault::LocalTimestamp(p) => timestamp(p),
+        TimeDefault::CurrentDate => {
+            let days = micros_to_days(clock.txn_start_micros).ok_or_else(|| {
+                SqlSurfaceError::datetime_field_overflow("current date is out of range")
+            })?;
+            Ok(Value::Date(days))
+        }
     }
 }
 
@@ -119,6 +245,64 @@ mod tests {
         assert_eq!(micros_to_days(-1), Some(-1));
         assert_eq!(micros_to_days(0), Some(0));
         assert_eq!(micros_to_days(MICROS_PER_DAY), Some(1));
+    }
+
+    #[test]
+    fn default_clock_scope_is_separate_and_restored() {
+        let c = StatementClock {
+            txn_start_micros: 5,
+            stmt_start_micros: 6,
+        };
+        assert_eq!(current_default_clock(), None);
+        {
+            let _g = DefaultClockScope::enter(c);
+            assert_eq!(current_default_clock(), Some(c));
+            // 式束縛用スロットには漏れない。
+            assert_eq!(current_clock(), None);
+        }
+        assert_eq!(current_default_clock(), None);
+    }
+
+    #[test]
+    fn txn_fixed_only_policy_is_restored() {
+        let c = StatementClock {
+            txn_start_micros: 1,
+            stmt_start_micros: 1,
+        };
+        assert_eq!(current_clock_policy(), ClockPolicy::All);
+        {
+            let _g = ClockScope::enter_txn_fixed_only(c);
+            assert_eq!(current_clock_policy(), ClockPolicy::TxnFixedOnly);
+            {
+                let _inner = ClockScope::enter(c);
+                assert_eq!(current_clock_policy(), ClockPolicy::All);
+            }
+            assert_eq!(current_clock_policy(), ClockPolicy::TxnFixedOnly);
+        }
+        assert_eq!(current_clock_policy(), ClockPolicy::All);
+    }
+
+    #[test]
+    fn eval_time_default_values() {
+        use crate::catalog::TimeDefault;
+        use crate::row_codec::Value;
+        let c = StatementClock {
+            txn_start_micros: 1_234_567,
+            stmt_start_micros: 9,
+        };
+        assert_eq!(
+            eval_time_default(TimeDefault::Now, &c).unwrap(),
+            Value::Timestamp(1_234_567)
+        );
+        assert_eq!(
+            eval_time_default(TimeDefault::CurrentTimestamp(Some(3)), &c).unwrap(),
+            Value::Timestamp(1_235_000)
+        );
+        assert_eq!(
+            eval_time_default(TimeDefault::CurrentDate, &c).unwrap(),
+            Value::Date(0)
+        );
+        assert!(eval_time_default(TimeDefault::LocalTimestamp(Some(7)), &c).is_err());
     }
 
     #[test]

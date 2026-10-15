@@ -3561,6 +3561,7 @@ pub(crate) fn execute_insert_with_schema_in(
         &bound.values,
         ledger_write,
         expected_schema,
+        &bound.volatile_default_columns,
     )
     .map_err(map_insert_write_error)?;
 
@@ -4566,6 +4567,7 @@ pub(crate) fn execute_predicate_delete_partitioned(
     content_hash_value: &crate::recovery::content_hash::ContentHash,
     limits: &crate::sql::parser::PartitionedDmlLimits,
     max_affected_rows: Option<std::num::NonZeroUsize>,
+    fixed_time: Option<i64>,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -4587,6 +4589,7 @@ pub(crate) fn execute_predicate_delete_partitioned(
                 needs_embedding,
                 limits,
                 max_affected_rows,
+                fixed_time,
                 predicate,
             )
         },
@@ -4619,6 +4622,7 @@ pub(crate) fn execute_predicate_update_partitioned(
     content_hash_value: &crate::recovery::content_hash::ContentHash,
     limits: &crate::sql::parser::PartitionedDmlLimits,
     max_affected_rows: Option<std::num::NonZeroUsize>,
+    fixed_time: Option<i64>,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -4642,6 +4646,7 @@ pub(crate) fn execute_predicate_update_partitioned(
                 needs_embedding,
                 limits,
                 max_affected_rows,
+                fixed_time,
                 predicate,
             )
         },
@@ -4761,6 +4766,7 @@ pub(crate) fn execute_insert_batch_with_schema_in(
     let rows: Vec<(u64, &[crate::row_codec::Value])> =
         bounds.iter().map(|b| (b.id, b.values.as_slice())).collect();
 
+    let volatile = volatile_default_columns_of(bounds);
     crate::tenant::insert_typed_rows_unchecked(
         target,
         table,
@@ -4769,6 +4775,7 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         &rows,
         ledger_write,
         expected_schema,
+        &volatile,
     )
     .map_err(map_insert_write_error)?;
 
@@ -4779,6 +4786,18 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         rows_affected,
         incremental: None,
     })
+}
+
+/// 各行の揮発性 DEFAULT 適用列（`BoundInsert::volatile_default_columns`）を `tenant` の
+/// 行ごと指定へ並べる。どの行にも無ければ空（従来のハッシュ形。SQL-37・Issue #1587）。
+fn volatile_default_columns_of(bounds: &[crate::sql::parser::BoundInsert]) -> Vec<&[usize]> {
+    if bounds.iter().all(|b| b.volatile_default_columns.is_empty()) {
+        return Vec::new();
+    }
+    bounds
+        .iter()
+        .map(|b| b.volatile_default_columns.as_slice())
+        .collect()
 }
 
 /// `RETURNING` 句（Issue #873・SQL-21）付き行形 `INSERT`（単一行・複数行
@@ -5050,6 +5069,7 @@ fn execute_upsert_inner(
         }
     };
 
+    let volatile = volatile_default_columns_of(&bound.rows);
     let outcome = match project {
         None => crate::tenant::upsert_typed_rows_unchecked(
             target,
@@ -5061,6 +5081,7 @@ fn execute_upsert_inner(
             &tenant_action,
             ledger_write,
             Some(bound_schema),
+            &volatile,
         ),
         Some(project) => crate::tenant::upsert_typed_rows_capturing_unchecked(
             target,
@@ -5072,6 +5093,7 @@ fn execute_upsert_inner(
             &tenant_action,
             ledger_write,
             Some(bound_schema),
+            &volatile,
             project,
         ),
     }
@@ -5496,6 +5518,7 @@ mod tests {
                     Value::Text("hello".to_string()),
                 ],
                 operation_id: Some(op_id.clone()),
+                volatile_default_columns: Vec::new(),
             }
         }
 
@@ -5634,6 +5657,7 @@ mod tests {
                         Value::Text("ja".to_string()),
                     ],
                     operation_id: Some(seed_op_id),
+                    volatile_default_columns: Vec::new(),
                 },
                 LedgerMode::Ledgered,
             )
@@ -5653,6 +5677,7 @@ mod tests {
                         Value::Text("world".to_string()),
                     ],
                     operation_id: Some(upsert_op_id.clone()),
+                    volatile_default_columns: Vec::new(),
                 }],
                 target: crate::sql::parser::BoundConflictTarget::RowId,
                 action: BoundConflictAction::DoUpdate(vec![(
