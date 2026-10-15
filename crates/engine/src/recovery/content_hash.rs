@@ -1617,7 +1617,7 @@ fn collect_referenced_udfs(
         // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は
         // UDF 呼び出しを持たない葉と同じく子を再帰的に走査するだけでよい
         // （UDF 呼び出しは `Expr::Call` 経由でのみ発生する）。
-        Expr::Null => Ok(()),
+        Expr::Null | Expr::ValueFunction { .. } => Ok(()),
         Expr::Case { whens, else_result } => {
             for (cond, result) in whens {
                 collect_referenced_udfs(cond, udf_registry, out)?;
@@ -1748,7 +1748,8 @@ fn push_set_expr(
             | Expr::Ident(_)
             | Expr::Null
             | Expr::DateLiteral(_)
-            | Expr::TimestampLiteral(_) => {}
+            | Expr::TimestampLiteral(_)
+            | Expr::ValueFunction { .. } => {}
         }
     }
     walk(b, expr);
@@ -1895,6 +1896,16 @@ fn push_dml_expr(
             });
             push_dml_expr(b, lhs, params)?;
             push_dml_expr(b, rhs, params)?;
+        }
+        // タグ 13（対象ビヘイビア: SQL-37。Issue #1586。`multi-row-dml-operation-id.md` で
+        // 予約済み）。括弧なし SQL 値関数を「種別 1 バイト・精度の有無 1 バイト・精度 1 バイト
+        // （無ければ 0）」で直列化する。#1586 の時点では書き込み文が時刻関数を受理しないため
+        // 到達しないが、網羅 match と D3 の契約（既存タグ 1〜12 は不変）のため固定する。
+        Expr::ValueFunction { kind, precision } => {
+            b.push_u8(13);
+            b.push_u8(kind.hash_tag());
+            b.push_u8(u8::from(precision.is_some()));
+            b.push_u8(precision.unwrap_or(0));
         }
     }
     Ok(())
@@ -4262,6 +4273,12 @@ mod tests {
             rhs: Box::new(r),
         }
     }
+    fn value_function(
+        kind: crate::sql::udf_call::ValueFunctionKind,
+        precision: Option<u8>,
+    ) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::ValueFunction { kind, precision }
+    }
     fn call(name: &str, args: Vec<crate::sql::udf_call::Expr>) -> crate::sql::udf_call::Expr {
         crate::sql::udf_call::Expr::Call {
             name: name.to_string(),
@@ -4435,6 +4452,46 @@ mod tests {
                 "json operand swap",
                 json_access(crate::sql::udf_call::JsonAccessOp::Get, n(), m()),
                 json_access(crate::sql::udf_call::JsonAccessOp::Get, m(), n()),
+            ),
+            // Issue #1586（SQL-37）: 括弧なし値関数は種別・精度の有無・精度値で区別される
+            // （タグ 13）。
+            (
+                "value function kind",
+                value_function(
+                    crate::sql::udf_call::ValueFunctionKind::CurrentTimestamp,
+                    None,
+                ),
+                value_function(
+                    crate::sql::udf_call::ValueFunctionKind::LocalTimestamp,
+                    None,
+                ),
+            ),
+            (
+                "value function precision presence",
+                value_function(
+                    crate::sql::udf_call::ValueFunctionKind::CurrentTimestamp,
+                    None,
+                ),
+                value_function(
+                    crate::sql::udf_call::ValueFunctionKind::CurrentTimestamp,
+                    Some(0),
+                ),
+            ),
+            (
+                "value function precision value",
+                value_function(
+                    crate::sql::udf_call::ValueFunctionKind::CurrentTimestamp,
+                    Some(3),
+                ),
+                value_function(
+                    crate::sql::udf_call::ValueFunctionKind::CurrentTimestamp,
+                    Some(6),
+                ),
+            ),
+            (
+                "value function vs identifier",
+                value_function(crate::sql::udf_call::ValueFunctionKind::CurrentDate, None),
+                ident("current_date"),
             ),
             (
                 "beyond 2^53 integer vs decimal spelling",

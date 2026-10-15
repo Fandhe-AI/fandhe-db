@@ -149,6 +149,12 @@ fn render_expr(expr: &Expr) -> String {
         // 契約。`escape_literal` は同モジュールの既存ヘルパーを共有する）。
         Expr::String(s) => format!("'{}'", escape_literal(s)),
         Expr::Ident(name) => name.clone(),
+        // 時刻の値関数は CHECK 本体で `42601` として拒否される（SQL-37・TABLE-16。
+        // `udf_call::first_non_builtin_call`）ため通常は到達しないが、網羅のため往復できる形で出す。
+        Expr::ValueFunction { kind, precision } => match precision {
+            Some(p) => format!("{}({p})", kind.as_sql()),
+            None => kind.as_sql().to_string(),
+        },
         // jsonb パス演算子（Issue #1596）。構文段が CHECK 本体での使用を `0A000` で拒否する
         // ため通常は到達しないが、`Expr` の全 variant を網羅するため、往復できる丸括弧付きで出す。
         Expr::JsonAccess { op, lhs, rhs } => format!(
@@ -427,7 +433,7 @@ fn referenced_column_names(
                 collect_idents(lhs, acc);
                 collect_idents(rhs, acc);
             }
-            Expr::Null => {}
+            Expr::Null | Expr::ValueFunction { .. } => {}
             Expr::Case { whens, else_result } => {
                 for (cond, result) in whens {
                     collect_idents(cond, acc);

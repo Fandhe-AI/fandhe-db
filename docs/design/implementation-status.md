@@ -940,3 +940,11 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 
 - **テスト**: `result_encoder`／`binary_param` の単体テスト、`wire13_type_oid.rs`・`wire14_binary_typed_columns.rs`・`wire14_binary_params.rs`・`nosql17_typed_json_parity.rs`・`nosql13_ddl.rs`。
 - **対象外**: `SMALLINT[]`（OID 1005）と NoSQL の `element_type: "smallint"`（`0A000` のまま）、COPY binary の int2（WIRE-23）、`AVG(smallint)` の numeric 化（#2270）。
+
+**Issue #1586（feat(engine)!: now() 系関数を式評価器に追加する。SQL-37 ポインタ。詳細は [now-evaluated-value-ledger.md](now-evaluated-value-ledger.md)・[datetime-scalar-functions.md](datetime-scalar-functions.md)）**: 読み取り文（投影・`WHERE`・`ORDER BY`・`HAVING`・FROM なし SELECT・`EXPLAIN`・Describe）で `now()`・`transaction_timestamp()`・`statement_timestamp()`・`clock_timestamp()`・`CURRENT_TIMESTAMP[(p)]`・`LOCALTIMESTAMP[(p)]`・`CURRENT_DATE` を受理する。トランザクション開始時刻（autocommit では文の開始時刻）と文の開始時刻は束縛時の定数、`clock_timestamp()` は評価のたびに壁時計を読む（定数畳み込みの対象外）。戻り値型は暫定で `TIMESTAMP`／`DATE`。
+
+- **BREAKING**: `now`・`transaction_timestamp`・`statement_timestamp`・`clock_timestamp` を予約名にした（同名 UDF の定義は `42723`）。`Expr::ValueFunction`・`ValueFunctionKind`・`BuiltinFn::ClockTimestamp` を追加。`now()` 等は `42883` から成功（時計のない文脈は `0A000`）へ変わった。
+- **fail-closed**: 時計を確定するのは読み取り文の入口（`core.rs`）だけ。INSERT VALUES・UPDATE SET（`42601`）、述語形 UPDATE／DELETE の WHERE・COPY・カーソル（`0A000`）、CHECK・DEFAULT・CREATE VIEW 本文（`42601`）は拒否のまま。`CURRENT_TIME`・`LOCALTIME` は `0A000`。
+- **content hash**: 式 DML の直列化に式タグ 13 を追加（既存タグ不変）。
+- **テスト**: `crates/engine/tests/sql37_current_time_functions.rs`（txn 内固定・文ごと確定・呼び出しごと評価・型・列名・精度・拒否コード・引用識別子）、`udf_call`・`time_fn`・`content_hash` の単体テスト。
+- **対象外**: 書き込み文での受理（#1587・#2188）、TIMESTAMPTZ・TIME 型と TimeZone（TABLE-32・TABLE-33）、カーソルの DECLARE、CREATE VIEW 本文、NoSQL（HTTP）表層。

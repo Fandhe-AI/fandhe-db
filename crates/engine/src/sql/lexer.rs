@@ -388,6 +388,20 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     tokenize_impl(input, false, false)
 }
 
+/// 括弧なし SQL 値関数の予約語か（大小無視。SQL-37・Issue #1586。引用付きの同名識別子を
+/// 裸のキーワードと区別するために字句段で印付けする）。
+fn is_value_function_keyword(s: &str) -> bool {
+    [
+        "current_timestamp",
+        "current_date",
+        "current_time",
+        "localtimestamp",
+        "localtime",
+    ]
+    .iter()
+    .any(|k| s.eq_ignore_ascii_case(k))
+}
+
 /// [`tokenize`] と同一だが、二重引用符付き `NULL` を [`Token::QuotedNull`] として返す版
 /// （Issue #1524）。値位置で裸の `NULL` と引用付き `"NULL"` を区別する必要がある
 /// INSERT／UPDATE／CREATE TABLE／ALTER TABLE の許可リスト検証経路だけが使う。
@@ -397,13 +411,16 @@ pub fn tokenize_marked(input: &str) -> Result<Vec<Token>, LexError> {
     tokenize_impl(input, false, true)
 }
 
-/// [`Token::QuotedNull`] を `Token::Ident` へ戻す（引用情報を捨てる。`tokenize` の
-/// 出力と同一になる）。値位置の区別が不要な文種（SELECT・DDL 制御等）へ渡す前に使う。
+/// 引用付き `NULL` の [`Token::QuotedNull`] を `Token::Ident` へ戻す（引用情報を捨てる。
+/// 引用付きの SQL 値関数予約語は `QuotedNull` のまま残す）。値位置の区別が不要な文種（SELECT・DDL 制御等）へ渡す前に使う。
 pub fn demote_quoted_null(tokens: Vec<Token>) -> Vec<Token> {
     tokens
         .into_iter()
         .map(|t| match t {
-            Token::QuotedNull(s) => Token::Ident(s),
+            // 引用付きの SQL 値関数予約語（`"current_date"` 等。SQL-37・Issue #1586）は
+            // 引用情報を保持する（`Parser::new` が式項で列参照として扱うために必要。
+            // 引用付き `NULL` だけを `Ident` へ戻す）。
+            Token::QuotedNull(s) if !is_value_function_keyword(&s) => Token::Ident(s),
             other => other,
         })
         .collect()
@@ -555,7 +572,12 @@ fn tokenize_impl(
             }
             if content.eq_ignore_ascii_case("true") || content.eq_ignore_ascii_case("false") {
                 tokens.push(Token::QuotedBoolWord(content.to_string()));
-            } else if mark_quoted_null && content.eq_ignore_ascii_case("NULL") {
+            } else if (mark_quoted_null && content.eq_ignore_ascii_case("NULL"))
+                || is_value_function_keyword(content)
+            {
+                // 引用付きの `NULL`・SQL 値関数予約語（`"current_date"` 等。SQL-37・Issue #1586）は
+                // 裸のキーワードと区別するため専用トークンにする（`Parser::new` が `Ident` へ
+                // 戻しつつ位置を記録し、式項では列参照として扱う）。
                 tokens.push(Token::QuotedNull(content.to_string()));
             } else {
                 tokens.push(Token::Ident(content.to_string()));

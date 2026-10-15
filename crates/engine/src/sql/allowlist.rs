@@ -19,8 +19,8 @@ use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::relation::{ColumnRef, TableRef};
 use crate::sql::udf_call::{
-    BinOp, Expr, JsonAccessOp, MAX_CALL_ARGS, MAX_CASE_BRANCHES, MAX_CASE_NESTING, MAX_EXPR_DEPTH,
-    MAX_EXPR_NODES, MAX_UDF_PARAMS,
+    BinOp, Expr, JsonAccessOp, ValueFunctionKind, MAX_CALL_ARGS, MAX_CASE_BRANCHES,
+    MAX_CASE_NESTING, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_UDF_PARAMS,
 };
 use crate::sql::using_operation_id::OperationId;
 use crate::sql::where_negation::negate_conjunction;
@@ -4006,6 +4006,17 @@ impl<'a> Parser<'a> {
     /// 文字列リテラル始まり・`NULL` 等は式トリガーに含めない（従来どおり `42601`）。
     /// 関数始まりは頭を従来と同じ深さで読み、直後が算術演算子のときだけ中置式へ継続する
     /// ため、`MAX_EXPR_DEPTH` 境界の既存入力の挙動は変わらない。
+    /// `pos` のトークンが**引用されていない**括弧なし SQL 値関数の予約語か
+    /// （SQL-37・Issue #1586。`parse_primary_expr` の生成条件と同一）。
+    fn is_value_function_keyword_at(&self, pos: usize) -> bool {
+        matches!(
+            self.tokens.get(pos),
+            Some(Token::Ident(name))
+                if !self.quoted_null.contains(&pos)
+                    && ValueFunctionKind::from_keyword(name).is_some()
+        )
+    }
+
     fn parse_select_item(&mut self) -> Result<SelectItem, SqlSurfaceError> {
         let mut is_extract_syntax = false;
         let expr = match self.peek().cloned() {
@@ -4025,7 +4036,8 @@ impl<'a> Parser<'a> {
                             | Token::HashArrowText
                     )
                 );
-                if starts_case {
+                if starts_case || self.is_value_function_keyword_at(self.pos) {
+                    // 括弧なし SQL 値関数（SQL-37・Issue #1586）は列名ではなく式項目。
                     self.parse_projection_infix(0)?
                 } else if starts_call {
                     is_extract_syntax = name.eq_ignore_ascii_case("extract");
@@ -6017,6 +6029,49 @@ impl<'a> Parser<'a> {
                         Err(DateTimeLiteralError::Overflow(detail)) => {
                             Err(SqlSurfaceError::datetime_field_overflow(detail))
                         }
+                    }
+                }
+            }
+            // SQL-37（Issue #1586）: 括弧なし SQL 値関数（`CURRENT_TIMESTAMP`・`CURRENT_DATE`・
+            // `LOCALTIMESTAMP` 等）。**引用されていない**識別子の予約語一致だけで生成する
+            // （`quoted_null` に位置が残る引用付き識別子は列参照のまま）。精度形 `KW(p)` は
+            // 括弧内が整数リテラル 1 個のときだけ（それ以外の `KW(...)` は従来どおり関数呼び出し
+            // として解析し、同名 UDF の呼び出し形を壊さない）。
+            Some(Token::Ident(name))
+                if !self.quoted_null.contains(&self.pos)
+                    && ValueFunctionKind::from_keyword(&name).is_some() =>
+            {
+                let Some(kind) = ValueFunctionKind::from_keyword(&name) else {
+                    return Err(SqlSurfaceError::unsupported("unsupported expression term"));
+                };
+                let precision = match (
+                    self.tokens.get(self.pos + 1),
+                    self.tokens.get(self.pos + 2),
+                    self.tokens.get(self.pos + 3),
+                ) {
+                    (Some(Token::Punct('(')), Some(Token::Number(n)), Some(Token::Punct(')')))
+                        if kind.accepts_precision() =>
+                    {
+                        n.parse::<u8>().ok().map(Some)
+                    }
+                    (Some(Token::Punct('(')), _, _) => None,
+                    _ => Some(None),
+                };
+                match precision {
+                    Some(precision) => {
+                        self.advance();
+                        if precision.is_some() {
+                            // `(` Number `)` の 3 トークンを消費する。
+                            self.advance();
+                            self.advance();
+                            self.advance();
+                        }
+                        self.consume_expr_node()?;
+                        Ok(Expr::ValueFunction { kind, precision })
+                    }
+                    None => {
+                        self.advance();
+                        self.parse_call_expr(name, depth)
                     }
                 }
             }
@@ -11538,6 +11593,8 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_) => false,
+        // 括弧なし値関数（Issue #1586）は関数呼び出しと同様に従来形では書けない式。
+        Expr::ValueFunction { .. } => true,
     }
 }
 

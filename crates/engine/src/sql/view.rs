@@ -508,7 +508,7 @@ fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurface
         // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は
         // 列参照を子に持ちうるため再帰的に検査する。`Expr::Null` は列参照を
         // 持たない。
-        Expr::Null => Ok(()),
+        Expr::Null | Expr::ValueFunction { .. } => Ok(()),
         Expr::Case { whens, else_result } => {
             for (cond, result) in whens {
                 expr_columns_within(columns, cond)?;
