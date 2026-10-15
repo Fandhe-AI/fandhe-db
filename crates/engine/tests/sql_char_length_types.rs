@@ -1,6 +1,6 @@
 //! `VARCHAR(n)`／`CHAR(n)` の宣言（`ColumnType::Varchar(Some(n))`・`ColumnType::Bpchar(n)`）の
 //! 結合テスト。ポインタ: TABLE-31・Issue #1563・#1564（長さ超過 22001・空白の切り詰め。兄弟: #1565 wire typmod・
-//! #1566 CHAR の空白詰めと比較・#1567 ALTER TYPE／FK／索引／UNIQUE）。
+//! #1566 CHAR の空白詰めと比較。#1567 の ALTER TYPE／FK／UNIQUE もここで固定する）。
 //!
 //! production 経路（`EngineCore::execute_sql_in_session`）で、(1) 長さと種別がカタログ param として
 //! 永続化され再起動後に復元されること、(2) n=0・上限超過・u32 あふれが fail-closed に拒否され副作用が
@@ -579,15 +579,6 @@ fn char_unsupported_forms_stay_fail_closed() {
             "{sql} must be rejected while it is out of scope"
         );
     }
-    for sql in [
-        "CREATE TABLE p (c CHAR(3) PRIMARY KEY)",
-        "CREATE TABLE p (c CHAR(3) UNIQUE)",
-    ] {
-        assert!(
-            exec_as("alice", &core, sql).is_err(),
-            "{sql} must be rejected"
-        );
-    }
 }
 
 /// DEFAULT は n 文字へ詰めた形で保持され、ADD COLUMN の補完行も詰めた値になる。
@@ -629,31 +620,458 @@ fn char_padding_beyond_engine_text_limit_is_rejected() {
     assert_eq!(select_count(&core, "SELECT id FROM t LIMIT 10"), 0);
 }
 
-/// 長さ付き型が絡む `ALTER COLUMN TYPE` は既存行が n を超える状態を作りうるため拒否する
-/// （`42804`。解禁は Issue #1567）。長さなしの `TEXT`↔`VARCHAR` は従来どおり成功する。
+/// `ALTER COLUMN TYPE` の文字列系の変換行列（TABLE-19・TABLE-31・Issue #1567）。
+/// 拡大はそのまま、`CHAR(n)` は空白詰め・rtrim の変換、同一型への変更は従来どおり `42804`。
 #[test]
-fn alter_column_type_with_bounded_types_is_incompatible() {
+fn alter_column_type_char_family_matrix() {
     let (path, _g, core) = open("cl-alter");
     ok(
         &core,
-        "CREATE TABLE t (a TEXT, b VARCHAR(3), c CHAR(3), d VARCHAR)",
+        "CREATE TABLE t (a TEXT, b VARCHAR(5), c CHAR(5), d VARCHAR(3), e VARCHAR)",
+    );
+    ok(
+        &core,
+        "INSERT INTO t (id, a, b, c, d) VALUES (1, 'ab', 'abc', 'ab', 'xy') \
+         USING OPERATION_ID 'o1'",
+    );
+    let sel = |col: &str| texts(&core, &format!("SELECT {col} FROM t WHERE id = 1 LIMIT 10"));
+    // 拡大（カタログのみ）。
+    ok(&core, "ALTER TABLE t ALTER COLUMN d TYPE VARCHAR(10)");
+    ok(&core, "ALTER TABLE t ALTER COLUMN d TYPE TEXT");
+    assert_eq!(sel("d"), vec![Some("xy".to_string())]);
+    // TEXT -> CHAR(3): 空白詰め。
+    ok(&core, "ALTER TABLE t ALTER COLUMN a TYPE CHAR(3)");
+    assert_eq!(sel("a"), vec![Some("ab ".to_string())]);
+    // CHAR(5) -> TEXT: rtrim。
+    ok(&core, "ALTER TABLE t ALTER COLUMN c TYPE TEXT");
+    assert_eq!(sel("c"), vec![Some("ab".to_string())]);
+    // VARCHAR(5) -> CHAR(8) -> VARCHAR(4)。
+    ok(&core, "ALTER TABLE t ALTER COLUMN b TYPE CHAR(8)");
+    assert_eq!(sel("b"), vec![Some("abc     ".to_string())]);
+    ok(&core, "ALTER TABLE t ALTER COLUMN b TYPE VARCHAR(4)");
+    assert_eq!(sel("b"), vec![Some("abc".to_string())]);
+    // CHAR(3) -> CHAR(5)。
+    ok(&core, "ALTER TABLE t ALTER COLUMN a TYPE CHAR(5)");
+    assert_eq!(sel("a"), vec![Some("ab   ".to_string())]);
+    // 変換後も比較は rtrim 意味論で、索引の有無に関わらず一致する。
+    assert_eq!(
+        select_count(&core, "SELECT id FROM t WHERE a = 'ab' LIMIT 10"),
+        1
+    );
+    ok(&core, "CREATE INDEX t_a ON t (a)");
+    assert_eq!(
+        select_count(&core, "SELECT id FROM t WHERE a = 'ab ' LIMIT 10"),
+        1
+    );
+    // 同一型への変更は従来どおり拒否する。
+    assert_eq!(
+        code(&core, "ALTER TABLE t ALTER COLUMN a TYPE CHAR(5)"),
+        "42804"
+    );
+    assert_eq!(
+        code(&core, "ALTER TABLE t ALTER COLUMN b TYPE VARCHAR(4)"),
+        "42804"
+    );
+    ok(&core, "ALTER TABLE t ALTER COLUMN e TYPE TEXT");
+    drop(core);
+    assert_eq!(column_type(&path, "t", "a"), ColumnType::Bpchar(5));
+    assert_eq!(column_type(&path, "t", "b"), ColumnType::Varchar(Some(4)));
+    assert_eq!(column_type(&path, "t", "c"), ColumnType::Text);
+    assert_eq!(column_type(&path, "t", "d"), ColumnType::Text);
+    let core = EngineCore::from_storage(
+        Storage::open(&path).expect("reopen"),
+        Box::new(CpuScalarProvider),
+    );
+    assert_eq!(
+        texts(&core, "SELECT a FROM t WHERE id = 1 LIMIT 10"),
+        vec![Some("ab   ".to_string())]
+    );
+}
+
+/// 縮小で超過行が 1 行でもあれば `22001` で失敗し、型・行・件数は一切変わらない（受入条件）。
+/// 超過部分が半角空白のみの値は切り詰めて受理する。
+#[test]
+fn alter_column_type_shrink_with_excess_rows_is_rejected_atomically() {
+    let (path, _g, core) = open("cl-alter-shrink");
+    ok(&core, "CREATE TABLE t (a TEXT, b VARCHAR(10), c CHAR(5))");
+    ok(
+        &core,
+        "INSERT INTO t (id, a, b, c) VALUES (1, 'ab', 'ab', 'ab') USING OPERATION_ID 'o1'",
+    );
+    ok(
+        &core,
+        "INSERT INTO t (id, a, b, c) VALUES (2, 'abcdef', 'abcdef', 'abc') USING OPERATION_ID 'o2'",
     );
     for sql in [
         "ALTER TABLE t ALTER COLUMN a TYPE VARCHAR(3)",
-        "ALTER TABLE t ALTER COLUMN b TYPE TEXT",
-        "ALTER TABLE t ALTER COLUMN b TYPE VARCHAR(10)",
-        "ALTER TABLE t ALTER COLUMN c TYPE TEXT",
+        "ALTER TABLE t ALTER COLUMN a TYPE CHAR(3)",
+        "ALTER TABLE t ALTER COLUMN b TYPE VARCHAR(3)",
+        "ALTER TABLE t ALTER COLUMN b TYPE CHAR(3)",
+        "ALTER TABLE t ALTER COLUMN c TYPE CHAR(2)",
+        "ALTER TABLE t ALTER COLUMN c TYPE VARCHAR(2)",
+    ] {
+        assert_eq!(code(&core, sql), "22001", "{sql}");
+    }
+    drop(core);
+    assert_eq!(column_type(&path, "t", "a"), ColumnType::Text);
+    assert_eq!(column_type(&path, "t", "b"), ColumnType::Varchar(Some(10)));
+    assert_eq!(column_type(&path, "t", "c"), ColumnType::Bpchar(5));
+    let core = EngineCore::from_storage(
+        Storage::open(&path).expect("reopen"),
+        Box::new(CpuScalarProvider),
+    );
+    assert_eq!(
+        texts(&core, "SELECT a FROM t LIMIT 10"),
+        vec![Some("ab".to_string()), Some("abcdef".to_string())]
+    );
+    assert_eq!(
+        texts(&core, "SELECT c FROM t LIMIT 10"),
+        vec![Some("ab   ".to_string()), Some("abc  ".to_string())]
+    );
+    // 超過が空白だけなら切り詰めて受理する。
+    ok(&core, "CREATE TABLE s (a TEXT)");
+    ok(
+        &core,
+        "INSERT INTO s (id, a) VALUES (1, 'ab     ') USING OPERATION_ID 'o3'",
+    );
+    ok(&core, "ALTER TABLE s ALTER COLUMN a TYPE VARCHAR(3)");
+    assert_eq!(
+        texts(&core, "SELECT a FROM s LIMIT 10"),
+        vec![Some("ab ".to_string())]
+    );
+}
+
+/// 列 DEFAULT も新しい型へ変換され、収まらなければ `22001`（行が無くても検査する）。
+#[test]
+fn alter_column_type_converts_column_default() {
+    let (_p, _g, core) = open("cl-alter-default");
+    ok(&core, "CREATE TABLE t (n INT, c TEXT DEFAULT 'a')");
+    ok(
+        &core,
+        "INSERT INTO t (id, n) VALUES (1, 1) USING OPERATION_ID 'o1'",
+    );
+    ok(&core, "ALTER TABLE t ALTER COLUMN c TYPE CHAR(3)");
+    assert_eq!(
+        texts(&core, "SELECT c FROM t WHERE id = 1 LIMIT 10"),
+        vec![Some("a  ".to_string())]
+    );
+    ok(
+        &core,
+        "INSERT INTO t (id, n) VALUES (2, 2) USING OPERATION_ID 'o2'",
+    );
+    assert_eq!(
+        texts(&core, "SELECT c FROM t WHERE id = 2 LIMIT 10"),
+        vec![Some("a  ".to_string())]
+    );
+    // ADD COLUMN の補完行（行バイトを持たない）も新しい型の値になる。
+    ok(&core, "ALTER TABLE t ADD COLUMN d TEXT DEFAULT 'x'");
+    ok(&core, "ALTER TABLE t ALTER COLUMN d TYPE CHAR(2)");
+    assert_eq!(
+        texts(&core, "SELECT d FROM t WHERE id = 1 LIMIT 10"),
+        vec![Some("x ".to_string())]
+    );
+    ok(&core, "ALTER TABLE t ALTER COLUMN c TYPE TEXT");
+    assert_eq!(
+        texts(&core, "SELECT c FROM t WHERE id = 1 LIMIT 10"),
+        vec![Some("a".to_string())]
+    );
+    ok(&core, "CREATE TABLE u (c TEXT DEFAULT 'abcd')");
+    assert_eq!(
+        code(&core, "ALTER TABLE u ALTER COLUMN c TYPE VARCHAR(3)"),
+        "22001"
+    );
+}
+
+/// 変換で値が同一になる行（`'ab'` と `'ab '` が `CHAR(3)` で同値）がある UNIQUE 列の変換は
+/// `23505` で表は不変。別テナントの同値は重複としない。
+#[test]
+fn alter_column_type_rechecks_unique_after_conversion() {
+    let (path, _g, core) = open("cl-alter-uniq");
+    ok(&core, "CREATE TABLE t (u TEXT UNIQUE)");
+    ok(
+        &core,
+        "INSERT INTO t (id, u) VALUES (1, 'ab') USING OPERATION_ID 'o1'",
+    );
+    ok(
+        &core,
+        "INSERT INTO t (id, u) VALUES (2, 'ab ') USING OPERATION_ID 'o2'",
+    );
+    assert_eq!(
+        code(&core, "ALTER TABLE t ALTER COLUMN u TYPE CHAR(3)"),
+        "23505"
+    );
+    assert_eq!(
+        texts(&core, "SELECT u FROM t LIMIT 10"),
+        vec![Some("ab".to_string()), Some("ab ".to_string())]
+    );
+    // テナントをまたぐ同値は重複ではない。
+    ok(&core, "CREATE TABLE t2 (u TEXT UNIQUE)");
+    ok(
+        &core,
+        "INSERT INTO t2 (id, u) VALUES (1, 'ab') USING OPERATION_ID 'o3'",
+    );
+    exec_as(
+        "bob",
+        &core,
+        "INSERT INTO t2 (id, u) VALUES (1, 'ab ') USING OPERATION_ID 'o4'",
+    )
+    .expect("bob insert");
+    ok(&core, "ALTER TABLE t2 ALTER COLUMN u TYPE CHAR(3)");
+    drop(core);
+    assert_eq!(column_type(&path, "t", "u"), ColumnType::Text);
+    assert_eq!(column_type(&path, "t2", "u"), ColumnType::Bpchar(3));
+}
+
+/// `CHAR(n)` の PRIMARY KEY・UNIQUE は末尾空白違いを同値として一意性を検査する。
+#[test]
+fn char_primary_key_and_unique_use_padded_identity() {
+    let (_p, _g, core) = open("cl-bpchar-key");
+    ok(&core, "CREATE TABLE p (c CHAR(3) PRIMARY KEY)");
+    ok(
+        &core,
+        "INSERT INTO p (id, c) VALUES (1, 'a') USING OPERATION_ID 'o1'",
+    );
+    assert_eq!(
+        code(
+            &core,
+            "INSERT INTO p (id, c) VALUES (2, 'a ') USING OPERATION_ID 'o2'"
+        ),
+        "23505"
+    );
+    ok(
+        &core,
+        "INSERT INTO p (id, c) VALUES (2, 'b') USING OPERATION_ID 'o3'",
+    );
+    assert_eq!(select_count(&core, "SELECT id FROM p LIMIT 10"), 2);
+
+    ok(&core, "CREATE TABLE u (c CHAR(3) UNIQUE, n INT)");
+    ok(
+        &core,
+        "INSERT INTO u (id, c, n) VALUES (1, 'a', 1) USING OPERATION_ID 'o5'",
+    );
+    assert_eq!(
+        code(
+            &core,
+            "INSERT INTO u (id, c, n) VALUES (2, 'a', 2) USING OPERATION_ID 'o6'"
+        ),
+        "23505"
+    );
+    // UPSERT の衝突検出も末尾空白違いを同値として扱う（DO NOTHING で行は増えない）。
+    ok(
+        &core,
+        "INSERT INTO u (id, c, n) VALUES (9, 'a  ', 9) ON CONFLICT (c) DO NOTHING \
+         USING OPERATION_ID 'o5b'",
+    );
+    assert_eq!(select_count(&core, "SELECT id FROM u LIMIT 10"), 1);
+    // NULL は区別される（NULLS DISTINCT）。
+    ok(
+        &core,
+        "INSERT INTO u (id, n) VALUES (3, 3) USING OPERATION_ID 'o7'",
+    );
+    ok(
+        &core,
+        "INSERT INTO u (id, n) VALUES (4, 4) USING OPERATION_ID 'o8'",
+    );
+    // 末尾空白だけ違う値を持つ TEXT 列への ADD UNIQUE は成立するが、CHAR 列では重複になる。
+    ok(&core, "CREATE TABLE w (c CHAR(3))");
+    ok(
+        &core,
+        "INSERT INTO w (id, c) VALUES (1, 'a') USING OPERATION_ID 'o9'",
+    );
+    ok(
+        &core,
+        "INSERT INTO w (id, c) VALUES (2, 'a ') USING OPERATION_ID 'o10'",
+    );
+    assert!(exec_as("alice", &core, "ALTER TABLE w ADD UNIQUE (c)").is_err());
+}
+
+/// FK の型照合: `CHAR(n)` の参照元は `CHAR(m)`・`TEXT`・`VARCHAR` の参照先を許し、
+/// 逆（`TEXT`／`VARCHAR` の参照元で `CHAR` の参照先）は宣言時に拒否する。
+#[test]
+fn char_foreign_key_type_matrix_and_integrity() {
+    let (path, _g, core) = open("cl-bpchar-fk");
+    ok(&core, "CREATE TABLE p (code CHAR(5) PRIMARY KEY)");
+    ok(&core, "CREATE TABLE c (ref CHAR(3) REFERENCES p (code))");
+    ok(
+        &core,
+        "INSERT INTO p (id, code) VALUES (1, 'ab') USING OPERATION_ID 'o1'",
+    );
+    ok(
+        &core,
+        "INSERT INTO c (id, ref) VALUES (1, 'ab') USING OPERATION_ID 'o2'",
+    );
+    ok(
+        &core,
+        "INSERT INTO c (id, ref) VALUES (2, 'ab ') USING OPERATION_ID 'o3'",
+    );
+    assert_eq!(
+        code(
+            &core,
+            "INSERT INTO c (id, ref) VALUES (3, 'zz') USING OPERATION_ID 'o4'"
+        ),
+        "23503"
+    );
+    assert_eq!(
+        code(&core, "DELETE FROM p WHERE id = 1 USING OPERATION_ID 'o5'"),
+        "23503"
+    );
+    // TEXT の親: 末尾空白付きの親値は CHAR の子に一致しない。
+    ok(&core, "CREATE TABLE tp (code TEXT PRIMARY KEY)");
+    ok(&core, "CREATE TABLE tc (ref CHAR(3) REFERENCES tp (code))");
+    ok(
+        &core,
+        "INSERT INTO tp (id, code) VALUES (1, 'ab') USING OPERATION_ID 'o6'",
+    );
+    ok(
+        &core,
+        "INSERT INTO tp (id, code) VALUES (2, 'cd ') USING OPERATION_ID 'o7'",
+    );
+    ok(
+        &core,
+        "INSERT INTO tc (id, ref) VALUES (1, 'ab') USING OPERATION_ID 'o8'",
+    );
+    assert_eq!(
+        code(
+            &core,
+            "INSERT INTO tc (id, ref) VALUES (2, 'cd') USING OPERATION_ID 'o9'"
+        ),
+        "23503"
+    );
+    assert_eq!(
+        code(
+            &core,
+            "DELETE FROM tp WHERE id = 1 USING OPERATION_ID 'o10'"
+        ),
+        "23503"
+    );
+    ok(
+        &core,
+        "DELETE FROM tp WHERE id = 2 USING OPERATION_ID 'o11'",
+    );
+    // TEXT の参照元で CHAR の参照先は宣言時に拒否する。
+    assert_eq!(
+        code(&core, "CREATE TABLE bad (ref TEXT REFERENCES p (code))"),
+        "42830"
+    );
+    drop(core);
+    assert!(!table_exists(&path, "bad"));
+}
+
+/// ON DELETE CASCADE と ON UPDATE CASCADE は `CHAR` の子を正しく見つけ、子の長さへ詰め直す。
+#[test]
+fn char_foreign_key_cascade_repads_child_values() {
+    let (_p, _g, core) = open("cl-bpchar-fk-cascade");
+    ok(&core, "CREATE TABLE p (code CHAR(5) PRIMARY KEY)");
+    ok(
+        &core,
+        "CREATE TABLE c (ref CHAR(3) REFERENCES p (code) ON DELETE CASCADE ON UPDATE CASCADE)",
+    );
+    ok(
+        &core,
+        "INSERT INTO p (id, code) VALUES (1, 'ab') USING OPERATION_ID 'o1'",
+    );
+    ok(
+        &core,
+        "INSERT INTO c (id, ref) VALUES (1, 'ab') USING OPERATION_ID 'o2'",
+    );
+    ok(
+        &core,
+        "UPDATE p SET code = 'xy' WHERE id = 1 USING OPERATION_ID 'o3'",
+    );
+    assert_eq!(
+        texts(&core, "SELECT ref FROM c LIMIT 10"),
+        vec![Some("xy ".to_string())]
+    );
+    // 子の長さ（3）を超える親の新値は fail-closed（23503）で、表は変わらない。
+    assert_eq!(
+        code(
+            &core,
+            "UPDATE p SET code = 'wxyz' WHERE id = 1 USING OPERATION_ID 'o4'"
+        ),
+        "23503"
+    );
+    assert_eq!(
+        texts(&core, "SELECT code FROM p LIMIT 10"),
+        vec![Some("xy   ".to_string())]
+    );
+    ok(&core, "DELETE FROM p WHERE id = 1 USING OPERATION_ID 'o5'");
+    assert_eq!(select_count(&core, "SELECT id FROM c LIMIT 10"), 0);
+}
+
+/// ALTER によって FK の型の組が拒否側になる場合（親の列を `TEXT`→`CHAR`）は `42804` で表は不変。
+/// 子の列を `TEXT`→`CHAR` に変えて一致関係が崩れる場合は `23503` で表は不変。
+#[test]
+fn alter_column_type_rechecks_foreign_keys() {
+    let (path, _g, core) = open("cl-alter-fk");
+    ok(&core, "CREATE TABLE p (code TEXT PRIMARY KEY)");
+    ok(&core, "CREATE TABLE c (ref TEXT REFERENCES p (code))");
+    ok(
+        &core,
+        "INSERT INTO p (id, code) VALUES (1, 'ab ') USING OPERATION_ID 'o1'",
+    );
+    ok(
+        &core,
+        "INSERT INTO c (id, ref) VALUES (1, 'ab ') USING OPERATION_ID 'o2'",
+    );
+    // 親を CHAR にすると TEXT の子 -> CHAR の親になり拒否される。
+    assert_eq!(
+        code(&core, "ALTER TABLE p ALTER COLUMN code TYPE CHAR(3)"),
+        "42804"
+    );
+    // 子を CHAR(3) にすると 'ab ' は rtrim で 'ab' となり、親の 'ab ' に一致しなくなる。
+    assert_eq!(
+        code(&core, "ALTER TABLE c ALTER COLUMN ref TYPE CHAR(3)"),
+        "23503"
+    );
+    drop(core);
+    assert_eq!(column_type(&path, "p", "code"), ColumnType::Text);
+    assert_eq!(column_type(&path, "c", "ref"), ColumnType::Text);
+    let core = EngineCore::from_storage(
+        Storage::open(&path).expect("reopen"),
+        Box::new(CpuScalarProvider),
+    );
+    assert_eq!(
+        texts(&core, "SELECT ref FROM c LIMIT 10"),
+        vec![Some("ab ".to_string())]
+    );
+    // 一致関係が保たれるなら受理される（子の値が親と rtrim 後に一致）。
+    ok(
+        &core,
+        "INSERT INTO p (id, code) VALUES (2, 'cd') USING OPERATION_ID 'o3'",
+    );
+    ok(&core, "CREATE TABLE c2 (ref TEXT REFERENCES p (code))");
+    ok(
+        &core,
+        "INSERT INTO c2 (id, ref) VALUES (1, 'cd') USING OPERATION_ID 'o4'",
+    );
+    ok(&core, "ALTER TABLE c2 ALTER COLUMN ref TYPE CHAR(4)");
+    assert_eq!(
+        code(&core, "DELETE FROM p WHERE id = 2 USING OPERATION_ID 'o5'"),
+        "23503"
+    );
+}
+
+/// 拒否・失敗のエラー文言は型と n だけの固定文言で、値・テナント名を含まない。
+#[test]
+fn alter_column_type_errors_do_not_leak_values() {
+    let (_p, _g, core) = open("cl-alter-leak");
+    ok(&core, "CREATE TABLE t (a TEXT UNIQUE)");
+    ok(
+        &core,
+        "INSERT INTO t (id, a) VALUES (1, 'secret-value') USING OPERATION_ID 'o1'",
+    );
+    for sql in [
+        "ALTER TABLE t ALTER COLUMN a TYPE VARCHAR(3)",
         "ALTER TABLE t ALTER COLUMN a TYPE CHAR(3)",
     ] {
-        assert_eq!(code(&core, sql), "42804", "{sql}");
+        let e = exec_as("alice", &core, sql).expect_err("must fail");
+        assert_eq!(e.wire_code(), "22001");
+        let msg = e.to_string();
+        assert!(
+            !msg.contains("secret-value") && !msg.contains("alice"),
+            "{msg}"
+        );
     }
-    ok(&core, "ALTER TABLE t ALTER COLUMN a TYPE VARCHAR");
-    ok(&core, "ALTER TABLE t ALTER COLUMN d TYPE TEXT");
-    drop(core);
-    assert_eq!(column_type(&path, "t", "a"), ColumnType::Varchar(None));
-    assert_eq!(column_type(&path, "t", "b"), ColumnType::Varchar(Some(3)));
-    assert_eq!(column_type(&path, "t", "c"), ColumnType::Bpchar(3));
-    assert_eq!(column_type(&path, "t", "d"), ColumnType::Text);
 }
 
 /// `VARCHAR(n)` の DEFAULT は文字数が n 以下であること。
