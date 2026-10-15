@@ -98,7 +98,7 @@ pub struct BoundConstSelect {
     having: Option<BoundHaving>,
     limit: Option<i64>,
     offset: Option<i64>,
-    /// 集計問い合わせか（集計項目を 1 つでも含む、または `HAVING` がある。（`GROUP BY` なしの集計文は入力 0 行でも 1 行を出す）。
+    /// 集計問い合わせか（集計項目を 1 つでも含む、または `HAVING` がある）。`GROUP BY` なしの集計文は入力 0 行でも 1 行を出す。
     has_aggregate: bool,
 }
 
