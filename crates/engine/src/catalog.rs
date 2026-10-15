@@ -3120,10 +3120,24 @@ pub enum TimeDefault {
 
 impl TimeDefault {
     /// 受理する列型（`TIMESTAMP` 系関数は `TIMESTAMP` 列、`CURRENT_DATE` は `DATE` 列）。
+    ///
+    /// 精度範囲外（7 以上）の形は列型に関わらず不適合とする（永続化前の fail-closed。
+    /// 永続化後に `from_canonical_text` が拒否してテーブルが利用不能になるのを防ぐ）。
     pub(crate) fn compatible_with(self, ty: &ColumnType) -> bool {
+        if !self.precision_in_range() {
+            return false;
+        }
         match self {
             TimeDefault::CurrentDate => matches!(ty, ColumnType::Date),
             _ => matches!(ty, ColumnType::Timestamp),
+        }
+    }
+
+    /// 小数秒精度が 0〜6 の範囲内か（精度なしの形は常に範囲内）。
+    pub(crate) fn precision_in_range(self) -> bool {
+        match self {
+            TimeDefault::CurrentTimestamp(Some(p)) | TimeDefault::LocalTimestamp(Some(p)) => p <= 6,
+            _ => true,
         }
     }
 
@@ -3230,7 +3244,14 @@ impl ColumnDefault {
         let (tag, raw): (char, String) = match self {
             ColumnDefault::Text(s) => ('s', s.clone()),
             ColumnDefault::Number(s) => ('n', s.clone()),
-            ColumnDefault::CurrentTime(t) => ('c', t.canonical_text()),
+            ColumnDefault::CurrentTime(t) => {
+                if !t.precision_in_range() {
+                    return Err(CatalogError::Invalid(
+                        "time function DEFAULT precision out of range (0..=6)".to_string(),
+                    ));
+                }
+                ('c', t.canonical_text())
+            }
             ColumnDefault::Bool(b) => {
                 return Ok(if *b { "t".to_string() } else { "f".to_string() })
             }
@@ -10620,6 +10641,31 @@ mod tests {
             assert!(!default.compatible_with(&bad_ty));
             assert!(!column_default_compatible_with_tag(&default, bad_tag));
             assert!(!default.compatible_with(&ColumnType::Text));
+        }
+    }
+
+    /// 精度範囲外の時刻 DEFAULT は永続化前に拒否され、何も作られない（fail-closed）。
+    #[test]
+    fn create_table_rejects_out_of_range_time_default_precision() {
+        let path = unique_db_path("catalog-time-default-precision");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        for form in [
+            TimeDefault::CurrentTimestamp(Some(7)),
+            TimeDefault::LocalTimestamp(Some(255)),
+        ] {
+            let default = ColumnDefault::CurrentTime(form);
+            assert!(default.encode_catalog_field().is_err());
+            let schema = TableSchema::new(
+                "t",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("at", ColumnType::Timestamp, true).with_default(default),
+                ],
+            );
+            let err = storage.create_table(&schema).expect_err("must reject");
+            assert!(matches!(err, CatalogError::Invalid(_)), "{err:?}");
+            assert!(storage.get_table_schema("t").is_err());
         }
     }
 
