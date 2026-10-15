@@ -2,7 +2,7 @@
 
 ## ステータス・対象
 
-- ステータス: 採用（設計段階。実装は #2454、境界・非連動のテストは #2455。WIRE-25・WIRE-5・WIRE-6・WIRE-11・SQL-46 のポインタのみ。spec 本文は転記しない）
+- ステータス: 採用（設計段階。実装は #2454、境界・非連動のテストは #2455 で実装済み。WIRE-25・WIRE-5・WIRE-6・WIRE-11・SQL-46 のポインタのみ。spec 本文は転記しない）
 - 親: TASK-338（`docs/spec/05-tasks.md`）、WIRE-25（`docs/spec/04-behavior/wire-protocol.md`）
 - 対象フラグ: `--read-timeout-secs`・`--max-connections`・`--max-prepared-statements`
 - 先行: [transaction-limits-cli.md](transaction-limits-cli.md)・[write-lock-wait-cli.md](write-lock-wait-cli.md)・[result-limits-cli.md](result-limits-cli.md)と同型。接続モデルは [wire-connection-model.md](wire-connection-model.md)、明示トランザクションは [explicit-transaction.md](explicit-transaction.md)
@@ -22,7 +22,7 @@
 | D5 | 定数（`MIN_*`/`DEFAULT_*`/`MAX_*`）と `validate_*` は、wire 層だけの概念なので `wire_server::limits` に置き engine の公開面を増やさない（兄弟フラグが engine に置くのとの意図的な逸脱）。CLI パーサーは新規モジュール（仮称 `connection_limits_opt.rs`。#2454 で確定）とし、ASCII 数字だけを受理する厳密パースで既存の `*_opt.rs` と同型にする（`+`・空白・全角数字・オーバーフローを拒否） |
 | D6 | fail-closed: 範囲外・非数値・値欠落・重複指定は bind より前に起動エラーで非 0 終了（last-wins にしない）。環境変数・セッション変数・SQL・NoSQL 要求・テナント単位からは変更できず、プロセス全体・全テナントに同じ値を適用する |
 | D7 | 値の運搬: `ConnectionLimiter::new(max)` と accept ループの `read_timeout` 引数は値を受け取る形で、`main.rs` が定数の代わりに解決済みの値を渡す。リミッターは `match surface` の前に 1 回だけ構築して SQL・NoSQL 表層で共有する（現行維持）。prepared statement 件数は `ExtendedQueryState::new()` から `PreparedStatementStore` へ上限値を注入する（グローバル状態を使わない。並列テストの干渉回避） |
-| D8 | 書き込みロック待機（SQL-46。`--write-lock-wait-ms`、既定 30 秒）と**連動しない**。既定値が同じ 30 秒なのは偶然で、定数を共有せず、一方から他方を導出せず、両者を比べる起動時警告も出さない。どちらかを変えても他方の解決値は変わらない（#2455 で検証） |
+| D8 | 書き込みロック待機（SQL-46。`--write-lock-wait-ms`、既定 30 秒）と**連動しない**。既定値が同じ 30 秒なのは偶然で、定数を共有せず、一方から他方を導出せず、両者を比べる起動時警告も出さない。どちらかを変えても他方の解決値は変わらない（#2455 で検証済み） |
 | D9 | keepalive を送らない（WIRE-25 (4)）。現行の実装に TCP keepalive の設定は無く、アプリケーション層の死活確認も無い。設定値を超えて無通信の接続は WIRE-5 のとおり応答なしで閉じる |
 | D10 | 超過時の応答は従来どおり: 読み取りタイムアウトは応答なしで切断（WIRE-5）、接続数超過は `53300`（WIRE-6。NoSQL は既存の HTTP 射影）、件数超過は `54000`（WIRE-11）。境界は設定値に従い、上限ちょうどまで受理し 1 つ超えたら拒否する。エラー文は英語でフラグ名・値・範囲だけを含む |
 
