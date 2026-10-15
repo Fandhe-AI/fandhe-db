@@ -54,10 +54,11 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::{ExprProgram, StackValue};
 use crate::sql::order_value::{
-    compare_ref_and_owned_values, compare_statement_order, expr_value_to_key_ref,
-    extract_order_value_ref, scalar_key_ref_to_owned, OrderValue, ScalarKeyRef,
+    compare_ref_and_owned_values, compare_statement_order, expr_value_to_jsonb_key,
+    expr_value_to_key_ref, extract_order_value_ref, scalar_key_ref_to_owned, OrderValue,
+    ScalarKeyRef,
 };
-use crate::sql::parser::{BoundOrderKey, BoundOrderTarget, BoundScan, ProjectedColumn};
+use crate::sql::parser::{BoundOrderKey, BoundOrderTarget, BoundScan, OrderKind, ProjectedColumn};
 use crate::sql::udf_call::{self, ExprValue};
 use crate::storage::{self, StorageError};
 use redb::ReadableTable;
@@ -416,7 +417,7 @@ fn predicted_heap_entry_bytes(refs: &[Option<ScalarKeyRef<'_>>], tenant_id_len: 
             .saturating_mul(std::mem::size_of::<Option<OrderValue>>()),
     );
     for r in refs {
-        if let Some(ScalarKeyRef::Bytes(b)) = r {
+        if let Some(ScalarKeyRef::Bytes(b) | ScalarKeyRef::JsonbKey(b)) = r {
             bytes = bytes.saturating_add(b.len());
         }
     }
@@ -976,7 +977,7 @@ fn heap_entry_keys_bytes(entry: &HeapEntry) -> usize {
         .capacity()
         .saturating_mul(std::mem::size_of::<Option<OrderValue>>());
     for key in &entry.keys {
-        if let Some(OrderValue::Bytes(b)) = key {
+        if let Some(OrderValue::Bytes(b) | OrderValue::JsonbKey(b)) = key {
             bytes = bytes.saturating_add(b.len());
         }
     }
@@ -1363,15 +1364,42 @@ pub(crate) fn execute_scan_with_budget(
                             )?);
                         }
                     }
-                    let mut expr_iter = expr_values.iter();
+                    // Issue #1597: jsonb 式キーは行ごとにソートキー（バイト列）を 1 回だけ作り、
+                    // 下の `refs` がそれを借用する（比較器は失敗しないため、格納値の破損・
+                    // 長さ超過はこの段で fail-closed に返す）。式キーと同じ並びで保持する。
+                    let mut jsonb_keys: Vec<Option<Vec<u8>>> =
+                        Vec::with_capacity(expr_values.len());
+                    {
+                        let mut kinds = bound
+                            .order_by
+                            .iter()
+                            .filter(|k| matches!(k.target, BoundOrderTarget::Expr(_)))
+                            .map(|k| k.kind);
+                        for v in &expr_values {
+                            let kind = kinds.next().ok_or_else(|| SqlSurfaceError::Internal {
+                                detail: "expression order key kind missing".to_string(),
+                            })?;
+                            jsonb_keys.push(if kind == OrderKind::Jsonb {
+                                expr_value_to_jsonb_key(v)?
+                            } else {
+                                None
+                            });
+                        }
+                    }
+                    let mut expr_iter = expr_values.iter().zip(jsonb_keys.iter());
                     let mut refs: Vec<Option<ScalarKeyRef<'_>>> =
                         Vec::with_capacity(bound.order_by.len());
                     for key in &bound.order_by {
                         if matches!(key.target, BoundOrderTarget::Expr(_)) {
-                            let v = expr_iter.next().ok_or_else(|| SqlSurfaceError::Internal {
-                                detail: "expression order key value missing".to_string(),
-                            })?;
-                            refs.push(expr_value_to_key_ref(v, key.kind)?);
+                            let (v, jk) =
+                                expr_iter.next().ok_or_else(|| SqlSurfaceError::Internal {
+                                    detail: "expression order key value missing".to_string(),
+                                })?;
+                            if key.kind == OrderKind::Jsonb {
+                                refs.push(jk.as_deref().map(ScalarKeyRef::JsonbKey));
+                            } else {
+                                refs.push(expr_value_to_key_ref(v, key.kind)?);
+                            }
                         } else {
                             refs.push(extract_order_value_ref(schema, key, id, scanned)?);
                         }

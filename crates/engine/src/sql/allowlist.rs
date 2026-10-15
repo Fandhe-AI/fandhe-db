@@ -6431,6 +6431,14 @@ impl<'a> Parser<'a> {
                 if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") {
                     return true;
                 }
+                // Issue #1597: `ORDER BY docb -> 'k'` のように識別子の直後に jsonb パス演算子が
+                // 続く形も式キー（列名キーでは `->` を解釈できない）。
+                if matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Arrow | Token::ArrowText | Token::HashArrow | Token::HashArrowText)
+                ) {
+                    return true;
+                }
                 matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
                     && !is_allowed_order_by_function_name(name)
             }
