@@ -2234,6 +2234,16 @@ fn is_int4_expr(expr: &Expr, env: &BindEnv<'_>) -> bool {
     }
 }
 
+/// 式木に除算が含まれるか（`->`／`->>` の添字右辺を非投影モードで拒否する判定用）。
+fn contains_div(expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary { op, lhs, rhs } => {
+            matches!(op, BinOp::Div) || contains_div(lhs) || contains_div(rhs)
+        }
+        _ => false,
+    }
+}
+
 /// jsonb パス取得演算子（`->` `->>` `#>` `#>>`。対象ビヘイビア: TABLE-25。Issue #1596）
 /// の束縛。左辺は jsonb 列の参照または入れ子のパス演算子のみ（それ以外は `42883`、
 /// `json` 列は原文保持の意味論が別 Issue のため `0A000`）。右辺は演算子ごとに型規則で
@@ -2291,6 +2301,14 @@ fn bind_json_access(
             match r_ty {
                 ExprType::Text => JsonAccessRhs::Key(Box::new(r_bound)),
                 ExprType::Scalar if is_int4_expr(rhs, env) => {
+                    // 非投影モード（WHERE 等）は整数除算の切り捨てを挿入せず f64 除算になり、
+                    // PostgreSQL の添字と食い違う（`n/2` が 1.5 になり 22003）ため fail-closed で拒否する。
+                    if !env.typed_arith && contains_div(rhs) {
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "integer division in a JSON subscript is supported only in the select list"
+                                .to_string(),
+                        });
+                    }
                     JsonAccessRhs::Index(Box::new(r_bound))
                 }
                 _ => return Err(operator_missing()),

@@ -248,6 +248,8 @@ fn jsonb_values_are_rejected_where_they_cannot_be_consumed_yet() {
         format!("SELECT id FROM {TABLE} WHERE docb -> 'a' = docb -> 'b' LIMIT 10"),
         format!("SELECT id FROM {TABLE} WHERE docb -> 'a' = 'x' LIMIT 10"),
         format!("SELECT COUNT(docb -> 'k') FROM {TABLE}"),
+        // 非投影モードでは整数除算の切り捨てが入らないため、添字右辺の除算は拒否する。
+        format!("SELECT id FROM {TABLE} WHERE docb -> n/2 ->> 'x' = 'y' LIMIT 10"),
         format!("SELECT lower(docb -> 'k') FROM {TABLE} LIMIT 10"),
         format!("SELECT COALESCE(docb -> 'k', docb -> 'a') FROM {TABLE} LIMIT 10"),
     ] {
