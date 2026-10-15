@@ -667,6 +667,9 @@ pub enum BuiltinFn {
 /// [`BoundExpr::Binary`] で表すためここには含めない（Issue #1539・SQL-42）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumericKind {
+    /// `smallint`（`int2`。OID 21。Issue #1560。整数リテラルは分類されず、列参照どうしの
+    /// 算術の結果としてのみ現れる）。
+    Int2,
     /// `integer`（`int4`。OID 23）。
     Int4,
     /// `bigint`（`int8`。OID 20）。
@@ -1642,6 +1645,7 @@ pub(crate) fn expr_result_column_type(
     } = bound
     {
         return Some(match kind {
+            NumericKind::Int2 => ColumnType::SmallInt,
             NumericKind::Int4 => ColumnType::Integer,
             NumericKind::Int8 => ColumnType::BigInt,
             NumericKind::Float4 => ColumnType::Real,
@@ -2355,8 +2359,8 @@ fn numeric_kind(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> Option<Num
         BoundExpr::ColumnRef { index } => {
             let column = env.schema?.columns.get(*index)?;
             match column.ty {
-                // int2 は int4 として扱う（結果型が integer になる既知の差分は #1560 で扱う）。
-                ColumnType::SmallInt | ColumnType::Integer => Some(NumericKind::Int4),
+                ColumnType::SmallInt => Some(NumericKind::Int2),
+                ColumnType::Integer => Some(NumericKind::Int4),
                 ColumnType::BigInt => Some(NumericKind::Int8),
                 ColumnType::Real => Some(NumericKind::Float4),
                 _ => None,
@@ -2375,10 +2379,13 @@ fn numeric_kind(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> Option<Num
 /// 暗黙キャスト候補のうち numeric カテゴリの優先型 float8 が選ばれ
 /// `double precision` になるため、`(Float4, Int*)` は意図的に `None`（倍精度）とする。
 fn combine_numeric_kind(l: Option<NumericKind>, r: Option<NumericKind>) -> Option<NumericKind> {
-    use NumericKind::{Float4, Int4, Int8};
+    use NumericKind::{Float4, Int2, Int4, Int8};
     match (l?, r?) {
-        (Int4, Int4) => Some(Int4),
-        (Int4 | Int8, Int4 | Int8) => Some(Int8),
+        // PostgreSQL の演算子解決: smallint 同士は smallint、int4 が混ざれば integer、
+        // bigint が混ざれば bigint（Issue #1560）。
+        (Int2, Int2) => Some(Int2),
+        (Int2 | Int4, Int2 | Int4) => Some(Int4),
+        (Int2 | Int4 | Int8, Int2 | Int4 | Int8) => Some(Int8),
         (Float4, Float4) => Some(Float4),
         _ => None,
     }
@@ -3761,7 +3768,7 @@ const TYPED_INT_EXACT_MAX: i64 = 1 << 53;
 /// 2^53 を超える場合は束縛段の不変条件違反として `Internal`（fail-closed。panic しない）。
 fn typed_arith(op: BinOp, kind: NumericKind, a: f64, b: f64) -> Result<f64, SqlSurfaceError> {
     match kind {
-        NumericKind::Int4 | NumericKind::Int8 => {
+        NumericKind::Int2 | NumericKind::Int4 | NumericKind::Int8 => {
             let (x, y) = (exact_int(a)?, exact_int(b)?);
             let r = match op {
                 BinOp::Add => x.checked_add(y),
@@ -3779,16 +3786,16 @@ fn typed_arith(op: BinOp, kind: NumericKind, a: f64, b: f64) -> Result<f64, SqlS
                     });
                 }
             };
-            let label = if kind == NumericKind::Int4 {
-                "integer out of range"
-            } else {
-                "bigint out of range"
+            let label = match kind {
+                NumericKind::Int2 => "smallint out of range",
+                NumericKind::Int4 => "integer out of range",
+                _ => "bigint out of range",
             };
             let r = r.ok_or_else(|| SqlSurfaceError::numeric_out_of_range(label))?;
-            let in_range = if kind == NumericKind::Int4 {
-                i32::try_from(r).is_ok()
-            } else {
-                r.unsigned_abs() <= TYPED_INT_EXACT_MAX as u64
+            let in_range = match kind {
+                NumericKind::Int2 => i16::try_from(r).is_ok(),
+                NumericKind::Int4 => i32::try_from(r).is_ok(),
+                _ => r.unsigned_abs() <= TYPED_INT_EXACT_MAX as u64,
             };
             if !in_range {
                 return Err(SqlSurfaceError::numeric_out_of_range(label));
@@ -5640,5 +5647,31 @@ mod tests {
         assert_eq!(code(BinOp::Mul, Float4, 3.0e38, 10.0), "22003");
         assert_eq!(code(BinOp::Mul, Float4, 1.0e-30, 1.0e-30), "22003");
         assert_eq!(code(BinOp::Div, Float4, 1.0, 0.0), "22012");
+    }
+
+    /// Issue #1560: smallint 同士の算術は smallint（i16 の溢れは 22003）、混在は広い方。
+    #[test]
+    fn typed_arith_int2_and_combine_kinds() {
+        use NumericKind::{Float4, Int2, Int4, Int8};
+        assert_eq!(
+            typed_arith(BinOp::Add, Int2, 32766.0, 1.0).unwrap(),
+            32767.0
+        );
+        for (op, a, b) in [
+            (BinOp::Add, 32767.0, 1.0),
+            (BinOp::Sub, -32768.0, 1.0),
+            (BinOp::Mul, 200.0, 200.0),
+            (BinOp::Div, -32768.0, -1.0),
+        ] {
+            let e = typed_arith(op, Int2, a, b).unwrap_err();
+            assert_eq!(e.wire_code().to_string(), "22003");
+        }
+        assert_eq!(combine_numeric_kind(Some(Int2), Some(Int2)), Some(Int2));
+        assert_eq!(combine_numeric_kind(Some(Int2), Some(Int4)), Some(Int4));
+        assert_eq!(combine_numeric_kind(Some(Int4), Some(Int2)), Some(Int4));
+        assert_eq!(combine_numeric_kind(Some(Int2), Some(Int8)), Some(Int8));
+        assert_eq!(combine_numeric_kind(Some(Int8), Some(Int4)), Some(Int8));
+        assert_eq!(combine_numeric_kind(Some(Int2), Some(Float4)), None);
+        assert_eq!(combine_numeric_kind(Some(Int2), None), None);
     }
 }

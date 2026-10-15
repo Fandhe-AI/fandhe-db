@@ -108,7 +108,8 @@ Describe は検証していなかったため範囲外の値が Describe だけ�
 各枝を `bind_scan`（Describe では `bind_scan_with_dummy_flags`）で束縛し、
 投影の `ColumnMeta` 列を得る。列数が不一致、または列ごとの型
 （`ColumnMeta::Id` と `Id` は一致、`Scalar { ty }` は `ColumnType` の完全一致
-のみ許容）が一致しない場合は新設エラー分類 `SqlSurfaceError::DatatypeMismatch`
+に加え、整数型〔`SMALLINT`／`INTEGER`／`BIGINT`〕どうしを互換とし結果列は広い方の型へ
+拡大する〔Issue #1560。名前は左端の枝〕）が一致しない場合は新設エラー分類 `SqlSurfaceError::DatatypeMismatch`
 （`ErrorClass::DatatypeMismatch`。`42804`）で拒否する。`Computed` 列は構文
 検証段で既に排除済みのため到達しない。結果列名・メタデータは常に左端の枝に
 揃える。

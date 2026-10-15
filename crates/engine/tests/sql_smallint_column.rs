@@ -3,7 +3,7 @@
 //! production 経路（`EngineCore::execute_sql_in_session`）で、(1) 型がカタログへ永続化され再オープン
 //! 後も復元されること、(2) INSERT・UPDATE SET・UPSERT・COPY・列 DEFAULT の値束縛が
 //! `-32768..=32767` 外を `22003` で拒否し副作用を残さないこと、(3) 未解禁の機能
-//! （PK／UNIQUE・型変更・配列）が fail-closed に拒否されること、を固定する。述語・集計・索引は
+//! （配列）が fail-closed に拒否されること、を固定する。述語・集計・索引は
 //! Issue #1559 で解禁済み（`sql_smallint_query.rs`）。
 
 use engine::catalog::ColumnType;
@@ -206,8 +206,9 @@ fn upsert_is_range_checked_on_both_sides() {
     assert!(rows(&core, "SELECT id, n FROM t LIMIT 10")[0].contains("SignedInteger(5)"));
 }
 
-/// 兄弟 Issue（#1560 等）や未解禁の機能は INTEGER 扱いで黙って通さず fail-closed に拒否する。
-/// 述語・集計・ORDER BY／GROUP BY・SET 式は #1559 で解禁済み（`sql_smallint_query.rs`）。
+/// 未解禁の機能（配列）は INTEGER 扱いで黙って通さず fail-closed に拒否する。
+/// 述語・集計・ORDER BY／GROUP BY・SET 式は #1559、PK／UNIQUE・型変更は #1560 で解禁済み
+/// （`sql_smallint_query.rs`・`sql_smallint_widening.rs`）。
 #[test]
 fn features_not_yet_enabled_are_rejected_fail_closed() {
     let (_p, _g, core) = open("si-failclosed");
@@ -217,14 +218,21 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
         "INSERT INTO t (id, n, m) VALUES (1, 5, 5) USING OPERATION_ID 'i1'",
     );
     for (sql, want) in [
-        ("CREATE TABLE p (n SMALLINT PRIMARY KEY)", "42601"),
-        ("CREATE TABLE u (n SMALLINT UNIQUE)", "42601"),
-        ("ALTER TABLE t ALTER COLUMN n TYPE INTEGER", "42804"),
         ("CREATE TABLE a (n SMALLINT[])", "0A000"),
         ("CREATE TABLE a (n INT2[3])", "0A000"),
     ] {
         assert_eq!(code(&core, sql), want, "{sql}");
     }
+}
+
+/// Issue #1560: PK／UNIQUE の解禁と SMALLINT↔INTEGER の型変更の受理。
+#[test]
+fn primary_key_unique_and_alter_type_are_enabled() {
+    let (_p, _g, core) = open("si-enabled");
+    ok(&core, "CREATE TABLE p (n SMALLINT PRIMARY KEY)");
+    ok(&core, "CREATE TABLE u (n SMALLINT UNIQUE)");
+    ok(&core, "CREATE TABLE t (n SMALLINT, m INTEGER)");
+    ok(&core, "ALTER TABLE t ALTER COLUMN n TYPE INTEGER");
 }
 
 #[test]
