@@ -6418,8 +6418,11 @@ impl<'a> Parser<'a> {
         // （他の通常関数は従来どおり `false` のまま。`NULL` 許可の対象を
         // 安易に広げると他関数のエラーコード契約が変わるため、`CONCAT` に
         // 限定するスコープにする）。
-        let allow_null_for_this_call =
-            name.eq_ignore_ascii_case("concat") || self.const_expr_null_args;
+        // `json_*`／`to_json`（Issue #2180）も同様に裸の `NULL` を NULL リテラルとして受理する
+        // （新設の関数で、`NULL` という名前の列を渡す後方互換の制約が無い）。
+        let allow_null_for_this_call = name.eq_ignore_ascii_case("concat")
+            || self.const_expr_null_args
+            || crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase());
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
             args.push(

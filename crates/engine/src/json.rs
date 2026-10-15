@@ -175,24 +175,45 @@ pub fn parse_f32_text(text: &str) -> Result<f32, std::num::ParseFloatError> {
     text.parse::<f32>()
 }
 
-struct JsonParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+/// オブジェクトの重複キーの扱い（Issue #2180・TABLE-25）。`jsonb`・NoSQL 要求本文など
+/// 正規化・照合を伴う経路は [`DuplicateKeys::Reject`]（fail-closed。Issue #732）、
+/// 入力テキストを原文のまま保存する `json` 列の格納値を読む経路だけが
+/// [`DuplicateKeys::LastWins`]（PostgreSQL の `json` と同じく最後の値が有効）を使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateKeys {
+    /// 重複キーを [`JsonError`] で拒否する（既定）。
+    Reject,
+    /// 重複キーは最後の値で上書きする。要素数上限は重複を含む生のメンバー数で判定する。
+    LastWins,
+}
+
+/// 共有 JSON パーサ（`crate::json_text` の原文スキャナも位置情報つきで再利用する）。
+pub(crate) struct JsonParser<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) pos: usize,
+    dup: DuplicateKeys,
 }
 
 impl<'a> JsonParser<'a> {
-    fn new(s: &'a str) -> Self {
+    pub(crate) fn new(s: &'a str) -> Self {
         Self {
             bytes: s.as_bytes(),
             pos: 0,
+            dup: DuplicateKeys::Reject,
         }
     }
 
-    fn peek(&self) -> Option<u8> {
+    /// 重複キーの扱いを差し替える（[`parse_json_with`]・`crate::json_text` 用）。
+    pub(crate) fn with_dup(mut self, dup: DuplicateKeys) -> Self {
+        self.dup = dup;
+        self
+    }
+
+    pub(crate) fn peek(&self) -> Option<u8> {
         self.bytes.get(self.pos).copied()
     }
 
-    fn bump(&mut self) -> Option<u8> {
+    pub(crate) fn bump(&mut self) -> Option<u8> {
         let b = self.peek();
         if b.is_some() {
             self.pos += 1;
@@ -200,7 +221,7 @@ impl<'a> JsonParser<'a> {
         b
     }
 
-    fn skip_ws(&mut self) {
+    pub(crate) fn skip_ws(&mut self) {
         while let Some(b) = self.peek() {
             if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
                 self.pos += 1;
@@ -210,14 +231,14 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn expect_byte(&mut self, expected: u8) -> Result<(), JsonError> {
+    pub(crate) fn expect_byte(&mut self, expected: u8) -> Result<(), JsonError> {
         match self.bump() {
             Some(b) if b == expected => Ok(()),
             _ => Err(JsonError),
         }
     }
 
-    fn parse_value(&mut self, depth: usize) -> Result<JsonValue, JsonError> {
+    pub(crate) fn parse_value(&mut self, depth: usize) -> Result<JsonValue, JsonError> {
         if depth > MAX_JSON_DEPTH {
             return Err(JsonError);
         }
@@ -242,6 +263,9 @@ impl<'a> JsonParser<'a> {
         }
         self.expect_byte(b'{')?;
         let mut map = BTreeMap::new();
+        // 重複キーを後勝ちで畳むと `map.len()` が実メンバー数より小さくなるため、
+        // 要素数上限（DoS 対策）は生のメンバー数で数える。
+        let mut raw_members = 0usize;
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
@@ -249,9 +273,10 @@ impl<'a> JsonParser<'a> {
         }
         loop {
             self.skip_ws();
-            if map.len() >= MAX_JSON_CONTAINER_ITEMS {
+            if raw_members >= MAX_JSON_CONTAINER_ITEMS {
                 return Err(JsonError);
             }
+            raw_members += 1;
             let key = self.parse_string()?;
             self.skip_ws();
             self.expect_byte(b':')?;
@@ -259,11 +284,16 @@ impl<'a> JsonParser<'a> {
             // RFC 8259 は重複キーの扱いをパーサ依存とするが、後勝ちで無警告に
             // 上書きすると呼び出し元（NoSQL 表層等）が別実装と解釈を違えうる
             // （confusion attack の温床）。fail-closed に拒否する（Issue #732）。
-            match map.entry(key) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(value);
+            match self.dup {
+                DuplicateKeys::Reject => match map.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(value);
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => return Err(JsonError),
+                },
+                DuplicateKeys::LastWins => {
+                    map.insert(key, value);
                 }
-                std::collections::btree_map::Entry::Occupied(_) => return Err(JsonError),
             }
             self.skip_ws();
             match self.bump() {
@@ -303,7 +333,7 @@ impl<'a> JsonParser<'a> {
         Ok(JsonValue::Array(items))
     }
 
-    fn parse_string(&mut self) -> Result<String, JsonError> {
+    pub(crate) fn parse_string(&mut self) -> Result<String, JsonError> {
         self.expect_byte(b'"')?;
         let mut out = String::new();
         // 呼び出しのたびに `out.chars().count()` で文字列全体を再走査すると
@@ -548,6 +578,18 @@ pub fn parse_json(s: &str) -> Result<JsonValue, JsonError> {
     Ok(value)
 }
 
+/// [`parse_json`] の重複キー方針指定版（Issue #2180。`json` 列の格納値を読む経路向け）。
+/// 深さ・文字数・要素数の上限は [`parse_json`] と同一。
+pub fn parse_json_with(s: &str, dup: DuplicateKeys) -> Result<JsonValue, JsonError> {
+    let mut parser = JsonParser::new(s).with_dup(dup);
+    let value = parser.parse_value(0)?;
+    parser.skip_ws();
+    if parser.pos != parser.bytes.len() {
+        return Err(JsonError);
+    }
+    Ok(value)
+}
+
 /// `JSON`／`JSONB` 列（TABLE-14・TASK-198、Issue #889）1 件あたりの最大バイト長。
 /// `row_codec::encode_scalar_columns` は TEXT 列と同じ枠（presence 1 バイト +
 /// `u32 LE` 長 4 バイト + UTF-8 本体）でこの値をスカラーペイロードへ書き込むため、
@@ -606,7 +648,9 @@ pub fn validate_json_column_text(s: &str) -> Result<(), JsonColumnError> {
     if s.len() > MAX_JSON_FIELD_LEN {
         return Err(JsonColumnError::TooLong);
     }
-    parse_json(s).map_err(|_| JsonColumnError::Invalid)?;
+    // `json` 列は入力テキストを原文のまま保存する型で、重複キーも PostgreSQL と同じく
+    // 受理する（Issue #2180。取り出し時は最後の値が有効）。`jsonb` は従来どおり拒否。
+    parse_json_with(s, DuplicateKeys::LastWins).map_err(|_| JsonColumnError::Invalid)?;
     Ok(())
 }
 
@@ -696,10 +740,21 @@ fn write_canonical_number(n: &JsonNumber, out: &mut String) {
 /// のため通常は到達しない。到達しても値を誤ってゼロ等へ縮退させず fail-closed
 /// に拒否する）。
 pub(crate) fn canonical_equality_text(s: &str) -> Result<String, JsonColumnError> {
+    // 格納値向け: `json` 列は重複キーを原文のまま保持しうる（Issue #2180）ため後勝ちで読む
+    // （`jsonb` の格納値は正規化済みで重複を含まないので結果は変わらない）。
+    canonical_equality_text_with(s, DuplicateKeys::LastWins)
+}
+
+/// [`canonical_equality_text`] の重複キー方針指定版。`jsonb` 列の右辺リテラル
+/// （`WHERE doc = '...'`）は従来どおり [`DuplicateKeys::Reject`] で検証する。
+pub(crate) fn canonical_equality_text_with(
+    s: &str,
+    dup: DuplicateKeys,
+) -> Result<String, JsonColumnError> {
     if s.len() > MAX_JSON_FIELD_LEN {
         return Err(JsonColumnError::TooLong);
     }
-    let value = parse_json(s).map_err(|_| JsonColumnError::Invalid)?;
+    let value = parse_json_with(s, dup).map_err(|_| JsonColumnError::Invalid)?;
     let mut out = String::new();
     write_equality_canonical(&value, &mut out)?;
     Ok(out)
@@ -1020,7 +1075,7 @@ fn signed_decimal_add(a_neg: bool, a: &str, b_neg: bool, b: &str) -> (bool, Stri
 /// RFC 8259 準拠の最小エスケーパ（自作。wire-server の `error_body` エスケーパへは
 /// engine から依存できないため独立実装とする）。`"`・`\`・U+0000〜U+001F を
 /// エスケープし、それ以外（非 ASCII の生 UTF-8 を含む）はそのまま出力する。
-fn write_canonical_string(s: &str, out: &mut String) {
+pub(crate) fn write_canonical_string(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -1106,7 +1161,9 @@ pub fn extract_path<'a>(v: &'a JsonValue, path: &JsonPath) -> Option<&'a JsonVal
 /// 正規化テキストで返す（`None` はキー不在・型不一致・範囲外。パース失敗は格納
 /// 契約違反のため呼び出し元の内部エラーとして扱う）。
 pub fn extract_path_text(stored: &str, path: &JsonPath) -> Result<Option<String>, JsonColumnError> {
-    let value = parse_json(stored).map_err(|_| JsonColumnError::Invalid)?;
+    // 格納値は `json` 列なら重複キーを含みうる（Issue #2180）ため後勝ちで読む。
+    let value =
+        parse_json_with(stored, DuplicateKeys::LastWins).map_err(|_| JsonColumnError::Invalid)?;
     Ok(extract_path(&value, path).map(|v| {
         let mut out = String::new();
         write_canonical(v, &mut out);
@@ -2417,6 +2474,64 @@ mod tests {
         assert_eq!(
             jsonb_sort_key(&oversized).unwrap_err(),
             JsonColumnError::TooLong
+        );
+    }
+
+    // ---- Issue #2180: `json` 列向けの重複キー後勝ち ----
+
+    #[test]
+    fn parse_json_with_last_wins_keeps_the_last_duplicate_value() {
+        let v = parse_json_with(
+            r#"{"a":1,"a":2,"b":{"x":1,"x":3}}"#,
+            DuplicateKeys::LastWins,
+        )
+        .unwrap();
+        let mut out = String::new();
+        write_canonical(&v, &mut out);
+        assert_eq!(out, r#"{"a":2,"b":{"x":3}}"#);
+    }
+
+    #[test]
+    fn parse_json_with_reject_matches_parse_json() {
+        assert_eq!(
+            parse_json_with(r#"{"a":1,"a":2}"#, DuplicateKeys::Reject).unwrap_err(),
+            JsonError
+        );
+    }
+
+    #[test]
+    fn last_wins_counts_raw_members_against_the_container_limit() {
+        // 重複キーで `BTreeMap` の要素数が増えなくても、生のメンバー数で上限を判定する。
+        let mut text = String::from("{");
+        for i in 0..=MAX_JSON_CONTAINER_ITEMS {
+            if i > 0 {
+                text.push(',');
+            }
+            text.push_str("\"k\":1");
+        }
+        text.push('}');
+        assert_eq!(
+            parse_json_with(&text, DuplicateKeys::LastWins).unwrap_err(),
+            JsonError
+        );
+    }
+
+    #[test]
+    fn validate_json_column_text_accepts_duplicate_keys_but_jsonb_rejects() {
+        assert!(validate_json_column_text(r#"{"a":1,"a":2}"#).is_ok());
+        assert_eq!(
+            canonicalize_jsonb_text(r#"{"a":1,"a":2}"#).unwrap_err(),
+            JsonColumnError::Invalid
+        );
+    }
+
+    #[test]
+    fn canonical_equality_text_with_reject_refuses_duplicates_while_stored_form_folds_them() {
+        let folded = canonical_equality_text(r#"{"a":1,"a":2}"#).unwrap();
+        assert_eq!(folded, canonical_equality_text(r#"{"a":2}"#).unwrap());
+        assert_eq!(
+            canonical_equality_text_with(r#"{"a":1,"a":2}"#, DuplicateKeys::Reject).unwrap_err(),
+            JsonColumnError::Invalid
         );
     }
 }

@@ -612,3 +612,99 @@ fn json_operation_id_resend_via_nosql_after_sql_seed_is_content_mismatch_when_wh
     let resp = query(&both, insert_body);
     assert_eq!(http_common::wire_code_of(&resp), "23505", "resp: {resp:?}");
 }
+
+// --- Issue #2180（TABLE-25）: `json`（原文保存）の演算子・関数と重複キー -----------
+
+/// `json` 列のパス演算子・関数の結果列は、`->`・`#>`・`to_json` が json（OID 114）、`->>`・
+/// `#>>` が text（OID 25）、`json_array_length` が int4（OID 23）として RowDescription に載り、
+/// 値は原文の部分テキスト（空白・数値表記・重複キーの最後の値）で返る。
+#[test]
+fn wire_json_text_operators_advertise_json_oids_and_return_original_text() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = common::spawn_server_with_engine(&users_path, core);
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    common::send_simple_query(
+        &mut alice,
+        r#"INSERT INTO docs (id, embedding, doc) VALUES (1, '[0.1,0.2,0.3]', ' {"a" : [ 1 , 2 ], "a" : [ 3 , 4 ], "d":1.0e2} ') USING OPERATION_ID 'op-json-text-1'"#,
+    );
+    assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT doc -> 'a' AS j, doc ->> 'd' AS t, doc #> '{a,0}' AS pj, doc #>> '{a,1}' AS pt, \
+         json_array_length(doc -> 'a') AS n, to_json(doc -> 'd') AS tj \
+         FROM docs WHERE id = 1 LIMIT 1",
+    );
+    let columns = common::read_row_description_with_oids(&mut alice);
+    assert_eq!(
+        columns,
+        vec![
+            ("j".to_string(), 114),
+            ("t".to_string(), 25),
+            ("pj".to_string(), 114),
+            ("pt".to_string(), 25),
+            ("n".to_string(), 23),
+            ("tj".to_string(), 114),
+        ]
+    );
+    let row = common::read_data_row(&mut alice);
+    assert_eq!(
+        row,
+        vec![
+            Some("[ 3 , 4 ]".to_string()),
+            Some("1.0e2".to_string()),
+            Some("3".to_string()),
+            Some("4".to_string()),
+            Some("2".to_string()),
+            Some("1.0e2".to_string()),
+        ]
+    );
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+
+    // jsonb 専用演算子は json に対して `42883`。
+    common::send_simple_query(&mut alice, "SELECT id FROM docs WHERE doc @> '{}' LIMIT 1");
+    common::expect_error_response_with_sqlstate(&mut alice, "42883");
+    common::read_ready_for_query(&mut alice);
+}
+
+/// 重複キーを含む `json` 行を NoSQL scan で読むと 200 になり、応答は重複キーを最後の値へ畳んだ
+/// 正規形になる（生テキストは連結しない。SQL は原文を返す）。
+#[test]
+fn nosql_scan_of_json_row_with_duplicate_keys_returns_last_value() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core);
+
+    common::send_simple_query(
+        &mut sql,
+        r#"INSERT INTO docs (id, embedding, doc) VALUES (1, '[0.1,0.2,0.3]', '{"a":1, "a" : 2}') USING OPERATION_ID 'op-dup-1'"#,
+    );
+    assert_eq!(common::read_command_complete(&mut sql), "INSERT 0 1");
+    common::read_ready_for_query(&mut sql);
+
+    let scan_body = br#"{"op":"scan","table":"docs","columns":["doc"],"limit":100}"#;
+    let resp = query(&both, scan_body);
+    assert_eq!(resp.status, 200, "scan must succeed: {resp:?}");
+    let JsonValue::Object(obj) = json_body(&resp) else {
+        panic!("expected object body");
+    };
+    let JsonValue::Array(rows) = obj.get("rows").expect("rows field").clone() else {
+        panic!("expected rows array");
+    };
+    let JsonValue::Array(row0) = &rows[0] else {
+        panic!("expected row array");
+    };
+    match &row0[0] {
+        JsonValue::Object(m) => {
+            assert_eq!(m.len(), 1);
+            assert_eq!(
+                m.get("a"),
+                Some(&JsonValue::Number(engine::json::JsonNumber::PosInt(2)))
+            );
+        }
+        other => panic!("expected JSON object, got {other:?}"),
+    }
+}

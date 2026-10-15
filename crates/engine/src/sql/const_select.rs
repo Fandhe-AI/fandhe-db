@@ -411,7 +411,7 @@ fn expr_value_to_cell(v: ExprValue<'_>, ty: Option<&ColumnType>) -> Result<Cell,
         ExprValue::Timestamp(t) => Cell::Timestamp(t),
         ExprValue::Null => Cell::Null,
         ExprValue::Vector(v) => Cell::Vector(into_owned_vector(v)?),
-        ExprValue::Json(j) => Cell::Json(j.into_owned()),
+        ExprValue::Json(j) | ExprValue::JsonText(j) => Cell::Json(j.into_owned()),
     })
 }
 

@@ -306,9 +306,9 @@ fn typed_null(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
         ExprType::Text => twin(Expr::String(String::new())),
         ExprType::Date => twin(Expr::DateLiteral(0)),
         ExprType::Timestamp => twin(Expr::TimestampLiteral(0)),
-        ExprType::Json => {
+        ExprType::Json | ExprType::JsonText => {
             return Err(SqlSurfaceError::unsupported(
-                "a jsonb value is not allowed in a constant expression",
+                "a json value is not allowed in a constant expression",
             ))
         }
         ExprType::Bool => Expr::Case {
@@ -577,8 +577,8 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         ExprValue::Vector(_) => Err(SqlSurfaceError::Internal {
             detail: "constant expression produced a vector".to_string(),
         }),
-        ExprValue::Json(_) => Err(SqlSurfaceError::unsupported(
-            "a jsonb value is not allowed in a constant expression",
+        ExprValue::Json(_) | ExprValue::JsonText(_) => Err(SqlSurfaceError::unsupported(
+            "a json value is not allowed in a constant expression",
         )),
     }
 }

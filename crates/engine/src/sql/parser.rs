@@ -5710,7 +5710,8 @@ fn resolve_aggregate_input(
                 | ExprType::Text
                 | ExprType::Date
                 | ExprType::Timestamp
-                | ExprType::Json => Err(SqlSurfaceError::invalid_input(
+                | ExprType::Json
+                | ExprType::JsonText => Err(SqlSurfaceError::invalid_input(
                     "aggregate argument must evaluate to a scalar",
                 )),
             }
@@ -5824,7 +5825,8 @@ fn resolve_count_distinct_input(
                 | ExprType::Text
                 | ExprType::Date
                 | ExprType::Timestamp
-                | ExprType::Json => Err(SqlSurfaceError::invalid_input(
+                | ExprType::Json
+                | ExprType::JsonText => Err(SqlSurfaceError::invalid_input(
                     "aggregate argument must evaluate to a scalar",
                 )),
             }
@@ -6306,6 +6308,10 @@ fn order_kind_for_expr_type(
         )),
         // Issue #1597・TABLE-25: jsonb 式はソートキー（バイト列順）で並べ替える。
         ExprType::Json => Ok(OrderKind::Jsonb),
+        // `json`（原文保存）には順序演算子が無い（Issue #2180。PostgreSQL と同じ `42883`）。
+        ExprType::JsonText => Err(SqlSurfaceError::undefined_function(
+            "could not identify an ordering operator for type json",
+        )),
     }
 }
 

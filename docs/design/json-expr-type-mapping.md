@@ -81,6 +81,41 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   （#2181）、`$n` の型推論、ORDER BY・GROUP BY・CASE の条件に置く裸の述語、JOIN 経路の
   修飾付き識別子。
 
+## Issue #2180 での変更（json 型の演算子・関数）
+
+- `json`（入力テキストを原文のまま保存する型）の式を受理した。`json` 列の裸の参照は
+  `ExprType::JsonText`（値は `ExprValue::JsonText`。列参照は借用）で、`jsonb` の
+  `ExprType::Json` とは別の型にしている（原文と正規形の取り違えを型で防ぐ）。
+  結果列型は `json`（OID 114）。
+- `->`・`#>` は原文の部分テキスト（外側の空白を除き、内側の空白・数値表記を保つ）を json で、
+  `->>`・`#>>` は text（文字列はエスケープを復号、JSON の `null` は SQL の NULL）で返す。
+  重複キーは最後の値。`#>` の途中段に重複キーがある場合は辿り切れた出現のうち最後のもの。
+  切り出しは `json_text.rs`（共有パーサーの位置情報を使うスキャナ）が担う。
+- 追加した関数: `json_typeof`・`json_array_length`（int4・OID 23）・`json_extract_path`・
+  `json_extract_path_text`・`json_build_object`・`json_build_array`・`to_json`。
+  可変長・任意型の引数を取るため、固定アリティの `BuiltinFn` ではなく
+  `BoundExpr::JsonFn`（`sql/json_fn.rs`）で束縛する。出力書式は PostgreSQL 17 の `json`
+  （`{"a" : 1, "b" : 2}`・`[1, 2]`）。json 値は原文のまま、jsonb 値は正規化テキストのまま
+  埋め込む。出力は長さ・深さ・要素数の上限を超えると `54000`。
+- 拒否の規則: `@>` `<@` `?` `?|` `?&`、比較、ORDER BY の式キーは `42883`（json には
+  演算子が無い）。json 列そのものの GROUP BY・DISTINCT は従来どおり `22000`（PostgreSQL は `42883`。差分）。
+  json 式（`doc -> 'a'`）の GROUP BY・DISTINCT・集計引数は構文段で受理されず `42601`。算術・関数引数（json 関数以外）・`CASE` 等・代入は jsonb と同じ `0A000`。
+  `json_extract_path` のパス要素 0 個は `42883`。`json_array_length` の非配列は `22023`、
+  `json_build_object` の引数個数が奇数・キーが json は `22023`。キーが NULL の場合の
+  PostgreSQL の SQLSTATE は `22004` だが、分類が未実装のため `22023` で拒否する
+  （差分。分類追加は別途）。
+- 既存の宣言的な等価（`WHERE doc = '...'`・`IN`・`IS NULL`）は式レーンへ流さず従来どおり
+  （重複キーは後勝ちで等価判定する）。
+- 関数引数の裸の `NULL` は NULL リテラルとして受理する（`json_*`・`to_json` に限る。strict な関数は NULL、
+  `json_build_*` は `null` を書く）。
+- `json_object_keys` など集合返却関数は名前を予約したうえで `0A000`（SRF 基盤 #2220 待ち）。
+- CHECK 本体・連鎖ビュー本文・UDF 本体では json 関数を置けない（`42601`／`0A000`）。
+  FROM なしの SELECT（定数式）は `0A000` のまま。
+- 対象外: jsonb の重複キー受理（PostgreSQL は最後の値を使うが本実装は `22P02` のまま）、
+  `$n` の型推論、jsonb の出力書式を PostgreSQL に揃えること（`to_json(jsonb)` の埋め込みが
+  `{"a":1}` で PostgreSQL の `{"a": 1}` と異なる）、2^53 を超える BIGINT の `to_json`
+  （式評価器のスカラーが f64 であることによる既存の制約）、NoSQL の filter へのパス演算子。
+
 ## 設計判断の所在
 
 型の形・値表現・字句と優先順位・演算子と関数の型解決・集合返却関数・jsonpath・
@@ -94,7 +129,7 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 | 領域 | 担当 Issue |
 | ---- | ---------- |
 | 式評価器への JSON 型の導入（jsonb。比較・述語・ORDER BY は #1597 で実装済み） | #1597 |
-| json 型の演算・関数 | #2180 |
+| json 型の演算・関数（実装済み） | #2180 |
 | パス演算子の構文 | #1596 |
 | 包含・存在演算子（実装済み） | #1598 |
 | 削除・更新系演算子 | #2181 |
