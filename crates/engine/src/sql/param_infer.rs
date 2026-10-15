@@ -76,7 +76,7 @@ fn is_supported_in_expr(ty: &PreparedParamType) -> bool {
                 | ColumnType::Real
                 | ColumnType::Double
                 | ColumnType::Text
-                | ColumnType::Varchar
+                | ColumnType::Varchar(_)
         ),
         PreparedParamType::Text => true,
         PreparedParamType::VectorText | PreparedParamType::Column(_) => false,

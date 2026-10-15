@@ -55,7 +55,8 @@ fn enum_labels() -> Vec<String> {
 fn type_label(ty: &ColumnType) -> &'static str {
     match ty {
         ColumnType::Text => "text",
-        ColumnType::Varchar => "varchar",
+        ColumnType::Varchar(_) => "varchar",
+        ColumnType::Bpchar(_) => "bpchar",
         ColumnType::SmallInt => "smallint",
         ColumnType::Vector(_) => "vector",
         ColumnType::Integer => "integer",
@@ -99,6 +100,7 @@ fn all_type_labels() -> BTreeSet<&'static str> {
     BTreeSet::from([
         "text",
         "varchar",
+        "bpchar",
         "smallint",
         "vector",
         "integer",
@@ -158,8 +160,11 @@ fn full_row_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> Ta
             ),
             ColumnDef::new("c_uuid", ColumnType::Uuid, true),
             // 末尾に置いて既存の列位置（`c_vector` 挿入位置など）を動かさない。
-            ColumnDef::new("c_varchar", ColumnType::Varchar, true),
+            ColumnDef::new("c_varchar", ColumnType::Varchar(None), true),
             ColumnDef::new("c_smallint", ColumnType::SmallInt, true),
+            // 長さ付き（Issue #1563）。
+            ColumnDef::new("c_varchar_n", ColumnType::Varchar(Some(16)), true),
+            ColumnDef::new("c_bpchar", ColumnType::Bpchar(8), true),
         ],
     )
 }
@@ -220,6 +225,9 @@ fn representative_scalar_values() -> Vec<Value> {
         Value::Text("varchar value".to_string()),
         // `c_smallint`（INTEGER と同一表現で範囲だけ i16。Issue #1558）。
         Value::Integer(-32768),
+        // `c_varchar_n`・`c_bpchar`（TEXT と同一フレーム。Issue #1563）。
+        Value::Text("varchar(16) value".chars().take(16).collect()),
+        Value::Text("bpchar".to_string()),
     ]
 }
 
@@ -417,6 +425,31 @@ fn roundtrip_single(ty: ColumnType, value: Value) {
 fn integer_roundtrips_min_max_zero_neg1() {
     for v in [i32::MIN, i32::MAX, 0, -1] {
         roundtrip_single(ColumnType::Integer, Value::Integer(v));
+    }
+}
+
+/// `VARCHAR(n)`／`CHAR(n)` の長さ境界（Issue #1563）。n ちょうどは受理、n+1 文字は拒否し、
+/// 長さはバイト数ではなく文字数で数える（マルチバイト文字）。
+#[test]
+fn char_length_types_roundtrip_boundaries_and_reject_overflow() {
+    for ty in [ColumnType::Varchar(Some(3)), ColumnType::Bpchar(3)] {
+        roundtrip_single(ty.clone(), Value::Text("abc".to_string()));
+        // 3 文字・9 バイト。
+        roundtrip_single(ty.clone(), Value::Text("日本語".to_string()));
+        roundtrip_single(ty.clone(), Value::Text(String::new()));
+        let schema = single_col_schema(ty.clone());
+        for over in ["abcd", "日本語!"] {
+            let result = encode_row(
+                &schema,
+                "tenant-a",
+                Visibility::Public,
+                &[Value::Text(over.to_string())],
+            );
+            assert!(
+                matches!(result, Err(RowCodecError::Invalid(_))),
+                "{ty:?} must reject {over:?}"
+            );
+        }
     }
 }
 
@@ -744,7 +777,7 @@ fn encode_row_rejects_value_variant_mismatch_for_every_type() {
     let _guard = CleanupGuard(path);
     let schema = full_row_schema(def);
     let wrong_value_for = |label: &str| -> Value {
-        if label == "text" || label == "varchar" {
+        if label == "text" || label == "varchar" || label == "bpchar" {
             Value::Integer(1)
         } else {
             Value::Text("wrong-type".to_string())

@@ -2206,7 +2206,7 @@ fn bind_expr_any(
                     // 使えるようにする。値は行コンテキスト（`eval_with_scalars` の
                     // `row_scalars`）から解決し、nullable 列の実 NULL は
                     // `ExprValue::Null` として伝播する（AC1・AC2）。
-                    ColumnType::Text | ColumnType::Varchar => Ok((BoundExpr::TextColumnRef { index }, ExprType::Text)),
+                    ColumnType::Text | ColumnType::Varchar(_) => Ok((BoundExpr::TextColumnRef { index }, ExprType::Text)),
                     // Issue #1183・SQL-24・SQL-26・TABLE-13 ポインタ: 数値 4 型
                     // （INTEGER／BIGINT／REAL／DOUBLE）の列参照を `WHERE`／投影／
                     // `CHECK` で共通に解禁する（#1075 の CHECK 専用 opt-in を撤廃）。
@@ -2219,6 +2219,10 @@ fn bind_expr_any(
                     | ColumnType::BigInt
                     | ColumnType::Real
                     | ColumnType::Double => Ok((BoundExpr::ColumnRef { index }, ExprType::Scalar)),
+                    // `CHAR(n)` の式内参照は bpchar 比較（Issue #1566）まで fail-closed に拒否する。
+                    ColumnType::Bpchar(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (CHAR columns are not supported yet)"
+                    ))),
                     ColumnType::Boolean => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BOOLEAN columns are not supported)"
                     ))),
@@ -2582,7 +2586,8 @@ fn combine_numeric_kind(l: Option<NumericKind>, r: Option<NumericKind>) -> Optio
 fn column_type_label(ty: &ColumnType) -> &'static str {
     match ty {
         ColumnType::Text => "text",
-        ColumnType::Varchar => "character varying",
+        ColumnType::Varchar(_) => "character varying",
+        ColumnType::Bpchar(_) => "character",
         ColumnType::Vector(_) => "vector",
         ColumnType::SmallInt => "smallint",
         ColumnType::Integer => "integer",

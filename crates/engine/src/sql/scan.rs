@@ -223,7 +223,8 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                     match &column.ty {
                         ColumnType::Vector(_) => needs_embedding = true,
                         ColumnType::Text
-                        | ColumnType::Varchar
+                        | ColumnType::Varchar(_)
+                        | ColumnType::Bpchar(_)
                         | ColumnType::SmallInt
                         | ColumnType::Integer
                         | ColumnType::BigInt
@@ -657,17 +658,19 @@ fn build_projected_cells(
                             )?));
                         }
                     }
-                    ColumnType::Text | ColumnType::Varchar => match scanned.get(*index) {
-                        Some(Some(row_codec::ScalarRef::Text(t))) => cells.push(Cell::Text(
-                            try_alloc_text_for_budget(t, byte_budget, max_result_bytes)?,
-                        )),
-                        Some(None) | None => cells.push(Cell::Null),
-                        Some(Some(_)) => {
-                            return Err(SqlSurfaceError::Internal {
-                                detail: "scalar payload type mismatch".to_string(),
-                            })
+                    ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
+                        match scanned.get(*index) {
+                            Some(Some(row_codec::ScalarRef::Text(t))) => cells.push(Cell::Text(
+                                try_alloc_text_for_budget(t, byte_budget, max_result_bytes)?,
+                            )),
+                            Some(None) | None => cells.push(Cell::Null),
+                            Some(Some(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
                         }
-                    },
+                    }
                     // F8（Issue #882 計画）: REAL/DOUBLE は `Cell::Float`
                     // （REAL は f64 への無損失拡大）へ投影する。
                     ColumnType::Real => match scanned.get(*index) {
