@@ -2581,7 +2581,9 @@ fn validate_set_assignments(
                     .map_err(TenantWriteError::Catalog)?;
             }
             (
-                crate::catalog::ColumnType::Text | crate::catalog::ColumnType::Varchar(_),
+                crate::catalog::ColumnType::Text
+                | crate::catalog::ColumnType::Varchar(_)
+                | crate::catalog::ColumnType::Bpchar(_),
                 crate::row_codec::Value::Text(t),
             ) => {
                 // SET 値の TEXT 長上限検証（対象行の探索より前に行う）。
@@ -2594,7 +2596,11 @@ fn validate_set_assignments(
                 // 要求する（末尾空白超過の未正規化値も探索前に一律拒否。fail-closed）。
                 let fitted = crate::row_codec::fit_char_length(&column.ty, t)
                     .map_err(|e| TenantWriteError::SetExpressionEvaluationFailed(e.into()))?;
-                if fitted.len() != t.len() {
+                // `CHAR(n)` は詰め済み（ちょうど n 文字）でなければ、切り詰めの有無に
+                // 関わらず codec と同じ厳格判定で拒否する（TABLE-31・Issue #1566）。
+                if fitted.len() != t.len()
+                    || matches!(column.ty, crate::catalog::ColumnType::Bpchar(_))
+                {
                     crate::row_codec::check_varchar_length(column, t).map_err(|e| {
                         TenantWriteError::Catalog(CatalogError::Invalid(e.to_string()))
                     })?;

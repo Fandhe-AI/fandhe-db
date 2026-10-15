@@ -64,6 +64,16 @@ pub enum Token {
     HashArrow,
     /// `#>>`（最長一致で `#>` より優先。SQL-42・Issue #1520）。
     HashArrowText,
+    /// `@>`（jsonb 包含。TABLE-25・Issue #1598）。単独の `@`・`@?`・`@@` は未対応文字のまま。
+    JsonContains,
+    /// `<@`（jsonb 被包含。TABLE-25・Issue #1598）。
+    JsonContainedBy,
+    /// `?`（jsonb キー存在。TABLE-25・Issue #1598）。
+    JsonExists,
+    /// `?|`（いずれかのキーが存在。最長一致で `?` より優先。TABLE-25・Issue #1598）。
+    JsonExistsAny,
+    /// `?&`（すべてのキーが存在。最長一致で `?` より優先。TABLE-25・Issue #1598）。
+    JsonExistsAll,
     /// `::`（SQL-42・Issue #1520）。
     TypeCast,
     /// `||`（SQL-42・Issue #1520）。
@@ -197,6 +207,11 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
             Token::ArrowText => out.push_str("->>"),
             Token::HashArrow => out.push_str("#>"),
             Token::HashArrowText => out.push_str("#>>"),
+            Token::JsonContains => out.push_str("@>"),
+            Token::JsonContainedBy => out.push_str("<@"),
+            Token::JsonExists => out.push('?'),
+            Token::JsonExistsAny => out.push_str("?|"),
+            Token::JsonExistsAll => out.push_str("?&"),
             Token::TypeCast => out.push_str("::"),
             Token::Concat => out.push_str("||"),
             Token::QualifiedIdent { qualifier, name } => {
@@ -542,6 +557,36 @@ fn tokenize_impl(
                 continue;
             }
         }
+        // `@>`（jsonb 包含。Issue #1598）。単独の `@`・`@?`・`@@` は未対応文字として拒否する
+        // （jsonpath 演算子は #2182 系の対象）。
+        if c == '@' {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if matches!(lookahead.peek(), Some(&(_, '>'))) {
+                lookahead.next();
+                tokens.push(Token::JsonContains);
+                chars = lookahead;
+                continue;
+            }
+        }
+        // `?|` → `?&` → `?` の最長一致（jsonb キー存在。Issue #1598）。
+        if c == '?' {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            match lookahead.peek() {
+                Some(&(_, '|')) => {
+                    lookahead.next();
+                    tokens.push(Token::JsonExistsAny);
+                }
+                Some(&(_, '&')) => {
+                    lookahead.next();
+                    tokens.push(Token::JsonExistsAll);
+                }
+                _ => tokens.push(Token::JsonExists),
+            }
+            chars = lookahead;
+            continue;
+        }
         // `::`・`||`。単独の `:`・`|` は未対応文字として拒否する。
         if c == ':' || c == '|' {
             let mut lookahead = chars.clone();
@@ -627,6 +672,13 @@ fn tokenize_impl(
                     continue;
                 }
                 tokens.push(Token::Le);
+                chars = lookahead;
+                continue;
+            }
+            // `<@`（jsonb 被包含。Issue #1598）。`<=` の判定より後ろで足りる（2 文字目が異なる）。
+            if matches!(lookahead.peek(), Some(&(_, '@'))) {
+                lookahead.next();
+                tokens.push(Token::JsonContainedBy);
                 chars = lookahead;
                 continue;
             }
@@ -1378,6 +1430,30 @@ mod tests {
     #[test]
     fn rejects_unterminated_string_literal() {
         assert!(tokenize("'abc").is_err());
+    }
+
+    /// TABLE-25・Issue #1598: jsonb 包含・存在演算子の字句化（最長一致・境界）。
+    #[test]
+    fn jsonb_containment_operators_lex_with_longest_match() {
+        use Token::*;
+        let a = || ident("a");
+        let b = || ident("b");
+        assert_eq!(toks("a @> b"), vec![a(), JsonContains, b()]);
+        assert_eq!(toks("a<@b"), vec![a(), JsonContainedBy, b()]);
+        assert_eq!(toks("a ? b"), vec![a(), JsonExists, b()]);
+        assert_eq!(toks("a ?| b"), vec![a(), JsonExistsAny, b()]);
+        assert_eq!(toks("a ?& b"), vec![a(), JsonExistsAll, b()]);
+        // 既存の `<` 系の最長一致は不変。
+        assert_eq!(toks("a <=> b")[1], DistanceOp);
+        assert_eq!(toks("a <= b")[1], Le);
+        assert_eq!(toks("a < b")[1], Punct('<'));
+        // `?||` は `?|` の後に単独の `|`（未対応）で拒否される。
+        assert!(tokenize("a ?|| b").is_err());
+        // 単独の `@`・`@@`・`@?`・`&` は拒否のまま（jsonpath は対象外）。
+        assert!(tokenize("a @ b").is_err());
+        assert!(tokenize("a @@ b").is_err());
+        assert!(tokenize("a @? b").is_err());
+        assert!(tokenize("a & b").is_err());
     }
 
     /// SQL-42・Issue #1520: 多文字演算子の字句化（最長一致・境界）。

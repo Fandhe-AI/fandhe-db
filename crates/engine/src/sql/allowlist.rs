@@ -212,10 +212,24 @@ fn is_where_group_operator_token(token: &Token) -> bool {
             | Token::Punct('-')
             | Token::Punct('*')
             | Token::Punct('/')
-            | Token::Arrow
+    ) || is_json_operator_token(token)
+}
+
+/// jsonb 演算子のトークン（パス取得 `-> ->> #> #>>`・包含 `@> <@`・存在 `? ?| ?&`。
+/// TABLE-25。Issue #1596・#1598）かどうか。式の中置演算子ループ
+/// （[`Parser::parse_json_access_rest`]）の続きを判定する先読みが共有する。
+fn is_json_operator_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Arrow
             | Token::ArrowText
             | Token::HashArrow
             | Token::HashArrowText
+            | Token::JsonContains
+            | Token::JsonContainedBy
+            | Token::JsonExists
+            | Token::JsonExistsAny
+            | Token::JsonExistsAll
     )
 }
 
@@ -4045,16 +4059,9 @@ impl<'a> Parser<'a> {
                 let starts_case =
                     name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
                 let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
-                let next_is_op = matches!(
-                    self.tokens.get(self.pos + 1),
-                    Some(
-                        Token::Punct('+' | '-' | '*' | '/')
-                            | Token::Arrow
-                            | Token::ArrowText
-                            | Token::HashArrow
-                            | Token::HashArrowText
-                    )
-                );
+                let next_is_op = self.tokens.get(self.pos + 1).is_some_and(|t| {
+                    matches!(t, Token::Punct('+' | '-' | '*' | '/')) || is_json_operator_token(t)
+                });
                 if starts_case || self.is_value_function_keyword_at(self.pos) {
                     // 括弧なし SQL 値関数（SQL-37・Issue #1586）は列名ではなく式項目。
                     self.parse_projection_infix(0)?
@@ -4068,16 +4075,10 @@ impl<'a> Parser<'a> {
                     let head = self.parse_call_expr(name, 0);
                     self.allow_unary_minus = prev;
                     let head = head?;
-                    if matches!(
-                        self.peek(),
-                        Some(
-                            Token::Punct('+' | '-' | '*' | '/')
-                                | Token::Arrow
-                                | Token::ArrowText
-                                | Token::HashArrow
-                                | Token::HashArrowText
-                        )
-                    ) {
+                    if self.peek().is_some_and(|t| {
+                        matches!(t, Token::Punct('+' | '-' | '*' | '/'))
+                            || is_json_operator_token(t)
+                    }) {
                         // `parse_value_expr(0)` と同じ段位（add=0・mul=1・primary=2）で継続する。
                         self.allow_unary_minus = true;
                         let r = self
@@ -5129,7 +5130,7 @@ impl<'a> Parser<'a> {
             } else {
                 // 裸の `NOT <式比較>`（`NOT id > 1`・`NOT (id + 1) > 5`）。頂点の比較を
                 // 反転して葉へ押し下げる。
-                let expr = self.parse_comparison_expr()?;
+                let expr = self.parse_expression_predicate()?;
                 let pred = vec![WherePredicate::Expression(expr)];
                 if negate_odd {
                     negate_conjunction(pred, &mut self.expr_node_budget)?
@@ -5138,7 +5139,9 @@ impl<'a> Parser<'a> {
                 }
             }
         } else {
-            vec![WherePredicate::Expression(self.parse_comparison_expr()?)]
+            vec![WherePredicate::Expression(
+                self.parse_expression_predicate()?,
+            )]
         };
         *leaf_count = leaf_count.checked_add(1).ok_or_else(|| {
             SqlSurfaceError::payload_too_large("WHERE predicate leaf count overflow")
@@ -5192,9 +5195,19 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `<値式> <比較演算子> <値式>`（式述語。頂点は必ず比較の [`Expr::Binary`]）。
-    fn parse_comparison_expr(&mut self) -> Result<Expr, SqlSurfaceError> {
+    /// WHERE の式述語の葉。通常は `<値式> <比較演算子> <値式>`（頂点は比較の [`Expr::Binary`]）だが、
+    /// 頂点が jsonb の包含・存在演算子（`@>` `<@` `?` `?|` `?&`。TABLE-25・Issue #1598）
+    /// の式なら比較演算子なしの裸の述語として受理する（それらは bool を返すため）。
+    /// 述語でない式が比較を伴わない場合は従来と同じ `42601`。`NOT` 付きは呼び出し元の
+    /// 否定押し下げ（`where_negation`）が `Expression(_)` を `42601` で拒否する（fail-closed。
+    /// 三値論理で fail-open にしない）。
+    fn parse_expression_predicate(&mut self) -> Result<Expr, SqlSurfaceError> {
         let lhs = self.parse_value_expr(0)?;
+        if let Expr::JsonAccess { op, .. } = &lhs {
+            if op.is_predicate() && !self.peek_is_cmp_op() {
+                return Ok(lhs);
+            }
+        }
         let op = self.expect_cmp_op()?;
         let rhs = self.parse_value_expr(0)?;
         Ok(Expr::Binary {
@@ -5783,6 +5796,14 @@ impl<'a> Parser<'a> {
         Ok((low, high))
     }
 
+    /// 次のトークンが [`Self::expect_cmp_op`] の受理する比較演算子かどうか（消費しない）。
+    fn peek_is_cmp_op(&self) -> bool {
+        matches!(
+            self.peek(),
+            Some(Token::Punct('>' | '<' | '=') | Token::Ge | Token::Le)
+        )
+    }
+
     /// 比較演算子トークン（`> < >= <= =`）を消費して [`BinOp`] へ写像する
     /// （TASK-79・SQL-9）。
     fn expect_cmp_op(&mut self) -> Result<BinOp, SqlSurfaceError> {
@@ -5819,8 +5840,8 @@ impl<'a> Parser<'a> {
         self.parse_json_access_rest(lhs, depth)
     }
 
-    /// jsonb パス演算子 `->` `->>` `#>` `#>>` のループ（対象ビヘイビア: TABLE-25。
-    /// Issue #1596）。PostgreSQL の優先順位表で「その他の演算子」の段にあたり、加減算
+    /// jsonb 演算子（パス取得 `->` `->>` `#>` `#>>`・包含 `@>` `<@`・存在 `?` `?|` `?&`）の
+    /// ループ（対象ビヘイビア: TABLE-25。Issue #1596・#1598）。PostgreSQL の優先順位表で「その他の演算子」の段にあたり、加減算
     /// （[`Self::parse_add_expr`]）より弱く比較より強い。左結合のため
     /// `a -> 'x' ->> 'y'` は `(a -> 'x') ->> 'y'`、`a -> 1 + 1` は `a -> (1 + 1)`。
     /// 左辺を解析済みの状態から継続できるよう [`Self::parse_add_rest`] と同じく分離している
@@ -5837,12 +5858,16 @@ impl<'a> Parser<'a> {
                 Some(Token::ArrowText) => JsonAccessOp::GetText,
                 Some(Token::HashArrow) => JsonAccessOp::Path,
                 Some(Token::HashArrowText) => JsonAccessOp::PathText,
+                Some(Token::JsonContains) => JsonAccessOp::Contains,
+                Some(Token::JsonContainedBy) => JsonAccessOp::ContainedBy,
+                Some(Token::JsonExists) => JsonAccessOp::Exists,
+                Some(Token::JsonExistsAny) => JsonAccessOp::ExistsAny,
+                Some(Token::JsonExistsAll) => JsonAccessOp::ExistsAll,
                 _ => break,
             };
             if self.in_check_body {
                 return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "JSON path operators are not supported in a CHECK constraint"
-                        .to_string(),
+                    detail: "JSON operators are not supported in a CHECK constraint".to_string(),
                 });
             }
             self.advance();
@@ -15363,6 +15388,63 @@ mod tests {
             panic!("expected -> below, got {inner:?}");
         };
         assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+    }
+
+    /// Issue #1598（TABLE-25）: 包含・存在演算子は WHERE の裸の述語として受理され、
+    /// パス演算子と同じ優先順位・左結合で `AND`／`OR`・括弧と組み合わせられる。
+    #[test]
+    fn json_containment_operators_parse_as_bare_where_predicates() {
+        use crate::sql::udf_call::JsonAccessOp;
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        for (sql_op, expected) in [
+            ("@>", JsonAccessOp::Contains),
+            ("<@", JsonAccessOp::ContainedBy),
+            ("?", JsonAccessOp::Exists),
+            ("?|", JsonAccessOp::ExistsAny),
+            ("?&", JsonAccessOp::ExistsAll),
+        ] {
+            let preds = where_predicates_for(&format!(
+                "SELECT * FROM documents WHERE d {sql_op} 'x' {tail}"
+            ));
+            let [WherePredicate::Expression(Expr::JsonAccess { op, .. })] = preds.as_slice() else {
+                panic!("expected a bare predicate for {sql_op}, got {preds:?}");
+            };
+            assert_eq!(*op, expected);
+        }
+        // `d -> 'a' @> '1'` は `(d -> 'a') @> '1'`（同じ優先順位の左結合）。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE d -> 'a' @> '1' {tail}"
+        ));
+        let [WherePredicate::Expression(Expr::JsonAccess {
+            op: JsonAccessOp::Contains,
+            lhs,
+            ..
+        })] = preds.as_slice()
+        else {
+            panic!("unexpected shape {preds:?}");
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            Expr::JsonAccess {
+                op: JsonAccessOp::Get,
+                ..
+            }
+        ));
+        // AND・括弧との組み合わせ。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE (d ? 'a') AND lang = 'ja' {tail}"
+        ));
+        assert_eq!(preds.len(), 2);
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE (d -> 'a') ? 'b' {tail}"
+        ));
+        assert!(matches!(
+            preds.as_slice(),
+            [WherePredicate::Expression(Expr::JsonAccess {
+                op: JsonAccessOp::Exists,
+                ..
+            })]
+        ));
     }
 
     /// Bugbot 指摘: 括弧付き値式の直後にパス演算子が続く `(d -> 'a') ->> 'b' = 'x'` が

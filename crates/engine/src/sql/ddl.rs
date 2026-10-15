@@ -1042,7 +1042,7 @@ pub(crate) fn add_column_default(
     literal: &InsertLiteral,
 ) -> Result<ColumnDefault, SqlSurfaceError> {
     let kind = match ty {
-        ColumnType::Text | ColumnType::Varchar(_) => "text",
+        ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => "text",
         ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
@@ -1096,8 +1096,11 @@ pub(crate) fn add_column_default(
             // 超過部分が半角空白のみなら切り詰めて保存する。TABLE-31・Issue #1564）。
             // PostgreSQL は INSERT 時に判定するが、ADD COLUMN では既存行が既定値を読むため
             // 格納不変条件を保つ目的で定義時に fail-closed とする。
-            let stored = crate::row_codec::fit_char_length(ty, s)?;
-            Ok(ColumnDefault::Text(stored.to_string()))
+            // `CHAR(n)` の既定値は n 文字へ詰めた形で保持する（読み出し時補完が借用で返せる
+            // よう、保持値＝格納形とする。詰め後の長さも上限で検査し、n が確保量を決めない。
+            // TABLE-31・Issue #1566）。
+            let stored = crate::row_codec::fit_pad_char_length(ty, s, MAX_COLUMN_DEFAULT_LEN)?;
+            Ok(ColumnDefault::Text(stored.into_owned()))
         }
         // `JSONB` は DDL 時に正規化した形で保持する（読み出し時補完が借用で返せるよう、
         // 保持値＝格納形とする。Issue #1337）。エラー文言に値は含めない。

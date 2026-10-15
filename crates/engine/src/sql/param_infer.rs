@@ -238,7 +238,14 @@ impl Inferrer<'_> {
                 | crate::sql::udf_call::JsonAccessOp::PathText => {
                     Ty::Known(PreparedParamType::Text)
                 }
-                _ => Ty::Untyped,
+                // 包含・存在演算子（Issue #1598）は bool を返す。`$n` の型付け対象外。
+                crate::sql::udf_call::JsonAccessOp::Get
+                | crate::sql::udf_call::JsonAccessOp::Path
+                | crate::sql::udf_call::JsonAccessOp::Contains
+                | crate::sql::udf_call::JsonAccessOp::ContainedBy
+                | crate::sql::udf_call::JsonAccessOp::Exists
+                | crate::sql::udf_call::JsonAccessOp::ExistsAny
+                | crate::sql::udf_call::JsonAccessOp::ExistsAll => Ty::Untyped,
             },
             // DATE／TIMESTAMP は式内 `$n` の対象外型。`Text` へ倒さず `assign` の
             // 対象外型判定（`0A000`）に落として fail-closed にする。

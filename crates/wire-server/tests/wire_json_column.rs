@@ -200,6 +200,135 @@ fn wire_jsonb_where_and_order_by_round_trip() {
     common::read_ready_for_query(&mut alice);
 }
 
+/// Issue #1598（TABLE-25）: 包含・存在演算子の結果列は bool（OID 16）として RowDescription に載り、
+/// 値は `t`／`f`、NULL 列は NULL。WHERE の裸の述語も簡易クエリで往復する。
+#[test]
+fn wire_jsonb_containment_operators_advertise_bool_oid_and_filter() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = common::spawn_server_with_engine(&users_path, core);
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    for (id, doc) in [(1, r#"{"a":1,"b":[1,2]}"#), (2, r#"["a","c"]"#)] {
+        common::send_simple_query(
+            &mut alice,
+            &format!(
+                "INSERT INTO docs (id, embedding, docb) VALUES ({id}, '[0.1,0.2,0.3]', '{doc}') USING OPERATION_ID 'op-c-{id}'"
+            ),
+        );
+        assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+        common::read_ready_for_query(&mut alice);
+    }
+    common::send_simple_query(
+        &mut alice,
+        "INSERT INTO docs (id, embedding) VALUES (3, '[0.1,0.2,0.3]') USING OPERATION_ID 'op-c-3'",
+    );
+    assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT docb @> '{\"a\":1}' AS c, docb <@ '{\"a\":1,\"b\":[1,2],\"z\":0}' AS cb, docb ? 'a' AS e, \
+         docb ?| '{x,b}' AS ea, docb ?& '{a,b}' AS eb FROM docs WHERE id = 1 LIMIT 10",
+    );
+    let columns = common::read_row_description_with_oids(&mut alice);
+    assert_eq!(
+        columns,
+        vec![
+            ("c".to_string(), 16),
+            ("cb".to_string(), 16),
+            ("e".to_string(), 16),
+            ("ea".to_string(), 16),
+            ("eb".to_string(), 16),
+        ]
+    );
+    let t = || Some("t".to_string());
+    assert_eq!(
+        common::read_data_row(&mut alice),
+        vec![t(), t(), t(), t(), t()]
+    );
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+
+    // NULL 列（id = 3）は NULL。
+    common::send_simple_query(
+        &mut alice,
+        "SELECT docb ? 'a' AS e FROM docs WHERE id = 3 LIMIT 10",
+    );
+    common::read_row_description(&mut alice);
+    assert_eq!(common::read_data_row(&mut alice), vec![None]);
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT id FROM docs WHERE docb ? 'a' ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 10",
+    );
+    common::read_row_description(&mut alice);
+    let mut got = vec![
+        common::read_data_row(&mut alice),
+        common::read_data_row(&mut alice),
+    ];
+    got.sort();
+    assert_eq!(
+        got,
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]]
+    );
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+}
+
+/// Issue #1598: 拡張クエリプロトコルでも `?`／`?|`／`?&`／`<@`／`@>` を含む SQL が Parse できる
+/// （`?` を `$n` と取り違えない）。結果は simple query と同じ `t`。
+#[test]
+fn wire_jsonb_containment_operators_work_over_extended_query() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = common::spawn_server_with_engine(&users_path, core);
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    common::send_simple_query(
+        &mut alice,
+        r#"INSERT INTO docs (id, embedding, docb) VALUES (1, '[0.1,0.2,0.3]', '{"a":1,"b":2}') USING OPERATION_ID 'op-e-1'"#,
+    );
+    assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+    common::read_ready_for_query(&mut alice);
+
+    for (i, expr) in [
+        "docb ? 'a'",
+        "docb ?| '{z,b}'",
+        "docb ?& '{a,b}'",
+        "docb <@ '{\"a\":1,\"b\":2,\"c\":3}'",
+        "docb @> '{\"a\":1}'",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let name = format!("s{i}");
+        let portal = format!("p{i}");
+        let sql = format!("SELECT {expr} FROM docs WHERE id = 1 LIMIT 1");
+        common::send_length_prefixed_message(&mut alice, b'P', &common::parse_body(&name, &sql, 0));
+        common::send_length_prefixed_message(&mut alice, b'B', &common::bind_body(&portal, &name));
+        common::send_length_prefixed_message(&mut alice, b'E', &common::execute_body(&portal, 0));
+        common::send_length_prefixed_message(&mut alice, b'S', &[]);
+        let mut value = None;
+        loop {
+            let (kind, body) = common::read_message(&mut alice);
+            match kind {
+                b'1' | b'2' | b'C' => {}
+                b'D' => {
+                    // DataRow: i16 列数、i32 長さ、値のバイト列（1 列 1 行）。
+                    assert_eq!(body.get(..2), Some(&[0u8, 1][..]));
+                    assert_eq!(body.get(2..6), Some(&1i32.to_be_bytes()[..]));
+                    value = body.get(6..).map(|b| b.to_vec());
+                }
+                b'Z' => break,
+                other => panic!("unexpected message {other:?} for {expr}"),
+            }
+        }
+        assert_eq!(value, Some(b"t".to_vec()), "{expr}");
+    }
+}
 #[test]
 fn wire_text_null_and_json_null_literal_are_distinguishable() {
     let (core, _guard) = new_core();

@@ -2057,6 +2057,12 @@ fn push_dml_expr(
                 crate::sql::udf_call::JsonAccessOp::GetText => 2,
                 crate::sql::udf_call::JsonAccessOp::Path => 3,
                 crate::sql::udf_call::JsonAccessOp::PathText => 4,
+                // Issue #1598: 包含・存在演算子。既存の 1〜4 は不変。
+                crate::sql::udf_call::JsonAccessOp::Contains => 5,
+                crate::sql::udf_call::JsonAccessOp::ContainedBy => 6,
+                crate::sql::udf_call::JsonAccessOp::Exists => 7,
+                crate::sql::udf_call::JsonAccessOp::ExistsAny => 8,
+                crate::sql::udf_call::JsonAccessOp::ExistsAll => 9,
             });
             push_dml_expr(b, lhs, params)?;
             push_dml_expr(b, rhs, params)?;
@@ -4791,6 +4797,47 @@ mod tests {
                 "json rhs value",
                 json_access(crate::sql::udf_call::JsonAccessOp::Get, n(), text("a")),
                 json_access(crate::sql::udf_call::JsonAccessOp::Get, n(), text("b")),
+            ),
+            // Issue #1598: 包含・存在演算子も種別で区別される（下位タグ 5〜9。既存の 1〜4 と非衝突）。
+            (
+                "json contains vs contained_by",
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::Contains,
+                    n(),
+                    text("{}"),
+                ),
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::ContainedBy,
+                    n(),
+                    text("{}"),
+                ),
+            ),
+            (
+                "json exists vs exists_any",
+                json_access(crate::sql::udf_call::JsonAccessOp::Exists, n(), text("a")),
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::ExistsAny,
+                    n(),
+                    text("a"),
+                ),
+            ),
+            (
+                "json exists_any vs exists_all",
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::ExistsAny,
+                    n(),
+                    text("{a}"),
+                ),
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::ExistsAll,
+                    n(),
+                    text("{a}"),
+                ),
+            ),
+            (
+                "json contains vs path",
+                json_access(crate::sql::udf_call::JsonAccessOp::Contains, n(), text("a")),
+                json_access(crate::sql::udf_call::JsonAccessOp::Get, n(), text("a")),
             ),
             (
                 "json operand swap",

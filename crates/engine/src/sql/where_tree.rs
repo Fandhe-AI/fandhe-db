@@ -145,6 +145,7 @@ impl BoundOrGroup {
             return None;
         }
         let mut column: Option<usize> = None;
+        let mut bpchar: Option<bool> = None;
         let mut total: usize = 0;
         for branch in &self.branches {
             if !branch.expr_filters.is_empty() || !branch.or_groups.is_empty() {
@@ -158,6 +159,13 @@ impl BoundOrGroup {
             match column {
                 None => column = Some(filter.column_index()),
                 Some(c) if c != filter.column_index() => return None,
+                Some(_) => {}
+            }
+            // 同じ列の述語は同じ比較意味論（`CHAR(n)` の rtrim 等）を持つ前提だが、
+            // 食い違う場合は畳まない（fail-closed）。
+            match bpchar {
+                None => bpchar = Some(filter.is_bpchar()),
+                Some(b) if b != filter.is_bpchar() => return None,
                 Some(_) => {}
             }
             let n = match filter.op() {
@@ -180,7 +188,7 @@ impl BoundOrGroup {
                 }
             }
         }
-        MetadataFilter::from_bound_text_in(column?, values)
+        MetadataFilter::from_bound_text_in(column?, bpchar?, values)
     }
 
     /// 生の `scanned`（`row_codec::scan_scalar_columns` 由来。実 NULL と型不一致を
