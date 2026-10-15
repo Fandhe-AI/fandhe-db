@@ -14,8 +14,8 @@
 
 use crate::sql::allowlist::{InsertLiteral, SqlSurfaceError};
 use crate::sql::udf_call::{
-    bind_const_expr, eval, first_non_builtin_call, BinOp, BoundExpr, Expr, ExprType, ExprValue,
-    UdfRegistry, MAX_EXPR_NODES,
+    bind_const_expr, eval, first_non_builtin_call_with, BinOp, BoundExpr, Expr, ExprType,
+    ExprValue, UdfRegistry, MAX_EXPR_NODES,
 };
 
 /// 仮値評価で起きたエラーの遅延方針（Issue #1546）。
@@ -527,7 +527,7 @@ fn propagate_null(expr: &Expr) -> Result<Expr, SqlSurfaceError> {
 /// 列参照を含まない式を評価して [`InsertLiteral`] へ畳み込む。
 pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfaceError> {
     prescan(expr)?;
-    if first_non_builtin_call(expr).is_some() {
+    if first_non_builtin_call_with(expr, false, true).is_some() {
         return Err(SqlSurfaceError::unsupported(
             "only built-in functions are allowed in a constant expression",
         ));

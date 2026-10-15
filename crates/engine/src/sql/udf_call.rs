@@ -954,7 +954,7 @@ pub(crate) fn is_current_time_function_name(name: &str) -> bool {
 /// 網羅し `_ =>` を置かない（variant 追加時にコンパイルエラーで検査漏れに気づく。
 /// fail-closed）。再帰の深さは構文段の式ネスト上限で抑えられる。
 pub(crate) fn first_non_builtin_call(expr: &Expr) -> Option<&str> {
-    first_non_builtin_call_with(expr, false)
+    first_non_builtin_call_with(expr, false, false)
 }
 
 /// [`first_non_builtin_call`] の本体。`allow_current_time` が真のときだけ現在時刻関数
@@ -962,7 +962,11 @@ pub(crate) fn first_non_builtin_call(expr: &Expr) -> Option<&str> {
 /// トランザクション固定の時刻だけを受理するスコープ（[`time_fn::ClockPolicy::TxnFixedOnly`]）の
 /// 中でのみ真にする（`sql::set_expr`。SQL-37・Issue #1587）。`statement_timestamp()`・
 /// `clock_timestamp()` はここでは通し、束縛段（`reject_non_txn_fixed_clock`）が `0A000` にする。
-pub(crate) fn first_non_builtin_call_with(expr: &Expr, allow_current_time: bool) -> Option<&str> {
+pub(crate) fn first_non_builtin_call_with(
+    expr: &Expr,
+    allow_current_time: bool,
+    allow_json_fns: bool,
+) -> Option<&str> {
     match expr {
         Expr::Number(_)
         | Expr::Ident(_)
@@ -975,31 +979,34 @@ pub(crate) fn first_non_builtin_call_with(expr: &Expr, allow_current_time: bool)
             // json 列参照を置けないため、時刻関数と同じく禁止要素として報告する（`42601`）。
             if !is_builtin_function_name(name)
                 || (!allow_current_time && is_current_time_function_name(name))
-                || crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase())
+                || (!allow_json_fns
+                    && crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase()))
             {
                 return Some(name.as_str());
             }
             args.iter()
-                .find_map(|a| first_non_builtin_call_with(a, allow_current_time))
+                .find_map(|a| first_non_builtin_call_with(a, allow_current_time, allow_json_fns))
         }
         Expr::Binary { lhs, rhs, .. }
         | Expr::NullIf(lhs, rhs)
-        | Expr::JsonAccess { lhs, rhs, .. } => first_non_builtin_call_with(lhs, allow_current_time)
-            .or_else(|| first_non_builtin_call_with(rhs, allow_current_time)),
+        | Expr::JsonAccess { lhs, rhs, .. } => {
+            first_non_builtin_call_with(lhs, allow_current_time, allow_json_fns)
+                .or_else(|| first_non_builtin_call_with(rhs, allow_current_time, allow_json_fns))
+        }
         Expr::Case { whens, else_result } => whens
             .iter()
             .find_map(|(c, r)| {
-                first_non_builtin_call_with(c, allow_current_time)
-                    .or_else(|| first_non_builtin_call_with(r, allow_current_time))
+                first_non_builtin_call_with(c, allow_current_time, allow_json_fns)
+                    .or_else(|| first_non_builtin_call_with(r, allow_current_time, allow_json_fns))
             })
             .or_else(|| {
-                else_result
-                    .as_deref()
-                    .and_then(|e| first_non_builtin_call_with(e, allow_current_time))
+                else_result.as_deref().and_then(|e| {
+                    first_non_builtin_call_with(e, allow_current_time, allow_json_fns)
+                })
             }),
         Expr::Coalesce(args) => args
             .iter()
-            .find_map(|a| first_non_builtin_call_with(a, allow_current_time)),
+            .find_map(|a| first_non_builtin_call_with(a, allow_current_time, allow_json_fns)),
         // 現在時刻関数（SQL-37・Issue #1586）は組み込みだが、CHECK（TABLE-16）・連鎖ビュー本文
         // （TABLE-18）では決定的でないため禁止要素として報告する（`42601`）。
         Expr::ValueFunction { kind, .. } => {
@@ -3541,6 +3548,13 @@ fn bind_json_any_arg(
     if ty == ExprType::Vector {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "a vector value cannot be converted to jsonb".to_string(),
+        });
+    }
+    // json 型の式全般（演算子結果・`json_*` 結果を含む）は評価時に内部エラーになるため、
+    // 束縛時にクライアント向けの `0A000` で拒否する。
+    if ty == ExprType::JsonText {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "a json value cannot be converted to jsonb here; use a jsonb value".to_string(),
         });
     }
     Ok(bound)

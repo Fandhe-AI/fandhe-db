@@ -70,7 +70,7 @@ pub(crate) fn bind_set_expr(
     let allow_current_time = crate::sql::time_fn::current_clock().is_some()
         && crate::sql::time_fn::current_clock_policy()
             == crate::sql::time_fn::ClockPolicy::TxnFixedOnly;
-    if first_non_builtin_call_with(expr, allow_current_time).is_some() {
+    if first_non_builtin_call_with(expr, allow_current_time, true).is_some() {
         return Err(SqlSurfaceError::unsupported(
             "only built-in functions are allowed in a SET expression",
         ));

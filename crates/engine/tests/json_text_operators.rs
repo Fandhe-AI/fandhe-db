@@ -520,3 +520,67 @@ fn predicate_update_with_json_extraction_is_idempotent_by_operation_id() {
     assert_eq!(err.wire_code(), "23505");
     assert_eq!(cell(&core, &alice, "n"), Cell::SignedInteger(9));
 }
+
+/// jsonb 関数の any 引数は json 型の式全般（演算子結果・`json_*` 結果）を束縛時に `0A000` で拒否する
+/// （評価時の内部エラー `XX000` にしない）。
+#[test]
+fn jsonb_any_args_reject_json_typed_expressions_at_bind() {
+    let (core, path, alice) = seeded();
+    let _guard = CleanupGuard(path);
+    for expr in [
+        "to_jsonb(doc -> 'a')",
+        "to_jsonb(json_build_object('a', 1))",
+        "jsonb_build_object('k', doc -> 'a')",
+        "jsonb_build_array(json_build_array(1))",
+    ] {
+        assert_eq!(code(&core, &alice, expr), "0A000", "{expr}");
+    }
+}
+
+/// `UPDATE SET` は json 関数のうちスカラー結果のもの（`json_array_length`・`json_typeof`）を
+/// 互換列へ代入でき、json 型の結果は互換列へ代入できない（`XX000` にしない）。
+#[test]
+fn update_set_accepts_scalar_json_functions() {
+    let (core, path, alice) = seeded();
+    let _guard = CleanupGuard(path);
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &format!(
+            "UPDATE {TABLE} SET n = json_array_length(doc -> 'a'), lang = json_typeof(doc) \
+             WHERE id = 1 USING OPERATION_ID 'upd-scalar'"
+        ),
+    )
+    .expect("scalar json function in SET should succeed");
+    assert_eq!(cell(&core, &alice, "n"), Cell::SignedInteger(2));
+    assert_eq!(cell(&core, &alice, "lang"), text("object"));
+    let sql = format!(
+        "UPDATE {TABLE} SET lang = json_build_object('a', 1) WHERE id = 1 \
+         USING OPERATION_ID 'upd-json'"
+    );
+    let c = code_sql(&core, &alice, &sql);
+    assert_ne!(c, "XX000");
+}
+
+/// `INSERT VALUES` も json 関数のスカラー結果を互換列へ受理し、json 型の結果で内部エラーにしない。
+#[test]
+fn insert_values_json_functions_do_not_internal_error() {
+    let (core, path, alice) = seeded();
+    let _guard = CleanupGuard(path);
+    let ok = format!(
+        "INSERT INTO {TABLE} (id, embedding, lang, n) VALUES \
+         (7, '[0.1,0.2]', json_typeof('[1]'), json_array_length('[1,2,3]')) \
+         USING OPERATION_ID 'ins-scalar'"
+    );
+    let res = core.execute_sql_in_session(&alice, &mut SessionState::default(), &ok);
+    assert!(
+        res.is_ok(),
+        "{:?}",
+        res.err().map(|e| e.wire_code().to_string())
+    );
+    let bad = format!(
+        "INSERT INTO {TABLE} (id, embedding, lang) VALUES \
+         (8, '[0.1,0.2]', json_build_object('a', 1)) USING OPERATION_ID 'ins-json'"
+    );
+    assert_ne!(code_sql(&core, &alice, &bad), "XX000");
+}
