@@ -30,6 +30,7 @@ float／日付／バイナリ／UUID／JSON 列をネイティブ型へ復元で
 | `Text` | `Text` | 25 | -1 | `text` |
 | `Vector(_)`／`Array(_)`／`Enum(_)`／`Computed{ty: None}`（ベクトル式など型なしの式列） | `Text` | 25 | -1 | `text` |
 | `Computed{ty: Some(t)}` | `t` の写像と同じ（Issue #1173。下記「集計・式列の型」参照） | — | — | — |
+| `SmallInt` | `Int2` | 21 | 2 | `int2`（Issue #1561・TABLE-30） |
 | `Integer` | `Int4` | 23 | 4 | `int4` |
 | `BigInt` | `Int8` | 20 | 8 | `int8` |
 | `Numeric{..}` | `Numeric` | 1700 | -1 | `numeric` |

@@ -933,3 +933,8 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 **Issue #1585（docs(design): now() 系の評価済み値の台帳保存を設計する。SQL-37 ポインタ。詳細は [now-evaluated-value-ledger.md](now-evaluated-value-ledger.md)）**: 評価前の構文形をハッシュする方針・台帳値 v3・分割実行ジョブ記録 v2・INSERT 系の別ドメインタグを設計記録に確定。ドキュメントのみの変更でコードは変更しない。
 
 - **対象外**: コード実装（#1586・#1587・#2188）、TIMESTAMPTZ／TimeZone、変更ログ・レプリケーション（RECOVER-14・RECOVER-15）。
+
+**Issue #1561（feat(wire): SMALLINT の型 OID 21・int2 バイナリ入出力・NoSQL 型束縛。親 #1557・TABLE-30 ポインタ。関連 WIRE-13・WIRE-14・NOSQL-13・NOSQL-17）**: #1558 の暫定状態（OID 23 公告・バイナリと NoSQL 型束縛は fail-closed）を解消した。(1) `RowDescription` は SMALLINT 列（`Computed` を含む）を OID 21・typlen 2・型名 `int2` で公告する（**契約変更**: 従来は OID 23・typlen 4）。(2) バイナリ結果は 2 バイト BE（i16 に収まらない `Cell` は `XX000` で fail-closed）。(3) バイナリ param は `BinaryParam::Int2` を追加し、SMALLINT／INTEGER／BIGINT／`id` の整数スロットで宣言 int2（OID 21）を受理する（拡大方向。従来 INTEGER スロットへの宣言 int2 は `0A000` だった）。範囲外値（宣言 int4／int8 の広い値）は engine の束縛が `22003` で拒否し、wire 側に第 2 の範囲検査は無い。長さ不正は `08P01`。(4) ParameterDescription の推論 OID は 21。(5) NoSQL の insert／update／filter（eq・範囲・between・in・述語形 DML）と `create_table`／`add_column` の型名 `"smallint"` を INTEGER と同じ規則で束縛する（範囲外 `22003`・小数／指数 `22P02`）。
+
+- **テスト**: `result_encoder`／`binary_param` の単体テスト、`wire13_type_oid.rs`・`wire14_binary_typed_columns.rs`・`wire14_binary_params.rs`・`nosql17_typed_json_parity.rs`・`nosql13_ddl.rs`。
+- **対象外**: `SMALLINT[]`（OID 1005）と NoSQL の `element_type: "smallint"`（`0A000` のまま）、COPY binary の int2（WIRE-23）、`AVG(smallint)` の numeric 化（#2270）。

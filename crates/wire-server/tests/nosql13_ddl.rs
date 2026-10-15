@@ -714,6 +714,37 @@ fn create_table_unknown_type_and_invalid_vector_shape_are_42601() {
     }
 }
 
+/// Issue #1561（TABLE-30・NOSQL-13）: `create_table` の型名 `"smallint"` が受理され、
+/// 範囲外値は 22003、配列要素型としての `"smallint"` は拒否のまま（0A000）。
+#[test]
+fn create_table_smallint_column_binds_range_and_rejects_array_element() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let resp = query(
+        &session,
+        br#"{"op":"create_table","table":"sm","columns":[
+        {"name":"embedding","type":"vector","dim":2},
+        {"name":"n","type":"smallint","nullable":true}
+    ]}"#,
+    );
+    assert_eq!(resp.status, 200, "got: {resp:?}");
+    let ok = query(
+        &session,
+        br#"{"op":"insert","table":"sm","rows":[{"id":1,"embedding":[0.1,0.2],"n":32767}],"operation_id":"sm-1"}"#,
+    );
+    assert_eq!(ok.status, 200, "got: {ok:?}");
+    let oor = query(
+        &session,
+        br#"{"op":"insert","table":"sm","rows":[{"id":2,"embedding":[0.1,0.2],"n":32768}],"operation_id":"sm-2"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&oor), "22003", "got: {oor:?}");
+    let arr = query(
+        &session,
+        br#"{"op":"create_table","table":"sm2","columns":[{"name":"a","type":"array","element_type":"smallint","max_len":4}]}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&arr), "0A000", "got: {arr:?}");
+}
+
 // --- CHECK 制約（Issue #1199・NOSQL-13・TABLE-16。SQL 表層と同じ engine の
 // 検査点が違反を `23514`／HTTP 409 で拒否することを固定する） -------------
 
