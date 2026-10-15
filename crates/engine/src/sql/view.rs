@@ -501,7 +501,7 @@ fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurface
             }
             Ok(())
         }
-        Expr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
             expr_columns_within(columns, lhs)?;
             expr_columns_within(columns, rhs)
         }

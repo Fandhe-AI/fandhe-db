@@ -224,6 +224,15 @@ impl Inferrer<'_> {
             Expr::Coalesce(args) => self.sibling_type(args.iter()),
             Expr::NullIf(a, b) => self.sibling_type([a.as_ref(), b.as_ref()].into_iter()),
             Expr::Null => Ty::Untyped,
+            // jsonb パス演算子（Issue #1596）。`->>`／`#>>` は text、`->`／`#>` は
+            // jsonb（`$n` の型付け対象外）なので型なしとして扱う。
+            Expr::JsonAccess { op, .. } => match op {
+                crate::sql::udf_call::JsonAccessOp::GetText
+                | crate::sql::udf_call::JsonAccessOp::PathText => {
+                    Ty::Known(PreparedParamType::Text)
+                }
+                _ => Ty::Untyped,
+            },
             // DATE／TIMESTAMP は式内 `$n` の対象外型。`Text` へ倒さず `assign` の
             // 対象外型判定（`0A000`）に落として fail-closed にする。
             Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => {
@@ -337,6 +346,16 @@ impl Inferrer<'_> {
                 self.walk_siblings(&refs)?;
             }
             Expr::NullIf(a, b) => self.walk_siblings(&[a.as_ref(), b.as_ref()])?,
+            // jsonb パス演算子の被演算子に `$n` は置けない（型を推論できないため
+            // `Untyped` として割り当て、不定扱い。Issue #1596）。
+            Expr::JsonAccess { lhs, rhs, .. } => {
+                for e in [lhs.as_ref(), rhs.as_ref()] {
+                    match as_param(e) {
+                        Some(n) => self.assign(n, Ty::Untyped)?,
+                        None => self.walk(e)?,
+                    }
+                }
+            }
             Expr::Number(_)
             | Expr::String(_)
             | Expr::Ident(_)

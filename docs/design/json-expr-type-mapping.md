@@ -29,6 +29,21 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 - wire 側は `ColumnMeta::Scalar{ty: Json|Jsonb}` から OID 114／3802 への写像が実装済み。
 - 集合返却関数の基盤（#2220）と CAST／`::`（#1588〜#1593）は未実装。
 
+## Issue #1596 での変更（パス演算子の構文・束縛・評価）
+
+- `ExprType::Json`・`ExprValue::Json`（正規化テキスト）・`BoundExpr::JsonbColumnRef`／
+  `JsonAccess` を最小限だけ導入した。jsonb 値を消費できるのは投影とパス演算子の左辺だけで、
+  比較・順序・集計・関数引数・`CASE`／`COALESCE`／`NULLIF`・`UPDATE SET` の代入は
+  `0A000`（#1597 が開放する）。
+- 構文は `Expr::JsonAccess`（`BinOp` とは別 variant）。優先順位は加減算より弱く比較より強い
+  左結合。CHECK 本体では受理しない。
+- `->`・`->>` の右辺は text（キー）または int4（添字。負値は末尾から）、`#>`・`#>>` の右辺は
+  text[] リテラルのみ。左辺が jsonb でなければ `42883`、`json` 列は `0A000`、jsonb 列の
+  裸の参照は従来どおり `22000`。
+- 結果: `->`・`#>` は jsonb（OID 3802）、`->>`・`#>>` は text（OID 25）。存在しないキー・
+  範囲外の添字・容器の型不一致は SQL の NULL。
+- DML の content hash にタグ 12 を追加した（[multi-row-dml-operation-id.md](multi-row-dml-operation-id.md)）。
+
 ## 設計判断の所在
 
 型の形・値表現・字句と優先順位・演算子と関数の型解決・集合返却関数・jsonpath・

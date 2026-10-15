@@ -163,7 +163,9 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
             }
         }
         Expr::Call { args, .. } => args.iter().try_for_each(prescan),
-        Expr::Binary { lhs, rhs, .. } | Expr::NullIf(lhs, rhs) => {
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::NullIf(lhs, rhs)
+        | Expr::JsonAccess { lhs, rhs, .. } => {
             prescan(lhs)?;
             prescan(rhs)
         }
@@ -214,6 +216,8 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
             check_intermediate_precision(rhs)?;
             check_node_value(expr, true)
         }
+        // jsonb パス演算子は列参照を要し、定数式では `prescan` が列参照として拒否する。
+        Expr::JsonAccess { .. } => Ok(()),
         Expr::NullIf(lhs, rhs) => {
             check_intermediate_precision(lhs)?;
             check_intermediate_precision(rhs)
@@ -291,6 +295,11 @@ fn typed_null(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
         ExprType::Text => twin(Expr::String(String::new())),
         ExprType::Date => twin(Expr::DateLiteral(0)),
         ExprType::Timestamp => twin(Expr::TimestampLiteral(0)),
+        ExprType::Json => {
+            return Err(SqlSurfaceError::unsupported(
+                "a jsonb value is not allowed in a constant expression",
+            ))
+        }
         ExprType::Bool => Expr::Case {
             whens: vec![(
                 Expr::Binary {
@@ -557,6 +566,9 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         ExprValue::Vector(_) => Err(SqlSurfaceError::Internal {
             detail: "constant expression produced a vector".to_string(),
         }),
+        ExprValue::Json(_) => Err(SqlSurfaceError::unsupported(
+            "a jsonb value is not allowed in a constant expression",
+        )),
     }
 }
 

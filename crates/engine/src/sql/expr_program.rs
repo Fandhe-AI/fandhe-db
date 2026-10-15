@@ -141,6 +141,11 @@ pub(crate) enum ExprStep {
     /// `NULLIF(lhs, rhs)`。rhs・lhs の順に pop し、[`crate::sql::udf_call::
     /// eval_nullif`] へ渡す。
     NullIf,
+    /// jsonb パス演算子（`->` `->>` `#>` `#>>`。Issue #1596・TABLE-25）の部分木を、
+    /// 参照実装 [`udf_call::eval_with_scalars`] でまるごと評価して 1 値を積む。
+    /// jsonb は行ごとの再パースが要る重い演算で、演算子連鎖は式ノード予算で有界のため、
+    /// ステップ列へ展開せず再帰評価に委ねる（差分テストが不要になり意味論も 1 実装に保てる）。
+    JsonSubtree(Box<BoundExpr>),
 }
 
 impl PartialEq for ExprStep {
@@ -175,6 +180,7 @@ impl PartialEq for ExprStep {
             }
             (ExprStep::Pop, ExprStep::Pop) => true,
             (ExprStep::NullIf, ExprStep::NullIf) => true,
+            (ExprStep::JsonSubtree(a), ExprStep::JsonSubtree(b)) => a == b,
             _ => false,
         }
     }
@@ -223,6 +229,8 @@ pub(crate) enum StackValue {
     /// （Issue #1075・TABLE-16 ポインタ。[`StackValue::TextColumnRef`] と同じ
     /// 「実体は行スカラービューから都度解決する」設計）。
     NumericColumnRef(usize),
+    /// jsonb 値の正規化テキスト（[`ExprStep::JsonSubtree`] の結果。所有データ）。
+    Json(String),
 }
 
 /// [`StackValue`] を、eval 呼び出しスコープに閉じたライフタイム `'a` を持つ
@@ -283,6 +291,7 @@ fn stack_to_expr_value<'a>(
                     .to_string(),
             }),
         },
+        StackValue::Json(s) => Ok(ExprValue::Json(Cow::Owned(s))),
         StackValue::NumericColumnRef(index) => match row_scalars.get(index) {
             None => Err(SqlSurfaceError::Internal {
                 detail: "NUMERIC column reference is outside the decoded row scalar view"
@@ -318,6 +327,7 @@ fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
         ExprValue::Text(s) => StackValue::Text(s.into_owned()),
         ExprValue::Date(d) => StackValue::Date(d),
         ExprValue::Timestamp(t) => StackValue::Timestamp(t),
+        ExprValue::Json(j) => StackValue::Json(j.into_owned()),
     }
 }
 
@@ -380,6 +390,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
                 | ExprValue::Text(_)
                 | ExprValue::Date(_)
                 | ExprValue::Timestamp(_)
+                | ExprValue::Json(_)
                 | ExprValue::Null => None,
             }
         }
@@ -445,6 +456,8 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::Null
         | BoundExpr::Case { .. }
         | BoundExpr::Coalesce(_)
+        | BoundExpr::JsonbColumnRef { .. }
+        | BoundExpr::JsonAccess { .. }
         | BoundExpr::NullIf { .. } => None,
     }
 }
@@ -525,6 +538,11 @@ fn compile_node(
         }
         BoundExpr::ColumnRef { index } => {
             steps.push(ExprStep::PushNumericColumn(*index));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::JsonbColumnRef { .. } | BoundExpr::JsonAccess { .. } => {
+            steps.push(ExprStep::JsonSubtree(Box::new(expr.clone())));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);
         }
@@ -871,6 +889,11 @@ impl ExprProgram {
                     scratch.push(StackValue::NumericColumnRef(*index));
                     pc += 1;
                 }
+                ExprStep::JsonSubtree(subtree) => {
+                    let v = udf_call::eval_with_scalars(subtree, id, embedding, row_scalars)?;
+                    scratch.push(expr_value_to_stack(v));
+                    pc += 1;
+                }
                 ExprStep::Builtin(f) => {
                     let arity = udf_call::builtin_signature(*f).0.len();
                     if scratch.len() < arity {
@@ -945,6 +968,7 @@ impl ExprProgram {
                             | ExprValue::Null
                             | ExprValue::Text(_)
                             | ExprValue::Date(_)
+                            | ExprValue::Json(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
                         let s = match scalar_ev {
@@ -954,6 +978,7 @@ impl ExprProgram {
                             | ExprValue::Null
                             | ExprValue::Text(_)
                             | ExprValue::Date(_)
+                            | ExprValue::Json(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
                         // バックエンドの失敗（deadline 超過・トラップ・メモリ確保

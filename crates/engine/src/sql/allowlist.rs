@@ -19,7 +19,7 @@ use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::relation::{ColumnRef, TableRef};
 use crate::sql::udf_call::{
-    BinOp, Expr, MAX_CALL_ARGS, MAX_CASE_BRANCHES, MAX_CASE_NESTING, MAX_EXPR_DEPTH,
+    BinOp, Expr, JsonAccessOp, MAX_CALL_ARGS, MAX_CASE_BRANCHES, MAX_CASE_NESTING, MAX_EXPR_DEPTH,
     MAX_EXPR_NODES, MAX_UDF_PARAMS,
 };
 use crate::sql::using_operation_id::OperationId;
@@ -4013,7 +4013,13 @@ impl<'a> Parser<'a> {
                 let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
                 let next_is_op = matches!(
                     self.tokens.get(self.pos + 1),
-                    Some(Token::Punct('+' | '-' | '*' | '/'))
+                    Some(
+                        Token::Punct('+' | '-' | '*' | '/')
+                            | Token::Arrow
+                            | Token::ArrowText
+                            | Token::HashArrow
+                            | Token::HashArrowText
+                    )
                 );
                 if starts_case {
                     self.parse_projection_infix(0)?
@@ -4027,12 +4033,22 @@ impl<'a> Parser<'a> {
                     let head = self.parse_call_expr(name, 0);
                     self.allow_unary_minus = prev;
                     let head = head?;
-                    if matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+                    if matches!(
+                        self.peek(),
+                        Some(
+                            Token::Punct('+' | '-' | '*' | '/')
+                                | Token::Arrow
+                                | Token::ArrowText
+                                | Token::HashArrow
+                                | Token::HashArrowText
+                        )
+                    ) {
                         // `parse_value_expr(0)` と同じ段位（add=0・mul=1・primary=2）で継続する。
                         self.allow_unary_minus = true;
                         let r = self
                             .parse_mul_rest(head, 1)
-                            .and_then(|m| self.parse_add_rest(m, 0));
+                            .and_then(|m| self.parse_add_rest(m, 0))
+                            .and_then(|a| self.parse_json_access_rest(a, 0));
                         self.allow_unary_minus = prev;
                         r?
                     } else {
@@ -4503,7 +4519,8 @@ impl<'a> Parser<'a> {
                 let lhs = Expr::Ident(aggregate_placeholder(0));
                 // `parse_value_expr(0)` と同じ段位（add=0・mul=1・primary=2）で継続する。
                 let mul = self.parse_mul_rest(lhs, 1)?;
-                self.parse_add_rest(mul, 0)
+                let add = self.parse_add_rest(mul, 0)?;
+                self.parse_json_access_rest(add, 0)
             }
             None => self.parse_value_expr(0),
         }
@@ -5758,7 +5775,46 @@ impl<'a> Parser<'a> {
     /// （TASK-79・SQL-9）。
     fn parse_value_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         self.check_expr_depth(depth)?;
-        self.parse_add_expr(depth)
+        let lhs = self.parse_add_expr(depth)?;
+        self.parse_json_access_rest(lhs, depth)
+    }
+
+    /// jsonb パス演算子 `->` `->>` `#>` `#>>` のループ（対象ビヘイビア: TABLE-25。
+    /// Issue #1596）。PostgreSQL の優先順位表で「その他の演算子」の段にあたり、加減算
+    /// （[`Self::parse_add_expr`]）より弱く比較より強い。左結合のため
+    /// `a -> 'x' ->> 'y'` は `(a -> 'x') ->> 'y'`、`a -> 1 + 1` は `a -> (1 + 1)`。
+    /// 左辺を解析済みの状態から継続できるよう [`Self::parse_add_rest`] と同じく分離している
+    /// （投影項目の先頭が関数呼び出しの場合の続き用）。連鎖 1 段ごとにノード予算を課金する。
+    /// CHECK 本体では評価経路の保証範囲外のため `0A000`。
+    fn parse_json_access_rest(
+        &mut self,
+        mut lhs: Expr,
+        depth: usize,
+    ) -> Result<Expr, SqlSurfaceError> {
+        loop {
+            let op = match self.peek() {
+                Some(Token::Arrow) => JsonAccessOp::Get,
+                Some(Token::ArrowText) => JsonAccessOp::GetText,
+                Some(Token::HashArrow) => JsonAccessOp::Path,
+                Some(Token::HashArrowText) => JsonAccessOp::PathText,
+                _ => break,
+            };
+            if self.in_check_body {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "JSON path operators are not supported in a CHECK constraint"
+                        .to_string(),
+                });
+            }
+            self.advance();
+            let rhs = self.parse_add_expr(depth + 1)?;
+            self.consume_expr_node()?;
+            lhs = Expr::JsonAccess {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
     }
 
     fn parse_add_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
@@ -11461,7 +11517,7 @@ fn parse_select_shape(
 fn expr_contains_scalar_function(expr: &Expr) -> bool {
     match expr {
         Expr::Call { .. } | Expr::Case { .. } | Expr::Coalesce(_) | Expr::NullIf(..) => true,
-        Expr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
             expr_contains_scalar_function(lhs) || expr_contains_scalar_function(rhs)
         }
         Expr::Number(_)
@@ -15013,14 +15069,77 @@ mod tests {
     #[test]
     fn rejects_multichar_operator_tokens_as_syntax_error() {
         assert_rejected_as_syntax_error(
-            "SELECT * FROM documents WHERE lang->'k' = 'x' ORDER BY embedding <=> '[0.1]' LIMIT 5",
-        );
-        assert_rejected_as_syntax_error(
             "SELECT * FROM documents WHERE lang::text = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
         );
         assert_rejected_as_syntax_error(
             "SELECT * FROM documents WHERE lang || 'a' = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
         );
+    }
+
+    /// Issue #1596（TABLE-25）: パス演算子は構文段で受理され、PostgreSQL と同じ優先順位
+    /// （加減算より弱く比較より強い）・左結合の木になる。型の検査は束縛段の担当。
+    #[test]
+    fn json_path_operators_parse_with_postgres_precedence_and_left_associativity() {
+        use crate::sql::udf_call::JsonAccessOp;
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE d -> 'a' ->> 'b' = 'x' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        let [WherePredicate::Expression(Expr::Binary {
+            op: BinOp::Eq, lhs, ..
+        })] = preds.as_slice()
+        else {
+            panic!("expected a single comparison, got {preds:?}");
+        };
+        // `(d -> 'a') ->> 'b'`（左結合）。
+        let Expr::JsonAccess {
+            op: JsonAccessOp::GetText,
+            lhs: inner,
+            rhs,
+        } = lhs.as_ref()
+        else {
+            panic!("expected ->> at the top, got {lhs:?}");
+        };
+        assert_eq!(rhs.as_ref(), &Expr::String("b".to_string()));
+        assert!(matches!(
+            inner.as_ref(),
+            Expr::JsonAccess {
+                op: JsonAccessOp::Get,
+                ..
+            }
+        ));
+
+        // `d -> 1 + 1` は `d -> (1 + 1)`（加算が強い）。
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE d -> 1 + 1 ->> 'k' = 'x' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        let [WherePredicate::Expression(Expr::Binary { lhs, .. })] = preds.as_slice() else {
+            panic!("unexpected shape {preds:?}");
+        };
+        let Expr::JsonAccess { lhs: inner, .. } = lhs.as_ref() else {
+            panic!("expected ->> at the top, got {lhs:?}");
+        };
+        let Expr::JsonAccess { rhs, .. } = inner.as_ref() else {
+            panic!("expected -> below, got {inner:?}");
+        };
+        assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+    }
+
+    /// `#>`／`#>>` もトークンから演算子種別へ写像される。
+    #[test]
+    fn json_hash_path_operators_parse_to_path_ops() {
+        use crate::sql::udf_call::JsonAccessOp;
+        for (sql_op, want) in [("#>", JsonAccessOp::Path), ("#>>", JsonAccessOp::PathText)] {
+            let preds = where_predicates_for(&format!(
+                "SELECT * FROM documents WHERE d {sql_op} '{{a,b}}' = 'x' ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            ));
+            let [WherePredicate::Expression(Expr::Binary { lhs, .. })] = preds.as_slice() else {
+                panic!("unexpected shape {preds:?}");
+            };
+            assert!(
+                matches!(lhs.as_ref(), Expr::JsonAccess { op, .. } if *op == want),
+                "{sql_op}: {lhs:?}"
+            );
+        }
     }
 
     /// SQL-42・Issue #1521: lexer が `%`／単独 `#` を字句化しても、構文段は受理しない

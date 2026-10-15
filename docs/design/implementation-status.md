@@ -915,3 +915,11 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 **Issue #1595（docs(design): JSON 演算子・関数・jsonpath の ExprType への写像を設計する。TABLE-25・TABLE-14 ポインタ。詳細は [json-expr-type-mapping.md](json-expr-type-mapping.md)）**: 公開コードの現状と担当 Issue 対応表を記録（設計判断の詳細は private spec 側に置きポインタ表記のみ）。ドキュメントのみの変更でコードは変更しない。
 
 - **対象外**: コード実装（兄弟 Issue）、jsonb 出力形式の PostgreSQL 17 との差の是正、`jsonb_agg` の担当未割当、SRF 基盤（#2220）。
+
+**Issue #1596（feat(engine): jsonb の `->` `->>` `#>` `#>>` を構文解析・束縛・評価する。TABLE-25 ポインタ。詳細は [json-expr-type-mapping.md](json-expr-type-mapping.md)）**: `jsonb` 列に対するパス取得演算子を投影と `WHERE` の式で使えるようにした。`->`・`#>` は jsonb、`->>`・`#>>` は text を返し、存在しないキー・範囲外の添字・容器の型不一致は NULL。優先順位は加減算より弱く比較より強い左結合。
+
+- **境界**: 最小の jsonb 型（`ExprType::Json`）だけを導入し、jsonb 値の消費は投影とパス演算子の左辺に限る。比較・`ORDER BY`・集計・関数引数・`CASE`／`COALESCE`／`NULLIF`・`UPDATE SET` は `0A000`（#1597）。`json` 列の左辺は `0A000`（#2180）、非 jsonb の左辺は `42883`。CHECK 本体は受理しない。
+- **右辺**: `->`／`->>` は text（キー）か int4（添字。負は末尾から）。bigint・小数・BIGINT 列は `42883`。`#>`／`#>>` は `'{a,b,0}'` 形式の text[] リテラルのみ（形式不正は `22P02`、リテラル以外は `0A000`）。
+- **content hash**: 式 DML の直列化にタグ 12 を追加（既存タグ不変）。
+- **テスト**: `crates/engine/tests/json_path_operators.rs`（値・NULL・優先順位・型規則・拒否コード・テナント境界）、`json_column.rs`（`json` 列は `42601` から `0A000` へ）、wire は `wire_json_column.rs`（OID 3802／25）。
+- **対象外**: jsonb の比較・順序・CAST（#1597、#1588〜#1593）、`json` 列の原文保持版（#2180）、`@>`／`?` 系（#1598）、`||`／`-`／`#-`（#2181）、関数群（#1599）、jsonpath（#2182 配下）、`#>` の右辺の配列式（TABLE-35）、文字列リテラル始まりの投影項目（従来どおり `42601`）、`ORDER BY` 式キーのパス演算子（`42601` のまま）。

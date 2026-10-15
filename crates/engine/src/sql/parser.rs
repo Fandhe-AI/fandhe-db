@@ -1344,12 +1344,13 @@ pub fn bind_projection(
                         cols.push(resolve_projected_column(name, alias, schema)?);
                     }
                     crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
-                        let (bound, ty, result_ty) = crate::sql::udf_call::bind_projection_expr(
-                            expr,
-                            schema,
-                            udfs,
-                            node_budget,
-                        )?;
+                        let (bound, ty, result_ty) =
+                            crate::sql::udf_call::bind_projection_expr_json_ok(
+                                expr,
+                                schema,
+                                udfs,
+                                node_budget,
+                            )?;
                         let name = alias.clone().unwrap_or_else(|| default_expr_alias(expr));
                         cols.push(ProjectedColumn::Computed {
                             name,
@@ -5638,7 +5639,8 @@ fn resolve_aggregate_input(
                 | ExprType::Bool
                 | ExprType::Text
                 | ExprType::Date
-                | ExprType::Timestamp => Err(SqlSurfaceError::invalid_input(
+                | ExprType::Timestamp
+                | ExprType::Json => Err(SqlSurfaceError::invalid_input(
                     "aggregate argument must evaluate to a scalar",
                 )),
             }
@@ -5745,7 +5747,8 @@ fn resolve_count_distinct_input(
                 | ExprType::Bool
                 | ExprType::Text
                 | ExprType::Date
-                | ExprType::Timestamp => Err(SqlSurfaceError::invalid_input(
+                | ExprType::Timestamp
+                | ExprType::Json => Err(SqlSurfaceError::invalid_input(
                     "aggregate argument must evaluate to a scalar",
                 )),
             }
@@ -6213,6 +6216,10 @@ fn order_kind_for_expr_type(
         ExprType::Vector => Err(SqlSurfaceError::invalid_input(
             "unsupported ORDER BY expression type: VECTOR",
         )),
+        // jsonb の順序は #1597 の担当（Issue #1596）。それまで fail-closed。
+        ExprType::Json => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "ORDER BY a jsonb expression is not supported".to_string(),
+        }),
     }
 }
 
@@ -6774,7 +6781,7 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
                 collect_expr_idents(arg, out);
             }
         }
-        Expr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
             collect_expr_idents(lhs, out);
             collect_expr_idents(rhs, out);
         }
@@ -7358,6 +7365,11 @@ fn rewrite_group_row_idents(
                 Some(e) => Some(Box::new(rec(e)?)),
                 None => None,
             },
+        },
+        Expr::JsonAccess { op, lhs, rhs } => Expr::JsonAccess {
+            op: *op,
+            lhs: Box::new(rec(lhs)?),
+            rhs: Box::new(rec(rhs)?),
         },
         Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(rec).collect::<Result<_, _>>()?),
         Expr::NullIf(a, b) => Expr::NullIf(Box::new(rec(a)?), Box::new(rec(b)?)),

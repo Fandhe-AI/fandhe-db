@@ -147,6 +147,8 @@ pub(crate) fn eval_set_expr_to_value<'a>(
             ColumnType::Boolean => Ok(Value::Bool(b)),
             _ => Err(internal()),
         },
+        // jsonb 値の代入は #1597 まで束縛段が `0A000` で拒否するため到達しない（fail-closed）。
+        ExprValue::Json(_) => Err(internal()),
         ExprValue::Date(d) => match &set.target_ty {
             ColumnType::Date => Ok(Value::Date(d)),
             ColumnType::Timestamp => i64::from(d)

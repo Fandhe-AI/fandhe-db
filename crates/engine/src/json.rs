@@ -1114,9 +1114,196 @@ pub fn extract_path_text(stored: &str, path: &JsonPath) -> Result<Option<String>
     }))
 }
 
+/// `->`／`->>` の右辺（SQL 表層のパス演算子。対象ビヘイビア: TABLE-25）が指す 1 段。
+/// 束縛段（`sql::udf_call`）が右辺の型からキーか添字かを確定して渡す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonAccessStep {
+    /// オブジェクトのキー参照（配列・スカラーに対しては NULL）。
+    Key(String),
+    /// 配列の添字参照。負値は末尾から数える（範囲外・非配列は NULL）。
+    Index(i32),
+}
+
+/// 型の合わない・存在しない参照結果を `None`（SQL の NULL）にしつつ、`text` なら
+/// `->>`／`#>>` の意味（JSON 文字列は生の文字列、JSON の `null` は NULL）で値を文字列化する。
+fn render_access_result(v: &JsonValue, as_text: bool) -> Option<String> {
+    if as_text {
+        match v {
+            JsonValue::Null => return None,
+            JsonValue::String(s) => return Some(s.clone()),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    write_canonical(v, &mut out);
+    Some(out)
+}
+
+fn access_array_index(len: usize, idx: i64) -> Option<usize> {
+    let len = i64::try_from(len).ok()?;
+    let pos = if idx < 0 { len.checked_add(idx)? } else { idx };
+    if pos < 0 || pos >= len {
+        return None;
+    }
+    usize::try_from(pos).ok()
+}
+
+/// 格納済み `jsonb` テキストに対する `->`（`as_text == false`）／`->>`（`true`）の評価
+/// （sql::udf_call の評価器から呼ばれる）。キー不在・範囲外・容器の型不一致は
+/// `Ok(None)`（SQL の NULL）。格納値のパース失敗は格納契約違反として `Err`。
+pub(crate) fn jsonb_access(
+    stored: &str,
+    step: &JsonAccessStep,
+    as_text: bool,
+) -> Result<Option<String>, JsonColumnError> {
+    let value = parse_json(stored).map_err(|_| JsonColumnError::Invalid)?;
+    let found = match (&value, step) {
+        (JsonValue::Object(map), JsonAccessStep::Key(k)) => map.get(k),
+        (JsonValue::Array(items), JsonAccessStep::Index(i)) => {
+            access_array_index(items.len(), i64::from(*i)).and_then(|p| items.get(p))
+        }
+        _ => None,
+    };
+    Ok(found.and_then(|v| render_access_result(v, as_text)))
+}
+
+/// `#>`／`#>>` の評価。`path` の各要素はオブジェクトならキー、配列なら整数（解釈できない
+/// 場合は NULL）として扱う。要素に NULL（`None`）があれば結果は NULL。空パスは値全体。
+pub(crate) fn jsonb_access_path(
+    stored: &str,
+    path: &[Option<String>],
+    as_text: bool,
+) -> Result<Option<String>, JsonColumnError> {
+    let value = parse_json(stored).map_err(|_| JsonColumnError::Invalid)?;
+    let mut cur = &value;
+    for elem in path {
+        let Some(elem) = elem else {
+            return Ok(None);
+        };
+        let next = match cur {
+            JsonValue::Object(map) => map.get(elem),
+            JsonValue::Array(items) => match elem.parse::<i32>() {
+                Ok(i) => access_array_index(items.len(), i64::from(i)).and_then(|p| items.get(p)),
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        match next {
+            Some(n) => cur = n,
+            None => return Ok(None),
+        }
+    }
+    Ok(render_access_result(cur, as_text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jsonb_access_key_index_and_text_semantics() {
+        let doc = r#"{"a":[10,{"b":"x\ny"},null],"n":null,"s":"str"}"#;
+        let key = |k: &str| JsonAccessStep::Key(k.to_string());
+        assert_eq!(
+            jsonb_access(doc, &key("s"), false).unwrap().as_deref(),
+            Some("\"str\"")
+        );
+        assert_eq!(
+            jsonb_access(doc, &key("s"), true).unwrap().as_deref(),
+            Some("str")
+        );
+        assert_eq!(
+            jsonb_access(doc, &key("n"), false).unwrap().as_deref(),
+            Some("null")
+        );
+        assert_eq!(jsonb_access(doc, &key("n"), true).unwrap(), None);
+        assert_eq!(jsonb_access(doc, &key("zz"), false).unwrap(), None);
+        // 配列にキー・スカラーに添字は NULL。
+        assert_eq!(jsonb_access("[1]", &key("a"), false).unwrap(), None);
+        assert_eq!(
+            jsonb_access("1", &JsonAccessStep::Index(0), false).unwrap(),
+            None
+        );
+        let arr = "[10,20,30]";
+        assert_eq!(
+            jsonb_access(arr, &JsonAccessStep::Index(0), false)
+                .unwrap()
+                .as_deref(),
+            Some("10")
+        );
+        assert_eq!(
+            jsonb_access(arr, &JsonAccessStep::Index(-1), false)
+                .unwrap()
+                .as_deref(),
+            Some("30")
+        );
+        assert_eq!(
+            jsonb_access(arr, &JsonAccessStep::Index(-3), false)
+                .unwrap()
+                .as_deref(),
+            Some("10")
+        );
+        assert_eq!(
+            jsonb_access(arr, &JsonAccessStep::Index(-4), false).unwrap(),
+            None
+        );
+        assert_eq!(
+            jsonb_access(arr, &JsonAccessStep::Index(3), false).unwrap(),
+            None
+        );
+        assert_eq!(
+            jsonb_access(arr, &JsonAccessStep::Index(i32::MIN), false).unwrap(),
+            None
+        );
+        assert_eq!(
+            jsonb_access(arr, &JsonAccessStep::Index(i32::MAX), false).unwrap(),
+            None
+        );
+        assert_eq!(
+            jsonb_access("not json", &key("a"), false),
+            Err(JsonColumnError::Invalid)
+        );
+    }
+
+    #[test]
+    fn jsonb_access_path_semantics() {
+        let doc = r#"{"a":[10,{"b":"x"}],"k":1}"#;
+        let p = |xs: &[&str]| xs.iter().map(|s| Some(s.to_string())).collect::<Vec<_>>();
+        assert_eq!(
+            jsonb_access_path(doc, &p(&["a", "1", "b"]), false)
+                .unwrap()
+                .as_deref(),
+            Some("\"x\"")
+        );
+        assert_eq!(
+            jsonb_access_path(doc, &p(&["a", "1", "b"]), true)
+                .unwrap()
+                .as_deref(),
+            Some("x")
+        );
+        assert_eq!(
+            jsonb_access_path(doc, &p(&["a", "-1", "b"]), true)
+                .unwrap()
+                .as_deref(),
+            Some("x")
+        );
+        assert_eq!(
+            jsonb_access_path(doc, &p(&["a", "x"]), false).unwrap(),
+            None
+        );
+        assert_eq!(
+            jsonb_access_path(doc, &p(&["k", "z"]), false).unwrap(),
+            None
+        );
+        assert_eq!(
+            jsonb_access_path(doc, &[], false).unwrap().as_deref(),
+            Some(r#"{"a":[10,{"b":"x"}],"k":1}"#)
+        );
+        assert_eq!(
+            jsonb_access_path(doc, &[Some("a".to_string()), None], false).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn parse_json_rejects_excess_nesting_depth() {

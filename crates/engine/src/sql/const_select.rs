@@ -158,7 +158,7 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
             args.iter()
                 .try_for_each(|a| reject_non_constant_with(a, allow_placeholders))
         }
-        Expr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
             reject_non_constant_with(lhs, allow_placeholders)?;
             reject_non_constant_with(rhs, allow_placeholders)
         }
@@ -410,6 +410,7 @@ fn expr_value_to_cell(v: ExprValue<'_>, ty: Option<&ColumnType>) -> Result<Cell,
         ExprValue::Timestamp(t) => Cell::Timestamp(t),
         ExprValue::Null => Cell::Null,
         ExprValue::Vector(v) => Cell::Vector(into_owned_vector(v)?),
+        ExprValue::Json(j) => Cell::Json(j.into_owned()),
     })
 }
 

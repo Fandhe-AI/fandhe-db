@@ -3365,6 +3365,9 @@ fn project_rows(
                         // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有
                         // 契約: NULL は `Cell::Null` へ写像する。
                         udf_call::ExprValue::Null => cells.push(Cell::Null),
+                        // jsonb パス演算子 `->`／`#>` の結果（Issue #1596・TABLE-25）。
+                        // jsonb 列の直接投影と同じ `Cell::Json`（text 形式で OID 3802）。
+                        udf_call::ExprValue::Json(j) => cells.push(Cell::Json(try_clone_text(&j)?)),
                     }
                 }
             }
