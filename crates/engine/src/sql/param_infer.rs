@@ -170,6 +170,11 @@ fn builtin_return_type(name: &str) -> Ty {
             Ty::Known(PreparedParamType::Text)
         }
         "length" | "position" => Ty::Known(scalar("?column?", ColumnType::Integer)),
+        // 関数形の現在時刻関数（SQL-37・Issue #1586）は TIMESTAMP を返すため、キーワード形
+        // （`Expr::ValueFunction`）と同じく対象外型表現へ写像し `assign` で `0A000` にする。
+        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
+            Ty::Known(PreparedParamType::VectorText)
+        }
         _ if is_builtin_function_name(name) => Ty::Known(scalar("?column?", ColumnType::Double)),
         _ => Ty::Unresolved,
     }
@@ -233,11 +238,18 @@ impl Inferrer<'_> {
                 | crate::sql::udf_call::JsonAccessOp::PathText => {
                     Ty::Known(PreparedParamType::Text)
                 }
-                _ => Ty::Untyped,
+                // 包含・存在演算子（Issue #1598）は bool を返す。`$n` の型付け対象外。
+                crate::sql::udf_call::JsonAccessOp::Get
+                | crate::sql::udf_call::JsonAccessOp::Path
+                | crate::sql::udf_call::JsonAccessOp::Contains
+                | crate::sql::udf_call::JsonAccessOp::ContainedBy
+                | crate::sql::udf_call::JsonAccessOp::Exists
+                | crate::sql::udf_call::JsonAccessOp::ExistsAny
+                | crate::sql::udf_call::JsonAccessOp::ExistsAll => Ty::Untyped,
             },
             // DATE／TIMESTAMP は式内 `$n` の対象外型。`Text` へ倒さず `assign` の
             // 対象外型判定（`0A000`）に落として fail-closed にする。
-            Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => {
+            Expr::DateLiteral(_) | Expr::TimestampLiteral(_) | Expr::ValueFunction { .. } => {
                 Ty::Known(PreparedParamType::VectorText)
             }
         }
@@ -363,7 +375,8 @@ impl Inferrer<'_> {
             | Expr::Ident(_)
             | Expr::Null
             | Expr::DateLiteral(_)
-            | Expr::TimestampLiteral(_) => {}
+            | Expr::TimestampLiteral(_)
+            | Expr::ValueFunction { .. } => {}
         }
         Ok(())
     }
@@ -534,6 +547,27 @@ mod tests {
         let e = infer("UPDATE t SET n = CASE WHEN b = $1 THEN 1 ELSE 0 END WHERE id = 1")
             .expect_err("boolean operand");
         assert_eq!(e.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn now_family_function_form_matches_keyword_form_rejection() {
+        let kw = infer(
+            "UPDATE t SET n = CASE WHEN CURRENT_TIMESTAMP = $1 THEN 1 ELSE 0 END WHERE id = 1",
+        )
+        .expect_err("keyword");
+        assert_eq!(kw.wire_code(), "0A000");
+        for f in [
+            "now()",
+            "transaction_timestamp()",
+            "statement_timestamp()",
+            "clock_timestamp()",
+        ] {
+            let e = infer(&format!(
+                "UPDATE t SET n = CASE WHEN {f} = $1 THEN 1 ELSE 0 END WHERE id = 1"
+            ))
+            .expect_err(f);
+            assert_eq!(e.wire_code(), "0A000", "{f}");
+        }
     }
 
     #[test]

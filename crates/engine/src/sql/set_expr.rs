@@ -21,8 +21,8 @@ use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::row_codec::{ScalarRef, Value};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::udf_call::{
-    bind_projection_expr, eval_with_scalars, first_non_builtin_call, BoundExpr, Expr, ExprType,
-    ExprValue, UdfRegistry, MAX_EXPR_NODES,
+    bind_projection_expr, eval_with_scalars, first_non_builtin_call_with, BoundExpr, Expr,
+    ExprType, ExprValue, UdfRegistry, MAX_EXPR_NODES,
 };
 
 /// f64 で整数を正確に表現できる上限（2^53）。これを超える BIGINT への代入は精度欠落の
@@ -64,7 +64,13 @@ pub(crate) fn bind_set_expr(
     column: &ColumnDef,
     schema: &TableSchema,
 ) -> Result<BoundSetExpr, SqlSurfaceError> {
-    if first_non_builtin_call(expr).is_some() {
+    // 現在時刻関数は、分割実行 DML がトランザクション固定の時刻だけを受理するスコープを
+    // 開いている間に限り SET 右辺で受理する（原子版の UPDATE SET は従来どおり 42601。
+    // SQL-37・Issue #1587。台帳 v3 を要する原子版は #2188）。
+    let allow_current_time = crate::sql::time_fn::current_clock().is_some()
+        && crate::sql::time_fn::current_clock_policy()
+            == crate::sql::time_fn::ClockPolicy::TxnFixedOnly;
+    if first_non_builtin_call_with(expr, allow_current_time).is_some() {
         return Err(SqlSurfaceError::unsupported(
             "only built-in functions are allowed in a SET expression",
         ));
@@ -78,6 +84,7 @@ pub(crate) fn bind_set_expr(
         | ColumnType::Double
         | ColumnType::Text
         | ColumnType::Varchar(_)
+        | ColumnType::Bpchar(_)
         | ColumnType::Boolean
         | ColumnType::Date
         | ColumnType::Timestamp => {}
@@ -101,8 +108,10 @@ pub(crate) fn bind_set_expr(
                 | ColumnType::Real
                 | ColumnType::Double,
             ExprType::Scalar
-        ) | (ColumnType::Text | ColumnType::Varchar(_), ExprType::Text)
-            | (ColumnType::Boolean, ExprType::Bool)
+        ) | (
+            ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
+            ExprType::Text
+        ) | (ColumnType::Boolean, ExprType::Bool)
             | (ColumnType::Date, ExprType::Date)
             | (ColumnType::Timestamp, ExprType::Timestamp | ExprType::Date)
     );
@@ -145,7 +154,12 @@ pub(crate) fn eval_set_expr_to_value<'a>(
         }
         ExprValue::Scalar(v) => scalar_to_value(&set.target_ty, v).ok_or_else(internal)?,
         ExprValue::Text(t) => match &set.target_ty {
-            ColumnType::Text | ColumnType::Varchar(_) => Ok(Value::Text(t.into_owned())),
+            // `VARCHAR(n)` の n 超過は `22001`（超過部分が半角空白のみなら切り詰め。
+            // TABLE-31・Issue #1564）。行ごとの評価結果にしか値が決まらないためここで判定する。
+            ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
+                // `CHAR(n)` は空白詰めして保存する（TABLE-31・Issue #1566）。
+                crate::sql::parser::bind_text_literal(&set.target_ty, &t)
+            }
             _ => Err(internal()),
         },
         ExprValue::Bool(b) => match &set.target_ty {

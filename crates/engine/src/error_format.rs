@@ -92,11 +92,15 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 48;
+    count = 49;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
     InvalidInput => ("22000", "INVALID_INPUT"),
+    /// `VARCHAR(n)`／`CHAR(n)` 列への書き込みで文字数が n を超えた（`22001`。
+    /// TABLE-31・ERR-6・Issue #1564）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::StringDataRightTruncation`] の写像。
+    StringDataRightTruncation => ("22001", "STRING_DATA_RIGHT_TRUNCATION"),
     /// 認証資格情報が無効（`28P01`）。wire-server の `auth::SQLSTATE_INVALID_PASSWORD`
     /// に対応する分類（engine 側に発生経路はなく、写像の集約のみ）。
     AuthInvalid => ("28P01", "AUTH_INVALID"),
@@ -281,7 +285,8 @@ define_error_classes! {
     /// 演算子・関数引数、WHERE／filter の非 bool。Issue #1186）を共有する。
     /// [`crate::sql::allowlist::SqlSurfaceError::DatatypeMismatch`] の写像。
     DatatypeMismatch => ("42804", "DATATYPE_MISMATCH"),
-    /// 未知関数の呼び出し・未実装の非決定的関数（`now()` 等）・`DATE`／`TIMESTAMP`
+    /// 未知関数の呼び出し・未実装の非決定的関数（`random()` 等）・現在時刻関数への引数指定
+    /// （`now(1)`）・`DATE`／`TIMESTAMP`
     /// に対する `SUM`／`AVG`（`42883`。SQL-26・TABLE-13・ERR-6、Issue #1186）。
     /// [`crate::sql::allowlist::SqlSurfaceError::UndefinedFunction`] の写像。
     UndefinedFunction => ("42883", "UNDEFINED_FUNCTION"),

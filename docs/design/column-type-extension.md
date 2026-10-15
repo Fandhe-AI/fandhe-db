@@ -762,3 +762,11 @@ NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応�
 - Issue 本文は「新 variant を作らず text＋param」としていたが、#2305 で `varchar` が独立タグになったため、`text` ではなく `varchar` の param 拡張と `bpchar` 新設で表す。CHAR を varchar の種別フラグにしなかったのは、比較・出力の意味論が TEXT と異なる CHAR が varchar の経路へ黙って流れる fail-open を避けるため。
 - `"char"`（OID 18 の 1 バイト型）とは別物のため、タグ名に `char` を使わない。
 - 詳細な決定と対象外は `docs/design/implementation-status.md` の Issue #1563 の項を参照。
+
+## Issue #1564 追記: 長さ超過の 22001
+
+- 束縛段（INSERT・UPDATE SET・UPSERT・COPY・NoSQL・DEFAULT）で文字数を検証し、n 超過は `22001`（TABLE-31・ERR-6）。超過部分が半角空白のみなら n 文字へ切り詰めて受理する。行 codec の厳格判定は最後の砦として残す。詳細は `docs/design/implementation-status.md` の Issue #1564 の項を参照。
+
+## Issue #1566 追記: CHAR(n) の空白詰めと bpchar 比較
+
+- 保存形は n 文字へ半角空白で詰めた値、比較・GROUP BY・ORDER BY・索引キーは末尾の半角空白を除いた値（TABLE-31）。`is_text_like`／`same_value_domain` は広げず、各 match 腕で Bpchar を個別に扱う（FK・ALTER・PK・UNIQUE は #1567 で解禁。正準キーはタグ 1 を TEXT と共有し FK の型照合は `fk_types_compatible` に集約）。詳細は `docs/design/implementation-status.md` の Issue #1566・#1567 の項を参照。

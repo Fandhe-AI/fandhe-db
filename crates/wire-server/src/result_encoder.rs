@@ -18,8 +18,12 @@
 //!   同一であり、`numeric` として公告することで値域制限なく全 `u64` 値を
 //!   そのまま送出できる
 //! - `ColumnMeta::Scalar{ty: Text}` → `text`（OID 25, typlen -1）
-//! - `ColumnMeta::Scalar{ty: Varchar}` → `varchar`（OID 1043, typlen -1。型修飾子は
-//!   常に -1。TABLE-31・Issue #2305）
+//! - `ColumnMeta::Scalar{ty: Varchar}` → `varchar`（OID 1043, typlen -1。TABLE-31・
+//!   Issue #2305）
+//! - `ColumnMeta::Scalar{ty: Bpchar(n)}` → `bpchar`（OID 1042, typlen -1。TABLE-31・
+//!   Issue #1565）
+//! - 型修飾子（RowDescription の typmod）は `VARCHAR(n)`／`CHAR(n)` が `n + 4`
+//!   （PostgreSQL の VARHDRSZ 加算。[`column_type_modifier`]）、それ以外は常に -1
 //! - `ColumnMeta::Scalar{ty: Vector(_)}` → `text`（OID 25。値は `[v1,v2,...]` 形式。
 //!   `VECTOR` 独自のバイナリ表現は定義しないため引き続き text 固定・受入基準 3）
 //! - `ColumnMeta::Scalar{ty: Boolean}` → `bool`（OID 16, typlen 1。値は `t`/`f`。
@@ -338,6 +342,10 @@ wire_type_enum! {
         /// TABLE-31・Issue #2305）。値表現は `Text` と同一（UTF-8 恒等のバイナリ送出を含む）で、
         /// 公告する OID（1043）と型名（`varchar`）だけが異なる。
         Varchar,
+        /// `ColumnMeta::Scalar{ty: Bpchar(_)}`（`CHAR(n)`。TABLE-31・Issue #1565）。値表現は
+        /// `Text` と同一（UTF-8 恒等のバイナリ送出を含む）で、公告 OID は 1042（`bpchar`）。
+        /// 長さ n は typmod（[`column_type_modifier`]）で伝える。
+        Bpchar,
         /// `ColumnMeta::Scalar{ty: SmallInt}`（`SMALLINT`／`INT2`。TABLE-30・WIRE-13・
         /// Issue #1561）。`i16` 全域を表現する。
         Int2,
@@ -389,6 +397,7 @@ impl WireType {
             WireType::Numeric => 1700,
             WireType::Text => 25,
             WireType::Varchar => 1043,
+            WireType::Bpchar => 1042,
             WireType::Int2 => 21,
             WireType::Int4 => 23,
             WireType::Int8 => 20,
@@ -410,6 +419,7 @@ impl WireType {
             WireType::Numeric
             | WireType::Text
             | WireType::Varchar
+            | WireType::Bpchar
             | WireType::Bytea
             | WireType::Json
             | WireType::Jsonb => -1,
@@ -428,6 +438,7 @@ impl WireType {
             WireType::Numeric => "numeric",
             WireType::Text => "text",
             WireType::Varchar => "varchar",
+            WireType::Bpchar => "bpchar",
             WireType::Int2 => "int2",
             WireType::Int4 => "int4",
             WireType::Int8 => "int8",
@@ -467,7 +478,7 @@ impl WireType {
             // `Computed` は公告が text でも本来の値がベクトル／実行時型で
             // あるため、型そのものの対応可否とは別に列種別で判定する
             // （[`column_binary_support`] 参照）。
-            WireType::Text | WireType::Varchar => true,
+            WireType::Text | WireType::Varchar | WireType::Bpchar => true,
             // 数値・真偽値・bytea・uuid は PostgreSQL の send 形式（ネット
             // ワークバイトオーダー）でバイナリ対応する（WIRE-14・TASK-218・
             // Issue #1172）。DataRow への結線は `encode_binary_cell`。
@@ -515,6 +526,7 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
     match ty {
         ColumnType::Text
         | ColumnType::Varchar(_)
+        | ColumnType::Bpchar(_)
         | ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
@@ -536,9 +548,52 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Numeric { .. }
         | ColumnType::Date
         | ColumnType::Timestamp => false,
-        // CHAR(n) は公告 OID が暫定で text のため、バイナリ結果は fail-closed に非対応とする
-        // （OID 1042 とともに Issue #1565 で扱う）。
-        ColumnType::Bpchar(_) => false,
+    }
+}
+
+/// `RowDescription` の type modifier（typmod）。`VARCHAR(n)`／`CHAR(n)` は PostgreSQL の
+/// VARHDRSZ（4）を加えた `n + 4`、それ以外は `-1`。`encode_row_description_with_formats`
+/// から呼ばれる。n はカタログが `1..=10485760` を検証済みの信頼値で、変換・加算の失敗は
+/// 内部不整合として `EncodeError`（`XX000`）で fail-closed にする。
+pub(crate) fn column_type_modifier(meta: &ColumnMeta) -> Result<i32, EncodeError> {
+    match meta {
+        ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
+            scalar_type_modifier(ty)
+        }
+        ColumnMeta::Id | ColumnMeta::AliasedId { .. } | ColumnMeta::Computed { ty: None, .. } => {
+            Ok(-1)
+        }
+    }
+}
+
+/// [`column_type_modifier`] の `ColumnType` 単位の写像。
+#[deny(clippy::wildcard_enum_match_arm)]
+fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeError> {
+    use engine::catalog::ColumnType;
+    const VARHDRSZ: i32 = 4;
+    match ty {
+        ColumnType::Varchar(Some(n)) | ColumnType::Bpchar(n) => i32::try_from(*n)
+            .ok()
+            .and_then(|n| n.checked_add(VARHDRSZ))
+            .ok_or(EncodeError),
+        ColumnType::Varchar(None)
+        | ColumnType::Text
+        | ColumnType::SmallInt
+        | ColumnType::Integer
+        | ColumnType::BigInt
+        | ColumnType::Boolean
+        | ColumnType::Real
+        | ColumnType::Double
+        | ColumnType::Bytea
+        | ColumnType::Uuid
+        | ColumnType::Vector(_)
+        | ColumnType::Enum(_)
+        | ColumnType::Array(_)
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Numeric { .. }
+        | ColumnType::Date
+        | ColumnType::Timestamp => Ok(-1),
     }
 }
 
@@ -577,9 +632,8 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         // 判断のため引き続き `text` を公告する。`VECTOR` も同様。
         engine::catalog::ColumnType::Text => WireType::Text,
         engine::catalog::ColumnType::Varchar(_) => WireType::Varchar,
-        // CHAR(n) は暫定で text（OID 25）を公告する（Issue #1563）。OID 1042 と typmod は
-        // Issue #1565 で行う。長さ付き VARCHAR(n) の typmod も同 Issue（現状は -1）。
-        engine::catalog::ColumnType::Bpchar(_) => WireType::Text,
+        // CHAR(n) は bpchar（OID 1042）。長さは typmod で伝える（TABLE-31・Issue #1565）。
+        engine::catalog::ColumnType::Bpchar(_) => WireType::Bpchar,
         engine::catalog::ColumnType::Vector(_) => WireType::Text,
         engine::catalog::ColumnType::Boolean => WireType::Bool,
         // SMALLINT は int2（OID 21・typlen 2。TABLE-30・Issue #1561）。値は
@@ -654,7 +708,7 @@ pub fn encode_row_description_with_formats(
         let wire_type = column_wire_type(meta);
         body.extend_from_slice(&wire_type.oid().to_be_bytes());
         body.extend_from_slice(&wire_type.typlen().to_be_bytes());
-        body.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
+        body.extend_from_slice(&column_type_modifier(meta)?.to_be_bytes()); // type modifier
         let format_code: i16 = match format {
             FormatCode::Text => 0,
             FormatCode::Binary => 1,
@@ -968,7 +1022,7 @@ fn encode_binary_cell(
         }
     };
     match (wire_type, cell) {
-        (WireType::Text | WireType::Varchar, Cell::Text(s)) => {
+        (WireType::Text | WireType::Varchar | WireType::Bpchar, Cell::Text(s)) => {
             push_len_prefixed(out, binary::text(s))
         }
         // i16 に収まらない値は engine の範囲強制の内部不整合なので fail-closed（`XX000`）。
@@ -2246,7 +2300,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 15);
+        assert_eq!(WireType::ALL.len(), 16);
     }
 
     /// `PostgreSQL` 組み込みカタログの公開値（`pg_type.oid`／`typlen`／
@@ -2255,10 +2309,11 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 15] = [
+        let expected: [(WireType, i32, i16, &str); 16] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
+            (WireType::Bpchar, 1042, -1, "bpchar"),
             (WireType::Int2, 21, 2, "int2"),
             (WireType::Int4, 23, 4, "int4"),
             (WireType::Int8, 20, 8, "int8"),
@@ -2283,7 +2338,7 @@ mod tests {
     /// 他の組み込み型〔`bpchar` = 1042〕・`i32::MAX` を確認）。
     #[test]
     fn from_oid_unknown_is_none() {
-        for oid in [0, -1, 1042, i32::MAX] {
+        for oid in [0, -1, 18, i32::MAX] {
             assert_eq!(WireType::from_oid(oid), None, "oid={oid}");
         }
     }
@@ -2733,6 +2788,7 @@ mod tests {
                 t,
                 WireType::Text
                     | WireType::Varchar
+                    | WireType::Bpchar
                     | WireType::Int2
                     | WireType::Int4
                     | WireType::Int8
@@ -2744,5 +2800,78 @@ mod tests {
             );
             assert_eq!(t.supports_binary(), expected, "{t:?}");
         }
+    }
+
+    /// typmod は `VARCHAR(n)`／`CHAR(n)` のみ `n + 4`、他は -1（Issue #1565・TABLE-31）。
+    #[test]
+    fn column_type_modifier_matrix() {
+        use engine::catalog::ColumnType;
+        let scalar = |ty: ColumnType| ColumnMeta::Scalar {
+            name: "c".to_string(),
+            ty,
+        };
+        let m = |meta: &ColumnMeta| column_type_modifier(meta).ok();
+        assert_eq!(m(&scalar(ColumnType::Varchar(None))), Some(-1));
+        assert_eq!(m(&scalar(ColumnType::Varchar(Some(10)))), Some(14));
+        assert_eq!(
+            m(&scalar(ColumnType::Varchar(Some(10_485_760)))),
+            Some(10_485_764)
+        );
+        assert_eq!(m(&scalar(ColumnType::Bpchar(5))), Some(9));
+        assert_eq!(m(&scalar(ColumnType::Bpchar(1))), Some(5));
+        assert_eq!(m(&scalar(ColumnType::Text)), Some(-1));
+        assert_eq!(m(&ColumnMeta::Id), Some(-1));
+        let computed = |ty| ColumnMeta::Computed {
+            name: "x".to_string(),
+            ty,
+        };
+        assert_eq!(m(&computed(Some(ColumnType::Varchar(Some(3))))), Some(7));
+        assert_eq!(m(&computed(None)), Some(-1));
+        // 内部不整合（i32 を超える n）は fail-closed。
+        assert!(column_type_modifier(&scalar(ColumnType::Bpchar(u32::MAX))).is_err());
+    }
+
+    /// RowDescription の OID と typmod 欄（OID・typlen の直後の i32）を実バイトで検証する。
+    #[test]
+    fn row_description_carries_varchar_and_bpchar_typmod() {
+        use engine::catalog::ColumnType;
+        let cols: Vec<ColumnMeta> = [
+            ("v", ColumnType::Varchar(Some(10))),
+            ("u", ColumnType::Varchar(None)),
+            ("c", ColumnType::Bpchar(5)),
+        ]
+        .into_iter()
+        .map(|(n, ty)| ColumnMeta::Scalar {
+            name: n.to_string(),
+            ty,
+        })
+        .collect();
+        let msg = encode_row_description_with_formats(&cols, &[FormatCode::Text; 3]).unwrap();
+        // 'T' + len(4) + count(2) の後に各列: name\0 + table oid(4) + attr(2) + oid(4) +
+        // typlen(2) + typmod(4) + format(2)
+        let mut pos = 7usize;
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            while msg[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1 + 6;
+            let oid = i32::from_be_bytes(msg[pos..pos + 4].try_into().unwrap());
+            let typmod = i32::from_be_bytes(msg[pos + 6..pos + 10].try_into().unwrap());
+            got.push((oid, typmod));
+            pos += 12;
+        }
+        assert_eq!(got, vec![(1043, 14), (1043, -1), (1042, 9)]);
+    }
+
+    /// CHAR 列（`Cell::Text`）のバイナリ送出は text と同一バイト列（Issue #1565）。
+    #[test]
+    fn bpchar_binary_encoding_matches_text() {
+        use engine::catalog::ColumnType as T;
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        one_computed_binary(T::Bpchar(5), Cell::Text("ab  ".to_string()), &mut a).unwrap();
+        one_computed_binary(T::Text, Cell::Text("ab  ".to_string()), &mut b).unwrap();
+        assert_eq!(a, b);
     }
 }

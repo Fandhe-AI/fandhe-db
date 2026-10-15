@@ -1,6 +1,7 @@
 //! 列型変換（`INTEGER`／`SMALLINT`→`BIGINT`・`REAL`→`DOUBLE PRECISION`・
-//! `BIGINT`→`SMALLINT`）に伴う既存行の一括書き換えと、`INTEGER`→`SMALLINT` の
-//! 範囲検証のみの走査（TABLE-19・TABLE-30・TABLE-40・Issue #1361・#1560。ポインタ表記のみ）。
+//! `BIGINT`→`SMALLINT`・文字列系の `VARCHAR(n)`／`CHAR(n)` 変換）に伴う既存行の一括書き換えと、
+//! `INTEGER`→`SMALLINT` の範囲検証のみの走査
+//! （TABLE-19・TABLE-30・TABLE-31・TABLE-40・Issue #1361・#1560・#1567。ポインタ表記のみ）。
 //!
 //! スカラー行ペイロード（`row_codec::encode_scalar_columns`）は列位置に依存する
 //! 固定形式で、拡大 2 変換と `BIGINT`→`SMALLINT` は列のフレーム幅（presence 1 + 4 バイト → presence 1 +
@@ -44,15 +45,24 @@ pub(crate) enum WideningKind {
     BigIntToSmallInt,
     /// `REAL`（f32）→ `DOUBLE PRECISION`（f64）。
     RealToDouble,
+    /// 文字列系の型変換（`TEXT`／`VARCHAR`／`VARCHAR(n)`／`CHAR(n)` の縮小・`CHAR` との相互変換。
+    /// TABLE-31・Issue #1567）。変換元・変換先の型は `old_schema`／`new_schema` の変更列から
+    /// 取り、1 値の変換は [`crate::row_codec::convert_char_family`] に集約する。値が変わらない行は
+    /// 書き換えない（縮小で全行が収まる場合は実質的に検証だけの走査になる）。
+    /// 長さ超過は [`RewriteOutcome::CharLength`]。
+    CharFamily,
 }
 
 /// 走査・書き換えの結果。範囲外は破損（`CorruptSchema`・`XX000`）と区別するため
 /// エラーではなく別の結果として返し、呼び出し元が固定文言の `22003` へ写像する
 /// （値・テナント・行 id は載せない。呼び出し元は commit せず txn を破棄する）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RewriteOutcome {
     Done,
     OutOfRange,
+    /// 文字列系の変換で `VARCHAR(n)`／`CHAR(n)` の長さを超える値があった（`22001`）、または
+    /// 空白詰め後が TEXT 上限を超えた（`54000`）。区別と固定文言は [`CharLengthExceeded`] が持つ。
+    CharLength(crate::row_codec::CharLengthExceeded),
 }
 
 /// 走査の動作。
@@ -159,6 +169,42 @@ fn scan_rows_in_txn(
             let slot = values
                 .get_mut(logical_index)
                 .ok_or_else(|| corrupt("column index out of range during column rewrite"))?;
+            if matches!(mode, Mode::Rewrite(WideningKind::CharFamily)) {
+                let (Some(from), Some(to)) = (
+                    old_schema.columns.get(logical_index).map(|c| &c.ty),
+                    new_schema.columns.get(logical_index).map(|c| &c.ty),
+                ) else {
+                    return Err(corrupt("column index out of range during column rewrite"));
+                };
+                let converted = match slot {
+                    Value::Null => continue,
+                    Value::Text(s) => {
+                        let limit = usize::try_from(crate::row_codec::MAX_TEXT_FIELD_LEN)
+                            .unwrap_or(usize::MAX);
+                        match crate::row_codec::convert_char_family(from, to, s, limit) {
+                            Ok(c) => c.into_owned(),
+                            Err(e) => return Ok(RewriteOutcome::CharLength(e)),
+                        }
+                    }
+                    _ => return Err(corrupt("unexpected value type during column rewrite")),
+                };
+                // 変換しても値が変わらない行は書き換えない。
+                if matches!(slot, Value::Text(s) if *s == converted) {
+                    continue;
+                }
+                *slot = Value::Text(converted);
+                let metadata = encode_scalar_columns(new_schema, &values)
+                    .map_err(|_| corrupt("failed to encode row payload during column rewrite"))?;
+                let encoded = encode_row(&RowInput {
+                    tenant_id: &row.tenant_id,
+                    visibility: row.visibility,
+                    embedding: &row.embedding,
+                    metadata: &metadata,
+                })
+                .map_err(|_| corrupt("failed to encode row during column rewrite"))?;
+                row_table.insert((tenant.as_str(), *id), encoded.as_slice())?;
+                continue;
+            }
             let kind = match mode {
                 Mode::ValidateSmallInt => {
                     match slot {
@@ -183,6 +229,7 @@ fn scan_rows_in_txn(
                 (WideningKind::RealToDouble, Value::Real(r)) => {
                     Value::Double(crate::scalar_float::canonicalize_double(f64::from(r)))
                 }
+                // `CharFamily` は上で処理済みで到達しない。
                 _ => return Err(corrupt("unexpected value type during column rewrite")),
             };
             let metadata = encode_scalar_columns(new_schema, &values)

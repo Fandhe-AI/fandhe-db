@@ -75,6 +75,11 @@ const ACTIVE_INDEX_VALUE: [u8; 1] = [1];
 
 /// 値フォーマットのバージョン（v1）。未知バージョンは fail-closed に拒否する。
 const JOB_FORMAT_VERSION_V1: u8 = 1;
+/// 値フォーマット v2（Issue #1587・設計 D6）。`Running` 記録だけが、ジョブ開始時に確定した
+/// 固定時刻（UTC マイクロ秒。`i64` LE）を末尾に持つ。時刻値関数を含む分割実行だけが書き、
+/// 含まない文は従来どおり v1（バイト列不変）。`Cancelled`／`Completed` は再開しないため
+/// 時刻を持たず常に v1。
+const JOB_FORMAT_VERSION_V2: u8 = 2;
 const STATE_RUNNING: u8 = 1;
 const STATE_CANCELLED: u8 = 2;
 const STATE_COMPLETED: u8 = 3;
@@ -192,6 +197,10 @@ pub(crate) enum JobRecord {
         cursor: u64,
         /// commit 済みの処理済み（変更）件数。
         processed: u64,
+        /// 時刻値関数を含む文のジョブ開始時に確定した固定時刻（UTC マイクロ秒。設計 D6）。
+        /// 再開時はこの値で束縛し直し、全チャンクで同じ時刻にする。含まない文は `None`
+        /// （v1 のバイト列のまま）。
+        fixed_time: Option<i64>,
     },
     /// 取り消し済み（カーソルを持たない固定長。削除しない）。
     Cancelled { hash: [u8; 32], committed: u64 },
@@ -211,18 +220,28 @@ impl JobRecord {
 
 /// 値の符号化（`[ver][state][hash 32][u64 …]`）。
 fn encode_record(record: &JobRecord) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(2 + 32 + 16);
-    buf.push(JOB_FORMAT_VERSION_V1);
+    let mut buf = Vec::with_capacity(2 + 32 + 24);
+    buf.push(match record {
+        JobRecord::Running {
+            fixed_time: Some(_),
+            ..
+        } => JOB_FORMAT_VERSION_V2,
+        _ => JOB_FORMAT_VERSION_V1,
+    });
     match record {
         JobRecord::Running {
             hash,
             cursor,
             processed,
+            fixed_time,
         } => {
             buf.push(STATE_RUNNING);
             buf.extend_from_slice(hash);
             buf.extend_from_slice(&cursor.to_le_bytes());
             buf.extend_from_slice(&processed.to_le_bytes());
+            if let Some(t) = fixed_time {
+                buf.extend_from_slice(&t.to_le_bytes());
+            }
         }
         JobRecord::Cancelled { hash, committed } => {
             buf.push(STATE_CANCELLED);
@@ -244,16 +263,29 @@ fn encode_record(record: &JobRecord) -> Vec<u8> {
 fn decode_record(value: &[u8]) -> Result<JobRecord, PartitionedJobError> {
     let bad = || PartitionedJobError::corrupt("partitioned job record is malformed");
     let (version, rest) = value.split_first().ok_or_else(bad)?;
-    if *version != JOB_FORMAT_VERSION_V1 {
+    if *version != JOB_FORMAT_VERSION_V1 && *version != JOB_FORMAT_VERSION_V2 {
         return Err(bad());
     }
     let (state, body) = rest.split_first().ok_or_else(bad)?;
+    // v2 は `Running` 専用（固定時刻付き）。他の状態の v2 は書かないため拒否する。
+    if *version == JOB_FORMAT_VERSION_V2 && *state != STATE_RUNNING {
+        return Err(bad());
+    }
     let (hash, tail) = body.split_first_chunk::<32>().ok_or_else(bad)?;
     let hash = *hash;
     match *state {
         STATE_RUNNING => {
             let (cursor, tail) = tail.split_first_chunk::<8>().ok_or_else(bad)?;
-            let processed: [u8; 8] = tail.try_into().map_err(|_| bad())?;
+            let (processed, tail) = tail.split_first_chunk::<8>().ok_or_else(bad)?;
+            // v1 は `processed` で終わり、v2 は固定時刻 8 バイトで終わる（長さは厳密）。
+            let fixed_time = if *version == JOB_FORMAT_VERSION_V2 {
+                let t: [u8; 8] = tail.try_into().map_err(|_| bad())?;
+                Some(i64::from_le_bytes(t))
+            } else if tail.is_empty() {
+                None
+            } else {
+                return Err(bad());
+            };
             let cursor = u64::from_le_bytes(*cursor);
             if cursor == u64::MAX {
                 return Err(bad());
@@ -261,7 +293,8 @@ fn decode_record(value: &[u8]) -> Result<JobRecord, PartitionedJobError> {
             Ok(JobRecord::Running {
                 hash,
                 cursor,
-                processed: u64::from_le_bytes(processed),
+                processed: u64::from_le_bytes(*processed),
+                fixed_time,
             })
         }
         STATE_CANCELLED => {
@@ -345,8 +378,13 @@ pub(crate) fn derive_status(record: Option<&JobRecord>, registered: bool) -> Opt
 pub(crate) enum ResendDecision {
     /// 記録なし。新規ジョブ。
     Fresh,
-    /// `Running`（中断）でハッシュ一致。カーソルから再開する。
-    Resume { cursor: u64, processed: u64 },
+    /// `Running`（中断）でハッシュ一致。カーソルから再開する。`fixed_time` は記録済みの
+    /// 固定時刻（時刻値関数を含まない文は `None`。設計 D6）。
+    Resume {
+        cursor: u64,
+        processed: u64,
+        fixed_time: Option<i64>,
+    },
     /// 取り消し済み（ハッシュ一致）。`committed` は取り消し時点の commit 済み件数。
     Cancelled { committed: u64 },
     /// 完了済み（ハッシュ一致）。重複。
@@ -358,10 +396,14 @@ pub(crate) enum ResendDecision {
 }
 
 /// 再送の判定（純粋関数）。登録簿に載っていれば最優先で `AlreadyRunning`。
+///
+/// `needs_fixed_time` は文が時刻値関数を含むか（設計 D6）。固定時刻を持たない記録（v1）への
+/// 時刻つき再開は、時刻を再現できないため `ContentMismatch`（`22023`。fail-closed）。
 pub(crate) fn classify_resend(
     record: Option<&JobRecord>,
     hash: &ContentHash,
     registry_hit: bool,
+    needs_fixed_time: bool,
 ) -> ResendDecision {
     if registry_hit {
         return ResendDecision::AlreadyRunning;
@@ -374,10 +416,17 @@ pub(crate) fn classify_resend(
     }
     match record {
         JobRecord::Running {
-            cursor, processed, ..
+            fixed_time: None, ..
+        } if needs_fixed_time => ResendDecision::ContentMismatch,
+        JobRecord::Running {
+            cursor,
+            processed,
+            fixed_time,
+            ..
         } => ResendDecision::Resume {
             cursor: *cursor,
             processed: *processed,
+            fixed_time: *fixed_time,
         },
         JobRecord::Cancelled { committed, .. } => ResendDecision::Cancelled {
             committed: *committed,
@@ -513,6 +562,7 @@ pub(crate) fn record_chunk_progress_in_txn(
     rows_changed: u64,
     last_scanned: u64,
     interrupted_limit: u64,
+    fixed_time: Option<i64>,
 ) -> Result<ChunkCommitOutcome, PartitionedJobError> {
     if last_scanned == u64::MAX {
         // この範囲は走査し尽くしており、`Running` には縮約できない。
@@ -539,6 +589,7 @@ pub(crate) fn record_chunk_progress_in_txn(
                 hash: *hash.as_bytes(),
                 cursor: last_scanned,
                 processed: rows_changed,
+                fixed_time,
             };
             write_record(txn, key, &record)?;
             let mut active = txn.open_table(PARTITIONED_JOB_ACTIVE_TABLE)?;
@@ -556,8 +607,10 @@ pub(crate) fn record_chunk_progress_in_txn(
             hash: stored,
             cursor,
             processed,
+            fixed_time: stored_time,
         }) => {
-            if !hash.matches(&stored) || last_scanned <= cursor {
+            // 固定時刻は作成時に永続化した値から変えない（再開時に別の時刻で書かせない。設計 D6）。
+            if !hash.matches(&stored) || last_scanned <= cursor || stored_time != fixed_time {
                 return Err(PartitionedJobError::StateConflict);
             }
             verify_active_index_present(txn, key)?;
@@ -568,6 +621,7 @@ pub(crate) fn record_chunk_progress_in_txn(
                 hash: stored,
                 cursor: last_scanned,
                 processed,
+                fixed_time: stored_time,
             };
             write_record(txn, key, &record)?;
             Ok(ChunkCommitOutcome::Updated)
@@ -965,6 +1019,7 @@ mod tests {
                 hash: h,
                 cursor: 42,
                 processed: 9,
+                fixed_time: None,
             },
             JobRecord::Cancelled {
                 hash: h,
@@ -976,12 +1031,119 @@ mod tests {
         }
     }
 
+    /// 固定時刻つき `Running`（設計 D6・Issue #1587）は v2 で往復し、固定時刻なしは従来どおり
+    /// v1（バイト列・長さ不変）のまま。
+    #[test]
+    fn running_record_with_fixed_time_uses_v2_and_roundtrips() {
+        let h = [7u8; 32];
+        let with_time = JobRecord::Running {
+            hash: h,
+            cursor: 42,
+            processed: 9,
+            fixed_time: Some(-5),
+        };
+        let bytes = encode_record(&with_time);
+        assert_eq!(bytes.first().copied(), Some(JOB_FORMAT_VERSION_V2));
+        assert_eq!(bytes.len(), 2 + 32 + 8 + 8 + 8);
+        assert_eq!(decode_record(&bytes).expect("decode v2"), with_time);
+
+        let without = JobRecord::Running {
+            hash: h,
+            cursor: 42,
+            processed: 9,
+            fixed_time: None,
+        };
+        let v1 = encode_record(&without);
+        assert_eq!(v1.first().copied(), Some(JOB_FORMAT_VERSION_V1));
+        assert_eq!(v1.len(), 2 + 32 + 8 + 8);
+        assert_eq!(decode_record(&v1).expect("decode v1"), without);
+    }
+
+    /// v2 の長さ不正・`Running` 以外の v2・v1 への余剰バイトは fail-closed（`Corrupted`）。
+    #[test]
+    fn v2_decode_is_strict_about_length_and_state() {
+        let h = [1u8; 32];
+        let good = encode_record(&JobRecord::Running {
+            hash: h,
+            cursor: 1,
+            processed: 1,
+            fixed_time: Some(7),
+        });
+        assert!(decode_record(&good).is_ok());
+        // 固定時刻の欠け・余剰。
+        assert!(decode_record(&good[..good.len() - 1]).is_err());
+        let mut extra = good.clone();
+        extra.push(0);
+        assert!(decode_record(&extra).is_err());
+        // v1 `Running` に余剰バイト（固定時刻相当）が付いた値は拒否する。
+        let mut v1_extra = encode_record(&JobRecord::Running {
+            hash: h,
+            cursor: 1,
+            processed: 1,
+            fixed_time: None,
+        });
+        v1_extra.extend_from_slice(&7i64.to_le_bytes());
+        assert!(decode_record(&v1_extra).is_err());
+        // `Running` 以外の v2 は書かないため拒否する。
+        let mut cancelled = encode_record(&JobRecord::Cancelled {
+            hash: h,
+            committed: 3,
+        });
+        cancelled[0] = JOB_FORMAT_VERSION_V2;
+        assert!(decode_record(&cancelled).is_err());
+        // 未知のバージョン。
+        let mut v3 = good.clone();
+        v3[0] = 3;
+        assert!(decode_record(&v3).is_err());
+    }
+
+    /// 時刻値関数を含む文の再送判定（設計 D6）。固定時刻を持つ記録は `Resume` で時刻を返し、
+    /// 固定時刻を持たない記録（v1）への時刻つき再開は `ContentMismatch`（`22023`）。
+    #[test]
+    fn classify_resend_handles_fixed_time_records() {
+        let h = hash("h");
+        let timed = JobRecord::Running {
+            hash: *h.as_bytes(),
+            cursor: 5,
+            processed: 2,
+            fixed_time: Some(123),
+        };
+        let untimed = JobRecord::Running {
+            hash: *h.as_bytes(),
+            cursor: 5,
+            processed: 2,
+            fixed_time: None,
+        };
+        assert_eq!(
+            classify_resend(Some(&timed), &h, false, true),
+            ResendDecision::Resume {
+                cursor: 5,
+                processed: 2,
+                fixed_time: Some(123)
+            }
+        );
+        assert_eq!(
+            classify_resend(Some(&untimed), &h, false, true),
+            ResendDecision::ContentMismatch
+        );
+        // 時刻を使わない文は固定時刻なしの記録から従来どおり再開する。
+        assert_eq!(
+            classify_resend(Some(&untimed), &h, false, false),
+            ResendDecision::Resume {
+                cursor: 5,
+                processed: 2,
+                fixed_time: None
+            }
+        );
+    }
+
     #[test]
     fn decode_rejects_unknown_version_state_and_length() {
         let good = encode_record(&JobRecord::Running {
             hash: [1; 32],
             cursor: 1,
             processed: 1,
+            fixed_time: None,
         });
         assert!(decode_record(&[]).is_err());
         let mut bad_ver = good.clone();
@@ -1064,7 +1226,7 @@ mod tests {
                 let mut t = wt.open_table(ROWS).expect("open");
                 t.insert(("t1", 1u64), b"x".as_slice()).expect("ins");
             }
-            let out = record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 10).expect("p");
+            let out = record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 10, None).expect("p");
             assert_eq!(out, ChunkCommitOutcome::Created);
             // commit せず drop。
         }
@@ -1077,7 +1239,7 @@ mod tests {
             let mut t = wt.open_table(ROWS).expect("open");
             t.insert(("t1", 1u64), b"x".as_slice()).expect("ins");
         }
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 10).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 10, None).expect("p");
         wt.commit().expect("commit");
         assert_eq!(rows_count(&db), 1);
         assert!(matches!(
@@ -1097,7 +1259,7 @@ mod tests {
         let k = key("t1", "docs", &id);
         for (changed, last) in [(3u64, 10u64), (0, 20), (4, 30)] {
             let wt = db.begin_write().expect("w");
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), changed, last, 10).expect("p");
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), changed, last, 10, None).expect("p");
             wt.commit().expect("c");
         }
         assert!(matches!(
@@ -1111,15 +1273,15 @@ mod tests {
         // カーソルが前進しない・ハッシュ不一致は fail-closed。
         let wt = db.begin_write().expect("w");
         assert!(matches!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 30, 10),
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 30, 10, None,),
             Err(PartitionedJobError::StateConflict)
         ));
         assert!(matches!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("other"), 1, 40, 10),
+            record_chunk_progress_in_txn(&wt, &k, &hash("other"), 1, 40, 10, None,),
             Err(PartitionedJobError::StateConflict)
         ));
         assert!(matches!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, u64::MAX, 10),
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, u64::MAX, 10, None,),
             Err(PartitionedJobError::StateConflict)
         ));
     }
@@ -1131,14 +1293,14 @@ mod tests {
         let k = key("t1", "docs", &id);
         let wt = db.begin_write().expect("w");
         assert_eq!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 0, 5, 10).expect("p"),
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 0, 5, 10, None,).expect("p"),
             ChunkCommitOutcome::NoRecord
         );
         wt.commit().expect("c");
         assert!(read_job(&db, &k).is_none());
         let wt = db.begin_write().expect("w");
         assert_eq!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 2, 9, 10).expect("p"),
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 2, 9, 10, None,).expect("p"),
             ChunkCommitOutcome::Created
         );
         wt.commit().expect("c");
@@ -1161,7 +1323,7 @@ mod tests {
         let k = key("t1", "docs", &id);
         let h = hash("h");
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &h, 3, 10, 10).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &h, 3, 10, 10, None).expect("p");
         wt.commit().expect("c");
         assert_eq!(active_count(&db), 1);
 
@@ -1204,7 +1366,7 @@ mod tests {
         let id = op("op-1");
         let k = key("t1", "docs", &id);
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 3, 10).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 3, 10, None).expect("p");
         wt.commit().expect("c");
         // 通常 DML 相当が先に同じ operation_id を台帳へ記録していた状況を作る。
         // （Running を通常 DML が拒否する不変条件の外側にある破損状態の再現。）
@@ -1232,7 +1394,7 @@ mod tests {
         let id = op("op-1");
         let k = key("t1", "docs", &id);
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 4, 8, 10).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 4, 8, 10, None).expect("p");
         wt.commit().expect("c");
         let wt = db.begin_write().expect("w");
         assert_eq!(
@@ -1259,7 +1421,7 @@ mod tests {
         let ids: Vec<OperationId> = (0..3).map(|i| op(&format!("op-{i}"))).collect();
         for id in ids.iter().take(2) {
             let wt = db.begin_write().expect("w");
-            record_chunk_progress_in_txn(&wt, &key("t1", "docs", id), &hash("h"), 1, 1, 2)
+            record_chunk_progress_in_txn(&wt, &key("t1", "docs", id), &hash("h"), 1, 1, 2, None)
                 .expect("p");
             wt.commit().expect("c");
         }
@@ -1269,7 +1431,15 @@ mod tests {
             t.insert(("t1", 9u64), b"x".as_slice()).expect("ins");
         }
         assert!(matches!(
-            record_chunk_progress_in_txn(&wt, &key("t1", "docs", &ids[2]), &hash("h"), 1, 9, 2),
+            record_chunk_progress_in_txn(
+                &wt,
+                &key("t1", "docs", &ids[2]),
+                &hash("h"),
+                1,
+                9,
+                2,
+                None,
+            ),
             Err(PartitionedJobError::InterruptedRecordLimitReached)
         ));
         drop(wt);
@@ -1277,9 +1447,9 @@ mod tests {
         assert!(read_job(&db, &key("t1", "docs", &ids[2])).is_none());
         // 別テーブル・別テナントは数えない。
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &key("t1", "other", &ids[2]), &hash("h"), 1, 1, 2)
+        record_chunk_progress_in_txn(&wt, &key("t1", "other", &ids[2]), &hash("h"), 1, 1, 2, None)
             .expect("other table is independent");
-        record_chunk_progress_in_txn(&wt, &key("t2", "docs", &ids[2]), &hash("h"), 1, 1, 2)
+        record_chunk_progress_in_txn(&wt, &key("t2", "docs", &ids[2]), &hash("h"), 1, 1, 2, None)
             .expect("other tenant is independent");
     }
 
@@ -1289,7 +1459,7 @@ mod tests {
         let ids: Vec<OperationId> = (0..5).map(|i| op(&format!("op-{i}"))).collect();
         for id in &ids {
             let wt = db.begin_write().expect("w");
-            record_chunk_progress_in_txn(&wt, &key("t1", "docs", id), &hash("h"), 1, 1, 100)
+            record_chunk_progress_in_txn(&wt, &key("t1", "docs", id), &hash("h"), 1, 1, 100, None)
                 .expect("p");
             wt.commit().expect("c");
         }
@@ -1321,7 +1491,7 @@ mod tests {
         drop(wt);
         // 索引値が不明なバージョン。
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100, None).expect("p");
         {
             let mut a = wt.open_table(PARTITIONED_JOB_ACTIVE_TABLE).expect("a");
             a.insert(k.tuple(), [9u8].as_slice()).expect("i");
@@ -1333,7 +1503,7 @@ mod tests {
         drop(wt);
         // 索引が指す記録が Running 以外。
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100, None).expect("p");
         write_record(
             &wt,
             &k,
@@ -1355,7 +1525,7 @@ mod tests {
         let id = op("op-1");
         let k = key("t1", "docs", &id);
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100, None).expect("p");
         wt.commit().expect("c");
         let wt = db.begin_write().expect("w");
         {
@@ -1363,8 +1533,46 @@ mod tests {
             a.remove(k.tuple()).expect("rm");
         }
         assert!(matches!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 5, 100),
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 5, 100, None,),
             Err(PartitionedJobError::Corrupted(_))
+        ));
+    }
+
+    /// 固定時刻は作成時に永続化し、以降のチャンクでは同じ値でのみ更新できる（設計 D6・
+    /// Issue #1587）。値が変わる更新・固定時刻の有無が変わる更新は `StateConflict`。
+    #[test]
+    fn fixed_time_is_persisted_at_creation_and_cannot_change() {
+        let (db, _g) = open_db("pj-fixed-time");
+        let id = op("op-1");
+        let k = key("t1", "docs", &id);
+        let wt = db.begin_write().expect("w");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100, Some(1_000)).expect("create");
+        wt.commit().expect("c");
+        assert!(matches!(
+            read_job(&db, &k),
+            Some(JobRecord::Running {
+                fixed_time: Some(1_000),
+                ..
+            })
+        ));
+        for bad in [Some(2_000), None] {
+            let wt = db.begin_write().expect("w");
+            assert!(matches!(
+                record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 5, 100, bad),
+                Err(PartitionedJobError::StateConflict)
+            ));
+        }
+        let wt = db.begin_write().expect("w");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 5, 100, Some(1_000)).expect("update");
+        wt.commit().expect("c");
+        assert!(matches!(
+            read_job(&db, &k),
+            Some(JobRecord::Running {
+                cursor: 5,
+                processed: 2,
+                fixed_time: Some(1_000),
+                ..
+            })
         ));
     }
 
@@ -1379,7 +1587,7 @@ mod tests {
         wt.commit().expect("c");
         let wt = db.begin_write().expect("w");
         assert!(matches!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100),
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100, None,),
             Err(PartitionedJobError::LedgerConflict(_))
         ));
         assert!(lookup_in_write_txn(&wt, &k).expect("l").is_none());
@@ -1392,7 +1600,7 @@ mod tests {
         let k = key("t1", "docs", &id);
         for cancel in [false, true] {
             let wt = db.begin_write().expect("w");
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100).expect("p");
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100, None).expect("p");
             {
                 let mut a = wt.open_table(PARTITIONED_JOB_ACTIVE_TABLE).expect("a");
                 a.insert(k.tuple(), [9u8].as_slice()).expect("i");
@@ -1413,7 +1621,8 @@ mod tests {
         let id = op("op-1");
         let wt = db.begin_write().expect("w");
         for (t, tb) in [("t1", "docs"), ("t1", "other"), ("t2", "docs")] {
-            record_chunk_progress_in_txn(&wt, &key(t, tb, &id), &hash("h"), 1, 1, 100).expect("p");
+            record_chunk_progress_in_txn(&wt, &key(t, tb, &id), &hash("h"), 1, 1, 100, None)
+                .expect("p");
         }
         assert_eq!(
             count_interrupted_in_txn(&wt, "t1", "docs", 100).expect("n"),
@@ -1434,7 +1643,7 @@ mod tests {
         let (db, _g) = open_db("pj-tenant");
         let id = op("op-1");
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &key("t1", "docs", &id), &hash("h"), 1, 1, 100)
+        record_chunk_progress_in_txn(&wt, &key("t1", "docs", &id), &hash("h"), 1, 1, 100, None)
             .expect("p");
         wt.commit().expect("c");
         assert!(read_job(&db, &key("t1", "docs", &id)).is_some());
@@ -1507,6 +1716,7 @@ mod tests {
             hash: *h.as_bytes(),
             cursor: 5,
             processed: 2,
+            fixed_time: None,
         };
         let cancelled = JobRecord::Cancelled {
             hash: *h.as_bytes(),
@@ -1516,36 +1726,40 @@ mod tests {
             hash: *h.as_bytes(),
             total: 2,
         };
-        assert_eq!(classify_resend(None, &h, false), ResendDecision::Fresh);
         assert_eq!(
-            classify_resend(Some(&running), &h, true),
+            classify_resend(None, &h, false, false,),
+            ResendDecision::Fresh
+        );
+        assert_eq!(
+            classify_resend(Some(&running), &h, true, false,),
             ResendDecision::AlreadyRunning
         );
         assert_eq!(
-            classify_resend(Some(&running), &h, false),
+            classify_resend(Some(&running), &h, false, false,),
             ResendDecision::Resume {
                 cursor: 5,
-                processed: 2
+                processed: 2,
+                fixed_time: None,
             }
         );
         assert_eq!(
-            classify_resend(Some(&running), &other, false),
+            classify_resend(Some(&running), &other, false, false,),
             ResendDecision::ContentMismatch
         );
         assert_eq!(
-            classify_resend(Some(&cancelled), &h, false),
+            classify_resend(Some(&cancelled), &h, false, false,),
             ResendDecision::Cancelled { committed: 2 }
         );
         assert_eq!(
-            classify_resend(Some(&cancelled), &other, false),
+            classify_resend(Some(&cancelled), &other, false, false,),
             ResendDecision::ContentMismatch
         );
         assert_eq!(
-            classify_resend(Some(&completed), &h, false),
+            classify_resend(Some(&completed), &h, false, false,),
             ResendDecision::Duplicate
         );
         assert_eq!(
-            classify_resend(Some(&completed), &other, false),
+            classify_resend(Some(&completed), &other, false, false,),
             ResendDecision::ContentMismatch
         );
     }
@@ -1556,6 +1770,7 @@ mod tests {
             hash: [0; 32],
             cursor: 5,
             processed: 2,
+            fixed_time: None,
         };
         assert_eq!(
             derive_status(Some(&running), true),
@@ -1583,7 +1798,7 @@ mod tests {
         {
             let db = redb::Database::create(&path).expect("create");
             let wt = db.begin_write().expect("w");
-            record_chunk_progress_in_txn(&wt, &key("t1", "docs", &id), &hash("h"), 2, 6, 10)
+            record_chunk_progress_in_txn(&wt, &key("t1", "docs", &id), &hash("h"), 2, 6, 10, None)
                 .expect("p");
             wt.commit().expect("c");
         }
@@ -1659,7 +1874,8 @@ mod tests {
         let id = op("op-1");
         let wt = db.begin_write().expect("w");
         for (t, tb) in [("t1", "docs"), ("t2", "docs"), ("t1", "keep")] {
-            record_chunk_progress_in_txn(&wt, &key(t, tb, &id), &hash("h"), 1, 1, 100).expect("p");
+            record_chunk_progress_in_txn(&wt, &key(t, tb, &id), &hash("h"), 1, 1, 100, None)
+                .expect("p");
         }
         wt.commit().expect("c");
         let wt = db.begin_write().expect("w");
@@ -1688,7 +1904,7 @@ mod tests {
 
     fn seed_running(db: &redb::Database, id: &OperationId) {
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &key("t1", "docs", id), &hash("job"), 1, 1, 10)
+        record_chunk_progress_in_txn(&wt, &key("t1", "docs", id), &hash("job"), 1, 1, 10, None)
             .expect("p");
         wt.commit().expect("c");
     }

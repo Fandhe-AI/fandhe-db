@@ -105,6 +105,7 @@ pub(crate) fn delete_rows_where_partitioned_unchecked<E>(
     needs_embedding: bool,
     limits: &PartitionedDmlLimits,
     max_affected_total: Option<NonZeroUsize>,
+    fixed_time: Option<i64>,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<E>> {
     run_partitioned(
@@ -117,6 +118,7 @@ pub(crate) fn delete_rows_where_partitioned_unchecked<E>(
         needs_embedding,
         limits,
         max_affected_total,
+        fixed_time,
         Kind::Delete,
         predicate,
         &mut Hooks::production(),
@@ -141,6 +143,7 @@ pub(crate) fn update_rows_where_partitioned_unchecked<E>(
     needs_embedding: bool,
     limits: &PartitionedDmlLimits,
     max_affected_total: Option<NonZeroUsize>,
+    fixed_time: Option<i64>,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<E>> {
     run_partitioned(
@@ -153,6 +156,7 @@ pub(crate) fn update_rows_where_partitioned_unchecked<E>(
         needs_embedding,
         limits,
         max_affected_total,
+        fixed_time,
         Kind::Update {
             assignments,
             set_exprs,
@@ -283,6 +287,7 @@ fn run_partitioned<E>(
     needs_embedding: bool,
     limits: &PartitionedDmlLimits,
     max_affected_total: Option<NonZeroUsize>,
+    fixed_time: Option<i64>,
     kind: Kind<'_>,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     hooks: &mut Hooks<'_>,
@@ -303,6 +308,7 @@ fn run_partitioned<E>(
         needs_embedding,
         limits,
         max_affected_total,
+        fixed_time,
         kind,
         predicate,
         hooks,
@@ -325,6 +331,7 @@ fn chunk_loop<E>(
     needs_embedding: bool,
     limits: &PartitionedDmlLimits,
     max_affected_total: Option<NonZeroUsize>,
+    fixed_time: Option<i64>,
     kind: Kind<'_>,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     hooks: &mut Hooks<'_>,
@@ -406,7 +413,12 @@ fn chunk_loop<E>(
         // ジョブ記録の照合。最初のチャンクは再送判定、以降はメモリ上の状態との一致確認。
         let record = partitioned_job::lookup_in_write_txn(&write_txn, &key).map_err(map_job_err)?;
         if state.first_chunk {
-            match partitioned_job::classify_resend(record.as_ref(), hash, false) {
+            match partitioned_job::classify_resend(
+                record.as_ref(),
+                hash,
+                false,
+                fixed_time.is_some(),
+            ) {
                 ResendDecision::Fresh => {
                     // 新規ジョブの開始時に中断記録数の上限を判定する（commit 前なので副作用
                     // なし）。`Resume` は新しい記録を作らないため対象外。作成 txn 内での再計数は
@@ -419,7 +431,16 @@ fn chunk_loop<E>(
                         return Err(PartitionedStopCause::InterruptedRecordLimitReached);
                     }
                 }
-                ResendDecision::Resume { cursor, processed } => {
+                ResendDecision::Resume {
+                    cursor,
+                    processed,
+                    fixed_time: recorded_time,
+                } => {
+                    // 呼び出し元が束縛に使った固定時刻は、ジョブ開始時に永続化した値と一致する
+                    // こと（事前読み込みから本 txn までの間の記録の変化を検出する。設計 D6）。
+                    if recorded_time != fixed_time {
+                        return Err(map_job_err(PartitionedJobError::StateConflict));
+                    }
                     state.cursor = Some(cursor);
                     state.processed = processed;
                     state.has_record = true;
@@ -442,12 +463,14 @@ fn chunk_loop<E>(
                         hash: stored,
                         cursor,
                         processed,
+                        fixed_time: stored_time,
                     }),
                     true,
                 ) => {
                     hash.matches(stored)
                         && Some(*cursor) == state.cursor
                         && *processed == state.processed
+                        && *stored_time == fixed_time
                 }
                 _ => false,
             };
@@ -567,6 +590,7 @@ fn chunk_loop<E>(
                 rows_changed,
                 cursor,
                 limits.interrupted_record_limit.get(),
+                fixed_time,
             )
             .map_err(map_job_err)?
             {

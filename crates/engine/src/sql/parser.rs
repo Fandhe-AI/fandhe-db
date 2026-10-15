@@ -302,6 +302,11 @@ pub struct BoundInsert {
     /// `None` を `23502` で拒否済みのため常に `Some`。`CompareOnlyWithoutLedger`
     /// でのみ `None` になり得る。
     pub operation_id: Option<OperationId>,
+    /// 時刻値関数の `DEFAULT`（`DEFAULT now()` 系。SQL-37・TABLE-16・Issue #1587）を
+    /// 省略列へ適用した列の `schema.columns` 上の位置。`values` には評価済みの時刻が入るが、
+    /// 内容照合ハッシュは評価値ではなく列の DEFAULT 構文形から計算する（設計 D1・D2。
+    /// 再送で評価時刻が変わっても同一ハッシュにするため）。空なら従来どおり値だけでハッシュする。
+    pub volatile_default_columns: Vec<usize>,
 }
 
 /// 束縛済みの単一行・`id` 指定形 `DELETE` 文（SQL-18・TASK-191。#867 が
@@ -565,15 +570,6 @@ pub(crate) fn bind_integer_literal(
         | ColumnType::Uuid => Err(SqlSurfaceError::Internal {
             detail: "bind_integer_literal called for a non-integer column".to_string(),
         }),
-    }
-}
-
-/// `CHAR(n)` 列への非 NULL 値の書き込みを拒否する `0A000`（TABLE-31・Issue #1563）。
-/// 空白詰め・bpchar 比較（Issue #1566）が入るまで、意味論が未確定の書き込みを
-/// fail-closed に塞ぐ。INSERT・UPDATE SET・UPSERT・NoSQL 書き込みが共有する。
-pub(crate) fn bpchar_write_unsupported(column: &str) -> SqlSurfaceError {
-    SqlSurfaceError::FeatureNotSupported {
-        detail: format!("writing to character(n) column {column:?} is not supported yet"),
     }
 }
 
@@ -1316,6 +1312,8 @@ pub(crate) fn default_expr_alias(expr: &Expr) -> String {
         Expr::Case { .. } => "case".to_string(),
         Expr::Coalesce(_) => "coalesce".to_string(),
         Expr::NullIf(..) => "nullif".to_string(),
+        // 括弧なし値関数の既定列名は小文字のキーワード名（SQL-37・Issue #1586）。
+        Expr::ValueFunction { kind, .. } => kind.as_sql().to_string(),
         // PostgreSQL の既定列名（Issue #1539・SQL-42。従来は `expr`）。
         _ => ANONYMOUS_COLUMN_NAME.to_string(),
     }
@@ -1700,10 +1698,9 @@ fn text_range_compare_as_expr(
         },
         _ => return None,
     };
-    let is_text = schema
-        .columns
-        .iter()
-        .any(|c| &c.name == column && c.ty.is_text_like());
+    let is_text = schema.columns.iter().any(|c| {
+        &c.name == column && (c.ty.is_text_like() || matches!(c.ty, ColumnType::Bpchar(_)))
+    });
     if !is_text {
         return None;
     }
@@ -2645,13 +2642,29 @@ pub(crate) fn fill_omitted_columns(
     columns: &[ColumnDef],
     bound_values: &mut [crate::row_codec::Value],
     provided: &[bool],
-) -> Result<(), SqlSurfaceError> {
+    clock: Option<crate::sql::time_fn::StatementClock>,
+) -> Result<Vec<usize>, SqlSurfaceError> {
+    // 時刻 DEFAULT を適用した列の位置（内容照合ハッシュが評価値の代わりに DEFAULT 構文形を
+    // 使う対象。`BoundInsert::volatile_default_columns`）。
+    let mut volatile: Vec<usize> = Vec::new();
     for (idx, column) in columns.iter().enumerate() {
         let is_provided = provided.get(idx).copied().unwrap_or(false);
         if is_provided {
             continue;
         }
         match &column.default {
+            Some(ColumnDefault::CurrentTime(time)) => {
+                // 評価時刻の無い文脈は `0A000`（fail-closed。ファイル INSERT・FK の
+                // SET DEFAULT 等は `bind_column_default` 側で常に拒否される）。
+                let clock = clock.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
+                    detail: "time function DEFAULT is not supported in this context".to_string(),
+                })?;
+                let value = crate::sql::time_fn::eval_time_default(*time, &clock)?;
+                if let Some(slot) = bound_values.get_mut(idx) {
+                    *slot = value;
+                }
+                volatile.push(idx);
+            }
             Some(default) => {
                 let value = bind_column_default(column, default)?;
                 if let Some(slot) = bound_values.get_mut(idx) {
@@ -2665,7 +2678,22 @@ pub(crate) fn fill_omitted_columns(
             }
         }
     }
-    Ok(())
+    Ok(volatile)
+}
+
+/// 文字列リテラルを TEXT／`VARCHAR(n)` 列の [`crate::row_codec::Value::Text`] へ束縛する
+/// （TABLE-31・Issue #1564）。n 文字超過は `22001`、超過部分が半角空白のみなら n 文字へ
+/// 切り詰める。INSERT・UPDATE SET・UPSERT・COPY・ファイル形 INSERT の束縛段が共有し、
+/// `$n`（拡張クエリ）・NoSQL の値束縛もここを通る。
+pub(crate) fn bind_text_literal(
+    ty: &ColumnType,
+    s: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    // `CHAR(n)` は n 文字まで半角空白で詰めて保存する（TABLE-31・Issue #1566）。
+    let limit = usize::try_from(crate::row_codec::MAX_TEXT_FIELD_LEN).unwrap_or(usize::MAX);
+    Ok(crate::row_codec::Value::Text(
+        crate::row_codec::fit_pad_char_length(ty, s, limit)?.into_owned(),
+    ))
 }
 
 /// [`ColumnDefault`] を実際の列型の [`crate::row_codec::Value`] へ束縛する
@@ -2682,6 +2710,18 @@ pub(crate) fn bind_column_default(
     default: &ColumnDefault,
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {
     use crate::row_codec::{DefaultBindError, ScalarRef, Value};
+    // 時刻値関数の DEFAULT は評価時刻を要するため、この共通関数（定数 DEFAULT 専用）では
+    // 常に `0A000`（既定が拒否の fail-closed。INSERT の省略列補完は `fill_omitted_columns`
+    // が評価する。ファイル INSERT・FK の SET DEFAULT 等の新経路が追加されても拒否が抜けない。
+    // SQL-37・Issue #1587、設計 D9）。
+    if matches!(default, ColumnDefault::CurrentTime(_)) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!(
+                "column {:?} time function DEFAULT is not supported in this context",
+                column.name
+            ),
+        });
+    }
     // 変換本体は `row_codec::default_scalar`（既存行の読み出し時補完と
     // 共有する唯一の実装。Issue #1169）。ここでは SQLSTATE への写像のみ行う。
     // BYTEA は借用の `ScalarRef` で返せない（`default_scalar` は `Incompatible`）ため、
@@ -2697,7 +2737,8 @@ pub(crate) fn bind_column_default(
     }
     match crate::row_codec::default_scalar(&column.ty, default) {
         Ok(scalar) => match scalar {
-            ScalarRef::Text(s) => Ok(Value::Text(s.to_string())),
+            // 旧形式で保存された既定値でも n 超過を書き込ませない（冪等。Issue #1564）。
+            ScalarRef::Text(s) => bind_text_literal(&column.ty, s),
             ScalarRef::Integer(v) => Ok(Value::Integer(v)),
             ScalarRef::BigInt(v) => Ok(Value::BigInt(v)),
             ScalarRef::Real(v) => Ok(Value::Real(v)),
@@ -2829,17 +2870,11 @@ fn bind_insert_row(
                 )))
             }
             (
-                ColumnType::Bpchar(_),
-                InsertLiteral::String(_)
-                | InsertLiteral::Number(_)
-                | InsertLiteral::Bool(_)
-                | InsertLiteral::Vector(_),
-            ) => return Err(bpchar_write_unsupported(name)),
-            (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Text(s.clone())
-            }
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
+                InsertLiteral::String(s),
+            ) => bind_text_literal(&column.ty, s)?,
             (
-                ColumnType::Text | ColumnType::Varchar(_),
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -2985,13 +3020,21 @@ fn bind_insert_row(
         }
     }
 
-    fill_omitted_columns(&schema.columns, &mut bound_values, &provided)?;
+    // 時刻 DEFAULT の評価時刻は `core.rs` の INSERT 入口が `DefaultClockScope` で渡す
+    // （無ければ時刻 DEFAULT は `0A000`）。
+    let volatile_default_columns = fill_omitted_columns(
+        &schema.columns,
+        &mut bound_values,
+        &provided,
+        crate::sql::time_fn::current_default_clock(),
+    )?;
 
     Ok(BoundInsert {
         table: table_name.to_string(),
         id,
         values: bound_values,
         operation_id: operation_id.clone(),
+        volatile_default_columns,
     })
 }
 
@@ -3277,17 +3320,11 @@ fn bind_set_assignments(
                 )))
             }
             (
-                ColumnType::Bpchar(_),
-                InsertLiteral::String(_)
-                | InsertLiteral::Number(_)
-                | InsertLiteral::Bool(_)
-                | InsertLiteral::Vector(_),
-            ) => return Err(bpchar_write_unsupported(name)),
-            (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Text(s.clone())
-            }
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
+                InsertLiteral::String(s),
+            ) => bind_text_literal(&column.ty, s)?,
             (
-                ColumnType::Text | ColumnType::Varchar(_),
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -4439,13 +4476,10 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a vector literal, got a non-vector literal"
                         )))
                     }
-                    (ColumnType::Bpchar(_), InsertLiteral::String(_) | InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
-                        return Err(bpchar_write_unsupported(name))
+                    (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::String(s)) => {
+                        bind_text_literal(&column.ty, s)?
                     }
-                    (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::String(s)) => {
-                        crate::row_codec::Value::Text(s.clone())
-                    }
-                    (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                    (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a text literal, got a non-text literal"
                         )))
@@ -4637,13 +4671,10 @@ fn bind_file_insert(
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let value = match (&column.ty, literal) {
-            (ColumnType::Bpchar(_), InsertLiteral::String(_) | InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
-                return Err(bpchar_write_unsupported(name))
+            (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::String(s)) => {
+                bind_text_literal(&column.ty, s)?
             }
-            (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Text(s.clone())
-            }
-            (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a non-text literal"
                 )))
@@ -4651,7 +4682,7 @@ fn bind_file_insert(
             // `InsertLiteral::Vector`（Issue #896 レビュー指摘・PR #1038）は
             // NoSQL 表層専用であり、ファイル形 `INSERT` の VALUES 構文からは
             // 構築されない到達不能パス（match の網羅性のためだけの分岐）。
-            (ColumnType::Text | ColumnType::Varchar(_), InsertLiteral::Vector(_)) => {
+            (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::Vector(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a vector literal"
                 )))
@@ -5566,8 +5597,15 @@ fn resolve_aggregate_input(
                     (ColumnType::Text | ColumnType::Varchar(_), _) => {
                         Ok(AggregateInput::TextColumn(index))
                     }
+                    // `COUNT(<CHAR 列>)` は NULL でない行を数えるだけで、保存形（n 文字へ空白詰め）の
+                    // まま TEXT 列と同じ経路で数えられる。`MIN`／`MAX` は rtrim 順序での集約が
+                    // 必要なため後続課題とし、`SUM`／`AVG` と合わせて拒否のまま残す
+                    // （TABLE-31・Issue #1566）。
+                    (ColumnType::Bpchar(_), AggregateFunc::Count) => {
+                        Ok(AggregateInput::TextColumn(index))
+                    }
                     (ColumnType::Bpchar(_), _) => Err(SqlSurfaceError::undefined_function(
-                        format!("column {name:?} is CHAR and cannot be used in an aggregate yet"),
+                        format!("column {name:?} is CHAR and cannot be used with SUM/AVG/MIN/MAX"),
                     )),
                     (ColumnType::Vector(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::VectorColumnPresence)
@@ -5767,9 +5805,9 @@ fn resolve_count_distinct_input(
                     ColumnType::Text | ColumnType::Varchar(_) => {
                         Ok(AggregateInput::TextColumn(index))
                     }
-                    ColumnType::Bpchar(_) => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} is CHAR and cannot be used with COUNT(DISTINCT ...) yet"
-                    ))),
+                    // 同じ列の保存形はすべて n 文字へ詰め済みのため、バイト等価が bpchar 等価と
+                    // 一致する（TABLE-31・Issue #1566）。
+                    ColumnType::Bpchar(_) => Ok(AggregateInput::TextColumn(index)),
                     ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with COUNT(DISTINCT ...)"
                     ))),
@@ -6189,6 +6227,11 @@ pub(crate) enum OrderKind {
     Id,
     /// `TEXT`（バイト列順。実装既定値として C collation とみなす）。
     Bytes,
+    /// `CHAR(n)`（bpchar。末尾の半角空白を除いたバイト列順。PostgreSQL の bpchar 比較と
+    /// 同じく末尾空白を意味のないものとして扱う。TABLE-31・Issue #1566）。キーは
+    /// [`OrderKind::Bytes`] と同じ `ScalarKeyRef::Bytes` だが、辞書索引から供給される単一
+    /// TEXT キー経路（[`crate::sql::group_by::single_text_key_column`]）には載せない。
+    Bpchar,
     /// `INTEGER`／`BIGINT`／`DATE`／`TIMESTAMP`（いずれも符号付き整数として
     /// 全順序を持つ内部表現。§比較規約）。
     SignedInt,
@@ -6224,6 +6267,7 @@ pub(crate) struct BoundOrderKey {
 fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
     match ty {
         ColumnType::Text | ColumnType::Varchar(_) => Some(OrderKind::Bytes),
+        ColumnType::Bpchar(_) => Some(OrderKind::Bpchar),
         ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
@@ -6238,8 +6282,7 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
-        | ColumnType::Jsonb
-        | ColumnType::Bpchar(_) => None,
+        | ColumnType::Jsonb => None,
     }
 }
 
@@ -6890,9 +6933,9 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
         }
         // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は
         // 列参照を子に持ちうるため再帰的に集める（`sql::view::
-        // expr_columns_within` と同じ走査規則）。`Expr::Null` は列参照を
-        // 持たない。
-        Expr::Null => {}
+        // expr_columns_within` と同じ走査規則）。`Expr::Null`・括弧なし値関数
+        // （Issue #1586）は列参照を持たない。
+        Expr::Null | Expr::ValueFunction { .. } => {}
         Expr::Case { whens, else_result } => {
             for (cond, result) in whens {
                 collect_expr_idents(cond, out);
@@ -7469,7 +7512,8 @@ fn rewrite_group_row_idents(
         | Expr::String(_)
         | Expr::Null
         | Expr::DateLiteral(_)
-        | Expr::TimestampLiteral(_) => expr.clone(),
+        | Expr::TimestampLiteral(_)
+        | Expr::ValueFunction { .. } => expr.clone(),
         Expr::Call { name, args } => Expr::Call {
             name: name.clone(),
             args: args.iter().map(rec).collect::<Result<_, _>>()?,

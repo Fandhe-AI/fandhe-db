@@ -1610,6 +1610,89 @@ pub enum ParsedSql {
     DropType(crate::sql::allowlist::ValidatedDropType),
 }
 
+/// 読み取り文（[`ParsedSql::Statement`]）だけが現在時刻関数を受理する束縛スコープを開く
+/// （SQL-37・Issue #1586。許可リスト型の fail-closed）。`txn_start_micros` は `Active`
+/// トランザクション中のトランザクション開始時刻（`None` は autocommit・Describe で、文の
+/// 開始時刻と同値）。INSERT／UPDATE／DELETE／COPY／DDL／カーソル等は `None` を返し、束縛が
+/// 時刻関数を `0A000`（定数式は `42601`）で拒否する。`ParsedSql` を網羅 `match` にして
+/// variant 追加時に判定漏れをコンパイルエラーで検出する。
+fn read_statement_clock_scope(
+    parsed: &ParsedSql,
+    txn_start_micros: Option<i64>,
+) -> Result<Option<crate::sql::time_fn::ClockScope>, crate::sql::allowlist::SqlSurfaceError> {
+    let is_read = match parsed {
+        ParsedSql::Statement(_) => true,
+        ParsedSql::Insert(_)
+        | ParsedSql::Truncate(_)
+        | ParsedSql::Delete(_)
+        | ParsedSql::Update(_)
+        | ParsedSql::Transaction(_)
+        | ParsedSql::DropTable(_)
+        | ParsedSql::CreateTable(_)
+        | ParsedSql::Cursor(_)
+        | ParsedSql::Partitioned(_)
+        | ParsedSql::AlterTable(_)
+        | ParsedSql::CreateView(_)
+        | ParsedSql::DropView(_)
+        | ParsedSql::CreateIndex(_)
+        | ParsedSql::DropIndex(_)
+        | ParsedSql::CreateType(_)
+        | ParsedSql::DropType(_) => false,
+    };
+    if !is_read {
+        return Ok(None);
+    }
+    let stmt_start_micros = crate::sql::time_fn::now_micros()?;
+    Ok(Some(crate::sql::time_fn::ClockScope::enter(
+        crate::sql::time_fn::StatementClock {
+            txn_start_micros: txn_start_micros.unwrap_or(stmt_start_micros),
+            stmt_start_micros,
+        },
+    )))
+}
+
+/// INSERT 文だけが列 `DEFAULT now()` 系の評価時刻を持つ束縛スコープを開く（SQL-37・
+/// TABLE-16・Issue #1587。許可リスト型の fail-closed）。`txn_start_micros` は `Active`
+/// トランザクション中のトランザクション開始時刻（`None` は autocommit で、文の開始時刻と
+/// 同値）。式束縛用の [`crate::sql::time_fn::ClockScope`] とは別スロットで、`INSERT VALUES`
+/// 内の時刻関数は受理しない（#2188 の担当）。`ParsedSql` を網羅 `match` にして variant 追加時の
+/// 判定漏れをコンパイルエラーで検出する。
+fn insert_default_clock_scope(
+    parsed: &ParsedSql,
+    txn_start_micros: Option<i64>,
+) -> Result<Option<crate::sql::time_fn::DefaultClockScope>, crate::sql::allowlist::SqlSurfaceError>
+{
+    let is_insert = match parsed {
+        ParsedSql::Insert(_) => true,
+        ParsedSql::Statement(_)
+        | ParsedSql::Truncate(_)
+        | ParsedSql::Delete(_)
+        | ParsedSql::Update(_)
+        | ParsedSql::Transaction(_)
+        | ParsedSql::DropTable(_)
+        | ParsedSql::CreateTable(_)
+        | ParsedSql::Cursor(_)
+        | ParsedSql::Partitioned(_)
+        | ParsedSql::AlterTable(_)
+        | ParsedSql::CreateView(_)
+        | ParsedSql::DropView(_)
+        | ParsedSql::CreateIndex(_)
+        | ParsedSql::DropIndex(_)
+        | ParsedSql::CreateType(_)
+        | ParsedSql::DropType(_) => false,
+    };
+    if !is_insert {
+        return Ok(None);
+    }
+    let stmt_start_micros = crate::sql::time_fn::now_micros()?;
+    Ok(Some(crate::sql::time_fn::DefaultClockScope::enter(
+        crate::sql::time_fn::StatementClock {
+            txn_start_micros: txn_start_micros.unwrap_or(stmt_start_micros),
+            stmt_start_micros,
+        },
+    )))
+}
+
 /// `read_txn`（確定済みスナップショットまたは明示トランザクションの書き込み
 /// トランザクション。[`crate::storage::read_source::ReadSource`]）から `table_name` の
 /// スキーマを取得する（[`EngineCore::read_txn_with_schema`] とエラー分類を共有する
@@ -4202,6 +4285,11 @@ impl EngineCore {
         session: &mut crate::sql::mode::SessionState,
         parsed: &ParsedSql,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // SQL-37（Issue #1586）: autocommit の読み取り文は文の開始時刻を `now()` 系の
+        // 値として確定する（`now()` と `statement_timestamp()` は同値）。
+        let _clock_scope = read_statement_clock_scope(parsed, None)?;
+        // SQL-37・Issue #1587: INSERT の列 `DEFAULT now()` 系の評価時刻（autocommit は文の開始時刻）。
+        let _default_clock_scope = insert_default_clock_scope(parsed, None)?;
         match parsed {
             ParsedSql::Insert(stmt) => {
                 // Issue #933: Parse 時点のスキーマキャッシュ（`InsertSchemaLookup`）
@@ -4582,6 +4670,29 @@ impl EngineCore {
         parsed: &ParsedSql,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{SqlSurfaceError, Statement};
+
+        // SQL-37（Issue #1586）: 読み取り文は文の開始時刻とトランザクション開始時刻を確定する
+        // （`Active` なのに開始時刻が無い場合は fail-closed の `Internal`）。
+        let _clock_scope = read_statement_clock_scope(
+            parsed,
+            Some(
+                txn.txn_start_micros()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?,
+            ),
+        )?;
+
+        // SQL-37・Issue #1587: INSERT の列 `DEFAULT now()` 系はトランザクション開始時刻で評価する。
+        let _default_clock_scope = insert_default_clock_scope(
+            parsed,
+            Some(
+                txn.txn_start_micros()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?,
+            ),
+        )?;
 
         // 注意（Issue #1182・#1272）: 明示トランザクション内の `RETURNING` は `INSERT`
         // （単一行・複数行）・`DELETE`・`UPDATE`（単一行・述語形）・UPSERT に対応する
@@ -5073,6 +5184,9 @@ impl EngineCore {
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
         use crate::sql::allowlist::{DeleteStatement, Statement, ValidatedUpdateForm};
+
+        // SQL-37（Issue #1586）: Describe も読み取り文の束縛を通る（値は型決定にしか使わない）。
+        let _clock_scope = read_statement_clock_scope(parsed, None)?;
 
         match parsed {
             ParsedSql::Insert(stmt) => {
@@ -7364,7 +7478,18 @@ impl EngineCore {
 
         // 判定 4・5: スキーマ取得 → 束縛（同一 read_txn 下）。
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
-        let bounds = bind(&schema)?;
+        // SQL-37・Issue #1587: 束縛クロージャ（NoSQL insert の `bind_insert`）が列 `DEFAULT now()`
+        // 系を評価する時刻（autocommit 相当の文の開始時刻）。束縛区間だけ保持する。
+        let bounds = {
+            let now = crate::sql::time_fn::now_micros()?;
+            let _default_clock_scope = crate::sql::time_fn::DefaultClockScope::enter(
+                crate::sql::time_fn::StatementClock {
+                    txn_start_micros: now,
+                    stmt_start_micros: now,
+                },
+            );
+            bind(&schema)?
+        };
         if bounds.len() != row_count
             || bounds
                 .iter()
@@ -7428,7 +7553,7 @@ impl EngineCore {
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)?;
-        self.begin_copy_validated(ctx, session, stmt)
+        self.begin_copy_validated(ctx, session, stmt, None)
     }
 
     /// [`Self::begin_copy`] の検証済み文を受け取る本体（[`Self::begin_copy_in_txn`] と共有）。
@@ -7437,10 +7562,19 @@ impl EngineCore {
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         stmt: crate::sql::allowlist::CopyStatement,
+        txn_start_micros: Option<i64>,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         match stmt {
             crate::sql::allowlist::CopyStatement::From(v) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
+                // SQL-37・Issue #1587: COPY の行ごとの束縛は複数の wire メッセージにまたがるため、
+                // 列 `DEFAULT now()` 系の評価時刻（文の開始時刻・明示トランザクションでは
+                // トランザクション開始時刻）をここで確定してセッションへ持たせる。
+                let stmt_start_micros = crate::sql::time_fn::now_micros()?;
+                let clock = crate::sql::time_fn::StatementClock {
+                    txn_start_micros: txn_start_micros.unwrap_or(stmt_start_micros),
+                    stmt_start_micros,
+                };
                 Ok(CopyPlan::From(crate::sql::copy::CopyInSession::new(
                     v.table_name,
                     v.columns,
@@ -7448,6 +7582,7 @@ impl EngineCore {
                     v.operation_id,
                     schema,
                     self.batch_limits,
+                    clock,
                 )?))
             }
             crate::sql::allowlist::CopyStatement::To(v) => {
@@ -7531,7 +7666,7 @@ impl EngineCore {
                 return Ok(CopyPlan::To(v.format, result));
             }
         }
-        self.begin_copy_validated(ctx, session, stmt)
+        self.begin_copy_validated(ctx, session, stmt, txn.txn_start_micros())
     }
 
     /// [`Self::begin_copy`] が返した `CopyPlan::From` セッションへ、CopyDone
@@ -8717,6 +8852,13 @@ impl EngineCore {
                 "RETURNING requires the session-aware entry point",
             ));
         }
+        // SQL-37・Issue #1587: 列 `DEFAULT now()` 系の評価時刻（autocommit は文の開始時刻）。
+        let now = crate::sql::time_fn::now_micros()?;
+        let _default_clock_scope =
+            crate::sql::time_fn::DefaultClockScope::enter(crate::sql::time_fn::StatementClock {
+                txn_start_micros: now,
+                stmt_start_micros: now,
+            });
         self.execute_insert_form(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
             ctx,
@@ -9133,11 +9275,21 @@ impl EngineCore {
         schema: &crate::catalog::TableSchema,
         limits: &crate::sql::parser::PartitionedDmlLimits,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let bound = crate::sql::parser::bind_predicate_delete(stmt, schema, udfs)?;
-        let content_hash_value = crate::recovery::content_hash::for_delete_where_partitioned(
+        // 時刻値関数を含む文は、ジョブ開始時に確定・永続化した固定時刻で全チャンクを束縛する
+        // （再開時も同じ値。SQL-37・RECOVER-11・Issue #1587、設計 D6）。束縛 → ハッシュ計算の
+        // 失敗順序は従来どおり。
+        let (bound, content_hash_value, fixed_time) = self.bind_partitioned_with_fixed_time(
+            ctx,
             stmt.table_name(),
-            stmt.where_predicates(),
-            udfs,
+            stmt.operation_id(),
+            || crate::sql::parser::bind_predicate_delete(stmt, schema, udfs),
+            || {
+                crate::recovery::content_hash::for_delete_where_partitioned(
+                    stmt.table_name(),
+                    stmt.where_predicates(),
+                    udfs,
+                )
+            },
         )?;
         crate::sql::exec::execute_predicate_delete_partitioned(
             &self.storage,
@@ -9148,6 +9300,7 @@ impl EngineCore {
             &content_hash_value,
             limits,
             self.dml_limits.max_affected_rows,
+            fixed_time,
         )
     }
 
@@ -9161,18 +9314,26 @@ impl EngineCore {
         schema: &crate::catalog::TableSchema,
         limits: &crate::sql::parser::PartitionedDmlLimits,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let bound = crate::sql::parser::bind_predicate_update(stmt, schema, udfs)?;
         let assignment_refs: Vec<(&str, &crate::sql::allowlist::SetValue)> = stmt
             .assignments()
             .iter()
             .map(|(name, literal)| (name.as_str(), literal))
             .collect();
-        let content_hash_value = crate::recovery::content_hash::for_update_where_partitioned(
+        // 時刻値関数を含む文の固定時刻（`run_partitioned_delete` と同じ。設計 D6）。
+        let (bound, content_hash_value, fixed_time) = self.bind_partitioned_with_fixed_time(
+            ctx,
             stmt.table_name(),
-            &assignment_refs,
-            stmt.where_predicates(),
-            udfs,
-            schema,
+            stmt.operation_id(),
+            || crate::sql::parser::bind_predicate_update(stmt, schema, udfs),
+            || {
+                crate::recovery::content_hash::for_update_where_partitioned(
+                    stmt.table_name(),
+                    &assignment_refs,
+                    stmt.where_predicates(),
+                    udfs,
+                    schema,
+                )
+            },
         )?;
         crate::sql::exec::execute_predicate_update_partitioned(
             &self.storage,
@@ -9183,7 +9344,86 @@ impl EngineCore {
             &content_hash_value,
             limits,
             self.dml_limits.max_affected_rows,
+            fixed_time,
         )
+    }
+
+    /// 分割実行 DML の束縛を、トランザクション固定の時刻関数だけを受理するスコープで行い、
+    /// 時刻値関数を含む文には**ジョブ開始時に確定した固定時刻**を返す（SQL-37・RECOVER-11・
+    /// RECOVER-12・Issue #1587、設計 D6）。
+    ///
+    /// 1. 現在時刻を仮の固定時刻としてスコープを開き `bind` を呼ぶ。束縛が時刻を要求しなければ
+    ///    （[`crate::sql::time_fn::ClockScope::was_used`]）時刻値関数を含まない文で、`None` を返す
+    ///    （従来どおり。`statement_timestamp()`・`clock_timestamp()` はスコープが `0A000` にする）。
+    /// 2. 含む文は、同じ `(tenant, table, operation_id)` の `Running` 記録が内容一致で固定時刻を
+    ///    持っていればその値、なければ仮の固定時刻を採用する。記録の値が仮と異なる場合は、記録の
+    ///    値で束縛し直す（全チャンクと再開後で同じ時刻にする）。固定時刻を持たない記録（v1）は
+    ///    `Some(仮)` のまま実行器の再送判定が `22023` にする。
+    ///
+    /// 実行器（`tenant::partitioned_dml`）が最初のチャンクの write txn 内で記録の値との一致を
+    /// 再検査し、事前読み込みとの間で記録が変わっていれば止める（TOCTOU 対策）。
+    fn bind_partitioned_with_fixed_time<T>(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        op_id: Option<&crate::recovery::required_op_id::OperationId>,
+        bind: impl Fn() -> Result<T, crate::sql::allowlist::SqlSurfaceError>,
+        hash_fn: impl FnOnce() -> Result<
+            crate::recovery::content_hash::ContentHash,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    ) -> Result<
+        (T, crate::recovery::content_hash::ContentHash, Option<i64>),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        use crate::sql::time_fn::{now_micros, ClockScope, StatementClock};
+        let provisional = now_micros()?;
+        let scope = ClockScope::enter_txn_fixed_only(StatementClock {
+            txn_start_micros: provisional,
+            stmt_start_micros: provisional,
+        });
+        let bound = bind()?;
+        let hash = hash_fn()?;
+        if !scope.was_used() {
+            return Ok((bound, hash, None));
+        }
+        let recorded = match op_id {
+            Some(op_id) => {
+                let key = crate::recovery::partitioned_job::JobKey::for_context(ctx, table, op_id);
+                let read_txn = self.storage.db().begin_read().map_err(|_| {
+                    crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }
+                })?;
+                match crate::recovery::partitioned_job::lookup_in_read_txn(&read_txn, &key) {
+                    Ok(Some(crate::recovery::partitioned_job::JobRecord::Running {
+                        hash: stored,
+                        fixed_time,
+                        ..
+                    })) if hash.matches(&stored) => fixed_time,
+                    Ok(_) => None,
+                    Err(_) => {
+                        return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "internal error".to_string(),
+                        })
+                    }
+                }
+            }
+            None => None,
+        };
+        match recorded {
+            Some(t) if t != provisional => {
+                drop(scope);
+                let _rebind_scope = ClockScope::enter_txn_fixed_only(StatementClock {
+                    txn_start_micros: t,
+                    stmt_start_micros: t,
+                });
+                let bound = bind()?;
+                Ok((bound, hash, Some(t)))
+            }
+            Some(t) => Ok((bound, hash, Some(t))),
+            None => Ok((bound, hash, Some(provisional))),
+        }
     }
 
     /// `SHOW`／`CANCEL PARTITIONED DML`・`EXPLAIN ... PARTITIONED`（Issue #1129）の実行。
@@ -9217,6 +9457,15 @@ impl EngineCore {
                 )?;
                 let schema = self.load_table_schema_for_dml(stmt.table_name())?;
                 let udfs = session.udfs();
+                // EXPLAIN は束縛だけ行う（SQL-37・Issue #1587）。時刻値関数は実行時と同じく
+                // トランザクション固定のものだけを受理する。
+                let now = crate::sql::time_fn::now_micros()?;
+                let _clock_scope = crate::sql::time_fn::ClockScope::enter_txn_fixed_only(
+                    crate::sql::time_fn::StatementClock {
+                        txn_start_micros: now,
+                        stmt_start_micros: now,
+                    },
+                );
                 crate::sql::parser::bind_predicate_delete(stmt, &schema, udfs)?;
                 crate::recovery::content_hash::for_delete_where_partitioned(
                     stmt.table_name(),
@@ -9243,6 +9492,13 @@ impl EngineCore {
                 )?;
                 let schema = self.load_table_schema_for_dml(stmt.table_name())?;
                 let udfs = session.udfs();
+                let now = crate::sql::time_fn::now_micros()?;
+                let _clock_scope = crate::sql::time_fn::ClockScope::enter_txn_fixed_only(
+                    crate::sql::time_fn::StatementClock {
+                        txn_start_micros: now,
+                        stmt_start_micros: now,
+                    },
+                );
                 crate::sql::parser::bind_predicate_update(stmt, &schema, udfs)?;
                 let assignment_refs: Vec<(&str, &crate::sql::allowlist::SetValue)> = stmt
                     .assignments()
@@ -12140,6 +12396,7 @@ mod tests {
                 crate::sql::using_operation_id::OperationId::parse("op-array-batch-limit")
                     .expect("valid operation id"),
             ),
+            volatile_default_columns: Vec::new(),
         };
 
         let result = core.validate_insert_row_batch_limits(std::slice::from_ref(&bound));

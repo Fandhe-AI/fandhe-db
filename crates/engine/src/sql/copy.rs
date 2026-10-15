@@ -514,6 +514,7 @@ fn bind_copy_record(
     fields: &[Option<String>],
     operation_id: &Option<OperationId>,
     schema: &TableSchema,
+    clock: crate::sql::time_fn::StatementClock,
 ) -> Result<BoundInsert, SqlSurfaceError> {
     let id_pos = columns.iter().position(|c| c == "id").ok_or_else(|| {
         SqlSurfaceError::invalid_input("COPY column list must include the id pseudo-column")
@@ -555,13 +556,9 @@ fn bind_copy_record(
             }
             Some(s) => match &column.ty {
                 ColumnType::Vector(dim) => Value::Vector(parse_vector_literal(s, *dim)?),
-                ColumnType::Text | ColumnType::Varchar(_) => Value::Text(s.clone()),
-                // `CHAR(n)` への非 NULL 書き込みは空白詰め・bpchar 比較（Issue #1566）まで
-                // fail-closed に拒否する。
-                ColumnType::Bpchar(_) => {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "writing to character(n) columns is not supported yet".to_string(),
-                    })
+                // `CHAR(n)` は空白詰めして保存する（TABLE-31・Issue #1566）。
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
+                    crate::sql::parser::bind_text_literal(&column.ty, s)?
                 }
                 ColumnType::Boolean => Value::Bool(parse_copy_boolean(s, name)?),
                 ColumnType::Array(array_ty) => Value::Array(parse_array_literal(s, array_ty)?),
@@ -615,13 +612,19 @@ fn bind_copy_record(
         }
     }
 
-    crate::sql::parser::fill_omitted_columns(&schema.columns, &mut bound_values, &provided)?;
+    let volatile_default_columns = crate::sql::parser::fill_omitted_columns(
+        &schema.columns,
+        &mut bound_values,
+        &provided,
+        Some(clock),
+    )?;
 
     Ok(BoundInsert {
         table: table_name.to_string(),
         id,
         values: bound_values,
         operation_id: operation_id.clone(),
+        volatile_default_columns,
     })
 }
 
@@ -715,6 +718,10 @@ pub struct CopyInSession {
     splitter: RecordSplitter,
     bounds: Vec<BoundInsert>,
     running_bytes: usize,
+    /// 列 `DEFAULT now()` 系の評価時刻（SQL-37・Issue #1587）。COPY は行ごとの束縛が複数の
+    /// wire メッセージにまたがり RAII のスレッドローカルスコープが届かないため、
+    /// 開始時に `core.rs` が確定した値をここへ保持して全行で共有する（全行同じ時刻）。
+    clock: crate::sql::time_fn::StatementClock,
 }
 
 impl CopyInSession {
@@ -766,6 +773,7 @@ impl CopyInSession {
         operation_id: Option<OperationId>,
         schema: TableSchema,
         limits: BatchLimits,
+        clock: crate::sql::time_fn::StatementClock,
     ) -> Result<Self, SqlSurfaceError> {
         Self::validate_columns_against_schema(&columns, &schema)?;
         Ok(Self {
@@ -777,6 +785,7 @@ impl CopyInSession {
             limits,
             bounds: Vec::new(),
             running_bytes: 0,
+            clock,
         })
     }
 
@@ -811,6 +820,7 @@ impl CopyInSession {
         let schema = &self.schema;
         let bounds = &mut self.bounds;
         let splitter = &mut self.splitter;
+        let clock = self.clock;
 
         splitter.feed(chunk, |fields| {
             if fields.len() != columns.len() {
@@ -823,7 +833,7 @@ impl CopyInSession {
             let next_count = bounds.len().saturating_add(1);
             batch_limits::check_row_count(next_count, &limits).map_err(map_batch_err)?;
             batch_limits::validate_chunk_total(next_count, &limits).map_err(map_batch_err)?;
-            let bound = bind_copy_record(&table, &columns, &fields, &operation_id, schema)?;
+            let bound = bind_copy_record(&table, &columns, &fields, &operation_id, schema, clock)?;
             let row_bytes = bound_insert_byte_len(&bound)?;
             batch_limits::check_row_body_len(bounds.len(), row_bytes, &limits)
                 .map_err(map_batch_err)?;
@@ -854,6 +864,7 @@ impl CopyInSession {
                 &fields,
                 &self.operation_id,
                 &self.schema,
+                self.clock,
             )?;
             let row_bytes = bound_insert_byte_len(&bound)?;
             batch_limits::check_row_body_len(self.bounds.len(), row_bytes, &self.limits)
@@ -1159,12 +1170,20 @@ mod tests {
         assert_eq!(fields, vec![Some("a".to_string())]);
     }
 
+    fn test_clock() -> crate::sql::time_fn::StatementClock {
+        crate::sql::time_fn::StatementClock {
+            txn_start_micros: 0,
+            stmt_start_micros: 0,
+        }
+    }
+
     #[test]
     fn bind_copy_record_rejects_null_for_non_nullable_column() {
         let schema = text_schema();
         let columns = vec!["id".to_string(), "body".to_string()];
         let fields = vec![Some("1".to_string()), None];
-        let err = bind_copy_record("t", &columns, &fields, &None, &schema).unwrap_err();
+        let err =
+            bind_copy_record("t", &columns, &fields, &None, &schema, test_clock()).unwrap_err();
         // TABLE-16・TASK-204、Issue #904: NOT NULL 違反は `23502`
         // （`NotNullViolation`）へ写像する（旧 `22000` から契約変更）。
         assert_eq!(err.wire_code(), "23502");
@@ -1175,7 +1194,7 @@ mod tests {
         let schema = text_schema();
         let columns = vec!["id".to_string(), "body".to_string(), "note".to_string()];
         let fields = vec![Some("1".to_string()), Some("hello".to_string()), None];
-        let bound = bind_copy_record("t", &columns, &fields, &None, &schema).unwrap();
+        let bound = bind_copy_record("t", &columns, &fields, &None, &schema, test_clock()).unwrap();
         assert_eq!(bound.id, 1);
         assert_eq!(
             bound.values,
@@ -1188,7 +1207,8 @@ mod tests {
         let schema = text_schema();
         let columns = vec!["body".to_string()];
         let fields = vec![Some("hello".to_string())];
-        let err = bind_copy_record("t", &columns, &fields, &None, &schema).unwrap_err();
+        let err =
+            bind_copy_record("t", &columns, &fields, &None, &schema, test_clock()).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
     }
 }

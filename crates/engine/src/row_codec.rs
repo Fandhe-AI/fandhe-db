@@ -2946,24 +2946,189 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
 }
 
 /// 行バイト列上 TEXT フレームで格納する列型か（`Text`／`Varchar`／`Bpchar`）。
-/// `Bpchar` は SQL 束縛段が非 NULL 書き込みを `0A000` で塞ぐ間（Issue #1566 まで）も、
-/// codec 自体は後続 Issue が触らずに済むよう Text フレームを受理する（長さは
-/// [`check_varchar_length`] が n 以下に制限する）。
+/// `Bpchar` は n 文字へ空白詰めした値を保存する（TABLE-31・Issue #1566）。
+/// 詰め済みであることは [`check_varchar_length`] が codec の最後の砦として検査する。
 fn is_text_frame_type(ty: &ColumnType) -> bool {
     ty.is_text_like() || matches!(ty, ColumnType::Bpchar(_))
+}
+
+/// `VARCHAR(n)`／`CHAR(n)` 列の文字数上限超過（`22001`。TABLE-31・Issue #1564）。
+/// 束縛段・DDL の既定値・SET 式評価が [`fit_char_length`] の失敗として返し、
+/// [`crate::sql::allowlist::SqlSurfaceError::StringDataRightTruncation`] へ写像する。
+/// 文言は型と n だけの固定文言で、値・列名・テナントは含めない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CharLengthExceeded {
+    /// `CHAR(n)` なら true（文言を `character(n)` にする）。
+    bpchar: bool,
+    n: u32,
+    /// `CHAR(n)` の空白詰め後の長さがエンジンの TEXT 上限を超える場合（`54000`）。
+    pad_limit: bool,
+}
+
+impl std::fmt::Display for CharLengthExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.pad_limit {
+            write!(
+                f,
+                "character({}) value exceeds the engine text field limit",
+                self.n
+            )
+        } else if self.bpchar {
+            write!(f, "value too long for type character({})", self.n)
+        } else {
+            write!(f, "value too long for type character varying({})", self.n)
+        }
+    }
+}
+
+impl From<CharLengthExceeded> for crate::sql::allowlist::SqlSurfaceError {
+    fn from(e: CharLengthExceeded) -> Self {
+        if e.pad_limit {
+            crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string())
+        } else {
+            crate::sql::allowlist::SqlSurfaceError::string_data_right_truncation(e.to_string())
+        }
+    }
+}
+
+/// `VARCHAR(n)`／`CHAR(n)` へ書き込む文字列を n 文字へ収める（TABLE-31・Issue #1564）。
+/// 収まる値はそのまま、n 文字を超える部分がすべて半角空白（U+0020 のみ。タブ・改行・
+/// 全角空白は対象外）なら n 文字へ切り詰めて返し、それ以外は [`CharLengthExceeded`]。
+/// `Varchar(None)`・`Text` 等の他の型は素通しする。SQL 束縛段・COPY・DDL の既定値・
+/// SET 式評価・UPSERT の `EXCLUDED` 代入が共有する判定で、codec の
+/// [`check_varchar_length`]（切り詰めなしの最後の砦）の手前で使う。
+pub(crate) fn fit_char_length<'a>(
+    ty: &ColumnType,
+    text: &'a str,
+) -> std::result::Result<&'a str, CharLengthExceeded> {
+    let (n, bpchar) = match ty {
+        ColumnType::Varchar(Some(n)) => (*n, false),
+        ColumnType::Bpchar(n) => (*n, true),
+        _ => return Ok(text),
+    };
+    let err = CharLengthExceeded {
+        bpchar,
+        n,
+        pad_limit: false,
+    };
+    let limit = usize::try_from(n).unwrap_or(usize::MAX);
+    // バイト数が n 以下なら文字数も n 以下（巨大文字列の走査を避ける）。
+    if text.len() <= limit {
+        return Ok(text);
+    }
+    let Some((idx, _)) = text.char_indices().nth(limit) else {
+        return Ok(text);
+    };
+    match (text.get(idx..), text.get(..idx)) {
+        (Some(rest), Some(head)) if rest.bytes().all(|b| b == b' ') => Ok(head),
+        _ => Err(err),
+    }
+}
+
+/// 書き込む文字列を列型の格納形へ正規化する（TABLE-31・Issue #1564／#1566）。
+/// [`fit_char_length`] で n 文字へ収めたうえで、`CHAR(n)` は n 文字まで半角空白
+/// （U+0020）で詰める。詰め後のバイト長が `limit`（通常の書き込みは
+/// [`MAX_TEXT_FIELD_LEN`]、DEFAULT は `MAX_COLUMN_DEFAULT_LEN`）を超える場合は、
+/// **確保の前に** `54000` 相当で拒否する（n が確保量を決めない。DoS 防止）。
+/// `VARCHAR(n)`・`TEXT` 等は [`fit_char_length`] と同じ結果（借用）を返す。
+pub(crate) fn fit_pad_char_length<'a>(
+    ty: &ColumnType,
+    text: &'a str,
+    limit: usize,
+) -> std::result::Result<std::borrow::Cow<'a, str>, CharLengthExceeded> {
+    let fitted = fit_char_length(ty, text)?;
+    let ColumnType::Bpchar(n) = ty else {
+        return Ok(std::borrow::Cow::Borrowed(fitted));
+    };
+    let n_usize = usize::try_from(*n).unwrap_or(usize::MAX);
+    let chars = fitted.chars().count();
+    let pad = n_usize.saturating_sub(chars);
+    if pad == 0 {
+        // 空白を足さない経路でも上限超過（n 文字ちょうどで 4MiB 超等）を素通りさせない。
+        if fitted.len() > limit {
+            return Err(CharLengthExceeded {
+                bpchar: true,
+                n: *n,
+                pad_limit: true,
+            });
+        }
+        return Ok(std::borrow::Cow::Borrowed(fitted));
+    }
+    match fitted.len().checked_add(pad) {
+        Some(total) if total <= limit => {
+            let mut out = String::with_capacity(total);
+            out.push_str(fitted);
+            out.extend(std::iter::repeat_n(' ', pad));
+            Ok(std::borrow::Cow::Owned(out))
+        }
+        _ => Err(CharLengthExceeded {
+            bpchar: true,
+            n: *n,
+            pad_limit: true,
+        }),
+    }
+}
+
+/// `ALTER COLUMN ... TYPE` の文字列系の型変換（`TEXT`／`VARCHAR`／`VARCHAR(n)`／`CHAR(n)` の
+/// 相互変換。TABLE-19・TABLE-31・Issue #1567）で 1 値を `to` の格納形へ変換する。
+/// 変換元が `CHAR(n)` なら先に末尾の U+0020 を除き（`bpchar`→`text` と同じ rtrim）、
+/// その後 [`fit_pad_char_length`] で書き込み経路（Issue #1564）と同じ規則
+/// （超過部分が半角空白のみなら切り詰め・それ以外は `22001`・`CHAR` は空白詰め・
+/// 詰め後が `limit` 超なら `54000`）を適用する。`catalog::alter_column_type_with` の
+/// 行走査（[`crate::column_rewrite`]）と DEFAULT 変換が共有する単一の変換点で、
+/// 値は返り値にもエラーにも含めない（エラーは型と n だけの固定文言）。
+pub(crate) fn convert_char_family<'a>(
+    from: &ColumnType,
+    to: &ColumnType,
+    text: &'a str,
+    limit: usize,
+) -> std::result::Result<std::borrow::Cow<'a, str>, CharLengthExceeded> {
+    let source = if matches!(from, ColumnType::Bpchar(_)) {
+        text.trim_end_matches(' ')
+    } else {
+        text
+    };
+    fit_pad_char_length(to, source, limit)
+}
+
+/// [`fit_pad_char_length`] を `Value::Text` へその場適用する（切り詰め・空白詰め）。
+pub(crate) fn normalize_char_length_value(
+    column: &crate::catalog::ColumnDef,
+    value: &mut Value,
+) -> std::result::Result<(), CharLengthExceeded> {
+    if let Value::Text(t) = value {
+        let limit = usize::try_from(MAX_TEXT_FIELD_LEN).unwrap_or(usize::MAX);
+        let fitted = fit_pad_char_length(&column.ty, t, limit)?.into_owned();
+        *t = fitted;
+    }
+    Ok(())
 }
 
 /// `VARCHAR(n)`／`CHAR(n)` 列への書き込みで、文字数（バイト数ではない）が n を超える値を
 /// 拒否する（TABLE-31・Issue #1563）。SQL・COPY・NoSQL・UPSERT・INSERT…SELECT・
 /// FK CASCADE の書き込みはすべて encode 系を通るため、ここが長さ超過を永続化させない
-/// 単一のチョークポイントになる。束縛段での `22001` 分類と末尾空白の切り詰め許容は
-/// Issue #1564 の担当で、それまでは `RowCodecError::Invalid` として fail-closed に拒否する。
+/// 最後の砦になる。`22001` 分類と末尾空白の切り詰め許容は束縛段の [`fit_char_length`]
+/// （Issue #1564）が担い、ここは切り詰めなしの厳格判定のまま
+/// `RowCodecError::Invalid` として fail-closed に拒否する。
 /// エラーには列名だけを含め、値は反射しない。
 pub(crate) fn check_varchar_length(column: &crate::catalog::ColumnDef, text: &str) -> Result<()> {
-    let n = match &column.ty {
-        ColumnType::Varchar(Some(n)) | ColumnType::Bpchar(n) => *n,
+    let (n, exact) = match &column.ty {
+        ColumnType::Varchar(Some(n)) => (*n, false),
+        ColumnType::Bpchar(n) => (*n, true),
         _ => return Ok(()),
     };
+    // `CHAR(n)` は n 文字へ空白詰め済みの値だけを保存する（TABLE-31・Issue #1566）。
+    // 未詰めの値は書き込み経路の正規化漏れなので fail-closed に拒否する。
+    if exact {
+        let limit = usize::try_from(n).unwrap_or(usize::MAX);
+        if text.len() < limit || text.chars().count() != limit {
+            return Err(RowCodecError::Invalid(format!(
+                "value for column {:?} of type character({n}) is not blank-padded",
+                column.name
+            )));
+        }
+        return Ok(());
+    }
     // 文字数が n を超えうるのはバイト数が n を超える場合のみ。巨大文字列の全走査を避け、
     // n+1 文字目の有無だけを調べる。
     let limit = usize::try_from(n).unwrap_or(usize::MAX);
@@ -3743,6 +3908,15 @@ pub(crate) fn validate_default(
         (crate::catalog::ColumnDefault::Text(s), ColumnType::Array(at)) => {
             parse_array_default(at, s).map(|_| ())
         }
+        // 時刻値関数の DEFAULT（SQL-37・Issue #1587）は値を評価せず、列型との適合だけを
+        // 検査する（評価は INSERT 時の `sql::parser::fill_omitted_columns` のみ）。
+        (crate::catalog::ColumnDefault::CurrentTime(t), _) => {
+            if t.compatible_with(ty) {
+                Ok(())
+            } else {
+                Err(DefaultBindError::Incompatible)
+            }
+        }
         _ => default_scalar(ty, default).map(|_| ()),
     }
 }
@@ -3788,9 +3962,10 @@ pub(crate) fn default_scalar<'a>(
         }
     }
     match (default, ty) {
-        (ColumnDefault::Text(s), ColumnType::Text | ColumnType::Varchar(_)) => {
-            Ok(ScalarRef::Text(s.as_str()))
-        }
+        (
+            ColumnDefault::Text(s),
+            ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_),
+        ) => Ok(ScalarRef::Text(s.as_str())),
         (ColumnDefault::Number(n), ColumnType::SmallInt) => n
             .parse::<i16>()
             .map(|v| ScalarRef::Integer(i32::from(v)))
@@ -3873,6 +4048,11 @@ pub(crate) fn default_scalar<'a>(
                 _ => Err(DefaultBindError::Malformed),
             }
         }
+        // 時刻 DEFAULT は評価時刻に依存するため、固定値の補完（読み出し時補完・FK の
+        // SET DEFAULT・`bind_column_default`）には使えない。`Incompatible` で fail-closed
+        // にする（ADD COLUMN ... DEFAULT now() は DDL が `0A000` で拒否するため
+        // 読み出し時補完へは到達しない。設計 D9・D10）。
+        (ColumnDefault::CurrentTime(_), _) => Err(DefaultBindError::Incompatible),
         _ => Err(DefaultBindError::Incompatible),
     }
 }
@@ -4600,6 +4780,89 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
 mod tests {
     use super::*;
     use crate::catalog::ColumnDef;
+
+    /// `convert_char_family`（TABLE-19・TABLE-31・Issue #1567）の変換行列。
+    #[test]
+    fn convert_char_family_matrix() {
+        let lim = MAX_TEXT_FIELD_LEN as usize;
+        let c3 = ColumnType::Bpchar(3);
+        let c5 = ColumnType::Bpchar(5);
+        let v2 = ColumnType::Varchar(Some(2));
+        let text = ColumnType::Text;
+        // 変換元が CHAR なら先に rtrim する。
+        assert_eq!(convert_char_family(&c5, &text, "ab   ", lim).unwrap(), "ab");
+        assert_eq!(convert_char_family(&c5, &c3, "ab   ", lim).unwrap(), "ab ");
+        assert_eq!(convert_char_family(&c3, &c5, "ab ", lim).unwrap(), "ab   ");
+        // rtrim 後も超過すれば 22001 相当（固定文言）。
+        let e = convert_char_family(&c5, &c3, "abcd ", lim).unwrap_err();
+        assert_eq!(e.to_string(), "value too long for type character(3)");
+        // TEXT の超過部分が空白のみなら切り詰め、それ以外は拒否。
+        assert_eq!(convert_char_family(&text, &v2, "ab  ", lim).unwrap(), "ab");
+        assert!(convert_char_family(&text, &v2, "abc", lim).is_err());
+        // 詰め後が上限を超える場合は確保せずに拒否。
+        let huge = ColumnType::Bpchar(MAX_TEXT_FIELD_LEN + 1);
+        let e = convert_char_family(&text, &huge, "a", lim).unwrap_err();
+        assert!(e.to_string().contains("engine text field limit"));
+    }
+
+    /// `fit_pad_char_length`（TABLE-31・Issue #1566）: 空白詰め・マルチバイト・上限超過・素通し。
+    #[test]
+    fn fit_pad_char_length_rules() {
+        let c3 = ColumnType::Bpchar(3);
+        let lim = MAX_TEXT_FIELD_LEN as usize;
+        assert_eq!(fit_pad_char_length(&c3, "a", lim).unwrap(), "a  ");
+        assert_eq!(fit_pad_char_length(&c3, "日", lim).unwrap(), "日  ");
+        assert_eq!(fit_pad_char_length(&c3, "abc", lim).unwrap(), "abc");
+        assert_eq!(fit_pad_char_length(&c3, "ab    ", lim).unwrap(), "ab ");
+        assert_eq!(fit_pad_char_length(&c3, "", lim).unwrap(), "   ");
+        assert!(fit_pad_char_length(&c3, "abcd", lim).is_err());
+        // 空白を足さない（n 文字ちょうど）が上限を超える値も 54000 相当で拒否する。
+        let c1 = ColumnType::Bpchar(1);
+        let e = fit_pad_char_length(&c1, "日", 2).unwrap_err();
+        assert!(e.pad_limit);
+        assert_eq!(fit_pad_char_length(&c1, "a", 1).unwrap(), "a");
+        // 詰め後が上限を超える場合は確保せずに 54000 相当で拒否する。
+        let big = ColumnType::Bpchar(MAX_TEXT_FIELD_LEN + 1);
+        let e = fit_pad_char_length(&big, "a", lim).unwrap_err();
+        assert!(matches!(
+            crate::sql::allowlist::SqlSurfaceError::from(e),
+            crate::sql::allowlist::SqlSurfaceError::PayloadTooLarge { .. }
+        ));
+        // CHAR 以外は素通し（VARCHAR は詰めない）。
+        assert_eq!(
+            fit_pad_char_length(&ColumnType::Varchar(Some(5)), "a", lim).unwrap(),
+            "a"
+        );
+    }
+
+    /// `fit_char_length`（TABLE-31・Issue #1564）: 境界・マルチバイト・空白切り詰め・素通し。
+    #[test]
+    fn fit_char_length_rules() {
+        let v3 = ColumnType::Varchar(Some(3));
+        assert_eq!(fit_char_length(&v3, "abc"), Ok("abc"));
+        assert_eq!(fit_char_length(&v3, "日本語"), Ok("日本語"));
+        assert!(fit_char_length(&v3, "日本語x").is_err());
+        assert_eq!(fit_char_length(&v3, "abc   "), Ok("abc"));
+        assert_eq!(fit_char_length(&v3, "ab  "), Ok("ab "));
+        assert!(fit_char_length(&v3, "ab c").is_err());
+        assert!(fit_char_length(&v3, "abc\t").is_err());
+        assert!(fit_char_length(&v3, "abc\u{3000}").is_err());
+        assert_eq!(
+            fit_char_length(&ColumnType::Text, "abcdefgh"),
+            Ok("abcdefgh")
+        );
+        assert_eq!(
+            fit_char_length(&ColumnType::Varchar(None), "abcdefgh"),
+            Ok("abcdefgh")
+        );
+        let e = fit_char_length(&ColumnType::Bpchar(2), "abc").unwrap_err();
+        assert_eq!(e.to_string(), "value too long for type character(2)");
+        let e = fit_char_length(&v3, "secret").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "value too long for type character varying(3)"
+        );
+    }
 
     fn text_vector_schema() -> TableSchema {
         TableSchema::new(

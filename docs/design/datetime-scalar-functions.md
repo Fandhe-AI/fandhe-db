@@ -107,14 +107,26 @@ builtin_name` に追加する（`round` と同じ流儀）。
 
 ### NOW() と決定性
 
-現在時刻系（`now`・`current_timestamp`・`current_date`・`localtimestamp`
-等）は実装しない。呼び出しは未知の関数として `42883` になる（Issue #1186）。これらの
-名前は UDF 予約名にも**しない**（PR #1107 の codex 是正を維持。組み込み
-関数はすべて純粋関数で時計を読まないため、`now` という名前の UDF があっても
-決定性は崩れない）。
+現在時刻関数は Issue #1586（SQL-37）で読み取り文に実装した（従来は未知の関数として `42883`。
+Issue #1186）。設計は [now-evaluated-value-ledger.md](now-evaluated-value-ledger.md)。
 
-> 改訂注記: SQL-37 の改訂で、これらは受理する方針へ変更された。設計は
-> [now-evaluated-value-ledger.md](now-evaluated-value-ledger.md)、実装は #1586・#1587・#2188。
+- 受理する形: `now()`・`transaction_timestamp()`・`statement_timestamp()`・`clock_timestamp()`・
+  `CURRENT_TIMESTAMP[(p)]`・`LOCALTIMESTAMP[(p)]`・`CURRENT_DATE`。戻り値型は暫定で
+  `TIMESTAMP`／`DATE`（UTC マイクロ秒。TIMESTAMPTZ 実装時に切り替える）。
+- 評価時点: `now()`・`transaction_timestamp()`・`CURRENT_*`・`LOCALTIMESTAMP` はトランザクション開始時刻
+  （autocommit では文の開始時刻）、`statement_timestamp()` は文の開始時刻で、いずれも**束縛時の定数**に
+  する。`clock_timestamp()` だけは定数化・畳み込みをせず、評価のたびに壁時計を読む。
+- 予約名（BREAKING）: `now`・`transaction_timestamp`・`statement_timestamp`・`clock_timestamp` は組み込み
+  として予約し、同名 UDF の定義は `42723`。`random` 等の未実装の非決定的関数名は予約しない。
+- 受理範囲: 時計を確定するのは読み取り文（SELECT・集計・FROM なし SELECT・EXPLAIN・JOIN 等と Describe）の
+  入口だけ（許可リスト型）。INSERT VALUES・原子版 UPDATE SET・述語形 UPDATE／DELETE（原子版）・CHECK・
+  CREATE VIEW 本文・カーソル・NoSQL は拒否する（定数式・CHECK・VIEW は `42601`、束縛段は `0A000`）。
+  例外（Issue #1587）: 列の `DEFAULT now()` 系（`CREATE TABLE`。INSERT・UPSERT・COPY の省略列へ適用）と、
+  分割実行 DML の SET・WHERE（トランザクション固定の関数のみ）。台帳 v3 を要する書き込み側の残り
+  （INSERT VALUES 内の式・原子版 UPDATE SET・`statement_timestamp()`／`clock_timestamp()` の書き込み）は
+  #2188 の実装後に受理する。
+- `CURRENT_TIME`・`LOCALTIME` は TIME 型が未実装のため `0A000`。引用付き識別子（`"current_date"`）は
+  従来どおり列参照。
 
 ### UDF 予約名
 

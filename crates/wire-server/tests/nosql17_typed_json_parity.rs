@@ -44,6 +44,8 @@ use wire_server::http::session::store::SessionStore;
 
 const NOSQL_TABLE: &str = "docs_nosql";
 const SQL_TABLE: &str = "docs_sql";
+const VARCHAR_TABLE: &str = "docs_vc";
+const CHAR_TABLE: &str = "docs_ch";
 
 /// 新型を全て含むスキーマ（`docs_nosql`・`docs_sql` で同一定義）。
 fn schema(name: &str) -> TableSchema {
@@ -140,6 +142,24 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     storage
         .create_table(&schema(SQL_TABLE))
         .expect("create sql table");
+    storage
+        .create_table(&TableSchema::new(
+            VARCHAR_TABLE,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("vc", ColumnType::Varchar(Some(3)), true),
+            ],
+        ))
+        .expect("create varchar table");
+    storage
+        .create_table(&TableSchema::new(
+            CHAR_TABLE,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("ch", ColumnType::Bpchar(3), true),
+            ],
+        ))
+        .expect("create char table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     (Arc::new(core), guard)
 }
@@ -1199,4 +1219,90 @@ fn smallint_binding_matches_sql() {
         );
         assert!(body.contains(&format!("[[{expected}]")), "{filter}: {body}");
     }
+}
+
+/// `VARCHAR(n)` 列への NoSQL `insert`／`update` の長さ超過は `22001`（HTTP 400）で副作用なし。
+/// 超過部分が半角空白のみなら n 文字へ切り詰めて受理する（TABLE-31・Issue #1564）。
+#[test]
+fn varchar_over_length_is_22001_and_trailing_spaces_are_truncated() {
+    let (core, _g) = new_core();
+    let addr = spawn(Arc::clone(&core));
+    let ins = |id: u64, v: &str, op: &str| {
+        alice(
+            addr,
+            &format!(
+                r#"{{"op":"insert","table":"{VARCHAR_TABLE}","rows":[{{"id":{id},"embedding":[0.5,0.25],"vc":"{v}"}}],"operation_id":"{op}"}}"#
+            ),
+        )
+    };
+    let resp = ins(1, "abcd", "vc-1");
+    assert_eq!(http_common::wire_code_of(&resp), "22001", "{resp:?}");
+    assert_eq!(resp.status, 400, "{resp:?}");
+    assert!(!body_utf8(&resp).contains("abcd"), "{resp:?}");
+    assert_eq!(ins(2, "abc  ", "vc-2").status, 200);
+    let upd = |v: &str, op: &str| {
+        alice(
+            addr,
+            &format!(
+                r#"{{"op":"update","table":"{VARCHAR_TABLE}","set":{{"vc":"{v}"}},"where":{{"id":2}},"operation_id":"{op}"}}"#
+            ),
+        )
+    };
+    let resp = upd("wxyz", "vc-3");
+    assert_eq!(http_common::wire_code_of(&resp), "22001", "{resp:?}");
+    assert_eq!(resp.status, 400, "{resp:?}");
+    assert_eq!(upd("xyz ", "vc-4").status, 200);
+    let scan = body_utf8(&alice(
+        addr,
+        &format!(r#"{{"op":"scan","table":"{VARCHAR_TABLE}","columns":["id","vc"],"limit":10}}"#),
+    ));
+    assert!(scan.contains("xyz") && !scan.contains("abc"), "{scan}");
+}
+
+/// `CHAR(n)` 列への NoSQL 書き込みは n 文字へ空白詰めして保存され、filter の eq／in／範囲は
+/// 末尾の半角空白を無視して SQL と同じ結果になる（TABLE-31・Issue #1566）。
+#[test]
+fn char_column_is_padded_and_filters_ignore_trailing_spaces() {
+    let (core, _g) = new_core();
+    let addr = spawn(Arc::clone(&core));
+    let ins = |id: u64, v: &str, op: &str| {
+        alice(
+            addr,
+            &format!(
+                r#"{{"op":"insert","table":"{CHAR_TABLE}","rows":[{{"id":{id},"embedding":[0.5,0.25],"ch":"{v}"}}],"operation_id":"{op}"}}"#
+            ),
+        )
+    };
+    assert_eq!(ins(1, "a", "ch-1").status, 200);
+    assert_eq!(ins(2, "b", "ch-2").status, 200);
+    let resp = ins(3, "abcd", "ch-3");
+    assert_eq!(http_common::wire_code_of(&resp), "22001", "{resp:?}");
+    let scan = |filter: &str| {
+        body_utf8(&alice(
+            addr,
+            &format!(
+                r#"{{"op":"scan","table":"{CHAR_TABLE}","columns":["id","ch"],"filter":[{filter}],"limit":10}}"#
+            ),
+        ))
+    };
+    let all = scan(r#"{"column":"ch","op":"in","value":["a","b"]}"#);
+    assert!(all.contains("a  ") && all.contains("b  "), "{all}");
+    for lit in ["a", "a  ", "a "] {
+        let body = scan(&format!(r#"{{"column":"ch","op":"eq","value":"{lit}"}}"#));
+        assert!(
+            body.contains("a  ") && !body.contains("b  "),
+            "{lit:?}: {body}"
+        );
+    }
+    let body = scan(r#"{"column":"ch","op":"lt","value":"b"}"#);
+    assert!(body.contains("a  ") && !body.contains("b  "), "{body}");
+    let upd = alice(
+        addr,
+        &format!(
+            r#"{{"op":"update","table":"{CHAR_TABLE}","set":{{"ch":"z"}},"where":{{"id":1}},"operation_id":"ch-4"}}"#
+        ),
+    );
+    assert_eq!(upd.status, 200, "{upd:?}");
+    let body = scan(r#"{"column":"ch","op":"eq","value":"z "}"#);
+    assert!(body.contains("z  "), "{body}");
 }

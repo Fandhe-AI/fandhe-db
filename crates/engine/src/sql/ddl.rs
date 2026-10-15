@@ -142,9 +142,14 @@ pub(crate) fn execute_create_table(
     // 不正リテラル等を永続化前に SQLSTATE 付きで拒否する）。
     for column in &columns {
         if let Some(default) = &column.default {
-            crate::sql::parser::bind_column_default(column, default)?;
+            // 時刻 DEFAULT は評価せず（型適合は構文段・`validate_schema` が検査済み）、
+            // `bind_column_default` へ流さない（あちらは定数 DEFAULT 専用）。
+            if !matches!(default, ColumnDefault::CurrentTime(_)) {
+                crate::sql::parser::bind_column_default(column, default)?;
+            }
         }
     }
+    reject_time_default_set_default(&columns, &validated.foreign_keys)?;
     let mut schema = TableSchema::new(validated.table_name.clone(), columns);
     // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`validated.primary_key` は
     // `sql::allowlist::finalize_primary_key` が `id` 単独宣言を `None` へ既に
@@ -625,7 +630,12 @@ pub(crate) fn execute_alter_table_add_foreign_key(
     stmt: &crate::sql::allowlist::ValidatedAlterTableAddForeignKey,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     match storage.get_table_schema(&stmt.table_name) {
-        Ok(_) => {}
+        Ok(schema) => {
+            reject_time_default_set_default(
+                &schema.columns,
+                std::slice::from_ref(&stmt.foreign_key),
+            )?;
+        }
         Err(CatalogError::TableNotFound(_)) => {
             return Err(undefined_table_or_view(storage, &stmt.table_name));
         }
@@ -761,7 +771,8 @@ pub(crate) fn execute_alter_table_drop_column(
 /// 未登録 ENUM は `42601`）→ `catalog::Storage::alter_table_alter_column_type`
 /// （単一 write txn 内で NUMERIC 範囲検証〔`42601`〕→ 列・型互換性判定〔`42804`〕→
 /// 拡大変換なら全テナント既存行の再エンコード〔Issue #1361。PK／UNIQUE／FK 列も受理し
-/// 索引を失効させる。Issue #1402〕）。
+/// 索引を失効させる。Issue #1402〕。文字列系の縮小・`CHAR(n)` 変換は超過行を `22001`・重複を
+/// `23505`・FK 違反を `23503`／`42804` で拒否し表は不変。Issue #1567））。
 pub(crate) fn execute_alter_table_alter_column_type(
     storage: &Storage,
     stmt: &ValidatedAlterTableAlterColumnType,
@@ -978,6 +989,50 @@ fn resolve_enum_type(
     })
 }
 
+/// 時刻 DEFAULT 列を `ON DELETE／UPDATE SET DEFAULT` の対象にする FK 宣言を `0A000` で
+/// 拒否する（SQL-37・Issue #1587、設計 D9。連鎖更新は台帳へ記録する主体の文が無く、
+/// 評価時刻を再送で再現できないため fail-closed）。`CREATE TABLE`・`ALTER TABLE ADD FOREIGN
+/// KEY` の両方が呼ぶ。参照元列が存在しない場合は後段の検証が従来どおり判定するため無視する。
+fn reject_time_default_set_default(
+    columns: &[ColumnDef],
+    foreign_keys: &[crate::catalog::ForeignKeyDef],
+) -> Result<(), SqlSurfaceError> {
+    for fk in foreign_keys {
+        if !fk.uses_set_default() {
+            continue;
+        }
+        let has_time_default = fk.columns().iter().any(|name| {
+            columns.iter().any(|c| {
+                &c.name == name && matches!(c.default, Some(ColumnDefault::CurrentTime(_)))
+            })
+        });
+        if has_time_default {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "SET DEFAULT referential action on a column with a time function DEFAULT is not supported".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// 時刻値関数の `DEFAULT`（`DEFAULT now()` 系。SQL-37・TABLE-16・Issue #1587）を
+/// 列型との適合だけ検査して [`ColumnDefault::CurrentTime`] にする（評価しない。評価は
+/// INSERT の省略列補完のみ）。`TIMESTAMP` 系関数は `TIMESTAMP` 列、`CURRENT_DATE` は
+/// `DATE` 列に限る。不一致は定数 DEFAULT の型不一致と同じ `42601`。
+pub(crate) fn time_column_default(
+    column_name: &str,
+    ty: &ColumnType,
+    time: crate::catalog::TimeDefault,
+) -> Result<ColumnDefault, SqlSurfaceError> {
+    if time.compatible_with(ty) {
+        Ok(ColumnDefault::CurrentTime(time))
+    } else {
+        Err(SqlSurfaceError::unsupported(format!(
+            "column {column_name:?} DEFAULT time function does not match the column type"
+        )))
+    }
+}
+
 /// `ADD COLUMN` の `DEFAULT` リテラルを列型に応じた [`ColumnDefault`] へ変換する
 /// （`CREATE TABLE` の列 DEFAULT と同じ規則。Issue #1169）。DEFAULT 非対応の列型
 /// （VECTOR 等）は `0A000`、対応型でリテラル種別が合わない場合は `42601`、
@@ -988,7 +1043,7 @@ pub(crate) fn add_column_default(
     literal: &InsertLiteral,
 ) -> Result<ColumnDefault, SqlSurfaceError> {
     let kind = match ty {
-        ColumnType::Text | ColumnType::Varchar(_) => "text",
+        ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => "text",
         ColumnType::SmallInt
         | ColumnType::Integer
         | ColumnType::BigInt
@@ -1038,7 +1093,15 @@ pub(crate) fn add_column_default(
             if s.len() > MAX_COLUMN_DEFAULT_LEN {
                 return Err(default_too_long(column_name));
             }
-            Ok(ColumnDefault::Text(s.clone()))
+            // `VARCHAR(n)` の既定値は定義時に n 文字へ収める（超過は `22001` で DDL を拒否。
+            // 超過部分が半角空白のみなら切り詰めて保存する。TABLE-31・Issue #1564）。
+            // PostgreSQL は INSERT 時に判定するが、ADD COLUMN では既存行が既定値を読むため
+            // 格納不変条件を保つ目的で定義時に fail-closed とする。
+            // `CHAR(n)` の既定値は n 文字へ詰めた形で保持する（読み出し時補完が借用で返せる
+            // よう、保持値＝格納形とする。詰め後の長さも上限で検査し、n が確保量を決めない。
+            // TABLE-31・Issue #1566）。
+            let stored = crate::row_codec::fit_pad_char_length(ty, s, MAX_COLUMN_DEFAULT_LEN)?;
+            Ok(ColumnDefault::Text(stored.into_owned()))
         }
         // `JSONB` は DDL 時に正規化した形で保持する（読み出し時補完が借用で返せるよう、
         // 保持値＝格納形とする。Issue #1337）。エラー文言に値は含めない。

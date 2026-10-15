@@ -19,8 +19,8 @@ use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::relation::{ColumnRef, TableRef};
 use crate::sql::udf_call::{
-    BinOp, Expr, JsonAccessOp, MAX_CALL_ARGS, MAX_CASE_BRANCHES, MAX_CASE_NESTING, MAX_EXPR_DEPTH,
-    MAX_EXPR_NODES, MAX_UDF_PARAMS,
+    BinOp, Expr, JsonAccessOp, ValueFunctionKind, MAX_CALL_ARGS, MAX_CASE_BRANCHES,
+    MAX_CASE_NESTING, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_UDF_PARAMS,
 };
 use crate::sql::using_operation_id::OperationId;
 use crate::sql::where_negation::negate_conjunction;
@@ -212,10 +212,24 @@ fn is_where_group_operator_token(token: &Token) -> bool {
             | Token::Punct('-')
             | Token::Punct('*')
             | Token::Punct('/')
-            | Token::Arrow
+    ) || is_json_operator_token(token)
+}
+
+/// jsonb 演算子のトークン（パス取得 `-> ->> #> #>>`・包含 `@> <@`・存在 `? ?| ?&`。
+/// TABLE-25。Issue #1596・#1598）かどうか。式の中置演算子ループ
+/// （[`Parser::parse_json_access_rest`]）の続きを判定する先読みが共有する。
+fn is_json_operator_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Arrow
             | Token::ArrowText
             | Token::HashArrow
             | Token::HashArrowText
+            | Token::JsonContains
+            | Token::JsonContainedBy
+            | Token::JsonExists
+            | Token::JsonExistsAny
+            | Token::JsonExistsAll
     )
 }
 
@@ -448,6 +462,9 @@ pub enum SqlSurfaceError {
     /// 非有限値・次元不一致、`LIMIT` 範囲外、hybrid の 2 引数形（実行不能）等。ERR-2:
     /// `22000`）。
     InvalidInput { detail: String },
+    /// `VARCHAR(n)`／`CHAR(n)` 列への書き込みで文字数が n を超えた（`22001`。TABLE-31・
+    /// ERR-6・Issue #1564）。`detail` は型と n だけの固定文言で、値・行・テナントを含めない。
+    StringDataRightTruncation { detail: String },
     /// 定数式 SELECT（`sql::const_select`）の負の `LIMIT`／`OFFSET`（`22000`。Issue #2329）。
     /// `InvalidInput` と同じ分類だが、`docs/design/sql-from-less-select.md` の固定文言
     /// （`LIMIT must not be negative`／`OFFSET must not be negative`）を接頭辞なしで
@@ -840,6 +857,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: 文字列書き込み経路の長さ超過（`22001`。Issue #1564）を報告する。
+    /// `detail` は [`crate::row_codec::CharLengthExceeded`] の固定文言（値を含まない）。
+    pub(crate) fn string_data_right_truncation(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::StringDataRightTruncation {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::const_select::execute` が負の `LIMIT`／`OFFSET`（`22000`）を
     /// 固定文言で報告するために使う（Issue #2329）。
     pub(crate) fn negative_row_count(clause: &'static str) -> Self {
@@ -1004,6 +1029,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InvalidInput { .. } | SqlSurfaceError::NegativeRowCount { .. } => {
                 ErrorClass::InvalidInput
             }
+            SqlSurfaceError::StringDataRightTruncation { .. } => {
+                ErrorClass::StringDataRightTruncation
+            }
             SqlSurfaceError::CardinalityViolation => ErrorClass::CardinalityViolation,
             SqlSurfaceError::PayloadTooLarge { .. } => ErrorClass::PayloadTooLarge,
             SqlSurfaceError::MissingOperationId => ErrorClass::MissingOperationId,
@@ -1078,6 +1106,7 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::UndefinedTable { name } => write!(f, "undefined table: {name}"),
             SqlSurfaceError::Internal { detail } => write!(f, "internal error: {detail}"),
             SqlSurfaceError::InvalidInput { detail } => write!(f, "invalid input: {detail}"),
+            SqlSurfaceError::StringDataRightTruncation { detail } => write!(f, "{detail}"),
             SqlSurfaceError::NegativeRowCount { clause } => {
                 write!(f, "{clause} must not be negative")
             }
@@ -2815,6 +2844,10 @@ impl ValidatedScan {
 struct ColumnConstraints {
     not_null: bool,
     default: Option<InsertLiteral>,
+    /// 時刻値関数の `DEFAULT`（`DEFAULT now()` 系。SQL-37・TABLE-16・Issue #1587）。
+    /// `default`（定数リテラル）とは排他。`CREATE TABLE` だけが受理し、
+    /// `ALTER TABLE ADD COLUMN` は `0A000`（設計 D10）。
+    time_default: Option<crate::catalog::TimeDefault>,
     unique: bool,
     /// 列制約 `CONSTRAINT <name> UNIQUE` の明示名（TABLE-22。Issue #1428）。
     unique_name: Option<String>,
@@ -4006,6 +4039,17 @@ impl<'a> Parser<'a> {
     /// 文字列リテラル始まり・`NULL` 等は式トリガーに含めない（従来どおり `42601`）。
     /// 関数始まりは頭を従来と同じ深さで読み、直後が算術演算子のときだけ中置式へ継続する
     /// ため、`MAX_EXPR_DEPTH` 境界の既存入力の挙動は変わらない。
+    /// `pos` のトークンが**引用されていない**括弧なし SQL 値関数の予約語か
+    /// （SQL-37・Issue #1586。`parse_primary_expr` の生成条件と同一）。
+    fn is_value_function_keyword_at(&self, pos: usize) -> bool {
+        matches!(
+            self.tokens.get(pos),
+            Some(Token::Ident(name))
+                if !self.quoted_null.contains(&pos)
+                    && ValueFunctionKind::from_keyword(name).is_some()
+        )
+    }
+
     fn parse_select_item(&mut self) -> Result<SelectItem, SqlSurfaceError> {
         let mut is_extract_syntax = false;
         let expr = match self.peek().cloned() {
@@ -4015,17 +4059,11 @@ impl<'a> Parser<'a> {
                 let starts_case =
                     name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
                 let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
-                let next_is_op = matches!(
-                    self.tokens.get(self.pos + 1),
-                    Some(
-                        Token::Punct('+' | '-' | '*' | '/')
-                            | Token::Arrow
-                            | Token::ArrowText
-                            | Token::HashArrow
-                            | Token::HashArrowText
-                    )
-                );
-                if starts_case {
+                let next_is_op = self.tokens.get(self.pos + 1).is_some_and(|t| {
+                    matches!(t, Token::Punct('+' | '-' | '*' | '/')) || is_json_operator_token(t)
+                });
+                if starts_case || self.is_value_function_keyword_at(self.pos) {
+                    // 括弧なし SQL 値関数（SQL-37・Issue #1586）は列名ではなく式項目。
                     self.parse_projection_infix(0)?
                 } else if starts_call {
                     is_extract_syntax = name.eq_ignore_ascii_case("extract");
@@ -4037,16 +4075,10 @@ impl<'a> Parser<'a> {
                     let head = self.parse_call_expr(name, 0);
                     self.allow_unary_minus = prev;
                     let head = head?;
-                    if matches!(
-                        self.peek(),
-                        Some(
-                            Token::Punct('+' | '-' | '*' | '/')
-                                | Token::Arrow
-                                | Token::ArrowText
-                                | Token::HashArrow
-                                | Token::HashArrowText
-                        )
-                    ) {
+                    if self.peek().is_some_and(|t| {
+                        matches!(t, Token::Punct('+' | '-' | '*' | '/'))
+                            || is_json_operator_token(t)
+                    }) {
                         // `parse_value_expr(0)` と同じ段位（add=0・mul=1・primary=2）で継続する。
                         self.allow_unary_minus = true;
                         let r = self
@@ -5098,7 +5130,7 @@ impl<'a> Parser<'a> {
             } else {
                 // 裸の `NOT <式比較>`（`NOT id > 1`・`NOT (id + 1) > 5`）。頂点の比較を
                 // 反転して葉へ押し下げる。
-                let expr = self.parse_comparison_expr()?;
+                let expr = self.parse_expression_predicate()?;
                 let pred = vec![WherePredicate::Expression(expr)];
                 if negate_odd {
                     negate_conjunction(pred, &mut self.expr_node_budget)?
@@ -5107,7 +5139,9 @@ impl<'a> Parser<'a> {
                 }
             }
         } else {
-            vec![WherePredicate::Expression(self.parse_comparison_expr()?)]
+            vec![WherePredicate::Expression(
+                self.parse_expression_predicate()?,
+            )]
         };
         *leaf_count = leaf_count.checked_add(1).ok_or_else(|| {
             SqlSurfaceError::payload_too_large("WHERE predicate leaf count overflow")
@@ -5161,9 +5195,19 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `<値式> <比較演算子> <値式>`（式述語。頂点は必ず比較の [`Expr::Binary`]）。
-    fn parse_comparison_expr(&mut self) -> Result<Expr, SqlSurfaceError> {
+    /// WHERE の式述語の葉。通常は `<値式> <比較演算子> <値式>`（頂点は比較の [`Expr::Binary`]）だが、
+    /// 頂点が jsonb の包含・存在演算子（`@>` `<@` `?` `?|` `?&`。TABLE-25・Issue #1598）
+    /// の式なら比較演算子なしの裸の述語として受理する（それらは bool を返すため）。
+    /// 述語でない式が比較を伴わない場合は従来と同じ `42601`。`NOT` 付きは呼び出し元の
+    /// 否定押し下げ（`where_negation`）が `Expression(_)` を `42601` で拒否する（fail-closed。
+    /// 三値論理で fail-open にしない）。
+    fn parse_expression_predicate(&mut self) -> Result<Expr, SqlSurfaceError> {
         let lhs = self.parse_value_expr(0)?;
+        if let Expr::JsonAccess { op, .. } = &lhs {
+            if op.is_predicate() && !self.peek_is_cmp_op() {
+                return Ok(lhs);
+            }
+        }
         let op = self.expect_cmp_op()?;
         let rhs = self.parse_value_expr(0)?;
         Ok(Expr::Binary {
@@ -5351,6 +5395,11 @@ impl<'a> Parser<'a> {
         }) else {
             return Ok(None);
         };
+        // 引用なしの SQL 値関数予約語（`CURRENT_DATE = ...` 等。SQL-37・Issue #1586）は
+        // 列名付きの確定形ではなく式なので、式述語フォールバックへ渡す。
+        if self.is_value_function_keyword_at(self.pos) {
+            return Ok(None);
+        }
         if name.eq_ignore_ascii_case("EXISTS")
             && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
             && matches!(
@@ -5747,6 +5796,14 @@ impl<'a> Parser<'a> {
         Ok((low, high))
     }
 
+    /// 次のトークンが [`Self::expect_cmp_op`] の受理する比較演算子かどうか（消費しない）。
+    fn peek_is_cmp_op(&self) -> bool {
+        matches!(
+            self.peek(),
+            Some(Token::Punct('>' | '<' | '=') | Token::Ge | Token::Le)
+        )
+    }
+
     /// 比較演算子トークン（`> < >= <= =`）を消費して [`BinOp`] へ写像する
     /// （TASK-79・SQL-9）。
     fn expect_cmp_op(&mut self) -> Result<BinOp, SqlSurfaceError> {
@@ -5783,8 +5840,8 @@ impl<'a> Parser<'a> {
         self.parse_json_access_rest(lhs, depth)
     }
 
-    /// jsonb パス演算子 `->` `->>` `#>` `#>>` のループ（対象ビヘイビア: TABLE-25。
-    /// Issue #1596）。PostgreSQL の優先順位表で「その他の演算子」の段にあたり、加減算
+    /// jsonb 演算子（パス取得 `->` `->>` `#>` `#>>`・包含 `@>` `<@`・存在 `?` `?|` `?&`）の
+    /// ループ（対象ビヘイビア: TABLE-25。Issue #1596・#1598）。PostgreSQL の優先順位表で「その他の演算子」の段にあたり、加減算
     /// （[`Self::parse_add_expr`]）より弱く比較より強い。左結合のため
     /// `a -> 'x' ->> 'y'` は `(a -> 'x') ->> 'y'`、`a -> 1 + 1` は `a -> (1 + 1)`。
     /// 左辺を解析済みの状態から継続できるよう [`Self::parse_add_rest`] と同じく分離している
@@ -5801,12 +5858,16 @@ impl<'a> Parser<'a> {
                 Some(Token::ArrowText) => JsonAccessOp::GetText,
                 Some(Token::HashArrow) => JsonAccessOp::Path,
                 Some(Token::HashArrowText) => JsonAccessOp::PathText,
+                Some(Token::JsonContains) => JsonAccessOp::Contains,
+                Some(Token::JsonContainedBy) => JsonAccessOp::ContainedBy,
+                Some(Token::JsonExists) => JsonAccessOp::Exists,
+                Some(Token::JsonExistsAny) => JsonAccessOp::ExistsAny,
+                Some(Token::JsonExistsAll) => JsonAccessOp::ExistsAll,
                 _ => break,
             };
             if self.in_check_body {
                 return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "JSON path operators are not supported in a CHECK constraint"
-                        .to_string(),
+                    detail: "JSON operators are not supported in a CHECK constraint".to_string(),
                 });
             }
             self.advance();
@@ -6017,6 +6078,58 @@ impl<'a> Parser<'a> {
                         Err(DateTimeLiteralError::Overflow(detail)) => {
                             Err(SqlSurfaceError::datetime_field_overflow(detail))
                         }
+                    }
+                }
+            }
+            // SQL-37（Issue #1586）: 括弧なし SQL 値関数（`CURRENT_TIMESTAMP`・`CURRENT_DATE`・
+            // `LOCALTIMESTAMP` 等）。**引用されていない**識別子の予約語一致だけで生成する
+            // （`quoted_null` に位置が残る引用付き識別子は列参照のまま）。精度形 `KW(p)` は
+            // 括弧内が整数リテラル 1 個のときだけ（それ以外の `KW(...)` は従来どおり関数呼び出し
+            // として解析し、同名 UDF の呼び出し形を壊さない）。
+            Some(Token::Ident(name))
+                if !self.quoted_null.contains(&self.pos)
+                    && ValueFunctionKind::from_keyword(&name).is_some() =>
+            {
+                let Some(kind) = ValueFunctionKind::from_keyword(&name) else {
+                    return Err(SqlSurfaceError::unsupported("unsupported expression term"));
+                };
+                let precision = match (
+                    self.tokens.get(self.pos + 1),
+                    self.tokens.get(self.pos + 2),
+                    self.tokens.get(self.pos + 3),
+                ) {
+                    (Some(Token::Punct('(')), Some(Token::Number(n)), Some(Token::Punct(')')))
+                        if kind.accepts_precision() =>
+                    {
+                        // 範囲外・非整数の数値トークン（`256`・`6.0` 等）も精度引数として扱い、
+                        // 0..=255 の範囲外精度（束縛時の 22023）と同じ分類へ揃える。
+                        match n.parse::<u8>() {
+                            Ok(p) => Some(Some(p)),
+                            Err(_) => {
+                                return Err(SqlSurfaceError::InvalidParameterValue {
+                                    detail: "timestamp precision must be between 0 and 6",
+                                });
+                            }
+                        }
+                    }
+                    (Some(Token::Punct('(')), _, _) => None,
+                    _ => Some(None),
+                };
+                match precision {
+                    Some(precision) => {
+                        self.advance();
+                        if precision.is_some() {
+                            // `(` Number `)` の 3 トークンを消費する。
+                            self.advance();
+                            self.advance();
+                            self.advance();
+                        }
+                        self.consume_expr_node()?;
+                        Ok(Expr::ValueFunction { kind, precision })
+                    }
+                    None => {
+                        self.advance();
+                        self.parse_call_expr(name, depth)
                     }
                 }
             }
@@ -6429,6 +6542,10 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(Token::Ident(name)) => {
                 if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") {
+                    return true;
+                }
+                // 引用なしの括弧なし SQL 値関数（SQL-37・Issue #1586）は式キー。
+                if self.is_value_function_keyword_at(self.pos) {
                     return true;
                 }
                 // Issue #1597: `ORDER BY docb -> 'k'` のように識別子の直後に jsonb パス演算子が
@@ -7542,6 +7659,14 @@ impl<'a> Parser<'a> {
                         "UNIQUE is not supported in ALTER TABLE ADD COLUMN",
                     ));
                 }
+                // 時刻値関数の DEFAULT は既存行の補完値を固定できないため拒否する
+                // （fail-closed。設計 D10・SQL-37・Issue #1587）。
+                if constraints.time_default.is_some() {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "time function DEFAULT is not supported in ALTER TABLE ADD COLUMN"
+                            .to_string(),
+                    });
+                }
                 // `DEFAULT` を欠く `NOT NULL` は行の有無にかかわらず `42601` で拒否する
                 // （TABLE-16）。`NOT NULL DEFAULT NULL` は既定値なしに正規化されるため
                 // ここで同じく拒否される（Issue #1524・fail-closed）。カタログ・行を参照しない構造判定のため、存在オラクル・
@@ -8138,7 +8263,7 @@ impl<'a> Parser<'a> {
         let column = if let ColumnType::Vector(_) = ty {
             // `VECTOR` は常に非 nullable。`NOT NULL` の明示指定は冗長だが受理する
             // （`constraints.not_null` の値に関わらず `nullable = false` のまま）。
-            if constraints.default.is_some() {
+            if constraints.default.is_some() || constraints.time_default.is_some() {
                 return Err(SqlSurfaceError::unsupported(format!(
                     "column {name:?}: VECTOR columns do not support DEFAULT"
                 )));
@@ -8154,9 +8279,13 @@ impl<'a> Parser<'a> {
             // （`sql::ddl::add_column_default`）に一本化する。配列は種別・長さのみ検査し（Issue #1374）、
             // リテラル種別の不一致は `42601`、長さ超過は `54000`。ENUM の語彙照合は
             // 実行段（`bind_column_default`）と `Storage::create_table` が行う。
-            let default = match &constraints.default {
-                None => None,
-                Some(literal) => Some(crate::sql::ddl::add_column_default(&name, &ty, literal)?),
+            let default = match (&constraints.default, constraints.time_default) {
+                (None, None) => None,
+                (Some(literal), _) => {
+                    Some(crate::sql::ddl::add_column_default(&name, &ty, literal)?)
+                }
+                // 時刻 DEFAULT は評価せず列型との適合だけを検査する（SQL-37・Issue #1587）。
+                (None, Some(t)) => Some(crate::sql::ddl::time_column_default(&name, &ty, t)?),
             };
             let mut column = ColumnDef::new(name, ty, !constraints.not_null);
             if let Some(default) = default {
@@ -8595,6 +8724,7 @@ impl<'a> Parser<'a> {
     fn parse_column_constraints(&mut self) -> Result<ColumnConstraints, SqlSurfaceError> {
         let mut not_null = false;
         let mut default: Option<InsertLiteral> = None;
+        let mut time_default: Option<crate::catalog::TimeDefault> = None;
         // `DEFAULT NULL` は `default` を `None` のまま残すため、重複検出は専用フラグで行う。
         let mut seen_default = false;
         let mut unique = false;
@@ -8639,6 +8769,12 @@ impl<'a> Parser<'a> {
                     return Err(SqlSurfaceError::unsupported("duplicate DEFAULT constraint"));
                 }
                 seen_default = true;
+                // 時刻値関数の DEFAULT（SQL-37・Issue #1587）。式全体がこの形のときだけ
+                // 受理し、複合式（`now() + ...`・CAST 等）は従来の定数式経路へ流して拒否する。
+                if let Some(t) = self.try_parse_time_default()? {
+                    time_default = Some(t);
+                    continue;
+                }
                 // `DEFAULT NULL` は既定値の宣言なしと同義（PostgreSQL も NULL 定数の
                 // 既定値は保存しない）。以降の束縛・カタログ・fast default は
                 // `InsertLiteral::Null` を受け取らない（Issue #1524・SQL-41）。
@@ -8653,9 +8789,108 @@ impl<'a> Parser<'a> {
         Ok(ColumnConstraints {
             not_null,
             default,
+            time_default,
             unique,
             unique_name,
         })
+    }
+
+    /// `DEFAULT` 直後が時刻値関数の単独形か判定し、そうなら消費して返す（SQL-37・
+    /// TABLE-16・Issue #1587）。受理: `now()`・`transaction_timestamp()`・
+    /// `CURRENT_TIMESTAMP[(p)]`・`LOCALTIMESTAMP[(p)]`・`CURRENT_DATE`。
+    /// `statement_timestamp()`・`clock_timestamp()` は書き込み側が未対応のため `0A000`
+    /// （台帳 v3 の #2188 で扱う）。単独形でない場合（直後が演算子・`::` 等、引用付き識別子、
+    /// その他の識別子・関数）は何も消費せず `None` を返し、従来の定数式経路が
+    /// 従来どおりの SQLSTATE で判定する。精度は 0〜6 を構文段で検査する（範囲外は `22023`）。
+    fn try_parse_time_default(
+        &mut self,
+    ) -> Result<Option<crate::catalog::TimeDefault>, SqlSurfaceError> {
+        use crate::catalog::TimeDefault;
+        let pos = self.pos;
+        if self.quoted_null.contains(&pos) {
+            return Ok(None);
+        }
+        let Some(Token::Ident(name)) = self.tokens.get(pos) else {
+            return Ok(None);
+        };
+        let lower = name.to_ascii_lowercase();
+        let empty_call = matches!(
+            (self.tokens.get(pos + 1), self.tokens.get(pos + 2)),
+            (Some(Token::Punct('(')), Some(Token::Punct(')')))
+        );
+        let mut consumed = 0usize;
+        let mut parsed: Option<TimeDefault> = None;
+        if empty_call {
+            consumed = 3;
+            match lower.as_str() {
+                "now" => parsed = Some(TimeDefault::Now),
+                "transaction_timestamp" => parsed = Some(TimeDefault::TransactionTimestamp),
+                "statement_timestamp" | "clock_timestamp" => {
+                    // 末尾が単独形のときだけ 0A000。複合式は従来経路に任せる。
+                    if self.time_default_tail_is_terminal(pos + consumed) {
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "statement_timestamp() and clock_timestamp() are not \
+                                     supported as column DEFAULT"
+                                .to_string(),
+                        });
+                    }
+                    return Ok(None);
+                }
+                _ => consumed = 0,
+            }
+        }
+        if parsed.is_none() {
+            let Some(kind) = ValueFunctionKind::from_keyword(&lower) else {
+                return Ok(None);
+            };
+            let precision = match (
+                self.tokens.get(pos + 1),
+                self.tokens.get(pos + 2),
+                self.tokens.get(pos + 3),
+            ) {
+                (Some(Token::Punct('(')), Some(Token::Number(n)), Some(Token::Punct(')')))
+                    if kind.accepts_precision() =>
+                {
+                    consumed = 4;
+                    match n.parse::<u8>() {
+                        Ok(p) if p <= 6 => Some(p),
+                        _ => {
+                            return Err(SqlSurfaceError::InvalidParameterValue {
+                                detail: "timestamp precision must be between 0 and 6",
+                            })
+                        }
+                    }
+                }
+                (Some(Token::Punct('(')), _, _) => return Ok(None),
+                _ => {
+                    consumed = 1;
+                    None
+                }
+            };
+            parsed = match kind {
+                ValueFunctionKind::CurrentTimestamp => {
+                    Some(TimeDefault::CurrentTimestamp(precision))
+                }
+                ValueFunctionKind::LocalTimestamp => Some(TimeDefault::LocalTimestamp(precision)),
+                ValueFunctionKind::CurrentDate => Some(TimeDefault::CurrentDate),
+                // TIME 型は未実装のため従来の経路（0A000）に任せる。
+                ValueFunctionKind::CurrentTime | ValueFunctionKind::LocalTime => return Ok(None),
+            };
+        }
+        if !self.time_default_tail_is_terminal(pos + consumed) {
+            return Ok(None);
+        }
+        self.pos = pos + consumed;
+        Ok(parsed)
+    }
+
+    /// 時刻 DEFAULT の直後のトークンが「式の続き」でないか（`+ - * /`・`::`・`||`・
+    /// 比較演算子・`.` 付き等は続きとみなして `false`）。
+    fn time_default_tail_is_terminal(&self, at: usize) -> bool {
+        matches!(
+            self.tokens.get(at),
+            None | Some(Token::Punct(',' | ')' | ';')) | Some(Token::Ident(_))
+        )
     }
 
     /// `DROP TABLE <table> [;]` の単一テーブル形のみを受理する（SQL-23、
@@ -9342,7 +9577,11 @@ pub(crate) fn render_view_body(body: &ParsedViewBody) -> String {
     let mut out = String::from("SELECT ");
     match &body.projection {
         Projection::All => out.push('*'),
-        Projection::Columns(cols) => out.push_str(&cols.join(", ")),
+        Projection::Columns(cols) => {
+            // SQL 値関数予約語と同名の列は引用付きで保存する（SQL-37・Issue #1586）。
+            let rendered: Vec<String> = cols.iter().map(|c| render_column_name(c)).collect();
+            out.push_str(&rendered.join(", "));
+        }
         // `parse_view_body` が構造的に拒否するため到達しない。
         Projection::Items(_) => out.push('*'),
     }
@@ -9368,7 +9607,10 @@ fn escape_string_literal(s: &str) -> String {
 /// 列名をビュー正規化 SQL 用に描画する。`true`／`false` と大小無視で一致する列名は
 /// 引用付きで出力し、再解析時に真偽リテラル（Issue #1526）へ化けて意味が変わるのを防ぐ。
 fn render_column_name(column: &str) -> String {
-    if column.eq_ignore_ascii_case("true") || column.eq_ignore_ascii_case("false") {
+    if column.eq_ignore_ascii_case("true")
+        || column.eq_ignore_ascii_case("false")
+        || ValueFunctionKind::from_keyword(column).is_some()
+    {
         format!("\"{column}\"")
     } else {
         column.to_string()
@@ -10039,17 +10281,24 @@ pub(crate) fn looks_like_join(tokens: &[Token]) -> bool {
 /// `FROM` 直後（`idx`）から見て、`<ident> [[AS] <alias>] JOIN...` の並びかどうかを
 /// 判定する（[`looks_like_join`] 参照）。
 pub(super) fn from_clause_starts_join(tokens: &[Token], idx: usize) -> bool {
-    if !matches!(tokens.get(idx), Some(Token::Ident(_))) {
+    // 引用付きの値関数予約語名（`"current_date"` 等）は QuotedNull で残るため、
+    // 表名・別名位置では識別子として受理する（Issue #1586）。
+    if !matches!(
+        tokens.get(idx),
+        Some(Token::Ident(_) | Token::QuotedNull(_))
+    ) {
         return false;
     }
     let mut i = idx + 1;
     if matches!(tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("AS")) {
         i += 1;
-        if !matches!(tokens.get(i), Some(Token::Ident(_))) {
+        if !matches!(tokens.get(i), Some(Token::Ident(_) | Token::QuotedNull(_))) {
             return false;
         }
         i += 1;
-    } else if matches!(tokens.get(i), Some(Token::Ident(w)) if !is_join_reserved_word(w)) {
+    } else if matches!(tokens.get(i), Some(Token::QuotedNull(_)))
+        || matches!(tokens.get(i), Some(Token::Ident(w)) if !is_join_reserved_word(w))
+    {
         i += 1;
     }
     is_join_keyword_at(tokens, i)
@@ -11538,6 +11787,8 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_) => false,
+        // 括弧なし値関数（Issue #1586）は関数呼び出しと同様に従来形では書けない式。
+        Expr::ValueFunction { .. } => true,
     }
 }
 
@@ -13112,7 +13363,10 @@ pub fn validate_create_table_tokens(
 pub(crate) fn parse_check_predicate_text(
     sql: &str,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let mut tokens = lexer::tokenize(sql)?;
+    // 旧版は時刻キーワード名の列参照を引用なしで保存した。CHECK は値関数を禁止しているため、
+    // 保存本文中の未引用の予約語は旧形式の列参照として復元する（書き込み不能化を防ぐ）。
+    lexer::requote_legacy_value_function_columns(&mut tokens);
     let mut p = Parser::new(&tokens);
     let predicates = p.parse_where()?;
     p.expect_end_of_statement()?;
@@ -15136,6 +15390,63 @@ mod tests {
         assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
     }
 
+    /// Issue #1598（TABLE-25）: 包含・存在演算子は WHERE の裸の述語として受理され、
+    /// パス演算子と同じ優先順位・左結合で `AND`／`OR`・括弧と組み合わせられる。
+    #[test]
+    fn json_containment_operators_parse_as_bare_where_predicates() {
+        use crate::sql::udf_call::JsonAccessOp;
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        for (sql_op, expected) in [
+            ("@>", JsonAccessOp::Contains),
+            ("<@", JsonAccessOp::ContainedBy),
+            ("?", JsonAccessOp::Exists),
+            ("?|", JsonAccessOp::ExistsAny),
+            ("?&", JsonAccessOp::ExistsAll),
+        ] {
+            let preds = where_predicates_for(&format!(
+                "SELECT * FROM documents WHERE d {sql_op} 'x' {tail}"
+            ));
+            let [WherePredicate::Expression(Expr::JsonAccess { op, .. })] = preds.as_slice() else {
+                panic!("expected a bare predicate for {sql_op}, got {preds:?}");
+            };
+            assert_eq!(*op, expected);
+        }
+        // `d -> 'a' @> '1'` は `(d -> 'a') @> '1'`（同じ優先順位の左結合）。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE d -> 'a' @> '1' {tail}"
+        ));
+        let [WherePredicate::Expression(Expr::JsonAccess {
+            op: JsonAccessOp::Contains,
+            lhs,
+            ..
+        })] = preds.as_slice()
+        else {
+            panic!("unexpected shape {preds:?}");
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            Expr::JsonAccess {
+                op: JsonAccessOp::Get,
+                ..
+            }
+        ));
+        // AND・括弧との組み合わせ。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE (d ? 'a') AND lang = 'ja' {tail}"
+        ));
+        assert_eq!(preds.len(), 2);
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE (d -> 'a') ? 'b' {tail}"
+        ));
+        assert!(matches!(
+            preds.as_slice(),
+            [WherePredicate::Expression(Expr::JsonAccess {
+                op: JsonAccessOp::Exists,
+                ..
+            })]
+        ));
+    }
+
     /// Bugbot 指摘: 括弧付き値式の直後にパス演算子が続く `(d -> 'a') ->> 'b' = 'x'` が
     /// BOOLEAN グループと誤分類されず、括弧なしと同じ木になる（NOT 前置の経路も含む）。
     #[test]
@@ -16255,6 +16566,76 @@ mod tests {
         assert_eq!(parse("DEFAULT foo").unwrap_err().wire_code(), "42703");
     }
 
+    /// 時刻値関数の `DEFAULT`（SQL-37・TABLE-16・Issue #1587）。単独形だけを時刻 DEFAULT として
+    /// 受理し、複合式・入れ子・未対応の関数は従来どおり拒否する。
+    #[test]
+    fn time_function_default_accepts_only_standalone_forms() {
+        use crate::catalog::TimeDefault;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            Parser::new(&tokens).parse_column_constraints()
+        };
+        for (sql, expected) in [
+            ("DEFAULT now()", TimeDefault::Now),
+            ("DEFAULT NOW ( )", TimeDefault::Now),
+            (
+                "DEFAULT transaction_timestamp()",
+                TimeDefault::TransactionTimestamp,
+            ),
+            (
+                "DEFAULT CURRENT_TIMESTAMP",
+                TimeDefault::CurrentTimestamp(None),
+            ),
+            (
+                "DEFAULT current_timestamp(3)",
+                TimeDefault::CurrentTimestamp(Some(3)),
+            ),
+            ("DEFAULT LOCALTIMESTAMP", TimeDefault::LocalTimestamp(None)),
+            (
+                "DEFAULT LOCALTIMESTAMP(0)",
+                TimeDefault::LocalTimestamp(Some(0)),
+            ),
+            ("DEFAULT CURRENT_DATE", TimeDefault::CurrentDate),
+        ] {
+            let c = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert_eq!(c.time_default, Some(expected), "{sql}");
+            assert_eq!(c.default, None, "{sql}");
+        }
+        // 後続の列制約と共存できる。
+        let c = parse("DEFAULT now() NOT NULL UNIQUE").unwrap();
+        assert_eq!(c.time_default, Some(TimeDefault::Now));
+        assert!(c.not_null && c.unique);
+        // 精度 7 は 22023、複合式・CAST・未対応関数は拒否、TIME 系（型未実装）は従来どおり 42601。
+        assert_eq!(
+            parse("DEFAULT CURRENT_TIMESTAMP(7)")
+                .unwrap_err()
+                .wire_code(),
+            "22023"
+        );
+        for (sql, code) in [
+            ("DEFAULT now() + 1", "42601"),
+            ("DEFAULT now()::text", "42601"),
+            ("DEFAULT now() || 'x'", "42601"),
+            ("DEFAULT CURRENT_TIMESTAMP + 1", "42601"),
+            ("DEFAULT statement_timestamp()", "0A000"),
+            ("DEFAULT clock_timestamp()", "0A000"),
+            ("DEFAULT CURRENT_TIME", "42601"),
+            ("DEFAULT LOCALTIME", "42601"),
+        ] {
+            assert_eq!(parse(sql).unwrap_err().wire_code(), code, "{sql}");
+        }
+        // 引用付き識別子は時刻 DEFAULT にしない（定数式経路が従来どおり拒否する）。
+        let marked =
+            crate::sql::lexer::tokenize_marked("DEFAULT \"current_timestamp\"").expect("tokenize");
+        assert_eq!(
+            Parser::new(&marked)
+                .parse_column_constraints()
+                .unwrap_err()
+                .wire_code(),
+            "42601"
+        );
+    }
+
     /// `DEFAULT` と VALUES の定数式（Issue #1543・SQL-45 のポインタ）。
     #[test]
     fn const_expr_default_and_values() {
@@ -16280,13 +16661,7 @@ mod tests {
             parse("DEFAULT true").unwrap().default,
             Some(InsertLiteral::Bool(true))
         );
-        for sql in [
-            "DEFAULT CURRENT_TIMESTAMP",
-            "DEFAULT now()",
-            "DEFAULT -(1+2)",
-        ] {
-            assert_eq!(parse(sql).unwrap_err().wire_code(), "42601", "{sql}");
-        }
+        assert_eq!(parse("DEFAULT -(1+2)").unwrap_err().wire_code(), "42601");
         assert_eq!(parse("DEFAULT n + 1").unwrap_err().wire_code(), "42703");
         // NULL は定数式の内部でも受理する（算術では NULL 伝播）。引用された "null" は
         // 列参照のまま 42703。
@@ -18897,6 +19272,79 @@ mod tests {
         ] {
             let err = validate_sql(sql, &lookup).expect_err("must be rejected");
             assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+        }
+    }
+
+    /// SQL-37・Issue #1586: 括弧なし時刻関数は ORDER BY でも式キーとして解析される
+    /// （列 `created` のみのカタログでも 42703 にならない）。
+    #[test]
+    fn order_by_accepts_bare_value_function_as_expression_key() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT id FROM documents ORDER BY CURRENT_TIMESTAMP LIMIT 10",
+            "SELECT id FROM documents ORDER BY id, current_date DESC LIMIT 10",
+        ] {
+            validate_sql(sql, &lookup).unwrap_or_else(|e| panic!("sql={sql:?} err={e:?}"));
+        }
+    }
+
+    /// SQL-37・Issue #1586（PR #2382 指摘）: 未引用の時刻関数を比較の左辺に置いても、
+    /// 列名付き Equality／Compare（確定形）として消費されない。
+    #[test]
+    fn bare_value_function_on_comparison_lhs_is_not_a_column_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT id FROM documents WHERE CURRENT_DATE = '1' LIMIT 10",
+            "SELECT id FROM documents WHERE CURRENT_TIMESTAMP > '2000-01-01 00:00:00' LIMIT 10",
+        ] {
+            if let Ok(Statement::Select(stmt)) = validate_sql(sql, &lookup) {
+                assert!(
+                    !stmt.where_predicates.iter().any(|p| matches!(
+                        p,
+                        WherePredicate::Equality { .. } | WherePredicate::Compare { .. }
+                    )),
+                    "sql={sql:?}"
+                );
+            }
+        }
+        // 引用付きは従来どおり列名付き確定形。
+        let stmt = validate_statement(
+            "SELECT * FROM documents WHERE \"current_date\" = 'x' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            &lookup,
+        )
+        .expect("quoted column");
+        assert!(matches!(
+            stmt.where_predicates.first(),
+            Some(WherePredicate::Equality { .. })
+        ));
+    }
+
+    /// SQL-37・Issue #1586（PR #2382 指摘）: 修飾列参照 `t.current_date` は正規化後も
+    /// 列参照であり、値関数へ化けない。
+    #[test]
+    fn qualified_value_function_named_column_stays_a_column_reference() {
+        let tokens = lexer::tokenize_marked("SELECT events.current_date FROM events").expect("lex");
+        let normalized = super::super::qualified_column::normalize_single_table_qualifiers(&tokens)
+            .expect("normalize");
+        assert!(normalized
+            .iter()
+            .any(|t| matches!(t, Token::QuotedNull(n) if n == "current_date")));
+        assert!(!normalized
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n == "current_date")));
+    }
+
+    /// SQL-37・Issue #1586（PR #2382 指摘）: 引用付き値関数予約語名の表名・別名でも
+    /// JOIN の先読みが成立する（`QuotedNull` を識別子として受理する）。
+    #[test]
+    fn join_lookahead_accepts_quoted_value_function_names() {
+        for sql in [
+            "SELECT * FROM \"current_date\" a JOIN events b ON a.id = b.id LIMIT 10",
+            "SELECT * FROM events \"current_date\" JOIN events2 b ON events.id = b.id LIMIT 10",
+            "SELECT * FROM events AS \"current_date\" JOIN events2 b ON events.id = b.id LIMIT 10",
+        ] {
+            let tokens = lexer::tokenize_marked(sql).expect("lex");
+            assert!(looks_like_join(&tokens), "sql={sql:?}");
         }
     }
 

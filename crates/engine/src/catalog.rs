@@ -370,6 +370,7 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
         ty,
         ColumnType::Text
             | ColumnType::Varchar(_)
+            | ColumnType::Bpchar(_)
             | ColumnType::Enum(_)
             | ColumnType::Date
             | ColumnType::Timestamp
@@ -1038,8 +1039,9 @@ const _: () = assert!(
 );
 
 /// `VARCHAR(n)`／`CHAR(n)` の n の上限（文字数。TABLE-31・Issue #1563）。n は文字数との
-/// 比較にだけ使い、アロケーション量には使わない。`CHAR(n)` の空白詰め（Issue #1566）で
-/// n 文字を確保する経路は、応答バッファ上限の内側で行うこと。
+/// 比較にだけ使い、アロケーション量には使わない。`CHAR(n)` の空白詰め（Issue #1566）は
+/// 確保の前に詰め後のバイト長を `MAX_TEXT_FIELD_LEN`（DEFAULT は `MAX_COLUMN_DEFAULT_LEN`）
+/// で検査し、超過は `54000` で拒否する（`row_codec::fit_pad_char_length`）。
 pub const MAX_CHAR_TYPE_LENGTH: u32 = 10_485_760;
 
 /// 1 テーブルが持てる列数の上限。カタログ値のデコード時、この値を超える宣言列数は
@@ -1503,6 +1505,35 @@ pub(crate) enum AlterPlan {
     Rewrite(crate::column_rewrite::WideningKind),
 }
 
+/// 文字列系の列型変換（`TEXT`／`VARCHAR`／`VARCHAR(n)`／`CHAR(n)`。TABLE-19・TABLE-31・
+/// Issue #1567）の実行計画。`alter_table_alter_column_type` の `decide` が使う単一の判定表。
+/// `Text`↔`Varchar(None)` と同一型（変更なし）は `None`（前者は呼び出し元の専用腕、後者は
+/// 従来どおり `IncompatibleTypeChange`）。
+///
+/// - `VARCHAR(n)`→長さなし／`VARCHAR(m)`（m > n）: 保存バイト列・正準キーが同一のため
+///   カタログのみ（`CatalogOnly`）。
+/// - 長さなし／`VARCHAR(n)`→`VARCHAR(m)`（m < n）・`CHAR(n)` との相互変換・`CHAR(n)`→`CHAR(m)`:
+///   全行を検査・変換する（`Rewrite(CharFamily)`）。
+fn char_family_alter_plan(from: &ColumnType, to: &ColumnType) -> Option<AlterPlan> {
+    use crate::column_rewrite::WideningKind::CharFamily;
+    let rewrite = Some(AlterPlan::Rewrite(CharFamily));
+    match (from, to) {
+        (ColumnType::Text | ColumnType::Varchar(None), ColumnType::Varchar(Some(_)))
+        | (ColumnType::Text | ColumnType::Varchar(_), ColumnType::Bpchar(_))
+        | (ColumnType::Bpchar(_), ColumnType::Text | ColumnType::Varchar(_)) => rewrite,
+        (ColumnType::Varchar(Some(_)), ColumnType::Text | ColumnType::Varchar(None)) => {
+            Some(AlterPlan::CatalogOnly)
+        }
+        (ColumnType::Varchar(Some(n)), ColumnType::Varchar(Some(m))) => match m.cmp(n) {
+            std::cmp::Ordering::Greater => Some(AlterPlan::CatalogOnly),
+            std::cmp::Ordering::Less => rewrite,
+            std::cmp::Ordering::Equal => None,
+        },
+        (ColumnType::Bpchar(n), ColumnType::Bpchar(m)) if n != m => rewrite,
+        _ => None,
+    }
+}
+
 /// [`crate::tenant::TenantWriteError`]（`CompiledChecks::compile`／
 /// [`crate::constraint::validate_existing_rows_for_check`] が返す）を
 /// [`AlterCheckError`] へ写像する（Issue #1068 設計 D4）。`CheckViolation`
@@ -1543,14 +1574,15 @@ pub enum ColumnType {
     /// 値表現・比較・関数・索引・正準キーは [`ColumnType::Text`] と共有し、違いはカタログ
     /// タグ（`varchar`。param は `-` または 10 進の n）と wire 公告型（OID 1043）だけ。
     /// TEXT と同値扱いにすべき判定は [`Self::is_text_like`]／[`Self::same_value_domain`] を使う。
-    /// n 超過の書き込みは行 codec の encode がバックストップとして拒否する（束縛段での
-    /// `22001` 分類は Issue #1564、wire typmod は Issue #1565）。
+    /// n 超過の書き込みは束縛段が `22001` で拒否し（超過部分が半角空白のみなら n 文字へ
+    /// 切り詰め。Issue #1564）、行 codec の encode は最後の砦として拒否する（wire typmod は Issue #1565）。
     Varchar(Option<u32>),
     /// `character(n)`（`CHAR(n)`／`CHARACTER(n)`、TABLE-31・Issue #1563）。n は
     /// `1..=`[`MAX_CHAR_TYPE_LENGTH`]。カタログタグは `bpchar`（`"char"` 1 バイト型とは別物）。
-    /// 空白詰め・末尾空白を無視する比較は Issue #1566、FK・索引・UNIQUE・ALTER TYPE は
-    /// Issue #1567 の担当で、それまでは非 NULL 値の書き込み・述語・索引・制約を fail-closed に
-    /// 拒否する（[`Self::is_text_like`] は `false`）。投影は TEXT と同じセルで返す。
+    /// 保存形は n 文字へ半角空白で詰めた値で、`=`／`IN`／`<`・`GROUP BY`／`ORDER BY`／
+    /// `DISTINCT`・スカラー索引は末尾の半角空白を無視して比較する（Issue #1566）。PK・UNIQUE・
+    /// FK・ALTER TYPE は Issue #1567 で解禁した（正準キーは TEXT とタグ 1 を共有し、FK の型照合は
+    /// [`Self::fk_types_compatible`]）。[`Self::is_text_like`] は `false` のまま、個別の腕で Bpchar を扱う。投影は TEXT と同じセルで返す。
     Bpchar(u32),
     /// 固定次元の埋め込み列（`VECTOR(N)`、TABLE-1）。0 と `MAX_VECTOR_DIM` 超過は
     /// encode・decode 両側で拒否する。
@@ -1655,6 +1687,7 @@ impl ColumnType {
             self,
             ColumnType::Text
                 | ColumnType::Varchar(_)
+                | ColumnType::Bpchar(_)
                 | ColumnType::SmallInt
                 | ColumnType::Integer
                 | ColumnType::BigInt
@@ -1676,6 +1709,31 @@ impl ColumnType {
             ColumnType::Integer => Some(1),
             ColumnType::BigInt => Some(2),
             _ => None,
+        }
+    }
+
+    /// FOREIGN KEY の参照元列 `child` と参照先列 `parent` の型の組を許すか（TABLE-17・
+    /// TABLE-31、Issue #1567）。宣言時（`resolve_foreign_key_target`）と ALTER COLUMN TYPE
+    /// 後の再照合（`alter_column_type_with`）が共有する単一の判定表で、第 2 の表を作らない。
+    ///
+    /// - 整数型どうし・`TEXT`／`VARCHAR` どうし・`CHAR(n)` が参照元のとき参照先が
+    ///   `CHAR(m)`／`TEXT`／`VARCHAR`（n と m は任意）は許す。実行時は
+    ///   `constraint::recode_key_for_types` が境界で正準キーを読み替える。
+    /// - `TEXT`／`VARCHAR` が参照元で `CHAR(m)` が参照先の組は拒否する。親キー `'a  '` に
+    ///   対応する子の値が `'a'`・`'a '`… と複数あり、完全一致のキー索引では逆引き
+    ///   （親の DELETE／キー UPDATE で子を探す処理）を列挙できず、RESTRICT を見逃す
+    ///   fail-open になるため（PostgreSQL との差分。実装記録に明記）。
+    /// - それ以外は型タグ＋パラメータの完全一致。
+    pub(crate) fn fk_types_compatible(child: &ColumnType, parent: &ColumnType) -> bool {
+        if child.integer_rank().is_some() && parent.integer_rank().is_some() {
+            return true;
+        }
+        match (child, parent) {
+            (ColumnType::Bpchar(_), ColumnType::Bpchar(_)) => true,
+            (ColumnType::Bpchar(_), p) if p.is_text_like() => true,
+            (c, ColumnType::Bpchar(_)) if c.is_text_like() => false,
+            (c, p) if c.is_text_like() && p.is_text_like() => true,
+            (c, p) => c.catalog_fields() == p.catalog_fields(),
         }
     }
 
@@ -1741,7 +1799,15 @@ impl ColumnType {
             // （Issue #2305。新型には未使用タグを採番する規則の意図的な例外）。共有に
             // より TEXT↔VARCHAR の PK／FK 照合で recode が不要になり、ALTER COLUMN
             // TYPE でも `user_uniq`・`key_index` を失効させずに済む。
-            ColumnType::Text | ColumnType::Varchar(_) => 1,
+            //
+            // `Bpchar`（`CHAR(n)`。TABLE-31・Issue #1567）も同じタグ 1 を共有し、payload は
+            // 保存値（n 文字へ空白詰め済み）のバイト列そのままとする。同一の `CHAR(n)` 列の
+            // 中では保存形が必ずちょうど n 文字（`row_codec::check_varchar_length` の
+            // 不変条件）なので、バイト一致が「末尾空白を無視した等価」と一致する。
+            // `CHAR(n)`↔`CHAR(m)`・`CHAR`↔`TEXT` の境界は `constraint::recode_key_for_types`
+            // が末尾空白を除いて読み替える。これまで Bpchar のキーは永続化されたことが無く、
+            // 既存タグの意味は変わらないため索引フォーマットの版上げは不要。
+            ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => 1,
             ColumnType::Integer => 2,
             // `SmallInt` は INTEGER と値表現（`Value::Integer`）が同一で、正準キーは値ベース
             // （`push_canonical_component`）のため同じタグ 2 を共有する（Issue #1558。新型には
@@ -1760,7 +1826,7 @@ impl ColumnType {
             ColumnType::Numeric { .. } => Self::NUMERIC_UNIQUE_KEY_TAG,
             ColumnType::Json | ColumnType::Jsonb => 13,
             ColumnType::Array(_) => Self::ARRAY_UNIQUE_KEY_TAG,
-            ColumnType::Vector(_) | ColumnType::Bpchar(_) => {
+            ColumnType::Vector(_) => {
                 // 呼び出し元が `is_unique_constraint_allowed` の契約を破っている
                 // （非許可型からタグを取得しようとした）。永続化しない内部
                 // スクラッチ用の値のため panic ではなく判別可能な番兵を返し、
@@ -3079,17 +3145,108 @@ fn array_param_enum_name(param: &str) -> Result<Option<&str>> {
 /// `Text` は SQL 文字列リテラルの原文を保持する。`TEXT` 列ではそのまま値になり、
 /// `DATE`／`TIMESTAMP`／`UUID` 列（Issue #1279・#1280・#1281）では `row_codec::default_scalar` が
 /// 列型に従って解釈し、`ENUM` 列（Issue #1282）では語彙に含まれるラベルかを照合する。
-/// 新 variant
-/// を足さず、`compatible_with`・`column_default_compatible_with_tag`・
-/// `row_codec::default_scalar`・`sql::ddl::add_column_default` の対応表へ同じ形で
-/// 腕を足して拡張する（公開 enum の variant 追加による破壊的変更とカタログ符号化の
-/// 変更を避ける）。
+/// 定数 DEFAULT は新 variant を足さず、`compatible_with`・
+/// `column_default_compatible_with_tag`・`row_codec::default_scalar`・
+/// `sql::ddl::add_column_default` の対応表へ同じ形で腕を足して拡張する。
+/// 例外として時刻値関数の DEFAULT（`DEFAULT now()` 系。SQL-37・TABLE-16・Issue #1587、
+/// 設計 D9）だけは評価時刻に依存する揮発性 DEFAULT のため専用 variant
+/// [`ColumnDefault::CurrentTime`] とカタログタグ `c` を持つ（公開 enum への variant 追加は
+/// 破壊的変更）。この variant は構文形のまま保存し、INSERT の省略列補完
+/// （`sql::parser::fill_omitted_columns`）だけが評価する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnDefault {
     /// 文字列リテラルの原文（`TEXT` 値、または型付き列で列型に従い解釈される）。
     Text(String),
     Number(String),
     Bool(bool),
+    /// 時刻値関数の DEFAULT（構文形。評価は INSERT 時のトランザクション開始時刻）。
+    CurrentTime(TimeDefault),
+}
+
+/// [`ColumnDefault::CurrentTime`] が受理する時刻値関数の構文形（許可リスト。
+/// SQL-37・Issue #1587）。`now()` と `CURRENT_TIMESTAMP` は評価値が同じでも別の形として
+/// 保持する（内容照合ハッシュは構文形から計算するため。設計 D1・D3）。
+/// `Option<u8>` は小数秒精度 `(p)`（0〜6。範囲外は decode・構文検証で拒否）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeDefault {
+    /// `now()`。
+    Now,
+    /// `transaction_timestamp()`。
+    TransactionTimestamp,
+    /// `CURRENT_TIMESTAMP[(p)]`。
+    CurrentTimestamp(Option<u8>),
+    /// `LOCALTIMESTAMP[(p)]`。
+    LocalTimestamp(Option<u8>),
+    /// `CURRENT_DATE`。
+    CurrentDate,
+}
+
+impl TimeDefault {
+    /// 受理する列型（`TIMESTAMP` 系関数は `TIMESTAMP` 列、`CURRENT_DATE` は `DATE` 列）。
+    ///
+    /// 精度範囲外（7 以上）の形は列型に関わらず不適合とする（永続化前の fail-closed。
+    /// 永続化後に `from_canonical_text` が拒否してテーブルが利用不能になるのを防ぐ）。
+    pub(crate) fn compatible_with(self, ty: &ColumnType) -> bool {
+        if !self.precision_in_range() {
+            return false;
+        }
+        match self {
+            TimeDefault::CurrentDate => matches!(ty, ColumnType::Date),
+            _ => matches!(ty, ColumnType::Timestamp),
+        }
+    }
+
+    /// 小数秒精度が 0〜6 の範囲内か（精度なしの形は常に範囲内）。
+    pub(crate) fn precision_in_range(self) -> bool {
+        match self {
+            TimeDefault::CurrentTimestamp(Some(p)) | TimeDefault::LocalTimestamp(Some(p)) => p <= 6,
+            _ => true,
+        }
+    }
+
+    /// 列タグ文字列版（[`column_default_compatible_with_tag`] 用）。
+    fn compatible_with_tag(self, tag: &str) -> bool {
+        match self {
+            TimeDefault::CurrentDate => tag == "date",
+            _ => tag == "timestamp",
+        }
+    }
+
+    /// カタログ保存用の正準テキスト（許可リスト。16 進化前の本体）。
+    pub(crate) fn canonical_text(self) -> String {
+        match self {
+            TimeDefault::Now => "now".to_string(),
+            TimeDefault::TransactionTimestamp => "transaction_timestamp".to_string(),
+            TimeDefault::CurrentDate => "current_date".to_string(),
+            TimeDefault::CurrentTimestamp(None) => "current_timestamp".to_string(),
+            TimeDefault::CurrentTimestamp(Some(p)) => format!("current_timestamp:{p}"),
+            TimeDefault::LocalTimestamp(None) => "localtimestamp".to_string(),
+            TimeDefault::LocalTimestamp(Some(p)) => format!("localtimestamp:{p}"),
+        }
+    }
+
+    /// [`TimeDefault::canonical_text`] の逆変換。許可リスト外・精度範囲外は `None`。
+    pub(crate) fn from_canonical_text(text: &str) -> Option<TimeDefault> {
+        let (head, precision) = match text.split_once(':') {
+            Some((h, p)) => {
+                let p: u8 = p.parse().ok()?;
+                // 正準形（先頭ゼロ・符号なし）だけを受理する。
+                if p > 6 || p.to_string() != text.split_once(':')?.1 {
+                    return None;
+                }
+                (h, Some(p))
+            }
+            None => (text, None),
+        };
+        match (head, precision) {
+            ("now", None) => Some(TimeDefault::Now),
+            ("transaction_timestamp", None) => Some(TimeDefault::TransactionTimestamp),
+            ("current_date", None) => Some(TimeDefault::CurrentDate),
+            ("current_timestamp", p) => Some(TimeDefault::CurrentTimestamp(p)),
+            ("localtimestamp", p) => Some(TimeDefault::LocalTimestamp(p)),
+            _ => None,
+        }
+    }
 }
 
 /// [`ColumnDefault`] 1 個ぶんのカタログテキスト表現（未加工の値本体）の
@@ -3120,6 +3277,7 @@ impl ColumnDefault {
                 ColumnDefault::Text(_),
                 ColumnType::Text
                     | ColumnType::Varchar(_)
+                    | ColumnType::Bpchar(_)
                     | ColumnType::Date
                     | ColumnType::Timestamp
                     | ColumnType::Uuid
@@ -3137,7 +3295,7 @@ impl ColumnDefault {
                     | ColumnType::Double
                     | ColumnType::Numeric { .. },
             ) | (ColumnDefault::Bool(_), ColumnType::Boolean)
-        )
+        ) || matches!(self, ColumnDefault::CurrentTime(t) if t.compatible_with(ty))
     }
 
     /// カタログテキスト形式（v5）の `default` フィールドへ符号化する。
@@ -3149,6 +3307,14 @@ impl ColumnDefault {
         let (tag, raw): (char, String) = match self {
             ColumnDefault::Text(s) => ('s', s.clone()),
             ColumnDefault::Number(s) => ('n', s.clone()),
+            ColumnDefault::CurrentTime(t) => {
+                if !t.precision_in_range() {
+                    return Err(CatalogError::Invalid(
+                        "time function DEFAULT precision out of range (0..=6)".to_string(),
+                    ));
+                }
+                ('c', t.canonical_text())
+            }
             ColumnDefault::Bool(b) => {
                 return Ok(if *b { "t".to_string() } else { "f".to_string() })
             }
@@ -3199,6 +3365,13 @@ impl ColumnDefault {
         match tag {
             's' => Ok(Some(ColumnDefault::Text(text))),
             'n' => Ok(Some(ColumnDefault::Number(text))),
+            // 時刻 DEFAULT は許可リストの正準形だけを受理する（未知の形・精度範囲外は
+            // fail-closed。SQL-37・Issue #1587）。
+            'c' => TimeDefault::from_canonical_text(&text)
+                .map(|t| Some(ColumnDefault::CurrentTime(t)))
+                .ok_or_else(|| {
+                    CatalogError::Invalid("unknown time column default form".to_string())
+                }),
             other => Err(CatalogError::Invalid(format!(
                 "unknown column default tag: {other:?}"
             ))),
@@ -3617,6 +3790,13 @@ impl ForeignKeyDef {
         self.match_type = match_type;
         self.deferrability = deferrability;
         self
+    }
+
+    /// `ON DELETE`／`ON UPDATE` のいずれかが `SET DEFAULT` か（時刻 DEFAULT 列との
+    /// 組み合わせ検査用。SQL-37・Issue #1587、設計 D9）。
+    pub(crate) fn uses_set_default(&self) -> bool {
+        matches!(self.on_delete, ReferentialAction::SetDefault)
+            || matches!(self.on_update, ReferentialAction::SetDefault)
     }
 
     /// 参照元（このスキーマ側）の列名（宣言順）。
@@ -4315,11 +4495,21 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
                 )));
             }
             // `VARCHAR(n)` の既定値は文字数が n 以下であること（超過した既定値は INSERT のたびに
-            // 長さ超過になるため定義時に拒否する。コードの精緻化は Issue #1564）。
+            // 長さ超過になるため定義時に拒否する。通常は DDL 段の `22001`〔Issue #1564〕が先に弾く最後の砦）。
             if let (ColumnType::Varchar(Some(n)), ColumnDefault::Text(s)) = (&column.ty, default) {
                 if u32::try_from(s.chars().count()).map_or(true, |len| len > *n) {
                     return Err(CatalogError::Invalid(format!(
                         "column {:?} has a DEFAULT longer than its declared length",
+                        column.name
+                    )));
+                }
+            }
+            // `CHAR(n)` の既定値は n 文字へ空白詰め済みの形で保持する（保持値＝格納形。
+            // TABLE-31・Issue #1566）。詰め前の値は DDL 段が詰めてから渡す最後の砦。
+            if let (ColumnType::Bpchar(n), ColumnDefault::Text(s)) = (&column.ty, default) {
+                if !matches!(u32::try_from(s.chars().count()), Ok(len) if len == *n) {
+                    return Err(CatalogError::Invalid(format!(
+                        "column {:?} has a DEFAULT that is not blank-padded to its declared length",
                         column.name
                     )));
                 }
@@ -4654,6 +4844,15 @@ fn validate_referential_action_declaration(schema: &TableSchema, fk: &ForeignKey
                 "column {name} is NOT NULL and cannot use the SET NULL referential action"
             )));
         }
+        // 時刻 DEFAULT 列は SET DEFAULT の対象にできない（連鎖更新には台帳へ記録する
+        // 主体の文が無く、評価時刻を再送で再現できないため。SQL-37・Issue #1587、設計 D9）。
+        // SQL 表層は `sql::ddl` が先に `0A000` で拒否するため、ここは Rust API・decode の
+        // 多層防御（fail-closed）。
+        if uses_set_default && matches!(column.default, Some(ColumnDefault::CurrentTime(_))) {
+            return Err(CatalogError::InvalidForeignKey(format!(
+                "column {name} has a time function DEFAULT and cannot use the SET DEFAULT referential action"
+            )));
+        }
         if uses_set_default && !column.nullable && column.default.is_none() {
             return Err(CatalogError::InvalidForeignKey(format!(
                 "column {name} is NOT NULL without a DEFAULT and cannot use the SET DEFAULT referential action"
@@ -4750,20 +4949,13 @@ fn resolve_foreign_key_target(
                     "referenced column {parent_name} does not exist"
                 ))
             })?;
-        // 型の同一性は型タグ＋パラメータ（`catalog_fields`。ENUM は型名を含む）で
-        // 判定する。一意性検査と同じ正準キー（型タグ付き）で参照先を照合するため、
-        // 型が異なる組は値が「等しく」見えても一致しない（黙って常に違反になる
-        // 宣言を受理しない）。例外は整数型（`SMALLINT`／`INTEGER`／`BIGINT`）の組で、実行時に
-        // `constraint::recode_key_for_types` が正準キーを読み替えるため受理する。
+        // 型の組の可否は [`ColumnType::fk_types_compatible`]（型タグ＋パラメータの一致を
+        // 基本に、整数型どうし・TEXT/VARCHAR どうし・CHAR(n) 参照元の組を許す）。
+        // 一意性検査と同じ正準キー（型タグ付き）で参照先を照合するため、型が異なる組は
+        // 値が「等しく」見えても一致しない（黙って常に違反になる宣言を受理しない）。
+        // 許す組は実行時に `constraint::recode_key_for_types` が正準キーを読み替える。
         let child_ty = child_type(child_name)?;
-        let integer_widened =
-            child_ty.integer_rank().is_some() && parent_ty.integer_rank().is_some();
-        // TEXT と VARCHAR は値表現・正準キーが同一のため組を許す（Issue #2305）。
-        let text_family = child_ty.is_text_like() && parent_ty.is_text_like();
-        if !integer_widened
-            && !text_family
-            && child_ty.catalog_fields() != parent_ty.catalog_fields()
-        {
+        if !ColumnType::fk_types_compatible(child_ty, parent_ty) {
             return Err(CatalogError::InvalidForeignKey(format!(
                 "foreign key column {child_name} and referenced column {parent_name} are of incompatible types"
             )));
@@ -4793,6 +4985,137 @@ fn resolve_foreign_key_target(
         }
     }
     Ok(resolved)
+}
+
+/// 文字列系の列型変換（Issue #1567）の後に、新スキーマ `new_schema`（カタログへ書き込み済み・
+/// 未 commit）で制約を再検証する。`alter_column_type_with` が `Rewrite(CharFamily)` の
+/// 場合にだけ、カタログのハンドルを手放した後・世代 bump の前に呼ぶ。
+///
+/// 1. 変更列を含む PK／UNIQUE の重複を全テナントの全行で探す（テナントごとに独立。
+///    他テナントの同値は重複としない）。重複は `23505`。
+/// 2. 変更列を参照元に含む自表の FK と、変更列を参照先に含む FK（他表・自己参照）の列の
+///    型の組を [`ColumnType::fk_types_compatible`] で照合する。不一致は固定文言の `42804`
+///    （`TEXT`／`VARCHAR` の参照元が `CHAR` の参照先になる組など。宣言時と同じ判定）。
+/// 3. 上記 FK の既存行を新スキーマで全テナント検証する
+///    （[`crate::constraint::verify_new_foreign_key_all_tenants_in_txn`]）。違反は `23503`。
+///
+/// 可視性で絞らない（不可視行の違反を見逃す fail-open を避ける。`PolicyContext` は取らない）。
+/// エラーは固定文言で、値・テナント・行 id を含めない。
+fn revalidate_after_char_family_change(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    new_schema: &TableSchema,
+    column_name: &str,
+) -> std::result::Result<(), AlterCheckError> {
+    // 1. PK／UNIQUE の重複。
+    let mut key_sets: Vec<Vec<String>> = Vec::new();
+    if let Some(pk) = new_schema.primary_key() {
+        if pk.iter().any(|c| c == column_name) {
+            key_sets.push(pk.to_vec());
+        }
+    }
+    for u in new_schema.unique_constraints() {
+        if u.columns().iter().any(|c| c == column_name) {
+            key_sets.push(u.columns().to_vec());
+        }
+    }
+    if !key_sets.is_empty() {
+        match write_txn.open_table(user_rows_table_def(&user_rows_table_name(table_name))) {
+            Ok(row_table) => {
+                for cols in &key_sets {
+                    if crate::constraint::table_has_duplicate_unique_key(
+                        &row_table, new_schema, cols,
+                    )? {
+                        return Err(AlterCheckError::Sql(SqlSurfaceError::unique_violation()));
+                    }
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(AlterCheckError::Catalog(map_row_table_error(e))),
+        }
+    }
+
+    // 2・3. FK。自表が子の FK（変更列が参照元列）と、変更列が参照先列の FK（他表・自己参照）。
+    let mismatch = || {
+        AlterCheckError::Sql(SqlSurfaceError::datatype_mismatch(
+            "foreign key column types are incompatible after the column type change",
+        ))
+    };
+    let col_ty = |schema: &TableSchema, name: &str| -> Option<ColumnType> {
+        schema
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.ty.clone())
+    };
+    let mut to_verify: Vec<(TableSchema, ForeignKeyDef, TableSchema)> = Vec::new();
+    for fk in new_schema.foreign_keys() {
+        let child_side = fk.columns().iter().any(|c| c == column_name);
+        // 自己参照 FK は参照先列だけが変更列の場合もここで検証する（他表の FK は下のループ）。
+        let self_parent_side =
+            fk.parent_table == table_name && fk.parent_columns().iter().any(|c| c == column_name);
+        if !(child_side || self_parent_side) || fk.references_parent_id() {
+            continue;
+        }
+        let parent = if fk.parent_table == table_name {
+            new_schema.clone()
+        } else {
+            require_table_schema_write(write_txn, &fk.parent_table)?
+        };
+        for (child_col, parent_col) in fk.columns().iter().zip(fk.parent_columns()) {
+            let (Some(c), Some(p)) = (col_ty(new_schema, child_col), col_ty(&parent, parent_col))
+            else {
+                return Err(AlterCheckError::Catalog(CatalogError::CorruptSchema(
+                    "foreign key column not found after column type change".to_string(),
+                )));
+            };
+            if !ColumnType::fk_types_compatible(&c, &p) {
+                return Err(mismatch());
+            }
+        }
+        to_verify.push((new_schema.clone(), fk.clone(), parent));
+    }
+    for (child, fk) in referencing_foreign_keys_in_txn(write_txn, table_name)? {
+        if !fk.parent_columns().iter().any(|c| c == column_name) {
+            continue;
+        }
+        // 自己参照は上のループで子として検証済み（`referencing_foreign_keys_in_txn` は
+        // 書き込み済みの新スキーマを返すため、ここでも同じ結果になる）。
+        if child.name == table_name {
+            continue;
+        }
+        for (child_col, parent_col) in fk.columns().iter().zip(fk.parent_columns()) {
+            let (Some(c), Some(p)) = (col_ty(&child, child_col), col_ty(new_schema, parent_col))
+            else {
+                return Err(AlterCheckError::Catalog(CatalogError::CorruptSchema(
+                    "foreign key column not found after column type change".to_string(),
+                )));
+            };
+            if !ColumnType::fk_types_compatible(&c, &p) {
+                return Err(mismatch());
+            }
+        }
+        to_verify.push((child, fk, new_schema.clone()));
+    }
+    for (child, fk, parent) in &to_verify {
+        crate::constraint::verify_new_foreign_key_all_tenants_in_txn(
+            write_txn,
+            &parent.name,
+            parent,
+            child,
+            fk,
+        )
+        .map_err(|e| match e {
+            crate::tenant::TenantWriteError::ForeignKeyViolation => {
+                AlterCheckError::Sql(SqlSurfaceError::ForeignKeyViolation)
+            }
+            crate::tenant::TenantWriteError::Catalog(c) => AlterCheckError::Catalog(c),
+            _ => AlterCheckError::Catalog(CatalogError::CorruptSchema(
+                "foreign key verification failed unexpectedly".to_string(),
+            )),
+        })?;
+    }
+    Ok(())
 }
 
 /// `CHECK` 制約（[`CheckConstraint`]。TABLE-16・TASK-204、Issue #906）の不変条件
@@ -7452,6 +7775,14 @@ impl Storage {
         let max_columns = max_columns.min(MAX_COLUMN_COUNT);
         validate_identifier(table_name)?;
         validate_column(&column)?;
+        // 時刻値関数の DEFAULT は既存行の補完値を固定できず、読み出し時補完が常に失敗して
+        // テーブルを読めなくするため、Rust API 直接呼び出しでも拒否する（多層防御。SQL 表層は
+        // `sql::allowlist` が `0A000` で先に拒否する。SQL-37・Issue #1587、設計 D10）。
+        if matches!(column.default, Some(ColumnDefault::CurrentTime(_))) {
+            return Err(CatalogError::Invalid(
+                "time function DEFAULT is not supported in ALTER TABLE ADD COLUMN".to_string(),
+            ));
+        }
         if crate::row_codec::validate_column_default(&column).is_err() {
             return Err(CatalogError::Invalid(
                 "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT".to_string(),
@@ -8458,6 +8789,8 @@ impl Storage {
     /// [`crate::column_rewrite`]。PK／UNIQUE／FOREIGN KEY の構成列も受理し、型タグ付きの
     /// 索引〔`user_uniq`・`key_index`〕は同一 txn 内で失効させる。Issue #1402）と、
     /// カタログのタグだけを書き換える `TEXT`↔`VARCHAR`（Issue #2305）、整数型の
+    /// 文字列系（`TEXT`／`VARCHAR`／`VARCHAR(n)`／`CHAR(n)` の拡大・縮小・相互変換。拡大はタグのみ、
+    /// 縮小と `CHAR` 絡みは全行検査・変換。超過は `22001` で表は不変。TABLE-31・Issue #1567）、
     /// `SMALLINT`→`INTEGER`（タグのみ）・`SMALLINT`→`BIGINT`（再エンコード）・
     /// `INTEGER`→`SMALLINT`（全行の範囲検証のみ）・`BIGINT`→`SMALLINT`（検証しつつ再エンコード）
     /// （Issue #1560。範囲外は固定文言の `22003` で表は不変）で、それ以外（VECTOR 次元変更・同一型・
@@ -8491,8 +8824,6 @@ impl Storage {
             // TEXT と VARCHAR は行バイト列・正準キーとも同一表現のため、カタログのタグだけを
             // 書き換える（行の書き換えも `user_uniq`・`key_index` の失効も不要。
             // 世代 bump は共通本体が行う。Issue #2305）。
-            // 長さ付き（`Varchar(Some)`・`Bpchar`）が絡む組は既存行が n を超える状態を作りうる
-            // ため catch-all（`IncompatibleTypeChange`）に落とす（解禁は Issue #1567）。
             (ColumnType::Text, ColumnType::Varchar(None))
             | (ColumnType::Varchar(None), ColumnType::Text) => {
                 Ok((target.clone(), AlterPlan::CatalogOnly))
@@ -8520,7 +8851,13 @@ impl Storage {
                 target.clone(),
                 AlterPlan::Rewrite(crate::column_rewrite::WideningKind::RealToDouble),
             )),
+            // 長さ付き（`Varchar(Some)`・`Bpchar`）が絡む組（TABLE-31・Issue #1567）。拡大は
+            // カタログのみ、縮小・`CHAR(n)` との相互変換は全テナント既存行を検査・変換する
+            // （[`char_family_alter_plan`]。超過行が 1 行でもあれば `22001` で表は不変）。
             (from, to) => {
+                if let Some(plan) = char_family_alter_plan(from, to) {
+                    return Ok((target.clone(), plan));
+                }
                 let (from_tag, from_param) = from.catalog_fields();
                 let (to_tag, to_param) = to.catalog_fields();
                 Err(CatalogError::IncompatibleTypeChange {
@@ -8562,6 +8899,7 @@ impl Storage {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()).into());
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let mut revalidate_schema: Option<TableSchema> = None;
         {
             let mut table = write_txn
                 .open_table(CATALOG_TABLE)
@@ -8603,6 +8941,27 @@ impl Storage {
                     }
                 }
             }
+            // 文字列系の変換では列 DEFAULT も新しい型の格納形へ変換する。`ADD COLUMN ... DEFAULT`
+            // の列は既存行にバイトが無く読み出し時に DEFAULT で補われるため、DEFAULT を
+            // 変換しないと新しい型の不変条件（`CHAR(n)` は詰め済み・`VARCHAR(n)` は n 以内）を
+            // 破る。超過は固定文言の `22001`（詰め後の上限超過は `54000`）で表は不変
+            // （TABLE-31・Issue #1567）。
+            if matches!(
+                plan,
+                AlterPlan::Rewrite(crate::column_rewrite::WideningKind::CharFamily)
+            ) {
+                if let Some(ColumnDefault::Text(raw)) = &column.default {
+                    let converted = crate::row_codec::convert_char_family(
+                        &column.ty,
+                        &new_ty,
+                        raw,
+                        MAX_COLUMN_DEFAULT_LEN,
+                    )
+                    .map_err(|e| AlterCheckError::Sql(e.into()))?
+                    .into_owned();
+                    column.default = Some(ColumnDefault::Text(converted));
+                }
+            }
             column.ty = new_ty;
             // `CHECK` 制約が参照する列の型変更は、評価結果が不変であることを論証できる
             // 拡大変換（`INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`）に限り受理する
@@ -8641,8 +9000,14 @@ impl Storage {
                     logical_index,
                     kind,
                 )?;
-                if outcome == crate::column_rewrite::RewriteOutcome::OutOfRange {
-                    return Err(out_of_range());
+                match outcome {
+                    crate::column_rewrite::RewriteOutcome::Done => {}
+                    crate::column_rewrite::RewriteOutcome::OutOfRange => return Err(out_of_range()),
+                    // 文字列系の変換で長さ超過（`22001`）・詰め後の上限超過（`54000`）。
+                    // 固定文言（型と n だけ）で、ここで return すると txn は commit されず副作用はゼロ。
+                    crate::column_rewrite::RewriteOutcome::CharLength(e) => {
+                        return Err(AlterCheckError::Sql(e.into()))
+                    }
                 }
                 // 変更列が PK／UNIQUE／FOREIGN KEY の構成列なら、型タグ付きの正準キー
                 // （永続一意索引 `user_uniq/{table}`・キー索引 `key_index`）が旧型のまま
@@ -8711,6 +9076,20 @@ impl Storage {
             table
                 .insert(table_name, encoded.as_slice())
                 .map_err(CatalogError::from)?;
+            if matches!(
+                plan,
+                AlterPlan::Rewrite(crate::column_rewrite::WideningKind::CharFamily)
+            ) {
+                revalidate_schema = Some(schema);
+            }
+        }
+        // 文字列系の変換は値を変えうる（`'ab'` と `'ab '` が `CHAR(3)` で同値になる・rtrim で
+        // FK の一致関係が変わる）ため、新スキーマで PK／UNIQUE の重複と FOREIGN KEY の型照合・
+        // 既存行の参照整合性を再検証する（TABLE-31・Issue #1567）。カタログのハンドルを
+        // 手放した後（検証が開き直すため）・世代 bump と commit の前に行う。違反は commit せず
+        // txn を破棄するので表（カタログ・行・索引）は一切変わらない。
+        if let Some(new_schema) = &revalidate_schema {
+            revalidate_after_char_family_change(&write_txn, table_name, new_schema, column_name)?;
         }
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
@@ -10217,7 +10596,7 @@ fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> boo
             ColumnDefault::Number(_),
             "integer" | "bigint" | "real" | "double" | "numeric"
         ) | (ColumnDefault::Bool(_), "boolean")
-    )
+    ) || matches!(default, ColumnDefault::CurrentTime(t) if t.compatible_with_tag(tag))
 }
 
 /// ENUM 型 `type_name` を参照する列を持つテーブル名の一覧を列挙する
@@ -10464,6 +10843,123 @@ mod tests {
     // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
     // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+    /// 時刻 DEFAULT（SQL-37・TABLE-16・Issue #1587）のカタログ往復。許可リストの全形が
+    /// タグ `c` で往復し、`compatible_with`・タグ版の整合判定が列型と一致する。
+    #[test]
+    fn time_default_roundtrips_and_is_type_checked() {
+        let forms = [
+            TimeDefault::Now,
+            TimeDefault::TransactionTimestamp,
+            TimeDefault::CurrentTimestamp(None),
+            TimeDefault::CurrentTimestamp(Some(0)),
+            TimeDefault::CurrentTimestamp(Some(6)),
+            TimeDefault::LocalTimestamp(None),
+            TimeDefault::LocalTimestamp(Some(3)),
+            TimeDefault::CurrentDate,
+        ];
+        for form in forms {
+            let default = ColumnDefault::CurrentTime(form);
+            let field = default.encode_catalog_field().expect("encode");
+            assert!(field.starts_with('c'), "{field}");
+            assert_eq!(
+                ColumnDefault::decode_catalog_field(&field).expect("decode"),
+                Some(default.clone())
+            );
+            let (ok_ty, ok_tag, bad_ty, bad_tag) = if form == TimeDefault::CurrentDate {
+                (ColumnType::Date, "date", ColumnType::Timestamp, "timestamp")
+            } else {
+                (ColumnType::Timestamp, "timestamp", ColumnType::Date, "date")
+            };
+            assert!(default.compatible_with(&ok_ty));
+            assert!(column_default_compatible_with_tag(&default, ok_tag));
+            assert!(!default.compatible_with(&bad_ty));
+            assert!(!column_default_compatible_with_tag(&default, bad_tag));
+            assert!(!default.compatible_with(&ColumnType::Text));
+        }
+    }
+
+    /// 精度範囲外の時刻 DEFAULT は永続化前に拒否され、何も作られない（fail-closed）。
+    #[test]
+    fn create_table_rejects_out_of_range_time_default_precision() {
+        let path = unique_db_path("catalog-time-default-precision");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        for form in [
+            TimeDefault::CurrentTimestamp(Some(7)),
+            TimeDefault::LocalTimestamp(Some(255)),
+        ] {
+            let default = ColumnDefault::CurrentTime(form);
+            assert!(default.encode_catalog_field().is_err());
+            let schema = TableSchema::new(
+                "t",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("at", ColumnType::Timestamp, true).with_default(default),
+                ],
+            );
+            let err = storage.create_table(&schema).expect_err("must reject");
+            assert!(matches!(err, CatalogError::Invalid(_)), "{err:?}");
+            assert!(storage.get_table_schema("t").is_err());
+        }
+    }
+
+    /// Rust API の `alter_table_add_column` も時刻 DEFAULT を拒否する（既存行の補完値を
+    /// 固定できず、受理するとテーブルが読めなくなるため。設計 D10）。
+    #[test]
+    fn alter_table_add_column_rejects_time_default() {
+        let path = unique_db_path("catalog-add-column-time-default");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "t",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+        let column = ColumnDef::new("at", ColumnType::Timestamp, true)
+            .with_default(ColumnDefault::CurrentTime(TimeDefault::Now));
+        let err = storage
+            .alter_table_add_column("t", column)
+            .expect_err("time DEFAULT must be rejected");
+        assert!(matches!(err, CatalogError::Invalid(_)), "{err:?}");
+        // 列は追加されない。
+        let schema = storage.get_table_schema("t").expect("schema");
+        assert_eq!(schema.columns.len(), 1);
+    }
+
+    /// 未知の形・精度範囲外・非正準な精度・不正 16 進は fail-closed（`Invalid`）。
+    #[test]
+    fn time_default_decode_rejects_unknown_forms() {
+        let hex = |raw: &str| {
+            let mut out = String::from("c");
+            for b in raw.as_bytes() {
+                out.push_str(&hex_encode_byte(*b));
+            }
+            out
+        };
+        for bad in [
+            "",
+            "now:1",
+            "clock_timestamp",
+            "statement_timestamp",
+            "current_timestamp:7",
+            "current_timestamp:",
+            "current_timestamp:03",
+            "current_timestamp:+3",
+            "current_date:1",
+            "localtime",
+            "NOW",
+            "now()",
+        ] {
+            assert!(
+                ColumnDefault::decode_catalog_field(&hex(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(ColumnDefault::decode_catalog_field("czz").is_err());
+        assert!(ColumnDefault::decode_catalog_field("c").is_err());
+    }
 
     /// 循環したビューカタログ（a -> b -> a）でも `exposed_columns_of_view` が
     /// スタックを使い果たさず `CorruptSchema` を返すこと（反復＋visited 集合）。

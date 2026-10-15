@@ -29,6 +29,7 @@ use crate::row_codec::ScalarRef;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::datetime_fn::{self, DatePartField, DateTruncUnit};
 use crate::sql::string_fn;
+use crate::sql::time_fn::{self, StatementClock};
 use crate::wasm_udf::WasmUdfBackend;
 
 /// UDF 定義が持てるパラメータ数の上限（`54000` で拒否）。
@@ -270,8 +271,8 @@ pub enum Expr {
     /// `TIMESTAMP '<literal>'`（[`Expr::DateLiteral`] と同じ理由。値は
     /// `crate::datetime::parse_timestamp` の解析結果＝マイクロ秒）。
     TimestampLiteral(i64),
-    /// jsonb のパス取得演算子 `->` `->>` `#>` `#>>`（対象ビヘイビア: TABLE-25。
-    /// Issue #1596）。構文段（`allowlist::Parser::parse_json_access_expr`）が
+    /// jsonb の演算子（パス取得 `->` `->>` `#>` `#>>`・包含 `@>` `<@`・存在 `?` `?|` `?&`。
+    /// 対象ビヘイビア: TABLE-25。Issue #1596・#1598）。構文段（`allowlist::Parser::parse_json_access_expr`）が
     /// PostgreSQL と同じ優先順位（加減算より弱く比較より強い）・左結合で生成する。
     /// [`BinOp`] とは別 variant にして、索引計画・宣言的述語・CHECK 等が
     /// 算術・比較の網羅 match へ誤って流し込まないようにする。
@@ -280,9 +281,69 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    /// 括弧なしの SQL 値関数（`CURRENT_TIMESTAMP`・`CURRENT_DATE`・`LOCALTIMESTAMP` 等。
+    /// 対象ビヘイビア: SQL-37・Issue #1586）。構文段（`allowlist::Parser::parse_primary_expr`）が
+    /// **引用されていない**識別子の予約語一致でだけ生成する（引用識別子は列参照のまま）。
+    /// `precision` は `CURRENT_TIMESTAMP(p)` の小数秒桁数（括弧内が整数リテラル 1 個のとき）。
+    /// 関数形の `now()` 等は従来どおり [`Expr::Call`]。
+    ValueFunction {
+        kind: ValueFunctionKind,
+        precision: Option<u8>,
+    },
 }
 
-/// jsonb パス取得演算子の種別（[`Expr::JsonAccess`]）。
+/// 括弧なし SQL 値関数の種別（[`Expr::ValueFunction`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueFunctionKind {
+    CurrentTimestamp,
+    CurrentDate,
+    CurrentTime,
+    LocalTimestamp,
+    LocalTime,
+}
+
+impl ValueFunctionKind {
+    /// 予約語（大文字小文字不問）から種別を引く。
+    pub fn from_keyword(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "current_timestamp" => Some(Self::CurrentTimestamp),
+            "current_date" => Some(Self::CurrentDate),
+            "current_time" => Some(Self::CurrentTime),
+            "localtimestamp" => Some(Self::LocalTimestamp),
+            "localtime" => Some(Self::LocalTime),
+            _ => None,
+        }
+    }
+
+    /// 小文字のキーワード表記（結果列名・CHECK／ビューの render 用。PostgreSQL の既定列名と同じ）。
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::CurrentTimestamp => "current_timestamp",
+            Self::CurrentDate => "current_date",
+            Self::CurrentTime => "current_time",
+            Self::LocalTimestamp => "localtimestamp",
+            Self::LocalTime => "localtime",
+        }
+    }
+
+    /// 精度指定（`(p)`）を取りうる種別か（`CURRENT_DATE` は取らない）。
+    pub fn accepts_precision(self) -> bool {
+        !matches!(self, Self::CurrentDate)
+    }
+
+    /// `content_hash` 用の安定した 1 バイト識別子（変更禁止）。
+    pub(crate) fn hash_tag(self) -> u8 {
+        match self {
+            Self::CurrentTimestamp => 1,
+            Self::CurrentDate => 2,
+            Self::CurrentTime => 3,
+            Self::LocalTimestamp => 4,
+            Self::LocalTime => 5,
+        }
+    }
+}
+
+/// jsonb 演算子の種別（[`Expr::JsonAccess`]。パス取得・包含・存在）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonAccessOp {
     /// `->`（右辺はキーまたは添字。結果は jsonb）。
@@ -293,6 +354,16 @@ pub enum JsonAccessOp {
     Path,
     /// `#>>`（右辺は text[] リテラル。結果は text）。
     PathText,
+    /// `@>`（両辺 jsonb。結果は bool。Issue #1598）。
+    Contains,
+    /// `<@`（両辺 jsonb。結果は bool。Issue #1598）。
+    ContainedBy,
+    /// `?`（右辺は text。結果は bool。Issue #1598）。
+    Exists,
+    /// `?|`（右辺は text[] リテラル。結果は bool。Issue #1598）。
+    ExistsAny,
+    /// `?&`（右辺は text[] リテラル。結果は bool。Issue #1598）。
+    ExistsAll,
 }
 
 impl JsonAccessOp {
@@ -303,7 +374,25 @@ impl JsonAccessOp {
             JsonAccessOp::GetText => "->>",
             JsonAccessOp::Path => "#>",
             JsonAccessOp::PathText => "#>>",
+            JsonAccessOp::Contains => "@>",
+            JsonAccessOp::ContainedBy => "<@",
+            JsonAccessOp::Exists => "?",
+            JsonAccessOp::ExistsAny => "?|",
+            JsonAccessOp::ExistsAll => "?&",
         }
+    }
+
+    /// bool を返す演算子（包含・存在）かどうか。WHERE の裸の述語として受理できる
+    /// （`allowlist::Parser::parse_expression_predicate`）。
+    pub fn is_predicate(self) -> bool {
+        matches!(
+            self,
+            JsonAccessOp::Contains
+                | JsonAccessOp::ContainedBy
+                | JsonAccessOp::Exists
+                | JsonAccessOp::ExistsAny
+                | JsonAccessOp::ExistsAll
+        )
     }
 }
 
@@ -423,6 +512,50 @@ pub enum BoundExpr {
         rhs: JsonAccessRhs,
         as_text: bool,
     },
+    /// jsonb の包含・存在演算子の束縛結果（Issue #1598・TABLE-25）。結果は bool
+    /// （[`ExprType::Bool`]）。`lhs` は jsonb を返す式。`<@` は評価時に左右を入れ替えて
+    /// `@>` として判定する。左右いずれかが SQL の NULL なら結果も NULL（strict）。
+    JsonPredicate {
+        op: JsonPredicateOp,
+        lhs: Box<BoundExpr>,
+        rhs: JsonPredicateRhs,
+    },
+}
+
+/// [`BoundExpr::JsonPredicate`] の演算子（Issue #1598）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonPredicateOp {
+    /// `@>`
+    Contains,
+    /// `<@`
+    ContainedBy,
+    /// `?`
+    Exists,
+    /// `?|`
+    ExistsAny,
+    /// `?&`
+    ExistsAll,
+}
+
+/// [`BoundExpr::JsonPredicate`] の右辺（束縛時に種別を確定済み）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonPredicateRhs {
+    /// `@>`／`<@` の jsonb 式。
+    Jsonb(Box<BoundExpr>),
+    /// `?` のキー（text を返す式）。
+    Key(Box<BoundExpr>),
+    /// `?|`／`?&` のキー集合（束縛時に解析済みの text[] リテラル。`None` は NULL 要素）。
+    Keys(Vec<Option<String>>),
+}
+
+impl JsonPredicateRhs {
+    /// 右辺が評価する式（`Keys` は式を持たない）。列参照・ノード数の走査用。
+    fn expr(&self) -> Option<&BoundExpr> {
+        match self {
+            JsonPredicateRhs::Jsonb(e) | JsonPredicateRhs::Key(e) => Some(e),
+            JsonPredicateRhs::Keys(_) => None,
+        }
+    }
 }
 
 /// [`BoundExpr::JsonAccess`] の右辺（束縛時に種別を確定済み）。
@@ -469,6 +602,18 @@ impl PartialEq for BoundExpr {
                     as_text: tb,
                 },
             ) => la == lb && ra == rb && ta == tb,
+            (
+                BoundExpr::JsonPredicate {
+                    op: oa,
+                    lhs: la,
+                    rhs: ra,
+                },
+                BoundExpr::JsonPredicate {
+                    op: ob,
+                    lhs: lb,
+                    rhs: rb,
+                },
+            ) => oa == ob && la == lb && ra == rb,
             (BoundExpr::JsonbLiteral(a), BoundExpr::JsonbLiteral(b)) => a == b,
             (BoundExpr::IdRef, BoundExpr::IdRef) => true,
             (
@@ -660,12 +805,21 @@ pub enum BuiltinFn {
     /// 解決できない。`bind_call`／`bind_binary` が `date_part`／`date_trunc` の
     /// `DATE` 引数、および `DATE`／`TIMESTAMP` 比較の `DATE` 側に挿入する）。
     DateToTimestamp,
+    /// `CHAR(n)` 列参照を TEXT として扱うための内部専用関数（名前では解決できない）。
+    /// 保存形（n 文字へ空白詰め）から末尾の半角空白（U+0020 のみ）を除く。PostgreSQL の
+    /// bpchar→text 変換と同じで、`length`／`lower`／`||`／TEXT 列との比較が末尾空白を
+    /// 無視した値で動く。`bind_expr_in` の列参照腕だけが挿入する（TABLE-31・Issue #1566）。
+    BpcharToText,
     /// 投影位置の整数／単精度の型付き算術（`+ - * /`）を表す内部専用関数（名前では
     /// 解決できない。Issue #1539・SQL-42。`bind_expr_in` の `Expr::Binary` 腕が
     /// 投影モード〔[`BindEnv::typed_arith`]〕のときだけ挿入する）。整数除算の切り捨て
     /// と checked オーバーフロー（`22003`）をノード単位で行うため、f64 一括計算では
     /// なく専用の演算ノードにしている（`(7/2)*2` が PostgreSQL と同じく 6 になる）。
     TypedArith(BinOp, NumericKind),
+    /// `clock_timestamp() -> Timestamp`（呼び出しごとに壁時計を読む。SQL-37・Issue #1586）。
+    /// 他の時刻関数と違い束縛時に定数化せず、評価のたびに `sql::time_fn::now_micros` を呼ぶ。
+    /// 畳み込み・共通部分式の 1 回化の対象外（[`is_foldable_builtin`]）。
+    ClockTimestamp,
 }
 
 /// 型付き算術（[`BuiltinFn::TypedArith`]）の結果種別。`float8` は既存の
@@ -692,7 +846,19 @@ pub enum NumericKind {
 /// `Round1`／`Round2` へオーバーロード解決されるため [`builtin_from_name`] の
 /// 対象外だが、名前としては組み込み扱いにする必要があるためここで別途判定する。
 pub(crate) fn is_builtin_function_name(name: &str) -> bool {
-    builtin_from_name(name).is_some() || is_variadic_or_overloaded_builtin_name(name)
+    builtin_from_name(name).is_some()
+        || is_variadic_or_overloaded_builtin_name(name)
+        || is_current_time_function_name(name)
+}
+
+/// 現在時刻関数（関数形）の名前か（SQL-37・Issue #1586）。`now`・`transaction_timestamp`・
+/// `statement_timestamp`・`clock_timestamp`。CHECK・定数式（INSERT VALUES）・連鎖ビュー本文が
+/// 受理しない文脈で拒否判定に使う。
+pub(crate) fn is_current_time_function_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp"
+    )
 }
 
 /// 式木の中で最初に見つかった「組み込み関数以外の呼び出し」の関数名を返す
@@ -704,6 +870,15 @@ pub(crate) fn is_builtin_function_name(name: &str) -> bool {
 /// 網羅し `_ =>` を置かない（variant 追加時にコンパイルエラーで検査漏れに気づく。
 /// fail-closed）。再帰の深さは構文段の式ネスト上限で抑えられる。
 pub(crate) fn first_non_builtin_call(expr: &Expr) -> Option<&str> {
+    first_non_builtin_call_with(expr, false)
+}
+
+/// [`first_non_builtin_call`] の本体。`allow_current_time` が真のときだけ現在時刻関数
+/// （`now()` 等・括弧なし値関数）を禁止要素として報告しない。分割実行 DML の `SET` 右辺が、
+/// トランザクション固定の時刻だけを受理するスコープ（[`time_fn::ClockPolicy::TxnFixedOnly`]）の
+/// 中でのみ真にする（`sql::set_expr`。SQL-37・Issue #1587）。`statement_timestamp()`・
+/// `clock_timestamp()` はここでは通し、束縛段（`reject_non_txn_fixed_clock`）が `0A000` にする。
+pub(crate) fn first_non_builtin_call_with(expr: &Expr, allow_current_time: bool) -> Option<&str> {
     match expr {
         Expr::Number(_)
         | Expr::Ident(_)
@@ -712,21 +887,41 @@ pub(crate) fn first_non_builtin_call(expr: &Expr) -> Option<&str> {
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_) => None,
         Expr::Call { name, args } => {
-            if !is_builtin_function_name(name) {
+            if !is_builtin_function_name(name)
+                || (!allow_current_time && is_current_time_function_name(name))
+            {
                 return Some(name.as_str());
             }
-            args.iter().find_map(first_non_builtin_call)
+            args.iter()
+                .find_map(|a| first_non_builtin_call_with(a, allow_current_time))
         }
         Expr::Binary { lhs, rhs, .. }
         | Expr::NullIf(lhs, rhs)
-        | Expr::JsonAccess { lhs, rhs, .. } => {
-            first_non_builtin_call(lhs).or_else(|| first_non_builtin_call(rhs))
-        }
+        | Expr::JsonAccess { lhs, rhs, .. } => first_non_builtin_call_with(lhs, allow_current_time)
+            .or_else(|| first_non_builtin_call_with(rhs, allow_current_time)),
         Expr::Case { whens, else_result } => whens
             .iter()
-            .find_map(|(c, r)| first_non_builtin_call(c).or_else(|| first_non_builtin_call(r)))
-            .or_else(|| else_result.as_deref().and_then(first_non_builtin_call)),
-        Expr::Coalesce(args) => args.iter().find_map(first_non_builtin_call),
+            .find_map(|(c, r)| {
+                first_non_builtin_call_with(c, allow_current_time)
+                    .or_else(|| first_non_builtin_call_with(r, allow_current_time))
+            })
+            .or_else(|| {
+                else_result
+                    .as_deref()
+                    .and_then(|e| first_non_builtin_call_with(e, allow_current_time))
+            }),
+        Expr::Coalesce(args) => args
+            .iter()
+            .find_map(|a| first_non_builtin_call_with(a, allow_current_time)),
+        // 現在時刻関数（SQL-37・Issue #1586）は組み込みだが、CHECK（TABLE-16）・連鎖ビュー本文
+        // （TABLE-18）では決定的でないため禁止要素として報告する（`42601`）。
+        Expr::ValueFunction { kind, .. } => {
+            if allow_current_time {
+                None
+            } else {
+                Some(kind.as_sql())
+            }
+        }
     }
 }
 
@@ -752,6 +947,7 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "mod" => Some(BuiltinFn::Mod),
         "power" => Some(BuiltinFn::Power),
         "sqrt" => Some(BuiltinFn::Sqrt),
+        "clock_timestamp" => Some(BuiltinFn::ClockTimestamp),
         // `round` は arity オーバーロード（1 引数／2 引数）のため、名前だけでは
         // 一意に variant を決定できない。呼び出し元（`bind_call`・
         // `validate_closed_expr`）が引数個数を見て `Round1`／`Round2` を
@@ -815,7 +1011,10 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::DatePart(_) => (&[ExprType::Timestamp], ExprType::Scalar),
         BuiltinFn::DateTrunc(_) => (&[ExprType::Timestamp], ExprType::Timestamp),
         BuiltinFn::DateToTimestamp => (&[ExprType::Date], ExprType::Timestamp),
+        BuiltinFn::BpcharToText => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::TypedArith(_, _) => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
+        // 戻り値型は TIMESTAMP（D8 の暫定。TIMESTAMPTZ 型の実装時に切り替える）。
+        BuiltinFn::ClockTimestamp => (&[], ExprType::Timestamp),
     }
 }
 
@@ -859,7 +1058,12 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         // ため同様に対象外とする。正しさには影響しない（defer-on-error で
         // 実行時に評価される。対象外事項として `docs/design/
         // datetime-scalar-functions.md` に記録）。
-        BuiltinFn::DatePart(_) | BuiltinFn::DateTrunc(_) | BuiltinFn::DateToTimestamp => false,
+        BuiltinFn::DatePart(_)
+        | BuiltinFn::DateTrunc(_)
+        | BuiltinFn::DateToTimestamp
+        | BuiltinFn::BpcharToText => false,
+        // 非決定的（呼び出しごとに値が変わる）ため畳み込まない（SQL-37・Issue #1586）。
+        BuiltinFn::ClockTimestamp => false,
         // Issue #1539・SQL-42: 型付き算術は `Binary` と同じく `Scalar` を返す純関数で、
         // 0 除算・オーバーフローは defer-on-error（畳み込み失敗時は実行時に評価）。
         BuiltinFn::TypedArith(_, _) => true,
@@ -1113,7 +1317,7 @@ fn validate_closed_expr(
         // jsonb パス演算子は列参照を要するため、列参照を持てない関数本体では常に未対応
         // （Issue #1596。jsonb 値を受け取る関数引数型も存在しない）。
         Expr::JsonAccess { .. } => Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "JSON path operators are not supported in a function body".to_string(),
+            detail: "JSON operators are not supported in a function body".to_string(),
         }),
         Expr::Ident(name) => {
             // `params` は `define_function` で正規化済み（小文字）。本体側の参照は
@@ -1138,7 +1342,19 @@ fn validate_closed_expr(
             // ここを素通りすると `CREATE FUNCTION f() AS vec_norm()` のような
             // 引数数不一致の関数本体が「定義時検証」という公開契約に反して登録
             // されてしまう（呼び出し時の `bind_call` 側の検査だけでは間に合わない）。
-            if name.eq_ignore_ascii_case("concat") {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "now" | "transaction_timestamp" | "statement_timestamp"
+            ) {
+                // 現在時刻関数（SQL-37・Issue #1586）は 0 引数の組み込み。`clock_timestamp` は
+                // 下の `builtin_from_name` 分岐で解決される。
+                if !args.is_empty() {
+                    return Err(SqlSurfaceError::undefined_function(format!(
+                        "function {name} expects 0 argument(s), got {}",
+                        args.len()
+                    )));
+                }
+            } else if name.eq_ignore_ascii_case("concat") {
                 if args.is_empty() {
                     return Err(SqlSurfaceError::undefined_function(
                         "function concat expects at least 1 argument, got 0",
@@ -1236,6 +1452,8 @@ fn validate_closed_expr(
             validate_closed_expr(rhs, params, registry, node_budget)
         }
         Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => Ok(()),
+        // 時刻の値関数は呼び出し側の文脈（読み取り文）の時刻へ展開時に束縛される。
+        Expr::ValueFunction { .. } => Ok(()),
     }
 }
 
@@ -1258,6 +1476,10 @@ struct BindEnv<'a> {
     /// （[`bind_projection_expr`]・[`bind_const_expr`]）だけが立て、`WHERE`／
     /// `ORDER BY`／`CHECK`／UDF 本体は従来の f64 意味論のまま（`false`）。
     typed_arith: bool,
+    /// 読み取り文の入口が確定した時刻（SQL-37・Issue #1586。[`time_fn::current_clock`]）。
+    /// `None` の文脈では時刻関数を `0A000` で拒否する。UDF 本体の展開（`inner_env`）は
+    /// 呼び出し側の値を継承する。
+    clock: Option<StatementClock>,
 }
 
 /// 展開済み [`BoundExpr`] のノード数を数える。UDF 連鎖のパラメータ参照展開時に
@@ -1300,6 +1522,13 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
                 + match rhs {
                     JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) => count_bound_nodes(e),
                     JsonAccessRhs::Path(p) => p.len(),
+                }
+        }
+        BoundExpr::JsonPredicate { lhs, rhs, .. } => {
+            1 + count_bound_nodes(lhs)
+                + match rhs {
+                    JsonPredicateRhs::Keys(k) => k.len(),
+                    other => other.expr().map_or(0, count_bound_nodes),
                 }
         }
         BoundExpr::Builtin { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
@@ -1354,6 +1583,9 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
                 JsonAccessRhs::Path(_) => 0,
             };
             max_bound_case_nesting(lhs).max(r)
+        }
+        BoundExpr::JsonPredicate { lhs, rhs, .. } => {
+            max_bound_case_nesting(lhs).max(rhs.expr().map_or(0, max_bound_case_nesting))
         }
         BoundExpr::Builtin { args, .. } => {
             args.iter().map(max_bound_case_nesting).max().unwrap_or(0)
@@ -1412,6 +1644,9 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
                     JsonAccessRhs::Path(_) => false,
                 }
         }
+        BoundExpr::JsonPredicate { lhs, rhs, .. } => {
+            references_embedding(lhs) || rhs.expr().is_some_and(references_embedding)
+        }
         BoundExpr::Builtin { args, .. } => args.iter().any(references_embedding),
         BoundExpr::Binary { lhs, rhs, .. } => {
             references_embedding(lhs) || references_embedding(rhs)
@@ -1442,6 +1677,12 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             visit_referenced_scalar_columns(lhs, visit);
             if let JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) = rhs {
+                visit_referenced_scalar_columns(e, visit);
+            }
+        }
+        BoundExpr::JsonPredicate { lhs, rhs, .. } => {
+            visit_referenced_scalar_columns(lhs, visit);
+            if let Some(e) = rhs.expr() {
                 visit_referenced_scalar_columns(e, visit);
             }
         }
@@ -1530,6 +1771,16 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
             }
             any
         }
+        // 包含・存在演算子（Issue #1598）。左辺・右辺の式が参照する列を両方反映する。
+        BoundExpr::JsonPredicate { lhs, rhs, .. } => {
+            let mut any = mark_referenced_scalar_columns(lhs, mask);
+            if let Some(e) = rhs.expr() {
+                if mark_referenced_scalar_columns(e, mask) {
+                    any = true;
+                }
+            }
+            any
+        }
         // `any`/`fold` は短絡評価となり、先頭の一致以降の引数をマークし損ねる
         // （複数引数が別々の TEXT 列を参照しうる。例: `concat(a, b)`）ため、
         // 明示ループで全引数を必ず走査する（`references_embedding` の `any`
@@ -1599,6 +1850,7 @@ pub fn bind_expr(
         registry,
         case_nesting: 0,
         typed_arith: false,
+        clock: time_fn::current_clock(),
     };
     bind_expr_in(expr, &mut env, node_budget)
 }
@@ -1633,6 +1885,7 @@ pub(crate) fn bind_projection_expr_json_ok(
         registry,
         case_nesting: 0,
         typed_arith: true,
+        clock: time_fn::current_clock(),
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
     let col = expr_result_column_type(expr, &bound, ty);
@@ -1654,6 +1907,7 @@ pub(crate) fn bind_order_expr(
         registry,
         case_nesting: 0,
         typed_arith: false,
+        clock: time_fn::current_clock(),
     };
     bind_expr_any(expr, &mut env, node_budget)
 }
@@ -1747,6 +2001,7 @@ pub(crate) fn bind_const_expr(
         registry,
         case_nesting: 0,
         typed_arith: true,
+        clock: time_fn::current_clock(),
     };
     let (bound, ty) = bind_expr_in(expr, &mut env, node_budget)?;
     let col = expr_result_column_type(expr, &bound, ty);
@@ -2124,10 +2379,15 @@ fn bind_expr_any(
                     | ColumnType::BigInt
                     | ColumnType::Real
                     | ColumnType::Double => Ok((BoundExpr::ColumnRef { index }, ExprType::Scalar)),
-                    // `CHAR(n)` の式内参照は bpchar 比較（Issue #1566）まで fail-closed に拒否する。
-                    ColumnType::Bpchar(_) => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} cannot be used in an expression (CHAR columns are not supported yet)"
-                    ))),
+                    // `CHAR(n)` の式内参照は TEXT へ変換した値（末尾の半角空白を除く）として
+                    // 扱う（PostgreSQL の bpchar→text 変換と同じ。TABLE-31・Issue #1566）。
+                    ColumnType::Bpchar(_) => Ok((
+                        BoundExpr::Builtin {
+                            f: BuiltinFn::BpcharToText,
+                            args: vec![BoundExpr::TextColumnRef { index }],
+                        },
+                        ExprType::Text,
+                    )),
                     ColumnType::Boolean => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BOOLEAN columns are not supported)"
                     ))),
@@ -2265,6 +2525,66 @@ fn bind_expr_any(
         Expr::DateLiteral(days) => Ok((BoundExpr::Date(*days), ExprType::Date)),
         Expr::TimestampLiteral(micros) => Ok((BoundExpr::Timestamp(*micros), ExprType::Timestamp)),
         Expr::JsonAccess { op, lhs, rhs } => bind_json_access(*op, lhs, rhs, env, node_budget),
+        Expr::ValueFunction { kind, precision } => bind_value_function(*kind, *precision, env),
+    }
+}
+
+/// 時刻関数を束縛する文脈の確定時刻を取り出す。`None`（読み取り文の入口が時計を確定していない
+/// 文脈。INSERT／UPDATE／DELETE／COPY／CHECK／DEFAULT／VIEW 本文等）は `0A000` で拒否する
+/// （SQL-37・Issue #1586。許可リスト型の fail-closed）。
+fn require_clock(env: &BindEnv<'_>) -> Result<StatementClock, SqlSurfaceError> {
+    // 分割実行 DML が「時刻値関数を含む文か」を判定するための印（`time_fn::ClockScope::was_used`）。
+    time_fn::mark_clock_used();
+    env.clock
+        .ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
+            detail: "current time functions are not supported in this context".to_string(),
+        })
+}
+
+/// 「トランザクション固定のみ」スコープ（分割実行 DML。[`time_fn::ClockPolicy::TxnFixedOnly`]）で
+/// `statement_timestamp()`・`clock_timestamp()` を `0A000` にする（再開時に値を再現できないため
+/// fail-closed。SQL-37・RECOVER-11・Issue #1587。書き込み側の対応は #2188）。
+fn reject_non_txn_fixed_clock(name: &str) -> Result<(), SqlSurfaceError> {
+    if time_fn::current_clock_policy() == time_fn::ClockPolicy::TxnFixedOnly {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!("{name}() is not supported in a partitioned statement"),
+        });
+    }
+    Ok(())
+}
+
+/// 括弧なし値関数（`CURRENT_TIMESTAMP`・`CURRENT_DATE`・`LOCALTIMESTAMP`）を束縛時に確定した
+/// 定数へ解決する。`CURRENT_TIME`・`LOCALTIME` は TIME 型が未実装のため `0A000`。
+fn bind_value_function(
+    kind: ValueFunctionKind,
+    precision: Option<u8>,
+    env: &BindEnv<'_>,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    match kind {
+        ValueFunctionKind::CurrentTime | ValueFunctionKind::LocalTime => {
+            Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "TIME values are not supported".to_string(),
+            })
+        }
+        ValueFunctionKind::CurrentDate => {
+            let clock = require_clock(env)?;
+            let days = time_fn::micros_to_days(clock.txn_start_micros).ok_or_else(|| {
+                SqlSurfaceError::datetime_field_overflow("current date is out of range")
+            })?;
+            Ok((BoundExpr::Date(days), ExprType::Date))
+        }
+        ValueFunctionKind::CurrentTimestamp | ValueFunctionKind::LocalTimestamp => {
+            let clock = require_clock(env)?;
+            let micros = match precision {
+                None => clock.txn_start_micros,
+                Some(p) => time_fn::round_to_precision(clock.txn_start_micros, p).ok_or(
+                    SqlSurfaceError::InvalidParameterValue {
+                        detail: "timestamp precision must be between 0 and 6",
+                    },
+                )?,
+            };
+            Ok((BoundExpr::Timestamp(micros), ExprType::Timestamp))
+        }
     }
 }
 
@@ -2302,6 +2622,9 @@ fn bind_json_access(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if op.is_predicate() {
+        return bind_json_predicate(op, lhs, rhs, env, node_budget);
+    }
     let operator_missing = || {
         SqlSurfaceError::undefined_function(format!(
             "operator does not exist: the operand types do not match the {} operator",
@@ -2361,6 +2684,15 @@ fn bind_json_access(
                 _ => return Err(operator_missing()),
             }
         }
+        JsonAccessOp::Contains
+        | JsonAccessOp::ContainedBy
+        | JsonAccessOp::Exists
+        | JsonAccessOp::ExistsAny
+        | JsonAccessOp::ExistsAll => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "JSON predicate operator reached the path operator binder".to_string(),
+            })
+        }
         JsonAccessOp::Path | JsonAccessOp::PathText => {
             let Expr::String(literal) = rhs else {
                 return Err(SqlSurfaceError::FeatureNotSupported {
@@ -2394,6 +2726,161 @@ fn bind_json_access(
             as_text,
         },
         result_ty,
+    ))
+}
+
+/// jsonb 述語（`@>` `<@` `?` `?|` `?&`。Issue #1598・TABLE-25）の jsonb オペランドを束縛する。
+/// `json` 列は `42883`（PostgreSQL に json 用の演算子は無い。パス演算子の `0A000` とは
+/// 異なる）、それ以外は通常の式として束縛する（jsonb 以外の型は呼び出し元が `42883` にする）。
+fn bind_json_predicate_operand(
+    expr: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if let Expr::Ident(name) = expr {
+        if !env.params.contains_key(name.to_ascii_lowercase().as_str()) {
+            let is_json_column = env.schema.is_some_and(|sc| {
+                sc.columns
+                    .iter()
+                    .any(|c| &c.name == name && matches!(c.ty, ColumnType::Json))
+            });
+            if is_json_column {
+                return Err(SqlSurfaceError::undefined_function(
+                    "operator does not exist: a json column cannot be used with a jsonb containment or existence operator",
+                ));
+            }
+        }
+    }
+    bind_expr_any(expr, env, node_budget)
+}
+
+/// 型なし文字列リテラルを jsonb 述語のオペランドとして解釈する（1 ノード課金）。
+fn bind_json_predicate_literal(
+    expr: &Expr,
+    node_budget: &mut usize,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    let Expr::String(s) = expr else {
+        return Err(SqlSurfaceError::Internal {
+            detail: "jsonb literal operand is not a string literal".to_string(),
+        });
+    };
+    *node_budget = node_budget
+        .checked_sub(1)
+        .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+    bind_jsonb_literal(s).map(|(b, _)| b)
+}
+
+/// jsonb の包含・存在演算子の束縛（Issue #1598・TABLE-25）。型規則は PostgreSQL に合わせ、
+/// 合わない組は `42883`、`?|`／`?&` の右辺が text[] リテラルでない場合は `0A000`
+/// （`#>` の前例。配列式は TABLE-35 の担当）。型なし文字列リテラルは反対側が jsonb のとき
+/// jsonb として解釈する（不正な JSON は `22P02`、長さ超過は `54000`。左右どちらでも同じ）。
+fn bind_json_predicate(
+    op: JsonAccessOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let operator_missing = || {
+        SqlSurfaceError::undefined_function(format!(
+            "operator does not exist: the operand types do not match the {} operator",
+            op.as_sql()
+        ))
+    };
+    let pred_op = match op {
+        JsonAccessOp::Contains => JsonPredicateOp::Contains,
+        JsonAccessOp::ContainedBy => JsonPredicateOp::ContainedBy,
+        JsonAccessOp::Exists => JsonPredicateOp::Exists,
+        JsonAccessOp::ExistsAny => JsonPredicateOp::ExistsAny,
+        JsonAccessOp::ExistsAll => JsonPredicateOp::ExistsAll,
+        _ => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "non-predicate JSON operator reached the predicate binder".to_string(),
+            })
+        }
+    };
+    let (l_bound, rhs_bound) = match pred_op {
+        JsonPredicateOp::Contains | JsonPredicateOp::ContainedBy => {
+            let lhs_is_literal = matches!(lhs, Expr::String(_));
+            let rhs_is_literal = matches!(rhs, Expr::String(_));
+            // 文字列リテラル同士は PostgreSQL では解決できるが、本実装は #1596 と同じ
+            // `42883` に統一する（SQLSTATE 差は対象外）。
+            if lhs_is_literal && rhs_is_literal {
+                return Err(operator_missing());
+            }
+            // 非リテラル側を先に束縛して jsonb であることを確認し、その後にリテラル側を
+            // jsonb として解釈する（左右どちらにリテラルを置いても同じ結果・同じ SQLSTATE）。
+            let (l_bound, r_bound) = if lhs_is_literal {
+                let (r, r_ty) = bind_json_predicate_operand(rhs, env, node_budget)?;
+                if r_ty != ExprType::Json {
+                    return Err(operator_missing());
+                }
+                (bind_json_predicate_literal(lhs, node_budget)?, r)
+            } else {
+                let (l, l_ty) = bind_json_predicate_operand(lhs, env, node_budget)?;
+                if l_ty != ExprType::Json {
+                    return Err(operator_missing());
+                }
+                if rhs_is_literal {
+                    (l, bind_json_predicate_literal(rhs, node_budget)?)
+                } else {
+                    let (r, r_ty) = bind_json_predicate_operand(rhs, env, node_budget)?;
+                    if r_ty != ExprType::Json {
+                        return Err(operator_missing());
+                    }
+                    (l, r)
+                }
+            };
+            (l_bound, JsonPredicateRhs::Jsonb(Box::new(r_bound)))
+        }
+        JsonPredicateOp::Exists => {
+            let (l, l_ty) = bind_json_predicate_operand(lhs, env, node_budget)?;
+            if l_ty != ExprType::Json {
+                return Err(operator_missing());
+            }
+            let (r, r_ty) = bind_expr_in(rhs, env, node_budget)?;
+            if r_ty != ExprType::Text {
+                return Err(operator_missing());
+            }
+            (l, JsonPredicateRhs::Key(Box::new(r)))
+        }
+        JsonPredicateOp::ExistsAny | JsonPredicateOp::ExistsAll => {
+            let (l, l_ty) = bind_json_predicate_operand(lhs, env, node_budget)?;
+            if l_ty != ExprType::Json {
+                return Err(operator_missing());
+            }
+            let Expr::String(literal) = rhs else {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "the right operand of ?| and ?& must be a text[] literal".to_string(),
+                });
+            };
+            *node_budget = node_budget
+                .checked_sub(1)
+                .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+            let array_ty = crate::catalog::ArrayType::new(
+                crate::catalog::ArrayElemType::Text,
+                crate::catalog::MAX_ARRAY_ELEMENTS,
+            )
+            .map_err(|_| SqlSurfaceError::Internal {
+                detail: "text[] type construction failed".to_string(),
+            })?;
+            match crate::sql::parser::parse_array_literal(literal, array_ty)? {
+                crate::row_codec::ArrayValue::Text(items) => (l, JsonPredicateRhs::Keys(items)),
+                _ => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "text[] literal parsed to a non-text array".to_string(),
+                    })
+                }
+            }
+        }
+    };
+    Ok((
+        BoundExpr::JsonPredicate {
+            op: pred_op,
+            lhs: Box::new(l_bound),
+            rhs: rhs_bound,
+        },
+        ExprType::Bool,
     ))
 }
 
@@ -2620,6 +3107,20 @@ fn bind_unknown_literal_against(
         return bind_jsonb_literal(s);
     }
     if other_ty != ExprType::Scalar {
+        // 相手が `CHAR(n)` 列参照（`BpcharToText`）なら、型なし文字列リテラルは bpchar として
+        // 解決され末尾の半角空白が比較に影響しない（TABLE-31・Issue #1566）。
+        if matches!(
+            other,
+            BoundExpr::Builtin {
+                f: BuiltinFn::BpcharToText,
+                ..
+            }
+        ) {
+            return Ok((
+                BoundExpr::Text(s.trim_end_matches(' ').to_string()),
+                ExprType::Text,
+            ));
+        }
         return Ok((BoundExpr::Text(s.to_string()), ExprType::Text));
     }
     let column_ty = match other {
@@ -2849,6 +3350,38 @@ fn bind_call(
         return bind_date_part_or_trunc(&lower_name, args, env, node_budget);
     }
 
+    // 現在時刻関数（SQL-37・Issue #1586）。引数を取らない（`now(1)` は arity 違反の `42883`）。
+    // `now`・`transaction_timestamp` は txn 開始時刻、`statement_timestamp` は文の開始時刻を
+    // 束縛時の定数にする。`clock_timestamp` は下の組み込み解決で `BuiltinFn::ClockTimestamp`
+    // （評価のたび壁時計を読む）になるが、時計の確定していない文脈では同じく拒否する。
+    if is_current_time_function_name(&lower_name) {
+        if !args.is_empty() {
+            return Err(SqlSurfaceError::undefined_function(format!(
+                "function {name} expects 0 argument(s), got {}",
+                args.len()
+            )));
+        }
+        let clock = require_clock(env)?;
+        match lower_name.as_str() {
+            "now" | "transaction_timestamp" => {
+                return Ok((
+                    BoundExpr::Timestamp(clock.txn_start_micros),
+                    ExprType::Timestamp,
+                ));
+            }
+            "statement_timestamp" => {
+                reject_non_txn_fixed_clock(&lower_name)?;
+                return Ok((
+                    BoundExpr::Timestamp(clock.stmt_start_micros),
+                    ExprType::Timestamp,
+                ));
+            }
+            _ => {
+                reject_non_txn_fixed_clock(&lower_name)?;
+            }
+        }
+    }
+
     if let Some(builtin) = builtin_from_name(name) {
         let (param_types, ret) = builtin_signature(builtin);
         if args.len() != param_types.len() {
@@ -2913,6 +3446,8 @@ fn bind_call(
             case_nesting: env.case_nesting,
             // UDF 本体は従来の f64 意味論のまま（Issue #1539。投影モードは本体へ伝播しない）。
             typed_arith: false,
+            // 呼び出し側の確定時刻を継承する（本体中の時刻関数は呼び出し文の時刻で束縛される）。
+            clock: env.clock,
         };
         return bind_expr_in(&def.body, &mut inner_env, node_budget);
     }
@@ -3322,6 +3857,72 @@ fn eval_json_access<'a>(
     })
 }
 
+/// [`crate::json::JsonColumnError`] を SQL 表層のエラーへ写す（評価時。上限超過は `54000`、
+/// 格納値の破損は格納契約違反として固定文言の `Internal`。行の値・リテラル本文は含めない）。
+fn json_predicate_error(e: crate::json::JsonColumnError) -> SqlSurfaceError {
+    match e {
+        crate::json::JsonColumnError::TooLong => SqlSurfaceError::payload_too_large(
+            "jsonb containment evaluation exceeds the allowed size",
+        ),
+        crate::json::JsonColumnError::Invalid => SqlSurfaceError::Internal {
+            detail: "stored jsonb value could not be parsed".to_string(),
+        },
+    }
+}
+
+/// 包含・存在演算子の評価（Issue #1598・TABLE-25）。左辺・右辺（jsonb 式・キー式）の
+/// いずれかが NULL なら結果は NULL。`?|`／`?&` のキー集合の NULL 要素は読み飛ばす
+/// （PostgreSQL の `jsonb_exists_any`／`jsonb_exists_all` と同じ。`#>` の NULL 伝播とは異なる）。
+fn eval_json_predicate<'a>(
+    op: JsonPredicateOp,
+    lhs: &BoundExpr,
+    rhs: &JsonPredicateRhs,
+    id: u64,
+    embedding: &'a [f32],
+    row_scalars: &'a [Option<ScalarRef<'a>>],
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    let stored = match eval_with_scalars(lhs, id, embedding, row_scalars)? {
+        ExprValue::Json(j) => j,
+        ExprValue::Null => return Ok(ExprValue::Null),
+        _ => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "JSON predicate left operand is not a jsonb value".to_string(),
+            })
+        }
+    };
+    let result = match rhs {
+        JsonPredicateRhs::Jsonb(e) => {
+            let other = match eval_with_scalars(e, id, embedding, row_scalars)? {
+                ExprValue::Json(j) => j,
+                ExprValue::Null => return Ok(ExprValue::Null),
+                _ => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "JSON predicate right operand is not a jsonb value".to_string(),
+                    })
+                }
+            };
+            match op {
+                JsonPredicateOp::ContainedBy => crate::json::jsonb_contains(&other, &stored),
+                _ => crate::json::jsonb_contains(&stored, &other),
+            }
+        }
+        JsonPredicateRhs::Key(e) => match eval_with_scalars(e, id, embedding, row_scalars)? {
+            ExprValue::Text(k) => crate::json::jsonb_exists(&stored, &k),
+            ExprValue::Null => return Ok(ExprValue::Null),
+            _ => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "JSON predicate key is not a text value".to_string(),
+                })
+            }
+        },
+        JsonPredicateRhs::Keys(keys) => match op {
+            JsonPredicateOp::ExistsAll => crate::json::jsonb_exists_all(&stored, keys),
+            _ => crate::json::jsonb_exists_any(&stored, keys),
+        },
+    };
+    result.map(ExprValue::Bool).map_err(json_predicate_error)
+}
+
 pub fn eval<'a>(
     expr: &BoundExpr,
     id: u64,
@@ -3416,6 +4017,9 @@ pub(crate) fn eval_with_scalars<'a>(
         BoundExpr::JsonbLiteral(text) => Ok(ExprValue::Json(Cow::Owned(text.clone()))),
         BoundExpr::JsonAccess { lhs, rhs, as_text } => {
             eval_json_access(lhs, rhs, *as_text, id, embedding, row_scalars)
+        }
+        BoundExpr::JsonPredicate { op, lhs, rhs } => {
+            eval_json_predicate(*op, lhs, rhs, id, embedding, row_scalars)
         }
         BoundExpr::IdRef => id_as_finite_scalar(id).map(ExprValue::Scalar),
         BoundExpr::IdCompare { op, value } => Ok(ExprValue::Bool(id_compare(*op, id, *value))),
@@ -3826,11 +4430,21 @@ pub(crate) fn apply_builtin<'a>(
             let d = take_date_arg(args, 0)?;
             Ok(ExprValue::Timestamp(datetime_fn::date_to_timestamp(d)))
         }
+        BuiltinFn::BpcharToText => match take_text_or_null_arg(args, 0)? {
+            None => Ok(ExprValue::Null),
+            Some(Cow::Borrowed(s)) => Ok(ExprValue::Text(Cow::Borrowed(s.trim_end_matches(' ')))),
+            Some(Cow::Owned(mut s)) => {
+                s.truncate(s.trim_end_matches(' ').len());
+                Ok(ExprValue::Text(Cow::Owned(s)))
+            }
+        },
         BuiltinFn::TypedArith(op, kind) => {
             let a = take_scalar_arg(args, 0)?;
             let b = take_scalar_arg(args, 1)?;
             typed_arith(op, kind, a, b).map(ExprValue::Scalar)
         }
+        // SQL-37（Issue #1586）: 評価のたびに壁時計を読む（束縛時に定数化しない）。
+        BuiltinFn::ClockTimestamp => time_fn::now_micros().map(ExprValue::Timestamp),
     }
 }
 
@@ -5206,18 +5820,14 @@ mod tests {
     }
 
     #[test]
-    fn defining_and_calling_a_udf_named_after_a_non_deterministic_function_succeeds() {
-        // PR #1107 codex-review P1 是正: `now`/`random` 等の名前を UDF 予約名に
-        // 含めると、これらの名前で登録・呼び出しできていた既存の宣言的 UDF が
-        // 登録時に拒否される破壊的変更になっていた（本 PR は数値関数のみを
-        // 対象とし、非決定的関数の実装は含まないため予約化の理由がない）。
-        // 数値関数の予約名（`round` 等）はそのまま維持しつつ、`now`／`random`／
-        // `current_timestamp` という名前の UDF が従来どおり登録・呼び出し
-        // できることを固定する。非決定的関数名の予約化は、日時スカラー関数群
-        // （`docs/design/numeric-scalar-functions.md`「スコープ外・後続課題」
-        // 参照）を実装する後続作業で spec の決定性要件と対にして判断する。
+    fn defining_and_calling_a_udf_named_after_an_unimplemented_non_deterministic_function_succeeds()
+    {
+        // PR #1107 codex-review P1 是正の維持: 未実装の非決定的関数名（`random`）や、
+        // 括弧付き呼び出しが `Expr::Call` のまま残る `current_timestamp` という名前の UDF は
+        // 従来どおり登録・呼び出せる。`now` 等の現在時刻関数名は Issue #1586（SQL-37）で
+        // 予約名になった（次のテスト）。
         let schema = schema_with_vector();
-        for name in ["now", "random", "current_timestamp"] {
+        for name in ["random", "current_timestamp"] {
             let mut registry = UdfRegistry::default();
             define_function(&mut registry, name, &[], &num("1.0"))
                 .unwrap_or_else(|e| panic!("definition of {name} should succeed, got {e:?}"));
@@ -5233,12 +5843,141 @@ mod tests {
     }
 
     #[test]
-    fn calling_a_non_deterministic_function_is_rejected_with_42883() {
+    fn current_time_function_names_are_reserved_for_udfs() {
+        // SQL-37・SQL-26（Issue #1586）: 同名 UDF の定義は `42723`。
+        for name in [
+            "now",
+            "transaction_timestamp",
+            "statement_timestamp",
+            "clock_timestamp",
+        ] {
+            let mut registry = UdfRegistry::default();
+            let err = define_function(&mut registry, name, &[], &num("1.0")).unwrap_err();
+            assert_eq!(err.wire_code(), "42723", "function name {name}");
+        }
+    }
+
+    #[test]
+    fn calling_an_unknown_non_deterministic_function_is_rejected_with_42883() {
         let schema = schema_with_vector();
         let registry = UdfRegistry::default();
         let mut budget = MAX_EXPR_NODES;
-        let err = bind_expr(&call("now", vec![]), &schema, &registry, &mut budget).unwrap_err();
+        let err = bind_expr(&call("random", vec![]), &schema, &registry, &mut budget).unwrap_err();
         assert_eq!(err.wire_code(), "42883");
+    }
+
+    #[test]
+    fn current_time_functions_without_a_clock_are_rejected_with_0a000() {
+        // 時計を確定していない文脈（INSERT・UPDATE・CHECK・DEFAULT 等）は fail-closed。
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        for name in [
+            "now",
+            "transaction_timestamp",
+            "statement_timestamp",
+            "clock_timestamp",
+        ] {
+            let mut budget = MAX_EXPR_NODES;
+            let err = bind_expr(&call(name, vec![]), &schema, &registry, &mut budget).unwrap_err();
+            assert_eq!(err.wire_code(), "0A000", "function name {name}");
+        }
+        let mut budget = MAX_EXPR_NODES;
+        let kw = Expr::ValueFunction {
+            kind: ValueFunctionKind::CurrentTimestamp,
+            precision: None,
+        };
+        let err = bind_expr(&kw, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn current_time_functions_bind_to_the_scope_clock() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let clock = StatementClock {
+            txn_start_micros: 1_700_000_123_456_789,
+            stmt_start_micros: 1_700_000_999_000_000,
+        };
+        let _scope = time_fn::ClockScope::enter(clock);
+        let bind = |e: Expr| {
+            let mut budget = MAX_EXPR_NODES;
+            bind_expr(&e, &schema, &registry, &mut budget)
+        };
+        for name in ["now", "transaction_timestamp"] {
+            let (b, ty) = bind(call(name, vec![])).expect("bind");
+            assert_eq!(b, BoundExpr::Timestamp(clock.txn_start_micros));
+            assert_eq!(ty, ExprType::Timestamp);
+        }
+        let (b, _) = bind(call("statement_timestamp", vec![])).expect("bind");
+        assert_eq!(b, BoundExpr::Timestamp(clock.stmt_start_micros));
+        let (b, ty) = bind(Expr::ValueFunction {
+            kind: ValueFunctionKind::CurrentTimestamp,
+            precision: Some(0),
+        })
+        .expect("bind");
+        assert_eq!(b, BoundExpr::Timestamp(1_700_000_123_000_000));
+        assert_eq!(ty, ExprType::Timestamp);
+        let (b, ty) = bind(Expr::ValueFunction {
+            kind: ValueFunctionKind::CurrentDate,
+            precision: None,
+        })
+        .expect("bind");
+        assert_eq!(
+            b,
+            BoundExpr::Date(
+                i32::try_from(clock.txn_start_micros / crate::datetime::MICROS_PER_DAY).unwrap()
+            )
+        );
+        assert_eq!(ty, ExprType::Date);
+        // 範囲外の精度は 22023、TIME 系は 0A000、引数付きは 42883。
+        let err = bind(Expr::ValueFunction {
+            kind: ValueFunctionKind::LocalTimestamp,
+            precision: Some(7),
+        })
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22023");
+        let err = bind(Expr::ValueFunction {
+            kind: ValueFunctionKind::CurrentTime,
+            precision: None,
+        })
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+        let err = bind(call("now", vec![num("1")])).unwrap_err();
+        assert_eq!(err.wire_code(), "42883");
+    }
+
+    #[test]
+    fn clock_timestamp_is_not_folded_and_is_evaluated_per_call() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let clock = StatementClock {
+            txn_start_micros: 1,
+            stmt_start_micros: 1,
+        };
+        let _scope = time_fn::ClockScope::enter(clock);
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, ty) = bind_expr(
+            &call("clock_timestamp", vec![]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("bind");
+        assert_eq!(ty, ExprType::Timestamp);
+        assert!(matches!(
+            bound,
+            BoundExpr::Builtin {
+                f: BuiltinFn::ClockTimestamp,
+                ..
+            }
+        ));
+        assert!(!is_foldable_builtin(BuiltinFn::ClockTimestamp));
+        let a = eval(&bound, 1, &[0.0, 0.0, 0.0]).expect("eval");
+        let b = eval(&bound, 1, &[0.0, 0.0, 0.0]).expect("eval");
+        let (ExprValue::Timestamp(a), ExprValue::Timestamp(b)) = (a, b) else {
+            panic!("expected timestamps");
+        };
+        assert!(a > clock.txn_start_micros && b >= a);
     }
 
     // --- CASE／COALESCE／NULLIF（対象ビヘイビア: SQL-26。Issue #921） ----------
