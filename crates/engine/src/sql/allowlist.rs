@@ -5378,6 +5378,11 @@ impl<'a> Parser<'a> {
         }) else {
             return Ok(None);
         };
+        // 引用なしの SQL 値関数予約語（`CURRENT_DATE = ...` 等。SQL-37・Issue #1586）は
+        // 列名付きの確定形ではなく式なので、式述語フォールバックへ渡す。
+        if self.is_value_function_keyword_at(self.pos) {
+            return Ok(None);
+        }
         if name.eq_ignore_ascii_case("EXISTS")
             && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
             && matches!(
@@ -13204,7 +13209,10 @@ pub fn validate_create_table_tokens(
 pub(crate) fn parse_check_predicate_text(
     sql: &str,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let mut tokens = lexer::tokenize(sql)?;
+    // 旧版は時刻キーワード名の列参照を引用なしで保存した。CHECK は値関数を禁止しているため、
+    // 保存本文中の未引用の予約語は旧形式の列参照として復元する（書き込み不能化を防ぐ）。
+    lexer::requote_legacy_value_function_columns(&mut tokens);
     let mut p = Parser::new(&tokens);
     let predicates = p.parse_where()?;
     p.expect_end_of_statement()?;
@@ -19003,6 +19011,52 @@ mod tests {
         ] {
             validate_sql(sql, &lookup).unwrap_or_else(|e| panic!("sql={sql:?} err={e:?}"));
         }
+    }
+
+    /// SQL-37・Issue #1586（PR #2382 指摘）: 未引用の時刻関数を比較の左辺に置いても、
+    /// 列名付き Equality／Compare（確定形）として消費されない。
+    #[test]
+    fn bare_value_function_on_comparison_lhs_is_not_a_column_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT id FROM documents WHERE CURRENT_DATE = '1' LIMIT 10",
+            "SELECT id FROM documents WHERE CURRENT_TIMESTAMP > '2000-01-01 00:00:00' LIMIT 10",
+        ] {
+            if let Ok(Statement::Select(stmt)) = validate_sql(sql, &lookup) {
+                assert!(
+                    !stmt.where_predicates.iter().any(|p| matches!(
+                        p,
+                        WherePredicate::Equality { .. } | WherePredicate::Compare { .. }
+                    )),
+                    "sql={sql:?}"
+                );
+            }
+        }
+        // 引用付きは従来どおり列名付き確定形。
+        let stmt = validate_statement(
+            "SELECT * FROM documents WHERE \"current_date\" = 'x' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            &lookup,
+        )
+        .expect("quoted column");
+        assert!(matches!(
+            stmt.where_predicates.first(),
+            Some(WherePredicate::Equality { .. })
+        ));
+    }
+
+    /// SQL-37・Issue #1586（PR #2382 指摘）: 修飾列参照 `t.current_date` は正規化後も
+    /// 列参照であり、値関数へ化けない。
+    #[test]
+    fn qualified_value_function_named_column_stays_a_column_reference() {
+        let tokens = lexer::tokenize_marked("SELECT events.current_date FROM events").expect("lex");
+        let normalized = super::super::qualified_column::normalize_single_table_qualifiers(&tokens)
+            .expect("normalize");
+        assert!(normalized
+            .iter()
+            .any(|t| matches!(t, Token::QuotedNull(n) if n == "current_date")));
+        assert!(!normalized
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n == "current_date")));
     }
 
     #[test]

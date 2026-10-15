@@ -268,6 +268,22 @@ fn demote_unneeded_quoted_bool_words(tokens: &mut [Token]) {
 /// 真偽リテラルとして保存した本文（マーカーあり）を保存形式の段階で区別する。
 pub(crate) const STORED_BODY_BOOL_LITERAL_MARKER: &str = "/*fandhe:bool-literal*/ ";
 
+/// 旧版が引用なしで保存した `"current_date"` 等の列参照を引用付きトークンへ戻す
+/// （SQL-37・Issue #1586）。新版の保存本文（ビュー・CHECK）は列名位置で必ず引用付きにし、
+/// 値関数そのものは保存しない（CHECK は値関数を禁止）ため、保存本文中の未引用の値関数
+/// 予約語は旧形式の列参照とみなしてよい。再解析で式項へ化けて保存済み定義が壊れるのを防ぐ。
+/// 呼び出し元は [`tokenize_stored_view_body`] と CHECK 述語の再パース
+/// （`sql::allowlist::parse_check_predicate_text`）。
+pub(crate) fn requote_legacy_value_function_columns(tokens: &mut [Token]) {
+    for slot in tokens.iter_mut() {
+        if let Token::Ident(w) = slot {
+            if is_value_function_keyword(w) {
+                *slot = Token::QuotedNull(std::mem::take(w));
+            }
+        }
+    }
+}
+
 /// 永続化ビュー本文を再解析用にトークン化する（Issue #1526・PR #2297 指摘）。
 /// 旧版は WHERE 述語葉位置の列参照 `"true"`／`"false"` を引用なしで保存した（単純形・
 /// 評価後射影形の双方）。マーカーなしの本文はこの旧形式として扱い、述語葉位置の未引用
@@ -276,16 +292,7 @@ pub(crate) const STORED_BODY_BOOL_LITERAL_MARKER: &str = "/*fandhe:bool-literal*
 /// 呼び出し元は `sql::view`（参照時）・カタログのビュー本文検査・作成時の自己検証。
 pub(crate) fn tokenize_stored_view_body(input: &str) -> Result<Vec<Token>, LexError> {
     let mut tokens = tokenize(input)?;
-    // 旧版は `"current_date"` 等の列参照を引用なしで保存した（SQL-37・Issue #1586）。新版の
-    // 保存本文は列名位置で必ず引用付きにするため、未引用の値関数予約語は旧形式の列参照として
-    // 引用付きトークンへ戻す（再解析で式項へ化けて保存済みビューが壊れるのを防ぐ）。
-    for slot in tokens.iter_mut() {
-        if let Token::Ident(w) = slot {
-            if is_value_function_keyword(w) {
-                *slot = Token::QuotedNull(std::mem::take(w));
-            }
-        }
-    }
+    requote_legacy_value_function_columns(&mut tokens);
     if input.starts_with(STORED_BODY_BOOL_LITERAL_MARKER) {
         return Ok(tokens);
     }
@@ -400,7 +407,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 
 /// 括弧なし SQL 値関数の予約語か（大小無視。SQL-37・Issue #1586。引用付きの同名識別子を
 /// 裸のキーワードと区別するために字句段で印付けする）。
-fn is_value_function_keyword(s: &str) -> bool {
+pub(crate) fn is_value_function_keyword(s: &str) -> bool {
     [
         "current_timestamp",
         "current_date",

@@ -1353,6 +1353,16 @@ mod tests {
         assert_eq!(err.wire_code(), "22000");
     }
 
+    /// SQL-37・Issue #1586（PR #2382 指摘）: 旧版が引用なしで保存した時刻キーワード名の
+    /// 列参照（`abs(current_date) > 0`）は、再解析で値関数にならず列参照として復元される
+    /// （書き込み不能化〔CorruptSchema〕の回帰防止）。
+    #[test]
+    fn legacy_unquoted_value_function_named_column_is_restored_as_column() {
+        let predicates = crate::sql::allowlist::parse_check_predicate_text("abs(current_date) > 0")
+            .expect("parse legacy body");
+        assert!(reject_forbidden_elements(&predicates).is_ok());
+    }
+
     #[test]
     fn render_predicates_round_trips_equality_and_prefix_predicates() {
         // CREATE TABLE で宣言できる列は TEXT／VECTOR のみ（BOOLEAN 列は未対応）
