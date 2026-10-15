@@ -252,6 +252,7 @@ impl FilterOp {
                 match expected {
                     TypedLiteral::Date(e) => v.as_date().map(|a| op.accepts(a.cmp(e))),
                     TypedLiteral::Timestamp(e) => v.as_timestamp().map(|a| op.accepts(a.cmp(e))),
+                    TypedLiteral::Time(e) => v.as_time().map(|a| op.accepts(a.cmp(e))),
                     TypedLiteral::Numeric(e) => v
                         .as_numeric()
                         .map(|a| op.accepts(crate::numeric::cmp_exact(&a, e))),
@@ -356,6 +357,14 @@ fn typed_in_eval(values: &[TypedLiteral], v: ScalarRef<'_>) -> Option<bool> {
                     .any(|t| matches!(t, TypedLiteral::Timestamp(e) if *e == actual)),
             )
         }
+        Some(TypedLiteral::Time(_)) => {
+            let actual = v.as_time()?;
+            Some(
+                values
+                    .iter()
+                    .any(|t| matches!(t, TypedLiteral::Time(e) if *e == actual)),
+            )
+        }
         Some(TypedLiteral::Numeric(_)) => {
             let actual = v.as_numeric()?;
             Some(values.iter().any(|t| matches!(t, TypedLiteral::Numeric(e) if crate::numeric::cmp_exact(&actual, e) == std::cmp::Ordering::Equal)))
@@ -391,6 +400,10 @@ fn typed_between_eval(low: &TypedLiteral, high: &TypedLiteral, v: ScalarRef<'_>)
         }
         (TypedLiteral::Timestamp(lo), TypedLiteral::Timestamp(hi)) => {
             let actual = v.as_timestamp()?;
+            Some(CompareOp::Ge.accepts(actual.cmp(lo)) && CompareOp::Le.accepts(actual.cmp(hi)))
+        }
+        (TypedLiteral::Time(lo), TypedLiteral::Time(hi)) => {
+            let actual = v.as_time()?;
             Some(CompareOp::Ge.accepts(actual.cmp(lo)) && CompareOp::Le.accepts(actual.cmp(hi)))
         }
         (TypedLiteral::Numeric(lo), TypedLiteral::Numeric(hi)) => {
@@ -483,6 +496,8 @@ pub enum TypedLiteral {
     Date(i32),
     /// `TIMESTAMP` 列。1970-01-01 00:00:00 起点のマイクロ秒。
     Timestamp(i64),
+    /// `TIME` 列。0 時起点のマイクロ秒（`0..=86_400_000_000`。Issue #1570）。
+    Time(i64),
     /// `NUMERIC` 列。列の `scale` に丸めず、リテラル自身の小数桁数で解析した
     /// 正確な値（`numeric::cmp_exact` で比較する）。
     Numeric(Decimal),
@@ -835,6 +850,7 @@ fn bind_filter_op(
                 match ty {
                     ColumnType::Date => TypedLiteral::Date(0),
                     ColumnType::Timestamp => TypedLiteral::Timestamp(0),
+                    ColumnType::Time => TypedLiteral::Time(0),
                     ColumnType::Numeric { .. } => TypedLiteral::Numeric(
                         crate::numeric::Decimal::from_parts(0, 0).map_err(|_| {
                             // `scale=0` は `MAX_PRECISION` 以下のため理論上
@@ -931,6 +947,7 @@ fn bind_filter_op(
                 }
                 ColumnType::Date
                 | ColumnType::Timestamp
+                | ColumnType::Time
                 | ColumnType::Numeric { .. }
                 | ColumnType::Uuid
                 | ColumnType::Bytea => {
@@ -941,6 +958,7 @@ fn bind_filter_op(
                             match ty {
                                 ColumnType::Date => TypedLiteral::Date(0),
                                 ColumnType::Timestamp => TypedLiteral::Timestamp(0),
+                                ColumnType::Time => TypedLiteral::Time(0),
                                 ColumnType::Numeric { .. } => TypedLiteral::Numeric(
                                     Decimal::from_parts(0, 0).map_err(|_| {
                                         SqlSurfaceError::Internal {
@@ -993,6 +1011,7 @@ fn bind_filter_op(
         FilterOp::BetweenLiteral { low, high } => match ty {
             ColumnType::Date
             | ColumnType::Timestamp
+            | ColumnType::Time
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid
             | ColumnType::Bytea => {
@@ -1000,6 +1019,7 @@ fn bind_filter_op(
                     let dummy = match ty {
                         ColumnType::Date => TypedLiteral::Date(0),
                         ColumnType::Timestamp => TypedLiteral::Timestamp(0),
+                        ColumnType::Time => TypedLiteral::Time(0),
                         ColumnType::Numeric { .. } => {
                             TypedLiteral::Numeric(Decimal::from_parts(0, 0).map_err(|_| {
                                 SqlSurfaceError::Internal {
@@ -1129,6 +1149,16 @@ fn bind_typed_compare_literal(
                     detail:
                         "bind_datetime_literal returned a non-Timestamp value for a TIMESTAMP column"
                             .to_string(),
+                }),
+            }
+        }
+        (ColumnType::Time, CompareLiteral::Text(s)) => {
+            check_literal_len(s)?;
+            match crate::sql::parser::bind_datetime_literal(column, ColumnType::Time, s)? {
+                crate::row_codec::Value::Time(t) => Ok(TypedLiteral::Time(t)),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "bind_datetime_literal returned a non-Time value for a TIME column"
+                        .to_string(),
                 }),
             }
         }

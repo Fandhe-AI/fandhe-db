@@ -101,12 +101,16 @@ pub(crate) enum ExprStep {
     ConstDate(i32),
     /// [`ExprStep::ConstDate`] の `TIMESTAMP` 版。
     ConstTimestamp(i64),
+    /// `TIME` 定数（Issue #1570）。
+    ConstTime(i64),
     /// 行の `DATE` 列参照を push する（[`ExprStep::PushTextColumn`] と同じ
     /// 「借用は行ループの外の引数から都度復元する」設計。対象ビヘイビア:
     /// SQL-26。Issue #920）。
     PushDateColumn(usize),
     /// [`ExprStep::PushDateColumn`] の `TIMESTAMP` 版。
     PushTimestampColumn(usize),
+    /// `TIME` 列参照（Issue #1570）。
+    PushTimeColumn(usize),
     /// 行の数値列（INTEGER/BIGINT/REAL/DOUBLE）参照を push する（Issue #1075・
     /// TABLE-16 ポインタ。`CHECK` 制約の式述語束縛でのみ生成される。
     /// [`ExprStep::PushTextColumn`] と同じ「借用は行ループの外の引数から都度
@@ -159,6 +163,8 @@ impl PartialEq for ExprStep {
             (ExprStep::PushTextColumn(a), ExprStep::PushTextColumn(b)) => a == b,
             (ExprStep::ConstDate(a), ExprStep::ConstDate(b)) => a == b,
             (ExprStep::ConstTimestamp(a), ExprStep::ConstTimestamp(b)) => a == b,
+            (ExprStep::ConstTime(a), ExprStep::ConstTime(b)) => a == b,
+            (ExprStep::PushTimeColumn(a), ExprStep::PushTimeColumn(b)) => a == b,
             (ExprStep::PushDateColumn(a), ExprStep::PushDateColumn(b)) => a == b,
             (ExprStep::PushTimestampColumn(a), ExprStep::PushTimestampColumn(b)) => a == b,
             (ExprStep::PushNumericColumn(a), ExprStep::PushNumericColumn(b)) => a == b,
@@ -220,11 +226,15 @@ pub(crate) enum StackValue {
     Date(i32),
     /// `TIMESTAMP` 値（[`StackValue::Date`] 参照）。
     Timestamp(i64),
+    /// `TIME` 値（Issue #1570）。
+    Time(i64),
     /// 現在評価中の行の `DATE` 列参照を表すマーカー（[`StackValue::
     /// TextColumnRef`] と同じ「実体は行スカラービューから都度解決する」設計）。
     DateColumnRef(usize),
     /// [`StackValue::DateColumnRef`] の `TIMESTAMP` 版。
     TimestampColumnRef(usize),
+    /// [`StackValue::DateColumnRef`] の `TIME` 版（Issue #1570）。
+    TimeColumnRef(usize),
     /// 現在評価中の行の数値列（INTEGER/BIGINT/REAL/DOUBLE）参照を表すマーカー
     /// （Issue #1075・TABLE-16 ポインタ。[`StackValue::TextColumnRef`] と同じ
     /// 「実体は行スカラービューから都度解決する」設計）。
@@ -258,6 +268,7 @@ fn stack_to_expr_value<'a>(
         StackValue::Text(s) => Ok(ExprValue::Text(Cow::Owned(s))),
         StackValue::Date(d) => Ok(ExprValue::Date(d)),
         StackValue::Timestamp(t) => Ok(ExprValue::Timestamp(t)),
+        StackValue::Time(t) => Ok(ExprValue::Time(t)),
         StackValue::TextColumnRef(index) => match row_scalars.get(index) {
             None => Err(SqlSurfaceError::Internal {
                 detail: "TEXT column reference is outside the decoded row scalar view".to_string(),
@@ -291,6 +302,16 @@ fn stack_to_expr_value<'a>(
             Some(Some(_)) => Err(SqlSurfaceError::Internal {
                 detail: "TIMESTAMP column reference resolved to a non-TIMESTAMP row scalar value"
                     .to_string(),
+            }),
+        },
+        StackValue::TimeColumnRef(index) => match row_scalars.get(index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "TIME column reference is outside the decoded row scalar view".to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Time(t))) => Ok(ExprValue::Time(*t)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "TIME column reference resolved to a non-TIME row scalar value".to_string(),
             }),
         },
         StackValue::Json(s) => Ok(ExprValue::Json(Cow::Owned(s))),
@@ -330,6 +351,7 @@ fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
         ExprValue::Text(s) => StackValue::Text(s.into_owned()),
         ExprValue::Date(d) => StackValue::Date(d),
         ExprValue::Timestamp(t) => StackValue::Timestamp(t),
+        ExprValue::Time(t) => StackValue::Time(t),
         ExprValue::Json(j) => StackValue::Json(j.into_owned()),
         ExprValue::JsonText(j) => StackValue::JsonText(j.into_owned()),
     }
@@ -394,6 +416,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
                 | ExprValue::Text(_)
                 | ExprValue::Date(_)
                 | ExprValue::Timestamp(_)
+                | ExprValue::Time(_)
                 | ExprValue::Json(_)
                 | ExprValue::JsonText(_)
                 | ExprValue::Null => None,
@@ -449,8 +472,10 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::TextColumnRef { .. }
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
+        | BoundExpr::Time(_)
         | BoundExpr::DateColumnRef { .. }
         | BoundExpr::TimestampColumnRef { .. }
+        | BoundExpr::TimeColumnRef { .. }
         // Issue #1075・TABLE-16 ポインタ: 数値列参照は行に依存するため畳み込まない
         // （`IdRef` と同じ理由。CHECK の式述語束縛でのみ生成される）。
         | BoundExpr::ColumnRef { .. }
@@ -534,6 +559,16 @@ fn compile_node(
         }
         BoundExpr::Timestamp(t) => {
             steps.push(ExprStep::ConstTimestamp(*t));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::Time(t) => {
+            steps.push(ExprStep::ConstTime(*t));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::TimeColumnRef { index } => {
+            steps.push(ExprStep::PushTimeColumn(*index));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);
         }
@@ -839,6 +874,7 @@ impl ExprProgram {
                         Some(StackValue::TextColumnRef(index))
                         | Some(StackValue::DateColumnRef(index))
                         | Some(StackValue::TimestampColumnRef(index))
+                        | Some(StackValue::TimeColumnRef(index))
                         | Some(StackValue::NumericColumnRef(index)) => {
                             match row_scalars.get(*index) {
                                 Some(Some(_)) => false,
@@ -893,6 +929,14 @@ impl ExprProgram {
                 }
                 ExprStep::ConstTimestamp(t) => {
                     scratch.push(StackValue::Timestamp(*t));
+                    pc += 1;
+                }
+                ExprStep::ConstTime(t) => {
+                    scratch.push(StackValue::Time(*t));
+                    pc += 1;
+                }
+                ExprStep::PushTimeColumn(index) => {
+                    scratch.push(StackValue::TimeColumnRef(*index));
                     pc += 1;
                 }
                 ExprStep::PushDateColumn(index) => {
@@ -987,6 +1031,7 @@ impl ExprProgram {
                             | ExprValue::Text(_)
                             | ExprValue::Date(_)
                             | ExprValue::Json(_)
+                            | ExprValue::Time(_)
                             | ExprValue::JsonText(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
@@ -998,6 +1043,7 @@ impl ExprProgram {
                             | ExprValue::Text(_)
                             | ExprValue::Date(_)
                             | ExprValue::Json(_)
+                            | ExprValue::Time(_)
                             | ExprValue::JsonText(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };

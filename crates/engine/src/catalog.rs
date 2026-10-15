@@ -374,6 +374,7 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
             | ColumnType::Enum(_)
             | ColumnType::Date
             | ColumnType::Timestamp
+            | ColumnType::Time
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid
             | ColumnType::Bytea
@@ -1619,8 +1620,8 @@ pub enum ColumnType {
     /// 時刻列（`TIME [WITHOUT TIME ZONE]`、TABLE-32・Issue #1569）。タイムゾーンを
     /// 持たず、内部表現は 0 時起点のマイクロ秒（`i64`。受理範囲 `00:00:00`〜
     /// `24:00:00` の両端を含む）。カタログタグは `time`・param は `-` 固定。値の解析・
-    /// 整形は [`crate::datetime`] へ委譲する。PK・UNIQUE・索引・述語は #1570 まで
-    /// fail-closed。
+    /// 整形は [`crate::datetime`] へ委譲する。述語・集計・索引・EXTRACT は Issue #1570 で
+    /// 解禁済み。PK・UNIQUE・型変更は担当 Issue 未定のため fail-closed。
     Time,
     /// 可変長の同型スカラー配列列（`<スカラー型>[]`、TABLE-14・TASK-198、Issue #888）。
     /// 要素型・要素数上限は [`ArrayType`] が保持する。検索経路（KNN・hybrid・ANN・
@@ -1827,7 +1828,7 @@ impl ColumnType {
             ColumnType::Boolean => 4,
             ColumnType::Date => 5,
             ColumnType::Timestamp => 6,
-            // `Time` は PK／UNIQUE 非許可（Issue #1569。#1570 で解禁）。到達しない契約の
+            // `Time` は PK／UNIQUE 非許可（Issue #1569。担当 Issue 未定の fail-closed）。到達しない契約の
             // ため `Vector` と同じ番兵 0 を返し、呼び出し元（`constraint.rs`）が拒否する。
             ColumnType::Time => 0,
             ColumnType::Bytea => 7,

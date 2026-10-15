@@ -4,9 +4,9 @@
 //! 再オープン後も値ごと復元されること、(2) INSERT・UPDATE SET・UPSERT・COPY FROM・列
 //! DEFAULT の値束縛が書式違反を `22007`、範囲外を `22008` で拒否し副作用を残さないこと、
 //! (3) 境界値 `00:00:00`・`23:59:59.999999`・`24:00:00` が往復で一致すること、(4) 未解禁の
-//! 機能（述語・集計・索引・PK/UNIQUE・型変更・配列・`TIME(p)`・`TIME WITH TIME ZONE`）が
-//! fail-closed に拒否されること、を固定する。未解禁の機能の解禁は兄弟 Issue #1570 の担当で、
-//! 解禁時は (4) の期待を反転させる。
+//! 機能（PK/UNIQUE・型変更・算術・配列・`TIME(p)`・`TIME WITH TIME ZONE`）が fail-closed に
+//! 拒否されること、を固定する。述語・集計・索引・EXTRACT・集合演算の解禁は Issue #1570 で行い、
+//! その挙動は `sql_time_query.rs` が固定する。PK/UNIQUE・型変更は担当 Issue 未定、wire・NoSQL は #1571。
 
 use engine::catalog::ColumnType;
 use engine::core::{CopyPlan, EngineCore};
@@ -414,25 +414,17 @@ fn other_tenants_cannot_see_time_rows() {
 }
 
 /// 未解禁の機能は TIMESTAMP 等の既存の腕へ黙って流さず fail-closed に拒否する。
-/// 解禁は #1570（述語・集計・索引・PK/UNIQUE・型変更）と #1571（wire・NoSQL）の担当で、
-/// 解禁時に本テストの期待を反転させる。
+/// PK/UNIQUE・型変更・算術は担当 Issue 未定、wire・NoSQL は #1571 の担当。述語・集計・索引・
+/// 集合演算は #1570 で解禁済み（`sql_time_query.rs`）。
 #[test]
 fn features_not_yet_enabled_are_rejected_fail_closed() {
     let (_p, _g, core) = open("tm-failclosed");
     ok(&core, "CREATE TABLE t (v TIME, n INTEGER)");
     insert(&core, 1, "'05:06:07'", "f1").expect("insert");
     for sql in [
-        "SELECT id, v FROM t WHERE v = '05:06:07' LIMIT 5",
-        "SELECT id, v FROM t WHERE v > '05:00:00' LIMIT 5",
-        "SELECT id, v FROM t ORDER BY v LIMIT 5",
-        "SELECT MIN(v) FROM t",
-        "SELECT COUNT(v) FROM t",
-        "SELECT v, COUNT(*) FROM t GROUP BY v",
-        "SELECT DISTINCT v FROM t LIMIT 5",
-        "SELECT v FROM t UNION SELECT v FROM t",
         "SELECT v + 1 FROM t LIMIT 5",
-        "SELECT id FROM t WHERE v IN ('05:06:07') LIMIT 5",
-        "CREATE INDEX ix ON t (v)",
+        "SELECT SUM(v) FROM t",
+        "SELECT AVG(v) FROM t",
         "CREATE TABLE a (v TIME PRIMARY KEY)",
         "CREATE TABLE a (v TIME UNIQUE)",
         "ALTER TABLE t ALTER COLUMN v TYPE TIMESTAMP",
@@ -448,29 +440,6 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
     assert_eq!(is_null.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [2]);
     // 行は無傷のまま読める。
     assert_eq!(times(&core, "SELECT id, v FROM t LIMIT 5").len(), 2);
-}
-
-/// 集合演算は格納値・行数・演算種別に依らず TIME 列の列型で拒否する（空入力・全 NULL・
-/// UNION ALL・INTERSECT・EXCEPT でも `0A000`。#1570 で解禁まで fail-closed）。
-#[test]
-fn set_operations_reject_time_columns_by_column_type() {
-    let (_p, _g, core) = open("tm-setop-type");
-    ok(&core, "CREATE TABLE t (v TIME, n INTEGER)");
-    ok(&core, "CREATE TABLE u (v TIME, n INTEGER)");
-    let check = |core: &EngineCore| {
-        for op in ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"] {
-            let sql = format!("SELECT v FROM t {op} SELECT v FROM u");
-            assert_eq!(code(core, &sql), "0A000", "{sql} must be 0A000");
-        }
-    };
-    // 空入力。
-    check(&core);
-    // 全 NULL。
-    insert(&core, 1, "NULL", "f1").expect("insert null");
-    check(&core);
-    // 値あり。
-    insert(&core, 2, "'05:06:07'", "f2").expect("insert");
-    check(&core);
 }
 
 /// `TIME(p)`・`TIME WITH TIME ZONE`・`TIMETZ`・`time[]` は構文段で `0A000`。

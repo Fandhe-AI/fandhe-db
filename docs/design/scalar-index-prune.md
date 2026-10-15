@@ -515,3 +515,7 @@ TEXT／BYTEA と同じ既知の乖離で結果の正しさには影響しない�
 `OrderedColumnIndex::I64` へ `i64` に拡張して構築する（負数を含め順序保存）。照会側
 （`numeric_column_candidates`・`numeric_i64_bounds`）は型によらず動き、`CREATE INDEX` の
 宣言対象にも含める。
+
+## Issue #1570: TIME 列の二次索引
+
+`TIME` 列は 0 時起点のマイクロ秒（`0..=86_400_000_000`）を `i64` のまま `OrderedColumnIndex::I64` へ構築する（レーン B。`DATE`／`TIMESTAMP` と同じ）。値域が `2^53` より遥かに小さいため縮退は起きず、範囲外の値だけを防御的に「索引対象外」へ縮退する。照会は `TypedLiteral::Time` を `exact_i64_bounds` に渡す。`CREATE INDEX` の宣言対象にも含める。

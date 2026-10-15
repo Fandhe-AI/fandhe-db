@@ -10,6 +10,9 @@
 //! `sql::udf_call::bind_call` が束縛時に一度だけ行い、行ループでは払い出し済みの
 //! enum のみを扱う（行ごとの文字列比較を避ける設計。§2-4 参照）。
 //!
+//! `TIME` 入力（Issue #1570）は [`time_part`] が担う。`date_part` は暦計算で日付境界へ
+//! 折り返す（`24:00:00` が hour=0 になる）ため流用せず、0 時起点のマイクロ秒をそのまま分解する。
+//!
 //! 意味論は PostgreSQL 互換（`date_part`／`EXTRACT`／`date_trunc` の公開済み
 //! 挙動）に合わせるが、以下は既知の差分として `docs/design/
 //! datetime-scalar-functions.md`（ADR）に記録する: `TIMESTAMPTZ` 非対応・
@@ -199,6 +202,44 @@ pub(crate) fn date_part(field: DatePartField, micros: i64) -> f64 {
     }
 }
 
+/// `TIME` が `time_part` で扱える field か（束縛時の拒否判定に使う。Issue #1570）。
+/// 時刻成分（`hour`/`minute`/`second`/`milliseconds`/`microseconds`）と `epoch` だけが
+/// 意味を持ち、日付由来の field は `time_part` が `None` を返す。
+pub(crate) fn time_supports_field(field: DatePartField) -> bool {
+    time_part(field, 0).is_some()
+}
+
+/// `date_part(field, time)`／`EXTRACT(field FROM time)` の値レベル計算（Issue #1570）。
+/// `micros` は `TIME` の内部表現（0 時起点のマイクロ秒。`24:00:00` = `86_400_000_000` を
+/// 含む）。`24:00:00` は hour=24・minute=0・second=0・epoch=86400（PostgreSQL と同じ）。
+/// 日付由来の field（`year`/`month`/`day`/`dow` 等）は `None`（束縛時に `0A000` で拒否済みの
+/// ため評価時には到達しない）。
+pub(crate) fn time_part(field: DatePartField, micros: i64) -> Option<f64> {
+    let hour = micros / 3_600_000_000;
+    let minute = (micros % 3_600_000_000) / 60_000_000;
+    let micros_in_minute = micros % 60_000_000;
+    match field {
+        DatePartField::Hour => Some(hour as f64),
+        DatePartField::Minute => Some(minute as f64),
+        DatePartField::Second => Some(micros_in_minute as f64 / 1_000_000.0),
+        DatePartField::Milliseconds => Some(micros_in_minute as f64 / 1_000.0),
+        DatePartField::Microseconds => Some(micros_in_minute as f64),
+        DatePartField::Epoch => Some(micros as f64 / 1_000_000.0),
+        DatePartField::Day
+        | DatePartField::Month
+        | DatePartField::Quarter
+        | DatePartField::Year
+        | DatePartField::Decade
+        | DatePartField::Century
+        | DatePartField::Millennium
+        | DatePartField::Dow
+        | DatePartField::IsoDow
+        | DatePartField::Doy
+        | DatePartField::IsoYear
+        | DatePartField::Week => None,
+    }
+}
+
 /// `days.checked_mul(MICROS_PER_DAY)` のオーバーフローを `22008`
 /// （[`SqlSurfaceError::datetime_field_overflow`]）へ写像する共通ヘルパー
 /// （`date_trunc` の各 unit 分岐が共有する）。
@@ -366,6 +407,29 @@ mod tests {
 
     /// 2024-02-29（閏年）12:34:56.789012 の全 field を独立オラクル
     /// （PostgreSQL の公開済み挙動）で固定する。
+    #[test]
+    fn time_part_fields_and_24h_boundary() {
+        let t = crate::datetime::parse_time("12:34:56.789012").unwrap();
+        assert_eq!(time_part(DatePartField::Hour, t), Some(12.0));
+        assert_eq!(time_part(DatePartField::Minute, t), Some(34.0));
+        assert!((time_part(DatePartField::Second, t).unwrap() - 56.789012).abs() < 1e-9);
+        assert!((time_part(DatePartField::Milliseconds, t).unwrap() - 56_789.012).abs() < 1e-6);
+        assert!((time_part(DatePartField::Microseconds, t).unwrap() - 56_789_012.0).abs() < 1e-3);
+        let end = crate::datetime::parse_time("24:00:00").unwrap();
+        assert_eq!(time_part(DatePartField::Hour, end), Some(24.0));
+        assert_eq!(time_part(DatePartField::Minute, end), Some(0.0));
+        assert_eq!(time_part(DatePartField::Second, end), Some(0.0));
+        assert_eq!(time_part(DatePartField::Epoch, end), Some(86_400.0));
+        assert_eq!(time_part(DatePartField::Hour, 0), Some(0.0));
+        let last = crate::datetime::parse_time("23:59:59.999999").unwrap();
+        assert_eq!(time_part(DatePartField::Hour, last), Some(23.0));
+        assert_eq!(time_part(DatePartField::Minute, last), Some(59.0));
+        assert!(time_part(DatePartField::Year, t).is_none());
+        assert!(time_part(DatePartField::Dow, t).is_none());
+        assert!(time_supports_field(DatePartField::Epoch));
+        assert!(!time_supports_field(DatePartField::Month));
+    }
+
     #[test]
     fn date_part_leap_day_all_fields() {
         let t = ts("2024-02-29 12:34:56.789012");

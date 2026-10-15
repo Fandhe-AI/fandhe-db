@@ -87,7 +87,8 @@ pub(crate) fn bind_set_expr(
         | ColumnType::Bpchar(_)
         | ColumnType::Boolean
         | ColumnType::Date
-        | ColumnType::Timestamp => {}
+        | ColumnType::Timestamp
+        | ColumnType::Time => {}
         _ => {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: format!("column {name:?} does not support an expression in SET"),
@@ -114,6 +115,7 @@ pub(crate) fn bind_set_expr(
         ) | (ColumnType::Boolean, ExprType::Bool)
             | (ColumnType::Date, ExprType::Date)
             | (ColumnType::Timestamp, ExprType::Timestamp | ExprType::Date)
+            | (ColumnType::Time, ExprType::Time)
     );
     if !assignable {
         return Err(SqlSurfaceError::datatype_mismatch(format!(
@@ -179,6 +181,15 @@ pub(crate) fn eval_set_expr_to_value<'a>(
         },
         ExprValue::Timestamp(t) => match &set.target_ty {
             ColumnType::Timestamp => Ok(Value::Timestamp(t)),
+            _ => Err(internal()),
+        },
+        // `TIME` は `0..=24:00:00`（両端含む）を再検証し、範囲外は `22008`（Issue #1570）。
+        // 行 codec の encode も最後の砦として検査するが、エラー分類をここで確定させる。
+        ExprValue::Time(t) => match &set.target_ty {
+            ColumnType::Time if (0..=MICROS_PER_DAY).contains(&t) => Ok(Value::Time(t)),
+            ColumnType::Time => Err(SqlSurfaceError::datetime_field_overflow(
+                "time field value out of range",
+            )),
             _ => Err(internal()),
         },
         ExprValue::Vector(_) => Err(internal()),

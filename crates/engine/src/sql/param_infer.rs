@@ -259,9 +259,10 @@ impl Inferrer<'_> {
             },
             // DATE／TIMESTAMP は式内 `$n` の対象外型。`Text` へ倒さず `assign` の
             // 対象外型判定（`0A000`）に落として fail-closed にする。
-            Expr::DateLiteral(_) | Expr::TimestampLiteral(_) | Expr::ValueFunction { .. } => {
-                Ty::Known(PreparedParamType::VectorText)
-            }
+            Expr::DateLiteral(_)
+            | Expr::TimestampLiteral(_)
+            | Expr::TimeLiteral(_)
+            | Expr::ValueFunction { .. } => Ty::Known(PreparedParamType::VectorText),
         }
     }
 
@@ -386,6 +387,7 @@ impl Inferrer<'_> {
             | Expr::Null
             | Expr::DateLiteral(_)
             | Expr::TimestampLiteral(_)
+            | Expr::TimeLiteral(_)
             | Expr::ValueFunction { .. } => {}
         }
         Ok(())

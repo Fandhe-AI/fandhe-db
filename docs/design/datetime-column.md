@@ -167,5 +167,15 @@ NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応�
 - **PostgreSQL との乖離**: 秒 60 を繰り上げず `22008` で拒否する（TIMESTAMP の D-5 と同じ）。TZ 接尾辞・AM/PM・1 桁の時は受理しない。
 - **整形**: `HH:MM:SS[.ffffff]`（端数 0 なら省略、末尾の 0 は削る）。端数の整形は `format_timestamp` と共通ヘルパーを共有する。
 - **型名**: `TIME`・`TIME WITHOUT TIME ZONE` は受理。`TIME(p)`・`TIME WITH TIME ZONE`・`TIMETZ`・`time[]` は構文段で `0A000`。`TIME` は綴りを保持する別名として返し、同名 ENUM との衝突を実行段が検出する。`time`・`timetz` は `CREATE_ONLY_RESERVED_TYPE_NAMES` へ追加した（`RESERVED_TYPE_NAMES` へは足さない）。
-- **暫定挙動（兄弟 Issue で解禁・反転する前提）**: WHERE・式・集計・`GROUP BY`・`ORDER BY`・`DISTINCT`・window・JOIN キー・サブクエリ比較・集合演算・SET 式・二次索引・PK／UNIQUE／FK・`ALTER COLUMN TYPE`（TIME との相互変換）は既存の拒否コードで fail-closed。wire の OID 1083・バイナリ入出力と NoSQL の insert／update／DDL の型束縛は #1571 で対応済み。NoSQL の filter は述語の解禁（#1570）まで拒否。
-- **対象外**: 述語・集計・索引・EXTRACT・型付きリテラル式 `TIME '...'`（#1570）、NoSQL filter（#1570 の後）、`TIME(p)` の保存精度（兄弟 Issue に担当なし。要確認）、`time[]`（OID 1183）。
+- **暫定挙動**: JOIN キー・PK／UNIQUE／FK・`ALTER COLUMN TYPE`（TIME との相互変換）は既存の拒否コードで fail-closed（述語・集計・並べ替え・索引・集合演算・SET 式・EXTRACT は Issue #1570 で解禁。下記）。wire の OID 1083・バイナリ入出力と NoSQL の insert／update／DDL の型束縛は #1571 で対応済み。NoSQL の filter は本 Issue の述語解禁後の別対応。
+- **対象外**: NoSQL filter、`TIME(p)` の保存精度（兄弟 Issue に担当なし。要確認）、`time[]`（OID 1183）。
+
+## Issue #1570 追記: TIME の述語・集計・索引・EXTRACT
+
+TABLE-32・親 #1568 のポインタ（第 2 段）。#1569 で fail-closed にしていた問い合わせ側を解禁した。
+
+- **比較・索引**: 述語は `TypedLiteral::Time`（レーン B の `TypedCompare`）、二次索引は `OrderedColumnIndex::I64`（`DATE`／`TIMESTAMP` と同じ構築・照会経路）。索引あり・全走査・Rust オラクルの 3 者一致を結合テストで固定する。`24:00:00` は有効な最大値で、`'24:00'` と同じ値になる。
+- **並べ替え・グループ化・集計**: `OrderKind::SignedInt` を共有する。グループキーを `Cell::Time` へ戻す際は `24:00:00` を許容するため上端を含めて検査する。`MIN`／`MAX`／`COUNT`／`COUNT(DISTINCT)` を受理し、`SUM`／`AVG` は `42883`。`HAVING` で `MIN`／`MAX` の数値比較対象にすることは `DATE`／`TIMESTAMP` と同じく拒否する。
+- **式層**: `TIME` 列参照と型付きリテラル `TIME '...'`（AST は解析済みの値を保持し、CHECK・ビューの描画は `format_time` の出力だけを使う）を受理する。`TIME` 同士の比較のみ許可し、`TIMESTAMP`／`DATE` との暗黙昇格は PostgreSQL に無いため行わない（`42883`）。型なし文字列リテラルは相手が `TIME` のとき TIME として解析する。算術（`time ± interval` 等）は未実装のまま拒否する。
+- **EXTRACT／date_part**: 既存の `date_part` は暦計算で日付境界へ折り返し `24:00:00` が hour=0 になるため流用せず、`datetime_fn::time_part` を新設した。受理する field は `hour`・`minute`・`second`（小数含む）・`milliseconds`・`microseconds`・`epoch`（0 時からの秒数）。日付由来の field は `0A000`（束縛時に拒否）、`date_trunc(text, time)` は PostgreSQL に存在しないため `42883`、未知の field は DATE／TIMESTAMP と同じ `22000`。
+- **残した fail-closed**: PK／UNIQUE／FK・`ALTER COLUMN TYPE`・JOIN キー（担当 Issue 未定）。wire OID 1083・バイナリ・NoSQL は #1571。

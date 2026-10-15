@@ -259,6 +259,8 @@ fn render_expr(expr: &Expr) -> String {
         Expr::TimestampLiteral(micros) => {
             format!("TIMESTAMP '{}'", crate::datetime::format_timestamp(*micros))
         }
+        // `TIME` 型付きリテラル（Issue #1570）。`24:00:00` も `format_time` が往復できる形で返す。
+        Expr::TimeLiteral(micros) => format!("TIME '{}'", crate::datetime::format_time(*micros)),
     }
 }
 
@@ -461,7 +463,7 @@ fn referenced_column_names(
                 collect_idents(lhs, acc);
                 collect_idents(rhs, acc);
             }
-            Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => {}
+            Expr::DateLiteral(_) | Expr::TimestampLiteral(_) | Expr::TimeLiteral(_) => {}
         }
     }
     let mut idents: Vec<&str> = Vec::new();

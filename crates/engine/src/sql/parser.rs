@@ -1474,6 +1474,7 @@ fn is_typed_compare_column_type(ty: &ColumnType) -> bool {
         ty,
         ColumnType::Date
             | ColumnType::Timestamp
+            | ColumnType::Time
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid
             | ColumnType::Bytea
@@ -4967,6 +4968,8 @@ pub(crate) enum AggregateInput {
     /// 同じ受理範囲（`COUNT`・`MIN`/`MAX`）を持つ（TABLE-13・TASK-197、
     /// Issue #884・#892）。
     TimestampColumn(usize),
+    /// `TIME` 列の裸参照（`COUNT`・`MIN`/`MAX`。Issue #1570）。
+    TimeColumn(usize),
     /// `ARRAY` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL 行数）
     /// でのみ使う（TABLE-14・TASK-198、Issue #888・D-A8）。`SUM`/`AVG`/`MIN`/
     /// `MAX` は `TextColumn`/`BooleanColumn` と同じパターンで
@@ -5706,9 +5709,13 @@ fn resolve_aggregate_input(
                     (ColumnType::Timestamp, _) => Err(SqlSurfaceError::undefined_function(
                         format!("column {name:?} is TIMESTAMP and cannot be used with SUM/AVG"),
                     )),
-                    // `TIME` 列の集計は #1570 で解禁する（Issue #1569。fail-closed）。
+                    // `TIME` 列は `COUNT`・`MIN`/`MAX` のみ（Issue #1570）。
+                    (
+                        ColumnType::Time,
+                        AggregateFunc::Count | AggregateFunc::Min | AggregateFunc::Max,
+                    ) => Ok(AggregateInput::TimeColumn(index)),
                     (ColumnType::Time, _) => Err(SqlSurfaceError::undefined_function(format!(
-                        "column {name:?} is TIME and cannot be used in aggregates yet"
+                        "column {name:?} is TIME and cannot be used with SUM/AVG"
                     ))),
                     (ColumnType::Array(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::ArrayColumn(index))
@@ -5782,11 +5789,11 @@ fn resolve_aggregate_input(
                 // 集計引数としては対象外とする。
                 // Issue #1186: `SUM`／`AVG` に `DATE`／`TIMESTAMP` 式を渡す組み合わせ
                 // は列参照と同じく `42883`（undefined_function）で拒否する。
-                ExprType::Date | ExprType::Timestamp
+                ExprType::Date | ExprType::Timestamp | ExprType::Time
                     if matches!(func, AggregateFunc::Sum | AggregateFunc::Avg) =>
                 {
                     Err(SqlSurfaceError::undefined_function(
-                        "SUM/AVG cannot be applied to a DATE or TIMESTAMP expression",
+                        "SUM/AVG cannot be applied to a DATE, TIMESTAMP or TIME expression",
                     ))
                 }
                 // Issue #1349: 列参照と同じ型・同じ関数には同じコードを返す（ERR-2）。
@@ -5811,6 +5818,7 @@ fn resolve_aggregate_input(
                 | ExprType::Text
                 | ExprType::Date
                 | ExprType::Timestamp
+                | ExprType::Time
                 | ExprType::Json
                 | ExprType::JsonText => Err(SqlSurfaceError::invalid_input(
                     "aggregate argument must evaluate to a scalar",
@@ -5880,9 +5888,7 @@ fn resolve_count_distinct_input(
                     ColumnType::Boolean => Ok(AggregateInput::BooleanColumn(index)),
                     ColumnType::Date => Ok(AggregateInput::DateColumn(index)),
                     ColumnType::Timestamp => Ok(AggregateInput::TimestampColumn(index)),
-                    ColumnType::Time => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} is TIME and cannot be used with COUNT(DISTINCT ...) yet"
-                    ))),
+                    ColumnType::Time => Ok(AggregateInput::TimeColumn(index)),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is ARRAY and cannot be used with COUNT(DISTINCT ...)"
                     ))),
@@ -5929,6 +5935,7 @@ fn resolve_count_distinct_input(
                 | ExprType::Text
                 | ExprType::Date
                 | ExprType::Timestamp
+                | ExprType::Time
                 | ExprType::Json
                 | ExprType::JsonText => Err(SqlSurfaceError::invalid_input(
                     "aggregate argument must evaluate to a scalar",
@@ -6337,15 +6344,14 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Date
-        | ColumnType::Timestamp => Some(OrderKind::SignedInt),
+        | ColumnType::Timestamp
+        | ColumnType::Time => Some(OrderKind::SignedInt),
         ColumnType::Real | ColumnType::Double => Some(OrderKind::Float),
         ColumnType::Boolean => Some(OrderKind::Bool),
         ColumnType::Numeric { .. } => Some(OrderKind::Numeric),
         ColumnType::Uuid => Some(OrderKind::Uuid),
         ColumnType::Enum(_) => Some(OrderKind::Enum),
-        // `TIME` の並べ替えは #1570 で解禁する（Issue #1569。fail-closed）。
-        ColumnType::Time
-        | ColumnType::Vector(_)
+        ColumnType::Vector(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -6408,7 +6414,7 @@ fn order_kind_for_expr_type(
         ExprType::Scalar => Ok(OrderKind::Float),
         ExprType::Text => Ok(OrderKind::Bytes),
         ExprType::Bool => Ok(OrderKind::Bool),
-        ExprType::Date | ExprType::Timestamp => Ok(OrderKind::SignedInt),
+        ExprType::Date | ExprType::Timestamp | ExprType::Time => Ok(OrderKind::SignedInt),
         ExprType::Vector => Err(SqlSurfaceError::invalid_input(
             "unsupported ORDER BY expression type: VECTOR",
         )),
@@ -6782,6 +6788,7 @@ pub(crate) enum WindowKeyKind {
     Boolean,
     Date,
     Timestamp,
+    Time,
     Numeric,
     Uuid,
 }
@@ -6835,10 +6842,10 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
             ColumnType::Boolean => WindowKeyKind::Boolean,
             ColumnType::Date => WindowKeyKind::Date,
             ColumnType::Timestamp => WindowKeyKind::Timestamp,
+            ColumnType::Time => WindowKeyKind::Time,
             ColumnType::Numeric { .. } => WindowKeyKind::Numeric,
             ColumnType::Uuid => WindowKeyKind::Uuid,
-            ColumnType::Time
-            | ColumnType::Vector(_)
+            ColumnType::Vector(_)
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
@@ -7028,7 +7035,7 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
         }
         // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。
         // Issue #920）は列識別子を参照しない。
-        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => {}
+        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) | Expr::TimeLiteral(_) => {}
     }
 }
 
@@ -7272,6 +7279,7 @@ pub(crate) fn check_having_target_is_numeric(
                 | AggregateInput::NumericColumn { .. }
                 | AggregateInput::DateColumn(_)
                 | AggregateInput::TimestampColumn(_)
+                | AggregateInput::TimeColumn(_)
         );
     if is_unsupported {
         return Err(SqlSurfaceError::invalid_input(format!(
@@ -7504,6 +7512,7 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
             AggregateInput::TextColumn(_) => ColumnType::Text,
             AggregateInput::DateColumn(_) => ColumnType::Date,
             AggregateInput::TimestampColumn(_) => ColumnType::Timestamp,
+            AggregateInput::TimeColumn(_) => ColumnType::Time,
             _ => EXPR_UNSUPPORTED_COLUMN_TYPE,
         },
     }
@@ -7585,6 +7594,7 @@ fn rewrite_group_row_idents(
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
+        | Expr::TimeLiteral(_)
         | Expr::ValueFunction { .. } => expr.clone(),
         Expr::Call { name, args } => Expr::Call {
             name: name.clone(),

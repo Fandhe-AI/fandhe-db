@@ -3407,6 +3407,7 @@ fn project_rows(
                         // 直接投影と同じテキスト整形経路を共有する）。
                         udf_call::ExprValue::Date(d) => cells.push(Cell::Date(d)),
                         udf_call::ExprValue::Timestamp(t) => cells.push(Cell::Timestamp(t)),
+                        udf_call::ExprValue::Time(t) => cells.push(Cell::Time(t)),
                         // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有
                         // 契約: NULL は `Cell::Null` へ写像する。
                         udf_call::ExprValue::Null => cells.push(Cell::Null),

@@ -1810,7 +1810,7 @@ fn collect_referenced_udfs(
         }
         // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。
         // Issue #920）は UDF 呼び出しを持たない葉。
-        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => Ok(()),
+        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) | Expr::TimeLiteral(_) => Ok(()),
     }
 }
 
@@ -1919,6 +1919,7 @@ fn push_set_expr(
             | Expr::Null
             | Expr::DateLiteral(_)
             | Expr::TimestampLiteral(_)
+            | Expr::TimeLiteral(_)
             | Expr::ValueFunction { .. } => {}
         }
     }
@@ -2050,6 +2051,13 @@ fn push_dml_expr(
         Expr::TimestampLiteral(micros) => {
             b.push_u8(10);
             b.push_u8(1);
+            b.push_raw(&micros.to_le_bytes());
+        }
+        // `TIME` 型付きリテラル（Issue #1570）。タグ 10 の型バイト 2 を追加するだけで、
+        // 既存の型バイト（0/1）とそれらのハッシュ値は不変。
+        Expr::TimeLiteral(micros) => {
+            b.push_u8(10);
+            b.push_u8(2);
             b.push_raw(&micros.to_le_bytes());
         }
         // タグ 12（対象ビヘイビア: TABLE-25。Issue #1596。ADR §4.4 タグ表に追記）。

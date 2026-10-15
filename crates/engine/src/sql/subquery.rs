@@ -1029,6 +1029,8 @@ enum SubqueryValueFamily {
     Boolean,
     Date,
     Timestamp,
+    /// `TIME`（Issue #1570）。
+    Time,
     Numeric,
     Uuid,
     Bytea,
@@ -1060,9 +1062,8 @@ fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
             Some(SubqueryValueFamily::Integer)
         }
         ColumnType::Real | ColumnType::Double => Some(SubqueryValueFamily::Float),
-        // `TIME` のサブクエリ比較は #1570 で解禁する（Issue #1569。fail-closed）。
-        ColumnType::Time
-        | ColumnType::Vector(_)
+        ColumnType::Time => Some(SubqueryValueFamily::Time),
+        ColumnType::Vector(_)
         | ColumnType::Array(_)
         | ColumnType::Json
         | ColumnType::Jsonb
@@ -1245,6 +1246,7 @@ fn resolve_in_subquery(
             }
             SubqueryValueFamily::Date
             | SubqueryValueFamily::Timestamp
+            | SubqueryValueFamily::Time
             | SubqueryValueFamily::Numeric
             | SubqueryValueFamily::Uuid
             | SubqueryValueFamily::Bytea => texts.push(typed_cell_text(cell, family)?),
@@ -1694,6 +1696,7 @@ fn typed_cell_text(cell: &Cell, family: SubqueryValueFamily) -> Result<String, S
         (SubqueryValueFamily::Timestamp, Cell::Timestamp(t)) => {
             Ok(crate::datetime::format_timestamp(*t))
         }
+        (SubqueryValueFamily::Time, Cell::Time(t)) => Ok(crate::datetime::format_time(*t)),
         (SubqueryValueFamily::Numeric, Cell::Numeric(d)) => Ok(d.to_string()),
         (SubqueryValueFamily::Uuid, Cell::Uuid(u)) => Ok(u.to_string()),
         (SubqueryValueFamily::Bytea, Cell::Bytes(b)) => Ok(crate::bytea::format_hex_text(b)),

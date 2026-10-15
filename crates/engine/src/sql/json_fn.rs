@@ -170,6 +170,12 @@ fn bind_value_arg(
                 detail: "a vector value cannot be converted to json".to_string(),
             })
         }
+        // TIME の json 化は未対応（#1570 の対象外）。fail-closed で拒否する。
+        ExprType::Time => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "a time value cannot be converted to json yet".to_string(),
+            })
+        }
     };
     Ok((bound, kind))
 }
