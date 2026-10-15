@@ -241,6 +241,8 @@ pub(crate) enum StackValue {
     NumericColumnRef(usize),
     /// jsonb 値の正規化テキスト（[`ExprStep::JsonSubtree`] の結果。所有データ）。
     Json(String),
+    /// `json`（原文保存）値の原文テキスト（Issue #2180。[`ExprStep::JsonSubtree`] の結果）。
+    JsonText(String),
 }
 
 /// [`StackValue`] を、eval 呼び出しスコープに閉じたライフタイム `'a` を持つ
@@ -313,6 +315,7 @@ fn stack_to_expr_value<'a>(
             }),
         },
         StackValue::Json(s) => Ok(ExprValue::Json(Cow::Owned(s))),
+        StackValue::JsonText(s) => Ok(ExprValue::JsonText(Cow::Owned(s))),
         StackValue::NumericColumnRef(index) => match row_scalars.get(index) {
             None => Err(SqlSurfaceError::Internal {
                 detail: "NUMERIC column reference is outside the decoded row scalar view"
@@ -350,6 +353,7 @@ fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
         ExprValue::Timestamp(t) => StackValue::Timestamp(t),
         ExprValue::Time(t) => StackValue::Time(t),
         ExprValue::Json(j) => StackValue::Json(j.into_owned()),
+        ExprValue::JsonText(j) => StackValue::JsonText(j.into_owned()),
     }
 }
 
@@ -414,6 +418,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
                 | ExprValue::Timestamp(_)
                 | ExprValue::Time(_)
                 | ExprValue::Json(_)
+                | ExprValue::JsonText(_)
                 | ExprValue::Null => None,
             }
         }
@@ -482,6 +487,8 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::Case { .. }
         | BoundExpr::Coalesce(_)
         | BoundExpr::JsonbColumnRef { .. }
+        | BoundExpr::JsonColumnRef { .. }
+        | BoundExpr::JsonTextFn(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::JsonAccess { .. }
         | BoundExpr::JsonFn { .. }
@@ -581,6 +588,8 @@ fn compile_node(
             *max_stack = (*max_stack).max(*current_depth);
         }
         BoundExpr::JsonbColumnRef { .. }
+        | BoundExpr::JsonColumnRef { .. }
+        | BoundExpr::JsonTextFn(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::JsonAccess { .. }
         | BoundExpr::JsonFn { .. }
@@ -1023,6 +1032,7 @@ impl ExprProgram {
                             | ExprValue::Date(_)
                             | ExprValue::Json(_)
                             | ExprValue::Time(_)
+                            | ExprValue::JsonText(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
                         let s = match scalar_ev {
@@ -1034,6 +1044,7 @@ impl ExprProgram {
                             | ExprValue::Date(_)
                             | ExprValue::Json(_)
                             | ExprValue::Time(_)
+                            | ExprValue::JsonText(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
                         // バックエンドの失敗（deadline 超過・トラップ・メモリ確保

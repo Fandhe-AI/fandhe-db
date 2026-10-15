@@ -728,7 +728,7 @@ fn bind_filter_op(
                     return Ok(if skip_enum_label_validation {
                         FilterOp::JsonEquals(String::new())
                     } else {
-                        FilterOp::JsonEquals(bind_json_key(value)?)
+                        FilterOp::JsonEquals(bind_json_key(value, ty)?)
                     });
                 }
                 _ => {}
@@ -997,7 +997,7 @@ fn bind_filter_op(
                         bound.push(if skip_enum_label_validation {
                             String::new()
                         } else {
-                            bind_json_key(v)?
+                            bind_json_key(v, ty)?
                         });
                     }
                     FilterOp::InJson(bound)
@@ -1101,8 +1101,15 @@ fn bind_array_key(
 /// JSON／JSONB 等価・`IN` の右辺リテラルを値等価の正規形へ変換する
 /// （Issue #1193）。長さ上限・構文・深さ・要素数は
 /// [`crate::json::canonical_equality_text`]（UNIQUE 制約と共通）が検証する。
-fn bind_json_key(literal: &str) -> Result<String, SqlSurfaceError> {
-    crate::json::canonical_equality_text(literal)
+fn bind_json_key(literal: &str, ty: &ColumnType) -> Result<String, SqlSurfaceError> {
+    // `json` 列の右辺は格納値と同じく重複キーを受理する（後勝ち。Issue #2180）。
+    // `jsonb` 列の右辺は従来どおり重複キーを拒否する。
+    let dup = if matches!(ty, ColumnType::Json) {
+        crate::json::DuplicateKeys::LastWins
+    } else {
+        crate::json::DuplicateKeys::Reject
+    };
+    crate::json::canonical_equality_text_with(literal, dup)
         .map_err(|e| crate::sql::parser::json_column_error(e, literal))
 }
 

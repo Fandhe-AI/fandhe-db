@@ -223,8 +223,8 @@ fn operand_type_rules_map_to_fixed_sqlstates() {
     assert_eq!(code(&core, &alice, &sel("n -> 'k'")), "42883");
     // 文字列リテラル始まりの投影項目は式として受理されない（従来どおり構文エラー）。
     assert_eq!(code(&core, &alice, &sel("'x' -> 'k'")), "42601");
-    // `json` 列は原文保持の意味論が別 Issue のため未対応。
-    assert_eq!(code(&core, &alice, &sel("doc -> 'k'")), "0A000");
+    // `json` 列のパス演算子は原文保存の意味で受理する（Issue #2180。
+    // 結合テストは `tests/json_text_operators.rs`）。
     // 右辺の型: 小数・bigint の範囲・BIGINT 列は演算子が存在しない。
     assert_eq!(code(&core, &alice, &sel("docb -> 1.5")), "42883");
     assert_eq!(code(&core, &alice, &sel("docb -> 3000000000")), "42883");

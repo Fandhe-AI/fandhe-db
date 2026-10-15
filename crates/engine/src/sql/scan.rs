@@ -909,7 +909,8 @@ fn build_projected_cells(
                     // jsonb パス演算子 `->`／`#>` の結果（Issue #1596・TABLE-25）。
                     // TEXT 結果と同じ累計バイト予算に計上する（行数分の蓄積で予算を
                     // 回避させない）。
-                    ExprValue::Json(j) => {
+                    // `json`（原文保存）式の結果（Issue #2180）も同じ累計バイト予算に計上する。
+                    ExprValue::Json(j) | ExprValue::JsonText(j) => {
                         cells.push(Cell::Json(try_alloc_text_for_budget(
                             &j,
                             byte_budget,

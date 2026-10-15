@@ -813,3 +813,13 @@ fn bare_null_compared_with_time_propagates_in_const_expr() {
         assert_eq!(first_col(&r), vec!["02:00:00".to_string()], "{e}");
     }
 }
+
+/// TIME の json 化（`to_json`）は未対応のため fail-closed で 0A000 になる。
+#[test]
+fn to_json_of_time_is_rejected_fail_closed() {
+    let (core, _g) = open_core("tq-to-json");
+    assert_eq!(
+        code(&core, &format!("SELECT to_json(v) FROM {TABLE} LIMIT 1")),
+        "0A000"
+    );
+}

@@ -158,7 +158,6 @@ fn insert_rejects_malformed_or_non_rfc8259_json() {
 
     for (label, literal) in [
         ("not json at all", "'not json'"),
-        ("duplicate key", r#"'{"a":1,"a":2}'"#),
         ("leading zero", "'01'"),
         ("trailing comma", "'[1,]'"),
         ("unterminated object", r#"'{"a":1'"#),
@@ -172,6 +171,41 @@ fn insert_rejects_malformed_or_non_rfc8259_json() {
             .unwrap_err();
         assert_eq!(err.wire_code(), "22P02", "case: {label}");
     }
+}
+
+/// Issue #2180（TABLE-25）: `json` 列は PostgreSQL と同じく重複キーを受理して原文のまま保存する。
+/// 重複キーを拒否するのは `jsonb` 列（正規化の都合）だけ。
+#[test]
+fn json_column_accepts_duplicate_keys_and_jsonb_rejects_them() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &insert_sql(1, "ja", r#"'{"a":1, "a" : 2}'"#, "'{}'", 1),
+    )
+    .expect("json column accepts duplicate keys");
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &insert_sql(2, "ja", "'{}'", r#"'{"a":1,"a":2}'"#, 1),
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22P02");
+    let rows = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT doc FROM {TABLE} WHERE id = 1 LIMIT 1"),
+        )
+        .expect("select")
+        .rows;
+    assert_eq!(
+        rows[0].cells[0],
+        Cell::Json(r#"{"a":1, "a" : 2}"#.to_string())
+    );
 }
 
 #[test]
@@ -431,26 +465,6 @@ fn where_json_equality_does_not_cross_tenants() {
 }
 
 #[test]
-fn json_path_operator_on_a_json_column_is_rejected_as_unsupported() {
-    let (core, path) = new_core();
-    let _guard = CleanupGuard(path);
-    let alice = ctx_for("alice");
-    core.execute_sql_in_session(
-        &alice,
-        &mut SessionState::default(),
-        &insert_sql(1, "ja", r#"'{"a":1}'"#, "'{}'", 1),
-    )
-    .expect("insert should succeed");
-
-    let err = core
-        .execute_sql(&alice, &format!("SELECT doc -> 'a' FROM {TABLE} LIMIT 10"))
-        .unwrap_err();
-    // Issue #1596（TABLE-25）: パス演算子は jsonb 列だけを受理する。`json` 列（原文保持）は
-    // 別 Issue の担当のため、構文エラー（42601）ではなく未対応（0A000）で拒否する。
-    assert_eq!(err.wire_code(), "0A000");
-}
-
-#[test]
 fn json_column_cannot_be_used_in_an_expression() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
@@ -468,7 +482,9 @@ fn json_column_cannot_be_used_in_an_expression() {
             &format!("SELECT vec_norm(doc) FROM {TABLE} LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    // Issue #2180: json 列の裸の参照は式の中で受理され、json 値を消費できない位置
+    // （関数引数・算術・CASE 等）は jsonb と同じ `0A000` で拒否する。
+    assert_eq!(err.wire_code(), "0A000");
 }
 
 #[test]

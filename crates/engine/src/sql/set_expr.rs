@@ -70,7 +70,7 @@ pub(crate) fn bind_set_expr(
     let allow_current_time = crate::sql::time_fn::current_clock().is_some()
         && crate::sql::time_fn::current_clock_policy()
             == crate::sql::time_fn::ClockPolicy::TxnFixedOnly;
-    if first_non_builtin_call_with(expr, allow_current_time).is_some() {
+    if first_non_builtin_call_with(expr, allow_current_time, true).is_some() {
         return Err(SqlSurfaceError::unsupported(
             "only built-in functions are allowed in a SET expression",
         ));
@@ -169,7 +169,8 @@ pub(crate) fn eval_set_expr_to_value<'a>(
             _ => Err(internal()),
         },
         // jsonb 値の代入は #1597 まで束縛段が `0A000` で拒否するため到達しない（fail-closed）。
-        ExprValue::Json(_) => Err(internal()),
+        // json 値（原文保存）の代入も束縛段が `0A000` で拒否するため到達しない（Issue #2180）。
+        ExprValue::Json(_) | ExprValue::JsonText(_) => Err(internal()),
         ExprValue::Date(d) => match &set.target_ty {
             ColumnType::Date => Ok(Value::Date(d)),
             ColumnType::Timestamp => i64::from(d)
