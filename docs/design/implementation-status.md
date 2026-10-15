@@ -918,3 +918,7 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **テスト**: `aggregate_scalar_types.rs`（numeric 型・i64 超・NULL・GROUP BY／HAVING／ORDER BY・窓・RLS）、`aggregate.rs`／`group_by.rs` 単体（38 桁境界・厳密比較）、`wire13_type_oid.rs`（OID 1700）、`wire14_binary_typed_columns.rs`（`0A000`）、`nosql4_aggregate.rs`（丸めない JSON number・SQL 表層パリティ）。
 - **性能**: 累積経路（`i128` 加算）は不変で、差分は `finish` での `Decimal` 化のみ。前後比較の実測は未実施（集計ベンチ常設化 #1490 待ち）。
 - **対象外**: numeric のバイナリ結果形式（WIRE-14 改訂が前提）、集計の numeric 算術（#1810・#1812）、`AVG` の numeric 化（#2270）、NoSQL の `Computed` 列 `columns[].type` が常に `text` である点。
+
+**Issue #1595（docs(design): JSON 演算子・関数・jsonpath の ExprType への写像を設計する。TABLE-25・TABLE-14 ポインタ。詳細は [json-expr-type-mapping.md](json-expr-type-mapping.md)）**: 公開コードの現状と担当 Issue 対応表を記録（設計判断の詳細は private spec 側に置きポインタ表記のみ）。ドキュメントのみの変更でコードは変更しない。
+
+- **対象外**: コード実装（兄弟 Issue）、jsonb 出力形式の PostgreSQL 17 との差の是正、`jsonb_agg` の担当未割当、SRF 基盤（#2220）。
