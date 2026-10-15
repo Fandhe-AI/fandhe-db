@@ -1167,6 +1167,7 @@ pub fn decode_bind_values(
             | Token::ArrowText
             | Token::HashArrow
             | Token::HashArrowText
+            | Token::HashMinus
             | Token::JsonContains
             | Token::JsonContainedBy
             | Token::JsonExists

@@ -153,6 +153,68 @@ fn wire_json_path_operators_advertise_jsonb_and_text_oids() {
     common::read_ready_for_query(&mut alice);
 }
 
+/// Issue #2181（TABLE-25）: 連結・削除演算子の結果列は jsonb（OID 3802）として RowDescription に載り、
+/// 値は正規化テキスト。スカラーからの削除は 22023、json 列への適用は 42883 の ErrorResponse。
+#[test]
+fn wire_jsonb_modify_operators_advertise_jsonb_oid_and_map_errors() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = common::spawn_server_with_engine(&users_path, core);
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    for (id, doc) in [(1, r#"{"a":1,"b":[1,2]}"#), (2, "5")] {
+        common::send_simple_query(
+            &mut alice,
+            &format!(
+                "INSERT INTO docs (id, embedding, docb, doc) VALUES ({id}, '[0.1,0.2,0.3]', '{doc}', '{{}}') USING OPERATION_ID 'op-m-{id}'"
+            ),
+        );
+        assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+        common::read_ready_for_query(&mut alice);
+    }
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT docb || '{\"c\":3}' AS cc, docb - 'a' AS dk, (docb -> 'b') - 0 AS di, docb #- '{b,1}' AS dp \
+         FROM docs WHERE id = 1 LIMIT 1",
+    );
+    let columns = common::read_row_description_with_oids(&mut alice);
+    assert_eq!(
+        columns,
+        vec![
+            ("cc".to_string(), 3802),
+            ("dk".to_string(), 3802),
+            ("di".to_string(), 3802),
+            ("dp".to_string(), 3802),
+        ]
+    );
+    assert_eq!(
+        common::read_data_row(&mut alice),
+        vec![
+            Some(r#"{"a":1,"b":[1,2],"c":3}"#.to_string()),
+            Some(r#"{"b":[1,2]}"#.to_string()),
+            Some("[2]".to_string()),
+            Some(r#"{"a":1,"b":[1]}"#.to_string()),
+        ]
+    );
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT docb - 'a' FROM docs WHERE id = 2 LIMIT 1",
+    );
+    common::expect_error_response_with_sqlstate(&mut alice, "22023");
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT doc - 'a' FROM docs WHERE id = 1 LIMIT 1",
+    );
+    common::expect_error_response_with_sqlstate(&mut alice, "42883");
+    common::read_ready_for_query(&mut alice);
+}
+
 /// Issue #1597（TABLE-25）: 簡易クエリで jsonb の述語（暗黙の jsonb リテラル解釈）と
 /// ORDER BY（式キー）が往復し、RowDescription は OID 3802・値は正規化テキストで返る。
 #[test]

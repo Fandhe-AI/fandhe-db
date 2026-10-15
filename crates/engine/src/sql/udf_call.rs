@@ -364,6 +364,11 @@ pub enum JsonAccessOp {
     ExistsAny,
     /// `?&`（右辺は text[] リテラル。結果は bool。Issue #1598）。
     ExistsAll,
+    /// `||`（連結・浅いマージ。結果は jsonb。Issue #2181）。
+    Concat,
+    /// `#-`（右辺は text[] リテラル。結果は jsonb。Issue #2181）。`jsonb - x` は
+    /// 加減算の段の [`BinOp::Sub`] のまま構文段が生成し、束縛段が左辺の型で振り分ける。
+    DeletePath,
 }
 
 impl JsonAccessOp {
@@ -379,6 +384,8 @@ impl JsonAccessOp {
             JsonAccessOp::Exists => "?",
             JsonAccessOp::ExistsAny => "?|",
             JsonAccessOp::ExistsAll => "?&",
+            JsonAccessOp::Concat => "||",
+            JsonAccessOp::DeletePath => "#-",
         }
     }
 
@@ -530,6 +537,13 @@ pub enum BoundExpr {
         lhs: Box<BoundExpr>,
         rhs: JsonPredicateRhs,
     },
+    /// jsonb の連結・削除演算子の束縛結果（Issue #2181・TABLE-25）。結果は jsonb
+    /// （[`ExprType::Json`]）。左右いずれかが SQL の NULL なら結果も NULL（strict）。
+    JsonModify {
+        op: JsonModifyOp,
+        lhs: Box<BoundExpr>,
+        rhs: JsonModifyRhs,
+    },
     /// jsonb 関数（`jsonb_typeof`・`jsonb_array_length`・`jsonb_extract_path(_text)`・
     /// `jsonb_build_object`・`jsonb_build_array`・`to_jsonb`。Issue #1599・TABLE-25）の束縛結果。
     /// 引数は多相・可変長・jsonb 値を取るため [`BuiltinFn`] では表せず専用 variant とする。
@@ -539,6 +553,42 @@ pub enum BoundExpr {
         f: JsonFnKind,
         args: Vec<BoundExpr>,
     },
+}
+
+/// [`BoundExpr::JsonModify`] の演算子（Issue #2181）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonModifyOp {
+    /// `||`
+    Concat,
+    /// `jsonb - text`
+    DeleteKey,
+    /// `jsonb - integer`
+    DeleteIndex,
+    /// `#-`
+    DeletePath,
+}
+
+/// [`BoundExpr::JsonModify`] の右辺（束縛時に種別を確定済み）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonModifyRhs {
+    /// `||` の jsonb 式。
+    Jsonb(Box<BoundExpr>),
+    /// `- text` のキー（text を返す式）。
+    Key(Box<BoundExpr>),
+    /// `- integer` の添字（int4 を返す式）。
+    Index(Box<BoundExpr>),
+    /// `#-` のパス（束縛時に解析済み。NULL 要素は束縛段で拒否済みのため持たない）。
+    Path(Vec<String>),
+}
+
+impl JsonModifyRhs {
+    /// 右辺が評価する式（`Path` は式を持たない）。列参照・ノード数の走査用。
+    fn expr(&self) -> Option<&BoundExpr> {
+        match self {
+            JsonModifyRhs::Jsonb(e) | JsonModifyRhs::Key(e) | JsonModifyRhs::Index(e) => Some(e),
+            JsonModifyRhs::Path(_) => None,
+        }
+    }
 }
 
 /// [`BoundExpr::JsonFn`] の関数種別（Issue #1599）。
@@ -651,6 +701,18 @@ impl PartialEq for BoundExpr {
                     rhs: ra,
                 },
                 BoundExpr::JsonPredicate {
+                    op: ob,
+                    lhs: lb,
+                    rhs: rb,
+                },
+            ) => oa == ob && la == lb && ra == rb,
+            (
+                BoundExpr::JsonModify {
+                    op: oa,
+                    lhs: la,
+                    rhs: ra,
+                },
+                BoundExpr::JsonModify {
                     op: ob,
                     lhs: lb,
                     rhs: rb,
@@ -1639,6 +1701,13 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
                 }
         }
         BoundExpr::JsonTextFn(f) => 1 + f.args.iter().map(count_bound_nodes).sum::<usize>(),
+        BoundExpr::JsonModify { lhs, rhs, .. } => {
+            1 + count_bound_nodes(lhs)
+                + match rhs {
+                    JsonModifyRhs::Path(p) => p.len(),
+                    other => other.expr().map_or(0, count_bound_nodes),
+                }
+        }
         BoundExpr::Builtin { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
         BoundExpr::Binary { lhs, rhs, .. } => 1 + count_bound_nodes(lhs) + count_bound_nodes(rhs),
         BoundExpr::WasmCall { args, .. } | BoundExpr::JsonFn { args, .. } => {
@@ -1699,6 +1768,9 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
             max_bound_case_nesting(lhs).max(rhs.expr().map_or(0, max_bound_case_nesting))
         }
         BoundExpr::JsonTextFn(f) => f.args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
+        BoundExpr::JsonModify { lhs, rhs, .. } => {
+            max_bound_case_nesting(lhs).max(rhs.expr().map_or(0, max_bound_case_nesting))
+        }
         BoundExpr::Builtin { args, .. } => {
             args.iter().map(max_bound_case_nesting).max().unwrap_or(0)
         }
@@ -1761,6 +1833,9 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
             references_embedding(lhs) || rhs.expr().is_some_and(references_embedding)
         }
         BoundExpr::JsonTextFn(f) => f.args.iter().any(references_embedding),
+        BoundExpr::JsonModify { lhs, rhs, .. } => {
+            references_embedding(lhs) || rhs.expr().is_some_and(references_embedding)
+        }
         BoundExpr::Builtin { args, .. } => args.iter().any(references_embedding),
         BoundExpr::Binary { lhs, rhs, .. } => {
             references_embedding(lhs) || references_embedding(rhs)
@@ -1798,6 +1873,12 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
             }
         }
         BoundExpr::JsonPredicate { lhs, rhs, .. } => {
+            visit_referenced_scalar_columns(lhs, visit);
+            if let Some(e) = rhs.expr() {
+                visit_referenced_scalar_columns(e, visit);
+            }
+        }
+        BoundExpr::JsonModify { lhs, rhs, .. } => {
             visit_referenced_scalar_columns(lhs, visit);
             if let Some(e) = rhs.expr() {
                 visit_referenced_scalar_columns(e, visit);
@@ -1906,6 +1987,16 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
             }
             any
         }
+        // 連結・削除演算子（Issue #2181）。左辺・右辺の式が参照する列を両方反映する。
+        BoundExpr::JsonModify { lhs, rhs, .. } => {
+            let mut any = mark_referenced_scalar_columns(lhs, mask);
+            if let Some(e) = rhs.expr() {
+                if mark_referenced_scalar_columns(e, mask) {
+                    any = true;
+                }
+            }
+            any
+        }
         // `any`/`fold` は短絡評価となり、先頭の一致以降の引数をマークし損ねる
         // （複数引数が別々の TEXT 列を参照しうる。例: `concat(a, b)`）ため、
         // 明示ループで全引数を必ず走査する（`references_embedding` の `any`
@@ -1967,6 +2058,28 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
             let r = mark_referenced_scalar_columns(rhs, mask);
             l || r
         }
+    }
+}
+
+thread_local! {
+    /// CHECK 述語の束縛中（[`CheckBindingGuard`] が生きている間）だけ `true`。構文段が型を知らず
+    /// 拒否できない jsonb の `-`（[`bind_json_delete`]）を CHECK 本体で `0A000` にするために使う。
+    static CHECK_BINDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// CHECK 述語の束縛区間を示す RAII ガード（`sql::parser::bind_check_predicates` が張る）。
+/// drop（panic 時を含む）で直前の値へ戻す。
+pub(crate) struct CheckBindingGuard(bool);
+
+impl CheckBindingGuard {
+    pub(crate) fn enter() -> Self {
+        Self(CHECK_BINDING.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for CheckBindingGuard {
+    fn drop(&mut self) {
+        CHECK_BINDING.with(|c| c.set(self.0));
     }
 }
 
@@ -2626,6 +2739,23 @@ pub(super) fn bind_expr_any(
         }
         Expr::Call { name, args } => bind_call(name, args, env, node_budget),
         Expr::Binary { op, lhs, rhs } => {
+            // Issue #2181: 左辺が jsonb の `-` は削除演算子（キー・添字）。それ以外の左辺は
+            // 従来の算術経路のまま（既存の算術の挙動を変えない）。
+            // AST 形で判定できる左辺（jsonb／json 列・パス／連結／削除演算子）は先に振り分ける。
+            // 関数呼び出し（`jsonb_build_object(..)` 等）の左辺は AST からは型が分からないため、
+            // 左辺を 1 度だけ束縛して得た [`ExprType`] で振り分ける（`||` の `bind_expr_any` と同方式。
+            // jsonb 以外は束縛済みの左辺を算術経路へ引き継ぎ、従来の挙動と fail-closed を保つ）。
+            let mut prebound_lhs: Option<(BoundExpr, ExprType)> = None;
+            if *op == BinOp::Sub {
+                if is_json_expr(lhs, env) {
+                    return bind_json_delete(lhs, rhs, env, node_budget);
+                }
+                let (l, lt) = bind_expr_any(lhs, env, node_budget)?;
+                if lt == ExprType::Json {
+                    return bind_json_delete_bound(l, rhs, env, node_budget);
+                }
+                prebound_lhs = Some((l, lt));
+            }
             if matches!(
                 op,
                 BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq
@@ -2665,7 +2795,9 @@ pub(super) fn bind_expr_any(
                 op,
                 BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq
             );
-            let (l, lt) = if is_comparison {
+            let (l, lt) = if let Some(pre) = prebound_lhs {
+                pre
+            } else if is_comparison {
                 bind_expr_any(lhs, env, node_budget)?
             } else {
                 bind_expr_in(lhs, env, node_budget)?
@@ -2815,6 +2947,9 @@ fn bind_json_access(
     if op.is_predicate() {
         return bind_json_predicate(op, lhs, rhs, env, node_budget);
     }
+    if matches!(op, JsonAccessOp::Concat | JsonAccessOp::DeletePath) {
+        return bind_json_modify(op, lhs, rhs, env, node_budget);
+    }
     let operator_missing = || {
         SqlSurfaceError::undefined_function(format!(
             "operator does not exist: the operand types do not match the {} operator",
@@ -2875,9 +3010,12 @@ fn bind_json_access(
         | JsonAccessOp::ContainedBy
         | JsonAccessOp::Exists
         | JsonAccessOp::ExistsAny
-        | JsonAccessOp::ExistsAll => {
+        | JsonAccessOp::ExistsAll
+        | JsonAccessOp::Concat
+        | JsonAccessOp::DeletePath => {
             return Err(SqlSurfaceError::Internal {
-                detail: "JSON predicate operator reached the path operator binder".to_string(),
+                detail: "JSON predicate or modify operator reached the path operator binder"
+                    .to_string(),
             })
         }
         JsonAccessOp::Path | JsonAccessOp::PathText => {
@@ -2916,6 +3054,254 @@ fn bind_json_access(
     ))
 }
 
+/// `||` の jsonb オペランドを束縛する。`json` 列は PostgreSQL では text 連結になるが
+/// 本実装に文字列連結は無いため `0A000`（fail-closed）。それ以外は通常の式として束縛する。
+fn bind_json_concat_operand(
+    expr: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if let Expr::Ident(name) = expr {
+        if !env.params.contains_key(name.to_ascii_lowercase().as_str()) {
+            let is_json_column = env.schema.is_some_and(|sc| {
+                sc.columns
+                    .iter()
+                    .any(|c| &c.name == name && matches!(c.ty, ColumnType::Json))
+            });
+            if is_json_column {
+                return Err(concat_not_supported());
+            }
+        }
+    }
+    bind_expr_any(expr, env, node_budget)
+}
+
+fn concat_not_supported() -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: "the || operator is only supported on jsonb operands".to_string(),
+    }
+}
+
+/// jsonb の連結・パス削除演算子（`||` `#-`。Issue #2181・TABLE-25）の束縛。
+/// `||` は両辺 jsonb（型なしリテラルは反対側が jsonb のとき jsonb として解釈）のみ受理し、
+/// 文字列連結に当たる組は `0A000`、型の合わない組は `42883`。`#-` は左辺 jsonb（`json` 列は
+/// `42883`）・右辺 text[] リテラル（NULL 要素は `22004` の分類が未実装のため `0A000`）。
+fn bind_json_modify(
+    op: JsonAccessOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let operator_missing = || {
+        SqlSurfaceError::undefined_function(format!(
+            "operator does not exist: the operand types do not match the {} operator",
+            op.as_sql()
+        ))
+    };
+    if op == JsonAccessOp::DeletePath {
+        let (l, l_ty) = bind_json_predicate_operand(lhs, env, node_budget)?;
+        if l_ty != ExprType::Json {
+            return Err(operator_missing());
+        }
+        let Expr::String(literal) = rhs else {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "the right operand of #- must be a text[] literal".to_string(),
+            });
+        };
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        let array_ty = crate::catalog::ArrayType::new(
+            crate::catalog::ArrayElemType::Text,
+            crate::catalog::MAX_ARRAY_ELEMENTS,
+        )
+        .map_err(|_| SqlSurfaceError::Internal {
+            detail: "text[] type construction failed".to_string(),
+        })?;
+        let items = match crate::sql::parser::parse_array_literal(literal, array_ty)? {
+            crate::row_codec::ArrayValue::Text(items) => items,
+            _ => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "text[] literal parsed to a non-text array".to_string(),
+                })
+            }
+        };
+        let path = items
+            .into_iter()
+            .map(|e| {
+                e.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
+                    detail: "a NULL element in the #- path is not supported".to_string(),
+                })
+            })
+            .collect::<Result<Vec<String>, _>>()?;
+        return Ok((
+            BoundExpr::JsonModify {
+                op: JsonModifyOp::DeletePath,
+                lhs: Box::new(l),
+                rhs: JsonModifyRhs::Path(path),
+            },
+            ExprType::Json,
+        ));
+    }
+    // `||`。
+    let lhs_is_literal = matches!(lhs, Expr::String(_));
+    let rhs_is_literal = matches!(rhs, Expr::String(_));
+    if lhs_is_literal && rhs_is_literal {
+        return Err(operator_missing());
+    }
+    // 型なしリテラルの反対側の型を確定させる。jsonb ならリテラルを jsonb として解釈、
+    // text なら文字列連結（未実装）、それ以外は演算子なし。
+    let (l_bound, r_bound) = if lhs_is_literal || rhs_is_literal {
+        let (other_expr, literal_expr) = if lhs_is_literal {
+            (rhs, lhs)
+        } else {
+            (lhs, rhs)
+        };
+        let (other, other_ty) = bind_json_concat_operand(other_expr, env, node_budget)?;
+        match other_ty {
+            ExprType::Json => {}
+            ExprType::Text => return Err(concat_not_supported()),
+            _ => return Err(operator_missing()),
+        }
+        let lit = bind_json_predicate_literal(literal_expr, node_budget)?;
+        if lhs_is_literal {
+            (lit, other)
+        } else {
+            (other, lit)
+        }
+    } else {
+        let (l, l_ty) = bind_json_concat_operand(lhs, env, node_budget)?;
+        let (r, r_ty) = bind_json_concat_operand(rhs, env, node_budget)?;
+        match (l_ty, r_ty) {
+            (ExprType::Json, ExprType::Json) => (l, r),
+            (ExprType::Json, ExprType::Text) | (ExprType::Text, ExprType::Json) => {
+                return Err(concat_not_supported())
+            }
+            (ExprType::Json, _) | (_, ExprType::Json) => return Err(operator_missing()),
+            _ => return Err(concat_not_supported()),
+        }
+    };
+    Ok((
+        BoundExpr::JsonModify {
+            op: JsonModifyOp::Concat,
+            lhs: Box::new(l_bound),
+            rhs: JsonModifyRhs::Jsonb(Box::new(r_bound)),
+        },
+        ExprType::Json,
+    ))
+}
+
+/// 加減算の段の `-` の左辺が jsonb を返しうる式かを AST から静的に判定する
+/// （[`bind_json_delete`] へ振り分けるか、従来の算術へ流すかの分岐。Issue #2181）。
+/// jsonb／json 列の識別子・jsonb を返すパス／連結／削除演算子・それらを左辺とする `-`。
+fn is_json_expr(expr: &Expr, env: &BindEnv<'_>) -> bool {
+    match expr {
+        Expr::Ident(name) => {
+            !env.params.contains_key(name.to_ascii_lowercase().as_str())
+                && env.schema.is_some_and(|sc| {
+                    sc.columns.iter().any(|c| {
+                        &c.name == name && matches!(c.ty, ColumnType::Jsonb | ColumnType::Json)
+                    })
+                })
+        }
+        Expr::JsonAccess { op, .. } => matches!(
+            op,
+            JsonAccessOp::Get
+                | JsonAccessOp::Path
+                | JsonAccessOp::Concat
+                | JsonAccessOp::DeletePath
+        ),
+        Expr::Binary {
+            op: BinOp::Sub,
+            lhs,
+            ..
+        } => is_json_expr(lhs, env),
+        _ => false,
+    }
+}
+
+/// `jsonb - text`／`jsonb - integer` の束縛（Issue #2181・TABLE-25）。`-` は加減算の段に
+/// あるため構文段は [`BinOp::Sub`] を生成し、左辺が jsonb のときだけここへ来る。
+/// `json` 列は `42883`（jsonb 専用の演算子）。右辺は text（キー削除）か int4 式（添字削除）、
+/// それ以外は `42883`。`jsonb - text[]` は text[] を書く手段（キャスト・`ARRAY[...]`）が
+/// 無いため対象外。
+fn bind_json_delete(
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    // CHECK 本体では `||`・`#-` と同じく拒否する（構文段は型を知らないため `-` だけは
+    // 束縛段で判定する。fail-closed）。
+    if CHECK_BINDING.with(std::cell::Cell::get) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "JSON operators are not supported in a CHECK constraint".to_string(),
+        });
+    }
+    let operator_missing = || {
+        SqlSurfaceError::undefined_function(
+            "operator does not exist: the operand types do not match the - operator",
+        )
+    };
+    let (l, l_ty) = bind_json_predicate_operand(lhs, env, node_budget)?;
+    if l_ty != ExprType::Json {
+        return Err(operator_missing());
+    }
+    bind_json_delete_rhs(l, rhs, env, node_budget)
+}
+
+/// 左辺を束縛済みの `jsonb - ...`（関数呼び出し等 AST 形で判定できない左辺。Issue #2181）。
+fn bind_json_delete_bound(
+    l: BoundExpr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if CHECK_BINDING.with(std::cell::Cell::get) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "JSON operators are not supported in a CHECK constraint".to_string(),
+        });
+    }
+    bind_json_delete_rhs(l, rhs, env, node_budget)
+}
+
+/// `jsonb - text`／`jsonb - integer` の右辺の束縛と型振り分け（[`bind_json_delete`] の後半）。
+fn bind_json_delete_rhs(
+    l: BoundExpr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let operator_missing = || {
+        SqlSurfaceError::undefined_function(
+            "operator does not exist: the operand types do not match the - operator",
+        )
+    };
+    let subscript_is_int4 = is_int4_expr(rhs, env);
+    let saved_typed_arith = env.typed_arith;
+    if subscript_is_int4 {
+        env.typed_arith = true;
+    }
+    let bound = bind_expr_in(rhs, env, node_budget);
+    env.typed_arith = saved_typed_arith;
+    let (r, r_ty) = bound?;
+    let (op, rhs_bound) = match r_ty {
+        ExprType::Text => (JsonModifyOp::DeleteKey, JsonModifyRhs::Key(Box::new(r))),
+        ExprType::Scalar if subscript_is_int4 => {
+            (JsonModifyOp::DeleteIndex, JsonModifyRhs::Index(Box::new(r)))
+        }
+        _ => return Err(operator_missing()),
+    };
+    Ok((
+        BoundExpr::JsonModify {
+            op,
+            lhs: Box::new(l),
+            rhs: rhs_bound,
+        },
+        ExprType::Json,
+    ))
+}
 /// jsonb 述語（`@>` `<@` `?` `?|` `?&`。Issue #1598・TABLE-25）の jsonb オペランドを束縛する。
 /// `json` 列は `42883`（PostgreSQL に json 用の演算子は無い。パス演算子の `0A000` とは
 /// 異なる）、それ以外は通常の式として束縛する（jsonb 以外の型は呼び出し元が `42883` にする）。
@@ -4338,6 +4724,108 @@ fn eval_json_predicate<'a>(
     result.map(ExprValue::Bool).map_err(json_predicate_error)
 }
 
+/// [`crate::json::JsonModifyError`] を SQL 表層のエラーへ写す（評価時。固定の英語文言のみで、
+/// 行の値・リテラル本文・他テナントの情報は含めない）。
+fn json_modify_error(e: crate::json::JsonModifyError) -> SqlSurfaceError {
+    use crate::json::JsonModifyError as E;
+    match e {
+        E::TooLong => {
+            SqlSurfaceError::payload_too_large("jsonb modification result exceeds the allowed size")
+        }
+        E::InvalidStored => SqlSurfaceError::Internal {
+            detail: "stored jsonb value could not be parsed".to_string(),
+        },
+        E::DeleteFromScalar => SqlSurfaceError::InvalidParameterValue {
+            detail: "cannot delete from scalar",
+        },
+        E::DeleteFromObjectByIndex => SqlSurfaceError::InvalidParameterValue {
+            detail: "cannot delete from object using integer index",
+        },
+        E::DeletePathInScalar => SqlSurfaceError::InvalidParameterValue {
+            detail: "cannot delete path in scalar",
+        },
+        E::PathElementNotInteger => SqlSurfaceError::InvalidParameterValue {
+            detail: "path element is not an integer",
+        },
+    }
+}
+
+/// 連結・削除演算子の評価（Issue #2181・TABLE-25）。左辺・右辺の式のいずれかが NULL なら
+/// 結果は NULL（strict）。添字は `eval_json_access` と同じ検査（小数部なし・`i32` 範囲内）を行う。
+fn eval_json_modify<'a>(
+    op: JsonModifyOp,
+    lhs: &BoundExpr,
+    rhs: &JsonModifyRhs,
+    id: u64,
+    embedding: &'a [f32],
+    row_scalars: &'a [Option<ScalarRef<'a>>],
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    let stored = match eval_with_scalars(lhs, id, embedding, row_scalars)? {
+        ExprValue::Json(j) => j,
+        ExprValue::Null => return Ok(ExprValue::Null),
+        _ => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "JSON modify operator left operand is not a jsonb value".to_string(),
+            })
+        }
+    };
+    let result = match (op, rhs) {
+        (JsonModifyOp::Concat, JsonModifyRhs::Jsonb(e)) => {
+            match eval_with_scalars(e, id, embedding, row_scalars)? {
+                ExprValue::Json(other) => crate::json::jsonb_concat(&stored, &other),
+                ExprValue::Null => return Ok(ExprValue::Null),
+                _ => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "JSON modify operator right operand is not a jsonb value"
+                            .to_string(),
+                    })
+                }
+            }
+        }
+        (JsonModifyOp::DeleteKey, JsonModifyRhs::Key(e)) => {
+            match eval_with_scalars(e, id, embedding, row_scalars)? {
+                ExprValue::Text(k) => crate::json::jsonb_delete_keys(&stored, &[k.as_ref()]),
+                ExprValue::Null => return Ok(ExprValue::Null),
+                _ => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "JSON modify operator key is not a text value".to_string(),
+                    })
+                }
+            }
+        }
+        (JsonModifyOp::DeleteIndex, JsonModifyRhs::Index(e)) => {
+            match eval_with_scalars(e, id, embedding, row_scalars)? {
+                ExprValue::Scalar(v) => {
+                    if v.fract() != 0.0 || v < f64::from(i32::MIN) || v > f64::from(i32::MAX) {
+                        return Err(SqlSurfaceError::numeric_out_of_range(
+                            "JSON array subscript is out of range for integer",
+                        ));
+                    }
+                    crate::json::jsonb_delete_index(&stored, v as i32)
+                }
+                ExprValue::Null => return Ok(ExprValue::Null),
+                _ => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "JSON modify operator subscript is not a numeric value".to_string(),
+                    })
+                }
+            }
+        }
+        (JsonModifyOp::DeletePath, JsonModifyRhs::Path(path)) => {
+            let refs: Vec<&str> = path.iter().map(String::as_str).collect();
+            crate::json::jsonb_delete_path(&stored, &refs)
+        }
+        _ => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "JSON modify operator and operand kind do not match".to_string(),
+            })
+        }
+    };
+    result
+        .map(|text| ExprValue::Json(Cow::Owned(text)))
+        .map_err(json_modify_error)
+}
+
 /// jsonb 構築・変換で起きた [`crate::json::JsonColumnError`] を SQL 表層のエラーへ写す
 /// （上限超過は `54000`、入力 jsonb のパース失敗は格納契約違反として固定文言の `Internal`）。
 fn json_build_error(e: crate::json::JsonColumnError) -> SqlSurfaceError {
@@ -4676,6 +5164,9 @@ pub(crate) fn eval_with_scalars<'a>(
         BoundExpr::JsonbLiteral(text) => Ok(ExprValue::Json(Cow::Owned(text.clone()))),
         BoundExpr::JsonAccess { lhs, rhs, as_text } => {
             eval_json_access(lhs, rhs, *as_text, id, embedding, row_scalars)
+        }
+        BoundExpr::JsonModify { op, lhs, rhs } => {
+            eval_json_modify(*op, lhs, rhs, id, embedding, row_scalars)
         }
         BoundExpr::JsonPredicate { op, lhs, rhs } => {
             eval_json_predicate(*op, lhs, rhs, id, embedding, row_scalars)

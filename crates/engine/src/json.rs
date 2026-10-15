@@ -1443,6 +1443,181 @@ pub(crate) fn jsonb_exists_all(
     Ok(keys.iter().flatten().all(|k| set.contains(k.as_str())))
 }
 
+// ---- jsonb の連結・削除演算子（Issue #2181・TABLE-25 ポインタ）----
+
+/// jsonb の `||`・`-`・`#-` の評価失敗（`sql::udf_call::json_modify_error` が SQL 表層の
+/// エラーへ写す。メッセージ・位置番号以外に行の値・リテラル本文は運ばない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JsonModifyError {
+    /// 結果が長さ・深さ・要素数の上限（[`MAX_JSON_FIELD_LEN`] ほか）を超える（`54000`）。
+    TooLong,
+    /// 格納値が解析できない（格納契約違反。`Internal`）。
+    InvalidStored,
+    /// スカラーからの削除（`22023`）。
+    DeleteFromScalar,
+    /// オブジェクトへの整数添字による削除（`22023`）。
+    DeleteFromObjectByIndex,
+    /// スカラーに対する `#-`（`22023`）。
+    DeletePathInScalar,
+    /// `#-` のパス要素が配列の段で整数として解釈できない（`22023`）。
+    PathElementNotInteger,
+}
+
+fn parse_stored_operand(s: &str) -> Result<JsonValue, JsonModifyError> {
+    parse_jsonb_operand(s).map_err(|e| match e {
+        JsonColumnError::TooLong => JsonModifyError::TooLong,
+        JsonColumnError::Invalid => JsonModifyError::InvalidStored,
+    })
+}
+
+/// 結果を正規化テキストへ確定する。`recheck` が真なら出力を再解析して深さ・要素数の
+/// 上限を解析器と一致させる（連結だけが値を大きくしうる。削除は縮むだけなので不要）。
+fn finish_jsonb_result(v: &JsonValue, recheck: bool) -> Result<String, JsonModifyError> {
+    let mut out = String::new();
+    write_canonical(v, &mut out);
+    if out.len() > MAX_JSON_FIELD_LEN {
+        return Err(JsonModifyError::TooLong);
+    }
+    if recheck && parse_json(&out).is_err() {
+        return Err(JsonModifyError::TooLong);
+    }
+    Ok(out)
+}
+
+fn into_concat_items(v: JsonValue) -> Vec<JsonValue> {
+    match v {
+        JsonValue::Array(items) => items,
+        other => vec![other],
+    }
+}
+
+/// `lhs || rhs`（PostgreSQL の `jsonb_concat`）。オブジェクト同士は浅いマージ（重複キーは
+/// 右辺）、それ以外は配列でない側を 1 要素配列とみなして連結する。呼び出し元は
+/// `sql::udf_call::eval_json_modify`。
+pub(crate) fn jsonb_concat(lhs: &str, rhs: &str) -> Result<String, JsonModifyError> {
+    let l = parse_stored_operand(lhs)?;
+    let r = parse_stored_operand(rhs)?;
+    let merged = match (l, r) {
+        (JsonValue::Object(mut a), JsonValue::Object(b)) => {
+            a.extend(b);
+            JsonValue::Object(a)
+        }
+        (l, r) => {
+            let mut items = into_concat_items(l);
+            let extra = into_concat_items(r);
+            items
+                .try_reserve(extra.len())
+                .map_err(|_| JsonModifyError::TooLong)?;
+            items.extend(extra);
+            if items.len() > MAX_JSON_CONTAINER_ITEMS {
+                return Err(JsonModifyError::TooLong);
+            }
+            JsonValue::Array(items)
+        }
+    };
+    finish_jsonb_result(&merged, true)
+}
+
+/// `stored - text`／`stored - text[]`（`jsonb_delete`・`jsonb_delete_array`）。
+/// オブジェクトはキー削除、配列は同じ値の文字列要素をすべて削除する。スカラーは `22023`。
+pub(crate) fn jsonb_delete_keys(stored: &str, keys: &[&str]) -> Result<String, JsonModifyError> {
+    let v = parse_stored_operand(stored)?;
+    let out = match v {
+        JsonValue::Object(mut map) => {
+            for k in keys {
+                map.remove(*k);
+            }
+            JsonValue::Object(map)
+        }
+        JsonValue::Array(mut items) => {
+            items.retain(|i| !matches!(i, JsonValue::String(s) if keys.contains(&s.as_str())));
+            JsonValue::Array(items)
+        }
+        _ => return Err(JsonModifyError::DeleteFromScalar),
+    };
+    finish_jsonb_result(&out, false)
+}
+
+/// `stored - integer`（`jsonb_delete_idx`）。負の添字は末尾から数え、範囲外は変化なし。
+pub(crate) fn jsonb_delete_index(stored: &str, idx: i32) -> Result<String, JsonModifyError> {
+    let v = parse_stored_operand(stored)?;
+    let out = match v {
+        JsonValue::Array(mut items) => {
+            if let Some(pos) = access_array_index(items.len(), i64::from(idx)) {
+                items.remove(pos);
+            }
+            JsonValue::Array(items)
+        }
+        JsonValue::Object(_) => return Err(JsonModifyError::DeleteFromObjectByIndex),
+        _ => return Err(JsonModifyError::DeleteFromScalar),
+    };
+    finish_jsonb_result(&out, false)
+}
+
+/// strtoint 相当の整数解釈（前置の空白と符号は可、末尾の余り・`i32` あふれは不可）。
+fn parse_path_index(elem: &str) -> Result<i32, JsonModifyError> {
+    let err = JsonModifyError::PathElementNotInteger;
+    let t = elem.trim_start_matches([' ', '\t', '\n', '\u{0B}', '\u{0C}', '\r']);
+    let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(err);
+    }
+    t.strip_prefix('+')
+        .unwrap_or(t)
+        .parse::<i32>()
+        .map_err(|_| err)
+}
+
+fn delete_path_rec(
+    v: JsonValue,
+    path: &[&str],
+    level: usize,
+) -> Result<JsonValue, JsonModifyError> {
+    let Some(elem) = path.get(level) else {
+        return Ok(v);
+    };
+    let last = level.saturating_add(1) == path.len();
+    match v {
+        JsonValue::Object(mut map) => {
+            if last {
+                map.remove(*elem);
+            } else if let Some(child) = map.remove(*elem) {
+                let new = delete_path_rec(child, path, level.saturating_add(1))?;
+                map.insert((*elem).to_string(), new);
+            }
+            Ok(JsonValue::Object(map))
+        }
+        JsonValue::Array(mut items) => {
+            let idx = parse_path_index(elem)?;
+            if let Some(pos) = access_array_index(items.len(), i64::from(idx)) {
+                if last {
+                    items.remove(pos);
+                } else if let Some(slot) = items.get_mut(pos) {
+                    let child = std::mem::replace(slot, JsonValue::Null);
+                    *slot = delete_path_rec(child, path, level.saturating_add(1))?;
+                }
+            }
+            Ok(JsonValue::Array(items))
+        }
+        scalar => Ok(scalar),
+    }
+}
+
+/// `stored #- path`（`jsonb_delete_path`）。パスが存在しなければ変化なし。ルートがスカラーなら
+/// `22023`。空の容器・空パスはそのまま返す。
+pub(crate) fn jsonb_delete_path(stored: &str, path: &[&str]) -> Result<String, JsonModifyError> {
+    let v = parse_stored_operand(stored)?;
+    let empty = match &v {
+        JsonValue::Object(m) => m.is_empty(),
+        JsonValue::Array(a) => a.is_empty(),
+        _ => return Err(JsonModifyError::DeletePathInScalar),
+    };
+    if empty || path.is_empty() {
+        return finish_jsonb_result(&v, false);
+    }
+    let out = delete_path_rec(v, path, 0)?;
+    finish_jsonb_result(&out, false)
+}
 // ---- jsonb の全順序（Issue #1597・TABLE-25 ポインタ）----
 
 /// 入れ子の値のタグ（順位は PostgreSQL の jsonb btree 順序: Null < String < Number <
@@ -2840,5 +3015,118 @@ mod tests {
             canonical_equality_text_with(r#"{"a":1,"a":2}"#, DuplicateKeys::Reject).unwrap_err(),
             JsonColumnError::Invalid
         );
+    }
+
+    #[test]
+    fn jsonb_concat_postgres_rules() {
+        let c = |a: &str, b: &str| jsonb_concat(a, b).unwrap();
+        assert_eq!(
+            c(r#"{"a":1,"b":2}"#, r#"{"b":3,"c":4}"#),
+            r#"{"a":1,"b":3,"c":4}"#
+        );
+        assert_eq!(
+            c(r#"{"a":{"x":1}}"#, r#"{"a":{"y":2}}"#),
+            r#"{"a":{"y":2}}"#
+        );
+        assert_eq!(c("[1,2]", "[3]"), "[1,2,3]");
+        assert_eq!(c("{}", "[]"), "[{}]");
+        assert_eq!(c("[]", "{}"), "[{}]");
+        assert_eq!(c("1", "2"), "[1,2]");
+        assert_eq!(c("[1]", "2"), "[1,2]");
+        assert_eq!(c("1", "[2]"), "[1,2]");
+        assert_eq!(c(r#"{"a":1}"#, "[2]"), r#"[{"a":1},2]"#);
+        assert_eq!(c("[2]", r#"{"a":1}"#), r#"[2,{"a":1}]"#);
+        assert_eq!(c("null", "null"), "[null,null]");
+        assert_eq!(c("[]", "[]"), "[]");
+    }
+
+    #[test]
+    fn jsonb_concat_enforces_depth_and_item_limits() {
+        let deep = format!(
+            "{}{{}}{}",
+            "{\"a\":".repeat(MAX_JSON_DEPTH - 1),
+            "}".repeat(MAX_JSON_DEPTH - 1)
+        );
+        assert!(parse_json(&deep).is_ok());
+        // 深さ 16 のオブジェクトを配列へ包むと 17 になるため拒否する。
+        assert_eq!(
+            jsonb_concat(&deep, "1").unwrap_err(),
+            JsonModifyError::TooLong
+        );
+        assert_eq!(
+            jsonb_concat("[1]", &deep).unwrap_err(),
+            JsonModifyError::TooLong
+        );
+        assert!(jsonb_concat(&deep, "{}").is_ok());
+        let big = format!("[{}0]", "0,".repeat(MAX_JSON_CONTAINER_ITEMS - 1));
+        assert_eq!(
+            jsonb_concat(&big, "[1]").unwrap_err(),
+            JsonModifyError::TooLong
+        );
+        assert_eq!(
+            jsonb_concat("{", "1").unwrap_err(),
+            JsonModifyError::InvalidStored
+        );
+    }
+
+    #[test]
+    fn jsonb_delete_keys_and_index_postgres_rules() {
+        let k = |s: &str, key: &str| jsonb_delete_keys(s, &[key]).unwrap();
+        assert_eq!(k(r#"{"a":1,"b":2}"#, "a"), r#"{"b":2}"#);
+        assert_eq!(k(r#"{"a":1}"#, "z"), r#"{"a":1}"#);
+        assert_eq!(k(r#"{"a":{"b":1}}"#, "b"), r#"{"a":{"b":1}}"#);
+        assert_eq!(k(r#"["a","b","a",1]"#, "a"), r#"["b",1]"#);
+        assert_eq!(k("[1,2]", "1"), "[1,2]");
+        assert_eq!(k("{}", "a"), "{}");
+        assert_eq!(
+            jsonb_delete_keys("1", &["a"]).unwrap_err(),
+            JsonModifyError::DeleteFromScalar
+        );
+        assert_eq!(
+            jsonb_delete_keys("[\"a\",\"b\"]", &["a", "b"]).unwrap(),
+            "[]"
+        );
+
+        let i = |s: &str, n: i32| jsonb_delete_index(s, n).unwrap();
+        assert_eq!(i("[1,2,3]", 0), "[2,3]");
+        assert_eq!(i("[1,2,3]", -1), "[1,2]");
+        assert_eq!(i("[1,2,3]", -3), "[2,3]");
+        assert_eq!(i("[1,2,3]", -4), "[1,2,3]");
+        assert_eq!(i("[1,2,3]", 3), "[1,2,3]");
+        assert_eq!(i("[]", 0), "[]");
+        assert_eq!(
+            jsonb_delete_index(r#"{"a":1}"#, 0).unwrap_err(),
+            JsonModifyError::DeleteFromObjectByIndex
+        );
+        assert_eq!(
+            jsonb_delete_index("1", 0).unwrap_err(),
+            JsonModifyError::DeleteFromScalar
+        );
+    }
+
+    #[test]
+    fn jsonb_delete_path_postgres_rules() {
+        let d = |s: &str, p: &[&str]| jsonb_delete_path(s, p).unwrap();
+        assert_eq!(d(r#"{"a":{"b":1,"c":2}}"#, &["a", "b"]), r#"{"a":{"c":2}}"#);
+        assert_eq!(d(r#"{"a":[1,2,3]}"#, &["a", "1"]), r#"{"a":[1,3]}"#);
+        assert_eq!(d(r#"{"a":[1,2,3]}"#, &["a", "-1"]), r#"{"a":[1,2]}"#);
+        assert_eq!(d(r#"{"a":[1,2,3]}"#, &["a", "9"]), r#"{"a":[1,2,3]}"#);
+        assert_eq!(d(r#"{"a":[{"x":1}]}"#, &["a", "0", "x"]), r#"{"a":[{}]}"#);
+        assert_eq!(d(r#"{"a":1}"#, &["z", "y"]), r#"{"a":1}"#);
+        assert_eq!(d(r#"{"a":1}"#, &["a", "y"]), r#"{"a":1}"#);
+        assert_eq!(d(r#"{"a":1}"#, &[]), r#"{"a":1}"#);
+        assert_eq!(d("[]", &["a"]), "[]");
+        assert_eq!(d("[1,2]", &[" +1"]), "[1]");
+        assert_eq!(
+            jsonb_delete_path("1", &["a"]).unwrap_err(),
+            JsonModifyError::DeletePathInScalar
+        );
+        assert_eq!(
+            jsonb_delete_path(r#"{"a":[1]}"#, &["a", "x"]).unwrap_err(),
+            JsonModifyError::PathElementNotInteger
+        );
+        for bad in ["1 ", "", "+", "99999999999", "1x"] {
+            assert!(jsonb_delete_path("[1,2]", &[bad]).is_err(), "{bad:?}");
+        }
     }
 }
