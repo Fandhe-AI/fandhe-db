@@ -1663,6 +1663,7 @@ pub(crate) fn bind_check_predicates(
     schema: &TableSchema,
     node_budget: &mut usize,
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
+    let _check_guard = crate::sql::udf_call::CheckBindingGuard::enter();
     let empty_udfs = crate::sql::udf_call::UdfRegistry::default();
     let mut equality_ordinal: usize = 0;
     // CHECK 文脈は書き換えを行わない（`allow_text_range_rewrite == false`）ため 0。

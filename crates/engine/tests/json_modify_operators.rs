@@ -402,24 +402,32 @@ fn check_body_rejects_the_new_operators() {
         (c, CleanupGuard(p))
     };
     let alice = ctx_for("alice");
-    for body in [
+    let run = |sql: &str| {
+        let mut session = SessionState::default();
+        session.allow_ddl();
+        core.execute_sql_in_session(&alice, &mut session, sql)
+    };
+    for (i, body) in [
         "docb || '{}' = docb",
         "docb - 'k' = docb",
+        "docb - 1 = docb",
+        "docb - 'a' - 'b' = docb",
+        "(docb - 'k') -> 'a' = docb",
         "docb #- '{k}' = docb",
-    ] {
-        let err = core
-            .execute_sql(
-                &alice,
-                &format!("CREATE TABLE chk (embedding VECTOR(2), docb JSONB, CHECK ({body}))"),
-            )
-            .map(|_| ())
-            .expect_err("CHECK with a jsonb modify operator must be rejected");
-        assert!(
-            matches!(err.wire_code(), "42601" | "0A000"),
-            "{body}: {}",
-            err.wire_code()
-        );
+    ]
+    .iter()
+    .enumerate()
+    {
+        let err = run(&format!(
+            "CREATE TABLE chk{i} (embedding VECTOR(2), docb JSONB, n INT, CHECK ({body}))"
+        ))
+        .map(|_| ())
+        .expect_err("CHECK with a jsonb modify operator must be rejected");
+        assert_eq!(err.wire_code(), "0A000", "{body}: {err:?}");
     }
+    // 数値型の '-' は従来どおり CHECK で使える（対照）。
+    run("CREATE TABLE chk_ok (embedding VECTOR(2), docb JSONB, n INT, CHECK (n - 1 >= 0))")
+        .expect("numeric minus in CHECK is still accepted");
 }
 
 #[test]

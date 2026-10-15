@@ -79,6 +79,8 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::InvalidParameterValue
         // Issue #1546: `$n` の型を決められない（`42P18`）も入力起因の拒否として 400。
         | ErrorClass::IndeterminateDatatype
+        // Issue #1599: `jsonb_build_object` の NULL キー（`22004`）も入力起因の拒否として 400。
+        | ErrorClass::NullValueNotAllowed
         | ErrorClass::MissingOperationId
         | ErrorClass::DatetimeFieldOverflow
         | ErrorClass::InvalidDatetimeFormat
@@ -157,7 +159,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 49] = [
+    const EXPECTED: [(ErrorClass, u16); 50] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -207,6 +209,7 @@ mod tests {
         (ErrorClass::AmbiguousColumn, 400),
         (ErrorClass::InvalidParameterValue, 400),
         (ErrorClass::IndeterminateDatatype, 400),
+        (ErrorClass::NullValueNotAllowed, 400),
     ];
 
     #[test]

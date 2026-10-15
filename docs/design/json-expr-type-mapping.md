@@ -104,6 +104,38 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   `0A000`）、`UPDATE ... SET` への jsonb 式の代入、text／json の `||`、ORDER BY の式キー、
   `$n` の型推論、NoSQL の filter。
 
+## Issue #1599 での変更（スカラー関数）
+
+- `jsonb_typeof`・`jsonb_array_length`・`jsonb_extract_path`・`jsonb_extract_path_text`・
+  `jsonb_build_object`・`jsonb_build_array`・`to_jsonb` を実装した。引数が多相・可変長・
+  jsonb 値のため `BuiltinFn` は拡張せず、専用の `BoundExpr::JsonFn`（`JsonFnKind`）で表す。
+  式プログラムでは `JsonSubtree` として再帰評価に委ねる（評価の実装は 1 つ）。
+- 結果型: `jsonb_typeof`・`jsonb_extract_path_text` は text（OID 25）、`jsonb_array_length` は
+  int4（OID 23）、それ以外は jsonb（OID 3802）。
+- NULL の扱い: `typeof`・`array_length`・`extract_path(_text)`・`to_jsonb` は strict
+  （`extract_path` はパス要素の NULL も NULL）。`build_*` は値の NULL を JSON の `null` にし、
+  `jsonb_build_object` のキーが NULL なら `22004`（新設の `ErrorClass::NullValueNotAllowed`。
+  HTTP は 400）。
+- エラー: `jsonb_array_length` をスカラー・オブジェクトに適用すると `22023`。
+  `jsonb_build_object` の奇数個の引数と jsonb のキーも `22023`（個数の検査は実行時なので、
+  行のない表では成功する）。型の合わない引数・`json` 列・パス要素なしは `42883`、
+  `to_jsonb` の型なしリテラル・裸の `NULL` は `42804`、不正な jsonb リテラルは `22P02`。
+  結果の入れ子が 16 段、総長が `MAX_JSON_FIELD_LEN`、文字列 1 個が上限を超えると `54000`
+  （出力は 1 要素ずつ検査する）。
+- 型なし文字列リテラルは jsonb 位置では jsonb として、「any」位置では text として解釈する。
+  数値・bool のキーは文字列化し、重複キーは最後の値が勝つ。DATE は `YYYY-MM-DD`、
+  TIMESTAMP は `T` 区切りの ISO 8601（小数秒の末尾の 0 は除く）に変換する。
+- 集合返却関数（`jsonb_object_keys`・`jsonb_array_elements(_text)`・`jsonb_each(_text)`）は
+  SRF の基盤（#2220）ができるまで実装しない。名前だけを予約し、束縛時に `0A000` で拒否する
+  （従来の `42883` から変わる。同名 UDF の定義は `42723`）。
+- 未対応のまま（fail-closed）: `UPDATE ... SET jsonb列 = <jsonb 関数>`・`INSERT ... VALUES` の
+  jsonb 関数・CHECK 本体（`0A000`）、GROUP BY・DISTINCT の jsonb 結果、`$n` の jsonb 型推論、
+  JOIN 経路、`VARIADIC ARRAY[...]` 形式の呼び出し。
+- 既知の差分: 引数の個数は `MAX_CALL_ARGS`（32。超過は `54000`）なので `jsonb_build_object` は
+  16 組まで（PostgreSQL は 100 個）。数値は内部が f64 のため `to_jsonb(1.0)` は `1`（末尾の 0 が
+  残らない）。指数表記なしで 64 バイトを超える極端な値は指数表記で出力する。`to_jsonb(vector)` は
+  `0A000`（PostgreSQL＋pgvector は文字列化する）。
+
 ## 設計判断の所在
 
 型の形・値表現・字句と優先順位・演算子と関数の型解決・集合返却関数・jsonpath・
@@ -121,7 +153,8 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 | パス演算子の構文 | #1596 |
 | 包含・存在演算子（実装済み） | #1598 |
 | 連結・削除演算子（実装済み） | #2181 |
-| JSON 関数・集合返却関数 | #1599 |
+| JSON スカラー関数（実装済み） | #1599 |
+| JSON 集合返却関数（SRF 基盤待ち） | #2220 |
 | jsonpath | #2183〜#2187 |
 | 索引 | #2204 |
 
