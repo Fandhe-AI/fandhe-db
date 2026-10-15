@@ -500,7 +500,7 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
             ColumnMeta::Id => int_kind(effective_oid),
             ColumnMeta::Computed { .. } | ColumnMeta::AliasedId { .. } => BinaryParam::Unsupported,
             ColumnMeta::Scalar { ty, .. } => match ty {
-                ColumnType::Text | ColumnType::Varchar => text_like(),
+                ColumnType::Text | ColumnType::Varchar(_) => text_like(),
                 ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => {
                     int_kind(effective_oid)
                 }
@@ -509,7 +509,9 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 ColumnType::Boolean => only(16, BinaryParam::Bool),
                 ColumnType::Bytea => only(17, BinaryParam::Bytea),
                 ColumnType::Uuid => only(2950, BinaryParam::Uuid),
-                ColumnType::Vector(_)
+                // CHAR(n) の param 型（bpchar＝OID 1042）は Issue #1565 で対応する。
+                ColumnType::Bpchar(_)
+                | ColumnType::Vector(_)
                 | ColumnType::Numeric { .. }
                 | ColumnType::Date
                 | ColumnType::Timestamp

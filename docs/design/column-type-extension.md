@@ -755,3 +755,10 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
 ## Issue #896 追記
 
 NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応・`columns[].type` の型名整備は Issue #896（NOSQL-17）で実施済み。詳細は `docs/design/nosql-typed-json-binding.md` 参照。
+
+## Issue #1563 追記: VARCHAR(n)／CHAR(n)
+
+- カタログ（TABLE-31）: `varchar` タグの param は `-`（長さなし。従来のバイト列を維持）または 10 進の n、`bpchar` タグの param は 10 進の n（`-` は不可）。復号は 10 進 ASCII 数字のみ受理し、先頭ゼロ・`+`・空・u32 あふれ・範囲外（`1..=10485760` の外）をすべて拒否する。
+- Issue 本文は「新 variant を作らず text＋param」としていたが、#2305 で `varchar` が独立タグになったため、`text` ではなく `varchar` の param 拡張と `bpchar` 新設で表す。CHAR を varchar の種別フラグにしなかったのは、比較・出力の意味論が TEXT と異なる CHAR が varchar の経路へ黙って流れる fail-open を避けるため。
+- `"char"`（OID 18 の 1 バイト型）とは別物のため、タグ名に `char` を使わない。
+- 詳細な決定と対象外は `docs/design/implementation-status.md` の Issue #1563 の項を参照。

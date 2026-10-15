@@ -555,7 +555,14 @@ fn bind_copy_record(
             }
             Some(s) => match &column.ty {
                 ColumnType::Vector(dim) => Value::Vector(parse_vector_literal(s, *dim)?),
-                ColumnType::Text | ColumnType::Varchar => Value::Text(s.clone()),
+                ColumnType::Text | ColumnType::Varchar(_) => Value::Text(s.clone()),
+                // `CHAR(n)` への非 NULL 書き込みは空白詰め・bpchar 比較（Issue #1566）まで
+                // fail-closed に拒否する。
+                ColumnType::Bpchar(_) => {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "writing to character(n) columns is not supported yet".to_string(),
+                    })
+                }
                 ColumnType::Boolean => Value::Bool(parse_copy_boolean(s, name)?),
                 ColumnType::Array(array_ty) => Value::Array(parse_array_literal(s, array_ty)?),
                 ColumnType::Bytea => bind_bytea_literal(s, name)?,

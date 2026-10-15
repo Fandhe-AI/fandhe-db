@@ -2420,10 +2420,15 @@ fn validate_set_assignments(
                     .map_err(TenantWriteError::Catalog)?;
             }
             (
-                crate::catalog::ColumnType::Text | crate::catalog::ColumnType::Varchar,
+                crate::catalog::ColumnType::Text | crate::catalog::ColumnType::Varchar(_),
                 crate::row_codec::Value::Text(t),
             ) => {
                 // SET 値の TEXT 長上限検証（対象行の探索より前に行う）。
+                // `VARCHAR(n)`／`CHAR(n)` の文字数上限も codec と同じ判定で先に拒否し、
+                // 一致行 0 件の `UPDATE 0` 成功（`operation_id` 消費）に分岐させない
+                // （Issue #1563・codex-review P1 指摘）。
+                crate::row_codec::check_varchar_length(column, t)
+                    .map_err(|e| TenantWriteError::Catalog(CatalogError::Invalid(e.to_string())))?;
                 let text_len = u32::try_from(t.len()).map_err(|_| {
                     TenantWriteError::Catalog(CatalogError::Invalid(format!(
                         "text field too long: {} bytes",
@@ -2773,7 +2778,8 @@ fn validate_set_assignments(
             // ここでも再検査する（`schema.columns` の型検証と同じ設計）。
             (
                 crate::catalog::ColumnType::Text
-                | crate::catalog::ColumnType::Varchar
+                | crate::catalog::ColumnType::Varchar(_)
+                | crate::catalog::ColumnType::Bpchar(_)
                 | crate::catalog::ColumnType::SmallInt
                 | crate::catalog::ColumnType::Integer
                 | crate::catalog::ColumnType::BigInt
@@ -2811,7 +2817,8 @@ fn validate_set_assignments(
             }
             (crate::catalog::ColumnType::Vector(_), _)
             | (crate::catalog::ColumnType::Text, _)
-            | (crate::catalog::ColumnType::Varchar, _)
+            | (crate::catalog::ColumnType::Varchar(_), _)
+            | (crate::catalog::ColumnType::Bpchar(_), _)
             | (crate::catalog::ColumnType::SmallInt, _)
             | (crate::catalog::ColumnType::Integer, _)
             | (crate::catalog::ColumnType::BigInt, _)

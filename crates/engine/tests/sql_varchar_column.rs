@@ -1,10 +1,10 @@
-//! 長さなし `VARCHAR`／`CHARACTER VARYING` 列（`ColumnType::Varchar`。TABLE-31・Issue #2305）の
+//! 長さなし `VARCHAR`／`CHARACTER VARYING` 列（`ColumnType::Varchar(None)`。TABLE-31・Issue #2305）の
 //! 結合テスト。ポインタ: TABLE-29・TABLE-30・TABLE-31。
 //!
 //! production 経路（`EngineCore::execute_sql_in_session`）で、(1) 型がカタログ上 TEXT と区別されて
 //! 永続化されること、(2) 値・比較・関数・索引・制約・集合演算・結合が TEXT 列と同じ結果になること、
-//! (3) `ALTER COLUMN TYPE` が TEXT と相互変換できること、(4) `VARCHAR(n)`／`VARCHAR[]` が
-//! `0A000` のままであること、を固定する。wire 公告（OID 1043）は wire-server 側のテストが担う。
+//! (3) `ALTER COLUMN TYPE` が TEXT と相互変換できること、(4) `VARCHAR[]` が
+//! `0A000` のままであること（長さ付き `VARCHAR(n)` は Issue #1563 で受理。`sql_char_length_types.rs`）、を固定する。wire 公告（OID 1043）は wire-server 側のテストが担う。
 
 use engine::catalog::ColumnType;
 use engine::core::EngineCore;
@@ -108,24 +108,22 @@ fn unbounded_varchar_is_persisted_as_a_distinct_type() {
     );
     ok(&core, "ALTER TABLE t ADD COLUMN d VARCHAR");
     drop(core);
-    assert_eq!(column_type(&path, "t", "a"), ColumnType::Varchar);
-    assert_eq!(column_type(&path, "t", "b"), ColumnType::Varchar);
+    assert_eq!(column_type(&path, "t", "a"), ColumnType::Varchar(None));
+    assert_eq!(column_type(&path, "t", "b"), ColumnType::Varchar(None));
     assert_eq!(column_type(&path, "t", "c"), ColumnType::Text);
-    assert_eq!(column_type(&path, "t", "d"), ColumnType::Varchar);
+    assert_eq!(column_type(&path, "t", "d"), ColumnType::Varchar(None));
 }
 
 #[test]
-fn length_modified_and_array_forms_stay_unsupported() {
+fn array_forms_stay_unsupported() {
     let (_p, _g, core) = open("vc-reject");
     ok(&core, "CREATE TABLE t (a INT)");
     for sql in [
-        "CREATE TABLE u (a VARCHAR(10))",
-        "CREATE TABLE u (a CHARACTER VARYING(10))",
+        "CREATE TABLE u (a VARCHAR(10)[])",
         "CREATE TABLE u (a VARCHAR[])",
         "CREATE TABLE u (a CHARACTER VARYING[2])",
-        "ALTER TABLE t ADD COLUMN b VARCHAR(10)",
         "ALTER TABLE t ADD COLUMN b VARCHAR[]",
-        "ALTER TABLE t ALTER COLUMN a TYPE VARCHAR(10)",
+        "ALTER TABLE t ALTER COLUMN a TYPE VARCHAR[]",
     ] {
         assert_eq!(code(&core, sql), "0A000", "{sql}");
     }
@@ -339,7 +337,7 @@ fn alter_column_type_converts_between_text_and_varchar() {
     );
     drop(core);
     assert_eq!(column_type(&path, "t", "k"), ColumnType::Text);
-    assert_eq!(column_type(&path, "t", "u"), ColumnType::Varchar);
+    assert_eq!(column_type(&path, "t", "u"), ColumnType::Varchar(None));
     assert_eq!(column_type(&path, "t", "w"), ColumnType::Text);
 }
 
