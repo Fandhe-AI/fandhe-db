@@ -119,8 +119,20 @@ TIMESTAMPTZ／TimeZone（TABLE-32・TABLE-33）が未実装の間は `ExprType::
 ### D9. DEFAULT now()
 
 `ColumnDefault` に時刻値関数の新 variant と新カタログタグを追加する（未知タグは既存どおり fail-closed）。
-適用点は `fill_omitted_columns` のみとし、D2 の種別 `2` の材料をハッシュ側へ渡す。定数 DEFAULT は従来どおり
-値でハッシュする（バイト不変）。
+定数 DEFAULT は従来どおり値でハッシュする（バイト不変）。
+
+`bind_column_default` の呼び出し経路は実コードで次の 5 つあり、時刻 DEFAULT の扱いを経路ごとに固定する。
+
+| 経路 | 場所 | 方針 |
+| ---- | ---- | ---- |
+| INSERT／バッチ INSERT／UPSERT の省略列補完 | `parser.rs` の `fill_omitted_columns`（`bind_insert` から） | 適用点。D7 の評価コンテキストを引数で受け取り、評価済みの値を D2 の種別 `2` の材料としてハッシュ側へ渡す |
+| COPY の省略列補完 | `copy.rs` から同じ `fill_omitted_columns` | 上と同じ。台帳は COPY の `operation_id` に記録する |
+| 文書取り込み（ファイル INSERT）の省略列補完 | `parser.rs` の `bind_file_insert`（`fill_omitted_columns` を通らず専用ループで `bind_column_default` を直接呼ぶ） | 初期実装は時刻 DEFAULT を評価せず `0A000` で拒否（fail-closed）。評価コンテキストを渡し台帳へ記録する対応は後続 Issue で、`fill_omitted_columns` と同じ評価関数へ寄せて行う |
+| FK の `ON DELETE／UPDATE SET DEFAULT` | `constraint.rs` の `apply_referential_action` | 参照アクションは親の文に連鎖した子行の書き換えで、台帳に記録する主体の文が無い。初期実装は時刻 DEFAULT 列が SET DEFAULT の対象になる FK の宣言・実行を `0A000` で拒否（fail-closed）。値を黙って NULL や定数へ差し替えない |
+| DDL 時の DEFAULT 検証 | `ddl.rs`（`CREATE TABLE`・`ALTER COLUMN SET DEFAULT`） | 評価せず型適合だけを検査する。時刻 DEFAULT は列型が時刻型であることを確認する |
+
+拒否は新しい `bind_column_default` 呼び出し側ではなく、時刻 DEFAULT variant を受けた時点の共通関数で
+未対応経路のコンテキストが無いことを検出して行い、経路の追加で拒否が抜けないようにする（既定が拒否の fail-closed）。
 
 ### D10. ALTER TABLE ADD COLUMN ... DEFAULT now()（判断項目）
 
