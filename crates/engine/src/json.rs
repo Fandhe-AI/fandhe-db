@@ -1565,7 +1565,224 @@ fn sk_push_number(n: &JsonNumber, out: &mut Vec<u8>, limit: usize) -> Result<(),
         out.extend_from_slice(&body);
     }
     Ok(())
+} // ---- jsonb 関数群（Issue #1599・TABLE-25 ポインタ）----
+  //
+  // `sql::udf_call` の評価器（`BoundExpr::JsonFn`）が呼ぶ値レベルの計算。入力の jsonb は
+  // 格納済みの正規化テキスト、出力は正規化テキスト。SQL の NULL 伝播・型規則は呼び出し側が
+  // 担い、ここは「値 → 値」と上限検査だけを持つ。
+
+/// `jsonb_typeof` の評価。正規化テキストの先頭の非空白バイトで型名を決める（再パース不要）。
+/// 想定外の先頭バイトは格納契約違反として `Invalid`。
+pub(crate) fn jsonb_typeof(stored: &str) -> Result<&'static str, JsonColumnError> {
+    match stored
+        .bytes()
+        .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        Some(b'{') => Ok("object"),
+        Some(b'[') => Ok("array"),
+        Some(b'"') => Ok("string"),
+        Some(b't' | b'f') => Ok("boolean"),
+        Some(b'n') => Ok("null"),
+        Some(b'-' | b'0'..=b'9') => Ok("number"),
+        _ => Err(JsonColumnError::Invalid),
+    }
 }
+
+/// `jsonb_array_length` の失敗。`Scalar`／`NotArray` はどちらも `22023`（文言のみ異なる）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JsonArrayLengthError {
+    /// スカラー値に適用した。
+    Scalar,
+    /// オブジェクトに適用した。
+    NotArray,
+    /// 格納値のパース失敗（格納契約違反）。
+    Stored(JsonColumnError),
+}
+
+/// `jsonb_array_length` の評価（配列の要素数。入れ子の要素は数えない）。
+pub(crate) fn jsonb_array_length(stored: &str) -> Result<usize, JsonArrayLengthError> {
+    let v =
+        parse_json(stored).map_err(|_| JsonArrayLengthError::Stored(JsonColumnError::Invalid))?;
+    match v {
+        JsonValue::Array(items) => Ok(items.len()),
+        JsonValue::Object(_) => Err(JsonArrayLengthError::NotArray),
+        _ => Err(JsonArrayLengthError::Scalar),
+    }
+}
+
+/// `f64` から JSON 値への変換。整数値で |v| <= 2^53 は 10 進整数（`-0` は `0`）、
+/// それ以外は指数表記を使わない最短表現。非有限値は PostgreSQL と同じく JSON 文字列
+/// （`"NaN"`・`"Infinity"`・`"-Infinity"`）にする。
+pub(crate) fn json_value_from_f64(v: f64) -> JsonValue {
+    if v.is_nan() {
+        return JsonValue::String("NaN".to_string());
+    }
+    if v.is_infinite() {
+        return JsonValue::String(if v > 0.0 { "Infinity" } else { "-Infinity" }.to_string());
+    }
+    JsonValue::Number(json_number_from_f64(v))
+}
+
+fn json_number_from_f64(v: f64) -> JsonNumber {
+    const EXACT_MAX: f64 = 9_007_199_254_740_992.0; // 2^53
+    if v.fract() == 0.0 && v.abs() <= EXACT_MAX {
+        let i = v as i64;
+        return if i >= 0 {
+            JsonNumber::PosInt(i as u64)
+        } else {
+            JsonNumber::NegInt(i)
+        };
+    }
+    // パーサーは数値リテラルを 64 バイトまでしか受理しない。指数表記なしの表現がそれを
+    // 超える極端な値（1e300 等）は、再パースできる最短の指数表記へ切り替える。
+    let mut text = format!("{v}");
+    if text.len() > 64 {
+        text = format!("{v:e}");
+    }
+    if let Ok(u) = text.parse::<u64>() {
+        return JsonNumber::PosInt(u);
+    }
+    if let Ok(i) = text.parse::<i64>() {
+        return JsonNumber::NegInt(i);
+    }
+    JsonNumber::Float {
+        value: v,
+        text: text.into_boxed_str(),
+    }
+}
+
+/// `jsonb_build_object` のキーとして使う数値の文字列化。
+pub(crate) fn json_number_key_text(v: f64) -> String {
+    match json_value_from_f64(v) {
+        JsonValue::String(s) => s,
+        JsonValue::Number(n) => {
+            let mut out = String::new();
+            write_canonical_number(&n, &mut out);
+            out
+        }
+        _ => String::new(),
+    }
+}
+
+/// `DATE`（日数）の JSON 表現（ISO 8601 の日付文字列）。
+pub(crate) fn json_value_from_date(days: i32) -> JsonValue {
+    JsonValue::String(crate::datetime::format_date(days))
+}
+
+/// `TIMESTAMP`（マイクロ秒）の JSON 表現（ISO 8601 の `T` 区切り。小数秒の末尾の 0 は除く）。
+pub(crate) fn json_value_from_timestamp(micros: i64) -> JsonValue {
+    JsonValue::String(json_timestamp_text(micros))
+}
+
+/// `TIMESTAMP` の ISO 8601 文字列（`jsonb_build_object` のキーにも使う）。
+pub(crate) fn json_timestamp_text(micros: i64) -> String {
+    crate::datetime::format_timestamp(micros).replacen(' ', "T", 1)
+}
+
+/// `v` のコンテナ入れ子の深さ（スカラーは 0、空の配列・オブジェクトは 1）。
+/// 明示スタックで数える（再帰を持ち込まない）。
+fn json_container_depth(v: &JsonValue) -> usize {
+    let mut max = 0usize;
+    let mut stack: Vec<(&JsonValue, usize)> = vec![(v, 0)];
+    while let Some((cur, depth)) = stack.pop() {
+        match cur {
+            JsonValue::Array(items) => {
+                let d = depth.saturating_add(1);
+                max = max.max(d);
+                stack.extend(items.iter().map(|i| (i, d)));
+            }
+            JsonValue::Object(map) => {
+                let d = depth.saturating_add(1);
+                max = max.max(d);
+                stack.extend(map.values().map(|i| (i, d)));
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
+/// 構築した値を上限検査つきで正規化テキストへ書き出す。入れ子が [`MAX_JSON_DEPTH`]、
+/// 文字列 1 個が [`MAX_JSON_STRING_CHARS`]、総バイト長が [`MAX_JSON_FIELD_LEN`] を超える
+/// ものは `TooLong`（`54000`）。出力は 1 要素書くたびに長さを検査し、確保量の上振れを
+/// 1 要素ぶんに抑える（再パースできない jsonb を作らないための契約）。
+pub(crate) fn serialize_jsonb_bounded(v: &JsonValue) -> Result<String, JsonColumnError> {
+    if json_container_depth(v) > MAX_JSON_DEPTH {
+        return Err(JsonColumnError::TooLong);
+    }
+    let mut out = String::new();
+    write_bounded(v, &mut out)?;
+    Ok(out)
+}
+
+fn write_bounded(v: &JsonValue, out: &mut String) -> Result<(), JsonColumnError> {
+    fn check(out: &str) -> Result<(), JsonColumnError> {
+        if out.len() > MAX_JSON_FIELD_LEN {
+            Err(JsonColumnError::TooLong)
+        } else {
+            Ok(())
+        }
+    }
+    fn check_str(s: &str) -> Result<(), JsonColumnError> {
+        // 文字数は UTF-8 のバイト長以下なので、バイト長が上限以下なら走査は不要。
+        if s.len() > MAX_JSON_STRING_CHARS
+            && s.chars().take(MAX_JSON_STRING_CHARS + 1).count() > MAX_JSON_STRING_CHARS
+        {
+            Err(JsonColumnError::TooLong)
+        } else {
+            Ok(())
+        }
+    }
+    match v {
+        JsonValue::String(s) => {
+            check_str(s)?;
+            write_canonical_string(s, out);
+            check(out)
+        }
+        JsonValue::Array(items) => {
+            if items.len() > MAX_JSON_CONTAINER_ITEMS {
+                return Err(JsonColumnError::TooLong);
+            }
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_bounded(item, out)?;
+            }
+            out.push(']');
+            check(out)
+        }
+        JsonValue::Object(map) => {
+            if map.len() > MAX_JSON_CONTAINER_ITEMS {
+                return Err(JsonColumnError::TooLong);
+            }
+            out.push('{');
+            for (i, (k, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                check_str(k)?;
+                write_canonical_string(k, out);
+                out.push(':');
+                write_bounded(item, out)?;
+            }
+            out.push('}');
+            check(out)
+        }
+        scalar => {
+            write_canonical(scalar, out);
+            check(out)
+        }
+    }
+}
+
+/// 格納済みの jsonb テキストを構築用の [`JsonValue`] へ戻す（`jsonb_build_*`・`to_jsonb`
+/// の jsonb 引数）。長さは [`MAX_JSON_FIELD_LEN`] で先に判定する。
+pub(crate) fn parse_jsonb_for_build(s: &str) -> Result<JsonValue, JsonColumnError> {
+    parse_jsonb_operand(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1623,6 +1840,96 @@ mod tests {
     #[test]
     fn jsonb_contains_rejects_invalid_stored_value() {
         assert_eq!(jsonb_contains("{", "{}"), Err(JsonColumnError::Invalid));
+    }
+
+    #[test]
+    fn jsonb_typeof_and_array_length_rules() {
+        assert_eq!(jsonb_typeof("{\"a\":1}").unwrap(), "object");
+        assert_eq!(jsonb_typeof("[]").unwrap(), "array");
+        assert_eq!(jsonb_typeof("\"s\"").unwrap(), "string");
+        assert_eq!(jsonb_typeof("-1.5e3").unwrap(), "number");
+        assert_eq!(jsonb_typeof("false").unwrap(), "boolean");
+        assert_eq!(jsonb_typeof("null").unwrap(), "null");
+        assert_eq!(jsonb_typeof(""), Err(JsonColumnError::Invalid));
+        assert_eq!(jsonb_array_length("[1,[2],{}]"), Ok(3));
+        assert_eq!(jsonb_array_length("[]"), Ok(0));
+        assert_eq!(
+            jsonb_array_length("{}"),
+            Err(JsonArrayLengthError::NotArray)
+        );
+        assert_eq!(jsonb_array_length("1"), Err(JsonArrayLengthError::Scalar));
+        assert_eq!(
+            jsonb_array_length("["),
+            Err(JsonArrayLengthError::Stored(JsonColumnError::Invalid))
+        );
+    }
+
+    #[test]
+    fn f64_to_json_number_rules() {
+        let text = |v: f64| serialize_jsonb_bounded(&json_value_from_f64(v)).unwrap();
+        assert_eq!(text(1.0), "1");
+        assert_eq!(text(-0.0), "0");
+        assert_eq!(text(-3.0), "-3");
+        assert_eq!(text(2.5), "2.5");
+        assert_eq!(text(0.1), "0.1");
+        assert_eq!(text(9_007_199_254_740_992.0), "9007199254740992");
+        assert_eq!(text(1e21), "1000000000000000000000");
+        // 指数表記なしだと 64 バイトを超える値は指数表記で出力する（再パース可能）。
+        assert_eq!(text(1e300), "1e300");
+        assert_eq!(text(-1.5e-300), "-1.5e-300");
+        assert_eq!(text(f64::NAN), "\"NaN\"");
+        assert_eq!(text(f64::INFINITY), "\"Infinity\"");
+        assert_eq!(text(f64::NEG_INFINITY), "\"-Infinity\"");
+        // 出力は必ず再パースできる（正規化テキストの往復）。
+        for v in [1e21, 1e-7, 123_456_789.123_456_79, -1e300] {
+            let t = text(v);
+            assert!(parse_json(&t).is_ok(), "{t}");
+        }
+        assert_eq!(json_number_key_text(2.5), "2.5");
+        assert_eq!(json_number_key_text(7.0), "7");
+    }
+
+    #[test]
+    fn date_and_timestamp_json_text() {
+        assert_eq!(json_timestamp_text(0), "1970-01-01T00:00:00");
+        assert_eq!(json_timestamp_text(1_500_000), "1970-01-01T00:00:01.5");
+        assert_eq!(
+            serialize_jsonb_bounded(&json_value_from_date(0)).unwrap(),
+            "\"1970-01-01\""
+        );
+    }
+
+    #[test]
+    fn serialize_jsonb_bounded_enforces_depth_and_size_limits() {
+        let nest = |n: usize| {
+            let mut v = JsonValue::Null;
+            for _ in 0..n {
+                v = JsonValue::Array(vec![v]);
+            }
+            v
+        };
+        assert!(serialize_jsonb_bounded(&nest(MAX_JSON_DEPTH)).is_ok());
+        assert_eq!(
+            serialize_jsonb_bounded(&nest(MAX_JSON_DEPTH + 1)),
+            Err(JsonColumnError::TooLong)
+        );
+        // 文字列 1 個の上限。
+        let long = JsonValue::String("a".repeat(MAX_JSON_STRING_CHARS + 1));
+        assert_eq!(
+            serialize_jsonb_bounded(&long),
+            Err(JsonColumnError::TooLong)
+        );
+        // 総バイト長の上限（文字列は上限内でも、複数並べて超える）。
+        let chunk = JsonValue::String("a".repeat(MAX_JSON_STRING_CHARS));
+        let many = JsonValue::Array(vec![chunk; MAX_JSON_FIELD_LEN / MAX_JSON_STRING_CHARS + 2]);
+        assert_eq!(
+            serialize_jsonb_bounded(&many),
+            Err(JsonColumnError::TooLong)
+        );
+        // 出力は再パースできる。
+        let ok = JsonValue::Array(vec![JsonValue::String("q\"\n".to_string())]);
+        let t = serialize_jsonb_bounded(&ok).unwrap();
+        assert_eq!(parse_json(&t).unwrap(), ok);
     }
 
     #[test]

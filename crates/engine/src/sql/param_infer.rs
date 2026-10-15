@@ -159,6 +159,8 @@ fn builtin_arg_is_text(name: &str, index: usize) -> bool {
         "lower" | "upper" | "length" | "trim" => index == 0,
         "substr" => index == 0,
         "replace" | "position" | "concat" => true,
+        // jsonb_extract_path(_text) のパス要素（2 番目以降）は text（Issue #1599）。
+        "jsonb_extract_path" | "jsonb_extract_path_text" => index >= 1,
         _ => false,
     }
 }
@@ -170,6 +172,12 @@ fn builtin_return_type(name: &str) -> Ty {
             Ty::Known(PreparedParamType::Text)
         }
         "length" | "position" => Ty::Known(scalar("?column?", ColumnType::Integer)),
+        // jsonb 関数（Issue #1599）。jsonb を返すものは `$n` の型付け対象外（型なし）。
+        "jsonb_typeof" | "jsonb_extract_path_text" => Ty::Known(PreparedParamType::Text),
+        "jsonb_array_length" => Ty::Known(scalar("?column?", ColumnType::Integer)),
+        "jsonb_extract_path" | "jsonb_build_object" | "jsonb_build_array" | "to_jsonb" => {
+            Ty::Untyped
+        }
         // 関数形の現在時刻関数（SQL-37・Issue #1586）は TIMESTAMP を返すため、キーワード形
         // （`Expr::ValueFunction`）と同じく対象外型表現へ写像し `assign` で `0A000` にする。
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {

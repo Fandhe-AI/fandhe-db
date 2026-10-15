@@ -278,6 +278,72 @@ fn wire_jsonb_containment_operators_advertise_bool_oid_and_filter() {
     common::read_ready_for_query(&mut alice);
 }
 
+/// Issue #1599（TABLE-25）: jsonb 関数の結果列は `jsonb_typeof`・`jsonb_extract_path_text` が
+/// text（OID 25）、`jsonb_array_length` が int4（OID 23）、jsonb を返す関数が jsonb（OID 3802）と
+/// して RowDescription に載り、代表的なエラーは固定の SQLSTATE（`22023`・`22004`）で返る。
+#[test]
+fn wire_jsonb_functions_advertise_type_oids_and_report_sqlstates() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = common::spawn_server_with_engine(&users_path, core);
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    common::send_simple_query(
+        &mut alice,
+        r#"INSERT INTO docs (id, embedding, docb) VALUES (1, '[0.1,0.2,0.3]', '{"a":[1,2,3]}') USING OPERATION_ID 'op-fn-1'"#,
+    );
+    assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT jsonb_typeof(docb) AS t, jsonb_array_length(docb -> 'a') AS n, \
+         jsonb_extract_path_text(docb, 'a', '0') AS x, jsonb_extract_path(docb, 'a') AS j, \
+         jsonb_build_object('k', id) AS o, jsonb_build_array(1, NULL) AS arr, to_jsonb(id) AS tj \
+         FROM docs WHERE id = 1 LIMIT 1",
+    );
+    let columns = common::read_row_description_with_oids(&mut alice);
+    assert_eq!(
+        columns,
+        vec![
+            ("t".to_string(), 25),
+            ("n".to_string(), 23),
+            ("x".to_string(), 25),
+            ("j".to_string(), 3802),
+            ("o".to_string(), 3802),
+            ("arr".to_string(), 3802),
+            ("tj".to_string(), 3802),
+        ]
+    );
+    assert_eq!(
+        common::read_data_row(&mut alice),
+        vec![
+            Some("object".to_string()),
+            Some("3".to_string()),
+            Some("1".to_string()),
+            Some("[1,2,3]".to_string()),
+            Some(r#"{"k":1}"#.to_string()),
+            Some("[1,null]".to_string()),
+            Some("1".to_string()),
+        ]
+    );
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+
+    // オブジェクトへの array_length は 22023、NULL キーは 22004。
+    common::send_simple_query(
+        &mut alice,
+        "SELECT jsonb_array_length(docb) FROM docs WHERE id = 1 LIMIT 1",
+    );
+    common::expect_error_response_with_sqlstate(&mut alice, "22023");
+    common::read_ready_for_query(&mut alice);
+    common::send_simple_query(
+        &mut alice,
+        "SELECT jsonb_build_object(NULL, 1) FROM docs WHERE id = 1 LIMIT 1",
+    );
+    common::expect_error_response_with_sqlstate(&mut alice, "22004");
+    common::read_ready_for_query(&mut alice);
+}
 /// Issue #1598: 拡張クエリプロトコルでも `?`／`?|`／`?&`／`<@`／`@>` を含む SQL が Parse できる
 /// （`?` を `$n` と取り違えない）。結果は simple query と同じ `t`。
 #[test]

@@ -1115,6 +1115,7 @@ Date: <IMF-fixdate>
 | `22000` | `INVALID_INPUT` | 400 | Bad Request | `op` 別スキーマ検証での値の型・形状不正 |
 | `22001` | `STRING_DATA_RIGHT_TRUNCATION` | 400 | Bad Request | `VARCHAR(n)` 列への書き込みで文字数が n を超過（Issue #1564。超過部分が半角空白のみなら切り詰めて受理） |
 | `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー、`CHECK` 制約式の数値あふれ、`BIGINT` が `f64` で正確に表せない値（絶対値が 2^53 超）の拒否 |
+| `22004` | `NULL_VALUE_NOT_ALLOWED` | 400 | Bad Request | SQL 表層の `jsonb_build_object` のキーが NULL。NoSQL の `op` 語彙からは到達しない。Issue #1599 |
 | `22007` | `INVALID_DATETIME_FORMAT` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの書式違反（`insert`／`update`／`filter`。Issue #1187） |
 | `22008` | `DATETIME_FIELD_OVERFLOW` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正（`update` の `set` 経由） |
 | `22012` | `DIVISION_BY_ZERO` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約（TABLE-16・TASK-204）の式評価での 0 除算 |
