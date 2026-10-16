@@ -66,6 +66,7 @@ fn schema(name: &str) -> TableSchema {
             ColumnDef::new("sm", ColumnType::SmallInt, true),
             ColumnDef::new("tm", ColumnType::Time, true),
             ColumnDef::new("tz", ColumnType::TimestampTz, true),
+            ColumnDef::new("iv", ColumnType::Interval, true),
             ColumnDef::new("day", ColumnType::Date, true),
             ColumnDef::new("at", ColumnType::Timestamp, true),
             ColumnDef::new("ext", ColumnType::Uuid, true),
@@ -1377,6 +1378,173 @@ fn timestamptz_binding_matches_sql() {
         ),
     );
     assert!(resp.status >= 400, "{resp:?}");
+}
+
+/// Issue #1583（TABLE-34・NOSQL-17）: INTERVAL 列の insert／update／scan が SQL 表層と一致し、
+/// 型不一致は 42601、書式・範囲違反は SQL 表層と同じ wire_code（22007／22015／22008／0A000）で
+/// 副作用が無い。filter の各レーンは SQL の `WHERE`（正規化キー比較）と一致する。
+#[test]
+fn interval_binding_matches_sql() {
+    let (core, _g) = new_core();
+    let addr = spawn(Arc::clone(&core));
+    for (i, v) in ["1 mon", "30 days", "2 days -01:00:00", "1 year"]
+        .into_iter()
+        .enumerate()
+    {
+        let id = 600 + i as u64;
+        let resp = alice(
+            addr,
+            &format!(
+                r#"{{"op":"insert","table":"{NOSQL_TABLE}","rows":[{{"id":{id},"embedding":[0.5,0.25],"lang":"ja","iv":"{v}"}}],"operation_id":"iv-nosql-{id}"}}"#
+            ),
+        );
+        assert_eq!(resp.status, 200, "{v}: {resp:?}");
+        sql_exec(
+            &core,
+            "tenant-a",
+            &format!(
+                "INSERT INTO {SQL_TABLE} (id, embedding, lang, iv) VALUES \
+                 ({id}, '[0.5,0.25]', 'ja', '{v}') USING OPERATION_ID 'iv-sql-{id}'"
+            ),
+        );
+    }
+    // update も同じ束縛規則で、SQL の UPDATE と同じ保存値になる。
+    let resp = alice(
+        addr,
+        &format!(
+            r#"{{"op":"update","table":"{NOSQL_TABLE}","set":{{"iv":"3 days"}},"where":{{"id":603}},"operation_id":"iv-upd"}}"#
+        ),
+    );
+    assert_eq!(resp.status, 200, "{resp:?}");
+    sql_exec(
+        &core,
+        "tenant-a",
+        &format!(
+            "UPDATE {SQL_TABLE} SET iv = '3 days' WHERE id = 603 USING OPERATION_ID 'iv-upd-sql'"
+        ),
+    );
+    let scan = |t: &str| {
+        format!(
+            r#"{{"op":"scan","table":"{t}","columns":["id","iv"],"sort":[{{"column":"id","dir":"asc"}}],"limit":100}}"#
+        )
+    };
+    let a = body_utf8(&alice(addr, &scan(NOSQL_TABLE)));
+    assert_eq!(a, body_utf8(&alice(addr, &scan(SQL_TABLE))));
+    assert_eq!(
+        a,
+        sql_oracle_body(
+            &core,
+            "tenant-a",
+            &format!("SELECT id, iv FROM {NOSQL_TABLE} ORDER BY id ASC LIMIT 100")
+        )
+    );
+    assert!(a.contains(r#""type":"interval""#), "{a}");
+    assert!(a.contains("1 mon") && a.contains("3 days"), "{a}");
+
+    // 拒否: 型不一致は 42601、それ以外は SQL 表層と同じ wire_code。副作用なし。
+    let before = count_rows(addr, NOSQL_TABLE);
+    for (i, json) in ["5", "true", "[1]", "{}"].into_iter().enumerate() {
+        let resp = insert_one(addr, &format!(r#""iv":{json}"#), &format!("iv-rej-t{i}"));
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            "42601",
+            "{json}: {resp:?}"
+        );
+    }
+    for (i, (lit, want)) in [
+        ("1 fortnight", "22007"),
+        ("2147483648 days", "22015"),
+        ("infinity", "0A000"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = insert_one(addr, &format!(r#""iv":"{lit}""#), &format!("iv-rej-{i}"));
+        let sql_code = sql_oracle_err(
+            &core,
+            "tenant-a",
+            &format!(
+                "INSERT INTO {SQL_TABLE} (id, embedding, lang, iv) VALUES \
+                 (100, '[0.5,0.25]', 'ja', '{lit}') USING OPERATION_ID 'iv-rej-sql-{i}'"
+            ),
+        );
+        assert_eq!(sql_code, want, "{lit}");
+        assert_eq!(http_common::wire_code_of(&resp), want, "{lit}: {resp:?}");
+        assert!(resp.status >= 400, "{lit}");
+    }
+    assert_eq!(count_rows(addr, NOSQL_TABLE), before);
+
+    // filter の各レーンが SQL の WHERE（正規化キー比較）と一致し、行を実際に選ぶ。
+    // 値は 1 mon／30 days／2 days -01:00:00／3 days（更新後）。
+    let aggs = r#"{"fn":"count","column":"*"}"#;
+    let cases: [(&str, &str, u32); 5] = [
+        (
+            r#"{"column":"iv","op":"eq","value":"30 days"}"#,
+            "iv = '30 days'",
+            2,
+        ),
+        (
+            r#"{"column":"iv","op":"ne","value":"30 days"}"#,
+            "iv <> '30 days'",
+            2,
+        ),
+        (
+            r#"{"column":"iv","op":"lt","value":"3 days"}"#,
+            "iv < '3 days'",
+            1,
+        ),
+        (
+            r#"{"column":"iv","op":"between","value":["1 day","2 mons"]}"#,
+            "iv >= '1 day' AND iv <= '2 mons'",
+            4,
+        ),
+        (
+            r#"{"column":"iv","op":"in","value":["1 mon","3 days"]}"#,
+            "iv = '1 mon' OR iv = '3 days'",
+            3,
+        ),
+    ];
+    for (filter, where_sql, expected) in cases {
+        let body = assert_aggregate_parity(
+            &core,
+            addr,
+            aggs,
+            &format!(r#","filter":[{filter}]"#),
+            &format!("SELECT COUNT(*) FROM {{T}} WHERE {where_sql}"),
+        );
+        assert!(body.contains(&format!("[[{expected}]")), "{filter}: {body}");
+    }
+    // sort: INTERVAL 列の並べ替えは SQL の `ORDER BY`（正規化キー順。`1 mon` と `30 days` は
+    // 同順位でタイブレークは id）と一致する。
+    for (dir, sql_dir) in [("asc", "ASC"), ("desc", "DESC")] {
+        let resp = alice(
+            addr,
+            &format!(
+                r#"{{"op":"scan","table":"{NOSQL_TABLE}","columns":["id","iv"],"sort":[{{"column":"iv","dir":"{dir}"}},{{"column":"id","dir":"asc"}}],"limit":100}}"#
+            ),
+        );
+        assert_eq!(resp.status, 200, "sort {dir}: {resp:?}");
+        assert_eq!(
+            body_utf8(&resp),
+            sql_oracle_body(
+                &core,
+                "tenant-a",
+                &format!(
+                    "SELECT id, iv FROM {NOSQL_TABLE} ORDER BY iv {sql_dir}, id ASC LIMIT 100"
+                )
+            ),
+            "sort {dir}"
+        );
+    }
+    // 述語形 DML の filter も同じ束縛規則（正規化等価の `30 days` で 1 mon／30 days の 2 行）。
+    let resp = alice(
+        addr,
+        &format!(
+            r#"{{"op":"delete","table":"{NOSQL_TABLE}","filter":[{{"column":"iv","op":"eq","value":"30 days"}}],"operation_id":"iv-del"}}"#
+        ),
+    );
+    assert_eq!(resp.status, 200, "{resp:?}");
+    assert!(body_utf8(&resp).contains(r#""deleted":2"#), "{resp:?}");
 }
 
 /// `VARCHAR(n)` 列への NoSQL `insert`／`update` の長さ超過は `22001`（HTTP 400）で副作用なし。

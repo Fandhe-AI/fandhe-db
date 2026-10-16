@@ -44,6 +44,9 @@
 //! - `ColumnMeta::Scalar{ty: TimestampTz}` → `timestamptz`（OID 1184, typlen 8。TABLE-33・
 //!   WIRE-13・WIRE-14・Issue #1577。バイナリは 2000-01-01 00:00:00 UTC 起点マイクロ秒の
 //!   8 バイト BE 整数。テキストは UTC 固定の offset 付き ISO 表記）
+//! - `ColumnMeta::Scalar{ty: Interval}`／集計結果の INTERVAL → `interval`（OID 1186,
+//!   typlen 16。TABLE-34・WIRE-13・WIRE-14・Issue #1583。バイナリは time i64・day i32・
+//!   month i32 の計 16 バイト BE。テキストは IntervalStyle=postgres）
 //! - `ColumnMeta::Scalar{ty: Bytea}` → `bytea`（OID 17, typlen -1。同上）
 //! - `ColumnMeta::Scalar{ty: Uuid}` → `uuid`（OID 2950, typlen 16。同上）
 //! - `ColumnMeta::Scalar{ty: Json}` → `json`（OID 114, typlen -1。同上）
@@ -250,6 +253,21 @@ pub mod binary {
             .checked_sub(PG_EPOCH_UNIX_MICROS)
             .map(i64::to_be_bytes)
             .ok_or(super::EncodeError)
+    }
+
+    /// `interval` のバイナリ表現（time i64〔µs〕・day i32・month i32 の計 16 バイト・
+    /// ビッグエンディアン。PostgreSQL の `interval_send` と同形。TABLE-34・WIRE-14・
+    /// Issue #1583）。engine の `Interval` は `months, days, micros` の順に持つが、wire の
+    /// 並びは逆順（micros → days → months）である点に注意。`binary_param` の復号側と
+    /// 往復テストが共有する。
+    pub fn interval(v: &engine::datetime::Interval) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        let (head, rest) = out.split_at_mut(8);
+        head.copy_from_slice(&v.micros.to_be_bytes());
+        let (days, months) = rest.split_at_mut(4);
+        days.copy_from_slice(&v.days.to_be_bytes());
+        months.copy_from_slice(&v.months.to_be_bytes());
+        out
     }
 
     /// `int4` のバイナリ表現（4 バイト・ビッグエンディアン 2 の補数）。
@@ -521,6 +539,10 @@ wire_type_enum! {
         /// テキスト表現は offset 付き ISO 表記、バイナリは 2000-01-01 00:00:00 UTC 起点
         /// マイクロ秒の 8 バイト BE。
         TimestampTz,
+        /// `ColumnMeta::Scalar{ty: Interval}`（TABLE-34・WIRE-13・WIRE-14・Issue #1583）。
+        /// テキスト表現は IntervalStyle=postgres、バイナリは time i64・day i32・month i32 の
+        /// 16 バイト BE。
+        Interval,
         /// `ColumnMeta::Scalar{ty: Bytea}`（TABLE-13・TASK-197・Issue #886・
         /// WIRE-13・TASK-200・Issue #895）。テキスト表現は `\x` + 小文字 16 進
         /// （`engine::bytea::format_hex_text`。PostgreSQL 既定の `bytea_output=hex`
@@ -559,6 +581,7 @@ impl WireType {
             WireType::Timestamp => 1114,
             WireType::Time => 1083,
             WireType::TimestampTz => 1184,
+            WireType::Interval => 1186,
             WireType::Bytea => 17,
             WireType::Uuid => 2950,
             WireType::Json => 114,
@@ -584,7 +607,7 @@ impl WireType {
             | WireType::Time
             | WireType::TimestampTz => 8,
             WireType::Bool => 1,
-            WireType::Uuid => 16,
+            WireType::Uuid | WireType::Interval => 16,
         }
     }
 
@@ -606,6 +629,7 @@ impl WireType {
             WireType::Timestamp => "timestamp",
             WireType::Time => "time",
             WireType::TimestampTz => "timestamptz",
+            WireType::Interval => "interval",
             WireType::Bytea => "bytea",
             WireType::Uuid => "uuid",
             WireType::Json => "json",
@@ -653,7 +677,9 @@ impl WireType {
             // `time` は 0 時起点 µs の 8 バイト BE（Issue #1571）。
             | WireType::Time
             // `timestamptz` は 2000-01-01 UTC 起点 µs の 8 バイト BE（Issue #1577）。
-            | WireType::TimestampTz => true,
+            | WireType::TimestampTz
+            // `interval` は time i64・day i32・month i32 の 16 バイト BE（Issue #1583）。
+            | WireType::Interval => true,
             // `DATE`／`TIMESTAMP`／`JSON`／`JSONB` は WIRE-14 の非対応型のまま
             // fail-closed で `0A000` に拒否する。
             WireType::Date | WireType::Timestamp | WireType::Json | WireType::Jsonb => false,
@@ -701,6 +727,7 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Uuid
         | ColumnType::Time
         | ColumnType::TimestampTz
+        | ColumnType::Interval
         | ColumnType::Numeric { .. } => scalar_wire_type(ty).supports_binary(),
         // `VECTOR` は公告 OID が `text` でも値の実体がベクトルのため、独自の
         // バイナリ表現は定義せず `0A000` で拒否する（WIRE-14 決定）。
@@ -713,10 +740,7 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Date
-        | ColumnType::Timestamp
-        // INTERVAL のバイナリ（OID 1186）は #1583 まで非対応（Issue #1579。暫定 OID 25 の
-        // text のまま値の意味が変わるバイナリを返さない fail-closed）。
-        | ColumnType::Interval => false,
+        | ColumnType::Timestamp => false,
     }
 }
 
@@ -821,9 +845,9 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         engine::catalog::ColumnType::Time => WireType::Time,
         // TIMESTAMPTZ は timestamptz（OID 1184・typlen 8。TABLE-33・Issue #1577）。
         engine::catalog::ColumnType::TimestampTz => WireType::TimestampTz,
-        // INTERVAL は OID 1186 を #1583 で公告するまで暫定で text（OID 25）を公告し、値は
-        // `format_interval`（IntervalStyle=postgres）の文字列で送る（Issue #1579）。
-        engine::catalog::ColumnType::Interval => WireType::Text,
+        // INTERVAL は interval（OID 1186・typlen 16。TABLE-34・Issue #1583）。text は
+        // `format_interval`（IntervalStyle=postgres）の文字列で送る。
+        engine::catalog::ColumnType::Interval => WireType::Interval,
         engine::catalog::ColumnType::Bytea => WireType::Bytea,
         engine::catalog::ColumnType::Uuid => WireType::Uuid,
         engine::catalog::ColumnType::Json => WireType::Json,
@@ -994,7 +1018,7 @@ fn cell_to_text(
         // セッション TimeZone（`tz`）の壁時計＋ offset 付き ISO 形式で整形する
         // （OID 1184 で公告。Issue #1574・#1575・#1577。UTC のセッションでは `+00`）。
         Cell::TimestampTz(micros) => Ok(Some(engine::datetime::format_timestamptz(*micros, tz))),
-        // INTERVAL は `IntervalStyle=postgres` の整形（OID は暫定で text。Issue #1579・#1583）。
+        // INTERVAL は `IntervalStyle=postgres` の整形（OID 1186。Issue #1579・#1583）。
         Cell::Interval(v) => Ok(Some(engine::datetime::format_interval(v))),
         Cell::Array(array_value) => Ok(Some(pg_array_text(array_value))),
         // `BYTEA` のテキスト表現は PostgreSQL 既定の `bytea_output=hex`（`\x` ＋
@@ -1318,6 +1342,14 @@ fn encode_binary_cell(
                 return Err(EncodeError);
             }
             push_fixed(out, wire_type, &binary::timestamptz(*m)?)
+        }
+        // 番兵（±infinity）等の engine が受理しない値は内部不整合として丸めず fail-closed
+        // （`XX000`。TABLE-34・Issue #1583）。
+        (WireType::Interval, Cell::Interval(v)) => {
+            if !engine::datetime::validate_interval(v) {
+                return Err(EncodeError);
+            }
+            push_fixed(out, wire_type, &binary::interval(v))
         }
         // 型と Cell の不一致、および非対応型（事前検査
         // `validate_binary_formats` で拒否済みの多層防御）は fail-closed。
@@ -1655,6 +1687,7 @@ mod tests {
             (Some(ColumnType::Timestamp), 1114, 8),
             (Some(ColumnType::Time), 1083, 8),
             (Some(ColumnType::TimestampTz), 1184, 8),
+            (Some(ColumnType::Interval), 1186, 16),
             (
                 Some(ColumnType::Numeric {
                     precision: 38,
@@ -2579,7 +2612,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 18);
+        assert_eq!(WireType::ALL.len(), 19);
     }
 
     /// `PostgreSQL` 組み込みカタログの公開値（`pg_type.oid`／`typlen`／
@@ -2588,7 +2621,7 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 18] = [
+        let expected: [(WireType, i32, i16, &str); 19] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
@@ -2603,6 +2636,7 @@ mod tests {
             (WireType::Timestamp, 1114, 8, "timestamp"),
             (WireType::Time, 1083, 8, "time"),
             (WireType::TimestampTz, 1184, 8, "timestamptz"),
+            (WireType::Interval, 1186, 16, "interval"),
             (WireType::Bytea, 17, -1, "bytea"),
             (WireType::Uuid, 2950, 16, "uuid"),
             (WireType::Json, 114, -1, "json"),
@@ -3240,6 +3274,7 @@ mod tests {
                     | WireType::Uuid
                     | WireType::Time
                     | WireType::TimestampTz
+                    | WireType::Interval
                     | WireType::Numeric
             );
             assert_eq!(t.supports_binary(), expected, "{t:?}");
@@ -3319,29 +3354,73 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// Issue #1579: INTERVAL は #1583 まで暫定で text（OID 25）を公告し、値は postgres 形式の
-    /// 文字列で出す。バイナリは非対応（fail-closed）。
+    /// Issue #1583: INTERVAL は interval（OID 1186・typlen 16）を公告し、text は postgres 形式、
+    /// バイナリは time i64・day i32・month i32 の 16 バイト BE。番兵は `Err` で何も書かない。
     #[test]
-    fn interval_column_is_advertised_as_text_without_binary_support() {
+    fn interval_column_is_advertised_as_interval_with_text_and_binary() {
         use engine::catalog::ColumnType;
         let meta = ColumnMeta::Scalar {
             name: "i".to_string(),
             ty: ColumnType::Interval,
         };
-        assert_eq!(column_wire_type(&meta), WireType::Text);
-        assert_eq!(column_wire_type(&meta).oid(), 25);
-        assert!(!column_binary_support(&meta));
-        let cell = Cell::Interval(engine::datetime::Interval {
+        assert_eq!(column_wire_type(&meta), WireType::Interval);
+        assert_eq!(column_wire_type(&meta).oid(), 1186);
+        assert!(column_binary_support(&meta));
+        let v = engine::datetime::Interval {
             months: 14,
             days: -1,
             micros: 7_200_000_000,
-        });
+        };
+        let cell = Cell::Interval(v);
         assert_eq!(
             cell_to_text_for_column(&meta, &cell)
                 .expect("text")
                 .as_deref(),
             Some("1 year 2 mons -1 days +02:00:00")
         );
+        let mut out = Vec::new();
+        encode_binary_cell(Some(WireType::Interval), &cell, &mut out).expect("binary");
+        let mut expected = vec![0, 0, 0, 16];
+        expected.extend_from_slice(&[0, 0, 0, 1, 0xAD, 0x27, 0x48, 0x00]);
+        expected.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        expected.extend_from_slice(&[0, 0, 0, 0x0E]);
+        assert_eq!(out, expected);
+        // 境界値（番兵でない組）は有効値として出る。
+        for (months, days, micros) in [
+            (i32::MIN, i32::MIN, i64::MIN + 1),
+            (i32::MAX, i32::MAX, i64::MAX - 1),
+            (0, 0, 0),
+        ] {
+            let iv = engine::datetime::Interval {
+                months,
+                days,
+                micros,
+            };
+            let mut o = Vec::new();
+            encode_binary_cell(Some(WireType::Interval), &Cell::Interval(iv), &mut o)
+                .expect("boundary");
+            assert_eq!(o.len(), 20);
+            assert_eq!(o.get(4..), Some(&binary::interval(&iv)[..]));
+        }
+        // 番兵は丸めず Err、出力へ何も書かない。
+        for iv in [
+            engine::datetime::Interval {
+                months: i32::MAX,
+                days: i32::MAX,
+                micros: i64::MAX,
+            },
+            engine::datetime::Interval {
+                months: i32::MIN,
+                days: i32::MIN,
+                micros: i64::MIN,
+            },
+        ] {
+            let mut o = Vec::new();
+            assert!(
+                encode_binary_cell(Some(WireType::Interval), &Cell::Interval(iv), &mut o).is_err()
+            );
+            assert!(o.is_empty());
+        }
     }
 
     /// Issue #1577: TIMESTAMPTZ は timestamptz（OID 1184・typlen 8）を公告し、text は UTC の

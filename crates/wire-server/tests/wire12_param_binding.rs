@@ -73,6 +73,7 @@ fn open_storage() -> (Storage, temp_db::CleanupGuard) {
                 ColumnDef::new("ts", ColumnType::Timestamp, true),
                 ColumnDef::new("tm", ColumnType::Time, true),
                 ColumnDef::new("tz", ColumnType::TimestampTz, true),
+                ColumnDef::new("iv", ColumnType::Interval, true),
                 ColumnDef::new("u", ColumnType::Uuid, true),
                 ColumnDef::new("bin", ColumnType::Bytea, true),
             ],
@@ -938,6 +939,8 @@ fn seven_type_slots_report_column_oids() {
         ("tm", 1083),
         // TIMESTAMPTZ スロットは timestamptz（OID 1184。TABLE-33・Issue #1577）。
         ("tz", 1184),
+        // INTERVAL スロットは interval（OID 1186。TABLE-34・Issue #1583）。
+        ("iv", 1186),
         ("u", 2950),
         ("bin", 17),
     ] {

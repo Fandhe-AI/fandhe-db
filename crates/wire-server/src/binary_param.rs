@@ -41,19 +41,47 @@ pub(crate) enum BinaryParam {
     /// timestamptz（2000-01-01 00:00:00 UTC 起点マイクロ秒の 8 バイト BE。TABLE-33・
     /// Issue #1577）。
     TimestampTz,
+    /// interval（time i64〔µs〕・day i32・month i32 の 16 バイト BE。TABLE-34・Issue #1583）。
+    /// `±infinity` 番兵は engine が受理しないため `OutOfRange`（`22008`）で拒否する。
+    Interval,
     /// numeric（`numeric_send` レイアウト。WIRE-26・Issue #2443）。長さ・`ndigits` を
     /// アロケーション前に上限検証し、正規の 10 進テキストへ変換する。
     Numeric,
 }
 
-/// バイナリ値の復号失敗。長さ不正は `08P01`、TIME・TIMESTAMPTZ の範囲外は `22008`、
+impl BinaryParam {
+    /// 範囲外エラー（`22008`）のメッセージに使う型ラベル。受信値は含めず型名のみを返す
+    /// （`extended_query` の Bind 処理から呼ばれる。情報漏えい防止のため固定文字列）。
+    #[deny(clippy::wildcard_enum_match_arm)]
+    pub(crate) fn out_of_range_label(self) -> &'static str {
+        match self {
+            BinaryParam::TimestampTz => "timestamp",
+            BinaryParam::Interval => "interval",
+            BinaryParam::Time => "time value",
+            BinaryParam::Unsupported
+            | BinaryParam::Utf8Identity
+            | BinaryParam::Int2
+            | BinaryParam::Int4
+            | BinaryParam::Int8
+            | BinaryParam::Float4
+            | BinaryParam::Float8
+            | BinaryParam::Bool
+            | BinaryParam::Bytea
+            | BinaryParam::Uuid
+            | BinaryParam::Numeric => "value",
+        }
+    }
+}
+
+/// バイナリ値の復号失敗。長さ不正は `08P01`、TIME・TIMESTAMPTZ・INTERVAL 番兵の範囲外は `22008`、
 /// numeric の外部表現不正は `22P03`・範囲超過は `22003`
 /// （`extended_query` が別々の `HandlerError` へ写す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinaryParamError {
     /// 長さが型の受信形式と合わない。
     InvalidLength,
-    /// 値が型の許容範囲外（TIME・TIMESTAMPTZ。Issue #1571・#1577）。
+    /// 値が型の許容範囲外（TIME・TIMESTAMPTZ・INTERVAL の ±infinity 番兵。Issue #1571・
+    /// #1577・#1583）。
     OutOfRange,
     /// numeric の外部表現が不正（未知の符号・範囲外の `dscale`・範囲外の桁群。`22P03`。
     /// Issue #2443）。
@@ -296,6 +324,30 @@ pub(crate) fn decode_to_text(kind: BinaryParam, raw: &[u8]) -> Result<Vec<u8>, B
             }
             engine::datetime::format_time(v)
         }
+        BinaryParam::Interval => {
+            let b = <[u8; 16]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
+            // 固定長 16 バイトを添字なしで micros(8)・days(4)・months(4) に分解する。
+            let (micros_b, rest) = b
+                .split_first_chunk::<8>()
+                .ok_or(BinaryParamError::InvalidLength)?;
+            let (days_b, months_b) = rest
+                .split_first_chunk::<4>()
+                .ok_or(BinaryParamError::InvalidLength)?;
+            let months_b =
+                <[u8; 4]>::try_from(months_b).map_err(|_| BinaryParamError::InvalidLength)?;
+            let v = engine::datetime::Interval {
+                months: i32::from_be_bytes(months_b),
+                days: i32::from_be_bytes(*days_b),
+                micros: i64::from_be_bytes(*micros_b),
+            };
+            // ±infinity 番兵は engine が受理しないため fail-closed。
+            if !engine::datetime::validate_interval(&v) {
+                return Err(BinaryParamError::OutOfRange);
+            }
+            // engine の正規テキスト（IntervalStyle=postgres）を束縛経路へ渡す。
+            // `parse_interval` との往復は engine 側で保証済み（バイナリ ≡ テキスト）。
+            engine::datetime::format_interval(&v)
+        }
         BinaryParam::TimestampTz => {
             let b = <[u8; 8]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
             // untrusted 入力: PG epoch 加算は checked、続けて engine の範囲検査を通す。
@@ -431,6 +483,79 @@ mod tests {
         }
     }
 
+    /// INTERVAL は time i64・day i32・month i32 の 16 バイト BE。番兵以外の格子は
+    /// `parse_interval` で元の値へ往復し、固定バイト列と一致する。番兵 2 種は `OutOfRange`
+    /// （Issue #1583）。
+    #[test]
+    fn interval_round_trips_and_rejects_sentinels() {
+        use engine::datetime::{parse_interval, validate_interval, Interval};
+        for months in [0, 1, -1, 12, -13, i32::MAX, i32::MIN, i32::MIN + 1] {
+            for days in [0, 1, -1, 30, i32::MAX, i32::MIN] {
+                for micros in [0, 1, -1, 3_600_000_000, -86_399_999_999, i64::MAX, i64::MIN] {
+                    let v = Interval {
+                        months,
+                        days,
+                        micros,
+                    };
+                    let raw = binary::interval(&v);
+                    let mut hand = Vec::new();
+                    hand.extend_from_slice(&micros.to_be_bytes());
+                    hand.extend_from_slice(&days.to_be_bytes());
+                    hand.extend_from_slice(&months.to_be_bytes());
+                    assert_eq!(raw.as_slice(), hand.as_slice());
+                    if !validate_interval(&v) {
+                        assert_eq!(
+                            decode_to_text(BinaryParam::Interval, &raw),
+                            Err(BinaryParamError::OutOfRange)
+                        );
+                        continue;
+                    }
+                    let t = dec(BinaryParam::Interval, &raw);
+                    assert_eq!(parse_interval(&t).ok(), Some(v), "{t}");
+                }
+            }
+        }
+        // 番兵 2 種（全 0x7F/0xFF 側・全 0x80/0x00 側）は明示的に拒否する。
+        let mut max = vec![0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        max.extend_from_slice(&[0x7F, 0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF]);
+        let mut min = vec![0x80, 0, 0, 0, 0, 0, 0, 0];
+        min.extend_from_slice(&[0x80, 0, 0, 0, 0x80, 0, 0, 0]);
+        for raw in [max, min] {
+            assert_eq!(
+                decode_to_text(BinaryParam::Interval, &raw),
+                Err(BinaryParamError::OutOfRange)
+            );
+        }
+        for len in [0, 15, 17, 32] {
+            assert_eq!(
+                decode_to_text(BinaryParam::Interval, &vec![0u8; len]),
+                Err(BinaryParamError::InvalidLength)
+            );
+        }
+    }
+
+    /// 任意の 16 バイトで panic せず、成功時は `parse_interval` で往復するテキストになる。
+    #[test]
+    fn interval_arbitrary_bytes_never_panic() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..5000 {
+            let mut raw = [0u8; 16];
+            for b in raw.iter_mut() {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                *b = (x >> 56) as u8;
+            }
+            match decode_to_text(BinaryParam::Interval, &raw) {
+                Ok(t) => {
+                    let s = String::from_utf8(t).expect("utf8");
+                    assert!(engine::datetime::parse_interval(&s).is_ok(), "{s}");
+                }
+                Err(e) => assert_eq!(e, BinaryParamError::OutOfRange),
+            }
+        }
+    }
+
     #[test]
     fn utf8_identity_passes_through() {
         assert_eq!(dec(BinaryParam::Utf8Identity, "あ".as_bytes()), "あ");
@@ -438,7 +563,7 @@ mod tests {
 
     #[test]
     fn wrong_lengths_are_rejected() {
-        let cases: [(BinaryParam, usize); 9] = [
+        let cases: [(BinaryParam, usize); 10] = [
             (BinaryParam::Int2, 2),
             (BinaryParam::Int4, 4),
             (BinaryParam::Int8, 8),
@@ -448,6 +573,7 @@ mod tests {
             (BinaryParam::Uuid, 16),
             (BinaryParam::Time, 8),
             (BinaryParam::TimestampTz, 8),
+            (BinaryParam::Interval, 16),
         ];
         for (kind, n) in cases {
             for len in [n - 1, n + 1] {
