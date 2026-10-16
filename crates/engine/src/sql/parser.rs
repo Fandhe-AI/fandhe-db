@@ -341,6 +341,45 @@ pub(crate) fn reject_current_time_literal(name: &str) -> SqlSurfaceError {
     ))
 }
 
+/// 定数式が TIMESTAMPTZ に評価された値（UTC マイクロ秒）を、代入先の列型へ束縛する
+/// （`bind_insert_row` から呼ぶ。Issue #1576 レビュー指摘）。TIMESTAMPTZ 列は範囲を再検証して
+/// そのまま、TIMESTAMP・DATE 列はセッション TZ の局所値へ変換する（PG の代入キャスト・
+/// `set_expr::convert_for_assignment` と同じ意味）。それ以外の列型は `42804`。
+fn bind_tstz_literal(
+    name: &str,
+    ty: &ColumnType,
+    micros: i64,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    use crate::row_codec::Value;
+    let overflow = || {
+        SqlSurfaceError::datetime_field_overflow(format!(
+            "column {name:?}: timestamptz out of range"
+        ))
+    };
+    match ty {
+        ColumnType::TimestampTz => {
+            if crate::datetime::validate_timestamptz_micros(micros) {
+                Ok(Value::TimestampTz(micros))
+            } else {
+                Err(overflow())
+            }
+        }
+        ColumnType::Timestamp => crate::datetime::with_current_session_time_zone(|tz| {
+            tz.timestamptz_to_timestamp(micros)
+        })
+        .map(Value::Timestamp)
+        .ok_or_else(overflow),
+        ColumnType::Date => {
+            crate::datetime::with_current_session_time_zone(|tz| tz.timestamptz_to_date(micros))
+                .map(Value::Date)
+                .ok_or_else(overflow)
+        }
+        _ => Err(SqlSurfaceError::datatype_mismatch(format!(
+            "column {name:?} cannot be assigned a TIMESTAMPTZ value"
+        ))),
+    }
+}
+
 /// 束縛済みの単一行・`id` 指定形 `DELETE` 文（SQL-18・TASK-191。#867 が
 /// `EngineCore::delete_row`〔既存の RLS 可視集合判定・`operation_id` ガード
 /// 込みの Rust API〕へ渡す入力形）。`BoundInsert` と異なり `values`／列型情報
@@ -392,7 +431,9 @@ pub(crate) fn bind_numeric_literal(
                 "column {name:?} expects a NUMERIC literal, got a vector literal"
             )))
         }
-        InsertLiteral::CurrentTime(_) => return Err(reject_current_time_literal(name)),
+        InsertLiteral::CurrentTime(_) | InsertLiteral::TimestampTz(_) => {
+            return Err(reject_current_time_literal(name))
+        }
         // 呼び出し元（`bind_insert`／`bind_set_assignments`／
         // `bind_upsert_assignments`）はいずれも `InsertLiteral::Null` を
         // 本関数へ渡すより前に nullable 判定込みで独自に処理するため実際には
@@ -537,7 +578,9 @@ pub(crate) fn bind_integer_literal(
                 "invalid input syntax for integer column {name:?}"
             )));
         }
-        InsertLiteral::CurrentTime(_) => return Err(reject_current_time_literal(name)),
+        InsertLiteral::CurrentTime(_) | InsertLiteral::TimestampTz(_) => {
+            return Err(reject_current_time_literal(name))
+        }
         InsertLiteral::Bool(_) | InsertLiteral::Null | InsertLiteral::Vector(_) => {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "column {name:?} expects an integer literal, got a non-integer literal"
@@ -2920,6 +2963,7 @@ fn bind_insert_row(
         | InsertLiteral::Bool(_)
         | InsertLiteral::Null
         | InsertLiteral::CurrentTime(_)
+        | InsertLiteral::TimestampTz(_)
         | InsertLiteral::Vector(_) => {
             return Err(SqlSurfaceError::invalid_input(
                 "id pseudo-column value must be a number",
@@ -2978,6 +3022,8 @@ fn bind_insert_row(
             (_, InsertLiteral::CurrentTime(_)) => {
                 return Err(reject_current_time_literal(name));
             }
+            // 定数式の TIMESTAMPTZ 結果は代入先の列型で変換する（Issue #1576）。
+            (ty, InsertLiteral::TimestampTz(micros)) => bind_tstz_literal(name, ty, *micros)?,
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
             }
@@ -3446,7 +3492,7 @@ fn bind_set_assignments(
         };
         let value = match (&column.ty, literal) {
             // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。
-            (_, InsertLiteral::CurrentTime(_)) => {
+            (_, InsertLiteral::CurrentTime(_) | InsertLiteral::TimestampTz(_)) => {
                 return Err(reject_current_time_literal(name));
             }
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
@@ -4637,7 +4683,7 @@ fn bind_upsert_assignments(
             UpsertValue::Literal(literal) => {
                 let v = match (&column.ty, literal) {
             // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。
-            (_, InsertLiteral::CurrentTime(_)) => {
+            (_, InsertLiteral::CurrentTime(_) | InsertLiteral::TimestampTz(_)) => {
                 return Err(reject_current_time_literal(name));
             }
                     (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
@@ -4863,7 +4909,7 @@ fn bind_file_insert(
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let value = match (&column.ty, literal) {
             // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。
-            (_, InsertLiteral::CurrentTime(_)) => {
+            (_, InsertLiteral::CurrentTime(_) | InsertLiteral::TimestampTz(_)) => {
                 return Err(reject_current_time_literal(name));
             }
             (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::String(s)) => {

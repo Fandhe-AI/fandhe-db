@@ -3034,6 +3034,11 @@ pub enum InsertLiteral {
     /// INSERT／NoSQL）は受理せず拒否する（fail-closed）。合成式（`now() + …`）は
     /// この variant にならず、従来どおり定数式経路で拒否される。
     CurrentTime(crate::catalog::TimeDefault),
+    /// 定数式が TIMESTAMPTZ に評価された結果（UTC マイクロ秒。Issue #1576 レビュー指摘）。
+    /// 代入先の列型が決まる束縛段で変換する（TIMESTAMPTZ 列はそのまま、TIMESTAMP・DATE 列は
+    /// セッション TZ の局所値へ。`sql::parser::bind_tstz_literal`）。文字列化して列側 parse へ
+    /// 渡すと TIMESTAMP・DATE 列が offset を拒否するため、型を保持する。
+    TimestampTz(i64),
 }
 
 /// `ON CONFLICT (id) DO UPDATE SET <col> = <value>` の SET 右辺（SQL-20・

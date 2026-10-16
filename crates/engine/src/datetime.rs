@@ -878,6 +878,19 @@ std::thread_local! {
     /// ため。tzdb の TZif 解析を行数分繰り返さない。1 件・名前は 255 バイト以下で有界。Issue #1576）。
     static ZONE_ARGUMENT_CACHE: std::cell::RefCell<Option<(String, SessionTimeZone)>> =
         const { std::cell::RefCell::new(None) };
+    /// 現在スレッドでセッション TimeZone が読まれたか（拡張クエリの Parse が、パラメータの無い
+    /// 文でも Bind 時の再 parse を要するか判定するための印。Issue #1576 レビュー指摘）。
+    static SESSION_TZ_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`take_session_time_zone_read`] の前に印を下ろす。
+pub(crate) fn reset_session_time_zone_read() {
+    SESSION_TZ_READ.with(|c| c.set(false));
+}
+
+/// 直前の [`reset_session_time_zone_read`] 以降にセッション TimeZone が読まれたかを返す。
+pub(crate) fn take_session_time_zone_read() -> bool {
+    SESSION_TZ_READ.with(|c| c.replace(false))
 }
 
 /// [`SessionTimeZone::resolve_zone_argument`] の 1 件キャッシュ付き版（行ごとの評価用）。
@@ -1015,12 +1028,14 @@ impl Drop for SessionTimeZoneScope {
 
 /// 現在スレッドに束縛されたセッション TimeZone。スコープが無い経路（NoSQL 等）は UTC。
 pub fn current_session_time_zone() -> SessionTimeZone {
+    SESSION_TZ_READ.with(|c| c.set(true));
     SESSION_TZ.with(|c| c.borrow().clone().unwrap_or_else(SessionTimeZone::utc))
 }
 
 /// 現在スレッドに束縛されたセッション TimeZone を clone せず借用して `f` を実行する
 /// （式の評価器が行ごとに呼ぶため。スコープが無ければ UTC。Issue #1576）。
 pub(crate) fn with_current_session_time_zone<R>(f: impl FnOnce(&SessionTimeZone) -> R) -> R {
+    SESSION_TZ_READ.with(|c| c.set(true));
     SESSION_TZ.with(|c| match c.borrow().as_ref() {
         Some(tz) => f(tz),
         None => f(&SessionTimeZone::utc()),

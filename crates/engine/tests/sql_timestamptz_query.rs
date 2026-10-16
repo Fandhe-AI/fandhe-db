@@ -1092,3 +1092,83 @@ fn const_fold_uses_session_zone_and_check_rejects_zone_less_forms() {
         "0A000"
     );
 }
+
+/// 定数式の TIMESTAMPTZ は代入先の列型で変換する（TIMESTAMP・DATE 列へはセッション TZ の局所値）。
+/// 裸の NULL の zone・値は strict に NULL を返す（`0A000` にしない）。Issue #1576 レビュー指摘。
+#[test]
+fn const_tstz_assignment_targets_and_null_arguments() {
+    let (_g, core) = open("tzq-review2");
+    let mut s = session();
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE ra (ts TIMESTAMP, d DATE, z TIMESTAMPTZ)",
+    );
+    ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO ra (id, ts, d, z) VALUES (1, \
+         TIMESTAMPTZ '2026-01-01 20:00:00+00', TIMESTAMPTZ '2026-01-01 20:00:00+00', \
+         TIMESTAMPTZ '2026-01-01 20:00:00+00') USING OPERATION_ID 'ra1'",
+    );
+    let r = rows(&core, &mut s, "SELECT ts, d, z FROM ra LIMIT 5");
+    assert_eq!(r[0][0], "2026-01-02 05:00:00");
+    assert_eq!(r[0][1], "2026-01-02");
+    assert_eq!(r[0][2], "2026-01-01 20:00:00+00");
+    // TEXT 列などへの代入は拒否のまま。
+    ok(&core, &mut s, "CREATE TABLE rb (t TEXT)");
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "INSERT INTO rb (id, t) VALUES (1, TIMESTAMPTZ '2026-01-01 20:00:00+00') \
+             USING OPERATION_ID 'rb1'"
+        ),
+        "42804"
+    );
+    // 定数式（INSERT VALUES）の裸の NULL は strict に NULL を返す。
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE rn (t TIMESTAMP, z TIMESTAMPTZ)",
+    );
+    for (i, (col, expr)) in [
+        ("t", "timezone('UTC', NULL)"),
+        ("z", "timezone(NULL, TIMESTAMP '2026-01-01 00:00:00')"),
+        (
+            "z",
+            "date_trunc('day', TIMESTAMPTZ '2026-01-01 00:00:00+00', NULL)",
+        ),
+        ("z", "TIMESTAMP '2026-01-01 00:00:00' AT TIME ZONE NULL"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        ok(
+            &core,
+            &mut s,
+            &format!(
+                "INSERT INTO rn (id, {col}) VALUES ({}, {expr}) USING OPERATION_ID 'rn{i}'",
+                i + 1
+            ),
+        );
+    }
+    for r in rows(&core, &mut s, "SELECT t, z FROM rn ORDER BY id LIMIT 10") {
+        assert_eq!(r, ["NULL", "NULL"]);
+    }
+    // 述語付き分割実行: ゾーン付きリテラルでも TIMESTAMP 列との比較は TZ 依存のため、別 TZ での再送は不一致。
+    ok(&core, &mut s, "CREATE TABLE rp (ts TIMESTAMP, n INTEGER)");
+    for i in 1..=3 {
+        ok(
+            &core,
+            &mut s,
+            &format!("INSERT INTO rp (id, ts, n) VALUES ({i}, '2026-01-01 00:00:00', {i}) USING OPERATION_ID 'rp{i}'"),
+        );
+    }
+    let del = "DELETE FROM rp WHERE ts < TIMESTAMPTZ '2026-06-01 00:00:00+00' \
+               USING OPERATION_ID 'rpd' PARTITIONED CHUNK 2";
+    ok(&core, &mut s, del);
+    ok(&core, &mut s, "SET TIME ZONE 'UTC'");
+    assert_eq!(code(&core, &mut s, del), "22023");
+}

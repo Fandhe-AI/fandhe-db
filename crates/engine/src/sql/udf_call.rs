@@ -5226,7 +5226,10 @@ fn bind_zone_argument(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<BoundExpr, SqlSurfaceError> {
-    let (bound, ty) = bind_expr_in(zone, env, node_budget)?;
+    // 裸の NULL は型未確定の NULL として受理し、評価時の strict 伝播で NULL にする
+    // （`date_part`／`date_trunc` と同じ。Issue #1576 レビュー指摘）。
+    let (bound, ty) = bind_null_aware(zone, env, node_budget)?;
+    let Some(ty) = ty else { return Ok(bound) };
     if ty != ExprType::Text {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail:
@@ -5268,7 +5271,11 @@ fn bind_timezone_call(
             reject_session_tz_in_check()?;
             (bind_timestamptz_text_literal(text)?, ExprType::TimestampTz)
         }
-        other => bind_expr_in(other, env, node_budget)?,
+        // 裸の NULL は timestamptz として扱い（PG の候補解決と同じ）、strict 伝播で NULL を返す。
+        other => {
+            let (b, t) = bind_null_aware(other, env, node_budget)?;
+            (b, t.unwrap_or(ExprType::TimestampTz))
+        }
     };
     let zone = match zone_arg {
         Some(z) => Some(bind_zone_argument(z, env, node_budget)?),

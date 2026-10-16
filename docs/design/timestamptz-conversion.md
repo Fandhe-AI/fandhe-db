@@ -23,7 +23,9 @@
 | D7 | 比較・ORDER BY・GROUP BY・集計・集合演算・二次索引は UTC の i64（時点）で行い、表示 TZ に依らない。TIMESTAMPTZ 列と文字列・TIMESTAMPTZ リテラルの比較は型付き述語（`TypedLiteral::TimestampTz`）で、二次索引（`OrderedColumnIndex::I64`）を使える。TIMESTAMP／DATE と TIMESTAMPTZ の混在（列どうし・TIMESTAMP 列 vs TIMESTAMPTZ リテラル）は行ごとに変換して比べ、索引は使わず全走査へ縮退する（gap では timestamp → timestamptz の変換が単調でないため。fail-closed） |
 | D8 | 代入時の変換は `UPDATE SET` の式で行う（`set_expr::convert_for_assignment`）。TIMESTAMP・DATE → TIMESTAMPTZ 列はセッション TZ の壁時計として、TIMESTAMPTZ → TIMESTAMP・DATE 列は局所の値として入る。INSERT の定数式は parse 中に畳み込まれるため parse 区間へもセッション TZ を張り（簡易・拡張クエリの Bind とも）、TIMESTAMPTZ を UTC の明示 offset で渡し、列側の束縛がセッション TZ に影響されない |
 | D9 | セッション TZ に依存する式（`AT LOCAL`・混在の比較・TIMESTAMPTZ への `date_part`／`date_trunc`・TIMESTAMP／DATE への 3 引数 `date_trunc`・ゾーン無しの文字列。宣言的な比較経路を含む）は CHECK 制約の本体に置けず `0A000`。定義時と別の TZ で結果が変わる述語を作らせない |
-| D10 | 分割実行 UPDATE の内容照合ハッシュは、ゾーン無しの TIMESTAMPTZ リテラルまたは `AT LOCAL`（`timezone(x)`）を含むとき解釈に使ったセッション TZ 名を含める（別の TZ での再送は `22023`）。新しい型バイト 3（ゾーン指定済み）・4（ゾーン無し）はタグ 10 の既存の型バイト（0〜2）とそれらのハッシュ値を変えない |
+| D10 | 分割実行 UPDATE／DELETE の内容照合ハッシュは、表が TIMESTAMPTZ 列を持つ、または式に TIMESTAMPTZ リテラル（ゾーン指定済みを含む）・`timezone()` を含むとき、UTC 以外ならセッション TZ 名を含める（別の TZ での再送は `22023`。TIMESTAMP 列との混在比較や代入変換も暗黙にセッション TZ を使うため）。新しい型バイト 3（ゾーン指定済み）・4（ゾーン無し）はタグ 10 の既存の型バイト（0〜2）とそれらのハッシュ値を変えない |
+| D11 | 定数式の TIMESTAMPTZ は `InsertLiteral::TimestampTz`（UTC のマイクロ秒）として代入先の列型が決まる束縛段まで保持し、TIMESTAMPTZ 列はそのまま、TIMESTAMP・DATE 列はセッション TZ の局所値へ変換する（UPDATE の代入変換と同じ意味）。`timezone`・`date_trunc` 第 3 引数の zone と値の裸の NULL は strict に NULL を返す |
+| D12 | 拡張クエリの Parse 時の定数畳み込みがセッション TZ を読んだパラメータ無しの文は、Parse の AST を再利用せず Bind ごとにセッション TZ の下で再 parse する（Parse 後・Bind 前の `SET TIME ZONE` を反映する） |
 
 ## 3. DST の確定（PG 17 の実測）
 
@@ -59,5 +61,4 @@
 - `COALESCE`／`CASE`／`UNION` で TIMESTAMP・DATE と TIMESTAMPTZ を混在させた場合の型の単一化（PG は timestamptz）は型不一致の拒否を維持する。
 - TIMESTAMPTZ の UNIQUE／PRIMARY KEY／FK・JOIN キー・SUM／AVG・算術・明示 CAST・json 変換・`TIMESTAMPTZ(p)`・配列・特殊値は閉じたまま。
 - 構文段の限界: 投影項目の先頭が型付きリテラルの式（`SELECT TIMESTAMP '…' AT TIME ZONE …` を FROM 付きで書く形）、式を本体に持つビューは従来から未対応。
-- TIMESTAMPTZ 列を持たないテーブルの分割実行 UPDATE／DELETE で、セッション TZ に依存する式（混在の比較など。ゾーン無しのリテラルと `AT LOCAL` を除く）を含む再送の TZ 照合は未対応。
 - `now()` 系の戻り値型の切り替え・EXTRACT の戻り型（PG は numeric）・サーバー既定 TZ の CLI フラグは対象外。

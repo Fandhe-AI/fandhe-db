@@ -473,3 +473,38 @@ fn at_time_zone_result_types_and_session_formatting() {
     assert_eq!(column_oid(&msgs, 1), 1184);
     assert_eq!(second_cells(&msgs), ["2026-07-01 00:00:00+09"]);
 }
+
+/// パラメータの無い prepared statement の定数畳み込み（ゾーン無し `TIMESTAMPTZ` リテラル）は、
+/// Parse 時ではなく Bind 時のセッション TimeZone で評価する（Issue #1576 レビュー指摘）。
+#[test]
+fn parameterless_prepared_insert_uses_the_bind_time_zone() {
+    let (core, _g) = new_core();
+    let (mut s, _) = connect(spawn(&core), &[]);
+    // UTC のまま Parse し、Bind 前に TZ を変える。
+    for (ty, body) in [
+        (
+            b'P',
+            parse_body(
+                "s1",
+                "INSERT INTO t (id, v) VALUES (1, TIMESTAMPTZ '2026-01-01 09:00:00') \
+                 USING OPERATION_ID 'pp1'",
+                0,
+            ),
+        ),
+        (b'S', Vec::new()),
+    ] {
+        send_length_prefixed_message(&mut s, ty, &body);
+    }
+    until_ready(&mut s);
+    run(&mut s, "SET TIME ZONE 'Asia/Tokyo'");
+    for (ty, body) in [
+        (b'B', bind_body("", "s1")),
+        (b'E', execute_body("", 0)),
+        (b'S', Vec::new()),
+    ] {
+        send_length_prefixed_message(&mut s, ty, &body);
+    }
+    until_ready(&mut s);
+    // 東京の 09:00 は UTC の 00:00（東京表示で 09:00:00+09）。UTC で畳み込むと 18:00:00+09 になる。
+    assert_eq!(select_v(&mut s), ["2026-01-01 09:00:00+09"]);
+}

@@ -599,10 +599,8 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         ExprValue::Date(d) => Ok(InsertLiteral::String(crate::datetime::format_date(d))),
         ExprValue::Timestamp(t) => Ok(InsertLiteral::String(crate::datetime::format_timestamp(t))),
         ExprValue::Time(t) => Ok(InsertLiteral::String(crate::datetime::format_time(t))),
-        // UTC の明示 offset で渡し、列側の束縛がセッション TZ に影響されないようにする（Issue #1576）。
-        ExprValue::TimestampTz(t) => Ok(InsertLiteral::String(
-            crate::datetime::format_timestamptz(t, &crate::datetime::SessionTimeZone::utc()),
-        )),
+        // 代入先の列型が決まる束縛段で変換するため型を保持する（Issue #1576）。
+        ExprValue::TimestampTz(t) => Ok(InsertLiteral::TimestampTz(t)),
         ExprValue::Vector(_) => Err(SqlSurfaceError::Internal {
             detail: "constant expression produced a vector".to_string(),
         }),

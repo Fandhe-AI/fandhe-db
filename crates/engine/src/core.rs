@@ -1898,6 +1898,10 @@ pub struct PreparedSql {
     /// `$n` ごとの型公告（`param_types().len() == param_count`。WIRE-12）。
     /// Parse 時点のカタログ（スキーマ）だけから導出し、行には触れない。
     param_types: Vec<crate::sql::params::PreparedParamType>,
+    /// Parse 時の構造検証 parse がセッション TimeZone を読んだか（ゾーン無し `TIMESTAMPTZ`
+    /// リテラル・`AT LOCAL` の定数畳み込み。Issue #1576）。`true` の文は `dummy_parsed` を
+    /// 実行へ再利用せず、Bind ごとにセッション TimeZone の下で再 parse する。
+    session_tz_dependent: bool,
 }
 
 impl PreparedSql {
@@ -1912,8 +1916,10 @@ impl PreparedSql {
     /// [`ParsedSql`] を返す。`$n` が無い文では `substitute_dummy` が恒等変換の
     /// ため、これは [`EngineCore::parse_sql`] の結果と構造的に同一である
     /// （wire-server が 0 パラメータ文を従来の Parsed 経路のまま保持するため）。
+    /// ただし Parse 時の畳み込みがセッション TimeZone を読んだ文は `None` を返し、呼び出し元は
+    /// Bind ごとに [`EngineCore::bind_prepared`] で再 parse する（Issue #1576）。
     pub fn parsed_if_unparameterized(&self) -> Option<&ParsedSql> {
-        (self.param_count == 0).then_some(&self.dummy_parsed)
+        (self.param_count == 0 && !self.session_tz_dependent).then_some(&self.dummy_parsed)
     }
 
     /// Bind 後に portal が実際に保持する束縛値の総バイト数（同一 `$n` の出現
@@ -4163,8 +4169,10 @@ impl EngineCore {
                 .map(|(i, _)| i)
                 .collect();
             let _guard = crate::sql::const_expr::defer_param_value_errors(positions);
+            crate::datetime::reset_session_time_zone_read();
             self.parse_tokens(dummy_tokens)?
         };
+        let session_tz_dependent = crate::datetime::take_session_time_zone_read();
         Ok(PreparedSql {
             tokens,
             param_count,
@@ -4172,6 +4180,7 @@ impl EngineCore {
             order_by_distance_literal_is_param,
             where_equality_dummy_flags,
             param_types,
+            session_tz_dependent,
         })
     }
 
@@ -9530,6 +9539,7 @@ impl EngineCore {
                     stmt.table_name(),
                     stmt.where_predicates(),
                     udfs,
+                    schema,
                 )
             },
         )?;
@@ -9713,6 +9723,7 @@ impl EngineCore {
                     stmt.table_name(),
                     stmt.where_predicates(),
                     udfs,
+                    &schema,
                 )?;
                 Ok(crate::sql::SqlOutcome::Explain(
                     crate::sql::partitioned::explain_result(
