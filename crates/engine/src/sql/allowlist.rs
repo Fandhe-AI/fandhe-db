@@ -7218,7 +7218,9 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
-            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/')))
+                && !self.peek_at_time_zone()
+            {
                 return Ok(lit);
             }
             self.pos = start;
@@ -7266,7 +7268,9 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
-            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/')))
+                && !self.peek_at_time_zone()
+            {
                 return Ok(SetValue::Literal(lit));
             }
             self.pos = start;

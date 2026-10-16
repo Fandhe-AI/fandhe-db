@@ -1128,6 +1128,44 @@ pub(crate) fn add_column_default(
         ))
     };
     match literal {
+        // 定数式（`TIMESTAMPTZ '...'`・`timezone(...)`／`AT TIME ZONE` の結果）が畳み込まれた
+        // 絶対時刻（Issue #1576・TABLE-33）。日時列の保持形（テキスト）へ DDL 時点の
+        // セッション TimeZone で変換する。TIMESTAMPTZ は UTC の明示 offset 付き表記へ
+        // 正規化し、読み出し時補完がセッションによらず同じ値になるようにする。
+        InsertLiteral::TimestampTz(micros)
+            if matches!(
+                ty,
+                ColumnType::TimestampTz | ColumnType::Timestamp | ColumnType::Date
+            ) =>
+        {
+            let overflow = || {
+                SqlSurfaceError::datetime_field_overflow(format!(
+                    "column {column_name:?} DEFAULT is out of range for its type"
+                ))
+            };
+            let text = match ty {
+                ColumnType::TimestampTz => {
+                    if !crate::datetime::validate_timestamptz_micros(*micros) {
+                        return Err(overflow());
+                    }
+                    crate::datetime::format_timestamptz(
+                        *micros,
+                        &crate::datetime::SessionTimeZone::utc(),
+                    )
+                }
+                ColumnType::Timestamp => crate::datetime::with_current_session_time_zone(|tz| {
+                    tz.timestamptz_to_timestamp(*micros)
+                })
+                .map(crate::datetime::format_timestamp)
+                .ok_or_else(overflow)?,
+                _ => crate::datetime::with_current_session_time_zone(|tz| {
+                    tz.timestamptz_to_date(*micros)
+                })
+                .map(crate::datetime::format_date)
+                .ok_or_else(overflow)?,
+            };
+            Ok(ColumnDefault::Text(text))
+        }
         // `DATE`／`TIMESTAMP`／`UUID`／`ENUM` は文字列リテラルの原文を保持し、解釈（ENUM は語彙照合）は
         // 束縛時（`parser::bind_column_default`）に行う（Issue #1279・#1280・#1281・#1282）。
         // ENUM の型名解決（未登録は 42601）は DEFAULT 評価より先に済んでいる。

@@ -1172,3 +1172,66 @@ fn const_tstz_assignment_targets_and_null_arguments() {
     ok(&core, &mut s, "SET TIME ZONE 'UTC'");
     assert_eq!(code(&core, &mut s, del), "22023");
 }
+
+/// レビュー指摘（PR #2481）: 値位置（INSERT VALUES／UPDATE SET）で単独の文字列リテラルの
+/// 直後に `AT TIME ZONE`／`AT LOCAL` が続く形も式として解析される。
+#[test]
+fn at_time_zone_after_lone_literal_in_value_positions() {
+    let (_g, core) = open("tzq-valpos");
+    let mut s = session();
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE v (at TIMESTAMPTZ, ts TIMESTAMP)",
+    );
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO v (id, at) VALUES (1, '2026-01-01 00:00:00' AT TIME ZONE 'Asia/Tokyo') \
+         USING OPERATION_ID 'v1'",
+    );
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO v (id, at) VALUES (2, '2026-01-01 00:00:00+00' AT TIME ZONE 'UTC') \
+         USING OPERATION_ID 'v2'",
+    );
+    let r = rows(&core, &mut s, "SELECT id, at FROM v ORDER BY id LIMIT 5");
+    assert_eq!(r[0][1], "2026-01-01 09:00:00+00");
+    ok(
+        &core,
+        &mut s,
+        "UPDATE v SET ts = '2026-01-01 00:00:00+00' AT TIME ZONE 'UTC' WHERE id = 2 \
+         USING OPERATION_ID 'v3'",
+    );
+    let r = rows(&core, &mut s, "SELECT ts FROM v WHERE id = 2 LIMIT 5");
+    assert_eq!(r[0][0], "2026-01-01 00:00:00");
+}
+
+/// レビュー指摘（PR #2481）: 定数式 DEFAULT が TIMESTAMPTZ を返しても CREATE TABLE／
+/// ALTER TABLE ADD COLUMN が受理され、UTC 表記へ正規化される。
+#[test]
+fn default_accepts_timestamptz_const_expr() {
+    let (_g, core) = open("tzq-default");
+    let mut s = session();
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE d (z TIMESTAMPTZ DEFAULT TIMESTAMPTZ '2026-01-01 09:00:00+09', \
+         t TIMESTAMP DEFAULT '2026-01-01 09:00:00+09' AT TIME ZONE 'UTC')",
+    );
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO d (id) VALUES (1) USING OPERATION_ID 'd1'",
+    );
+    ok(
+        &core,
+        &mut s,
+        "ALTER TABLE d ADD COLUMN w TIMESTAMPTZ DEFAULT '2026-01-01 00:00:00' AT TIME ZONE 'Asia/Tokyo'",
+    );
+    let r = rows(&core, &mut s, "SELECT z, t, w FROM d LIMIT 5");
+    assert_eq!(r[0][0], "2026-01-01 00:00:00+00");
+    assert_eq!(r[0][1], "2026-01-01 00:00:00");
+    assert_eq!(r[0][2], "2026-01-01 09:00:00+00");
+}
