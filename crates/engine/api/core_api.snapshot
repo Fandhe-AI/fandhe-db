@@ -26,6 +26,7 @@ pub mod incremental;
 pub mod isa;
 pub mod join_limits;
 pub mod json;
+pub mod jsonpath_limits;
 pub mod kernel;
 pub mod nesting_limits;
 pub mod numeric;

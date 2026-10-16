@@ -254,6 +254,7 @@ pub mod isa;
 pub mod join_limits;
 pub mod json;
 pub(crate) mod json_text;
+pub mod jsonpath_limits;
 pub mod kernel;
 pub(crate) mod key_index;
 pub mod nesting_limits;

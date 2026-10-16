@@ -81,6 +81,15 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::IndeterminateDatatype
         // Issue #1599: `jsonb_build_object` の NULL キー（`22004`）も入力起因の拒否として 400。
         | ErrorClass::NullValueNotAllowed
+        // Issue #2184: jsonpath 評価器の `2203x` 系は入力起因の拒否として 400（SQL 表層への
+        // 配線は #2185／#2186。NoSQL 表層からは到達不能）。
+        | ErrorClass::JsonSubscriptInvalid
+        | ErrorClass::NonNumericJsonItem
+        | ErrorClass::SingletonJsonItemRequired
+        | ErrorClass::JsonArrayNotFound
+        | ErrorClass::JsonMemberNotFound
+        | ErrorClass::JsonNumberNotFound
+        | ErrorClass::JsonObjectNotFound
         | ErrorClass::MissingOperationId
         | ErrorClass::DatetimeFieldOverflow
         | ErrorClass::InvalidDatetimeFormat
@@ -159,7 +168,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 50] = [
+    const EXPECTED: [(ErrorClass, u16); 57] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -210,6 +219,13 @@ mod tests {
         (ErrorClass::InvalidParameterValue, 400),
         (ErrorClass::IndeterminateDatatype, 400),
         (ErrorClass::NullValueNotAllowed, 400),
+        (ErrorClass::JsonSubscriptInvalid, 400),
+        (ErrorClass::NonNumericJsonItem, 400),
+        (ErrorClass::SingletonJsonItemRequired, 400),
+        (ErrorClass::JsonArrayNotFound, 400),
+        (ErrorClass::JsonMemberNotFound, 400),
+        (ErrorClass::JsonNumberNotFound, 400),
+        (ErrorClass::JsonObjectNotFound, 400),
     ];
 
     #[test]
