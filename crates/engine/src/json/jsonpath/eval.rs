@@ -1371,10 +1371,12 @@ impl<'a> Ev<'a> {
                     _ => Err(hard(JsonPathEvalError::Internal)),
                 },
                 Kind::Num => {
-                    // PostgreSQL の numeric_int4 同様、丸めた結果が int4 に収まれば受理する。
+                    // PG 17 実測表（jsonpath_pg17_table.inc）に合わせ、scale 付き（2.0・0.0 等）は
+                    // 拒否し、scale 0 で int4 に収まる整数だけ受理する（拒否は 22036）。
                     let v = jb
                         .num()
                         .and_then(num::from_json_number)
+                        .filter(|d| d.scale() == 0)
                         .and_then(|d| num::round_to_i128(&d))
                         .and_then(|t| i32::try_from(t).ok());
                     match v {

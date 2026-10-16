@@ -1114,3 +1114,24 @@ fn division_does_not_overflow_on_intermediate_values() {
         Some("1.00000000000000000000")
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR #2466 レビュー対応の回帰テスト
+// ---------------------------------------------------------------------------
+
+/// `.boolean()` は PG 17 実測表に合わせ、scale 付き数値（2.0・0.0・1.5）を 22036 で拒否する。
+#[test]
+fn boolean_method_rejects_scaled_numbers() {
+    for json in ["2.0", "0.0", "1.5", "1.0"] {
+        let err = eval_query("$.boolean()", json).unwrap_err();
+        assert_eq!(err.wire_code(), "22036", "{json}");
+    }
+    assert_eq!(
+        eval_query("$.boolean()", "2").unwrap(),
+        vec![JsonValue::Bool(true)]
+    );
+    assert_eq!(
+        eval_query("$.boolean()", "0").unwrap(),
+        vec![JsonValue::Bool(false)]
+    );
+}
