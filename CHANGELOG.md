@@ -9,6 +9,13 @@
 
 ### Breaking Changes
 
+- セッション TimeZone（Issue #1575・TABLE-33）に伴う公開 API の変更: 公開 enum
+  `engine::sql::allowlist::Statement` に `SetTimeZone { value: TimeZoneSetting }`・`ShowTimeZone`、
+  公開 enum `engine::sql::SqlOutcome` に `SetTimeZone`・`Show(QueryResult)` を追加した
+  （既存の網羅的 `match` はアームの追加が必要）。`engine::datetime::SessionTimeZone` は表示値を
+  持つ構造体になり、`SessionState::time_zone`・`SessionTimeZone::parse_setting` を追加した。
+  pg wire の起動時 ParameterStatus に `TimeZone`（既定 `UTC`）が増え、StartupMessage の
+  `TimeZone` を受理する（不正値は認証後に FATAL `22023`）。
 - crate 名を `fandhe-vector-db-engine` / `fandhe-vector-db-wire-server` から
   `fandhe-db-engine` / `fandhe-db-wire-server` へ変更した（プロジェクト名を
   vector-db から fandhe-db へ改めたため）。0.2.0 は新しい crate 名での初公開版となる。
