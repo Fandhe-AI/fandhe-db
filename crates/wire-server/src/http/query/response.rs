@@ -1232,7 +1232,7 @@ mod tests {
         assert_eq!(numbers, expected);
     }
 
-    /// Issue #1569: TIME 列は JSON 文字列（`HH:MM:SS[.ffffff]`）・型名 `"time"`。
+    /// Issue #1574: TIMESTAMPTZ 列は UTC 固定（`+00` 付き）の JSON 文字列・型名 `"timestamptz"`。
     #[test]
     fn timestamptz_cell_is_a_utc_json_string_and_column_type_is_timestamptz() {
         let result = QueryResult {
@@ -1251,6 +1251,7 @@ mod tests {
         assert!(body.contains("\"2026-01-01 03:00:00.5+00\""), "{body}");
     }
 
+    /// Issue #1569: TIME 列は JSON 文字列（`HH:MM:SS[.ffffff]`）・型名 `"time"`。
     #[test]
     fn time_cell_is_a_json_string_and_column_type_is_time() {
         let result = QueryResult {
