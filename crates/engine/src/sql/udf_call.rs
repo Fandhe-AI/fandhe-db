@@ -5075,6 +5075,8 @@ fn bind_date_part_or_trunc(
     // `date_trunc(unit, timestamp, zone)` は timestamp を timestamptz へ暗黙変換して第 3 引数の
     // TZ で切り捨てる（PG 17）。`date_trunc(unit, date)` の戻り型は従来どおり timestamp。
     if let Some(zone) = zone_bound {
+        // timestamp／date → timestamptz の暗黙変換はセッション TZ に依存するため、CHECK 本体では拒否する。
+        reject_session_tz_in_check()?;
         let src = match src_ty {
             Some(ExprType::Timestamp) | None => src_bound,
             Some(ExprType::Date) => wrap_date_to_timestamp(src_bound),
@@ -5179,7 +5181,7 @@ fn bind_date_part_or_trunc(
 /// セッション TimeZone に依存する式を CHECK 制約の本体へ置くことを `0A000` で拒否する
 /// （Issue #1576。CHECK は式テキストを永続化して INSERT／UPDATE ごとに再評価するため、定義時と
 /// 別の TZ で結果が変わる述語を fail-closed で作らせない）。
-fn reject_session_tz_in_check() -> Result<(), SqlSurfaceError> {
+pub(crate) fn reject_session_tz_in_check() -> Result<(), SqlSurfaceError> {
     if CHECK_BINDING.with(std::cell::Cell::get) {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail:
@@ -6289,6 +6291,14 @@ pub(crate) fn eval_nullif<'a>(
                 Ok(ExprValue::Null)
             } else {
                 Ok(ExprValue::Time(a))
+            }
+        }
+        // Issue #1576: TIMESTAMPTZ は UTC の時点で比べる（`NULLIF(tstz, tstz)`）。
+        (ExprValue::TimestampTz(a), ExprValue::TimestampTz(b)) => {
+            if a == b {
+                Ok(ExprValue::Null)
+            } else {
+                Ok(ExprValue::TimestampTz(a))
             }
         }
         _ => Err(SqlSurfaceError::Internal {

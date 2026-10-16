@@ -1027,3 +1027,68 @@ fn boolean_combinations_nulls_and_case() {
     assert_eq!(c, "22007");
     assert!(!msg.contains("garbage-literal"), "{msg}");
 }
+
+/// レビュー指摘（PR #2481）: INSERT の定数式畳み込みは parse 中に走るため、セッション TZ を
+/// parse 区間へも張る。CHECK 本体はゾーン無しの文字列比較・3 引数 `date_trunc` の暗黙変換を
+/// `0A000` で拒否する。`NULLIF(timestamptz, timestamptz)` は評価できる。
+#[test]
+fn const_fold_uses_session_zone_and_check_rejects_zone_less_forms() {
+    let (_g, core) = open("tzq-review");
+    let mut s = session();
+    ok(&core, &mut s, "CREATE TABLE r (at TIMESTAMPTZ)");
+    ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO r (id, at) VALUES (1, TIMESTAMPTZ '2026-01-01 09:00:00') \
+         USING OPERATION_ID 'r1'",
+    );
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO r (id, at) VALUES (2, TIMESTAMP '2026-01-01 09:00:00' AT LOCAL) \
+         USING OPERATION_ID 'r2'",
+    );
+    let r = rows(&core, &mut s, "SELECT id, at FROM r ORDER BY id LIMIT 5");
+    assert_eq!(r[0][1], "2026-01-01 00:00:00+00");
+    assert_eq!(r[1][1], "2026-01-01 00:00:00+00");
+    assert_eq!(
+        one(
+            &core,
+            &mut s,
+            "SELECT NULLIF(TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 00:00:00+00')"
+        ),
+        "NULL"
+    );
+    assert_eq!(
+        one(
+            &core,
+            &mut s,
+            "SELECT NULLIF(TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-02 00:00:00+00')"
+        ),
+        "2026-01-01 00:00:00+00"
+    );
+    // CHECK: ゾーン無しの文字列との比較は宣言的経路でも拒否。ゾーン付きは受理。
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "CREATE TABLE ck1 (at TIMESTAMPTZ, CHECK (at > '2026-01-01 00:00:00'))"
+        ),
+        "0A000"
+    );
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE ck2 (at TIMESTAMPTZ, CHECK (at > '2026-01-01 00:00:00+00'))",
+    );
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "CREATE TABLE ck3 (ts TIMESTAMP, \
+             CHECK (date_trunc('day', ts, 'UTC') = TIMESTAMPTZ '2026-01-01 00:00:00+00'))"
+        ),
+        "0A000"
+    );
+}

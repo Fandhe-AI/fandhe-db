@@ -381,12 +381,13 @@ fn null_kind(e: &Expr) -> Option<Option<ExprType>> {
 
 /// `NULL` オペランドの型候補（`NULL` 側の位置に置いて束縛を試す順序。算術で曖昧な
 /// `NULL + 1` は PostgreSQL と同様に Scalar を優先する）。
-const NULL_OPERAND_CANDIDATES: [ExprType; 5] = [
+const NULL_OPERAND_CANDIDATES: [ExprType; 6] = [
     ExprType::Scalar,
     ExprType::Text,
     ExprType::Date,
     ExprType::Timestamp,
     ExprType::Time,
+    ExprType::TimestampTz,
 ];
 
 /// 関数呼び出しの `NULL` 引数に対する型候補の組み合わせ試行回数の上限（DoS 防止）。

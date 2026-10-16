@@ -4688,7 +4688,12 @@ impl EngineCore {
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = crate::sql::lexer::tokenize_marked(sql)?;
-        let parsed = self.parse_tokens(tokens)?;
+        // 定数式の畳み込み（INSERT VALUES・DEFAULT）は parse 中に行われるため、セッション
+        // TimeZone を parse 区間へも張る（ゾーン無し `TIMESTAMPTZ` リテラル・`AT LOCAL`。Issue #1576）。
+        let parsed = {
+            let _session_tz_scope = session_time_zone_scope(session);
+            self.parse_tokens(tokens)?
+        };
         self.execute_parsed_in_session(ctx, session, &parsed)
     }
 
@@ -4721,11 +4726,15 @@ impl EngineCore {
         // `COMMIT` が先行する書き込みを永続化してしまう。PR #1041 レビュー指摘）。
         // `fail` は `Active` 以外では何もしないため、`Idle` の autocommit 経路・
         // 既に `Failed` の経路の挙動は不変。
-        let parsed = match self.parse_sql(sql) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                txn.fail();
-                return Err(e);
+        let parsed = {
+            // parse 中の定数式畳み込みがセッション TimeZone を読む（Issue #1576）。
+            let _session_tz_scope = session_time_zone_scope(session);
+            match self.parse_sql(sql) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    txn.fail();
+                    return Err(e);
+                }
             }
         };
         self.execute_parsed_in_txn(ctx, session, txn, &parsed)

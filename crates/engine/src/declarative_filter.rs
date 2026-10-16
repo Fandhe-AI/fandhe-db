@@ -1178,6 +1178,17 @@ fn bind_typed_compare_literal(
         }
         (ColumnType::TimestampTz, CompareLiteral::Text(s)) => {
             check_literal_len(s)?;
+            // ゾーン無しの入力はセッション TZ で UTC へ確定するため、CHECK 本体では `0A000`
+            // （宣言的経路は `predicate_sql` を書き込みのたびに再束縛し、結果が TZ で変わる。D9）。
+            if matches!(
+                crate::sql::allowlist::parse_timestamptz_expr_literal(s),
+                Ok(crate::sql::udf_call::Expr::TimestampTzLiteral {
+                    session_local: true,
+                    ..
+                })
+            ) {
+                crate::sql::udf_call::reject_session_tz_in_check()?;
+            }
             match crate::sql::parser::bind_datetime_literal(column, ColumnType::TimestampTz, s)? {
                 crate::row_codec::Value::TimestampTz(t) => Ok(TypedLiteral::TimestampTz(t)),
                 _ => Err(SqlSurfaceError::Internal {

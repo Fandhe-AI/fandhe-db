@@ -1801,9 +1801,15 @@ fn handle_bind_body(
             // 同一 `$n` の出現ごとに値が複製されるため、受信量ではなく変換後・展開後の
             // 実保持量で portal の保持量上限を判定する（PR #1217 レビュー指摘）。
             bound_bytes = prepared.expanded_bound_bytes(&decoded);
-            let bound = engine
-                .bind_prepared(prepared, &decoded)
-                .map_err(HandlerError::Sql)?;
+            // 定数式の畳み込み（`TIMESTAMPTZ '…'` のゾーン無し入力・`AT LOCAL`）は再 parse の中で
+            // 行われるため、セッション TimeZone をその区間へ張る（Issue #1576）。
+            let bound = {
+                let _session_tz_scope =
+                    engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
+                engine
+                    .bind_prepared(prepared, &decoded)
+                    .map_err(HandlerError::Sql)?
+            };
             let columns = engine
                 .describe_parsed_in_txn(session, txn, &bound)
                 .map_err(HandlerError::Sql)?;

@@ -2061,6 +2061,14 @@ fn push_dml_expr(
             for arg in args {
                 push_dml_expr(b, arg, params)?;
             }
+            // `timezone(x)`（`x AT LOCAL`。Issue #1576）はセッション TimeZone で結果が決まるため、
+            // 解釈に使った TZ 名を含めて、列に TIMESTAMPTZ を持たない表でも別 TZ での再送を
+            // 別内容として扱う。`timezone` は本 Issue で導入した関数名のため既存ハッシュは不変。
+            if args.len() == 1 && name.eq_ignore_ascii_case("timezone") {
+                let tz = crate::datetime::current_session_time_zone();
+                b.push_bytes(tz.display().as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
         }
         Expr::Binary { op, lhs, rhs } => {
             b.push_u8(4);

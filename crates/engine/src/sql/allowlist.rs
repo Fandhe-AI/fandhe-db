@@ -223,7 +223,7 @@ fn is_where_group_operator_token(token: &Token) -> bool {
 /// （`session_local = false`）、持たない入力は壁時計のまま保持する（`true`。束縛時にセッション TZ で
 /// UTC へ確定する）。ゾーン指定の有無は、既定 TZ を 2 通り（UTC・+01）にして結果が一致するかで判定する。
 /// エラー文言にリテラル本文は含めない。
-fn parse_timestamptz_expr_literal(literal: &str) -> Result<Expr, SqlSurfaceError> {
+pub(crate) fn parse_timestamptz_expr_literal(literal: &str) -> Result<Expr, SqlSurfaceError> {
     use crate::datetime::{SessionTimeZone, TimestampTzLiteralError};
     let utc_tz = SessionTimeZone::utc();
     let micros = match crate::datetime::parse_timestamptz(literal, &utc_tz) {
