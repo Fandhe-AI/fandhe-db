@@ -11,7 +11,7 @@
 
 ## 1. 背景・対応範囲
 
-- 現状、TEXT は常にバイト列順（C collation）で比較され、`COLLATE` は構文段で `42601` として拒否される
+- 現状、TEXT は常にバイト列順（C collation）で比較され、`COLLATE` は構文段で `42601` として拒否されていた（Issue #1609 で `C`／`POSIX` の解析・保存に対応済み）
 - 既定照合 `C`（バイト順・決定的）と `POSIX`（`C` と同義）は依存なしで実装できる
 - ICU 照合（`und-x-icu`・`ja-x-icu` など）だけが照合アルゴリズムと CLDR 照合データを必要とする。依存の追加は dependency-policy によりユーザー承認制のため、本 ADR で承認事項を整理し、2026-10-15 にオーナーの承認を得た
 
@@ -91,3 +91,13 @@
 - 2026-10-15: オーナーが推奨案（決定事項 1〜4）を承認し、本 ADR を Accepted とした。記録: [Issue #1608 のコメント](https://github.com/Fandhe-AI/fandhe-db/issues/1608#issuecomment-6199758104)
   - 承認内容: `icu_collator = "=2.3.1"` の追加、`icu_collator_data = "=2.3.0"` の直接 exact pin、ライセンス Unicode-3.0 の受け入れ、feature ゲートなし（案 A）、許可リストでの解決、`compiled_data` での開始
   - 決定事項 5 とそれ以外の直接依存・版の変更は範囲外。#2189 で必要と判明した時点で止めて再承認を得る
+
+## 付録: Issue #2189 での実施結果
+
+- 追加した依存: `crates/engine/Cargo.toml` に `icu_collator = "=2.3.1"` と `icu_collator_data = "=2.3.0"` の 2 行（非 optional・default features）。依存の実追加は #2189 で行った
+- `Cargo.lock` は新規 crate の追加のみで、既存 crate の版は変わらない
+- 版違いの重複（`cargo tree -d`）: `hashbrown`（0.16.1 / 0.17.1）、`syn`（2.0.119 / 3.0.5）。`multiple-versions = "warn"` のため fail しない
+- `icu_normalizer_data` は直接 pin せず、`Cargo.lock`（2.3.0）と CI の `--locked` で固定する。直接 pin は承認範囲外のため、必要ならオーナーの判断を仰ぐ
+- ビルド再現性の前提: `icu_collator_data` の `build.rs` はビルド時に環境変数 `ICU4X_DATA_DIR` があると別データへ差し替える。CI・release・開発環境で設定しないこと
+- `ja` などのロケール指定 Collator の構築には `icu_locale_core` の直接依存が要るため、#2190 で決定事項 5 の再承認が必要になる見込み
+- 導入確認として `crates/engine/tests/icu_collator_smoke.rs` を追加した（root 照合の構築と自明な順序のみ。意味論は #2190）

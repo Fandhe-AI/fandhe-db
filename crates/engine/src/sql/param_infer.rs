@@ -239,6 +239,8 @@ impl Inferrer<'_> {
             Expr::Coalesce(args) => self.sibling_type(args.iter()),
             Expr::NullIf(a, b) => self.sibling_type([a.as_ref(), b.as_ref()].into_iter()),
             Expr::Null => Ty::Untyped,
+            // 照合指定（TABLE-28・Issue #1609）は内側の式と同じ型。
+            Expr::Collate { expr, .. } => self.type_of(expr),
             // jsonb パス演算子（Issue #1596）。`->>`／`#>>` は text、`->`／`#>` は
             // jsonb（`$n` の型付け対象外）なので型なしとして扱う。
             Expr::JsonAccess { op, .. } => match op {
@@ -381,6 +383,11 @@ impl Inferrer<'_> {
                     }
                 }
             }
+            // 照合指定（TABLE-28・Issue #1609）の対象は文字列型。`$n` 単独なら TEXT と推論する。
+            Expr::Collate { expr, .. } => match as_param(expr) {
+                Some(n) => self.assign(n, Ty::Known(PreparedParamType::Text))?,
+                None => self.walk(expr)?,
+            },
             Expr::Number(_)
             | Expr::String(_)
             | Expr::Ident(_)

@@ -18,6 +18,7 @@ wire 側（`crates/wire-server/src/extended_query.rs`）の Parse／Describe(S)�
   `VectorText`、`USING PLAN($n)`／`USING OPERATION_ID $n` は `Text`、`WHERE <列> = $n`
   ・`INSERT` の行内 ordinal は当該列の型、未参照番号は `Text`）で補う。
   pgjdbc が文字列に varchar（1043）を宣言する点を踏まえ、宣言 OID の不一致は拒否しない。
+  （この 2 点は WIRE-24 の確定〔#2436〜#2438〕をもって、後述「Parse の型 OID 指定時の判定規則」（WIRE-24 ポインタ）で置き換える予定）
 - 宣言件数がプレースホルダ数を超える Parse は `08P01`（PostgreSQL は受理するが、
   fail-closed な逸脱）。
 - Bind: 値数が要求数と異なれば `08P01`。パラメータ format code は 0・1 以外を `08P01`。
@@ -28,7 +29,7 @@ wire 側（`crates/wire-server/src/extended_query.rs`）の Parse／Describe(S)�
   `BOOLEAN` は 16、`BYTEA` は 17、`UUID` は 2950、`id` は宣言 23／20 のみ）に載る組み合わせに限り、
   PostgreSQL の暗黙キャストより意図的に厳しい fail-closed とする。非対応スロット
   （`NUMERIC`・日時・`JSON`・配列・`ENUM`・`VECTOR`・宣言 0 の `id` 等）への binary 指定は
-  `0A000`、値の長さが固定長型の受信形式と合わなければ `08P01`（値は応答に含めない）。判定順は
+  `0A000`（Parse 時の `0A000` とは別の意味。WIRE-24 参照）、値の長さが固定長型の受信形式と合わなければ `08P01`（値は応答に含めない）。判定順は
   「全スロットの非対応判定（`0A000`）→ 復号（`08P01`）」で、復号後の値で保持量上限を判定する。
 - 値の形式不正（非 UTF-8・NUL）は `22P02` へ移行した（従来 `22000`）。NULL は据え置き
   `22000`。
@@ -207,10 +208,27 @@ prepared_params.rs` で固定）。
   （`BOOLEAN`・`DATE`・`TIMESTAMP`・`NUMERIC` 等）の `$n` は、式の中では置換後のリテラルがその型として
   束縛されないため `0A000` で fail-closed にする
 - エラー文言には `$n` の番号だけを含める（値・表の存在情報は含めない）
-- 既知の PG 差分: Parse の宣言 OID は engine に渡らないため、宣言があっても推論不能なら `42P18`。
+- 既知の PG 差分: Parse の宣言 OID は engine に渡らないため、宣言があっても推論不能なら `42P18`（#2436・#2437 で解消予定。後述「Parse の型 OID 指定時の判定規則」参照）。
   小数リテラルとの演算は `DOUBLE`（PG は numeric）。`-$1` は `0 - $1` に脱糖されるため
   `INTEGER`（PG では曖昧）。`INSERT ... VALUES` の `-$1` に負の実値を Bind すると `- -n` となり
   `42601` で fail-closed（既存の二重マイナス拒否と同じ契約）。`ON CONFLICT ... DO UPDATE SET` の式と `$n` は別担当（`42601` のまま）
+
+## Parse の型 OID 指定時の判定規則（Issue #2434・#2435。TASK-337・WIRE-24 ポインタ）
+
+ステータス: 設計記録の追記（判定規則の確定は spec 側のビヘイビア WIRE-24 が SSOT）。
+本節はポインタ表記のみで、判定の詳細は spec 本文を参照する（転記しない）。
+
+- Parse で 0 以外の型 OID が宣言された場合の判定は WIRE-24 に従う。関連: WIRE-12・WIRE-13・
+  WIRE-14、SQL-41・SQL-45・SQL-47、ERR-6。
+- 実装の分担: #2436（OID の公告・復号）・#2437（変換可否。#1588 に依存）・#2438（持たない型の拒否）・
+  #2439（NULL）・#2440（テスト）。
+- 「持つ型」の単一情報源は `crates/wire-server/src/result_encoder.rs` の `WireType::ALL` とし、
+  第 2 の表を作らない。
+- OID 0（未宣言を含む）の推論と公告は変えない。拒否時は ErrorResponse を返して同期回復し、
+  接続は維持する（WIRE-11 の既存経路）。
+- 新しい `wire_code` は追加せず、既存の `ErrorClass` と HTTP 射影を使う。エラー文には値・
+  表の存在情報を含めず、テナント境界を越える情報を返さない。
+- 既存テストが固定している寛容な挙動の更新は #2436・#2437 の担当が行う（削除・弱体化はしない）。
 
 ## 値の形式（型付き置換。Issue #1342）
 
@@ -259,6 +277,8 @@ prepared_params.rs` で固定）。
   既存の `bind_insert`（Bind 後）が判定する。
 
 ## NULL パラメータ値
+
+> #2439（TASK-337・WIRE-24 ポインタ）で本節を置き換える予定。
 
 `decode_bind_values` は `None`（SQL NULL）を一律 `22000` で拒否する（本
 バージョンのスコープ外）。したがって `USING OPERATION_ID $n` の `$n` に
@@ -313,6 +333,8 @@ prepared_params.rs` で固定）。
   大きい浮動小数の `WHERE` 比較がリテラル形でも `22003` になる点は式評価側の既存挙動。
 - 非 text スロットで宣言 OID 0 のバイナリ値を UTF-8 恒等で受理していた点は Issue #1345 で
   解消済み。
+- TASK-337 の分担: #2436 OID の公告・復号、#2437 変換可否（#1588 に依存）、#2438 `0A000`、
+  #2439 NULL、#2440 層 A/B。OID 705 の扱いは #2436 で確認し #2440 の層 B で最終確認する。
 - NULL パラメータ値の意味論的な位置別処理（`USING OPERATION_ID $n` へ NULL を
   「省略と同義」として通す等）。
 - 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較・`ON CONFLICT ... SET`・

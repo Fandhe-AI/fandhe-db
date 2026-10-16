@@ -195,7 +195,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2304（型名エイリアス BOOL・FLOAT の予約名追加。`catalog.rs` に行が追加）で一括追随（+3 行。旧: 8568/8649/8788/8821）。
     // Issue #1563（VARCHAR(n)／CHAR(n) の宣言。`catalog.rs` に行が追加）で一括追随（+65 行。旧: 8680/8761/8900/8933）。
     // Issue #1569（TIME 列の codec・DEFAULT 型タグ許容。`catalog.rs` に行が追加）で一括追随（+23 行。旧: 9124/9205/9344/9377）。
-    ("catalog.rs", 9148),
+    ("catalog.rs", 9299),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -254,7 +254,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1364（名前付き主キー・カタログ v13。`catalog.rs` に行が追加）で追随（旧: 7892）。
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8356）。
     // Issue #1427（CHECK 参照列の拡大変換受理。`catalog.rs` に行が追加）で追随（旧: 8476）。
-    ("catalog.rs", 9229),
+    ("catalog.rs", 9380),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -306,7 +306,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8459）。
     // Issue #1427（CHECK 参照列の拡大変換受理。`catalog.rs` に行が追加）で追随（旧: 8607）。
     // Issue #1436（連鎖本文の式述語の保留・再検証。`catalog.rs` に行が追加）で追随（旧: 8670）。
-    ("catalog.rs", 9368),
+    ("catalog.rs", 9519),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -363,7 +363,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8492）。
     // Issue #1427（CHECK 参照列の拡大変換受理。`catalog.rs` に行が追加）で追随（旧: 8640）。
     // Issue #1436（同上）で追随（旧: 8703）。
-    ("catalog.rs", 9401),
+    ("catalog.rs", 9552),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_

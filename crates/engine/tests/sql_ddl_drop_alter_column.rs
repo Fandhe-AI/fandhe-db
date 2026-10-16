@@ -370,13 +370,29 @@ fn unsupported_qualifiers_are_rejected_with_42601() {
         "ALTER TABLE docs ALTER amount TYPE NUMERIC(9,2)",
         "ALTER TABLE docs ALTER COLUMN amount SET DATA TYPE NUMERIC(9,2)",
         "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING amount",
-        "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) COLLATE x",
         "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2), ALTER COLUMN qty TYPE BIGINT",
         "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) RETURNING id",
         "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2); SELECT 1",
     ] {
         assert_eq!(code_of(&core, &mut session, sql), "42601", "{sql}");
     }
+}
+
+/// TABLE-28・Issue #1609: `COLLATE` は構文対応済み。未知の照合名は `42704`（照合名の
+/// 解決が型の可否判定〔`42804`〕より先）。以前は `42601` で拒否していた。
+#[test]
+fn alter_type_with_unknown_collation_is_rejected_with_42704() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    assert_eq!(
+        code_of(
+            &core,
+            &mut session,
+            "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) COLLATE x"
+        ),
+        "42704"
+    );
 }
 
 #[test]

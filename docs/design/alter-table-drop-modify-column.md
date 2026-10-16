@@ -200,9 +200,10 @@ SQL 表層への結線は、TASK-202 の DDL 許可リスト・権限ゲート�
 SQL-23・ERR-6・NOSQL-13）。
 
 - **構文（許可リスト）**: `ALTER TABLE <t> DROP COLUMN <c>`・
-  `ALTER TABLE <t> ALTER COLUMN <c> TYPE <型名>` のみ。`COLUMN` 省略・
+  `ALTER TABLE <t> ALTER COLUMN <c> TYPE <型名> [COLLATE <名前>]` のみ（`COLLATE` は
+  TABLE-28・Issue #1609 で追加。未知の照合名は `42704`、照合を持てない型は `42804`）。`COLUMN` 省略・
   `IF EXISTS`・`ONLY`・`CASCADE`／`RESTRICT`・`SET DATA TYPE`・`USING`・
-  `COLLATE`・複数アクション・`RETURNING`・`USING OPERATION_ID` はいずれも `42601`。
+  複数アクション・`RETURNING`・`USING OPERATION_ID` はいずれも `42601`。
   予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`。大文字小文字
   無視）は構造検証段で `42601`（カタログ非照会のため存在オラクルにならない）。
 - **判定順序**: 構文検証 → DDL 権限ゲート（`42501`）→ テーブル存在確認
