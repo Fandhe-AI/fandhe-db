@@ -1180,6 +1180,10 @@ pub struct EngineCore {
     /// [`Self::with_group_by_limits`] のみ（起動時 1 回）。集計の実行段
     /// （単一表・集合演算枝・サブクエリ内側・ビュー外側・JOIN）にだけ効く。
     group_by_limits: crate::group_by_limits::GroupByLimits,
+    /// jsonpath 評価のステップ数・再帰深さの上限（Issue #2184・TABLE-25 ポインタ）。
+    /// 差し替えは [`Self::with_jsonpath_limits`] のみ（起動時 1 回）。評価器の呼び出し側
+    /// （SQL 表層の `jsonb_path_*`。Issue #2185 以降）が参照するまでは getter のみの利用。
+    jsonpath_limits: crate::jsonpath_limits::JsonPathLimits,
     /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限（Issue #1552）。
     /// 差し替えは [`Self::with_nesting_limits`] のみ（起動時 1 回）。構文解析段と
     /// サブクエリ解決段にだけ効き、格納済みビュー本文の再パースはハード上限のまま。
@@ -2180,6 +2184,7 @@ impl EngineCore {
             schema_limits: crate::schema_limits::SchemaLimits::default(),
             scan_limits: crate::scan_limits::ScanLimits::default(),
             group_by_limits: crate::group_by_limits::GroupByLimits::default(),
+            jsonpath_limits: crate::jsonpath_limits::JsonPathLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             join_limits: crate::join_limits::JoinSizeLimits::default(),
             result_limits: crate::result_limits::ResultLimits::default(),
@@ -2449,6 +2454,20 @@ impl EngineCore {
     /// 現在の `GROUP BY` 上限（Issue #1550）。
     pub fn group_by_limits(&self) -> crate::group_by_limits::GroupByLimits {
         self.group_by_limits
+    }
+
+    /// jsonpath 評価のステップ数・再帰深さ上限（[`crate::jsonpath_limits::JsonPathLimits`]）を
+    /// 差し替えたビルダーを返す（Issue #2184）。`wire-server` の起動時 CLI フラグ
+    /// （`--max-jsonpath-steps`・`--max-jsonpath-depth`）からのみ呼ぶ。未呼び出しなら
+    /// ハード上限と同値の既定。
+    pub fn with_jsonpath_limits(mut self, limits: crate::jsonpath_limits::JsonPathLimits) -> Self {
+        self.jsonpath_limits = limits;
+        self
+    }
+
+    /// 現在の jsonpath 評価上限（Issue #2184）。
+    pub fn jsonpath_limits(&self) -> crate::jsonpath_limits::JsonPathLimits {
+        self.jsonpath_limits
     }
 
     /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限
