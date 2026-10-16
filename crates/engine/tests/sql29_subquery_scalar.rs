@@ -760,3 +760,32 @@ fn scalar_subquery_stays_rejected_in_non_subquery_contexts() {
         .expect("unparameterized scalar subquery must be accepted");
     assert_eq!(prepared.param_count(), 0);
 }
+
+/// Issue #2270 回帰（PR #2463 レビュー指摘）: 非 0 scale の numeric 投影を DOUBLE／BIGINT 列の
+/// `IN`／`NOT IN (SELECT ...)` で比較できる。集計の内側は `IN` では従来から `42601`。
+#[test]
+fn in_subquery_accepts_scaled_numeric_for_double_and_bigint_targets() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    ins(&core, &ctx, REFS, 1, &[("price", "'3.00'")]);
+    ins(&core, &ctx, REFS, 2, &[("price", "'2.50'")]);
+    ins(&core, &ctx, ITEMS, 1, &[("ratio", "3.0"), ("qty", "3")]);
+    ins(&core, &ctx, ITEMS, 2, &[("ratio", "2.5"), ("qty", "4")]);
+    ins(&core, &ctx, ITEMS, 3, &[("ratio", "9.0"), ("qty", "9")]);
+    let q = |col: &str, op: &str| {
+        format!("SELECT id FROM {ITEMS} WHERE {col} {op} (SELECT price FROM {REFS} LIMIT 100) LIMIT 100")
+    };
+    assert_eq!(ids(&core, &ctx, &q("ratio", "IN")), vec![1, 2]);
+    assert_eq!(ids(&core, &ctx, &q("ratio", "NOT IN")), vec![3]);
+    // 2.50 は整数列のどの値とも一致しない。3.00 は 3 と一致する。
+    assert_eq!(ids(&core, &ctx, &q("qty", "IN")), vec![1]);
+    assert_eq!(ids(&core, &ctx, &q("qty", "NOT IN")), vec![2, 3]);
+    // 集計を内側に置く IN は従来どおり 42601。
+    let (code, _) = err_code(
+        &core,
+        &ctx,
+        &format!("SELECT id FROM {ITEMS} WHERE ratio IN (SELECT AVG(qty) FROM {REFS}) LIMIT 100"),
+    );
+    assert_eq!(code, "42601");
+}

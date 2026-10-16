@@ -1225,7 +1225,14 @@ fn cmp_decimal_to_literal(d: &crate::numeric::Decimal, literal: f64) -> std::cmp
         };
     }
     // Rust の `Display` は f64 を指数表記にしない（長さは高々 ~330 文字）。
-    let parsed = crate::numeric::parse_literal_exact(&format!("{literal}"));
+    // 整数値のリテラルは最短往復表現が桁を丸める（2^63 → "9223372036854776000"）ため、
+    // 厳密な 10 進展開（`{:.0}`）で読み直す。非整数は最短往復表現（0.1 を 0.1 と読む）を使う。
+    let text = if literal.fract() == 0.0 {
+        format!("{literal:.0}")
+    } else {
+        format!("{literal}")
+    };
+    let parsed = crate::numeric::parse_literal_exact(&text);
     match parsed {
         Ok(lit) => crate::numeric::cmp_exact(d, &lit),
         Err(_) if literal.abs() >= 1.0 => {
@@ -3159,6 +3166,15 @@ mod tests {
             BinOp::Gt,
             1.5
         ));
+    }
+
+    #[test]
+    fn having_matches_numeric_large_integer_literal_is_exact() {
+        // 2^63 は f64 で厳密に表せるが最短往復表現は丸められる（回帰: codex P1）。
+        let d = Cell::Numeric(
+            crate::numeric::Decimal::from_parts(9_223_372_036_854_775_808, 0).unwrap(),
+        );
+        assert!(having_matches(&d, BinOp::Eq, 9_223_372_036_854_775_808.0));
     }
 
     #[test]

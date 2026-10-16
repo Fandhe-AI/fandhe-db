@@ -1116,15 +1116,15 @@ fn validate_in_target_column<'a>(
 }
 
 /// `IN`／`NOT IN` の内側投影列が対象列の値族と比較可能か。値族の完全一致に加え、
-/// scale 0 の `NUMERIC`（`SUM(BIGINT)` 等。Issue #2271）は整数・浮動小数列の対象と
-/// 比較できる（PostgreSQL と同じ。従来受理していた比較を `SUM` の戻り値型変更で
+/// 任意 scale の `NUMERIC`（`SUM(BIGINT)`〔Issue #2271〕・整数 `AVG`〔Issue #2270〕等）は
+/// 整数・浮動小数列の対象と比較できる（PostgreSQL と同じ。従来受理していた比較を `SUM` の戻り値型変更で
 /// 拒否しない）。実行時のセル取り出しは [`resolve_in_subquery`] が担う。
 fn in_family_compatible(inner_meta: &ColumnMeta, family: SubqueryValueFamily) -> bool {
     inner_value_family(inner_meta) == Some(family)
         || (matches!(
             family,
             SubqueryValueFamily::Integer | SubqueryValueFamily::Float
-        ) && is_scale0_numeric_meta(inner_meta))
+        ) && is_numeric_meta(inner_meta))
 }
 
 /// `IN` の内側投影列と対象列の値族不一致の静的エラー（`resolve_in_subquery` 用）。
@@ -1262,6 +1262,16 @@ fn resolve_in_subquery(
                 // scale 0 の numeric（`SUM(BIGINT)`。Issue #2271）は `i128` の厳密値として
                 // 保持し、`i64` 超でも誤った一致・不一致を出さない。
                 Cell::Numeric(d) if d.scale() == 0 => ints.push(d.unscaled()),
+                // 小数部を持つ numeric（整数 `AVG`。Issue #2270）: 小数部が 0 なら整数として
+                // 厳密に照合し、非 0 なら整数列のどの値とも等しくないため集合へ入れない。
+                Cell::Numeric(d) => {
+                    let div = 10i128.checked_pow(u32::from(d.scale()));
+                    if let Some(div) = div {
+                        if d.unscaled() % div == 0 {
+                            ints.push(d.unscaled() / div);
+                        }
+                    }
+                }
                 _ => return Err(unexpected_cell_type()),
             },
             SubqueryValueFamily::Float => match cell {
@@ -1278,8 +1288,9 @@ fn resolve_in_subquery(
                 }
                 // scale 0 の numeric（Issue #2271）は float8 へ写して比較する
                 // （PostgreSQL の float8 × numeric 比較と同じく numeric 側を float8 へ変換）。
-                Cell::Numeric(d) if d.scale() == 0 => {
-                    let f = d.unscaled() as f64;
+                // 任意 scale（整数 `AVG`。Issue #2270）は 10 進文字列の最近接 f64 へ写す。
+                Cell::Numeric(d) => {
+                    let f: f64 = d.to_string().parse().map_err(|_| unexpected_cell_type())?;
                     floats.push(if f == 0.0 { 0.0 } else { f });
                 }
                 _ => return Err(unexpected_cell_type()),
@@ -1738,16 +1749,6 @@ fn number_cell_text(cell: &Cell) -> Result<String, SqlSurfaceError> {
             "subquery returned a non-finite number",
         )),
         _ => Err(unexpected_cell_type()),
-    }
-}
-
-/// 内側投影列が scale 0 の `NUMERIC`（`SUM(BIGINT)` 等。整数として厳密に扱える）か。
-fn is_scale0_numeric_meta(meta: &ColumnMeta) -> bool {
-    match meta {
-        ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
-            matches!(ty, ColumnType::Numeric { scale: 0, .. })
-        }
-        _ => false,
     }
 }
 
