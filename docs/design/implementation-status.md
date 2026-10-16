@@ -1013,3 +1013,5 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - Issue #2189（build(engine)。TABLE-28 ポインタ）: ICU4X の `icu_collator = "=2.3.1"` と `icu_collator_data = "=2.3.0"` を `crates/engine/Cargo.toml` へ非 optional で完全固定追加した（承認記録: Issue #1608 のコメント、ADR [icu-collator-adoption.md](icu-collator-adoption.md)）。`Cargo.lock` は追加のみ。`crates/engine/tests/icu_collator_smoke.rs` で `compiled_data` による root 照合の構築を確認した。照合比較・ソートキー・`COLLATE` の受理は #2190、照合を含む索引は #2191 の対象外。
 
 - Issue #2435（docs(design)。TASK-337・WIRE-24 ポインタ。親 #2434）: [wire-extended-query-param-binding.md](wire-extended-query-param-binding.md) に「Parse の型 OID 指定時の判定規則」節をポインタ表記で追記し、置き換え予定の既存記述へ注記を入れた。新しい `wire_code` は追加しない。コード変更なし（実装は #2436〜#2438、NULL は #2439、テストは #2440）。
+
+- Issue #1573（docs(design)。TABLE-33 ポインタ。詳細は [timestamptz-tz-data-adoption.md](timestamptz-tz-data-adoption.md)）: TIMESTAMPTZ の TZ データ源として jiff（`=0.2.38`・`std`＋`tzdb-bundle-always`・`jiff-tzdb` `=0.1.9` の直接 pin）を採る承認資料を作成し、2026-10-16 にオーナーが推奨案を承認した（記録: Issue #1573 のコメント）。tzdata はバイナリ同梱（OS 参照・環境変数は不使用）、バイナリ増分は約 +0.54MB。#1574〜#1577 は本承認に基づき着手してよい。本 Issue ではコード・依存の変更なし。
