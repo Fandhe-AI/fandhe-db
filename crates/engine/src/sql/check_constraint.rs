@@ -174,6 +174,9 @@ fn render_expr(expr: &Expr) -> String {
                 collation.sql_name()
             )
         }
+        // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）。CHECK 本体は構文段が `0A000` で
+        // 拒否するため通常は到達しないが、全 variant 網羅のため往復できる形で出す。
+        Expr::SqlJsonQuery(q) => render_sql_json_query(q),
         // jsonb パス演算子（Issue #1596）。構文段が CHECK 本体での使用を `0A000` で拒否する
         // ため通常は到達しないが、`Expr` の全 variant を網羅するため、往復できる丸括弧付きで出す。
         Expr::JsonAccess { op, lhs, rhs } => format!(
@@ -405,6 +408,53 @@ fn compare_op_str(op: crate::sql::allowlist::CompareOp) -> &'static str {
 
 /// 文字列リテラルの `'` を `''` へエスケープする（SQL 文字列リテラルの標準的な
 /// エスケープ規約。`sql::lexer` の文字列リテラル字句解析と対になる）。
+fn render_sql_json_query(q: &udf_call::SqlJsonQueryExpr) -> String {
+    use udf_call::SqlJsonBehavior;
+    let render_behavior = |b: &SqlJsonBehavior| match b {
+        SqlJsonBehavior::Error => "ERROR".to_string(),
+        SqlJsonBehavior::Null => "NULL".to_string(),
+        SqlJsonBehavior::True => "TRUE".to_string(),
+        SqlJsonBehavior::False => "FALSE".to_string(),
+        SqlJsonBehavior::Unknown => "UNKNOWN".to_string(),
+        SqlJsonBehavior::EmptyArray => "EMPTY ARRAY".to_string(),
+        SqlJsonBehavior::EmptyObject => "EMPTY OBJECT".to_string(),
+        SqlJsonBehavior::Default(e) => format!("DEFAULT {}", render_expr(e)),
+    };
+    let mut out = format!(
+        "{}({}, {}",
+        q.kind.as_str(),
+        render_expr(&q.context),
+        render_expr(&q.path)
+    );
+    if !q.passing.is_empty() {
+        let items: Vec<String> = q
+            .passing
+            .iter()
+            .map(|(n, e)| format!("{} AS {n}", render_expr(e)))
+            .collect();
+        out.push_str(&format!(" PASSING {}", items.join(", ")));
+    }
+    if let Some(r) = &q.returning {
+        out.push_str(&format!(" RETURNING {r}"));
+    }
+    if q.with_wrapper {
+        out.push_str(" WITH WRAPPER");
+    }
+    match q.keep_quotes {
+        Some(true) => out.push_str(" KEEP QUOTES"),
+        Some(false) => out.push_str(" OMIT QUOTES"),
+        None => {}
+    }
+    if let Some(b) = &q.on_empty {
+        out.push_str(&format!(" {} ON EMPTY", render_behavior(b)));
+    }
+    if let Some(b) = &q.on_error {
+        out.push_str(&format!(" {} ON ERROR", render_behavior(b)));
+    }
+    out.push(')');
+    out
+}
+
 fn escape_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
@@ -540,6 +590,18 @@ fn referenced_column_names(
             }
             Expr::Null | Expr::ValueFunction { .. } => {}
             Expr::Collate { expr, .. } => collect_idents(expr, acc),
+            Expr::SqlJsonQuery(q) => {
+                collect_idents(&q.context, acc);
+                collect_idents(&q.path, acc);
+                for (_, e) in &q.passing {
+                    collect_idents(e, acc);
+                }
+                for b in [&q.on_empty, &q.on_error].into_iter().flatten() {
+                    if let udf_call::SqlJsonBehavior::Default(e) = b {
+                        collect_idents(e, acc);
+                    }
+                }
+            }
             Expr::Case { whens, else_result } => {
                 for (cond, result) in whens {
                     collect_idents(cond, acc);
@@ -1501,6 +1563,30 @@ mod tests {
     /// （このテキストは永続化されて再パースされるため）。CHECK 述語の頂点は
     /// 常に比較の `Expr::Binary` という既存の構造的保証（`render_expression_predicate`
     /// docs 参照）に合わせ、`CASE`/`COALESCE`/`NULLIF` は比較の片辺として置く。
+    /// `SqlJsonQuery`（Issue #2187）は全句を構文どおりに出力する（`escape_literal` を通す）。
+    #[test]
+    fn render_expr_emits_sql_json_query_clauses() {
+        use crate::sql::udf_call::{Expr, SqlJsonBehavior, SqlJsonQueryExpr, SqlJsonQueryKind};
+        let q = Expr::SqlJsonQuery(Box::new(SqlJsonQueryExpr {
+            kind: SqlJsonQueryKind::Query,
+            context: Expr::Ident("d".to_string()),
+            path: Expr::String("$.a ? (@ == $v)".to_string()),
+            passing: vec![("v".to_string(), Expr::String("it's".to_string()))],
+            returning: Some("text".to_string()),
+            with_wrapper: false,
+            keep_quotes: Some(false),
+            on_empty: Some(SqlJsonBehavior::EmptyArray),
+            on_error: Some(SqlJsonBehavior::Default(Box::new(Expr::String(
+                "{}".to_string(),
+            )))),
+        }));
+        assert_eq!(
+            render_expr(&q),
+            "json_query(d, '$.a ? (@ == $v)' PASSING 'it''s' AS v RETURNING text OMIT QUOTES \
+             EMPTY ARRAY ON EMPTY DEFAULT '{}' ON ERROR)"
+        );
+    }
+
     #[test]
     fn render_expr_round_trips_case_coalesce_nullif_through_reparse() {
         use crate::sql::allowlist::{parse_check_predicate_text, WherePredicate};

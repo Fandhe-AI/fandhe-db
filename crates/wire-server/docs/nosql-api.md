@@ -1122,13 +1122,16 @@ Date: <IMF-fixdate>
 | `22015` | `INTERVAL_FIELD_OVERFLOW` | 400 | Bad Request | `INTERVAL` リテラルのフィールド値が範囲外（数値が `i64` に収まらない・単位換算や累積があふれる）。SQL 表層に加え、NoSQL の INTERVAL 列への `insert`／`update`／`filter` の文字列束縛からも到達する（型束縛は #1583 で対応）。Issue #1579 |
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
 | `22023` | `INVALID_PARAMETER_VALUE` | 400 | Bad Request | 型名の引数が範囲外（`FLOAT(p)` の精度。SQL 表層の DDL 専用で、NoSQL の `op` 語彙からは到達しない。Issue #2304） |
-| `22033` | `JSON_SUBSCRIPT_INVALID` | 400 | Bad Request | jsonpath の配列添字が不正（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
-| `22036` | `NON_NUMERIC_JSON_ITEM` | 400 | Bad Request | jsonpath の項目メソッドが数値・文字列以外に適用された、または変換が範囲外。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
-| `22038` | `SINGLETON_JSON_ITEM_REQUIRED` | 400 | Bad Request | jsonpath の算術オペランドが単一の数値でない。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
-| `22039` | `JSON_ARRAY_NOT_FOUND` | 400 | Bad Request | jsonpath の配列アクセサ・`.size()` が配列以外に適用された（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
-| `2203A` | `JSON_MEMBER_NOT_FOUND` | 400 | Bad Request | jsonpath のメンバーアクセサがキー欠落（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
-| `2203B` | `JSON_NUMBER_NOT_FOUND` | 400 | Bad Request | jsonpath の単項算術・`.abs()` 等が数値以外に適用された。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
-| `2203C` | `JSON_OBJECT_NOT_FOUND` | 400 | Bad Request | jsonpath のメンバーアクセサ・`.keyvalue()` がオブジェクト以外に適用された（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
+| `22033` | `JSON_SUBSCRIPT_INVALID` | 400 | Bad Request | jsonpath の配列添字が不正（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）・`JSON_EXISTS` 等（#2187）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
+| `22034` | `MORE_THAN_ONE_SQL_JSON_ITEM` | 400 | Bad Request | SQL/JSON 問い合わせ関数（`JSON_VALUE`・ラッパーなしの `JSON_QUERY`）が単一項目を要する位置で 2 件以上を得た。SQL 表層専用で、NoSQL の `op` 語彙からは到達しない。Issue #2187 |
+| `22035` | `NO_SQL_JSON_ITEM` | 400 | Bad Request | `ERROR ON EMPTY` 指定で path の結果が空だった。SQL 表層専用で、NoSQL の `op` 語彙からは到達しない。Issue #2187 |
+| `22036` | `NON_NUMERIC_JSON_ITEM` | 400 | Bad Request | jsonpath の項目メソッドが数値・文字列以外に適用された、または変換が範囲外。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）・`JSON_EXISTS` 等（#2187）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
+| `22038` | `SINGLETON_JSON_ITEM_REQUIRED` | 400 | Bad Request | jsonpath の算術オペランドが単一の数値でない。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）・`JSON_EXISTS` 等（#2187）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
+| `22039` | `JSON_ARRAY_NOT_FOUND` | 400 | Bad Request | jsonpath の配列アクセサ・`.size()` が配列以外に適用された（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）・`JSON_EXISTS` 等（#2187）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
+| `2203A` | `JSON_MEMBER_NOT_FOUND` | 400 | Bad Request | jsonpath のメンバーアクセサがキー欠落（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）・`JSON_EXISTS` 等（#2187）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
+| `2203B` | `JSON_NUMBER_NOT_FOUND` | 400 | Bad Request | jsonpath の単項算術・`.abs()` 等が数値以外に適用された。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）・`JSON_EXISTS` 等（#2187）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
+| `2203C` | `JSON_OBJECT_NOT_FOUND` | 400 | Bad Request | jsonpath のメンバーアクセサ・`.keyvalue()` がオブジェクト以外に適用された（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）・`JSON_EXISTS` 等（#2187）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
+| `2203F` | `SQL_JSON_SCALAR_REQUIRED` | 400 | Bad Request | `JSON_VALUE` の結果がスカラーでない（配列・オブジェクト）。SQL 表層専用で、NoSQL の `op` 語彙からは到達しない。Issue #2187 |
 | `22P02` | `INVALID_TEXT_REPRESENTATION` | 400 | Bad Request | 値の形式不正: ENUM 列の語彙外ラベル・INTEGER／BIGINT 列への小数／指数表記・BYTEA の不正 base64・NUMERIC／配列／JSON 列の形式不正（`insert`／`update`／`filter`。Issue #1187） |
 | `22P03` | `INVALID_BINARY_REPRESENTATION` | 400 | Bad Request | numeric パラメータのバイナリ受信で外部表現（符号・`dscale`・桁群）が不正。SQL 表層（拡張クエリの Bind）専用で、NoSQL の `op` 語彙からは到達しない。Issue #2443 |
 | `22P05` | `UNTRANSLATABLE_CHARACTER` | 400 | Bad Request | jsonpath リテラルに NUL 文字（`\u0000`・`\x00`）が含まれる。SQL 表層（`jsonb_path_*`）専用で、NoSQL の `op` 語彙からは到達しない。Issue #2185 |

@@ -194,13 +194,32 @@ fn where_region(tokens: &[Token]) -> Option<(usize, usize)> {
     let start = tokens
         .iter()
         .position(|t| matches!(t, Token::Keyword(crate::sql::lexer::Keyword::Where)))?;
+    // 括弧の深さ。`RETURNING`・`ON` は SQL/JSON 問い合わせ関数（`JSON_VALUE(... RETURNING text
+    // ON ERROR)` 等。Issue #2187）の句語としても括弧内に現れるため、本物の句境界（常に深さ 0）
+    // だけを境界とする。他の境界語・`ORDER`／`LIMIT` の判定は従来どおり（サブクエリ内でも境界）。
+    let mut depth: usize = 0;
     let end = tokens
         .iter()
         .enumerate()
         .skip(start + 1)
         .find_map(|(idx, t)| match t {
+            Token::Punct('(' | '[') => {
+                depth = depth.saturating_add(1);
+                None
+            }
+            Token::Punct(')' | ']') => {
+                depth = depth.saturating_sub(1);
+                None
+            }
             Token::Keyword(crate::sql::lexer::Keyword::Order)
             | Token::Keyword(crate::sql::lexer::Keyword::Limit) => Some(idx),
+            Token::Ident(name)
+                if depth > 0
+                    && (name.eq_ignore_ascii_case("RETURNING")
+                        || name.eq_ignore_ascii_case("ON")) =>
+            {
+                None
+            }
             Token::Ident(name)
                 if WHERE_CLAUSE_BOUNDARY_IDENTS
                     .iter()
@@ -1976,6 +1995,25 @@ mod tests {
             let err = positions(sql).unwrap_err();
             assert_eq!(err.wire_code(), "42601", "sql = {sql}");
         }
+    }
+
+    /// SQL/JSON 問い合わせ関数の句語（`RETURNING`・`ON`）が括弧内にあっても WHERE 領域を閉じず、
+    /// 括弧の外の本物の `RETURNING` では閉じる（Issue #2187）。
+    #[test]
+    fn where_region_ignores_returning_and_on_inside_parentheses() {
+        let tokens = tokenize_with_params(
+            "SELECT id FROM t WHERE JSON_VALUE(d, '$.a' RETURNING text NULL ON ERROR) = $1 \
+             AND lang = $2",
+        )
+        .expect("tokenize_with_params should succeed");
+        let (_, end) = where_region(&tokens).expect("WHERE region should exist");
+        assert_eq!(end, tokens.len());
+        let tokens = tokenize_with_params(
+            "DELETE FROM t WHERE JSON_EXISTS(d, '$.a' FALSE ON ERROR) AND lang = $1 RETURNING id",
+        )
+        .expect("tokenize_with_params should succeed");
+        let (_, end) = where_region(&tokens).expect("WHERE region should exist");
+        assert!(matches!(tokens.get(end), Some(Token::Ident(n)) if n == "RETURNING"));
     }
 
     #[test]

@@ -144,6 +144,19 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
         | Expr::TimestampTzLiteral { .. }
         | Expr::ValueFunction { .. } => Ok(()),
         Expr::Collate { expr, .. } => reject_non_constant_with(expr, allow_placeholders),
+        Expr::SqlJsonQuery(q) => {
+            reject_non_constant_with(&q.context, allow_placeholders)?;
+            reject_non_constant_with(&q.path, allow_placeholders)?;
+            for (_, e) in &q.passing {
+                reject_non_constant_with(e, allow_placeholders)?;
+            }
+            for b in [&q.on_empty, &q.on_error].into_iter().flatten() {
+                if let crate::sql::udf_call::SqlJsonBehavior::Default(e) = b {
+                    reject_non_constant_with(e, allow_placeholders)?;
+                }
+            }
+            Ok(())
+        }
         Expr::Ident(n) if allow_placeholders && aggregate_placeholder_index(n).is_some() => Ok(()),
         Expr::Ident(_) => Err(SqlSurfaceError::ColumnReferenceWithoutFrom),
         Expr::Call { name, args } => {

@@ -248,6 +248,9 @@ impl Inferrer<'_> {
             Expr::Null => Ty::Untyped,
             // 照合指定（TABLE-28・Issue #1609）は内側の式と同じ型。
             Expr::Collate { expr, .. } => self.type_of(expr),
+            // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）。`jsonb_path_*` と同じく `$n` の
+            // 型付け対象外（boolean 用の `PreparedParamType` が無く、RETURNING で型が変わるため）。
+            Expr::SqlJsonQuery(_) => Ty::Untyped,
             // jsonb パス演算子（Issue #1596）。`->>`／`#>>` は text、`->`／`#>` は
             // jsonb（`$n` の型付け対象外）なので型なしとして扱う。
             Expr::JsonAccess { op, .. } => match op {
@@ -399,6 +402,22 @@ impl Inferrer<'_> {
                 Some(n) => self.assign(n, Ty::Known(PreparedParamType::Text))?,
                 None => self.walk(expr)?,
             },
+            // SQL/JSON 問い合わせ関数の部分式の `$n` は型を導けない（`Untyped`＝不定）。
+            Expr::SqlJsonQuery(q) => {
+                let mut children: Vec<&Expr> = vec![&q.context, &q.path];
+                children.extend(q.passing.iter().map(|(_, e)| e));
+                for b in [&q.on_empty, &q.on_error].into_iter().flatten() {
+                    if let crate::sql::udf_call::SqlJsonBehavior::Default(e) = b {
+                        children.push(e);
+                    }
+                }
+                for e in children {
+                    match as_param(e) {
+                        Some(n) => self.assign(n, Ty::Untyped)?,
+                        None => self.walk(e)?,
+                    }
+                }
+            }
             Expr::Number(_)
             | Expr::String(_)
             | Expr::Ident(_)

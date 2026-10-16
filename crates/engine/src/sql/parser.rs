@@ -1461,6 +1461,8 @@ fn bind_ranking(
 pub(crate) fn default_expr_alias(expr: &Expr) -> String {
     match expr {
         Expr::Call { name, .. } => name.clone(),
+        // SQL/JSON 問い合わせ関数の既定列名は PostgreSQL と同じ小文字の関数名（Issue #2187）。
+        Expr::SqlJsonQuery(q) => q.kind.as_str().to_string(),
         // PostgreSQL にならった既定エイリアス（対象ビヘイビア: SQL-26。
         // Issue #921）。
         Expr::Case { .. } => "case".to_string(),
@@ -7474,6 +7476,11 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
         Expr::Null | Expr::ValueFunction { .. } => {}
         // 照合指定（TABLE-28・Issue #1609）は内側の式の列参照を集める。
         Expr::Collate { expr, .. } => collect_expr_idents(expr, out),
+        Expr::SqlJsonQuery(q) => {
+            for c in q.children() {
+                collect_expr_idents(c, out);
+            }
+        }
         Expr::Case { whens, else_result } => {
             for (cond, result) in whens {
                 collect_expr_idents(cond, out);
@@ -8141,6 +8148,7 @@ fn rewrite_group_row_idents(
             expr: Box::new(rec(expr)?),
             collation: *collation,
         },
+        Expr::SqlJsonQuery(q) => Expr::SqlJsonQuery(Box::new(q.try_map_children(&mut |e| rec(e))?)),
     })
 }
 
