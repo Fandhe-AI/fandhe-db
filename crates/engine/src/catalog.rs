@@ -1244,6 +1244,8 @@ const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &[
     // Issue #1569（TABLE-32）。`TIME`・`TIMETZ` は型名解決表の語。
     "time",
     "timetz",
+    // Issue #1574（TABLE-33）。`TIMESTAMPTZ` は型名解決表の語。
+    "timestamptz",
 ];
 
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、
@@ -1700,6 +1702,12 @@ pub enum ColumnType {
     /// 整形は [`crate::datetime`] へ委譲する。述語・集計・索引・EXTRACT は Issue #1570 で
     /// 解禁済み。PK・UNIQUE・型変更は担当 Issue 未定のため fail-closed。
     Time,
+    /// 時刻付き timestamp 列（`TIMESTAMPTZ`／`TIMESTAMP WITH TIME ZONE`、TABLE-33・
+    /// Issue #1574）。内部表現は UTC の 1970-01-01 起点マイクロ秒（`i64`。受理範囲は
+    /// `TIMESTAMP` と同じ `0001-01-01`〜`9999-12-31`〔UTC〕）。カタログタグは
+    /// `timestamptz`・param は `-` 固定。値の解析・整形は [`crate::datetime`] へ委譲する。
+    /// PK・UNIQUE・索引・述語・集計は #1576 まで fail-closed。
+    TimestampTz,
     /// 可変長の同型スカラー配列列（`<スカラー型>[]`、TABLE-14・TASK-198、Issue #888）。
     /// 要素型・要素数上限は [`ArrayType`] が保持する。検索経路（KNN・hybrid・ANN・
     /// 二次索引・`EXPLAIN`）からは一貫して非対象として除外する（`VECTOR` 列との
@@ -1908,6 +1916,8 @@ impl ColumnType {
             // `Time` は PK／UNIQUE 非許可（Issue #1569。担当 Issue 未定の fail-closed）。到達しない契約の
             // ため `Vector` と同じ番兵 0 を返し、呼び出し元（`constraint.rs`）が拒否する。
             ColumnType::Time => 0,
+            // `TimestampTz` も PK／UNIQUE 非許可（Issue #1574。担当 Issue 未定の fail-closed）。
+            ColumnType::TimestampTz => 0,
             ColumnType::Bytea => 7,
             ColumnType::Uuid => 8,
             ColumnType::Enum(_) => 9,
@@ -1946,6 +1956,7 @@ impl ColumnType {
             ColumnType::Date => ("date", "-".to_string()),
             ColumnType::Timestamp => ("timestamp", "-".to_string()),
             ColumnType::Time => ("time", "-".to_string()),
+            ColumnType::TimestampTz => ("timestamptz", "-".to_string()),
             ColumnType::Array(array_ty) => ("array", array_ty.catalog_param()),
             ColumnType::Bytea => ("bytea", "-".to_string()),
             ColumnType::Json => ("json", "-".to_string()),
@@ -2074,6 +2085,14 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::Time)
+            }
+            "timestamptz" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "timestamptz column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::TimestampTz)
             }
             "array" => Ok(ColumnType::Array(parse_array_param(param, resolve_enum)?)),
             "bytea" => {
@@ -3397,6 +3416,7 @@ impl ColumnDefault {
                     | ColumnType::Date
                     | ColumnType::Timestamp
                     | ColumnType::Time
+                    | ColumnType::TimestampTz
                     | ColumnType::Uuid
                     | ColumnType::Enum(_)
                     | ColumnType::Json
@@ -3568,11 +3588,11 @@ pub struct ColumnDef {
     /// 使うため、作成後に変わらないこと（`ALTER COLUMN SET DEFAULT` を導入する場合は
     /// 補完専用の値の分離が必要）が不変条件。
     pub default: Option<ColumnDefault>,
-    /// 列に明示した照合（`COLLATE "C"`／`"POSIX"`。TABLE-28・Issue #1609）。`None` は
-    /// 「照合指定なし」で、明示した `C`／`POSIX` とは区別して保存する。付けられるのは
-    /// [`crate::collation::is_collatable`] な型だけ（encode・decode 両側で fail-closed に
-    /// 検査する）。本 Issue では解析と保存のみで、比較・ソート・索引キーの意味論は変えない
-    /// （#1610・#2190・#2191）。
+    /// 列に明示した照合（`COLLATE "C"`／`"POSIX"`／`"und-x-icu"`／`"ja-x-icu"`。TABLE-28・
+    /// Issue #1609・#2190）。`None` は「照合指定なし」で、明示した `C`／`POSIX` とは区別して
+    /// 保存する。付けられるのは [`crate::collation::is_collatable`] な型だけ（encode・decode
+    /// 両側で fail-closed に検査する）。比較・ソートへの反映は `sql` 層が行い（#1610・#2190）、
+    /// 照合込みの索引は #2191。
     pub collation: Option<crate::collation::Collation>,
 }
 
@@ -4377,6 +4397,7 @@ impl TableSchema {
             | ColumnType::Date
             | ColumnType::Timestamp
             | ColumnType::Time
+            | ColumnType::TimestampTz
             | ColumnType::Bytea
             | ColumnType::Json
             | ColumnType::Jsonb

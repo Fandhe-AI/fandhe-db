@@ -403,6 +403,11 @@ pub fn map_json_to_literal(
                 "TIME column value must be a JSON string",
             )),
         },
+        // TIMESTAMPTZ の NoSQL 型束縛は OID 1184 の公告と同時に対応する（#1577）。それまでは
+        // fail-closed で拒否する（Issue #1574）。
+        ColumnType::TimestampTz => Err(TypedJsonError::TypeMismatch(
+            "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
+        )),
         // SMALLINT は INTEGER／BIGINT と同じ規則で束縛し、範囲検査は engine の
         // `bind_integer_literal` に一本化する（TABLE-30・NOSQL-17・Issue #1561）。
         ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => match raw {
@@ -602,6 +607,18 @@ mod tests {
             map_json_to_literal(&col(ColumnType::Text), &JsonValue::Null).expect_err("reject");
         assert!(matches!(err, TypedJsonError::LegacyMismatch(_)));
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// TIMESTAMPTZ の NoSQL 型束縛は #1577 まで fail-closed（値を束縛せず `42601` で拒否する）。
+    #[test]
+    fn timestamptz_column_is_rejected_until_nosql_binding_lands() {
+        let err = map_json_to_literal(
+            &col(ColumnType::TimestampTz),
+            &JsonValue::String("2026-01-01 00:00:00Z".to_string()),
+        )
+        .expect_err("reject");
+        assert!(matches!(err, TypedJsonError::TypeMismatch(_)));
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]

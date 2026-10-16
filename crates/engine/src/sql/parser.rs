@@ -596,6 +596,7 @@ pub(crate) fn bind_integer_literal(
         | ColumnType::Date
         | ColumnType::Timestamp
         | ColumnType::Time
+        | ColumnType::TimestampTz
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -713,6 +714,31 @@ pub(crate) fn bind_datetime_literal(
                 )))
             }
         },
+        // TIMESTAMPTZ 列（TABLE-33・Issue #1574）。UTC のマイクロ秒へ正規化して束縛する。
+        // TZ の無い入力はセッション TimeZone で解釈するが、セッション値の保持は #1575 の担当の
+        // ため、本 Issue では UTC 固定（`SessionTimeZone::utc()`）。書式違反 `22007`・範囲外
+        // `22008`・未知の TZ 名 `22023`（detail は静的文字列で入力を反射しない）。
+        ColumnType::TimestampTz => {
+            use crate::datetime::{DateTimeLiteralError, SessionTimeZone, TimestampTzLiteralError};
+            match crate::datetime::parse_timestamptz(literal, &SessionTimeZone::utc()) {
+                Ok(micros) => Ok(crate::row_codec::Value::TimestampTz(micros)),
+                Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Format(detail))) => {
+                    Err(SqlSurfaceError::invalid_datetime_format(format!(
+                        "column {column_name:?}: {detail}"
+                    )))
+                }
+                Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Overflow(detail))) => {
+                    Err(SqlSurfaceError::datetime_field_overflow(format!(
+                        "column {column_name:?}: {detail}"
+                    )))
+                }
+                Err(TimestampTzLiteralError::UnknownTimeZone) => {
+                    Err(SqlSurfaceError::InvalidParameterValue {
+                        detail: "time zone not recognized",
+                    })
+                }
+            }
+        }
         ColumnType::Text
         | ColumnType::Varchar(_)
         | ColumnType::Bpchar(_)
@@ -1070,6 +1096,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             | ColumnType::Date
             | ColumnType::Timestamp
             | ColumnType::Time
+            | ColumnType::TimestampTz
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
@@ -1122,6 +1149,7 @@ pub(crate) fn text_column_index(
                 | ColumnType::Date
                 | ColumnType::Timestamp
                 | ColumnType::Time
+                | ColumnType::TimestampTz
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
@@ -2806,6 +2834,7 @@ pub(crate) fn bind_column_default(
             ScalarRef::Uuid(u) => Ok(Value::Uuid(u)),
             ScalarRef::Timestamp(t) => Ok(Value::Timestamp(t)),
             ScalarRef::Time(t) => Ok(Value::Time(t)),
+            ScalarRef::TimestampTz(t) => Ok(Value::TimestampTz(t)),
             ScalarRef::Json(j) => Ok(Value::Json(j.to_string())),
             _ => Err(SqlSurfaceError::invalid_input(format!(
                 "column {:?} DEFAULT is not compatible with its type",
@@ -2844,6 +2873,9 @@ pub(crate) fn bind_column_default(
                 column.name
             )))
         }
+        Err(DefaultBindError::UnknownTimeZone) => Err(SqlSurfaceError::InvalidParameterValue {
+            detail: "time zone not recognized",
+        }),
         Err(DefaultBindError::Incompatible) => Err(SqlSurfaceError::invalid_input(format!(
             "column {:?} DEFAULT is not compatible with its type",
             column.name
@@ -3039,12 +3071,23 @@ fn bind_insert_row(
             (ColumnType::Time, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Time, s)?
             }
+            (ColumnType::TimestampTz, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::TimestampTz, s)?
+            }
             (
                 ColumnType::Time,
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a TIME literal (HH:MM:SS)"
+                )))
+            }
+            (
+                ColumnType::TimestampTz,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a TIMESTAMPTZ literal (YYYY-MM-DD HH:MM:SS[+TZ])"
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -3196,6 +3239,7 @@ pub(crate) fn bind_json_literal(
         | ColumnType::Date
         | ColumnType::Timestamp
         | ColumnType::Time
+        | ColumnType::TimestampTz
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -3504,12 +3548,23 @@ fn bind_set_assignments(
             (ColumnType::Time, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Time, s)?
             }
+            (ColumnType::TimestampTz, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::TimestampTz, s)?
+            }
             (
                 ColumnType::Time,
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a TIME literal (HH:MM:SS)"
+                )))
+            }
+            (
+                ColumnType::TimestampTz,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a TIMESTAMPTZ literal (YYYY-MM-DD HH:MM:SS[+TZ])"
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -4664,9 +4719,17 @@ fn bind_upsert_assignments(
                     (ColumnType::Time, InsertLiteral::String(s)) => {
                         bind_datetime_literal(name, ColumnType::Time, s)?
                     }
+                    (ColumnType::TimestampTz, InsertLiteral::String(s)) => {
+                        bind_datetime_literal(name, ColumnType::TimestampTz, s)?
+                    }
                     (ColumnType::Time, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a TIME literal (HH:MM:SS)"
+                        )))
+                    }
+                    (ColumnType::TimestampTz, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a TIMESTAMPTZ literal (YYYY-MM-DD HH:MM:SS[+TZ])"
                         )))
                     }
                     (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -4879,6 +4942,11 @@ fn bind_file_insert(
                     "column {name:?}: TIME column is not supported for file-form INSERT"
                 )))
             }
+            (ColumnType::TimestampTz, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: TIMESTAMPTZ column is not supported for file-form INSERT"
+                )))
+            }
             // 配列列（TABLE-14・Issue #888）も BOOLEAN と同じく対象外として拒否する。
             (ColumnType::Array(_), _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -5010,6 +5078,13 @@ pub(crate) enum AggregateInput {
     /// `MIN`/`MAX`（バイト順・NULL 無視）でのみ使う（`SUM`/`AVG` は
     /// [`resolve_aggregate_input`] が型不整合として拒否済み）。
     TextColumn(usize),
+    /// 照合がバイト列順でない `TEXT` 列（または `COLLATE` で非バイト列順の照合を明示した列）の
+    /// `MIN`/`MAX`（TABLE-28・Issue #2190）。累積器が `collation` の比較器で極値を選ぶ。
+    /// バイト列順の照合は従来どおり [`AggregateInput::TextColumn`]。`COUNT` には使わない。
+    CollatedTextColumn {
+        index: usize,
+        collation: crate::collation::Collation,
+    },
     /// `INTEGER` 列の裸の列参照（`schema.columns` の添字）。`COUNT`/`SUM`/
     /// `AVG`/`MIN`/`MAX` のすべてで使う（TABLE-13・TASK-196、Issue #881・
     /// #892）。`SUM` の結果は `i128` 累積・確定時に `i64` へ収まるか検査する
@@ -5462,8 +5537,22 @@ impl BoundAggregate {
         }
         let mut order_by = Vec::with_capacity(keys.len());
         for key in keys {
+            let target = resolve_group_reference(&key_names, &[], &self.items, &key.column)?;
+            // 集計結果（`Cell`）の ORDER BY は項目の照合を運ばずバイト列順で比較するため、
+            // 非バイト列順の照合の MIN/MAX を並べ替えに使う形は `0A000` で拒否する
+            // （TABLE-28・Issue #2190。グループキー自体はキーの照合で比較される）。
+            if let OrderTarget::Aggregate(idx) = target {
+                if matches!(
+                    self.items.get(idx).map(|item| &item.input),
+                    Some(AggregateInput::CollatedTextColumn { .. })
+                ) {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "this collation is not supported in this expression".to_string(),
+                    });
+                }
+            }
             order_by.push(BoundOrderBy {
-                target: resolve_group_reference(&key_names, &[], &self.items, &key.column)?,
+                target,
                 descending: key.descending,
             });
         }
@@ -5716,6 +5805,36 @@ fn resolve_aggregate_input(
     use crate::sql::allowlist::{AggregateArg, AggregateFunc};
     use crate::sql::udf_call::ExprType;
 
+    // `MIN`/`MAX(<TEXT 列> COLLATE "x")`（TABLE-28・Issue #2190）: 明示した照合を累積器へ運ぶ。
+    // 列以外の式への `COLLATE` は従来どおり式として束縛する（非バイト列順は `0A000`）。
+    if matches!(func, AggregateFunc::Min | AggregateFunc::Max) {
+        if let AggregateArg::Expr(Expr::Collate {
+            expr: inner,
+            collation,
+        }) = arg
+        {
+            if let Expr::Ident(name) = inner.as_ref() {
+                if let Some((index, column)) = schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| &c.name == name)
+                {
+                    if matches!(column.ty, ColumnType::Text | ColumnType::Varchar(_)) {
+                        if collation.is_byte_order() {
+                            return Ok(AggregateInput::TextColumn(index));
+                        }
+                        collation.ensure_available()?;
+                        return Ok(AggregateInput::CollatedTextColumn {
+                            index,
+                            collation: *collation,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     match arg {
         AggregateArg::Star => Ok(AggregateInput::AllVisible),
         AggregateArg::Expr(Expr::Ident(name)) => {
@@ -5733,11 +5852,15 @@ fn resolve_aggregate_input(
                         "column {name:?} is TEXT and cannot be used with SUM/AVG"
                     ))),
                     (ColumnType::Text | ColumnType::Varchar(_), _) => {
-                        // `MIN`／`MAX` は順序比較。累積器は照合を運ばず既定照合の比較器を使うため、
-                        // バイト列順でない列の照合は `0A000` で拒否する（TABLE-28・Issue #1610。
-                        // 結線は #2190）。`COUNT` は等値だけなので照合に依存しない。
+                        // `MIN`／`MAX` は順序比較のため、列の照合が非バイト列順（ICU）なら
+                        // 累積器へ照合を運ぶ（TABLE-28・Issue #2190）。`COUNT` は等値だけなので
+                        // 照合に依存しない。
                         if matches!(func, AggregateFunc::Min | AggregateFunc::Max) {
-                            crate::sql::udf_call::require_wired_collation(column.collation)?;
+                            if let Some(collation) = column.collation.filter(|c| !c.is_byte_order())
+                            {
+                                collation.ensure_available()?;
+                                return Ok(AggregateInput::CollatedTextColumn { index, collation });
+                            }
                         }
                         Ok(AggregateInput::TextColumn(index))
                     }
@@ -5802,6 +5925,10 @@ fn resolve_aggregate_input(
                     (ColumnType::Time, _) => Err(SqlSurfaceError::undefined_function(format!(
                         "column {name:?} is TIME and cannot be used with SUM/AVG"
                     ))),
+                    // TIMESTAMPTZ 列の集計は #1576 まで fail-closed（Issue #1574）。
+                    (ColumnType::TimestampTz, _) => Err(SqlSurfaceError::undefined_function(
+                        format!("column {name:?} is TIMESTAMPTZ and cannot be used in aggregates"),
+                    )),
                     (ColumnType::Array(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::ArrayColumn(index))
                     }
@@ -5974,6 +6101,10 @@ fn resolve_count_distinct_input(
                     ColumnType::Date => Ok(AggregateInput::DateColumn(index)),
                     ColumnType::Timestamp => Ok(AggregateInput::TimestampColumn(index)),
                     ColumnType::Time => Ok(AggregateInput::TimeColumn(index)),
+                    // TIMESTAMPTZ 列の集計は #1576 まで fail-closed（Issue #1574）。
+                    ColumnType::TimestampTz => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is TIMESTAMPTZ and cannot be used with COUNT(DISTINCT ...)"
+                    ))),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is ARRAY and cannot be used with COUNT(DISTINCT ...)"
                     ))),
@@ -6436,6 +6567,8 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         | ColumnType::Date
         | ColumnType::Timestamp
         | ColumnType::Time => Some(OrderKind::SignedInt),
+        // TIMESTAMPTZ の並べ替え・DISTINCT は #1576 まで fail-closed（Issue #1574）。
+        ColumnType::TimestampTz => None,
         ColumnType::Real | ColumnType::Double => Some(OrderKind::Float),
         ColumnType::Boolean => Some(OrderKind::Bool),
         ColumnType::Numeric { .. } => Some(OrderKind::Numeric),
@@ -6474,11 +6607,14 @@ fn bind_scalar_order_by(
                     key.column
                 ))
             })?;
+            let collation = crate::collation::Collation::effective(None, column.collation);
+            // ICU 照合の比較器が使えない場合は実行時ではなく束縛時に `XX000` で拒否する。
+            collation.ensure_available()?;
             bound.push(BoundOrderKey {
                 target: BoundOrderTarget::Column(index),
                 kind,
                 descending: key.descending,
-                collation: crate::collation::Collation::effective(None, column.collation),
+                collation,
             });
             continue;
         }
@@ -6608,21 +6744,39 @@ fn bind_scan_order_keys(
                                         explicit,
                                         Some(key.collation),
                                     );
+                                    key.collation.ensure_available()?;
                                 }
                                 bound.extend(keys);
                                 continue;
                             }
                         }
                     }
-                    let (be, ty) =
-                        crate::sql::udf_call::bind_order_expr(expr, schema, udfs, node_budget)?;
+                    // 最上位の `COLLATE` は明示照合としてキーに運ぶため、内側の式だけを束縛する
+                    // （内側の式に非バイト列順の列が混じれば束縛側の `0A000` が拒否する）。
+                    let bind_target = match expr {
+                        crate::sql::udf_call::Expr::Collate { expr: inner, .. } => inner.as_ref(),
+                        other => other,
+                    };
+                    let (be, ty) = crate::sql::udf_call::bind_order_expr(
+                        bind_target,
+                        schema,
+                        udfs,
+                        node_budget,
+                    )?;
+                    if explicit.is_some() && ty != crate::sql::udf_call::ExprType::Text {
+                        return Err(SqlSurfaceError::datatype_mismatch(
+                            "collations are not supported by this expression type",
+                        ));
+                    }
+                    let key_collation = crate::collation::Collation::effective(explicit, None);
+                    key_collation.ensure_available()?;
                     let kind = order_kind_for_expr_type(ty)?;
                     let program = crate::sql::expr_program::ExprProgram::compile(&be);
                     bound.push(BoundOrderKey {
                         target: BoundOrderTarget::Expr(exprs.len()),
                         kind,
                         descending: *descending,
-                        collation: crate::collation::Collation::effective(explicit, None),
+                        collation: key_collation,
                     });
                     exprs.push((be, program));
                 }
@@ -6966,7 +7120,12 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
         .find(|(_, c)| c.name == name)
     {
         let kind = match &column.ty {
-            ColumnType::Text | ColumnType::Varchar(_) => WindowKeyKind::Text,
+            ColumnType::Text | ColumnType::Varchar(_) => {
+                // ウィンドウの PARTITION BY/ORDER BY は照合を運ばず既定のバイト列順で比較する
+                // ため、非バイト列順の照合（ICU。Issue #2190）の列は `0A000` で拒否する。
+                crate::sql::udf_call::require_wired_collation(column.collation)?;
+                WindowKeyKind::Text
+            }
             ColumnType::SmallInt | ColumnType::Integer => WindowKeyKind::Integer,
             ColumnType::BigInt => WindowKeyKind::BigInt,
             ColumnType::Real => WindowKeyKind::Real,
@@ -6983,7 +7142,8 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
             | ColumnType::Json
             | ColumnType::Jsonb
             | ColumnType::Bpchar(_)
-            | ColumnType::Enum(_) => {
+            | ColumnType::Enum(_)
+            | ColumnType::TimestampTz => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} cannot be used as a window PARTITION BY/ORDER BY key"
                 )));
@@ -7028,13 +7188,14 @@ fn bind_window_item(
                     });
                 }
             };
-            Some(resolve_aggregate_input(
-                agg_func,
-                arg,
-                schema,
-                udfs,
-                node_budget,
-            )?)
+            let resolved = resolve_aggregate_input(agg_func, arg, schema, udfs, node_budget)?;
+            // 照合付きの MIN/MAX（ICU。Issue #2190）はウィンドウ累積器が照合を運ばないため拒否する。
+            if matches!(resolved, AggregateInput::CollatedTextColumn { .. }) {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "this collation is not supported in this expression".to_string(),
+                });
+            }
+            Some(resolved)
         }
     };
 
@@ -7369,11 +7530,13 @@ fn resolve_group_by_key(
     if let Some(index) = schema.columns.iter().position(|c| c.name == column) {
         let def = schema.columns.get(index).ok_or_else(reject)?;
         let kind = resolve_order_kind(&def.ty).ok_or_else(reject)?;
+        let collation = crate::collation::Collation::effective(None, def.collation);
+        collation.ensure_available()?;
         return Ok(BoundOrderKey {
             target: BoundOrderTarget::Column(index),
             kind,
             descending: false,
-            collation: crate::collation::Collation::effective(None, def.collation),
+            collation,
         });
     }
     if column == "id" {
@@ -7418,6 +7581,7 @@ pub(crate) fn check_having_target_is_numeric(
         && matches!(
             item.input,
             AggregateInput::TextColumn(_)
+                | AggregateInput::CollatedTextColumn { .. }
                 | AggregateInput::NumericColumn { .. }
                 | AggregateInput::DateColumn(_)
                 | AggregateInput::TimestampColumn(_)
@@ -7564,7 +7728,23 @@ fn bind_group_by_clause(
     let mut order_exprs = Vec::new();
     for ob in &clause.order_by {
         let target = match &ob.expr {
-            None => resolve_target(&ob.target)?,
+            None => {
+                let target = resolve_target(&ob.target)?;
+                // 集計結果（`Cell`）の ORDER BY は項目の照合を運ばずバイト列順で比較するため、
+                // 非バイト列順の照合の MIN/MAX は `0A000` で拒否する（TABLE-28・Issue #2190）。
+                if let OrderTarget::Aggregate(idx) = target {
+                    if matches!(
+                        items.get(idx).map(|item| &item.input),
+                        Some(AggregateInput::CollatedTextColumn { .. })
+                    ) {
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "this collation is not supported in this expression"
+                                .to_string(),
+                        });
+                    }
+                }
+                target
+            }
             Some(expr) => {
                 let rewritten = rewrite_group_row_idents(expr, &resolve_target)?;
                 let (bound, ty) =
@@ -7657,7 +7837,9 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
             AggregateInput::RealColumn(_)
             | AggregateInput::DoubleColumn(_)
             | AggregateInput::ScalarExpr { .. } => ColumnType::Double,
-            AggregateInput::TextColumn(_) => ColumnType::Text,
+            AggregateInput::TextColumn(_) | AggregateInput::CollatedTextColumn { .. } => {
+                ColumnType::Text
+            }
             AggregateInput::DateColumn(_) => ColumnType::Date,
             AggregateInput::TimestampColumn(_) => ColumnType::Timestamp,
             AggregateInput::TimeColumn(_) => ColumnType::Time,
@@ -7705,7 +7887,13 @@ fn group_row_schema(
             BoundOrderTarget::Id => ColumnType::BigInt,
             BoundOrderTarget::Expr(_) => ColumnType::Bytea,
         };
-        columns.push(ColumnDef::new(format!("__gk{i}"), ty, true));
+        let mut def = ColumnDef::new(format!("__gk{i}"), ty, true);
+        // グループキーの照合を行ビューの列へ運ぶ。非バイト列順（ICU。Issue #2190）の照合の
+        // キーを式で消費する形は、式束縛の照合ガードが `0A000` で拒否する。
+        if !key.collation.is_byte_order() {
+            def.collation = Some(key.collation);
+        }
+        columns.push(def);
     }
     for (j, item) in items.iter().enumerate() {
         let ty = if precise {
@@ -7713,7 +7901,12 @@ fn group_row_schema(
         } else {
             aggregate_result_column_type(item)
         };
-        columns.push(ColumnDef::new(format!("__ga{j}"), ty, true));
+        let mut def = ColumnDef::new(format!("__ga{j}"), ty, true);
+        // 照合付きの MIN/MAX の結果列も照合を運ぶ（同上）。
+        if let AggregateInput::CollatedTextColumn { collation, .. } = &item.input {
+            def.collation = Some(*collation);
+        }
+        columns.push(def);
     }
     TableSchema::new("__group_row", columns)
 }

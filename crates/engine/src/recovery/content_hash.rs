@@ -307,6 +307,13 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(16);
             b.push_u64(*micros as u64);
         }
+        // TIMESTAMPTZ（TABLE-33・Issue #1574）は未使用の新規タグ 17 を採番する（既存タグの
+        // 意味・並びは不変）。UTC へ正規化済みのマイクロ秒をハッシュするため、`+09` と `Z` の
+        // 同一時刻は同じハッシュになる。
+        Value::TimestampTz(micros) => {
+            b.push_u8(17);
+            b.push_u64(*micros as u64);
+        }
         // 配列列（TABLE-14・Issue #888）は 10 とする。要素型タグ・要素数・各要素を
         // 積むことで、`{ab}`（1 要素）と `{a,b}`（2 要素）のような表記ゆれが
         // 衝突しない単射なハッシュ入力にする。
@@ -2139,6 +2146,9 @@ fn push_dml_expr(
                 // 既存の `Binary Sub` のハッシュで区別される。
                 crate::sql::udf_call::JsonAccessOp::Concat => 10,
                 crate::sql::udf_call::JsonAccessOp::DeletePath => 11,
+                // Issue #2186: jsonpath 演算子。既存の 1〜11 は不変。
+                crate::sql::udf_call::JsonAccessOp::PathExists => 12,
+                crate::sql::udf_call::JsonAccessOp::PathMatch => 13,
             });
             push_dml_expr(b, lhs, params)?;
             push_dml_expr(b, rhs, params)?;
@@ -5022,6 +5032,29 @@ mod tests {
                 "json contains vs path",
                 json_access(crate::sql::udf_call::JsonAccessOp::Contains, n(), text("a")),
                 json_access(crate::sql::udf_call::JsonAccessOp::Get, n(), text("a")),
+            ),
+            // Issue #2186: jsonpath 演算子は互いに、また既存の存在演算子とも区別される。
+            (
+                "json path_exists vs path_match",
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::PathExists,
+                    n(),
+                    text("$.a"),
+                ),
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::PathMatch,
+                    n(),
+                    text("$.a"),
+                ),
+            ),
+            (
+                "json path_exists vs exists",
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::PathExists,
+                    n(),
+                    text("a"),
+                ),
+                json_access(crate::sql::udf_call::JsonAccessOp::Exists, n(), text("a")),
             ),
             // Issue #2181: 連結・パス削除演算子も種別・左右で区別される（下位タグ 10・11）。
             (

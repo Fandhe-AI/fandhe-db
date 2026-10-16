@@ -528,6 +528,8 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 | ColumnType::Numeric { .. }
                 | ColumnType::Date
                 | ColumnType::Timestamp
+                // TIMESTAMPTZ スロットのバイナリ受理は OID 1184 の公告と同時（#1577）。
+                | ColumnType::TimestampTz
                 | ColumnType::Json
                 | ColumnType::Jsonb
                 | ColumnType::Array(_)

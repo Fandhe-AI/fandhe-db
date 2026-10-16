@@ -1197,6 +1197,7 @@ pub(crate) fn decode_bind_values_nullable(
             Token::Ident(s)
             | Token::QuotedNull(s)
             | Token::QuotedBoolWord(s)
+            | Token::QuotedCollationName(s)
             | Token::StringLiteral(s)
             | Token::Number(s) => s.len(),
             Token::QualifiedIdent { qualifier, name } => {
@@ -1224,6 +1225,8 @@ pub(crate) fn decode_bind_values_nullable(
             | Token::HashArrowText
             | Token::HashMinus
             | Token::JsonContains
+            | Token::JsonPathExists
+            | Token::JsonPathMatch
             | Token::JsonContainedBy
             | Token::JsonExists
             | Token::JsonExistsAny

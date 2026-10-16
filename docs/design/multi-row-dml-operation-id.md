@@ -239,13 +239,14 @@ origin/main 取り込み時の是正: 並行実装していた Issue #921 のタ
 - `DateLiteral(days)`＝タグ 10・型バイト `0`・`days`（`i32`、LE）
 - `TimestampLiteral(micros)`＝タグ 10・型バイト `1`・`micros`（`i64`、LE）
 - `JsonAccess{op, lhs, rhs}`＝タグ 12・演算子種別 1 バイト（`->`=1・`->>`=2・`#>`=3・`#>>`=4・
-  `@>`=5・`<@`=6・`?`=7・`?|`=8・`?&`=9・`||`=10・`#-`=11）・`lhs`・`rhs`（Issue #1596・#1598・#2181。既存の種別は不変。`jsonb - x` は `Binary Sub` のタグで区別される）
+  `@>`=5・`<@`=6・`?`=7・`?|`=8・`?&`=9・`||`=10・`#-`=11・`@?`=12・`@@`=13）・`lhs`・`rhs`（Issue #1596・#1598・#2181・#2186。既存の種別は不変。`jsonb - x` は `Binary Sub` のタグで区別される）
 - `ValueFunction{kind, precision}`＝タグ 13・種別 1 バイト（`CURRENT_TIMESTAMP`=1・`CURRENT_DATE`=2・
   `CURRENT_TIME`=3・`LOCALTIMESTAMP`=4・`LOCALTIME`=5）・精度の有無 1 バイト・精度 1 バイト（無ければ 0）
   （Issue #1586 で導入。#1586 の時点では書き込み文が時刻関数を受理しないため DML のハッシュには現れない。
   [now-evaluated-value-ledger.md](now-evaluated-value-ledger.md)）
-- `Collate{expr, collation}`＝タグ 14・照合のカタログトークン（長さ前置。`c`／`posix`）・`expr`
-  （Issue #1609・TABLE-28。既存タグ 1〜13 は不変）
+- `Collate{expr, collation}`＝タグ 14・照合のカタログトークン（長さ前置。`c`／`posix`／
+  `und_x_icu`／`ja_x_icu`）・`expr`（Issue #1609・TABLE-28。既存タグ 1〜13 は不変。
+  Issue #2190 で ICU の 2 トークンを追加したが、既存のトークンのハッシュ・形式は変わらない）
 - `SqlJsonQuery`＝タグ 15・関数種別 1 バイト（`JSON_EXISTS`=1・`JSON_VALUE`=2・`JSON_QUERY`=3）・context 式・
   path 式・PASSING の件数（u32 LE）と（変数名〔長さ前置〕・値式）の組・RETURNING の有無 1 バイトと型名
   （長さ前置）・ラッパー 1 バイト・引用符 1 バイト（省略=0・KEEP=1・OMIT=2）・`ON EMPTY`／`ON ERROR` の各

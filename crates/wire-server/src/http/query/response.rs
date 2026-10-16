@@ -145,6 +145,20 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             out.push('"');
             Ok(())
         }
+        // TIMESTAMPTZ は UTC 固定の ISO 文字列（`+00` 付き）。セッション TimeZone での表示は
+        // #1575、型の公告は #1577 の担当（Issue #1574）。
+        Cell::TimestampTz(micros) => {
+            out.push('"');
+            escape_json_string_into(
+                out,
+                &engine::datetime::format_timestamptz(
+                    *micros,
+                    &engine::datetime::SessionTimeZone::utc(),
+                ),
+            );
+            out.push('"');
+            Ok(())
+        }
         // TIME は `HH:MM:SS[.ffffff]` の JSON 文字列（Issue #1569）。
         Cell::Time(micros) => {
             out.push('"');
@@ -364,6 +378,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
             ColumnType::Date => "date",
             ColumnType::Timestamp => "timestamp",
             ColumnType::Time => "time",
+            ColumnType::TimestampTz => "timestamptz",
             ColumnType::Numeric { .. } => "numeric",
             ColumnType::Uuid => "uuid",
             ColumnType::Bytea => "bytea",
@@ -1215,6 +1230,25 @@ mod tests {
             .collect();
         let expected: Vec<f64> = values.iter().map(|f| *f as f64).collect();
         assert_eq!(numbers, expected);
+    }
+
+    /// Issue #1574: TIMESTAMPTZ 列は UTC 固定（`+00` 付き）の JSON 文字列・型名 `"timestamptz"`。
+    #[test]
+    fn timestamptz_cell_is_a_utc_json_string_and_column_type_is_timestamptz() {
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Scalar {
+                name: "t".to_string(),
+                ty: ColumnType::TimestampTz,
+            }],
+            rows: vec![
+                row(vec![Cell::TimestampTz(0)]),
+                row(vec![Cell::TimestampTz(1_767_236_400_500_000)]),
+            ],
+        };
+        let body = encode(&result).expect("encode");
+        assert!(body.contains("\"timestamptz\""), "{body}");
+        assert!(body.contains("\"1970-01-01 00:00:00+00\""), "{body}");
+        assert!(body.contains("\"2026-01-01 03:00:00.5+00\""), "{body}");
     }
 
     /// Issue #1569: TIME 列は JSON 文字列（`HH:MM:SS[.ffffff]`）・型名 `"time"`。

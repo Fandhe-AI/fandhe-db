@@ -44,6 +44,12 @@ pub enum Token {
     /// BOOLEAN 列の識別子として扱う（`sql::allowlist` の `try_parse_structural_leaf`）。
     /// それ以外の引用識別子は従来どおり [`Token::Ident`]。
     QuotedBoolWord(String),
+    /// ハイフンを含む二重引用符付きの照合名候補（`"und-x-icu"` 等。Issue #2190・TABLE-28）。
+    /// 引用識別子はハイフンを含められない（[`is_plain_identifier`]）が、ICU の照合名は
+    /// ハイフンを含むため、先頭が英字で単一の `-` 区切りの英数字語（長さ 63 バイト以下
+    /// 〔NAMEDATALEN-1〕）だけを専用トークンにする。受理するのは `COLLATE` 直後の照合名の位置だけで、
+    /// 他の位置では既存の不一致腕により `42601` になる（識別子として使えない）。
+    QuotedCollationName(String),
     StringLiteral(String),
     Number(String),
     /// `(` `)` `,` `*` `=` `;` `+` `-` `/` `>` `<` `[` `]` `%` `#`（`%`・単独 `#` は
@@ -67,8 +73,12 @@ pub enum Token {
     /// `#-`（jsonb のパス削除。TABLE-25・Issue #2181）。`#--` は PostgreSQL と同じく
     /// `#` と行コメントに分ける。
     HashMinus,
-    /// `@>`（jsonb 包含。TABLE-25・Issue #1598）。単独の `@`・`@?`・`@@` は未対応文字のまま。
+    /// `@>`（jsonb 包含。TABLE-25・Issue #1598）。単独の `@` は未対応文字のまま。
     JsonContains,
+    /// `@?`（jsonpath 存在判定。TABLE-25・Issue #2186）。
+    JsonPathExists,
+    /// `@@`（jsonpath 述語判定。TABLE-25・Issue #2186）。
+    JsonPathMatch,
     /// `<@`（jsonb 被包含。TABLE-25・Issue #1598）。
     JsonContainedBy,
     /// `?`（jsonb キー存在。TABLE-25・Issue #1598）。
@@ -192,7 +202,7 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
                 Keyword::Limit => "LIMIT",
             }),
             Token::Ident(s) | Token::Number(s) => out.push_str(s),
-            Token::QuotedBoolWord(s) => {
+            Token::QuotedBoolWord(s) | Token::QuotedCollationName(s) => {
                 out.push('"');
                 out.push_str(s);
                 out.push('"');
@@ -212,6 +222,8 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
             Token::HashArrowText => out.push_str("#>>"),
             Token::HashMinus => out.push_str("#-"),
             Token::JsonContains => out.push_str("@>"),
+            Token::JsonPathExists => out.push_str("@?"),
+            Token::JsonPathMatch => out.push_str("@@"),
             Token::JsonContainedBy => out.push_str("<@"),
             Token::JsonExists => out.push('?'),
             Token::JsonExistsAny => out.push_str("?|"),
@@ -570,14 +582,21 @@ fn tokenize_impl(
                 }
             }
         }
-        // `@>`（jsonb 包含。Issue #1598）。単独の `@`・`@?`・`@@` は未対応文字として拒否する
-        // （jsonpath 演算子は #2182 系の対象）。
+        // `@>`（jsonb 包含。Issue #1598）・`@?`・`@@`（jsonpath 演算子。Issue #2186）。
+        // 単独の `@` は未対応文字として拒否する。`@?|` のような続きは `@?` の後に別トークンが
+        // 続くだけで、構文段が 42601 で拒否する（fail-closed）。
         if c == '@' {
             let mut lookahead = chars.clone();
             lookahead.next();
-            if matches!(lookahead.peek(), Some(&(_, '>'))) {
+            let token = match lookahead.peek() {
+                Some(&(_, '>')) => Some(Token::JsonContains),
+                Some(&(_, '?')) => Some(Token::JsonPathExists),
+                Some(&(_, '@')) => Some(Token::JsonPathMatch),
+                _ => None,
+            };
+            if let Some(token) = token {
                 lookahead.next();
-                tokens.push(Token::JsonContains);
+                tokens.push(token);
                 chars = lookahead;
                 continue;
             }
@@ -638,6 +657,11 @@ fn tokenize_impl(
                     message: "zero-length quoted identifier".to_string(),
                     byte_offset: offset,
                 });
+            }
+            if is_hyphenated_collation_name(content) {
+                tokens.push(Token::QuotedCollationName(content.to_string()));
+                advance_to(&mut chars, end);
+                continue;
             }
             if !is_plain_identifier(content) {
                 return Err(LexError {
@@ -889,6 +913,28 @@ pub(crate) fn quoted_identifier_end(input: &str, start: usize) -> Option<usize> 
         }
         j = j.saturating_add(1);
     }
+}
+
+/// 二重引用符の中身が、ハイフンを含む照合名の形（先頭は英字、`[A-Za-z0-9_]+` の語を単一の `-` で
+/// 連結した形で `-` を 1 個以上含む・63 バイト以下）か（Issue #2190）。文字種と長さを字句段で制限し、解決は構文段の固定許可リスト
+/// （`Collation::resolve_name`）が行う。
+fn is_hyphenated_collation_name(content: &str) -> bool {
+    const MAX_COLLATION_NAME_BYTES: usize = 63;
+    if content.len() > MAX_COLLATION_NAME_BYTES || !content.contains('-') {
+        return false;
+    }
+    if !content
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    // ハイフンは英数字・`_` の語の間の区切りとしてだけ許す（先頭・末尾・連続は不可。`--` は
+    // コメント開始と紛れるため特に許さない）。
+    content
+        .split('-')
+        .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 /// 二重引用符識別子の中身が、引用符なしで字句解析しても同じ 1 個の `Ident` に
@@ -1473,10 +1519,12 @@ mod tests {
         assert_eq!(toks("a < b")[1], Punct('<'));
         // `?||` は `?|` の後に単独の `|`（未対応）で拒否される。
         assert!(tokenize("a ?|| b").is_err());
-        // 単独の `@`・`@@`・`@?`・`&` は拒否のまま（jsonpath は対象外）。
+        // 単独の `@`・`&` は拒否のまま（`@@`・`@?` は受理される）。
         assert!(tokenize("a @ b").is_err());
-        assert!(tokenize("a @@ b").is_err());
-        assert!(tokenize("a @? b").is_err());
+        assert_eq!(toks("a @? b"), vec![a(), JsonPathExists, b()]);
+        assert_eq!(toks("a@@b"), vec![a(), JsonPathMatch, b()]);
+        // 最長一致の後に残る単独の `@` は従来どおり拒否する。
+        assert!(tokenize("a @@@ b").is_err());
         assert!(tokenize("a & b").is_err());
     }
 
@@ -1533,7 +1581,7 @@ mod tests {
     /// SQL-42・Issue #1520: 新トークンの描画 → 再字句化で同一列に戻る（最小ケース）。
     #[test]
     fn render_tokens_round_trips_multichar_operators() {
-        let sql = "a -> b ->> c #> d #>> e :: f || g - > h";
+        let sql = "a -> b ->> c #> d #>> e :: f || g - > h @? i @@ j";
         let tokens = tokenize(sql).expect("tokenize");
         let rendered = render_tokens(&tokens).expect("render");
         assert_eq!(tokenize(&rendered).expect("re-tokenize"), tokens);
@@ -2065,5 +2113,39 @@ mod quoted_bool_word_tests {
         assert!(!stored_body_needs_bool_literal_marker(
             &tokenize("SELECT id FROM t WHERE flag = true").expect("tokenize")
         ));
+    }
+    /// TABLE-28・Issue #2190: ハイフンを含む二重引用符付きの照合名候補だけが専用トークンになる。
+    /// 文字種（先頭は英字、以降は英数字・`_`・`-`）と長さ（63 バイト以下）を字句段で制限する。
+    #[test]
+    fn hyphenated_quoted_collation_name_token() {
+        let toks = tokenize("COLLATE \"und-x-icu\"").expect("tokenize");
+        assert_eq!(
+            toks.last(),
+            Some(&Token::QuotedCollationName("und-x-icu".to_string()))
+        );
+        // ハイフンなしの引用識別子は従来どおり `Ident`。
+        assert_eq!(
+            tokenize("\"C\"").expect("tokenize"),
+            vec![Token::Ident("C".to_string())]
+        );
+        // 先頭が英字でない・不正な文字・長すぎる語は従来どおり拒否（fail-closed）。
+        for bad in [
+            "\"1a-b\"",
+            "\"-ab\"",
+            "\"ab-\"",
+            "\"a--b\"",
+            "\"a b-c\"",
+            "\"a.b-c\"",
+            "\"\u{e9}-x\"",
+        ] {
+            assert!(tokenize(bad).is_err(), "{bad}");
+        }
+        let long = format!("\"a-{}\"", "x".repeat(62));
+        assert!(tokenize(&long).is_err(), "64 bytes must be rejected");
+        let max = format!("\"a-{}\"", "x".repeat(61));
+        assert!(tokenize(&max).is_ok(), "63 bytes is the limit");
+        // 描画は引用付きで往復する。
+        let rendered = render_tokens(&toks).expect("render");
+        assert_eq!(tokenize(&rendered).expect("retokenize"), toks);
     }
 }

@@ -67,6 +67,7 @@ fn type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Date => "date",
         ColumnType::Timestamp => "timestamp",
         ColumnType::Time => "time",
+        ColumnType::TimestampTz => "timestamptz",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",
@@ -112,6 +113,7 @@ fn all_type_labels() -> BTreeSet<&'static str> {
         "date",
         "timestamp",
         "time",
+        "timestamptz",
         "array",
         "bytea",
         "json",
@@ -168,6 +170,7 @@ fn full_row_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> Ta
             ColumnDef::new("c_varchar_n", ColumnType::Varchar(Some(16)), true),
             ColumnDef::new("c_bpchar", ColumnType::Bpchar(8), true),
             ColumnDef::new("c_time", ColumnType::Time, true),
+            ColumnDef::new("c_timestamptz", ColumnType::TimestampTz, true),
         ],
     )
 }
@@ -234,6 +237,8 @@ fn representative_scalar_values() -> Vec<Value> {
         Value::Text("bpchar  ".to_string()),
         // `c_time`（0 時起点のマイクロ秒。Issue #1569）。
         Value::Time(engine::datetime::TIME_MAX_MICROS),
+        // `c_timestamptz`（UTC のマイクロ秒。Issue #1574）。
+        Value::TimestampTz(engine::datetime::TIMESTAMPTZ_MAX_MICROS),
     ]
 }
 
@@ -640,6 +645,73 @@ fn time_roundtrips_boundaries_and_rejects_out_of_range() {
         &[Value::Timestamp(engine::datetime::TIME_MAX_MICROS + 1)],
     )
     .expect("encode timestamp");
+    assert!(matches!(
+        decode_row(&schema, &bytes),
+        Err(RowCodecError::Invalid(_))
+    ));
+}
+
+/// TIMESTAMPTZ は UTC の最小値・最大値を往復でき、範囲外は encode でも decode でも拒否する。
+/// naive の TIMESTAMP 値と取り違えて書くこともできない（Issue #1574・TABLE-33 ポインタ）。
+#[test]
+fn timestamptz_roundtrips_min_and_max_and_rejects_out_of_range() {
+    for v in [
+        engine::datetime::TIMESTAMPTZ_MIN_MICROS,
+        0,
+        engine::datetime::TIMESTAMPTZ_MAX_MICROS,
+    ] {
+        roundtrip_single(ColumnType::TimestampTz, Value::TimestampTz(v));
+    }
+    let schema = single_col_schema(ColumnType::TimestampTz);
+    for v in [
+        engine::datetime::TIMESTAMPTZ_MIN_MICROS - 1,
+        engine::datetime::TIMESTAMPTZ_MAX_MICROS + 1,
+        i64::MIN,
+        i64::MAX,
+    ] {
+        assert!(matches!(
+            encode_row(
+                &schema,
+                "tenant-a",
+                Visibility::Public,
+                &[Value::TimestampTz(v)]
+            ),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+    // naive の TIMESTAMP 値を TIMESTAMPTZ 列へ書くことはできない（型取り違えの拒否）。
+    assert!(matches!(
+        encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Timestamp(0)]
+        ),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // TIMESTAMP 列は TIMESTAMPTZ 値を受け付けない。
+    let ts_schema = single_col_schema(ColumnType::Timestamp);
+    assert!(matches!(
+        encode_row(
+            &ts_schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::TimestampTz(0)]
+        ),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // 範囲外バイトを TIMESTAMPTZ 列として読むと decode が拒否する（破損データの fail-closed）。
+    let time_schema = single_col_schema(ColumnType::Time);
+    let mut bytes = encode_row(
+        &time_schema,
+        "tenant-a",
+        Visibility::Public,
+        &[Value::Time(0)],
+    )
+    .expect("encode time");
+    // 値部（presence の直後 8 バイト）を i64::MAX に書き換える。
+    let tail = bytes.len();
+    bytes[tail - 8..].copy_from_slice(&i64::MAX.to_le_bytes());
     assert!(matches!(
         decode_row(&schema, &bytes),
         Err(RowCodecError::Invalid(_))

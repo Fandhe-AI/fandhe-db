@@ -275,6 +275,14 @@ impl<'a, 'b> Binder<'a, 'b> {
                 detail: "JOIN relation index out of range".to_string(),
             })?;
         let name = slot_name(slot, schema)?;
+        // JOIN の比較・並べ替え・グルーピングは列型だけで行い照合を運ばない（既定のバイト列順）。
+        // 非バイト列順の照合（ICU。Issue #2190）の列の参照は `0A000` で拒否する（照合が黙って
+        // 落ちる意味論の fail-open を作らない）。
+        if let ColumnSlot::Column(i) = slot {
+            crate::sql::udf_call::require_wired_collation(
+                schema.columns.get(i).and_then(|c| c.collation),
+            )?;
+        }
         let side = self
             .sides
             .get_mut(rel)

@@ -65,6 +65,7 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "TIMESTAMP",
     "TIME",
     "TIMETZ",
+    "TIMESTAMPTZ",
     "BYTEA",
     "JSON",
     "JSONB",
@@ -218,8 +219,8 @@ fn is_where_group_operator_token(token: &Token) -> bool {
     ) || is_json_operator_token(token)
 }
 
-/// jsonb 演算子のトークン（パス取得 `-> ->> #> #>>`・包含 `@> <@`・存在 `? ?| ?&`。
-/// TABLE-25。Issue #1596・#1598）かどうか。式の中置演算子ループ
+/// jsonb 演算子のトークン（パス取得 `-> ->> #> #>>`・包含 `@> <@`・存在 `? ?| ?&`・jsonpath `@? @@`。
+/// TABLE-25。Issue #1596・#1598・#2186）かどうか。式の中置演算子ループ
 /// （[`Parser::parse_json_access_rest`]）の続きを判定する先読みが共有する。
 fn is_json_operator_token(token: &Token) -> bool {
     matches!(
@@ -231,6 +232,8 @@ fn is_json_operator_token(token: &Token) -> bool {
             | Token::HashMinus
             | Token::Concat
             | Token::JsonContains
+            | Token::JsonPathExists
+            | Token::JsonPathMatch
             | Token::JsonContainedBy
             | Token::JsonExists
             | Token::JsonExistsAny
@@ -520,6 +523,11 @@ pub enum SqlSurfaceError {
     /// ポインタ）。`param` は 1 始まりの `$n` 番号で、エラー文言には番号だけを含める
     /// （値・表の存在情報は含めない）。
     IndeterminateDatatype { param: u16 },
+    /// 明示的な `COLLATE` 同士の食い違い（`42P21`。Issue #2190・TABLE-28）。固定文言のみ。
+    CollationMismatch,
+    /// 暗黙の照合の衝突を照合が必要な演算が消費した（`42P22`。Issue #2190・TABLE-28）。
+    /// 固定文言のみ。
+    IndeterminateCollation,
     /// NULL を許さない引数への NULL（`22004`。Issue #1599。`jsonb_build_object` のキー）。
     NullValueNotAllowed { detail: &'static str },
     /// SQL/JSON 問い合わせ関数が単一項目を要する位置で 2 件以上を得た（`22034`。Issue #2187）。
@@ -1066,6 +1074,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
             SqlSurfaceError::IndeterminateDatatype { .. } => ErrorClass::IndeterminateDatatype,
+            SqlSurfaceError::CollationMismatch => ErrorClass::CollationMismatch,
+            SqlSurfaceError::IndeterminateCollation => ErrorClass::IndeterminateCollation,
             SqlSurfaceError::NullValueNotAllowed { .. } => ErrorClass::NullValueNotAllowed,
             SqlSurfaceError::MoreThanOneSqlJsonItem { .. } => ErrorClass::MoreThanOneSqlJsonItem,
             SqlSurfaceError::NoSqlJsonItem { .. } => ErrorClass::NoSqlJsonItem,
@@ -1183,6 +1193,12 @@ impl std::fmt::Display for SqlSurfaceError {
             | SqlSurfaceError::SqlJsonScalarRequired { detail } => f.write_str(detail),
             SqlSurfaceError::IndeterminateDatatype { param } => {
                 write!(f, "could not determine data type of parameter ${param}")
+            }
+            SqlSurfaceError::CollationMismatch => {
+                f.write_str("collation mismatch between explicit collations")
+            }
+            SqlSurfaceError::IndeterminateCollation => {
+                f.write_str("could not determine which collation to use for the comparison")
             }
             SqlSurfaceError::DatetimeFieldOverflow { detail } => {
                 write!(f, "datetime field overflow: {detail}")
@@ -5918,7 +5934,7 @@ impl<'a> Parser<'a> {
         self.parse_json_access_rest(lhs, depth)
     }
 
-    /// jsonb 演算子（パス取得 `->` `->>` `#>` `#>>`・包含 `@>` `<@`・存在 `?` `?|` `?&`）の
+    /// jsonb 演算子（パス取得 `->` `->>` `#>` `#>>`・包含 `@>` `<@`・存在 `?` `?|` `?&`・jsonpath `@?` `@@`）の
     /// ループ（対象ビヘイビア: TABLE-25。Issue #1596・#1598）。PostgreSQL の優先順位表で「その他の演算子」の段にあたり、加減算
     /// （[`Self::parse_add_expr`]）より弱く比較より強い。左結合のため
     /// `a -> 'x' ->> 'y'` は `(a -> 'x') ->> 'y'`、`a -> 1 + 1` は `a -> (1 + 1)`。
@@ -5939,6 +5955,8 @@ impl<'a> Parser<'a> {
                 Some(Token::HashMinus) => JsonAccessOp::DeletePath,
                 Some(Token::Concat) => JsonAccessOp::Concat,
                 Some(Token::JsonContains) => JsonAccessOp::Contains,
+                Some(Token::JsonPathExists) => JsonAccessOp::PathExists,
+                Some(Token::JsonPathMatch) => JsonAccessOp::PathMatch,
                 Some(Token::JsonContainedBy) => JsonAccessOp::ContainedBy,
                 Some(Token::JsonExists) => JsonAccessOp::Exists,
                 Some(Token::JsonExistsAny) => JsonAccessOp::ExistsAny,
@@ -9191,11 +9209,11 @@ impl<'a> Parser<'a> {
     /// （TABLE-28。Issue #1609）。名前は `Token::Ident` のみ（文字列リテラル・数値・修飾名は
     /// `42601`）、未知の名前は `42704`。解決は固定リストとの完全一致だけでカタログを参照
     /// しないため、DDL 権限ゲートより前（構文段）で返してもテーブルの存在オラクルにならない。
-    /// 引用識別子はハイフンを含められない（字句段の制約）ため、`"und-x-icu"` 等の ICU 名は
-    /// ICU 照合の導入（#2190）までは字句段で `42601` になる。
+    /// ハイフンを含む ICU 名（`"und-x-icu"`）は字句段が専用トークン
+    /// （[`Token::QuotedCollationName`]）にし、この位置でだけ受理する（Issue #2190）。
     fn parse_collation_name(&mut self) -> Result<crate::collation::Collation, SqlSurfaceError> {
         let name = match self.advance() {
-            Some(Token::Ident(name)) => name.clone(),
+            Some(Token::Ident(name) | Token::QuotedCollationName(name)) => name.clone(),
             other => {
                 return Err(SqlSurfaceError::unsupported(format!(
                     "expected collation name, got {other:?}"
@@ -14629,15 +14647,15 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// 列型キーワード判定は型名エイリアスと未確定型を含む 29 語を大小無視で認識する
-    /// （Issue #1529・TABLE-29。Issue #1569 で `TIME`・`TIMETZ` を追加）。
+    /// 列型キーワード判定は型名エイリアスと未確定型を含む 30 語を大小無視で認識する
+    /// （Issue #1529・TABLE-29。Issue #1569 で `TIME`・`TIMETZ`、Issue #1574 で `TIMESTAMPTZ` を追加）。
     #[test]
     fn column_type_keyword_covers_aliases_case_insensitively() {
         for kw in CREATE_TABLE_COLUMN_TYPE_KEYWORDS {
             assert!(is_column_type_keyword(kw), "{kw}");
             assert!(is_column_type_keyword(&kw.to_ascii_lowercase()), "{kw}");
         }
-        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 29);
+        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 30);
         for ok in ["Int4", "iNt8", "float4", "FLOAT8", "int", "int2", "varchar"] {
             assert!(is_column_type_keyword(ok), "{ok}");
         }
@@ -15845,6 +15863,8 @@ mod tests {
             ("?", JsonAccessOp::Exists),
             ("?|", JsonAccessOp::ExistsAny),
             ("?&", JsonAccessOp::ExistsAll),
+            ("@?", JsonAccessOp::PathExists),
+            ("@@", JsonAccessOp::PathMatch),
         ] {
             let preds = where_predicates_for(&format!(
                 "SELECT * FROM documents WHERE d {sql_op} 'x' {tail}"

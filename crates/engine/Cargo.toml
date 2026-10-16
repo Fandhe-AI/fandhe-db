@@ -68,6 +68,21 @@ icu_collator = "=2.3.1"
 # 別データに差し替わるため、CI・release・開発環境では設定しないこと。
 icu_collator_data = "=2.3.0"
 
+# Issue #1574（TABLE-33 TIMESTAMPTZ。ビヘイビア ID のポインタのみ）: TZ データ源。
+# **オーナー承認済み: 2026-10-16。承認記録は Issue #1573 のコメント、および
+# `docs/design/timestamptz-tz-data-adoption.md`（Accepted）**。
+#   - jiff = "=0.2.38"（default-features = false、features は std・tzdb-bundle-always のみ）
+#   - jiff-tzdb = "=0.1.9"（直接 exact pin。同梱 tzdata の版を固定する）
+#   - 非 optional の理由: feature ゲートを作るとビルド構成で TZ 解決結果が変わるため
+# engine は `TimeZoneDatabase::bundled()` を明示して使い、`jiff::tz::db()`・
+# `TimeZone::system()` は使わない（実行時に tzdata ファイル・`TZ` を読まない）。
+# .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
+jiff = { version = "=0.2.38", default-features = false, features = [
+    "std",
+    "tzdb-bundle-always",
+] }
+jiff-tzdb = "=0.1.9"
+
 # Issue #333（SEARCH-7 方式変更。クロスエンコーダ型リランカーの導入）:
 # `rerank::CrossEncoderReranker`（`rerank.rs`）が呼ぶ実 ONNX 推論バックエンド
 # （`src/rerank/cross_encoder_onnx.rs`。`cross-encoder` feature 限定）用の依存。

@@ -1067,7 +1067,9 @@ fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
         | ColumnType::Array(_)
         | ColumnType::Json
         | ColumnType::Jsonb
-        | ColumnType::Bpchar(_) => None,
+        | ColumnType::Bpchar(_)
+        // TIMESTAMPTZ のサブクエリ値族は #1576 まで対応外（Issue #1574。fail-closed）。
+        | ColumnType::TimestampTz => None,
     }
 }
 

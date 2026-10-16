@@ -67,8 +67,9 @@ PG のバイナリ表現を返す場合はオフセット変換が必要にな�
 タイムゾーン設定・変換・`AT TIME ZONE` は持たない。入力に TZ 接尾辞
 （`Z`、`+hh:mm`、`-hh`）があれば閉じた文法の外として `22007` で拒否する。
 値をどのタイムゾーンで解釈するかはクライアント側の責任とする。
-`TIMESTAMPTZ` は対象外。TZ データ源の承認資料は
-[timestamptz-tz-data-adoption.md](timestamptz-tz-data-adoption.md)（承認済み・2026-10-16。実装は #1572 配下）。
+`TIMESTAMPTZ` は本節の対象外で、UTC 保存の別型として追加した
+（[Issue #1574 追記](#issue-1574-追記-timestamptz-列型)）。TZ データ源の承認資料は
+[timestamptz-tz-data-adoption.md](timestamptz-tz-data-adoption.md)（承認済み・2026-10-16）。
 
 ### D-5: リテラル文法（閉じた定義）
 
@@ -180,3 +181,18 @@ TABLE-32・親 #1568 のポインタ（第 2 段）。#1569 で fail-closed に�
 - **式層**: `TIME` 列参照と型付きリテラル `TIME '...'`（AST は解析済みの値を保持し、CHECK・ビューの描画は `format_time` の出力だけを使う）を受理する。`TIME` 同士の比較のみ許可し、`TIMESTAMP`／`DATE` との暗黙昇格は PostgreSQL に無いため行わない（`42883`）。型なし文字列リテラルは相手が `TIME` のとき TIME として解析する。算術（`time ± interval` 等）は未実装のまま拒否する。
 - **EXTRACT／date_part**: 既存の `date_part` は暦計算で日付境界へ折り返し `24:00:00` が hour=0 になるため流用せず、`datetime_fn::time_part` を新設した。受理する field は `hour`・`minute`・`second`（小数含む）・`milliseconds`・`microseconds`・`epoch`（0 時からの秒数）。日付由来の field は `0A000`（束縛時に拒否）、`date_trunc(text, time)` は PostgreSQL に存在しないため `42883`、未知の field は DATE／TIMESTAMP と同じ `22000`。
 - **残した fail-closed**: PK／UNIQUE／FK・`ALTER COLUMN TYPE`・JOIN キー（担当 Issue 未定）。wire OID 1083・バイナリ・NoSQL は #1571。
+
+## Issue #1574 追記: TIMESTAMPTZ 列型
+
+`TIMESTAMPTZ`／`TIMESTAMP WITH TIME ZONE` を独立の `ColumnType::TimestampTz` として追加した（TABLE-33・親 #1572 のポインタ。第 1 段）。
+
+- **内部表現**: UTC の 1970-01-01 起点マイクロ秒 `i64`。受理範囲は UTC で `0001-01-01 00:00:00Z`〜`9999-12-31 23:59:59.999999Z`（`TIMESTAMP` と同じ）。カタログタグは `timestamptz`（`param` は `-` 固定）。値は `Value::TimestampTz`／`ScalarRef::TimestampTz`／`Cell::TimestampTz` の専用 variant とし、naive の `Timestamp` を流用しない（naive 値と UTC 値の取り違えによる fail-open を防ぐ）。行バイトは presence + `i64 LE`（9 バイト。`SCALAR_TIMESTAMPTZ_ENTRY_LEN`）で、encode・decode・scan のすべてで `validate_timestamptz_micros` により範囲を再検証する。`content_hash` は未使用のタグ 17 を採番した（UTC へ正規化した後の値をハッシュするため、`+09` と `Z` の同一時刻は同じハッシュになる）。
+- **閉じた文法**: `<TIMESTAMP の D-5 文法>[空白 0〜1 個]<ゾーン>`。ゾーンは `Z`／`z`、数値 offset（`±HH`・`±HHMM`・`±HH:MM`・`±HH:MM:SS`。数字は 2 桁固定、時 0〜15、分・秒 0〜59）、IANA 名（bundled tzdb で解決できるもの）。日時部は `parse_timestamp` と同一の実装を共有する（日付だけ・秒なし・小数 7 桁以上は `22007`）。長さは解析前に `MAX_TIMESTAMPTZ_LITERAL_LEN` で拒否し、非 ASCII は `22007`。
+- **正規化**: ゾーンのある入力は UTC へ変換して格納する。ゾーンの無い入力はセッション TimeZone の壁時計として解釈する。セッション TimeZone の保持は #1575 の担当のため、本 Issue では `SessionTimeZone::utc()` 固定（差し替え口は `parse_timestamptz` の `default_tz` 引数）。`SessionTimeZone` は jiff の型を公開 API へ出さない不透明型で、`TimeZoneDatabase::bundled()` から解決したものだけを保持する（`jiff::tz::db()`・`TimeZone::system()` は使わない）。TZ 名は長さ・許可文字（ASCII 英数と `/`・`_`・`+`・`-`）を検査してから解決し、`Etc/Unknown` は明示的に拒否する。
+- **DST の解決（暫定）**: 名前付き TZ の gap（存在しない時刻）は直前の offset、fold（重複する時刻）は後の offset で解決する（PG の `DetermineTimeZoneOffset` の既定と同じ見込み。例: NY の `2026-03-08 02:30` は `-05` として `07:30Z`、`2026-11-01 01:30` は `-05` として `06:30Z`）。jiff の既定に任せず自前で選んでいる。最終確定は #1576 が PG 17 の実測と照合して行う。
+- **SQLSTATE**: 書式違反 `22007`、範囲外（UTC へ直して範囲外、offset の範囲外を含む）`22008`、解決できない TZ 名 `22023`（detail は静的文字列で入力を反射しない）。
+- **整形**: `format_timestamptz(utc_micros, &SessionTimeZone)` は `YYYY-MM-DD HH:MM:SS[.ffffff]+HH[:MM[:SS]]`（分・秒が 0 でなければ付ける）。局所年が 0 以下になる場合は PG に合わせ年を `1 - year` とし offset の後ろに「 BC」（先頭に空白を伴う）を付ける。局所年 10000 は 5 桁のまま出す。LMT のような秒を含む offset も整形できる。現状の呼び出し元（投影・COPY TO・HTTP JSON）はすべて UTC 固定（`+00`）。
+- **型名**: `TIMESTAMPTZ`・`TIMESTAMP WITH TIME ZONE` を受理（`TIMESTAMPTZ` は綴りを保持する別名として返し、同名 ENUM との衝突を実行段が検出する）。`TIMESTAMPTZ(p)`・`timestamptz[]` は構文段で `0A000`。`timestamptz` は `CREATE_ONLY_RESERVED_TYPE_NAMES` へ追加した。
+- **PostgreSQL との乖離**: (1) 日付だけ・秒なし・小数 7 桁以上・1 桁の時の offset は受理しない。(2) 範囲は UTC で 0001〜9999 年。(3) offset の範囲外は PG では `22009` だが、Issue の写像に従い `22008`。(4) TZ 略称（`JST` 等）と POSIX 形式は #1575 まで `22023`。
+- **暫定挙動（fail-closed）**: 述語・ORDER BY・GROUP BY・集計・window・集合演算・式（列参照と型付きリテラル `TIMESTAMPTZ '...'`）・二次索引・EXTRACT／date_trunc・UDF 引数は既存の拒否コードで拒否する（#1576）。PK／UNIQUE／FK・JOIN キー・`ALTER COLUMN TYPE` は担当 Issue 未定。wire は暫定で text（OID 25）を公告してバイナリは非対応、NoSQL は型束縛・filter とも `TypeMismatch` で拒否する（OID 1184 とバイナリ・NoSQL は #1577）。JSON 応答の型名は `"timestamptz"`。
+- **対象外**: セッション TimeZone（`SET TIME ZONE`／StartupMessage／`SHOW`）・TZ 略称・POSIX 形式は #1575。`AT TIME ZONE`・他型との変換・述語・集計・索引・EXTRACT・DST 解決の PG 17 照合は #1576。`now()`／`CURRENT_TIMESTAMP` の戻り値型の切り替え、`TIMESTAMPTZ(p)`、`timestamptz[]`（OID 1185）、特殊値 `infinity`・`epoch`・`now` は担当 Issue 未定。

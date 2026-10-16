@@ -474,6 +474,65 @@ fn wire_jsonb_path_functions_advertise_oids_and_report_sqlstates() {
     }
 }
 
+/// Issue #2186（TABLE-25）: `@?`／`@@` の結果列は boolean（OID 16）として RowDescription に載り、
+/// silent=true の関数形と同じ値になる。path 構文エラー（`42601`）・型エラー（`42883`）・
+/// 抑止されない評価エラー（未定義変数 `42704`）は ErrorResponse の SQLSTATE で届く。
+#[test]
+fn wire_jsonpath_operators_advertise_bool_oid_and_report_sqlstates() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = common::spawn_server_with_engine(&users_path, core);
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    common::send_simple_query(
+        &mut alice,
+        r#"INSERT INTO docs (id, embedding, docb) VALUES (1, '[0.1,0.2,0.3]', '{"a":[1,2,3]}') USING OPERATION_ID 'op-jpo-1'"#,
+    );
+    assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT docb @? '$.a' AS ex, docb @@ '$.a[0] == 1' AS m, docb @? '$.zzz' AS nx \
+         FROM docs WHERE id = 1 LIMIT 1",
+    );
+    let columns = common::read_row_description_with_oids(&mut alice);
+    assert_eq!(
+        columns,
+        vec![
+            ("ex".to_string(), 16),
+            ("m".to_string(), 16),
+            ("nx".to_string(), 16),
+        ]
+    );
+    assert_eq!(
+        common::read_data_row(&mut alice),
+        vec![
+            Some("t".to_string()),
+            Some("t".to_string()),
+            Some("f".to_string()),
+        ]
+    );
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+
+    for (sql, sqlstate) in [
+        (
+            "SELECT docb @? '$.' FROM docs WHERE id = 1 LIMIT 1",
+            "42601",
+        ),
+        ("SELECT id @? '$.a' FROM docs WHERE id = 1 LIMIT 1", "42883"),
+        (
+            "SELECT docb @? '$x' FROM docs WHERE id = 1 LIMIT 1",
+            "42704",
+        ),
+    ] {
+        common::send_simple_query(&mut alice, sql);
+        common::expect_error_response_with_sqlstate(&mut alice, sqlstate);
+        common::read_ready_for_query(&mut alice);
+    }
+}
+
 /// Issue #1598: 拡張クエリプロトコルでも `?`／`?|`／`?&`／`<@`／`@>` を含む SQL が Parse できる
 /// （`?` を `$n` と取り違えない）。結果は simple query と同じ `t`。
 #[test]
@@ -496,6 +555,9 @@ fn wire_jsonb_containment_operators_work_over_extended_query() {
         "docb ?& '{a,b}'",
         "docb <@ '{\"a\":1,\"b\":2,\"c\":3}'",
         "docb @> '{\"a\":1}'",
+        // Issue #2186: `$n` と取り違えない jsonpath 演算子。
+        "docb @? '$.a'",
+        "docb @@ '$.a == 1'",
     ]
     .iter()
     .enumerate()

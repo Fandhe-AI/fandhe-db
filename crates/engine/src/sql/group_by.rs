@@ -410,7 +410,7 @@ pub(crate) fn single_text_key_column(group_by: &crate::sql::parser::BoundGroupBy
 fn key_component_budget_bytes(value: Option<&ScalarKeyRef<'_>>) -> usize {
     match value {
         None => 0,
-        Some(ScalarKeyRef::Bytes(b)) => b.len(),
+        Some(ScalarKeyRef::Bytes(b) | ScalarKeyRef::Collated { text: b, .. }) => b.len(),
         Some(_) => RESULT_CELL_FIXED_BYTES,
     }
 }
@@ -1177,6 +1177,7 @@ pub(crate) fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         | Cell::Date(_)
         | Cell::Timestamp(_)
         | Cell::Time(_)
+        | Cell::TimestampTz(_)
         | Cell::Array(_)
         | Cell::Bytes(_)
         | Cell::Json(_)
@@ -1279,7 +1280,8 @@ fn cmp_cell_values(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         (Cell::Integer(x), Cell::Float(y)) => (*x as f64).total_cmp(y),
         (Cell::Float(x), Cell::Integer(y)) => x.total_cmp(&(*y as f64)),
         (Cell::Float(x), Cell::Float(y)) => x.total_cmp(y),
-        // 集計結果の `ORDER BY` は項目の照合を運ばない（既定照合の比較器。#2190）。
+        // 集計結果の `ORDER BY` は項目の照合を運ばない（既定照合の比較器）。非バイト列順の照合の
+        // MIN/MAX を並べ替えに使う形は束縛段が拒否する（TABLE-28・Issue #2190）。
         (Cell::Text(x), Cell::Text(y)) => {
             crate::collation::Collation::DEFAULT.compare(x.as_bytes(), y.as_bytes())
         }
@@ -1349,6 +1351,7 @@ pub(crate) fn has_text_min_max_aggregate(items: &[crate::sql::parser::BoundAggre
         ) && matches!(
             item.input,
             crate::sql::parser::AggregateInput::TextColumn(_)
+                | crate::sql::parser::AggregateInput::CollatedTextColumn { .. }
         )
     })
 }
@@ -2546,7 +2549,8 @@ fn eval_group_row_exprs(
         order_values.push(expr_value_to_order_value(
             &value,
             *kind,
-            // 集計文の式 `ORDER BY` は照合を運ばない（既定照合。照合の受け渡しは #2190）。
+            // 集計文の式 `ORDER BY` は照合を運ばない（既定照合）。グループキー・集計結果が非バイト列順の
+            // 照合を持つ場合の式への参照は、行ビューの列が照合を持つため式束縛が拒否する（Issue #2190）。
             crate::collation::Collation::DEFAULT,
         )?);
     }
@@ -2646,6 +2650,7 @@ pub(crate) fn cell_to_scalar_ref(
         Cell::Numeric(d) => Some(row_codec::ScalarRef::Numeric(*d)),
         Cell::Uuid(u) => Some(row_codec::ScalarRef::Uuid(*u)),
         Cell::Time(t) => Some(row_codec::ScalarRef::Time(*t)),
+        Cell::TimestampTz(t) => Some(row_codec::ScalarRef::TimestampTz(*t)),
         Cell::Vector(_) | Cell::Array(_) | Cell::Bytes(_) | Cell::Json(_) => {
             return Err(accumulator_bug(
                 "group row cell type is not usable in an expression",

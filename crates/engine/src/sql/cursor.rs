@@ -292,7 +292,8 @@ pub(crate) fn estimate_cell_bytes(cell: &Cell) -> usize {
         | Cell::SignedInteger(_)
         | Cell::Float(_)
         | Cell::Timestamp(_)
-        | Cell::Time(_) => 8,
+        | Cell::Time(_)
+        | Cell::TimestampTz(_) => 8,
         Cell::Date(_) => 4,
         Cell::Text(s) => s.len().saturating_add(8),
         Cell::Bytes(b) => b.len().saturating_add(8),

@@ -766,6 +766,7 @@ fn bind_filter_op(
                 | ColumnType::Date
                 | ColumnType::Timestamp
                 | ColumnType::Time
+                | ColumnType::TimestampTz
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json

@@ -679,7 +679,9 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Date
-        | ColumnType::Timestamp => false,
+        | ColumnType::Timestamp
+        // TIMESTAMPTZ は OID 1184 の公告・バイナリ入出力と同時に対応する（#1577）。
+        | ColumnType::TimestampTz => false,
     }
 }
 
@@ -726,6 +728,7 @@ fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeE
         | ColumnType::Numeric { .. }
         | ColumnType::Date
         | ColumnType::Timestamp
+        | ColumnType::TimestampTz
         | ColumnType::Time => Ok(-1),
     }
 }
@@ -780,6 +783,9 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         engine::catalog::ColumnType::Timestamp => WireType::Timestamp,
         // TIME は time（OID 1083・typlen 8。TABLE-32・Issue #1571）。
         engine::catalog::ColumnType::Time => WireType::Time,
+        // TIMESTAMPTZ は専用 OID（1184）の公告が #1577 の担当のため、暫定で text（OID 25）を
+        // 公告し値は `datetime::format_timestamptz` の ISO 文字列で出す（Issue #1574）。
+        engine::catalog::ColumnType::TimestampTz => WireType::Text,
         engine::catalog::ColumnType::Bytea => WireType::Bytea,
         engine::catalog::ColumnType::Uuid => WireType::Uuid,
         engine::catalog::ColumnType::Json => WireType::Json,
@@ -928,6 +934,12 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         Cell::Timestamp(micros) => Ok(Some(engine::datetime::format_timestamp(*micros))),
         // TIME は `HH:MM:SS[.ffffff]` に整形する（Issue #1569。OID は暫定で text）。
         Cell::Time(micros) => Ok(Some(engine::datetime::format_time(*micros))),
+        // セッション TimeZone での表示は #1575 の担当。それまでは UTC 固定で整形する
+        // （Issue #1574。`+00` 付きの ISO 形式）。
+        Cell::TimestampTz(micros) => Ok(Some(engine::datetime::format_timestamptz(
+            *micros,
+            &engine::datetime::SessionTimeZone::utc(),
+        ))),
         Cell::Array(array_value) => Ok(Some(pg_array_text(array_value))),
         // `BYTEA` のテキスト表現は PostgreSQL 既定の `bytea_output=hex`（`\x` ＋
         // 小文字 16 進）と同形にする（B5・Issue #886）。
@@ -3199,6 +3211,36 @@ mod tests {
         one_computed_binary(T::Bpchar(5), Cell::Text("ab  ".to_string()), &mut a).unwrap();
         one_computed_binary(T::Text, Cell::Text("ab  ".to_string()), &mut b).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// Issue #1574: TIMESTAMPTZ は text（OID 25）で公告し、値は UTC の ISO 形式で出す。
+    /// バイナリ形式は未対応のため fail-closed で拒否する。
+    #[test]
+    fn timestamptz_column_is_advertised_as_text_with_utc_iso_and_no_binary() {
+        use engine::catalog::ColumnType;
+        let meta = ColumnMeta::Scalar {
+            name: "t".to_string(),
+            ty: ColumnType::TimestampTz,
+        };
+        // OID 1184 の公告・バイナリ入出力は #1577。それまでは text（OID 25）で公告する。
+        assert_eq!(column_wire_type(&meta), WireType::Text);
+        assert_eq!(column_wire_type(&meta).oid(), 25);
+        assert!(!column_binary_support(&meta));
+        let columns = vec![meta.clone()];
+        assert!(validate_binary_formats(&columns, &[FormatCode::Binary]).is_err());
+        for (micros, want) in [
+            (0, "1970-01-01 00:00:00+00"),
+            (1_767_236_400_000_000, "2026-01-01 03:00:00+00"),
+            (
+                engine::datetime::TIMESTAMPTZ_MAX_MICROS,
+                "9999-12-31 23:59:59.999999+00",
+            ),
+        ] {
+            assert_eq!(
+                cell_to_text_for_column(&meta, &Cell::TimestampTz(micros)).expect("text"),
+                Some(want.to_string())
+            );
+        }
     }
 
     /// Issue #1571: TIME は time（OID 1083・typlen 8）を公告し、text は `HH:MM:SS[.ffffff]`、

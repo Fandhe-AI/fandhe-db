@@ -234,6 +234,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::Date
                         | ColumnType::Timestamp
                         | ColumnType::Time
+                        | ColumnType::TimestampTz
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -418,7 +419,12 @@ fn predicted_heap_entry_bytes(refs: &[Option<ScalarKeyRef<'_>>], tenant_id_len: 
             .saturating_mul(std::mem::size_of::<Option<OrderValue>>()),
     );
     for r in refs {
-        if let Some(ScalarKeyRef::Bytes(b) | ScalarKeyRef::JsonbKey(b)) = r {
+        if let Some(
+            ScalarKeyRef::Bytes(b)
+            | ScalarKeyRef::JsonbKey(b)
+            | ScalarKeyRef::Collated { text: b, .. },
+        ) = r
+        {
             bytes = bytes.saturating_add(b.len());
         }
     }
@@ -758,6 +764,17 @@ fn build_projected_cells(
                         }
                         Some(None) | None => cells.push(Cell::Null),
                     },
+                    ColumnType::TimestampTz => {
+                        match scanned.get(*index) {
+                            Some(Some(row_codec::ScalarRef::TimestampTz(t))) => {
+                                cells.push(Cell::TimestampTz(*t))
+                            }
+                            Some(Some(_)) => return Err(scan_bug(
+                                "TIMESTAMPTZ column scan yielded a non-TimestampTz scalar value",
+                            )),
+                            Some(None) | None => cells.push(Cell::Null),
+                        }
+                    }
                     ColumnType::Array(_) => match scanned.get(*index) {
                         Some(Some(row_codec::ScalarRef::Array(array_ref))) => {
                             let value = try_alloc_array_for_budget(
@@ -989,7 +1006,10 @@ fn heap_entry_keys_bytes(entry: &HeapEntry) -> usize {
         .capacity()
         .saturating_mul(std::mem::size_of::<Option<OrderValue>>());
     for key in &entry.keys {
-        if let Some(OrderValue::Bytes(b) | OrderValue::JsonbKey(b)) = key {
+        if let Some(
+            OrderValue::Bytes(b) | OrderValue::JsonbKey(b) | OrderValue::Collated { text: b, .. },
+        ) = key
+        {
             bytes = bytes.saturating_add(b.len());
         }
     }
