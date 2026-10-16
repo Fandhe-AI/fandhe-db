@@ -41,9 +41,13 @@ pub(crate) enum BinaryParam {
     /// timestamptz（2000-01-01 00:00:00 UTC 起点マイクロ秒の 8 バイト BE。TABLE-33・
     /// Issue #1577）。
     TimestampTz,
+    /// numeric（`numeric_send` レイアウト。WIRE-26・Issue #2443）。長さ・`ndigits` を
+    /// アロケーション前に上限検証し、正規の 10 進テキストへ変換する。
+    Numeric,
 }
 
-/// バイナリ値の復号失敗。長さ不正は `08P01`、TIME・TIMESTAMPTZ の範囲外は `22008`
+/// バイナリ値の復号失敗。長さ不正は `08P01`、TIME・TIMESTAMPTZ の範囲外は `22008`、
+/// numeric の外部表現不正は `22P03`・範囲超過は `22003`
 /// （`extended_query` が別々の `HandlerError` へ写す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinaryParamError {
@@ -51,6 +55,182 @@ pub(crate) enum BinaryParamError {
     InvalidLength,
     /// 値が型の許容範囲外（TIME・TIMESTAMPTZ。Issue #1571・#1577）。
     OutOfRange,
+    /// numeric の外部表現が不正（未知の符号・範囲外の `dscale`・範囲外の桁群。`22P03`。
+    /// Issue #2443）。
+    InvalidRepresentation,
+    /// numeric の値が engine の絶対上限（整数部 38 桁・テキスト 1024 バイト）を超える
+    /// （`22003`。列ごとの精度超過は engine の束縛段が判定する。Issue #2443）。
+    NumericOutOfRange,
+}
+
+/// numeric 符号語（`numeric_send` の `sign`）。
+const NUMERIC_POS: u16 = 0x0000;
+const NUMERIC_NEG: u16 = 0x4000;
+const NUMERIC_NAN: u16 = 0xC000;
+const NUMERIC_PINF: u16 = 0xD000;
+const NUMERIC_NINF: u16 = 0xF000;
+/// `dscale` に使える下位 14 ビット（PostgreSQL の `NUMERIC_DSCALE_MASK`）。
+const NUMERIC_DSCALE_MASK: u16 = 0x3FFF;
+
+/// 先頭から 2 バイトを BE の `u16` として読む（範囲外は長さ不正）。
+fn be_u16(raw: &[u8], at: usize) -> Result<u16, BinaryParamError> {
+    let end = at.checked_add(2).ok_or(BinaryParamError::InvalidLength)?;
+    let b = raw
+        .get(at..end)
+        .and_then(|s| <[u8; 2]>::try_from(s).ok())
+        .ok_or(BinaryParamError::InvalidLength)?;
+    Ok(u16::from_be_bytes(b))
+}
+
+/// 0..=9999 の 1 群を 4 桁（`pad` なら先頭ゼロ込み、でなければ先頭ゼロ省略）で `out` へ追記する。
+/// 呼び出し側が `g <= 9999` を検証済みの契約（桁は 0..=9 のため `b'0' + d` は溢れない）。
+fn push_group(out: &mut String, g: u16, pad: bool, nonzero: &mut bool) {
+    let digits = [g / 1000, g / 100 % 10, g / 10 % 10, g % 10];
+    let mut started = pad;
+    for d in digits {
+        if d != 0 {
+            started = true;
+            *nonzero = true;
+        }
+        if started {
+            out.push(char::from(
+                b'0'.saturating_add(u8::try_from(d).unwrap_or(0)),
+            ));
+        }
+    }
+    if !started {
+        // 先頭群が 0 の場合（整数部 0）は呼び出し側が扱うため通常到達しない。
+        out.push('0');
+    }
+}
+
+/// numeric のバイナリ受信形式を正規 10 進テキスト（または `NaN`／`Infinity`／`-Infinity`）へ
+/// 復号する（WIRE-26・Issue #2443）。受信データ経路のため添字・`unwrap` を使わず、
+/// 長さ・`ndigits`・符号・`dscale`・桁群・出力長をすべてアロケーション前に検査する。
+/// 判定順: 長さ（08P01）→ 符号・`dscale`・桁群（22P03）→ 範囲（22003）。
+/// 小数第 `dscale` 位より下の桁は PostgreSQL の受信処理と同じく切り捨て、列の精度・scale への
+/// 丸めと超過判定は engine の束縛段（`parse_for_column`）に任せる。
+fn decode_numeric(raw: &[u8]) -> Result<String, BinaryParamError> {
+    if raw.len() < 8 {
+        return Err(BinaryParamError::InvalidLength);
+    }
+    let ndigits = usize::from(be_u16(raw, 0)?);
+    if ndigits > crate::result_encoder::binary::NUMERIC_MAX_GROUPS {
+        return Err(BinaryParamError::InvalidLength);
+    }
+    let expected = ndigits
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(8))
+        .ok_or(BinaryParamError::InvalidLength)?;
+    if raw.len() != expected {
+        return Err(BinaryParamError::InvalidLength);
+    }
+    let weight = i32::from(be_u16(raw, 2)? as i16);
+    let sign = be_u16(raw, 4)?;
+    let dscale = be_u16(raw, 6)?;
+    if !matches!(
+        sign,
+        NUMERIC_POS | NUMERIC_NEG | NUMERIC_NAN | NUMERIC_PINF | NUMERIC_NINF
+    ) || dscale & !NUMERIC_DSCALE_MASK != 0
+    {
+        return Err(BinaryParamError::InvalidRepresentation);
+    }
+    let mut groups = [0u16; crate::result_encoder::binary::NUMERIC_MAX_GROUPS];
+    for (i, slot) in groups.iter_mut().take(ndigits).enumerate() {
+        let at = i
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(8))
+            .ok_or(BinaryParamError::InvalidLength)?;
+        let g = be_u16(raw, at)?;
+        if g > 9999 {
+            return Err(BinaryParamError::InvalidRepresentation);
+        }
+        *slot = g;
+    }
+    match sign {
+        NUMERIC_NAN => return Ok("NaN".to_string()),
+        NUMERIC_PINF => return Ok("Infinity".to_string()),
+        NUMERIC_NINF => return Ok("-Infinity".to_string()),
+        _ => {}
+    }
+    // 指数 `e`（10^(4e) の位）の群。範囲外は 0。
+    let group_at = |e: i32| -> u16 {
+        weight
+            .checked_sub(e)
+            .and_then(|i| usize::try_from(i).ok())
+            .filter(|i| *i < ndigits)
+            .and_then(|i| groups.get(i))
+            .copied()
+            .unwrap_or(0)
+    };
+    // 先頭の非ゼロ群から整数部の有効桁数を求める（全群 0 なら整数部は `0`）。
+    let first = groups.iter().take(ndigits).position(|g| *g != 0);
+    let int_top_exp = first.and_then(|f| {
+        let e = weight.checked_sub(i32::try_from(f).ok()?)?;
+        (e >= 0).then_some(e)
+    });
+    let int_digits = match (int_top_exp, first.and_then(|f| groups.get(f)).copied()) {
+        (Some(e), Some(g)) => {
+            let lead = match g {
+                0..=9 => 1,
+                10..=99 => 2,
+                100..=999 => 3,
+                _ => 4,
+            };
+            e.checked_mul(4)
+                .and_then(|n| n.checked_add(lead))
+                .ok_or(BinaryParamError::NumericOutOfRange)?
+        }
+        _ => 1,
+    };
+    if int_digits > i32::from(engine::numeric::MAX_PRECISION) {
+        return Err(BinaryParamError::NumericOutOfRange);
+    }
+    let scale = usize::from(dscale);
+    let total = usize::try_from(int_digits)
+        .ok()
+        .and_then(|n| n.checked_add(1)) // 符号
+        .and_then(|n| n.checked_add(if scale > 0 { scale.checked_add(1)? } else { 0 }))
+        .ok_or(BinaryParamError::NumericOutOfRange)?;
+    if total > engine::numeric::MAX_LITERAL_LEN {
+        return Err(BinaryParamError::NumericOutOfRange);
+    }
+    let mut out = String::with_capacity(total);
+    let mut nonzero = false;
+    match int_top_exp {
+        Some(top) => {
+            for e in (0..=top).rev() {
+                push_group(&mut out, group_at(e), e != top, &mut nonzero);
+            }
+        }
+        None => out.push('0'),
+    }
+    if scale > 0 {
+        out.push('.');
+        let mut remaining = scale;
+        let mut e: i32 = -1;
+        while remaining > 0 {
+            let g = group_at(e);
+            // 4 桁を固定長配列で生成し、ヒープ確保なしで必要桁だけ out へ追記する。
+            let digits = [g / 1000, g / 100 % 10, g / 10 % 10, g % 10];
+            let take = remaining.min(4);
+            for d in digits.iter().take(take) {
+                if *d != 0 {
+                    nonzero = true;
+                }
+                out.push(char::from(
+                    b'0'.saturating_add(u8::try_from(*d).unwrap_or(0)),
+                ));
+            }
+            remaining -= take;
+            e = e.saturating_sub(1);
+        }
+    }
+    // 切り捨て後に全桁 0 なら符号を付けない（`-0` を出さない）。
+    if sign == NUMERIC_NEG && nonzero {
+        out.insert(0, '-');
+    }
+    Ok(out)
 }
 
 /// float を PostgreSQL のテキスト入力が受理する表記へ変換する（有限値は最短往復桁）。
@@ -105,6 +285,7 @@ pub(crate) fn decode_to_text(kind: BinaryParam, raw: &[u8]) -> Result<Vec<u8>, B
             let b = <[u8; 16]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
             engine::uuid::Uuid::from_bytes(b).to_string()
         }
+        BinaryParam::Numeric => decode_numeric(raw)?,
         BinaryParam::Bytea => engine::bytea::format_hex_text(raw),
         BinaryParam::Time => {
             let b = <[u8; 8]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
@@ -281,5 +462,175 @@ mod tests {
             decode_to_text(BinaryParam::Unsupported, &[]),
             Err(BinaryParamError::InvalidLength)
         );
+    }
+
+    /// numeric バイト列を組み立てる（ヘッダ + 桁群。値の正規性は検査しない）。
+    fn nraw(ndigits: u16, weight: i16, sign: u16, dscale: u16, groups: &[u16]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for w in [ndigits, weight as u16, sign, dscale] {
+            v.extend_from_slice(&w.to_be_bytes());
+        }
+        for g in groups {
+            v.extend_from_slice(&g.to_be_bytes());
+        }
+        v
+    }
+
+    fn ndec(raw: &[u8]) -> Result<String, BinaryParamError> {
+        decode_to_text(BinaryParam::Numeric, raw).map(|b| String::from_utf8(b).expect("utf8"))
+    }
+
+    #[test]
+    fn numeric_round_trips_with_result_encoder() {
+        let max38 = 10u128.pow(38) - 1;
+        let cases: [(bool, u128, u8); 13] = [
+            (false, 0, 0),
+            (false, 0, 2),
+            (false, 1, 0),
+            (true, 1, 0),
+            (false, 9999, 0),
+            (false, 10000, 0),
+            (true, 5, 1),
+            (false, 1_234_567_890_123, 4),
+            (false, max38, 0),
+            (true, max38, 0),
+            (false, 1, 38),
+            (false, 1, 37),
+            (false, max38, 38),
+        ];
+        for (neg, mag, scale) in cases {
+            let (buf, n) = binary::numeric(neg, mag, scale).expect("encode");
+            let raw = buf.get(..n).expect("len");
+            let signed = i128::try_from(mag).expect("fits");
+            let d = engine::numeric::Decimal::from_parts(if neg { -signed } else { signed }, scale)
+                .expect("decimal");
+            assert_eq!(
+                ndec(raw).expect("decode"),
+                d.to_string(),
+                "{neg} {mag} {scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_normalizes_and_truncates() {
+        // 先頭・末尾のゼロ群を含む 12.5（weight 1: [0, 12, 5000, 0]）。
+        assert_eq!(
+            ndec(&nraw(4, 1, 0, 1, &[0, 12, 5000, 0])).as_deref(),
+            Ok("12.5")
+        );
+        // dscale より下の桁は切り捨て（123.456 → dscale 1）。
+        assert_eq!(
+            ndec(&nraw(2, 0, 0, 1, &[123, 4560])).as_deref(),
+            Ok("123.4")
+        );
+        // 切り捨てで全桁 0 になる負値は符号なし。
+        assert_eq!(
+            ndec(&nraw(1, -1, NUMERIC_NEG, 2, &[10])).as_deref(),
+            Ok("0.00")
+        );
+        assert_eq!(
+            ndec(&nraw(1, -1, NUMERIC_NEG, 2, &[1000])).as_deref(),
+            Ok("-0.10")
+        );
+        // 負号付きのゼロ。
+        assert_eq!(ndec(&nraw(0, 0, NUMERIC_NEG, 0, &[])).as_deref(), Ok("0"));
+        // 全群ゼロなら巨大な weight でも 0。
+        assert_eq!(ndec(&nraw(1, i16::MAX, 0, 0, &[0])).as_deref(), Ok("0"));
+        // dscale 0 は小数部を捨てる。
+        assert_eq!(ndec(&nraw(2, 0, 0, 0, &[7, 9999])).as_deref(), Ok("7"));
+        // weight が桁群より大きい場合はゼロ詰め。
+        assert_eq!(ndec(&nraw(1, 2, 0, 0, &[3])).as_deref(), Ok("300000000"));
+    }
+
+    #[test]
+    fn numeric_special_values() {
+        assert_eq!(ndec(&nraw(0, 0, NUMERIC_NAN, 0, &[])).as_deref(), Ok("NaN"));
+        assert_eq!(
+            ndec(&nraw(0, 0, NUMERIC_PINF, 0, &[])).as_deref(),
+            Ok("Infinity")
+        );
+        assert_eq!(
+            ndec(&nraw(0, 0, NUMERIC_NINF, 0, &[])).as_deref(),
+            Ok("-Infinity")
+        );
+        // 特殊値でも桁群は検証する。
+        assert_eq!(
+            ndec(&nraw(1, 0, NUMERIC_NAN, 0, &[10000])),
+            Err(BinaryParamError::InvalidRepresentation)
+        );
+    }
+
+    #[test]
+    fn numeric_length_errors_are_invalid_length() {
+        for len in 0..8 {
+            assert_eq!(ndec(&vec![0u8; len]), Err(BinaryParamError::InvalidLength));
+        }
+        let ok = nraw(2, 0, 0, 0, &[1, 2]);
+        assert!(ndec(&ok).is_ok());
+        for cut in [1usize, 2] {
+            assert_eq!(
+                ndec(ok.get(..ok.len() - cut).expect("cut")),
+                Err(BinaryParamError::InvalidLength)
+            );
+            let mut longer = ok.clone();
+            longer.extend(std::iter::repeat_n(0u8, cut));
+            assert_eq!(ndec(&longer), Err(BinaryParamError::InvalidLength));
+        }
+        // ndigits の上限は 32（受理）・33（拒否）。
+        let g32 = vec![0u16; 32];
+        assert!(ndec(&nraw(32, 0, 0, 0, &g32)).is_ok());
+        let g33 = vec![0u16; 33];
+        assert_eq!(
+            ndec(&nraw(33, 0, 0, 0, &g33)),
+            Err(BinaryParamError::InvalidLength)
+        );
+        assert_eq!(
+            ndec(&nraw(0xFFFF, 0, 0, 0, &[])),
+            Err(BinaryParamError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn numeric_representation_errors_are_22p03() {
+        let bad = BinaryParamError::InvalidRepresentation;
+        for sign in [0x8000u16, 0x0001, 0xFFFF] {
+            assert_eq!(ndec(&nraw(0, 0, sign, 0, &[])), Err(bad), "sign {sign:#x}");
+        }
+        for dscale in [0x4000u16, 0xFFFF] {
+            assert_eq!(
+                ndec(&nraw(0, 0, 0, dscale, &[])),
+                Err(bad),
+                "dscale {dscale:#x}"
+            );
+        }
+        // 0x3FFF は 22P03 ではなく範囲超過（22003）。
+        assert_eq!(
+            ndec(&nraw(0, 0, 0, 0x3FFF, &[])),
+            Err(BinaryParamError::NumericOutOfRange)
+        );
+        for g in [10000u16, 0xFFFF] {
+            assert_eq!(ndec(&nraw(1, 0, 0, 0, &[g])), Err(bad), "group {g}");
+        }
+        // 長さ不正が表現不正より先。
+        assert_eq!(
+            ndec(&nraw(1, 0, 0x8000, 0, &[])),
+            Err(BinaryParamError::InvalidLength)
+        );
+        // 符号不正と桁不正が同時なら 22P03。
+        assert_eq!(ndec(&nraw(1, 0, 0x8000, 0, &[10000])), Err(bad));
+    }
+
+    #[test]
+    fn numeric_range_errors_are_22003() {
+        let over = BinaryParamError::NumericOutOfRange;
+        // 整数部 38 桁は受理、39 桁は拒否（weight 9・先頭群 1 桁 = 37 桁、先頭群 2 桁 = 38 桁）。
+        let ok38 = ndec(&nraw(1, 9, 0, 0, &[10])).expect("38 digits");
+        assert_eq!(ok38.len(), 38);
+        assert_eq!(ndec(&nraw(1, 9, 0, 0, &[100])), Err(over));
+        assert_eq!(ndec(&nraw(1, i16::MAX, 0, 0, &[1])), Err(over));
+        // テキスト長（符号 1 + 整数部 1 + '.' + dscale）が 1024 ちょうど（dscale 1021）は受理、超過は拒否。
+        assert!(ndec(&nraw(0, 0, 0, 1021, &[])).is_ok());
+        assert_eq!(ndec(&nraw(0, 0, 0, 1022, &[])), Err(over));
     }
 }

@@ -1129,6 +1129,7 @@ Date: <IMF-fixdate>
 | `2203B` | `JSON_NUMBER_NOT_FOUND` | 400 | Bad Request | jsonpath の単項算術・`.abs()` 等が数値以外に適用された。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
 | `2203C` | `JSON_OBJECT_NOT_FOUND` | 400 | Bad Request | jsonpath のメンバーアクセサ・`.keyvalue()` がオブジェクト以外に適用された（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
 | `22P02` | `INVALID_TEXT_REPRESENTATION` | 400 | Bad Request | 値の形式不正: ENUM 列の語彙外ラベル・INTEGER／BIGINT 列への小数／指数表記・BYTEA の不正 base64・NUMERIC／配列／JSON 列の形式不正（`insert`／`update`／`filter`。Issue #1187） |
+| `22P03` | `INVALID_BINARY_REPRESENTATION` | 400 | Bad Request | numeric パラメータのバイナリ受信で外部表現（符号・`dscale`・桁群）が不正。SQL 表層（拡張クエリの Bind）専用で、NoSQL の `op` 語彙からは到達しない。Issue #2443 |
 | `22P05` | `UNTRANSLATABLE_CHARACTER` | 400 | Bad Request | jsonpath リテラルに NUL 文字（`\u0000`・`\x00`）が含まれる。SQL 表層（`jsonb_path_*`）専用で、NoSQL の `op` 語彙からは到達しない。Issue #2185 |
 | `23502` | `MISSING_OPERATION_ID` | 400 | Bad Request | `insert` の `operation_id` 欠落 |
 | `23502` | `NOT_NULL_VIOLATION` | 400 | Bad Request | `NOT NULL` 列（TABLE-16・TASK-204）への `insert`／`update` での省略・明示 `null` |

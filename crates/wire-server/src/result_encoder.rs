@@ -292,7 +292,10 @@ pub mod binary {
     pub const NUMERIC_MAX_BYTES: usize = 8 + 2 * NUMERIC_MAX_GROUPS;
     /// 組み立て用の桁群バッファ上限。u128（最大 39 桁＝10 群）の整数部と
     /// 小数部（scale 最大 38 → 10 群）の合計 20 群に余裕を持たせた固定長。
-    const NUMERIC_MAX_GROUPS: usize = 32;
+    ///
+    /// 受信側（`binary_param` の numeric 復号）も `ndigits` の上限としてこの値を共有する
+    /// （列の精度上限 38 桁は最大 20 群で、整列とゼロ詰めの余裕を加えた値。Issue #2443）。
+    pub(crate) const NUMERIC_MAX_GROUPS: usize = 32;
 
     /// [`numeric`] の桁群バッファへ 1 群（0..=9999）を追記する。上限超過・範囲外は
     /// `EncodeError`（添字アクセスを避け `get_mut` で境界検査する）。

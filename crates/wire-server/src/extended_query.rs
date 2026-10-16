@@ -500,8 +500,12 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
         PreparedParamType::Text => text_like(),
         PreparedParamType::VectorText => BinaryParam::Unsupported,
         PreparedParamType::Column(meta) => match meta {
-            // `id` は宣言 0（実効 1700=NUMERIC）をバイナリ非対応とする。
-            ColumnMeta::Id => int_kind(effective_oid),
+            // `id` は実効 1700（NUMERIC。宣言 0 または 1700）を numeric バイナリで受理し、
+            // 値の可否は engine の id 束縛規則（小数・負値の拒否）に任せる（Issue #2443）。
+            ColumnMeta::Id => match effective_oid {
+                1700 => BinaryParam::Numeric,
+                other => int_kind(other),
+            },
             ColumnMeta::Computed { .. } | ColumnMeta::AliasedId { .. } => BinaryParam::Unsupported,
             ColumnMeta::Scalar { ty, .. } => match ty {
                 ColumnType::Text | ColumnType::Varchar(_) => text_like(),
@@ -527,8 +531,10 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                         BinaryParam::Unsupported
                     }
                 }
+                // NUMERIC スロットは numeric（OID 1700）のみバイナリ受理（WIRE-26・Issue #2443）。
+                // 宣言 20／23／25／701 等は値の意味が変わりうるため `0A000`（fail-closed）。
+                ColumnType::Numeric { .. } => only(1700, BinaryParam::Numeric),
                 ColumnType::Vector(_)
-                | ColumnType::Numeric { .. }
                 | ColumnType::Date
                 | ColumnType::Timestamp
                 | ColumnType::Json
@@ -1071,6 +1077,14 @@ enum HandlerError {
         index: usize,
         label: &'static str,
     },
+    /// バイナリ形式の numeric 値の外部表現が不正（`22P03`。WIRE-26・Issue #2443）。
+    InvalidBinaryRepresentation {
+        index: usize,
+    },
+    /// バイナリ形式の numeric 値が engine の絶対上限を超える（`22003`。Issue #2443）。
+    BinaryParamNumericOutOfRange {
+        index: usize,
+    },
     /// 結果 format code の解決・事前検査で生じたエラー（WIRE-14。
     /// `result_encoder::BinaryFormatError` をそのまま分類し直したもの）。
     BinaryFormat(result_encoder::BinaryFormatError),
@@ -1125,6 +1139,10 @@ impl HandlerError {
             HandlerError::BinaryFormatUnsupported => ErrorClass::FeatureNotSupported,
             HandlerError::InvalidBinaryParam { .. } => ErrorClass::ProtocolViolation,
             HandlerError::BinaryParamOutOfRange { .. } => ErrorClass::DatetimeFieldOverflow,
+            HandlerError::InvalidBinaryRepresentation { .. } => {
+                ErrorClass::InvalidBinaryRepresentation
+            }
+            HandlerError::BinaryParamNumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
             HandlerError::BinaryFormat(e) => e.error_class(),
             HandlerError::ResultTypeChanged => ErrorClass::FeatureNotSupported,
             HandlerError::SuspendedBytesExceeded => ErrorClass::PayloadTooLarge,
@@ -1193,6 +1211,12 @@ impl HandlerError {
             }
             HandlerError::BinaryParamOutOfRange { index, label } => {
                 format!("{label} out of range in bind parameter ${index}")
+            }
+            HandlerError::InvalidBinaryRepresentation { index } => {
+                format!("invalid external \"numeric\" value in bind parameter ${index}")
+            }
+            HandlerError::BinaryParamNumericOutOfRange { index } => {
+                format!("numeric field overflow in bind parameter ${index}")
             }
             HandlerError::BinaryFormat(result_encoder::BinaryFormatError::FormatCountMismatch) => {
                 "format code count does not match the parameter or result count".to_string()
@@ -1746,6 +1770,12 @@ fn handle_bind_body(
                                 |e| match e {
                                     binary_param::BinaryParamError::InvalidLength => {
                                         HandlerError::InvalidBinaryParam { index: i + 1 }
+                                    }
+                                    binary_param::BinaryParamError::InvalidRepresentation => {
+                                        HandlerError::InvalidBinaryRepresentation { index: i + 1 }
+                                    }
+                                    binary_param::BinaryParamError::NumericOutOfRange => {
+                                        HandlerError::BinaryParamNumericOutOfRange { index: i + 1 }
                                     }
                                     binary_param::BinaryParamError::OutOfRange => {
                                         HandlerError::BinaryParamOutOfRange {
@@ -3257,6 +3287,38 @@ mod tests {
         store.discard_retained_outside_generation(None);
         assert!(store.get("kept_same").is_none());
         assert!(store.get("fresh_other").is_some());
+    }
+
+    /// NUMERIC スロットと `id` スロットは実効 OID 1700 のみ numeric バイナリを受理する
+    /// （WIRE-26・Issue #2443）。互換表外の宣言 OID は fail-closed。
+    #[test]
+    fn binary_param_kind_numeric_and_id_slots() {
+        use engine::catalog::ColumnType;
+        let num = PreparedParamType::Column(ColumnMeta::Scalar {
+            name: "p".to_string(),
+            ty: ColumnType::Numeric {
+                precision: 5,
+                scale: 2,
+            },
+        });
+        for declared in [0, 1700] {
+            assert_eq!(
+                binary_param_kind(&num, declared, 1700),
+                BinaryParam::Numeric
+            );
+        }
+        for declared in [20, 23, 25, 701] {
+            assert_eq!(
+                binary_param_kind(&num, declared, declared),
+                BinaryParam::Unsupported
+            );
+        }
+        let id = PreparedParamType::Column(ColumnMeta::Id);
+        for declared in [0, 1700] {
+            assert_eq!(binary_param_kind(&id, declared, 1700), BinaryParam::Numeric);
+        }
+        assert_eq!(binary_param_kind(&id, 20, 20), BinaryParam::Int8);
+        assert_eq!(binary_param_kind(&id, 23, 23), BinaryParam::Int4);
     }
 
     /// CHAR(n) スロットは宣言 OID 0・25・1043・1042 のバイナリを UTF-8 恒等で受理し、
