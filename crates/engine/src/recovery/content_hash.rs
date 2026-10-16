@@ -1330,6 +1330,24 @@ fn update_where_with_tag(
         .map_err(|_| dml_hash_field_too_large())?;
     push_dml_assignments(&mut b, assignments, DmlVectorRepr::Canonical, schema)?;
     push_dml_where_predicates(&mut b, where_predicates, udf_registry)?;
+    // 分割実行だけは再開（別接続からの同一 operation_id の再送）で残りの行を別の解釈で書き
+    // 足しうるため、TZ 無しの TIMESTAMPTZ リテラル（SET 値・述語）の解釈に使うセッション
+    // TimeZone をハッシュへ含め、異なる TimeZone での再開を内容不一致（22023）にする
+    // （Issue #1575 レビュー指摘）。TIMESTAMPTZ 列を持たないテーブルは入力が変わらない。
+    if matches!(tag, OpTag::UpdateWherePartitioned)
+        && schema
+            .columns
+            .iter()
+            .any(|c| matches!(c.ty, crate::catalog::ColumnType::TimestampTz))
+    {
+        b.push_u8(0xA1);
+        b.push_bytes(
+            crate::datetime::current_session_time_zone()
+                .display()
+                .as_bytes(),
+        )
+        .map_err(|_| dml_hash_field_too_large())?;
+    }
     Ok(b.finish())
 }
 
@@ -4470,6 +4488,39 @@ mod tests {
             column: "lang".to_string(),
             value: "ja".to_string(),
         }]
+    }
+
+    /// TIMESTAMPTZ 列を持つテーブルの分割実行 UPDATE は、セッション TimeZone が違えば
+    /// 別ハッシュ（再開時の別解釈を内容不一致にする。Issue #1575 レビュー指摘）。持たない
+    /// テーブルでは TimeZone に依らず同一。
+    #[test]
+    fn partitioned_update_hash_includes_session_time_zone_only_for_timestamptz_tables() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::datetime::{SessionTimeZone, SessionTimeZoneScope};
+        use crate::sql::udf_call::UdfRegistry;
+        let registry = UdfRegistry::default();
+        let predicates = partitioned_test_predicates();
+        let literal = crate::sql::allowlist::SetValue::Literal(
+            crate::sql::allowlist::InsertLiteral::String("2024-01-01 00:00:00".to_string()),
+        );
+        let assignments = [("ts", &literal)];
+        let hash_in = |tz: &str, schema: &TableSchema| {
+            let _scope =
+                SessionTimeZoneScope::enter(SessionTimeZone::parse_setting(tz).expect("tz"));
+            for_update_where_partitioned("t", &assignments, &predicates, &registry, schema)
+                .expect("hash")
+        };
+        let with_tz = TableSchema::new(
+            "t".to_string(),
+            vec![ColumnDef::new("ts", ColumnType::TimestampTz, true)],
+        );
+        assert_ne!(hash_in("Asia/Tokyo", &with_tz), hash_in("UTC", &with_tz));
+        assert_eq!(hash_in("UTC", &with_tz), hash_in("UTC", &with_tz));
+        let without = TableSchema::new(
+            "t".to_string(),
+            vec![ColumnDef::new("ts", ColumnType::Text, true)],
+        );
+        assert_eq!(hash_in("Asia/Tokyo", &without), hash_in("UTC", &without));
     }
 
     /// 分割実行版は原子版と別ドメイン（タグ 11／12）で、同一入力でも別ハッシュ

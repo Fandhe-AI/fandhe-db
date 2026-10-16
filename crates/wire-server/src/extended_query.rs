@@ -663,30 +663,53 @@ enum PortalBody {
 /// 保持対象は wire 表現ではなく [`engine::sql::exec::ResultRow`] 自体のため、
 /// 行本体・`Cell` 配列・文字列／ベクトル／バイト列のヒープ領域を合算する。NULL や短い値の
 /// 多い行では `Cell` 配列が wire 表現を大幅に上回るため、`frame_len` 単独では上限を超えて
-/// 保持できてしまう（Issue #1575 レビュー指摘）。配列など内部のヒープ量を直接数えない
-/// セルを含む行は、`frame_len`（エンコード済みバイト数）を代理値として 1 度だけ加算する。
-fn retained_row_bytes(row: &engine::sql::exec::ResultRow, frame_len: usize) -> usize {
+/// 保持できてしまう（Issue #1575 レビュー指摘）。配列セルも [`retained_array_bytes`] で
+/// 要素配列と要素内ヒープの実保持量を合算する（wire 表現では代用しない）。
+/// `_frame_len` は呼び出し互換のため受け取るだけで会計には使わない。
+fn retained_row_bytes(row: &engine::sql::exec::ResultRow, _frame_len: usize) -> usize {
     use engine::sql::exec::Cell;
     let mut total = std::mem::size_of::<engine::sql::exec::ResultRow>()
         .saturating_add(row.cells.len().saturating_mul(std::mem::size_of::<Cell>()));
-    let mut opaque = false;
     for cell in &row.cells {
         let heap = match cell {
             Cell::Text(s) | Cell::Json(s) => s.len(),
             Cell::Vector(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
             Cell::Bytes(b) => b.len(),
-            Cell::Array(_) => {
-                opaque = true;
-                0
-            }
+            Cell::Array(a) => retained_array_bytes(a),
             _ => 0,
         };
         total = total.saturating_add(heap);
     }
-    if opaque {
-        total = total.saturating_add(frame_len);
-    }
     total
+}
+
+/// 配列セル 1 個の保持量見積り。要素スロット（`Option<T>`）の配列分に加え、文字列・
+/// バイト列要素のヒープ領域（`String`／`Vec` の本体と内容）を合算する。
+fn retained_array_bytes(array: &engine::row_codec::ArrayValue) -> usize {
+    use engine::row_codec::ArrayValue;
+    fn slots<T>(items: &[Option<T>]) -> usize {
+        items.len().saturating_mul(std::mem::size_of::<Option<T>>())
+    }
+    fn strings(items: &[Option<String>]) -> usize {
+        items.iter().fold(slots(items), |acc, it| {
+            acc.saturating_add(it.as_ref().map_or(0, String::capacity))
+        })
+    }
+    match array {
+        ArrayValue::Text(v) | ArrayValue::Json(v) | ArrayValue::Jsonb(v) | ArrayValue::Enum(v) => {
+            strings(v)
+        }
+        ArrayValue::Bool(v) => slots(v),
+        ArrayValue::Integer(v) | ArrayValue::Date(v) => slots(v),
+        ArrayValue::BigInt(v) | ArrayValue::Timestamp(v) => slots(v),
+        ArrayValue::Real(v) => slots(v),
+        ArrayValue::Double(v) => slots(v),
+        ArrayValue::Uuid(v) => slots(v),
+        ArrayValue::Numeric(v) => slots(v),
+        ArrayValue::Bytea(v) => v.iter().fold(slots(v), |acc, it| {
+            acc.saturating_add(it.as_ref().map_or(0, Vec::capacity))
+        }),
+    }
 }
 
 /// 中断 portal が保持する列メタの保守的なメモリ見積り（上限会計用）。
@@ -2552,6 +2575,32 @@ mod tests {
         };
         assert!(retained_row_bytes(&text_row, 104) >= 100);
         assert_eq!(retained_columns_bytes(&[]), 0);
+    }
+
+    /// 配列セルは wire 表現（空文字列要素は 2 バイト程度）ではなく要素スロット分で計上する。
+    #[test]
+    fn retained_row_bytes_counts_array_slots_not_frame_len() {
+        use engine::row_codec::ArrayValue;
+        use engine::sql::exec::{Cell, ResultRow};
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Array(ArrayValue::Text(vec![
+                Some(String::new());
+                10_000
+            ]))],
+        };
+        let slot = std::mem::size_of::<Option<String>>();
+        assert!(retained_row_bytes(&row, 0) >= 10_000 * slot);
+        let big = ResultRow {
+            id: 2,
+            score: 0.0,
+            cells: vec![Cell::Array(ArrayValue::Bytea(vec![
+                Some(vec![0u8; 64]);
+                100
+            ]))],
+        };
+        assert!(retained_row_bytes(&big, 0) >= 100 * 64);
     }
 
     use super::*;

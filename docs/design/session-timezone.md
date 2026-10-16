@@ -46,7 +46,7 @@
 - strtod 由来の受理形（`'1e1'`・`' 9'`・`'0x10'`・`'9 '`）、jiff の POSIX parser が受け付けない形、±25:59:59 を超える POSIX offset、裸 offset の `:SS` 成分は `22023`。
 - StartupMessage の `TimeZone` 重複は `08P01` で拒否する（PG は後勝ち）。
 - エラー文言は入力値を含まない固定文言（PG は値を付ける）。
-- 分割実行 DML（`... PARTITIONED`）の内容照合ハッシュは SET 値の**リテラル文字列**を入力にするため、TZ を変えて同じ operation_id・同じ SQL を再送しても重複（23505）で拒否され、書き込み直されない（最初の解釈が残る）。
+- 分割実行 `UPDATE ... PARTITIONED` の内容照合ハッシュは、TIMESTAMPTZ 列を持つテーブルでは解決済みのセッション TimeZone の表示名を含む。TimeZone を変えて同じ operation_id・同じ SQL を再送した再開は内容不一致（`22023`）で拒否され、残りの行が別の解釈で書かれない。分割実行 `DELETE` の述語は対象外。
 
 ## 5. 対象外
 
