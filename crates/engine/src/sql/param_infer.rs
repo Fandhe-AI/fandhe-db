@@ -185,6 +185,8 @@ fn builtin_return_type(name: &str) -> Ty {
         | "jsonb_path_query_first"
         | "jsonb_path_exists"
         | "jsonb_path_match" => Ty::Untyped,
+        // INTERVAL を返す正規化関数（Issue #1582）は `$n` の型付け対象外（Double と誤推論しない）。
+        "justify_hours" | "justify_days" | "justify_interval" => Ty::Untyped,
         // 関数形の現在時刻関数（SQL-37・Issue #1586）は TIMESTAMP を返すため、キーワード形
         // （`Expr::ValueFunction`）と同じく対象外型表現へ写像し `assign` で `0A000` にする。
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {

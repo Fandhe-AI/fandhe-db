@@ -1131,6 +1131,17 @@ pub enum BuiltinFn {
     /// `date_part` は暦計算で `24:00:00` が日付境界へ折り返すため別 variant にする。`field` は
     /// 束縛時に `datetime_fn::time_supports_field` で検証済み。
     TimePart(DatePartField),
+    /// `date_part(field, src: Interval) -> Scalar`／`EXTRACT(field FROM interval)`（Issue #1582・
+    /// TABLE-34）。`field` は束縛時に `datetime_fn::interval_supports_field` で検証済み。
+    IntervalPart(DatePartField),
+    /// `date_trunc(unit, src: Interval) -> Interval`（Issue #1582）。`week` は束縛時に `0A000`。
+    IntervalTrunc(DateTruncUnit),
+    /// `justify_hours(interval) -> interval`（Issue #1582）。
+    JustifyHours,
+    /// `justify_days(interval) -> interval`（Issue #1582）。
+    JustifyDays,
+    /// `justify_interval(interval) -> interval`（Issue #1582）。
+    JustifyInterval,
     /// `date_trunc(unit: Text, src: Timestamp) -> Timestamp`（`field` と同じく
     /// `unit` は束縛時に解決済み）。
     DateTrunc(DateTruncUnit),
@@ -1370,6 +1381,10 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "power" => Some(BuiltinFn::Power),
         "sqrt" => Some(BuiltinFn::Sqrt),
         "clock_timestamp" => Some(BuiltinFn::ClockTimestamp),
+        // Issue #1582・TABLE-34: INTERVAL の正規化関数（引数 1 個固定。予約名になる）。
+        "justify_hours" => Some(BuiltinFn::JustifyHours),
+        "justify_days" => Some(BuiltinFn::JustifyDays),
+        "justify_interval" => Some(BuiltinFn::JustifyInterval),
         // `round` は arity オーバーロード（1 引数／2 引数）のため、名前だけでは
         // 一意に variant を決定できない。呼び出し元（`bind_call`・
         // `validate_closed_expr`）が引数個数を見て `Round1`／`Round2` を
@@ -1432,6 +1447,11 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         // 含まれない（§2-4）。
         BuiltinFn::DatePart(_) => (&[ExprType::Timestamp], ExprType::Scalar),
         BuiltinFn::TimePart(_) => (&[ExprType::Time], ExprType::Scalar),
+        BuiltinFn::IntervalPart(_) => (&[ExprType::Interval], ExprType::Scalar),
+        BuiltinFn::IntervalTrunc(_)
+        | BuiltinFn::JustifyHours
+        | BuiltinFn::JustifyDays
+        | BuiltinFn::JustifyInterval => (&[ExprType::Interval], ExprType::Interval),
         BuiltinFn::DatePartTz(_) => (&[ExprType::TimestampTz], ExprType::Scalar),
         BuiltinFn::DateTruncTz(_) => (&[ExprType::TimestampTz], ExprType::TimestampTz),
         BuiltinFn::DateTruncTzZone(_) => (
@@ -1504,6 +1524,11 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         // datetime-scalar-functions.md` に記録）。
         BuiltinFn::DatePart(_)
         | BuiltinFn::TimePart(_)
+        | BuiltinFn::IntervalPart(_)
+        | BuiltinFn::IntervalTrunc(_)
+        | BuiltinFn::JustifyHours
+        | BuiltinFn::JustifyDays
+        | BuiltinFn::JustifyInterval
         | BuiltinFn::DatePartTz(_)
         | BuiltinFn::DateTruncTz(_)
         | BuiltinFn::DateTruncTzZone(_)
@@ -5044,6 +5069,29 @@ fn bind_call(
                 args.len()
             )));
         }
+        // `justify_*`（Issue #1582）は strict 関数: 裸の `NULL` 引数は型検査で
+        // 弾かず、結果型 `Interval` の `NULL` として伝播させる（`date_part` 等と同方針）。
+        if matches!(
+            builtin,
+            BuiltinFn::JustifyHours | BuiltinFn::JustifyDays | BuiltinFn::JustifyInterval
+        ) {
+            if let Some(a) = args.first() {
+                let (b, ty) = bind_null_aware(a, env, node_budget)?;
+                return match ty {
+                    None => Ok((BoundExpr::Null, ret)),
+                    Some(ExprType::Interval) => Ok((
+                        BoundExpr::Builtin {
+                            f: builtin,
+                            args: vec![b],
+                        },
+                        ret,
+                    )),
+                    Some(_) => Err(SqlSurfaceError::datatype_mismatch(format!(
+                        "function {name} argument type mismatch"
+                    ))),
+                };
+            }
+        }
         let mut bound_args = Vec::with_capacity(args.len());
         for (a, expected) in args.iter().zip(param_types.iter()) {
             let (b, ty) = bind_expr_in(a, env, node_budget)?;
@@ -5353,6 +5401,13 @@ fn bind_date_part_or_trunc(
             ),
         });
     }
+    // `date_trunc(text, interval, text)` は PostgreSQL に存在しないため `42883`（Issue #1582）。
+    // zone 付きの暗黙変換経路（下）は INTERVAL を `42804` で拒否してしまうので先に判定する。
+    if has_zone_arg && src_ty == Some(ExprType::Interval) {
+        return Err(SqlSurfaceError::undefined_function(
+            "function date_trunc(text, interval, text) does not exist",
+        ));
+    }
     // `date_trunc(unit, timestamp, zone)` は timestamp を timestamptz へ暗黙変換して第 3 引数の
     // TZ で切り捨てる（PG 17）。`date_trunc(unit, date)` の戻り型は従来どおり timestamp。
     if let Some(zone) = zone_bound {
@@ -5379,6 +5434,53 @@ fn bind_date_part_or_trunc(
                 args: vec![tstz_from_timestamp(src), zone],
             },
             ExprType::TimestampTz,
+        ));
+    }
+    // `INTERVAL` 入力（Issue #1582・TABLE-34）。セッション TZ に依存しないため CHECK 本体でも使える。
+    if src_ty == Some(ExprType::Interval) {
+        let interval_result_ty = if lower_name == "date_part" {
+            ExprType::Scalar
+        } else {
+            ExprType::Interval
+        };
+        let Some(field_name) = field_name else {
+            return Ok((BoundExpr::Null, interval_result_ty));
+        };
+        if lower_name == "date_part" {
+            let field = DatePartField::from_name(&field_name).ok_or_else(|| {
+                SqlSurfaceError::invalid_input(format!("unknown date_part field: {field_name}"))
+            })?;
+            if !datetime_fn::interval_supports_field(field) {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: format!(
+                        "date_part unit {field_name:?} is not supported for type interval"
+                    ),
+                });
+            }
+            return Ok((
+                BoundExpr::Builtin {
+                    f: BuiltinFn::IntervalPart(field),
+                    args: vec![src_bound],
+                },
+                ExprType::Scalar,
+            ));
+        }
+        let unit = DateTruncUnit::from_name(&field_name).ok_or_else(|| {
+            SqlSurfaceError::invalid_input(format!("unknown date_trunc unit: {field_name}"))
+        })?;
+        if unit == DateTruncUnit::Week {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "date_trunc unit \"week\" is not supported for type interval. \
+                         Months usually have fractional weeks."
+                    .to_string(),
+            });
+        }
+        return Ok((
+            BoundExpr::Builtin {
+                f: BuiltinFn::IntervalTrunc(unit),
+                args: vec![src_bound],
+            },
+            ExprType::Interval,
         ));
     }
     // `TIME` 入力（Issue #1570）。`date_part` は時刻成分と `epoch` だけを `TimePart` で受理し、
@@ -6838,6 +6940,32 @@ pub(crate) fn apply_builtin<'a>(
             })?;
             finite_scalar(v, "date_part")
         }
+        BuiltinFn::IntervalPart(field) => {
+            let iv = take_interval_arg(args, 0)?;
+            let v = datetime_fn::interval_part(field, &iv).ok_or_else(|| {
+                SqlSurfaceError::Internal {
+                    detail: "date_part field is not supported for INTERVAL at evaluation time"
+                        .to_string(),
+                }
+            })?;
+            finite_scalar(v, "date_part")
+        }
+        BuiltinFn::IntervalTrunc(unit) => {
+            let iv = take_interval_arg(args, 0)?;
+            datetime_fn::interval_trunc(unit, &iv).map(ExprValue::Interval)
+        }
+        BuiltinFn::JustifyHours => {
+            let iv = take_interval_arg(args, 0)?;
+            interval_arith::justify_hours(&iv).map(ExprValue::Interval)
+        }
+        BuiltinFn::JustifyDays => {
+            let iv = take_interval_arg(args, 0)?;
+            interval_arith::justify_days(&iv).map(ExprValue::Interval)
+        }
+        BuiltinFn::JustifyInterval => {
+            let iv = take_interval_arg(args, 0)?;
+            interval_arith::justify_interval(&iv).map(ExprValue::Interval)
+        }
         BuiltinFn::DateTrunc(unit) => {
             let t = take_timestamp_arg(args, 0)?;
             datetime_fn::date_trunc(unit, t).map(ExprValue::Timestamp)
@@ -7104,6 +7232,22 @@ fn take_scalar_arg(args: &mut [Option<ExprValue<'_>>], idx: usize) -> Result<f64
 fn take_date_arg(args: &mut [Option<ExprValue<'_>>], idx: usize) -> Result<i32, SqlSurfaceError> {
     match args.get_mut(idx).and_then(Option::take) {
         Some(ExprValue::Date(d)) => Ok(d),
+        Some(_) => Err(SqlSurfaceError::Internal {
+            detail: "function argument type mismatch at evaluation time".to_string(),
+        }),
+        None => Err(SqlSurfaceError::Internal {
+            detail: "missing function argument at evaluation time".to_string(),
+        }),
+    }
+}
+
+/// `args[idx]` を `Interval` として取り出す（[`take_date_arg`] 参照。Issue #1582）。
+fn take_interval_arg(
+    args: &mut [Option<ExprValue<'_>>],
+    idx: usize,
+) -> Result<crate::datetime::Interval, SqlSurfaceError> {
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::Interval(v)) => Ok(v),
         Some(_) => Err(SqlSurfaceError::Internal {
             detail: "function argument type mismatch at evaluation time".to_string(),
         }),
@@ -8161,6 +8305,11 @@ mod tests {
             BuiltinFn::Mod,
             BuiltinFn::Power,
             BuiltinFn::Sqrt,
+            BuiltinFn::IntervalPart(DatePartField::Day),
+            BuiltinFn::IntervalTrunc(DateTruncUnit::Day),
+            BuiltinFn::JustifyHours,
+            BuiltinFn::JustifyDays,
+            BuiltinFn::JustifyInterval,
             BuiltinFn::TypedArith(BinOp::Add, NumericKind::Int4),
         ] {
             let (params, _) = builtin_signature(f);

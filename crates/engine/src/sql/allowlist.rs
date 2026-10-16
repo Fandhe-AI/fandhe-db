@@ -6803,6 +6803,10 @@ impl<'a> Parser<'a> {
             });
         }
         let allow_null_for_this_call = name.eq_ignore_ascii_case("concat")
+            // `justify_*`（Issue #1582）も strict 関数として裸の `NULL` を受理する。
+            || name.eq_ignore_ascii_case("justify_hours")
+            || name.eq_ignore_ascii_case("justify_days")
+            || name.eq_ignore_ascii_case("justify_interval")
             || self.const_expr_null_args
             || is_json_fn_call
             || crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase());
