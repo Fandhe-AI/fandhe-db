@@ -509,6 +509,8 @@ fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurface
         // 列参照を子に持ちうるため再帰的に検査する。`Expr::Null` は列参照を
         // 持たない。
         Expr::Null | Expr::ValueFunction { .. } => Ok(()),
+        // 照合指定（TABLE-28・Issue #1609）は内側の式の列参照を検査する。
+        Expr::Collate { expr, .. } => expr_columns_within(columns, expr),
         Expr::Case { whens, else_result } => {
             for (cond, result) in whens {
                 expr_columns_within(columns, cond)?;

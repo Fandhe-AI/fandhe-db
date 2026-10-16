@@ -164,6 +164,16 @@ fn render_expr(expr: &Expr) -> String {
             Some(p) => format!("{}({p})", kind.as_sql()),
             None => kind.as_sql().to_string(),
         },
+        // 式の照合指定（TABLE-28・Issue #1609）。構文段が CHECK 本体での使用を `0A000` で
+        // 拒否するため通常は到達しないが、全 variant 網羅のため往復できる丸括弧付きで出す
+        // （照合名は許可リスト由来の固定文字列で、引用識別子の字句制約を出ない）。
+        Expr::Collate { expr, collation } => {
+            format!(
+                "({} COLLATE \"{}\")",
+                render_expr(expr),
+                collation.sql_name()
+            )
+        }
         // jsonb パス演算子（Issue #1596）。構文段が CHECK 本体での使用を `0A000` で拒否する
         // ため通常は到達しないが、`Expr` の全 variant を網羅するため、往復できる丸括弧付きで出す。
         Expr::JsonAccess { op, lhs, rhs } => format!(
@@ -445,6 +455,7 @@ fn referenced_column_names(
                 collect_idents(rhs, acc);
             }
             Expr::Null | Expr::ValueFunction { .. } => {}
+            Expr::Collate { expr, .. } => collect_idents(expr, acc),
             Expr::Case { whens, else_result } => {
                 for (cond, result) in whens {
                     collect_idents(cond, acc);
@@ -1439,6 +1450,25 @@ mod tests {
                 "round trip mismatch for rendered text {rendered:?}"
             );
         }
+    }
+
+    /// 式の `COLLATE`（TABLE-28・Issue #1609）は CHECK 句の構文段が `0A000` で拒否する
+    /// （結合テスト `sql_collate_ddl`）。`render_expr` の腕は網羅のためのもので、
+    /// 往復できる丸括弧付きの形で出すことだけを固定する。
+    #[test]
+    fn collate_is_rendered_in_parenthesized_form() {
+        use crate::collation::Collation;
+        use crate::sql::allowlist::parse_check_predicate_text;
+        use crate::sql::udf_call::Expr;
+
+        let expr = Expr::Collate {
+            expr: Box::new(Expr::Ident("name".to_string())),
+            collation: Collation::Posix,
+        };
+        assert_eq!(render_expr(&expr), "(name COLLATE \"POSIX\")");
+        // 保存済みテキストの再解析（`in_check_body` なし）は式の往復が成立する。
+        let reparsed = parse_check_predicate_text("name COLLATE \"C\" = 'x'").expect("reparse");
+        assert_eq!(reparsed.len(), 1);
     }
 
     /// codex-review（Cursor Bugbot）P1 指摘の回帰テスト: 文字列スカラー関数群

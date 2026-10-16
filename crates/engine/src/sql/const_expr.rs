@@ -141,6 +141,11 @@ const VALUE_FUNCTION_NAMES: &[&str] = &[
 /// 構文的な事前走査。`Expr` の全 variant を網羅する（`_ =>` を置かない）。
 fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
     match expr {
+        // 定数式文脈（INSERT VALUES・DEFAULT 等）の `COLLATE` は従来どおり `42601`
+        // （TABLE-28・Issue #1609 の対象外。比較・格納の照合対応は #1610）。
+        Expr::Collate { .. } => Err(SqlSurfaceError::unsupported(
+            "COLLATE is not supported in a constant expression",
+        )),
         Expr::Number(_)
         | Expr::String(_)
         | Expr::Null
@@ -221,6 +226,7 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::TimestampLiteral(_)
         | Expr::TimeLiteral(_)
         | Expr::ValueFunction { .. } => Ok(()),
+        Expr::Collate { expr, .. } => check_intermediate_precision(expr),
         Expr::Call { args, .. } => {
             args.iter().try_for_each(check_intermediate_precision)?;
             check_node_value(expr, true)

@@ -49,6 +49,7 @@ pub(crate) fn expr_node_count(expr: &Expr) -> usize {
         Expr::NullIf(a, b) => 1usize
             .saturating_add(expr_node_count(a))
             .saturating_add(expr_node_count(b)),
+        Expr::Collate { expr, .. } => 1usize.saturating_add(expr_node_count(expr)),
         Expr::Case { whens, else_result } => {
             let mut n = 1usize;
             for (c, r) in whens {
