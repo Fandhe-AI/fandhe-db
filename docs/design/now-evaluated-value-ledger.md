@@ -1,6 +1,6 @@
 # ADR: now() 系の評価済み値の台帳保存と内容照合ハッシュへの影響（Issue #1585）
 
-- ステータス: Proposed
+- ステータス: Accepted（#1586・#1587・#2188 で実装済み）
 - 対応 Issue: #1585（親 #1584。後続 #1586・#1587・#2188）
 - 関連ポインタ: `docs/spec/04-behavior/sql-surface.md`（SQL-37）・RECOVER-10・RECOVER-11・
   RECOVER-12・RECOVER-14・RECOVER-15・TABLE-16・TABLE-32・TABLE-33・TASK-248。spec 本文は
@@ -232,3 +232,47 @@ RECOVER-12・TABLE-16・TASK-248）。
   #1587 の範囲では生じなかったため、#2188 で決める（推奨: `LedgerEntryInput { hash, evaluated_at }` の導入）。
 - **spec 側への確認事項**: Issue の「確定時刻を台帳に保持」という表現と、本実装（INSERT 系は構文ハッシュで
   再送を `23505` にし評価値は行に残す、分割実行はジョブ記録に固定時刻を持つ。台帳 v3 は #2188）の対応づけ。
+
+### #2188 での実装メモ
+
+書き込み文での現在時刻関数の評価と台帳 v3 を実装した（ポインタ: SQL-37・RECOVER-10・RECOVER-11・
+RECOVER-12・RECOVER-14・RECOVER-15・TABLE-16・TASK-248）。
+
+- **D4（台帳 v3）**: `[3][hash 32B][txn_start i64 LE]` の 41 バイト固定。長さ不一致・未知の版は従来どおり
+  `Corrupted`（`XX000`）。照合はハッシュだけで行い（v2 と v3 は相互にハッシュで照合できる）、時刻は判定に
+  使わず、エラー応答にも含めない。API 形は設計案の `LedgerEntryInput` ではなく、変更範囲の小さい
+  `LedgerWrite::RecordEvaluated { op_id, txn_start_micros }`（`LedgerWrite::with_evaluated_at` で生成）にした。
+  `tenant.rs` の約 27 か所の記録呼び出しは変えていない。
+  - v3 を書く条件は「その文の束縛・評価が時刻関数を 1 つでも評価した」場合（`ClockScope`／`DefaultClockScope`
+    の `was_used`）。時刻関数を使わない文は v2 のままでバイト不変。評価時刻は
+    `time_fn::ledger_evaluated_at()`（現スレッドのスコープのトランザクション開始時刻）から
+    `record_in_txn_accepting` が取得する。#1587 の `DEFAULT now()` 適用経路にも自動的に v3 が付く。
+  - 同一文の `VALUES` の `now()` と省略列の `DEFAULT now()` は同じ時計を共有する（INSERT 入口が
+    式スコープの確定時刻を DEFAULT スコープへ引き継ぐ）。
+  - 分割実行は完了時の台帳記録（`record_partitioned_completion_in_txn`）に、時刻値関数を含む場合のジョブ固定時刻を
+    渡して v3 を書く（チャンクを 1 つで終えた場合も含む）。`statement_timestamp()`／`clock_timestamp()` は
+    再開時に再現できないため従来どおり `0A000`。
+- **D5（clock_timestamp）**: 呼び出しごと（行ごと）に壁時計を読む。ハッシュは構文形のため再送で揺れない。
+  `DEFAULT clock_timestamp()` は複数行 INSERT で行ごとに評価する。`DEFAULT statement_timestamp()` と
+  `DEFAULT LOCALTIME[(p)]` も受理する（`TimeDefault` に `StatementTimestamp`・`ClockTimestamp`・
+  `LocalTime(Option<u8>)` を追加＝BREAKING。正準テキストは `statement_timestamp`・`clock_timestamp`・
+  `localtime[:p]` で、旧バイナリは decode で `Invalid` にする）。ADD COLUMN の時刻 DEFAULT（D10）と FK の
+  `SET DEFAULT` の拒否は変えない。
+- **受理範囲**: INSERT の `VALUES` は要素全体が単独の時刻関数（`now()`・`transaction_timestamp()`・
+  `statement_timestamp()`・`clock_timestamp()`・`CURRENT_TIMESTAMP[(p)]`・`CURRENT_DATE`・
+  `LOCALTIMESTAMP[(p)]`・`LOCALTIME[(p)]`）の場合に限る（`InsertLiteral::CurrentTime` の追加＝BREAKING）。
+  合成式（`now() + …`）は従来どおり `42601`。原子版の UPDATE SET・UPDATE／DELETE の WHERE は式経路で受理する。
+  UPSERT の `DO UPDATE SET`・COPY・ファイル形 INSERT・NoSQL は受理しない（`CurrentTime` を明示的に拒否）。
+  列型との適合は `TimeDefault::compatible_with`（不一致は `22000` 系の入力不正）。
+- **D2（ハッシュ種別 1）**: `VALUES` 内の単独時刻関数は種別バイト `1`（`HashColumnInput::ValuesTime`）で
+  構文形を直列化する。DEFAULT 適用（種別 `2`）とは別ハッシュになる。時刻関数を含まない文はバイト不変。
+  `BoundInsert::volatile_default_columns` は `Vec<usize>` から `Vec<VolatileColumn>` へ変更（＝BREAKING）。
+- **LOCALTIME**: `TIME` 型。トランザクション開始時刻（精度指定があれば先に丸める）の 1 日の中の時刻。
+  TimeZone 未実装の間は UTC（D8 の暫定方針）。`CURRENT_TIME` は timetz（未実装）のため `0A000` のまま。
+- **D11（変更ログ・レプリケーション）**: 変更ログ（RECOVER-14）とレプリケーション（RECOVER-15）には、行に
+  commit された評価済みの値を記録し、再生時に時刻関数を再評価しない。台帳の `txn_start` は監査・診断用で、
+  再生の入力にしない。
+- **ダウングレード**: v3 を書いた DB を旧バイナリで開くと、該当キーの照合が `XX000`（fail-closed）になる。
+  移行処理は入れない。
+- **spec 側への確認事項**: Issue の「同一 operation_id の再送で初回の値を返す」という表現は、本設計の
+  「再送は構文形のハッシュで `23505`、評価済みの値は行に残り、台帳は開始時刻だけ記録」に対応づけた。

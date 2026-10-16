@@ -1610,22 +1610,24 @@ pub enum ParsedSql {
     DropType(crate::sql::allowlist::ValidatedDropType),
 }
 
-/// 読み取り文（[`ParsedSql::Statement`]）だけが現在時刻関数を受理する束縛スコープを開く
-/// （SQL-37・Issue #1586。許可リスト型の fail-closed）。`txn_start_micros` は `Active`
-/// トランザクション中のトランザクション開始時刻（`None` は autocommit・Describe で、文の
-/// 開始時刻と同値）。INSERT／UPDATE／DELETE／COPY／DDL／カーソル等は `None` を返し、束縛が
-/// 時刻関数を `0A000`（定数式は `42601`）で拒否する。`ParsedSql` を網羅 `match` にして
-/// variant 追加時に判定漏れをコンパイルエラーで検出する。
-fn read_statement_clock_scope(
+/// 読み取り文（[`ParsedSql::Statement`]）と書き込み文（INSERT／UPDATE／DELETE の原子版）が
+/// 現在時刻関数を受理する束縛スコープを開く（SQL-37・Issue #1586・#2188。許可リスト型の
+/// fail-closed）。`txn_start_micros` は `Active` トランザクション中のトランザクション開始時刻
+/// （`None` は autocommit・Describe で、文の開始時刻と同値）。書き込み文で時刻関数が評価
+/// されると、台帳エントリは v3 で評価時刻を記録する（`recovery::ledger`）。分割実行
+/// （`Partitioned`）は固定時刻の専用スコープ（`TxnFixedOnly`）を別に開く。COPY／DDL／
+/// カーソル等は `None` を返し、束縛が時刻関数を `0A000`（定数式は `42601`）で拒否する。
+/// `ParsedSql` を網羅 `match` にして variant 追加時に判定漏れをコンパイルエラーで検出する。
+fn statement_clock_scope(
     parsed: &ParsedSql,
     txn_start_micros: Option<i64>,
 ) -> Result<Option<crate::sql::time_fn::ClockScope>, crate::sql::allowlist::SqlSurfaceError> {
     let is_read = match parsed {
-        ParsedSql::Statement(_) => true,
-        ParsedSql::Insert(_)
-        | ParsedSql::Truncate(_)
+        ParsedSql::Statement(_)
+        | ParsedSql::Insert(_)
         | ParsedSql::Delete(_)
-        | ParsedSql::Update(_)
+        | ParsedSql::Update(_) => true,
+        ParsedSql::Truncate(_)
         | ParsedSql::Transaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
@@ -1683,6 +1685,12 @@ fn insert_default_clock_scope(
     };
     if !is_insert {
         return Ok(None);
+    }
+    // 式スコープ（`statement_clock_scope`）が既に確定した時刻があればそれを共有する。
+    // `VALUES` の `now()` と省略列の `DEFAULT now()` が同一文で別の値にならず、台帳 v3 の
+    // 評価時刻とも一致させるため（Issue #2188）。
+    if let Some(clock) = crate::sql::time_fn::current_clock() {
+        return Ok(Some(crate::sql::time_fn::DefaultClockScope::enter(clock)));
     }
     let stmt_start_micros = crate::sql::time_fn::now_micros()?;
     Ok(Some(crate::sql::time_fn::DefaultClockScope::enter(
@@ -4287,7 +4295,7 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // SQL-37（Issue #1586）: autocommit の読み取り文は文の開始時刻を `now()` 系の
         // 値として確定する（`now()` と `statement_timestamp()` は同値）。
-        let _clock_scope = read_statement_clock_scope(parsed, None)?;
+        let _clock_scope = statement_clock_scope(parsed, None)?;
         // SQL-37・Issue #1587: INSERT の列 `DEFAULT now()` 系の評価時刻（autocommit は文の開始時刻）。
         let _default_clock_scope = insert_default_clock_scope(parsed, None)?;
         match parsed {
@@ -4673,7 +4681,7 @@ impl EngineCore {
 
         // SQL-37（Issue #1586）: 読み取り文は文の開始時刻とトランザクション開始時刻を確定する
         // （`Active` なのに開始時刻が無い場合は fail-closed の `Internal`）。
-        let _clock_scope = read_statement_clock_scope(
+        let _clock_scope = statement_clock_scope(
             parsed,
             Some(
                 txn.txn_start_micros()
@@ -5186,7 +5194,7 @@ impl EngineCore {
         use crate::sql::allowlist::{DeleteStatement, Statement, ValidatedUpdateForm};
 
         // SQL-37（Issue #1586）: Describe も読み取り文の束縛を通る（値は型決定にしか使わない）。
-        let _clock_scope = read_statement_clock_scope(parsed, None)?;
+        let _clock_scope = statement_clock_scope(parsed, None)?;
 
         match parsed {
             ParsedSql::Insert(stmt) => {
@@ -7480,7 +7488,9 @@ impl EngineCore {
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         // SQL-37・Issue #1587: 束縛クロージャ（NoSQL insert の `bind_insert`）が列 `DEFAULT now()`
         // 系を評価する時刻（autocommit 相当の文の開始時刻）。束縛区間だけ保持する。
-        let bounds = {
+        // 束縛スコープは実書き込み前に破棄されるため、時刻 DEFAULT を評価していれば台帳 v3 の
+        // 評価時刻をここで取り出し、書き込み区間へ引き継ぐ（Issue #2188）。
+        let (bounds, bound_evaluated_at) = {
             let now = crate::sql::time_fn::now_micros()?;
             let _default_clock_scope = crate::sql::time_fn::DefaultClockScope::enter(
                 crate::sql::time_fn::StatementClock {
@@ -7488,8 +7498,13 @@ impl EngineCore {
                     stmt_start_micros: now,
                 },
             );
-            bind(&schema)?
+            let bounds = bind(&schema)?;
+            (bounds, crate::sql::time_fn::ledger_evaluated_at())
         };
+        // COPY など呼び出し元が既に上書きを設定している場合は、束縛が評価していないときに
+        // それを潰さない。
+        let _ledger_clock_scope =
+            bound_evaluated_at.map(|at| crate::sql::time_fn::LedgerClockScope::enter(Some(at)));
         if bounds.len() != row_count
             || bounds
                 .iter()
@@ -7750,7 +7765,11 @@ impl EngineCore {
             operation_id,
             bounds,
             schema: bound_schema,
+            evaluated_at,
         } = batch;
+        // COPY の束縛は wire メッセージをまたいで完了済みのため、台帳 v3 の評価時刻を
+        // 書き込み区間へ明示的に渡す（Issue #2188。None は v2 の権威値）。
+        let _ledger_clock_scope = crate::sql::time_fn::LedgerClockScope::enter(evaluated_at);
         self.execute_bound_insert_with_target(
             target,
             ctx,

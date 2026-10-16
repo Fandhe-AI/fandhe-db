@@ -724,6 +724,8 @@ pub struct CopyInSession {
     /// wire メッセージにまたがり RAII のスレッドローカルスコープが届かないため、
     /// 開始時に `core.rs` が確定した値をここへ保持して全行で共有する（全行同じ時刻）。
     clock: crate::sql::time_fn::StatementClock,
+    /// いずれかの行で時刻 DEFAULT が評価されたか（台帳 v3 の評価時刻を残す判定。Issue #2188）。
+    clock_used: bool,
 }
 
 impl CopyInSession {
@@ -788,6 +790,7 @@ impl CopyInSession {
             bounds: Vec::new(),
             running_bytes: 0,
             clock,
+            clock_used: false,
         })
     }
 
@@ -824,7 +827,10 @@ impl CopyInSession {
         let splitter = &mut self.splitter;
         let clock = self.clock;
 
-        splitter.feed(chunk, |fields| {
+        // 行ごとの束縛が評価した時刻 DEFAULT の印をスコープ外のスレッド状態へ漏らさず、
+        // 自セッションの `clock_used` へ回収する（Issue #2188）。
+        let scope = crate::sql::time_fn::DefaultClockScope::enter(clock);
+        let result = splitter.feed(chunk, |fields| {
             if fields.len() != columns.len() {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "COPY record field count {} does not match column count {}",
@@ -841,7 +847,9 @@ impl CopyInSession {
                 .map_err(map_batch_err)?;
             bounds.push(bound);
             Ok(())
-        })
+        });
+        self.clock_used |= scope.was_used();
+        result
     }
 
     /// CopyDone 到達時に呼ぶ。改行なしで終わった末尾レコード（存在する場合）を
@@ -860,6 +868,7 @@ impl CopyInSession {
             let next_count = self.bounds.len().saturating_add(1);
             batch_limits::check_row_count(next_count, &self.limits).map_err(map_batch_err)?;
             batch_limits::validate_chunk_total(next_count, &self.limits).map_err(map_batch_err)?;
+            let scope = crate::sql::time_fn::DefaultClockScope::enter(self.clock);
             let bound = bind_copy_record(
                 &self.table,
                 &self.columns,
@@ -867,7 +876,10 @@ impl CopyInSession {
                 &self.operation_id,
                 &self.schema,
                 self.clock,
-            )?;
+            );
+            self.clock_used |= scope.was_used();
+            drop(scope);
+            let bound = bound?;
             let row_bytes = bound_insert_byte_len(&bound)?;
             batch_limits::check_row_body_len(self.bounds.len(), row_bytes, &self.limits)
                 .map_err(map_batch_err)?;
@@ -886,6 +898,7 @@ impl CopyInSession {
             operation_id: self.operation_id,
             bounds: self.bounds,
             schema: *self.schema,
+            evaluated_at: self.clock_used.then_some(self.clock.txn_start_micros),
         })
     }
 }
@@ -898,6 +911,8 @@ pub struct CopyInBatch {
     pub(crate) operation_id: Option<OperationId>,
     pub(crate) bounds: Vec<BoundInsert>,
     pub(crate) schema: TableSchema,
+    /// 時刻 DEFAULT を評価した場合の台帳 v3 評価時刻（トランザクション開始時刻。Issue #2188）。
+    pub(crate) evaluated_at: Option<i64>,
 }
 
 impl CopyInBatch {

@@ -65,6 +65,21 @@ const LEDGER_ENTRY_FORMAT_VERSION_V1: u8 = 1;
 /// 内容ハッシュ。TASK-101・RECOVER-10）。
 const LEDGER_ENTRY_FORMAT_VERSION_V2: u8 = 2;
 
+/// [`OP_LEDGER_TABLE`] の値フォーマットバージョン v3（バージョンバイト＋32 バイト
+/// 内容ハッシュ＋評価に用いたトランザクション開始時刻 `i64` LE の 41 バイト固定。
+/// Issue #2188・SQL-37。時刻関数を評価した書き込みだけが書く。設計:
+/// `docs/design/now-evaluated-value-ledger.md` D4）。
+const LEDGER_ENTRY_FORMAT_VERSION_V3: u8 = 3;
+
+/// v3 台帳エントリの符号化。照合はハッシュだけで行い、時刻は監査・診断用に残す。
+fn encode_entry_v3(hash: &ContentHash, txn_start_micros: i64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 32 + 8);
+    buf.push(LEDGER_ENTRY_FORMAT_VERSION_V3);
+    buf.extend_from_slice(hash.as_bytes());
+    buf.extend_from_slice(&txn_start_micros.to_le_bytes());
+    buf
+}
+
 /// v2 台帳エントリの符号化。バージョンバイト＋[`ContentHash`] の生バイト列。
 fn encode_entry_v2(hash: &ContentHash) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + 32);
@@ -132,6 +147,12 @@ enum StoredEntry {
     V1,
     /// v2（内容ハッシュを保持する現行フォーマット）。
     V2 { hash: [u8; 32] },
+    /// v3（内容ハッシュ＋評価に用いたトランザクション開始時刻。Issue #2188）。
+    V3 {
+        hash: [u8; 32],
+        #[cfg_attr(not(test), allow(dead_code))]
+        txn_start_micros: i64,
+    },
 }
 
 /// [`delete_table_in_txn`] が 1 回の走査・削除で `keys_to_remove` に保持するキー数の
@@ -162,6 +183,15 @@ fn decode_entry(value: &[u8]) -> Result<StoredEntry, UnknownLedgerEntryFormat> {
             let hash: [u8; 32] = rest.try_into().map_err(|_| UnknownLedgerEntryFormat)?;
             Ok(StoredEntry::V2 { hash })
         }
+        Some((&LEDGER_ENTRY_FORMAT_VERSION_V3, rest)) if rest.len() == 40 => {
+            let (h, t) = rest.split_at(32);
+            let hash: [u8; 32] = h.try_into().map_err(|_| UnknownLedgerEntryFormat)?;
+            let t: [u8; 8] = t.try_into().map_err(|_| UnknownLedgerEntryFormat)?;
+            Ok(StoredEntry::V3 {
+                hash,
+                txn_start_micros: i64::from_le_bytes(t),
+            })
+        }
         _ => Err(UnknownLedgerEntryFormat),
     }
 }
@@ -172,9 +202,42 @@ fn decode_entry(value: &[u8]) -> Result<StoredEntry, UnknownLedgerEntryFormat> {
 pub(crate) enum LedgerWrite<'a> {
     /// 台帳あり構成（`LedgerMode::Ledgered`）。検証済み `operation_id` を記録する。
     Record(&'a OperationId),
+    /// [`LedgerWrite::Record`] に加え、時刻関数の評価に用いたトランザクション開始時刻
+    /// （UTC マイクロ秒）を v3 エントリとして記録する（Issue #2188・SQL-37。照合には
+    /// 使わない。[`LedgerWrite::with_evaluated_at`] で生成する）。
+    RecordEvaluated {
+        /// 検証済み `operation_id`。
+        op_id: &'a OperationId,
+        /// 評価に用いたトランザクション開始時刻（UTC マイクロ秒）。
+        txn_start_micros: i64,
+    },
     /// 台帳を持たない構成（`LedgerMode::CompareOnlyWithoutLedger`）。台帳テーブルへは
     /// 一切触れない（テーブル自体も作らない）。
     Disabled,
+}
+
+impl<'a> LedgerWrite<'a> {
+    /// 記録対象の `operation_id`。[`LedgerWrite::Disabled`] は `None`。
+    pub(crate) fn op_id(&self) -> Option<&'a OperationId> {
+        match self {
+            LedgerWrite::Record(op_id) => Some(op_id),
+            LedgerWrite::RecordEvaluated { op_id, .. } => Some(op_id),
+            LedgerWrite::Disabled => None,
+        }
+    }
+
+    /// 時刻関数を評価した書き込みであれば、その評価に用いたトランザクション開始時刻
+    /// を載せた変種へ変える（`None` や [`LedgerWrite::Disabled`] はそのまま返す）。
+    /// exec／core 層が束縛結果から呼ぶ（`tenant.rs` の呼び出しは変えない）。
+    pub(crate) fn with_evaluated_at(self, evaluated_at: Option<i64>) -> Self {
+        match (self, evaluated_at) {
+            (LedgerWrite::Record(op_id), Some(t)) => LedgerWrite::RecordEvaluated {
+                op_id,
+                txn_start_micros: t,
+            },
+            (other, _) => other,
+        }
+    }
 }
 
 /// [`record_in_txn`] の成功時の記録結果。既存キーの検出（重複・内容不一致）は
@@ -298,6 +361,10 @@ pub(crate) fn record_in_txn_accepting(
     content_hash: &ContentHash,
     legacy_hashes: &[ContentHash],
 ) -> Result<RecordOutcome, LedgerRecordError> {
+    // 現スレッドの式スコープ／DEFAULT スコープの間に時刻関数が評価されていれば、評価に
+    // 用いたトランザクション開始時刻を v3 エントリとして残す（Issue #2188・SQL-37。
+    // 呼び出し元の `tenant.rs` は同一スタック上で `core.rs` のスコープ内にいる）。
+    let ledger = ledger.with_evaluated_at(crate::sql::time_fn::ledger_evaluated_at());
     record_core(
         write_txn,
         tenant_id,
@@ -318,12 +385,13 @@ pub(crate) fn record_partitioned_completion_in_txn(
     table: &str,
     op_id: &OperationId,
     content_hash: &ContentHash,
+    fixed_time: Option<i64>,
 ) -> Result<RecordOutcome, LedgerRecordError> {
     record_core(
         write_txn,
         tenant_id,
         table,
-        LedgerWrite::Record(op_id),
+        LedgerWrite::Record(op_id).with_evaluated_at(fixed_time),
         content_hash,
         &[],
         JobTableCheck::Skip,
@@ -349,9 +417,14 @@ fn record_core(
     legacy_hashes: &[ContentHash],
     job_check: JobTableCheck,
 ) -> Result<RecordOutcome, LedgerRecordError> {
-    let op_id = match ledger {
-        LedgerWrite::Record(op_id) => op_id,
-        LedgerWrite::Disabled => return Ok(RecordOutcome::Skipped),
+    let Some(op_id) = ledger.op_id() else {
+        return Ok(RecordOutcome::Skipped);
+    };
+    let evaluated_at = match ledger {
+        LedgerWrite::RecordEvaluated {
+            txn_start_micros, ..
+        } => Some(txn_start_micros),
+        _ => None,
     };
     let mut ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
     let key = (tenant_id, table, op_id.as_str());
@@ -363,7 +436,7 @@ fn record_core(
         })?;
         return match stored {
             StoredEntry::V1 => Err(LedgerRecordError::ContentMismatch),
-            StoredEntry::V2 { hash } => {
+            StoredEntry::V2 { hash } | StoredEntry::V3 { hash, .. } => {
                 let matches_current = content_hash.matches(&hash);
                 let matches_legacy =
                     !matches_current && legacy_hashes.iter().any(|legacy| legacy.matches(&hash));
@@ -392,7 +465,11 @@ fn record_core(
             }
         }
     }
-    ledger_table.insert(key, encode_entry_v2(content_hash).as_slice())?;
+    let encoded = match evaluated_at {
+        Some(t) => encode_entry_v3(content_hash, t),
+        None => encode_entry_v2(content_hash),
+    };
+    ledger_table.insert(key, encoded.as_slice())?;
     // `last_op`（TASK-98・RECOVER-7）: 同一 write トランザクション内で upsert する
     // （`op_ledger` の keep-first 契約とは独立。原子性は `write_txn` の commit/drop
     // に委ねる）。
@@ -700,6 +777,33 @@ pub(crate) fn last_operation_in_read_txn(
         return Ok(LastOperationRaw::LegacyLedgerWithoutLastOp);
     }
     Ok(LastOperationRaw::NotFound)
+}
+
+/// 台帳エントリが v3 なら、記録された評価時刻（トランザクション開始時刻・UTC マイクロ秒）
+/// を返す（テスト専用。Issue #2188。v1／v2・未記録は `None`）。
+#[cfg(test)]
+pub(crate) fn evaluated_at_in_read_txn(
+    read_txn: &redb::ReadTransaction,
+    tenant_id: &str,
+    table: &str,
+    op_id: &OperationId,
+) -> Result<Option<i64>, StorageError> {
+    let ledger_table = match read_txn.open_table(OP_LEDGER_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(StorageError::from(e)),
+    };
+    let Some(guard) = ledger_table.get((tenant_id, table, op_id.as_str()))? else {
+        return Ok(None);
+    };
+    match decode_entry(guard.value())
+        .map_err(|_| StorageError::Codec("op_ledger entry has unknown format version".into()))?
+    {
+        StoredEntry::V3 {
+            txn_start_micros, ..
+        } => Ok(Some(txn_start_micros)),
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -1556,5 +1660,95 @@ mod tests {
         let found = last_operation_in_read_txn(&read_txn, "tenant-a", "never-written")
             .expect("last_operation_in_read_txn");
         assert_eq!(found, LastOperationRaw::NotFound);
+    }
+
+    // Issue #2188: v3 の往復。v2 と v3 はハッシュだけで相互に照合でき、時刻は判定に使わない。
+    #[test]
+    fn v3_roundtrip_and_cross_version_hash_match() {
+        let path = unique_db_path("ledger-v3");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+        let wt = db.begin_write().expect("begin write");
+        let id3 = op("op-v3");
+        let id2 = op("op-v2");
+        record_in_txn(
+            &wt,
+            "t",
+            "d",
+            LedgerWrite::Record(&id3).with_evaluated_at(Some(-1234)),
+            &hash("h3"),
+        )
+        .expect("record v3");
+        record_in_txn(&wt, "t", "d", LedgerWrite::Record(&id2), &hash("h2")).expect("record v2");
+        wt.commit().expect("commit");
+        let rt = db.begin_read().expect("read");
+        assert_eq!(
+            evaluated_at_in_read_txn(&rt, "t", "d", &id3).expect("read"),
+            Some(-1234)
+        );
+        assert_eq!(
+            evaluated_at_in_read_txn(&rt, "t", "d", &id2).expect("read"),
+            None
+        );
+        assert!(contains_in_read_txn(&rt, "t", "d", &id3).expect("contains"));
+        drop(rt);
+        let wt = db.begin_write().expect("begin write");
+        // v3 エントリへ別時刻・同一ハッシュの再送は Duplicate、v2 へ v3 形の再送も Duplicate。
+        let dup = record_in_txn(
+            &wt,
+            "t",
+            "d",
+            LedgerWrite::Record(&id3).with_evaluated_at(Some(99)),
+            &hash("h3"),
+        );
+        assert!(matches!(dup, Err(LedgerRecordError::Duplicate)));
+        let dup = record_in_txn(
+            &wt,
+            "t",
+            "d",
+            LedgerWrite::Record(&id2).with_evaluated_at(Some(99)),
+            &hash("h2"),
+        );
+        assert!(matches!(dup, Err(LedgerRecordError::Duplicate)));
+        let mism = record_in_txn(
+            &wt,
+            "t",
+            "d",
+            LedgerWrite::Record(&id3).with_evaluated_at(Some(99)),
+            &hash("other"),
+        );
+        assert!(matches!(mism, Err(LedgerRecordError::ContentMismatch)));
+    }
+
+    // Issue #2188: v3 の長さ不一致は fail-closed（40 と 42 バイト）。
+    #[test]
+    fn v3_wrong_length_is_rejected() {
+        let mut short = vec![LEDGER_ENTRY_FORMAT_VERSION_V3];
+        short.extend_from_slice(&[0u8; 39]);
+        assert!(decode_entry(&short).is_err());
+        let mut long = vec![LEDGER_ENTRY_FORMAT_VERSION_V3];
+        long.extend_from_slice(&[0u8; 41]);
+        assert!(decode_entry(&long).is_err());
+        let mut ok = vec![LEDGER_ENTRY_FORMAT_VERSION_V3];
+        ok.extend_from_slice(&[0u8; 40]);
+        assert!(decode_entry(&ok).is_ok());
+    }
+
+    // Issue #2188: Disabled は with_evaluated_at を適用しても台帳に触れない。
+    #[test]
+    fn disabled_ignores_evaluated_at() {
+        let path = unique_db_path("ledger-v3-dis");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+        let wt = db.begin_write().expect("begin write");
+        let out = record_in_txn(
+            &wt,
+            "t",
+            "d",
+            LedgerWrite::Disabled.with_evaluated_at(Some(1)),
+            &hash("x"),
+        )
+        .expect("disabled");
+        assert_eq!(out, RecordOutcome::Skipped);
     }
 }

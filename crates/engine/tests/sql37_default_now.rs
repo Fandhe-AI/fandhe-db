@@ -114,14 +114,15 @@ fn unsupported_or_mismatched_time_defaults_are_rejected() {
             .wire_code()
             .to_string()
     };
-    // 書き込み側が未対応（#2188）: 0A000。
+    // `CURRENT_TIME`（timetz 未実装）は引き続き拒否する。
     assert_eq!(
-        ddl("CREATE TABLE t1 (embedding VECTOR(2), n TIMESTAMP DEFAULT statement_timestamp())"),
-        "0A000"
+        ddl("CREATE TABLE t1 (embedding VECTOR(2), n TIME DEFAULT CURRENT_TIME)"),
+        "42601"
     );
+    // LOCALTIME は TIME 列にだけ付けられる（TIMESTAMP 列は型不一致）。
     assert_eq!(
-        ddl("CREATE TABLE t2 (embedding VECTOR(2), n TIMESTAMP DEFAULT clock_timestamp())"),
-        "0A000"
+        ddl("CREATE TABLE t2 (embedding VECTOR(2), n TIMESTAMP DEFAULT LOCALTIME)"),
+        "42601"
     );
     // 複合式・CHECK 内は 42601。
     assert_eq!(
@@ -540,7 +541,7 @@ fn partitioned_delete_accepts_transaction_fixed_functions_in_where() {
 }
 
 #[test]
-fn partitioned_statement_and_clock_timestamp_are_rejected_and_atomic_set_stays_rejected() {
+fn partitioned_statement_and_clock_timestamp_are_rejected_and_atomic_set_is_accepted() {
     let path = unique_db_path("sql37-default-now-pdml-reject");
     let _g = CleanupGuard(path.clone());
     let core = open_core(&path);
@@ -556,15 +557,16 @@ fn partitioned_statement_and_clock_timestamp_are_rejected_and_atomic_set_stays_r
     ] {
         assert_eq!(code(&core, "tenant-a", sql), "0A000", "{sql}");
     }
-    // 原子版（分割なし）の UPDATE SET now() は従来どおり拒否される（#2188 の担当）。
-    let atomic = code(
+    // 拒否された分割実行は副作用なし。
+    assert!(docs_at(&core).iter().all(|t| *t == Y2000));
+    // 原子版（分割なし）の UPDATE SET now() は受理される（Issue #2188。台帳 v3 を書く）。
+    exec(
         &core,
         "tenant-a",
         "UPDATE docs SET at = now() WHERE n > 0 USING OPERATION_ID 'x5'",
-    );
-    assert!(atomic == "42601" || atomic == "0A000", "{atomic}");
-    // 副作用なし。
-    assert!(docs_at(&core).iter().all(|t| *t == Y2000));
+    )
+    .expect("atomic update set now()");
+    assert!(docs_at(&core).iter().all(|t| *t != Y2000));
 }
 #[test]
 fn file_insert_with_omitted_time_default_column_is_rejected_without_side_effects() {
