@@ -1386,10 +1386,9 @@ fn three_clients_verify_search_mode_switch_and_precision_contract() {
 /// 描画も psql（空文字）／pg（`Array.join` で空文字）／psycopg（`str(None)`=
 /// "None"）で異なる。NULL 契約の検証は層 A に閉じる）。集計列は
 /// Issue #1173 以降、入力型に応じた型付き OID（`COUNT`/`SUM(INTEGER)` は int8、
-/// `SUM(id)` は numeric、`AVG(id)` は float8）で送出されるため、クライアントが
-/// 型を復元して描画する。`AVG(id)` が整数値になる carol の AGG1 は psycopg が
-/// float として `2.0` と描画する（psql・node pg は `2`）ため、この 1 ケースだけ
-/// クライアント別の期待値にする（3 クライアントでの型復元の網羅検証は #1176 の担当）。
+/// `SUM(id)`・`AVG(id)` は numeric）で送出されるため、クライアントが
+/// 型を復元して描画する。
+/// numeric は 3 クライアントとも同じ文字列で描画される。
 #[test]
 #[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
 fn three_clients_verify_aggregate_queries_and_rls_invariance() {
@@ -1413,12 +1412,12 @@ fn three_clients_verify_aggregate_queries_and_rls_invariance() {
     let alice_agg3 = vec!["ja|2".to_string(), "en|1".to_string(), "xx|1".to_string()];
     let alice_agg4 = vec!["ja|2".to_string()];
 
-    let bob_agg1 = vec!["4|18|4.5|en|ja".to_string()];
+    let bob_agg1 = vec!["4|18|4.5000000000000000|en|ja".to_string()];
     let bob_agg2 = vec!["3".to_string()];
     let bob_agg3 = vec!["ja|3".to_string(), "en|1".to_string()];
     let bob_agg4 = vec!["ja|3".to_string()];
 
-    let carol_agg1 = vec!["3|6|2|en|ja".to_string()];
+    let carol_agg1 = vec!["3|6|2.0000000000000000|en|ja".to_string()];
     let carol_agg2 = vec!["2".to_string()];
     let carol_agg3 = vec!["ja|2".to_string(), "en|1".to_string()];
     let carol_agg4 = vec!["ja|2".to_string()];
@@ -1454,17 +1453,9 @@ fn three_clients_verify_aggregate_queries_and_rls_invariance() {
                 "psql: unexpected {label} result for user {user} (must include only this \
                  tenant's own Private group, never another tenant's)"
             );
-
-            // `AVG(id)`（float8）が整数値になる carol の AGG1 だけ、psycopg は
-            // Python の float として `2.0` と描画する（クライアント別の期待値）。
-            let psycopg_expected: Vec<String> = if user == "carol" && label == "AGG1" {
-                vec!["3|6|2.0|en|ja".to_string()]
-            } else {
-                expected.clone()
-            };
             let psycopg_rows = run_psycopg(port, user, pw, sql);
             assert_eq!(
-                psycopg_rows, psycopg_expected,
+                &psycopg_rows, expected,
                 "psycopg: unexpected {label} result for user {user}"
             );
 
