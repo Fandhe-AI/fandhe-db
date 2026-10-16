@@ -4297,7 +4297,7 @@ impl EngineCore {
         }
         // Issue #2436・WIRE-24: 宣言型がある値は、置換の前に宣言型として検証する。
         // NULL は検証対象外で SQL の NULL として置換される。非 UTF-8 は後段の復号が拒否する。
-        // float4 は丸めた正規値で Bind 値を差し替え、受信形式によらず同じ結果にする。
+        // float4 は浮動小数スロットに限り丸めた正規値で Bind 値を差し替え、受信形式によらず同じ結果にする。
         // 差し替えは復号（総バイト数上限 MAX_INPUT_LEN の検証）より前に行い、正規化で
         // 長くなった値も参照回数込みで上限検査の対象にする。
         let mut canonical_values: Vec<(usize, Vec<u8>)> = Vec::new();
@@ -4309,7 +4309,15 @@ impl EngineCore {
                 continue;
             };
             let n = u16::try_from(i.saturating_add(1)).unwrap_or(u16::MAX);
-            if let Some(canonical) = crate::sql::params::validate_declared_value(n, *ty, text)? {
+            let canonical = crate::sql::params::validate_declared_value(n, *ty, text)?;
+            // 正規値への差し替えは、置換先が浮動小数リテラルのスロットに限る。整数・文字列・
+            // 真偽値スロットでは元の値を据え置き（`'2'` が `'2.0'` になる等を避ける）、
+            // 宣言型としての検証だけを行う。
+            let is_float_slot = prepared
+                .param_types
+                .get(i)
+                .is_some_and(|t| t.literal_kind() == crate::sql::params::ParamLiteralKind::Float);
+            if let (Some(canonical), true) = (canonical, is_float_slot) {
                 canonical_values.push((i, canonical.into_bytes()));
             }
         }

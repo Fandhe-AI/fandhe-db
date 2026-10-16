@@ -958,9 +958,12 @@ pub(crate) fn validate_declared_value(
                     )));
                 };
                 let sign = if value.starts_with('-') { "-" } else { "" };
-                // Debug 表記は整数値でも小数点（`1.0`）、極小・極大値は指数（`1e-40`）を
-                // 残すため、再解析で整数リテラルへ型が変わらず、長さも短く保たれる。
-                return Ok(Some(format!("{sign}{f:?}")));
+                // f32 を f64 へ拡張した値の Debug 表記（f64 への最短往復表記）にする。f32 の
+                // Debug 表記（`0.1`）では f64 として再解析した際に丸め済みの値を保持できず、
+                // DOUBLE 列への代入で値が変わるため。整数値でも小数点（`1.0`）、極小・極大値は
+                // 指数（`1e-40`）を残すので、再解析で整数リテラルへ型が変わらない。
+                let widened = f64::from(f);
+                return Ok(Some(format!("{sign}{widened:?}")));
             }
             Ok(None)
         }

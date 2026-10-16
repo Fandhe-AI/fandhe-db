@@ -304,7 +304,12 @@ fn float4_canonical_text_keeps_float_literal_type() {
     let prepared = core
         .parse_sql_prepared_with_declared(sql, &[Some(D::Float4), Some(D::Float4)])
         .expect("parse");
-    for (text, literal) in [("1.0", "1.0"), ("1", "1.0"), ("1e-40", "1e-40")] {
+    // 期待値は f32 へ丸めた値を f64 へ拡張した最短往復表記（`1e-40` の f32 値は 9.99994610111476e-41）。
+    for (text, literal) in [
+        ("1.0", "1.0"),
+        ("1", "1.0"),
+        ("1e-40", "9.99994610111476e-41"),
+    ] {
         let bound = core
             .bind_prepared(&prepared, &[some(text), some("0")])
             .expect("bind");
@@ -315,4 +320,50 @@ fn float4_canonical_text_keeps_float_literal_type() {
             .expect("literal parse");
         assert_eq!(bound, expected, "{text}");
     }
+}
+
+/// float4 宣言で `0.1` を渡すと、DOUBLE 列スロットへは f32 を f64 へ拡張した値
+/// （0.10000000149011612）が置換される（f32 の最短表記 `0.1` のままにしない）。
+#[test]
+fn float4_value_for_double_slot_is_widened_f32() {
+    let (core, _g) = setup("decl-f4-widen");
+    let sql = "UPDATE docs SET d = $1 WHERE id = 1 USING OPERATION_ID 'op-1'";
+    let prepared = core
+        .parse_sql_prepared_with_declared(sql, &[Some(D::Float4)])
+        .expect("parse");
+    let bound = core.bind_prepared(&prepared, &[some("0.1")]).expect("bind");
+    let expected = core
+        .parse_sql("UPDATE docs SET d = 0.10000000149011612 WHERE id = 1 USING OPERATION_ID 'op-1'")
+        .expect("literal parse");
+    assert_eq!(bound, expected);
+}
+
+/// float4 宣言でも、推論済みの INTEGER・TEXT・OPERATION_ID スロットでは値を据え置く
+/// （`'2'` が `'2.0'` に変わって 22P02 になる・TEXT へ `2.0` が保存される退行を防ぐ）。
+#[test]
+fn float4_declared_value_is_kept_for_non_float_slots() {
+    let (core, _g) = setup("decl-f4-keep");
+    let int_sql = "UPDATE docs SET d = 1.5 WHERE n = $1 AND id = 1 USING OPERATION_ID 'op-1'";
+    let prepared = core
+        .parse_sql_prepared_with_declared(int_sql, &[Some(D::Float4)])
+        .expect("parse");
+    let bound = core
+        .bind_prepared(&prepared, &[some("2")])
+        .expect("bind int");
+    let expected = core
+        .parse_sql("UPDATE docs SET d = 1.5 WHERE n = 2 AND id = 1 USING OPERATION_ID 'op-1'")
+        .expect("literal parse");
+    assert_eq!(bound, expected);
+
+    let text_sql = "UPDATE docs SET t = $1 WHERE id = 1 USING OPERATION_ID 'op-1'";
+    let prepared = core
+        .parse_sql_prepared_with_declared(text_sql, &[Some(D::Float4)])
+        .expect("parse");
+    let bound = core
+        .bind_prepared(&prepared, &[some("2")])
+        .expect("bind text");
+    let expected = core
+        .parse_sql("UPDATE docs SET t = '2' WHERE id = 1 USING OPERATION_ID 'op-1'")
+        .expect("literal parse");
+    assert_eq!(bound, expected);
 }
