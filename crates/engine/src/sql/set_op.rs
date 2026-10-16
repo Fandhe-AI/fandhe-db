@@ -271,6 +271,13 @@ fn check_branch_type_compatibility(
             )));
         }
     }
+    // TIMESTAMPTZ は集合演算が #1576 まで未対応のため、演算種別・格納データ（空表・NULL のみ
+    // を含む）によらず実行前に拒否する（Issue #1574。fail-closed。`0A000`）。
+    if columns_have_timestamptz(l_columns) || columns_have_timestamptz(r_columns) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "TIMESTAMPTZ columns are not supported in set operations yet".to_string(),
+        });
+    }
     let dedup_needed = !matches!(op, SetOperator::UnionAll);
     if dedup_needed && (l_has_vector || r_has_vector) {
         return Err(SqlSurfaceError::invalid_input(
@@ -278,6 +285,18 @@ fn check_branch_type_compatibility(
         ));
     }
     Ok(())
+}
+
+fn columns_have_timestamptz(columns: &[ColumnMeta]) -> bool {
+    columns.iter().any(|c| {
+        matches!(
+            c,
+            ColumnMeta::Scalar {
+                ty: ColumnType::TimestampTz,
+                ..
+            }
+        )
+    })
 }
 
 fn columns_have_vector(columns: &[ColumnMeta]) -> bool {
@@ -409,7 +428,7 @@ fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
                 out.extend_from_slice(&n.to_be_bytes());
                 push_len_prefixed(&mut out, &payload)?;
             }
-            // TIMESTAMPTZ は集合演算が #1576 まで未対応のため型検証で弾かれ、本来到達しない
+            // TIMESTAMPTZ は集合演算が #1576 まで未対応のため check_branch_type_compatibility で弾かれ、本来到達しない
             // （Issue #1574。防御的に拒否する fail-closed）。
             Cell::TimestampTz(_) => {
                 return Err(SqlSurfaceError::Internal {
@@ -484,7 +503,7 @@ fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
             }
             // 型タグ 1 byte ＋ `i64` の 8 byte（`row_key` の `Cell::Time`。Issue #1570）。
             Cell::Time(_) => 1 + 8,
-            // TIMESTAMPTZ は集合演算が #1576 まで未対応のため型検証で弾かれ、本来到達しない
+            // TIMESTAMPTZ は集合演算が #1576 まで未対応のため check_branch_type_compatibility で弾かれ、本来到達しない
             // （Issue #1574。防御的に拒否する fail-closed）。
             Cell::TimestampTz(_) => {
                 return Err(SqlSurfaceError::Internal {
@@ -1381,5 +1400,96 @@ mod tests {
         assert_eq!(merged_ty(Bpchar(5), Bpchar(10)), Text);
         assert_eq!(merged_ty(Bpchar(5), Text), Text);
         assert_eq!(merged_ty(Bpchar(5), Varchar(None)), Text);
+    }
+
+    fn tstz_schema(name: &str) -> TableSchema {
+        TableSchema::new(
+            name,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("at", ColumnType::TimestampTz, true),
+            ],
+        )
+    }
+
+    fn tstz_branch(table: &str) -> SetTree {
+        SetTree::Branch(Box::new(ValidatedScan {
+            table_name: table.to_string(),
+            projection: Projection::Columns(vec!["at".to_string()]),
+            where_predicates: Vec::new(),
+            limit: crate::core::MAX_SEARCH_K as u32,
+            order_by: Vec::new(),
+            offset: 0,
+            window_items: Vec::new(),
+            order_keys: Vec::new(),
+            scalar_subquery_items: Vec::new(),
+        }))
+    }
+
+    /// Issue #1574 レビュー指摘の回帰: TIMESTAMPTZ 列の集合演算は演算 4 種・データ 3 状況
+    /// （空表・NULL のみ・非 NULL 値あり）・実行／Describe の両経路で一律に `0A000` となる。
+    #[test]
+    fn timestamptz_set_operations_are_rejected_for_all_ops_data_states_and_paths() {
+        let ops = [
+            SetOperator::Union,
+            SetOperator::UnionAll,
+            SetOperator::Intersect,
+            SetOperator::Except,
+        ];
+        for state in ["empty", "null-only", "non-null"] {
+            let path = unique_db_path(&format!("set-op-tstz-{state}"));
+            let storage = Storage::open(&path).expect("open storage");
+            let _guard = CleanupGuard(path);
+            storage.create_table(&tstz_schema("a")).expect("create a");
+            storage.create_table(&tstz_schema("b")).expect("create b");
+            let tenant_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+            let value = match state {
+                "null-only" => Some(Value::Null),
+                "non-null" => Some(Value::TimestampTz(1_000_000)),
+                _ => None,
+            };
+            if let Some(v) = value {
+                for t in ["a", "b"] {
+                    let op_id = OperationId::parse(&format!("seed-{t}")).expect("valid op id");
+                    crate::tenant::insert_typed_row(
+                        &storage,
+                        t,
+                        &tenant_ctx,
+                        1,
+                        Visibility::Public,
+                        &[Value::Vector(vec![0.0, 0.0]), v.clone()],
+                        &op_id,
+                    )
+                    .expect("insert row");
+                }
+            }
+            let mut schemas = HashMap::new();
+            schemas.insert("a".to_string(), tstz_schema("a"));
+            schemas.insert("b".to_string(), tstz_schema("b"));
+            let udfs = UdfRegistry::default();
+            for op in ops {
+                let tree = SetTree::Op {
+                    op,
+                    left: Box::new(tstz_branch("a")),
+                    right: Box::new(tstz_branch("b")),
+                };
+                let read_txn = storage.db().begin_read().expect("begin_read");
+                let err = execute_with_budget(
+                    &read_txn,
+                    &tenant_ctx,
+                    &schemas,
+                    &tree,
+                    &udfs,
+                    None,
+                    usize::MAX,
+                    crate::group_by_limits::GroupByLimits::default(),
+                )
+                .expect_err("TIMESTAMPTZ set operation must be rejected");
+                assert_eq!(err.wire_code(), "0A000", "execute {op:?} {state}");
+                let err = describe_columns(&schemas, &tree, &udfs, &[], None, &Default::default())
+                    .expect_err("TIMESTAMPTZ set operation must be rejected on describe");
+                assert_eq!(err.wire_code(), "0A000", "describe {op:?} {state}");
+            }
+        }
     }
 }
