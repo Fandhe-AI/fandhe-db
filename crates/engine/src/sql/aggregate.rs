@@ -464,10 +464,11 @@ pub(crate) fn classify_aggregate_access(
     target: &Result<crate::sql::scalar_index::ScalarIndexTargetOwned, ()>,
 ) -> (
     crate::sql::scalar_plan::ScalarPlan,
+    Option<crate::sql::scalar_index::ScalarFallbackReason>,
     crate::sql::explain::AccessPath,
 ) {
     use crate::sql::explain::AccessPath;
-    use crate::sql::scalar_index::scalar_plan_under_target;
+    use crate::sql::scalar_index::scalar_plan_under_target_with_reason;
     use crate::sql::scalar_plan::{classify_scalar_plan, ScalarPlan, ScalarShapeInput};
 
     let has_vector = schema.vector_dim().is_some();
@@ -497,9 +498,14 @@ pub(crate) fn classify_aggregate_access(
     } else {
         ScalarPlan::PlainScan
     };
-    let scalar_plan = scalar_plan_under_target(
+    // 照合込みの使用可否（Issue #2191）。実行時の `ScalarIndex::candidates_for` と同じ
+    // `text_index_supports` を通し、照合の不一致なら全走査へ縮退する（理由付き）。
+    let text_uses =
+        crate::sql::explain::text_predicate_uses(bound.metadata_filters(), bound.expr_filters());
+    let (scalar_plan, scalar_fallback) = scalar_plan_under_target_with_reason(
         scalar_plan_before_target,
         metadata_filter_columns.iter().copied(),
+        &text_uses,
         schema,
         target,
     );
@@ -534,7 +540,13 @@ pub(crate) fn classify_aggregate_access(
                 .and_then(|idx| schema.columns.get(idx))
                 .is_some_and(|column| match target {
                     Err(()) => false,
-                    Ok(t) => t.includes(&column.name),
+                    // 列挙形は辞書がバイト列順の列だけが使える（`ScalarIndex::column_groups` が
+                    // ICU 順の辞書では `None` を返し全走査へ縮退する。Issue #2191）。
+                    Ok(t) => {
+                        t.includes(&column.name)
+                            && (!crate::collation::is_collatable(&column.ty)
+                                || t.as_target().text_index_collation(column).is_byte_order())
+                    }
                 });
         let access_path = if !single_key_group_by {
             AccessPath::FullScan
@@ -554,12 +566,12 @@ pub(crate) fn classify_aggregate_access(
         // 等と `access_path: full_scan` が同時に出て D5「矛盾出力の防止」に
         // 反していた。実行経路（全走査で述語索引を一切使わない）に合わせ、
         // 複数列 `GROUP BY` では `scalar_plan` も `PlainScan` へ揃える。
-        let scalar_plan = if single_key_group_by {
-            scalar_plan
+        let (scalar_plan, scalar_fallback) = if single_key_group_by {
+            (scalar_plan, scalar_fallback)
         } else {
-            ScalarPlan::PlainScan
+            (ScalarPlan::PlainScan, None)
         };
-        (scalar_plan, access_path)
+        (scalar_plan, scalar_fallback, access_path)
     } else {
         // `GROUP BY` なし単一行集計の `DecodeTier::Fast` 判定
         // （[`select_decode_tier`]）は `VECTOR` 列の有無を問わない
@@ -583,7 +595,7 @@ pub(crate) fn classify_aggregate_access(
         } else {
             AccessPath::FullScan
         };
-        (scalar_plan, access_path)
+        (scalar_plan, scalar_fallback, access_path)
     }
 }
 

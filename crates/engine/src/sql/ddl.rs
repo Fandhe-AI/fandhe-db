@@ -240,6 +240,7 @@ pub(crate) fn execute_create_table(
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexCollationNotSupported(_)
         | CatalogError::IndexLimitExceeded(_)
         // 制約名の操作（`ALTER TABLE ... ADD/DROP CONSTRAINT`。Issue #1067）専用の
         // 変種で、`Storage::create_table` からは返らない（到達不能。`CREATE TABLE`
@@ -742,6 +743,7 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexCollationNotSupported(_)
         | CatalogError::IndexLimitExceeded(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
@@ -895,6 +897,7 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexCollationNotSupported(_)
         | CatalogError::IndexLimitExceeded(_)
         | CatalogError::UniqueConstraintViolation
         | CatalogError::InvalidForeignKey(_)
@@ -1242,6 +1245,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexCollationNotSupported(_)
         | CatalogError::IndexLimitExceeded(_)
         // `FOREIGN KEY` 宣言の照合（`create_table` 専用。TABLE-17・TASK-205、
         // Issue #907）は `alter_table_add_column` からは返らない（到達不能）。
@@ -1377,7 +1381,8 @@ pub(crate) fn execute_create_index(
         validated.table().to_string(),
         kind,
         validated.columns().to_vec(),
-    );
+    )
+    .with_column_collations(validated.column_collations().to_vec());
     storage.create_index(&def).map_err(map_create_index_error)?;
     Ok(CreateIndexOutcome {})
 }
@@ -1396,7 +1401,8 @@ pub(crate) fn execute_drop_index(
 
 /// `Storage::create_index` の [`CatalogError`] を SQL 表層の契約へ写像する
 /// （ERR-6: 名前衝突 `42P07`、対象テーブル不存在 `42P01`、対象がビュー `42809`、
-/// 列不存在 `42703`、種別と列型の不整合 `0A000`、件数上限 `54000`）。エラー文言に
+/// 列不存在 `42703`、種別と列型の不整合 `0A000`、照合を持てない列への `COLLATE` `42804`、
+/// 件数上限 `54000`）。エラー文言に
 /// テナント・行内容・redb 内部詳細は含めない（security.md P0）。
 fn map_create_index_error(e: CatalogError) -> SqlSurfaceError {
     match e {
@@ -1405,6 +1411,11 @@ fn map_create_index_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
         CatalogError::IndexKindMismatch(detail) => SqlSurfaceError::FeatureNotSupported { detail },
+        // 照合を持てない列（`id`・数値・`VECTOR` 等）・`USING hnsw` への `COLLATE`（Issue #2191。
+        // PostgreSQL と同じ `42804`）。
+        CatalogError::IndexCollationNotSupported(detail) => {
+            SqlSurfaceError::datatype_mismatch(detail)
+        }
         CatalogError::IndexLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
         // 識別子形状・列数（構文検証段で既に拒否済みのため通常は到達しない）。
         CatalogError::Invalid(_) => {
