@@ -76,6 +76,11 @@ pub(crate) const MAX_AGGREGATE_RESULT_BYTES: usize = crate::arena::MAX_ARENA_TOT
 
 /// [`accumulate_text_budget`] の予算超過 detail 文言（[`is_aggregate_text_budget_error`]
 /// が照合する）。
+/// `MIN`/`MAX`(TEXT) 累積器が使う照合（TABLE-28・Issue #1610）。累積器は入力列の照合を
+/// 運ばないため既定照合の比較器に 1 本化し、バイト列順でない列の照合は束縛段の
+/// `require_wired_collation` が拒否する。列の照合を運ぶ結線は #2190。
+const TEXT_AGG_COLLATION: crate::collation::Collation = crate::collation::Collation::DEFAULT;
+
 const AGGREGATE_TEXT_BUDGET_EXCEEDED_DETAIL: &str = "aggregate result exceeds capacity";
 /// 同上。`checked_add` のオーバーフロー側の detail 文言。
 const AGGREGATE_TEXT_BUDGET_OVERFLOW_DETAIL: &str = "aggregate text budget accounting overflowed";
@@ -600,7 +605,7 @@ pub(crate) enum Accumulator {
     /// `MIN(<Scalar 式>)`。`f64` は全順序を持たないため `total_cmp` で比較する。
     FloatMin(Option<f64>),
     FloatMax(Option<f64>),
-    /// `MIN(<TEXT 列>)`。バイト順比較（`str::lt`/`str::gt`）。
+    /// `MIN(<TEXT 列>)`。[`TEXT_AGG_COLLATION`] の比較器で比較する。
     TextMin(Option<String>),
     TextMax(Option<String>),
     /// `SUM(<INTEGER>)`（Issue #892・D2）。`i128` の `checked_add` で
@@ -1437,7 +1442,9 @@ impl Accumulator {
             Accumulator::TextMin(m) => {
                 let should_update = match m {
                     None => true,
-                    Some(cur) => value < cur.as_str(),
+                    Some(cur) => TEXT_AGG_COLLATION
+                        .compare(value.as_bytes(), cur.as_bytes())
+                        .is_lt(),
                 };
                 if should_update {
                     *m = Some(try_clone_str(value)?);
@@ -1447,7 +1454,9 @@ impl Accumulator {
             Accumulator::TextMax(m) => {
                 let should_update = match m {
                     None => true,
-                    Some(cur) => value > cur.as_str(),
+                    Some(cur) => TEXT_AGG_COLLATION
+                        .compare(value.as_bytes(), cur.as_bytes())
+                        .is_gt(),
                 };
                 if should_update {
                     *m = Some(try_clone_str(value)?);

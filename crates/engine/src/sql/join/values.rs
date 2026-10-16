@@ -203,7 +203,8 @@ pub(super) fn compare_vals(a: &CmpVal<'_>, b: &CmpVal<'_>) -> Ordering {
         (CmpVal::Int(x), CmpVal::Int(y)) => x.cmp(y),
         (CmpVal::Float(x), CmpVal::Float(y)) => compare_f64(*x, *y),
         (CmpVal::Num(x), CmpVal::Num(y)) => crate::numeric::cmp_exact(x, y),
-        (CmpVal::Bytes(x), CmpVal::Bytes(y)) => x.cmp(y),
+        // 照合の比較器（既定照合）に 1 本化。照合の受け渡しは #2190（TABLE-28・Issue #1610）。
+        (CmpVal::Bytes(x), CmpVal::Bytes(y)) => crate::collation::Collation::DEFAULT.compare(x, y),
         (CmpVal::Bool(x), CmpVal::Bool(y)) => x.cmp(y),
         (CmpVal::Uuid(x), CmpVal::Uuid(y)) => x.cmp(y),
         (CmpVal::Ordinal(x), CmpVal::Ordinal(y)) => x.cmp(y),

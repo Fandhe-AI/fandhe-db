@@ -1410,7 +1410,7 @@ pub(crate) fn execute_scan_with_budget(
                             if key.kind == OrderKind::Jsonb {
                                 refs.push(jk.as_deref().map(ScalarKeyRef::JsonbKey));
                             } else {
-                                refs.push(expr_value_to_key_ref(v, key.kind)?);
+                                refs.push(expr_value_to_key_ref(v, key.kind, key.collation)?);
                             }
                         } else {
                             refs.push(extract_order_value_ref(schema, key, id, scanned)?);
@@ -1904,6 +1904,7 @@ mod tests {
                 target: crate::sql::parser::BoundOrderTarget::Column(1),
                 kind: crate::sql::parser::OrderKind::Bytes,
                 descending: false,
+                collation: crate::collation::Collation::DEFAULT,
             }],
             offset: 0,
             windows: Vec::new(),
@@ -2262,6 +2263,7 @@ mod tests {
                 target: crate::sql::parser::BoundOrderTarget::Column(0),
                 kind: crate::sql::parser::OrderKind::Bytes,
                 descending: false,
+                collation: crate::collation::Collation::DEFAULT,
             }],
             offset: 0,
             windows: Vec::new(),
@@ -2340,6 +2342,7 @@ mod tests {
                 target: crate::sql::parser::BoundOrderTarget::Column(0),
                 kind: crate::sql::parser::OrderKind::Bytes,
                 descending: false,
+                collation: crate::collation::Collation::DEFAULT,
             }],
             offset: 0,
             windows: Vec::new(),
@@ -2419,6 +2422,7 @@ mod tests {
                 target: crate::sql::parser::BoundOrderTarget::Column(0),
                 kind: crate::sql::parser::OrderKind::Bytes,
                 descending: false,
+                collation: crate::collation::Collation::DEFAULT,
             }],
             offset: 0,
             windows: Vec::new(),
@@ -2521,6 +2525,7 @@ mod tests {
                 target: crate::sql::parser::BoundOrderTarget::Column(0),
                 kind: crate::sql::parser::OrderKind::Bytes,
                 descending: false,
+                collation: crate::collation::Collation::DEFAULT,
             }],
             offset: 5,
             windows: Vec::new(),
