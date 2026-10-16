@@ -53,7 +53,7 @@
 - サーバー既定の TimeZone を変える CLI フラグ（reset 値は注入可能な形にしてある）。
 - `SET TIME ZONE INTERVAL ...`（INTERVAL 型の担当 Issue まで `0A000`）、`SET LOCAL`（`0A000`）、`RESET timezone`／`RESET ALL`（従来どおり `42601`）。
 - StartupMessage の `options`（`-c TimeZone=...`）、`SHOW ALL`、DateStyle など他の GUC。
-- `AT TIME ZONE`・`timezone()`・DST の gap／fold の最終確定（#1576）。
+- `AT TIME ZONE`・`timezone()`・DST の gap／fold の最終確定は #1576 で実装・確定済み（[timestamptz-conversion.md](timestamptz-conversion.md)）。
 - `now()`／`CURRENT_TIMESTAMP` の戻り値型の切り替え、`CURRENT_DATE`／`LOCALTIME`／`LOCALTIMESTAMP` のセッション TZ 評価（型切り替えの担当 Issue）。
 - wire OID 1184 とバイナリ入出力（#1577）。
 
