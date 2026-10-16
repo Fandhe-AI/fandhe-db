@@ -193,8 +193,9 @@ fn cell_to_copy_value(
     format: CopyFormat,
     meta: &ColumnMeta,
     cell: &Cell,
+    tz: &engine::datetime::SessionTimeZone,
 ) -> Result<Option<String>, result_encoder::EncodeError> {
-    let text = result_encoder::cell_to_text_for_column(meta, cell)?;
+    let text = result_encoder::cell_to_text_for_column_in_tz(meta, cell, tz)?;
     Ok(text.map(|t| match format {
         CopyFormat::Text => escape_copy_text(&t),
         CopyFormat::Csv => escape_copy_csv(&t),
@@ -245,6 +246,7 @@ fn encode_copy_data_row_into(
     columns: &[ColumnMeta],
     row: &ResultRow,
     out: &mut Vec<u8>,
+    tz: &engine::datetime::SessionTimeZone,
 ) -> Result<(), result_encoder::EncodeError> {
     // 列メタとセル数の不一致は内部不整合（fail-closed。何も書かずに拒否する）。
     if columns.len() != row.cells.len() {
@@ -253,7 +255,7 @@ fn encode_copy_data_row_into(
     let start = out.len();
     let mut fields: Vec<Option<String>> = Vec::with_capacity(row.cells.len());
     for (meta, cell) in columns.iter().zip(&row.cells) {
-        match cell_to_copy_value(format, meta, cell) {
+        match cell_to_copy_value(format, meta, cell, tz) {
             Ok(v) => fields.push(v),
             Err(e) => {
                 out.truncate(start);
@@ -306,6 +308,7 @@ fn encode_copy_data_row_into(
 /// 前に確定しているため、この経路には到達しない）。
 fn run_copy_to<S: WireStream>(
     stream: &mut S,
+    conn_session: &SessionState,
     txn: &mut SessionTransaction<'_>,
     format: CopyFormat,
     result: &QueryResult,
@@ -335,7 +338,15 @@ fn run_copy_to<S: WireStream>(
 
     for row in &result.rows {
         let start = buffer.frame_start();
-        if encode_copy_data_row_into(format, &result.columns, row, buffer.as_mut_vec()).is_err() {
+        if encode_copy_data_row_into(
+            format,
+            &result.columns,
+            row,
+            buffer.as_mut_vec(),
+            conn_session.time_zone(),
+        )
+        .is_err()
+        {
             buffer.truncate_to(start);
             buffer.flush(stream)?;
             return respond_error_and_ready(
@@ -359,7 +370,7 @@ fn run_copy_to<S: WireStream>(
             if finish == Finish::ReadyForQuery {
                 buffer.push_frame(
                     stream,
-                    &result_encoder::encode_ready_for_query(txn.status()),
+                    &crate::handshake::ready_for_query_frames(conn_session, txn),
                 )?;
             }
             buffer.flush(stream)?;
@@ -400,6 +411,7 @@ fn run_copy_from<'e, S: WireStream>(
     stream: &mut S,
     engine: &'e EngineCore,
     ctx: &PolicyContext,
+    conn_session: &SessionState,
     txn: &mut SessionTransaction<'e>,
     mut session: CopyInSession,
     finish: Finish,
@@ -468,7 +480,16 @@ fn run_copy_from<'e, S: WireStream>(
             b'c' => {
                 framing::read_length_prefixed_body(stream, 4, 4)
                     .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
-                return finish_copy_from(stream, engine, ctx, txn, session, errored, finish);
+                return finish_copy_from(
+                    stream,
+                    engine,
+                    ctx,
+                    conn_session,
+                    txn,
+                    session,
+                    errored,
+                    finish,
+                );
             }
             b'f' => {
                 let body = framing::read_length_prefixed_body(
@@ -577,10 +598,12 @@ fn run_copy_from<'e, S: WireStream>(
 /// `simple_query::execute_and_respond` と同じ設計（`ResponseBoundaryGuard` は
 /// 呼び出し元 [`run`] が関数全体を覆い、`EmergencyResponseRegistration` は
 /// commit 呼び出しだけをブロックスコープで覆う）。
+#[allow(clippy::too_many_arguments)]
 fn finish_copy_from<'e, S: WireStream>(
     stream: &mut S,
     engine: &'e EngineCore,
     ctx: &PolicyContext,
+    conn_session: &SessionState,
     txn: &mut SessionTransaction<'e>,
     session: CopyInSession,
     errored: Option<SqlSurfaceError>,
@@ -609,7 +632,11 @@ fn finish_copy_from<'e, S: WireStream>(
                 Ok(msg) => {
                     stream.write_all(&msg)?;
                     if finish == Finish::ReadyForQuery {
-                        crate::handshake::write_ready_for_query_io(stream, txn.status())?;
+                        crate::handshake::write_ready_for_query_synced_io(
+                            stream,
+                            conn_session,
+                            txn,
+                        )?;
                     }
                     Ok(CopyStep::Completed)
                 }
@@ -669,9 +696,11 @@ pub(crate) fn run<'e, S: WireStream>(
     let _response_boundary = engine::recovery::commit_boundary::ResponseBoundaryGuard::new();
 
     match engine.begin_copy_in_txn(ctx, session, txn, sql) {
-        Ok(CopyPlan::To(format, result)) => run_copy_to(stream, txn, format, &result, finish),
+        Ok(CopyPlan::To(format, result)) => {
+            run_copy_to(stream, session, txn, format, &result, finish)
+        }
         Ok(CopyPlan::From(copy_session)) => {
-            run_copy_from(stream, engine, ctx, txn, copy_session, finish)
+            run_copy_from(stream, engine, ctx, session, txn, copy_session, finish)
         }
         Err(e) => respond_sql_error(stream, txn, &e).map(|()| CopyStep::Failed),
     }

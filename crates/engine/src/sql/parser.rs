@@ -715,12 +715,14 @@ pub(crate) fn bind_datetime_literal(
             }
         },
         // TIMESTAMPTZ 列（TABLE-33・Issue #1574）。UTC のマイクロ秒へ正規化して束縛する。
-        // TZ の無い入力はセッション TimeZone で解釈するが、セッション値の保持は #1575 の担当の
-        // ため、本 Issue では UTC 固定（`SessionTimeZone::utc()`）。書式違反 `22007`・範囲外
-        // `22008`・未知の TZ 名 `22023`（detail は静的文字列で入力を反射しない）。
+        // TZ の無い入力はセッション TimeZone で解釈する（#1575。engine の各セッション入口が
+        // `SessionTimeZoneScope` で張った値を `current_session_time_zone` が返し、スコープの無い
+        // NoSQL（HTTP）経路は UTC）。書式違反 `22007`・範囲外 `22008`・未知の TZ 名 `22023`
+        // （detail は静的文字列で入力を反射しない）。
         ColumnType::TimestampTz => {
-            use crate::datetime::{DateTimeLiteralError, SessionTimeZone, TimestampTzLiteralError};
-            match crate::datetime::parse_timestamptz(literal, &SessionTimeZone::utc()) {
+            use crate::datetime::{DateTimeLiteralError, TimestampTzLiteralError};
+            let session_tz = crate::datetime::current_session_time_zone();
+            match crate::datetime::parse_timestamptz(literal, &session_tz) {
                 Ok(micros) => Ok(crate::row_codec::Value::TimestampTz(micros)),
                 Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Format(detail))) => {
                     Err(SqlSurfaceError::invalid_datetime_format(format!(

@@ -613,9 +613,11 @@ fn run_statement_as<'e, S: WireStream>(
             OutcomeResponse::Rows { result, shape } => {
                 let sent = result.rows.len();
                 let tag = shape.render(sent);
-                respond_rows_with_tag(stream, &result, &tag, finish, txn)
+                respond_rows_with_tag(stream, &result, &tag, finish, session, txn)
             }
-            OutcomeResponse::Command { tag } => respond_command_complete(stream, &tag, finish, txn),
+            OutcomeResponse::Command { tag } => {
+                respond_command_complete(stream, &tag, finish, session, txn)
+            }
         },
         Err(e) => {
             // `engine::core::EngineCore::execute_sql_in_txn`／
@@ -748,6 +750,15 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         },
         SqlOutcome::SetSearchMode(_) => OutcomeResponse::Command {
             tag: "SET".to_string(),
+        },
+        // TABLE-33・Issue #1575: `SET TIME ZONE`／`SET timezone` は `SET`、`SHOW timezone` は
+        // 通常の行応答（`RowDescription`/`DataRow`）に `SHOW` タグ（PG と同じ）。
+        SqlOutcome::SetTimeZone => OutcomeResponse::Command {
+            tag: "SET".to_string(),
+        },
+        SqlOutcome::Show(result) => OutcomeResponse::Rows {
+            result,
+            shape: TagShape::Fixed("SHOW".to_string()),
         },
         SqlOutcome::CreateFunction { .. } => OutcomeResponse::Command {
             tag: "CREATE FUNCTION".to_string(),
@@ -884,12 +895,14 @@ fn respond_command_complete<S: WireStream>(
     stream: &mut S,
     tag: &str,
     finish: Finish,
+    session: &SessionState,
     txn: &mut SessionTransaction<'_>,
 ) -> io::Result<StatementStatus> {
     respond_command_complete_with(
         stream,
         tag,
         finish,
+        session,
         txn,
         result_encoder::encode_command_complete,
     )
@@ -908,6 +921,7 @@ fn respond_command_complete_with<S: WireStream>(
     stream: &mut S,
     tag: &str,
     finish: Finish,
+    session: &SessionState,
     txn: &mut SessionTransaction<'_>,
     encode: impl FnOnce(&str) -> Result<Vec<u8>, result_encoder::EncodeError>,
 ) -> io::Result<StatementStatus> {
@@ -915,7 +929,9 @@ fn respond_command_complete_with<S: WireStream>(
         Ok(msg) => {
             write_all(stream, &msg)?;
             if finish == Finish::ReadyForQuery {
-                crate::handshake::write_ready_for_query_io(stream, txn.status())?;
+                // TimeZone が通知済みの値と変わっていれば ParameterStatus を RFQ の直前に付ける
+                // （TABLE-33・Issue #1575）。
+                crate::handshake::write_ready_for_query_synced_io(stream, session, txn)?;
             }
             Ok(StatementStatus::Completed)
         }
@@ -1069,7 +1085,16 @@ fn respond_query_result<S: WireStream>(
     // `respond_rows_with_tag` は `Active` 以外では `fail()` が no-op になるため、
     // 既存のバイト列契約（`ReadyForQuery` は常に `Idle`）は変わらない。
     let mut txn = SessionTransaction::new(engine::sql::transaction::TransactionLimits::default());
-    respond_rows_with_tag(stream, result, &tag, finish, &mut txn)
+    // 接続確立時（`handshake`）に UTC を通知済みの状態を再現する（ParameterStatus を挟まない）。
+    txn.set_reported_time_zone("UTC");
+    respond_rows_with_tag(
+        stream,
+        result,
+        &tag,
+        finish,
+        &SessionState::default(),
+        &mut txn,
+    )
 }
 
 /// `RowDescription`／`DataRow`* の組み立てとフレーム送出を担う共通本体
@@ -1085,6 +1110,7 @@ fn respond_rows_with_tag<S: WireStream>(
     result: &engine::sql::exec::QueryResult,
     tag: &str,
     finish: Finish,
+    session: &SessionState,
     txn: &mut SessionTransaction<'_>,
 ) -> io::Result<StatementStatus> {
     let row_desc = match result_encoder::encode_row_description(&result.columns) {
@@ -1123,7 +1149,12 @@ fn respond_rows_with_tag<S: WireStream>(
 
     for row in &result.rows {
         let start = buffer.frame_start();
-        match result_encoder::encode_data_row_into(&result.columns, row, buffer.as_mut_vec()) {
+        match result_encoder::encode_data_row_into_in_tz(
+            &result.columns,
+            row,
+            buffer.as_mut_vec(),
+            session.time_zone(),
+        ) {
             Ok(()) => {}
             Err(_) => {
                 // 失敗時は `encode_data_row_into` 自身が書きかけを巻き戻し
@@ -1156,7 +1187,7 @@ fn respond_rows_with_tag<S: WireStream>(
             if finish == Finish::ReadyForQuery {
                 buffer.push_frame(
                     stream,
-                    &result_encoder::encode_ready_for_query(txn.status()),
+                    &crate::handshake::ready_for_query_frames(session, txn),
                 )?;
             }
             buffer.flush(stream)?;
@@ -1386,6 +1417,7 @@ mod tests {
             &result,
             "SELECT 1",
             Finish::ReadyForQuery,
+            &SessionState::default(),
             &mut txn,
         )
         .expect("respond");
@@ -1439,6 +1471,7 @@ mod tests {
             &mut server,
             "INSERT 0 1",
             Finish::ReadyForQuery,
+            &SessionState::default(),
             &mut txn,
             |_| Err(result_encoder::EncodeError),
         )
@@ -1479,9 +1512,14 @@ mod tests {
             client.read_to_end(&mut buf).expect("read_to_end");
             buf
         });
-        let status =
-            respond_command_complete(&mut server, "INSERT 0 1", Finish::ReadyForQuery, &mut txn)
-                .expect("respond");
+        let status = respond_command_complete(
+            &mut server,
+            "INSERT 0 1",
+            Finish::ReadyForQuery,
+            &SessionState::default(),
+            &mut txn,
+        )
+        .expect("respond");
         drop(server);
         let received = reader.join().expect("reader thread");
 

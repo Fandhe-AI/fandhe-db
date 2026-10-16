@@ -877,9 +877,25 @@ pub fn encode_row_description_with_formats(
 /// ために公開する（COPY TO の出力と SELECT の text 出力が同一の cell 表現を
 /// 共有することで、`COPY (...) TO STDOUT` の出力を同じテーブルへ
 /// `COPY ... FROM STDIN` で再投入した際に値の往復が保たれる）。
+///
+/// セッション TimeZone を持たない呼び出し（テスト・NoSQL。TIMESTAMPTZ は UTC 表示）の薄い
+/// ラッパー。pg wire の本番経路は [`cell_to_text_for_column_in_tz`] に接続のセッション
+/// TimeZone を渡す（TABLE-33・Issue #1575）。
+#[cfg(test)]
 pub(crate) fn cell_to_text_for_column(
     meta: &ColumnMeta,
     cell: &Cell,
+) -> Result<Option<String>, EncodeError> {
+    cell_to_text_for_column_in_tz(meta, cell, &engine::datetime::SessionTimeZone::utc())
+}
+
+/// [`cell_to_text_for_column`] のセッション TimeZone 指定版。`TIMESTAMPTZ`（`Cell::TimestampTz`）
+/// を `tz` の壁時計で整形する以外は同一。`DataRow`（simple／extended）と `COPY TO` の
+/// 本番経路が接続の `SessionState::time_zone` を渡す（TABLE-33・Issue #1575）。
+pub(crate) fn cell_to_text_for_column_in_tz(
+    meta: &ColumnMeta,
+    cell: &Cell,
+    tz: &engine::datetime::SessionTimeZone,
 ) -> Result<Option<String>, EncodeError> {
     if let Cell::Float(f) = cell {
         if column_wire_type(meta) == WireType::Float4 {
@@ -891,7 +907,7 @@ pub(crate) fn cell_to_text_for_column(
             return Ok(Some(engine::scalar_float::format_real(narrowed)));
         }
     }
-    cell_to_text(cell)
+    cell_to_text(cell, tz)
 }
 
 /// `Cell` の text フォーマット表現。`Null` は `None`（`DataRow` の -1 長へ写像）。
@@ -905,7 +921,10 @@ pub(crate) fn cell_to_text_for_column(
 ///
 /// 列の型に依存しない基本表現で、[`cell_to_text_for_column`] が `float4` 以外の
 /// 列で委譲する。
-fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
+fn cell_to_text(
+    cell: &Cell,
+    tz: &engine::datetime::SessionTimeZone,
+) -> Result<Option<String>, EncodeError> {
     match cell {
         Cell::Null => Ok(None),
         Cell::Integer(v) => Ok(Some(v.to_string())),
@@ -934,12 +953,9 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         Cell::Timestamp(micros) => Ok(Some(engine::datetime::format_timestamp(*micros))),
         // TIME は `HH:MM:SS[.ffffff]` に整形する（Issue #1569。OID は暫定で text）。
         Cell::Time(micros) => Ok(Some(engine::datetime::format_time(*micros))),
-        // セッション TimeZone での表示は #1575 の担当。それまでは UTC 固定で整形する
-        // （Issue #1574。`+00` 付きの ISO 形式）。
-        Cell::TimestampTz(micros) => Ok(Some(engine::datetime::format_timestamptz(
-            *micros,
-            &engine::datetime::SessionTimeZone::utc(),
-        ))),
+        // セッション TimeZone（`tz`）の壁時計＋ offset 付き ISO 形式で整形する
+        // （Issue #1574・#1575。UTC のセッションでは `+00`）。
+        Cell::TimestampTz(micros) => Ok(Some(engine::datetime::format_timestamptz(*micros, tz))),
         Cell::Array(array_value) => Ok(Some(pg_array_text(array_value))),
         // `BYTEA` のテキスト表現は PostgreSQL 既定の `bytea_output=hex`（`\x` ＋
         // 小文字 16 進）と同形にする（B5・Issue #886）。
@@ -1063,7 +1079,18 @@ pub fn encode_data_row_into(
     row: &ResultRow,
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
-    encode_data_row_body(columns, row, out, |_| ColumnEncoding::Text)
+    encode_data_row_into_in_tz(columns, row, out, &engine::datetime::SessionTimeZone::utc())
+}
+
+/// [`encode_data_row_into`] のセッション TimeZone 指定版（簡易クエリの本番経路。
+/// `TIMESTAMPTZ` を `tz` の壁時計で整形する。TABLE-33・Issue #1575）。
+pub fn encode_data_row_into_in_tz(
+    columns: &[ColumnMeta],
+    row: &ResultRow,
+    out: &mut Vec<u8>,
+    tz: &engine::datetime::SessionTimeZone,
+) -> Result<(), EncodeError> {
+    encode_data_row_body(columns, row, out, tz, |_| ColumnEncoding::Text)
 }
 
 /// `DataRow`（'D'）を列ごとの [`FormatCode`] を反映して `out` の末尾へ追記する
@@ -1091,12 +1118,16 @@ pub fn encode_data_row_into_with_formats(
     }
     // `formats` は呼び出し元内部で長さ一致を確認済みだが、添字アクセス
     // （`[]`）は使わず `get` で明示的に処理する（coding-rust 規約）。
-    encode_data_row_body(columns, row, out, |i| {
-        match formats.get(i).copied().unwrap_or(FormatCode::Text) {
+    encode_data_row_body(
+        columns,
+        row,
+        out,
+        &engine::datetime::SessionTimeZone::utc(),
+        |i| match formats.get(i).copied().unwrap_or(FormatCode::Text) {
             FormatCode::Text => ColumnEncoding::Text,
             FormatCode::Binary => ColumnEncoding::Binary(None),
-        }
-    })
+        },
+    )
 }
 
 /// 列ごとの符号化方式（[`encode_data_row_body`] の内部表現）。
@@ -1124,10 +1155,28 @@ pub fn encode_data_row_into_with_columns(
     formats: &[FormatCode],
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
+    encode_data_row_into_with_columns_in_tz(
+        row,
+        columns,
+        formats,
+        out,
+        &engine::datetime::SessionTimeZone::utc(),
+    )
+}
+
+/// [`encode_data_row_into_with_columns`] のセッション TimeZone 指定版（拡張クエリの Execute の
+/// 本番経路。テキスト形式の `TIMESTAMPTZ` を `tz` の壁時計で整形する。TABLE-33・Issue #1575）。
+pub fn encode_data_row_into_with_columns_in_tz(
+    row: &ResultRow,
+    columns: &[ColumnMeta],
+    formats: &[FormatCode],
+    out: &mut Vec<u8>,
+    tz: &engine::datetime::SessionTimeZone,
+) -> Result<(), EncodeError> {
     if row.cells.len() != formats.len() || row.cells.len() != columns.len() {
         return Err(EncodeError);
     }
-    encode_data_row_body(columns, row, out, |i| {
+    encode_data_row_body(columns, row, out, tz, |i| {
         match formats.get(i).copied().unwrap_or(FormatCode::Text) {
             FormatCode::Text => ColumnEncoding::Text,
             FormatCode::Binary => ColumnEncoding::Binary(columns.get(i).map(column_wire_type)),
@@ -1238,6 +1287,7 @@ fn encode_data_row_body<F>(
     columns: &[ColumnMeta],
     row: &ResultRow,
     out: &mut Vec<u8>,
+    tz: &engine::datetime::SessionTimeZone,
     encoding_at: F,
 ) -> Result<(), EncodeError>
 where
@@ -1266,7 +1316,11 @@ where
         for (i, cell) in row.cells.iter().enumerate() {
             match encoding_at(i) {
                 ColumnEncoding::Text => {
-                    match cell_to_text_for_column(columns.get(i).ok_or(EncodeError)?, cell)? {
+                    match cell_to_text_for_column_in_tz(
+                        columns.get(i).ok_or(EncodeError)?,
+                        cell,
+                        tz,
+                    )? {
                         None => out.extend_from_slice(&(-1i32).to_be_bytes()),
                         Some(text) => push_len_prefixed(out, text.as_bytes())?,
                     }

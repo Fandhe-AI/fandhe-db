@@ -1868,6 +1868,16 @@ pub enum Statement {
     SetSearchMode {
         value: String,
     },
+    /// `SET [SESSION] TIME ZONE ...`／`SET [SESSION] timezone {TO|=} ...`（TABLE-33・
+    /// Issue #1575）。値の意味論的妥当性検証は `core.rs` の実行腕が
+    /// `SessionTimeZone::parse_setting` で行う（本モジュールは構造の受理までを担う）。
+    /// **#1575 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    SetTimeZone {
+        value: TimeZoneSetting,
+    },
+    /// `SHOW timezone`／`SHOW TIME ZONE`／`SHOW "TimeZone"`（TABLE-33・Issue #1575）。
+    /// 列名 `TimeZone` の text 1 行を返す（`core.rs` の実行腕）。
+    ShowTimeZone,
     /// `CREATE FUNCTION <name>(<param>[, <param>...]) AS <expr>`（TASK-79・SQL-9）。
     /// カタログ照会を必要としない（セッションのみに影響するため FROM テーブルの
     /// 存在確認は行わない）。パラメータ名重複・登録済み名との衝突・列参照の禁止
@@ -12234,6 +12244,101 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
     })
 }
 
+/// `SET TIME ZONE`／`SET timezone` の右辺（TABLE-33・Issue #1575）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimeZoneSetting {
+    /// `DEFAULT`（および `SET TIME ZONE LOCAL`）。セッションの reset 値へ戻す。
+    Default,
+    /// 文字列リテラル・識別子・符号付き数値の生テキスト（未検証。`22023` の判定は実行腕）。
+    Value(String),
+}
+
+/// 文が `SHOW timezone`／`SHOW TIME ZONE`／`SHOW "TimeZone"`（末尾 `;` 可）か（#1575）。
+/// 他の `SHOW`（分割実行 DML の制御）は従来どおり別経路が解析するため、厳密一致のみ真にする。
+pub(crate) fn is_show_time_zone(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    if p.expect_ident_matching("SHOW").is_err() {
+        return false;
+    }
+    let ok = if p.peek_ident_matches("TIME") {
+        p.advance();
+        p.expect_ident_matching("ZONE").is_ok()
+    } else {
+        p.expect_ident_matching("TIMEZONE").is_ok()
+    };
+    ok && p.expect_end_of_statement().is_ok()
+}
+
+/// `SET` 文の 2 語目が TimeZone 系（`TIME`・`TIMEZONE`・`SESSION`・`LOCAL`）か（#1575）。
+/// 真のとき [`parse_set_time_zone`] が解析し、偽のとき従来の [`parse_set_search_mode`]
+/// （挙動・エラー文言を変えない）へ進む。
+fn is_set_time_zone_head(tokens: &[Token]) -> bool {
+    matches!(
+        tokens.get(1),
+        Some(Token::Ident(w)) if ["TIME", "TIMEZONE", "SESSION", "LOCAL"]
+            .iter()
+            .any(|k| w.eq_ignore_ascii_case(k))
+    )
+}
+
+/// `SET [SESSION] TIME ZONE <値>` と `SET [SESSION] timezone {TO|=} <値>` の許可形状
+/// （TABLE-33・Issue #1575）。`SET LOCAL ...`・`SET TIME ZONE INTERVAL ...` は 0A000。
+/// 値は文字列リテラル・識別子・符号付き数値・`DEFAULT`（`TIME ZONE` 形は `LOCAL` も）。
+fn parse_set_time_zone(tokens: &[Token]) -> Result<TimeZoneSetting, SqlSurfaceError> {
+    let unsupported = |detail: &str| SqlSurfaceError::FeatureNotSupported {
+        detail: detail.to_string(),
+    };
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SET")?;
+    if p.peek_ident_matches("LOCAL") {
+        return Err(unsupported("SET LOCAL is not supported"));
+    }
+    if p.peek_ident_matches("SESSION") {
+        p.advance();
+    }
+    let time_zone_form = p.peek_ident_matches("TIME");
+    if time_zone_form {
+        p.advance();
+        p.expect_ident_matching("ZONE")?;
+    } else {
+        let name = p.expect_ident()?;
+        if !name.eq_ignore_ascii_case("timezone") {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "unsupported SET variable: {name}"
+            )));
+        }
+        if p.peek_ident_matches("TO") {
+            p.advance();
+        } else {
+            p.expect_punct('=')?;
+        }
+    }
+    let value = match p.advance() {
+        Some(Token::StringLiteral(s)) => TimeZoneSetting::Value(s.clone()),
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DEFAULT") => TimeZoneSetting::Default,
+        Some(Token::Ident(w)) if time_zone_form && w.eq_ignore_ascii_case("LOCAL") => {
+            TimeZoneSetting::Default
+        }
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("INTERVAL") => {
+            return Err(unsupported("SET TIME ZONE INTERVAL is not supported"));
+        }
+        Some(Token::Ident(w)) => TimeZoneSetting::Value(w.clone()),
+        Some(Token::Number(n)) => TimeZoneSetting::Value(n.clone()),
+        Some(Token::Punct(sign @ ('-' | '+'))) => {
+            let sign = *sign;
+            let n = p.expect_number()?;
+            TimeZoneSetting::Value(format!("{sign}{n}"))
+        }
+        other => {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "expected time zone value, got {other:?}"
+            )));
+        }
+    };
+    p.expect_end_of_statement()?;
+    Ok(value)
+}
+
 /// `SET search_mode = '<literal>'`（TASK-161・SQL-12）の許可形状。規範形は
 /// `=` ＋ 文字列リテラルの完全一致のみ（`TO` 形・非引用値・`RESET`/`SHOW` 等の緩和は
 /// SQL-12 に規範がないため、本実装は最も厳格な形に倒す。緩和は spec 側の判断事項）。
@@ -12825,6 +12930,10 @@ fn validate_sql_tokens_impl(
                 }
             }
         }
+        _ if is_set_statement && is_set_time_zone_head(tokens) => {
+            let value = parse_set_time_zone(tokens)?;
+            Ok(Statement::SetTimeZone { value })
+        }
         _ if is_set_statement => {
             let value = parse_set_search_mode(tokens)?;
             Ok(Statement::SetSearchMode { value })
@@ -12892,6 +13001,8 @@ fn validate_sql_tokens_impl(
                 // panic ではなくエラー応答にする。ライブラリコードは panic
                 // させない方針。`.claude/rules/coding-rust.md`）。
                 Statement::SetSearchMode { .. }
+                | Statement::SetTimeZone { .. }
+                | Statement::ShowTimeZone
                 | Statement::CreateFunction { .. }
                 | Statement::Explain(_)
                 // Issue #929（SQL-29 (c)）: `validate_select_statement` は集合演算
@@ -13128,8 +13239,13 @@ pub fn validate_statement(
 ) -> Result<ValidatedStatement, SqlSurfaceError> {
     match validate_sql(sql, lookup)? {
         Statement::Select(stmt) => Ok(stmt),
-        Statement::SetSearchMode { .. } => Err(SqlSurfaceError::unsupported(
-            "SET is not a query statement (use a session-aware entry point)",
+        Statement::SetSearchMode { .. } | Statement::SetTimeZone { .. } => {
+            Err(SqlSurfaceError::unsupported(
+                "SET is not a query statement (use a session-aware entry point)",
+            ))
+        }
+        Statement::ShowTimeZone => Err(SqlSurfaceError::unsupported(
+            "SHOW is not a query statement (use a session-aware entry point)",
         )),
         Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(
             "CREATE FUNCTION is not a query statement (use a session-aware entry point)",

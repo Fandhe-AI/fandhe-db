@@ -145,8 +145,9 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             out.push('"');
             Ok(())
         }
-        // TIMESTAMPTZ は UTC 固定の ISO 文字列（`+00` 付き）。セッション TimeZone での表示は
-        // #1575、型の公告は #1577 の担当（Issue #1574）。
+        // TIMESTAMPTZ は UTC 固定の ISO 文字列（`+00` 付き）。NoSQL（HTTP）表層はセッション
+        // TimeZone を持たず UTC で表示する仕様（TABLE-33 (5)。Issue #1575 で意図的に維持）。
+        // 型の公告は #1577 の担当（Issue #1574）。
         Cell::TimestampTz(micros) => {
             out.push('"');
             escape_json_string_into(

@@ -728,6 +728,11 @@ pub struct CopyInSession {
     clock: crate::sql::time_fn::StatementClock,
     /// いずれかの行で時刻 DEFAULT が評価されたか（台帳 v3 の評価時刻を残す判定。Issue #2188）。
     clock_used: bool,
+    /// `COPY` 開始時点のセッション TimeZone（TABLE-33・Issue #1575）。行ごとの束縛が複数の wire
+    /// メッセージにまたがりスレッドローカルのスコープが届かないため、`clock` と同じく開始時に
+    /// 確定した値を保持し、[`Self::feed`]／[`Self::finish`] で TZ 無しの `TIMESTAMPTZ` 入力の解釈に使う。
+    // `Box`: `CopyPlan::From` の `clippy::large_enum_variant` を避けるため（schema と同じ理由）。
+    time_zone: Box<crate::datetime::SessionTimeZone>,
 }
 
 impl CopyInSession {
@@ -772,6 +777,7 @@ impl CopyInSession {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         table: String,
         columns: Vec<String>,
@@ -780,6 +786,7 @@ impl CopyInSession {
         schema: TableSchema,
         limits: BatchLimits,
         clock: crate::sql::time_fn::StatementClock,
+        time_zone: crate::datetime::SessionTimeZone,
     ) -> Result<Self, SqlSurfaceError> {
         Self::validate_columns_against_schema(&columns, &schema)?;
         Ok(Self {
@@ -793,6 +800,7 @@ impl CopyInSession {
             running_bytes: 0,
             clock,
             clock_used: false,
+            time_zone: Box::new(time_zone),
         })
     }
 
@@ -831,6 +839,7 @@ impl CopyInSession {
 
         // 行ごとの束縛が評価した時刻 DEFAULT の印をスコープ外のスレッド状態へ漏らさず、
         // 自セッションの `clock_used` へ回収する（Issue #2188）。
+        let _tz_scope = crate::datetime::SessionTimeZoneScope::enter((*self.time_zone).clone());
         let scope = crate::sql::time_fn::DefaultClockScope::enter(clock);
         let result = splitter.feed(chunk, |fields| {
             if fields.len() != columns.len() {
@@ -870,6 +879,7 @@ impl CopyInSession {
             let next_count = self.bounds.len().saturating_add(1);
             batch_limits::check_row_count(next_count, &self.limits).map_err(map_batch_err)?;
             batch_limits::validate_chunk_total(next_count, &self.limits).map_err(map_batch_err)?;
+            let _tz_scope = crate::datetime::SessionTimeZoneScope::enter((*self.time_zone).clone());
             let scope = crate::sql::time_fn::DefaultClockScope::enter(self.clock);
             let bound = bind_copy_record(
                 &self.table,

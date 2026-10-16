@@ -1622,6 +1622,23 @@ pub enum ParsedSql {
 /// （`Partitioned`）は固定時刻の専用スコープ（`TxnFixedOnly`）を別に開く。COPY／DDL／
 /// カーソル等は `None` を返し、束縛が時刻関数を `0A000`（定数式は `42601`）で拒否する。
 /// `ParsedSql` を網羅 `match` にして variant 追加時に判定漏れをコンパイルエラーで検出する。
+/// `SHOW TimeZone` の結果列（列名 `TimeZone`・text の 1 列。実行と Describe が共有する）。
+fn show_time_zone_columns() -> Vec<crate::sql::exec::ColumnMeta> {
+    vec![crate::sql::exec::ColumnMeta::Computed {
+        name: "TimeZone".to_string(),
+        ty: Some(crate::catalog::ColumnType::Text),
+    }]
+}
+
+/// セッション TimeZone を現在の文の束縛区間へ張る（`execute_parsed_in_session` 等の
+/// セッション入口が呼ぶ。TZ を持たない `TIMESTAMPTZ` リテラルの解釈とDDL既定値の正規化が
+/// 読む。TABLE-33・Issue #1575）。
+fn session_time_zone_scope(
+    session: &crate::sql::mode::SessionState,
+) -> crate::datetime::SessionTimeZoneScope {
+    crate::datetime::SessionTimeZoneScope::enter(session.time_zone().clone())
+}
+
 fn statement_clock_scope(
     parsed: &ParsedSql,
     txn_start_micros: Option<i64>,
@@ -3205,6 +3222,14 @@ impl EngineCore {
                     "SET search_mode requires a session-aware entry point",
                 ))
             }
+            // TABLE-33・Issue #1575: セッションを持たない入口では `SET TIME ZONE`／`SHOW` も
+            // 値の妥当性に関わらず一律 `42601`（`SET search_mode` と同じ決定的な契約）。
+            crate::sql::allowlist::Statement::SetTimeZone { .. }
+            | crate::sql::allowlist::Statement::ShowTimeZone => {
+                Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "SET/SHOW TimeZone requires a session-aware entry point",
+                ))
+            }
             // TASK-79（SQL-9）: UDF 定義はセッションへ登録する statement のため、
             // セッションを持たないこのエントリポイントでは受理しない（`SET` と同じ
             // 「値の妥当性に関わらず一律 `42601`」の決定的な契約を踏襲する）。
@@ -3225,6 +3250,8 @@ impl EngineCore {
                 match self.execute_validated_in_session(ctx, &mut session, stmt)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
+                    | crate::sql::SqlOutcome::SetTimeZone
+                    | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
                     | crate::sql::SqlOutcome::Insert(_)
@@ -3267,6 +3294,8 @@ impl EngineCore {
                 match self.execute_validated_in_session(ctx, &mut session, stmt)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
+                    | crate::sql::SqlOutcome::SetTimeZone
+                    | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
                     | crate::sql::SqlOutcome::Insert(_)
@@ -3306,6 +3335,8 @@ impl EngineCore {
                 match self.execute_validated_in_session(ctx, &mut session, stmt)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
+                    | crate::sql::SqlOutcome::SetTimeZone
+                    | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
                     | crate::sql::SqlOutcome::Insert(_)
@@ -3352,6 +3383,8 @@ impl EngineCore {
                 match self.execute_validated_in_session(ctx, &mut session, stmt)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
+                    | crate::sql::SqlOutcome::SetTimeZone
+                    | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
                     | crate::sql::SqlOutcome::Insert(_)
@@ -3397,6 +3430,8 @@ impl EngineCore {
                 match self.execute_validated_in_session(ctx, &mut session, stmt)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
+                    | crate::sql::SqlOutcome::SetTimeZone
+                    | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
                     | crate::sql::SqlOutcome::Insert(_)
@@ -3678,6 +3713,14 @@ impl EngineCore {
         if txn_control_head {
             let ctrl = crate::sql::transaction::validate_transaction_control_tokens(&tokens)?;
             return Ok(ParsedSql::Transaction(ctrl));
+        }
+
+        // TABLE-33・Issue #1575: `SHOW timezone`／`SHOW TIME ZONE` は分割実行 DML の `SHOW` より
+        // 先に厳密一致で取り出す（それ以外の `SHOW` の挙動は変えない）。
+        if crate::sql::allowlist::is_show_time_zone(&tokens) {
+            return Ok(ParsedSql::Statement(
+                crate::sql::allowlist::Statement::ShowTimeZone,
+            ));
         }
 
         // Issue #1129: `SHOW`／`CANCEL PARTITIONED DML '<id>' ON <table>`。カタログは引かない
@@ -4320,6 +4363,9 @@ impl EngineCore {
         // 限って `jsonpath_limits` を現スレッドへ張る（`ClockScope` と同じ RAII。大域状態ではない）。
         let _jsonpath_limits_scope =
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
+        // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
+        // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
+        let _session_tz_scope = session_time_zone_scope(session);
         // SQL-37・Issue #1587: INSERT の列 `DEFAULT now()` 系の評価時刻（autocommit は文の開始時刻）。
         let _default_clock_scope = insert_default_clock_scope(parsed, None)?;
         match parsed {
@@ -4718,6 +4764,9 @@ impl EngineCore {
         // 限って `jsonpath_limits` を現スレッドへ張る（`ClockScope` と同じ RAII。大域状態ではない）。
         let _jsonpath_limits_scope =
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
+        // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
+        // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
+        let _session_tz_scope = session_time_zone_scope(session);
 
         // SQL-37・Issue #1587: INSERT の列 `DEFAULT now()` 系はトランザクション開始時刻で評価する。
         let _default_clock_scope = insert_default_clock_scope(
@@ -4840,7 +4889,10 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::Truncate(outcome))
             }
             ParsedSql::Statement(
-                stmt @ (Statement::SetSearchMode { .. } | Statement::CreateFunction { .. }),
+                stmt @ (Statement::SetSearchMode { .. }
+                | Statement::SetTimeZone { .. }
+                | Statement::ShowTimeZone
+                | Statement::CreateFunction { .. }),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
             // 検索・集計・広域取得・`EXPLAIN`・JOIN・評価後射影形ビュー・集合演算はすべて
             // 同じ読み取り経路へ入る（Issue #1179・#1192・#1353）。dirty テーブルの有無・
@@ -5121,6 +5173,8 @@ impl EngineCore {
                 self.execute_read_statement(ctx, session, stmt, write_txn)
             }
             Statement::SetSearchMode { .. }
+            | Statement::SetTimeZone { .. }
+            | Statement::ShowTimeZone
             | Statement::CreateFunction { .. }
             | Statement::ConstSelect(_) => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "unexpected statement in transactional read path".to_string(),
@@ -5227,6 +5281,9 @@ impl EngineCore {
         // 限って `jsonpath_limits` を現スレッドへ張る（`ClockScope` と同じ RAII。大域状態ではない）。
         let _jsonpath_limits_scope =
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
+        // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
+        // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
+        let _session_tz_scope = session_time_zone_scope(session);
 
         match parsed {
             ParsedSql::Insert(stmt) => {
@@ -5312,6 +5369,9 @@ impl EngineCore {
                 Ok(Some(crate::sql::partitioned::describe_columns(control)))
             }
             ParsedSql::Statement(Statement::SetSearchMode { .. }) => Ok(None),
+            ParsedSql::Statement(Statement::SetTimeZone { .. }) => Ok(None),
+            // `SHOW TimeZone` は列名 `TimeZone`（text）の 1 列固定（TABLE-33・Issue #1575）。
+            ParsedSql::Statement(Statement::ShowTimeZone) => Ok(Some(show_time_zone_columns())),
             ParsedSql::Statement(Statement::CreateFunction { .. }) => Ok(None),
             // `EXPLAIN` は常に単一の `Computed` 列（`QUERY PLAN`）を返す
             // （`sql::explain::build_explain_result` と同一の列。中身の生成には
@@ -5515,12 +5575,44 @@ impl EngineCore {
         // 起動時の評価上限を使えるようにする（`execute_parsed_in_session` 等と同じ RAII）。
         let _jsonpath_limits_scope =
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
+        // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
+        // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
+        let _session_tz_scope = session_time_zone_scope(session);
         match stmt {
             crate::sql::allowlist::Statement::SetSearchMode { value } => {
                 let mode = crate::sql::mode::SearchMode::parse_literal(&value)?;
                 session.set_search_mode(mode);
                 Ok(crate::sql::SqlOutcome::SetSearchMode(mode))
             }
+            // TABLE-33・Issue #1575: 検証（解決）に成功した場合に限りセッションへ代入する
+            // （失敗した `SET` は値を変えない）。`DEFAULT`／`LOCAL` は reset 値へ戻す。
+            // 失敗は固定文言の `22023`（入力値を反射しない）。
+            crate::sql::allowlist::Statement::SetTimeZone { value } => {
+                match value {
+                    crate::sql::allowlist::TimeZoneSetting::Default => session.reset_time_zone(),
+                    crate::sql::allowlist::TimeZoneSetting::Value(text) => {
+                        let tz = crate::datetime::SessionTimeZone::parse_setting(&text).map_err(
+                            |_| crate::sql::allowlist::SqlSurfaceError::InvalidParameterValue {
+                                detail: crate::datetime::INVALID_TIME_ZONE_DETAIL,
+                            },
+                        )?;
+                        session.set_time_zone(tz);
+                    }
+                }
+                Ok(crate::sql::SqlOutcome::SetTimeZone)
+            }
+            crate::sql::allowlist::Statement::ShowTimeZone => Ok(crate::sql::SqlOutcome::Show(
+                crate::sql::exec::QueryResult {
+                    columns: show_time_zone_columns(),
+                    rows: vec![crate::sql::exec::ResultRow {
+                        id: 0,
+                        score: 0.0,
+                        cells: vec![crate::sql::exec::Cell::Text(
+                            session.time_zone().display().to_string(),
+                        )],
+                    }],
+                },
+            )),
             // TASK-79（SQL-9）: `CREATE FUNCTION` の検証・登録は
             // `sql::udf_call::define_function` に委譲する（検証→登録の順を守り、
             // 失敗時は `session.udfs()` を一切変更しない。`SET search_mode` と同じ
@@ -7634,6 +7726,7 @@ impl EngineCore {
                     schema,
                     self.batch_limits,
                     clock,
+                    session.time_zone().clone(),
                 )?))
             }
             crate::sql::allowlist::CopyStatement::To(v) => {

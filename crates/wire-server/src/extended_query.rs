@@ -2085,11 +2085,12 @@ fn execute_portal<'e, S: WireStream>(
                         // のみを意味する（`XX000` 相当。`result_encoder`
                         // モジュールドキュメント参照）。
                         let mut frame = Vec::new();
-                        result_encoder::encode_data_row_into_with_columns(
+                        result_encoder::encode_data_row_into_with_columns_in_tz(
                             row,
                             &result.columns,
                             &result_formats,
                             &mut frame,
+                            session.time_zone(),
                         )
                         .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
                         remaining_bytes = remaining_bytes.saturating_add(frame.len());
@@ -2114,11 +2115,12 @@ fn execute_portal<'e, S: WireStream>(
                     );
                     for row in result.rows.iter().take(take) {
                         let mut frame = Vec::new();
-                        result_encoder::encode_data_row_into_with_columns(
+                        result_encoder::encode_data_row_into_with_columns_in_tz(
                             row,
                             &result.columns,
                             &result_formats,
                             &mut frame,
+                            session.time_zone(),
                         )
                         .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
                         buffer
@@ -2339,6 +2341,7 @@ pub(crate) fn handle_sync<S: WireStream>(
     state: &mut ExtendedQueryState,
     txn_status: engine::sql::transaction::TransactionStatus,
     active_generation: Option<u64>,
+    ready_frames: &[u8],
 ) -> io::Result<LoopSignal> {
     let _body = match framing::read_length_prefixed_body(stream, 4, 4) {
         Ok(b) => b,
@@ -2366,7 +2369,10 @@ pub(crate) fn handle_sync<S: WireStream>(
     // TASK-221・PR #1041 レビュー指摘 P1: 以前は明示トランザクションの状態を
     // 無視して常に `Idle`（'I'）を送出しており、`BEGIN` 後もクライアントから
     // トランザクションが終了したように見えていた）。
-    stream.write_all(&result_encoder::encode_ready_for_query(txn_status))?;
+    // `ready_frames` は呼び出し元（`handshake::post_auth_loop`）が
+    // `handshake::ready_for_query_frames` で組み立てた `[ParameterStatus(TimeZone)] ReadyForQuery`
+    // （TABLE-33・Issue #1575。`txn_status` と同じ `txn` の状態バイトを含む）。
+    stream.write_all(ready_frames)?;
     stream.flush()?;
     Ok(LoopSignal::Continue)
 }
