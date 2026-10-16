@@ -277,7 +277,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 55] = [
+const EXPECTED_STATUS: [(&str, u16); 58] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -355,6 +355,9 @@ const EXPECTED_STATUS: [(&str, u16); 55] = [
     ("2203A", 400),
     ("2203B", 400),
     ("2203C", 400),
+    ("22034", 400),
+    ("22035", 400),
+    ("2203F", 400),
     // `UntranslatableCharacter`（`22P05`。Issue #2185）: jsonpath リテラルの NUL 文字。400。
     ("22P05", 400),
     // `DuplicateObject`（`42710`。TABLE-22、Issue #1195）: ERR-6 の新設行。400
@@ -451,7 +454,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 58);
+const _: () = assert!(ErrorClass::ALL.len() == 61);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -958,6 +961,10 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         ErrorClass::JsonMemberNotFound,
         ErrorClass::JsonNumberNotFound,
         ErrorClass::JsonObjectNotFound,
+        // SQL/JSON 問い合わせ関数の `22034`／`22035`／`2203F`（Issue #2187）: SQL 表層専用。
+        ErrorClass::MoreThanOneSqlJsonItem,
+        ErrorClass::NoSqlJsonItem,
+        ErrorClass::SqlJsonScalarRequired,
         // `UntranslatableCharacter`（`22P05`。Issue #2185）: jsonpath リテラルの NUL 文字。
         // SQL 表層専用で NoSQL 表層からは到達不能。
         ErrorClass::UntranslatableCharacter,

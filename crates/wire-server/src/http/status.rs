@@ -91,6 +91,10 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::JsonMemberNotFound
         | ErrorClass::JsonNumberNotFound
         | ErrorClass::JsonObjectNotFound
+        // Issue #2187: SQL/JSON 問い合わせ関数の `22034`／`22035`／`2203F` も入力起因の拒否。
+        | ErrorClass::MoreThanOneSqlJsonItem
+        | ErrorClass::NoSqlJsonItem
+        | ErrorClass::SqlJsonScalarRequired
         | ErrorClass::MissingOperationId
         | ErrorClass::DatetimeFieldOverflow
         | ErrorClass::InvalidDatetimeFormat
@@ -169,7 +173,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 58] = [
+    const EXPECTED: [(ErrorClass, u16); 61] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -227,6 +231,9 @@ mod tests {
         (ErrorClass::JsonMemberNotFound, 400),
         (ErrorClass::JsonNumberNotFound, 400),
         (ErrorClass::JsonObjectNotFound, 400),
+        (ErrorClass::MoreThanOneSqlJsonItem, 400),
+        (ErrorClass::NoSqlJsonItem, 400),
+        (ErrorClass::SqlJsonScalarRequired, 400),
         (ErrorClass::UntranslatableCharacter, 400),
     ];
 

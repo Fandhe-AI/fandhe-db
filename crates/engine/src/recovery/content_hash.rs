@@ -1820,6 +1820,21 @@ fn collect_referenced_udfs(
         Expr::Null | Expr::ValueFunction { .. } => Ok(()),
         // 照合指定（TABLE-28・Issue #1609）は内側の式の UDF 呼び出しを再帰的に走査する。
         Expr::Collate { expr, .. } => collect_referenced_udfs(expr, udf_registry, out),
+        // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）は context・path・PASSING・
+        // DEFAULT の部分式の UDF 呼び出しを走査する。
+        Expr::SqlJsonQuery(q) => {
+            collect_referenced_udfs(&q.context, udf_registry, out)?;
+            collect_referenced_udfs(&q.path, udf_registry, out)?;
+            for (_, e) in &q.passing {
+                collect_referenced_udfs(e, udf_registry, out)?;
+            }
+            for beh in [&q.on_empty, &q.on_error].into_iter().flatten() {
+                if let crate::sql::udf_call::SqlJsonBehavior::Default(e) = beh {
+                    collect_referenced_udfs(e, udf_registry, out)?;
+                }
+            }
+            Ok(())
+        }
         Expr::Case { whens, else_result } => {
             for (cond, result) in whens {
                 collect_referenced_udfs(cond, udf_registry, out)?;
@@ -1938,6 +1953,16 @@ fn push_set_expr(
                 walk(b, rhs);
             }
             Expr::Collate { expr, .. } => walk(b, expr),
+            Expr::SqlJsonQuery(q) => {
+                walk(b, &q.context);
+                walk(b, &q.path);
+                q.passing.iter().for_each(|(_, e)| walk(b, e));
+                for beh in [&q.on_empty, &q.on_error].into_iter().flatten() {
+                    if let crate::sql::udf_call::SqlJsonBehavior::Default(e) = beh {
+                        walk(b, e);
+                    }
+                }
+            }
             Expr::Case { whens, else_result } => {
                 for (c, r) in whens {
                     walk(b, c);
@@ -2137,6 +2162,46 @@ fn push_dml_expr(
             b.push_bytes(collation.catalog_token().as_bytes())
                 .map_err(|_| dml_hash_field_too_large())?;
             push_dml_expr(b, expr, params)?;
+        }
+        // タグ 15（対象ビヘイビア: TABLE-25。Issue #2187。ADR §4.4 タグ表に追記）。
+        // 関数種別・context・path・PASSING（件数＋〔名前を長さ前置・式〕の組）・RETURNING・
+        // ラッパー・引用符・ON EMPTY／ON ERROR（DEFAULT は式を前置順）を、可変長部を長さ前置
+        // または有無フラグ付きで単射に直列化する（述語形の UPDATE／DELETE の WHERE に
+        // `JSON_EXISTS` が入りうるため、拒否ではなくハッシュする）。既存タグ 1〜14 は不変。
+        Expr::SqlJsonQuery(q) => {
+            b.push_u8(15);
+            b.push_u8(q.kind.hash_tag());
+            push_dml_expr(b, &q.context, params)?;
+            push_dml_expr(b, &q.path, params)?;
+            let count = u32::try_from(q.passing.len()).map_err(|_| dml_hash_field_too_large())?;
+            b.push_raw(&count.to_le_bytes());
+            for (name, e) in &q.passing {
+                b.push_bytes(name.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+                push_dml_expr(b, e, params)?;
+            }
+            b.push_u8(u8::from(q.returning.is_some()));
+            if let Some(r) = &q.returning {
+                b.push_bytes(r.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
+            b.push_u8(u8::from(q.with_wrapper));
+            b.push_u8(match q.keep_quotes {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            });
+            for beh in [&q.on_empty, &q.on_error] {
+                match beh {
+                    None => b.push_u8(0),
+                    Some(beh) => {
+                        b.push_u8(beh.hash_tag());
+                        if let crate::sql::udf_call::SqlJsonBehavior::Default(e) = beh {
+                            push_dml_expr(b, e, params)?;
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -4723,6 +4788,25 @@ mod tests {
             collation,
         }
     }
+    /// `SqlJsonQuery`（タグ 15）の最小形。`mutate` で句を 1 つだけ変えた対を作る。
+    fn sjq(
+        kind: crate::sql::udf_call::SqlJsonQueryKind,
+        mutate: impl FnOnce(&mut crate::sql::udf_call::SqlJsonQueryExpr),
+    ) -> crate::sql::udf_call::Expr {
+        let mut q = crate::sql::udf_call::SqlJsonQueryExpr {
+            kind,
+            context: ident("d"),
+            path: text("$.a"),
+            passing: vec![],
+            returning: None,
+            with_wrapper: false,
+            keep_quotes: None,
+            on_empty: None,
+            on_error: None,
+        };
+        mutate(&mut q);
+        crate::sql::udf_call::Expr::SqlJsonQuery(Box::new(q))
+    }
     fn value_function(
         kind: crate::sql::udf_call::ValueFunctionKind,
         precision: Option<u8>,
@@ -5032,6 +5116,73 @@ mod tests {
                 "collate operand",
                 collate(ident("a"), crate::collation::Collation::C),
                 collate(ident("b"), crate::collation::Collation::C),
+            ),
+            // Issue #2187（TABLE-25）: SQL/JSON 問い合わせ関数の各句で区別される（タグ 15）。
+            (
+                "sqljson kind",
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Value, |_| {}),
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Query, |_| {}),
+            ),
+            (
+                "sqljson on error",
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Exists, |_| {}),
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Exists, |q| {
+                    q.on_error = Some(crate::sql::udf_call::SqlJsonBehavior::True);
+                }),
+            ),
+            (
+                "sqljson behavior slot",
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Value, |q| {
+                    q.on_empty = Some(crate::sql::udf_call::SqlJsonBehavior::Error);
+                }),
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Value, |q| {
+                    q.on_error = Some(crate::sql::udf_call::SqlJsonBehavior::Error);
+                }),
+            ),
+            (
+                "sqljson default value",
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Value, |q| {
+                    q.on_empty = Some(crate::sql::udf_call::SqlJsonBehavior::Default(Box::new(
+                        text("a"),
+                    )));
+                }),
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Value, |q| {
+                    q.on_empty = Some(crate::sql::udf_call::SqlJsonBehavior::Default(Box::new(
+                        text("b"),
+                    )));
+                }),
+            ),
+            (
+                "sqljson passing name",
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Exists, |q| {
+                    q.passing = vec![("x".to_string(), num("1"))];
+                }),
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Exists, |q| {
+                    q.passing = vec![("y".to_string(), num("1"))];
+                }),
+            ),
+            (
+                "sqljson returning",
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Value, |_| {}),
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Value, |q| {
+                    q.returning = Some("text".to_string());
+                }),
+            ),
+            (
+                "sqljson wrapper",
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Query, |_| {}),
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Query, |q| {
+                    q.with_wrapper = true;
+                }),
+            ),
+            (
+                "sqljson quotes",
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Query, |q| {
+                    q.keep_quotes = Some(true);
+                }),
+                sjq(crate::sql::udf_call::SqlJsonQueryKind::Query, |q| {
+                    q.keep_quotes = Some(false);
+                }),
             ),
             (
                 "beyond 2^53 integer vs decimal spelling",

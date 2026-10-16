@@ -246,6 +246,11 @@ origin/main 取り込み時の是正: 並行実装していた Issue #921 のタ
   [now-evaluated-value-ledger.md](now-evaluated-value-ledger.md)）
 - `Collate{expr, collation}`＝タグ 14・照合のカタログトークン（長さ前置。`c`／`posix`）・`expr`
   （Issue #1609・TABLE-28。既存タグ 1〜13 は不変）
+- `SqlJsonQuery`＝タグ 15・関数種別 1 バイト（`JSON_EXISTS`=1・`JSON_VALUE`=2・`JSON_QUERY`=3）・context 式・
+  path 式・PASSING の件数（u32 LE）と（変数名〔長さ前置〕・値式）の組・RETURNING の有無 1 バイトと型名
+  （長さ前置）・ラッパー 1 バイト・引用符 1 バイト（省略=0・KEEP=1・OMIT=2）・`ON EMPTY`／`ON ERROR` の各
+  （省略=0、あれば挙動タグ 1〜8 ＋ `DEFAULT`〔タグ 8〕のときだけ式）（Issue #2187・TABLE-25。
+  述語形の `UPDATE`／`DELETE` の WHERE に `JSON_EXISTS` が入りうるためハッシュする。既存タグ 1〜14 は不変）
 
 型バイトで `DATE`／`TIMESTAMP` を区別するのは、同じ暦日を表す
 `DATE '2024-01-01'` と `TIMESTAMP '2024-01-01 00:00:00'` を型バイトなしで

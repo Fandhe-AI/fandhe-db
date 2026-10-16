@@ -267,9 +267,54 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   書ける（否定の `NOT` 付きは `42601`。`JsonAccess` の述語演算子と同じ扱い）。CHECK・関数本体は `0A000`。
 - 意図的な差分・対象外: 集合返却の `jsonb_path_query` は名前だけ予約して `0A000`（SRF 基盤 #2220 待ち）、
   `jsonb_path_*_tz` は未実装（`42883`）、`jsonpath` 型そのもの・名前付き引数は対象外。`@?`／`@@` は #2186、
-  `JSON_EXISTS` 等は #2187。#2184 から引き継ぐ差分（数値の桁数・`.keyvalue()` の id・datetime 系・
+  `JSON_EXISTS` 等は #2187（実装済み。上の節）。#2184 から引き継ぐ差分（数値の桁数・`.keyvalue()` の id・datetime 系・
   `like_regex`）は変わらない。
 - 期待値は PostgreSQL 17 の挙動に合わせたが、実機との突き合わせは未実施（strict の推定を含む）。
+
+## Issue #2187 での変更（SQL/JSON 問い合わせ関数）
+
+- `JSON_EXISTS`・`JSON_VALUE`・`JSON_QUERY` を SQL の式評価器へ配線した（TABLE-25・TASK-273 ポインタ。
+  束縛・評価は `crates/engine/src/sql/jsonpath_fn.rs`）。構文は専用の AST `Expr::SqlJsonQuery`
+  （破壊的変更。`feat(engine)!`）で、`PASSING`・`RETURNING`・ラッパー・引用符・`ON EMPTY`／`ON ERROR` を構造のまま
+  保持する。位置引数へ脱糖しないのは、句を引数の並びで表せないことと、内部名が既定の列名・利用者の呼び出しへ
+  漏れることを避けるため。句語は文脈依存の識別子として照合する（予約語化しない）。
+- 受理範囲（意味を確かめていない形はすべて `0A000`＝fail-closed。受理しない句も構文としては認識して `0A000` を返す）:
+
+  | 項目 | 受理する形 | 受理しない形 |
+  | ---- | ---------- | ------------ |
+  | context item | jsonb の式・列、型なし文字列リテラル、裸の `NULL`（結果 NULL） | text 系・`json` 列・その他の型、`FORMAT JSON` は `0A000` |
+  | path | 型なし文字列リテラル（束縛時に解析。構文エラーは行が無くても出る）、裸の `NULL` | 列・式は `0A000` |
+  | `PASSING v AS name` | jsonb・text・数値・boolean・`NULL`（JSON の `null`）。名前は小文字へ畳む。32 件まで（超過は `54000`） | datetime・vector・`json` 値、畳んだ名前の重複は `0A000` |
+  | `RETURNING`（`JSON_VALUE`） | 省略（`text`）・`text`・長さなしの `varchar` | それ以外は `0A000` |
+  | `RETURNING`（`JSON_QUERY`） | 省略（`jsonb`）・`jsonb`・`json`・`text`・長さなしの `varchar` | それ以外は `0A000` |
+  | `RETURNING`（`JSON_EXISTS`） | — | `0A000` |
+  | ラッパー | `WITHOUT [ARRAY] WRAPPER`（既定）・`WITH [UNCONDITIONAL] [ARRAY] WRAPPER` | `CONDITIONAL` は `0A000` |
+  | 引用符 | `KEEP QUOTES [ON SCALAR STRING]`（既定）・`OMIT QUOTES [ON SCALAR STRING]`（text 系の `RETURNING` のみ） | jsonb／json の `OMIT QUOTES` は `0A000`。`WITH WRAPPER` と引用符の同時指定は `42601` |
+  | `ON EMPTY`／`ON ERROR` | `JSON_EXISTS`: `TRUE`・`FALSE`・`UNKNOWN`・`ERROR`（`ON ERROR` のみ）。`JSON_VALUE`: `ERROR`・`NULL`・`DEFAULT`。`JSON_QUERY`: `ERROR`・`NULL`・`EMPTY [ARRAY]`・`EMPTY OBJECT`・`DEFAULT` | 関数に合わない挙動・順序違反は `42601` |
+  | `DEFAULT` | 文字列リテラル・`NULL`。text 系の `JSON_VALUE` に限り先頭ゼロなしの整数リテラル。`JSON_QUERY` の jsonb／json は束縛時に jsonb として解析（不正は `22P02`） | 列参照・一般式・その他の数値は `0A000` |
+
+- 既定: `JSON_EXISTS` は `FALSE ON ERROR`、`JSON_VALUE`・`JSON_QUERY` は `NULL ON EMPTY`・`NULL ON ERROR`。
+  既定の列名は `json_exists`／`json_value`／`json_query`。
+- 評価の順序と `ON ERROR` の捕捉範囲（設計判断）: path を**非 silent** で評価し、抑止可能な評価エラー
+  （`JsonPathEvalError::is_suppressible`）だけを `ON ERROR` の対象にする。`54000`（上限超過）・`42704`（未定義変数）・
+  `22023`・`0A000`（`like_regex`・datetime 系）・内部不整合は句の指定に関係なく常に返る。0 件は `ON EMPTY`
+  （`ERROR ON EMPTY` は `22035` をそのまま返し、`ON ERROR` では捕捉しない）。2 件以上（`22034`。`JSON_VALUE`・
+  ラッパーなしの `JSON_QUERY`）と非スカラー（`2203F`。`JSON_VALUE`）は `ON ERROR` の対象。結果の直列化の上限超過
+  （`54000`）は捕捉しない。JSON の `null` は `JSON_VALUE` では SQL の NULL、`JSON_QUERY` では `null`。
+- 新しい SQLSTATE: `22034`（`ErrorClass::MoreThanOneSqlJsonItem`）・`22035`（`NoSqlJsonItem`）・
+  `2203F`（`SqlJsonScalarRequired`）。文言は固定の英語文で、入力の断片を含めない（wire-server の HTTP 写像は 400）。
+- 使える位置: 投影・WHERE（`JSON_EXISTS` は比較なしの裸の述語。`NOT` 付きは `42601`）・ORDER BY・FROM なし SELECT。
+  CHECK・関数本体・定数式（INSERT VALUES 等）は `0A000`／`42601`（既存の jsonb 関数と同じ扱い）。
+- prepared 文: `RETURNING`・`ON` が括弧内の句語として現れるため、`sql::params::where_region` は括弧の深さを数え、
+  深さ 0 の `RETURNING`・`ON` だけを句境界とする。
+- 内容ハッシュ（`recovery::content_hash`）は新しいタグ 15 で直列化する（[multi-row-dml-operation-id.md](multi-row-dml-operation-id.md) §4.4）。
+- 意図的な差分・対象外: `JSON_TABLE`・SQL/JSON 構築関数・`IS JSON`、上表の `0A000` の形（text 系 context item・
+  `FORMAT JSON`・非リテラルの path と `DEFAULT`・`CONDITIONAL WRAPPER`・数値型等の `RETURNING`・datetime の
+  `PASSING`）、`PASSING` の引用付き識別子の大文字小文字（字句段が引用の有無を保持しないため常に小文字へ畳む）、
+  引用された `"json_value"(...)` も同じ構文として扱う。`ERROR ON EMPTY` を `ON ERROR` で捕捉しない点、
+  関数に合わない挙動の SQLSTATE（`42601`）、ラッパー指定時の 0 件の扱い（`ON EMPTY` を適用）は
+  PostgreSQL 17 の挙動の推定を含む。
+- 期待値は PostgreSQL 17 のドキュメント・ソース由来で、実機との突き合わせは未実施。
 
 ## 設計判断の所在
 
@@ -290,7 +335,7 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 | 連結・削除演算子（実装済み） | #2181 |
 | JSON スカラー関数（実装済み） | #1599 |
 | JSON 集合返却関数（SRF 基盤待ち） | #2220 |
-| jsonpath（字句・構文解析器は #2183、評価器は #2184、`jsonb_path_*` 関数は #2185 で実装済み） | #2183〜#2187 |
+| jsonpath（字句・構文解析器は #2183、評価器は #2184、`jsonb_path_*` 関数は #2185、`JSON_EXISTS`・`JSON_VALUE`・`JSON_QUERY` は #2187 で実装済み。`@?`／`@@` は #2186） | #2183〜#2187 |
 | 索引 | #2204 |
 
 ## 対象外・申し送り

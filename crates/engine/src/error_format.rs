@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 58;
+    count = 61;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -373,6 +373,16 @@ define_error_classes! {
     /// jsonpath のメンバーアクセサ・`.keyvalue()` がオブジェクト以外に適用された
     /// （`2203C`。Issue #2184）。
     JsonObjectNotFound => ("2203C", "JSON_OBJECT_NOT_FOUND"),
+    /// SQL/JSON 問い合わせ関数が単一項目を要する位置で 2 件以上を得た（`22034`。Issue #2187・
+    /// TABLE-25 のポインタ）。`JSON_VALUE`／ラッパーなしの `JSON_QUERY` が返す。項目の値は含めない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::MoreThanOneSqlJsonItem`] の写像。
+    MoreThanOneSqlJsonItem => ("22034", "MORE_THAN_ONE_SQL_JSON_ITEM"),
+    /// `ERROR ON EMPTY` の指定で path の結果が空だった（`22035`。Issue #2187）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::NoSqlJsonItem`] の写像。
+    NoSqlJsonItem => ("22035", "NO_SQL_JSON_ITEM"),
+    /// `JSON_VALUE` の結果がスカラーでない（配列・オブジェクト。`2203F`。Issue #2187）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::SqlJsonScalarRequired`] の写像。
+    SqlJsonScalarRequired => ("2203F", "SQL_JSON_SCALAR_REQUIRED"),
 }
 
 impl ErrorClass {

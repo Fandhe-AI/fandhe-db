@@ -50,6 +50,10 @@ pub(crate) fn expr_node_count(expr: &Expr) -> usize {
             .saturating_add(expr_node_count(a))
             .saturating_add(expr_node_count(b)),
         Expr::Collate { expr, .. } => 1usize.saturating_add(expr_node_count(expr)),
+        Expr::SqlJsonQuery(q) => q
+            .children()
+            .into_iter()
+            .fold(1usize, |acc, c| acc.saturating_add(expr_node_count(c))),
         Expr::Case { whens, else_result } => {
             let mut n = 1usize;
             for (c, r) in whens {

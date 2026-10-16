@@ -146,6 +146,12 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
         Expr::Collate { .. } => Err(SqlSurfaceError::unsupported(
             "COLLATE is not supported in a constant expression",
         )),
+        // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）は定数式（INSERT VALUES・DEFAULT 等）
+        // では受理しない（`0A000`。FROM なし SELECT は `const_select` の別経路が受理する）。
+        Expr::SqlJsonQuery(_) => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "SQL/JSON query functions are not supported in a constant expression"
+                .to_string(),
+        }),
         Expr::Number(_)
         | Expr::String(_)
         | Expr::Null
@@ -228,6 +234,8 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::TimeLiteral(_)
         | Expr::ValueFunction { .. } => Ok(()),
         Expr::Collate { expr, .. } => check_intermediate_precision(expr),
+        // 到達しない（`prescan` が拒否済み）。
+        Expr::SqlJsonQuery(_) => Ok(()),
         Expr::Call { args, .. } => {
             args.iter().try_for_each(check_intermediate_precision)?;
             check_node_value(expr, true)
