@@ -530,6 +530,14 @@ impl<'a> Ev<'a> {
         Ok(())
     }
 
+    /// 数値テキスト（`Float` の `text`）を複製・生成する前にバイト予算を差し引く。
+    fn charge_number(&mut self, n: &JsonNumber) -> R<()> {
+        if let JsonNumber::Float { text, .. } = n {
+            self.charge_bytes(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
+        }
+        Ok(())
+    }
+
     fn enter(&mut self) -> R<()> {
         self.tick(1)?;
         if self.depth >= self.max_depth {
@@ -745,7 +753,9 @@ impl<'a> Ev<'a> {
             }
             PathNode::Last => {
                 if self.innermost < 0 {
-                    return Err(hard(JsonPathEvalError::Internal));
+                    // 添字外の `last` は PostgreSQL では構文段階で 42601 だが、本実装の
+                    // 構文解析は受理するため、評価時に数値でない添字扱い（22033）で拒否する。
+                    return Err(hard(JsonPathEvalError::SubscriptNotNumeric));
                 }
                 if next.is_empty() && found.is_none() {
                     return Ok(Res::Ok);
@@ -1310,21 +1320,32 @@ impl<'a> Ev<'a> {
             Method::BigInt => self.int_method(jb, i128::from(i64::MIN), i128::from(i64::MAX)),
             Method::Integer => self.int_method(jb, i128::from(i32::MIN), i128::from(i32::MAX)),
             Method::Number => match jb.kind() {
-                Kind::Num => jb
-                    .num()
-                    .map(|n| Item::Num(n.clone()))
-                    .ok_or(hard(JsonPathEvalError::Internal)),
+                Kind::Num => {
+                    let n = jb.num().ok_or(hard(JsonPathEvalError::Internal))?;
+                    self.charge_number(n)?;
+                    Ok(Item::Num(n.clone()))
+                }
                 Kind::Str => match jb.str().and_then(parse_numeric_text) {
-                    Some(n) => Ok(Item::Num(n)),
+                    Some(n) => {
+                        self.charge_number(&n)?;
+                        Ok(Item::Num(n))
+                    }
                     None => Err(self.soft(JsonPathEvalError::NonNumericItem)),
                 },
                 _ => Err(self.soft(JsonPathEvalError::NonNumericItem)),
             },
             Method::Decimal { precision, scale } => {
                 let n: JsonNumber = match jb.kind() {
-                    Kind::Num => jb.num().cloned().ok_or(hard(JsonPathEvalError::Internal))?,
+                    Kind::Num => {
+                        let n = jb.num().ok_or(hard(JsonPathEvalError::Internal))?;
+                        self.charge_number(n)?;
+                        n.clone()
+                    }
                     Kind::Str => match jb.str().and_then(parse_numeric_text) {
-                        Some(n) => n,
+                        Some(n) => {
+                            self.charge_number(&n)?;
+                            n
+                        }
                         None => return Err(self.soft(JsonPathEvalError::NonNumericItem)),
                     },
                     _ => return Err(self.soft(JsonPathEvalError::NonNumericItem)),
@@ -1350,11 +1371,11 @@ impl<'a> Ev<'a> {
                     _ => Err(hard(JsonPathEvalError::Internal)),
                 },
                 Kind::Num => {
+                    // PostgreSQL の numeric_int4 同様、丸めた結果が int4 に収まれば受理する。
                     let v = jb
                         .num()
                         .and_then(num::from_json_number)
-                        .filter(|d| d.scale() == 0)
-                        .and_then(|d| num::trunc_to_i128(&d))
+                        .and_then(|d| num::round_to_i128(&d))
                         .and_then(|t| i32::try_from(t).ok());
                     match v {
                         Some(v) => Ok(Item::Bool(v != 0)),

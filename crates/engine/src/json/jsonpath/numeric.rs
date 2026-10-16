@@ -238,9 +238,10 @@ pub(super) fn round_to_i128(a: &Decimal) -> Option<i128> {
     let f = pow10(u32::from(a.scale()))?;
     let q = a.unscaled().checked_div(f)?;
     let r = a.unscaled().checked_rem(f)?;
-    // |r| * 2 >= f なら 0 から遠い側へ。`f` は 10 の冪（>= 1）。
-    let twice = r.checked_abs()?.checked_mul(2)?;
-    if twice >= f {
+    // |r| * 2 >= f なら 0 から遠い側へ。2 倍のオーバーフローを避けるため
+    // `|r| >= f - |r|` で比較する（|r| < f なので引き算は安全）。
+    let ar = r.checked_abs()?;
+    if ar >= f.checked_sub(ar)? {
         if a.unscaled() < 0 {
             q.checked_sub(1)
         } else {
@@ -270,8 +271,9 @@ pub(super) fn apply_precision_scale(a: &Decimal, p: i64, s: i64) -> Result<Decim
                 Some(f) => {
                     let q = a.unscaled() / f;
                     let r = a.unscaled() % f;
-                    let twice = r.checked_abs().ok_or(NumFail::Overflow)?.checked_mul(2);
-                    let up = matches!(twice, Some(t) if t >= f);
+                    let ar = r.checked_abs().ok_or(NumFail::Overflow)?;
+                    // 2 倍のオーバーフローを避け `|r| >= f - |r|` で half away from zero を判定する。
+                    let up = f.checked_sub(ar).is_some_and(|rest| ar >= rest);
                     if up {
                         if a.unscaled() < 0 {
                             q.checked_sub(1).ok_or(NumFail::Overflow)?
@@ -387,6 +389,13 @@ mod tests {
         assert_eq!(round_to_i128(&d("-1.5")), Some(-2));
         assert_eq!(round_to_i128(&d("1.4")), Some(1));
         assert_eq!(trunc_to_i128(&d("-1.9")), Some(-1));
+    }
+
+    #[test]
+    fn rounding_does_not_overflow_at_max_scale() {
+        let nines = format!("0.{}", "9".repeat(38));
+        assert_eq!(round_to_i128(&d(&nines)), Some(1));
+        assert_eq!(show(apply_precision_scale(&d(&nines), 1, 0)), "1");
     }
 
     #[test]
