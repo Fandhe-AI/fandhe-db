@@ -468,4 +468,19 @@ mod tests {
             "2024-03-11 03:30:00-04"
         );
     }
+
+    /// 月加算後の中間値が jiff の年範囲（9999 年）を超えても、最終値が有効範囲内なら成功する。
+    #[test]
+    fn timestamptz_intermediate_beyond_jiff_range() {
+        let tz = SessionTimeZone::parse_setting("America/New_York").unwrap();
+        let t = crate::datetime::parse_timestamptz("2000-01-01 12:00:00-05", &tz).unwrap();
+        let next = timestamptz_add_interval(t, &iv("120000 mons -3652425 days"), &tz).unwrap();
+        let s = crate::datetime::format_timestamptz(next, &tz);
+        assert!(s.starts_with("2000-") || s.starts_with("1999-"), "{s}");
+        // 最終値が範囲外なら従来どおり 22008。
+        assert_eq!(
+            code(timestamptz_add_interval(t, &iv("120000 mons"), &tz).unwrap_err()),
+            "22008"
+        );
+    }
 }

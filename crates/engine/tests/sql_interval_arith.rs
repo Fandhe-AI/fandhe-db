@@ -433,6 +433,25 @@ fn update_set_and_insert_values_accept_interval_expressions() {
             "NULL"
         );
     }
+    // 裸の NULL と INTERVAL の加減算は INTERVAL 同士の演算へ解決される（型が TIMESTAMP にならない）。
+    for (id, e) in [
+        (13, "COALESCE(NULL + INTERVAL '1 day', INTERVAL '0')"),
+        (14, "COALESCE(INTERVAL '1 day' - NULL, INTERVAL '0')"),
+    ] {
+        ok(
+            &core,
+            &mut s,
+            &format!("INSERT INTO ev (id, v) VALUES ({id}, {e}) USING OPERATION_ID 'i{id}'"),
+        );
+        assert_eq!(
+            one(
+                &core,
+                &mut s,
+                &format!("SELECT v FROM ev WHERE id = {id} LIMIT 5")
+            ),
+            "iv:00:00:00"
+        );
+    }
     // 範囲外の結果は副作用を残さない。
     assert_eq!(
         code(
@@ -650,4 +669,18 @@ fn other_tenants_rows_never_appear_in_arithmetic_results() {
         Err(_) => 0,
     };
     assert_eq!(r, 0);
+}
+
+/// TIMESTAMPTZ の月加算後の中間値が 9999 年を超えても最終値が範囲内なら成功する。
+#[test]
+fn timestamptz_intermediate_beyond_year_9999_succeeds() {
+    let (_g, core) = open("ivar-tz-mid");
+    let mut s = session();
+    ok(&core, &mut s, "SET TIME ZONE 'America/New_York'");
+    let r = one(
+        &core,
+        &mut s,
+        "SELECT TIMESTAMPTZ '2000-01-01 12:00:00-05' + INTERVAL '120000 mons -3652425 days'",
+    );
+    assert!(r.starts_with("tz:"), "{r}");
 }

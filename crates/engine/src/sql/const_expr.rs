@@ -417,14 +417,40 @@ const MAX_NULL_ARG_PROBES: usize = 256;
 
 /// 1 オペランドが取りうる置換候補。非 `NULL` は式そのもの、型既知の `NULL` は
 /// 型付き `NULL`、裸の `NULL` は型候補ごとの型付き `NULL`。
-fn operand_options(e: &Expr, k: Option<Option<ExprType>>) -> Vec<Expr> {
+///
+/// 裸の `NULL` は `prefer` の型を候補の先頭へ移す（相手オペランドが `INTERVAL` の
+/// 加減算で `INTERVAL` 同士の演算を選ばせるため。Issue #1581）。
+fn operand_options(e: &Expr, k: Option<Option<ExprType>>, prefer: Option<ExprType>) -> Vec<Expr> {
     match k {
         None => vec![e.clone()],
         Some(Some(t)) => typed_null(t).into_iter().collect(),
         Some(None) => NULL_OPERAND_CANDIDATES
             .iter()
+            .filter(|t| Some(**t) == prefer)
+            .chain(
+                NULL_OPERAND_CANDIDATES
+                    .iter()
+                    .filter(|t| Some(**t) != prefer),
+            )
             .filter_map(|t| typed_null(*t).ok())
             .collect(),
+    }
+}
+
+/// 非 `NULL` オペランドが `INTERVAL` 型なら、加減算の裸 `NULL` 側で優先する型（`INTERVAL`）を返す。
+fn interval_preference(
+    op: BinOp,
+    other: &Expr,
+    other_null: Option<Option<ExprType>>,
+) -> Option<ExprType> {
+    if other_null.is_some() || !matches!(op, BinOp::Add | BinOp::Sub) {
+        return None;
+    }
+    let registry = UdfRegistry::default();
+    let mut budget = MAX_EXPR_NODES;
+    match bind_const_expr(other, &registry, &mut budget) {
+        Ok((_, ExprType::Interval, _)) => Some(ExprType::Interval),
+        _ => None,
     }
 }
 
@@ -442,8 +468,10 @@ fn fold_null_binary(
     rn: Option<Option<ExprType>>,
 ) -> Result<Expr, SqlSurfaceError> {
     let mut first_err: Option<SqlSurfaceError> = None;
-    for lhs in operand_options(l, ln) {
-        for rhs in operand_options(r, rn) {
+    let lpref = interval_preference(op, r, rn);
+    let rpref = interval_preference(op, l, ln);
+    for lhs in operand_options(l, ln, lpref) {
+        for rhs in operand_options(r, rn, rpref) {
             let probe = Expr::Binary {
                 op,
                 lhs: Box::new(lhs.clone()),
@@ -496,7 +524,7 @@ fn fold_null_call(name: &str, args: Vec<Expr>) -> Result<Expr, SqlSurfaceError> 
     };
     let options: Vec<Vec<Expr>> = args
         .iter()
-        .map(|a| operand_options(a, null_kind(a)))
+        .map(|a| operand_options(a, null_kind(a), None))
         .collect();
     let mut idx = vec![0usize; args.len()];
     for _ in 0..MAX_NULL_ARG_PROBES {

@@ -727,6 +727,14 @@ impl SessionTimeZone {
         let days = local_micros.div_euclid(MICROS_PER_DAY);
         let day_micros = local_micros.rem_euclid(MICROS_PER_DAY);
         let (year, month, day) = civil_from_days(days);
+        // jiff の年範囲（±9999）外は、暦（曜日配置）が一致する 400 年周期の同位置年へ写して
+        // offset だけを引く。日付の加減算で最終値が有効範囲へ戻る中間値を許容するため
+        // （TIMESTAMP 側の中間値許容と同じ契約。Issue #1581）。
+        let year = if (-9999..=9999).contains(&year) {
+            year
+        } else {
+            (year - 2000).rem_euclid(400) + 2000
+        };
         let secs = day_micros / 1_000_000;
         let sub_nanos = (day_micros % 1_000_000) * 1_000;
         let dt = jiff::civil::DateTime::new(
