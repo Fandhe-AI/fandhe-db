@@ -902,12 +902,13 @@ impl DeclaredParamType {
 /// 浮動小数系は既存の浮動小数文法（`float4` は有限性も確認）、`bool` は
 /// [`parse_pg_bool`] で判定する。text 系と、`numeric`・日時・`bytea`・`uuid`・`json(b)`
 /// は追加検証をしない（単独で呼べる検証器を第 2 の文法として持たない方針。値は束縛後の
-/// 既存リテラル経路が列型に応じて検証する）。エラー文言は `$n` 番号と型名だけで値を含めない。
+/// 既存リテラル経路が列型に応じて検証する）。`float4` は f32 へ丸めた正規テキストを
+/// `Some` で返す（呼び出し側が置換値に使う）。エラー文言は `$n` 番号と型名だけで値を含めない。
 pub(crate) fn validate_declared_value(
     n: u16,
     ty: DeclaredParamType,
     value: &str,
-) -> Result<(), SqlSurfaceError> {
+) -> Result<Option<String>, SqlSurfaceError> {
     let name = ty.name();
     match ty {
         DeclaredParamType::Int2 | DeclaredParamType::Int4 | DeclaredParamType::Int8 => {
@@ -936,20 +937,24 @@ pub(crate) fn validate_declared_value(
             if magnitude > max {
                 return Err(out_of_range());
             }
-            Ok(())
+            Ok(None)
         }
         DeclaredParamType::Float4 | DeclaredParamType::Float8 => {
             let body = split_float(n, value)?;
             if ty == DeclaredParamType::Float4 {
                 // 字句解析器の数値文法を通った本文が f32 で有限にならなければ範囲外。
-                let finite = body.parse::<f32>().map(f32::is_finite).unwrap_or(false);
-                if !finite {
+                // 有限なら f32 へ丸めた値を正規テキストにして返す（置換へ渡し、バイナリ形式
+                // （f32 復号済み）と text 形式で同じ値になるようにする）。
+                let parsed = body.parse::<f32>().ok().filter(|f| f.is_finite());
+                let Some(f) = parsed else {
                     return Err(SqlSurfaceError::numeric_out_of_range(format!(
                         "value for parameter ${n} is out of range for type {name}"
                     )));
-                }
+                };
+                let sign = if value.starts_with('-') { "-" } else { "" };
+                return Ok(Some(format!("{sign}{f}")));
             }
-            Ok(())
+            Ok(None)
         }
         DeclaredParamType::Bool => {
             if parse_pg_bool(value).is_none() {
@@ -957,7 +962,7 @@ pub(crate) fn validate_declared_value(
                     "invalid input syntax for parameter ${n} (expected {name})"
                 )));
             }
-            Ok(())
+            Ok(None)
         }
         DeclaredParamType::Text
         | DeclaredParamType::Varchar
@@ -969,7 +974,7 @@ pub(crate) fn validate_declared_value(
         | DeclaredParamType::Bytea
         | DeclaredParamType::Uuid
         | DeclaredParamType::Json
-        | DeclaredParamType::Jsonb => Ok(()),
+        | DeclaredParamType::Jsonb => Ok(None),
     }
 }
 

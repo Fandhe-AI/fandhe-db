@@ -233,3 +233,49 @@ fn inferred_slot_type_is_not_overridden_by_declaration() {
     ));
     assert_eq!(prepared.declared_param_types(), &[Some(D::Varchar)]);
 }
+
+/// 未参照番号（空文字列で残る位置）に宣言型付きで実値を Bind しても、生の Bind 値で
+/// 検証されるため `22P02` にならない（PR #2470 指摘）。
+#[test]
+fn unreferenced_number_with_declared_numeric_types_binds_real_value() {
+    let (core, _g) = setup("decl-unref-bind");
+    let sql = "SELECT id FROM docs WHERE n = $2 ORDER BY id LIMIT 5";
+    let cases: [(D, &str); 6] = [
+        (D::Int2, "1"),
+        (D::Int4, "1"),
+        (D::Int8, "1"),
+        (D::Float4, "1.5"),
+        (D::Float8, "1.5"),
+        (D::Bool, "true"),
+    ];
+    for (ty, v) in cases {
+        assert_eq!(
+            bind_code(&core, sql, &[Some(ty), Some(D::Int4)], &[v, "2"]),
+            Ok(()),
+            "{ty:?}"
+        );
+    }
+    // 未参照でも実値は宣言型で検証される（不正値は 22P02）。
+    assert_eq!(
+        bind_code(&core, sql, &[Some(D::Int4), Some(D::Int4)], &["x", "2"]),
+        Err("22P02".to_string())
+    );
+}
+
+/// float4 宣言は f32 へ丸めた値を置換する。text の "16777217" はバイナリ形式（f32 復号）
+/// の 16777216 と同じ結果になる。
+#[test]
+fn float4_declared_value_is_rounded_like_binary_form() {
+    let (core, _g) = setup("decl-f4-round");
+    let sql = "UPDATE docs SET d = $1 + $2 WHERE id = 1 USING OPERATION_ID 'op-1'";
+    let prepared = core
+        .parse_sql_prepared_with_declared(sql, &[Some(D::Float4), Some(D::Float4)])
+        .expect("parse");
+    let bound = core
+        .bind_prepared(&prepared, &[some("16777217"), some("0")])
+        .expect("bind");
+    let rounded = core
+        .bind_prepared(&prepared, &[some("16777216"), some("0")])
+        .expect("bind rounded");
+    assert_eq!(bound, rounded);
+}

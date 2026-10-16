@@ -4294,13 +4294,23 @@ impl EngineCore {
                 ),
             ));
         }
-        let decoded = crate::sql::params::decode_bind_values(&prepared.tokens, values)?;
-        // Issue #2436・WIRE-24: 宣言型がある値は、置換の前に宣言型として検証する
-        // （`decode_bind_values` が NULL を拒否済みのため全値が非 NULL）。
+        let mut decoded = crate::sql::params::decode_bind_values(&prepared.tokens, values)?;
+        // Issue #2436・WIRE-24: 宣言型がある値は、置換の前に宣言型として検証する。
+        // `decoded` は未参照番号が空文字列のままなので、検証には生の Bind 値を使う
+        // （`decode_bind_values` が NULL・非 UTF-8 を拒否済み）。float4 は丸めた正規値で
+        // 置換値を差し替え、受信形式によらず同じ結果にする。
         for (i, decl) in prepared.declared.iter().enumerate() {
-            if let (Some(ty), Some(value)) = (decl, decoded.get(i)) {
-                let n = u16::try_from(i.saturating_add(1)).unwrap_or(u16::MAX);
-                crate::sql::params::validate_declared_value(n, *ty, value)?;
+            let (Some(ty), Some(Some(raw))) = (decl, values.get(i)) else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(raw) else {
+                continue;
+            };
+            let n = u16::try_from(i.saturating_add(1)).unwrap_or(u16::MAX);
+            if let Some(canonical) = crate::sql::params::validate_declared_value(n, *ty, text)? {
+                if let Some(slot) = decoded.get_mut(i) {
+                    *slot = canonical;
+                }
             }
         }
         let kinds: Vec<crate::sql::params::ParamLiteralKind> = prepared
