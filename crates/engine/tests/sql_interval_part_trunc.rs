@@ -332,6 +332,18 @@ fn null_inputs_are_strict_and_typed() {
         ),
         "NULL"
     );
+    // justify_*(NULL) は裸の NULL を受理し、結果型 INTERVAL の NULL を返す。
+    for f in ["justify_hours", "justify_days", "justify_interval"] {
+        assert_eq!(one(&core, &mut s, &format!("SELECT {f}(NULL)")), "NULL");
+        assert_eq!(
+            one(
+                &core,
+                &mut s,
+                &format!("SELECT {f}(NULL) + INTERVAL '1 day'")
+            ),
+            "NULL"
+        );
+    }
     // date_trunc(NULL, interval) の結果型は INTERVAL なので INTERVAL と加算できる。
     assert_eq!(
         one(

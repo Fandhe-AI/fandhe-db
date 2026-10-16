@@ -5069,6 +5069,29 @@ fn bind_call(
                 args.len()
             )));
         }
+        // `justify_*`（Issue #1582）は strict 関数: 裸の `NULL` 引数は型検査で
+        // 弾かず、結果型 `Interval` の `NULL` として伝播させる（`date_part` 等と同方針）。
+        if matches!(
+            builtin,
+            BuiltinFn::JustifyHours | BuiltinFn::JustifyDays | BuiltinFn::JustifyInterval
+        ) {
+            if let Some(a) = args.first() {
+                let (b, ty) = bind_null_aware(a, env, node_budget)?;
+                return match ty {
+                    None => Ok((BoundExpr::Null, ret)),
+                    Some(ExprType::Interval) => Ok((
+                        BoundExpr::Builtin {
+                            f: builtin,
+                            args: vec![b],
+                        },
+                        ret,
+                    )),
+                    Some(_) => Err(SqlSurfaceError::datatype_mismatch(format!(
+                        "function {name} argument type mismatch"
+                    ))),
+                };
+            }
+        }
         let mut bound_args = Vec::with_capacity(args.len());
         for (a, expected) in args.iter().zip(param_types.iter()) {
             let (b, ty) = bind_expr_in(a, env, node_budget)?;
