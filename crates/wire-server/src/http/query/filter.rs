@@ -711,7 +711,8 @@ fn declare_between(
         ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
-        // INTERVAL の述語は #1580・#1583 まで拒否する（fail-closed。Issue #1579）。
+        // INTERVAL の述語は engine 側が #1580 で解禁済みだが、NoSQL の型束縛は #1583 まで拒否する
+        // （fail-closed。Issue #1579）。
         ColumnType::Interval => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "INTERVAL column is not supported on the NoSQL surface yet",
         ))),
@@ -883,7 +884,8 @@ fn declare_eq(
         ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
-        // INTERVAL の述語は #1580・#1583 まで拒否する（fail-closed。Issue #1579）。
+        // INTERVAL の述語は engine 側が #1580 で解禁済みだが、NoSQL の型束縛は #1583 まで拒否する
+        // （fail-closed。Issue #1579）。
         ColumnType::Interval => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "INTERVAL column is not supported on the NoSQL surface yet",
         ))),
@@ -984,7 +986,8 @@ fn declare_range(
         ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
-        // INTERVAL の述語は #1580・#1583 まで拒否する（fail-closed。Issue #1579）。
+        // INTERVAL の述語は engine 側が #1580 で解禁済みだが、NoSQL の型束縛は #1583 まで拒否する
+        // （fail-closed。Issue #1579）。
         ColumnType::Interval => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "INTERVAL column is not supported on the NoSQL surface yet",
         ))),
@@ -1181,7 +1184,8 @@ fn declare_in(
         ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
-        // INTERVAL の述語は #1580・#1583 まで拒否する（fail-closed。Issue #1579）。
+        // INTERVAL の述語は engine 側が #1580 で解禁済みだが、NoSQL の型束縛は #1583 まで拒否する
+        // （fail-closed。Issue #1579）。
         ColumnType::Interval => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "INTERVAL column is not supported on the NoSQL surface yet",
         ))),

@@ -899,6 +899,7 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
                 | AggregateInput::DateColumn(index)
                 | AggregateInput::TimestampColumn(index)
                 | AggregateInput::TimeColumn(index)
+                | AggregateInput::IntervalColumn(index)
                 | AggregateInput::TimestampTzColumn(index)
                 | AggregateInput::ArrayColumn(index)
                 | AggregateInput::ByteaColumn(index)
@@ -1093,6 +1094,13 @@ fn extract_window_input(
             }
             None => WindowInputValue::TimestampTz(None),
         },
+        // INTERVAL 列のウィンドウ集計は束縛段（`bind_window_item`）が `0A000` で拒否済みのため
+        // ここへ到達するのは配線不備のみ（Issue #1580。fail-closed）。
+        AggregateInput::IntervalColumn(_) => {
+            return Err(window_bug(
+                "INTERVAL window aggregate input must be rejected at bind time",
+            ))
+        }
         AggregateInput::TimeColumn(index) => {
             match scanned.get(*index).copied().flatten() {
                 Some(v) => WindowInputValue::Time(Some(v.as_time().ok_or_else(|| {

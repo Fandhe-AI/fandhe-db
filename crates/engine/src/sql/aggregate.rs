@@ -280,6 +280,7 @@ impl ReferencedColumns {
                 | AggregateInput::DateColumn(index)
                 | AggregateInput::TimestampColumn(index)
                 | AggregateInput::TimeColumn(index)
+                | AggregateInput::IntervalColumn(index)
                 | AggregateInput::TimestampTzColumn(index)
                 | AggregateInput::ArrayColumn(index)
                 | AggregateInput::ByteaColumn(index)
@@ -697,6 +698,19 @@ pub(crate) enum Accumulator {
     /// `MIN`/`MAX(<TIME>)`（Issue #1570）。0 時起点のマイクロ秒（`i64`）の全順序比較。
     TimeMin(Option<i64>),
     TimeMax(Option<i64>),
+    /// `MIN`/`MAX(<INTERVAL>)`（Issue #1580）。正規化キー（`datetime::interval_cmp_key`）で比較し、
+    /// 結果は元の三要素。キーが同点のときは PG17 の `interval_smaller`／`interval_larger` と同じく
+    /// 後から観測した値を採る（`1 mon` と `30 days` が同点なら走査順で後の方を返す）。
+    IntervalMin(Option<crate::datetime::Interval>),
+    IntervalMax(Option<crate::datetime::Interval>),
+    /// `SUM(<INTERVAL>)`（Issue #1580）。三要素ごとの checked 加算（正規化しない。PG17 `interval_pl`）。
+    /// あふれは `22008`。
+    IntervalSum(Option<crate::datetime::Interval>),
+    /// `AVG(<INTERVAL>)`（Issue #1580）。三要素の和を取り、確定時に PG17 `interval_div` で割る。
+    IntervalAvg {
+        sum: Option<crate::datetime::Interval>,
+        count: u64,
+    },
     /// `MIN`/`MAX(<TIMESTAMPTZ>)`（Issue #1576）。UTC マイクロ秒（`i64`）の全順序比較。
     TimestampTzMin(Option<i64>),
     TimestampTzMax(Option<i64>),
@@ -869,6 +883,13 @@ impl Accumulator {
             (Max, AggregateInput::TimestampColumn(_)) => Accumulator::TimestampMax(None),
             (Min, AggregateInput::TimeColumn(_)) => Accumulator::TimeMin(None),
             (Max, AggregateInput::TimeColumn(_)) => Accumulator::TimeMax(None),
+            (Min, AggregateInput::IntervalColumn(_)) => Accumulator::IntervalMin(None),
+            (Max, AggregateInput::IntervalColumn(_)) => Accumulator::IntervalMax(None),
+            (Sum, AggregateInput::IntervalColumn(_)) => Accumulator::IntervalSum(None),
+            (Avg, AggregateInput::IntervalColumn(_)) => Accumulator::IntervalAvg {
+                sum: None,
+                count: 0,
+            },
             (Min, AggregateInput::TimestampTzColumn(_)) => Accumulator::TimestampTzMin(None),
             (Max, AggregateInput::TimestampTzColumn(_)) => Accumulator::TimestampTzMax(None),
             _ => return Err(accumulator_bug("unsupported (func, input) combination")),
@@ -975,6 +996,16 @@ impl Accumulator {
                     None => None,
                 };
                 self.observe_time(value)
+            }
+            // `INTERVAL` 列は `COUNT`・`MIN`/`MAX`・`SUM`/`AVG`（Issue #1580）。
+            AggregateInput::IntervalColumn(index) => {
+                let value = match scanned.get(*index).copied().flatten() {
+                    Some(v) => Some(v.as_interval().ok_or_else(|| {
+                        accumulator_bug("IntervalColumn observed a ScalarRef that is not Interval")
+                    })?),
+                    None => None,
+                };
+                self.observe_interval(value)
             }
             // `TIMESTAMPTZ` 列は `COUNT`・`MIN`/`MAX` のみ（`SUM`/`AVG` は構文段で 42883。
             // Issue #1576）。比較は UTC の時点で行う。
@@ -1287,6 +1318,19 @@ impl Accumulator {
                     None => None,
                 }
             }
+            // 正規化キー（16 バイト）で重複を除く。`1 mon` と `30 days` は同じキー（Issue #1580）。
+            AggregateInput::IntervalColumn(index) => match scanned.get(*index).copied().flatten() {
+                Some(v) => Some(
+                    crate::datetime::interval_cmp_key(&v.as_interval().ok_or_else(|| {
+                        accumulator_bug(
+                            "IntervalColumn observed a ScalarRef that is not Interval (distinct)",
+                        )
+                    })?)
+                    .to_be_bytes()
+                    .to_vec(),
+                ),
+                None => None,
+            },
             AggregateInput::TimeColumn(index) => match scanned.get(*index).copied().flatten() {
                 Some(v) => Some(
                     v.as_time()
@@ -1810,6 +1854,65 @@ impl Accumulator {
         }
     }
 
+    /// `INTERVAL` 版の [`Self::observe_date`]（Issue #1580）。`MIN`/`MAX` は正規化キーで比較し、
+    /// 同点は後勝ち（PG17 の遷移関数と同じ）。`SUM`/`AVG` の加算あふれは `22008`。
+    fn observe_interval(
+        &mut self,
+        value: Option<crate::datetime::Interval>,
+    ) -> Result<(), SqlSurfaceError> {
+        use crate::datetime::{checked_add_interval, cmp_interval};
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let overflow = |what: &str| {
+            SqlSurfaceError::datetime_field_overflow(format!("{what} interval out of range"))
+        };
+        match self {
+            Accumulator::Count(n) => {
+                *n = n.checked_add(1).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range("COUNT exceeds u64 range")
+                })?;
+                Ok(())
+            }
+            Accumulator::IntervalMin(m) => {
+                *m = Some(match m {
+                    Some(cur) if cmp_interval(cur, &value).is_lt() => *cur,
+                    _ => value,
+                });
+                Ok(())
+            }
+            Accumulator::IntervalMax(m) => {
+                *m = Some(match m {
+                    Some(cur) if cmp_interval(cur, &value).is_gt() => *cur,
+                    _ => value,
+                });
+                Ok(())
+            }
+            Accumulator::IntervalSum(sum) => {
+                *sum = Some(match sum {
+                    None => value,
+                    Some(cur) => checked_add_interval(cur, &value).map_err(|_| overflow("SUM"))?,
+                });
+                Ok(())
+            }
+            Accumulator::IntervalAvg { sum, count } => {
+                *sum = Some(match sum {
+                    None => value,
+                    Some(cur) => checked_add_interval(cur, &value).map_err(|_| overflow("AVG"))?,
+                });
+                *count = count.checked_add(1).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range(
+                        "AVG(INTERVAL) row count exceeds u64 range",
+                    )
+                })?;
+                Ok(())
+            }
+            _ => Err(accumulator_bug(
+                "observe_interval on an incompatible accumulator",
+            )),
+        }
+    }
+
     /// `TIME` 版の [`Self::observe_date`]（同じ契約。Issue #1570）。
     fn observe_time(&mut self, value: Option<i64>) -> Result<(), SqlSurfaceError> {
         let Some(value) = value else {
@@ -2037,6 +2140,19 @@ impl Accumulator {
             Accumulator::TimestampMax(m) => m.map(Cell::Timestamp).unwrap_or(Cell::Null),
             Accumulator::TimeMin(m) => m.map(Cell::Time).unwrap_or(Cell::Null),
             Accumulator::TimeMax(m) => m.map(Cell::Time).unwrap_or(Cell::Null),
+            Accumulator::IntervalMin(m)
+            | Accumulator::IntervalMax(m)
+            | Accumulator::IntervalSum(m) => m.map(Cell::Interval).unwrap_or(Cell::Null),
+            Accumulator::IntervalAvg { sum, count } => match sum {
+                None => Cell::Null,
+                Some(s) => {
+                    let out =
+                        crate::datetime::interval_div_f64(&s, count as f64).map_err(|_| {
+                            SqlSurfaceError::datetime_field_overflow("AVG interval out of range")
+                        })?;
+                    Cell::Interval(out)
+                }
+            },
             Accumulator::TimestampTzMin(m) => m.map(Cell::TimestampTz).unwrap_or(Cell::Null),
             Accumulator::TimestampTzMax(m) => m.map(Cell::TimestampTz).unwrap_or(Cell::Null),
             // SQL-25 (c)・TASK-209: 空集合・全 NULL はいずれも `0`
@@ -2666,6 +2782,7 @@ pub(crate) fn aggregate_result_type(
         (Min | Max, AggregateInput::DateColumn(_)) => ColumnType::Date,
         (Min | Max, AggregateInput::TimestampColumn(_)) => ColumnType::Timestamp,
         (Min | Max, AggregateInput::TimeColumn(_)) => ColumnType::Time,
+        (Min | Max | Sum | Avg, AggregateInput::IntervalColumn(_)) => ColumnType::Interval,
         (Min | Max, AggregateInput::TimestampTzColumn(_)) => ColumnType::TimestampTz,
         (Min | Max, AggregateInput::TextColumn(_) | AggregateInput::CollatedTextColumn { .. }) => {
             ColumnType::Text

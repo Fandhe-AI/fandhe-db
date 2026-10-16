@@ -602,6 +602,15 @@ impl<'a> ScalarRef<'a> {
         }
     }
 
+    /// `INTERVAL` 列の値（生の三要素。比較は呼び出し側が `datetime::interval_cmp_key` を通す。
+    /// Issue #1580）。`Interval` 以外は `None`（fail-closed）。
+    pub fn as_interval(&self) -> Option<crate::datetime::Interval> {
+        match self {
+            ScalarRef::Interval(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     /// `TIME` 列の内部表現（0 時起点のマイクロ秒。`0..=86_400_000_000`）。
     /// `Time` 以外は `None`（同上、fail-closed。Issue #1570）。
     pub fn as_time(&self) -> Option<i64> {
