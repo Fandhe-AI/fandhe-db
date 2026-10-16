@@ -464,11 +464,11 @@ fn partitioned_resend_with_another_zone_does_not_rewrite() {
     ok(&core, &mut s, sql);
     // 同じ operation_id・同じ TZ の再送は重複（23505）。
     assert_eq!(code(&core, &mut s, sql), "23505");
-    // 内容照合ハッシュは SET 値のリテラル文字列を入力にするため、別の TZ での再送も同じ重複
-    // （23505）で拒否される。書き込まず、最初の解釈（Asia/Tokyo）の格納値が変わらない（fail-closed）。
+    // 内容照合ハッシュは非 UTC の TimeZone を含むため、別の TZ での再送は内容不一致（22023）で
+    // 拒否される。書き込まず、最初の解釈（Asia/Tokyo）の格納値が変わらない（fail-closed）。
     let first = stored(&core, 1);
     ok(&core, &mut s, "SET TIME ZONE 'UTC'");
-    assert_eq!(code(&core, &mut s, sql), "23505");
+    assert_eq!(code(&core, &mut s, sql), "22023");
     assert_eq!(stored(&core, 1), first);
     assert_eq!(utc_text(first.unwrap()), "2026-01-01 00:00:00+00");
 }

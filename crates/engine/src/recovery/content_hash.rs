@@ -1333,20 +1333,21 @@ fn update_where_with_tag(
     // 分割実行だけは再開（別接続からの同一 operation_id の再送）で残りの行を別の解釈で書き
     // 足しうるため、TZ 無しの TIMESTAMPTZ リテラル（SET 値・述語）の解釈に使うセッション
     // TimeZone をハッシュへ含め、異なる TimeZone での再開を内容不一致（22023）にする
-    // （Issue #1575 レビュー指摘）。TIMESTAMPTZ 列を持たないテーブルは入力が変わらない。
+    // （Issue #1575 レビュー指摘）。TIMESTAMPTZ 列を持たないテーブル、および UTC（従来の
+    // 唯一の解釈）では入力を変えず、TimeZone 導入前に永続化された中断ジョブの再送
+    // （同一 SQL・同一 operation_id・UTC）が内容不一致にならないよう互換を保つ。
     if matches!(tag, OpTag::UpdateWherePartitioned)
         && schema
             .columns
             .iter()
             .any(|c| matches!(c.ty, crate::catalog::ColumnType::TimestampTz))
     {
-        b.push_u8(0xA1);
-        b.push_bytes(
-            crate::datetime::current_session_time_zone()
-                .display()
-                .as_bytes(),
-        )
-        .map_err(|_| dml_hash_field_too_large())?;
+        let tz = crate::datetime::current_session_time_zone();
+        if tz.display() != "UTC" {
+            b.push_u8(0xA1);
+            b.push_bytes(tz.display().as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+        }
     }
     Ok(b.finish())
 }
@@ -4516,6 +4517,12 @@ mod tests {
         );
         assert_ne!(hash_in("Asia/Tokyo", &with_tz), hash_in("UTC", &with_tz));
         assert_eq!(hash_in("UTC", &with_tz), hash_in("UTC", &with_tz));
+        // UTC は TimeZone 導入前と同一入力（旧記録の再送互換）。TZ 列の有無で変わらない。
+        let plain = TableSchema::new(
+            "t".to_string(),
+            vec![ColumnDef::new("ts", ColumnType::Text, true)],
+        );
+        assert_eq!(hash_in("UTC", &with_tz), hash_in("UTC", &plain));
         let without = TableSchema::new(
             "t".to_string(),
             vec![ColumnDef::new("ts", ColumnType::Text, true)],

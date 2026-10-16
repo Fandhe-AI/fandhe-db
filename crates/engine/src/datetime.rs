@@ -796,13 +796,15 @@ fn parse_decimal_hours(input: &str) -> Result<Option<i64>, TimeZoneSettingError>
     Ok(Some(if neg { -secs } else { secs }))
 }
 
-/// 裸の `[+-]?H[H]:MM` を秒（記述どおりの符号）へ変換する。分は 0〜59。
+/// 裸の `[+-]H[H]:MM`（符号必須）を秒（記述どおりの符号）へ変換する。分は 0〜59。
 /// `:SS` 付き（PG は別エラー）や範囲外は fail-closed で `None`。
 fn parse_bare_offset(input: &str) -> Option<i32> {
     let (neg, body) = match input.as_bytes().first()? {
         b'-' => (true, input.get(1..)?),
         b'+' => (false, input.get(1..)?),
-        _ => (false, input),
+        // 符号なしの `H:MM` は PG でも東西が曖昧なため受理しない（POSIX 反転で
+        // 意図と逆向きのオフセットになるのを防ぐ。fail-closed）。
+        _ => return None,
     };
     let (h, m) = body.split_once(':')?;
     if h.is_empty() || h.len() > 2 || m.len() != 2 {
@@ -1562,6 +1564,9 @@ mod tests {
     #[test]
     fn setting_bare_offsets_follow_posix_sign() {
         assert_eq!(setting("+09:00"), ("+09:00".into(), -9 * 3600));
+        // 符号なしの H:MM は拒否する（POSIX 反転で逆向きになるのを防ぐ）。
+        assert!(SessionTimeZone::parse_setting("9:00").is_err());
+        assert!(SessionTimeZone::parse_setting("09:00").is_err());
         assert_eq!(setting("-5:30"), ("-5:30".into(), 5 * 3600 + 1800));
     }
 
