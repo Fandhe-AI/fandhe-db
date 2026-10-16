@@ -33,7 +33,8 @@ use crate::jsonpath_limits::JsonPathLimits;
 use crate::row_codec::ScalarRef;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::udf_call::{
-    bind_json_jsonb_arg, json_build_error, BindEnv, BoundExpr, Expr, ExprType, ExprValue,
+    bind_json_jsonb_arg, bind_json_jsonb_operand, json_build_error, BindEnv, BoundExpr, Expr,
+    ExprType, ExprValue, JsonAccessOp,
 };
 
 /// `jsonb_path_*` 関数の種別。
@@ -213,6 +214,51 @@ fn bind_expr_for_error(
     node_budget: &mut usize,
 ) -> Result<(), SqlSurfaceError> {
     crate::sql::udf_call::bind_expr_any(expr, env, node_budget).map(|_| ())
+}
+
+/// 演算子形 `@?`・`@@` の束縛（Issue #2186・TABLE-25）。`udf_call::bind_json_access` から呼ばれ、
+/// `jsonb_path_exists(l, r, '{}', true)`／`jsonb_path_match(l, r, '{}', true)` と同じ
+/// [`BoundJsonPathFn`]（vars なし・silent 定数 true）を組み立てる。評価は関数形と同じ
+/// [`eval_jsonpath_fn`] なので結果は構造上一致する。左辺は jsonb（型なし文字列リテラルは
+/// jsonb として解析）、右辺は型なし文字列リテラルのみ（束縛時に解析）。
+pub(super) fn bind_jsonpath_operator(
+    op: JsonAccessOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let kind = match op {
+        JsonAccessOp::PathExists => JsonPathFnKind::Exists,
+        JsonAccessOp::PathMatch => JsonPathFnKind::Match,
+        _ => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "non-jsonpath operator reached the jsonpath operator binder".to_string(),
+            })
+        }
+    };
+    let sql = op.as_sql();
+    let missing = || {
+        SqlSurfaceError::undefined_function(format!(
+            "operator does not exist: the operand types do not match the {sql} operator"
+        ))
+    };
+    let target = bind_json_jsonb_operand(lhs, env, node_budget, missing)?;
+    let path = match rhs {
+        Expr::Null | Expr::String(_) => bind_path_arg(sql, rhs, node_budget)?,
+        _ => return Err(missing()),
+    };
+    Ok((
+        BoundExpr::JsonPathFn(Box::new(BoundJsonPathFn {
+            kind,
+            target,
+            path,
+            vars: None,
+            silent: SilentArg::Const(true),
+            limits: current_jsonpath_limits(),
+        })),
+        ExprType::Bool,
+    ))
 }
 
 /// `jsonb_path_*` 1 呼び出しの束縛（`name` は小文字化済み）。
