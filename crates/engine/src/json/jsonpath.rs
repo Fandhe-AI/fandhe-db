@@ -8,11 +8,10 @@
 //! 呼ばれる前提の入口だけを公開する。`super` の `JsonPath`／`JsonPathStep`（`#>` 用の
 //! Rust 内部 API）とは無関係。
 //!
-//! 受理文法は PostgreSQL 17 の `jsonpath` に合わせる。意図的な差分は 3 点。
+//! 受理文法は PostgreSQL 17 の `jsonpath` に合わせる。意図的な差分は 2 点。
 //! (1) 長さ・入れ子深さ・数値リテラル長・式の高さに上限を設ける（PostgreSQL には無い。
 //! fail-closed の DoS 対策。超過は `54000`）。(2) `like_regex` は構文を解析した上で
-//! 0A000 で拒否する（正規表現の依存が未承認のため）。(3) `\u0000` は PostgreSQL では
-//! `22P05` だが、対応する `ErrorClass` が無いため暫定で `22P02` とする。
+//! 0A000 で拒否する（正規表現の依存が未承認のため）。
 //! エラーは固定の英語文のみを返し、入力の断片を含めない。
 
 pub mod ast;
@@ -54,7 +53,7 @@ pub enum JsonPathParseError {
     Empty,
     /// 対になっていないサロゲート・範囲外のコードポイント（22P02）。
     InvalidUnicode,
-    /// NUL 文字（`\u0000`・`\x00`）。PostgreSQL は 22P05。暫定で 22P02（下記）。
+    /// NUL 文字（`\u0000`・`\x00`。22P05）。
     UnsupportedUnicodeEscape,
     /// `**{n}` の n が int4 の範囲外（22003）。
     IntegerOutOfRange,
@@ -72,11 +71,10 @@ impl ClassifiedError for JsonPathParseError {
     fn error_class(&self) -> ErrorClass {
         match self {
             JsonPathParseError::Syntax => ErrorClass::UnsupportedSqlSyntax,
-            JsonPathParseError::Empty
-            | JsonPathParseError::InvalidUnicode
-            // 22P05 用の分類を足すと error_format の件数・wire-server の HTTP 写像まで
-            // 波及する。jsonpath を SQL 表層へ配線する Issue（#2185／#2186）で追加する。
-            | JsonPathParseError::UnsupportedUnicodeEscape => ErrorClass::InvalidTextRepresentation,
+            JsonPathParseError::Empty | JsonPathParseError::InvalidUnicode => {
+                ErrorClass::InvalidTextRepresentation
+            }
+            JsonPathParseError::UnsupportedUnicodeEscape => ErrorClass::UntranslatableCharacter,
             JsonPathParseError::IntegerOutOfRange => ErrorClass::NumericOutOfRange,
             JsonPathParseError::RegexNotSupported => ErrorClass::FeatureNotSupported,
             JsonPathParseError::TooLong

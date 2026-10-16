@@ -406,6 +406,74 @@ fn wire_jsonb_functions_advertise_type_oids_and_report_sqlstates() {
     common::expect_error_response_with_sqlstate(&mut alice, "22004");
     common::read_ready_for_query(&mut alice);
 }
+
+/// Issue #2185（TABLE-25）: `jsonb_path_query_array`／`_first` の結果列は jsonb（OID 3802）、
+/// `jsonb_path_exists`／`_match` は boolean（OID 16）として RowDescription に載り、jsonpath の
+/// 評価エラー（`2203A`）・束縛時エラー（`22P05`・`42601`）は ErrorResponse の SQLSTATE で届く。
+#[test]
+fn wire_jsonb_path_functions_advertise_oids_and_report_sqlstates() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = common::spawn_server_with_engine(&users_path, core);
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    common::send_simple_query(
+        &mut alice,
+        r#"INSERT INTO docs (id, embedding, docb) VALUES (1, '[0.1,0.2,0.3]', '{"a":[1,2,3]}') USING OPERATION_ID 'op-jp-1'"#,
+    );
+    assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT jsonb_path_query_array(docb, '$.a[*]') AS qa, \
+         jsonb_path_query_first(docb, '$.a[*]') AS qf, \
+         jsonb_path_exists(docb, '$.a') AS ex, \
+         jsonb_path_match(docb, '$.a[0] == 1') AS m \
+         FROM docs WHERE id = 1 LIMIT 1",
+    );
+    let columns = common::read_row_description_with_oids(&mut alice);
+    assert_eq!(
+        columns,
+        vec![
+            ("qa".to_string(), 3802),
+            ("qf".to_string(), 3802),
+            ("ex".to_string(), 16),
+            ("m".to_string(), 16),
+        ]
+    );
+    assert_eq!(
+        common::read_data_row(&mut alice),
+        vec![
+            Some("[1,2,3]".to_string()),
+            Some("1".to_string()),
+            Some("t".to_string()),
+            Some("t".to_string()),
+        ]
+    );
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+
+    for (sql, sqlstate) in [
+        (
+            "SELECT jsonb_path_query_array(docb, 'strict $.zzz') FROM docs WHERE id = 1 LIMIT 1",
+            "2203A",
+        ),
+        (
+            r#"SELECT jsonb_path_exists(docb, '"\u0000"') FROM docs WHERE id = 1 LIMIT 1"#,
+            "22P05",
+        ),
+        (
+            "SELECT jsonb_path_exists(docb, '$.') FROM docs WHERE id = 1 LIMIT 1",
+            "42601",
+        ),
+    ] {
+        common::send_simple_query(&mut alice, sql);
+        common::expect_error_response_with_sqlstate(&mut alice, sqlstate);
+        common::read_ready_for_query(&mut alice);
+    }
+}
+
 /// Issue #1598: 拡張クエリプロトコルでも `?`／`?|`／`?&`／`<@`／`@>` を含む SQL が Parse できる
 /// （`?` を `$n` と取り違えない）。結果は simple query と同じ `t`。
 #[test]

@@ -536,6 +536,9 @@ pub enum BoundExpr {
     /// `json_*` 関数・`to_json`・`json_build_*` の束縛結果（Issue #2180。束縛・評価は
     /// `sql::json_fn`）。
     JsonTextFn(Box<crate::sql::json_fn::BoundJsonFn>),
+    /// `jsonb_path_*` の束縛結果（Issue #2185・TABLE-25。束縛・評価は `sql::jsonpath_fn`）。
+    /// 解析済みの jsonpath を保持するため `JsonFn { f, args }` とは別 variant にしている。
+    JsonPathFn(Box<crate::sql::jsonpath_fn::BoundJsonPathFn>),
     /// jsonb として解釈済みの文字列リテラル（Issue #1597・TABLE-25）。jsonb 式と比較される
     /// 型なし文字列リテラル（PostgreSQL の unknown 型）を [`bind_jsonb_literal`] が
     /// 解析・正規化した結果で、正規化済み JSON テキストを保持する。
@@ -705,6 +708,7 @@ impl PartialEq for BoundExpr {
                 a == b
             }
             (BoundExpr::JsonTextFn(a), BoundExpr::JsonTextFn(b)) => a == b,
+            (BoundExpr::JsonPathFn(a), BoundExpr::JsonPathFn(b)) => a == b,
             (
                 BoundExpr::JsonAccess {
                     lhs: la,
@@ -998,6 +1002,7 @@ pub(crate) fn is_builtin_function_name(name: &str) -> bool {
         || crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase())
         || json_fn_from_name(name).is_some()
         || is_deferred_json_srf_name(name)
+        || crate::sql::jsonpath_fn::is_jsonpath_fn_name(&name.to_ascii_lowercase())
 }
 
 /// jsonb 関数（[`JsonFnKind`]）の名前解決（Issue #1599）。大小は無視する。
@@ -1021,6 +1026,7 @@ pub(crate) fn is_deferred_json_srf_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "jsonb_object_keys"
+            | "jsonb_path_query"
             | "jsonb_array_elements"
             | "jsonb_array_elements_text"
             | "jsonb_each"
@@ -1592,7 +1598,10 @@ fn validate_closed_expr(
                         args.len()
                     )));
                 }
-            } else if json_fn_from_name(name).is_some() || is_deferred_json_srf_name(name) {
+            } else if json_fn_from_name(name).is_some()
+                || is_deferred_json_srf_name(name)
+                || crate::sql::jsonpath_fn::is_jsonpath_fn_name(&name.to_ascii_lowercase())
+            {
                 // jsonb 関数（Issue #1599）は jsonb 値を取るため、列参照を持てない関数本体では
                 // 常に未対応（jsonb パス演算子と同じ扱い）。
                 return Err(SqlSurfaceError::FeatureNotSupported {
@@ -1690,6 +1699,18 @@ pub(super) struct BindEnv<'a> {
     clock: Option<StatementClock>,
 }
 
+impl BindEnv<'_> {
+    /// `name` が現在の束縛環境で解決できる識別子（スキーマの列名または UDF 仮引数名。
+    /// 大小無視）か。`jsonb_path_*` の `silent` 位置で、真偽リテラル（字句段で識別子に戻る）と
+    /// boolean 列の参照を区別するために使う（Issue #2185）。
+    pub(super) fn has_identifier(&self, name: &str) -> bool {
+        self.params.contains_key(name.to_ascii_lowercase().as_str())
+            || self
+                .schema
+                .is_some_and(|sc| sc.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)))
+    }
+}
+
 /// 展開済み [`BoundExpr`] のノード数を数える。UDF 連鎖のパラメータ参照展開時に
 /// クローンする部分木のサイズを `node_budget` へ課金するために使う
 /// （`bind_expr_in` の `Expr::Ident` 分岐を参照）。木の深さは束縛段で既に
@@ -1743,6 +1764,10 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
                 }
         }
         BoundExpr::JsonTextFn(f) => 1 + f.args.iter().map(count_bound_nodes).sum::<usize>(),
+        BoundExpr::JsonPathFn(f) => {
+            // path は解析済み AST（1 ノード扱い）。target と vars の部分木を数える。
+            2 + count_bound_nodes(&f.target) + f.vars.as_ref().map_or(0, count_bound_nodes)
+        }
         BoundExpr::JsonModify { lhs, rhs, .. } => {
             1 + count_bound_nodes(lhs)
                 + match rhs {
@@ -1812,6 +1837,9 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
             max_bound_case_nesting(lhs).max(rhs.expr().map_or(0, max_bound_case_nesting))
         }
         BoundExpr::JsonTextFn(f) => f.args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
+        BoundExpr::JsonPathFn(f) => {
+            max_bound_case_nesting(&f.target).max(f.vars.as_ref().map_or(0, max_bound_case_nesting))
+        }
         BoundExpr::JsonModify { lhs, rhs, .. } => {
             max_bound_case_nesting(lhs).max(rhs.expr().map_or(0, max_bound_case_nesting))
         }
@@ -1879,6 +1907,9 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
             references_embedding(lhs) || rhs.expr().is_some_and(references_embedding)
         }
         BoundExpr::JsonTextFn(f) => f.args.iter().any(references_embedding),
+        BoundExpr::JsonPathFn(f) => {
+            references_embedding(&f.target) || f.vars.as_ref().is_some_and(references_embedding)
+        }
         BoundExpr::JsonModify { lhs, rhs, .. } => {
             references_embedding(lhs) || rhs.expr().is_some_and(references_embedding)
         }
@@ -1944,6 +1975,12 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         BoundExpr::JsonTextFn(f) => {
             for a in &f.args {
                 visit_referenced_scalar_columns(a, visit);
+            }
+        }
+        BoundExpr::JsonPathFn(f) => {
+            visit_referenced_scalar_columns(&f.target, visit);
+            if let Some(v) = &f.vars {
+                visit_referenced_scalar_columns(v, visit);
             }
         }
         BoundExpr::Builtin { args, .. }
@@ -2060,6 +2097,15 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
                 }
             }
             any
+        }
+        BoundExpr::JsonPathFn(f) => {
+            // 短絡させず target・vars の両方を必ずマークする。
+            let a = mark_referenced_scalar_columns(&f.target, mask);
+            let b = f
+                .vars
+                .as_ref()
+                .is_some_and(|v| mark_referenced_scalar_columns(v, mask));
+            a || b
         }
         BoundExpr::Builtin { args, .. }
         | BoundExpr::WasmCall { args, .. }
@@ -4019,7 +4065,7 @@ fn charge_one_node(node_budget: &mut usize) -> Result<(), SqlSurfaceError> {
 }
 
 /// jsonb 位置の引数を束縛する（[`bind_json_fn`] 参照）。
-fn bind_json_jsonb_arg(
+pub(super) fn bind_json_jsonb_arg(
     name: &str,
     expr: &Expr,
     env: &mut BindEnv<'_>,
@@ -4217,6 +4263,9 @@ fn bind_call(
     let lower_name = name.to_ascii_lowercase();
     if crate::sql::json_fn::is_json_fn_name(&lower_name) {
         return crate::sql::json_fn::bind_json_fn(&lower_name, args, env, node_budget);
+    }
+    if crate::sql::jsonpath_fn::is_jsonpath_fn_name(&lower_name) {
+        return crate::sql::jsonpath_fn::bind_jsonpath_fn(&lower_name, args, env, node_budget);
     }
     if lower_name == "concat" {
         return bind_concat(args, env, node_budget);
@@ -5011,7 +5060,7 @@ fn eval_json_modify<'a>(
 
 /// jsonb 構築・変換で起きた [`crate::json::JsonColumnError`] を SQL 表層のエラーへ写す
 /// （上限超過は `54000`、入力 jsonb のパース失敗は格納契約違反として固定文言の `Internal`）。
-fn json_build_error(e: crate::json::JsonColumnError) -> SqlSurfaceError {
+pub(super) fn json_build_error(e: crate::json::JsonColumnError) -> SqlSurfaceError {
     match e {
         crate::json::JsonColumnError::TooLong => {
             SqlSurfaceError::payload_too_large("jsonb result exceeds the allowed size")
@@ -5356,6 +5405,9 @@ pub(crate) fn eval_with_scalars<'a>(
         },
         BoundExpr::JsonTextFn(f) => {
             crate::sql::json_fn::eval_json_fn(f, id, embedding, row_scalars)
+        }
+        BoundExpr::JsonPathFn(f) => {
+            crate::sql::jsonpath_fn::eval_jsonpath_fn(f, id, embedding, row_scalars)
         }
         BoundExpr::JsonbLiteral(text) => Ok(ExprValue::Json(Cow::Owned(text.clone()))),
         BoundExpr::JsonAccess { lhs, rhs, as_text } => {
