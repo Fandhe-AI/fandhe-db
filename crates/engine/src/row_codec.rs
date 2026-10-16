@@ -584,6 +584,15 @@ impl<'a> ScalarRef<'a> {
         }
     }
 
+    /// `TIMESTAMPTZ` 列の内部表現（UTC の 1970-01-01 起点マイクロ秒）。
+    /// `TimestampTz` 以外は `None`（同上、fail-closed。Issue #1576）。
+    pub fn as_timestamptz(&self) -> Option<i64> {
+        match self {
+            ScalarRef::TimestampTz(t) => Some(*t),
+            _ => None,
+        }
+    }
+
     /// `TIME` 列の内部表現（0 時起点のマイクロ秒。`0..=86_400_000_000`）。
     /// `Time` 以外は `None`（同上、fail-closed。Issue #1570）。
     pub fn as_time(&self) -> Option<i64> {

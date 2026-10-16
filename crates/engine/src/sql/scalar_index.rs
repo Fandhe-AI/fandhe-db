@@ -540,6 +540,15 @@ fn push_typed_value(accum: &mut OrderedColumnIndex, value: &ScalarRef<'_>, slot:
             acc.push((*v, slot));
             true
         }
+        // `TIMESTAMPTZ`（Issue #1576）。UTC マイクロ秒を `TIMESTAMP` と同じ規則（`2^53` 超は列単位で
+        // 縮退）で順序索引へ載せる。比較は時点で行うため表示 TZ に依らない。
+        (OrderedColumnIndex::I64(acc), ScalarRef::TimestampTz(v)) => {
+            if !i64_within_exact_f64_range(*v) {
+                return false;
+            }
+            acc.push((*v, slot));
+            true
+        }
         // `TIME` は 0 時起点のマイクロ秒（`0..=86_400_000_000`）で `2^53` より遥かに
         // 小さいが、範囲外の値は防御的に「索引対象外」へ縮退する（Issue #1570）。
         (OrderedColumnIndex::I64(acc), ScalarRef::Time(v)) => {
@@ -1352,7 +1361,10 @@ impl ScalarIndex {
                 // `TIMESTAMP` は行走査中に `2^53` を超える値が 1 件でも見つかった
                 // 時点で列単位に `None` へ縮退する（モジュールドキュメント
                 // 「`MAX_EXACT_TYPED_I64_ABS`」参照）。
-                ColumnType::Date | ColumnType::Timestamp | ColumnType::Time => {
+                ColumnType::Date
+                | ColumnType::Timestamp
+                | ColumnType::TimestampTz
+                | ColumnType::Time => {
                     per_column.push(None);
                     let entry_size = std::mem::size_of::<(i64, u32)>();
                     let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
@@ -1446,9 +1458,7 @@ impl ScalarIndex {
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
                 | ColumnType::Json
-                | ColumnType::Jsonb
-                // TIMESTAMPTZ の二次索引は #1576 まで非対象（Issue #1574。fail-closed）。
-                | ColumnType::TimestampTz => {
+                | ColumnType::Jsonb => {
                     per_column.push(None);
                     per_column_typed.push(None);
                 }
@@ -2148,6 +2158,10 @@ impl ScalarIndex {
                 range_slots(pairs, lower, upper)
             }
             (OrderedColumnIndex::I64(pairs), TypedLiteral::Timestamp(t)) => {
+                let (lower, upper) = exact_i64_bounds(op, *t);
+                range_slots(pairs, lower, upper)
+            }
+            (OrderedColumnIndex::I64(pairs), TypedLiteral::TimestampTz(t)) => {
                 let (lower, upper) = exact_i64_bounds(op, *t);
                 range_slots(pairs, lower, upper)
             }

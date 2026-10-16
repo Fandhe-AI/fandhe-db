@@ -271,6 +271,25 @@ fn render_expr(expr: &Expr) -> String {
         }
         // `TIME` 型付きリテラル（Issue #1570）。`24:00:00` も `format_time` が往復できる形で返す。
         Expr::TimeLiteral(micros) => format!("TIME '{}'", crate::datetime::format_time(*micros)),
+        // `TIMESTAMPTZ` 型付きリテラル（Issue #1576）。ゾーン無しの入力は定義時のセッション TZ で
+        // UTC へ確定し、再パースで定義時と別の解釈にならないよう UTC の明示 offset（`+00`）で描く。
+        Expr::TimestampTzLiteral {
+            micros,
+            session_local,
+        } => {
+            let utc = if *session_local {
+                crate::datetime::with_current_session_time_zone(|tz| {
+                    tz.timestamp_to_timestamptz(*micros)
+                })
+                .unwrap_or(*micros)
+            } else {
+                *micros
+            };
+            format!(
+                "TIMESTAMPTZ '{}'",
+                crate::datetime::format_timestamptz(utc, &crate::datetime::SessionTimeZone::utc())
+            )
+        }
     }
 }
 
@@ -474,7 +493,10 @@ fn referenced_column_names(
                 collect_idents(lhs, acc);
                 collect_idents(rhs, acc);
             }
-            Expr::DateLiteral(_) | Expr::TimestampLiteral(_) | Expr::TimeLiteral(_) => {}
+            Expr::DateLiteral(_)
+            | Expr::TimestampLiteral(_)
+            | Expr::TimeLiteral(_)
+            | Expr::TimestampTzLiteral { .. } => {}
         }
     }
     let mut idents: Vec<&str> = Vec::new();

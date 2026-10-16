@@ -451,26 +451,17 @@ fn other_tenants_cannot_see_timestamptz_rows() {
 }
 
 /// 未解禁の機能は TIMESTAMP 等の既存の腕へ黙って流さず fail-closed に拒否する
-/// （述語・集計・索引・式は #1576、PK/UNIQUE・型変更は担当 Issue 未定）。
+/// （述語・集計・索引・式は Issue #1576 で解禁済みで `sql_timestamptz_query.rs` が担当。
+/// PK/UNIQUE・型変更・算術・SUM/AVG は担当 Issue 未定のため閉じたまま）。
 #[test]
 fn features_not_yet_enabled_are_rejected_fail_closed() {
     let (_p, _g, core) = open("tz-failclosed");
     ok(&core, "CREATE TABLE t (v TIMESTAMPTZ, n INTEGER)");
     insert(&core, 1, "'2026-01-01 03:00:00Z'", "f1").expect("insert");
     for sql in [
-        "SELECT id FROM t WHERE v = '2026-01-01 03:00:00Z' LIMIT 5",
-        "SELECT id FROM t WHERE v > '2026-01-01 03:00:00Z' LIMIT 5",
-        "SELECT id, v FROM t ORDER BY v LIMIT 5",
-        "SELECT DISTINCT v FROM t LIMIT 5",
-        "SELECT v, COUNT(*) FROM t GROUP BY v",
-        "SELECT MIN(v) FROM t",
-        "SELECT MAX(v) FROM t",
-        "SELECT COUNT(v) FROM t",
-        "SELECT COUNT(DISTINCT v) FROM t",
+        "SELECT SUM(v) FROM t",
+        "SELECT AVG(v) FROM t",
         "SELECT v + 1 FROM t LIMIT 5",
-        "SELECT EXTRACT(YEAR FROM v) FROM t LIMIT 5",
-        "SELECT TIMESTAMPTZ '2026-01-01 00:00:00Z' FROM t LIMIT 5",
-        "CREATE INDEX ix ON t (v)",
         "CREATE TABLE a (v TIMESTAMPTZ PRIMARY KEY)",
         "CREATE TABLE a (v TIMESTAMPTZ UNIQUE)",
         "ALTER TABLE t ALTER COLUMN v TYPE TIMESTAMP",

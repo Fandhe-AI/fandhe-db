@@ -151,7 +151,8 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
-        | Expr::TimeLiteral(_) => Ok(()),
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. } => Ok(()),
         Expr::Ident(name) => {
             if VALUE_FUNCTION_NAMES
                 .iter()
@@ -226,6 +227,7 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
         | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
         | Expr::ValueFunction { .. } => Ok(()),
         Expr::Collate { expr, .. } => check_intermediate_precision(expr),
         Expr::Call { args, .. } => {
@@ -317,6 +319,10 @@ fn typed_null(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
         ExprType::Date => twin(Expr::DateLiteral(0)),
         ExprType::Timestamp => twin(Expr::TimestampLiteral(0)),
         ExprType::Time => twin(Expr::TimeLiteral(0)),
+        ExprType::TimestampTz => twin(Expr::TimestampTzLiteral {
+            micros: 0,
+            session_local: false,
+        }),
         ExprType::Json | ExprType::JsonText => {
             return Err(SqlSurfaceError::unsupported(
                 "a json value is not allowed in a constant expression",
@@ -356,6 +362,10 @@ fn null_kind(e: &Expr) -> Option<Option<ExprType>> {
             Expr::DateLiteral(0) => Some(Some(ExprType::Date)),
             Expr::TimestampLiteral(0) => Some(Some(ExprType::Timestamp)),
             Expr::TimeLiteral(0) => Some(Some(ExprType::Time)),
+            Expr::TimestampTzLiteral {
+                micros: 0,
+                session_local: false,
+            } => Some(Some(ExprType::TimestampTz)),
             _ => None,
         },
         Expr::Case { whens, else_result } if else_result.is_none() && whens.len() == 1 => {
@@ -588,6 +598,10 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         ExprValue::Date(d) => Ok(InsertLiteral::String(crate::datetime::format_date(d))),
         ExprValue::Timestamp(t) => Ok(InsertLiteral::String(crate::datetime::format_timestamp(t))),
         ExprValue::Time(t) => Ok(InsertLiteral::String(crate::datetime::format_time(t))),
+        // UTC の明示 offset で渡し、列側の束縛がセッション TZ に影響されないようにする（Issue #1576）。
+        ExprValue::TimestampTz(t) => Ok(InsertLiteral::String(
+            crate::datetime::format_timestamptz(t, &crate::datetime::SessionTimeZone::utc()),
+        )),
         ExprValue::Vector(_) => Err(SqlSurfaceError::Internal {
             detail: "constant expression produced a vector".to_string(),
         }),

@@ -1868,7 +1868,10 @@ fn collect_referenced_udfs(
         }
         // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。
         // Issue #920）は UDF 呼び出しを持たない葉。
-        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) | Expr::TimeLiteral(_) => Ok(()),
+        Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. } => Ok(()),
     }
 }
 
@@ -1979,6 +1982,7 @@ fn push_set_expr(
             | Expr::DateLiteral(_)
             | Expr::TimestampLiteral(_)
             | Expr::TimeLiteral(_)
+            | Expr::TimestampTzLiteral { .. }
             | Expr::ValueFunction { .. } => {}
         }
     }
@@ -2118,6 +2122,25 @@ fn push_dml_expr(
             b.push_u8(10);
             b.push_u8(2);
             b.push_raw(&micros.to_le_bytes());
+        }
+        // `TIMESTAMPTZ` 型付きリテラル（Issue #1576）。型バイト 3 はゾーン指定済み（UTC 値）、
+        // 4 はゾーン無し（壁時計）で、後者は解釈に使うセッション TimeZone 名を含めて、異なる TZ
+        // での再送を別内容として扱う。既存の型バイト（0〜2）とそれらのハッシュ値は不変。
+        Expr::TimestampTzLiteral {
+            micros,
+            session_local,
+        } => {
+            b.push_u8(10);
+            if *session_local {
+                b.push_u8(4);
+                b.push_raw(&micros.to_le_bytes());
+                let tz = crate::datetime::current_session_time_zone();
+                b.push_bytes(tz.display().as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            } else {
+                b.push_u8(3);
+                b.push_raw(&micros.to_le_bytes());
+            }
         }
         // タグ 12（対象ビヘイビア: TABLE-25。Issue #1596。ADR §4.4 タグ表に追記）。
         // 演算子種別（`->` `->>` `#>` `#>>`）を 1 バイトで区別してから左辺・右辺を

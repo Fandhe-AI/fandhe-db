@@ -1031,6 +1031,8 @@ enum SubqueryValueFamily {
     Timestamp,
     /// `TIME`（Issue #1570）。
     Time,
+    /// `TIMESTAMPTZ`（Issue #1576）。外側へ渡す値は UTC の明示 offset 付きテキスト。
+    TimestampTz,
     Numeric,
     Uuid,
     Bytea,
@@ -1063,13 +1065,12 @@ fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
         }
         ColumnType::Real | ColumnType::Double => Some(SubqueryValueFamily::Float),
         ColumnType::Time => Some(SubqueryValueFamily::Time),
+        ColumnType::TimestampTz => Some(SubqueryValueFamily::TimestampTz),
         ColumnType::Vector(_)
         | ColumnType::Array(_)
         | ColumnType::Json
         | ColumnType::Jsonb
-        | ColumnType::Bpchar(_)
-        // TIMESTAMPTZ のサブクエリ値族は #1576 まで対応外（Issue #1574。fail-closed）。
-        | ColumnType::TimestampTz => None,
+        | ColumnType::Bpchar(_) => None,
     }
 }
 
@@ -1249,6 +1250,7 @@ fn resolve_in_subquery(
             SubqueryValueFamily::Date
             | SubqueryValueFamily::Timestamp
             | SubqueryValueFamily::Time
+            | SubqueryValueFamily::TimestampTz
             | SubqueryValueFamily::Numeric
             | SubqueryValueFamily::Uuid
             | SubqueryValueFamily::Bytea => texts.push(typed_cell_text(cell, family)?),
@@ -1710,6 +1712,10 @@ fn typed_cell_text(cell: &Cell, family: SubqueryValueFamily) -> Result<String, S
             Ok(crate::datetime::format_timestamp(*t))
         }
         (SubqueryValueFamily::Time, Cell::Time(t)) => Ok(crate::datetime::format_time(*t)),
+        // UTC の明示 offset で渡し、外側の比較がセッション TZ に影響されないようにする。
+        (SubqueryValueFamily::TimestampTz, Cell::TimestampTz(t)) => Ok(
+            crate::datetime::format_timestamptz(*t, &crate::datetime::SessionTimeZone::utc()),
+        ),
         (SubqueryValueFamily::Numeric, Cell::Numeric(d)) => Ok(d.to_string()),
         (SubqueryValueFamily::Uuid, Cell::Uuid(u)) => Ok(u.to_string()),
         (SubqueryValueFamily::Bytea, Cell::Bytes(b)) => Ok(crate::bytea::format_hex_text(b)),

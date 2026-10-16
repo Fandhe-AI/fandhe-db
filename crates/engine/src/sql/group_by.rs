@@ -1295,6 +1295,7 @@ fn cmp_cell_values(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         (Cell::Date(x), Cell::Date(y)) => x.cmp(y),
         (Cell::Timestamp(x), Cell::Timestamp(y)) => x.cmp(y),
         (Cell::Time(x), Cell::Time(y)) => x.cmp(y),
+        (Cell::TimestampTz(x), Cell::TimestampTz(y)) => x.cmp(y),
         // `NUMERIC` は scale が異なりうる（整数 `AVG` は値ごとに scale が変わる。
         // Issue #2270）ため、`cmp_exact` で scale を揃えて厳密に比較する。
         (Cell::Numeric(x), Cell::Numeric(y)) => crate::numeric::cmp_exact(x, y),
@@ -2263,6 +2264,7 @@ fn expr_value_to_cell(
         ExprValue::Date(d) => Cell::Date(d),
         ExprValue::Timestamp(t) => Cell::Timestamp(t),
         ExprValue::Time(t) => Cell::Time(t),
+        ExprValue::TimestampTz(t) => Cell::TimestampTz(t),
         ExprValue::Null => Cell::Null,
         ExprValue::Json(_) | ExprValue::JsonText(_) => {
             return Err(accumulator_bug(

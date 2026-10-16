@@ -485,6 +485,7 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
             | ColumnType::Enum(_)
             | ColumnType::Date
             | ColumnType::Timestamp
+            | ColumnType::TimestampTz
             | ColumnType::Time
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid
@@ -1850,7 +1851,7 @@ pub enum ColumnType {
     /// Issue #1574）。内部表現は UTC の 1970-01-01 起点マイクロ秒（`i64`。受理範囲は
     /// `TIMESTAMP` と同じ `0001-01-01`〜`9999-12-31`〔UTC〕）。カタログタグは
     /// `timestamptz`・param は `-` 固定。値の解析・整形は [`crate::datetime`] へ委譲する。
-    /// PK・UNIQUE・索引・述語・集計は #1576 まで fail-closed。
+    /// 述語・集計・二次索引・式内参照は Issue #1576 で解禁済み。PK・UNIQUE・FK・JOIN キーは担当 Issue 未定のため fail-closed。
     TimestampTz,
     /// 可変長の同型スカラー配列列（`<スカラー型>[]`、TABLE-14・TASK-198、Issue #888）。
     /// 要素型・要素数上限は [`ArrayType`] が保持する。検索経路（KNN・hybrid・ANN・

@@ -783,8 +783,9 @@ impl SessionTimeZone {
         {
             return Err(TimeZoneSettingError);
         }
+        // 表示値は AT TIME ZONE の評価が使わないため正規名の探索（tzdb 全走査）は省く。
         if let Some(named) = Self::resolve_named(input) {
-            return Ok(named.with_canonical_name(input));
+            return Ok(named);
         }
         if let Some(secs) = parse_zone_numeric(input) {
             // POSIX 解釈（`+9` は UTC の 9 時間「西」）。
