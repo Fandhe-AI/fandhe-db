@@ -211,15 +211,16 @@ fn decode_numeric(raw: &[u8]) -> Result<String, BinaryParamError> {
         let mut e: i32 = -1;
         while remaining > 0 {
             let g = group_at(e);
-            let mut buf = String::with_capacity(4);
-            let mut nz = false;
-            push_group(&mut buf, g, true, &mut nz);
+            // 4 桁を固定長配列で生成し、ヒープ確保なしで必要桁だけ out へ追記する。
+            let digits = [g / 1000, g / 100 % 10, g / 10 % 10, g % 10];
             let take = remaining.min(4);
-            for c in buf.chars().take(take) {
-                if c != '0' {
+            for d in digits.iter().take(take) {
+                if *d != 0 {
                     nonzero = true;
                 }
-                out.push(c);
+                out.push(char::from(
+                    b'0'.saturating_add(u8::try_from(*d).unwrap_or(0)),
+                ));
             }
             remaining -= take;
             e = e.saturating_sub(1);
