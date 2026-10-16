@@ -82,12 +82,13 @@ PostgreSQL の Bind 規則に従う。
 
 | 列 | 公告 OID | バイナリ可否 |
 | --- | --- | --- |
-| `ColumnMeta::Id` | numeric（1700） | **非対応 → `0A000`**（詳細は WIRE-14 参照） |
+| `ColumnMeta::Id`／`AliasedId` | numeric（1700） | 対応（Issue #2442。`numeric_send` 形式） |
 | `Scalar{ty: Text}` | text（25） | 対応（UTF-8 生バイト） |
 | `Scalar{ty: Integer／BigInt／Real／Double／Boolean／Bytea／Uuid}` | int4／int8／float4／float8／bool／bytea／uuid | 対応（Issue #1172。PostgreSQL の send 形式） |
-| `Scalar{ty: Numeric／Date／Timestamp／Json／Jsonb／Array／Enum}` | numeric／date／timestamp／json／jsonb／text | **非対応 → `0A000`** |
+| `Scalar{ty: Numeric}` | numeric（1700） | 対応（Issue #2442。`numeric_send` 形式。`dscale` はセルの実 scale） |
+| `Scalar{ty: Date／Timestamp／Json／Jsonb／Array／Enum}` | numeric／date／timestamp／json／jsonb／text | **非対応 → `0A000`** |
 | `Scalar{ty: Vector(_)}` | text（25） | **非対応 → `0A000`**（詳細は WIRE-14 参照） |
-| `ColumnMeta::Computed{ty: Some(t)}` | `t` の写像（Issue #1407。集計・式列・ウィンドウ関数の結果列） | `t` が対応型（`Integer／BigInt／Real／Double／Boolean／Text`）なら対応、非対応型なら **`0A000`** |
+| `ColumnMeta::Computed{ty: Some(t)}` | `t` の写像（Issue #1407。集計・式列・ウィンドウ関数の結果列） | `t` が対応型（`Integer／BigInt／Real／Double／Boolean／Text／Numeric`）なら対応、非対応型なら **`0A000`** |
 | `ColumnMeta::Computed{ty: None}` | text（25） | **非対応 → `0A000`**（静的型を持たないベクトル式など。fail-closed。詳細は WIRE-14 参照） |
 
 `WireType::supports_binary`（`Id`／`Text` の型そのものの対応可否）と
@@ -108,8 +109,8 @@ Issue #1172 で `int4`／`int8`／`float4`／`float8`／`bool`／`bytea`／`uuid
 `00 00 00 01`、`int8(-1)` → `ff` × 8、`float8(1.0)` → `3f f0 00 …`、
 `bool_(true)` → `01`）。
 
-`id`（`numeric`）のバイナリ対応拡大は spec 側で未策定のため引き続き未実施
-（詳細は WIRE-13 参照）。
+`numeric`（`id`・NUMERIC 列・整数 AVG／SUM 結果列）の結果側バイナリは Issue #2442 で
+対応した（下記「Issue #2442 追記」）。
 
 ## 形式コードを受け取るエンコーダと既存出力の不変性
 
@@ -147,8 +148,8 @@ matches_legacy_encoder`）で固定している。シグネチャは
   float4 縮小・固定長型の長さが `typlen` と不一致の場合は `EncodeError`（`XX000`）で
   text へ黙ってフォールバックしない。`bytea`／`text` の長さは `i32::try_from` で検証する。
   失敗時に部分フレームを残さない契約は不変。
-- 非対応型（`NUMERIC`・`DATE`・`TIMESTAMP`・`JSON`・`JSONB`・配列・`ENUM`・
-  `VECTOR`・`id`・`Computed{ty: None}`・非対応型の `Computed`）は従来どおり Bind で `0A000`（当該文のみ拒否・
+- 非対応型（`DATE`・`TIMESTAMP`・`JSON`・`JSONB`・配列・`ENUM`・
+  `VECTOR`・`Computed{ty: None}`・非対応型の `Computed`。`NUMERIC`・`id` は Issue #2442 で対応）は従来どおり Bind で `0A000`（当該文のみ拒否・
   接続維持）。
 - 長さ上限検証・`08P01` の範囲: バイナリ形式パラメータの復号は本 Issue の対象外
   （Issue #1345 で実装。下記参照）。本 Issue では
@@ -202,7 +203,8 @@ matches_legacy_encoder`）で固定している。シグネチャは
 
 - **判定**: `column_binary_support` は `Computed{ty: Some(t)}` を `Scalar{ty: t}` と同じ
   `scalar_type_binary_support` で判定する（WIRE-13・WIRE-14 のポインタ）。`ty: None`・
-  `NUMERIC`（`SUM／MIN／MAX(id)` を含む）・`DATE`／`TIMESTAMP` は従来どおり `0A000`。
+  `DATE`／`TIMESTAMP` は従来どおり `0A000`（`NUMERIC`〔`SUM／MIN／MAX(id)` を含む〕は
+  Issue #2442 で対応）。
 - **符号化**: `COUNT`・`ROW_NUMBER` 系は `int8` を公告しつつセルが `Cell::Integer(u64)` のため、
   `(Int8, Cell::Integer)` を `i64::try_from` 付きで追加した（範囲外は `EncodeError`＝`XX000`・
   部分フレームなし）。型と Cell の他の不一致は fail-closed のまま。
@@ -217,3 +219,19 @@ matches_legacy_encoder`）で固定している。シグネチャは
 - 結果: `TIME` 列（`Computed{ty: Some(Time)}` を含む）は OID 1083・typlen 8 で公告し、バイナリは 0 時起点マイクロ秒の 8 バイト BE（PostgreSQL の `time_send` と同形）。範囲 `00:00:00`〜`24:00:00` の外の `Cell::Time` は黙って丸めず `XX000` で fail-closed
 - param: `TIME` スロットは宣言 OID 1083（推論含む）のみバイナリを受理し、それ以外の宣言は `0A000`。8 バイト以外は `08P01`、範囲外は `22008`（値は応答に含めない）。復号後は正規テキストにして engine の束縛経路へ渡す（テキストで送った場合と同一）
 - `DATE`／`TIMESTAMP` は従来どおり非対応（`0A000`）
+
+## Issue #2442 追記: numeric 結果列のバイナリ符号化
+
+- **対象**: numeric を公告する結果列すべて（`id`・別名付き `id`・`NUMERIC(p, s)` 列・
+  `SUM／MIN／MAX(id)`・整数の `AVG`・`SUM(BIGINT)`・NUMERIC 列の集計）。WIRE-13・WIRE-14・
+  TABLE-13 のポインタ。
+- **符号化**: PostgreSQL の `numeric_send` と同じレイアウト（`ndigits`・`weight`・`sign`・
+  `dscale` と base-10000 の桁群。先頭・末尾のゼロ群は除去、値 0 は `ndigits=0`）。`dscale` は
+  セルの実 scale から取る（列型の名目 scale ではない）。小数部を 4 桁境界へ揃える際の
+  u128 桁あふれ（scale 37・38）は最下位群の先行切り出しで回避し、桁群は固定長スタック
+  バッファで組み立てる。型とセルの不一致・上限超過は `EncodeError`（`XX000`）で fail-closed。
+- **契約変更**: 以前は `0A000` で拒否されたバイナリ要求が成功する（後方互換の拡張）。
+  非対応型（`DATE`／`TIMESTAMP`／`JSON`／`JSONB`／`VECTOR` など）の `0A000` は不変。
+- **対象外**: パラメータ側のバイナリ復号（#2443）、PostgreSQL 17 実機とのバイト列一致と
+  SQLSTATE 境界（#2444）、実クライアントでの値一致の正例（#2445）。パラメータ側の `numeric`
+  は引き続き非対応。
