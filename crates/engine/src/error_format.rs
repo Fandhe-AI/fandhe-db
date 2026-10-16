@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 61;
+    count = 62;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -192,6 +192,11 @@ define_error_classes! {
     /// `DatetimeFieldOverflow`（`22008`）のまま。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidDatetimeFormat`] の写像。
     InvalidDatetimeFormat => ("22007", "INVALID_DATETIME_FORMAT"),
+    /// `INTERVAL` リテラルのフィールド値が範囲外（`22015`）。数値が `i64` に収まらない・
+    /// 単位換算や同一フィールドへの累積が `i32`／`i64` をあふれる場合（TABLE-34・Issue #1579）。
+    /// 全フィールド合成後の範囲外は `DatetimeFieldOverflow`（`22008`）のまま。
+    /// [`crate::sql::allowlist::SqlSurfaceError::IntervalFieldOverflow`] の写像。
+    IntervalFieldOverflow => ("22015", "INTERVAL_FIELD_OVERFLOW"),
     /// 構文上受理された値が、宣言済み型の表現として不正（`22P02`）。ENUM 列
     /// （TABLE-14・TASK-198）の語彙外ラベルが最初の送出経路（[`crate::catalog::
     /// EnumLabelError`]・`sql::allowlist::SqlSurfaceError::InvalidTextRepresentation`）。

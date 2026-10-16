@@ -160,6 +160,14 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             out.push('"');
             Ok(())
         }
+        // INTERVAL は `IntervalStyle=postgres` 形式の JSON 文字列（Issue #1579。型の公告は
+        // `"interval"`。NoSQL の型束縛・filter は #1583 まで拒否する）。
+        Cell::Interval(v) => {
+            out.push('"');
+            escape_json_string_into(out, &engine::datetime::format_interval(v));
+            out.push('"');
+            Ok(())
+        }
         // TIME は `HH:MM:SS[.ffffff]` の JSON 文字列（Issue #1569）。
         Cell::Time(micros) => {
             out.push('"');
@@ -380,6 +388,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
             ColumnType::Timestamp => "timestamp",
             ColumnType::Time => "time",
             ColumnType::TimestampTz => "timestamptz",
+            ColumnType::Interval => "interval",
             ColumnType::Numeric { .. } => "numeric",
             ColumnType::Uuid => "uuid",
             ColumnType::Bytea => "bytea",

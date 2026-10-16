@@ -235,6 +235,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::Timestamp
                         | ColumnType::Time
                         | ColumnType::TimestampTz
+                        | ColumnType::Interval
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -775,6 +776,17 @@ fn build_projected_cells(
                             Some(None) | None => cells.push(Cell::Null),
                         }
                     }
+                    ColumnType::Interval => match scanned.get(*index) {
+                        Some(Some(row_codec::ScalarRef::Interval(v))) => {
+                            cells.push(Cell::Interval(*v))
+                        }
+                        Some(Some(_)) => {
+                            return Err(scan_bug(
+                                "INTERVAL column scan yielded a non-Interval scalar value",
+                            ))
+                        }
+                        Some(None) | None => cells.push(Cell::Null),
+                    },
                     ColumnType::Array(_) => match scanned.get(*index) {
                         Some(Some(row_codec::ScalarRef::Array(array_ref))) => {
                             let value = try_alloc_array_for_budget(

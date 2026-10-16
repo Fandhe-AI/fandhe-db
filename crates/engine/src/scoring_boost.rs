@@ -108,6 +108,7 @@ impl ScoringBoost {
             | ColumnType::Timestamp
             | ColumnType::Time
             | ColumnType::TimestampTz
+            | ColumnType::Interval
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json

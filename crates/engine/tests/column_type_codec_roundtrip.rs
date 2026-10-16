@@ -68,6 +68,7 @@ fn type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Timestamp => "timestamp",
         ColumnType::Time => "time",
         ColumnType::TimestampTz => "timestamptz",
+        ColumnType::Interval => "interval",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",
@@ -114,6 +115,7 @@ fn all_type_labels() -> BTreeSet<&'static str> {
         "timestamp",
         "time",
         "timestamptz",
+        "interval",
         "array",
         "bytea",
         "json",
@@ -171,6 +173,7 @@ fn full_row_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> Ta
             ColumnDef::new("c_bpchar", ColumnType::Bpchar(8), true),
             ColumnDef::new("c_time", ColumnType::Time, true),
             ColumnDef::new("c_timestamptz", ColumnType::TimestampTz, true),
+            ColumnDef::new("c_interval", ColumnType::Interval, true),
         ],
     )
 }
@@ -239,6 +242,12 @@ fn representative_scalar_values() -> Vec<Value> {
         Value::Time(engine::datetime::TIME_MAX_MICROS),
         // `c_timestamptz`（UTC のマイクロ秒。Issue #1574）。
         Value::TimestampTz(engine::datetime::TIMESTAMPTZ_MAX_MICROS),
+        // `c_interval`（月・日・マイクロ秒の三要素。Issue #1579）。
+        Value::Interval(engine::datetime::Interval {
+            months: -14,
+            days: 3,
+            micros: 4_005_000_006,
+        }),
     ]
 }
 
@@ -1869,4 +1878,119 @@ fn array_new_elem_types_reject_truncated_and_trailing_payloads_on_decode() {
     assert!(decode_row(&schema, truncated).is_err());
     encoded.push(0xAA);
     assert!(decode_row(&schema, &encoded).is_err());
+}
+
+/// INTERVAL は最小・0・最大の三要素を往復でき、無限大の予約値（番兵）は encode でも decode でも
+/// 拒否する。他型の値との取り違えも拒否する（Issue #1579・TABLE-34 ポインタ）。
+#[test]
+fn interval_roundtrips_extremes_and_rejects_sentinels_and_mixups() {
+    use engine::datetime::Interval;
+    for v in [
+        Interval {
+            months: 0,
+            days: 0,
+            micros: 0,
+        },
+        Interval {
+            months: i32::MIN,
+            days: 0,
+            micros: 0,
+        },
+        Interval {
+            months: i32::MAX,
+            days: i32::MAX,
+            micros: 0,
+        },
+        Interval {
+            months: 0,
+            days: i32::MIN,
+            micros: i64::MIN,
+        },
+        Interval {
+            months: 1,
+            days: -1,
+            micros: i64::MAX,
+        },
+    ] {
+        roundtrip_single(ColumnType::Interval, Value::Interval(v));
+    }
+    let schema = single_col_schema(ColumnType::Interval);
+    for v in [
+        Interval {
+            months: i32::MAX,
+            days: i32::MAX,
+            micros: i64::MAX,
+        },
+        Interval {
+            months: i32::MIN,
+            days: i32::MIN,
+            micros: i64::MIN,
+        },
+    ] {
+        assert!(matches!(
+            encode_row(
+                &schema,
+                "tenant-a",
+                Visibility::Public,
+                &[Value::Interval(v)]
+            ),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+    // 他型の値を INTERVAL 列へ、INTERVAL 値を他型の列へ書くことはできない。
+    assert!(matches!(
+        encode_row(&schema, "tenant-a", Visibility::Public, &[Value::Time(0)]),
+        Err(RowCodecError::Invalid(_))
+    ));
+    let time_schema = single_col_schema(ColumnType::Time);
+    assert!(matches!(
+        encode_row(
+            &time_schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Interval(Interval {
+                months: 0,
+                days: 0,
+                micros: 0
+            })]
+        ),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // 値部を番兵に書き換えたバイト列は decode が拒否する（破損データの fail-closed）。
+    let mut bytes = encode_row(
+        &schema,
+        "tenant-a",
+        Visibility::Public,
+        &[Value::Interval(Interval {
+            months: 0,
+            days: 0,
+            micros: 0,
+        })],
+    )
+    .expect("encode interval");
+    let tail = bytes.len();
+    bytes[tail - 16..tail - 8].copy_from_slice(&i64::MAX.to_le_bytes());
+    bytes[tail - 8..tail - 4].copy_from_slice(&i32::MAX.to_le_bytes());
+    bytes[tail - 4..].copy_from_slice(&i32::MAX.to_le_bytes());
+    assert!(matches!(
+        decode_row(&schema, &bytes),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // 切り詰めたバイト列も拒否する。
+    let good = encode_row(
+        &schema,
+        "tenant-a",
+        Visibility::Public,
+        &[Value::Interval(Interval {
+            months: 1,
+            days: 2,
+            micros: 3,
+        })],
+    )
+    .expect("encode interval");
+    let cut = good.get(..good.len() - 3).expect("slice");
+    assert!(matches!(
+        decode_row(&schema, cut),
+        Err(RowCodecError::Invalid(_))
+    ));
 }

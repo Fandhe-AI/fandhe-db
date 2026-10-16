@@ -13,6 +13,12 @@
 
 use std::fmt::Write as _;
 
+mod interval;
+pub use interval::{
+    format_interval, parse_interval, validate_interval, Interval, IntervalLiteralError,
+    MAX_INTERVAL_LITERAL_LEN,
+};
+
 /// 先発グレゴリオ暦（proleptic Gregorian）で表現できる `DATE` の最小値
 /// （`0001-01-01`）を 1970-01-01 起点の日数で表した値。
 pub const DATE_MIN_DAYS: i32 = -719_162;

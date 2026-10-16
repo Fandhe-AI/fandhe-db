@@ -324,6 +324,14 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(17);
             b.push_u64(*micros as u64);
         }
+        // INTERVAL（TABLE-34・Issue #1579）は未使用の新規タグ 18 を採番する。正規化しない
+        // 生の三要素（月・日・マイクロ秒）をハッシュする（`1 mon` と `30 days` は別の格納値）。
+        Value::Interval(v) => {
+            b.push_u8(18);
+            b.push_u64(i64::from(v.months) as u64);
+            b.push_u64(i64::from(v.days) as u64);
+            b.push_u64(v.micros as u64);
+        }
         // 配列列（TABLE-14・Issue #888）は 10 とする。要素型タグ・要素数・各要素を
         // 積むことで、`{ab}`（1 要素）と `{a,b}`（2 要素）のような表記ゆれが
         // 衝突しない単射なハッシュ入力にする。

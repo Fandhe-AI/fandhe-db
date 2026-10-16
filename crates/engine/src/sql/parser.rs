@@ -640,6 +640,7 @@ pub(crate) fn bind_integer_literal(
         | ColumnType::Timestamp
         | ColumnType::Time
         | ColumnType::TimestampTz
+        | ColumnType::Interval
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -782,6 +783,32 @@ pub(crate) fn bind_datetime_literal(
                         detail: "time zone not recognized",
                     })
                 }
+            }
+        }
+        // INTERVAL 列（TABLE-34・Issue #1579）。書式違反 `22007`・フィールド値の範囲外 `22015`・
+        // 合成後の範囲外 `22008`・`infinity` は未対応のため `0A000`（detail は静的文字列）。
+        ColumnType::Interval => {
+            use crate::datetime::IntervalLiteralError;
+            match crate::datetime::parse_interval(literal) {
+                Ok(v) => Ok(crate::row_codec::Value::Interval(v)),
+                Err(e @ IntervalLiteralError::Format(_)) => {
+                    Err(SqlSurfaceError::invalid_datetime_format(format!(
+                        "column {column_name:?}: {e}"
+                    )))
+                }
+                Err(e @ IntervalLiteralError::FieldOverflow) => {
+                    Err(SqlSurfaceError::interval_field_overflow(format!(
+                        "column {column_name:?}: {e}"
+                    )))
+                }
+                Err(e @ IntervalLiteralError::OutOfRange) => {
+                    Err(SqlSurfaceError::datetime_field_overflow(format!(
+                        "column {column_name:?}: {e}"
+                    )))
+                }
+                Err(IntervalLiteralError::Infinity) => Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "infinite interval values are not supported yet".to_string(),
+                }),
             }
         }
         ColumnType::Text
@@ -1142,6 +1169,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             | ColumnType::Timestamp
             | ColumnType::Time
             | ColumnType::TimestampTz
+            | ColumnType::Interval
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
@@ -1195,6 +1223,7 @@ pub(crate) fn text_column_index(
                 | ColumnType::Timestamp
                 | ColumnType::Time
                 | ColumnType::TimestampTz
+                | ColumnType::Interval
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
@@ -1582,6 +1611,7 @@ fn is_typed_compare_column_type(ty: &ColumnType) -> bool {
         ColumnType::Date
             | ColumnType::Timestamp
             | ColumnType::TimestampTz
+            | ColumnType::Interval
             | ColumnType::Time
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid
@@ -2879,6 +2909,7 @@ pub(crate) fn bind_column_default(
             ScalarRef::Timestamp(t) => Ok(Value::Timestamp(t)),
             ScalarRef::Time(t) => Ok(Value::Time(t)),
             ScalarRef::TimestampTz(t) => Ok(Value::TimestampTz(t)),
+            ScalarRef::Interval(v) => Ok(Value::Interval(v)),
             ScalarRef::Json(j) => Ok(Value::Json(j.to_string())),
             _ => Err(SqlSurfaceError::invalid_input(format!(
                 "column {:?} DEFAULT is not compatible with its type",
@@ -2919,6 +2950,15 @@ pub(crate) fn bind_column_default(
         }
         Err(DefaultBindError::UnknownTimeZone) => Err(SqlSurfaceError::InvalidParameterValue {
             detail: "time zone not recognized",
+        }),
+        Err(DefaultBindError::IntervalFieldOverflow) => {
+            Err(SqlSurfaceError::interval_field_overflow(format!(
+                "column {:?} DEFAULT has an interval field out of range",
+                column.name
+            )))
+        }
+        Err(DefaultBindError::IntervalInfinity) => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "infinite interval values are not supported yet".to_string(),
         }),
         Err(DefaultBindError::Incompatible) => Err(SqlSurfaceError::invalid_input(format!(
             "column {:?} DEFAULT is not compatible with its type",
@@ -3121,6 +3161,9 @@ fn bind_insert_row(
             (ColumnType::TimestampTz, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::TimestampTz, s)?
             }
+            (ColumnType::Interval, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::Interval, s)?
+            }
             (
                 ColumnType::Time,
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
@@ -3135,6 +3178,14 @@ fn bind_insert_row(
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a TIMESTAMPTZ literal (YYYY-MM-DD HH:MM:SS[+TZ])"
+                )))
+            }
+            (
+                ColumnType::Interval,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects an INTERVAL literal (e.g. '1 day 02:00:00')"
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -3287,6 +3338,7 @@ pub(crate) fn bind_json_literal(
         | ColumnType::Timestamp
         | ColumnType::Time
         | ColumnType::TimestampTz
+        | ColumnType::Interval
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -3598,6 +3650,9 @@ fn bind_set_assignments(
             (ColumnType::TimestampTz, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::TimestampTz, s)?
             }
+            (ColumnType::Interval, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::Interval, s)?
+            }
             (
                 ColumnType::Time,
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
@@ -3612,6 +3667,14 @@ fn bind_set_assignments(
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a TIMESTAMPTZ literal (YYYY-MM-DD HH:MM:SS[+TZ])"
+                )))
+            }
+            (
+                ColumnType::Interval,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects an INTERVAL literal (e.g. '1 day 02:00:00')"
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -4769,6 +4832,9 @@ fn bind_upsert_assignments(
                     (ColumnType::TimestampTz, InsertLiteral::String(s)) => {
                         bind_datetime_literal(name, ColumnType::TimestampTz, s)?
                     }
+                    (ColumnType::Interval, InsertLiteral::String(s)) => {
+                        bind_datetime_literal(name, ColumnType::Interval, s)?
+                    }
                     (ColumnType::Time, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a TIME literal (HH:MM:SS)"
@@ -4777,6 +4843,11 @@ fn bind_upsert_assignments(
                     (ColumnType::TimestampTz, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a TIMESTAMPTZ literal (YYYY-MM-DD HH:MM:SS[+TZ])"
+                        )))
+                    }
+                    (ColumnType::Interval, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects an INTERVAL literal (e.g. '1 day 02:00:00')"
                         )))
                     }
                     (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -4992,6 +5063,11 @@ fn bind_file_insert(
             (ColumnType::TimestampTz, _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: TIMESTAMPTZ column is not supported for file-form INSERT"
+                )))
+            }
+            (ColumnType::Interval, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: INTERVAL column is not supported for file-form INSERT"
                 )))
             }
             // 配列列（TABLE-14・Issue #888）も BOOLEAN と同じく対象外として拒否する。
@@ -5982,6 +6058,10 @@ fn resolve_aggregate_input(
                     (ColumnType::TimestampTz, _) => Err(SqlSurfaceError::undefined_function(
                         format!("column {name:?} is TIMESTAMPTZ and cannot be used with SUM/AVG"),
                     )),
+                    // `INTERVAL` 列の集約は #1580 まで fail-closed（Issue #1579）。
+                    (ColumnType::Interval, _) => Err(SqlSurfaceError::undefined_function(format!(
+                        "column {name:?} is INTERVAL and cannot be aggregated yet"
+                    ))),
                     (ColumnType::Array(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::ArrayColumn(index))
                     }
@@ -6156,6 +6236,10 @@ fn resolve_count_distinct_input(
                     ColumnType::Timestamp => Ok(AggregateInput::TimestampColumn(index)),
                     ColumnType::Time => Ok(AggregateInput::TimeColumn(index)),
                     ColumnType::TimestampTz => Ok(AggregateInput::TimestampTzColumn(index)),
+                    // `INTERVAL` 列の COUNT(DISTINCT) は #1580 まで fail-closed（Issue #1579）。
+                    ColumnType::Interval => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is INTERVAL and cannot be used with COUNT(DISTINCT ...) yet"
+                    ))),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is ARRAY and cannot be used with COUNT(DISTINCT ...)"
                     ))),
@@ -6629,7 +6713,9 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
-        | ColumnType::Jsonb => None,
+        | ColumnType::Jsonb
+        // `INTERVAL` は正規化比較（#1580）まで並べ替え不能（fail-closed。Issue #1579）。
+        | ColumnType::Interval => None,
     }
 }
 
@@ -7197,6 +7283,7 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
             | ColumnType::Json
             | ColumnType::Jsonb
             | ColumnType::Bpchar(_)
+            | ColumnType::Interval
             | ColumnType::Enum(_) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} cannot be used as a window PARTITION BY/ORDER BY key"

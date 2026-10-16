@@ -228,6 +228,9 @@ pub enum Cell {
     /// マイクロ秒。テキスト整形は [`crate::datetime::format_timestamptz`] に委譲する
     /// （セッション TimeZone での表示は #1575）。
     TimestampTz(i64),
+    /// `INTERVAL` 列の投影結果（TABLE-34・Issue #1579）。月・日・マイクロ秒の三要素。
+    /// テキスト整形は [`crate::datetime::format_interval`] に委譲する。
+    Interval(crate::datetime::Interval),
     /// 配列列（TABLE-14・TASK-198、Issue #888）の投影結果。
     Array(row_codec::ArrayValue),
     /// `BYTEA` 列の投影結果（Issue #886）。
@@ -539,6 +542,7 @@ fn candidate_value_to_scalar_ref<'a>(
         Value::Timestamp(v) => Some(ScalarRef::Timestamp(*v)),
         Value::Time(v) => Some(ScalarRef::Time(*v)),
         Value::TimestampTz(v) => Some(ScalarRef::TimestampTz(*v)),
+        Value::Interval(v) => Some(ScalarRef::Interval(*v)),
         Value::Bytes(b) => Some(ScalarRef::Bytes(b.as_slice())),
         Value::Json(t) => Some(ScalarRef::Json(t.as_str())),
         Value::Enum(label) => Some(ScalarRef::Enum(label.as_str())),
@@ -1300,6 +1304,9 @@ pub(crate) fn execute_statement_with_cache(
                     }
                     Some(row_codec::ScalarRef::TimestampTz(t)) => {
                         kept.push(Value::TimestampTz(t));
+                    }
+                    Some(row_codec::ScalarRef::Interval(v)) => {
+                        kept.push(Value::Interval(v));
                     }
                     Some(row_codec::ScalarRef::Array(array_ref)) => {
                         let value = try_alloc_array_for_budget(
@@ -2767,6 +2774,7 @@ fn decode_deferred_scalars(
             Some(row_codec::ScalarRef::Timestamp(t)) => out.push(Value::Timestamp(t)),
             Some(row_codec::ScalarRef::Time(t)) => out.push(Value::Time(t)),
             Some(row_codec::ScalarRef::TimestampTz(t)) => out.push(Value::TimestampTz(t)),
+            Some(row_codec::ScalarRef::Interval(v)) => out.push(Value::Interval(v)),
             Some(row_codec::ScalarRef::Array(array_ref)) => {
                 let value =
                     try_alloc_array_for_budget(array_ref, budget, MAX_CANDIDATE_SCALAR_BYTES)
@@ -3048,6 +3056,7 @@ fn project_rows(
                                 | Some(Value::Timestamp(_))
                                 | Some(Value::Time(_))
                                 | Some(Value::TimestampTz(_))
+                                | Some(Value::Interval(_))
                                 | Some(Value::Array(_))
                                 | Some(Value::Bytes(_))
                                 | Some(Value::Json(_))
@@ -3075,6 +3084,7 @@ fn project_rows(
                             | Some(Value::Timestamp(_))
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
+                            | Some(Value::Interval(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3099,6 +3109,7 @@ fn project_rows(
                             | Some(Value::Timestamp(_))
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
+                            | Some(Value::Interval(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3150,6 +3161,7 @@ fn project_rows(
                             | Some(Value::Timestamp(_))
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
+                            | Some(Value::Interval(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3174,6 +3186,7 @@ fn project_rows(
                             | Some(Value::Timestamp(_))
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
+                            | Some(Value::Interval(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3198,6 +3211,7 @@ fn project_rows(
                             | Some(Value::Timestamp(_))
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
+                            | Some(Value::Interval(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3222,6 +3236,7 @@ fn project_rows(
                             | Some(Value::Date(_))
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
+                            | Some(Value::Interval(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3246,6 +3261,7 @@ fn project_rows(
                             | Some(Value::Date(_))
                             | Some(Value::Timestamp(_))
                             | Some(Value::TimestampTz(_))
+                            | Some(Value::Interval(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3270,6 +3286,32 @@ fn project_rows(
                             | Some(Value::Date(_))
                             | Some(Value::Timestamp(_))
                             | Some(Value::Time(_))
+                            | Some(Value::Interval(_))
+                            | Some(Value::Array(_))
+                            | Some(Value::Bytes(_))
+                            | Some(Value::Json(_))
+                            | Some(Value::Enum(_))
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Interval => match decoded.get(*index) {
+                            Some(Value::Interval(v)) => cells.push(Cell::Interval(*v)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_))
+                            | Some(Value::Time(_))
+                            | Some(Value::TimestampTz(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3297,6 +3339,7 @@ fn project_rows(
                             | Some(Value::Timestamp(_))
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
+                            | Some(Value::Interval(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_))
@@ -3331,6 +3374,7 @@ fn project_rows(
                             | Some(Value::Timestamp(_))
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
+                            | Some(Value::Interval(_))
                             | Some(Value::Array(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_))
@@ -3355,6 +3399,7 @@ fn project_rows(
                             | Some(Value::Timestamp(_))
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
+                            | Some(Value::Interval(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Enum(_))
@@ -3379,6 +3424,7 @@ fn project_rows(
                             | Some(Value::Timestamp(_))
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
+                            | Some(Value::Interval(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -3403,6 +3449,7 @@ fn project_rows(
                             | Some(Value::Timestamp(_))
                             | Some(Value::Time(_))
                             | Some(Value::TimestampTz(_))
+                            | Some(Value::Interval(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))

@@ -277,7 +277,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 58] = [
+const EXPECTED_STATUS: [(&str, u16); 59] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -363,6 +363,8 @@ const EXPECTED_STATUS: [(&str, u16); 58] = [
     ("22P05", 400),
     // `InvalidBinaryRepresentation`（`22P03`。Issue #2443）: numeric バイナリ受信の外部表現不正。400。
     ("22P03", 400),
+    // `IntervalFieldOverflow`（`22015`。Issue #1579）: INTERVAL リテラルのフィールド値の範囲外。400。
+    ("22015", 400),
     // `DuplicateObject`（`42710`。TABLE-22、Issue #1195）: ERR-6 の新設行。400
     // （`42P07` の 409 とは揃えない）。
     ("42710", 400),
@@ -457,7 +459,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 61);
+const _: () = assert!(ErrorClass::ALL.len() == 62);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -973,6 +975,9 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         ErrorClass::UntranslatableCharacter,
         // `InvalidBinaryRepresentation`（`22P03`。Issue #2443）: SQL 表層専用で NoSQL 表層からは到達不能。
         ErrorClass::InvalidBinaryRepresentation,
+        // `IntervalFieldOverflow`（`22015`。Issue #1579）: INTERVAL の型束縛は NoSQL 表層で #1583 まで
+        // 拒否するため到達不能（SQL 表層専用）。
+        ErrorClass::IntervalFieldOverflow,
         // （`PartialCompletion`／`PartitionedDmlCancelled`〔`VD001`／`VD002`〕は Issue #1130 で
         // `update`／`delete` の分割実行修飾から到達可能になったため外した。固定は
         // `err4_f_partitioned_dml_vd001_vd002_reachable_via_nosql_update` が担う）

@@ -538,6 +538,8 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 ColumnType::Vector(_)
                 | ColumnType::Date
                 | ColumnType::Timestamp
+                // INTERVAL のバイナリ受信は #1583 まで非対応（Issue #1579）。
+                | ColumnType::Interval
                 | ColumnType::Json
                 | ColumnType::Jsonb
                 | ColumnType::Array(_)
