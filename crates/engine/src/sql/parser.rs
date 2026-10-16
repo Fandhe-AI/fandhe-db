@@ -5247,6 +5247,10 @@ pub(crate) enum AggregateInput {
     TimestampColumn(usize),
     /// `TIME` 列の裸参照（`COUNT`・`MIN`/`MAX`。Issue #1570）。
     TimeColumn(usize),
+    /// `INTERVAL` 列の裸参照（`COUNT`・`MIN`/`MAX`・`SUM`/`AVG`。Issue #1580・TABLE-34 ポインタ）。
+    /// `MIN`/`MAX` は正規化キーで比較して元の三要素を返し、`SUM`/`AVG` は三要素ごとの
+    /// checked 加算（あふれは `22008`）。ウィンドウ関数の入力には使えない（`0A000`）。
+    IntervalColumn(usize),
     /// `TIMESTAMPTZ` 列の裸参照（`COUNT`・`MIN`/`MAX`。UTC の時点で比較する。Issue #1576）。
     TimestampTzColumn(usize),
     /// `ARRAY` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL 行数）
@@ -6058,10 +6062,8 @@ fn resolve_aggregate_input(
                     (ColumnType::TimestampTz, _) => Err(SqlSurfaceError::undefined_function(
                         format!("column {name:?} is TIMESTAMPTZ and cannot be used with SUM/AVG"),
                     )),
-                    // `INTERVAL` 列の集約は #1580 まで fail-closed（Issue #1579）。
-                    (ColumnType::Interval, _) => Err(SqlSurfaceError::undefined_function(format!(
-                        "column {name:?} is INTERVAL and cannot be aggregated yet"
-                    ))),
+                    // `INTERVAL` 列は `COUNT`・`MIN`/`MAX`・`SUM`/`AVG` を受理する（Issue #1580）。
+                    (ColumnType::Interval, _) => Ok(AggregateInput::IntervalColumn(index)),
                     (ColumnType::Array(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::ArrayColumn(index))
                     }
@@ -6241,10 +6243,8 @@ fn resolve_count_distinct_input(
                     ColumnType::Timestamp => Ok(AggregateInput::TimestampColumn(index)),
                     ColumnType::Time => Ok(AggregateInput::TimeColumn(index)),
                     ColumnType::TimestampTz => Ok(AggregateInput::TimestampTzColumn(index)),
-                    // `INTERVAL` 列の COUNT(DISTINCT) は #1580 まで fail-closed（Issue #1579）。
-                    ColumnType::Interval => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} is INTERVAL and cannot be used with COUNT(DISTINCT ...) yet"
-                    ))),
+                    // `INTERVAL` 列の COUNT(DISTINCT) は正規化キーで重複を除く（Issue #1580）。
+                    ColumnType::Interval => Ok(AggregateInput::IntervalColumn(index)),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is ARRAY and cannot be used with COUNT(DISTINCT ...)"
                     ))),
@@ -6684,6 +6684,10 @@ pub(crate) enum OrderKind {
     /// 式キー（jsonb 列の裸のキーも式として束縛する）専用で、GROUP BY・DISTINCT 用の
     /// [`resolve_order_kind`] は返さない。
     Jsonb,
+    /// `INTERVAL`（Issue #1580。正規化キー〔`datetime::cmp_interval`〕での比較。`1 mon` と
+    /// `30 days` は同順位）。`ORDER BY` 専用で、GROUP BY・DISTINCT 用の
+    /// [`resolve_group_by_key`] は拒否する（代表値の規則が未確定）。
+    Interval,
 }
 
 /// スカラー `ORDER BY` の束縛済み 1 キー分（Issue #915・SQL-25）。
@@ -6719,13 +6723,12 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         ColumnType::Numeric { .. } => Some(OrderKind::Numeric),
         ColumnType::Uuid => Some(OrderKind::Uuid),
         ColumnType::Enum(_) => Some(OrderKind::Enum),
+        ColumnType::Interval => Some(OrderKind::Interval),
         ColumnType::Vector(_)
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
-        | ColumnType::Jsonb
-        // `INTERVAL` は正規化比較（#1580）まで並べ替え不能（fail-closed。Issue #1579）。
-        | ColumnType::Interval => None,
+        | ColumnType::Jsonb => None,
     }
 }
 
@@ -7350,6 +7353,12 @@ fn bind_window_item(
                     detail: "this collation is not supported in this expression".to_string(),
                 });
             }
+            // INTERVAL 列のウィンドウ集計は未対応（Issue #1580。担当 Issue 未定の fail-closed）。
+            if matches!(resolved, AggregateInput::IntervalColumn(_)) {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "INTERVAL columns are not supported in window aggregates".to_string(),
+                });
+            }
             Some(resolved)
         }
     };
@@ -7683,6 +7692,11 @@ fn resolve_group_by_key(
     };
     if let Some(index) = schema.columns.iter().position(|c| c.name == column) {
         let def = schema.columns.get(index).ok_or_else(reject)?;
+        // INTERVAL は並べ替えできるが、グループ化は正規化等価（`1 mon` = `30 days`）の代表値の規則が
+        // 未確定のため拒否のまま（Issue #1580。`resolve_order_kind` を呼ぶ前に明示的に拒否する）。
+        if matches!(def.ty, ColumnType::Interval) {
+            return Err(reject());
+        }
         let kind = resolve_order_kind(&def.ty).ok_or_else(reject)?;
         let collation = crate::collation::Collation::effective(None, def.collation);
         collation.ensure_available()?;
@@ -7741,6 +7755,7 @@ pub(crate) fn check_having_target_is_numeric(
                 | AggregateInput::TimestampColumn(_)
                 | AggregateInput::TimeColumn(_)
                 | AggregateInput::TimestampTzColumn(_)
+                | AggregateInput::IntervalColumn(_)
         );
     if is_unsupported {
         return Err(SqlSurfaceError::invalid_input(format!(
@@ -7976,7 +7991,8 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
             | AggregateInput::IdU64
             | AggregateInput::IntegerColumn(_)
             | AggregateInput::SmallIntColumn(_)
-            | AggregateInput::BigIntColumn(_) => EXPR_UNSUPPORTED_COLUMN_TYPE,
+            | AggregateInput::BigIntColumn(_)
+            | AggregateInput::IntervalColumn(_) => EXPR_UNSUPPORTED_COLUMN_TYPE,
             _ => ColumnType::Double,
         },
         AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => match &item.input {
