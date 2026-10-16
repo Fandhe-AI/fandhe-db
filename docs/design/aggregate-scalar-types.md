@@ -41,7 +41,7 @@
 > （`Accumulator::BigIntSum`）。`22003` は 38 桁超過のみ。`SUM(INTEGER)` は従来どおり `bigint` で、
 > 以下の確定時判定が適用される。単純形 `HAVING`・`ORDER BY` は厳密比較（`i128`）で互換を保つ。
 > 式内（投影式・`HAVING` 式・`ORDER BY` 式）の `SUM(BIGINT)` は numeric 算術未対応のため `22000` で
-> 拒否し（算術は #1810 の範囲）、バイナリ結果形式は numeric 非対応（WIRE-14）のため `0A000` になる。
+> 拒否し（算術は #1810 の範囲）、バイナリ結果形式は numeric（`numeric_send`）で送出できる（Issue #2442。WIRE-14・WIRE-26。実クライアントでの値一致は #2445）。
 > スカラーサブクエリは scale 0 の numeric と整数列の比較を許可する。
 
 `SUM(INTEGER)` の結果は `Cell::SignedInteger(i64)`（`BIGINT` 相当）。累積は `i128` の
@@ -71,8 +71,8 @@
 > - `GROUP BY` の `ORDER BY` は `cmp_exact`、単純形 `HAVING` は `Decimal` と `f64` リテラル
 >   （最短往復表現の 10 進として読む）の厳密比較にする（scale 不一致で黙って縮退させない）。
 > - 式内（投影式・`HAVING` 式・`ORDER BY` 式）の整数 `AVG` は numeric 算術が未対応のため
->   `22000` で拒否する（算術は #1810・#1812 の範囲）。バイナリ結果形式は numeric 非対応
->   （WIRE-14）のため `0A000`（#2441・#2442）。
+>   `22000` で拒否する（算術は #1810・#1812 の範囲）。バイナリ結果形式は numeric で送出できる
+>   （Issue #2442。WIRE-14・WIRE-26）。
 > - スカラーサブクエリ比較は端数のある numeric を整数列とは floor による厳密な整数比較、
 >   浮動小数列とは `f64` 変換で比べる。
 > - `UNION` 等の重複排除キーは numeric の末尾の小数部ゼロを除き、scale だけが異なる等しい値を

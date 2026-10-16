@@ -22,9 +22,15 @@
 //! - `$n` の受理位置は限定されるため C4（`hybrid_rrf` 関数引数）は `$n` を持てず、
 //!   パラメータ 0 個の拡張プロトコルで送る。関数引数への `$n` は `42601` で拒否される
 //!   ことを負のケースとして固定する。
-//! - `id` 列は numeric（OID 1700）で、結果のバイナリ送出は Issue #2442 で対応済み。
-//!   実クライアントでの numeric バイナリ受信の正例は #2445 が検証する。本ファイルの
-//!   バイナリ受信検証は `id`・VECTOR を投影しない型付きテーブル（`typed_items`）で行う。
+//! - `id` 列は numeric（OID 1700）で、結果のバイナリ送出は Issue #2442、パラメータの
+//!   バイナリ受信は #2443 で対応済み。実クライアントでの numeric のバイナリ結果・
+//!   バイナリパラメータの値一致は Issue #2445（WIRE-14・WIRE-26・TABLE-13）として本ファイルの
+//!   `numeric_items` 系テストが検証する。`typed_items` は `id`・VECTOR を投影しない
+//!   非 numeric 列の検証用。
+//! - numeric のドライバ差: psycopg は text／binary とも `Decimal`（dscale 保持）。node pg は
+//!   text が `string`、既定のバイナリ parser が JS の `number`（精度は double 相当）になる。
+//!   node は値部の一致（数値・文字列表記）で比較し、型タグの差は別にアサートする。
+//!   node の UTF-8 往復制約は numeric では `weight >= 0` かつ桁群の下位バイト `< 0x80`。
 //! - node pg のバイナリ受信は DataRow を UTF-8 文字列として読むため、0x80 以上の
 //!   バイトを含む値は壊れる。3 クライアント共通行（行 A）は全送信バイトが `< 0x80` の
 //!   値に限定し、その制約を非 ignore テスト（[`node_binary_fixture_bytes_are_utf8_safe`]）
@@ -52,6 +58,7 @@ use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::Value;
 use engine::storage::{Storage, Visibility};
 use engine::uuid::Uuid;
+use wire_server::result_encoder::binary;
 
 // --- fixture（seed とガードテストで共有する定数） -------------------------------
 
@@ -80,6 +87,39 @@ const B_LABEL: &str = "psycopg-wide-row";
 
 /// 行 C（RLS 用。tenant-a の Private 行）。
 const SECRET_LABEL: &str = "secret-a";
+
+/// `numeric_items`（Issue #2445。numeric のバイナリ結果・バイナリパラメータ用）。
+/// 行 NA（3 クライアント共通。node pg のバイナリ制約を満たす）。
+const NA_LABEL: &str = "num-shared";
+const NA_ID: u64 = 20;
+const NA_QTY: i32 = 7;
+const NA_AMOUNT: &str = "3.14";
+const NA_DELTA: &str = "-1.01";
+/// 行 NB（psycopg 専用。負の weight・末尾ゼロ・高位バイトを含む）。
+const NB_LABEL: &str = "num-wide";
+const NB_ID: u64 = 21;
+const NB_AMOUNT: &str = "0.50";
+const NB_DELTA: &str = "-12345678.90";
+const NB_WIDE: &str = "123456789012345678901234567.8901234567";
+/// 行 NC（RLS 用。tenant-a の Private 行）。
+const NC_LABEL: &str = "num-secret";
+const NC_ID: u64 = 22;
+const NC_AMOUNT: &str = "42.42";
+/// `SUM(typed_items.b)`（numeric(38,0)）の期待値。
+const SUM_B_TEXT: &str = "9000000000";
+
+/// 全列に別名を付ける（node pg は `Object.values(row)` で同名列が潰れる）。
+const NUMERIC_SQL: &str =
+    "SELECT id AS i, amount AS a, delta AS d FROM numeric_items WHERE label = $1 LIMIT 10";
+const NUMERIC_WIDE_SQL: &str = "SELECT wide AS w FROM numeric_items WHERE label = $1 LIMIT 10";
+const NUMERIC_SUM_SQL: &str =
+    "SELECT SUM(amount) AS s_a FROM numeric_items WHERE label = 'num-shared'";
+const NUMERIC_AVG_SQL: &str =
+    "SELECT AVG(qty) AS a_q FROM numeric_items WHERE label = 'num-shared'";
+const NUMERIC_SUM_B_SQL: &str = "SELECT SUM(b) AS s_b FROM typed_items WHERE label = 'shared-row'";
+const NUMERIC_SUM_ALL_SQL: &str = "SELECT SUM(amount) AS s_a FROM numeric_items";
+const NUMERIC_BY_AMOUNT_SQL: &str = "SELECT label FROM numeric_items WHERE amount = $1 LIMIT 10";
+const NUMERIC_BY_ID_SQL: &str = "SELECT label FROM numeric_items WHERE id = $1 LIMIT 10";
 
 /// C1〜C3（`three_client_e2e.rs` と同じ意味論の `$n` 版）。
 const C1_SQL: &str = "SELECT id FROM docs ORDER BY embedding <=> $1 LIMIT 3";
@@ -298,6 +338,95 @@ fn seed_db() -> (PathBuf, temp_db::CleanupGuard) {
         )
         .expect("insert typed row");
     }
+
+    // numeric 用の表（Issue #2445）。値は列の scale へ丸めた `Decimal` で投入する。
+    storage
+        .create_table(&TableSchema::new(
+            "numeric_items",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("label", ColumnType::Text, false),
+                ColumnDef::new("qty", ColumnType::Integer, true),
+                ColumnDef::new(
+                    "amount",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+                ColumnDef::new(
+                    "delta",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+                ColumnDef::new(
+                    "wide",
+                    ColumnType::Numeric {
+                        precision: 38,
+                        scale: 10,
+                    },
+                    true,
+                ),
+            ],
+        ))
+        .expect("create numeric_items");
+    let num = |text: &str, p: u8, s: u8| {
+        Value::Numeric(engine::numeric::parse_for_column(text, p, s).expect("valid numeric"))
+    };
+    let numeric_rows = [
+        (
+            NA_ID,
+            Visibility::Public,
+            vec![
+                Value::Vector(vec![1.0, 0.0]),
+                Value::Text(NA_LABEL.to_string()),
+                Value::Integer(NA_QTY),
+                num(NA_AMOUNT, 10, 2),
+                num(NA_DELTA, 10, 2),
+                Value::Null,
+            ],
+        ),
+        (
+            NB_ID,
+            Visibility::Public,
+            vec![
+                Value::Vector(vec![1.0, 0.0]),
+                Value::Text(NB_LABEL.to_string()),
+                Value::Integer(1),
+                num(NB_AMOUNT, 10, 2),
+                num(NB_DELTA, 10, 2),
+                num(NB_WIDE, 38, 10),
+            ],
+        ),
+        (
+            NC_ID,
+            Visibility::Private,
+            vec![
+                Value::Vector(vec![1.0, 0.0]),
+                Value::Text(NC_LABEL.to_string()),
+                Value::Integer(1),
+                num(NC_AMOUNT, 10, 2),
+                Value::Null,
+                Value::Null,
+            ],
+        ),
+    ];
+    for (id, vis, row) in numeric_rows {
+        engine::tenant::insert_typed_row(
+            &storage,
+            "numeric_items",
+            &ctx_a,
+            id,
+            vis,
+            &row,
+            &op(&format!("ext-e2e-numeric-op-{id}")),
+        )
+        .expect("insert numeric row");
+    }
     (path, guard)
 }
 
@@ -320,6 +449,35 @@ struct Opts {
     binary: bool,
     /// psycopg のみ: `params` を Python `int`（バイナリパラメータ）として束縛する。
     int_params: bool,
+    /// psycopg のみ: `params` を `Decimal`（numeric のバイナリパラメータ）として束縛する。
+    decimal_params: bool,
+    /// node pg のみ: `params` を `numeric_send` の hex として `Buffer`（format 1・宣言
+    /// OID 0）で束縛する。
+    binary_hex_params: bool,
+}
+
+/// numeric の 10 進テキスト（例 `-1.01`）を PG の `numeric_send` と同じバイト列（hex）へ
+/// 符号化する。符号化器は #2444 で PG17 とバイト一致を確認済みのもの（node pg には numeric の
+/// バイナリ Dumper が無く、JS で符号化を再実装しないための橋渡し）。
+fn numeric_send_bytes(text: &str) -> Vec<u8> {
+    let (neg, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    let scale = u8::try_from(frac_part.len()).expect("scale fits u8");
+    let mag: u128 = format!("{int_part}{frac_part}")
+        .parse()
+        .expect("numeric fixture is a plain decimal");
+    let (buf, n) = binary::numeric(neg, mag, scale).expect("encode numeric");
+    buf[..n].to_vec()
+}
+
+fn numeric_send_hex(text: &str) -> String {
+    numeric_send_bytes(text)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// `["a","b"]` 形式の最小 JSON エンコーダ。`\`・制御文字を含む文字列は拒否する
@@ -427,7 +585,14 @@ fn spawn_psycopg_ext(
         .env("WIRE_USER", user)
         .env("WIRE_PASSWORD", password)
         .env("WIRE_SQL", sql);
-    if opts.int_params {
+    assert!(!opts.binary_hex_params, "binary_hex_params is node pg only");
+    if opts.decimal_params {
+        assert!(
+            !opts.int_params,
+            "decimal_params and int_params are exclusive"
+        );
+        cmd.env("WIRE_PARAMS_DECIMAL", json_string_array(params));
+    } else if opts.int_params {
         cmd.env("WIRE_PARAMS_INT", format!("[{}]", params.join(",")));
     } else if !params.is_empty() {
         cmd.env("WIRE_PARAMS", json_string_array(params));
@@ -458,7 +623,13 @@ fn spawn_pg_ext(
         .env("WIRE_USER", user)
         .env("WIRE_PASSWORD", password)
         .env("WIRE_SQL", sql);
-    if !params.is_empty() {
+    assert!(
+        !opts.decimal_params && !opts.int_params,
+        "decimal_params/int_params are psycopg only"
+    );
+    if opts.binary_hex_params {
+        cmd.env("WIRE_PARAMS_BINARY_HEX", json_string_array(params));
+    } else if !params.is_empty() {
         cmd.env("WIRE_PARAMS", json_string_array(params));
     } else {
         cmd.env("WIRE_EXTENDED_NOPARAM", "1");
@@ -482,6 +653,10 @@ fn spawn_client(
     match client {
         Client::Psql => {
             assert!(!opts.binary, "psql has no binary-result mode");
+            assert!(
+                !opts.decimal_params && !opts.binary_hex_params && !opts.int_params,
+                "psql has no binary parameter mode"
+            );
             spawn_psql_bind(port, user, password, sql, params, false)
         }
         Client::Psycopg => spawn_psycopg_ext(port, user, password, sql, params, opts),
@@ -992,6 +1167,332 @@ fn three_clients_keep_fail_closed_contracts_on_extended_path() {
         );
     }
     drop(server);
+}
+
+/// node pg の numeric 結果の比較（text は `string`、バイナリは既定 parser により `number`）。
+/// 型タグの差を別にアサートしたうえで、値部の文字列表記が同一で `f64` としても一致すること
+/// を確認する（値は末尾ゼロなし・有効桁 15 以下に限る fixture）。
+fn assert_node_numeric_match(text: &[String], binary: &[String], want: &[&str], what: &str) {
+    let tagged = |tag: &str| -> Vec<String> {
+        want.iter()
+            .map(|row| {
+                row.split('|')
+                    .map(|v| format!("{tag}:{v}"))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    };
+    assert_eq!(text, tagged("string"), "pg text numeric tags: {what}");
+    assert_eq!(binary, tagged("number"), "pg binary numeric tags: {what}");
+    let (t, b) = (untag(text), untag(binary));
+    assert_eq!(t, b, "pg numeric value text: {what}");
+    for (tr, br) in t.iter().zip(b.iter()) {
+        for (tv, bv) in tr.split('|').zip(br.split('|')) {
+            let (tf, bf) = (
+                tv.parse::<f64>().expect("numeric text parses as f64"),
+                bv.parse::<f64>().expect("numeric number parses as f64"),
+            );
+            assert_eq!(tf, bf, "pg numeric value as f64: {what}");
+        }
+    }
+}
+
+/// numeric（結果列・`id`・集計）のバイナリ結果が、テキスト結果および psql のテキストと
+/// 値で一致すること（Issue #2445・WIRE-14・WIRE-26・TABLE-13）。psycopg は text／binary とも
+/// `Decimal`（dscale 保持）で完全一致、node pg は text=`string`／binary=`number`（値部一致）。
+/// bob のバイナリ集計は tenant-a の Private 行を数えない（テナント境界）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn psycopg_and_pg_numeric_binary_results_match_text_results() {
+    let (db_path, _db_guard) = seed_db();
+    let users_dir = temp_db::TempDir::new("three-client-ext-numeric-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+    let server = spawn_wire_server(&users_path, &db_path);
+    let port = server.port;
+    let d = Opts::default();
+    let bin = Opts { binary: true, ..d };
+    let run = |client: Client, user: &str, pw: &str, sql: &str, params: &[&str], o: Opts| {
+        run_ext(client, port, user, pw, sql, params, o)
+    };
+
+    // 独立オラクル: psql のテキスト（PostgreSQL 正準表記）。
+    let oracle_row = format!("{NA_ID}|{NA_AMOUNT}|{NA_DELTA}");
+    assert_eq!(
+        run(
+            Client::Psql,
+            "alice",
+            "pw-alice",
+            NUMERIC_SQL,
+            &[NA_LABEL],
+            d
+        ),
+        vec![oracle_row.clone()]
+    );
+    assert_eq!(
+        run(Client::Psql, "alice", "pw-alice", NUMERIC_SUM_SQL, &[], d),
+        vec![NA_AMOUNT.to_string()]
+    );
+    assert_eq!(
+        run(Client::Psql, "alice", "pw-alice", NUMERIC_SUM_B_SQL, &[], d),
+        vec![SUM_B_TEXT.to_string()]
+    );
+
+    // psycopg: 行 NA・NB・集計はバイナリ == テキスト（型タグ込み）かつ期待値と一致。
+    let psycopg_cases: [(&str, Vec<&str>, String); 6] = [
+        (
+            NUMERIC_SQL,
+            vec![NA_LABEL],
+            format!("Decimal:{NA_ID}|Decimal:{NA_AMOUNT}|Decimal:{NA_DELTA}"),
+        ),
+        (
+            NUMERIC_SQL,
+            vec![NB_LABEL],
+            format!("Decimal:{NB_ID}|Decimal:{NB_AMOUNT}|Decimal:{NB_DELTA}"),
+        ),
+        (
+            NUMERIC_WIDE_SQL,
+            vec![NB_LABEL],
+            format!("Decimal:{NB_WIDE}"),
+        ),
+        (NUMERIC_SUM_SQL, vec![], format!("Decimal:{NA_AMOUNT}")),
+        (NUMERIC_AVG_SQL, vec![], "Decimal:7.0000000000000000".into()),
+        (NUMERIC_SUM_B_SQL, vec![], format!("Decimal:{SUM_B_TEXT}")),
+    ];
+    for (sql, params, want) in &psycopg_cases {
+        let text = run(Client::Psycopg, "alice", "pw-alice", sql, params, d);
+        let binary = run(Client::Psycopg, "alice", "pw-alice", sql, params, bin);
+        assert_eq!(binary, text, "psycopg: binary must equal text: `{sql}`");
+        assert_eq!(binary, vec![want.clone()], "psycopg: values: `{sql}`");
+    }
+
+    // node pg: 行 NA と node-safe な集計（値部一致。型は string／number）。
+    let node_cases: [(&str, Vec<&str>, &str); 3] = [
+        (NUMERIC_SQL, vec![NA_LABEL], oracle_row.as_str()),
+        (NUMERIC_SUM_SQL, vec![], NA_AMOUNT),
+        (NUMERIC_SUM_B_SQL, vec![], SUM_B_TEXT),
+    ];
+    for (sql, params, want) in &node_cases {
+        let text = run(Client::Pg, "alice", "pw-alice", sql, params, d);
+        let binary = run(Client::Pg, "alice", "pw-alice", sql, params, bin);
+        assert_node_numeric_match(&text, &binary, &[*want], sql);
+    }
+
+    // テナント境界: Public の NA・NB だけが bob に見え（SUM = 3.64）、alice には NC（42.42）も
+    // 加わる（46.06）。バイナリでも同じで、bob は Private 行の値を観測できない。
+    for client in [Client::Psycopg, Client::Pg] {
+        let bob = untag(&run(client, "bob", "pw-bob", NUMERIC_SUM_ALL_SQL, &[], bin));
+        assert_eq!(bob, s(&["3.64"]), "{client:?}: bob must not sum NC");
+        let alice = untag(&run(
+            client,
+            "alice",
+            "pw-alice",
+            NUMERIC_SUM_ALL_SQL,
+            &[],
+            bin,
+        ));
+        assert_eq!(alice, s(&["46.06"]), "{client:?}: alice sums NA+NB+NC");
+        let secret = run(client, "bob", "pw-bob", NUMERIC_SQL, &[NC_LABEL], bin);
+        assert!(
+            secret.is_empty(),
+            "{client:?}: bob must not read NC: {secret:?}"
+        );
+    }
+    let alice_nc = untag(&run(
+        Client::Psycopg,
+        "alice",
+        "pw-alice",
+        NUMERIC_SQL,
+        &[NC_LABEL],
+        bin,
+    ));
+    assert_eq!(alice_nc[0].split('|').nth(1), Some(NC_AMOUNT));
+    drop(server);
+}
+
+/// numeric のバイナリパラメータ（psycopg の `Decimal`＋`DecimalBinaryDumper`、node pg の
+/// `numeric_send` Buffer）が、テキストパラメータと同じ行を引き当てること、INSERT で
+/// 保存でき RLS が維持されること、不正値は fail-closed であること（WIRE-26・WIRE-14）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn psycopg_and_pg_numeric_binary_params_match_text_params() {
+    let (db_path, _db_guard) = seed_db();
+    let users_dir = temp_db::TempDir::new("three-client-ext-numeric-param-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+    let server = spawn_wire_server(&users_path, &db_path);
+    let port = server.port;
+    let d = Opts::default();
+    let dec = Opts {
+        decimal_params: true,
+        ..d
+    };
+    let hex = Opts {
+        binary_hex_params: true,
+        ..d
+    };
+
+    // 読み取り: `NUMERIC` 列スロット（宣言 1700／0）と `id` スロット。
+    let reads: [(&str, &str, &str); 3] = [
+        (NUMERIC_BY_AMOUNT_SQL, NA_AMOUNT, NA_LABEL),
+        (NUMERIC_BY_AMOUNT_SQL, NB_AMOUNT, NB_LABEL),
+        (NUMERIC_BY_ID_SQL, "20", NA_LABEL),
+    ];
+    for (sql, param, label) in reads {
+        let want = s(&[label]);
+        let hexed = numeric_send_hex(param);
+        let psql = run_ext(Client::Psql, port, "alice", "pw-alice", sql, &[param], d);
+        assert_eq!(psql, want, "psql text param `{param}`");
+        for (client, o, p) in [
+            (Client::Psycopg, d, param),
+            (Client::Psycopg, dec, param),
+            (Client::Pg, d, param),
+            (Client::Pg, hex, hexed.as_str()),
+        ] {
+            let rows = untag(&run_ext(client, port, "alice", "pw-alice", sql, &[p], o));
+            assert_eq!(rows, want, "{client:?}: param `{param}` ({sql})");
+        }
+    }
+
+    // テナント境界: NC（Private）の値を bob がバイナリパラメータで引いても 0 行。
+    // alice は同じ問い合わせで引ける（非 vacuous）。
+    let nc_hex = numeric_send_hex(NC_AMOUNT);
+    for (client, o, p) in [
+        (Client::Psycopg, dec, NC_AMOUNT),
+        (Client::Pg, hex, nc_hex.as_str()),
+    ] {
+        let alice = untag(&run_ext(
+            client,
+            port,
+            "alice",
+            "pw-alice",
+            NUMERIC_BY_AMOUNT_SQL,
+            &[p],
+            o,
+        ));
+        assert_eq!(alice, s(&[NC_LABEL]), "{client:?}: alice finds NC");
+        let bob = run_ext(
+            client,
+            port,
+            "bob",
+            "pw-bob",
+            NUMERIC_BY_AMOUNT_SQL,
+            &[p],
+            o,
+        );
+        assert!(bob.is_empty(), "{client:?}: bob must not find NC: {bob:?}");
+    }
+
+    // 書き込み: numeric 1 個だけを束縛した INSERT。psql のテキストで読み戻す。
+    let inserted_amount = "5.25";
+    let inserted_hex = numeric_send_hex(inserted_amount);
+    for (client, o, p, id, tag) in [
+        (Client::Psycopg, dec, inserted_amount, 31, "psycopg"),
+        (Client::Pg, hex, inserted_hex.as_str(), 32, "pg"),
+    ] {
+        let label = format!("num-ins-{tag}");
+        let sql = format!(
+            "INSERT INTO numeric_items (id, embedding, label, amount) \
+             VALUES ({id}, '[1.0,0.0]', '{label}', $1) USING OPERATION_ID 'ext-e2e-num-ins-{tag}'"
+        );
+        let out = run_ext(client, port, "alice", "pw-alice", &sql, &[p], o);
+        assert!(
+            out.is_empty(),
+            "{client:?}: INSERT returns no rows: {out:?}"
+        );
+        let readback = run_ext(
+            Client::Psql,
+            port,
+            "alice",
+            "pw-alice",
+            "SELECT amount FROM numeric_items WHERE label = $1 LIMIT 10",
+            &[&label],
+            d,
+        );
+        assert_eq!(readback, s(&[inserted_amount]), "{client:?}: stored amount");
+        for (other, pw) in [("bob", "pw-bob"), ("carol", "pw-carol")] {
+            let rows = run_ext(
+                Client::Psql,
+                port,
+                other,
+                pw,
+                "SELECT amount FROM numeric_items WHERE label = $1 LIMIT 10",
+                &[&label],
+                d,
+            );
+            assert!(
+                rows.is_empty(),
+                "{other} must not see alice's row: {rows:?}"
+            );
+        }
+    }
+
+    // 負例: 不正な桁群（`[10000]`。ndigits=1・weight=0・sign=0・dscale=0）は 22P03。
+    expect_sqlstate(
+        Client::Pg,
+        port,
+        "alice",
+        "pw-alice",
+        NUMERIC_BY_AMOUNT_SQL,
+        &["00010000000000002710"],
+        hex,
+        "22P03",
+    );
+    // NaN はテキストで送った場合と同じ SQLSTATE（22P02）。
+    expect_sqlstate(
+        Client::Psycopg,
+        port,
+        "alice",
+        "pw-alice",
+        NUMERIC_BY_AMOUNT_SQL,
+        &["NaN"],
+        d,
+        "22P02",
+    );
+    expect_sqlstate(
+        Client::Psycopg,
+        port,
+        "alice",
+        "pw-alice",
+        NUMERIC_BY_AMOUNT_SQL,
+        &["NaN"],
+        dec,
+        "22P02",
+    );
+    drop(server);
+}
+
+/// fixture ガード（常時実行・numeric 版）: node pg 共通の numeric 値（行 NA・`id`・集計）の
+/// 送出バイトが全て `< 0x80` で、行 NB が高位バイトを含むこと。node 用の値は `f64` へ
+/// 往復しても同じ表記（JS の `number` で厳密に表せる）であること。
+#[test]
+fn node_numeric_fixture_bytes_are_utf8_safe() {
+    let node_values = [
+        NA_ID.to_string(),
+        NA_AMOUNT.to_string(),
+        NA_DELTA.to_string(),
+        SUM_B_TEXT.to_string(),
+        "3.64".to_string(),
+        "46.06".to_string(),
+    ];
+    for v in &node_values {
+        let bytes = numeric_send_bytes(v);
+        assert!(
+            bytes.iter().all(|b| *b < 0x80),
+            "node-shared numeric {v} must be binary safe: {bytes:?}"
+        );
+        let f: f64 = v.parse().expect("f64");
+        assert_eq!(&f.to_string(), v, "{v} must round-trip through a JS number");
+    }
+    let wide: Vec<u8> = [NB_AMOUNT, NB_DELTA, NB_WIDE]
+        .iter()
+        .flat_map(|v| numeric_send_bytes(v))
+        .collect();
+    assert!(
+        wide.iter().any(|b| *b >= 0x80),
+        "row NB must exercise high bytes"
+    );
 }
 
 /// fixture ガード（常時実行）: 行 A の送信形式（バイナリ）が全バイト `< 0x80` であること
