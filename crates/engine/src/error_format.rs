@@ -7,7 +7,9 @@
 //! 分散し、決定的分類（同一入力に常に同一 `wire_code`）・一意対応（分類⇔`wire_code`）が
 //! 構造的に保証されない状態を防ぐことが目的。
 //!
-//! 収録範囲は「engine・wire-server が現に返している `wire_code`」を基本とし、TASK-153
+//! 収録範囲は「engine・wire-server が現に返している `wire_code`」を基本とし（engine の公開 API
+//! である jsonpath 評価器〔Issue #2184〕から返る `2203x` 系を含む。SQL／NoSQL 表層への接続は
+//! #2185／#2186）、TASK-153
 //! （対象ビヘイビア ERR-1）が wire-server 側の横断写像（`wire-server/src/
 //! error_response.rs`）の網羅対象として `AuthRequired`（`28000`）を追加した。送出経路は
 //! TASK-174／HTTP-8（Issue #753）で wire-server の `http::session::close`／`http::
@@ -92,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 50;
+    count = 57;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -348,6 +350,25 @@ define_error_classes! {
     /// `jsonb_build_object` のキーが NULL の場合に返す。値・キー名は応答に含めない。
     /// [`crate::sql::allowlist::SqlSurfaceError::NullValueNotAllowed`] の写像。
     NullValueNotAllowed => ("22004", "NULL_VALUE_NOT_ALLOWED"),
+    /// jsonpath の配列添字が不正（`22033`。Issue #2184・TABLE-25 のポインタ）。strict で
+    /// 添字が範囲外・数値でない場合に jsonpath 評価器が返す。添字の値は応答に含めない。
+    JsonSubscriptInvalid => ("22033", "JSON_SUBSCRIPT_INVALID"),
+    /// jsonpath の項目メソッドが数値（または文字列）以外に適用された（`22036`。Issue #2184）。
+    /// `.bigint()`・`.integer()`・`.double()` 等の型違い・範囲外変換で評価器が返す。
+    NonNumericJsonItem => ("22036", "NON_NUMERIC_JSON_ITEM"),
+    /// jsonpath の算術オペランドが単一の数値項目でない（`22038`。Issue #2184）。
+    /// `jsonb_path_match` 相当の「単一の bool が必要」違反にも使う。
+    SingletonJsonItemRequired => ("22038", "SINGLETON_JSON_ITEM_REQUIRED"),
+    /// jsonpath の配列アクセサ・`.size()` が配列以外に適用された（`22039`。Issue #2184）。
+    JsonArrayNotFound => ("22039", "JSON_ARRAY_NOT_FOUND"),
+    /// jsonpath のメンバーアクセサがキー欠落で空になった（`2203A`。Issue #2184）。strict のみ。
+    /// キー名は応答に含めない。
+    JsonMemberNotFound => ("2203A", "JSON_MEMBER_NOT_FOUND"),
+    /// jsonpath の単項算術・`.abs()` 等が数値以外に適用された（`2203B`。Issue #2184）。
+    JsonNumberNotFound => ("2203B", "JSON_NUMBER_NOT_FOUND"),
+    /// jsonpath のメンバーアクセサ・`.keyvalue()` がオブジェクト以外に適用された
+    /// （`2203C`。Issue #2184）。
+    JsonObjectNotFound => ("2203C", "JSON_OBJECT_NOT_FOUND"),
 }
 
 impl ErrorClass {
