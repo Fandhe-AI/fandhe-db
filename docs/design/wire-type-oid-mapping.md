@@ -71,7 +71,7 @@ variant 名・型名は既存 `Int4`/`Int8` に倣い PostgreSQL の `typname` �
 | `id` 列 | `numeric`（OID 1700, typlen -1）のまま | engine の行 ID は `u64` 全域（`u64::MAX` を含む）を有効値とし、符号付き 64bit の `int8`（OID 20）ではこれを表現できない（PR #210 レビュー指摘）。受入基準 3（既存の `id` 公告不変）とも整合する |
 | `VECTOR(N)`／`ARRAY`／`ENUM` | `text`（OID 25, typlen -1）のまま | 専用 OID を持たない実装既定値。値そのものはテキスト表現（`[v1,v2,...]`・`{a,b}`・ラベル文字列）のまま変わらない |
 | `ColumnMeta::Computed`（式・集計結果） | 本 Issue 時点では `text`（OID 25）のまま。**Issue #1173 で型付き OID へ更新済み**（下記「集計・式列の型」） | 静的な型情報を持たなかったため（当時） |
-| バイナリ形式（WIRE-14） | `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／`BOOLEAN`／`BYTEA`／`UUID` は Issue #1172、`TIME` は Issue #1571（0 時起点マイクロ秒の 8 バイト BE）でバイナリ対応（`docs/design/wire-binary-format.md`「Issue #1172 追記」「Issue #1571 追記」参照）。`DATE`／`TIMESTAMP`／`JSON`／`JSONB`／`NUMERIC`／`id`／配列／`ENUM`／`VECTOR`／`Computed` は引き続き `supports_binary` / `column_binary_support` が `false`（fail-closed・`0A000`） | 対応拡大は WIRE-14・TASK-218・Issue #1172 で実施済み。float4 の縮小は無損失検査つき |
+| バイナリ形式（WIRE-14） | `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／`BOOLEAN`／`BYTEA`／`UUID` は Issue #1172、`TIME` は Issue #1571（0 時起点マイクロ秒の 8 バイト BE）でバイナリ対応（`docs/design/wire-binary-format.md`「Issue #1172 追記」「Issue #1571 追記」参照）。`NUMERIC`／`id` は Issue #2442（結果）・#2443（パラメータ）でバイナリ対応（WIRE-26。実クライアントでの値一致は Issue #2445）。`DATE`／`TIMESTAMP`／`JSON`／`JSONB`／配列／`ENUM`／`VECTOR`／`Computed{ty: None}` は引き続き `supports_binary` / `column_binary_support` が `false`（fail-closed・`0A000`） | 対応拡大は WIRE-14・TASK-218・Issue #1172 で実施済み。float4 の縮小は無損失検査つき |
 | typmod | `VARCHAR(n)`／`CHAR(n)` は `n + 4`、他は `-1` | Issue #1565（TABLE-31）。`NUMERIC(p,s)` の typmod 符号化は未採用。長さの異なる TEXT 系を合成する集合演算は左の長さを外して `-1`（過小公告の防止）。`CHAR(n)` は bpchar（OID 1042）で、text／varchar スロットへの宣言 OID 1042 のバイナリ入力は末尾空白の意味差があるため `0A000` のまま |
 | REAL のテキスト表現 | 本 Issue 時点では変更しない。**Issue #1173 で PostgreSQL の float4 出力形式へ更新済み**（`0.1` → `0.1`・`1e6` → `1e+06`） | 当時は `Cell::Float(f64::from(f32))` の `to_string()` により `0.1f32` が `0.10000000149011612` になっていた |
 
@@ -98,7 +98,7 @@ format_type` 呼び出しをサーバーへ要求するため本サーバー（`
 ## 申し送り
 
 - 新型のバイナリ形式対応拡大 → WIRE-14・TASK-218 の後続として別途追跡
-- `id`（`numeric`）のバイナリ対応拡大 → spec 側で未策定のため引き続き未実施
+- `id`（`numeric`）・`NUMERIC` のバイナリ対応拡大 → Issue #2442（結果）・#2443（パラメータ）で対応済み（WIRE-26 のポインタ）
 - `Computed`（集計・式列）への型情報付与とそれに伴う OID 公告 → Issue #1173 で
   対応済み（下記「集計・式列の型」）
 - 層 B（3 クライアントでの型復元）→ **Issue #1176 で実施済み**

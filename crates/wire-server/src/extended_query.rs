@@ -86,7 +86,8 @@
 //! - Bind のパラメータ binary 値の長さ不正（Issue #1345・WIRE-14）
 //!   → `08P01`（`ProtocolViolation`）
 //! - Bind のパラメータ format code が binary（1）で対象スロットが復号非対応
-//!   （int4/int8/float4/float8/bool/bytea/uuid・text 系以外。WIRE-12・#1171・
+//!   （int4/int8/float4/float8/bool/bytea/uuid・numeric〔Issue #2443。`NUMERIC` 列・`id` スロット〕・
+//!   time/timestamptz・text 系以外。WIRE-12・#1171・
 //!   #1345）・結果 format code が非対応型の列を
 //!   binary 指定（WIRE-14・[`result_encoder::column_binary_support`]）・
 //!   Describe(Portal) 対象の受理不能・実行結果列の不整合（いずれも `0A000`

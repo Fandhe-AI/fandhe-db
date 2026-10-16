@@ -964,12 +964,22 @@ psycopg_extended.py`・`pg_extended.js` を追加した。簡易クエリ経路�
   f32 厳密表現を常時実行の `node_binary_fixture_bytes_are_utf8_safe` で機械検証する。
   負数・高位バイトの行 B は psycopg のみで検証する。node の bytea／uuid は公開 API
   `pg.types.setTypeParser` で parser を登録する（ドライバ無改造）。
-- **負のケース**: 受理位置外 `$n` → `42601`、numeric（`id`）を含むバイナリ要求 →
-  `0A000`、非 text スロットのバイナリパラメータ（psycopg の Python `int`）→ `0A000`、
+- **numeric のバイナリ（Issue #2445・WIRE-14・WIRE-26・TABLE-13）**: `numeric_items` 表で、
+  結果列・`id`・`SUM`／`AVG`・`SUM(BIGINT)` のバイナリ受信（`psycopg_and_pg_numeric_binary_results_match_text_results`）
+  と、`NUMERIC` 列・`id` スロットへのバイナリパラメータの読み取り・INSERT・不正値の拒否
+  （`..._binary_params_match_text_params`）を検証する。psql のテキストを独立オラクルとし、
+  psycopg は `Decimal` で text／binary を型タグ込みで完全一致、node pg は text=`string`／
+  binary=`number`（pg-types 既定の 1700 parser）で値部を比較する。psycopg のバイナリ送信は
+  `register_dumper(Decimal, DecimalBinaryDumper)`、node pg は `numeric_send` の `Buffer`
+  （format 1・宣言 OID 0）。node の UTF-8 制約は `weight >= 0` かつ桁群の下位バイト `< 0x80`
+  で、`node_numeric_fixture_bytes_are_utf8_safe` が機械検証する。bob のバイナリ集計・パラメータが
+  Private 行を観測しないことも確認する。
+- **負のケース**: 受理位置外 `$n` → `42601`、静的型を持たないベクトル式（`vec_div`）を含むバイナリ要求 →
+  `0A000`（numeric は #2442 で対応済みのため負例に使わない）、非 text スロットのバイナリパラメータ（psycopg の Python `int`）→ `0A000`、
   Private 行の他テナント非可視、`' OR '1'='1` 束縛が不透明リテラルのまま 0 行。
 
 実行結果（本開発環境）: psql 18.6・psycopg 3.3.6・node v24.13.0 + pg 8.23.0 で
-`--ignored` 5 件 green、非 ignore の fixture ガード 1 件 green。
+`--ignored` 8 件 green（numeric の層 B 2 件〔Issue #2445〕を含む）、非 ignore の fixture ガード 2 件 green。
 
 ## 分割実行 DML の 3 クライアント検証（Issue #1339・SQL-32）
 

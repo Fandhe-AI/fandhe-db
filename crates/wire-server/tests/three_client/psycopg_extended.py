@@ -14,6 +14,11 @@ node pg と同一の SQL 定数を 3 クライアントで共有できる（既�
 - WIRE_PARAMS（任意）: 文字列の JSON 配列（テキストパラメータとして束縛）。
 - WIRE_PARAMS_INT（任意）: 整数の JSON 配列。Python `int` はバイナリパラメータとして
   送られるため、非 text スロットのバイナリ束縛が `0A000` で拒否される負のケースに使う。
+- WIRE_PARAMS_DECIMAL（任意）: 文字列の JSON 配列。各要素を `decimal.Decimal` にして
+  束縛する。psycopg の AUTO 形式は `Decimal` を text（`DecimalDumper`）で送るため、
+  公開 API `conn.adapters.register_dumper` で `DecimalBinaryDumper` を登録し直し、
+  numeric（OID 1700）のバイナリパラメータ（WIRE-26。Issue #2445）として送らせる
+  （ドライバ無改造）。`WIRE_PARAMS`／`WIRE_PARAMS_INT` とは排他。
 - WIRE_BINARY（任意）: `1` のみ受理。結果をバイナリ形式で要求する。
 - WIRE_EXTENDED_NOPARAM（任意）: `1` のみ受理。パラメータ無しでも `prepare=True` で
   名前付き文（拡張プロトコル）として送る。
@@ -81,7 +86,25 @@ def main() -> int:
     if str_params is not None and int_params is not None:
         print("psycopg_extended: WIRE_PARAMS and WIRE_PARAMS_INT are exclusive", file=sys.stderr)
         return 1
+    dec_raw = _json_list("WIRE_PARAMS_DECIMAL", str)
+    if dec_raw is not None and (str_params is not None or int_params is not None):
+        print(
+            "psycopg_extended: WIRE_PARAMS_DECIMAL is exclusive with WIRE_PARAMS/WIRE_PARAMS_INT",
+            file=sys.stderr,
+        )
+        return 1
+    decimal_params = None
+    if dec_raw is not None:
+        import decimal
+
+        try:
+            decimal_params = [decimal.Decimal(v) for v in dec_raw]
+        except decimal.InvalidOperation as e:
+            print(f"psycopg_extended: WIRE_PARAMS_DECIMAL has an invalid decimal: {e}", file=sys.stderr)
+            return 1
     params = str_params if str_params is not None else int_params
+    if decimal_params is not None:
+        params = decimal_params
     binary = _flag("WIRE_BINARY")
     noparam_extended = _flag("WIRE_EXTENDED_NOPARAM")
 
@@ -101,6 +124,12 @@ def main() -> int:
             autocommit=True,
             connect_timeout=5,
         ) as conn:
+            if decimal_params is not None:
+                from decimal import Decimal
+
+                from psycopg.types.numeric import DecimalBinaryDumper
+
+                conn.adapters.register_dumper(Decimal, DecimalBinaryDumper)
             with psycopg.RawCursor(conn) as cur:
                 cur.execute(
                     sql,
