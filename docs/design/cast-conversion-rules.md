@@ -59,7 +59,7 @@
 | int2 | i | i | = | i | i | i | × | io/a | io/a | io/a | × | × | × | × | × | × | × | × | × | × |
 | float4 | a | a | a | = | i | a | × | io/a | io/a | io/a | × | × | × | × | × | × | × | × | × | × |
 | float8 | a | a | a | a | = | a | × | io/a | io/a | io/a | × | × | × | × | × | × | × | × | × | × |
-| numeric | a | a | a | i | i | i | × | io/a | io/a | io/a | × | × | × | × | × | × | × | × | × | × |
+| numeric | a | a | a | i | i | = | × | io/a | io/a | io/a | × | × | × | × | × | × | × | × | × | × |
 | bool | e | × | × | × | × | × | = | a | a | a | × | × | × | × | × | × | × | × | × | × |
 | text | io/e | io/e | io/e | io/e | io/e | io/e | io/e | = | i | i | io/e | io/e | io/e | io/e | io/e | io/e | io/e | io/e | io/e | io/e |
 | varchar | io/e | io/e | io/e | io/e | io/e | io/e | io/e | i | = | i | io/e | io/e | io/e | io/e | io/e | io/e | io/e | io/e | io/e | io/e |
@@ -106,6 +106,21 @@
 - numeric の NaN／Infinity → 整数は **`0A000`**（`cannot convert NaN to integer`・
   `cannot convert infinity to integer`）。NaN／Infinity を表せない NUMERIC での
   float → numeric の扱いは #1591 で決める（本書では決めない）
+
+#### numeric の型修飾子 `numeric(p,s)`（`numeric → numeric` の `=`）
+
+PostgreSQL 17 の挙動（公開情報）に従う。
+
+- 適用順は、(1) スケール `s` へ**四捨五入**（0 から遠い側へ丸める。`1.25` は `numeric(3,1)` で
+  `1.3`、`-1.25` は `-1.3`。float の偶数丸めとは異なる）、(2) **丸め後**の値で精度を判定、の順
+- 丸め後の整数部の桁数が `p - s` を超えると `22003`（`numeric field overflow`）。
+  例: `99.95::numeric(3,1)` は丸めで `100.0` となり整数部 3 桁が `p - s = 2` を超えるため
+  `22003`。丸め前の桁数では判定しない
+- NaN は修飾子を問わず通る。Infinity は有限の `p`・`s` で表せないため `22003`
+- 修飾子の範囲は `1 <= p <= 1000`、`-1000 <= s <= 1000` かつ `s <= p`。範囲外は
+  `22023`（`invalid_parameter_value`）。修飾子なしの `numeric` は精度・スケールとも無制限で、
+  丸めも精度判定も行わない
+- 数値間の他の変換（整数・float → `numeric(p,s)`）も、変換後に同じ丸めと精度判定を適用する
 
 ### BOOLEAN
 
