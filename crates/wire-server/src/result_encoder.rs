@@ -309,10 +309,8 @@ macro_rules! wire_type_enum {
             /// 全 variant の列挙（型写像表の単一情報源）。[`wire_type_enum!`]
             /// が enum 定義と同一の variant トークン列から生成するため、
             /// `ALL` だけを更新し忘れる状態が構造的に発生し得ない。
-            /// [`from_oid`]・単体テストの網羅性検査はここから導出する。
-            /// 単体テスト専用のため非テストビルドでは未使用となり
-            /// `#[cfg(test)]` で dead_code を回避する。
-            #[cfg(test)]
+            /// [`from_oid`]（Parse の宣言 OID の写像。Issue #2436）・単体テストの
+            /// 網羅性検査はここから導出する。
             pub(crate) const ALL: [$name; wire_type_enum!(@count $($variant)+)] =
                 [$($name::$variant),+];
         }
@@ -469,11 +467,39 @@ impl WireType {
 
     /// OID からの逆引き。[`ALL`] を線形走査するのみで、逆引き専用の第 2 の
     /// 写像表は持たない（単一情報源。WIRE-13・TASK-200・Issue #895）。
-    /// 単体テスト専用（結合テスト側は独立の固定表を持つ）ため非テスト
-    /// ビルドでは未使用となり `#[cfg(test)]` で dead_code を回避する。
-    #[cfg(test)]
+    /// 拡張クエリの Parse が宣言された型 OID を「本 DB が持つ型」へ写す
+    /// 入口（`extended_query::handle_parse_body`。Issue #2436・WIRE-24 ポインタ）。
+    /// 持たない OID は `None`（呼び出し側が推論へ倒す）。
     pub(crate) fn from_oid(oid: i32) -> Option<Self> {
         Self::ALL.iter().copied().find(|t| t.oid() == oid)
+    }
+
+    /// Parse の宣言 OID が指すこの型を、engine の宣言型（値の検証・スロット型に使う）へ
+    /// 写す（Issue #2436・WIRE-24 ポインタ）。網羅 `match` にし、[`WireType`] に variant が
+    /// 増えたらコンパイルエラーで写像漏れを検出する。「持つ型」の判定は本 enum が単一情報源で、
+    /// engine 側の宣言型は第 2 の型表ではない。
+    #[deny(clippy::wildcard_enum_match_arm)]
+    pub(crate) fn declared_param_type(self) -> engine::sql::params::DeclaredParamType {
+        use engine::sql::params::DeclaredParamType as D;
+        match self {
+            WireType::Numeric => D::Numeric,
+            WireType::Text => D::Text,
+            WireType::Varchar => D::Varchar,
+            WireType::Bpchar => D::Bpchar,
+            WireType::Int2 => D::Int2,
+            WireType::Int4 => D::Int4,
+            WireType::Int8 => D::Int8,
+            WireType::Bool => D::Bool,
+            WireType::Float4 => D::Float4,
+            WireType::Float8 => D::Float8,
+            WireType::Date => D::Date,
+            WireType::Timestamp => D::Timestamp,
+            WireType::Time => D::Time,
+            WireType::Bytea => D::Bytea,
+            WireType::Uuid => D::Uuid,
+            WireType::Json => D::Json,
+            WireType::Jsonb => D::Jsonb,
+        }
     }
 
     /// この型がバイナリ形式（format code 1）に対応するか（WIRE-14）。
@@ -2331,6 +2357,18 @@ mod tests {
     #[test]
     fn wire_type_all_is_exhaustive() {
         assert_eq!(WireType::ALL.len(), 17);
+    }
+
+    /// Parse の宣言 OID 写像（Issue #2436・WIRE-24 ポインタ）: 全 variant が OID から
+    /// 往復でき、engine の宣言型へ写る。
+    #[test]
+    fn wire_type_round_trips_through_oid_and_declared_type() {
+        for t in WireType::ALL {
+            assert_eq!(WireType::from_oid(t.oid()), Some(t));
+            let _ = t.declared_param_type();
+        }
+        assert_eq!(WireType::from_oid(0), None);
+        assert_eq!(WireType::from_oid(-1), None);
     }
 
     /// `PostgreSQL` 組み込みカタログの公開値（`pg_type.oid`／`typlen`／

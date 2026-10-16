@@ -1822,12 +1822,23 @@ pub struct PreparedSql {
     /// `$n` ごとの型公告（`param_types().len() == param_count`。WIRE-12）。
     /// Parse 時点のカタログ（スキーマ）だけから導出し、行には触れない。
     param_types: Vec<crate::sql::params::PreparedParamType>,
+    /// Parse で宣言された型 OID から写した `$n` ごとの宣言型（`declared.len() ==
+    /// param_count`。未宣言・0・unknown・持たない型は `None`。Issue #2436・WIRE-24 ポインタ）。
+    /// 推論型（`param_types`）を上書きせず並べて保持する（変換可否の判定が両方を見るため）。
+    /// Bind は値を宣言型として検証する（[`EngineCore::bind_prepared`]）。
+    declared: Vec<Option<crate::sql::params::DeclaredParamType>>,
 }
 
 impl PreparedSql {
+    /// `$n` ごとの宣言型（`param_count()` と同じ長さ。宣言なしは `None`）。
+    pub fn declared_param_types(&self) -> &[Option<crate::sql::params::DeclaredParamType>] {
+        &self.declared
+    }
+
     /// `$n` ごとの型公告（`param_count()` と同じ長さ。番号 1 始まりの `n` が
     /// `n - 1` 番目）。wire-server の `ParameterDescription` の OID・バイナリ
-    /// 受理可否の判定にだけ使う（値の検証意味論には影響しない。WIRE-12）。
+    /// 受理可否の判定に使う（WIRE-12）。値の宣言型としての検証は
+    /// [`Self::declared_param_types`] と [`EngineCore::bind_prepared`] が担う（WIRE-24）。
     pub fn param_types(&self) -> &[crate::sql::params::PreparedParamType] {
         &self.param_types
     }
@@ -3969,6 +3980,20 @@ impl EngineCore {
         &self,
         sql: &str,
     ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
+        self.parse_sql_prepared_with_declared(sql, &[])
+    }
+
+    /// [`Self::parse_sql_prepared`] に Parse で宣言された型（wire-server が型 OID から
+    /// 写した `$n` ごとの宣言型。番号 1 始まりの `n` が `n - 1` 番目、`None` は未宣言）を
+    /// 渡す版（Issue #2436・WIRE-24 ポインタ）。宣言型は推論段で反映する: 推論できない
+    /// 位置・未参照番号は宣言型をスロット型とし（`42P18` にしない）、推論型がある位置は
+    /// 推論型のまま宣言型を並べて保持する。`declared` が `param_count` より長い余剰分は
+    /// ここでは無視する（過剰宣言の `08P01` は wire-server が判定する）。
+    pub fn parse_sql_prepared_with_declared(
+        &self,
+        sql: &str,
+        declared: &[Option<crate::sql::params::DeclaredParamType>],
+    ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = crate::sql::lexer::tokenize_with_params(sql)?;
         // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW`
         // は DDL であり、`sql::params` が受理する `$n` の許可位置一覧
@@ -4027,7 +4052,7 @@ impl EngineCore {
         // 式内 `$n`（`1 + $1` 等）は文字列ダミーでは定数畳み込み／束縛の型検査に落ちるため、
         // 推論を parse より前に置く。推論不能（`42P18`）のときだけ、構文エラー（`42601`）を
         // 先に返す（PostgreSQL と同じ優先順位）ため文字列ダミーで parse を試す。
-        let param_types = match self.infer_param_types(&tokens, param_count) {
+        let param_types = match self.infer_param_types(&tokens, param_count, declared) {
             Ok(types) => types,
             Err(e @ crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype { .. }) => {
                 // 文字列ダミーの定数畳み込みで型エラーになっても途中終了しないよう、
@@ -4070,6 +4095,9 @@ impl EngineCore {
             order_by_distance_literal_is_param,
             where_equality_dummy_flags,
             param_types,
+            declared: (0..usize::from(param_count))
+                .map(|i| declared.get(i).copied().flatten())
+                .collect(),
         })
     }
 
@@ -4090,6 +4118,7 @@ impl EngineCore {
         &self,
         tokens: &[crate::sql::lexer::Token],
         param_count: u16,
+        declared: &[Option<crate::sql::params::DeclaredParamType>],
     ) -> Result<Vec<crate::sql::params::PreparedParamType>, crate::sql::allowlist::SqlSurfaceError>
     {
         use crate::sql::allowlist::SqlSurfaceError;
@@ -4193,6 +4222,23 @@ impl EngineCore {
                     ParamInference::Indeterminate => expr_indeterminate = true,
                 }
             }
+            // Issue #2436・WIRE-24: 推論型が無い（全出現が推論不能、または未参照）番号は、
+            // 宣言型があればそれをスロット型にする（`42P18` にしない）。式の中で扱えない
+            // 宣言型は推論時と同じく `0A000`。推論型がある位置は宣言型で上書きしない。
+            if resolved.is_empty() {
+                if let Some(d) = declared.get(idx).copied().flatten() {
+                    if expr_indeterminate && !d.is_supported_in_expr() {
+                        let param = u16::try_from(idx.saturating_add(1)).unwrap_or(u16::MAX);
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: format!(
+                                "parameter ${param} of this data type is not supported inside an expression"
+                            ),
+                        });
+                    }
+                    out.push(PreparedParamType::Declared(d));
+                    continue;
+                }
+            }
             if resolved.is_empty() && expr_indeterminate {
                 let param = u16::try_from(idx.saturating_add(1)).unwrap_or(u16::MAX);
                 return Err(SqlSurfaceError::IndeterminateDatatype { param });
@@ -4249,6 +4295,14 @@ impl EngineCore {
             ));
         }
         let decoded = crate::sql::params::decode_bind_values(&prepared.tokens, values)?;
+        // Issue #2436・WIRE-24: 宣言型がある値は、置換の前に宣言型として検証する
+        // （`decode_bind_values` が NULL を拒否済みのため全値が非 NULL）。
+        for (i, decl) in prepared.declared.iter().enumerate() {
+            if let (Some(ty), Some(value)) = (decl, decoded.get(i)) {
+                let n = u16::try_from(i.saturating_add(1)).unwrap_or(u16::MAX);
+                crate::sql::params::validate_declared_value(n, *ty, value)?;
+            }
+        }
         let kinds: Vec<crate::sql::params::ParamLiteralKind> = prepared
             .param_types
             .iter()

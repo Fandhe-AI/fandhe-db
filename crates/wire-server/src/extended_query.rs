@@ -118,7 +118,7 @@ use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::recovery::commit_boundary::ResponseBoundaryGuard;
 use engine::sql::exec::ColumnMeta;
 use engine::sql::mode::SessionState;
-use engine::sql::params::{PreparedParamType, MAX_PARAMS};
+use engine::sql::params::{DeclaredParamType, PreparedParamType, MAX_PARAMS};
 
 use crate::binary_param::{self, BinaryParam};
 use crate::error_response;
@@ -456,7 +456,10 @@ pub(crate) enum PreparedStatement {
 
 /// `$n` 1 個分の公告情報（Parse が確定し、Describe(S) の
 /// `ParameterDescription` と Bind のバイナリ受理判定が参照する）。
-/// 値の検証意味論には影響しない（値は常に engine のリテラル置換経路を通る）。
+/// 宣言 OID は値の検証にも用いる（engine が `parse_sql_prepared_with_declared` で受けた
+/// 宣言型として Bind 時に検証する。Issue #2436・WIRE-24 ポインタ）。受理範囲は
+/// 互換表（[`binary_param_kind`]）と engine の既存経路で決まり、宣言 OID で広げない。
+/// 値は常に engine のリテラル置換経路を通る。
 pub(crate) struct ParamSlot {
     /// `ParameterDescription` で公告する型 OID（宣言 OID が 0 以外ならその
     /// echo、それ以外は推論 OID）。
@@ -464,6 +467,21 @@ pub(crate) struct ParamSlot {
     /// バイナリ形式の値の復号種別（Issue #1345）。`Unsupported` は binary 指定を
     /// `0A000` で拒否する。復号結果は正規テキストとして engine へ渡す。
     binary: BinaryParam,
+}
+
+/// 型 OID 0 と並んで「宣言なし」として扱う unknown（705）。PostgreSQL も unknown 宣言を
+/// 文脈から推論するため、推論・公告は OID 0 と同じにする（Issue #2436）。
+const UNKNOWN_OID: i32 = 705;
+
+/// 宣言 OID を engine の宣言型へ写す（Issue #2436・WIRE-24 ポインタ）。0・unknown（705）・
+/// 未知／負の OID は `None`（推論へ倒す）。
+// TODO(#2438): 持たない型の OID は Parse 時に `0A000` で拒否する予定。現状は推論へ倒し、
+// ParameterDescription の echo とバイナリの扱いは従来のまま。
+fn declared_param_type_for_oid(oid: i32) -> Option<DeclaredParamType> {
+    if oid == 0 || oid == UNKNOWN_OID {
+        return None;
+    }
+    result_encoder::WireType::from_oid(oid).map(result_encoder::WireType::declared_param_type)
 }
 
 /// 宣言 OID のうち、text 系スロットへバイナリ（UTF-8 バイト恒等）を許す型。
@@ -478,7 +496,9 @@ const BPCHAR_SLOT_DECLARED_OIDS: [i32; 4] = [0, 25, 1043, 1042];
 /// 推論スロット型と実効 OID（宣言 OID が 0 以外ならそれ、0 なら推論 OID）から
 /// バイナリ復号種別を決める（Issue #1345）。推論型との互換表に載らない組み合わせは
 /// すべて `Unsupported`（fail-closed）。PostgreSQL の暗黙キャスト（float4→float8 等）より意図的に厳しい: 値の意味が暗黙キャストと変わりうる
-/// 組み合わせを受理しない。
+/// 組み合わせを受理しない。推論スロット側の互換表は #2437（宣言型と文脈型の変換可否判定）が
+/// 置き換える箇所のため、本 Issue（#2436）では変更しない。宣言型をスロット型とする
+/// `Declared` だけは宣言型そのものの受信形式を受理する。
 #[deny(clippy::wildcard_enum_match_arm)]
 fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i32) -> BinaryParam {
     use engine::catalog::ColumnType;
@@ -499,6 +519,27 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
     match ty {
         PreparedParamType::Text => text_like(),
         PreparedParamType::VectorText => BinaryParam::Unsupported,
+        // 宣言型がスロット型（推論不能位置・未参照番号）。実効 OID は宣言 OID そのもの。
+        // Numeric・日時・JSON のバイナリは未対応のまま（WIRE-14。Numeric は別 Issue）。
+        PreparedParamType::Declared(d) => match d {
+            DeclaredParamType::Int2 => BinaryParam::Int2,
+            DeclaredParamType::Int4 => BinaryParam::Int4,
+            DeclaredParamType::Int8 => BinaryParam::Int8,
+            DeclaredParamType::Float4 => BinaryParam::Float4,
+            DeclaredParamType::Float8 => BinaryParam::Float8,
+            DeclaredParamType::Bool => BinaryParam::Bool,
+            DeclaredParamType::Bytea => BinaryParam::Bytea,
+            DeclaredParamType::Uuid => BinaryParam::Uuid,
+            DeclaredParamType::Time => BinaryParam::Time,
+            DeclaredParamType::Text | DeclaredParamType::Varchar | DeclaredParamType::Bpchar => {
+                BinaryParam::Utf8Identity
+            }
+            DeclaredParamType::Numeric
+            | DeclaredParamType::Date
+            | DeclaredParamType::Timestamp
+            | DeclaredParamType::Json
+            | DeclaredParamType::Jsonb => BinaryParam::Unsupported,
+        },
         PreparedParamType::Column(meta) => match meta {
             // `id` は宣言 0（実効 1700=NUMERIC）をバイナリ非対応とする。
             ColumnMeta::Id => int_kind(effective_oid),
@@ -1301,8 +1342,14 @@ fn handle_parse_body(
         }
         PreparedStatement::Empty
     } else {
+        // 宣言 OID は件数上限（`MAX_PARAMS`）検証済みの長さでだけ復号・写像する。
+        let declared_oids = decode_declared_oids(&msg.param_oid_bytes);
+        let declared_types: Vec<Option<DeclaredParamType>> = declared_oids
+            .iter()
+            .map(|oid| declared_param_type_for_oid(*oid))
+            .collect();
         let prepared = engine
-            .parse_sql_prepared(&msg.query)
+            .parse_sql_prepared_with_declared(&msg.query, &declared_types)
             .map_err(HandlerError::Sql)?;
         match prepared.parsed_if_unparameterized() {
             // `$n` を含まない文は従来どおり Parsed 経路のまま保持する
@@ -1314,8 +1361,7 @@ fn handle_parse_body(
                 PreparedStatement::Parsed(parsed.clone())
             }
             None => {
-                let declared = decode_declared_oids(&msg.param_oid_bytes);
-                let slots = build_param_slots(&prepared, &declared)?;
+                let slots = build_param_slots(&prepared, &declared_oids)?;
                 PreparedStatement::Parameterized { prepared, slots }
             }
         }
@@ -1326,11 +1372,11 @@ fn handle_parse_body(
         .map_err(HandlerError::Store)
 }
 
-/// `$n` ごとの公告 OID・バイナリ可否を組み立てる（WIRE-12）。宣言 OID は
-/// 値の検証には一切使わない（値は常にリテラル置換経路を通るため、宣言型で
-/// 検証を迂回できない）。0 以外はそのまま echo し、0・未宣言は推論値で補う。
-/// バイナリは、推論がバイナリ対応かつ宣言 OID が text 系（0・25・1043）の
-/// ときだけ許す。
+/// `$n` ごとの公告 OID・バイナリ可否を組み立てる（WIRE-12・WIRE-24 ポインタ）。
+/// 宣言 OID の値の検証は engine が Bind 時に宣言型として行う（Issue #2436）。ここでは
+/// unknown（705）を 0 に正規化したうえで、0 以外はそのまま echo し、0・未宣言は
+/// 推論値で補う。バイナリは、推論がバイナリ対応かつ宣言 OID が text 系（0・25・1043）の
+/// ときだけ許す（`Declared` スロットは宣言型の受信形式を受理する）。
 fn build_param_slots(
     prepared: &PreparedSql,
     declared: &[i32],
@@ -1343,13 +1389,18 @@ fn build_param_slots(
         .iter()
         .enumerate()
         .map(|(i, ty)| {
+            let declared_oid = match declared.get(i).copied().unwrap_or(0) {
+                UNKNOWN_OID => 0,
+                other => other,
+            };
             let inferred_oid = match ty {
                 PreparedParamType::Text | PreparedParamType::VectorText => {
                     result_encoder::WireType::Text.oid()
                 }
                 PreparedParamType::Column(meta) => result_encoder::column_wire_type(meta).oid(),
+                // 宣言型がスロット型になるのは宣言があるときだけ（`declared_oid != 0`）。
+                PreparedParamType::Declared(_) => declared_oid,
             };
-            let declared_oid = declared.get(i).copied().unwrap_or(0);
             let oid = if declared_oid != 0 {
                 declared_oid
             } else {
@@ -2905,6 +2956,39 @@ mod tests {
                 portal_with_bound_bytes(MAX_BOUND_PARAM_BYTES_PER_SESSION),
             )
             .expect("credit returns after clear_all");
+    }
+
+    #[test]
+    fn declared_oid_maps_to_declared_param_type() {
+        use engine::sql::params::DeclaredParamType as D;
+        assert_eq!(declared_param_type_for_oid(0), None);
+        assert_eq!(declared_param_type_for_oid(UNKNOWN_OID), None);
+        assert_eq!(declared_param_type_for_oid(25), Some(D::Text));
+        assert_eq!(declared_param_type_for_oid(23), Some(D::Int4));
+        assert_eq!(declared_param_type_for_oid(1700), Some(D::Numeric));
+        assert_eq!(declared_param_type_for_oid(99_999), None);
+        assert_eq!(declared_param_type_for_oid(-5), None);
+    }
+
+    #[test]
+    fn binary_param_kind_declared_arms() {
+        use engine::sql::params::DeclaredParamType as D;
+        let kind = |d: D| binary_param_kind(&PreparedParamType::Declared(d), 0, 0);
+        assert!(matches!(kind(D::Int2), BinaryParam::Int2));
+        assert!(matches!(kind(D::Int4), BinaryParam::Int4));
+        assert!(matches!(kind(D::Int8), BinaryParam::Int8));
+        assert!(matches!(kind(D::Float4), BinaryParam::Float4));
+        assert!(matches!(kind(D::Float8), BinaryParam::Float8));
+        assert!(matches!(kind(D::Bool), BinaryParam::Bool));
+        assert!(matches!(kind(D::Bytea), BinaryParam::Bytea));
+        assert!(matches!(kind(D::Uuid), BinaryParam::Uuid));
+        assert!(matches!(kind(D::Time), BinaryParam::Time));
+        for d in [D::Text, D::Varchar, D::Bpchar] {
+            assert!(matches!(kind(d), BinaryParam::Utf8Identity));
+        }
+        for d in [D::Numeric, D::Date, D::Timestamp, D::Json, D::Jsonb] {
+            assert!(matches!(kind(d), BinaryParam::Unsupported));
+        }
     }
 
     #[test]

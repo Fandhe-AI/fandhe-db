@@ -787,8 +787,8 @@ pub(crate) enum ParamPosition {
 }
 
 /// `$n` の型公告（`ParameterDescription` の OID 決定と、バイナリ受理可否の
-/// 判定に使う。値の検証意味論には一切影響しない——値は常に
-/// [`Token::StringLiteral`] 置換経路を通る）。
+/// 判定に使う。置換経路は不変——値は常に型付きリテラルトークンの置換を通る。
+/// Parse の宣言型による値の検証は [`DeclaredParamType`]・[`validate_declared_value`]）。
 /// [`crate::core::PreparedSql::param_types`] が返す（WIRE-12）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum PreparedParamType {
@@ -800,6 +800,177 @@ pub enum PreparedParamType {
     /// スカラー列（`id` 含む）の型。wire 側が列の公告 OID・バイナリ可否を
     /// 既存の結果列と同じ規則で導出する。
     Column(crate::sql::exec::ColumnMeta),
+    /// Parse で宣言された型 OID（[`DeclaredParamType`]）をそのままスロット型とする
+    /// （Issue #2436・WIRE-24 ポインタ）。推論できない位置（式内 `$1 + $2` の全出現が
+    /// 推論不能）と未参照番号にだけ使い、推論型がある位置では使わない。
+    Declared(DeclaredParamType),
+}
+
+/// Parse の型 OID 宣言が指す「本 DB が持つ型」（Issue #2436・WIRE-24 ポインタ）。
+/// wire-server が `WireType`（持つ型の単一情報源）から写像して
+/// [`crate::core::EngineCore::parse_sql_prepared_with_declared`] へ渡す。長さ・精度などの
+/// 制約は持たない（宣言 OID は型の種類しか表さないため）。「持つ型」の判定には使わず、
+/// 第 2 の型表にはしない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredParamType {
+    Int2,
+    Int4,
+    Int8,
+    Float4,
+    Float8,
+    Bool,
+    Text,
+    Varchar,
+    Bpchar,
+    Numeric,
+    Date,
+    Timestamp,
+    Time,
+    Bytea,
+    Uuid,
+    Json,
+    Jsonb,
+}
+
+impl DeclaredParamType {
+    /// 置換リテラル種別。整数系は `Integer`、浮動小数系は `Float`、`Bool` は `Boolean`、
+    /// それ以外は文字列リテラル（束縛後の既存経路が型ごとに検証する）。
+    #[deny(clippy::wildcard_enum_match_arm)]
+    pub(crate) fn literal_kind(self) -> ParamLiteralKind {
+        match self {
+            DeclaredParamType::Int2 | DeclaredParamType::Int4 | DeclaredParamType::Int8 => {
+                ParamLiteralKind::Integer
+            }
+            DeclaredParamType::Float4 | DeclaredParamType::Float8 => ParamLiteralKind::Float,
+            DeclaredParamType::Bool => ParamLiteralKind::Boolean,
+            DeclaredParamType::Text
+            | DeclaredParamType::Varchar
+            | DeclaredParamType::Bpchar
+            | DeclaredParamType::Numeric
+            | DeclaredParamType::Date
+            | DeclaredParamType::Timestamp
+            | DeclaredParamType::Time
+            | DeclaredParamType::Bytea
+            | DeclaredParamType::Uuid
+            | DeclaredParamType::Json
+            | DeclaredParamType::Jsonb => ParamLiteralKind::String,
+        }
+    }
+
+    /// エラー文言用の型名（値は含めない）。
+    #[deny(clippy::wildcard_enum_match_arm)]
+    fn name(self) -> &'static str {
+        match self {
+            DeclaredParamType::Int2 => "int2",
+            DeclaredParamType::Int4 => "int4",
+            DeclaredParamType::Int8 => "int8",
+            DeclaredParamType::Float4 => "float4",
+            DeclaredParamType::Float8 => "float8",
+            DeclaredParamType::Bool => "bool",
+            DeclaredParamType::Text => "text",
+            DeclaredParamType::Varchar => "varchar",
+            DeclaredParamType::Bpchar => "bpchar",
+            DeclaredParamType::Numeric => "numeric",
+            DeclaredParamType::Date => "date",
+            DeclaredParamType::Timestamp => "timestamp",
+            DeclaredParamType::Time => "time",
+            DeclaredParamType::Bytea => "bytea",
+            DeclaredParamType::Uuid => "uuid",
+            DeclaredParamType::Json => "json",
+            DeclaredParamType::Jsonb => "jsonb",
+        }
+    }
+
+    /// 式の中の `$n` に割り当てられる型か（`sql::param_infer` の `is_supported_in_expr` と
+    /// 同じ範囲: 整数・浮動小数・text・varchar）。範囲外は呼び出し側が `0A000` にする。
+    pub(crate) fn is_supported_in_expr(self) -> bool {
+        matches!(
+            self,
+            DeclaredParamType::Int2
+                | DeclaredParamType::Int4
+                | DeclaredParamType::Int8
+                | DeclaredParamType::Float4
+                | DeclaredParamType::Float8
+                | DeclaredParamType::Text
+                | DeclaredParamType::Varchar
+        )
+    }
+}
+
+/// Bind 値（text 形式の正規テキスト）を宣言型として検証する（Issue #2436・WIRE-24
+/// ポインタ）。整数系は既存の整数文法＋型の値域（不正 `22P02`／範囲外 `22003`）、
+/// 浮動小数系は既存の浮動小数文法（`float4` は有限性も確認）、`bool` は
+/// [`parse_pg_bool`] で判定する。text 系と、`numeric`・日時・`bytea`・`uuid`・`json(b)`
+/// は追加検証をしない（単独で呼べる検証器を第 2 の文法として持たない方針。値は束縛後の
+/// 既存リテラル経路が列型に応じて検証する）。エラー文言は `$n` 番号と型名だけで値を含めない。
+pub(crate) fn validate_declared_value(
+    n: u16,
+    ty: DeclaredParamType,
+    value: &str,
+) -> Result<(), SqlSurfaceError> {
+    let name = ty.name();
+    match ty {
+        DeclaredParamType::Int2 | DeclaredParamType::Int4 | DeclaredParamType::Int8 => {
+            let (negative, digits) = split_integer(n, value)?;
+            let out_of_range = || {
+                SqlSurfaceError::numeric_out_of_range(format!(
+                    "value for parameter ${n} is out of range for type {name}"
+                ))
+            };
+            // 符号付き最大値の絶対値（負側は +1 まで許す）。u128 で比較して桁あふれを避ける。
+            let limit: u128 = match ty {
+                DeclaredParamType::Int2 => 1 << 15,
+                DeclaredParamType::Int4 => 1 << 31,
+                _ => 1 << 63,
+            };
+            let trimmed = digits.trim_start_matches('0');
+            if trimmed.len() > 39 {
+                return Err(out_of_range());
+            }
+            let magnitude: u128 = if trimmed.is_empty() {
+                0
+            } else {
+                trimmed.parse().map_err(|_| out_of_range())?
+            };
+            let max = if negative { limit } else { limit - 1 };
+            if magnitude > max {
+                return Err(out_of_range());
+            }
+            Ok(())
+        }
+        DeclaredParamType::Float4 | DeclaredParamType::Float8 => {
+            let body = split_float(n, value)?;
+            if ty == DeclaredParamType::Float4 {
+                // 字句解析器の数値文法を通った本文が f32 で有限にならなければ範囲外。
+                let finite = body.parse::<f32>().map(f32::is_finite).unwrap_or(false);
+                if !finite {
+                    return Err(SqlSurfaceError::numeric_out_of_range(format!(
+                        "value for parameter ${n} is out of range for type {name}"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        DeclaredParamType::Bool => {
+            if parse_pg_bool(value).is_none() {
+                return Err(SqlSurfaceError::invalid_text_representation(format!(
+                    "invalid input syntax for parameter ${n} (expected {name})"
+                )));
+            }
+            Ok(())
+        }
+        DeclaredParamType::Text
+        | DeclaredParamType::Varchar
+        | DeclaredParamType::Bpchar
+        | DeclaredParamType::Numeric
+        | DeclaredParamType::Date
+        | DeclaredParamType::Timestamp
+        | DeclaredParamType::Time
+        | DeclaredParamType::Bytea
+        | DeclaredParamType::Uuid
+        | DeclaredParamType::Json
+        | DeclaredParamType::Jsonb => Ok(()),
+    }
 }
 
 impl PreparedParamType {
@@ -827,6 +998,7 @@ impl PreparedParamType {
                 ColumnType::Boolean => ParamLiteralKind::Boolean,
                 _ => ParamLiteralKind::String,
             },
+            PreparedParamType::Declared(d) => d.literal_kind(),
             _ => ParamLiteralKind::String,
         }
     }
@@ -847,9 +1019,9 @@ pub(crate) enum ParamLiteralKind {
     Boolean,
 }
 
-/// `value` を整数リテラルのトークン列へ変換する（`-?[0-9]+` のみ受理）。
-/// 負値は字句解析器と同じく `Punct('-')` + `Number`。
-fn integer_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceError> {
+/// 整数文法（`-?[0-9]+`）の判定。符号の有無と数字列を返す。置換
+/// （[`integer_literal_tokens`]）と宣言型検証（[`validate_declared_value`]）で共有する。
+fn split_integer(n: u16, value: &str) -> Result<(bool, &str), SqlSurfaceError> {
     let (negative, digits) = match value.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, value),
@@ -859,6 +1031,25 @@ fn integer_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceE
             "invalid input syntax for parameter ${n} (expected integer)"
         )));
     }
+    Ok((negative, digits))
+}
+
+/// 浮動小数文法の判定（先頭の `-` を 1 個剥がした本文を返す）。
+/// [`float_literal_tokens`] と [`validate_declared_value`] で共有する。
+fn split_float(n: u16, value: &str) -> Result<&str, SqlSurfaceError> {
+    let body = value.strip_prefix('-').unwrap_or(value);
+    if !lexer::is_single_number_literal(body) {
+        return Err(SqlSurfaceError::invalid_text_representation(format!(
+            "invalid input syntax for parameter ${n} (expected floating-point number)"
+        )));
+    }
+    Ok(body)
+}
+
+/// `value` を整数リテラルのトークン列へ変換する（`-?[0-9]+` のみ受理）。
+/// 負値は字句解析器と同じく `Punct('-')` + `Number`。
+fn integer_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceError> {
+    let (negative, digits) = split_integer(n, value)?;
     let mut out = Vec::with_capacity(2);
     if negative {
         out.push(Token::Punct('-'));
@@ -873,15 +1064,8 @@ fn integer_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceE
 /// エラーに値本文は含めない。値域外（REAL への `1e40` 等）は束縛後の既存経路が
 /// リテラル形と同じコードで拒否する。
 fn float_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceError> {
-    let (negative, body) = match value.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, value),
-    };
-    if !lexer::is_single_number_literal(body) {
-        return Err(SqlSurfaceError::invalid_text_representation(format!(
-            "invalid input syntax for parameter ${n} (expected floating-point number)"
-        )));
-    }
+    let body = split_float(n, value)?;
+    let negative = value.starts_with('-');
     let mut out = Vec::with_capacity(2);
     if negative {
         out.push(Token::Punct('-'));
