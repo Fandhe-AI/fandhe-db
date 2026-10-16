@@ -313,6 +313,139 @@ pub enum Expr {
         expr: Box<Expr>,
         collation: crate::collation::Collation,
     },
+    /// SQL/JSON 問い合わせ関数 `JSON_EXISTS`・`JSON_VALUE`・`JSON_QUERY`（対象ビヘイビア:
+    /// TABLE-25・TASK-273。Issue #2187）。構文段（`allowlist::Parser::parse_sql_json_query`）が
+    /// 専用の句（`PASSING`・`RETURNING`・ラッパー・引用符・`ON EMPTY`／`ON ERROR`）を構造のまま
+    /// 保持する。位置引数へ脱糖しないのは、句を引数の並びで正直に表せないことと、内部名が既定の
+    /// 列名・利用者の呼び出しへ漏れることを避けるため。束縛・評価は `sql::jsonpath_fn`。
+    SqlJsonQuery(Box<SqlJsonQueryExpr>),
+}
+
+/// SQL/JSON 問い合わせ関数の種別（[`Expr::SqlJsonQuery`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlJsonQueryKind {
+    Exists,
+    Value,
+    Query,
+}
+
+impl SqlJsonQueryKind {
+    /// 既定の列名・エラー文に使う関数名（PostgreSQL と同じ小文字）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SqlJsonQueryKind::Exists => "json_exists",
+            SqlJsonQueryKind::Value => "json_value",
+            SqlJsonQueryKind::Query => "json_query",
+        }
+    }
+
+    /// 内容ハッシュ用の変更禁止タグ（`recovery::content_hash`）。
+    pub(crate) fn hash_tag(self) -> u8 {
+        match self {
+            SqlJsonQueryKind::Exists => 1,
+            SqlJsonQueryKind::Value => 2,
+            SqlJsonQueryKind::Query => 3,
+        }
+    }
+}
+
+/// `ON EMPTY`／`ON ERROR` の挙動（[`SqlJsonQueryExpr`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlJsonBehavior {
+    Error,
+    Null,
+    True,
+    False,
+    Unknown,
+    /// `EMPTY [ARRAY]`（`[]`）。
+    EmptyArray,
+    /// `EMPTY OBJECT`（`{}`）。
+    EmptyObject,
+    /// `DEFAULT <式>`（構文段は式をそのまま保持し、束縛段が受理形を検査する）。
+    Default(Box<Expr>),
+}
+
+impl SqlJsonBehavior {
+    /// 内容ハッシュ用の変更禁止タグ（`recovery::content_hash`。`Default` は 8）。
+    pub(crate) fn hash_tag(&self) -> u8 {
+        match self {
+            SqlJsonBehavior::Error => 1,
+            SqlJsonBehavior::Null => 2,
+            SqlJsonBehavior::True => 3,
+            SqlJsonBehavior::False => 4,
+            SqlJsonBehavior::Unknown => 5,
+            SqlJsonBehavior::EmptyArray => 6,
+            SqlJsonBehavior::EmptyObject => 7,
+            SqlJsonBehavior::Default(_) => 8,
+        }
+    }
+}
+
+/// [`Expr::SqlJsonQuery`] の中身。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlJsonQueryExpr {
+    pub kind: SqlJsonQueryKind,
+    /// 第 1 引数（context item）。
+    pub context: Expr,
+    /// 第 2 引数（path。束縛段が型なし文字列リテラル・`NULL` だけを受理する）。
+    pub path: Expr,
+    /// `PASSING <式> AS <名前>` の並び（名前は引用なし識別子として小文字へ畳み済み）。
+    pub passing: Vec<(String, Expr)>,
+    /// `RETURNING <型名>`（小文字・空白 1 個区切りに正規化した文字列。束縛段が受理形を検査する）。
+    pub returning: Option<String>,
+    /// `WITH [UNCONDITIONAL] [ARRAY] WRAPPER` が指定されたか（`WITHOUT` と省略は偽）。
+    pub with_wrapper: bool,
+    /// `KEEP QUOTES`（`Some(true)`）・`OMIT QUOTES`（`Some(false)`）・省略（`None`）。
+    pub keep_quotes: Option<bool>,
+    pub on_empty: Option<SqlJsonBehavior>,
+    pub on_error: Option<SqlJsonBehavior>,
+}
+
+impl SqlJsonQueryExpr {
+    /// 部分式（context・path・PASSING の値・DEFAULT 式）を出現順に返す。走査系の網羅 match が
+    /// 部分式の取りこぼし（列参照・UDF 呼び出し・式ノード数）を起こさないよう共有する。
+    pub fn children(&self) -> Vec<&Expr> {
+        let mut v: Vec<&Expr> = vec![&self.context, &self.path];
+        v.extend(self.passing.iter().map(|(_, e)| e));
+        for b in [&self.on_empty, &self.on_error].into_iter().flatten() {
+            if let SqlJsonBehavior::Default(e) = b {
+                v.push(e);
+            }
+        }
+        v
+    }
+
+    /// 全部分式を `f` で写した複製を返す（列名の書き換え等）。
+    pub fn try_map_children<E>(
+        &self,
+        f: &mut dyn FnMut(&Expr) -> Result<Expr, E>,
+    ) -> Result<SqlJsonQueryExpr, E> {
+        let map_beh = |b: &Option<SqlJsonBehavior>,
+                       f: &mut dyn FnMut(&Expr) -> Result<Expr, E>|
+         -> Result<Option<SqlJsonBehavior>, E> {
+            Ok(match b {
+                Some(SqlJsonBehavior::Default(e)) => {
+                    Some(SqlJsonBehavior::Default(Box::new(f(e)?)))
+                }
+                other => other.clone(),
+            })
+        };
+        Ok(SqlJsonQueryExpr {
+            kind: self.kind,
+            context: f(&self.context)?,
+            path: f(&self.path)?,
+            passing: self
+                .passing
+                .iter()
+                .map(|(n, e)| Ok((n.clone(), f(e)?)))
+                .collect::<Result<_, E>>()?,
+            returning: self.returning.clone(),
+            with_wrapper: self.with_wrapper,
+            keep_quotes: self.keep_quotes,
+            on_empty: map_beh(&self.on_empty, f)?,
+            on_error: map_beh(&self.on_error, f)?,
+        })
+    }
 }
 
 /// 括弧なし SQL 値関数の種別（[`Expr::ValueFunction`]）。
@@ -1178,6 +1311,16 @@ pub(crate) fn first_non_builtin_call_with(
         Expr::Collate { expr, .. } => {
             first_non_builtin_call_with(expr, allow_current_time, allow_json_fns)
         }
+        // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）は jsonb 関数と同じ扱い（CHECK 本体・
+        // 連鎖ビュー本文では禁止要素として報告し、許可される文脈では部分式を検査する）。
+        Expr::SqlJsonQuery(q) => {
+            if !allow_json_fns {
+                return Some(q.kind.as_str());
+            }
+            q.children()
+                .into_iter()
+                .find_map(|c| first_non_builtin_call_with(c, allow_current_time, allow_json_fns))
+        }
         Expr::Case { whens, else_result } => whens
             .iter()
             .find_map(|(c, r)| {
@@ -1630,6 +1773,10 @@ fn validate_closed_expr(
         Expr::String(_) => Ok(()),
         // 照合指定（TABLE-28・Issue #1609）は内側の式を検査する（束縛段が文字列系か検査する）。
         Expr::Collate { expr, .. } => validate_closed_expr(expr, params, registry, node_budget),
+        // SQL/JSON 問い合わせ関数は UDF 本体（閉じた式）では受理しない（jsonb 関数と同じ `0A000`）。
+        Expr::SqlJsonQuery(_) => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "SQL/JSON query functions are not supported in a function body".to_string(),
+        }),
         // jsonb パス演算子は列参照を要するため、列参照を持てない関数本体では常に未対応
         // （Issue #1596。jsonb 値を受け取る関数引数型も存在しない）。
         Expr::JsonAccess { .. } => Err(SqlSurfaceError::FeatureNotSupported {
@@ -1904,8 +2051,10 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         }
         BoundExpr::JsonTextFn(f) => 1 + f.args.iter().map(count_bound_nodes).sum::<usize>(),
         BoundExpr::JsonPathFn(f) => {
-            // path は解析済み AST（1 ノード扱い）。target と vars の部分木を数える。
-            2 + count_bound_nodes(&f.target) + f.vars.as_ref().map_or(0, count_bound_nodes)
+            // path は解析済み AST（1 ノード扱い）。target・vars・PASSING の部分木を数える。
+            2 + count_bound_nodes(&f.target)
+                + f.vars.as_ref().map_or(0, count_bound_nodes)
+                + f.passing_exprs().map(count_bound_nodes).sum::<usize>()
         }
         BoundExpr::JsonModify { lhs, rhs, .. } => {
             1 + count_bound_nodes(lhs)
@@ -1980,9 +2129,14 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
             max_bound_case_nesting(lhs).max(rhs.expr().map_or(0, max_bound_case_nesting))
         }
         BoundExpr::JsonTextFn(f) => f.args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
-        BoundExpr::JsonPathFn(f) => {
-            max_bound_case_nesting(&f.target).max(f.vars.as_ref().map_or(0, max_bound_case_nesting))
-        }
+        BoundExpr::JsonPathFn(f) => max_bound_case_nesting(&f.target)
+            .max(f.vars.as_ref().map_or(0, max_bound_case_nesting))
+            .max(
+                f.passing_exprs()
+                    .map(max_bound_case_nesting)
+                    .max()
+                    .unwrap_or(0),
+            ),
         BoundExpr::JsonModify { lhs, rhs, .. } => {
             max_bound_case_nesting(lhs).max(rhs.expr().map_or(0, max_bound_case_nesting))
         }
@@ -2055,7 +2209,9 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         }
         BoundExpr::JsonTextFn(f) => f.args.iter().any(references_embedding),
         BoundExpr::JsonPathFn(f) => {
-            references_embedding(&f.target) || f.vars.as_ref().is_some_and(references_embedding)
+            references_embedding(&f.target)
+                || f.vars.as_ref().is_some_and(references_embedding)
+                || f.passing_exprs().any(references_embedding)
         }
         BoundExpr::JsonModify { lhs, rhs, .. } => {
             references_embedding(lhs) || rhs.expr().is_some_and(references_embedding)
@@ -2132,6 +2288,9 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
             visit_referenced_scalar_columns(&f.target, visit);
             if let Some(v) = &f.vars {
                 visit_referenced_scalar_columns(v, visit);
+            }
+            for e in f.passing_exprs() {
+                visit_referenced_scalar_columns(e, visit);
             }
         }
         BoundExpr::Builtin { args, .. }
@@ -2260,7 +2419,12 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
                 .vars
                 .as_ref()
                 .is_some_and(|v| mark_referenced_scalar_columns(v, mask));
-            a || b
+            // PASSING の値式も必ずマークする（取りこぼすと行のマスク外参照が評価時に `Internal` になる）。
+            let mut c = false;
+            for e in f.passing_exprs() {
+                c |= mark_referenced_scalar_columns(e, mask);
+            }
+            a || b || c
         }
         BoundExpr::Builtin { args, .. }
         | BoundExpr::WasmCall { args, .. }
@@ -3223,6 +3387,7 @@ pub(super) fn bind_expr_any(
         }
         Expr::JsonAccess { op, lhs, rhs } => bind_json_access(*op, lhs, rhs, env, node_budget),
         Expr::ValueFunction { kind, precision } => bind_value_function(*kind, *precision, env),
+        Expr::SqlJsonQuery(q) => crate::sql::jsonpath_fn::bind_sql_json_query(q, env, node_budget),
     }
 }
 
@@ -5858,7 +6023,7 @@ pub(super) fn json_build_error(e: crate::json::JsonColumnError) -> SqlSurfaceErr
 
 /// 評価済みの値を JSON 値へ変換する（`to_jsonb`・`jsonb_build_*` の値側。Issue #1599）。
 /// SQL の NULL は JSON の `null`（`to_jsonb` は呼び出し側が先に NULL を返す）。
-fn json_value_from_expr_value(
+pub(crate) fn json_value_from_expr_value(
     v: &ExprValue<'_>,
 ) -> Result<crate::json::JsonValue, SqlSurfaceError> {
     use crate::json::JsonValue;

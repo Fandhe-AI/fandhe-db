@@ -34,7 +34,7 @@ use crate::row_codec::ScalarRef;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::udf_call::{
     bind_json_jsonb_arg, bind_json_jsonb_operand, json_build_error, BindEnv, BoundExpr, Expr,
-    ExprType, ExprValue, JsonAccessOp,
+    ExprType, ExprValue, JsonAccessOp, SqlJsonBehavior, SqlJsonQueryExpr, SqlJsonQueryKind,
 };
 
 /// `jsonb_path_*` 関数の種別。
@@ -44,6 +44,12 @@ pub(crate) enum JsonPathFnKind {
     QueryFirst,
     Exists,
     Match,
+    /// `JSON_EXISTS`（句は [`BoundJsonPathFn::sqljson`]。Issue #2187）。
+    SqlExists,
+    /// `JSON_VALUE`（Issue #2187）。
+    SqlValue,
+    /// `JSON_QUERY`（Issue #2187）。
+    SqlQuery,
 }
 
 /// `silent` 引数の束縛結果（定数だけ。行ごとの評価は行わない）。
@@ -68,6 +74,18 @@ pub struct BoundJsonPathFn {
     pub(crate) vars: Option<BoundExpr>,
     pub(crate) silent: SilentArg,
     pub(crate) limits: JsonPathLimits,
+    /// SQL/JSON 問い合わせ関数（`JSON_EXISTS`・`JSON_VALUE`・`JSON_QUERY`。Issue #2187）の句。
+    /// `jsonb_path_*` では `None`。
+    pub(crate) sqljson: Option<Box<BoundSqlJsonClauses>>,
+}
+
+impl BoundJsonPathFn {
+    /// `PASSING` の値式（`jsonb_path_*` では空）。式木の走査系が部分式を取りこぼさないよう共有する。
+    pub(crate) fn passing_exprs(&self) -> impl Iterator<Item = &BoundExpr> {
+        self.sqljson
+            .iter()
+            .flat_map(|c| c.passing.iter().map(|(_, e)| e))
+    }
 }
 
 /// 本モジュールが束縛する関数名（小文字）か。
@@ -255,6 +273,7 @@ pub(super) fn bind_jsonpath_operator(
             path,
             vars: None,
             silent: SilentArg::Const(true),
+            sqljson: None,
             limits: current_jsonpath_limits(),
         })),
         ExprType::Bool,
@@ -309,6 +328,7 @@ pub(super) fn bind_jsonpath_fn(
             vars,
             silent,
             limits: current_jsonpath_limits(),
+            sqljson: None,
         })),
         ty,
     ))
@@ -342,6 +362,9 @@ pub(crate) fn eval_jsonpath_fn<'a>(
     row_scalars: &'a [Option<ScalarRef<'a>>],
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
     use crate::sql::udf_call::eval_with_scalars;
+    if let Some(c) = &f.sqljson {
+        return eval_sql_json(f, c, id, embedding, row_scalars);
+    }
     let target = jsonb_input(eval_with_scalars(&f.target, id, embedding, row_scalars)?)?;
     let vars_text = match &f.vars {
         Some(v) => Some(jsonb_input(eval_with_scalars(
@@ -397,7 +420,445 @@ pub(crate) fn eval_jsonpath_fn<'a>(
         JsonPathFnKind::Match => Ok(jsonpath_match(path, &root, opts)
             .map_err(eval_err)?
             .map_or(ExprValue::Null, ExprValue::Bool)),
+        // 句つきの種別は先頭で `eval_sql_json` へ振り分け済み（到達しない）。
+        JsonPathFnKind::SqlExists | JsonPathFnKind::SqlValue | JsonPathFnKind::SqlQuery => Err(
+            internal("SQL/JSON query function reached the jsonb_path evaluator"),
+        ),
     }
+}
+// ---------------------------------------------------------------------------
+// SQL/JSON 問い合わせ関数（JSON_EXISTS・JSON_VALUE・JSON_QUERY。TABLE-25・TASK-273・Issue #2187）
+// ---------------------------------------------------------------------------
+//
+// 構文段（`allowlist::Parser::parse_sql_json_query`）が [`Expr::SqlJsonQuery`] として句を構造のまま
+// 渡し、[`bind_sql_json_query`] が受理範囲を決めて [`BoundJsonPathFn`] へ束縛する。評価は同じ
+// jsonpath 評価器（`crate::json::jsonpath`）を**非 silent** で呼び、抑止できる評価エラー
+// （`JsonPathEvalError::is_suppressible`）だけを `ON ERROR` の対象にする。抑止できないエラー
+// （上限超過 `54000`・未定義変数 `42704`・未対応構文 `0A000`・内部不整合）は句の指定に関係なく
+// 呼び出し元へ返る（fail-closed）。意味を確かめていない句・型はすべて束縛時に `0A000` で拒否する。
+
+/// `RETURNING` で受理した結果型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlJsonRet {
+    /// `text`／長さなしの `varchar`。
+    Text,
+    /// `jsonb`（`JSON_QUERY` の既定）。
+    Jsonb,
+    /// `json`（jsonb の正準テキストを json として返す）。
+    Json,
+}
+
+/// 束縛時に結果型へ変換済みの `DEFAULT` 定数。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BoundDefault {
+    Null,
+    Text(String),
+    /// jsonb の正準テキスト。
+    Json(String),
+}
+
+/// 束縛済みの `ON EMPTY`／`ON ERROR` の挙動。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BoundBehavior {
+    Error,
+    Null,
+    True,
+    False,
+    Unknown,
+    EmptyArray,
+    EmptyObject,
+    Default(BoundDefault),
+}
+
+/// SQL/JSON 問い合わせ関数の句の束縛結果（[`BoundJsonPathFn::sqljson`]）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundSqlJsonClauses {
+    pub(crate) ret: SqlJsonRet,
+    pub(crate) with_wrapper: bool,
+    pub(crate) omit_quotes: bool,
+    pub(crate) on_empty: BoundBehavior,
+    pub(crate) on_error: BoundBehavior,
+    /// `PASSING` の（変数名, 値式）。名前は束縛時に重複なしを確認済み。
+    pub(crate) passing: Vec<(String, BoundExpr)>,
+}
+
+fn sqljson_unsupported(detail: &str) -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: detail.to_string(),
+    }
+}
+
+/// `RETURNING` の型名を関数ごとの受理表で判定する（PostgreSQL の入力関数による変換との一致を
+/// まだ保証できない型はすべて `0A000`）。
+fn bind_sql_json_returning(
+    kind: SqlJsonQueryKind,
+    returning: Option<&str>,
+) -> Result<SqlJsonRet, SqlSurfaceError> {
+    match (kind, returning) {
+        (SqlJsonQueryKind::Exists, Some(_)) => Err(sqljson_unsupported(
+            "RETURNING is not supported in JSON_EXISTS",
+        )),
+        (SqlJsonQueryKind::Exists, None) => Ok(SqlJsonRet::Text),
+        (SqlJsonQueryKind::Value, None | Some("text" | "varchar")) => Ok(SqlJsonRet::Text),
+        (SqlJsonQueryKind::Query, None | Some("jsonb")) => Ok(SqlJsonRet::Jsonb),
+        (SqlJsonQueryKind::Query, Some("json")) => Ok(SqlJsonRet::Json),
+        (SqlJsonQueryKind::Query, Some("text" | "varchar")) => Ok(SqlJsonRet::Text),
+        _ => Err(sqljson_unsupported(
+            "this RETURNING type is not supported by SQL/JSON query functions",
+        )),
+    }
+}
+
+/// `DEFAULT` 式を結果型へ束縛時に変換して定数にする（列参照・一般式は `0A000`）。
+fn bind_sql_json_default(
+    kind: SqlJsonQueryKind,
+    ret: SqlJsonRet,
+    expr: &Expr,
+    node_budget: &mut usize,
+) -> Result<BoundDefault, SqlSurfaceError> {
+    charge_node(node_budget)?;
+    match expr {
+        Expr::Null => Ok(BoundDefault::Null),
+        Expr::String(s) => match ret {
+            SqlJsonRet::Text => Ok(BoundDefault::Text(s.clone())),
+            SqlJsonRet::Jsonb | SqlJsonRet::Json => crate::json::canonicalize_jsonb_text(s)
+                .map(BoundDefault::Json)
+                .map_err(|e| match e {
+                    crate::json::JsonColumnError::TooLong => {
+                        SqlSurfaceError::payload_too_large("jsonb result exceeds the allowed size")
+                    }
+                    crate::json::JsonColumnError::Invalid => {
+                        SqlSurfaceError::InvalidTextRepresentation {
+                            detail: "invalid input syntax for type json".to_string(),
+                        }
+                    }
+                }),
+        },
+        // text 系の結果型に限り、先頭ゼロなしの整数リテラルだけを数値のテキスト表記のまま受理する
+        // （PostgreSQL の numeric→text 出力と一致する範囲）。
+        Expr::Number(raw)
+            if kind == SqlJsonQueryKind::Value
+                && ret == SqlJsonRet::Text
+                && !raw.is_empty()
+                && raw.bytes().all(|b| b.is_ascii_digit())
+                && (raw == "0" || !raw.starts_with('0')) =>
+        {
+            Ok(BoundDefault::Text(raw.clone()))
+        }
+        _ => Err(sqljson_unsupported(
+            "DEFAULT of SQL/JSON query functions must be a string literal or NULL",
+        )),
+    }
+}
+
+/// 関数ごとに許される挙動だけを受理して束縛する（合わない挙動は PostgreSQL と同じ構文エラー）。
+fn bind_sql_json_behavior(
+    kind: SqlJsonQueryKind,
+    ret: SqlJsonRet,
+    b: Option<&SqlJsonBehavior>,
+    node_budget: &mut usize,
+) -> Result<BoundBehavior, SqlSurfaceError> {
+    let Some(b) = b else {
+        return Ok(match kind {
+            SqlJsonQueryKind::Exists => BoundBehavior::False,
+            _ => BoundBehavior::Null,
+        });
+    };
+    let invalid =
+        || SqlSurfaceError::unsupported("invalid ON EMPTY/ON ERROR behavior for function");
+    let allowed = match (kind, b) {
+        (SqlJsonQueryKind::Exists, SqlJsonBehavior::Error | SqlJsonBehavior::True)
+        | (SqlJsonQueryKind::Exists, SqlJsonBehavior::False | SqlJsonBehavior::Unknown) => true,
+        (SqlJsonQueryKind::Exists, _) => false,
+        (_, SqlJsonBehavior::Error | SqlJsonBehavior::Null | SqlJsonBehavior::Default(_)) => true,
+        (SqlJsonQueryKind::Query, SqlJsonBehavior::EmptyArray | SqlJsonBehavior::EmptyObject) => {
+            true
+        }
+        _ => false,
+    };
+    if !allowed {
+        return Err(invalid());
+    }
+    Ok(match b {
+        SqlJsonBehavior::Error => BoundBehavior::Error,
+        SqlJsonBehavior::Null => BoundBehavior::Null,
+        SqlJsonBehavior::True => BoundBehavior::True,
+        SqlJsonBehavior::False => BoundBehavior::False,
+        SqlJsonBehavior::Unknown => BoundBehavior::Unknown,
+        SqlJsonBehavior::EmptyArray => BoundBehavior::EmptyArray,
+        SqlJsonBehavior::EmptyObject => BoundBehavior::EmptyObject,
+        SqlJsonBehavior::Default(e) => {
+            BoundBehavior::Default(bind_sql_json_default(kind, ret, e, node_budget)?)
+        }
+    })
+}
+
+/// context item の束縛。jsonb の式・型なし文字列リテラル・裸の `NULL` だけを受理し、json（原文保存）
+/// と text 系ほかは `0A000`（json→jsonb 変換と不正 JSON の写像が未整備のため）。
+fn bind_sql_json_context(
+    name: &str,
+    expr: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    match expr {
+        Expr::Null | Expr::String(_) => bind_json_jsonb_arg(name, expr, env, node_budget),
+        _ => {
+            let (bound, ty) = crate::sql::udf_call::bind_expr_any(expr, env, node_budget)?;
+            if ty != ExprType::Json {
+                return Err(sqljson_unsupported(
+                    "the context item of SQL/JSON query functions must be a jsonb value",
+                ));
+            }
+            Ok(bound)
+        }
+    }
+}
+
+/// `PASSING` 値の束縛。jsonb・text・数値・boolean・`NULL`（JSON の `null`）だけを受理する。
+fn bind_sql_json_passing(
+    expr: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    if matches!(expr, Expr::Null) {
+        charge_node(node_budget)?;
+        return Ok(BoundExpr::Null);
+    }
+    let (bound, ty) = crate::sql::udf_call::bind_expr_any(expr, env, node_budget)?;
+    match ty {
+        ExprType::Json | ExprType::Text | ExprType::Scalar | ExprType::Bool => Ok(bound),
+        _ => Err(sqljson_unsupported(
+            "this PASSING value type is not supported by SQL/JSON query functions",
+        )),
+    }
+}
+
+/// SQL/JSON 問い合わせ関数 1 呼び出しの束縛（`udf_call::bind_expr_any` の `Expr::SqlJsonQuery` 腕から呼ばれる）。
+pub(super) fn bind_sql_json_query(
+    q: &SqlJsonQueryExpr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let name = q.kind.as_str();
+    let ret = bind_sql_json_returning(q.kind, q.returning.as_deref())?;
+    let omit_quotes = q.keep_quotes == Some(false);
+    if omit_quotes && ret != SqlJsonRet::Text {
+        return Err(sqljson_unsupported(
+            "OMIT QUOTES is only supported with a text RETURNING type",
+        ));
+    }
+    charge_node(node_budget)?;
+    let target = bind_sql_json_context(name, &q.context, env, node_budget)?;
+    let path = match &q.path {
+        Expr::Null | Expr::String(_) => bind_path_arg(name, &q.path, node_budget)?,
+        _ => {
+            return Err(sqljson_unsupported(
+                "the path of SQL/JSON query functions must be a string literal",
+            ))
+        }
+    };
+    if q.passing.len() > crate::sql::udf_call::MAX_CALL_ARGS {
+        return Err(SqlSurfaceError::payload_too_large(
+            "too many PASSING arguments",
+        ));
+    }
+    let mut passing: Vec<(String, BoundExpr)> = Vec::with_capacity(q.passing.len());
+    for (var, e) in &q.passing {
+        if passing.iter().any(|(n, _)| n == var) {
+            return Err(sqljson_unsupported(
+                "duplicate PASSING variable names are not supported",
+            ));
+        }
+        let bound = bind_sql_json_passing(e, env, node_budget)?;
+        passing.push((var.clone(), bound));
+    }
+    if q.kind == SqlJsonQueryKind::Exists && q.on_empty.is_some() {
+        return Err(SqlSurfaceError::unsupported(
+            "ON EMPTY is not allowed in JSON_EXISTS",
+        ));
+    }
+    let on_empty = bind_sql_json_behavior(q.kind, ret, q.on_empty.as_ref(), node_budget)?;
+    let on_error = bind_sql_json_behavior(q.kind, ret, q.on_error.as_ref(), node_budget)?;
+    let (fn_kind, ty) = match q.kind {
+        SqlJsonQueryKind::Exists => (JsonPathFnKind::SqlExists, ExprType::Bool),
+        SqlJsonQueryKind::Value => (JsonPathFnKind::SqlValue, ExprType::Text),
+        SqlJsonQueryKind::Query => (
+            JsonPathFnKind::SqlQuery,
+            match ret {
+                SqlJsonRet::Jsonb => ExprType::Json,
+                SqlJsonRet::Json => ExprType::JsonText,
+                SqlJsonRet::Text => ExprType::Text,
+            },
+        ),
+    };
+    Ok((
+        BoundExpr::JsonPathFn(Box::new(BoundJsonPathFn {
+            kind: fn_kind,
+            target,
+            path,
+            vars: None,
+            silent: SilentArg::Omitted,
+            limits: current_jsonpath_limits(),
+            sqljson: Some(Box::new(BoundSqlJsonClauses {
+                ret,
+                with_wrapper: q.with_wrapper,
+                omit_quotes,
+                on_empty,
+                on_error,
+                passing,
+            })),
+        })),
+        ty,
+    ))
+}
+
+// --- 評価 ---
+
+const MSG_VALUE_NOT_SINGLE: &str = "JSON path expression in JSON_VALUE must return a single item";
+const MSG_QUERY_NOT_SINGLE: &str =
+    "JSON path expression in JSON_QUERY must return a single item when no wrapper is requested";
+const MSG_VALUE_NOT_SCALAR: &str =
+    "JSON path expression in JSON_VALUE must return a single scalar item";
+const MSG_NO_ITEM: &str = "no SQL/JSON item found for specified path";
+
+fn json_const<'a>(text: &str, ret: SqlJsonRet) -> ExprValue<'a> {
+    let owned = Cow::Owned(text.to_string());
+    match ret {
+        SqlJsonRet::Jsonb => ExprValue::Json(owned),
+        SqlJsonRet::Json => ExprValue::JsonText(owned),
+        SqlJsonRet::Text => ExprValue::Text(owned),
+    }
+}
+
+/// `ON EMPTY`／`ON ERROR` の挙動を値にする。`ERROR` は `err` をそのまま返す。
+fn apply_behavior<'a>(
+    b: &BoundBehavior,
+    ret: SqlJsonRet,
+    err: SqlSurfaceError,
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    match b {
+        BoundBehavior::Error => Err(err),
+        BoundBehavior::Null | BoundBehavior::Unknown => Ok(ExprValue::Null),
+        BoundBehavior::True => Ok(ExprValue::Bool(true)),
+        BoundBehavior::False => Ok(ExprValue::Bool(false)),
+        BoundBehavior::EmptyArray => Ok(json_const("[]", ret)),
+        BoundBehavior::EmptyObject => Ok(json_const("{}", ret)),
+        BoundBehavior::Default(BoundDefault::Null) => Ok(ExprValue::Null),
+        BoundBehavior::Default(BoundDefault::Text(s)) => Ok(ExprValue::Text(Cow::Owned(s.clone()))),
+        BoundBehavior::Default(BoundDefault::Json(s)) => Ok(json_const(s, ret)),
+    }
+}
+
+/// SQL/JSON 問い合わせ関数の評価（`eval_jsonpath_fn` から句つきの束縛結果で呼ばれる）。
+fn eval_sql_json<'a>(
+    f: &BoundJsonPathFn,
+    c: &BoundSqlJsonClauses,
+    id: u64,
+    embedding: &'a [f32],
+    row_scalars: &'a [Option<ScalarRef<'a>>],
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    use crate::sql::udf_call::eval_with_scalars;
+    let ctx_value = eval_with_scalars(&f.target, id, embedding, row_scalars)?;
+    // PASSING 式は NULL 短絡より先に評価する（jsonb_path_* と同じく vars の評価エラーを
+    // NULL 行でも伝播させ、行ごとにエラー有無が変わらないようにする）。
+    let mut vars = std::collections::BTreeMap::new();
+    for (var, e) in &c.passing {
+        let v = eval_with_scalars(e, id, embedding, row_scalars)?;
+        vars.insert(
+            var.clone(),
+            crate::sql::udf_call::json_value_from_expr_value(&v)?,
+        );
+    }
+    let ctx_text = match ctx_value {
+        ExprValue::Null => return Ok(ExprValue::Null),
+        ExprValue::Json(t) => t,
+        _ => return Err(internal("SQL/JSON context item is not a jsonb value")),
+    };
+    let Some(path) = f.path.as_ref() else {
+        return Ok(ExprValue::Null);
+    };
+    let root = crate::json::parse_jsonb_for_build(&ctx_text).map_err(json_build_error)?;
+    let vars_value = JsonValue::Object(vars);
+    let mut opts = JsonPathEvalOptions::new().with_limits(f.limits);
+    if !c.passing.is_empty() {
+        opts = opts.with_vars(&vars_value);
+    }
+    // 抑止できる評価エラーだけを ON ERROR の対象にする（それ以外は常に返す）。
+    let eval_failure = |e: crate::json::jsonpath::JsonPathEvalError| {
+        if e.is_suppressible() {
+            apply_behavior(&c.on_error, c.ret, SqlSurfaceError::JsonPathEval(e))
+        } else {
+            Err(SqlSurfaceError::JsonPathEval(e))
+        }
+    };
+    if f.kind == JsonPathFnKind::SqlExists {
+        return match jsonpath_exists(path, &root, opts) {
+            Ok(Some(b)) => Ok(ExprValue::Bool(b)),
+            Ok(None) => Ok(ExprValue::Null),
+            Err(e) => eval_failure(e),
+        };
+    }
+    let items = match jsonpath_query(path, &root, opts) {
+        Ok(items) => items,
+        Err(e) => return eval_failure(e),
+    };
+    // ON EMPTY: 項目が 0 件。`ERROR ON EMPTY` は `22035` をそのまま返す。
+    if items.is_empty() {
+        return apply_behavior(
+            &c.on_empty,
+            c.ret,
+            SqlSurfaceError::NoSqlJsonItem {
+                detail: MSG_NO_ITEM,
+            },
+        );
+    }
+    let on_error = |err: SqlSurfaceError| apply_behavior(&c.on_error, c.ret, err);
+    if f.kind == JsonPathFnKind::SqlValue {
+        let [item] = items.as_slice() else {
+            return on_error(SqlSurfaceError::MoreThanOneSqlJsonItem {
+                detail: MSG_VALUE_NOT_SINGLE,
+            });
+        };
+        return match item {
+            JsonValue::Null => Ok(ExprValue::Null),
+            JsonValue::Bool(b) => Ok(ExprValue::Text(Cow::Borrowed(if *b {
+                "true"
+            } else {
+                "false"
+            }))),
+            JsonValue::String(s) => Ok(ExprValue::Text(Cow::Owned(s.clone()))),
+            JsonValue::Number(_) => Ok(ExprValue::Text(Cow::Owned(
+                serialize_jsonb_bounded(item).map_err(json_build_error)?,
+            ))),
+            JsonValue::Array(_) | JsonValue::Object(_) => {
+                on_error(SqlSurfaceError::SqlJsonScalarRequired {
+                    detail: MSG_VALUE_NOT_SCALAR,
+                })
+            }
+        };
+    }
+    // JSON_QUERY
+    let result = if c.with_wrapper {
+        JsonValue::Array(items)
+    } else {
+        let mut it = items.into_iter();
+        match (it.next(), it.next()) {
+            (Some(one), None) => one,
+            _ => {
+                return on_error(SqlSurfaceError::MoreThanOneSqlJsonItem {
+                    detail: MSG_QUERY_NOT_SINGLE,
+                })
+            }
+        }
+    };
+    if c.omit_quotes && !c.with_wrapper {
+        if let JsonValue::String(s) = result {
+            return Ok(ExprValue::Text(Cow::Owned(s)));
+        }
+    }
+    let text = serialize_jsonb_bounded(&result).map_err(json_build_error)?;
+    Ok(json_const(&text, c.ret))
 }
 
 #[cfg(test)]

@@ -19,8 +19,9 @@ use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::relation::{ColumnRef, TableRef};
 use crate::sql::udf_call::{
-    BinOp, Expr, JsonAccessOp, ValueFunctionKind, MAX_CALL_ARGS, MAX_CASE_BRANCHES,
-    MAX_CASE_NESTING, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_UDF_PARAMS,
+    BinOp, Expr, JsonAccessOp, SqlJsonBehavior, SqlJsonQueryExpr, SqlJsonQueryKind,
+    ValueFunctionKind, MAX_CALL_ARGS, MAX_CASE_BRANCHES, MAX_CASE_NESTING, MAX_EXPR_DEPTH,
+    MAX_EXPR_NODES, MAX_UDF_PARAMS,
 };
 use crate::sql::using_operation_id::OperationId;
 use crate::sql::where_negation::negate_conjunction;
@@ -563,6 +564,13 @@ pub enum SqlSurfaceError {
     IndeterminateCollation,
     /// NULL を許さない引数への NULL（`22004`。Issue #1599。`jsonb_build_object` のキー）。
     NullValueNotAllowed { detail: &'static str },
+    /// SQL/JSON 問い合わせ関数が単一項目を要する位置で 2 件以上を得た（`22034`。Issue #2187）。
+    /// 文言は固定の英語文で、項目・キー・値を含めない。
+    MoreThanOneSqlJsonItem { detail: &'static str },
+    /// `ERROR ON EMPTY` で結果が空（`22035`。Issue #2187）。
+    NoSqlJsonItem { detail: &'static str },
+    /// `JSON_VALUE` の結果がスカラーでない（`2203F`。Issue #2187）。
+    SqlJsonScalarRequired { detail: &'static str },
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
     /// スカラー／ベクトル算術式評価（SQL-26）の非有限値化（Issue #1163）にも使う。
@@ -1114,6 +1122,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::CollationMismatch => ErrorClass::CollationMismatch,
             SqlSurfaceError::IndeterminateCollation => ErrorClass::IndeterminateCollation,
             SqlSurfaceError::NullValueNotAllowed { .. } => ErrorClass::NullValueNotAllowed,
+            SqlSurfaceError::MoreThanOneSqlJsonItem { .. } => ErrorClass::MoreThanOneSqlJsonItem,
+            SqlSurfaceError::NoSqlJsonItem { .. } => ErrorClass::NoSqlJsonItem,
+            SqlSurfaceError::SqlJsonScalarRequired { .. } => ErrorClass::SqlJsonScalarRequired,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidDatetimeFormat { .. } => ErrorClass::InvalidDatetimeFormat,
             SqlSurfaceError::IntervalFieldOverflow { .. } => ErrorClass::IntervalFieldOverflow,
@@ -1223,6 +1234,9 @@ impl std::fmt::Display for SqlSurfaceError {
             // 接頭辞なしで固定文言をそのまま出す（PostgreSQL と同じ文言。値は埋め込まない）。
             SqlSurfaceError::InvalidParameterValue { detail } => f.write_str(detail),
             SqlSurfaceError::NullValueNotAllowed { detail } => f.write_str(detail),
+            SqlSurfaceError::MoreThanOneSqlJsonItem { detail }
+            | SqlSurfaceError::NoSqlJsonItem { detail }
+            | SqlSurfaceError::SqlJsonScalarRequired { detail } => f.write_str(detail),
             SqlSurfaceError::IndeterminateDatatype { param } => {
                 write!(f, "could not determine data type of parameter ${param}")
             }
@@ -5342,6 +5356,12 @@ impl<'a> Parser<'a> {
                 return Ok(lhs);
             }
         }
+        // `JSON_EXISTS`（Issue #2187）も boolean を返すため、裸の述語として受理する。
+        if let Expr::SqlJsonQuery(q) = &lhs {
+            if q.kind == SqlJsonQueryKind::Exists && !self.peek_is_cmp_op() {
+                return Ok(lhs);
+            }
+        }
         // `jsonb_path_exists`／`jsonb_path_match`（Issue #2185）は boolean を返すため、`JsonAccess` の
         // 述語演算子（Issue #1598）と同じく比較演算子なしの裸の述語として受理する。
         if let Expr::Call { name, .. } = &lhs {
@@ -6663,6 +6683,11 @@ impl<'a> Parser<'a> {
             )));
         }
         self.expect_punct('(')?;
+        // SQL/JSON 問い合わせ関数（TABLE-25・TASK-273。Issue #2187）は専用の句を持つため、
+        // 通常の引数列とは別の下位パーサへ振り分ける。
+        if let Some(kind) = sql_json_query_kind_from_name(&name) {
+            return self.parse_sql_json_query(kind, depth);
+        }
         // Issue #919・SQL-26: `POSITION(needle IN haystack)` は唯一の SQL 標準
         // 特殊構文形（カンマ区切りではなく `IN` キーワード区切り）。`name` が
         // 大小無視で `position` の場合に限りこの専用形を解析し、`haystack`／
@@ -6801,6 +6826,237 @@ impl<'a> Parser<'a> {
         self.expect_punct(')')?;
         self.consume_expr_node()?;
         Ok(Expr::Call { name, args })
+    }
+
+    /// 現在位置が大文字小文字を区別せず `word` の識別子なら消費して `true`。
+    fn eat_word(&mut self, word: &str) -> bool {
+        if self.peek_ident_matches(word) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `ON EMPTY`／`ON ERROR` の挙動の先頭語（`ERROR`・`NULL`・`TRUE`・`FALSE`・`UNKNOWN`・
+    /// `EMPTY`・`DEFAULT`）か。引用付きの `NULL`・真偽語は挙動ではない。
+    fn at_sql_json_behavior(&self) -> bool {
+        let Some(Token::Ident(w)) = self.peek() else {
+            return false;
+        };
+        if self.quoted_null.contains(&self.pos) {
+            return false;
+        }
+        [
+            "error", "null", "true", "false", "unknown", "empty", "default",
+        ]
+        .iter()
+        .any(|k| w.eq_ignore_ascii_case(k))
+    }
+
+    /// `ON EMPTY`／`ON ERROR` の 1 つ分（`<挙動> ON {EMPTY|ERROR}`）を解析する。
+    /// 戻り値の `bool` は `ON EMPTY` なら真。
+    fn parse_sql_json_behavior_clause(
+        &mut self,
+        depth: usize,
+    ) -> Result<(SqlJsonBehavior, bool), SqlSurfaceError> {
+        let word = self.expect_ident()?.to_ascii_lowercase();
+        let behavior = match word.as_str() {
+            "error" => SqlJsonBehavior::Error,
+            "null" => SqlJsonBehavior::Null,
+            "true" => SqlJsonBehavior::True,
+            "false" => SqlJsonBehavior::False,
+            "unknown" => SqlJsonBehavior::Unknown,
+            "empty" => {
+                if self.eat_word("object") {
+                    SqlJsonBehavior::EmptyObject
+                } else {
+                    self.eat_word("array");
+                    SqlJsonBehavior::EmptyArray
+                }
+            }
+            "default" => {
+                let e = self.parse_value_expr_with_null_context(depth + 1, true)?;
+                SqlJsonBehavior::Default(Box::new(e))
+            }
+            _ => {
+                return Err(SqlSurfaceError::unsupported(
+                    "unexpected token in SQL/JSON behavior clause",
+                ))
+            }
+        };
+        self.expect_ident_matching("on")?;
+        let is_empty = if self.eat_word("empty") {
+            true
+        } else if self.eat_word("error") {
+            false
+        } else {
+            return Err(SqlSurfaceError::unsupported(
+                "expected EMPTY or ERROR after ON in SQL/JSON behavior clause",
+            ));
+        };
+        Ok((behavior, is_empty))
+    }
+
+    /// `RETURNING` の型名（小文字・空白 1 個区切りに正規化。`(...)`・`[]` の修飾は印だけ残し、
+    /// 受理判定は束縛段が行う）。`FORMAT JSON` は `0A000`。
+    fn parse_sql_json_returning_type(&mut self) -> Result<String, SqlSurfaceError> {
+        let mut words = vec![self.expect_ident()?.to_ascii_lowercase()];
+        const CLAUSE_WORDS: [&str; 12] = [
+            "with", "without", "keep", "omit", "error", "null", "true", "false", "unknown",
+            "empty", "default", "on",
+        ];
+        loop {
+            if self.peek_ident_matches("format") || self.peek_ident_matches("encoding") {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "FORMAT JSON in RETURNING is not supported".to_string(),
+                });
+            }
+            match self.peek() {
+                Some(Token::Ident(w))
+                    if !CLAUSE_WORDS.iter().any(|k| w.eq_ignore_ascii_case(k)) =>
+                {
+                    words.push(w.to_ascii_lowercase());
+                    self.advance();
+                }
+                Some(Token::Punct('(')) => {
+                    while !matches!(self.peek(), Some(Token::Punct(')')) | None) {
+                        self.advance();
+                    }
+                    self.advance();
+                    words.push("(...)".to_string());
+                }
+                Some(Token::Punct('[')) => {
+                    while !matches!(self.peek(), Some(Token::Punct(']')) | None) {
+                        self.advance();
+                    }
+                    self.advance();
+                    words.push("[]".to_string());
+                }
+                _ => break,
+            }
+        }
+        Ok(words.join(" "))
+    }
+
+    /// `JSON_EXISTS`／`JSON_VALUE`／`JSON_QUERY` の `(` 直後からの解析（TABLE-25・TASK-273。
+    /// Issue #2187）。句の順序は PostgreSQL の文法に合わせ、`PASSING` → `RETURNING` →
+    /// （`JSON_QUERY` のみ）ラッパー → 引用符 → `ON EMPTY` → `ON ERROR`。受理しない句
+    /// （`FORMAT JSON`・`CONDITIONAL WRAPPER` 等）は構文としては認識して `0A000` を返し、順序違反・
+    /// 未知の語は `42601` にする。型・挙動の受理判定は束縛段（`sql::jsonpath_fn`）が行う。
+    fn parse_sql_json_query(
+        &mut self,
+        kind: SqlJsonQueryKind,
+        depth: usize,
+    ) -> Result<Expr, SqlSurfaceError> {
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "SQL/JSON query functions are not supported in a CHECK constraint"
+                    .to_string(),
+            });
+        }
+        let not_supported = |detail: &str| SqlSurfaceError::FeatureNotSupported {
+            detail: detail.to_string(),
+        };
+        let context = self.parse_value_expr_with_null_context(depth + 1, true)?;
+        if self.peek_ident_matches("format") {
+            return Err(not_supported("FORMAT JSON is not supported"));
+        }
+        self.expect_punct(',')?;
+        let path = self.parse_value_expr_with_null_context(depth + 1, true)?;
+        if self.peek_ident_matches("as") {
+            return Err(not_supported("a path name (AS) is not supported"));
+        }
+        let mut passing: Vec<(String, Expr)> = Vec::new();
+        if self.eat_word("passing") {
+            loop {
+                if passing.len() >= MAX_CALL_ARGS {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many PASSING arguments",
+                    ));
+                }
+                let value = self.parse_value_expr_with_null_context(depth + 1, true)?;
+                self.expect_ident_matching("as")?;
+                // 引用の有無を字句段が保持しないため、引用なし識別子として小文字へ畳む。
+                let var = self.expect_ident()?.to_ascii_lowercase();
+                passing.push((var, value));
+                if matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        let returning = if self.eat_word("returning") {
+            Some(self.parse_sql_json_returning_type()?)
+        } else {
+            None
+        };
+        let mut with_wrapper = false;
+        let mut keep_quotes: Option<bool> = None;
+        if kind == SqlJsonQueryKind::Query {
+            if self.eat_word("without") {
+                self.eat_word("array");
+                self.expect_ident_matching("wrapper")?;
+            } else if self.peek_ident_matches("with") {
+                self.advance();
+                if self.peek_ident_matches("conditional") {
+                    return Err(not_supported("CONDITIONAL WRAPPER is not supported"));
+                }
+                self.eat_word("unconditional");
+                self.eat_word("array");
+                self.expect_ident_matching("wrapper")?;
+                with_wrapper = true;
+            }
+            if self.peek_ident_matches("keep") || self.peek_ident_matches("omit") {
+                let keep = self.peek_ident_matches("keep");
+                self.advance();
+                self.expect_ident_matching("quotes")?;
+                if self.peek_ident_matches("on") && self.peek_ident_matches_at(1, "scalar") {
+                    self.advance();
+                    self.advance();
+                    self.expect_ident_matching("string")?;
+                }
+                keep_quotes = Some(keep);
+            }
+            if with_wrapper && keep_quotes.is_some() {
+                return Err(SqlSurfaceError::unsupported(
+                    "QUOTES behavior must not be specified when WITH WRAPPER is used",
+                ));
+            }
+        }
+        let mut on_empty: Option<SqlJsonBehavior> = None;
+        let mut on_error: Option<SqlJsonBehavior> = None;
+        while self.at_sql_json_behavior() {
+            let (behavior, is_empty) = self.parse_sql_json_behavior_clause(depth)?;
+            if is_empty {
+                // ON EMPTY は ON ERROR より前にだけ置ける。JSON_EXISTS は ON EMPTY を持たない。
+                if on_empty.is_some() || on_error.is_some() || kind == SqlJsonQueryKind::Exists {
+                    return Err(SqlSurfaceError::unsupported(
+                        "misplaced or unsupported ON EMPTY clause",
+                    ));
+                }
+                on_empty = Some(behavior);
+            } else {
+                if on_error.is_some() {
+                    return Err(SqlSurfaceError::unsupported("duplicate ON ERROR clause"));
+                }
+                on_error = Some(behavior);
+            }
+        }
+        self.expect_punct(')')?;
+        self.consume_expr_node()?;
+        Ok(Expr::SqlJsonQuery(Box::new(SqlJsonQueryExpr {
+            kind,
+            context,
+            path,
+            passing,
+            returning,
+            with_wrapper,
+            keep_quotes,
+            on_empty,
+            on_error,
+        })))
     }
 
     /// ORDER BY 式の許可形状（距離演算子形または関数呼び出し形）。関数呼び出し形は
@@ -12231,6 +12487,16 @@ fn parse_select_shape(
     }))
 }
 
+/// SQL/JSON 問い合わせ関数の名前（大小無視）から種別を引く（Issue #2187）。
+fn sql_json_query_kind_from_name(name: &str) -> Option<SqlJsonQueryKind> {
+    match name.to_ascii_lowercase().as_str() {
+        "json_exists" => Some(SqlJsonQueryKind::Exists),
+        "json_value" => Some(SqlJsonQueryKind::Value),
+        "json_query" => Some(SqlJsonQueryKind::Query),
+        _ => None,
+    }
+}
+
 /// 式木が関数呼び出し・`CASE`・`COALESCE`・`NULLIF` のいずれかを含むか（Issue #1188。
 /// `HAVING` の式述語を「従来形では書けない形」に限定する判定。`EXTRACT` は構文段で
 /// `date_part` 呼び出しへ脱糖済みのため `Call` に含まれる）。
@@ -12240,8 +12506,9 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
             expr_contains_scalar_function(lhs) || expr_contains_scalar_function(rhs)
         }
-        // 照合指定（TABLE-28・Issue #1609）は従来形では書けない式。
-        Expr::Collate { .. } => true,
+        // 照合指定（TABLE-28・Issue #1609）は従来形では書けない式。SQL/JSON 問い合わせ関数
+        // （TABLE-25・Issue #2187）も関数呼び出しと同様。
+        Expr::Collate { .. } | Expr::SqlJsonQuery(_) => true,
         Expr::Number(_)
         | Expr::String(_)
         | Expr::Ident(_)
