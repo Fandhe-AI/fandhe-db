@@ -471,7 +471,7 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
     Ok(())
 }
 
-/// スカラー索引宣言が対象にできる列型。`VECTOR`・`BOOLEAN`／`JSON(B)`／`ARRAY` は
+/// スカラー索引宣言が対象にできる列型。`VECTOR`・`BOOLEAN`／`JSON(B)`／`ARRAY`／`INTERVAL`（#1580 で解禁）は
 /// 索引化に効かない宣言を作らないため fail-closed に拒否する。`BYTEA` は自動・
 /// 宣言とも `OrderedColumnIndex::Bytes` で索引化されるため受理する（#1257・#1362、INDEX-7）。
 /// 数値 4 型（INTEGER／BIGINT／REAL／DOUBLE PRECISION）もレーン A（#1359）で自動・
@@ -486,7 +486,6 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
             | ColumnType::Date
             | ColumnType::Timestamp
             | ColumnType::TimestampTz
-            | ColumnType::Interval
             | ColumnType::Time
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid

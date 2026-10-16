@@ -398,6 +398,7 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
         "SELECT INTERVAL '1 day' FROM t LIMIT 5",
         "CREATE TABLE a (v INTERVAL PRIMARY KEY)",
         "CREATE TABLE a (v INTERVAL UNIQUE)",
+        "CREATE INDEX idx_v ON t (v)",
         "ALTER TABLE t ALTER COLUMN v TYPE TEXT",
         "ALTER TABLE t ALTER COLUMN n TYPE INTERVAL",
     ] {
