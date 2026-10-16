@@ -169,7 +169,7 @@ Sync バッチ内で後続のメッセージが失敗しても、先に commit �
 | 未定義 statement／portal への参照・名前付き statement／portal の重複作成・`Failed` 状態の portal への再 Execute | `08P01`（`ProtocolViolation`） |
 | Bind のパラメータ数不一致・format code 個数不正 | `08P01` |
 | 結果 format code の個数不正・値不正（0/1 以外） | `08P01`（`ResultFormats::resolve`） |
-| Bind のパラメータ format code が binary 指定で対象スロットが text 系以外（WIRE-12・#1171）・結果 format code が非対応型の列を binary 指定（WIRE-14。`id`／`VECTOR`／`Computed`。TABLE-13・Issue #886 の `BOOLEAN`／`BYTEA` も同様） | `0A000`（`FeatureNotSupported`） |
+| Bind のパラメータ format code が binary 指定で対象スロットが text 系以外（WIRE-12・#1171）・結果 format code が非対応型の列を binary 指定（WIRE-14。`VECTOR`／`Computed{ty: None}`。`id`・`NUMERIC` は Issue #2442 でバイナリ対応済み。TABLE-13・Issue #886 の `BOOLEAN`／`BYTEA` も同様） | `0A000`（`FeatureNotSupported`） |
 | Execute の結果列不整合（cached plan must not change result type 相当） | `0A000` |
 | 件数・名前長・保持バイト上限超過 | `54000`（`PayloadTooLarge`） |
 | body の構造不正（NUL 終端欠落・余剰バイト・負の件数・非 UTF-8・種別バイト不正） | `08P01` |
@@ -237,7 +237,7 @@ panic すると緊急応答〔TASK-97・RECOVER-6〕が発火しない fail-open
   派生 portal 一括 Close／未存在名の Close）・Flush の無応答性と非空
   body の Sync／Flush の切断・portal 件数／名前長上限・結果 format code
   の解決／事前検査（`TEXT` 列への binary 指定は成功し `RowDescription`／
-  `DataRow` に反映される・非対応型〔`id` 等〕への binary 指定は `0A000`・
+  `DataRow` に反映される・非対応型〔#934 当時は `id` 等。現在は `VECTOR` 等〕への binary 指定は `0A000`・
   個数／値不正は `08P01`）・テナント境界（RLS-7）・`engine: None` 経路の
   後方互換・簡易クエリ応答の不変性を固定。PR #1013 レビュー指摘対応で
   `malformed_terminate_during_ignore_till_sync_is_rejected_not_silently_closed`

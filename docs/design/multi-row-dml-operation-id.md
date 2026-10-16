@@ -238,6 +238,8 @@ origin/main 取り込み時の是正: 並行実装していた Issue #921 のタ
 
 - `DateLiteral(days)`＝タグ 10・型バイト `0`・`days`（`i32`、LE）
 - `TimestampLiteral(micros)`＝タグ 10・型バイト `1`・`micros`（`i64`、LE）
+- `TimeLiteral(micros)`＝タグ 10・型バイト `2`・`micros`（`i64`、LE。Issue #1570）
+- `TimestampTzLiteral`（Issue #1576）＝タグ 10・型バイト `3`（ゾーン指定済み。UTC の `micros`、`i64` LE）／型バイト `4`（ゾーン無し。壁時計の `micros` ＋解釈に使うセッション TimeZone 名の長さ前置き）。既存の型バイト 0〜2 のハッシュ値は不変
 - `JsonAccess{op, lhs, rhs}`＝タグ 12・演算子種別 1 バイト（`->`=1・`->>`=2・`#>`=3・`#>>`=4・
   `@>`=5・`<@`=6・`?`=7・`?|`=8・`?&`=9・`||`=10・`#-`=11・`@?`=12・`@@`=13）・`lhs`・`rhs`（Issue #1596・#1598・#2181・#2186。既存の種別は不変。`jsonb - x` は `Binary Sub` のタグで区別される）
 - `ValueFunction{kind, precision}`＝タグ 13・種別 1 バイト（`CURRENT_TIMESTAMP`=1・`CURRENT_DATE`=2・

@@ -139,7 +139,9 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
         | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
         | Expr::ValueFunction { .. } => Ok(()),
         Expr::Collate { expr, .. } => reject_non_constant_with(expr, allow_placeholders),
         Expr::SqlJsonQuery(q) => {
@@ -421,6 +423,8 @@ fn expr_value_to_cell(v: ExprValue<'_>, ty: Option<&ColumnType>) -> Result<Cell,
         ExprValue::Date(d) => Cell::Date(d),
         ExprValue::Timestamp(t) => Cell::Timestamp(t),
         ExprValue::Time(t) => Cell::Time(t),
+        ExprValue::TimestampTz(t) => Cell::TimestampTz(t),
+        ExprValue::Interval(v) => Cell::Interval(v),
         ExprValue::Null => Cell::Null,
         ExprValue::Vector(v) => Cell::Vector(into_owned_vector(v)?),
         ExprValue::Json(j) | ExprValue::JsonText(j) => Cell::Json(j.into_owned()),

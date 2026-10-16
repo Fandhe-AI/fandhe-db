@@ -412,6 +412,15 @@ pub fn map_json_to_literal(
                 "TIMESTAMPTZ column value must be a JSON string",
             )),
         },
+        // INTERVAL は JSON 文字列を文字列リテラルとして束縛し、書式・範囲の検査は engine の
+        // `parse_interval` に委ねる（書式違反 `22007`・フィールド範囲外 `22015`・合成後の
+        // 範囲外 `22008`・`infinity` は `0A000`。TABLE-34・NOSQL-17・Issue #1583）。
+        ColumnType::Interval => match raw {
+            JsonValue::String(s) => Ok(InsertLiteral::String(s.clone())),
+            _ => Err(TypedJsonError::TypeMismatch(
+                "INTERVAL column value must be a JSON string",
+            )),
+        },
         // SMALLINT は INTEGER／BIGINT と同じ規則で束縛し、範囲検査は engine の
         // `bind_integer_literal` に一本化する（TABLE-30・NOSQL-17・Issue #1561）。
         ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => match raw {
@@ -627,6 +636,28 @@ mod tests {
             JsonValue::Number(JsonNumber::PosInt(1)),
         ] {
             let err = map_json_to_literal(&col(ColumnType::TimestampTz), &bad).expect_err("reject");
+            assert!(matches!(err, TypedJsonError::TypeMismatch(_)));
+            assert_eq!(err.wire_code(), "42601");
+        }
+    }
+
+    /// INTERVAL は JSON 文字列のみを文字列リテラルとして束縛し、他の JSON 型は `42601`
+    /// （Issue #1583）。
+    #[test]
+    fn interval_column_binds_strings_and_rejects_other_json() {
+        let ok = map_json_to_literal(
+            &col(ColumnType::Interval),
+            &JsonValue::String("1 day".to_string()),
+        )
+        .expect("string binds");
+        assert!(matches!(ok, InsertLiteral::String(ref s) if s == "1 day"));
+        for bad in [
+            JsonValue::Bool(true),
+            JsonValue::Number(JsonNumber::PosInt(1)),
+            JsonValue::Array(vec![]),
+            JsonValue::Object(Default::default()),
+        ] {
+            let err = map_json_to_literal(&col(ColumnType::Interval), &bad).expect_err("reject");
             assert!(matches!(err, TypedJsonError::TypeMismatch(_)));
             assert_eq!(err.wire_code(), "42601");
         }

@@ -189,18 +189,68 @@ TABLE-32・親 #1568 のポインタ（第 2 段）。#1569 で fail-closed に�
 - **内部表現**: UTC の 1970-01-01 起点マイクロ秒 `i64`。受理範囲は UTC で `0001-01-01 00:00:00Z`〜`9999-12-31 23:59:59.999999Z`（`TIMESTAMP` と同じ）。カタログタグは `timestamptz`（`param` は `-` 固定）。値は `Value::TimestampTz`／`ScalarRef::TimestampTz`／`Cell::TimestampTz` の専用 variant とし、naive の `Timestamp` を流用しない（naive 値と UTC 値の取り違えによる fail-open を防ぐ）。行バイトは presence + `i64 LE`（9 バイト。`SCALAR_TIMESTAMPTZ_ENTRY_LEN`）で、encode・decode・scan のすべてで `validate_timestamptz_micros` により範囲を再検証する。`content_hash` は未使用のタグ 17 を採番した（UTC へ正規化した後の値をハッシュするため、`+09` と `Z` の同一時刻は同じハッシュになる）。
 - **閉じた文法**: `<TIMESTAMP の D-5 文法>[空白 0〜1 個]<ゾーン>`。ゾーンは `Z`／`z`、数値 offset（`±HH`・`±HHMM`・`±HH:MM`・`±HH:MM:SS`。数字は 2 桁固定、時 0〜15、分・秒 0〜59）、IANA 名（bundled tzdb で解決できるもの）。日時部は `parse_timestamp` と同一の実装を共有する（日付だけ・秒なし・小数 7 桁以上は `22007`）。長さは解析前に `MAX_TIMESTAMPTZ_LITERAL_LEN` で拒否し、非 ASCII は `22007`。
 - **正規化**: ゾーンのある入力は UTC へ変換して格納する。ゾーンの無い入力はセッション TimeZone の壁時計として解釈する。セッション TimeZone の保持は #1575 の担当のため、本 Issue では `SessionTimeZone::utc()` 固定（差し替え口は `parse_timestamptz` の `default_tz` 引数）。`SessionTimeZone` は jiff の型を公開 API へ出さない不透明型で、`TimeZoneDatabase::bundled()` から解決したものだけを保持する（`jiff::tz::db()`・`TimeZone::system()` は使わない）。TZ 名は長さ・許可文字（ASCII 英数と `/`・`_`・`+`・`-`）を検査してから解決し、`Etc/Unknown` は明示的に拒否する。
-- **DST の解決（暫定）**: 名前付き TZ の gap（存在しない時刻）は直前の offset、fold（重複する時刻）は後の offset で解決する（PG の `DetermineTimeZoneOffset` の既定と同じ見込み。例: NY の `2026-03-08 02:30` は `-05` として `07:30Z`、`2026-11-01 01:30` は `-05` として `06:30Z`）。jiff の既定に任せず自前で選んでいる。最終確定は #1576 が PG 17 の実測と照合して行う。
+- **DST の解決**: 名前付き TZ の gap（存在しない時刻）は直前の offset、fold（重複する時刻）は後の offset で解決する（PG の `DetermineTimeZoneOffset` の既定と同じ見込み。例: NY の `2026-03-08 02:30` は `-05` として `07:30Z`、`2026-11-01 01:30` は `-05` として `06:30Z`）。jiff の既定に任せず自前で選んでいる。PG 17 の実測との照合は #1576 で完了し確定した（[timestamptz-conversion.md](timestamptz-conversion.md)）。
 - **SQLSTATE**: 書式違反 `22007`、範囲外（UTC へ直して範囲外、offset の範囲外を含む）`22008`、解決できない TZ 名 `22023`（detail は静的文字列で入力を反射しない）。
 - **整形**: `format_timestamptz(utc_micros, &SessionTimeZone)` は `YYYY-MM-DD HH:MM:SS[.ffffff]+HH[:MM[:SS]]`（分・秒が 0 でなければ付ける）。局所年が 0 以下になる場合は PG に合わせ年を `1 - year` とし offset の後ろに「 BC」（先頭に空白を伴う）を付ける。局所年 10000 は 5 桁のまま出す。LMT のような秒を含む offset も整形できる。現状の呼び出し元（投影・COPY TO・HTTP JSON）はすべて UTC 固定（`+00`）。
 - **型名**: `TIMESTAMPTZ`・`TIMESTAMP WITH TIME ZONE` を受理（`TIMESTAMPTZ` は綴りを保持する別名として返し、同名 ENUM との衝突を実行段が検出する）。`TIMESTAMPTZ(p)`・`timestamptz[]` は構文段で `0A000`。`timestamptz` は `CREATE_ONLY_RESERVED_TYPE_NAMES` へ追加した。
 - **PostgreSQL との乖離**: (1) 日付だけ・秒なし・小数 7 桁以上・1 桁の時の offset は受理しない。(2) 範囲は UTC で 0001〜9999 年。(3) offset の範囲外は PG では `22009` だが、Issue の写像に従い `22008`。(4) TZ 略称（`JST` 等）と POSIX 形式は #1575 まで `22023`。
-- **暫定挙動（fail-closed）**: 述語・ORDER BY・GROUP BY・集計・window・集合演算・式（列参照と型付きリテラル `TIMESTAMPTZ '...'`）・二次索引・EXTRACT／date_trunc・UDF 引数は既存の拒否コードで拒否する（#1576）。PK／UNIQUE／FK・JOIN キー・`ALTER COLUMN TYPE` は担当 Issue 未定。wire は暫定で text（OID 25）を公告してバイナリは非対応、NoSQL は型束縛・filter とも `TypeMismatch` で拒否する（OID 1184 とバイナリ・NoSQL は #1577）。JSON 応答の型名は `"timestamptz"`。
-- **対象外**: セッション TimeZone（`SET TIME ZONE`／StartupMessage／`SHOW`）・TZ 略称・POSIX 形式は #1575。`AT TIME ZONE`・他型との変換・述語・集計・索引・EXTRACT・DST 解決の PG 17 照合は #1576。`now()`／`CURRENT_TIMESTAMP` の戻り値型の切り替え、`TIMESTAMPTZ(p)`、`timestamptz[]`（OID 1185）、特殊値 `infinity`・`epoch`・`now` は担当 Issue 未定。
+- **暫定挙動（fail-closed）**: 述語・ORDER BY・GROUP BY・集計・window・集合演算・式・二次索引・EXTRACT／date_trunc は #1576 で解禁済み（[timestamptz-conversion.md](timestamptz-conversion.md)）。UDF 引数は引き続き拒否する。PK／UNIQUE／FK・JOIN キー・`ALTER COLUMN TYPE` は担当 Issue 未定。wire は暫定で text（OID 25）を公告してバイナリは非対応、NoSQL は型束縛・filter とも `TypeMismatch` で拒否する（OID 1184 とバイナリ・NoSQL は #1577）。JSON 応答の型名は `"timestamptz"`。
+- **対象外**: セッション TimeZone（`SET TIME ZONE`／StartupMessage／`SHOW`）・POSIX 形式は #1575 で実装済み（[session-timezone.md](session-timezone.md)。TZ 略称は PG と同じく `SET` で `22023`）。`AT TIME ZONE`・他型との変換・述語・集計・索引・EXTRACT・DST 解決の PG 17 照合は #1576 で実装済み（[timestamptz-conversion.md](timestamptz-conversion.md)）。`now()`／`CURRENT_TIMESTAMP` の戻り値型の切り替え、`TIMESTAMPTZ(p)`、`timestamptz[]`（OID 1185）、特殊値 `infinity`・`epoch`・`now` は担当 Issue 未定。
 
 ## Issue #1577 追記: TIMESTAMPTZ の wire OID とバイナリ入出力
 
 TABLE-33・WIRE-13・WIRE-14・NOSQL-13・NOSQL-17 のポインタ。#1574 の暫定状態（wire は text・OID 25、バイナリと NoSQL 型束縛は拒否）を解消した。
 
-- **wire**: OID 1184・typlen 8 で公告し、バイナリ結果・バイナリ param に対応（詳細は [wire-binary-format.md](wire-binary-format.md)）。テキスト出力は UTC 固定。
+- **wire**: OID 1184・typlen 8 で公告し、バイナリ結果・バイナリ param に対応（詳細は [wire-binary-format.md](wire-binary-format.md)）。テキスト出力はセッション TimeZone で整形する（#1575）。
 - **NoSQL**: insert／update は JSON 文字列を束縛し（数値・真偽値は `42601`）、書式・範囲・TZ 名の検査は engine の `parse_timestamptz`（`22007`／`22008`／`22023`）に委ねる。`create_table`／`add_column` の型名 `"timestamptz"` を受理する。
-- **対象外**: セッション TimeZone での表示（#1575）、NoSQL filter・述語（#1576 の後）、`timestamptz[]`（OID 1185）、COPY バイナリ、特殊値 `infinity`。
+- **対象外**: NoSQL filter・述語（#1576 の後）、`timestamptz[]`（OID 1185）、COPY バイナリ、特殊値 `infinity`。
+
+## Issue #1579 追記: INTERVAL 列型
+
+`INTERVAL` を独立の `ColumnType::Interval` として追加した（TABLE-34・親 #1578 のポインタ。第 1 段。型の格納表現と入出力の書式だけを用意し、比較・算術・EXTRACT・wire OID は後続 Issue が担う）。
+
+- **内部表現**: 月（`i32`）・日（`i32`）・マイクロ秒（`i64`）の三要素 `datetime::Interval`。三要素は独立で、`1 mon` と `30 days`、`24 hours` と `1 day` は別の格納値になる（SQL の比較は #1580 の正規化キー）。`PartialEq`／`Hash` は生の三要素の一致で codec・content_hash 専用。値は `Value::Interval`／`ScalarRef::Interval`／`Cell::Interval`。カタログタグは `interval`（`param` は `-` 固定）。行ペイロードは presence(1) ＋ micros(8, LE) ＋ days(4, LE) ＋ months(4, LE) の 17 バイト。`content_hash` のタグは 18（正規化しない生の三要素をハッシュする）。
+- **無限大の番兵**: PostgreSQL 17 の予約値 `(i32::MAX, i32::MAX, i64::MAX)`・`(i32::MIN, i32::MIN, i64::MIN)` は有効な値として受理しない。入力 `infinity`／`-infinity` は `0A000`、解析結果が番兵と一致した場合は `22008`。encode・decode・scan・`tenant::validate_set_assignments` で多層に拒否する（将来 infinity を解禁しても番兵の意味が衝突しない）。
+- **閉じた文法**（`datetime::parse_interval`。長さ上限 255 バイト、フィールド数上限 25、ASCII のみ、前後の空白と大小文字は許容）: (a) 単位句 `[@] 要素… [ago]`（要素は符号付き数値＋単位、または時刻部 `[±]H+:MM[:SS[.f]]`。単位なしの数値は秒、直後が時刻部なら日）、(b) SQL 標準形 `Y-M`・`D H:MM:SS`、(c) ISO 8601（記号形式 `P1Y2M3DT4H5M6S`、代替形式 `P0001-02-03T04:05:06`。`P`・単位は大文字）。単位の綴りは `microsecond(s)`・`us`・`msec`・`second(s)`・`sec`・`minute(s)`・`min`・`hour(s)`・`hr`・`day(s)`・`week(s)`・`month(s)`・`mon`・`year(s)`・`yr`・`decade(s)`・`century/centuries`・`millennium/millennia` などを受理する。
+- **端数の繰り下げ**: PG17 と同じ規則。年・decade・century・millennium の端数は整数月へ偶数丸めし、残余は日へ繰り下げない。月の端数は 30 日単位で日へ、日の端数は µs へ（偶数丸め）。例: `1.5 years` は `1 year 6 mons`、`0.1 years` は `1 mon`、`1.5 months` は `1 mon 15 days`、`1.5 days` は `1 day 12:00:00`。累積は `years`・`months`・`days`（`i32`）と `micros`（`i64`）の中間値に `checked_*` で積み、最後に `年×12＋月` を合成する。
+- **SQLSTATE**: 書式違反 `22007`、フィールド値の範囲外（数値が `i64` に収まらない・単位換算や累積があふれる）`22015`（`ErrorClass::IntervalFieldOverflow` を新設）、合成後の範囲外・番兵一致 `22008`、`infinity` `0A000`。detail は静的文字列で入力を反射しない。
+- **整形**: `format_interval` は `IntervalStyle=postgres`（`EncodeInterval` と同じ規則）。年・月・日を順に `N year(s)`・`N mon(s)`・`N day(s)`（単数形は値が 1 のときだけ）、直前が負で今が正のときだけ `+` を付ける。時刻部は `HH:MM:SS[.ffffff]`（端数の末尾の 0 は削る。時は 2 桁以上）で、全要素 0 なら `00:00:00`。`parse_interval(format_interval(v)) == v` が番兵以外の全域で成り立つ。
+- **型名**: `INTERVAL`（綴りを保持する別名として返し、同名 ENUM との衝突を実行段が検出する）。`interval` は `CREATE_ONLY_RESERVED_TYPE_NAMES` に追加した。`INTERVAL(p)`・フィールド制限付き（`INTERVAL YEAR TO MONTH` 等）・`interval[]` は構文段で `0A000`。
+- **暫定挙動（fail-closed）**: #1579 時点で受理するのは DDL の列宣言、INSERT／UPDATE SET／UPSERT／COPY FROM／列 DEFAULT（文字列リテラル）、投影・RETURNING・COPY TO の整形、`IS NULL`。述語（`IS NULL` 以外）・ORDER BY・集計・索引宣言は #1580 で解禁した（下の「Issue #1580 追記」）。GROUP BY・SELECT DISTINCT・window・集合演算・サブクエリの値族・scoring_boost は担当 Issue 未定（代表値の規則の確定が必要）で拒否のまま。式中の列参照・型付きリテラル `INTERVAL '...'`・算術は #1581 まで拒否する。wire は暫定で text（OID 25）を公告し値は `format_interval` の文字列で出す。バイナリの結果列・パラメータは非対応、NoSQL の型束縛と filter は `42601`（JSON 応答の型名は `"interval"`）。いずれも #1583。PK／UNIQUE／FK・JOIN キー・`ALTER COLUMN TYPE`・ファイル形 INSERT は担当 Issue 未定のため既存の拒否コードで止める。
+- **PostgreSQL との乖離**: (1) `infinity`／`-infinity` は未対応。(2) 単位語の「先頭 10 文字で照合する」癖は再現しない（完全一致のみ）。(3) `INTERVAL(p)` とフィールド制限は `0A000`。(4) `IntervalStyle` は `postgres` 固定（`SET IntervalStyle`・ParameterStatus は対象外）。
+- **対象外**: `ExprType::Interval`・算術・型付きリテラル式（#1581）、EXTRACT／date_part（#1582）、OID 1186・バイナリ・NoSQL（#1583）、フィールド修飾子付きのリテラル（`'1' DAY`）、`interval[]`（OID 1187）、PK／UNIQUE／FK・JOIN キー・型変更（担当未定）。
+
+## Issue #1580 追記: INTERVAL の比較・集計・索引
+
+INTERVAL 列の述語・ORDER BY・集計・二次索引を解禁した（TABLE-34・親 #1578 のポインタ。第 2 段）。
+
+- **比較キー**: `datetime::interval_cmp_key` が PG17 の `interval_cmp_value` と同じ換算（1 か月 = 30 日、1 日 = 24 時間）で 1 本のスカラーにする。`key = micros + (months * 30 + days) * 86_400_000_000` を **i128** で計算する。`months * 30 + days` は約 6.7e10 以内、日数 × 8.64e10 µs は約 5.8e21 以内で、i64 には収まらないが i128（約 1.7e38）には余裕で収まる。正規化等価は生の等価より粗く、`'1 mon'`・`'30 days'`・`'720 hours'` は同じキーになる。
+- **`Ord` は実装しない**: `Interval` の `PartialEq`／`Eq`／`Hash` は生の三要素（codec・content_hash・`validate_interval` 専用）で、正規化した `Ord` を同居させると `Ord` と `Eq` の整合契約に反する。SQL の意味論（比較・並べ替え・DISTINCT・索引）は必ず `cmp_interval`／`interval_cmp_key` を通す。
+- **WHERE**: `FilterOp::TypedCompare`／`InTyped`／`BetweenLiteral` に対応する。`TypedLiteral::Interval(i128)` は**正規化キー**を保持し、行側も `ScalarRef::as_interval` からキーへ変換して比べる（TIME の腕のように生の等価で比べると、`v IN ('30 days')` が格納済みの `'1 month'` を取りこぼす）。Describe 用のダミー（`Interval(0)`）を compare・in・between の 3 箇所に追加した。
+- **ORDER BY**: `OrderKind::Interval`。キーは生の三要素を保持し比較は `cmp_interval`。同点の行は既存の副次順序（id → テナント）で決まる。`resolve_order_kind` は GROUP BY のキー解決と共有されるため、`resolve_group_by_key` が INTERVAL を `resolve_order_kind` の前に明示的に拒否する（SELECT DISTINCT も同じ関数を通る）。`NULLS FIRST/LAST` の明示指定は engine 全体で未対応のため対象外（PG 既定の NULL 位置のみ）。
+- **集計**: `COUNT`・`COUNT(DISTINCT)`（正規化キー 16 バイトで重複除去）・`MIN`/`MAX`・`SUM`・`AVG`。`MIN`/`MAX` は正規化キーで比べ**元の三要素**を返す。キーが同点のときは PG17 の遷移関数（`interval_smaller`／`interval_larger`）と同じく後から観測した値を採る。PG は aggsortop により索引経由で求めることもあり、同点時の代表は実装依存になる点が乖離になりうる。`SUM` は三要素ごとの checked 加算（正規化しない。`'1 mon' + '30 days'` は `'1 mon 30 days'`）で、あふれは `22008`。`AVG` は和（あふれは `22008`）を `interval_div_f64`（PG17 `interval_div` 相当。#1581 の乗除でも再利用する）で割る。固定ベクタ: `AVG('1 mon','2 mons')` = `1 mon 15 days`、`AVG('1 day','2 days')` = `1 day 12:00:00`、`AVG('1 mon','00:00:00')` = `15 days`。全行 NULL・0 行は NULL（`COUNT(DISTINCT)` は 0）。結果型は INTERVAL。HAVING の数値比較対象と式内の参照は拒否のまま。
+- **二次索引**: `OrderedColumnIndex::Interval(Vec<(i128, u32)>)`。`I128` は NUMERIC 専用（列 scale を持つ）のため流用せず、`(I128, Numeric)` の照会腕が INTERVAL 列から到達しないようにした。自動索引と `CREATE INDEX` の宣言（`is_declarable_scalar_index_type`）の両方で構築し、キーは評価側と同じ `interval_cmp_key` なので索引経路と全走査の結果は一致する。`InTyped` は他型と同じく索引未対応（全走査）。
+- **fail-closed のまま（担当 Issue 未定）**: GROUP BY・SELECT DISTINCT・window（PARTITION BY／ORDER BY のキーと集計の入力）・集合演算・サブクエリの値族・scoring_boost。正規化等価な値を 1 グループにまとめるとき、どちらの三要素を代表値として出すかの規則（PG との整合）が未確定のため。PK／UNIQUE／FK・JOIN キー・`ALTER COLUMN TYPE` も現状維持。
+- **対象外**: 式・算術・型付きリテラル `INTERVAL '...'`・列同士の比較（#1581）、EXTRACT（#1582）、OID 1186・バイナリ・NoSQL の filter／型束縛（#1583。下の「Issue #1583 追記」で対応）。
+
+## Issue #1583 追記: INTERVAL の wire OID とバイナリ入出力・NoSQL
+
+TABLE-34・WIRE-13・WIRE-14・NOSQL-13・NOSQL-14・NOSQL-17 のポインタ。#1579 の暫定状態（wire は text・OID 25、バイナリと NoSQL は拒否）を解消した。wire-server のみの変更で、engine は変更しない。
+
+- **wire**: OID 1186・typlen 16・型名 `interval` で公告し、バイナリ結果（time i64・day i32・month i32 の 16 バイト BE）とバイナリ param に対応（詳細は [wire-binary-format.md](wire-binary-format.md)）。**契約変更**: INTERVAL 列の公告 OID が 25 から 1186 へ変わる。
+- **NoSQL 型束縛・DDL**: insert／update は JSON 文字列を束縛し（数値・真偽値・配列・オブジェクトは `42601`）、書式・範囲の検査は engine の `parse_interval`（`22007`／`22015`／`22008`、`infinity` は `0A000`）に委ねる。`create_table`／`add_column` の型名 `"interval"` を受理する（`interval(p)` などの修飾付きは拒否のまま）。
+- **NoSQL filter**: `eq`／`ne`／範囲比較／`between`／`in`／`is_null` を DATE／TIMESTAMP／UUID と同じ文字列レーンで解禁した（比較は engine の正規化キー。`1 mon` と `30 days` は等価）。述語形の update／delete の filter も同じ束縛点を共有する。`prefix`／`like` は TEXT 系専用のまま（`22000`）。
+- **NoSQL sort**: `scan` の `sort` に INTERVAL 列を指定すると SQL の `ORDER BY` と同じ正規化キー順（同順位は id）になることをテストで固定した。変更は不要だった。
+- **対象外**: `interval[]`（OID 1187）、`INTERVAL(p)`・フィールド修飾付きの列型、`infinity`／`-infinity` の受理、`SET IntervalStyle` と ParameterStatus、COPY バイナリ、GROUP BY・DISTINCT・PK／UNIQUE／FK・JOIN キー（担当 Issue 未定）、式・算術（#1581）、EXTRACT（#1582）。
+
+## Issue #1581 追記: 日付時刻と INTERVAL の加減算・乗除
+
+TABLE-34・親 #1578 のポインタ。#1579 の暫定状態（式中の INTERVAL 列参照・型付きリテラル・算術は拒否）を解消した。純関数は `sql/interval_arith.rs`、束縛は `udf_call::bind_binary`、評価は `eval_binary`（再帰評価と `expr_program` の双方が共有）。
+
+- **式の型**: `ExprType::Interval`／`ExprValue::Interval`／`BoundExpr::{Interval, IntervalColumnRef}`／`Expr::IntervalLiteral`。結果列型は `ColumnType::Interval`（wire は #1583 で OID 1186・typlen 16・バイナリ入出力に対応済み）。
+- **型規則**: `TIMESTAMP ± INTERVAL`・`INTERVAL + TIMESTAMP` は TIMESTAMP、`DATE ± INTERVAL` は TIMESTAMP（深夜 0 時へ昇格）、`TIMESTAMPTZ ± INTERVAL` は TIMESTAMPTZ（セッション TZ 依存のため CHECK では `0A000`）、`INTERVAL ± INTERVAL`・`INTERVAL * n`・`n * INTERVAL`・`INTERVAL / n` は INTERVAL、`TIMESTAMP(TZ) - TIMESTAMP(TZ)`（DATE・混在を含む）は INTERVAL、`DATE - DATE` は従来どおり日数。INTERVAL が絡む上記以外の組は `42883`、INTERVAL を伴わない既存の不一致（`TIMESTAMP + 1` 等）は従来どおり `42804`。
+- **意味論（PG17 準拠）**: 月 → 日 → 時刻の順に加算し、月加算後の日は新しい月の末日へ切り詰める（`2024-01-31 + 1 mon` は `2024-02-29`、`+ '1 mon 1 day'` は `2024-03-01`）。`TIMESTAMPTZ` はセッション TZ の壁時計で月・日を加算し UTC へ戻す（gap は直前の offset、fold は後の offset。#1576 と同じ）。jiff の年範囲（±9999）を超える未来側の中間値は、暦が一致する 400 年窓（9200〜9599 年）へ写して tzdb の将来規則で offset を引く（2007 年以前の歴史的規則を拾わない。過去側は 2000〜2399 年）。減算は INTERVAL の各要素を符号反転して加算する（`i32::MIN`／`i64::MIN` は `22008`）。時点の差は日数と日内マイクロ秒に分け符号を揃える（`interval_justify_hours`）。乗除は PG17 の `interval_mul`／`interval_div` と同じ月 → 日 → 秒へのカスケード（端数は µs の偶数丸め）。
+- **SQLSTATE**: 結果・中間値が範囲外（PG の timestamp 範囲を超える中間値を含む）、INTERVAL の要素あふれ、乗除の NaN は `22008`（±∞ の係数は infinity の interval を要するため `0A000`）。0 除算は `22012`。エラー文言は固定の英語で値を含めない。
+- **#1580 との境界**: #1580 の比較・集計・索引は列参照が対象で、INTERVAL 式（算術結果）の比較・`NULLIF`・`ORDER BY`・集計（SUM/AVG/MIN/MAX）・GROUP BY は `42883`／`0A000` の fail-closed のまま。正規化キー比較の式への解禁は別途。
+- **既知の差分**: (1) 本 DB の TIMESTAMP 範囲は 0001〜9999 年のため、PG では成功する範囲外の結果が `22008` になる。(2) 型なし文字列 `'2024-01-31' + INTERVAL …` は本 DB では TEXT 扱いで `42883`（PG は interval として解釈し `22007` 等で失敗する。いずれも成功しない）。(3) 単項マイナス `-INTERVAL`・CAST（`::`）は文法に無い。(4) `INTERVAL '1' DAY` などのフィールド修飾子・`INTERVAL(p)` は `0A000`。(5) `TIME ± INTERVAL`・`TIME - TIME` は `42883`。(6) INTERVAL 式を `jsonb` へ変換する形は `0A000`。
+- **対象外**: `justify_*`／`age`／`make_interval`、EXTRACT／date_part／date_trunc の INTERVAL 対応（#1582）、OID 1186・バイナリ・NoSQL（#1583）、infinity の interval、`IntervalStyle` の切り替え。

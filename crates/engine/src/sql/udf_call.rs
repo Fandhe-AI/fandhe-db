@@ -28,6 +28,7 @@ use crate::catalog::{ColumnType, TableSchema};
 use crate::row_codec::ScalarRef;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::datetime_fn::{self, DatePartField, DateTruncUnit};
+use crate::sql::interval_arith;
 use crate::sql::string_fn;
 use crate::sql::time_fn::{self, StatementClock};
 use crate::wasm_udf::WasmUdfBackend;
@@ -274,6 +275,15 @@ pub enum Expr {
     /// `TIME '<literal>'`（[`Expr::DateLiteral`] と同じ理由。値は
     /// `crate::datetime::parse_time` の解析結果＝0 時起点のマイクロ秒。Issue #1570）。
     TimeLiteral(i64),
+    /// `TIMESTAMPTZ '<literal>'`／`TIMESTAMP WITH TIME ZONE '<literal>'`（Issue #1576・TABLE-33）。
+    /// 構文段はセッション TimeZone を知らない（セッション TZ の束縛は実行段）ため、ゾーン指定
+    /// （`Z`・数値 offset・IANA 名）を持つ入力は UTC マイクロ秒へ解決済みで保持し、持たない入力は
+    /// 壁時計のまま保持して束縛時にセッション TZ で UTC へ確定する（`session_local = true`）。
+    TimestampTzLiteral { micros: i64, session_local: bool },
+    /// `INTERVAL '<literal>'`（型付きリテラル。対象ビヘイビア: TABLE-34。Issue #1581）。
+    /// 構文段が `crate::datetime::parse_interval` で解析済みの三要素を保持する
+    /// （[`Expr::DateLiteral`] と同じ理由で生文字列は保持しない）。
+    IntervalLiteral(crate::datetime::Interval),
     /// jsonb の演算子（パス取得 `->` `->>` `#>` `#>>`・包含 `@>` `<@`・存在 `?` `?|` `?&`。
     /// 対象ビヘイビア: TABLE-25。Issue #1596・#1598）。構文段（`allowlist::Parser::parse_json_access_expr`）が
     /// PostgreSQL と同じ優先順位（加減算より弱く比較より強い）・左結合で生成する。
@@ -641,6 +651,14 @@ pub enum BoundExpr {
     Timestamp(i64),
     /// `TIME` 定数（0 時起点のマイクロ秒。Issue #1570）。
     Time(i64),
+    /// `TIMESTAMPTZ` 定数（UTC の 1970-01-01 起点マイクロ秒。Issue #1576）。
+    TimestampTz(i64),
+    /// `INTERVAL` 定数（Issue #1581・TABLE-34）。
+    Interval(crate::datetime::Interval),
+    /// nullable `INTERVAL` 列の参照（[`BoundExpr::DateColumnRef`] 参照。Issue #1581）。
+    IntervalColumnRef {
+        index: usize,
+    },
     /// nullable `DATE` 列の参照。`index` は `TextColumnRef` と同じ論理列
     /// インデックス系列（`schema.columns` 添字）。値は行スカラー値
     /// （[`eval_with_scalars`] の `row_scalars`）から解決する。
@@ -653,6 +671,10 @@ pub enum BoundExpr {
     },
     /// nullable `TIME` 列の参照（[`BoundExpr::DateColumnRef`] 参照。Issue #1570）。
     TimeColumnRef {
+        index: usize,
+    },
+    /// nullable `TIMESTAMPTZ` 列の参照（[`BoundExpr::DateColumnRef`] 参照。Issue #1576）。
+    TimestampTzColumnRef {
         index: usize,
     },
     /// nullable な数値列（INTEGER/BIGINT/REAL/DOUBLE）の参照（Issue #1075・
@@ -833,6 +855,16 @@ impl PartialEq for BoundExpr {
             (BoundExpr::Date(a), BoundExpr::Date(b)) => a == b,
             (BoundExpr::Timestamp(a), BoundExpr::Timestamp(b)) => a == b,
             (BoundExpr::Time(a), BoundExpr::Time(b)) => a == b,
+            (BoundExpr::TimestampTz(a), BoundExpr::TimestampTz(b)) => a == b,
+            (
+                BoundExpr::TimestampTzColumnRef { index: a },
+                BoundExpr::TimestampTzColumnRef { index: b },
+            ) => a == b,
+            (BoundExpr::Interval(a), BoundExpr::Interval(b)) => a == b,
+            (
+                BoundExpr::IntervalColumnRef { index: a },
+                BoundExpr::IntervalColumnRef { index: b },
+            ) => a == b,
             (BoundExpr::TimeColumnRef { index: a }, BoundExpr::TimeColumnRef { index: b }) => {
                 a == b
             }
@@ -959,6 +991,10 @@ pub enum ExprType {
     Timestamp,
     /// `TIME` 値（0 時起点のマイクロ秒。Issue #1570）。
     Time,
+    /// `TIMESTAMPTZ` 値（UTC のマイクロ秒。比較・並べ替えは時点で行う。Issue #1576）。
+    TimestampTz,
+    /// `INTERVAL` 値（月・日・マイクロ秒の三要素。Issue #1581・TABLE-34）。
+    Interval,
     /// jsonb 値（Issue #1596・TABLE-25）。消費できるのは投影・比較・ORDER BY・JSON 演算子の
     /// オペランド・jsonb 関数（Issue #1599）の引数だけで、算術・集計・関数引数・`CASE` 等・代入は `0A000` で拒否する（Issue #1597）。
     Json,
@@ -991,6 +1027,10 @@ pub enum ExprValue<'a> {
     Timestamp(i64),
     /// `TIME` 値（0 時起点のマイクロ秒。`0..=86_400_000_000`。Issue #1570）。
     Time(i64),
+    /// `TIMESTAMPTZ` 値（UTC のマイクロ秒。Issue #1576）。
+    TimestampTz(i64),
+    /// `INTERVAL` 値（Issue #1581・TABLE-34）。
+    Interval(crate::datetime::Interval),
     /// jsonb 値の正規化テキスト（Issue #1596・TABLE-25。`write_canonical` 済み）。
     /// 列参照は借用、パス演算子の結果は所有。
     Json(Cow<'a, str>),
@@ -1094,6 +1134,28 @@ pub enum BuiltinFn {
     /// `date_trunc(unit: Text, src: Timestamp) -> Timestamp`（`field` と同じく
     /// `unit` は束縛時に解決済み）。
     DateTrunc(DateTruncUnit),
+    /// `date_part(field, src: TimestampTz) -> Scalar`（Issue #1576）。暦の計算はセッション TZ、
+    /// `epoch` は UTC の絶対値、`timezone*` は offset。実行時の引数は `src` 1 個。
+    DatePartTz(DatePartField),
+    /// `date_trunc(unit, src: TimestampTz) -> TimestampTz`（セッション TZ。Issue #1576）。
+    DateTruncTz(DateTruncUnit),
+    /// `date_trunc(unit, src: TimestampTz, zone: Text) -> TimestampTz`（第 3 引数の TZ。Issue #1576）。
+    DateTruncTzZone(DateTruncUnit),
+    /// `TIMESTAMP` → `TIMESTAMPTZ`（セッション TZ の壁時計として解釈。暗黙の変換と代入時の変換。
+    /// 内部専用。Issue #1576）。
+    TimestampToTstz,
+    /// `TIMESTAMPTZ` → `TIMESTAMP`（セッション TZ の壁時計。内部専用。Issue #1576）。
+    TstzToTimestamp,
+    /// `DATE` → `TIMESTAMPTZ`（局所の 0 時。内部専用。Issue #1576）。
+    DateToTstz,
+    /// `TIMESTAMPTZ` → `DATE`（局所の日付。内部専用。Issue #1576）。
+    TstzToDate,
+    /// `timezone(zone: Text, ts: Timestamp) -> TimestampTz`／`ts AT TIME ZONE zone`（Issue #1576）。
+    AtZoneToTstz,
+    /// `timezone(zone: Text, tstz: TimestampTz) -> Timestamp`／`tstz AT TIME ZONE zone`。
+    AtZoneToTimestamp,
+    /// `timezone(ts: Timestamp) -> TimestampTz`／`ts AT LOCAL`（セッション TZ。Issue #1576）。
+    AtLocalToTstz,
     /// `DATE` を深夜 0 時の `TIMESTAMP` へ昇格する内部専用関数（名前では
     /// 解決できない。`bind_call`／`bind_binary` が `date_part`／`date_trunc` の
     /// `DATE` 引数、および `DATE`／`TIMESTAMP` 比較の `DATE` 側に挿入する）。
@@ -1117,7 +1179,8 @@ pub enum BuiltinFn {
     /// でないとき（ICU）だけ束縛段が作り、バイト列順なら従来の [`BoundExpr::Binary`] のまま
     /// にして既定照合の経路をバイト単位で不変に保つ。引数は TEXT 2 個で、NULL を含めば NULL。
     /// `BoundExpr::Binary` ではないためスカラー二次索引の分類（`sql::scalar_plan`）に乗らず、
-    /// 全走査へ縮退する（照合込みの索引は #2191）。
+    /// 全走査へ縮退する（EXPLAIN の縮退理由は `sql::explain::expr_text_equality` が `=` 比較に
+    /// ついて検出する。照合込みの索引は #2191）。
     TextCompare(BinOp, crate::collation::Collation),
 }
 
@@ -1222,7 +1285,9 @@ pub(crate) fn first_non_builtin_call_with(
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
-        | Expr::TimeLiteral(_) => None,
+        | Expr::IntervalLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. } => None,
         Expr::Call { name, args } => {
             // `json_*`／`to_json`（Issue #2180）は json 型の式を要し、CHECK 本体・連鎖ビュー本文には
             // json 列参照を置けないため、時刻関数と同じく禁止要素として報告する（`42601`）。
@@ -1325,7 +1390,7 @@ fn is_variadic_or_overloaded_builtin_name(name: &str) -> bool {
         // `date_part`／`date_trunc`（対象ビヘイビア: SQL-26。Issue #920）は
         // field／unit の解決結果を `BuiltinFn` のペイロードとして持つため、
         // 名前だけでは variant が一意に定まらない（`round` と同じ理由。§2-4）。
-        "substr" | "concat" | "round" | "date_part" | "date_trunc"
+        "substr" | "concat" | "round" | "date_part" | "date_trunc" | "timezone"
     )
 }
 
@@ -1367,6 +1432,26 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         // 含まれない（§2-4）。
         BuiltinFn::DatePart(_) => (&[ExprType::Timestamp], ExprType::Scalar),
         BuiltinFn::TimePart(_) => (&[ExprType::Time], ExprType::Scalar),
+        BuiltinFn::DatePartTz(_) => (&[ExprType::TimestampTz], ExprType::Scalar),
+        BuiltinFn::DateTruncTz(_) => (&[ExprType::TimestampTz], ExprType::TimestampTz),
+        BuiltinFn::DateTruncTzZone(_) => (
+            &[ExprType::TimestampTz, ExprType::Text],
+            ExprType::TimestampTz,
+        ),
+        BuiltinFn::TimestampToTstz | BuiltinFn::AtLocalToTstz => {
+            (&[ExprType::Timestamp], ExprType::TimestampTz)
+        }
+        BuiltinFn::TstzToTimestamp => (&[ExprType::TimestampTz], ExprType::Timestamp),
+        BuiltinFn::DateToTstz => (&[ExprType::Date], ExprType::TimestampTz),
+        BuiltinFn::TstzToDate => (&[ExprType::TimestampTz], ExprType::Date),
+        BuiltinFn::AtZoneToTstz => (
+            &[ExprType::Text, ExprType::Timestamp],
+            ExprType::TimestampTz,
+        ),
+        BuiltinFn::AtZoneToTimestamp => (
+            &[ExprType::Text, ExprType::TimestampTz],
+            ExprType::Timestamp,
+        ),
         BuiltinFn::DateTrunc(_) => (&[ExprType::Timestamp], ExprType::Timestamp),
         BuiltinFn::DateToTimestamp => (&[ExprType::Date], ExprType::Timestamp),
         BuiltinFn::BpcharToText => (&[ExprType::Text], ExprType::Text),
@@ -1419,6 +1504,16 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         // datetime-scalar-functions.md` に記録）。
         BuiltinFn::DatePart(_)
         | BuiltinFn::TimePart(_)
+        | BuiltinFn::DatePartTz(_)
+        | BuiltinFn::DateTruncTz(_)
+        | BuiltinFn::DateTruncTzZone(_)
+        | BuiltinFn::TimestampToTstz
+        | BuiltinFn::TstzToTimestamp
+        | BuiltinFn::DateToTstz
+        | BuiltinFn::TstzToDate
+        | BuiltinFn::AtZoneToTstz
+        | BuiltinFn::AtZoneToTimestamp
+        | BuiltinFn::AtLocalToTstz
         | BuiltinFn::DateTrunc(_)
         | BuiltinFn::DateToTimestamp
         | BuiltinFn::BpcharToText => false,
@@ -1747,9 +1842,22 @@ fn validate_closed_expr(
                 // 対象ビヘイビア: SQL-26（Issue #920）。field／unit の解決は
                 // 呼び出し時（`bind_call`）に第 1 引数が Text リテラルか検査する
                 // ため、定義時はここで arity（常に 2）のみ検査する。
-                if args.len() != 2 {
+                let max = if name.eq_ignore_ascii_case("date_trunc") {
+                    3
+                } else {
+                    2
+                };
+                if !(2..=max).contains(&args.len()) {
                     return Err(SqlSurfaceError::undefined_function(format!(
                         "function {name} expects 2 argument(s), got {}",
+                        args.len()
+                    )));
+                }
+            } else if name.eq_ignore_ascii_case("timezone") {
+                // `timezone(zone, x)`／`timezone(x)`（Issue #1576）。型の検査は呼び出し時に行う。
+                if !(1..=2).contains(&args.len()) {
+                    return Err(SqlSurfaceError::undefined_function(format!(
+                        "function {name} expects 1 or 2 argument(s), got {}",
                         args.len()
                     )));
                 }
@@ -1834,7 +1942,11 @@ fn validate_closed_expr(
             validate_closed_expr(lhs, params, registry, node_budget)?;
             validate_closed_expr(rhs, params, registry, node_budget)
         }
-        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) | Expr::TimeLiteral(_) => Ok(()),
+        Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. } => Ok(()),
         // 時刻の値関数は呼び出し側の文脈（読み取り文）の時刻へ展開時に束縛される。
         Expr::ValueFunction { .. } => Ok(()),
     }
@@ -1908,9 +2020,13 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
         | BoundExpr::Time(_)
+        | BoundExpr::TimestampTz(_)
+        | BoundExpr::Interval(_)
         | BoundExpr::DateColumnRef { .. }
         | BoundExpr::TimestampColumnRef { .. }
         | BoundExpr::TimeColumnRef { .. }
+        | BoundExpr::TimestampTzColumnRef { .. }
+        | BoundExpr::IntervalColumnRef { .. }
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
@@ -1987,9 +2103,13 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
         | BoundExpr::Time(_)
+        | BoundExpr::TimestampTz(_)
+        | BoundExpr::Interval(_)
         | BoundExpr::DateColumnRef { .. }
         | BoundExpr::TimestampColumnRef { .. }
         | BoundExpr::TimeColumnRef { .. }
+        | BoundExpr::TimestampTzColumnRef { .. }
+        | BoundExpr::IntervalColumnRef { .. }
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
@@ -2063,9 +2183,13 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
         | BoundExpr::Time(_)
+        | BoundExpr::TimestampTz(_)
+        | BoundExpr::Interval(_)
         | BoundExpr::DateColumnRef { .. }
         | BoundExpr::TimestampColumnRef { .. }
         | BoundExpr::TimeColumnRef { .. }
+        | BoundExpr::TimestampTzColumnRef { .. }
+        | BoundExpr::IntervalColumnRef { .. }
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
@@ -2120,6 +2244,8 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::DateColumnRef { index }
         | BoundExpr::TimestampColumnRef { index }
         | BoundExpr::TimeColumnRef { index }
+        | BoundExpr::TimestampTzColumnRef { index }
+        | BoundExpr::IntervalColumnRef { index }
         | BoundExpr::JsonbColumnRef { index }
         | BoundExpr::JsonColumnRef { index }
         | BoundExpr::ColumnRef { index } => visit(*index),
@@ -2146,6 +2272,8 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
         | BoundExpr::Time(_)
+        | BoundExpr::TimestampTz(_)
+        | BoundExpr::Interval(_)
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
@@ -2217,6 +2345,8 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::DateColumnRef { index }
         | BoundExpr::TimestampColumnRef { index }
         | BoundExpr::TimeColumnRef { index }
+        | BoundExpr::TimestampTzColumnRef { index }
+        | BoundExpr::IntervalColumnRef { index }
         | BoundExpr::JsonbColumnRef { index }
         | BoundExpr::JsonColumnRef { index }
         | BoundExpr::ColumnRef { index } => {
@@ -2230,6 +2360,8 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
         | BoundExpr::Time(_)
+        | BoundExpr::TimestampTz(_)
+        | BoundExpr::Interval(_)
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
@@ -2557,6 +2689,8 @@ pub(crate) fn column_type_for_expr_type(ty: ExprType) -> Option<ColumnType> {
         ExprType::Date => Some(ColumnType::Date),
         ExprType::Timestamp => Some(ColumnType::Timestamp),
         ExprType::Time => Some(ColumnType::Time),
+        ExprType::TimestampTz => Some(ColumnType::TimestampTz),
+        ExprType::Interval => Some(ColumnType::Interval),
         ExprType::Json => Some(ColumnType::Jsonb),
         ExprType::JsonText => Some(ColumnType::Json),
         ExprType::Vector => None,
@@ -2798,6 +2932,7 @@ fn bind_nullif(
                     | ExprType::Date
                     | ExprType::Timestamp
                     | ExprType::Time
+                    | ExprType::TimestampTz
             ) {
                 return Err(SqlSurfaceError::DatatypeMismatch {
                     detail: "NULLIF arguments must be scalar, text, date, timestamp, or time"
@@ -3060,10 +3195,18 @@ pub(super) fn bind_expr_any(
                     // `TIME` 列の式内参照（Issue #1570。EXTRACT／date_part・比較の前提）。
                     // 値は行スカラービューから解決し、実 NULL は `ExprValue::Null` として伝播する。
                     ColumnType::Time => Ok((BoundExpr::TimeColumnRef { index }, ExprType::Time)),
-                    // TIMESTAMPTZ 列の式内参照は #1576 まで fail-closed（Issue #1574）。
-                    ColumnType::TimestampTz => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} cannot be used in an expression (TIMESTAMPTZ columns are not supported)"
-                    ))),
+                    // `TIMESTAMPTZ` 列の式内参照（Issue #1576）。値は UTC マイクロ秒で、比較・
+                    // 並べ替えは時点で行い、暦の計算はセッション TZ で行う。
+                    ColumnType::TimestampTz => Ok((
+                        BoundExpr::TimestampTzColumnRef { index },
+                        ExprType::TimestampTz,
+                    )),
+                    // `INTERVAL` 列の式内参照（Issue #1581・TABLE-34）。値は行スカラービューから
+                    // 解決し、実 NULL は `ExprValue::Null` として伝播する。
+                    ColumnType::Interval => Ok((
+                        BoundExpr::IntervalColumnRef { index },
+                        ExprType::Interval,
+                    )),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (ARRAY columns are not supported)"
                     ))),
@@ -3225,6 +3368,23 @@ pub(super) fn bind_expr_any(
         Expr::DateLiteral(days) => Ok((BoundExpr::Date(*days), ExprType::Date)),
         Expr::TimestampLiteral(micros) => Ok((BoundExpr::Timestamp(*micros), ExprType::Timestamp)),
         Expr::TimeLiteral(micros) => Ok((BoundExpr::Time(*micros), ExprType::Time)),
+        Expr::IntervalLiteral(v) => Ok((BoundExpr::Interval(*v), ExprType::Interval)),
+        // `TIMESTAMPTZ '…'`（Issue #1576）。ゾーン指定の無い入力は束縛時のセッション TZ で
+        // UTC へ確定する（PG と同じく parse analysis 時点の TZ）。
+        Expr::TimestampTzLiteral {
+            micros,
+            session_local,
+        } => {
+            if *session_local {
+                let utc = crate::datetime::with_current_session_time_zone(|tz| {
+                    tz.timestamp_to_timestamptz(*micros)
+                })
+                .ok_or_else(datetime_fn::tz_out_of_range)?;
+                Ok((BoundExpr::TimestampTz(utc), ExprType::TimestampTz))
+            } else {
+                Ok((BoundExpr::TimestampTz(*micros), ExprType::TimestampTz))
+            }
+        }
         Expr::JsonAccess { op, lhs, rhs } => bind_json_access(*op, lhs, rhs, env, node_budget),
         Expr::ValueFunction { kind, precision } => bind_value_function(*kind, *precision, env),
         Expr::SqlJsonQuery(q) => crate::sql::jsonpath_fn::bind_sql_json_query(q, env, node_budget),
@@ -4119,6 +4279,7 @@ fn column_type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Timestamp => "timestamp",
         ColumnType::Time => "time",
         ColumnType::TimestampTz => "timestamp with time zone",
+        ColumnType::Interval => "interval",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",
@@ -4281,6 +4442,13 @@ fn bind_unknown_literal_against(
     // 解析する（PostgreSQL の `docb -> 'k' = '1'` と同じ解決）。
     if other_ty == ExprType::Json {
         return bind_jsonb_literal(s);
+    }
+    // `TIMESTAMPTZ` 式と比較される型なし文字列リテラルは timestamptz として束縛時のセッション TZ で
+    // 解析する（PostgreSQL と同じ解決。Issue #1576）。
+    if other_ty == ExprType::TimestampTz {
+        reject_session_tz_in_check()?;
+        let bound = bind_timestamptz_text_literal(s)?;
+        return Ok((bound, ExprType::TimestampTz));
     }
     // `TIME` 式と比較される型なし文字列リテラルは TIME として解析する（PostgreSQL と同じ
     // 解決。Issue #1570）。エラーにリテラル本文は含めない（`bind_datetime_literal` と同じ写像）。
@@ -4594,7 +4762,66 @@ fn bind_binary(
             (ExprType::Date, ExprType::Date) if op == BinOp::Sub => {
                 Ok((mk(op, l, r), ExprType::Scalar))
             }
+            // 日付時刻と INTERVAL の算術（Issue #1581・TABLE-34。PostgreSQL 17 準拠）。
+            // `DATE ± INTERVAL` は深夜 0 時の `TIMESTAMP` へ昇格して `TIMESTAMP` を返す。
+            (ExprType::Timestamp, ExprType::Interval) => {
+                Ok((mk(op, l, r), ExprType::Timestamp))
+            }
+            (ExprType::Interval, ExprType::Timestamp) if op == BinOp::Add => {
+                Ok((mk(op, l, r), ExprType::Timestamp))
+            }
+            (ExprType::Date, ExprType::Interval) => {
+                Ok((mk(op, wrap_date_to_timestamp(l), r), ExprType::Timestamp))
+            }
+            (ExprType::Interval, ExprType::Date) if op == BinOp::Add => {
+                Ok((mk(op, l, wrap_date_to_timestamp(r)), ExprType::Timestamp))
+            }
+            // `TIMESTAMPTZ ± INTERVAL` は月・日をセッション TZ の壁時計で加算するため、
+            // セッション TZ に依存する（CHECK 制約では `0A000`）。
+            (ExprType::TimestampTz, ExprType::Interval) => {
+                reject_session_tz_in_check()?;
+                Ok((mk(op, l, r), ExprType::TimestampTz))
+            }
+            (ExprType::Interval, ExprType::TimestampTz) if op == BinOp::Add => {
+                reject_session_tz_in_check()?;
+                Ok((mk(op, l, r), ExprType::TimestampTz))
+            }
+            (ExprType::Interval, ExprType::Interval) => Ok((mk(op, l, r), ExprType::Interval)),
+            // 時点どうしの差は INTERVAL（`TIMESTAMPTZ` 同士は UTC の差で TZ 非依存）。
+            (ExprType::Timestamp, ExprType::Timestamp) if op == BinOp::Sub => {
+                Ok((mk(op, l, r), ExprType::Interval))
+            }
+            (ExprType::TimestampTz, ExprType::TimestampTz) if op == BinOp::Sub => {
+                Ok((mk(op, l, r), ExprType::Interval))
+            }
+            (ExprType::Date, ExprType::Timestamp) if op == BinOp::Sub => Ok((
+                mk(op, wrap_date_to_timestamp(l), r),
+                ExprType::Interval,
+            )),
+            (ExprType::Timestamp, ExprType::Date) if op == BinOp::Sub => Ok((
+                mk(op, l, wrap_date_to_timestamp(r)),
+                ExprType::Interval,
+            )),
+            (ExprType::TimestampTz, ExprType::Timestamp) if op == BinOp::Sub => {
+                reject_session_tz_in_check()?;
+                Ok((mk(op, l, tstz_from_timestamp(r)), ExprType::Interval))
+            }
+            (ExprType::Timestamp, ExprType::TimestampTz) if op == BinOp::Sub => {
+                reject_session_tz_in_check()?;
+                Ok((mk(op, tstz_from_timestamp(l), r), ExprType::Interval))
+            }
+            (ExprType::TimestampTz, ExprType::Date) if op == BinOp::Sub => {
+                reject_session_tz_in_check()?;
+                Ok((mk(op, l, tstz_from_date(r)), ExprType::Interval))
+            }
+            (ExprType::Date, ExprType::TimestampTz) if op == BinOp::Sub => {
+                reject_session_tz_in_check()?;
+                Ok((mk(op, tstz_from_date(l), r), ExprType::Interval))
+            }
             (ExprType::Text, _) | (_, ExprType::Text) => Err(text_arithmetic_error()),
+            // INTERVAL が絡む上記以外の組（`INTERVAL - TIMESTAMP`・`INTERVAL + 1`・`TIME ± INTERVAL`
+            // など）は PostgreSQL の `operator does not exist` と同じ `42883`。
+            (ExprType::Interval, _) | (_, ExprType::Interval) => Err(interval_operator_error()),
             _ => Err(SqlSurfaceError::datatype_mismatch(
                 "'+'/'-' require both operands to be scalar, or a DATE combined with a day-count scalar",
             )),
@@ -4604,7 +4831,12 @@ fn bind_binary(
             (ExprType::Vector, ExprType::Scalar) | (ExprType::Scalar, ExprType::Vector) => {
                 Ok((mk(op, l, r), ExprType::Vector))
             }
+            // `INTERVAL * 数値`・`数値 * INTERVAL`（Issue #1581）。
+            (ExprType::Interval, ExprType::Scalar) | (ExprType::Scalar, ExprType::Interval) => {
+                Ok((mk(op, l, r), ExprType::Interval))
+            }
             (ExprType::Text, _) | (_, ExprType::Text) => Err(text_arithmetic_error()),
+            (ExprType::Interval, _) | (_, ExprType::Interval) => Err(interval_operator_error()),
             _ => Err(SqlSurfaceError::datatype_mismatch(
                 "'*' requires scalar operands, or one vector and one scalar operand",
             )),
@@ -4612,7 +4844,10 @@ fn bind_binary(
         BinOp::Div => match (lt, rt) {
             (ExprType::Scalar, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Scalar)),
             (ExprType::Vector, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Vector)),
+            // `INTERVAL / 数値`（Issue #1581。0 除算は評価時に `22012`）。
+            (ExprType::Interval, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Interval)),
             (ExprType::Text, _) | (_, ExprType::Text) => Err(text_arithmetic_error()),
+            (ExprType::Interval, _) | (_, ExprType::Interval) => Err(interval_operator_error()),
             _ => Err(SqlSurfaceError::datatype_mismatch(
                 "'/' requires scalar operands, or a vector divided by a scalar",
             )),
@@ -4630,6 +4865,26 @@ fn bind_binary(
             // `TIME` 同士の比較（0 時起点のマイクロ秒の全順序。Issue #1570）。PostgreSQL に
             // `TIME`⋈`TIMESTAMP`／`DATE` の暗黙変換は無いため、混在は下の腕で `42883`。
             (ExprType::Time, ExprType::Time) => Ok((mk(op, l, r), ExprType::Bool)),
+            // `TIMESTAMPTZ` 同士は UTC の時点で比較する（Issue #1576）。TIMESTAMP・DATE との混在は
+            // 後者をセッション TZ で `TIMESTAMPTZ` へ変換してから比較する（PG の暗黙の変換。
+            // 評価時のセッション TZ を使うため束縛には TZ を焼き込まない）。
+            (ExprType::TimestampTz, ExprType::TimestampTz) => Ok((mk(op, l, r), ExprType::Bool)),
+            (ExprType::TimestampTz, ExprType::Timestamp) => {
+                reject_session_tz_in_check()?;
+                Ok((mk(op, l, tstz_from_timestamp(r)), ExprType::Bool))
+            }
+            (ExprType::Timestamp, ExprType::TimestampTz) => {
+                reject_session_tz_in_check()?;
+                Ok((mk(op, tstz_from_timestamp(l), r), ExprType::Bool))
+            }
+            (ExprType::TimestampTz, ExprType::Date) => {
+                reject_session_tz_in_check()?;
+                Ok((mk(op, l, tstz_from_date(r)), ExprType::Bool))
+            }
+            (ExprType::Date, ExprType::TimestampTz) => {
+                reject_session_tz_in_check()?;
+                Ok((mk(op, tstz_from_date(l), r), ExprType::Bool))
+            }
             // `DATE` ⋈ `TIMESTAMP` は `DATE` 側を深夜 0 時の `TIMESTAMP` へ
             // 暗黙昇格してから比較する（PostgreSQL 互換。§2-3）。
             (ExprType::Date, ExprType::Timestamp) => {
@@ -4644,7 +4899,7 @@ fn bind_binary(
             // Issue #1408・SQL-24・ERR-2: 比較演算子が存在しない型の組（PostgreSQL の
             // `operator does not exist`）は `42883`（従来は `42804`）。算術腕は据え置き。
             _ => Err(SqlSurfaceError::undefined_function(
-                "operator does not exist: comparison operands must be both scalar, both text, both date/timestamp, both time, or both jsonb",
+                "operator does not exist: comparison operands must be both scalar, both text, both date/timestamp/timestamptz, both time, or both jsonb",
             )),
         },
     }
@@ -4654,6 +4909,14 @@ fn bind_binary(
 /// `operator does not exist` 相当で `42883`。値・列名は含めない固定文言）。
 fn text_arithmetic_error() -> SqlSurfaceError {
     SqlSurfaceError::undefined_function("operator does not exist: arithmetic on text operand")
+}
+
+/// INTERVAL を含む未対応の算術の組のエラー（PostgreSQL の `operator does not exist` 相当で
+/// `42883`。値・列名は含めない固定文言。Issue #1581）。
+fn interval_operator_error() -> SqlSurfaceError {
+    SqlSurfaceError::undefined_function(
+        "operator does not exist: unsupported operand types for INTERVAL arithmetic",
+    )
 }
 
 /// `DATE` 値を深夜 0 時の `TIMESTAMP` へ暗黙昇格する（`BuiltinFn::DateToTimestamp`
@@ -4735,6 +4998,9 @@ fn bind_call(
 
     if lower_name == "date_part" || lower_name == "date_trunc" {
         return bind_date_part_or_trunc(&lower_name, args, env, node_budget);
+    }
+    if lower_name == "timezone" {
+        return bind_timezone_call(args, env, node_budget);
     }
 
     // 現在時刻関数（SQL-37・Issue #1586）。引数を取らない（`now(1)` は arity 違反の `42883`）。
@@ -4983,7 +5249,9 @@ fn bind_date_part_or_trunc(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
-    if args.len() != 2 {
+    // `date_trunc(unit, timestamptz, zone)` の 3 引数形だけは第 3 引数（zone）を持つ（Issue #1576）。
+    let has_zone_arg = lower_name == "date_trunc" && args.len() == 3;
+    if args.len() != 2 && !has_zone_arg {
         return Err(SqlSurfaceError::undefined_function(format!(
             "function {lower_name} expects 2 argument(s), got {}",
             args.len()
@@ -5035,6 +5303,84 @@ fn bind_date_part_or_trunc(
         }
     };
     let (src_bound, src_ty) = bind_null_aware(src_arg, env, node_budget)?;
+    let zone_bound = if has_zone_arg {
+        let zone_arg = args.get(2).ok_or_else(|| {
+            SqlSurfaceError::undefined_function("function date_trunc expects 3 argument(s)")
+        })?;
+        Some(bind_zone_argument(zone_arg, env, node_budget)?)
+    } else {
+        None
+    };
+    // `TIMESTAMPTZ` 入力（Issue #1576）。暦の計算はセッション TZ（`date_trunc` の第 3 引数があれば
+    // その TZ）。`timezone*` field は `TIMESTAMPTZ` だけが持つ。
+    if src_ty == Some(ExprType::TimestampTz) {
+        let Some(field_name) = field_name else {
+            return Ok((BoundExpr::Null, result_ty_tz(lower_name)));
+        };
+        if lower_name == "date_part" {
+            reject_session_tz_in_check()?;
+            let field = DatePartField::from_name(&field_name).ok_or_else(|| {
+                SqlSurfaceError::invalid_input(format!("unknown date_part field: {field_name}"))
+            })?;
+            return Ok((
+                BoundExpr::Builtin {
+                    f: BuiltinFn::DatePartTz(field),
+                    args: vec![src_bound],
+                },
+                ExprType::Scalar,
+            ));
+        }
+        let unit = DateTruncUnit::from_name(&field_name).ok_or_else(|| {
+            SqlSurfaceError::invalid_input(format!("unknown date_trunc unit: {field_name}"))
+        })?;
+        if zone_bound.is_none() {
+            reject_session_tz_in_check()?;
+        }
+        return Ok(match zone_bound {
+            Some(zone) => (
+                BoundExpr::Builtin {
+                    f: BuiltinFn::DateTruncTzZone(unit),
+                    args: vec![src_bound, zone],
+                },
+                ExprType::TimestampTz,
+            ),
+            None => (
+                BoundExpr::Builtin {
+                    f: BuiltinFn::DateTruncTz(unit),
+                    args: vec![src_bound],
+                },
+                ExprType::TimestampTz,
+            ),
+        });
+    }
+    // `date_trunc(unit, timestamp, zone)` は timestamp を timestamptz へ暗黙変換して第 3 引数の
+    // TZ で切り捨てる（PG 17）。`date_trunc(unit, date)` の戻り型は従来どおり timestamp。
+    if let Some(zone) = zone_bound {
+        // timestamp／date → timestamptz の暗黙変換はセッション TZ に依存するため、CHECK 本体では拒否する。
+        reject_session_tz_in_check()?;
+        let src = match src_ty {
+            Some(ExprType::Timestamp) | None => src_bound,
+            Some(ExprType::Date) => wrap_date_to_timestamp(src_bound),
+            _ => {
+                return Err(SqlSurfaceError::datatype_mismatch(
+                    "function date_trunc expects a DATE, TIMESTAMP or TIMESTAMPTZ as its second argument",
+                ))
+            }
+        };
+        let Some(field_name) = field_name else {
+            return Ok((BoundExpr::Null, ExprType::TimestampTz));
+        };
+        let unit = DateTruncUnit::from_name(&field_name).ok_or_else(|| {
+            SqlSurfaceError::invalid_input(format!("unknown date_trunc unit: {field_name}"))
+        })?;
+        return Ok((
+            BoundExpr::Builtin {
+                f: BuiltinFn::DateTruncTzZone(unit),
+                args: vec![tstz_from_timestamp(src), zone],
+            },
+            ExprType::TimestampTz,
+        ));
+    }
     // `TIME` 入力（Issue #1570）。`date_part` は時刻成分と `epoch` だけを `TimePart` で受理し、
     // 日付由来の field は PostgreSQL と同じく `0A000`（束縛時に拒否して行ごとの評価へ持ち込まない）。
     // `date_trunc(text, time)` は PostgreSQL に存在しないため `42883`。
@@ -5082,6 +5428,16 @@ fn bind_date_part_or_trunc(
         let field = DatePartField::from_name(&field_name).ok_or_else(|| {
             SqlSurfaceError::invalid_input(format!("unknown date_part field: {field_name}"))
         })?;
+        if matches!(
+            field,
+            DatePartField::Timezone | DatePartField::TimezoneHour | DatePartField::TimezoneMinute
+        ) {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: format!(
+                    "date_part unit {field_name:?} is not supported for type timestamp without time zone"
+                ),
+            });
+        }
         Ok((
             BoundExpr::Builtin {
                 f: BuiltinFn::DatePart(field),
@@ -5100,6 +5456,182 @@ fn bind_date_part_or_trunc(
             },
             result_ty,
         ))
+    }
+}
+
+/// セッション TimeZone に依存する式を CHECK 制約の本体へ置くことを `0A000` で拒否する
+/// （Issue #1576。CHECK は式テキストを永続化して INSERT／UPDATE ごとに再評価するため、定義時と
+/// 別の TZ で結果が変わる述語を fail-closed で作らせない）。
+pub(crate) fn reject_session_tz_in_check() -> Result<(), SqlSurfaceError> {
+    if CHECK_BINDING.with(std::cell::Cell::get) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail:
+                "a session TimeZone dependent expression is not supported in a CHECK constraint"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// `TIMESTAMPTZ` 入力の `date_part`／`date_trunc` の結果型（Issue #1576）。
+fn result_ty_tz(lower_name: &str) -> ExprType {
+    if lower_name == "date_part" {
+        ExprType::Scalar
+    } else {
+        ExprType::TimestampTz
+    }
+}
+
+/// `TIMESTAMP` 式をセッション TZ の壁時計として `TIMESTAMPTZ` へ変換するノードで包む
+/// （暗黙の変換。Issue #1576）。
+pub(crate) fn tstz_from_timestamp(e: BoundExpr) -> BoundExpr {
+    BoundExpr::Builtin {
+        f: BuiltinFn::TimestampToTstz,
+        args: vec![e],
+    }
+}
+
+/// `DATE` 式を局所の 0 時の `TIMESTAMPTZ` へ変換するノードで包む（Issue #1576）。
+pub(crate) fn tstz_from_date(e: BoundExpr) -> BoundExpr {
+    BoundExpr::Builtin {
+        f: BuiltinFn::DateToTstz,
+        args: vec![e],
+    }
+}
+
+/// `AT TIME ZONE`・`timezone()`・`date_trunc` 第 3 引数の zone 引数を束縛する（Issue #1576）。
+/// TEXT 式だけを受理する。定数リテラルは束縛時に解決を試し、不正なら `22023`（固定文言）で
+/// 早期に拒否する。式（列・パラメータ）の zone は評価時に解決する。
+fn bind_zone_argument(
+    zone: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    // 裸の NULL は型未確定の NULL として受理し、評価時の strict 伝播で NULL にする
+    // （`date_part`／`date_trunc` と同じ。Issue #1576 レビュー指摘）。
+    let (bound, ty) = bind_null_aware(zone, env, node_budget)?;
+    let Some(ty) = ty else { return Ok(bound) };
+    if ty != ExprType::Text {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail:
+                "a time zone must be a text value (interval and timetz zones are not supported)"
+                    .to_string(),
+        });
+    }
+    if let BoundExpr::Text(name) = &bound {
+        crate::datetime::SessionTimeZone::resolve_zone_argument(name).map_err(|_| {
+            SqlSurfaceError::InvalidParameterValue {
+                detail: crate::datetime::UNRECOGNIZED_TIME_ZONE_DETAIL,
+            }
+        })?;
+    }
+    Ok(bound)
+}
+
+/// `timezone(zone, x)`／`timezone(x)`（`x AT TIME ZONE zone`／`x AT LOCAL` の脱糖先。Issue #1576）。
+/// `x` が TIMESTAMP（または DATE）なら TIMESTAMPTZ を、TIMESTAMPTZ（型なし文字列を含む）なら
+/// TIMESTAMP を返す。TIME・INTERVAL を伴う形は未実装のため `0A000`。
+fn bind_timezone_call(
+    args: &[Expr],
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let (zone_arg, value_arg) = match args {
+        [value] => (None, value),
+        [zone, value] => (Some(zone), value),
+        _ => {
+            return Err(SqlSurfaceError::undefined_function(format!(
+                "function timezone expects 1 or 2 argument(s), got {}",
+                args.len()
+            )))
+        }
+    };
+    // 型なし文字列リテラルは timestamptz として解決される（PG）。それ以外は式の型に従う。
+    let (value, value_ty) = match value_arg {
+        Expr::String(text) => {
+            reject_session_tz_in_check()?;
+            (bind_timestamptz_text_literal(text)?, ExprType::TimestampTz)
+        }
+        // 裸の NULL は timestamptz として扱い（PG の候補解決と同じ）、strict 伝播で NULL を返す。
+        other => {
+            let (b, t) = bind_null_aware(other, env, node_budget)?;
+            (b, t.unwrap_or(ExprType::TimestampTz))
+        }
+    };
+    let zone = match zone_arg {
+        Some(z) => Some(bind_zone_argument(z, env, node_budget)?),
+        None => None,
+    };
+    let with_zone = |f: BuiltinFn, value: BoundExpr| -> BoundExpr {
+        BoundExpr::Builtin {
+            f,
+            args: match &zone {
+                Some(z) => vec![z.clone(), value],
+                None => vec![value],
+            },
+        }
+    };
+    if zone.is_none() || matches!(value_ty, ExprType::Date) {
+        reject_session_tz_in_check()?;
+    }
+    match (value_ty, zone.is_some()) {
+        (ExprType::Timestamp, true) => Ok((
+            with_zone(BuiltinFn::AtZoneToTstz, value),
+            ExprType::TimestampTz,
+        )),
+        (ExprType::Timestamp, false) => Ok((
+            with_zone(BuiltinFn::AtLocalToTstz, value),
+            ExprType::TimestampTz,
+        )),
+        // date は局所（セッション）の 0 時の timestamptz へ変換してから timestamptz → timestamp。
+        (ExprType::Date, true) => Ok((
+            with_zone(BuiltinFn::AtZoneToTimestamp, tstz_from_date(value)),
+            ExprType::Timestamp,
+        )),
+        (ExprType::Date, false) => Ok((
+            BoundExpr::Builtin {
+                f: BuiltinFn::TstzToTimestamp,
+                args: vec![tstz_from_date(value)],
+            },
+            ExprType::Timestamp,
+        )),
+        (ExprType::TimestampTz, true) => Ok((
+            with_zone(BuiltinFn::AtZoneToTimestamp, value),
+            ExprType::Timestamp,
+        )),
+        (ExprType::TimestampTz, false) => Ok((
+            BoundExpr::Builtin {
+                f: BuiltinFn::TstzToTimestamp,
+                args: vec![value],
+            },
+            ExprType::Timestamp,
+        )),
+        (ExprType::Time, _) => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "AT TIME ZONE on a time value (timetz) is not supported".to_string(),
+        }),
+        _ => Err(SqlSurfaceError::undefined_function(
+            "function timezone requires a timestamp, timestamptz or date value",
+        )),
+    }
+}
+
+/// 型なし文字列リテラルを `TIMESTAMPTZ` として束縛時のセッション TZ で確定する（PG と同じく
+/// parse analysis 時点の TZ。Issue #1576）。エラーにリテラル本文は含めない。
+fn bind_timestamptz_text_literal(text: &str) -> Result<BoundExpr, SqlSurfaceError> {
+    use crate::datetime::{DateTimeLiteralError, TimestampTzLiteralError};
+    match crate::datetime::parse_timestamptz(text, &crate::datetime::current_session_time_zone()) {
+        Ok(micros) => Ok(BoundExpr::TimestampTz(micros)),
+        Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Format(_))) => Err(
+            SqlSurfaceError::invalid_datetime_format("invalid input syntax for type timestamptz"),
+        ),
+        Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Overflow(_))) => Err(
+            SqlSurfaceError::datetime_field_overflow("timestamptz out of range"),
+        ),
+        Err(TimestampTzLiteralError::UnknownTimeZone) => {
+            Err(SqlSurfaceError::InvalidParameterValue {
+                detail: crate::datetime::UNRECOGNIZED_TIME_ZONE_DETAIL,
+            })
+        }
     }
 }
 
@@ -5503,6 +6035,18 @@ pub(crate) fn json_value_from_expr_value(
         ExprValue::Date(d) => crate::json::json_value_from_date(*d),
         ExprValue::Timestamp(t) => crate::json::json_value_from_timestamp(*t),
         ExprValue::Time(t) => JsonValue::String(crate::datetime::format_time(*t)),
+        // `TIMESTAMPTZ` の json 化は未対応（Issue #1576 の対象外。fail-closed）。
+        ExprValue::TimestampTz(_) => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "a timestamptz value cannot be converted to json yet".to_string(),
+            })
+        }
+        // `INTERVAL` の json 化は未対応（Issue #1581 の対象外。fail-closed）。
+        ExprValue::Interval(_) => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "an interval value cannot be converted to json yet".to_string(),
+            })
+        }
         ExprValue::Json(j) => crate::json::parse_jsonb_for_build(j).map_err(json_build_error)?,
         ExprValue::Vector(_) => {
             return Err(SqlSurfaceError::FeatureNotSupported {
@@ -5531,6 +6075,12 @@ fn json_object_key(v: &ExprValue<'_>) -> Result<String, SqlSurfaceError> {
         ExprValue::Date(d) => Ok(crate::datetime::format_date(*d)),
         ExprValue::Timestamp(t) => Ok(crate::json::json_timestamp_text(*t)),
         ExprValue::Time(t) => Ok(crate::datetime::format_time(*t)),
+        ExprValue::TimestampTz(_) => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "a timestamptz value cannot be converted to json yet".to_string(),
+        }),
+        ExprValue::Interval(_) => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "an interval value cannot be converted to json yet".to_string(),
+        }),
         ExprValue::Json(_) | ExprValue::JsonText(_) | ExprValue::Vector(_) => {
             Err(SqlSurfaceError::InvalidParameterValue {
                 detail: "key value must be scalar, not array, composite, or json",
@@ -5747,6 +6297,33 @@ pub(crate) fn eval_with_scalars<'a>(
         BoundExpr::Date(d) => Ok(ExprValue::Date(*d)),
         BoundExpr::Timestamp(t) => Ok(ExprValue::Timestamp(*t)),
         BoundExpr::Time(t) => Ok(ExprValue::Time(*t)),
+        BoundExpr::TimestampTz(t) => Ok(ExprValue::TimestampTz(*t)),
+        BoundExpr::Interval(v) => Ok(ExprValue::Interval(*v)),
+        BoundExpr::IntervalColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "INTERVAL column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Interval(v))) => Ok(ExprValue::Interval(*v)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "INTERVAL column reference resolved to a non-INTERVAL row scalar value"
+                    .to_string(),
+            }),
+        },
+        BoundExpr::TimestampTzColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "TIMESTAMPTZ column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::TimestampTz(t))) => Ok(ExprValue::TimestampTz(*t)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail:
+                    "TIMESTAMPTZ column reference resolved to a non-TIMESTAMPTZ row scalar value"
+                        .to_string(),
+            }),
+        },
         BoundExpr::TextColumnRef { index } => match row_scalars.get(*index) {
             None => Err(SqlSurfaceError::Internal {
                 detail: "TEXT column reference is outside the decoded row scalar view".to_string(),
@@ -6026,6 +6603,14 @@ pub(crate) fn eval_nullif<'a>(
                 Ok(ExprValue::Time(a))
             }
         }
+        // Issue #1576: TIMESTAMPTZ は UTC の時点で比べる（`NULLIF(tstz, tstz)`）。
+        (ExprValue::TimestampTz(a), ExprValue::TimestampTz(b)) => {
+            if a == b {
+                Ok(ExprValue::Null)
+            } else {
+                Ok(ExprValue::TimestampTz(a))
+            }
+        }
         _ => Err(SqlSurfaceError::Internal {
             detail: "NULLIF operand type mismatch at evaluation time".to_string(),
         }),
@@ -6257,6 +6842,64 @@ pub(crate) fn apply_builtin<'a>(
             let t = take_timestamp_arg(args, 0)?;
             datetime_fn::date_trunc(unit, t).map(ExprValue::Timestamp)
         }
+        // Issue #1576・TABLE-33: TIMESTAMPTZ。暦の計算は評価時のセッション TZ で行う。
+        BuiltinFn::DatePartTz(field) => {
+            let t = take_timestamptz_arg(args, 0)?;
+            let v = crate::datetime::with_current_session_time_zone(|tz| {
+                datetime_fn::timestamptz_part(field, t, tz)
+            })?;
+            finite_scalar(v, "date_part")
+        }
+        BuiltinFn::DateTruncTz(unit) => {
+            let t = take_timestamptz_arg(args, 0)?;
+            crate::datetime::with_current_session_time_zone(|tz| {
+                datetime_fn::timestamptz_trunc(unit, t, tz)
+            })
+            .map(ExprValue::TimestampTz)
+        }
+        BuiltinFn::DateTruncTzZone(unit) => {
+            let t = take_timestamptz_arg(args, 0)?;
+            let zone = resolve_zone_value(args, 1)?;
+            datetime_fn::timestamptz_trunc(unit, t, &zone).map(ExprValue::TimestampTz)
+        }
+        BuiltinFn::TimestampToTstz | BuiltinFn::AtLocalToTstz => {
+            let t = take_timestamp_arg(args, 0)?;
+            crate::datetime::with_current_session_time_zone(|tz| tz.timestamp_to_timestamptz(t))
+                .map(ExprValue::TimestampTz)
+                .ok_or_else(datetime_fn::tz_out_of_range)
+        }
+        BuiltinFn::TstzToTimestamp => {
+            let t = take_timestamptz_arg(args, 0)?;
+            crate::datetime::with_current_session_time_zone(|tz| tz.timestamptz_to_timestamp(t))
+                .map(ExprValue::Timestamp)
+                .ok_or_else(datetime_fn::tz_out_of_range)
+        }
+        BuiltinFn::DateToTstz => {
+            let d = take_date_arg(args, 0)?;
+            crate::datetime::with_current_session_time_zone(|tz| tz.date_to_timestamptz(d))
+                .map(ExprValue::TimestampTz)
+                .ok_or_else(datetime_fn::tz_out_of_range)
+        }
+        BuiltinFn::TstzToDate => {
+            let t = take_timestamptz_arg(args, 0)?;
+            crate::datetime::with_current_session_time_zone(|tz| tz.timestamptz_to_date(t))
+                .map(ExprValue::Date)
+                .ok_or_else(datetime_fn::tz_out_of_range)
+        }
+        BuiltinFn::AtZoneToTstz => {
+            let zone = resolve_zone_value(args, 0)?;
+            let t = take_timestamp_arg(args, 1)?;
+            zone.timestamp_to_timestamptz(t)
+                .map(ExprValue::TimestampTz)
+                .ok_or_else(datetime_fn::tz_out_of_range)
+        }
+        BuiltinFn::AtZoneToTimestamp => {
+            let zone = resolve_zone_value(args, 0)?;
+            let t = take_timestamptz_arg(args, 1)?;
+            zone.timestamptz_to_timestamp(t)
+                .map(ExprValue::Timestamp)
+                .ok_or_else(datetime_fn::tz_out_of_range)
+        }
         BuiltinFn::DateToTimestamp => {
             let d = take_date_arg(args, 0)?;
             Ok(ExprValue::Timestamp(datetime_fn::date_to_timestamp(d)))
@@ -6483,6 +7126,38 @@ fn take_time_arg(args: &mut [Option<ExprValue<'_>>], idx: usize) -> Result<i64, 
     }
 }
 
+/// `args[idx]` を `TimestampTz`（UTC マイクロ秒）として取り出す（Issue #1576）。
+fn take_timestamptz_arg(
+    args: &mut [Option<ExprValue<'_>>],
+    idx: usize,
+) -> Result<i64, SqlSurfaceError> {
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::TimestampTz(t)) => Ok(t),
+        Some(_) => Err(SqlSurfaceError::Internal {
+            detail: "function argument type mismatch at evaluation time".to_string(),
+        }),
+        None => Err(SqlSurfaceError::Internal {
+            detail: "missing function argument at evaluation time".to_string(),
+        }),
+    }
+}
+
+/// `AT TIME ZONE` 等の zone 引数（TEXT）を解決する（Issue #1576）。解決できなければ `22023`
+/// （固定文言。入力値は反射しない）。
+fn resolve_zone_value(
+    args: &mut [Option<ExprValue<'_>>],
+    idx: usize,
+) -> Result<crate::datetime::SessionTimeZone, SqlSurfaceError> {
+    let name = take_text_or_null_arg(args, idx)?.ok_or_else(|| SqlSurfaceError::Internal {
+        detail: "NULL time zone reached evaluation".to_string(),
+    })?;
+    crate::datetime::resolve_zone_argument_cached(&name).map_err(|_| {
+        SqlSurfaceError::InvalidParameterValue {
+            detail: crate::datetime::UNRECOGNIZED_TIME_ZONE_DETAIL,
+        }
+    })
+}
+
 /// `args[idx]` を `Timestamp` として取り出す（[`take_date_arg`] 参照）。
 fn take_timestamp_arg(
     args: &mut [Option<ExprValue<'_>>],
@@ -6560,6 +7235,49 @@ pub(crate) fn eval_binary<'a>(
             (ExprValue::Date(a), ExprValue::Date(b)) if op == BinOp::Sub => {
                 Ok(ExprValue::Scalar(datetime_fn::date_diff_days(a, b)))
             }
+            // 日付時刻と INTERVAL の算術（Issue #1581・TABLE-34）。束縛段（`bind_binary`）が
+            // 受理した組だけがここに到達する（`DATE` は `DateToTimestamp` で昇格済み）。
+            (ExprValue::Timestamp(t), ExprValue::Interval(iv)) if is_add_or_sub(op) => {
+                let iv = signed_interval(op, &iv)?;
+                interval_arith::timestamp_add_interval(t, &iv).map(ExprValue::Timestamp)
+            }
+            (ExprValue::Interval(iv), ExprValue::Timestamp(t)) if op == BinOp::Add => {
+                interval_arith::timestamp_add_interval(t, &iv).map(ExprValue::Timestamp)
+            }
+            (ExprValue::TimestampTz(t), ExprValue::Interval(iv)) if is_add_or_sub(op) => {
+                let iv = signed_interval(op, &iv)?;
+                crate::datetime::with_current_session_time_zone(|tz| {
+                    interval_arith::timestamptz_add_interval(t, &iv, tz)
+                })
+                .map(ExprValue::TimestampTz)
+            }
+            (ExprValue::Interval(iv), ExprValue::TimestampTz(t)) if op == BinOp::Add => {
+                crate::datetime::with_current_session_time_zone(|tz| {
+                    interval_arith::timestamptz_add_interval(t, &iv, tz)
+                })
+                .map(ExprValue::TimestampTz)
+            }
+            (ExprValue::Timestamp(a), ExprValue::Timestamp(b)) if op == BinOp::Sub => {
+                interval_arith::timestamp_diff(a, b).map(ExprValue::Interval)
+            }
+            (ExprValue::TimestampTz(a), ExprValue::TimestampTz(b)) if op == BinOp::Sub => {
+                interval_arith::timestamp_diff(a, b).map(ExprValue::Interval)
+            }
+            (ExprValue::Interval(a), ExprValue::Interval(b)) if op == BinOp::Add => {
+                interval_arith::interval_add(&a, &b).map(ExprValue::Interval)
+            }
+            (ExprValue::Interval(a), ExprValue::Interval(b)) if op == BinOp::Sub => {
+                interval_arith::interval_sub(&a, &b).map(ExprValue::Interval)
+            }
+            (ExprValue::Interval(iv), ExprValue::Scalar(n)) if op == BinOp::Mul => {
+                interval_arith::interval_mul_f64(&iv, n).map(ExprValue::Interval)
+            }
+            (ExprValue::Scalar(n), ExprValue::Interval(iv)) if op == BinOp::Mul => {
+                interval_arith::interval_mul_f64(&iv, n).map(ExprValue::Interval)
+            }
+            (ExprValue::Interval(iv), ExprValue::Scalar(n)) if op == BinOp::Div => {
+                interval_arith::interval_div_checked(&iv, n).map(ExprValue::Interval)
+            }
             _ => Err(SqlSurfaceError::Internal {
                 detail: "operand type mismatch at evaluation time".to_string(),
             }),
@@ -6610,6 +7328,10 @@ pub(crate) fn eval_binary<'a>(
                 Ok(ExprValue::Bool(compare(op, a, b)?))
             }
             (ExprValue::Time(a), ExprValue::Time(b)) => Ok(ExprValue::Bool(compare(op, a, b)?)),
+            // `TIMESTAMPTZ` は UTC の時点（i64）で比較する（Issue #1576）。
+            (ExprValue::TimestampTz(a), ExprValue::TimestampTz(b)) => {
+                Ok(ExprValue::Bool(compare(op, a, b)?))
+            }
             // Issue #1597・TABLE-25: jsonb 同士の比較。両辺をバイト比較可能なソートキーへ
             // 変換して比較する（格納値が壊れていれば誤順序へ縮退せず fail-closed）。
             (ExprValue::Json(a), ExprValue::Json(b)) => {
@@ -6635,6 +7357,23 @@ pub(crate) fn jsonb_sort_key_for_eval(text: &str) -> Result<Vec<u8>, SqlSurfaceE
             detail: "stored jsonb value could not be parsed".to_string(),
         },
     })
+}
+
+fn is_add_or_sub(op: BinOp) -> bool {
+    matches!(op, BinOp::Add | BinOp::Sub)
+}
+
+/// `x - INTERVAL` は INTERVAL を符号反転した加算として評価する（PostgreSQL の
+/// `timestamp_mi_interval` と同じ。反転できない値は `22008`）。
+fn signed_interval(
+    op: BinOp,
+    iv: &crate::datetime::Interval,
+) -> Result<crate::datetime::Interval, SqlSurfaceError> {
+    if op == BinOp::Sub {
+        interval_arith::negate_interval(iv)
+    } else {
+        Ok(*iv)
+    }
 }
 
 /// `Ord` を実装する値同士の比較演算子を適用する共通ヘルパー

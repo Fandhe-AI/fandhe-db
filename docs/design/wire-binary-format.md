@@ -86,7 +86,7 @@ PostgreSQL の Bind 規則に従う。
 | `Scalar{ty: Text}` | text（25） | 対応（UTF-8 生バイト） |
 | `Scalar{ty: Integer／BigInt／Real／Double／Boolean／Bytea／Uuid}` | int4／int8／float4／float8／bool／bytea／uuid | 対応（Issue #1172。PostgreSQL の send 形式） |
 | `Scalar{ty: Numeric}` | numeric（1700） | 対応（Issue #2442。`numeric_send` 形式。`dscale` はセルの実 scale） |
-| `Scalar{ty: Date／Timestamp／Json／Jsonb／Array／Enum}` | numeric／date／timestamp／json／jsonb／text | **非対応 → `0A000`** |
+| `Scalar{ty: Date／Timestamp／Json／Jsonb／Array／Enum}` | date／timestamp／json／jsonb／text | **非対応 → `0A000`** |
 | `Scalar{ty: Vector(_)}` | text（25） | **非対応 → `0A000`**（詳細は WIRE-14 参照） |
 | `ColumnMeta::Computed{ty: Some(t)}` | `t` の写像（Issue #1407。集計・式列・ウィンドウ関数の結果列） | `t` が対応型（`Integer／BigInt／Real／Double／Boolean／Text／Numeric`）なら対応、非対応型なら **`0A000`** |
 | `ColumnMeta::Computed{ty: None}` | text（25） | **非対応 → `0A000`**（静的型を持たないベクトル式など。fail-closed。詳細は WIRE-14 参照） |
@@ -189,14 +189,15 @@ matches_legacy_encoder`）で固定している。シグネチャは
 - 型 OID 拡張（`BOOLEAN`／`REAL`／`DOUBLE PRECISION`／`DATE`／`TIMESTAMP`／
   `BYTEA`／`UUID`／`JSON`／`JSONB`）→ **Issue #895 で実施済み**
   （`docs/design/wire-type-oid-mapping.md` 参照）。数値・真偽値・
-  bytea・uuid のバイナリ対応は Issue #1172 で実施済み。`id`・`DATE`／`TIMESTAMP`／
-  `JSON`／`JSONB` は引き続き非対応。集計・式列・ウィンドウ関数の結果列は Issue #1407 で
+  bytea・uuid のバイナリ対応は Issue #1172 で実施済み。`id`・`NUMERIC` は Issue #2442
+  （結果）・#2443（パラメータ）で対応済み。`DATE`／`TIMESTAMP`／`JSON`／`JSONB` は引き続き非対応。集計・式列・ウィンドウ関数の結果列は Issue #1407 で
   対応（下記「Issue #1407 追記」）
 - 3 クライアントのバイナリ受信モードでの値一致（層 B）→ **Issue #1176 で実施済み**
   （`three_client_extended_e2e.rs`。psycopg・node pg でテキスト結果との一致を確認。
   psql は結果のバイナリ受信モードを持たず対象外。node pg はバイナリ DataRow を
   UTF-8 文字列として読むため 0x80 以上のバイトを含む値は検証対象外とし、
-  psycopg と層 A で担保する）
+  psycopg と層 A で担保する）。numeric の層 B は Issue #2445 で実施済み
+  （下記「Issue #2445 追記」）
 - カーソル（WIRE-15）→ #937
 
 ## Issue #1407 追記: 集計式・式列・ウィンドウ関数の結果列
@@ -226,6 +227,12 @@ matches_legacy_encoder`）で固定している。シグネチャは
 - param: `TIMESTAMPTZ` スロットは宣言 OID 1184（推論含む）のみバイナリを受理し、それ以外の宣言は `0A000`。8 バイト以外は `08P01`、範囲外（PG の infinity 番兵を含む）は `22008`（値は応答に含めない）。復号後は明示 offset（`+00`）付きの正規テキストにして engine の束縛経路へ渡す。offset 無しだとセッション TimeZone の壁時計として解釈され、#1575 で意味が変わるため
 - `DATE`／`TIMESTAMP` は従来どおり非対応（`0A000`）
 
+## Issue #1583 追記（INTERVAL のバイナリ入出力・TABLE-34・WIRE-14 ポインタ）
+
+- 結果: `INTERVAL` 列（`Computed{ty: Some(Interval)}` の `MIN`／`MAX`／`SUM`／`AVG` を含む）は OID 1186・typlen 16 で公告し、バイナリは time（i64・マイクロ秒）・day（i32）・month（i32）の計 16 バイト BE（PostgreSQL の `interval_send` と同形）。engine の `Interval` は months・days・micros の順だが、wire は逆順になる。`±infinity` 番兵の `Cell::Interval` は丸めず `XX000`。テキストは IntervalStyle=postgres。**契約変更**: 従来の OID 25 から 1186 へ変わる
+- param: `INTERVAL` スロットは宣言 OID 1186（推論含む）のみバイナリを受理し、それ以外の宣言（25 等）は `0A000`。16 バイト以外は `08P01`、`±infinity` 番兵は `22008`（値は応答に含めない）。復号後は engine の `format_interval` で正規テキストにして既存の束縛経路（`parse_interval`）へ渡すため、バイナリ ≡ テキストが構造的に保たれる
+- `interval[]`（OID 1187）・COPY バイナリは対象外
+
 ## Issue #2442 追記: numeric 結果列のバイナリ符号化
 
 - **対象**: numeric を公告する結果列すべて（`id`・別名付き `id`・`NUMERIC(p, s)` 列・
@@ -239,5 +246,85 @@ matches_legacy_encoder`）で固定している。シグネチャは
 - **契約変更**: 以前は `0A000` で拒否されたバイナリ要求が成功する（後方互換の拡張）。
   非対応型（`DATE`／`TIMESTAMP`／`JSON`／`JSONB`／`VECTOR` など）の `0A000` は不変。
 - **対象外**: パラメータ側のバイナリ復号（#2443）、PostgreSQL 17 実機とのバイト列一致と
-  SQLSTATE 境界（#2444）、実クライアントでの値一致の正例（#2445）。パラメータ側の `numeric`
-  は引き続き非対応。
+  SQLSTATE 境界（#2444）、実クライアントでの値一致の正例（#2445。実施済み。下記）。パラメータ側の `numeric`
+  は Issue #2443 で対応した（下記）。
+
+## Issue #2443 追記: numeric パラメータのバイナリ復号
+
+- **受理スロット**: `NUMERIC(p, s)` 列と `id` 列の位置の `$n` は、実効 OID 1700（宣言 0 または 1700）のときだけ
+  バイナリを numeric として受理する（WIRE-26・WIRE-14 のポインタ）。宣言 20／23／25／701 等は
+  `0A000`（fail-closed）。別名付き `id`・計算列の位置は従来どおり `0A000`。`id` の値の可否
+  （小数・負値）は engine の id 束縛規則のままで、テキスト形式と同じコードで拒否される。
+- **復号**: `numeric_send` レイアウトを検査しつつ正規 10 進テキストへ変換し、engine の束縛経路へ
+  渡す（列の精度・scale への丸めと超過判定は `parse_for_column` が担い、第 2 の値検証を作らない）。
+  小数第 `dscale` 位より下の桁は切り捨て、全桁 0 になった負値は符号を付けない。`NaN`／`±Infinity` は
+  テキストと同じ表記へ変換するため、テキスト形式と同じ SQLSTATE で拒否される。
+- **検査順（アロケーション前）**: ヘッダ長 → `ndigits` 上限（桁群上限と共有の 32）→ 長さの完全一致
+  （いずれも `08P01`）→ 符号語・`dscale`（14 ビット）・各桁群（0..=9999）（`22P03`。特殊値でも全桁検査）
+  → 整数部の有効桁数が engine の精度上限（38）以内・出力テキストが engine のリテラル長上限以内
+  （超過は `22003`）。出力は検査済みの長さで 1 回だけ確保する。
+- **SQLSTATE 境界**: 不正な長さ `08P01`、不正な表現 `22P03`（`ErrorClass::InvalidBinaryRepresentation`
+  を新設。HTTP 射影は 400・SQL 表層専用）、値の範囲超過 `22003`。エラー文言は `$n` の番号のみで
+  値・テーブル名を含めない。
+- **意図的な差分（#2444 で照合済み・差分を維持）**: (1) `ndigits` 上限超過と宣言長を超える末尾バイトを `08P01` とする
+  （PostgreSQL は別の SQLSTATE を返しうる）。(2) 極端に大きい `dscale`（出力が上限超）を丸めず `22003` とする。
+- **対象外**: PostgreSQL 17 実機とのバイト列・SQLSTATE 照合（#2444）、実クライアント検証と
+  非対応型一覧の最終整理（#2445）。
+
+## Issue #2444 追記: numeric バイナリの PostgreSQL 17 照合（WIRE-26・TASK-339 ポインタ）
+
+- **採取環境**: PostgreSQL 17.11（Debian 17.11-1.pgdg13+2・x86_64）。結果側は
+  `numeric_send(<値>::numeric(p,s))` の 16 進、パラメータ側は psycopg 3 の生バイナリ Dumper
+  （OID 1700）で `select %s::numeric(p,s)::text` へ Bind した SQLSTATE を実測した。採取手順は
+  `crates/wire-server/tests/wire26_numeric_pg17_vectors.rs` の `//!` に記載（スクリプトはリポに置かない）。
+- **結果側（全件一致）**: NUMERIC(p,s) 列 25 値（0・負値・scale 超の丸め・`-0.00`・38 桁・scale 37／38・
+  `i64` 境界）、`id`（0・1・`u64::MAX`）、集計（整数 `AVG` の `dscale` 16・20 相当、`SUM(BIGINT)`、
+  `AVG(BIGINT)`、`SUM(NUMERIC)`）が `numeric_send` とバイト単位で一致し、text 形式も `numeric_out` と
+  一致する。実装の修正は不要だった。
+- **パラメータ側の境界**: 同ファイルの表（28 項目）で現状を固定する。PG17 と一致するもの: ヘッダ不足・
+  宣言より短い本文（`08P01`）、不正な符号語・`dscale`・桁群（`22P03`）、精度超過・整数部 39 桁・
+  `weight` 過大（`22003`）、`dscale` 以下の切り捨て、内部のゼロ群、判定順（符号 → 桁群 → `weight`）。
+- **意図的な差分（PG17 実測 → 本リポ）**: 本 Issue は `test` のため SQLSTATE は変更せず現状を固定した。
+  PG に合わせるかどうかは別 Issue で扱う。
+
+  | 入力 | PG17 | 本リポ | 理由（ポインタ） |
+  | ---- | ---- | ------ | ---------------- |
+  | 宣言長を超える末尾バイト | `22P03` | `08P01` | WIRE-26（長さ不正は `08P01`） |
+  | `ndigits` 33 以上 | 受理 | `08P01` | WIRE-26（アロケーション前の上限） |
+  | 宣言より短い本文＋不正符号語 | `22P03` | `08P01` | 同上（長さの検査を先に行う） |
+  | 末尾バイト＋不正符号語 | `22P03` | `08P01` | 同上 |
+  | 大きい `dscale`（出力が 1024 バイト超） | 受理 | `22003` | `MAX_LITERAL_LEN`（出力長の上限） |
+  | `NaN` | 受理 | `22P02` | WIRE-26（テキスト形式と同じコード） |
+  | `±Infinity` | `22003` | `22P02` | 同上 |
+
+- **層 A**: `wire26_numeric_pg17_vectors.rs`（API 層・結果側・パラメータ往復・境界・テナント境界）。
+  差分行は `INTENTIONAL_DIFFS` で管理し、PG17 との乖離を黙って増減させない。
+- **観測事項**: `u64::MAX` の id を持つ行が表にあると、`WHERE id = ..` の比較は `22003`
+  （厳密比較できる範囲外）になる。そのため `u64::MAX` は専用表 `numid` に置いて検証した。
+
+## Issue #2445 追記: numeric の層 B（実クライアントでの値一致）と非対応型一覧の更新
+
+- **対象**（WIRE-14・WIRE-26・TABLE-13 のポインタ）: `three_client_extended_e2e.rs` の
+  `psycopg_and_pg_numeric_binary_results_match_text_results`（結果列・`id`・`SUM`／`AVG`・
+  `SUM(BIGINT)` のバイナリ受信）と `psycopg_and_pg_numeric_binary_params_match_text_params`
+  （`NUMERIC` 列・`id` スロットへのバイナリパラメータの読み取り・INSERT・不正値の拒否）。
+  psql のテキスト出力を値の独立オラクルとする。
+- **ドライバの型と比較方法**: psycopg は text／binary とも `Decimal`（`dscale` 保持）で、
+  型タグ込みの完全一致を取る。node pg は text が `string`、既定のバイナリ parser（pg-types 2.2.0
+  の 1700）が JS の `number` を返すため、型タグの差を別にアサートし、値部は文字列表記と
+  `f64` で比較する（`number` は double 精度。ドライバ側の仕様で本リポでは対処しない）。
+- **node pg のバイト制約**: バイナリ DataRow を UTF-8 で読む制約は numeric では
+  `weight >= 0` かつ各桁群の下位バイトが `< 0x80` を意味する（|値| < 1 の小数は
+  `weight = -1`〔`0xFFFF`〕で壊れる）。node 共通行は `3.14`・`-1.01`・`id = 20`・
+  `SUM(BIGINT) = 9000000000` に限り、常時実行ガード `node_numeric_fixture_bytes_are_utf8_safe` が
+  機械検証する。`0.50`・38 桁の値・`-12345678.90` は psycopg のみで検証する。
+- **パラメータの送り方**: psycopg の AUTO 形式は `Decimal` を text で送るため、公開 API
+  `conn.adapters.register_dumper(Decimal, DecimalBinaryDumper)` で登録し直してバイナリ（宣言 1700）にする。
+  node pg に numeric の Dumper は無く、`Buffer` は format 1・宣言 OID 0 で送られる。`numeric_send` の
+  バイト列は #2444 で PG17 と一致を確認済みのエンコーダで作り、JS で符号化を再実装しない。
+- **テナント境界**: bob のバイナリ集計・バイナリパラメータが tenant-a の Private 行を観測しない
+  ことを、alice では同じ問い合わせが引けること（非 vacuous）とあわせて確認した。
+- **現在の WIRE-14 非対応型一覧（`0A000`）**: `DATE`／`TIMESTAMP`／`JSON`／`JSONB`／配列／`ENUM`／
+  `VECTOR`／`Computed{ty: None}`（静的型を持たないベクトル式など）。numeric（`NUMERIC` 列・`id`・
+  numeric の集計結果）は含まない。
+- **検証環境**: psycopg 3.3.6（Python 3.14）・node 24 の `pg` 8.23.0・psql 18.6。

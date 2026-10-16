@@ -43,7 +43,12 @@ Accepted。数値スカラー関数群は先行 PR（#1107）で実装済み（
 | `date_trunc(u, DATE\|TIMESTAMP)` | TIMESTAMP | 未知の unit: `22000`（束縛時）。結果が範囲外（1〜9 年の `decade` 切り捨て等）: `22008` |
 | `DATE ± n` / `n + DATE` | DATE | `n` が非整数: `42804`（Issue #1274）。`n` が `i32` 範囲外: `22003`（`NumericOutOfRange`）。結果が `DATE` 受理範囲外: `22008` |
 | `DATE - DATE` | Scalar（日数） | なし（範囲内の差は必ず表現できる） |
-| `TIMESTAMP ± n`・`TIMESTAMP - TIMESTAMP`・`DATE * / n` | — | `42804`（`INTERVAL` 型が無いため対象外。`bind_binary` の型不一致経路） |
+| `TIMESTAMP ± n`・`DATE * / n` | — | `42804`（`bind_binary` の型不一致経路。INTERVAL を伴わない組は従来どおり） |
+| `TIMESTAMP(TZ) ± INTERVAL`・`INTERVAL + TIMESTAMP(TZ)` | TIMESTAMP(TZ) | 結果・中間値が範囲外: `22008`。`TIMESTAMPTZ` はセッション TZ に依存する（CHECK では `0A000`）。Issue #1581 |
+| `DATE ± INTERVAL`・`INTERVAL + DATE` | TIMESTAMP | DATE を深夜 0 時の TIMESTAMP へ昇格する（PG の `date_pl_interval`）。Issue #1581 |
+| `TIMESTAMP(TZ) - TIMESTAMP(TZ)`・DATE との混在 | INTERVAL | 日数と日内マイクロ秒（符号を揃える）。範囲外: `22008`。Issue #1581 |
+| `INTERVAL ± INTERVAL`・`INTERVAL * n`・`n * INTERVAL`・`INTERVAL / n` | INTERVAL | 範囲外・NaN: `22008`、0 除算: `22012`。Issue #1581 |
+| INTERVAL が絡む上記以外の組（`INTERVAL - TIMESTAMP`・`INTERVAL + n`・`TIME ± INTERVAL` 等） | — | `42883`（`operator does not exist`） |
 | 型付きリテラルの書式違反 / 範囲外 | — | `22007` / `22008`（Issue #1187。`datetime-column.md` と同じ写像） |
 | 引数の型不一致 | — | `42804`（Issue #1186） |
 | arity 違反 | — | `42883`（Issue #1349） |
@@ -178,3 +183,9 @@ is_not_masked_out` で分岐内参照のみの回帰を固定する）。
 ## Issue #1570 追記: TIME 入力
 
 `date_part`／`EXTRACT` は `TIME` 入力を `BuiltinFn::TimePart`（`datetime_fn::time_part`）で受理する。受理 field は `hour`・`minute`・`second`・`milliseconds`・`microseconds`・`epoch`。`24:00:00` は hour=24・minute=0・second=0・epoch=86400。日付由来の field（`year`・`month`・`day`・`dow`・`doy`・`week` 等）は束縛時に `0A000`、`date_trunc(text, time)` は `42883`、未知の field は従来どおり `22000`。NULL の strict 伝播は DATE／TIMESTAMP と同じ。
+
+## Issue #1576 追記: TIMESTAMPTZ 入力
+
+- `date_part`／`EXTRACT` は TIMESTAMPTZ 入力を `BuiltinFn::DatePartTz` で評価する。暦の field は評価時のセッション TZ の壁時計、`epoch` は UTC の絶対値、`timezone`・`timezone_hour`・`timezone_minute` は offset（秒・時・分。東が正）。`timezone*` field は TIMESTAMPTZ 専用で、TIMESTAMP／DATE／TIME に対しては `0A000`。
+- `date_trunc(unit, timestamptz)` は `DateTruncTz`（セッション TZ）、`date_trunc(unit, timestamptz, zone)` は `DateTruncTzZone`（第 3 引数の TZ。不正な zone は `22023`）。day 以上の単位は切り捨て後の局所時刻を DST の gap／fold 規則で UTC へ再解決し、hour 以下の単位は元の offset を保つ（PG 17 の実測。[timestamptz-conversion.md](timestamptz-conversion.md)）。TIMESTAMP を第 3 引数付きで渡すと timestamptz へ暗黙変換して TIMESTAMPTZ を返す。
+- いずれもセッション TZ に依存するため定数畳み込みの対象外で、CHECK 制約の本体では `0A000`。

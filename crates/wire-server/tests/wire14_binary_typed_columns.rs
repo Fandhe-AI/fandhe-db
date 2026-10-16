@@ -246,6 +246,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ColumnDef::new("s", ColumnType::SmallInt, true),
                 ColumnDef::new("tm", ColumnType::Time, true),
                 ColumnDef::new("tz", ColumnType::TimestampTz, true),
+                ColumnDef::new("iv", ColumnType::Interval, true),
             ],
         ))
         .expect("create table");
@@ -280,6 +281,25 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             1 => Value::TimestampTz(0),
             2 => Value::TimestampTz(946_684_800_000_000),
             3 => Value::TimestampTz(engine::datetime::TIMESTAMPTZ_MAX_MICROS),
+            _ => Value::Null,
+        });
+        // INTERVAL 列 `iv`（Issue #1583）: id 1: 正値・id 2: 負値・id 3: 境界（番兵でない最大側）。
+        row.push(match id {
+            1 => Value::Interval(engine::datetime::Interval {
+                months: 14,
+                days: -1,
+                micros: 7_200_000_000,
+            }),
+            2 => Value::Interval(engine::datetime::Interval {
+                months: -1,
+                days: -30,
+                micros: -86_399_999_999,
+            }),
+            3 => Value::Interval(engine::datetime::Interval {
+                months: i32::MAX,
+                days: i32::MIN,
+                micros: i64::MAX,
+            }),
             _ => Value::Null,
         });
         engine::tenant::insert_typed_row(&storage, "t", &ctx, id, Visibility::Private, &row, &op)
@@ -846,4 +866,52 @@ fn timestamptz_column_binary_result_matches_text_and_golden_bytes() {
     assert_eq!(fmts, vec![1, 0]);
     assert_eq!(rows[0][0].as_deref(), Some(&0i64.to_be_bytes()[..]));
     assert_eq!(rows[0][1].as_deref(), Some(&b"-2147483648"[..]));
+}
+
+/// INTERVAL 列（TABLE-34・WIRE-14・Issue #1583）: バイナリ結果は time i64・day i32・month i32 の
+/// 16 バイト BE の固定ベクタと一致し、text は IntervalStyle=postgres。NULL は NULL のまま。
+#[test]
+fn interval_column_binary_result_matches_text_and_golden_bytes() {
+    let (mut s, _g, _) = connect("alice", "correct-horse");
+    let golden = |micros: i64, days: i32, months: i32| -> Vec<u8> {
+        let mut v = micros.to_be_bytes().to_vec();
+        v.extend_from_slice(&days.to_be_bytes());
+        v.extend_from_slice(&months.to_be_bytes());
+        v
+    };
+    let cases: [(i32, Vec<u8>, &str); 3] = [
+        (
+            1,
+            golden(7_200_000_000, -1, 14),
+            "1 year 2 mons -1 days +02:00:00",
+        ),
+        (
+            2,
+            golden(-86_399_999_999, -30, -1),
+            "-1 mons -30 days -23:59:59.999999",
+        ),
+        (3, golden(i64::MAX, i32::MIN, i32::MAX), ""),
+    ];
+    for (id, bytes, text) in cases {
+        let sql = format!("SELECT iv FROM t WHERE id = {id} LIMIT 10");
+        let (_, text_rows) = run(&mut s, &sql, &[0]);
+        let (bf, bin_rows) = run(&mut s, &sql, &[1]);
+        assert_eq!(bf, vec![1]);
+        if !text.is_empty() {
+            assert_eq!(text_rows[0][0].as_deref(), Some(text.as_bytes()), "id={id}");
+        }
+        assert_eq!(bin_rows[0][0].as_deref(), Some(&bytes[..]), "id={id}");
+    }
+    let (mut b, _gb, _) = connect("bob", "battery-staple");
+    let sql = "SELECT iv FROM t WHERE id = 10 LIMIT 10";
+    let (_, text_rows) = run(&mut b, sql, &[0]);
+    let (_, bin_rows) = run(&mut b, sql, &[1]);
+    assert_eq!(text_rows[0][0], None);
+    assert_eq!(bin_rows[0][0], None);
+    let (fmts, rows) = run(&mut s, "SELECT iv, n FROM t WHERE id = 1 LIMIT 10", &[1, 0]);
+    assert_eq!(fmts, vec![1, 0]);
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some(&golden(7_200_000_000, -1, 14)[..])
+    );
 }

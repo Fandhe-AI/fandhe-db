@@ -812,6 +812,42 @@ fn create_table_timestamptz_column_binds() {
     assert_eq!(add.status, 200, "got: {add:?}");
 }
 
+/// Issue #1583（TABLE-34・NOSQL-13）: `create_table`／`add_column` の型名 `"interval"` が
+/// 受理され、文字列が束縛でき、書式不正は 22007・数値は 42601 で拒否される。
+#[test]
+fn create_table_interval_column_binds() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let resp = query(
+        &session,
+        br#"{"op":"create_table","table":"iv","columns":[
+        {"name":"embedding","type":"vector","dim":2},
+        {"name":"d","type":"interval","nullable":true}
+    ]}"#,
+    );
+    assert_eq!(resp.status, 200, "got: {resp:?}");
+    let ok = query(
+        &session,
+        br#"{"op":"insert","table":"iv","rows":[{"id":1,"embedding":[0.1,0.2],"d":"1 year 2 mons -1 days +02:00:00"}],"operation_id":"iv-1"}"#,
+    );
+    assert_eq!(ok.status, 200, "got: {ok:?}");
+    let bad = query(
+        &session,
+        br#"{"op":"insert","table":"iv","rows":[{"id":2,"embedding":[0.1,0.2],"d":"nope"}],"operation_id":"iv-2"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&bad), "22007", "got: {bad:?}");
+    let num = query(
+        &session,
+        br#"{"op":"insert","table":"iv","rows":[{"id":3,"embedding":[0.1,0.2],"d":5}],"operation_id":"iv-3"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&num), "42601", "got: {num:?}");
+    let add = query(
+        &session,
+        br#"{"op":"alter_table","table":"iv","add_column":{"name":"d2","type":"interval"}}"#,
+    );
+    assert_eq!(add.status, 200, "got: {add:?}");
+}
+
 // --- CHECK 制約（Issue #1199・NOSQL-13・TABLE-16。SQL 表層と同じ engine の
 // 検査点が違反を `23514`／HTTP 409 で拒否することを固定する） -------------
 

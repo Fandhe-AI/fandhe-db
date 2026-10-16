@@ -186,6 +186,9 @@ pub enum Value {
     /// （`i64`）。`Timestamp`（naive）と別 variant にするのは、naive 値と UTC 値を取り違えて
     /// 投影・比較しないため（fail-closed）。
     TimestampTz(i64),
+    /// `INTERVAL` 列の値（TABLE-34・Issue #1579）。月・日・マイクロ秒の三要素。
+    /// 他型の variant を流用しない（取り違えによる fail-open を防ぐ）。
+    Interval(crate::datetime::Interval),
     /// 配列列の値（TABLE-14・TASK-198、Issue #888）。要素型ごとに variant を
     /// 分けることで、同一列の要素がすべて同じ型であることを型で保証する
     /// （`ColumnType::Array` の `ArrayElemType` と対応させる）。
@@ -461,6 +464,8 @@ pub enum ScalarRef<'a> {
     Time(i64),
     /// `TIMESTAMPTZ` 列（TABLE-33・Issue #1574）。UTC の 1970-01-01 起点マイクロ秒。
     TimestampTz(i64),
+    /// `INTERVAL` 列（TABLE-34・Issue #1579）。月・日・マイクロ秒の三要素。
+    Interval(crate::datetime::Interval),
     /// 配列列の借用結果（Issue #888）。構造・UTF-8・要素上限はすべて走査時に
     /// 検証済みで、[`ArrayRef::to_value`] は追加のエラー処理なしに複製できる。
     Array(ArrayRef<'a>),
@@ -508,6 +513,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Timestamp(_)
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
+            | ScalarRef::Interval(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -529,6 +535,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Timestamp(_)
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
+            | ScalarRef::Interval(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -552,6 +559,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Timestamp(_)
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
+            | ScalarRef::Interval(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -575,6 +583,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Date(_)
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
+            | ScalarRef::Interval(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -584,12 +593,31 @@ impl<'a> ScalarRef<'a> {
         }
     }
 
+    /// `TIMESTAMPTZ` 列の内部表現（UTC の 1970-01-01 起点マイクロ秒）。
+    /// `TimestampTz` 以外は `None`（同上、fail-closed。Issue #1576）。
+    pub fn as_timestamptz(&self) -> Option<i64> {
+        match self {
+            ScalarRef::TimestampTz(t) => Some(*t),
+            _ => None,
+        }
+    }
+
+    /// `INTERVAL` 列の値（生の三要素。比較は呼び出し側が `datetime::interval_cmp_key` を通す。
+    /// Issue #1580）。`Interval` 以外は `None`（fail-closed）。
+    pub fn as_interval(&self) -> Option<crate::datetime::Interval> {
+        match self {
+            ScalarRef::Interval(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     /// `TIME` 列の内部表現（0 時起点のマイクロ秒。`0..=86_400_000_000`）。
     /// `Time` 以外は `None`（同上、fail-closed。Issue #1570）。
     pub fn as_time(&self) -> Option<i64> {
         match self {
             ScalarRef::Time(t) => Some(*t),
             ScalarRef::TimestampTz(_)
+            | ScalarRef::Interval(_)
             | ScalarRef::Text(_)
             | ScalarRef::Integer(_)
             | ScalarRef::BigInt(_)
@@ -624,6 +652,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Timestamp(_)
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
+            | ScalarRef::Interval(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -651,6 +680,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Timestamp(_)
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
+            | ScalarRef::Interval(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -680,6 +710,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Timestamp(_)
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
+            | ScalarRef::Interval(_)
             | ScalarRef::Array(_)
             | ScalarRef::Json(_)
             | ScalarRef::Enum(_)
@@ -705,6 +736,7 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Timestamp(_)
             | ScalarRef::Time(_)
             | ScalarRef::TimestampTz(_)
+            | ScalarRef::Interval(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -815,6 +847,59 @@ pub(crate) const SCALAR_TIME_ENTRY_LEN: u32 = 9;
 /// `TIMESTAMPTZ` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
 /// （presence(1) + 値(8, LE i64。UTC マイクロ秒)。Issue #1574）。
 pub(crate) const SCALAR_TIMESTAMPTZ_ENTRY_LEN: u32 = 9;
+
+/// `INTERVAL` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + micros(8, LE i64) + days(4, LE i32) + months(4, LE i32)。Issue #1579）。
+pub(crate) const SCALAR_INTERVAL_ENTRY_LEN: u32 = 17;
+
+/// `INTERVAL` の値部（micros(8) + days(4) + months(4)、LE）を書き込む。呼び出し側が
+/// presence と `reserve` を済ませている前提（Issue #1579）。
+fn write_interval_payload(buf: &mut Vec<u8>, v: &crate::datetime::Interval) {
+    buf.extend_from_slice(&v.micros.to_le_bytes());
+    buf.extend_from_slice(&v.days.to_le_bytes());
+    buf.extend_from_slice(&v.months.to_le_bytes());
+}
+
+/// `INTERVAL` の値部 16 バイトを `offset` から読み、番兵（無限大の予約値）を拒否して
+/// 値と次の offset を返す。切り詰め・番兵は `Invalid`（fail-closed。Issue #1579）。
+fn read_interval_payload(
+    buf: &[u8],
+    offset: usize,
+) -> std::result::Result<(crate::datetime::Interval, usize), RowCodecError> {
+    let end = offset.checked_add(16).ok_or_else(|| {
+        RowCodecError::Invalid("offset overflow at interval value field".to_string())
+    })?;
+    let bytes = buf.get(offset..end).ok_or_else(|| {
+        RowCodecError::Invalid("row buffer truncated at interval value field".to_string())
+    })?;
+    let invalid = || RowCodecError::Invalid("interval value field is malformed".to_string());
+    let micros: [u8; 8] = bytes
+        .get(0..8)
+        .ok_or_else(invalid)?
+        .try_into()
+        .map_err(|_| invalid())?;
+    let days: [u8; 4] = bytes
+        .get(8..12)
+        .ok_or_else(invalid)?
+        .try_into()
+        .map_err(|_| invalid())?;
+    let months: [u8; 4] = bytes
+        .get(12..16)
+        .ok_or_else(invalid)?
+        .try_into()
+        .map_err(|_| invalid())?;
+    let v = crate::datetime::Interval {
+        months: i32::from_le_bytes(months),
+        days: i32::from_le_bytes(days),
+        micros: i64::from_le_bytes(micros),
+    };
+    if !crate::datetime::validate_interval(&v) {
+        return Err(RowCodecError::Invalid(
+            "interval value is a reserved infinity sentinel".to_string(),
+        ));
+    }
+    Ok((v, end))
+}
 
 /// 配列列のフレーム flags バイト（NULL 要素なし）。ペイロードは要素列のみ。
 const ARRAY_FLAGS_NONE: u8 = 0x00;
@@ -1734,6 +1819,7 @@ pub fn encode_row(
                     | ColumnType::Timestamp
                     | ColumnType::Time
                     | ColumnType::TimestampTz
+                    | ColumnType::Interval
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -1780,6 +1866,7 @@ pub fn encode_row(
                     | ColumnType::Timestamp
                     | ColumnType::Time
                     | ColumnType::TimestampTz
+                    | ColumnType::Interval
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -1907,6 +1994,22 @@ pub fn encode_row(
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&micros.to_le_bytes());
             }
+            Value::Interval(v) => {
+                if !matches!(column.ty, ColumnType::Interval) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Interval value, got Interval",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_interval(v) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: interval value is a reserved sentinel",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                write_interval_payload(&mut buf, v);
+            }
             Value::Array(array_value) => {
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
@@ -1924,6 +2027,7 @@ pub fn encode_row(
                     | ColumnType::Timestamp
                     | ColumnType::Time
                     | ColumnType::TimestampTz
+                    | ColumnType::Interval
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
@@ -1987,6 +2091,7 @@ pub fn encode_row(
                     | ColumnType::Timestamp
                     | ColumnType::Time
                     | ColumnType::TimestampTz
+                    | ColumnType::Interval
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -2160,6 +2265,7 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         Some(ScalarRef::Timestamp(t)) => Value::Timestamp(t),
                         Some(ScalarRef::Time(t)) => Value::Time(t),
                         Some(ScalarRef::TimestampTz(t)) => Value::TimestampTz(t),
+                        Some(ScalarRef::Interval(v)) => Value::Interval(v),
                         Some(ScalarRef::Json(t)) => Value::Json(t.to_string()),
                         _ => {
                             return Err(RowCodecError::Invalid(format!(
@@ -2535,6 +2641,11 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     })?;
                     values.push(Value::TimestampTz(micros));
                 }
+                ColumnType::Interval => {
+                    let (v, new_offset) = read_interval_payload(buf, offset)?;
+                    offset = new_offset;
+                    values.push(Value::Interval(v));
+                }
                 ColumnType::Array(array_ty) => {
                     let (array_ref, new_offset) =
                         parse_array_frame(buf, offset, array_ty.elem(), array_ty.max_len())?;
@@ -2869,6 +2980,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Timestamp
                     | ColumnType::Time
                     | ColumnType::TimestampTz
+                    | ColumnType::Interval
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -3008,6 +3120,23 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&micros.to_le_bytes());
             }
+            Value::Interval(v) => {
+                if !matches!(column.ty, ColumnType::Interval) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Interval value, got Interval",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_interval(v) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: interval value is a reserved sentinel",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_INTERVAL_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                write_interval_payload(&mut buf, v);
+            }
             Value::Array(array_value) => {
                 let array_ty = match &column.ty {
                     ColumnType::Array(array_ty) => array_ty,
@@ -3025,6 +3154,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Timestamp
                     | ColumnType::Time
                     | ColumnType::TimestampTz
+                    | ColumnType::Interval
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
@@ -3105,6 +3235,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Timestamp
                     | ColumnType::Time
                     | ColumnType::TimestampTz
+                    | ColumnType::Interval
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -3375,6 +3506,7 @@ fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) ->
         | ColumnType::Timestamp
         | ColumnType::Time
         | ColumnType::TimestampTz
+        | ColumnType::Interval
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -3605,6 +3737,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Timestamp
                         | ColumnType::Time
                         | ColumnType::TimestampTz
+                        | ColumnType::Interval
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -3733,6 +3866,23 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_VALUE);
                     buf.extend_from_slice(&micros.to_le_bytes());
                 }
+                Value::Interval(v) => {
+                    if !matches!(column.ty, ColumnType::Interval) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Interval value, got Interval",
+                            column.name
+                        )));
+                    }
+                    if !crate::datetime::validate_interval(v) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: interval value is a reserved sentinel",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_INTERVAL_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    write_interval_payload(&mut buf, v);
+                }
                 Value::Array(array_value) => {
                     let array_ty = match &column.ty {
                         ColumnType::Array(array_ty) => array_ty,
@@ -3750,6 +3900,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Timestamp
                         | ColumnType::Time
                         | ColumnType::TimestampTz
+                        | ColumnType::Interval
                         | ColumnType::Bytea
                         | ColumnType::Json
                         | ColumnType::Jsonb
@@ -3793,6 +3944,7 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Timestamp
                         | ColumnType::Time
                         | ColumnType::TimestampTz
+                        | ColumnType::Interval
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -3938,6 +4090,11 @@ pub(crate) fn merge_encode_scalar_columns(
                     reserve(&mut buf, SCALAR_TIMESTAMPTZ_ENTRY_LEN)?;
                     buf.push(PRESENCE_VALUE);
                     buf.extend_from_slice(&micros.to_le_bytes());
+                }
+                Some(ScalarRef::Interval(v)) => {
+                    reserve(&mut buf, SCALAR_INTERVAL_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    write_interval_payload(&mut buf, &v);
                 }
                 Some(ScalarRef::Array(array_ref)) => {
                     let payload_len = u32::try_from(array_ref.bytes.len()).map_err(|_| {
@@ -4111,6 +4268,10 @@ pub(crate) enum DefaultBindError {
     EnumLabel,
     /// `TIMESTAMPTZ` リテラルの TZ 名が解決できない（SQLSTATE `22023`。Issue #1574）。
     UnknownTimeZone,
+    /// `INTERVAL` リテラルのフィールド値が範囲外（SQLSTATE `22015`。Issue #1579）。
+    IntervalFieldOverflow,
+    /// `INTERVAL` リテラルが `infinity`／`-infinity`（SQLSTATE `0A000`。Issue #1579）。
+    IntervalInfinity,
 }
 
 /// 列の `DEFAULT` を型付きスカラー値へ変換する読み出し時補完版（JSON／JSONB は
@@ -4299,8 +4460,11 @@ pub(crate) fn default_scalar<'a>(
         },
         // `TIMESTAMPTZ` 列の既定値は `datetime::parse_timestamptz`（INSERT のリテラル束縛と
         // 同じ閉じた文法）で UTC のマイクロ秒へ正規化する（Issue #1574）。TZ の無い既定値は
-        // セッション TimeZone で解釈すべきだが、セッション値の保持は #1575 の担当のため
-        // 本 Issue では UTC 固定（`SessionTimeZone::utc()`）。
+        // セッション TimeZone で解釈すべきだが、ここは読み出し時補完・カタログ decode からも
+        // 呼ばれ決定的でなければならないため **意図的に UTC 固定**（`SessionTimeZone::utc()`）。
+        // TZ 無しの既定値は DDL 実行時（`sql::ddl::normalize_timestamptz_default`）にその時点の
+        // セッション TimeZone で解釈され、明示 offset 付き（`...+00`）へ正規化して保存されるため、
+        // 補完時のセッションによらず同じ値になる（TABLE-33・Issue #1575）。
         (ColumnDefault::Text(s), ColumnType::TimestampTz) => {
             use crate::datetime::{DateTimeLiteralError, SessionTimeZone, TimestampTzLiteralError};
             match crate::datetime::parse_timestamptz(s, &SessionTimeZone::utc()) {
@@ -4314,6 +4478,18 @@ pub(crate) fn default_scalar<'a>(
                 Err(TimestampTzLiteralError::UnknownTimeZone) => {
                     Err(DefaultBindError::UnknownTimeZone)
                 }
+            }
+        }
+        (ColumnDefault::Text(s), ColumnType::Interval) => {
+            use crate::datetime::IntervalLiteralError;
+            match crate::datetime::parse_interval(s) {
+                Ok(v) => Ok(ScalarRef::Interval(v)),
+                Err(IntervalLiteralError::Format(_)) => Err(DefaultBindError::DatetimeFormat),
+                Err(IntervalLiteralError::FieldOverflow) => {
+                    Err(DefaultBindError::IntervalFieldOverflow)
+                }
+                Err(IntervalLiteralError::OutOfRange) => Err(DefaultBindError::DatetimeOverflow),
+                Err(IntervalLiteralError::Infinity) => Err(DefaultBindError::IntervalInfinity),
             }
         }
         // `JSON` 列の既定値は文字列リテラルの原文を保持し、構文だけを共有検証
@@ -4955,6 +5131,15 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
+                ColumnType::Interval => {
+                    let (v, new_offset) = read_interval_payload(buf, offset)?;
+                    offset = new_offset;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Interval(v)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
                 ColumnType::Json | ColumnType::Jsonb => {
                     // フレーミング・UTF-8 検証は TEXT と共有する（Issue #889 D2）。
                     // 格納時（encode 経路）に構文検証・正規化済みのため、ここでは
@@ -5047,6 +5232,7 @@ pub fn scalar_refs_as_text<'a>(scanned: &[Option<ScalarRef<'a>>]) -> Vec<Option<
             | Some(ScalarRef::Timestamp(_))
             | Some(ScalarRef::Time(_))
             | Some(ScalarRef::TimestampTz(_))
+            | Some(ScalarRef::Interval(_))
             | Some(ScalarRef::Array(_))
             | Some(ScalarRef::Bytes(_))
             | Some(ScalarRef::Json(_))
@@ -5103,6 +5289,7 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
             Some(ScalarRef::Timestamp(micros)) => values.push(Value::Timestamp(micros)),
             Some(ScalarRef::Time(micros)) => values.push(Value::Time(micros)),
             Some(ScalarRef::TimestampTz(micros)) => values.push(Value::TimestampTz(micros)),
+            Some(ScalarRef::Interval(v)) => values.push(Value::Interval(v)),
             Some(ScalarRef::Array(array_ref)) => {
                 values.push(Value::Array(array_ref.to_value()?));
             }

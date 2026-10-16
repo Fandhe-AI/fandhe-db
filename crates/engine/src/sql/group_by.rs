@@ -391,7 +391,9 @@ impl Ord for GroupKey {
 /// `sql::aggregate::classify_aggregate_access`（EXPLAIN の静的判定）も本関数を
 /// 単一の情報源として共有し、実行経路との食い違い（D5 矛盾出力）を防ぐ。
 /// キーの実効照合がバイト列順でない場合も `None`（索引の `column_groups` はバイト列順の
-/// 辞書で供給するため、汎用経路へ縮退させる。TABLE-28・Issue #1610。照合込みの索引は #2191）。
+/// 辞書で供給し、集計表 `string_groups` もバイト列順で並べ直すため、汎用経路へ縮退させる。
+/// TABLE-28・Issue #1610。ICU 順の辞書を持つ列は `column_groups` 自体が `None` を返す。
+/// ICU キーの列挙形は集計表側の照合対応が要るため #2191 の対象外）。
 pub(crate) fn single_text_key_column(group_by: &crate::sql::parser::BoundGroupBy) -> Option<usize> {
     match group_by.keys.as_slice() {
         [key] if key.kind == OrderKind::Bytes && key.collation.is_byte_order() => {
@@ -1178,6 +1180,7 @@ pub(crate) fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         | Cell::Timestamp(_)
         | Cell::Time(_)
         | Cell::TimestampTz(_)
+        | Cell::Interval(_)
         | Cell::Array(_)
         | Cell::Bytes(_)
         | Cell::Json(_)
@@ -1293,6 +1296,9 @@ fn cmp_cell_values(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         (Cell::Date(x), Cell::Date(y)) => x.cmp(y),
         (Cell::Timestamp(x), Cell::Timestamp(y)) => x.cmp(y),
         (Cell::Time(x), Cell::Time(y)) => x.cmp(y),
+        // 集計結果（MIN/MAX/SUM/AVG）の ORDER BY は正規化キーで比べる（Issue #1580）。
+        (Cell::Interval(x), Cell::Interval(y)) => crate::datetime::cmp_interval(x, y),
+        (Cell::TimestampTz(x), Cell::TimestampTz(y)) => x.cmp(y),
         // `NUMERIC` は scale が異なりうる（整数 `AVG` は値ごとに scale が変わる。
         // Issue #2270）ため、`cmp_exact` で scale を揃えて厳密に比較する。
         (Cell::Numeric(x), Cell::Numeric(y)) => crate::numeric::cmp_exact(x, y),
@@ -2261,6 +2267,8 @@ fn expr_value_to_cell(
         ExprValue::Date(d) => Cell::Date(d),
         ExprValue::Timestamp(t) => Cell::Timestamp(t),
         ExprValue::Time(t) => Cell::Time(t),
+        ExprValue::TimestampTz(t) => Cell::TimestampTz(t),
+        ExprValue::Interval(v) => Cell::Interval(v),
         ExprValue::Null => Cell::Null,
         ExprValue::Json(_) | ExprValue::JsonText(_) => {
             return Err(accumulator_bug(
@@ -2651,6 +2659,7 @@ pub(crate) fn cell_to_scalar_ref(
         Cell::Uuid(u) => Some(row_codec::ScalarRef::Uuid(*u)),
         Cell::Time(t) => Some(row_codec::ScalarRef::Time(*t)),
         Cell::TimestampTz(t) => Some(row_codec::ScalarRef::TimestampTz(*t)),
+        Cell::Interval(v) => Some(row_codec::ScalarRef::Interval(*v)),
         Cell::Vector(_) | Cell::Array(_) | Cell::Bytes(_) | Cell::Json(_) => {
             return Err(accumulator_bug(
                 "group row cell type is not usable in an expression",

@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 63;
+    count = 65;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -192,6 +192,11 @@ define_error_classes! {
     /// `DatetimeFieldOverflow`（`22008`）のまま。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidDatetimeFormat`] の写像。
     InvalidDatetimeFormat => ("22007", "INVALID_DATETIME_FORMAT"),
+    /// `INTERVAL` リテラルのフィールド値が範囲外（`22015`）。数値が `i64` に収まらない・
+    /// 単位換算や同一フィールドへの累積が `i32`／`i64` をあふれる場合（TABLE-34・Issue #1579）。
+    /// 全フィールド合成後の範囲外は `DatetimeFieldOverflow`（`22008`）のまま。
+    /// [`crate::sql::allowlist::SqlSurfaceError::IntervalFieldOverflow`] の写像。
+    IntervalFieldOverflow => ("22015", "INTERVAL_FIELD_OVERFLOW"),
     /// 構文上受理された値が、宣言済み型の表現として不正（`22P02`）。ENUM 列
     /// （TABLE-14・TASK-198）の語彙外ラベルが最初の送出経路（[`crate::catalog::
     /// EnumLabelError`]・`sql::allowlist::SqlSurfaceError::InvalidTextRepresentation`）。
@@ -206,6 +211,10 @@ define_error_classes! {
     /// 拒否（[`crate::json::jsonpath::JsonPathParseError::UnsupportedUnicodeEscape`]。Issue #2185）。
     /// SQL 表層専用で NoSQL の `op` 語彙からは到達しない。
     UntranslatableCharacter => ("22P05", "UNTRANSLATABLE_CHARACTER"),
+    /// バイナリ形式の外部表現が不正（`22P03`）。wire-server の Bind が受ける numeric
+    /// パラメータのバイナリ復号（符号・`dscale`・桁群の不正。WIRE-26・TASK-339・Issue #2443）で
+    /// 発生する。SQL 表層（拡張クエリ）専用で NoSQL の `op` 語彙からは到達しない。
+    InvalidBinaryRepresentation => ("22P03", "INVALID_BINARY_REPRESENTATION"),
     /// 明示トランザクション（SQL-31・TASK-221）内で発生した一般的な状態不整合
     /// （`25000`）。同一トランザクション内での `operation_id` 再利用など、他の
     /// より具体的な分類に属さないトランザクション状態エラーに使う。

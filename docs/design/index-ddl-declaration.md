@@ -22,7 +22,7 @@ spec 本文はここへ転記しない（`.claude/rules/spec-confidentiality.md`
 本 Issue で次の 3 文を SQL 表層へ追加した。
 
 ```text
-CREATE INDEX <name> ON <table> ( <col>[, <col>...] )   -- スカラー宣言
+CREATE INDEX <name> ON <table> ( <col> [COLLATE <名前>][, ...] )   -- スカラー宣言（COLLATE は Issue #2191）
 CREATE INDEX <name> ON <table> USING hnsw ( <col> )     -- HNSW 宣言（VECTOR 列 1 本）
 DROP INDEX <name>
 ```
@@ -76,6 +76,8 @@ DROP INDEX <name>
 | 参照列が存在しない（`id` は暗黙列として常に有効） | `42703`（`UNDEFINED_COLUMN`。新設） | 400 |
 | `CREATE INDEX` の対象がビュー・既存索引、`DROP INDEX` にテーブル・ビュー名、`DROP TABLE`／`DROP VIEW`／`ALTER TABLE ADD COLUMN`／書き込み系 DML（`INSERT`・UPSERT・`UPDATE`・`DELETE`・`TRUNCATE`）に索引名 | `42809` | 400 |
 | 対象テーブルが存在しない | `42P01` | 404 |
+| 索引列の `COLLATE` の名前が許可リストに無い（構文段。カタログを参照しない。Issue #2191） | `42704` | 400 |
+| 照合を持てない列（`id`・数値・`VECTOR` 等）・`USING hnsw` への `COLLATE`（カタログ段。Issue #2191） | `42804` | 400 |
 | `USING` が `hnsw` 以外（`btree`・`bm25` 等）／`USING hnsw` の複数列・非 `VECTOR` 列（`id` を含む）／スカラー宣言が `VECTOR` 列・索引化非対応の型／部分索引の `WHERE`／式・関数呼び出し・リテラルの列指定 | `0A000` | 501 |
 | `UNIQUE`／`IF [NOT] EXISTS`／`ASC`・`DESC`／列の重複指定／`DROP` の複数名・`CASCADE`／`(col + 1)` 等の余分なトークン | `42601` | 400 |
 | 列リストの要素数上限（256）超過・索引宣言の総数上限（10,000）超過 | `54000` | 413 |
@@ -172,3 +174,7 @@ Issue #1065 で実装済み。詳細・設計判断は
   `--ddl-allowed-users` のユーザー単位ゲート・ERR-6 分類の wire 経由観測。
 - `crates/wire-server/src/http/status.rs`・`crates/wire-server/tests/err4_http_projection.rs`:
   新設 2 分類の HTTP 射影。
+
+## 追記（Issue #2191・TABLE-28）: 索引列の `COLLATE`
+
+列リストの各要素は `<識別子> [COLLATE <照合名>]`。照合名は固定の許可リスト（`C`・`POSIX`・`und-x-icu`・`ja-x-icu`）の完全一致で解決する。二重の `COLLATE` は `42601`、式索引は従来どおり `0A000`。カタログは照合を明示した列があるときだけ `v2`（5 行目に列ごとの照合トークン）で書き、無いときは従来の `v1` とバイト単位で同一。設計と判断は [collation-aware-index.md](collation-aware-index.md)。

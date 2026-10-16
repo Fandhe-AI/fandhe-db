@@ -73,6 +73,7 @@ fn open_storage() -> (Storage, temp_db::CleanupGuard) {
                 ColumnDef::new("ts", ColumnType::Timestamp, true),
                 ColumnDef::new("tm", ColumnType::Time, true),
                 ColumnDef::new("tz", ColumnType::TimestampTz, true),
+                ColumnDef::new("iv", ColumnType::Interval, true),
                 ColumnDef::new("u", ColumnType::Uuid, true),
                 ColumnDef::new("bin", ColumnType::Bytea, true),
             ],
@@ -912,8 +913,14 @@ fn typed_slots_reject_malformed_values_with_22p02_and_decode_binary_per_wire14()
     // 長さ不正は 08P01。
     send_pbes_expect_error(&mut s, int_sql, &[], &[1], &[Some(b"12345")], "08P01");
     send_pbes_expect_error(&mut s, bool_sql, &[], &[1], &[Some(b"tt")], "08P01");
-    // id スロットは宣言 0（実効 numeric）のバイナリを引き続き 0A000 で拒否する。
-    send_pbes_expect_error(&mut s, id_sql, &[], &[1], &[Some(b"1")], "0A000");
+    // id スロットは宣言 0（実効 numeric）のバイナリを numeric として復号する（WIRE-26 (3) に
+    // よる仕様変更に基づく期待値更新。Issue #2443）。1 バイトは numeric として不正な長さで 08P01、
+    // 正しい numeric バイト列はテキスト形式と同一の応答になる。
+    send_pbes_expect_error(&mut s, id_sql, &[], &[1], &[Some(b"1")], "08P01");
+    let one = [0u8, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+    let (text_rows, _) = run_extended(&mut s, id_sql, &[0], &[Some(b"1")]);
+    let (bin_rows, _) = run_extended(&mut s, id_sql, &[1], &[Some(&one)]);
+    assert_eq!(text_rows, bin_rows);
 }
 
 // --- 型付き束縛（Issue #1406・WIRE-12・WIRE-14）: 7 型の列位置 -----------------
@@ -932,6 +939,8 @@ fn seven_type_slots_report_column_oids() {
         ("tm", 1083),
         // TIMESTAMPTZ スロットは timestamptz（OID 1184。TABLE-33・Issue #1577）。
         ("tz", 1184),
+        // INTERVAL スロットは interval（OID 1186。TABLE-34・Issue #1583）。
+        ("iv", 1186),
         ("u", 2950),
         ("bin", 17),
     ] {
@@ -1051,6 +1060,13 @@ fn seven_type_malformed_values_and_binary_per_wire14() {
         ("d", b"2.25".to_vec(), 2.25f64.to_be_bytes().to_vec()),
         ("u", uid.as_bytes().to_vec(), uid_bin),
         ("bin", b"\\x0102".to_vec(), vec![1u8, 2]),
+        // NUMERIC は numeric_send レイアウト（ndigits=2・weight=0・正・dscale=2・[3, 1400]）。
+        // WIRE-26 (3) による仕様変更（Issue #2443）。
+        (
+            "num",
+            b"3.14".to_vec(),
+            vec![0u8, 2, 0, 0, 0, 0, 0, 2, 0, 3, 5, 120],
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -1081,8 +1097,9 @@ fn seven_type_malformed_values_and_binary_per_wire14() {
         &[Some(&f64::NAN.to_be_bytes())],
         "22P02",
     );
-    // NUMERIC・DATE・TIMESTAMP のバイナリは WIRE-14 どおり 0A000（接続は維持）。
-    for col in ["num", "dt", "ts"] {
+    // DATE・TIMESTAMP のバイナリは WIRE-14 どおり 0A000（接続は維持）。NUMERIC は上の
+    // バイナリ ≡ テキスト比較へ移した（WIRE-26。Issue #2443）。
+    for col in ["dt", "ts"] {
         send_pbes_expect_error(&mut s, &sel(col), &[], &[1], &[Some(b"1")], "0A000");
     }
 }

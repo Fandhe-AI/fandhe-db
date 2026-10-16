@@ -78,7 +78,7 @@ jiff の既定 features（`tz-system`・`tzdb-zoneinfo`・`tzdb-concatenated`・
 ## 5. 後続 Issue への申し送り
 
 - **#1574**: 依存の実際の追加、`make deny` の通過、release でのサイズ再確認、`Cargo.lock` の新規分と `cargo tree -d` の確認
-- **#1575**: POSIX 形式の TZ 文字列（例: `EST5EDT`、`+09` の符号が逆になる PG の解釈）、略称の扱い、不正な名前の SQLSTATE を PG 17 と照合する
+- **#1575（実装済み。結果は [session-timezone.md](session-timezone.md)）**: POSIX 形式の TZ 文字列（例: `EST5EDT`、`+09` の符号が逆になる PG の解釈）、略称の扱い、不正な名前の SQLSTATE を PG 17 と照合する
 - **#1576**: DST の gap（存在しない時刻）と fold（重複する時刻）の解決を、jiff の既定値に任せず明示オプション（Disambiguation）で選び、PG 17 の挙動と比べてテストで固定する
 - **#1577**: wire は依存を追加しない
 - **sort-determinism-check の維持**: TIMESTAMPTZ の比較は UTC の i64 で行う

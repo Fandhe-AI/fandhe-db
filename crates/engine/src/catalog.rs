@@ -191,25 +191,62 @@ pub struct IndexDef {
     pub table: String,
     pub kind: IndexKind,
     pub columns: Vec<String>,
+    /// `columns` と同じ長さの列ごとの照合（`CREATE INDEX ... (col COLLATE "x")`。Issue #2191・
+    /// TABLE-28）。`None` は照合指定なし（列の実効照合に従う）。スカラー宣言のみが持ち、
+    /// `USING hnsw`・`id`・照合を持てない型の列への指定は [`Storage::create_index`] が
+    /// [`CatalogError::IndexCollationNotSupported`] で拒否する。
+    pub collations: Vec<Option<crate::collation::Collation>>,
 }
 
 impl IndexDef {
+    /// 照合指定なしの索引宣言を作る（`collations` はすべて `None`）。
     pub fn new(name: String, table: String, kind: IndexKind, columns: Vec<String>) -> Self {
+        let collations = vec![None; columns.len()];
         Self {
             name,
             table,
             kind,
             columns,
+            collations,
         }
+    }
+
+    /// 列ごとの照合指定を与える（`collations` は `columns` と同じ長さであること。長さの
+    /// 不一致は [`Storage::create_index`] が `Invalid` で拒否する）。
+    pub fn with_column_collations(
+        mut self,
+        collations: Vec<Option<crate::collation::Collation>>,
+    ) -> Self {
+        self.collations = collations;
+        self
     }
 }
 
-/// [`IndexDef`] のテキスト形式エンコード（`v1\n<table>\n<kind>\n<col1>,<col2>,...`）。
+/// [`IndexDef`] のテキスト形式エンコード。照合を明示した列が無い宣言は従来どおりの
+/// `v1\n<table>\n<kind>\n<col1>,<col2>,...`（バイト単位で不変）、1 列でも明示した宣言は
+/// 5 行目に列と同じ数の照合トークン（`-` は指定なし、それ以外は
+/// [`crate::collation::Collation::catalog_token`]）をカンマ区切りで並べた `v2`
+/// （Issue #2191。旧バイナリは `v2` を未知の版として拒否する。前方互換はない）。
 /// 列名・テーブル名は [`validate_identifier`] を通過済みの前提（`,`・改行のいずれも
 /// 含み得ない）のため、区切り文字として安全に使える。
 fn encode_index_def(def: &IndexDef) -> Result<Vec<u8>> {
     let columns_csv = def.columns.join(",");
-    let text = format!("v1\n{}\n{}\n{}", def.table, def.kind.as_str(), columns_csv);
+    let text = if def.collations.iter().all(Option::is_none) {
+        format!("v1\n{}\n{}\n{}", def.table, def.kind.as_str(), columns_csv)
+    } else {
+        let tokens: Vec<&str> = def
+            .collations
+            .iter()
+            .map(|c| c.map_or("-", |c| c.catalog_token()))
+            .collect();
+        format!(
+            "v2\n{}\n{}\n{}\n{}",
+            def.table,
+            def.kind.as_str(),
+            columns_csv,
+            tokens.join(",")
+        )
+    };
     if text.len() > MAX_CATALOG_VALUE_LEN {
         return Err(CatalogError::Invalid(
             "index definition exceeds catalog value size limit".to_string(),
@@ -233,11 +270,12 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     let version = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema(format!("missing format version for index {name}"))
     })?;
-    if version != "v1" {
+    if version != "v1" && version != "v2" {
         return Err(CatalogError::CorruptSchema(format!(
             "unknown index catalog format version for index {name}"
         )));
     }
+    let is_v2 = version == "v2";
     let table = lines
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema(format!("missing table for index {name}")))?
@@ -260,6 +298,13 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     let columns_csv = lines
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema(format!("missing columns for index {name}")))?;
+    let collations_line = if is_v2 {
+        Some(lines.next().ok_or_else(|| {
+            CatalogError::CorruptSchema(format!("missing collations for index {name}"))
+        })?)
+    } else {
+        None
+    };
     if lines.next().is_some() {
         return Err(CatalogError::CorruptSchema(format!(
             "unexpected trailing data for index {name}"
@@ -284,12 +329,50 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
             "duplicate column in index {name}"
         )));
     }
+    let collations = match collations_line {
+        None => vec![None; columns.len()],
+        Some(line) => decode_index_collations(name, line, columns.len(), &kind)?,
+    };
     Ok(IndexDef {
         name: name.to_string(),
         table,
         kind,
         columns,
+        collations,
     })
+}
+
+/// `v2` の照合トークン行を復元する。未知トークン・要素数の不一致・すべて `-`（`v1` で書くべき
+/// 非正準形）・`hnsw` への照合の付与は、手で書き換えられた永続データとして
+/// [`CatalogError::CorruptSchema`] で fail-closed に拒否する（Issue #2191）。
+fn decode_index_collations(
+    name: &str,
+    line: &str,
+    column_count: usize,
+    kind: &IndexKind,
+) -> Result<Vec<Option<crate::collation::Collation>>> {
+    let corrupt =
+        || CatalogError::CorruptSchema(format!("invalid index collations for index {name}"));
+    let mut out: Vec<Option<crate::collation::Collation>> = Vec::new();
+    for token in line.split(',') {
+        if out.len() >= MAX_COLUMN_COUNT {
+            return Err(corrupt());
+        }
+        if token == "-" {
+            out.push(None);
+        } else {
+            out.push(Some(
+                crate::collation::Collation::from_catalog_token(token).ok_or_else(corrupt)?,
+            ));
+        }
+    }
+    if out.len() != column_count
+        || out.iter().all(Option::is_none)
+        || matches!(kind, IndexKind::Hnsw)
+    {
+        return Err(corrupt());
+    }
+    Ok(out)
 }
 
 /// 列名リストの中で最初に重複した列名を返す（[`Storage::create_index`] の入力検証と
@@ -311,6 +394,34 @@ fn first_duplicate_column(columns: &[String]) -> Option<&str> {
 /// - `Scalar`: 各列は索引化対応済みの型（[`is_declarable_scalar_index_type`]）で
 ///   なければならない。
 fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
+    // 照合（Issue #2191・TABLE-28）は、照合を持てる型（`TEXT`・`VARCHAR`・`CHAR`）のスカラー
+    // 宣言の列にだけ付けられる。`id`（暗黙の行キー）・数値・`VECTOR` 等の型・`USING hnsw` は
+    // 種別・列型の検査より前に `IndexCollationNotSupported`（`42804`）で拒否する。
+    for (col, collation) in def.columns.iter().zip(def.collations.iter()) {
+        if collation.is_none() {
+            continue;
+        }
+        if matches!(def.kind, IndexKind::Hnsw) {
+            return Err(CatalogError::IndexCollationNotSupported(
+                "USING hnsw does not support COLLATE".to_string(),
+            ));
+        }
+        match schema.columns.iter().find(|c| &c.name == col) {
+            Some(column) if crate::collation::is_collatable(&column.ty) => {}
+            Some(_) => {
+                return Err(CatalogError::IndexCollationNotSupported(format!(
+                    "column {col} does not support COLLATE in an index"
+                )));
+            }
+            // `id` は存在するが照合を持てない。それ以外の不在は列不在（`42703`）。
+            None if col == "id" => {
+                return Err(CatalogError::IndexCollationNotSupported(
+                    "column id does not support COLLATE in an index".to_string(),
+                ));
+            }
+            None => return Err(CatalogError::ColumnNotFound(col.clone())),
+        }
+    }
     match def.kind {
         IndexKind::Hnsw => {
             let col = match def.columns.as_slice() {
@@ -361,7 +472,8 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
 }
 
 /// スカラー索引宣言が対象にできる列型。`VECTOR`・`BOOLEAN`／`JSON(B)`／`ARRAY` は
-/// 索引化に効かない宣言を作らないため fail-closed に拒否する。`BYTEA` は自動・
+/// 索引化に効かない宣言を作らないため fail-closed に拒否する。`INTERVAL` は正規化キー
+/// （`datetime::interval_cmp_key`）の `OrderedColumnIndex::Interval` で索引化される（#1580）。`BYTEA` は自動・
 /// 宣言とも `OrderedColumnIndex::Bytes` で索引化されるため受理する（#1257・#1362、INDEX-7）。
 /// 数値 4 型（INTEGER／BIGINT／REAL／DOUBLE PRECISION）もレーン A（#1359）で自動・
 /// 宣言とも索引化されるため受理する（#1413、INDEX-7）。
@@ -374,7 +486,9 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
             | ColumnType::Enum(_)
             | ColumnType::Date
             | ColumnType::Timestamp
+            | ColumnType::TimestampTz
             | ColumnType::Time
+            | ColumnType::Interval
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid
             | ColumnType::Bytea
@@ -397,7 +511,28 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
 pub(crate) struct DeclaredIndexTargets {
     /// 対象テーブルのスカラー宣言列（複数宣言の和集合・重複排除）。宣言が
     /// 1 件も無ければ `None`（呼び出し元は `Auto` 〔現行の全列自動〕へ倒す）。
-    pub(crate) scalar_columns: Option<Vec<String>>,
+    pub(crate) scalar_columns: Option<Vec<DeclaredScalarColumn>>,
+}
+
+/// スカラー宣言された列 1 つ分の宣言一覧（Issue #2191）。同じ列を覆う宣言が複数ある場合、
+/// 照合の食い違いを含めてここへ全部持ち、どの照合で辞書を作るかの決定は構築側
+/// （`sql::scalar_index::DeclaredScalarColumn::resolved_collation`）が列の実効照合と合わせて行う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredScalarColumn {
+    pub(crate) name: String,
+    /// `(索引名, 宣言の照合)`。宣言の照合 `None` は列の実効照合に従う。
+    pub(crate) decls: Vec<(String, Option<crate::collation::Collation>)>,
+}
+
+impl DeclaredScalarColumn {
+    /// 照合指定のない単一の宣言だけを持つ列（テスト・既定経路用）。
+    #[cfg(test)]
+    pub(crate) fn plain(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            decls: vec![(format!("i_{name}"), None)],
+        }
+    }
 }
 
 /// 対象テーブルの索引宣言を、クエリが使っているのと同一の `read_txn`
@@ -420,7 +555,7 @@ pub(crate) fn declared_index_targets_in_txn(
         }
         Err(e) => return Err(e.into()),
     };
-    let mut scalar_columns: Vec<String> = Vec::new();
+    let mut scalar_columns: Vec<DeclaredScalarColumn> = Vec::new();
     for (scanned, entry) in index_table.iter()?.enumerate() {
         if scanned >= MAX_INDEX_COUNT {
             return Err(CatalogError::CorruptSchema(format!(
@@ -430,9 +565,14 @@ pub(crate) fn declared_index_targets_in_txn(
         let (key, value) = entry?;
         let def = decode_index_def(key.value(), value.value())?;
         if matches!(def.kind, IndexKind::Scalar) && def.table == table {
-            for col in def.columns {
-                if !scalar_columns.iter().any(|c| c == &col) {
-                    scalar_columns.push(col);
+            for (col, collation) in def.columns.into_iter().zip(def.collations) {
+                let decl = (def.name.clone(), collation);
+                match scalar_columns.iter_mut().find(|c| c.name == col) {
+                    Some(existing) => existing.decls.push(decl),
+                    None => scalar_columns.push(DeclaredScalarColumn {
+                        name: col,
+                        decls: vec![decl],
+                    }),
                 }
             }
         }
@@ -1246,6 +1386,8 @@ const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &[
     "timetz",
     // Issue #1574（TABLE-33）。`TIMESTAMPTZ` は型名解決表の語。
     "timestamptz",
+    // Issue #1579（TABLE-34）。`INTERVAL` は型名解決表の語。
+    "interval",
 ];
 
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、
@@ -1364,6 +1506,9 @@ pub enum CatalogError {
     /// スカラー宣言に `VECTOR` 列または索引化非対応の型を指定した等。
     /// TASK-206・INDEX-7、Issue #908。SQL 表層では `0A000`）。
     IndexKindMismatch(String),
+    /// 照合（`COLLATE`）を持てない列への索引照合の指定（`id`・数値・`VECTOR` 等の型、
+    /// `USING hnsw`。Issue #2191・TABLE-28。SQL 表層では `42804`）。`detail` は固定文言のみ。
+    IndexCollationNotSupported(String),
     /// 索引宣言の登録件数上限超過（TASK-206・INDEX-7、Issue #908。本リポの実装
     /// 既定値による DoS 対策。SQL 表層では `54000`）。`detail` は固定文言のみ。
     IndexLimitExceeded(String),
@@ -1466,6 +1611,9 @@ impl fmt::Display for CatalogError {
             CatalogError::IndexKindMismatch(detail) => {
                 write!(f, "index kind mismatch: {detail}")
             }
+            CatalogError::IndexCollationNotSupported(detail) => {
+                write!(f, "index collation not supported: {detail}")
+            }
             CatalogError::IndexLimitExceeded(detail) => {
                 write!(f, "index limit exceeded: {detail}")
             }
@@ -1528,6 +1676,7 @@ impl std::error::Error for CatalogError {
             | CatalogError::IndexAlreadyExists(_)
             | CatalogError::IndexNotFound(_)
             | CatalogError::IndexKindMismatch(_)
+            | CatalogError::IndexCollationNotSupported(_)
             | CatalogError::IndexLimitExceeded(_)
             | CatalogError::InvalidForeignKey(_)
             | CatalogError::ConstraintAlreadyExists(_)
@@ -1706,8 +1855,13 @@ pub enum ColumnType {
     /// Issue #1574）。内部表現は UTC の 1970-01-01 起点マイクロ秒（`i64`。受理範囲は
     /// `TIMESTAMP` と同じ `0001-01-01`〜`9999-12-31`〔UTC〕）。カタログタグは
     /// `timestamptz`・param は `-` 固定。値の解析・整形は [`crate::datetime`] へ委譲する。
-    /// PK・UNIQUE・索引・述語・集計は #1576 まで fail-closed。
+    /// 述語・集計・二次索引・式内参照は Issue #1576 で解禁済み。PK・UNIQUE・FK・JOIN キーは担当 Issue 未定のため fail-closed。
     TimestampTz,
+    /// 期間列（`INTERVAL`、TABLE-34・Issue #1579）。内部表現は月（`i32`）・日（`i32`）・
+    /// マイクロ秒（`i64`）の三要素で、行ペイロードは presence 込み 17 バイト。カタログタグは
+    /// `interval`・param は `-` 固定。値の解析・整形は [`crate::datetime`] へ委譲する。
+    /// PK・UNIQUE・索引・述語・集計・式は #1580・#1581 まで fail-closed。
+    Interval,
     /// 可変長の同型スカラー配列列（`<スカラー型>[]`、TABLE-14・TASK-198、Issue #888）。
     /// 要素型・要素数上限は [`ArrayType`] が保持する。検索経路（KNN・hybrid・ANN・
     /// 二次索引・`EXPLAIN`）からは一貫して非対象として除外する（`VECTOR` 列との
@@ -1918,6 +2072,8 @@ impl ColumnType {
             ColumnType::Time => 0,
             // `TimestampTz` も PK／UNIQUE 非許可（Issue #1574。担当 Issue 未定の fail-closed）。
             ColumnType::TimestampTz => 0,
+            // `Interval` も PK／UNIQUE 非許可（Issue #1579。担当 Issue 未定の fail-closed）。
+            ColumnType::Interval => 0,
             ColumnType::Bytea => 7,
             ColumnType::Uuid => 8,
             ColumnType::Enum(_) => 9,
@@ -1957,6 +2113,7 @@ impl ColumnType {
             ColumnType::Timestamp => ("timestamp", "-".to_string()),
             ColumnType::Time => ("time", "-".to_string()),
             ColumnType::TimestampTz => ("timestamptz", "-".to_string()),
+            ColumnType::Interval => ("interval", "-".to_string()),
             ColumnType::Array(array_ty) => ("array", array_ty.catalog_param()),
             ColumnType::Bytea => ("bytea", "-".to_string()),
             ColumnType::Json => ("json", "-".to_string()),
@@ -2093,6 +2250,14 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::TimestampTz)
+            }
+            "interval" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "interval column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Interval)
             }
             "array" => Ok(ColumnType::Array(parse_array_param(param, resolve_enum)?)),
             "bytea" => {
@@ -3417,6 +3582,7 @@ impl ColumnDefault {
                     | ColumnType::Timestamp
                     | ColumnType::Time
                     | ColumnType::TimestampTz
+                    | ColumnType::Interval
                     | ColumnType::Uuid
                     | ColumnType::Enum(_)
                     | ColumnType::Json
@@ -3592,7 +3758,7 @@ pub struct ColumnDef {
     /// Issue #1609・#2190）。`None` は「照合指定なし」で、明示した `C`／`POSIX` とは区別して
     /// 保存する。付けられるのは [`crate::collation::is_collatable`] な型だけ（encode・decode
     /// 両側で fail-closed に検査する）。比較・ソートへの反映は `sql` 層が行い（#1610・#2190）、
-    /// 照合込みの索引は #2191。
+    /// スカラー二次索引の辞書は列の実効照合（起動時 opt-in では索引宣言の照合）順に並ぶ（#2191）。
     pub collation: Option<crate::collation::Collation>,
 }
 
@@ -4398,6 +4564,7 @@ impl TableSchema {
             | ColumnType::Timestamp
             | ColumnType::Time
             | ColumnType::TimestampTz
+            | ColumnType::Interval
             | ColumnType::Bytea
             | ColumnType::Json
             | ColumnType::Jsonb
@@ -8984,8 +9151,9 @@ impl Storage {
     /// [`Self::alter_table_alter_column_type`] に照合（`... TYPE <型> COLLATE <名前>`。
     /// TABLE-28・Issue #1609）を加えた版。`collation` は変更後の列の照合で、`None`（`COLLATE`
     /// 省略）は新しい型の既定（照合指定なし）へ戻す。型が同じで照合だけが変わる場合は
-    /// カタログのみ書き換える（`C`／`POSIX` はどちらもバイト列順で、行・索引の再構築は
-    /// 不要。#2191 で照合込みの索引を導入したら、照合の変更時に再構築すること）。
+    /// カタログのみ書き換える（行・永続の一意索引は照合に依らないバイト列キーのため再構築は
+    /// 不要。照合順に依存するメモリ上のスカラー二次索引は、世代の更新で次のクエリが新しい
+    /// 照合の辞書で作り直す。Issue #2191）。
     /// 照合を付けられない型への指定は `Invalid`（表層が先に `42804` で拒否する多層防御）。
     pub(crate) fn alter_table_alter_column_type_collated(
         &self,
@@ -9623,6 +9791,11 @@ impl Storage {
                 def.columns.len()
             )));
         }
+        if def.collations.len() != def.columns.len() {
+            return Err(CatalogError::Invalid(
+                "index collations must match the column list".to_string(),
+            ));
+        }
         for c in &def.columns {
             validate_identifier(c)?;
         }
@@ -10195,6 +10368,7 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexCollationNotSupported(_)
         | CatalogError::IndexLimitExceeded(_)
         // `FOREIGN KEY` 宣言の照合（`create_table` 専用）はテーブル存在確認からは
         // 到達しない（網羅性のため `Internal` へ丸める）。
@@ -11241,6 +11415,110 @@ mod tests {
             ))
             .expect("create sibling");
         (storage, guard)
+    }
+
+    /// 照合を明示した列が無い宣言は従来の `v1` とバイト単位で同一、1 列でも明示した宣言は
+    /// `v2`（Issue #2191）。往復で同じ宣言を復元する。
+    #[test]
+    fn index_def_encoding_v1_is_unchanged_and_v2_round_trips() {
+        use crate::collation::Collation;
+        let plain = IndexDef::new(
+            "i".to_string(),
+            "docs".to_string(),
+            IndexKind::Scalar,
+            vec!["a".to_string(), "b".to_string()],
+        );
+        assert_eq!(
+            encode_index_def(&plain).expect("encode"),
+            b"v1\ndocs\nscalar\na,b".to_vec()
+        );
+        assert_eq!(
+            decode_index_def("i", b"v1\ndocs\nscalar\na,b").expect("decode"),
+            plain
+        );
+        let collated = plain
+            .clone()
+            .with_column_collations(vec![None, Some(Collation::JaIcu)]);
+        let bytes = encode_index_def(&collated).expect("encode");
+        assert_eq!(bytes, b"v2\ndocs\nscalar\na,b\n-,ja_x_icu".to_vec());
+        assert_eq!(decode_index_def("i", &bytes).expect("decode"), collated);
+    }
+
+    /// 手で書き換えられた `v2` は fail-closed に拒否する（未知トークン・要素数の不一致・
+    /// すべて `-` の非正準形・`hnsw` への照合・5 行目の欠落・余剰行）。
+    #[test]
+    fn index_def_decode_rejects_corrupt_v2() {
+        for bytes in [
+            &b"v2\ndocs\nscalar\na,b\n-,xx"[..],
+            b"v2\ndocs\nscalar\na,b\nund_x_icu",
+            b"v2\ndocs\nscalar\na,b\n-,-",
+            b"v2\ndocs\nhnsw\na\nc",
+            b"v2\ndocs\nscalar\na,b",
+            b"v2\ndocs\nscalar\na\nc\nextra",
+            b"v1\ndocs\nscalar\na\nc",
+            b"v3\ndocs\nscalar\na",
+        ] {
+            assert!(
+                matches!(
+                    decode_index_def("i", bytes),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    /// 索引の照合は照合を持てる型のスカラー宣言の列にだけ付けられる（Issue #2191）。
+    #[test]
+    fn create_index_collation_requires_a_collatable_scalar_column() {
+        use crate::collation::Collation;
+        let (storage, _guard) = index_fixture_storage("index-collation-validate");
+        let with = |name: &str, kind, cols: &[&str], colls: Vec<Option<Collation>>| {
+            IndexDef::new(
+                name.to_string(),
+                "docs".to_string(),
+                kind,
+                cols.iter().map(|c| c.to_string()).collect(),
+            )
+            .with_column_collations(colls)
+        };
+        storage
+            .create_index(&with(
+                "ok",
+                IndexKind::Scalar,
+                &["lang"],
+                vec![Some(Collation::UndIcu)],
+            ))
+            .expect("TEXT column accepts a collation");
+        for (cols, kind) in [
+            (&["flag"][..], IndexKind::Scalar),
+            (&["id"][..], IndexKind::Scalar),
+            (&["embedding"][..], IndexKind::Scalar),
+            (&["embedding"][..], IndexKind::Hnsw),
+        ] {
+            assert!(
+                matches!(
+                    storage.create_index(&with("bad", kind, cols, vec![Some(Collation::C)])),
+                    Err(CatalogError::IndexCollationNotSupported(_))
+                ),
+                "{cols:?}"
+            );
+        }
+        assert!(matches!(
+            storage.create_index(&with(
+                "missing",
+                IndexKind::Scalar,
+                &["nope"],
+                vec![Some(Collation::C)]
+            )),
+            Err(CatalogError::ColumnNotFound(_))
+        ));
+        // 長さの不一致は Rust API からの不正入力として拒否する。
+        assert!(matches!(
+            storage.create_index(&with("len", IndexKind::Scalar, &["lang"], vec![])),
+            Err(CatalogError::Invalid(_))
+        ));
     }
 
     fn scalar_def(name: &str, table: &str, cols: &[&str]) -> IndexDef {

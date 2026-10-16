@@ -20,7 +20,9 @@
 //! 完全一致のみで、ライブラリの構築成否を受理の根拠にしない（決定事項 3）。ICU の照合が
 //! 結線されていない経路へ入った場合は `sql` 層の `require_wired_collation` が `0A000` で
 //! 拒否する（意味論の fail-open を作らない）。式の照合の導出と衝突（`42P21`／`42P22`）は
-//! `sql::udf_call` が担い、照合込みの索引は #2191 が担う。
+//! `sql::udf_call` が担う。照合込みの索引（辞書の並びを索引の照合順にする・照合が異なる比較では
+//! 索引を使わない）は Issue #2191 で `sql::scalar_index` に結線した（[`Collation::same_order`]
+//! が使用可否の一致判定）。
 //!
 //! 新しい照合を足すときは [`Collation`] へ variant を足す（ワイルドカード腕を使っていない
 //! ため、全ディスパッチ地点がコンパイルエラーで列挙される）。
@@ -94,6 +96,14 @@ impl Collation {
         }
     }
 
+    /// 2 つの照合が同じ順序（同じ等値・同じ大小）を与えるか。同一の照合に加え、`C` と `POSIX`
+    /// のようにどちらもバイト列順の照合同士は同値とみなす。索引の照合と式の照合が「一致する」
+    /// 判定（照合込みの索引の使用可否。Issue #2191）の唯一の定義で、`C` 列に付けた索引を
+    /// `POSIX` の比較が使えなくなる後退を避ける。
+    pub fn same_order(self, other: Collation) -> bool {
+        self == other || (self.is_byte_order() && other.is_byte_order())
+    }
+
     /// ICU の比較器（バイト列順の照合は `None`）。
     fn icu(self) -> Option<&'static IcuCollator> {
         match self {
@@ -135,8 +145,9 @@ impl Collation {
     /// しない。ICU 照合は「ICU キー ‖ `0x00` ‖ 元バイト列」の形にする。ICU キーは `0x00` を
     /// 含まない（レベル区切りは `0x01`／`0x02`）ため、キーが異なればキーで、等しければ
     /// 元バイト列で順序が決まり、[`Self::compare`] と一致する。キー生成は比較より高コスト
-    /// なので、何度も比較されるキー（索引など。#2191）にだけ使う。長さは入力長に比例する
-    /// 上限で拒否する。
+    /// なので、何度も比較されるキー（永続の順序索引など）にだけ使う。長さは入力長に比例する
+    /// 上限で拒否する。Issue #2191 の二次索引はメモリ上の辞書を異なり値ごとに
+    /// [`Self::compare`] で並べるだけで、ソートキーを保持しない。
     pub fn sort_key(self, s: &[u8]) -> Result<Cow<'_, [u8]>, SqlSurfaceError> {
         let Some(c) = self.icu() else {
             debug_assert!(self.is_byte_order(), "ICU collator must be available");
@@ -236,6 +247,7 @@ pub fn is_collatable(ty: &ColumnType) -> bool {
         | ColumnType::Timestamp
         | ColumnType::Time
         | ColumnType::TimestampTz
+        | ColumnType::Interval
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json

@@ -272,8 +272,92 @@ fn render_expr(expr: &Expr) -> String {
         Expr::TimestampLiteral(micros) => {
             format!("TIMESTAMP '{}'", crate::datetime::format_timestamp(*micros))
         }
+        // `INTERVAL` 型付きリテラル（Issue #1581）。三要素から正規形（`format_interval`）を
+        // 再構成し、原文を連結しない（再パースで同じ三要素に戻る）。
+        Expr::IntervalLiteral(v) => {
+            format!("INTERVAL '{}'", crate::datetime::format_interval(v))
+        }
         // `TIME` 型付きリテラル（Issue #1570）。`24:00:00` も `format_time` が往復できる形で返す。
         Expr::TimeLiteral(micros) => format!("TIME '{}'", crate::datetime::format_time(*micros)),
+        // `TIMESTAMPTZ` 型付きリテラル（Issue #1576）。ゾーン無しの入力は定義時のセッション TZ で
+        // UTC へ確定し、再パースで定義時と別の解釈にならないよう UTC の明示 offset（`+00`）で描く。
+        Expr::TimestampTzLiteral {
+            micros,
+            session_local,
+        } => {
+            let utc = if *session_local {
+                crate::datetime::with_current_session_time_zone(|tz| {
+                    tz.timestamp_to_timestamptz(*micros)
+                })
+                .unwrap_or(*micros)
+            } else {
+                *micros
+            };
+            format!(
+                "TIMESTAMPTZ '{}'",
+                crate::datetime::format_timestamptz(utc, &crate::datetime::SessionTimeZone::utc())
+            )
+        }
+    }
+}
+
+/// ゾーン無し `TIMESTAMPTZ` リテラル（`session_local = true`）を、`render_expr` と同じく
+/// 定義時セッション TZ で UTC へ確定した定数（`session_local = false`）へ書き換える。
+/// `build_check_constraint` の往復一致検証で、元 AST 側を再パース結果と同じ形に揃えるために使う。
+fn normalize_session_local_expr(expr: &mut Expr) {
+    match expr {
+        Expr::TimestampTzLiteral {
+            micros,
+            session_local,
+        } => {
+            if *session_local {
+                *micros = crate::datetime::with_current_session_time_zone(|tz| {
+                    tz.timestamp_to_timestamptz(*micros)
+                })
+                .unwrap_or(*micros);
+                *session_local = false;
+            }
+        }
+        Expr::Call { args, .. } | Expr::Coalesce(args) => {
+            args.iter_mut().for_each(normalize_session_local_expr);
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+            normalize_session_local_expr(lhs);
+            normalize_session_local_expr(rhs);
+        }
+        Expr::NullIf(lhs, rhs) => {
+            normalize_session_local_expr(lhs);
+            normalize_session_local_expr(rhs);
+        }
+        Expr::Case { whens, else_result } => {
+            for (cond, result) in whens.iter_mut() {
+                normalize_session_local_expr(cond);
+                normalize_session_local_expr(result);
+            }
+            if let Some(e) = else_result {
+                normalize_session_local_expr(e);
+            }
+        }
+        Expr::Collate { expr, .. } => normalize_session_local_expr(expr),
+        _ => {}
+    }
+}
+
+/// [`normalize_session_local_expr`] を述語列へ適用する（式を持たない述語は無変更）。
+fn normalize_session_local_predicates(predicates: &mut [WherePredicate]) {
+    for predicate in predicates {
+        match predicate {
+            WherePredicate::Expression(e) => normalize_session_local_expr(e),
+            WherePredicate::Not(inner) => {
+                normalize_session_local_predicates(std::slice::from_mut(&mut **inner));
+            }
+            WherePredicate::Or(branches) => {
+                for branch in branches {
+                    normalize_session_local_predicates(branch);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -536,7 +620,11 @@ fn referenced_column_names(
                 collect_idents(lhs, acc);
                 collect_idents(rhs, acc);
             }
-            Expr::DateLiteral(_) | Expr::TimestampLiteral(_) | Expr::TimeLiteral(_) => {}
+            Expr::DateLiteral(_)
+            | Expr::TimestampLiteral(_)
+            | Expr::IntervalLiteral(_)
+            | Expr::TimeLiteral(_)
+            | Expr::TimestampTzLiteral { .. } => {}
         }
     }
     let mut idents: Vec<&str> = Vec::new();
@@ -705,7 +793,12 @@ pub(crate) fn build_check_constraint(
     // `render_predicate` は `sql::allowlist::Parser` が受理する文法のみを
     // 生成するよう構築済み）。
     let reparsed = crate::sql::allowlist::parse_check_predicate_text(&predicate_sql)?;
-    if reparsed != check.predicates {
+    // `render_expr` はゾーン無し `TIMESTAMPTZ` リテラルを定義時セッション TZ で UTC へ確定した
+    // 明示 offset 形で描くため、再パース結果の `session_local` は常に false になる。比較対象の
+    // 元 AST も同じ UTC 定数へ正規化してから突き合わせる（正規化で往復不一致にしない）。
+    let mut expected = check.predicates.clone();
+    normalize_session_local_predicates(&mut expected);
+    if reparsed != expected {
         return Err(SqlSurfaceError::unsupported(
             "CHECK constraint predicate does not round-trip through normalization",
         ));
@@ -952,6 +1045,21 @@ mod tests {
         assert_eq!(checks[0].name, "docs_kind_check");
         assert_eq!(checks[0].columns, vec!["kind".to_string()]);
         assert_eq!(checks[0].predicate_sql, "kind = 'a'");
+    }
+
+    /// Issue #1576。ゾーン無し `TIMESTAMPTZ` リテラルを含む CHECK が、UTC の明示 offset へ
+    /// 正規化した往復でも `42601` にならず、UTC 定数として永続化されることを固定する。
+    #[test]
+    fn check_constraint_with_zoneless_timestamptz_literal_round_trips() {
+        let v = parse_create_table(
+            "CREATE TABLE c (at TIMESTAMPTZ, CHECK (at > TIMESTAMPTZ '2026-01-01 00:00:00'))",
+        );
+        let schema = schema_of(&v);
+        let checks = validate_and_build(&schema, &v.checks).expect("must validate");
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0]
+            .predicate_sql
+            .contains("TIMESTAMPTZ '2026-01-01 00:00:00+00'"));
     }
 
     /// 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP` 型付きリテラルを

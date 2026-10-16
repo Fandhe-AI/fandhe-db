@@ -103,6 +103,10 @@ pub(crate) enum ExprStep {
     ConstTimestamp(i64),
     /// `TIME` 定数（Issue #1570）。
     ConstTime(i64),
+    /// `TIMESTAMPTZ` 定数（UTC マイクロ秒。Issue #1576）。
+    ConstTimestampTz(i64),
+    /// `INTERVAL` 定数（Issue #1581）。
+    ConstInterval(crate::datetime::Interval),
     /// 行の `DATE` 列参照を push する（[`ExprStep::PushTextColumn`] と同じ
     /// 「借用は行ループの外の引数から都度復元する」設計。対象ビヘイビア:
     /// SQL-26。Issue #920）。
@@ -111,6 +115,10 @@ pub(crate) enum ExprStep {
     PushTimestampColumn(usize),
     /// `TIME` 列参照（Issue #1570）。
     PushTimeColumn(usize),
+    /// `TIMESTAMPTZ` 列参照（Issue #1576）。
+    PushTimestampTzColumn(usize),
+    /// `INTERVAL` 列参照（Issue #1581）。
+    PushIntervalColumn(usize),
     /// 行の数値列（INTEGER/BIGINT/REAL/DOUBLE）参照を push する（Issue #1075・
     /// TABLE-16 ポインタ。`CHECK` 制約の式述語束縛でのみ生成される。
     /// [`ExprStep::PushTextColumn`] と同じ「借用は行ループの外の引数から都度
@@ -164,6 +172,10 @@ impl PartialEq for ExprStep {
             (ExprStep::ConstDate(a), ExprStep::ConstDate(b)) => a == b,
             (ExprStep::ConstTimestamp(a), ExprStep::ConstTimestamp(b)) => a == b,
             (ExprStep::ConstTime(a), ExprStep::ConstTime(b)) => a == b,
+            (ExprStep::ConstTimestampTz(a), ExprStep::ConstTimestampTz(b)) => a == b,
+            (ExprStep::PushTimestampTzColumn(a), ExprStep::PushTimestampTzColumn(b)) => a == b,
+            (ExprStep::ConstInterval(a), ExprStep::ConstInterval(b)) => a == b,
+            (ExprStep::PushIntervalColumn(a), ExprStep::PushIntervalColumn(b)) => a == b,
             (ExprStep::PushTimeColumn(a), ExprStep::PushTimeColumn(b)) => a == b,
             (ExprStep::PushDateColumn(a), ExprStep::PushDateColumn(b)) => a == b,
             (ExprStep::PushTimestampColumn(a), ExprStep::PushTimestampColumn(b)) => a == b,
@@ -228,6 +240,10 @@ pub(crate) enum StackValue {
     Timestamp(i64),
     /// `TIME` 値（Issue #1570）。
     Time(i64),
+    /// `TIMESTAMPTZ` 値（Issue #1576）。
+    TimestampTz(i64),
+    /// `INTERVAL` 値（Issue #1581）。
+    Interval(crate::datetime::Interval),
     /// 現在評価中の行の `DATE` 列参照を表すマーカー（[`StackValue::
     /// TextColumnRef`] と同じ「実体は行スカラービューから都度解決する」設計）。
     DateColumnRef(usize),
@@ -235,6 +251,10 @@ pub(crate) enum StackValue {
     TimestampColumnRef(usize),
     /// [`StackValue::DateColumnRef`] の `TIME` 版（Issue #1570）。
     TimeColumnRef(usize),
+    /// [`StackValue::DateColumnRef`] の `TIMESTAMPTZ` 版（Issue #1576）。
+    TimestampTzColumnRef(usize),
+    /// [`StackValue::DateColumnRef`] の `INTERVAL` 版（Issue #1581）。
+    IntervalColumnRef(usize),
     /// 現在評価中の行の数値列（INTEGER/BIGINT/REAL/DOUBLE）参照を表すマーカー
     /// （Issue #1075・TABLE-16 ポインタ。[`StackValue::TextColumnRef`] と同じ
     /// 「実体は行スカラービューから都度解決する」設計）。
@@ -269,6 +289,20 @@ fn stack_to_expr_value<'a>(
         StackValue::Date(d) => Ok(ExprValue::Date(d)),
         StackValue::Timestamp(t) => Ok(ExprValue::Timestamp(t)),
         StackValue::Time(t) => Ok(ExprValue::Time(t)),
+        StackValue::TimestampTz(t) => Ok(ExprValue::TimestampTz(t)),
+        StackValue::Interval(v) => Ok(ExprValue::Interval(v)),
+        StackValue::IntervalColumnRef(index) => match row_scalars.get(index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "INTERVAL column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Interval(v))) => Ok(ExprValue::Interval(*v)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "INTERVAL column reference resolved to a non-INTERVAL row scalar value"
+                    .to_string(),
+            }),
+        },
         StackValue::TextColumnRef(index) => match row_scalars.get(index) {
             None => Err(SqlSurfaceError::Internal {
                 detail: "TEXT column reference is outside the decoded row scalar view".to_string(),
@@ -302,6 +336,19 @@ fn stack_to_expr_value<'a>(
             Some(Some(_)) => Err(SqlSurfaceError::Internal {
                 detail: "TIMESTAMP column reference resolved to a non-TIMESTAMP row scalar value"
                     .to_string(),
+            }),
+        },
+        StackValue::TimestampTzColumnRef(index) => match row_scalars.get(index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "TIMESTAMPTZ column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::TimestampTz(t))) => Ok(ExprValue::TimestampTz(*t)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail:
+                    "TIMESTAMPTZ column reference resolved to a non-TIMESTAMPTZ row scalar value"
+                        .to_string(),
             }),
         },
         StackValue::TimeColumnRef(index) => match row_scalars.get(index) {
@@ -352,6 +399,8 @@ fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
         ExprValue::Date(d) => StackValue::Date(d),
         ExprValue::Timestamp(t) => StackValue::Timestamp(t),
         ExprValue::Time(t) => StackValue::Time(t),
+        ExprValue::TimestampTz(t) => StackValue::TimestampTz(t),
+        ExprValue::Interval(v) => StackValue::Interval(v),
         ExprValue::Json(j) => StackValue::Json(j.into_owned()),
         ExprValue::JsonText(j) => StackValue::JsonText(j.into_owned()),
     }
@@ -417,6 +466,8 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
                 | ExprValue::Date(_)
                 | ExprValue::Timestamp(_)
                 | ExprValue::Time(_)
+                | ExprValue::TimestampTz(_)
+                | ExprValue::Interval(_)
                 | ExprValue::Json(_)
                 | ExprValue::JsonText(_)
                 | ExprValue::Null => None,
@@ -473,9 +524,13 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
         | BoundExpr::Time(_)
+        | BoundExpr::TimestampTz(_)
+        | BoundExpr::Interval(_)
         | BoundExpr::DateColumnRef { .. }
         | BoundExpr::TimestampColumnRef { .. }
         | BoundExpr::TimeColumnRef { .. }
+        | BoundExpr::TimestampTzColumnRef { .. }
+        | BoundExpr::IntervalColumnRef { .. }
         // Issue #1075・TABLE-16 ポインタ: 数値列参照は行に依存するため畳み込まない
         // （`IdRef` と同じ理由。CHECK の式述語束縛でのみ生成される）。
         | BoundExpr::ColumnRef { .. }
@@ -560,6 +615,26 @@ fn compile_node(
         }
         BoundExpr::Timestamp(t) => {
             steps.push(ExprStep::ConstTimestamp(*t));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::TimestampTz(t) => {
+            steps.push(ExprStep::ConstTimestampTz(*t));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::TimestampTzColumnRef { index } => {
+            steps.push(ExprStep::PushTimestampTzColumn(*index));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::Interval(v) => {
+            steps.push(ExprStep::ConstInterval(*v));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::IntervalColumnRef { index } => {
+            steps.push(ExprStep::PushIntervalColumn(*index));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);
         }
@@ -877,6 +952,8 @@ impl ExprProgram {
                         | Some(StackValue::DateColumnRef(index))
                         | Some(StackValue::TimestampColumnRef(index))
                         | Some(StackValue::TimeColumnRef(index))
+                        | Some(StackValue::TimestampTzColumnRef(index))
+                        | Some(StackValue::IntervalColumnRef(index))
                         | Some(StackValue::NumericColumnRef(index)) => {
                             match row_scalars.get(*index) {
                                 Some(Some(_)) => false,
@@ -931,6 +1008,22 @@ impl ExprProgram {
                 }
                 ExprStep::ConstTimestamp(t) => {
                     scratch.push(StackValue::Timestamp(*t));
+                    pc += 1;
+                }
+                ExprStep::ConstTimestampTz(t) => {
+                    scratch.push(StackValue::TimestampTz(*t));
+                    pc += 1;
+                }
+                ExprStep::PushTimestampTzColumn(index) => {
+                    scratch.push(StackValue::TimestampTzColumnRef(*index));
+                    pc += 1;
+                }
+                ExprStep::ConstInterval(v) => {
+                    scratch.push(StackValue::Interval(*v));
+                    pc += 1;
+                }
+                ExprStep::PushIntervalColumn(index) => {
+                    scratch.push(StackValue::IntervalColumnRef(*index));
                     pc += 1;
                 }
                 ExprStep::ConstTime(t) => {
@@ -1034,6 +1127,8 @@ impl ExprProgram {
                             | ExprValue::Date(_)
                             | ExprValue::Json(_)
                             | ExprValue::Time(_)
+                            | ExprValue::TimestampTz(_)
+                            | ExprValue::Interval(_)
                             | ExprValue::JsonText(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
@@ -1046,6 +1141,8 @@ impl ExprProgram {
                             | ExprValue::Date(_)
                             | ExprValue::Json(_)
                             | ExprValue::Time(_)
+                            | ExprValue::TimestampTz(_)
+                            | ExprValue::Interval(_)
                             | ExprValue::JsonText(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };

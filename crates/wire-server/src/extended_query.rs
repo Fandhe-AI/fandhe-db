@@ -86,7 +86,8 @@
 //! - Bind のパラメータ binary 値の長さ不正（Issue #1345・WIRE-14）
 //!   → `08P01`（`ProtocolViolation`）
 //! - Bind のパラメータ format code が binary（1）で対象スロットが復号非対応
-//!   （int4/int8/float4/float8/bool/bytea/uuid・text 系以外。WIRE-12・#1171・
+//!   （int4/int8/float4/float8/bool/bytea/uuid・numeric〔Issue #2443。`NUMERIC` 列・`id` スロット〕・
+//!   time/timestamptz・text 系以外。WIRE-12・#1171・
 //!   #1345）・結果 format code が非対応型の列を
 //!   binary 指定（WIRE-14・[`result_encoder::column_binary_support`]）・
 //!   Describe(Portal) 対象の受理不能・実行結果列の不整合（いずれも `0A000`
@@ -500,8 +501,12 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
         PreparedParamType::Text => text_like(),
         PreparedParamType::VectorText => BinaryParam::Unsupported,
         PreparedParamType::Column(meta) => match meta {
-            // `id` は宣言 0（実効 1700=NUMERIC）をバイナリ非対応とする。
-            ColumnMeta::Id => int_kind(effective_oid),
+            // `id` は実効 1700（NUMERIC。宣言 0 または 1700）を numeric バイナリで受理し、
+            // 値の可否は engine の id 束縛規則（小数・負値の拒否）に任せる（Issue #2443）。
+            ColumnMeta::Id => match effective_oid {
+                1700 => BinaryParam::Numeric,
+                other => int_kind(other),
+            },
             ColumnMeta::Computed { .. } | ColumnMeta::AliasedId { .. } => BinaryParam::Unsupported,
             ColumnMeta::Scalar { ty, .. } => match ty {
                 ColumnType::Text | ColumnType::Varchar(_) => text_like(),
@@ -518,6 +523,9 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 // TIMESTAMPTZ スロットは timestamptz（OID 1184）のみバイナリ受理（TABLE-33・
                 // Issue #1577）。宣言 1114／25 のバイナリは意味が変わるため `0A000`。
                 ColumnType::TimestampTz => only(1184, BinaryParam::TimestampTz),
+                // INTERVAL スロットは interval（OID 1186）のみバイナリ受理（TABLE-34・Issue #1583）。
+                // 宣言 25 等のバイナリは意味が変わるため `0A000`（fail-closed）。
+                ColumnType::Interval => only(1186, BinaryParam::Interval),
                 // CHAR(n) スロット（bpchar＝OID 1042）。値は engine のリテラル置換経路を通り、
                 // 非 NULL 書き込みの可否は engine 側の契約に従う（Issue #1565）。
                 ColumnType::Bpchar(_) => {
@@ -527,8 +535,10 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                         BinaryParam::Unsupported
                     }
                 }
+                // NUMERIC スロットは numeric（OID 1700）のみバイナリ受理（WIRE-26・Issue #2443）。
+                // 宣言 20／23／25／701 等は値の意味が変わりうるため `0A000`（fail-closed）。
+                ColumnType::Numeric { .. } => only(1700, BinaryParam::Numeric),
                 ColumnType::Vector(_)
-                | ColumnType::Numeric { .. }
                 | ColumnType::Date
                 | ColumnType::Timestamp
                 | ColumnType::Json
@@ -659,10 +669,87 @@ enum PortalBody {
 
 /// portal が保持する未送出行と、完了時に使う `CommandComplete` タグの組み立て
 /// 方（[`crate::simple_query::TagShape`]）。
+/// 中断 portal が保持する 1 行の保守的なメモリ見積り（上限会計用）。
+/// 保持対象は wire 表現ではなく [`engine::sql::exec::ResultRow`] 自体のため、
+/// 行本体・`Cell` 配列・文字列／ベクトル／バイト列のヒープ領域を合算する。NULL や短い値の
+/// 多い行では `Cell` 配列が wire 表現を大幅に上回るため、`frame_len` 単独では上限を超えて
+/// 保持できてしまう（Issue #1575 レビュー指摘）。配列セルも [`retained_array_bytes`] で
+/// 要素配列と要素内ヒープの実保持量を合算する（wire 表現では代用しない）。
+/// `_frame_len` は呼び出し互換のため受け取るだけで会計には使わない。
+fn retained_row_bytes(row: &engine::sql::exec::ResultRow, _frame_len: usize) -> usize {
+    use engine::sql::exec::Cell;
+    let mut total = std::mem::size_of::<engine::sql::exec::ResultRow>()
+        .saturating_add(row.cells.len().saturating_mul(std::mem::size_of::<Cell>()));
+    for cell in &row.cells {
+        let heap = match cell {
+            Cell::Text(s) | Cell::Json(s) => s.len(),
+            Cell::Vector(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
+            Cell::Bytes(b) => b.len(),
+            Cell::Array(a) => retained_array_bytes(a),
+            _ => 0,
+        };
+        total = total.saturating_add(heap);
+    }
+    total
+}
+
+/// 配列セル 1 個の保持量見積り。要素スロット（`Option<T>`）の配列分に加え、文字列・
+/// バイト列要素のヒープ領域（`String`／`Vec` の本体と内容）を合算する。
+fn retained_array_bytes(array: &engine::row_codec::ArrayValue) -> usize {
+    use engine::row_codec::ArrayValue;
+    fn slots<T>(items: &[Option<T>]) -> usize {
+        items.len().saturating_mul(std::mem::size_of::<Option<T>>())
+    }
+    fn strings(items: &[Option<String>]) -> usize {
+        items.iter().fold(slots(items), |acc, it| {
+            acc.saturating_add(it.as_ref().map_or(0, String::capacity))
+        })
+    }
+    match array {
+        ArrayValue::Text(v) | ArrayValue::Json(v) | ArrayValue::Jsonb(v) | ArrayValue::Enum(v) => {
+            strings(v)
+        }
+        ArrayValue::Bool(v) => slots(v),
+        ArrayValue::Integer(v) | ArrayValue::Date(v) => slots(v),
+        ArrayValue::BigInt(v) | ArrayValue::Timestamp(v) => slots(v),
+        ArrayValue::Real(v) => slots(v),
+        ArrayValue::Double(v) => slots(v),
+        ArrayValue::Uuid(v) => slots(v),
+        ArrayValue::Numeric(v) => slots(v),
+        ArrayValue::Bytea(v) => v.iter().fold(slots(v), |acc, it| {
+            acc.saturating_add(it.as_ref().map_or(0, Vec::capacity))
+        }),
+    }
+}
+
+/// 中断 portal が保持する列メタの保守的なメモリ見積り（上限会計用）。
+fn retained_columns_bytes(columns: &[ColumnMeta]) -> usize {
+    let mut total = columns
+        .len()
+        .saturating_mul(std::mem::size_of::<ColumnMeta>());
+    for c in columns {
+        let name_len = match c {
+            ColumnMeta::Id => 0,
+            ColumnMeta::AliasedId { name }
+            | ColumnMeta::Scalar { name, .. }
+            | ColumnMeta::Computed { name, .. } => name.len(),
+        };
+        total = total.saturating_add(name_len);
+    }
+    total
+}
+
 struct PortalRows {
-    /// 未送出の `DataRow` フレーム（`max_rows` ごとに任意の境界で分割送出する
-    /// ため、行単位で個別フレームとして保持する）。
-    frames: std::collections::VecDeque<Vec<u8>>,
+    /// 未送出の行（値）と、中断時点のエンコード済みバイト数（保持上限の会計用）。
+    /// `max_rows` ごとに任意の境界で分割送出するため行単位で保持し、`DataRow` への
+    /// 整形は送出時の現在のセッション TimeZone で行う（中断中の `SET TIME ZONE` を
+    /// 再開後の送出へ反映する。TABLE-33・Issue #1575）。
+    frames: std::collections::VecDeque<(engine::sql::exec::ResultRow, usize)>,
+    /// 保持行の列メタ（送出時の整形に使う）。
+    columns: Vec<ColumnMeta>,
+    /// `columns` の保守的なヒープ見積り（[`retained_columns_bytes`]）。保持上限の会計に
+    /// 行の見積りと合算する（中断 portal 数に比例して列メタが無計上で残らないようにする）。
+    columns_bytes: usize,
     shape: crate::simple_query::TagShape,
     /// この portal がこれまでの Execute 呼び出し（今回分を含まない）で
     /// 既に送出済みの行数。完了時の `CommandComplete` タグは PostgreSQL の
@@ -894,8 +981,8 @@ impl PortalStore {
                 PortalState::Suspended(rows) => rows
                     .frames
                     .iter()
-                    .map(Vec::len)
-                    .fold(0usize, |acc, len| acc.saturating_add(len)),
+                    .map(|(_, len)| *len)
+                    .fold(rows.columns_bytes, |acc, len| acc.saturating_add(len)),
                 PortalState::Ready | PortalState::Done { .. } | PortalState::Failed => 0,
             })
             .fold(0usize, |acc, n| acc.saturating_add(n))
@@ -994,6 +1081,14 @@ enum HandlerError {
         index: usize,
         label: &'static str,
     },
+    /// バイナリ形式の numeric 値の外部表現が不正（`22P03`。WIRE-26・Issue #2443）。
+    InvalidBinaryRepresentation {
+        index: usize,
+    },
+    /// バイナリ形式の numeric 値が engine の絶対上限を超える（`22003`。Issue #2443）。
+    BinaryParamNumericOutOfRange {
+        index: usize,
+    },
     /// 結果 format code の解決・事前検査で生じたエラー（WIRE-14。
     /// `result_encoder::BinaryFormatError` をそのまま分類し直したもの）。
     BinaryFormat(result_encoder::BinaryFormatError),
@@ -1048,6 +1143,10 @@ impl HandlerError {
             HandlerError::BinaryFormatUnsupported => ErrorClass::FeatureNotSupported,
             HandlerError::InvalidBinaryParam { .. } => ErrorClass::ProtocolViolation,
             HandlerError::BinaryParamOutOfRange { .. } => ErrorClass::DatetimeFieldOverflow,
+            HandlerError::InvalidBinaryRepresentation { .. } => {
+                ErrorClass::InvalidBinaryRepresentation
+            }
+            HandlerError::BinaryParamNumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
             HandlerError::BinaryFormat(e) => e.error_class(),
             HandlerError::ResultTypeChanged => ErrorClass::FeatureNotSupported,
             HandlerError::SuspendedBytesExceeded => ErrorClass::PayloadTooLarge,
@@ -1116,6 +1215,12 @@ impl HandlerError {
             }
             HandlerError::BinaryParamOutOfRange { index, label } => {
                 format!("{label} out of range in bind parameter ${index}")
+            }
+            HandlerError::InvalidBinaryRepresentation { index } => {
+                format!("invalid external \"numeric\" value in bind parameter ${index}")
+            }
+            HandlerError::BinaryParamNumericOutOfRange { index } => {
+                format!("numeric field overflow in bind parameter ${index}")
             }
             HandlerError::BinaryFormat(result_encoder::BinaryFormatError::FormatCountMismatch) => {
                 "format code count does not match the parameter or result count".to_string()
@@ -1244,6 +1349,7 @@ fn io_error_from_frame(e: FrameError) -> io::Error {
 pub(crate) fn handle_parse<S: WireStream>(
     stream: &mut S,
     engine: &EngineCore,
+    session: &SessionState,
     txn: &mut engine::sql::transaction::SessionTransaction<'_>,
     state: &mut ExtendedQueryState,
 ) -> io::Result<LoopSignal> {
@@ -1261,7 +1367,7 @@ pub(crate) fn handle_parse<S: WireStream>(
         }
     };
 
-    match handle_parse_body(engine, txn, &mut state.statements, &body) {
+    match handle_parse_body(engine, session, txn, &mut state.statements, &body) {
         Ok(()) => {
             stream.write_all(&result_encoder::encode_parse_complete())?;
             stream.flush()?;
@@ -1276,6 +1382,7 @@ pub(crate) fn handle_parse<S: WireStream>(
 
 fn handle_parse_body(
     engine: &EngineCore,
+    session: &SessionState,
     txn: &mut engine::sql::transaction::SessionTransaction<'_>,
     store: &mut PreparedStatementStore,
     body: &[u8],
@@ -1305,9 +1412,15 @@ fn handle_parse_body(
         }
         PreparedStatement::Empty
     } else {
-        let prepared = engine
-            .parse_sql_prepared(&msg.query)
-            .map_err(HandlerError::Sql)?;
+        // Parse 時の定数畳み込み（`AT LOCAL`・ゾーン無し `TIMESTAMPTZ '…'`）も接続の TimeZone で
+        // 行い、簡易クエリと挙動を揃える（Issue #1576 レビュー指摘）。
+        let prepared = {
+            let _session_tz_scope =
+                engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
+            engine
+                .parse_sql_prepared(&msg.query)
+                .map_err(HandlerError::Sql)?
+        };
         match prepared.parsed_if_unparameterized() {
             // `$n` を含まない文は従来どおり Parsed 経路のまま保持する
             // （二重 parse なし・挙動不変）。宣言型があれば過剰宣言。
@@ -1670,14 +1783,16 @@ fn handle_bind_body(
                                     binary_param::BinaryParamError::InvalidLength => {
                                         HandlerError::InvalidBinaryParam { index: i + 1 }
                                     }
+                                    binary_param::BinaryParamError::InvalidRepresentation => {
+                                        HandlerError::InvalidBinaryRepresentation { index: i + 1 }
+                                    }
+                                    binary_param::BinaryParamError::NumericOutOfRange => {
+                                        HandlerError::BinaryParamNumericOutOfRange { index: i + 1 }
+                                    }
                                     binary_param::BinaryParamError::OutOfRange => {
                                         HandlerError::BinaryParamOutOfRange {
                                             index: i + 1,
-                                            label: if slot.binary == BinaryParam::TimestampTz {
-                                                "timestamp"
-                                            } else {
-                                                "time value"
-                                            },
+                                            label: slot.binary.out_of_range_label(),
                                         }
                                     }
                                 },
@@ -1694,9 +1809,15 @@ fn handle_bind_body(
             // 同一 `$n` の出現ごとに値が複製されるため、受信量ではなく変換後・展開後の
             // 実保持量で portal の保持量上限を判定する（PR #1217 レビュー指摘）。
             bound_bytes = prepared.expanded_bound_bytes(&decoded);
-            let bound = engine
-                .bind_prepared(prepared, &decoded)
-                .map_err(HandlerError::Sql)?;
+            // 定数式の畳み込み（`TIMESTAMPTZ '…'` のゾーン無し入力・`AT LOCAL`）は再 parse の中で
+            // 行われるため、セッション TimeZone をその区間へ張る（Issue #1576）。
+            let bound = {
+                let _session_tz_scope =
+                    engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
+                engine
+                    .bind_prepared(prepared, &decoded)
+                    .map_err(HandlerError::Sql)?
+            };
             let columns = engine
                 .describe_parsed_in_txn(session, txn, &bound)
                 .map_err(HandlerError::Sql)?;
@@ -2084,7 +2205,13 @@ fn execute_portal<'e, S: WireStream>(
                     // ErrorResponse を返す事態を避ける）。
                     let other_suspended_bytes =
                         state.portals.total_suspended_bytes_excluding(portal_name);
-                    let mut remaining_bytes: usize = 0;
+                    // 列メタの保持分は中断が確定する（`take` 以降に行がある）場合のみ加算する。
+                    let columns_bytes = retained_columns_bytes(&result.columns);
+                    let mut remaining_bytes: usize = if result.rows.len() > take {
+                        columns_bytes
+                    } else {
+                        0
+                    };
                     let mut frames = std::collections::VecDeque::new();
                     for row in result.rows.iter().skip(take) {
                         // Bind 時点で確定した結果 format code（WIRE-14。
@@ -2094,19 +2221,21 @@ fn execute_portal<'e, S: WireStream>(
                         // のみを意味する（`XX000` 相当。`result_encoder`
                         // モジュールドキュメント参照）。
                         let mut frame = Vec::new();
-                        result_encoder::encode_data_row_into_with_columns(
+                        result_encoder::encode_data_row_into_with_columns_in_tz(
                             row,
                             &result.columns,
                             &result_formats,
                             &mut frame,
+                            session.time_zone(),
                         )
                         .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
-                        remaining_bytes = remaining_bytes.saturating_add(frame.len());
+                        let retained = retained_row_bytes(row, frame.len());
+                        remaining_bytes = remaining_bytes.saturating_add(retained);
                         let session_total = other_suspended_bytes.saturating_add(remaining_bytes);
                         if session_total > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION {
                             return Err(commit_wrap(HandlerError::SuspendedBytesExceeded));
                         }
-                        frames.push_back(frame);
+                        frames.push_back((row.clone(), retained));
                     }
 
                     // 中断保持分の検査を通過した後で初めて `take` 分の送出へ移る。
@@ -2123,11 +2252,12 @@ fn execute_portal<'e, S: WireStream>(
                     );
                     for row in result.rows.iter().take(take) {
                         let mut frame = Vec::new();
-                        result_encoder::encode_data_row_into_with_columns(
+                        result_encoder::encode_data_row_into_with_columns_in_tz(
                             row,
                             &result.columns,
                             &result_formats,
                             &mut frame,
+                            session.time_zone(),
                         )
                         .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
                         buffer
@@ -2177,6 +2307,8 @@ fn execute_portal<'e, S: WireStream>(
                         .ok_or(HandlerError::UnknownPortal)?;
                     portal.state = PortalState::Suspended(PortalRows {
                         frames,
+                        columns: result.columns.clone(),
+                        columns_bytes,
                         shape,
                         sent_so_far: take,
                         committed: is_write_statement,
@@ -2272,13 +2404,25 @@ fn execute_portal<'e, S: WireStream>(
             (max_rows as usize).min(total)
         };
 
-        let hint: usize = rows.frames.iter().take(take).map(Vec::len).sum();
+        // 会計値（行本体の見積りを含む）は送出バッファの容量ヒントには過大のため
+        // 行数ベースの概算に留める（上限は `with_capacity_hint` 側で抑えられる）。
+        let hint: usize = take.saturating_mul(64);
         let mut buffer = crate::response_buffer::ResponseBuffer::with_capacity_hint(
             MAX_RESPONSE_BUFFER_BYTES,
             hint,
         );
         for _ in 0..take {
-            if let Some(frame) = rows.frames.pop_front() {
+            if let Some((row, _)) = rows.frames.pop_front() {
+                // 送出時点のセッション TimeZone で整形する（中断中の変更を反映）。
+                let mut frame = Vec::new();
+                result_encoder::encode_data_row_into_with_columns_in_tz(
+                    &row,
+                    &rows.columns,
+                    &portal.result_formats,
+                    &mut frame,
+                    session.time_zone(),
+                )
+                .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
                 buffer
                     .push_frame(stream, &frame)
                     .map_err(|e| commit_wrap(io_to_handler(e)))?;
@@ -2348,6 +2492,7 @@ pub(crate) fn handle_sync<S: WireStream>(
     state: &mut ExtendedQueryState,
     txn_status: engine::sql::transaction::TransactionStatus,
     active_generation: Option<u64>,
+    ready_frames: &[u8],
 ) -> io::Result<LoopSignal> {
     let _body = match framing::read_length_prefixed_body(stream, 4, 4) {
         Ok(b) => b,
@@ -2375,7 +2520,10 @@ pub(crate) fn handle_sync<S: WireStream>(
     // TASK-221・PR #1041 レビュー指摘 P1: 以前は明示トランザクションの状態を
     // 無視して常に `Idle`（'I'）を送出しており、`BEGIN` 後もクライアントから
     // トランザクションが終了したように見えていた）。
-    stream.write_all(&result_encoder::encode_ready_for_query(txn_status))?;
+    // `ready_frames` は呼び出し元（`handshake::post_auth_loop`）が
+    // `handshake::ready_for_query_frames` で組み立てた `[ParameterStatus(TimeZone)] ReadyForQuery`
+    // （TABLE-33・Issue #1575。`txn_status` と同じ `txn` の状態バイトを含む）。
+    stream.write_all(ready_frames)?;
     stream.flush()?;
     Ok(LoopSignal::Continue)
 }
@@ -2450,6 +2598,55 @@ pub(crate) fn handle_flush<S: WireStream>(stream: &mut S) -> io::Result<LoopSign
 
 #[cfg(test)]
 mod tests {
+    /// 中断 portal の保持量見積りは wire 表現（`frame_len`）より行本体・`Cell` 配列分だけ大きい
+    /// （NULL 多数の行で上限会計が過小にならない。Issue #1575 レビュー指摘）。
+    #[test]
+    fn retained_row_bytes_counts_cells_and_heap_beyond_frame_len() {
+        use engine::sql::exec::{Cell, ResultRow};
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Null; 1000],
+        };
+        // NULL セルの DataRow 表現は 1 セル 4 バイト相当だが、保持量は Cell 配列分を含む。
+        let n = retained_row_bytes(&row, 4000);
+        assert!(n >= 1000 * std::mem::size_of::<Cell>());
+        assert!(n > 4000);
+        let text_row = ResultRow {
+            id: 2,
+            score: 0.0,
+            cells: vec![Cell::Text("x".repeat(100))],
+        };
+        assert!(retained_row_bytes(&text_row, 104) >= 100);
+        assert_eq!(retained_columns_bytes(&[]), 0);
+    }
+
+    /// 配列セルは wire 表現（空文字列要素は 2 バイト程度）ではなく要素スロット分で計上する。
+    #[test]
+    fn retained_row_bytes_counts_array_slots_not_frame_len() {
+        use engine::row_codec::ArrayValue;
+        use engine::sql::exec::{Cell, ResultRow};
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Array(ArrayValue::Text(vec![
+                Some(String::new());
+                10_000
+            ]))],
+        };
+        let slot = std::mem::size_of::<Option<String>>();
+        assert!(retained_row_bytes(&row, 0) >= 10_000 * slot);
+        let big = ResultRow {
+            id: 2,
+            score: 0.0,
+            cells: vec![Cell::Array(ArrayValue::Bytea(vec![
+                Some(vec![0u8; 64]);
+                100
+            ]))],
+        };
+        assert!(retained_row_bytes(&big, 0) >= 100 * 64);
+    }
+
     use super::*;
     use crate::limits::MAX_PREPARED_STATEMENTS_PER_SESSION;
 
@@ -3104,6 +3301,38 @@ mod tests {
         store.discard_retained_outside_generation(None);
         assert!(store.get("kept_same").is_none());
         assert!(store.get("fresh_other").is_some());
+    }
+
+    /// NUMERIC スロットと `id` スロットは実効 OID 1700 のみ numeric バイナリを受理する
+    /// （WIRE-26・Issue #2443）。互換表外の宣言 OID は fail-closed。
+    #[test]
+    fn binary_param_kind_numeric_and_id_slots() {
+        use engine::catalog::ColumnType;
+        let num = PreparedParamType::Column(ColumnMeta::Scalar {
+            name: "p".to_string(),
+            ty: ColumnType::Numeric {
+                precision: 5,
+                scale: 2,
+            },
+        });
+        for declared in [0, 1700] {
+            assert_eq!(
+                binary_param_kind(&num, declared, 1700),
+                BinaryParam::Numeric
+            );
+        }
+        for declared in [20, 23, 25, 701] {
+            assert_eq!(
+                binary_param_kind(&num, declared, declared),
+                BinaryParam::Unsupported
+            );
+        }
+        let id = PreparedParamType::Column(ColumnMeta::Id);
+        for declared in [0, 1700] {
+            assert_eq!(binary_param_kind(&id, declared, 1700), BinaryParam::Numeric);
+        }
+        assert_eq!(binary_param_kind(&id, 20, 20), BinaryParam::Int8);
+        assert_eq!(binary_param_kind(&id, 23, 23), BinaryParam::Int4);
     }
 
     /// CHAR(n) スロットは宣言 OID 0・25・1043・1042 のバイナリを UTF-8 恒等で受理し、

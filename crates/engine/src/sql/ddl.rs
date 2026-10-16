@@ -143,6 +143,11 @@ pub(crate) fn execute_create_table(
     for column in &columns {
         check_column_collation(&column.ty, column.collation)?;
     }
+    // TIMESTAMPTZ の TZ 無し既定値は DDL 時点のセッション TimeZone で解釈して固定する
+    // （TABLE-33・Issue #1575。PG と同じ）。
+    for column in &mut columns {
+        normalize_timestamptz_default(column)?;
+    }
     // 解決後の列型に対して DEFAULT を束縛検証する（ENUM の語彙外・DATE/NUMERIC の
     // 不正リテラル等を永続化前に SQLSTATE 付きで拒否する）。
     for column in &columns {
@@ -240,6 +245,7 @@ pub(crate) fn execute_create_table(
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexCollationNotSupported(_)
         | CatalogError::IndexLimitExceeded(_)
         // 制約名の操作（`ALTER TABLE ... ADD/DROP CONSTRAINT`。Issue #1067）専用の
         // 変種で、`Storage::create_table` からは返らない（到達不能。`CREATE TABLE`
@@ -414,10 +420,14 @@ pub(crate) fn execute_alter_table_add_column(
     let mut column = ColumnDef::new(stmt.column_name.clone(), ty, !stmt.not_null);
     column.collation = stmt.collation;
     if let Some(default) = default {
+        column = column.with_default(default);
+        // TZ 無しの TIMESTAMPTZ 既定値は DDL 時点のセッション TimeZone で固定する（#1575）。
+        normalize_timestamptz_default(&mut column)?;
         // 束縛できない DEFAULT（範囲外・桁数超過等）は永続化前に SQLSTATE 付きで拒否する
         // （既存行の読み出し時補完が常に失敗する状態をカタログへ残さない）。
-        crate::sql::parser::bind_column_default(&column, &default)?;
-        column = column.with_default(default);
+        if let Some(default) = &column.default {
+            crate::sql::parser::bind_column_default(&column, default)?;
+        }
     }
     storage
         .alter_table_add_column_with_limit(&stmt.table_name, column, limits.max_table_columns())
@@ -742,6 +752,7 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexCollationNotSupported(_)
         | CatalogError::IndexLimitExceeded(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
@@ -895,6 +906,7 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexCollationNotSupported(_)
         | CatalogError::IndexLimitExceeded(_)
         | CatalogError::UniqueConstraintViolation
         | CatalogError::InvalidForeignKey(_)
@@ -1093,6 +1105,9 @@ pub(crate) fn add_column_default(
         // TIMESTAMPTZ の既定値は文字列リテラルの原文を保持し、解釈は束縛時
         // （`parser::bind_column_default`）に行う（Issue #1574）。
         ColumnType::TimestampTz => "timestamptz",
+        // INTERVAL の既定値も文字列リテラルの原文を保持し、解釈は束縛時
+        // （`parser::bind_column_default`）に行う（Issue #1579）。
+        ColumnType::Interval => "interval",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
         ColumnType::Bytea => "bytea",
@@ -1116,6 +1131,44 @@ pub(crate) fn add_column_default(
         ))
     };
     match literal {
+        // 定数式（`TIMESTAMPTZ '...'`・`timezone(...)`／`AT TIME ZONE` の結果）が畳み込まれた
+        // 絶対時刻（Issue #1576・TABLE-33）。日時列の保持形（テキスト）へ DDL 時点の
+        // セッション TimeZone で変換する。TIMESTAMPTZ は UTC の明示 offset 付き表記へ
+        // 正規化し、読み出し時補完がセッションによらず同じ値になるようにする。
+        InsertLiteral::TimestampTz(micros)
+            if matches!(
+                ty,
+                ColumnType::TimestampTz | ColumnType::Timestamp | ColumnType::Date
+            ) =>
+        {
+            let overflow = || {
+                SqlSurfaceError::datetime_field_overflow(format!(
+                    "column {column_name:?} DEFAULT is out of range for its type"
+                ))
+            };
+            let text = match ty {
+                ColumnType::TimestampTz => {
+                    if !crate::datetime::validate_timestamptz_micros(*micros) {
+                        return Err(overflow());
+                    }
+                    crate::datetime::format_timestamptz(
+                        *micros,
+                        &crate::datetime::SessionTimeZone::utc(),
+                    )
+                }
+                ColumnType::Timestamp => crate::datetime::with_current_session_time_zone(|tz| {
+                    tz.timestamptz_to_timestamp(*micros)
+                })
+                .map(crate::datetime::format_timestamp)
+                .ok_or_else(overflow)?,
+                _ => crate::datetime::with_current_session_time_zone(|tz| {
+                    tz.timestamptz_to_date(*micros)
+                })
+                .map(crate::datetime::format_date)
+                .ok_or_else(overflow)?,
+            };
+            Ok(ColumnDefault::Text(text))
+        }
         // `DATE`／`TIMESTAMP`／`UUID`／`ENUM` は文字列リテラルの原文を保持し、解釈（ENUM は語彙照合）は
         // 束縛時（`parser::bind_column_default`）に行う（Issue #1279・#1280・#1281・#1282）。
         // ENUM の型名解決（未登録は 42601）は DEFAULT 評価より先に済んでいる。
@@ -1126,6 +1179,7 @@ pub(crate) fn add_column_default(
                 || kind == "timestamp"
                 || kind == "time"
                 || kind == "timestamptz"
+                || kind == "interval"
                 || kind == "uuid"
                 || kind == "enum"
                 || kind == "json" =>
@@ -1186,6 +1240,52 @@ pub(crate) fn add_column_default(
     }
 }
 
+/// `TIMESTAMPTZ` 列の既定値リテラルを、DDL 実行時点のセッション TimeZone
+/// （[`crate::datetime::current_session_time_zone`]。engine の各セッション入口が張るスコープ）で
+/// 解釈し、UTC の明示 offset 付き表記（`...+00`）へ正規化して保持する（TABLE-33・Issue #1575）。
+///
+/// 呼び出し元は `execute_create_table`／`execute_alter_table_add_column`（永続化前）。
+/// 読み出し時補完（`row_codec::default_scalar`）は常に UTC で解釈するが、正規化後の値は
+/// 明示 offset を持つためセッションによらず同じ値になる（既存カタログの TZ 無し既定値は
+/// 当時の DDL セッション＝常に UTC と同じ解釈のまま）。TZ 付きの既定値も同じ UTC 表記へ揃う。
+/// 解釈できない値は DDL を拒否する（エラー文言に値を含めない）。
+fn normalize_timestamptz_default(column: &mut ColumnDef) -> Result<(), SqlSurfaceError> {
+    use crate::datetime::{DateTimeLiteralError, TimestampTzLiteralError};
+    if column.ty != ColumnType::TimestampTz {
+        return Ok(());
+    }
+    let Some(ColumnDefault::Text(text)) = &column.default else {
+        return Ok(());
+    };
+    let tz = crate::datetime::current_session_time_zone();
+    match crate::datetime::parse_timestamptz(text, &tz) {
+        Ok(micros) => {
+            column.default = Some(ColumnDefault::Text(crate::datetime::format_timestamptz(
+                micros,
+                &crate::datetime::SessionTimeZone::utc(),
+            )));
+            Ok(())
+        }
+        Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Format(_))) => {
+            Err(SqlSurfaceError::invalid_datetime_format(format!(
+                "column {:?} DEFAULT has an invalid datetime format for its type",
+                column.name
+            )))
+        }
+        Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Overflow(_))) => {
+            Err(SqlSurfaceError::datetime_field_overflow(format!(
+                "column {:?} DEFAULT is out of range for its type",
+                column.name
+            )))
+        }
+        Err(TimestampTzLiteralError::UnknownTimeZone) => {
+            Err(SqlSurfaceError::InvalidParameterValue {
+                detail: "time zone not recognized",
+            })
+        }
+    }
+}
+
 fn default_too_long(column_name: &str) -> SqlSurfaceError {
     SqlSurfaceError::payload_too_large(format!(
         "column {column_name:?} DEFAULT literal exceeds length limit"
@@ -1242,6 +1342,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexCollationNotSupported(_)
         | CatalogError::IndexLimitExceeded(_)
         // `FOREIGN KEY` 宣言の照合（`create_table` 専用。TABLE-17・TASK-205、
         // Issue #907）は `alter_table_add_column` からは返らない（到達不能）。
@@ -1377,7 +1478,8 @@ pub(crate) fn execute_create_index(
         validated.table().to_string(),
         kind,
         validated.columns().to_vec(),
-    );
+    )
+    .with_column_collations(validated.column_collations().to_vec());
     storage.create_index(&def).map_err(map_create_index_error)?;
     Ok(CreateIndexOutcome {})
 }
@@ -1396,7 +1498,8 @@ pub(crate) fn execute_drop_index(
 
 /// `Storage::create_index` の [`CatalogError`] を SQL 表層の契約へ写像する
 /// （ERR-6: 名前衝突 `42P07`、対象テーブル不存在 `42P01`、対象がビュー `42809`、
-/// 列不存在 `42703`、種別と列型の不整合 `0A000`、件数上限 `54000`）。エラー文言に
+/// 列不存在 `42703`、種別と列型の不整合 `0A000`、照合を持てない列への `COLLATE` `42804`、
+/// 件数上限 `54000`）。エラー文言に
 /// テナント・行内容・redb 内部詳細は含めない（security.md P0）。
 fn map_create_index_error(e: CatalogError) -> SqlSurfaceError {
     match e {
@@ -1405,6 +1508,11 @@ fn map_create_index_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
         CatalogError::IndexKindMismatch(detail) => SqlSurfaceError::FeatureNotSupported { detail },
+        // 照合を持てない列（`id`・数値・`VECTOR` 等）・`USING hnsw` への `COLLATE`（Issue #2191。
+        // PostgreSQL と同じ `42804`）。
+        CatalogError::IndexCollationNotSupported(detail) => {
+            SqlSurfaceError::datatype_mismatch(detail)
+        }
         CatalogError::IndexLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
         // 識別子形状・列数（構文検証段で既に拒否済みのため通常は到達しない）。
         CatalogError::Invalid(_) => {
