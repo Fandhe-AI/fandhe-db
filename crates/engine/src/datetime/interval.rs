@@ -144,16 +144,15 @@ impl Acc {
         self.add_micros(micros)
     }
 
-    /// 年の端数（`scale` 年単位）を月へ、さらにその端数を日へ繰り下げる
-    /// （PG の `AdjustFractYears` 相当）。
+    /// 年の端数（`scale` 年単位）を整数月へ偶数丸めして加える（PG の
+    /// `AdjustFractYears` 相当）。月の残余は日へ繰り下げない（`0.1 years` は `1 mon`）。
     fn adjust_fract_years(&mut self, frac: f64, scale: i64) -> ParseResult<()> {
         if frac == 0.0 {
             return Ok(());
         }
         let scaled = frac * (scale * MONTHS_PER_YEAR) as f64;
-        let extra_months = scaled.trunc();
-        self.add_months(extra_months as i64)?;
-        self.adjust_fract_days(scaled - extra_months, DAYS_PER_MONTH)
+        let extra_months = round_to_i64(scaled)?;
+        self.add_months(extra_months)
     }
 
     /// 整数部と端数を `scale` マイクロ秒単位で加える（`AdjustMicroseconds` 相当）。
@@ -809,6 +808,8 @@ mod tests {
             ("P0001-02-03T04:05:06", "1 year 2 mons 3 days 04:05:06"),
             ("1.5 years", "1 year 6 mons"),
             ("1.5 months", "1 mon 15 days"),
+            ("0.1 years", "1 mon"),
+            ("0.01 years", "00:00:00"),
             ("1.5 days", "1 day 12:00:00"),
             ("100 hours", "100:00:00"),
             ("1-2", "1 year 2 mons"),
