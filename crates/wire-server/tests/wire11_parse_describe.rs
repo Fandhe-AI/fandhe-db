@@ -268,7 +268,7 @@ fn describe_window_columns_announce_same_oids_as_simple_query() {
             ("rn".to_string(), 20),
             ("c".to_string(), 20),
             ("s".to_string(), 1700),
-            ("a".to_string(), 701),
+            ("a".to_string(), 1700),
             ("b".to_string(), 25),
         ]
     );

@@ -178,14 +178,14 @@ fn expected_plain(col: &str, func: &str) -> String {
     let (sum, avg, min, max): (&str, &str, &str, &str) = match col {
         "i" => (
             "SignedInteger(30)",
-            "Float(15.0)",
+            "Numeric(Decimal { unscaled: 150000000000000000, scale: 16 })",
             "SignedInteger(10)",
             "SignedInteger(20)",
         ),
         "bi" => (
             // Issue #2271（TABLE-13）: `SUM(BIGINT)` は numeric(38,0)。
             "Numeric(Decimal { unscaled: 300, scale: 0 })",
-            "Float(150.0)",
+            "Numeric(Decimal { unscaled: 1500000000000000000, scale: 16 })",
             "SignedInteger(100)",
             "SignedInteger(200)",
         ),

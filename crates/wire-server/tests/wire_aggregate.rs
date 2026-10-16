@@ -44,7 +44,7 @@ use common::*;
 /// `Public` ＋ 自テナント `Private` を許可）:
 /// id=1 (tenant-a, [1,0], "ja") / id=2 (tenant-b, [0,1], "en") /
 /// id=3 (tenant-c, [-1,0], "ja") / id=11 (tenant-a, [1,0], "xx")。
-/// `COUNT(*)=4`・`SUM(id)=17`・`AVG(id)=4.25`・`MIN(id)=1`・`MAX(id)=11`・
+/// `COUNT(*)=4`・`SUM(id)=17`・`AVG(id)=4.2500000000000000`（numeric）・`MIN(id)=1`・`MAX(id)=11`・
 /// `MIN(lang)="en"`・`MAX(lang)="xx"`・各ノルムが 1 のため
 /// `SUM(vec_norm(embedding))=4`。`GROUP BY lang` → `en:(n=1,s=2)`,
 /// `ja:(n=2,s=4)`, `xx:(n=1,s=11)`（キー昇順）。
@@ -145,7 +145,7 @@ fn sql13_single_row_aggregates_are_returned_as_text_columns_over_wire() {
         Some("4"),
         Some("4"),
         Some("17"),
-        Some("4.25"),
+        Some("4.2500000000000000"),
         Some("1"),
         Some("11"),
         Some("en"),

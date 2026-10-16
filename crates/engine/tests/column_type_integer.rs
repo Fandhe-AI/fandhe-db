@@ -415,7 +415,7 @@ fn integer_column_reference_in_where_group_by_and_expr_is_accepted() {
 
 /// `SUM`/`AVG`/`MIN`/`MAX(<INTEGER>/<BIGINT>)` は Issue #892 で受理された
 /// （TABLE-13・SQL-13）。`SUM` は `BIGINT` 相当（`Cell::SignedInteger`）・
-/// `AVG` は `DOUBLE PRECISION` 相当（`Cell::Float`）で返る。
+/// `AVG` は numeric（`Cell::Numeric`。Issue #2270）で返る。
 #[test]
 fn sum_of_integer_column_succeeds_after_issue_892() {
     let path = unique_db_path("column-type-integer-sum-after-892");
@@ -453,7 +453,13 @@ fn sum_of_integer_column_succeeds_after_issue_892() {
     let avg = core
         .execute_sql(&ctx, &format!("SELECT AVG(b) FROM {TABLE}"))
         .expect("AVG(BIGINT) must succeed after Issue #892");
-    assert_eq!(avg.rows[0].cells, vec![Cell::Float(40.0)]);
+    assert_eq!(
+        avg.rows[0].cells,
+        vec![Cell::Numeric(
+            engine::numeric::Decimal::from_parts(400_000_000_000_000_000, 16)
+                .expect("valid decimal")
+        )]
+    );
 
     let min_max = core
         .execute_sql(&ctx, &format!("SELECT MIN(n), MAX(n) FROM {TABLE}"))

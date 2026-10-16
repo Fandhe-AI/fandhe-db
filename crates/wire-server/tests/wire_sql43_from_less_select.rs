@@ -473,7 +473,7 @@ fn simple_aggregates_return_one_row_with_pg_oids() {
         &mut s,
         "SELECT avg(1)",
         &[("avg", 1700, -1)],
-        &[Some("1.0000000000000000")],
+        &[Some("1.00000000000000000000")],
     );
 }
 

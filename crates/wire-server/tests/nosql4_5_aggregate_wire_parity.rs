@@ -363,7 +363,7 @@ fn five_functions_single_request_match_sql_and_fixed_oracle() {
     // alice（tenant-a）は Public 3 件 + 自テナント Private 行（id=11）1 件の
     // 計 4 件を可視とする（RLS-11・TASK-195・read-your-writes）。
     assert!(
-        body_utf8(&resp).contains(r#""rows":[[4,4,17,4.25,1,11,"en","xx"]]"#),
+        body_utf8(&resp).contains(r#""rows":[[4,4,17,4.2500000000000000,1,11,"en","xx"]]"#),
         "{}",
         body_utf8(&resp)
     );

@@ -124,7 +124,7 @@ fn expect(stream: &mut TcpStream, kind: u8) -> Vec<u8> {
     body
 }
 
-const SQL: &str = "SELECT max(n)+1, sum(n)+1, count(*)*2, sum(r)+sum(r), avg(n)*2 FROM t";
+const SQL: &str = "SELECT max(n)+1, sum(n)+1, count(*)*2, sum(r)+sum(r), avg(r)*2 FROM t";
 
 fn expected_types() -> Vec<(String, i32, i16)> {
     vec![
@@ -148,7 +148,7 @@ fn simple_query_advertises_aggregate_expression_types() {
             Some("8".to_string()),
             Some("2".to_string()),
             Some("5".to_string()),
-            Some("14".to_string())
+            Some("5".to_string())
         ]
     );
     assert_eq!(read_command_complete(&mut s), "SELECT 1");
@@ -186,11 +186,7 @@ fn extended_describe_matches_runtime_row_description_in_binary() {
     assert_eq!(row[1], Some(8i64.to_be_bytes().to_vec()), "int8 binary");
     assert_eq!(row[2], Some(2i64.to_be_bytes().to_vec()), "int8 binary");
     assert_eq!(row[3], Some(5.0f32.to_be_bytes().to_vec()), "float4 binary");
-    assert_eq!(
-        row[4],
-        Some(14.0f64.to_be_bytes().to_vec()),
-        "float8 binary"
-    );
+    assert_eq!(row[4], Some(5.0f64.to_be_bytes().to_vec()), "float8 binary");
     expect(&mut s, b'C');
     assert_eq!(expect(&mut s, b'Z'), [b'I']);
 }
@@ -204,5 +200,26 @@ fn integer_overflow_and_division_by_zero_use_postgres_sqlstates() {
 
     send_simple_query(&mut s, "SELECT sum(n)/0 FROM t");
     expect_error_response_with_sqlstate(&mut s, "22012");
+    read_ready_for_query(&mut s);
+}
+
+/// Issue #2270（TABLE-13）: 整数の AVG は numeric を返すため、式の中では numeric 算術が
+/// 未対応の間 22000 で拒否される（接続は維持される）。
+#[test]
+fn avg_of_integer_in_expression_is_rejected_with_22000() {
+    let (mut s, _g) = connect();
+    send_simple_query(&mut s, "SELECT avg(n)*2 FROM t");
+    expect_error_response_with_sqlstate(&mut s, "22000");
+    read_ready_for_query(&mut s);
+
+    // 式の外の AVG(整数) は numeric（OID 1700）で、PG 17 と同じ小数 16 桁のテキストになる。
+    send_simple_query(&mut s, "SELECT avg(n) FROM t");
+    let fields = read_row_description_with_types(&mut s);
+    assert_eq!(fields[0].1, 1700);
+    assert_eq!(
+        read_data_row(&mut s),
+        vec![Some("7.0000000000000000".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut s), "SELECT 1");
     read_ready_for_query(&mut s);
 }

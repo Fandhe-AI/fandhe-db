@@ -56,6 +56,29 @@ use crate::sql::udf_call::{self, BoundExpr, ExprValue};
 use crate::storage::{self, StorageError};
 use redb::ReadableTable;
 
+/// 整数・`id` の AVG の列メタ型（Issue #2270・TABLE-13）。wire の typmod は numeric で常に
+/// -1 のため scale は外部に出ないが、0 以外にして整数 numeric 扱い
+/// （`subquery` の scale 0 判定）を避ける。セルの実 scale は値ごとに変わる。
+pub(crate) const AVG_INTEGER_RESULT_TYPE: crate::catalog::ColumnType =
+    crate::catalog::ColumnType::Numeric {
+        precision: crate::numeric::MAX_PRECISION,
+        scale: 16,
+    };
+
+/// 整数 AVG の確定セル。累積（`finish`）と同じ規則を `const_select` と共有する。
+/// 38 桁超過は 22003、内部不変条件違反は XX000（fail-closed）。
+fn integer_avg_cell(sum: i128, count: u64) -> Result<Cell, SqlSurfaceError> {
+    match crate::numeric::avg_integer(sum, count) {
+        Ok(d) => Ok(Cell::Numeric(d)),
+        Err(crate::numeric::NumericError::OutOfRange) => {
+            Err(SqlSurfaceError::numeric_out_of_range(
+                "AVG(integer) exceeds the maximum supported precision",
+            ))
+        }
+        Err(_) => Err(accumulator_bug("AVG(integer) produced an invalid result")),
+    }
+}
+
 /// 型不整合・NULL 契約違反等の意味論的問題ではなく、`bind_aggregate` の型検査を
 /// 通過したはずの `(AggregateFunc, AggregateInput)` の組み合わせが
 /// [`Accumulator::new`] の網羅から漏れていた場合に返す（実装バグの検出用。
@@ -1785,9 +1808,11 @@ impl Accumulator {
         Ok(match self {
             Accumulator::Count(n) => Cell::Integer(n),
             Accumulator::IdSum(s) => s.map(Cell::Integer).unwrap_or(Cell::Null),
+            // Issue #2270（TABLE-13）: 整数・`id` の AVG は numeric。結果 scale は値ごとに
+            // PG の `select_div_scale` 規則で決まる（列メタの scale とは一致しない）。
             Accumulator::IdAvg { sum, count } => match sum {
                 None => Cell::Null,
-                Some(s) => Cell::Float(s as f64 / count as f64),
+                Some(s) => integer_avg_cell(i128::from(s), count)?,
             },
             Accumulator::IdMin(m) => m.map(Cell::Integer).unwrap_or(Cell::Null),
             Accumulator::IdMax(m) => m.map(Cell::Integer).unwrap_or(Cell::Null),
@@ -1844,7 +1869,7 @@ impl Accumulator {
             },
             Accumulator::IntAvg { sum, count } => match sum {
                 None => Cell::Null,
-                Some(s) => Cell::Float(s as f64 / count as f64),
+                Some(s) => integer_avg_cell(s, count)?,
             },
             Accumulator::IntMin(m) => m.map(Cell::SignedInteger).unwrap_or(Cell::Null),
             Accumulator::IntMax(m) => m.map(Cell::SignedInteger).unwrap_or(Cell::Null),
@@ -2497,7 +2522,9 @@ pub(crate) fn aggregate_result_type(
             precision: 20,
             scale: 0,
         },
-        (Avg, AggregateInput::IdU64) => ColumnType::Double,
+        // Issue #2270: 整数・`id` の AVG は numeric。名目 scale 16 は列メタ用で、
+        // セルの scale は値ごとに変わる（`integer_avg_cell`）。
+        (Avg, AggregateInput::IdU64) => AVG_INTEGER_RESULT_TYPE,
         (Sum, AggregateInput::IntegerColumn(_) | AggregateInput::SmallIntColumn(_)) => {
             ColumnType::BigInt
         }
@@ -2511,7 +2538,7 @@ pub(crate) fn aggregate_result_type(
             AggregateInput::IntegerColumn(_)
             | AggregateInput::SmallIntColumn(_)
             | AggregateInput::BigIntColumn(_),
-        ) => ColumnType::Double,
+        ) => AVG_INTEGER_RESULT_TYPE,
         (Min | Max, AggregateInput::IntegerColumn(_)) => ColumnType::Integer,
         (Min | Max, AggregateInput::SmallIntColumn(_)) => ColumnType::SmallInt,
         (Min | Max, AggregateInput::BigIntColumn(_)) => ColumnType::BigInt,
@@ -3636,7 +3663,31 @@ mod tests {
         let mut acc = Accumulator::new(AggregateFunc::Avg, &AggregateInput::IdU64).unwrap();
         acc.observe_id(2).unwrap();
         acc.observe_id(4).unwrap();
-        assert_eq!(acc.finish().unwrap(), Cell::Float(3.0));
+        // Issue #2270: 整数・`id` の AVG は numeric（PG の結果 scale 規則で 16 桁）。
+        assert_eq!(
+            acc.finish().unwrap(),
+            Cell::Numeric(crate::numeric::Decimal::from_parts(30_000_000_000_000_000, 16).unwrap())
+        );
+    }
+
+    #[test]
+    fn int_avg_finish_uses_per_value_scale_and_numeric_type() {
+        let mut acc =
+            Accumulator::new(AggregateFunc::Avg, &AggregateInput::BigIntColumn(0)).unwrap();
+        acc.observe_int(Some(1)).unwrap();
+        acc.observe_int(Some(1)).unwrap();
+        // 2 / 2 = 1（PG は 20 桁: select_div_scale の先頭桁規則）。
+        let Cell::Numeric(d) = acc.finish().unwrap() else {
+            panic!("AVG(bigint) must be numeric");
+        };
+        assert_eq!(d.to_string(), "1.00000000000000000000");
+        assert!(matches!(
+            aggregate_result_type(AggregateFunc::Avg, &AggregateInput::IntegerColumn(0)),
+            Some(crate::catalog::ColumnType::Numeric { .. })
+        ));
+        let empty =
+            Accumulator::new(AggregateFunc::Avg, &AggregateInput::SmallIntColumn(0)).unwrap();
+        assert_eq!(empty.finish().unwrap(), Cell::Null);
     }
 
     #[test]

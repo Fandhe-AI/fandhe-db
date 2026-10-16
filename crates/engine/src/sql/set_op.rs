@@ -312,6 +312,18 @@ fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), SqlSurfaceEr
     Ok(())
 }
 
+/// 行キー用の `NUMERIC` 正準テキスト（末尾の小数部ゼロを除く）。整数 `AVG`（Issue #2270）は
+/// 値ごとに scale が異なり、`1.5000000000000000` と `1.50` は numeric として等しいため、
+/// 重複排除では値の等価で同一視する（PostgreSQL と同じ）。
+fn numeric_key_text(d: &crate::numeric::Decimal) -> String {
+    let text = d.to_string();
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    }
+}
+
 /// 行の正準バイト列表現（重複除去・`INTERSECT`／`EXCEPT` の同値判定に使う行
 /// キー）。セルごとに「型タグ＋長さ接頭辞（`u32` BE）＋ペイロード」を連結する
 /// （SQL-29 (c) §2.3）。`VECTOR` 列は §2.2 の型検証で重複除去を伴う演算からは
@@ -373,7 +385,7 @@ fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
             }
             Cell::Numeric(d) => {
                 out.push(10);
-                push_len_prefixed(&mut out, d.to_string().as_bytes())?;
+                push_len_prefixed(&mut out, numeric_key_text(d).as_bytes())?;
             }
             Cell::Uuid(u) => {
                 out.push(11);
@@ -445,7 +457,7 @@ fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
             Cell::Text(s) => 1 + len_prefixed_total_len(s.len())?,
             Cell::Bytes(b) => 1 + len_prefixed_total_len(b.len())?,
             Cell::Json(s) => 1 + len_prefixed_total_len(s.len())?,
-            Cell::Numeric(d) => 1 + len_prefixed_total_len(d.to_string().len())?,
+            Cell::Numeric(d) => 1 + len_prefixed_total_len(numeric_key_text(d).len())?,
             // 型タグ 1 byte ＋ UUID 本体（[`crate::uuid::Uuid::as_bytes`] は
             // 常に 16 byte）。
             Cell::Uuid(_) => 1 + 16,
@@ -1252,6 +1264,29 @@ mod tests {
         )
         .expect_err("type mismatch must be rejected even with a zero-byte budget");
         assert_eq!(err.wire_code(), "42804");
+    }
+
+    /// Issue #2270: 値が等しく scale だけ異なる numeric（整数 `AVG` の値ごとの scale）は
+    /// 重複排除キーで同一視され、値が異なるものは区別される。
+    #[test]
+    fn row_key_treats_numerics_with_different_scale_as_equal() {
+        let key = |text: &str| {
+            let d = crate::numeric::parse_literal_exact(text).expect("valid decimal");
+            let row = ResultRow {
+                id: 0,
+                score: 0.0,
+                cells: vec![Cell::Numeric(d)],
+            };
+            (row_key(&row).expect("key"), row_key_len(&row).expect("len"))
+        };
+        let (a, a_len) = key("1.5000000000000000");
+        let (b, b_len) = key("1.50000000000000000000");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), a_len);
+        assert_eq!(b.len(), b_len);
+        assert_ne!(key("1.5").0, key("1.51").0);
+        assert_eq!(key("10").0, key("10.0000").0);
+        assert_ne!(key("10").0, key("1").0);
     }
 
     /// PR #1105 レビュー指摘の回帰（set_op.rs:393・415・423）: [`row_key_len`]
