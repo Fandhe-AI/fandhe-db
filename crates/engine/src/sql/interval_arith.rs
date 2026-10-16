@@ -92,8 +92,9 @@ fn add_months_local(local: i128, months: i32) -> Result<i128, SqlSurfaceError> {
         .ok_or_else(timestamp_out_of_range)?;
     let ny = total.div_euclid(12);
     let nm = (total.rem_euclid(12) + 1) as u32;
-    // 閉区間 [-4712, 294276] 年は PG の範囲。外は即エラー（days_from_civil の保険）。
-    if !(-4712..=294_276).contains(&ny) {
+    // 閉区間 [-4713, 294276] 年は予備検査（-4713 は 11-24 未満を含むため正確な下限は
+    // join_local の通日検査が判定する）。外は即エラー（days_from_civil の保険）。
+    if !(-4713..=294_276).contains(&ny) {
         return Err(timestamp_out_of_range());
     }
     let nd = d.min(days_in_month(ny, nm));

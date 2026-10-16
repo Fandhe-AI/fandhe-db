@@ -700,12 +700,18 @@ impl SessionTimeZone {
     }
 
     /// UTC 時刻（マイクロ秒）における UTC からの offset（秒）。jiff の `Timestamp` 範囲外は
-    /// 端へ丸める（範囲端は 12 月末で DST 規則が変わらないため offset は同じ）。
+    /// 暦が一致する 400 年周期の同位置（2000〜2399 年）へ写して引く。`local_to_utc_micros` の
+    /// 範囲外年の写像と同じ周期にそろえ、UTC→局所と局所→UTC で offset を食い違わせない
+    /// （Issue #1581）。
     pub(crate) fn offset_seconds_at(&self, utc_micros: i64) -> i32 {
-        let ts = jiff::Timestamp::from_microsecond(utc_micros).unwrap_or(if utc_micros < 0 {
-            jiff::Timestamp::MIN
-        } else {
-            jiff::Timestamp::MAX
+        let ts = jiff::Timestamp::from_microsecond(utc_micros).unwrap_or_else(|_| {
+            const CYCLE_MICROS: i128 = 146_097 * MICROS_PER_DAY as i128;
+            let base = i128::from(days_from_civil(2000, 1, 1)) * MICROS_PER_DAY as i128;
+            let mapped = (i128::from(utc_micros) - base).rem_euclid(CYCLE_MICROS) + base;
+            i64::try_from(mapped)
+                .ok()
+                .and_then(|m| jiff::Timestamp::from_microsecond(m).ok())
+                .unwrap_or(jiff::Timestamp::MAX)
         });
         match &self.repr {
             TzRepr::Fixed(secs) => *secs,

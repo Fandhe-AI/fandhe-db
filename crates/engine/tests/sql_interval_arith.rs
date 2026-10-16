@@ -684,3 +684,36 @@ fn timestamptz_intermediate_beyond_year_9999_succeeds() {
     );
     assert!(r.starts_with("tz:"), "{r}");
 }
+
+/// DST 期間（7 月）の日付で、範囲外の中間値を経由しても壁時計が 1 時間ずれない
+/// （UTC→局所と局所→UTC で 400 年周期の同じ対応年を使う。Issue #1581）。
+#[test]
+fn timestamptz_out_of_range_intermediate_keeps_dst_offset() {
+    let (_g, core) = open("ivar-tz-mid-dst");
+    let mut s = session();
+    ok(&core, &mut s, "SET TIME ZONE 'America/New_York'");
+    assert_eq!(
+        one(
+            &core,
+            &mut s,
+            "SELECT TIMESTAMPTZ '2000-07-01 12:00:00-04' + INTERVAL '120000 mons -3652425 days'",
+        ),
+        "tz:2000-07-01 16:00:00+00"
+    );
+}
+
+/// 月加算後が天文学的年 -4713 でも、日加算後の最終値が範囲内なら成功する
+/// （年の予備検査は -4713 を許容し、正確な下限は通日検査が判定する）。
+#[test]
+fn month_addition_landing_in_year_minus_4713_succeeds() {
+    let (_g, core) = open("ivar-year-4713");
+    let mut s = session();
+    assert_eq!(
+        one(
+            &core,
+            &mut s,
+            "SELECT TIMESTAMP '2000-01-01 00:00:00' + INTERVAL '-80545 mons 2451545 days'",
+        ),
+        "ts:2000-01-08 00:00:00"
+    );
+}
