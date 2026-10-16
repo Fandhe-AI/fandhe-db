@@ -14,7 +14,6 @@
 use std::fmt::Write as _;
 
 mod interval;
-#[allow(unused_imports)]
 pub(crate) use interval::interval_div_f64;
 pub use interval::{
     checked_add_interval, cmp_interval, format_interval, interval_cmp_key, parse_interval,
