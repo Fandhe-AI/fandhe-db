@@ -706,6 +706,9 @@ fn declare_between(
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
+        ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+            "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
+        ))),
         // SMALLINT も同じ式レーンで束縛する（TABLE-30・NOSQL-17・Issue #1561）。範囲外は
         // engine が `22003` を返す。以降の eq／範囲／in の各分岐も同じ。
         ColumnType::SmallInt
@@ -869,6 +872,9 @@ fn declare_eq(
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
+        ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+            "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
+        ))),
         // Issue #1183: 数値型（SMALLINT 含む）は式レーンで束縛する（SQL の式述語と同じ経路）。
         ColumnType::SmallInt
         | ColumnType::Integer
@@ -960,6 +966,9 @@ fn declare_range(
         // insert／update の型束縛は typed_json 側で Issue #1571 により対応済み）。
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
+        ))),
+        ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+            "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
         // Issue #1183: 数値型（SMALLINT 含む）は式レーンで束縛する（`declare_eq` と同じ）。
         ColumnType::SmallInt
@@ -1148,6 +1157,9 @@ fn declare_in(
         // insert／update の型束縛は typed_json 側で Issue #1571 により対応済み）。
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
+        ))),
+        ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+            "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
         ColumnType::SmallInt
         | ColumnType::Integer
