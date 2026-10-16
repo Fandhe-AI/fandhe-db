@@ -186,6 +186,7 @@ pub(crate) mod hnsw_hybrid;
 /// 構成）。
 pub(crate) mod join;
 pub(crate) mod json_fn;
+pub(crate) mod jsonpath_fn;
 pub mod lexer;
 pub mod mode;
 pub(crate) mod numeric_fn;

@@ -732,6 +732,12 @@ pub enum SqlSurfaceError {
     /// 集計の `HAVING`／`ORDER BY` が出力名（重複した集計名・キー別名の重複・
     /// キーと集計項目の衝突）を複数一致で解決できない場合も同分類（Issue #1270）。
     AmbiguousColumn { name: String },
+    /// jsonpath 評価（`jsonb_path_*`。Issue #2185）の失敗。分類・文言は内側の
+    /// [`crate::json::jsonpath::JsonPathEvalError`] に委譲する（固定の英語文で入力の断片を含めない）。
+    JsonPathEval(crate::json::jsonpath::JsonPathEvalError),
+    /// jsonpath 文字列の解析失敗（束縛時。Issue #2185）。分類・文言は内側の
+    /// [`crate::json::jsonpath::JsonPathParseError`] に委譲する。
+    JsonPathParse(crate::json::jsonpath::JsonPathParseError),
 }
 
 impl SqlSurfaceError {
@@ -1105,12 +1111,16 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::UndefinedFunction { .. } => ErrorClass::UndefinedFunction,
             SqlSurfaceError::DuplicateFunction { .. } => ErrorClass::DuplicateFunction,
             SqlSurfaceError::AmbiguousColumn { .. } => ErrorClass::AmbiguousColumn,
+            SqlSurfaceError::JsonPathEval(e) => e.error_class(),
+            SqlSurfaceError::JsonPathParse(e) => e.error_class(),
         }
     }
 
     fn client_message(&self) -> String {
         match self {
             SqlSurfaceError::Internal { .. } => "internal error".to_string(),
+            SqlSurfaceError::JsonPathEval(e) => e.client_message(),
+            SqlSurfaceError::JsonPathParse(e) => e.client_message(),
             other => other.to_string(),
         }
     }
@@ -1339,6 +1349,8 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::AmbiguousColumn { name } => {
                 write!(f, "column reference {name:?} is ambiguous")
             }
+            SqlSurfaceError::JsonPathEval(e) => f.write_str(&e.client_message()),
+            SqlSurfaceError::JsonPathParse(e) => f.write_str(&e.client_message()),
         }
     }
 }
@@ -5258,6 +5270,15 @@ impl<'a> Parser<'a> {
                 return Ok(lhs);
             }
         }
+        // `jsonb_path_exists`／`jsonb_path_match`（Issue #2185）は boolean を返すため、`JsonAccess` の
+        // 述語演算子（Issue #1598）と同じく比較演算子なしの裸の述語として受理する。
+        if let Expr::Call { name, .. } = &lhs {
+            if crate::sql::jsonpath_fn::is_jsonpath_predicate_fn_name(name)
+                && !self.peek_is_cmp_op()
+            {
+                return Ok(lhs);
+            }
+        }
         let op = self.expect_cmp_op()?;
         let rhs = self.parse_value_expr(0)?;
         Ok(Expr::Binary {
@@ -6501,7 +6522,8 @@ impl<'a> Parser<'a> {
         // NULL リテラルとして受理する（新設の関数で、`NULL` という名前の列を渡す後方互換の制約が無い）。
         // jsonb 関数は CHECK 本体では未対応（jsonb 演算子と同じ `0A000`）。
         let is_json_fn_call = crate::sql::udf_call::json_fn_from_name(&name).is_some()
-            || crate::sql::udf_call::is_deferred_json_srf_name(&name);
+            || crate::sql::udf_call::is_deferred_json_srf_name(&name)
+            || crate::sql::jsonpath_fn::is_jsonpath_fn_name(&name.to_ascii_lowercase());
         if is_json_fn_call && self.in_check_body {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: "jsonb functions are not supported in a CHECK constraint".to_string(),

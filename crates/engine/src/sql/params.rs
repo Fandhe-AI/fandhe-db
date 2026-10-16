@@ -12,6 +12,12 @@
 //! SQL テキストへも字句解析器へも戻らないため、値経由のインジェクション経路は
 //! 構造的に存在しない）。
 //!
+//! ## NULL パラメータ（Issue #2439・WIRE-12・WIRE-24 のポインタ）
+//!
+//! Bind 値 `None`（NULL）は裸の `Token::Ident("NULL")` 1 個へ置換し、位置ごとの
+//! 受理／拒否と `wire_code` は後段の許可リストパーサーがリテラル `NULL` と同一の
+//! 規則で決める（本モジュールに位置別の NULL 分岐は置かない）。
+//!
 //! ## 受理するプレースホルダ位置（WIRE-12 の規範形。これ以外は `42601`）
 //!
 //! 1. `ORDER BY <vec列> <=> $n`（ベクトル位置。直前トークンが [`Token::DistanceOp`]）
@@ -1048,15 +1054,21 @@ pub fn substitute_values(
     tokens: &[Token],
     values: &[String],
 ) -> Result<Vec<Token>, SqlSurfaceError> {
-    substitute_values_typed(tokens, values, &[])
+    let wrapped: Vec<Option<String>> = values.iter().cloned().map(Some).collect();
+    substitute_values_typed(tokens, &wrapped, &[])
 }
 
 /// [`substitute_values`] の型付き版（Issue #1342）。種別に応じて整数・真偽値の
 /// 形式を検証し（不正は `22P02`）、字句解析器がリテラルから生成するのと同一の
 /// トークン列へ置換する。[`crate::core::EngineCore::bind_prepared`] が呼ぶ。
+///
+/// `values` の `None`（NULL パラメータ。WIRE-24）は種別に関わらず、字句解析器が
+/// SQL テキストの裸の `NULL` から生成するのと同一の `Token::Ident("NULL")` 1 個へ
+/// 置換する。受理／拒否と `wire_code` は位置ごとに後段の許可リストパーサーが
+/// リテラル `NULL` と同じ規則で決める（本関数に位置別の分岐は置かない）。
 pub(crate) fn substitute_values_typed(
     tokens: &[Token],
-    values: &[String],
+    values: &[Option<String>],
     kinds: &[ParamLiteralKind],
 ) -> Result<Vec<Token>, SqlSurfaceError> {
     substitute_with(tokens, |n| {
@@ -1066,6 +1078,9 @@ pub(crate) fn substitute_values_typed(
         let value = values.get(idx).ok_or_else(|| {
             SqlSurfaceError::invalid_input(format!("missing bind value for parameter ${n}"))
         })?;
+        let Some(value) = value else {
+            return Ok(vec![Token::Ident("NULL".to_string())]);
+        };
         match kind_of(kinds, n) {
             ParamLiteralKind::String => Ok(vec![Token::StringLiteral(value.clone())]),
             ParamLiteralKind::Integer => integer_literal_tokens(n, value),
@@ -1091,9 +1106,11 @@ pub(crate) fn substitute_values_typed(
 /// 値は（検証は受けるが）一切複製されないため、その内容量はメモリ増幅
 /// 攻撃の入力にならない。
 ///
-/// - `NULL`（`values` の要素が `None`）は本バージョンのスコープ外として
-///   [`SqlSurfaceError::invalid_input`]（`22000`）で拒否する（未参照の
-///   位置も含め、渡された全値に対して検証する）。
+/// - `NULL`（`values` の要素が `None`）は [`decode_bind_values_nullable`] が
+///   `None` のまま保持する（WIRE-24）。本関数（テキスト値専用の公開ラッパー）は
+///   従来契約どおり `None` を含む入力を [`SqlSurfaceError::invalid_input`]
+///   （`22000`）で拒否する。NULL を含む束縛は
+///   [`crate::core::EngineCore::bind_prepared`] が nullable 版経由で扱う。
 /// - 非 UTF-8・NUL 文字混入は [`SqlSurfaceError::invalid_text_representation`]
 ///   （`22P02`。WIRE-12。値の形式不正）。
 /// - 置換後総バイト数超過は [`SqlSurfaceError::payload_too_large`]（`54000`）。
@@ -1101,12 +1118,30 @@ pub fn decode_bind_values(
     tokens: &[Token],
     values: &[Option<Vec<u8>>],
 ) -> Result<Vec<String>, SqlSurfaceError> {
+    if values.iter().any(Option::is_none) {
+        return Err(SqlSurfaceError::invalid_input(
+            "NULL parameter values are not supported".to_string(),
+        ));
+    }
+    let decoded = decode_bind_values_nullable(tokens, values)?;
+    Ok(decoded.into_iter().map(Option::unwrap_or_default).collect())
+}
+
+/// [`decode_bind_values`] の NULL 対応版（Issue #2439・WIRE-12・WIRE-24）。
+/// 検証・上限判定の規則は同一で、`None`（NULL）は `None` のまま返す。置換後総
+/// バイト数には、参照される NULL を `NULL` トークン（4 バイト）として計上する。
+/// [`crate::core::EngineCore::bind_prepared`] から呼ばれる。
+pub(crate) fn decode_bind_values_nullable(
+    tokens: &[Token],
+    values: &[Option<Vec<u8>>],
+) -> Result<Vec<Option<String>>, SqlSurfaceError> {
     // 借用のまま UTF-8 検証・NUL 拒否を行う（値の複製より前）。
-    let mut borrowed: Vec<&str> = Vec::with_capacity(values.len());
+    let mut borrowed: Vec<Option<&str>> = Vec::with_capacity(values.len());
     for raw in values {
-        let bytes = raw.as_ref().ok_or_else(|| {
-            SqlSurfaceError::invalid_input("NULL parameter values are not supported".to_string())
-        })?;
+        let Some(bytes) = raw.as_ref() else {
+            borrowed.push(None);
+            continue;
+        };
         let text = std::str::from_utf8(bytes).map_err(|_| {
             SqlSurfaceError::invalid_text_representation("parameter value is not valid UTF-8")
         })?;
@@ -1115,7 +1150,7 @@ pub fn decode_bind_values(
                 "parameter value must not contain a NUL byte",
             ));
         }
-        borrowed.push(text);
+        borrowed.push(Some(text));
     }
 
     // 総置換バイト数（$n の出現回数 × 対応する値の長さ、の総和）を、値の
@@ -1135,8 +1170,9 @@ pub fn decode_bind_values(
         let len = match token {
             Token::Param(n) => {
                 let idx = usize::from(*n).checked_sub(1);
+                // NULL は置換後に `NULL` 1 トークン（4 バイト）になる。
                 idx.and_then(|i| borrowed.get(i))
-                    .map(|s| s.len())
+                    .map(|s| s.map_or(4, str::len))
                     .unwrap_or(0)
             }
             Token::Ident(s)
@@ -1192,15 +1228,16 @@ pub fn decode_bind_values(
     // 未参照の位置は空文字列のまま残す（`substitute_values` は `tokens` の
     // `Token::Param` からしか添字アクセスしないため参照されず、複製コストも
     // メモリ上の保持コストも発生しない）。
-    let mut decoded: Vec<String> = vec![String::new(); values.len()];
+    let mut decoded: Vec<Option<String>> =
+        borrowed.iter().map(|b| b.map(|_| String::new())).collect();
     for token in tokens {
         let Token::Param(n) = token else { continue };
         let Some(idx) = usize::from(*n).checked_sub(1) else {
             continue;
         };
-        if let Some(slot) = decoded.get_mut(idx) {
+        if let Some(Some(slot)) = decoded.get_mut(idx) {
             if slot.is_empty() {
-                if let Some(text) = borrowed.get(idx) {
+                if let Some(Some(text)) = borrowed.get(idx) {
                     *slot = (*text).to_string();
                 }
             }
@@ -1838,10 +1875,35 @@ mod tests {
     }
 
     #[test]
-    fn decode_bind_values_rejects_null() {
+    fn decode_bind_values_public_wrapper_still_rejects_null() {
         let tokens = tokenize_with_params("WHERE lang = $1").expect("tokenize should succeed");
         let err = decode_bind_values(&tokens, &[None]).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn decode_bind_values_nullable_keeps_null_and_substitutes_null_token() {
+        // WIRE-24: NULL は `None` のまま保持され、置換後は裸の `NULL` 1 トークンになる。
+        let tokens =
+            tokenize_with_params("WHERE lang = $1 AND body = $2").expect("tokenize should succeed");
+        let decoded = decode_bind_values_nullable(&tokens, &[None, Some(b"x".to_vec())]).unwrap();
+        assert_eq!(decoded, vec![None, Some("x".to_string())]);
+        let substituted = substitute_values_typed(&tokens, &decoded, &[]).unwrap();
+        assert!(substituted.contains(&Token::Ident("NULL".to_string())));
+        assert!(!substituted.contains(&Token::QuotedNull("NULL".to_string())));
+    }
+
+    #[test]
+    fn decode_bind_values_nullable_accepts_repeated_null_reference() {
+        // 参照される NULL は 4 バイト（`NULL` トークン）として計上されるが、
+        // トークン数上限内の反復では総バイト数上限に達しない。
+        let mut sql = "WHERE lang = $1".to_string();
+        for _ in 0..4_000 {
+            sql.push_str(" AND lang = $1");
+        }
+        let tokens = tokenize_with_params(&sql).expect("tokenize should succeed");
+        let decoded = decode_bind_values_nullable(&tokens, &[None]).unwrap();
+        assert_eq!(decoded, vec![None]);
     }
 
     #[test]
@@ -2040,6 +2102,7 @@ mod typed_tests {
         assert!(dummy.contains(&Token::Number("0".into())));
         assert!(dummy.contains(&Token::Ident("false".into())));
         let values: Vec<String> = ["ja", "-3", "t", "x"].map(String::from).to_vec();
+        let values: Vec<Option<String>> = values.into_iter().map(Some).collect();
         let bound = substitute_values_typed(&tokens, &values, &kinds).unwrap();
         assert!(bound.contains(&Token::Punct('-')));
         assert!(bound.contains(&Token::Ident("true".into())));

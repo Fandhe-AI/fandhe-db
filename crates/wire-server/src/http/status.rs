@@ -84,8 +84,9 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::IndeterminateCollation
         // Issue #1599: `jsonb_build_object` の NULL キー（`22004`）も入力起因の拒否として 400。
         | ErrorClass::NullValueNotAllowed
-        // Issue #2184: jsonpath 評価器の `2203x` 系は入力起因の拒否として 400（SQL 表層への
-        // 配線は #2185／#2186。NoSQL 表層からは到達不能）。
+        // Issue #2184: jsonpath 評価器の `2203x` 系は入力起因の拒否として 400（SQL 表層へは
+        // `jsonb_path_*`〔#2185〕で配線済み。NoSQL 表層からは到達不能）。`22P05`（#2185）も同様。
+        | ErrorClass::UntranslatableCharacter
         | ErrorClass::JsonSubscriptInvalid
         | ErrorClass::NonNumericJsonItem
         | ErrorClass::SingletonJsonItemRequired
@@ -171,7 +172,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 59] = [
+    const EXPECTED: [(ErrorClass, u16); 60] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -231,6 +232,7 @@ mod tests {
         (ErrorClass::JsonMemberNotFound, 400),
         (ErrorClass::JsonNumberNotFound, 400),
         (ErrorClass::JsonObjectNotFound, 400),
+        (ErrorClass::UntranslatableCharacter, 400),
     ];
 
     #[test]

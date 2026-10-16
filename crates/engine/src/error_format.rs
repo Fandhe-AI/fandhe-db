@@ -8,8 +8,8 @@
 //! 構造的に保証されない状態を防ぐことが目的。
 //!
 //! 収録範囲は「engine・wire-server が現に返している `wire_code`」を基本とし（engine の公開 API
-//! である jsonpath 評価器〔Issue #2184〕から返る `2203x` 系を含む。SQL／NoSQL 表層への接続は
-//! #2185／#2186）、TASK-153
+//! である jsonpath 評価器〔Issue #2184〕から返る `2203x` 系を含む。SQL 表層へは `jsonb_path_*`
+//! 〔Issue #2185〕で接続済みで、`@?`／`@@` は #2186）、TASK-153
 //! （対象ビヘイビア ERR-1）が wire-server 側の横断写像（`wire-server/src/
 //! error_response.rs`）の網羅対象として `AuthRequired`（`28000`）を追加した。送出経路は
 //! TASK-174／HTTP-8（Issue #753）で wire-server の `http::session::close`／`http::
@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 59;
+    count = 60;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -202,6 +202,10 @@ define_error_classes! {
     /// 本分類へ写像する（PostgreSQL の `invalid_text_representation` と同じ区別）。
     /// 文字列以外のリテラルの種別不一致は `InvalidInput`（`22000`）のまま。
     InvalidTextRepresentation => ("22P02", "INVALID_TEXT_REPRESENTATION"),
+    /// 文字集合上表現できない文字（`22P05`）。jsonpath リテラルの NUL 文字（`\u0000`・`\x00`）の
+    /// 拒否（[`crate::json::jsonpath::JsonPathParseError::UnsupportedUnicodeEscape`]。Issue #2185）。
+    /// SQL 表層専用で NoSQL の `op` 語彙からは到達しない。
+    UntranslatableCharacter => ("22P05", "UNTRANSLATABLE_CHARACTER"),
     /// 明示トランザクション（SQL-31・TASK-221）内で発生した一般的な状態不整合
     /// （`25000`）。同一トランザクション内での `operation_id` 再利用など、他の
     /// より具体的な分類に属さないトランザクション状態エラーに使う。

@@ -465,10 +465,24 @@ fn error_mapping_and_recovery() {
     send_pbes_expect_error(&mut s, sql, &[], &[0, 0], &[Some(b"a")], "08P01");
     // 宣言件数 > プレースホルダ数 → 08P01。
     send_pbes_expect_error(&mut s, sql, &[25, 25], &[], &[Some(b"a")], "08P01");
-    // 非 UTF-8・NUL → 22P02。NULL → 22000。
+    // 非 UTF-8・NUL → 22P02。
     send_pbes_expect_error(&mut s, sql, &[], &[], &[Some(&[0xff, 0xfe])], "22P02");
     send_pbes_expect_error(&mut s, sql, &[], &[], &[Some(b"a\0b")], "22P02");
-    send_pbes_expect_error(&mut s, sql, &[], &[], &[None], "22000");
+    // NULL はリテラル `NULL` と同じ規則で扱われる（WIRE-24・Issue #2439）。TEXT 列の
+    // `= NULL` はリテラルでも 42703 で拒否されるため、パラメータも同じ SQLSTATE になる。
+    send_pbes_expect_error(&mut s, sql, &[], &[], &[None], "42703");
+    send_simple_query(
+        &mut s,
+        "SELECT id FROM documents WHERE body = NULL LIMIT 10",
+    );
+    let (k, body) = read_message(&mut s);
+    assert_eq!(k as char, 'E');
+    assert!(String::from_utf8_lossy(&body).contains("42703"));
+    loop {
+        if read_message(&mut s).0 == b'Z' {
+            break;
+        }
+    }
     // 受理位置外（LIMIT $1）→ 42601。
     send_pbes_expect_error(
         &mut s,
