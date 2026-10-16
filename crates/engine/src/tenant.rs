@@ -2878,6 +2878,29 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (crate::catalog::ColumnType::Interval, crate::row_codec::Value::Interval(interval)) => {
+                // INTERVAL 値は行コーデック上 17 バイト固定（`row_codec::SCALAR_INTERVAL_ENTRY_LEN`）。
+                // 無限大の予約値（番兵）を Rust API から直接渡された場合も、対象行の探索より前に
+                // 拒否する多層防御を置く（Issue #1579）。
+                if !crate::datetime::validate_interval(interval) {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "SET value out of range for INTERVAL column".to_string(),
+                    )));
+                }
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_INTERVAL_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             (crate::catalog::ColumnType::Array(array_ty), crate::row_codec::Value::Array(av)) => {
                 // 配列 SET 値のフレーム長検証（対象行の探索より前に行う。
                 // Issue #888・D-A3。`row_codec::scalar_array_entry_len` を
@@ -3076,6 +3099,7 @@ fn validate_set_assignments(
             | (crate::catalog::ColumnType::Timestamp, _)
             | (crate::catalog::ColumnType::Time, _)
             | (crate::catalog::ColumnType::TimestampTz, _)
+            | (crate::catalog::ColumnType::Interval, _)
             | (crate::catalog::ColumnType::Array(_), _)
             | (crate::catalog::ColumnType::Bytea, _)
             | (crate::catalog::ColumnType::Json, _)

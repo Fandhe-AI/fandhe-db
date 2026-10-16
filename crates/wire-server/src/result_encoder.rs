@@ -713,7 +713,10 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Date
-        | ColumnType::Timestamp => false,
+        | ColumnType::Timestamp
+        // INTERVAL のバイナリ（OID 1186）は #1583 まで非対応（Issue #1579。暫定 OID 25 の
+        // text のまま値の意味が変わるバイナリを返さない fail-closed）。
+        | ColumnType::Interval => false,
     }
 }
 
@@ -761,6 +764,7 @@ fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeE
         | ColumnType::Date
         | ColumnType::Timestamp
         | ColumnType::TimestampTz
+        | ColumnType::Interval
         | ColumnType::Time => Ok(-1),
     }
 }
@@ -817,6 +821,9 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         engine::catalog::ColumnType::Time => WireType::Time,
         // TIMESTAMPTZ は timestamptz（OID 1184・typlen 8。TABLE-33・Issue #1577）。
         engine::catalog::ColumnType::TimestampTz => WireType::TimestampTz,
+        // INTERVAL は OID 1186 を #1583 で公告するまで暫定で text（OID 25）を公告し、値は
+        // `format_interval`（IntervalStyle=postgres）の文字列で送る（Issue #1579）。
+        engine::catalog::ColumnType::Interval => WireType::Text,
         engine::catalog::ColumnType::Bytea => WireType::Bytea,
         engine::catalog::ColumnType::Uuid => WireType::Uuid,
         engine::catalog::ColumnType::Json => WireType::Json,
@@ -987,6 +994,8 @@ fn cell_to_text(
         // セッション TimeZone（`tz`）の壁時計＋ offset 付き ISO 形式で整形する
         // （OID 1184 で公告。Issue #1574・#1575・#1577。UTC のセッションでは `+00`）。
         Cell::TimestampTz(micros) => Ok(Some(engine::datetime::format_timestamptz(*micros, tz))),
+        // INTERVAL は `IntervalStyle=postgres` の整形（OID は暫定で text。Issue #1579・#1583）。
+        Cell::Interval(v) => Ok(Some(engine::datetime::format_interval(v))),
         Cell::Array(array_value) => Ok(Some(pg_array_text(array_value))),
         // `BYTEA` のテキスト表現は PostgreSQL 既定の `bytea_output=hex`（`\x` ＋
         // 小文字 16 進）と同形にする（B5・Issue #886）。
@@ -3308,6 +3317,31 @@ mod tests {
         one_computed_binary(T::Bpchar(5), Cell::Text("ab  ".to_string()), &mut a).unwrap();
         one_computed_binary(T::Text, Cell::Text("ab  ".to_string()), &mut b).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// Issue #1579: INTERVAL は #1583 まで暫定で text（OID 25）を公告し、値は postgres 形式の
+    /// 文字列で出す。バイナリは非対応（fail-closed）。
+    #[test]
+    fn interval_column_is_advertised_as_text_without_binary_support() {
+        use engine::catalog::ColumnType;
+        let meta = ColumnMeta::Scalar {
+            name: "i".to_string(),
+            ty: ColumnType::Interval,
+        };
+        assert_eq!(column_wire_type(&meta), WireType::Text);
+        assert_eq!(column_wire_type(&meta).oid(), 25);
+        assert!(!column_binary_support(&meta));
+        let cell = Cell::Interval(engine::datetime::Interval {
+            months: 14,
+            days: -1,
+            micros: 7_200_000_000,
+        });
+        assert_eq!(
+            cell_to_text_for_column(&meta, &cell)
+                .expect("text")
+                .as_deref(),
+            Some("1 year 2 mons -1 days +02:00:00")
+        );
     }
 
     /// Issue #1577: TIMESTAMPTZ は timestamptz（OID 1184・typlen 8）を公告し、text は UTC の

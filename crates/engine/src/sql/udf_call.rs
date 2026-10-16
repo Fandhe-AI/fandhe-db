@@ -3004,6 +3004,11 @@ pub(super) fn bind_expr_any(
                         BoundExpr::TimestampTzColumnRef { index },
                         ExprType::TimestampTz,
                     )),
+                    // `INTERVAL` 列の式内参照は `ExprType::Interval` と算術（#1581）まで fail-closed
+                    // （Issue #1579）。
+                    ColumnType::Interval => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (INTERVAL columns are not supported yet)"
+                    ))),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (ARRAY columns are not supported)"
                     ))),
@@ -4074,6 +4079,7 @@ fn column_type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Timestamp => "timestamp",
         ColumnType::Time => "time",
         ColumnType::TimestampTz => "timestamp with time zone",
+        ColumnType::Interval => "interval",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",

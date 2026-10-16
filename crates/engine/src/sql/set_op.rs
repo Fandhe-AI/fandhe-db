@@ -123,6 +123,7 @@ fn cell_payload_bytes(cell: &Cell) -> usize {
         | Cell::Timestamp(_)
         | Cell::Time(_)
         | Cell::TimestampTz(_)
+        | Cell::Interval(_)
         | Cell::Uuid(_) => 0,
     }
 }
@@ -257,6 +258,13 @@ fn check_branch_type_compatibility(
     l_has_vector: bool,
     r_has_vector: bool,
 ) -> Result<(), SqlSurfaceError> {
+    // `INTERVAL` 列は正規化比較（#1580）まで集合演算の対象外（`0A000`。fail-closed。
+    // Issue #1579）。UNION ALL も含め、重複除去の行キー化に到達させない。
+    if columns_have_interval(l_columns) || columns_have_interval(r_columns) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "INTERVAL columns cannot be used in set operations yet".to_string(),
+        });
+    }
     if l_columns.len() != r_columns.len() {
         return Err(SqlSurfaceError::datatype_mismatch(format!(
             "column count mismatch: {} vs {}",
@@ -278,6 +286,22 @@ fn check_branch_type_compatibility(
         ));
     }
     Ok(())
+}
+
+/// 列メタデータに `INTERVAL` 列が含まれるか（集合演算の fail-closed 判定。Issue #1579）。
+fn columns_have_interval(columns: &[ColumnMeta]) -> bool {
+    columns.iter().any(|c| {
+        matches!(
+            c,
+            ColumnMeta::Scalar {
+                ty: ColumnType::Interval,
+                ..
+            } | ColumnMeta::Computed {
+                ty: Some(ColumnType::Interval),
+                ..
+            }
+        )
+    })
 }
 
 fn columns_have_vector(columns: &[ColumnMeta]) -> bool {
@@ -415,6 +439,13 @@ fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
                 out.push(14);
                 out.extend_from_slice(&t.to_be_bytes());
             }
+            // `INTERVAL` は `check_branch_type_compatibility` が `0A000` で事前に拒否する
+            // ため到達しない。破損状態を防御的に拒否する（fail-closed。Issue #1579）。
+            Cell::Interval(_) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "INTERVAL column reached set operation row key encoding".to_string(),
+                });
+            }
             // §2.2 の型検証（重複除去を伴う演算からの `VECTOR` 列排除）で本来
             // 到達しない。破損状態を防御的に拒否する（fail-closed。XX000）。
             Cell::Vector(_) => {
@@ -485,6 +516,8 @@ fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
             Cell::Time(_) => 1 + 8,
             // 型タグ 1 byte ＋ `i64` の 8 byte（`row_key` の `Cell::TimestampTz`。Issue #1576）。
             Cell::TimestampTz(_) => 1 + 8,
+            // `row_key` が拒否する（到達しない）ため寸法は 0。
+            Cell::Interval(_) => 0,
             // §2.2 の型検証で本来到達しない（`row_key` と同じ防御的拒否）。
             Cell::Vector(_) => {
                 return Err(SqlSurfaceError::Internal {

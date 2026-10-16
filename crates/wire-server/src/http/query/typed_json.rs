@@ -412,6 +412,10 @@ pub fn map_json_to_literal(
                 "TIMESTAMPTZ column value must be a JSON string",
             )),
         },
+        // INTERVAL の型束縛は #1583 まで拒否する（fail-closed。Issue #1579）。
+        ColumnType::Interval => Err(TypedJsonError::TypeMismatch(
+            "INTERVAL column is not supported on the NoSQL surface yet",
+        )),
         // SMALLINT は INTEGER／BIGINT と同じ規則で束縛し、範囲検査は engine の
         // `bind_integer_literal` に一本化する（TABLE-30・NOSQL-17・Issue #1561）。
         ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => match raw {
@@ -630,6 +634,18 @@ mod tests {
             assert!(matches!(err, TypedJsonError::TypeMismatch(_)));
             assert_eq!(err.wire_code(), "42601");
         }
+    }
+
+    /// INTERVAL の型束縛は #1583 まで `42601` で拒否する（Issue #1579）。
+    #[test]
+    fn interval_column_is_rejected_on_the_nosql_surface() {
+        let err = map_json_to_literal(
+            &col(ColumnType::Interval),
+            &JsonValue::String("1 day".to_string()),
+        )
+        .expect_err("reject");
+        assert!(matches!(err, TypedJsonError::TypeMismatch(_)));
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]

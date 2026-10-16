@@ -1105,6 +1105,9 @@ pub(crate) fn add_column_default(
         // TIMESTAMPTZ の既定値は文字列リテラルの原文を保持し、解釈は束縛時
         // （`parser::bind_column_default`）に行う（Issue #1574）。
         ColumnType::TimestampTz => "timestamptz",
+        // INTERVAL の既定値も文字列リテラルの原文を保持し、解釈は束縛時
+        // （`parser::bind_column_default`）に行う（Issue #1579）。
+        ColumnType::Interval => "interval",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
         ColumnType::Bytea => "bytea",
@@ -1176,6 +1179,7 @@ pub(crate) fn add_column_default(
                 || kind == "timestamp"
                 || kind == "time"
                 || kind == "timestamptz"
+                || kind == "interval"
                 || kind == "uuid"
                 || kind == "enum"
                 || kind == "json" =>

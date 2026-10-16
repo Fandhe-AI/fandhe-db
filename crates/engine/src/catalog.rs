@@ -471,7 +471,7 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
     Ok(())
 }
 
-/// スカラー索引宣言が対象にできる列型。`VECTOR`・`BOOLEAN`／`JSON(B)`／`ARRAY` は
+/// スカラー索引宣言が対象にできる列型。`VECTOR`・`BOOLEAN`／`JSON(B)`／`ARRAY`／`INTERVAL`（#1580 で解禁）は
 /// 索引化に効かない宣言を作らないため fail-closed に拒否する。`BYTEA` は自動・
 /// 宣言とも `OrderedColumnIndex::Bytes` で索引化されるため受理する（#1257・#1362、INDEX-7）。
 /// 数値 4 型（INTEGER／BIGINT／REAL／DOUBLE PRECISION）もレーン A（#1359）で自動・
@@ -1384,6 +1384,8 @@ const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &[
     "timetz",
     // Issue #1574（TABLE-33）。`TIMESTAMPTZ` は型名解決表の語。
     "timestamptz",
+    // Issue #1579（TABLE-34）。`INTERVAL` は型名解決表の語。
+    "interval",
 ];
 
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、
@@ -1853,6 +1855,11 @@ pub enum ColumnType {
     /// `timestamptz`・param は `-` 固定。値の解析・整形は [`crate::datetime`] へ委譲する。
     /// 述語・集計・二次索引・式内参照は Issue #1576 で解禁済み。PK・UNIQUE・FK・JOIN キーは担当 Issue 未定のため fail-closed。
     TimestampTz,
+    /// 期間列（`INTERVAL`、TABLE-34・Issue #1579）。内部表現は月（`i32`）・日（`i32`）・
+    /// マイクロ秒（`i64`）の三要素で、行ペイロードは presence 込み 17 バイト。カタログタグは
+    /// `interval`・param は `-` 固定。値の解析・整形は [`crate::datetime`] へ委譲する。
+    /// PK・UNIQUE・索引・述語・集計・式は #1580・#1581 まで fail-closed。
+    Interval,
     /// 可変長の同型スカラー配列列（`<スカラー型>[]`、TABLE-14・TASK-198、Issue #888）。
     /// 要素型・要素数上限は [`ArrayType`] が保持する。検索経路（KNN・hybrid・ANN・
     /// 二次索引・`EXPLAIN`）からは一貫して非対象として除外する（`VECTOR` 列との
@@ -2063,6 +2070,8 @@ impl ColumnType {
             ColumnType::Time => 0,
             // `TimestampTz` も PK／UNIQUE 非許可（Issue #1574。担当 Issue 未定の fail-closed）。
             ColumnType::TimestampTz => 0,
+            // `Interval` も PK／UNIQUE 非許可（Issue #1579。担当 Issue 未定の fail-closed）。
+            ColumnType::Interval => 0,
             ColumnType::Bytea => 7,
             ColumnType::Uuid => 8,
             ColumnType::Enum(_) => 9,
@@ -2102,6 +2111,7 @@ impl ColumnType {
             ColumnType::Timestamp => ("timestamp", "-".to_string()),
             ColumnType::Time => ("time", "-".to_string()),
             ColumnType::TimestampTz => ("timestamptz", "-".to_string()),
+            ColumnType::Interval => ("interval", "-".to_string()),
             ColumnType::Array(array_ty) => ("array", array_ty.catalog_param()),
             ColumnType::Bytea => ("bytea", "-".to_string()),
             ColumnType::Json => ("json", "-".to_string()),
@@ -2238,6 +2248,14 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::TimestampTz)
+            }
+            "interval" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "interval column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Interval)
             }
             "array" => Ok(ColumnType::Array(parse_array_param(param, resolve_enum)?)),
             "bytea" => {
@@ -3562,6 +3580,7 @@ impl ColumnDefault {
                     | ColumnType::Timestamp
                     | ColumnType::Time
                     | ColumnType::TimestampTz
+                    | ColumnType::Interval
                     | ColumnType::Uuid
                     | ColumnType::Enum(_)
                     | ColumnType::Json
@@ -4543,6 +4562,7 @@ impl TableSchema {
             | ColumnType::Timestamp
             | ColumnType::Time
             | ColumnType::TimestampTz
+            | ColumnType::Interval
             | ColumnType::Bytea
             | ColumnType::Json
             | ColumnType::Jsonb

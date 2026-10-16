@@ -1454,9 +1454,12 @@ impl ScalarIndex {
                 // 前方一致・範囲述語を持たないため同じく非索引化（判断根拠は
                 // `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
                 // `VECTOR` 列も従来どおり索引対象外。
+                // `INTERVAL` 列も等価・範囲述語を持たない（正規化比較は #1580）ため非索引化
+                // （Issue #1579）。
                 ColumnType::Vector(_)
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
+                | ColumnType::Interval
                 | ColumnType::Json
                 | ColumnType::Jsonb => {
                     per_column.push(None);

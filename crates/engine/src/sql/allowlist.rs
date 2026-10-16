@@ -65,6 +65,7 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "TIME",
     "TIMETZ",
     "TIMESTAMPTZ",
+    "INTERVAL",
     "BYTEA",
     "JSON",
     "JSONB",
@@ -585,6 +586,9 @@ pub enum SqlSurfaceError {
     /// TABLE-13・ERR-6、Issue #1187）。`22007`
     /// （[`crate::error_format::ErrorClass::InvalidDatetimeFormat`]）。
     InvalidDatetimeFormat { detail: String },
+    /// `INTERVAL` リテラルのフィールド値が範囲外（TABLE-34・Issue #1579）。`22015`
+    /// （[`crate::error_format::ErrorClass::IntervalFieldOverflow`]）。
+    IntervalFieldOverflow { detail: String },
     /// 構文上受理された値が、宣言済み型の表現として不正（TABLE-14・TASK-198、
     /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）に
     /// 加え、UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）の厳密文法違反
@@ -987,6 +991,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `sql::parser::bind_datetime_literal`（TABLE-34・Issue #1579）が
+    /// `INTERVAL` リテラルのフィールド値の範囲外を報告するために使う。
+    pub(crate) fn interval_field_overflow(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::IntervalFieldOverflow {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::parser::bind_enum_literal`（Issue #890）が ENUM 列の
     /// 語彙外ラベルを報告するために使う。エラーメッセージには語彙の一覧を
     /// 含めない（型名とクライアント自身の入力値のみ。security.md P0）。
@@ -1104,6 +1116,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::NullValueNotAllowed { .. } => ErrorClass::NullValueNotAllowed,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidDatetimeFormat { .. } => ErrorClass::InvalidDatetimeFormat,
+            SqlSurfaceError::IntervalFieldOverflow { .. } => ErrorClass::IntervalFieldOverflow,
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
                 ErrorClass::InvalidTextRepresentation
             }
@@ -1224,6 +1237,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::InvalidDatetimeFormat { detail } => {
                 write!(f, "invalid datetime format: {detail}")
+            }
+            SqlSurfaceError::IntervalFieldOverflow { detail } => {
+                write!(f, "interval field overflow: {detail}")
             }
             SqlSurfaceError::InvalidTextRepresentation { detail } => {
                 write!(f, "invalid text representation: {detail}")
@@ -14707,7 +14723,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// 列型キーワード判定は型名エイリアスと未確定型を含む 30 語を大小無視で認識する
+    /// 列型キーワード判定は型名エイリアスと未確定型を含む 31 語を大小無視で認識する
     /// （Issue #1529・TABLE-29。Issue #1569 で `TIME`・`TIMETZ`、Issue #1574 で `TIMESTAMPTZ` を追加）。
     #[test]
     fn column_type_keyword_covers_aliases_case_insensitively() {
@@ -14715,7 +14731,7 @@ mod tests {
             assert!(is_column_type_keyword(kw), "{kw}");
             assert!(is_column_type_keyword(&kw.to_ascii_lowercase()), "{kw}");
         }
-        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 30);
+        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 31);
         for ok in ["Int4", "iNt8", "float4", "FLOAT8", "int", "int2", "varchar"] {
             assert!(is_column_type_keyword(ok), "{ok}");
         }

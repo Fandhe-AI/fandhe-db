@@ -204,3 +204,18 @@ TABLE-33・WIRE-13・WIRE-14・NOSQL-13・NOSQL-17 のポインタ。#1574 の�
 - **wire**: OID 1184・typlen 8 で公告し、バイナリ結果・バイナリ param に対応（詳細は [wire-binary-format.md](wire-binary-format.md)）。テキスト出力はセッション TimeZone で整形する（#1575）。
 - **NoSQL**: insert／update は JSON 文字列を束縛し（数値・真偽値は `42601`）、書式・範囲・TZ 名の検査は engine の `parse_timestamptz`（`22007`／`22008`／`22023`）に委ねる。`create_table`／`add_column` の型名 `"timestamptz"` を受理する。
 - **対象外**: NoSQL filter・述語（#1576 の後）、`timestamptz[]`（OID 1185）、COPY バイナリ、特殊値 `infinity`。
+
+## Issue #1579 追記: INTERVAL 列型
+
+`INTERVAL` を独立の `ColumnType::Interval` として追加した（TABLE-34・親 #1578 のポインタ。第 1 段。型の格納表現と入出力の書式だけを用意し、比較・算術・EXTRACT・wire OID は後続 Issue が担う）。
+
+- **内部表現**: 月（`i32`）・日（`i32`）・マイクロ秒（`i64`）の三要素 `datetime::Interval`。三要素は独立で、`1 mon` と `30 days`、`24 hours` と `1 day` は別の格納値になる（正規化比較は #1580）。`PartialEq` は生の三要素の一致。値は `Value::Interval`／`ScalarRef::Interval`／`Cell::Interval`。カタログタグは `interval`（`param` は `-` 固定）。行ペイロードは presence(1) ＋ micros(8, LE) ＋ days(4, LE) ＋ months(4, LE) の 17 バイト。`content_hash` のタグは 18（正規化しない生の三要素をハッシュする）。
+- **無限大の番兵**: PostgreSQL 17 の予約値 `(i32::MAX, i32::MAX, i64::MAX)`・`(i32::MIN, i32::MIN, i64::MIN)` は有効な値として受理しない。入力 `infinity`／`-infinity` は `0A000`、解析結果が番兵と一致した場合は `22008`。encode・decode・scan・`tenant::validate_set_assignments` で多層に拒否する（将来 infinity を解禁しても番兵の意味が衝突しない）。
+- **閉じた文法**（`datetime::parse_interval`。長さ上限 255 バイト、フィールド数上限 25、ASCII のみ、前後の空白と大小文字は許容）: (a) 単位句 `[@] 要素… [ago]`（要素は符号付き数値＋単位、または時刻部 `[±]H+:MM[:SS[.f]]`。単位なしの数値は秒、直後が時刻部なら日）、(b) SQL 標準形 `Y-M`・`D H:MM:SS`、(c) ISO 8601（記号形式 `P1Y2M3DT4H5M6S`、代替形式 `P0001-02-03T04:05:06`。`P`・単位は大文字）。単位の綴りは `microsecond(s)`・`us`・`msec`・`second(s)`・`sec`・`minute(s)`・`min`・`hour(s)`・`hr`・`day(s)`・`week(s)`・`month(s)`・`mon`・`year(s)`・`yr`・`decade(s)`・`century/centuries`・`millennium/millennia` などを受理する。
+- **端数の繰り下げ**: PG17 と同じ規則。年・decade・century・millennium の端数は整数月へ偶数丸めし、残余は日へ繰り下げない。月の端数は 30 日単位で日へ、日の端数は µs へ（偶数丸め）。例: `1.5 years` は `1 year 6 mons`、`0.1 years` は `1 mon`、`1.5 months` は `1 mon 15 days`、`1.5 days` は `1 day 12:00:00`。累積は `years`・`months`・`days`（`i32`）と `micros`（`i64`）の中間値に `checked_*` で積み、最後に `年×12＋月` を合成する。
+- **SQLSTATE**: 書式違反 `22007`、フィールド値の範囲外（数値が `i64` に収まらない・単位換算や累積があふれる）`22015`（`ErrorClass::IntervalFieldOverflow` を新設）、合成後の範囲外・番兵一致 `22008`、`infinity` `0A000`。detail は静的文字列で入力を反射しない。
+- **整形**: `format_interval` は `IntervalStyle=postgres`（`EncodeInterval` と同じ規則）。年・月・日を順に `N year(s)`・`N mon(s)`・`N day(s)`（単数形は値が 1 のときだけ）、直前が負で今が正のときだけ `+` を付ける。時刻部は `HH:MM:SS[.ffffff]`（端数の末尾の 0 は削る。時は 2 桁以上）で、全要素 0 なら `00:00:00`。`parse_interval(format_interval(v)) == v` が番兵以外の全域で成り立つ。
+- **型名**: `INTERVAL`（綴りを保持する別名として返し、同名 ENUM との衝突を実行段が検出する）。`interval` は `CREATE_ONLY_RESERVED_TYPE_NAMES` に追加した。`INTERVAL(p)`・フィールド制限付き（`INTERVAL YEAR TO MONTH` 等）・`interval[]` は構文段で `0A000`。
+- **暫定挙動（fail-closed）**: 受理するのは DDL の列宣言、INSERT／UPDATE SET／UPSERT／COPY FROM／列 DEFAULT（文字列リテラル）、投影・RETURNING・COPY TO の整形、`IS NULL`。述語（`IS NULL` 以外）・ORDER BY・GROUP BY・集計・`COUNT(DISTINCT)`・window・集合演算・サブクエリの値族・scoring_boost は #1580 まで拒否する（`CREATE INDEX` による索引宣言も #1580 まで拒否する）。式中の列参照・型付きリテラル `INTERVAL '...'`・算術は #1581 まで拒否する。wire は暫定で text（OID 25）を公告し値は `format_interval` の文字列で出す。バイナリの結果列・パラメータは非対応、NoSQL の型束縛と filter は `42601`（JSON 応答の型名は `"interval"`）。いずれも #1583。PK／UNIQUE／FK・JOIN キー・`ALTER COLUMN TYPE`・ファイル形 INSERT は担当 Issue 未定のため既存の拒否コードで止める。
+- **PostgreSQL との乖離**: (1) `infinity`／`-infinity` は未対応。(2) 単位語の「先頭 10 文字で照合する」癖は再現しない（完全一致のみ）。(3) `INTERVAL(p)` とフィールド制限は `0A000`。(4) `IntervalStyle` は `postgres` 固定（`SET IntervalStyle`・ParameterStatus は対象外）。
+- **対象外**: 比較・正規化・集計・索引（#1580）、`ExprType::Interval`・算術・型付きリテラル式（#1581）、EXTRACT／date_part（#1582）、OID 1186・バイナリ・NoSQL（#1583）、フィールド修飾子付きのリテラル（`'1' DAY`）、`interval[]`（OID 1187）、PK／UNIQUE／FK・JOIN キー・型変更（担当未定）。

@@ -84,6 +84,7 @@ pub(crate) fn to_static_column_type_with_array_default(
         SqlColumnTypeName::Timestamp => ColumnType::Timestamp,
         SqlColumnTypeName::Time => ColumnType::Time,
         SqlColumnTypeName::TimestampTz => ColumnType::TimestampTz,
+        SqlColumnTypeName::Interval => ColumnType::Interval,
         SqlColumnTypeName::Bytea => ColumnType::Bytea,
         SqlColumnTypeName::Json => ColumnType::Json,
         SqlColumnTypeName::Jsonb => ColumnType::Jsonb,
@@ -135,7 +136,8 @@ pub(crate) fn to_static_column_type_with_array_default(
                 ColumnType::Timestamp => ArrayElemType::Timestamp,
                 // `time[]` は別 OID（1183）のため拒否する（Issue #1569。`smallint[]` と同じ理由）。
                 // `timestamptz[]` も別 OID（1185）のため拒否する（Issue #1574）。
-                ColumnType::Time | ColumnType::TimestampTz => {
+                // `interval[]` も別 OID（1187）のため拒否する（Issue #1579）。
+                ColumnType::Time | ColumnType::TimestampTz | ColumnType::Interval => {
                     return Err(SqlSurfaceError::FeatureNotSupported {
                         detail: "this array element type is not supported yet".to_string(),
                     })
@@ -216,6 +218,9 @@ pub enum SqlColumnTypeName {
     /// `TIMESTAMPTZ`／`TIMESTAMP WITH TIME ZONE`（TABLE-33・Issue #1574）。`TIMESTAMPTZ(p)`・
     /// `TIMESTAMP(p) WITH TIME ZONE`・配列は構文段で `0A000` のため精度付きには到達しない。
     TimestampTz,
+    /// `INTERVAL`（TABLE-34・Issue #1579）。`INTERVAL(p)`・フィールド制限付き
+    /// （`INTERVAL YEAR TO MONTH` 等）・配列は構文段で `0A000` のため修飾付きには到達しない。
+    Interval,
     Bytea,
     Json,
     Jsonb,
@@ -330,6 +335,10 @@ enum TypeNameKind {
     /// 既存 ENUM 名と衝突し得るため、実行段が検出する）。`TIMESTAMP WITH TIME ZONE` は
     /// 2 語形として [`TypeNameKind::Timestamp`] 側で解決する。
     TimestampTz,
+    /// `INTERVAL`（Issue #1579。TABLE-34）。`INTERVAL(p)` とフィールド制限付き（`YEAR`・`MONTH`・
+    /// `DAY`・`HOUR`・`MINUTE`・`SECOND` が続く形）は `0A000`。綴りを保持する別名として返す
+    /// （`interval` は既存 ENUM 名と衝突し得るため、実行段が検出する）。
+    Interval,
     /// `VECTOR(N)`。
     Vector,
     /// `NUMERIC(p,s)`／`DECIMAL(p,s)`。
@@ -376,6 +385,7 @@ const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
     ("TIMESTAMP", TypeNameKind::Timestamp),
     ("TIME", TypeNameKind::Time),
     ("TIMESTAMPTZ", TypeNameKind::TimestampTz),
+    ("INTERVAL", TypeNameKind::Interval),
     // `TIMETZ`（`TIME WITH TIME ZONE` の別綴り）は列型として未対応（Issue #1569）。
     (
         "TIMETZ",
@@ -522,6 +532,20 @@ fn parse_base_type_name(
                 return Err(unsettled_type_error("timestamptz(p)"));
             }
             Ok(alias_type(name, SqlColumnTypeName::TimestampTz))
+        }
+        TypeNameKind::Interval => {
+            match tokens.get(*pos) {
+                Some(Token::Punct('(')) => return Err(unsettled_type_error("interval(p)")),
+                Some(Token::Ident(s))
+                    if ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"]
+                        .iter()
+                        .any(|f| s.eq_ignore_ascii_case(f)) =>
+                {
+                    return Err(unsettled_type_error("interval with field restriction"));
+                }
+                _ => {}
+            }
+            Ok(alias_type(name, SqlColumnTypeName::Interval))
         }
         TypeNameKind::Time => {
             match tokens.get(*pos) {
