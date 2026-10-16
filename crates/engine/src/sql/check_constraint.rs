@@ -269,6 +269,11 @@ fn render_expr(expr: &Expr) -> String {
         Expr::TimestampLiteral(micros) => {
             format!("TIMESTAMP '{}'", crate::datetime::format_timestamp(*micros))
         }
+        // `INTERVAL` 型付きリテラル（Issue #1581）。三要素から正規形（`format_interval`）を
+        // 再構成し、原文を連結しない（再パースで同じ三要素に戻る）。
+        Expr::IntervalLiteral(v) => {
+            format!("INTERVAL '{}'", crate::datetime::format_interval(v))
+        }
         // `TIME` 型付きリテラル（Issue #1570）。`24:00:00` も `format_time` が往復できる形で返す。
         Expr::TimeLiteral(micros) => format!("TIME '{}'", crate::datetime::format_time(*micros)),
         // `TIMESTAMPTZ` 型付きリテラル（Issue #1576）。ゾーン無しの入力は定義時のセッション TZ で
@@ -555,6 +560,7 @@ fn referenced_column_names(
             }
             Expr::DateLiteral(_)
             | Expr::TimestampLiteral(_)
+            | Expr::IntervalLiteral(_)
             | Expr::TimeLiteral(_)
             | Expr::TimestampTzLiteral { .. } => {}
         }

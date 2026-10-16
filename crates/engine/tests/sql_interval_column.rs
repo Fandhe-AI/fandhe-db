@@ -6,7 +6,7 @@
 //! 書式違反を `22007`、フィールド値の範囲外を `22015`、合成後の範囲外を `22008`、`infinity` を
 //! `0A000` で拒否し副作用を残さないこと、(4) 未解禁の機能（述語・並べ替え・集計・索引・式・
 //! PK/UNIQUE・型変更・集合演算・配列・`INTERVAL(p)`・フィールド制限）が fail-closed に拒否される
-//! こと、(5) テナント境界が不変であること、を固定する。比較・集計・索引は #1580、式・算術は #1581、
+//! こと、(5) テナント境界が不変であること、を固定する。比較・集計・索引は #1580、式・算術は #1581（正の挙動は `sql_interval_arith.rs`）、
 //! EXTRACT は #1582、OID 1186・バイナリ・NoSQL は #1583 の担当。
 
 use engine::catalog::ColumnType;
@@ -373,7 +373,9 @@ fn other_tenants_cannot_see_interval_rows() {
 }
 
 /// 未解禁の機能は他型の腕へ黙って流さず fail-closed に拒否する（述語・並べ替え・集計・索引は
-/// #1580、式・算術・型付きリテラルは #1581。PK/UNIQUE・型変更は担当 Issue 未定）。
+/// #1580。式・算術・型付きリテラルの正の挙動は #1581 の `sql_interval_arith.rs` が固定し、ここには
+/// 今も拒否される形〔`INTERVAL + 数値`・FROM 付き SELECT 先頭の型付きリテラル〕だけを残す。
+/// PK/UNIQUE・型変更は担当 Issue 未定）。
 #[test]
 fn features_not_yet_enabled_are_rejected_fail_closed() {
     let (_p, _g, core) = open("iv-failclosed");
@@ -386,7 +388,6 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
         "SELECT id FROM t WHERE v BETWEEN '1 day' AND '2 days' LIMIT 5",
         "SELECT id FROM t WHERE v IS NOT DISTINCT FROM '1 day' LIMIT 5",
         "SELECT id, ROW_NUMBER() OVER (ORDER BY v) FROM t LIMIT 5",
-        "UPDATE t SET v = v WHERE id = 1 USING OPERATION_ID 'fx1'",
         "SELECT id FROM t ORDER BY v LIMIT 5",
         "SELECT COUNT(DISTINCT v) FROM t",
         "SELECT MIN(v) FROM t",

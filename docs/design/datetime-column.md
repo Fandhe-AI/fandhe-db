@@ -219,3 +219,15 @@ TABLE-33・WIRE-13・WIRE-14・NOSQL-13・NOSQL-17 のポインタ。#1574 の�
 - **暫定挙動（fail-closed）**: 受理するのは DDL の列宣言、INSERT／UPDATE SET／UPSERT／COPY FROM／列 DEFAULT（文字列リテラル）、投影・RETURNING・COPY TO の整形、`IS NULL`。述語（`IS NULL` 以外）・ORDER BY・GROUP BY・集計・`COUNT(DISTINCT)`・window・集合演算・サブクエリの値族・scoring_boost は #1580 まで拒否する（`CREATE INDEX` による索引宣言も #1580 まで拒否する）。式中の列参照・型付きリテラル `INTERVAL '...'`・算術は #1581 まで拒否する。wire は暫定で text（OID 25）を公告し値は `format_interval` の文字列で出す。バイナリの結果列・パラメータは非対応、NoSQL の型束縛と filter は `42601`（JSON 応答の型名は `"interval"`）。いずれも #1583。PK／UNIQUE／FK・JOIN キー・`ALTER COLUMN TYPE`・ファイル形 INSERT は担当 Issue 未定のため既存の拒否コードで止める。
 - **PostgreSQL との乖離**: (1) `infinity`／`-infinity` は未対応。(2) 単位語の「先頭 10 文字で照合する」癖は再現しない（完全一致のみ）。(3) `INTERVAL(p)` とフィールド制限は `0A000`。(4) `IntervalStyle` は `postgres` 固定（`SET IntervalStyle`・ParameterStatus は対象外）。
 - **対象外**: 比較・正規化・集計・索引（#1580）、`ExprType::Interval`・算術・型付きリテラル式（#1581）、EXTRACT／date_part（#1582）、OID 1186・バイナリ・NoSQL（#1583）、フィールド修飾子付きのリテラル（`'1' DAY`）、`interval[]`（OID 1187）、PK／UNIQUE／FK・JOIN キー・型変更（担当未定）。
+
+## Issue #1581 追記: 日付時刻と INTERVAL の加減算・乗除
+
+TABLE-34・親 #1578 のポインタ。#1579 の暫定状態（式中の INTERVAL 列参照・型付きリテラル・算術は拒否）を解消した。純関数は `sql/interval_arith.rs`、束縛は `udf_call::bind_binary`、評価は `eval_binary`（再帰評価と `expr_program` の双方が共有）。
+
+- **式の型**: `ExprType::Interval`／`ExprValue::Interval`／`BoundExpr::{Interval, IntervalColumnRef}`／`Expr::IntervalLiteral`。結果列型は `ColumnType::Interval`（wire は #1579 の暫定どおり text）。
+- **型規則**: `TIMESTAMP ± INTERVAL`・`INTERVAL + TIMESTAMP` は TIMESTAMP、`DATE ± INTERVAL` は TIMESTAMP（深夜 0 時へ昇格）、`TIMESTAMPTZ ± INTERVAL` は TIMESTAMPTZ（セッション TZ 依存のため CHECK では `0A000`）、`INTERVAL ± INTERVAL`・`INTERVAL * n`・`n * INTERVAL`・`INTERVAL / n` は INTERVAL、`TIMESTAMP(TZ) - TIMESTAMP(TZ)`（DATE・混在を含む）は INTERVAL、`DATE - DATE` は従来どおり日数。INTERVAL が絡む上記以外の組は `42883`、INTERVAL を伴わない既存の不一致（`TIMESTAMP + 1` 等）は従来どおり `42804`。
+- **意味論（PG17 準拠）**: 月 → 日 → 時刻の順に加算し、月加算後の日は新しい月の末日へ切り詰める（`2024-01-31 + 1 mon` は `2024-02-29`、`+ '1 mon 1 day'` は `2024-03-01`）。`TIMESTAMPTZ` はセッション TZ の壁時計で月・日を加算し UTC へ戻す（gap は直前の offset、fold は後の offset。#1576 と同じ）。減算は INTERVAL の各要素を符号反転して加算する（`i32::MIN`／`i64::MIN` は `22008`）。時点の差は日数と日内マイクロ秒に分け符号を揃える（`interval_justify_hours`）。乗除は PG17 の `interval_mul`／`interval_div` と同じ月 → 日 → 秒へのカスケード（端数は µs の偶数丸め）。
+- **SQLSTATE**: 結果・中間値が範囲外（PG の timestamp 範囲を超える中間値を含む）、INTERVAL の要素あふれ、乗除の NaN は `22008`（±∞ の係数は infinity の interval を要するため `0A000`）。0 除算は `22012`。エラー文言は固定の英語で値を含めない。
+- **#1580 との境界**: #1580（PR #2485）が未マージの状態で実装したため、INTERVAL 式の比較・`NULLIF`・`ORDER BY`・集計（SUM/AVG/MIN/MAX）・GROUP BY は `42883`／`0A000` の fail-closed のまま。#1580 のマージ後に正規化キー比較を式へ解禁する。
+- **既知の差分**: (1) 本 DB の TIMESTAMP 範囲は 0001〜9999 年のため、PG では成功する範囲外の結果が `22008` になる。(2) 型なし文字列 `'2024-01-31' + INTERVAL …` は本 DB では TEXT 扱いで `42883`（PG は interval として解釈し `22007` 等で失敗する。いずれも成功しない）。(3) 単項マイナス `-INTERVAL`・CAST（`::`）は文法に無い。(4) `INTERVAL '1' DAY` などのフィールド修飾子・`INTERVAL(p)` は `0A000`。(5) `TIME ± INTERVAL`・`TIME - TIME` は `42883`。(6) INTERVAL 式を `jsonb` へ変換する形は `0A000`。
+- **対象外**: `justify_*`／`age`／`make_interval`、EXTRACT／date_part／date_trunc の INTERVAL 対応（#1582）、OID 1186・バイナリ・NoSQL（#1583）、infinity の interval、`IntervalStyle` の切り替え。

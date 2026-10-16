@@ -1910,6 +1910,7 @@ fn collect_referenced_udfs(
         // Issue #920）は UDF 呼び出しを持たない葉。
         Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
         | Expr::TimeLiteral(_)
         | Expr::TimestampTzLiteral { .. } => Ok(()),
     }
@@ -2021,6 +2022,7 @@ fn push_set_expr(
             | Expr::Null
             | Expr::DateLiteral(_)
             | Expr::TimestampLiteral(_)
+            | Expr::IntervalLiteral(_)
             | Expr::TimeLiteral(_)
             | Expr::TimestampTzLiteral { .. }
             | Expr::ValueFunction { .. } => {}
@@ -2179,6 +2181,17 @@ fn push_dml_expr(
             b.push_u8(10);
             b.push_u8(2);
             b.push_raw(&micros.to_le_bytes());
+        }
+        // `INTERVAL` 型付きリテラル（Issue #1581・TABLE-34）。型バイト 5 に months（i32 LE）・
+        // days（i32 LE）・micros（i64 LE）を連結する。既存の型バイト 0〜4 とそれらのハッシュ値は不変。
+        // セッション TZ 依存の印は付けない: `TIMESTAMPTZ ± INTERVAL` の TZ 依存は、相手側の
+        // `TIMESTAMPTZ` リテラル（印を付ける）または `TIMESTAMPTZ` 列（schema 判定）が担う。
+        Expr::IntervalLiteral(v) => {
+            b.push_u8(10);
+            b.push_u8(5);
+            b.push_raw(&v.months.to_le_bytes());
+            b.push_raw(&v.days.to_le_bytes());
+            b.push_raw(&v.micros.to_le_bytes());
         }
         // `TIMESTAMPTZ` 型付きリテラル（Issue #1576）。型バイト 3 はゾーン指定済み（UTC 値）、
         // 4 はゾーン無し（壁時計）で、後者は解釈に使うセッション TimeZone 名を含めて、異なる TZ
@@ -5007,6 +5020,41 @@ mod tests {
                 Expr::TimestampLiteral(0),
             ),
             ("date value", Expr::DateLiteral(0), Expr::DateLiteral(1)),
+            (
+                "interval months vs days",
+                Expr::IntervalLiteral(crate::datetime::Interval {
+                    months: 1,
+                    days: 0,
+                    micros: 0,
+                }),
+                Expr::IntervalLiteral(crate::datetime::Interval {
+                    months: 0,
+                    days: 1,
+                    micros: 0,
+                }),
+            ),
+            (
+                "interval micros",
+                Expr::IntervalLiteral(crate::datetime::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: 1,
+                }),
+                Expr::IntervalLiteral(crate::datetime::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: 2,
+                }),
+            ),
+            (
+                "interval vs timestamp",
+                Expr::IntervalLiteral(crate::datetime::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: 0,
+                }),
+                Expr::TimestampLiteral(0),
+            ),
             (
                 "case when order",
                 Expr::Case {

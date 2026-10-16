@@ -933,6 +933,7 @@ fn build_projected_cells(
                     ExprValue::Timestamp(t) => cells.push(Cell::Timestamp(t)),
                     ExprValue::Time(t) => cells.push(Cell::Time(t)),
                     ExprValue::TimestampTz(t) => cells.push(Cell::TimestampTz(t)),
+                    ExprValue::Interval(v) => cells.push(Cell::Interval(v)),
                     // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有
                     // 契約: NULL は `Cell::Null` へ写像する。
                     ExprValue::Null => cells.push(Cell::Null),

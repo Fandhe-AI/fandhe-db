@@ -2266,6 +2266,7 @@ fn expr_value_to_cell(
         ExprValue::Timestamp(t) => Cell::Timestamp(t),
         ExprValue::Time(t) => Cell::Time(t),
         ExprValue::TimestampTz(t) => Cell::TimestampTz(t),
+        ExprValue::Interval(v) => Cell::Interval(v),
         ExprValue::Null => Cell::Null,
         ExprValue::Json(_) | ExprValue::JsonText(_) => {
             return Err(accumulator_bug(

@@ -9,6 +9,13 @@
 
 ### Breaking Changes
 
+- 日付時刻と INTERVAL の加減算・乗除（Issue #1581・TABLE-34）に伴う公開 API の変更:
+  公開 enum `engine::sql::udf_call::Expr` に `IntervalLiteral(Interval)`、`BoundExpr` に
+  `Interval`・`IntervalColumnRef`、`ExprType`／`ExprValue` に `Interval` を追加した
+  （既存の網羅的 `match` はアームの追加が必要）。従来 `42804` か「列を式で使えない」
+  エラーだった `TIMESTAMP ± INTERVAL`・`DATE ± INTERVAL`・`INTERVAL * n`・
+  `TIMESTAMP - TIMESTAMP` などの INTERVAL 算術と、INTERVAL 列の式内参照・型付きリテラル
+  `INTERVAL '…'` が受理に変わる。INTERVAL が絡む未対応の演算子の組は `42883` で拒否する。
 - `AT TIME ZONE`・TIMESTAMPTZ の変換と問い合わせ（Issue #1576・TABLE-33）に伴う公開 API の変更:
   公開 enum `engine::sql::udf_call::Expr` に `TimestampTzLiteral { micros, session_local }`、
   `BoundExpr` に `TimestampTz`・`TimestampTzColumnRef`、`ExprType`／`ExprValue` に `TimestampTz`、

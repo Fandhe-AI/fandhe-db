@@ -6169,6 +6169,11 @@ fn resolve_aggregate_input(
                 | ExprType::JsonText => Err(SqlSurfaceError::invalid_input(
                     "aggregate argument must evaluate to a scalar",
                 )),
+                // INTERVAL 式の集計は未対応（Issue #1581 の対象外。列の集計・比較は #1580）。
+                ExprType::Interval => Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "aggregates over INTERVAL expressions are not supported yet"
+                        .to_string(),
+                }),
             }
         }
     }
@@ -6292,6 +6297,11 @@ fn resolve_count_distinct_input(
                 | ExprType::JsonText => Err(SqlSurfaceError::invalid_input(
                     "aggregate argument must evaluate to a scalar",
                 )),
+                // INTERVAL 式の集計は未対応（Issue #1581 の対象外。列の集計・比較は #1580）。
+                ExprType::Interval => Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "aggregates over INTERVAL expressions are not supported yet"
+                        .to_string(),
+                }),
             }
         }
     }
@@ -6785,6 +6795,10 @@ fn order_kind_for_expr_type(
         ExprType::Vector => Err(SqlSurfaceError::invalid_input(
             "unsupported ORDER BY expression type: VECTOR",
         )),
+        // INTERVAL 式の並べ替えは未対応（Issue #1581 の対象外。正規化キーの比較は #1580）。
+        ExprType::Interval => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "ORDER BY an INTERVAL expression is not supported yet".to_string(),
+        }),
         // Issue #1597・TABLE-25: jsonb 式はソートキー（バイト列順）で並べ替える。
         ExprType::Json => Ok(OrderKind::Jsonb),
         // `json`（原文保存）には順序演算子が無い（Issue #2180。PostgreSQL と同じ `42883`）。
@@ -7473,6 +7487,7 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
         // Issue #920）は列識別子を参照しない。
         Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
         | Expr::TimeLiteral(_)
         | Expr::TimestampTzLiteral { .. } => {}
     }
@@ -8076,6 +8091,7 @@ fn rewrite_group_row_idents(
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
         | Expr::TimeLiteral(_)
         | Expr::TimestampTzLiteral { .. }
         | Expr::ValueFunction { .. } => expr.clone(),

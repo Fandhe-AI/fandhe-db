@@ -3502,6 +3502,7 @@ fn project_rows(
                         udf_call::ExprValue::Timestamp(t) => cells.push(Cell::Timestamp(t)),
                         udf_call::ExprValue::Time(t) => cells.push(Cell::Time(t)),
                         udf_call::ExprValue::TimestampTz(t) => cells.push(Cell::TimestampTz(t)),
+                        udf_call::ExprValue::Interval(v) => cells.push(Cell::Interval(v)),
                         // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有
                         // 契約: NULL は `Cell::Null` へ写像する。
                         udf_call::ExprValue::Null => cells.push(Cell::Null),

@@ -10,6 +10,9 @@
 //! `sql::udf_call::bind_call` が束縛時に一度だけ行い、行ループでは払い出し済みの
 //! enum のみを扱う（行ごとの文字列比較を避ける設計。§2-4 参照）。
 //!
+//! `TIMESTAMP`／`TIMESTAMPTZ` と `INTERVAL` の加減算・差分は `crate::sql::interval_arith`（TABLE-34。
+//! Issue #1581）が担い、本モジュールは `DATE ± n` の日数算術だけを持つ。
+//!
 //! `TIME` 入力（Issue #1570）は [`time_part`] が担う。`date_part` は暦計算で日付境界へ
 //! 折り返す（`24:00:00` が hour=0 になる）ため流用せず、0 時起点のマイクロ秒をそのまま分解する。
 //!

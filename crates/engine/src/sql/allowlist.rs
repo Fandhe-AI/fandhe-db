@@ -6303,6 +6303,76 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            // `INTERVAL '<literal>'`（型付きリテラル。TABLE-34・Issue #1581）。列名 `interval` は
+            // 直後が文字列リテラルのときだけ型付きリテラルとして扱うため壊れない。解析は
+            // `crate::datetime::parse_interval`（長さ上限・ASCII 限定・フィールド数上限あり）に
+            // 限り、AST には解析済みの三要素だけを保持する。フィールド修飾子
+            // （`INTERVAL '1' DAY` 等）と精度指定（`INTERVAL(p) '…'`）は意味論（単位の解釈・
+            // 丸め）が未対応のため、別名として黙って解釈せず `0A000` で拒否する。
+            Some(Token::Ident(name))
+                if name.eq_ignore_ascii_case("INTERVAL")
+                    && !self.quoted_null.contains(&self.pos)
+                    && matches!(
+                        (
+                            self.tokens.get(self.pos + 1),
+                            self.tokens.get(self.pos + 2),
+                            self.tokens.get(self.pos + 3),
+                            self.tokens.get(self.pos + 4),
+                        ),
+                        (Some(Token::StringLiteral(_)), _, _, _)
+                            | (
+                                Some(Token::Punct('(')),
+                                Some(Token::Number(_)),
+                                Some(Token::Punct(')')),
+                                Some(Token::StringLiteral(_)),
+                            )
+                    ) =>
+            {
+                if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('('))) {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "INTERVAL precision is not supported yet".to_string(),
+                    });
+                }
+                if let Some(Token::Ident(q)) = self.tokens.get(self.pos + 2) {
+                    if !self.quoted_null.contains(&(self.pos + 2))
+                        && ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"]
+                            .iter()
+                            .any(|f| q.eq_ignore_ascii_case(f))
+                    {
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "INTERVAL field qualifiers are not supported yet".to_string(),
+                        });
+                    }
+                }
+                self.advance();
+                let literal = match self.advance() {
+                    Some(Token::StringLiteral(s)) => s.clone(),
+                    other => {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "expected string literal after INTERVAL, got {other:?}"
+                        )))
+                    }
+                };
+                self.consume_expr_node()?;
+                use crate::datetime::IntervalLiteralError;
+                match crate::datetime::parse_interval(&literal) {
+                    Ok(v) => Ok(Expr::IntervalLiteral(v)),
+                    Err(IntervalLiteralError::Format(detail)) => {
+                        Err(SqlSurfaceError::invalid_datetime_format(detail))
+                    }
+                    Err(e @ IntervalLiteralError::FieldOverflow) => {
+                        Err(SqlSurfaceError::interval_field_overflow(e.to_string()))
+                    }
+                    Err(e @ IntervalLiteralError::OutOfRange) => {
+                        Err(SqlSurfaceError::datetime_field_overflow(e.to_string()))
+                    }
+                    Err(IntervalLiteralError::Infinity) => {
+                        Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "infinite interval values are not supported yet".to_string(),
+                        })
+                    }
+                }
+            }
             Some(Token::Ident(name))
                 if (name.eq_ignore_ascii_case("DATE")
                     || name.eq_ignore_ascii_case("TIMESTAMP")
@@ -12178,6 +12248,7 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
         | Expr::TimeLiteral(_)
         | Expr::TimestampTzLiteral { .. } => false,
         // 括弧なし値関数（Issue #1586）は関数呼び出しと同様に従来形では書けない式。
