@@ -740,7 +740,9 @@ fn post_auth_loop<'e, S: WireStream>(
                 // 適用していた契約をそのまま維持）。
                 match (engine, txn.as_mut()) {
                     (Some(engine), Some(txn)) => {
-                        match crate::extended_query::handle_parse(stream, engine, txn, extended)? {
+                        match crate::extended_query::handle_parse(
+                            stream, engine, session, txn, extended,
+                        )? {
                             crate::extended_query::LoopSignal::Continue => {}
                             crate::extended_query::LoopSignal::Closed => return Ok(()),
                         }

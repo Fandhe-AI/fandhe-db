@@ -234,6 +234,9 @@ pub(crate) fn extract_order_value_ref<'a>(
         (ColumnType::Date, OrderKind::SignedInt, row_codec::ScalarRef::Date(v)) => {
             Ok(Some(ScalarKeyRef::SignedInt(i64::from(*v))))
         }
+        (ColumnType::TimestampTz, OrderKind::SignedInt, row_codec::ScalarRef::TimestampTz(v)) => {
+            Ok(Some(ScalarKeyRef::SignedInt(*v)))
+        }
         (ColumnType::Timestamp, OrderKind::SignedInt, row_codec::ScalarRef::Timestamp(v)) => {
             Ok(Some(ScalarKeyRef::SignedInt(*v)))
         }
@@ -481,6 +484,7 @@ pub(crate) fn order_value_to_cell(
             .map(Cell::Date)
             .map_err(|_| scan_bug("group key DATE value out of range")),
         (OrderValue::SignedInt(v), Some(ColumnType::Timestamp)) => Ok(Cell::Timestamp(*v)),
+        (OrderValue::SignedInt(v), Some(ColumnType::TimestampTz)) => Ok(Cell::TimestampTz(*v)),
         // `24:00:00`（= `MICROS_PER_DAY`）は正当な保存値のため上端を含めて検査する。
         (OrderValue::SignedInt(v), Some(ColumnType::Time)) => {
             if (0..=crate::datetime::MICROS_PER_DAY).contains(v) {
@@ -528,6 +532,7 @@ pub(crate) fn expr_value_to_key_ref<'v>(
             Ok(Some(ScalarKeyRef::SignedInt(i64::from(*d))))
         }
         (ExprValue::Timestamp(t), OrderKind::SignedInt) => Ok(Some(ScalarKeyRef::SignedInt(*t))),
+        (ExprValue::TimestampTz(t), OrderKind::SignedInt) => Ok(Some(ScalarKeyRef::SignedInt(*t))),
         (ExprValue::Time(t), OrderKind::SignedInt) => Ok(Some(ScalarKeyRef::SignedInt(*t))),
         // jsonb はソートキーを呼び出し元が先に作って借用させる（[`expr_value_to_jsonb_key`]）。
         // ここへ到達するのは配線不備のみ。

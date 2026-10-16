@@ -149,14 +149,24 @@ enum OpTag {
 /// 更新へ置換した。各 `push_*` は `Sha256::update` を直接呼ぶため、バッチ全体
 /// （数百 KB 規模）を保持する中間バッファは存在しない。出力（ダイジェスト）は
 /// 旧実装（`#[cfg(test)] sha256_reference`）と等価であることをテストで機械検証する。
-struct HashInputBuilder(Sha256);
+struct HashInputBuilder(Sha256, bool);
 
 impl HashInputBuilder {
+    /// 直列化した式がセッション TimeZone に依存しうる（`TIMESTAMPTZ` リテラル・`timezone()`）と
+    /// 印を付ける（`push_dml_expr` が呼ぶ。分割実行の TZ 混入判定が読む。Issue #1576）。
+    fn mark_tz_dependent(&mut self) {
+        self.1 = true;
+    }
+
+    fn is_tz_dependent(&self) -> bool {
+        self.1
+    }
+
     fn new(tag: OpTag) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(DOMAIN_TAG);
         hasher.update(&[tag as u8]);
-        HashInputBuilder(hasher)
+        HashInputBuilder(hasher, false)
     }
 
     /// 可変長バイト列を「4 バイト LE 長さ＋本体」で連結する。untrusted 入力由来の
@@ -1330,18 +1340,28 @@ fn update_where_with_tag(
         .map_err(|_| dml_hash_field_too_large())?;
     push_dml_assignments(&mut b, assignments, DmlVectorRepr::Canonical, schema)?;
     push_dml_where_predicates(&mut b, where_predicates, udf_registry)?;
-    // 分割実行だけは再開（別接続からの同一 operation_id の再送）で残りの行を別の解釈で書き
-    // 足しうるため、TZ 無しの TIMESTAMPTZ リテラル（SET 値・述語）の解釈に使うセッション
-    // TimeZone をハッシュへ含め、異なる TimeZone での再開を内容不一致（22023）にする
-    // （Issue #1575 レビュー指摘）。TIMESTAMPTZ 列を持たないテーブル、および UTC（従来の
-    // 唯一の解釈）では入力を変えず、TimeZone 導入前に永続化された中断ジョブの再送
-    // （同一 SQL・同一 operation_id・UTC）が内容不一致にならないよう互換を保つ。
-    if matches!(tag, OpTag::UpdateWherePartitioned)
-        && schema
+    if matches!(tag, OpTag::UpdateWherePartitioned) {
+        push_partitioned_time_zone(&mut b, schema)?;
+    }
+    Ok(b.finish())
+}
+
+/// 分割実行（再開で別接続から同一 operation_id が再送される）の内容照合へ、セッション TimeZone を
+/// 含める。再開時に別の TimeZone で残りの行へ別の条件・値を適用しないための fail-closed
+/// （Issue #1575・#1576 レビュー指摘）。含めるのは TZ に依存しうる文だけ: 表が `TIMESTAMPTZ` 列を持つ、
+/// または式に `TIMESTAMPTZ` リテラル・`timezone()` がある（TIMESTAMP 列との混在比較や代入変換も
+/// 暗黙にセッション TZ を使うため、列を持たない表でも対象）。UTC では入力を変えず、TimeZone
+/// 導入前に永続化された中断ジョブの再送（同一 SQL・同一 operation_id・UTC）の互換を保つ。
+fn push_partitioned_time_zone(
+    b: &mut HashInputBuilder,
+    schema: &crate::catalog::TableSchema,
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    let depends = b.is_tz_dependent()
+        || schema
             .columns
             .iter()
-            .any(|c| matches!(c.ty, crate::catalog::ColumnType::TimestampTz))
-    {
+            .any(|c| matches!(c.ty, crate::catalog::ColumnType::TimestampTz));
+    if depends {
         let tz = crate::datetime::current_session_time_zone();
         if tz.display() != "UTC" {
             b.push_u8(0xA1);
@@ -1349,7 +1369,7 @@ fn update_where_with_tag(
                 .map_err(|_| dml_hash_field_too_large())?;
         }
     }
-    Ok(b.finish())
+    Ok(())
 }
 
 /// 分割実行版述語つき `UPDATE ... WHERE`（Issue #1127。ADR
@@ -1439,7 +1459,13 @@ pub(crate) fn for_delete_where(
     where_predicates: &[crate::sql::allowlist::WherePredicate],
     udf_registry: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
-    delete_where_with_tag(OpTag::DeleteWhere, table, where_predicates, udf_registry)
+    delete_where_with_tag(
+        OpTag::DeleteWhere,
+        table,
+        where_predicates,
+        udf_registry,
+        None,
+    )
 }
 
 /// [`for_delete_where`] と [`for_delete_where_partitioned`] が共有する本体
@@ -1449,11 +1475,15 @@ fn delete_where_with_tag(
     table: &str,
     where_predicates: &[crate::sql::allowlist::WherePredicate],
     udf_registry: &crate::sql::udf_call::UdfRegistry,
+    schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
     let mut b = HashInputBuilder::new(tag);
     b.push_bytes(table.as_bytes())
         .map_err(|_| dml_hash_field_too_large())?;
     push_dml_where_predicates(&mut b, where_predicates, udf_registry)?;
+    if let Some(schema) = schema {
+        push_partitioned_time_zone(&mut b, schema)?;
+    }
     Ok(b.finish())
 }
 
@@ -1466,12 +1496,14 @@ pub(crate) fn for_delete_where_partitioned(
     table: &str,
     where_predicates: &[crate::sql::allowlist::WherePredicate],
     udf_registry: &crate::sql::udf_call::UdfRegistry,
+    schema: &crate::catalog::TableSchema,
 ) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
     delete_where_with_tag(
         OpTag::DeleteWherePartitioned,
         table,
         where_predicates,
         udf_registry,
+        Some(schema),
     )
 }
 
@@ -1595,7 +1627,7 @@ fn push_dml_assignments(
             }
             // `VALUES` の単独時刻関数（Issue #2188）は UPDATE の `SET` リテラルには現れない
             // （時刻関数は式経路 `SetValue::Expr` を通る）。到達は fail-closed で拒否する。
-            InsertLiteral::CurrentTime(_) => {
+            InsertLiteral::CurrentTime(_) | InsertLiteral::TimestampTz(_) => {
                 return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                     "time function literal is not valid in UPDATE SET",
                 ));
@@ -1868,7 +1900,10 @@ fn collect_referenced_udfs(
         }
         // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。
         // Issue #920）は UDF 呼び出しを持たない葉。
-        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) | Expr::TimeLiteral(_) => Ok(()),
+        Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. } => Ok(()),
     }
 }
 
@@ -1979,6 +2014,7 @@ fn push_set_expr(
             | Expr::DateLiteral(_)
             | Expr::TimestampLiteral(_)
             | Expr::TimeLiteral(_)
+            | Expr::TimestampTzLiteral { .. }
             | Expr::ValueFunction { .. } => {}
         }
     }
@@ -2057,6 +2093,23 @@ fn push_dml_expr(
             for arg in args {
                 push_dml_expr(b, arg, params)?;
             }
+            // `timezone(x)`（`x AT LOCAL`。Issue #1576）はセッション TimeZone で結果が決まるため、
+            // 解釈に使った TZ 名を含めて、列に TIMESTAMPTZ を持たない表でも別 TZ での再送を
+            // 別内容として扱う。`timezone` は本 Issue で導入した関数名のため既存ハッシュは不変。
+            if name.eq_ignore_ascii_case("timezone") {
+                // 2 引数形も、型なし文字列リテラル（束縛時のセッション TZ で解釈）を取りうる。
+                b.mark_tz_dependent();
+            }
+            // 3 引数 `date_trunc(unit, ts, zone)` は TIMESTAMP 入力をセッション TimeZone で
+            // TIMESTAMPTZ へ変換するため、TIMESTAMP 列のみの表でも TZ 依存とする。
+            if name.eq_ignore_ascii_case("date_trunc") && args.len() == 3 {
+                b.mark_tz_dependent();
+            }
+            if args.len() == 1 && name.eq_ignore_ascii_case("timezone") {
+                let tz = crate::datetime::current_session_time_zone();
+                b.push_bytes(tz.display().as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
         }
         Expr::Binary { op, lhs, rhs } => {
             b.push_u8(4);
@@ -2118,6 +2171,26 @@ fn push_dml_expr(
             b.push_u8(10);
             b.push_u8(2);
             b.push_raw(&micros.to_le_bytes());
+        }
+        // `TIMESTAMPTZ` 型付きリテラル（Issue #1576）。型バイト 3 はゾーン指定済み（UTC 値）、
+        // 4 はゾーン無し（壁時計）で、後者は解釈に使うセッション TimeZone 名を含めて、異なる TZ
+        // での再送を別内容として扱う。既存の型バイト（0〜2）とそれらのハッシュ値は不変。
+        Expr::TimestampTzLiteral {
+            micros,
+            session_local,
+        } => {
+            b.push_u8(10);
+            b.mark_tz_dependent();
+            if *session_local {
+                b.push_u8(4);
+                b.push_raw(&micros.to_le_bytes());
+                let tz = crate::datetime::current_session_time_zone();
+                b.push_bytes(tz.display().as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            } else {
+                b.push_u8(3);
+                b.push_raw(&micros.to_le_bytes());
+            }
         }
         // タグ 12（対象ビヘイビア: TABLE-25。Issue #1596。ADR §4.4 タグ表に追記）。
         // 演算子種別（`->` `->>` `#>` `#>>`）を 1 バイトで区別してから左辺・右辺を
@@ -4530,6 +4603,39 @@ mod tests {
         assert_eq!(hash_in("Asia/Tokyo", &without), hash_in("UTC", &without));
     }
 
+    /// TIMESTAMP 列のみの表でも、3 引数 `date_trunc` を含む分割実行 UPDATE は
+    /// セッション TimeZone が違えば別ハッシュ（Issue #1576 レビュー指摘）。
+    #[test]
+    fn partitioned_update_hash_includes_time_zone_for_three_arg_date_trunc() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::datetime::{SessionTimeZone, SessionTimeZoneScope};
+        use crate::sql::allowlist::SetValue;
+        use crate::sql::udf_call::{Expr, UdfRegistry};
+        let registry = UdfRegistry::default();
+        let predicates = partitioned_test_predicates();
+        let schema = TableSchema::new(
+            "t".to_string(),
+            vec![ColumnDef::new("ts", ColumnType::Timestamp, true)],
+        );
+        let expr = |args: Vec<Expr>| {
+            SetValue::Expr(Expr::Call {
+                name: "date_trunc".to_string(),
+                args,
+            })
+        };
+        let lit = |s: &str| Expr::String(s.to_string());
+        let three = expr(vec![lit("day"), Expr::Ident("ts".to_string()), lit("UTC")]);
+        let two = expr(vec![lit("day"), Expr::Ident("ts".to_string())]);
+        let hash_in = |tz: &str, v: &SetValue| {
+            let _scope =
+                SessionTimeZoneScope::enter(SessionTimeZone::parse_setting(tz).expect("tz"));
+            for_update_where_partitioned("t", &[("ts", v)], &predicates, &registry, &schema)
+                .expect("hash")
+        };
+        assert_ne!(hash_in("Asia/Tokyo", &three), hash_in("UTC", &three));
+        assert_eq!(hash_in("Asia/Tokyo", &two), hash_in("UTC", &two));
+    }
+
     /// 分割実行版は原子版と別ドメイン（タグ 11／12）で、同一入力でも別ハッシュ
     /// になり、かつ決定的である。原子版の出力は共有本体の導入前後で不変
     /// （タグ・直列化を手組みした参照ビルダーと一致する）。
@@ -4545,11 +4651,12 @@ mod tests {
         let assignments = [("title", &literal)];
 
         let atomic_del = for_delete_where("t", &predicates, &registry).expect("hash");
-        let part_del = for_delete_where_partitioned("t", &predicates, &registry).expect("hash");
+        let part_del =
+            for_delete_where_partitioned("t", &predicates, &registry, &schema).expect("hash");
         assert_ne!(atomic_del, part_del);
         assert_eq!(
             part_del,
-            for_delete_where_partitioned("t", &predicates, &registry).expect("hash again")
+            for_delete_where_partitioned("t", &predicates, &registry, &schema).expect("hash again")
         );
 
         let atomic_upd =

@@ -218,6 +218,39 @@ fn is_where_group_operator_token(token: &Token) -> bool {
     ) || is_json_operator_token(token)
 }
 
+/// `TIMESTAMPTZ '<literal>'` を AST の値へ解析する（Issue #1576）。構文段はセッション TimeZone を
+/// 知らないため、ゾーン指定（`Z`・数値 offset・IANA 名）を持つ入力は UTC マイクロ秒へ解決し
+/// （`session_local = false`）、持たない入力は壁時計のまま保持する（`true`。束縛時にセッション TZ で
+/// UTC へ確定する）。ゾーン指定の有無は、既定 TZ を 2 通り（UTC・+01）にして結果が一致するかで判定する。
+/// エラー文言にリテラル本文は含めない。
+pub(crate) fn parse_timestamptz_expr_literal(literal: &str) -> Result<Expr, SqlSurfaceError> {
+    use crate::datetime::{SessionTimeZone, TimestampTzLiteralError};
+    let utc_tz = SessionTimeZone::utc();
+    let micros = match crate::datetime::parse_timestamptz(literal, &utc_tz) {
+        Ok(m) => m,
+        Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Format(detail))) => {
+            return Err(SqlSurfaceError::invalid_datetime_format(detail))
+        }
+        Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Overflow(detail))) => {
+            return Err(SqlSurfaceError::datetime_field_overflow(detail))
+        }
+        Err(TimestampTzLiteralError::UnknownTimeZone) => {
+            return Err(SqlSurfaceError::InvalidParameterValue {
+                detail: crate::datetime::UNRECOGNIZED_TIME_ZONE_DETAIL,
+            })
+        }
+    };
+    // POSIX 解釈で `-1` は UTC+01。UTC と +01 で結果が変わる入力だけがゾーン無し。
+    let session_local = match SessionTimeZone::resolve_zone_argument("-1") {
+        Ok(plus_one) => crate::datetime::parse_timestamptz(literal, &plus_one) != Ok(micros),
+        Err(_) => true,
+    };
+    Ok(Expr::TimestampTzLiteral {
+        micros,
+        session_local,
+    })
+}
+
 /// jsonb 演算子のトークン（パス取得 `-> ->> #> #>>`・包含 `@> <@`・存在 `? ?| ?&`・jsonpath `@? @@`。
 /// TABLE-25。Issue #1596・#1598・#2186）かどうか。式の中置演算子ループ
 /// （[`Parser::parse_json_access_rest`]）の続きを判定する先読みが共有する。
@@ -3001,6 +3034,11 @@ pub enum InsertLiteral {
     /// INSERT／NoSQL）は受理せず拒否する（fail-closed）。合成式（`now() + …`）は
     /// この variant にならず、従来どおり定数式経路で拒否される。
     CurrentTime(crate::catalog::TimeDefault),
+    /// 定数式が TIMESTAMPTZ に評価された結果（UTC マイクロ秒。Issue #1576 レビュー指摘）。
+    /// 代入先の列型が決まる束縛段で変換する（TIMESTAMPTZ 列はそのまま、TIMESTAMP・DATE 列は
+    /// セッション TZ の局所値へ。`sql::parser::bind_tstz_literal`）。文字列化して列側 parse へ
+    /// 渡すと TIMESTAMP・DATE 列が offset を拒否するため、型を保持する。
+    TimestampTz(i64),
 }
 
 /// `ON CONFLICT (id) DO UPDATE SET <col> = <value>` の SET 右辺（SQL-20・
@@ -4134,7 +4172,11 @@ impl<'a> Parser<'a> {
                 // TABLE-28・Issue #1609: 識別子の直後の `COLLATE` も式項目の継続。
                 let next_is_op = self.tokens.get(self.pos + 1).is_some_and(|t| {
                     matches!(t, Token::Punct('+' | '-' | '*' | '/')) || is_json_operator_token(t)
-                }) || self.peek_ident_matches_at(1, "COLLATE");
+                }) || self.peek_ident_matches_at(1, "COLLATE")
+                    || (self.peek_ident_matches_at(1, "AT")
+                        && (self.peek_ident_matches_at(2, "LOCAL")
+                            || (self.peek_ident_matches_at(2, "TIME")
+                                && self.peek_ident_matches_at(3, "ZONE"))));
                 if starts_case || self.is_value_function_keyword_at(self.pos) {
                     // 括弧なし SQL 値関数（SQL-37・Issue #1586）は列名ではなく式項目。
                     self.parse_projection_infix(0)?
@@ -4149,6 +4191,7 @@ impl<'a> Parser<'a> {
                     self.allow_unary_minus = prev;
                     let head = head?;
                     if self.peek_ident_matches("COLLATE")
+                        || self.peek_at_time_zone()
                         || self.peek().is_some_and(|t| {
                             matches!(t, Token::Punct('+' | '-' | '*' | '/'))
                                 || is_json_operator_token(t)
@@ -6006,7 +6049,8 @@ impl<'a> Parser<'a> {
     fn parse_mul_rest(&mut self, lhs: Expr, depth: usize) -> Result<Expr, SqlSurfaceError> {
         // 先頭の関数呼び出しを先に読み終えた投影項目から継続する場合も、後置 `COLLATE` を
         // 一次式の直後として受理する（`parse_primary_expr` 経由では適用済みで冪等）。
-        let mut lhs = self.parse_collate_postfix(lhs)?;
+        let lhs = self.parse_collate_postfix(lhs)?;
+        let mut lhs = self.parse_at_time_zone_postfix(lhs, depth)?;
         loop {
             let op = match self.peek() {
                 Some(Token::Punct('*')) => BinOp::Mul,
@@ -6031,7 +6075,69 @@ impl<'a> Parser<'a> {
     /// `WHEN`（`sql::allowlist` 内の他の文脈的キーワード）と同じ判断）。
     fn parse_primary_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         let primary = self.parse_primary_expr_inner(depth)?;
-        self.parse_collate_postfix(primary)
+        let primary = self.parse_collate_postfix(primary)?;
+        self.parse_at_time_zone_postfix(primary, depth)
+    }
+
+    /// `TIMESTAMP` の直後が `WITH TIME ZONE <文字列>`／`WITHOUT TIME ZONE <文字列>` なら、
+    /// 文字列リテラルの直前までのトークン数と「ゾーン付きか」を返す（Issue #1576。先読みのみ）。
+    fn timestamp_with_zone_literal_len(&self) -> Option<(usize, bool)> {
+        let with_zone = if self.peek_ident_matches_at(1, "WITH") {
+            true
+        } else if self.peek_ident_matches_at(1, "WITHOUT") {
+            false
+        } else {
+            return None;
+        };
+        if self.peek_ident_matches_at(2, "TIME")
+            && self.peek_ident_matches_at(3, "ZONE")
+            && matches!(self.tokens.get(self.pos + 4), Some(Token::StringLiteral(_)))
+        {
+            Some((4, with_zone))
+        } else {
+            None
+        }
+    }
+
+    /// 現在位置が `AT TIME ZONE`／`AT LOCAL` の開始か（先読みのみ。Issue #1576）。
+    fn peek_at_time_zone(&self) -> bool {
+        self.peek_ident_matches("AT")
+            && ((self.peek_ident_matches_at(1, "TIME") && self.peek_ident_matches_at(2, "ZONE"))
+                || self.peek_ident_matches_at(1, "LOCAL"))
+    }
+
+    /// 後置 `AT TIME ZONE <zone>`／`AT LOCAL`（Issue #1576・TABLE-33）。PG と同じく `*` `/` `+` `-`
+    /// より強く `COLLATE` より弱く結合し、左結合。`timezone(<zone>, <expr>)`／`timezone(<expr>)`
+    /// の関数呼び出しへ脱糖する（PG も同じ関数の構文糖）。zone は一次式（と後置 `COLLATE`）まで。
+    /// INTERVAL の zone は未実装のため束縛段で拒否される。
+    fn parse_at_time_zone_postfix(
+        &mut self,
+        mut lhs: Expr,
+        depth: usize,
+    ) -> Result<Expr, SqlSurfaceError> {
+        while self.peek_at_time_zone() {
+            if self.peek_ident_matches_at(1, "LOCAL") {
+                self.advance();
+                self.advance();
+                self.consume_expr_node()?;
+                lhs = Expr::Call {
+                    name: "timezone".to_string(),
+                    args: vec![lhs],
+                };
+            } else {
+                self.advance();
+                self.advance();
+                self.advance();
+                let zone = self.parse_primary_expr_inner(depth + 1)?;
+                let zone = self.parse_collate_postfix(zone)?;
+                self.consume_expr_node()?;
+                lhs = Expr::Call {
+                    name: "timezone".to_string(),
+                    args: vec![zone, lhs],
+                };
+            }
+        }
+        Ok(lhs)
     }
 
     /// [`Self::parse_primary_expr`] の本体（後置 `COLLATE` を除く一次式）。
@@ -6140,6 +6246,47 @@ impl<'a> Parser<'a> {
             // AST には解析済みの内部表現を保持する（§2-8。CHECK・ビューの
             // render→再パース往復での区切り文字表記揺れを避けるため、生文字列は
             // 保持しない）。
+            // `TIMESTAMPTZ '<literal>'`／`TIMESTAMP WITH TIME ZONE '<literal>'`／
+            // `TIMESTAMP WITHOUT TIME ZONE '<literal>'`（Issue #1576・TABLE-33）。列名 `timestamptz`
+            // は直後が文字列リテラルのときだけ型付きリテラルとして扱うため壊れない。
+            Some(Token::Ident(name))
+                if (name.eq_ignore_ascii_case("TIMESTAMPTZ")
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::StringLiteral(_))))
+                    || (name.eq_ignore_ascii_case("TIMESTAMP")
+                        && self.timestamp_with_zone_literal_len().is_some()) =>
+            {
+                let (consumed, with_zone) = if name.eq_ignore_ascii_case("TIMESTAMPTZ") {
+                    (1, true)
+                } else {
+                    self.timestamp_with_zone_literal_len()
+                        .ok_or_else(|| SqlSurfaceError::unsupported("expected TIMESTAMP literal"))?
+                };
+                for _ in 0..consumed {
+                    self.advance();
+                }
+                let literal = match self.advance() {
+                    Some(Token::StringLiteral(s)) => s.clone(),
+                    other => {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "expected string literal after TIMESTAMP, got {other:?}"
+                        )))
+                    }
+                };
+                self.consume_expr_node()?;
+                if with_zone {
+                    parse_timestamptz_expr_literal(&literal)
+                } else {
+                    match crate::datetime::parse_timestamp(&literal) {
+                        Ok(micros) => Ok(Expr::TimestampLiteral(micros)),
+                        Err(DateTimeLiteralError::Format(detail)) => {
+                            Err(SqlSurfaceError::invalid_datetime_format(detail))
+                        }
+                        Err(DateTimeLiteralError::Overflow(detail)) => {
+                            Err(SqlSurfaceError::datetime_field_overflow(detail))
+                        }
+                    }
+                }
+            }
             Some(Token::Ident(name))
                 if (name.eq_ignore_ascii_case("DATE")
                     || name.eq_ignore_ascii_case("TIMESTAMP")
@@ -7071,7 +7218,9 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
-            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/')))
+                && !self.peek_at_time_zone()
+            {
                 return Ok(lit);
             }
             self.pos = start;
@@ -7119,7 +7268,9 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
-            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/')))
+                && !self.peek_at_time_zone()
+            {
                 return Ok(SetValue::Literal(lit));
             }
             self.pos = start;
@@ -12011,7 +12162,8 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
-        | Expr::TimeLiteral(_) => false,
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. } => false,
         // 括弧なし値関数（Issue #1586）は関数呼び出しと同様に従来形では書けない式。
         Expr::ValueFunction { .. } => true,
     }

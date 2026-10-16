@@ -272,6 +272,7 @@ impl Inferrer<'_> {
             Expr::DateLiteral(_)
             | Expr::TimestampLiteral(_)
             | Expr::TimeLiteral(_)
+            | Expr::TimestampTzLiteral { .. }
             | Expr::ValueFunction { .. } => Ty::Known(PreparedParamType::VectorText),
         }
     }
@@ -403,6 +404,7 @@ impl Inferrer<'_> {
             | Expr::DateLiteral(_)
             | Expr::TimestampLiteral(_)
             | Expr::TimeLiteral(_)
+            | Expr::TimestampTzLiteral { .. }
             | Expr::ValueFunction { .. } => {}
         }
         Ok(())

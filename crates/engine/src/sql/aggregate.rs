@@ -280,6 +280,7 @@ impl ReferencedColumns {
                 | AggregateInput::DateColumn(index)
                 | AggregateInput::TimestampColumn(index)
                 | AggregateInput::TimeColumn(index)
+                | AggregateInput::TimestampTzColumn(index)
                 | AggregateInput::ArrayColumn(index)
                 | AggregateInput::ByteaColumn(index)
                 | AggregateInput::JsonColumn(index)
@@ -696,6 +697,9 @@ pub(crate) enum Accumulator {
     /// `MIN`/`MAX(<TIME>)`（Issue #1570）。0 時起点のマイクロ秒（`i64`）の全順序比較。
     TimeMin(Option<i64>),
     TimeMax(Option<i64>),
+    /// `MIN`/`MAX(<TIMESTAMPTZ>)`（Issue #1576）。UTC マイクロ秒（`i64`）の全順序比較。
+    TimestampTzMin(Option<i64>),
+    TimestampTzMax(Option<i64>),
     /// `COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）。`seen` は正準化済み
     /// キー（[`Accumulator::observe_distinct`]）の集合、`bytes` はそのキーの
     /// 累計バイト数（[`Accumulator::distinct_footprint`] が呼び出し元へ公開する
@@ -865,6 +869,8 @@ impl Accumulator {
             (Max, AggregateInput::TimestampColumn(_)) => Accumulator::TimestampMax(None),
             (Min, AggregateInput::TimeColumn(_)) => Accumulator::TimeMin(None),
             (Max, AggregateInput::TimeColumn(_)) => Accumulator::TimeMax(None),
+            (Min, AggregateInput::TimestampTzColumn(_)) => Accumulator::TimestampTzMin(None),
+            (Max, AggregateInput::TimestampTzColumn(_)) => Accumulator::TimestampTzMax(None),
             _ => return Err(accumulator_bug("unsupported (func, input) combination")),
         })
     }
@@ -969,6 +975,19 @@ impl Accumulator {
                     None => None,
                 };
                 self.observe_time(value)
+            }
+            // `TIMESTAMPTZ` 列は `COUNT`・`MIN`/`MAX` のみ（`SUM`/`AVG` は構文段で 42883。
+            // Issue #1576）。比較は UTC の時点で行う。
+            AggregateInput::TimestampTzColumn(index) => {
+                let value = match scanned.get(*index).copied().flatten() {
+                    Some(v) => Some(v.as_timestamptz().ok_or_else(|| {
+                        accumulator_bug(
+                            "TimestampTzColumn observed a ScalarRef that is not TimestampTz",
+                        )
+                    })?),
+                    None => None,
+                };
+                self.observe_timestamptz(value)
             }
             // `INTEGER`／`BIGINT` 列は `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` の
             // すべてを受理する（TABLE-13・TASK-196、Issue #881・#892）。`SUM`/
@@ -1253,6 +1272,21 @@ impl Accumulator {
                 ),
                 None => None,
             },
+            AggregateInput::TimestampTzColumn(index) => {
+                match scanned.get(*index).copied().flatten() {
+                    Some(v) => Some(
+                        v.as_timestamptz()
+                            .ok_or_else(|| {
+                                accumulator_bug(
+                                    "TimestampTzColumn observed a ScalarRef that is not TimestampTz (distinct)",
+                                )
+                            })?
+                            .to_be_bytes()
+                            .to_vec(),
+                    ),
+                    None => None,
+                }
+            }
             AggregateInput::TimeColumn(index) => match scanned.get(*index).copied().flatten() {
                 Some(v) => Some(
                     v.as_time()
@@ -1744,6 +1778,38 @@ impl Accumulator {
         }
     }
 
+    /// `TIMESTAMPTZ` 版の [`Self::observe_date`]（同じ契約。UTC マイクロ秒。Issue #1576）。
+    fn observe_timestamptz(&mut self, value: Option<i64>) -> Result<(), SqlSurfaceError> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        match self {
+            Accumulator::Count(n) => {
+                *n = n.checked_add(1).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range("COUNT exceeds u64 range")
+                })?;
+                Ok(())
+            }
+            Accumulator::TimestampTzMin(m) => {
+                *m = Some(match m {
+                    None => value,
+                    Some(cur) => value.min(*cur),
+                });
+                Ok(())
+            }
+            Accumulator::TimestampTzMax(m) => {
+                *m = Some(match m {
+                    None => value,
+                    Some(cur) => value.max(*cur),
+                });
+                Ok(())
+            }
+            _ => Err(accumulator_bug(
+                "observe_timestamptz on an incompatible accumulator",
+            )),
+        }
+    }
+
     /// `TIME` 版の [`Self::observe_date`]（同じ契約。Issue #1570）。
     fn observe_time(&mut self, value: Option<i64>) -> Result<(), SqlSurfaceError> {
         let Some(value) = value else {
@@ -1971,6 +2037,8 @@ impl Accumulator {
             Accumulator::TimestampMax(m) => m.map(Cell::Timestamp).unwrap_or(Cell::Null),
             Accumulator::TimeMin(m) => m.map(Cell::Time).unwrap_or(Cell::Null),
             Accumulator::TimeMax(m) => m.map(Cell::Time).unwrap_or(Cell::Null),
+            Accumulator::TimestampTzMin(m) => m.map(Cell::TimestampTz).unwrap_or(Cell::Null),
+            Accumulator::TimestampTzMax(m) => m.map(Cell::TimestampTz).unwrap_or(Cell::Null),
             // SQL-25 (c)・TASK-209: 空集合・全 NULL はいずれも `0`
             // （PostgreSQL の `COUNT(DISTINCT ...)` と同じ契約。`COUNT` 一般の
             // 「空集合で NULL ではなく 0」という既存契約とも一致する）。
@@ -2598,6 +2666,7 @@ pub(crate) fn aggregate_result_type(
         (Min | Max, AggregateInput::DateColumn(_)) => ColumnType::Date,
         (Min | Max, AggregateInput::TimestampColumn(_)) => ColumnType::Timestamp,
         (Min | Max, AggregateInput::TimeColumn(_)) => ColumnType::Time,
+        (Min | Max, AggregateInput::TimestampTzColumn(_)) => ColumnType::TimestampTz,
         (Min | Max, AggregateInput::TextColumn(_) | AggregateInput::CollatedTextColumn { .. }) => {
             ColumnType::Text
         }

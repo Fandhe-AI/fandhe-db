@@ -271,13 +271,6 @@ fn check_branch_type_compatibility(
             )));
         }
     }
-    // TIMESTAMPTZ は集合演算が #1576 まで未対応のため、演算種別・格納データ（空表・NULL のみ
-    // を含む）によらず実行前に拒否する（Issue #1574。fail-closed。`0A000`）。
-    if columns_have_timestamptz(l_columns) || columns_have_timestamptz(r_columns) {
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "TIMESTAMPTZ columns are not supported in set operations yet".to_string(),
-        });
-    }
     let dedup_needed = !matches!(op, SetOperator::UnionAll);
     if dedup_needed && (l_has_vector || r_has_vector) {
         return Err(SqlSurfaceError::invalid_input(
@@ -285,18 +278,6 @@ fn check_branch_type_compatibility(
         ));
     }
     Ok(())
-}
-
-fn columns_have_timestamptz(columns: &[ColumnMeta]) -> bool {
-    columns.iter().any(|c| {
-        matches!(
-            c,
-            ColumnMeta::Scalar {
-                ty: ColumnType::TimestampTz,
-                ..
-            }
-        )
-    })
 }
 
 fn columns_have_vector(columns: &[ColumnMeta]) -> bool {
@@ -428,12 +409,11 @@ fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
                 out.extend_from_slice(&n.to_be_bytes());
                 push_len_prefixed(&mut out, &payload)?;
             }
-            // TIMESTAMPTZ は集合演算が #1576 まで未対応のため check_branch_type_compatibility で弾かれ、本来到達しない
-            // （Issue #1574。防御的に拒否する fail-closed）。
-            Cell::TimestampTz(_) => {
-                return Err(SqlSurfaceError::Internal {
-                    detail: "TIMESTAMPTZ column reached set operation row key encoding".to_string(),
-                });
+            // `TIMESTAMPTZ`（Issue #1576）。UTC マイクロ秒を型タグ 14 で単射に符号化する
+            // （時点で同一視するため表示 TZ に依存しない）。
+            Cell::TimestampTz(t) => {
+                out.push(14);
+                out.extend_from_slice(&t.to_be_bytes());
             }
             // §2.2 の型検証（重複除去を伴う演算からの `VECTOR` 列排除）で本来
             // 到達しない。破損状態を防御的に拒否する（fail-closed。XX000）。
@@ -503,13 +483,8 @@ fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
             }
             // 型タグ 1 byte ＋ `i64` の 8 byte（`row_key` の `Cell::Time`。Issue #1570）。
             Cell::Time(_) => 1 + 8,
-            // TIMESTAMPTZ は集合演算が #1576 まで未対応のため check_branch_type_compatibility で弾かれ、本来到達しない
-            // （Issue #1574。防御的に拒否する fail-closed）。
-            Cell::TimestampTz(_) => {
-                return Err(SqlSurfaceError::Internal {
-                    detail: "TIMESTAMPTZ column reached set operation row key encoding".to_string(),
-                });
-            }
+            // 型タグ 1 byte ＋ `i64` の 8 byte（`row_key` の `Cell::TimestampTz`。Issue #1576）。
+            Cell::TimestampTz(_) => 1 + 8,
             // §2.2 の型検証で本来到達しない（`row_key` と同じ防御的拒否）。
             Cell::Vector(_) => {
                 return Err(SqlSurfaceError::Internal {
@@ -1426,10 +1401,10 @@ mod tests {
         }))
     }
 
-    /// Issue #1574 レビュー指摘の回帰: TIMESTAMPTZ 列の集合演算は演算 4 種・データ 3 状況
-    /// （空表・NULL のみ・非 NULL 値あり）・実行／Describe の両経路で一律に `0A000` となる。
+    /// Issue #1576: TIMESTAMPTZ 列の集合演算は演算 4 種・データ 3 状況（空表・NULL のみ・非 NULL
+    /// 値あり）・実行／Describe の両経路で成功し、重複除去は UTC の時点（値）で行う。
     #[test]
-    fn timestamptz_set_operations_are_rejected_for_all_ops_data_states_and_paths() {
+    fn timestamptz_set_operations_dedup_by_instant_for_all_ops_and_data_states() {
         let ops = [
             SetOperator::Union,
             SetOperator::UnionAll,
@@ -1474,7 +1449,7 @@ mod tests {
                     right: Box::new(tstz_branch("b")),
                 };
                 let read_txn = storage.db().begin_read().expect("begin_read");
-                let err = execute_with_budget(
+                let result = execute_with_budget(
                     &read_txn,
                     &tenant_ctx,
                     &schemas,
@@ -1484,11 +1459,17 @@ mod tests {
                     usize::MAX,
                     crate::group_by_limits::GroupByLimits::default(),
                 )
-                .expect_err("TIMESTAMPTZ set operation must be rejected");
-                assert_eq!(err.wire_code(), "0A000", "execute {op:?} {state}");
-                let err = describe_columns(&schemas, &tree, &udfs, &[], None, &Default::default())
-                    .expect_err("TIMESTAMPTZ set operation must be rejected on describe");
-                assert_eq!(err.wire_code(), "0A000", "describe {op:?} {state}");
+                .unwrap_or_else(|e| panic!("execute {op:?} {state}: {e:?}"));
+                // 両枝は同一の 1 行（空表なら 0 行）。
+                let present = usize::from(state != "empty");
+                let expected = match op {
+                    SetOperator::UnionAll => 2 * present,
+                    SetOperator::Union | SetOperator::Intersect => present,
+                    SetOperator::Except => 0,
+                };
+                assert_eq!(result.rows.len(), expected, "{op:?} {state}");
+                describe_columns(&schemas, &tree, &udfs, &[], None, &Default::default())
+                    .unwrap_or_else(|e| panic!("describe {op:?} {state}: {e:?}"));
             }
         }
     }

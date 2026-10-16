@@ -519,3 +519,7 @@ TEXT／BYTEA と同じ既知の乖離で結果の正しさには影響しない�
 ## Issue #1570: TIME 列の二次索引
 
 `TIME` 列は 0 時起点のマイクロ秒（`0..=86_400_000_000`）を `i64` のまま `OrderedColumnIndex::I64` へ構築する（レーン B。`DATE`／`TIMESTAMP` と同じ）。値域が `2^53` より遥かに小さいため縮退は起きず、範囲外の値だけを防御的に「索引対象外」へ縮退する。照会は `TypedLiteral::Time` を `exact_i64_bounds` に渡す。`CREATE INDEX` の宣言対象にも含める。
+
+## Issue #1576: TIMESTAMPTZ 列の二次索引
+
+`TIMESTAMPTZ` 列は UTC マイクロ秒を `i64` のまま `OrderedColumnIndex::I64` へ構築する（レーン B。`TIMESTAMP` と同じく `2^53` を超える値が 1 件でもあれば列単位で縮退する）。照会は `TypedLiteral::TimestampTz` で、文字列リテラルは束縛時のセッション TZ（ゾーン指定があればそれ）で UTC へ確定してから範囲照合する。比較は時点で行うため表示 TZ に依らない。TIMESTAMP／DATE 列と TIMESTAMPTZ 値の比較は行ごとに列側を変換する式として評価し、索引は使わず全走査へ縮退する（gap で timestamp → timestamptz の変換が単調でなく、リテラルを逆変換した範囲が誤りうるため。fail-closed）。詳細は [timestamptz-conversion.md](timestamptz-conversion.md)。

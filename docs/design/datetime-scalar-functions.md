@@ -178,3 +178,9 @@ is_not_masked_out` で分岐内参照のみの回帰を固定する）。
 ## Issue #1570 追記: TIME 入力
 
 `date_part`／`EXTRACT` は `TIME` 入力を `BuiltinFn::TimePart`（`datetime_fn::time_part`）で受理する。受理 field は `hour`・`minute`・`second`・`milliseconds`・`microseconds`・`epoch`。`24:00:00` は hour=24・minute=0・second=0・epoch=86400。日付由来の field（`year`・`month`・`day`・`dow`・`doy`・`week` 等）は束縛時に `0A000`、`date_trunc(text, time)` は `42883`、未知の field は従来どおり `22000`。NULL の strict 伝播は DATE／TIMESTAMP と同じ。
+
+## Issue #1576 追記: TIMESTAMPTZ 入力
+
+- `date_part`／`EXTRACT` は TIMESTAMPTZ 入力を `BuiltinFn::DatePartTz` で評価する。暦の field は評価時のセッション TZ の壁時計、`epoch` は UTC の絶対値、`timezone`・`timezone_hour`・`timezone_minute` は offset（秒・時・分。東が正）。`timezone*` field は TIMESTAMPTZ 専用で、TIMESTAMP／DATE／TIME に対しては `0A000`。
+- `date_trunc(unit, timestamptz)` は `DateTruncTz`（セッション TZ）、`date_trunc(unit, timestamptz, zone)` は `DateTruncTzZone`（第 3 引数の TZ。不正な zone は `22023`）。day 以上の単位は切り捨て後の局所時刻を DST の gap／fold 規則で UTC へ再解決し、hour 以下の単位は元の offset を保つ（PG 17 の実測。[timestamptz-conversion.md](timestamptz-conversion.md)）。TIMESTAMP を第 3 引数付きで渡すと timestamptz へ暗黙変換して TIMESTAMPTZ を返す。
+- いずれもセッション TZ に依存するため定数畳み込みの対象外で、CHECK 制約の本体では `0A000`。
