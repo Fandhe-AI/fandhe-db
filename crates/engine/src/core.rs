@@ -4229,9 +4229,9 @@ impl EngineCore {
     /// 以降すべて既存の [`Self::execute_parsed_in_session`]／
     /// [`Self::describe_parsed_in_session`] を通る）。
     ///
-    /// `values` は `$1` から順に対応する実値（NULL は `None`。本バージョンでは
-    /// スコープ外として `22000` で拒否する。詳細は `sql::params` モジュール
-    /// ドキュメント参照）。個数が [`PreparedSql::param_count`] と一致しない場合は
+    /// `values` は `$1` から順に対応する実値。NULL（`None`）は裸の `NULL` トークンへ
+    /// 置換され、位置ごとの受理／拒否（`wire_code`）はリテラル `NULL` と同一になる
+    /// （Issue #2439・WIRE-24。詳細は `sql::params` モジュールドキュメント参照）。個数が [`PreparedSql::param_count`] と一致しない場合は
     /// `22000`（wire 層は Bind メッセージ自体の値件数検証で `08P01` を先に返す
     /// 契約のため、ここでの不一致検出は防御的な保険）。
     pub fn bind_prepared(
@@ -4248,7 +4248,7 @@ impl EngineCore {
                 ),
             ));
         }
-        let decoded = crate::sql::params::decode_bind_values(&prepared.tokens, values)?;
+        let decoded = crate::sql::params::decode_bind_values_nullable(&prepared.tokens, values)?;
         let kinds: Vec<crate::sql::params::ParamLiteralKind> = prepared
             .param_types
             .iter()

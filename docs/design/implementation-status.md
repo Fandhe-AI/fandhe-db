@@ -1017,3 +1017,5 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - Issue #2435（docs(design)。TASK-337・WIRE-24 ポインタ。親 #2434）: [wire-extended-query-param-binding.md](wire-extended-query-param-binding.md) に「Parse の型 OID 指定時の判定規則」節をポインタ表記で追記し、置き換え予定の既存記述へ注記を入れた。新しい `wire_code` は追加しない。コード変更なし（実装は #2436〜#2438、NULL は #2439、テストは #2440）。
 
 - Issue #1573（docs(design)。TABLE-33 ポインタ。詳細は [timestamptz-tz-data-adoption.md](timestamptz-tz-data-adoption.md)）: TIMESTAMPTZ の TZ データ源として jiff（`=0.2.38`・`std`＋`tzdb-bundle-always`・`jiff-tzdb` `=0.1.9` の直接 pin）を採る承認資料を作成し、2026-10-16 にオーナーが推奨案を承認した（記録: Issue #1573 のコメント）。tzdata はバイナリ同梱（OS 参照・環境変数は不使用）、バイナリ増分は約 +0.54MB。#1574〜#1577 は本承認に基づき着手してよい。本 Issue ではコード・依存の変更なし。
+
+- Issue #2439（feat(engine)。TASK-337・WIRE-12・WIRE-24 ポインタ。親 #2434）: Bind の NULL パラメータ（`None`）を、一律 `22000` 拒否から、裸の `NULL` トークンへの置換（リテラル `NULL` と同値。位置別の受理／拒否と `wire_code` は既存の許可リストパーサーが決める）へ変更した。`decode_bind_values_nullable` を新設し、公開 `decode_bind_values`／`substitute_values` の署名は維持。新しい `wire_code` は追加しない。同値性テストを `crates/engine/tests/prepared_params.rs` に追加し、wire12／wire14 の層 A 期待値を更新した。詳細は [wire-extended-query-param-binding.md](wire-extended-query-param-binding.md)。
