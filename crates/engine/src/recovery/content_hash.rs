@@ -2121,6 +2121,9 @@ fn push_dml_expr(
                 // 既存の `Binary Sub` のハッシュで区別される。
                 crate::sql::udf_call::JsonAccessOp::Concat => 10,
                 crate::sql::udf_call::JsonAccessOp::DeletePath => 11,
+                // Issue #2186: jsonpath 演算子。既存の 1〜11 は不変。
+                crate::sql::udf_call::JsonAccessOp::PathExists => 12,
+                crate::sql::udf_call::JsonAccessOp::PathMatch => 13,
             });
             push_dml_expr(b, lhs, params)?;
             push_dml_expr(b, rhs, params)?;
@@ -4945,6 +4948,29 @@ mod tests {
                 "json contains vs path",
                 json_access(crate::sql::udf_call::JsonAccessOp::Contains, n(), text("a")),
                 json_access(crate::sql::udf_call::JsonAccessOp::Get, n(), text("a")),
+            ),
+            // Issue #2186: jsonpath 演算子は互いに、また既存の存在演算子とも区別される。
+            (
+                "json path_exists vs path_match",
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::PathExists,
+                    n(),
+                    text("$.a"),
+                ),
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::PathMatch,
+                    n(),
+                    text("$.a"),
+                ),
+            ),
+            (
+                "json path_exists vs exists",
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::PathExists,
+                    n(),
+                    text("a"),
+                ),
+                json_access(crate::sql::udf_call::JsonAccessOp::Exists, n(), text("a")),
             ),
             // Issue #2181: 連結・パス削除演算子も種別・左右で区別される（下位タグ 10・11）。
             (

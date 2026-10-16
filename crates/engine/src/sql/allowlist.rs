@@ -218,8 +218,8 @@ fn is_where_group_operator_token(token: &Token) -> bool {
     ) || is_json_operator_token(token)
 }
 
-/// jsonb 演算子のトークン（パス取得 `-> ->> #> #>>`・包含 `@> <@`・存在 `? ?| ?&`。
-/// TABLE-25。Issue #1596・#1598）かどうか。式の中置演算子ループ
+/// jsonb 演算子のトークン（パス取得 `-> ->> #> #>>`・包含 `@> <@`・存在 `? ?| ?&`・jsonpath `@? @@`。
+/// TABLE-25。Issue #1596・#1598・#2186）かどうか。式の中置演算子ループ
 /// （[`Parser::parse_json_access_rest`]）の続きを判定する先読みが共有する。
 fn is_json_operator_token(token: &Token) -> bool {
     matches!(
@@ -231,6 +231,8 @@ fn is_json_operator_token(token: &Token) -> bool {
             | Token::HashMinus
             | Token::Concat
             | Token::JsonContains
+            | Token::JsonPathExists
+            | Token::JsonPathMatch
             | Token::JsonContainedBy
             | Token::JsonExists
             | Token::JsonExistsAny
@@ -5912,7 +5914,7 @@ impl<'a> Parser<'a> {
         self.parse_json_access_rest(lhs, depth)
     }
 
-    /// jsonb 演算子（パス取得 `->` `->>` `#>` `#>>`・包含 `@>` `<@`・存在 `?` `?|` `?&`）の
+    /// jsonb 演算子（パス取得 `->` `->>` `#>` `#>>`・包含 `@>` `<@`・存在 `?` `?|` `?&`・jsonpath `@?` `@@`）の
     /// ループ（対象ビヘイビア: TABLE-25。Issue #1596・#1598）。PostgreSQL の優先順位表で「その他の演算子」の段にあたり、加減算
     /// （[`Self::parse_add_expr`]）より弱く比較より強い。左結合のため
     /// `a -> 'x' ->> 'y'` は `(a -> 'x') ->> 'y'`、`a -> 1 + 1` は `a -> (1 + 1)`。
@@ -5933,6 +5935,8 @@ impl<'a> Parser<'a> {
                 Some(Token::HashMinus) => JsonAccessOp::DeletePath,
                 Some(Token::Concat) => JsonAccessOp::Concat,
                 Some(Token::JsonContains) => JsonAccessOp::Contains,
+                Some(Token::JsonPathExists) => JsonAccessOp::PathExists,
+                Some(Token::JsonPathMatch) => JsonAccessOp::PathMatch,
                 Some(Token::JsonContainedBy) => JsonAccessOp::ContainedBy,
                 Some(Token::JsonExists) => JsonAccessOp::Exists,
                 Some(Token::JsonExistsAny) => JsonAccessOp::ExistsAny,
@@ -15592,6 +15596,8 @@ mod tests {
             ("?", JsonAccessOp::Exists),
             ("?|", JsonAccessOp::ExistsAny),
             ("?&", JsonAccessOp::ExistsAll),
+            ("@?", JsonAccessOp::PathExists),
+            ("@@", JsonAccessOp::PathMatch),
         ] {
             let preds = where_predicates_for(&format!(
                 "SELECT * FROM documents WHERE d {sql_op} 'x' {tail}"

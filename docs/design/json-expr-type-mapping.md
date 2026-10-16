@@ -266,10 +266,29 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 - 使える位置: 投影・ORDER BY・WHERE。`jsonb_path_exists`／`jsonb_path_match` は WHERE で比較なしの裸の述語として
   書ける（否定の `NOT` 付きは `42601`。`JsonAccess` の述語演算子と同じ扱い）。CHECK・関数本体は `0A000`。
 - 意図的な差分・対象外: 集合返却の `jsonb_path_query` は名前だけ予約して `0A000`（SRF 基盤 #2220 待ち）、
-  `jsonb_path_*_tz` は未実装（`42883`）、`jsonpath` 型そのもの・名前付き引数は対象外。`@?`／`@@` は #2186、
-  `JSON_EXISTS` 等は #2187。#2184 から引き継ぐ差分（数値の桁数・`.keyvalue()` の id・datetime 系・
+  `jsonb_path_*_tz` は未実装（`42883`）、`jsonpath` 型そのもの・名前付き引数は対象外。
+  `@?`／`@@` は #2186 で実装済み（下記）、`JSON_EXISTS` 等は #2187。#2184 から引き継ぐ差分（数値の桁数・`.keyvalue()` の id・datetime 系・
   `like_regex`）は変わらない。
 - 期待値は PostgreSQL 17 の挙動に合わせたが、実機との突き合わせは未実施（strict の推定を含む）。
+
+## Issue #2186 での変更（`@?`・`@@` 演算子）
+
+- 対象ビヘイビア: TABLE-25（ポインタ）。`jsonb @? jsonpath`（存在判定）と `jsonb @@ jsonpath`
+  （述語判定）を、字句（`Token::JsonPathExists`・`JsonPathMatch`。最長一致で単独の `@` は従来どおり拒否）・
+  構文（`Expr::JsonAccess` の `PathExists`・`PathMatch`。`@>` と同じ優先順位・左結合）・束縛に追加した。
+- 束縛は関数呼び出しへ脱糖せず、`sql::jsonpath_fn::bind_jsonpath_operator` が
+  `jsonb_path_exists(l, r, '{}', true)`／`jsonb_path_match(l, r, '{}', true)` と同じ `BoundJsonPathFn`
+  （vars なし・silent は定数 true・起動時上限の焼き込み）を組み立てる。評価は関数形と同じ
+  `eval_jsonpath_fn` のため、結果とエラー分類は構造上一致する（結合テストで全行・複数 path で固定）。
+- 左辺は jsonb（型なし文字列リテラルは jsonb として解析。`json` 列・他の型は `42883`）。右辺は型なし文字列
+  リテラルのみで、束縛時に解析する（行が無くても構文エラー。text 列・一般式は `42883`）。
+  演算子の位置の裸の `NULL` は他の jsonb 演算子と同じく列名として解決される（リテラル化されない）。
+- 結果型は bool（OID 16）。WHERE では比較なしの裸の述語として書ける（`NOT` 付きは `42601`、CHECK・
+  関数本体は `0A000`/`42601` の既存規則）。`$n` は Bind 時に文字列リテラルへ置換されリテラルとして受理される。
+- 再起動耐性のハッシュ（RECOVER-10 ポインタ）は演算子種別 `@?`=12・`@@`=13 を追加（既存は不変）。
+- 対象外: GIN 相当の索引（#2204）、NoSQL filter、`jsonpath` 型の式・列・CAST、`@@` の全文検索版、
+  ORDER BY・VIEW 本文での利用（既存の jsonb 述語演算子と同じ受理範囲）。
+  期待値は PostgreSQL 17 の挙動に合わせたが、実機との突き合わせは未実施。
 
 ## 設計判断の所在
 
@@ -290,7 +309,7 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 | 連結・削除演算子（実装済み） | #2181 |
 | JSON スカラー関数（実装済み） | #1599 |
 | JSON 集合返却関数（SRF 基盤待ち） | #2220 |
-| jsonpath（字句・構文解析器は #2183、評価器は #2184、`jsonb_path_*` 関数は #2185 で実装済み） | #2183〜#2187 |
+| jsonpath（字句・構文解析器は #2183、評価器は #2184、`jsonb_path_*` 関数は #2185、`@?`／`@@` は #2186 で実装済み） | #2183〜#2187 |
 | 索引 | #2204 |
 
 ## 対象外・申し送り

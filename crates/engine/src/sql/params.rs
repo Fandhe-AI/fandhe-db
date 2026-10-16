@@ -1206,6 +1206,8 @@ pub(crate) fn decode_bind_values_nullable(
             | Token::HashArrowText
             | Token::HashMinus
             | Token::JsonContains
+            | Token::JsonPathExists
+            | Token::JsonPathMatch
             | Token::JsonContainedBy
             | Token::JsonExists
             | Token::JsonExistsAny

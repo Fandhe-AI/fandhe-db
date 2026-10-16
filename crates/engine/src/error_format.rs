@@ -9,7 +9,7 @@
 //!
 //! 収録範囲は「engine・wire-server が現に返している `wire_code`」を基本とし（engine の公開 API
 //! である jsonpath 評価器〔Issue #2184〕から返る `2203x` 系を含む。SQL 表層へは `jsonb_path_*`
-//! 〔Issue #2185〕で接続済みで、`@?`／`@@` は #2186）、TASK-153
+//! 〔Issue #2185〕・`@?`／`@@`〔Issue #2186〕で接続済み）、TASK-153
 //! （対象ビヘイビア ERR-1）が wire-server 側の横断写像（`wire-server/src/
 //! error_response.rs`）の網羅対象として `AuthRequired`（`28000`）を追加した。送出経路は
 //! TASK-174／HTTP-8（Issue #753）で wire-server の `http::session::close`／`http::

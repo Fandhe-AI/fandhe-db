@@ -356,7 +356,7 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 範囲 `1`〜`1,024`）（Issue #2184・TABLE-25）は、jsonpath 評価器の評価ステップ数と再帰深さの上限を、
 プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は評価器のハード上限と同じ値です）。
 超過時の SQLSTATE は `54000` で、`silent` でも抑止されません。設定値は SQL の `jsonb_path_*`
-（Issue #2185）の評価に適用されます（`@?`／`@@`・`JSON_EXISTS` は後続 Issue で配線）。範囲外・非数値・値欠落・2 回目以降の重複指定は
+（Issue #2185）の評価に適用されます（`@?`／`@@`〔Issue #2186〕にも同じ上限が適用されます。`JSON_EXISTS` は後続 Issue で配線）。範囲外・非数値・値欠落・2 回目以降の重複指定は
 fail-closed で起動エラーです。上限を引き上げることはできません
 （詳細: [docs/design/jsonpath-limits-cli.md](docs/design/jsonpath-limits-cli.md)）。
 
