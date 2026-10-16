@@ -379,21 +379,153 @@ fn parse_sql_prepared_rejects_parameter_number_over_max() {
     assert_eq!(err.wire_code(), "54000");
 }
 
-// --- 値検証（NULL は `22000`・形式不正は `22P02`） -------------------------------------------------------
+// --- 値検証（形式不正は `22P02`。NULL はリテラル `NULL` と同値: Issue #2439・WIRE-12・WIRE-24） -----
+
+/// NULL パラメータ（`None`）の束縛結果が、`$n` を裸の `NULL` に置き換えた SQL の
+/// `parse_sql` 結果と一致することを確認する（両方成功なら `ParsedSql` 完全一致、
+/// 両方失敗なら `wire_code` 一致。片方だけ成功は失敗）。受理／拒否を返す。
+fn assert_null_bind_matches_literal(
+    core: &EngineCore,
+    template: &str,
+    values: &[Option<&str>],
+    literal_sql: &str,
+) -> bool {
+    let prepared = core
+        .parse_sql_prepared(template)
+        .expect("parse_sql_prepared should succeed");
+    let vals: Vec<Option<Vec<u8>>> = values.iter().map(|v| v.and_then(some)).collect();
+    let bound = core.bind_prepared(&prepared, &vals);
+    let literal = core.parse_sql(literal_sql);
+    match (bound, literal) {
+        (Ok(b), Ok(l)) => {
+            assert_eq!(b, l, "bound form must equal literal form: {template}");
+            true
+        }
+        (Err(b), Err(l)) => {
+            assert_eq!(b.wire_code(), l.wire_code(), "wire_code parity: {template}");
+            false
+        }
+        (b, l) => panic!(
+            "accept/reject mismatch for {template}: bound_ok={} literal_ok={}",
+            b.is_ok(),
+            l.is_ok()
+        ),
+    }
+}
 
 #[test]
-fn bind_prepared_rejects_null_value() {
-    let path = unique_db_path("prepared-rejects-null-value");
+fn bind_prepared_null_matches_literal_null_per_position() {
+    let path = unique_db_path("prepared-null-parity");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_typed_table(&path);
+
+    let cases: &[(&str, &[Option<&str>], &str)] = &[
+        (
+            "SELECT id FROM typed WHERE body = $1 LIMIT 5",
+            &[None],
+            "SELECT id FROM typed WHERE body = NULL LIMIT 5",
+        ),
+        (
+            "SELECT id FROM typed WHERE id = $1 LIMIT 5",
+            &[None],
+            "SELECT id FROM typed WHERE id = NULL LIMIT 5",
+        ),
+        (
+            "SELECT id FROM typed WHERE n = $1 LIMIT 5",
+            &[None],
+            "SELECT id FROM typed WHERE n = NULL LIMIT 5",
+        ),
+        (
+            "SELECT id FROM typed WHERE b = $1 LIMIT 5",
+            &[None],
+            "SELECT id FROM typed WHERE b = NULL LIMIT 5",
+        ),
+        (
+            "SELECT id FROM typed WHERE flag = $1 LIMIT 5",
+            &[None],
+            "SELECT id FROM typed WHERE flag = NULL LIMIT 5",
+        ),
+        (
+            "SELECT id FROM typed WHERE mood = $1 LIMIT 5",
+            &[None],
+            "SELECT id FROM typed WHERE mood = NULL LIMIT 5",
+        ),
+        (
+            "SELECT id FROM typed ORDER BY embedding <=> $1 LIMIT 5",
+            &[None],
+            "SELECT id FROM typed ORDER BY embedding <=> NULL LIMIT 5",
+        ),
+        (
+            "SELECT id FROM typed USING PLAN($1) LIMIT 5",
+            &[None],
+            "SELECT id FROM typed USING PLAN(NULL) LIMIT 5",
+        ),
+        (
+            "INSERT INTO typed (id, embedding, body, n) VALUES (1, $1, $2, $3) USING OPERATION_ID $4",
+            &[Some("[0.1,0.2,0.3]"), Some("x"), None, Some("op-1")],
+            "INSERT INTO typed (id, embedding, body, n) VALUES (1, '[0.1,0.2,0.3]', 'x', NULL) USING OPERATION_ID 'op-1'",
+        ),
+        (
+            "INSERT INTO typed (id, embedding, body, n) VALUES (1, $1, $2, $3) USING OPERATION_ID $4",
+            &[Some("[0.1,0.2,0.3]"), None, Some("1"), Some("op-1")],
+            "INSERT INTO typed (id, embedding, body, n) VALUES (1, '[0.1,0.2,0.3]', NULL, 1) USING OPERATION_ID 'op-1'",
+        ),
+        (
+            "INSERT INTO typed (id, embedding, body) VALUES (1, $1, $2) USING OPERATION_ID $3",
+            &[Some("[0.1,0.2,0.3]"), Some("x"), None],
+            "INSERT INTO typed (id, embedding, body) VALUES (1, '[0.1,0.2,0.3]', 'x') USING OPERATION_ID NULL",
+        ),
+        (
+            "UPDATE typed SET n = $1 WHERE id = 1 USING OPERATION_ID 'op-2'",
+            &[None],
+            "UPDATE typed SET n = NULL WHERE id = 1 USING OPERATION_ID 'op-2'",
+        ),
+        (
+            "UPDATE typed SET body = $1 WHERE id = 1 USING OPERATION_ID 'op-2'",
+            &[None],
+            "UPDATE typed SET body = NULL WHERE id = 1 USING OPERATION_ID 'op-2'",
+        ),
+        (
+            "UPDATE typed SET n = n + $1 WHERE id = 1 USING OPERATION_ID 'op-2'",
+            &[None],
+            "UPDATE typed SET n = n + NULL WHERE id = 1 USING OPERATION_ID 'op-2'",
+        ),
+        (
+            "UPDATE typed SET body = upper($1) WHERE id = 1 USING OPERATION_ID 'op-2'",
+            &[None],
+            "UPDATE typed SET body = upper(NULL) WHERE id = 1 USING OPERATION_ID 'op-2'",
+        ),
+        (
+            "SELECT id FROM typed WHERE body = $1 AND body = $1 LIMIT 5",
+            &[None],
+            "SELECT id FROM typed WHERE body = NULL AND body = NULL LIMIT 5",
+        ),
+    ];
+    // 受理／拒否の期待（リテラル `NULL` の現状と同値。ベクトル `<=>`・`USING PLAN`・
+    // 台帳あり構成の `USING OPERATION_ID` は拒否側）。
+    let expected = [
+        true, true, true, true, true, true, false, false, true, true, false, true, true, true,
+        true, true,
+    ];
+    assert_eq!(cases.len(), expected.len());
+    for ((template, values, literal), want) in cases.iter().zip(expected) {
+        let accepted = assert_null_bind_matches_literal(&core, template, values, literal);
+        assert_eq!(accepted, want, "{template}");
+    }
+}
+
+#[test]
+fn bind_prepared_accepts_null_in_where_equality() {
+    // WIRE-24: 型が決まる位置（`WHERE <列> = $n`）の NULL は受理される。
+    let path = unique_db_path("prepared-accepts-null");
     let _guard = CleanupGuard(path.clone());
     let core = new_core_with_documents_table(&path);
 
     let prepared = core
         .parse_sql_prepared("SELECT id FROM documents WHERE lang = $1 LIMIT 5")
         .expect("parse_sql_prepared should succeed");
-    let err = core
-        .bind_prepared(&prepared, &[None])
-        .expect_err("NULL bind value must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    core.bind_prepared(&prepared, &[None])
+        .expect("NULL bind value must be accepted where the literal NULL is");
 }
 
 #[test]
