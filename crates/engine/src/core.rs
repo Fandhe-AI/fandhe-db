@@ -1181,8 +1181,8 @@ pub struct EngineCore {
     /// （単一表・集合演算枝・サブクエリ内側・ビュー外側・JOIN）にだけ効く。
     group_by_limits: crate::group_by_limits::GroupByLimits,
     /// jsonpath 評価のステップ数・再帰深さの上限（Issue #2184・TABLE-25 ポインタ）。
-    /// 差し替えは [`Self::with_jsonpath_limits`] のみ（起動時 1 回）。評価器の呼び出し側
-    /// （SQL 表層の `jsonb_path_*`。Issue #2185 以降）が参照するまでは getter のみの利用。
+    /// 差し替えは [`Self::with_jsonpath_limits`] のみ（起動時 1 回）。SQL 表層の `jsonb_path_*`
+    /// （Issue #2185）は、文実行入口が張る `JsonPathLimitsScope` 経由で束縛時にこの値を焼き込む。
     jsonpath_limits: crate::jsonpath_limits::JsonPathLimits,
     /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限（Issue #1552）。
     /// 差し替えは [`Self::with_nesting_limits`] のみ（起動時 1 回）。構文解析段と
@@ -4316,6 +4316,10 @@ impl EngineCore {
         // SQL-37（Issue #1586）: autocommit の読み取り文は文の開始時刻を `now()` 系の
         // 値として確定する（`now()` と `statement_timestamp()` は同値）。
         let _clock_scope = statement_clock_scope(parsed, None)?;
+        // Issue #2185: `jsonb_path_*` の束縛が起動時 CLI の評価上限を焼き込めるよう、文の束縛区間に
+        // 限って `jsonpath_limits` を現スレッドへ張る（`ClockScope` と同じ RAII。大域状態ではない）。
+        let _jsonpath_limits_scope =
+            crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
         // SQL-37・Issue #1587: INSERT の列 `DEFAULT now()` 系の評価時刻（autocommit は文の開始時刻）。
         let _default_clock_scope = insert_default_clock_scope(parsed, None)?;
         match parsed {
@@ -4710,6 +4714,10 @@ impl EngineCore {
                     })?,
             ),
         )?;
+        // Issue #2185: `jsonb_path_*` の束縛が起動時 CLI の評価上限を焼き込めるよう、文の束縛区間に
+        // 限って `jsonpath_limits` を現スレッドへ張る（`ClockScope` と同じ RAII。大域状態ではない）。
+        let _jsonpath_limits_scope =
+            crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
 
         // SQL-37・Issue #1587: INSERT の列 `DEFAULT now()` 系はトランザクション開始時刻で評価する。
         let _default_clock_scope = insert_default_clock_scope(
@@ -5215,6 +5223,10 @@ impl EngineCore {
 
         // SQL-37（Issue #1586）: Describe も読み取り文の束縛を通る（値は型決定にしか使わない）。
         let _clock_scope = statement_clock_scope(parsed, None)?;
+        // Issue #2185: `jsonb_path_*` の束縛が起動時 CLI の評価上限を焼き込めるよう、文の束縛区間に
+        // 限って `jsonpath_limits` を現スレッドへ張る（`ClockScope` と同じ RAII。大域状態ではない）。
+        let _jsonpath_limits_scope =
+            crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
 
         match parsed {
             ParsedSql::Insert(stmt) => {
@@ -5499,6 +5511,10 @@ impl EngineCore {
         stmt: crate::sql::allowlist::Statement,
         dict_txn: Option<&redb::WriteTransaction>,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // Issue #2185: 検証済み文の直接実行（`execute_sql` 等）でも `jsonb_path_*` の束縛が
+        // 起動時の評価上限を使えるようにする（`execute_parsed_in_session` 等と同じ RAII）。
+        let _jsonpath_limits_scope =
+            crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
         match stmt {
             crate::sql::allowlist::Statement::SetSearchMode { value } => {
                 let mode = crate::sql::mode::SearchMode::parse_literal(&value)?;

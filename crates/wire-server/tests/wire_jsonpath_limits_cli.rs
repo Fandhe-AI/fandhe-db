@@ -12,6 +12,13 @@
 //!
 //! 設定値が評価の判定（`54000`）へ届くことは
 //! `crates/engine/tests/jsonpath_eval.rs` の担当（本ファイルは CLI 解析の外形確認）。
+//! ただし Issue #2185 以降は、`EngineCore::with_jsonpath_limits` で下げた上限が pg wire 越しの
+//! `jsonb_path_*` の評価（`54000`）に効くことを R5 で確認する。
+
+#[path = "common/mod.rs"]
+mod common;
+#[path = "http_common/mod.rs"]
+mod http_common;
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -197,5 +204,68 @@ fn invalid_missing_duplicate_or_out_of_range_values_are_rejected() {
                 "args={extra_args:?}: expected stderr to contain {msg:?}, got: {stderr}"
             );
         }
+    }
+}
+
+/// R5（Issue #2185）: 上限を下げて組み立てた engine では病的な path が `54000` になり、既定の
+/// 上限では同じ文が成功する。`silent` を付けても `54000` は抑止されない。
+#[test]
+fn lowered_limits_reach_jsonb_path_evaluation_over_pg_wire() {
+    use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+    use engine::core::EngineCore;
+    use engine::jsonpath_limits::JsonPathLimits;
+    use engine::kernel::CpuScalarProvider;
+    use engine::storage::Storage;
+    use std::sync::Arc;
+
+    let run = |limits: Option<JsonPathLimits>, tag: &str| {
+        let path = http_common::temp_db::unique_db_path(tag);
+        let guard = http_common::temp_db::CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                    ColumnDef::new("docb", ColumnType::Jsonb, true),
+                ],
+            ))
+            .expect("create table");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let core = match limits {
+            Some(l) => core.with_jsonpath_limits(l),
+            None => core,
+        };
+        let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+        let addr = common::spawn_server_with_engine(&users_path, Arc::new(core));
+        let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+        common::send_simple_query(
+            &mut alice,
+            r#"INSERT INTO docs (id, embedding, docb) VALUES (1, '[0.1,0.2,0.3]', '{"a":[1,2,3]}') USING OPERATION_ID 'op-lim-1'"#,
+        );
+        assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+        common::read_ready_for_query(&mut alice);
+        (alice, guard)
+    };
+
+    let sql = "SELECT jsonb_path_query_array(docb, '$.**.**.**') FROM docs WHERE id = 1 LIMIT 1";
+    let (mut default_conn, _g1) = run(None, "wire-jsonpath-limits-default");
+    common::send_simple_query(&mut default_conn, sql);
+    let _ = common::read_row_description_with_oids(&mut default_conn);
+    let _ = common::read_data_row(&mut default_conn);
+    common::read_command_complete(&mut default_conn);
+    common::read_ready_for_query(&mut default_conn);
+
+    let (mut small_conn, _g2) = run(
+        Some(JsonPathLimits::new(5, 4)),
+        "wire-jsonpath-limits-small",
+    );
+    for stmt in [
+        sql,
+        "SELECT jsonb_path_query_array(docb, '$.**.**.**', '{}', true) FROM docs WHERE id = 1 LIMIT 1",
+    ] {
+        common::send_simple_query(&mut small_conn, stmt);
+        common::expect_error_response_with_sqlstate(&mut small_conn, "54000");
+        common::read_ready_for_query(&mut small_conn);
     }
 }

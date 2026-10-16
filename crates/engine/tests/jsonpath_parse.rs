@@ -764,11 +764,6 @@ const PG17_TABLE: &[(&str, &str)] = &[
 /// PostgreSQL 17 との意図的な差分（入力, 本リポジトリの結果）。`like_regex` を含む入力は
 /// 別規則（`expected`）で一括して扱う。
 const DIVERGENCES: &[(&str, &str)] = &[
-    // `\u0000`・`\x00`: PostgreSQL は 22P05。対応する ErrorClass が未追加のため暫定で 22P02。
-    (r####""\x00""####, "22P02"),
-    (r####""\u0000""####, "22P02"),
-    (r####"$"\u0000""####, "22P02"),
-    (r####""\u{0}""####, "22P02"),
     // 識別子の直後の `/*`: PostgreSQL は識別子の文字列を黙って捨てて受理／拒否が不定になる
     // 癖がある。本リポジトリは fail-closed で一律 42601 とする。
     (r####"last/* c */ $"####, "42601"),
@@ -1023,7 +1018,7 @@ fn wire_codes_per_variant() {
         (Syntax, "42601"),
         (Empty, "22P02"),
         (InvalidUnicode, "22P02"),
-        (UnsupportedUnicodeEscape, "22P02"),
+        (UnsupportedUnicodeEscape, "22P05"),
         (IntegerOutOfRange, "22003"),
         (RegexNotSupported, "0A000"),
         (TooLong, "54000"),
