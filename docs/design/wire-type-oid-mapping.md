@@ -40,6 +40,7 @@ float／日付／バイナリ／UUID／JSON 列をネイティブ型へ復元で
 | `Date` | `Date` | 1082 | 4 | `date` |
 | `Timestamp` | `Timestamp` | 1114 | 8 | `timestamp` |
 | `Time` | `Time` | 1083 | 8 | `time` |
+| `TimestampTz` | `TimestampTz` | 1184 | 8 | `timestamptz` |
 | `Bytea` | `Bytea` | 17 | -1 | `bytea` |
 | `Uuid` | `Uuid` | 2950 | 16 | `uuid` |
 | `Json` | `Json` | 114 | -1 | `json` |

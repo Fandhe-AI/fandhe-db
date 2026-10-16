@@ -781,6 +781,37 @@ fn create_table_time_column_binds_and_rejects_array_element() {
     assert_eq!(http_common::wire_code_of(&arr), "0A000", "got: {arr:?}");
 }
 
+/// Issue #1577（TABLE-33・NOSQL-13）: `create_table`／`add_column` の型名 `"timestamptz"` が
+/// 受理され、ISO 8601 の文字列が束縛でき、書式不正は 22007 で拒否される。
+#[test]
+fn create_table_timestamptz_column_binds() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let resp = query(
+        &session,
+        br#"{"op":"create_table","table":"tz","columns":[
+        {"name":"embedding","type":"vector","dim":2},
+        {"name":"t","type":"timestamptz","nullable":true}
+    ]}"#,
+    );
+    assert_eq!(resp.status, 200, "got: {resp:?}");
+    let ok = query(
+        &session,
+        br#"{"op":"insert","table":"tz","rows":[{"id":1,"embedding":[0.1,0.2],"t":"2026-01-01T00:00:00+09:00"}],"operation_id":"tz-1"}"#,
+    );
+    assert_eq!(ok.status, 200, "got: {ok:?}");
+    let bad = query(
+        &session,
+        br#"{"op":"insert","table":"tz","rows":[{"id":2,"embedding":[0.1,0.2],"t":"nope"}],"operation_id":"tz-2"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&bad), "22007", "got: {bad:?}");
+    let add = query(
+        &session,
+        br#"{"op":"alter_table","table":"tz","add_column":{"name":"t2","type":"timestamptz"}}"#,
+    );
+    assert_eq!(add.status, 200, "got: {add:?}");
+}
+
 // --- CHECK 制約（Issue #1199・NOSQL-13・TABLE-16。SQL 表層と同じ engine の
 // 検査点が違反を `23514`／HTTP 409 で拒否することを固定する） -------------
 

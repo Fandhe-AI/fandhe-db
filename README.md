@@ -17,6 +17,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - **接続プロトコル**: PostgreSQL wire プロトコル v3 互換の**自作実装**（`pgwire` 等の外部ライブラリへ可能な限り依存しない）。psql・psycopg・node pg が無改造で接続可能なことを PoC-8 で実測済み
 - **クエリ表層**: 標準クエリカタログ C1〜C5 を MVP とする vector 特化 SQL（C6 集計・C7 結合は拡張扱い）。LLM クエリプランニングは専用構文 `USING PLAN(...)` で SQL に露出
 - **検索モード**: `recall`（広域・既定）／`precision`（ピンポイント抽出）の切り替えを提供。切替手段・実行契約の詳細は spec のビヘイビア定義（SQL-12・SEARCH-9/10・PLAN-11・TASK-161〜165）を参照
+- **照合順序（`COLLATE`）**: 既定は `C`（バイト列順）。`C`／`POSIX` に加え、ICU4X（`icu_collator`）による `und-x-icu`・`ja-x-icu`（deterministic。等しい値はバイト列順で二次比較）を列定義・式の `COLLATE` で指定できる。`ORDER BY`・`GROUP BY`・`DISTINCT`・`MIN`／`MAX`・`WHERE` の比較が照合に従い、照合を運べない経路は `0A000` で拒否する（fail-closed）。照合込みの索引は後続（#2191）。対応状況の詳細は [`docs/design/implementation-status.md`](docs/design/implementation-status.md) の Issue #2190
 - **広域取得（ソートなしのフィルタ取得）**: `ORDER BY`／`USING PLAN` を伴わない `SELECT ... [WHERE ...] LIMIT n` を SQL 表層へ追加（`Statement::Scan`。Issue #454）。ランキング段・取得モードを持たず、可視かつ `WHERE` を満たす行を先頭から `LIMIT` 件返す（順序保証なし・早期終了）。契約の詳細（spec 側では SQL-15・TASK-170 として付与済み〔fandhe-db-spec#12〕。受け入れ確認・確定化は TASK-170 が担う。閾値等は実装既定値）は [`docs/design/wide-retrieval-scan.md`](docs/design/wide-retrieval-scan.md) を参照
 - **クレート構成**: `engine`（コアロジック: データロード・検索カーネル・認証・RLS）＋ `wire-server`（バイナリ）の workspace 構成（TASK-66 で雛形を構築済み。各機能の実装は後続タスク）
 - **永続化**: `redb` ベース（単一ライタ・スナップショット読み取り。並行書き込み検証は MS-1 の TASK-144）
