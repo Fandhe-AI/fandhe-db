@@ -1345,6 +1345,7 @@ fn io_error_from_frame(e: FrameError) -> io::Error {
 pub(crate) fn handle_parse<S: WireStream>(
     stream: &mut S,
     engine: &EngineCore,
+    session: &SessionState,
     txn: &mut engine::sql::transaction::SessionTransaction<'_>,
     state: &mut ExtendedQueryState,
 ) -> io::Result<LoopSignal> {
@@ -1362,7 +1363,7 @@ pub(crate) fn handle_parse<S: WireStream>(
         }
     };
 
-    match handle_parse_body(engine, txn, &mut state.statements, &body) {
+    match handle_parse_body(engine, session, txn, &mut state.statements, &body) {
         Ok(()) => {
             stream.write_all(&result_encoder::encode_parse_complete())?;
             stream.flush()?;
@@ -1377,6 +1378,7 @@ pub(crate) fn handle_parse<S: WireStream>(
 
 fn handle_parse_body(
     engine: &EngineCore,
+    session: &SessionState,
     txn: &mut engine::sql::transaction::SessionTransaction<'_>,
     store: &mut PreparedStatementStore,
     body: &[u8],
@@ -1406,9 +1408,15 @@ fn handle_parse_body(
         }
         PreparedStatement::Empty
     } else {
-        let prepared = engine
-            .parse_sql_prepared(&msg.query)
-            .map_err(HandlerError::Sql)?;
+        // Parse 時の定数畳み込み（`AT LOCAL`・ゾーン無し `TIMESTAMPTZ '…'`）も接続の TimeZone で
+        // 行い、簡易クエリと挙動を揃える（Issue #1576 レビュー指摘）。
+        let prepared = {
+            let _session_tz_scope =
+                engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
+            engine
+                .parse_sql_prepared(&msg.query)
+                .map_err(HandlerError::Sql)?
+        };
         match prepared.parsed_if_unparameterized() {
             // `$n` を含まない文は従来どおり Parsed 経路のまま保持する
             // （二重 parse なし・挙動不変）。宣言型があれば過剰宣言。

@@ -2100,6 +2100,11 @@ fn push_dml_expr(
                 // 2 引数形も、型なし文字列リテラル（束縛時のセッション TZ で解釈）を取りうる。
                 b.mark_tz_dependent();
             }
+            // 3 引数 `date_trunc(unit, ts, zone)` は TIMESTAMP 入力をセッション TimeZone で
+            // TIMESTAMPTZ へ変換するため、TIMESTAMP 列のみの表でも TZ 依存とする。
+            if name.eq_ignore_ascii_case("date_trunc") && args.len() == 3 {
+                b.mark_tz_dependent();
+            }
             if args.len() == 1 && name.eq_ignore_ascii_case("timezone") {
                 let tz = crate::datetime::current_session_time_zone();
                 b.push_bytes(tz.display().as_bytes())
@@ -4596,6 +4601,39 @@ mod tests {
             vec![ColumnDef::new("ts", ColumnType::Text, true)],
         );
         assert_eq!(hash_in("Asia/Tokyo", &without), hash_in("UTC", &without));
+    }
+
+    /// TIMESTAMP 列のみの表でも、3 引数 `date_trunc` を含む分割実行 UPDATE は
+    /// セッション TimeZone が違えば別ハッシュ（Issue #1576 レビュー指摘）。
+    #[test]
+    fn partitioned_update_hash_includes_time_zone_for_three_arg_date_trunc() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::datetime::{SessionTimeZone, SessionTimeZoneScope};
+        use crate::sql::allowlist::SetValue;
+        use crate::sql::udf_call::{Expr, UdfRegistry};
+        let registry = UdfRegistry::default();
+        let predicates = partitioned_test_predicates();
+        let schema = TableSchema::new(
+            "t".to_string(),
+            vec![ColumnDef::new("ts", ColumnType::Timestamp, true)],
+        );
+        let expr = |args: Vec<Expr>| {
+            SetValue::Expr(Expr::Call {
+                name: "date_trunc".to_string(),
+                args,
+            })
+        };
+        let lit = |s: &str| Expr::String(s.to_string());
+        let three = expr(vec![lit("day"), Expr::Ident("ts".to_string()), lit("UTC")]);
+        let two = expr(vec![lit("day"), Expr::Ident("ts".to_string())]);
+        let hash_in = |tz: &str, v: &SetValue| {
+            let _scope =
+                SessionTimeZoneScope::enter(SessionTimeZone::parse_setting(tz).expect("tz"));
+            for_update_where_partitioned("t", &[("ts", v)], &predicates, &registry, &schema)
+                .expect("hash")
+        };
+        assert_ne!(hash_in("Asia/Tokyo", &three), hash_in("UTC", &three));
+        assert_eq!(hash_in("Asia/Tokyo", &two), hash_in("UTC", &two));
     }
 
     /// 分割実行版は原子版と別ドメイン（タグ 11／12）で、同一入力でも別ハッシュ

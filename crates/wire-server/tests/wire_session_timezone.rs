@@ -508,3 +508,34 @@ fn parameterless_prepared_insert_uses_the_bind_time_zone() {
     // 東京の 09:00 は UTC の 00:00（東京表示で 09:00:00+09）。UTC で畳み込むと 18:00:00+09 になる。
     assert_eq!(select_v(&mut s), ["2026-01-01 09:00:00+09"]);
 }
+
+/// Parse 時の定数畳み込みにも接続のセッション TimeZone を適用する（Issue #1576 レビュー指摘）。
+/// UTC で畳み込むと `AT LOCAL AT TIME ZONE 'Asia/Tokyo'` が範囲外（22008）になる式でも、
+/// Asia/Tokyo 接続では簡易クエリと同じく Parse が成功する。
+#[test]
+fn parse_folds_constants_with_the_connection_time_zone() {
+    let (core, _g) = new_core();
+    let (mut s, _) = connect(spawn(&core), &[]);
+    run(&mut s, "SET TIME ZONE 'Asia/Tokyo'");
+    for (ty, body) in [
+        (
+            b'P',
+            parse_body(
+                "s1",
+                "INSERT INTO t (id, v) VALUES (1, \
+                 TIMESTAMP '9999-12-31 20:00:00' AT LOCAL AT TIME ZONE 'Asia/Tokyo') \
+                 USING OPERATION_ID 'pz1'",
+                0,
+            ),
+        ),
+        (b'S', Vec::new()),
+    ] {
+        send_length_prefixed_message(&mut s, ty, &body);
+    }
+    let msgs = until_ready(&mut s);
+    assert!(
+        msgs.iter().any(|(t, _)| *t == b'1') && msgs.iter().all(|(t, _)| *t != b'E'),
+        "Parse should succeed: {}",
+        types(&msgs)
+    );
+}
