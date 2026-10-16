@@ -588,9 +588,19 @@ struct TextColumnIndex {
     offsets: Vec<u32>,
     slots: Vec<u32>,
     equality: HashMap<String, u32>,
+    /// `values` の並びを決める辞書の照合（Issue #2191。`ENUM` はバイト列順の `C`）。
+    collation: crate::collation::Collation,
+    /// 構築時の列の実効照合（宣言的述語〔裸の列 対 リテラル〕の式の照合）。
+    column_collation: crate::collation::Collation,
 }
 
 impl TextColumnIndex {
+    /// この辞書で `usage` の述語を解決できるか（[`text_index_supports`]。式の照合は
+    /// 宣言的述語の裸の列を想定した構築時の列の実効照合）。
+    fn supports(&self, usage: TextPredicateUse) -> bool {
+        text_index_supports(usage, self.collation, self.column_collation)
+    }
+
     /// `value_index`（`values`/`equality` の添字）に対応するスロット列（昇順）。
     #[cfg_attr(not(test), allow(dead_code))]
     fn slots_for_value_index(&self, value_index: u32) -> Option<&[u32]> {
@@ -607,6 +617,11 @@ impl TextColumnIndex {
     /// ドキュメント「データモデル」・[`ScalarIndex::candidates_for`] 参照）。
     #[cfg_attr(not(test), allow(dead_code))]
     fn prefix_slots(&self, prefix: &str) -> Vec<u32> {
+        // 前方一致の連続性は辞書がバイト列順のときだけ成り立つ。呼び出し側は
+        // `supports(Prefix)` で防ぐが、防御として ICU 順の辞書では何も返さない。
+        if !self.collation.is_byte_order() {
+            return Vec::new();
+        }
         // `values` はバイト列昇順の辞書のため、`prefix` 自身が最初に現れうる
         // 位置を二分探索で求め、そこから前方一致が途切れるまで線形に辿る
         // （辞書順では前方一致する値は連続する）。
@@ -714,11 +729,119 @@ pub(crate) struct ScalarIndex {
     approx_bytes: usize,
 }
 
+/// バイト列順で組み上げた辞書（`values`・CSR の `offsets`/`slots`・`equality`）を、辞書の
+/// 照合順へ並べ替える（Issue #2191・TABLE-28）。バイト列順の照合は何もしない。ICU 照合は
+/// 異なり値だけを [`crate::collation::Collation::compare`]（等しい場合はバイト列で二次比較する
+/// 全順序。deterministic）で並べ、置換に従って `values`・`offsets`・`slots` を組み直し、
+/// `equality` の添字を写し替える。文字列本体は移動するだけで複製しない。組み直しで一時的に
+/// 増えるのは `offsets`/`slots`/置換配列/新しい `values` 配列領域の分だけで、`approx_bytes`（確定済みの計上額）に
+/// 足した合計を予算検査してから確保する。
+fn reorder_text_dictionary(
+    values: &mut Vec<String>,
+    offsets: &mut Vec<u32>,
+    slots: &mut Vec<u32>,
+    equality: &mut HashMap<String, u32>,
+    collation: crate::collation::Collation,
+    approx_bytes: usize,
+) -> Result<(), ScalarIndexBuildError> {
+    if collation.is_byte_order() || values.len() < 2 {
+        return Ok(());
+    }
+    let distinct = values.len();
+    // 新旧の `String` 配列は代入まで同時に存在するため、`new_values` の領域
+    // （異なり値数 × `size_of::<String>()`）も一時メモリとして計上する。
+    let temp_bytes = distinct
+        .saturating_mul(2 * std::mem::size_of::<u32>())
+        .saturating_add(distinct.saturating_mul(std::mem::size_of::<String>()))
+        .saturating_add(
+            offsets
+                .len()
+                .saturating_add(slots.len())
+                .saturating_mul(std::mem::size_of::<u32>()),
+        );
+    check_scalar_index_budget(approx_bytes, temp_bytes)?;
+    // `order[new] = old`
+    let mut order: Vec<u32> = Vec::new();
+    order
+        .try_reserve_exact(distinct)
+        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+    for i in 0..distinct {
+        order.push(u32::try_from(i).map_err(|_| ScalarIndexBuildError::SlotOverflow)?);
+    }
+    let value_at = |i: u32| -> &[u8] {
+        usize::try_from(i)
+            .ok()
+            .and_then(|i| values.get(i))
+            .map_or(&[][..], |v| v.as_bytes())
+    };
+    // 異なり値はバイト列が互いに異なり、比較は等しいとき必ずバイト列で二次比較するため
+    // 同値ペアは存在しない（決定的）。
+    order.sort_unstable_by(|a, b| collation.compare(value_at(*a), value_at(*b))); // sort-determinism: allow 異なり値の全順序（compare は等しい場合にバイト列で二次比較する）
+    let mut rank: Vec<u32> = Vec::new();
+    rank.try_reserve_exact(distinct)
+        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+    rank.resize(distinct, 0);
+    let mut new_values: Vec<String> = Vec::new();
+    new_values
+        .try_reserve_exact(distinct)
+        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+    let mut new_offsets: Vec<u32> = Vec::new();
+    new_offsets
+        .try_reserve_exact(offsets.len())
+        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+    let mut new_slots: Vec<u32> = Vec::new();
+    new_slots
+        .try_reserve_exact(slots.len())
+        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+    new_offsets.push(0);
+    for (new_pos, &old) in order.iter().enumerate() {
+        let old_usize = usize::try_from(old).map_err(|_| ScalarIndexBuildError::SlotOverflow)?;
+        let start = offsets
+            .get(old_usize)
+            .copied()
+            .and_then(|v| usize::try_from(v).ok());
+        let end = old_usize
+            .checked_add(1)
+            .and_then(|n| offsets.get(n))
+            .copied()
+            .and_then(|v| usize::try_from(v).ok());
+        let (Some(start), Some(end)) = (start, end) else {
+            return Err(ScalarIndexBuildError::SlotOverflow);
+        };
+        let Some(range) = slots.get(start..end) else {
+            return Err(ScalarIndexBuildError::SlotOverflow);
+        };
+        new_slots.extend_from_slice(range);
+        new_offsets
+            .push(u32::try_from(new_slots.len()).map_err(|_| ScalarIndexBuildError::SlotOverflow)?);
+        let Some(value) = values.get_mut(old_usize) else {
+            return Err(ScalarIndexBuildError::SlotOverflow);
+        };
+        new_values.push(std::mem::take(value));
+        if let Some(r) = rank.get_mut(old_usize) {
+            *r = u32::try_from(new_pos).map_err(|_| ScalarIndexBuildError::SlotOverflow)?;
+        }
+    }
+    for vi in equality.values_mut() {
+        let mapped = usize::try_from(*vi)
+            .ok()
+            .and_then(|i| rank.get(i))
+            .copied()
+            .ok_or(ScalarIndexBuildError::SlotOverflow)?;
+        *vi = mapped;
+    }
+    *values = new_values;
+    *offsets = new_offsets;
+    *slots = new_slots;
+    Ok(())
+}
+
 /// `TextColumnIndex` 構築時の並び替えキー: バイト列昇順、同値はスロット昇順。
 /// スロット（`u32`。同一列内で重複しない）が全順序の明示的タイブレークを
 /// 提供するため、この比較関数のもとで同値ペアは存在しない（決定的ソート）。
 fn cmp_value_then_slot(a: &(String, u32), b: &(String, u32)) -> std::cmp::Ordering {
-    // 辞書を構築する列は実効照合がバイト列順のものだけ（構築側のゲート）。比較は照合の
+    // 蓄積の段はバイト列順で並べ、同じ値の行を連続させる（辞書の照合順への並べ替えは
+    // 異なり値だけを対象に `reorder_text_dictionary` が行う。Issue #2191）。比較は照合の
     // 比較器を経由させ、「キーの順序 = 比較器の順序」を構造的にそろえる（Issue #1610）。
     crate::collation::Collation::DEFAULT
         .compare(a.0.as_bytes(), b.0.as_bytes())
@@ -772,7 +895,37 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> Option<Vec<u32>> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ScalarIndexTarget<'a> {
     Auto,
-    Declared(&'a [String]),
+    Declared(&'a [DeclaredScalarColumn]),
+}
+
+pub(crate) use crate::catalog::DeclaredScalarColumn;
+
+impl DeclaredScalarColumn {
+    /// この列の辞書を並べる照合を決める（Issue #2191・TABLE-28）。1 列に辞書は 1 本だけ
+    /// 持つため、宣言の照合（`None` は列の実効照合に従う）が複数あって解決後に食い違う場合は
+    /// 次の規則で 1 つに決める: 列の実効照合と同じ順序の宣言があればその照合、なければ
+    /// 索引名の昇順で最初の宣言の照合。決定は宣言の追加順・カタログの走査順に依存しない。
+    pub(crate) fn resolved_collation(
+        &self,
+        column_collation: Option<crate::collation::Collation>,
+    ) -> crate::collation::Collation {
+        use crate::collation::Collation;
+        let column_effective = Collation::effective(None, column_collation);
+        let resolved = |c: Option<Collation>| Collation::effective(c, column_collation);
+        if let Some(c) = self
+            .decls
+            .iter()
+            .map(|(_, c)| resolved(*c))
+            .find(|c| c.same_order(column_effective))
+        {
+            return c;
+        }
+        self.decls
+            .iter()
+            .min_by(|a, b| a.0.cmp(&b.0))
+            .map(|(_, c)| resolved(*c))
+            .unwrap_or(column_effective)
+    }
 }
 
 impl ScalarIndexTarget<'_> {
@@ -780,7 +933,81 @@ impl ScalarIndexTarget<'_> {
     fn includes(&self, column_name: &str) -> bool {
         match self {
             ScalarIndexTarget::Auto => true,
-            ScalarIndexTarget::Declared(cols) => cols.iter().any(|c| c == column_name),
+            ScalarIndexTarget::Declared(cols) => cols.iter().any(|c| c.name == column_name),
+        }
+    }
+
+    /// `column` の辞書（`TEXT` 系列）を並べる照合。`Auto` は列の実効照合、`Declared` は宣言から
+    /// 決めた照合（[`DeclaredScalarColumn::resolved_collation`]）。宣言に無い列は構築対象外の
+    /// ため列の実効照合を返す（呼び出し側は [`Self::includes`] を先に見る）。
+    pub(crate) fn text_index_collation(
+        &self,
+        column: &crate::catalog::ColumnDef,
+    ) -> crate::collation::Collation {
+        match self {
+            ScalarIndexTarget::Auto => {
+                crate::collation::Collation::effective(None, column.collation)
+            }
+            ScalarIndexTarget::Declared(cols) => {
+                match cols.iter().find(|c| c.name == column.name) {
+                    Some(decl) => decl.resolved_collation(column.collation),
+                    None => crate::collation::Collation::effective(None, column.collation),
+                }
+            }
+        }
+    }
+}
+
+/// 辞書の照合を決める対象の列か（`TEXT`・`VARCHAR`・`CHAR`。`ENUM` は宣言順で照合を持たない）。
+fn is_text_family(ty: &ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_)
+    )
+}
+
+/// 述語が辞書をどう使うか（照合込みの使用可否の判定入力。Issue #2191）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextPredicateUse {
+    /// 等価・`IN`（辞書の直引き）。式の照合が索引の照合と同じ順序のときだけ使える。
+    Equality,
+    /// `LIKE 'x%'` の前方一致（辞書の範囲走査）。辞書がバイト列順のときだけ使える
+    /// （ICU 順の辞書ではバイト列の前方一致が連続しない）。
+    Prefix,
+    /// 式レーンの `=` 比較（索引は使わない。EXPLAIN の理由表示にだけ使う）。値は比較の照合。
+    ExprEquality(crate::collation::Collation),
+}
+
+/// 照合込みの索引の使用可否の唯一の定義（実行時の `candidates_for`・`resolve_candidates` と
+/// 静的判定 `scalar_plan_under_target_with_reason` が共有する。EXPLAIN と実行時の矛盾を作らない）。
+/// `index` は辞書の照合、`expr` は式側（裸の列 対 リテラルの宣言的述語では列の実効照合）。
+pub(crate) fn text_index_supports(
+    usage: TextPredicateUse,
+    index: crate::collation::Collation,
+    expr: crate::collation::Collation,
+) -> bool {
+    match usage {
+        TextPredicateUse::Equality => index.same_order(expr),
+        TextPredicateUse::Prefix => index.is_byte_order(),
+        // 式レーンの `=` 比較は索引を使わないが、照合が一致していれば「照合は原因ではない」と
+        // 判定できる（EXPLAIN の理由表示用）。
+        TextPredicateUse::ExprEquality(compare) => index.same_order(compare),
+    }
+}
+
+/// `EXPLAIN` の `scalar_plan:` 行へ付ける、索引を使えない理由（閉じた語彙。Issue #2191）。
+/// 値・テナントの存在情報を含めない固定語彙だけを持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScalarFallbackReason {
+    /// 述語の照合と索引の照合が合わず、全走査へ縮退した。
+    CollationMismatch,
+}
+
+impl ScalarFallbackReason {
+    /// `EXPLAIN` の語彙（snake_case）。
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            ScalarFallbackReason::CollationMismatch => "collation_mismatch",
         }
     }
 }
@@ -793,7 +1020,7 @@ impl ScalarIndexTarget<'_> {
 #[derive(Debug, Clone)]
 pub(crate) enum ScalarIndexTargetOwned {
     Auto,
-    Declared(Vec<String>),
+    Declared(Vec<DeclaredScalarColumn>),
 }
 
 impl ScalarIndexTargetOwned {
@@ -899,6 +1126,59 @@ pub(crate) fn scalar_plan_under_target(
         }
     }
     plan
+}
+
+/// [`scalar_plan_under_target`] に、照合込みの使用可否（Issue #2191・TABLE-28）を加えた版。
+/// `text_uses` は述語が TEXT 系列の辞書をどう使うか（列添字と [`TextPredicateUse`]）で、
+/// 実行時の `candidates_for`・`filter_column_is_indexed` と同じ [`text_index_supports`] を
+/// 通す（EXPLAIN と実行時を矛盾させない）。索引の照合と合わない宣言的述語（`Equality`・
+/// `Prefix`）が 1 つでもあれば全体を `PlainScan` へ降格する（実行時は 1 述語でも使えなければ
+/// 全走査に縮退する）。戻り値の理由は、最終的な計画が `PlainScan` で、照合の不一致を 1 つ以上
+/// 検出したときだけ `Some`（式レーンの `=` 比較の不一致もここで検出する）。カタログ読み取り
+/// 失敗（`target` が `Err`）は理由を付けない（原因は照合ではない）。
+pub(crate) fn scalar_plan_under_target_with_reason(
+    plan: crate::sql::scalar_plan::ScalarPlan,
+    metadata_filter_columns: impl IntoIterator<Item = Option<usize>>,
+    text_uses: &[(usize, TextPredicateUse)],
+    schema: &TableSchema,
+    target: &Result<ScalarIndexTargetOwned, ()>,
+) -> (
+    crate::sql::scalar_plan::ScalarPlan,
+    Option<ScalarFallbackReason>,
+) {
+    use crate::sql::scalar_plan::ScalarPlan;
+
+    let after_target = scalar_plan_under_target(plan, metadata_filter_columns, schema, target);
+    let Ok(owned) = target else {
+        return (after_target, None);
+    };
+    let target_ref = owned.as_target();
+    let mut mismatch = false;
+    let mut blocks_index = false;
+    for &(column_index, usage) in text_uses {
+        let Some(column) = schema.columns.get(column_index) else {
+            continue;
+        };
+        if !is_text_family(&column.ty) || !target_ref.includes(&column.name) {
+            continue;
+        }
+        let index_collation = target_ref.text_index_collation(column);
+        let column_collation = crate::collation::Collation::effective(None, column.collation);
+        if !text_index_supports(usage, index_collation, column_collation) {
+            mismatch = true;
+            if !matches!(usage, TextPredicateUse::ExprEquality(_)) {
+                blocks_index = true;
+            }
+        }
+    }
+    let final_plan = if blocks_index {
+        ScalarPlan::PlainScan
+    } else {
+        after_target
+    };
+    let reason = (final_plan == ScalarPlan::PlainScan && mismatch)
+        .then_some(ScalarFallbackReason::CollationMismatch);
+    (final_plan, reason)
 }
 
 impl ScalarIndex {
@@ -1022,19 +1302,10 @@ impl ScalarIndex {
                 per_column_typed.push(None);
                 continue;
             }
-            // 辞書はバイト列昇順で並べるため、列の実効照合がバイト列順でない TEXT 系列は未索引に
-            // する（等価・前方一致・IN・単一 TEXT GROUP BY の各経路は「列が索引未対応」契約で
-            // 全走査へ縮退する）。照合込みの索引は #2191（TABLE-28・Issue #1610）。ENUM は
-            // 照合を持たない（宣言順）ため対象外。
-            if matches!(
-                column.ty,
-                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_)
-            ) && !crate::collation::Collation::effective(None, column.collation).is_byte_order()
-            {
-                per_column.push(None);
-                per_column_typed.push(None);
-                continue;
-            }
+            // TEXT 系列の辞書は索引の照合順（Auto は列の実効照合、Declared は宣言の照合）で並べる
+            // （確定段 `reorder_text_dictionary`。Issue #2191・TABLE-28）。蓄積は照合に依らず
+            // バイト列順で行い、異なり値だけを照合順へ並べ替えるため、ICU 照合でも比較回数は
+            // 異なり値数 d に対して O(d log d) に収まる。
             match &column.ty {
                 // ENUM 列は TEXT と同じ辞書表現を共有する（Issue #890 D3。
                 // ラベルは短いため平均値長ゲートで除外されることは実質ない）。
@@ -1425,7 +1696,7 @@ impl ScalarIndex {
         columns
             .try_reserve_exact(column_count)
             .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
-        for entries in per_column {
+        for (col_index, entries) in per_column.into_iter().enumerate() {
             match entries {
                 None => columns.push(None),
                 Some(mut pairs) => {
@@ -1521,11 +1792,33 @@ impl ScalarIndex {
                             .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                         offsets.push(slots_len);
                     }
+                    // 辞書の照合（Issue #2191）。`ENUM` は宣言順で照合を持たないため `C` 固定。
+                    let schema_column = schema.columns.get(col_index);
+                    let (collation, column_collation) = match schema_column {
+                        Some(c) if is_text_family(&c.ty) => (
+                            target.text_index_collation(c),
+                            crate::collation::Collation::effective(None, c.collation),
+                        ),
+                        _ => (
+                            crate::collation::Collation::DEFAULT,
+                            crate::collation::Collation::DEFAULT,
+                        ),
+                    };
+                    reorder_text_dictionary(
+                        &mut values,
+                        &mut offsets,
+                        &mut slots,
+                        &mut equality,
+                        collation,
+                        approx_bytes,
+                    )?;
                     columns.push(Some(TextColumnIndex {
                         values,
                         offsets,
                         slots,
                         equality,
+                        collation,
+                        column_collation,
                     }));
                 }
             }
@@ -1659,10 +1952,20 @@ impl ScalarIndex {
                 .typed_columns
                 .get(filter.column_index())
                 .is_some_and(Option::is_some),
-            _ => self
-                .columns
-                .get(filter.column_index())
-                .is_some_and(Option::is_some),
+            op => {
+                let Some(Some(column)) = self.columns.get(filter.column_index()) else {
+                    return false;
+                };
+                // 照合込みの使用可否（Issue #2191）。静的判定 `scalar_plan_under_target_with_reason`
+                // と同じ `text_index_supports` を通す。
+                match op {
+                    FilterOp::Equals(_) | FilterOp::InText(_) => {
+                        column.supports(TextPredicateUse::Equality)
+                    }
+                    FilterOp::StartsWith(_) => column.supports(TextPredicateUse::Prefix),
+                    _ => true,
+                }
+            }
         }
     }
 
@@ -1691,19 +1994,32 @@ impl ScalarIndex {
         }
         let column = self.columns.get(filter.column_index())?.as_ref()?;
         let mut result = match filter.op() {
-            FilterOp::Equals(value) => column
-                .equality
-                .get(value)
-                .and_then(|&vi| column.slots_for_value_index(vi))
-                .map(|s| s.to_vec())
-                .unwrap_or_default(),
-            FilterOp::StartsWith(prefix) => column.prefix_slots(prefix),
+            FilterOp::Equals(value) => {
+                if !column.supports(TextPredicateUse::Equality) {
+                    return None;
+                }
+                column
+                    .equality
+                    .get(value)
+                    .and_then(|&vi| column.slots_for_value_index(vi))
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default()
+            }
+            FilterOp::StartsWith(prefix) => {
+                if !column.supports(TextPredicateUse::Prefix) {
+                    return None;
+                }
+                column.prefix_slots(prefix)
+            }
             // `IN`（`TEXT`／`ENUM` 列。SQL-24・TASK-208 ポインタ）: 値ごとの
             // 等価スロットの和集合を取る。束縛段（`declarative_filter::
             // bind_filter_op`）が値を重複除去済みで渡すため本来互いに素だが、
             // 防御的に `sort_unstable`＋`dedup`（呼び出し元と同じ後処理）で
             // 冪等にする。
             FilterOp::InText(values) => {
+                if !column.supports(TextPredicateUse::Equality) {
+                    return None;
+                }
                 let mut union = Vec::new();
                 for value in values {
                     if let Some(slots) = column
@@ -1884,6 +2200,11 @@ impl ScalarIndex {
         column_index: usize,
     ) -> Option<impl Iterator<Item = (&str, &[u32])> + '_> {
         let column = self.columns.get(column_index)?.as_ref()?;
+        // 列挙形はキーのバイト列昇順を前提にする（`string_groups` がバイト列順で並べ直す）。
+        // 辞書が ICU 順の列は列挙できない（全走査へ縮退。Issue #2191）。
+        if !column.collation.is_byte_order() {
+            return None;
+        }
         Some((0..column.values.len()).filter_map(move |i| {
             let value = column.values.get(i)?.as_str();
             let value_index = u32::try_from(i).ok()?;
@@ -3405,6 +3726,8 @@ mod tests {
             offsets,
             slots,
             equality,
+            collation: crate::collation::Collation::DEFAULT,
+            column_collation: crate::collation::Collation::DEFAULT,
         };
 
         // `len()` ベースで計上した場合の下限（旧実装相当）。
@@ -4171,6 +4494,186 @@ mod tests {
 
     /// 新スカラー型の列を一通り含むテスト用テーブル。`flag`（`BOOLEAN`）は
     /// 索引対象外の型が引き続き `None` のままであることの対照として使う。
+    /// 照合込みの辞書（Issue #2191）: ICU 列の辞書は照合順に並び、`=`・`IN` は全走査のオラクルと
+    /// 一致する候補を返し、前方一致は辞書が連続しないため索引を使わない（`None`）。
+    #[test]
+    fn icu_dictionary_is_collation_ordered_and_equality_matches_oracle() {
+        use crate::collation::Collation;
+        let path = unique_db_path("scalar-index-icu-dict");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let mut schema = schema();
+        schema.columns[1].collation = Some(Collation::UndIcu);
+        storage.create_table(&schema).expect("create table");
+        let ctx_a = ctx("tenant-a");
+        let values = ["b", "A", "a", "B", "\u{e9}", "e", "z", "a", "", "\u{3042}"];
+        for (i, v) in values.iter().enumerate() {
+            insert(
+                &storage,
+                &ctx_a,
+                i as u64 + 1,
+                Some(v),
+                None,
+                Visibility::Public,
+            );
+        }
+        let (snapshot, schema) = snapshot_from(&storage, &ctx_a);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build");
+        let column = index.columns[1].as_ref().expect("ICU column is indexed");
+        assert_eq!(column.collation, Collation::UndIcu);
+        let mut expected: Vec<&str> = values.to_vec();
+        expected.sort_by(|a, b| Collation::UndIcu.compare(a.as_bytes(), b.as_bytes()));
+        expected.dedup();
+        let got: Vec<&str> = column.values.iter().map(String::as_str).collect();
+        assert_eq!(got, expected);
+        // 等価・`IN` は辞書の並びによらず、バイト列の等値のオラクルと一致する。
+        for needle in values.iter().chain(["zz"].iter()) {
+            let slots = index
+                .candidates_for(&MetadataFilter_equals(&schema, "kind", needle))
+                .expect("equality is served by the index");
+            let want: Vec<u32> = values
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v == &needle)
+                .map(|(i, _)| i as u32)
+                .collect();
+            assert_eq!(slots, want, "{needle:?}");
+        }
+        // 前方一致は ICU 順の辞書では使えない（全走査へ縮退）。
+        let prefix = MetadataFilter_starts_with(&schema, "kind", "a");
+        assert!(index.candidates_for(&prefix).is_none());
+        assert!(!index.filter_column_is_indexed(&prefix));
+        assert!(index.filter_column_is_indexed(&MetadataFilter_equals(&schema, "kind", "a")));
+        // 列挙形（GROUP BY）も辞書がバイト列順でないため使えない。
+        assert!(index.column_groups(1).is_none());
+    }
+
+    /// 宣言の照合の決定規則（Issue #2191）: 列の実効照合と同じ順序の宣言があればその照合、
+    /// なければ索引名の昇順で最初の宣言の照合（追加順・走査順に依らない）。
+    #[test]
+    fn declared_collation_resolution_rule_is_order_independent() {
+        use crate::collation::Collation;
+        let decl = |decls: &[(&str, Option<Collation>)]| DeclaredScalarColumn {
+            name: "kind".to_string(),
+            decls: decls.iter().map(|(n, c)| (n.to_string(), *c)).collect(),
+        };
+        // 列の実効照合は und-x-icu。
+        let col = Some(Collation::UndIcu);
+        // 指定なし宣言は列の実効照合に従う。
+        assert_eq!(
+            decl(&[("a", None)]).resolved_collation(col),
+            Collation::UndIcu
+        );
+        // 列と同じ順序の宣言が優先される（索引名の昇順より先）。
+        assert_eq!(
+            decl(&[("a", Some(Collation::C)), ("b", Some(Collation::UndIcu))])
+                .resolved_collation(col),
+            Collation::UndIcu
+        );
+        assert_eq!(
+            decl(&[("b", Some(Collation::UndIcu)), ("a", Some(Collation::C))])
+                .resolved_collation(col),
+            Collation::UndIcu
+        );
+        // 一致する宣言がなければ索引名の昇順で最初。
+        assert_eq!(
+            decl(&[("b", Some(Collation::C)), ("a", Some(Collation::JaIcu))])
+                .resolved_collation(col),
+            Collation::JaIcu
+        );
+        // C と POSIX は同じ順序とみなす。
+        assert_eq!(
+            decl(&[("a", Some(Collation::Posix))]).resolved_collation(None),
+            Collation::Posix
+        );
+    }
+
+    /// 照合込みの使用可否の単一情報源（Issue #2191）。
+    #[test]
+    fn text_index_supports_rules() {
+        use crate::collation::Collation::{JaIcu, Posix, UndIcu, C};
+        // 等価: 索引と式が同じ順序のときだけ。C と POSIX は同値。
+        assert!(text_index_supports(TextPredicateUse::Equality, C, Posix));
+        assert!(text_index_supports(
+            TextPredicateUse::Equality,
+            UndIcu,
+            UndIcu
+        ));
+        assert!(!text_index_supports(TextPredicateUse::Equality, UndIcu, C));
+        assert!(!text_index_supports(TextPredicateUse::Equality, C, JaIcu));
+        assert!(!text_index_supports(
+            TextPredicateUse::Equality,
+            UndIcu,
+            JaIcu
+        ));
+        // 前方一致: 辞書がバイト列順のときだけ。
+        assert!(text_index_supports(TextPredicateUse::Prefix, C, UndIcu));
+        assert!(!text_index_supports(
+            TextPredicateUse::Prefix,
+            UndIcu,
+            UndIcu
+        ));
+    }
+
+    /// 縮退理由つきの静的判定（Issue #2191）。理由は最終計画が `PlainScan` で不一致を検出
+    /// したときだけ付く。
+    #[test]
+    fn scalar_plan_with_reason_reports_collation_mismatch() {
+        use crate::collation::Collation;
+        use crate::sql::scalar_plan::ScalarPlan;
+        let mut schema = schema();
+        schema.columns[1].collation = Some(Collation::UndIcu);
+        let auto = Ok(ScalarIndexTargetOwned::Auto);
+        let run = |plan, uses: &[(usize, TextPredicateUse)]| {
+            scalar_plan_under_target_with_reason(plan, [Some(1)], uses, &schema, &auto)
+        };
+        // 宣言的な等価は索引を使える。前方一致は ICU 辞書で使えず理由つきの PlainScan。
+        assert_eq!(
+            run(
+                ScalarPlan::IndexEquality,
+                &[(1, TextPredicateUse::Equality)]
+            ),
+            (ScalarPlan::IndexEquality, None)
+        );
+        assert_eq!(
+            run(ScalarPlan::IndexPrefix, &[(1, TextPredicateUse::Prefix)]),
+            (
+                ScalarPlan::PlainScan,
+                Some(ScalarFallbackReason::CollationMismatch)
+            )
+        );
+        // 式レーンの `=`: 照合が合えば理由なし、合わなければ理由つき。
+        assert_eq!(
+            run(
+                ScalarPlan::PlainScan,
+                &[(1, TextPredicateUse::ExprEquality(Collation::UndIcu))]
+            ),
+            (ScalarPlan::PlainScan, None)
+        );
+        assert_eq!(
+            run(
+                ScalarPlan::PlainScan,
+                &[(1, TextPredicateUse::ExprEquality(Collation::C))]
+            ),
+            (
+                ScalarPlan::PlainScan,
+                Some(ScalarFallbackReason::CollationMismatch)
+            )
+        );
+        // カタログ読み取り失敗は理由を付けない（原因は照合ではない）。
+        let failed: Result<ScalarIndexTargetOwned, ()> = Err(());
+        assert_eq!(
+            scalar_plan_under_target_with_reason(
+                ScalarPlan::IndexPrefix,
+                [Some(1)],
+                &[(1, TextPredicateUse::Prefix)],
+                &schema,
+                &failed
+            ),
+            (ScalarPlan::PlainScan, None)
+        );
+    }
+
     fn typed_schema() -> TableSchema {
         TableSchema::new(
             "typed_docs",
@@ -5299,7 +5802,9 @@ mod tests {
         fn declared_target_downgrades_excluded_column_to_plain_scan() {
             let schema = schema();
             // `kind`（添字 1）のみを宣言対象にする。述語は `path`（添字 2）。
-            let target = Ok(ScalarIndexTargetOwned::Declared(vec!["kind".to_string()]));
+            let target = Ok(ScalarIndexTargetOwned::Declared(vec![
+                DeclaredScalarColumn::plain("kind"),
+            ]));
             assert_eq!(
                 scalar_plan_under_target(ScalarPlan::IndexEquality, [Some(2)], &schema, &target),
                 ScalarPlan::PlainScan,
@@ -5310,7 +5815,9 @@ mod tests {
         #[test]
         fn declared_target_keeps_plan_when_all_columns_included() {
             let schema = schema();
-            let target = Ok(ScalarIndexTargetOwned::Declared(vec!["kind".to_string()]));
+            let target = Ok(ScalarIndexTargetOwned::Declared(vec![
+                DeclaredScalarColumn::plain("kind"),
+            ]));
             assert_eq!(
                 scalar_plan_under_target(ScalarPlan::IndexEquality, [Some(1)], &schema, &target),
                 ScalarPlan::IndexEquality,
@@ -5333,7 +5840,9 @@ mod tests {
         #[test]
         fn id_only_predicate_is_not_downgraded_under_declared() {
             let schema = schema();
-            let target = Ok(ScalarIndexTargetOwned::Declared(vec!["kind".to_string()]));
+            let target = Ok(ScalarIndexTargetOwned::Declared(vec![
+                DeclaredScalarColumn::plain("kind"),
+            ]));
             assert_eq!(
                 scalar_plan_under_target(ScalarPlan::IndexIdRange, [], &schema, &target),
                 ScalarPlan::IndexIdRange,
@@ -5345,7 +5854,9 @@ mod tests {
         #[test]
         fn unresolvable_column_index_downgrades_to_plain_scan() {
             let schema = schema();
-            let target = Ok(ScalarIndexTargetOwned::Declared(vec!["kind".to_string()]));
+            let target = Ok(ScalarIndexTargetOwned::Declared(vec![
+                DeclaredScalarColumn::plain("kind"),
+            ]));
             assert_eq!(
                 scalar_plan_under_target(ScalarPlan::IndexEquality, [None], &schema, &target),
                 ScalarPlan::PlainScan,
@@ -5358,7 +5869,9 @@ mod tests {
             let schema = schema();
             for target in [
                 Ok(ScalarIndexTargetOwned::Auto),
-                Ok(ScalarIndexTargetOwned::Declared(vec!["kind".to_string()])),
+                Ok(ScalarIndexTargetOwned::Declared(vec![
+                    DeclaredScalarColumn::plain("kind"),
+                ])),
                 Err(()),
             ] {
                 assert_eq!(

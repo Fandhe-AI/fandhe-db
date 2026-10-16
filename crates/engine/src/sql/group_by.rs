@@ -391,7 +391,9 @@ impl Ord for GroupKey {
 /// `sql::aggregate::classify_aggregate_access`（EXPLAIN の静的判定）も本関数を
 /// 単一の情報源として共有し、実行経路との食い違い（D5 矛盾出力）を防ぐ。
 /// キーの実効照合がバイト列順でない場合も `None`（索引の `column_groups` はバイト列順の
-/// 辞書で供給するため、汎用経路へ縮退させる。TABLE-28・Issue #1610。照合込みの索引は #2191）。
+/// 辞書で供給し、集計表 `string_groups` もバイト列順で並べ直すため、汎用経路へ縮退させる。
+/// TABLE-28・Issue #1610。ICU 順の辞書を持つ列は `column_groups` 自体が `None` を返す。
+/// ICU キーの列挙形は集計表側の照合対応が要るため #2191 の対象外）。
 pub(crate) fn single_text_key_column(group_by: &crate::sql::parser::BoundGroupBy) -> Option<usize> {
     match group_by.keys.as_slice() {
         [key] if key.kind == OrderKind::Bytes && key.collation.is_byte_order() => {

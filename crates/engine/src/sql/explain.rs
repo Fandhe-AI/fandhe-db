@@ -53,6 +53,7 @@ use crate::search_engine::SearchEngineKind;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::hnsw_cache::AnnPlan;
 use crate::sql::mode::ResolvedMode;
+use crate::sql::scalar_index::{ScalarFallbackReason, TextPredicateUse};
 use crate::sql::scalar_plan::{classify_scalar_plan, ScalarPlan, ScalarShapeInput};
 use crate::sql::udf_call::BoundExpr;
 
@@ -86,6 +87,9 @@ pub struct ExplainEngine {
     /// [`crate::sql::scalar_plan::classify_scalar_plan`] の判定結果
     /// （静的判定。Issue #474）。
     pub(crate) scalar_plan: ScalarPlan,
+    /// `scalar_plan:` 行へ ` reason=<語彙>` として付ける、索引を使えない理由（Issue #2191。
+    /// 照合の不一致で全走査へ縮退したときだけ `Some`）。
+    pub(crate) scalar_fallback: Option<ScalarFallbackReason>,
 }
 
 impl ExplainEngine {
@@ -102,7 +106,15 @@ impl ExplainEngine {
             kind,
             ann_plan,
             scalar_plan,
+            scalar_fallback: None,
         }
+    }
+
+    /// `scalar_plan:` 行へ付ける縮退理由を設定する（Issue #2191。`core.rs` の EXPLAIN 経路が
+    /// [`crate::sql::scalar_index::scalar_plan_under_target_with_reason`] の結果を渡す）。
+    pub(crate) fn with_scalar_fallback(mut self, reason: Option<ScalarFallbackReason>) -> Self {
+        self.scalar_fallback = reason;
+        self
     }
 
     /// [`crate::core::EngineCore::search_engine_kind`] の戻り値そのまま。
@@ -269,6 +281,136 @@ impl FilterColumnSet {
     }
 }
 
+/// 述語が TEXT 系列の辞書をどう使うかの列集合（Issue #2191）。`USING PLAN` の EXPLAIN は
+/// 束縛結果を [`Copy`] の [`ExplainShape`] に畳み、世代照合後のカタログ照会で索引の照合が確定
+/// してから照合込みの使用可否を判定するため、ここへ覚えておく。式レーンの `=` 比較は比較の
+/// 照合ごとに別の集合へ入れる（`C`／`POSIX` 系・`und-x-icu`・`ja-x-icu`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextUseSets {
+    /// 宣言的述語の等価・`IN`。
+    equality: FilterColumnSet,
+    /// 宣言的述語の前方一致。
+    prefix: FilterColumnSet,
+    /// 式レーンの `=` 比較（添字は [`expr_compare_slot`]）。
+    expr_equality: [FilterColumnSet; EXPR_COMPARE_SLOTS],
+}
+
+/// [`TextUseSets::expr_equality`] の要素数（照合の系統数）。
+const EXPR_COMPARE_SLOTS: usize = 3;
+
+/// 式レーンの比較の照合を [`TextUseSets::expr_equality`] の添字へ写す。網羅 `match`
+/// で、照合を追加したときに分類の判断を強制する。
+fn expr_compare_slot(collation: crate::collation::Collation) -> usize {
+    use crate::collation::Collation;
+    match collation {
+        Collation::C | Collation::Posix => 0,
+        Collation::UndIcu => 1,
+        Collation::JaIcu => 2,
+    }
+}
+
+/// [`expr_compare_slot`] の逆写像（スロットを代表の照合へ戻す）。
+fn expr_compare_collation(slot: usize) -> crate::collation::Collation {
+    use crate::collation::Collation;
+    match slot {
+        1 => Collation::UndIcu,
+        2 => Collation::JaIcu,
+        _ => Collation::C,
+    }
+}
+
+impl TextUseSets {
+    fn from_filters(filters: &[MetadataFilter], exprs: &[BoundExpr]) -> Self {
+        use crate::declarative_filter::FilterOp;
+        let mut sets = Self {
+            equality: FilterColumnSet::empty(),
+            prefix: FilterColumnSet::empty(),
+            expr_equality: [FilterColumnSet::empty(); EXPR_COMPARE_SLOTS],
+        };
+        for filter in filters {
+            match filter.op() {
+                FilterOp::Equals(_) | FilterOp::InText(_) => {
+                    sets.equality.insert(filter.column_index());
+                }
+                FilterOp::StartsWith(_) => sets.prefix.insert(filter.column_index()),
+                _ => {}
+            }
+        }
+        for expr in exprs {
+            if let Some((column_index, collation)) = expr_text_equality(expr) {
+                if let Some(set) = sets.expr_equality.get_mut(expr_compare_slot(collation)) {
+                    set.insert(column_index);
+                }
+            }
+        }
+        sets
+    }
+
+    /// 列添字と使い方の組へ展開する（要素数は列数上限 × 系統数で固定長）。
+    fn uses(&self) -> Vec<(usize, TextPredicateUse)> {
+        let mut out = Vec::new();
+        for i in self
+            .equality
+            .resolved_column_indices()
+            .into_iter()
+            .flatten()
+        {
+            out.push((i, TextPredicateUse::Equality));
+        }
+        for i in self.prefix.resolved_column_indices().into_iter().flatten() {
+            out.push((i, TextPredicateUse::Prefix));
+        }
+        for (slot, set) in self.expr_equality.iter().enumerate() {
+            for i in set.resolved_column_indices().into_iter().flatten() {
+                out.push((
+                    i,
+                    TextPredicateUse::ExprEquality(expr_compare_collation(slot)),
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// 式述語が TEXT 列の `=` 比較なら `(列添字, 比較の照合)` を返す（Issue #2191）。
+/// 照合を持つ比較はバイト列順でない照合のとき `TextCompare`、バイト列順のときは通常の
+/// `Binary` に束縛される（`udf_call::bind_collated_comparison`）ため、両方の形を見る。
+/// トップレベルの比較だけを対象にする（OR・NOT・関数の内側は理由表示の対象外）。
+fn expr_text_equality(expr: &BoundExpr) -> Option<(usize, crate::collation::Collation)> {
+    use crate::sql::udf_call::{BinOp, BuiltinFn};
+    match expr {
+        BoundExpr::Builtin {
+            f: BuiltinFn::TextCompare(BinOp::Eq, collation),
+            args,
+        } => args.iter().find_map(|a| match a {
+            BoundExpr::TextColumnRef { index } => Some((*index, *collation)),
+            _ => None,
+        }),
+        BoundExpr::Binary {
+            op: BinOp::Eq,
+            lhs,
+            rhs,
+        } => [lhs.as_ref(), rhs.as_ref()]
+            .into_iter()
+            .find_map(|a| match a {
+                BoundExpr::TextColumnRef { index } => {
+                    Some((*index, crate::collation::Collation::DEFAULT))
+                }
+                _ => None,
+            }),
+        _ => None,
+    }
+}
+
+/// 述語の TEXT 系列の辞書の使い方を、列添字と [`TextPredicateUse`] の組で返す（検索 EXPLAIN
+/// の `search_explain_from_bound` が [`ExplainShape`] を経由せず直接使う入口）。
+pub(crate) fn text_predicate_uses(
+    filters: &[MetadataFilter],
+    exprs: &[BoundExpr],
+) -> Vec<(usize, TextPredicateUse)> {
+    TextUseSets::from_filters(filters, exprs).uses()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExplainShape {
@@ -300,6 +442,8 @@ pub struct ExplainShape {
     /// `metadata_filters` から独立に構築する（両者の使い分けは [`Self::
     /// filter_cols`] のドキュメント参照）。
     filter_columns: FilterColumnSet,
+    /// Issue #2191: TEXT 系列の辞書の使い方（照合込みの使用可否と縮退理由の入力）。
+    text_uses: TextUseSets,
 }
 
 /// [`ExplainShape::filter_cols`] の語数。[`crate::catalog::MAX_COLUMN_COUNT`] から
@@ -360,7 +504,15 @@ impl ExplainShape {
             filter_cols,
             filter_cols_overflow,
             filter_columns: FilterColumnSet::from_filters(metadata_filters, expr_filters),
+            text_uses: TextUseSets::from_filters(metadata_filters, expr_filters),
         }
+    }
+
+    /// TEXT 系列の辞書の使い方（列添字と使い方の組。Issue #2191）。`core.rs::
+    /// EngineCore::run_explain_plan` が [`crate::sql::scalar_index::
+    /// scalar_plan_under_target_with_reason`] へ渡す。
+    pub(crate) fn text_uses(&self) -> Vec<(usize, TextPredicateUse)> {
+        self.text_uses.uses()
     }
 
     /// `ann_plan:` 行（Issue #411・[`crate::sql::hnsw_cache::classify_ann_plan`]）
@@ -539,7 +691,19 @@ fn push_engine_tail_rows(
     lines.push(ann_line);
     let mut scalar_line = format!("scalar_plan: {}", scalar_plan_token(engine.scalar_plan));
     append_index_suffix(&mut scalar_line, names.scalar());
+    append_reason_suffix(&mut scalar_line, engine.scalar_fallback);
     lines.push(scalar_line);
+}
+
+/// `line` の末尾へ、索引を使えない理由があれば ` reason=<語彙>` を追記する（Issue #2191。
+/// [`append_index_suffix`] と同じく既存トークンの末尾への追記のみで、行の追加・順序変更は
+/// しない。`None` なら何もしない＝既存の行と完全に同一のまま）。語彙は固定で、値・他テナントの
+/// 存在情報を含まない。
+fn append_reason_suffix(line: &mut String, reason: Option<ScalarFallbackReason>) {
+    if let Some(reason) = reason {
+        line.push_str(" reason=");
+        line.push_str(reason.token());
+    }
 }
 
 /// `line` の末尾へ、索引経路を使う場合に限り ` index=<name>[,<name>...]`
@@ -641,11 +805,13 @@ pub(crate) fn build_search_explain_result(
 /// 事項）。
 pub(crate) fn build_relational_explain_result(
     scalar_plan: ScalarPlan,
+    scalar_fallback: Option<ScalarFallbackReason>,
     access_path: AccessPath,
     names: &ExplainIndexNames,
 ) -> QueryResult {
     let mut scalar_line = format!("scalar_plan: {}", scalar_plan_token(scalar_plan));
     append_index_suffix(&mut scalar_line, names.scalar());
+    append_reason_suffix(&mut scalar_line, scalar_fallback);
     let lines = vec![
         scalar_line,
         format!("access_path: {}", access_path_token(access_path)),
@@ -674,6 +840,7 @@ mod tests {
             kind: Some(SearchEngineKind::ParallelBruteForce),
             ann_plan: AnnPlan::PlainScanEngine,
             scalar_plan: ScalarPlan::PlainScan,
+            scalar_fallback: None,
         }
     }
 
@@ -785,6 +952,7 @@ mod tests {
             kind: None,
             ann_plan: AnnPlan::UnknownCustomProvider,
             scalar_plan: ScalarPlan::PlainScan,
+            scalar_fallback: None,
         };
 
         let result = build_explain_result(&planned, &engine);
@@ -810,6 +978,7 @@ mod tests {
             kind: Some(SearchEngineKind::Hnsw(hnsw_params)),
             ann_plan: AnnPlan::HnswFullVisible,
             scalar_plan: ScalarPlan::PlainScan,
+            scalar_fallback: None,
         };
 
         let result = build_explain_result(&planned, &engine);
@@ -844,6 +1013,7 @@ mod tests {
                 kind: Some(SearchEngineKind::ParallelBruteForce),
                 ann_plan: plan,
                 scalar_plan: ScalarPlan::PlainScan,
+                scalar_fallback: None,
             };
             let result = build_explain_result(&planned, &engine);
             // `ann_plan` は末尾から 2 番目（末尾行は Issue #474 の
@@ -915,6 +1085,7 @@ mod tests {
                 kind,
                 ann_plan,
                 scalar_plan: ScalarPlan::PlainScan,
+                scalar_fallback: None,
             };
             let result = build_explain_result(&planned, &engine);
 
@@ -1012,6 +1183,7 @@ mod tests {
             kind: Some(SearchEngineKind::ParallelBruteForce),
             ann_plan: AnnPlan::HnswFullVisible,
             scalar_plan: ScalarPlan::IndexConjunction,
+            scalar_fallback: None,
         };
         let names = ExplainIndexNames::new(
             vec!["idx_vec".to_string()],
@@ -1038,6 +1210,7 @@ mod tests {
         let names = ExplainIndexNames::new(vec![], vec!["idx_kind".to_string()]);
         let result = build_relational_explain_result(
             ScalarPlan::IndexEquality,
+            None,
             AccessPath::ScalarIndexCandidates,
             &names,
         );

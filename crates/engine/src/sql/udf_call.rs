@@ -984,7 +984,8 @@ pub enum BuiltinFn {
     /// でないとき（ICU）だけ束縛段が作り、バイト列順なら従来の [`BoundExpr::Binary`] のまま
     /// にして既定照合の経路をバイト単位で不変に保つ。引数は TEXT 2 個で、NULL を含めば NULL。
     /// `BoundExpr::Binary` ではないためスカラー二次索引の分類（`sql::scalar_plan`）に乗らず、
-    /// 全走査へ縮退する（照合込みの索引は #2191）。
+    /// 全走査へ縮退する（EXPLAIN の縮退理由は `sql::explain::expr_text_equality` が `=` 比較に
+    /// ついて検出する。照合込みの索引は #2191）。
     TextCompare(BinOp, crate::collation::Collation),
 }
 
