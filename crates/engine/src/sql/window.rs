@@ -566,7 +566,8 @@ fn materialize_rows(
                     .len()
                     .saturating_mul(std::mem::size_of::<Option<OrderValue>>());
                 for r in &refs {
-                    if let Some(ScalarKeyRef::Bytes(b)) = r {
+                    if let Some(ScalarKeyRef::Bytes(b) | ScalarKeyRef::Collated { text: b, .. }) = r
+                    {
                         add = add.saturating_add(b.len());
                     }
                 }
@@ -886,8 +887,11 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
             Some(AggregateInput::VectorColumnPresence) => {
                 has_scalar_reference = true;
             }
+            // 照合付きの MIN/MAX は束縛段（`bind_window_item`）が `0A000` で拒否するため実際には
+            // 到達しないが、列参照としてはテキスト列と同じ扱いにしておく。
             Some(
                 AggregateInput::TextColumn(index)
+                | AggregateInput::CollatedTextColumn { index, .. }
                 | AggregateInput::BooleanColumn(index)
                 | AggregateInput::DateColumn(index)
                 | AggregateInput::TimestampColumn(index)
@@ -1020,6 +1024,9 @@ fn extract_window_input(
     Ok(match input {
         AggregateInput::AllVisible | AggregateInput::IdU64 => WindowInputValue::AllVisibleOrId,
         AggregateInput::VectorColumnPresence => WindowInputValue::VectorPresence(dim),
+        AggregateInput::CollatedTextColumn { .. } => {
+            return Err(window_bug("collated MIN/MAX reached the window executor"))
+        }
         AggregateInput::TextColumn(index) => WindowInputValue::Text(
             scanned
                 .get(*index)
@@ -1234,7 +1241,8 @@ fn cmp_window_key_value(a: &WindowKeyValue, b: &WindowKeyValue) -> std::cmp::Ord
     use std::cmp::Ordering;
     match (a, b) {
         (WindowKeyValue::Id(x), WindowKeyValue::Id(y)) => x.cmp(y),
-        // 照合の比較器（既定照合）に 1 本化。照合の受け渡しは #2190（TABLE-28・Issue #1610）。
+        // 照合の比較器（既定照合）に 1 本化。非バイト列順の照合（ICU）のキー・MIN/MAX は束縛段が
+        // 拒否する（`resolve_window_key`・`bind_window_item`。TABLE-28・Issue #2190）。
         (WindowKeyValue::Text(x), WindowKeyValue::Text(y)) => {
             crate::collation::Collation::DEFAULT.compare(x.as_bytes(), y.as_bytes())
         }
