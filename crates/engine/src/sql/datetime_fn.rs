@@ -669,8 +669,7 @@ mod tests {
         parse_timestamp(s).expect("fixture timestamp must parse")
     }
 
-    /// 2024-02-29（閏年）12:34:56.789012 の全 field を独立オラクル
-    /// （PostgreSQL の公開済み挙動）で固定する。
+    /// INTERVAL の date_part／date_trunc を独立オラクル（PostgreSQL の公開済み挙動）で固定する。
     #[test]
     fn interval_part_and_trunc() {
         use crate::datetime::{format_interval, parse_interval};
@@ -704,6 +703,8 @@ mod tests {
         );
     }
 
+    /// 2024-02-29（閏年）12:34:56.789012 の全 field を独立オラクル
+    /// （PostgreSQL の公開済み挙動）で固定する。
     #[test]
     fn time_part_fields_and_24h_boundary() {
         let t = crate::datetime::parse_time("12:34:56.789012").unwrap();
