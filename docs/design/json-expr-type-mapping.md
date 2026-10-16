@@ -303,6 +303,9 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   （`54000`）は捕捉しない。JSON の `null` は `JSON_VALUE` では SQL の NULL、`JSON_QUERY` では `null`。
 - 新しい SQLSTATE: `22034`（`ErrorClass::MoreThanOneSqlJsonItem`）・`22035`（`NoSqlJsonItem`）・
   `2203F`（`SqlJsonScalarRequired`）。文言は固定の英語文で、入力の断片を含めない（wire-server の HTTP 写像は 400）。
+  spec 追従の申し送り: これら 3 コードと HTTP 400 の対応付けは `docs/spec/04-behavior/error-format.md` ERR-6 に
+  未収載である（コード値のみをポインタ表記）。ERR-6 への追加は private spec リポ側の作業で、本リポの権限外。
+  追従が済むまでは本実装（`error_format.rs`・`allowlist.rs`・`wire-server/src/http/status.rs`）を暫定の根拠とする。
 - 使える位置: 投影・WHERE（`JSON_EXISTS` は比較なしの裸の述語。`NOT` 付きは `42601`）・ORDER BY・FROM なし SELECT。
   CHECK・関数本体・定数式（INSERT VALUES 等）は `0A000`／`42601`（既存の jsonb 関数と同じ扱い）。
 - prepared 文: `RETURNING`・`ON` が括弧内の句語として現れるため、`sql::params::where_region` は括弧の深さを数え、
@@ -315,7 +318,6 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   関数に合わない挙動の SQLSTATE（`42601`）、ラッパー指定時の 0 件の扱い（`ON EMPTY` を適用）は
   PostgreSQL 17 の挙動の推定を含む。
 - 期待値は PostgreSQL 17 のドキュメント・ソース由来で、実機との突き合わせは未実施。
-
 
 ## Issue #2186 での変更（`@?`・`@@` 演算子）
 

@@ -384,6 +384,7 @@ define_error_classes! {
     JsonObjectNotFound => ("2203C", "JSON_OBJECT_NOT_FOUND"),
     /// SQL/JSON 問い合わせ関数が単一項目を要する位置で 2 件以上を得た（`22034`。Issue #2187・
     /// TABLE-25 のポインタ）。`JSON_VALUE`／ラッパーなしの `JSON_QUERY` が返す。項目の値は含めない。
+    /// 22034・22035・2203F は ERR-6 への収載が未了（spec 追従待ち。docs/design/json-expr-type-mapping.md 参照）。
     /// [`crate::sql::allowlist::SqlSurfaceError::MoreThanOneSqlJsonItem`] の写像。
     MoreThanOneSqlJsonItem => ("22034", "MORE_THAN_ONE_SQL_JSON_ITEM"),
     /// `ERROR ON EMPTY` の指定で path の結果が空だった（`22035`。Issue #2187）。
