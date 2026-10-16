@@ -382,6 +382,12 @@ pub enum JsonAccessOp {
     /// `#-`（右辺は text[] リテラル。結果は jsonb。Issue #2181）。`jsonb - x` は
     /// 加減算の段の [`BinOp::Sub`] のまま構文段が生成し、束縛段が左辺の型で振り分ける。
     DeletePath,
+    /// `@?`（右辺は jsonpath 文字列リテラル。結果は bool。`jsonb_path_exists(l, r, '{}', true)`
+    /// と同値。Issue #2186）。
+    PathExists,
+    /// `@@`（右辺は jsonpath 文字列リテラル。結果は bool。`jsonb_path_match(l, r, '{}', true)`
+    /// と同値。Issue #2186）。
+    PathMatch,
 }
 
 impl JsonAccessOp {
@@ -399,6 +405,8 @@ impl JsonAccessOp {
             JsonAccessOp::ExistsAll => "?&",
             JsonAccessOp::Concat => "||",
             JsonAccessOp::DeletePath => "#-",
+            JsonAccessOp::PathExists => "@?",
+            JsonAccessOp::PathMatch => "@@",
         }
     }
 
@@ -412,6 +420,8 @@ impl JsonAccessOp {
                 | JsonAccessOp::Exists
                 | JsonAccessOp::ExistsAny
                 | JsonAccessOp::ExistsAll
+                | JsonAccessOp::PathExists
+                | JsonAccessOp::PathMatch
         )
     }
 }
@@ -3123,6 +3133,9 @@ fn bind_json_access(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if matches!(op, JsonAccessOp::PathExists | JsonAccessOp::PathMatch) {
+        return crate::sql::jsonpath_fn::bind_jsonpath_operator(op, lhs, rhs, env, node_budget);
+    }
     if op.is_predicate() {
         return bind_json_predicate(op, lhs, rhs, env, node_budget);
     }
@@ -3191,7 +3204,9 @@ fn bind_json_access(
         | JsonAccessOp::ExistsAny
         | JsonAccessOp::ExistsAll
         | JsonAccessOp::Concat
-        | JsonAccessOp::DeletePath => {
+        | JsonAccessOp::DeletePath
+        | JsonAccessOp::PathExists
+        | JsonAccessOp::PathMatch => {
             return Err(SqlSurfaceError::Internal {
                 detail: "JSON predicate or modify operator reached the path operator binder"
                     .to_string(),
@@ -4071,6 +4086,19 @@ pub(super) fn bind_json_jsonb_arg(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<BoundExpr, SqlSurfaceError> {
+    bind_json_jsonb_operand(expr, env, node_budget, || {
+        SqlSurfaceError::undefined_function(format!("function {name} requires a jsonb argument"))
+    })
+}
+
+/// [`bind_json_jsonb_arg`] の本体。jsonb 以外の型のときの 42883 文言だけを呼び出し側
+/// （関数形は `function … requires`、演算子形は `operator does not exist`）が決める。
+pub(super) fn bind_json_jsonb_operand(
+    expr: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+    type_mismatch: impl FnOnce() -> SqlSurfaceError,
+) -> Result<BoundExpr, SqlSurfaceError> {
     match expr {
         Expr::Null => {
             charge_one_node(node_budget)?;
@@ -4080,9 +4108,7 @@ pub(super) fn bind_json_jsonb_arg(
         _ => {
             let (bound, ty) = bind_json_predicate_operand(expr, env, node_budget)?;
             if ty != ExprType::Json {
-                return Err(SqlSurfaceError::undefined_function(format!(
-                    "function {name} requires a jsonb argument"
-                )));
+                return Err(type_mismatch());
             }
             Ok(bound)
         }

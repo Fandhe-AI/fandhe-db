@@ -329,9 +329,8 @@ fn bare_predicate_restrictions_fail_closed() {
     assert_eq!(code(&core, &alice, &sel("NOT (docb ? 'a')")), "42601");
     // 比較を伴わない非述語の式は従来どおり 42601。
     assert_eq!(code(&core, &alice, &sel("docb -> 'a'")), "42601");
-    // 字句: 単独の `@`・`@@`・`@?` は未対応のまま。
+    // 字句: 単独の `@` は未対応のまま（`@?`・`@@` は Issue #2186 で対応済み）。
     assert_eq!(code(&core, &alice, &sel("docb @ '{}'")), "42601");
-    assert_eq!(code(&core, &alice, &sel("docb @@ '{}'")), "42601");
     // CHECK 本体では受理しない。
     let err = core
         .execute_sql(

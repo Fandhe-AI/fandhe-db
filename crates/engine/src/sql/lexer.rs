@@ -67,8 +67,12 @@ pub enum Token {
     /// `#-`（jsonb のパス削除。TABLE-25・Issue #2181）。`#--` は PostgreSQL と同じく
     /// `#` と行コメントに分ける。
     HashMinus,
-    /// `@>`（jsonb 包含。TABLE-25・Issue #1598）。単独の `@`・`@?`・`@@` は未対応文字のまま。
+    /// `@>`（jsonb 包含。TABLE-25・Issue #1598）。単独の `@` は未対応文字のまま。
     JsonContains,
+    /// `@?`（jsonpath 存在判定。TABLE-25・Issue #2186）。
+    JsonPathExists,
+    /// `@@`（jsonpath 述語判定。TABLE-25・Issue #2186）。
+    JsonPathMatch,
     /// `<@`（jsonb 被包含。TABLE-25・Issue #1598）。
     JsonContainedBy,
     /// `?`（jsonb キー存在。TABLE-25・Issue #1598）。
@@ -212,6 +216,8 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
             Token::HashArrowText => out.push_str("#>>"),
             Token::HashMinus => out.push_str("#-"),
             Token::JsonContains => out.push_str("@>"),
+            Token::JsonPathExists => out.push_str("@?"),
+            Token::JsonPathMatch => out.push_str("@@"),
             Token::JsonContainedBy => out.push_str("<@"),
             Token::JsonExists => out.push('?'),
             Token::JsonExistsAny => out.push_str("?|"),
@@ -570,14 +576,21 @@ fn tokenize_impl(
                 }
             }
         }
-        // `@>`（jsonb 包含。Issue #1598）。単独の `@`・`@?`・`@@` は未対応文字として拒否する
-        // （jsonpath 演算子は #2182 系の対象）。
+        // `@>`（jsonb 包含。Issue #1598）・`@?`・`@@`（jsonpath 演算子。Issue #2186）。
+        // 単独の `@` は未対応文字として拒否する。`@?|` のような続きは `@?` の後に別トークンが
+        // 続くだけで、構文段が 42601 で拒否する（fail-closed）。
         if c == '@' {
             let mut lookahead = chars.clone();
             lookahead.next();
-            if matches!(lookahead.peek(), Some(&(_, '>'))) {
+            let token = match lookahead.peek() {
+                Some(&(_, '>')) => Some(Token::JsonContains),
+                Some(&(_, '?')) => Some(Token::JsonPathExists),
+                Some(&(_, '@')) => Some(Token::JsonPathMatch),
+                _ => None,
+            };
+            if let Some(token) = token {
                 lookahead.next();
-                tokens.push(Token::JsonContains);
+                tokens.push(token);
                 chars = lookahead;
                 continue;
             }
@@ -1475,8 +1488,10 @@ mod tests {
         assert!(tokenize("a ?|| b").is_err());
         // 単独の `@`・`@@`・`@?`・`&` は拒否のまま（jsonpath は対象外）。
         assert!(tokenize("a @ b").is_err());
-        assert!(tokenize("a @@ b").is_err());
-        assert!(tokenize("a @? b").is_err());
+        assert_eq!(toks("a @? b"), vec![a(), JsonPathExists, b()]);
+        assert_eq!(toks("a@@b"), vec![a(), JsonPathMatch, b()]);
+        // 最長一致の後に残る単独の `@` は従来どおり拒否する。
+        assert!(tokenize("a @@@ b").is_err());
         assert!(tokenize("a & b").is_err());
     }
 
@@ -1533,7 +1548,7 @@ mod tests {
     /// SQL-42・Issue #1520: 新トークンの描画 → 再字句化で同一列に戻る（最小ケース）。
     #[test]
     fn render_tokens_round_trips_multichar_operators() {
-        let sql = "a -> b ->> c #> d #>> e :: f || g - > h";
+        let sql = "a -> b ->> c #> d #>> e :: f || g - > h @? i @@ j";
         let tokens = tokenize(sql).expect("tokenize");
         let rendered = render_tokens(&tokens).expect("render");
         assert_eq!(tokenize(&rendered).expect("re-tokenize"), tokens);
