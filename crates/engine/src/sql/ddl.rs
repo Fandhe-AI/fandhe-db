@@ -1090,6 +1090,9 @@ pub(crate) fn add_column_default(
         ColumnType::Uuid => "uuid",
         ColumnType::Timestamp => "timestamp",
         ColumnType::Time => "time",
+        // TIMESTAMPTZ の既定値は文字列リテラルの原文を保持し、解釈は束縛時
+        // （`parser::bind_column_default`）に行う（Issue #1574）。
+        ColumnType::TimestampTz => "timestamptz",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
         ColumnType::Bytea => "bytea",
@@ -1122,6 +1125,7 @@ pub(crate) fn add_column_default(
                 || kind == "date"
                 || kind == "timestamp"
                 || kind == "time"
+                || kind == "timestamptz"
                 || kind == "uuid"
                 || kind == "enum"
                 || kind == "json" =>

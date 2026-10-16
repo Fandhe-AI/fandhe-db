@@ -307,6 +307,13 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(16);
             b.push_u64(*micros as u64);
         }
+        // TIMESTAMPTZ（TABLE-33・Issue #1574）は未使用の新規タグ 17 を採番する（既存タグの
+        // 意味・並びは不変）。UTC へ正規化済みのマイクロ秒をハッシュするため、`+09` と `Z` の
+        // 同一時刻は同じハッシュになる。
+        Value::TimestampTz(micros) => {
+            b.push_u8(17);
+            b.push_u64(*micros as u64);
+        }
         // 配列列（TABLE-14・Issue #888）は 10 とする。要素型タグ・要素数・各要素を
         // 積むことで、`{ab}`（1 要素）と `{a,b}`（2 要素）のような表記ゆれが
         // 衝突しない単射なハッシュ入力にする。

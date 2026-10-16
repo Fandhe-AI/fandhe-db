@@ -83,6 +83,15 @@ jiff の既定 features（`tz-system`・`tzdb-zoneinfo`・`tzdb-concatenated`・
 - **#1577**: wire は依存を追加しない
 - **sort-determinism-check の維持**: TIMESTAMPTZ の比較は UTC の i64 で行う
 
+## 5.1 Issue #1574 での実装結果
+
+- 追加した依存は承認どおり `jiff = "=0.2.38"`（`default-features = false`、`std`・`tzdb-bundle-always`）と `jiff-tzdb = "=0.1.9"` のみ。`crates/engine/Cargo.toml` に承認記録へのポインタ付きで記載した。wire-server には追加していない
+- `cargo tree -e normal -p fandhe-db-engine` で新規にリンクされる crate は `jiff`・`jiff-core`・`jiff-tzdb` の 3 つ。`Cargo.lock` には上記に加え、optional feature 用の `jiff-static`・`defmt`・`defmt-macros`・`defmt-parser`・`bitflags 1.3.2` が lock のみ追加される（ビルドには含まれない）
+- `make deny`（advisories／bans／licenses／sources）は通過。`cargo tree -d` に jiff 由来の重複は増えていない
+- engine は `TimeZoneDatabase::bundled()` を明示して使い、`jiff::tz::db()`・`TimeZone::system()`・`try_system()` は使っていない
+- `tz-fat`・`perf-inline` は有効にしていない（必要性を示す計測がないため。本資料の範囲で今後も採用しない場合は理由の再確認だけで足りる）
+- release バイナリのサイズ差は今回の作業では未計測。承認資料の見積もり（約 +0.54MB）のままである
+
 ## 6. セキュリティ観点（OWASP Top 10）
 
 | 観点 | 内容 |

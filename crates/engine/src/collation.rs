@@ -235,6 +235,7 @@ pub fn is_collatable(ty: &ColumnType) -> bool {
         | ColumnType::Date
         | ColumnType::Timestamp
         | ColumnType::Time
+        | ColumnType::TimestampTz
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
