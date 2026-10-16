@@ -577,6 +577,48 @@ pub fn parse_literal_exact(text: &str) -> Result<Decimal, NumericError> {
     parse_for_column(text, MAX_PRECISION, scale)
 }
 
+/// 整数 `AVG` の結果 scale（TABLE-13・Issue #2270）。PostgreSQL の
+/// `select_div_scale`（被除数 `sum`・除数 `count` の NBASE=10000 先頭桁と weight から
+/// `16 - 4 * qweight` を求め、`0..=1000` に丸める。入力 scale は 0）を再現する。
+/// 結果は `count <= u64::MAX` のとき高々 36 で、`avg_integer` から呼ばれる。
+pub(crate) fn pg_div_result_scale(sum: i128, count: u64) -> u8 {
+    // 絶対値の NBASE 先頭桁と weight（4 桁区切りの桁位置）。0 は (0, 0)。
+    fn weight_and_first(x: u128) -> (i32, u128) {
+        if x == 0 {
+            return (0, 0);
+        }
+        let mut weight: i32 = 0;
+        let mut rest = x;
+        while rest >= 10_000 {
+            rest /= 10_000;
+            weight += 1;
+        }
+        (weight, rest)
+    }
+    let (w_sum, first_sum) = weight_and_first(sum.unsigned_abs());
+    let (w_cnt, first_cnt) = weight_and_first(u128::from(count));
+    let mut qweight = w_sum - w_cnt;
+    if first_sum <= first_cnt {
+        qweight -= 1;
+    }
+    let rscale = 16 - 4 * qweight;
+    // 入力 scale は 0 なので下限 0。上限 1000 は到達しないが仕様どおり切る。
+    u8::try_from(rscale.clamp(0, 1000)).unwrap_or(MAX_PRECISION)
+}
+
+/// 整数列・`id` の `AVG`（TABLE-13・Issue #2270）の確定値。`sum / count` を
+/// [`pg_div_result_scale`] の scale で長除算（half away from zero）し `Decimal` にする。
+/// `count == 0` と 38 桁超過は `Err`（呼び出し元の `finish` が 22003/XX000 へ写像）。
+pub(crate) fn avg_integer(sum: i128, count: u64) -> Result<Decimal, NumericError> {
+    let scale = pg_div_result_scale(sum, count);
+    let unscaled = avg_unscaled(sum, count, 0, scale)?;
+    let decimal = Decimal::from_parts(unscaled, scale)?;
+    if !decimal.fits_precision(MAX_PRECISION) {
+        return Err(NumericError::OutOfRange);
+    }
+    Ok(decimal)
+}
+
 /// `AVG(NUMERIC(p,s))`（TABLE-13・SQL-13、Issue #892・D6）向けの長除算。
 /// `sum`（`from_scale` 桁の unscaled 累積値）を `count`（非 NULL 行数、`> 0`）で
 /// 割り、結果を `to_scale`（`>= from_scale`）桁の unscaled 整数として返す。
@@ -833,6 +875,35 @@ mod tests {
         // a は 0.999...9（38 桁）、b は 999...9（38 桁の整数）で a < b。
         assert_eq!(cmp_exact(&a, &b), Ordering::Less);
         assert_eq!(cmp_exact(&a, &a), Ordering::Equal);
+    }
+
+    // --- avg_integer（Issue #2270・PG17 オラクル） ---------------------------
+
+    #[test]
+    fn avg_integer_matches_postgres_scale_and_value() {
+        let cases: [(i128, u64, &str); 9] = [
+            (3, 2, "1.5000000000000000"),
+            (2, 2, "1.00000000000000000000"),
+            (1, 1, "1.00000000000000000000"),
+            (0, 1, "0.00000000000000000000"),
+            (5_000_050_000, 100_000, "50000.500000000000"),
+            (4, 3, "1.3333333333333333"),
+            (5, 3, "1.6666666666666667"),
+            (-7, 2, "-3.5000000000000000"),
+            (18_446_744_073_709_551_614, 2, "9223372036854775807"),
+        ];
+        for (sum, count, want) in cases {
+            let got = avg_integer(sum, count).unwrap();
+            assert_eq!(got.to_string(), want, "sum={sum} count={count}");
+        }
+    }
+
+    #[test]
+    fn avg_integer_rejects_zero_count_and_stays_in_precision() {
+        assert!(avg_integer(1, 0).is_err());
+        let big = avg_integer(i128::from(i64::MAX) * 1_000_000, u64::MAX).unwrap();
+        assert!(big.fits_precision(MAX_PRECISION));
+        assert!(pg_div_result_scale(1, u64::MAX) <= 40);
     }
 
     // --- avg_unscaled（D6・Issue #892） -------------------------------------

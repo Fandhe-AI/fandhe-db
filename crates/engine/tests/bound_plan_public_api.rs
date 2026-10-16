@@ -322,7 +322,14 @@ fn aggregate_sql_and_bound_paths_match_for_multi_function_with_where() {
     assert_eq!(cells[0], Cell::Integer(5), "n");
     assert_eq!(cells[1], Cell::Integer(5), "c");
     assert_eq!(cells[2], Cell::Integer(15), "s");
-    assert_eq!(cells[3], Cell::Float(3.0), "a");
+    // Issue #2270: 整数の AVG は numeric（15 / 5 = 3.0000000000000000）。
+    assert_eq!(
+        cells[3],
+        Cell::Numeric(
+            engine::numeric::Decimal::from_parts(30_000_000_000_000_000, 16).expect("decimal")
+        ),
+        "a"
+    );
     assert_eq!(cells[4], Cell::Integer(1), "lo");
     assert_eq!(cells[5], Cell::Integer(5), "hi");
     assert_eq!(cells[6], Cell::Text("en".to_string()), "lmin");

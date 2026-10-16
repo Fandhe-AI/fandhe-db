@@ -6,7 +6,7 @@
 //! `tests/sql_group_by.rs`（正しさの回帰テスト・CI 常時実行）とはファイルを
 //! 分離している。
 //!
-//! `COUNT(*)`・5 集計・`GROUP BY … HAVING` の 3 フェーズについて、25,000 行の
+//! `COUNT(*)`・5 集計・`GROUP BY … HAVING`・`AVG(id)`（Issue #2270）の各フェーズについて、25,000 行の
 //! テーブルへ `EngineCore::execute_sql` を複数回発行し p50/p95 を記録する
 //! （行数・繰り返し回数は定数で上限固定。security.md「不安全な設計｜無制限
 //! リソース確保」対応）。
@@ -139,5 +139,13 @@ fn main() {
         &ctx,
         "group_by_having",
         "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang HAVING n > 0",
+    );
+    // Issue #2270: 整数の AVG の numeric 化の前後比較（累積は不変で `finish` のみ変わる）。
+    run_phase(&core, &ctx, "agg_avg_id", "SELECT AVG(id) FROM docs");
+    run_phase(
+        &core,
+        &ctx,
+        "group_by_avg_id",
+        "SELECT lang, AVG(id) AS a FROM docs GROUP BY lang",
     );
 }

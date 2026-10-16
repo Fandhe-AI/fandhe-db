@@ -1408,7 +1408,7 @@ fn three_clients_verify_aggregate_queries_and_rls_invariance() {
 
     // テナント別の独立オラクル値（RLS-11 導入後。alice=own Private id=11
     // lang="xx"・bob=own Private id=12 lang="ja"・carol=Private 行なし）。
-    let alice_agg1 = vec!["4|17|4.25|en|xx".to_string()];
+    let alice_agg1 = vec!["4|17|4.2500000000000000|en|xx".to_string()];
     let alice_agg2 = vec!["2".to_string()];
     let alice_agg3 = vec!["ja|2".to_string(), "en|1".to_string(), "xx|1".to_string()];
     let alice_agg4 = vec!["ja|2".to_string()];

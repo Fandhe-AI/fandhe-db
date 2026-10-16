@@ -870,7 +870,7 @@ const PARITY_CASES: &[ParityCase] = &[
         sql: "SELECT COUNT(*), SUM(id), AVG(id), MIN(lang), MAX(lang) FROM docs",
         json_body: r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"},{"fn":"sum","column":"id"},{"fn":"avg","column":"id"},{"fn":"min","column":"lang"},{"fn":"max","column":"lang"}]}"#,
         ordered: true,
-        expected_rows_alice: &[&["4", "17", "4.25", "en", "xx"]],
+        expected_rows_alice: &[&["4", "17", "4.2500000000000000", "en", "xx"]],
         expected_rows_bob: &[&["4", "18", "4.5", "en", "ja"]],
         expected_rows_carol: &[&["3", "6", "2", "en", "ja"]],
     },

@@ -184,7 +184,10 @@ fn where_id_range_multi_aggregate_cold_hot_equivalence() {
         vec![
             Cell::Integer(5),
             Cell::Integer(40),
-            Cell::Float(8.0),
+            // Issue #2270: 整数の AVG は numeric（40 / 5 = 8.0000000000000000）。
+            Cell::Numeric(
+                engine::numeric::Decimal::from_parts(80_000_000_000_000_000, 16).unwrap()
+            ),
             Cell::Text("a".to_string()),
             Cell::Text("b".to_string()),
         ]

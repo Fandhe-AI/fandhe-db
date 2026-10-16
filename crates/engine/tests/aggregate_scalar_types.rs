@@ -305,7 +305,7 @@ fn sum_numeric_exceeding_38_digits_is_22003() {
 // --- AVG の丸め ---------------------------------------------------------
 
 #[test]
-fn avg_integer_divides_and_returns_float() {
+fn avg_integer_divides_and_returns_numeric() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -342,7 +342,13 @@ fn avg_integer_divides_and_returns_float() {
     let result = core
         .execute_sql(&alice, &format!("SELECT AVG(n) FROM {TABLE}"))
         .expect("AVG(INTEGER) must succeed");
-    assert_eq!(result.rows[0].cells, vec![Cell::Float(1.5)]);
+    // Issue #2270（TABLE-13）: 整数の AVG は numeric。PG 17 の `1.5000000000000000`（小数 16 桁）。
+    assert_eq!(
+        result.rows[0].cells,
+        vec![Cell::Numeric(
+            Decimal::from_parts(15_000_000_000_000_000, 16).expect("valid decimal")
+        )]
+    );
 }
 
 /// `AVG(NUMERIC(p,s))` の丸めは half away from zero（D6）。割り切れない値・

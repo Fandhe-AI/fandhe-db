@@ -236,11 +236,10 @@ fn item_name(item: &ConstSelectItem) -> String {
 
 /// 集計の結果型表（Issue #2330。PostgreSQL 17 準拠。`FROM` あり側の
 /// `aggregate_result_type` は `sum(int8)`→`numeric` へ是正済み（Issue #2271）だが、
-/// `avg(int)`→`double` のままで、是正は TASK-330 のポインタ。本経路は先に PG の型へ
-/// そろえるため AVG のみ一時的に食い違う）。
+/// `avg(int)` も numeric へ是正済み〔Issue #2270・TASK-330〕で両経路は一致する）。
 /// `arg_ty` は引数の型（`count(*)`・型不明は `None`）。非対応の組は暗黙変換せず `42883`。
-/// `avg(整数)` の numeric は scale 16 で公告し、値も同 scale で返す（PG は 20 桁。
-/// 表示桁の完全一致は対象外）。
+/// `avg(整数)` の numeric は列メタ上は名目 scale で公告し、値の scale は PG と同じく
+/// 値ごとに決まる（[`crate::numeric::avg_integer`]）。
 fn const_aggregate_result_type(
     func: AggregateFunc,
     arg_ty: Option<&ColumnType>,
@@ -268,10 +267,9 @@ fn const_aggregate_result_type(
         }),
         (AggregateFunc::Sum, ColumnType::Real) => Ok(ColumnType::Real),
         (AggregateFunc::Sum, ColumnType::Double) => Ok(ColumnType::Double),
-        (AggregateFunc::Avg, ColumnType::Integer | ColumnType::BigInt) => Ok(ColumnType::Numeric {
-            precision: MAX_PRECISION,
-            scale: AVG_INT_SCALE,
-        }),
+        (AggregateFunc::Avg, ColumnType::Integer | ColumnType::BigInt) => {
+            Ok(crate::sql::aggregate::AVG_INTEGER_RESULT_TYPE)
+        }
         (AggregateFunc::Avg, ColumnType::Numeric { precision, scale }) => Ok(ColumnType::Numeric {
             precision: MAX_PRECISION,
             scale: numeric_avg_result_scale(*precision, *scale),
@@ -291,9 +289,6 @@ fn const_aggregate_result_type(
         _ => Err(unsupported()),
     }
 }
-
-/// `avg(integer|bigint)` の numeric 結果の scale。
-const AVG_INT_SCALE: u8 = 16;
 
 /// 集計呼び出しの引数を束縛し、結果型を確定する（投影項目と `HAVING` で共有）。
 /// 戻り値は（束縛済み引数、引数の型、結果型）。
@@ -437,11 +432,10 @@ fn single_row_aggregate(
             numeric_cell(i128::from(v), 0)
         }
         (AggregateFunc::Avg, _, Cell::SignedInteger(v)) => {
-            let u =
-                crate::numeric::avg_unscaled(i128::from(v), 1, 0, AVG_INT_SCALE).map_err(|_| {
-                    SqlSurfaceError::numeric_out_of_range("numeric value is out of range")
-                })?;
-            numeric_cell(u, AVG_INT_SCALE)
+            let d = crate::numeric::avg_integer(i128::from(v), 1).map_err(|_| {
+                SqlSurfaceError::numeric_out_of_range("numeric value is out of range")
+            })?;
+            Ok(Cell::Numeric(d))
         }
         // numeric の avg は入力 1 行なら値そのもの（結果 scale は入力 scale 以上で、
         // リテラル引数では一致する）。

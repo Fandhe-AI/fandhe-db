@@ -255,6 +255,18 @@ fn basic_aggregates_match_sql_text_execution_byte_for_byte() {
         let oracle = sql_oracle_body(&core, sql);
         assert_eq!(body_utf8(&resp), oracle, "nosql_body={nosql_body}");
     }
+
+    // Issue #2270（NOSQL-4）: 整数の AVG は numeric で、JSON number は桁を丸めず
+    // PG 17 と同じ小数部の桁数のまま出る（`3.0000000000000000` が `3` にならない）。
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"avg","column":"id"}]}"#,
+    );
+    assert!(
+        body_utf8(&resp).contains(r#""rows":[[3.0000000000000000]]"#),
+        "{}",
+        body_utf8(&resp)
+    );
 }
 
 #[test]

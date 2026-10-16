@@ -804,7 +804,7 @@ const COMPUTED_SQL: [&str; 3] = [
 ];
 
 /// 期待値（psycopg の型名付き表記。`COUNT`・`SUM(INTEGER)`・`ROW_NUMBER` は int8、
-/// `MIN(INTEGER)` は int4、`AVG` は float8、`SUM(REAL)` は float4）。
+/// `MIN(INTEGER)` は int4、`AVG(DOUBLE)` は float8、`SUM(REAL)` は float4）。
 fn computed_expected_psycopg() -> Vec<Vec<String>> {
     vec![
         s(&["int:1|int:7|int:7|float:2.0|float:0.5"]),

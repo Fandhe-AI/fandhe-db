@@ -7263,8 +7263,9 @@ fn resolve_group_by_key(
 /// `DATE`/`TIMESTAMP` の `MIN`/`MAX`（`Cell::Date`/`Cell::Timestamp`）は
 /// 黙って `false` へ縮退させず、`TEXT` と同じく型不整合 `22000` で拒否する
 /// （`COUNT` はいずれの列型でも結果が `Cell::Integer` になるため対象外）。
-/// `SUM(<BIGINT>)`（Issue #2271。scale 0 の `Cell::Numeric`）は
-/// [`crate::sql::group_by::having_matches`] が厳密比較に対応しているため対象に含めない。
+/// `SUM(<BIGINT>)`（Issue #2271）と整数・`id` の `AVG`（Issue #2270。値ごとに scale が
+/// 異なる `Cell::Numeric`）は [`crate::sql::group_by::having_matches`] が厳密比較に
+/// 対応しているため対象に含めない。
 pub(crate) fn check_having_target_is_numeric(
     item: &BoundAggregateItem,
     target_name: &str,
@@ -7493,7 +7494,13 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
     match item.func {
         AggregateFunc::Count => ColumnType::BigInt,
         AggregateFunc::Avg => match item.input {
-            AggregateInput::NumericColumn { .. } => EXPR_UNSUPPORTED_COLUMN_TYPE,
+            // Issue #2270（TABLE-13）: 整数・`id` の AVG も `Cell::Numeric` を返すため、
+            // 式内では扱えない列として `22000` で拒否する（numeric 算術は別 Issue）。
+            AggregateInput::NumericColumn { .. }
+            | AggregateInput::IdU64
+            | AggregateInput::IntegerColumn(_)
+            | AggregateInput::SmallIntColumn(_)
+            | AggregateInput::BigIntColumn(_) => EXPR_UNSUPPORTED_COLUMN_TYPE,
             _ => ColumnType::Double,
         },
         AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => match &item.input {

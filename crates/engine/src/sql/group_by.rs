@@ -1146,12 +1146,12 @@ pub(crate) fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
             }
         }
-        // Issue #2271（TABLE-13）: `SUM(<BIGINT>)` は scale 0 の `Cell::Numeric`。
-        // `i128` の厳密比較で `f64` リテラルと比べる。scale 非 0 の numeric は
-        // 束縛段が拒否済みのため到達せず、fail-closed に不一致とする。
-        Cell::Numeric(d) if d.scale() == 0 => {
+        // Issue #2271・#2270（TABLE-13）: `SUM(<BIGINT>)`（scale 0）と整数 `AVG`（値ごとに
+        // scale が異なる）は `Cell::Numeric`。`Decimal` 同士の厳密比較で `f64` リテラルと
+        // 比べる（[`cmp_decimal_to_literal`]。近似も scale 不一致による縮退もしない）。
+        Cell::Numeric(d) => {
             use std::cmp::Ordering;
-            let ord = cmp_i128_to_literal(d.unscaled(), literal);
+            let ord = cmp_decimal_to_literal(d, literal);
             match op {
                 BinOp::Gt => ord == Ordering::Greater,
                 BinOp::Lt => ord == Ordering::Less,
@@ -1176,7 +1176,6 @@ pub(crate) fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         | Cell::Array(_)
         | Cell::Bytes(_)
         | Cell::Json(_)
-        | Cell::Numeric(_)
         | Cell::Uuid(_) => false,
     }
 }
@@ -1209,24 +1208,49 @@ fn cmp_signed_to_literal(n: i64, literal: f64) -> std::cmp::Ordering {
     }
 }
 
-/// scale 0 の `Cell::Numeric`（`i128`）と `HAVING` の `f64` リテラルを厳密に比較する
-/// （Issue #2271。`SUM(<BIGINT>)` 用）。[`cmp_signed_to_literal`] と同じ規約を `i128` へ拡張。
-fn cmp_i128_to_literal(n: i128, literal: f64) -> std::cmp::Ordering {
+/// `Decimal` と `f64` リテラルの厳密比較（Issue #2270）。リテラルは最短往復表現の
+/// 10 進文字列として読み直し [`crate::numeric::cmp_exact`] で比べるため、scale の異なる
+/// 値も近似なしで順序づく。`NaN` は既存規約どおり `Greater`、±inf は大きさで確定する。
+/// 38 桁で表せないリテラル（|x| ≥ 10^38 または非ゼロで |x| < 10^-38）は符号と大きさだけで決める。
+fn cmp_decimal_to_literal(d: &crate::numeric::Decimal, literal: f64) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     if literal.is_nan() {
         return Ordering::Greater;
     }
-    // `i128` の表現域は `[-2^127, 2^127 - 1]`。範囲外のリテラルは符号だけで確定する。
-    if literal < -170_141_183_460_469_231_731_687_303_715_884_105_728.0 {
-        return Ordering::Greater;
+    if literal.is_infinite() {
+        return if literal > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
     }
-    if literal >= 170_141_183_460_469_231_731_687_303_715_884_105_728.0 {
-        return Ordering::Less;
-    }
-    let floor_i128 = literal.floor() as i128;
-    match n.cmp(&floor_i128) {
-        Ordering::Equal if literal.fract() != 0.0 => Ordering::Less,
-        other => other,
+    // Rust の `Display` は f64 を指数表記にしない（長さは高々 ~330 文字）。
+    let parsed = crate::numeric::parse_literal_exact(&format!("{literal}"));
+    match parsed {
+        Ok(lit) => crate::numeric::cmp_exact(d, &lit),
+        Err(_) if literal.abs() >= 1.0 => {
+            // 整数部が 38 桁を超える巨大リテラル: 符号だけで確定。
+            if literal > 0.0 {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        Err(_) => {
+            // 0 でない極小リテラル（|x| < 10^-38）: d は 0 か |d| ≥ 10^-38。
+            let d_sign = d.unscaled().cmp(&0);
+            if literal > 0.0 {
+                if d_sign == Ordering::Greater {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            } else if d_sign == Ordering::Less {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
     }
 }
 
@@ -1253,13 +1277,9 @@ fn cmp_cell_values(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         (Cell::Date(x), Cell::Date(y)) => x.cmp(y),
         (Cell::Timestamp(x), Cell::Timestamp(y)) => x.cmp(y),
         (Cell::Time(x), Cell::Time(y)) => x.cmp(y),
-        // `NUMERIC` は同一列由来なら常に同じ scale を持つ（`Accumulator`
-        // 各 variant が列の scale をそのまま保持する契約）。scale が一致しない
-        // 組み合わせは到達しない想定の防御的フォールバックとして Equal を返す
-        // （並び替え全体を破綻させない）。
-        (Cell::Numeric(x), Cell::Numeric(y)) if x.scale() == y.scale() => {
-            x.unscaled().cmp(&y.unscaled())
-        }
+        // `NUMERIC` は scale が異なりうる（整数 `AVG` は値ごとに scale が変わる。
+        // Issue #2270）ため、`cmp_exact` で scale を揃えて厳密に比較する。
+        (Cell::Numeric(x), Cell::Numeric(y)) => crate::numeric::cmp_exact(x, y),
         // `Cell::Null` は呼び出し元が別途処理するため、ここへ渡ってきても
         // （防御的フォールバックとして）到達しない想定。型不一致も同様に
         // Equal を返す（並び替え全体が破綻しないようにする防御的フォールバック）。
@@ -3072,38 +3092,73 @@ mod tests {
     // --- cmp_signed_to_literal（Issue #892・D8） --------------------------
 
     #[test]
-    fn cmp_i128_to_literal_handles_boundaries_and_fractions() {
+    fn cmp_decimal_to_literal_handles_boundaries_and_fractions() {
         use std::cmp::Ordering;
-        let n = i128::from(i64::MAX) + 1; // 2^63（f64 で厳密表現できる）
+        let d = |u: i128, sc: u8| crate::numeric::Decimal::from_parts(u, sc).unwrap();
+        // リテラルは最短往復表現の 10 進として読むため、2^53 以下の整数で厳密に確かめる。
+        let n = 1i128 << 53;
         assert_eq!(
-            cmp_i128_to_literal(n, 9_223_372_036_854_775_808.0),
+            cmp_decimal_to_literal(&d(n, 0), 9_007_199_254_740_992.0),
             Ordering::Equal
         );
         assert_eq!(
-            cmp_i128_to_literal(n - 1, 9_223_372_036_854_775_808.0),
+            cmp_decimal_to_literal(&d(n - 1, 0), 9_007_199_254_740_992.0),
             Ordering::Less
         );
-        assert_eq!(cmp_i128_to_literal(5, 5.5), Ordering::Less);
-        assert_eq!(cmp_i128_to_literal(-6, -5.5), Ordering::Less);
-        assert_eq!(cmp_i128_to_literal(-5, -5.5), Ordering::Greater);
-        assert_eq!(cmp_i128_to_literal(0, f64::NAN), Ordering::Greater);
-        assert_eq!(cmp_i128_to_literal(i128::MAX, 1.0e39), Ordering::Less);
-        assert_eq!(cmp_i128_to_literal(i128::MIN, -1.0e39), Ordering::Greater);
+        assert_eq!(cmp_decimal_to_literal(&d(5, 0), 5.5), Ordering::Less);
+        assert_eq!(cmp_decimal_to_literal(&d(-6, 0), -5.5), Ordering::Less);
+        assert_eq!(cmp_decimal_to_literal(&d(-5, 0), -5.5), Ordering::Greater);
         assert_eq!(
-            cmp_i128_to_literal(i128::MAX, f64::INFINITY),
+            cmp_decimal_to_literal(&d(0, 0), f64::NAN),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_decimal_to_literal(&d(i128::MAX, 0), 1.0e39),
             Ordering::Less
         );
+        assert_eq!(
+            cmp_decimal_to_literal(&d(i128::MIN + 1, 0), -1.0e39),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_decimal_to_literal(&d(i128::MAX, 0), f64::INFINITY),
+            Ordering::Less
+        );
+        // 値ごとに scale が異なる整数 AVG（Issue #2270）。
+        assert_eq!(
+            cmp_decimal_to_literal(&d(15_000_000_000_000_000, 16), 1.5),
+            Ordering::Equal
+        );
+        assert_eq!(
+            cmp_decimal_to_literal(&d(100_000_000_000_000_000_000, 20), 1.0),
+            Ordering::Equal
+        );
+        // 極小リテラル（10^-38 未満）は符号と 0 判定で決まる。
+        assert_eq!(cmp_decimal_to_literal(&d(0, 20), 1e-50), Ordering::Less);
+        assert_eq!(cmp_decimal_to_literal(&d(1, 20), 1e-50), Ordering::Greater);
+        assert_eq!(cmp_decimal_to_literal(&d(0, 20), -1e-50), Ordering::Greater);
+        assert_eq!(cmp_decimal_to_literal(&d(-1, 20), -1e-50), Ordering::Less);
     }
 
     #[test]
-    fn having_matches_numeric_scale0_uses_exact_comparison() {
+    fn having_matches_numeric_uses_exact_comparison_at_any_scale() {
         let d =
             |u: i128, sc: u8| Cell::Numeric(crate::numeric::Decimal::from_parts(u, sc).unwrap());
         assert!(having_matches(&d(10, 0), BinOp::Gt, 9.5));
         assert!(having_matches(&d(10, 0), BinOp::Eq, 10.0));
         assert!(!having_matches(&d(10, 0), BinOp::Lt, 10.0));
-        // scale 非 0 は従来どおり不一致（fail-closed。束縛段が拒否済み）。
-        assert!(!having_matches(&d(1000, 2), BinOp::Eq, 10.0));
+        // Issue #2270: scale 非 0 も厳密比較（整数 AVG）。
+        assert!(having_matches(&d(1000, 2), BinOp::Eq, 10.0));
+        assert!(having_matches(
+            &d(15_000_000_000_000_000, 16),
+            BinOp::Ge,
+            1.5
+        ));
+        assert!(!having_matches(
+            &d(15_000_000_000_000_000, 16),
+            BinOp::Gt,
+            1.5
+        ));
     }
 
     #[test]
@@ -3194,6 +3249,14 @@ mod tests {
         let a = Cell::Numeric(crate::numeric::Decimal::from_parts(150, 2).unwrap());
         let b = Cell::Numeric(crate::numeric::Decimal::from_parts(200, 2).unwrap());
         assert_eq!(cmp_cell_values(&a, &b), Ordering::Less);
+        // Issue #2270: scale が異なる値も厳密に比較する（1.5@16 < 2.0@20）。
+        let c =
+            Cell::Numeric(crate::numeric::Decimal::from_parts(15_000_000_000_000_000, 16).unwrap());
+        let e = Cell::Numeric(
+            crate::numeric::Decimal::from_parts(200_000_000_000_000_000_000, 20).unwrap(),
+        );
+        assert_eq!(cmp_cell_values(&c, &e), Ordering::Less);
+        assert_eq!(cmp_cell_values(&e, &c), Ordering::Greater);
     }
 
     // --- Issue #894: 新スカラー型（TABLE-13・TASK-199）の GROUP BY 経路 --------

@@ -59,7 +59,28 @@
 
 ### D3: `AVG(INTEGER/BIGINT)`
 
-結果は `Cell::Float(f64)`（`DOUBLE PRECISION` 相当）。
+> **Issue #2270（TABLE-13・TASK-330 ポインタ）による改訂**: `AVG(SMALLINT/INTEGER/BIGINT)` と
+> `AVG(id)` の結果は `numeric`（`Cell::Numeric`、OID 1700）になる。累積（`i128`／`u64` の
+> 合計と行数）は変えず、`Accumulator::finish` でだけ `numeric::avg_integer` により
+> `sum / count` を長除算（half away from zero）して `Decimal` にする。小数部の桁数は
+> PostgreSQL 17 の結果 scale の規則（`select_div_scale`。被除数・除数の NBASE=10000 の
+> 先頭桁と weight から `16 - 4 * qweight`）を `numeric::pg_div_result_scale` で再現し、
+> **値ごとに変わる**（列メタの scale とは一致しない。列メタは名目 scale 16 で公告）。
+> 影響する下流経路と扱い:
+>
+> - `GROUP BY` の `ORDER BY` は `cmp_exact`、単純形 `HAVING` は `Decimal` と `f64` リテラル
+>   （最短往復表現の 10 進として読む）の厳密比較にする（scale 不一致で黙って縮退させない）。
+> - 式内（投影式・`HAVING` 式・`ORDER BY` 式）の整数 `AVG` は numeric 算術が未対応のため
+>   `22000` で拒否する（算術は #1810・#1812 の範囲）。バイナリ結果形式は numeric 非対応
+>   （WIRE-14）のため `0A000`（#2441・#2442）。
+> - スカラーサブクエリ比較は端数のある numeric を整数列とは floor による厳密な整数比較、
+>   浮動小数列とは `f64` 変換で比べる。
+> - `UNION` 等の重複排除キーは numeric の末尾の小数部ゼロを除き、scale だけが異なる等しい値を
+>   同一視する。
+> - 窓関数・JOIN 集計・FROM なし SELECT・NoSQL `aggregate` は同じ `Accumulator`／共有関数で追随する。
+>   NoSQL の JSON number は桁を丸めない。
+
+旧仕様（参考）: 結果は `Cell::Float(f64)`（`DOUBLE PRECISION` 相当）で、
 `(sum_i128 as f64) / (count as f64)`（IEEE 754 の最近接偶数丸め）。空集合は
 `NULL`。
 

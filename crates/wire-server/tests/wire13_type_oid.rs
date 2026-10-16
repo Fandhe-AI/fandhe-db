@@ -299,7 +299,7 @@ fn expected_aggregate_oids() -> Vec<(&'static str, i32)> {
         ("s_n", 20),
         // Issue #2271（TABLE-13）: `SUM(BIGINT)` は numeric(OID 1700)。
         ("s_b", 1700),
-        ("a_n", 701),
+        ("a_n", 1700),
         ("m_n", 23),
         ("x_b", 20),
         ("s_r", 700),
@@ -311,7 +311,7 @@ fn expected_aggregate_oids() -> Vec<(&'static str, i32)> {
         ("m_day", 1082),
         ("x_ts", 1114),
         ("s_id", 1700),
-        ("a_id", 701),
+        ("a_id", 1700),
     ]
 }
 
@@ -417,7 +417,7 @@ fn expected_window_oids() -> Vec<(&'static str, i32)> {
         ("s_n", 20),
         // Issue #2271（TABLE-13）: `SUM(BIGINT)` は numeric(OID 1700)。
         ("s_b", 1700),
-        ("a_n", 701),
+        ("a_n", 1700),
         ("m_n", 23),
         ("x_b", 20),
         ("s_r", 700),
@@ -429,7 +429,7 @@ fn expected_window_oids() -> Vec<(&'static str, i32)> {
         ("m_day", 1082),
         ("x_ts", 1114),
         ("s_id", 1700),
-        ("a_id", 701),
+        ("a_id", 1700),
     ]
 }
 

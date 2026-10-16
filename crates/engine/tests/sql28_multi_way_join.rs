@@ -766,7 +766,7 @@ fn group_by_with_aggregates_having_and_order_by() {
         ),
         vec!["eng|ann|bob", "hr|NULL|NULL", "ops|cat|cat"]
     );
-    // AVG（整数入力の結果は浮動小数）。
+    // AVG（整数入力の結果は numeric。Issue #2270 で PG 17 と同じ小数 16 桁）。
     assert_eq!(
         q(
             &core,
@@ -775,7 +775,11 @@ fn group_by_with_aggregates_having_and_order_by() {
                  GROUP BY dept.dname ORDER BY dept.dname"
             )
         ),
-        vec!["eng|150", "hr|NULL", "ops|150"]
+        vec![
+            "eng|150.0000000000000000",
+            "hr|NULL",
+            "ops|150.0000000000000000"
+        ]
     );
 }
 
