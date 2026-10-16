@@ -22,8 +22,9 @@
 //! - `$n` の受理位置は限定されるため C4（`hybrid_rrf` 関数引数）は `$n` を持てず、
 //!   パラメータ 0 個の拡張プロトコルで送る。関数引数への `$n` は `42601` で拒否される
 //!   ことを負のケースとして固定する。
-//! - `id` 列は numeric（OID 1700）でバイナリ非対応（`0A000`）。バイナリ受信の検証は
-//!   `id`・VECTOR を投影しない型付きテーブル（`typed_items`）で行う。
+//! - `id` 列は numeric（OID 1700）で、結果のバイナリ送出は Issue #2442 で対応済み。
+//!   実クライアントでの numeric バイナリ受信の正例は #2445 が検証する。本ファイルの
+//!   バイナリ受信検証は `id`・VECTOR を投影しない型付きテーブル（`typed_items`）で行う。
 //! - node pg のバイナリ受信は DataRow を UTF-8 文字列として読むため、0x80 以上の
 //!   バイトを含む値は壊れる。3 クライアント共通行（行 A）は全送信バイトが `< 0x80` の
 //!   値に限定し、その制約を非 ignore テスト（[`node_binary_fixture_bytes_are_utf8_safe`]）
@@ -855,11 +856,8 @@ fn computed_columns_binary_results_match_text_results() {
         assert_eq!(&binary, expected_rows, "psycopg: decoded values: `{sql}`");
     }
 
-    // バイナリ非対応の結果列（numeric・date・静的型なし）は 0A000 のまま。
-    for sql in [
-        "SELECT MIN(id) AS m FROM typed_items",
-        "SELECT vec_div(embedding, 2.0) AS half FROM typed_items LIMIT 3",
-    ] {
+    // バイナリ非対応の結果列（静的型なし）は 0A000 のまま（numeric は #2442 で対応済み）。
+    for sql in ["SELECT vec_div(embedding, 2.0) AS half FROM typed_items LIMIT 3"] {
         for client in [Client::Psycopg, Client::Pg] {
             expect_sqlstate(client, port, "alice", "pw-alice", sql, &[], bin, "0A000");
         }
@@ -914,7 +912,8 @@ fn three_clients_keep_fail_closed_contracts_on_extended_path() {
         );
     }
 
-    // id（numeric）を含む結果のバイナリ要求は 0A000。
+    // バイナリ非対応の結果列（静的型を持たないベクトル式）の要求は 0A000
+    // （`id`〔numeric〕は Issue #2442 で対応済みのため負例に使わない）。
     let bin = Opts { binary: true, ..d };
     for client in [Client::Psycopg, Client::Pg] {
         expect_sqlstate(
@@ -922,8 +921,8 @@ fn three_clients_keep_fail_closed_contracts_on_extended_path() {
             port,
             "alice",
             "pw-alice",
-            C1_SQL,
-            &["[1.0,0.0]"],
+            "SELECT vec_div(embedding, 2.0) AS half FROM docs LIMIT 3",
+            &[],
             bin,
             "0A000",
         );
