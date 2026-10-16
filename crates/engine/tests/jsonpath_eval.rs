@@ -1197,3 +1197,30 @@ fn string_conversions_are_charged_by_input_bytes() {
         );
     }
 }
+
+/// `.double()` が文字列から生成する数値テキスト（`1e-320` は約 320 桁）も累積バイト予算に
+/// 計上され、結果列に残らない形（`.size()`）でも上限を超えると `ResultTooLarge` になる。
+#[test]
+fn generated_number_text_is_byte_budgeted() {
+    let inner = format!("[{}]", vec![r#""1e-320""#; 65_536].join(","));
+    let doc = format!("[{inner}]");
+    let subs = vec!["0"; 15].join(",");
+    let path = format!("$[{subs}][*].double().size()");
+    assert_eq!(
+        eval_with(
+            &path,
+            &doc,
+            JsonPathLimits::new(MAX_JSONPATH_EVAL_STEPS, 1024)
+        ),
+        Err(JsonPathEvalError::ResultTooLarge)
+    );
+    // 1 回分（約 21 MiB）なら成功する。
+    assert_eq!(
+        eval_with(
+            "$[0][*].double().size()",
+            &doc,
+            JsonPathLimits::new(MAX_JSONPATH_EVAL_STEPS, 1024)
+        ),
+        Ok(65_536)
+    );
+}

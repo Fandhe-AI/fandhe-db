@@ -414,10 +414,6 @@ fn literal_number(n: &PathNumeric) -> JsonNumber {
     }
 }
 
-fn decimal_number(d: Decimal) -> Item<'static> {
-    Item::Num(num::to_json_number(d))
-}
-
 // ---------------------------------------------------------------------------
 // 評価コンテキスト
 // ---------------------------------------------------------------------------
@@ -546,6 +542,13 @@ impl<'a> Ev<'a> {
             self.charge_bytes(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
         }
         Ok(())
+    }
+
+    /// 新たに生成した数値を、保持する前にバイト予算へ課金して返す。評価中に数値を生成する
+    /// 箇所（算術・単項・各種メソッド・リテラル）はすべてここを通す。
+    fn charged(&mut self, n: JsonNumber) -> R<JsonNumber> {
+        self.charge_number(&n)?;
+        Ok(n)
     }
 
     /// 項目の複製。所有バイト分を累積バイト予算へ課金してから複製する（超過は `54000`）。
@@ -810,7 +813,10 @@ impl<'a> Ev<'a> {
             PathNode::Null => Item::Null,
             PathNode::Bool(b) => Item::Bool(*b),
             PathNode::String(s) => Item::Str(Cow::Borrowed(&**s)),
-            PathNode::Numeric(n) => Item::Num(literal_number(n)),
+            PathNode::Numeric(n) => {
+                let lit = literal_number(n);
+                Item::Num(self.charged(lit)?)
+            }
             _ => return Err(hard(JsonPathEvalError::Internal)),
         };
         let lax = self.lax;
@@ -1353,7 +1359,7 @@ impl<'a> Ev<'a> {
                         _ => Err(self.soft(JsonPathEvalError::NonNumericItem)),
                     },
                     Kind::Str => match jb.str().and_then(parse_float8_text) {
-                        Some(f) => Ok(Item::Num(float8_to_number(f))),
+                        Some(f) => Ok(Item::Num(self.charged(float8_to_number(f))?)),
                         None => Err(self.soft(JsonPathEvalError::NonNumericItem)),
                     },
                     _ => Err(self.soft(JsonPathEvalError::NonNumericItem)),
@@ -1400,7 +1406,7 @@ impl<'a> Ev<'a> {
                             return Err(self.soft(JsonPathEvalError::NonNumericItem));
                         };
                         match num::apply_precision_scale(&d, p, s) {
-                            Ok(r) => Ok(decimal_number(r)),
+                            Ok(r) => Ok(Item::Num(self.charged(num::to_json_number(r))?)),
                             Err(_) => Err(self.soft(JsonPathEvalError::NonNumericItem)),
                         }
                     }
@@ -1447,6 +1453,7 @@ impl<'a> Ev<'a> {
                         self.charge_number(n)?;
                     }
                     let text = jb.num().map(number_text).unwrap_or_default();
+                    self.charge_bytes(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
                     Ok(Item::Str(Cow::Owned(text)))
                 }
                 _ => Err(self.soft(JsonPathEvalError::NonNumericItem)),
@@ -1477,7 +1484,7 @@ impl<'a> Ev<'a> {
             _ => num::ceil(&d),
         };
         match r {
-            Ok(v) => Ok(decimal_number(v)),
+            Ok(v) => Ok(Item::Num(self.charged(num::to_json_number(v))?)),
             Err(_) => Err(self.soft(JsonPathEvalError::NumericOutOfRange)),
         }
     }
@@ -1566,7 +1573,7 @@ impl<'a> Ev<'a> {
                     n.clone()
                 }
                 UnaryOp::Minus => match num::from_json_number(n).and_then(|d| num::neg(&d).ok()) {
-                    Some(d) => num::to_json_number(d),
+                    Some(d) => self.charged(num::to_json_number(d))?,
                     // 表現範囲外の巨大な値は、綴りの符号だけを反転する。
                     None => {
                         self.charge_number(n)?;
@@ -1658,7 +1665,7 @@ impl<'a> Ev<'a> {
             ArithOp::Mod => num::rem(&a, &b),
         };
         match out {
-            Ok(d) => Ok(num::to_json_number(d)),
+            Ok(d) => self.charged(num::to_json_number(d)),
             Err(num::NumFail::DivisionByZero) => Err(self.soft(JsonPathEvalError::DivisionByZero)),
             Err(num::NumFail::Overflow) => Err(self.soft(JsonPathEvalError::NumericOutOfRange)),
         }
