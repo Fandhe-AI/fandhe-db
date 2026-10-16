@@ -489,6 +489,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::JsonTextFn(_)
+        | BoundExpr::JsonPathFn(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::JsonAccess { .. }
         | BoundExpr::JsonFn { .. }
@@ -590,6 +591,7 @@ fn compile_node(
         BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::JsonTextFn(_)
+        | BoundExpr::JsonPathFn(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::JsonAccess { .. }
         | BoundExpr::JsonFn { .. }

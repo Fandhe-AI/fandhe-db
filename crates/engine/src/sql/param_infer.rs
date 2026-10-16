@@ -179,6 +179,12 @@ fn builtin_return_type(name: &str) -> Ty {
         "jsonb_extract_path" | "jsonb_build_object" | "jsonb_build_array" | "to_jsonb" => {
             Ty::Untyped
         }
+        // `jsonb_path_*`（Issue #2185）。jsonb を返すものも boolean を返すものも `$n` の型付け
+        // 対象外（boolean 用の `PreparedParamType` が無いため。Double と誤推論しない）。
+        "jsonb_path_query_array"
+        | "jsonb_path_query_first"
+        | "jsonb_path_exists"
+        | "jsonb_path_match" => Ty::Untyped,
         // 関数形の現在時刻関数（SQL-37・Issue #1586）は TIMESTAMP を返すため、キーワード形
         // （`Expr::ValueFunction`）と同じく対象外型表現へ写像し `assign` で `0A000` にする。
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
