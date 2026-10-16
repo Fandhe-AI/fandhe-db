@@ -118,14 +118,15 @@ Issue #1186）。設計は [now-evaluated-value-ledger.md](now-evaluated-value-l
   する。`clock_timestamp()` だけは定数化・畳み込みをせず、評価のたびに壁時計を読む。
 - 予約名（BREAKING）: `now`・`transaction_timestamp`・`statement_timestamp`・`clock_timestamp` は組み込み
   として予約し、同名 UDF の定義は `42723`。`random` 等の未実装の非決定的関数名は予約しない。
-- 受理範囲: 時計を確定するのは読み取り文（SELECT・集計・FROM なし SELECT・EXPLAIN・JOIN 等と Describe）の
-  入口だけ（許可リスト型）。INSERT VALUES・原子版 UPDATE SET・述語形 UPDATE／DELETE（原子版）・CHECK・
-  CREATE VIEW 本文・カーソル・NoSQL は拒否する（定数式・CHECK・VIEW は `42601`、束縛段は `0A000`）。
+- 受理範囲: 時計を確定するのは読み取り文（SELECT・集計・FROM なし SELECT・EXPLAIN・JOIN 等と Describe）と、
+  書き込み文（INSERT・UPDATE・DELETE の原子版。Issue #2188）の入口だけ（許可リスト型）。書き込み文では
+  INSERT の `VALUES` の単独形・UPDATE SET・WHERE を受理し、時刻関数を評価した文は台帳 v3 に評価時刻を残す。
+  CHECK・CREATE VIEW 本文・カーソル・COPY のテキスト・NoSQL は拒否する（定数式・CHECK・VIEW は `42601`、
+  束縛段は `0A000`）。
   例外（Issue #1587）: 列の `DEFAULT now()` 系（`CREATE TABLE`。INSERT・UPSERT・COPY の省略列へ適用）と、
-  分割実行 DML の SET・WHERE（トランザクション固定の関数のみ）。台帳 v3 を要する書き込み側の残り
-  （INSERT VALUES 内の式・原子版 UPDATE SET・`statement_timestamp()`／`clock_timestamp()` の書き込み）は
-  #2188 の実装後に受理する。
-- `CURRENT_TIME`・`LOCALTIME` は TIME 型が未実装のため `0A000`。引用付き識別子（`"current_date"`）は
+  分割実行 DML の SET・WHERE（トランザクション固定の関数のみ）。`INSERT … VALUES` の合成式
+  （`now() + …`）は引き続き `42601`。
+- `LOCALTIME[(p)]` は `TIME`（UTC。Issue #2188）。`CURRENT_TIME` は timetz 未実装のため `0A000`。引用付き識別子（`"current_date"`）は
   従来どおり列参照。
 
 ### UDF 予約名

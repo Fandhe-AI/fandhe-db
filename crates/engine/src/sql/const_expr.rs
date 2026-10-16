@@ -163,9 +163,10 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
                 Err(SqlSurfaceError::UndefinedColumn { name: name.clone() })
             }
         }
-        // SQL-37（Issue #1586・#1587）: 現在時刻関数は、INSERT VALUES 内の式を台帳 v3（#2188）で
-        // 扱えるようになるまで定数式で受理しない（`42601`）。列 `DEFAULT now()` 系（#1587）は
-        // この定数式経路ではなく `sql::allowlist` の時刻 DEFAULT 専用経路が受理する。
+        // SQL-37（Issue #1586・#1587・#2188）: 現在時刻関数は定数式（畳み込み）では受理しない
+        // （`42601`）。要素全体が単独の時刻関数である `VALUES` 要素と列 `DEFAULT` は、この定数式経路
+        // ではなく `sql::allowlist` の時刻関数専用経路（`InsertLiteral::CurrentTime`・
+        // `TimeDefault`）が受理する。合成式（`now() + …`）は後続 Issue。
         Expr::ValueFunction { .. } => Err(SqlSurfaceError::unsupported(
             "volatile or session-dependent value is not allowed in a constant expression",
         )),

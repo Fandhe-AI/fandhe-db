@@ -2944,6 +2944,14 @@ pub enum InsertLiteral {
     /// 直接届く既に解析済みの数値列には適用対象が無い設計判断。
     /// `docs/design/nosql-typed-json-binding.md` 参照）。
     Vector(Vec<f32>),
+    /// `INSERT … VALUES` の要素が単独の時刻関数だった場合の構文形（`now()`・
+    /// `statement_timestamp()`・`clock_timestamp()`・`CURRENT_TIMESTAMP[(p)]` 等。SQL-37・
+    /// Issue #2188）。評価は束縛段（`sql::parser::bind_insert_row`）が現スレッドの時刻
+    /// スコープで行い、内容照合ハッシュは評価値ではなくこの構文形から計算する。
+    /// `bind_insert_row` 以外の束縛経路（UPDATE／UPSERT の DO UPDATE／COPY／ファイル形
+    /// INSERT／NoSQL）は受理せず拒否する（fail-closed）。合成式（`now() + …`）は
+    /// この variant にならず、従来どおり定数式経路で拒否される。
+    CurrentTime(crate::catalog::TimeDefault),
 }
 
 /// `ON CONFLICT (id) DO UPDATE SET <col> = <value>` の SET 右辺（SQL-20・
@@ -7288,6 +7296,15 @@ impl<'a> Parser<'a> {
         Ok((column, value))
     }
 
+    /// `VALUES` 要素 1 個。要素全体が単独の時刻関数なら [`InsertLiteral::CurrentTime`]
+    /// （SQL-37・Issue #2188）、それ以外は従来の [`Self::expect_literal_or_const_expr`]。
+    fn expect_insert_value(&mut self) -> Result<InsertLiteral, SqlSurfaceError> {
+        if let Some(t) = self.try_parse_time_default()? {
+            return Ok(InsertLiteral::CurrentTime(t));
+        }
+        self.expect_literal_or_const_expr()
+    }
+
     /// `VALUES` の 1 行分 `(<lit>[, <lit>]*)` を解析し、リテラル数が列数と一致する
     /// ことを検証する（SQL-16、TASK-190）。複数行形・単一行形のいずれからも
     /// 呼ばれる共有ヘルパ。
@@ -7296,13 +7313,13 @@ impl<'a> Parser<'a> {
         columns: &[String],
     ) -> Result<Vec<InsertLiteral>, SqlSurfaceError> {
         self.expect_punct('(')?;
-        let mut values = vec![self.expect_literal_or_const_expr()?];
+        let mut values = vec![self.expect_insert_value()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
             if values.len() >= MAX_COLUMN_COUNT {
                 return Err(SqlSurfaceError::unsupported("too many INSERT values"));
             }
-            values.push(self.expect_literal_or_const_expr()?);
+            values.push(self.expect_insert_value()?);
         }
         self.expect_punct(')')?;
 
@@ -8831,11 +8848,11 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `DEFAULT` 直後が時刻値関数の単独形か判定し、そうなら消費して返す（SQL-37・
-    /// TABLE-16・Issue #1587）。受理: `now()`・`transaction_timestamp()`・
-    /// `CURRENT_TIMESTAMP[(p)]`・`LOCALTIMESTAMP[(p)]`・`CURRENT_DATE`。
-    /// `statement_timestamp()`・`clock_timestamp()` は書き込み側が未対応のため `0A000`
-    /// （台帳 v3 の #2188 で扱う）。単独形でない場合（直後が演算子・`::` 等、引用付き識別子、
+    /// `DEFAULT` 直後・`VALUES` 要素の先頭が時刻値関数の単独形か判定し、そうなら消費して返す
+    /// （SQL-37・TABLE-16・Issue #1587・#2188）。受理: `now()`・`transaction_timestamp()`・
+    /// `statement_timestamp()`・`clock_timestamp()`・`CURRENT_TIMESTAMP[(p)]`・
+    /// `LOCALTIMESTAMP[(p)]`・`LOCALTIME[(p)]`・`CURRENT_DATE`（`CURRENT_TIME` は timetz 未実装で
+    /// 受理しない）。単独形でない場合（直後が演算子・`::` 等、引用付き識別子、
     /// その他の識別子・関数）は何も消費せず `None` を返し、従来の定数式経路が
     /// 従来どおりの SQLSTATE で判定する。精度は 0〜6 を構文段で検査する（範囲外は `22023`）。
     fn try_parse_time_default(
@@ -8861,17 +8878,8 @@ impl<'a> Parser<'a> {
             match lower.as_str() {
                 "now" => parsed = Some(TimeDefault::Now),
                 "transaction_timestamp" => parsed = Some(TimeDefault::TransactionTimestamp),
-                "statement_timestamp" | "clock_timestamp" => {
-                    // 末尾が単独形のときだけ 0A000。複合式は従来経路に任せる。
-                    if self.time_default_tail_is_terminal(pos + consumed) {
-                        return Err(SqlSurfaceError::FeatureNotSupported {
-                            detail: "statement_timestamp() and clock_timestamp() are not \
-                                     supported as column DEFAULT"
-                                .to_string(),
-                        });
-                    }
-                    return Ok(None);
-                }
+                "statement_timestamp" => parsed = Some(TimeDefault::StatementTimestamp),
+                "clock_timestamp" => parsed = Some(TimeDefault::ClockTimestamp),
                 _ => consumed = 0,
             }
         }
@@ -8909,8 +8917,9 @@ impl<'a> Parser<'a> {
                 }
                 ValueFunctionKind::LocalTimestamp => Some(TimeDefault::LocalTimestamp(precision)),
                 ValueFunctionKind::CurrentDate => Some(TimeDefault::CurrentDate),
-                // TIME 型は未実装のため従来の経路（0A000）に任せる。
-                ValueFunctionKind::CurrentTime | ValueFunctionKind::LocalTime => return Ok(None),
+                ValueFunctionKind::LocalTime => Some(TimeDefault::LocalTime(precision)),
+                // `CURRENT_TIME` は timetz（未実装）のため従来の経路（0A000）に任せる。
+                ValueFunctionKind::CurrentTime => return Ok(None),
             };
         }
         if !self.time_default_tail_is_terminal(pos + consumed) {
@@ -16698,6 +16707,13 @@ mod tests {
                 TimeDefault::LocalTimestamp(Some(0)),
             ),
             ("DEFAULT CURRENT_DATE", TimeDefault::CurrentDate),
+            (
+                "DEFAULT statement_timestamp()",
+                TimeDefault::StatementTimestamp,
+            ),
+            ("DEFAULT clock_timestamp()", TimeDefault::ClockTimestamp),
+            ("DEFAULT LOCALTIME", TimeDefault::LocalTime(None)),
+            ("DEFAULT localtime(3)", TimeDefault::LocalTime(Some(3))),
         ] {
             let c = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
             assert_eq!(c.time_default, Some(expected), "{sql}");
@@ -16707,7 +16723,7 @@ mod tests {
         let c = parse("DEFAULT now() NOT NULL UNIQUE").unwrap();
         assert_eq!(c.time_default, Some(TimeDefault::Now));
         assert!(c.not_null && c.unique);
-        // 精度 7 は 22023、複合式・CAST・未対応関数は拒否、TIME 系（型未実装）は従来どおり 42601。
+        // 精度 7 は 22023、複合式・CAST・CURRENT_TIME（timetz 未実装）は 42601。
         assert_eq!(
             parse("DEFAULT CURRENT_TIMESTAMP(7)")
                 .unwrap_err()
@@ -16719,10 +16735,10 @@ mod tests {
             ("DEFAULT now()::text", "42601"),
             ("DEFAULT now() || 'x'", "42601"),
             ("DEFAULT CURRENT_TIMESTAMP + 1", "42601"),
-            ("DEFAULT statement_timestamp()", "0A000"),
-            ("DEFAULT clock_timestamp()", "0A000"),
+            ("DEFAULT statement_timestamp() + 1", "42601"),
+            ("DEFAULT clock_timestamp()::text", "42601"),
             ("DEFAULT CURRENT_TIME", "42601"),
-            ("DEFAULT LOCALTIME", "42601"),
+            ("DEFAULT LOCALTIME + 1", "42601"),
         ] {
             assert_eq!(parse(sql).unwrap_err().wire_code(), code, "{sql}");
         }

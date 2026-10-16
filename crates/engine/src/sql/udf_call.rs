@@ -2911,7 +2911,8 @@ fn require_clock(env: &BindEnv<'_>) -> Result<StatementClock, SqlSurfaceError> {
 
 /// 「トランザクション固定のみ」スコープ（分割実行 DML。[`time_fn::ClockPolicy::TxnFixedOnly`]）で
 /// `statement_timestamp()`・`clock_timestamp()` を `0A000` にする（再開時に値を再現できないため
-/// fail-closed。SQL-37・RECOVER-11・Issue #1587。書き込み側の対応は #2188）。
+/// fail-closed。SQL-37・RECOVER-11・Issue #1587・#2188）。原子版の書き込み文は
+/// [`time_fn::ClockPolicy::All`] のためここでは拒否しない。
 fn reject_non_txn_fixed_clock(name: &str) -> Result<(), SqlSurfaceError> {
     if time_fn::current_clock_policy() == time_fn::ClockPolicy::TxnFixedOnly {
         return Err(SqlSurfaceError::FeatureNotSupported {
@@ -2929,10 +2930,26 @@ fn bind_value_function(
     env: &BindEnv<'_>,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
     match kind {
-        ValueFunctionKind::CurrentTime | ValueFunctionKind::LocalTime => {
-            Err(SqlSurfaceError::FeatureNotSupported {
-                detail: "TIME values are not supported".to_string(),
-            })
+        // `CURRENT_TIME` は戻り値が timetz（TIMETZ 未実装）のため `0A000` のまま。
+        ValueFunctionKind::CurrentTime => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "TIME WITH TIME ZONE values are not supported".to_string(),
+        }),
+        // `LOCALTIME[(p)]` はトランザクション開始時刻の時刻部（TimeZone 未実装の間は UTC。
+        // 設計 D8。Issue #2188）。
+        ValueFunctionKind::LocalTime => {
+            let clock = require_clock(env)?;
+            let micros = match precision {
+                None => clock.txn_start_micros,
+                Some(p) => time_fn::round_to_precision(clock.txn_start_micros, p).ok_or(
+                    SqlSurfaceError::InvalidParameterValue {
+                        detail: "time precision must be between 0 and 6",
+                    },
+                )?,
+            };
+            Ok((
+                BoundExpr::Time(time_fn::micros_to_time_of_day(micros)),
+                ExprType::Time,
+            ))
         }
         ValueFunctionKind::CurrentDate => {
             let clock = require_clock(env)?;

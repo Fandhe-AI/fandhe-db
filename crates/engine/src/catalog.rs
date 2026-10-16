@@ -3201,6 +3201,12 @@ pub enum TimeDefault {
     LocalTimestamp(Option<u8>),
     /// `CURRENT_DATE`。
     CurrentDate,
+    /// `statement_timestamp()`（文の開始時刻。Issue #2188）。
+    StatementTimestamp,
+    /// `clock_timestamp()`（行ごとに壁時計を読む。Issue #2188）。
+    ClockTimestamp,
+    /// `LOCALTIME[(p)]`（トランザクション開始時刻の時刻部。`TIME` 列向け。Issue #2188）。
+    LocalTime(Option<u8>),
 }
 
 impl TimeDefault {
@@ -3214,6 +3220,7 @@ impl TimeDefault {
         }
         match self {
             TimeDefault::CurrentDate => matches!(ty, ColumnType::Date),
+            TimeDefault::LocalTime(_) => matches!(ty, ColumnType::Time),
             _ => matches!(ty, ColumnType::Timestamp),
         }
     }
@@ -3221,7 +3228,9 @@ impl TimeDefault {
     /// 小数秒精度が 0〜6 の範囲内か（精度なしの形は常に範囲内）。
     pub(crate) fn precision_in_range(self) -> bool {
         match self {
-            TimeDefault::CurrentTimestamp(Some(p)) | TimeDefault::LocalTimestamp(Some(p)) => p <= 6,
+            TimeDefault::CurrentTimestamp(Some(p))
+            | TimeDefault::LocalTimestamp(Some(p))
+            | TimeDefault::LocalTime(Some(p)) => p <= 6,
             _ => true,
         }
     }
@@ -3230,6 +3239,7 @@ impl TimeDefault {
     fn compatible_with_tag(self, tag: &str) -> bool {
         match self {
             TimeDefault::CurrentDate => tag == "date",
+            TimeDefault::LocalTime(_) => tag == "time",
             _ => tag == "timestamp",
         }
     }
@@ -3240,6 +3250,10 @@ impl TimeDefault {
             TimeDefault::Now => "now".to_string(),
             TimeDefault::TransactionTimestamp => "transaction_timestamp".to_string(),
             TimeDefault::CurrentDate => "current_date".to_string(),
+            TimeDefault::StatementTimestamp => "statement_timestamp".to_string(),
+            TimeDefault::ClockTimestamp => "clock_timestamp".to_string(),
+            TimeDefault::LocalTime(None) => "localtime".to_string(),
+            TimeDefault::LocalTime(Some(p)) => format!("localtime:{p}"),
             TimeDefault::CurrentTimestamp(None) => "current_timestamp".to_string(),
             TimeDefault::CurrentTimestamp(Some(p)) => format!("current_timestamp:{p}"),
             TimeDefault::LocalTimestamp(None) => "localtimestamp".to_string(),
@@ -3264,6 +3278,9 @@ impl TimeDefault {
             ("now", None) => Some(TimeDefault::Now),
             ("transaction_timestamp", None) => Some(TimeDefault::TransactionTimestamp),
             ("current_date", None) => Some(TimeDefault::CurrentDate),
+            ("statement_timestamp", None) => Some(TimeDefault::StatementTimestamp),
+            ("clock_timestamp", None) => Some(TimeDefault::ClockTimestamp),
+            ("localtime", p) => Some(TimeDefault::LocalTime(p)),
             ("current_timestamp", p) => Some(TimeDefault::CurrentTimestamp(p)),
             ("localtimestamp", p) => Some(TimeDefault::LocalTimestamp(p)),
             _ => None,
@@ -10966,14 +10983,15 @@ mod tests {
         for bad in [
             "",
             "now:1",
-            "clock_timestamp",
-            "statement_timestamp",
+            "clock_timestamp:1",
+            "statement_timestamp:1",
+            "localtime:7",
+            "localtime:03",
             "current_timestamp:7",
             "current_timestamp:",
             "current_timestamp:03",
             "current_timestamp:+3",
             "current_date:1",
-            "localtime",
             "NOW",
             "now()",
         ] {
@@ -10984,6 +11002,27 @@ mod tests {
         }
         assert!(ColumnDefault::decode_catalog_field("czz").is_err());
         assert!(ColumnDefault::decode_catalog_field("c").is_err());
+    }
+
+    /// Issue #2188: 新しい時刻 DEFAULT の正準テキストが往復する（TIME 列は `localtime` のみ）。
+    #[test]
+    fn new_time_defaults_roundtrip_and_type_compat() {
+        for t in [
+            TimeDefault::StatementTimestamp,
+            TimeDefault::ClockTimestamp,
+            TimeDefault::LocalTime(None),
+            TimeDefault::LocalTime(Some(3)),
+        ] {
+            assert_eq!(
+                TimeDefault::from_canonical_text(&t.canonical_text()),
+                Some(t)
+            );
+        }
+        assert!(TimeDefault::LocalTime(None).compatible_with(&ColumnType::Time));
+        assert!(!TimeDefault::LocalTime(None).compatible_with(&ColumnType::Timestamp));
+        assert!(!TimeDefault::LocalTime(Some(7)).compatible_with(&ColumnType::Time));
+        assert!(TimeDefault::ClockTimestamp.compatible_with(&ColumnType::Timestamp));
+        assert!(!TimeDefault::ClockTimestamp.compatible_with(&ColumnType::Time));
     }
 
     /// 循環したビューカタログ（a -> b -> a）でも `exposed_columns_of_view` が

@@ -339,7 +339,7 @@ fn chunk_loop<E>(
 ) -> Result<PartitionedDmlOutcome, PartitionedStopCause<E>> {
     validate_identifier(table).map_err(w)?;
     // 台帳を持たない構成は、テーブルにもジョブ表にも触れる前に拒否する（fail-closed）。
-    let LedgerWrite::Record(op_id) = ledger_write else {
+    let Some(op_id) = ledger_write.op_id() else {
         return Err(PartitionedStopCause::LedgerRequired);
     };
     let tenant = ctx.tenant_id();
@@ -575,8 +575,14 @@ fn chunk_loop<E>(
 
         let completed_total = if exhausted {
             Some(
-                partitioned_job::complete_in_txn(&write_txn, &key, hash, rows_changed)
-                    .map_err(map_job_err)?,
+                partitioned_job::complete_with_fixed_time_in_txn(
+                    &write_txn,
+                    &key,
+                    hash,
+                    rows_changed,
+                    fixed_time,
+                )
+                .map_err(map_job_err)?,
             )
         } else {
             // `!exhausted` なら 1 行以上走査済みでカーソルが存在する。

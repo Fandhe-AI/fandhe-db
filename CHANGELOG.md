@@ -25,6 +25,15 @@
   変更した。単一行 INSERT は `rows.len() == 1` として同じ内容を保持するため、
   移行は `stmt.values` を `stmt.rows[0]`（単一行前提のコードの場合）へ
   読み替えるか、複数行を扱う場合は `rows` を反復する形へ書き換える。
+- 書き込み文の現在時刻関数（Issue #2188・SQL-37）に伴う公開 API の変更: 公開 enum
+  `engine::sql::allowlist::InsertLiteral` に `CurrentTime(TimeDefault)`、公開 enum
+  `engine::catalog::TimeDefault` に `StatementTimestamp`・`ClockTimestamp`・`LocalTime(Option<u8>)`
+  を追加した（網羅 `match` は更新が必要）。`engine::sql::parser::BoundInsert::volatile_default_columns`
+  の型を `Vec<usize>` から `Vec<VolatileColumn>`（新しい公開 enum）へ変更した。移行は
+  `VolatileColumn::Default(i)` を従来の位置 `i` として読み替える。
+- `operation_id` 台帳に値フォーマット v3（ハッシュ＋評価に用いたトランザクション開始時刻）を追加した。
+  時刻関数を評価した書き込みだけが v3 を書く。v3 を書いた DB を旧バイナリで開くと、該当キーの再送照合が
+  `XX000`（fail-closed）になる（ダウングレード不可の既知の制約。移行処理は無い）。
 - `engine::sql::parser::BoundInsertForm` に新しい variant `RowBatch(Vec<BoundInsert>)`
   を追加した。この enum を網羅的に `match` していた利用側コードは、新 variant
   への対応を追加しないとコンパイルできない。

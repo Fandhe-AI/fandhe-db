@@ -306,7 +306,39 @@ pub struct BoundInsert {
     /// 省略列へ適用した列の `schema.columns` 上の位置。`values` には評価済みの時刻が入るが、
     /// 内容照合ハッシュは評価値ではなく列の DEFAULT 構文形から計算する（設計 D1・D2。
     /// 再送で評価時刻が変わっても同一ハッシュにするため）。空なら従来どおり値だけでハッシュする。
-    pub volatile_default_columns: Vec<usize>,
+    ///
+    /// Issue #2188: `VALUES` の要素に書かれた単独の時刻関数（`now()` 等）の列も同じ一覧に
+    /// 含め（[`VolatileColumn::Values`]）、ハッシュは種別バイト `1` の構文形を使う。
+    pub volatile_default_columns: Vec<VolatileColumn>,
+}
+
+/// 内容照合ハッシュが評価値ではなく構文形を使う列（時刻関数を評価した列。SQL-37・
+/// Issue #1587・#2188）。`tenant` の INSERT 系書き込みと `sql::exec` が共有する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolatileColumn {
+    /// 省略列へ適用した列 `DEFAULT now()` 系（`schema.columns` 上の位置。ハッシュ種別 `2`）。
+    Default(usize),
+    /// `VALUES` の要素が単独の時刻関数だった列（位置と構文形。ハッシュ種別 `1`）。
+    Values(usize, crate::catalog::TimeDefault),
+}
+
+impl VolatileColumn {
+    /// `schema.columns` 上の位置。
+    pub fn index(&self) -> usize {
+        match self {
+            VolatileColumn::Default(i) | VolatileColumn::Values(i, _) => *i,
+        }
+    }
+}
+
+/// `InsertLiteral::CurrentTime`（`VALUES` 要素の単独時刻関数。Issue #2188）を受理しない
+/// 束縛経路（UPDATE のリテラル・UPSERT の `DO UPDATE`・ファイル形 INSERT・COPY・NoSQL）の
+/// 共通拒否（fail-closed。パーサーはこれらの経路へ `CurrentTime` を渡さないため、
+/// 到達は内部の構築ミスのみ）。
+pub(crate) fn reject_current_time_literal(name: &str) -> SqlSurfaceError {
+    SqlSurfaceError::invalid_input(format!(
+        "column {name:?} does not accept a time function in this position"
+    ))
 }
 
 /// 束縛済みの単一行・`id` 指定形 `DELETE` 文（SQL-18・TASK-191。#867 が
@@ -360,6 +392,7 @@ pub(crate) fn bind_numeric_literal(
                 "column {name:?} expects a NUMERIC literal, got a vector literal"
             )))
         }
+        InsertLiteral::CurrentTime(_) => return Err(reject_current_time_literal(name)),
         // 呼び出し元（`bind_insert`／`bind_set_assignments`／
         // `bind_upsert_assignments`）はいずれも `InsertLiteral::Null` を
         // 本関数へ渡すより前に nullable 判定込みで独自に処理するため実際には
@@ -504,6 +537,7 @@ pub(crate) fn bind_integer_literal(
                 "invalid input syntax for integer column {name:?}"
             )));
         }
+        InsertLiteral::CurrentTime(_) => return Err(reject_current_time_literal(name)),
         InsertLiteral::Bool(_) | InsertLiteral::Null | InsertLiteral::Vector(_) => {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "column {name:?} expects an integer literal, got a non-integer literal"
@@ -2663,10 +2697,10 @@ pub(crate) fn fill_omitted_columns(
     bound_values: &mut [crate::row_codec::Value],
     provided: &[bool],
     clock: Option<crate::sql::time_fn::StatementClock>,
-) -> Result<Vec<usize>, SqlSurfaceError> {
+) -> Result<Vec<VolatileColumn>, SqlSurfaceError> {
     // 時刻 DEFAULT を適用した列の位置（内容照合ハッシュが評価値の代わりに DEFAULT 構文形を
     // 使う対象。`BoundInsert::volatile_default_columns`）。
-    let mut volatile: Vec<usize> = Vec::new();
+    let mut volatile: Vec<VolatileColumn> = Vec::new();
     for (idx, column) in columns.iter().enumerate() {
         let is_provided = provided.get(idx).copied().unwrap_or(false);
         if is_provided {
@@ -2683,7 +2717,7 @@ pub(crate) fn fill_omitted_columns(
                 if let Some(slot) = bound_values.get_mut(idx) {
                     *slot = value;
                 }
-                volatile.push(idx);
+                volatile.push(VolatileColumn::Default(idx));
             }
             Some(default) => {
                 let value = bind_column_default(column, default)?;
@@ -2850,6 +2884,7 @@ fn bind_insert_row(
         InsertLiteral::String(_)
         | InsertLiteral::Bool(_)
         | InsertLiteral::Null
+        | InsertLiteral::CurrentTime(_)
         | InsertLiteral::Vector(_) => {
             return Err(SqlSurfaceError::invalid_input(
                 "id pseudo-column value must be a number",
@@ -2860,6 +2895,8 @@ fn bind_insert_row(
     let mut bound_values: Vec<crate::row_codec::Value> =
         vec![crate::row_codec::Value::Null; schema.columns.len()];
     let mut provided = vec![false; schema.columns.len()];
+    // `VALUES` の単独時刻関数を評価した列（ハッシュは構文形。Issue #2188）。
+    let mut volatile_values: Vec<VolatileColumn> = Vec::new();
 
     for (name, literal) in columns.iter().zip(values.iter()) {
         if name == "id" {
@@ -2878,7 +2915,34 @@ fn bind_insert_row(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
+        if let InsertLiteral::CurrentTime(time) = literal {
+            // 時刻関数の単独形（SQL-37・Issue #2188）。列型と構文形の適合を確認してから、
+            // 現スレッドの時刻スコープ（`core.rs` の INSERT 入口が開く）で評価する。
+            if !time.compatible_with(&column.ty) {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} type does not match the time function"
+                )));
+            }
+            let clock = crate::sql::time_fn::current_default_clock().ok_or_else(|| {
+                SqlSurfaceError::FeatureNotSupported {
+                    detail: "time functions are not supported in this context".to_string(),
+                }
+            })?;
+            let value = crate::sql::time_fn::eval_time_default(*time, &clock)?;
+            if let Some(slot) = bound_values.get_mut(col_idx) {
+                *slot = value;
+            }
+            if let Some(flag) = provided.get_mut(col_idx) {
+                *flag = true;
+            }
+            volatile_values.push(VolatileColumn::Values(col_idx, *time));
+            continue;
+        }
         let value = match (&column.ty, literal) {
+            // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。
+            (_, InsertLiteral::CurrentTime(_)) => {
+                return Err(reject_current_time_literal(name));
+            }
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
             }
@@ -3054,12 +3118,13 @@ fn bind_insert_row(
 
     // 時刻 DEFAULT の評価時刻は `core.rs` の INSERT 入口が `DefaultClockScope` で渡す
     // （無ければ時刻 DEFAULT は `0A000`）。
-    let volatile_default_columns = fill_omitted_columns(
+    let mut volatile_default_columns = fill_omitted_columns(
         &schema.columns,
         &mut bound_values,
         &provided,
         crate::sql::time_fn::current_default_clock(),
     )?;
+    volatile_default_columns.extend(volatile_values);
 
     Ok(BoundInsert {
         table: table_name.to_string(),
@@ -3333,6 +3398,10 @@ fn bind_set_assignments(
             }
         };
         let value = match (&column.ty, literal) {
+            // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。
+            (_, InsertLiteral::CurrentTime(_)) => {
+                return Err(reject_current_time_literal(name));
+            }
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
             }
@@ -4509,6 +4578,10 @@ fn bind_upsert_assignments(
             }
             UpsertValue::Literal(literal) => {
                 let v = match (&column.ty, literal) {
+            // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。
+            (_, InsertLiteral::CurrentTime(_)) => {
+                return Err(reject_current_time_literal(name));
+            }
                     (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
                     }
@@ -4723,6 +4796,10 @@ fn bind_file_insert(
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
         let value = match (&column.ty, literal) {
+            // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。
+            (_, InsertLiteral::CurrentTime(_)) => {
+                return Err(reject_current_time_literal(name));
+            }
             (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::String(s)) => {
                 bind_text_literal(&column.ty, s)?
             }

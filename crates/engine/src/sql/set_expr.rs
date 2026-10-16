@@ -64,12 +64,11 @@ pub(crate) fn bind_set_expr(
     column: &ColumnDef,
     schema: &TableSchema,
 ) -> Result<BoundSetExpr, SqlSurfaceError> {
-    // 現在時刻関数は、分割実行 DML がトランザクション固定の時刻だけを受理するスコープを
-    // 開いている間に限り SET 右辺で受理する（原子版の UPDATE SET は従来どおり 42601。
-    // SQL-37・Issue #1587。台帳 v3 を要する原子版は #2188）。
-    let allow_current_time = crate::sql::time_fn::current_clock().is_some()
-        && crate::sql::time_fn::current_clock_policy()
-            == crate::sql::time_fn::ClockPolicy::TxnFixedOnly;
+    // 現在時刻関数は、時刻スコープ（原子版 UPDATE の `core.rs` 入口、または分割実行 DML の
+    // 固定時刻スコープ）が開いている間に限り SET 右辺で受理する。スコープが無い文脈は
+    // 従来どおり 42601。分割実行の `statement_timestamp()`／`clock_timestamp()` の拒否は
+    // 束縛段（`udf_call::reject_non_txn_fixed_clock`）が担う（SQL-37・Issue #1587・#2188）。
+    let allow_current_time = crate::sql::time_fn::current_clock().is_some();
     if first_non_builtin_call_with(expr, allow_current_time, true).is_some() {
         return Err(SqlSurfaceError::unsupported(
             "only built-in functions are allowed in a SET expression",

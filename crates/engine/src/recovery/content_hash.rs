@@ -902,6 +902,10 @@ pub(crate) enum HashColumnInput<'a> {
     /// 省略列へ適用した揮発性 DEFAULT（種別バイト `2`）。評価値ではなく DEFAULT の構文形を
     /// ハッシュする。同じ文の再送は評価時刻によらず同一ハッシュになる（設計 D1）。
     VolatileDefault(crate::catalog::TimeDefault),
+    /// `INSERT … VALUES` の要素に書かれた単独の時刻関数（種別バイト `1`。Issue #2188・
+    /// SQL-37）。評価値ではなく構文形をハッシュする（[`HashColumnInput::VolatileDefault`]
+    /// と同じ理由）。DEFAULT 適用（種別 `2`）とは別ハッシュになる。
+    ValuesTime(crate::catalog::TimeDefault),
 }
 
 /// [`for_typed_insert_batch_expr`]・[`for_typed_upsert_expr`]・`tenant.rs` が共有する
@@ -941,6 +945,18 @@ fn time_default_expr(time: crate::catalog::TimeDefault) -> crate::sql::udf_call:
             kind: ValueFunctionKind::CurrentDate,
             precision: None,
         },
+        TimeDefault::StatementTimestamp => Expr::Call {
+            name: "statement_timestamp".to_string(),
+            args: Vec::new(),
+        },
+        TimeDefault::ClockTimestamp => Expr::Call {
+            name: "clock_timestamp".to_string(),
+            args: Vec::new(),
+        },
+        TimeDefault::LocalTime(precision) => Expr::ValueFunction {
+            kind: ValueFunctionKind::LocalTime,
+            precision,
+        },
     }
 }
 
@@ -949,7 +965,7 @@ fn time_default_expr(time: crate::catalog::TimeDefault) -> crate::sql::udf_call:
 ///
 /// `id` → `visibility` → [`push_vector`] → 列数（`Value::Null` 除外後。LE u32）→ 列ごとに
 /// 「列名 → 種別バイト → 本体」。種別 `0` は値（[`push_value`]）、種別 `1` は
-/// VALUES 内の式用に番号だけ予約（#2188 まで到達しない）、種別 `2` は揮発性 DEFAULT
+/// VALUES 内の単独時刻関数（#2188。構文形を `push_dml_expr` で直列化）、種別 `2` は揮発性 DEFAULT
 /// （構文形を `push_dml_expr` で直列化）。列数プレフィクスは単一行でも常に置く
 /// （[`for_typed_insert_batch`] の行境界曖昧性回避と同じ理由で、全 `*Expr` 形に共通のレイアウトにする）。
 fn push_expr_row(
@@ -976,6 +992,13 @@ fn push_expr_row(
                 b.push_bytes(name.as_bytes())?;
                 b.push_u8(0);
                 push_value(b, v)?;
+            }
+            HashColumnInput::ValuesTime(time) => {
+                b.push_bytes(name.as_bytes())?;
+                b.push_u8(1);
+                push_dml_expr(b, &time_default_expr(*time), None).map_err(|_| {
+                    StorageError::Codec("content hash values expression too large".to_string())
+                })?;
             }
             HashColumnInput::VolatileDefault(time) => {
                 b.push_bytes(name.as_bytes())?;
@@ -1543,6 +1566,13 @@ fn push_dml_assignments(
             InsertLiteral::Vector(values) => {
                 b.push_u8(5);
                 push_vector(b, values).map_err(|_| dml_hash_field_too_large())?;
+            }
+            // `VALUES` の単独時刻関数（Issue #2188）は UPDATE の `SET` リテラルには現れない
+            // （時刻関数は式経路 `SetValue::Expr` を通る）。到達は fail-closed で拒否する。
+            InsertLiteral::CurrentTime(_) => {
+                return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "time function literal is not valid in UPDATE SET",
+                ));
             }
         }
     }
@@ -2184,6 +2214,36 @@ mod tests {
             for_typed_insert_expr(1, Visibility::Private, &embedding, &with_null).expect("hash"),
             hash_with(TimeDefault::Now)
         );
+    }
+
+    /// Issue #2188: `VALUES` の単独時刻関数（種別 1）は DEFAULT 適用（種別 2）と別ハッシュで、
+    /// 新しい時刻形（statement／clock／LOCALTIME）も互いに別内容になる。同じ構文形は安定。
+    #[test]
+    fn values_time_kind_is_distinct_from_default_and_between_forms() {
+        use crate::catalog::TimeDefault;
+        let embedding = [1.0_f32, 0.0];
+        let hash = |col: HashColumnInput<'_>| {
+            let cols = [("at", col)];
+            for_typed_insert_expr(1, Visibility::Private, &embedding, &cols).expect("hash")
+        };
+        let values = |t| hash(HashColumnInput::ValuesTime(t));
+        let default = |t| hash(HashColumnInput::VolatileDefault(t));
+        assert_eq!(values(TimeDefault::Now), values(TimeDefault::Now));
+        assert_ne!(values(TimeDefault::Now), default(TimeDefault::Now));
+        let forms = [
+            TimeDefault::Now,
+            TimeDefault::StatementTimestamp,
+            TimeDefault::ClockTimestamp,
+            TimeDefault::LocalTime(None),
+            TimeDefault::LocalTime(Some(3)),
+            TimeDefault::CurrentTimestamp(None),
+        ];
+        for (i, a) in forms.iter().enumerate() {
+            for b in forms.iter().skip(i + 1) {
+                assert_ne!(values(*a), values(*b), "{a:?} vs {b:?}");
+                assert_ne!(default(*a), default(*b), "{a:?} vs {b:?}");
+            }
+        }
     }
 
     /// バッチ・UPSERT の `*Expr` 形は、単一行形・従来形・互いに別ドメインで、行境界を

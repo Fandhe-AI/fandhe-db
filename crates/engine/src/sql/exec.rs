@@ -4834,7 +4834,9 @@ pub(crate) fn execute_insert_batch_with_schema_in(
 
 /// 各行の揮発性 DEFAULT 適用列（`BoundInsert::volatile_default_columns`）を `tenant` の
 /// 行ごと指定へ並べる。どの行にも無ければ空（従来のハッシュ形。SQL-37・Issue #1587）。
-fn volatile_default_columns_of(bounds: &[crate::sql::parser::BoundInsert]) -> Vec<&[usize]> {
+fn volatile_default_columns_of(
+    bounds: &[crate::sql::parser::BoundInsert],
+) -> Vec<&[crate::sql::parser::VolatileColumn]> {
     if bounds.iter().all(|b| b.volatile_default_columns.is_empty()) {
         return Vec::new();
     }
