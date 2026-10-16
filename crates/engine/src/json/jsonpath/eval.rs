@@ -1817,6 +1817,8 @@ impl<'a> Ev<'a> {
         for l in lseq {
             for r in rseq {
                 self.tick(1)?;
+                // 文字列対は走査バイト数に比例して追加課金する（fail-closed）。
+                self.tick(pair_scan_steps(l, r))?;
                 match f(l, r) {
                     Tri::Unknown => {
                         if strict {
@@ -1896,6 +1898,20 @@ fn level_bound(l: AnyLevel) -> u32 {
 // ---------------------------------------------------------------------------
 // 比較・文字列変換
 // ---------------------------------------------------------------------------
+
+/// 文字列比較 1 組あたりの追加課金の粒度（バイト）。
+const STR_SCAN_BYTES_PER_STEP: usize = 64;
+
+/// 文字列どうしの比較・前方一致で走査しうるバイト数（短い側の長さ）に比例した追加ステップ数。
+/// `pair_loop` から呼ばれ、巨大文字列の大量比較による処理量の爆発を上限エラーに倒す。
+fn pair_scan_steps(l: &Item<'_>, r: &Item<'_>) -> u64 {
+    match (l.str(), r.str()) {
+        (Some(a), Some(b)) => {
+            u64::try_from(a.len().min(b.len()) / STR_SCAN_BYTES_PER_STEP).unwrap_or(u64::MAX)
+        }
+        _ => 0,
+    }
+}
 
 /// 比較の型クラス。数値・文字列・真偽値・null は同型どうしだけ比較でき、コンテナは
 /// 比較不能（unknown）。

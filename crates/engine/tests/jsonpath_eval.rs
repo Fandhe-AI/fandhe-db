@@ -1135,3 +1135,23 @@ fn boolean_method_rejects_scaled_numbers() {
         vec![JsonValue::Bool(false)]
     );
 }
+
+/// 巨大文字列の比較は走査バイト数に比例して課金され、上限超過は fail-closed（54000）。
+#[test]
+fn string_comparison_is_charged_by_scanned_bytes() {
+    let big = |tail: char| format!("{}{}", "a".repeat(1 << 16), tail);
+    let doc = format!(r#"{{"a":"{}","b":"{}"}}"#, big('x'), big('y'));
+    let small = r#"{"a":"x","b":"y"}"#;
+    let limits = JsonPathLimits::new(500, 1024);
+    let path = "$ ? ($.a < $.b)";
+    assert_eq!(eval_with(path, small, limits), Ok(1));
+    assert_eq!(
+        eval_with(path, &doc, limits),
+        Err(JsonPathEvalError::StepLimitExceeded)
+    );
+    // 十分な予算があれば同じ入力でも成功する。
+    assert_eq!(
+        eval_with(path, &doc, JsonPathLimits::new(1_000_000, 1024)),
+        Ok(1)
+    );
+}
