@@ -706,6 +706,8 @@ fn declare_between(
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
+        // TIMESTAMPTZ の述語は engine の述語解禁（#1576）の後に解禁する。insert／update の型束縛は
+        // typed_json 側で Issue #1577 により対応済み。
         ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
@@ -872,6 +874,8 @@ fn declare_eq(
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
+        // TIMESTAMPTZ の述語は engine の述語解禁（#1576）の後に解禁する。insert／update の型束縛は
+        // typed_json 側で Issue #1577 により対応済み。
         ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
@@ -967,6 +971,8 @@ fn declare_range(
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
+        // TIMESTAMPTZ の述語は engine の述語解禁（#1576）の後に解禁する。insert／update の型束縛は
+        // typed_json 側で Issue #1577 により対応済み。
         ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
@@ -1158,6 +1164,8 @@ fn declare_in(
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
+        // TIMESTAMPTZ の述語は engine の述語解禁（#1576）の後に解禁する。insert／update の型束縛は
+        // typed_json 側で Issue #1577 により対応済み。
         ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),

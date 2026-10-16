@@ -38,15 +38,18 @@ pub(crate) enum BinaryParam {
     Uuid,
     /// time（0 時起点マイクロ秒の 8 バイト BE。TABLE-32・Issue #1571）。
     Time,
+    /// timestamptz（2000-01-01 00:00:00 UTC 起点マイクロ秒の 8 バイト BE。TABLE-33・
+    /// Issue #1577）。
+    TimestampTz,
 }
 
-/// バイナリ値の復号失敗。長さ不正は `08P01`、TIME の範囲外は `22008`
+/// バイナリ値の復号失敗。長さ不正は `08P01`、TIME・TIMESTAMPTZ の範囲外は `22008`
 /// （`extended_query` が別々の `HandlerError` へ写す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinaryParamError {
     /// 長さが型の受信形式と合わない。
     InvalidLength,
-    /// 値が型の許容範囲外（TIME のみ。Issue #1571）。
+    /// 値が型の許容範囲外（TIME・TIMESTAMPTZ。Issue #1571・#1577）。
     OutOfRange,
 }
 
@@ -111,6 +114,19 @@ pub(crate) fn decode_to_text(kind: BinaryParam, raw: &[u8]) -> Result<Vec<u8>, B
                 return Err(BinaryParamError::OutOfRange);
             }
             engine::datetime::format_time(v)
+        }
+        BinaryParam::TimestampTz => {
+            let b = <[u8; 8]>::try_from(raw).map_err(|_| BinaryParamError::InvalidLength)?;
+            // untrusted 入力: PG epoch 加算は checked、続けて engine の範囲検査を通す。
+            // PG の infinity 番兵（i64::MAX／MIN）も範囲外として fail-closed で拒否する。
+            let v = i64::from_be_bytes(b)
+                .checked_add(crate::result_encoder::binary::PG_EPOCH_UNIX_MICROS)
+                .filter(|v| engine::datetime::validate_timestamptz_micros(*v))
+                .ok_or(BinaryParamError::OutOfRange)?;
+            // 必ず明示 offset（`+00`）付きで整形する。offset 無しのテキストは engine がセッション
+            // TimeZone の壁時計として解釈するため（#1575）、バイナリ値の意味をセッション TZ から
+            // 独立に保つ。
+            engine::datetime::format_timestamptz(v, &engine::datetime::SessionTimeZone::utc())
         }
     };
     Ok(text.into_bytes())
@@ -196,6 +212,44 @@ mod tests {
         }
     }
 
+    /// TIMESTAMPTZ は 2000-01-01 UTC 起点 µs の 8 バイト BE。境界値は `parse_timestamptz` で
+    /// 元の UTC µs へ戻り、範囲外・infinity 番兵は `OutOfRange`（Issue #1577）。
+    #[test]
+    fn timestamptz_round_trips_and_rejects_out_of_range() {
+        use engine::datetime::{
+            parse_timestamptz, SessionTimeZone, TIMESTAMPTZ_MAX_MICROS, TIMESTAMPTZ_MIN_MICROS,
+        };
+        let pg = binary::PG_EPOCH_UNIX_MICROS;
+        for unix in [
+            TIMESTAMPTZ_MIN_MICROS,
+            TIMESTAMPTZ_MAX_MICROS,
+            pg,
+            pg - 1,
+            pg + 123_456,
+            0,
+        ] {
+            let raw = (unix - pg).to_be_bytes();
+            let t = dec(BinaryParam::TimestampTz, &raw);
+            assert_eq!(
+                parse_timestamptz(&t, &SessionTimeZone::utc()).ok(),
+                Some(unix),
+                "{t}"
+            );
+        }
+        for pgv in [
+            i64::MAX,
+            i64::MIN,
+            TIMESTAMPTZ_MAX_MICROS - pg + 1,
+            TIMESTAMPTZ_MIN_MICROS - pg - 1,
+        ] {
+            assert_eq!(
+                decode_to_text(BinaryParam::TimestampTz, &pgv.to_be_bytes()),
+                Err(BinaryParamError::OutOfRange),
+                "{pgv}"
+            );
+        }
+    }
+
     #[test]
     fn utf8_identity_passes_through() {
         assert_eq!(dec(BinaryParam::Utf8Identity, "あ".as_bytes()), "あ");
@@ -203,7 +257,7 @@ mod tests {
 
     #[test]
     fn wrong_lengths_are_rejected() {
-        let cases: [(BinaryParam, usize); 8] = [
+        let cases: [(BinaryParam, usize); 9] = [
             (BinaryParam::Int2, 2),
             (BinaryParam::Int4, 4),
             (BinaryParam::Int8, 8),
@@ -212,6 +266,7 @@ mod tests {
             (BinaryParam::Bool, 1),
             (BinaryParam::Uuid, 16),
             (BinaryParam::Time, 8),
+            (BinaryParam::TimestampTz, 8),
         ];
         for (kind, n) in cases {
             for len in [n - 1, n + 1] {

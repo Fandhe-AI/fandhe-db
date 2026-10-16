@@ -245,6 +245,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ColumnDef::new("mood", ColumnType::Enum(mood), true),
                 ColumnDef::new("s", ColumnType::SmallInt, true),
                 ColumnDef::new("tm", ColumnType::Time, true),
+                ColumnDef::new("tz", ColumnType::TimestampTz, true),
             ],
         ))
         .expect("create table");
@@ -271,6 +272,14 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             1 => Value::Time(0),
             2 => Value::Time(86_399_999_999),
             3 => Value::Time(86_400_000_000),
+            _ => Value::Null,
+        });
+        // TIMESTAMPTZ 列 `tz`（Issue #1577）: id 1: 1970 epoch（PG 値は負）・id 2: 2000 epoch・
+        // id 3: 上限。他は NULL。
+        row.push(match id {
+            1 => Value::TimestampTz(0),
+            2 => Value::TimestampTz(946_684_800_000_000),
+            3 => Value::TimestampTz(engine::datetime::TIMESTAMPTZ_MAX_MICROS),
             _ => Value::Null,
         });
         engine::tenant::insert_typed_row(&storage, "t", &ctx, id, Visibility::Private, &row, &op)
@@ -796,5 +805,45 @@ fn time_column_binary_result_matches_text_and_golden_bytes() {
         rows[0][0].as_deref(),
         Some(&86_399_999_999i64.to_be_bytes()[..])
     );
+    assert_eq!(rows[0][1].as_deref(), Some(&b"-2147483648"[..]));
+}
+
+/// TIMESTAMPTZ 列（TABLE-33・WIRE-14・Issue #1577）: バイナリ結果は 2000-01-01 UTC 起点 µs の
+/// 8 バイト BE で、text 形式（UTC の ISO 表記）と同じ瞬間を表す。NULL は NULL のまま。
+#[test]
+fn timestamptz_column_binary_result_matches_text_and_golden_bytes() {
+    let (mut s, _g, _) = connect("alice", "correct-horse");
+    let cases: [(i32, i64, &str); 3] = [
+        (1, -946_684_800_000_000, "1970-01-01 00:00:00+00"),
+        (2, 0, "2000-01-01 00:00:00+00"),
+        (
+            3,
+            253_402_300_799_999_999 - 946_684_800_000_000,
+            "9999-12-31 23:59:59.999999+00",
+        ),
+    ];
+    for (id, pg_micros, text) in cases {
+        let sql = format!("SELECT tz FROM t WHERE id = {id} LIMIT 10");
+        let (_, text_rows) = run(&mut s, &sql, &[0]);
+        let (bf, bin_rows) = run(&mut s, &sql, &[1]);
+        assert_eq!(bf, vec![1]);
+        assert_eq!(text_rows[0][0].as_deref(), Some(text.as_bytes()), "id={id}");
+        assert_eq!(
+            bin_rows[0][0].as_deref(),
+            Some(&pg_micros.to_be_bytes()[..]),
+            "id={id}"
+        );
+    }
+    // NULL は両形式とも NULL（tenant-b の id 10 は `tz` が NULL）。
+    let (mut b, _gb, _) = connect("bob", "battery-staple");
+    let sql = "SELECT tz FROM t WHERE id = 10 LIMIT 10";
+    let (_, text_rows) = run(&mut b, sql, &[0]);
+    let (_, bin_rows) = run(&mut b, sql, &[1]);
+    assert_eq!(text_rows[0][0], None);
+    assert_eq!(bin_rows[0][0], None);
+    // text/binary 混在も列単位で効く。
+    let (fmts, rows) = run(&mut s, "SELECT tz, n FROM t WHERE id = 2 LIMIT 10", &[1, 0]);
+    assert_eq!(fmts, vec![1, 0]);
+    assert_eq!(rows[0][0].as_deref(), Some(&0i64.to_be_bytes()[..]));
     assert_eq!(rows[0][1].as_deref(), Some(&b"-2147483648"[..]));
 }

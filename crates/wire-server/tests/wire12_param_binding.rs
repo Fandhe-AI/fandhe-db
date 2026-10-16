@@ -72,6 +72,7 @@ fn open_storage() -> (Storage, temp_db::CleanupGuard) {
                 ColumnDef::new("dt", ColumnType::Date, true),
                 ColumnDef::new("ts", ColumnType::Timestamp, true),
                 ColumnDef::new("tm", ColumnType::Time, true),
+                ColumnDef::new("tz", ColumnType::TimestampTz, true),
                 ColumnDef::new("u", ColumnType::Uuid, true),
                 ColumnDef::new("bin", ColumnType::Bytea, true),
             ],
@@ -929,11 +930,14 @@ fn seven_type_slots_report_column_oids() {
         ("ts", 1114),
         // TIME スロットは time（OID 1083。TABLE-32・Issue #1571）。
         ("tm", 1083),
+        // TIMESTAMPTZ スロットは timestamptz（OID 1184。TABLE-33・Issue #1577）。
+        ("tz", 1184),
         ("u", 2950),
         ("bin", 17),
     ] {
         // TIME 述語は未対応（Issue #1570）のため、tm は INSERT スロットのみ検証する。
-        if col != "tm" {
+        // TIMESTAMPTZ 述語も engine の述語解禁（Issue #1576）まで未対応。
+        if col != "tm" && col != "tz" {
             assert_eq!(
                 describe_statement_oids(
                     &mut s,

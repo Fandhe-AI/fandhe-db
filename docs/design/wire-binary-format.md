@@ -220,6 +220,12 @@ matches_legacy_encoder`）で固定している。シグネチャは
 - param: `TIME` スロットは宣言 OID 1083（推論含む）のみバイナリを受理し、それ以外の宣言は `0A000`。8 バイト以外は `08P01`、範囲外は `22008`（値は応答に含めない）。復号後は正規テキストにして engine の束縛経路へ渡す（テキストで送った場合と同一）
 - `DATE`／`TIMESTAMP` は従来どおり非対応（`0A000`）
 
+## Issue #1577 追記（TIMESTAMPTZ のバイナリ入出力・TABLE-33・WIRE-14 ポインタ）
+
+- 結果: `TIMESTAMPTZ` 列（`Computed{ty: Some(TimestampTz)}` を含む）は OID 1184・typlen 8 で公告し、バイナリは 2000-01-01 00:00:00 UTC 起点マイクロ秒の 8 バイト BE（PostgreSQL の `timestamptz_send` と同形）。範囲外の `Cell::TimestampTz` は丸めず `XX000`。テキストは UTC 固定の `+00` 付き ISO 表記（セッション TimeZone での表示は #1575）。**契約変更**: 従来の OID 25 から 1184 へ変わる
+- param: `TIMESTAMPTZ` スロットは宣言 OID 1184（推論含む）のみバイナリを受理し、それ以外の宣言は `0A000`。8 バイト以外は `08P01`、範囲外（PG の infinity 番兵を含む）は `22008`（値は応答に含めない）。復号後は明示 offset（`+00`）付きの正規テキストにして engine の束縛経路へ渡す。offset 無しだとセッション TimeZone の壁時計として解釈され、#1575 で意味が変わるため
+- `DATE`／`TIMESTAMP` は従来どおり非対応（`0A000`）
+
 ## Issue #2442 追記: numeric 結果列のバイナリ符号化
 
 - **対象**: numeric を公告する結果列すべて（`id`・別名付き `id`・`NUMERIC(p, s)` 列・

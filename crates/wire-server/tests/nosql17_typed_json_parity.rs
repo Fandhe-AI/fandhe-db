@@ -65,6 +65,7 @@ fn schema(name: &str) -> TableSchema {
             ColumnDef::new("flag", ColumnType::Boolean, true),
             ColumnDef::new("sm", ColumnType::SmallInt, true),
             ColumnDef::new("tm", ColumnType::Time, true),
+            ColumnDef::new("tz", ColumnType::TimestampTz, true),
             ColumnDef::new("day", ColumnType::Date, true),
             ColumnDef::new("at", ColumnType::Timestamp, true),
             ColumnDef::new("ext", ColumnType::Uuid, true),
@@ -1295,6 +1296,84 @@ fn time_binding_matches_sql() {
             NOSQL_TABLE,
             r#"{"fn":"count","column":"*"}"#,
             r#","filter":[{"column":"tm","op":"eq","value":"00:00:00"}]"#,
+        ),
+    );
+    assert!(resp.status >= 400, "{resp:?}");
+}
+
+/// Issue #1577（TABLE-33・NOSQL-17）: TIMESTAMPTZ 列の insert／scan が SQL 表層と一致し
+/// （`T` 区切り・`Z`・数値 offset・IANA 名）、型不一致は 42601・書式不正は 22007・
+/// 範囲外は 22008・未知の TZ 名は 22023 で副作用が無い。filter は述語解禁（#1576）まで fail-closed。
+#[test]
+fn timestamptz_binding_matches_sql() {
+    let (core, _g) = new_core();
+    let addr = spawn(Arc::clone(&core));
+    for (i, v) in [
+        "2026-01-01T00:00:00Z",
+        "2026-01-01 09:00:00+09:00",
+        "2026-01-01T09:00:00.123456 Asia/Tokyo",
+        "9999-12-31 23:59:59.999999+00",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = 500 + i as u64;
+        let resp = alice(
+            addr,
+            &format!(
+                r#"{{"op":"insert","table":"{NOSQL_TABLE}","rows":[{{"id":{id},"embedding":[0.5,0.25],"lang":"ja","tz":"{v}"}}],"operation_id":"tz-nosql-{id}"}}"#
+            ),
+        );
+        assert_eq!(resp.status, 200, "{v}: {resp:?}");
+        sql_exec(
+            &core,
+            "tenant-a",
+            &format!(
+                "INSERT INTO {SQL_TABLE} (id, embedding, lang, tz) VALUES \
+                 ({id}, '[0.5,0.25]', 'ja', '{v}') USING OPERATION_ID 'tz-sql-{id}'"
+            ),
+        );
+    }
+    let scan = |t: &str| {
+        format!(
+            r#"{{"op":"scan","table":"{t}","columns":["id","tz"],"sort":[{{"column":"id","dir":"asc"}}],"limit":100}}"#
+        )
+    };
+    let a = body_utf8(&alice(addr, &scan(NOSQL_TABLE)));
+    assert_eq!(a, body_utf8(&alice(addr, &scan(SQL_TABLE))));
+    assert_eq!(
+        a,
+        sql_oracle_body(
+            &core,
+            "tenant-a",
+            &format!("SELECT id, tz FROM {NOSQL_TABLE} ORDER BY id ASC LIMIT 100")
+        )
+    );
+    assert!(a.contains(r#""type":"timestamptz""#), "{a}");
+
+    let before = count_rows(addr, NOSQL_TABLE);
+    for (i, (json, want)) in [
+        ("5", "42601"),
+        ("true", "42601"),
+        (r#""not-a-timestamp""#, "22007"),
+        (r#""10000-01-01 00:00:00Z""#, "22008"),
+        (r#""2026-01-01 00:00:00 Not/AZone""#, "22023"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = insert_one(addr, &format!(r#""tz":{json}"#), &format!("tz-rej-{i}"));
+        assert_eq!(http_common::wire_code_of(&resp), want, "{json}: {resp:?}");
+        assert!(resp.status >= 400, "{json}");
+    }
+    assert_eq!(count_rows(addr, NOSQL_TABLE), before);
+
+    let resp = alice(
+        addr,
+        &agg_body(
+            NOSQL_TABLE,
+            r#"{"fn":"count","column":"*"}"#,
+            r#","filter":[{"column":"tz","op":"eq","value":"2026-01-01T00:00:00Z"}]"#,
         ),
     );
     assert!(resp.status >= 400, "{resp:?}");

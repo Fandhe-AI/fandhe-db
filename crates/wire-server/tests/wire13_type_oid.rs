@@ -59,6 +59,8 @@ fn expected_types() -> Vec<(&'static str, i32, i16)> {
         ("sm", 21, 2),
         // TIME は time（OID 1083・typlen 8。TABLE-32・Issue #1571）。
         ("tm", 1083, 8),
+        // TIMESTAMPTZ は timestamptz（OID 1184・typlen 8。TABLE-33・Issue #1577）。
+        ("tz", 1184, 8),
     ]
 }
 
@@ -111,6 +113,7 @@ fn new_core_typed_probe() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ColumnDef::new("vc", ColumnType::Varchar(None), false),
                 ColumnDef::new("sm", ColumnType::SmallInt, false),
                 ColumnDef::new("tm", ColumnType::Time, false),
+                ColumnDef::new("tz", ColumnType::TimestampTz, false),
             ],
         ))
         .expect("create table");
@@ -149,6 +152,7 @@ fn new_core_typed_probe() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             Value::Text("varchar-val".to_string()),
             Value::Integer(-7),
             Value::Time(45_296_789_000),
+            Value::TimestampTz(1_767_236_400_000_000),
         ],
         &op_id,
     )
@@ -158,7 +162,7 @@ fn new_core_typed_probe() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (Arc::new(core), guard)
 }
 
-const SELECT_ALL: &str = "SELECT id, embedding, flag, n, b, r, d, day, ts, blob, uid, doc, docb, price, tags, mood, vc, sm, tm FROM typed_probe LIMIT 10";
+const SELECT_ALL: &str = "SELECT id, embedding, flag, n, b, r, d, day, ts, blob, uid, doc, docb, price, tags, mood, vc, sm, tm, tz FROM typed_probe LIMIT 10";
 
 /// 受入基準 1〜3: 新規スカラー型が PostgreSQL 組み込み OID・typlen で公告され、
 /// 既存の `id`（`numeric`）・`VECTOR`（`text`）の公告は不変であることを、
@@ -220,6 +224,7 @@ fn data_row_text_values_are_unchanged_by_new_oid_announcements() {
         "vc",
         "sm",
         "tm",
+        "tz",
     ];
     assert_eq!(row.len(), names.len());
     let by_name = |name: &str| -> Option<String> {
@@ -250,6 +255,7 @@ fn data_row_text_values_are_unchanged_by_new_oid_announcements() {
     assert_eq!(by_name("vc").as_deref(), Some("varchar-val"));
     assert_eq!(by_name("sm").as_deref(), Some("-7"));
     assert_eq!(by_name("tm").as_deref(), Some("12:34:56.789"));
+    assert_eq!(by_name("tz").as_deref(), Some("2026-01-01 03:00:00+00"));
 
     let _tag = read_command_complete(&mut stream);
     read_ready_for_query(&mut stream);

@@ -196,3 +196,11 @@ TABLE-32・親 #1568 のポインタ（第 2 段）。#1569 で fail-closed に�
 - **PostgreSQL との乖離**: (1) 日付だけ・秒なし・小数 7 桁以上・1 桁の時の offset は受理しない。(2) 範囲は UTC で 0001〜9999 年。(3) offset の範囲外は PG では `22009` だが、Issue の写像に従い `22008`。(4) TZ 略称（`JST` 等）と POSIX 形式は #1575 まで `22023`。
 - **暫定挙動（fail-closed）**: 述語・ORDER BY・GROUP BY・集計・window・集合演算・式（列参照と型付きリテラル `TIMESTAMPTZ '...'`）・二次索引・EXTRACT／date_trunc・UDF 引数は既存の拒否コードで拒否する（#1576）。PK／UNIQUE／FK・JOIN キー・`ALTER COLUMN TYPE` は担当 Issue 未定。wire は暫定で text（OID 25）を公告してバイナリは非対応、NoSQL は型束縛・filter とも `TypeMismatch` で拒否する（OID 1184 とバイナリ・NoSQL は #1577）。JSON 応答の型名は `"timestamptz"`。
 - **対象外**: セッション TimeZone（`SET TIME ZONE`／StartupMessage／`SHOW`）・TZ 略称・POSIX 形式は #1575。`AT TIME ZONE`・他型との変換・述語・集計・索引・EXTRACT・DST 解決の PG 17 照合は #1576。`now()`／`CURRENT_TIMESTAMP` の戻り値型の切り替え、`TIMESTAMPTZ(p)`、`timestamptz[]`（OID 1185）、特殊値 `infinity`・`epoch`・`now` は担当 Issue 未定。
+
+## Issue #1577 追記: TIMESTAMPTZ の wire OID とバイナリ入出力
+
+TABLE-33・WIRE-13・WIRE-14・NOSQL-13・NOSQL-17 のポインタ。#1574 の暫定状態（wire は text・OID 25、バイナリと NoSQL 型束縛は拒否）を解消した。
+
+- **wire**: OID 1184・typlen 8 で公告し、バイナリ結果・バイナリ param に対応（詳細は [wire-binary-format.md](wire-binary-format.md)）。テキスト出力は UTC 固定。
+- **NoSQL**: insert／update は JSON 文字列を束縛し（数値・真偽値は `42601`）、書式・範囲・TZ 名の検査は engine の `parse_timestamptz`（`22007`／`22008`／`22023`）に委ねる。`create_table`／`add_column` の型名 `"timestamptz"` を受理する。
+- **対象外**: セッション TimeZone での表示（#1575）、NoSQL filter・述語（#1576 の後）、`timestamptz[]`（OID 1185）、COPY バイナリ、特殊値 `infinity`。

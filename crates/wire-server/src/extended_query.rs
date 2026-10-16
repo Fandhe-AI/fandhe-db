@@ -515,6 +515,9 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 ColumnType::Uuid => only(2950, BinaryParam::Uuid),
                 // TIME スロットは time（OID 1083）のみバイナリ受理（TABLE-32・Issue #1571）。
                 ColumnType::Time => only(1083, BinaryParam::Time),
+                // TIMESTAMPTZ スロットは timestamptz（OID 1184）のみバイナリ受理（TABLE-33・
+                // Issue #1577）。宣言 1114／25 のバイナリは意味が変わるため `0A000`。
+                ColumnType::TimestampTz => only(1184, BinaryParam::TimestampTz),
                 // CHAR(n) スロット（bpchar＝OID 1042）。値は engine のリテラル置換経路を通り、
                 // 非 NULL 書き込みの可否は engine 側の契約に従う（Issue #1565）。
                 ColumnType::Bpchar(_) => {
@@ -528,8 +531,6 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 | ColumnType::Numeric { .. }
                 | ColumnType::Date
                 | ColumnType::Timestamp
-                // TIMESTAMPTZ スロットのバイナリ受理は OID 1184 の公告と同時（#1577）。
-                | ColumnType::TimestampTz
                 | ColumnType::Json
                 | ColumnType::Jsonb
                 | ColumnType::Array(_)
@@ -987,10 +988,11 @@ enum HandlerError {
     InvalidBinaryParam {
         index: usize,
     },
-    /// バイナリ形式の TIME 値が範囲 `00:00:00`〜`24:00:00` の外（`22008`。Issue #1571。
-    /// `index` は 1 始まりの `$n` 番号で、値は含めない）。
+    /// バイナリ形式の TIME／TIMESTAMPTZ 値が許容範囲の外（`22008`。Issue #1571・#1577。
+    /// `index` は 1 始まりの `$n` 番号、`label` は型ラベルで、値は含めない）。
     BinaryParamOutOfRange {
         index: usize,
+        label: &'static str,
     },
     /// 結果 format code の解決・事前検査で生じたエラー（WIRE-14。
     /// `result_encoder::BinaryFormatError` をそのまま分類し直したもの）。
@@ -1112,8 +1114,8 @@ impl HandlerError {
             HandlerError::InvalidBinaryParam { index } => {
                 format!("incorrect binary data format in bind parameter ${index}")
             }
-            HandlerError::BinaryParamOutOfRange { index } => {
-                format!("time value out of range in bind parameter ${index}")
+            HandlerError::BinaryParamOutOfRange { index, label } => {
+                format!("{label} out of range in bind parameter ${index}")
             }
             HandlerError::BinaryFormat(result_encoder::BinaryFormatError::FormatCountMismatch) => {
                 "format code count does not match the parameter or result count".to_string()
@@ -1669,7 +1671,14 @@ fn handle_bind_body(
                                         HandlerError::InvalidBinaryParam { index: i + 1 }
                                     }
                                     binary_param::BinaryParamError::OutOfRange => {
-                                        HandlerError::BinaryParamOutOfRange { index: i + 1 }
+                                        HandlerError::BinaryParamOutOfRange {
+                                            index: i + 1,
+                                            label: if slot.binary == BinaryParam::TimestampTz {
+                                                "timestamp"
+                                            } else {
+                                                "time value"
+                                            },
+                                        }
                                     }
                                 },
                             )?)
