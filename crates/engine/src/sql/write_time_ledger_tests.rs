@@ -360,3 +360,50 @@ fn partitioned_completion_records_the_fixed_time_in_v3() {
     drop(core);
     assert_eq!(ledger_time(&path, "pt-1"), Some(fixed));
 }
+
+fn run_copy(core: &EngineCore, sql: &str, data: &[u8]) {
+    let session = SessionState::default();
+    let plan = core
+        .begin_copy(&ctx("tenant-a"), &session, sql)
+        .expect("begin copy");
+    let mut copy = match plan {
+        crate::core::CopyPlan::From(s) => s,
+        crate::core::CopyPlan::To(..) => panic!("expected COPY FROM STDIN plan"),
+    };
+    copy.feed(data).expect("feed");
+    let batch = copy.finish().expect("finish");
+    core.commit_copy_in(&ctx("tenant-a"), batch)
+        .expect("commit copy");
+}
+
+// Issue #2188（PR #2464 レビュー対応）: COPY は束縛と台帳記録が別スコープに分かれるため、
+// DEFAULT now() を評価した COPY だけが v3 を残し、時刻を使わない COPY・同一スレッドの
+// 後続 INSERT は v2 のまま（COPY の評価が文の外へ漏れない）。
+#[test]
+fn copy_records_v3_only_when_time_default_is_evaluated_and_does_not_leak() {
+    let path = unique_db_path("write-time-copy");
+    let _g = CleanupGuard(path.clone());
+    let core = open_core(&path);
+    setup(&core);
+    run_copy(
+        &core,
+        "COPY ev (id, embedding) FROM STDIN USING OPERATION_ID 'cp-1'",
+        b"1\t[0.1,0.2]\n",
+    );
+    run_copy(
+        &core,
+        "COPY ev (id, embedding, d) FROM STDIN USING OPERATION_ID 'cp-2'",
+        b"2\t[0.1,0.2]\t2000-01-01 00:00:00\n",
+    );
+    run(
+        &core,
+        "tenant-a",
+        "INSERT INTO ev (id, embedding, d) VALUES (3, '[0.1,0.2]', '2000-01-01 00:00:00') \
+         USING OPERATION_ID 'cp-3'",
+    )
+    .expect("plain insert");
+    drop(core);
+    assert!(ledger_time(&path, "cp-1").is_some());
+    assert_eq!(ledger_time(&path, "cp-2"), None);
+    assert_eq!(ledger_time(&path, "cp-3"), None);
+}

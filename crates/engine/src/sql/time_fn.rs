@@ -61,6 +61,10 @@ thread_local! {
     /// 分割実行 DML が「時刻値関数を含む文か」を AST の網羅走査なしに判定するために使う
     /// （束縛が時刻を要求した＝含む。判定漏れが fail-closed になる）。
     static CLOCK_USED: Cell<bool> = const { Cell::new(false) };
+    /// 束縛と台帳記録が別スコープに分かれる経路（NoSQL insert・COPY）が、束縛時に確定した
+    /// 台帳 v3 の評価時刻を書き込み区間へ引き継ぐ上書き値（[`LedgerClockScope`]）。
+    /// `None` は上書きなし、`Some(x)` は `x`（`None` なら v2）を権威値として使う。
+    static LEDGER_OVERRIDE: Cell<Option<Option<i64>>> = const { Cell::new(None) };
 }
 
 /// [`StatementClock`] を現スレッドの束縛スコープへ設定する RAII ガード。drop で直前の値へ戻す
@@ -136,8 +140,43 @@ impl DefaultClockScope {
     pub(crate) fn enter(clock: StatementClock) -> Self {
         let prev = DEFAULT_CLOCK.with(|c| c.replace(Some(clock)));
         // 式スコープと同じ「時刻関数を評価したか」の印を入れ子で保存・復元する。
-        let prev_used = CLOCK_USED.with(|u| u.get());
+        // 式スコープ（`ClockScope`）の内側で時刻を共有する場合はその印を引き継ぎ、スコープ外
+        // （COPY の feed 等）の評価で残った印は文ごとに false へ初期化する（Issue #2188。
+        // 時刻関数を使わない INSERT が v3 を記録しないようにする）。
+        let in_expr_scope = CURRENT.with(|c| c.get()).is_some();
+        let prev_used = CLOCK_USED.with(|u| {
+            let prev = u.get();
+            if !in_expr_scope {
+                u.set(false);
+            }
+            prev
+        });
         DefaultClockScope { prev, prev_used }
+    }
+
+    /// このスコープの間に時刻 DEFAULT（または式）が時刻を評価したか。
+    pub(crate) fn was_used(&self) -> bool {
+        CLOCK_USED.with(|u| u.get())
+    }
+}
+
+/// 束縛時に確定した台帳 v3 の評価時刻を書き込み区間へ引き継ぐ RAII ガード（NoSQL insert・
+/// COPY。束縛スコープは書き込み前に破棄されるため）。drop で直前の値へ戻す。
+pub(crate) struct LedgerClockScope {
+    prev: Option<Option<i64>>,
+}
+
+impl LedgerClockScope {
+    pub(crate) fn enter(evaluated_at: Option<i64>) -> Self {
+        let prev = LEDGER_OVERRIDE.with(|o| o.replace(Some(evaluated_at)));
+        LedgerClockScope { prev }
+    }
+}
+
+impl Drop for LedgerClockScope {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        LEDGER_OVERRIDE.with(|o| o.set(prev));
     }
 }
 
@@ -247,6 +286,9 @@ pub(crate) fn micros_to_time_of_day(micros: i64) -> i64 {
 /// 現スレッドの [`ClockScope`]／[`DefaultClockScope`] の間に時刻関数が評価されていれば
 /// `Some`。`recovery::ledger::record_in_txn_accepting` が参照する（Issue #2188・SQL-37）。
 pub(crate) fn ledger_evaluated_at() -> Option<i64> {
+    if let Some(overridden) = LEDGER_OVERRIDE.with(|o| o.get()) {
+        return overridden;
+    }
     if !CLOCK_USED.with(|u| u.get()) {
         return None;
     }

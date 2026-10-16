@@ -7488,7 +7488,9 @@ impl EngineCore {
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         // SQL-37・Issue #1587: 束縛クロージャ（NoSQL insert の `bind_insert`）が列 `DEFAULT now()`
         // 系を評価する時刻（autocommit 相当の文の開始時刻）。束縛区間だけ保持する。
-        let bounds = {
+        // 束縛スコープは実書き込み前に破棄されるため、時刻 DEFAULT を評価していれば台帳 v3 の
+        // 評価時刻をここで取り出し、書き込み区間へ引き継ぐ（Issue #2188）。
+        let (bounds, bound_evaluated_at) = {
             let now = crate::sql::time_fn::now_micros()?;
             let _default_clock_scope = crate::sql::time_fn::DefaultClockScope::enter(
                 crate::sql::time_fn::StatementClock {
@@ -7496,8 +7498,13 @@ impl EngineCore {
                     stmt_start_micros: now,
                 },
             );
-            bind(&schema)?
+            let bounds = bind(&schema)?;
+            (bounds, crate::sql::time_fn::ledger_evaluated_at())
         };
+        // COPY など呼び出し元が既に上書きを設定している場合は、束縛が評価していないときに
+        // それを潰さない。
+        let _ledger_clock_scope =
+            bound_evaluated_at.map(|at| crate::sql::time_fn::LedgerClockScope::enter(Some(at)));
         if bounds.len() != row_count
             || bounds
                 .iter()
@@ -7758,7 +7765,11 @@ impl EngineCore {
             operation_id,
             bounds,
             schema: bound_schema,
+            evaluated_at,
         } = batch;
+        // COPY の束縛は wire メッセージをまたいで完了済みのため、台帳 v3 の評価時刻を
+        // 書き込み区間へ明示的に渡す（Issue #2188。None は v2 の権威値）。
+        let _ledger_clock_scope = crate::sql::time_fn::LedgerClockScope::enter(evaluated_at);
         self.execute_bound_insert_with_target(
             target,
             ctx,
