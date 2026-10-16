@@ -49,6 +49,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ColumnDef::new("uid", ColumnType::Uuid, true),
                 ColumnDef::new("day", ColumnType::Date, true),
                 ColumnDef::new("tm", ColumnType::Time, true),
+                ColumnDef::new("tz", ColumnType::TimestampTz, true),
                 ColumnDef::new(
                     "price",
                     ColumnType::Numeric {
@@ -655,6 +656,87 @@ fn time_slot_binary_params() {
     let after = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
     assert_eq!(before, after, "no side effect");
     // テナント境界: bob から alice の TIME 行は見えない。
+    let mut b = connect(spawn(core), "bob");
+    let o = query(&mut b, sel, &[], &[], &[]);
+    assert_eq!(o.expect("bob rows").0.len(), 0);
+}
+
+/// TIMESTAMPTZ スロットのバイナリ param（TABLE-33・WIRE-14・Issue #1577）。バイナリ ≡ 同じ瞬間の
+/// テキスト、長さ不正 `08P01`、範囲外・infinity 番兵 `22008`（副作用なし・値を含まない）、
+/// 宣言 OID 不一致 `0A000`、テナント境界。
+#[test]
+fn timestamptz_slot_binary_params() {
+    let (core, _g) = new_core();
+    let mut s = connect(spawn(core.clone()), "alice");
+    let sel = "SELECT id FROM t WHERE tz IS NOT NULL LIMIT 20";
+    // (PG epoch 起点 µs, 同じ瞬間の明示 offset 付きテキスト)
+    let cases: [(i64, &str); 4] = [
+        (0, "2000-01-01 00:00:00+00"),
+        (-946_684_800_000_000, "1970-01-01 00:00:00+00"),
+        (-1, "1999-12-31 23:59:59.999999+00"),
+        (123_456_789, "2000-01-01 09:02:03.456789+09"),
+    ];
+    for (i, (pg, text)) in cases.iter().enumerate() {
+        for (j, declared) in [&[][..], &[1184]].into_iter().enumerate() {
+            let id_bin = 100 + (i * 10 + j * 2) as i32;
+            let id_txt = id_bin + 1;
+            let ins = |id: i32| {
+                format!(
+                    "INSERT INTO t (id, embedding, tz) VALUES ({id}, '[0,1]', $1) USING OPERATION_ID 'tz-{id}'"
+                )
+            };
+            let o = query(
+                &mut s,
+                &ins(id_bin),
+                declared,
+                &[1],
+                &[Some(&pg.to_be_bytes())],
+            );
+            assert!(o.is_ok(), "binary insert {pg}: {o:?}");
+            let o = query(
+                &mut s,
+                &ins(id_txt),
+                declared,
+                &[0],
+                &[Some(text.as_bytes())],
+            );
+            assert!(o.is_ok(), "text insert {text}: {o:?}");
+            let mut by = |id: i32| {
+                query(
+                    &mut s,
+                    &format!("SELECT tz FROM t WHERE id = {id} LIMIT 1"),
+                    &[],
+                    &[],
+                    &[],
+                )
+            };
+            assert_eq!(by(id_bin), by(id_txt), "pg micros {pg}");
+        }
+    }
+    let before = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
+    let ins =
+        "INSERT INTO t (id, embedding, tz) VALUES (900, '[0,1]', $1) USING OPERATION_ID 'tz-bad'";
+    for bad in [&[0u8; 7][..], &[0u8; 9][..]] {
+        let o = query(&mut s, ins, &[1184], &[1], &[Some(bad)]);
+        expect_err(o, "08P01", &mut s);
+    }
+    // 範囲外（上限超過・下限未満・加算オーバーフロー・infinity 番兵）は 22008。
+    for bad in [
+        253_402_300_800_000_000i64 - 946_684_800_000_000,
+        -62_135_596_800_000_000i64 - 946_684_800_000_000 - 1,
+        i64::MIN,
+        i64::MAX,
+    ] {
+        let o = query(&mut s, ins, &[1184], &[1], &[Some(&bad.to_be_bytes())]);
+        expect_err(o, "22008", &mut s);
+    }
+    // 宣言 OID 不一致のバイナリは 0A000。
+    for declared in [20, 1114, 25] {
+        let o = query(&mut s, ins, &[declared], &[1], &[Some(&0i64.to_be_bytes())]);
+        expect_err(o, "0A000", &mut s);
+    }
+    let after = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
+    assert_eq!(before, after, "no side effect");
     let mut b = connect(spawn(core), "bob");
     let o = query(&mut b, sel, &[], &[], &[]);
     assert_eq!(o.expect("bob rows").0.len(), 0);

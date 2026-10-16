@@ -41,6 +41,9 @@
 //! - `ColumnMeta::Scalar{ty: Timestamp}` → `timestamp`（OID 1114, typlen 8。同上）
 //! - `ColumnMeta::Scalar{ty: Time}` → `time`（OID 1083, typlen 8。TABLE-32・WIRE-13・
 //!   WIRE-14・Issue #1571。バイナリは 0 時起点マイクロ秒の 8 バイト BE 整数）
+//! - `ColumnMeta::Scalar{ty: TimestampTz}` → `timestamptz`（OID 1184, typlen 8。TABLE-33・
+//!   WIRE-13・WIRE-14・Issue #1577。バイナリは 2000-01-01 00:00:00 UTC 起点マイクロ秒の
+//!   8 バイト BE 整数。テキストは UTC 固定の offset 付き ISO 表記）
 //! - `ColumnMeta::Scalar{ty: Bytea}` → `bytea`（OID 17, typlen -1。同上）
 //! - `ColumnMeta::Scalar{ty: Uuid}` → `uuid`（OID 2950, typlen 16。同上）
 //! - `ColumnMeta::Scalar{ty: Json}` → `json`（OID 114, typlen -1。同上）
@@ -232,6 +235,21 @@ pub mod binary {
     /// PostgreSQL の `time_send` と同形。TABLE-32・WIRE-14・Issue #1571）。
     pub fn time(v: i64) -> [u8; 8] {
         v.to_be_bytes()
+    }
+
+    /// 2000-01-01 00:00:00 UTC（PostgreSQL epoch）の Unix epoch 起点マイクロ秒。
+    /// `timestamptz` のバイナリ入出力（`binary_param` の復号側も共有する）の基準値。
+    pub const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
+
+    /// `timestamptz` のバイナリ表現（2000-01-01 00:00:00 UTC 起点マイクロ秒の 8 バイト・
+    /// ビッグエンディアン。PostgreSQL の `timestamptz_send` と同形。TABLE-33・WIRE-14・
+    /// Issue #1577）。引数は engine 内部の Unix epoch 起点 µs。減算がオーバーフローする
+    /// 場合は `EncodeError`（呼び出し側で範囲検査済みなら起きない防御）。
+    pub fn timestamptz(unix_micros: i64) -> Result<[u8; 8], super::EncodeError> {
+        unix_micros
+            .checked_sub(PG_EPOCH_UNIX_MICROS)
+            .map(i64::to_be_bytes)
+            .ok_or(super::EncodeError)
     }
 
     /// `int4` のバイナリ表現（4 バイト・ビッグエンディアン 2 の補数）。
@@ -496,6 +514,10 @@ wire_type_enum! {
         /// `ColumnMeta::Scalar{ty: Time}`（TABLE-32・WIRE-13・WIRE-14・Issue #1571）。
         /// テキスト表現は `HH:MM:SS[.ffffff]`、バイナリは 0 時起点マイクロ秒の 8 バイト BE。
         Time,
+        /// `ColumnMeta::Scalar{ty: TimestampTz}`（TABLE-33・WIRE-13・WIRE-14・Issue #1577）。
+        /// テキスト表現は offset 付き ISO 表記、バイナリは 2000-01-01 00:00:00 UTC 起点
+        /// マイクロ秒の 8 バイト BE。
+        TimestampTz,
         /// `ColumnMeta::Scalar{ty: Bytea}`（TABLE-13・TASK-197・Issue #886・
         /// WIRE-13・TASK-200・Issue #895）。テキスト表現は `\x` + 小文字 16 進
         /// （`engine::bytea::format_hex_text`。PostgreSQL 既定の `bytea_output=hex`
@@ -533,6 +555,7 @@ impl WireType {
             WireType::Date => 1082,
             WireType::Timestamp => 1114,
             WireType::Time => 1083,
+            WireType::TimestampTz => 1184,
             WireType::Bytea => 17,
             WireType::Uuid => 2950,
             WireType::Json => 114,
@@ -552,7 +575,11 @@ impl WireType {
             | WireType::Jsonb => -1,
             WireType::Int2 => 2,
             WireType::Int4 | WireType::Float4 | WireType::Date => 4,
-            WireType::Int8 | WireType::Float8 | WireType::Timestamp | WireType::Time => 8,
+            WireType::Int8
+            | WireType::Float8
+            | WireType::Timestamp
+            | WireType::Time
+            | WireType::TimestampTz => 8,
             WireType::Bool => 1,
             WireType::Uuid => 16,
         }
@@ -575,6 +602,7 @@ impl WireType {
             WireType::Date => "date",
             WireType::Timestamp => "timestamp",
             WireType::Time => "time",
+            WireType::TimestampTz => "timestamptz",
             WireType::Bytea => "bytea",
             WireType::Uuid => "uuid",
             WireType::Json => "json",
@@ -620,7 +648,9 @@ impl WireType {
             | WireType::Bytea
             | WireType::Uuid
             // `time` は 0 時起点 µs の 8 バイト BE（Issue #1571）。
-            | WireType::Time => true,
+            | WireType::Time
+            // `timestamptz` は 2000-01-01 UTC 起点 µs の 8 バイト BE（Issue #1577）。
+            | WireType::TimestampTz => true,
             // `DATE`／`TIMESTAMP`／`JSON`／`JSONB` は WIRE-14 の非対応型のまま
             // fail-closed で `0A000` に拒否する。
             WireType::Date | WireType::Timestamp | WireType::Json | WireType::Jsonb => false,
@@ -667,6 +697,7 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Bytea
         | ColumnType::Uuid
         | ColumnType::Time
+        | ColumnType::TimestampTz
         | ColumnType::Numeric { .. } => scalar_wire_type(ty).supports_binary(),
         // `VECTOR` は公告 OID が `text` でも値の実体がベクトルのため、独自の
         // バイナリ表現は定義せず `0A000` で拒否する（WIRE-14 決定）。
@@ -679,9 +710,7 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Date
-        | ColumnType::Timestamp
-        // TIMESTAMPTZ は OID 1184 の公告・バイナリ入出力と同時に対応する（#1577）。
-        | ColumnType::TimestampTz => false,
+        | ColumnType::Timestamp => false,
     }
 }
 
@@ -783,9 +812,8 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         engine::catalog::ColumnType::Timestamp => WireType::Timestamp,
         // TIME は time（OID 1083・typlen 8。TABLE-32・Issue #1571）。
         engine::catalog::ColumnType::Time => WireType::Time,
-        // TIMESTAMPTZ は専用 OID（1184）の公告が #1577 の担当のため、暫定で text（OID 25）を
-        // 公告し値は `datetime::format_timestamptz` の ISO 文字列で出す（Issue #1574）。
-        engine::catalog::ColumnType::TimestampTz => WireType::Text,
+        // TIMESTAMPTZ は timestamptz（OID 1184・typlen 8。TABLE-33・Issue #1577）。
+        engine::catalog::ColumnType::TimestampTz => WireType::TimestampTz,
         engine::catalog::ColumnType::Bytea => WireType::Bytea,
         engine::catalog::ColumnType::Uuid => WireType::Uuid,
         engine::catalog::ColumnType::Json => WireType::Json,
@@ -934,8 +962,8 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         Cell::Timestamp(micros) => Ok(Some(engine::datetime::format_timestamp(*micros))),
         // TIME は `HH:MM:SS[.ffffff]` に整形する（Issue #1569。OID は暫定で text）。
         Cell::Time(micros) => Ok(Some(engine::datetime::format_time(*micros))),
-        // セッション TimeZone での表示は #1575 の担当。それまでは UTC 固定で整形する
-        // （Issue #1574。`+00` 付きの ISO 形式）。
+        // OID 1184 で公告する（Issue #1577）。セッション TimeZone での表示は #1575 の担当で、
+        // それまでは UTC 固定で整形する（Issue #1574。`+00` 付きの ISO 形式）。
         Cell::TimestampTz(micros) => Ok(Some(engine::datetime::format_timestamptz(
             *micros,
             &engine::datetime::SessionTimeZone::utc(),
@@ -1221,6 +1249,14 @@ fn encode_binary_cell(
         (WireType::Numeric, Cell::Integer(v)) => {
             let (buf, n) = binary::numeric(false, u128::from(*v), 0)?;
             push_len_prefixed(out, buf.get(..n).ok_or(EncodeError)?)
+        }
+        // 範囲外は engine の範囲強制の内部不整合。丸めず fail-closed（`XX000`）にする
+        // （TABLE-33・Issue #1577）。
+        (WireType::TimestampTz, Cell::TimestampTz(m)) => {
+            if !engine::datetime::validate_timestamptz_micros(*m) {
+                return Err(EncodeError);
+            }
+            push_fixed(out, wire_type, &binary::timestamptz(*m)?)
         }
         // 型と Cell の不一致、および非対応型（事前検査
         // `validate_binary_formats` で拒否済みの多層防御）は fail-closed。
@@ -1552,6 +1588,7 @@ mod tests {
             (Some(ColumnType::Date), 1082, 4),
             (Some(ColumnType::Timestamp), 1114, 8),
             (Some(ColumnType::Time), 1083, 8),
+            (Some(ColumnType::TimestampTz), 1184, 8),
             (
                 Some(ColumnType::Numeric {
                     precision: 38,
@@ -2476,7 +2513,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 17);
+        assert_eq!(WireType::ALL.len(), 18);
     }
 
     /// `PostgreSQL` 組み込みカタログの公開値（`pg_type.oid`／`typlen`／
@@ -2485,7 +2522,7 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 17] = [
+        let expected: [(WireType, i32, i16, &str); 18] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
@@ -2499,6 +2536,7 @@ mod tests {
             (WireType::Date, 1082, 4, "date"),
             (WireType::Timestamp, 1114, 8, "timestamp"),
             (WireType::Time, 1083, 8, "time"),
+            (WireType::TimestampTz, 1184, 8, "timestamptz"),
             (WireType::Bytea, 17, -1, "bytea"),
             (WireType::Uuid, 2950, 16, "uuid"),
             (WireType::Json, 114, -1, "json"),
@@ -3134,6 +3172,7 @@ mod tests {
                     | WireType::Bytea
                     | WireType::Uuid
                     | WireType::Time
+                    | WireType::TimestampTz
                     | WireType::Numeric
             );
             assert_eq!(t.supports_binary(), expected, "{t:?}");
@@ -3213,23 +3252,23 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// Issue #1574: TIMESTAMPTZ は text（OID 25）で公告し、値は UTC の ISO 形式で出す。
-    /// バイナリ形式は未対応のため fail-closed で拒否する。
+    /// Issue #1577: TIMESTAMPTZ は timestamptz（OID 1184・typlen 8）を公告し、text は UTC の
+    /// ISO 形式、バイナリは 2000-01-01 UTC 起点 µs の 8 バイト BE で出す。範囲外は fail-closed。
     #[test]
-    fn timestamptz_column_is_advertised_as_text_with_utc_iso_and_no_binary() {
+    fn timestamptz_column_is_advertised_as_timestamptz_with_text_and_binary() {
         use engine::catalog::ColumnType;
         let meta = ColumnMeta::Scalar {
             name: "t".to_string(),
             ty: ColumnType::TimestampTz,
         };
-        // OID 1184 の公告・バイナリ入出力は #1577。それまでは text（OID 25）で公告する。
-        assert_eq!(column_wire_type(&meta), WireType::Text);
-        assert_eq!(column_wire_type(&meta).oid(), 25);
-        assert!(!column_binary_support(&meta));
+        assert_eq!(column_wire_type(&meta), WireType::TimestampTz);
+        assert_eq!(column_wire_type(&meta).oid(), 1184);
+        assert!(column_binary_support(&meta));
         let columns = vec![meta.clone()];
-        assert!(validate_binary_formats(&columns, &[FormatCode::Binary]).is_err());
+        validate_binary_formats(&columns, &[FormatCode::Binary]).expect("binary ok");
         for (micros, want) in [
             (0, "1970-01-01 00:00:00+00"),
+            (binary::PG_EPOCH_UNIX_MICROS, "2000-01-01 00:00:00+00"),
             (1_767_236_400_000_000, "2026-01-01 03:00:00+00"),
             (
                 engine::datetime::TIMESTAMPTZ_MAX_MICROS,
@@ -3240,6 +3279,41 @@ mod tests {
                 cell_to_text_for_column(&meta, &Cell::TimestampTz(micros)).expect("text"),
                 Some(want.to_string())
             );
+            let mut out = Vec::new();
+            encode_binary_cell(
+                Some(WireType::TimestampTz),
+                &Cell::TimestampTz(micros),
+                &mut out,
+            )
+            .unwrap();
+            let mut want_bytes = 8i32.to_be_bytes().to_vec();
+            want_bytes.extend_from_slice(&(micros - 946_684_800_000_000).to_be_bytes());
+            assert_eq!(out, want_bytes, "{micros}");
+        }
+        // 下限もバイナリで PG epoch 換算の値になる（text は整形のみ確認）。
+        let mut out = Vec::new();
+        let min = engine::datetime::TIMESTAMPTZ_MIN_MICROS;
+        encode_binary_cell(
+            Some(WireType::TimestampTz),
+            &Cell::TimestampTz(min),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out[4..], (min - 946_684_800_000_000).to_be_bytes());
+        for bad in [
+            engine::datetime::TIMESTAMPTZ_MIN_MICROS - 1,
+            engine::datetime::TIMESTAMPTZ_MAX_MICROS + 1,
+            i64::MIN,
+            i64::MAX,
+        ] {
+            let mut out = vec![9u8];
+            assert!(encode_binary_cell(
+                Some(WireType::TimestampTz),
+                &Cell::TimestampTz(bad),
+                &mut out
+            )
+            .is_err());
+            assert_eq!(out, vec![9u8], "失敗時は何も書かない");
         }
     }
 
