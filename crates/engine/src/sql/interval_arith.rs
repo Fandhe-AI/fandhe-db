@@ -13,8 +13,9 @@
 //! 閉形式で計算し、巨大な値でもループしない。エラー文言は固定の英語で値を含めない。
 
 use crate::datetime::{
-    civil_from_days, days_from_civil, validate_interval, validate_timestamp_micros,
-    validate_timestamptz_micros, Interval, SessionTimeZone, MICROS_PER_DAY,
+    checked_add_interval, checked_sub_interval, civil_from_days, days_from_civil, interval_scale,
+    validate_interval, validate_timestamp_micros, validate_timestamptz_micros, Interval,
+    SessionTimeZone, MICROS_PER_DAY,
 };
 use crate::sql::allowlist::SqlSurfaceError;
 
@@ -168,7 +169,7 @@ pub(crate) fn timestamptz_add_interval(
     // PG の `timestamptz_pl_interval` と同じく、月と日はそれぞれ別の「壁時計 -> UTC」往復で
     // 加算する（月の結果が DST の gap に入ると UTC への変換で正規化され、日の加算は
     // 正規化後の時点の offset から始まる）。
-    let mut cur = utc;
+    let mut cur = i128::from(utc);
     for step in [
         Interval {
             months: iv.months,
@@ -184,16 +185,16 @@ pub(crate) fn timestamptz_add_interval(
         if step.months == 0 && step.days == 0 {
             continue;
         }
-        let off = i128::from(tz.offset_seconds_at(cur)) * 1_000_000;
-        let local = i128::from(cur) + off;
-        let shifted = shift_local(local, &step)?;
-        let local64 = i64::try_from(shifted).map_err(|_| timestamp_out_of_range())?;
+        // 中間値は i128 のまま保持し、i64 への縮小は最終結果でのみ行う（中間許容契約）。
+        let off = i128::from(tz.offset_seconds_at_wide(cur)) * 1_000_000;
+        let shifted = shift_local(cur + off, &step)?;
         cur = tz
-            .local_to_utc_micros(local64)
+            .local_to_utc_micros_wide(shifted)
             .ok_or_else(timestamp_out_of_range)?;
     }
     let out = cur
-        .checked_add(iv.micros)
+        .checked_add(i128::from(iv.micros))
+        .and_then(|v| i64::try_from(v).ok())
         .ok_or_else(timestamp_out_of_range)?;
     if validate_timestamptz_micros(out) {
         Ok(out)
@@ -223,90 +224,15 @@ pub(crate) fn timestamp_diff(a: i64, b: i64) -> Result<Interval, SqlSurfaceError
     })
 }
 
-/// `INTERVAL + INTERVAL`。
+/// `INTERVAL + INTERVAL`。値の計算は集計と共通の [`checked_add_interval`] で、
+/// ここでは SQLSTATE（`22008`）への写像だけを行う。
 pub(crate) fn interval_add(a: &Interval, b: &Interval) -> Result<Interval, SqlSurfaceError> {
-    check_finite(Interval {
-        months: a
-            .months
-            .checked_add(b.months)
-            .ok_or_else(interval_out_of_range)?,
-        days: a
-            .days
-            .checked_add(b.days)
-            .ok_or_else(interval_out_of_range)?,
-        micros: a
-            .micros
-            .checked_add(b.micros)
-            .ok_or_else(interval_out_of_range)?,
-    })
+    checked_add_interval(a, b).map_err(|_| interval_out_of_range())
 }
 
 /// `INTERVAL − INTERVAL`。
 pub(crate) fn interval_sub(a: &Interval, b: &Interval) -> Result<Interval, SqlSurfaceError> {
-    check_finite(Interval {
-        months: a
-            .months
-            .checked_sub(b.months)
-            .ok_or_else(interval_out_of_range)?,
-        days: a
-            .days
-            .checked_sub(b.days)
-            .ok_or_else(interval_out_of_range)?,
-        micros: a
-            .micros
-            .checked_sub(b.micros)
-            .ok_or_else(interval_out_of_range)?,
-    })
-}
-
-/// PG の `TSROUND`（マイクロ秒単位の偶数丸め）。
-fn tsround(v: f64) -> f64 {
-    (v * 1_000_000.0).round_ties_even() / 1_000_000.0
-}
-
-fn fits_i32(v: f64) -> bool {
-    (-2_147_483_648.0..2_147_483_648.0).contains(&v)
-}
-
-fn fits_i64(v: f64) -> bool {
-    (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&v)
-}
-
-/// 乗除の共通カスケード（PG の `interval_mul`／`interval_div`）。`scale` は各要素へ
-/// 適用する写像（乗算は `x * factor`、除算は `x / factor`）。
-fn interval_scale(iv: &Interval, scale: impl Fn(f64) -> f64) -> Result<Interval, SqlSurfaceError> {
-    let month_f = scale(f64::from(iv.months));
-    if !fits_i32(month_f) {
-        return Err(interval_out_of_range());
-    }
-    let months = month_f as i32;
-    let day_f = scale(f64::from(iv.days));
-    if !fits_i32(day_f) {
-        return Err(interval_out_of_range());
-    }
-    let mut days = day_f as i32;
-    // 整数部は上で処理済み。小数部を月 → 日 → 秒へカスケードする（上へは繰り上げない）。
-    let month_rem_days = tsround((month_f - f64::from(months)) * 30.0);
-    let mut sec_rem = tsround(
-        (day_f - f64::from(days) + month_rem_days - f64::from(month_rem_days as i32)) * 86_400.0,
-    );
-    if sec_rem.abs() >= 86_400.0 {
-        let whole = (sec_rem / 86_400.0) as i32;
-        days = days.checked_add(whole).ok_or_else(interval_out_of_range)?;
-        sec_rem -= f64::from(whole) * 86_400.0;
-    }
-    days = days
-        .checked_add(month_rem_days as i32)
-        .ok_or_else(interval_out_of_range)?;
-    let micros_f = (scale(iv.micros as f64) + sec_rem * 1_000_000.0).round_ties_even();
-    if !fits_i64(micros_f) {
-        return Err(interval_out_of_range());
-    }
-    check_finite(Interval {
-        months,
-        days,
-        micros: micros_f as i64,
-    })
+    checked_sub_interval(a, b).map_err(|_| interval_out_of_range())
 }
 
 /// `INTERVAL * 数値`（PG17 の `interval_mul`）。NaN・±∞ は `22008`。
@@ -317,7 +243,7 @@ pub(crate) fn interval_mul_f64(iv: &Interval, factor: f64) -> Result<Interval, S
     if factor.is_infinite() {
         return Err(infinite_interval_unsupported());
     }
-    interval_scale(iv, |x| x * factor)
+    interval_scale(iv, |x| x * factor).map_err(|_| interval_out_of_range())
 }
 
 /// `INTERVAL / 数値`（PG17 の `interval_div`）。0 は `22012`、NaN・±∞ は `22008`。
@@ -334,7 +260,7 @@ pub(crate) fn interval_div_checked(
     if factor.is_infinite() {
         return Err(infinite_interval_unsupported());
     }
-    interval_scale(iv, |x| x / factor)
+    interval_scale(iv, |x| x / factor).map_err(|_| interval_out_of_range())
 }
 
 #[cfg(test)]
@@ -498,5 +424,17 @@ mod tests {
         assert!(s.contains(" 02:30:00-0"), "{s}");
         // 日内の壁時計がずれていなければ、元の時点から日・月の整数倍だけ離れた位置にある。
         assert_eq!((fwd - t).rem_euclid(3_600_000_000), 0);
+    }
+
+    /// 月加算後の壁時計が i64 の Unix 起点マイクロ秒を超えても、最終値が有効なら成功する
+    /// （Issue #1581 レビュー指摘）。
+    #[test]
+    fn timestamptz_intermediate_beyond_i64_micros() {
+        for name in ["UTC", "America/New_York"] {
+            let tz = SessionTimeZone::parse_setting(name).unwrap();
+            let t = crate::datetime::parse_timestamptz("2000-01-01 00:00:00+00", &tz).unwrap();
+            let r = timestamptz_add_interval(t, &iv("3507000 mons -106742121 days"), &tz);
+            assert!(r.is_ok(), "{name}: {:?}", r.err().map(code));
+        }
     }
 }
