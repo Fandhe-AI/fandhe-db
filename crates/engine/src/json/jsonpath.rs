@@ -1,10 +1,12 @@
 //! SQL/JSON path（`jsonpath`）の字句・構文解析器（Issue #2183・TABLE-25 ポインタ）。
 //!
-//! 責務境界: untrusted な jsonpath 文字列を [`SqlJsonPath`]（AST）へ解析するところまで。
-//! 評価（Issue #2184）・`jsonpath` 型の入出力・`jsonb_path_*` 関数（#2185）・`@?`／`@@`
-//! （#2186）・`JSON_EXISTS` 等（#2187）は呼び出し側の後続 Issue が担い、本モジュールは
-//! それらから呼ばれる前提の入口 [`parse_jsonpath`] だけを公開する。`super` の
-//! `JsonPath`／`JsonPathStep`（`#>` 用の Rust 内部 API）とは無関係。
+//! 責務境界: untrusted な jsonpath 文字列を [`SqlJsonPath`]（AST）へ解析するところ
+//! （[`parse_jsonpath`]）と、解析済みの AST を jsonb 値へ適用する評価器（Issue #2184。
+//! [`jsonpath_query`]・[`jsonpath_exists`]・[`jsonpath_match`]。意味論と上限は `eval.rs`）
+//! まで。`jsonpath` 型の入出力・`jsonb_path_*` 関数（#2185）・`@?`／`@@`（#2186）・
+//! `JSON_EXISTS` 等（#2187）は呼び出し側の後続 Issue が担い、本モジュールはそれらから
+//! 呼ばれる前提の入口だけを公開する。`super` の `JsonPath`／`JsonPathStep`（`#>` 用の
+//! Rust 内部 API）とは無関係。
 //!
 //! 受理文法は PostgreSQL 17 の `jsonpath` に合わせる。意図的な差分は 3 点。
 //! (1) 長さ・入れ子深さ・数値リテラル長・式の高さに上限を設ける（PostgreSQL には無い。
@@ -14,12 +16,19 @@
 //! エラーは固定の英語文のみを返し、入力の断片を含めない。
 
 pub mod ast;
+mod eval;
 mod lexer;
+mod numeric;
 mod parser;
 
 pub use ast::{
     AccessorOp, AnyLevel, ArithOp, CompareOp, Method, PathMode, PathNode, PathNumeric, RegexFlags,
     SqlJsonPath, StartsWithOperand, Subscript, UnaryOp,
+};
+
+pub use eval::{
+    jsonpath_exists, jsonpath_match, jsonpath_query, JsonPathEvalError, JsonPathEvalOptions,
+    MAX_SEQUENCE_ITEMS,
 };
 
 use crate::error_format::{ClassifiedError, ErrorClass};

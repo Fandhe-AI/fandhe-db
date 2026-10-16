@@ -1077,6 +1077,79 @@ fn signed_decimal_add(a_neg: bool, a: &str, b_neg: bool, b: &str) -> (bool, Stri
     }
 }
 
+/// 2 つの [`JsonNumber`] を**値として厳密に**比較する（`f64` を経由しない。`1` と `1.0`
+/// は等しく、`1e400` 同士も桁文字列で比較する）。jsonpath 評価器（Issue #2184・TABLE-25
+/// ポインタ）の比較述語が使う唯一の経路で、[`canonical_equality_text`]・[`jsonb_sort_key`]
+/// と同じ正規化（[`normalize_json_number`]）を共有して判断の二重管理を避ける。
+/// 正規化できない数値（文法違反のテキスト。構文検証済みの入力では起こらない）は `None`
+/// （呼び出し元が unknown 扱いにして fail-closed にする）。
+pub(crate) fn cmp_json_numbers(a: &JsonNumber, b: &JsonNumber) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let (a_neg, a_man, a_exp_neg, a_exp) = normalize_json_number(a).ok()?;
+    let (b_neg, b_man, b_exp_neg, b_exp) = normalize_json_number(b).ok()?;
+    let a_zero = a_man == "0";
+    let b_zero = b_man == "0";
+    match (a_zero, b_zero) {
+        (true, true) => return Some(Ordering::Equal),
+        (true, false) => {
+            return Some(if b_neg {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            });
+        }
+        (false, true) => {
+            return Some(if a_neg {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            });
+        }
+        (false, false) => {}
+    }
+    if a_neg != b_neg {
+        return Some(if a_neg {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    // 同符号: 絶対値を比較し、負なら反転する。絶対値は「最上位桁の 10 進指数」
+    // （指数 + 仮数桁数 - 1）で大小が決まり、等しければ仮数を右ゼロ詰めして辞書式で比べる。
+    let a_top = signed_decimal_add(
+        a_exp_neg,
+        &a_exp,
+        false,
+        &a_man.len().saturating_sub(1).to_string(),
+    );
+    let b_top = signed_decimal_add(
+        b_exp_neg,
+        &b_exp,
+        false,
+        &b_man.len().saturating_sub(1).to_string(),
+    );
+    let mag = match (a_top.0, b_top.0) {
+        (false, true) => Ordering::Greater,
+        (true, false) => Ordering::Less,
+        (false, false) => digits_cmp(&a_top.1, &b_top.1),
+        (true, true) => digits_cmp(&b_top.1, &a_top.1),
+    };
+    let mag = if mag != Ordering::Equal {
+        mag
+    } else {
+        let width = a_man.len().max(b_man.len());
+        let pad = |m: &str| -> String {
+            let mut t = m.to_string();
+            while t.len() < width {
+                t.push('0');
+            }
+            t
+        };
+        pad(&a_man).cmp(&pad(&b_man))
+    };
+    Some(if a_neg { mag.reverse() } else { mag })
+}
+
 /// RFC 8259 準拠の最小エスケーパ（自作。wire-server の `error_body` エスケーパへは
 /// engine から依存できないため独立実装とする）。`"`・`\`・U+0000〜U+001F を
 /// エスケープし、それ以外（非 ASCII の生 UTF-8 を含む）はそのまま出力する。
