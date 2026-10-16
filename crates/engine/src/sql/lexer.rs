@@ -1486,7 +1486,7 @@ mod tests {
         assert_eq!(toks("a < b")[1], Punct('<'));
         // `?||` は `?|` の後に単独の `|`（未対応）で拒否される。
         assert!(tokenize("a ?|| b").is_err());
-        // 単独の `@`・`@@`・`@?`・`&` は拒否のまま（jsonpath は対象外）。
+        // 単独の `@`・`&` は拒否のまま（`@@`・`@?` は受理される）。
         assert!(tokenize("a @ b").is_err());
         assert_eq!(toks("a @? b"), vec![a(), JsonPathExists, b()]);
         assert_eq!(toks("a@@b"), vec![a(), JsonPathMatch, b()]);
