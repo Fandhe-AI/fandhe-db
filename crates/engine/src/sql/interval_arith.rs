@@ -484,4 +484,19 @@ mod tests {
             "22008"
         );
     }
+
+    /// 範囲外の未来年の中間値が 2007 年以前の歴史的 DST 規則を拾わない（将来規則を使う）。
+    /// 存在しない現地時刻 02:30（gap）を含む往復で元の時点へ戻る（Issue #1581 レビュー指摘）。
+    #[test]
+    fn timestamptz_far_future_intermediate_uses_future_rules() {
+        let tz = SessionTimeZone::parse_setting("America/New_York").unwrap();
+        let t = crate::datetime::parse_timestamptz("2000-04-01 02:30:00-05", &tz).unwrap();
+        let fwd = timestamptz_add_interval(t, &iv("120012 mons -3652790 days"), &tz).unwrap();
+        // 中間値 12001-04-01 02:30 は将来規則（3 月から EDT）では存在する壁時計のまま保たれ、
+        // 2001 年の歴史的規則（4 月第 1 日曜）の gap として 03:30 へずれない。
+        let s = crate::datetime::format_timestamptz(fwd, &tz);
+        assert!(s.contains(" 02:30:00-0"), "{s}");
+        // 日内の壁時計がずれていなければ、元の時点から日・月の整数倍だけ離れた位置にある。
+        assert_eq!((fwd - t).rem_euclid(3_600_000_000), 0);
+    }
 }

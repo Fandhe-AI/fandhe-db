@@ -77,6 +77,10 @@ impl std::fmt::Display for DateTimeLiteralError {
     }
 }
 
+/// jiff の範囲外の未来年を写す 400 年窓の起点年（2000 と 400 の倍数分ずれ、暦が一致する）。
+/// tzdb の将来規則（現行の DST 規則）が効く年代で、歴史的規則を拾わない（Issue #1581）。
+const FUTURE_MAP_BASE_YEAR: i64 = 9200;
+
 /// 先発グレゴリオ暦での閏年判定（西暦 4 年で割り切れ、100 年で割り切れない
 /// か、400 年で割り切れる）。
 fn is_leap_year(year: i64) -> bool {
@@ -707,7 +711,14 @@ impl SessionTimeZone {
         let ts = jiff::Timestamp::from_microsecond(utc_micros).unwrap_or_else(|_| {
             const CYCLE_MICROS: i128 = 146_097 * MICROS_PER_DAY as i128;
             let base = i128::from(days_from_civil(2000, 1, 1)) * MICROS_PER_DAY as i128;
-            let mapped = (i128::from(utc_micros) - base).rem_euclid(CYCLE_MICROS) + base;
+            // 未来側は tzdb の将来規則（現行の DST 規則）が効く窓へ、過去側は従来の窓へ写す。
+            let target_year = if utc_micros > 0 {
+                FUTURE_MAP_BASE_YEAR
+            } else {
+                2000
+            };
+            let target = i128::from(days_from_civil(target_year, 1, 1)) * MICROS_PER_DAY as i128;
+            let mapped = (i128::from(utc_micros) - base).rem_euclid(CYCLE_MICROS) + target;
             i64::try_from(mapped)
                 .ok()
                 .and_then(|m| jiff::Timestamp::from_microsecond(m).ok())
@@ -736,8 +747,12 @@ impl SessionTimeZone {
         // jiff の年範囲（±9999）外は、暦（曜日配置）が一致する 400 年周期の同位置年へ写して
         // offset だけを引く。日付の加減算で最終値が有効範囲へ戻る中間値を許容するため
         // （TIMESTAMP 側の中間値許容と同じ契約。Issue #1581）。
+        // 未来側（> 9999）は 2007 年以前の歴史的規則を拾わないよう、将来規則が効く窓
+        // （9200〜9599 年）へ写す。過去側（< -9999）は従来の 2000〜2399 年へ写す。
         let year = if (-9999..=9999).contains(&year) {
             year
+        } else if year > 9999 {
+            (year - 2000).rem_euclid(400) + FUTURE_MAP_BASE_YEAR
         } else {
             (year - 2000).rem_euclid(400) + 2000
         };
