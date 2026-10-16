@@ -410,6 +410,15 @@ const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
     ("CHARACTER", TypeNameKind::Character),
 ];
 
+/// `word` が型名解決表（[`TYPE_NAME_TABLE`]）の先頭語か（大小無視）。`<type> '<literal>'` の
+/// 先読み（`sql::allowlist::Parser::parse_primary_expr_inner`。Issue #1590）が、列名・関数名と
+/// 型名を取り違えないために使う。表は 1 つのままで、第 2 の型名表は作らない。
+pub(crate) fn is_type_name_head(word: &str) -> bool {
+    TYPE_NAME_TABLE
+        .iter()
+        .any(|(head, _)| word.eq_ignore_ascii_case(head))
+}
+
 /// 未確定型の `0A000`。メッセージは正規名のみで組み立て、綴り（別名）に依らず同一にする。
 fn unsettled_type_error(canonical: &str) -> SqlSurfaceError {
     SqlSurfaceError::FeatureNotSupported {

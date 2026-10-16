@@ -1470,8 +1470,28 @@ pub(crate) fn default_expr_alias(expr: &Expr) -> String {
         Expr::NullIf(..) => "nullif".to_string(),
         // 括弧なし値関数の既定列名は小文字のキーワード名（SQL-37・Issue #1586）。
         Expr::ValueFunction { kind, .. } => kind.as_sql().to_string(),
+        // `CAST`（SQL-47・Issue #1590）。PostgreSQL と同じく、被演算子が名前を持つ形
+        // （列・関数呼び出し等）ならその名前、持たなければ変換先の型の内部名（`int4` 等）。
+        Expr::Cast { expr, ty } => {
+            cast_operand_name(expr).unwrap_or_else(|| ty.catalog_name().to_string())
+        }
         // PostgreSQL の既定列名（Issue #1539・SQL-42。従来は `expr`）。
         _ => ANONYMOUS_COLUMN_NAME.to_string(),
+    }
+}
+
+/// `CAST` の被演算子が既定列名として持つ名前（PostgreSQL の `FigureColname` の強い名前に相当）。
+fn cast_operand_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Ident(name) => Some(name.clone()),
+        Expr::Call { .. }
+        | Expr::Coalesce(_)
+        | Expr::NullIf(..)
+        | Expr::SqlJsonQuery(_)
+        | Expr::ValueFunction { .. } => Some(default_expr_alias(expr)),
+        Expr::Cast { expr, .. } => cast_operand_name(expr),
+        Expr::Collate { expr, .. } => cast_operand_name(expr),
+        _ => None,
     }
 }
 
@@ -7475,7 +7495,7 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
         // （Issue #1586）は列参照を持たない。
         Expr::Null | Expr::ValueFunction { .. } => {}
         // 照合指定（TABLE-28・Issue #1609）は内側の式の列参照を集める。
-        Expr::Collate { expr, .. } => collect_expr_idents(expr, out),
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => collect_expr_idents(expr, out),
         Expr::SqlJsonQuery(q) => {
             for c in q.children() {
                 collect_expr_idents(c, out);
@@ -8149,6 +8169,10 @@ fn rewrite_group_row_idents(
             collation: *collation,
         },
         Expr::SqlJsonQuery(q) => Expr::SqlJsonQuery(Box::new(q.try_map_children(&mut |e| rec(e))?)),
+        Expr::Cast { expr, ty } => Expr::Cast {
+            expr: Box::new(rec(expr)?),
+            ty: ty.clone(),
+        },
     })
 }
 

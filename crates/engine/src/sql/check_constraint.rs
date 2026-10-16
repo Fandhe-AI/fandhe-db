@@ -177,6 +177,9 @@ fn render_expr(expr: &Expr) -> String {
         // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）。CHECK 本体は構文段が `0A000` で
         // 拒否するため通常は到達しないが、全 variant 網羅のため往復できる形で出す。
         Expr::SqlJsonQuery(q) => render_sql_json_query(q),
+        // `CAST`（SQL-47・Issue #1590）。構文段が CHECK 本体での使用を `0A000` で拒否するため通常は
+        // 到達しないが、全 variant 網羅と往復のため、変換先は `CastType::to_sql` の固定語彙で出す。
+        Expr::Cast { expr, ty } => format!("CAST({} AS {})", render_expr(expr), ty.to_sql()),
         // jsonb パス演算子（Issue #1596）。構文段が CHECK 本体での使用を `0A000` で拒否する
         // ため通常は到達しないが、`Expr` の全 variant を網羅するため、往復できる丸括弧付きで出す。
         Expr::JsonAccess { op, lhs, rhs } => format!(
@@ -589,7 +592,7 @@ fn referenced_column_names(
                 collect_idents(rhs, acc);
             }
             Expr::Null | Expr::ValueFunction { .. } => {}
-            Expr::Collate { expr, .. } => collect_idents(expr, acc),
+            Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => collect_idents(expr, acc),
             Expr::SqlJsonQuery(q) => {
                 collect_idents(&q.context, acc);
                 collect_idents(&q.path, acc);
