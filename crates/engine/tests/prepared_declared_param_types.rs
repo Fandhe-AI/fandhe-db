@@ -279,3 +279,40 @@ fn float4_declared_value_is_rounded_like_binary_form() {
         .expect("bind rounded");
     assert_eq!(bound, rounded);
 }
+
+/// 置換後総バイト数の上限検査は float4 の正規化後の値で行う。生の Bind 値のままなら
+/// 合計 2MB 超で `54000` になる構成でも、正規値（`0.0`）なら上限内で受理される。
+#[test]
+fn float4_size_limit_is_checked_on_canonical_text() {
+    let (core, _g) = setup("decl-f4-size");
+    let sql = "UPDATE docs SET d = $1 + $1 + $1 + $1 + $1 + $1 + $1 + $1 + $1 + $1 \
+               WHERE id = 1 USING OPERATION_ID 'op-1'";
+    let prepared = core
+        .parse_sql_prepared_with_declared(sql, &[Some(D::Float4)])
+        .expect("parse");
+    let long = format!("0.{}1", "0".repeat(200_000));
+    core.bind_prepared(&prepared, &[some(&long)])
+        .expect("canonical text is short");
+}
+
+/// float4 の正規テキストは小数点または指数を保ち、再解析で整数リテラルへ型が変わらない
+/// （`$1 / 2` が整数除算にならない）。`1.0`・`1e-40` を含む。
+#[test]
+fn float4_canonical_text_keeps_float_literal_type() {
+    let (core, _g) = setup("decl-f4-float-literal");
+    let sql = "UPDATE docs SET d = $1 + $2 WHERE id = 1 USING OPERATION_ID 'op-1'";
+    let prepared = core
+        .parse_sql_prepared_with_declared(sql, &[Some(D::Float4), Some(D::Float4)])
+        .expect("parse");
+    for (text, literal) in [("1.0", "1.0"), ("1", "1.0"), ("1e-40", "1e-40")] {
+        let bound = core
+            .bind_prepared(&prepared, &[some(text), some("0")])
+            .expect("bind");
+        let expected = core
+            .parse_sql(&format!(
+                "UPDATE docs SET d = {literal} + 0.0 WHERE id = 1 USING OPERATION_ID 'op-1'"
+            ))
+            .expect("literal parse");
+        assert_eq!(bound, expected, "{text}");
+    }
+}

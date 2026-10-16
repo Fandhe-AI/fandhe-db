@@ -4295,12 +4295,12 @@ impl EngineCore {
                 ),
             ));
         }
-        let mut decoded =
-            crate::sql::params::decode_bind_values_nullable(&prepared.tokens, values)?;
         // Issue #2436・WIRE-24: 宣言型がある値は、置換の前に宣言型として検証する。
-        // `decoded` は未参照番号が空文字列のままなので、検証には生の Bind 値を使う
-        // （NULL は検証対象外で SQL の NULL として置換される。非 UTF-8 は復号が拒否済み）。float4 は丸めた正規値で
-        // 置換値を差し替え、受信形式によらず同じ結果にする。
+        // NULL は検証対象外で SQL の NULL として置換される。非 UTF-8 は後段の復号が拒否する。
+        // float4 は丸めた正規値で Bind 値を差し替え、受信形式によらず同じ結果にする。
+        // 差し替えは復号（総バイト数上限 MAX_INPUT_LEN の検証）より前に行い、正規化で
+        // 長くなった値も参照回数込みで上限検査の対象にする。
+        let mut canonical_values: Vec<(usize, Vec<u8>)> = Vec::new();
         for (i, decl) in prepared.declared.iter().enumerate() {
             let (Some(ty), Some(Some(raw))) = (decl, values.get(i)) else {
                 continue;
@@ -4310,11 +4310,22 @@ impl EngineCore {
             };
             let n = u16::try_from(i.saturating_add(1)).unwrap_or(u16::MAX);
             if let Some(canonical) = crate::sql::params::validate_declared_value(n, *ty, text)? {
-                if let Some(slot) = decoded.get_mut(i) {
-                    *slot = Some(canonical);
-                }
+                canonical_values.push((i, canonical.into_bytes()));
             }
         }
+        let effective: std::borrow::Cow<'_, [Option<Vec<u8>>]> = if canonical_values.is_empty() {
+            std::borrow::Cow::Borrowed(values)
+        } else {
+            let mut v = values.to_vec();
+            for (i, bytes) in canonical_values {
+                if let Some(slot) = v.get_mut(i) {
+                    *slot = Some(bytes);
+                }
+            }
+            std::borrow::Cow::Owned(v)
+        };
+        let decoded =
+            crate::sql::params::decode_bind_values_nullable(&prepared.tokens, &effective)?;
         let kinds: Vec<crate::sql::params::ParamLiteralKind> = prepared
             .param_types
             .iter()

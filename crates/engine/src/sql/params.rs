@@ -958,7 +958,9 @@ pub(crate) fn validate_declared_value(
                     )));
                 };
                 let sign = if value.starts_with('-') { "-" } else { "" };
-                return Ok(Some(format!("{sign}{f}")));
+                // Debug 表記は整数値でも小数点（`1.0`）、極小・極大値は指数（`1e-40`）を
+                // 残すため、再解析で整数リテラルへ型が変わらず、長さも短く保たれる。
+                return Ok(Some(format!("{sign}{f:?}")));
             }
             Ok(None)
         }
