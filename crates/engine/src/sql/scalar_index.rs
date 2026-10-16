@@ -718,7 +718,11 @@ pub(crate) struct ScalarIndex {
 /// スロット（`u32`。同一列内で重複しない）が全順序の明示的タイブレークを
 /// 提供するため、この比較関数のもとで同値ペアは存在しない（決定的ソート）。
 fn cmp_value_then_slot(a: &(String, u32), b: &(String, u32)) -> std::cmp::Ordering {
-    a.0.as_bytes().cmp(b.0.as_bytes()).then(a.1.cmp(&b.1))
+    // 辞書を構築する列は実効照合がバイト列順のものだけ（構築側のゲート）。比較は照合の
+    // 比較器を経由させ、「キーの順序 = 比較器の順序」を構造的にそろえる（Issue #1610）。
+    crate::collation::Collation::DEFAULT
+        .compare(a.0.as_bytes(), b.0.as_bytes())
+        .then(a.1.cmp(&b.1))
 }
 
 /// [`ScalarIndex::resolve_candidates`] の結果（Issue #474: `sql::exec` が
@@ -1014,6 +1018,19 @@ impl ScalarIndex {
             // 構築コストを一切払わない）。`id` は本ループの対象外（`id_index`
             // として別途・宣言によらず常に構築する）。
             if !target.includes(&column.name) {
+                per_column.push(None);
+                per_column_typed.push(None);
+                continue;
+            }
+            // 辞書はバイト列昇順で並べるため、列の実効照合がバイト列順でない TEXT 系列は未索引に
+            // する（等価・前方一致・IN・単一 TEXT GROUP BY の各経路は「列が索引未対応」契約で
+            // 全走査へ縮退する）。照合込みの索引は #2191（TABLE-28・Issue #1610）。ENUM は
+            // 照合を持たない（宣言順）ため対象外。
+            if matches!(
+                column.ty,
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_)
+            ) && !crate::collation::Collation::effective(None, column.collation).is_byte_order()
+            {
                 per_column.push(None);
                 per_column_typed.push(None);
                 continue;

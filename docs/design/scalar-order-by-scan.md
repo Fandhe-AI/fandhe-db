@@ -65,7 +65,7 @@ SELECT <投影> FROM <table | view>
 
 | 型 | `OrderKind` | 比較規約 |
 | --- | --- | --- |
-| `TEXT` | `Bytes` | バイト列順（C collation。実装既定値。ICU 照合は [icu-collator-adoption.md](icu-collator-adoption.md)） |
+| `TEXT` | `Bytes` | バイト列順（C collation。実装既定値。キーの実効照合に従い、現在の許可リストはバイト列順のみ〔Issue #1610〕。ICU 照合は [icu-collator-adoption.md](icu-collator-adoption.md)） |
 | `INTEGER`／`BIGINT`／`DATE`／`TIMESTAMP` | `SignedInt` | 符号付き整数の内部表現をそのまま比較 |
 | `REAL`／`DOUBLE` | `Float` | NaN はすべての非 NaN より大きく NaN 同士は等しい。`-0.0 == 0.0`（IEEE754 の `PartialOrd` がそのまま満たす。`f64::total_cmp` は符号ビットまで区別するため使わない） |
 | `BOOLEAN` | `Bool` | `false < true` |

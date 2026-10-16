@@ -2191,6 +2191,33 @@ pub(crate) fn bind_projection_expr_json_ok(
     Ok((bound, ty, col))
 }
 
+/// 式内の TEXT 系列参照が持つ照合（列定義の `collation`）を引く。範囲外・スキーマなしは
+/// `None`（照合指定なし＝既定）として扱う。
+fn column_collation(
+    schema: Option<&TableSchema>,
+    index: usize,
+) -> Option<crate::collation::Collation> {
+    schema
+        .and_then(|s| s.columns.get(index))
+        .and_then(|c| c.collation)
+}
+
+/// 照合の比較が結線済みの経路でしか使えないことを保証するガード（TABLE-28・Issue #1610）。
+/// 式の比較・JOIN・ウィンドウ・集合演算などは照合を運ばず既定のバイト列順で比較するため、
+/// バイト列順でない照合が来たら黙って誤順序にせず `0A000` で拒否する（fail-closed）。
+/// 現在の許可リスト（`C`／`POSIX`）では常に通る。#2190 が導出を結線した経路から順に外す。
+/// 文言は固定の英語で、テーブル名・列名・値を含めない。
+pub(crate) fn require_wired_collation(
+    collation: Option<crate::collation::Collation>,
+) -> Result<(), SqlSurfaceError> {
+    match collation {
+        Some(c) if !c.is_byte_order() => Err(SqlSurfaceError::unsupported(
+            "this collation is not supported in this expression",
+        )),
+        Some(_) | None => Ok(()),
+    }
+}
+
 /// ORDER BY の式キーを束縛する（Issue #1597・TABLE-25）。[`bind_expr`] との違いは jsonb
 /// 結果（パス演算子・jsonb 列）を許す点（並べ替えは jsonb のソートキーで行う）。それ以外の
 /// 位置の拒否規則は [`bind_expr`] と同じ。
@@ -2618,15 +2645,15 @@ pub(super) fn bind_expr_any(
         // 照合指定（TABLE-28・Issue #1609）。照合名は構文段で許可リスト（`C`／`POSIX`）に
         // 解決済み。どちらも既定のバイト列順と同値なので、内側が文字列系（TEXT／VARCHAR／CHAR・
         // 文字列リテラル）であることを検査したうえで内側の `BoundExpr` をそのまま返す
-        // （照合を持たない型は `42804`）。`BoundExpr` への照合の保持は #1610・#2190 が担う。
+        // （照合を持たない型は `42804`）。Issue #1610 で順序付け・索引の地点は結線済みで、式の
+        // 比較への照合の導出と `BoundExpr` への保持は #2190 が担う。それまではバイト列順でない
+        // 照合を [`require_wired_collation`] が `0A000` で拒否する（fail-closed）。
         Expr::Collate {
             expr: inner,
             collation,
         } => {
             let (bound, ty) = bind_expr_any(inner, env, node_budget)?;
-            match collation {
-                crate::collation::Collation::C | crate::collation::Collation::Posix => {}
-            }
+            require_wired_collation(Some(*collation))?;
             if ty != ExprType::Text {
                 return Err(SqlSurfaceError::datatype_mismatch(
                     "collations are not supported by this expression type",
@@ -2737,7 +2764,10 @@ pub(super) fn bind_expr_any(
                     // 使えるようにする。値は行コンテキスト（`eval_with_scalars` の
                     // `row_scalars`）から解決し、nullable 列の実 NULL は
                     // `ExprValue::Null` として伝播する（AC1・AC2）。
-                    ColumnType::Text | ColumnType::Varchar(_) => Ok((BoundExpr::TextColumnRef { index }, ExprType::Text)),
+                    ColumnType::Text | ColumnType::Varchar(_) => {
+                        require_wired_collation(column_collation(env.schema, index))?;
+                        Ok((BoundExpr::TextColumnRef { index }, ExprType::Text))
+                    }
                     // Issue #1183・SQL-24・SQL-26・TABLE-13 ポインタ: 数値 4 型
                     // （INTEGER／BIGINT／REAL／DOUBLE）の列参照を `WHERE`／投影／
                     // `CHECK` で共通に解禁する（#1075 の CHECK 専用 opt-in を撤廃）。
@@ -2752,13 +2782,16 @@ pub(super) fn bind_expr_any(
                     | ColumnType::Double => Ok((BoundExpr::ColumnRef { index }, ExprType::Scalar)),
                     // `CHAR(n)` の式内参照は TEXT へ変換した値（末尾の半角空白を除く）として
                     // 扱う（PostgreSQL の bpchar→text 変換と同じ。TABLE-31・Issue #1566）。
-                    ColumnType::Bpchar(_) => Ok((
-                        BoundExpr::Builtin {
-                            f: BuiltinFn::BpcharToText,
-                            args: vec![BoundExpr::TextColumnRef { index }],
-                        },
-                        ExprType::Text,
-                    )),
+                    ColumnType::Bpchar(_) => {
+                        require_wired_collation(column_collation(env.schema, index))?;
+                        Ok((
+                            BoundExpr::Builtin {
+                                f: BuiltinFn::BpcharToText,
+                                args: vec![BoundExpr::TextColumnRef { index }],
+                            },
+                            ExprType::Text,
+                        ))
+                    }
                     ColumnType::Boolean => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BOOLEAN columns are not supported)"
                     ))),
@@ -6054,13 +6087,16 @@ pub(crate) fn eval_binary<'a>(
             // Issue #919・SQL-26: TEXT 同士の比較はバイト順（UTF-8 コードポイント
             // 順）で行う。束縛段（`bind_binary`）が TEXT/TEXT の組しか許可しない
             // ため、他の型混在はここでも `Internal`（束縛段の不変条件が崩れた
-            // 場合の保険）。
+            // 場合の保険）。順序比較は照合の比較器（既定照合。式への照合の導出は #2190、
+            // 結線までは [`require_wired_collation`] がバイト列順以外を拒否する）を経由し、
+            // 等値は deterministic な照合でバイト列の等値と一致するためそのまま比較する。
             (ExprValue::Text(a), ExprValue::Text(b)) => {
+                let ord = crate::collation::Collation::DEFAULT.compare(a.as_bytes(), b.as_bytes());
                 let result = match op {
-                    BinOp::Gt => a > b,
-                    BinOp::Lt => a < b,
-                    BinOp::Ge => a >= b,
-                    BinOp::Le => a <= b,
+                    BinOp::Gt => ord.is_gt(),
+                    BinOp::Lt => ord.is_lt(),
+                    BinOp::Ge => ord.is_ge(),
+                    BinOp::Le => ord.is_le(),
                     BinOp::Eq => a == b,
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
                         return Err(SqlSurfaceError::Internal {

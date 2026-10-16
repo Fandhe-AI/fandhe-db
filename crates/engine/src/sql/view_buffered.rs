@@ -804,7 +804,7 @@ fn sort_rows_by_keys(
                         let (_, program) =
                             scan.bound.order_exprs.get(i).ok_or_else(internal_error)?;
                         let value = program.eval(0, &[], scanned, &mut scratch)?;
-                        out.push(expr_value_to_order_value(&value, key.kind)?);
+                        out.push(expr_value_to_order_value(&value, key.kind, key.collation)?);
                     }
                     BoundOrderTarget::Column(_) => {
                         out.push(

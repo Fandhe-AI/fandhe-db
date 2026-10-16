@@ -130,6 +130,19 @@ pub(crate) enum ScalarKeyRef<'a> {
     JsonbKey(&'a [u8]),
 }
 
+/// TEXT 系キーの値を、キーの実効照合で比較用の借用キーへ写す（TABLE-28・Issue #1610）。
+/// 順序付けで照合を参照する唯一の地点で、比較器（`compare_*`）はバイト比較のまま。
+/// 網羅 `match` にして、バイト列順でない照合を足したときにここがコンパイルエラーで
+/// 列挙されるようにする。`C`／`POSIX` は入力の借用（アロケーションなし）。借用で返せない
+/// ソートキー（ICU）を導入する際は `ScalarKeyRef` に所有型を足すこと（#2190）。
+fn collated_text_key(collation: crate::collation::Collation, bytes: &[u8]) -> ScalarKeyRef<'_> {
+    match collation {
+        crate::collation::Collation::C | crate::collation::Collation::Posix => {
+            ScalarKeyRef::Bytes(bytes)
+        }
+    }
+}
+
 /// 可視行 1 件から `bound.order_by` の各キーの実行時比較値を、複製せず
 /// 借用のまま抽出する（Issue #915）。`scanned` は呼び出し元
 /// （[`with_visible_row`]）が `DecodeTier::DimAndScalar` 以上でデコード済みの
@@ -177,11 +190,11 @@ pub(crate) fn extract_order_value_ref<'a>(
             ColumnType::Text | ColumnType::Varchar(_),
             OrderKind::Bytes,
             row_codec::ScalarRef::Text(t),
-        ) => Ok(Some(ScalarKeyRef::Bytes(t.as_bytes()))),
+        ) => Ok(Some(collated_text_key(key.collation, t.as_bytes()))),
         // `CHAR(n)` は保存形（n 文字へ空白詰め）の末尾の半角空白を除いた値で比較する
         // （TABLE-31・Issue #1566）。
         (ColumnType::Bpchar(_), OrderKind::Bpchar, row_codec::ScalarRef::Text(t)) => Ok(Some(
-            ScalarKeyRef::Bytes(t.trim_end_matches(' ').as_bytes()),
+            collated_text_key(key.collation, t.trim_end_matches(' ').as_bytes()),
         )),
         (
             ColumnType::SmallInt | ColumnType::Integer,
@@ -432,12 +445,15 @@ pub(crate) fn order_value_to_cell(
 pub(crate) fn expr_value_to_key_ref<'v>(
     value: &'v crate::sql::udf_call::ExprValue<'_>,
     kind: OrderKind,
+    collation: crate::collation::Collation,
 ) -> Result<Option<ScalarKeyRef<'v>>, SqlSurfaceError> {
     use crate::sql::udf_call::ExprValue;
     match (value, kind) {
         (ExprValue::Null, _) => Ok(None),
         (ExprValue::Scalar(v), OrderKind::Float) => Ok(Some(ScalarKeyRef::Float(*v))),
-        (ExprValue::Text(t), OrderKind::Bytes) => Ok(Some(ScalarKeyRef::Bytes(t.as_bytes()))),
+        (ExprValue::Text(t), OrderKind::Bytes) => {
+            Ok(Some(collated_text_key(collation, t.as_bytes())))
+        }
         (ExprValue::Bool(b), OrderKind::Bool) => Ok(Some(ScalarKeyRef::Bool(*b))),
         (ExprValue::Date(d), OrderKind::SignedInt) => {
             Ok(Some(ScalarKeyRef::SignedInt(i64::from(*d))))
@@ -458,11 +474,12 @@ pub(crate) fn expr_value_to_key_ref<'v>(
 pub(crate) fn expr_value_to_order_value(
     value: &crate::sql::udf_call::ExprValue<'_>,
     kind: OrderKind,
+    collation: crate::collation::Collation,
 ) -> Result<Option<OrderValue>, SqlSurfaceError> {
     if kind == OrderKind::Jsonb {
         return Ok(expr_value_to_jsonb_key(value)?.map(OrderValue::JsonbKey));
     }
-    match expr_value_to_key_ref(value, kind)? {
+    match expr_value_to_key_ref(value, kind, collation)? {
         Some(r) => Ok(Some(scalar_key_ref_to_owned(r)?)),
         None => Ok(None),
     }

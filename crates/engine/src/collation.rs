@@ -1,14 +1,25 @@
-//! 列・式に付ける照合順序（`COLLATE`）の許可リストとカタログ表現（TABLE-28、Issue #1609）。
+//! 列・式に付ける照合順序（`COLLATE`）の許可リストとカタログ表現（TABLE-28、Issue #1609・#1610）。
 //!
 //! SQL 表層（`sql::allowlist`）が構文段で照合名を解決し、`catalog` が列行の `param`
-//! フィールドへ保存・復元する際の共通語彙を提供する。本 Issue の範囲は「解析と保存」
-//! だけで、比較・ORDER BY・索引キーの照合対応は #1610、ICU 照合（`und-x-icu` 等）の
-//! 比較器・照合の導出と衝突（`42P22`／`42P21`）は #2189・#2190、照合込みの索引は #2191
-//! が担う。ICU の比較器が無い間に ICU 名を受理すると、宣言とは違うバイト列順で黙って比較される
-//! 列ができてしまう（意味論の fail-open）ため、受理するのは依存なしで実装できる `C` と
-//! `POSIX`（どちらもバイト列順）に限る。ICU 照合を追加するときは [`Collation`] へ
-//! variant を足す（ワイルドカード腕を使っていないため、全ディスパッチ地点がコンパイル
-//! エラーで列挙される）。方針は `docs/design/icu-collator-adoption.md` の決定事項 3
+//! フィールドへ保存・復元する際の共通語彙を提供する。
+//!
+//! Issue #1610 で、順序付けと索引のディスパッチ点（`ORDER BY`・`GROUP BY`・`DISTINCT` の
+//! キー抽出、`MIN`/`MAX`(TEXT)、スカラー二次索引の構築）を [`Collation`] の網羅 `match`
+//! （[`Collation::is_byte_order`]・[`Collation::compare`]・[`Collation::sort_key`]）経由に
+//! 結線した。実効照合は「明示 `COLLATE` → 列の照合 → 既定 [`Collation::DEFAULT`]」の順
+//! （[`Collation::effective`]）。結線していない経路（式の比較・JOIN・ウィンドウ・集合演算）は、
+//! バイト列順でない照合が加わった時点で `sql` 層の `require_wired_collation` が `0A000` で
+//! 拒否する（fail-closed）。等値だけの経路（`=`・DISTINCT/GROUP BY のグループ同一性・
+//! UNIQUE/FK の正準キー・JOIN の等値キー・集合演算の重複除去）は変更しない。deterministic な
+//! 照合では等値がバイト列の等値と一致する（[`Collation::compare`] の契約）ため、キーの符号化を
+//! 照合依存にする必要がない。
+//!
+//! ICU 照合（`und-x-icu` 等）の比較器・照合の導出と衝突（`42P22`／`42P21`）は #2189・#2190、
+//! 照合込みの索引は #2191 が担う。ICU の比較器が無い間に ICU 名を受理すると、宣言とは違う
+//! バイト列順で黙って比較される列ができてしまう（意味論の fail-open）ため、受理するのは
+//! 依存なしで実装できる `C` と `POSIX`（どちらもバイト列順）に限る。ICU 照合を追加するときは
+//! [`Collation`] へ variant を足す（ワイルドカード腕を使っていないため、全ディスパッチ地点が
+//! コンパイルエラーで列挙される）。方針は `docs/design/icu-collator-adoption.md` の決定事項 3
 //! （固定の許可リストで解決し、ライブラリの構築成否を拒否の根拠にしない）に従う。
 
 use crate::catalog::ColumnType;
@@ -24,6 +35,41 @@ pub enum Collation {
 }
 
 impl Collation {
+    /// 照合指定なし（`None`）が意味する既定照合（バイト列順）。
+    pub const DEFAULT: Collation = Collation::C;
+
+    /// 実効照合を決める（明示 `COLLATE` → 列の照合 → [`Self::DEFAULT`]）。照合の導出と衝突
+    /// （`42P21`／`42P22`）は #2190 の担当で、ここは優先順位だけを持つ。
+    pub fn effective(explicit: Option<Collation>, column: Option<Collation>) -> Collation {
+        explicit.or(column).unwrap_or(Self::DEFAULT)
+    }
+
+    /// バイト列順と同一の順序を与える照合か。`false` の照合は、バイト列順を前提にした経路
+    /// （索引の辞書・グルーピング用の索引走査）を使わず全走査へ縮退させること。
+    pub fn is_byte_order(self) -> bool {
+        match self {
+            Collation::C | Collation::Posix => true,
+        }
+    }
+
+    /// 2 つのテキストを照合で比較する全順序。契約: 照合が等しいと判定した値は、バイト列順で
+    /// 二次比較して全順序にする（deterministic collation。`docs/design/icu-collator-adoption.md`
+    /// §5）。`C`／`POSIX` はバイト列順そのもので二次比較は何もしない。
+    pub fn compare(self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        match self {
+            Collation::C | Collation::Posix => a.cmp(b),
+        }
+    }
+
+    /// 照合順をバイト列の辞書順へ写すソートキー。`C`／`POSIX` は入力の借用でアロケーション
+    /// しない。将来の ICU 照合は「照合キー ‖ 区切り ‖ 元バイト列」の形にし、キーの等値が
+    /// 元バイト列の等値と一致するようにする（#2190）。
+    pub fn sort_key(self, s: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            Collation::C | Collation::Posix => std::borrow::Cow::Borrowed(s),
+        }
+    }
+
     /// SQL 上の照合名を許可リストと完全一致で解決する。未知の名前は `None`（呼び出し元が
     /// `42704` にする）。大小文字は畳まない（`"C"`／`"POSIX"` のみ）。固定比較だけで
     /// アロケーションせず、カタログも参照しないため、権限ゲートより前に呼んでもテーブルの
@@ -114,6 +160,34 @@ mod tests {
         }
         assert_eq!(Collation::from_catalog_token("C"), None);
         assert_eq!(Collation::from_catalog_token("icu"), None);
+    }
+
+    /// TABLE-28: 実効照合の優先順位と、バイト列順照合の比較・ソートキー。
+    #[test]
+    fn effective_compare_and_sort_key() {
+        use std::cmp::Ordering;
+        assert_eq!(Collation::effective(None, None), Collation::DEFAULT);
+        assert_eq!(
+            Collation::effective(None, Some(Collation::Posix)),
+            Collation::Posix
+        );
+        assert_eq!(
+            Collation::effective(Some(Collation::C), Some(Collation::Posix)),
+            Collation::C
+        );
+        let vals: [&[u8]; 5] = [b"", b"B", b"a", b"ab", "é".as_bytes()];
+        for c in [Collation::C, Collation::Posix] {
+            assert!(c.is_byte_order());
+            for a in vals {
+                assert_eq!(c.compare(a, a), Ordering::Equal);
+                assert!(matches!(c.sort_key(a), std::borrow::Cow::Borrowed(_)));
+                for b in vals {
+                    assert_eq!(c.compare(a, b), c.compare(b, a).reverse());
+                    assert_eq!(c.compare(a, b), c.sort_key(a).cmp(&c.sort_key(b)));
+                    assert_eq!(c.compare(a, b), a.cmp(b));
+                }
+            }
+        }
     }
 
     #[test]

@@ -5731,6 +5731,12 @@ fn resolve_aggregate_input(
                         "column {name:?} is TEXT and cannot be used with SUM/AVG"
                     ))),
                     (ColumnType::Text | ColumnType::Varchar(_), _) => {
+                        // `MIN`／`MAX` は順序比較。累積器は照合を運ばず既定照合の比較器を使うため、
+                        // バイト列順でない列の照合は `0A000` で拒否する（TABLE-28・Issue #1610。
+                        // 結線は #2190）。`COUNT` は等値だけなので照合に依存しない。
+                        if matches!(func, AggregateFunc::Min | AggregateFunc::Max) {
+                            crate::sql::udf_call::require_wired_collation(column.collation)?;
+                        }
                         Ok(AggregateInput::TextColumn(index))
                     }
                     // `COUNT(<CHAR 列>)` は NULL でない行を数えるだけで、保存形（n 文字へ空白詰め）の
@@ -6407,6 +6413,11 @@ pub(crate) struct BoundOrderKey {
     pub(crate) target: BoundOrderTarget,
     pub(crate) kind: OrderKind,
     pub(crate) descending: bool,
+    /// キーの実効照合（TABLE-28・Issue #1610。明示 `COLLATE` → 列の照合 → 既定の順）。
+    /// TEXT 系以外のキー（`Id`・数値・日時等）は常に [`crate::collation::Collation::DEFAULT`]
+    /// （照合を持たない型では意味を持たない）。キー抽出（`sql::order_value`）が値をソートキーへ
+    /// 写す際にだけ参照し、比較器自体はバイト比較のまま。
+    pub(crate) collation: crate::collation::Collation,
 }
 
 /// [`ColumnType`] から比較規約の分類を導出する（Issue #915・SQL-25）。
@@ -6465,6 +6476,7 @@ fn bind_scalar_order_by(
                 target: BoundOrderTarget::Column(index),
                 kind,
                 descending: key.descending,
+                collation: crate::collation::Collation::effective(None, column.collation),
             });
             continue;
         }
@@ -6473,6 +6485,7 @@ fn bind_scalar_order_by(
                 target: BoundOrderTarget::Id,
                 kind: OrderKind::Id,
                 descending: key.descending,
+                collation: crate::collation::Collation::DEFAULT,
             });
             continue;
         }
@@ -6554,6 +6567,7 @@ fn bind_scan_order_keys(
                             target: BoundOrderTarget::Expr(exprs.len()),
                             kind: OrderKind::Jsonb,
                             descending: k.descending,
+                            collation: crate::collation::Collation::DEFAULT,
                         });
                         exprs.push((be, program));
                         continue;
@@ -6561,6 +6575,43 @@ fn bind_scan_order_keys(
                     bound.extend(bind_scalar_order_by(std::slice::from_ref(k), schema)?);
                 }
                 ScanOrderKey::Expr { expr, descending } => {
+                    // 最上位の `COLLATE "x"` は明示照合としてキーに記録する（TABLE-28・
+                    // Issue #1610）。内側が TEXT 系の列識別子なら列キーに束縛し直し、列の
+                    // 高速経路（抽出の借用比較）を外れないようにする。
+                    let explicit = match expr {
+                        crate::sql::udf_call::Expr::Collate { collation, .. } => Some(*collation),
+                        _ => None,
+                    };
+                    if let crate::sql::udf_call::Expr::Collate { expr: inner, .. } = expr {
+                        if let crate::sql::udf_call::Expr::Ident(name) = inner.as_ref() {
+                            let is_text_column = schema.columns.iter().any(|c| {
+                                c.name == *name
+                                    && matches!(
+                                        c.ty,
+                                        ColumnType::Text
+                                            | ColumnType::Varchar(_)
+                                            | ColumnType::Bpchar(_)
+                                    )
+                            });
+                            if is_text_column {
+                                let mut keys = bind_scalar_order_by(
+                                    &[ScalarOrderKey {
+                                        column: name.clone(),
+                                        descending: *descending,
+                                    }],
+                                    schema,
+                                )?;
+                                for key in &mut keys {
+                                    key.collation = crate::collation::Collation::effective(
+                                        explicit,
+                                        Some(key.collation),
+                                    );
+                                }
+                                bound.extend(keys);
+                                continue;
+                            }
+                        }
+                    }
                     let (be, ty) =
                         crate::sql::udf_call::bind_order_expr(expr, schema, udfs, node_budget)?;
                     let kind = order_kind_for_expr_type(ty)?;
@@ -6569,6 +6620,7 @@ fn bind_scan_order_keys(
                         target: BoundOrderTarget::Expr(exprs.len()),
                         kind,
                         descending: *descending,
+                        collation: crate::collation::Collation::effective(explicit, None),
                     });
                     exprs.push((be, program));
                 }
@@ -6584,6 +6636,7 @@ fn bind_scan_order_keys(
                     target: BoundOrderTarget::Expr(exprs.len()),
                     kind,
                     descending: *descending,
+                    collation: crate::collation::Collation::DEFAULT,
                 });
                 exprs.push((expr.clone(), program));
             }
@@ -7313,6 +7366,7 @@ fn resolve_group_by_key(
             target: BoundOrderTarget::Column(index),
             kind,
             descending: false,
+            collation: crate::collation::Collation::effective(None, def.collation),
         });
     }
     if column == "id" {
@@ -7320,6 +7374,7 @@ fn resolve_group_by_key(
             target: BoundOrderTarget::Id,
             kind: OrderKind::Id,
             descending: false,
+            collation: crate::collation::Collation::DEFAULT,
         });
     }
     // スキーマ実列でも `id` でもない＝未定義列（Issue #2332: `42703`）。

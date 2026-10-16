@@ -1234,7 +1234,10 @@ fn cmp_window_key_value(a: &WindowKeyValue, b: &WindowKeyValue) -> std::cmp::Ord
     use std::cmp::Ordering;
     match (a, b) {
         (WindowKeyValue::Id(x), WindowKeyValue::Id(y)) => x.cmp(y),
-        (WindowKeyValue::Text(x), WindowKeyValue::Text(y)) => x.cmp(y),
+        // 照合の比較器（既定照合）に 1 本化。照合の受け渡しは #2190（TABLE-28・Issue #1610）。
+        (WindowKeyValue::Text(x), WindowKeyValue::Text(y)) => {
+            crate::collation::Collation::DEFAULT.compare(x.as_bytes(), y.as_bytes())
+        }
         (WindowKeyValue::Integer(x), WindowKeyValue::Integer(y)) => x.cmp(y),
         (WindowKeyValue::BigInt(x), WindowKeyValue::BigInt(y)) => x.cmp(y),
         (WindowKeyValue::Real(x), WindowKeyValue::Real(y)) => {

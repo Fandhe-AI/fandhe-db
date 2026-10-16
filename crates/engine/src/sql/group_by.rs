@@ -390,12 +390,16 @@ impl Ord for GroupKey {
 /// 疑似列 `id`）は型付きグループキーの全走査（`multi_groups`）へ回す。
 /// `sql::aggregate::classify_aggregate_access`（EXPLAIN の静的判定）も本関数を
 /// 単一の情報源として共有し、実行経路との食い違い（D5 矛盾出力）を防ぐ。
+/// キーの実効照合がバイト列順でない場合も `None`（索引の `column_groups` はバイト列順の
+/// 辞書で供給するため、汎用経路へ縮退させる。TABLE-28・Issue #1610。照合込みの索引は #2191）。
 pub(crate) fn single_text_key_column(group_by: &crate::sql::parser::BoundGroupBy) -> Option<usize> {
     match group_by.keys.as_slice() {
-        [key] if key.kind == OrderKind::Bytes => match key.target {
-            BoundOrderTarget::Column(index) => Some(index),
-            BoundOrderTarget::Id | BoundOrderTarget::Expr(_) => None,
-        },
+        [key] if key.kind == OrderKind::Bytes && key.collation.is_byte_order() => {
+            match key.target {
+                BoundOrderTarget::Column(index) => Some(index),
+                BoundOrderTarget::Id | BoundOrderTarget::Expr(_) => None,
+            }
+        }
         _ => None,
     }
 }
@@ -1275,7 +1279,10 @@ fn cmp_cell_values(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         (Cell::Integer(x), Cell::Float(y)) => (*x as f64).total_cmp(y),
         (Cell::Float(x), Cell::Integer(y)) => x.total_cmp(&(*y as f64)),
         (Cell::Float(x), Cell::Float(y)) => x.total_cmp(y),
-        (Cell::Text(x), Cell::Text(y)) => x.cmp(y),
+        // 集計結果の `ORDER BY` は項目の照合を運ばない（既定照合の比較器。#2190）。
+        (Cell::Text(x), Cell::Text(y)) => {
+            crate::collation::Collation::DEFAULT.compare(x.as_bytes(), y.as_bytes())
+        }
         // Issue #892（D9）: `ORDER BY` が新スカラー型の集計結果を並べ替える際に
         // 使う。`ORDER BY` 対象は同一集計項目（`OrderTarget::Aggregate`）の
         // 複数グループ分の結果であり、`Cell` の variant は常に揃っている
@@ -2536,7 +2543,12 @@ fn eval_group_row_exprs(
         let value = program.eval(0, &[], &scalars, scratch)?;
         // 所有値化（TEXT の複製）の前に、式キーの保持分を結果予算へ課金する。
         charge.charge(&value)?;
-        order_values.push(expr_value_to_order_value(&value, *kind)?);
+        order_values.push(expr_value_to_order_value(
+            &value,
+            *kind,
+            // 集計文の式 `ORDER BY` は照合を運ばない（既定照合。照合の受け渡しは #2190）。
+            crate::collation::Collation::DEFAULT,
+        )?);
     }
     Ok((true, order_values))
 }
@@ -2741,6 +2753,7 @@ mod tests {
                     target: BoundOrderTarget::Column(1),
                     kind: OrderKind::Bytes,
                     descending: false,
+                    collation: crate::collation::Collation::DEFAULT,
                 }],
                 having: Vec::new(),
                 order_by: Vec::new(),
@@ -2889,6 +2902,7 @@ mod tests {
                     target: BoundOrderTarget::Column(1),
                     kind: OrderKind::Bytes,
                     descending: false,
+                    collation: crate::collation::Collation::DEFAULT,
                 }],
                 having: Vec::new(),
                 order_by: Vec::new(),
@@ -3320,6 +3334,7 @@ mod tests {
                     target: BoundOrderTarget::Column(1),
                     kind: OrderKind::Bytes,
                     descending: false,
+                    collation: crate::collation::Collation::DEFAULT,
                 }],
                 having: Vec::new(),
                 order_by: Vec::new(),
