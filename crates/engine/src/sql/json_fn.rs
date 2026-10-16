@@ -176,6 +176,18 @@ fn bind_value_arg(
                 detail: "a time value cannot be converted to json yet".to_string(),
             })
         }
+        // TIMESTAMPTZ の json 化も未対応（Issue #1576 の対象外）。fail-closed で拒否する。
+        ExprType::TimestampTz => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "a timestamptz value cannot be converted to json yet".to_string(),
+            })
+        }
+        // INTERVAL の json 化は未対応（Issue #1581 の対象外）。fail-closed で拒否する。
+        ExprType::Interval => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "an interval value cannot be converted to json yet".to_string(),
+            })
+        }
     };
     Ok((bound, kind))
 }

@@ -296,6 +296,7 @@ pub enum CatalogError {
     IndexAlreadyExists(String),
     IndexNotFound(String),
     IndexKindMismatch(String),
+    IndexCollationNotSupported(String),
     IndexLimitExceeded(String),
     InvalidForeignKey(String),
     ConstraintAlreadyExists(String),

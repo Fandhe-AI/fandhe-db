@@ -10,6 +10,9 @@
 //! `sql::udf_call::bind_call` が束縛時に一度だけ行い、行ループでは払い出し済みの
 //! enum のみを扱う（行ごとの文字列比較を避ける設計。§2-4 参照）。
 //!
+//! `TIMESTAMP`／`TIMESTAMPTZ` と `INTERVAL` の加減算・差分は `crate::sql::interval_arith`（TABLE-34。
+//! Issue #1581）が担い、本モジュールは `DATE ± n` の日数算術だけを持つ。
+//!
 //! `TIME` 入力（Issue #1570）は [`time_part`] が担う。`date_part` は暦計算で日付境界へ
 //! 折り返す（`24:00:00` が hour=0 になる）ため流用せず、0 時起点のマイクロ秒をそのまま分解する。
 //!
@@ -45,6 +48,11 @@ pub enum DatePartField {
     Doy,
     IsoYear,
     Epoch,
+    /// `timezone`・`timezone_hour`・`timezone_minute`（`TIMESTAMPTZ` 専用。UTC からの offset。
+    /// Issue #1576）。`TIMESTAMP`／`DATE`／`TIME` に対しては束縛時に `0A000` で拒否する。
+    Timezone,
+    TimezoneHour,
+    TimezoneMinute,
 }
 
 impl DatePartField {
@@ -70,6 +78,9 @@ impl DatePartField {
             "doy" => Self::Doy,
             "isoyear" => Self::IsoYear,
             "epoch" => Self::Epoch,
+            "timezone" => Self::Timezone,
+            "timezone_hour" => Self::TimezoneHour,
+            "timezone_minute" => Self::TimezoneMinute,
             _ => return None,
         })
     }
@@ -199,7 +210,67 @@ pub(crate) fn date_part(field: DatePartField, micros: i64) -> f64 {
         DatePartField::IsoYear => iso_week_and_year(days).0 as f64,
         DatePartField::Week => iso_week_and_year(days).1 as f64,
         DatePartField::Epoch => micros as f64 / 1_000_000.0,
+        // 束縛時に `TIMESTAMPTZ` 以外へは到達させない（`0A000`）。到達した場合の値は NaN とし、
+        // 呼び出し元の `finite_scalar` が内部エラーへ倒す（fail-closed）。
+        DatePartField::Timezone | DatePartField::TimezoneHour | DatePartField::TimezoneMinute => {
+            f64::NAN
+        }
     }
+}
+
+/// `TIMESTAMPTZ` の `date_part`／`EXTRACT`（Issue #1576）。`epoch` は UTC の絶対値、
+/// `timezone*` は `tz` の offset、それ以外は `tz` の壁時計での暦計算（[`date_part`]）。
+/// 壁時計が `TIMESTAMP` の範囲を外れる入力は `22008`。
+pub(crate) fn timestamptz_part(
+    field: DatePartField,
+    utc_micros: i64,
+    tz: &crate::datetime::SessionTimeZone,
+) -> Result<f64, SqlSurfaceError> {
+    let offset = tz.offset_seconds_at(utc_micros);
+    Ok(match field {
+        DatePartField::Epoch => utc_micros as f64 / 1_000_000.0,
+        DatePartField::Timezone => f64::from(offset),
+        DatePartField::TimezoneHour => f64::from(offset / 3600),
+        DatePartField::TimezoneMinute => f64::from((offset % 3600) / 60),
+        _ => {
+            let local = tz
+                .timestamptz_to_timestamp(utc_micros)
+                .ok_or_else(tz_out_of_range)?;
+            date_part(field, local)
+        }
+    })
+}
+
+/// `date_trunc(unit, timestamptz[, zone])`（Issue #1576）。壁時計で切り捨て、day 以上の単位は
+/// 切り捨て後の局所時刻を DST の gap／fold 規則で UTC へ再解決し、hour 以下の単位は元の
+/// offset を保つ（PG 17 の実測）。
+pub(crate) fn timestamptz_trunc(
+    unit: DateTruncUnit,
+    utc_micros: i64,
+    tz: &crate::datetime::SessionTimeZone,
+) -> Result<i64, SqlSurfaceError> {
+    let local = tz
+        .timestamptz_to_timestamp(utc_micros)
+        .ok_or_else(tz_out_of_range)?;
+    let truncated = date_trunc(unit, local)?;
+    let utc = match unit {
+        DateTruncUnit::Microseconds
+        | DateTruncUnit::Milliseconds
+        | DateTruncUnit::Second
+        | DateTruncUnit::Minute
+        | DateTruncUnit::Hour => {
+            let offset = i64::from(tz.offset_seconds_at(utc_micros)) * 1_000_000;
+            truncated.checked_sub(offset)
+        }
+        _ => tz.timestamp_to_timestamptz(truncated),
+    };
+    utc.filter(|u| crate::datetime::validate_timestamptz_micros(*u))
+        .ok_or_else(tz_out_of_range)
+}
+
+/// `TIMESTAMPTZ` の変換結果が表現範囲外のときの共通エラー（`22008`）。
+pub(crate) fn tz_out_of_range() -> SqlSurfaceError {
+    SqlSurfaceError::datetime_field_overflow("timestamptz value is out of the representable range")
 }
 
 /// `TIME` が `time_part` で扱える field か（束縛時の拒否判定に使う。Issue #1570）。
@@ -236,7 +307,10 @@ pub(crate) fn time_part(field: DatePartField, micros: i64) -> Option<f64> {
         | DatePartField::IsoDow
         | DatePartField::Doy
         | DatePartField::IsoYear
-        | DatePartField::Week => None,
+        | DatePartField::Week
+        | DatePartField::Timezone
+        | DatePartField::TimezoneHour
+        | DatePartField::TimezoneMinute => None,
     }
 }
 

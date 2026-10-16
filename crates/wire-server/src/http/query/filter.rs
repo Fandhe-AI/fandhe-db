@@ -38,13 +38,13 @@
 //!
 //! 型別レーン:
 //! - `eq`: `TEXT`／`ENUM`（文字列。`prefix` と同じ）・`BOOLEAN`（真偽値）・
-//!   `DATE`／`TIMESTAMP`／`UUID`（文字列）・`BYTEA`（base64 文字列）・
+//!   `DATE`／`TIMESTAMP`／`UUID`／`INTERVAL`（文字列）・`BYTEA`（base64 文字列）・
 //!   `NUMERIC`（数値または数値文字列）
-//! - `lt`／`le`／`lte`／`gt`／`ge`／`gte`: `DATE`／`TIMESTAMP`／`UUID`（文字列）・
+//! - `lt`／`le`／`lte`／`gt`／`ge`／`gte`: `DATE`／`TIMESTAMP`／`UUID`／`INTERVAL`（文字列）・
 //!   `NUMERIC`（数値または数値文字列）・`BYTEA`（base64 文字列）。
 //!   `TEXT`／`ENUM`／`BOOLEAN`／`VECTOR`／`ARRAY`／`JSON`／`JSONB` は
 //!   engine 側の「範囲比較非対応列」判定（`22000`）へ委譲する
-//! - `in`: `TEXT`／`ENUM`（文字列配列）・`DATE`／`TIMESTAMP`／`UUID`（文字列配列）・
+//! - `in`: `TEXT`／`ENUM`（文字列配列）・`DATE`／`TIMESTAMP`／`UUID`／`INTERVAL`（文字列配列）・
 //!   `NUMERIC`（数値または数値文字列の配列）・`BYTEA`（base64 文字列配列）・
 //!   `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`（JSON 数値の配列。SQL の
 //!   数値リテラル `col IN (1, 2)` の脱糖と同じ `col = 1 OR col = 2` の式レーン。
@@ -672,9 +672,14 @@ fn declare_between(
         ))]
     };
     match ty {
-        ColumnType::Date | ColumnType::Timestamp | ColumnType::Uuid => {
+        ColumnType::Date
+        | ColumnType::Timestamp
+        | ColumnType::Uuid
+        // INTERVAL は文字列リテラルとして束縛し、書式・範囲は engine の `parse_interval` に委ねる
+        // （`22007`／`22015`／`22008`／`0A000`。比較は正規化キー。TABLE-34・Issue #1583）。
+        | ColumnType::Interval => {
             let (l, h) = text_pair(
-                "between filter value for a DATE/TIMESTAMP/UUID column must be two JSON strings",
+                "between filter value for a DATE/TIMESTAMP/UUID/INTERVAL column must be two JSON strings",
             )?;
             Ok(leaf(l, h))
         }
@@ -706,6 +711,8 @@ fn declare_between(
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
+        // TIMESTAMPTZ の述語は engine の述語解禁（#1576）の後に解禁する。insert／update の型束縛は
+        // typed_json 側で Issue #1577 により対応済み。
         ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
@@ -827,14 +834,19 @@ fn declare_eq(
                 "eq filter value for a BOOLEAN column must be a JSON boolean",
             ))),
         },
-        ColumnType::Date | ColumnType::Timestamp | ColumnType::Uuid => match value {
+        ColumnType::Date
+        | ColumnType::Timestamp
+        | ColumnType::Uuid
+        // INTERVAL は文字列リテラルとして束縛し、書式・範囲は engine の `parse_interval` に委ねる
+        // （`22007`／`22015`／`22008`／`0A000`。比較は正規化キー。TABLE-34・Issue #1583）。
+        | ColumnType::Interval => match value {
             JsonValue::String(s) => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::compare(
                 column,
                 CompareOp::Eq,
                 s.as_str(),
             ))),
             _ => Err(FilterError::Value(TypedJsonError::TypeMismatch(
-                "eq filter value for a DATE/TIMESTAMP/UUID column must be a JSON string",
+                "eq filter value for a DATE/TIMESTAMP/UUID/INTERVAL column must be a JSON string",
             ))),
         },
         ColumnType::Bytea => match value {
@@ -872,6 +884,8 @@ fn declare_eq(
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
+        // TIMESTAMPTZ の述語は engine の述語解禁（#1576）の後に解禁する。insert／update の型束縛は
+        // typed_json 側で Issue #1577 により対応済み。
         ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
@@ -924,14 +938,19 @@ fn declare_range(
     value: &JsonValue,
 ) -> Result<DeclarativePredicate, FilterError> {
     match ty {
-        ColumnType::Date | ColumnType::Timestamp | ColumnType::Uuid => match value {
+        ColumnType::Date
+        | ColumnType::Timestamp
+        | ColumnType::Uuid
+        // INTERVAL は文字列リテラルとして束縛し、書式・範囲は engine の `parse_interval` に委ねる
+        // （`22007`／`22015`／`22008`／`0A000`。比較は正規化キー。TABLE-34・Issue #1583）。
+        | ColumnType::Interval => match value {
             JsonValue::String(s) => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::compare(
                 column,
                 cmp,
                 s.as_str(),
             ))),
             _ => Err(FilterError::Value(TypedJsonError::TypeMismatch(
-                "range filter value for a DATE/TIMESTAMP/UUID column must be a JSON string",
+                "range filter value for a DATE/TIMESTAMP/UUID/INTERVAL column must be a JSON string",
             ))),
         },
         ColumnType::Bytea => match value {
@@ -967,6 +986,8 @@ fn declare_range(
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
+        // TIMESTAMPTZ の述語は engine の述語解禁（#1576）の後に解禁する。insert／update の型束縛は
+        // typed_json 側で Issue #1577 により対応済み。
         ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
@@ -1060,14 +1081,19 @@ fn declare_in(
                 column, values,
             )))
         }
-        ColumnType::Date | ColumnType::Timestamp | ColumnType::Uuid => {
+        ColumnType::Date
+        | ColumnType::Timestamp
+        | ColumnType::Uuid
+        // INTERVAL は文字列リテラルとして束縛し、書式・範囲は engine の `parse_interval` に委ねる
+        // （`22007`／`22015`／`22008`／`0A000`。比較は正規化キー。TABLE-34・Issue #1583）。
+        | ColumnType::Interval => {
             let mut values = Vec::with_capacity(items.len());
             for item in items {
                 match item {
                     JsonValue::String(s) => values.push(s.clone()),
                     _ => {
                         return Err(FilterError::Value(TypedJsonError::TypeMismatch(
-                            "in filter value for a DATE/TIMESTAMP/UUID column must be an array of JSON strings",
+                            "in filter value for a DATE/TIMESTAMP/UUID/INTERVAL column must be an array of JSON strings",
                         )))
                     }
                 }
@@ -1158,6 +1184,8 @@ fn declare_in(
         ColumnType::Time => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIME column is not supported on the NoSQL surface yet",
         ))),
+        // TIMESTAMPTZ の述語は engine の述語解禁（#1576）の後に解禁する。insert／update の型束縛は
+        // typed_json 側で Issue #1577 により対応済み。
         ColumnType::TimestampTz => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             "TIMESTAMPTZ column is not supported on the NoSQL surface yet",
         ))),
@@ -2126,6 +2154,49 @@ mod tests {
         let err =
             bind(r#"[{"column":"active","op":"prefix","value":"t"}]"#).expect_err("must reject");
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// INTERVAL 列の `eq`／範囲／`between`／`in` は文字列リテラルとして束縛され、非文字列は
+    /// `42601`、不正リテラルは engine 由来の `22007`、`prefix` は TEXT 系専用の `22000`
+    /// （Issue #1583）。
+    #[test]
+    fn interval_column_filters_bind_strings_and_reject_others() {
+        let schema = TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("iv", ColumnType::Interval, true),
+            ],
+        );
+        let run = |json: &str| bind_filter(&filter_items(json), &schema, &udfs());
+        for ok in [
+            r#"[{"column":"iv","op":"eq","value":"1 mon"}]"#,
+            r#"[{"column":"iv","op":"lt","value":"30 days"}]"#,
+            r#"[{"column":"iv","op":"between","value":["1 day","2 days"]}]"#,
+            r#"[{"column":"iv","op":"in","value":["1 day","2 days"]}]"#,
+        ] {
+            assert!(run(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            r#"[{"column":"iv","op":"eq","value":1}]"#,
+            r#"[{"column":"iv","op":"lt","value":true}]"#,
+            r#"[{"column":"iv","op":"in","value":[1]}]"#,
+            r#"[{"column":"iv","op":"between","value":[1,2]}]"#,
+        ] {
+            assert_eq!(run(bad).expect_err(bad).wire_code(), "42601", "{bad}");
+        }
+        assert_eq!(
+            run(r#"[{"column":"iv","op":"eq","value":"1 fortnight"}]"#)
+                .expect_err("bad literal")
+                .wire_code(),
+            "22007"
+        );
+        assert_eq!(
+            run(r#"[{"column":"iv","op":"prefix","value":"1"}]"#)
+                .expect_err("prefix")
+                .wire_code(),
+            "22000"
+        );
     }
 
     // --- bind_filter_where_predicates（述語形 DML への写像。Issue #1062） ---

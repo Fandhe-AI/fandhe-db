@@ -31,6 +31,13 @@ pub(crate) enum OrderValue {
     Id(u64),
     /// `TEXT`（バイト列順）。
     Bytes(Vec<u8>),
+    /// `TEXT`（バイト列順でない照合。ICU。Issue #2190）。比較は `collation.compare` で行い、
+    /// 元テキストを保持する（グループキーの出力復元のためソートキーへ変換しない）。同じ
+    /// キーでは `Bytes` と混在しない（[`collated_text_key`] が実効照合から 1 回だけ決める）。
+    Collated {
+        collation: crate::collation::Collation,
+        text: Vec<u8>,
+    },
     /// `INTEGER`／`BIGINT`／`DATE`／`TIMESTAMP`。
     SignedInt(i64),
     /// `REAL`／`DOUBLE`。
@@ -43,6 +50,9 @@ pub(crate) enum OrderValue {
     /// `JSONB`（[`crate::json::jsonb_sort_key`] のバイト列。辞書順が jsonb の全順序。
     /// Issue #1597）。
     JsonbKey(Vec<u8>),
+    /// `INTERVAL`（生の三要素を保持し、比較は正規化キー〔`datetime::cmp_interval`〕。
+    /// Issue #1580。GROUP BY・DISTINCT のキーにはならない＝代表値の規則が未確定）。
+    Interval(crate::datetime::Interval),
 }
 
 /// `f64` 比較（NaN はすべての非 NaN より大きく NaN 同士は等しい。`-0.0 == 0.0` は
@@ -66,6 +76,16 @@ pub(crate) fn compare_order_values(a: &OrderValue, b: &OrderValue) -> Ordering {
     match (a, b) {
         (OrderValue::Id(x), OrderValue::Id(y)) => x.cmp(y),
         (OrderValue::Bytes(x), OrderValue::Bytes(y)) => x.cmp(y),
+        (
+            OrderValue::Collated {
+                collation: ca,
+                text: x,
+            },
+            OrderValue::Collated {
+                collation: cb,
+                text: y,
+            },
+        ) if ca == cb => ca.compare(x, y),
         (OrderValue::SignedInt(x), OrderValue::SignedInt(y)) => x.cmp(y),
         (OrderValue::Float(x), OrderValue::Float(y)) => compare_f64(*x, *y),
         (OrderValue::Bool(x), OrderValue::Bool(y)) => x.cmp(y),
@@ -73,6 +93,7 @@ pub(crate) fn compare_order_values(a: &OrderValue, b: &OrderValue) -> Ordering {
         (OrderValue::Uuid(x), OrderValue::Uuid(y)) => x.cmp(y),
         (OrderValue::EnumOrdinal(x), OrderValue::EnumOrdinal(y)) => x.cmp(y),
         (OrderValue::JsonbKey(x), OrderValue::JsonbKey(y)) => x.cmp(y),
+        (OrderValue::Interval(x), OrderValue::Interval(y)) => crate::datetime::cmp_interval(x, y),
         _ => Ordering::Equal,
     }
 }
@@ -120,6 +141,11 @@ pub(crate) fn compare_order_key(
 pub(crate) enum ScalarKeyRef<'a> {
     Id(u64),
     Bytes(&'a [u8]),
+    /// [`OrderValue::Collated`] の借用版（Issue #2190）。
+    Collated {
+        collation: crate::collation::Collation,
+        text: &'a [u8],
+    },
     SignedInt(i64),
     Float(f64),
     Bool(bool),
@@ -128,17 +154,24 @@ pub(crate) enum ScalarKeyRef<'a> {
     EnumOrdinal(usize),
     /// [`OrderValue::JsonbKey`] の借用版（Issue #1597）。
     JsonbKey(&'a [u8]),
+    /// [`OrderValue::Interval`] の借用版（`Copy`。Issue #1580）。
+    Interval(crate::datetime::Interval),
 }
 
-/// TEXT 系キーの値を、キーの実効照合で比較用の借用キーへ写す（TABLE-28・Issue #1610）。
-/// 順序付けで照合を参照する唯一の地点で、比較器（`compare_*`）はバイト比較のまま。
-/// 網羅 `match` にして、バイト列順でない照合を足したときにここがコンパイルエラーで
-/// 列挙されるようにする。`C`／`POSIX` は入力の借用（アロケーションなし）。借用で返せない
-/// ソートキー（ICU）を導入する際は `ScalarKeyRef` に所有型を足すこと（#2190）。
+/// TEXT 系キーの値を、キーの実効照合で比較用の借用キーへ写す（TABLE-28・Issue #1610・#2190）。
+/// 順序付けで照合を参照する唯一の地点。バイト列順の照合（`C`／`POSIX`）は従来どおり `Bytes`
+/// （借用・アロケーションなし）で、既定照合の経路をバイト単位で不変に保つ。バイト列順でない
+/// 照合（ICU）は `Collated` にし、比較器が `collation.compare` を呼ぶ。ICU のソートキーは
+/// 候補が数回しか比較されない ORDER BY のヒープでは生成コストを償却できず、予算も膨らむため
+/// 生成しない（比較器方式）。1 つのキーの値の variant は、ここで `collation` から一度だけ
+/// 決まる（同じキーで `Bytes` と `Collated` が混在しない不変条件）。
 fn collated_text_key(collation: crate::collation::Collation, bytes: &[u8]) -> ScalarKeyRef<'_> {
-    match collation {
-        crate::collation::Collation::C | crate::collation::Collation::Posix => {
-            ScalarKeyRef::Bytes(bytes)
+    if collation.is_byte_order() {
+        ScalarKeyRef::Bytes(bytes)
+    } else {
+        ScalarKeyRef::Collated {
+            collation,
+            text: bytes,
         }
     }
 }
@@ -207,11 +240,17 @@ pub(crate) fn extract_order_value_ref<'a>(
         (ColumnType::Date, OrderKind::SignedInt, row_codec::ScalarRef::Date(v)) => {
             Ok(Some(ScalarKeyRef::SignedInt(i64::from(*v))))
         }
+        (ColumnType::TimestampTz, OrderKind::SignedInt, row_codec::ScalarRef::TimestampTz(v)) => {
+            Ok(Some(ScalarKeyRef::SignedInt(*v)))
+        }
         (ColumnType::Timestamp, OrderKind::SignedInt, row_codec::ScalarRef::Timestamp(v)) => {
             Ok(Some(ScalarKeyRef::SignedInt(*v)))
         }
         (ColumnType::Time, OrderKind::SignedInt, row_codec::ScalarRef::Time(v)) => {
             Ok(Some(ScalarKeyRef::SignedInt(*v)))
+        }
+        (ColumnType::Interval, OrderKind::Interval, row_codec::ScalarRef::Interval(v)) => {
+            Ok(Some(ScalarKeyRef::Interval(*v)))
         }
         (ColumnType::Real, OrderKind::Float, row_codec::ScalarRef::Real(v)) => {
             Ok(Some(ScalarKeyRef::Float(f64::from(*v))))
@@ -264,6 +303,19 @@ pub(crate) fn scalar_key_ref_to_owned(
             owned.extend_from_slice(b);
             OrderValue::Bytes(owned)
         }
+        ScalarKeyRef::Collated { collation, text } => {
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(text.len())
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve order key text field: {e}"),
+                })?;
+            owned.extend_from_slice(text);
+            OrderValue::Collated {
+                collation,
+                text: owned,
+            }
+        }
         ScalarKeyRef::JsonbKey(b) => {
             let mut owned = Vec::new();
             owned
@@ -280,6 +332,7 @@ pub(crate) fn scalar_key_ref_to_owned(
         ScalarKeyRef::Numeric(v) => OrderValue::Numeric(v),
         ScalarKeyRef::Uuid(v) => OrderValue::Uuid(v),
         ScalarKeyRef::EnumOrdinal(v) => OrderValue::EnumOrdinal(v),
+        ScalarKeyRef::Interval(v) => OrderValue::Interval(v),
     })
 }
 
@@ -318,6 +371,16 @@ pub(crate) fn compare_ref_and_owned_values(a: &ScalarKeyRef<'_>, b: &OrderValue)
     match (a, b) {
         (ScalarKeyRef::Id(x), OrderValue::Id(y)) => x.cmp(y),
         (ScalarKeyRef::Bytes(x), OrderValue::Bytes(y)) => (*x).cmp(y.as_slice()),
+        (
+            ScalarKeyRef::Collated {
+                collation: ca,
+                text: x,
+            },
+            OrderValue::Collated {
+                collation: cb,
+                text: y,
+            },
+        ) if ca == cb => ca.compare(x, y),
         (ScalarKeyRef::SignedInt(x), OrderValue::SignedInt(y)) => x.cmp(y),
         (ScalarKeyRef::Float(x), OrderValue::Float(y)) => compare_f64(*x, *y),
         (ScalarKeyRef::Bool(x), OrderValue::Bool(y)) => x.cmp(y),
@@ -325,6 +388,7 @@ pub(crate) fn compare_ref_and_owned_values(a: &ScalarKeyRef<'_>, b: &OrderValue)
         (ScalarKeyRef::Uuid(x), OrderValue::Uuid(y)) => x.cmp(y),
         (ScalarKeyRef::EnumOrdinal(x), OrderValue::EnumOrdinal(y)) => x.cmp(y),
         (ScalarKeyRef::JsonbKey(x), OrderValue::JsonbKey(y)) => (*x).cmp(y.as_slice()),
+        (ScalarKeyRef::Interval(x), OrderValue::Interval(y)) => crate::datetime::cmp_interval(x, y),
         _ => Ordering::Equal,
     }
 }
@@ -336,6 +400,10 @@ impl OrderValue {
         match self {
             OrderValue::Id(v) => ScalarKeyRef::Id(*v),
             OrderValue::Bytes(b) => ScalarKeyRef::Bytes(b.as_slice()),
+            OrderValue::Collated { collation, text } => ScalarKeyRef::Collated {
+                collation: *collation,
+                text: text.as_slice(),
+            },
             OrderValue::SignedInt(v) => ScalarKeyRef::SignedInt(*v),
             OrderValue::Float(v) => ScalarKeyRef::Float(*v),
             OrderValue::Bool(v) => ScalarKeyRef::Bool(*v),
@@ -343,6 +411,7 @@ impl OrderValue {
             OrderValue::Uuid(v) => ScalarKeyRef::Uuid(*v),
             OrderValue::EnumOrdinal(v) => ScalarKeyRef::EnumOrdinal(*v),
             OrderValue::JsonbKey(b) => ScalarKeyRef::JsonbKey(b.as_slice()),
+            OrderValue::Interval(v) => ScalarKeyRef::Interval(*v),
         }
     }
 }
@@ -355,6 +424,16 @@ pub(crate) fn compare_key_refs(a: &ScalarKeyRef<'_>, b: &ScalarKeyRef<'_>) -> Or
     match (a, b) {
         (ScalarKeyRef::Id(x), ScalarKeyRef::Id(y)) => x.cmp(y),
         (ScalarKeyRef::Bytes(x), ScalarKeyRef::Bytes(y)) => x.cmp(y),
+        (
+            ScalarKeyRef::Collated {
+                collation: ca,
+                text: x,
+            },
+            ScalarKeyRef::Collated {
+                collation: cb,
+                text: y,
+            },
+        ) if ca == cb => ca.compare(x, y),
         (ScalarKeyRef::SignedInt(x), ScalarKeyRef::SignedInt(y)) => x.cmp(y),
         (ScalarKeyRef::Float(x), ScalarKeyRef::Float(y)) => compare_f64(*x, *y),
         (ScalarKeyRef::Bool(x), ScalarKeyRef::Bool(y)) => x.cmp(y),
@@ -362,6 +441,9 @@ pub(crate) fn compare_key_refs(a: &ScalarKeyRef<'_>, b: &ScalarKeyRef<'_>) -> Or
         (ScalarKeyRef::Uuid(x), ScalarKeyRef::Uuid(y)) => x.cmp(y),
         (ScalarKeyRef::EnumOrdinal(x), ScalarKeyRef::EnumOrdinal(y)) => x.cmp(y),
         (ScalarKeyRef::JsonbKey(x), ScalarKeyRef::JsonbKey(y)) => x.cmp(y),
+        (ScalarKeyRef::Interval(x), ScalarKeyRef::Interval(y)) => {
+            crate::datetime::cmp_interval(x, y)
+        }
         _ => Ordering::Equal,
     }
 }
@@ -377,6 +459,11 @@ pub(crate) fn order_value_to_cell(
     ty: Option<&ColumnType>,
 ) -> Result<crate::sql::exec::Cell, SqlSurfaceError> {
     use crate::sql::exec::Cell;
+    // 照合付きの TEXT は元テキストを保持しているため、`Bytes` と同じ復元に合流させる。
+    let value = match value {
+        OrderValue::Collated { text, .. } => &OrderValue::Bytes(text.clone()),
+        other => other,
+    };
     match (value, ty) {
         (OrderValue::Id(v), None) => Ok(Cell::Integer(*v)),
         (OrderValue::Bytes(b), Some(ColumnType::Text | ColumnType::Varchar(_))) => {
@@ -412,6 +499,7 @@ pub(crate) fn order_value_to_cell(
             .map(Cell::Date)
             .map_err(|_| scan_bug("group key DATE value out of range")),
         (OrderValue::SignedInt(v), Some(ColumnType::Timestamp)) => Ok(Cell::Timestamp(*v)),
+        (OrderValue::SignedInt(v), Some(ColumnType::TimestampTz)) => Ok(Cell::TimestampTz(*v)),
         // `24:00:00`（= `MICROS_PER_DAY`）は正当な保存値のため上端を含めて検査する。
         (OrderValue::SignedInt(v), Some(ColumnType::Time)) => {
             if (0..=crate::datetime::MICROS_PER_DAY).contains(v) {
@@ -431,6 +519,9 @@ pub(crate) fn order_value_to_cell(
             .ok_or_else(|| scan_bug("group key ENUM ordinal out of range")),
         // jsonb はグループキーにならない（GROUP BY・DISTINCT は対象外）。
         (OrderValue::JsonbKey(_), _) => Err(scan_bug("jsonb value used as a group key")),
+        // INTERVAL は GROUP BY・DISTINCT のキーにならない（束縛段 `resolve_group_by_key` が拒否済み）。
+        // 正規化等価な値をまとめるときの代表値の規則が未確定のため、到達したら配線不備として fail-closed。
+        (OrderValue::Interval(_), _) => Err(scan_bug("interval value used as a group key")),
         _ => Err(scan_bug("group key value/column type mismatch")),
     }
 }
@@ -459,6 +550,7 @@ pub(crate) fn expr_value_to_key_ref<'v>(
             Ok(Some(ScalarKeyRef::SignedInt(i64::from(*d))))
         }
         (ExprValue::Timestamp(t), OrderKind::SignedInt) => Ok(Some(ScalarKeyRef::SignedInt(*t))),
+        (ExprValue::TimestampTz(t), OrderKind::SignedInt) => Ok(Some(ScalarKeyRef::SignedInt(*t))),
         (ExprValue::Time(t), OrderKind::SignedInt) => Ok(Some(ScalarKeyRef::SignedInt(*t))),
         // jsonb はソートキーを呼び出し元が先に作って借用させる（[`expr_value_to_jsonb_key`]）。
         // ここへ到達するのは配線不備のみ。
@@ -497,5 +589,89 @@ pub(crate) fn expr_value_to_jsonb_key(
         ExprValue::Null => Ok(None),
         ExprValue::Json(text) => crate::sql::udf_call::jsonb_sort_key_for_eval(text).map(Some),
         _ => Err(scan_bug("expression order key value/kind mismatch")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collation::Collation;
+
+    /// TABLE-28・Issue #2190: バイト列順の照合は従来どおり `Bytes`（借用）、ICU は `Collated`。
+    #[test]
+    fn collated_text_key_variant_follows_collation() {
+        assert!(matches!(
+            collated_text_key(Collation::C, b"a"),
+            ScalarKeyRef::Bytes(b"a")
+        ));
+        assert!(matches!(
+            collated_text_key(Collation::Posix, b"a"),
+            ScalarKeyRef::Bytes(b"a")
+        ));
+        assert!(matches!(
+            collated_text_key(Collation::UndIcu, b"a"),
+            ScalarKeyRef::Collated {
+                collation: Collation::UndIcu,
+                text: b"a"
+            }
+        ));
+    }
+
+    /// ICU の比較器で並び、所有化・借用化を往復しても比較結果が変わらない。同じ ICU 照合
+    /// どうしで `Equal` に潰れない（バイト列順の二次比較）。
+    #[test]
+    fn collated_values_compare_with_collation_and_round_trip() {
+        let c = Collation::UndIcu;
+        let key = |s: &'static str| collated_text_key(c, s.as_bytes());
+        // ICU では "a" < "B"（バイト列順では "B" < "a"）。
+        assert_eq!(compare_key_refs(&key("a"), &key("B")), Ordering::Less);
+        assert_eq!(compare_key_refs(&key("B"), &key("a")), Ordering::Greater);
+        assert_eq!(compare_key_refs(&key("a"), &key("a")), Ordering::Equal);
+        // ICU 上は等しい NFC／NFD でも全順序（Equal に潰れない）。
+        assert_ne!(
+            compare_key_refs(&key("\u{e9}"), &key("e\u{301}")),
+            Ordering::Equal
+        );
+        let owned = scalar_key_ref_to_owned(key("a")).expect("owned");
+        assert!(matches!(&owned, OrderValue::Collated { text, .. } if text == b"a"));
+        assert_eq!(
+            compare_ref_and_owned_values(&key("B"), &owned),
+            Ordering::Greater
+        );
+        assert_eq!(compare_order_values(&owned, &owned), Ordering::Equal);
+        assert_eq!(
+            compare_key_refs(&owned.as_key_ref(), &key("a")),
+            Ordering::Equal
+        );
+    }
+
+    /// 照合の異なる値の組・`Bytes` と `Collated` の組は、同じキーでは構築されない不変条件に
+    /// 反する状態（安全側の `Equal`）。ここで固定して、混在が黙って順序を作らないことを示す。
+    #[test]
+    fn mixed_variants_never_define_an_order() {
+        let a = ScalarKeyRef::Collated {
+            collation: Collation::UndIcu,
+            text: b"a",
+        };
+        let b = ScalarKeyRef::Collated {
+            collation: Collation::JaIcu,
+            text: b"b",
+        };
+        assert_eq!(compare_key_refs(&a, &b), Ordering::Equal);
+        assert_eq!(
+            compare_key_refs(&a, &ScalarKeyRef::Bytes(b"b")),
+            Ordering::Equal
+        );
+    }
+
+    /// グループキーの出力復元: 照合付きの TEXT は元テキストのままセルへ戻る。
+    #[test]
+    fn collated_group_key_restores_text_cell() {
+        let v = OrderValue::Collated {
+            collation: Collation::UndIcu,
+            text: "あ".as_bytes().to_vec(),
+        };
+        let cell = order_value_to_cell(&v, Some(&ColumnType::Text)).expect("cell");
+        assert!(matches!(cell, crate::sql::exec::Cell::Text(s) if s == "あ"));
     }
 }

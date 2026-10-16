@@ -65,6 +65,7 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "TIME",
     "TIMETZ",
     "TIMESTAMPTZ",
+    "INTERVAL",
     "BYTEA",
     "JSON",
     "JSONB",
@@ -216,6 +217,39 @@ fn is_where_group_operator_token(token: &Token) -> bool {
             | Token::Punct('*')
             | Token::Punct('/')
     ) || is_json_operator_token(token)
+}
+
+/// `TIMESTAMPTZ '<literal>'` を AST の値へ解析する（Issue #1576）。構文段はセッション TimeZone を
+/// 知らないため、ゾーン指定（`Z`・数値 offset・IANA 名）を持つ入力は UTC マイクロ秒へ解決し
+/// （`session_local = false`）、持たない入力は壁時計のまま保持する（`true`。束縛時にセッション TZ で
+/// UTC へ確定する）。ゾーン指定の有無は、既定 TZ を 2 通り（UTC・+01）にして結果が一致するかで判定する。
+/// エラー文言にリテラル本文は含めない。
+pub(crate) fn parse_timestamptz_expr_literal(literal: &str) -> Result<Expr, SqlSurfaceError> {
+    use crate::datetime::{SessionTimeZone, TimestampTzLiteralError};
+    let utc_tz = SessionTimeZone::utc();
+    let micros = match crate::datetime::parse_timestamptz(literal, &utc_tz) {
+        Ok(m) => m,
+        Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Format(detail))) => {
+            return Err(SqlSurfaceError::invalid_datetime_format(detail))
+        }
+        Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Overflow(detail))) => {
+            return Err(SqlSurfaceError::datetime_field_overflow(detail))
+        }
+        Err(TimestampTzLiteralError::UnknownTimeZone) => {
+            return Err(SqlSurfaceError::InvalidParameterValue {
+                detail: crate::datetime::UNRECOGNIZED_TIME_ZONE_DETAIL,
+            })
+        }
+    };
+    // POSIX 解釈で `-1` は UTC+01。UTC と +01 で結果が変わる入力だけがゾーン無し。
+    let session_local = match SessionTimeZone::resolve_zone_argument("-1") {
+        Ok(plus_one) => crate::datetime::parse_timestamptz(literal, &plus_one) != Ok(micros),
+        Err(_) => true,
+    };
+    Ok(Expr::TimestampTzLiteral {
+        micros,
+        session_local,
+    })
 }
 
 /// jsonb 演算子のトークン（パス取得 `-> ->> #> #>>`・包含 `@> <@`・存在 `? ?| ?&`・jsonpath `@? @@`。
@@ -522,6 +556,11 @@ pub enum SqlSurfaceError {
     /// ポインタ）。`param` は 1 始まりの `$n` 番号で、エラー文言には番号だけを含める
     /// （値・表の存在情報は含めない）。
     IndeterminateDatatype { param: u16 },
+    /// 明示的な `COLLATE` 同士の食い違い（`42P21`。Issue #2190・TABLE-28）。固定文言のみ。
+    CollationMismatch,
+    /// 暗黙の照合の衝突を照合が必要な演算が消費した（`42P22`。Issue #2190・TABLE-28）。
+    /// 固定文言のみ。
+    IndeterminateCollation,
     /// NULL を許さない引数への NULL（`22004`。Issue #1599。`jsonb_build_object` のキー）。
     NullValueNotAllowed { detail: &'static str },
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
@@ -547,6 +586,9 @@ pub enum SqlSurfaceError {
     /// TABLE-13・ERR-6、Issue #1187）。`22007`
     /// （[`crate::error_format::ErrorClass::InvalidDatetimeFormat`]）。
     InvalidDatetimeFormat { detail: String },
+    /// `INTERVAL` リテラルのフィールド値が範囲外（TABLE-34・Issue #1579）。`22015`
+    /// （[`crate::error_format::ErrorClass::IntervalFieldOverflow`]）。
+    IntervalFieldOverflow { detail: String },
     /// 構文上受理された値が、宣言済み型の表現として不正（TABLE-14・TASK-198、
     /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）に
     /// 加え、UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）の厳密文法違反
@@ -949,6 +991,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `sql::parser::bind_datetime_literal`（TABLE-34・Issue #1579）が
+    /// `INTERVAL` リテラルのフィールド値の範囲外を報告するために使う。
+    pub(crate) fn interval_field_overflow(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::IntervalFieldOverflow {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::parser::bind_enum_literal`（Issue #890）が ENUM 列の
     /// 語彙外ラベルを報告するために使う。エラーメッセージには語彙の一覧を
     /// 含めない（型名とクライアント自身の入力値のみ。security.md P0）。
@@ -1061,9 +1111,12 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
             SqlSurfaceError::IndeterminateDatatype { .. } => ErrorClass::IndeterminateDatatype,
+            SqlSurfaceError::CollationMismatch => ErrorClass::CollationMismatch,
+            SqlSurfaceError::IndeterminateCollation => ErrorClass::IndeterminateCollation,
             SqlSurfaceError::NullValueNotAllowed { .. } => ErrorClass::NullValueNotAllowed,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidDatetimeFormat { .. } => ErrorClass::InvalidDatetimeFormat,
+            SqlSurfaceError::IntervalFieldOverflow { .. } => ErrorClass::IntervalFieldOverflow,
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
                 ErrorClass::InvalidTextRepresentation
             }
@@ -1173,11 +1226,20 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::IndeterminateDatatype { param } => {
                 write!(f, "could not determine data type of parameter ${param}")
             }
+            SqlSurfaceError::CollationMismatch => {
+                f.write_str("collation mismatch between explicit collations")
+            }
+            SqlSurfaceError::IndeterminateCollation => {
+                f.write_str("could not determine which collation to use for the comparison")
+            }
             SqlSurfaceError::DatetimeFieldOverflow { detail } => {
                 write!(f, "datetime field overflow: {detail}")
             }
             SqlSurfaceError::InvalidDatetimeFormat { detail } => {
                 write!(f, "invalid datetime format: {detail}")
+            }
+            SqlSurfaceError::IntervalFieldOverflow { detail } => {
+                write!(f, "interval field overflow: {detail}")
             }
             SqlSurfaceError::InvalidTextRepresentation { detail } => {
                 write!(f, "invalid text representation: {detail}")
@@ -1868,6 +1930,16 @@ pub enum Statement {
     SetSearchMode {
         value: String,
     },
+    /// `SET [SESSION] TIME ZONE ...`／`SET [SESSION] timezone {TO|=} ...`（TABLE-33・
+    /// Issue #1575）。値の意味論的妥当性検証は `core.rs` の実行腕が
+    /// `SessionTimeZone::parse_setting` で行う（本モジュールは構造の受理までを担う）。
+    /// **#1575 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    SetTimeZone {
+        value: TimeZoneSetting,
+    },
+    /// `SHOW timezone`／`SHOW TIME ZONE`／`SHOW "TimeZone"`（TABLE-33・Issue #1575）。
+    /// 列名 `TimeZone` の text 1 行を返す（`core.rs` の実行腕）。
+    ShowTimeZone,
     /// `CREATE FUNCTION <name>(<param>[, <param>...]) AS <expr>`（TASK-79・SQL-9）。
     /// カタログ照会を必要としない（セッションのみに影響するため FROM テーブルの
     /// 存在確認は行わない）。パラメータ名重複・登録済み名との衝突・列参照の禁止
@@ -2978,6 +3050,11 @@ pub enum InsertLiteral {
     /// INSERT／NoSQL）は受理せず拒否する（fail-closed）。合成式（`now() + …`）は
     /// この variant にならず、従来どおり定数式経路で拒否される。
     CurrentTime(crate::catalog::TimeDefault),
+    /// 定数式が TIMESTAMPTZ に評価された結果（UTC マイクロ秒。Issue #1576 レビュー指摘）。
+    /// 代入先の列型が決まる束縛段で変換する（TIMESTAMPTZ 列はそのまま、TIMESTAMP・DATE 列は
+    /// セッション TZ の局所値へ。`sql::parser::bind_tstz_literal`）。文字列化して列側 parse へ
+    /// 渡すと TIMESTAMP・DATE 列が offset を拒否するため、型を保持する。
+    TimestampTz(i64),
 }
 
 /// `ON CONFLICT (id) DO UPDATE SET <col> = <value>` の SET 右辺（SQL-20・
@@ -4111,7 +4188,11 @@ impl<'a> Parser<'a> {
                 // TABLE-28・Issue #1609: 識別子の直後の `COLLATE` も式項目の継続。
                 let next_is_op = self.tokens.get(self.pos + 1).is_some_and(|t| {
                     matches!(t, Token::Punct('+' | '-' | '*' | '/')) || is_json_operator_token(t)
-                }) || self.peek_ident_matches_at(1, "COLLATE");
+                }) || self.peek_ident_matches_at(1, "COLLATE")
+                    || (self.peek_ident_matches_at(1, "AT")
+                        && (self.peek_ident_matches_at(2, "LOCAL")
+                            || (self.peek_ident_matches_at(2, "TIME")
+                                && self.peek_ident_matches_at(3, "ZONE"))));
                 if starts_case || self.is_value_function_keyword_at(self.pos) {
                     // 括弧なし SQL 値関数（SQL-37・Issue #1586）は列名ではなく式項目。
                     self.parse_projection_infix(0)?
@@ -4126,6 +4207,7 @@ impl<'a> Parser<'a> {
                     self.allow_unary_minus = prev;
                     let head = head?;
                     if self.peek_ident_matches("COLLATE")
+                        || self.peek_at_time_zone()
                         || self.peek().is_some_and(|t| {
                             matches!(t, Token::Punct('+' | '-' | '*' | '/'))
                                 || is_json_operator_token(t)
@@ -5983,7 +6065,8 @@ impl<'a> Parser<'a> {
     fn parse_mul_rest(&mut self, lhs: Expr, depth: usize) -> Result<Expr, SqlSurfaceError> {
         // 先頭の関数呼び出しを先に読み終えた投影項目から継続する場合も、後置 `COLLATE` を
         // 一次式の直後として受理する（`parse_primary_expr` 経由では適用済みで冪等）。
-        let mut lhs = self.parse_collate_postfix(lhs)?;
+        let lhs = self.parse_collate_postfix(lhs)?;
+        let mut lhs = self.parse_at_time_zone_postfix(lhs, depth)?;
         loop {
             let op = match self.peek() {
                 Some(Token::Punct('*')) => BinOp::Mul,
@@ -6008,7 +6091,69 @@ impl<'a> Parser<'a> {
     /// `WHEN`（`sql::allowlist` 内の他の文脈的キーワード）と同じ判断）。
     fn parse_primary_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         let primary = self.parse_primary_expr_inner(depth)?;
-        self.parse_collate_postfix(primary)
+        let primary = self.parse_collate_postfix(primary)?;
+        self.parse_at_time_zone_postfix(primary, depth)
+    }
+
+    /// `TIMESTAMP` の直後が `WITH TIME ZONE <文字列>`／`WITHOUT TIME ZONE <文字列>` なら、
+    /// 文字列リテラルの直前までのトークン数と「ゾーン付きか」を返す（Issue #1576。先読みのみ）。
+    fn timestamp_with_zone_literal_len(&self) -> Option<(usize, bool)> {
+        let with_zone = if self.peek_ident_matches_at(1, "WITH") {
+            true
+        } else if self.peek_ident_matches_at(1, "WITHOUT") {
+            false
+        } else {
+            return None;
+        };
+        if self.peek_ident_matches_at(2, "TIME")
+            && self.peek_ident_matches_at(3, "ZONE")
+            && matches!(self.tokens.get(self.pos + 4), Some(Token::StringLiteral(_)))
+        {
+            Some((4, with_zone))
+        } else {
+            None
+        }
+    }
+
+    /// 現在位置が `AT TIME ZONE`／`AT LOCAL` の開始か（先読みのみ。Issue #1576）。
+    fn peek_at_time_zone(&self) -> bool {
+        self.peek_ident_matches("AT")
+            && ((self.peek_ident_matches_at(1, "TIME") && self.peek_ident_matches_at(2, "ZONE"))
+                || self.peek_ident_matches_at(1, "LOCAL"))
+    }
+
+    /// 後置 `AT TIME ZONE <zone>`／`AT LOCAL`（Issue #1576・TABLE-33）。PG と同じく `*` `/` `+` `-`
+    /// より強く `COLLATE` より弱く結合し、左結合。`timezone(<zone>, <expr>)`／`timezone(<expr>)`
+    /// の関数呼び出しへ脱糖する（PG も同じ関数の構文糖）。zone は一次式（と後置 `COLLATE`）まで。
+    /// INTERVAL の zone は未実装のため束縛段で拒否される。
+    fn parse_at_time_zone_postfix(
+        &mut self,
+        mut lhs: Expr,
+        depth: usize,
+    ) -> Result<Expr, SqlSurfaceError> {
+        while self.peek_at_time_zone() {
+            if self.peek_ident_matches_at(1, "LOCAL") {
+                self.advance();
+                self.advance();
+                self.consume_expr_node()?;
+                lhs = Expr::Call {
+                    name: "timezone".to_string(),
+                    args: vec![lhs],
+                };
+            } else {
+                self.advance();
+                self.advance();
+                self.advance();
+                let zone = self.parse_primary_expr_inner(depth + 1)?;
+                let zone = self.parse_collate_postfix(zone)?;
+                self.consume_expr_node()?;
+                lhs = Expr::Call {
+                    name: "timezone".to_string(),
+                    args: vec![zone, lhs],
+                };
+            }
+        }
+        Ok(lhs)
     }
 
     /// [`Self::parse_primary_expr`] の本体（後置 `COLLATE` を除く一次式）。
@@ -6117,6 +6262,117 @@ impl<'a> Parser<'a> {
             // AST には解析済みの内部表現を保持する（§2-8。CHECK・ビューの
             // render→再パース往復での区切り文字表記揺れを避けるため、生文字列は
             // 保持しない）。
+            // `TIMESTAMPTZ '<literal>'`／`TIMESTAMP WITH TIME ZONE '<literal>'`／
+            // `TIMESTAMP WITHOUT TIME ZONE '<literal>'`（Issue #1576・TABLE-33）。列名 `timestamptz`
+            // は直後が文字列リテラルのときだけ型付きリテラルとして扱うため壊れない。
+            Some(Token::Ident(name))
+                if (name.eq_ignore_ascii_case("TIMESTAMPTZ")
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::StringLiteral(_))))
+                    || (name.eq_ignore_ascii_case("TIMESTAMP")
+                        && self.timestamp_with_zone_literal_len().is_some()) =>
+            {
+                let (consumed, with_zone) = if name.eq_ignore_ascii_case("TIMESTAMPTZ") {
+                    (1, true)
+                } else {
+                    self.timestamp_with_zone_literal_len()
+                        .ok_or_else(|| SqlSurfaceError::unsupported("expected TIMESTAMP literal"))?
+                };
+                for _ in 0..consumed {
+                    self.advance();
+                }
+                let literal = match self.advance() {
+                    Some(Token::StringLiteral(s)) => s.clone(),
+                    other => {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "expected string literal after TIMESTAMP, got {other:?}"
+                        )))
+                    }
+                };
+                self.consume_expr_node()?;
+                if with_zone {
+                    parse_timestamptz_expr_literal(&literal)
+                } else {
+                    match crate::datetime::parse_timestamp(&literal) {
+                        Ok(micros) => Ok(Expr::TimestampLiteral(micros)),
+                        Err(DateTimeLiteralError::Format(detail)) => {
+                            Err(SqlSurfaceError::invalid_datetime_format(detail))
+                        }
+                        Err(DateTimeLiteralError::Overflow(detail)) => {
+                            Err(SqlSurfaceError::datetime_field_overflow(detail))
+                        }
+                    }
+                }
+            }
+            // `INTERVAL '<literal>'`（型付きリテラル。TABLE-34・Issue #1581）。列名 `interval` は
+            // 直後が文字列リテラルのときだけ型付きリテラルとして扱うため壊れない。解析は
+            // `crate::datetime::parse_interval`（長さ上限・ASCII 限定・フィールド数上限あり）に
+            // 限り、AST には解析済みの三要素だけを保持する。フィールド修飾子
+            // （`INTERVAL '1' DAY` 等）と精度指定（`INTERVAL(p) '…'`）は意味論（単位の解釈・
+            // 丸め）が未対応のため、別名として黙って解釈せず `0A000` で拒否する。
+            Some(Token::Ident(name))
+                if name.eq_ignore_ascii_case("INTERVAL")
+                    && !self.quoted_null.contains(&self.pos)
+                    && matches!(
+                        (
+                            self.tokens.get(self.pos + 1),
+                            self.tokens.get(self.pos + 2),
+                            self.tokens.get(self.pos + 3),
+                            self.tokens.get(self.pos + 4),
+                        ),
+                        (Some(Token::StringLiteral(_)), _, _, _)
+                            | (
+                                Some(Token::Punct('(')),
+                                Some(Token::Number(_)),
+                                Some(Token::Punct(')')),
+                                Some(Token::StringLiteral(_)),
+                            )
+                    ) =>
+            {
+                if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('('))) {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "INTERVAL precision is not supported yet".to_string(),
+                    });
+                }
+                if let Some(Token::Ident(q)) = self.tokens.get(self.pos + 2) {
+                    if !self.quoted_null.contains(&(self.pos + 2))
+                        && ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"]
+                            .iter()
+                            .any(|f| q.eq_ignore_ascii_case(f))
+                    {
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "INTERVAL field qualifiers are not supported yet".to_string(),
+                        });
+                    }
+                }
+                self.advance();
+                let literal = match self.advance() {
+                    Some(Token::StringLiteral(s)) => s.clone(),
+                    other => {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "expected string literal after INTERVAL, got {other:?}"
+                        )))
+                    }
+                };
+                self.consume_expr_node()?;
+                use crate::datetime::IntervalLiteralError;
+                match crate::datetime::parse_interval(&literal) {
+                    Ok(v) => Ok(Expr::IntervalLiteral(v)),
+                    Err(IntervalLiteralError::Format(detail)) => {
+                        Err(SqlSurfaceError::invalid_datetime_format(detail))
+                    }
+                    Err(e @ IntervalLiteralError::FieldOverflow) => {
+                        Err(SqlSurfaceError::interval_field_overflow(e.to_string()))
+                    }
+                    Err(e @ IntervalLiteralError::OutOfRange) => {
+                        Err(SqlSurfaceError::datetime_field_overflow(e.to_string()))
+                    }
+                    Err(IntervalLiteralError::Infinity) => {
+                        Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "infinite interval values are not supported yet".to_string(),
+                        })
+                    }
+                }
+            }
             Some(Token::Ident(name))
                 if (name.eq_ignore_ascii_case("DATE")
                     || name.eq_ignore_ascii_case("TIMESTAMP")
@@ -7048,7 +7304,9 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
-            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/')))
+                && !self.peek_at_time_zone()
+            {
                 return Ok(lit);
             }
             self.pos = start;
@@ -7096,7 +7354,9 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
-            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/')))
+                && !self.peek_at_time_zone()
+            {
                 return Ok(SetValue::Literal(lit));
             }
             self.pos = start;
@@ -8940,11 +9200,11 @@ impl<'a> Parser<'a> {
     /// （TABLE-28。Issue #1609）。名前は `Token::Ident` のみ（文字列リテラル・数値・修飾名は
     /// `42601`）、未知の名前は `42704`。解決は固定リストとの完全一致だけでカタログを参照
     /// しないため、DDL 権限ゲートより前（構文段）で返してもテーブルの存在オラクルにならない。
-    /// 引用識別子はハイフンを含められない（字句段の制約）ため、`"und-x-icu"` 等の ICU 名は
-    /// ICU 照合の導入（#2190）までは字句段で `42601` になる。
+    /// ハイフンを含む ICU 名（`"und-x-icu"`）は字句段が専用トークン
+    /// （[`Token::QuotedCollationName`]）にし、この位置でだけ受理する（Issue #2190）。
     fn parse_collation_name(&mut self) -> Result<crate::collation::Collation, SqlSurfaceError> {
         let name = match self.advance() {
-            Some(Token::Ident(name)) => name.clone(),
+            Some(Token::Ident(name) | Token::QuotedCollationName(name)) => name.clone(),
             other => {
                 return Err(SqlSurfaceError::unsupported(format!(
                     "expected collation name, got {other:?}"
@@ -9964,7 +10224,7 @@ pub(crate) fn validate_create_view_tokens(
     })
 }
 
-/// `CREATE INDEX <name> ON <table> [USING hnsw] (<col>[, ...])` の許可形状構造
+/// `CREATE INDEX <name> ON <table> [USING hnsw] (<col> [COLLATE <name>][, ...])` の許可形状構造
 /// 検証結果（TASK-206・INDEX-7・SQL-23、Issue #908）。[`ValidatedDropTable`] と
 /// 同じくカタログ照会を一切行わない（列の存在・型整合・名前衝突・対象の種別は
 /// `sql::ddl::execute_create_index` → `catalog::Storage::create_index` が単一の
@@ -9977,6 +10237,9 @@ pub struct ValidatedCreateIndex {
     /// 拒否済み）。
     pub(crate) hnsw: bool,
     pub(crate) columns: Vec<String>,
+    /// `columns` と同じ長さの列ごとの `COLLATE`（`None` は照合指定なし。Issue #2191・
+    /// TABLE-28）。名前の解決は固定の許可リストとの完全一致だけで、カタログを参照しない。
+    pub(crate) collations: Vec<Option<crate::collation::Collation>>,
 }
 
 impl ValidatedCreateIndex {
@@ -9994,6 +10257,11 @@ impl ValidatedCreateIndex {
 
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    /// `columns` と同じ長さの列ごとの照合指定（`None` は指定なし）。
+    pub fn column_collations(&self) -> &[Option<crate::collation::Collation>] {
+        &self.collations
     }
 }
 
@@ -10057,13 +10325,17 @@ pub(crate) fn validate_create_index_tokens(
         false
     };
     p.expect_punct('(')?;
-    let mut columns = vec![parse_index_column(&mut p)?];
+    let (first, first_collation) = parse_index_column(&mut p)?;
+    let mut columns = vec![first];
+    let mut collations = vec![first_collation];
     while matches!(p.peek(), Some(Token::Punct(','))) {
         p.advance();
         if columns.len() >= MAX_COLUMN_COUNT {
             return Err(SqlSurfaceError::payload_too_large("too many index columns"));
         }
-        columns.push(parse_index_column(&mut p)?);
+        let (column, collation) = parse_index_column(&mut p)?;
+        columns.push(column);
+        collations.push(collation);
     }
     p.expect_punct(')')?;
     if hnsw && columns.len() != 1 {
@@ -10092,12 +10364,17 @@ pub(crate) fn validate_create_index_tokens(
         table,
         hnsw,
         columns,
+        collations,
     })
 }
 
-/// [`validate_create_index_tokens`] の列リスト 1 要素。裸の識別子のみを受理する
-/// （式・関数呼び出し・括弧・リテラルは `0A000` で拒否する）。
-fn parse_index_column(p: &mut Parser<'_>) -> Result<String, SqlSurfaceError> {
+/// [`validate_create_index_tokens`] の列リスト 1 要素。裸の識別子と、その直後の任意の
+/// `COLLATE <name>`（Issue #2191・TABLE-28）のみを受理する（式・関数呼び出し・括弧・
+/// リテラルは `0A000`、2 回目の `COLLATE` は `42601`、未知の照合名は `42704`）。照合を
+/// 持てない型への指定の拒否（`42804`）は型を知るカタログ段（`Storage::create_index`）が担う。
+fn parse_index_column(
+    p: &mut Parser<'_>,
+) -> Result<(String, Option<crate::collation::Collation>), SqlSurfaceError> {
     if !matches!(p.peek(), Some(Token::Ident(_))) {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "index columns must be plain identifiers".to_string(),
@@ -10109,7 +10386,13 @@ fn parse_index_column(p: &mut Parser<'_>) -> Result<String, SqlSurfaceError> {
             detail: "expression indexes are not supported".to_string(),
         });
     }
-    Ok(name)
+    let collation = if p.peek_ident_matches("COLLATE") {
+        p.advance();
+        Some(p.parse_collation_name()?)
+    } else {
+        None
+    };
+    Ok((name, collation))
 }
 
 /// [`ValidatedDropIndex`] の構造検証本体。`IF EXISTS`・`CASCADE`・複数名の同時
@@ -11965,7 +12248,9 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
-        | Expr::TimeLiteral(_) => false,
+        | Expr::IntervalLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. } => false,
         // 括弧なし値関数（Issue #1586）は関数呼び出しと同様に従来形では書けない式。
         Expr::ValueFunction { .. } => true,
     }
@@ -12232,6 +12517,101 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
             offset: 0,
         }),
     })
+}
+
+/// `SET TIME ZONE`／`SET timezone` の右辺（TABLE-33・Issue #1575）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimeZoneSetting {
+    /// `DEFAULT`（および `SET TIME ZONE LOCAL`）。セッションの reset 値へ戻す。
+    Default,
+    /// 文字列リテラル・識別子・符号付き数値の生テキスト（未検証。`22023` の判定は実行腕）。
+    Value(String),
+}
+
+/// 文が `SHOW timezone`／`SHOW TIME ZONE`／`SHOW "TimeZone"`（末尾 `;` 可）か（#1575）。
+/// 他の `SHOW`（分割実行 DML の制御）は従来どおり別経路が解析するため、厳密一致のみ真にする。
+pub(crate) fn is_show_time_zone(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    if p.expect_ident_matching("SHOW").is_err() {
+        return false;
+    }
+    let ok = if p.peek_ident_matches("TIME") {
+        p.advance();
+        p.expect_ident_matching("ZONE").is_ok()
+    } else {
+        p.expect_ident_matching("TIMEZONE").is_ok()
+    };
+    ok && p.expect_end_of_statement().is_ok()
+}
+
+/// `SET` 文の 2 語目が TimeZone 系（`TIME`・`TIMEZONE`・`SESSION`・`LOCAL`）か（#1575）。
+/// 真のとき [`parse_set_time_zone`] が解析し、偽のとき従来の [`parse_set_search_mode`]
+/// （挙動・エラー文言を変えない）へ進む。
+fn is_set_time_zone_head(tokens: &[Token]) -> bool {
+    matches!(
+        tokens.get(1),
+        Some(Token::Ident(w)) if ["TIME", "TIMEZONE", "SESSION", "LOCAL"]
+            .iter()
+            .any(|k| w.eq_ignore_ascii_case(k))
+    )
+}
+
+/// `SET [SESSION] TIME ZONE <値>` と `SET [SESSION] timezone {TO|=} <値>` の許可形状
+/// （TABLE-33・Issue #1575）。`SET LOCAL ...`・`SET TIME ZONE INTERVAL ...` は 0A000。
+/// 値は文字列リテラル・識別子・符号付き数値・`DEFAULT`（`TIME ZONE` 形は `LOCAL` も）。
+fn parse_set_time_zone(tokens: &[Token]) -> Result<TimeZoneSetting, SqlSurfaceError> {
+    let unsupported = |detail: &str| SqlSurfaceError::FeatureNotSupported {
+        detail: detail.to_string(),
+    };
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SET")?;
+    if p.peek_ident_matches("LOCAL") {
+        return Err(unsupported("SET LOCAL is not supported"));
+    }
+    if p.peek_ident_matches("SESSION") {
+        p.advance();
+    }
+    let time_zone_form = p.peek_ident_matches("TIME");
+    if time_zone_form {
+        p.advance();
+        p.expect_ident_matching("ZONE")?;
+    } else {
+        let name = p.expect_ident()?;
+        if !name.eq_ignore_ascii_case("timezone") {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "unsupported SET variable: {name}"
+            )));
+        }
+        if p.peek_ident_matches("TO") {
+            p.advance();
+        } else {
+            p.expect_punct('=')?;
+        }
+    }
+    let value = match p.advance() {
+        Some(Token::StringLiteral(s)) => TimeZoneSetting::Value(s.clone()),
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DEFAULT") => TimeZoneSetting::Default,
+        Some(Token::Ident(w)) if time_zone_form && w.eq_ignore_ascii_case("LOCAL") => {
+            TimeZoneSetting::Default
+        }
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("INTERVAL") => {
+            return Err(unsupported("SET TIME ZONE INTERVAL is not supported"));
+        }
+        Some(Token::Ident(w)) => TimeZoneSetting::Value(w.clone()),
+        Some(Token::Number(n)) => TimeZoneSetting::Value(n.clone()),
+        Some(Token::Punct(sign @ ('-' | '+'))) => {
+            let sign = *sign;
+            let n = p.expect_number()?;
+            TimeZoneSetting::Value(format!("{sign}{n}"))
+        }
+        other => {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "expected time zone value, got {other:?}"
+            )));
+        }
+    };
+    p.expect_end_of_statement()?;
+    Ok(value)
 }
 
 /// `SET search_mode = '<literal>'`（TASK-161・SQL-12）の許可形状。規範形は
@@ -12825,6 +13205,10 @@ fn validate_sql_tokens_impl(
                 }
             }
         }
+        _ if is_set_statement && is_set_time_zone_head(tokens) => {
+            let value = parse_set_time_zone(tokens)?;
+            Ok(Statement::SetTimeZone { value })
+        }
         _ if is_set_statement => {
             let value = parse_set_search_mode(tokens)?;
             Ok(Statement::SetSearchMode { value })
@@ -12892,6 +13276,8 @@ fn validate_sql_tokens_impl(
                 // panic ではなくエラー応答にする。ライブラリコードは panic
                 // させない方針。`.claude/rules/coding-rust.md`）。
                 Statement::SetSearchMode { .. }
+                | Statement::SetTimeZone { .. }
+                | Statement::ShowTimeZone
                 | Statement::CreateFunction { .. }
                 | Statement::Explain(_)
                 // Issue #929（SQL-29 (c)）: `validate_select_statement` は集合演算
@@ -13128,8 +13514,13 @@ pub fn validate_statement(
 ) -> Result<ValidatedStatement, SqlSurfaceError> {
     match validate_sql(sql, lookup)? {
         Statement::Select(stmt) => Ok(stmt),
-        Statement::SetSearchMode { .. } => Err(SqlSurfaceError::unsupported(
-            "SET is not a query statement (use a session-aware entry point)",
+        Statement::SetSearchMode { .. } | Statement::SetTimeZone { .. } => {
+            Err(SqlSurfaceError::unsupported(
+                "SET is not a query statement (use a session-aware entry point)",
+            ))
+        }
+        Statement::ShowTimeZone => Err(SqlSurfaceError::unsupported(
+            "SHOW is not a query statement (use a session-aware entry point)",
         )),
         Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(
             "CREATE FUNCTION is not a query statement (use a session-aware entry point)",
@@ -14262,6 +14653,42 @@ pub(crate) fn validate_update_form_tokens(
 
 #[cfg(test)]
 mod tests {
+    /// `CREATE INDEX` の列ごとの `COLLATE`（TABLE-28、Issue #2191）。名前は構文段で許可リストに
+    /// 解決し、二重指定は `42601`、未知の名前は `42704`、式索引は `0A000`。
+    #[test]
+    fn create_index_column_collate_parses_and_classifies_errors() {
+        use super::*;
+        use crate::collation::Collation;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            validate_create_index_tokens(&tokens)
+        };
+        let ok = parse("CREATE INDEX i ON t (a COLLATE \"und-x-icu\", b, c COLLATE \"C\")")
+            .expect("accepted");
+        assert_eq!(ok.columns(), ["a", "b", "c"]);
+        assert_eq!(
+            ok.column_collations(),
+            [Some(Collation::UndIcu), None, Some(Collation::C)]
+        );
+        let plain = parse("CREATE INDEX i ON t (a, b)").expect("accepted");
+        assert_eq!(plain.column_collations(), [None, None]);
+        // 型の判定はカタログ段のため、構文段では HNSW でも通す。
+        assert!(parse("CREATE INDEX i ON t USING hnsw (v COLLATE \"C\")").is_ok());
+        for (sql, code) in [
+            ("CREATE INDEX i ON t (a COLLATE \"nope\")", "42704"),
+            (
+                "CREATE INDEX i ON t (a COLLATE \"C\" COLLATE \"C\")",
+                "42601",
+            ),
+            ("CREATE INDEX i ON t (a COLLATE)", "42601"),
+            ("CREATE INDEX i ON t (a COLLATE 'C')", "42601"),
+            ("CREATE INDEX i ON t (lower(a) COLLATE \"C\")", "0A000"),
+            ("CREATE INDEX i ON t (a COLLATE \"C\", a)", "42601"),
+        ] {
+            assert_eq!(parse(sql).expect_err(sql).wire_code(), code, "{sql}");
+        }
+    }
+
     #[test]
     fn const_select_top_level_aggregate_items_parse_shapes() {
         use super::*;
@@ -14367,7 +14794,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// 列型キーワード判定は型名エイリアスと未確定型を含む 30 語を大小無視で認識する
+    /// 列型キーワード判定は型名エイリアスと未確定型を含む 31 語を大小無視で認識する
     /// （Issue #1529・TABLE-29。Issue #1569 で `TIME`・`TIMETZ`、Issue #1574 で `TIMESTAMPTZ` を追加）。
     #[test]
     fn column_type_keyword_covers_aliases_case_insensitively() {
@@ -14375,7 +14802,7 @@ mod tests {
             assert!(is_column_type_keyword(kw), "{kw}");
             assert!(is_column_type_keyword(&kw.to_ascii_lowercase()), "{kw}");
         }
-        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 30);
+        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 31);
         for ok in ["Int4", "iNt8", "float4", "FLOAT8", "int", "int2", "varchar"] {
             assert!(is_column_type_keyword(ok), "{ok}");
         }

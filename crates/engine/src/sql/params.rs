@@ -831,6 +831,8 @@ pub enum DeclaredParamType {
     Numeric,
     Date,
     Timestamp,
+    TimestampTz,
+    Interval,
     Time,
     Bytea,
     Uuid,
@@ -855,6 +857,8 @@ impl DeclaredParamType {
             | DeclaredParamType::Numeric
             | DeclaredParamType::Date
             | DeclaredParamType::Timestamp
+            | DeclaredParamType::TimestampTz
+            | DeclaredParamType::Interval
             | DeclaredParamType::Time
             | DeclaredParamType::Bytea
             | DeclaredParamType::Uuid
@@ -879,6 +883,8 @@ impl DeclaredParamType {
             DeclaredParamType::Numeric => "numeric",
             DeclaredParamType::Date => "date",
             DeclaredParamType::Timestamp => "timestamp",
+            DeclaredParamType::TimestampTz => "timestamptz",
+            DeclaredParamType::Interval => "interval",
             DeclaredParamType::Time => "time",
             DeclaredParamType::Bytea => "bytea",
             DeclaredParamType::Uuid => "uuid",
@@ -905,10 +911,10 @@ impl DeclaredParamType {
 
 /// Bind 値（text 形式の正規テキスト）を宣言型として検証する（Issue #2436・WIRE-24
 /// ポインタ）。整数系は既存の整数文法＋型の値域（不正 `22P02`／範囲外 `22003`）、
-/// 浮動小数系は既存の浮動小数文法（`float4` は有限性も確認）、`bool` は
+/// 浮動小数系は既存の浮動小数文法（宣言幅での有限性も確認）、`bool` は
 /// [`parse_pg_bool`] で判定する。text 系と、`numeric`・日時・`bytea`・`uuid`・`json(b)`
 /// は追加検証をしない（単独で呼べる検証器を第 2 の文法として持たない方針。値は束縛後の
-/// 既存リテラル経路が列型に応じて検証する）。`float4` は f32 へ丸めた正規テキストを
+/// 既存リテラル経路が列型に応じて検証する）。浮動小数系は宣言幅へ丸めた正規テキストを
 /// `Some` で返す（呼び出し側が置換値に使う）。エラー文言は `$n` 番号と型名だけで値を含めない。
 pub(crate) fn validate_declared_value(
     n: u16,
@@ -947,25 +953,26 @@ pub(crate) fn validate_declared_value(
         }
         DeclaredParamType::Float4 | DeclaredParamType::Float8 => {
             let body = split_float(n, value)?;
-            if ty == DeclaredParamType::Float4 {
-                // 字句解析器の数値文法を通った本文が f32 で有限にならなければ範囲外。
-                // 有限なら f32 へ丸めた値を正規テキストにして返す（置換へ渡し、バイナリ形式
-                // （f32 復号済み）と text 形式で同じ値になるようにする）。
-                let parsed = body.parse::<f32>().ok().filter(|f| f.is_finite());
-                let Some(f) = parsed else {
-                    return Err(SqlSurfaceError::numeric_out_of_range(format!(
-                        "value for parameter ${n} is out of range for type {name}"
-                    )));
-                };
-                let sign = if value.starts_with('-') { "-" } else { "" };
-                // f32 を f64 へ拡張した値の Debug 表記（f64 への最短往復表記）にする。f32 の
-                // Debug 表記（`0.1`）では f64 として再解析した際に丸め済みの値を保持できず、
-                // DOUBLE 列への代入で値が変わるため。整数値でも小数点（`1.0`）、極小・極大値は
-                // 指数（`1e-40`）を残すので、再解析で整数リテラルへ型が変わらない。
-                let widened = f64::from(f);
-                return Ok(Some(format!("{sign}{widened:?}")));
+            // 字句解析器の数値文法を通った本文が宣言幅（float4 は f32、float8 は f64）で有限に
+            // ならなければ範囲外。NaN／Infinity は数値文法を通らず上の `split_float` が
+            // `22P02` にする（float4 と同じ既存契約）。
+            let parsed = if ty == DeclaredParamType::Float4 {
+                body.parse::<f32>().ok().map(f64::from)
+            } else {
+                body.parse::<f64>().ok()
             }
-            Ok(None)
+            .filter(|f| f.is_finite());
+            let Some(widened) = parsed else {
+                return Err(SqlSurfaceError::numeric_out_of_range(format!(
+                    "value for parameter ${n} is out of range for type {name}"
+                )));
+            };
+            let sign = if value.starts_with('-') { "-" } else { "" };
+            // 宣言幅へ丸めた値を f64 の Debug 表記（最短往復表記）にして返し、置換へ渡す。
+            // text 形式とバイナリ形式（復号済み）で同じ値になり、f32 は丸め済みの値を DOUBLE
+            // 列でも保持する。整数値でも小数点（`1.0`）、極小・極大値は指数（`1e-40`）を残すので、
+            // 再解析で整数リテラルへ型が変わらない（`$1 / $2` が整数除算にならない）。
+            Ok(Some(format!("{sign}{widened:?}")))
         }
         DeclaredParamType::Bool => {
             if parse_pg_bool(value).is_none() {
@@ -981,6 +988,8 @@ pub(crate) fn validate_declared_value(
         | DeclaredParamType::Numeric
         | DeclaredParamType::Date
         | DeclaredParamType::Timestamp
+        | DeclaredParamType::TimestampTz
+        | DeclaredParamType::Interval
         | DeclaredParamType::Time
         | DeclaredParamType::Bytea
         | DeclaredParamType::Uuid
@@ -1372,6 +1381,7 @@ pub(crate) fn decode_bind_values_nullable(
             Token::Ident(s)
             | Token::QuotedNull(s)
             | Token::QuotedBoolWord(s)
+            | Token::QuotedCollationName(s)
             | Token::StringLiteral(s)
             | Token::Number(s) => s.len(),
             Token::QualifiedIdent { qualifier, name } => {

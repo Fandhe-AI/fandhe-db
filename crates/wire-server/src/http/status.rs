@@ -79,11 +79,16 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::InvalidParameterValue
         // Issue #1546: `$n` の型を決められない（`42P18`）も入力起因の拒否として 400。
         | ErrorClass::IndeterminateDatatype
+        // Issue #2190: 照合の不一致（`42P21`）・照合を決められない（`42P22`）も入力起因で 400。
+        | ErrorClass::CollationMismatch
+        | ErrorClass::IndeterminateCollation
         // Issue #1599: `jsonb_build_object` の NULL キー（`22004`）も入力起因の拒否として 400。
         | ErrorClass::NullValueNotAllowed
         // Issue #2184: jsonpath 評価器の `2203x` 系は入力起因の拒否として 400（SQL 表層へは
         // `jsonb_path_*`〔#2185〕で配線済み。NoSQL 表層からは到達不能）。`22P05`（#2185）も同様。
         | ErrorClass::UntranslatableCharacter
+        // Issue #2443: numeric バイナリ受信の外部表現不正（`22P03`）も入力起因で 400。
+        | ErrorClass::InvalidBinaryRepresentation
         | ErrorClass::JsonSubscriptInvalid
         | ErrorClass::NonNumericJsonItem
         | ErrorClass::SingletonJsonItemRequired
@@ -94,6 +99,8 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::MissingOperationId
         | ErrorClass::DatetimeFieldOverflow
         | ErrorClass::InvalidDatetimeFormat
+        // Issue #1579: INTERVAL リテラルのフィールド値の範囲外（`22015`）も入力起因で 400。
+        | ErrorClass::IntervalFieldOverflow
         | ErrorClass::InvalidTextRepresentation
         // `DuplicateColumn`（`42701`。Issue #899）は `CREATE TABLE` の列リスト
         // 自体が不正という構文的な分類のため、他の 42xxx 系と同じ 400 とする。
@@ -169,7 +176,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 58] = [
+    const EXPECTED: [(ErrorClass, u16); 62] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -196,6 +203,7 @@ mod tests {
         (ErrorClass::OperationIdContentMismatch, 400),
         (ErrorClass::DatetimeFieldOverflow, 400),
         (ErrorClass::InvalidDatetimeFormat, 400),
+        (ErrorClass::IntervalFieldOverflow, 400),
         (ErrorClass::InvalidTextRepresentation, 400),
         (ErrorClass::LockNotAvailable, 503),
         (ErrorClass::InvalidTransactionState, 400),
@@ -219,6 +227,8 @@ mod tests {
         (ErrorClass::AmbiguousColumn, 400),
         (ErrorClass::InvalidParameterValue, 400),
         (ErrorClass::IndeterminateDatatype, 400),
+        (ErrorClass::CollationMismatch, 400),
+        (ErrorClass::IndeterminateCollation, 400),
         (ErrorClass::NullValueNotAllowed, 400),
         (ErrorClass::JsonSubscriptInvalid, 400),
         (ErrorClass::NonNumericJsonItem, 400),
@@ -228,6 +238,7 @@ mod tests {
         (ErrorClass::JsonNumberNotFound, 400),
         (ErrorClass::JsonObjectNotFound, 400),
         (ErrorClass::UntranslatableCharacter, 400),
+        (ErrorClass::InvalidBinaryRepresentation, 400),
     ];
 
     #[test]

@@ -367,3 +367,34 @@ fn float4_declared_value_is_kept_for_non_float_slots() {
         .expect("literal parse");
     assert_eq!(bound, expected);
 }
+
+/// float8 宣言の整数値 `1`・`2` は浮動小数リテラル（`1.0`・`2.0`）で置換され、`$1 / $2` が
+/// 整数除算にならない。NaN／Infinity は float4 と同じく `22P02`、f64 範囲外は `22003`。
+#[test]
+fn float8_canonical_text_keeps_float_literal_type() {
+    let (core, _g) = setup("decl-f8-float-literal");
+    let sql = "UPDATE docs SET d = $1 / $2 WHERE id = 1 USING OPERATION_ID 'op-1'";
+    let prepared = core
+        .parse_sql_prepared_with_declared(sql, &[Some(D::Float8), Some(D::Float8)])
+        .expect("parse");
+    let bound = core
+        .bind_prepared(&prepared, &[some("1"), some("2")])
+        .expect("bind");
+    let expected = core
+        .parse_sql("UPDATE docs SET d = 1.0 / 2.0 WHERE id = 1 USING OPERATION_ID 'op-1'")
+        .expect("literal parse");
+    assert_eq!(bound, expected);
+    // 整数リテラルのままの `1 / 2` とは別の構文木になる。
+    let integer_form = core
+        .parse_sql("UPDATE docs SET d = 1 / 2 WHERE id = 1 USING OPERATION_ID 'op-1'")
+        .expect("literal parse");
+    assert_ne!(bound, integer_form);
+
+    for (v, code) in [("NaN", "22P02"), ("Infinity", "22P02"), ("1e999", "22003")] {
+        assert_eq!(
+            bind_code(&core, sql, &[Some(D::Float8), Some(D::Float8)], &[v, "2"]),
+            Err(code.to_string()),
+            "{v}"
+        );
+    }
+}

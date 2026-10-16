@@ -165,6 +165,7 @@ pub(crate) mod ddl_column_type;
 /// SQL テキスト経由束縛と同一の実行意味論を共有する。第 2 の評価器を作らない）。
 pub mod declarative_predicate;
 pub(crate) mod describe;
+pub(crate) mod interval_arith;
 pub(crate) mod set_expr;
 #[cfg(test)]
 mod write_time_ledger_tests;
@@ -291,6 +292,18 @@ pub use visible_cache::VisibleBitmapCacheStats;
 pub enum SqlOutcome {
     Query(exec::QueryResult),
     SetSearchMode(mode::SearchMode),
+    /// `SET [SESSION] TIME ZONE ...`／`SET timezone ...` の成功応答（CommandComplete `SET`。
+    /// TABLE-33・Issue #1575）。新しい値は `SessionState::time_zone` が保持する。
+    ///
+    /// **Issue #1575 で追加した破壊的変更（BREAKING CHANGE）**: variant を追加した
+    /// （既存の網羅的 `match` はワイルドカードアームの追加が必要）。
+    SetTimeZone,
+    /// `SHOW timezone`／`SHOW TIME ZONE` の応答（列名 `TimeZone`・text の 1 行。CommandComplete
+    /// タグは PG と同じ `SHOW`。TABLE-33・Issue #1575）。行の形は通常の検索 SELECT と同じで、
+    /// タグだけが異なるため `Query` とは別 variant にしている。
+    ///
+    /// **Issue #1575 で追加した破壊的変更（BREAKING CHANGE）**: variant を追加した。
+    Show(exec::QueryResult),
     /// `CREATE FUNCTION <name>(...) AS <expr>`（TASK-79・SQL-9）がセッションへの
     /// 登録に成功したことを示す応答。登録された関数名を保持する。
     CreateFunction {

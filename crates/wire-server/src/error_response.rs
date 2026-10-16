@@ -99,6 +99,18 @@ pub fn encode(class: ErrorClass, message: &str) -> Result<Vec<u8>, EncodeError> 
     wrap_frame(body)
 }
 
+/// 接続を閉じる前提の `FATAL` エラー応答（`S`=`FATAL`・`C`・`M` の 3 フィールド）。
+/// 認証成功後の StartupMessage パラメータ検証失敗（TimeZone の `22023`。TABLE-33・
+/// Issue #1575。PG と同じく AuthenticationOk の後に FATAL を返して切断する）が使う。
+/// 分類ごとの severity 契約（[`severity_for`]）は変えず、呼び出し元が切断する場合だけ使う。
+pub fn encode_fatal(class: ErrorClass, message: &str) -> Result<Vec<u8>, EncodeError> {
+    reject_embedded_nul(message)?;
+    let mut body = Vec::new();
+    push_s_c_m_fields(&mut body, "FATAL", class.wire_code(), message);
+    body.push(0); // フィールド終端
+    wrap_frame(body)
+}
+
 /// 緊急応答（`RECOVER-5` (3)。commit 後 panic 時に「commit は成功している
 /// かもしれない」ことを伝える固定文字列）の `D`（detail）値（ERR-5・TASK-153
 /// ポインタ）。値の内容は他テナントのデータ・存在情報を一切含まない固定文言
@@ -240,6 +252,18 @@ mod tests {
             encode(ErrorClass::ConnectionLimitExceeded, "too many connections").expect("encode");
         let body = body_of(&msg);
         assert_eq!(find_field(body, b'S').as_deref(), Some("FATAL"));
+    }
+
+    /// [`encode_fatal`] は分類に関わらず `S`=`FATAL` で、`C`・`M` を [`encode`] と同じに載せる
+    /// （起動時 TimeZone 不正の `22023`。TABLE-33・Issue #1575）。
+    #[test]
+    fn encode_fatal_forces_fatal_severity() {
+        let msg = encode_fatal(ErrorClass::InvalidParameterValue, "bad value").expect("encode");
+        let body = body_of(&msg);
+        assert_eq!(find_field(body, b'S').as_deref(), Some("FATAL"));
+        assert_eq!(find_field(body, b'C').as_deref(), Some("22023"));
+        assert_eq!(find_field(body, b'M').as_deref(), Some("bad value"));
+        assert!(encode_fatal(ErrorClass::InvalidParameterValue, "a\0b").is_err());
     }
 
     /// [`severity_for`] は `ConnectionLimitExceeded` 以外の全分類で `ERROR` を

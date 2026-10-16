@@ -132,6 +132,7 @@ const OID_INT2: i32 = 21;
 const OID_INT4: i32 = 23;
 const OID_INT8: i32 = 20;
 const OID_FLOAT4: i32 = 700;
+const OID_FLOAT8: i32 = 701;
 const OID_DATE: i32 = 1082;
 const OID_UNKNOWN: i32 = 705;
 
@@ -299,6 +300,45 @@ fn indeterminate_expression_binds_in_text_and_binary() {
     .expect("binary bind");
     assert_eq!(tag, "UPDATE 1");
     assert!(matches!(cell(&core, "n", 1), Cell::SignedInteger(42)));
+}
+
+/// 宣言 float8 の `$1 / $2` は text／binary のどちらでも整数値（`1`・`2`）を浮動小数として
+/// 置換し、整数除算（0）にならず 0.5 が保存される（Issue #2436 codex P1）。
+#[test]
+fn float8_division_keeps_fraction_in_text_and_binary() {
+    let (core, _g) = new_core();
+    let mut s = connect(core.clone());
+    let sql = "UPDATE t SET d = $1 / $2 WHERE id = 1 USING OPERATION_ID $3";
+    let tag = run_declared(
+        &mut s,
+        sql,
+        &[OID_FLOAT8, OID_FLOAT8],
+        &[0],
+        &[b"1", b"2", b"f8-1"],
+    )
+    .expect("text bind");
+    assert_eq!(tag, "UPDATE 1");
+    assert!(matches!(cell(&core, "d", 1), Cell::Float(v) if v == 0.5));
+
+    // 値を別に変えてから binary 形式で同じ式を実行する。
+    run_declared(
+        &mut s,
+        "UPDATE t SET d = 9.0 WHERE id = 1 USING OPERATION_ID $1",
+        &[],
+        &[0],
+        &[b"f8-reset"],
+    )
+    .expect("reset");
+    let tag = run_declared(
+        &mut s,
+        sql,
+        &[OID_FLOAT8, OID_FLOAT8],
+        &[1, 1, 0],
+        &[&1.0f64.to_be_bytes(), &2.0f64.to_be_bytes(), b"f8-2"],
+    )
+    .expect("binary bind");
+    assert_eq!(tag, "UPDATE 1");
+    assert!(matches!(cell(&core, "d", 1), Cell::Float(v) if v == 0.5));
 }
 
 #[test]

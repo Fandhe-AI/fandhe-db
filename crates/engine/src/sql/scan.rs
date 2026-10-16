@@ -235,6 +235,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::Timestamp
                         | ColumnType::Time
                         | ColumnType::TimestampTz
+                        | ColumnType::Interval
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -419,7 +420,12 @@ fn predicted_heap_entry_bytes(refs: &[Option<ScalarKeyRef<'_>>], tenant_id_len: 
             .saturating_mul(std::mem::size_of::<Option<OrderValue>>()),
     );
     for r in refs {
-        if let Some(ScalarKeyRef::Bytes(b) | ScalarKeyRef::JsonbKey(b)) = r {
+        if let Some(
+            ScalarKeyRef::Bytes(b)
+            | ScalarKeyRef::JsonbKey(b)
+            | ScalarKeyRef::Collated { text: b, .. },
+        ) = r
+        {
             bytes = bytes.saturating_add(b.len());
         }
     }
@@ -770,6 +776,17 @@ fn build_projected_cells(
                             Some(None) | None => cells.push(Cell::Null),
                         }
                     }
+                    ColumnType::Interval => match scanned.get(*index) {
+                        Some(Some(row_codec::ScalarRef::Interval(v))) => {
+                            cells.push(Cell::Interval(*v))
+                        }
+                        Some(Some(_)) => {
+                            return Err(scan_bug(
+                                "INTERVAL column scan yielded a non-Interval scalar value",
+                            ))
+                        }
+                        Some(None) | None => cells.push(Cell::Null),
+                    },
                     ColumnType::Array(_) => match scanned.get(*index) {
                         Some(Some(row_codec::ScalarRef::Array(array_ref))) => {
                             let value = try_alloc_array_for_budget(
@@ -915,6 +932,8 @@ fn build_projected_cells(
                     ExprValue::Date(d) => cells.push(Cell::Date(d)),
                     ExprValue::Timestamp(t) => cells.push(Cell::Timestamp(t)),
                     ExprValue::Time(t) => cells.push(Cell::Time(t)),
+                    ExprValue::TimestampTz(t) => cells.push(Cell::TimestampTz(t)),
+                    ExprValue::Interval(v) => cells.push(Cell::Interval(v)),
                     // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有
                     // 契約: NULL は `Cell::Null` へ写像する。
                     ExprValue::Null => cells.push(Cell::Null),
@@ -1001,7 +1020,10 @@ fn heap_entry_keys_bytes(entry: &HeapEntry) -> usize {
         .capacity()
         .saturating_mul(std::mem::size_of::<Option<OrderValue>>());
     for key in &entry.keys {
-        if let Some(OrderValue::Bytes(b) | OrderValue::JsonbKey(b)) = key {
+        if let Some(
+            OrderValue::Bytes(b) | OrderValue::JsonbKey(b) | OrderValue::Collated { text: b, .. },
+        ) = key
+        {
             bytes = bytes.saturating_add(b.len());
         }
     }

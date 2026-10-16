@@ -9,11 +9,16 @@
 // 環境変数（argv／stdin は使わない。語彙外は fail-closed で終了コード 1）:
 // WIRE_HOST / WIRE_PORT / WIRE_USER / WIRE_PASSWORD / WIRE_SQL: 必須。
 // WIRE_PARAMS（任意）: 文字列の JSON 配列（values として束縛）。
+// WIRE_PARAMS_BINARY_HEX（任意）: hex 文字列の JSON 配列。各要素を `Buffer` にして values へ
+//   渡す（pg-protocol は Buffer を format 1・宣言 OID 0 で送る。numeric の `numeric_send`
+//   バイト列を呼び出し側が作って渡す。Issue #2445）。`WIRE_PARAMS` とは排他。
 // WIRE_BINARY（任意）: "1" のみ受理。結果をバイナリ形式で要求する。node pg は bytea(17)・
 //   uuid(2950) のバイナリ parser を持たないため、公開 API `pg.types.setTypeParser` で
 //   登録する（ドライバ無改造）。なお node pg はバイナリ DataRow を UTF-8 文字列として
 //   読み戻すため、0x80 以上のバイトを含む値は壊れる（ドライバ側の制約。fixture は
-//   全バイト < 0x80 の行に限定する。ADR 参照）。
+//   全バイト < 0x80 の行に限定する。ADR 参照）。numeric では `weight >= 0` かつ各桁群の
+//   下位バイト < 0x80 の値に限ることを意味する。また numeric(1700) の既定バイナリ parser は
+//   JS の number を返す（テキストは string）ため、setTypeParser では上書きしない）。
 // WIRE_EXTENDED_NOPARAM（任意）: "1" のみ受理。values 無しでも拡張プロトコルを強制する。
 //
 // 出力: 各行のセルを `<型名>:<正準表現>` にして `|` 連結し改行区切りで stdout へ。
@@ -51,6 +56,22 @@ if (process.env.WIRE_PARAMS) {
   if (!Array.isArray(values) || !values.every((s) => typeof s === "string")) {
     fail("WIRE_PARAMS must be a JSON array of strings");
   }
+}
+if (process.env.WIRE_PARAMS_BINARY_HEX) {
+  if (values !== undefined) fail("WIRE_PARAMS and WIRE_PARAMS_BINARY_HEX are exclusive");
+  let hexes;
+  try {
+    hexes = JSON.parse(process.env.WIRE_PARAMS_BINARY_HEX);
+  } catch (e) {
+    fail(`WIRE_PARAMS_BINARY_HEX is not valid JSON: ${e}`);
+  }
+  if (
+    !Array.isArray(hexes) ||
+    !hexes.every((h) => typeof h === "string" && /^([0-9a-f]{2})*$/.test(h))
+  ) {
+    fail("WIRE_PARAMS_BINARY_HEX must be a JSON array of lowercase hex strings");
+  }
+  values = hexes.map((h) => Buffer.from(h, "hex"));
 }
 const binary = flag("WIRE_BINARY");
 const noparamExtended = flag("WIRE_EXTENDED_NOPARAM");

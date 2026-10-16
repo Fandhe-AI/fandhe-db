@@ -68,7 +68,9 @@ pub(crate) fn expr_node_count(expr: &Expr) -> usize {
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
         | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
         | Expr::ValueFunction { .. } => 1,
     }
 }

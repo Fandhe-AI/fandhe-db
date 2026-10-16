@@ -49,6 +49,8 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ColumnDef::new("uid", ColumnType::Uuid, true),
                 ColumnDef::new("day", ColumnType::Date, true),
                 ColumnDef::new("tm", ColumnType::Time, true),
+                ColumnDef::new("tz", ColumnType::TimestampTz, true),
+                ColumnDef::new("iv", ColumnType::Interval, true),
                 ColumnDef::new(
                     "price",
                     ColumnType::Numeric {
@@ -183,6 +185,18 @@ fn i4(v: i32) -> Vec<u8> {
     v.to_be_bytes().to_vec()
 }
 
+/// numeric のバイナリ受信形式（`numeric_send` レイアウト）を組み立てる（WIRE-26）。
+fn nbin(weight: i16, sign: u16, dscale: u16, groups: &[u16]) -> Vec<u8> {
+    let mut v = Vec::new();
+    for w in [groups.len() as u16, weight as u16, sign, dscale] {
+        v.extend_from_slice(&w.to_be_bytes());
+    }
+    for g in groups {
+        v.extend_from_slice(&g.to_be_bytes());
+    }
+    v
+}
+
 #[test]
 fn binary_equals_text_for_integer_bool_bytea_uuid() {
     let (core, _g) = new_core();
@@ -242,7 +256,8 @@ fn binary_equals_text_for_integer_bool_bytea_uuid() {
     );
     assert_eq!(hit(bin), 1);
 
-    // id スロット: 宣言 20／23 は受理、宣言 0（実効 numeric）は 0A000。
+    // id スロット: 宣言 20／23 は受理、宣言 0（実効 numeric）は numeric バイナリとして
+    // 受理する（WIRE-26 (3) による仕様変更。Issue #2443）。
     let text = query(
         &mut s,
         "SELECT id FROM t WHERE id = $1 LIMIT 5",
@@ -267,6 +282,26 @@ fn binary_equals_text_for_integer_bool_bytea_uuid() {
         &[Some(&i4(1))],
     );
     assert_eq!(hit(bin), 1);
+    let text = query(
+        &mut s,
+        "SELECT id FROM t WHERE id = $1 LIMIT 5",
+        &[],
+        &[0],
+        &[Some(b"1")],
+    );
+    for declared in [&[][..], &[1700]] {
+        let bin = query(
+            &mut s,
+            "SELECT id FROM t WHERE id = $1 LIMIT 5",
+            declared,
+            &[1],
+            &[Some(&nbin(0, 0, 0, &[1]))],
+        );
+        assert_eq!(text, bin);
+        assert_eq!(hit(bin), 1);
+    }
+    // 宣言 0 のスロットへ 4 バイトの int4 を送ると numeric としては不正な長さで 08P01
+    // （期待値の差し替えではなく WIRE-26 の新しい境界）。
     let o = query(
         &mut s,
         "SELECT id FROM t WHERE id = $1 LIMIT 5",
@@ -274,7 +309,7 @@ fn binary_equals_text_for_integer_bool_bytea_uuid() {
         &[1],
         &[Some(&i4(1))],
     );
-    expect_err(o, "0A000", &mut s);
+    expect_err(o, "08P01", &mut s);
 
     // bool
     for (byte, txt) in [(1u8, "t"), (0u8, "f")] {
@@ -446,13 +481,14 @@ fn wrong_lengths_are_08p01_and_connection_survives() {
 fn unsupported_slots_are_0a000_and_checked_before_lengths() {
     let (core, _g) = new_core();
     let mut s = connect(spawn(core), "alice");
-    for sql in [
-        "SELECT id FROM t WHERE price = $1 LIMIT 5",
+    let o = query(
+        &mut s,
         "SELECT id FROM t WHERE day = $1 LIMIT 5",
-    ] {
-        let o = query(&mut s, sql, &[], &[1], &[Some(b"1")]);
-        expect_err(o, "0A000", &mut s);
-    }
+        &[],
+        &[1],
+        &[Some(b"1")],
+    );
+    expect_err(o, "0A000", &mut s);
     // 宣言 int2 は拡大方向の変換として INTEGER スロットで受理する（TABLE-30・Issue #1561）。
     let text = query(
         &mut s,
@@ -479,10 +515,10 @@ fn unsupported_slots_are_0a000_and_checked_before_lengths() {
         &[Some(&[0, 0, 0, 7])],
     );
     expect_err(o, "0A000", &mut s);
-    // 非対応スロット（price）と長さ不正スロット（n）が混在 → 0A000 が先。
+    // 非対応スロット（day）と長さ不正スロット（n）が混在 → 0A000 が先。
     let o = query(
         &mut s,
-        "SELECT id FROM t WHERE n = $1 AND price = $2 LIMIT 5",
+        "SELECT id FROM t WHERE n = $1 AND day = $2 LIMIT 5",
         &[],
         &[1, 1],
         &[Some(&[0, 1]), Some(b"1")],
@@ -659,3 +695,283 @@ fn time_slot_binary_params() {
     let o = query(&mut b, sel, &[], &[], &[]);
     assert_eq!(o.expect("bob rows").0.len(), 0);
 }
+
+/// TIMESTAMPTZ スロットのバイナリ param（TABLE-33・WIRE-14・Issue #1577）。バイナリ ≡ 同じ瞬間の
+/// テキスト、長さ不正 `08P01`、範囲外・infinity 番兵 `22008`（副作用なし・値を含まない）、
+/// 宣言 OID 不一致 `0A000`、テナント境界。
+#[test]
+fn timestamptz_slot_binary_params() {
+    let (core, _g) = new_core();
+    let mut s = connect(spawn(core.clone()), "alice");
+    let sel = "SELECT id FROM t WHERE tz IS NOT NULL LIMIT 20";
+    // (PG epoch 起点 µs, 同じ瞬間の明示 offset 付きテキスト)
+    let cases: [(i64, &str); 4] = [
+        (0, "2000-01-01 00:00:00+00"),
+        (-946_684_800_000_000, "1970-01-01 00:00:00+00"),
+        (-1, "1999-12-31 23:59:59.999999+00"),
+        (123_456_789, "2000-01-01 09:02:03.456789+09"),
+    ];
+    for (i, (pg, text)) in cases.iter().enumerate() {
+        for (j, declared) in [&[][..], &[1184]].into_iter().enumerate() {
+            let id_bin = 100 + (i * 10 + j * 2) as i32;
+            let id_txt = id_bin + 1;
+            let ins = |id: i32| {
+                format!(
+                    "INSERT INTO t (id, embedding, tz) VALUES ({id}, '[0,1]', $1) USING OPERATION_ID 'tz-{id}'"
+                )
+            };
+            let o = query(
+                &mut s,
+                &ins(id_bin),
+                declared,
+                &[1],
+                &[Some(&pg.to_be_bytes())],
+            );
+            assert!(o.is_ok(), "binary insert {pg}: {o:?}");
+            let o = query(
+                &mut s,
+                &ins(id_txt),
+                declared,
+                &[0],
+                &[Some(text.as_bytes())],
+            );
+            assert!(o.is_ok(), "text insert {text}: {o:?}");
+            let mut by = |id: i32| {
+                query(
+                    &mut s,
+                    &format!("SELECT tz FROM t WHERE id = {id} LIMIT 1"),
+                    &[],
+                    &[],
+                    &[],
+                )
+            };
+            assert_eq!(by(id_bin), by(id_txt), "pg micros {pg}");
+        }
+    }
+    let before = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
+    let ins =
+        "INSERT INTO t (id, embedding, tz) VALUES (900, '[0,1]', $1) USING OPERATION_ID 'tz-bad'";
+    for bad in [&[0u8; 7][..], &[0u8; 9][..]] {
+        let o = query(&mut s, ins, &[1184], &[1], &[Some(bad)]);
+        expect_err(o, "08P01", &mut s);
+    }
+    // 範囲外（上限超過・下限未満・加算オーバーフロー・infinity 番兵）は 22008。
+    for bad in [
+        253_402_300_800_000_000i64 - 946_684_800_000_000,
+        -62_135_596_800_000_000i64 - 946_684_800_000_000 - 1,
+        i64::MIN,
+        i64::MAX,
+    ] {
+        let o = query(&mut s, ins, &[1184], &[1], &[Some(&bad.to_be_bytes())]);
+        expect_err(o, "22008", &mut s);
+    }
+    // 宣言 OID 不一致のバイナリは 0A000。
+    for declared in [20, 1114, 25] {
+        let o = query(&mut s, ins, &[declared], &[1], &[Some(&0i64.to_be_bytes())]);
+        expect_err(o, "0A000", &mut s);
+    }
+    let after = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
+    assert_eq!(before, after, "no side effect");
+    let mut b = connect(spawn(core), "bob");
+    let o = query(&mut b, sel, &[], &[], &[]);
+    assert_eq!(o.expect("bob rows").0.len(), 0);
+}
+
+/// INTERVAL スロットのバイナリ param（TABLE-34・WIRE-14・Issue #1583）。バイナリ ≡ 同じ値の
+/// テキスト（往復一致）、長さ不正 `08P01`、±infinity 番兵 `22008`（副作用なし・値を含まない）、
+/// 宣言 OID 不一致 `0A000`、テナント境界。
+#[test]
+fn interval_slot_binary_params() {
+    let (core, _g) = new_core();
+    let mut s = connect(spawn(core.clone()), "alice");
+    let sel = "SELECT id FROM t WHERE iv IS NOT NULL LIMIT 50";
+    let bin = |micros: i64, days: i32, months: i32| -> Vec<u8> {
+        let mut v = micros.to_be_bytes().to_vec();
+        v.extend_from_slice(&days.to_be_bytes());
+        v.extend_from_slice(&months.to_be_bytes());
+        v
+    };
+    // (バイナリ, 同じ値のテキスト)
+    let cases: Vec<(Vec<u8>, &str)> = vec![
+        (bin(0, 0, 0), "00:00:00"),
+        (
+            bin(7_200_000_000, -1, 14),
+            "1 year 2 mons -1 days +02:00:00",
+        ),
+        (
+            bin(-86_399_999_999, -30, -1),
+            "-1 mons -30 days -23:59:59.999999",
+        ),
+        (bin(1, 1, 0), "1 day 00:00:00.000001"),
+    ];
+    for (i, (raw, text)) in cases.iter().enumerate() {
+        for (j, declared) in [&[][..], &[1186]].into_iter().enumerate() {
+            let id_bin = 1000 + (i * 10 + j * 2) as i32;
+            let id_txt = id_bin + 1;
+            let ins = |id: i32| {
+                format!(
+                    "INSERT INTO t (id, embedding, iv) VALUES ({id}, '[0,1]', $1) USING OPERATION_ID 'iv-{id}'"
+                )
+            };
+            let o = query(&mut s, &ins(id_bin), declared, &[1], &[Some(raw)]);
+            assert!(o.is_ok(), "binary insert {raw:?}: {o:?}");
+            let o = query(
+                &mut s,
+                &ins(id_txt),
+                declared,
+                &[0],
+                &[Some(text.as_bytes())],
+            );
+            assert!(o.is_ok(), "text insert {text}: {o:?}");
+            let mut by = |id: i32| {
+                query(
+                    &mut s,
+                    &format!("SELECT iv FROM t WHERE id = {id} LIMIT 1"),
+                    &[],
+                    &[],
+                    &[],
+                )
+            };
+            assert_eq!(by(id_bin), by(id_txt), "raw {raw:?}");
+        }
+    }
+    let before = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
+    let ins =
+        "INSERT INTO t (id, embedding, iv) VALUES (900, '[0,1]', $1) USING OPERATION_ID 'iv-bad'";
+    for bad in [&[0u8; 15][..], &[0u8; 17][..], &[][..]] {
+        let o = query(&mut s, ins, &[1186], &[1], &[Some(bad)]);
+        expect_err(o, "08P01", &mut s);
+    }
+    // ±infinity 番兵は 22008。
+    for bad in [
+        bin(i64::MAX, i32::MAX, i32::MAX),
+        bin(i64::MIN, i32::MIN, i32::MIN),
+    ] {
+        let o = query(&mut s, ins, &[1186], &[1], &[Some(&bad)]);
+        expect_err(o, "22008", &mut s);
+    }
+    // 宣言 OID 不一致のバイナリは 0A000。
+    for declared in [20, 1083, 25] {
+        let o = query(&mut s, ins, &[declared], &[1], &[Some(&bin(0, 0, 0))]);
+        expect_err(o, "0A000", &mut s);
+    }
+    let after = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
+    assert_eq!(before, after, "no side effect");
+    let mut b = connect(spawn(core), "bob");
+    let o = query(&mut b, sel, &[], &[], &[]);
+    assert_eq!(o.expect("bob rows").0.len(), 0);
+}
+
+/// NUMERIC 列スロットのバイナリ受信（WIRE-26・WIRE-14。Issue #2443）。正例は
+/// テキスト形式と同一の応答（読み書き両方向）、不正は `08P01`／`22P03`／`22003`、
+/// 互換表外の宣言 OID は `0A000`、テナント境界。いずれのエラーも Sync で回復する。
+#[test]
+fn numeric_binary_params_per_wire26() {
+    let (core, _g) = new_core();
+    let mut s = connect(spawn(core), "alice");
+    let o = query(
+        &mut s,
+        "INSERT INTO t (id, embedding, price) VALUES (50, '[0,1]', '123.45') USING OPERATION_ID 'num-seed'",
+        &[],
+        &[],
+        &[],
+    );
+    assert!(o.is_ok());
+    let sel = "SELECT id FROM t WHERE price = $1 LIMIT 5";
+    let text = query(&mut s, sel, &[], &[0], &[Some(b"123.45")]);
+    assert_eq!(text.as_ref().expect("text").0.len(), 1);
+    // 123.45 / 123.450（dscale 3）/ 123.449（dscale 3）。宣言 0・1700。
+    // 各バイナリ値は、同じ値をテキストで送った場合と同一の応答になる。
+    let cases = [
+        (nbin(0, 0, 2, &[123, 4500]), "123.45"),
+        (nbin(0, 0, 3, &[123, 4500]), "123.450"),
+        (nbin(0, 0, 3, &[123, 4490]), "123.449"),
+    ];
+    for declared in [&[][..], &[1700]] {
+        for (raw, txt) in &cases {
+            let expect = query(&mut s, sel, &[], &[0], &[Some(txt.as_bytes())]);
+            let bin = query(&mut s, sel, declared, &[1], &[Some(raw)]);
+            assert_eq!(expect, bin, "{raw:?}");
+        }
+    }
+    // 書き込み経路: バイナリ INSERT をテキストで読み戻して一致する。
+    let o = query(
+        &mut s,
+        "INSERT INTO t (id, embedding, price) VALUES (51, '[0,1]', $1) USING OPERATION_ID 'num-bin-1'",
+        &[],
+        &[1],
+        &[Some(&nbin(0, NUMERIC_NEG, 2, &[5, 2500]))],
+    );
+    assert!(o.is_ok(), "{o:?}");
+    let back = query(&mut s, sel, &[], &[0], &[Some(b"-5.25")]);
+    assert_eq!(back.expect("readback").0.len(), 1);
+
+    // 22003: 列の精度超過（engine 側）と weight 過大（復号側）。
+    let o = query(
+        &mut s,
+        "INSERT INTO t (id, embedding, price) VALUES (52, '[0,1]', $1) USING OPERATION_ID 'num-bin-2'",
+        &[],
+        &[1],
+        &[Some(&nbin(0, 0, 2, &[1000, 0]))],
+    );
+    expect_err(o, "22003", &mut s);
+    let o = query(&mut s, sel, &[], &[1], &[Some(&nbin(i16::MAX, 0, 0, &[1]))]);
+    expect_err(o, "22003", &mut s);
+    // 22P03: 符号・dscale・桁の不正。
+    for raw in [
+        nbin(0, 0x8000, 0, &[1]),
+        nbin(0, 0, 0x4000, &[1]),
+        nbin(0, 0, 0, &[10000]),
+    ] {
+        let o = query(&mut s, sel, &[], &[1], &[Some(&raw)]);
+        expect_err(o, "22P03", &mut s);
+    }
+    // 08P01: 短い・長い・ndigits 上限超過。
+    let ok = nbin(0, 0, 0, &[1]);
+    let mut long = ok.clone();
+    long.push(0);
+    let too_many = nbin(0, 0, 0, &[0; 33]);
+    for raw in [ok[..ok.len() - 1].to_vec(), long, vec![0, 1, 2], too_many] {
+        let o = query(&mut s, sel, &[], &[1], &[Some(&raw)]);
+        expect_err(o, "08P01", &mut s);
+    }
+    // NaN／Infinity: バイナリの SQLSTATE はテキストで同じ値を送った場合と一致する。
+    for (sign, txt) in [
+        (0xC000u16, "NaN"),
+        (0xD000, "Infinity"),
+        (0xF000, "-Infinity"),
+    ] {
+        let t = query(&mut s, sel, &[], &[0], &[Some(txt.as_bytes())]);
+        let b = query(&mut s, sel, &[], &[1], &[Some(&nbin(0, sign, 0, &[]))]);
+        assert_eq!(t, b, "{txt}");
+        expect_err(b, "22P02", &mut s);
+    }
+    // 互換表外の宣言 OID（int4）は 0A000。
+    let o = query(&mut s, sel, &[23], &[1], &[Some(&nbin(0, 0, 0, &[1]))]);
+    expect_err(o, "0A000", &mut s);
+}
+
+/// numeric バイナリでもテナント境界は維持される（bob は alice の行に一致する値で 0 件）。
+#[test]
+fn numeric_binary_params_respect_tenant_boundary() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let mut alice = connect(addr, "alice");
+    let o = query(
+        &mut alice,
+        "INSERT INTO t (id, embedding, price) VALUES (50, '[0,1]', '123.45') USING OPERATION_ID 'num-t'",
+        &[],
+        &[],
+        &[],
+    );
+    assert!(o.is_ok());
+    let sel = "SELECT id FROM t WHERE price = $1 LIMIT 5";
+    let raw = nbin(0, 0, 2, &[123, 4500]);
+    let a = query(&mut alice, sel, &[], &[1], &[Some(&raw)]);
+    assert_eq!(a.expect("alice").0.len(), 1);
+    let mut bob = connect(addr, "bob");
+    let b = query(&mut bob, sel, &[], &[1], &[Some(&raw)]);
+    assert_eq!(b.map(|(rows, _)| rows.len()), Ok(0));
+}
+
+const NUMERIC_NEG: u16 = 0x4000;

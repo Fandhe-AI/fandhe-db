@@ -79,6 +79,8 @@ fn schema() -> TableSchema {
             // `plan` 検索を誘発するため）。
             ColumnDef::new("path", ColumnType::Text, false),
             ColumnDef::new("body", ColumnType::Text, false),
+            // INTERVAL の NoSQL 型束縛から `22015` へ到達する経路の検証用（Issue #1583）。
+            ColumnDef::new("iv", ColumnType::Interval, true),
         ],
     )
 }
@@ -277,7 +279,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 55] = [
+const EXPECTED_STATUS: [(&str, u16); 59] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -345,6 +347,10 @@ const EXPECTED_STATUS: [(&str, u16); 55] = [
     // `IndeterminateDatatype`（`42P18`。Issue #1546）: 拡張クエリの Parse で `$n` の型を
     // 決められない。SQL 表層専用の分類で 400。
     ("42P18", 400),
+    // `CollationMismatch`（`42P21`）・`IndeterminateCollation`（`42P22`。Issue #2190）:
+    // SQL 表層専用の照合エラーで 400。
+    ("42P21", 400),
+    ("42P22", 400),
     // `NullValueNotAllowed`（`22004`。Issue #1599）: `jsonb_build_object` の NULL キー。400。
     ("22004", 400),
     // jsonpath 評価器の `2203x` 系（Issue #2184）: 入力起因の拒否で 400。
@@ -357,6 +363,10 @@ const EXPECTED_STATUS: [(&str, u16); 55] = [
     ("2203C", 400),
     // `UntranslatableCharacter`（`22P05`。Issue #2185）: jsonpath リテラルの NUL 文字。400。
     ("22P05", 400),
+    // `InvalidBinaryRepresentation`（`22P03`。Issue #2443）: numeric バイナリ受信の外部表現不正。400。
+    ("22P03", 400),
+    // `IntervalFieldOverflow`（`22015`。Issue #1579）: INTERVAL リテラルのフィールド値の範囲外。400。
+    ("22015", 400),
     // `DuplicateObject`（`42710`。TABLE-22、Issue #1195）: ERR-6 の新設行。400
     // （`42P07` の 409 とは揃えない）。
     ("42710", 400),
@@ -451,7 +461,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 58);
+const _: () = assert!(ErrorClass::ALL.len() == 62);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -946,6 +956,10 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // `IndeterminateDatatype`（`42P18`。Issue #1546）: 拡張クエリの Parse で `$n` の型を
         // 決められない。NoSQL 表層には `$n` 束縛が無く到達不能。
         ErrorClass::IndeterminateDatatype,
+        // `CollationMismatch`（`42P21`）・`IndeterminateCollation`（`42P22`。Issue #2190）:
+        // 式の `COLLATE` は NoSQL 表層の `op` 語彙に無く到達不能。
+        ErrorClass::CollationMismatch,
+        ErrorClass::IndeterminateCollation,
         // `NullValueNotAllowed`（`22004`。Issue #1599）: `jsonb_build_object` の NULL キー。
         // SQL 表層専用の分類で、NoSQL 表層からは到達不能。
         ErrorClass::NullValueNotAllowed,
@@ -961,6 +975,11 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // `UntranslatableCharacter`（`22P05`。Issue #2185）: jsonpath リテラルの NUL 文字。
         // SQL 表層専用で NoSQL 表層からは到達不能。
         ErrorClass::UntranslatableCharacter,
+        // `InvalidBinaryRepresentation`（`22P03`。Issue #2443）: SQL 表層専用で NoSQL 表層からは到達不能。
+        ErrorClass::InvalidBinaryRepresentation,
+        // （`IntervalFieldOverflow`〔`22015`〕は Issue #1583 で NoSQL の INTERVAL 型束縛から
+        // 到達可能になったため外した。固定は `err4_f_interval_field_overflow_reachable_via_nosql_insert`
+        // が担う）
         // （`PartialCompletion`／`PartitionedDmlCancelled`〔`VD001`／`VD002`〕は Issue #1130 で
         // `update`／`delete` の分割実行修飾から到達可能になったため外した。固定は
         // `err4_f_partitioned_dml_vd001_vd002_reachable_via_nosql_update` が担う）
@@ -970,6 +989,20 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         let resp = http_common::parse_single_response(&raw);
         assert_projected(&resp, class.wire_code());
     }
+}
+
+/// `IntervalFieldOverflow`（`22015`。Issue #1579・#1583）は NoSQL 表層の INTERVAL 列への
+/// `insert` でフィールド値が範囲外の文字列を束縛したときに到達し、HTTP 400 へ射影される。
+#[test]
+fn err4_f_interval_field_overflow_reachable_via_nosql_insert() {
+    let (core, _guard) = new_core();
+    let addr = spawn(core);
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2],"lang":"ja","path":"docs/1.md","body":"alpha","iv":"2147483648 days"}],"operation_id":"err4-op-iv-overflow"}"#,
+    );
+    assert_projected_as(&resp, ErrorClass::IntervalFieldOverflow);
+    assert_eq!(resp.status, 400, "{resp:?}");
 }
 
 /// `PartialCompletion`／`PartitionedDmlCancelled`（`VD001`／`VD002`。Issue #1130・NOSQL-12・

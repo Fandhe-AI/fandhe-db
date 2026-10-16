@@ -214,6 +214,7 @@ pub(crate) fn project_row(
                 Some(Value::Timestamp(t)) => Cell::Timestamp(*t),
                 Some(Value::Time(t)) => Cell::Time(*t),
                 Some(Value::TimestampTz(t)) => Cell::TimestampTz(*t),
+                Some(Value::Interval(v)) => Cell::Interval(*v),
                 Some(Value::Array(array_value)) => Cell::Array(try_clone_array_for_budget(
                     array_value,
                     budget,

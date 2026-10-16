@@ -253,6 +253,12 @@ impl FilterOp {
                     TypedLiteral::Date(e) => v.as_date().map(|a| op.accepts(a.cmp(e))),
                     TypedLiteral::Timestamp(e) => v.as_timestamp().map(|a| op.accepts(a.cmp(e))),
                     TypedLiteral::Time(e) => v.as_time().map(|a| op.accepts(a.cmp(e))),
+                    TypedLiteral::Interval(e) => v
+                        .as_interval()
+                        .map(|a| op.accepts(crate::datetime::interval_cmp_key(&a).cmp(e))),
+                    TypedLiteral::TimestampTz(e) => {
+                        v.as_timestamptz().map(|a| op.accepts(a.cmp(e)))
+                    }
                     TypedLiteral::Numeric(e) => v
                         .as_numeric()
                         .map(|a| op.accepts(crate::numeric::cmp_exact(&a, e))),
@@ -357,12 +363,29 @@ fn typed_in_eval(values: &[TypedLiteral], v: ScalarRef<'_>) -> Option<bool> {
                     .any(|t| matches!(t, TypedLiteral::Timestamp(e) if *e == actual)),
             )
         }
+        Some(TypedLiteral::TimestampTz(_)) => {
+            let actual = v.as_timestamptz()?;
+            Some(
+                values
+                    .iter()
+                    .any(|t| matches!(t, TypedLiteral::TimestampTz(e) if *e == actual)),
+            )
+        }
         Some(TypedLiteral::Time(_)) => {
             let actual = v.as_time()?;
             Some(
                 values
                     .iter()
                     .any(|t| matches!(t, TypedLiteral::Time(e) if *e == actual)),
+            )
+        }
+        // 正規化キーで照合する（`'1 mon'` と `'30 days'` は同値。生の三要素の等価は使わない）。
+        Some(TypedLiteral::Interval(_)) => {
+            let actual = crate::datetime::interval_cmp_key(&v.as_interval()?);
+            Some(
+                values
+                    .iter()
+                    .any(|t| matches!(t, TypedLiteral::Interval(e) if *e == actual)),
             )
         }
         Some(TypedLiteral::Numeric(_)) => {
@@ -402,8 +425,16 @@ fn typed_between_eval(low: &TypedLiteral, high: &TypedLiteral, v: ScalarRef<'_>)
             let actual = v.as_timestamp()?;
             Some(CompareOp::Ge.accepts(actual.cmp(lo)) && CompareOp::Le.accepts(actual.cmp(hi)))
         }
+        (TypedLiteral::TimestampTz(lo), TypedLiteral::TimestampTz(hi)) => {
+            let actual = v.as_timestamptz()?;
+            Some(CompareOp::Ge.accepts(actual.cmp(lo)) && CompareOp::Le.accepts(actual.cmp(hi)))
+        }
         (TypedLiteral::Time(lo), TypedLiteral::Time(hi)) => {
             let actual = v.as_time()?;
+            Some(CompareOp::Ge.accepts(actual.cmp(lo)) && CompareOp::Le.accepts(actual.cmp(hi)))
+        }
+        (TypedLiteral::Interval(lo), TypedLiteral::Interval(hi)) => {
+            let actual = crate::datetime::interval_cmp_key(&v.as_interval()?);
             Some(CompareOp::Ge.accepts(actual.cmp(lo)) && CompareOp::Le.accepts(actual.cmp(hi)))
         }
         (TypedLiteral::Numeric(lo), TypedLiteral::Numeric(hi)) => {
@@ -498,6 +529,13 @@ pub enum TypedLiteral {
     Timestamp(i64),
     /// `TIME` 列。0 時起点のマイクロ秒（`0..=86_400_000_000`。Issue #1570）。
     Time(i64),
+    /// `INTERVAL` 列。正規化比較キー（[`crate::datetime::interval_cmp_key`]。Issue #1580）。
+    /// 生の三要素ではなくキーを保持するので、評価側も行値をキーへ変換して比べる
+    /// （`'30 days'` が格納済みの `'1 month'` と一致する）。
+    Interval(i128),
+    /// `TIMESTAMPTZ` 列。UTC の 1970-01-01 起点マイクロ秒（Issue #1576）。文字列リテラルは束縛時の
+    /// セッション TimeZone（ゾーン指定があればそれ）で UTC へ確定する。
+    TimestampTz(i64),
     /// `NUMERIC` 列。列の `scale` に丸めず、リテラル自身の小数桁数で解析した
     /// 正確な値（`numeric::cmp_exact` で比較する）。
     Numeric(Decimal),
@@ -767,6 +805,7 @@ fn bind_filter_op(
                 | ColumnType::Timestamp
                 | ColumnType::Time
                 | ColumnType::TimestampTz
+                | ColumnType::Interval
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
@@ -852,6 +891,8 @@ fn bind_filter_op(
                     ColumnType::Date => TypedLiteral::Date(0),
                     ColumnType::Timestamp => TypedLiteral::Timestamp(0),
                     ColumnType::Time => TypedLiteral::Time(0),
+                    ColumnType::Interval => TypedLiteral::Interval(0),
+                    ColumnType::TimestampTz => TypedLiteral::TimestampTz(0),
                     ColumnType::Numeric { .. } => TypedLiteral::Numeric(
                         crate::numeric::Decimal::from_parts(0, 0).map_err(|_| {
                             // `scale=0` は `MAX_PRECISION` 以下のため理論上
@@ -949,6 +990,8 @@ fn bind_filter_op(
                 ColumnType::Date
                 | ColumnType::Timestamp
                 | ColumnType::Time
+                | ColumnType::Interval
+                | ColumnType::TimestampTz
                 | ColumnType::Numeric { .. }
                 | ColumnType::Uuid
                 | ColumnType::Bytea => {
@@ -960,6 +1003,8 @@ fn bind_filter_op(
                                 ColumnType::Date => TypedLiteral::Date(0),
                                 ColumnType::Timestamp => TypedLiteral::Timestamp(0),
                                 ColumnType::Time => TypedLiteral::Time(0),
+                                ColumnType::Interval => TypedLiteral::Interval(0),
+                                ColumnType::TimestampTz => TypedLiteral::TimestampTz(0),
                                 ColumnType::Numeric { .. } => TypedLiteral::Numeric(
                                     Decimal::from_parts(0, 0).map_err(|_| {
                                         SqlSurfaceError::Internal {
@@ -1013,6 +1058,8 @@ fn bind_filter_op(
             ColumnType::Date
             | ColumnType::Timestamp
             | ColumnType::Time
+            | ColumnType::Interval
+            | ColumnType::TimestampTz
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid
             | ColumnType::Bytea => {
@@ -1021,6 +1068,8 @@ fn bind_filter_op(
                         ColumnType::Date => TypedLiteral::Date(0),
                         ColumnType::Timestamp => TypedLiteral::Timestamp(0),
                         ColumnType::Time => TypedLiteral::Time(0),
+                        ColumnType::Interval => TypedLiteral::Interval(0),
+                        ColumnType::TimestampTz => TypedLiteral::TimestampTz(0),
                         ColumnType::Numeric { .. } => {
                             TypedLiteral::Numeric(Decimal::from_parts(0, 0).map_err(|_| {
                                 SqlSurfaceError::Internal {
@@ -1153,6 +1202,27 @@ fn bind_typed_compare_literal(
                 }),
             }
         }
+        (ColumnType::TimestampTz, CompareLiteral::Text(s)) => {
+            check_literal_len(s)?;
+            // ゾーン無しの入力はセッション TZ で UTC へ確定するため、CHECK 本体では `0A000`
+            // （宣言的経路は `predicate_sql` を書き込みのたびに再束縛し、結果が TZ で変わる。D9）。
+            if matches!(
+                crate::sql::allowlist::parse_timestamptz_expr_literal(s),
+                Ok(crate::sql::udf_call::Expr::TimestampTzLiteral {
+                    session_local: true,
+                    ..
+                })
+            ) {
+                crate::sql::udf_call::reject_session_tz_in_check()?;
+            }
+            match crate::sql::parser::bind_datetime_literal(column, ColumnType::TimestampTz, s)? {
+                crate::row_codec::Value::TimestampTz(t) => Ok(TypedLiteral::TimestampTz(t)),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "bind_datetime_literal returned a non-TimestampTz value for a TIMESTAMPTZ column"
+                        .to_string(),
+                }),
+            }
+        }
         (ColumnType::Time, CompareLiteral::Text(s)) => {
             check_literal_len(s)?;
             match crate::sql::parser::bind_datetime_literal(column, ColumnType::Time, s)? {
@@ -1160,6 +1230,19 @@ fn bind_typed_compare_literal(
                 _ => Err(SqlSurfaceError::Internal {
                     detail: "bind_datetime_literal returned a non-Time value for a TIME column"
                         .to_string(),
+                }),
+            }
+        }
+        (ColumnType::Interval, CompareLiteral::Text(s)) => {
+            check_literal_len(s)?;
+            match crate::sql::parser::bind_datetime_literal(column, ColumnType::Interval, s)? {
+                crate::row_codec::Value::Interval(v) => Ok(TypedLiteral::Interval(
+                    crate::datetime::interval_cmp_key(&v),
+                )),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail:
+                        "bind_datetime_literal returned a non-Interval value for an INTERVAL column"
+                            .to_string(),
                 }),
             }
         }

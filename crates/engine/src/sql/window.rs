@@ -189,6 +189,8 @@ enum WindowKeyValue {
     Date(i32),
     Timestamp(i64),
     Time(i64),
+    /// `TIMESTAMPTZ`（UTC マイクロ秒。Issue #1576）。
+    TimestampTz(i64),
     Numeric(crate::numeric::Decimal),
     Uuid(crate::uuid::Uuid),
 }
@@ -212,6 +214,7 @@ enum WindowInputValue {
     Date(Option<i32>),
     Timestamp(Option<i64>),
     Time(Option<i64>),
+    TimestampTz(Option<i64>),
     Numeric(Option<crate::numeric::Decimal>),
     /// `BOOLEAN`／`ARRAY`／`BYTEA`／`JSON`／`JSONB`／`ENUM`／`UUID` 列の裸参照
     /// （いずれも `COUNT` 限定。`Accumulator::observe` はこれらの型で値の中身を
@@ -566,7 +569,8 @@ fn materialize_rows(
                     .len()
                     .saturating_mul(std::mem::size_of::<Option<OrderValue>>());
                 for r in &refs {
-                    if let Some(ScalarKeyRef::Bytes(b)) = r {
+                    if let Some(ScalarKeyRef::Bytes(b) | ScalarKeyRef::Collated { text: b, .. }) = r
+                    {
                         add = add.saturating_add(b.len());
                     }
                 }
@@ -886,12 +890,17 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
             Some(AggregateInput::VectorColumnPresence) => {
                 has_scalar_reference = true;
             }
+            // 照合付きの MIN/MAX は束縛段（`bind_window_item`）が `0A000` で拒否するため実際には
+            // 到達しないが、列参照としてはテキスト列と同じ扱いにしておく。
             Some(
                 AggregateInput::TextColumn(index)
+                | AggregateInput::CollatedTextColumn { index, .. }
                 | AggregateInput::BooleanColumn(index)
                 | AggregateInput::DateColumn(index)
                 | AggregateInput::TimestampColumn(index)
                 | AggregateInput::TimeColumn(index)
+                | AggregateInput::IntervalColumn(index)
+                | AggregateInput::TimestampTzColumn(index)
                 | AggregateInput::ArrayColumn(index)
                 | AggregateInput::ByteaColumn(index)
                 | AggregateInput::JsonColumn(index)
@@ -991,6 +1000,15 @@ fn extract_window_key(
             None => return Err(window_bug("TIME key scan yielded a non-Time scalar value")),
         },
         (WindowKeyKind::Time, None) => None,
+        (WindowKeyKind::TimestampTz, Some(v)) => match v.as_timestamptz() {
+            Some(t) => Some(WindowKeyValue::TimestampTz(t)),
+            None => {
+                return Err(window_bug(
+                    "TIMESTAMPTZ key scan yielded a non-TimestampTz scalar value",
+                ))
+            }
+        },
+        (WindowKeyKind::TimestampTz, None) => None,
         (WindowKeyKind::Numeric, Some(v)) => match v.as_numeric() {
             Some(d) => Some(WindowKeyValue::Numeric(d)),
             None => {
@@ -1020,6 +1038,9 @@ fn extract_window_input(
     Ok(match input {
         AggregateInput::AllVisible | AggregateInput::IdU64 => WindowInputValue::AllVisibleOrId,
         AggregateInput::VectorColumnPresence => WindowInputValue::VectorPresence(dim),
+        AggregateInput::CollatedTextColumn { .. } => {
+            return Err(window_bug("collated MIN/MAX reached the window executor"))
+        }
         AggregateInput::TextColumn(index) => WindowInputValue::Text(
             scanned
                 .get(*index)
@@ -1065,6 +1086,21 @@ fn extract_window_input(
             })?)),
             None => WindowInputValue::Timestamp(None),
         },
+        AggregateInput::TimestampTzColumn(index) => match scanned.get(*index).copied().flatten() {
+            Some(v) => {
+                WindowInputValue::TimestampTz(Some(v.as_timestamptz().ok_or_else(|| {
+                    window_bug("TIMESTAMPTZ input scan yielded a non-TimestampTz scalar value")
+                })?))
+            }
+            None => WindowInputValue::TimestampTz(None),
+        },
+        // INTERVAL 列のウィンドウ集計は束縛段（`bind_window_item`）が `0A000` で拒否済みのため
+        // ここへ到達するのは配線不備のみ（Issue #1580。fail-closed）。
+        AggregateInput::IntervalColumn(_) => {
+            return Err(window_bug(
+                "INTERVAL window aggregate input must be rejected at bind time",
+            ))
+        }
         AggregateInput::TimeColumn(index) => {
             match scanned.get(*index).copied().flatten() {
                 Some(v) => WindowInputValue::Time(Some(v.as_time().ok_or_else(|| {
@@ -1179,6 +1215,10 @@ fn partition_key_bytes(keys: &[Option<WindowKeyValue>]) -> Vec<u8> {
                 out.push(13);
                 out.extend_from_slice(&v.to_be_bytes());
             }
+            Some(WindowKeyValue::TimestampTz(v)) => {
+                out.push(14);
+                out.extend_from_slice(&v.to_be_bytes());
+            }
             Some(WindowKeyValue::Numeric(d)) => {
                 out.push(10);
                 out.extend_from_slice(&d.unscaled().to_be_bytes());
@@ -1234,7 +1274,8 @@ fn cmp_window_key_value(a: &WindowKeyValue, b: &WindowKeyValue) -> std::cmp::Ord
     use std::cmp::Ordering;
     match (a, b) {
         (WindowKeyValue::Id(x), WindowKeyValue::Id(y)) => x.cmp(y),
-        // 照合の比較器（既定照合）に 1 本化。照合の受け渡しは #2190（TABLE-28・Issue #1610）。
+        // 照合の比較器（既定照合）に 1 本化。非バイト列順の照合（ICU）のキー・MIN/MAX は束縛段が
+        // 拒否する（`resolve_window_key`・`bind_window_item`。TABLE-28・Issue #2190）。
         (WindowKeyValue::Text(x), WindowKeyValue::Text(y)) => {
             crate::collation::Collation::DEFAULT.compare(x.as_bytes(), y.as_bytes())
         }
@@ -1248,6 +1289,7 @@ fn cmp_window_key_value(a: &WindowKeyValue, b: &WindowKeyValue) -> std::cmp::Ord
         (WindowKeyValue::Date(x), WindowKeyValue::Date(y)) => x.cmp(y),
         (WindowKeyValue::Timestamp(x), WindowKeyValue::Timestamp(y)) => x.cmp(y),
         (WindowKeyValue::Time(x), WindowKeyValue::Time(y)) => x.cmp(y),
+        (WindowKeyValue::TimestampTz(x), WindowKeyValue::TimestampTz(y)) => x.cmp(y),
         (WindowKeyValue::Numeric(x), WindowKeyValue::Numeric(y)) => crate::numeric::cmp_exact(x, y),
         (WindowKeyValue::Uuid(x), WindowKeyValue::Uuid(y)) => x.as_bytes().cmp(y.as_bytes()),
         _ => Ordering::Equal,
@@ -1580,6 +1622,10 @@ fn observe_window_row(
         }
         (AggregateInput::TimestampColumn(index), WindowInputValue::Timestamp(v)) => {
             let scanned = build_scanned(*index, v.map(row_codec::ScalarRef::Timestamp));
+            acc.observe(input, id, &no_vector, &scanned, scratch)
+        }
+        (AggregateInput::TimestampTzColumn(index), WindowInputValue::TimestampTz(v)) => {
+            let scanned = build_scanned(*index, v.map(row_codec::ScalarRef::TimestampTz));
             acc.observe(input, id, &no_vector, &scanned, scratch)
         }
         (AggregateInput::TimeColumn(index), WindowInputValue::Time(v)) => {

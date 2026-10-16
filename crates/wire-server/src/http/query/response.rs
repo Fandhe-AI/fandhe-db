@@ -145,8 +145,9 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             out.push('"');
             Ok(())
         }
-        // TIMESTAMPTZ は UTC 固定の ISO 文字列（`+00` 付き）。セッション TimeZone での表示は
-        // #1575、型の公告は #1577 の担当（Issue #1574）。
+        // TIMESTAMPTZ は UTC 固定の ISO 文字列（`+00` 付き）。NoSQL（HTTP）表層はセッション
+        // TimeZone を持たず UTC で表示する仕様（TABLE-33 (5)。Issue #1575 で意図的に維持）。
+        // 型の公告は #1577 の担当（Issue #1574）。
         Cell::TimestampTz(micros) => {
             out.push('"');
             escape_json_string_into(
@@ -156,6 +157,14 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
                     &engine::datetime::SessionTimeZone::utc(),
                 ),
             );
+            out.push('"');
+            Ok(())
+        }
+        // INTERVAL は `IntervalStyle=postgres` 形式の JSON 文字列（Issue #1579。型の公告は
+        // `"interval"`。NoSQL の型束縛・filter は Issue #1583 で対応）。
+        Cell::Interval(v) => {
+            out.push('"');
+            escape_json_string_into(out, &engine::datetime::format_interval(v));
             out.push('"');
             Ok(())
         }
@@ -379,6 +388,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
             ColumnType::Timestamp => "timestamp",
             ColumnType::Time => "time",
             ColumnType::TimestampTz => "timestamptz",
+            ColumnType::Interval => "interval",
             ColumnType::Numeric { .. } => "numeric",
             ColumnType::Uuid => "uuid",
             ColumnType::Bytea => "bytea",

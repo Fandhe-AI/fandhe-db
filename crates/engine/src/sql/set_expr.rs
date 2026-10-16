@@ -87,6 +87,8 @@ pub(crate) fn bind_set_expr(
         | ColumnType::Boolean
         | ColumnType::Date
         | ColumnType::Timestamp
+        | ColumnType::TimestampTz
+        | ColumnType::Interval
         | ColumnType::Time => {}
         _ => {
             return Err(SqlSurfaceError::FeatureNotSupported {
@@ -115,6 +117,14 @@ pub(crate) fn bind_set_expr(
             | (ColumnType::Date, ExprType::Date)
             | (ColumnType::Timestamp, ExprType::Timestamp | ExprType::Date)
             | (ColumnType::Time, ExprType::Time)
+            | (ColumnType::Interval, ExprType::Interval)
+            // `TIMESTAMPTZ` 列への代入（Issue #1576）。TIMESTAMP・DATE はセッション TZ の壁時計として、
+            // TIMESTAMP・DATE 列への TIMESTAMPTZ は局所の値として変換する（PG の代入キャスト）。
+            | (
+                ColumnType::TimestampTz,
+                ExprType::TimestampTz | ExprType::Timestamp | ExprType::Date
+            )
+            | (ColumnType::Timestamp | ColumnType::Date, ExprType::TimestampTz)
     );
     if !assignable {
         return Err(SqlSurfaceError::datatype_mismatch(format!(
@@ -122,6 +132,7 @@ pub(crate) fn bind_set_expr(
         )));
     }
 
+    let bound = convert_for_assignment(&column.ty, ty, bound);
     Ok(BoundSetExpr {
         source: expr.clone(),
         bound,
@@ -129,6 +140,27 @@ pub(crate) fn bind_set_expr(
         nullable: column.nullable,
         column_name: name.to_string(),
     })
+}
+
+/// 日時型どうしの代入時の変換ノードを挟む（セッション TZ は評価時に読む。Issue #1576）。
+/// 変換不要な組（同型）はそのまま返す。
+fn convert_for_assignment(
+    target: &ColumnType,
+    from: ExprType,
+    bound: crate::sql::udf_call::BoundExpr,
+) -> crate::sql::udf_call::BoundExpr {
+    use crate::sql::udf_call::{BoundExpr, BuiltinFn};
+    let wrap = |f: BuiltinFn, inner: BoundExpr| BoundExpr::Builtin {
+        f,
+        args: vec![inner],
+    };
+    match (target, from) {
+        (ColumnType::TimestampTz, ExprType::Timestamp) => wrap(BuiltinFn::TimestampToTstz, bound),
+        (ColumnType::TimestampTz, ExprType::Date) => wrap(BuiltinFn::DateToTstz, bound),
+        (ColumnType::Timestamp, ExprType::TimestampTz) => wrap(BuiltinFn::TstzToTimestamp, bound),
+        (ColumnType::Date, ExprType::TimestampTz) => wrap(BuiltinFn::TstzToDate, bound),
+        _ => bound,
+    }
 }
 
 /// 束縛済みの SET 式を 1 行ぶん評価し、対象列型の [`Value`] へ変換する。`row_scalars` は
@@ -188,6 +220,27 @@ pub(crate) fn eval_set_expr_to_value<'a>(
             ColumnType::Time if (0..=MICROS_PER_DAY).contains(&t) => Ok(Value::Time(t)),
             ColumnType::Time => Err(SqlSurfaceError::datetime_field_overflow(
                 "time field value out of range",
+            )),
+            _ => Err(internal()),
+        },
+        // `INTERVAL` は無限大の予約値（番兵）と一致しないことを再検証し、一致したら `22008`
+        // （Issue #1581。行 codec の encode も最後の砦として検査する）。
+        ExprValue::Interval(v) => match &set.target_ty {
+            ColumnType::Interval if crate::datetime::validate_interval(&v) => {
+                Ok(Value::Interval(v))
+            }
+            ColumnType::Interval => Err(SqlSurfaceError::datetime_field_overflow(
+                "interval out of range",
+            )),
+            _ => Err(internal()),
+        },
+        // `TIMESTAMPTZ` は UTC の表現範囲を再検証し、範囲外は `22008`（Issue #1576）。
+        ExprValue::TimestampTz(t) => match &set.target_ty {
+            ColumnType::TimestampTz if crate::datetime::validate_timestamptz_micros(t) => {
+                Ok(Value::TimestampTz(t))
+            }
+            ColumnType::TimestampTz => Err(SqlSurfaceError::datetime_field_overflow(
+                "timestamptz out of range",
             )),
             _ => Err(internal()),
         },
