@@ -4,7 +4,8 @@
 //!
 //! 固定する内容: 宣言 OID の echo（列スロット・推論不能な式のスロット）、unknown（705）の
 //! 推論扱い、text／binary 形式の値の宣言型としての復号・検証、過剰宣言の `08P01`。
-//! 持たない型の OID の挙動は #2438 が変更するため固定しない。
+//! 持たない型の OID（配列型・存在しない OID・負値）は Parse で `0A000` となり、
+//! ignore-till-sync の同期回復で接続を維持する（Issue #2438。WIRE-24 (1)・WIRE-11）。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -414,4 +415,129 @@ fn over_declaration_is_08p01() {
         &[OID_INT4, OID_INT4],
         "08P01",
     );
+}
+
+/// 宣言 OID 付き Parse を送り、ErrorResponse の本文（`C`・`M` フィールド込み）を返す。
+/// 呼び出し後は Sync → ReadyForQuery まで消費して同期回復させる。
+fn parse_error_text(s: &mut Stream, name: &str, sql: &str, oids: &[i32]) -> String {
+    send_length_prefixed_message(s, b'P', &parse_declared(name, sql, oids));
+    let body = expect_kind(s, b'E');
+    send_length_prefixed_message(s, b'S', b"");
+    expect_kind(s, b'Z');
+    String::from_utf8_lossy(&body).to_string()
+}
+
+const SELECT_N: &str = "SELECT id FROM t WHERE n = $1 LIMIT 5";
+
+#[test]
+fn unsupported_oid_is_rejected_with_0a000_and_connection_survives() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    // 配列型・存在しない OID・負値・i32::MIN はいずれも持たない型（Issue #2438）。
+    for oid in [1007, 99_999, -1, i32::MIN] {
+        let text = parse_error_text(&mut s, "", SELECT_N, &[oid]);
+        assert!(text.contains("C0A000"), "oid {oid}: {text:?}");
+    }
+    // 同じ接続で後続の Parse・Bind・Execute が正常に動く。
+    let tag = run_declared(&mut s, SELECT_N, &[OID_INT4], &[0], &[b"10"]).expect("recovered");
+    assert_eq!(tag, "SELECT 1");
+    let tag = run_declared(&mut s, SELECT_N, &[0], &[0], &[b"10"]).expect("recovered");
+    assert_eq!(tag, "SELECT 1");
+}
+
+#[test]
+fn unsupported_oid_in_later_position_names_that_param() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    let text = parse_error_text(
+        &mut s,
+        "",
+        "SELECT id FROM t WHERE n = $1 AND b = $2 LIMIT 5",
+        &[OID_INT4, 1007],
+    );
+    assert!(text.contains("C0A000"), "{text:?}");
+    assert!(text.contains("$2"), "{text:?}");
+    assert!(
+        !text.contains("tenant") && !text.contains(" t "),
+        "{text:?}"
+    );
+    assert_alive(&mut s);
+}
+
+#[test]
+fn rejected_named_statement_is_not_stored() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    // 拒否された名前付き Parse は保存されない。
+    let text = parse_error_text(&mut s, "q", SELECT_N, &[1007]);
+    assert!(text.contains("C0A000"), "{text:?}");
+    send_length_prefixed_message(&mut s, b'D', &describe_statement_msg("q"));
+    let body = expect_kind(&mut s, b'E');
+    assert!(String::from_utf8_lossy(&body).contains("C08P01"));
+    send_length_prefixed_message(&mut s, b'S', b"");
+    expect_kind(&mut s, b'Z');
+    // 既存の同名 statement は拒否された再 Parse で上書き・削除されない。
+    send_length_prefixed_message(&mut s, b'P', &parse_declared("k", SELECT_N, &[OID_INT2]));
+    expect_kind(&mut s, b'1');
+    let text = parse_error_text(&mut s, "k", SELECT_N, &[1007]);
+    assert!(text.contains("C0A000"), "{text:?}");
+    send_length_prefixed_message(&mut s, b'D', &describe_statement_msg("k"));
+    let oids = param_description_oids(&expect_kind(&mut s, b't'));
+    assert_eq!(oids, vec![OID_INT2]);
+    let (k, _) = read_message(&mut s);
+    assert!(k == b'T' || k == b'n');
+    send_length_prefixed_message(&mut s, b'S', b"");
+    expect_kind(&mut s, b'Z');
+}
+
+#[test]
+fn unsupported_oid_rejection_does_not_depend_on_catalog() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    // 存在する表・存在しない表で同一の SQLSTATE と message になる（存在情報の非漏えい）。
+    let a = parse_error_text(&mut s, "", SELECT_N, &[1007]);
+    let b = parse_error_text(
+        &mut s,
+        "",
+        "SELECT id FROM no_such_table WHERE n = $1 LIMIT 5",
+        &[1007],
+    );
+    assert!(a.contains("C0A000"), "{a:?}");
+    assert_eq!(a, b);
+}
+
+#[test]
+fn precedence_of_0a000() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    // 件数上限（54000）は OID 判定より先。
+    let mut many = vec![OID_INT4; 64];
+    many.push(1007);
+    let text = parse_error_text(&mut s, "", SELECT_N, &many);
+    assert!(text.contains("C54000"), "{text:?}");
+    // 空文 + 宣言は 08P01。
+    let text = parse_error_text(&mut s, "", "", &[1007]);
+    assert!(text.contains("C08P01"), "{text:?}");
+    // Failed トランザクション中は 25P02。
+    send_simple_query(&mut s, "BEGIN");
+    loop {
+        if read_message(&mut s).0 == b'Z' {
+            break;
+        }
+    }
+    send_simple_query(&mut s, "SELECT * FROM no_such_table");
+    loop {
+        if read_message(&mut s).0 == b'Z' {
+            break;
+        }
+    }
+    let text = parse_error_text(&mut s, "", SELECT_N, &[1007]);
+    assert!(text.contains("C25P02"), "{text:?}");
+}
+
+#[test]
+fn indeterminate_position_with_unsupported_oid_is_0a000_not_42p18() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    assert_parse_error_declared(&mut s, EXPR, &[1007, OID_INT4], "0A000");
 }
