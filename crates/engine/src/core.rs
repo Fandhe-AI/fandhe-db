@@ -6836,6 +6836,15 @@ impl EngineCore {
         // ここで固定的に導出できる。`explain_engine_for`（Issue #922・SQL-27
         // で `USING PLAN` なし検索 EXPLAIN と共有するために抽出。Issue #1066
         // で使用索引名の組み立ても統合）へ委譲する。
+        // Issue #2191: 照合込みの使用可否と縮退理由（実行時の `candidates_for` と同じ判定関数）。
+        let scalar_plan_with_reason =
+            crate::sql::scalar_index::scalar_plan_under_target_with_reason(
+                explain_shape.scalar_plan(),
+                explain_shape.metadata_filter_columns(),
+                &explain_shape.text_uses(),
+                &post_check_schema,
+                &target,
+            );
         let (explain_engine, index_names) = self.explain_engine_for(
             &post_check_txn,
             table,
@@ -6853,12 +6862,8 @@ impl EngineCore {
             // 直後の `explain_engine_for` の `scalar_names_eligible` 判定
             // 〔`scalar_plan != PlainScan`〕も連動して索引名注記を出さなく
             // なる。Issue #1066 PR #1155 codex-review P2 対応と矛盾しない）。
-            crate::sql::scalar_index::scalar_plan_under_target(
-                explain_shape.scalar_plan(),
-                explain_shape.metadata_filter_columns(),
-                &post_check_schema,
-                &target,
-            ),
+            scalar_plan_with_reason.0,
+            scalar_plan_with_reason.1,
             scalar_filter_column_names.as_deref(),
         );
         drop(post_check_txn);
@@ -6942,6 +6947,7 @@ impl EngineCore {
         filters_empty: bool,
         scalar_prefilter: bool,
         scalar_plan: crate::sql::scalar_plan::ScalarPlan,
+        scalar_fallback: Option<crate::sql::scalar_index::ScalarFallbackReason>,
         scalar_filter_columns: Option<&[&str]>,
     ) -> (
         crate::sql::explain::ExplainEngine,
@@ -7044,7 +7050,8 @@ impl EngineCore {
                 self.search_engine_kind(),
                 ann_plan,
                 scalar_plan,
-            ),
+            )
+            .with_scalar_fallback(scalar_fallback),
             crate::sql::explain::ExplainIndexNames::new(ann_names, scalar_names),
         )
     }
@@ -7150,12 +7157,19 @@ impl EngineCore {
                 crate::sql::scalar_plan::numeric_predicate_columns(bound.expr_filters()).map(Some),
             )
             .collect();
-        let scalar_plan = crate::sql::scalar_index::scalar_plan_under_target(
-            scalar_plan_before_target,
-            metadata_filter_columns,
-            schema,
-            &target,
+        // Issue #2191: 照合込みの使用可否と縮退理由（実行時の `candidates_for` と同じ判定関数）。
+        let text_uses = crate::sql::explain::text_predicate_uses(
+            bound.metadata_filters(),
+            bound.expr_filters(),
         );
+        let (scalar_plan, scalar_fallback) =
+            crate::sql::scalar_index::scalar_plan_under_target_with_reason(
+                scalar_plan_before_target,
+                metadata_filter_columns,
+                &text_uses,
+                schema,
+                &target,
+            );
         let (engine, index_names) = self.explain_engine_for(
             read_txn,
             bound.table(),
@@ -7164,6 +7178,7 @@ impl EngineCore {
             filters_empty,
             scalar_prefilter,
             scalar_plan,
+            scalar_fallback,
             scalar_filter_column_names.as_deref(),
         );
         crate::sql::explain::build_search_explain_result(bound.mode(), &engine, &index_names)
@@ -7235,7 +7250,7 @@ impl EngineCore {
             &schema.name,
             self.hnsw_state.is_some(),
         );
-        let (scalar_plan, access_path) =
+        let (scalar_plan, scalar_fallback, access_path) =
             crate::sql::aggregate::classify_aggregate_access(schema, bound, &target);
         // Issue #1066: `access_path`（上記 `target` 補正後の値）が
         // `ScalarIndexCandidates` のときに限り、`metadata_filters` の列が
@@ -7267,7 +7282,12 @@ impl EngineCore {
         } else {
             crate::sql::explain::ExplainIndexNames::default()
         };
-        crate::sql::explain::build_relational_explain_result(scalar_plan, access_path, &index_names)
+        crate::sql::explain::build_relational_explain_result(
+            scalar_plan,
+            scalar_fallback,
+            access_path,
+            &index_names,
+        )
     }
 
     /// `EXPLAIN SELECT ... LIMIT n [OFFSET m]`（広域取得。ビュー展開後の形を
@@ -7304,6 +7324,7 @@ impl EngineCore {
     fn scan_explain_result() -> crate::sql::exec::QueryResult {
         crate::sql::explain::build_relational_explain_result(
             crate::sql::scalar_plan::ScalarPlan::PlainScan,
+            None,
             crate::sql::explain::AccessPath::FullScan,
             &crate::sql::explain::ExplainIndexNames::default(),
         )

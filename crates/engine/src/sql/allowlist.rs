@@ -9987,7 +9987,7 @@ pub(crate) fn validate_create_view_tokens(
     })
 }
 
-/// `CREATE INDEX <name> ON <table> [USING hnsw] (<col>[, ...])` の許可形状構造
+/// `CREATE INDEX <name> ON <table> [USING hnsw] (<col> [COLLATE <name>][, ...])` の許可形状構造
 /// 検証結果（TASK-206・INDEX-7・SQL-23、Issue #908）。[`ValidatedDropTable`] と
 /// 同じくカタログ照会を一切行わない（列の存在・型整合・名前衝突・対象の種別は
 /// `sql::ddl::execute_create_index` → `catalog::Storage::create_index` が単一の
@@ -10000,6 +10000,9 @@ pub struct ValidatedCreateIndex {
     /// 拒否済み）。
     pub(crate) hnsw: bool,
     pub(crate) columns: Vec<String>,
+    /// `columns` と同じ長さの列ごとの `COLLATE`（`None` は照合指定なし。Issue #2191・
+    /// TABLE-28）。名前の解決は固定の許可リストとの完全一致だけで、カタログを参照しない。
+    pub(crate) collations: Vec<Option<crate::collation::Collation>>,
 }
 
 impl ValidatedCreateIndex {
@@ -10017,6 +10020,11 @@ impl ValidatedCreateIndex {
 
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    /// `columns` と同じ長さの列ごとの照合指定（`None` は指定なし）。
+    pub fn column_collations(&self) -> &[Option<crate::collation::Collation>] {
+        &self.collations
     }
 }
 
@@ -10080,13 +10088,17 @@ pub(crate) fn validate_create_index_tokens(
         false
     };
     p.expect_punct('(')?;
-    let mut columns = vec![parse_index_column(&mut p)?];
+    let (first, first_collation) = parse_index_column(&mut p)?;
+    let mut columns = vec![first];
+    let mut collations = vec![first_collation];
     while matches!(p.peek(), Some(Token::Punct(','))) {
         p.advance();
         if columns.len() >= MAX_COLUMN_COUNT {
             return Err(SqlSurfaceError::payload_too_large("too many index columns"));
         }
-        columns.push(parse_index_column(&mut p)?);
+        let (column, collation) = parse_index_column(&mut p)?;
+        columns.push(column);
+        collations.push(collation);
     }
     p.expect_punct(')')?;
     if hnsw && columns.len() != 1 {
@@ -10115,12 +10127,17 @@ pub(crate) fn validate_create_index_tokens(
         table,
         hnsw,
         columns,
+        collations,
     })
 }
 
-/// [`validate_create_index_tokens`] の列リスト 1 要素。裸の識別子のみを受理する
-/// （式・関数呼び出し・括弧・リテラルは `0A000` で拒否する）。
-fn parse_index_column(p: &mut Parser<'_>) -> Result<String, SqlSurfaceError> {
+/// [`validate_create_index_tokens`] の列リスト 1 要素。裸の識別子と、その直後の任意の
+/// `COLLATE <name>`（Issue #2191・TABLE-28）のみを受理する（式・関数呼び出し・括弧・
+/// リテラルは `0A000`、2 回目の `COLLATE` は `42601`、未知の照合名は `42704`）。照合を
+/// 持てない型への指定の拒否（`42804`）は型を知るカタログ段（`Storage::create_index`）が担う。
+fn parse_index_column(
+    p: &mut Parser<'_>,
+) -> Result<(String, Option<crate::collation::Collation>), SqlSurfaceError> {
     if !matches!(p.peek(), Some(Token::Ident(_))) {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "index columns must be plain identifiers".to_string(),
@@ -10132,7 +10149,13 @@ fn parse_index_column(p: &mut Parser<'_>) -> Result<String, SqlSurfaceError> {
             detail: "expression indexes are not supported".to_string(),
         });
     }
-    Ok(name)
+    let collation = if p.peek_ident_matches("COLLATE") {
+        p.advance();
+        Some(p.parse_collation_name()?)
+    } else {
+        None
+    };
+    Ok((name, collation))
 }
 
 /// [`ValidatedDropIndex`] の構造検証本体。`IF EXISTS`・`CASCADE`・複数名の同時
@@ -14391,6 +14414,42 @@ pub(crate) fn validate_update_form_tokens(
 
 #[cfg(test)]
 mod tests {
+    /// `CREATE INDEX` の列ごとの `COLLATE`（TABLE-28、Issue #2191）。名前は構文段で許可リストに
+    /// 解決し、二重指定は `42601`、未知の名前は `42704`、式索引は `0A000`。
+    #[test]
+    fn create_index_column_collate_parses_and_classifies_errors() {
+        use super::*;
+        use crate::collation::Collation;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            validate_create_index_tokens(&tokens)
+        };
+        let ok = parse("CREATE INDEX i ON t (a COLLATE \"und-x-icu\", b, c COLLATE \"C\")")
+            .expect("accepted");
+        assert_eq!(ok.columns(), ["a", "b", "c"]);
+        assert_eq!(
+            ok.column_collations(),
+            [Some(Collation::UndIcu), None, Some(Collation::C)]
+        );
+        let plain = parse("CREATE INDEX i ON t (a, b)").expect("accepted");
+        assert_eq!(plain.column_collations(), [None, None]);
+        // 型の判定はカタログ段のため、構文段では HNSW でも通す。
+        assert!(parse("CREATE INDEX i ON t USING hnsw (v COLLATE \"C\")").is_ok());
+        for (sql, code) in [
+            ("CREATE INDEX i ON t (a COLLATE \"nope\")", "42704"),
+            (
+                "CREATE INDEX i ON t (a COLLATE \"C\" COLLATE \"C\")",
+                "42601",
+            ),
+            ("CREATE INDEX i ON t (a COLLATE)", "42601"),
+            ("CREATE INDEX i ON t (a COLLATE 'C')", "42601"),
+            ("CREATE INDEX i ON t (lower(a) COLLATE \"C\")", "0A000"),
+            ("CREATE INDEX i ON t (a COLLATE \"C\", a)", "42601"),
+        ] {
+            assert_eq!(parse(sql).expect_err(sql).wire_code(), code, "{sql}");
+        }
+    }
+
     #[test]
     fn const_select_top_level_aggregate_items_parse_shapes() {
         use super::*;

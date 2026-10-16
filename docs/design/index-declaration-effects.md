@@ -304,3 +304,7 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
   `USING PLAN` 経由の `EXPLAIN`（SQL テキスト・
   `EngineCore::explain_bound_plan_in_session` の両方）でも同じ反映が効き、
   行がビット単位で一致することを固定。
+
+## 追記（Issue #2191・TABLE-28）: 宣言の照合
+
+起動時 opt-in のとき、宣言の `COLLATE` が TEXT 系列の辞書の並び（索引の照合）になる。照合指定のない宣言は列の実効照合に従う。同じ列に解決後の照合が異なる宣言が複数あるときは、列の実効照合と同じ順序の宣言があればその照合、なければ索引名の昇順で最初の宣言の照合に決める。opt-in がなければ、宣言はカタログに記録されるだけで構築に効かない（従来どおり）。詳細は [collation-aware-index.md](collation-aware-index.md)。

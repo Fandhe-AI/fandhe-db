@@ -110,3 +110,8 @@
 - ICU4X の `CollationKeySink` は `unstable` feature の背後にあり名前を出せない（feature の追加は依存変更になる）ため、標準実装の `Vec<u8>` へ `try_reserve` で確保し、生成後に入力長の定数倍の上限と入力長の上限を検査する
 - PG 17.11（ICU 有効ビルド・ICU4C）との順序一致を、基本的な 31 値のプールで `und-x-icu`・`ja-x-icu` とも確認した（`crates/engine/tests/sql_collate_icu.rs`）。漢字の順序は `und` と `ja` で異なるが（`字` と `漢` の前後）、ICU4X でも PG と同じだった。ICU4C／ICU4X の版差は残りうるため、プールは基本の文字を中心にしている
 - 照合データの差し替え経路（環境変数 `ICU4X_DATA_DIR`・実行時のデータファイル）は作っていない。CI・開発環境で `ICU4X_DATA_DIR` を設定しない前提は #2189 のとおり
+
+## 付録: Issue #2191 での実施結果
+
+- スカラー二次索引の辞書を索引の照合順で並べ、ICU 列の等価・`IN` を索引化した（[collation-aware-index.md](collation-aware-index.md)）。ソートキーは使わず、異なり値だけを `Collation::compare` で並べる。
+- **collversion の結論**: 照合順に依存する構造はメモリ上の `ScalarIndex` だけで、プロセス起動・テーブル世代ごとに作り直す。永続の `user_uniq`・`key_index` はバイト列の等値で照合データの版に依存しない。データは `icu_collator_data = "=2.3.0"` の完全固定でバイナリに焼き込まれ、版の変更は依存更新（承認制）としてのみ起きる。したがって**現時点では再構築もカタログへの版の記録も不要**。ソートキーを永続化する順序索引や nondeterministic 照合を導入するときに、版の記録と不一致時の再構築・拒否を改めて設計する（オーナー確認事項）。
