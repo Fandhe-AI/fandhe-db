@@ -673,6 +673,10 @@ pub enum SqlSurfaceError {
     /// `DOUBLE` 単独も含む。ERR-6: `42704`）。`name` はクライアントが指定した綴りのみで、
     /// 既存の ENUM 型名・ラベル・テナント情報は含めない（fail-closed）。
     UndefinedType { name: String },
+    /// 許可リスト（`C`／`POSIX`）に無い照合名を `COLLATE` に指定した（TABLE-28、Issue #1609。
+    /// ERR-6: `42704`）。`name` はクライアントが指定した綴りのみ（カタログを参照せず
+    /// 他テナント・既存オブジェクトの情報は含めない）。
+    UndefinedCollation { name: String },
     /// 索引 DDL が参照した列が対象テーブルに存在しない、または FROM ありの SELECT／DML が
     /// 参照した列がスキーマに存在しない（TASK-206・INDEX-7、Issue #908、Issue #2332。
     /// DDL 側は [`crate::catalog::CatalogError::ColumnNotFound`] の写像。ERR-6: `42703`）。
@@ -1084,6 +1088,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::UniqueViolation => ErrorClass::UniqueViolation,
             SqlSurfaceError::UndefinedObject { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::UndefinedType { .. } => ErrorClass::UndefinedObject,
+            SqlSurfaceError::UndefinedCollation { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::UndefinedColumn { .. }
             | SqlSurfaceError::ColumnReferenceWithoutFrom => ErrorClass::UndefinedColumn,
             SqlSurfaceError::CheckViolation { .. } => ErrorClass::CheckViolation,
@@ -1278,6 +1283,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::UndefinedType { name } => {
                 write!(f, "type does not exist: {name}")
+            }
+            SqlSurfaceError::UndefinedCollation { name } => {
+                write!(f, "collation does not exist: {name}")
             }
             SqlSurfaceError::UndefinedColumn { name } => {
                 write!(f, "column does not exist: {name}")
@@ -2859,6 +2867,9 @@ struct ColumnConstraints {
     unique: bool,
     /// 列制約 `CONSTRAINT <name> UNIQUE` の明示名（TABLE-22。Issue #1428）。
     unique_name: Option<String>,
+    /// 列制約 `COLLATE <name>`（TABLE-28。Issue #1609）。名前は構文段で許可リストに
+    /// 解決済み。列型への適用可否（文字列系のみ）は実行段（`sql::ddl`）が判定する。
+    collation: Option<crate::collation::Collation>,
 }
 
 /// `CREATE TABLE` の列 1 個ぶんの構文解析結果（[`Parser::parse_create_table_column`]
@@ -3467,6 +3478,10 @@ pub struct ValidatedAlterTableAddColumn {
     /// カタログ照会を要するため実行段（`sql::ddl::execute_alter_table_add_column`）
     /// が行う。
     pub default: Option<InsertLiteral>,
+    /// `COLLATE <name>` 句（TABLE-28・Issue #1609）。名前は構文段で許可リストに解決済み。
+    /// 列型への適用可否（文字列系のみ。ENUM 解決後の判定を含む）は実行段が `42804` で判定する。
+    /// **BREAKING CHANGE**: pub フィールド追加。
+    pub collation: Option<crate::collation::Collation>,
 }
 
 /// 許可形状の構造判定を通過した `ALTER TABLE ... ADD [CONSTRAINT <name>] UNIQUE
@@ -3559,6 +3574,9 @@ pub struct ValidatedAlterTableAlterColumnType {
     pub table_name: String,
     pub column_name: String,
     pub column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+    /// `... TYPE <型> COLLATE <name>` の照合（TABLE-28・Issue #1609）。`None`（`COLLATE`
+    /// 省略）は新しい型の既定（照合指定なし）へ戻す。**BREAKING CHANGE**: pub フィールド追加。
+    pub collation: Option<crate::collation::Collation>,
 }
 
 /// `ALTER TABLE` の許可形状 8 種の和（Issue #1067・#1068・#1069・#1167・#1196）。`ParsedSql::AlterTable` が
@@ -4075,9 +4093,10 @@ impl<'a> Parser<'a> {
                 let starts_case =
                     name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
                 let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
+                // TABLE-28・Issue #1609: 識別子の直後の `COLLATE` も式項目の継続。
                 let next_is_op = self.tokens.get(self.pos + 1).is_some_and(|t| {
                     matches!(t, Token::Punct('+' | '-' | '*' | '/')) || is_json_operator_token(t)
-                });
+                }) || self.peek_ident_matches_at(1, "COLLATE");
                 if starts_case || self.is_value_function_keyword_at(self.pos) {
                     // 括弧なし SQL 値関数（SQL-37・Issue #1586）は列名ではなく式項目。
                     self.parse_projection_infix(0)?
@@ -4091,10 +4110,12 @@ impl<'a> Parser<'a> {
                     let head = self.parse_call_expr(name, 0);
                     self.allow_unary_minus = prev;
                     let head = head?;
-                    if self.peek().is_some_and(|t| {
-                        matches!(t, Token::Punct('+' | '-' | '*' | '/'))
-                            || is_json_operator_token(t)
-                    }) {
+                    if self.peek_ident_matches("COLLATE")
+                        || self.peek().is_some_and(|t| {
+                            matches!(t, Token::Punct('+' | '-' | '*' | '/'))
+                                || is_json_operator_token(t)
+                        })
+                    {
                         // `parse_value_expr(0)` と同じ段位（add=0・mul=1・primary=2）で継続する。
                         self.allow_unary_minus = true;
                         let r = self
@@ -5933,7 +5954,10 @@ impl<'a> Parser<'a> {
     }
 
     /// 乗除算ループ（`* /`）。[`Self::parse_add_rest`] と同じ理由で左辺解析済みから継続できる。
-    fn parse_mul_rest(&mut self, mut lhs: Expr, depth: usize) -> Result<Expr, SqlSurfaceError> {
+    fn parse_mul_rest(&mut self, lhs: Expr, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        // 先頭の関数呼び出しを先に読み終えた投影項目から継続する場合も、後置 `COLLATE` を
+        // 一次式の直後として受理する（`parse_primary_expr` 経由では適用済みで冪等）。
+        let mut lhs = self.parse_collate_postfix(lhs)?;
         loop {
             let op = match self.peek() {
                 Some(Token::Punct('*')) => BinOp::Mul,
@@ -5957,6 +5981,12 @@ impl<'a> Parser<'a> {
     /// キーワードとして扱う（対象ビヘイビア: SQL-26。Issue #921。既存の `AS`／
     /// `WHEN`（`sql::allowlist` 内の他の文脈的キーワード）と同じ判断）。
     fn parse_primary_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        let primary = self.parse_primary_expr_inner(depth)?;
+        self.parse_collate_postfix(primary)
+    }
+
+    /// [`Self::parse_primary_expr`] の本体（後置 `COLLATE` を除く一次式）。
+    fn parse_primary_expr_inner(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         self.check_expr_depth(depth)?;
         match self.peek().cloned() {
             // codex-review P1 指摘対応（Issue #921 PR #1101）: `NULL` は
@@ -6598,6 +6628,11 @@ impl<'a> Parser<'a> {
                     self.tokens.get(self.pos + 1),
                     Some(Token::Arrow | Token::ArrowText | Token::HashArrow | Token::HashArrowText)
                 ) {
+                    return true;
+                }
+                // TABLE-28・Issue #1609: `ORDER BY name COLLATE "C"` も式キー
+                // （列名キーでは `COLLATE` を解釈できない）。
+                if self.peek_ident_matches_at(1, "COLLATE") {
                     return true;
                 }
                 matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
@@ -7736,6 +7771,7 @@ impl<'a> Parser<'a> {
                         column_type,
                         not_null: constraints.not_null,
                         default: constraints.default,
+                        collation: constraints.collation,
                     },
                 ));
             }
@@ -7836,8 +7872,9 @@ impl<'a> Parser<'a> {
                 constraint_name,
             });
         }
-        // `ALTER COLUMN <col> TYPE <型名>`（TABLE-19、Issue #1167）。`SET DATA TYPE`・
-        // `USING`・`COLLATE` は `TYPE` 不一致／余剰トークンとして `42601`。
+        // `ALTER COLUMN <col> TYPE <型名> [COLLATE <name>]`（TABLE-19、Issue #1167。
+        // `COLLATE` は TABLE-28・Issue #1609）。`SET DATA TYPE`・`USING` は `TYPE` 不一致／
+        // 余剰トークンとして `42601`。
         if self.peek_contextual_keyword("ALTER") {
             self.advance();
             self.expect_contextual_keyword("COLUMN")?;
@@ -7846,10 +7883,18 @@ impl<'a> Parser<'a> {
             self.expect_contextual_keyword("TYPE")?;
             let column_type =
                 crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut self.pos)?;
+            // 任意の `COLLATE <name>`（1 回まで。TABLE-28・Issue #1609）。
+            let collation = if self.peek_ident_matches("COLLATE") {
+                self.advance();
+                Some(self.parse_collation_name()?)
+            } else {
+                None
+            };
             return Ok(ParsedAlterTableShape::AlterColumnType {
                 table_name,
                 column_name,
                 column_type,
+                collation,
             });
         }
         Err(SqlSurfaceError::unsupported("unsupported ALTER TABLE form"))
@@ -8326,7 +8371,10 @@ impl<'a> Parser<'a> {
                     "column {name:?}: VECTOR columns do not support UNIQUE"
                 )));
             }
-            ColumnDef::new(name, ty, false)
+            let mut column = ColumnDef::new(name, ty, false);
+            // 照合は付与だけ行い、型への適用可否は実行段（`sql::ddl`）が `42804` で判定する。
+            column.collation = constraints.collation;
+            column
         } else {
             // DEFAULT の型別変換は `ADD COLUMN` と共有する純関数
             // （`sql::ddl::add_column_default`）に一本化する。配列は種別・長さのみ検査し（Issue #1374）、
@@ -8344,6 +8392,8 @@ impl<'a> Parser<'a> {
             if let Some(default) = default {
                 column = column.with_default(default);
             }
+            // 照合は付与だけ行い、型への適用可否（ENUM 解決後を含む）は実行段が判定する。
+            column.collation = constraints.collation;
             column
         };
 
@@ -8782,7 +8832,17 @@ impl<'a> Parser<'a> {
         let mut seen_default = false;
         let mut unique = false;
         let mut unique_name: Option<String> = None;
+        let mut collation: Option<crate::collation::Collation> = None;
         loop {
+            // `COLLATE <name>`（TABLE-28。Issue #1609）。順序自由・1 回まで。
+            if self.peek_ident_matches("COLLATE") {
+                self.advance();
+                if collation.is_some() {
+                    return Err(SqlSurfaceError::unsupported("duplicate COLLATE clause"));
+                }
+                collation = Some(self.parse_collation_name()?);
+                continue;
+            }
             if self.peek_ident_matches("UNIQUE") {
                 self.advance();
                 if unique {
@@ -8845,7 +8905,49 @@ impl<'a> Parser<'a> {
             time_default,
             unique,
             unique_name,
+            collation,
         })
+    }
+
+    /// `COLLATE` 直後の照合名を読み、許可リスト（[`crate::collation::Collation`]）で解決する
+    /// （TABLE-28。Issue #1609）。名前は `Token::Ident` のみ（文字列リテラル・数値・修飾名は
+    /// `42601`）、未知の名前は `42704`。解決は固定リストとの完全一致だけでカタログを参照
+    /// しないため、DDL 権限ゲートより前（構文段）で返してもテーブルの存在オラクルにならない。
+    /// 引用識別子はハイフンを含められない（字句段の制約）ため、`"und-x-icu"` 等の ICU 名は
+    /// ICU 照合の導入（#2190）までは字句段で `42601` になる。
+    fn parse_collation_name(&mut self) -> Result<crate::collation::Collation, SqlSurfaceError> {
+        let name = match self.advance() {
+            Some(Token::Ident(name)) => name.clone(),
+            other => {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "expected collation name, got {other:?}"
+                )))
+            }
+        };
+        crate::collation::Collation::resolve_name(&name)
+            .ok_or(SqlSurfaceError::UndefinedCollation { name })
+    }
+
+    /// 一次式の直後の後置 `COLLATE <name>`（TABLE-28。Issue #1609）を左結合で繰り返し
+    /// 受理する。PostgreSQL の優先順位に合わせ、`*` `/` `+` `-`・jsonb 演算子・比較より強い
+    /// （`a || b COLLATE "C"` は `b` にだけ掛かる）。1 段ごとにノード予算を課金する。
+    /// CHECK 本体では永続化する述語の往復保証の範囲外のため `0A000`。
+    fn parse_collate_postfix(&mut self, mut lhs: Expr) -> Result<Expr, SqlSurfaceError> {
+        while self.peek_ident_matches("COLLATE") {
+            if self.in_check_body {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "COLLATE is not supported in a CHECK constraint".to_string(),
+                });
+            }
+            self.advance();
+            let collation = self.parse_collation_name()?;
+            self.consume_expr_node()?;
+            lhs = Expr::Collate {
+                expr: Box::new(lhs),
+                collation,
+            };
+        }
+        Ok(lhs)
     }
 
     /// `DEFAULT` 直後・`VALUES` 要素の先頭が時刻値関数の単独形か判定し、そうなら消費して返す
@@ -10114,6 +10216,7 @@ struct ParsedAlterTableAddColumnShape {
     column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
     not_null: bool,
     default: Option<InsertLiteral>,
+    collation: Option<crate::collation::Collation>,
 }
 
 /// 構文木（[`ValidatedAlterTable`] の元）。カタログ存在確認前の中間結果
@@ -10146,6 +10249,7 @@ enum ParsedAlterTableShape {
         table_name: String,
         column_name: String,
         column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+        collation: Option<crate::collation::Collation>,
     },
     AddPrimaryKey {
         table_name: String,
@@ -11826,6 +11930,8 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
             expr_contains_scalar_function(lhs) || expr_contains_scalar_function(rhs)
         }
+        // 照合指定（TABLE-28・Issue #1609）は従来形では書けない式。
+        Expr::Collate { .. } => true,
         Expr::Number(_)
         | Expr::String(_)
         | Expr::Ident(_)
@@ -13517,6 +13623,7 @@ pub fn validate_alter_table_tokens(
                 column_type: shape.column_type,
                 not_null: shape.not_null,
                 default: shape.default,
+                collation: shape.collation,
             })
         }
         ParsedAlterTableShape::AddUnique {
@@ -13567,10 +13674,12 @@ pub fn validate_alter_table_tokens(
             table_name,
             column_name,
             column_type,
+            collation,
         } => ValidatedAlterTable::AlterColumnType(ValidatedAlterTableAlterColumnType {
             table_name,
             column_name,
             column_type,
+            collation,
         }),
     })
 }
@@ -15490,6 +15599,52 @@ mod tests {
                 ..
             })]
         ));
+    }
+
+    /// Issue #1609（TABLE-28）: 後置 `COLLATE` は一次式の直後に結合し、`||`・`+`・比較より強い
+    /// （`d || x COLLATE "C"` は `x` にだけ掛かる）。連鎖は左結合。
+    #[test]
+    fn postfix_collate_binds_tighter_than_binary_operators() {
+        use crate::collation::Collation;
+        use crate::sql::udf_call::JsonAccessOp;
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE d || x COLLATE \"C\" = 'v' {tail}"
+        ));
+        let [WherePredicate::Expression(Expr::Binary { lhs, .. })] = preds.as_slice() else {
+            panic!("unexpected shape {preds:?}");
+        };
+        let Expr::JsonAccess {
+            op: JsonAccessOp::Concat,
+            rhs,
+            ..
+        } = lhs.as_ref()
+        else {
+            panic!("expected || at the top, got {lhs:?}");
+        };
+        assert_eq!(
+            rhs.as_ref(),
+            &Expr::Collate {
+                expr: Box::new(Expr::Ident("x".to_string())),
+                collation: Collation::C,
+            }
+        );
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE a COLLATE \"C\" COLLATE \"POSIX\" = 'v' {tail}"
+        ));
+        let [WherePredicate::Expression(Expr::Binary { lhs, .. })] = preds.as_slice() else {
+            panic!("unexpected shape {preds:?}");
+        };
+        assert_eq!(
+            lhs.as_ref(),
+            &Expr::Collate {
+                expr: Box::new(Expr::Collate {
+                    expr: Box::new(Expr::Ident("a".to_string())),
+                    collation: Collation::C,
+                }),
+                collation: Collation::Posix,
+            }
+        );
     }
 
     /// Issue #2181（TABLE-25）: `||`・`#-` は `->` と同じ段（左結合）、`-` は加減算の段のまま

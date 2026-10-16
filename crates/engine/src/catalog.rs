@@ -1023,6 +1023,83 @@ fn validate_catalog_param(param: &str) -> Result<()> {
     Ok(())
 }
 
+/// 列行 `param` 内の照合要素の接頭辞（TABLE-28・Issue #1609）。
+const COLLATION_PARAM_PREFIX: &str = "collate_";
+
+/// 照合を `param` に載せられる型タグ（`text`／`varchar`／`bpchar`）か。
+fn tag_accepts_collation(tag: &str) -> bool {
+    matches!(tag, "text" | "varchar" | "bpchar")
+}
+
+/// 文字列系の型タグの `param` に照合を合成する（TABLE-28・Issue #1609）。照合なしは従来と
+/// 同一のバイト列。文法: `text` は `-` または `collate_<t>`、`varchar` は
+/// `-`／`<n>`／`collate_<t>`／`<n>,collate_<t>`、`bpchar` は `<n>` または `<n>,collate_<t>`。
+/// 照合を付けられないタグに照合が来たら `Invalid`（encode 側の fail-closed）。
+fn encode_collation_param(
+    tag: &str,
+    base: &str,
+    collation: Option<crate::collation::Collation>,
+) -> Result<String> {
+    let Some(c) = collation else {
+        return Ok(base.to_string());
+    };
+    if !tag_accepts_collation(tag) {
+        return Err(CatalogError::Invalid(format!(
+            "{tag} column must not declare a collation"
+        )));
+    }
+    let token = c.catalog_token();
+    if base == "-" {
+        Ok(format!("{COLLATION_PARAM_PREFIX}{token}"))
+    } else {
+        Ok(format!("{base},{COLLATION_PARAM_PREFIX}{token}"))
+    }
+}
+
+/// [`encode_collation_param`] の逆変換（decode 側）。`param` を型由来の基本 `param` と照合に
+/// 分離する。未知のトークン・重複・末尾以外の位置・非正準形はすべて `CatalogError::Invalid`
+/// （fail-closed）。照合を載せられないタグ（ENUM の型名が `collate_x` である場合などを含む）の
+/// `param` には触れず、各型の文法検査に委ねる。
+fn split_collation_param<'a>(
+    tag: &str,
+    param: &'a str,
+) -> Result<(&'a str, Option<crate::collation::Collation>)> {
+    if !tag_accepts_collation(tag) {
+        return Ok((param, None));
+    }
+    let has_collation_element =
+        |s: &str| s.split(',').any(|e| e.starts_with(COLLATION_PARAM_PREFIX));
+    let (head, tail) = match param.rsplit_once(',') {
+        Some((head, tail)) => (Some(head), tail),
+        None => (None, param),
+    };
+    let Some(token) = tail.strip_prefix(COLLATION_PARAM_PREFIX) else {
+        // 末尾以外にある照合要素は拒否する。
+        if has_collation_element(param) {
+            return Err(CatalogError::Invalid(
+                "malformed collation element in column param".to_string(),
+            ));
+        }
+        return Ok((param, None));
+    };
+    let collation = crate::collation::Collation::from_catalog_token(token)
+        .ok_or_else(|| CatalogError::Invalid("unknown collation in column param".to_string()))?;
+    let base = match head {
+        None => "-",
+        Some(h) => {
+            // 基本 param 側に照合要素が残っていれば重複。`-,collate_c` のような非正準形
+            // （照合なしの `-` は先頭に出さない）も一意な正準形のため拒否する。
+            if has_collation_element(h) || h == "-" {
+                return Err(CatalogError::Invalid(
+                    "malformed collation element in column param".to_string(),
+                ));
+            }
+            h
+        }
+    };
+    Ok((base, Some(collation)))
+}
+
 /// 識別子（テーブル名・列名）のバイト長上限。PostgreSQL の識別子長慣習に整合させた
 /// 実装ローカルな値（対象ビヘイビア: TABLE-6）。
 const MAX_IDENTIFIER_LEN: usize = 63;
@@ -3491,6 +3568,12 @@ pub struct ColumnDef {
     /// 使うため、作成後に変わらないこと（`ALTER COLUMN SET DEFAULT` を導入する場合は
     /// 補完専用の値の分離が必要）が不変条件。
     pub default: Option<ColumnDefault>,
+    /// 列に明示した照合（`COLLATE "C"`／`"POSIX"`。TABLE-28・Issue #1609）。`None` は
+    /// 「照合指定なし」で、明示した `C`／`POSIX` とは区別して保存する。付けられるのは
+    /// [`crate::collation::is_collatable`] な型だけ（encode・decode 両側で fail-closed に
+    /// 検査する）。本 Issue では解析と保存のみで、比較・ソート・索引キーの意味論は変えない
+    /// （#1610・#2190・#2191）。
+    pub collation: Option<crate::collation::Collation>,
 }
 
 impl ColumnDef {
@@ -3500,7 +3583,22 @@ impl ColumnDef {
             ty,
             nullable,
             default: None,
+            collation: None,
         }
+    }
+
+    /// [`ColumnDef::new`] に照合を追加した版（TABLE-28・Issue #1609）。
+    pub fn with_collation(mut self, collation: crate::collation::Collation) -> Self {
+        self.collation = Some(collation);
+        self
+    }
+
+    /// カタログ列行用の型タグと `param`。型由来の `param`（[`ColumnType::catalog_fields`]）に
+    /// 照合を合成する（[`encode_collation_param`]）。生存列の encode はすべてここを通す。
+    fn catalog_fields(&self) -> Result<(&'static str, String)> {
+        let (tag, base) = self.ty.catalog_fields();
+        let param = encode_collation_param(tag, &base, self.collation)?;
+        Ok((tag, param))
     }
 
     /// [`ColumnDef::new`] に `DEFAULT` を追加した版（TABLE-16・TASK-204、
@@ -6314,7 +6412,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         for slot in schema.physical_slots() {
             match slot {
                 PhysicalSlot::Live(_, column) => {
-                    let (type_name, param_field) = column.ty.catalog_fields();
+                    let (type_name, param_field) = column.catalog_fields()?;
                     out.push_str(&encode_column_line_v5(
                         &column.name,
                         type_name,
@@ -6375,7 +6473,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         for slot in schema.physical_slots() {
             match slot {
                 PhysicalSlot::Live(_, column) => {
-                    let (type_name, param_field) = column.ty.catalog_fields();
+                    let (type_name, param_field) = column.catalog_fields()?;
                     out.push_str(&encode_column_line_v5(
                         &column.name,
                         type_name,
@@ -6452,7 +6550,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         for slot in schema.physical_slots() {
             match slot {
                 PhysicalSlot::Live(_, column) => {
-                    let (type_name, param_field) = column.ty.catalog_fields();
+                    let (type_name, param_field) = column.catalog_fields()?;
                     out.push_str(&encode_column_line_v5(
                         &column.name,
                         type_name,
@@ -6503,7 +6601,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         for slot in schema.physical_slots() {
             match slot {
                 PhysicalSlot::Live(_, column) => {
-                    let (type_name, param_field) = column.ty.catalog_fields();
+                    let (type_name, param_field) = column.catalog_fields()?;
                     out.push_str(&encode_column_line_v3(
                         &column.name,
                         type_name,
@@ -6534,7 +6632,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         for column in &schema.columns {
             // 型タグ・`param` の往復は ColumnType::catalog_fields に集約する
             // （Issue #880 D2。型を追加する際にここを個別に触らずに済む）。
-            let (type_name, param_field) = column.ty.catalog_fields();
+            let (type_name, param_field) = column.catalog_fields()?;
             out.push_str(&encode_column_line(
                 &column.name,
                 type_name,
@@ -6552,7 +6650,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         for slot in schema.physical_slots() {
             match slot {
                 PhysicalSlot::Live(_, column) => {
-                    let (type_name, param_field) = column.ty.catalog_fields();
+                    let (type_name, param_field) = column.catalog_fields()?;
                     out.push_str(&encode_column_line_v3(
                         &column.name,
                         type_name,
@@ -6853,7 +6951,8 @@ fn decode_schema_body(
         // 未知の型タグ・型別の `param` 文法違反は、ここで `ColumnDef`（`name` の
         // 所有 `String` を確保する）を構築する前に拒否する（アロケーション前拒否。
         // Issue #880 D7）。
-        let ty = ColumnType::from_catalog_fields(type_name, param_field, resolve_enum)?;
+        let (base_param, collation) = split_collation_param(type_name, param_field)?;
+        let ty = ColumnType::from_catalog_fields(type_name, base_param, resolve_enum)?;
 
         let nullable = match nullable_field {
             "0" => false,
@@ -6868,6 +6967,7 @@ fn decode_schema_body(
         match state_field {
             None | Some("L") => {
                 let mut column = ColumnDef::new(name, ty, nullable);
+                column.collation = collation;
                 if let Some(field) = default_field {
                     // decode 側は「fail-closed（不正な default はスキーマ自体を
                     // 読み込み不能にする）」方針。`ColumnDefault::compatible_with`
@@ -6930,6 +7030,12 @@ fn decode_schema_body(
                             "dropped column {name:?} must not declare a DEFAULT"
                         )));
                     }
+                }
+                // 墓標は照合を持たない（encode 側は合成しない。TABLE-28・Issue #1609）。
+                if collation.is_some() {
+                    return Err(CatalogError::Invalid(format!(
+                        "dropped column {name:?} must not declare a collation"
+                    )));
                 }
                 // 墓標の型は必ずフレーム等価型（TABLE-19 D1・D2）でなければ
                 // ならない。手書きの不正データが `VECTOR`／`ENUM`／`JSON`／
@@ -8782,7 +8888,8 @@ impl Storage {
         column_name: &str,
         new_precision: u8,
     ) -> Result<()> {
-        self.alter_column_type_with(table_name, column_name, |current| {
+        self.alter_column_type_with(table_name, column_name, |col| {
+            let current = &col.ty;
             let (old_precision, old_scale) = match current {
                 ColumnType::Numeric { precision, scale } => (*precision, *scale),
                 other => {
@@ -8808,6 +8915,7 @@ impl Storage {
                     precision: new_precision,
                     scale: old_scale,
                 },
+                col.collation,
                 AlterPlan::CatalogOnly,
             ))
         })
@@ -8842,16 +8950,55 @@ impl Storage {
     /// 判定を単一 write txn 内で完結させる（表層が事前に読んだ scale と書込時点の
     /// scale がずれる TOCTOU を作らない。DROP して同名で ADD し直された列に
     /// 誤って確定しない）。`NUMERIC` の範囲不正は型不一致判定より先に `Invalid`。
+    #[cfg(test)]
     pub(crate) fn alter_table_alter_column_type(
         &self,
         table_name: &str,
         column_name: &str,
         target: &ColumnType,
     ) -> std::result::Result<(), AlterCheckError> {
+        self.alter_table_alter_column_type_collated(table_name, column_name, target, None)
+    }
+
+    /// [`Self::alter_table_alter_column_type`] に照合（`... TYPE <型> COLLATE <名前>`。
+    /// TABLE-28・Issue #1609）を加えた版。`collation` は変更後の列の照合で、`None`（`COLLATE`
+    /// 省略）は新しい型の既定（照合指定なし）へ戻す。型が同じで照合だけが変わる場合は
+    /// カタログのみ書き換える（`C`／`POSIX` はどちらもバイト列順で、行・索引の再構築は
+    /// 不要。#2191 で照合込みの索引を導入したら、照合の変更時に再構築すること）。
+    /// 照合を付けられない型への指定は `Invalid`（表層が先に `42804` で拒否する多層防御）。
+    pub(crate) fn alter_table_alter_column_type_collated(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        target: &ColumnType,
+        collation: Option<crate::collation::Collation>,
+    ) -> std::result::Result<(), AlterCheckError> {
         if let ColumnType::Numeric { precision, scale } = target {
             validate_numeric_precision_scale(*precision, *scale)?;
         }
-        self.alter_column_type_with(table_name, column_name, |current| match (current, target) {
+        if collation.is_some() && !crate::collation::is_collatable(target) {
+            return Err(CatalogError::Invalid(
+                "collation is not allowed for this column type".to_string(),
+            )
+            .into());
+        }
+        self.alter_column_type_with(table_name, column_name, |col| {
+            if col.ty == *target && col.collation != collation {
+                return Ok((target.clone(), collation, AlterPlan::CatalogOnly));
+            }
+            let (new_ty, plan) = Self::decide_alter_type(&col.ty, column_name, target)?;
+            Ok((new_ty, collation, plan))
+        })
+    }
+
+    /// 型変更の可否判定（照合を除く）。[`Self::alter_table_alter_column_type_collated`] の
+    /// `decide` 本体で、受理する組は同関数の呼び出し元ドキュメントを参照。
+    fn decide_alter_type(
+        current: &ColumnType,
+        column_name: &str,
+        target: &ColumnType,
+    ) -> Result<(ColumnType, AlterPlan)> {
+        match (current, target) {
             (
                 ColumnType::Numeric {
                     precision: p0,
@@ -8907,7 +9054,7 @@ impl Storage {
                     to: format!("{to_tag},{to_param}"),
                 })
             }
-        })
+        }
     }
 
     /// 列型変更の共通本体。単一 write txn 内で 予約名拒否 → スキーマ decode →
@@ -8932,7 +9079,10 @@ impl Storage {
         &self,
         table_name: &str,
         column_name: &str,
-        decide: impl FnOnce(&ColumnType) -> Result<(ColumnType, AlterPlan)>,
+        decide: impl FnOnce(
+            &ColumnDef,
+        )
+            -> Result<(ColumnType, Option<crate::collation::Collation>, AlterPlan)>,
     ) -> std::result::Result<(), AlterCheckError> {
         validate_identifier(table_name)?;
         validate_identifier(column_name)?;
@@ -8964,7 +9114,7 @@ impl Storage {
                 .columns
                 .get_mut(logical_index)
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
-            let (new_ty, plan) = decide(&column.ty)?;
+            let (new_ty, new_collation, plan) = decide(column)?;
             // SMALLINT への縮小では列 DEFAULT も範囲内であること。`ADD COLUMN ... NOT NULL
             // DEFAULT` の列は既存行にバイトが無く読み出し時に DEFAULT で補われるため、
             // 行の走査だけでは範囲外の DEFAULT を見逃す（Issue #1560）。
@@ -9004,6 +9154,7 @@ impl Storage {
                 }
             }
             column.ty = new_ty;
+            column.collation = new_collation;
             // `CHECK` 制約が参照する列の型変更は、評価結果が不変であることを論証できる
             // 拡大変換（`INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`）に限り受理する
             // （Issue #1427）。それ以外（NUMERIC 精度拡大）は述語の意味を黙って変えない
@@ -16689,5 +16840,101 @@ mod tests {
                 vec!["b".to_string()],
             )]);
         assert!(validate_schema(&colliding).is_err());
+    }
+
+    /// 照合（`COLLATE`。TABLE-28・Issue #1609）は列行の `param` に載り、`text`／`varchar`／
+    /// `bpchar` で往復する。照合指定なしの列は従来と同一のバイト列（版も v2 のまま）。
+    #[test]
+    fn encode_decode_roundtrips_column_collations() {
+        use crate::collation::Collation;
+        let schema = TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, true).with_collation(Collation::C),
+                ColumnDef::new("b", ColumnType::Varchar(None), true)
+                    .with_collation(Collation::Posix),
+                ColumnDef::new("c", ColumnType::Varchar(Some(3)), true)
+                    .with_collation(Collation::C),
+                ColumnDef::new("d", ColumnType::Bpchar(5), true).with_collation(Collation::Posix),
+                ColumnDef::new("e", ColumnType::Text, true),
+                ColumnDef::new("f", ColumnType::Varchar(Some(3)), true),
+            ],
+        );
+        let encoded = encode_schema(&schema).expect("encode");
+        assert_eq!(
+            encoded,
+            b"v2\ncols:6\na:text:collate_c:1\nb:varchar:collate_posix:1\n\
+              c:varchar:3,collate_c:1\nd:bpchar:5,collate_posix:1\ne:text:-:1\nf:varchar:3:1\n"
+                .to_vec()
+        );
+        assert_eq!(decode_schema("t", &encoded).expect("decode"), schema);
+    }
+
+    /// 照合は墓標・主キー・DEFAULT・UNIQUE を持つ版（v3〜v6）でも往復し、墓標行には付かない。
+    #[test]
+    fn column_collations_roundtrip_across_format_versions() {
+        use crate::collation::Collation;
+        let schema = TableSchema::from_parts(
+            "docs",
+            vec![
+                ColumnDef::new("code", ColumnType::Text, false).with_collation(Collation::Posix),
+                ColumnDef::new("lang", ColumnType::Varchar(Some(8)), true)
+                    .with_default(ColumnDefault::Text("ja".to_string()))
+                    .with_collation(Collation::C),
+            ],
+            vec![DroppedSlot {
+                physical_index: 1,
+                name: "old".to_string(),
+                ty: ColumnType::Text,
+            }],
+            Some(vec!["code".to_string()]),
+            vec![UniqueConstraint::new(vec!["lang".to_string()])],
+        );
+        let encoded = encode_schema(&schema).expect("encode");
+        let text = std::str::from_utf8(&encoded).expect("utf8");
+        assert!(text.contains("code:text:collate_posix:0:L:-\n"), "{text}");
+        assert!(text.contains("old:text:-:1:D:-\n"), "{text}");
+        let decoded = decode_schema("docs", &encoded).expect("decode");
+        assert_eq!(decoded, assign_unique_constraint_names(schema));
+    }
+
+    /// 不正な照合 param は decode 側で fail-closed に拒否する（未知トークン・重複・末尾以外・
+    /// 非正準形・照合を持てない型・墓標行）。
+    #[test]
+    fn corrupt_collation_params_are_rejected() {
+        for bad in [
+            "a:text:collate_icu:1",
+            "a:text:collate_C:1",
+            "a:text:collate_:1",
+            "a:text:collate_c,collate_c:1",
+            "a:varchar:3,collate_c,collate_c:1",
+            "a:varchar:collate_c,3:1",
+            "a:varchar:-,collate_c:1",
+            "a:bpchar:collate_c:1",
+            "a:integer:collate_c:1",
+            "a:integer:-,collate_c:1",
+            "a:vector:3,collate_c:1",
+        ] {
+            let body = format!("v2\ncols:1\n{bad}\n");
+            assert!(
+                decode_schema("t", body.as_bytes()).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        let dropped = "v3\ncols:2\nkeep:text:-:1:L\ngone:text:collate_c:1:D\n";
+        assert!(decode_schema("t", dropped.as_bytes()).is_err());
+    }
+
+    /// 照合を持てない型への照合は encode 側でも拒否し、不正な param を永続化しない。
+    #[test]
+    fn encode_rejects_collation_on_non_collatable_type() {
+        use crate::collation::Collation;
+        for ty in [ColumnType::Integer, ColumnType::Boolean, ColumnType::Jsonb] {
+            let schema = TableSchema::new(
+                "t",
+                vec![ColumnDef::new("a", ty.clone(), true).with_collation(Collation::C)],
+            );
+            assert!(encode_schema(&schema).is_err(), "{ty:?} must be rejected");
+        }
     }
 }

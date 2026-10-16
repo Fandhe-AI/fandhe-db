@@ -7092,6 +7092,8 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
         // expr_columns_within` と同じ走査規則）。`Expr::Null`・括弧なし値関数
         // （Issue #1586）は列参照を持たない。
         Expr::Null | Expr::ValueFunction { .. } => {}
+        // 照合指定（TABLE-28・Issue #1609）は内側の式の列参照を集める。
+        Expr::Collate { expr, .. } => collect_expr_idents(expr, out),
         Expr::Case { whens, else_result } => {
             for (cond, result) in whens {
                 collect_expr_idents(cond, out);
@@ -7699,6 +7701,10 @@ fn rewrite_group_row_idents(
         },
         Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(rec).collect::<Result<_, _>>()?),
         Expr::NullIf(a, b) => Expr::NullIf(Box::new(rec(a)?), Box::new(rec(b)?)),
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(rec(expr)?),
+            collation: *collation,
+        },
     })
 }
 

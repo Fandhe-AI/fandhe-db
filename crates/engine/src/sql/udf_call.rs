@@ -293,6 +293,16 @@ pub enum Expr {
         kind: ValueFunctionKind,
         precision: Option<u8>,
     },
+    /// 式の照合指定 `<expr> COLLATE "<名前>"`（対象ビヘイビア: TABLE-28。Issue #1609）。
+    /// 構文段（`allowlist::Parser`）が照合名を許可リスト（[`crate::collation::Collation`]）で
+    /// 解決済みで、未知の名前は `42704` で拒否されている。Issue #1609 では `C`／`POSIX`
+    /// （どちらも既定のバイト列順と同値）だけを受理するため、束縛後の意味は内側の式と同じ
+    /// （束縛段は内側が文字列系であることだけを検査する）。比較・ソートへの照合の伝播と
+    /// ICU 照合は #1610・#2190 が担う。
+    Collate {
+        expr: Box<Expr>,
+        collation: crate::collation::Collation,
+    },
 }
 
 /// 括弧なし SQL 値関数の種別（[`Expr::ValueFunction`]）。
@@ -1077,6 +1087,10 @@ pub(crate) fn first_non_builtin_call_with(
             first_non_builtin_call_with(lhs, allow_current_time, allow_json_fns)
                 .or_else(|| first_non_builtin_call_with(rhs, allow_current_time, allow_json_fns))
         }
+        // 照合指定（TABLE-28・Issue #1609）は内側の式を検査するだけ。
+        Expr::Collate { expr, .. } => {
+            first_non_builtin_call_with(expr, allow_current_time, allow_json_fns)
+        }
         Expr::Case { whens, else_result } => whens
             .iter()
             .find_map(|(c, r)| {
@@ -1494,6 +1508,8 @@ fn validate_closed_expr(
     match expr {
         Expr::Number(_) => Ok(()),
         Expr::String(_) => Ok(()),
+        // 照合指定（TABLE-28・Issue #1609）は内側の式を検査する（束縛段が文字列系か検査する）。
+        Expr::Collate { expr, .. } => validate_closed_expr(expr, params, registry, node_budget),
         // jsonb パス演算子は列参照を要するため、列参照を持てない関数本体では常に未対応
         // （Issue #1596。jsonb 値を受け取る関数引数型も存在しない）。
         Expr::JsonAccess { .. } => Err(SqlSurfaceError::FeatureNotSupported {
@@ -2599,6 +2615,25 @@ pub(super) fn bind_expr_any(
         .checked_sub(1)
         .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
     match expr {
+        // 照合指定（TABLE-28・Issue #1609）。照合名は構文段で許可リスト（`C`／`POSIX`）に
+        // 解決済み。どちらも既定のバイト列順と同値なので、内側が文字列系（TEXT／VARCHAR／CHAR・
+        // 文字列リテラル）であることを検査したうえで内側の `BoundExpr` をそのまま返す
+        // （照合を持たない型は `42804`）。`BoundExpr` への照合の保持は #1610・#2190 が担う。
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => {
+            let (bound, ty) = bind_expr_any(inner, env, node_budget)?;
+            match collation {
+                crate::collation::Collation::C | crate::collation::Collation::Posix => {}
+            }
+            if ty != ExprType::Text {
+                return Err(SqlSurfaceError::datatype_mismatch(
+                    "collations are not supported by this expression type",
+                ));
+            }
+            Ok((bound, ty))
+        }
         Expr::Number(raw) => {
             let v = parse_number_literal(raw)?;
             Ok((BoundExpr::Number(v), ExprType::Scalar))

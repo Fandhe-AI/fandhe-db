@@ -1818,6 +1818,8 @@ fn collect_referenced_udfs(
         // UDF 呼び出しを持たない葉と同じく子を再帰的に走査するだけでよい
         // （UDF 呼び出しは `Expr::Call` 経由でのみ発生する）。
         Expr::Null | Expr::ValueFunction { .. } => Ok(()),
+        // 照合指定（TABLE-28・Issue #1609）は内側の式の UDF 呼び出しを再帰的に走査する。
+        Expr::Collate { expr, .. } => collect_referenced_udfs(expr, udf_registry, out),
         Expr::Case { whens, else_result } => {
             for (cond, result) in whens {
                 collect_referenced_udfs(cond, udf_registry, out)?;
@@ -1935,6 +1937,7 @@ fn push_set_expr(
                 walk(b, lhs);
                 walk(b, rhs);
             }
+            Expr::Collate { expr, .. } => walk(b, expr),
             Expr::Case { whens, else_result } => {
                 for (c, r) in whens {
                     walk(b, c);
@@ -2124,6 +2127,16 @@ fn push_dml_expr(
             b.push_u8(kind.hash_tag());
             b.push_u8(u8::from(precision.is_some()));
             b.push_u8(precision.unwrap_or(0));
+        }
+        // タグ 14（対象ビヘイビア: TABLE-28。Issue #1609。ADR §4.4 タグ表に追記）。
+        // 照合のカタログトークンを長さ前置で連結してから内側の式を前置順に直列化する。
+        // `COLLATE` の有無・照合の違いだけが異なる再送を同一内容と誤判定しない
+        // （RECOVER-10）。既存タグ 1〜13 は不変。
+        Expr::Collate { expr, collation } => {
+            b.push_u8(14);
+            b.push_bytes(collation.catalog_token().as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            push_dml_expr(b, expr, params)?;
         }
     }
     Ok(())
@@ -4701,6 +4714,15 @@ mod tests {
             rhs: Box::new(r),
         }
     }
+    fn collate(
+        inner: crate::sql::udf_call::Expr,
+        collation: crate::collation::Collation,
+    ) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::Collate {
+            expr: Box::new(inner),
+            collation,
+        }
+    }
     fn value_function(
         kind: crate::sql::udf_call::ValueFunctionKind,
         precision: Option<u8>,
@@ -4994,6 +5016,22 @@ mod tests {
                 "value function vs identifier",
                 value_function(crate::sql::udf_call::ValueFunctionKind::CurrentDate, None),
                 ident("current_date"),
+            ),
+            // Issue #1609（TABLE-28）: `COLLATE` の有無・照合の違いで区別される（タグ 14）。
+            (
+                "collate presence",
+                ident("name"),
+                collate(ident("name"), crate::collation::Collation::C),
+            ),
+            (
+                "collate collation",
+                collate(ident("name"), crate::collation::Collation::C),
+                collate(ident("name"), crate::collation::Collation::Posix),
+            ),
+            (
+                "collate operand",
+                collate(ident("a"), crate::collation::Collation::C),
+                collate(ident("b"), crate::collation::Collation::C),
             ),
             (
                 "beyond 2^53 integer vs decimal spelling",
