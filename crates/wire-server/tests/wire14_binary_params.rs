@@ -488,7 +488,8 @@ fn unsupported_slots_are_0a000_and_checked_before_lengths() {
         &[Some(&[0, 1]), Some(b"1")],
     );
     expect_err(o, "0A000", &mut s);
-    // NULL は format に関わらず従来どおり 22000。
+    // NULL は値が無いため format に関わらず 22000 では拒否されず、リテラル `n = NULL` と
+    // 同じ規則（42703）になる（WIRE-24・Issue #2439）。
     let o = query(
         &mut s,
         "SELECT id FROM t WHERE n = $1 LIMIT 5",
@@ -496,7 +497,7 @@ fn unsupported_slots_are_0a000_and_checked_before_lengths() {
         &[1],
         &[None],
     );
-    expect_err(o, "22000", &mut s);
+    expect_err(o, "42703", &mut s);
 }
 
 #[test]
