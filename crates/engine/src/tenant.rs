@@ -2858,7 +2858,7 @@ fn validate_set_assignments(
             ) => {
                 // TIMESTAMPTZ 値は行コーデック上 9 バイト固定（`row_codec::SCALAR_TIMESTAMPTZ_ENTRY_LEN`）。
                 // Rust API から直接渡された範囲外値も対象行の探索より前に拒否する多層防御を
-                // 置く（Issue #1569）。
+                // 置く（Issue #1574）。
                 if !crate::datetime::validate_timestamptz_micros(*micros) {
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                         "SET value out of range for TIMESTAMPTZ column".to_string(),

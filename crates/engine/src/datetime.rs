@@ -781,6 +781,7 @@ pub fn format_timestamptz(utc_micros: i64, tz: &SessionTimeZone) -> String {
     }
     out
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

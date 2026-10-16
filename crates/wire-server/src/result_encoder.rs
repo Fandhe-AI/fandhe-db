@@ -2919,8 +2919,8 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// Issue #1571: TIME は time（OID 1083・typlen 8）を公告し、text は `HH:MM:SS[.ffffff]`、
-    /// バイナリは 0 時起点 µs の 8 バイト BE で出す。範囲外の `Cell::Time` は fail-closed。
+    /// Issue #1574: TIMESTAMPTZ は text（OID 25）で公告し、値は UTC の ISO 形式で出す。
+    /// バイナリ形式は未対応のため fail-closed で拒否する。
     #[test]
     fn timestamptz_column_is_advertised_as_text_with_utc_iso_and_no_binary() {
         use engine::catalog::ColumnType;
@@ -2949,6 +2949,8 @@ mod tests {
         }
     }
 
+    /// Issue #1571: TIME は time（OID 1083・typlen 8）を公告し、text は `HH:MM:SS[.ffffff]`、
+    /// バイナリは 0 時起点 µs の 8 バイト BE で出す。範囲外の `Cell::Time` は fail-closed。
     #[test]
     fn time_column_is_advertised_as_time_with_text_and_binary() {
         use engine::catalog::ColumnType;
