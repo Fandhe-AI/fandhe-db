@@ -477,6 +477,10 @@ fn read_year_month(sc: &mut Scanner<'_>, acc: &mut Acc) -> ParseResult<()> {
         return Err(IntervalLiteralError::FieldOverflow);
     }
     let (y, m) = if neg { (-y, -m) } else { (y, m) };
+    // `2020-01-01` や `1-2-3` のような日付形は PG17 で 22007 となるため、Y-M の直後の `-` を拒否する。
+    if sc.peek() == Some(b'-') {
+        return Err(BAD_FORMAT);
+    }
     acc.add_years(y)?;
     acc.add_months(m)
 }
@@ -491,6 +495,8 @@ fn parse_postgres_like(s: &str) -> ParseResult<Acc> {
     let mut fields = 0usize;
     let mut ago = false;
     let mut seen_item = false;
+    // 値要素（数値・時刻・年月）を 1 つ以上読んだか。`@` 単独・`ago` 単独を拒否するため。
+    let mut values = 0usize;
     loop {
         sc.skip_ws();
         if sc.at_end() {
@@ -524,13 +530,16 @@ fn parse_postgres_like(s: &str) -> ParseResult<Acc> {
         }
         if is_year_month(&sc) {
             read_year_month(&mut sc, &mut acc)?;
+            values += 1;
             continue;
         }
         if here_is_time(&sc) {
             read_time(&mut sc, &mut acc)?;
+            values += 1;
             continue;
         }
         let n = read_number(&mut sc)?;
+        values += 1;
         sc.skip_ws();
         match sc.peek() {
             Some(c) if c.is_ascii_alphabetic() => {
@@ -559,7 +568,7 @@ fn parse_postgres_like(s: &str) -> ParseResult<Acc> {
             }
         }
     }
-    if !seen_item {
+    if !seen_item || values == 0 {
         return Err(BAD_FORMAT);
     }
     if ago {
@@ -640,6 +649,7 @@ fn parse_iso8601(s: &str) -> ParseResult<Acc> {
     }
     let mut in_time = false;
     let mut components = 0usize;
+    let mut time_components = 0usize;
     while !sc.at_end() {
         if sc.peek() == Some(b'T') {
             if in_time {
@@ -650,6 +660,9 @@ fn parse_iso8601(s: &str) -> ParseResult<Acc> {
             continue;
         }
         components += 1;
+        if in_time {
+            time_components += 1;
+        }
         if components > MAX_INTERVAL_FIELDS {
             return Err(BAD_FORMAT);
         }
@@ -668,7 +681,8 @@ fn parse_iso8601(s: &str) -> ParseResult<Acc> {
         };
         apply_unit(&mut acc, n, unit)?;
     }
-    if components == 0 {
+    // `T` の後に時間要素が無い（`P1DT`）入力は不正。
+    if components == 0 || (in_time && time_components == 0) {
         return Err(BAD_FORMAT);
     }
     Ok(acc)
@@ -855,6 +869,12 @@ mod tests {
             "P",
             "PT",
             "1 day ago 1",
+            "@",
+            "ago",
+            "@ ago",
+            "P1DT",
+            "2020-01-01",
+            "1-2-3",
         ] {
             assert!(
                 matches!(parse_interval(bad), Err(IntervalLiteralError::Format(_))),
