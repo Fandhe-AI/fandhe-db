@@ -825,12 +825,37 @@ fn describe_portal_returns_row_description_or_no_data_without_parameter_descript
     assert_eq!(kind, b'n', "expected NoData");
 }
 
-/// 受け入れ条件 10（WIRE-14 結線）: `id` 列（`numeric`）への binary 形式
-/// 指定は非対応型として `0A000` で回復可能（[`result_encoder::
-/// column_binary_support`] が `Id` を非対応とする）。
+/// 受け入れ条件 10（WIRE-14 結線）: VECTOR 列への binary 形式指定は非対応型
+/// として `0A000` で回復可能（[`result_encoder::column_binary_support`] が
+/// `Vector` を非対応とする。`id`〔numeric〕は Issue #2442 で対応済み）。
 #[test]
 fn binary_result_format_on_unsupported_column_is_rejected_with_feature_not_supported() {
     let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = tcp_connect(addr);
+
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("s1", "SELECT embedding FROM documents LIMIT 1", 0),
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'1');
+    send_length_prefixed_message(
+        &mut stream,
+        b'B',
+        &bind_body_with_binary_result_format("p1", "s1"),
+    );
+    assert_error_then_recovers(&mut stream, "0A000");
+}
+
+/// WIRE-14・Issue #2442: `id`（numeric 公告）への binary 形式指定は受理され、
+/// Bind が `BindComplete` で成功する。
+#[test]
+fn binary_result_format_on_id_column_is_accepted() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 1);
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
     let mut stream = tcp_connect(addr);
@@ -847,7 +872,8 @@ fn binary_result_format_on_unsupported_column_is_rejected_with_feature_not_suppo
         b'B',
         &bind_body_with_binary_result_format("p1", "s1"),
     );
-    assert_error_then_recovers(&mut stream, "0A000");
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'2', "expected BindComplete");
 }
 
 /// 受け入れ条件 10（WIRE-14 結線）: `TEXT` 列は binary 形式に対応する

@@ -412,17 +412,7 @@ fn per_column_format_codes_apply_independently() {
 #[test]
 fn unsupported_columns_binary_request_is_0a000_and_connection_survives() {
     let (mut s, _g, _) = connect("alice", "correct-horse");
-    for col in [
-        "tags",
-        "mood",
-        "embedding",
-        "price",
-        "day",
-        "ts",
-        "doc",
-        "docb",
-        "id",
-    ] {
+    for col in ["tags", "mood", "embedding", "day", "ts", "doc", "docb"] {
         let sql = format!("SELECT {col} FROM t WHERE id = 1 LIMIT 10");
         close_all(&mut s);
         parse(&mut s, "s", &sql);
@@ -511,6 +501,42 @@ fn run_with_oids(stream: &mut Stream, sql: &str, codes: &[i16]) -> (Vec<u32>, Ve
     (oids, formats, rows)
 }
 
+/// `numeric_send` 形式（ndigits・weight・sign・dscale・base-10000 桁群）を
+/// テキスト表現へ戻すテスト側の独立デコーダ（エンコーダの実装とは共有しない）。
+fn decode_numeric(bytes: &[u8]) -> String {
+    let h = |i: usize| i16::from_be_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+    let nd = h(0) as usize;
+    assert_eq!(bytes.len(), 8 + nd * 2, "numeric length");
+    let (weight, sign, dscale) = (i32::from(h(1)), h(2) as u16, h(3) as usize);
+    let digit = |w: i32| -> i16 {
+        let idx = weight - w;
+        if idx >= 0 && (idx as usize) < nd {
+            h(4 + idx as usize)
+        } else {
+            0
+        }
+    };
+    let mut int_s = String::new();
+    for w in (0..=weight.max(0)).rev() {
+        int_s.push_str(&format!("{:04}", digit(w)));
+    }
+    let int_t = int_s.trim_start_matches('0');
+    let int_t = if int_t.is_empty() { "0" } else { int_t };
+    let mut frac = String::new();
+    let mut w = -1;
+    while frac.len() < dscale {
+        frac.push_str(&format!("{:04}", digit(w)));
+        w -= 1;
+    }
+    frac.truncate(dscale);
+    let neg = if sign == 0x4000 { "-" } else { "" };
+    if dscale > 0 {
+        format!("{neg}{int_t}.{frac}")
+    } else {
+        format!("{neg}{int_t}")
+    }
+}
+
 /// バイナリセルを型 OID に応じて text 表現へ復号する。
 fn decode_by_oid(oid: u32, bytes: &[u8]) -> String {
     match oid {
@@ -528,6 +554,7 @@ fn decode_by_oid(oid: u32, bytes: &[u8]) -> String {
         701 => engine::scalar_float::format_double(f64::from_bits(u64::from_be_bytes(
             bytes.try_into().unwrap(),
         ))),
+        1700 => decode_numeric(bytes),
         other => panic!("unexpected oid {other}"),
     }
 }
@@ -619,20 +646,14 @@ fn expression_columns_binary_matches_text() {
     );
 }
 
-/// Issue #1407: バイナリ非対応の静的型（`numeric`・`date`・`timestamp`）や静的型なし
+/// Issue #1407: バイナリ非対応の静的型（`date`・`timestamp`。numeric は Issue #2442 で対応済み）や静的型なし
 /// （ベクトル式）、非対応キー列の `GROUP BY` は引き続き `0A000` で、接続は維持される。
 #[test]
 fn unsupported_computed_columns_binary_request_is_0a000_and_connection_survives() {
     let (mut s, _g, _) = connect("alice", "correct-horse");
     for sql in [
-        "SELECT MIN(id) AS m FROM t",
         "SELECT MIN(day) AS m FROM t",
         "SELECT MAX(ts) AS m FROM t",
-        "SELECT SUM(price) AS m FROM t",
-        // Issue #2271: `SUM(BIGINT)` は numeric のためバイナリ非対応（WIRE-14）。
-        "SELECT SUM(b) AS m FROM t",
-        // Issue #2270: 整数の `AVG` も numeric のためバイナリ非対応（WIRE-14。#2441・#2442）。
-        "SELECT AVG(n) AS m FROM t",
         "SELECT vec_div(embedding, 2.0) AS half FROM t LIMIT 10",
         "SELECT day, COUNT(*) AS c FROM t GROUP BY day LIMIT 10",
         "SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn, MIN(day) OVER () AS m FROM t LIMIT 10",
@@ -645,6 +666,54 @@ fn unsupported_computed_columns_binary_request_is_0a000_and_connection_survives(
         let (_, rows) = run(&mut s, sql, &[0]);
         assert!(!rows.is_empty(), "{sql}");
     }
+}
+
+/// Issue #2442（WIRE-13・WIRE-14・TABLE-13）: numeric を公告する結果列（NUMERIC 列・
+/// `id`・`SUM/MIN/MAX(id)`・整数の `AVG`・`SUM(BIGINT)`・NUMERIC 列の `SUM`）の
+/// バイナリがテキストと同じ値へ戻る。NULL セルは長さ -1。
+#[test]
+fn numeric_columns_binary_matches_text() {
+    let (mut s, _g, _) = connect("alice", "correct-horse");
+    // price は id 1 のみ 123.45、他は NULL。
+    assert_binary_matches_text(&mut s, "SELECT price FROM t WHERE id = 1 LIMIT 10", &[1700]);
+    let rows = assert_binary_matches_text(
+        &mut s,
+        "SELECT id, price FROM t ORDER BY id LIMIT 10",
+        &[1700, 1700],
+    );
+    assert_eq!(rows[1][1], None, "NULL numeric は長さ -1");
+    assert_binary_matches_text(
+        &mut s,
+        "SELECT MIN(id) AS lo, MAX(id) AS hi, SUM(id) AS s_id, SUM(price) AS s_p, \
+         SUM(b) AS s_b, AVG(n) AS a_n FROM t",
+        &[1700, 1700, 1700, 1700, 1700, 1700],
+    );
+    // price = 123.45 の生バイト（ndigits 2・weight 0・sign +・dscale 2・[123, 4500]）。
+    let (_, rows) = run(&mut s, "SELECT price FROM t WHERE id = 1 LIMIT 10", &[1]);
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some(&[0, 2, 0, 0, 0, 0, 0, 2, 0x00, 0x7B, 0x11, 0x94][..])
+    );
+}
+
+/// Issue #2442: numeric のバイナリ結果でも他テナントの行・集計値は混ざらない（RLS-7）。
+#[test]
+fn numeric_binary_results_respect_tenant_boundary() {
+    let (mut s, _g, _) = connect("bob", "battery-staple");
+    let rows = assert_binary_matches_text(&mut s, "SELECT id FROM t LIMIT 10", &[1700]);
+    assert_eq!(rows.len(), 1, "bob sees only his own row");
+    assert_eq!(decode_numeric(rows[0][0].as_deref().unwrap()), "10");
+    let rows = assert_binary_matches_text(
+        &mut s,
+        "SELECT MIN(id) AS lo, SUM(id) AS s_id, AVG(n) AS a_n FROM t",
+        &[1700, 1700, 1700],
+    );
+    assert_eq!(decode_numeric(rows[0][0].as_deref().unwrap()), "10");
+    assert_eq!(decode_numeric(rows[0][1].as_deref().unwrap()), "10");
+    assert_eq!(
+        decode_numeric(rows[0][2].as_deref().unwrap()),
+        "777.0000000000000000"
+    );
 }
 
 /// Issue #1407: 集計・ウィンドウのバイナリ結果にも他テナントの Private 行は混ざらない（RLS-7）。
