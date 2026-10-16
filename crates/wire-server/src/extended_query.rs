@@ -1385,10 +1385,9 @@ fn build_param_slots(
     if declared.len() > types.len() {
         return Err(HandlerError::DeclaredParamTypesExceedPlaceholders);
     }
-    let slots = types
-        .iter()
-        .enumerate()
-        .map(|(i, ty)| {
+    let mut slots = Vec::with_capacity(types.len());
+    for (i, ty) in types.iter().enumerate() {
+        {
             let declared_oid = match declared.get(i).copied().unwrap_or(0) {
                 UNKNOWN_OID => 0,
                 other => other,
@@ -1399,19 +1398,27 @@ fn build_param_slots(
                 }
                 PreparedParamType::Column(meta) => result_encoder::column_wire_type(meta).oid(),
                 // 宣言型がスロット型になるのは宣言があるときだけ（`declared_oid != 0`）。
-                PreparedParamType::Declared(_) => declared_oid,
+                // 不変条件の破れ（宣言欠落・0）は 0 公告にせず fail-closed で拒否する。
+                PreparedParamType::Declared(_) => {
+                    if declared_oid == 0 {
+                        return Err(internal_error(
+                            "declared parameter slot has no declared type oid",
+                        ));
+                    }
+                    declared_oid
+                }
             };
             let oid = if declared_oid != 0 {
                 declared_oid
             } else {
                 inferred_oid
             };
-            ParamSlot {
+            slots.push(ParamSlot {
                 oid,
                 binary: binary_param_kind(ty, declared_oid, oid),
-            }
-        })
-        .collect();
+            });
+        }
+    }
     Ok(slots)
 }
 
@@ -2956,6 +2963,56 @@ mod tests {
                 portal_with_bound_bytes(MAX_BOUND_PARAM_BYTES_PER_SESSION),
             )
             .expect("credit returns after clear_all");
+    }
+
+    /// WIRE-12 ポインタ（Issue #2436）: `Declared` スロットに宣言 OID が無い（短い・0）
+    /// 不整合は 0 公告にせず fail-closed で拒否する。
+    #[test]
+    fn build_param_slots_rejects_declared_slot_without_declared_oid() {
+        use engine::sql::params::DeclaredParamType as D;
+        let path = std::env::temp_dir().join(format!(
+            "fandhe-ext-declared-oid-{}-{:?}.redb",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let storage = engine::storage::Storage::open(&path).expect("open storage");
+        let engine = EngineCore::from_storage(storage, Box::new(engine::kernel::CpuScalarProvider));
+        let ctx = engine::policy::PolicyContext::with_visibilities(
+            "sys",
+            [
+                engine::storage::Visibility::Public,
+                engine::storage::Visibility::Private,
+            ],
+        )
+        .expect("valid tenant");
+        let mut session = SessionState::default();
+        session.allow_ddl();
+        engine
+            .execute_sql_in_session(&ctx, &mut session, "CREATE TABLE docs (n INTEGER)")
+            .expect("create table");
+        let prepared = engine
+            .parse_sql_prepared_with_declared(
+                "UPDATE docs SET n = $1 + $2 WHERE id = 1 USING OPERATION_ID 'op-1'",
+                &[Some(D::Int4), Some(D::Int4)],
+            )
+            .expect("prepare");
+        assert!(matches!(
+            prepared.param_types(),
+            [
+                PreparedParamType::Declared(_),
+                PreparedParamType::Declared(_)
+            ]
+        ));
+        assert!(build_param_slots(&prepared, &[]).is_err());
+        assert!(build_param_slots(&prepared, &[23]).is_err());
+        assert!(build_param_slots(&prepared, &[0, 23]).is_err());
+        assert!(build_param_slots(&prepared, &[UNKNOWN_OID, 23]).is_err());
+        let Ok(slots) = build_param_slots(&prepared, &[23, 23]) else {
+            panic!("declared oid present must succeed");
+        };
+        assert_eq!(slots[0].oid, 23);
+        drop(engine);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
