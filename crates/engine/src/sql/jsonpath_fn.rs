@@ -759,15 +759,9 @@ fn eval_sql_json<'a>(
     row_scalars: &'a [Option<ScalarRef<'a>>],
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
     use crate::sql::udf_call::eval_with_scalars;
-    let ctx_text = match eval_with_scalars(&f.target, id, embedding, row_scalars)? {
-        ExprValue::Null => return Ok(ExprValue::Null),
-        ExprValue::Json(t) => t,
-        _ => return Err(internal("SQL/JSON context item is not a jsonb value")),
-    };
-    let Some(path) = f.path.as_ref() else {
-        return Ok(ExprValue::Null);
-    };
-    let root = crate::json::parse_jsonb_for_build(&ctx_text).map_err(json_build_error)?;
+    let ctx_value = eval_with_scalars(&f.target, id, embedding, row_scalars)?;
+    // PASSING 式は NULL 短絡より先に評価する（jsonb_path_* と同じく vars の評価エラーを
+    // NULL 行でも伝播させ、行ごとにエラー有無が変わらないようにする）。
     let mut vars = std::collections::BTreeMap::new();
     for (var, e) in &c.passing {
         let v = eval_with_scalars(e, id, embedding, row_scalars)?;
@@ -776,6 +770,15 @@ fn eval_sql_json<'a>(
             crate::sql::udf_call::json_value_from_expr_value(&v)?,
         );
     }
+    let ctx_text = match ctx_value {
+        ExprValue::Null => return Ok(ExprValue::Null),
+        ExprValue::Json(t) => t,
+        _ => return Err(internal("SQL/JSON context item is not a jsonb value")),
+    };
+    let Some(path) = f.path.as_ref() else {
+        return Ok(ExprValue::Null);
+    };
+    let root = crate::json::parse_jsonb_for_build(&ctx_text).map_err(json_build_error)?;
     let vars_value = JsonValue::Object(vars);
     let mut opts = JsonPathEvalOptions::new().with_limits(f.limits);
     if !c.passing.is_empty() {
