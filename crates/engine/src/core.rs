@@ -1898,6 +1898,11 @@ pub struct PreparedSql {
     /// `$n` ごとの型公告（`param_types().len() == param_count`。WIRE-12）。
     /// Parse 時点のカタログ（スキーマ）だけから導出し、行には触れない。
     param_types: Vec<crate::sql::params::PreparedParamType>,
+    /// Parse で宣言された型 OID から写した `$n` ごとの宣言型（`declared.len() ==
+    /// param_count`。未宣言・0・unknown・持たない型は `None`。Issue #2436・WIRE-24 ポインタ）。
+    /// 推論型（`param_types`）を上書きせず並べて保持する（変換可否の判定が両方を見るため）。
+    /// Bind は値を宣言型として検証する（[`EngineCore::bind_prepared`]）。
+    declared: Vec<Option<crate::sql::params::DeclaredParamType>>,
     /// Parse 時の構造検証 parse がセッション TimeZone を読んだか（ゾーン無し `TIMESTAMPTZ`
     /// リテラル・`AT LOCAL` の定数畳み込み。Issue #1576）。`true` の文は `dummy_parsed` を
     /// 実行へ再利用せず、Bind ごとにセッション TimeZone の下で再 parse する。
@@ -1905,9 +1910,15 @@ pub struct PreparedSql {
 }
 
 impl PreparedSql {
+    /// `$n` ごとの宣言型（`param_count()` と同じ長さ。宣言なしは `None`）。
+    pub fn declared_param_types(&self) -> &[Option<crate::sql::params::DeclaredParamType>] {
+        &self.declared
+    }
+
     /// `$n` ごとの型公告（`param_count()` と同じ長さ。番号 1 始まりの `n` が
     /// `n - 1` 番目）。wire-server の `ParameterDescription` の OID・バイナリ
-    /// 受理可否の判定にだけ使う（値の検証意味論には影響しない。WIRE-12）。
+    /// 受理可否の判定に使う（WIRE-12）。値の宣言型としての検証は
+    /// [`Self::declared_param_types`] と [`EngineCore::bind_prepared`] が担う（WIRE-24）。
     pub fn param_types(&self) -> &[crate::sql::params::PreparedParamType] {
         &self.param_types
     }
@@ -4077,6 +4088,20 @@ impl EngineCore {
         &self,
         sql: &str,
     ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
+        self.parse_sql_prepared_with_declared(sql, &[])
+    }
+
+    /// [`Self::parse_sql_prepared`] に Parse で宣言された型（wire-server が型 OID から
+    /// 写した `$n` ごとの宣言型。番号 1 始まりの `n` が `n - 1` 番目、`None` は未宣言）を
+    /// 渡す版（Issue #2436・WIRE-24 ポインタ）。宣言型は推論段で反映する: 推論できない
+    /// 位置・未参照番号は宣言型をスロット型とし（`42P18` にしない）、推論型がある位置は
+    /// 推論型のまま宣言型を並べて保持する。`declared` が `param_count` より長い余剰分は
+    /// ここでは無視する（過剰宣言の `08P01` は wire-server が判定する）。
+    pub fn parse_sql_prepared_with_declared(
+        &self,
+        sql: &str,
+        declared: &[Option<crate::sql::params::DeclaredParamType>],
+    ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = crate::sql::lexer::tokenize_with_params(sql)?;
         // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW`
         // は DDL であり、`sql::params` が受理する `$n` の許可位置一覧
@@ -4135,7 +4160,7 @@ impl EngineCore {
         // 式内 `$n`（`1 + $1` 等）は文字列ダミーでは定数畳み込み／束縛の型検査に落ちるため、
         // 推論を parse より前に置く。推論不能（`42P18`）のときだけ、構文エラー（`42601`）を
         // 先に返す（PostgreSQL と同じ優先順位）ため文字列ダミーで parse を試す。
-        let param_types = match self.infer_param_types(&tokens, param_count) {
+        let param_types = match self.infer_param_types(&tokens, param_count, declared) {
             Ok(types) => types,
             Err(e @ crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype { .. }) => {
                 // 文字列ダミーの定数畳み込みで型エラーになっても途中終了しないよう、
@@ -4180,6 +4205,9 @@ impl EngineCore {
             order_by_distance_literal_is_param,
             where_equality_dummy_flags,
             param_types,
+            declared: (0..usize::from(param_count))
+                .map(|i| declared.get(i).copied().flatten())
+                .collect(),
             session_tz_dependent,
         })
     }
@@ -4201,6 +4229,7 @@ impl EngineCore {
         &self,
         tokens: &[crate::sql::lexer::Token],
         param_count: u16,
+        declared: &[Option<crate::sql::params::DeclaredParamType>],
     ) -> Result<Vec<crate::sql::params::PreparedParamType>, crate::sql::allowlist::SqlSurfaceError>
     {
         use crate::sql::allowlist::SqlSurfaceError;
@@ -4304,6 +4333,23 @@ impl EngineCore {
                     ParamInference::Indeterminate => expr_indeterminate = true,
                 }
             }
+            // Issue #2436・WIRE-24: 推論型が無い（全出現が推論不能、または未参照）番号は、
+            // 宣言型があればそれをスロット型にする（`42P18` にしない）。式の中で扱えない
+            // 宣言型は推論時と同じく `0A000`。推論型がある位置は宣言型で上書きしない。
+            if resolved.is_empty() {
+                if let Some(d) = declared.get(idx).copied().flatten() {
+                    if expr_indeterminate && !d.is_supported_in_expr() {
+                        let param = u16::try_from(idx.saturating_add(1)).unwrap_or(u16::MAX);
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: format!(
+                                "parameter ${param} of this data type is not supported inside an expression"
+                            ),
+                        });
+                    }
+                    out.push(PreparedParamType::Declared(d));
+                    continue;
+                }
+            }
             if resolved.is_empty() && expr_indeterminate {
                 let param = u16::try_from(idx.saturating_add(1)).unwrap_or(u16::MAX);
                 return Err(SqlSurfaceError::IndeterminateDatatype { param });
@@ -4360,7 +4406,45 @@ impl EngineCore {
                 ),
             ));
         }
-        let decoded = crate::sql::params::decode_bind_values_nullable(&prepared.tokens, values)?;
+        // Issue #2436・WIRE-24: 宣言型がある値は、置換の前に宣言型として検証する。
+        // NULL は検証対象外で SQL の NULL として置換される。非 UTF-8 は後段の復号が拒否する。
+        // float4 は浮動小数スロットに限り丸めた正規値で Bind 値を差し替え、受信形式によらず同じ結果にする。
+        // 差し替えは復号（総バイト数上限 MAX_INPUT_LEN の検証）より前に行い、正規化で
+        // 長くなった値も参照回数込みで上限検査の対象にする。
+        let mut canonical_values: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (i, decl) in prepared.declared.iter().enumerate() {
+            let (Some(ty), Some(Some(raw))) = (decl, values.get(i)) else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(raw) else {
+                continue;
+            };
+            let n = u16::try_from(i.saturating_add(1)).unwrap_or(u16::MAX);
+            let canonical = crate::sql::params::validate_declared_value(n, *ty, text)?;
+            // 正規値への差し替えは、置換先が浮動小数リテラルのスロットに限る。整数・文字列・
+            // 真偽値スロットでは元の値を据え置き（`'2'` が `'2.0'` になる等を避ける）、
+            // 宣言型としての検証だけを行う。
+            let is_float_slot = prepared
+                .param_types
+                .get(i)
+                .is_some_and(|t| t.literal_kind() == crate::sql::params::ParamLiteralKind::Float);
+            if let (Some(canonical), true) = (canonical, is_float_slot) {
+                canonical_values.push((i, canonical.into_bytes()));
+            }
+        }
+        let effective: std::borrow::Cow<'_, [Option<Vec<u8>>]> = if canonical_values.is_empty() {
+            std::borrow::Cow::Borrowed(values)
+        } else {
+            let mut v = values.to_vec();
+            for (i, bytes) in canonical_values {
+                if let Some(slot) = v.get_mut(i) {
+                    *slot = Some(bytes);
+                }
+            }
+            std::borrow::Cow::Owned(v)
+        };
+        let decoded =
+            crate::sql::params::decode_bind_values_nullable(&prepared.tokens, &effective)?;
         let kinds: Vec<crate::sql::params::ParamLiteralKind> = prepared
             .param_types
             .iter()

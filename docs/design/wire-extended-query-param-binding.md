@@ -12,7 +12,8 @@ wire 側（`crates/wire-server/src/extended_query.rs`）の Parse／Describe(S)�
 - Parse: 宣言型件数は `MAX_PARAMS`（64）超過を OID 復号より前に `54000` で拒否する。
   `$n` を含まない文は従来どおり `Parsed`（`PreparedSql::parsed_if_unparameterized`）
   として保持し挙動不変。`$n` を含む文は `PreparedStatement::Parameterized` を保持する。
-- 宣言 OID は値の検証には一切使わない（値は常にリテラル置換経路を通る）。0 以外は
+- 宣言 OID は Issue #2436（WIRE-24 ポインタ）以降、値の検証にも用いる（後述「Parse の型 OID
+  指定時の判定規則」。値は常にリテラル置換経路を通る点は不変）。0 以外は
   `ParameterDescription` へ echo し、0・未宣言は engine の型推論
   （`PreparedSql::param_types`。`ORDER BY <vec> <=> $n` は text 公告だがバイナリ不可の
   `VectorText`、`USING PLAN($n)`／`USING OPERATION_ID $n` は `Text`、`WHERE <列> = $n`
@@ -208,7 +209,7 @@ prepared_params.rs` で固定）。
   （`BOOLEAN`・`DATE`・`TIMESTAMP`・`NUMERIC` 等）の `$n` は、式の中では置換後のリテラルがその型として
   束縛されないため `0A000` で fail-closed にする
 - エラー文言には `$n` の番号だけを含める（値・表の存在情報は含めない）
-- 既知の PG 差分: Parse の宣言 OID は engine に渡らないため、宣言があっても推論不能なら `42P18`（#2436・#2437 で解消予定。後述「Parse の型 OID 指定時の判定規則」参照）。
+- 既知の PG 差分: Parse の宣言 OID（0・705 以外で本 DB が持つ型）は #2436 で engine に渡り、推論不能な位置は宣言型で解決する（`42P18` は宣言が無い番号だけ）。宣言済みの `$k` を式内の別の `$m` の推論の相手として伝播させること（`$1::int4 + $2` で `$2` を int4 にする等）はしない（OID 0 の推論は不変）。
   小数リテラルとの演算は `DOUBLE`（PG は numeric）。`-$1` は `0 - $1` に脱糖されるため
   `INTEGER`（PG では曖昧）。`INSERT ... VALUES` の `-$1` に負の実値を Bind すると `- -n` となり
   `42601` で fail-closed（既存の二重マイナス拒否と同じ契約）。`ON CONFLICT ... DO UPDATE SET` の式と `$n` は別担当（`42601` のまま）
@@ -229,6 +230,28 @@ prepared_params.rs` で固定）。
 - 新しい `wire_code` は追加せず、既存の `ErrorClass` と HTTP 射影を使う。エラー文には値・
   表の存在情報を含めず、テナント境界を越える情報を返さない。
 - 既存テストが固定している寛容な挙動の更新は #2436・#2437 の担当が行う（削除・弱体化はしない）。
+
+### #2436 の決定事項（宣言 OID の公告と値の復号。WIRE-24・WIRE-12・WIRE-14 ポインタ）
+
+- 運搬: wire-server が宣言 OID を `WireType::from_oid` で engine の `DeclaredParamType` へ写し
+  （写像は `WireType::declared_param_type` の網羅 `match` のみ）、
+  `EngineCore::parse_sql_prepared_with_declared` へ渡す。既存の `parse_sql_prepared` は宣言なしの
+  薄いラッパー。`PreparedSql::declared_param_types` が宣言型を、`param_types` が推論型を、
+  並べて保持する（上書きしない。#2437 が両方を見て変換可否を判定する）。
+- 0 と unknown（705）は宣言なしとして推論・公告する。持たない型の OID も現状は推論へ倒す
+  （公告の echo とバイナリの扱いは従来のまま。#2438 が Parse 時の `0A000` に置き換える）。
+- スロット型: 推論型がある位置は推論型のまま。推論型が無い位置（式内の全出現が推論不能・
+  未参照番号）は宣言型を `PreparedParamType::Declared` としてスロット型にし、`42P18` を返さない。
+  式の中で扱えない宣言型（`BOOLEAN`・日時・`NUMERIC` 等）は推論時と同じ `0A000`。
+- 値の検証: Bind はテキスト形式の正規テキストを置換の前に宣言型として検証する。整数系は
+  既存の整数文法と値域（不正 `22P02`・範囲外 `22003`）、浮動小数系は既存の浮動小数文法
+  （`float4` は有限性も確認）、`bool` は `parse_pg_bool`。text 系と `numeric`・日時・`bytea`・
+  `uuid`・`json(b)` は、単独で呼べる検証器を第 2 の文法として持たない方針により追加検証をせず、
+  束縛後の既存リテラル経路に委ねる。エラー文言は `$n` 番号と型名だけで値を含めない。
+- バイナリ: `Declared` スロットは宣言型の受信形式を受理する（`NUMERIC`・日時・`JSON` は
+  未対応のまま `0A000`）。推論スロット側の互換表は変更しない（#2437 が置き換える）。
+- 受理範囲: 宣言型として値が不正な場合の拒否が増え、推論不能位置と未参照番号の宣言型が
+  受理に変わる。それ以外は据え置く（fail-closed）。新しい `wire_code` は追加しない。
 
 ## 値の形式（型付き置換。Issue #1342）
 
