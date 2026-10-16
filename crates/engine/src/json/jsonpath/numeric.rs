@@ -149,24 +149,52 @@ pub(super) fn div(a: &Decimal, b: &Decimal) -> Result<Decimal, NumFail> {
         .max(i64::from(b.scale()))
         .max(0);
     // 結果の `unscaled` = round(a.unscaled * 10^(rscale + b.scale - a.scale) / b.unscaled)。
+    // 結果 scale が表現範囲外なら確定で桁あふれ（`make` と同じ結論を長除算の前に出す）。
+    if rscale > 38 {
+        return Err(NumFail::Overflow);
+    }
     let k = rscale + i64::from(b.scale()) - i64::from(a.scale());
     let mut num = a.unscaled().unsigned_abs();
     let mut den = b.unscaled().unsigned_abs();
+    let mut q: u128;
+    let mut r: u128;
     if k >= 0 {
-        let f = 10u128
-            .checked_pow(u32::try_from(k).map_err(|_| NumFail::Overflow)?)
-            .ok_or(NumFail::Overflow)?;
-        num = num.checked_mul(f).ok_or(NumFail::Overflow)?;
+        // 分子へ 10^k を掛けず、1 桁ずつの長除算で中間値の膨張を避ける
+        // （成否は結果 q が i128 に収まるかのみで決まる）。
+        q = num / den;
+        r = num % den;
+        for _ in 0..k {
+            let mut acc: u128 = 0;
+            let mut digit: u128 = 0;
+            for _ in 0..10 {
+                // acc + r を `acc >= den - r` の比較でオーバーフローなく畳み込む（r < den）。
+                if acc >= den - r {
+                    acc -= den - r;
+                    digit += 1;
+                } else {
+                    acc += r;
+                }
+            }
+            r = acc;
+            q = q
+                .checked_mul(10)
+                .and_then(|x| x.checked_add(digit))
+                .ok_or(NumFail::Overflow)?;
+        }
     } else {
-        let f = 10u128
-            .checked_pow(u32::try_from(-k).map_err(|_| NumFail::Overflow)?)
-            .ok_or(NumFail::Overflow)?;
-        den = den.checked_mul(f).ok_or(NumFail::Overflow)?;
+        let m = u32::try_from(-k).map_err(|_| NumFail::Overflow)?;
+        match 10u128.checked_pow(m).and_then(|f| den.checked_mul(f)) {
+            Some(d) => den = d,
+            None => {
+                // 除数が u128 を超える: 被除数は i128 絶対値以下なので商 0・丸めも 0。
+                num = 0;
+                den = 1;
+            }
+        }
+        q = num / den;
+        r = num % den;
     }
-    let mut q = num / den;
-    let r = num % den;
-    // half away from zero: 2r >= den なら絶対値を 1 増やす（2r は den <= u128::MAX/2 でなくても
-    // 比較を `r >= den - r` で行ってオーバーフローを避ける）。
+    // half away from zero: 2r >= den を `r >= den - r` で行ってオーバーフローを避ける。
     if r >= den - r {
         q = q.checked_add(1).ok_or(NumFail::Overflow)?;
     }

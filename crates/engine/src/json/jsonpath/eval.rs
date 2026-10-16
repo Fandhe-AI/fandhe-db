@@ -46,6 +46,13 @@ use crate::numeric::Decimal;
 /// 別に、メモリを有界にするための安全弁（超過は `54000`）。
 pub const MAX_SEQUENCE_ITEMS: usize = 1_048_576;
 
+/// 1 回の評価で新規に確保してよい値のバイト数の累計上限（複製・文字列生成の合計。
+/// ノード数課金だけでは巨大文字列の複製を抑えられないための安全弁。超過は `54000`）。
+pub const MAX_EVAL_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
+
+/// 値 1 ノードあたりの固定費として見積もるバイト数（バイト予算の概算用）。
+const NODE_COST_BYTES: u64 = 32;
+
 /// 評価の失敗。`wire_code()` は PostgreSQL 17 の SQLSTATE に合わせる。`client_message` は
 /// 固定の英語文で、キー名・変数名・値・位置など入力の断片を含めない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -495,6 +502,8 @@ struct Ev<'a> {
     /// 添字式の中の `last` が参照する、最も内側の配列の長さ（添字の外では -1）。
     innermost: i64,
     steps_left: u64,
+    /// 新規確保の残りバイト予算（複製・文字列生成の前に差し引く）。
+    bytes_left: u64,
     depth: usize,
     max_depth: usize,
     /// `.keyvalue()` の `id` 用。コンテナのアドレス → 文書内の先行順番号（遅延構築）。
@@ -508,6 +517,16 @@ impl<'a> Ev<'a> {
             return Err(hard(JsonPathEvalError::StepLimitExceeded));
         }
         self.steps_left -= n;
+        Ok(())
+    }
+
+    /// 確保の前にバイト予算を差し引く。超過は `54000`（抑止不可）。
+    fn charge_bytes(&mut self, n: u64) -> R<()> {
+        if n > self.bytes_left {
+            self.bytes_left = 0;
+            return Err(hard(JsonPathEvalError::ResultTooLarge));
+        }
+        self.bytes_left -= n;
         Ok(())
     }
 
@@ -1053,6 +1072,7 @@ impl<'a> Ev<'a> {
     #[inline(never)]
     fn get_array_index(&mut self, node: &'a PathNode, jb: &Item<'a>) -> R<i64> {
         let mut seq: Vec<Item<'a>> = Vec::new();
+        // PostgreSQL 17 の実測（TABLE-25 fixture）では lax でも結果配列はアンラップされない。
         self.exec_item(node, jb, Some(&mut seq))?;
         let n = match seq.as_slice() {
             [one] => one.num(),
@@ -1348,7 +1368,11 @@ impl<'a> Ev<'a> {
                 _ => Err(self.soft(JsonPathEvalError::NonNumericItem)),
             },
             Method::String => match jb.kind() {
-                Kind::Str => Ok(Item::Str(Cow::Owned(jb.str().unwrap_or("").to_string()))),
+                Kind::Str => {
+                    let src = jb.str().unwrap_or("");
+                    self.charge_bytes(u64::try_from(src.len()).unwrap_or(u64::MAX))?;
+                    Ok(Item::Str(Cow::Owned(src.to_string())))
+                }
                 Kind::Bool => {
                     let b = matches!(jb, Item::Bool(true) | Item::Ref(JsonValue::Bool(true)));
                     Ok(Item::Str(Cow::Borrowed(if b { "true" } else { "false" })))
@@ -2072,7 +2096,10 @@ fn parse_numeric_text(s: &str) -> Option<JsonNumber> {
     if neg {
         text.push('-');
     }
-    text.push_str(if int_part.is_empty() { "0" } else { &int_part });
+    // RFC 8259 は整数部の先頭ゼロと不正な綴りを許さない。Decimal へ変換できない場合の
+    // フォールバック（text をそのまま保持）でも有効な JSON になるよう、常に正規化する。
+    let int_norm = int_part.trim_start_matches('0');
+    text.push_str(if int_norm.is_empty() { "0" } else { int_norm });
     if !frac_part.is_empty() {
         text.push('.');
         text.push_str(&frac_part);
@@ -2187,18 +2214,29 @@ fn parse_bool_text(s: &str) -> Option<bool> {
 /// 項目を所有の [`JsonValue`] にする。部分木の複製は大きさ（ノード数）に比例して課金する。
 fn materialize(ev: &mut Ev<'_>, item: Item<'_>) -> Result<JsonValue, JsonPathEvalError> {
     let into = |ev: &mut Ev<'_>, v: &JsonValue| -> Result<JsonValue, JsonPathEvalError> {
-        // 明示スタックでノード数を数えて課金してから複製する。
+        // 明示スタックでノード数とバイト数を数えて課金してから複製する。
         let mut n: u64 = 0;
+        let mut bytes: u64 = 0;
         let mut stack: Vec<&JsonValue> = vec![v];
         while let Some(x) = stack.pop() {
             n = n.saturating_add(1);
+            bytes = bytes.saturating_add(NODE_COST_BYTES);
             match x {
                 JsonValue::Array(a) => stack.extend(a.iter()),
-                JsonValue::Object(m) => stack.extend(m.values()),
+                JsonValue::Object(m) => {
+                    for (k, c) in m {
+                        bytes = bytes.saturating_add(u64::try_from(k.len()).unwrap_or(u64::MAX));
+                        stack.push(c);
+                    }
+                }
+                JsonValue::String(s) => {
+                    bytes = bytes.saturating_add(u64::try_from(s.len()).unwrap_or(u64::MAX));
+                }
                 _ => {}
             }
         }
         ev.tick(n).map_err(unwrap_fail)?;
+        ev.charge_bytes(bytes).map_err(unwrap_fail)?;
         Ok(v.clone())
     };
     match item {
@@ -2206,8 +2244,14 @@ fn materialize(ev: &mut Ev<'_>, item: Item<'_>) -> Result<JsonValue, JsonPathEva
         Item::Null => Ok(JsonValue::Null),
         Item::Bool(b) => Ok(JsonValue::Bool(b)),
         Item::Num(n) => Ok(JsonValue::Number(n)),
-        Item::Str(s) => Ok(JsonValue::String(s.into_owned())),
+        Item::Str(s) => {
+            ev.charge_bytes(u64::try_from(s.len()).unwrap_or(u64::MAX))
+                .map_err(unwrap_fail)?;
+            Ok(JsonValue::String(s.into_owned()))
+        }
         Item::KeyValue { id, key, value } => {
+            ev.charge_bytes(u64::try_from(key.len()).unwrap_or(u64::MAX))
+                .map_err(unwrap_fail)?;
             let mut m = BTreeMap::new();
             m.insert("id".to_string(), JsonValue::Number(int_number(id)));
             m.insert("key".to_string(), JsonValue::String(key.to_string()));
@@ -2249,6 +2293,7 @@ fn run<'a>(
         current: Item::Ref(root),
         innermost: -1,
         steps_left: opts.limits.max_eval_steps(),
+        bytes_left: MAX_EVAL_ALLOC_BYTES,
         depth: 0,
         max_depth: opts.limits.max_eval_depth(),
         id_map: None,
@@ -2312,7 +2357,11 @@ pub fn jsonpath_match(
     opts: JsonPathEvalOptions<'_>,
 ) -> Result<Option<bool>, JsonPathEvalError> {
     let silent = opts.silent;
-    let (_suppressed, items, _ev) = run(path, root, &opts, true)?;
+    let (suppressed, items, _ev) = run(path, root, &opts, true)?;
+    // 抑止されたエラーで終わった場合は、途中に集まった項目に依らず NULL（silent 時のみ到達）。
+    if suppressed {
+        return Ok(None);
+    }
     if let [one] = items.as_slice() {
         match one {
             Item::Bool(b) | Item::Ref(JsonValue::Bool(b)) => return Ok(Some(*b)),

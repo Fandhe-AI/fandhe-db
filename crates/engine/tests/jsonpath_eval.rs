@@ -1077,3 +1077,40 @@ fn worst_case_shapes_fit_in_two_mib_stack() {
     // 深さ 1,000 の連鎖は既定の上限内で成功する。
     assert_eq!(in_small_stack(long_ops("[*]"), "1"), Ok(1));
 }
+
+fn eval_query(path: &str, json: &str) -> Result<Vec<JsonValue>, JsonPathEvalError> {
+    let p = parse_jsonpath(path).expect("parse");
+    let doc = parse_json(json).expect("json");
+    jsonpath_query(&p, &doc, JsonPathEvalOptions::new())
+}
+
+#[test]
+fn cloned_bytes_are_budgeted_cumulatively() {
+    // 1 MiB の文字列を同じ添字で多数回複製する。ノード数課金は 1 件 1 ノードで通るが、
+    // 累計バイト予算（256 MiB）で 54000 になる。
+    let doc = format!("[\"{}\"]", "a".repeat(1 << 20));
+    let many = format!("$[{}]", vec!["0"; 300].join(","));
+    let err = eval_query(&many, &doc).expect_err("over budget");
+    assert_eq!(err.wire_code(), "54000");
+    // 予算内（8 回 = 8 MiB）は成功する。
+    let few = format!("$[{}]", ["0"; 8].join(","));
+    assert_eq!(eval_query(&few, &doc).map(|v| v.len()), Ok(8));
+}
+
+#[test]
+fn numeric_string_conversion_emits_valid_json_text() {
+    // 整数部の先頭ゼロは Decimal に収まらない指数でも正規化される（RFC 8259）。
+    let out = eval_query("$.number()", "\"01e400\"").expect("number");
+    let text = out.first().map(canon).unwrap_or_default();
+    assert!(parse_json(&text).is_ok(), "invalid json: {text}");
+    assert!(!text.starts_with("01"), "leading zero kept: {text}");
+}
+
+#[test]
+fn division_does_not_overflow_on_intermediate_values() {
+    let out = eval_query("$ / $", "100000000000000000000").expect("divide");
+    assert_eq!(
+        out.first().map(canon).as_deref(),
+        Some("1.00000000000000000000")
+    );
+}
