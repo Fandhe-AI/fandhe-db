@@ -4231,9 +4231,10 @@ impl EngineCore {
     ///
     /// `values` は `$1` から順に対応する実値。NULL（`None`）は裸の `NULL` トークンへ
     /// 置換され、位置ごとの受理／拒否（`wire_code`）はリテラル `NULL` と同一になる
-    /// （Issue #2439・WIRE-24。詳細は `sql::params` モジュールドキュメント参照）。個数が [`PreparedSql::param_count`] と一致しない場合は
-    /// `22000`（wire 層は Bind メッセージ自体の値件数検証で `08P01` を先に返す
-    /// 契約のため、ここでの不一致検出は防御的な保険）。
+    /// （Issue #2439・WIRE-24。詳細は `sql::params` モジュールドキュメント参照）。
+    /// 個数が [`PreparedSql::param_count`] と一致しない場合は `22000`
+    /// （wire 層は Bind メッセージ自体の値件数検証で `08P01` を先に返す契約のため、
+    /// ここでの不一致検出は防御的な保険）。
     pub fn bind_prepared(
         &self,
         prepared: &PreparedSql,
