@@ -1119,7 +1119,7 @@ Date: <IMF-fixdate>
 | `22007` | `INVALID_DATETIME_FORMAT` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの書式違反（`insert`／`update`／`filter`。Issue #1187） |
 | `22008` | `DATETIME_FIELD_OVERFLOW` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正（`update` の `set` 経由） |
 | `22012` | `DIVISION_BY_ZERO` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約（TABLE-16・TASK-204）の式評価での 0 除算 |
-| `22015` | `INTERVAL_FIELD_OVERFLOW` | 400 | Bad Request | `INTERVAL` リテラルのフィールド値が範囲外（数値が `i64` に収まらない・単位換算や累積があふれる）。SQL 表層専用で、NoSQL の `op` 語彙からは（INTERVAL 列の型束縛が #1583 まで非対応のため）到達しない。Issue #1579 |
+| `22015` | `INTERVAL_FIELD_OVERFLOW` | 400 | Bad Request | `INTERVAL` リテラルのフィールド値が範囲外（数値が `i64` に収まらない・単位換算や累積があふれる）。SQL 表層に加え、NoSQL の INTERVAL 列への `insert`／`update`／`filter` の文字列束縛からも到達する（型束縛は #1583 で対応）。Issue #1579 |
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
 | `22023` | `INVALID_PARAMETER_VALUE` | 400 | Bad Request | 型名の引数が範囲外（`FLOAT(p)` の精度。SQL 表層の DDL 専用で、NoSQL の `op` 語彙からは到達しない。Issue #2304） |
 | `22033` | `JSON_SUBSCRIPT_INVALID` | 400 | Bad Request | jsonpath の配列添字が不正（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |

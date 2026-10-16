@@ -161,7 +161,7 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             Ok(())
         }
         // INTERVAL は `IntervalStyle=postgres` 形式の JSON 文字列（Issue #1579。型の公告は
-        // `"interval"`。NoSQL の型束縛・filter は #1583 まで拒否する）。
+        // `"interval"`。NoSQL の型束縛・filter は Issue #1583 で対応）。
         Cell::Interval(v) => {
             out.push('"');
             escape_json_string_into(out, &engine::datetime::format_interval(v));

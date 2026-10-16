@@ -227,6 +227,12 @@ matches_legacy_encoder`）で固定している。シグネチャは
 - param: `TIMESTAMPTZ` スロットは宣言 OID 1184（推論含む）のみバイナリを受理し、それ以外の宣言は `0A000`。8 バイト以外は `08P01`、範囲外（PG の infinity 番兵を含む）は `22008`（値は応答に含めない）。復号後は明示 offset（`+00`）付きの正規テキストにして engine の束縛経路へ渡す。offset 無しだとセッション TimeZone の壁時計として解釈され、#1575 で意味が変わるため
 - `DATE`／`TIMESTAMP` は従来どおり非対応（`0A000`）
 
+## Issue #1583 追記（INTERVAL のバイナリ入出力・TABLE-34・WIRE-14 ポインタ）
+
+- 結果: `INTERVAL` 列（`Computed{ty: Some(Interval)}` の `MIN`／`MAX`／`SUM`／`AVG` を含む）は OID 1186・typlen 16 で公告し、バイナリは time（i64・マイクロ秒）・day（i32）・month（i32）の計 16 バイト BE（PostgreSQL の `interval_send` と同形）。engine の `Interval` は months・days・micros の順だが、wire は逆順になる。`±infinity` 番兵の `Cell::Interval` は丸めず `XX000`。テキストは IntervalStyle=postgres。**契約変更**: 従来の OID 25 から 1186 へ変わる
+- param: `INTERVAL` スロットは宣言 OID 1186（推論含む）のみバイナリを受理し、それ以外の宣言（25 等）は `0A000`。16 バイト以外は `08P01`、`±infinity` 番兵は `22008`（値は応答に含めない）。復号後は engine の `format_interval` で正規テキストにして既存の束縛経路（`parse_interval`）へ渡すため、バイナリ ≡ テキストが構造的に保たれる
+- `interval[]`（OID 1187）・COPY バイナリは対象外
+
 ## Issue #2442 追記: numeric 結果列のバイナリ符号化
 
 - **対象**: numeric を公告する結果列すべて（`id`・別名付き `id`・`NUMERIC(p, s)` 列・

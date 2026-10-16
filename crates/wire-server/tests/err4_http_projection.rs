@@ -79,6 +79,8 @@ fn schema() -> TableSchema {
             // `plan` 検索を誘発するため）。
             ColumnDef::new("path", ColumnType::Text, false),
             ColumnDef::new("body", ColumnType::Text, false),
+            // INTERVAL の NoSQL 型束縛から `22015` へ到達する経路の検証用（Issue #1583）。
+            ColumnDef::new("iv", ColumnType::Interval, true),
         ],
     )
 }
@@ -975,9 +977,9 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         ErrorClass::UntranslatableCharacter,
         // `InvalidBinaryRepresentation`（`22P03`。Issue #2443）: SQL 表層専用で NoSQL 表層からは到達不能。
         ErrorClass::InvalidBinaryRepresentation,
-        // `IntervalFieldOverflow`（`22015`。Issue #1579）: INTERVAL の型束縛は NoSQL 表層で #1583 まで
-        // 拒否するため到達不能（SQL 表層専用）。
-        ErrorClass::IntervalFieldOverflow,
+        // （`IntervalFieldOverflow`〔`22015`〕は Issue #1583 で NoSQL の INTERVAL 型束縛から
+        // 到達可能になったため外した。固定は `err4_f_interval_field_overflow_reachable_via_nosql_insert`
+        // が担う）
         // （`PartialCompletion`／`PartitionedDmlCancelled`〔`VD001`／`VD002`〕は Issue #1130 で
         // `update`／`delete` の分割実行修飾から到達可能になったため外した。固定は
         // `err4_f_partitioned_dml_vd001_vd002_reachable_via_nosql_update` が担う）
@@ -987,6 +989,20 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         let resp = http_common::parse_single_response(&raw);
         assert_projected(&resp, class.wire_code());
     }
+}
+
+/// `IntervalFieldOverflow`（`22015`。Issue #1579・#1583）は NoSQL 表層の INTERVAL 列への
+/// `insert` でフィールド値が範囲外の文字列を束縛したときに到達し、HTTP 400 へ射影される。
+#[test]
+fn err4_f_interval_field_overflow_reachable_via_nosql_insert() {
+    let (core, _guard) = new_core();
+    let addr = spawn(core);
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2],"lang":"ja","path":"docs/1.md","body":"alpha","iv":"2147483648 days"}],"operation_id":"err4-op-iv-overflow"}"#,
+    );
+    assert_projected_as(&resp, ErrorClass::IntervalFieldOverflow);
+    assert_eq!(resp.status, 400, "{resp:?}");
 }
 
 /// `PartialCompletion`／`PartitionedDmlCancelled`（`VD001`／`VD002`。Issue #1130・NOSQL-12・
