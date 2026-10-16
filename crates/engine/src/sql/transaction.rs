@@ -280,6 +280,12 @@ pub struct SessionTransaction<'e> {
     /// よいか（同一トランザクション内のままか）を突き合わせるために使う
     /// （PR #1049 レビュー指摘対応。[`Self::active_generation`] 参照）。
     generation: u64,
+    /// クライアントへ最後に通知した TimeZone の表示値（wire-server の ParameterStatus 重複抑止の
+    /// 記録。TABLE-33・Issue #1575）。`SessionState` ではなくここに置くのは、`ROLLBACK`／abort が
+    /// `SessionState` ごと巻き戻す一方、「通知済みの値」は巻き戻してはならない（巻き戻すと
+    /// 取り消しで戻った値が通知されなくなる）ため。トランザクション状態機械とは無関係な、
+    /// 接続単位の記録を `txn`（全応答経路が既に受け取る接続単位の値）に相乗りさせている。
+    reported_time_zone: Option<String>,
 }
 
 impl<'e> SessionTransaction<'e> {
@@ -288,7 +294,18 @@ impl<'e> SessionTransaction<'e> {
             state: TxnState::Idle,
             limits,
             generation: 0,
+            reported_time_zone: None,
         }
+    }
+
+    /// 最後にクライアントへ通知した TimeZone の表示値（未通知なら `None`）。
+    pub fn reported_time_zone(&self) -> Option<&str> {
+        self.reported_time_zone.as_deref()
+    }
+
+    /// `display` を通知済みとして記録する（wire-server が ParameterStatus を書いた直後に呼ぶ）。
+    pub fn set_reported_time_zone(&mut self, display: &str) {
+        self.reported_time_zone = Some(display.to_string());
     }
 
     /// 現在の状態（#943 が `ReadyForQuery` の状態バイトへ写像する想定の照会 API）。

@@ -551,21 +551,64 @@ pub fn validate_timestamptz_micros(micros: i64) -> bool {
 
 /// セッションの TimeZone を表す不透明型。jiff の型を engine の公開 API へ漏らさず、
 /// wire-server が jiff へ依存しないための境界
-/// （`docs/design/timestamptz-tz-data-adoption.md`）。中身は bundled tzdb
-/// （`TimeZoneDatabase::bundled()`）から解決したものに限り、実行時に tzdata ファイル・
-/// `TZ`・`TZDIR` を読む経路は持たない。セッション値の保持と `SET TIME ZONE` は #1575 が
-/// 担当し、本 Issue の呼び出し元はすべて [`SessionTimeZone::utc`] を渡す。
+/// （`docs/design/timestamptz-tz-data-adoption.md`・`docs/design/session-timezone.md`）。
+/// 中身は bundled tzdb（`TimeZoneDatabase::bundled()`）から解決した IANA 名・POSIX 文字列、
+/// または固定 offset に限り、実行時に tzdata ファイル・`TZ`・`TZDIR` を読む経路は持たない。
+/// セッション値は [`crate::sql::mode::SessionState`] が保持し（#1575・TABLE-33）、
+/// 表示値（`SHOW TimeZone`・ParameterStatus の値）は [`SessionTimeZone::display`] が返す。
 #[derive(Debug, Clone)]
-pub struct SessionTimeZone(jiff::tz::TimeZone);
+pub struct SessionTimeZone {
+    repr: TzRepr,
+    display: String,
+}
+
+/// [`SessionTimeZone`] の内部表現。固定 offset は PG の `|h| < 168` を表現するため
+/// jiff の `Offset`（±25:59:59 上限）ではなく秒数で自前保持する。
+#[derive(Debug, Clone)]
+enum TzRepr {
+    /// UTC からの固定 offset（秒。東が正）。
+    Fixed(i32),
+    /// IANA 名または POSIX 文字列から解決した jiff のゾーン。
+    Tz(jiff::tz::TimeZone),
+}
+
+impl Default for SessionTimeZone {
+    fn default() -> Self {
+        SessionTimeZone::utc()
+    }
+}
+
+/// `SET TIME ZONE` / StartupMessage の値を解決できないエラー（`22023`）。
+/// 入力値は反射しない（固定文言。呼び出し元が `invalid value for parameter "TimeZone"` へ写像する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeZoneSettingError;
+
+/// `SET TIME ZONE`／StartupMessage の値を解決できないときの固定文言（`22023`。入力値は反射しない。
+/// TABLE-33・Issue #1575）。engine の `SET` 実行腕と wire-server の起動時 FATAL が共有する。
+pub const INVALID_TIME_ZONE_DETAIL: &str = "invalid value for parameter \"TimeZone\"";
+
+/// TimeZone 設定値の受理上限バイト長（PG の `TZ_STRLEN_MAX` 相当）。
+pub const MAX_TIMEZONE_SETTING_LEN: usize = 255;
+
+/// 数値 offset の絶対値の上限（秒、未満で受理）。PG の `|h| < 168` に合わせる。
+const MAX_FIXED_OFFSET_SECS: i64 = 168 * 3600;
 
 impl SessionTimeZone {
-    /// UTC。TimeZone 未設定時の既定（#1575 でセッション値へ差し替える）。
+    /// UTC。TimeZone 未設定時の既定。
     pub fn utc() -> Self {
-        SessionTimeZone(jiff::tz::TimeZone::UTC)
+        SessionTimeZone {
+            repr: TzRepr::Tz(jiff::tz::TimeZone::UTC),
+            display: "UTC".to_string(),
+        }
+    }
+
+    /// `SHOW TimeZone`／ParameterStatus に出す表示値（PG 互換の正規化済み文字列）。
+    pub fn display(&self) -> &str {
+        &self.display
     }
 
     /// IANA 名を bundled tzdb から解決する。長さ・許可文字を検査し、`Etc/Unknown` 等の
-    /// 未知ゾーンは明示的に拒否する（fail-closed）。呼び出し元（リテラル解析・#1575 の
+    /// 未知ゾーンは明示的に拒否する（fail-closed）。呼び出し元（リテラル解析・
     /// `SET TIME ZONE`）が未知名を `22023` へ写像する。
     pub(crate) fn resolve_named(name: &str) -> Option<Self> {
         if name.is_empty() || name.len() > MAX_TZ_NAME_LEN {
@@ -581,7 +624,71 @@ impl SessionTimeZone {
         if tz.is_unknown() {
             return None;
         }
-        Some(SessionTimeZone(tz))
+        Some(SessionTimeZone {
+            repr: TzRepr::Tz(tz),
+            display: name.to_string(),
+        })
+    }
+
+    /// `SET TIME ZONE`／`SET timezone`／StartupMessage の値を解決する（TABLE-33・#1575）。
+    ///
+    /// PG の `check_timezone` に倣い、10 進数 → IANA 名 → 裸の `±H[H]:MM`
+    /// （POSIX 解釈で符号反転）→ POSIX 文字列の順に試す。入力は untrusted のため
+    /// 長さ → ASCII → 許可文字の順に検査し、失敗は固定の [`TimeZoneSettingError`]（`22023`）。
+    pub fn parse_setting(input: &str) -> Result<Self, TimeZoneSettingError> {
+        if input.is_empty() || input.len() > MAX_TIMEZONE_SETTING_LEN || !input.is_ascii() {
+            return Err(TimeZoneSettingError);
+        }
+        if !input.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'/' | b'_' | b'+' | b'-' | b':' | b',' | b'.' | b'<' | b'>'
+                )
+        }) {
+            return Err(TimeZoneSettingError);
+        }
+        if let Some(secs) = parse_decimal_hours(input)? {
+            return Ok(Self::fixed_from_hours_setting(secs));
+        }
+        if let Some(named) = Self::resolve_named(input) {
+            return Ok(named.with_canonical_name(input));
+        }
+        if let Some(offset) = parse_bare_offset(input) {
+            // POSIX 解釈では符号が逆（`+09:00` は UTC の 9 時間「西」）。表示は入力のまま。
+            return Ok(SessionTimeZone {
+                repr: TzRepr::Fixed(-offset),
+                display: input.to_string(),
+            });
+        }
+        let upper = input.to_ascii_uppercase();
+        let tz = jiff::tz::TimeZone::posix(&upper).map_err(|_| TimeZoneSettingError)?;
+        Ok(SessionTimeZone {
+            repr: TzRepr::Tz(tz),
+            display: upper,
+        })
+    }
+
+    /// 数値の時間 offset（秒、東が正）から PG の表示形（`<+09>-09` 等）を持つ値を作る。
+    fn fixed_from_hours_setting(secs: i64) -> Self {
+        let body = format_hms(secs.unsigned_abs());
+        let (abbr_sign, posix_sign) = if secs < 0 { ('-', '+') } else { ('+', '-') };
+        SessionTimeZone {
+            // 範囲は parse_decimal_hours が `< 168h` に制限済みのため i32 に収まる。
+            repr: TzRepr::Fixed(i32::try_from(secs).unwrap_or(0)),
+            display: format!("<{abbr_sign}{body}>{posix_sign}{body}"),
+        }
+    }
+
+    /// tzdb 上の正規名（大文字小文字・リンク名を保つ）を表示値にする。
+    fn with_canonical_name(mut self, input: &str) -> Self {
+        let lower = input.to_ascii_lowercase();
+        let canonical = jiff::tz::TimeZoneDatabase::bundled()
+            .available()
+            .find(|n| n.as_str().to_ascii_lowercase() == lower)
+            .map(|n| n.as_str().to_string());
+        self.display = canonical.unwrap_or_else(|| input.to_string());
+        self
     }
 
     /// UTC 時刻（マイクロ秒）における UTC からの offset（秒）。jiff の `Timestamp` 範囲外は
@@ -592,7 +699,10 @@ impl SessionTimeZone {
         } else {
             jiff::Timestamp::MAX
         });
-        self.0.to_offset(ts).seconds()
+        match &self.repr {
+            TzRepr::Fixed(secs) => *secs,
+            TzRepr::Tz(tz) => tz.to_offset(ts).seconds(),
+        }
     }
 
     /// TZ の無い入力（naive）をこの TimeZone の壁時計として解釈した UTC マイクロ秒を返す。
@@ -600,6 +710,12 @@ impl SessionTimeZone {
     /// 暫定: #1576 が PG 17 の実測と照合して最終確定する）。
     fn local_to_utc_micros(&self, local_micros: i64) -> Option<i64> {
         use jiff::tz::AmbiguousOffset;
+        let tz = match &self.repr {
+            TzRepr::Fixed(secs) => {
+                return local_micros.checked_sub(i64::from(*secs).checked_mul(1_000_000)?);
+            }
+            TzRepr::Tz(tz) => tz,
+        };
         let days = local_micros.div_euclid(MICROS_PER_DAY);
         let day_micros = local_micros.rem_euclid(MICROS_PER_DAY);
         let (year, month, day) = civil_from_days(days);
@@ -615,13 +731,132 @@ impl SessionTimeZone {
             i32::try_from(sub_nanos).ok()?,
         )
         .ok()?;
-        let offset = match self.0.to_ambiguous_timestamp(dt).offset() {
+        let offset = match tz.to_ambiguous_timestamp(dt).offset() {
             AmbiguousOffset::Unambiguous { offset } => offset,
             AmbiguousOffset::Gap { before, .. } => before,
             AmbiguousOffset::Fold { after, .. } => after,
         };
         local_micros.checked_sub(i64::from(offset.seconds()).checked_mul(1_000_000)?)
     }
+}
+
+/// 秒数（絶対値）を `HH[:MM[:SS]]` へ整形する（0 でない下位要素だけを付ける）。
+fn format_hms(abs_secs: u64) -> String {
+    let (hh, mm, ss) = (abs_secs / 3600, (abs_secs % 3600) / 60, abs_secs % 60);
+    let mut out = format!("{hh:02}");
+    if mm != 0 || ss != 0 {
+        let _ = write!(out, ":{mm:02}");
+    }
+    if ss != 0 {
+        let _ = write!(out, ":{ss:02}");
+    }
+    out
+}
+
+/// 10 進数（`[+-]?(\d+(\.\d*)?|\.\d+)`）なら時間 offset として秒（東が正）へ変換する。
+/// 10 進数でなければ `Ok(None)`、`|h| >= 168` は `Err`（PG の範囲外）。丸めは最近傍秒。
+fn parse_decimal_hours(input: &str) -> Result<Option<i64>, TimeZoneSettingError> {
+    let (neg, body) = match input.as_bytes().first() {
+        Some(b'-') => (true, input.get(1..).unwrap_or("")),
+        Some(b'+') => (false, input.get(1..).unwrap_or("")),
+        _ => (false, input),
+    };
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    let all_digits = |t: &str| t.bytes().all(|b| b.is_ascii_digit());
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !all_digits(int_part)
+        || !all_digits(frac_part)
+    {
+        return Ok(None);
+    }
+    // 整数部は桁あふれ回避のため長さを先に制限してから範囲判定する。
+    let int_val: i64 = if int_part.is_empty() {
+        0
+    } else if int_part.len() > 6 {
+        return Err(TimeZoneSettingError);
+    } else {
+        int_part.parse().map_err(|_| TimeZoneSettingError)?
+    };
+    if int_val >= 168 {
+        return Err(TimeZoneSettingError);
+    }
+    // 小数部は 9 桁で打ち切る（秒未満は最近傍秒へ丸めるため影響しない）。
+    let frac_digits: String = frac_part.chars().take(9).collect();
+    let frac_num: i64 = if frac_digits.is_empty() {
+        0
+    } else {
+        frac_digits.parse().map_err(|_| TimeZoneSettingError)?
+    };
+    let denom = 10i64.pow(u32::try_from(frac_digits.len()).map_err(|_| TimeZoneSettingError)?);
+    let frac_secs = (frac_num * 3600 * 2 + denom) / (denom * 2);
+    let secs = int_val * 3600 + frac_secs;
+    if secs >= MAX_FIXED_OFFSET_SECS {
+        return Err(TimeZoneSettingError);
+    }
+    Ok(Some(if neg { -secs } else { secs }))
+}
+
+/// 裸の `[+-]H[H]:MM`（符号必須）を秒（記述どおりの符号）へ変換する。分は 0〜59。
+/// `:SS` 付き（PG は別エラー）や範囲外は fail-closed で `None`。
+fn parse_bare_offset(input: &str) -> Option<i32> {
+    let (neg, body) = match input.as_bytes().first()? {
+        b'-' => (true, input.get(1..)?),
+        b'+' => (false, input.get(1..)?),
+        // 符号なしの `H:MM` は PG でも東西が曖昧なため受理しない（POSIX 反転で
+        // 意図と逆向きのオフセットになるのを防ぐ。fail-closed）。
+        _ => return None,
+    };
+    let (h, m) = body.split_once(':')?;
+    if h.is_empty() || h.len() > 2 || m.len() != 2 {
+        return None;
+    }
+    let num = |t: &str| -> Option<i32> {
+        if t.bytes().all(|b| b.is_ascii_digit()) {
+            t.parse().ok()
+        } else {
+            None
+        }
+    };
+    let (h, m) = (num(h)?, num(m)?);
+    if m > 59 {
+        return None;
+    }
+    let total = h * 3600 + m * 60;
+    Some(if neg { -total } else { total })
+}
+
+std::thread_local! {
+    /// 現在の文の実行に束縛されたセッション TimeZone（無ければ UTC）。
+    static SESSION_TZ: std::cell::RefCell<Option<SessionTimeZone>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// セッション TimeZone をスレッドローカルへ束縛する RAII スコープ（#1575）。
+/// engine の各セッション実行入口（`core.rs`）が文ごとに張り、TZ を持たない
+/// `TIMESTAMPTZ` リテラルの束縛（`sql/parser.rs`）が [`current_session_time_zone`] で読む。
+/// drop で直前の値へ戻すため、panic しても他の接続・文脈へ漏れない。
+pub struct SessionTimeZoneScope {
+    prev: Option<SessionTimeZone>,
+}
+
+impl SessionTimeZoneScope {
+    /// `tz` を現在スレッドの束縛値にする。
+    pub fn enter(tz: SessionTimeZone) -> Self {
+        let prev = SESSION_TZ.with(|c| c.borrow_mut().replace(tz));
+        SessionTimeZoneScope { prev }
+    }
+}
+
+impl Drop for SessionTimeZoneScope {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        SESSION_TZ.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// 現在スレッドに束縛されたセッション TimeZone。スコープが無い経路（NoSQL 等）は UTC。
+pub fn current_session_time_zone() -> SessionTimeZone {
+    SESSION_TZ.with(|c| c.borrow().clone().unwrap_or_else(SessionTimeZone::utc))
 }
 
 /// `TIMESTAMPTZ` リテラルの解析エラー。`Literal` は `22007`（書式）／`22008`（範囲外）、
@@ -1285,5 +1520,117 @@ mod tests {
         for v in [TIMESTAMPTZ_MIN_MICROS, 0, TIMESTAMPTZ_MAX_MICROS] {
             assert_eq!(tstz_ok(&format_timestamptz(v, &utc)), v);
         }
+    }
+
+    // --- セッション TimeZone 設定値（TABLE-33・#1575。期待値は PG 17 の実測） ---
+
+    /// 設定値を解決し（表示値, 2026-01-01 00:00:00 UTC での offset 秒）を返す。
+    fn setting(input: &str) -> (String, i32) {
+        let tz = SessionTimeZone::parse_setting(input).unwrap_or_else(|_| panic!("{input}"));
+        (
+            tz.display().to_string(),
+            tz.offset_seconds_at(1_767_225_600_000_000),
+        )
+    }
+
+    #[test]
+    fn setting_iana_names_use_canonical_case() {
+        assert_eq!(setting("Asia/Tokyo"), ("Asia/Tokyo".into(), 9 * 3600));
+        assert_eq!(setting("asia/tokyo"), ("Asia/Tokyo".into(), 9 * 3600));
+        assert_eq!(setting("utc"), ("UTC".into(), 0));
+        assert_eq!(setting("UTC"), ("UTC".into(), 0));
+        assert_eq!(setting("japan"), ("Japan".into(), 9 * 3600));
+        assert_eq!(setting("us/eastern"), ("US/Eastern".into(), -5 * 3600));
+        assert_eq!(setting("Etc/GMT+9"), ("Etc/GMT+9".into(), -9 * 3600));
+        assert_eq!(setting("est5edt"), ("EST5EDT".into(), -5 * 3600));
+    }
+
+    #[test]
+    fn setting_numeric_hours_are_fixed_offsets() {
+        assert_eq!(setting("9"), ("<+09>-09".into(), 9 * 3600));
+        assert_eq!(setting("+9"), ("<+09>-09".into(), 9 * 3600));
+        assert_eq!(setting("+09"), ("<+09>-09".into(), 9 * 3600));
+        assert_eq!(setting("-8"), ("<-08>+08".into(), -8 * 3600));
+        assert_eq!(setting("5.5"), ("<+05:30>-05:30".into(), 5 * 3600 + 1800));
+        assert_eq!(
+            setting("-8.25"),
+            ("<-08:15>+08:15".into(), -(8 * 3600 + 900))
+        );
+        assert_eq!(setting("0"), ("<+00>-00".into(), 0));
+        assert_eq!(setting("-0"), ("<+00>-00".into(), 0));
+        assert_eq!(setting("167"), ("<+167>-167".into(), 167 * 3600));
+    }
+
+    #[test]
+    fn setting_bare_offsets_follow_posix_sign() {
+        assert_eq!(setting("+09:00"), ("+09:00".into(), -9 * 3600));
+        // 符号なしの H:MM は拒否する（POSIX 反転で逆向きになるのを防ぐ）。
+        assert!(SessionTimeZone::parse_setting("9:00").is_err());
+        assert!(SessionTimeZone::parse_setting("09:00").is_err());
+        assert_eq!(setting("-5:30"), ("-5:30".into(), 5 * 3600 + 1800));
+    }
+
+    #[test]
+    fn setting_posix_strings() {
+        assert_eq!(setting("UTC+9"), ("UTC+9".into(), -9 * 3600));
+        assert_eq!(setting("JST-9"), ("JST-9".into(), 9 * 3600));
+        assert_eq!(setting("jst-9"), ("JST-9".into(), 9 * 3600));
+    }
+
+    #[test]
+    fn setting_rejects_invalid_values() {
+        for bad in [
+            "JST",
+            "Etc/Unknown",
+            "Foo/Bar",
+            "Z",
+            "",
+            "  ",
+            "local",
+            "default",
+            "abc",
+            "Asia/Tokyo ",
+            "../etc",
+            "Asia/Tokyo/",
+            "168",
+            "200",
+            "nan",
+            "inf",
+            "1e1",
+            " 9",
+            "0x10",
+            "9 ",
+            "日本",
+            "Asia/Tōkyō",
+            "+09:00:30",
+        ] {
+            assert!(SessionTimeZone::parse_setting(bad).is_err(), "{bad:?}");
+        }
+        let long = "A".repeat(MAX_TIMEZONE_SETTING_LEN + 1);
+        assert!(SessionTimeZone::parse_setting(&long).is_err());
+    }
+
+    #[test]
+    fn fixed_offset_parses_and_formats_naive_literals() {
+        let tz = SessionTimeZone::parse_setting("9").unwrap();
+        let micros = parse_timestamptz("2026-01-01 09:00:00", &tz).unwrap();
+        assert_eq!(micros, 1_767_225_600_000_000);
+        assert_eq!(format_timestamptz(micros, &tz), "2026-01-01 09:00:00+09");
+    }
+
+    #[test]
+    fn session_scope_restores_previous_value() {
+        assert_eq!(current_session_time_zone().display(), "UTC");
+        let tokyo = SessionTimeZone::parse_setting("Asia/Tokyo").unwrap();
+        {
+            let _outer = SessionTimeZoneScope::enter(tokyo);
+            assert_eq!(current_session_time_zone().display(), "Asia/Tokyo");
+            {
+                let _inner = SessionTimeZoneScope::enter(SessionTimeZone::utc());
+                assert_eq!(current_session_time_zone().display(), "UTC");
+            }
+            assert_eq!(current_session_time_zone().display(), "Asia/Tokyo");
+        }
+        assert_eq!(current_session_time_zone().display(), "UTC");
     }
 }

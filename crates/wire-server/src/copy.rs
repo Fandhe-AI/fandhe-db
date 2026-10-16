@@ -121,10 +121,10 @@ fn enforce_discard_budget<S: WireStream>(
     Ok(())
 }
 
-/// ErrorResponse を書いてから ReadyForQuery を書く
-/// （`simple_query::respond_error_and_ready` と同じ契約。COPY サブプロトコル
+/// ErrorResponse だけを書く（`ReadyForQuery` は `CopyStep::Failed` を受けた
+/// `simple_query` が書く。`simple_query::respond_error` と同じ契約。COPY サブプロトコル
 /// のエラーも接続を維持する簡易クエリの一部であり、切断はしない）。
-/// `ReadyForQuery` の状態バイトは接続の明示トランザクション状態（`txn.status()`）から
+/// 後続の `ReadyForQuery` の状態バイトは接続の明示トランザクション状態（`txn.status()`）から
 /// 導出する（SQL-31・TASK-221、Issue #1179。`handshake::post_auth_loop` は `Idle`・
 /// `Active` のとき本モジュール〔`crate::copy::run`〕へ委譲し、`Failed` 中の COPY は
 /// 本モジュールへ到達する前に `25P02` で拒否する）。
@@ -139,8 +139,9 @@ fn respond_error_and_ready<S: WireStream>(
     message: &str,
 ) -> io::Result<()> {
     txn.fail();
-    crate::handshake::write_error_response_io(stream, class, message)?;
-    crate::handshake::write_ready_for_query_io(stream, txn.status())
+    // `ReadyForQuery` はここでは書かない。`CopyStep::Failed` を受けた呼び出し元
+    // （`simple_query`）がセッション復元の後に TimeZone 通知付きで送る（TABLE-33・Issue #1575）。
+    crate::handshake::write_error_response_io(stream, class, message)
 }
 
 fn respond_sql_error<S: WireStream>(
@@ -193,8 +194,9 @@ fn cell_to_copy_value(
     format: CopyFormat,
     meta: &ColumnMeta,
     cell: &Cell,
+    tz: &engine::datetime::SessionTimeZone,
 ) -> Result<Option<String>, result_encoder::EncodeError> {
-    let text = result_encoder::cell_to_text_for_column(meta, cell)?;
+    let text = result_encoder::cell_to_text_for_column_in_tz(meta, cell, tz)?;
     Ok(text.map(|t| match format {
         CopyFormat::Text => escape_copy_text(&t),
         CopyFormat::Csv => escape_copy_csv(&t),
@@ -245,6 +247,7 @@ fn encode_copy_data_row_into(
     columns: &[ColumnMeta],
     row: &ResultRow,
     out: &mut Vec<u8>,
+    tz: &engine::datetime::SessionTimeZone,
 ) -> Result<(), result_encoder::EncodeError> {
     // 列メタとセル数の不一致は内部不整合（fail-closed。何も書かずに拒否する）。
     if columns.len() != row.cells.len() {
@@ -253,7 +256,7 @@ fn encode_copy_data_row_into(
     let start = out.len();
     let mut fields: Vec<Option<String>> = Vec::with_capacity(row.cells.len());
     for (meta, cell) in columns.iter().zip(&row.cells) {
-        match cell_to_copy_value(format, meta, cell) {
+        match cell_to_copy_value(format, meta, cell, tz) {
             Ok(v) => fields.push(v),
             Err(e) => {
                 out.truncate(start);
@@ -306,6 +309,7 @@ fn encode_copy_data_row_into(
 /// 前に確定しているため、この経路には到達しない）。
 fn run_copy_to<S: WireStream>(
     stream: &mut S,
+    conn_session: &SessionState,
     txn: &mut SessionTransaction<'_>,
     format: CopyFormat,
     result: &QueryResult,
@@ -335,7 +339,17 @@ fn run_copy_to<S: WireStream>(
 
     for row in &result.rows {
         let start = buffer.frame_start();
-        if encode_copy_data_row_into(format, &result.columns, row, buffer.as_mut_vec()).is_err() {
+        if encode_copy_data_row_into(
+            format,
+            &result.columns,
+            row,
+            buffer.as_mut_vec(),
+            // COPY TO は往復契約（COPY FROM の `parse_numeric_offset` は時 0〜15 のみ受理）の
+            // ため、セッション TimeZone に依らず UTC 固定で出力する（Issue #1575）。
+            &engine::datetime::SessionTimeZone::utc(),
+        )
+        .is_err()
+        {
             buffer.truncate_to(start);
             buffer.flush(stream)?;
             return respond_error_and_ready(
@@ -359,7 +373,7 @@ fn run_copy_to<S: WireStream>(
             if finish == Finish::ReadyForQuery {
                 buffer.push_frame(
                     stream,
-                    &result_encoder::encode_ready_for_query(txn.status()),
+                    &crate::handshake::ready_for_query_frames(conn_session, txn),
                 )?;
             }
             buffer.flush(stream)?;
@@ -400,6 +414,7 @@ fn run_copy_from<'e, S: WireStream>(
     stream: &mut S,
     engine: &'e EngineCore,
     ctx: &PolicyContext,
+    conn_session: &SessionState,
     txn: &mut SessionTransaction<'e>,
     mut session: CopyInSession,
     finish: Finish,
@@ -468,7 +483,16 @@ fn run_copy_from<'e, S: WireStream>(
             b'c' => {
                 framing::read_length_prefixed_body(stream, 4, 4)
                     .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
-                return finish_copy_from(stream, engine, ctx, txn, session, errored, finish);
+                return finish_copy_from(
+                    stream,
+                    engine,
+                    ctx,
+                    conn_session,
+                    txn,
+                    session,
+                    errored,
+                    finish,
+                );
             }
             b'f' => {
                 let body = framing::read_length_prefixed_body(
@@ -577,10 +601,12 @@ fn run_copy_from<'e, S: WireStream>(
 /// `simple_query::execute_and_respond` と同じ設計（`ResponseBoundaryGuard` は
 /// 呼び出し元 [`run`] が関数全体を覆い、`EmergencyResponseRegistration` は
 /// commit 呼び出しだけをブロックスコープで覆う）。
+#[allow(clippy::too_many_arguments)]
 fn finish_copy_from<'e, S: WireStream>(
     stream: &mut S,
     engine: &'e EngineCore,
     ctx: &PolicyContext,
+    conn_session: &SessionState,
     txn: &mut SessionTransaction<'e>,
     session: CopyInSession,
     errored: Option<SqlSurfaceError>,
@@ -609,7 +635,11 @@ fn finish_copy_from<'e, S: WireStream>(
                 Ok(msg) => {
                     stream.write_all(&msg)?;
                     if finish == Finish::ReadyForQuery {
-                        crate::handshake::write_ready_for_query_io(stream, txn.status())?;
+                        crate::handshake::write_ready_for_query_synced_io(
+                            stream,
+                            conn_session,
+                            txn,
+                        )?;
                     }
                     Ok(CopyStep::Completed)
                 }
@@ -632,7 +662,7 @@ fn finish_copy_from<'e, S: WireStream>(
 pub(crate) enum CopyStep {
     /// `CommandComplete "COPY n"`（と `finish` に応じた `ReadyForQuery`）を書き終えた。
     Completed,
-    /// ErrorResponse＋`ReadyForQuery` を書き終えた。呼び出し元は以降の文を実行しない。
+    /// ErrorResponse を書き終えた（`ReadyForQuery` は呼び出し元が復元後に送る）。呼び出し元は以降の文を実行しない。
     Failed,
     /// Terminate（'X'）受信・早期 EOF。呼び出し元は接続ループを終了させる。
     Closed,
@@ -669,9 +699,11 @@ pub(crate) fn run<'e, S: WireStream>(
     let _response_boundary = engine::recovery::commit_boundary::ResponseBoundaryGuard::new();
 
     match engine.begin_copy_in_txn(ctx, session, txn, sql) {
-        Ok(CopyPlan::To(format, result)) => run_copy_to(stream, txn, format, &result, finish),
+        Ok(CopyPlan::To(format, result)) => {
+            run_copy_to(stream, session, txn, format, &result, finish)
+        }
         Ok(CopyPlan::From(copy_session)) => {
-            run_copy_from(stream, engine, ctx, txn, copy_session, finish)
+            run_copy_from(stream, engine, ctx, session, txn, copy_session, finish)
         }
         Err(e) => respond_sql_error(stream, txn, &e).map(|()| CopyStep::Failed),
     }

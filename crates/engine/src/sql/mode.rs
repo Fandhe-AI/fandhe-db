@@ -209,9 +209,39 @@ pub struct SessionState {
     /// UDF 定義が他接続・他テナントへ漏れる経路は構造上存在しない。永続化しない
     /// （`crate::sql::udf_call` モジュールドキュメント参照）。
     udfs: crate::sql::udf_call::UdfRegistry,
+    /// セッションの現在の TimeZone（TABLE-33・Issue #1575）。既定は UTC。接続単位の値型である
+    /// ため他接続・他テナントへ影響する経路は構造上存在せず、`sql/transaction.rs` が
+    /// ROLLBACK／abort で `SessionState` ごと巻き戻すため PG と同じく取り消しで値が戻る。
+    time_zone: crate::datetime::SessionTimeZone,
+    /// `SET TIME ZONE DEFAULT|LOCAL` の戻り先（reset 値）。StartupMessage の `TimeZone` が
+    /// あればその値、無ければサーバー既定の UTC。
+    time_zone_reset: crate::datetime::SessionTimeZone,
 }
 
 impl SessionState {
+    /// セッションの現在の TimeZone。
+    pub fn time_zone(&self) -> &crate::datetime::SessionTimeZone {
+        &self.time_zone
+    }
+
+    /// 検証済みの TimeZone を現在値にする。呼び出し元（`core.rs` の `SetTimeZone` 実行腕）が
+    /// `SessionTimeZone::parse_setting` 成功後にのみ呼ぶ（失敗した `SET` はセッションを変えない）。
+    pub fn set_time_zone(&mut self, tz: crate::datetime::SessionTimeZone) {
+        self.time_zone = tz;
+    }
+
+    /// `SET TIME ZONE DEFAULT|LOCAL` の実体。現在値を reset 値へ戻す。
+    pub fn reset_time_zone(&mut self) {
+        self.time_zone = self.time_zone_reset.clone();
+    }
+
+    /// StartupMessage の `TimeZone` を現在値と reset 値の両方へ設定する。wire-server の
+    /// handshake が認証成功後に 1 回だけ呼ぶ契約（SQL 文経由の経路は持たない）。
+    pub fn apply_startup_time_zone(&mut self, tz: crate::datetime::SessionTimeZone) {
+        self.time_zone_reset = tz.clone();
+        self.time_zone = tz;
+    }
+
     pub fn search_mode(&self) -> Option<SearchMode> {
         self.search_mode
     }
@@ -270,6 +300,25 @@ impl SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_zone_defaults_to_utc_and_resets_to_startup_value() {
+        use crate::datetime::SessionTimeZone;
+        let mut session = SessionState::default();
+        assert_eq!(session.time_zone().display(), "UTC");
+        session.set_time_zone(SessionTimeZone::parse_setting("Asia/Tokyo").unwrap());
+        assert_eq!(session.time_zone().display(), "Asia/Tokyo");
+        session.reset_time_zone();
+        assert_eq!(session.time_zone().display(), "UTC");
+
+        session
+            .apply_startup_time_zone(SessionTimeZone::parse_setting("America/New_York").unwrap());
+        session.set_time_zone(SessionTimeZone::utc());
+        let snapshot = session.clone();
+        session.reset_time_zone();
+        assert_eq!(session.time_zone().display(), "America/New_York");
+        assert_eq!(snapshot.time_zone().display(), "UTC");
+    }
 
     #[test]
     fn resolve_mode_defaults_to_recall_when_unset() {

@@ -659,10 +659,87 @@ enum PortalBody {
 
 /// portal が保持する未送出行と、完了時に使う `CommandComplete` タグの組み立て
 /// 方（[`crate::simple_query::TagShape`]）。
+/// 中断 portal が保持する 1 行の保守的なメモリ見積り（上限会計用）。
+/// 保持対象は wire 表現ではなく [`engine::sql::exec::ResultRow`] 自体のため、
+/// 行本体・`Cell` 配列・文字列／ベクトル／バイト列のヒープ領域を合算する。NULL や短い値の
+/// 多い行では `Cell` 配列が wire 表現を大幅に上回るため、`frame_len` 単独では上限を超えて
+/// 保持できてしまう（Issue #1575 レビュー指摘）。配列セルも [`retained_array_bytes`] で
+/// 要素配列と要素内ヒープの実保持量を合算する（wire 表現では代用しない）。
+/// `_frame_len` は呼び出し互換のため受け取るだけで会計には使わない。
+fn retained_row_bytes(row: &engine::sql::exec::ResultRow, _frame_len: usize) -> usize {
+    use engine::sql::exec::Cell;
+    let mut total = std::mem::size_of::<engine::sql::exec::ResultRow>()
+        .saturating_add(row.cells.len().saturating_mul(std::mem::size_of::<Cell>()));
+    for cell in &row.cells {
+        let heap = match cell {
+            Cell::Text(s) | Cell::Json(s) => s.len(),
+            Cell::Vector(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
+            Cell::Bytes(b) => b.len(),
+            Cell::Array(a) => retained_array_bytes(a),
+            _ => 0,
+        };
+        total = total.saturating_add(heap);
+    }
+    total
+}
+
+/// 配列セル 1 個の保持量見積り。要素スロット（`Option<T>`）の配列分に加え、文字列・
+/// バイト列要素のヒープ領域（`String`／`Vec` の本体と内容）を合算する。
+fn retained_array_bytes(array: &engine::row_codec::ArrayValue) -> usize {
+    use engine::row_codec::ArrayValue;
+    fn slots<T>(items: &[Option<T>]) -> usize {
+        items.len().saturating_mul(std::mem::size_of::<Option<T>>())
+    }
+    fn strings(items: &[Option<String>]) -> usize {
+        items.iter().fold(slots(items), |acc, it| {
+            acc.saturating_add(it.as_ref().map_or(0, String::capacity))
+        })
+    }
+    match array {
+        ArrayValue::Text(v) | ArrayValue::Json(v) | ArrayValue::Jsonb(v) | ArrayValue::Enum(v) => {
+            strings(v)
+        }
+        ArrayValue::Bool(v) => slots(v),
+        ArrayValue::Integer(v) | ArrayValue::Date(v) => slots(v),
+        ArrayValue::BigInt(v) | ArrayValue::Timestamp(v) => slots(v),
+        ArrayValue::Real(v) => slots(v),
+        ArrayValue::Double(v) => slots(v),
+        ArrayValue::Uuid(v) => slots(v),
+        ArrayValue::Numeric(v) => slots(v),
+        ArrayValue::Bytea(v) => v.iter().fold(slots(v), |acc, it| {
+            acc.saturating_add(it.as_ref().map_or(0, Vec::capacity))
+        }),
+    }
+}
+
+/// 中断 portal が保持する列メタの保守的なメモリ見積り（上限会計用）。
+fn retained_columns_bytes(columns: &[ColumnMeta]) -> usize {
+    let mut total = columns
+        .len()
+        .saturating_mul(std::mem::size_of::<ColumnMeta>());
+    for c in columns {
+        let name_len = match c {
+            ColumnMeta::Id => 0,
+            ColumnMeta::AliasedId { name }
+            | ColumnMeta::Scalar { name, .. }
+            | ColumnMeta::Computed { name, .. } => name.len(),
+        };
+        total = total.saturating_add(name_len);
+    }
+    total
+}
+
 struct PortalRows {
-    /// 未送出の `DataRow` フレーム（`max_rows` ごとに任意の境界で分割送出する
-    /// ため、行単位で個別フレームとして保持する）。
-    frames: std::collections::VecDeque<Vec<u8>>,
+    /// 未送出の行（値）と、中断時点のエンコード済みバイト数（保持上限の会計用）。
+    /// `max_rows` ごとに任意の境界で分割送出するため行単位で保持し、`DataRow` への
+    /// 整形は送出時の現在のセッション TimeZone で行う（中断中の `SET TIME ZONE` を
+    /// 再開後の送出へ反映する。TABLE-33・Issue #1575）。
+    frames: std::collections::VecDeque<(engine::sql::exec::ResultRow, usize)>,
+    /// 保持行の列メタ（送出時の整形に使う）。
+    columns: Vec<ColumnMeta>,
+    /// `columns` の保守的なヒープ見積り（[`retained_columns_bytes`]）。保持上限の会計に
+    /// 行の見積りと合算する（中断 portal 数に比例して列メタが無計上で残らないようにする）。
+    columns_bytes: usize,
     shape: crate::simple_query::TagShape,
     /// この portal がこれまでの Execute 呼び出し（今回分を含まない）で
     /// 既に送出済みの行数。完了時の `CommandComplete` タグは PostgreSQL の
@@ -894,8 +971,8 @@ impl PortalStore {
                 PortalState::Suspended(rows) => rows
                     .frames
                     .iter()
-                    .map(Vec::len)
-                    .fold(0usize, |acc, len| acc.saturating_add(len)),
+                    .map(|(_, len)| *len)
+                    .fold(rows.columns_bytes, |acc, len| acc.saturating_add(len)),
                 PortalState::Ready | PortalState::Done { .. } | PortalState::Failed => 0,
             })
             .fold(0usize, |acc, n| acc.saturating_add(n))
@@ -2084,7 +2161,13 @@ fn execute_portal<'e, S: WireStream>(
                     // ErrorResponse を返す事態を避ける）。
                     let other_suspended_bytes =
                         state.portals.total_suspended_bytes_excluding(portal_name);
-                    let mut remaining_bytes: usize = 0;
+                    // 列メタの保持分は中断が確定する（`take` 以降に行がある）場合のみ加算する。
+                    let columns_bytes = retained_columns_bytes(&result.columns);
+                    let mut remaining_bytes: usize = if result.rows.len() > take {
+                        columns_bytes
+                    } else {
+                        0
+                    };
                     let mut frames = std::collections::VecDeque::new();
                     for row in result.rows.iter().skip(take) {
                         // Bind 時点で確定した結果 format code（WIRE-14。
@@ -2094,19 +2177,21 @@ fn execute_portal<'e, S: WireStream>(
                         // のみを意味する（`XX000` 相当。`result_encoder`
                         // モジュールドキュメント参照）。
                         let mut frame = Vec::new();
-                        result_encoder::encode_data_row_into_with_columns(
+                        result_encoder::encode_data_row_into_with_columns_in_tz(
                             row,
                             &result.columns,
                             &result_formats,
                             &mut frame,
+                            session.time_zone(),
                         )
                         .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
-                        remaining_bytes = remaining_bytes.saturating_add(frame.len());
+                        let retained = retained_row_bytes(row, frame.len());
+                        remaining_bytes = remaining_bytes.saturating_add(retained);
                         let session_total = other_suspended_bytes.saturating_add(remaining_bytes);
                         if session_total > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION {
                             return Err(commit_wrap(HandlerError::SuspendedBytesExceeded));
                         }
-                        frames.push_back(frame);
+                        frames.push_back((row.clone(), retained));
                     }
 
                     // 中断保持分の検査を通過した後で初めて `take` 分の送出へ移る。
@@ -2123,11 +2208,12 @@ fn execute_portal<'e, S: WireStream>(
                     );
                     for row in result.rows.iter().take(take) {
                         let mut frame = Vec::new();
-                        result_encoder::encode_data_row_into_with_columns(
+                        result_encoder::encode_data_row_into_with_columns_in_tz(
                             row,
                             &result.columns,
                             &result_formats,
                             &mut frame,
+                            session.time_zone(),
                         )
                         .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
                         buffer
@@ -2177,6 +2263,8 @@ fn execute_portal<'e, S: WireStream>(
                         .ok_or(HandlerError::UnknownPortal)?;
                     portal.state = PortalState::Suspended(PortalRows {
                         frames,
+                        columns: result.columns.clone(),
+                        columns_bytes,
                         shape,
                         sent_so_far: take,
                         committed: is_write_statement,
@@ -2272,13 +2360,25 @@ fn execute_portal<'e, S: WireStream>(
             (max_rows as usize).min(total)
         };
 
-        let hint: usize = rows.frames.iter().take(take).map(Vec::len).sum();
+        // 会計値（行本体の見積りを含む）は送出バッファの容量ヒントには過大のため
+        // 行数ベースの概算に留める（上限は `with_capacity_hint` 側で抑えられる）。
+        let hint: usize = take.saturating_mul(64);
         let mut buffer = crate::response_buffer::ResponseBuffer::with_capacity_hint(
             MAX_RESPONSE_BUFFER_BYTES,
             hint,
         );
         for _ in 0..take {
-            if let Some(frame) = rows.frames.pop_front() {
+            if let Some((row, _)) = rows.frames.pop_front() {
+                // 送出時点のセッション TimeZone で整形する（中断中の変更を反映）。
+                let mut frame = Vec::new();
+                result_encoder::encode_data_row_into_with_columns_in_tz(
+                    &row,
+                    &rows.columns,
+                    &portal.result_formats,
+                    &mut frame,
+                    session.time_zone(),
+                )
+                .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
                 buffer
                     .push_frame(stream, &frame)
                     .map_err(|e| commit_wrap(io_to_handler(e)))?;
@@ -2348,6 +2448,7 @@ pub(crate) fn handle_sync<S: WireStream>(
     state: &mut ExtendedQueryState,
     txn_status: engine::sql::transaction::TransactionStatus,
     active_generation: Option<u64>,
+    ready_frames: &[u8],
 ) -> io::Result<LoopSignal> {
     let _body = match framing::read_length_prefixed_body(stream, 4, 4) {
         Ok(b) => b,
@@ -2375,7 +2476,10 @@ pub(crate) fn handle_sync<S: WireStream>(
     // TASK-221・PR #1041 レビュー指摘 P1: 以前は明示トランザクションの状態を
     // 無視して常に `Idle`（'I'）を送出しており、`BEGIN` 後もクライアントから
     // トランザクションが終了したように見えていた）。
-    stream.write_all(&result_encoder::encode_ready_for_query(txn_status))?;
+    // `ready_frames` は呼び出し元（`handshake::post_auth_loop`）が
+    // `handshake::ready_for_query_frames` で組み立てた `[ParameterStatus(TimeZone)] ReadyForQuery`
+    // （TABLE-33・Issue #1575。`txn_status` と同じ `txn` の状態バイトを含む）。
+    stream.write_all(ready_frames)?;
     stream.flush()?;
     Ok(LoopSignal::Continue)
 }
@@ -2450,6 +2554,55 @@ pub(crate) fn handle_flush<S: WireStream>(stream: &mut S) -> io::Result<LoopSign
 
 #[cfg(test)]
 mod tests {
+    /// 中断 portal の保持量見積りは wire 表現（`frame_len`）より行本体・`Cell` 配列分だけ大きい
+    /// （NULL 多数の行で上限会計が過小にならない。Issue #1575 レビュー指摘）。
+    #[test]
+    fn retained_row_bytes_counts_cells_and_heap_beyond_frame_len() {
+        use engine::sql::exec::{Cell, ResultRow};
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Null; 1000],
+        };
+        // NULL セルの DataRow 表現は 1 セル 4 バイト相当だが、保持量は Cell 配列分を含む。
+        let n = retained_row_bytes(&row, 4000);
+        assert!(n >= 1000 * std::mem::size_of::<Cell>());
+        assert!(n > 4000);
+        let text_row = ResultRow {
+            id: 2,
+            score: 0.0,
+            cells: vec![Cell::Text("x".repeat(100))],
+        };
+        assert!(retained_row_bytes(&text_row, 104) >= 100);
+        assert_eq!(retained_columns_bytes(&[]), 0);
+    }
+
+    /// 配列セルは wire 表現（空文字列要素は 2 バイト程度）ではなく要素スロット分で計上する。
+    #[test]
+    fn retained_row_bytes_counts_array_slots_not_frame_len() {
+        use engine::row_codec::ArrayValue;
+        use engine::sql::exec::{Cell, ResultRow};
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Array(ArrayValue::Text(vec![
+                Some(String::new());
+                10_000
+            ]))],
+        };
+        let slot = std::mem::size_of::<Option<String>>();
+        assert!(retained_row_bytes(&row, 0) >= 10_000 * slot);
+        let big = ResultRow {
+            id: 2,
+            score: 0.0,
+            cells: vec![Cell::Array(ArrayValue::Bytea(vec![
+                Some(vec![0u8; 64]);
+                100
+            ]))],
+        };
+        assert!(retained_row_bytes(&big, 0) >= 100 * 64);
+    }
+
     use super::*;
     use crate::limits::MAX_PREPARED_STATEMENTS_PER_SESSION;
 

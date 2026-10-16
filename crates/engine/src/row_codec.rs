@@ -4299,8 +4299,11 @@ pub(crate) fn default_scalar<'a>(
         },
         // `TIMESTAMPTZ` 列の既定値は `datetime::parse_timestamptz`（INSERT のリテラル束縛と
         // 同じ閉じた文法）で UTC のマイクロ秒へ正規化する（Issue #1574）。TZ の無い既定値は
-        // セッション TimeZone で解釈すべきだが、セッション値の保持は #1575 の担当のため
-        // 本 Issue では UTC 固定（`SessionTimeZone::utc()`）。
+        // セッション TimeZone で解釈すべきだが、ここは読み出し時補完・カタログ decode からも
+        // 呼ばれ決定的でなければならないため **意図的に UTC 固定**（`SessionTimeZone::utc()`）。
+        // TZ 無しの既定値は DDL 実行時（`sql::ddl::normalize_timestamptz_default`）にその時点の
+        // セッション TimeZone で解釈され、明示 offset 付き（`...+00`）へ正規化して保存されるため、
+        // 補完時のセッションによらず同じ値になる（TABLE-33・Issue #1575）。
         (ColumnDefault::Text(s), ColumnType::TimestampTz) => {
             use crate::datetime::{DateTimeLiteralError, SessionTimeZone, TimestampTzLiteralError};
             match crate::datetime::parse_timestamptz(s, &SessionTimeZone::utc()) {

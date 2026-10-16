@@ -277,7 +277,9 @@ fn write_backend_key_data<S: WireStream>(stream: &mut S, pid: i32, secret: i32) 
     write_all(stream, &msg)
 }
 
-fn write_parameter_status<S: WireStream>(stream: &mut S, name: &str, value: &str) -> Result<()> {
+/// ParameterStatus（'S'）フレームを組み立てる。`name`・`value` は engine が正規化した
+/// 表示値（NUL を含まない。呼び出し元は untrusted 入力を直接渡さない）。
+fn encode_parameter_status(name: &str, value: &str) -> Vec<u8> {
     let mut body = Vec::with_capacity(name.len() + value.len() + 2);
     body.extend_from_slice(name.as_bytes());
     body.push(0);
@@ -288,7 +290,41 @@ fn write_parameter_status<S: WireStream>(stream: &mut S, name: &str, value: &str
     msg.push(b'S');
     msg.extend_from_slice(&total_len.to_be_bytes());
     msg.extend_from_slice(&body);
-    write_all(stream, &msg)
+    msg
+}
+
+fn write_parameter_status<S: WireStream>(stream: &mut S, name: &str, value: &str) -> Result<()> {
+    write_all(stream, &encode_parameter_status(name, value))
+}
+
+/// 成功応答の末尾（`CommandComplete` の後）に置く `[ParameterStatus(TimeZone)] ReadyForQuery`
+/// を組み立てる（TABLE-33・Issue #1575）。セッションの現在の TimeZone が `txn` に記録された
+/// 通知済みの値と異なるときだけ ParameterStatus を先頭に付け、記録を更新する。
+/// SET・`DEFAULT`・`ROLLBACK` による復元・単純／拡張プロトコルを、RFQ を書く場所での
+/// 比較だけで網羅する。エラー応答経路も、セッション復元を済ませてからこの関数経由で RFQ を書く
+/// （ParameterStatus は常に RFQ より前に出る）。
+pub(crate) fn ready_for_query_frames(
+    session: &engine::sql::mode::SessionState,
+    txn: &mut engine::sql::transaction::SessionTransaction<'_>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    let current = session.time_zone().display();
+    if txn.reported_time_zone() != Some(current) {
+        out.extend_from_slice(&encode_parameter_status("TimeZone", current));
+        txn.set_reported_time_zone(current);
+    }
+    out.extend_from_slice(&crate::result_encoder::encode_ready_for_query(txn.status()));
+    out
+}
+
+/// [`ready_for_query_frames`] をストリームへ書く（`crate::simple_query`／`crate::copy` が
+/// 成功応答の終端で使う）。
+pub(crate) fn write_ready_for_query_synced_io<S: WireStream>(
+    stream: &mut S,
+    session: &engine::sql::mode::SessionState,
+    txn: &mut engine::sql::transaction::SessionTransaction<'_>,
+) -> io::Result<()> {
+    stream.write_all(&ready_for_query_frames(session, txn))
 }
 
 /// `ReadyForQuery`（'Z'）を単独送出する（ハンドシェイク完了直後など、応答
@@ -323,16 +359,6 @@ pub(crate) fn write_error_response_io<S: WireStream>(
     write_error_response(stream, class, message).map_err(io::Error::from)
 }
 
-/// `write_ready_for_query` の `io::Result` 版ラッパー。[`crate::simple_query`] は
-/// 本モジュール限定の `handshake::Result` を扱えないため、`ReadyForQuery` を
-/// 送出する唯一の経路としてこの関数を `pub(crate)` にする。
-pub(crate) fn write_ready_for_query_io<S: WireStream>(
-    stream: &mut S,
-    status: engine::sql::transaction::TransactionStatus,
-) -> io::Result<()> {
-    write_ready_for_query(stream, status).map_err(io::Error::from)
-}
-
 /// バイト列組み立ては [`crate::error_response::encode`] に委譲する（`ErrorClass`
 /// から severity・SQLSTATE を一元的に決定し、通常応答経路がこの横断写像を必ず
 /// 経由するようにする。TASK-153・ERR-1・codex-review P1 指摘対応・PR #258。
@@ -360,7 +386,7 @@ fn write_error_response<S: WireStream>(
 /// SSLRequest/GSSENCRequest への応答ループは無制限に繰り返させない
 /// （各コードにつき応答は高々 1 回。2 回目以降は fail-closed で拒否し、
 /// 無限ループでスレッドを占有させる経路を作らない）。
-fn negotiate_startup(stream: &mut TcpStream) -> Result<String> {
+fn negotiate_startup(stream: &mut TcpStream) -> Result<StartupParams> {
     let mut ssl_seen = false;
     let mut gssenc_seen = false;
     loop {
@@ -408,9 +434,10 @@ fn negotiate_startup(stream: &mut TcpStream) -> Result<String> {
 /// 残余バイトがないこと）・`user` キーが複数回出現しないことを検証する
 /// （review 指摘: 残余バイトの無視・重複キーの後勝ち上書きは、フレーミングの
 /// 曖昧さやテナント決定への不正な入力混入余地を生むため fail-closed で拒否する）。
-fn parse_startup_params(params_body: &[u8]) -> Result<String> {
+fn parse_startup_params(params_body: &[u8]) -> Result<StartupParams> {
     let mut pos = 0usize;
     let mut user: Option<String> = None;
+    let mut time_zone: Option<String> = None;
     loop {
         let key = read_c_string(params_body, &mut pos)?;
         if key.is_empty() {
@@ -427,10 +454,32 @@ fn parse_startup_params(params_body: &[u8]) -> Result<String> {
                 return Err(HandshakeError::Protocol("duplicate user parameter"));
             }
             user = Some(value.to_string());
+        } else if key.eq_ignore_ascii_case("timezone") {
+            // TABLE-33・Issue #1575: StartupMessage の `TimeZone`（キーは大文字小文字を区別しない）。
+            // ここでは長さと重複だけを検査し、解決（tzdb の参照）は認証成功後に行う
+            // （認証前の入力に解決結果の観測手段を与えない）。重複は `user` と同じく fail-closed
+            // で拒否する（PG は後勝ちだが、曖昧さを持ち込まない）。
+            if time_zone.is_some() {
+                return Err(HandshakeError::Protocol("duplicate TimeZone parameter"));
+            }
+            if value.len() > engine::datetime::MAX_TIMEZONE_SETTING_LEN {
+                return Err(HandshakeError::Protocol("TimeZone parameter is too long"));
+            }
+            time_zone = Some(value.to_string());
         }
         // その他のパラメータは意図的に読み捨てる（ポインタ: WIRE-2）。
     }
-    user.ok_or(HandshakeError::Protocol("missing required parameter: user"))
+    let user = user.ok_or(HandshakeError::Protocol("missing required parameter: user"))?;
+    Ok(StartupParams { user, time_zone })
+}
+
+/// StartupMessage から取り出す値（TASK-67・WIRE-2。`TimeZone` は TABLE-33・Issue #1575）。
+/// `user` はテナント決定、`time_zone` は認証成功後にセッションの初期値・reset 値へ解決する
+/// 未検証の生テキスト（`None` はサーバー既定の UTC）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupParams {
+    user: String,
+    time_zone: Option<String>,
 }
 
 /// PasswordMessage（'p'）を読み、末尾 null を除いた生パスワードバイト列を返す。
@@ -810,11 +859,18 @@ fn post_auth_loop<'e, S: WireStream>(
                         .map(|t| t.status())
                         .unwrap_or(engine::sql::transaction::TransactionStatus::Idle);
                     let active_generation = txn.as_ref().and_then(|t| t.active_generation());
+                    // Sync の応答末尾 `[ParameterStatus(TimeZone)] ReadyForQuery`（TABLE-33・
+                    // Issue #1575）。`txn` が無い場合は従来どおり通知なしの RFQ のみ。
+                    let ready_frames = match txn.as_mut() {
+                        Some(t) => ready_for_query_frames(session, t),
+                        None => crate::result_encoder::encode_ready_for_query(txn_status).to_vec(),
+                    };
                     match crate::extended_query::handle_sync(
                         stream,
                         extended,
                         txn_status,
                         active_generation,
+                        &ready_frames,
                     )? {
                         crate::extended_query::LoopSignal::Continue => {}
                         crate::extended_query::LoopSignal::Closed => return Ok(()),
@@ -1380,7 +1436,7 @@ fn handle_connection_inner(
 enum PreTlsOutcome {
     /// StartupMessage を受理した（TLS へ昇格しない。`SSLRequest` を送らない
     /// クライアント、または `tls` 未設定時の従来経路）。
-    Ready(String),
+    Ready(StartupParams),
     /// `SSLRequest` を受理し、TLS へ昇格すべき（Issue #966）。
     UpgradeTls,
     /// `mode == TlsMode::Require` の下で、`SSLRequest` を経ない平文
@@ -1449,7 +1505,7 @@ fn negotiate_startup_or_upgrade(stream: &mut TcpStream, mode: TlsMode) -> Result
 /// `Protocol` エラーとし、平文経路の「2 回目の SSLRequest」と同じ応答契約
 /// （[`respond_and_close`] 経由の ErrorResponse・切断）へ倒す。PostgreSQL
 /// 本体も TLS 確立後の再ネゴシエーション要求は拒否する。
-fn negotiate_after_tls<S: WireStream>(stream: &mut S) -> Result<String> {
+fn negotiate_after_tls<S: WireStream>(stream: &mut S) -> Result<StartupParams> {
     let body = framing::read_startup_frame(stream)?;
     let code_bytes: [u8; 4] = body
         .get(0..4)
@@ -1477,9 +1533,13 @@ fn run_authenticated_session<S: WireStream>(
     stream: &mut S,
     store: &UserStore,
     engine: Option<&engine::core::EngineCore>,
-    username: String,
+    params: StartupParams,
     session_limits: crate::limits::SessionLimits,
 ) -> io::Result<()> {
+    let StartupParams {
+        user: username,
+        time_zone: startup_time_zone,
+    } = params;
     let outcome = match authenticate(stream, store, &username) {
         Ok(o) => o,
         Err(e) => {
@@ -1512,6 +1572,23 @@ fn run_authenticated_session<S: WireStream>(
     // 一度だけ設定済み（WIRE-5）であり、ここで切り替えない（TLS 昇格時は
     // `handle_tls_upgrade` がハンドシェイク前後で退避・復元する）。
     write_authentication_ok(stream)?;
+    // TABLE-33・Issue #1575: StartupMessage の `TimeZone` は認証成功後に解決する（認証前の入力に
+    // tzdb の参照結果を観測させない）。解決できない値は AuthenticationOk の後に FATAL `22023`
+    // （固定文言・値を含めない）を返して切断する（PG と同じ。BackendKeyData は送らない）。
+    let mut session = engine::sql::mode::SessionState::default();
+    if let Some(text) = &startup_time_zone {
+        match engine::datetime::SessionTimeZone::parse_setting(text) {
+            Ok(tz) => session.apply_startup_time_zone(tz),
+            Err(_) => {
+                let msg = crate::error_response::encode_fatal(
+                    ErrorClass::InvalidParameterValue,
+                    engine::datetime::INVALID_TIME_ZONE_DETAIL,
+                )
+                .map_err(|_| io::Error::other("failed to encode ErrorResponse"))?;
+                return stream.write_all(&msg);
+            }
+        }
+    }
     // BackendKeyData の値そのものはキャンセル要求の照合以外に使わないため、
     // 暗号学的な強さは要求しない。プロセス ID とプロセス内カウンタで十分。
     let pid = std::process::id() as i32;
@@ -1519,16 +1596,21 @@ fn run_authenticated_session<S: WireStream>(
     write_backend_key_data(stream, pid, secret)?;
     write_parameter_status(stream, "server_version", "14.0")?;
     write_parameter_status(stream, "client_encoding", "UTF8")?;
+    write_parameter_status(stream, "TimeZone", session.time_zone().display())?;
     write_ready_for_query(stream, engine::sql::transaction::TransactionStatus::Idle)?;
 
-    // 接続単位のセッション状態（取得モード・宣言的 UDF レジストリ）。
+    // 接続単位のセッション状態（取得モード・宣言的 UDF レジストリ・TimeZone）。
     // `EngineCore` 自体は保持しない（`sql::mode` モジュールドキュメント参照）。
-    let mut session = engine::sql::mode::SessionState::default();
     // 接続単位の明示トランザクション状態（SQL-31・TASK-221）。`session` と同じく
     // 接続終了（drop）で破棄する ―― 未 commit のまま接続が切れた場合、保持中の
     // 共有 `redb::WriteTransaction` は commit されずに abort され、単一ライタの
     // 占有（`writer_gate::WriterPermit`）も解放される。
     let mut txn = engine.map(|e| e.new_session_transaction());
+    // 起動時 ParameterStatus で通知した TimeZone を通知済みとして記録する（以後の変化だけを
+    // `ready_for_query_frames` が通知する。TABLE-33・Issue #1575）。
+    if let Some(t) = txn.as_mut() {
+        t.set_reported_time_zone(session.time_zone().display());
+    }
     // SQL-23・TASK-202・TASK-203（Issue #899・#902）: DDL 実行権限
     // （`CREATE TABLE`・`DROP TABLE` 共通）は認証成功後（＝`username` が
     // 確定した時点）に 1 回だけ付与する。`PolicyContext`（`ctx`）はテナント ID・
@@ -1728,8 +1810,9 @@ mod tests {
         body.extend_from_slice(b"user\0alice\0");
         body.extend_from_slice(b"database\0other-tenant\0");
         body.push(0);
-        let user = parse_startup_params(&body).expect("valid params");
-        assert_eq!(user, "alice");
+        let params = parse_startup_params(&body).expect("valid params");
+        assert_eq!(params.user, "alice");
+        assert_eq!(params.time_zone, None);
     }
 
     #[test]
