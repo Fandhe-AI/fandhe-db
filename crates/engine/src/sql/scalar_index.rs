@@ -734,7 +734,7 @@ pub(crate) struct ScalarIndex {
 /// 異なり値だけを [`crate::collation::Collation::compare`]（等しい場合はバイト列で二次比較する
 /// 全順序。deterministic）で並べ、置換に従って `values`・`offsets`・`slots` を組み直し、
 /// `equality` の添字を写し替える。文字列本体は移動するだけで複製しない。組み直しで一時的に
-/// 増えるのは `offsets`/`slots`/置換配列の分だけで、`approx_bytes`（確定済みの計上額）に
+/// 増えるのは `offsets`/`slots`/置換配列/新しい `values` 配列領域の分だけで、`approx_bytes`（確定済みの計上額）に
 /// 足した合計を予算検査してから確保する。
 fn reorder_text_dictionary(
     values: &mut Vec<String>,
@@ -748,8 +748,11 @@ fn reorder_text_dictionary(
         return Ok(());
     }
     let distinct = values.len();
+    // 新旧の `String` 配列は代入まで同時に存在するため、`new_values` の領域
+    // （異なり値数 × `size_of::<String>()`）も一時メモリとして計上する。
     let temp_bytes = distinct
         .saturating_mul(2 * std::mem::size_of::<u32>())
+        .saturating_add(distinct.saturating_mul(std::mem::size_of::<String>()))
         .saturating_add(
             offsets
                 .len()
