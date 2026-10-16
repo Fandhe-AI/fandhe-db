@@ -1224,3 +1224,20 @@ fn generated_number_text_is_byte_budgeted() {
         Ok(65_536)
     );
 }
+
+/// 結果の複製（materialize）は部分木内の数値テキストも計上する。JSON の数値は 64 バイトまで
+/// なので、約 4 MiB のテキストを持つ部分木を 60 回選択する（ステップ上限内・ノード固定費だけ
+/// では 256 MiB に届かない形）と `ResultTooLarge` になる。
+#[test]
+fn materialize_charges_number_text_in_subtree() {
+    let n = format!("0.{}", "1".repeat(62));
+    let inner = format!("[{}]", vec![n.as_str(); 60_000].join(","));
+    let doc = format!("[{inner}]");
+    let subs = vec!["0"; 60].join(",");
+    let limits = JsonPathLimits::new(MAX_JSONPATH_EVAL_STEPS, 1024);
+    assert_eq!(
+        eval_with(&format!("$[{subs}]"), &doc, limits),
+        Err(JsonPathEvalError::ResultTooLarge)
+    );
+    assert_eq!(eval_with("$[0]", &doc, limits), Ok(1));
+}

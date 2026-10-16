@@ -53,6 +53,19 @@ pub const MAX_EVAL_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
 /// 値 1 ノードあたりの固定費として見積もるバイト数（バイト予算の概算用）。
 const NODE_COST_BYTES: u64 = 32;
 
+fn len_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// 数値が所有するヒープバイト数（`Float` のテキストのみ）。複製・生成の課金はすべて
+/// この関数（と [`Ev::charge_value`]）で数える。
+fn number_heap_bytes(n: &JsonNumber) -> u64 {
+    match n {
+        JsonNumber::Float { text, .. } => len_u64(text.len()),
+        _ => 0,
+    }
+}
+
 /// 評価の失敗。`wire_code()` は PostgreSQL 17 の SQLSTATE に合わせる。`client_message` は
 /// 固定の英語文で、キー名・変数名・値・位置など入力の断片を含めない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,12 +328,11 @@ impl<'a> Item<'a> {
 
     /// 複製すると新たに確保されるバイト数（借用の文字列・参照は 0）。複製前の予算課金に使う。
     fn owned_bytes(&self) -> u64 {
-        let n = match self {
-            Item::Str(Cow::Owned(t)) => t.len(),
-            Item::Num(JsonNumber::Float { text, .. }) => text.len(),
+        match self {
+            Item::Str(Cow::Owned(t)) => len_u64(t.len()),
+            Item::Num(n) => number_heap_bytes(n),
             _ => 0,
-        };
-        u64::try_from(n).unwrap_or(u64::MAX)
+        }
     }
 
     fn array_elems(&self) -> Option<&'a [JsonValue]> {
@@ -538,10 +550,7 @@ impl<'a> Ev<'a> {
 
     /// 数値テキスト（`Float` の `text`）を複製・生成する前にバイト予算を差し引く。
     fn charge_number(&mut self, n: &JsonNumber) -> R<()> {
-        if let JsonNumber::Float { text, .. } = n {
-            self.charge_bytes(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
-        }
-        Ok(())
+        self.charge_bytes(number_heap_bytes(n))
     }
 
     /// 新たに生成した数値を、保持する前にバイト予算へ課金して返す。評価中に数値を生成する
@@ -549,6 +558,34 @@ impl<'a> Ev<'a> {
     fn charged(&mut self, n: JsonNumber) -> R<JsonNumber> {
         self.charge_number(&n)?;
         Ok(n)
+    }
+
+    /// 部分木 `v` を複製する前の課金。ノード数をステップへ、所有ヒープ（ノード固定費・文字列・
+    /// キー・数値テキスト）をバイト予算へ、走査しながら課金する（巨大な部分木の走査自体も
+    /// 途中で打ち切る）。`materialize` が `v.clone()` の直前に呼ぶ唯一の経路。
+    fn charge_value(&mut self, v: &JsonValue) -> R<()> {
+        let mut bytes: u64 = 0;
+        let mut stack: Vec<&JsonValue> = vec![v];
+        while let Some(x) = stack.pop() {
+            self.tick(1)?;
+            bytes = bytes.saturating_add(NODE_COST_BYTES);
+            match x {
+                JsonValue::Array(a) => stack.extend(a.iter()),
+                JsonValue::Object(m) => {
+                    for (k, c) in m {
+                        bytes = bytes.saturating_add(len_u64(k.len()));
+                        stack.push(c);
+                    }
+                }
+                JsonValue::String(t) => bytes = bytes.saturating_add(len_u64(t.len())),
+                JsonValue::Number(n) => bytes = bytes.saturating_add(number_heap_bytes(n)),
+                _ => {}
+            }
+            if bytes > self.bytes_left {
+                return self.charge_bytes(bytes);
+            }
+        }
+        self.charge_bytes(bytes)
     }
 
     /// 項目の複製。所有バイト分を累積バイト予算へ課金してから複製する（超過は `54000`）。
@@ -1441,7 +1478,7 @@ impl<'a> Ev<'a> {
             Method::String => match jb.kind() {
                 Kind::Str => {
                     let src = jb.str().unwrap_or("");
-                    self.charge_bytes(u64::try_from(src.len()).unwrap_or(u64::MAX))?;
+                    self.charge_bytes(len_u64(src.len()))?;
                     Ok(Item::Str(Cow::Owned(src.to_string())))
                 }
                 Kind::Bool => {
@@ -1453,7 +1490,7 @@ impl<'a> Ev<'a> {
                         self.charge_number(n)?;
                     }
                     let text = jb.num().map(number_text).unwrap_or_default();
-                    self.charge_bytes(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
+                    self.charge_bytes(len_u64(text.len()))?;
                     Ok(Item::Str(Cow::Owned(text)))
                 }
                 _ => Err(self.soft(JsonPathEvalError::NonNumericItem)),
@@ -2320,29 +2357,7 @@ fn parse_bool_text(s: &str) -> Option<bool> {
 /// 項目を所有の [`JsonValue`] にする。部分木の複製は大きさ（ノード数）に比例して課金する。
 fn materialize(ev: &mut Ev<'_>, item: Item<'_>) -> Result<JsonValue, JsonPathEvalError> {
     let into = |ev: &mut Ev<'_>, v: &JsonValue| -> Result<JsonValue, JsonPathEvalError> {
-        // 明示スタックでノード数とバイト数を数えて課金してから複製する。
-        let mut n: u64 = 0;
-        let mut bytes: u64 = 0;
-        let mut stack: Vec<&JsonValue> = vec![v];
-        while let Some(x) = stack.pop() {
-            n = n.saturating_add(1);
-            bytes = bytes.saturating_add(NODE_COST_BYTES);
-            match x {
-                JsonValue::Array(a) => stack.extend(a.iter()),
-                JsonValue::Object(m) => {
-                    for (k, c) in m {
-                        bytes = bytes.saturating_add(u64::try_from(k.len()).unwrap_or(u64::MAX));
-                        stack.push(c);
-                    }
-                }
-                JsonValue::String(s) => {
-                    bytes = bytes.saturating_add(u64::try_from(s.len()).unwrap_or(u64::MAX));
-                }
-                _ => {}
-            }
-        }
-        ev.tick(n).map_err(unwrap_fail)?;
-        ev.charge_bytes(bytes).map_err(unwrap_fail)?;
+        ev.charge_value(v).map_err(unwrap_fail)?;
         Ok(v.clone())
     };
     match item {
@@ -2351,12 +2366,12 @@ fn materialize(ev: &mut Ev<'_>, item: Item<'_>) -> Result<JsonValue, JsonPathEva
         Item::Bool(b) => Ok(JsonValue::Bool(b)),
         Item::Num(n) => Ok(JsonValue::Number(n)),
         Item::Str(s) => {
-            ev.charge_bytes(u64::try_from(s.len()).unwrap_or(u64::MAX))
-                .map_err(unwrap_fail)?;
+            ev.charge_bytes(len_u64(s.len())).map_err(unwrap_fail)?;
             Ok(JsonValue::String(s.into_owned()))
         }
         Item::KeyValue { id, key, value } => {
-            ev.charge_bytes(u64::try_from(key.len()).unwrap_or(u64::MAX))
+            // 3 エントリ分の固定費（キー "id"・"key"・"value" を含む）と key の複製。
+            ev.charge_bytes(len_u64(key.len()).saturating_add(3 * NODE_COST_BYTES + 10))
                 .map_err(unwrap_fail)?;
             let mut m = BTreeMap::new();
             m.insert("id".to_string(), JsonValue::Number(int_number(id)));
