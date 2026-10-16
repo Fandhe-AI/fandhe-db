@@ -50,8 +50,8 @@
 //!   の対象外＝据え置き判断。WIRE-13・TASK-200・Issue #895）
 //! - `ColumnMeta::Scalar{ty: Numeric{..}}` → `numeric`（OID 1700, typlen -1。
 //!   値は `Cell::Numeric`（`Decimal` の正規テキスト）のテキスト表現。
-//!   バイナリ形式は `supports_binary` が別途 fail-closed に非対応とする
-//!   〔TASK-197・Issue #885〕）
+//!   バイナリ形式は PostgreSQL の `numeric_send` 形式〔TASK-197・Issue #885・
+//!   Issue #2442・WIRE-14〕）
 //! - `ColumnMeta::Computed{ty: Some(t)}` → `Scalar{ty: t}` と同じ写像（集計結果・
 //!   式列の静的な結果型。`COUNT` → `int8`・`SUM(REAL)` → `float4` など。Issue #1173・
 //!   WIRE-13・TABLE-13 のポインタ）。`Computed{ty: None}`（ベクトル式など静的型を
@@ -67,11 +67,12 @@
 //! `BIGINT`・`REAL`・`DOUBLE PRECISION`・`BOOLEAN`・`BYTEA`・`UUID`（PostgreSQL の
 //! send 形式。`Computed{ty: Some(t)}`〔集計・式列・ウィンドウ関数の結果列〕も `t` が
 //! 対応型ならバイナリ可。Issue #1407。結線は
-//! [`encode_data_row_into_with_columns`]）で、`Id`（`numeric`）・
+//! [`encode_data_row_into_with_columns`]）と、`NUMERIC`（`id`・別名付き `id`・
+//! NUMERIC 列・整数 AVG/SUM の結果列を含む。`numeric_send` 形式。Issue #2442）で、
 //! `Vector`（text 表現だが値はベクトル）・静的型を持たない `Computed{ty: None}` は
 //! バイナリ非対応として事前検査（[`validate_binary_formats`]）で
 //! `0A000` に拒否する（spec の WIRE-14 が定める対応範囲。`VECTOR` 列の独自
-//! バイナリ表現は定義しない）。`NUMERIC`・`DATE`・
+//! バイナリ表現は定義しない）。`DATE`・
 //! `TIMESTAMP`・`JSON`・`JSONB`・配列・`ENUM` も `0A000` のまま。
 //!
 //! Bind の結果形式コードから本 API への結線は
@@ -267,6 +268,120 @@ pub mod binary {
     /// `uuid` のバイナリ表現（16 バイトをそのまま返す）。
     pub fn uuid(v: [u8; 16]) -> [u8; 16] {
         v
+    }
+
+    /// `numeric` バイナリ表現の最大バイト数（ヘッダ 8 + 桁群 2 バイト × 最大 32 群）。
+    pub const NUMERIC_MAX_BYTES: usize = 8 + 2 * NUMERIC_MAX_GROUPS;
+    /// 組み立て用の桁群バッファ上限。u128（最大 39 桁＝10 群）の整数部と
+    /// 小数部（scale 最大 38 → 10 群）の合計 20 群に余裕を持たせた固定長。
+    const NUMERIC_MAX_GROUPS: usize = 32;
+
+    /// [`numeric`] の桁群バッファへ 1 群（0..=9999）を追記する。上限超過・範囲外は
+    /// `EncodeError`（添字アクセスを避け `get_mut` で境界検査する）。
+    fn push_group(
+        groups: &mut [u16; NUMERIC_MAX_GROUPS],
+        len: &mut usize,
+        g: u128,
+    ) -> Result<(), super::EncodeError> {
+        let slot = groups.get_mut(*len).ok_or(super::EncodeError)?;
+        *slot = u16::try_from(g).map_err(|_| super::EncodeError)?;
+        *len = len.checked_add(1).ok_or(super::EncodeError)?;
+        Ok(())
+    }
+
+    /// `numeric` のバイナリ表現（PostgreSQL の `numeric_send` と同じレイアウト。
+    /// `ndigits:i16`・`weight:i16`・`sign:u16`・`dscale:i16`・base-10000 の桁群 `i16`
+    /// をネットワークバイトオーダーで並べる。WIRE-14・TABLE-13・Issue #2442）。
+    ///
+    /// `magnitude` は符号なしの絶対値、`scale` は `dscale`（セルの実 scale）。
+    /// 小数部へ `10^pad` を掛けて 4 桁境界へ揃える素朴な方式は scale 37・38 で
+    /// u128 を超えるため、最下位群だけ先に切り出して桁揃えする。桁群は固定長
+    /// スタックバッファで組み立て（行ごとのヒープ確保を避ける）、戻り値は
+    /// `(バッファ, 有効バイト数)`。長さ付与は呼び出し元（`encode_binary_cell`）。
+    /// 先頭・末尾のゼロ群は除去し、値 0 は `ndigits=0, weight=0, sign=正` で
+    /// `dscale` のみ保持する。桁あふれ・上限超過は `EncodeError`（`XX000`）。
+    pub fn numeric(
+        negative: bool,
+        magnitude: u128,
+        scale: u8,
+    ) -> Result<([u8; NUMERIC_MAX_BYTES], usize), super::EncodeError> {
+        use super::EncodeError;
+        let pow10 = |n: u32| 10u128.checked_pow(n).ok_or(EncodeError);
+        let scale_u32 = u32::from(scale);
+        let divisor = pow10(scale_u32)?;
+        let int_part = magnitude / divisor;
+        let mut frac = magnitude % divisor;
+
+        let mut groups = [0u16; NUMERIC_MAX_GROUPS];
+        let mut len = 0usize;
+        // 小数部（低位群から）。端数桁があれば最下位群を先に 4 桁境界へ揃える。
+        let rem = scale_u32 % 4;
+        if rem != 0 {
+            let low = pow10(rem)?;
+            let pad = pow10(4 - rem)?;
+            let g = (frac % low).checked_mul(pad).ok_or(EncodeError)?;
+            push_group(&mut groups, &mut len, g)?;
+            frac /= low;
+        }
+        for _ in 0..(scale_u32 / 4) {
+            push_group(&mut groups, &mut len, frac % 10_000)?;
+            frac /= 10_000;
+        }
+        let frac_groups = len;
+        // 整数部（低位群から）。
+        let mut int_rest = int_part;
+        while int_rest != 0 {
+            push_group(&mut groups, &mut len, int_rest % 10_000)?;
+            int_rest /= 10_000;
+        }
+        let int_groups = len.checked_sub(frac_groups).ok_or(EncodeError)?;
+
+        // 低位→高位の並びを高位→低位へ反転する。
+        let used = groups.get_mut(..len).ok_or(EncodeError)?;
+        used.reverse();
+
+        // weight は先頭群の 10000 の冪指数。整数部が無ければ -1 から始める。
+        let mut weight = i32::try_from(int_groups).map_err(|_| EncodeError)? - 1;
+        let mut start = 0usize;
+        let mut end = len;
+        while start < end && used.get(start).copied() == Some(0) {
+            start += 1;
+            weight -= 1;
+        }
+        while end > start && used.get(end - 1).copied() == Some(0) {
+            end -= 1;
+        }
+        let digits = used.get(start..end).ok_or(EncodeError)?;
+        let (ndigits, weight, sign) = if digits.is_empty() {
+            (0i16, 0i16, 0u16)
+        } else {
+            (
+                i16::try_from(digits.len()).map_err(|_| EncodeError)?,
+                i16::try_from(weight).map_err(|_| EncodeError)?,
+                if negative { 0x4000 } else { 0x0000 },
+            )
+        };
+        let dscale = i16::from(scale);
+
+        let mut buf = [0u8; NUMERIC_MAX_BYTES];
+        let header = [
+            ndigits.to_be_bytes(),
+            weight.to_be_bytes(),
+            sign.to_be_bytes(),
+            dscale.to_be_bytes(),
+        ];
+        let mut pos = 0usize;
+        for part in &header {
+            let dst = buf.get_mut(pos..pos + 2).ok_or(EncodeError)?;
+            dst.copy_from_slice(part);
+            pos += 2;
+        }
+        for d in digits {
+            let dst = buf.get_mut(pos..pos + 2).ok_or(EncodeError)?;
+            dst.copy_from_slice(&d.to_be_bytes());
+            pos += 2;
+        }
+        Ok((buf, pos))
     }
 
     /// `text` のバイナリ表現（UTF-8 生バイト。PostgreSQL の text send と同一。
@@ -509,9 +624,10 @@ impl WireType {
     #[deny(clippy::wildcard_enum_match_arm)]
     pub(crate) const fn supports_binary(self) -> bool {
         match self {
-            // `id` は `numeric` として公告しており、WIRE-14 は `NUMERIC` を
-            // 非対応型としている。
-            WireType::Numeric => false,
+            // `numeric` は PostgreSQL の `numeric_send` 形式（base-10000 桁群）で
+            // バイナリ対応する（`id`・NUMERIC 列・SUM/AVG 結果列。WIRE-14・
+            // TABLE-13・Issue #2442）。DataRow への結線は `encode_binary_cell`。
+            WireType::Numeric => true,
             // `text` は UTF-8 生バイトがそのままバイナリ表現（PostgreSQL の
             // text send と同じ）。ただし `ColumnMeta::Scalar{ty: Vector(_)}`・
             // `Computed` は公告が text でも本来の値がベクトル／実行時型で
@@ -539,7 +655,7 @@ impl WireType {
 }
 
 /// `ColumnMeta` 1 個がバイナリ形式に対応するか（WIRE-14）。`Id` は公告する
-/// [`WireType`] の [`WireType::supports_binary`] へ委譲する（`numeric` のため非対応）。
+/// [`WireType`] の [`WireType::supports_binary`] へ委譲する（`numeric` として対応。Issue #2442）。
 /// `Scalar{ty}` と `Computed{ty: Some(ty)}`（集計結果・式列・ウィンドウ関数の静的な結果型。
 /// Issue #1407）は同じ [`scalar_type_binary_support`] で判定する。静的型を持たない
 /// `Computed{ty: None}`（ベクトル式など）は値の実体が実行時型で決まるため fail-closed で
@@ -552,14 +668,14 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
         ColumnMeta::Scalar { ty, .. } => scalar_type_binary_support(ty),
         ColumnMeta::Computed { ty: Some(ty), .. } => scalar_type_binary_support(ty),
         ColumnMeta::Computed { ty: None, .. } => false,
-        // 別名付き `id` は numeric 公告（バイナリ非対応。`Id` と同じ）。
+        // 別名付き `id` は numeric 公告（`Id` と同じくバイナリ対応）。
         ColumnMeta::AliasedId { .. } => column_wire_type(meta).supports_binary(),
     }
 }
 
 /// `ColumnType` 1 個がバイナリ形式に対応するか（`Scalar`／`Computed{ty: Some}` の共有判定。
 /// WIRE-14・TASK-218・Issue #1172・#1407）。対応型は `TEXT`・`INTEGER`・`BIGINT`・`REAL`・
-/// `DOUBLE PRECISION`・`BOOLEAN`・`BYTEA`・`UUID`・`TIME`。値の実体（`Cell`）との整合は
+/// `DOUBLE PRECISION`・`BOOLEAN`・`BYTEA`・`UUID`・`TIME`・`NUMERIC`。値の実体（`Cell`）との整合は
 /// `encode_binary_cell` が検査する。
 #[deny(clippy::wildcard_enum_match_arm)]
 fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
@@ -576,18 +692,18 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
         | ColumnType::Double
         | ColumnType::Bytea
         | ColumnType::Uuid
-        | ColumnType::Time => scalar_wire_type(ty).supports_binary(),
+        | ColumnType::Time
+        | ColumnType::Numeric { .. } => scalar_wire_type(ty).supports_binary(),
         // `VECTOR` は公告 OID が `text` でも値の実体がベクトルのため、独自の
         // バイナリ表現は定義せず `0A000` で拒否する（WIRE-14 決定）。
         // `ENUM`・`ARRAY` は専用 OID を持たない据え置き判断（Issue #895）、
-        // `JSON`／`JSONB`・`NUMERIC`・`DATE`／`TIMESTAMP` はバイナリ表現が
+        // `JSON`／`JSONB`・`DATE`／`TIMESTAMP` はバイナリ表現が
         // 未策定のため、いずれも fail-closed で非対応とする。
         ColumnType::Vector(_)
         | ColumnType::Enum(_)
         | ColumnType::Array(_)
         | ColumnType::Json
         | ColumnType::Jsonb
-        | ColumnType::Numeric { .. }
         | ColumnType::Date
         | ColumnType::Timestamp => false,
     }
@@ -1108,6 +1224,18 @@ fn encode_binary_cell(
             }
             push_fixed(out, wire_type, &binary::time(*m))
         }
+        // `numeric`（`id`・NUMERIC 列・整数 AVG/SUM 結果）。`dscale` はセルの実 scale
+        // （列型の名目 scale ではない）。`i128::abs` は MIN で panic するため
+        // `unsigned_abs` を使う（Issue #2442）。
+        (WireType::Numeric, Cell::Numeric(d)) => {
+            let u = d.unscaled();
+            let (buf, n) = binary::numeric(u < 0, u.unsigned_abs(), d.scale())?;
+            push_len_prefixed(out, buf.get(..n).ok_or(EncodeError)?)
+        }
+        (WireType::Numeric, Cell::Integer(v)) => {
+            let (buf, n) = binary::numeric(false, u128::from(*v), 0)?;
+            push_len_prefixed(out, buf.get(..n).ok_or(EncodeError)?)
+        }
         // 型と Cell の不一致、および非対応型（事前検査
         // `validate_binary_formats` で拒否済みの多層防御）は fail-closed。
         _ => Err(EncodeError),
@@ -1458,7 +1586,8 @@ mod tests {
         assert!(column_binary_support(&computed(Some(ColumnType::BigInt))));
         assert!(!column_binary_support(&computed(None)));
         assert!(column_binary_support(&computed(Some(ColumnType::SmallInt))));
-        assert!(!column_binary_support(&computed(Some(
+        // `NUMERIC` はバイナリ対応（Issue #2442）。
+        assert!(column_binary_support(&computed(Some(
             ColumnType::Numeric {
                 precision: 38,
                 scale: 2,
@@ -1933,12 +2062,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_binary_formats_rejects_id_column_as_binary() {
+    fn validate_binary_formats_accepts_id_column_as_binary() {
+        // `id` は numeric 公告で、バイナリ対応（WIRE-14・Issue #2442）。
         let columns = vec![ColumnMeta::Id];
         let formats = vec![FormatCode::Binary];
-        let err = validate_binary_formats(&columns, &formats).unwrap_err();
-        assert_eq!(err, BinaryFormatError::UnsupportedType { column_index: 0 });
-        assert_eq!(err.error_class(), ErrorClass::FeatureNotSupported);
+        assert!(validate_binary_formats(&columns, &formats).is_ok());
     }
 
     #[test]
@@ -2197,7 +2325,10 @@ mod tests {
 
     #[test]
     fn column_binary_support_matrix() {
-        assert!(!column_binary_support(&ColumnMeta::Id));
+        assert!(column_binary_support(&ColumnMeta::Id));
+        assert!(column_binary_support(&ColumnMeta::AliasedId {
+            name: "i".to_string(),
+        }));
         assert!(column_binary_support(&ColumnMeta::Scalar {
             name: "lang".to_string(),
             ty: engine::catalog::ColumnType::Text,
@@ -2223,11 +2354,14 @@ mod tests {
                 ty: Some(ty),
             }));
         }
-        for ty in [
-            engine::catalog::ColumnType::Numeric {
+        assert!(column_binary_support(&ColumnMeta::Computed {
+            name: "agg".to_string(),
+            ty: Some(engine::catalog::ColumnType::Numeric {
                 precision: 20,
                 scale: 0,
-            },
+            }),
+        }));
+        for ty in [
             engine::catalog::ColumnType::Date,
             engine::catalog::ColumnType::Timestamp,
             engine::catalog::ColumnType::Vector(3),
@@ -2237,7 +2371,7 @@ mod tests {
                 ty: Some(ty),
             }));
         }
-        // 数値・真偽値・bytea・uuid は対応（WIRE-14・Issue #1172）。
+        // 数値・真偽値・bytea・uuid・numeric は対応（WIRE-14・Issue #1172・#2442）。
         for ty in [
             engine::catalog::ColumnType::Integer,
             engine::catalog::ColumnType::BigInt,
@@ -2246,6 +2380,10 @@ mod tests {
             engine::catalog::ColumnType::Double,
             engine::catalog::ColumnType::Bytea,
             engine::catalog::ColumnType::Uuid,
+            engine::catalog::ColumnType::Numeric {
+                precision: 5,
+                scale: 2,
+            },
         ] {
             assert!(
                 column_binary_support(&ColumnMeta::Scalar {
@@ -2255,16 +2393,12 @@ mod tests {
                 "{ty:?} は binary 対応"
             );
         }
-        // 非対応のまま（`0A000`）: 日時・JSON・NUMERIC（配列・ENUM は wire 結合テストで固定）。
+        // 非対応のまま（`0A000`）: 日時・JSON（配列・ENUM は wire 結合テストで固定）。
         for ty in [
             engine::catalog::ColumnType::Date,
             engine::catalog::ColumnType::Timestamp,
             engine::catalog::ColumnType::Json,
             engine::catalog::ColumnType::Jsonb,
-            engine::catalog::ColumnType::Numeric {
-                precision: 5,
-                scale: 2,
-            },
         ] {
             assert!(
                 !column_binary_support(&ColumnMeta::Scalar {
@@ -2850,6 +2984,165 @@ mod tests {
         );
     }
 
+    // --- numeric バイナリ（WIRE-14・TABLE-13・Issue #2442）---
+
+    /// `numeric_send` 形式を `(ndigits, weight, sign, dscale, digits)` へ分解する。
+    fn numeric_parts(buf: &[u8]) -> (i16, i16, u16, i16, Vec<i16>) {
+        let h = |i: usize| i16::from_be_bytes([buf[i * 2], buf[i * 2 + 1]]);
+        let nd = h(0);
+        let digits = (0..nd as usize).map(|i| h(4 + i)).collect();
+        (nd, h(1), h(2) as u16, h(3), digits)
+    }
+
+    /// テスト側の独立デコーダ（base-10000 → 10 進テキスト。dscale で小数桁を揃える）。
+    fn numeric_to_text(buf: &[u8]) -> String {
+        let (_, weight, sign, dscale, digits) = numeric_parts(buf);
+        let mut int_s = String::new();
+        let mut frac_s = String::new();
+        let first = i32::from(weight);
+        let last = first - digits.len() as i32 + 1;
+        let lo = last.min(0);
+        let hi = first.max(0);
+        for w in (lo..=hi).rev() {
+            let idx = first - w;
+            let d = if idx >= 0 && (idx as usize) < digits.len() {
+                digits[idx as usize]
+            } else {
+                0
+            };
+            if w >= 0 {
+                int_s.push_str(&format!("{d:04}"));
+            } else {
+                frac_s.push_str(&format!("{d:04}"));
+            }
+        }
+        let int_t = int_s.trim_start_matches('0');
+        let int_t = if int_t.is_empty() { "0" } else { int_t };
+        frac_s.truncate(dscale as usize);
+        while frac_s.len() < dscale as usize {
+            frac_s.push('0');
+        }
+        let neg = if sign == 0x4000 { "-" } else { "" };
+        if dscale > 0 {
+            format!("{neg}{int_t}.{frac_s}")
+        } else {
+            format!("{neg}{int_t}")
+        }
+    }
+
+    fn enc_numeric(neg: bool, mag: u128, scale: u8) -> Vec<u8> {
+        let (buf, n) = binary::numeric(neg, mag, scale).expect("encode");
+        buf[..n].to_vec()
+    }
+
+    #[test]
+    fn numeric_binary_golden_values() {
+        // 黄金値は numeric_send のレイアウトから導出（PG17 実機照合は別 Issue）。
+        let p = |neg, mag, scale| numeric_parts(&enc_numeric(neg, mag, scale));
+        assert_eq!(p(false, 1_234_567, 2), (3, 1, 0, 2, vec![1, 2345, 6700]));
+        assert_eq!(p(false, 1, 5), (1, -2, 0, 5, vec![1000]));
+        assert_eq!(p(false, 0, 2), (0, 0, 0, 2, vec![]));
+        assert_eq!(p(false, 0, 0), (0, 0, 0, 0, vec![]));
+        assert_eq!(p(true, 0, 0), (0, 0, 0, 0, vec![]));
+        assert_eq!(p(true, 1, 0), (1, 0, 0x4000, 0, vec![1]));
+        assert_eq!(p(false, 10_000, 0), (1, 1, 0, 0, vec![1]));
+        assert_eq!(
+            p(false, 15_000_000_000_000_000, 16),
+            (2, 0, 0, 16, vec![1, 5000])
+        );
+        assert_eq!(
+            p(false, u128::from(u64::MAX), 0),
+            (5, 4, 0, 0, vec![1844, 6744, 737, 955, 1615])
+        );
+        // price = 123.45（NUMERIC(5,2)）の生バイト。
+        assert_eq!(
+            enc_numeric(false, 12345, 2),
+            [0, 2, 0, 0, 0, 0, 0, 2, 0x00, 0x7B, 0x11, 0x94]
+        );
+    }
+
+    #[test]
+    fn numeric_binary_roundtrips_extreme_values() {
+        for scale in [0u8, 1, 2, 3, 4, 5, 16, 36, 37, 38] {
+            for mag in [
+                0u128,
+                1,
+                9_999,
+                10_000,
+                u128::from(u64::MAX),
+                i128::MAX as u128,
+                i128::MIN.unsigned_abs(),
+            ] {
+                for neg in [false, true] {
+                    // i128 に収まらない組（正の MIN 絶対値）は対象外。i128::MIN は
+                    // 負側でのみ表現できる。
+                    let signed = match (neg, i128::try_from(mag)) {
+                        (false, Ok(v)) => v,
+                        (true, Ok(v)) => -v,
+                        (true, Err(_)) if mag == i128::MIN.unsigned_abs() => i128::MIN,
+                        _ => continue,
+                    };
+                    let want =
+                        engine::numeric::Decimal::from_parts(signed, scale).expect("decimal");
+                    let u = want.unscaled();
+                    let bytes = enc_numeric(u < 0, u.unsigned_abs(), want.scale());
+                    assert_eq!(numeric_to_text(&bytes), want.to_string(), "{mag} s{scale}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_cell_binary_encodes_with_cell_scale_and_rejects_mismatch() {
+        let col = |ty| scalar(ty);
+        let numeric_ty = engine::catalog::ColumnType::Numeric {
+            precision: 5,
+            scale: 2,
+        };
+        let dec = engine::numeric::Decimal::from_parts(12345, 2).expect("decimal");
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Numeric(dec), Cell::Null],
+        };
+        let mut out = Vec::new();
+        encode_data_row_into_with_columns(
+            &row,
+            &[col(numeric_ty.clone()), ColumnMeta::Id],
+            &[FormatCode::Binary, FormatCode::Binary],
+            &mut out,
+        )
+        .expect("encode");
+        assert_eq!(i32_at(&out, 7), 12);
+        // 型不一致（Numeric 列に Text／SignedInteger）は text へ落とさず拒否し truncate。
+        for bad in [Cell::Text("1".into()), Cell::SignedInteger(1)] {
+            let row = ResultRow {
+                id: 1,
+                score: 0.0,
+                cells: vec![bad],
+            };
+            let mut out = b"KEEP".to_vec();
+            let r = encode_data_row_into_with_columns(
+                &row,
+                &[col(numeric_ty.clone())],
+                &[FormatCode::Binary],
+                &mut out,
+            );
+            assert!(r.is_err());
+            assert_eq!(out, b"KEEP");
+        }
+        // id は Cell::Integer(u64) を numeric で送る。
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Integer(u64::MAX)],
+        };
+        let mut out = Vec::new();
+        encode_data_row_into_with_columns(&row, &[ColumnMeta::Id], &[FormatCode::Binary], &mut out)
+            .expect("encode");
+        assert_eq!(i32_at(&out, 7), 8 + 10);
+    }
+
     #[test]
     fn wire_type_supports_binary_matrix() {
         for t in WireType::ALL {
@@ -2867,6 +3160,7 @@ mod tests {
                     | WireType::Bytea
                     | WireType::Uuid
                     | WireType::Time
+                    | WireType::Numeric
             );
             assert_eq!(t.supports_binary(), expected, "{t:?}");
         }

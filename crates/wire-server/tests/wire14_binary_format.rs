@@ -140,18 +140,13 @@ fn mixed_per_column_codes_apply_independently() {
 }
 
 #[test]
-fn id_column_binary_request_is_rejected_as_feature_not_supported() {
-    let columns = vec![ColumnMeta::Id];
+fn id_column_binary_request_is_accepted_as_numeric() {
+    // `id` は numeric 公告で、バイナリ対応（WIRE-14・Issue #2442）。
+    let columns = vec![ColumnMeta::Id, ColumnMeta::AliasedId { name: "i".into() }];
     let formats = ResultFormats::new(&[1])
         .resolve(columns.len())
         .expect("resolve");
-    let err = validate_binary_formats(&columns, &formats).unwrap_err();
-    assert_eq!(err, BinaryFormatError::UnsupportedType { column_index: 0 });
-    assert_eq!(
-        err.error_class(),
-        engine::error_format::ErrorClass::FeatureNotSupported
-    );
-    assert_eq!(err.error_class().wire_code(), "0A000");
+    assert!(validate_binary_formats(&columns, &formats).is_ok());
 }
 
 #[test]
@@ -238,14 +233,19 @@ fn computed_column_binary_request_follows_static_type() {
             "{ty:?}"
         );
     }
-    for ty in [
-        ColumnType::Numeric {
+    // NUMERIC の静的型は対応（Issue #2442）。
+    let columns = vec![ColumnMeta::Computed {
+        name: "agg".to_string(),
+        ty: Some(ColumnType::Numeric {
             precision: 20,
             scale: 0,
-        },
-        ColumnType::Date,
-        ColumnType::Timestamp,
-    ] {
+        }),
+    }];
+    let formats = ResultFormats::new(&[1])
+        .resolve(columns.len())
+        .expect("resolve");
+    assert!(validate_binary_formats(&columns, &formats).is_ok());
+    for ty in [ColumnType::Date, ColumnType::Timestamp] {
         let columns = vec![ColumnMeta::Computed {
             name: "agg".to_string(),
             ty: Some(ty.clone()),
