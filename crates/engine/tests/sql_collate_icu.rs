@@ -599,6 +599,30 @@ fn unwired_paths_are_rejected_fail_closed() {
     for sql in &cases {
         assert_eq!(code_of(&core, sql), "0A000", "{sql}");
     }
+    // 本文の式が明示した ICU 照合（`MIN(x COLLATE "und-x-icu")` 等）を結果列として外側へ運ぶ
+    // ビューは、評価後射影形ビューの本文に許す形（集計引数は素の列のみ・式項目なし）の外で、
+    // 定義時に拒否される。照合が外側の `ORDER BY`／範囲比較で黙ってバイト列順に落ちる経路を
+    // 作らない（PR #2474 レビュー指摘）。
+    for body in [
+        "SELECT t0, MIN(t0 COLLATE \"und-x-icu\") AS m FROM docs GROUP BY t0",
+        "SELECT t0, MIN(t0 COLLATE \"und-x-icu\") AS m FROM docs GROUP BY t0 ORDER BY t0 LIMIT 50",
+        "SELECT id, t0 COLLATE \"und-x-icu\" AS m FROM docs ORDER BY id LIMIT 50",
+    ] {
+        let mut session = SessionState::default();
+        session.allow_ddl();
+        let err = core
+            .execute_sql_in_session(
+                &ctx("tenant-a"),
+                &mut session,
+                &format!("CREATE VIEW vx AS {body}"),
+            )
+            .expect_err(body);
+        assert!(
+            matches!(err.wire_code(), "0A000" | "42601"),
+            "{body}: {}",
+            err.wire_code()
+        );
+    }
     // 結線のある・照合に依存しない形は通る（素通しのビュー、照合なしの列だけの JOIN）。
     run(&core, "SELECT iu FROM vb LIMIT 5");
     run(
