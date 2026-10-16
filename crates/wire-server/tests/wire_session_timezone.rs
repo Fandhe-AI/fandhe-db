@@ -415,3 +415,61 @@ fn harness_sanity() {
     send_length_prefixed_message(&mut s, b'X', &[]);
     assert_eq!(s.read(&mut buf).unwrap_or(0), 0);
 }
+/// RowDescription（`T`）の第 `col` 列（0 起点）の型 OID。
+fn column_oid(msgs: &[(u8, Vec<u8>)], col: usize) -> i32 {
+    let body = &msgs
+        .iter()
+        .find(|(t, _)| *t == b'T')
+        .expect("RowDescription")
+        .1;
+    let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+    assert!(col < n);
+    let mut pos = 2;
+    for i in 0..n {
+        let name_end = body[pos..].iter().position(|b| *b == 0).expect("name nul");
+        pos += name_end + 1;
+        // table oid(4) + attnum(2) + type oid(4) + typlen(2) + typmod(4) + format(2)
+        let oid = i32::from_be_bytes(body[pos + 6..pos + 10].try_into().unwrap());
+        if i == col {
+            return oid;
+        }
+        pos += 18;
+    }
+    unreachable!("column index checked above")
+}
+
+/// 2 列目の DataRow 文字列（単純プロトコル）。
+fn second_cells(msgs: &[(u8, Vec<u8>)]) -> Vec<String> {
+    msgs.iter()
+        .filter(|(t, _)| *t == b'D')
+        .map(|(_, body)| {
+            let mut pos = 2;
+            let len = i32::from_be_bytes(body[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4 + len;
+            let len = i32::from_be_bytes(body[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            String::from_utf8_lossy(&body[pos..pos + len]).to_string()
+        })
+        .collect()
+}
+
+/// `AT TIME ZONE`／`date_trunc` の結果列の型 OID（timestamp=1114・timestamptz=1184）と、
+/// timestamptz 結果がセッション TZ の offset 付きで整形されること（Issue #1576）。
+#[test]
+fn at_time_zone_result_types_and_session_formatting() {
+    let (core, _g) = new_core();
+    let (mut s, _) = connect(spawn(&core), &[]);
+    run(
+        &mut s,
+        "INSERT INTO t (id, v) VALUES (1, '2026-07-01 12:00:00+00') USING OPERATION_ID 'o1'",
+    );
+    run(&mut s, "SET TIME ZONE 'Asia/Tokyo'");
+    // timestamptz → timestamp（壁時計。offset なし）。
+    let msgs = run(&mut s, "SELECT id, v AT TIME ZONE 'UTC' FROM t LIMIT 5");
+    assert_eq!(column_oid(&msgs, 1), 1114);
+    assert_eq!(second_cells(&msgs), ["2026-07-01 12:00:00"]);
+    // timestamptz → timestamptz（date_trunc。セッション TZ の offset 付き）。
+    let msgs = run(&mut s, "SELECT id, date_trunc('day', v) FROM t LIMIT 5");
+    assert_eq!(column_oid(&msgs, 1), 1184);
+    assert_eq!(second_cells(&msgs), ["2026-07-01 00:00:00+09"]);
+}

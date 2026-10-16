@@ -6831,7 +6831,7 @@ fn resolve_zone_value(
     let name = take_text_or_null_arg(args, idx)?.ok_or_else(|| SqlSurfaceError::Internal {
         detail: "NULL time zone reached evaluation".to_string(),
     })?;
-    crate::datetime::SessionTimeZone::resolve_zone_argument(&name).map_err(|_| {
+    crate::datetime::resolve_zone_argument_cached(&name).map_err(|_| {
         SqlSurfaceError::InvalidParameterValue {
             detail: crate::datetime::UNRECOGNIZED_TIME_ZONE_DETAIL,
         }

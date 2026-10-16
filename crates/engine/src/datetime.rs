@@ -873,6 +873,32 @@ fn parse_zone_numeric(input: &str) -> Option<i32> {
     Some(if neg { -total } else { total })
 }
 
+std::thread_local! {
+    /// 直前に解決した zone 引数の 1 件キャッシュ（式の評価が行ごとに同じ zone 名を解決する
+    /// ため。tzdb の TZif 解析を行数分繰り返さない。1 件・名前は 255 バイト以下で有界。Issue #1576）。
+    static ZONE_ARGUMENT_CACHE: std::cell::RefCell<Option<(String, SessionTimeZone)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`SessionTimeZone::resolve_zone_argument`] の 1 件キャッシュ付き版（行ごとの評価用）。
+/// 解決結果は名前だけで決まる純関数のため、キャッシュは結果を変えない。
+pub(crate) fn resolve_zone_argument_cached(
+    input: &str,
+) -> Result<SessionTimeZone, TimeZoneSettingError> {
+    let hit = ZONE_ARGUMENT_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(name, _)| name == input)
+            .map(|(_, tz)| tz.clone())
+    });
+    if let Some(tz) = hit {
+        return Ok(tz);
+    }
+    let tz = SessionTimeZone::resolve_zone_argument(input)?;
+    ZONE_ARGUMENT_CACHE.with(|c| *c.borrow_mut() = Some((input.to_string(), tz.clone())));
+    Ok(tz)
+}
+
 /// 秒数（絶対値）を `HH[:MM[:SS]]` へ整形する（0 でない下位要素だけを付ける）。
 fn format_hms(abs_secs: u64) -> String {
     let (hh, mm, ss) = (abs_secs / 3600, (abs_secs % 3600) / 60, abs_secs % 60);

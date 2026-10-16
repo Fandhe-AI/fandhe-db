@@ -289,7 +289,10 @@ fn setup_events(core: &EngineCore, s: &mut SessionState) {
 }
 
 fn ids(core: &EngineCore, s: &mut SessionState, sql: &str) -> Vec<String> {
-    let sql = if sql.contains("LIMIT") {
+    let mut tail = sql.rsplit(' ');
+    let last = tail.next().unwrap_or("");
+    let ends_with_limit = tail.next() == Some("LIMIT") && last.chars().all(|c| c.is_ascii_digit());
+    let sql = if ends_with_limit {
         sql.to_string()
     } else {
         format!("{sql} LIMIT 200")
@@ -519,4 +522,508 @@ fn extract_and_date_trunc_use_the_session_zone() {
         ),
         "2026-03-08 07:00:00+00"
     );
+}
+/// GROUP BY・DISTINCT・集合演算・サブクエリは UTC の時点で同一視する。
+#[test]
+fn grouping_distinct_set_ops_and_subquery() {
+    let (_g, core) = open("tzq-group");
+    let mut s = session();
+    ok(&core, &mut s, "CREATE TABLE g (at TIMESTAMPTZ, k INTEGER)");
+    // 同一時点を別 offset で入れる（UTC 2026-01-01 00:00 が 2 行、別時点が 1 行）。
+    for (id, at, k) in [
+        (1, "2026-01-01 09:00:00+09", 1),
+        (2, "2026-01-01 00:00:00+00", 2),
+        (3, "2026-02-01 00:00:00+00", 3),
+    ] {
+        ok(
+            &core,
+            &mut s,
+            &format!(
+                "INSERT INTO g (id, at, k) VALUES ({id}, '{at}', {k}) USING OPERATION_ID 'g{id}'"
+            ),
+        );
+    }
+    for z in ["UTC", "America/New_York"] {
+        ok(&core, &mut s, &format!("SET TIME ZONE '{z}'"));
+        let grouped = rows(
+            &core,
+            &mut s,
+            "SELECT at, COUNT(*) FROM g GROUP BY at ORDER BY at LIMIT 10",
+        );
+        assert_eq!(
+            grouped,
+            vec![
+                vec!["2026-01-01 00:00:00+00".to_string(), "2".to_string()],
+                vec!["2026-02-01 00:00:00+00".to_string(), "1".to_string()],
+            ],
+            "{z}"
+        );
+        assert_eq!(
+            rows(&core, &mut s, "SELECT DISTINCT at FROM g LIMIT 10").len(),
+            2,
+            "{z}"
+        );
+        let union = rows(
+            &core,
+            &mut s,
+            "SELECT at FROM g WHERE k = 1 UNION SELECT at FROM g WHERE k = 2",
+        );
+        assert_eq!(union.len(), 1, "{z}");
+        assert_eq!(union[0][0], "2026-01-01 00:00:00+00", "{z}");
+        assert_eq!(
+            rows(
+                &core,
+                &mut s,
+                "SELECT at FROM g WHERE k = 1 UNION ALL SELECT at FROM g WHERE k = 2"
+            )
+            .len(),
+            2,
+            "{z}"
+        );
+        assert_eq!(
+            ids(
+                &core,
+                &mut s,
+                "SELECT id FROM g WHERE at IN (SELECT at FROM g WHERE k = 1 LIMIT 10) ORDER BY id"
+            ),
+            ["1", "2"],
+            "{z}"
+        );
+        assert_eq!(
+            ids(
+                &core,
+                &mut s,
+                "SELECT id FROM g WHERE at = (SELECT MAX(at) FROM g)"
+            ),
+            ["3"],
+            "{z}"
+        );
+    }
+}
+
+/// 二次索引: 索引ありと全走査（`id + 0 > 0` で索引を無効化）の結果が一致し、表示 TZ に依らない。
+#[test]
+fn secondary_index_matches_full_scan() {
+    let (_g, core) = open("tzq-index");
+    let mut s = session();
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE ix (at TIMESTAMPTZ, ts TIMESTAMP)",
+    );
+    for i in 0..40u64 {
+        let (month, day) = (1 + i % 12, 1 + i % 27);
+        ok(
+            &core,
+            &mut s,
+            &format!(
+                "INSERT INTO ix (id, at, ts) VALUES ({}, '2026-{month:02}-{day:02} 12:00:00+00', \
+                 '2026-{month:02}-{day:02} 12:00:00') USING OPERATION_ID 'ix{i}'",
+                i + 1
+            ),
+        );
+    }
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO ix (id) VALUES (100) USING OPERATION_ID 'ix-null'",
+    );
+    let preds = [
+        "at = '2026-03-04 12:00:00+00'",
+        "at > '2026-06-01 00:00:00+00'",
+        "at >= '2026-06-01 00:00:00+00' AND at < '2026-09-01 00:00:00+00'",
+        "at BETWEEN '2026-02-01 00:00:00+00' AND '2026-04-01 00:00:00+00'",
+        "at IN ('2026-03-04 12:00:00+00', '2026-05-06 12:00:00+00')",
+        "at < '2026-01-01 00:00:00+00'",
+    ];
+    let mut before = Vec::new();
+    for p in preds {
+        before.push(ids(
+            &core,
+            &mut s,
+            &format!("SELECT id FROM ix WHERE {p} ORDER BY id"),
+        ));
+    }
+    ok(&core, &mut s, "CREATE INDEX ix_at ON ix (at)");
+    for z in ["UTC", "Asia/Tokyo"] {
+        ok(&core, &mut s, &format!("SET TIME ZONE '{z}'"));
+        for (p, expected) in preds.iter().zip(&before) {
+            let indexed = ids(
+                &core,
+                &mut s,
+                &format!("SELECT id FROM ix WHERE {p} ORDER BY id"),
+            );
+            let scanned = ids(
+                &core,
+                &mut s,
+                &format!("SELECT id FROM ix WHERE {p} AND id + 0 > 0 ORDER BY id"),
+            );
+            assert_eq!(&indexed, expected, "{z} {p}");
+            assert_eq!(&scanned, expected, "{z} {p}");
+        }
+    }
+    // ゾーン無しの文字列はセッション TZ の壁時計（束縛時に UTC へ確定し、索引でも同じ結果）。
+    ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
+    let a = ids(
+        &core,
+        &mut s,
+        "SELECT id FROM ix WHERE at = '2026-01-01 21:00:00' ORDER BY id",
+    );
+    let b = ids(
+        &core,
+        &mut s,
+        "SELECT id FROM ix WHERE at = '2026-01-01 21:00:00' AND id + 0 > 0 ORDER BY id",
+    );
+    assert_eq!(a, b);
+    assert!(!a.is_empty());
+    // TIMESTAMP 列 vs TIMESTAMPTZ のリテラルは索引を使わず全走査で同じ結果になる。
+    ok(&core, &mut s, "CREATE INDEX ix_ts ON ix (ts)");
+    ok(&core, &mut s, "SET TIME ZONE 'UTC'");
+    let c = ids(
+        &core,
+        &mut s,
+        "SELECT id FROM ix WHERE ts = TIMESTAMPTZ '2026-01-01 12:00:00+00' ORDER BY id",
+    );
+    assert_eq!(c, a);
+}
+fn explain_lines(core: &EngineCore, s: &mut SessionState, sql: &str) -> Vec<String> {
+    let SqlOutcome::Explain(result) = run(core, s, sql).expect("EXPLAIN must succeed") else {
+        panic!("expected Explain");
+    };
+    result
+        .rows
+        .iter()
+        .filter_map(|r| match r.cells.first() {
+            Some(Cell::Text(t)) => Some(t.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// TIMESTAMPTZ 列の範囲・等価述語は型付き順序索引を使い、TIMESTAMP 列 vs TIMESTAMPTZ の混在比較は
+/// 索引を使わず全走査へ縮退する（gap で変換が単調でないため。fail-closed）。
+#[test]
+fn explain_shows_index_use_and_mixed_comparison_fallback() {
+    let (_g, core) = open("tzq-explain");
+    let mut s = session();
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE ex (embedding VECTOR(2), at TIMESTAMPTZ, ts TIMESTAMP)",
+    );
+    for i in 0..8u64 {
+        ok(
+            &core,
+            &mut s,
+            &format!(
+                "INSERT INTO ex (id, embedding, at, ts) VALUES ({}, '[1.0,0.0]', \
+                 '2026-01-0{} 12:00:00+00', '2026-01-0{} 12:00:00') USING OPERATION_ID 'ex{i}'",
+                i + 1,
+                i + 1,
+                i + 1
+            ),
+        );
+    }
+    ok(&core, &mut s, "CREATE INDEX ex_at ON ex (at)");
+    ok(&core, &mut s, "CREATE INDEX ex_ts ON ex (ts)");
+    let tail = "ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10";
+    let ranged = explain_lines(
+        &core,
+        &mut s,
+        &format!("EXPLAIN SELECT id FROM ex WHERE at > '2026-01-04 00:00:00+00' {tail}"),
+    );
+    assert!(
+        ranged.iter().any(|l| l == "scalar_plan: index_typed_range"),
+        "{ranged:?}"
+    );
+    let mixed = explain_lines(
+        &core,
+        &mut s,
+        &format!(
+            "EXPLAIN SELECT id FROM ex WHERE ts > TIMESTAMPTZ '2026-01-04 00:00:00+00' {tail}"
+        ),
+    );
+    assert!(
+        !mixed.iter().any(|l| l == "scalar_plan: index_typed_range"),
+        "{mixed:?}"
+    );
+}
+
+/// 代入時の変換（INSERT・UPDATE）と式の型付け。TIMESTAMP・DATE はセッション TZ の壁時計として
+/// TIMESTAMPTZ 列へ、TIMESTAMPTZ は局所の値として TIMESTAMP・DATE 列へ入る（PG の代入キャスト）。
+#[test]
+fn assignment_conversions_follow_the_session_zone() {
+    let (_g, core) = open("tzq-assign");
+    let mut s = session();
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE a (at TIMESTAMPTZ, ts TIMESTAMP, d DATE)",
+    );
+    ok(&core, &mut s, "SET TIME ZONE 'America/New_York'");
+    // INSERT: TIMESTAMP リテラル（gap を含む）→ TIMESTAMPTZ 列。
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO a (id, at) VALUES (1, TIMESTAMP '2026-06-01 12:00:00') USING OPERATION_ID 'a1'",
+    );
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO a (id, at) VALUES (2, TIMESTAMP '2026-03-08 02:30:00') USING OPERATION_ID 'a2'",
+    );
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO a (id, d) VALUES (3, DATE '2026-06-01') USING OPERATION_ID 'a3'",
+    );
+    // DATE 列 → TIMESTAMPTZ 列（局所の 0 時）。
+    ok(
+        &core,
+        &mut s,
+        "UPDATE a SET at = d WHERE id = 3 USING OPERATION_ID 'a3u'",
+    );
+    let r = rows(&core, &mut s, "SELECT id, at FROM a ORDER BY id LIMIT 10");
+    assert_eq!(r[0][1], "2026-06-01 16:00:00+00");
+    assert_eq!(r[1][1], "2026-03-08 07:30:00+00");
+    assert_eq!(r[2][1], "2026-06-01 04:00:00+00");
+    // UPDATE SET: TIMESTAMPTZ の式 → TIMESTAMP・DATE 列は局所の値になる。
+    ok(
+        &core,
+        &mut s,
+        "UPDATE a SET ts = at, d = at WHERE id = 1 USING OPERATION_ID 'u1'",
+    );
+    let r = rows(
+        &core,
+        &mut s,
+        "SELECT id, ts, d FROM a WHERE id = 1 LIMIT 5",
+    );
+    assert_eq!(r[0][1], "2026-06-01 12:00:00");
+    assert_eq!(r[0][2], "2026-06-01");
+    // UPDATE SET: timestamp 列 → timestamptz 列（セッション TZ の壁時計）。
+    ok(
+        &core,
+        &mut s,
+        "UPDATE a SET at = ts WHERE id = 1 USING OPERATION_ID 'u2'",
+    );
+    let r = rows(&core, &mut s, "SELECT at FROM a WHERE id = 1 LIMIT 5");
+    assert_eq!(r[0][0], "2026-06-01 16:00:00+00");
+    // AT TIME ZONE の結果を列へ入れる。
+    ok(
+        &core,
+        &mut s,
+        "UPDATE a SET at = ts AT TIME ZONE 'Asia/Tokyo' WHERE id = 1 USING OPERATION_ID 'u3'",
+    );
+    let r = rows(&core, &mut s, "SELECT at FROM a WHERE id = 1 LIMIT 5");
+    assert_eq!(r[0][0], "2026-06-01 03:00:00+00");
+}
+
+/// 範囲外の変換は `22008`、TZ 依存式の CHECK は `0A000`、他テナントの行はどの経路からも見えない。
+#[test]
+fn range_errors_check_constraints_and_tenant_boundary() {
+    let (_g, core) = open("tzq-misc");
+    let mut s = session();
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "SELECT TIMESTAMP '0001-01-01 00:00:00' AT TIME ZONE 'Asia/Tokyo'"
+        ),
+        "22008"
+    );
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "SELECT TIMESTAMPTZ '9999-12-31 23:59:59+00' AT TIME ZONE 'Asia/Tokyo'"
+        ),
+        "22008"
+    );
+    // 範囲内の端は成功する。
+    assert_eq!(
+        one(
+            &core,
+            &mut s,
+            "SELECT TIMESTAMPTZ '9999-12-31 23:59:59+00' AT TIME ZONE 'America/Los_Angeles'"
+        ),
+        "9999-12-31 15:59:59"
+    );
+    // CHECK にセッション TZ 依存の式は置けない（定義時と別の TZ で結果が変わるため）。
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE c (at TIMESTAMPTZ, ts TIMESTAMP)",
+    );
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "CREATE TABLE c2 (at TIMESTAMPTZ, ts TIMESTAMP, CHECK (at > ts))"
+        ),
+        "0A000"
+    );
+    // 他テナントの行は集計・AT TIME ZONE・索引のどの経路からも見えない。
+    ok(&core, &mut s, "CREATE INDEX c_at ON c (at)");
+    ok(
+        &core,
+        &mut s,
+        "INSERT INTO c (id, at, ts) VALUES (1, '2026-01-01 00:00:00+00', '2026-01-01 00:00:00') \
+         USING OPERATION_ID 'c1'",
+    );
+    assert!(
+        rows(
+            &core,
+            &mut s,
+            "SELECT id, ts AT TIME ZONE 'UTC' FROM c LIMIT 10"
+        )
+        .len()
+            == 1
+    );
+    let mut bob = session();
+    let mut by_bob = |sql: &str| match run_as("bob", &core, &mut bob, sql).expect("bob query") {
+        SqlOutcome::Query(r) => r.rows.len(),
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(
+        by_bob("SELECT id FROM c WHERE at >= '2025-01-01 00:00:00+00' LIMIT 10"),
+        0
+    );
+    assert_eq!(
+        by_bob("SELECT id, ts AT TIME ZONE 'UTC' FROM c LIMIT 10"),
+        0
+    );
+    assert_eq!(by_bob("SELECT MAX(at) FROM c"), 1);
+    let max = match run_as("bob", &core, &mut bob, "SELECT MAX(at) FROM c").expect("max") {
+        SqlOutcome::Query(r) => r.rows[0].cells[0].clone(),
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(max, Cell::Null);
+}
+
+/// まだ閉じている機能（SUM/AVG・PK/UNIQUE・算術・明示 CAST）の拒否コードは変わらない。
+#[test]
+fn closed_features_stay_fail_closed() {
+    let (_g, core) = open("tzq-closed");
+    let mut s = session();
+    ok(&core, &mut s, "CREATE TABLE t (at TIMESTAMPTZ, n INTEGER)");
+    assert_eq!(code(&core, &mut s, "SELECT SUM(at) FROM t"), "42883");
+    assert_eq!(code(&core, &mut s, "SELECT at + 1 FROM t LIMIT 5"), "42804");
+    // PK／UNIQUE は担当 Issue 未定のまま拒否される（拒否コードは #1574 から不変）。
+    assert!(run(&core, &mut s, "CREATE TABLE u (at TIMESTAMPTZ PRIMARY KEY)").is_err());
+    // INTERVAL の zone は未実装のため構文段で拒否される。
+    assert!(run(
+        &core,
+        &mut s,
+        "SELECT TIMESTAMP '2026-01-01 00:00:00' AT TIME ZONE INTERVAL '1 hour'"
+    )
+    .is_err());
+}
+/// window 関数のキー・集計入力と、分割実行 UPDATE の TZ 依存を確認する。
+#[test]
+fn window_and_partitioned_update() {
+    let (_g, core) = open("tzq-window");
+    let mut s = session();
+    setup_events(&core, &mut s);
+    // window: ORDER BY／PARTITION BY のキーと MIN／MAX 入力。
+    let r = rows(
+        &core,
+        &mut s,
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY at DESC) FROM ev WHERE at IS NOT NULL ORDER BY id LIMIT 10",
+    );
+    assert_eq!(r[0], ["1", "4"]);
+    assert_eq!(r[3], ["4", "1"]);
+    let r = rows(
+        &core,
+        &mut s,
+        "SELECT id, MAX(at) OVER (PARTITION BY n) FROM ev WHERE id = 3 LIMIT 5",
+    );
+    assert_eq!(r[0][1], "2026-06-15 12:00:00+00");
+    // 分割実行 UPDATE: ゾーン無しのリテラルを別の TZ から再送すると内容不一致（22023）になる。
+    let sql = "UPDATE ev SET at = '2026-01-01 09:00:00' WHERE n >= 0 \
+               USING OPERATION_ID 'pp1' PARTITIONED CHUNK 2";
+    ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
+    ok(&core, &mut s, sql);
+    ok(&core, &mut s, "SET TIME ZONE 'UTC'");
+    assert_eq!(code(&core, &mut s, sql), "22023");
+    // TIMESTAMPTZ 列を持たないテーブルでも、TIMESTAMPTZ の式（ゾーン無しのリテラル）を含む再送は
+    // セッション TZ が違えば内容不一致になる。
+    ok(&core, &mut s, "CREATE TABLE tp (ts TIMESTAMP, n INTEGER)");
+    for i in 1..=3 {
+        ok(
+            &core,
+            &mut s,
+            &format!("INSERT INTO tp (id, ts, n) VALUES ({i}, '2026-01-01 00:00:00', {i}) USING OPERATION_ID 'tp{i}'"),
+        );
+    }
+    let sql2 = "UPDATE tp SET n = 0 WHERE ts < TIMESTAMPTZ '2026-06-01 00:00:00' \
+                USING OPERATION_ID 'pp2' PARTITIONED CHUNK 2";
+    ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
+    ok(&core, &mut s, sql2);
+    ok(&core, &mut s, "SET TIME ZONE 'UTC'");
+    assert_eq!(code(&core, &mut s, sql2), "22023");
+}
+/// NOT／OR・NULL の扱い・ORDER BY の NULL 位置・式の中の比較（CASE）も時点で動く。
+#[test]
+fn boolean_combinations_nulls_and_case() {
+    let (_g, core) = open("tzq-bool");
+    let mut s = session();
+    setup_events(&core, &mut s);
+    ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
+    assert_eq!(
+        ids(
+            &core,
+            &mut s,
+            "SELECT id FROM ev WHERE NOT at > '2026-03-08 07:30:00+00' ORDER BY id"
+        ),
+        ["1", "2"]
+    );
+    assert_eq!(
+        ids(
+            &core,
+            &mut s,
+            "SELECT id FROM ev WHERE at < '2026-02-01 00:00:00+00' OR at > '2026-10-01 00:00:00+00' ORDER BY id"
+        ),
+        ["1", "4"]
+    );
+    // NULL は比較で偽（行に入らない）。IS NULL は存在ビットだけを見る。
+    assert_eq!(
+        ids(&core, &mut s, "SELECT id FROM ev WHERE at IS NULL"),
+        ["5"]
+    );
+    // ORDER BY ASC は NULL が最後（PG の既定）。
+    assert_eq!(
+        ids(&core, &mut s, "SELECT id FROM ev ORDER BY at ASC"),
+        ["1", "2", "3", "4", "5"]
+    );
+    // 式の中の比較と AT TIME ZONE の組み合わせ。
+    let r = rows(
+        &core,
+        &mut s,
+        "SELECT id, CASE WHEN at > '2026-06-01 00:00:00+00' THEN 1 ELSE 0 END FROM ev WHERE id < 5 ORDER BY id LIMIT 10",
+    );
+    assert_eq!(
+        r.iter().map(|x| x[1].as_str()).collect::<Vec<_>>(),
+        ["0", "0", "1", "1"]
+    );
+    let r = rows(
+        &core,
+        &mut s,
+        "SELECT id, at AT TIME ZONE 'UTC' FROM ev WHERE id = 3 LIMIT 5",
+    );
+    assert_eq!(r[0][1], "2026-06-15 12:00:00");
+    // 範囲が逆の BETWEEN は空。
+    assert!(ids(
+        &core,
+        &mut s,
+        "SELECT id FROM ev WHERE at BETWEEN '2026-12-01 00:00:00+00' AND '2026-01-01 00:00:00+00'"
+    )
+    .is_empty());
+    // 不正なリテラルは 22007、リテラル本文をエラー文言に含めない。
+    let (c, msg) = err(
+        &core,
+        &mut s,
+        "SELECT id FROM ev WHERE at = 'garbage-literal' LIMIT 5",
+    );
+    assert_eq!(c, "22007");
+    assert!(!msg.contains("garbage-literal"), "{msg}");
 }
