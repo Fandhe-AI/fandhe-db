@@ -42,6 +42,7 @@ use crate::policy::PolicyContext;
 use crate::recovery::content_hash;
 use crate::recovery::ledger::{self, LedgerRecordError, LedgerWrite};
 use crate::recovery::required_op_id::{LedgerMode, OperationId};
+use crate::sql::parser::VolatileColumn;
 // `CheckEvaluationFailed` が運ぶ内側のエラー型（`sql::check_constraint::
 // CompiledChecks::enforce` が返す `ExprProgram::eval` の失敗を、通常の式評価
 // （WHERE／SELECT）と同じ分類・同じ安全な文言のまま呼び出し元へ透過させるために
@@ -1113,7 +1114,7 @@ pub(crate) fn insert_rows_unchecked(
 /// Issue #1587）。外側が空スライスなら全行が揮発性 DEFAULT なし（従来のハッシュ形）、
 /// 空でなければ `rows` と同じ長さで、行ごとに `sql::parser::BoundInsert::volatile_default_columns`
 /// を渡す。内容照合ハッシュは該当列を評価値ではなく DEFAULT の構文形でハッシュする（設計 D1・D2）。
-pub(crate) type VolatileDefaultColumns<'a> = &'a [&'a [usize]];
+pub(crate) type VolatileDefaultColumns<'a> = &'a [&'a [VolatileColumn]];
 
 /// `volatile` のいずれかの行が揮発性 DEFAULT を持つか。
 fn any_volatile_default(volatile: VolatileDefaultColumns<'_>) -> bool {
@@ -1129,14 +1130,23 @@ fn named_expr_columns<'a>(
     schema: &'a crate::catalog::TableSchema,
     values: &'a [crate::row_codec::Value],
     vector_idx: Option<usize>,
-    volatile: &[usize],
+    volatile: &[VolatileColumn],
 ) -> Result<Vec<(&'a str, content_hash::HashColumnInput<'a>)>, TenantWriteError> {
-    for &idx in volatile {
-        let is_time_default = matches!(
-            schema.columns.get(idx).and_then(|c| c.default.as_ref()),
-            Some(crate::catalog::ColumnDefault::CurrentTime(_))
-        );
-        if !is_time_default || Some(idx) == vector_idx {
+    for col in volatile {
+        let idx = col.index();
+        // DEFAULT 適用列は、スキーマの DEFAULT が時刻 DEFAULT であることも確認する
+        // （VALUES の時刻関数列は構文形を自前で持つため DEFAULT の有無を問わない）。
+        let ok = match col {
+            VolatileColumn::Default(_) => matches!(
+                schema.columns.get(idx).and_then(|c| c.default.as_ref()),
+                Some(crate::catalog::ColumnDefault::CurrentTime(_))
+            ),
+            VolatileColumn::Values(_, t) => schema
+                .columns
+                .get(idx)
+                .is_some_and(|c| t.compatible_with(&c.ty)),
+        };
+        if !ok || Some(idx) == vector_idx {
             return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                 "volatile DEFAULT column does not match the table schema".to_string(),
             )));
@@ -1152,12 +1162,22 @@ fn named_expr_columns<'a>(
         if Some(idx) == vector_idx || matches!(column.ty, crate::catalog::ColumnType::Vector(_)) {
             continue;
         }
-        if volatile.contains(&idx) {
-            if let Some(crate::catalog::ColumnDefault::CurrentTime(t)) = column.default.as_ref() {
-                out.push((
+        if let Some(col) = volatile.iter().find(|c| c.index() == idx) {
+            match col {
+                VolatileColumn::Default(_) => {
+                    if let Some(crate::catalog::ColumnDefault::CurrentTime(t)) =
+                        column.default.as_ref()
+                    {
+                        out.push((
+                            column.name.as_str(),
+                            content_hash::HashColumnInput::VolatileDefault(*t),
+                        ));
+                    }
+                }
+                VolatileColumn::Values(_, t) => out.push((
                     column.name.as_str(),
-                    content_hash::HashColumnInput::VolatileDefault(*t),
-                ));
+                    content_hash::HashColumnInput::ValuesTime(*t),
+                )),
             }
         } else if let Some(value) = values.get(idx) {
             out.push((
@@ -1253,7 +1273,7 @@ pub(crate) fn insert_typed_row_unchecked(
     values: &[crate::row_codec::Value],
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
-    volatile_default_columns: &[usize],
+    volatile_default_columns: &[VolatileColumn],
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
     target.with_txn(|write_txn| {
@@ -1474,7 +1494,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                 };
                 schema.validate_row_embedding_dim(embedding.len())?;
                 if use_expr {
-                    let row_volatile: &[usize] = volatile_default_columns
+                    let row_volatile: &[VolatileColumn] = volatile_default_columns
                         .get(row_idx)
                         .copied()
                         .unwrap_or(&[]);
@@ -1856,7 +1876,7 @@ fn upsert_typed_rows_impl(
                 };
                 schema.validate_row_embedding_dim(embedding.len())?;
                 if use_expr {
-                    let row_volatile: &[usize] = volatile_default_columns
+                    let row_volatile: &[VolatileColumn] = volatile_default_columns
                         .get(row_idx)
                         .copied()
                         .unwrap_or(&[]);

@@ -161,7 +161,8 @@ mod tests {
             crate::recovery::ledger::LedgerWrite::Record(recorded) => {
                 assert_eq!(recorded, &id);
             }
-            crate::recovery::ledger::LedgerWrite::Disabled => {
+            crate::recovery::ledger::LedgerWrite::RecordEvaluated { .. }
+            | crate::recovery::ledger::LedgerWrite::Disabled => {
                 panic!("Ledgered must resolve to Record")
             }
         }

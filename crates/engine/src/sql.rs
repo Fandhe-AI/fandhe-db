@@ -166,6 +166,8 @@ pub(crate) mod ddl_column_type;
 pub mod declarative_predicate;
 pub(crate) mod describe;
 pub(crate) mod set_expr;
+#[cfg(test)]
+mod write_time_ledger_tests;
 // `SELECT DISTINCT`・`COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）が共有する
 // 正準キー化・予算管理。`allowlist`（構文の脱糖先）と `aggregate`／`group_by`
 // （`Accumulator::CountDistinct` の予算管理）の双方から参照される。

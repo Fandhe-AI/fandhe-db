@@ -642,21 +642,41 @@ pub(crate) fn complete_in_txn(
     hash: &ContentHash,
     rows_changed_in_final_chunk: u64,
 ) -> Result<u64, PartitionedJobError> {
+    complete_with_fixed_time_in_txn(txn, key, hash, rows_changed_in_final_chunk, None)
+}
+
+/// [`complete_in_txn`] の固定時刻つき版。文が時刻値関数を含む場合に呼び出し元が渡す
+/// 固定時刻（ジョブ開始時に確定した値）を、台帳 v3 の評価時刻として記録する（Issue #2188）。
+/// 一括で完了する（`Running` 記録を作らない）場合でも評価時刻を残すために、`Running`
+/// 記録の固定時刻より引数を優先する（両者が存在すれば同値であることは呼び出し元が検証済み）。
+pub(crate) fn complete_with_fixed_time_in_txn(
+    txn: &redb::WriteTransaction,
+    key: &JobKey<'_>,
+    hash: &ContentHash,
+    rows_changed_in_final_chunk: u64,
+    explicit_fixed_time: Option<i64>,
+) -> Result<u64, PartitionedJobError> {
     let prior = lookup_in_write_txn(txn, key)?;
-    let (prior_processed, was_running) = match prior {
-        None => (0, false),
+    let (prior_processed, was_running, fixed_time) = match prior {
+        None => (0, false, None),
         Some(JobRecord::Running {
             hash: stored,
             processed,
+            fixed_time,
             ..
-        }) if hash.matches(&stored) => (processed, true),
+        }) if hash.matches(&stored) => (processed, true, fixed_time),
         Some(_) => return Err(PartitionedJobError::StateConflict),
     };
     let total = prior_processed
         .checked_add(rows_changed_in_final_chunk)
         .ok_or_else(|| PartitionedJobError::corrupt("partitioned job count overflow"))?;
     crate::recovery::ledger::record_partitioned_completion_in_txn(
-        txn, key.tenant, key.table, key.op_id, hash,
+        txn,
+        key.tenant,
+        key.table,
+        key.op_id,
+        hash,
+        explicit_fixed_time.or(fixed_time),
     )
     .map_err(|e| match e {
         LedgerRecordError::Corrupted(se) => PartitionedJobError::Corrupted(se),
@@ -1371,8 +1391,15 @@ mod tests {
         // 通常 DML 相当が先に同じ operation_id を台帳へ記録していた状況を作る。
         // （Running を通常 DML が拒否する不変条件の外側にある破損状態の再現。）
         let wt = db.begin_write().expect("w");
-        ledger::record_partitioned_completion_in_txn(&wt, "t1", "docs", &id, &hash("foreign"))
-            .expect("seed");
+        ledger::record_partitioned_completion_in_txn(
+            &wt,
+            "t1",
+            "docs",
+            &id,
+            &hash("foreign"),
+            None,
+        )
+        .expect("seed");
         wt.commit().expect("c");
 
         let wt = db.begin_write().expect("w");
@@ -1582,7 +1609,7 @@ mod tests {
         let id = op("op-1");
         let k = key("t1", "docs", &id);
         let wt = db.begin_write().expect("w");
-        ledger::record_partitioned_completion_in_txn(&wt, "t1", "docs", &id, &hash("h"))
+        ledger::record_partitioned_completion_in_txn(&wt, "t1", "docs", &id, &hash("h"), None)
             .expect("ledger");
         wt.commit().expect("c");
         let wt = db.begin_write().expect("w");
