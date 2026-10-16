@@ -999,4 +999,4 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 
 - Issue #2189（build(engine)。TABLE-28 ポインタ）: ICU4X の `icu_collator = "=2.3.1"` と `icu_collator_data = "=2.3.0"` を `crates/engine/Cargo.toml` へ非 optional で完全固定追加した（承認記録: Issue #1608 のコメント、ADR [icu-collator-adoption.md](icu-collator-adoption.md)）。`Cargo.lock` は追加のみ。`crates/engine/tests/icu_collator_smoke.rs` で `compiled_data` による root 照合の構築を確認した。照合比較・ソートキー・`COLLATE` の受理は #2190、照合を含む索引は #2191 の対象外。
 
-- Issue #2435（docs(design)。TASK-337・WIRE-24 ポインタ。親 #2434）: [wire-extended-query-param-binding.md](wire-extended-query-param-binding.md) に「Parse の型 OID 指定時の判定規則」節を追記した。Parse 時の判定順（フレーム検査 → `42601` → 持たない型 `0A000` → 変換可否 `42804`／`42883` → 推論不能 `42P18`）、位置別の判定区分、「持つ型」の単一情報源（`WireType::ALL`）、OID 0 の推論不変、拒否時の接続維持、他テナント非観測を記録した。新しい `wire_code` は追加しない。既存本文の置き換え予定箇所に注記を入れた。コード変更なし（実装は #2436〜#2438、NULL は #2439、テストは #2440）。
+- Issue #2435（docs(design)。TASK-337・WIRE-24 ポインタ。親 #2434）: [wire-extended-query-param-binding.md](wire-extended-query-param-binding.md) に「Parse の型 OID 指定時の判定規則」節をポインタ表記で追記し、置き換え予定の既存記述へ注記を入れた。新しい `wire_code` は追加しない。コード変更なし（実装は #2436〜#2438、NULL は #2439、テストは #2440）。
