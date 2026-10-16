@@ -152,6 +152,11 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
             detail: "SQL/JSON query functions are not supported in a constant expression"
                 .to_string(),
         }),
+        // `CAST`（SQL-47・Issue #1590）も定数式（INSERT VALUES・DEFAULT 等）では未対応（`0A000`）。
+        // 値の変換は #1591／#1592 の担当で、評価できない式を定数として黙って通さない。
+        Expr::Cast { .. } => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "CAST is not supported in a constant expression".to_string(),
+        }),
         Expr::Number(_)
         | Expr::String(_)
         | Expr::Null
@@ -239,7 +244,7 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::ValueFunction { .. } => Ok(()),
         Expr::Collate { expr, .. } => check_intermediate_precision(expr),
         // 到達しない（`prescan` が拒否済み）。
-        Expr::SqlJsonQuery(_) => Ok(()),
+        Expr::SqlJsonQuery(_) | Expr::Cast { .. } => Ok(()),
         Expr::Call { args, .. } => {
             args.iter().try_for_each(check_intermediate_precision)?;
             check_node_value(expr, true)

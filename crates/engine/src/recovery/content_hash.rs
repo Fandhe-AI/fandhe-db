@@ -1886,6 +1886,8 @@ fn collect_referenced_udfs(
         Expr::Null | Expr::ValueFunction { .. } => Ok(()),
         // 照合指定（TABLE-28・Issue #1609）は内側の式の UDF 呼び出しを再帰的に走査する。
         Expr::Collate { expr, .. } => collect_referenced_udfs(expr, udf_registry, out),
+        // `CAST`（SQL-47・Issue #1590）は被演算子の UDF 呼び出しを再帰的に走査する。
+        Expr::Cast { expr, .. } => collect_referenced_udfs(expr, udf_registry, out),
         // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）は context・path・PASSING・
         // DEFAULT の部分式の UDF 呼び出しを走査する。
         Expr::SqlJsonQuery(q) => {
@@ -2022,7 +2024,7 @@ fn push_set_expr(
                 walk(b, lhs);
                 walk(b, rhs);
             }
-            Expr::Collate { expr, .. } => walk(b, expr),
+            Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => walk(b, expr),
             Expr::SqlJsonQuery(q) => {
                 walk(b, &q.context);
                 walk(b, &q.path);
@@ -2325,6 +2327,17 @@ fn push_dml_expr(
                     }
                 }
             }
+        }
+        // タグ 16（対象ビヘイビア: SQL-47。Issue #1590。ADR §4.4 タグ表に追記）。
+        // 変換先の正規の綴り（`CastType::to_sql`。固定語彙のみ）を長さ前置で連結してから被演算子を
+        // 前置順に直列化する。型だけ・被演算子だけ・CAST の有無だけが異なる再送を同一内容と誤判定しない
+        // （RECOVER-10）。UPDATE の `SET` 式や述語形の WHERE に CAST が入りうるため、拒否せずハッシュする。
+        // 既存タグ 1〜15 は不変。
+        Expr::Cast { expr, ty } => {
+            b.push_u8(16);
+            b.push_bytes(ty.to_sql().as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            push_dml_expr(b, expr, params)?;
         }
     }
     Ok(())
@@ -4984,6 +4997,15 @@ mod tests {
             collation,
         }
     }
+    fn cast_to(
+        inner: crate::sql::udf_call::Expr,
+        ty: crate::sql::cast::CastType,
+    ) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::Cast {
+            expr: Box::new(inner),
+            ty,
+        }
+    }
     /// `SqlJsonQuery`（タグ 15）の最小形。`mutate` で句を 1 つだけ変えた対を作る。
     fn sjq(
         kind: crate::sql::udf_call::SqlJsonQueryKind,
@@ -5370,6 +5392,35 @@ mod tests {
                 "collate operand",
                 collate(ident("a"), crate::collation::Collation::C),
                 collate(ident("b"), crate::collation::Collation::C),
+            ),
+            // Issue #1590（SQL-47）: CAST は変換先の型・被演算子・CAST の有無で区別される（タグ 16）。
+            (
+                "cast target type",
+                cast_to(ident("a"), crate::sql::cast::CastType::Int4),
+                cast_to(ident("a"), crate::sql::cast::CastType::Int8),
+            ),
+            (
+                "cast target modifier",
+                cast_to(ident("a"), crate::sql::cast::CastType::Varchar(Some(3))),
+                cast_to(ident("a"), crate::sql::cast::CastType::Varchar(Some(4))),
+            ),
+            (
+                "cast array vs element",
+                cast_to(ident("a"), crate::sql::cast::CastType::Int4),
+                cast_to(
+                    ident("a"),
+                    crate::sql::cast::CastType::Array(Box::new(crate::sql::cast::CastType::Int4)),
+                ),
+            ),
+            (
+                "cast operand",
+                cast_to(ident("a"), crate::sql::cast::CastType::Int4),
+                cast_to(ident("b"), crate::sql::cast::CastType::Int4),
+            ),
+            (
+                "cast presence",
+                cast_to(ident("a"), crate::sql::cast::CastType::Int4),
+                ident("a"),
             ),
             // Issue #2187（TABLE-25）: SQL/JSON 問い合わせ関数の各句で区別される（タグ 15）。
             (

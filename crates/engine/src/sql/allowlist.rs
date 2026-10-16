@@ -726,6 +726,10 @@ pub enum SqlSurfaceError {
     /// `DOUBLE` 単独も含む。ERR-6: `42704`）。`name` はクライアントが指定した綴りのみで、
     /// 既存の ENUM 型名・ラベル・テナント情報は含めない（fail-closed）。
     UndefinedType { name: String },
+    /// 明示の `CAST` で変換元と変換先の型の組に変換の対応が無い（Issue #1590・SQL-47。
+    /// ERR-6: `42846`）。`from`／`to` は `sql::cast::CastType::pg_label` の静的な語だけで、
+    /// 利用者が書いた綴り・値・列名は含めない。
+    CannotCoerce { from: String, to: String },
     /// 許可リスト（`C`／`POSIX`）に無い照合名を `COLLATE` に指定した（TABLE-28、Issue #1609。
     /// ERR-6: `42704`）。`name` はクライアントが指定した綴りのみ（カタログを参照せず
     /// 他テナント・既存オブジェクトの情報は含めない）。
@@ -1120,6 +1124,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
             SqlSurfaceError::IndeterminateDatatype { .. } => ErrorClass::IndeterminateDatatype,
             SqlSurfaceError::CollationMismatch => ErrorClass::CollationMismatch,
+            SqlSurfaceError::CannotCoerce { .. } => ErrorClass::CannotCoerce,
             SqlSurfaceError::IndeterminateCollation => ErrorClass::IndeterminateCollation,
             SqlSurfaceError::NullValueNotAllowed { .. } => ErrorClass::NullValueNotAllowed,
             SqlSurfaceError::MoreThanOneSqlJsonItem { .. } => ErrorClass::MoreThanOneSqlJsonItem,
@@ -1242,6 +1247,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::CollationMismatch => {
                 f.write_str("collation mismatch between explicit collations")
+            }
+            SqlSurfaceError::CannotCoerce { from, to } => {
+                write!(f, "cannot cast type {from} to {to}")
             }
             SqlSurfaceError::IndeterminateCollation => {
                 f.write_str("could not determine which collation to use for the comparison")
@@ -6445,6 +6453,36 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            // `<type> '<literal>'`（型名表の型。SQL-47・Issue #1590）。上の `DATE`／`TIMESTAMP`／
+            // `TIME`／`TIMESTAMPTZ`／`INTERVAL` の腕（AST・内容ハッシュ・CHECK の往復を変えないため
+            // 残す）に当たらなかった型名が対象で、型名の直後が文字列リテラルのときだけ
+            // `Expr::Cast` にする（先読みで確かめるため、同名の列参照・`numeric(1,2)` の関数呼び出し形は
+            // 従来の分岐のまま）。配列型の直後の文字列は PostgreSQL と同じく構文エラー。
+            Some(Token::Ident(_)) if self.peek_typed_string_literal().is_some() => {
+                if self.in_check_body {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "typed literals are not supported in a CHECK constraint"
+                            .to_string(),
+                    });
+                }
+                let Some((lit_pos, literal)) = self.peek_typed_string_literal() else {
+                    return Err(SqlSurfaceError::unsupported("unsupported expression term"));
+                };
+                let ty = self.parse_cast_target_type()?;
+                if matches!(ty, crate::sql::cast::CastType::Array(_)) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "an array type cannot precede a string literal",
+                    ));
+                }
+                // 型名の直後は先読みで確かめた文字列リテラル（消費して位置を進める）。
+                self.pos = lit_pos.saturating_add(1);
+                self.consume_expr_node()?;
+                self.consume_expr_node()?;
+                Ok(Expr::Cast {
+                    expr: Box::new(Expr::String(literal)),
+                    ty,
+                })
+            }
             // SQL-37（Issue #1586）: 括弧なし SQL 値関数（`CURRENT_TIMESTAMP`・`CURRENT_DATE`・
             // `LOCALTIMESTAMP` 等）。**引用されていない**識別子の予約語一致だけで生成する
             // （`quoted_null` に位置が残る引用付き識別子は列参照のまま）。精度形 `KW(p)` は
@@ -6652,6 +6690,71 @@ impl<'a> Parser<'a> {
         Ok(Expr::NullIf(Box::new(lhs), Box::new(rhs)))
     }
 
+    /// `CAST '(' <expr> AS <type> ')'` の `(` からの解析（対象ビヘイビア: SQL-47。Issue #1590）。
+    /// 呼び出し元（[`Self::parse_call_expr`]）は `CAST` を消費済み。被演算子は単独の `NULL` だけを
+    /// [`Expr::Null`] として受理し（型付き NULL）、それ以外は通常の値式として読む。変換先の型名は
+    /// DDL と同じ型名解決（`ddl_column_type::parse_column_type_name`）で読み、CAST 用の閉じた型集合へ
+    /// 写す（未知の型名は `42704`）。`AS` や `)` が欠けていれば `42601`。式の深さ（`MAX_EXPR_DEPTH`）と
+    /// ノード数（`MAX_EXPR_NODES`）は他の式と同じく課金する。CHECK 本体では評価経路の保証範囲外のため
+    /// `0A000`。
+    fn parse_cast_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.check_expr_depth(depth)?;
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "CAST is not supported in a CHECK constraint".to_string(),
+            });
+        }
+        self.expect_punct('(')?;
+        let operand = if self.peek_ident_matches("NULL")
+            && !self.quoted_null.contains(&self.pos)
+            && self.peek_ident_matches_at(1, "AS")
+        {
+            self.advance();
+            self.consume_expr_node()?;
+            Expr::Null
+        } else {
+            self.parse_value_expr_with_null_context(depth + 1, false)?
+        };
+        self.expect_contextual_keyword("AS")?;
+        let ty = self.parse_cast_target_type()?;
+        self.expect_punct(')')?;
+        self.consume_expr_node()?;
+        Ok(Expr::Cast {
+            expr: Box::new(operand),
+            ty,
+        })
+    }
+
+    /// 現在位置から型名 1 個を読み、CAST の変換先の型へ写す（[`Self::parse_cast_expr`] の下請け）。
+    fn parse_cast_target_type(&mut self) -> Result<crate::sql::cast::CastType, SqlSurfaceError> {
+        let mut pos = self.pos;
+        let name = crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut pos)?;
+        let ty = crate::sql::cast::CastType::from_sql_type_name(&name)?;
+        self.pos = pos;
+        Ok(ty)
+    }
+
+    /// `<type> '<literal>'` の型名部分の先読み。現在位置が引用なしの型名の先頭語で、型名の直後が
+    /// 文字列リテラルなら `(型, 文字列リテラルの位置)` を返す（位置は消費しない）。型名として
+    /// 読めない・直後が文字列でない場合は `None`（`numeric(1,2)` のような関数呼び出し形や、
+    /// 同名の列参照を従来の分岐へ回す）。Issue #1590。
+    fn peek_typed_string_literal(&self) -> Option<(usize, String)> {
+        let Some(Token::Ident(head)) = self.tokens.get(self.pos) else {
+            return None;
+        };
+        if self.quoted_null.contains(&self.pos)
+            || !crate::sql::ddl_column_type::is_type_name_head(head)
+        {
+            return None;
+        }
+        let mut pos = self.pos;
+        crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut pos).ok()?;
+        match self.tokens.get(pos) {
+            Some(Token::StringLiteral(s)) => Some((pos, s.clone())),
+            _ => None,
+        }
+    }
+
     /// 関数呼び出し式 `<name> '(' [expr {',' expr}] ')'` を解析する。呼び出し元は
     /// 直前に `name` を消費済みで、次のトークンが `'('` である前提（`peek` 済み）。
     ///
@@ -6672,6 +6775,12 @@ impl<'a> Parser<'a> {
         }
         if name.eq_ignore_ascii_case("nullif") {
             return self.parse_nullif_expr(depth);
+        }
+        // `CAST(<expr> AS <type>)`（SQL-47・Issue #1590）は `AS` を含む専用構文のため、
+        // 通常の引数列とは別の下位パーサへ振り分ける（PostgreSQL でも `CAST` は予約語。
+        // 同名の UDF は登録自体を拒否する）。
+        if name.eq_ignore_ascii_case("cast") {
+            return self.parse_cast_expr(depth);
         }
         if is_aggregate_function_name(&name) {
             // Issue #1541: 集計式項目の式モード中だけ、式の途中の集計呼び出しを受理する。
@@ -12513,6 +12622,8 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         // 照合指定（TABLE-28・Issue #1609）は従来形では書けない式。SQL/JSON 問い合わせ関数
         // （TABLE-25・Issue #2187）も関数呼び出しと同様。
         Expr::Collate { .. } | Expr::SqlJsonQuery(_) => true,
+        // `CAST`（SQL-47・Issue #1590）も従来形では書けない式。
+        Expr::Cast { .. } => true,
         Expr::Number(_)
         | Expr::String(_)
         | Expr::Ident(_)

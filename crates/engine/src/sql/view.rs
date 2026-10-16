@@ -510,7 +510,7 @@ fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurface
         // 持たない。
         Expr::Null | Expr::ValueFunction { .. } => Ok(()),
         // 照合指定（TABLE-28・Issue #1609）は内側の式の列参照を検査する。
-        Expr::Collate { expr, .. } => expr_columns_within(columns, expr),
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => expr_columns_within(columns, expr),
         Expr::SqlJsonQuery(q) => {
             for c in q.children() {
                 expr_columns_within(columns, c)?;

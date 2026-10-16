@@ -143,7 +143,9 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
         | Expr::TimeLiteral(_)
         | Expr::TimestampTzLiteral { .. }
         | Expr::ValueFunction { .. } => Ok(()),
-        Expr::Collate { expr, .. } => reject_non_constant_with(expr, allow_placeholders),
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
+            reject_non_constant_with(expr, allow_placeholders)
+        }
         Expr::SqlJsonQuery(q) => {
             reject_non_constant_with(&q.context, allow_placeholders)?;
             reject_non_constant_with(&q.path, allow_placeholders)?;

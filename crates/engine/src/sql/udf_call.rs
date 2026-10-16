@@ -319,6 +319,14 @@ pub enum Expr {
     /// 保持する。位置引数へ脱糖しないのは、句を引数の並びで正直に表せないことと、内部名が既定の
     /// 列名・利用者の呼び出しへ漏れることを避けるため。束縛・評価は `sql::jsonpath_fn`。
     SqlJsonQuery(Box<SqlJsonQueryExpr>),
+    /// `CAST(<expr> AS <type>)` と `<type> '<literal>'`（対象ビヘイビア: SQL-47。Issue #1590）。
+    /// 構文段（`allowlist::Parser::parse_cast_expr`）が変換先を [`crate::sql::cast::CastType`]
+    /// へ解決済みで保持する（未知の型名は `42704`、`vector` は `0A000` で構文段が拒否する）。
+    /// 束縛・規則表の判定は `sql::cast::bind_cast`。`NULL` は被演算子の位置でのみ受理する。
+    Cast {
+        expr: Box<Expr>,
+        ty: crate::sql::cast::CastType,
+    },
 }
 
 /// SQL/JSON 問い合わせ関数の種別（[`Expr::SqlJsonQuery`]）。
@@ -1319,7 +1327,7 @@ pub(crate) fn first_non_builtin_call_with(
                 .or_else(|| first_non_builtin_call_with(rhs, allow_current_time, allow_json_fns))
         }
         // 照合指定（TABLE-28・Issue #1609）は内側の式を検査するだけ。
-        Expr::Collate { expr, .. } => {
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
             first_non_builtin_call_with(expr, allow_current_time, allow_json_fns)
         }
         // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）は jsonb 関数と同じ扱い（CHECK 本体・
@@ -1578,7 +1586,7 @@ fn is_reserved_function_name(name: &str) -> bool {
     // 既存 `min`/`集計` と同じ理由。Bugbot 指摘対応）。
     matches!(
         upper.as_str(),
-        "VISIBLE" | "HYBRID_RRF" | "HYBRID" | "CASE" | "COALESCE" | "NULLIF"
+        "VISIBLE" | "HYBRID_RRF" | "HYBRID" | "CASE" | "COALESCE" | "NULLIF" | "CAST"
     ) || is_builtin_function_name(name)
         || crate::sql::allowlist::is_aggregate_function_name(name)
 }
@@ -1798,6 +1806,8 @@ fn validate_closed_expr(
         Expr::String(_) => Ok(()),
         // 照合指定（TABLE-28・Issue #1609）は内側の式を検査する（束縛段が文字列系か検査する）。
         Expr::Collate { expr, .. } => validate_closed_expr(expr, params, registry, node_budget),
+        // `CAST`（SQL-47・Issue #1590）は被演算子を検査する（変換先の型名は構文段で解決済み）。
+        Expr::Cast { expr, .. } => validate_closed_expr(expr, params, registry, node_budget),
         // SQL/JSON 問い合わせ関数は UDF 本体（閉じた式）では受理しない（jsonb 関数と同じ `0A000`）。
         Expr::SqlJsonQuery(_) => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "SQL/JSON query functions are not supported in a function body".to_string(),
@@ -2007,6 +2017,12 @@ pub(super) struct BindEnv<'a> {
 }
 
 impl BindEnv<'_> {
+    /// 列参照の解決元スキーマ（UDF 本体の展開中は `None`）。`sql::cast` が変換元の静的な型を
+    /// 列参照から導くために使う。
+    pub(super) fn schema(&self) -> Option<&TableSchema> {
+        self.schema
+    }
+
     /// `name` が現在の束縛環境で解決できる識別子（スキーマの列名または UDF 仮引数名。
     /// 大小無視）か。`jsonb_path_*` の `silent` 位置で、真偽リテラル（字句段で識別子に戻る）と
     /// boolean 列の参照を区別するために使う（Issue #2185）。
@@ -2672,6 +2688,11 @@ pub(crate) fn expr_result_column_type(
                 _ => ColumnType::Integer,
             });
         }
+    }
+    // `CAST`／`<type> '<literal>'` の結果列の型は変換先の型で決める（SQL-47・Issue #1590）。
+    // これを欠くと `CAST(NULL AS integer)` が double precision として公告される。
+    if let Expr::Cast { ty, .. } = expr {
+        return ty.result_column_type();
     }
     // `json_array_length` は int4（Issue #2180）。
     if let BoundExpr::JsonTextFn(f) = bound {
@@ -3413,6 +3434,8 @@ pub(super) fn bind_expr_any(
         Expr::JsonAccess { op, lhs, rhs } => bind_json_access(*op, lhs, rhs, env, node_budget),
         Expr::ValueFunction { kind, precision } => bind_value_function(*kind, *precision, env),
         Expr::SqlJsonQuery(q) => crate::sql::jsonpath_fn::bind_sql_json_query(q, env, node_budget),
+        // `CAST`／`<type> '<literal>'`（SQL-47・Issue #1590）。規則表の判定と束縛は `sql::cast`。
+        Expr::Cast { expr: inner, ty } => crate::sql::cast::bind_cast(inner, ty, env, node_budget),
     }
 }
 
@@ -4243,6 +4266,10 @@ pub(super) fn numeric_kind(
 ) -> Option<NumericKind> {
     if let Expr::Number(raw) = expr {
         return classify_projection_integer_literal(raw).map(|(_, k)| k);
+    }
+    // `CAST` の結果の数値種別は変換先の型（倍精度は既存の慣例どおり `None`。SQL-47・Issue #1590）。
+    if let Expr::Cast { ty, .. } = expr {
+        return ty.numeric_kind();
     }
     match bound {
         BoundExpr::ColumnRef { index } => {

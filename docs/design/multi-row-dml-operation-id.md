@@ -254,6 +254,9 @@ origin/main 取り込み時の是正: 並行実装していた Issue #921 のタ
   （長さ前置）・ラッパー 1 バイト・引用符 1 バイト（省略=0・KEEP=1・OMIT=2）・`ON EMPTY`／`ON ERROR` の各
   （省略=0、あれば挙動タグ 1〜8 ＋ `DEFAULT`〔タグ 8〕のときだけ式）（Issue #2187・TABLE-25。
   述語形の `UPDATE`／`DELETE` の WHERE に `JSON_EXISTS` が入りうるためハッシュする。既存タグ 1〜14 は不変）
+- `Cast{expr, ty}`＝タグ 16・変換先の正規の綴り（`CastType::to_sql`。固定語彙のみ。長さ前置）・`expr`
+  （Issue #1590・SQL-47。`UPDATE` の `SET` 式や述語形の WHERE に `CAST` が入りうるためハッシュする。
+  型だけ・被演算子だけ・`CAST` の有無だけが異なる式は互いに異なるハッシュになる。既存タグ 1〜15 は不変）
 
 型バイトで `DATE`／`TIMESTAMP` を区別するのは、同じ暦日を表す
 `DATE '2024-01-01'` と `TIMESTAMP '2024-01-01 00:00:00'` を型バイトなしで

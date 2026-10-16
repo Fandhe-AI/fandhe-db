@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 65;
+    count = 66;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -363,6 +363,11 @@ define_error_classes! {
     /// のポインタ）。照合名は固定の許可リスト由来で、テーブル名・列名・値は文言に含めない。
     /// [`crate::sql::allowlist::SqlSurfaceError::CollationMismatch`] の写像。
     CollationMismatch => ("42P21", "COLLATION_MISMATCH"),
+    /// 明示の `CAST`／`::` で、型の組に変換の対応が無い（`42846`。Issue #1590・SQL-47 のポインタ。
+    /// 規則表は `docs/design/cast-conversion-rules.md`）。型の組だけで束縛時に決まり、値が NULL でも
+    /// 同じく返る。文言は静的な型名だけで、値・列名・テナント情報を含めない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::CannotCoerce`] の写像。
+    CannotCoerce => ("42846", "CANNOT_COERCE"),
     /// 暗黙の照合が衝突し、明示的な `COLLATE` で解消されないまま照合を要する演算（比較・
     /// ORDER BY・GROUP BY・DISTINCT・MIN/MAX）が消費した（`42P22`。Issue #2190・TABLE-28）。
     /// PostgreSQL は実行時に返すが、本実装は束縛時に返す（データに依存しない fail-closed）。

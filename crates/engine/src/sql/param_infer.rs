@@ -250,6 +250,21 @@ impl Inferrer<'_> {
             Expr::Null => Ty::Untyped,
             // 照合指定（TABLE-28・Issue #1609）は内側の式と同じ型。
             Expr::Collate { expr, .. } => self.type_of(expr),
+            // `CAST`（SQL-47・Issue #1590）の結果型は変換先の型（兄弟推論用。被演算子の `$n` には
+            // 影響しない）。式の型を持たない型は型なし。
+            Expr::Cast { ty, .. } => match ty.result_column_type() {
+                Some(
+                    ct @ (ColumnType::SmallInt
+                    | ColumnType::Integer
+                    | ColumnType::BigInt
+                    | ColumnType::Real
+                    | ColumnType::Double),
+                ) => Ty::Known(scalar("?column?", ct)),
+                Some(ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_)) => {
+                    Ty::Known(PreparedParamType::Text)
+                }
+                _ => Ty::Untyped,
+            },
             // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）。`jsonb_path_*` と同じく `$n` の
             // 型付け対象外（boolean 用の `PreparedParamType` が無く、RETURNING で型が変わるため）。
             Expr::SqlJsonQuery(_) => Ty::Untyped,
@@ -402,6 +417,12 @@ impl Inferrer<'_> {
             // 照合指定（TABLE-28・Issue #1609）の対象は文字列型。`$n` 単独なら TEXT と推論する。
             Expr::Collate { expr, .. } => match as_param(expr) {
                 Some(n) => self.assign(n, Ty::Known(PreparedParamType::Text))?,
+                None => self.walk(expr)?,
+            },
+            // `CAST($n AS t)` の `$n` は変換先の型での推論を行わない（`Untyped`＝不定。Issue #1590 の
+            // 対象外。Describe の仮値置換との整合が要るため、誤った型を公告しない側に倒す）。
+            Expr::Cast { expr, .. } => match as_param(expr) {
+                Some(n) => self.assign(n, Ty::Untyped)?,
                 None => self.walk(expr)?,
             },
             // SQL/JSON 問い合わせ関数の部分式の `$n` は型を導けない（`Untyped`＝不定）。

@@ -233,9 +233,9 @@ TABLE-39・TABLE-40・INDEX-9）では、他テナントの値が呼び出し元
 - `crates/engine/src/sql/udf_call.rs` の `ExprType`: Scalar・Vector・Bool・Text・Date・
   Timestamp・Time・TimestampTz・Interval・Json・JsonText（数値は `NumericKind` で区別）。
   Uuid・Bytea・配列・Numeric の厳密値を表す式の型は未整備で、#1591／#1592 の前提となる
-- `crates/engine/src/error_format.rs` の `ErrorClass` に `42846` は未登録。追加は
-  `define_error_classes` への 1 行追加と `count` の更新で、wire-server の HTTP 写像・
-  `nosql-api.md` の追従も要る。**担当は #1590**（本 Issue では行わない）
+- `crates/engine/src/error_format.rs` の `ErrorClass` に `42846`（`CannotCoerce`）を登録済み
+  （Issue #1590。wire-server の HTTP 写像〔400〕・`nosql-api.md` も追従）。構文は `Expr::Cast`
+  （`sql::udf_call`）、規則表と束縛は新モジュール `sql::cast`（表を 400 セル照合する単体テスト付き）
 - 既存の値リテラル解析（`datetime::parse_interval` や `sql::parser` の型別リテラル束縛）は
   変換の入力関数として再利用できる見込み（判断は兄弟 Issue）
 
@@ -255,3 +255,25 @@ TABLE-39・TABLE-40・INDEX-9）では、他テナントの値が呼び出し元
 - 暗黙・代入の文脈では変換を広げない（`42883`／`42804` を維持）。拡張するのは明示の CAST／`::` のみ
 - NaN／Infinity を表せない NUMERIC での float → numeric、numeric NaN／Infinity → 整数は
   PostgreSQL との差分候補で、扱いは #1591 で決める
+
+### Issue #1590 で確定した差分
+
+- ENUM 型名は、ENUM が実在してもカタログを引かずに `42704` になる（型の存在が他テナントへの
+  存在オラクルにならないための静的な判定）
+- 修飾子なしの `numeric`・`numeric(p)` は、DDL と共通の型名解析のため `42601` になる
+  （PostgreSQL では受理。扱いは #1591）
+- CHECK 本体での CAST と `<型名> '<文字列リテラル>'` は `0A000`
+- INSERT VALUES・列 DEFAULT の定数式での CAST は `0A000`
+- FROM ありの投影項目の先頭に置いた `<型名> '<文字列リテラル>'`（`SELECT INTERVAL '1 day' FROM t` 等）は
+  従来どおり拒否（FROM なし SELECT・式の途中・`WHERE` では受理）
+- `CAST($n AS t)` の `$n` は変換先の型での推論をしない（Describe の仮値置換との整合が要るため。
+  拡張クエリでは `$n` を CAST の被演算子・比較の相手に置いた形が `42601` で拒否される。実測済み）
+- 本 Issue の束縛が値を扱うのは、恒等（同一型で型修飾子なし）・型なし文字列リテラル（date／time／
+  timestamp／timestamptz／interval／jsonb／修飾子なしの text・varchar）・型付き NULL に限る。規則表が
+  変換を許すそれ以外の組は `0A000`（#1591・#1592 が `BuiltinFn` の variant として足す）
+- 数値だが種別を静的に決められない式（`id`・関数・算術・CASE）は、数値 6 型・bool への変換を `0A000`、
+  それ以外の変換先は全数値行で規則が同じなので通常どおり判定する
+- 式の深さ上限（32）のもとで CAST を入れ子にできるのは 10 段まで（CAST 1 段は丸括弧で包んだ部分式 1 段と同じ再帰を消費し、括弧の入れ子と最大段数が一致する）
+- UDF 本体の展開中はスキーマを持たないため、本体の CAST は実引数の変換元を精密に導けない（整数列は種別不明の数値、TEXT 系の列は text として扱う）。このため `CAST(x AS integer)` を本体に持つ UDF に整数列を渡すと、直接の `CAST(i4 AS integer)` と違って `0A000` になる。fail-closed 側の差で、精密化は #1591 以降で扱う
+- 既定の列名は PostgreSQL と同じく、被演算子が名前を持つ形（列・関数呼び出し）ならその名前、
+  持たなければ変換先のカタログ名（`int4` 等）
