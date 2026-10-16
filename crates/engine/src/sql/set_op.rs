@@ -122,6 +122,7 @@ fn cell_payload_bytes(cell: &Cell) -> usize {
         | Cell::Date(_)
         | Cell::Timestamp(_)
         | Cell::Time(_)
+        | Cell::TimestampTz(_)
         | Cell::Uuid(_) => 0,
     }
 }
@@ -408,6 +409,13 @@ fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
                 out.extend_from_slice(&n.to_be_bytes());
                 push_len_prefixed(&mut out, &payload)?;
             }
+            // TIMESTAMPTZ は集合演算が #1576 まで未対応のため型検証で弾かれ、本来到達しない
+            // （Issue #1574。防御的に拒否する fail-closed）。
+            Cell::TimestampTz(_) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "TIMESTAMPTZ column reached set operation row key encoding".to_string(),
+                });
+            }
             // §2.2 の型検証（重複除去を伴う演算からの `VECTOR` 列排除）で本来
             // 到達しない。破損状態を防御的に拒否する（fail-closed。XX000）。
             Cell::Vector(_) => {
@@ -476,6 +484,13 @@ fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
             }
             // 型タグ 1 byte ＋ `i64` の 8 byte（`row_key` の `Cell::Time`。Issue #1570）。
             Cell::Time(_) => 1 + 8,
+            // TIMESTAMPTZ は集合演算が #1576 まで未対応のため型検証で弾かれ、本来到達しない
+            // （Issue #1574。防御的に拒否する fail-closed）。
+            Cell::TimestampTz(_) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "TIMESTAMPTZ column reached set operation row key encoding".to_string(),
+                });
+            }
             // §2.2 の型検証で本来到達しない（`row_key` と同じ防御的拒否）。
             Cell::Vector(_) => {
                 return Err(SqlSurfaceError::Internal {

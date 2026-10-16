@@ -1175,7 +1175,9 @@ impl ScalarIndex {
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
                 | ColumnType::Json
-                | ColumnType::Jsonb => {
+                | ColumnType::Jsonb
+                // TIMESTAMPTZ の二次索引は #1576 まで非対象（Issue #1574。fail-closed）。
+                | ColumnType::TimestampTz => {
                     per_column.push(None);
                     per_column_typed.push(None);
                 }

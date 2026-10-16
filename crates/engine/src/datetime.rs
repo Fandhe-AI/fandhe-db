@@ -1,5 +1,5 @@
-//! `DATE`／`TIMESTAMP`／`TIME` 列型（TABLE-13・TASK-197。Issue #884。TIME は
-//! TABLE-32・Issue #1569）のリテラル解析・
+//! `DATE`／`TIMESTAMP`／`TIME`／`TIMESTAMPTZ` 列型（TABLE-13・TASK-197。Issue #884。TIME は
+//! TABLE-32・Issue #1569、TIMESTAMPTZ は TABLE-33・Issue #1574）のリテラル解析・
 //! 内部表現変換・投影テキスト整形を集約する単一情報源。
 //!
 //! 責務境界: `catalog`（列型宣言）・`row_codec`（行バイト表現の encode/decode）・
@@ -525,6 +525,262 @@ pub fn format_time(micros: i64) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// TIMESTAMPTZ（TABLE-33・Issue #1574）
+// ---------------------------------------------------------------------------
+
+/// `TIMESTAMPTZ` の最小値（UTC の `0001-01-01 00:00:00Z`）をマイクロ秒で表した値。
+/// 内部表現は常に UTC の 1970-01-01 起点マイクロ秒で、範囲は `TIMESTAMP` と同一。
+pub const TIMESTAMPTZ_MIN_MICROS: i64 = TIMESTAMP_MIN_MICROS;
+
+/// `TIMESTAMPTZ` の最大値（UTC の `9999-12-31 23:59:59.999999Z`）をマイクロ秒で表した値。
+pub const TIMESTAMPTZ_MAX_MICROS: i64 = TIMESTAMP_MAX_MICROS;
+
+/// タイムゾーン名の受理上限バイト長。bundled tzdb の最長名より十分長く、
+/// untrusted 入力の早期拒否に使う。
+pub(crate) const MAX_TZ_NAME_LEN: usize = 64;
+
+/// `TIMESTAMPTZ` リテラルの受理上限バイト長（`TIMESTAMP` の最長形 ＋ 空白 1 ＋ TZ 名）。
+pub const MAX_TIMESTAMPTZ_LITERAL_LEN: usize = MAX_DATETIME_LITERAL_LEN + 1 + MAX_TZ_NAME_LEN;
+
+/// `TIMESTAMPTZ` の UTC マイクロ秒が受理範囲内かどうか。行コーデックの decode 側
+/// （壊れたバイト列の再検証）と INSERT 束縛の双方から使う（fail-closed）。
+pub fn validate_timestamptz_micros(micros: i64) -> bool {
+    (TIMESTAMPTZ_MIN_MICROS..=TIMESTAMPTZ_MAX_MICROS).contains(&micros)
+}
+
+/// セッションの TimeZone を表す不透明型。jiff の型を engine の公開 API へ漏らさず、
+/// wire-server が jiff へ依存しないための境界
+/// （`docs/design/timestamptz-tz-data-adoption.md`）。中身は bundled tzdb
+/// （`TimeZoneDatabase::bundled()`）から解決したものに限り、実行時に tzdata ファイル・
+/// `TZ`・`TZDIR` を読む経路は持たない。セッション値の保持と `SET TIME ZONE` は #1575 が
+/// 担当し、本 Issue の呼び出し元はすべて [`SessionTimeZone::utc`] を渡す。
+#[derive(Debug, Clone)]
+pub struct SessionTimeZone(jiff::tz::TimeZone);
+
+impl SessionTimeZone {
+    /// UTC。TimeZone 未設定時の既定（#1575 でセッション値へ差し替える）。
+    pub fn utc() -> Self {
+        SessionTimeZone(jiff::tz::TimeZone::UTC)
+    }
+
+    /// IANA 名を bundled tzdb から解決する。長さ・許可文字を検査し、`Etc/Unknown` 等の
+    /// 未知ゾーンは明示的に拒否する（fail-closed）。呼び出し元（リテラル解析・#1575 の
+    /// `SET TIME ZONE`）が未知名を `22023` へ写像する。
+    pub(crate) fn resolve_named(name: &str) -> Option<Self> {
+        if name.is_empty() || name.len() > MAX_TZ_NAME_LEN {
+            return None;
+        }
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'+' | b'-'))
+        {
+            return None;
+        }
+        let tz = jiff::tz::TimeZoneDatabase::bundled().get(name).ok()?;
+        if tz.is_unknown() {
+            return None;
+        }
+        Some(SessionTimeZone(tz))
+    }
+
+    /// UTC 時刻（マイクロ秒）における UTC からの offset（秒）。jiff の `Timestamp` 範囲外は
+    /// 端へ丸める（範囲端は 12 月末で DST 規則が変わらないため offset は同じ）。
+    fn offset_seconds_at(&self, utc_micros: i64) -> i32 {
+        let ts = jiff::Timestamp::from_microsecond(utc_micros).unwrap_or(if utc_micros < 0 {
+            jiff::Timestamp::MIN
+        } else {
+            jiff::Timestamp::MAX
+        });
+        self.0.to_offset(ts).seconds()
+    }
+
+    /// TZ の無い入力（naive）をこの TimeZone の壁時計として解釈した UTC マイクロ秒を返す。
+    /// DST の gap は直前の offset、fold は後の offset で解決する（PG の既定解釈。
+    /// 暫定: #1576 が PG 17 の実測と照合して最終確定する）。
+    fn local_to_utc_micros(&self, local_micros: i64) -> Option<i64> {
+        use jiff::tz::AmbiguousOffset;
+        let days = local_micros.div_euclid(MICROS_PER_DAY);
+        let day_micros = local_micros.rem_euclid(MICROS_PER_DAY);
+        let (year, month, day) = civil_from_days(days);
+        let secs = day_micros / 1_000_000;
+        let sub_nanos = (day_micros % 1_000_000) * 1_000;
+        let dt = jiff::civil::DateTime::new(
+            i16::try_from(year).ok()?,
+            i8::try_from(month).ok()?,
+            i8::try_from(day).ok()?,
+            i8::try_from(secs / 3600).ok()?,
+            i8::try_from((secs % 3600) / 60).ok()?,
+            i8::try_from(secs % 60).ok()?,
+            i32::try_from(sub_nanos).ok()?,
+        )
+        .ok()?;
+        let offset = match self.0.to_ambiguous_timestamp(dt).offset() {
+            AmbiguousOffset::Unambiguous { offset } => offset,
+            AmbiguousOffset::Gap { before, .. } => before,
+            AmbiguousOffset::Fold { after, .. } => after,
+        };
+        local_micros.checked_sub(i64::from(offset.seconds()).checked_mul(1_000_000)?)
+    }
+}
+
+/// `TIMESTAMPTZ` リテラルの解析エラー。`Literal` は `22007`（書式）／`22008`（範囲外）、
+/// `UnknownTimeZone` は `22023`（`time zone not recognized`）へ呼び出し元が写像する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimestampTzLiteralError {
+    /// 書式違反または範囲外（[`DateTimeLiteralError`] と同じ分類）。
+    Literal(DateTimeLiteralError),
+    /// 解決できない（bundled tzdb に無い・許可文字外・長さ超過）TZ 名。
+    UnknownTimeZone,
+}
+
+impl From<DateTimeLiteralError> for TimestampTzLiteralError {
+    fn from(e: DateTimeLiteralError) -> Self {
+        TimestampTzLiteralError::Literal(e)
+    }
+}
+
+/// `HH`・`HHMM`・`HH:MM`・`HH:MM:SS`（先頭の符号は呼び出し側で消費済み）の数字部を
+/// offset 秒へ変換する。時は 0〜15、分・秒は 0〜59（超過は `Overflow`）。
+fn parse_numeric_offset(sign: i64, digits: &[u8]) -> Result<i64, DateTimeLiteralError> {
+    let fmt_err = || {
+        DateTimeLiteralError::Format(
+            "UTC offset must be in the form +HH, +HHMM, +HH:MM or +HH:MM:SS".to_string(),
+        )
+    };
+    let pair =
+        |at: usize| -> Option<i64> { parse_ascii_digits(digits, at, 2).map(|(v, _)| i64::from(v)) };
+    let colon = |at: usize| digits.get(at) == Some(&b':');
+    let (h, m, s) = match digits.len() {
+        2 => (pair(0), Some(0), Some(0)),
+        4 => (pair(0), pair(2), Some(0)),
+        5 if colon(2) => (pair(0), pair(3), Some(0)),
+        8 if colon(2) && colon(5) => (pair(0), pair(3), pair(6)),
+        _ => return Err(fmt_err()),
+    };
+    let (Some(h), Some(m), Some(s)) = (h, m, s) else {
+        return Err(fmt_err());
+    };
+    // 範囲外の SQLSTATE は Issue が定める写像に従い 22008（PG は 22009。docs に乖離として記録）。
+    if h > 15 || m > 59 || s > 59 {
+        return Err(DateTimeLiteralError::Overflow(
+            "UTC offset is out of range".to_string(),
+        ));
+    }
+    Ok(sign * (h * 3600 + m * 60 + s))
+}
+
+/// 値が `TIMESTAMPTZ` の表現範囲を超えたときの共通エラー。
+fn timestamptz_out_of_range() -> DateTimeLiteralError {
+    DateTimeLiteralError::Overflow(
+        "timestamptz value is out of the representable range".to_string(),
+    )
+}
+
+/// `TIMESTAMPTZ` リテラル（`<TIMESTAMP 文法>[空白 0〜1 個]<ゾーン>`）を解析し、
+/// UTC の 1970-01-01 起点マイクロ秒へ正規化する（TABLE-33・Issue #1574）。
+///
+/// ゾーンは `Z`／`z`、数値 offset（`parse_numeric_offset` 参照）、IANA 名のいずれか。
+/// ゾーンが無い入力は `default_tz`（セッション TimeZone。#1575）の壁時計として解釈する。
+/// 入力は untrusted のため長さ → ASCII → 閉じた文法の順に検査する。
+pub fn parse_timestamptz(
+    s: &str,
+    default_tz: &SessionTimeZone,
+) -> Result<i64, TimestampTzLiteralError> {
+    if s.len() > MAX_TIMESTAMPTZ_LITERAL_LEN {
+        return Err(DateTimeLiteralError::Format(
+            "TIMESTAMPTZ literal exceeds the maximum length".to_string(),
+        )
+        .into());
+    }
+    if !s.is_ascii() {
+        return Err(
+            DateTimeLiteralError::Format("TIMESTAMPTZ literal must be ASCII".to_string()).into(),
+        );
+    }
+    let bytes = s.as_bytes();
+    let (_, _, _, after_date) = parse_date_part(bytes)?;
+    // 日時部の終端 = 区切りの後で数字・':'・'.' が途切れる位置。
+    let mut end = after_date.saturating_add(1).min(bytes.len());
+    while bytes
+        .get(end)
+        .is_some_and(|b| b.is_ascii_digit() || *b == b':' || *b == b'.')
+    {
+        end += 1;
+    }
+    let (Some(naive_text), Some(rest)) = (s.get(..end), s.get(end..)) else {
+        return Err(
+            DateTimeLiteralError::Format("malformed TIMESTAMPTZ literal".to_string()).into(),
+        );
+    };
+    let naive = parse_timestamp(naive_text)?;
+    let zone = rest.strip_prefix(' ').unwrap_or(rest);
+
+    let utc = if rest.is_empty() {
+        default_tz
+            .local_to_utc_micros(naive)
+            .ok_or_else(timestamptz_out_of_range)?
+    } else if zone.is_empty() {
+        // 末尾に空白だけが残る入力は書式違反。
+        return Err(DateTimeLiteralError::Format(
+            "TIMESTAMPTZ literal has trailing characters".to_string(),
+        )
+        .into());
+    } else if matches!(zone, "Z" | "z") {
+        naive
+    } else if let Some((sign, digits)) = zone
+        .strip_prefix('+')
+        .map(|d| (1i64, d))
+        .or_else(|| zone.strip_prefix('-').map(|d| (-1i64, d)))
+    {
+        let secs = parse_numeric_offset(sign, digits.as_bytes())?;
+        secs.checked_mul(1_000_000)
+            .and_then(|o| naive.checked_sub(o))
+            .ok_or_else(timestamptz_out_of_range)?
+    } else {
+        let tz =
+            SessionTimeZone::resolve_named(zone).ok_or(TimestampTzLiteralError::UnknownTimeZone)?;
+        tz.local_to_utc_micros(naive)
+            .ok_or_else(timestamptz_out_of_range)?
+    };
+    if !validate_timestamptz_micros(utc) {
+        return Err(timestamptz_out_of_range().into());
+    }
+    Ok(utc)
+}
+
+/// `TIMESTAMPTZ` の UTC マイクロ秒を `tz` の壁時計へ変換し、PG の ISO 出力
+/// （`YYYY-MM-DD HH:MM:SS[.ffffff]+HH[:MM[:SS]]`）で整形する。局所年が 0 以下になる場合は
+/// 年を `1 - year` とし、offset の後ろに ` BC` を付ける。
+pub fn format_timestamptz(utc_micros: i64, tz: &SessionTimeZone) -> String {
+    let offset_secs = tz.offset_seconds_at(utc_micros);
+    let local = utc_micros.saturating_add(i64::from(offset_secs) * 1_000_000);
+    let days = local.div_euclid(MICROS_PER_DAY);
+    let day_micros = local.rem_euclid(MICROS_PER_DAY);
+    let (year, month, day) = civil_from_days(days);
+    let (shown_year, bc) = if year <= 0 {
+        (1 - year, true)
+    } else {
+        (year, false)
+    };
+    let mut out = String::with_capacity(36);
+    let _ = write!(out, "{shown_year:04}-{month:02}-{day:02} ");
+    write_time_of_day(&mut out, day_micros);
+    let abs = offset_secs.unsigned_abs();
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let (hh, mm, ss) = (abs / 3600, (abs % 3600) / 60, abs % 60);
+    let _ = write!(out, "{sign}{hh:02}");
+    if mm != 0 || ss != 0 {
+        let _ = write!(out, ":{mm:02}");
+    }
+    if ss != 0 {
+        let _ = write!(out, ":{ss:02}");
+    }
+    if bc {
+        out.push_str(" BC");
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +1072,217 @@ mod tests {
             parse_time(&long),
             Err(DateTimeLiteralError::Format(_))
         ));
+    }
+
+    // ---- TIMESTAMPTZ（TABLE-33・Issue #1574） ----
+
+    fn tstz(s: &str) -> Result<i64, TimestampTzLiteralError> {
+        parse_timestamptz(s, &SessionTimeZone::utc())
+    }
+
+    fn tstz_ok(s: &str) -> i64 {
+        tstz(s).unwrap_or_else(|e| panic!("{s}: {e:?}"))
+    }
+
+    #[test]
+    fn timestamptz_offset_forms_normalize_to_same_utc() {
+        let base = parse_timestamp("2026-01-01 03:00:00").unwrap();
+        for lit in [
+            "2026-01-01 03:00:00",
+            "2026-01-01 03:00:00Z",
+            "2026-01-01 03:00:00 z",
+            "2026-01-01T03:00:00+00",
+            "2026-01-01 03:00:00+00:00",
+            "2026-01-01 12:00:00+09",
+            "2026-01-01 12:00:00 +09",
+            "2026-01-01 12:00:00+0900",
+            "2026-01-01 12:00:00+09:00",
+            "2026-01-01 12:00:00+09:00:00",
+            "2026-01-01 08:30:00+0530",
+            "2025-12-31 22:00:00-05",
+            "2026-01-01 03:00:00 UTC",
+            "2026-01-01 12:00:00 Asia/Tokyo",
+        ] {
+            assert_eq!(tstz_ok(lit), base, "{lit}");
+        }
+    }
+
+    #[test]
+    fn timestamptz_rejects_malformed_with_format_error() {
+        for lit in [
+            "",
+            "2026-01-01",
+            "2026-01-01 03:00",
+            "2026-01-01 03:00:00.1234567Z",
+            "2026-01-01 03:00:00+9",
+            "2026-01-01 03:00:00+090",
+            "2026-01-01 03:00:00+09:0",
+            "2026-01-01 03:00:00+09:00:0",
+            "2026-01-01 03:00:00+0a",
+            "2026-01-01 03:00:00 ",
+            "2026-01-01 03:00:00+09:00x",
+            "2026-01-01 03:00:00\u{ff0b}09",
+            "2026-01-01 03:00:00\u{3042}",
+        ] {
+            assert!(
+                matches!(
+                    tstz(lit),
+                    Err(TimestampTzLiteralError::Literal(
+                        DateTimeLiteralError::Format(_)
+                    ))
+                ),
+                "{lit}: {:?}",
+                tstz(lit)
+            );
+        }
+        let long = format!(
+            "2026-01-01 03:00:00 {}",
+            "A".repeat(MAX_TIMESTAMPTZ_LITERAL_LEN)
+        );
+        assert!(matches!(
+            tstz(&long),
+            Err(TimestampTzLiteralError::Literal(
+                DateTimeLiteralError::Format(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn timestamptz_out_of_range_maps_to_overflow() {
+        for lit in [
+            "2026-01-01 03:00:00+16",
+            "2026-01-01 03:00:00+0960",
+            "2026-01-01 03:00:00+09:00:60",
+            "0001-01-01 00:00:00+01",
+            "9999-12-31 23:59:59.999999-01",
+            "2026-02-30 03:00:00Z",
+        ] {
+            assert!(
+                matches!(
+                    tstz(lit),
+                    Err(TimestampTzLiteralError::Literal(
+                        DateTimeLiteralError::Overflow(_)
+                    ))
+                ),
+                "{lit}: {:?}",
+                tstz(lit)
+            );
+        }
+        assert_eq!(tstz_ok("0001-01-01 00:00:00+00"), TIMESTAMPTZ_MIN_MICROS);
+        assert_eq!(
+            tstz_ok("9999-12-31 23:59:59.999999Z"),
+            TIMESTAMPTZ_MAX_MICROS
+        );
+        assert!(matches!(
+            tstz("0001-01-01 00:00:00.000000+00:00:01"),
+            Err(TimestampTzLiteralError::Literal(
+                DateTimeLiteralError::Overflow(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn timestamptz_unknown_zone_names_are_rejected() {
+        for lit in [
+            "2026-01-01 03:00:00 Mars/Base",
+            "2026-01-01 03:00:00 Etc/Unknown",
+            "2026-01-01 03:00:00 ../../etc/passwd",
+            "2026-01-01 03:00:00 Asia/Tokyo;",
+        ] {
+            assert_eq!(
+                tstz(lit),
+                Err(TimestampTzLiteralError::UnknownTimeZone),
+                "{lit}"
+            );
+        }
+        assert!(SessionTimeZone::resolve_named("").is_none());
+        assert!(SessionTimeZone::resolve_named(&"A".repeat(MAX_TZ_NAME_LEN + 1)).is_none());
+    }
+
+    /// DST の gap／fold の解決は暫定（#1576 が PG 17 実測と照合して確定する）。
+    #[test]
+    fn timestamptz_named_zone_dst_resolution_is_provisional() {
+        // gap（2026-03-08 02:30 は存在しない）は直前の offset（-05）で解釈 => 07:30Z。
+        assert_eq!(
+            tstz_ok("2026-03-08 02:30:00 America/New_York"),
+            tstz_ok("2026-03-08 07:30:00Z")
+        );
+        // fold（2026-11-01 01:30 が 2 回）は後の offset（-05）で解釈 => 06:30Z。
+        assert_eq!(
+            tstz_ok("2026-11-01 01:30:00 America/New_York"),
+            tstz_ok("2026-11-01 06:30:00Z")
+        );
+        assert_eq!(
+            tstz_ok("2026-07-01 12:00:00 America/New_York"),
+            tstz_ok("2026-07-01 16:00:00Z")
+        );
+        // セッション TimeZone（naive 入力の解釈）。
+        let ny = SessionTimeZone::resolve_named("America/New_York").unwrap();
+        assert_eq!(
+            parse_timestamptz("2026-07-01 12:00:00", &ny).unwrap(),
+            tstz_ok("2026-07-01 16:00:00Z")
+        );
+        // 明示 offset はセッション TimeZone に影響されない。
+        assert_eq!(
+            parse_timestamptz("2026-07-01 12:00:00+00", &ny).unwrap(),
+            tstz_ok("2026-07-01 12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn format_timestamptz_uses_iso_offset_suffix() {
+        let utc = SessionTimeZone::utc();
+        assert_eq!(
+            format_timestamptz(tstz_ok("2026-01-01 03:00:00Z"), &utc),
+            "2026-01-01 03:00:00+00"
+        );
+        assert_eq!(
+            format_timestamptz(tstz_ok("2026-01-01 03:00:00.5Z"), &utc),
+            "2026-01-01 03:00:00.5+00"
+        );
+        let tokyo = SessionTimeZone::resolve_named("Asia/Tokyo").unwrap();
+        assert_eq!(
+            format_timestamptz(tstz_ok("2026-01-01 03:00:00Z"), &tokyo),
+            "2026-01-01 12:00:00+09"
+        );
+        let kolkata = SessionTimeZone::resolve_named("Asia/Kolkata").unwrap();
+        assert_eq!(
+            format_timestamptz(tstz_ok("2026-01-01 03:00:00Z"), &kolkata),
+            "2026-01-01 08:30:00+05:30"
+        );
+        // LMT のように秒を含む offset。
+        assert_eq!(
+            format_timestamptz(tstz_ok("1880-01-01 00:00:00Z"), &tokyo),
+            "1880-01-01 09:18:59+09:18:59"
+        );
+    }
+
+    #[test]
+    fn format_timestamptz_handles_range_edges() {
+        let utc = SessionTimeZone::utc();
+        assert_eq!(
+            format_timestamptz(TIMESTAMPTZ_MIN_MICROS, &utc),
+            "0001-01-01 00:00:00+00"
+        );
+        assert_eq!(
+            format_timestamptz(TIMESTAMPTZ_MAX_MICROS, &utc),
+            "9999-12-31 23:59:59.999999+00"
+        );
+        let ny = SessionTimeZone::resolve_named("America/New_York").unwrap();
+        // 局所年が 0 以下になる場合は BC 表記。NY の LMT は -04:56:02。
+        assert_eq!(
+            format_timestamptz(TIMESTAMPTZ_MIN_MICROS, &ny),
+            "0001-12-31 19:03:58-04:56:02 BC"
+        );
+        let tokyo = SessionTimeZone::resolve_named("Asia/Tokyo").unwrap();
+        // 局所年が 10000 になる場合は 5 桁のまま出す。
+        assert_eq!(
+            format_timestamptz(TIMESTAMPTZ_MAX_MICROS, &tokyo),
+            "10000-01-01 08:59:59.999999+09"
+        );
+        // 往復（UTC）。
+        for v in [TIMESTAMPTZ_MIN_MICROS, 0, TIMESTAMPTZ_MAX_MICROS] {
+            assert_eq!(tstz_ok(&format_timestamptz(v, &utc)), v);
+        }
     }
 }

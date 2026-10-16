@@ -83,6 +83,7 @@ pub(crate) fn to_static_column_type_with_array_default(
         SqlColumnTypeName::Date => ColumnType::Date,
         SqlColumnTypeName::Timestamp => ColumnType::Timestamp,
         SqlColumnTypeName::Time => ColumnType::Time,
+        SqlColumnTypeName::TimestampTz => ColumnType::TimestampTz,
         SqlColumnTypeName::Bytea => ColumnType::Bytea,
         SqlColumnTypeName::Json => ColumnType::Json,
         SqlColumnTypeName::Jsonb => ColumnType::Jsonb,
@@ -133,7 +134,8 @@ pub(crate) fn to_static_column_type_with_array_default(
                 ColumnType::Date => ArrayElemType::Date,
                 ColumnType::Timestamp => ArrayElemType::Timestamp,
                 // `time[]` は別 OID（1183）のため拒否する（Issue #1569。`smallint[]` と同じ理由）。
-                ColumnType::Time => {
+                // `timestamptz[]` も別 OID（1185）のため拒否する（Issue #1574）。
+                ColumnType::Time | ColumnType::TimestampTz => {
                     return Err(SqlSurfaceError::FeatureNotSupported {
                         detail: "this array element type is not supported yet".to_string(),
                     })
@@ -211,6 +213,9 @@ pub enum SqlColumnTypeName {
     /// `TIME`／`TIME WITHOUT TIME ZONE`（TABLE-32・Issue #1569）。`TIME(p)`・
     /// `TIME WITH TIME ZONE`・`TIMETZ` は構文段で `0A000` のため本 variant には到達しない。
     Time,
+    /// `TIMESTAMPTZ`／`TIMESTAMP WITH TIME ZONE`（TABLE-33・Issue #1574）。`TIMESTAMPTZ(p)`・
+    /// `TIMESTAMP(p) WITH TIME ZONE`・配列は構文段で `0A000` のため精度付きには到達しない。
+    TimestampTz,
     Bytea,
     Json,
     Jsonb,
@@ -320,6 +325,11 @@ enum TypeNameKind {
     /// `0A000`（保存精度 p を持たないため丸めを守れず、fail-closed）。綴りを保持する別名
     /// として返す（`TIME` は予約型名でなく既存 ENUM 名と衝突し得るため、実行段が検出する）。
     Time,
+    /// `TIMESTAMPTZ`（Issue #1574。TABLE-33）。`TIMESTAMPTZ(p)` は `0A000`（保存精度 p を
+    /// 持たないため丸めを守れず fail-closed）。綴りを保持する別名として返す（`timestamptz` は
+    /// 既存 ENUM 名と衝突し得るため、実行段が検出する）。`TIMESTAMP WITH TIME ZONE` は
+    /// 2 語形として [`TypeNameKind::Timestamp`] 側で解決する。
+    TimestampTz,
     /// `VECTOR(N)`。
     Vector,
     /// `NUMERIC(p,s)`／`DECIMAL(p,s)`。
@@ -365,6 +375,7 @@ const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
     ("DATE", TypeNameKind::Direct(|| SqlColumnTypeName::Date)),
     ("TIMESTAMP", TypeNameKind::Timestamp),
     ("TIME", TypeNameKind::Time),
+    ("TIMESTAMPTZ", TypeNameKind::TimestampTz),
     // `TIMETZ`（`TIME WITH TIME ZONE` の別綴り）は列型として未対応（Issue #1569）。
     (
         "TIMETZ",
@@ -494,8 +505,23 @@ fn parse_base_type_name(
                 *pos += 1;
                 expect_contextual_keyword(tokens, pos, "TIME")?;
                 expect_contextual_keyword(tokens, pos, "ZONE")?;
+            } else if matches!(
+                tokens.get(*pos),
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("WITH")
+            ) {
+                // `TIMESTAMP WITH TIME ZONE`（Issue #1574）は `TIMESTAMPTZ` の標準綴り。
+                *pos += 1;
+                expect_contextual_keyword(tokens, pos, "TIME")?;
+                expect_contextual_keyword(tokens, pos, "ZONE")?;
+                return Ok(SqlColumnTypeName::TimestampTz);
             }
             Ok(SqlColumnTypeName::Timestamp)
+        }
+        TypeNameKind::TimestampTz => {
+            if matches!(tokens.get(*pos), Some(Token::Punct('('))) {
+                return Err(unsettled_type_error("timestamptz(p)"));
+            }
+            Ok(alias_type(name, SqlColumnTypeName::TimestampTz))
         }
         TypeNameKind::Time => {
             match tokens.get(*pos) {

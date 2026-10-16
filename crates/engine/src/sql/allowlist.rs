@@ -64,6 +64,7 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "TIMESTAMP",
     "TIME",
     "TIMETZ",
+    "TIMESTAMPTZ",
     "BYTEA",
     "JSON",
     "JSONB",
@@ -14340,15 +14341,15 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// 列型キーワード判定は型名エイリアスと未確定型を含む 29 語を大小無視で認識する
-    /// （Issue #1529・TABLE-29。Issue #1569 で `TIME`・`TIMETZ` を追加）。
+    /// 列型キーワード判定は型名エイリアスと未確定型を含む 30 語を大小無視で認識する
+    /// （Issue #1529・TABLE-29。Issue #1569 で `TIME`・`TIMETZ`、Issue #1574 で `TIMESTAMPTZ` を追加）。
     #[test]
     fn column_type_keyword_covers_aliases_case_insensitively() {
         for kw in CREATE_TABLE_COLUMN_TYPE_KEYWORDS {
             assert!(is_column_type_keyword(kw), "{kw}");
             assert!(is_column_type_keyword(&kw.to_ascii_lowercase()), "{kw}");
         }
-        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 29);
+        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 30);
         for ok in ["Int4", "iNt8", "float4", "FLOAT8", "int", "int2", "varchar"] {
             assert!(is_column_type_keyword(ok), "{ok}");
         }

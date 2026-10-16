@@ -2809,6 +2809,10 @@ pub(super) fn bind_expr_any(
                     // `TIME` 列の式内参照（Issue #1570。EXTRACT／date_part・比較の前提）。
                     // 値は行スカラービューから解決し、実 NULL は `ExprValue::Null` として伝播する。
                     ColumnType::Time => Ok((BoundExpr::TimeColumnRef { index }, ExprType::Time)),
+                    // TIMESTAMPTZ 列の式内参照は #1576 まで fail-closed（Issue #1574）。
+                    ColumnType::TimestampTz => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (TIMESTAMPTZ columns are not supported)"
+                    ))),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (ARRAY columns are not supported)"
                     ))),
@@ -3667,6 +3671,7 @@ fn column_type_label(ty: &ColumnType) -> &'static str {
         ColumnType::Date => "date",
         ColumnType::Timestamp => "timestamp",
         ColumnType::Time => "time",
+        ColumnType::TimestampTz => "timestamp with time zone",
         ColumnType::Array(_) => "array",
         ColumnType::Bytea => "bytea",
         ColumnType::Json => "json",
