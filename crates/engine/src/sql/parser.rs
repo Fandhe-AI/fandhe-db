@@ -596,6 +596,7 @@ pub(crate) fn bind_integer_literal(
         | ColumnType::Date
         | ColumnType::Timestamp
         | ColumnType::Time
+        | ColumnType::TimestampTz
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
@@ -713,6 +714,31 @@ pub(crate) fn bind_datetime_literal(
                 )))
             }
         },
+        // TIMESTAMPTZ 列（TABLE-33・Issue #1574）。UTC のマイクロ秒へ正規化して束縛する。
+        // TZ の無い入力はセッション TimeZone で解釈するが、セッション値の保持は #1575 の担当の
+        // ため、本 Issue では UTC 固定（`SessionTimeZone::utc()`）。書式違反 `22007`・範囲外
+        // `22008`・未知の TZ 名 `22023`（detail は静的文字列で入力を反射しない）。
+        ColumnType::TimestampTz => {
+            use crate::datetime::{DateTimeLiteralError, SessionTimeZone, TimestampTzLiteralError};
+            match crate::datetime::parse_timestamptz(literal, &SessionTimeZone::utc()) {
+                Ok(micros) => Ok(crate::row_codec::Value::TimestampTz(micros)),
+                Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Format(detail))) => {
+                    Err(SqlSurfaceError::invalid_datetime_format(format!(
+                        "column {column_name:?}: {detail}"
+                    )))
+                }
+                Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Overflow(detail))) => {
+                    Err(SqlSurfaceError::datetime_field_overflow(format!(
+                        "column {column_name:?}: {detail}"
+                    )))
+                }
+                Err(TimestampTzLiteralError::UnknownTimeZone) => {
+                    Err(SqlSurfaceError::InvalidParameterValue {
+                        detail: "time zone not recognized",
+                    })
+                }
+            }
+        }
         ColumnType::Text
         | ColumnType::Varchar(_)
         | ColumnType::Bpchar(_)
@@ -1070,6 +1096,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             | ColumnType::Date
             | ColumnType::Timestamp
             | ColumnType::Time
+            | ColumnType::TimestampTz
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
@@ -1122,6 +1149,7 @@ pub(crate) fn text_column_index(
                 | ColumnType::Date
                 | ColumnType::Timestamp
                 | ColumnType::Time
+                | ColumnType::TimestampTz
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
@@ -2804,6 +2832,7 @@ pub(crate) fn bind_column_default(
             ScalarRef::Uuid(u) => Ok(Value::Uuid(u)),
             ScalarRef::Timestamp(t) => Ok(Value::Timestamp(t)),
             ScalarRef::Time(t) => Ok(Value::Time(t)),
+            ScalarRef::TimestampTz(t) => Ok(Value::TimestampTz(t)),
             ScalarRef::Json(j) => Ok(Value::Json(j.to_string())),
             _ => Err(SqlSurfaceError::invalid_input(format!(
                 "column {:?} DEFAULT is not compatible with its type",
@@ -2842,6 +2871,9 @@ pub(crate) fn bind_column_default(
                 column.name
             )))
         }
+        Err(DefaultBindError::UnknownTimeZone) => Err(SqlSurfaceError::InvalidParameterValue {
+            detail: "time zone not recognized",
+        }),
         Err(DefaultBindError::Incompatible) => Err(SqlSurfaceError::invalid_input(format!(
             "column {:?} DEFAULT is not compatible with its type",
             column.name
@@ -3037,12 +3069,23 @@ fn bind_insert_row(
             (ColumnType::Time, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Time, s)?
             }
+            (ColumnType::TimestampTz, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::TimestampTz, s)?
+            }
             (
                 ColumnType::Time,
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a TIME literal (HH:MM:SS)"
+                )))
+            }
+            (
+                ColumnType::TimestampTz,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a TIMESTAMPTZ literal (YYYY-MM-DD HH:MM:SS[+TZ])"
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -3194,6 +3237,7 @@ pub(crate) fn bind_json_literal(
         | ColumnType::Date
         | ColumnType::Timestamp
         | ColumnType::Time
+        | ColumnType::TimestampTz
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -3502,12 +3546,23 @@ fn bind_set_assignments(
             (ColumnType::Time, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Time, s)?
             }
+            (ColumnType::TimestampTz, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::TimestampTz, s)?
+            }
             (
                 ColumnType::Time,
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a TIME literal (HH:MM:SS)"
+                )))
+            }
+            (
+                ColumnType::TimestampTz,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a TIMESTAMPTZ literal (YYYY-MM-DD HH:MM:SS[+TZ])"
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -4662,9 +4717,17 @@ fn bind_upsert_assignments(
                     (ColumnType::Time, InsertLiteral::String(s)) => {
                         bind_datetime_literal(name, ColumnType::Time, s)?
                     }
+                    (ColumnType::TimestampTz, InsertLiteral::String(s)) => {
+                        bind_datetime_literal(name, ColumnType::TimestampTz, s)?
+                    }
                     (ColumnType::Time, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a TIME literal (HH:MM:SS)"
+                        )))
+                    }
+                    (ColumnType::TimestampTz, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a TIMESTAMPTZ literal (YYYY-MM-DD HH:MM:SS[+TZ])"
                         )))
                     }
                     (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -4875,6 +4938,11 @@ fn bind_file_insert(
             (ColumnType::Time, _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: TIME column is not supported for file-form INSERT"
+                )))
+            }
+            (ColumnType::TimestampTz, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: TIMESTAMPTZ column is not supported for file-form INSERT"
                 )))
             }
             // 配列列（TABLE-14・Issue #888）も BOOLEAN と同じく対象外として拒否する。
@@ -5800,6 +5868,10 @@ fn resolve_aggregate_input(
                     (ColumnType::Time, _) => Err(SqlSurfaceError::undefined_function(format!(
                         "column {name:?} is TIME and cannot be used with SUM/AVG"
                     ))),
+                    // TIMESTAMPTZ 列の集計は #1576 まで fail-closed（Issue #1574）。
+                    (ColumnType::TimestampTz, _) => Err(SqlSurfaceError::undefined_function(
+                        format!("column {name:?} is TIMESTAMPTZ and cannot be used in aggregates"),
+                    )),
                     (ColumnType::Array(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::ArrayColumn(index))
                     }
@@ -5972,6 +6044,10 @@ fn resolve_count_distinct_input(
                     ColumnType::Date => Ok(AggregateInput::DateColumn(index)),
                     ColumnType::Timestamp => Ok(AggregateInput::TimestampColumn(index)),
                     ColumnType::Time => Ok(AggregateInput::TimeColumn(index)),
+                    // TIMESTAMPTZ 列の集計は #1576 まで fail-closed（Issue #1574）。
+                    ColumnType::TimestampTz => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is TIMESTAMPTZ and cannot be used with COUNT(DISTINCT ...)"
+                    ))),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is ARRAY and cannot be used with COUNT(DISTINCT ...)"
                     ))),
@@ -6434,6 +6510,8 @@ fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
         | ColumnType::Date
         | ColumnType::Timestamp
         | ColumnType::Time => Some(OrderKind::SignedInt),
+        // TIMESTAMPTZ の並べ替え・DISTINCT は #1576 まで fail-closed（Issue #1574）。
+        ColumnType::TimestampTz => None,
         ColumnType::Real | ColumnType::Double => Some(OrderKind::Float),
         ColumnType::Boolean => Some(OrderKind::Bool),
         ColumnType::Numeric { .. } => Some(OrderKind::Numeric),
@@ -6981,7 +7059,8 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
             | ColumnType::Json
             | ColumnType::Jsonb
             | ColumnType::Bpchar(_)
-            | ColumnType::Enum(_) => {
+            | ColumnType::Enum(_)
+            | ColumnType::TimestampTz => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} cannot be used as a window PARTITION BY/ORDER BY key"
                 )));

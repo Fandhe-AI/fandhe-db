@@ -146,6 +146,7 @@ pub(super) fn cell_payload_bytes(cell: &Cell) -> usize {
         | Cell::Date(_)
         | Cell::Timestamp(_)
         | Cell::Time(_)
+        | Cell::TimestampTz(_)
         | Cell::Uuid(_) => 0,
     }
 }
