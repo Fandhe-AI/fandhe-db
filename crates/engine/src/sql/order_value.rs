@@ -50,6 +50,9 @@ pub(crate) enum OrderValue {
     /// `JSONB`（[`crate::json::jsonb_sort_key`] のバイト列。辞書順が jsonb の全順序。
     /// Issue #1597）。
     JsonbKey(Vec<u8>),
+    /// `INTERVAL`（生の三要素を保持し、比較は正規化キー〔`datetime::cmp_interval`〕。
+    /// Issue #1580。GROUP BY・DISTINCT のキーにはならない＝代表値の規則が未確定）。
+    Interval(crate::datetime::Interval),
 }
 
 /// `f64` 比較（NaN はすべての非 NaN より大きく NaN 同士は等しい。`-0.0 == 0.0` は
@@ -90,6 +93,7 @@ pub(crate) fn compare_order_values(a: &OrderValue, b: &OrderValue) -> Ordering {
         (OrderValue::Uuid(x), OrderValue::Uuid(y)) => x.cmp(y),
         (OrderValue::EnumOrdinal(x), OrderValue::EnumOrdinal(y)) => x.cmp(y),
         (OrderValue::JsonbKey(x), OrderValue::JsonbKey(y)) => x.cmp(y),
+        (OrderValue::Interval(x), OrderValue::Interval(y)) => crate::datetime::cmp_interval(x, y),
         _ => Ordering::Equal,
     }
 }
@@ -150,6 +154,8 @@ pub(crate) enum ScalarKeyRef<'a> {
     EnumOrdinal(usize),
     /// [`OrderValue::JsonbKey`] の借用版（Issue #1597）。
     JsonbKey(&'a [u8]),
+    /// [`OrderValue::Interval`] の借用版（`Copy`。Issue #1580）。
+    Interval(crate::datetime::Interval),
 }
 
 /// TEXT 系キーの値を、キーの実効照合で比較用の借用キーへ写す（TABLE-28・Issue #1610・#2190）。
@@ -243,6 +249,9 @@ pub(crate) fn extract_order_value_ref<'a>(
         (ColumnType::Time, OrderKind::SignedInt, row_codec::ScalarRef::Time(v)) => {
             Ok(Some(ScalarKeyRef::SignedInt(*v)))
         }
+        (ColumnType::Interval, OrderKind::Interval, row_codec::ScalarRef::Interval(v)) => {
+            Ok(Some(ScalarKeyRef::Interval(*v)))
+        }
         (ColumnType::Real, OrderKind::Float, row_codec::ScalarRef::Real(v)) => {
             Ok(Some(ScalarKeyRef::Float(f64::from(*v))))
         }
@@ -323,6 +332,7 @@ pub(crate) fn scalar_key_ref_to_owned(
         ScalarKeyRef::Numeric(v) => OrderValue::Numeric(v),
         ScalarKeyRef::Uuid(v) => OrderValue::Uuid(v),
         ScalarKeyRef::EnumOrdinal(v) => OrderValue::EnumOrdinal(v),
+        ScalarKeyRef::Interval(v) => OrderValue::Interval(v),
     })
 }
 
@@ -378,6 +388,7 @@ pub(crate) fn compare_ref_and_owned_values(a: &ScalarKeyRef<'_>, b: &OrderValue)
         (ScalarKeyRef::Uuid(x), OrderValue::Uuid(y)) => x.cmp(y),
         (ScalarKeyRef::EnumOrdinal(x), OrderValue::EnumOrdinal(y)) => x.cmp(y),
         (ScalarKeyRef::JsonbKey(x), OrderValue::JsonbKey(y)) => (*x).cmp(y.as_slice()),
+        (ScalarKeyRef::Interval(x), OrderValue::Interval(y)) => crate::datetime::cmp_interval(x, y),
         _ => Ordering::Equal,
     }
 }
@@ -400,6 +411,7 @@ impl OrderValue {
             OrderValue::Uuid(v) => ScalarKeyRef::Uuid(*v),
             OrderValue::EnumOrdinal(v) => ScalarKeyRef::EnumOrdinal(*v),
             OrderValue::JsonbKey(b) => ScalarKeyRef::JsonbKey(b.as_slice()),
+            OrderValue::Interval(v) => ScalarKeyRef::Interval(*v),
         }
     }
 }
@@ -429,6 +441,9 @@ pub(crate) fn compare_key_refs(a: &ScalarKeyRef<'_>, b: &ScalarKeyRef<'_>) -> Or
         (ScalarKeyRef::Uuid(x), ScalarKeyRef::Uuid(y)) => x.cmp(y),
         (ScalarKeyRef::EnumOrdinal(x), ScalarKeyRef::EnumOrdinal(y)) => x.cmp(y),
         (ScalarKeyRef::JsonbKey(x), ScalarKeyRef::JsonbKey(y)) => x.cmp(y),
+        (ScalarKeyRef::Interval(x), ScalarKeyRef::Interval(y)) => {
+            crate::datetime::cmp_interval(x, y)
+        }
         _ => Ordering::Equal,
     }
 }
@@ -504,6 +519,9 @@ pub(crate) fn order_value_to_cell(
             .ok_or_else(|| scan_bug("group key ENUM ordinal out of range")),
         // jsonb はグループキーにならない（GROUP BY・DISTINCT は対象外）。
         (OrderValue::JsonbKey(_), _) => Err(scan_bug("jsonb value used as a group key")),
+        // INTERVAL は GROUP BY・DISTINCT のキーにならない（束縛段 `resolve_group_by_key` が拒否済み）。
+        // 正規化等価な値をまとめるときの代表値の規則が未確定のため、到達したら配線不備として fail-closed。
+        (OrderValue::Interval(_), _) => Err(scan_bug("interval value used as a group key")),
         _ => Err(scan_bug("group key value/column type mismatch")),
     }
 }

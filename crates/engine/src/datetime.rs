@@ -14,8 +14,10 @@
 use std::fmt::Write as _;
 
 mod interval;
+pub(crate) use interval::interval_div_f64;
 pub use interval::{
-    format_interval, parse_interval, validate_interval, Interval, IntervalLiteralError,
+    checked_add_interval, cmp_interval, format_interval, interval_cmp_key, parse_interval,
+    validate_interval, Interval, IntervalLiteralError, IntervalRangeError,
     MAX_INTERVAL_LITERAL_LEN,
 };
 

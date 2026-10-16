@@ -381,6 +381,12 @@ enum OrderedColumnIndex {
     /// バイト列で、`Vec<u8>` の `Ord`（辞書順。空バイト列が最小）は
     /// `declarative_filter::FilterOp::eval` の `&[u8]` 比較と一致する。
     Bytes(Vec<(Vec<u8>, u32)>),
+    /// `INTERVAL` 列（Issue #1580・TABLE-34 ポインタ）。キーは正規化比較キー
+    /// （[`crate::datetime::interval_cmp_key`]。`1 mon` と `30 days` が同一キー）。
+    /// `I128`（`NUMERIC` 専用で列 scale を持つ）とは別 variant にして、`(I128, Numeric)` の
+    /// 照会腕が INTERVAL 列から誤って到達しないようにする。`WHERE` の評価
+    /// （`declarative_filter`）も同じ関数でキー化するため、索引経路と全走査は一致する。
+    Interval(Vec<(i128, u32)>),
 }
 
 /// `f64`（有限値・`-0.0` は `+0.0` へ正規化済みである契約——`scalar_float.rs`
@@ -579,6 +585,14 @@ fn push_typed_value(accum: &mut OrderedColumnIndex, value: &ScalarRef<'_>, slot:
         }
         (OrderedColumnIndex::U128(acc), ScalarRef::Uuid(u)) => {
             acc.push((uuid_to_sortable_u128(u.as_bytes()), slot));
+            true
+        }
+        // 番兵（`±infinity`）は行 codec が拒否済みだが、多層防御として索引対象外へ縮退する。
+        (OrderedColumnIndex::Interval(acc), ScalarRef::Interval(v)) => {
+            if !crate::datetime::validate_interval(v) {
+                return false;
+            }
+            acc.push((crate::datetime::interval_cmp_key(v), slot));
             true
         }
         _ => false,
@@ -1446,6 +1460,22 @@ impl ScalarIndex {
                         .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     per_column_typed.push(Some(OrderedColumnIndex::Bytes(acc)));
                 }
+                // `INTERVAL` 列（Issue #1580）は正規化キー（`i128`）の順序索引
+                // （`OrderedColumnIndex::Interval`）で扱う。常に構築する。
+                ColumnType::Interval => {
+                    per_column.push(None);
+                    let entry_size = std::mem::size_of::<(i128, u32)>();
+                    let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
+                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
+                    approx_bytes = approx_bytes.saturating_add(reservation_bytes);
+                    if let Some(slot) = typed_col_reservation_bytes.get_mut(col_index) {
+                        *slot = reservation_bytes;
+                    }
+                    let mut acc: Vec<(i128, u32)> = Vec::new();
+                    acc.try_reserve_exact(row_count)
+                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+                    per_column_typed.push(Some(OrderedColumnIndex::Interval(acc)));
+                }
                 // `BOOLEAN` 列は索引対象外（Issue #883・D-e。値域が 2 値のため
                 // 索引化コストに見合わず、対応述語 `BoolEquals` は常に
                 // plain scan——`scalar_plan.rs` 参照——のまま据え置く）。
@@ -1454,12 +1484,9 @@ impl ScalarIndex {
                 // 前方一致・範囲述語を持たないため同じく非索引化（判断根拠は
                 // `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
                 // `VECTOR` 列も従来どおり索引対象外。
-                // `INTERVAL` 列も等価・範囲述語を持たない（正規化比較は #1580）ため非索引化
-                // （Issue #1579）。
                 ColumnType::Vector(_)
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
-                | ColumnType::Interval
                 | ColumnType::Json
                 | ColumnType::Jsonb => {
                     per_column.push(None);
@@ -1863,6 +1890,10 @@ impl ScalarIndex {
                     pairs.sort_unstable(); // sort-determinism: allow (u128 キー, u32 スロット) のタプル全順序でスロットが明示的タイブレーク
                     typed_columns.push(Some(OrderedColumnIndex::U128(pairs)));
                 }
+                Some(OrderedColumnIndex::Interval(mut pairs)) => {
+                    pairs.sort_unstable(); // sort-determinism: allow (i128 正規化キー, u32 スロット) のタプル全順序でスロットが明示的タイブレーク
+                    typed_columns.push(Some(OrderedColumnIndex::Interval(pairs)));
+                }
                 Some(OrderedColumnIndex::Bytes(mut pairs)) => {
                     pairs.sort_unstable(); // sort-determinism: allow (バイト列キー, u32 スロット) のタプル全順序でスロットが明示的タイブレーク
                     typed_columns.push(Some(OrderedColumnIndex::Bytes(pairs)));
@@ -2176,6 +2207,17 @@ impl ScalarIndex {
                 let (lower, upper) = crate::numeric::rescale_bounds_for_column(d, *col_scale, op)?;
                 range_slots(pairs, lower, upper)
             }
+            (OrderedColumnIndex::Interval(pairs), TypedLiteral::Interval(k)) => {
+                // リテラルは正規化キー済み。評価側（`FilterOp::eval`）と同じキー空間で比べる。
+                let (lower, upper) = match op {
+                    CompareOp::Eq => (Bound::Included(*k), Bound::Included(*k)),
+                    CompareOp::Gt => (Bound::Excluded(*k), Bound::Unbounded),
+                    CompareOp::Ge => (Bound::Included(*k), Bound::Unbounded),
+                    CompareOp::Lt => (Bound::Unbounded, Bound::Excluded(*k)),
+                    CompareOp::Le => (Bound::Unbounded, Bound::Included(*k)),
+                };
+                range_slots(pairs, lower, upper)
+            }
             (OrderedColumnIndex::U128(pairs), TypedLiteral::Uuid(u)) => {
                 let (lower, upper) = exact_u128_bounds(op, uuid_to_sortable_u128(u.as_bytes()));
                 range_slots(pairs, lower, upper)
@@ -2383,6 +2425,17 @@ impl ScalarIndex {
             // `TypedKey` は `Copy` のため可変長キーを表せない。テスト専用経路
             // では `BYTEA` を未対応（`None`）として扱う。
             OrderedColumnIndex::Bytes(_) => None,
+            OrderedColumnIndex::Interval(pairs) => {
+                let extract = |k: TypedKey| match k {
+                    TypedKey::I128(v) => Some(v),
+                    _ => None,
+                };
+                range_slots(
+                    pairs,
+                    map_bound(lower, extract)?,
+                    map_bound(upper, extract)?,
+                )
+            }
         }
     }
 
@@ -2626,6 +2679,9 @@ impl ScalarIndex {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<(u64, u32)>()),
                 OrderedColumnIndex::I128(v, _scale) => v
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(i128, u32)>()),
+                OrderedColumnIndex::Interval(v) => v
                     .capacity()
                     .saturating_mul(std::mem::size_of::<(i128, u32)>()),
                 OrderedColumnIndex::U128(v) => v

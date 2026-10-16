@@ -1296,6 +1296,8 @@ fn cmp_cell_values(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         (Cell::Date(x), Cell::Date(y)) => x.cmp(y),
         (Cell::Timestamp(x), Cell::Timestamp(y)) => x.cmp(y),
         (Cell::Time(x), Cell::Time(y)) => x.cmp(y),
+        // 集計結果（MIN/MAX/SUM/AVG）の ORDER BY は正規化キーで比べる（Issue #1580）。
+        (Cell::Interval(x), Cell::Interval(y)) => crate::datetime::cmp_interval(x, y),
         (Cell::TimestampTz(x), Cell::TimestampTz(y)) => x.cmp(y),
         // `NUMERIC` は scale が異なりうる（整数 `AVG` は値ごとに scale が変わる。
         // Issue #2270）ため、`cmp_exact` で scale を揃えて厳密に比較する。

@@ -5,7 +5,10 @@
 //! 整形、番兵の検証を集約する。`catalog`（列型宣言）・`row_codec`（17 バイトの行
 //! ペイロード）・`sql::parser`（リテラル束縛と SQLSTATE 写像）・`wire-server`
 //! （投影テキスト）が本モジュールへ委譲する。比較・正規化・算術は後続 Issue
-//! （#1580・#1581）の担当で、ここでは生の三要素の一致だけを扱う。
+//! （#1580・#1581）の担当。Issue #1580 で比較用の正規化キー（[`interval_cmp_key`]）と
+//! 集計用の checked 加算・除算を追加した。生の三要素の一致（`PartialEq`／`Hash`）は
+//! codec・content_hash 専用で、SQL の意味論（比較・並べ替え・DISTINCT・索引）は
+//! 必ず正規化キーを通す。
 //!
 //! 受理する文法は PostgreSQL 17 の公開仕様に準拠した閉じた定義とする。
 //! (a) 単位句（`1 day 2 hours`・`@ 1 day ago`）、(b) SQL 標準形（`1-2`・`1 2:03:04`）、
@@ -29,7 +32,9 @@ const DAYS_PER_MONTH: f64 = 30.0;
 const MONTHS_PER_YEAR: i64 = 12;
 
 /// `INTERVAL` の値。月・日・マイクロ秒を独立に保持する（`1 mon` と `30 days` は
-/// 別の値。正規化比較は #1580）。`PartialEq` は生の三要素の一致。
+/// 別の値）。`PartialEq`／`Hash` は生の三要素の一致で codec・content_hash 専用。
+/// SQL の比較は [`cmp_interval`]（正規化キー）を使い、`Ord` は意図して実装しない
+/// （正規化等価は生の等価より粗く、`Eq` と整合する `Ord` を作れないため）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Interval {
     /// 月数（年は 12 か月に換算済み）。
@@ -777,6 +782,96 @@ pub fn format_interval(v: &Interval) -> String {
     out
 }
 
+/// 1 日のマイクロ秒数（i128 キー計算用）。
+const MICROS_PER_DAY_I128: i128 = MICROS_PER_DAY_I64 as i128;
+
+/// 比較・並べ替え・DISTINCT・索引が共有する正規化キー（PG17 `interval_cmp_value` と同じ
+/// 「1 か月 = 30 日、1 日 = 24 時間」換算）。
+///
+/// i128 で計算するので overflow しない: `months * 30 + days` は |値| ≤ 2^31 * 30 + 2^31
+/// （約 6.7e10）で、日数 × 8.64e10 µs の積は高々約 5.8e21、µs 項の |i64| ≈ 9.2e18 を足しても
+/// i128（約 1.7e38）に十分収まる。`sql` の ORDER BY・WHERE・集計と scalar_index が同じ
+/// 関数を呼ぶことで、索引経路と全走査の結果を一致させる。
+pub fn interval_cmp_key(v: &Interval) -> i128 {
+    let days_total = i128::from(v.months) * 30 + i128::from(v.days);
+    days_total * MICROS_PER_DAY_I128 + i128::from(v.micros)
+}
+
+/// 正規化キーでの全順序比較（`1 mon` と `30 days` は `Equal`）。
+pub fn cmp_interval(a: &Interval, b: &Interval) -> std::cmp::Ordering {
+    interval_cmp_key(a).cmp(&interval_cmp_key(b))
+}
+
+/// 集計（SUM/AVG）で範囲外になったことを表す（SQLSTATE 22008 へ写像される）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntervalRangeError;
+
+/// 三要素ごとの checked 加算（PG17 `interval_pl`。正規化しない）。あふれ・番兵一致は
+/// [`IntervalRangeError`]。SUM の遷移関数と AVG の和で使う。
+pub fn checked_add_interval(a: &Interval, b: &Interval) -> Result<Interval, IntervalRangeError> {
+    let r = Interval {
+        months: a.months.checked_add(b.months).ok_or(IntervalRangeError)?,
+        days: a.days.checked_add(b.days).ok_or(IntervalRangeError)?,
+        micros: a.micros.checked_add(b.micros).ok_or(IntervalRangeError)?,
+    };
+    if validate_interval(&r) {
+        Ok(r)
+    } else {
+        Err(IntervalRangeError)
+    }
+}
+
+/// µs 精度への丸め（PG の `TSROUND`）。
+fn tsround(x: f64) -> f64 {
+    (x * 1_000_000.0).round_ties_even() / 1_000_000.0
+}
+
+/// `interval / float8`（PG17 `interval_div`）。AVG の最終段で使い、#1581 の乗除でも
+/// 再利用する前提。`factor` が 0・NaN、または結果が各要素の範囲外なら [`IntervalRangeError`]。
+pub(crate) fn interval_div_f64(v: &Interval, factor: f64) -> Result<Interval, IntervalRangeError> {
+    const I32_LIM: f64 = 2_147_483_648.0;
+    const I64_LIM: f64 = 9_223_372_036_854_775_808.0;
+    if factor == 0.0 || factor.is_nan() {
+        return Err(IntervalRangeError);
+    }
+    let m = f64::from(v.months) / factor;
+    if m.is_nan() || m < -I32_LIM || m >= I32_LIM {
+        return Err(IntervalRangeError);
+    }
+    let d = f64::from(v.days) / factor;
+    if d.is_nan() || d < -I32_LIM || d >= I32_LIM {
+        return Err(IntervalRangeError);
+    }
+    let month = m.trunc();
+    let mut day = d.trunc();
+    let month_rem_days = tsround((m - month) * DAYS_PER_MONTH);
+    let mut sec_rem = tsround((d - day + month_rem_days - month_rem_days.trunc()) * 86_400.0);
+    if sec_rem.abs() >= 86_400.0 {
+        let extra = (sec_rem / 86_400.0).trunc();
+        day += extra;
+        sec_rem -= extra * 86_400.0;
+    }
+    day += month_rem_days.trunc();
+    if !(-I32_LIM..I32_LIM).contains(&day) {
+        return Err(IntervalRangeError);
+    }
+    let us = (v.micros as f64 / factor + sec_rem * 1_000_000.0).round_ties_even();
+    if us.is_nan() || !(-I64_LIM..I64_LIM).contains(&us) {
+        return Err(IntervalRangeError);
+    }
+    // 上で範囲検査済みなので `as` は飽和・切り捨てを起こさない。
+    let r = Interval {
+        months: month as i32,
+        days: day as i32,
+        micros: us as i64,
+    };
+    if validate_interval(&r) {
+        Ok(r)
+    } else {
+        Err(IntervalRangeError)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,5 +1029,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cmp_key_normalizes() {
+        let p = |s: &str| parse_interval(s).unwrap();
+        assert_eq!(
+            cmp_interval(&p("1 mon"), &p("30 days")),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            cmp_interval(&p("1 day"), &p("24:00:00")),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(interval_cmp_key(&p("1 mon -30 days")), 0);
+        assert!(cmp_interval(&p("1 year"), &p("360 days")).is_eq());
+        assert!(cmp_interval(&p("1 year"), &p("359 days")).is_gt());
+        assert!(cmp_interval(&p("1 mon"), &p("31 days")).is_lt());
+        // 境界でも panic しない。
+        let max = iv(i32::MAX, i32::MAX, i64::MAX - 1);
+        let min = iv(i32::MIN, i32::MIN, i64::MIN + 1);
+        assert!(cmp_interval(&min, &max).is_lt());
+    }
+
+    #[test]
+    fn checked_add_and_div_vectors() {
+        let p = |s: &str| parse_interval(s).unwrap();
+        assert_eq!(
+            checked_add_interval(&p("1 mon"), &p("30 days")),
+            Ok(iv(1, 30, 0))
+        );
+        assert_eq!(
+            checked_add_interval(&iv(i32::MAX, 0, 0), &iv(1, 0, 0)),
+            Err(IntervalRangeError)
+        );
+        let avg = |a: &str, b: &str| {
+            let s = checked_add_interval(&p(a), &p(b)).unwrap();
+            format_interval(&interval_div_f64(&s, 2.0).unwrap())
+        };
+        assert_eq!(avg("1 mon", "2 mons"), "1 mon 15 days");
+        assert_eq!(avg("1 day", "2 days"), "1 day 12:00:00");
+        assert_eq!(avg("1 mon", "00:00:00"), "15 days");
+        assert_eq!(interval_div_f64(&iv(0, 0, 0), 0.0), Err(IntervalRangeError));
     }
 }

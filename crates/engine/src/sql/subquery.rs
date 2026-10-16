@@ -1071,7 +1071,8 @@ fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Bpchar(_)
-        // `INTERVAL` の値族は比較（#1580）まで未対応（fail-closed。Issue #1579）。
+        // `INTERVAL` の値族は未対応（fail-closed。正規化等価の代表値の規則が未確定で担当 Issue 未定。
+        // Issue #1579・#1580）。
         | ColumnType::Interval => None,
     }
 }
