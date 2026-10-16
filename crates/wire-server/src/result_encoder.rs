@@ -3106,7 +3106,8 @@ mod tests {
 
     #[test]
     fn numeric_binary_golden_values() {
-        // 黄金値は numeric_send のレイアウトから導出（PG17 実機照合は別 Issue）。
+        // 黄金値は numeric_send のレイアウトから導出。PG17 実機との照合は
+        // tests/wire26_numeric_pg17_vectors.rs（Issue #2444）が担う。
         let p = |neg, mag, scale| numeric_parts(&enc_numeric(neg, mag, scale));
         assert_eq!(p(false, 1_234_567, 2), (3, 1, 0, 2, vec![1, 2345, 6700]));
         assert_eq!(p(false, 1, 5), (1, -2, 0, 5, vec![1000]));

@@ -561,6 +561,8 @@ mod tests {
         );
     }
 
+    // PG17 実測: 末尾の余分なバイトは 22P03、ndigits 33 以上は受理。本実装は WIRE-26 に従い
+    // 08P01 で拒否する意図的な差分（照合表は tests/wire26_numeric_pg17_vectors.rs。Issue #2444）。
     #[test]
     fn numeric_length_errors_are_invalid_length() {
         for len in 0..8 {
