@@ -271,6 +271,7 @@ impl Inferrer<'_> {
             // 対象外型判定（`0A000`）に落として fail-closed にする。
             Expr::DateLiteral(_)
             | Expr::TimestampLiteral(_)
+            | Expr::IntervalLiteral(_)
             | Expr::TimeLiteral(_)
             | Expr::TimestampTzLiteral { .. }
             | Expr::ValueFunction { .. } => Ty::Known(PreparedParamType::VectorText),
@@ -403,6 +404,7 @@ impl Inferrer<'_> {
             | Expr::Null
             | Expr::DateLiteral(_)
             | Expr::TimestampLiteral(_)
+            | Expr::IntervalLiteral(_)
             | Expr::TimeLiteral(_)
             | Expr::TimestampTzLiteral { .. }
             | Expr::ValueFunction { .. } => {}

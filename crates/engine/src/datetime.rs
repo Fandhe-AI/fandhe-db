@@ -14,12 +14,12 @@
 use std::fmt::Write as _;
 
 mod interval;
-pub(crate) use interval::interval_div_f64;
 pub use interval::{
     checked_add_interval, cmp_interval, format_interval, interval_cmp_key, parse_interval,
     validate_interval, Interval, IntervalLiteralError, IntervalRangeError,
     MAX_INTERVAL_LITERAL_LEN,
 };
+pub(crate) use interval::{checked_sub_interval, interval_div_f64, interval_scale};
 
 /// 先発グレゴリオ暦（proleptic Gregorian）で表現できる `DATE` の最小値
 /// （`0001-01-01`）を 1970-01-01 起点の日数で表した値。
@@ -76,6 +76,10 @@ impl std::fmt::Display for DateTimeLiteralError {
         }
     }
 }
+
+/// jiff の範囲外の未来年を写す 400 年窓の起点年（2000 と 400 の倍数分ずれ、暦が一致する）。
+/// tzdb の将来規則（現行の DST 規則）が効く年代で、歴史的規則を拾わない（Issue #1581）。
+const FUTURE_MAP_BASE_YEAR: i64 = 9200;
 
 /// 先発グレゴリオ暦での閏年判定（西暦 4 年で割り切れ、100 年で割り切れない
 /// か、400 年で割り切れる）。
@@ -700,12 +704,34 @@ impl SessionTimeZone {
     }
 
     /// UTC 時刻（マイクロ秒）における UTC からの offset（秒）。jiff の `Timestamp` 範囲外は
-    /// 端へ丸める（範囲端は 12 月末で DST 規則が変わらないため offset は同じ）。
+    /// 暦が一致する 400 年周期の同位置（2000〜2399 年）へ写して引く。`local_to_utc_micros` の
+    /// 範囲外年の写像と同じ周期にそろえ、UTC→局所と局所→UTC で offset を食い違わせない
+    /// （Issue #1581）。
     pub(crate) fn offset_seconds_at(&self, utc_micros: i64) -> i32 {
-        let ts = jiff::Timestamp::from_microsecond(utc_micros).unwrap_or(if utc_micros < 0 {
-            jiff::Timestamp::MIN
-        } else {
-            jiff::Timestamp::MAX
+        self.offset_seconds_at_wide(i128::from(utc_micros))
+    }
+
+    /// [`Self::offset_seconds_at`] の i128 版。INTERVAL 加算の中間値が i64 の Unix 起点
+    /// マイクロ秒を超えても offset を引けるようにする（Issue #1581）。
+    pub(crate) fn offset_seconds_at_wide(&self, utc_micros: i128) -> i32 {
+        let direct = i64::try_from(utc_micros)
+            .ok()
+            .and_then(|m| jiff::Timestamp::from_microsecond(m).ok());
+        let ts = direct.unwrap_or_else(|| {
+            const CYCLE_MICROS: i128 = 146_097 * MICROS_PER_DAY as i128;
+            let base = i128::from(days_from_civil(2000, 1, 1)) * MICROS_PER_DAY as i128;
+            // 未来側は tzdb の将来規則（現行の DST 規則）が効く窓へ、過去側は従来の窓へ写す。
+            let target_year = if utc_micros > 0 {
+                FUTURE_MAP_BASE_YEAR
+            } else {
+                2000
+            };
+            let target = i128::from(days_from_civil(target_year, 1, 1)) * MICROS_PER_DAY as i128;
+            let mapped = (utc_micros - base).rem_euclid(CYCLE_MICROS) + target;
+            i64::try_from(mapped)
+                .ok()
+                .and_then(|m| jiff::Timestamp::from_microsecond(m).ok())
+                .unwrap_or(jiff::Timestamp::MAX)
         });
         match &self.repr {
             TzRepr::Fixed(secs) => *secs,
@@ -717,16 +743,35 @@ impl SessionTimeZone {
     /// DST の gap は直前の offset、fold は後の offset で解決する（PG 17 の実測と照合して
     /// 確定済み。Issue #1576。`docs/design/timestamptz-conversion.md`）。
     pub(crate) fn local_to_utc_micros(&self, local_micros: i64) -> Option<i64> {
+        i64::try_from(self.local_to_utc_micros_wide(i128::from(local_micros))?).ok()
+    }
+
+    /// [`Self::local_to_utc_micros`] の i128 版。壁時計・結果とも i64 を超えうる中間値を
+    /// 受け付け、範囲の検証は呼び出し側（最終結果）に委ねる（Issue #1581）。
+    pub(crate) fn local_to_utc_micros_wide(&self, local_micros: i128) -> Option<i128> {
         use jiff::tz::AmbiguousOffset;
         let tz = match &self.repr {
             TzRepr::Fixed(secs) => {
-                return local_micros.checked_sub(i64::from(*secs).checked_mul(1_000_000)?);
+                return local_micros.checked_sub(i128::from(*secs).checked_mul(1_000_000)?);
             }
             TzRepr::Tz(tz) => tz,
         };
-        let days = local_micros.div_euclid(MICROS_PER_DAY);
-        let day_micros = local_micros.rem_euclid(MICROS_PER_DAY);
+        let day_len = i128::from(MICROS_PER_DAY);
+        let days = i64::try_from(local_micros.div_euclid(day_len)).ok()?;
+        let day_micros = i64::try_from(local_micros.rem_euclid(day_len)).ok()?;
         let (year, month, day) = civil_from_days(days);
+        // jiff の年範囲（±9999）外は、暦（曜日配置）が一致する 400 年周期の同位置年へ写して
+        // offset だけを引く。日付の加減算で最終値が有効範囲へ戻る中間値を許容するため
+        // （TIMESTAMP 側の中間値許容と同じ契約。Issue #1581）。
+        // 未来側（> 9999）は 2007 年以前の歴史的規則を拾わないよう、将来規則が効く窓
+        // （9200〜9599 年）へ写す。過去側（< -9999）は従来の 2000〜2399 年へ写す。
+        let year = if (-9999..=9999).contains(&year) {
+            year
+        } else if year > 9999 {
+            (year - 2000).rem_euclid(400) + FUTURE_MAP_BASE_YEAR
+        } else {
+            (year - 2000).rem_euclid(400) + 2000
+        };
         let secs = day_micros / 1_000_000;
         let sub_nanos = (day_micros % 1_000_000) * 1_000;
         let dt = jiff::civil::DateTime::new(
@@ -744,7 +789,7 @@ impl SessionTimeZone {
             AmbiguousOffset::Gap { before, .. } => before,
             AmbiguousOffset::Fold { after, .. } => after,
         };
-        local_micros.checked_sub(i64::from(offset.seconds()).checked_mul(1_000_000)?)
+        local_micros.checked_sub(i128::from(offset.seconds()).checked_mul(1_000_000)?)
     }
 }
 

@@ -7,7 +7,8 @@
 //! `0A000` で拒否し副作用を残さないこと、(4) 未解禁の機能（式・PK/UNIQUE・型変更・集合演算・
 //! 配列・`INTERVAL(p)`・フィールド制限など）が fail-closed に拒否されること、(5) テナント境界が
 //! 不変であること、を固定する。比較・集計・索引は #1580（`sql_interval_query.rs`）、式・算術は
-//! #1581、EXTRACT は #1582、OID 1186・バイナリ・NoSQL は #1583 の担当。
+//! #1581（正の挙動は `sql_interval_arith.rs`）、EXTRACT は #1582、OID 1186・バイナリ・NoSQL は
+//! #1583 の担当。
 
 use engine::catalog::ColumnType;
 use engine::core::{CopyPlan, EngineCore};
@@ -372,9 +373,11 @@ fn other_tenants_cannot_see_interval_rows() {
     assert!(!err.to_string().contains("secretword"));
 }
 
-/// 未解禁の機能は他型の腕へ黙って流さず fail-closed に拒否する（式・算術・型付きリテラルは
-/// #1581。GROUP BY・DISTINCT・window・PK/UNIQUE・型変更は担当 Issue 未定）。述語・並べ替え・
-/// 集計・索引は #1580 で解禁し `sql_interval_query.rs` が担う。
+/// 未解禁の機能は他型の腕へ黙って流さず fail-closed に拒否する（GROUP BY・DISTINCT・window・
+/// PK/UNIQUE・型変更は担当 Issue 未定。述語・並べ替え・集計・索引は #1580 で解禁し
+/// `sql_interval_query.rs` が担う。式・算術・型付きリテラルの正の挙動は #1581 の
+/// `sql_interval_arith.rs` が固定し、ここには今も拒否される形〔`INTERVAL + 数値`・FROM 付き
+/// SELECT 先頭の型付きリテラル〕だけを残す）。
 #[test]
 fn features_not_yet_enabled_are_rejected_fail_closed() {
     let (_p, _g, core) = open("iv-failclosed");
@@ -383,7 +386,6 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
     for sql in [
         "SELECT id FROM t WHERE v IS NOT DISTINCT FROM '1 day' LIMIT 5",
         "SELECT id, ROW_NUMBER() OVER (ORDER BY v) FROM t LIMIT 5",
-        "UPDATE t SET v = v WHERE id = 1 USING OPERATION_ID 'fx1'",
         "SELECT v FROM t GROUP BY v",
         "SELECT v + 1 FROM t LIMIT 5",
         "SELECT v FROM t UNION SELECT v FROM t",

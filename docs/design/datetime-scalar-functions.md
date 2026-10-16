@@ -43,7 +43,12 @@ Accepted。数値スカラー関数群は先行 PR（#1107）で実装済み（
 | `date_trunc(u, DATE\|TIMESTAMP)` | TIMESTAMP | 未知の unit: `22000`（束縛時）。結果が範囲外（1〜9 年の `decade` 切り捨て等）: `22008` |
 | `DATE ± n` / `n + DATE` | DATE | `n` が非整数: `42804`（Issue #1274）。`n` が `i32` 範囲外: `22003`（`NumericOutOfRange`）。結果が `DATE` 受理範囲外: `22008` |
 | `DATE - DATE` | Scalar（日数） | なし（範囲内の差は必ず表現できる） |
-| `TIMESTAMP ± n`・`TIMESTAMP - TIMESTAMP`・`DATE * / n` | — | `42804`（`INTERVAL` 型が無いため対象外。`bind_binary` の型不一致経路） |
+| `TIMESTAMP ± n`・`DATE * / n` | — | `42804`（`bind_binary` の型不一致経路。INTERVAL を伴わない組は従来どおり） |
+| `TIMESTAMP(TZ) ± INTERVAL`・`INTERVAL + TIMESTAMP(TZ)` | TIMESTAMP(TZ) | 結果・中間値が範囲外: `22008`。`TIMESTAMPTZ` はセッション TZ に依存する（CHECK では `0A000`）。Issue #1581 |
+| `DATE ± INTERVAL`・`INTERVAL + DATE` | TIMESTAMP | DATE を深夜 0 時の TIMESTAMP へ昇格する（PG の `date_pl_interval`）。Issue #1581 |
+| `TIMESTAMP(TZ) - TIMESTAMP(TZ)`・DATE との混在 | INTERVAL | 日数と日内マイクロ秒（符号を揃える）。範囲外: `22008`。Issue #1581 |
+| `INTERVAL ± INTERVAL`・`INTERVAL * n`・`n * INTERVAL`・`INTERVAL / n` | INTERVAL | 範囲外・NaN: `22008`、0 除算: `22012`。Issue #1581 |
+| INTERVAL が絡む上記以外の組（`INTERVAL - TIMESTAMP`・`INTERVAL + n`・`TIME ± INTERVAL` 等） | — | `42883`（`operator does not exist`） |
 | 型付きリテラルの書式違反 / 範囲外 | — | `22007` / `22008`（Issue #1187。`datetime-column.md` と同じ写像） |
 | 引数の型不一致 | — | `42804`（Issue #1186） |
 | arity 違反 | — | `42883`（Issue #1349） |

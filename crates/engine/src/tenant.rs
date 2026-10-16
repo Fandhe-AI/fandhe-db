@@ -3058,6 +3058,7 @@ fn validate_set_assignments(
                 | crate::catalog::ColumnType::Timestamp
                 | crate::catalog::ColumnType::Time
                 | crate::catalog::ColumnType::TimestampTz
+                | crate::catalog::ColumnType::Interval
                 | crate::catalog::ColumnType::Array(_)
                 | crate::catalog::ColumnType::Bytea
                 | crate::catalog::ColumnType::Json

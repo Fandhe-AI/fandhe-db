@@ -838,7 +838,6 @@ fn features_still_disabled_are_rejected_fail_closed() {
     }
     // DML・DDL は DDL 許可セッションで実行しても拒否され、副作用を残さない。
     for sql in [
-        "UPDATE docs SET v = v WHERE id = 1 USING OPERATION_ID 'fc-1'",
         "CREATE TABLE a (v INTERVAL PRIMARY KEY)",
         "CREATE TABLE a (v INTERVAL UNIQUE)",
         "ALTER TABLE docs ALTER COLUMN v TYPE TEXT",

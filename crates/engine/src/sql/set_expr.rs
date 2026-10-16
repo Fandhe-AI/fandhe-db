@@ -88,6 +88,7 @@ pub(crate) fn bind_set_expr(
         | ColumnType::Date
         | ColumnType::Timestamp
         | ColumnType::TimestampTz
+        | ColumnType::Interval
         | ColumnType::Time => {}
         _ => {
             return Err(SqlSurfaceError::FeatureNotSupported {
@@ -116,6 +117,7 @@ pub(crate) fn bind_set_expr(
             | (ColumnType::Date, ExprType::Date)
             | (ColumnType::Timestamp, ExprType::Timestamp | ExprType::Date)
             | (ColumnType::Time, ExprType::Time)
+            | (ColumnType::Interval, ExprType::Interval)
             // `TIMESTAMPTZ` 列への代入（Issue #1576）。TIMESTAMP・DATE はセッション TZ の壁時計として、
             // TIMESTAMP・DATE 列への TIMESTAMPTZ は局所の値として変換する（PG の代入キャスト）。
             | (
@@ -218,6 +220,17 @@ pub(crate) fn eval_set_expr_to_value<'a>(
             ColumnType::Time if (0..=MICROS_PER_DAY).contains(&t) => Ok(Value::Time(t)),
             ColumnType::Time => Err(SqlSurfaceError::datetime_field_overflow(
                 "time field value out of range",
+            )),
+            _ => Err(internal()),
+        },
+        // `INTERVAL` は無限大の予約値（番兵）と一致しないことを再検証し、一致したら `22008`
+        // （Issue #1581。行 codec の encode も最後の砦として検査する）。
+        ExprValue::Interval(v) => match &set.target_ty {
+            ColumnType::Interval if crate::datetime::validate_interval(&v) => {
+                Ok(Value::Interval(v))
+            }
+            ColumnType::Interval => Err(SqlSurfaceError::datetime_field_overflow(
+                "interval out of range",
             )),
             _ => Err(internal()),
         },

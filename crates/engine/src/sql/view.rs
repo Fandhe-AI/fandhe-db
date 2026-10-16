@@ -535,6 +535,7 @@ fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurface
         // Issue #920）は列参照を持たない。
         Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
         | Expr::TimeLiteral(_)
         | Expr::TimestampTzLiteral { .. } => Ok(()),
     }

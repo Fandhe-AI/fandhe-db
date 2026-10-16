@@ -151,6 +151,7 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::Null
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
         | Expr::TimeLiteral(_)
         | Expr::TimestampTzLiteral { .. } => Ok(()),
         Expr::Ident(name) => {
@@ -226,6 +227,7 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::Ident(_)
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
         | Expr::TimeLiteral(_)
         | Expr::TimestampTzLiteral { .. }
         | Expr::ValueFunction { .. } => Ok(()),
@@ -328,6 +330,23 @@ fn typed_null(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
                 "a json value is not allowed in a constant expression",
             ))
         }
+        // `INTERVAL` は `NULLIF` が比較を要する（#1580 まで未対応）ため、分岐なしの
+        // `CASE WHEN 1 = 0 THEN INTERVAL '0' END` で型付き NULL を表す（Issue #1581）。
+        ExprType::Interval => Expr::Case {
+            whens: vec![(
+                Expr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(Expr::Number("1".to_string())),
+                    rhs: Box::new(Expr::Number("0".to_string())),
+                },
+                Expr::IntervalLiteral(crate::datetime::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: 0,
+                }),
+            )],
+            else_result: None,
+        },
         ExprType::Bool => Expr::Case {
             whens: vec![(
                 Expr::Binary {
@@ -371,6 +390,8 @@ fn null_kind(e: &Expr) -> Option<Option<ExprType>> {
         Expr::Case { whens, else_result } if else_result.is_none() && whens.len() == 1 => {
             if *e == typed_null(ExprType::Bool).ok()? {
                 Some(Some(ExprType::Bool))
+            } else if *e == typed_null(ExprType::Interval).ok()? {
+                Some(Some(ExprType::Interval))
             } else {
                 None
             }
@@ -381,13 +402,14 @@ fn null_kind(e: &Expr) -> Option<Option<ExprType>> {
 
 /// `NULL` オペランドの型候補（`NULL` 側の位置に置いて束縛を試す順序。算術で曖昧な
 /// `NULL + 1` は PostgreSQL と同様に Scalar を優先する）。
-const NULL_OPERAND_CANDIDATES: [ExprType; 6] = [
+const NULL_OPERAND_CANDIDATES: [ExprType; 7] = [
     ExprType::Scalar,
     ExprType::Text,
     ExprType::Date,
     ExprType::Timestamp,
     ExprType::Time,
     ExprType::TimestampTz,
+    ExprType::Interval,
 ];
 
 /// 関数呼び出しの `NULL` 引数に対する型候補の組み合わせ試行回数の上限（DoS 防止）。
@@ -395,14 +417,40 @@ const MAX_NULL_ARG_PROBES: usize = 256;
 
 /// 1 オペランドが取りうる置換候補。非 `NULL` は式そのもの、型既知の `NULL` は
 /// 型付き `NULL`、裸の `NULL` は型候補ごとの型付き `NULL`。
-fn operand_options(e: &Expr, k: Option<Option<ExprType>>) -> Vec<Expr> {
+///
+/// 裸の `NULL` は `prefer` の型を候補の先頭へ移す（相手オペランドが `INTERVAL` の
+/// 加減算で `INTERVAL` 同士の演算を選ばせるため。Issue #1581）。
+fn operand_options(e: &Expr, k: Option<Option<ExprType>>, prefer: Option<ExprType>) -> Vec<Expr> {
     match k {
         None => vec![e.clone()],
         Some(Some(t)) => typed_null(t).into_iter().collect(),
         Some(None) => NULL_OPERAND_CANDIDATES
             .iter()
+            .filter(|t| Some(**t) == prefer)
+            .chain(
+                NULL_OPERAND_CANDIDATES
+                    .iter()
+                    .filter(|t| Some(**t) != prefer),
+            )
             .filter_map(|t| typed_null(*t).ok())
             .collect(),
+    }
+}
+
+/// 非 `NULL` オペランドが `INTERVAL` 型なら、加減算の裸 `NULL` 側で優先する型（`INTERVAL`）を返す。
+fn interval_preference(
+    op: BinOp,
+    other: &Expr,
+    other_null: Option<Option<ExprType>>,
+) -> Option<ExprType> {
+    if other_null.is_some() || !matches!(op, BinOp::Add | BinOp::Sub) {
+        return None;
+    }
+    let registry = UdfRegistry::default();
+    let mut budget = MAX_EXPR_NODES;
+    match bind_const_expr(other, &registry, &mut budget) {
+        Ok((_, ExprType::Interval, _)) => Some(ExprType::Interval),
+        _ => None,
     }
 }
 
@@ -420,8 +468,10 @@ fn fold_null_binary(
     rn: Option<Option<ExprType>>,
 ) -> Result<Expr, SqlSurfaceError> {
     let mut first_err: Option<SqlSurfaceError> = None;
-    for lhs in operand_options(l, ln) {
-        for rhs in operand_options(r, rn) {
+    let lpref = interval_preference(op, r, rn);
+    let rpref = interval_preference(op, l, ln);
+    for lhs in operand_options(l, ln, lpref) {
+        for rhs in operand_options(r, rn, rpref) {
             let probe = Expr::Binary {
                 op,
                 lhs: Box::new(lhs.clone()),
@@ -474,7 +524,7 @@ fn fold_null_call(name: &str, args: Vec<Expr>) -> Result<Expr, SqlSurfaceError> 
     };
     let options: Vec<Vec<Expr>> = args
         .iter()
-        .map(|a| operand_options(a, null_kind(a)))
+        .map(|a| operand_options(a, null_kind(a), None))
         .collect();
     let mut idx = vec![0usize; args.len()];
     for _ in 0..MAX_NULL_ARG_PROBES {
@@ -601,6 +651,8 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         ExprValue::Time(t) => Ok(InsertLiteral::String(crate::datetime::format_time(t))),
         // 代入先の列型が決まる束縛段で変換するため型を保持する（Issue #1576）。
         ExprValue::TimestampTz(t) => Ok(InsertLiteral::TimestampTz(t)),
+        // INTERVAL 列へは `parse_interval` で再解析されて入る（正規形の往復一致は単体テストで固定）。
+        ExprValue::Interval(v) => Ok(InsertLiteral::String(crate::datetime::format_interval(&v))),
         ExprValue::Vector(_) => Err(SqlSurfaceError::Internal {
             detail: "constant expression produced a vector".to_string(),
         }),
@@ -628,6 +680,48 @@ mod tests {
         Expr::Call {
             name: name.to_string(),
             args,
+        }
+    }
+
+    /// INTERVAL の畳み込み結果は `format_interval` → `parse_interval` で往復一致する
+    /// （INTERVAL 列へは再解析されて入るため、極値でも値が変わらないこと。Issue #1581）。
+    #[test]
+    fn folded_interval_literal_roundtrips_through_text() {
+        use crate::datetime::{format_interval, parse_interval, Interval};
+        for v in [
+            Interval {
+                months: i32::MAX,
+                days: i32::MAX,
+                micros: i64::MAX - 1,
+            },
+            Interval {
+                months: i32::MIN,
+                days: i32::MIN,
+                micros: i64::MIN + 1,
+            },
+            Interval {
+                months: -1,
+                days: 1,
+                micros: -1,
+            },
+            Interval {
+                months: 0,
+                days: 0,
+                micros: 0,
+            },
+            Interval {
+                months: 14,
+                days: -3,
+                micros: 4_000_000,
+            },
+        ] {
+            let InsertLiteral::String(text) =
+                fold_const_literal(&Expr::IntervalLiteral(v)).expect("fold")
+            else {
+                panic!("expected a string literal");
+            };
+            assert_eq!(parse_interval(&text), Ok(v), "{text}");
+            assert_eq!(format_interval(&v), text);
         }
     }
 

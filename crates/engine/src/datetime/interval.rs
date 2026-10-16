@@ -4,11 +4,11 @@
 //! マイクロ秒）、文字列リテラルの閉じた文法の解析、`IntervalStyle=postgres` 形式の
 //! 整形、番兵の検証を集約する。`catalog`（列型宣言）・`row_codec`（17 バイトの行
 //! ペイロード）・`sql::parser`（リテラル束縛と SQLSTATE 写像）・`wire-server`
-//! （投影テキスト）が本モジュールへ委譲する。比較・正規化・算術は後続 Issue
-//! （#1580・#1581）の担当。Issue #1580 で比較用の正規化キー（[`interval_cmp_key`]）と
-//! 集計用の checked 加算・除算を追加した。生の三要素の一致（`PartialEq`／`Hash`）は
-//! codec・content_hash 専用で、SQL の意味論（比較・並べ替え・DISTINCT・索引）は
-//! 必ず正規化キーを通す。
+//! （投影テキスト）が本モジュールへ委譲する。Issue #1580 で比較用の正規化キー
+//! （[`interval_cmp_key`]）と集計用の checked 加算・除算を追加した。生の三要素の一致
+//! （`PartialEq`／`Hash`）は codec・content_hash 専用で、SQL の意味論（比較・並べ替え・
+//! DISTINCT・索引）は必ず正規化キーを通す。日付時刻との加減算・乗除は
+//! `crate::sql::interval_arith`（#1581）が担う。
 //!
 //! 受理する文法は PostgreSQL 17 の公開仕様に準拠した閉じた定義とする。
 //! (a) 単位句（`1 day 2 hours`・`@ 1 day ago`）、(b) SQL 標準形（`1-2`・`1 2:03:04`）、
@@ -826,19 +826,38 @@ fn tsround(x: f64) -> f64 {
     (x * 1_000_000.0).round_ties_even() / 1_000_000.0
 }
 
-/// `interval / float8`（PG17 `interval_div`）。AVG の最終段で使い、#1581 の乗除でも
-/// 再利用する前提。`factor` が 0・NaN、または結果が各要素の範囲外なら [`IntervalRangeError`]。
-pub(crate) fn interval_div_f64(v: &Interval, factor: f64) -> Result<Interval, IntervalRangeError> {
+/// 三要素ごとの checked 減算（`a - b`。正規化しない）。あふれ・番兵一致は
+/// [`IntervalRangeError`]。式の `INTERVAL - INTERVAL`（#1581）が使う。
+pub(crate) fn checked_sub_interval(
+    a: &Interval,
+    b: &Interval,
+) -> Result<Interval, IntervalRangeError> {
+    let r = Interval {
+        months: a.months.checked_sub(b.months).ok_or(IntervalRangeError)?,
+        days: a.days.checked_sub(b.days).ok_or(IntervalRangeError)?,
+        micros: a.micros.checked_sub(b.micros).ok_or(IntervalRangeError)?,
+    };
+    if validate_interval(&r) {
+        Ok(r)
+    } else {
+        Err(IntervalRangeError)
+    }
+}
+
+/// 乗除の共通カスケード（PG17 の `interval_mul`／`interval_div`）。`scale` は各要素へ
+/// 適用する写像（乗算は `x * factor`、除算は `x / factor`）。結果の各要素が範囲外・NaN なら
+/// [`IntervalRangeError`]。AVG の最終段（[`interval_div_f64`]）と式の乗除（#1581）が共有する。
+pub(crate) fn interval_scale(
+    v: &Interval,
+    scale: impl Fn(f64) -> f64,
+) -> Result<Interval, IntervalRangeError> {
     const I32_LIM: f64 = 2_147_483_648.0;
     const I64_LIM: f64 = 9_223_372_036_854_775_808.0;
-    if factor == 0.0 || factor.is_nan() {
-        return Err(IntervalRangeError);
-    }
-    let m = f64::from(v.months) / factor;
+    let m = scale(f64::from(v.months));
     if m.is_nan() || m < -I32_LIM || m >= I32_LIM {
         return Err(IntervalRangeError);
     }
-    let d = f64::from(v.days) / factor;
+    let d = scale(f64::from(v.days));
     if d.is_nan() || d < -I32_LIM || d >= I32_LIM {
         return Err(IntervalRangeError);
     }
@@ -855,7 +874,7 @@ pub(crate) fn interval_div_f64(v: &Interval, factor: f64) -> Result<Interval, In
     if !(-I32_LIM..I32_LIM).contains(&day) {
         return Err(IntervalRangeError);
     }
-    let us = (v.micros as f64 / factor + sec_rem * 1_000_000.0).round_ties_even();
+    let us = (scale(v.micros as f64) + sec_rem * 1_000_000.0).round_ties_even();
     if us.is_nan() || !(-I64_LIM..I64_LIM).contains(&us) {
         return Err(IntervalRangeError);
     }
@@ -870,6 +889,15 @@ pub(crate) fn interval_div_f64(v: &Interval, factor: f64) -> Result<Interval, In
     } else {
         Err(IntervalRangeError)
     }
+}
+
+/// `interval / float8`（PG17 `interval_div`）。AVG の最終段で使う。`factor` が 0・NaN、
+/// または結果が各要素の範囲外なら [`IntervalRangeError`]。
+pub(crate) fn interval_div_f64(v: &Interval, factor: f64) -> Result<Interval, IntervalRangeError> {
+    if factor == 0.0 || factor.is_nan() {
+        return Err(IntervalRangeError);
+    }
+    interval_scale(v, |x| x / factor)
 }
 
 #[cfg(test)]
