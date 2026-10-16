@@ -141,6 +141,7 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
         | Expr::TimestampLiteral(_)
         | Expr::TimeLiteral(_)
         | Expr::ValueFunction { .. } => Ok(()),
+        Expr::Collate { expr, .. } => reject_non_constant_with(expr, allow_placeholders),
         Expr::Ident(n) if allow_placeholders && aggregate_placeholder_index(n).is_some() => Ok(()),
         Expr::Ident(_) => Err(SqlSurfaceError::ColumnReferenceWithoutFrom),
         Expr::Call { name, args } => {
