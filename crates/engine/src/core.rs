@@ -4275,11 +4275,12 @@ impl EngineCore {
     /// 以降すべて既存の [`Self::execute_parsed_in_session`]／
     /// [`Self::describe_parsed_in_session`] を通る）。
     ///
-    /// `values` は `$1` から順に対応する実値（NULL は `None`。本バージョンでは
-    /// スコープ外として `22000` で拒否する。詳細は `sql::params` モジュール
-    /// ドキュメント参照）。個数が [`PreparedSql::param_count`] と一致しない場合は
-    /// `22000`（wire 層は Bind メッセージ自体の値件数検証で `08P01` を先に返す
-    /// 契約のため、ここでの不一致検出は防御的な保険）。
+    /// `values` は `$1` から順に対応する実値。NULL（`None`）は裸の `NULL` トークンへ
+    /// 置換され、位置ごとの受理／拒否（`wire_code`）はリテラル `NULL` と同一になる
+    /// （Issue #2439・WIRE-24。詳細は `sql::params` モジュールドキュメント参照）。
+    /// 個数が [`PreparedSql::param_count`] と一致しない場合は `22000`
+    /// （wire 層は Bind メッセージ自体の値件数検証で `08P01` を先に返す契約のため、
+    /// ここでの不一致検出は防御的な保険）。
     pub fn bind_prepared(
         &self,
         prepared: &PreparedSql,
@@ -4294,10 +4295,11 @@ impl EngineCore {
                 ),
             ));
         }
-        let mut decoded = crate::sql::params::decode_bind_values(&prepared.tokens, values)?;
+        let mut decoded =
+            crate::sql::params::decode_bind_values_nullable(&prepared.tokens, values)?;
         // Issue #2436・WIRE-24: 宣言型がある値は、置換の前に宣言型として検証する。
         // `decoded` は未参照番号が空文字列のままなので、検証には生の Bind 値を使う
-        // （`decode_bind_values` が NULL・非 UTF-8 を拒否済み）。float4 は丸めた正規値で
+        // （NULL は検証対象外で SQL の NULL として置換される。非 UTF-8 は復号が拒否済み）。float4 は丸めた正規値で
         // 置換値を差し替え、受信形式によらず同じ結果にする。
         for (i, decl) in prepared.declared.iter().enumerate() {
             let (Some(ty), Some(Some(raw))) = (decl, values.get(i)) else {
@@ -4309,7 +4311,7 @@ impl EngineCore {
             let n = u16::try_from(i.saturating_add(1)).unwrap_or(u16::MAX);
             if let Some(canonical) = crate::sql::params::validate_declared_value(n, *ty, text)? {
                 if let Some(slot) = decoded.get_mut(i) {
-                    *slot = canonical;
+                    *slot = Some(canonical);
                 }
             }
         }

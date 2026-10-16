@@ -32,8 +32,8 @@ wire 側（`crates/wire-server/src/extended_query.rs`）の Parse／Describe(S)�
   （`NUMERIC`・日時・`JSON`・配列・`ENUM`・`VECTOR`・宣言 0 の `id` 等）への binary 指定は
   `0A000`（Parse 時の `0A000` とは別の意味。WIRE-24 参照）、値の長さが固定長型の受信形式と合わなければ `08P01`（値は応答に含めない）。判定順は
   「全スロットの非対応判定（`0A000`）→ 復号（`08P01`）」で、復号後の値で保持量上限を判定する。
-- 値の形式不正（非 UTF-8・NUL）は `22P02` へ移行した（従来 `22000`）。NULL は据え置き
-  `22000`。
+- 値の形式不正（非 UTF-8・NUL）は `22P02` へ移行した（従来 `22000`）。NULL は #2439 で
+  リテラル `NULL` と同値の束縛へ移行した（後述「NULL パラメータ値」節）。
 - 束縛済み `ParsedSql` は値を保持するため、portal が保持する束縛値バイトの接続単位合計を
   `limits::MAX_BOUND_PARAM_BYTES_PER_SESSION`（4 MiB）で制限する（超過は `54000`。
   portal ごとの値から都度合算するため除去経路での減算漏れが無い）。
@@ -301,27 +301,27 @@ prepared_params.rs` で固定）。
 
 ## NULL パラメータ値
 
-> #2439（TASK-337・WIRE-24 ポインタ）で本節を置き換える予定。
+Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")` 1 個へ
+置換する（#2439・TASK-337・WIRE-24 ポインタ）。`QuotedNull` は使わない。値は SQL
+テキストへ連結せずトークンとして直接生成する。受理／拒否と `wire_code` は
+後段の許可リストパーサーが「同じ位置に SQL テキストで `NULL` と書いた場合」と
+同一の規則で決めるため、`params.rs` に位置別の NULL 分岐は置かない。従来の
+一律 `22000` は廃止した（`bind_prepared` の挙動変更。公開関数
+`decode_bind_values`／`substitute_values` の署名は不変で、前者は `None` を含む入力に
+従来どおり `22000` を返すテキスト専用ラッパーとして残る）。
 
-`decode_bind_values` は `None`（SQL NULL）を一律 `22000` で拒否する（本
-バージョンのスコープ外）。したがって `USING OPERATION_ID $n` の `$n` に
-「句の省略」に相当する値を束縛する手段は現状ない。
-
-- 空文字列の束縛は省略と同義ではない。`OperationId::parse("")` は台帳の
-  構成（`LedgerMode`）に関係なく常に `23502` を返す。一方、句の省略が
-  `23502` になるのは台帳あり構成（`LedgerMode::Ledgered`）の場合だけで、
-  台帳なし構成（`CompareOnlyWithoutLedger`）では省略が受理される。
-- 省略相当を指定したい場合は、`$n` を使わない別の文として Parse する。
-  具体的には `USING OPERATION_ID` 句そのものを書かないか、SQL テキストへ
-  `USING OPERATION_ID NULL` を直接書く。後者は既存の許可リスト
-  （`sql::allowlist::Parser::parse_operation_id_clause`。大小無視の `NULL`
-  を句の省略と同じ `None` として扱う）が構文として受理するため `42601` には
-  ならず、どちらの書き方も構成ごとに省略と同じ結果になる（台帳あり構成は
-  `23502`、台帳なし構成は受理。RECOVER-1・TASK-92 の既存契約。
-  `crates/engine/tests/prepared_params.rs` の
-  `parse_sql_prepared_treats_literal_null_operation_id_as_omitted_clause`
-  で固定）。`USING OPERATION_ID` の値そのものは、NULL 以外は文字列リテラル
-  のみを受理する（数値・他の識別子は `42601`）。
+- 型なしのリテラル `NULL` として扱う。宣言 OID と組み合わせた型付き NULL は #2436／#2437
+  の範囲。
+- `USING OPERATION_ID $n` への NULL は、既存契約の `USING OPERATION_ID NULL`（句の省略と
+  同義。台帳あり構成 `23502`、台帳なし構成は受理。RECOVER-1・TASK-92）をそのまま継承する。
+- 実装時点の事実: リテラルの `<列> = NULL` はベクトル `<=>`・`USING PLAN(NULL)` と同様、
+  現状では実行時に拒否される位置があり（TEXT 等の `= NULL` は `42703`）、NULL パラメータも
+  同じ `wire_code` で拒否される。`INSERT ... VALUES`・`UPDATE ... SET`・式内では受理される。
+- 同値性は `crates/engine/tests/prepared_params.rs` の
+  `bind_prepared_null_matches_literal_null_per_position` で固定する。
+- wire 層の第 1 パスは、binary 非対応スロットに binary format が指定された場合、値が NULL でも
+  `0A000` を先に返す（既存の fail-closed）。PostgreSQL では NULL に format は無関係なため
+  差分になりうる。#2436／#2438・#2440 への申し送り。
 
 ## 検証
 
@@ -340,7 +340,7 @@ prepared_params.rs` で固定）。
     リテラルとして扱われ文の形が変わらないこと（実行結果・テーブルの
     存続を含む）。
   - 位置拒否（`42601`）・字句拒否（`$0`／`$01`／`$1a`）・番号上限
-    （`54000`）・値検証（`22000`）・値件数不一致・RLS 暗黙適用（他テナントの
+    （`54000`）・値検証（`22P02`）・NULL のリテラル同値・値件数不一致・RLS 暗黙適用（他テナントの
     行が混入しない）・Describe の同値性・Parse／Describe の副作用ゼロ・
     簡易クエリでの `$n` 拒否（既存契約）を固定。
 
@@ -358,8 +358,8 @@ prepared_params.rs` で固定）。
   解消済み。
 - TASK-337 の分担: #2436 OID の公告・復号、#2437 変換可否（#1588 に依存）、#2438 `0A000`、
   #2439 NULL、#2440 層 A/B。OID 705 の扱いは #2436 で確認し #2440 の層 B で最終確認する。
-- NULL パラメータ値の意味論的な位置別処理（`USING OPERATION_ID $n` へ NULL を
-  「省略と同義」として通す等）。
+- NULL パラメータ値は #2439 で解消済み（上記節）。リテラル `<列> = NULL` 自体が未対応の
+  位置（`42703`）は SQL-41 系の別課題。
 - 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較・`ON CONFLICT ... SET`・
   hybrid 関数引数・`LIKE $n`。`UPDATE ... SET col = $n` は Issue #1544 で受理済み）。
 - 層 B（psycopg 3／node pg／psql 実クライアントでの `make e2e-three-client`
