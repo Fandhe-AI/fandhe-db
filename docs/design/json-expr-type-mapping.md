@@ -303,9 +303,9 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   （`54000`）は捕捉しない。JSON の `null` は `JSON_VALUE` では SQL の NULL、`JSON_QUERY` では `null`。
 - 新しい SQLSTATE: `22034`（`ErrorClass::MoreThanOneSqlJsonItem`）・`22035`（`NoSqlJsonItem`）・
   `2203F`（`SqlJsonScalarRequired`）。文言は固定の英語文で、入力の断片を含めない（wire-server の HTTP 写像は 400）。
-  spec 追従の申し送り: これら 3 コードと HTTP 400 の対応付けは `docs/spec/04-behavior/error-format.md` ERR-6 に
-  未収載である（コード値のみをポインタ表記）。ERR-6 への追加は private spec リポ側の作業で、本リポの権限外。
-  spec 側の追記（ERR-6 への 3 コードの収載）が済むまで、これらの対応付けは未確定の契約として扱い、確定は spec 側の定義を待つ。
+  根拠: `docs/spec/04-behavior/error-format.md` ERR-6 の 2026-10-10 改訂注記（PG17 同等化の前提判断）が、
+  クラス 2203x を PostgreSQL 17 と同じコードで実装時に分類表へ追加すると定めている。HTTP 400 は ERR-6 の
+  「新設行は 1 コード 1 ステータス」の原則による。spec 分類表への行追加は spec リポ側の同期作業として扱う。
 - 使える位置: 投影・WHERE（`JSON_EXISTS` は比較なしの裸の述語。`NOT` 付きは `42601`）・ORDER BY・FROM なし SELECT。
   CHECK・関数本体・定数式（INSERT VALUES 等）は `0A000`／`42601`（既存の jsonb 関数と同じ扱い）。
 - prepared 文: `RETURNING`・`ON` が括弧内の句語として現れるため、`sql::params::where_region` は括弧の深さを数え、
