@@ -121,10 +121,10 @@ fn enforce_discard_budget<S: WireStream>(
     Ok(())
 }
 
-/// ErrorResponse を書いてから ReadyForQuery を書く
-/// （`simple_query::respond_error_and_ready` と同じ契約。COPY サブプロトコル
+/// ErrorResponse だけを書く（`ReadyForQuery` は `CopyStep::Failed` を受けた
+/// `simple_query` が書く。`simple_query::respond_error` と同じ契約。COPY サブプロトコル
 /// のエラーも接続を維持する簡易クエリの一部であり、切断はしない）。
-/// `ReadyForQuery` の状態バイトは接続の明示トランザクション状態（`txn.status()`）から
+/// 後続の `ReadyForQuery` の状態バイトは接続の明示トランザクション状態（`txn.status()`）から
 /// 導出する（SQL-31・TASK-221、Issue #1179。`handshake::post_auth_loop` は `Idle`・
 /// `Active` のとき本モジュール〔`crate::copy::run`〕へ委譲し、`Failed` 中の COPY は
 /// 本モジュールへ到達する前に `25P02` で拒否する）。
@@ -139,8 +139,9 @@ fn respond_error_and_ready<S: WireStream>(
     message: &str,
 ) -> io::Result<()> {
     txn.fail();
-    crate::handshake::write_error_response_io(stream, class, message)?;
-    crate::handshake::write_ready_for_query_io(stream, txn.status())
+    // `ReadyForQuery` はここでは書かない。`CopyStep::Failed` を受けた呼び出し元
+    // （`simple_query`）がセッション復元の後に TimeZone 通知付きで送る（TABLE-33・Issue #1575）。
+    crate::handshake::write_error_response_io(stream, class, message)
 }
 
 fn respond_sql_error<S: WireStream>(
@@ -661,7 +662,7 @@ fn finish_copy_from<'e, S: WireStream>(
 pub(crate) enum CopyStep {
     /// `CommandComplete "COPY n"`（と `finish` に応じた `ReadyForQuery`）を書き終えた。
     Completed,
-    /// ErrorResponse＋`ReadyForQuery` を書き終えた。呼び出し元は以降の文を実行しない。
+    /// ErrorResponse を書き終えた（`ReadyForQuery` は呼び出し元が復元後に送る）。呼び出し元は以降の文を実行しない。
     Failed,
     /// Terminate（'X'）受信・早期 EOF。呼び出し元は接続ループを終了させる。
     Closed,

@@ -72,19 +72,30 @@ fn write_all<S: WireStream>(stream: &mut S, msg: &[u8]) -> io::Result<()> {
     stream.write_all(msg)
 }
 
-/// ErrorResponse を書いてから ReadyForQuery を書く（簡易クエリのエラーは接続を
+/// ErrorResponse だけを書く。`ReadyForQuery` は呼び出し元が [`finish_failed`] で書く
+/// （セッション復元の後に TimeZone を通知してから RFQ を送るため。簡易クエリのエラーは接続を
 /// 維持する。WIRE-8 の「切断」は拡張クエリプロトコル限定の既存契約であり、ここは
 /// 変更しない）。`class` は `crate::handshake::write_error_response_io`（実体は
 /// `crate::error_response::encode`）へそのまま渡り、severity・SQLSTATE の決定を
 /// 横断写像へ一元化する（TASK-153・ERR-1・codex-review P1 指摘対応・PR #258）。
-fn respond_error_and_ready<S: WireStream>(
+fn respond_error<S: WireStream>(
     stream: &mut S,
     class: ErrorClass,
     message: &str,
-    txn_status: engine::sql::transaction::TransactionStatus,
 ) -> io::Result<()> {
-    crate::handshake::write_error_response_io(stream, class, message)?;
-    crate::handshake::write_ready_for_query_io(stream, txn_status)
+    crate::handshake::write_error_response_io(stream, class, message)
+}
+
+/// 失敗応答の `ReadyForQuery` を書く（Issue #1575 レビュー指摘）。ErrorResponse の送出後に
+/// 呼び出し元がセッション復元（`MessageSnapshot`／暗黙トランザクションのスナップショット）を
+/// 済ませてから呼ぶことで、復元後の TimeZone の `ParameterStatus` が必ず `ReadyForQuery`
+/// より前に送られる（TABLE-33）。
+fn finish_failed<S: WireStream>(
+    stream: &mut S,
+    session: &SessionState,
+    txn: &mut SessionTransaction<'_>,
+) -> io::Result<()> {
+    crate::handshake::write_ready_for_query_synced_io(stream, session, txn)
 }
 
 /// [`execute_and_respond`]・[`run_statement`] が使う「この応答の後に
@@ -106,7 +117,7 @@ enum StatementStatus {
     /// 応答（`RowDescription`/`DataRow`*/`CommandComplete`、`finish` に応じた
     /// `ReadyForQuery`）を書き終えた。
     Completed,
-    /// ErrorResponse＋`ReadyForQuery` を書き終えた（`respond_error_and_ready`・
+    /// ErrorResponse を書き終えた（`respond_error`・RFQ は呼び出し元が復元後に書く。
     /// エンコード失敗時のフォールバックのいずれか）。呼び出し元は以降の文を
     /// 実行せず、セッション状態を巻き戻す。
     Failed,
@@ -157,7 +168,7 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
 
     if sql.trim().is_empty() {
         write_all(stream, &result_encoder::encode_empty_query_response())?;
-        crate::handshake::write_ready_for_query_io(stream, txn.status())?;
+        crate::handshake::write_ready_for_query_synced_io(stream, session, txn)?;
         return Ok(LoopSignal::Continue);
     }
 
@@ -166,12 +177,12 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
             // 分割・位置検証のエラーも、明示トランザクション中なら `Failed` へ
             // 遷移させる（SQL-31・TASK-221。PR #1041 レビュー指摘: `Active` の
             // まま残すと後続の `COMMIT` が先行する書き込みを永続化してしまう）。
-            respond_splitter_error(stream, txn, &e)?;
+            respond_splitter_error(stream, session, txn, &e)?;
             Ok(LoopSignal::Continue)
         }
         Ok(engine::sql::statement_splitter::SplitOutcome::Single) => {
             if engine::sql::copy::is_copy_statement(sql) {
-                return run_copy_statement(
+                let step = run_copy_statement(
                     stream,
                     engine,
                     ctx,
@@ -179,10 +190,13 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
                     txn,
                     sql,
                     Finish::ReadyForQuery,
-                )
-                .map(copy_step_to_signal);
+                )?;
+                if matches!(step, crate::copy::CopyStep::Failed) {
+                    finish_failed(stream, session, txn)?;
+                }
+                return Ok(copy_step_to_signal(step));
             }
-            run_statement(
+            let status = run_statement(
                 stream,
                 engine,
                 ctx,
@@ -190,12 +204,15 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
                 txn,
                 sql,
                 Finish::ReadyForQuery,
-            )
-            .map(|_| LoopSignal::Continue)
+            )?;
+            if status == StatementStatus::Failed {
+                finish_failed(stream, session, txn)?;
+            }
+            Ok(LoopSignal::Continue)
         }
         Ok(engine::sql::statement_splitter::SplitOutcome::Empty) => {
             write_all(stream, &result_encoder::encode_empty_query_response())?;
-            crate::handshake::write_ready_for_query_io(stream, txn.status())?;
+            crate::handshake::write_ready_for_query_synced_io(stream, session, txn)?;
             Ok(LoopSignal::Continue)
         }
         Ok(engine::sql::statement_splitter::SplitOutcome::Statements(stmts)) => {
@@ -205,7 +222,7 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
             let session_in_txn = txn.status() != engine::sql::transaction::TransactionStatus::Idle;
             match engine::sql::statement_splitter::plan_multi_statement(&stmts, session_in_txn) {
                 Err(e) => {
-                    respond_splitter_error(stream, txn, &e)?;
+                    respond_splitter_error(stream, session, txn, &e)?;
                     Ok(LoopSignal::Continue)
                 }
                 Ok(engine::sql::statement_splitter::MultiStatementPlan::Sequential) => {
@@ -275,6 +292,7 @@ fn run_sequential_statements<'e, S: WireStream>(
                 // ErrorResponse＋ReadyForQuery は run_statement 内で
                 // 送出済み。残りの文は実行せず、セッション状態を復元する。
                 snapshot.restore_after_failure(before, txn.status(), session);
+                finish_failed(stream, session, txn)?;
                 return Ok(LoopSignal::Continue);
             }
         }
@@ -310,7 +328,8 @@ fn run_implicit_transaction<'e, S: WireStream>(
     let snapshot = session.clone();
     if let Err(e) = engine.begin_implicit_transaction(txn, session) {
         // ライタゲートの待機上限超過（`55P03`）等。1 文も実行しない。
-        respond_error_and_ready(stream, e.error_class(), &e.client_message(), txn.status())?;
+        respond_error(stream, e.error_class(), &e.client_message())?;
+        finish_failed(stream, session, txn)?;
         return Ok(LoopSignal::Continue);
     }
     let result = run_implicit_statements(stream, engine, ctx, session, txn, stmts, &snapshot);
@@ -348,6 +367,9 @@ fn run_implicit_statements<'e, S: WireStream>(
                 Finish::ReadyForQuery,
             )?;
             *session = snapshot.clone();
+            if matches!(step, crate::copy::CopyStep::Failed) {
+                finish_failed(stream, session, txn)?;
+            }
             return Ok(copy_step_to_signal(step));
         }
         let (finish, role) = if is_last {
@@ -361,13 +383,9 @@ fn run_implicit_statements<'e, S: WireStream>(
                     // 想定外: 途中の文の後に暗黙トランザクションが失われている。
                     // 後続の書き込みが autocommit で実行されないよう、ここで打ち切る
                     // （fail-closed）。
-                    respond_error_and_ready(
-                        stream,
-                        ErrorClass::InternalError,
-                        "internal error",
-                        txn.status(),
-                    )?;
+                    respond_error(stream, ErrorClass::InternalError, "internal error")?;
                     *session = snapshot.clone();
+                    finish_failed(stream, session, txn)?;
                     return Ok(LoopSignal::Continue);
                 }
             }
@@ -375,6 +393,7 @@ fn run_implicit_statements<'e, S: WireStream>(
                 // ErrorResponse＋ReadyForQuery('I') は送出済み。先行する書き込みは
                 // `fail` が破棄している。セッション状態をメッセージ受信前へ戻す。
                 *session = snapshot.clone();
+                finish_failed(stream, session, txn)?;
                 return Ok(LoopSignal::Continue);
             }
         }
@@ -417,22 +436,16 @@ fn run_copy_statement<'e, S: WireStream>(
         // CopyIn へは入らずメッセージ全体をロールバックする）。
         TransactionStatus::InTransaction => {
             txn.fail();
-            respond_error_and_ready(
+            respond_error(
                 stream,
                 ErrorClass::FeatureNotSupported,
                 "COPY is not supported inside a transaction block",
-                txn.status(),
             )?;
             Ok(crate::copy::CopyStep::Failed)
         }
         TransactionStatus::Failed => {
             let err = txn.take_failed_error();
-            respond_error_and_ready(
-                stream,
-                err.error_class(),
-                &err.client_message(),
-                txn.status(),
-            )?;
+            respond_error(stream, err.error_class(), &err.client_message())?;
             Ok(crate::copy::CopyStep::Failed)
         }
     }
@@ -496,20 +509,18 @@ impl MessageSnapshot {
 /// 永続化してしまう。PR #1041 レビュー指摘）。
 fn respond_splitter_error<S: WireStream>(
     stream: &mut S,
+    session: &SessionState,
     txn: &mut SessionTransaction<'_>,
     e: &engine::sql::statement_splitter::MultiStatementError,
 ) -> io::Result<()> {
     if txn.status() == engine::sql::transaction::TransactionStatus::Failed {
         let failed = txn.take_failed_error();
-        return respond_error_and_ready(
-            stream,
-            failed.error_class(),
-            &failed.client_message(),
-            txn.status(),
-        );
+        respond_error(stream, failed.error_class(), &failed.client_message())?;
+        return finish_failed(stream, session, txn);
     }
     txn.fail();
-    respond_error_and_ready(stream, e.error_class(), &e.client_message(), txn.status())
+    respond_error(stream, e.error_class(), &e.client_message())?;
+    finish_failed(stream, session, txn)
 }
 
 /// 複数文実行の 1 文を実行し、応答（`finish` に応じた `ReadyForQuery` の有無）を
@@ -625,7 +636,7 @@ fn run_statement_as<'e, S: WireStream>(
             // から返す（`Active` 中は `fail()` 済み・`Failed` 中の再エラーは
             // 据え置き）ため、ここで読む `txn.status()` は直前のエラーを反映
             // 済み（WIRE-19・SQL-31・TASK-221・PR #1041 レビュー指摘 P1）。
-            respond_error_and_ready(stream, e.error_class(), &e.client_message(), txn.status())?;
+            respond_error(stream, e.error_class(), &e.client_message())?;
             Ok(StatementStatus::Failed)
         }
     }
@@ -937,11 +948,10 @@ fn respond_command_complete_with<S: WireStream>(
         }
         Err(_) => {
             txn.fail();
-            respond_error_and_ready(
+            respond_error(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode command complete response",
-                txn.status(),
             )?;
             Ok(StatementStatus::Failed)
         }
@@ -1087,14 +1097,13 @@ fn respond_query_result<S: WireStream>(
     let mut txn = SessionTransaction::new(engine::sql::transaction::TransactionLimits::default());
     // 接続確立時（`handshake`）に UTC を通知済みの状態を再現する（ParameterStatus を挟まない）。
     txn.set_reported_time_zone("UTC");
-    respond_rows_with_tag(
-        stream,
-        result,
-        &tag,
-        finish,
-        &SessionState::default(),
-        &mut txn,
-    )
+    let session = SessionState::default();
+    let status = respond_rows_with_tag(stream, result, &tag, finish, &session, &mut txn)?;
+    if status == StatementStatus::Failed {
+        // 本番では呼び出し元（`execute_and_respond` 等）が復元後に書く `ReadyForQuery` を補う。
+        finish_failed(stream, &session, &mut txn)?;
+    }
+    Ok(status)
 }
 
 /// `RowDescription`／`DataRow`* の組み立てとフレーム送出を担う共通本体
@@ -1123,11 +1132,10 @@ fn respond_rows_with_tag<S: WireStream>(
             // `INSERT` 等の書き込みが未確定のまま残り、後続の `COMMIT` で
             // 誤って永続化されてしまう。
             txn.fail();
-            respond_error_and_ready(
+            respond_error(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode row description",
-                txn.status(),
             )?;
             return Ok(StatementStatus::Failed);
         }
@@ -1167,11 +1175,10 @@ fn respond_rows_with_tag<S: WireStream>(
                 // 行エンコード失敗も上記と同じ理由で `Active` を `Failed` へ
                 // 強制遷移させる（SQL-31・PR #1041 レビュー指摘 P1）。
                 txn.fail();
-                respond_error_and_ready(
+                respond_error(
                     stream,
                     ErrorClass::InternalError,
                     "failed to encode data row",
-                    txn.status(),
                 )?;
                 return Ok(StatementStatus::Failed);
             }
@@ -1198,11 +1205,10 @@ fn respond_rows_with_tag<S: WireStream>(
             // `CommandComplete` エンコード失敗も同様に `Failed` へ遷移させる
             // （SQL-31・PR #1041 レビュー指摘 P1）。
             txn.fail();
-            respond_error_and_ready(
+            respond_error(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode command complete response",
-                txn.status(),
             )?;
             Ok(StatementStatus::Failed)
         }
@@ -1421,6 +1427,7 @@ mod tests {
             &mut txn,
         )
         .expect("respond");
+        finish_failed(&mut server, &SessionState::default(), &mut txn).expect("rfq");
         drop(server);
         let received = reader.join().expect("reader thread");
 
@@ -1476,6 +1483,7 @@ mod tests {
             |_| Err(result_encoder::EncodeError),
         )
         .expect("respond");
+        finish_failed(&mut server, &SessionState::default(), &mut txn).expect("rfq");
         drop(server);
         let received = reader.join().expect("reader thread");
 

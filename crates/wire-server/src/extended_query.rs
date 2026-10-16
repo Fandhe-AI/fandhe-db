@@ -659,6 +659,53 @@ enum PortalBody {
 
 /// portal が保持する未送出行と、完了時に使う `CommandComplete` タグの組み立て
 /// 方（[`crate::simple_query::TagShape`]）。
+/// 中断 portal が保持する 1 行の保守的なメモリ見積り（上限会計用）。
+/// 保持対象は wire 表現ではなく [`engine::sql::exec::ResultRow`] 自体のため、
+/// 行本体・`Cell` 配列・文字列／ベクトル／バイト列のヒープ領域を合算する。NULL や短い値の
+/// 多い行では `Cell` 配列が wire 表現を大幅に上回るため、`frame_len` 単独では上限を超えて
+/// 保持できてしまう（Issue #1575 レビュー指摘）。配列など内部のヒープ量を直接数えない
+/// セルを含む行は、`frame_len`（エンコード済みバイト数）を代理値として 1 度だけ加算する。
+fn retained_row_bytes(row: &engine::sql::exec::ResultRow, frame_len: usize) -> usize {
+    use engine::sql::exec::Cell;
+    let mut total = std::mem::size_of::<engine::sql::exec::ResultRow>()
+        .saturating_add(row.cells.len().saturating_mul(std::mem::size_of::<Cell>()));
+    let mut opaque = false;
+    for cell in &row.cells {
+        let heap = match cell {
+            Cell::Text(s) | Cell::Json(s) => s.len(),
+            Cell::Vector(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
+            Cell::Bytes(b) => b.len(),
+            Cell::Array(_) => {
+                opaque = true;
+                0
+            }
+            _ => 0,
+        };
+        total = total.saturating_add(heap);
+    }
+    if opaque {
+        total = total.saturating_add(frame_len);
+    }
+    total
+}
+
+/// 中断 portal が保持する列メタの保守的なメモリ見積り（上限会計用）。
+fn retained_columns_bytes(columns: &[ColumnMeta]) -> usize {
+    let mut total = columns
+        .len()
+        .saturating_mul(std::mem::size_of::<ColumnMeta>());
+    for c in columns {
+        let name_len = match c {
+            ColumnMeta::Id => 0,
+            ColumnMeta::AliasedId { name }
+            | ColumnMeta::Scalar { name, .. }
+            | ColumnMeta::Computed { name, .. } => name.len(),
+        };
+        total = total.saturating_add(name_len);
+    }
+    total
+}
+
 struct PortalRows {
     /// 未送出の行（値）と、中断時点のエンコード済みバイト数（保持上限の会計用）。
     /// `max_rows` ごとに任意の境界で分割送出するため行単位で保持し、`DataRow` への
@@ -667,6 +714,9 @@ struct PortalRows {
     frames: std::collections::VecDeque<(engine::sql::exec::ResultRow, usize)>,
     /// 保持行の列メタ（送出時の整形に使う）。
     columns: Vec<ColumnMeta>,
+    /// `columns` の保守的なヒープ見積り（[`retained_columns_bytes`]）。保持上限の会計に
+    /// 行の見積りと合算する（中断 portal 数に比例して列メタが無計上で残らないようにする）。
+    columns_bytes: usize,
     shape: crate::simple_query::TagShape,
     /// この portal がこれまでの Execute 呼び出し（今回分を含まない）で
     /// 既に送出済みの行数。完了時の `CommandComplete` タグは PostgreSQL の
@@ -899,7 +949,7 @@ impl PortalStore {
                     .frames
                     .iter()
                     .map(|(_, len)| *len)
-                    .fold(0usize, |acc, len| acc.saturating_add(len)),
+                    .fold(rows.columns_bytes, |acc, len| acc.saturating_add(len)),
                 PortalState::Ready | PortalState::Done { .. } | PortalState::Failed => 0,
             })
             .fold(0usize, |acc, n| acc.saturating_add(n))
@@ -2088,7 +2138,13 @@ fn execute_portal<'e, S: WireStream>(
                     // ErrorResponse を返す事態を避ける）。
                     let other_suspended_bytes =
                         state.portals.total_suspended_bytes_excluding(portal_name);
-                    let mut remaining_bytes: usize = 0;
+                    // 列メタの保持分は中断が確定する（`take` 以降に行がある）場合のみ加算する。
+                    let columns_bytes = retained_columns_bytes(&result.columns);
+                    let mut remaining_bytes: usize = if result.rows.len() > take {
+                        columns_bytes
+                    } else {
+                        0
+                    };
                     let mut frames = std::collections::VecDeque::new();
                     for row in result.rows.iter().skip(take) {
                         // Bind 時点で確定した結果 format code（WIRE-14。
@@ -2106,12 +2162,13 @@ fn execute_portal<'e, S: WireStream>(
                             session.time_zone(),
                         )
                         .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
-                        remaining_bytes = remaining_bytes.saturating_add(frame.len());
+                        let retained = retained_row_bytes(row, frame.len());
+                        remaining_bytes = remaining_bytes.saturating_add(retained);
                         let session_total = other_suspended_bytes.saturating_add(remaining_bytes);
                         if session_total > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION {
                             return Err(commit_wrap(HandlerError::SuspendedBytesExceeded));
                         }
-                        frames.push_back((row.clone(), frame.len()));
+                        frames.push_back((row.clone(), retained));
                     }
 
                     // 中断保持分の検査を通過した後で初めて `take` 分の送出へ移る。
@@ -2184,6 +2241,7 @@ fn execute_portal<'e, S: WireStream>(
                     portal.state = PortalState::Suspended(PortalRows {
                         frames,
                         columns: result.columns.clone(),
+                        columns_bytes,
                         shape,
                         sent_so_far: take,
                         committed: is_write_statement,
@@ -2279,7 +2337,9 @@ fn execute_portal<'e, S: WireStream>(
             (max_rows as usize).min(total)
         };
 
-        let hint: usize = rows.frames.iter().take(take).map(|(_, len)| *len).sum();
+        // 会計値（行本体の見積りを含む）は送出バッファの容量ヒントには過大のため
+        // 行数ベースの概算に留める（上限は `with_capacity_hint` 側で抑えられる）。
+        let hint: usize = take.saturating_mul(64);
         let mut buffer = crate::response_buffer::ResponseBuffer::with_capacity_hint(
             MAX_RESPONSE_BUFFER_BYTES,
             hint,
@@ -2471,6 +2531,29 @@ pub(crate) fn handle_flush<S: WireStream>(stream: &mut S) -> io::Result<LoopSign
 
 #[cfg(test)]
 mod tests {
+    /// 中断 portal の保持量見積りは wire 表現（`frame_len`）より行本体・`Cell` 配列分だけ大きい
+    /// （NULL 多数の行で上限会計が過小にならない。Issue #1575 レビュー指摘）。
+    #[test]
+    fn retained_row_bytes_counts_cells_and_heap_beyond_frame_len() {
+        use engine::sql::exec::{Cell, ResultRow};
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Null; 1000],
+        };
+        // NULL セルの DataRow 表現は 1 セル 4 バイト相当だが、保持量は Cell 配列分を含む。
+        let n = retained_row_bytes(&row, 4000);
+        assert!(n >= 1000 * std::mem::size_of::<Cell>());
+        assert!(n > 4000);
+        let text_row = ResultRow {
+            id: 2,
+            score: 0.0,
+            cells: vec![Cell::Text("x".repeat(100))],
+        };
+        assert!(retained_row_bytes(&text_row, 104) >= 100);
+        assert_eq!(retained_columns_bytes(&[]), 0);
+    }
+
     use super::*;
     use crate::limits::MAX_PREPARED_STATEMENTS_PER_SESSION;
 
