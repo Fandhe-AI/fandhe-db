@@ -231,7 +231,17 @@ INTERVAL 列の述語・ORDER BY・集計・二次索引を解禁した（TABLE-
 - **集計**: `COUNT`・`COUNT(DISTINCT)`（正規化キー 16 バイトで重複除去）・`MIN`/`MAX`・`SUM`・`AVG`。`MIN`/`MAX` は正規化キーで比べ**元の三要素**を返す。キーが同点のときは PG17 の遷移関数（`interval_smaller`／`interval_larger`）と同じく後から観測した値を採る。PG は aggsortop により索引経由で求めることもあり、同点時の代表は実装依存になる点が乖離になりうる。`SUM` は三要素ごとの checked 加算（正規化しない。`'1 mon' + '30 days'` は `'1 mon 30 days'`）で、あふれは `22008`。`AVG` は和（あふれは `22008`）を `interval_div_f64`（PG17 `interval_div` 相当。#1581 の乗除でも再利用する）で割る。固定ベクタ: `AVG('1 mon','2 mons')` = `1 mon 15 days`、`AVG('1 day','2 days')` = `1 day 12:00:00`、`AVG('1 mon','00:00:00')` = `15 days`。全行 NULL・0 行は NULL（`COUNT(DISTINCT)` は 0）。結果型は INTERVAL。HAVING の数値比較対象と式内の参照は拒否のまま。
 - **二次索引**: `OrderedColumnIndex::Interval(Vec<(i128, u32)>)`。`I128` は NUMERIC 専用（列 scale を持つ）のため流用せず、`(I128, Numeric)` の照会腕が INTERVAL 列から到達しないようにした。自動索引と `CREATE INDEX` の宣言（`is_declarable_scalar_index_type`）の両方で構築し、キーは評価側と同じ `interval_cmp_key` なので索引経路と全走査の結果は一致する。`InTyped` は他型と同じく索引未対応（全走査）。
 - **fail-closed のまま（担当 Issue 未定）**: GROUP BY・SELECT DISTINCT・window（PARTITION BY／ORDER BY のキーと集計の入力）・集合演算・サブクエリの値族・scoring_boost。正規化等価な値を 1 グループにまとめるとき、どちらの三要素を代表値として出すかの規則（PG との整合）が未確定のため。PK／UNIQUE／FK・JOIN キー・`ALTER COLUMN TYPE` も現状維持。
-- **対象外**: 式・算術・型付きリテラル `INTERVAL '...'`・列同士の比較（#1581）、EXTRACT（#1582）、OID 1186・バイナリ・NoSQL の filter／型束縛（#1583。wire は引き続き text を公告し wire-server のコードは変更しない）。
+- **対象外**: 式・算術・型付きリテラル `INTERVAL '...'`・列同士の比較（#1581）、EXTRACT（#1582）、OID 1186・バイナリ・NoSQL の filter／型束縛（#1583。下の「Issue #1583 追記」で対応）。
+
+## Issue #1583 追記: INTERVAL の wire OID とバイナリ入出力・NoSQL
+
+TABLE-34・WIRE-13・WIRE-14・NOSQL-13・NOSQL-14・NOSQL-17 のポインタ。#1579 の暫定状態（wire は text・OID 25、バイナリと NoSQL は拒否）を解消した。wire-server のみの変更で、engine は変更しない。
+
+- **wire**: OID 1186・typlen 16・型名 `interval` で公告し、バイナリ結果（time i64・day i32・month i32 の 16 バイト BE）とバイナリ param に対応（詳細は [wire-binary-format.md](wire-binary-format.md)）。**契約変更**: INTERVAL 列の公告 OID が 25 から 1186 へ変わる。
+- **NoSQL 型束縛・DDL**: insert／update は JSON 文字列を束縛し（数値・真偽値・配列・オブジェクトは `42601`）、書式・範囲の検査は engine の `parse_interval`（`22007`／`22015`／`22008`、`infinity` は `0A000`）に委ねる。`create_table`／`add_column` の型名 `"interval"` を受理する（`interval(p)` などの修飾付きは拒否のまま）。
+- **NoSQL filter**: `eq`／`ne`／範囲比較／`between`／`in`／`is_null` を DATE／TIMESTAMP／UUID と同じ文字列レーンで解禁した（比較は engine の正規化キー。`1 mon` と `30 days` は等価）。述語形の update／delete の filter も同じ束縛点を共有する。`prefix`／`like` は TEXT 系専用のまま（`22000`）。
+- **NoSQL sort**: `scan` の `sort` に INTERVAL 列を指定すると SQL の `ORDER BY` と同じ正規化キー順（同順位は id）になることをテストで固定した。変更は不要だった。
+- **対象外**: `interval[]`（OID 1187）、`INTERVAL(p)`・フィールド修飾付きの列型、`infinity`／`-infinity` の受理、`SET IntervalStyle` と ParameterStatus、COPY バイナリ、GROUP BY・DISTINCT・PK／UNIQUE／FK・JOIN キー（担当 Issue 未定）、式・算術（#1581）、EXTRACT（#1582）。
 
 ## Issue #1581 追記: 日付時刻と INTERVAL の加減算・乗除
 

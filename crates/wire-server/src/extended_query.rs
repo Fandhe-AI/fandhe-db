@@ -523,6 +523,9 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 // TIMESTAMPTZ スロットは timestamptz（OID 1184）のみバイナリ受理（TABLE-33・
                 // Issue #1577）。宣言 1114／25 のバイナリは意味が変わるため `0A000`。
                 ColumnType::TimestampTz => only(1184, BinaryParam::TimestampTz),
+                // INTERVAL スロットは interval（OID 1186）のみバイナリ受理（TABLE-34・Issue #1583）。
+                // 宣言 25 等のバイナリは意味が変わるため `0A000`（fail-closed）。
+                ColumnType::Interval => only(1186, BinaryParam::Interval),
                 // CHAR(n) スロット（bpchar＝OID 1042）。値は engine のリテラル置換経路を通り、
                 // 非 NULL 書き込みの可否は engine 側の契約に従う（Issue #1565）。
                 ColumnType::Bpchar(_) => {
@@ -538,8 +541,6 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 ColumnType::Vector(_)
                 | ColumnType::Date
                 | ColumnType::Timestamp
-                // INTERVAL のバイナリ受信は #1583 まで非対応（Issue #1579）。
-                | ColumnType::Interval
                 | ColumnType::Json
                 | ColumnType::Jsonb
                 | ColumnType::Array(_)
@@ -1791,11 +1792,7 @@ fn handle_bind_body(
                                     binary_param::BinaryParamError::OutOfRange => {
                                         HandlerError::BinaryParamOutOfRange {
                                             index: i + 1,
-                                            label: if slot.binary == BinaryParam::TimestampTz {
-                                                "timestamp"
-                                            } else {
-                                                "time value"
-                                            },
+                                            label: slot.binary.out_of_range_label(),
                                         }
                                     }
                                 },

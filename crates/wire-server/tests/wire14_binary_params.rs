@@ -50,6 +50,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ColumnDef::new("day", ColumnType::Date, true),
                 ColumnDef::new("tm", ColumnType::Time, true),
                 ColumnDef::new("tz", ColumnType::TimestampTz, true),
+                ColumnDef::new("iv", ColumnType::Interval, true),
                 ColumnDef::new(
                     "price",
                     ColumnType::Numeric {
@@ -767,6 +768,91 @@ fn timestamptz_slot_binary_params() {
     // 宣言 OID 不一致のバイナリは 0A000。
     for declared in [20, 1114, 25] {
         let o = query(&mut s, ins, &[declared], &[1], &[Some(&0i64.to_be_bytes())]);
+        expect_err(o, "0A000", &mut s);
+    }
+    let after = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
+    assert_eq!(before, after, "no side effect");
+    let mut b = connect(spawn(core), "bob");
+    let o = query(&mut b, sel, &[], &[], &[]);
+    assert_eq!(o.expect("bob rows").0.len(), 0);
+}
+
+/// INTERVAL スロットのバイナリ param（TABLE-34・WIRE-14・Issue #1583）。バイナリ ≡ 同じ値の
+/// テキスト（往復一致）、長さ不正 `08P01`、±infinity 番兵 `22008`（副作用なし・値を含まない）、
+/// 宣言 OID 不一致 `0A000`、テナント境界。
+#[test]
+fn interval_slot_binary_params() {
+    let (core, _g) = new_core();
+    let mut s = connect(spawn(core.clone()), "alice");
+    let sel = "SELECT id FROM t WHERE iv IS NOT NULL LIMIT 50";
+    let bin = |micros: i64, days: i32, months: i32| -> Vec<u8> {
+        let mut v = micros.to_be_bytes().to_vec();
+        v.extend_from_slice(&days.to_be_bytes());
+        v.extend_from_slice(&months.to_be_bytes());
+        v
+    };
+    // (バイナリ, 同じ値のテキスト)
+    let cases: Vec<(Vec<u8>, &str)> = vec![
+        (bin(0, 0, 0), "00:00:00"),
+        (
+            bin(7_200_000_000, -1, 14),
+            "1 year 2 mons -1 days +02:00:00",
+        ),
+        (
+            bin(-86_399_999_999, -30, -1),
+            "-1 mons -30 days -23:59:59.999999",
+        ),
+        (bin(1, 1, 0), "1 day 00:00:00.000001"),
+    ];
+    for (i, (raw, text)) in cases.iter().enumerate() {
+        for (j, declared) in [&[][..], &[1186]].into_iter().enumerate() {
+            let id_bin = 1000 + (i * 10 + j * 2) as i32;
+            let id_txt = id_bin + 1;
+            let ins = |id: i32| {
+                format!(
+                    "INSERT INTO t (id, embedding, iv) VALUES ({id}, '[0,1]', $1) USING OPERATION_ID 'iv-{id}'"
+                )
+            };
+            let o = query(&mut s, &ins(id_bin), declared, &[1], &[Some(raw)]);
+            assert!(o.is_ok(), "binary insert {raw:?}: {o:?}");
+            let o = query(
+                &mut s,
+                &ins(id_txt),
+                declared,
+                &[0],
+                &[Some(text.as_bytes())],
+            );
+            assert!(o.is_ok(), "text insert {text}: {o:?}");
+            let mut by = |id: i32| {
+                query(
+                    &mut s,
+                    &format!("SELECT iv FROM t WHERE id = {id} LIMIT 1"),
+                    &[],
+                    &[],
+                    &[],
+                )
+            };
+            assert_eq!(by(id_bin), by(id_txt), "raw {raw:?}");
+        }
+    }
+    let before = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
+    let ins =
+        "INSERT INTO t (id, embedding, iv) VALUES (900, '[0,1]', $1) USING OPERATION_ID 'iv-bad'";
+    for bad in [&[0u8; 15][..], &[0u8; 17][..], &[][..]] {
+        let o = query(&mut s, ins, &[1186], &[1], &[Some(bad)]);
+        expect_err(o, "08P01", &mut s);
+    }
+    // ±infinity 番兵は 22008。
+    for bad in [
+        bin(i64::MAX, i32::MAX, i32::MAX),
+        bin(i64::MIN, i32::MIN, i32::MIN),
+    ] {
+        let o = query(&mut s, ins, &[1186], &[1], &[Some(&bad)]);
+        expect_err(o, "22008", &mut s);
+    }
+    // 宣言 OID 不一致のバイナリは 0A000。
+    for declared in [20, 1083, 25] {
+        let o = query(&mut s, ins, &[declared], &[1], &[Some(&bin(0, 0, 0))]);
         expect_err(o, "0A000", &mut s);
     }
     let after = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
