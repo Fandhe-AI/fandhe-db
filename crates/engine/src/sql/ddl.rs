@@ -138,6 +138,11 @@ pub(crate) fn execute_create_table(
             }
         }
     }
+    // 解決後の列型に対して `COLLATE` の適用可否を判定する（TABLE-28・Issue #1609。
+    // ENUM 解決後の型で判定するため、未登録 ENUM の `42704` が `42804` より先になる）。
+    for column in &columns {
+        check_column_collation(&column.ty, column.collation)?;
+    }
     // 解決後の列型に対して DEFAULT を束縛検証する（ENUM の語彙外・DATE/NUMERIC の
     // 不正リテラル等を永続化前に SQLSTATE 付きで拒否する）。
     for column in &columns {
@@ -401,11 +406,13 @@ pub(crate) fn execute_alter_table_add_column(
         Err(other) => return Err(map_add_column_error(other)),
     }
     let ty = resolve_column_type(storage, &stmt.column_type, limits)?;
+    check_column_collation(&ty, stmt.collation)?;
     let default = match &stmt.default {
         None => None,
         Some(literal) => Some(add_column_default(&stmt.column_name, &ty, literal)?),
     };
     let mut column = ColumnDef::new(stmt.column_name.clone(), ty, !stmt.not_null);
+    column.collation = stmt.collation;
     if let Some(default) = default {
         // 束縛できない DEFAULT（範囲外・桁数超過等）は永続化前に SQLSTATE 付きで拒否する
         // （既存行の読み出し時補完が常に失敗する状態をカタログへ残さない）。
@@ -780,8 +787,14 @@ pub(crate) fn execute_alter_table_alter_column_type(
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     ensure_table_exists(storage, &stmt.table_name)?;
     let target = resolve_alter_target_type(storage, &stmt.column_type, limits)?;
+    check_column_collation(&target, stmt.collation)?;
     storage
-        .alter_table_alter_column_type(&stmt.table_name, &stmt.column_name, &target)
+        .alter_table_alter_column_type_collated(
+            &stmt.table_name,
+            &stmt.column_name,
+            &target,
+            stmt.collation,
+        )
         .map_err(|e| match e {
             AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
                 undefined_table_or_view(storage, &stmt.table_name)
@@ -796,6 +809,27 @@ pub(crate) fn execute_alter_table_alter_column_type(
             column_name: stmt.column_name.clone(),
         },
     })
+}
+
+/// 列定義の `COLLATE` が列型に付けられるかを判定する（TABLE-28・Issue #1609）。照合を
+/// 持てるのは文字列系（`TEXT`／`VARCHAR`／`CHAR`）だけで、それ以外のスカラー型は `42804`、
+/// 配列は `0A000`（対象外）。照合名の解決（`42704`）は構文段で済んでいるため、判定順は
+/// 名前 → 型になる。`CREATE TABLE`・`ADD COLUMN`・`ALTER COLUMN TYPE` の実行段が共有する。
+fn check_column_collation(
+    ty: &ColumnType,
+    collation: Option<crate::collation::Collation>,
+) -> Result<(), SqlSurfaceError> {
+    if collation.is_none() || crate::collation::is_collatable(ty) {
+        return Ok(());
+    }
+    if matches!(ty, ColumnType::Array(_)) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "COLLATE on an array column is not supported".to_string(),
+        });
+    }
+    Err(SqlSurfaceError::datatype_mismatch(
+        "collations are not supported by this column type",
+    ))
 }
 
 /// 対象テーブルの存在確認（不在なら `42P01`／`42809`）。読み出し失敗は
