@@ -86,7 +86,7 @@ PostgreSQL の Bind 規則に従う。
 | `Scalar{ty: Text}` | text（25） | 対応（UTF-8 生バイト） |
 | `Scalar{ty: Integer／BigInt／Real／Double／Boolean／Bytea／Uuid}` | int4／int8／float4／float8／bool／bytea／uuid | 対応（Issue #1172。PostgreSQL の send 形式） |
 | `Scalar{ty: Numeric}` | numeric（1700） | 対応（Issue #2442。`numeric_send` 形式。`dscale` はセルの実 scale） |
-| `Scalar{ty: Date／Timestamp／Json／Jsonb／Array／Enum}` | numeric／date／timestamp／json／jsonb／text | **非対応 → `0A000`** |
+| `Scalar{ty: Date／Timestamp／Json／Jsonb／Array／Enum}` | date／timestamp／json／jsonb／text | **非対応 → `0A000`** |
 | `Scalar{ty: Vector(_)}` | text（25） | **非対応 → `0A000`**（詳細は WIRE-14 参照） |
 | `ColumnMeta::Computed{ty: Some(t)}` | `t` の写像（Issue #1407。集計・式列・ウィンドウ関数の結果列） | `t` が対応型（`Integer／BigInt／Real／Double／Boolean／Text／Numeric`）なら対応、非対応型なら **`0A000`** |
 | `ColumnMeta::Computed{ty: None}` | text（25） | **非対応 → `0A000`**（静的型を持たないベクトル式など。fail-closed。詳細は WIRE-14 参照） |
@@ -189,14 +189,15 @@ matches_legacy_encoder`）で固定している。シグネチャは
 - 型 OID 拡張（`BOOLEAN`／`REAL`／`DOUBLE PRECISION`／`DATE`／`TIMESTAMP`／
   `BYTEA`／`UUID`／`JSON`／`JSONB`）→ **Issue #895 で実施済み**
   （`docs/design/wire-type-oid-mapping.md` 参照）。数値・真偽値・
-  bytea・uuid のバイナリ対応は Issue #1172 で実施済み。`id`・`DATE`／`TIMESTAMP`／
-  `JSON`／`JSONB` は引き続き非対応。集計・式列・ウィンドウ関数の結果列は Issue #1407 で
+  bytea・uuid のバイナリ対応は Issue #1172 で実施済み。`id`・`NUMERIC` は Issue #2442
+  （結果）・#2443（パラメータ）で対応済み。`DATE`／`TIMESTAMP`／`JSON`／`JSONB` は引き続き非対応。集計・式列・ウィンドウ関数の結果列は Issue #1407 で
   対応（下記「Issue #1407 追記」）
 - 3 クライアントのバイナリ受信モードでの値一致（層 B）→ **Issue #1176 で実施済み**
   （`three_client_extended_e2e.rs`。psycopg・node pg でテキスト結果との一致を確認。
   psql は結果のバイナリ受信モードを持たず対象外。node pg はバイナリ DataRow を
   UTF-8 文字列として読むため 0x80 以上のバイトを含む値は検証対象外とし、
-  psycopg と層 A で担保する）
+  psycopg と層 A で担保する）。numeric の層 B は Issue #2445 で実施済み
+  （下記「Issue #2445 追記」）
 - カーソル（WIRE-15）→ #937
 
 ## Issue #1407 追記: 集計式・式列・ウィンドウ関数の結果列
@@ -239,7 +240,7 @@ matches_legacy_encoder`）で固定している。シグネチャは
 - **契約変更**: 以前は `0A000` で拒否されたバイナリ要求が成功する（後方互換の拡張）。
   非対応型（`DATE`／`TIMESTAMP`／`JSON`／`JSONB`／`VECTOR` など）の `0A000` は不変。
 - **対象外**: パラメータ側のバイナリ復号（#2443）、PostgreSQL 17 実機とのバイト列一致と
-  SQLSTATE 境界（#2444）、実クライアントでの値一致の正例（#2445）。パラメータ側の `numeric`
+  SQLSTATE 境界（#2444）、実クライアントでの値一致の正例（#2445。実施済み。下記）。パラメータ側の `numeric`
   は Issue #2443 で対応した（下記）。
 
 ## Issue #2443 追記: numeric パラメータのバイナリ復号
@@ -294,3 +295,30 @@ matches_legacy_encoder`）で固定している。シグネチャは
   差分行は `INTENTIONAL_DIFFS` で管理し、PG17 との乖離を黙って増減させない。
 - **観測事項**: `u64::MAX` の id を持つ行が表にあると、`WHERE id = ..` の比較は `22003`
   （厳密比較できる範囲外）になる。そのため `u64::MAX` は専用表 `numid` に置いて検証した。
+
+## Issue #2445 追記: numeric の層 B（実クライアントでの値一致）と非対応型一覧の更新
+
+- **対象**（WIRE-14・WIRE-26・TABLE-13 のポインタ）: `three_client_extended_e2e.rs` の
+  `psycopg_and_pg_numeric_binary_results_match_text_results`（結果列・`id`・`SUM`／`AVG`・
+  `SUM(BIGINT)` のバイナリ受信）と `psycopg_and_pg_numeric_binary_params_match_text_params`
+  （`NUMERIC` 列・`id` スロットへのバイナリパラメータの読み取り・INSERT・不正値の拒否）。
+  psql のテキスト出力を値の独立オラクルとする。
+- **ドライバの型と比較方法**: psycopg は text／binary とも `Decimal`（`dscale` 保持）で、
+  型タグ込みの完全一致を取る。node pg は text が `string`、既定のバイナリ parser（pg-types 2.2.0
+  の 1700）が JS の `number` を返すため、型タグの差を別にアサートし、値部は文字列表記と
+  `f64` で比較する（`number` は double 精度。ドライバ側の仕様で本リポでは対処しない）。
+- **node pg のバイト制約**: バイナリ DataRow を UTF-8 で読む制約は numeric では
+  `weight >= 0` かつ各桁群の下位バイトが `< 0x80` を意味する（|値| < 1 の小数は
+  `weight = -1`〔`0xFFFF`〕で壊れる）。node 共通行は `3.14`・`-1.01`・`id = 20`・
+  `SUM(BIGINT) = 9000000000` に限り、常時実行ガード `node_numeric_fixture_bytes_are_utf8_safe` が
+  機械検証する。`0.50`・38 桁の値・`-12345678.90` は psycopg のみで検証する。
+- **パラメータの送り方**: psycopg の AUTO 形式は `Decimal` を text で送るため、公開 API
+  `conn.adapters.register_dumper(Decimal, DecimalBinaryDumper)` で登録し直してバイナリ（宣言 1700）にする。
+  node pg に numeric の Dumper は無く、`Buffer` は format 1・宣言 OID 0 で送られる。`numeric_send` の
+  バイト列は #2444 で PG17 と一致を確認済みのエンコーダで作り、JS で符号化を再実装しない。
+- **テナント境界**: bob のバイナリ集計・バイナリパラメータが tenant-a の Private 行を観測しない
+  ことを、alice では同じ問い合わせが引けること（非 vacuous）とあわせて確認した。
+- **現在の WIRE-14 非対応型一覧（`0A000`）**: `DATE`／`TIMESTAMP`／`JSON`／`JSONB`／配列／`ENUM`／
+  `VECTOR`／`Computed{ty: None}`（静的型を持たないベクトル式など）。numeric（`NUMERIC` 列・`id`・
+  numeric の集計結果）は含まない。
+- **検証環境**: psycopg 3.3.6（Python 3.14）・node 24 の `pg` 8.23.0・psql 18.6。

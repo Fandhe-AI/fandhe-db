@@ -26,9 +26,9 @@ wire 側（`crates/wire-server/src/extended_query.rs`）の Parse／Describe(S)�
   `float4`／`float8`／`bool`／`bytea`／`uuid` は PostgreSQL の受信形式で正規テキストへ復号して
   から `bind_prepared` へ渡す（Issue #1345・WIRE-14）。受理は推論スロット型と実効 OID（宣言が
   0 以外ならそれ、0 なら推論）の互換表（整数列は 23／20、`REAL` は 700、`DOUBLE` は 701、
-  `BOOLEAN` は 16、`BYTEA` は 17、`UUID` は 2950、`id` は宣言 23／20 のみ）に載る組み合わせに限り、
+  `BOOLEAN` は 16、`BYTEA` は 17、`UUID` は 2950、`NUMERIC` と `id` は宣言 0／1700〔Issue #2443・WIRE-26〕、`id` は宣言 23／20 も可）に載る組み合わせに限り、
   PostgreSQL の暗黙キャストより意図的に厳しい fail-closed とする。非対応スロット
-  （`NUMERIC`・日時・`JSON`・配列・`ENUM`・`VECTOR`・宣言 0 の `id` 等）への binary 指定は
+  （日時・`JSON`・配列・`ENUM`・`VECTOR`・別名付き `id`・計算列等。`NUMERIC` 列・`id` は numeric として受理）への binary 指定は
   `0A000`（Parse 時の `0A000` とは別の意味。WIRE-24 参照）、値の長さが固定長型の受信形式と合わなければ `08P01`（値は応答に含めない）。判定順は
   「全スロットの非対応判定（`0A000`）→ 復号（`08P01`）」で、復号後の値で保持量上限を判定する。
 - 値の形式不正（非 UTF-8・NUL）は `22P02` へ移行した（従来 `22000`）。NULL は #2439 で
@@ -328,7 +328,7 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
 - パラメータのバイナリ形式復号（WIRE-14）→ Issue #1345 で 7 型を実装済み。
 - `REAL`／`DOUBLE`／`NUMERIC`／`DATE`／`TIMESTAMP`／`UUID`／`BYTEA` 列への型付き `$n` 束縛
   → Issue #1406 で実装済み（上記「値の形式」参照）。バイナリは `REAL`／`DOUBLE`／`UUID`／
-  `BYTEA` のみ受理し、`NUMERIC`／`DATE`／`TIMESTAMP` は WIRE-14 どおり `0A000`、
+  `BYTEA` のみ受理し（当時。`NUMERIC` は Issue #2443 で受理）、`DATE`／`TIMESTAMP` は WIRE-14 どおり `0A000`、
   バイナリの `NaN`・`±Infinity` はリテラル形でも表現不能のため `22P02`。絶対値が非常に
   大きい浮動小数の `WHERE` 比較がリテラル形でも `22003` になる点は式評価側の既存挙動。
 - 非 text スロットで宣言 OID 0 のバイナリ値を UTF-8 恒等で受理していた点は Issue #1345 で
