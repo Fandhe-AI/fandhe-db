@@ -100,7 +100,10 @@
 //! - body の構造不正（NUL 終端欠落・余剰バイト・負の件数・非 UTF-8・種別バイト
 //!   不正）→ `08P01`
 //! - パラメータ型宣言の件数が上限（`MAX_PARAMS`）超過 → `54000`。プレースホルダ数
-//!   超過 → `08P01`（WIRE-12・#1171。宣言 OID 自体は受理し値検証には使わない）
+//!   超過 → `08P01`（WIRE-12・#1171）
+//! - Parse で宣言された型 OID が本 DB の持たない型（`WireType::ALL` に無い。負値・配列型を
+//!   含む）→ `0A000`。ErrorResponse 後は ignore-till-sync で同期回復し接続は維持する
+//!   （WIRE-24 (1)・WIRE-11・Issue #2438。判定は宣言 OID だけで決まりカタログに依存しない）
 //! - Bind のパラメータ format code の値不正（0/1 以外）・値数不一致 → `08P01`
 //! - SQL 検証失敗・実行時エラー → `engine::sql::allowlist::SqlSurfaceError::
 //!   error_class()`（簡易クエリと同一の分類）
@@ -474,15 +477,22 @@ pub(crate) struct ParamSlot {
 /// 文脈から推論するため、推論・公告は OID 0 と同じにする（Issue #2436）。
 const UNKNOWN_OID: i32 = 705;
 
-/// 宣言 OID を engine の宣言型へ写す（Issue #2436・WIRE-24 ポインタ）。0・unknown（705）・
-/// 未知／負の OID は `None`（推論へ倒す）。
-// TODO(#2438): 持たない型の OID は Parse 時に `0A000` で拒否する予定。現状は推論へ倒し、
-// ParameterDescription の echo とバイナリの扱いは従来のまま。
-fn declared_param_type_for_oid(oid: i32) -> Option<DeclaredParamType> {
+/// 本 DB が持たない型の OID（`WireType::ALL` に無いもの）を宣言した印
+/// （Issue #2438・WIRE-24 ポインタ）。[`HandlerError::UnsupportedParamType`] へ写す。
+#[derive(Debug, PartialEq, Eq)]
+struct UnsupportedOid;
+
+/// 宣言 OID を engine の宣言型へ写す（Issue #2436・#2438・WIRE-24 ポインタ）。
+/// 0・unknown（705）は `Ok(None)`（宣言なしとして推論）、持つ型は `Ok(Some(宣言型))`、
+/// それ以外（未知・負・配列型の OID）は `Err(UnsupportedOid)`（fail-closed）。
+/// 「持つ型」の判定元は `WireType::ALL`（`from_oid`）のみで、第 2 の表は作らない。
+fn declared_param_type_for_oid(oid: i32) -> Result<Option<DeclaredParamType>, UnsupportedOid> {
     if oid == 0 || oid == UNKNOWN_OID {
-        return None;
+        return Ok(None);
     }
-    result_encoder::WireType::from_oid(oid).map(result_encoder::WireType::declared_param_type)
+    result_encoder::WireType::from_oid(oid)
+        .map(|ty| Some(ty.declared_param_type()))
+        .ok_or(UnsupportedOid)
 }
 
 /// 宣言 OID のうち、text 系スロットへバイナリ（UTF-8 バイト恒等）を許す型。
@@ -1099,6 +1109,11 @@ enum HandlerError {
     /// Parse の宣言型件数が SQL 中のプレースホルダ数を超える（`08P01`。
     /// PostgreSQL は受理するが、本実装は fail-closed に拒否する逸脱）。
     DeclaredParamTypesExceedPlaceholders,
+    /// Parse が本 DB の持たない型の OID を宣言した（`0A000`。WIRE-24 (1)・Issue #2438）。
+    /// `index` は 1 始まりの `$n` 番号で、OID の値・表名・テナントは含めない。
+    UnsupportedParamType {
+        index: usize,
+    },
     /// Bind のパラメータ format code が 0・1 以外（`08P01`）。
     InvalidParamFormatCode,
     /// 対象が未定義のステートメント名。
@@ -1179,6 +1194,7 @@ impl HandlerError {
             HandlerError::PortalStore(_) => ErrorClass::PayloadTooLarge,
             HandlerError::TooManyParams => ErrorClass::PayloadTooLarge,
             HandlerError::DeclaredParamTypesExceedPlaceholders => ErrorClass::ProtocolViolation,
+            HandlerError::UnsupportedParamType { .. } => ErrorClass::FeatureNotSupported,
             HandlerError::InvalidParamFormatCode => ErrorClass::ProtocolViolation,
             HandlerError::UnknownStatement => ErrorClass::ProtocolViolation,
             HandlerError::UnknownPortal => ErrorClass::ProtocolViolation,
@@ -1239,6 +1255,9 @@ impl HandlerError {
             HandlerError::DeclaredParamTypesExceedPlaceholders => {
                 "Parse declares more parameter types than the statement has placeholders"
                     .to_string()
+            }
+            HandlerError::UnsupportedParamType { index } => {
+                format!("parameter ${index} declares a type OID that is not supported")
             }
             HandlerError::InvalidParamFormatCode => {
                 "parameter format code must be 0 (text) or 1 (binary)".to_string()
@@ -1458,10 +1477,21 @@ fn handle_parse_body(
     } else {
         // 宣言 OID は件数上限（`MAX_PARAMS`）検証済みの長さでだけ復号・写像する。
         let declared_oids = decode_declared_oids(&msg.param_oid_bytes);
-        let declared_types: Vec<Option<DeclaredParamType>> = declared_oids
-            .iter()
-            .map(|oid| declared_param_type_for_oid(*oid))
-            .collect();
+        // 持たない型の OID は engine の parse より前に `0A000` で拒否する（判定は宣言 OID だけで
+        // 決まり、カタログ・テナントに依存しない。Issue #2438）。
+        let mut declared_types: Vec<Option<DeclaredParamType>> =
+            Vec::with_capacity(declared_oids.len());
+        for (i, oid) in declared_oids.iter().enumerate() {
+            match declared_param_type_for_oid(*oid) {
+                Ok(ty) => declared_types.push(ty),
+                Err(UnsupportedOid) => {
+                    let index = i.checked_add(1).ok_or_else(|| {
+                        HandlerError::Internal("param index overflow".to_string())
+                    })?;
+                    return Err(HandlerError::UnsupportedParamType { index });
+                }
+            }
+        }
         // Parse 時の定数畳み込み（`AT LOCAL`・ゾーン無し `TIMESTAMPTZ '…'`）も接続の TimeZone で
         // 行い、簡易クエリと挙動を揃える（Issue #1576 レビュー指摘）。
         let prepared = {
@@ -3229,13 +3259,26 @@ mod tests {
     #[test]
     fn declared_oid_maps_to_declared_param_type() {
         use engine::sql::params::DeclaredParamType as D;
-        assert_eq!(declared_param_type_for_oid(0), None);
-        assert_eq!(declared_param_type_for_oid(UNKNOWN_OID), None);
-        assert_eq!(declared_param_type_for_oid(25), Some(D::Text));
-        assert_eq!(declared_param_type_for_oid(23), Some(D::Int4));
-        assert_eq!(declared_param_type_for_oid(1700), Some(D::Numeric));
-        assert_eq!(declared_param_type_for_oid(99_999), None);
-        assert_eq!(declared_param_type_for_oid(-5), None);
+        assert_eq!(declared_param_type_for_oid(0), Ok(None));
+        assert_eq!(declared_param_type_for_oid(UNKNOWN_OID), Ok(None));
+        assert_eq!(declared_param_type_for_oid(25), Ok(Some(D::Text)));
+        assert_eq!(declared_param_type_for_oid(23), Ok(Some(D::Int4)));
+        assert_eq!(declared_param_type_for_oid(1700), Ok(Some(D::Numeric)));
+        // 持たない型は Issue #2438 で推論から拒否（`0A000`）へ変更された。
+        for oid in [99_999, -5, -1, i32::MIN, 1007] {
+            assert_eq!(
+                declared_param_type_for_oid(oid),
+                Err(UnsupportedOid),
+                "{oid}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_param_type_is_feature_not_supported() {
+        let e = HandlerError::UnsupportedParamType { index: 2 };
+        assert!(matches!(e.error_class(), ErrorClass::FeatureNotSupported));
+        assert!(e.message().contains("$2"));
     }
 
     #[test]

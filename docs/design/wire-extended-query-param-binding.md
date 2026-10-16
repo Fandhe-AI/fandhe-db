@@ -19,7 +19,7 @@ wire 側（`crates/wire-server/src/extended_query.rs`）の Parse／Describe(S)�
   `VectorText`、`USING PLAN($n)`／`USING OPERATION_ID $n` は `Text`、`WHERE <列> = $n`
   ・`INSERT` の行内 ordinal は当該列の型、未参照番号は `Text`）で補う。
   pgjdbc が文字列に varchar（1043）を宣言する点を踏まえ、宣言 OID の不一致は拒否しない。
-  （この 2 点は WIRE-24 の確定〔#2436〜#2438〕をもって、後述「Parse の型 OID 指定時の判定規則」（WIRE-24 ポインタ）で置き換える予定）
+  （この 2 点は WIRE-24 の確定〔#2436〜#2438〕で、後述「Parse の型 OID 指定時の判定規則」（WIRE-24 ポインタ）へ置き換え済み）
 - 宣言件数がプレースホルダ数を超える Parse は `08P01`（PostgreSQL は受理するが、
   fail-closed な逸脱）。
 - Bind: 値数が要求数と異なれば `08P01`。パラメータ format code は 0・1 以外を `08P01`。
@@ -238,8 +238,23 @@ prepared_params.rs` で固定）。
   `EngineCore::parse_sql_prepared_with_declared` へ渡す。既存の `parse_sql_prepared` は宣言なしの
   薄いラッパー。`PreparedSql::declared_param_types` が宣言型を、`param_types` が推論型を、
   並べて保持する（上書きしない。#2437 が両方を見て変換可否を判定する）。
-- 0 と unknown（705）は宣言なしとして推論・公告する。持たない型の OID も現状は推論へ倒す
-  （公告の echo とバイナリの扱いは従来のまま。#2438 が Parse 時の `0A000` に置き換える）。
+- 0 と unknown（705）は宣言なしとして推論・公告する。
+- 持たない型の OID（#2438 の決定。WIRE-24 (1)・WIRE-11・ERR-6 ポインタ）:
+  - 「持つ型」の判定元は `WireType::ALL`（`WireType::from_oid`）のみ。第 2 の表は作らない。
+    それ以外の OID（負値・配列型・存在しない OID を含む）は Parse で `0A000`
+    （`HandlerError::UnsupportedParamType`。message は `$n` 番号のみで OID の値・表名・テナントを含めない）。
+    新しい `wire_code` は追加しない。
+  - 判定位置と順序: `25P02`（Failed トランザクション）→ 宣言件数上限 `54000` → 空文 + 宣言の
+    `08P01` → **持たない型の `0A000`（OID 復号の直後・engine の parse より前）** → engine の parse
+    （`42601`・`42P18` 等）→ 過剰宣言の `08P01`。判定が宣言 OID だけで決まるためカタログに依存せず、
+    他テナントの表の存在を観測できない。推論不能位置が `42P18` に化ける経路も塞ぐ。
+  - 回復: 既存の ignore-till-sync に乗り、接続は維持する。拒否した Parse は statement を保存せず、
+    同名の既存 statement も変更しない。
+  - 既知の PostgreSQL 差分: 構文エラー文に持たない型の OID がある場合、PostgreSQL は構文エラーを
+    先に返すが本実装は `0A000` を先に返す。過剰宣言位置の持たない型も `0A000`（`08P01` より先）。
+    存在しない型 OID も `0A000` に統一する。
+  - クライアント影響: 配列型 OID を宣言するドライバ（例: 配列パラメータ）は Parse で `0A000` になる。
+    スカラーの主要 OID と、OID 0 を送るクライアントは影響しない。確認は #2440 へ申し送る。
 - スロット型: 推論型がある位置は推論型のまま。推論型が無い位置（式内の全出現が推論不能・
   未参照番号）は宣言型を `PreparedParamType::Declared` としてスロット型にし、`42P18` を返さない。
   式の中で扱えない宣言型（`BOOLEAN`・日時・`NUMERIC` 等）は推論時と同じ `0A000`。
