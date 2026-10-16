@@ -313,6 +313,16 @@ impl<'a> Item<'a> {
         }
     }
 
+    /// 複製すると新たに確保されるバイト数（借用の文字列・参照は 0）。複製前の予算課金に使う。
+    fn owned_bytes(&self) -> u64 {
+        let n = match self {
+            Item::Str(Cow::Owned(t)) => t.len(),
+            Item::Num(JsonNumber::Float { text, .. }) => text.len(),
+            _ => 0,
+        };
+        u64::try_from(n).unwrap_or(u64::MAX)
+    }
+
     fn array_elems(&self) -> Option<&'a [JsonValue]> {
         match self {
             Item::Ref(JsonValue::Array(v)) => Some(v.as_slice()),
@@ -538,6 +548,17 @@ impl<'a> Ev<'a> {
         Ok(())
     }
 
+    /// 項目の複製。所有バイト分を累積バイト予算へ課金してから複製する（超過は `54000`）。
+    fn dup(&mut self, it: &Item<'a>) -> R<Item<'a>> {
+        self.charge_bytes(it.owned_bytes())?;
+        Ok(it.clone())
+    }
+
+    /// 文字列を走査・変換する処理の前に、入力バイト数に比例したステップを課金する。
+    fn charge_scan(&mut self, len: usize) -> R<()> {
+        self.tick(scan_steps(len))
+    }
+
     fn enter(&mut self) -> R<()> {
         self.tick(1)?;
         if self.depth >= self.max_depth {
@@ -657,11 +678,12 @@ impl<'a> Ev<'a> {
             };
             let is_container = v.is_container();
             if level >= first || (first == u32::MAX && last == u32::MAX && !is_container) {
+                let dv = self.dup(&v)?;
                 let saved = self.ignore_structural;
                 if ignore_structural {
                     self.ignore_structural = true;
                 }
-                let r = self.apply(ap, v.clone(), unwrap_next, found.as_deref_mut());
+                let r = self.apply(ap, dv, unwrap_next, found.as_deref_mut());
                 self.ignore_structural = saved;
                 res = r?;
                 if res == Res::Ok && found.is_none() {
@@ -749,6 +771,7 @@ impl<'a> Ev<'a> {
             PathNode::Root => self.exec_chain(next, Item::Ref(self.root), lax, found),
             PathNode::Current => {
                 let cur = self.current.clone();
+                self.charge_bytes(cur.owned_bytes())?;
                 self.exec_chain(next, cur, lax, found)
             }
             PathNode::Last => {
@@ -925,7 +948,8 @@ impl<'a> Ev<'a> {
         if jb.is_array() {
             self.exec_any(Apply::Chain(next), jb, found, 1, 1, false, lax)
         } else if lax {
-            self.exec_chain(next, jb.clone(), lax, found)
+            let dj = self.dup(jb)?;
+            self.exec_chain(next, dj, lax, found)
         } else if !self.ignore_structural {
             Err(self.soft(JsonPathEvalError::ArrayNotFound))
         } else {
@@ -980,7 +1004,8 @@ impl<'a> Ev<'a> {
         if first == 0 {
             let saved = self.ignore_structural;
             self.ignore_structural = true;
-            let r = self.exec_chain(next, jb.clone(), lax, found.as_deref_mut());
+            let dj = self.dup(jb)?;
+            let r = self.exec_chain(next, dj, lax, found.as_deref_mut());
             self.ignore_structural = saved;
             match r {
                 Ok(x) => res = x,
@@ -1018,7 +1043,8 @@ impl<'a> Ev<'a> {
             Ok(Res::NotFound)
         } else {
             let lax = self.lax;
-            self.exec_chain(next, jb.clone(), lax, found)
+            let dj = self.dup(jb)?;
+            self.exec_chain(next, dj, lax, found)
         }
     }
 
@@ -1053,7 +1079,7 @@ impl<'a> Ev<'a> {
             while index <= to {
                 self.tick(1)?;
                 let v = match elems {
-                    None => jb.clone(),
+                    None => self.dup(jb)?,
                     Some(e) => match usize::try_from(index).ok().and_then(|i| e.get(i)) {
                         Some(x) => Item::Ref(x),
                         None => {
@@ -1293,6 +1319,21 @@ impl<'a> Ev<'a> {
     /// 値を 1 つ返す項目メソッド（配列展開・`.keyvalue()` 以外）。
     #[inline(never)]
     fn apply_value_method(&mut self, m: &'a Method, jb: &Item<'a>) -> R<Item<'a>> {
+        // 文字列を走査・変換するメソッドは、変換の前に入力バイト数に比例して課金する。
+        if let Some(t) = jb.str() {
+            if matches!(
+                m,
+                Method::Double
+                    | Method::BigInt
+                    | Method::Integer
+                    | Method::Number
+                    | Method::Decimal { .. }
+                    | Method::Boolean
+                    | Method::String
+            ) {
+                self.charge_scan(t.len())?;
+            }
+        }
         match m {
             Method::Abs | Method::Floor | Method::Ceiling => {
                 let Some(n) = jb.num() else {
@@ -1306,6 +1347,7 @@ impl<'a> Ev<'a> {
                 match jb.kind() {
                     Kind::Num => match jb.num() {
                         Some(n) if n.as_f64().is_finite() && !underflows(n) => {
+                            self.charge_number(n)?;
                             Ok(Item::Num(n.clone()))
                         }
                         _ => Err(self.soft(JsonPathEvalError::NonNumericItem)),
@@ -1401,6 +1443,9 @@ impl<'a> Ev<'a> {
                     Ok(Item::Str(Cow::Borrowed(if b { "true" } else { "false" })))
                 }
                 Kind::Num => {
+                    if let Some(n) = jb.num() {
+                        self.charge_number(n)?;
+                    }
                     let text = jb.num().map(number_text).unwrap_or_default();
                     Ok(Item::Str(Cow::Owned(text)))
                 }
@@ -1414,6 +1459,7 @@ impl<'a> Ev<'a> {
     fn numeric_method(&mut self, m: &Method, n: &JsonNumber) -> R<Item<'a>> {
         if let Method::Abs = m {
             // 巨大な値でも壊れないよう、符号の除去は桁文字列のまま行う。
+            self.charge_number(n)?;
             return Ok(Item::Num(match n {
                 JsonNumber::PosInt(v) => JsonNumber::PosInt(*v),
                 JsonNumber::NegInt(v) => JsonNumber::PosInt(v.unsigned_abs()),
@@ -1515,11 +1561,17 @@ impl<'a> Ev<'a> {
                 return Ok(Res::Ok);
             }
             let out = match op {
-                UnaryOp::Plus => n.clone(),
+                UnaryOp::Plus => {
+                    self.charge_number(n)?;
+                    n.clone()
+                }
                 UnaryOp::Minus => match num::from_json_number(n).and_then(|d| num::neg(&d).ok()) {
                     Some(d) => num::to_json_number(d),
                     // 表現範囲外の巨大な値は、綴りの符号だけを反転する。
-                    None => negate_text(n),
+                    None => {
+                        self.charge_number(n)?;
+                        negate_text(n)
+                    }
                 },
             };
             let r = self.exec_chain(next, Item::Num(out), lax, found.as_deref_mut())?;
@@ -1690,7 +1742,8 @@ impl<'a> Ev<'a> {
     /// `executeNestedBoolItem`: フィルタ内の述語。`@` を差し替える（lax の構造エラー抑止は
     /// フィルタ内でも有効）。
     fn exec_nested_bool(&mut self, pred: &'a PathNode, jb: &Item<'a>) -> R<Tri> {
-        let saved_current = std::mem::replace(&mut self.current, jb.clone());
+        let dj = self.dup(jb)?;
+        let saved_current = std::mem::replace(&mut self.current, dj);
         let r = self.exec_bool(pred, jb);
         self.current = saved_current;
         r
@@ -1906,11 +1959,14 @@ const STR_SCAN_BYTES_PER_STEP: usize = 64;
 /// `pair_loop` から呼ばれ、巨大文字列の大量比較による処理量の爆発を上限エラーに倒す。
 fn pair_scan_steps(l: &Item<'_>, r: &Item<'_>) -> u64 {
     match (l.str(), r.str()) {
-        (Some(a), Some(b)) => {
-            u64::try_from(a.len().min(b.len()) / STR_SCAN_BYTES_PER_STEP).unwrap_or(u64::MAX)
-        }
+        (Some(a), Some(b)) => scan_steps(a.len().min(b.len())),
         _ => 0,
     }
+}
+
+/// 長さ `len` バイトの文字列を走査・変換するときの追加ステップ数。
+fn scan_steps(len: usize) -> u64 {
+    u64::try_from(len / STR_SCAN_BYTES_PER_STEP).unwrap_or(u64::MAX)
 }
 
 /// 比較の型クラス。数値・文字列・真偽値・null は同型どうしだけ比較でき、コンテナは
@@ -2231,6 +2287,10 @@ fn float8_to_number(f: f64) -> JsonNumber {
 
 /// `parse_bool_with_len` 相当: 一意に決まる接頭辞を受理する（空白は許さない）。
 fn parse_bool_text(s: &str) -> Option<bool> {
+    // 受理する最長の綴りは `false`（5 バイト）。それより長い入力は複製せずに拒否する。
+    if s.len() > 5 {
+        return None;
+    }
     let l = s.to_ascii_lowercase();
     let prefix_of = |word: &str| !l.is_empty() && word.starts_with(l.as_str());
     match l.as_bytes().first()? {

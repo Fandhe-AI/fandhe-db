@@ -1155,3 +1155,45 @@ fn string_comparison_is_charged_by_scanned_bytes() {
         Ok(1)
     );
 }
+
+/// lax の非配列への添字アクセスによる所有文字列の大量複製は、累積バイト予算で止まる（54000）。
+#[test]
+fn lax_subscript_duplication_is_byte_budgeted() {
+    let doc = format!(r#""{}""#, "a".repeat(1 << 16));
+    let subs = vec!["0"; 5_000].join(",");
+    // 後続に `.size()` を置き、複製が結果列に残らない形でも累積で課金されることを確かめる。
+    let path = format!("$.string()[{subs}].size()");
+    assert_eq!(
+        eval_with(&path, &doc, JsonPathLimits::default()),
+        Err(JsonPathEvalError::ResultTooLarge)
+    );
+    // 少数の添字なら成功する。
+    assert_eq!(
+        eval_with("$.string()[0,0]", &doc, JsonPathLimits::default()),
+        Ok(2)
+    );
+}
+
+/// 文字列の変換系メソッドは入力バイト数に比例してステップを課金され、述語内で大きな文字列を
+/// 繰り返し変換すると上限エラーになる。
+#[test]
+fn string_conversions_are_charged_by_input_bytes() {
+    let big = format!(r#"["{}"]"#, "1".repeat(1 << 16));
+    let small = r#"["1"]"#;
+    let limits = JsonPathLimits::new(500, 1024);
+    for path in [
+        "$[*] ? (@.number() > 0)",
+        "$[*] ? (@.double() > 0)",
+        "$[*] ? (@.bigint() > 0)",
+        "$[*] ? (@.decimal(5, 2) > 0)",
+        "$[*] ? (@.boolean() == true)",
+        "$[*] ? (@.string() == \"x\")",
+    ] {
+        assert!(eval_with(path, small, limits).is_ok(), "{path}");
+        assert_eq!(
+            eval_with(path, &big, limits),
+            Err(JsonPathEvalError::StepLimitExceeded),
+            "{path}"
+        );
+    }
+}
