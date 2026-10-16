@@ -369,7 +369,7 @@ fn connections_are_independent() {
 }
 
 #[test]
-fn copy_to_uses_the_session_time_zone() {
+fn copy_to_is_utc_fixed_regardless_of_session_time_zone() {
     let (core, _g) = new_core();
     let (mut s, _) = connect(spawn(&core), &[]);
     run(
@@ -384,7 +384,30 @@ fn copy_to_uses_the_session_time_zone() {
         .map(|(_, b)| String::from_utf8_lossy(b).to_string())
         .collect();
     assert_eq!(data.len(), 1);
-    assert!(data[0].contains("2026-01-01 09:00:00+09"), "{:?}", data[0]);
+    assert!(data[0].contains("2026-01-01 00:00:00+00"), "{:?}", data[0]);
+}
+
+/// エラー終了する複数文メッセージでもセッション復元後の TimeZone が通知される
+/// （ParameterStatus は RFQ の後に非同期通知として届く）。
+#[test]
+fn error_terminated_multi_statement_message_still_notifies_restored_value() {
+    let (core, _g) = new_core();
+    let (mut s, _) = connect(spawn(&core), &[]);
+    run(&mut s, "BEGIN");
+    run(&mut s, "SET TIME ZONE 'Asia/Tokyo'");
+    let msgs = run(&mut s, "ROLLBACK; SELECT id FROM missing LIMIT 1");
+    assert!(msgs.iter().any(|(t, _)| *t == b'E'), "{}", types(&msgs));
+    let mut reported = msgs
+        .iter()
+        .filter(|(t, _)| *t == b'S')
+        .map(|(_, b)| parse_param_status(b).1)
+        .collect::<Vec<_>>();
+    if reported.is_empty() {
+        let (t, body) = read_msg(&mut s);
+        assert_eq!(t, b'S');
+        reported.push(parse_param_status(&body).1);
+    }
+    assert_eq!(reported.last().map(String::as_str), Some("UTC"));
 }
 
 /// 読み取りが終端していることの回帰（ハーネスの健全性。未使用 import 警告も避ける）。

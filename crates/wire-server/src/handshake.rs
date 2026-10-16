@@ -317,6 +317,23 @@ pub(crate) fn ready_for_query_frames(
     out
 }
 
+/// 通知済みの TimeZone と現在値が異なるときだけ単独の ParameterStatus を送る。
+/// 簡易クエリのエラー・空クエリ経路は通知なしの RFQ を書くため、セッション復元
+/// （`ROLLBACK` 等）後の値をメッセージ処理の終端で補正する（ParameterStatus は
+/// 非同期に送出可能なメッセージ。TABLE-33・Issue #1575）。
+fn sync_time_zone_status<S: WireStream>(
+    stream: &mut S,
+    session: &engine::sql::mode::SessionState,
+    txn: &mut engine::sql::transaction::SessionTransaction<'_>,
+) -> Result<()> {
+    let current = session.time_zone().display();
+    if txn.reported_time_zone() != Some(current) {
+        write_parameter_status(stream, "TimeZone", current)?;
+        txn.set_reported_time_zone(current);
+    }
+    Ok(())
+}
+
 /// [`ready_for_query_frames`] をストリームへ書く（`crate::simple_query`／`crate::copy` が
 /// 成功応答の終端で使う）。
 pub(crate) fn write_ready_for_query_synced_io<S: WireStream>(
@@ -719,7 +736,13 @@ fn post_auth_loop<'e, S: WireStream>(
                         match crate::simple_query::execute_and_respond(
                             stream, engine, ctx, session, txn, text,
                         )? {
-                            crate::extended_query::LoopSignal::Continue => {}
+                            crate::extended_query::LoopSignal::Continue => {
+                                // エラー応答・空クエリ・COPY 失敗など RFQ が通知なしで
+                                // 送られた経路の取りこぼしを、メッセージ処理後の
+                                // 現在値比較で補う（成功経路は通知済みのため no-op。
+                                // TABLE-33・Issue #1575）。
+                                sync_time_zone_status(stream, session, txn)?;
+                            }
                             crate::extended_query::LoopSignal::Closed => return Ok(()),
                         }
                     }

@@ -660,9 +660,13 @@ enum PortalBody {
 /// portal が保持する未送出行と、完了時に使う `CommandComplete` タグの組み立て
 /// 方（[`crate::simple_query::TagShape`]）。
 struct PortalRows {
-    /// 未送出の `DataRow` フレーム（`max_rows` ごとに任意の境界で分割送出する
-    /// ため、行単位で個別フレームとして保持する）。
-    frames: std::collections::VecDeque<Vec<u8>>,
+    /// 未送出の行（値）と、中断時点のエンコード済みバイト数（保持上限の会計用）。
+    /// `max_rows` ごとに任意の境界で分割送出するため行単位で保持し、`DataRow` への
+    /// 整形は送出時の現在のセッション TimeZone で行う（中断中の `SET TIME ZONE` を
+    /// 再開後の送出へ反映する。TABLE-33・Issue #1575）。
+    frames: std::collections::VecDeque<(engine::sql::exec::ResultRow, usize)>,
+    /// 保持行の列メタ（送出時の整形に使う）。
+    columns: Vec<ColumnMeta>,
     shape: crate::simple_query::TagShape,
     /// この portal がこれまでの Execute 呼び出し（今回分を含まない）で
     /// 既に送出済みの行数。完了時の `CommandComplete` タグは PostgreSQL の
@@ -894,7 +898,7 @@ impl PortalStore {
                 PortalState::Suspended(rows) => rows
                     .frames
                     .iter()
-                    .map(Vec::len)
+                    .map(|(_, len)| *len)
                     .fold(0usize, |acc, len| acc.saturating_add(len)),
                 PortalState::Ready | PortalState::Done { .. } | PortalState::Failed => 0,
             })
@@ -2107,7 +2111,7 @@ fn execute_portal<'e, S: WireStream>(
                         if session_total > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION {
                             return Err(commit_wrap(HandlerError::SuspendedBytesExceeded));
                         }
-                        frames.push_back(frame);
+                        frames.push_back((row.clone(), frame.len()));
                     }
 
                     // 中断保持分の検査を通過した後で初めて `take` 分の送出へ移る。
@@ -2179,6 +2183,7 @@ fn execute_portal<'e, S: WireStream>(
                         .ok_or(HandlerError::UnknownPortal)?;
                     portal.state = PortalState::Suspended(PortalRows {
                         frames,
+                        columns: result.columns.clone(),
                         shape,
                         sent_so_far: take,
                         committed: is_write_statement,
@@ -2274,13 +2279,23 @@ fn execute_portal<'e, S: WireStream>(
             (max_rows as usize).min(total)
         };
 
-        let hint: usize = rows.frames.iter().take(take).map(Vec::len).sum();
+        let hint: usize = rows.frames.iter().take(take).map(|(_, len)| *len).sum();
         let mut buffer = crate::response_buffer::ResponseBuffer::with_capacity_hint(
             MAX_RESPONSE_BUFFER_BYTES,
             hint,
         );
         for _ in 0..take {
-            if let Some(frame) = rows.frames.pop_front() {
+            if let Some((row, _)) = rows.frames.pop_front() {
+                // 送出時点のセッション TimeZone で整形する（中断中の変更を反映）。
+                let mut frame = Vec::new();
+                result_encoder::encode_data_row_into_with_columns_in_tz(
+                    &row,
+                    &rows.columns,
+                    &portal.result_formats,
+                    &mut frame,
+                    session.time_zone(),
+                )
+                .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
                 buffer
                     .push_frame(stream, &frame)
                     .map_err(|e| commit_wrap(io_to_handler(e)))?;

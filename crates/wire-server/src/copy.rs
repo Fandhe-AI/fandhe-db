@@ -343,7 +343,9 @@ fn run_copy_to<S: WireStream>(
             &result.columns,
             row,
             buffer.as_mut_vec(),
-            conn_session.time_zone(),
+            // COPY TO は往復契約（COPY FROM の `parse_numeric_offset` は時 0〜15 のみ受理）の
+            // ため、セッション TimeZone に依らず UTC 固定で出力する（Issue #1575）。
+            &engine::datetime::SessionTimeZone::utc(),
         )
         .is_err()
         {
