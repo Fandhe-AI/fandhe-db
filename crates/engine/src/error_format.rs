@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 60;
+    count = 61;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -206,6 +206,10 @@ define_error_classes! {
     /// 拒否（[`crate::json::jsonpath::JsonPathParseError::UnsupportedUnicodeEscape`]。Issue #2185）。
     /// SQL 表層専用で NoSQL の `op` 語彙からは到達しない。
     UntranslatableCharacter => ("22P05", "UNTRANSLATABLE_CHARACTER"),
+    /// バイナリ形式の外部表現が不正（`22P03`）。wire-server の Bind が受ける numeric
+    /// パラメータのバイナリ復号（符号・`dscale`・桁群の不正。WIRE-26・TASK-339・Issue #2443）で
+    /// 発生する。SQL 表層（拡張クエリ）専用で NoSQL の `op` 語彙からは到達しない。
+    InvalidBinaryRepresentation => ("22P03", "INVALID_BINARY_REPRESENTATION"),
     /// 明示トランザクション（SQL-31・TASK-221）内で発生した一般的な状態不整合
     /// （`25000`）。同一トランザクション内での `operation_id` 再利用など、他の
     /// より具体的な分類に属さないトランザクション状態エラーに使う。
