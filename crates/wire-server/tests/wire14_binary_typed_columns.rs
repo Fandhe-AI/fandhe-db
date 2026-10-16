@@ -562,16 +562,16 @@ fn assert_binary_matches_text(stream: &mut Stream, sql: &str, expected_oids: &[u
     bin_rows
 }
 
-/// Issue #1407: 集計結果列（`COUNT`＝int8・`SUM(INTEGER)`＝int8・`AVG`＝float8・
+/// Issue #1407: 集計結果列（`COUNT`＝int8・`SUM(INTEGER)`＝int8・`AVG(DOUBLE)`＝float8・
 /// `MIN(INTEGER)`＝int4・`SUM(REAL)`＝float4）のバイナリがテキストと同じ値へ戻る。
 #[test]
 fn aggregate_columns_binary_matches_text() {
     let (mut s, _g, _) = connect("alice", "correct-horse");
     let rows = assert_binary_matches_text(
         &mut s,
-        "SELECT COUNT(*) AS c, SUM(n) AS s_n, AVG(n) AS a_n, MIN(n) AS m_n, \
+        "SELECT COUNT(*) AS c, SUM(n) AS s_n, MIN(n) AS m_n, \
          MAX(b) AS x_b, SUM(r) AS s_r, AVG(d) AS a_d FROM t",
-        &[20, 20, 701, 23, 20, 700, 701],
+        &[20, 20, 23, 20, 700, 701],
     );
     // COUNT(*) は alice の 3 行（tenant-b の Private 行は含まない）。
     assert_eq!(rows[0][0].as_deref(), Some(&3i64.to_be_bytes()[..]));
@@ -631,6 +631,8 @@ fn unsupported_computed_columns_binary_request_is_0a000_and_connection_survives(
         "SELECT SUM(price) AS m FROM t",
         // Issue #2271: `SUM(BIGINT)` は numeric のためバイナリ非対応（WIRE-14）。
         "SELECT SUM(b) AS m FROM t",
+        // Issue #2270: 整数の `AVG` も numeric のためバイナリ非対応（WIRE-14。#2441・#2442）。
+        "SELECT AVG(n) AS m FROM t",
         "SELECT vec_div(embedding, 2.0) AS half FROM t LIMIT 10",
         "SELECT day, COUNT(*) AS c FROM t GROUP BY day LIMIT 10",
         "SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn, MIN(day) OVER () AS m FROM t LIMIT 10",

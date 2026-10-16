@@ -699,7 +699,7 @@ fn sql_column_types_via_raw_wire(
 /// `JsonNumber` の 3 variant を、両表層が共有する Rust `Display` 経由の
 /// 10 進テキストへ揃える（`Cell::Integer`/`Cell::Float` の `to_string()`／
 /// `{f}` と同じ表現。整数値の浮動小数は小数点無しの表記になる——例えば
-/// `AVG(id)` の `2.0` は両表層とも `"2"` になる）。
+/// 浮動小数 `2.0` は両表層とも `"2"` になる）。
 fn format_json_number(n: &JsonNumber) -> String {
     match n {
         JsonNumber::PosInt(v) => v.to_string(),
@@ -870,9 +870,9 @@ const PARITY_CASES: &[ParityCase] = &[
         sql: "SELECT COUNT(*), SUM(id), AVG(id), MIN(lang), MAX(lang) FROM docs",
         json_body: r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"},{"fn":"sum","column":"id"},{"fn":"avg","column":"id"},{"fn":"min","column":"lang"},{"fn":"max","column":"lang"}]}"#,
         ordered: true,
-        expected_rows_alice: &[&["4", "17", "4.25", "en", "xx"]],
-        expected_rows_bob: &[&["4", "18", "4.5", "en", "ja"]],
-        expected_rows_carol: &[&["3", "6", "2", "en", "ja"]],
+        expected_rows_alice: &[&["4", "17", "4.2500000000000000", "en", "xx"]],
+        expected_rows_bob: &[&["4", "18", "4.5000000000000000", "en", "ja"]],
+        expected_rows_carol: &[&["3", "6", "2.0000000000000000", "en", "ja"]],
     },
     ParityCase {
         label: "agg2",

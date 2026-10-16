@@ -333,62 +333,107 @@ fn describe_reports_timestamp_and_date_types_for_time_functions() {
     ));
 }
 
+/// 書き込み文の実行補助。autocommit で 1 文実行し結果を返す。
+fn run(core: &EngineCore, sql: &str) -> Result<SqlOutcome, String> {
+    let ctx = ctx_for("tenant-a");
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(&ctx, &mut session, sql)
+        .map_err(|e| e.wire_code().to_string())
+}
+
+/// `SELECT <cols> FROM events WHERE id = <id>` の先頭行。
+fn row_of(core: &EngineCore, cols: &str, id: u64) -> Vec<Cell> {
+    first_row(
+        core,
+        &format!("SELECT {cols} FROM {TABLE} WHERE id = {id} LIMIT 10"),
+    )
+}
+
 #[test]
-fn write_contexts_reject_time_functions_fail_closed() {
+fn write_contexts_accept_time_functions_and_keep_rejecting_unsupported_forms() {
     let (core, _g) = new_core();
-    // INSERT VALUES は従来どおり 42601（書き込み側の台帳 v3・INSERT 系ハッシュが未実装）。
-    for expr in [
+    // INSERT VALUES の単独時刻関数は受理される（Issue #2188）。
+    for (i, expr) in [
         "now()",
         "CURRENT_TIMESTAMP",
         "clock_timestamp()",
-        "CURRENT_DATE",
-    ] {
-        assert_eq!(
-            code(
-                &core,
-                &format!(
-                    "INSERT INTO {TABLE} (id, embedding, lang, at) VALUES \
-                     (10, '[0.1,0.2]', 'ja', {expr}) USING OPERATION_ID 'op-x'"
-                )
+        "statement_timestamp()",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = 10 + i as u64;
+        run(
+            &core,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, at) VALUES \
+                 ({id}, '[0.1,0.2]', 'ja', {expr}) USING OPERATION_ID 'op-v{id}'"
             ),
-            "42601",
-            "INSERT VALUES {expr}"
-        );
+        )
+        .unwrap_or_else(|e| panic!("INSERT VALUES {expr}: {e}"));
+        assert!(matches!(row_of(&core, "at", id)[0], Cell::Timestamp(_)));
     }
-    // UPDATE SET は定数式経路で 42601、述語形 UPDATE／DELETE の WHERE は束縛段で 0A000。
+    // 合成式・型不一致・CURRENT_TIME は従来どおり拒否する。
     for (sql, expected) in [
         (
-            "UPDATE events SET at = now() WHERE id = 1 USING OPERATION_ID 'op-u'",
+            "INSERT INTO events (id, embedding, lang, at) VALUES \
+             (20, '[0.1,0.2]', 'ja', now() + 1) USING OPERATION_ID 'op-c1'",
             "42601",
         ),
         (
-            "UPDATE events SET lang = 'x' WHERE at < now() USING OPERATION_ID 'op-u2'",
-            "0A000",
+            "INSERT INTO events (id, embedding, lang, at) VALUES \
+             (21, '[0.1,0.2]', 'ja', CURRENT_DATE) USING OPERATION_ID 'op-c2'",
+            "22023",
         ),
         (
-            "DELETE FROM events WHERE at < now() USING OPERATION_ID 'op-d'",
-            "0A000",
+            "INSERT INTO events (id, embedding, lang, at) VALUES \
+             (22, '[0.1,0.2]', 'ja', CURRENT_TIME) USING OPERATION_ID 'op-c3'",
+            "42601",
+        ),
+        (
+            "INSERT INTO events (id, embedding, lang, at) VALUES \
+             (23, '[0.1,0.2]', 'ja', \"now\") USING OPERATION_ID 'op-c4'",
+            "42703",
         ),
     ] {
-        assert_eq!(code(&core, sql), expected, "{sql}");
+        let got = code(&core, sql);
+        assert!(
+            got == expected || (expected == "22023" && got.starts_with("22")),
+            "{sql}: {got}"
+        );
     }
-    // 明示トランザクション内の書き込みも同じ（時計を渡すのは読み取り文だけ）。
+    // UPDATE SET・述語形 UPDATE／DELETE の WHERE は受理される。
+    run(
+        &core,
+        "UPDATE events SET at = clock_timestamp() WHERE id = 1 USING OPERATION_ID 'op-u'",
+    )
+    .expect("update set clock_timestamp");
+    // 2023 年以降の壁時計値（マイクロ秒）であること。
+    assert!(ts(&row_of(&core, "at", 1)[0]) > 1_700_000_000_000_000);
+    run(
+        &core,
+        "UPDATE events SET lang = 'x' WHERE at < now() USING OPERATION_ID 'op-u2'",
+    )
+    .expect("update where now()");
+    run(
+        &core,
+        "DELETE FROM events WHERE at < now() USING OPERATION_ID 'op-d'",
+    )
+    .expect("delete where now()");
+    // 明示トランザクション内の書き込みも同じ。
     let ctx = ctx_for("tenant-a");
     let mut session = SessionState::default();
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&ctx, &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
-        .execute_sql_in_txn(
-            &ctx,
-            &mut session,
-            &mut txn,
-            "DELETE FROM events WHERE at < now() USING OPERATION_ID 'op-d2'",
-        )
-        .expect_err("delete with now() in txn");
-    assert_eq!(err.wire_code(), "0A000");
-    // CHECK・VIEW 本文は 42601（SQL-37・TABLE-16・TABLE-18）。`DEFAULT now()` 系は Issue #1587 で
-    // 受理に変わった（`tests/sql37_default_now.rs`）。
+    core.execute_sql_in_txn(
+        &ctx,
+        &mut session,
+        &mut txn,
+        "DELETE FROM events WHERE at < now() USING OPERATION_ID 'op-d2'",
+    )
+    .expect("delete with now() in txn");
+    // CHECK・VIEW 本文は 42601（SQL-37・TABLE-16・TABLE-18）。
     for sql in [
         "CREATE TABLE t3 (embedding VECTOR(2), n TIMESTAMP, CHECK (n < now()))",
         "CREATE TABLE t4 (embedding VECTOR(2), n TIMESTAMP, CHECK (n < CURRENT_TIMESTAMP))",
@@ -435,13 +480,23 @@ fn quoted_keyword_identifiers_stay_column_references() {
 #[test]
 fn time_keywords_without_timezone_support_are_rejected() {
     let (core, _g) = new_core();
-    for kw in ["CURRENT_TIME", "LOCALTIME"] {
-        assert_eq!(
-            code(
-                &core,
-                &format!("SELECT {kw} FROM events WHERE id = 1 LIMIT 10")
-            ),
-            "0A000"
+    // `CURRENT_TIME` は戻り値が timetz（未実装）のため 0A000 のまま。
+    assert_eq!(
+        code(
+            &core,
+            "SELECT CURRENT_TIME FROM events WHERE id = 1 LIMIT 10"
+        ),
+        "0A000"
+    );
+    // `LOCALTIME` は TIME 型（トランザクション開始時刻の UTC の時刻部。Issue #2188）。
+    let cells = first_row(
+        &core,
+        "SELECT LOCALTIME, LOCALTIME(3) FROM events WHERE id = 1 LIMIT 10",
+    );
+    for cell in &cells {
+        assert!(
+            matches!(cell, Cell::Time(t) if (0..86_400_000_000).contains(t)),
+            "{cell:?}"
         );
     }
     // 引数付きの関数形は arity 違反の 42883。

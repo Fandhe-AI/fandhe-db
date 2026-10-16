@@ -1116,15 +1116,15 @@ fn validate_in_target_column<'a>(
 }
 
 /// `IN`／`NOT IN` の内側投影列が対象列の値族と比較可能か。値族の完全一致に加え、
-/// scale 0 の `NUMERIC`（`SUM(BIGINT)` 等。Issue #2271）は整数・浮動小数列の対象と
-/// 比較できる（PostgreSQL と同じ。従来受理していた比較を `SUM` の戻り値型変更で
+/// 任意 scale の `NUMERIC`（`SUM(BIGINT)`〔Issue #2271〕・整数 `AVG`〔Issue #2270〕等）は
+/// 整数・浮動小数列の対象と比較できる（PostgreSQL と同じ。従来受理していた比較を `SUM` の戻り値型変更で
 /// 拒否しない）。実行時のセル取り出しは [`resolve_in_subquery`] が担う。
 fn in_family_compatible(inner_meta: &ColumnMeta, family: SubqueryValueFamily) -> bool {
     inner_value_family(inner_meta) == Some(family)
         || (matches!(
             family,
             SubqueryValueFamily::Integer | SubqueryValueFamily::Float
-        ) && is_scale0_numeric_meta(inner_meta))
+        ) && is_numeric_meta(inner_meta))
 }
 
 /// `IN` の内側投影列と対象列の値族不一致の静的エラー（`resolve_in_subquery` 用）。
@@ -1262,6 +1262,16 @@ fn resolve_in_subquery(
                 // scale 0 の numeric（`SUM(BIGINT)`。Issue #2271）は `i128` の厳密値として
                 // 保持し、`i64` 超でも誤った一致・不一致を出さない。
                 Cell::Numeric(d) if d.scale() == 0 => ints.push(d.unscaled()),
+                // 小数部を持つ numeric（整数 `AVG`。Issue #2270）: 小数部が 0 なら整数として
+                // 厳密に照合し、非 0 なら整数列のどの値とも等しくないため集合へ入れない。
+                Cell::Numeric(d) => {
+                    let div = 10i128.checked_pow(u32::from(d.scale()));
+                    if let Some(div) = div {
+                        if d.unscaled() % div == 0 {
+                            ints.push(d.unscaled() / div);
+                        }
+                    }
+                }
                 _ => return Err(unexpected_cell_type()),
             },
             SubqueryValueFamily::Float => match cell {
@@ -1278,8 +1288,9 @@ fn resolve_in_subquery(
                 }
                 // scale 0 の numeric（Issue #2271）は float8 へ写して比較する
                 // （PostgreSQL の float8 × numeric 比較と同じく numeric 側を float8 へ変換）。
-                Cell::Numeric(d) if d.scale() == 0 => {
-                    let f = d.unscaled() as f64;
+                // 任意 scale（整数 `AVG`。Issue #2270）は 10 進文字列の最近接 f64 へ写す。
+                Cell::Numeric(d) => {
+                    let f: f64 = d.to_string().parse().map_err(|_| unexpected_cell_type())?;
                     floats.push(if f == 0.0 { 0.0 } else { f });
                 }
                 _ => return Err(unexpected_cell_type()),
@@ -1720,6 +1731,12 @@ fn number_cell_text(cell: &Cell) -> Result<String, SqlSurfaceError> {
                 Ok(n.to_string())
             }
         }
+        // Issue #2270: 端数のある numeric（整数 `AVG`）を浮動小数列との比較用に `f64` へ写す
+        // （PostgreSQL の `float8` と `numeric` の比較と同じ向き）。
+        Cell::Numeric(d) => {
+            let f: f64 = d.to_string().parse().map_err(|_| unexpected_cell_type())?;
+            number_cell_text(&Cell::Float(f))
+        }
         // 2^53 以上の整数値は全桁の整数リテラルになり、式束縛の正確表現ガード
         // （`parse_number_literal`）に拒否されるため、小数点付きで表す。
         Cell::Float(f)
@@ -1735,11 +1752,12 @@ fn number_cell_text(cell: &Cell) -> Result<String, SqlSurfaceError> {
     }
 }
 
-/// 内側投影列が scale 0 の `NUMERIC`（`SUM(BIGINT)` 等。整数として厳密に扱える）か。
-fn is_scale0_numeric_meta(meta: &ColumnMeta) -> bool {
+/// 内側投影列が任意 scale の `NUMERIC` か（整数 `AVG`〔Issue #2270〕は値ごとに scale が
+/// 変わる numeric。スカラー比較では実行時に厳密比較へ写す）。
+fn is_numeric_meta(meta: &ColumnMeta) -> bool {
     match meta {
         ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
-            matches!(ty, ColumnType::Numeric { scale: 0, .. })
+            matches!(ty, ColumnType::Numeric { .. })
         }
         _ => false,
     }
@@ -1761,7 +1779,7 @@ fn check_scalar_family_compatible(
                 || (matches!(
                     target_family,
                     SubqueryValueFamily::Integer | SubqueryValueFamily::Float
-                ) && is_scale0_numeric_meta(inner_meta))
+                ) && is_numeric_meta(inner_meta))
         }
         None => false,
     };
@@ -1932,14 +1950,37 @@ fn scalar_literal_predicate(
         }
         SubqueryValueFamily::Integer
             if matches!(cell, Cell::Integer(_) | Cell::SignedInteger(_))
-                || matches!(cell, Cell::Numeric(d) if d.scale() == 0) =>
+                || matches!(cell, Cell::Numeric(_)) =>
         {
             // 整数列 × 整数セルは `2^53` 超でも比較できるよう `int_compare` へ写像する。
             // scale 0 の numeric（`SUM(BIGINT)`。Issue #2271）も同じ経路で厳密に比べる。
             let n: i128 = match cell {
                 Cell::Integer(u) => i128::from(*u),
                 Cell::SignedInteger(i) => i128::from(*i),
-                Cell::Numeric(d) => d.unscaled(),
+                Cell::Numeric(d) if d.scale() == 0 => d.unscaled(),
+                // Issue #2270: 端数のある numeric（整数 `AVG`）は floor で厳密な整数比較へ
+                // 書き換える。整数列は端数を持てないため `=` は常に偽、`>`/`>=` は
+                // `> floor`、`<`/`<=` は `<= floor`、`<>` は非 NULL の全行。
+                Cell::Numeric(d) => {
+                    let divisor = 10i128
+                        .checked_pow(u32::from(d.scale()))
+                        .ok_or_else(unexpected_cell_type)?;
+                    let q = d.unscaled() / divisor;
+                    let r = d.unscaled() % divisor;
+                    if r == 0 {
+                        q
+                    } else {
+                        let floor = if d.unscaled() < 0 { q - 1 } else { q };
+                        let le = target_int_compare(column, target_ty, BinOp::Le, floor);
+                        let gt = target_int_compare(column, target_ty, BinOp::Gt, floor);
+                        return Ok(match op {
+                            ScalarSubqueryOp::Eq => WherePredicate::Or(Vec::new()),
+                            ScalarSubqueryOp::Gt | ScalarSubqueryOp::Ge => gt,
+                            ScalarSubqueryOp::Lt | ScalarSubqueryOp::Le => le,
+                            ScalarSubqueryOp::Ne => WherePredicate::Or(vec![vec![le], vec![gt]]),
+                        });
+                    }
+                }
                 _ => return Err(unexpected_cell_type()),
             };
             Ok(match op {

@@ -199,7 +199,7 @@ fn float_results_use_postgres_like_types() {
     let r = run(
         &core,
         &ctx,
-        "SELECT avg(n)*2, sum(r)+1, sum(r)+sum(r), sum(d)+1, max(n)+1 FROM t",
+        "SELECT avg(d)*2, sum(r)+1, sum(r)+sum(r), sum(d)+1, max(n)+1 FROM t",
     );
     assert_eq!(col_ty(&r, 0), Some(ColumnType::Double));
     // real + integer は PostgreSQL でも double precision。
@@ -214,8 +214,30 @@ fn float_results_use_postgres_like_types() {
     assert_eq!(cells[3], Cell::Float(5.5));
     assert_eq!(cells[4], Cell::SignedInteger(11));
     match cells[0] {
-        Cell::Float(v) => assert!((v - 26.0 / 3.0).abs() < 1e-9, "{v}"),
+        // avg(d) = (0.5 + 1.5 + 2.5) / 3 = 1.5 → *2 = 3.0。
+        Cell::Float(v) => assert!((v - 3.0).abs() < 1e-9, "{v}"),
         ref other => panic!("expected Float, got {other:?}"),
+    }
+}
+
+/// Issue #2270（TABLE-13）: 整数の AVG は numeric を返すため、式の中（numeric 算術は
+/// 別 Issue）では fail-closed の 22000 で拒否する。Describe と実行の結果も一致する。
+#[test]
+fn avg_of_integer_in_expression_is_rejected_with_22000() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT avg(n)*2 FROM t",
+        "SELECT g, avg(n)+1 FROM t GROUP BY g",
+        "SELECT avg(id)+1 FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "22000", "{sql}");
+        let parsed = core.parse_sql(sql).expect("parse");
+        let described = core.describe_parsed_in_session(&SessionState::default(), &parsed);
+        assert_eq!(
+            described.expect_err("describe must reject").wire_code(),
+            "22000",
+            "{sql}"
+        );
     }
 }
 
@@ -325,7 +347,7 @@ fn describe_matches_execution() {
         "SELECT sum(n)+1, count(*)*2 FROM t",
         "SELECT g, sum(n)+1 AS s FROM t GROUP BY g",
         "SELECT max(n)-min(n) FROM t",
-        "SELECT avg(n)*2 FROM t",
+        "SELECT avg(d)*2 FROM t",
     ] {
         let parsed = core.parse_sql(sql).expect("parse");
         let described = core

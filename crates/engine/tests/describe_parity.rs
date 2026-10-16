@@ -228,7 +228,11 @@ fn describe_typed_aggregate_and_expression_columns_match_execute() {
                 precision: 20,
                 scale: 0
             }),
-            Some(ColumnType::Double),
+            // Issue #2270: 整数・`id` の AVG は numeric（名目 scale 16）。
+            Some(ColumnType::Numeric {
+                precision: 38,
+                scale: 16
+            }),
         ]
     );
 }
@@ -275,7 +279,11 @@ fn describe_window_scan_matches_execute() {
                 precision: 20,
                 scale: 0
             }),
-            Some(ColumnType::Double),
+            // Issue #2270: 整数・`id` の AVG は numeric（名目 scale 16）。
+            Some(ColumnType::Numeric {
+                precision: 38,
+                scale: 16
+            }),
             Some(ColumnType::Text),
         ]
     );

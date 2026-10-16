@@ -172,6 +172,15 @@ fn as_integer(cell: &Cell) -> u64 {
     }
 }
 
+/// numeric セル（整数 AVG。Issue #2270）または NULL。
+fn as_numeric_or_null(cell: &Cell) -> Option<engine::numeric::Decimal> {
+    match cell {
+        Cell::Numeric(v) => Some(*v),
+        Cell::Null => None,
+        other => panic!("expected Cell::Numeric or Cell::Null, got {other:?}"),
+    }
+}
+
 fn as_float_or_null(cell: &Cell) -> Option<f64> {
     match cell {
         Cell::Float(v) => Some(*v),
@@ -242,16 +251,24 @@ fn sql13_basic_aggregates_match_independent_oracle() {
                 "SUM(id) tenant={tenant} allow_private={allow_private}"
             );
 
-            let expected_avg = if visible.is_empty() {
-                None
+            // 独立オラクル: 平均は numeric（小数 16 桁以上）で、`unscaled * count` が
+            // `sum * 10^scale` と丸め誤差（半分以内）で一致する。
+            let avg = as_numeric_or_null(&cells[3]);
+            if visible.is_empty() {
+                assert_eq!(
+                    avg, None,
+                    "AVG(id) tenant={tenant} allow_private={allow_private}"
+                );
             } else {
-                Some(id_sum as f64 / visible.len() as f64)
-            };
-            assert_eq!(
-                as_float_or_null(&cells[3]),
-                expected_avg,
-                "AVG(id) tenant={tenant} allow_private={allow_private}"
-            );
+                let d = avg.expect("AVG(id) must be non-NULL for visible rows");
+                assert!(d.scale() >= 16, "AVG(id) scale tenant={tenant}");
+                let lhs = d.unscaled() * visible.len() as i128;
+                let rhs = i128::from(id_sum) * 10i128.pow(u32::from(d.scale()));
+                assert!(
+                    (lhs - rhs).abs() * 2 <= visible.len() as i128,
+                    "AVG(id) tenant={tenant} allow_private={allow_private}"
+                );
+            }
 
             let expected_min_id = visible.iter().map(|r| r.id).min();
             let expected_max_id = visible.iter().map(|r| r.id).max();

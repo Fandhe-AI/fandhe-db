@@ -5,14 +5,15 @@
 //! 日付変換の純関数を提供する（対象ビヘイビア: SQL-37・TASK-248・Issue #1586。
 //! 設計記録は `docs/design/now-evaluated-value-ledger.md` の D3・D7・D8）。
 //!
-//! 呼び出し文脈: `core.rs` の読み取り文の実行入口（autocommit・明示／暗黙トランザクション・
-//! Describe）が文の先頭で時刻を確定し、[`ClockScope`] を保持している間だけ束縛が時刻関数を
-//! 受理する。スコープ外（INSERT／UPDATE／DELETE／COPY／CHECK／DEFAULT／VIEW 本文／NoSQL 等）は
-//! 既定の `None` のまま `0A000` で拒否される（許可リスト型の fail-closed）。例外は 2 つ:
-//! 列 `DEFAULT now()` 系の評価（[`DefaultClockScope`]。INSERT の省略列補完専用の別スロット。
-//! Issue #1587）と、分割実行 DML の SET・WHERE（[`ClockPolicy::TxnFixedOnly`]。ジョブ開始時に
-//! 確定した固定時刻。設計 D6）。INSERT VALUES 内・原子版 UPDATE SET の時刻関数は台帳 v3
-//! （#2188）の実装まで受理しない。
+//! 呼び出し文脈: `core.rs` の読み取り文・書き込み文（INSERT／UPDATE／DELETE の原子版。Issue #2188）の
+//! 実行入口（autocommit・明示／暗黙トランザクション・Describe）が文の先頭で時刻を確定し、
+//! [`ClockScope`] を保持している間だけ束縛が時刻関数を受理する。スコープ外（COPY／CHECK／
+//! VIEW 本文／NoSQL 等）は既定の `None` のまま `0A000` で拒否される（許可リスト型の
+//! fail-closed）。ほかに、列 `DEFAULT now()` 系の評価（[`DefaultClockScope`]。INSERT の省略列補完と
+//! `VALUES` の単独時刻関数の評価。Issue #1587・#2188）と、分割実行 DML の SET・WHERE
+//! （[`ClockPolicy::TxnFixedOnly`]。ジョブ開始時に確定した固定時刻。設計 D6）がある。
+//! 書き込み文で時刻関数が評価されると [`ledger_evaluated_at`] が `Some` を返し、
+//! `recovery::ledger` が台帳 v3 にトランザクション開始時刻を記録する。
 //!
 //! 時刻の運搬は `SessionState`／`UdfRegistry` に載せない（`session_at_begin` の clone・
 //! ROLLBACK 復元や `UdfRegistry` の等価比較の意味を崩さないため）。束縛は呼び出しスレッドで
@@ -60,6 +61,10 @@ thread_local! {
     /// 分割実行 DML が「時刻値関数を含む文か」を AST の網羅走査なしに判定するために使う
     /// （束縛が時刻を要求した＝含む。判定漏れが fail-closed になる）。
     static CLOCK_USED: Cell<bool> = const { Cell::new(false) };
+    /// 束縛と台帳記録が別スコープに分かれる経路（NoSQL insert・COPY）が、束縛時に確定した
+    /// 台帳 v3 の評価時刻を書き込み区間へ引き継ぐ上書き値（[`LedgerClockScope`]）。
+    /// `None` は上書きなし、`Some(x)` は `x`（`None` なら v2）を権威値として使う。
+    static LEDGER_OVERRIDE: Cell<Option<Option<i64>>> = const { Cell::new(None) };
 }
 
 /// [`StatementClock`] を現スレッドの束縛スコープへ設定する RAII ガード。drop で直前の値へ戻す
@@ -128,12 +133,50 @@ pub(crate) fn current_clock_policy() -> ClockPolicy {
 /// `fill_omitted_columns` へ明示的に渡す）。drop で直前の値へ戻す。
 pub(crate) struct DefaultClockScope {
     prev: Option<StatementClock>,
+    prev_used: bool,
 }
 
 impl DefaultClockScope {
     pub(crate) fn enter(clock: StatementClock) -> Self {
         let prev = DEFAULT_CLOCK.with(|c| c.replace(Some(clock)));
-        DefaultClockScope { prev }
+        // 式スコープと同じ「時刻関数を評価したか」の印を入れ子で保存・復元する。
+        // 式スコープ（`ClockScope`）の内側で時刻を共有する場合はその印を引き継ぎ、スコープ外
+        // （COPY の feed 等）の評価で残った印は文ごとに false へ初期化する（Issue #2188。
+        // 時刻関数を使わない INSERT が v3 を記録しないようにする）。
+        let in_expr_scope = CURRENT.with(|c| c.get()).is_some();
+        let prev_used = CLOCK_USED.with(|u| {
+            let prev = u.get();
+            if !in_expr_scope {
+                u.set(false);
+            }
+            prev
+        });
+        DefaultClockScope { prev, prev_used }
+    }
+
+    /// このスコープの間に時刻 DEFAULT（または式）が時刻を評価したか。
+    pub(crate) fn was_used(&self) -> bool {
+        CLOCK_USED.with(|u| u.get())
+    }
+}
+
+/// 束縛時に確定した台帳 v3 の評価時刻を書き込み区間へ引き継ぐ RAII ガード（NoSQL insert・
+/// COPY。束縛スコープは書き込み前に破棄されるため）。drop で直前の値へ戻す。
+pub(crate) struct LedgerClockScope {
+    prev: Option<Option<i64>>,
+}
+
+impl LedgerClockScope {
+    pub(crate) fn enter(evaluated_at: Option<i64>) -> Self {
+        let prev = LEDGER_OVERRIDE.with(|o| o.replace(Some(evaluated_at)));
+        LedgerClockScope { prev }
+    }
+}
+
+impl Drop for LedgerClockScope {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        LEDGER_OVERRIDE.with(|o| o.set(prev));
     }
 }
 
@@ -141,6 +184,8 @@ impl Drop for DefaultClockScope {
     fn drop(&mut self) {
         let prev = self.prev;
         DEFAULT_CLOCK.with(|c| c.set(prev));
+        let prev_used = self.prev_used;
+        CLOCK_USED.with(|u| u.set(prev_used));
     }
 }
 
@@ -170,7 +215,23 @@ pub(crate) fn eval_time_default(
         };
         Ok(Value::Timestamp(micros))
     };
+    // 時刻関数を評価した印（台帳 v3 に評価時刻を残す判定。Issue #2188）。
+    mark_clock_used();
     match time {
+        TimeDefault::StatementTimestamp => Ok(Value::Timestamp(clock.stmt_start_micros)),
+        // 行ごと・呼び出しごとに壁時計を読む（トランザクション・文の時刻には固定しない）。
+        TimeDefault::ClockTimestamp => Ok(Value::Timestamp(now_micros()?)),
+        TimeDefault::LocalTime(p) => {
+            let micros = match p {
+                None => clock.txn_start_micros,
+                Some(p) => round_to_precision(clock.txn_start_micros, p).ok_or(
+                    SqlSurfaceError::InvalidParameterValue {
+                        detail: "time precision must be between 0 and 6",
+                    },
+                )?,
+            };
+            Ok(Value::Time(micros_to_time_of_day(micros)))
+        }
         TimeDefault::Now | TimeDefault::TransactionTimestamp => timestamp(None),
         TimeDefault::CurrentTimestamp(p) | TimeDefault::LocalTimestamp(p) => timestamp(p),
         TimeDefault::CurrentDate => {
@@ -213,6 +274,28 @@ pub(crate) fn round_to_precision(micros: i64, precision: u8) -> Option<i64> {
         .div_euclid(unit)
         .checked_mul(unit)?;
     validate_timestamp_micros(rounded).then_some(rounded)
+}
+
+/// UTC マイクロ秒を 1 日の中の時刻（0 以上 1 日未満のマイクロ秒）へ変換する（`LOCALTIME`。
+/// TimeZone 未実装の間は UTC 扱い。設計 D8）。
+pub(crate) fn micros_to_time_of_day(micros: i64) -> i64 {
+    micros.rem_euclid(MICROS_PER_DAY)
+}
+
+/// 評価に時刻関数を使った書き込みの台帳 v3 に残す評価時刻（トランザクション開始時刻）。
+/// 現スレッドの [`ClockScope`]／[`DefaultClockScope`] の間に時刻関数が評価されていれば
+/// `Some`。`recovery::ledger::record_in_txn_accepting` が参照する（Issue #2188・SQL-37）。
+pub(crate) fn ledger_evaluated_at() -> Option<i64> {
+    if let Some(overridden) = LEDGER_OVERRIDE.with(|o| o.get()) {
+        return overridden;
+    }
+    if !CLOCK_USED.with(|u| u.get()) {
+        return None;
+    }
+    CURRENT
+        .with(|c| c.get())
+        .or_else(|| DEFAULT_CLOCK.with(|c| c.get()))
+        .map(|c| c.txn_start_micros)
 }
 
 /// UTC マイクロ秒を 1970-01-01 起点の日数へ変換する（`CURRENT_DATE`）。範囲外は `None`。
