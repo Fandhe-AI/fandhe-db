@@ -3,8 +3,9 @@
 //!
 //! `EngineCore::execute_sql_in_session`（構文検証 → DDL 権限ゲート → `sql::ddl`）を
 //! production 経路として検証し、再起動後（`Storage` の開き直し）に照合が復元されることを
-//! カタログ API で確認する。受理するのは `C`／`POSIX` のみで、それ以外は `42704`（fail-closed）。
-//! 比較・ソートの意味論は変えない（`COLLATE` なしと同じ結果）。
+//! カタログ API で確認する。受理するのは `C`／`POSIX`／`und-x-icu`／`ja-x-icu` のみで、それ以外は
+//! `42704`（fail-closed）。`C`／`POSIX` の比較・ソートの意味論は変えない（`COLLATE` なしと同じ結果）。
+//! ICU 照合の比較・順序は `sql_collate_icu.rs` が検証する。
 
 use engine::catalog::{ColumnType, TableSchema};
 use engine::collation::Collation;
@@ -214,7 +215,14 @@ fn rejections_are_fail_closed_and_side_effect_free() {
         ),
         ("CREATE TABLE x1 (a TEXT COLLATE)", "42601"),
         ("CREATE TABLE x1 (a TEXT COLLATE 'C')", "42601"),
-        ("CREATE TABLE x1 (a TEXT COLLATE \"und-x-icu\")", "42601"),
+        // ハイフン入りの引用照合名は照合名の位置でだけ受理する（Issue #2190）。他の位置は従来どおり
+        // 引用識別子として使えず 42601。
+        ("CREATE TABLE \"und-x-icu\" (a TEXT)", "42601"),
+        ("CREATE TABLE x1 (\"und-x-icu\" TEXT)", "42601"),
+        // 許可リスト外の ICU 名は 42704。
+        ("CREATE TABLE x1 (a TEXT COLLATE \"en-x-icu\")", "42704"),
+        ("CREATE TABLE x1 (a TEXT COLLATE \"UND-X-ICU\")", "42704"),
+        ("CREATE TABLE x1 (a TEXT COLLATE \"xx-x-icu\")", "42704"),
         ("CREATE TABLE x1 (a TEXT COLLATE pg_catalog.\"C\")", "42601"),
         // 0A000: 対象外。
         ("CREATE TABLE x1 (a TEXT[] COLLATE \"C\")", "0A000"),
@@ -289,14 +297,23 @@ fn expression_collate_matches_plain_results() {
         ),
         vec!["cherry", "banana", "apple", "Apple"]
     );
+    // 異なる明示の照合同士の比較は 42P21（Issue #2190。PostgreSQL と同じ）。
+    let mut s = SessionState::default();
+    assert_eq!(
+        code_of(
+            &core,
+            &mut s,
+            "SELECT a FROM t WHERE a COLLATE \"C\" = 'apple' COLLATE \"POSIX\" LIMIT 100"
+        ),
+        "42P21"
+    );
     assert_eq!(
         texts(
             &core,
-            "SELECT a FROM t WHERE a COLLATE \"C\" = 'apple' COLLATE \"POSIX\" LIMIT 100"
+            "SELECT a FROM t WHERE a COLLATE \"C\" = 'apple' COLLATE \"C\" LIMIT 100"
         ),
         vec!["apple"]
     );
-    let mut s = SessionState::default();
     assert_eq!(
         code_of(&core, &mut s, "SELECT 1 COLLATE \"C\" FROM t LIMIT 100"),
         "42804"

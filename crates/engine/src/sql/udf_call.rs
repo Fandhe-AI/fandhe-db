@@ -293,12 +293,12 @@ pub enum Expr {
         kind: ValueFunctionKind,
         precision: Option<u8>,
     },
-    /// 式の照合指定 `<expr> COLLATE "<名前>"`（対象ビヘイビア: TABLE-28。Issue #1609）。
+    /// 式の照合指定 `<expr> COLLATE "<名前>"`（対象ビヘイビア: TABLE-28。Issue #1609・#2190）。
     /// 構文段（`allowlist::Parser`）が照合名を許可リスト（[`crate::collation::Collation`]）で
-    /// 解決済みで、未知の名前は `42704` で拒否されている。Issue #1609 では `C`／`POSIX`
-    /// （どちらも既定のバイト列順と同値）だけを受理するため、束縛後の意味は内側の式と同じ
-    /// （束縛段は内側が文字列系であることだけを検査する）。比較・ソートへの照合の伝播と
-    /// ICU 照合は #1610・#2190 が担う。
+    /// 解決済みで、未知の名前は `42704` で拒否されている。束縛後の `BoundExpr` は内側の式と
+    /// 同じで（束縛段は内側が文字列系であることだけを検査する）、照合は比較演算子の腕
+    /// （葉同士の比較）と ORDER BY・MIN/MAX のキー束縛が AST から導出して運ぶ。それ以外の位置の
+    /// 非バイト列順の照合は `0A000`。
     Collate {
         expr: Box<Expr>,
         collation: crate::collation::Collation,
@@ -966,6 +966,12 @@ pub enum BuiltinFn {
     /// 他の時刻関数と違い束縛時に定数化せず、評価のたびに `sql::time_fn::now_micros` を呼ぶ。
     /// 畳み込み・共通部分式の 1 回化の対象外（[`is_foldable_builtin`]）。
     ClockTimestamp,
+    /// 照合付きの TEXT 比較（`> < >= <= =`。Issue #2190・TABLE-28）。実効照合がバイト列順
+    /// でないとき（ICU）だけ束縛段が作り、バイト列順なら従来の [`BoundExpr::Binary`] のまま
+    /// にして既定照合の経路をバイト単位で不変に保つ。引数は TEXT 2 個で、NULL を含めば NULL。
+    /// `BoundExpr::Binary` ではないためスカラー二次索引の分類（`sql::scalar_plan`）に乗らず、
+    /// 全走査へ縮退する（照合込みの索引は #2191）。
+    TextCompare(BinOp, crate::collation::Collation),
 }
 
 /// 型付き算術（[`BuiltinFn::TypedArith`]）の結果種別。`float8` は既存の
@@ -1208,6 +1214,7 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::TypedArith(_, _) => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
         // 戻り値型は TIMESTAMP（D8 の暫定。TIMESTAMPTZ 型の実装時に切り替える）。
         BuiltinFn::ClockTimestamp => (&[], ExprType::Timestamp),
+        BuiltinFn::TextCompare(_, _) => (&[ExprType::Text, ExprType::Text], ExprType::Bool),
     }
 }
 
@@ -1258,6 +1265,8 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::BpcharToText => false,
         // 非決定的（呼び出しごとに値が変わる）ため畳み込まない（SQL-37・Issue #1586）。
         BuiltinFn::ClockTimestamp => false,
+        // 引数が TEXT のため畳み込み表現（`Scalar`／`Bool` のみ）に載らない。
+        BuiltinFn::TextCompare(_, _) => false,
         // Issue #1539・SQL-42: 型付き算術は `Binary` と同じく `Scalar` を返す純関数で、
         // 0 除算・オーバーフローは defer-on-error（畳み込み失敗時は実行時に評価）。
         BuiltinFn::TypedArith(_, _) => true,
@@ -1688,6 +1697,10 @@ pub(super) struct BindEnv<'a> {
     /// `None` の文脈では時刻関数を `0A000` で拒否する。UDF 本体の展開（`inner_env`）は
     /// 呼び出し側の値を継承する。
     clock: Option<StatementClock>,
+    /// 次に束縛する式 1 個だけ、ICU など非バイト列順の照合に対する `require_wired_collation`
+    /// ガードを外す印（Issue #2190）。照合を導出して比較ノードへ運ぶ比較演算子の腕
+    /// （[`bind_collated_comparison`]）だけが立て、[`bind_expr_any`] が入口で消費して下げる。
+    collation_leaf: bool,
 }
 
 /// 展開済み [`BoundExpr`] のノード数を数える。UDF 連鎖のパラメータ参照展開時に
@@ -2150,6 +2163,7 @@ pub fn bind_expr(
         case_nesting: 0,
         typed_arith: false,
         clock: time_fn::current_clock(),
+        collation_leaf: false,
     };
     bind_expr_in(expr, &mut env, node_budget)
 }
@@ -2185,6 +2199,7 @@ pub(crate) fn bind_projection_expr_json_ok(
         case_nesting: 0,
         typed_arith: true,
         clock: time_fn::current_clock(),
+        collation_leaf: false,
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
     let col = expr_result_column_type(expr, &bound, ty);
@@ -2205,15 +2220,17 @@ fn column_collation(
 /// 照合の比較が結線済みの経路でしか使えないことを保証するガード（TABLE-28・Issue #1610）。
 /// 式の比較・JOIN・ウィンドウ・集合演算などは照合を運ばず既定のバイト列順で比較するため、
 /// バイト列順でない照合が来たら黙って誤順序にせず `0A000` で拒否する（fail-closed）。
-/// 現在の許可リスト（`C`／`POSIX`）では常に通る。#2190 が導出を結線した経路から順に外す。
+/// バイト列順の照合（`C`／`POSIX`）は常に通る。ICU の照合（Issue #2190）は、比較演算子の葉・
+/// ORDER BY・GROUP BY・DISTINCT・MIN/MAX のように照合を運ぶ経路だけがこのガードを経由せず
+/// 結線し、それ以外（JOIN・ウィンドウ・式の内側・集計結果の並べ替え等）はここで拒否する。
 /// 文言は固定の英語で、テーブル名・列名・値を含めない。
 pub(crate) fn require_wired_collation(
     collation: Option<crate::collation::Collation>,
 ) -> Result<(), SqlSurfaceError> {
     match collation {
-        Some(c) if !c.is_byte_order() => Err(SqlSurfaceError::unsupported(
-            "this collation is not supported in this expression",
-        )),
+        Some(c) if !c.is_byte_order() => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "this collation is not supported in this expression".to_string(),
+        }),
         Some(_) | None => Ok(()),
     }
 }
@@ -2234,6 +2251,7 @@ pub(crate) fn bind_order_expr(
         case_nesting: 0,
         typed_arith: false,
         clock: time_fn::current_clock(),
+        collation_leaf: false,
     };
     bind_expr_any(expr, &mut env, node_budget)
 }
@@ -2303,6 +2321,7 @@ pub(crate) fn bind_const_projection_expr(
         case_nesting: 0,
         typed_arith: true,
         clock: time_fn::current_clock(),
+        collation_leaf: false,
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
     let col = expr_result_column_type(expr, &bound, ty);
@@ -2368,6 +2387,7 @@ pub(crate) fn bind_const_expr(
         case_nesting: 0,
         typed_arith: true,
         clock: time_fn::current_clock(),
+        collation_leaf: false,
     };
     let (bound, ty) = bind_expr_in(expr, &mut env, node_budget)?;
     let col = expr_result_column_type(expr, &bound, ty);
@@ -2641,19 +2661,26 @@ pub(super) fn bind_expr_any(
     *node_budget = node_budget
         .checked_sub(1)
         .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+    // 比較演算子の腕が立てた「ガードを外す」印はこの 1 式だけに効かせる（子へは伝播しない）。
+    let collation_leaf = std::mem::take(&mut env.collation_leaf);
     match expr {
-        // 照合指定（TABLE-28・Issue #1609）。照合名は構文段で許可リスト（`C`／`POSIX`）に
-        // 解決済み。どちらも既定のバイト列順と同値なので、内側が文字列系（TEXT／VARCHAR／CHAR・
-        // 文字列リテラル）であることを検査したうえで内側の `BoundExpr` をそのまま返す
-        // （照合を持たない型は `42804`）。Issue #1610 で順序付け・索引の地点は結線済みで、式の
-        // 比較への照合の導出と `BoundExpr` への保持は #2190 が担う。それまではバイト列順でない
-        // 照合を [`require_wired_collation`] が `0A000` で拒否する（fail-closed）。
+        // 照合指定（TABLE-28・Issue #1609・#2190）。照合名は構文段で許可リストに解決済み。
+        // 束縛後の `BoundExpr` は内側の式と同じで、照合は比較演算子の腕
+        // （[`bind_collated_comparison`]）と ORDER BY のキー束縛が AST から導出して運ぶ。
+        // それ以外の位置でバイト列順でない照合が来たら [`require_wired_collation`] が
+        // `0A000` で拒否する（照合が黙って落ちる意味論の fail-open を作らない）。内側が
+        // 文字列系でなければ `42804`。
         Expr::Collate {
             expr: inner,
             collation,
         } => {
+            if !collation_leaf {
+                require_wired_collation(Some(*collation))?;
+            }
+            // 比較演算子の腕が許した場合のみ、葉（列・文字列リテラル・入れ子の `COLLATE`）
+            // の内側へもガード解除を伝える。
+            env.collation_leaf = collation_leaf && is_collation_leaf_shape(inner);
             let (bound, ty) = bind_expr_any(inner, env, node_budget)?;
-            require_wired_collation(Some(*collation))?;
             if ty != ExprType::Text {
                 return Err(SqlSurfaceError::datatype_mismatch(
                     "collations are not supported by this expression type",
@@ -2765,7 +2792,9 @@ pub(super) fn bind_expr_any(
                     // `row_scalars`）から解決し、nullable 列の実 NULL は
                     // `ExprValue::Null` として伝播する（AC1・AC2）。
                     ColumnType::Text | ColumnType::Varchar(_) => {
-                        require_wired_collation(column_collation(env.schema, index))?;
+                        if !collation_leaf {
+                            require_wired_collation(column_collation(env.schema, index))?;
+                        }
                         Ok((BoundExpr::TextColumnRef { index }, ExprType::Text))
                     }
                     // Issue #1183・SQL-24・SQL-26・TABLE-13 ポインタ: 数値 4 型
@@ -2783,7 +2812,9 @@ pub(super) fn bind_expr_any(
                     // `CHAR(n)` の式内参照は TEXT へ変換した値（末尾の半角空白を除く）として
                     // 扱う（PostgreSQL の bpchar→text 変換と同じ。TABLE-31・Issue #1566）。
                     ColumnType::Bpchar(_) => {
-                        require_wired_collation(column_collation(env.schema, index))?;
+                        if !collation_leaf {
+                            require_wired_collation(column_collation(env.schema, index))?;
+                        }
                         Ok((
                             BoundExpr::Builtin {
                                 f: BuiltinFn::BpcharToText,
@@ -2875,6 +2906,16 @@ pub(super) fn bind_expr_any(
                 op,
                 BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq
             ) {
+                // Issue #2190・TABLE-28: 列・文字列リテラル・`COLLATE` 同士の比較は照合を導出
+                // する（衝突は `42P21`／`42P22`）。ICU など非バイト列順の照合が絡むときだけ
+                // 専用の束縛へ分岐し、バイト列順だけの比較は従来の経路のまま（バイト単位で不変）。
+                // CHECK 本体は照合に依存する述語を永続化しない（照合データの版に結果が依存するため）。
+                // 分岐せず、ICU 列の参照を既存のガードが `0A000` で拒否する。
+                if !CHECK_BINDING.with(std::cell::Cell::get) {
+                    if let Some(eff) = derive_comparison_collation(lhs, rhs, env)? {
+                        return bind_collated_comparison(*op, lhs, rhs, eff, env, node_budget);
+                    }
+                }
                 reject_numeric_literal_vs_operatorless_column(lhs, rhs, env)?;
                 // Issue #1408・SQL-24: 片側だけが文字列リテラル（PostgreSQL の unknown 型）の
                 // 比較は、反対側の型としてリテラルを解釈する。
@@ -2965,6 +3006,186 @@ pub(super) fn bind_expr_any(
     }
 }
 
+/// 式の照合の導出状態（TABLE-28・Issue #2190。PostgreSQL の照合導出の部分集合）。
+/// 列・文字列リテラル・`COLLATE` だけが葉として値を持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollDerivation {
+    /// 照合を持たない型（非 TEXT）または未導出。併合の単位元。
+    NotCollatable,
+    /// 文字列リテラル・照合指定なしの列（DB 既定 = `C` 相当。最も弱い）。
+    Default,
+    /// 照合を明示した列の暗黙の照合。
+    Implicit(crate::collation::Collation),
+    /// `COLLATE` による明示の照合。
+    Explicit(crate::collation::Collation),
+    /// 異なる暗黙の照合同士の衝突。照合を要する演算が消費したら `42P22`。
+    Conflict,
+}
+
+impl CollDerivation {
+    /// 2 つの導出を併合する。明示は暗黙・既定に勝ち、異なる明示同士は `42P21`、暗黙は既定に
+    /// 勝ち、異なる暗黙同士は [`CollDerivation::Conflict`]（その時点ではエラーにしない）。
+    pub(crate) fn merge(self, other: Self) -> Result<Self, SqlSurfaceError> {
+        use CollDerivation::{Conflict, Default, Explicit, Implicit, NotCollatable};
+        Ok(match (self, other) {
+            (NotCollatable, x) | (x, NotCollatable) => x,
+            (Default, x) | (x, Default) => x,
+            (Explicit(a), Explicit(b)) => {
+                if a == b {
+                    Explicit(a)
+                } else {
+                    return Err(SqlSurfaceError::CollationMismatch);
+                }
+            }
+            (Explicit(a), _) | (_, Explicit(a)) => Explicit(a),
+            (Implicit(a), Implicit(b)) => {
+                if a == b {
+                    Implicit(a)
+                } else {
+                    Conflict
+                }
+            }
+            (Conflict, _) | (_, Conflict) => Conflict,
+        })
+    }
+
+    /// 照合を要する演算が消費したときの実効照合。衝突は `42P22`、照合なし・既定は
+    /// [`crate::collation::Collation::DEFAULT`]。
+    pub(crate) fn consume(self) -> Result<crate::collation::Collation, SqlSurfaceError> {
+        match self {
+            CollDerivation::Conflict => Err(SqlSurfaceError::IndeterminateCollation),
+            CollDerivation::Implicit(c) | CollDerivation::Explicit(c) => Ok(c),
+            CollDerivation::NotCollatable | CollDerivation::Default => {
+                Ok(crate::collation::Collation::DEFAULT)
+            }
+        }
+    }
+
+    /// 非バイト列順の照合を含むか（比較専用の束縛へ分岐する判定）。
+    fn mentions_non_byte_order(self) -> bool {
+        match self {
+            CollDerivation::Implicit(c) | CollDerivation::Explicit(c) => !c.is_byte_order(),
+            CollDerivation::NotCollatable | CollDerivation::Default | CollDerivation::Conflict => {
+                false
+            }
+        }
+    }
+}
+
+/// 照合の導出対象にする葉の形か（列参照・文字列リテラル・`COLLATE`）。それ以外の式は
+/// 導出せず、非バイト列順の列が混じれば従来どおり [`require_wired_collation`] が拒否する。
+fn is_collation_leaf_shape(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Ident(_) | Expr::String(_) | Expr::Collate { .. }
+    )
+}
+
+/// 葉の式の照合の導出。葉でない式（関数呼び出し等）や UDF パラメータ参照は `None`。
+fn derive_leaf_collation(expr: &Expr, env: &BindEnv<'_>) -> Option<CollDerivation> {
+    match expr {
+        Expr::String(_) => Some(CollDerivation::Default),
+        Expr::Collate { collation, .. } => Some(CollDerivation::Explicit(*collation)),
+        Expr::Ident(name) => {
+            if env.params.contains_key(name.to_ascii_lowercase().as_str()) {
+                return None;
+            }
+            let column = env.schema?.columns.iter().find(|c| &c.name == name);
+            Some(match column {
+                Some(c) if c.ty.is_text_like() || matches!(c.ty, ColumnType::Bpchar(_)) => {
+                    match c.collation {
+                        Some(coll) => CollDerivation::Implicit(coll),
+                        None => CollDerivation::Default,
+                    }
+                }
+                _ => CollDerivation::NotCollatable,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 葉の式（`COLLATE` の入れ子を含む）が非バイト列順の照合を含むか。`iu COLLATE "C" < 'b'` の
+/// ように実効照合がバイト列順でも、ICU 列の参照を含む葉は専用の束縛（ガード解除）で扱う。
+fn leaf_mentions_icu(expr: &Expr, env: &BindEnv<'_>) -> bool {
+    match expr {
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => !collation.is_byte_order() || leaf_mentions_icu(inner, env),
+        other => {
+            derive_leaf_collation(other, env).is_some_and(CollDerivation::mentions_non_byte_order)
+        }
+    }
+}
+
+/// 比較演算子の両辺（葉）から実効照合を導出する。分岐が不要（葉でない・非バイト列順の
+/// 照合が絡まない）なら `Ok(None)`。明示同士の不一致は `42P21`、暗黙同士の衝突は `42P22`
+/// （PostgreSQL は行の比較時に返すが、本実装は束縛時に返す＝データに依存しない fail-closed）。
+fn derive_comparison_collation(
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &BindEnv<'_>,
+) -> Result<Option<crate::collation::Collation>, SqlSurfaceError> {
+    let (Some(dl), Some(dr)) = (
+        derive_leaf_collation(lhs, env),
+        derive_leaf_collation(rhs, env),
+    ) else {
+        return Ok(None);
+    };
+    let merged = dl.merge(dr)?;
+    let eff = merged.consume()?;
+    if leaf_mentions_icu(lhs, env) || leaf_mentions_icu(rhs, env) || !eff.is_byte_order() {
+        eff.ensure_available()?;
+        Ok(Some(eff))
+    } else {
+        Ok(None)
+    }
+}
+
+/// 照合の導出結果 `eff` を持つ比較（`> < >= <= =`）の束縛。両辺はガード解除付きで束縛し、
+/// TEXT 同士で実効照合が非バイト列順なら [`BuiltinFn::TextCompare`] にする（バイト列順なら
+/// 従来の `Binary`）。片側が文字列リテラルのときの型解釈は従来の腕と同じ。
+fn bind_collated_comparison(
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    eff: crate::collation::Collation,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let (l, lt, r, rt) = match (lhs, rhs) {
+        (other, Expr::String(s)) if !matches!(other, Expr::String(_)) => {
+            env.collation_leaf = true;
+            let (l, lt) = bind_expr_any(other, env, node_budget)?;
+            let (r, rt) = bind_unknown_literal_against(s, &l, lt, env, node_budget)?;
+            (l, lt, r, rt)
+        }
+        (Expr::String(s), other) if !matches!(other, Expr::String(_)) => {
+            env.collation_leaf = true;
+            let (r, rt) = bind_expr_any(other, env, node_budget)?;
+            let (l, lt) = bind_unknown_literal_against(s, &r, rt, env, node_budget)?;
+            (l, lt, r, rt)
+        }
+        _ => {
+            env.collation_leaf = true;
+            let (l, lt) = bind_expr_any(lhs, env, node_budget)?;
+            env.collation_leaf = true;
+            let (r, rt) = bind_expr_any(rhs, env, node_budget)?;
+            (l, lt, r, rt)
+        }
+    };
+    if lt == ExprType::Text && rt == ExprType::Text && !eff.is_byte_order() {
+        return Ok((
+            BoundExpr::Builtin {
+                f: BuiltinFn::TextCompare(op, eff),
+                args: vec![l, r],
+            },
+            ExprType::Bool,
+        ));
+    }
+    bind_binary(op, l, lt, r, rt)
+}
 /// 時刻関数を束縛する文脈の確定時刻を取り出す。`None`（読み取り文の入口が時計を確定していない
 /// 文脈。INSERT／UPDATE／DELETE／COPY／CHECK／DEFAULT／VIEW 本文等）は `0A000` で拒否する
 /// （SQL-37・Issue #1586。許可リスト型の fail-closed）。
@@ -4369,6 +4590,7 @@ fn bind_call(
             typed_arith: false,
             // 呼び出し側の確定時刻を継承する（本体中の時刻関数は呼び出し文の時刻で束縛される）。
             clock: env.clock,
+            collation_leaf: false,
         };
         return bind_expr_in(&def.body, &mut inner_env, node_budget);
     }
@@ -5806,6 +6028,32 @@ pub(crate) fn apply_builtin<'a>(
         }
         // SQL-37（Issue #1586）: 評価のたびに壁時計を読む（束縛時に定数化しない）。
         BuiltinFn::ClockTimestamp => time_fn::now_micros().map(ExprValue::Timestamp),
+        // Issue #2190: 照合付きの TEXT 比較。等値は deterministic な照合でバイト列の等値と
+        // 一致するためそのまま比較し、順序比較だけ照合の比較器を使う。
+        BuiltinFn::TextCompare(op, collation) => {
+            let a = take_text_or_null_arg(args, 0)?;
+            let b = take_text_or_null_arg(args, 1)?;
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    let ord = collation.compare(a.as_bytes(), b.as_bytes());
+                    let result = match op {
+                        BinOp::Gt => ord.is_gt(),
+                        BinOp::Lt => ord.is_lt(),
+                        BinOp::Ge => ord.is_ge(),
+                        BinOp::Le => ord.is_le(),
+                        BinOp::Eq => a == b,
+                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                            return Err(SqlSurfaceError::Internal {
+                                detail: "non-comparison operator in collated comparison"
+                                    .to_string(),
+                            });
+                        }
+                    };
+                    Ok(ExprValue::Bool(result))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
     }
 }
 
@@ -6087,8 +6335,8 @@ pub(crate) fn eval_binary<'a>(
             // Issue #919・SQL-26: TEXT 同士の比較はバイト順（UTF-8 コードポイント
             // 順）で行う。束縛段（`bind_binary`）が TEXT/TEXT の組しか許可しない
             // ため、他の型混在はここでも `Internal`（束縛段の不変条件が崩れた
-            // 場合の保険）。順序比較は照合の比較器（既定照合。式への照合の導出は #2190、
-            // 結線までは [`require_wired_collation`] がバイト列順以外を拒否する）を経由し、
+            // 場合の保険）。ここはバイト列順の比較（照合が非バイト列順の比較は束縛段が
+            // [`BuiltinFn::TextCompare`] にする。Issue #2190）で、順序比較は既定照合の比較器を経由し、
             // 等値は deterministic な照合でバイト列の等値と一致するためそのまま比較する。
             (ExprValue::Text(a), ExprValue::Text(b)) => {
                 let ord = crate::collation::Collation::DEFAULT.compare(a.as_bytes(), b.as_bytes());
@@ -7886,5 +8134,38 @@ mod tests {
         assert_eq!(combine_numeric_kind(Some(Int8), Some(Int4)), Some(Int8));
         assert_eq!(combine_numeric_kind(Some(Int2), Some(Float4)), None);
         assert_eq!(combine_numeric_kind(Some(Int2), None), None);
+    }
+    /// TABLE-28・Issue #2190: 照合の導出の併合規則。明示は暗黙・既定に勝ち、異なる明示は
+    /// `42P21`、暗黙は既定に勝ち、異なる暗黙は衝突（消費したら `42P22`）。
+    #[test]
+    fn collation_derivation_merge_rules() {
+        use crate::collation::Collation as C;
+        use CollDerivation::{Conflict, Default, Explicit, Implicit, NotCollatable};
+        let ok = |a: CollDerivation, b: CollDerivation| a.merge(b).expect("merge");
+        assert_eq!(ok(NotCollatable, Default), Default);
+        assert_eq!(ok(Default, Default), Default);
+        assert_eq!(ok(Default, Implicit(C::UndIcu)), Implicit(C::UndIcu));
+        assert_eq!(ok(Implicit(C::UndIcu), Default), Implicit(C::UndIcu));
+        assert_eq!(
+            ok(Implicit(C::UndIcu), Implicit(C::UndIcu)),
+            Implicit(C::UndIcu)
+        );
+        assert_eq!(ok(Implicit(C::UndIcu), Implicit(C::JaIcu)), Conflict);
+        assert_eq!(ok(Implicit(C::C), Implicit(C::Posix)), Conflict);
+        assert_eq!(ok(Conflict, Implicit(C::C)), Conflict);
+        assert_eq!(ok(Conflict, Default), Conflict);
+        // 明示は衝突も解消する。
+        assert_eq!(ok(Explicit(C::C), Conflict), Explicit(C::C));
+        assert_eq!(ok(Explicit(C::C), Implicit(C::UndIcu)), Explicit(C::C));
+        assert_eq!(ok(Default, Explicit(C::JaIcu)), Explicit(C::JaIcu));
+        assert_eq!(ok(Explicit(C::C), Explicit(C::C)), Explicit(C::C));
+        let err = Explicit(C::C).merge(Explicit(C::Posix)).expect_err("42P21");
+        assert_eq!(err.wire_code(), "42P21");
+        // 消費。
+        assert_eq!(Conflict.consume().expect_err("42P22").wire_code(), "42P22");
+        assert_eq!(Default.consume().expect("default"), C::DEFAULT);
+        assert_eq!(NotCollatable.consume().expect("none"), C::DEFAULT);
+        assert_eq!(Implicit(C::JaIcu).consume().expect("ja"), C::JaIcu);
+        assert_eq!(Explicit(C::UndIcu).consume().expect("und"), C::UndIcu);
     }
 }

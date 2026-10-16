@@ -3568,11 +3568,11 @@ pub struct ColumnDef {
     /// 使うため、作成後に変わらないこと（`ALTER COLUMN SET DEFAULT` を導入する場合は
     /// 補完専用の値の分離が必要）が不変条件。
     pub default: Option<ColumnDefault>,
-    /// 列に明示した照合（`COLLATE "C"`／`"POSIX"`。TABLE-28・Issue #1609）。`None` は
-    /// 「照合指定なし」で、明示した `C`／`POSIX` とは区別して保存する。付けられるのは
-    /// [`crate::collation::is_collatable`] な型だけ（encode・decode 両側で fail-closed に
-    /// 検査する）。本 Issue では解析と保存のみで、比較・ソート・索引キーの意味論は変えない
-    /// （#1610・#2190・#2191）。
+    /// 列に明示した照合（`COLLATE "C"`／`"POSIX"`／`"und-x-icu"`／`"ja-x-icu"`。TABLE-28・
+    /// Issue #1609・#2190）。`None` は「照合指定なし」で、明示した `C`／`POSIX` とは区別して
+    /// 保存する。付けられるのは [`crate::collation::is_collatable`] な型だけ（encode・decode
+    /// 両側で fail-closed に検査する）。比較・ソートへの反映は `sql` 層が行い（#1610・#2190）、
+    /// 照合込みの索引は #2191。
     pub collation: Option<crate::collation::Collation>,
 }
 

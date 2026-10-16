@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 57;
+    count = 59;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -346,6 +346,15 @@ define_error_classes! {
     /// （存在オラクルを作らない）。[`crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype`]
     /// の写像。
     IndeterminateDatatype => ("42P18", "INDETERMINATE_DATATYPE"),
+    /// 同じ式の 2 つの明示的な `COLLATE` が食い違う（`42P21`。Issue #2190・TABLE-28・ERR-6
+    /// のポインタ）。照合名は固定の許可リスト由来で、テーブル名・列名・値は文言に含めない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::CollationMismatch`] の写像。
+    CollationMismatch => ("42P21", "COLLATION_MISMATCH"),
+    /// 暗黙の照合が衝突し、明示的な `COLLATE` で解消されないまま照合を要する演算（比較・
+    /// ORDER BY・GROUP BY・DISTINCT・MIN/MAX）が消費した（`42P22`。Issue #2190・TABLE-28）。
+    /// PostgreSQL は実行時に返すが、本実装は束縛時に返す（データに依存しない fail-closed）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::IndeterminateCollation`] の写像。
+    IndeterminateCollation => ("42P22", "INDETERMINATE_COLLATION"),
     /// NULL を許さない引数に NULL が渡された（`22004`。Issue #1599・TABLE-25 のポインタ）。
     /// `jsonb_build_object` のキーが NULL の場合に返す。値・キー名は応答に含めない。
     /// [`crate::sql::allowlist::SqlSurfaceError::NullValueNotAllowed`] の写像。

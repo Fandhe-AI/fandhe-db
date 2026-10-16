@@ -519,6 +519,11 @@ pub enum SqlSurfaceError {
     /// ポインタ）。`param` は 1 始まりの `$n` 番号で、エラー文言には番号だけを含める
     /// （値・表の存在情報は含めない）。
     IndeterminateDatatype { param: u16 },
+    /// 明示的な `COLLATE` 同士の食い違い（`42P21`。Issue #2190・TABLE-28）。固定文言のみ。
+    CollationMismatch,
+    /// 暗黙の照合の衝突を照合が必要な演算が消費した（`42P22`。Issue #2190・TABLE-28）。
+    /// 固定文言のみ。
+    IndeterminateCollation,
     /// NULL を許さない引数への NULL（`22004`。Issue #1599。`jsonb_build_object` のキー）。
     NullValueNotAllowed { detail: &'static str },
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
@@ -1052,6 +1057,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
             SqlSurfaceError::IndeterminateDatatype { .. } => ErrorClass::IndeterminateDatatype,
+            SqlSurfaceError::CollationMismatch => ErrorClass::CollationMismatch,
+            SqlSurfaceError::IndeterminateCollation => ErrorClass::IndeterminateCollation,
             SqlSurfaceError::NullValueNotAllowed { .. } => ErrorClass::NullValueNotAllowed,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidDatetimeFormat { .. } => ErrorClass::InvalidDatetimeFormat,
@@ -1159,6 +1166,12 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::NullValueNotAllowed { detail } => f.write_str(detail),
             SqlSurfaceError::IndeterminateDatatype { param } => {
                 write!(f, "could not determine data type of parameter ${param}")
+            }
+            SqlSurfaceError::CollationMismatch => {
+                f.write_str("collation mismatch between explicit collations")
+            }
+            SqlSurfaceError::IndeterminateCollation => {
+                f.write_str("could not determine which collation to use for the comparison")
             }
             SqlSurfaceError::DatetimeFieldOverflow { detail } => {
                 write!(f, "datetime field overflow: {detail}")
@@ -8913,11 +8926,11 @@ impl<'a> Parser<'a> {
     /// （TABLE-28。Issue #1609）。名前は `Token::Ident` のみ（文字列リテラル・数値・修飾名は
     /// `42601`）、未知の名前は `42704`。解決は固定リストとの完全一致だけでカタログを参照
     /// しないため、DDL 権限ゲートより前（構文段）で返してもテーブルの存在オラクルにならない。
-    /// 引用識別子はハイフンを含められない（字句段の制約）ため、`"und-x-icu"` 等の ICU 名は
-    /// ICU 照合の導入（#2190）までは字句段で `42601` になる。
+    /// ハイフンを含む ICU 名（`"und-x-icu"`）は字句段が専用トークン
+    /// （[`Token::QuotedCollationName`]）にし、この位置でだけ受理する（Issue #2190）。
     fn parse_collation_name(&mut self) -> Result<crate::collation::Collation, SqlSurfaceError> {
         let name = match self.advance() {
-            Some(Token::Ident(name)) => name.clone(),
+            Some(Token::Ident(name) | Token::QuotedCollationName(name)) => name.clone(),
             other => {
                 return Err(SqlSurfaceError::unsupported(format!(
                     "expected collation name, got {other:?}"

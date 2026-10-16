@@ -244,8 +244,9 @@ origin/main 取り込み時の是正: 並行実装していた Issue #921 のタ
   `CURRENT_TIME`=3・`LOCALTIMESTAMP`=4・`LOCALTIME`=5）・精度の有無 1 バイト・精度 1 バイト（無ければ 0）
   （Issue #1586 で導入。#1586 の時点では書き込み文が時刻関数を受理しないため DML のハッシュには現れない。
   [now-evaluated-value-ledger.md](now-evaluated-value-ledger.md)）
-- `Collate{expr, collation}`＝タグ 14・照合のカタログトークン（長さ前置。`c`／`posix`）・`expr`
-  （Issue #1609・TABLE-28。既存タグ 1〜13 は不変）
+- `Collate{expr, collation}`＝タグ 14・照合のカタログトークン（長さ前置。`c`／`posix`／
+  `und_x_icu`／`ja_x_icu`）・`expr`（Issue #1609・TABLE-28。既存タグ 1〜13 は不変。
+  Issue #2190 で ICU の 2 トークンを追加したが、既存のトークンのハッシュ・形式は変わらない）
 
 型バイトで `DATE`／`TIMESTAMP` を区別するのは、同じ暦日を表す
 `DATE '2024-01-01'` と `TIMESTAMP '2024-01-01 00:00:00'` を型バイトなしで

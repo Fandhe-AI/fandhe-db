@@ -101,3 +101,12 @@
 - ビルド再現性の前提: `icu_collator_data` の `build.rs` はビルド時に環境変数 `ICU4X_DATA_DIR` があると別データへ差し替える。CI・release・開発環境で設定しないこと
 - `ja` などのロケール指定 Collator の構築には `icu_locale_core` の直接依存が要るため、#2190 で決定事項 5 の再承認が必要になる見込み
 - 導入確認として `crates/engine/tests/icu_collator_smoke.rs` を追加した（root 照合の構築と自明な順序のみ。意味論は #2190）
+
+## 付録: Issue #2190 での実施結果
+
+- 決定事項 5（`icu_locale_core` の直接依存）は**再承認が不要になった**。`icu_collator` が公開する `CollatorPreferences::from_locale_strict(&Locale)` へ `"ja".parse()` を型推論で渡せるため、`icu_locale_core` を直接依存にせず `ja-x-icu` の Collator を構築できる。`Cargo.toml`・`Cargo.lock`・`deny.toml` は変更していない
+- 照合名は固定の許可リストの完全一致で解決する（`C`・`POSIX`・`und-x-icu`・`ja-x-icu`）。他の ICU 名は `42704`。構文では、ハイフンを含む引用識別子のうち「先頭が英字・単一の `-` で区切った英数字語・63 バイト以下」の形だけを専用トークン（`Token::QuotedCollationName`）にし、`COLLATE` 直後でだけ受理する（他の位置では従来どおり引用識別子として使えず `42601`）
+- 比較は `compare_utf8` に、`Equal` のときのバイト列順の二次比較を重ねた全順序（deterministic）。ORDER BY・GROUP BY・DISTINCT・MIN/MAX は比較器方式で、ソートキーは作らない（ヒープの候補は数回しか比較されず、ICU4X の注意書きどおりキー生成の償却が効かないため）。`Collation::sort_key`（ICU キー ‖ `0x00` ‖ 元バイト列）は #2191 が使う API として提供し、性質テストで `compare` と一致することを固定した（ICU キーが `0x00` を含まないことも検査）
+- ICU4X の `CollationKeySink` は `unstable` feature の背後にあり名前を出せない（feature の追加は依存変更になる）ため、標準実装の `Vec<u8>` へ `try_reserve` で確保し、生成後に入力長の定数倍の上限と入力長の上限を検査する
+- PG 17.11（ICU 有効ビルド・ICU4C）との順序一致を、基本的な 31 値のプールで `und-x-icu`・`ja-x-icu` とも確認した（`crates/engine/tests/sql_collate_icu.rs`）。漢字の順序は `und` と `ja` で異なるが（`字` と `漢` の前後）、ICU4X でも PG と同じだった。ICU4C／ICU4X の版差は残りうるため、プールは基本の文字を中心にしている
+- 照合データの差し替え経路（環境変数 `ICU4X_DATA_DIR`・実行時のデータファイル）は作っていない。CI・開発環境で `ICU4X_DATA_DIR` を設定しない前提は #2189 のとおり

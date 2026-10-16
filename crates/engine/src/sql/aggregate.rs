@@ -99,11 +99,6 @@ pub(crate) const MAX_AGGREGATE_RESULT_BYTES: usize = crate::arena::MAX_ARENA_TOT
 
 /// [`accumulate_text_budget`] の予算超過 detail 文言（[`is_aggregate_text_budget_error`]
 /// が照合する）。
-/// `MIN`/`MAX`(TEXT) 累積器が使う照合（TABLE-28・Issue #1610）。累積器は入力列の照合を
-/// 運ばないため既定照合の比較器に 1 本化し、バイト列順でない列の照合は束縛段の
-/// `require_wired_collation` が拒否する。列の照合を運ぶ結線は #2190。
-const TEXT_AGG_COLLATION: crate::collation::Collation = crate::collation::Collation::DEFAULT;
-
 const AGGREGATE_TEXT_BUDGET_EXCEEDED_DETAIL: &str = "aggregate result exceeds capacity";
 /// 同上。`checked_add` のオーバーフロー側の detail 文言。
 const AGGREGATE_TEXT_BUDGET_OVERFLOW_DETAIL: &str = "aggregate text budget accounting overflowed";
@@ -280,6 +275,7 @@ impl ReferencedColumns {
         for item in items {
             match &item.input {
                 AggregateInput::TextColumn(index)
+                | AggregateInput::CollatedTextColumn { index, .. }
                 | AggregateInput::BooleanColumn(index)
                 | AggregateInput::DateColumn(index)
                 | AggregateInput::TimestampColumn(index)
@@ -628,9 +624,10 @@ pub(crate) enum Accumulator {
     /// `MIN(<Scalar 式>)`。`f64` は全順序を持たないため `total_cmp` で比較する。
     FloatMin(Option<f64>),
     FloatMax(Option<f64>),
-    /// `MIN(<TEXT 列>)`。[`TEXT_AGG_COLLATION`] の比較器で比較する。
-    TextMin(Option<String>),
-    TextMax(Option<String>),
+    /// `MIN(<TEXT 列>)`。保持する照合（列の照合・`COLLATE`。TABLE-28・Issue #2190）の比較器で
+    /// 比較する（バイト列順の照合は従来どおりバイト比較）。
+    TextMin(Option<String>, crate::collation::Collation),
+    TextMax(Option<String>, crate::collation::Collation),
     /// `SUM(<INTEGER>)`（Issue #892・D2）。`i128` の `checked_add` で
     /// 正確に累積し、`finish` で `i64` 範囲を検査する（部分和が一時的に
     /// `i64` を超えても最終値が収まれば成功する契約のため、確定時に検査する）。
@@ -767,8 +764,18 @@ impl Accumulator {
             },
             (Min, AggregateInput::ScalarExpr { .. }) => Accumulator::FloatMin(None),
             (Max, AggregateInput::ScalarExpr { .. }) => Accumulator::FloatMax(None),
-            (Min, AggregateInput::TextColumn(_)) => Accumulator::TextMin(None),
-            (Max, AggregateInput::TextColumn(_)) => Accumulator::TextMax(None),
+            (Min, AggregateInput::TextColumn(_)) => {
+                Accumulator::TextMin(None, crate::collation::Collation::DEFAULT)
+            }
+            (Max, AggregateInput::TextColumn(_)) => {
+                Accumulator::TextMax(None, crate::collation::Collation::DEFAULT)
+            }
+            (Min, AggregateInput::CollatedTextColumn { collation, .. }) => {
+                Accumulator::TextMin(None, *collation)
+            }
+            (Max, AggregateInput::CollatedTextColumn { collation, .. }) => {
+                Accumulator::TextMax(None, *collation)
+            }
             // Issue #892（D2）: `INTEGER`/`BIGINT` 列。`SUM`/`AVG` は `i128` で
             // 正確に累積する。`SUM(INTEGER/SMALLINT)` は確定時（`finish`）に `i64` 範囲を
             // 検査し、`SUM(BIGINT)` は numeric で返す（Issue #2271）。
@@ -896,7 +903,8 @@ impl Accumulator {
                 }
             }
             AggregateInput::IdU64 => self.observe_id(id),
-            AggregateInput::TextColumn(index) => {
+            AggregateInput::TextColumn(index)
+            | AggregateInput::CollatedTextColumn { index, .. } => {
                 let value = scanned
                     .get(*index)
                     .copied()
@@ -1150,7 +1158,8 @@ impl Accumulator {
     ) -> Result<(), SqlSurfaceError> {
         let key: Option<Vec<u8>> = match input {
             AggregateInput::IdU64 => Some(id.to_be_bytes().to_vec()),
-            AggregateInput::TextColumn(index) => scanned
+            AggregateInput::TextColumn(index)
+            | AggregateInput::CollatedTextColumn { index, .. } => scanned
                 .get(*index)
                 .copied()
                 .flatten()
@@ -1462,24 +1471,20 @@ impl Accumulator {
                 })?;
                 Ok(())
             }
-            Accumulator::TextMin(m) => {
+            Accumulator::TextMin(m, collation) => {
                 let should_update = match m {
                     None => true,
-                    Some(cur) => TEXT_AGG_COLLATION
-                        .compare(value.as_bytes(), cur.as_bytes())
-                        .is_lt(),
+                    Some(cur) => collation.compare(value.as_bytes(), cur.as_bytes()).is_lt(),
                 };
                 if should_update {
                     *m = Some(try_clone_str(value)?);
                 }
                 Ok(())
             }
-            Accumulator::TextMax(m) => {
+            Accumulator::TextMax(m, collation) => {
                 let should_update = match m {
                     None => true,
-                    Some(cur) => TEXT_AGG_COLLATION
-                        .compare(value.as_bytes(), cur.as_bytes())
-                        .is_gt(),
+                    Some(cur) => collation.compare(value.as_bytes(), cur.as_bytes()).is_gt(),
                 };
                 if should_update {
                     *m = Some(try_clone_str(value)?);
@@ -1800,7 +1805,7 @@ impl Accumulator {
     /// 不十分）。
     pub(crate) fn text_len(&self) -> usize {
         match self {
-            Accumulator::TextMin(m) | Accumulator::TextMax(m) => {
+            Accumulator::TextMin(m, _) | Accumulator::TextMax(m, _) => {
                 m.as_ref().map(String::len).unwrap_or(0)
             }
             _ => 0,
@@ -1846,8 +1851,8 @@ impl Accumulator {
             },
             Accumulator::FloatMin(m) => m.map(Cell::Float).unwrap_or(Cell::Null),
             Accumulator::FloatMax(m) => m.map(Cell::Float).unwrap_or(Cell::Null),
-            Accumulator::TextMin(m) => m.map(Cell::Text).unwrap_or(Cell::Null),
-            Accumulator::TextMax(m) => m.map(Cell::Text).unwrap_or(Cell::Null),
+            Accumulator::TextMin(m, _) => m.map(Cell::Text).unwrap_or(Cell::Null),
+            Accumulator::TextMax(m, _) => m.map(Cell::Text).unwrap_or(Cell::Null),
             // Issue #892（D2）: 部分和は `i128` で正確に保持し、ここで初めて
             // `i64`（BIGINT）範囲を検査する（走査順に依存しない確定的判定）。
             Accumulator::IntSum(s) => match s {
@@ -2581,7 +2586,9 @@ pub(crate) fn aggregate_result_type(
         (Min | Max, AggregateInput::DateColumn(_)) => ColumnType::Date,
         (Min | Max, AggregateInput::TimestampColumn(_)) => ColumnType::Timestamp,
         (Min | Max, AggregateInput::TimeColumn(_)) => ColumnType::Time,
-        (Min | Max, AggregateInput::TextColumn(_)) => ColumnType::Text,
+        (Min | Max, AggregateInput::TextColumn(_) | AggregateInput::CollatedTextColumn { .. }) => {
+            ColumnType::Text
+        }
         _ => return None,
     })
 }
@@ -3772,8 +3779,8 @@ mod tests {
 
     #[test]
     fn text_min_max_skip_null_and_compare_by_byte_order() {
-        let mut min = Accumulator::TextMin(None);
-        let mut max = Accumulator::TextMax(None);
+        let mut min = Accumulator::TextMin(None, crate::collation::Collation::DEFAULT);
+        let mut max = Accumulator::TextMax(None, crate::collation::Collation::DEFAULT);
         for v in [Some("banana"), None, Some("apple"), Some("cherry")] {
             min.observe_text(v).unwrap();
             max.observe_text(v).unwrap();
@@ -3784,7 +3791,7 @@ mod tests {
 
     #[test]
     fn text_min_max_empty_set_is_null() {
-        let min = Accumulator::TextMin(None);
+        let min = Accumulator::TextMin(None, crate::collation::Collation::DEFAULT);
         assert_eq!(min.finish().unwrap(), Cell::Null);
     }
 

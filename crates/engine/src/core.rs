@@ -1725,6 +1725,65 @@ fn table_schema_in(
     })
 }
 
+/// 評価後射影形ビュー本文が参照するテーブル名を集める（入れ子の評価後射影形ビューは本文を辿る）。
+fn buffered_body_tables(stmt: &crate::sql::allowlist::Statement, out: &mut Vec<String>) {
+    use crate::sql::allowlist::Statement;
+    match stmt {
+        Statement::Select(v) => out.push(v.table_name().to_string()),
+        Statement::Aggregate(v) => out.push(v.table_name().to_string()),
+        Statement::Scan(v) => out.push(v.table_name().to_string()),
+        Statement::Join(v) => out.extend(crate::sql::join::collect_join_tables(v)),
+        Statement::SetOperation(v) => crate::sql::set_op::collect_branch_tables(&v.tree, out),
+        Statement::BufferedView(v) => buffered_body_tables(&v.body, out),
+        _ => {}
+    }
+}
+
+/// 評価後射影形ビューの外側クエリが、本文の結果列の順序・比較に依存するか（TABLE-28・
+/// Issue #2190）。外側は本文の評価済みセルを列型だけで比較するため、本文のテキスト列に
+/// ついた照合は運ばれない。素通し（`WHERE`・`ORDER BY`・ウィンドウ・集計がない）以外は
+/// 順序・比較に依存するとみなす。
+fn buffered_outer_depends_on_order(view: &crate::sql::allowlist::ValidatedBufferedView) -> bool {
+    match &view.outer {
+        crate::sql::allowlist::BufferedOuter::Rows(rows) => {
+            !rows.where_predicates.is_empty()
+                || !rows.order_by.is_empty()
+                || !rows.order_keys.is_empty()
+                || !rows.window_items.is_empty()
+        }
+        crate::sql::allowlist::BufferedOuter::Aggregate(_) => true,
+    }
+}
+
+/// 評価後射影形ビューの本文が非バイト列順の照合（ICU）の列を持つテーブルを参照し、かつ外側が
+/// 順序・比較に依存するときは `0A000` で拒否する（照合が運ばれずバイト列順で黙って
+/// 比較される意味論の fail-open を作らない。TABLE-28・Issue #2190）。
+fn check_buffered_view_collations(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    view: &crate::sql::allowlist::ValidatedBufferedView,
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    if !buffered_outer_depends_on_order(view) {
+        return Ok(());
+    }
+    let mut names = Vec::new();
+    buffered_body_tables(&view.body, &mut names);
+    let schemas = table_schemas_in(read_txn, &names)?;
+    let collated = schemas.values().any(|schema| {
+        schema
+            .columns
+            .iter()
+            .any(|c| c.collation.is_some_and(|coll| !coll.is_byte_order()))
+    });
+    if collated {
+        return Err(
+            crate::sql::allowlist::SqlSurfaceError::FeatureNotSupported {
+                detail: "this collation is not supported in this expression".to_string(),
+            },
+        );
+    }
+    Ok(())
+}
+
 /// [`table_schema_in`] の複数テーブル版（重複名は 1 回だけ解決する）。
 fn table_schemas_in(
     read_txn: &impl crate::storage::read_source::ReadSource,
@@ -5373,6 +5432,7 @@ impl EngineCore {
             // （本文は実行せずに）導出し、外側の射影だけを適用する。
             ParsedSql::Statement(Statement::BufferedView(validated)) => {
                 Self::check_buffered_outer_limit(validated, limits)?;
+                check_buffered_view_collations(&self.begin_read_txn()?, validated)?;
                 let body_parsed = ParsedSql::Statement((*validated.body).clone());
                 // 本文は永続化済みで `$n` を含まないため、外側の `$n` 置換に
                 // 位置対応するダミーフラグは渡さない（本文の ENUM 検証を省略しない）。
@@ -5972,6 +6032,7 @@ impl EngineCore {
             // もの）。第 2 の実行器は作らない。
             crate::sql::allowlist::Statement::BufferedView(validated) => {
                 Self::check_buffered_outer_limit(&validated, &limits)?;
+                check_buffered_view_collations(read_txn, &validated)?;
                 let body = (*validated.body).clone();
                 match self.execute_read_statement_with_limits(
                     ctx,

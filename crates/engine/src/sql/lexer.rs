@@ -44,6 +44,12 @@ pub enum Token {
     /// BOOLEAN 列の識別子として扱う（`sql::allowlist` の `try_parse_structural_leaf`）。
     /// それ以外の引用識別子は従来どおり [`Token::Ident`]。
     QuotedBoolWord(String),
+    /// ハイフンを含む二重引用符付きの照合名候補（`"und-x-icu"` 等。Issue #2190・TABLE-28）。
+    /// 引用識別子はハイフンを含められない（[`is_plain_identifier`]）が、ICU の照合名は
+    /// ハイフンを含むため、先頭が英字で単一の `-` 区切りの英数字語（長さ 63 バイト以下
+    /// 〔NAMEDATALEN-1〕）だけを専用トークンにする。受理するのは `COLLATE` 直後の照合名の位置だけで、
+    /// 他の位置では既存の不一致腕により `42601` になる（識別子として使えない）。
+    QuotedCollationName(String),
     StringLiteral(String),
     Number(String),
     /// `(` `)` `,` `*` `=` `;` `+` `-` `/` `>` `<` `[` `]` `%` `#`（`%`・単独 `#` は
@@ -192,7 +198,7 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
                 Keyword::Limit => "LIMIT",
             }),
             Token::Ident(s) | Token::Number(s) => out.push_str(s),
-            Token::QuotedBoolWord(s) => {
+            Token::QuotedBoolWord(s) | Token::QuotedCollationName(s) => {
                 out.push('"');
                 out.push_str(s);
                 out.push('"');
@@ -639,6 +645,11 @@ fn tokenize_impl(
                     byte_offset: offset,
                 });
             }
+            if is_hyphenated_collation_name(content) {
+                tokens.push(Token::QuotedCollationName(content.to_string()));
+                advance_to(&mut chars, end);
+                continue;
+            }
             if !is_plain_identifier(content) {
                 return Err(LexError {
                     message: "unsupported quoted identifier".to_string(),
@@ -889,6 +900,28 @@ pub(crate) fn quoted_identifier_end(input: &str, start: usize) -> Option<usize> 
         }
         j = j.saturating_add(1);
     }
+}
+
+/// 二重引用符の中身が、ハイフンを含む照合名の形（先頭は英字、`[A-Za-z0-9_]+` の語を単一の `-` で
+/// 連結した形で `-` を 1 個以上含む・63 バイト以下）か（Issue #2190）。文字種と長さを字句段で制限し、解決は構文段の固定許可リスト
+/// （`Collation::resolve_name`）が行う。
+fn is_hyphenated_collation_name(content: &str) -> bool {
+    const MAX_COLLATION_NAME_BYTES: usize = 63;
+    if content.len() > MAX_COLLATION_NAME_BYTES || !content.contains('-') {
+        return false;
+    }
+    if !content
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    // ハイフンは英数字・`_` の語の間の区切りとしてだけ許す（先頭・末尾・連続は不可。`--` は
+    // コメント開始と紛れるため特に許さない）。
+    content
+        .split('-')
+        .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 /// 二重引用符識別子の中身が、引用符なしで字句解析しても同じ 1 個の `Ident` に
@@ -2065,5 +2098,39 @@ mod quoted_bool_word_tests {
         assert!(!stored_body_needs_bool_literal_marker(
             &tokenize("SELECT id FROM t WHERE flag = true").expect("tokenize")
         ));
+    }
+    /// TABLE-28・Issue #2190: ハイフンを含む二重引用符付きの照合名候補だけが専用トークンになる。
+    /// 文字種（先頭は英字、以降は英数字・`_`・`-`）と長さ（63 バイト以下）を字句段で制限する。
+    #[test]
+    fn hyphenated_quoted_collation_name_token() {
+        let toks = tokenize("COLLATE \"und-x-icu\"").expect("tokenize");
+        assert_eq!(
+            toks.last(),
+            Some(&Token::QuotedCollationName("und-x-icu".to_string()))
+        );
+        // ハイフンなしの引用識別子は従来どおり `Ident`。
+        assert_eq!(
+            tokenize("\"C\"").expect("tokenize"),
+            vec![Token::Ident("C".to_string())]
+        );
+        // 先頭が英字でない・不正な文字・長すぎる語は従来どおり拒否（fail-closed）。
+        for bad in [
+            "\"1a-b\"",
+            "\"-ab\"",
+            "\"ab-\"",
+            "\"a--b\"",
+            "\"a b-c\"",
+            "\"a.b-c\"",
+            "\"\u{e9}-x\"",
+        ] {
+            assert!(tokenize(bad).is_err(), "{bad}");
+        }
+        let long = format!("\"a-{}\"", "x".repeat(62));
+        assert!(tokenize(&long).is_err(), "64 bytes must be rejected");
+        let max = format!("\"a-{}\"", "x".repeat(61));
+        assert!(tokenize(&max).is_ok(), "63 bytes is the limit");
+        // 描画は引用付きで往復する。
+        let rendered = render_tokens(&toks).expect("render");
+        assert_eq!(tokenize(&rendered).expect("retokenize"), toks);
     }
 }
