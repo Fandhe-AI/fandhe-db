@@ -224,6 +224,113 @@ pub(crate) fn timestamp_diff(a: i64, b: i64) -> Result<Interval, SqlSurfaceError
     })
 }
 
+/// C の `TMODULO` 相当（0 方向切り捨ての商を取り出し、`t` を余りにする）。
+fn tmodulo(t: &mut i64, unit: i64) -> i64 {
+    let q = *t / unit;
+    if q != 0 {
+        *t -= q * unit;
+    }
+    q
+}
+
+fn add_i32(a: i32, b: i64) -> Result<i32, SqlSurfaceError> {
+    i64::from(a)
+        .checked_add(b)
+        .and_then(|v| i32::try_from(v).ok())
+        .ok_or_else(interval_out_of_range)
+}
+
+/// 日と時間の符号を揃える（日が正で時間が負なら 1 日分を時間へ借りる。逆も同様）。
+fn align_day_time(days: &mut i32, micros: &mut i64) {
+    if *days > 0 && *micros < 0 {
+        *micros += MICROS_PER_DAY;
+        *days -= 1;
+    } else if *days < 0 && *micros > 0 {
+        *micros -= MICROS_PER_DAY;
+        *days += 1;
+    }
+}
+
+/// 無限大の番兵の入力は `22008`（本 DB は infinity の interval を扱わない。多層防御）。
+fn require_finite(iv: &Interval) -> Result<(), SqlSurfaceError> {
+    if validate_interval(iv) {
+        Ok(())
+    } else {
+        Err(interval_out_of_range())
+    }
+}
+
+/// `justify_hours(interval)`（PG17 の `interval_justify_hours`）。24 時間を 1 日へ繰り上げ、
+/// 日と時間の符号を揃える。日の加算があふれたら `22008`。
+pub(crate) fn justify_hours(iv: &Interval) -> Result<Interval, SqlSurfaceError> {
+    require_finite(iv)?;
+    let mut micros = iv.micros;
+    let whole = tmodulo(&mut micros, MICROS_PER_DAY);
+    let mut days = add_i32(iv.days, whole)?;
+    align_day_time(&mut days, &mut micros);
+    check_finite(Interval {
+        months: iv.months,
+        days,
+        micros,
+    })
+}
+
+/// `justify_days(interval)`（PG17 の `interval_justify_days`）。30 日を 1 か月へ繰り上げ、
+/// 月と日の符号を揃える。月の加算があふれたら `22008`。
+pub(crate) fn justify_days(iv: &Interval) -> Result<Interval, SqlSurfaceError> {
+    require_finite(iv)?;
+    let mut days = i64::from(iv.days);
+    let whole = tmodulo(&mut days, 30);
+    let mut months = add_i32(iv.months, whole)?;
+    if months > 0 && days < 0 {
+        days += 30;
+        months -= 1;
+    } else if months < 0 && days > 0 {
+        days -= 30;
+        months += 1;
+    }
+    let days = i32::try_from(days).map_err(|_| interval_out_of_range())?;
+    check_finite(Interval {
+        months,
+        days,
+        micros: iv.micros,
+    })
+}
+
+/// `justify_interval(interval)`（PG17 の `interval_justify_interval`）。時間→日→月へ繰り上げ、
+/// 月・日・時間の符号を揃える。あふれたら `22008`。
+pub(crate) fn justify_interval(iv: &Interval) -> Result<Interval, SqlSurfaceError> {
+    require_finite(iv)?;
+    let mut months = iv.months;
+    let mut days = i64::from(iv.days);
+    let mut micros = iv.micros;
+    // あふれを避けるため、日と時間の符号が同じなら先に日を月へ繰り上げる。
+    if (days > 0 && micros > 0) || (days < 0 && micros < 0) {
+        let whole = tmodulo(&mut days, 30);
+        months = add_i32(months, whole)?;
+    }
+    let whole_days = tmodulo(&mut micros, MICROS_PER_DAY);
+    days = days
+        .checked_add(whole_days)
+        .ok_or_else(interval_out_of_range)?;
+    let whole_months = tmodulo(&mut days, 30);
+    months = add_i32(months, whole_months)?;
+    if months > 0 && (days < 0 || (days == 0 && micros < 0)) {
+        days += 30;
+        months -= 1;
+    } else if months < 0 && (days > 0 || (days == 0 && micros > 0)) {
+        days -= 30;
+        months += 1;
+    }
+    let mut days = i32::try_from(days).map_err(|_| interval_out_of_range())?;
+    align_day_time(&mut days, &mut micros);
+    check_finite(Interval {
+        months,
+        days,
+        micros,
+    })
+}
+
 /// `INTERVAL + INTERVAL`。値の計算は集計と共通の [`checked_add_interval`] で、
 /// ここでは SQLSTATE（`22008`）への写像だけを行う。
 pub(crate) fn interval_add(a: &Interval, b: &Interval) -> Result<Interval, SqlSurfaceError> {
@@ -371,6 +478,32 @@ mod tests {
             code(timestamp_add_interval(ts("2000-01-01"), &huge).unwrap_err()),
             "22008"
         );
+    }
+
+    #[test]
+    fn justify_functions() {
+        let h = |s: &str| format_interval(&justify_hours(&iv(s)).unwrap());
+        assert_eq!(h("1 day 25:00:00"), "2 days 01:00:00");
+        assert_eq!(h("1 day -01:00:00"), "23:00:00");
+        let d = |s: &str| format_interval(&justify_days(&iv(s)).unwrap());
+        assert_eq!(d("35 days"), "1 mon 5 days");
+        assert_eq!(d("-35 days"), "-1 mons -5 days");
+        assert_eq!(d("1 mon -1 day"), "29 days");
+        let j = |s: &str| format_interval(&justify_interval(&iv(s)).unwrap());
+        assert_eq!(j("1 mon -1 hour"), "29 days 23:00:00");
+        assert_eq!(j("-1 mon 1 hour"), "-29 days -23:00:00");
+        let big = Interval {
+            months: 0,
+            days: i32::MAX - 1,
+            micros: 2 * MICROS_PER_DAY,
+        };
+        assert_eq!(code(justify_hours(&big).unwrap_err()), "22008");
+        let max_months = Interval {
+            months: i32::MAX - 1,
+            days: 60,
+            micros: 0,
+        };
+        assert_eq!(code(justify_days(&max_months).unwrap_err()), "22008");
     }
 
     #[test]

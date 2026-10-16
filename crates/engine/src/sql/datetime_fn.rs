@@ -16,13 +16,19 @@
 //! `TIME` 入力（Issue #1570）は [`time_part`] が担う。`date_part` は暦計算で日付境界へ
 //! 折り返す（`24:00:00` が hour=0 になる）ため流用せず、0 時起点のマイクロ秒をそのまま分解する。
 //!
+//! `INTERVAL` 入力（Issue #1582・TABLE-34）は [`interval_part`]／[`interval_trunc`] が担う。
+//! 分解は PostgreSQL の `interval2itm` と同じく時間を日へ繰り上げず（`'36 hours'` は day 0・
+//! hour 36）、符号付き整数除算は 0 方向への切り捨て（暦計算の `div_euclid` は流用しない）。
+//!
 //! 意味論は PostgreSQL 互換（`date_part`／`EXTRACT`／`date_trunc` の公開済み
 //! 挙動）に合わせるが、以下は既知の差分として `docs/design/
 //! datetime-scalar-functions.md`（ADR）に記録する: `TIMESTAMPTZ` 非対応・
 //! `DATE` 入力の暗黙昇格・`EXTRACT` の既定列名差分等。spec 本文は転記せず
 //! TASK-210・SQL-26 のポインタのみを付す。
 
-use crate::datetime::{civil_from_days, days_from_civil, MICROS_PER_DAY};
+use crate::datetime::{
+    civil_from_days, days_from_civil, validate_interval, Interval, MICROS_PER_DAY,
+};
 use crate::sql::allowlist::SqlSurfaceError;
 
 /// `date_part`／`EXTRACT` が受理する field（大小無視・単数形/複数形の一部を
@@ -314,6 +320,190 @@ pub(crate) fn time_part(field: DatePartField, micros: i64) -> Option<f64> {
     }
 }
 
+/// `INTERVAL` を PostgreSQL の `interval2itm` と同じ規則で分解した値（Issue #1582）。
+/// 年・月は `months` を 12 で割った商・余り、日はそのまま、時間以下は `micros` から
+/// 時・分・秒・マイクロ秒へ切り出す（日へは繰り上げない）。符号は各要素が元の符号を保つ。
+#[derive(Debug, Clone, Copy)]
+struct IntervalParts {
+    year: i64,
+    mon: i64,
+    mday: i64,
+    hour: i64,
+    min: i64,
+    sec: i64,
+    usec: i64,
+}
+
+impl IntervalParts {
+    fn from_interval(iv: &Interval) -> Self {
+        let months = i64::from(iv.months);
+        let mut t = iv.micros;
+        let hour = t / 3_600_000_000;
+        t %= 3_600_000_000;
+        let min = t / 60_000_000;
+        t %= 60_000_000;
+        let sec = t / 1_000_000;
+        let usec = t % 1_000_000;
+        Self {
+            year: months / 12,
+            mon: months % 12,
+            mday: i64::from(iv.days),
+            hour,
+            min,
+            sec,
+            usec,
+        }
+    }
+}
+
+/// `INTERVAL` が `date_part` で扱える field か（束縛時の拒否判定。Issue #1582）。
+/// `week`・`dow`・`isodow`・`doy`・`isoyear`・`timezone*` は PostgreSQL と同じく非対応（`0A000`）。
+pub(crate) fn interval_supports_field(field: DatePartField) -> bool {
+    !matches!(
+        field,
+        DatePartField::Week
+            | DatePartField::Dow
+            | DatePartField::IsoDow
+            | DatePartField::Doy
+            | DatePartField::IsoYear
+            | DatePartField::Timezone
+            | DatePartField::TimezoneHour
+            | DatePartField::TimezoneMinute
+    )
+}
+
+/// `date_part(field, interval)`／`EXTRACT(field FROM interval)` の値レベル計算（Issue #1582。
+/// PostgreSQL 17 の `interval_part_common` の float8 経路）。未対応 field は `None`
+/// （束縛時に `0A000` で拒否済みのため評価時には到達しない）。
+pub(crate) fn interval_part(field: DatePartField, iv: &Interval) -> Option<f64> {
+    let p = IntervalParts::from_interval(iv);
+    Some(match field {
+        DatePartField::Microseconds => (p.sec * 1_000_000 + p.usec) as f64,
+        DatePartField::Milliseconds => p.sec as f64 * 1000.0 + p.usec as f64 / 1000.0,
+        DatePartField::Second => p.sec as f64 + p.usec as f64 / 1_000_000.0,
+        DatePartField::Minute => p.min as f64,
+        DatePartField::Hour => p.hour as f64,
+        DatePartField::Day => p.mday as f64,
+        DatePartField::Month => p.mon as f64,
+        DatePartField::Quarter => (p.mon / 3 + 1) as f64,
+        DatePartField::Year => p.year as f64,
+        DatePartField::Decade => (p.year / 10) as f64,
+        DatePartField::Century => (p.year / 100) as f64,
+        DatePartField::Millennium => (p.year / 1000) as f64,
+        DatePartField::Epoch => {
+            let months = i64::from(iv.months);
+            let mut r = iv.micros as f64 / 1_000_000.0;
+            r += (365.25 * 86_400.0) * (months / 12) as f64;
+            r += (30.0 * 86_400.0) * (months % 12) as f64;
+            r += 86_400.0 * f64::from(iv.days);
+            r
+        }
+        DatePartField::Week
+        | DatePartField::Dow
+        | DatePartField::IsoDow
+        | DatePartField::Doy
+        | DatePartField::IsoYear
+        | DatePartField::Timezone
+        | DatePartField::TimezoneHour
+        | DatePartField::TimezoneMinute => return None,
+    })
+}
+
+fn interval_trunc_out_of_range() -> SqlSurfaceError {
+    SqlSurfaceError::datetime_field_overflow("interval out of range")
+}
+
+/// `date_trunc(unit, interval)` の値レベル計算（Issue #1582。PostgreSQL 17 の `interval_trunc`）。
+/// 上位の単位から下位へ順に切り落とす。`week` は PostgreSQL と同じく非対応（束縛時に `0A000`
+/// 済みのため評価時には `0A000` を返す fail-closed）。あふれ・番兵衝突は `22008`。
+pub(crate) fn interval_trunc(
+    unit: DateTruncUnit,
+    iv: &Interval,
+) -> Result<Interval, SqlSurfaceError> {
+    let mut p = IntervalParts::from_interval(iv);
+    if unit == DateTruncUnit::Week {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "date_trunc unit \"week\" is not supported for type interval".to_string(),
+        });
+    }
+    // 上位 unit の切り捨ては下位 unit の切り捨てを含む（PostgreSQL の FALL THRU と同じ）。
+    let rank = |u: DateTruncUnit| -> u8 {
+        match u {
+            DateTruncUnit::Millennium => 12,
+            DateTruncUnit::Century => 11,
+            DateTruncUnit::Decade => 10,
+            DateTruncUnit::Year => 9,
+            DateTruncUnit::Quarter => 8,
+            DateTruncUnit::Month => 7,
+            DateTruncUnit::Week => 6,
+            DateTruncUnit::Day => 5,
+            DateTruncUnit::Hour => 4,
+            DateTruncUnit::Minute => 3,
+            DateTruncUnit::Second => 2,
+            DateTruncUnit::Milliseconds => 1,
+            DateTruncUnit::Microseconds => 0,
+        }
+    };
+    let r = rank(unit);
+    if r >= 12 {
+        p.year = (p.year / 1000) * 1000;
+    }
+    if r >= 11 {
+        p.year = (p.year / 100) * 100;
+    }
+    if r >= 10 {
+        p.year = (p.year / 10) * 10;
+    }
+    if r >= 9 {
+        p.mon = 0;
+    }
+    if r == 8 {
+        p.mon = 3 * (p.mon / 3);
+    }
+    if r >= 7 {
+        p.mday = 0;
+    }
+    if r >= 5 {
+        p.hour = 0;
+    }
+    if r >= 4 {
+        p.min = 0;
+    }
+    if r >= 3 {
+        p.sec = 0;
+    }
+    if r >= 2 {
+        p.usec = 0;
+    }
+    if r == 1 {
+        p.usec = (p.usec / 1000) * 1000;
+    }
+    let months = p
+        .year
+        .checked_mul(12)
+        .and_then(|v| v.checked_add(p.mon))
+        .and_then(|v| i32::try_from(v).ok())
+        .ok_or_else(interval_trunc_out_of_range)?;
+    let days = i32::try_from(p.mday).map_err(|_| interval_trunc_out_of_range())?;
+    let micros = p
+        .hour
+        .checked_mul(3_600_000_000)
+        .and_then(|v| v.checked_add(p.min * 60_000_000))
+        .and_then(|v| v.checked_add(p.sec * 1_000_000))
+        .and_then(|v| v.checked_add(p.usec))
+        .ok_or_else(interval_trunc_out_of_range)?;
+    let out = Interval {
+        months,
+        days,
+        micros,
+    };
+    if validate_interval(&out) {
+        Ok(out)
+    } else {
+        Err(interval_trunc_out_of_range())
+    }
+}
+
 /// `days.checked_mul(MICROS_PER_DAY)` のオーバーフローを `22008`
 /// （[`SqlSurfaceError::datetime_field_overflow`]）へ写像する共通ヘルパー
 /// （`date_trunc` の各 unit 分岐が共有する）。
@@ -481,6 +671,39 @@ mod tests {
 
     /// 2024-02-29（閏年）12:34:56.789012 の全 field を独立オラクル
     /// （PostgreSQL の公開済み挙動）で固定する。
+    #[test]
+    fn interval_part_and_trunc() {
+        use crate::datetime::{format_interval, parse_interval};
+        let iv = |s: &str| parse_interval(s).unwrap();
+        let p = |f, s: &str| interval_part(f, &iv(s)).unwrap();
+        let v = iv("1 year 2 mons 3 days 04:05:06.789");
+        assert_eq!(interval_part(DatePartField::Milliseconds, &v), Some(6789.0));
+        assert_eq!(
+            interval_part(DatePartField::Epoch, &v),
+            Some(37_015_506.789_000_005)
+        );
+        assert_eq!(p(DatePartField::Quarter, "-14 mons"), 1.0);
+        assert_eq!(p(DatePartField::Year, "-14 mons"), -1.0);
+        assert_eq!(p(DatePartField::Hour, "36 hours"), 36.0);
+        assert_eq!(p(DatePartField::Day, "36 hours"), 0.0);
+        assert!(!interval_supports_field(DatePartField::Week));
+        assert!(!interval_supports_field(DatePartField::Timezone));
+        assert!(interval_part(DatePartField::Dow, &v).is_none());
+        let t = |u, s: &str| format_interval(&interval_trunc(u, &iv(s)).unwrap());
+        assert_eq!(t(DateTruncUnit::Decade, "-15 years"), "-10 years");
+        assert_eq!(t(DateTruncUnit::Quarter, "1 year 5 mons"), "1 year 3 mons");
+        assert_eq!(
+            t(DateTruncUnit::Milliseconds, "00:00:01.234567"),
+            "00:00:01.234"
+        );
+        assert_eq!(
+            interval_trunc(DateTruncUnit::Week, &v)
+                .unwrap_err()
+                .wire_code(),
+            "0A000"
+        );
+    }
+
     #[test]
     fn time_part_fields_and_24h_boundary() {
         let t = crate::datetime::parse_time("12:34:56.789012").unwrap();

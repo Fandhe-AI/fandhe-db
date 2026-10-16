@@ -189,3 +189,16 @@ is_not_masked_out` で分岐内参照のみの回帰を固定する）。
 - `date_part`／`EXTRACT` は TIMESTAMPTZ 入力を `BuiltinFn::DatePartTz` で評価する。暦の field は評価時のセッション TZ の壁時計、`epoch` は UTC の絶対値、`timezone`・`timezone_hour`・`timezone_minute` は offset（秒・時・分。東が正）。`timezone*` field は TIMESTAMPTZ 専用で、TIMESTAMP／DATE／TIME に対しては `0A000`。
 - `date_trunc(unit, timestamptz)` は `DateTruncTz`（セッション TZ）、`date_trunc(unit, timestamptz, zone)` は `DateTruncTzZone`（第 3 引数の TZ。不正な zone は `22023`）。day 以上の単位は切り捨て後の局所時刻を DST の gap／fold 規則で UTC へ再解決し、hour 以下の単位は元の offset を保つ（PG 17 の実測。[timestamptz-conversion.md](timestamptz-conversion.md)）。TIMESTAMP を第 3 引数付きで渡すと timestamptz へ暗黙変換して TIMESTAMPTZ を返す。
 - いずれもセッション TZ に依存するため定数畳み込みの対象外で、CHECK 制約の本体では `0A000`。
+
+## Issue #1582 追記: INTERVAL 入力と justify_*
+
+対象ビヘイビア: TABLE-34（ポインタ）。純関数は `sql/datetime_fn.rs`（`interval_part`・`interval_trunc`）と
+`sql/interval_arith.rs`（`justify_*`）。
+
+- **分解**: PostgreSQL 17 の `interval2itm` と同じ。年 = `months / 12`、月 = `months % 12`、日はそのまま、時間以下は `micros` から切り出す（日へ繰り上げない。`'36 hours'` は day 0・hour 36）。符号付き除算は 0 方向への切り捨てで、TIMESTAMP 用の暦計算（`div_euclid`）は流用しない。
+- **date_part／EXTRACT**: `microseconds`・`milliseconds`・`second`・`minute`・`hour`・`day`・`month`・`quarter`（`mon / 3 + 1`）・`year`・`decade`・`century`・`millennium`・`epoch`（1 年 = 365.25 日、1 か月 = 30 日、PG の float8 経路と同じ演算順）。`week`・`dow`・`isodow`・`doy`・`isoyear`・`timezone*` は `0A000`（束縛時）。未知の field は `22000`。
+- **date_trunc**: 戻り型は INTERVAL。上位の単位から下位へ順に切り落とす（`decade` は 0 方向、`-15 years` → `-10 years`）。`week` は `0A000`。`date_trunc(unit, interval, zone)` は `42883`。あふれ・番兵衝突は `22008`。
+- **justify_hours／justify_days／justify_interval**: PG17 の `interval_justify_*` の移植（引数 1 個）。同名の UDF は予約名として `42723`。あふれは `22008`。
+- **NULL**: 第 1 引数が裸の NULL のときは strict に NULL。結果型は `date_part` が Scalar、`date_trunc` が INTERVAL。
+- **CHECK**: セッション TZ に依存しないため CHECK 本体で使える。
+- **既知差分・対象外**: EXTRACT の戻り型は f64（PG は numeric）、未知 field の SQLSTATE は `22000`（PG は `22023`）、`age()`、`make_interval`、infinity の interval、DecodeUnits の略記、`date_trunc` の INTERVAL 版の定数畳み込み、INTERVAL 式の比較・ORDER BY・GROUP BY・集計（列参照のみ #1580 で解禁済み）。
