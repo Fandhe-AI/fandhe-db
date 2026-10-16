@@ -217,7 +217,7 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 - `ErrorClass` に `2203x` 系を追加した（`22033` 添字不正・`22036` 非数値項目・`22038` 単一項目が必要・
   `22039` 配列なし・`2203A` メンバーなし・`2203B` 数値なし・`2203C` オブジェクトなし。計 7 分類）。wire-server の
   HTTP 写像は 400（SQL 表層専用で、NoSQL 表層からは到達しない）。`22P05`（#2183 の暫定 `22P02`）は
-  SQL 表層へ配線する #2185 で扱う。
+  SQL 表層へ配線した #2185 で `ErrorClass::UntranslatableCharacter` として解消した。
 - 意図的な差分:
   - 数値演算（`+ - * / %`・単項 `-`・`.floor()`・`.ceiling()`・`.decimal(p, s)`）は `numeric::Decimal`
     （`i128`、`scale` 38 以下）の厳密演算。オペランドは 38 桁まで、結果が表現範囲を超えれば `22003`
@@ -239,6 +239,38 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   （入力長・入れ子・リテラル長・式の高さ）の CLI 化、結果集合の直列化上限（`serialize_jsonb_bounded`）の
   適用（結果を返す呼び出し側が担う）。
 
+## Issue #2185 での変更（jsonb_path_* 関数）
+
+- `jsonb_path_query_array`・`jsonb_path_query_first`・`jsonb_path_exists`・`jsonb_path_match` を SQL の式評価器へ
+  配線した（TABLE-25 ポインタ。`crates/engine/src/sql/jsonpath_fn.rs`）。引数は
+  `(target jsonb, path jsonpath [, vars jsonb [, silent boolean]])`。結果型は `_array`／`_first` が jsonb
+  （OID 3802）、`_exists`／`_match` が boolean（OID 16）。
+- NULL: 4 引数のどれかが SQL の NULL なら結果も NULL（strict）。`_first` は 0 件で NULL、`_array` は 0 件で `[]`、
+  `_match` は単一の null で NULL。
+- 引数の束縛規則（束縛時に確定し、評価時に再判定しない）:
+  - `target`・`vars`: 既存の jsonb 引数の規則（型なし文字列リテラルは jsonb として解析。不正は `22P02`、
+    長さ超過は `54000`。jsonb 以外の型・`json` 列は `42883`）。
+  - `path`: 型なし文字列リテラルだけを受理し、束縛時に解析する（行が無い表でも構文エラーになる）。
+    裸の `NULL` は結果 NULL。text 式・列は `42883`（`jsonpath` 型の CAST・列は CAST 基盤待ちのため対象外）。
+  - `silent`: 真偽リテラル・文字列（`'t'`・`'yes'` 等。不正は `22P02`）・`NULL` の定数だけ。boolean 列・一般式は
+    `0A000`（行ごとの評価は初版の対象外）。
+  - 引数個数は 2〜4。範囲外は `42883`。名前付き引数は未対応。
+- エラー: 解析器・評価器の SQLSTATE をそのまま返す（`SqlSurfaceError::{JsonPathParse, JsonPathEval}`。分類・文言は
+  内側に委譲）。`silent` が抑止するのは抑止可能な評価エラーだけで、`54000`・`42704`・`22023`・`0A000` は常に返る。
+  `22P05`（NUL 文字）の `ErrorClass::UntranslatableCharacter` を新設し、#2183 の暫定 `22P02` を解消した
+  （wire-server の HTTP 写像は 400。SQL 表層専用）。
+- 結果の直列化は `serialize_jsonb_bounded` を通し、長さ・深さ・要素数の上限超過は `54000`。
+- 上限: `EngineCore::jsonpath_limits` は文の束縛区間に張る thread-local の RAII スコープ
+  （`JsonPathLimitsScope`。`time_fn::ClockScope` と同型）で束縛へ運び、束縛時に `BoundJsonPathFn` へ焼き込む。
+  スコープが張られない経路はハード上限にフォールバックする（無制限にはならない）。
+- 使える位置: 投影・ORDER BY・WHERE。`jsonb_path_exists`／`jsonb_path_match` は WHERE で比較なしの裸の述語として
+  書ける（否定の `NOT` 付きは `42601`。`JsonAccess` の述語演算子と同じ扱い）。CHECK・関数本体は `0A000`。
+- 意図的な差分・対象外: 集合返却の `jsonb_path_query` は名前だけ予約して `0A000`（SRF 基盤 #2220 待ち）、
+  `jsonb_path_*_tz` は未実装（`42883`）、`jsonpath` 型そのもの・名前付き引数は対象外。`@?`／`@@` は #2186、
+  `JSON_EXISTS` 等は #2187。#2184 から引き継ぐ差分（数値の桁数・`.keyvalue()` の id・datetime 系・
+  `like_regex`）は変わらない。
+- 期待値は PostgreSQL 17 の挙動に合わせたが、実機との突き合わせは未実施（strict の推定を含む）。
+
 ## 設計判断の所在
 
 型の形・値表現・字句と優先順位・演算子と関数の型解決・集合返却関数・jsonpath・
@@ -258,7 +290,7 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 | 連結・削除演算子（実装済み） | #2181 |
 | JSON スカラー関数（実装済み） | #1599 |
 | JSON 集合返却関数（SRF 基盤待ち） | #2220 |
-| jsonpath（字句・構文解析器は #2183、評価器は #2184 で実装済み） | #2183〜#2187 |
+| jsonpath（字句・構文解析器は #2183、評価器は #2184、`jsonb_path_*` 関数は #2185 で実装済み） | #2183〜#2187 |
 | 索引 | #2204 |
 
 ## 対象外・申し送り
