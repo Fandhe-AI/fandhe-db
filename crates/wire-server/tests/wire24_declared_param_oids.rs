@@ -341,6 +341,40 @@ fn float8_division_keeps_fraction_in_text_and_binary() {
     assert!(matches!(cell(&core, "d", 1), Cell::Float(v) if v == 0.5));
 }
 
+/// 宣言 timestamptz（1184）・interval（1186）の binary Bind は、列スロットと同じ復号器で
+/// 受理される（未参照番号の宣言型スロット。Bugbot 指摘）。不正長は fail-closed で拒否する。
+#[test]
+fn declared_timestamptz_and_interval_binary_are_accepted() {
+    let (core, _g) = new_core();
+    let mut s = connect(core.clone());
+    let sql = "UPDATE t SET n = $3 WHERE id = 1 USING OPERATION_ID $4";
+    let ts = 0i64.to_be_bytes();
+    let mut iv = Vec::new();
+    iv.extend_from_slice(&1_000_000i64.to_be_bytes());
+    iv.extend_from_slice(&1i32.to_be_bytes());
+    iv.extend_from_slice(&0i32.to_be_bytes());
+    let tag = run_declared(
+        &mut s,
+        sql,
+        &[1184, 1186],
+        &[1, 1, 0, 0],
+        &[&ts, &iv, b"7", b"tz-1"],
+    )
+    .expect("binary bind");
+    assert_eq!(tag, "UPDATE 1");
+    assert!(matches!(cell(&core, "n", 1), Cell::SignedInteger(7)));
+    let err = run_declared(
+        &mut s,
+        sql,
+        &[1184, 1186],
+        &[1, 1, 0, 0],
+        &[&ts[..4], &iv, b"8", b"tz-2"],
+    )
+    .expect_err("short timestamptz");
+    assert!(!err.is_empty());
+    assert_alive(&mut s);
+}
+
 #[test]
 fn declared_date_binary_is_unsupported_and_legacy_table_is_unchanged() {
     let (core, _g) = new_core();

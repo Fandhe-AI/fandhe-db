@@ -532,14 +532,15 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
             DeclaredParamType::Bytea => BinaryParam::Bytea,
             DeclaredParamType::Uuid => BinaryParam::Uuid,
             DeclaredParamType::Time => BinaryParam::Time,
+            // 列スロットと同じ復号器（timestamptz=1184・interval=1186。TABLE-33・TABLE-34）。
+            DeclaredParamType::TimestampTz => BinaryParam::TimestampTz,
+            DeclaredParamType::Interval => BinaryParam::Interval,
             DeclaredParamType::Text | DeclaredParamType::Varchar | DeclaredParamType::Bpchar => {
                 BinaryParam::Utf8Identity
             }
             DeclaredParamType::Numeric
             | DeclaredParamType::Date
             | DeclaredParamType::Timestamp
-            | DeclaredParamType::TimestampTz
-            | DeclaredParamType::Interval
             | DeclaredParamType::Json
             | DeclaredParamType::Jsonb => BinaryParam::Unsupported,
         },
@@ -3250,6 +3251,8 @@ mod tests {
         assert!(matches!(kind(D::Bytea), BinaryParam::Bytea));
         assert!(matches!(kind(D::Uuid), BinaryParam::Uuid));
         assert!(matches!(kind(D::Time), BinaryParam::Time));
+        assert!(matches!(kind(D::TimestampTz), BinaryParam::TimestampTz));
+        assert!(matches!(kind(D::Interval), BinaryParam::Interval));
         for d in [D::Text, D::Varchar, D::Bpchar] {
             assert!(matches!(kind(d), BinaryParam::Utf8Identity));
         }
