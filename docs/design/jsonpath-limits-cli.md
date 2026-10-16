@@ -17,7 +17,7 @@ jsonpath 評価器（`engine::json::jsonpath::jsonpath_query` ほか。意味論
 | D1 | ハード上限がそのまま既定値。ステップ数 `4,000,000`（`MAX_JSONB_CONTAINMENT_STEPS` と同じ桁）・再帰深さ `1,024`（解析器の式の高さ上限と同じ）。設定できるのは**下げる方向だけ**（範囲は `1..=4000000`・`1..=1024`）。引き上げは評価器の安全弁を外すことになるため対象外 |
 | D2 | 超過は SQLSTATE `54000`（fail-closed）。`silent`（`jsonb_path_*` の同名引数相当）でも、述語内でも抑止されず、必ず呼び出し元へ返る |
 | D3 | 値の運搬は `group_by_limits` と同型。`engine::jsonpath_limits::JsonPathLimits`（`Copy`・フィールド非公開・ハード上限で飽和）を `EngineCore::with_jsonpath_limits` で起動時に 1 回注入する。プロセス大域の状態は使わない（Issue #2185 の運搬方式は D4）。範囲検証は engine の `validate_*` に一本化し、wire-server は CLI 文字列を厳密パース（先頭 `+`・空白・全角数字・空文字を弾く）して渡すだけ |
-| D4 | `jsonb_path_*`（Issue #2185）は、文の束縛区間に限った thread-local の RAII スコープ（`sql::jsonpath_fn::JsonPathLimitsScope`。`time_fn::ClockScope` と同型）で `EngineCore::jsonpath_limits` を束縛へ運び、束縛時に束縛結果へ焼き込んで評価の `JsonPathEvalOptions::with_limits` へ渡す。スコープが張られない経路はハード上限にフォールバックする（ハード上限が最大値なので無制限にはならない）。`@?`／`@@`・`JSON_EXISTS` は #2186・#2187 が同じ方式で配線する |
+| D4 | `jsonb_path_*`（Issue #2185）は、文の束縛区間に限った thread-local の RAII スコープ（`sql::jsonpath_fn::JsonPathLimitsScope`。`time_fn::ClockScope` と同型）で `EngineCore::jsonpath_limits` を束縛へ運び、束縛時に束縛結果へ焼き込んで評価の `JsonPathEvalOptions::with_limits` へ渡す。スコープが張られない経路はハード上限にフォールバックする（ハード上限が最大値なので無制限にはならない）。`@?`／`@@`（Issue #2186）も同じ束縛関数 `bind_jsonpath_operator` で現在のスコープの上限を焼き込む。`JSON_EXISTS` は #2187 が同じ方式で配線する |
 | D5 | フラグ名は `--max-jsonpath-steps <1-4000000>`・`--max-jsonpath-depth <1-1024>`。範囲外・非数値・値欠落は起動エラー。2 回目以降の指定は fail-closed（last-wins にしない）。解決は bind・ユーザーストア読込より前 |
 
 ## 「ステップ」と「深さ」の定義

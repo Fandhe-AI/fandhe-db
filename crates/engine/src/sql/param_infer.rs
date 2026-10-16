@@ -264,7 +264,9 @@ impl Inferrer<'_> {
                 | crate::sql::udf_call::JsonAccessOp::ExistsAny
                 | crate::sql::udf_call::JsonAccessOp::ExistsAll
                 | crate::sql::udf_call::JsonAccessOp::Concat
-                | crate::sql::udf_call::JsonAccessOp::DeletePath => Ty::Untyped,
+                | crate::sql::udf_call::JsonAccessOp::DeletePath
+                | crate::sql::udf_call::JsonAccessOp::PathExists
+                | crate::sql::udf_call::JsonAccessOp::PathMatch => Ty::Untyped,
             },
             // DATE／TIMESTAMP は式内 `$n` の対象外型。`Text` へ倒さず `assign` の
             // 対象外型判定（`0A000`）に落として fail-closed にする。
