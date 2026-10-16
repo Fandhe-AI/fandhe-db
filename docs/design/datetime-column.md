@@ -67,7 +67,8 @@ PG のバイナリ表現を返す場合はオフセット変換が必要にな�
 タイムゾーン設定・変換・`AT TIME ZONE` は持たない。入力に TZ 接尾辞
 （`Z`、`+hh:mm`、`-hh`）があれば閉じた文法の外として `22007` で拒否する。
 値をどのタイムゾーンで解釈するかはクライアント側の責任とする。
-`TIMESTAMPTZ` は対象外。
+`TIMESTAMPTZ` は対象外。TZ データ源の承認資料は
+[timestamptz-tz-data-adoption.md](timestamptz-tz-data-adoption.md)（承認済み・2026-10-16。実装は #1572 配下）。
 
 ### D-5: リテラル文法（閉じた定義）
 
