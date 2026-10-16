@@ -18,11 +18,18 @@ use crate::datetime::{
 };
 use crate::sql::allowlist::SqlSurfaceError;
 
-/// PostgreSQL の timestamp が表現できる日付範囲（ユリウス日 0〜5874897 を
-/// 1970-01-01 起点の日数へ換算）。中間値（月加算後・日加算後）をこの範囲で検査し、
-/// 範囲外へ出て戻る入力も PostgreSQL と同じくエラーにする。
-const PG_MIN_DAYS: i128 = -2_440_588;
-const PG_MAX_DAYS: i128 = 3_434_309;
+/// PostgreSQL の timestamp が表現できる日付範囲（4714 BC-11-24〜294276-12-31）の
+/// 下限を 1970-01-01 起点の日数で返す。中間値（月加算後・日加算後）をこの範囲で検査し、
+/// 範囲外へ出て戻る入力は PostgreSQL と同じくエラーにする。最終結果の 0001〜9999 年の
+/// 検査（`validate_timestamp_micros`）とは分離している。
+fn pg_min_days() -> i128 {
+    i128::from(days_from_civil(-4713, 11, 24))
+}
+
+/// [`pg_min_days`] の上限側（294276-12-31）。
+fn pg_max_days() -> i128 {
+    i128::from(days_from_civil(294_276, 12, 31))
+}
 
 fn interval_out_of_range() -> SqlSurfaceError {
     SqlSurfaceError::datetime_field_overflow("interval out of range")
@@ -65,7 +72,7 @@ fn split_local(local: i128) -> (i128, i128) {
 }
 
 fn join_local(days: i128, tod: i128) -> Result<i128, SqlSurfaceError> {
-    if !(PG_MIN_DAYS..=PG_MAX_DAYS).contains(&days) {
+    if !(pg_min_days()..=pg_max_days()).contains(&days) {
         return Err(timestamp_out_of_range());
     }
     days.checked_mul(i128::from(MICROS_PER_DAY))
@@ -402,6 +409,15 @@ mod tests {
             code(interval_mul_f64(&iv("1 day"), f64::INFINITY).unwrap_err()),
             "0A000"
         );
+    }
+
+    #[test]
+    fn intermediate_beyond_9999_is_allowed_when_final_in_range() {
+        // 月加算直後は 12000 年（0001〜9999 年の外）だが PG の timestamp 範囲内。
+        let out =
+            timestamp_add_interval(ts("2000-01-01"), &iv("120000 mons -3652425 days")).unwrap();
+        assert!(validate_timestamp_micros(out));
+        assert_eq!(pg_min_days(), -2_440_588);
     }
 
     #[test]
