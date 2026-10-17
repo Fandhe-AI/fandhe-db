@@ -2275,6 +2275,7 @@ fn expr_value_to_cell(
                 "aggregate projection expression produced a json value",
             ))
         }
+        ExprValue::Numeric(d) => Cell::Numeric(d),
         ExprValue::Vector(_) => {
             return Err(accumulator_bug(
                 "aggregate projection expression produced a vector",

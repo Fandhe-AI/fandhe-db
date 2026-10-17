@@ -165,6 +165,12 @@ fn bind_value_arg(
         ExprType::Timestamp => JsonArgKind::Timestamp,
         ExprType::Json => JsonArgKind::Jsonb,
         ExprType::JsonText => JsonArgKind::Json,
+        // numeric 式（CAST の結果）の json 化は未対応（Issue #1591）。fail-closed で拒否する。
+        ExprType::Numeric => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "a numeric value cannot be converted to json yet".to_string(),
+            })
+        }
         ExprType::Vector => {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: "a vector value cannot be converted to json".to_string(),

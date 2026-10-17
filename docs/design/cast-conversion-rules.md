@@ -105,7 +105,7 @@
 - float8 の NaN → 整数は `22003`（`integer out of range`）
 - numeric の NaN／Infinity → 整数は **`0A000`**（`cannot convert NaN to integer`・
   `cannot convert infinity to integer`）。NaN／Infinity を表せない NUMERIC での
-  float → numeric の扱いは #1591 で決める（本書では決めない）
+  float → numeric の扱いは #1591 で決めた（「Issue #1591 で確定した差分」参照）
 
 #### numeric の型修飾子 `numeric(p,s)`（`numeric → numeric` の `=`）
 
@@ -231,8 +231,9 @@ TABLE-39・TABLE-40・INDEX-9）では、他テナントの値が呼び出し元
   Integer・BigInt・Real・Double・Boolean・Date・Timestamp・Time・TimestampTz・Interval・
   Array・Bytea・Json・Jsonb・Enum・Numeric・Uuid
 - `crates/engine/src/sql/udf_call.rs` の `ExprType`: Scalar・Vector・Bool・Text・Date・
-  Timestamp・Time・TimestampTz・Interval・Json・JsonText（数値は `NumericKind` で区別）。
-  Uuid・Bytea・配列・Numeric の厳密値を表す式の型は未整備で、#1591／#1592 の前提となる
+  Timestamp・Time・TimestampTz・Interval・Json・JsonText・Numeric（数値は `NumericKind` で区別。
+  `Numeric` は Issue #1591 で追加した厳密値の型）。Uuid・Bytea・配列を表す式の型は未整備で、
+  #1592 の前提となる
 - `crates/engine/src/error_format.rs` の `ErrorClass` に `42846`（`CannotCoerce`）を登録済み
   （Issue #1590。wire-server の HTTP 写像〔400〕・`nosql-api.md` も追従）。構文は `Expr::Cast`
   （`sql::udf_call`）、規則表と束縛は新モジュール `sql::cast`（表を 400 セル照合する単体テスト付き）
@@ -254,14 +255,14 @@ TABLE-39・TABLE-40・INDEX-9）では、他テナントの値が呼び出し元
   fail-closed（拒否側）に倒す
 - 暗黙・代入の文脈では変換を広げない（`42883`／`42804` を維持）。拡張するのは明示の CAST／`::` のみ
 - NaN／Infinity を表せない NUMERIC での float → numeric、numeric NaN／Infinity → 整数は
-  PostgreSQL との差分候補で、扱いは #1591 で決める
+  PostgreSQL との差分候補だった。#1591 で「本エンジンでは到達しない」と確定した（下記）
 
 ### Issue #1590 で確定した差分
 
 - ENUM 型名は、ENUM が実在してもカタログを引かずに `42704` になる（型の存在が他テナントへの
   存在オラクルにならないための静的な判定）
 - 修飾子なしの `numeric`・`numeric(p)` は、DDL と共通の型名解析のため `42601` になる
-  （PostgreSQL では受理。扱いは #1591）
+  （PostgreSQL では受理。CAST の型名に限り #1591 で受理するようにした）
 - CHECK 本体での CAST と `<型名> '<文字列リテラル>'` は `0A000`
 - INSERT VALUES・列 DEFAULT の定数式での CAST は `0A000`
 - FROM ありの投影項目の先頭に置いた `<型名> '<文字列リテラル>'`（`SELECT INTERVAL '1 day' FROM t` 等）は
@@ -277,3 +278,47 @@ TABLE-39・TABLE-40・INDEX-9）では、他テナントの値が呼び出し元
 - UDF 本体の展開中はスキーマを持たないため、本体の CAST は実引数の変換元を精密に導けない（整数列は種別不明の数値、TEXT 系の列は text として扱う）。このため `CAST(x AS integer)` を本体に持つ UDF に整数列を渡すと、直接の `CAST(i4 AS integer)` と違って `0A000` になる。fail-closed 側の差で、精密化は #1591 以降で扱う
 - 既定の列名は PostgreSQL と同じく、被演算子が名前を持つ形（列・関数呼び出し）ならその名前、
   持たなければ変換先のカタログ名（`int4` 等）
+
+### Issue #1591 で確定した差分
+
+数値 6 型・BOOLEAN・文字列 3 型どうし（10 型 × 10 型の 100 セル）の値の変換を実装した。評価は
+`sql::cast_value`、束縛は `sql::cast::bind_cast`。テストは
+`crates/engine/tests/sql_cast_numeric_text_bool.rs`（セルキー `<変換元>-><変換先>` で 100 セル）。
+PostgreSQL 17 との照合は実機を使えなかったため、本書の「系統ごとの値レベルの規則」を拠り所にした
+（実機との照合は未実施）。
+
+#### 実装した範囲
+
+- 整数への変換: float は偶数丸め、numeric は 0 から遠い側への四捨五入の後に範囲検査（`22003`）
+- 文字列 → 整数: 前後の空白、符号、`0x`／`0o`／`0b` の接頭辞、数字の間の単独の `_` を受け付ける。
+  `1.5`・空文字・空白のみは `22P02`
+- 文字列 → float: `+1`・`.5`・`1.`・指数を受け付ける。範囲外とアンダーフローは `22003`
+- float → numeric: 有効桁 15（float8）／6（float4）の `%g` 相当の表現を経由する（最短往復表記ではない）
+- `varchar(n)`／`char(n)` への明示の変換は文字数 `n` で黙って切り詰め、`char(n)` は空白で埋める。
+  CHAR(n) の値を別の型へ変換するときは末尾の空白を除く
+- 型なし文字列リテラルと列の値は同じ入力関数を通る（束縛時に 1 度検証し、評価は変換ノードが行う）
+- 結果列の型は変換先で決める。修飾子なしの numeric は scale が値ごとに変わるため、結果列型は
+  固定の sentinel（`AVG` の整数と同じ前例。wire の typmod は常に -1）
+
+#### PostgreSQL との差分（fail-closed 側）
+
+| 項目 | 本エンジン | 理由 |
+| ---- | ---------- | ---- |
+| 2^53 を超える int8 の結果 | `22003`（丸めない） | 式評価が整数を f64 で運ぶ |
+| 文字列の `NaN`／`Infinity`（float・numeric への入力） | `0A000` | 非有限値を値として持たない |
+| float → numeric の NaN／Infinity、numeric の NaN／Infinity → 整数 | 到達しない | float の値は常に有限、`Decimal` は非有限値を持たない |
+| 16 進表記の float、`_` 区切り・非 10 進接頭辞つきの numeric | `22P02` | 文法を閉じる |
+| 38 桁を超える numeric、scale 38 を超える値（`1e300`・`1e-40`） | `22003` | `Decimal` は最大 38 桁 |
+| `numeric(p,s)` で p が 39 以上、`s > p`、負の位取り | `0A000` | PostgreSQL では有効だが `Decimal` で表せない |
+| `numeric(0,…)`・`numeric(1001,…)` など範囲外の精度 | `22023` | PostgreSQL と同じ |
+| 種別を静的に決められない数値（関数・`id`・算術・CASE）の数値・bool・文字列型への変換 | `0A000` | numeric と float で丸め・表記が異なる |
+| numeric 値の消費位置 | 投影と CAST の被演算子だけ（比較・算術・関数引数・CASE・集計・ORDER BY は `0A000`） | 式評価に numeric の演算が無い |
+| NUMERIC／BOOLEAN 列 | CAST の被演算子の位置でだけ式の中で参照できる | 一般の位置での解禁は別 Issue |
+| CHAR(n) の比較・連結 | `CAST(x AS char(n))` の結果を TEXT として消費すると、空白埋めのまま比較される | TEXT の式型は bpchar を区別できない |
+| CHECK 本体・列 DEFAULT・INSERT VALUES の値の変換 | `0A000` | 全テナントを走査する検証経路へ持ち込まない |
+
+#### 型名
+
+修飾子なしの `numeric`／`decimal` と `numeric(p)`（`= numeric(p,0)`）は、CAST と
+`<型名> '<文字列リテラル>'` の型名に限って受け付ける。DDL の型名解析は変えていない
+（修飾子なしの `numeric` 列は従来どおり `42601`）。

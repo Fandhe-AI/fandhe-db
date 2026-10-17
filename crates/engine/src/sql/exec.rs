@@ -324,6 +324,16 @@ pub(crate) fn scalar_cell_for(
         detail: detail.to_string(),
     };
     match result_ty {
+        // `CAST(.. AS smallint)` の結果列（Issue #1591）。範囲は束縛段が保証する不変条件。
+        Some(ColumnType::SmallInt) => {
+            if v.is_finite() && v.fract() == 0.0 && v.abs() <= f64::from(i16::MAX) + 1.0 {
+                let i = i16::try_from(v as i64)
+                    .map_err(|_| invariant("smallint projection value is out of range"))?;
+                Ok(Cell::SignedInteger(i64::from(i)))
+            } else {
+                Err(invariant("smallint projection value is not an int2"))
+            }
+        }
         Some(ColumnType::Integer) => {
             if v.is_finite() && v.fract() == 0.0 && v.abs() <= f64::from(i32::MAX) + 1.0 {
                 let i = i32::try_from(v as i64)
@@ -3514,6 +3524,8 @@ fn project_rows(
                         udf_call::ExprValue::JsonText(j) => {
                             cells.push(Cell::Json(try_clone_text(&j)?))
                         }
+                        // `CAST(.. AS numeric)` の結果（Issue #1591）。`Cell::Numeric` は列直接投影と共通。
+                        udf_call::ExprValue::Numeric(d) => cells.push(Cell::Numeric(d)),
                     }
                 }
             }
