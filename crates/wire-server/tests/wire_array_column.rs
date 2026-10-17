@@ -367,8 +367,8 @@ fn wire_array_extended_element_types_roundtrip() {
     }
 }
 /// 多次元配列（TABLE-35 (2)・Issue #1605）が simple query 経由で往復する。`DataRow` は入れ子の
-/// PostgreSQL 配列テキストで、`RowDescription` の型公告は他の配列列と同じ text のまま
-/// （配列型 OID の公告は WIRE-13 の後続 Issue の範囲）。不整列リテラルは `22P02`。
+/// PostgreSQL 配列テキストで、`RowDescription` は配列型 OID（`int4[]`=1007。Issue #1606）で公告する。
+/// 不整列リテラルは `22P02`。
 #[test]
 fn wire_multi_dimensional_array_roundtrips_and_rejects_ragged_literals() {
     let path = temp_db::unique_db_path("wire-array-column-multidim");
