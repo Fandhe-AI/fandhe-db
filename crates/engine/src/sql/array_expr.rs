@@ -474,6 +474,11 @@ pub(crate) fn eval_array_index<'a>(
     let (Some(array), Some(i)) = (array_of(b)?, index_value(&i)?) else {
         return Ok(ExprValue::Null);
     };
+    // 多次元値への単一添字は添字数の不一致で NULL（PostgreSQL と同じ。多重添字
+    // `arr[i][j]` は構文段で `0A000`。Issue #1605）。
+    if matches!(array, ArrayValue::Multi(_)) {
+        return Ok(ExprValue::Null);
+    }
     let len = array.len();
     // `i - 1` は 0 始まりの位置。範囲外は NULL（PG と同じ）。`get()` 相当の `slice` で
     // 1 要素だけを切り出し、添字アクセスを避ける。
@@ -529,7 +534,9 @@ pub(crate) fn eval_array_slice<'a>(
         (Some(None), _) | (_, Some(None)) => return Ok(ExprValue::Null),
         (l, h) => (l.flatten(), h.flatten()),
     };
-    let len = i64::try_from(array.len()).unwrap_or(i64::MAX);
+    // 長さは第 1 次元（多次元値は第 1 次元に沿って切り出す。Issue #1605）。
+    let first_dim = array.dims().first().copied().unwrap_or(0);
+    let len = i64::from(first_dim);
     let lo_i = lo_v.unwrap_or(1).max(1);
     let hi_i = hi_v.unwrap_or(len).min(len);
     if lo_i > hi_i {

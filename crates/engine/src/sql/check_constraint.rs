@@ -186,6 +186,23 @@ fn render_expr(expr: &Expr) -> String {
             "ARRAY[{}]",
             items.iter().map(render_expr).collect::<Vec<_>>().join(", ")
         ),
+        // 量化比較（TABLE-35・Issue #1603）。構文段が CHECK 本体での使用を `0A000` で拒否するため
+        // 通常は到達しないが、全 variant 網羅のため PG 構文で出す。
+        Expr::Quantified {
+            op,
+            quantifier,
+            lhs,
+            rhs,
+        } => format!(
+            "({} {} {}({}))",
+            render_expr(lhs),
+            op.as_sql(),
+            match quantifier {
+                udf_call::Quantifier::Any => "ANY",
+                udf_call::Quantifier::All => "ALL",
+            },
+            render_expr(rhs)
+        ),
         Expr::Subscript { base, subscript } => {
             let b = render_expr(base);
             match subscript {
@@ -610,7 +627,7 @@ fn referenced_column_names(
             }
             Expr::Null | Expr::ValueFunction { .. } => {}
             Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => collect_idents(expr, acc),
-            Expr::ArrayConstructor(_) | Expr::Subscript { .. } => {
+            Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
                 for child in expr.array_expr_children().into_iter().flatten() {
                     collect_idents(child, acc);
                 }

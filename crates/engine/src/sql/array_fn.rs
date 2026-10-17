@@ -446,6 +446,16 @@ fn one_element(v: ExprValue<'_>, elem: ArrayElemType) -> Result<ArrayValue, SqlS
     values_to_array(vec![own(v)?], elem)
 }
 
+/// 多次元配列を取れない関数の入力を弾く（`0A000`。fail-closed。Cardinality／Length 以外が使う）。
+fn array_1d(v: ExprValue<'_>) -> Result<Option<ArrayValue>, SqlSurfaceError> {
+    match array_of(v)? {
+        Some(ArrayValue::Multi(_)) => Err(SqlSurfaceError::unsupported(
+            "this array function does not support multidimensional arrays",
+        )),
+        other => Ok(other),
+    }
+}
+
 fn text_of(v: ExprValue<'_>) -> Result<Option<String>, SqlSurfaceError> {
     match v {
         ExprValue::Null => Ok(None),
@@ -480,11 +490,14 @@ pub(crate) fn eval_array_fn<'a>(
             let (Some(a), Some(d)) = (a, d) else {
                 return Ok(ExprValue::Null);
             };
-            // 配列は 1 次元のみ。空配列と 1 以外の次元は NULL。
-            if d != 1 || a.len() == 0 {
-                return Ok(ExprValue::Null);
-            }
-            Ok(ExprValue::Scalar(a.len() as f64))
+            // 指定次元の長さ。空配列と範囲外の次元は NULL（多次元は各次元の長さ）。
+            let dims = a.dims();
+            let idx = usize::try_from(d).ok().and_then(|d| d.checked_sub(1));
+            let n = match idx.and_then(|i| dims.get(i)) {
+                Some(n) if a.len() > 0 => *n,
+                _ => return Ok(ExprValue::Null),
+            };
+            Ok(ExprValue::Scalar(f64::from(n)))
         }
         ArrayFnKind::Cardinality => match array_of(ev(0)?)? {
             Some(a) => Ok(ExprValue::Scalar(a.len() as f64)),
@@ -492,7 +505,7 @@ pub(crate) fn eval_array_fn<'a>(
         },
         ArrayFnKind::Append | ArrayFnKind::Prepend => {
             let elem = need_elem()?;
-            let base = match array_of(ev(0)?)? {
+            let base = match array_1d(ev(0)?)? {
                 Some(a) => a,
                 None => values_to_array(Vec::new(), elem)?,
             };
@@ -504,13 +517,13 @@ pub(crate) fn eval_array_fn<'a>(
             };
             Ok(ExprValue::Array(joined))
         }
-        ArrayFnKind::Cat => match (array_of(ev(0)?)?, array_of(ev(1)?)?) {
+        ArrayFnKind::Cat => match (array_1d(ev(0)?)?, array_1d(ev(1)?)?) {
             (None, None) => Ok(ExprValue::Null),
             (Some(a), None) | (None, Some(a)) => Ok(ExprValue::Array(a)),
             (Some(a), Some(b)) => Ok(ExprValue::Array(join(&a, &b)?)),
         },
         ArrayFnKind::Position => {
-            let Some(a) = array_of(ev(0)?)? else {
+            let Some(a) = array_1d(ev(0)?)? else {
                 return Ok(ExprValue::Null);
             };
             let needle = one_element(ev(1)?, need_elem()?)?;
@@ -532,7 +545,7 @@ pub(crate) fn eval_array_fn<'a>(
             })
         }
         ArrayFnKind::Remove => {
-            let Some(a) = array_of(ev(0)?)? else {
+            let Some(a) = array_1d(ev(0)?)? else {
                 return Ok(ExprValue::Null);
             };
             let needle = one_element(ev(1)?, need_elem()?)?;
@@ -542,7 +555,7 @@ pub(crate) fn eval_array_fn<'a>(
             Ok(ExprValue::Array(kept))
         }
         ArrayFnKind::ToString => {
-            let a = array_of(ev(0)?)?;
+            let a = array_1d(ev(0)?)?;
             let delim = text_of(ev(1)?)?;
             let (Some(a), Some(delim)) = (a, delim) else {
                 return Ok(ExprValue::Null);

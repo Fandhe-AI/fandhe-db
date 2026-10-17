@@ -3245,7 +3245,7 @@ impl ArrayElemType {
     }
 }
 
-/// 配列列 1 個の宣言（要素型＋要素数上限。TABLE-14・TASK-198、Issue #888）。
+/// 配列列 1 個の宣言（要素型＋要素数上限＋宣言次元数。TABLE-14・TASK-198、Issue #888・#1605）。
 /// フィールドを private にし [`ArrayType::new`]／[`ArrayType::new_enum`] のみを
 /// 構築経路とすることで、上限の範囲検証（`1..=MAX_ARRAY_ELEMENTS`）を経ない値を
 /// 作れないようにする。`ENUM` 要素の語彙（`Arc`）を持つため `Copy` ではない
@@ -3255,7 +3255,14 @@ pub struct ArrayType {
     elem: ArrayElemType,
     max_len: u32,
     enum_def: Option<Arc<EnumTypeDef>>,
+    /// 宣言された次元数（`INTEGER[][]` なら 2。既定 1。Issue #1605・TABLE-35 (2)）。
+    /// 格納できる値の次元数は制限しない（PostgreSQL と同じ。宣言は表示・互換判定用）。
+    ndims: u8,
 }
+
+/// 配列の次元数の実装上限（本リポの実装既定値。TABLE-35 (2)・Issue #1605）。
+/// DDL の `[]` 連続数・リテラルの入れ子深さ・行 codec の次元ヘッダが共有する。
+pub const MAX_ARRAY_DIMS: u8 = 6;
 
 /// 配列列 1 個が宣言できる要素数の実装上限（本リポの実装既定値。TASK-198）。
 /// [`crate::row_codec`] の decode 側もこの値を要素数の上限検証に用いる。
@@ -3282,6 +3289,7 @@ impl ArrayType {
             elem,
             max_len,
             enum_def: None,
+            ndims: 1,
         })
     }
 
@@ -3292,7 +3300,25 @@ impl ArrayType {
             elem: ArrayElemType::Enum,
             max_len,
             enum_def: Some(def),
+            ndims: 1,
         })
+    }
+
+    /// 宣言次元数を差し替えた配列型を返す（Issue #1605）。`1..=MAX_ARRAY_DIMS` 外は `Err`。
+    /// DDL の `<型>[][]`（実行段）とカタログ param の復号が使う唯一の設定経路。
+    pub fn with_ndims(mut self, ndims: u8) -> Result<Self> {
+        if ndims == 0 || ndims > MAX_ARRAY_DIMS {
+            return Err(CatalogError::Invalid(format!(
+                "array dimensions must be within 1..={MAX_ARRAY_DIMS}, got {ndims}"
+            )));
+        }
+        self.ndims = ndims;
+        Ok(self)
+    }
+
+    /// 宣言された次元数（既定 1）。
+    pub fn ndims(&self) -> u8 {
+        self.ndims
     }
 
     fn check_max_len(max_len: u32) -> Result<()> {
@@ -3317,6 +3343,7 @@ impl ArrayType {
             elem: self.elem,
             max_len,
             enum_def: self.enum_def.clone(),
+            ndims: self.ndims,
         })
     }
 
@@ -3332,12 +3359,19 @@ impl ArrayType {
     /// カタログ v2 の `param` フィールド文字列。
     /// `<tag>,<max_len>`／`numeric,<p>,<s>,<max_len>`／`enum,<type_name>,<max_len>`。
     fn catalog_param(&self) -> String {
-        match (&self.elem, &self.enum_def) {
+        let base = match (&self.elem, &self.enum_def) {
             (ArrayElemType::Numeric { precision, scale }, _) => {
                 format!("numeric,{precision},{scale},{}", self.max_len)
             }
             (ArrayElemType::Enum, Some(def)) => format!("enum,{},{}", def.name, self.max_len),
             (elem, _) => format!("{},{}", elem.catalog_tag(), self.max_len),
+        };
+        // 2 次元以上のときだけ末尾に `d<N>` を足す。1 次元は従来の param をバイト単位で
+        // 変えない（Issue #1605。旧バイナリは末尾フィールドを max_len の非正準として拒否する）。
+        if self.ndims > 1 {
+            format!("{base},d{}", self.ndims)
+        } else {
+            base
         }
     }
 }
@@ -3349,13 +3383,20 @@ fn parse_array_param(
     param: &str,
     resolve_enum: &mut dyn FnMut(&str) -> Result<Arc<EnumTypeDef>>,
 ) -> Result<ArrayType> {
-    let fields: Vec<&str> = param.split(',').collect();
+    let mut fields: Vec<&str> = param.split(',').collect();
     let elem_tag = fields.first().copied().unwrap_or("");
     let expected = match elem_tag {
         "numeric" => 4,
         "enum" => 3,
         _ => 2,
     };
+    // 末尾の `d<N>`（2 次元以上の宣言。Issue #1605）を先に切り離す。
+    let mut ndims: u8 = 1;
+    if fields.len() == expected + 1 {
+        let dims_field = fields.last().copied().unwrap_or("");
+        ndims = parse_dims_field(dims_field)?;
+        fields.pop();
+    }
     if fields.len() != expected {
         return Err(CatalogError::Invalid(format!(
             "array param has wrong number of fields: {param:?}"
@@ -3371,7 +3412,7 @@ fn parse_array_param(
             "array max_len is not in canonical form: {max_len_field:?}"
         )));
     }
-    match (elem_tag, fields.as_slice()) {
+    let base = match (elem_tag, fields.as_slice()) {
         ("numeric", [_, p, sc, _]) => {
             let (precision, scale) = parse_numeric_param(&format!("{p},{sc}"))?;
             ArrayType::new(ArrayElemType::Numeric { precision, scale }, max_len)
@@ -3382,7 +3423,20 @@ fn parse_array_param(
             ArrayType::new_enum(def, max_len)
         }
         (other, _) => ArrayType::new(ArrayElemType::from_catalog_tag(other)?, max_len),
+    }?;
+    base.with_ndims(ndims)
+}
+
+/// 配列 param 末尾の `d<N>`（`N` は `2..=MAX_ARRAY_DIMS` の正準 10 進）を復号する
+/// （Issue #1605）。`d1`・`d07`・範囲外は非正準として拒否する（fail-closed）。
+fn parse_dims_field(field: &str) -> Result<u8> {
+    let bad = || CatalogError::Invalid(format!("malformed array dims field: {field:?}"));
+    let digits = field.strip_prefix('d').ok_or_else(bad)?;
+    let n: u8 = digits.parse().map_err(|_| bad())?;
+    if n.to_string() != digits || !(2..=MAX_ARRAY_DIMS).contains(&n) {
+        return Err(bad());
     }
+    Ok(n)
 }
 
 /// 配列列 `param` が参照する ENUM 型名（`enum` 要素でなければ `None`）。
@@ -3394,6 +3448,12 @@ fn array_param_enum_name(param: &str) -> Result<Option<&str>> {
         return Ok(None);
     }
     let corrupt = || CatalogError::CorruptSchema(format!("malformed array enum param: {param:?}"));
+    // 末尾の `d<N>`（Issue #1605）は依存判定に無関係だが、正準形であることは確認する。
+    let mut fields = fields;
+    if fields.len() == 4 {
+        let dims_field = fields.pop().unwrap_or("");
+        parse_dims_field(dims_field).map_err(|_| corrupt())?;
+    }
     match fields.as_slice() {
         [_, name, max_len] => {
             validate_identifier(name).map_err(|_| corrupt())?;
@@ -3846,6 +3906,7 @@ fn normalize_dropped_column_type(ty: ColumnType) -> ColumnType {
         // ため `TEXT[]` へ正規化し、`DROP TYPE` が削除済み列の残存参照でブロックされ続ける
         // 結合を断つ（Issue #1357）。
         ColumnType::Array(array_ty) if is_text_framed_array_elem(array_ty.elem()) => {
+            // 墓標は値が読まれないため次元宣言も 1 次元へ正規化する（Issue #1605）。
             match ArrayType::new(ArrayElemType::Text, array_ty.max_len()) {
                 Ok(text_array) => ColumnType::Array(text_array),
                 // `max_len` は構築時に検証済みのため到達しない。到達した場合は元の型を
@@ -7890,10 +7951,10 @@ impl Storage {
                         let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
                         if column.default.is_some() {
                             let mut checked = column.clone();
-                            checked.ty = ColumnType::Array(ArrayType::new_enum(
-                                registered,
-                                array_ty.max_len(),
-                            )?);
+                            checked.ty = ColumnType::Array(
+                                ArrayType::new_enum(registered, array_ty.max_len())?
+                                    .with_ndims(array_ty.ndims())?,
+                            );
                             if crate::row_codec::validate_column_default(&checked).is_err() {
                                 return Err(CatalogError::Invalid(
                                     "column has an ARRAY DEFAULT that is not valid for its \
@@ -8142,8 +8203,10 @@ impl Storage {
             if let ColumnType::Array(array_ty) = &column.ty {
                 if let Some(def) = array_ty.enum_def() {
                     let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
-                    column.ty =
-                        ColumnType::Array(ArrayType::new_enum(registered, array_ty.max_len())?);
+                    column.ty = ColumnType::Array(
+                        ArrayType::new_enum(registered, array_ty.max_len())?
+                            .with_ndims(array_ty.ndims())?,
+                    );
                     // 登録済みの語彙で DEFAULT を再検証する（Issue #1374）。
                     if crate::row_codec::validate_column_default(&column).is_err() {
                         return Err(CatalogError::Invalid(
@@ -12924,6 +12987,90 @@ mod tests {
             ColumnType::from_catalog_fields("array", "enum,ghost,4", &mut array_resolver),
             Err(CatalogError::TypeNotFound(_))
         ));
+    }
+
+    /// Issue #1605: 2 次元以上の宣言は param 末尾の `d<N>` で往復し、1 次元の param は従来の
+    /// バイト列のまま。`d1`・先頭ゼロ・範囲外・余剰フィールドは拒否する。
+    #[test]
+    fn array_dims_param_roundtrips_and_rejects_non_canonical() {
+        let int2 = ColumnType::Array(
+            ArrayType::new(ArrayElemType::Integer, 8)
+                .and_then(|a| a.with_ndims(2))
+                .expect("array ty"),
+        );
+        assert_eq!(int2.catalog_fields(), ("array", "integer,8,d2".to_string()));
+        let decoded = ColumnType::from_catalog_fields("array", "integer,8,d2", &mut array_resolver)
+            .expect("decode 2d array");
+        assert_eq!(decoded, int2);
+        let ColumnType::Array(decoded) = decoded else {
+            panic!("expected array");
+        };
+        assert_eq!(decoded.ndims(), 2);
+        // 1 次元は従来の param のまま。
+        let int1 = ColumnType::Array(ArrayType::new(ArrayElemType::Integer, 8).expect("array ty"));
+        assert_eq!(int1.catalog_fields(), ("array", "integer,8".to_string()));
+        // 要素型ごとのフィールド数に `d<N>` が加わっても往復する。
+        for param in [
+            "numeric,10,2,8,d3",
+            "enum,mood,4,d6",
+            "text,1024,d2",
+            "bytea,4,d4",
+        ] {
+            let ty = ColumnType::from_catalog_fields("array", param, &mut array_resolver)
+                .expect("decode");
+            assert_eq!(ty.catalog_fields(), ("array", param.to_string()));
+        }
+        for bad in [
+            "integer,8,d1",
+            "integer,8,d7",
+            "integer,8,d02",
+            "integer,8,d0",
+            "integer,8,2",
+            "integer,8,D2",
+            "integer,8,d2,d2",
+            "integer,8,d",
+            "enum,mood,4,d1",
+        ] {
+            assert!(
+                matches!(
+                    ColumnType::from_catalog_fields("array", bad, &mut array_resolver),
+                    Err(CatalogError::Invalid(_))
+                ),
+                "param {bad:?} must be rejected"
+            );
+        }
+        assert!(ArrayType::new(ArrayElemType::Integer, 8)
+            .and_then(|a| a.with_ndims(0))
+            .is_err());
+        assert!(ArrayType::new(ArrayElemType::Integer, 8)
+            .and_then(|a| a.with_ndims(MAX_ARRAY_DIMS + 1))
+            .is_err());
+        // `--max-array-elements` 経路の `with_max_len` は次元数を保つ。
+        let ColumnType::Array(base) = int2 else {
+            panic!("expected array");
+        };
+        assert_eq!(base.with_max_len(4).expect("max_len").ndims(), 2);
+    }
+
+    /// Issue #1605（P0）: `d<N>` 付きの ENUM 要素配列も ENUM 型への依存として検出する
+    /// （見落とすと `DROP TYPE` が素通しになる）。壊れた `d<N>` は `CorruptSchema`。
+    #[test]
+    fn array_param_enum_name_accepts_dims_suffix() {
+        assert_eq!(
+            array_param_enum_name("enum,mood,4,d2").expect("ok"),
+            Some("mood")
+        );
+        assert_eq!(
+            array_param_enum_name("enum,mood,4").expect("ok"),
+            Some("mood")
+        );
+        assert_eq!(array_param_enum_name("integer,8,d2").expect("ok"), None);
+        for bad in ["enum,mood,4,d1", "enum,mood,4,x", "enum,mood,4,d2,d2"] {
+            assert!(matches!(
+                array_param_enum_name(bad),
+                Err(CatalogError::CorruptSchema(_))
+            ));
+        }
     }
 
     /// Issue #1357 D3（P0）: `<enum>[]` 列も ENUM 型への依存として検出する。見落とすと

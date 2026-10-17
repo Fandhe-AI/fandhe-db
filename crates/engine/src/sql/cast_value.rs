@@ -1130,6 +1130,8 @@ pub(crate) fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>,
             .collect()
     }
     let text = |s: &String| Ok(ExprValue::Text(Cow::Owned(s.clone())));
+    // 多次元値の呼び出し元（`cast_array`）は次元を保持して包み直す。次元を捨てて平坦化する
+    // 経路を作らないため、ここへ `Multi` が直接来たら fail-closed（Issue #1605）。
     match a {
         ArrayValue::Text(v) => map(v, text),
         ArrayValue::Bool(v) => map(v, |b| Ok(ExprValue::Bool(*b))),
@@ -1152,6 +1154,9 @@ pub(crate) fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>,
         ArrayValue::Json(v) => map(v, |s| Ok(ExprValue::JsonText(Cow::Owned(s.clone())))),
         ArrayValue::Jsonb(v) => map(v, |s| Ok(ExprValue::Json(Cow::Owned(s.clone())))),
         ArrayValue::Enum(_) => Err(internal("enum array reached an array cast")),
+        ArrayValue::Multi(_) => Err(SqlSurfaceError::unsupported(
+            "this operation on multi-dimensional arrays is not supported",
+        )),
     }
 }
 
@@ -1243,11 +1248,14 @@ fn cast_array(
         return Err(internal("array element type is not supported for casts"));
     };
     let element = CastFn { from: src, to: dst };
-    let converted = array_to_values(a)?
+    // 多次元は平坦な要素列を変換してから次元を与え直す（次元を保つ。Issue #1605）。
+    let converted = array_to_values(a.flat())?
         .into_iter()
         .map(|v| apply_cast(element, v))
         .collect::<Result<Vec<_>, _>>()?;
-    values_to_array(converted, to)
+    let flat = values_to_array(converted, to)?;
+    ArrayValue::with_dims(flat, a.dims())
+        .map_err(|_| internal("array dimensions were lost in an array cast"))
 }
 
 #[cfg(test)]
