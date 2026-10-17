@@ -19,9 +19,9 @@ use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::relation::{ColumnRef, TableRef};
 use crate::sql::udf_call::{
-    BinOp, Expr, JsonAccessOp, SqlJsonBehavior, SqlJsonQueryExpr, SqlJsonQueryKind,
-    ValueFunctionKind, MAX_CALL_ARGS, MAX_CASE_BRANCHES, MAX_CASE_NESTING, MAX_EXPR_DEPTH,
-    MAX_EXPR_NODES, MAX_UDF_PARAMS,
+    ArrayCmpOp, ArraySubscript, BinOp, Expr, JsonAccessOp, Quantifier, SqlJsonBehavior,
+    SqlJsonQueryExpr, SqlJsonQueryKind, ValueFunctionKind, MAX_CALL_ARGS, MAX_CASE_BRANCHES,
+    MAX_CASE_NESTING, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_UDF_PARAMS,
 };
 use crate::sql::using_operation_id::OperationId;
 use crate::sql::where_negation::negate_conjunction;
@@ -281,6 +281,7 @@ fn is_json_operator_token(token: &Token) -> bool {
             | Token::JsonExists
             | Token::JsonExistsAny
             | Token::JsonExistsAll
+            | Token::ArrayOverlap
     )
 }
 
@@ -3919,6 +3920,16 @@ struct Parser<'a> {
     agg_slots_used: usize,
 }
 
+/// WHERE の式述語 1 葉の解析結果（[`Parser::parse_expression_predicate`]）。`<>` は式の AST に
+/// 比較演算子が無いため、呼び出し元が `NOT a = b` と同じ形へ脱糖できるよう `=` の式として運ぶ
+/// （TABLE-35・Issue #1603）。
+enum ExprLeaf {
+    /// そのまま `WherePredicate::Expression` にする式。
+    Plain(Expr),
+    /// `a <> b` を表す `a = b` の式（呼び出し元が否定を押し下げる）。
+    NotEqual(Expr),
+}
+
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
         let mut quoted_null = Vec::new();
@@ -4217,15 +4228,21 @@ impl<'a> Parser<'a> {
                     name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
                 let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
                 // TABLE-28・Issue #1609: 識別子の直後の `COLLATE` も式項目の継続。
+                // TABLE-35・Issue #1602: 識別子の直後の `[`（添字・スライス）と、引用なしの
+                // `ARRAY[...]`／`ARRAY(...)`（配列コンストラクタ）も式項目の開始。
+                let starts_array = name.eq_ignore_ascii_case("ARRAY")
+                    && !self.quoted_null.contains(&self.pos)
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('[' | '(')));
                 let next_is_op = self.tokens.get(self.pos + 1).is_some_and(|t| {
-                    matches!(t, Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
+                    matches!(t, Token::Punct('+' | '-' | '*' | '/' | '['))
+                        || matches!(t, Token::TypeCast)
                         || is_json_operator_token(t)
                 }) || self.peek_ident_matches_at(1, "COLLATE")
                     || (self.peek_ident_matches_at(1, "AT")
                         && (self.peek_ident_matches_at(2, "LOCAL")
                             || (self.peek_ident_matches_at(2, "TIME")
                                 && self.peek_ident_matches_at(3, "ZONE"))));
-                if starts_case || self.is_value_function_keyword_at(self.pos) {
+                if starts_case || starts_array || self.is_value_function_keyword_at(self.pos) {
                     // 括弧なし SQL 値関数（SQL-37・Issue #1586）は列名ではなく式項目。
                     self.parse_projection_infix(0)?
                 } else if starts_call {
@@ -5341,18 +5358,34 @@ impl<'a> Parser<'a> {
             } else {
                 // 裸の `NOT <式比較>`（`NOT id > 1`・`NOT (id + 1) > 5`）。頂点の比較を
                 // 反転して葉へ押し下げる。
-                let expr = self.parse_expression_predicate()?;
-                let pred = vec![WherePredicate::Expression(expr)];
-                if negate_odd {
-                    negate_conjunction(pred, &mut self.expr_node_budget)?
-                } else {
-                    pred
+                match self.parse_expression_predicate()? {
+                    ExprLeaf::Plain(expr) => {
+                        let pred = vec![WherePredicate::Expression(expr)];
+                        if negate_odd {
+                            negate_conjunction(pred, &mut self.expr_node_budget)?
+                        } else {
+                            pred
+                        }
+                    }
+                    // `NOT a <> b` は `a = b` そのもの（二重否定を畳む）。
+                    ExprLeaf::NotEqual(eq) if negate_odd => {
+                        vec![WherePredicate::Expression(eq)]
+                    }
+                    ExprLeaf::NotEqual(eq) => negate_conjunction(
+                        vec![WherePredicate::Expression(eq)],
+                        &mut self.expr_node_budget,
+                    )?,
                 }
             }
         } else {
-            vec![WherePredicate::Expression(
-                self.parse_expression_predicate()?,
-            )]
+            match self.parse_expression_predicate()? {
+                ExprLeaf::Plain(expr) => vec![WherePredicate::Expression(expr)],
+                // `a <> b` は `NOT a = b` と同じ形（`a < b OR a > b`）へ脱糖する。
+                ExprLeaf::NotEqual(eq) => negate_conjunction(
+                    vec![WherePredicate::Expression(eq)],
+                    &mut self.expr_node_budget,
+                )?,
+            }
         };
         *leaf_count = leaf_count.checked_add(1).ok_or_else(|| {
             SqlSurfaceError::payload_too_large("WHERE predicate leaf count overflow")
@@ -5412,17 +5445,17 @@ impl<'a> Parser<'a> {
     /// 述語でない式が比較を伴わない場合は従来と同じ `42601`。`NOT` 付きは呼び出し元の
     /// 否定押し下げ（`where_negation`）が `Expression(_)` を `42601` で拒否する（fail-closed。
     /// 三値論理で fail-open にしない）。
-    fn parse_expression_predicate(&mut self) -> Result<Expr, SqlSurfaceError> {
+    fn parse_expression_predicate(&mut self) -> Result<ExprLeaf, SqlSurfaceError> {
         let lhs = self.parse_value_expr(0)?;
         if let Expr::JsonAccess { op, .. } = &lhs {
             if op.is_predicate() && !self.peek_is_cmp_op() {
-                return Ok(lhs);
+                return Ok(ExprLeaf::Plain(lhs));
             }
         }
         // `JSON_EXISTS`（Issue #2187）も boolean を返すため、裸の述語として受理する。
         if let Expr::SqlJsonQuery(q) = &lhs {
             if q.kind == SqlJsonQueryKind::Exists && !self.peek_is_cmp_op() {
-                return Ok(lhs);
+                return Ok(ExprLeaf::Plain(lhs));
             }
         }
         // `jsonb_path_exists`／`jsonb_path_match`（Issue #2185）は boolean を返すため、`JsonAccess` の
@@ -5431,16 +5464,99 @@ impl<'a> Parser<'a> {
             if crate::sql::jsonpath_fn::is_jsonpath_predicate_fn_name(name)
                 && !self.peek_is_cmp_op()
             {
-                return Ok(lhs);
+                return Ok(ExprLeaf::Plain(lhs));
             }
         }
-        let op = self.expect_cmp_op()?;
+        // `<>`（字句上は `<` `>` の 2 トークン。`!=` も同じ）。TABLE-35・Issue #1603。
+        let not_equal = matches!(self.peek(), Some(Token::Punct('<')))
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::Punct('>'))
+            );
+        let cmp = if not_equal {
+            self.advance();
+            self.advance();
+            ArrayCmpOp::Ne
+        } else {
+            match self.expect_cmp_op()? {
+                BinOp::Gt => ArrayCmpOp::Gt,
+                BinOp::Lt => ArrayCmpOp::Lt,
+                BinOp::Ge => ArrayCmpOp::Ge,
+                BinOp::Le => ArrayCmpOp::Le,
+                _ => ArrayCmpOp::Eq,
+            }
+        };
+        if let Some(quantifier) = self.peek_quantifier() {
+            return self.parse_quantified_rest(cmp, quantifier, lhs);
+        }
         let rhs = self.parse_value_expr(0)?;
-        Ok(Expr::Binary {
+        let binary = |op: BinOp, lhs: Expr, rhs: Expr| Expr::Binary {
             op,
             lhs: Box::new(lhs),
             rhs: Box::new(rhs),
+        };
+        Ok(match cmp {
+            ArrayCmpOp::Ne => ExprLeaf::NotEqual(binary(BinOp::Eq, lhs, rhs)),
+            ArrayCmpOp::Eq => ExprLeaf::Plain(binary(BinOp::Eq, lhs, rhs)),
+            ArrayCmpOp::Lt => ExprLeaf::Plain(binary(BinOp::Lt, lhs, rhs)),
+            ArrayCmpOp::Le => ExprLeaf::Plain(binary(BinOp::Le, lhs, rhs)),
+            ArrayCmpOp::Gt => ExprLeaf::Plain(binary(BinOp::Gt, lhs, rhs)),
+            ArrayCmpOp::Ge => ExprLeaf::Plain(binary(BinOp::Ge, lhs, rhs)),
         })
+    }
+
+    /// 比較演算子の直後が量化子 `ANY`／`SOME`／`ALL` と `(` の並びなら量化子を返す（消費しない）。
+    /// `any` という名前の列は `(` が続かないため従来どおり識別子として読まれる
+    /// （TABLE-35・Issue #1603）。
+    fn peek_quantifier(&self) -> Option<Quantifier> {
+        let Some(Token::Ident(w)) = self.peek() else {
+            return None;
+        };
+        if !matches!(
+            self.tokens.get(self.pos.saturating_add(1)),
+            Some(Token::Punct('('))
+        ) {
+            return None;
+        }
+        if w.eq_ignore_ascii_case("ANY") || w.eq_ignore_ascii_case("SOME") {
+            Some(Quantifier::Any)
+        } else if w.eq_ignore_ascii_case("ALL") {
+            Some(Quantifier::All)
+        } else {
+            None
+        }
+    }
+
+    /// 量化比較の `ANY|SOME|ALL ( <配列式> )` を読み、[`Expr::Quantified`] を作る
+    /// （対象ビヘイビア: TABLE-35。Issue #1603）。サブクエリ形（`( SELECT ...)`）は
+    /// `0A000`。CHECK 本体では評価経路の保証範囲外のため `0A000`。ノード予算と再帰深さを課金する。
+    fn parse_quantified_rest(
+        &mut self,
+        op: ArrayCmpOp,
+        quantifier: Quantifier,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "ANY/ALL is not supported in a CHECK constraint".to_string(),
+            });
+        }
+        self.advance();
+        self.advance();
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Select))) {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "ANY/ALL with a subquery is not supported".to_string(),
+            });
+        }
+        let rhs = self.parse_value_expr(1)?;
+        self.expect_punct(')')?;
+        self.consume_expr_node()?;
+        Ok(ExprLeaf::Plain(Expr::Quantified {
+            op,
+            quantifier,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }))
     }
 
     /// 数値リテラルの `<col> [NOT] IN (n, ...)`／`<col> [NOT] BETWEEN a AND b` を
@@ -6102,6 +6218,7 @@ impl<'a> Parser<'a> {
                 Some(Token::JsonExists) => JsonAccessOp::Exists,
                 Some(Token::JsonExistsAny) => JsonAccessOp::ExistsAny,
                 Some(Token::JsonExistsAll) => JsonAccessOp::ExistsAll,
+                Some(Token::ArrayOverlap) => JsonAccessOp::Overlap,
                 _ => break,
             };
             if self.in_check_body {
@@ -6183,10 +6300,142 @@ impl<'a> Parser<'a> {
     /// キーワードとして扱う（対象ビヘイビア: SQL-26。Issue #921。既存の `AS`／
     /// `WHEN`（`sql::allowlist` 内の他の文脈的キーワード）と同じ判断）。
     fn parse_primary_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        let start = self.pos;
         let primary = self.parse_primary_expr_inner(depth)?;
+        // 添字は `::` より強く結合する（`arr[1]::text` は要素の CAST。PG と同じ）。
+        let subscriptable = self.is_subscriptable_primary(start, &primary);
+        let primary = self.parse_subscript_postfix(primary, subscriptable, depth)?;
         let primary = self.parse_typecast_postfix(primary, depth)?;
         let primary = self.parse_collate_postfix(primary)?;
         self.parse_at_time_zone_postfix(primary, depth)
+    }
+
+    /// 直前に読んだ一次式（`start` から現在位置まで）が添字を付けられる形か。PG の文法
+    /// （`c_expr opt_indirection`）に合わせ、列参照（引用なし・引用付きの単一識別子）と括弧式だけ
+    /// を許す。`ARRAY[..][1]`・関数呼び出し・リテラルの直後の `[` はここで `false` になり、
+    /// 呼び出し元の後続の構文解析が `42601` で拒否する（TABLE-35・Issue #1602）。
+    fn is_subscriptable_primary(&self, start: usize, primary: &Expr) -> bool {
+        match self.tokens.get(start) {
+            Some(Token::Punct('(')) => true,
+            Some(Token::Ident(_)) => {
+                matches!(primary, Expr::Ident(_)) && self.pos == start.saturating_add(1)
+            }
+            _ => false,
+        }
+    }
+
+    /// 後置の添字 `[i]`・スライス `[lo:hi]`・`[:hi]`・`[lo:]`・`[:]`（TABLE-35・Issue #1602）。
+    /// 添字を 2 つ以上続けた形（`arr[1][2]`）は多次元の意味になるため `0A000`（本変更では対象外。Issue #1605 は型・codec・リテラルのみ）。
+    /// 要素の式は `NULL` を許す（`arr[NULL]` は NULL）。1 段ごとにノード予算と再帰深さを課金し、
+    /// CHECK 本体では `0A000`（永続化する述語の往復保証の範囲外）。
+    fn parse_subscript_postfix(
+        &mut self,
+        base: Expr,
+        subscriptable: bool,
+        depth: usize,
+    ) -> Result<Expr, SqlSurfaceError> {
+        if !subscriptable || !matches!(self.peek(), Some(Token::Punct('['))) {
+            return Ok(base);
+        }
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "array subscripts are not supported in a CHECK constraint".to_string(),
+            });
+        }
+        self.check_expr_depth(depth.saturating_add(1))?;
+        self.advance();
+        let subscript = if matches!(self.peek(), Some(Token::Punct(':'))) {
+            self.advance();
+            let hi = self.parse_optional_subscript_bound(depth)?;
+            ArraySubscript::Slice { lo: None, hi }
+        } else {
+            let first = self.parse_value_expr_with_null_context(depth.saturating_add(1), true)?;
+            if matches!(self.peek(), Some(Token::Punct(':'))) {
+                self.advance();
+                let hi = self.parse_optional_subscript_bound(depth)?;
+                ArraySubscript::Slice {
+                    lo: Some(Box::new(first)),
+                    hi,
+                }
+            } else {
+                ArraySubscript::Index(Box::new(first))
+            }
+        };
+        self.expect_punct(']')?;
+        self.consume_expr_node()?;
+        if matches!(self.peek(), Some(Token::Punct('['))) {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "multidimensional array subscripts are not supported".to_string(),
+            });
+        }
+        Ok(Expr::Subscript {
+            base: Box::new(base),
+            subscript,
+        })
+    }
+
+    /// スライスの `:` の直後の境界（`]` が続けば省略）。
+    fn parse_optional_subscript_bound(
+        &mut self,
+        depth: usize,
+    ) -> Result<Option<Box<Expr>>, SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Punct(']'))) {
+            return Ok(None);
+        }
+        let bound = self.parse_value_expr_with_null_context(depth.saturating_add(1), true)?;
+        Ok(Some(Box::new(bound)))
+    }
+
+    /// 配列コンストラクタ `ARRAY[<expr>, ...]`（TABLE-35・Issue #1602）。呼び出し元は現在位置が
+    /// 引用なしの `ARRAY` であることを確かめ済み。要素数は `MAX_ARRAY_ELEMENTS` を超えた時点で
+    /// `54000` にし、`Vec` へ積む前に検査する（無制限確保の防止）。入れ子（多次元）・
+    /// `ARRAY(<subquery>)`・CHECK 本体は `0A000`。空の `ARRAY[]` は構文上は受理し、型の決定は
+    /// 束縛段に任せる（`ARRAY[]::int[]` だけが有効）。
+    fn parse_array_constructor(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.check_expr_depth(depth)?;
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "ARRAY constructors are not supported in a CHECK constraint".to_string(),
+            });
+        }
+        self.advance();
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "ARRAY(subquery) is not supported".to_string(),
+            });
+        }
+        self.expect_punct('[')?;
+        let mut items: Vec<Expr> = Vec::new();
+        if !matches!(self.peek(), Some(Token::Punct(']'))) {
+            loop {
+                if matches!(self.peek(), Some(Token::Punct('['))) {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "multidimensional arrays are not supported".to_string(),
+                    });
+                }
+                if items.len() >= crate::catalog::MAX_ARRAY_ELEMENTS as usize {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "ARRAY constructor has too many elements",
+                    ));
+                }
+                let item =
+                    self.parse_value_expr_with_null_context(depth.saturating_add(1), true)?;
+                if matches!(item, Expr::ArrayConstructor(_)) {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "multidimensional arrays are not supported".to_string(),
+                    });
+                }
+                items.push(item);
+                if matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_punct(']')?;
+        self.consume_expr_node()?;
+        Ok(Expr::ArrayConstructor(items))
     }
 
     /// `TIMESTAMP` の直後が `WITH TIME ZONE <文字列>`／`WITHOUT TIME ZONE <文字列>` なら、
@@ -6270,6 +6519,15 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.consume_expr_node()?;
                 Ok(Expr::Null)
+            }
+            // 配列コンストラクタ `ARRAY[...]`・`ARRAY(<subquery>)`（TABLE-35・Issue #1602）。
+            // 引用されていない `ARRAY` の直後が `[`／`(` のときだけ（引用識別子 `"array"` は列参照）。
+            Some(Token::Ident(name))
+                if name.eq_ignore_ascii_case("ARRAY")
+                    && !self.quoted_null.contains(&self.pos)
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('[' | '('))) =>
+            {
+                self.parse_array_constructor(depth)
             }
             // codex-review P1 指摘対応（Issue #921 PR #1101）: `parse_select_item`
             // と同じ方針で、次のトークンが `WHEN` のときのみ `CASE` 式として扱う。
@@ -6870,6 +7128,16 @@ impl<'a> Parser<'a> {
             return Err(SqlSurfaceError::unsupported(format!(
                 "aggregate function {name} is only allowed as a top-level SELECT item"
             )));
+        }
+        // TABLE-35・Issue #1603: `ANY`／`SOME`／`ALL` は WHERE の比較演算子の右辺（量化比較）に
+        // だけ置ける。それ以外の位置の `ANY(...)` を未知の関数（`42883`）へ落とさず構文エラーにする。
+        if ["any", "some", "all"]
+            .iter()
+            .any(|kw| name.eq_ignore_ascii_case(kw))
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "ANY/SOME/ALL is only supported on the right side of a comparison operator in WHERE",
+            ));
         }
         self.expect_punct('(')?;
         // SQL/JSON 問い合わせ関数（TABLE-25・TASK-273。Issue #2187）は専用の句を持つため、
@@ -9091,11 +9359,13 @@ impl<'a> Parser<'a> {
             // 要素が ENUM の配列（Issue #1357）。語彙は未解決マーカーで仮置きし、
             // 実行段（`sql::ddl::execute_create_table`）が DDL 権限ゲートの後で
             // 登録済みの定義へ差し替える（ENUM 列と同じ契約）。
-            StaticColumnType::ArrayOfEnumCandidate(enum_name, max_len) => {
+            StaticColumnType::ArrayOfEnumCandidate(enum_name, max_len, ndims) => {
                 match crate::catalog::ArrayType::new_enum(
                     crate::catalog::EnumTypeDef::unresolved(enum_name),
                     max_len,
-                ) {
+                )
+                .and_then(|a| a.with_ndims(ndims))
+                {
                     Ok(a) => ColumnType::Array(a),
                     Err(e) => {
                         return Err(SqlSurfaceError::unsupported(format!(
@@ -12749,6 +13019,8 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         Expr::Collate { .. } | Expr::SqlJsonQuery(_) => true,
         // `CAST`（SQL-47・Issue #1590）も従来形では書けない式。
         Expr::Cast { .. } => true,
+        // 配列コンストラクタ・添字（TABLE-35・Issue #1602）も従来形では書けない式。
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => true,
         Expr::Number(_)
         | Expr::String(_)
         | Expr::Ident(_)
@@ -16565,6 +16837,67 @@ mod tests {
             panic!("expected -> below, got {inner:?}");
         };
         assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+    }
+
+    /// Issue #1603（TABLE-35）: 量化比較 `ANY`／`SOME`／`ALL` と `&&` の構文。`SOME` は `ANY` に正規化し、
+    /// `<>`／`!=` は `NOT =` と同じ `Or([<],[>])` へ脱糖し、サブクエリ形は `0A000`。
+    #[test]
+    fn quantified_comparisons_and_overlap_parse() {
+        use crate::sql::udf_call::{ArrayCmpOp, JsonAccessOp, Quantifier};
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        for (sql, want_op, want_q) in [
+            ("a = ANY(b)", ArrayCmpOp::Eq, Quantifier::Any),
+            ("a = SOME(b)", ArrayCmpOp::Eq, Quantifier::Any),
+            ("a <> ALL(b)", ArrayCmpOp::Ne, Quantifier::All),
+            ("a != ALL(b)", ArrayCmpOp::Ne, Quantifier::All),
+            ("a < any (b)", ArrayCmpOp::Lt, Quantifier::Any),
+            ("a <= ALL(b)", ArrayCmpOp::Le, Quantifier::All),
+            ("a > ANY(b)", ArrayCmpOp::Gt, Quantifier::Any),
+            ("a >= ALL(b)", ArrayCmpOp::Ge, Quantifier::All),
+        ] {
+            let preds =
+                where_predicates_for(&format!("SELECT * FROM documents WHERE {sql} {tail}"));
+            let [WherePredicate::Expression(Expr::Quantified { op, quantifier, .. })] =
+                preds.as_slice()
+            else {
+                panic!("expected a quantified predicate for {sql}, got {preds:?}");
+            };
+            assert_eq!((*op, *quantifier), (want_op, want_q), "{sql}");
+        }
+        // `a && b` は jsonb 演算子と同じ段の裸の述語。
+        let preds = where_predicates_for(&format!("SELECT * FROM documents WHERE a && b {tail}"));
+        assert!(matches!(
+            preds.as_slice(),
+            [WherePredicate::Expression(Expr::JsonAccess {
+                op: JsonAccessOp::Overlap,
+                ..
+            })]
+        ));
+        // `a <> b`（式）は `a < b OR a > b`。
+        let preds =
+            where_predicates_for(&format!("SELECT * FROM documents WHERE a + 1 <> b {tail}"));
+        let [WherePredicate::Or(branches)] = preds.as_slice() else {
+            panic!("expected an OR of two comparisons, got {preds:?}");
+        };
+        assert_eq!(branches.len(), 2);
+        // `any` という名前の列（直後が `(` でない）は識別子のまま。
+        let preds =
+            where_predicates_for(&format!("SELECT * FROM documents WHERE any = all {tail}"));
+        assert!(matches!(
+            preds.as_slice(),
+            [WherePredicate::Expression(Expr::Binary { .. })]
+        ));
+        // サブクエリ形と、比較の右辺以外の `ANY(` は拒否する。
+        let lookup = catalog_with(&["documents"]);
+        for (sql, code) in [
+            ("a = ANY(SELECT x FROM documents)", "0A000"),
+            ("a & b", "42601"),
+            ("ANY(a) = 1", "42601"),
+        ] {
+            let full = format!("SELECT * FROM documents WHERE {sql} {tail}");
+            let err = validate_statement(&full, &lookup).expect_err(sql);
+            assert_eq!(err.wire_code(), code, "{sql}");
+        }
     }
 
     /// Issue #1598（TABLE-25）: 包含・存在演算子は WHERE の裸の述語として受理され、

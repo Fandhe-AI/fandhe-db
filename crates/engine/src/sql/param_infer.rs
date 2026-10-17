@@ -300,6 +300,11 @@ impl Inferrer<'_> {
             // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）。`jsonb_path_*` と同じく `$n` の
             // 型付け対象外（boolean 用の `PreparedParamType` が無く、RETURNING で型が変わるため）。
             Expr::SqlJsonQuery(_) => Ty::Untyped,
+            // 配列コンストラクタ・添字（TABLE-35・Issue #1602）の結果は配列で、`$n` の兄弟型としては
+            // 使わない（型なし）。
+            Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
+                Ty::Untyped
+            }
             // jsonb パス演算子（Issue #1596）。`->>`／`#>>` は text、`->`／`#>` は
             // jsonb（`$n` の型付け対象外）なので型なしとして扱う。
             Expr::JsonAccess { op, .. } => match op {
@@ -318,7 +323,8 @@ impl Inferrer<'_> {
                 | crate::sql::udf_call::JsonAccessOp::Concat
                 | crate::sql::udf_call::JsonAccessOp::DeletePath
                 | crate::sql::udf_call::JsonAccessOp::PathExists
-                | crate::sql::udf_call::JsonAccessOp::PathMatch => Ty::Untyped,
+                | crate::sql::udf_call::JsonAccessOp::PathMatch
+                | crate::sql::udf_call::JsonAccessOp::Overlap => Ty::Untyped,
             },
             // DATE／TIMESTAMP は式内 `$n` の対象外型。`Text` へ倒さず `assign` の
             // 対象外型判定（`0A000`）に落として fail-closed にする。
@@ -485,6 +491,43 @@ impl Inferrer<'_> {
                 }
                 None => self.walk(expr)?,
             },
+            // 配列コンストラクタの要素の `$n` は兄弟要素の型で推論する（兄弟が無ければ不定＝`42P18`）。
+            // 添字・スライス境界の `$n` は int4、基底の `$n` は型を導けない（TABLE-35・Issue #1602）。
+            Expr::ArrayConstructor(items) => {
+                let refs: Vec<&Expr> = items.iter().collect();
+                self.walk_siblings(&refs)?;
+            }
+            // 量化比較の `$n` は要素型・配列型を導けない（`Untyped`＝不定＝`42P18`。fail-closed。
+            // TABLE-35・Issue #1603）。`$n` を使わない部分式は再帰で調べる。
+            Expr::Quantified { lhs, rhs, .. } => {
+                for e in [lhs, rhs] {
+                    match as_param(e) {
+                        Some(n) => self.assign(n, Ty::Untyped)?,
+                        None => self.walk(e)?,
+                    }
+                }
+            }
+            Expr::Subscript { base, subscript } => {
+                use crate::sql::udf_call::ArraySubscript;
+                match as_param(base) {
+                    Some(n) => self.assign(n, Ty::Untyped)?,
+                    None => self.walk(base)?,
+                }
+                let bounds: Vec<&Expr> = match subscript {
+                    ArraySubscript::Index(i) => vec![i.as_ref()],
+                    ArraySubscript::Slice { lo, hi } => {
+                        [lo, hi].into_iter().flatten().map(|b| b.as_ref()).collect()
+                    }
+                };
+                for e in bounds {
+                    match as_param(e) {
+                        Some(n) => {
+                            self.assign(n, Ty::Known(scalar("?column?", ColumnType::Integer)))?
+                        }
+                        None => self.walk(e)?,
+                    }
+                }
+            }
             // SQL/JSON 問い合わせ関数の部分式の `$n` は型を導けない（`Untyped`＝不定）。
             Expr::SqlJsonQuery(q) => {
                 let mut children: Vec<&Expr> = vec![&q.context, &q.path];

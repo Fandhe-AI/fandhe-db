@@ -469,7 +469,7 @@ impl CastType {
 
 /// 変換元の静的な型の導出結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SourceKind {
+pub(super) enum SourceKind {
     /// 規則表の見出しが確定した。
     Known(CastKind),
     /// 数値だが種別（整数・float・numeric）を静的に決められない
@@ -483,7 +483,7 @@ enum SourceKind {
 }
 
 /// 配列の要素型を CAST の型へ写す（ENUM は `None`）。
-fn elem_cast_type(e: ArrayElemType) -> Option<CastType> {
+pub(crate) fn elem_cast_type(e: ArrayElemType) -> Option<CastType> {
     Some(match e {
         ArrayElemType::Text => CastType::Text,
         ArrayElemType::Bool => CastType::Bool,
@@ -533,7 +533,7 @@ fn column_kind(schema: Option<&TableSchema>, index: usize) -> Option<CastKind> {
 }
 
 /// 型を変えない `COLLATE` ラッパーを剥がした式を返す（変換元の型追跡用）。
-fn strip_collate(mut e: &Expr) -> &Expr {
+pub(super) fn strip_collate(mut e: &Expr) -> &Expr {
     while let Expr::Collate { expr, .. } = e {
         e = expr;
     }
@@ -546,7 +546,7 @@ fn strip_collate(mut e: &Expr) -> &Expr {
 /// [`SourceKind::UnknownNumeric`]。TEXT は列の宣言型（text／varchar）と `BpcharToText` から復元する
 /// （三者は `42846` の判定がすべて同じなので、取り違えても `×` の判定は変わらない。恒等の判定にだけ
 /// 正確さが要る）。
-fn source_cast_kind(
+pub(super) fn source_cast_kind(
     operand: &Expr,
     bound: &BoundExpr,
     ty: ExprType,
@@ -568,6 +568,11 @@ fn source_cast_kind(
             match bound {
                 BoundExpr::ColumnRef { index } => match column_kind(schema, *index) {
                     Some(k) => SourceKind::Known(k),
+                    None => SourceKind::UnknownNumeric,
+                },
+                // 配列の添字の結果は要素型の種別（TABLE-35・Issue #1602）。
+                BoundExpr::ArrayIndex { elem, .. } => match elem_cast_type(*elem) {
+                    Some(t) => SourceKind::Known(t.kind()),
                     None => SourceKind::UnknownNumeric,
                 },
                 BoundExpr::Builtin {
@@ -613,6 +618,10 @@ fn source_cast_kind(
                     }
                 }))
             }
+            // 配列コンストラクタ・スライスの結果は束縛結果が持つ要素型（TABLE-35・Issue #1602）。
+            BoundExpr::ArrayConstructor { elem, .. } | BoundExpr::ArraySlice { elem, .. } => {
+                SourceKind::Array(elem_cast_type(*elem))
+            }
             _ => SourceKind::Array(None),
         },
         ExprType::Vector => SourceKind::Outside,
@@ -620,7 +629,7 @@ fn source_cast_kind(
 }
 
 /// 数値リテラルの型（PostgreSQL と同じく、整数形は int4 → int8 → numeric、小数は numeric）。
-fn number_literal_kind(raw: &str) -> CastKind {
+pub(super) fn number_literal_kind(raw: &str) -> CastKind {
     match crate::sql::udf_call::classify_integer_literal(raw) {
         Some((_, NumericKind::Int4)) => CastKind::Int4,
         Some((_, NumericKind::Int8)) => CastKind::Int8,
@@ -878,7 +887,7 @@ fn bind_string_literal_as(
     bind_expr_any(&literal, env, node_budget)
 }
 
-fn charge_node(node_budget: &mut usize) -> Result<(), SqlSurfaceError> {
+pub(super) fn charge_node(node_budget: &mut usize) -> Result<(), SqlSurfaceError> {
     *node_budget = node_budget
         .checked_sub(1)
         .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
@@ -886,7 +895,7 @@ fn charge_node(node_budget: &mut usize) -> Result<(), SqlSurfaceError> {
 }
 
 /// 2^53（式評価が整数を f64 で正確に運べる上限）を超える整数形リテラルか。
-fn exceeds_exact_integer(raw: &str) -> bool {
+pub(super) fn exceeds_exact_integer(raw: &str) -> bool {
     match crate::sql::udf_call::classify_integer_literal(raw) {
         Some((v, _)) => v.unsigned_abs() > (1u64 << 53),
         None => false,
@@ -895,7 +904,10 @@ fn exceeds_exact_integer(raw: &str) -> bool {
 
 /// `CAST` の被演算子になる NUMERIC／BOOLEAN／UUID／BYTEA／配列列の参照を、CAST の位置でだけ受理して葉にする。
 /// それ以外の位置の参照は従来どおり束縛段が拒否する。UDF 本体（スキーマなし）は対象外。
-fn bind_cast_operand_column(name: &str, env: &BindEnv<'_>) -> Option<(BoundExpr, ExprType)> {
+pub(super) fn bind_cast_operand_column(
+    name: &str,
+    env: &BindEnv<'_>,
+) -> Option<(BoundExpr, ExprType)> {
     let schema = env.schema()?;
     // UDF の仮引数は列より優先される（`Expr::Ident` の通常の束縛順序と同じ）。
     if env.has_param(name) {
@@ -918,6 +930,76 @@ fn bind_cast_operand_column(name: &str, env: &BindEnv<'_>) -> Option<(BoundExpr,
     }
 }
 
+/// 配列値の式を配列列へ代入するための変換を作る（`UPDATE ... SET <配列列> = <配列式>`。
+/// TABLE-35・Issue #1602。呼び出し元は `sql::set_expr::bind_set_expr`）。
+///
+/// 要素型が列と同じなら式をそのまま返す。異なる場合は PG の代入変換と同じく、要素の規則が
+/// 恒等・暗黙・代入・文字列型への I/O 代入のいずれかのときだけ `BuiltinFn::Cast`（配列 → 配列）を
+/// 挟み、それ以外は `42804`。要素型を静的に確定できない式・ENUM 要素の列は `0A000`。
+/// `NUMERIC(p,s)[]` 列へは位取りの異なる要素型の組として必ず変換ノードを通り、列の位取りへ
+/// 正規化される。
+pub(super) fn bind_array_assignment(
+    expr: &Expr,
+    bound: BoundExpr,
+    schema: &TableSchema,
+    target: &ArrayType,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    let unsupported = |detail: &str| SqlSurfaceError::FeatureNotSupported {
+        detail: detail.to_string(),
+    };
+    let Some(tgt_ty) = elem_cast_type(target.elem()) else {
+        return Err(unsupported(
+            "assigning an array expression to this column type is not supported",
+        ));
+    };
+    let src_ty = match source_cast_kind(expr, &bound, ExprType::Array, Some(schema)) {
+        SourceKind::Array(Some(t)) => t,
+        _ => {
+            return Err(unsupported(
+                "the element type of this array expression cannot be determined",
+            ))
+        }
+    };
+    if src_ty == tgt_ty {
+        return Ok(bound);
+    }
+    if !matches!(
+        cast_rule(src_ty.kind(), tgt_ty.kind()),
+        CastRule::Identity | CastRule::Implicit | CastRule::Assignment | CastRule::IoAssignment
+    ) {
+        return Err(SqlSurfaceError::datatype_mismatch(
+            "column cannot be assigned an array with a different element type",
+        ));
+    }
+    let src_arr = CastType::Array(Box::new(src_ty));
+    let tgt_arr = CastType::Array(Box::new(tgt_ty));
+    let (Some(src), Some(dst)) = (
+        cast_src(CastKind::Array, ExprType::Array, src_arr.array_elem_type()),
+        cast_dst(&tgt_arr),
+    ) else {
+        return Err(unsupported(
+            "assigning an array expression to this column type is not supported",
+        ));
+    };
+    Ok(cast_node(CastFn { from: src, to: dst }, bound))
+}
+
+/// 配列の要素・添字の基底など、CAST の被演算子と同じ規則で式を束縛する（列参照は numeric／bool／
+/// uuid／bytea／配列の列も葉として受理する。TABLE-35・Issue #1602 の `sql::array_expr` が使う）。
+pub(super) fn bind_operand(
+    operand: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if let Expr::Ident(name) = operand {
+        if let Some(leaf) = bind_cast_operand_column(name, env) {
+            charge_node(node_budget)?;
+            return Ok(leaf);
+        }
+    }
+    bind_expr_any(operand, env, node_budget)
+}
+
 /// `CAST(<operand> AS <target>)` の束縛（`udf_call::bind_expr_any` の `Expr::Cast` 腕から呼ばれる）。
 ///
 /// 束縛の結果は次のいずれか。
@@ -934,6 +1016,16 @@ pub(super) fn bind_cast(
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
     let target_ty = target.expr_type();
+    // 空の `ARRAY[]` は変換先の要素型の空配列にする（`ARRAY[]::int[]`。PG と同じく型は変換先で決まる）。
+    if let (Expr::ArrayConstructor(items), CastType::Array(_)) = (strip_collate(operand), target) {
+        if items.is_empty() {
+            charge_node(node_budget)?;
+            return Ok((
+                crate::sql::array_expr::bind_empty_array_as(target)?,
+                ExprType::Array,
+            ));
+        }
+    }
     let (bound, ty) = match operand {
         // 型付き NULL（`CAST(NULL AS integer)`）。変換先に式の型が無ければ未実装。
         Expr::Null => {
@@ -964,6 +1056,22 @@ pub(super) fn bind_cast(
         },
         _ => bind_expr_any(operand, env, node_budget)?,
     };
+    cast_bound(operand, bound, ty, target, env, node_budget)
+}
+
+/// 束縛済みの被演算子 `bound`（式の型 `ty`。AST は `operand`）を `target` へ変換する
+/// [`bind_cast`] の後半。配列コンストラクタ・添字（`sql::array_expr`）が、要素・添字の式を
+/// 分類のために 1 度束縛した結果を再束縛せずに変換へ渡すために公開する（入れ子の式を束縛し直すと
+/// 入れ子の深さに対して指数的に束縛が重複するため。TABLE-35・Issue #1602）。
+pub(super) fn cast_bound(
+    operand: &Expr,
+    bound: BoundExpr,
+    ty: ExprType,
+    target: &CastType,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let target_ty = target.expr_type();
     let source = source_cast_kind(operand, &bound, ty, env.schema());
     // 配列は要素型つきで規則を引く（`Some(None)` は要素型を CAST の型で表せない ENUM 配列）。
     let mut array_from: Option<Option<CastType>> = None;

@@ -150,6 +150,8 @@ pub mod aggregate;
 mod aggregate_embedding_decode_tests;
 pub mod allowlist;
 pub(crate) mod arena_cache;
+mod array_expr;
+mod array_ops;
 pub mod cast;
 pub mod cast_value;
 pub(crate) mod check_constraint;

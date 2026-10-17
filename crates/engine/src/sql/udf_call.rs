@@ -327,6 +327,207 @@ pub enum Expr {
         expr: Box<Expr>,
         ty: crate::sql::cast::CastType,
     },
+    /// 配列コンストラクタ `ARRAY[<expr>, ...]`（対象ビヘイビア: TABLE-35。Issue #1602）。
+    /// 要素型の統一は束縛段（`sql::array_expr`）が行う。多次元・`ARRAY(<subquery>)` は構文段が拒否する。
+    ArrayConstructor(Vec<Expr>),
+    /// 配列の添字 `<base>[<i>]`・スライス `<base>[<lo>:<hi>]`（TABLE-35。Issue #1602）。
+    /// 基底は列参照または括弧式に限る（PG の `c_expr opt_indirection` と同じ）。
+    Subscript {
+        base: Box<Expr>,
+        subscript: ArraySubscript,
+    },
+    /// 量化比較 `<lhs> <op> ANY|SOME|ALL (<array>)`（対象ビヘイビア: TABLE-35。Issue #1603）。
+    /// 構文段（`allowlist::Parser::parse_expression_predicate`）が WHERE の式述語の頂点としてだけ生成し、
+    /// `SOME` は `ANY` に正規化する。束縛・評価は `sql::array_ops`。サブクエリ形は構文段が `0A000` で拒否する。
+    Quantified {
+        op: ArrayCmpOp,
+        quantifier: Quantifier,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+}
+
+/// 量化比較・配列どうしの比較で使う比較演算子（[`Expr::Quantified`]・[`BoundExpr::ArrayCompare`]）。
+/// [`BinOp`] には `<>` が無く、`BinOp` を拡張すると算術・比較の網羅 match が広範に崩れるため、
+/// 配列系の述語専用に別の列挙にしている（TABLE-35。Issue #1603）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayCmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl ArrayCmpOp {
+    /// 演算子の否定（`NOT (a = b)` ↔ `a <> b`、`<` ↔ `>=`）。量化子の反転と組で
+    /// `where_negation` が使う。三値論理でも `NOT (x op y)` は `x (!op) y` と等価（NULL は NULL のまま）。
+    pub fn negated(self) -> Self {
+        match self {
+            ArrayCmpOp::Eq => ArrayCmpOp::Ne,
+            ArrayCmpOp::Ne => ArrayCmpOp::Eq,
+            ArrayCmpOp::Lt => ArrayCmpOp::Ge,
+            ArrayCmpOp::Le => ArrayCmpOp::Gt,
+            ArrayCmpOp::Gt => ArrayCmpOp::Le,
+            ArrayCmpOp::Ge => ArrayCmpOp::Lt,
+        }
+    }
+
+    /// `content_hash` 用の安定した 1 バイト識別子（変更禁止）。
+    pub(crate) fn hash_tag(self) -> u8 {
+        match self {
+            ArrayCmpOp::Eq => 1,
+            ArrayCmpOp::Ne => 2,
+            ArrayCmpOp::Lt => 3,
+            ArrayCmpOp::Le => 4,
+            ArrayCmpOp::Gt => 5,
+            ArrayCmpOp::Ge => 6,
+        }
+    }
+
+    /// SQL 表記（CHECK／ビューの描画用）。
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            ArrayCmpOp::Eq => "=",
+            ArrayCmpOp::Ne => "<>",
+            ArrayCmpOp::Lt => "<",
+            ArrayCmpOp::Le => "<=",
+            ArrayCmpOp::Gt => ">",
+            ArrayCmpOp::Ge => ">=",
+        }
+    }
+}
+
+/// 量化子（[`Expr::Quantified`]）。`SOME` は構文段で `Any` に正規化される。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quantifier {
+    Any,
+    All,
+}
+
+impl Quantifier {
+    /// 量化子の反転（ANY ↔ ALL）。量化の De Morgan（`NOT (x op ANY a)` = `x !op ALL a`）に使う。
+    pub fn flipped(self) -> Self {
+        match self {
+            Quantifier::Any => Quantifier::All,
+            Quantifier::All => Quantifier::Any,
+        }
+    }
+}
+
+/// 配列の包含・被包含・重なり（[`BoundExpr::ArrayContainment`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayContainOp {
+    /// `@>`（左が右を含む）。
+    Contains,
+    /// `<@`（左が右に含まれる）。
+    ContainedBy,
+    /// `&&`（共通要素がある）。
+    Overlap,
+}
+
+impl BoundExpr {
+    /// 配列コンストラクタ・添字・スライスの子の束縛式を出現順に返す（それ以外は `None`）。
+    /// 子を再帰で辿るだけの網羅 match が同じ分解を共有するための補助（TABLE-35・Issue #1602）。
+    pub(crate) fn array_children(&self) -> Option<Vec<&BoundExpr>> {
+        match self {
+            BoundExpr::ArrayConstructor { items, .. } => Some(items.iter().collect()),
+            BoundExpr::ArrayIndex { base, index, .. } => Some(vec![base.as_ref(), index.as_ref()]),
+            BoundExpr::ArraySlice { base, lo, hi, .. } => {
+                let mut out: Vec<&BoundExpr> = vec![base.as_ref()];
+                out.extend([lo, hi].into_iter().flatten().map(|b| b.as_ref()));
+                Some(out)
+            }
+            // 配列述語（TABLE-35・Issue #1603）の子も同じ補助で辿る。
+            BoundExpr::ArrayCompare { lhs, rhs, .. }
+            | BoundExpr::ArrayContainment { lhs, rhs, .. } => {
+                Some(vec![lhs.as_ref(), rhs.as_ref()])
+            }
+            BoundExpr::ArrayQuantified { lhs, array, .. } => {
+                Some(vec![lhs.as_ref(), array.as_ref()])
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Expr {
+    /// 配列コンストラクタ・添字の子式を出現順に返す（それ以外の variant は `None`）。
+    /// 子を再帰で辿るだけの網羅 match（ビューの参照列収集・名前収集・CHECK 描画等）が
+    /// 同じ分解を共有するための補助（TABLE-35。Issue #1602）。
+    pub(crate) fn array_expr_children(&self) -> Option<Vec<&Expr>> {
+        match self {
+            Expr::ArrayConstructor(items) => Some(items.iter().collect()),
+            Expr::Subscript { base, subscript } => {
+                let mut out: Vec<&Expr> = vec![base.as_ref()];
+                match subscript {
+                    ArraySubscript::Index(i) => out.push(i.as_ref()),
+                    ArraySubscript::Slice { lo, hi } => {
+                        out.extend([lo, hi].into_iter().flatten().map(|b| b.as_ref()));
+                    }
+                }
+                Some(out)
+            }
+            // 量化比較（TABLE-35・Issue #1603）も子（左辺・配列式）を再帰で辿るだけの走査と共有する。
+            Expr::Quantified { lhs, rhs, .. } => Some(vec![lhs.as_ref(), rhs.as_ref()]),
+            _ => None,
+        }
+    }
+
+    /// 配列コンストラクタ・添字の子式を `f` で写した新しい式を返す（それ以外は `None`）。
+    /// 識別子の書き換えなど、構造を保ったまま子を置換する走査が共有する補助。
+    pub(crate) fn try_map_array_children<E>(
+        &self,
+        f: &mut dyn FnMut(&Expr) -> Result<Expr, E>,
+    ) -> Option<Result<Expr, E>> {
+        match self {
+            Expr::ArrayConstructor(items) => Some(
+                items
+                    .iter()
+                    .map(&mut *f)
+                    .collect::<Result<Vec<_>, E>>()
+                    .map(Expr::ArrayConstructor),
+            ),
+            Expr::Subscript { base, subscript } => Some((|| {
+                let base = Box::new(f(base)?);
+                let subscript = match subscript {
+                    ArraySubscript::Index(i) => ArraySubscript::Index(Box::new(f(i)?)),
+                    ArraySubscript::Slice { lo, hi } => ArraySubscript::Slice {
+                        lo: lo.as_deref().map(|e| f(e).map(Box::new)).transpose()?,
+                        hi: hi.as_deref().map(|e| f(e).map(Box::new)).transpose()?,
+                    },
+                };
+                Ok(Expr::Subscript { base, subscript })
+            })()),
+            Expr::Quantified {
+                op,
+                quantifier,
+                lhs,
+                rhs,
+            } => Some((|| {
+                Ok(Expr::Quantified {
+                    op: *op,
+                    quantifier: *quantifier,
+                    lhs: Box::new(f(lhs)?),
+                    rhs: Box::new(f(rhs)?),
+                })
+            })()),
+            _ => None,
+        }
+    }
+}
+
+/// 添字の種別（[`Expr::Subscript`]）。スライスの境界は片側省略を `None` で表す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArraySubscript {
+    /// `[i]`。
+    Index(Box<Expr>),
+    /// `[lo:hi]`・`[:hi]`・`[lo:]`・`[:]`。
+    Slice {
+        lo: Option<Box<Expr>>,
+        hi: Option<Box<Expr>>,
+    },
 }
 
 /// SQL/JSON 問い合わせ関数の種別（[`Expr::SqlJsonQuery`]）。
@@ -539,6 +740,9 @@ pub enum JsonAccessOp {
     /// `@@`（右辺は jsonpath 文字列リテラル。結果は bool。`jsonb_path_match(l, r, '{}', true)`
     /// と同値。Issue #2186）。
     PathMatch,
+    /// `&&`（配列の重なり。結果は bool。配列専用で、jsonb オペランドは `42883`。
+    /// TABLE-35・Issue #1603）。
+    Overlap,
 }
 
 impl JsonAccessOp {
@@ -558,6 +762,7 @@ impl JsonAccessOp {
             JsonAccessOp::DeletePath => "#-",
             JsonAccessOp::PathExists => "@?",
             JsonAccessOp::PathMatch => "@@",
+            JsonAccessOp::Overlap => "&&",
         }
     }
 
@@ -573,6 +778,7 @@ impl JsonAccessOp {
                 | JsonAccessOp::ExistsAll
                 | JsonAccessOp::PathExists
                 | JsonAccessOp::PathMatch
+                | JsonAccessOp::Overlap
         )
     }
 }
@@ -729,6 +935,50 @@ pub enum BoundExpr {
     /// nullable 配列列の参照（Issue #1592・SQL-47）。`CAST` の被演算子の位置でだけ生成する。
     ArrayColumnRef {
         index: usize,
+    },
+    /// 配列コンストラクタ `ARRAY[...]`（TABLE-35・Issue #1602。束縛・評価は `sql::array_expr`）。
+    /// 各要素は統一後の要素型 `elem` へ変換済みの束縛式で、評価は要素値を `elem` の配列へ詰める。
+    ArrayConstructor {
+        elem: crate::catalog::ArrayElemType,
+        items: Vec<BoundExpr>,
+    },
+    /// 配列の添字 `base[index]`（1 始まり。範囲外・NULL は NULL。`index` は int4 へ変換済み）。
+    /// `elem` は基底配列の要素型。
+    ArrayIndex {
+        elem: crate::catalog::ArrayElemType,
+        base: Box<BoundExpr>,
+        index: Box<BoundExpr>,
+    },
+    /// 配列のスライス `base[lo:hi]`（境界は int4 へ変換済み。省略は `None`。結果は同じ要素型の配列）。
+    ArraySlice {
+        elem: crate::catalog::ArrayElemType,
+        base: Box<BoundExpr>,
+        lo: Option<Box<BoundExpr>>,
+        hi: Option<Box<BoundExpr>>,
+    },
+    /// 配列どうしの比較（`=` `<>` `<` `<=` `>` `>=`。TABLE-35・Issue #1603。束縛・評価は
+    /// `sql::array_ops`）。両辺は同じ要素型 `elem` の配列。結果は bool（配列が NULL なら NULL）。
+    ArrayCompare {
+        op: ArrayCmpOp,
+        elem: crate::catalog::ArrayElemType,
+        lhs: Box<BoundExpr>,
+        rhs: Box<BoundExpr>,
+    },
+    /// 配列の包含・被包含・重なり（`@>` `<@` `&&`。TABLE-35・Issue #1603）。結果は bool。
+    ArrayContainment {
+        op: ArrayContainOp,
+        elem: crate::catalog::ArrayElemType,
+        lhs: Box<BoundExpr>,
+        rhs: Box<BoundExpr>,
+    },
+    /// 量化比較 `lhs op ANY|ALL (array)`（TABLE-35・Issue #1603）。`lhs` は要素型 `elem` と
+    /// 比較できる型へ束縛済み。`all` が真なら ALL、偽なら ANY。
+    ArrayQuantified {
+        op: ArrayCmpOp,
+        all: bool,
+        elem: crate::catalog::ArrayElemType,
+        lhs: Box<BoundExpr>,
+        array: Box<BoundExpr>,
     },
     /// `json_*` 関数・`to_json`・`json_build_*` の束縛結果（Issue #2180。束縛・評価は
     /// `sql::json_fn`）。
@@ -931,6 +1181,86 @@ impl PartialEq for BoundExpr {
             (BoundExpr::ArrayColumnRef { index: a }, BoundExpr::ArrayColumnRef { index: b }) => {
                 a == b
             }
+            (
+                BoundExpr::ArrayConstructor {
+                    elem: ea,
+                    items: ia,
+                },
+                BoundExpr::ArrayConstructor {
+                    elem: eb,
+                    items: ib,
+                },
+            ) => ea == eb && ia == ib,
+            (
+                BoundExpr::ArrayIndex {
+                    elem: ea,
+                    base: ba,
+                    index: xa,
+                },
+                BoundExpr::ArrayIndex {
+                    elem: eb,
+                    base: bb,
+                    index: xb,
+                },
+            ) => ea == eb && ba == bb && xa == xb,
+            (
+                BoundExpr::ArraySlice {
+                    elem: ea,
+                    base: ba,
+                    lo: la,
+                    hi: ha,
+                },
+                BoundExpr::ArraySlice {
+                    elem: eb,
+                    base: bb,
+                    lo: lb,
+                    hi: hb,
+                },
+            ) => ea == eb && ba == bb && la == lb && ha == hb,
+            (
+                BoundExpr::ArrayCompare {
+                    op: oa,
+                    elem: ea,
+                    lhs: la,
+                    rhs: ra,
+                },
+                BoundExpr::ArrayCompare {
+                    op: ob,
+                    elem: eb,
+                    lhs: lb,
+                    rhs: rb,
+                },
+            ) => oa == ob && ea == eb && la == lb && ra == rb,
+            (
+                BoundExpr::ArrayContainment {
+                    op: oa,
+                    elem: ea,
+                    lhs: la,
+                    rhs: ra,
+                },
+                BoundExpr::ArrayContainment {
+                    op: ob,
+                    elem: eb,
+                    lhs: lb,
+                    rhs: rb,
+                },
+            ) => oa == ob && ea == eb && la == lb && ra == rb,
+            (
+                BoundExpr::ArrayQuantified {
+                    op: oa,
+                    all: aa,
+                    elem: ea,
+                    lhs: la,
+                    array: ya,
+                },
+                BoundExpr::ArrayQuantified {
+                    op: ob,
+                    all: ab,
+                    elem: eb,
+                    lhs: lb,
+                    array: yb,
+                },
+            ) => oa == ob && aa == ab && ea == eb && la == lb && ya == yb,
             (BoundExpr::JsonTextFn(a), BoundExpr::JsonTextFn(b)) => a == b,
             (BoundExpr::JsonPathFn(a), BoundExpr::JsonPathFn(b)) => a == b,
             (
@@ -1424,6 +1754,12 @@ pub(crate) fn first_non_builtin_call_with(
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
             first_non_builtin_call_with(expr, allow_current_time, allow_json_fns)
         }
+        // 配列コンストラクタ・添字（TABLE-35・Issue #1602）は子を検査するだけ。
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
+            .array_expr_children()
+            .into_iter()
+            .flatten()
+            .find_map(|c| first_non_builtin_call_with(c, allow_current_time, allow_json_fns)),
         // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）は jsonb 関数と同じ扱い（CHECK 本体・
         // 連鎖ビュー本文では禁止要素として報告し、許可される文脈では部分式を検査する）。
         Expr::SqlJsonQuery(q) => {
@@ -1725,9 +2061,23 @@ fn is_reserved_function_name(name: &str) -> bool {
     // 消費するため、`case(...)` という呼び出し形は `WHEN` を期待する CASE
     // 構文解析へ吸われて `42601` になる。`is_reserved_function_name` docs の
     // 既存 `min`/`集計` と同じ理由。Bugbot 指摘対応）。
+    //
+    // `ANY`／`SOME`／`ALL`（Issue #1603・TABLE-35 ポインタ）は量化比較の量化子として
+    // 構文解析され、量化子の位置以外の関数呼び出し形は `42601` で拒否される。同名の UDF を
+    // 許すと呼び出せない定義が登録でき、既存の同名 UDF の呼び出しも壊れるため予約する
+    // （互換性変更。`docs/design/implementation-status.md` の Issue #1603 節に記載）。
     matches!(
         upper.as_str(),
-        "VISIBLE" | "HYBRID_RRF" | "HYBRID" | "CASE" | "COALESCE" | "NULLIF" | "CAST"
+        "VISIBLE"
+            | "HYBRID_RRF"
+            | "HYBRID"
+            | "CASE"
+            | "COALESCE"
+            | "NULLIF"
+            | "CAST"
+            | "ANY"
+            | "SOME"
+            | "ALL"
     ) || is_builtin_function_name(name)
         || crate::sql::allowlist::is_aggregate_function_name(name)
 }
@@ -1949,6 +2299,14 @@ fn validate_closed_expr(
         Expr::Collate { expr, .. } => validate_closed_expr(expr, params, registry, node_budget),
         // `CAST`（SQL-47・Issue #1590）は被演算子を検査する（変換先の型名は構文段で解決済み）。
         Expr::Cast { expr, .. } => validate_closed_expr(expr, params, registry, node_budget),
+        // 配列コンストラクタ・添字は UDF 本体（スキーマが無く要素型を決められない閉じた式）では
+        // 受理しない（TABLE-35・Issue #1602。`0A000`）。
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
+            Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "array constructors and subscripts are not supported in a function body"
+                    .to_string(),
+            })
+        }
         // SQL/JSON 問い合わせ関数は UDF 本体（閉じた式）では受理しない（jsonb 関数と同じ `0A000`）。
         Expr::SqlJsonQuery(_) => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "SQL/JSON query functions are not supported in a function body".to_string(),
@@ -2229,6 +2587,16 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => 1,
+        BoundExpr::ArrayConstructor { .. }
+        | BoundExpr::ArrayIndex { .. }
+        | BoundExpr::ArraySlice { .. }
+        | BoundExpr::ArrayCompare { .. }
+        | BoundExpr::ArrayContainment { .. }
+        | BoundExpr::ArrayQuantified { .. } => expr
+            .array_children()
+            .into_iter()
+            .flatten()
+            .fold(1usize, |acc, c| acc.saturating_add(count_bound_nodes(c))),
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             1 + count_bound_nodes(lhs)
                 + match rhs {
@@ -2318,6 +2686,18 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => 0,
+        BoundExpr::ArrayConstructor { .. }
+        | BoundExpr::ArrayIndex { .. }
+        | BoundExpr::ArraySlice { .. }
+        | BoundExpr::ArrayCompare { .. }
+        | BoundExpr::ArrayContainment { .. }
+        | BoundExpr::ArrayQuantified { .. } => expr
+            .array_children()
+            .into_iter()
+            .flatten()
+            .map(max_bound_case_nesting)
+            .max()
+            .unwrap_or(0),
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             let r = match rhs {
                 JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) => max_bound_case_nesting(e),
@@ -2403,6 +2783,16 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => false,
+        BoundExpr::ArrayConstructor { .. }
+        | BoundExpr::ArrayIndex { .. }
+        | BoundExpr::ArraySlice { .. }
+        | BoundExpr::ArrayCompare { .. }
+        | BoundExpr::ArrayContainment { .. }
+        | BoundExpr::ArrayQuantified { .. } => expr
+            .array_children()
+            .into_iter()
+            .flatten()
+            .any(references_embedding),
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             references_embedding(lhs)
                 || match rhs {
@@ -2460,6 +2850,16 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::ArrayColumnRef { index }
         | BoundExpr::BoolColumnRef { index }
         | BoundExpr::ColumnRef { index } => visit(*index),
+        BoundExpr::ArrayConstructor { .. }
+        | BoundExpr::ArrayIndex { .. }
+        | BoundExpr::ArraySlice { .. }
+        | BoundExpr::ArrayCompare { .. }
+        | BoundExpr::ArrayContainment { .. }
+        | BoundExpr::ArrayQuantified { .. } => {
+            for c in expr.array_children().into_iter().flatten() {
+                visit_referenced_scalar_columns(c, visit);
+            }
+        }
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             visit_referenced_scalar_columns(lhs, visit);
             if let JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) = rhs {
@@ -2587,6 +2987,20 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::Null => false,
         // 左辺の jsonb 列と、キー／添字の式が参照する列を両方マスクへ反映する
         // （取りこぼすとマスク外参照＝実 NULL の誤判定になるため全て走査する）。
+        BoundExpr::ArrayConstructor { .. }
+        | BoundExpr::ArrayIndex { .. }
+        | BoundExpr::ArraySlice { .. }
+        | BoundExpr::ArrayCompare { .. }
+        | BoundExpr::ArrayContainment { .. }
+        | BoundExpr::ArrayQuantified { .. } => {
+            let mut any = false;
+            for c in expr.array_children().into_iter().flatten() {
+                if mark_referenced_scalar_columns(c, mask) {
+                    any = true;
+                }
+            }
+            any
+        }
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             let mut any = mark_referenced_scalar_columns(lhs, mask);
             if let JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) = rhs {
@@ -2794,6 +3208,30 @@ pub(crate) fn bind_projection_expr_json_ok(
     Ok((bound, ty, col))
 }
 
+/// 配列列への `UPDATE ... SET` 右辺を束縛する（TABLE-35・Issue #1602。`sql::set_expr` から呼ばれる）。
+///
+/// 通常の投影束縛と同じだが、右辺が裸の列名のときは CAST の被演算子と同じ規則（配列列を
+/// `ArrayColumnRef` の葉として受理）で解決する。これで `SET nums = other_nums` が到達できる。
+pub(crate) fn bind_array_assignment_source(
+    expr: &Expr,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    let mut env = BindEnv {
+        schema: Some(schema),
+        params: std::collections::HashMap::new(),
+        registry,
+        case_nesting: 0,
+        typed_arith: true,
+        clock: time_fn::current_clock(),
+        collation_leaf: false,
+    };
+    let (bound, ty) = crate::sql::cast::bind_operand(expr, &mut env, node_budget)?;
+    let col = expr_result_column_type(expr, &bound, ty);
+    Ok((bound, ty, col))
+}
+
 /// 式内の TEXT 系列参照が持つ照合（列定義の `collation`）を引く。範囲外・スキーマなしは
 /// `None`（照合指定なし＝既定）として扱う。
 fn column_collation(
@@ -2897,6 +3335,21 @@ pub(crate) fn expr_result_column_type(
             return Some(ColumnType::Integer);
         }
     }
+    // 配列コンストラクタ・スライスの結果は要素型つきの配列、添字の結果は要素型そのもの
+    // （TABLE-35・Issue #1602。整数要素は倍精度ではなく元の整数型を公告する）。
+    match bound {
+        BoundExpr::ArrayConstructor { elem, .. } | BoundExpr::ArraySlice { elem, .. } => {
+            return crate::catalog::ArrayType::new(*elem, crate::catalog::MAX_ARRAY_ELEMENTS)
+                .ok()
+                .map(ColumnType::Array);
+        }
+        BoundExpr::ArrayIndex { elem, .. } => {
+            return crate::sql::cast::elem_cast_type(*elem)
+                .and_then(|t| t.result_column_type())
+                .or_else(|| column_type_for_expr_type(ty));
+        }
+        _ => {}
+    }
     column_type_for_expr_type(ty)
 }
 
@@ -2993,6 +3446,32 @@ pub(crate) fn bind_const_expr(
         collation_leaf: false,
     };
     let (bound, ty) = bind_expr_in(expr, &mut env, node_budget)?;
+    let col = expr_result_column_type(expr, &bound, ty);
+    Ok((bound, ty, col))
+}
+
+/// [`bind_const_expr`] の最上位だけ配列値を許す版（`INSERT ... VALUES` の定数式の畳み込み用。
+/// 配列は評価後に PG 配列テキストへ畳まれ、列側の入力関数が列の要素型で解釈し直す。
+/// TABLE-35・Issue #1602）。式の内側（演算の被演算子・関数引数・`CASE` 等）の拒否規則は
+/// [`bind_expr_any`] 側のまま維持される。
+pub(crate) fn bind_const_expr_array_top(
+    expr: &Expr,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    let mut env = BindEnv {
+        schema: None,
+        params: std::collections::HashMap::new(),
+        registry,
+        case_nesting: 0,
+        typed_arith: true,
+        clock: time_fn::current_clock(),
+        collation_leaf: false,
+    };
+    let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
+    if ty != ExprType::Array {
+        reject_json_operand(ty)?;
+    }
     let col = expr_result_column_type(expr, &bound, ty);
     Ok((bound, ty, col))
 }
@@ -3549,6 +4028,17 @@ pub(super) fn bind_expr_any(
                 op,
                 BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq
             ) {
+                // TABLE-35・Issue #1603: どちらかが配列式の比較は配列どうしの比較（要素型が同じ
+                // 配列のみ。反対側が型なしリテラルなら配列として解釈）。照合の導出より前に振り分ける。
+                if is_array_expr(lhs, env) || is_array_expr(rhs, env) {
+                    return crate::sql::array_ops::bind_array_comparison(
+                        *op,
+                        lhs,
+                        rhs,
+                        env,
+                        node_budget,
+                    );
+                }
                 // Issue #2190・TABLE-28: 列・文字列リテラル・`COLLATE` 同士の比較は照合を導出
                 // する（衝突は `42P21`／`42P22`）。ICU など非バイト列順の照合が絡むときだけ
                 // 専用の束縛へ分岐し、バイト列順だけの比較は従来の経路のまま（バイト単位で不変）。
@@ -3666,6 +4156,20 @@ pub(super) fn bind_expr_any(
         Expr::SqlJsonQuery(q) => crate::sql::jsonpath_fn::bind_sql_json_query(q, env, node_budget),
         // `CAST`／`<type> '<literal>'`（SQL-47・Issue #1590）。規則表の判定と束縛は `sql::cast`。
         Expr::Cast { expr: inner, ty } => crate::sql::cast::bind_cast(inner, ty, env, node_budget),
+        // 配列コンストラクタ・添字・スライス（TABLE-35・Issue #1602）。束縛は `sql::array_expr`。
+        Expr::ArrayConstructor(items) => {
+            crate::sql::array_expr::bind_array_constructor(items, env, node_budget)
+        }
+        Expr::Subscript { base, subscript } => {
+            crate::sql::array_expr::bind_subscript(base, subscript, env, node_budget)
+        }
+        // 量化比較 `lhs op ANY|ALL (array)`（TABLE-35・Issue #1603）。束縛は `sql::array_ops`。
+        Expr::Quantified {
+            op,
+            quantifier,
+            lhs,
+            rhs,
+        } => crate::sql::array_ops::bind_quantified(*op, *quantifier, lhs, rhs, env, node_budget),
     }
 }
 
@@ -3961,6 +4465,14 @@ fn bind_json_access(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    // TABLE-35・Issue #1603: `&&` と、配列オペランドを持つ `@>`／`<@` は配列の述語（jsonb の述語とは
+    // 別の束縛）。`&&` に配列でないオペランドが来た場合も配列側の束縛が `42883` で拒否する。
+    if op == JsonAccessOp::Overlap
+        || (matches!(op, JsonAccessOp::Contains | JsonAccessOp::ContainedBy)
+            && (is_array_expr(lhs, env) || is_array_expr(rhs, env)))
+    {
+        return crate::sql::array_ops::bind_array_containment(op, lhs, rhs, env, node_budget);
+    }
     if matches!(op, JsonAccessOp::PathExists | JsonAccessOp::PathMatch) {
         return crate::sql::jsonpath_fn::bind_jsonpath_operator(op, lhs, rhs, env, node_budget);
     }
@@ -4034,7 +4546,8 @@ fn bind_json_access(
         | JsonAccessOp::Concat
         | JsonAccessOp::DeletePath
         | JsonAccessOp::PathExists
-        | JsonAccessOp::PathMatch => {
+        | JsonAccessOp::PathMatch
+        | JsonAccessOp::Overlap => {
             return Err(SqlSurfaceError::Internal {
                 detail: "JSON predicate or modify operator reached the path operator binder"
                     .to_string(),
@@ -4245,6 +4758,34 @@ fn is_json_expr(expr: &Expr, env: &BindEnv<'_>) -> bool {
             lhs,
             ..
         } => is_json_expr(lhs, env),
+        _ => false,
+    }
+}
+
+/// `expr` が配列値の式かを AST の形から判定する（`sql::array_ops` が比較・包含・量化比較の
+/// 配列オペランドを見分けるために使う。構文段はスキーマを知らないため束縛段で判定する）。
+/// 配列列（UDF 仮引数を優先）・`ARRAY[...]`・スライス・配列型への CAST が対象で、`COLLATE` は
+/// 剥がして見る。配列を返す関数が増えたら（Issue #1604）ここに足す。
+pub(super) fn is_array_expr(expr: &Expr, env: &BindEnv<'_>) -> bool {
+    match expr {
+        Expr::Ident(name) => {
+            !env.has_param(name)
+                && env.schema.is_some_and(|sc| {
+                    sc.columns
+                        .iter()
+                        .any(|c| &c.name == name && matches!(c.ty, ColumnType::Array(_)))
+                })
+        }
+        Expr::ArrayConstructor(_) => true,
+        Expr::Subscript {
+            subscript: ArraySubscript::Slice { .. },
+            ..
+        } => true,
+        Expr::Cast {
+            ty: crate::sql::cast::CastType::Array(_),
+            ..
+        } => true,
+        Expr::Collate { expr, .. } => is_array_expr(expr, env),
         _ => false,
     }
 }
@@ -4518,6 +5059,13 @@ pub(super) fn numeric_kind(
         } => Some(*k),
         // `json_array_length` は int4（Issue #2180）。整数除算・添字の型解決に反映する。
         BoundExpr::JsonTextFn(f) if f.result_is_int4() => Some(NumericKind::Int4),
+        // 整数・real 要素の添字は要素型どおりの整数演算にする（TABLE-35・Issue #1602）。
+        BoundExpr::ArrayIndex { elem, .. } => match elem {
+            crate::catalog::ArrayElemType::Integer => Some(NumericKind::Int4),
+            crate::catalog::ArrayElemType::BigInt => Some(NumericKind::Int8),
+            crate::catalog::ArrayElemType::Real => Some(NumericKind::Float4),
+            _ => None,
+        },
         // `jsonb_array_length` は int4 なので、算術でも整数演算に解決する（Issue #1599）。
         BoundExpr::JsonFn {
             f: JsonFnKind::ArrayLength,
@@ -6840,6 +7388,43 @@ pub(crate) fn eval_with_scalars<'a>(
                     .to_string(),
             }),
         },
+        // 配列コンストラクタ・添字・スライス（TABLE-35・Issue #1602）。評価は `sql::array_expr`。
+        BoundExpr::ArrayConstructor { elem, items } => {
+            crate::sql::array_expr::eval_array_constructor(*elem, items, id, embedding, row_scalars)
+        }
+        BoundExpr::ArrayIndex { base, index, .. } => {
+            crate::sql::array_expr::eval_array_index(base, index, id, embedding, row_scalars)
+        }
+        BoundExpr::ArraySlice { base, lo, hi, .. } => crate::sql::array_expr::eval_array_slice(
+            base,
+            lo.as_deref(),
+            hi.as_deref(),
+            id,
+            embedding,
+            row_scalars,
+        ),
+        // 配列の比較・包含・量化比較（TABLE-35・Issue #1603）。評価は `sql::array_ops`。
+        BoundExpr::ArrayCompare { op, lhs, rhs, .. } => {
+            crate::sql::array_ops::eval_array_compare(*op, lhs, rhs, id, embedding, row_scalars)
+        }
+        BoundExpr::ArrayContainment { op, lhs, rhs, .. } => {
+            crate::sql::array_ops::eval_array_containment(*op, lhs, rhs, id, embedding, row_scalars)
+        }
+        BoundExpr::ArrayQuantified {
+            op,
+            all,
+            lhs,
+            array,
+            ..
+        } => crate::sql::array_ops::eval_array_quantified(
+            *op,
+            *all,
+            lhs,
+            array,
+            id,
+            embedding,
+            row_scalars,
+        ),
         BoundExpr::JsonTextFn(f) => {
             crate::sql::json_fn::eval_json_fn(f, id, embedding, row_scalars)
         }
@@ -8963,6 +9548,17 @@ mod tests {
             "statement_timestamp",
             "clock_timestamp",
         ] {
+            let mut registry = UdfRegistry::default();
+            let err = define_function(&mut registry, name, &[], &num("1.0")).unwrap_err();
+            assert_eq!(err.wire_code(), "42723", "function name {name}");
+        }
+    }
+
+    #[test]
+    fn quantifier_names_are_reserved_for_udfs() {
+        // Issue #1603（TABLE-35 ポインタ）: ANY／SOME／ALL は量化子として予約され、
+        // 同名 UDF（宣言的・WASM とも）の定義は `42723`（大文字小文字を区別しない）。
+        for name in ["any", "some", "all", "ANY", "Some"] {
             let mut registry = UdfRegistry::default();
             let err = define_function(&mut registry, name, &[], &num("1.0")).unwrap_err();
             assert_eq!(err.wire_code(), "42723", "function name {name}");

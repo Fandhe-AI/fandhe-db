@@ -570,6 +570,12 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::UuidColumnRef { .. }
         | BoundExpr::ByteaColumnRef { .. }
         | BoundExpr::ArrayColumnRef { .. }
+        | BoundExpr::ArrayConstructor { .. }
+        | BoundExpr::ArrayIndex { .. }
+        | BoundExpr::ArraySlice { .. }
+        | BoundExpr::ArrayCompare { .. }
+        | BoundExpr::ArrayContainment { .. }
+        | BoundExpr::ArrayQuantified { .. }
         | BoundExpr::JsonTextFn(_)
         | BoundExpr::JsonPathFn(_)
         | BoundExpr::JsonbLiteral(_)
@@ -700,6 +706,12 @@ fn compile_node(
         | BoundExpr::UuidColumnRef { .. }
         | BoundExpr::ByteaColumnRef { .. }
         | BoundExpr::ArrayColumnRef { .. }
+        | BoundExpr::ArrayConstructor { .. }
+        | BoundExpr::ArrayIndex { .. }
+        | BoundExpr::ArraySlice { .. }
+        | BoundExpr::ArrayCompare { .. }
+        | BoundExpr::ArrayContainment { .. }
+        | BoundExpr::ArrayQuantified { .. }
         | BoundExpr::JsonTextFn(_)
         | BoundExpr::JsonPathFn(_)
         | BoundExpr::JsonbLiteral(_)

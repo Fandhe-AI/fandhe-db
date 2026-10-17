@@ -343,7 +343,18 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             // `{NULL}` と `{"NULL"}` が衝突しない単射性を保つ。
             let has_null = array_value.has_null();
             let mark: u8 = if has_null { 0x80 } else { 0 };
-            match array_value {
+            // 2 次元以上（Issue #1605）は要素型タグの前に未使用のマーカー 0x40・次元数・各次元長を
+            // 積む。1 次元の先頭バイトは要素型タグ（0..=13）または NULL 印付き（0x80 以上）で
+            // 0x40 とは衝突せず、`{{1,2},{3,4}}` と `{1,2,3,4}` が別ハッシュになる。1 次元の
+            // 入力バイト列は従来と同一。
+            if let crate::row_codec::ArrayValue::Multi(m) = array_value {
+                b.push_u8(0x40);
+                b.push_u8(u8::try_from(m.dims().len()).unwrap_or(u8::MAX));
+                for d in m.dims() {
+                    b.push_u64(u64::from(*d));
+                }
+            }
+            match array_value.flat() {
                 crate::row_codec::ArrayValue::Text(items) => {
                     b.push_u8(mark); // 要素型タグ: TEXT
                     b.push_u64(items.len() as u64);
@@ -514,6 +525,12 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
                             b.push_bytes(item.as_bytes())?;
                         }
                     }
+                }
+                // `flat()` は `Multi` を返さない（網羅性のための fail-closed な腕）。
+                crate::row_codec::ArrayValue::Multi(_) => {
+                    return Err(StorageError::Codec(
+                        "nested multi-dimensional array in content hash".to_string(),
+                    ))
                 }
             }
         }
@@ -1888,6 +1905,31 @@ fn collect_referenced_udfs(
         Expr::Collate { expr, .. } => collect_referenced_udfs(expr, udf_registry, out),
         // `CAST`（SQL-47・Issue #1590）は被演算子の UDF 呼び出しを再帰的に走査する。
         Expr::Cast { expr, .. } => collect_referenced_udfs(expr, udf_registry, out),
+        // 配列コンストラクタ・添字（TABLE-35・Issue #1602）は子の UDF 呼び出しを再帰的に走査する。
+        Expr::ArrayConstructor(items) => {
+            for item in items {
+                collect_referenced_udfs(item, udf_registry, out)?;
+            }
+            Ok(())
+        }
+        // 量化比較（TABLE-35・Issue #1603）は左辺・配列式の UDF 呼び出しを再帰的に走査する。
+        Expr::Quantified { lhs, rhs, .. } => {
+            collect_referenced_udfs(lhs, udf_registry, out)?;
+            collect_referenced_udfs(rhs, udf_registry, out)
+        }
+        Expr::Subscript { base, subscript } => {
+            use crate::sql::udf_call::ArraySubscript;
+            collect_referenced_udfs(base, udf_registry, out)?;
+            match subscript {
+                ArraySubscript::Index(i) => collect_referenced_udfs(i, udf_registry, out),
+                ArraySubscript::Slice { lo, hi } => {
+                    for e in [lo, hi].into_iter().flatten() {
+                        collect_referenced_udfs(e, udf_registry, out)?;
+                    }
+                    Ok(())
+                }
+            }
+        }
         // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）は context・path・PASSING・
         // DEFAULT の部分式の UDF 呼び出しを走査する。
         Expr::SqlJsonQuery(q) => {
@@ -2025,6 +2067,23 @@ fn push_set_expr(
                 walk(b, rhs);
             }
             Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => walk(b, expr),
+            Expr::ArrayConstructor(items) => items.iter().for_each(|e| walk(b, e)),
+            Expr::Quantified { lhs, rhs, .. } => {
+                walk(b, lhs);
+                walk(b, rhs);
+            }
+            Expr::Subscript { base, subscript } => {
+                use crate::sql::udf_call::ArraySubscript;
+                walk(b, base);
+                match subscript {
+                    ArraySubscript::Index(i) => walk(b, i),
+                    ArraySubscript::Slice { lo, hi } => {
+                        for e in [lo, hi].into_iter().flatten() {
+                            walk(b, e);
+                        }
+                    }
+                }
+            }
             Expr::SqlJsonQuery(q) => {
                 walk(b, &q.context);
                 walk(b, &q.path);
@@ -2264,6 +2323,8 @@ fn push_dml_expr(
                 // Issue #2186: jsonpath 演算子。既存の 1〜11 は不変。
                 crate::sql::udf_call::JsonAccessOp::PathExists => 12,
                 crate::sql::udf_call::JsonAccessOp::PathMatch => 13,
+                // Issue #1603: 配列の重なり `&&`。既存の 1〜13 は不変。
+                crate::sql::udf_call::JsonAccessOp::Overlap => 14,
             });
             push_dml_expr(b, lhs, params)?;
             push_dml_expr(b, rhs, params)?;
@@ -2338,6 +2399,55 @@ fn push_dml_expr(
             b.push_bytes(ty.to_sql().as_bytes())
                 .map_err(|_| dml_hash_field_too_large())?;
             push_dml_expr(b, expr, params)?;
+        }
+        // タグ 17・18（対象ビヘイビア: TABLE-35。Issue #1602。変更禁止）。17 は
+        // `ARRAY[...]`（要素数を u32 LE で前置してから要素を順に直列化）、18 は添字・スライス
+        // （種別 0=添字・1=スライス、スライスは境界の有無ビットを前置してから基底→境界の順）。
+        // 要素の順序・添字とスライスの違い・`[:2]` と `[1:2]` の違いを同一内容と誤判定しない。
+        Expr::ArrayConstructor(items) => {
+            b.push_u8(17);
+            let count = u32::try_from(items.len()).map_err(|_| dml_hash_field_too_large())?;
+            b.push_raw(&count.to_le_bytes());
+            for item in items {
+                push_dml_expr(b, item, params)?;
+            }
+        }
+        // タグ 19（対象ビヘイビア: TABLE-35。Issue #1603。変更禁止）。量化比較
+        // `lhs op ANY|ALL (rhs)` を「比較演算子 1 バイト・量化子 1 バイト（0=ANY・1=ALL）・左辺・
+        // 右辺」の順で直列化する。演算子・ANY と ALL・左右の入れ替えを同一内容と誤判定しない。
+        Expr::Quantified {
+            op,
+            quantifier,
+            lhs,
+            rhs,
+        } => {
+            b.push_u8(19);
+            b.push_u8(op.hash_tag());
+            b.push_u8(match quantifier {
+                crate::sql::udf_call::Quantifier::Any => 0,
+                crate::sql::udf_call::Quantifier::All => 1,
+            });
+            push_dml_expr(b, lhs, params)?;
+            push_dml_expr(b, rhs, params)?;
+        }
+        Expr::Subscript { base, subscript } => {
+            use crate::sql::udf_call::ArraySubscript;
+            b.push_u8(18);
+            push_dml_expr(b, base, params)?;
+            match subscript {
+                ArraySubscript::Index(i) => {
+                    b.push_u8(0);
+                    push_dml_expr(b, i, params)?;
+                }
+                ArraySubscript::Slice { lo, hi } => {
+                    b.push_u8(1);
+                    b.push_u8(u8::from(lo.is_some()));
+                    b.push_u8(u8::from(hi.is_some()));
+                    for e in [lo, hi].into_iter().flatten() {
+                        push_dml_expr(b, e, params)?;
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -4977,6 +5087,20 @@ mod tests {
             rhs: Box::new(r),
         }
     }
+    use crate::sql::udf_call::{ArrayCmpOp, Quantifier};
+    fn quantified(
+        op: ArrayCmpOp,
+        quantifier: Quantifier,
+        l: crate::sql::udf_call::Expr,
+        r: crate::sql::udf_call::Expr,
+    ) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::Quantified {
+            op,
+            quantifier,
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        }
+    }
     fn json_access(
         op: crate::sql::udf_call::JsonAccessOp,
         l: crate::sql::udf_call::Expr,
@@ -5004,6 +5128,18 @@ mod tests {
         crate::sql::udf_call::Expr::Cast {
             expr: Box::new(inner),
             ty,
+        }
+    }
+    fn array_ctor(items: Vec<crate::sql::udf_call::Expr>) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::ArrayConstructor(items)
+    }
+    fn subscript(
+        base: crate::sql::udf_call::Expr,
+        subscript: crate::sql::udf_call::ArraySubscript,
+    ) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::Subscript {
+            base: Box::new(base),
+            subscript,
         }
     }
     /// `SqlJsonQuery`（タグ 15）の最小形。`mutate` で句を 1 つだけ変えた対を作る。
@@ -5299,6 +5435,36 @@ mod tests {
                 ),
                 json_access(crate::sql::udf_call::JsonAccessOp::Exists, n(), text("a")),
             ),
+            // Issue #1603: 配列の重なり `&&` と量化比較（タグ 19）は互いに・既存の演算子と区別される。
+            (
+                "array overlap vs contains",
+                json_access(crate::sql::udf_call::JsonAccessOp::Overlap, n(), text("{}")),
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::Contains,
+                    n(),
+                    text("{}"),
+                ),
+            ),
+            (
+                "quantified any vs all",
+                quantified(ArrayCmpOp::Eq, Quantifier::Any, n(), text("{1}")),
+                quantified(ArrayCmpOp::Eq, Quantifier::All, n(), text("{1}")),
+            ),
+            (
+                "quantified eq vs ne",
+                quantified(ArrayCmpOp::Eq, Quantifier::Any, n(), text("{1}")),
+                quantified(ArrayCmpOp::Ne, Quantifier::Any, n(), text("{1}")),
+            ),
+            (
+                "quantified lt vs ge",
+                quantified(ArrayCmpOp::Lt, Quantifier::All, n(), text("{1}")),
+                quantified(ArrayCmpOp::Ge, Quantifier::All, n(), text("{1}")),
+            ),
+            (
+                "quantified operand swap",
+                quantified(ArrayCmpOp::Eq, Quantifier::Any, n(), text("{1}")),
+                quantified(ArrayCmpOp::Eq, Quantifier::Any, text("{1}"), n()),
+            ),
             // Issue #2181: 連結・パス削除演算子も種別・左右で区別される（下位タグ 10・11）。
             (
                 "json concat vs contains",
@@ -5421,6 +5587,82 @@ mod tests {
                 "cast presence",
                 cast_to(ident("a"), crate::sql::cast::CastType::Int4),
                 ident("a"),
+            ),
+            // TABLE-35（Issue #1602）: 配列コンストラクタ（タグ 17）と添字・スライス（タグ 18）は、
+            // 要素の順序・個数・添字とスライスの別・境界の有無で区別される。
+            (
+                "array constructor order",
+                array_ctor(vec![num("1"), num("2")]),
+                array_ctor(vec![num("2"), num("1")]),
+            ),
+            (
+                "array constructor length",
+                array_ctor(vec![num("1")]),
+                array_ctor(vec![num("1"), num("1")]),
+            ),
+            (
+                "array constructor vs bare element",
+                array_ctor(vec![num("1")]),
+                num("1"),
+            ),
+            (
+                "subscript index vs slice",
+                subscript(
+                    ident("a"),
+                    crate::sql::udf_call::ArraySubscript::Index(Box::new(num("1"))),
+                ),
+                subscript(
+                    ident("a"),
+                    crate::sql::udf_call::ArraySubscript::Slice {
+                        lo: Some(Box::new(num("1"))),
+                        hi: None,
+                    },
+                ),
+            ),
+            (
+                "slice lower-only vs upper-only",
+                subscript(
+                    ident("a"),
+                    crate::sql::udf_call::ArraySubscript::Slice {
+                        lo: Some(Box::new(num("2"))),
+                        hi: None,
+                    },
+                ),
+                subscript(
+                    ident("a"),
+                    crate::sql::udf_call::ArraySubscript::Slice {
+                        lo: None,
+                        hi: Some(Box::new(num("2"))),
+                    },
+                ),
+            ),
+            (
+                "slice open vs bounded",
+                subscript(
+                    ident("a"),
+                    crate::sql::udf_call::ArraySubscript::Slice {
+                        lo: None,
+                        hi: Some(Box::new(num("2"))),
+                    },
+                ),
+                subscript(
+                    ident("a"),
+                    crate::sql::udf_call::ArraySubscript::Slice {
+                        lo: Some(Box::new(num("1"))),
+                        hi: Some(Box::new(num("2"))),
+                    },
+                ),
+            ),
+            (
+                "subscript base",
+                subscript(
+                    ident("a"),
+                    crate::sql::udf_call::ArraySubscript::Index(Box::new(num("1"))),
+                ),
+                subscript(
+                    ident("b"),
+                    crate::sql::udf_call::ArraySubscript::Index(Box::new(num("1"))),
+                ),
             ),
             // Issue #2187（TABLE-25）: SQL/JSON 問い合わせ関数の各句で区別される（タグ 15）。
             (

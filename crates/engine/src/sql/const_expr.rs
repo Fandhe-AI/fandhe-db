@@ -14,8 +14,8 @@
 
 use crate::sql::allowlist::{InsertLiteral, SqlSurfaceError};
 use crate::sql::udf_call::{
-    bind_const_expr, eval, first_non_builtin_call_with, BinOp, BoundExpr, Expr, ExprType,
-    ExprValue, UdfRegistry, MAX_EXPR_NODES,
+    bind_const_expr, bind_const_expr_array_top, eval, first_non_builtin_call_with, BinOp,
+    BoundExpr, Expr, ExprType, ExprValue, UdfRegistry, MAX_EXPR_NODES,
 };
 
 /// 仮値評価で起きたエラーの遅延方針（Issue #1546）。
@@ -157,6 +157,13 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
         Expr::Cast { .. } => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "CAST is not supported in a constant expression".to_string(),
         }),
+        // 配列コンストラクタ・添字（TABLE-35・Issue #1602）は子を再帰で検査する（列参照は
+        // `Expr::Ident` の腕で `42703`）。評価結果の配列は `fold_const_literal` が配列テキストへ畳む。
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
+            .array_expr_children()
+            .into_iter()
+            .flatten()
+            .try_for_each(prescan),
         Expr::Number(_)
         | Expr::String(_)
         | Expr::Null
@@ -245,6 +252,12 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         Expr::Collate { expr, .. } => check_intermediate_precision(expr),
         // 到達しない（`prescan` が拒否済み）。
         Expr::SqlJsonQuery(_) | Expr::Cast { .. } => Ok(()),
+        // 配列の要素・添字は子ごとに精度を検査する（要素値の範囲は配列の構築側が検査する）。
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
+            .array_expr_children()
+            .into_iter()
+            .flatten()
+            .try_for_each(check_intermediate_precision),
         Expr::Call { args, .. } => {
             args.iter().try_for_each(check_intermediate_precision)?;
             check_node_value(expr, true)
@@ -613,6 +626,29 @@ fn propagate_null(expr: &Expr) -> Result<Expr, SqlSurfaceError> {
                 None => None,
             },
         },
+        // 配列コンストラクタ・添字（TABLE-35・Issue #1602）。要素・添字の中の `NULL` を含む
+        // 演算だけを型付き `NULL` へ畳み、裸の `NULL` 要素はそのまま残す（束縛器が共通型へ解決する）。
+        Expr::ArrayConstructor(items) => {
+            Expr::ArrayConstructor(items.iter().map(propagate_null).collect::<Result<_, _>>()?)
+        }
+        Expr::Subscript { base, subscript } => {
+            use crate::sql::udf_call::ArraySubscript;
+            let opt = |b: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>, SqlSurfaceError> {
+                b.as_deref()
+                    .map(|e| propagate_null(e).map(Box::new))
+                    .transpose()
+            };
+            Expr::Subscript {
+                base: Box::new(propagate_null(base)?),
+                subscript: match subscript {
+                    ArraySubscript::Index(i) => ArraySubscript::Index(Box::new(propagate_null(i)?)),
+                    ArraySubscript::Slice { lo, hi } => ArraySubscript::Slice {
+                        lo: opt(lo)?,
+                        hi: opt(hi)?,
+                    },
+                },
+            }
+        }
         other => other.clone(),
     })
 }
@@ -636,7 +672,7 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
     let expr = &propagated;
     let registry = UdfRegistry::default();
     let mut budget = MAX_EXPR_NODES;
-    let (bound, _ty, _) = bind_const_expr(expr, &registry, &mut budget)?;
+    let (bound, _ty, _) = bind_const_expr_array_top(expr, &registry, &mut budget)?;
     if crate::sql::udf_call::references_embedding(&bound) || matches!(bound, BoundExpr::IdRef) {
         return Err(SqlSurfaceError::Internal {
             detail: "constant expression resolved to a row reference".to_string(),
@@ -679,7 +715,18 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         ExprValue::Json(_) | ExprValue::JsonText(_) => Err(SqlSurfaceError::unsupported(
             "a json value is not allowed in a constant expression",
         )),
-        ExprValue::Numeric(_) | ExprValue::Uuid(_) | ExprValue::Bytes(_) | ExprValue::Array(_) => {
+        // 配列（TABLE-35・Issue #1602）は PG 配列テキストへ畳み、列側の `parse_array_literal` が
+        // 列の要素型で解釈し直す（Date／Interval と同じ前例。エンコード済みの `InsertLiteral` を
+        // 増やさないため content_hash・DDL・wire は不変）。往復は `ArrayValue::to_pg_text` の契約。
+        ExprValue::Array(a) => a
+            .to_pg_text_bounded(crate::sql::parser::MAX_ARRAY_LITERAL_BYTES)
+            .map(InsertLiteral::String)
+            .ok_or_else(|| {
+                SqlSurfaceError::payload_too_large(
+                    "constant array expression exceeds the maximum array literal length",
+                )
+            }),
+        ExprValue::Numeric(_) | ExprValue::Uuid(_) | ExprValue::Bytes(_) => {
             Err(SqlSurfaceError::unsupported(
                 "a value produced by CAST is not allowed in a constant expression",
             ))

@@ -1116,7 +1116,7 @@ fn convert_between<'a>(f: CastFn, v: ExprValue<'a>) -> Result<ExprValue<'a>, Sql
 
 /// 配列の要素を評価値へ写す（NULL 要素は `ExprValue::Null`）。bigint は式評価の整数表現の
 /// 上限（2^53）を超える要素を `22003` で拒否する（スカラーの int8 と同じ既知の差分）。
-fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>, SqlSurfaceError> {
+pub(crate) fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>, SqlSurfaceError> {
     fn map<T>(
         items: &[Option<T>],
         f: impl Fn(&T) -> Result<ExprValue<'static>, SqlSurfaceError>,
@@ -1130,6 +1130,8 @@ fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>, SqlSurface
             .collect()
     }
     let text = |s: &String| Ok(ExprValue::Text(Cow::Owned(s.clone())));
+    // 多次元値の呼び出し元（`cast_array`）は次元を保持して包み直す。次元を捨てて平坦化する
+    // 経路を作らないため、ここへ `Multi` が直接来たら fail-closed（Issue #1605）。
     match a {
         ArrayValue::Text(v) => map(v, text),
         ArrayValue::Bool(v) => map(v, |b| Ok(ExprValue::Bool(*b))),
@@ -1152,11 +1154,14 @@ fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>, SqlSurface
         ArrayValue::Json(v) => map(v, |s| Ok(ExprValue::JsonText(Cow::Owned(s.clone())))),
         ArrayValue::Jsonb(v) => map(v, |s| Ok(ExprValue::Json(Cow::Owned(s.clone())))),
         ArrayValue::Enum(_) => Err(internal("enum array reached an array cast")),
+        ArrayValue::Multi(_) => Err(SqlSurfaceError::unsupported(
+            "this operation on multi-dimensional arrays is not supported",
+        )),
     }
 }
 
 /// 要素ごとの評価値を、変換先の要素型の配列へ詰め直す。
-fn values_to_array(
+pub(crate) fn values_to_array(
     values: Vec<ExprValue<'static>>,
     to: ArrayElemType,
 ) -> Result<ArrayValue, SqlSurfaceError> {
@@ -1243,11 +1248,14 @@ fn cast_array(
         return Err(internal("array element type is not supported for casts"));
     };
     let element = CastFn { from: src, to: dst };
-    let converted = array_to_values(a)?
+    // 多次元は平坦な要素列を変換してから次元を与え直す（次元を保つ。Issue #1605）。
+    let converted = array_to_values(a.flat())?
         .into_iter()
         .map(|v| apply_cast(element, v))
         .collect::<Result<Vec<_>, _>>()?;
-    values_to_array(converted, to)
+    let flat = values_to_array(converted, to)?;
+    ArrayValue::with_dims(flat, a.dims())
+        .map_err(|_| internal("array dimensions were lost in an array cast"))
 }
 
 #[cfg(test)]
