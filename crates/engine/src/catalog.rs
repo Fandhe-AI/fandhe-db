@@ -1794,6 +1794,9 @@ pub enum CatalogError {
     /// ERR-6: `42P16`）。中身はクライアント自身が指定したテーブル名のみで
     /// テナントデータを含まない。
     MultiplePrimaryKeys(String),
+    /// 主キーの構成列への `ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL`（TABLE-39 (4)、
+    /// Issue #1632。ERR-6: `42P16`）。中身はクライアント自身が指定した列名のみ。
+    ColumnInPrimaryKey(String),
     /// `ALTER TABLE ... DROP CONSTRAINT <name>` の対象名が、UNIQUE・CHECK・
     /// FOREIGN KEY いずれの制約としても存在しない（Issue #1067・#1069。
     /// ERR-6: `42704`）。
@@ -1892,6 +1895,9 @@ impl fmt::Display for CatalogError {
             CatalogError::MultiplePrimaryKeys(table) => {
                 write!(f, "multiple primary keys for table {table} are not allowed")
             }
+            CatalogError::ColumnInPrimaryKey(column) => {
+                write!(f, "column \"{column}\" is in a primary key")
+            }
             CatalogError::ConstraintNotFound(name) => {
                 write!(f, "constraint not found: {name}")
             }
@@ -1947,6 +1953,7 @@ impl std::error::Error for CatalogError {
             | CatalogError::InvalidForeignKey(_)
             | CatalogError::ConstraintAlreadyExists(_)
             | CatalogError::MultiplePrimaryKeys(_)
+            | CatalogError::ColumnInPrimaryKey(_)
             | CatalogError::ConstraintNotFound(_)
             | CatalogError::ConstraintLimitExceeded(_)
             | CatalogError::ForeignKeyViolation
@@ -9410,6 +9417,78 @@ impl Storage {
         Ok(())
     }
 
+    /// `ALTER TABLE ... ALTER COLUMN <column> DROP NOT NULL`（TABLE-39 (4) のポインタ、
+    /// Issue #1632）。SQL 表層 `sql::ddl::execute_alter_table_alter_column_drop_not_null` から
+    /// 呼ばれる唯一の実装で、単一の write txn（書き込みロック保持中）でカタログを更新する。
+    /// 制約を緩める変更なので既存行は走査しない（行コーデックは nullable に関係なく presence
+    /// バイトを書き、末尾欠落行の補完は `fill_value` を nullable より先に評価するため、
+    /// 既存行の見え方は変わらない）。
+    ///
+    /// 判定順序（fail-closed。拒否はすべて commit 前に return し副作用ゼロ）:
+    /// (1) 識別子・保護列名 (2) テーブル取得（`TableNotFound`） (3) 列取得
+    /// （`ColumnNotFound`） (4) 主キー構成列は `ColumnInPrimaryKey`（`42P16`。no-op 判定より
+    /// 先） (5) 既に nullable なら冪等に成功（commit・世代 bump なし） (6) VECTOR 列は
+    /// NULL 許容 VECTOR が未実装のため `Invalid`（TABLE-26 の後続で置換） (7) 変更後スキーマの
+    /// [`validate_schema`]（自己参照 FK の整合） (8) この表を参照する他表の FK の参照先照合の
+    /// 再実行（参照元列 NOT NULL かつ `ON UPDATE CASCADE` の組は `InvalidForeignKey`）。
+    /// 成功時はカタログを更新し世代を bump する（nullability はキーの正準エンコードを
+    /// 変えないため索引の失効は不要）。
+    pub fn alter_table_drop_not_null(&self, table_name: &str, column_name: &str) -> Result<()> {
+        validate_identifier(table_name)?;
+        validate_identifier(column_name)?;
+        if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
+            return Err(CatalogError::ProtectedColumn(column_name.to_string()));
+        }
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let updated = {
+            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| c.name == column_name)
+                .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+            if schema
+                .primary_key()
+                .is_some_and(|pk| pk.iter().any(|c| c == column_name))
+            {
+                return Err(CatalogError::ColumnInPrimaryKey(column_name.to_string()));
+            }
+            if column.nullable {
+                // 既に nullable。冪等な no-op。
+                return Ok(());
+            }
+            if matches!(column.ty, ColumnType::Vector(_)) {
+                return Err(CatalogError::Invalid(
+                    "DROP NOT NULL on a VECTOR column is not supported".to_string(),
+                ));
+            }
+            let mut updated = schema.clone();
+            for c in updated.columns.iter_mut() {
+                if c.name == column_name {
+                    c.nullable = true;
+                }
+            }
+            validate_schema(&updated)?;
+            updated
+        };
+        // 参照先側の再検査（自己参照は上の `validate_schema` で検査済み。カタログから読める
+        // のは変更前スキーマなので除外する）。`CATALOG_TABLE` のハンドルを持たない状態で呼ぶ。
+        for (child, fk) in referencing_foreign_keys_in_txn(&write_txn, table_name)? {
+            if child.name == table_name || !fk.parent_columns.iter().any(|c| c == column_name) {
+                continue;
+            }
+            resolve_foreign_key_target(&child, &fk, &updated)?;
+        }
+        {
+            let encoded = encode_schema(&updated)?;
+            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            catalog_table.insert(table_name, encoded.as_slice())?;
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(())
+    }
+
     /// `ALTER TABLE ... ALTER COLUMN <column> SET／DROP DEFAULT`（TABLE-39 (1)(2)(6) のポインタ、
     /// Issue #1628）。SQL 表層 `sql::ddl::execute_alter_table_alter_column_set_default`／
     /// `execute_alter_table_alter_column_drop_default` から呼ばれる唯一の実装で、`default_expr`
@@ -11350,6 +11429,7 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         // テーブル存在確認からは到達しない（網羅性のため `Internal` へ丸める）。
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::MultiplePrimaryKeys(_)
+        | CatalogError::ColumnInPrimaryKey(_)
         | CatalogError::ConstraintNotFound(_)
         | CatalogError::ConstraintLimitExceeded(_)
         // `ALTER TABLE ... ADD FOREIGN KEY` の既存行検証違反（TABLE-22・

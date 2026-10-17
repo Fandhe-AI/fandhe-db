@@ -659,6 +659,10 @@ pub enum SqlSurfaceError {
     /// （TABLE-22 (d)）。ERR-6: `42P16`。`table` はクライアント自身が
     /// 指定したテーブル名。
     InvalidTableDefinition { table: String },
+    /// 主キーの構成列への `ALTER COLUMN ... DROP NOT NULL`（TABLE-39 (4)、Issue #1632）。
+    /// ERR-6: `42P16`（`InvalidTableDefinition` と同じ分類）。`column` はクライアント自身が
+    /// 指定した列名のみ。
+    ColumnInPrimaryKey { column: String },
     /// 分割実行 DML が 1 チャンク以上 commit した後に止まった（Issue #1129・
     /// RECOVER-11。`VD001`）。`cause` は止めた原因の分類（コードのみを応答へ載せ、
     /// 内側のメッセージは載せない）。`operation_id` はクライアント自身が指定した値。
@@ -900,6 +904,15 @@ impl SqlSurfaceError {
     pub(crate) fn invalid_table_definition(table: impl Into<String>) -> Self {
         SqlSurfaceError::InvalidTableDefinition {
             table: truncate_for_error(&table.into()),
+        }
+    }
+
+    /// `pub(crate)`: `sql::ddl` の `ALTER COLUMN ... DROP NOT NULL` が主キー構成列を拒否する
+    /// 際に `catalog::CatalogError::ColumnInPrimaryKey` を写像する（Issue #1632）。列名は
+    /// untrusted な字句解析結果のため切り詰める。
+    pub(crate) fn column_in_primary_key(column: impl Into<String>) -> Self {
+        SqlSurfaceError::ColumnInPrimaryKey {
+            column: truncate_for_error(&column.into()),
         }
     }
 
@@ -1158,7 +1171,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateObject { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::DuplicateType { .. } => ErrorClass::DuplicateObject,
-            SqlSurfaceError::InvalidTableDefinition { .. } => ErrorClass::InvalidTableDefinition,
+            SqlSurfaceError::InvalidTableDefinition { .. }
+            | SqlSurfaceError::ColumnInPrimaryKey { .. } => ErrorClass::InvalidTableDefinition,
             SqlSurfaceError::PartialCompletion { .. } => ErrorClass::PartialCompletion,
             SqlSurfaceError::PartitionedDmlCancelled { .. } => ErrorClass::PartitionedDmlCancelled,
             SqlSurfaceError::PartitionedDmlInTransaction => ErrorClass::ActiveSqlTransaction,
@@ -1318,6 +1332,10 @@ impl std::fmt::Display for SqlSurfaceError {
             // クライアント自身が指定したテーブル名のみ。他テナント情報は含めない。
             SqlSurfaceError::InvalidTableDefinition { table } => {
                 write!(f, "multiple primary keys for table {table} are not allowed")
+            }
+            // クライアント自身が指定した列名のみ。他テナント情報は含めない。
+            SqlSurfaceError::ColumnInPrimaryKey { column } => {
+                write!(f, "column \"{column}\" is in a primary key")
             }
             // 件数（自テナントで commit 済み）・原因コード・クライアント自身の operation_id
             // だけを載せる。内側のメッセージ・テーブル名・他テナント情報は含めない。
@@ -3732,6 +3750,16 @@ pub struct ValidatedAlterTableAlterColumnSetNotNull {
     pub column_name: String,
 }
 
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> DROP NOT
+/// NULL` 文（TABLE-39 (4)、Issue #1632）。列・表の存在確認と主キー構成列・VECTOR 列・
+/// FK 参照先側の整合検査は実行段（`sql::ddl::execute_alter_table_alter_column_drop_not_null`）が
+/// DDL 権限ゲートの後で担う（権限の無い主体への存在オラクル化を防ぐ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAlterColumnDropNotNull {
+    pub table_name: String,
+    pub column_name: String,
+}
+
 /// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> SET DEFAULT
 /// <式>` 文（TABLE-39 (1)、Issue #1628）。式は `CREATE TABLE` の列 DEFAULT と同じ許可範囲
 /// （定数リテラル・定数式・時刻値関数）で、`default` と `time_default` は高々一方が `Some`
@@ -3755,7 +3783,7 @@ pub struct ValidatedAlterTableAlterColumnDropDefault {
     pub column_name: String,
 }
 
-/// `ALTER TABLE` の許可形状 12 種の和（Issue #1067・#1068・#1069・#1167・#1196・#1619・#1628・#1631）。`ParsedSql::AlterTable` が
+/// `ALTER TABLE` の許可形状 13 種の和（Issue #1067・#1068・#1069・#1167・#1196・#1619・#1628・#1631・#1632）。`ParsedSql::AlterTable` が
 /// 保持する型で、`sql::ddl::execute_alter_table` が対応する実行本体へ振り分ける
 /// （構文の許可リスト判定は `sql::allowlist` の管轄、ディスパッチは `sql::ddl`・
 /// `core.rs` の管轄という既存の責務分担を維持する）。
@@ -3785,6 +3813,9 @@ pub struct ValidatedAlterTableAlterColumnDropDefault {
 ///
 /// **BREAKING CHANGE**（Issue #1628）: `AlterColumnSetDefault`・`AlterColumnDropDefault`
 /// variant を追加した。本 enum を網羅的に `match` するクレート外のコードは追随が必要。
+///
+/// **BREAKING CHANGE**（Issue #1632）: `AlterColumnDropNotNull` variant を追加した。
+/// 本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedAlterTable {
     AddColumn(ValidatedAlterTableAddColumn),
@@ -3798,6 +3829,7 @@ pub enum ValidatedAlterTable {
     AlterColumnSetNotNull(ValidatedAlterTableAlterColumnSetNotNull),
     AlterColumnSetDefault(ValidatedAlterTableAlterColumnSetDefault),
     AlterColumnDropDefault(ValidatedAlterTableAlterColumnDropDefault),
+    AlterColumnDropNotNull(ValidatedAlterTableAlterColumnDropNotNull),
     RenameColumn(ValidatedAlterTableRenameColumn),
 }
 
@@ -9044,10 +9076,18 @@ impl<'a> Parser<'a> {
                     column_name,
                 });
             }
-            // `ALTER COLUMN <col> DROP DEFAULT`（TABLE-39 (2)、Issue #1628）。`DROP NOT NULL` は
-            // 兄弟 Issue の範囲のため本段階では `42601`（`DEFAULT` 不一致）。
+            // `ALTER COLUMN <col> DROP DEFAULT`（TABLE-39 (2)、Issue #1628）・
+            // `DROP NOT NULL`（TABLE-39 (4)、Issue #1632）。それ以外は `42601`。
             if self.peek_contextual_keyword("DROP") {
                 self.advance();
+                if self.peek_contextual_keyword("NOT") {
+                    self.advance();
+                    self.expect_contextual_keyword("NULL")?;
+                    return Ok(ParsedAlterTableShape::AlterColumnDropNotNull {
+                        table_name,
+                        column_name,
+                    });
+                }
                 self.expect_contextual_keyword("DEFAULT")?;
                 return Ok(ParsedAlterTableShape::AlterColumnDropDefault {
                     table_name,
@@ -11616,6 +11656,10 @@ enum ParsedAlterTableShape {
         columns: Vec<String>,
     },
     AlterColumnSetNotNull {
+        table_name: String,
+        column_name: String,
+    },
+    AlterColumnDropNotNull {
         table_name: String,
         column_name: String,
     },
@@ -15195,6 +15239,15 @@ pub fn validate_alter_table_tokens(
             table_name,
             column_name,
         }),
+        ParsedAlterTableShape::AlterColumnDropNotNull {
+            table_name,
+            column_name,
+        } => {
+            ValidatedAlterTable::AlterColumnDropNotNull(ValidatedAlterTableAlterColumnDropNotNull {
+                table_name,
+                column_name,
+            })
+        }
         ParsedAlterTableShape::AlterColumnSetDefault {
             table_name,
             column_name,
@@ -16092,8 +16145,21 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+        match validate_alter_table("ALTER TABLE docs ALTER COLUMN a DROP NOT NULL;") {
+            Ok(ValidatedAlterTable::AlterColumnDropNotNull(d)) => {
+                assert_eq!(d.table_name, "docs");
+                assert_eq!(d.column_name, "a");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let e = SqlSurfaceError::column_in_primary_key("c");
+        assert_eq!(e.wire_code(), "42P16");
+        assert_eq!(e.to_string(), "column \"c\" is in a primary key");
         for sql in [
-            "ALTER TABLE docs ALTER COLUMN a DROP NOT NULL",
+            "ALTER TABLE docs ALTER a DROP NOT NULL",
+            "ALTER TABLE docs ALTER COLUMN a DROP NOT NULL extra",
+            "ALTER TABLE docs ALTER COLUMN a DROP NULL",
+            "ALTER TABLE docs ALTER COLUMN id DROP NOT NULL",
             "ALTER TABLE docs ALTER a SET DEFAULT 1",
             "ALTER TABLE docs ALTER COLUMN a SET DEFAULT",
             "ALTER TABLE docs ALTER COLUMN id SET DEFAULT 1",

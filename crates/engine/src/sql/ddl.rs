@@ -46,11 +46,12 @@ use crate::schema_limits::SchemaLimits;
 use crate::sql::allowlist::{
     InsertLiteral, SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
     ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnDropDefault,
-    ValidatedAlterTableAlterColumnSetDefault, ValidatedAlterTableAlterColumnSetNotNull,
-    ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
-    ValidatedAlterTableDropConstraint, ValidatedAlterTableRenameColumn, ValidatedCreateIndex,
-    ValidatedCreateTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
-    ValidatedDropTable, ValidatedDropType, ValidatedDropView,
+    ValidatedAlterTableAlterColumnDropNotNull, ValidatedAlterTableAlterColumnSetDefault,
+    ValidatedAlterTableAlterColumnSetNotNull, ValidatedAlterTableAlterColumnType,
+    ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint,
+    ValidatedAlterTableRenameColumn, ValidatedCreateIndex, ValidatedCreateTable,
+    ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex, ValidatedDropTable,
+    ValidatedDropType, ValidatedDropView,
 };
 use crate::sql::ddl_column_type::{
     alias_spelling, to_static_column_type_with_array_default, SqlColumnTypeName, StaticColumnType,
@@ -278,6 +279,7 @@ pub(crate) fn execute_create_table(
         // `42P16` で先に拒否するため `MultiplePrimaryKeys` も返らない）。
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::MultiplePrimaryKeys(_)
+        | CatalogError::ColumnInPrimaryKey(_)
         | CatalogError::ConstraintNotFound(_)
         | CatalogError::ConstraintLimitExceeded(_)
         // `ForeignKeyViolation` は `Storage::alter_table_add_foreign_key`
@@ -417,6 +419,8 @@ pub enum AlterTableAction {
     AlterColumnType { column_name: String },
     /// `ALTER COLUMN <col> SET NOT NULL`（TABLE-39 (3)、Issue #1631）。**BREAKING CHANGE**: variant 追加。
     AlterColumnSetNotNull { column_name: String },
+    /// `ALTER COLUMN <col> DROP NOT NULL`（TABLE-39 (4)、Issue #1632）。**BREAKING CHANGE**: variant 追加。
+    AlterColumnDropNotNull { column_name: String },
     /// `ALTER COLUMN <col> SET DEFAULT <式>`（TABLE-39 (1)、Issue #1628）。**BREAKING CHANGE**: variant 追加。
     AlterColumnSetDefault { column_name: String },
     /// `ALTER COLUMN <col> DROP DEFAULT`（TABLE-39 (2)、Issue #1628）。**BREAKING CHANGE**: variant 追加。
@@ -683,6 +687,9 @@ pub(crate) fn execute_alter_table(
         crate::sql::allowlist::ValidatedAlterTable::AlterColumnSetNotNull(stmt) => {
             execute_alter_table_alter_column_set_not_null(storage, stmt)
         }
+        crate::sql::allowlist::ValidatedAlterTable::AlterColumnDropNotNull(stmt) => {
+            execute_alter_table_alter_column_drop_not_null(storage, stmt)
+        }
         crate::sql::allowlist::ValidatedAlterTable::AlterColumnSetDefault(stmt) => {
             execute_alter_table_alter_column_set_default(storage, stmt)
         }
@@ -820,6 +827,7 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
         | CatalogError::IndexCollationNotSupported(_)
+        | CatalogError::ColumnInPrimaryKey(_)
         | CatalogError::IndexLimitExceeded(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
@@ -939,6 +947,30 @@ fn execute_alter_table_alter_column_set_not_null(
     Ok(AlterTableOutcome {
         table_name: stmt.table_name.clone(),
         action: AlterTableAction::AlterColumnSetNotNull {
+            column_name: stmt.column_name.clone(),
+        },
+    })
+}
+
+/// `ALTER TABLE <table> ALTER COLUMN <column> DROP NOT NULL` の実行本体（TABLE-39 (4)、
+/// Issue #1632）。前提は [`execute_alter_table_drop_column`] と同じ（`core.rs` が
+/// [`require_ddl_permission`] を先に通す）。判定順序: テーブル存在確認 →
+/// `catalog::Storage::alter_table_drop_not_null`（主キー構成列〔`42P16`〕・VECTOR 列・FK 参照先側
+/// の整合〔`42830`〕を検査し、拒否時は副作用ゼロ。既存行は走査しない）。
+fn execute_alter_table_alter_column_drop_not_null(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAlterColumnDropNotNull,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    storage
+        .alter_table_drop_not_null(&stmt.table_name, &stmt.column_name)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_alter_column_nullability_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AlterColumnDropNotNull {
             column_name: stmt.column_name.clone(),
         },
     })
@@ -1073,6 +1105,7 @@ fn map_alter_column_nullability_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::NotNullConstraintViolation(column) => {
             SqlSurfaceError::not_null_violation(column)
         }
+        CatalogError::ColumnInPrimaryKey(column) => SqlSurfaceError::column_in_primary_key(column),
         CatalogError::InvalidForeignKey(detail) => SqlSurfaceError::invalid_foreign_key(detail),
         // 残りは `map_drop_alter_column_error` の契約に従う（`TableNotFound`・
         // `ColumnNotFound`・`ProtectedColumn`・`Invalid`・`WriteLockTimeout` 等）。
@@ -1170,6 +1203,7 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::InvalidForeignKey(_)
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::MultiplePrimaryKeys(_)
+        | CatalogError::ColumnInPrimaryKey(_)
         | CatalogError::ConstraintNotFound(_)
         | CatalogError::ConstraintLimitExceeded(_)
         | CatalogError::ForeignKeyViolation
@@ -1687,6 +1721,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         // 変種で、`alter_table_add_column` からは返らない（到達不能）。
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::MultiplePrimaryKeys(_)
+        | CatalogError::ColumnInPrimaryKey(_)
         | CatalogError::ConstraintNotFound(_)
         | CatalogError::ConstraintLimitExceeded(_)
         // `ALTER TABLE ... ADD FOREIGN KEY` の既存行検証違反（TABLE-22・
