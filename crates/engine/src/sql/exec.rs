@@ -5324,6 +5324,7 @@ pub(crate) fn execute_file_insert(
         path: &bound.path,
         body: &bound.body,
         template_values: &bound.template_values,
+        default_applied_columns: &bound.default_applied_columns,
         path_column_index: bound.path_column_index,
         body_column_index: bound.body_column_index,
         vector_column_index: bound.vector_column_index,

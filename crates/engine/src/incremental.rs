@@ -157,6 +157,9 @@ pub struct BoundFileIndexInput<'a> {
     /// VECTOR 列の位置は呼び出し時点でプレースホルダ（`Value::Null`）でよい
     /// （各チャンク行の構築時に上書きするため）。
     pub template_values: &'a [Value],
+    /// 省略列へ `DEFAULT` を適用した列の位置（`BoundFileInsert::default_applied_columns`。
+    /// 内容照合ハッシュの材料から除外する。Issue #1629）。
+    pub default_applied_columns: &'a [usize],
     pub path_column_index: usize,
     pub body_column_index: usize,
     pub vector_column_index: usize,
@@ -394,6 +397,7 @@ fn embed_and_write_phase(
             content_hash_path: input.path,
             content_hash_body: input.body,
             content_hash_template_values: input.template_values,
+            content_hash_default_applied: input.default_applied_columns,
             ledger_write,
             max_scanned_rows,
         },

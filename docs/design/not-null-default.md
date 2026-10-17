@@ -287,3 +287,27 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
 - **範囲外**: 各書き込み経路（INSERT／UPSERT／COPY／NoSQL／`UPDATE ... SET c = DEFAULT`）が新しい
   既定値を使うことの網羅的検証と content_hash／台帳の整合（#1629）、`DROP NOT NULL`（#1632）、
   `COLUMN` 省略形・複数アクション、NoSQL 表層、wire-server 側の結合テスト。
+
+## Issue #1629 追記: SET DEFAULT の INSERT 反映と content_hash／台帳の整合
+
+ポインタ: TABLE-39 (1)(2)(6)、RECOVER-10、RECOVER-11、TABLE-5、TABLE-16。
+
+- **反映**: INSERT（単一行・複数行）・UPSERT・COPY・NoSQL `insert`・ファイル形 INSERT の省略列補完は
+  `fill_omitted_columns`（ファイル形は `bind_file_insert` の同型ループ）が現在の `default_expr` を使う
+  （#1628 までに実装済み。本 Issue では結合テスト `sql_set_default_insert_resend.rs` で固定）。
+- **D1 内容照合ハッシュの材料**: 省略列に適用した DEFAULT（定数・時刻とも）は材料から除外し、
+  送られた文に書かれた列だけでハッシュする。SET／DROP DEFAULT・DEFAULT 付き ADD COLUMN を挟んだ
+  同一文の再送は `23505`（再実行しない）になる。旧・時刻 DEFAULT の構文形（種別バイト `2`）は
+  退役し再利用しない。Expr ドメイン（`*Expr`）は `VALUES` 内の単独時刻関数（種別 `1`）がある文だけが使う。
+- **D2 信号の運び方**: `VolatileColumn::Default(idx)` を「DEFAULT 適用列」に意味を広げ、定数 DEFAULT も
+  push する（フィールド名は据え置き）。`tenant.rs` の `named_value_columns`／`named_expr_columns` が
+  書き込み txn 内のスキーマと照合したうえで除外する（不整合は `Invalid` で fail-closed）。
+  ファイル形は `BoundFileInsert::default_applied_columns`（BREAKING）で位置を運ぶ。
+- **D3 既知の衝突**: 明示 `NULL` と、省略して DEFAULT が適用される文は同一ハッシュになる
+  （明示 NULL を除外する既存規則と同じ分類。op_id の誤再利用時のみ）。解消には明示 NULL の種別化が
+  必要で、#1525 と同種の互換性判断になるため別 Issue とする。
+- **D4 旧台帳との互換**: DEFAULT を適用していない文のバイト列は不変（golden テスト不変）。DEFAULT を
+  適用する文は旧版の記録に対し `22023`（fail-closed）になる。legacy ハッシュは新しい正規ハッシュと
+  一致しうるため受理しない（BREAKING）。
+- **範囲外**: `INSERT ... VALUES (DEFAULT)`（SQL-50）と `UPDATE ... SET c = DEFAULT` は未実装。
+  実装時は DEFAULT キーワードを構文形としてハッシュし評価値を入れない。

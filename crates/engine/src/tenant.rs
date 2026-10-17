@@ -1116,45 +1116,60 @@ pub(crate) fn insert_rows_unchecked(
 /// を渡す。内容照合ハッシュは該当列を評価値ではなく DEFAULT の構文形でハッシュする（設計 D1・D2）。
 pub(crate) type VolatileDefaultColumns<'a> = &'a [&'a [VolatileColumn]];
 
-/// `volatile` のいずれかの行が揮発性 DEFAULT を持つか。
-fn any_volatile_default(volatile: VolatileDefaultColumns<'_>) -> bool {
-    volatile.iter().any(|row| !row.is_empty())
+/// `volatile` のいずれかの行が `VALUES` 内の単独時刻関数（[`VolatileColumn::Values`]）を持つか。
+/// 持つ行がある文だけ `*Expr` ドメインでハッシュする。省略列への DEFAULT 適用
+/// （[`VolatileColumn::Default`]）は経路選択に影響させない（Issue #1629 D1）。
+fn any_values_time(volatile: VolatileDefaultColumns<'_>) -> bool {
+    volatile
+        .iter()
+        .any(|row| row.iter().any(|c| matches!(c, VolatileColumn::Values(..))))
 }
 
-/// 揮発性 DEFAULT を含み得る INSERT 系ハッシュ材料の 1 行分の列（非 `VECTOR` 列。スキーマ列順）を
-/// 組み立てる。`volatile`（束縛時の列位置）の列は、write トランザクション内で再取得した
-/// `schema` の DEFAULT が時刻 DEFAULT であることを確認し、評価値ではなく構文形を材料にする。
-/// 位置が範囲外・時刻 DEFAULT でない列を指す場合は束縛後にスキーマが変わったとみなし
+/// 束縛時の `volatile`（列位置）が、write トランザクション内で再取得した `schema` と整合するか検査する。
+/// `Default` は位置が範囲内・VECTOR 列でなく、スキーマ側に DEFAULT があること、`Values` は
+/// 時刻関数と列型が適合することを要求する。束縛後にスキーマが変わったとみなせる不整合は
 /// fail-closed で拒否する（`expected_schema` 一致検査が通る通常経路では到達しない）。
-fn named_expr_columns<'a>(
-    schema: &'a crate::catalog::TableSchema,
-    values: &'a [crate::row_codec::Value],
+fn check_volatile_columns(
+    schema: &crate::catalog::TableSchema,
     vector_idx: Option<usize>,
     volatile: &[VolatileColumn],
-) -> Result<Vec<(&'a str, content_hash::HashColumnInput<'a>)>, TenantWriteError> {
+) -> Result<(), TenantWriteError> {
     for col in volatile {
         let idx = col.index();
-        // DEFAULT 適用列は、スキーマの DEFAULT が時刻 DEFAULT であることも確認する
-        // （VALUES の時刻関数列は構文形を自前で持つため DEFAULT の有無を問わない）。
         let ok = match col {
-            VolatileColumn::Default(_) => matches!(
-                schema
-                    .columns
-                    .get(idx)
-                    .and_then(|c| c.default_expr.as_ref()),
-                Some(crate::catalog::ColumnDefault::CurrentTime(_))
-            ),
+            VolatileColumn::Default(_) => schema
+                .columns
+                .get(idx)
+                .is_some_and(|c| c.default_expr.is_some()),
             VolatileColumn::Values(_, t) => schema
                 .columns
                 .get(idx)
                 .is_some_and(|c| t.compatible_with(&c.ty)),
         };
-        if !ok || Some(idx) == vector_idx {
+        let is_vector = schema
+            .columns
+            .get(idx)
+            .is_some_and(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)));
+        if !ok || Some(idx) == vector_idx || is_vector {
             return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                 "volatile DEFAULT column does not match the table schema".to_string(),
             )));
         }
     }
+    Ok(())
+}
+
+/// 値ベース（`for_typed_insert` 系）のハッシュ材料の 1 行分の列（非 `VECTOR` 列。スキーマ列順）。
+/// 省略列に DEFAULT を適用した列（[`VolatileColumn::Default`]）は、送られた文に書かれていない
+/// ため材料から除外する（Issue #1629 D1。DEFAULT の変更・追加を挟んだ再送を一致させる。
+/// TABLE-39・RECOVER-10）。
+fn named_value_columns<'a>(
+    schema: &'a crate::catalog::TableSchema,
+    values: &'a [crate::row_codec::Value],
+    vector_idx: Option<usize>,
+    volatile: &[VolatileColumn],
+) -> Result<Vec<(&'a str, &'a crate::row_codec::Value)>, TenantWriteError> {
+    check_volatile_columns(schema, vector_idx, volatile)?;
     let mut out = Vec::new();
     out.try_reserve_exact(schema.columns.len()).map_err(|_| {
         TenantWriteError::Storage(StorageError::Codec(
@@ -1165,28 +1180,53 @@ fn named_expr_columns<'a>(
         if Some(idx) == vector_idx || matches!(column.ty, crate::catalog::ColumnType::Vector(_)) {
             continue;
         }
-        if let Some(col) = volatile.iter().find(|c| c.index() == idx) {
-            match col {
-                VolatileColumn::Default(_) => {
-                    if let Some(crate::catalog::ColumnDefault::CurrentTime(t)) =
-                        column.default_expr.as_ref()
-                    {
-                        out.push((
-                            column.name.as_str(),
-                            content_hash::HashColumnInput::VolatileDefault(*t),
-                        ));
-                    }
-                }
-                VolatileColumn::Values(_, t) => out.push((
-                    column.name.as_str(),
-                    content_hash::HashColumnInput::ValuesTime(*t),
-                )),
-            }
-        } else if let Some(value) = values.get(idx) {
-            out.push((
+        if volatile
+            .iter()
+            .any(|c| matches!(c, VolatileColumn::Default(i) if *i == idx))
+        {
+            continue;
+        }
+        if let Some(value) = values.get(idx) {
+            out.push((column.name.as_str(), value));
+        }
+    }
+    Ok(out)
+}
+
+/// `VALUES` 内の単独時刻関数を含む INSERT 系ハッシュ材料の 1 行分の列（非 `VECTOR` 列。スキーマ列順）。
+/// `Values` 列は評価値ではなく構文形（種別 `1`）を材料にし、`Default` 列は
+/// [`named_value_columns`] と同じく除外する（Issue #1629 D1。種別 `2` は退役）。
+fn named_expr_columns<'a>(
+    schema: &'a crate::catalog::TableSchema,
+    values: &'a [crate::row_codec::Value],
+    vector_idx: Option<usize>,
+    volatile: &[VolatileColumn],
+) -> Result<Vec<(&'a str, content_hash::HashColumnInput<'a>)>, TenantWriteError> {
+    check_volatile_columns(schema, vector_idx, volatile)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(schema.columns.len()).map_err(|_| {
+        TenantWriteError::Storage(StorageError::Codec(
+            "failed to reserve insert hash columns".to_string(),
+        ))
+    })?;
+    for (idx, column) in schema.columns.iter().enumerate() {
+        if Some(idx) == vector_idx || matches!(column.ty, crate::catalog::ColumnType::Vector(_)) {
+            continue;
+        }
+        match volatile.iter().find(|c| c.index() == idx) {
+            Some(VolatileColumn::Default(_)) => {}
+            Some(VolatileColumn::Values(_, t)) => out.push((
                 column.name.as_str(),
-                content_hash::HashColumnInput::Value(value),
-            ));
+                content_hash::HashColumnInput::ValuesTime(*t),
+            )),
+            None => {
+                if let Some(value) = values.get(idx) {
+                    out.push((
+                        column.name.as_str(),
+                        content_hash::HashColumnInput::Value(value),
+                    ));
+                }
+            }
         }
     }
     Ok(out)
@@ -1333,25 +1373,20 @@ pub(crate) fn insert_typed_row_unchecked(
         // `content_hash::push_named_scalar_columns` ドキュメント参照。位置基準の
         // ままだと `ALTER TABLE ADD COLUMN` を挟んだ再送で配列幅がずれ、内容一致の
         // 再送が `22023` に誤判定される）。
-        let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
-            .columns
+        // `VALUES` 内の単独時刻関数（Issue #2188）を含む文だけ、構文形を材料にする別ドメイン
+        // （`InsertExpr`）を使う。省略列へ適用した DEFAULT（定数・時刻とも）は材料から除外し、
+        // DEFAULT の変更を挟んだ再送が一致するようにする（Issue #1629 D1）。
+        let content_hash = if volatile_default_columns
             .iter()
-            .enumerate()
-            .filter(|(idx, column)| {
-                Some(*idx) != vector_idx
-                    && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
-            })
-            .filter_map(|(idx, column)| values.get(idx).map(|value| (column.name.as_str(), value)))
-            .collect();
-        // 揮発性 DEFAULT（`DEFAULT now()` 系。SQL-37・Issue #1587）を適用した列があれば、
-        // 評価値ではなく DEFAULT の構文形をハッシュする別ドメイン（`InsertExpr`）を使う。
-        // 無ければ従来どおり（バイト不変）。
-        let content_hash = if volatile_default_columns.is_empty() {
-            content_hash::for_typed_insert(id, visibility, embedding, &named_columns)?
-        } else {
+            .any(|c| matches!(c, VolatileColumn::Values(..)))
+        {
             let expr_columns =
                 named_expr_columns(&schema, values, vector_idx, volatile_default_columns)?;
             content_hash::for_typed_insert_expr(id, visibility, embedding, &expr_columns)?
+        } else {
+            let named_columns =
+                named_value_columns(&schema, values, vector_idx, volatile_default_columns)?;
+            content_hash::for_typed_insert(id, visibility, embedding, &named_columns)?
         };
         ledger::record_in_txn(
             write_txn,
@@ -1475,7 +1510,7 @@ pub(crate) fn insert_typed_rows_unchecked(
             })?;
             // 揮発性 DEFAULT を適用した行があるバッチは、全行を `*Expr` 形（列ごとの種別バイト付き）
             // でハッシュする（SQL-37・Issue #1587。無ければ従来形でバイト不変）。
-            let use_expr = any_volatile_default(volatile_default_columns);
+            let use_expr = any_values_time(volatile_default_columns);
             type ExprHashRow<'a> = (
                 u64,
                 crate::storage::Visibility,
@@ -1506,18 +1541,11 @@ pub(crate) fn insert_typed_rows_unchecked(
                     expr_rows.push((*id, visibility, embedding, expr_columns));
                     continue;
                 }
-                let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, column)| {
-                        Some(*idx) != vector_idx
-                            && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
-                    })
-                    .filter_map(|(idx, column)| {
-                        values.get(idx).map(|value| (column.name.as_str(), value))
-                    })
-                    .collect();
+                let row_volatile: &[VolatileColumn] = volatile_default_columns
+                    .get(row_idx)
+                    .copied()
+                    .unwrap_or(&[]);
+                let named_columns = named_value_columns(&schema, values, vector_idx, row_volatile)?;
                 hash_rows.push((*id, visibility, embedding, named_columns));
             }
             let content_hash = if use_expr {
@@ -1857,7 +1885,7 @@ fn upsert_typed_rows_impl(
             })?;
             // 揮発性 DEFAULT を適用した行があれば全行を `*Expr` 形でハッシュする
             // （`insert_typed_rows_unchecked` と同じ。SQL-37・Issue #1587）。
-            let use_expr = any_volatile_default(volatile_default_columns);
+            let use_expr = any_values_time(volatile_default_columns);
             type ExprHashRow<'a> = (
                 u64,
                 crate::storage::Visibility,
@@ -1888,18 +1916,11 @@ fn upsert_typed_rows_impl(
                     expr_rows.push((*id, insert_visibility, embedding, expr_columns));
                     continue;
                 }
-                let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, column)| {
-                        Some(*idx) != vector_idx
-                            && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
-                    })
-                    .filter_map(|(idx, column)| {
-                        values.get(idx).map(|value| (column.name.as_str(), value))
-                    })
-                    .collect();
+                let row_volatile: &[VolatileColumn] = volatile_default_columns
+                    .get(row_idx)
+                    .copied()
+                    .unwrap_or(&[]);
+                let named_columns = named_value_columns(&schema, values, vector_idx, row_volatile)?;
                 hash_rows.push((*id, insert_visibility, embedding, named_columns));
             }
             let hash_input: Vec<content_hash::TypedInsertBatchRow<'_>> = hash_rows
@@ -5129,6 +5150,9 @@ pub(crate) struct ReplaceByTextKey<'a> {
     pub content_hash_path: &'a str,
     pub content_hash_body: &'a str,
     pub content_hash_template_values: &'a [crate::row_codec::Value],
+    /// `content_hash_template_values` のうち DEFAULT 適用で埋まった列の位置。ハッシュの材料から
+    /// 除外する（Issue #1629 D1。DEFAULT の変更を挟んだ再送を一致させる）。
+    pub content_hash_default_applied: &'a [usize],
     /// 台帳への記録指示（TASK-93・RECOVER-2）。行の削除・挿入と同一 write
     /// トランザクション内で適用される。
     pub ledger_write: LedgerWrite<'a>,
@@ -5150,6 +5174,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
         content_hash_path,
         content_hash_body,
         content_hash_template_values,
+        content_hash_default_applied,
         ledger_write,
         max_scanned_rows,
     } = req;
@@ -5309,6 +5334,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 .filter(|(idx, column)| {
                     *idx != vector_idx
                         && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
+                        && !content_hash_default_applied.contains(idx)
                 })
                 .filter_map(|(idx, column)| {
                     content_hash_template_values
@@ -5775,6 +5801,7 @@ mod tests {
                 content_hash_path: "other.txt",
                 content_hash_body: "unrelated",
                 content_hash_template_values: &[],
+                content_hash_default_applied: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -5794,6 +5821,7 @@ mod tests {
                 content_hash_path: "note.txt",
                 content_hash_body: "v1 body",
                 content_hash_template_values: &[],
+                content_hash_default_applied: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -5819,6 +5847,7 @@ mod tests {
                 content_hash_path: "note.txt",
                 content_hash_body: "v2 body",
                 content_hash_template_values: &[],
+                content_hash_default_applied: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -5879,6 +5908,7 @@ mod tests {
                 content_hash_path: "shared.txt",
                 content_hash_body: "tenant-b content",
                 content_hash_template_values: &[],
+                content_hash_default_applied: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -5898,6 +5928,7 @@ mod tests {
                 content_hash_path: "shared.txt",
                 content_hash_body: "tenant-a content",
                 content_hash_template_values: &[],
+                content_hash_default_applied: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -5936,6 +5967,7 @@ mod tests {
                 content_hash_path: "absent.txt",
                 content_hash_body: "",
                 content_hash_template_values: &[],
+                content_hash_default_applied: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -5974,6 +6006,7 @@ mod tests {
                 content_hash_path: "a.txt",
                 content_hash_body: "body",
                 content_hash_template_values: &[],
+                content_hash_default_applied: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -6272,6 +6305,7 @@ mod tests {
                 content_hash_path: "irrelevant",
                 content_hash_body: "",
                 content_hash_template_values: &[],
+                content_hash_default_applied: &[],
                 ledger_write: LedgerWrite::Disabled,
             },
         )
@@ -6308,6 +6342,7 @@ mod tests {
                 content_hash_path: "note.txt",
                 content_hash_body: "v1",
                 content_hash_template_values: &[],
+                content_hash_default_applied: &[],
                 ledger_write: LedgerWrite::Disabled,
             },
         )
@@ -8007,6 +8042,7 @@ mod tests {
                 content_hash_path: "c.txt",
                 content_hash_body: "body-c",
                 content_hash_template_values: &[],
+                content_hash_default_applied: &[],
                 ledger_write: LedgerWrite::Disabled,
             },
         )
