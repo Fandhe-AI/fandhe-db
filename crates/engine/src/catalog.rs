@@ -10194,6 +10194,38 @@ impl Storage {
         }
     }
 
+    /// `name` がテーブル・ビュー・索引のいずれかとして存在するかをスナップショット読み取りで
+    /// 判定する（TABLE-36、Issue #1613）。`sql::ddl::execute_create_table` が
+    /// `IF NOT EXISTS` の早期判定（定義の意味検証より前に no-op で抜ける）に使う専用 API で、
+    /// 最終的な衝突判定は `create_table` の書き込みトランザクションが担う。全テナント共有の
+    /// 名前空間だけを見るため、テナント別の情報は読まない。
+    pub(crate) fn relation_name_exists(&self, name: &str) -> Result<bool> {
+        let read_txn = self.db().begin_read()?;
+        match read_txn.open_table(CATALOG_TABLE) {
+            Ok(t) => {
+                if t.get(name)?.is_some() {
+                    return Ok(true);
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match read_txn.open_table(VIEWS_TABLE) {
+            Ok(t) => {
+                if t.get(name)?.is_some() {
+                    return Ok(true);
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match read_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => Ok(t.get(name)?.is_some()),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// 索引宣言を名前順に列挙する（TASK-206・INDEX-7、Issue #908。宣言の確認・
     /// テスト用の読み取り API。スナップショット読み取りで、件数は
     /// [`MAX_INDEX_COUNT`] で打ち切る）。
