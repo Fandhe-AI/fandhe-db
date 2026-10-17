@@ -339,7 +339,6 @@ fn structural_rejections_do_not_consult_the_catalog() {
         ("CREATE INDEX ON docs (lang)".into(), "42601"),
         ("DROP INDEX a, b".into(), "42601"),
         ("DROP INDEX a CASCADE".into(), "42601"),
-        ("DROP INDEX IF EXISTS a".into(), "42601"),
         (too_many_sql, "54000"),
     ];
     for (sql, code) in &cases {

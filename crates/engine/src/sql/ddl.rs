@@ -297,7 +297,18 @@ pub(crate) fn execute_create_table(
 /// スコープの操作ではないため、そもそも「自テナント分の件数」という概念を
 /// 持たない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DropTableOutcome {}
+pub struct DropTableOutcome {
+    /// `IF EXISTS` で対象が無く何もしなかったか（Issue #1614・TABLE-36 ポインタ）。
+    /// CommandComplete のタグは通常の DROP と同一のため、wire 側は参照しない。
+    pub(crate) skipped: bool,
+}
+
+impl DropTableOutcome {
+    /// `IF EXISTS` により対象不在で no-op 成功した場合に真。
+    pub fn skipped(&self) -> bool {
+        self.skipped
+    }
+}
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体。
 /// `crate::catalog::Storage::drop_table`（カタログエントリ・全テナント行
@@ -312,10 +323,17 @@ pub(crate) fn execute_drop_table(
     storage: &Storage,
     validated: &ValidatedDropTable,
 ) -> Result<DropTableOutcome, SqlSurfaceError> {
-    storage
-        .drop_table(&validated.table_name)
-        .map_err(map_drop_table_error)?;
-    Ok(DropTableOutcome {})
+    // `IF EXISTS` かつ対象不在（`TableNotFound`）だけを成功へ読み替える。`Storage::drop_table` は
+    // `TableNotFound` を commit 前に返し txn が破棄されるため、カタログ・台帳・世代は変わらない。
+    // 種類違い（`42809`）・依存（`2BP01`）・ロック timeout 等は読み替えず従来の写像へ流す
+    // （fail-closed。権限ゲートは呼び出し元で通過済みのため存在オラクルにならない）。
+    match storage.drop_table(&validated.table_name) {
+        Ok(()) => Ok(DropTableOutcome { skipped: false }),
+        Err(CatalogError::TableNotFound(_)) if validated.if_exists => {
+            Ok(DropTableOutcome { skipped: true })
+        }
+        Err(e) => Err(map_drop_table_error(e)),
+    }
 }
 
 /// `Storage::drop_table` の [`CatalogError`] を SQL 表層の契約へ写像する
@@ -1504,7 +1522,18 @@ pub struct CreateViewOutcome {}
 
 /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）の成功応答。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DropViewOutcome {}
+pub struct DropViewOutcome {
+    /// `IF EXISTS` で対象が無く何もしなかったか（Issue #1614・TABLE-36 ポインタ）。
+    /// CommandComplete のタグは通常の DROP と同一のため、wire 側は参照しない。
+    pub(crate) skipped: bool,
+}
+
+impl DropViewOutcome {
+    /// `IF EXISTS` により対象不在で no-op 成功した場合に真。
+    pub fn skipped(&self) -> bool {
+        self.skipped
+    }
+}
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体。
 /// `crate::catalog::Storage::create_view` へ委譲する（構文検証段〔
@@ -1531,10 +1560,17 @@ pub(crate) fn execute_drop_view(
     storage: &Storage,
     validated: &ValidatedDropView,
 ) -> Result<DropViewOutcome, SqlSurfaceError> {
-    storage
-        .drop_view(validated.name())
-        .map_err(map_drop_view_error)?;
-    Ok(DropViewOutcome {})
+    // `IF EXISTS` かつ対象不在（`ViewNotFound`）だけを成功へ読み替える。`Storage::drop_view` は
+    // `ViewNotFound` を commit 前に返し txn が破棄されるため、カタログ・台帳・世代は変わらない。
+    // 種類違い（`42809`）・依存（`2BP01`）・ロック timeout 等は読み替えず従来の写像へ流す
+    // （fail-closed。権限ゲートは呼び出し元で通過済みのため存在オラクルにならない）。
+    match storage.drop_view(validated.name()) {
+        Ok(()) => Ok(DropViewOutcome { skipped: false }),
+        Err(CatalogError::ViewNotFound(_)) if validated.if_exists() => {
+            Ok(DropViewOutcome { skipped: true })
+        }
+        Err(e) => Err(map_drop_view_error(e)),
+    }
 }
 
 /// `Storage::create_view` の [`CatalogError`] を SQL 表層の契約へ写像する
@@ -1589,7 +1625,18 @@ pub struct CreateIndexOutcome {}
 
 /// `DROP INDEX`（TASK-206・INDEX-7・SQL-23、Issue #908）の成功応答。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DropIndexOutcome {}
+pub struct DropIndexOutcome {
+    /// `IF EXISTS` で対象が無く何もしなかったか（Issue #1614・TABLE-36 ポインタ）。
+    /// CommandComplete のタグは通常の DROP と同一のため、wire 側は参照しない。
+    pub(crate) skipped: bool,
+}
+
+impl DropIndexOutcome {
+    /// `IF EXISTS` により対象不在で no-op 成功した場合に真。
+    pub fn skipped(&self) -> bool {
+        self.skipped
+    }
+}
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
 /// （TASK-206・INDEX-7、Issue #908）。`crate::catalog::Storage::create_index`
@@ -1627,10 +1674,17 @@ pub(crate) fn execute_drop_index(
     storage: &Storage,
     validated: &ValidatedDropIndex,
 ) -> Result<DropIndexOutcome, SqlSurfaceError> {
-    storage
-        .drop_index(validated.name())
-        .map_err(map_drop_index_error)?;
-    Ok(DropIndexOutcome {})
+    // `IF EXISTS` かつ対象不在（`IndexNotFound`）だけを成功へ読み替える。`Storage::drop_index` は
+    // `IndexNotFound` を commit 前に返し txn が破棄されるため、カタログ・台帳・世代は変わらない。
+    // 種類違い（`42809`）・依存（`2BP01`）・ロック timeout 等は読み替えず従来の写像へ流す
+    // （fail-closed。権限ゲートは呼び出し元で通過済みのため存在オラクルにならない）。
+    match storage.drop_index(validated.name()) {
+        Ok(()) => Ok(DropIndexOutcome { skipped: false }),
+        Err(CatalogError::IndexNotFound(_)) if validated.if_exists() => {
+            Ok(DropIndexOutcome { skipped: true })
+        }
+        Err(e) => Err(map_drop_index_error(e)),
+    }
 }
 
 /// `Storage::create_index` の [`CatalogError`] を SQL 表層の契約へ写像する
@@ -1684,7 +1738,18 @@ pub struct CreateTypeOutcome {}
 
 /// `DROP TYPE`（TABLE-14・SQL-23・TASK-198、Issue #1194）の成功応答。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DropTypeOutcome {}
+pub struct DropTypeOutcome {
+    /// `IF EXISTS` で対象が無く何もしなかったか（Issue #1614・TABLE-36 ポインタ）。
+    /// CommandComplete のタグは通常の DROP と同一のため、wire 側は参照しない。
+    pub(crate) skipped: bool,
+}
+
+impl DropTypeOutcome {
+    /// `IF EXISTS` により対象不在で no-op 成功した場合に真。
+    pub fn skipped(&self) -> bool {
+        self.skipped
+    }
+}
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
 /// （Issue #1194）。`Storage::create_enum_type`（単一 write txn 内で名前検証・
@@ -1713,10 +1778,17 @@ pub(crate) fn execute_drop_type(
     storage: &Storage,
     validated: &ValidatedDropType,
 ) -> Result<DropTypeOutcome, SqlSurfaceError> {
-    storage
-        .drop_enum_type(validated.name())
-        .map_err(map_drop_type_error)?;
-    Ok(DropTypeOutcome {})
+    // `IF EXISTS` かつ対象不在（`TypeNotFound`）だけを成功へ読み替える。`Storage::drop_enum_type` は
+    // `TypeNotFound` を commit 前に返し txn が破棄されるため、カタログ・台帳・世代は変わらない。
+    // 種類違い（`42809`）・依存（`2BP01`）・ロック timeout 等は読み替えず従来の写像へ流す
+    // （fail-closed。権限ゲートは呼び出し元で通過済みのため存在オラクルにならない）。
+    match storage.drop_enum_type(validated.name()) {
+        Ok(()) => Ok(DropTypeOutcome { skipped: false }),
+        Err(CatalogError::TypeNotFound(_)) if validated.if_exists() => {
+            Ok(DropTypeOutcome { skipped: true })
+        }
+        Err(e) => Err(map_drop_type_error(e)),
+    }
 }
 
 /// `Storage::create_enum_type` の [`CatalogError`] を SQL 表層の契約へ写像する
@@ -1757,6 +1829,76 @@ fn map_drop_type_error(e: CatalogError) -> SqlSurfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `IF EXISTS` の対象不在 no-op は全体世代・テーブル単位世代・索引カタログ世代を
+    /// 進めない（Issue #1614・TABLE-36 ポインタ）。対照として実在する索引の DROP は
+    /// 索引カタログ世代を進める（検査が何も見ていない状態を防ぐ）。
+    #[test]
+    fn if_exists_noop_leaves_all_generations_untouched() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::sql::allowlist::{
+            ValidatedDropIndex, ValidatedDropTable, ValidatedDropType, ValidatedDropView,
+        };
+        use redb::ReadableDatabase;
+
+        let path = crate::test_util::temp_db::unique_db_path("ddl-drop-ie-gen");
+        let _guard = crate::test_util::temp_db::CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+        let snapshot = |st: &Storage| {
+            let read = st.db().begin_read().expect("read txn");
+            (
+                st.current_generation().expect("generation"),
+                st.table_generation("docs").expect("table generation"),
+                crate::catalog::index_catalog_generation_in_txn(&read).expect("index generation"),
+            )
+        };
+        let before = snapshot(&storage);
+
+        let t = ValidatedDropTable {
+            table_name: "ghost".into(),
+            if_exists: true,
+        };
+        assert!(execute_drop_table(&storage, &t).expect("table").skipped());
+        let v = ValidatedDropView {
+            name: "ghost".into(),
+            if_exists: true,
+        };
+        assert!(execute_drop_view(&storage, &v).expect("view").skipped());
+        let i = ValidatedDropIndex {
+            name: "ghost".into(),
+            if_exists: true,
+        };
+        assert!(execute_drop_index(&storage, &i).expect("index").skipped());
+        let y = ValidatedDropType {
+            name: "ghost".into(),
+            if_exists: true,
+        };
+        assert!(execute_drop_type(&storage, &y).expect("type").skipped());
+        assert_eq!(
+            snapshot(&storage),
+            before,
+            "no-op must not bump generations"
+        );
+
+        // IF EXISTS なしでは従来どおり不在エラー。
+        let strict = ValidatedDropIndex {
+            name: "ghost".into(),
+            if_exists: false,
+        };
+        assert_eq!(
+            execute_drop_index(&storage, &strict)
+                .expect_err("missing")
+                .wire_code(),
+            "42704"
+        );
+        assert_eq!(snapshot(&storage), before);
+    }
 
     /// 未登録の型名は解決前後（race を含む）とも `42704` に写す（Issue #2306）。
     #[test]
