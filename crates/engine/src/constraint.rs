@@ -687,7 +687,8 @@ where
 /// 呼ぶ既存行の NULL 検査。`row_table`（対象テーブルの行ストア全体）を**全テナント・
 /// `Public`／`Private` を問わず**走査し、`columns` のいずれかが NULL の行が 1 件でも
 /// あれば最初に見つけた NULL 列名を返す（列名はスキーマ情報でありテナント・行・値を
-/// 含まない）。呼び出し元は `catalog::Storage::alter_table_add_primary_key`。
+/// 含まない）。呼び出し元は `catalog::Storage::alter_table_add_primary_key` と
+/// `catalog::Storage::alter_table_set_not_null`（Issue #1631）。
 ///
 /// **契約**: `schema` は**変更前**のスキーマ（PK 構成列がまだ nullable のもの）を渡す。
 /// `row_codec::scan_scalar_columns_masked` は行バッファの末尾で途切れた列を nullable
@@ -711,9 +712,7 @@ where
             .columns
             .iter()
             .position(|c| &c.name == name)
-            .ok_or_else(|| {
-                CatalogError::Invalid(format!("primary key references unknown column: {name}"))
-            })?;
+            .ok_or_else(|| CatalogError::Invalid(format!("column not found in schema: {name}")))?;
         indices.push((idx, name.as_str()));
     }
     let mut mask = vec![false; schema.columns.len()];
