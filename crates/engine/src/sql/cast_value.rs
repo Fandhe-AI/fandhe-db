@@ -1000,6 +1000,13 @@ fn jsonb_to_scalar<'a>(text: &str, to: CastDst) -> Result<ExprValue<'a>, SqlSurf
         }
         JsonValue::Number(n) => {
             let overflow = || out_of_range("value overflows numeric format");
+            // 変換先が浮動小数のときは、小数・指数表記の JSON 数値を numeric（38 桁制約）へ
+            // 通さず、元テキストから対象の型へ直接解析する（`1e100`／`1e-100` を許容する。
+            // 型の範囲外〔非有限・float4 のアンダーフロー含む〕のみ `22003`）。
+            if let (JsonNumber::Float { text, .. }, CastDst::Float4 | CastDst::Float8) = (&n, to) {
+                let x = text_to_float(text, matches!(to, CastDst::Float4))?;
+                return Ok(ExprValue::Scalar(x));
+            }
             let d = match n {
                 JsonNumber::PosInt(u) => {
                     Decimal::from_parts(i128::from(u), 0).map_err(|_| overflow())?

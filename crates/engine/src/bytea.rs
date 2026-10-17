@@ -143,7 +143,7 @@ pub enum ByteaCastError {
 pub fn parse_cast_text(s: &str) -> Result<Vec<u8>, ByteaCastError> {
     let bytes = s.as_bytes();
     let max = MAX_BYTEA_FIELD_LEN as usize;
-    if matches!(bytes.get(..2), Some([b'\\', b'x'])) {
+    if matches!(bytes.get(..2), Some([b'\\', b'x' | b'X'])) {
         let body = bytes.get(2..).unwrap_or(&[]);
         if body.len() / 2 > max {
             return Err(ByteaCastError::TooLong);
@@ -208,6 +208,8 @@ mod tests {
     fn cast_text_hex_form_and_errors() {
         assert_eq!(parse_cast_text("\\x616263").unwrap(), b"abc".to_vec());
         assert_eq!(parse_cast_text("\\x").unwrap(), Vec::<u8>::new());
+        // 大文字の `\X` 接頭辞も byteain と同様に 16 進形式として受理する。
+        assert_eq!(parse_cast_text("\\X616263").unwrap(), b"abc".to_vec());
         assert_eq!(parse_cast_text("\\xabc"), Err(ByteaCastError::OddLength));
         assert_eq!(parse_cast_text("\\xzz"), Err(ByteaCastError::InvalidDigit));
         assert_eq!(parse_cast_text("\\x a"), Err(ByteaCastError::InvalidDigit));

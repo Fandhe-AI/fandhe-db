@@ -345,8 +345,10 @@ PostgreSQL 17 との照合は実機を使えなかったため、本書の「系
   無限大は `0A000`）
 - json ⇄ jsonb: json → jsonb は重複キーを最後の値で畳んで正規化、jsonb → json は正規化テキストのまま。
   文字列型 → json は構文検証のみで原文を保持し、→ jsonb は正規化する（不正は `22P02`）
-- jsonb → 数値 6 型・boolean（`e`）: 数値は numeric を経由して #1591 の変換（四捨五入・範囲検査 `22003`・
-  `numeric(p,s)` の丸め）を共有する。型の合わない JSON は `22023`（`cannot cast jsonb <string|numeric|
+- jsonb → 数値 6 型・boolean（`e`）: 整数・numeric 系への数値は numeric を経由して #1591 の変換
+  （四捨五入・範囲検査 `22003`・`numeric(p,s)` の丸め）を共有する。float4／float8 への小数・指数表記の
+  数値は numeric を経由せず元テキストから対象の型へ直接解析する（`1e100`／`1e-100` は double precision で
+  成功。型の範囲外〔非有限・float4 のアンダーフロー含む〕のみ `22003`）。型の合わない JSON は `22023`（`cannot cast jsonb <string|numeric|
   boolean|null|array|object> to type <型名>`。値を含まない固定文言）
 - uuid ⇄ 文字列型: 出力は小文字の正規形、入力は厳密な 36 文字形（不正は `22P02`）
 - bytea ⇄ 文字列型: 出力は `\x` ＋ 小文字 16 進、入力は PostgreSQL の `byteain` に従う（`\x` 始まりは

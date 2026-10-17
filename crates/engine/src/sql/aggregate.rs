@@ -2884,7 +2884,12 @@ fn finish_aggregate_result(
         .iter()
         .any(|c| matches!(c, crate::sql::parser::ProjectionColumn::Expr { .. }))
     {
-        crate::sql::group_by::project_ungrouped_row(bound, schema, &cells)?
+        crate::sql::group_by::project_ungrouped_row(
+            bound,
+            schema,
+            &cells,
+            MAX_AGGREGATE_RESULT_BYTES,
+        )?
     } else {
         cells
     };

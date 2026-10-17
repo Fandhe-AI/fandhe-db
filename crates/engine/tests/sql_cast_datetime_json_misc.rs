@@ -773,6 +773,28 @@ fn jsonb_to_scalar_follows_numeric_rounding_and_type_errors() {
         err_of(&core, "CAST(CAST('40000' AS jsonb) AS smallint)").wire_code(),
         "22003"
     );
+    // 浮動小数への変換は numeric を経由せず元テキストから直接解析する。
+    assert_eq!(
+        value(&core, "CAST(CAST('1e100' AS jsonb) AS double precision)"),
+        Cell::Float(1e100)
+    );
+    assert_eq!(
+        value(&core, "CAST(CAST('1e-100' AS jsonb) AS double precision)"),
+        Cell::Float(1e-100)
+    );
+    // real は範囲外（オーバーフロー・アンダーフロー）を 22003 とする。
+    for lit in ["1e100", "1e-100", "1e400"] {
+        let dst = if lit == "1e400" {
+            "double precision"
+        } else {
+            "real"
+        };
+        assert_eq!(
+            err_of(&core, &format!("CAST(CAST('{lit}' AS jsonb) AS {dst})")).wire_code(),
+            "22003",
+            "{lit} -> {dst}"
+        );
+    }
     // 38 桁を超える数値は numeric に収まらない
     assert_eq!(
         err_of(&core, "CAST(CAST('1e400' AS jsonb) AS numeric)").wire_code(),

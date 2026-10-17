@@ -3528,8 +3528,34 @@ fn project_rows(
                         udf_call::ExprValue::Numeric(d) => cells.push(Cell::Numeric(d)),
                         // `CAST` の結果（Issue #1592）。列直接投影と同じセルへ写す。
                         udf_call::ExprValue::Uuid(u) => cells.push(Cell::Uuid(u)),
-                        udf_call::ExprValue::Bytes(b) => cells.push(Cell::Bytes(b.into_owned())),
-                        udf_call::ExprValue::Array(a) => cells.push(Cell::Array(a)),
+                        // 式結果の BYTEA／配列は入力より大きくなりうるため、確保前に累計バイト量を
+                        // scan 経路と同じ上限（`MAX_CANDIDATE_SCALAR_BYTES`）で検証する（fail-closed）。
+                        udf_call::ExprValue::Bytes(b) => {
+                            deferred_budget = try_accumulate_budget(
+                                deferred_budget,
+                                b.len(),
+                                MAX_CANDIDATE_SCALAR_BYTES,
+                            )
+                            .map_err(|_| {
+                                SqlSurfaceError::payload_too_large(
+                                    "projected result exceeds capacity",
+                                )
+                            })?;
+                            cells.push(Cell::Bytes(b.into_owned()))
+                        }
+                        udf_call::ExprValue::Array(a) => {
+                            deferred_budget = try_accumulate_budget(
+                                deferred_budget,
+                                a.approx_heap_bytes(),
+                                MAX_CANDIDATE_SCALAR_BYTES,
+                            )
+                            .map_err(|_| {
+                                SqlSurfaceError::payload_too_large(
+                                    "projected result exceeds capacity",
+                                )
+                            })?;
+                            cells.push(Cell::Array(a))
+                        }
                     }
                 }
             }

@@ -2121,8 +2121,18 @@ fn finish_groups(
 
     let mut rows = Vec::with_capacity(finished.len());
     let mut project_scratch: Vec<StackValue> = Vec::new();
+    // 式列が返す BYTEA／配列セルの累計見積りバイト数（結果バイト予算への課金。Issue #1592）。
+    let mut computed_bytes: usize = 0;
     for (key, cells, _) in finished {
-        let row_cells = project_row(bound, schema, &key, &cells, &mut project_scratch)?;
+        let row_cells = project_row(
+            bound,
+            schema,
+            &key,
+            &cells,
+            &mut project_scratch,
+            &mut computed_bytes,
+            budget.max_result_bytes,
+        )?;
         rows.push(ResultRow {
             id: 0,
             score: 0.0,
@@ -2146,6 +2156,8 @@ fn project_row(
     key: &GroupKey,
     cells: &[Cell],
     scratch: &mut Vec<StackValue>,
+    computed_bytes: &mut usize,
+    max_result_bytes: usize,
 ) -> Result<Vec<Cell>, SqlSurfaceError> {
     let group_keys: &[crate::sql::parser::BoundOrderKey] = bound
         .group_by
@@ -2226,7 +2238,20 @@ fn project_row(
                     .as_ref()
                     .ok_or_else(|| accumulator_bug("projection expression without a row view"))?;
                 let value = program.eval(0, &[], row_scalars, scratch)?;
-                expr_value_to_cell(value, result_ty.as_ref())?
+                let cell = expr_value_to_cell(value, result_ty.as_ref())?;
+                // CAST 等が返す BYTEA／配列は入力より大きくなりうるため、結果バイト予算
+                // （`max_result_bytes`）へ累計課金し超過は `54000` で拒否する（Issue #1592。
+                // 通常 SELECT の投影段〔`sql::exec`〕の予算計上と同方針・fail-closed）。
+                if matches!(cell, Cell::Bytes(_) | Cell::Array(_)) {
+                    *computed_bytes = computed_bytes
+                        .saturating_add(crate::sql::cursor::estimate_cell_bytes(&cell));
+                    if *computed_bytes > max_result_bytes {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            RESULT_BUDGET_EXCEEDED_DETAIL,
+                        ));
+                    }
+                }
+                cell
             }
         };
         row_cells.push(cell);
@@ -2240,6 +2265,7 @@ pub(crate) fn project_ungrouped_row(
     bound: &BoundAggregate,
     schema: &TableSchema,
     cells: &[Cell],
+    max_result_bytes: usize,
 ) -> Result<Vec<Cell>, SqlSurfaceError> {
     if bound
         .projection
@@ -2249,7 +2275,16 @@ pub(crate) fn project_ungrouped_row(
         return Err(accumulator_bug("group key projected without GROUP BY"));
     }
     let mut scratch: Vec<StackValue> = Vec::new();
-    project_row(bound, schema, &GroupKey(Vec::new()), cells, &mut scratch)
+    let mut computed_bytes: usize = 0;
+    project_row(
+        bound,
+        schema,
+        &GroupKey(Vec::new()),
+        cells,
+        &mut scratch,
+        &mut computed_bytes,
+        max_result_bytes,
+    )
 }
 
 /// 式の評価値を出力セルへ変換する（Issue #1541）。`Scalar` は束縛時に確定した結果列型に
@@ -2462,7 +2497,7 @@ impl<'a> GroupedRowAccumulator<'a> {
                 cells.push(acc.finish()?);
             }
             let columns = crate::sql::aggregate::aggregate_projection_columns(bound, schema)?;
-            let row_cells = project_ungrouped_row(bound, schema, &cells)?;
+            let row_cells = project_ungrouped_row(bound, schema, &cells, budget.max_result_bytes)?;
             return Ok(QueryResult {
                 columns,
                 rows: vec![ResultRow {
@@ -3006,6 +3041,34 @@ mod tests {
             crate::group_by_limits::GroupByLimits::default(),
         )
         .expect_err("tiny caller-supplied budget must reject before default cap");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// Issue #1592: 式列の `CAST(.. AS bytea)` 結果は結果バイト予算へ課金され、超過は `54000`。
+    #[test]
+    fn ungrouped_projection_charges_cast_bytea_to_result_budget() {
+        use crate::sql::cast_value::{CastDst, CastFn, CastSrc};
+        use crate::sql::udf_call::{BoundExpr, BuiltinFn};
+        let expr = BoundExpr::Builtin {
+            f: BuiltinFn::Cast(CastFn {
+                from: CastSrc::Text,
+                to: CastDst::Bytea,
+            }),
+            args: vec![BoundExpr::Text("abcdefgh".to_string())],
+        };
+        let mut bound = bound_count_star_grouped_by_lang();
+        bound.group_by = None;
+        bound.projection = vec![crate::sql::parser::ProjectionColumn::Expr {
+            program: crate::sql::expr_program::ExprProgram::compile(&expr),
+            name: "b".to_string(),
+            result_ty: Some(ColumnType::Bytea),
+            mask: Vec::new(),
+        }];
+        let schema = schema_with_text_group_column();
+        let cells = project_ungrouped_row(&bound, &schema, &[], 1_000).expect("within budget");
+        assert!(matches!(cells.as_slice(), [Cell::Bytes(b)] if b.len() == 8));
+        let err = project_ungrouped_row(&bound, &schema, &[], 8)
+            .expect_err("bytea result over the budget must be rejected");
         assert_eq!(err.wire_code(), "54000");
     }
 
