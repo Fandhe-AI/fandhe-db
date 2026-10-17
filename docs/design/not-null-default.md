@@ -256,7 +256,7 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
 - **構文**: `ALTER TABLE <表> ALTER COLUMN <列> SET DEFAULT <式>`／`... DROP DEFAULT`。式の許可範囲は
   `CREATE TABLE` の列 DEFAULT と同じ（定数リテラル・定数式・時刻値関数・`NULL`）。`SET DEFAULT NULL`
   は `DROP DEFAULT` と同じ扱い（SQL-41 の正規化）。`COLUMN` 省略形・カンマ区切りの
-  複数アクションは `42601` のまま。
+  複数アクションは Issue #1633 で受理した（[alter-table-multi-action.md](alter-table-multi-action.md)）。
 - **変えるもの／変えないもの**: 変えるのは以後の書き込みで使う INSERT 既定値（`default_expr`）だけで、
   ADD COLUMN 時に決めた既存行の読み出し時補完値（`fill_value`）は変えない。食い違うスキーマは
   カタログ v14 で永続化される。変更時はテーブル単位の世代を進める。

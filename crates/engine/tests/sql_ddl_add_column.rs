@@ -457,8 +457,6 @@ fn malformed_syntax_variants_are_rejected_with_42601() {
 
     for sql in [
         format!("ALTER TABLE {TABLE} ADD note TEXT"),
-        format!("ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS note TEXT"),
-        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT, ADD COLUMN note2 TEXT"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT UNIQUE"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT PRIMARY KEY"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT NOT NULL NOT NULL"),

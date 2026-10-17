@@ -39,16 +39,17 @@
 //! 一切変更しない。
 
 use crate::catalog::{
-    AlterCheckError, CatalogError, ColumnDef, ColumnDefault, ColumnType, IndexDef, IndexKind,
-    TableSchema, MAX_COLUMN_DEFAULT_LEN,
+    AlterApply, AlterCheckError, CatalogError, ColumnDef, ColumnDefault, ColumnType, IndexDef,
+    IndexKind, TableSchema, MAX_COLUMN_DEFAULT_LEN,
 };
 use crate::schema_limits::SchemaLimits;
 use crate::sql::allowlist::{
-    InsertLiteral, SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
-    ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnDropDefault,
-    ValidatedAlterTableAlterColumnDropNotNull, ValidatedAlterTableAlterColumnSetDefault,
-    ValidatedAlterTableAlterColumnSetNotNull, ValidatedAlterTableAlterColumnType,
-    ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint,
+    InsertLiteral, SqlSurfaceError, ValidatedAlterTable, ValidatedAlterTableAddCheck,
+    ValidatedAlterTableAddColumn, ValidatedAlterTableAddUnique,
+    ValidatedAlterTableAlterColumnDropDefault, ValidatedAlterTableAlterColumnDropNotNull,
+    ValidatedAlterTableAlterColumnSetDefault, ValidatedAlterTableAlterColumnSetNotNull,
+    ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
+    ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
     ValidatedAlterTableRenameColumn, ValidatedCreateIndex, ValidatedCreateTable,
     ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex, ValidatedDropTable,
     ValidatedDropType, ValidatedDropView,
@@ -405,6 +406,12 @@ pub struct AlterTableOutcome {
 pub enum AlterTableAction {
     /// `ADD COLUMN`（TASK-202、Issue #900）。
     AddColumn { column_name: String },
+    /// `ADD COLUMN IF NOT EXISTS` が同名の生存列を見つけて何も変えなかった（TABLE-36、
+    /// Issue #1633）。**BREAKING CHANGE**: variant 追加。
+    AddColumnSkipped { column_name: String },
+    /// 複数アクションを単一 txn で適用した結果（TABLE-39 (5)、Issue #1633）。要素は記述順。
+    /// **BREAKING CHANGE**: variant 追加。
+    Multiple { actions: Vec<AlterTableAction> },
     /// `ADD [CONSTRAINT <name>] UNIQUE (...)`（TABLE-16・TASK-204、Issue #1067）・
     /// `ADD [CONSTRAINT <name>] CHECK (<述語>)`（TABLE-16・TASK-204、
     /// Issue #1068）のいずれの成功も本 variant を共有する（新しい variant を
@@ -462,13 +469,59 @@ pub(crate) fn execute_alter_table_add_column(
     stmt: &ValidatedAlterTableAddColumn,
     limits: &SchemaLimits,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
-    match storage.get_table_schema(&stmt.table_name) {
-        Ok(_) => {}
+    let schema = match storage.get_table_schema(&stmt.table_name) {
+        Ok(s) => s,
+        Err(CatalogError::TableNotFound(_)) => {
+            return Err(undefined_table_or_view(storage, &stmt.table_name));
+        }
+        Err(other) => return Err(map_add_column_error(other)),
+    };
+    // `IF NOT EXISTS`（TABLE-36、Issue #1633）: 同名の生存列があれば型解決・DEFAULT の束縛より
+    // 前に成功扱いで返す（カタログ・世代は変えない。墓標は名前空間に入らない）。
+    if stmt.if_not_exists && schema.columns.iter().any(|c| c.name == stmt.column_name) {
+        return Ok(add_column_skipped_outcome(stmt));
+    }
+    let column = build_add_column_def(storage, stmt, limits)?;
+    match storage.alter_table_add_column_with_limit(
+        &stmt.table_name,
+        column,
+        limits.max_table_columns(),
+    ) {
+        Ok(()) => {}
+        // 判定と書き込みの間に並行して同名列が追加された場合も `IF NOT EXISTS` なら成功扱い。
+        Err(CatalogError::ColumnAlreadyExists(_)) if stmt.if_not_exists => {
+            return Ok(add_column_skipped_outcome(stmt));
+        }
         Err(CatalogError::TableNotFound(_)) => {
             return Err(undefined_table_or_view(storage, &stmt.table_name));
         }
         Err(other) => return Err(map_add_column_error(other)),
     }
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AddColumn {
+            column_name: stmt.column_name.clone(),
+        },
+    })
+}
+
+/// `ADD COLUMN IF NOT EXISTS` が何もしなかったときの応答（Issue #1633）。
+fn add_column_skipped_outcome(stmt: &ValidatedAlterTableAddColumn) -> AlterTableOutcome {
+    AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AddColumnSkipped {
+            column_name: stmt.column_name.clone(),
+        },
+    }
+}
+
+/// `ADD COLUMN` 文から `ColumnDef` を組み立てる（型解決・COLLATE 適合・DEFAULT の列型整合と
+/// 束縛検証）。単一アクション経路と複数アクション経路（Issue #1633）が共有する。
+fn build_add_column_def(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAddColumn,
+    limits: &SchemaLimits,
+) -> Result<ColumnDef, SqlSurfaceError> {
     let ty = resolve_column_type(storage, &stmt.column_type, limits)?;
     check_column_collation(&ty, stmt.collation)?;
     let default = match &stmt.default {
@@ -487,18 +540,7 @@ pub(crate) fn execute_alter_table_add_column(
             crate::sql::parser::bind_column_default(&column, default)?;
         }
     }
-    storage
-        .alter_table_add_column_with_limit(&stmt.table_name, column, limits.max_table_columns())
-        .map_err(|e| match e {
-            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
-            other => map_add_column_error(other),
-        })?;
-    Ok(AlterTableOutcome {
-        table_name: stmt.table_name.clone(),
-        action: AlterTableAction::AddColumn {
-            column_name: stmt.column_name.clone(),
-        },
-    })
+    Ok(column)
 }
 
 /// `ALTER TABLE <table> ADD [CONSTRAINT <name>] UNIQUE (<col>[, ...])` の実行本体
@@ -660,6 +702,9 @@ pub(crate) fn execute_alter_table(
     limits: &SchemaLimits,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     match validated {
+        crate::sql::allowlist::ValidatedAlterTable::Multiple(stmt) => {
+            execute_alter_table_multiple(storage, stmt, limits)
+        }
         crate::sql::allowlist::ValidatedAlterTable::AddColumn(stmt) => {
             execute_alter_table_add_column(storage, stmt, limits)
         }
@@ -698,6 +743,254 @@ pub(crate) fn execute_alter_table(
         }
         crate::sql::allowlist::ValidatedAlterTable::RenameColumn(stmt) => {
             execute_alter_table_rename_column(storage, stmt)
+        }
+    }
+}
+
+/// `ALTER TABLE <table> <アクション>, <アクション>, ...` の実行本体（TABLE-39 (5) のポインタ、
+/// Issue #1633）。呼び出し元（[`execute_alter_table`]）は `core.rs` が
+/// [`require_ddl_permission`] を先に通した後に呼ぶ。
+///
+/// 全アクションを `Storage::alter_table_in_single_txn` の単一 write txn 内で適用する。途中の
+/// アクションが失敗したら txn ごと破棄され何も適用されない（カタログ・世代とも不変）。適用順は
+/// PostgreSQL の `AlterTablePass` に倣い、pass（`DROP COLUMN` → `ADD COLUMN` →
+/// 列属性変更〔SET／DROP NOT NULL・SET／DROP DEFAULT〕）の昇順で、同じ pass 内は記述順。応答の `actions` は記述順に並べ直す。各アクションは txn 内のスキーマ（前のアクションの
+/// 結果を含む）に対して判定し、エラーの SQLSTATE は単一アクション経路と同じ写像を使う。
+/// いずれのアクションもカタログを変えなかった場合（`IF NOT EXISTS` の skip・冪等な no-op のみ）は
+/// commit せず世代も進めない。
+pub(crate) fn execute_alter_table_multiple(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableMultiple,
+    limits: &SchemaLimits,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    let mut order: Vec<usize> = (0..stmt.actions.len()).collect();
+    // 安定ソート: 同じ pass 内は記述順を保つ。
+    order.sort_by_key(|&i| stmt.actions.get(i).map_or(u8::MAX, alter_action_pass));
+    let results = storage
+        .alter_table_in_single_txn(&stmt.table_name, |txn| {
+            let mut results: Vec<Option<AlterTableAction>> = vec![None; stmt.actions.len()];
+            let mut changed = false;
+            let mut live_checked = false;
+            for &i in &order {
+                let Some(action) = stmt.actions.get(i) else {
+                    continue;
+                };
+                // 列属性変更 pass に入る前に、DROP／ADD pass の結果として生存列が残っていることを
+                // 確かめる（0 本のまま属性変更が内部エラーにならないよう、ここで 42601 にする）。
+                if !live_checked && alter_action_pass(action) >= ALTER_PASS_ATTRIBUTES {
+                    Storage::ensure_table_has_live_column_in_txn(txn, &stmt.table_name)
+                        .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
+                    live_checked = true;
+                }
+                let (done, apply) =
+                    apply_alter_action_in_txn(storage, txn, &stmt.table_name, action, limits)?;
+                changed |= apply == AlterApply::Applied;
+                if let Some(slot) = results.get_mut(i) {
+                    *slot = Some(done);
+                }
+            }
+            // DROP COLUMN の「生存列 1 本以上」検証は中間状態では保留しているため、全アクション
+            // 適用後にここで検証する（最後の列を置き換える `ADD COLUMN b, DROP COLUMN a` 等を許す。
+            // 0 本のままなら単一 DROP と同じ 42601 で txn ごと破棄）。
+            Storage::ensure_table_has_live_column_in_txn(txn, &stmt.table_name)
+                .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
+            Ok((results, changed))
+        })
+        .map_err(|e| match e {
+            AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                undefined_table_or_view(storage, &stmt.table_name)
+            }
+            AlterCheckError::Catalog(other) => map_drop_alter_column_error(other),
+            AlterCheckError::Sql(sql_err) => sql_err,
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::Multiple {
+            actions: results.into_iter().flatten().collect(),
+        },
+    })
+}
+
+/// 複数アクションの列属性変更 pass の番号（[`alter_action_pass`] 参照）。
+const ALTER_PASS_ATTRIBUTES: u8 = 2;
+
+/// 複数アクションの適用順（PostgreSQL の `AlterTablePass` 相当）。数値が小さいほど先に適用する。
+/// 複数アクションに含められない種別は構文段で拒否済みのため最後尾（到達しない）に置く。
+fn alter_action_pass(action: &ValidatedAlterTable) -> u8 {
+    match action {
+        ValidatedAlterTable::DropColumn(_) => 0,
+        ValidatedAlterTable::AddColumn(_) => 1,
+        // 列属性変更（SET／DROP NOT NULL・SET／DROP DEFAULT）は ADD COLUMN の後に記述順で適用する
+        // （同一 pass 内は安定ソートで記述順を保つ）。
+        ValidatedAlterTable::AlterColumnSetNotNull(_)
+        | ValidatedAlterTable::AlterColumnDropNotNull(_)
+        | ValidatedAlterTable::AlterColumnSetDefault(_)
+        | ValidatedAlterTable::AlterColumnDropDefault(_) => ALTER_PASS_ATTRIBUTES,
+        _ => u8::MAX,
+    }
+}
+
+/// write txn 内の [`CatalogError`] を複数アクション経路のエラーへ写す。`TableNotFound` は
+/// txn を破棄した後で `42P01`／`42809` を判別するため未変換のまま返し、それ以外は各アクション
+/// 種別の写像 `map` で `SqlSurfaceError` にする。
+fn alter_in_txn_error(
+    e: CatalogError,
+    map: fn(CatalogError) -> SqlSurfaceError,
+) -> AlterCheckError {
+    match e {
+        CatalogError::TableNotFound(_) => AlterCheckError::Catalog(e),
+        other => AlterCheckError::Sql(map(other)),
+    }
+}
+
+/// 複数アクションの 1 個を write txn 内で適用する。前提・判定は単一アクション経路の
+/// `execute_alter_table_*` と同じで、スキーマは txn 内のもの（前のアクションの結果を含む）を使う。
+/// txn 内から `Storage` の write txn を開く API は呼ばない（書き込みゲートの再入で `55P03`
+/// になるため）。`ENUM` 型名の存在確認だけは読み取り専用の `storage` 経由で行う。
+fn apply_alter_action_in_txn(
+    storage: &Storage,
+    txn: &redb::WriteTransaction,
+    table_name: &str,
+    action: &ValidatedAlterTable,
+    limits: &SchemaLimits,
+) -> Result<(AlterTableAction, AlterApply), AlterCheckError> {
+    use crate::catalog::{get_table_schema_in_txn, get_table_schema_in_txn_impl};
+    match action {
+        ValidatedAlterTable::AddColumn(stmt) => {
+            // DROP COLUMN pass 直後は生存列 0 本の中間状態がありうる（全アクション適用後に検証する）。
+            let schema = get_table_schema_in_txn_impl(txn, table_name, false)
+                .map_err(|e| alter_in_txn_error(e, map_add_column_error))?;
+            if stmt.if_not_exists && schema.columns.iter().any(|c| c.name == stmt.column_name) {
+                return Ok((
+                    AlterTableAction::AddColumnSkipped {
+                        column_name: stmt.column_name.clone(),
+                    },
+                    AlterApply::Unchanged,
+                ));
+            }
+            let column =
+                build_add_column_def(storage, stmt, limits).map_err(AlterCheckError::Sql)?;
+            let max_columns =
+                Storage::prevalidate_add_column(table_name, &column, limits.max_table_columns())
+                    .map_err(|e| alter_in_txn_error(e, map_add_column_error))?;
+            Storage::alter_table_add_column_in_txn(txn, table_name, column, max_columns, true)
+                .map_err(|e| alter_in_txn_error(e, map_add_column_error))?;
+            Ok((
+                AlterTableAction::AddColumn {
+                    column_name: stmt.column_name.clone(),
+                },
+                AlterApply::Applied,
+            ))
+        }
+        ValidatedAlterTable::DropColumn(stmt) => {
+            let map = map_drop_alter_column_error;
+            Storage::validate_alter_column_target(table_name, &stmt.column_name)
+                .map_err(|e| alter_in_txn_error(e, map))?;
+            Storage::alter_table_drop_column_in_txn(txn, table_name, &stmt.column_name, true)
+                .map_err(|e| alter_in_txn_error(e, map))?;
+            Ok((
+                AlterTableAction::DropColumn {
+                    column_name: stmt.column_name.clone(),
+                },
+                AlterApply::Applied,
+            ))
+        }
+        ValidatedAlterTable::AlterColumnSetNotNull(stmt) => {
+            let map = map_alter_column_nullability_error;
+            Storage::validate_alter_column_target(table_name, &stmt.column_name)
+                .map_err(|e| alter_in_txn_error(e, map))?;
+            let apply =
+                Storage::alter_table_set_not_null_in_txn(txn, table_name, &stmt.column_name)
+                    .map_err(|e| alter_in_txn_error(e, map))?;
+            Ok((
+                AlterTableAction::AlterColumnSetNotNull {
+                    column_name: stmt.column_name.clone(),
+                },
+                apply,
+            ))
+        }
+        ValidatedAlterTable::AlterColumnDropNotNull(stmt) => {
+            let map = map_alter_column_nullability_error;
+            Storage::validate_alter_column_target(table_name, &stmt.column_name)
+                .map_err(|e| alter_in_txn_error(e, map))?;
+            let apply =
+                Storage::alter_table_drop_not_null_in_txn(txn, table_name, &stmt.column_name)
+                    .map_err(|e| alter_in_txn_error(e, map))?;
+            Ok((
+                AlterTableAction::AlterColumnDropNotNull {
+                    column_name: stmt.column_name.clone(),
+                },
+                apply,
+            ))
+        }
+        ValidatedAlterTable::AlterColumnSetDefault(stmt) => {
+            let map = map_alter_column_default_error;
+            let schema = get_table_schema_in_txn(txn, table_name)
+                .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
+            let probe = prepare_set_default_probe(&schema, stmt).map_err(AlterCheckError::Sql)?;
+            Storage::validate_alter_column_target(table_name, &stmt.column_name)
+                .map_err(|e| alter_in_txn_error(e, map))?;
+            let apply = Storage::alter_table_set_default_expr_in_txn(
+                txn,
+                table_name,
+                &stmt.column_name,
+                &probe.ty,
+                probe.default_expr.clone(),
+            )
+            .map_err(|e| alter_in_txn_error(e, map))?;
+            Ok((
+                AlterTableAction::AlterColumnSetDefault {
+                    column_name: stmt.column_name.clone(),
+                },
+                apply,
+            ))
+        }
+        ValidatedAlterTable::AlterColumnDropDefault(stmt) => {
+            let map = map_alter_column_default_error;
+            let schema = get_table_schema_in_txn(txn, table_name)
+                .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
+            let ty = schema
+                .columns
+                .iter()
+                .find(|c| c.name == stmt.column_name)
+                .map(|c| c.ty.clone())
+                .ok_or_else(|| {
+                    AlterCheckError::Sql(SqlSurfaceError::UndefinedColumn {
+                        name: stmt.column_name.clone(),
+                    })
+                })?;
+            Storage::validate_alter_column_target(table_name, &stmt.column_name)
+                .map_err(|e| alter_in_txn_error(e, map))?;
+            let apply = Storage::alter_table_set_default_expr_in_txn(
+                txn,
+                table_name,
+                &stmt.column_name,
+                &ty,
+                None,
+            )
+            .map_err(|e| alter_in_txn_error(e, map))?;
+            Ok((
+                AlterTableAction::AlterColumnDropDefault {
+                    column_name: stmt.column_name.clone(),
+                },
+                apply,
+            ))
+        }
+        // 構文段（`into_validated_alter_table`）が複数アクションから除外済みの種別。到達した場合は
+        // fail-closed で拒否する（何も適用しない）。
+        ValidatedAlterTable::Multiple(_)
+        | ValidatedAlterTable::AddUnique(_)
+        | ValidatedAlterTable::AddCheck(_)
+        | ValidatedAlterTable::DropConstraint(_)
+        | ValidatedAlterTable::AddForeignKey(_)
+        | ValidatedAlterTable::AddPrimaryKey(_)
+        | ValidatedAlterTable::AlterColumnType(_)
+        | ValidatedAlterTable::RenameColumn(_) => {
+            Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail: "multiple ALTER TABLE actions including this action are not supported"
+                    .to_string(),
+            }))
         }
     }
 }
@@ -976,28 +1269,14 @@ fn execute_alter_table_alter_column_drop_not_null(
     })
 }
 
-/// `ALTER TABLE <table> ALTER COLUMN <column> SET DEFAULT <式>` の実行本体（TABLE-39 (1)、
-/// Issue #1628）。前提は [`execute_alter_table_drop_column`] と同じ（`core.rs` が
-/// [`require_ddl_permission`] を先に通す）。変えるのは以後の書き込みで使う INSERT 既定値
-/// （`default_expr`）だけで、既存行の読み出し時補完値（`fill_value`）は変えない。
-///
-/// 判定順序: (1) テーブル存在確認（`42P01`／`42809`） (2) 列の取得（`42703`。保護列は
-/// catalog 側で拒否） (3) 既定値の生成（リテラル→[`set_column_default_value`]、時刻値関数→
-/// [`time_column_default_for_set`]。型不一致は `42804`） (4) `TIMESTAMPTZ` の正規化 (5) 値の束縛検証
-/// （`22003`／`22P02` 等） (6) 時刻既定値と FK `SET DEFAULT` の組の拒否（`0A000`）
-/// (7) `catalog::Storage::alter_table_set_default_expr`（単一 write txn 内で列型の一致・
-/// 再検証・FK 宣言整合〔`42830`〕を行い、拒否時は副作用ゼロ）。
-fn execute_alter_table_alter_column_set_default(
-    storage: &Storage,
+/// `SET DEFAULT` の検証済み列定義（`default_expr` のみ差し替え済み）を作る。列の取得
+/// （`42703`）・既定値の生成（型不一致 `42804`）・`TIMESTAMPTZ` 正規化・値の束縛検証・
+/// 時刻既定値と FK `SET DEFAULT` の組の拒否（`0A000`）を行う。単一アクション経路と、
+/// write txn 内のスキーマで呼ぶ複数アクション経路（Issue #1633）が共有する。
+fn prepare_set_default_probe(
+    schema: &TableSchema,
     stmt: &ValidatedAlterTableAlterColumnSetDefault,
-) -> Result<AlterTableOutcome, SqlSurfaceError> {
-    let schema = match storage.get_table_schema(&stmt.table_name) {
-        Ok(s) => s,
-        Err(CatalogError::TableNotFound(_)) => {
-            return Err(undefined_table_or_view(storage, &stmt.table_name));
-        }
-        Err(other) => return Err(map_drop_alter_column_error(other)),
-    };
+) -> Result<ColumnDef, SqlSurfaceError> {
     let column = schema
         .columns
         .iter()
@@ -1031,11 +1310,37 @@ fn execute_alter_table_alter_column_set_default(
         }
     }
     reject_time_default_set_default(&columns, schema.foreign_keys())?;
+    Ok(probe)
+}
+
+/// `ALTER TABLE <table> ALTER COLUMN <column> SET DEFAULT <式>` の実行本体（TABLE-39 (1)、
+/// Issue #1628）。前提は [`execute_alter_table_drop_column`] と同じ（`core.rs` が
+/// [`require_ddl_permission`] を先に通す）。変えるのは以後の書き込みで使う INSERT 既定値
+/// （`default_expr`）だけで、既存行の読み出し時補完値（`fill_value`）は変えない。
+///
+/// 判定順序: (1) テーブル存在確認（`42P01`／`42809`） (2) 列の取得（`42703`。保護列は
+/// catalog 側で拒否） (3) 既定値の生成（リテラル→[`set_column_default_value`]、時刻値関数→
+/// [`time_column_default_for_set`]。型不一致は `42804`） (4) `TIMESTAMPTZ` の正規化 (5) 値の束縛検証
+/// （`22003`／`22P02` 等） (6) 時刻既定値と FK `SET DEFAULT` の組の拒否（`0A000`）
+/// (7) `catalog::Storage::alter_table_set_default_expr`（単一 write txn 内で列型の一致・
+/// 再検証・FK 宣言整合〔`42830`〕を行い、拒否時は副作用ゼロ）。
+fn execute_alter_table_alter_column_set_default(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAlterColumnSetDefault,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    let schema = match storage.get_table_schema(&stmt.table_name) {
+        Ok(s) => s,
+        Err(CatalogError::TableNotFound(_)) => {
+            return Err(undefined_table_or_view(storage, &stmt.table_name));
+        }
+        Err(other) => return Err(map_drop_alter_column_error(other)),
+    };
+    let probe = prepare_set_default_probe(&schema, stmt)?;
     storage
         .alter_table_set_default_expr(
             &stmt.table_name,
             &stmt.column_name,
-            &column.ty,
+            &probe.ty,
             probe.default_expr.clone(),
         )
         .map_err(|e| match e {
@@ -2545,5 +2850,61 @@ mod tests {
                 map_add_check_or_foreign_key_error(b).wire_code()
             );
         }
+    }
+
+    /// `ADD COLUMN IF NOT EXISTS` の skip と複数アクションの全 no-op は世代を進めず、途中失敗は
+    /// カタログも世代も変えない。成功時だけ世代が 1 だけ進む（TABLE-36・TABLE-39 (5)、
+    /// Issue #1633）。
+    #[test]
+    fn alter_table_if_not_exists_and_multi_action_generation_contract() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::sql::allowlist::validate_alter_table;
+
+        let path = crate::test_util::temp_db::unique_db_path("ddl-alter-multi-gen");
+        let _guard = crate::test_util::temp_db::CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("a", ColumnType::Text, true)],
+            ))
+            .expect("create table");
+        let limits = SchemaLimits::default();
+        let run = |sql: &str| {
+            let v = validate_alter_table(sql).expect("valid shape");
+            execute_alter_table(&storage, &v, &limits)
+        };
+        let generation = || storage.table_generation("docs").expect("generation");
+        let schema = || storage.get_table_schema("docs").expect("schema");
+
+        // 既存列への IF NOT EXISTS は skip（世代・スキーマ不変）。
+        let (g0, s0) = (generation(), schema());
+        let out = run("ALTER TABLE docs ADD COLUMN IF NOT EXISTS a TEXT").expect("skip");
+        assert_eq!(
+            out.action,
+            AlterTableAction::AddColumnSkipped {
+                column_name: "a".to_string()
+            }
+        );
+        assert_eq!(generation(), g0);
+        assert_eq!(schema(), s0);
+
+        // 全アクションが no-op（skip と冪等な DROP DEFAULT）なら commit しない。
+        run("ALTER TABLE docs ADD COLUMN IF NOT EXISTS a TEXT, ALTER COLUMN a DROP DEFAULT")
+            .expect("all no-op");
+        assert_eq!(generation(), g0);
+
+        // 途中失敗（3 個目が存在しない列）は何も適用せず世代も進めない。
+        let err = run("ALTER TABLE docs ADD COLUMN b TEXT, ADD COLUMN c INTEGER, DROP COLUMN zz")
+            .expect_err("must fail");
+        assert_eq!(err.wire_code(), "42703");
+        assert_eq!(generation(), g0);
+        assert_eq!(schema(), s0);
+
+        // 成功は世代を 1 だけ進める（複数アクションでも bump は 1 回）。
+        run("ALTER TABLE docs ADD COLUMN b TEXT, ADD COLUMN c INTEGER DEFAULT 1")
+            .expect("multi success");
+        assert_eq!(generation(), g0 + 1);
+        assert_eq!(schema().columns.len(), 3);
     }
 }

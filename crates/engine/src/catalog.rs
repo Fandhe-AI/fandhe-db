@@ -1995,6 +1995,16 @@ impl From<CatalogError> for AlterCheckError {
     }
 }
 
+/// 単一の write txn 内で 1 アクションを適用した結果（Issue #1633）。`*_in_txn` 本体が返し、
+/// 単独 wrapper は `Applied` のときだけ世代 bump と commit を行う（`Unchanged` は冪等な
+/// no-op で commit しない既存契約）。複数アクション経路（`sql::ddl` の
+/// `execute_alter_table_multiple`）は全アクションが `Unchanged` のときだけ commit を省く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlterApply {
+    Applied,
+    Unchanged,
+}
+
 /// 列型変更の実行計画（`alter_column_type_with` の `decide` が返す。Issue #1560）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AlterPlan {
@@ -5260,8 +5270,16 @@ fn validate_default_value(column: &ColumnDef, default: &ColumnDefault) -> Result
 /// [`TableSchema::vector_dim`] が先頭列のみを見て後続列を黙殺する fail-open な
 /// 状態になり得るため、ここで拒否する（.claude/rules/security.md「不安全な設計」）。
 fn validate_schema(schema: &TableSchema) -> Result<()> {
+    validate_schema_impl(schema, true)
+}
+
+/// [`validate_schema`] の本体。`require_live` が `false` のときだけ「生存列 1 本以上」の検査を
+/// 省く。複数アクション `ALTER TABLE` の中間状態（`DROP COLUMN` 直後で `ADD COLUMN` 前）を
+/// 同一 write txn 内に限って許すための経路で、全アクション適用後に呼び出し側が
+/// `require_live = true` 相当の検証を必ず行う（Issue #1633）。
+fn validate_schema_impl(schema: &TableSchema, require_live: bool) -> Result<()> {
     validate_identifier(&schema.name)?;
-    if schema.columns.is_empty() {
+    if require_live && schema.columns.is_empty() {
         return Err(CatalogError::Invalid(
             "table must have at least one column".to_string(),
         ));
@@ -6944,6 +6962,12 @@ fn parse_foreign_key_section_v12<'a>(
 /// v2／v3（墓標の有無で選択）のまま、バイト列を変えない（既存ゴールデン
 /// テストへ影響しない）。
 fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
+    encode_schema_impl(schema, true)
+}
+
+/// [`encode_schema`] の本体。`require_live = false` は複数アクション `ALTER TABLE` の
+/// 中間状態専用（[`validate_schema_impl`] 参照）。
+fn encode_schema_impl(schema: &TableSchema, require_live: bool) -> Result<Vec<u8>> {
     // UNIQUE 制約の名前未確定（空名）分を確定する（設計 D2・Issue #1067）。
     // `encode_schema` は「スキーマ検証を集約する唯一の choke point」（本関数
     // ドキュメント参照）であるため、名前確定もここへ集約し、`Storage::
@@ -6957,7 +6981,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     // `assign_foreign_key_constraint_names` ドキュメント参照）。
     let schema = assign_foreign_key_constraint_names(schema);
     let schema = &schema;
-    validate_schema(schema)?;
+    validate_schema_impl(schema, require_live)?;
     let has_default = schema
         .columns
         .iter()
@@ -7395,7 +7419,18 @@ fn decode_schema_with_resolver(
     bytes: &[u8],
     resolve_enum: &mut dyn FnMut(&str) -> Result<Arc<EnumTypeDef>>,
 ) -> Result<TableSchema> {
-    decode_schema_body(table_name, bytes, resolve_enum).map_err(|e| match e {
+    decode_schema_with_resolver_impl(table_name, bytes, resolve_enum, true)
+}
+
+/// [`decode_schema_with_resolver`] の本体。`require_live = false` は複数アクション
+/// `ALTER TABLE` の中間状態（生存列 0 本）を読み戻す経路専用（Issue #1633）。
+fn decode_schema_with_resolver_impl(
+    table_name: &str,
+    bytes: &[u8],
+    resolve_enum: &mut dyn FnMut(&str) -> Result<Arc<EnumTypeDef>>,
+    require_live: bool,
+) -> Result<TableSchema> {
+    decode_schema_body(table_name, bytes, resolve_enum, require_live).map_err(|e| match e {
         // `FOREIGN KEY` の自己参照照合（`validate_foreign_keys`）が返す
         // `InvalidForeignKey` も、格納済み値の破損として同じく読み替える
         // （TABLE-17・TASK-205、Issue #907）。
@@ -7457,6 +7492,7 @@ fn decode_schema_body(
     table_name: &str,
     bytes: &[u8],
     resolve_enum: &mut dyn FnMut(&str) -> Result<Arc<EnumTypeDef>>,
+    require_live: bool,
 ) -> Result<TableSchema> {
     if bytes.len() > MAX_CATALOG_VALUE_LEN {
         return Err(CatalogError::Invalid(format!(
@@ -7960,7 +7996,7 @@ fn decode_schema_body(
     // デコード結果を再度検証する（列数上限・列名重複・識別子・墓標の不変条件）。
     // 手書きの不正データがフィールドごとの検証をすり抜けても、スキーマ全体の
     // 不変条件はここで担保する。
-    validate_schema(&schema)?;
+    validate_schema_impl(&schema, require_live)?;
     Ok(schema)
 }
 
@@ -8672,12 +8708,57 @@ impl Storage {
     pub fn alter_table_add_column_with_limit(
         &self,
         table_name: &str,
-        mut column: ColumnDef,
+        column: ColumnDef,
         max_columns: usize,
     ) -> Result<()> {
+        let max_columns = Self::prevalidate_add_column(table_name, &column, max_columns)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Self::alter_table_add_column_in_txn(&write_txn, table_name, column, max_columns, false)?;
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// 複数の ALTER アクションを単一の write txn で適用する共通入口（Issue #1633・TABLE-39 (5)
+    /// のポインタ）。`f` が txn 内で各アクションの `*_in_txn` 本体を順に呼ぶ。`f` が `Err` なら
+    /// txn は commit されず破棄され、何も適用されない。`f` が返す `bool` は「いずれかのアクションが
+    /// カタログを変更した」で、`false`（全アクションが冪等な no-op）なら commit も世代 bump も
+    /// 行わない。世代 bump は commit の直前に 1 回だけ行う（`USING PLAN` の世代照合の失効契約）。
+    pub(crate) fn alter_table_in_single_txn<T>(
+        &self,
+        table_name: &str,
+        f: impl FnOnce(&redb::WriteTransaction) -> std::result::Result<(T, bool), AlterCheckError>,
+    ) -> std::result::Result<T, AlterCheckError> {
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let (out, changed) = f(&write_txn)?;
+        if !changed {
+            return Ok(out);
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(out)
+    }
+
+    /// 列単位の ALTER（DROP COLUMN／SET・DROP NOT NULL／SET・DROP DEFAULT）共通の txn 前検査
+    /// （識別子・保護列名。Issue #1633 で複数アクション経路と共有するため切り出し）。
+    pub(crate) fn validate_alter_column_target(table_name: &str, column_name: &str) -> Result<()> {
+        validate_identifier(table_name)?;
+        validate_identifier(column_name)?;
+        if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
+            return Err(CatalogError::ProtectedColumn(column_name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// [`Self::alter_table_add_column_with_limit`] の txn 開始前検査（カタログ・行に依存しない
+    /// 判定のみ）。複数アクション経路（Issue #1633）も同じ検査を通す。有効列数上限を返す。
+    pub(crate) fn prevalidate_add_column(
+        table_name: &str,
+        column: &ColumnDef,
+        max_columns: usize,
+    ) -> Result<usize> {
         let max_columns = max_columns.min(MAX_COLUMN_COUNT);
         validate_identifier(table_name)?;
-        validate_column(&column)?;
+        validate_column(column)?;
         // 時刻値関数の DEFAULT は既存行の補完値を固定できず、読み出し時補完が常に失敗して
         // テーブルを読めなくするため、Rust API 直接呼び出しでも拒否する（多層防御。SQL 表層は
         // `sql::allowlist` が `0A000` で先に拒否する。SQL-37・Issue #1587、設計 D10）。
@@ -8697,8 +8778,8 @@ impl Storage {
                     .to_string(),
             ));
         }
-        if crate::row_codec::validate_column_default(&column).is_err()
-            || crate::row_codec::validate_column_fill_value(&column).is_err()
+        if crate::row_codec::validate_column_default(column).is_err()
+            || crate::row_codec::validate_column_fill_value(column).is_err()
         {
             return Err(CatalogError::Invalid(
                 "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT".to_string(),
@@ -8713,8 +8794,21 @@ impl Storage {
                 "NOT NULL column added via ALTER TABLE ADD COLUMN requires a DEFAULT".to_string(),
             ));
         }
-        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Ok(max_columns)
+    }
 
+    /// [`Self::alter_table_add_column_with_limit`] の write txn 内本体（begin・世代 bump・commit
+    /// を含まない。Issue #1633）。単独 wrapper と、複数アクションを単一 txn で適用する
+    /// `sql::ddl::execute_alter_table_multiple` の双方から呼ばれる。txn 前検査
+    /// （[`Self::prevalidate_add_column`]）は呼び出し側の責務。列名重複は
+    /// [`CatalogError::ColumnAlreadyExists`]、列数上限超過は [`CatalogError::TooManyColumns`]。
+    pub(crate) fn alter_table_add_column_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        mut column: ColumnDef,
+        max_columns: usize,
+        allow_empty_before: bool,
+    ) -> Result<()> {
         {
             // 呼び出し元が渡した `ColumnType::Enum` の `Arc<EnumTypeDef>` は信頼せず、
             // この write txn から見えるカタログ登録済みの定義で必ず置き換える
@@ -8722,7 +8816,7 @@ impl Storage {
             // `<enum>[]` 列も同様に登録済みの定義（語彙）へ置き換える（Issue #1357）。
             if let ColumnType::Array(array_ty) = &column.ty {
                 if let Some(def) = array_ty.enum_def() {
-                    let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
+                    let registered = get_enum_type_in_write_txn(write_txn, def.name())?;
                     column.ty = ColumnType::Array(
                         ArrayType::new_enum(registered, array_ty.max_len())?
                             .with_ndims(array_ty.ndims())?,
@@ -8739,7 +8833,7 @@ impl Storage {
                 }
             }
             if let ColumnType::Enum(def) = &column.ty {
-                column.ty = ColumnType::Enum(get_enum_type_in_write_txn(&write_txn, def.name())?);
+                column.ty = ColumnType::Enum(get_enum_type_in_write_txn(write_txn, def.name())?);
                 // txn 前の検査は呼び出し元の `Arc` の語彙で行っているため、登録済みの
                 // 定義へ置き換えた後で DEFAULT を再検証する。省略すると未登録ラベルが
                 // 既定値として永続化され、既存行の読み出し時補完が常に失敗する
@@ -8760,8 +8854,13 @@ impl Storage {
                     .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
                 guard.value().to_vec()
             };
-            let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
-            let mut schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
+            let mut resolve = |name: &str| get_enum_type_in_write_txn(write_txn, name);
+            let mut schema = decode_schema_with_resolver_impl(
+                table_name,
+                &existing,
+                &mut resolve,
+                !allow_empty_before,
+            )?;
             if schema.columns.iter().any(|c| c.name == column.name) {
                 return Err(CatalogError::ColumnAlreadyExists(column.name.clone()));
             }
@@ -8779,8 +8878,7 @@ impl Storage {
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
         }
-        bump_table_generation_in_txn(&write_txn, table_name)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        Ok(())
     }
 
     /// 既存列を削除する（`ALTER TABLE ... DROP COLUMN`。TABLE-19・TASK-203、
@@ -8809,6 +8907,43 @@ impl Storage {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()));
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Self::alter_table_drop_column_in_txn(&write_txn, table_name, column_name, false)?;
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// 複数アクション `ALTER TABLE` の最後に呼ぶ検証。txn 内の現在のスキーマに生存列が 1 本以上
+    /// あることを確かめ、0 本なら `Invalid`（SQL 表層で `42601`）で拒否する（Issue #1633。
+    /// `defer_live_check` で保留した中間検証の本検証。fail-closed）。
+    pub(crate) fn ensure_table_has_live_column_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+    ) -> Result<()> {
+        let table = write_txn.open_table(CATALOG_TABLE)?;
+        let existing: Vec<u8> = {
+            let guard = table
+                .get(table_name)?
+                .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
+            guard.value().to_vec()
+        };
+        let mut resolve = |name: &str| get_enum_type_in_write_txn(write_txn, name);
+        let schema = decode_schema_with_resolver_impl(table_name, &existing, &mut resolve, false)?;
+        validate_schema(&schema)
+    }
+
+    /// [`Self::alter_table_drop_column`] の write txn 内本体（begin・世代 bump・commit を含まない。
+    /// Issue #1633）。単独 wrapper と複数アクション経路が共有する。識別子・保護列名の検査は
+    /// 呼び出し側（wrapper／`sql::ddl`）の責務。
+    ///
+    /// `defer_live_check = true` は複数アクション経路専用で、削除後の生存列 0 本を中間状態として
+    /// 許す（後続の `ADD COLUMN` で埋まる場合のため）。この場合、呼び出し側は全アクション適用後に
+    /// [`Self::ensure_table_has_live_column_in_txn`] を必ず呼ぶ。`false` は従来どおり即時拒否。
+    pub(crate) fn alter_table_drop_column_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        column_name: &str,
+        defer_live_check: bool,
+    ) -> Result<()> {
         {
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             let existing: Vec<u8> = {
@@ -8817,8 +8952,13 @@ impl Storage {
                     .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
                 guard.value().to_vec()
             };
-            let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
-            let mut schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
+            let mut resolve = |name: &str| get_enum_type_in_write_txn(write_txn, name);
+            let mut schema = decode_schema_with_resolver_impl(
+                table_name,
+                &existing,
+                &mut resolve,
+                !defer_live_check,
+            )?;
 
             // 対象列の物理位置は、削除前のスキーマの物理走査（`.enumerate()`
             // の添字がそのまま物理位置に一致する。[`TableSchema::physical_slots`]
@@ -8916,14 +9056,13 @@ impl Storage {
 
             // `validate_schema`（`encode_schema` 内で呼ばれる）が「生存列 1 本以上」
             // を含む全ての不変条件を検証する。ここでの追加検証は不要。
-            let encoded = encode_schema(&schema)?;
+            let encoded = encode_schema_impl(&schema, !defer_live_check)?;
             table.insert(table_name, encoded.as_slice())?;
         }
         // 削除した列を含む索引宣言（TASK-206・INDEX-7、Issue #908）も同一 txn で
         // 削除する（[`delete_indexes_referencing_column_in_txn`] 参照）。
-        delete_indexes_referencing_column_in_txn(&write_txn, table_name, column_name)?;
-        bump_table_generation_in_txn(&write_txn, table_name)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        delete_indexes_referencing_column_in_txn(write_txn, table_name, column_name)?;
+        Ok(())
     }
 
     /// 既存テーブルの列名を変更する（`ALTER TABLE ... RENAME [COLUMN] <old> TO <new>`。
@@ -9342,14 +9481,28 @@ impl Storage {
     /// 成功時はカタログを更新し世代を bump する（nullability はキーの正準エンコードを
     /// 変えないため索引の失効は不要）。
     pub fn alter_table_set_not_null(&self, table_name: &str, column_name: &str) -> Result<()> {
-        validate_identifier(table_name)?;
-        validate_identifier(column_name)?;
-        if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
-            return Err(CatalogError::ProtectedColumn(column_name.to_string()));
-        }
+        Self::validate_alter_column_target(table_name, column_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        if Self::alter_table_set_not_null_in_txn(&write_txn, table_name, column_name)?
+            == AlterApply::Unchanged
         {
-            let schema = require_table_schema_write(&write_txn, table_name)?;
+            // 冪等な no-op。txn を commit せず破棄する（世代も進めない）。
+            return Ok(());
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(())
+    }
+
+    /// [`Self::alter_table_set_not_null`] の write txn 内本体（begin・世代 bump・commit を含まない。
+    /// Issue #1633）。識別子・保護列名の検査は呼び出し側の責務。
+    pub(crate) fn alter_table_set_not_null_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<AlterApply> {
+        {
+            let schema = require_table_schema_write(write_txn, table_name)?;
             let column = schema
                 .columns
                 .iter()
@@ -9357,7 +9510,7 @@ impl Storage {
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
             if !column.nullable {
                 // 既に NOT NULL（PK 構成列・VECTOR 列を含む）。冪等な no-op。
-                return Ok(());
+                return Ok(AlterApply::Unchanged);
             }
             if matches!(column.ty, ColumnType::Vector(_)) {
                 // 行コーデックのスカラー走査は VECTOR 列を常に `None` として返すため NULL 検査が
@@ -9379,7 +9532,7 @@ impl Storage {
                 if !fk.columns.iter().any(|c| c == column_name) || fk.parent_table == table_name {
                     continue;
                 }
-                let parent = match require_table_schema_write(&write_txn, &fk.parent_table) {
+                let parent = match require_table_schema_write(write_txn, &fk.parent_table) {
                     Ok(p) => p,
                     Err(CatalogError::TableNotFound(_)) | Err(CatalogError::WrongObjectKind(_)) => {
                         return Err(CatalogError::CorruptSchema(
@@ -9412,9 +9565,7 @@ impl Storage {
             let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
-        bump_table_generation_in_txn(&write_txn, table_name)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
-        Ok(())
+        Ok(AlterApply::Applied)
     }
 
     /// `ALTER TABLE ... ALTER COLUMN <column> DROP NOT NULL`（TABLE-39 (4) のポインタ、
@@ -9434,14 +9585,28 @@ impl Storage {
     /// 成功時はカタログを更新し世代を bump する（nullability はキーの正準エンコードを
     /// 変えないため索引の失効は不要）。
     pub fn alter_table_drop_not_null(&self, table_name: &str, column_name: &str) -> Result<()> {
-        validate_identifier(table_name)?;
-        validate_identifier(column_name)?;
-        if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
-            return Err(CatalogError::ProtectedColumn(column_name.to_string()));
-        }
+        Self::validate_alter_column_target(table_name, column_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        if Self::alter_table_drop_not_null_in_txn(&write_txn, table_name, column_name)?
+            == AlterApply::Unchanged
+        {
+            // 冪等な no-op。txn を commit せず破棄する（世代も進めない）。
+            return Ok(());
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(())
+    }
+
+    /// [`Self::alter_table_drop_not_null`] の write txn 内本体（begin・世代 bump・commit を含まない。
+    /// Issue #1633）。識別子・保護列名の検査は呼び出し側の責務。
+    pub(crate) fn alter_table_drop_not_null_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<AlterApply> {
         let updated = {
-            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let schema = require_table_schema_write(write_txn, table_name)?;
             let column = schema
                 .columns
                 .iter()
@@ -9455,7 +9620,7 @@ impl Storage {
             }
             if column.nullable {
                 // 既に nullable。冪等な no-op。
-                return Ok(());
+                return Ok(AlterApply::Unchanged);
             }
             if matches!(column.ty, ColumnType::Vector(_)) {
                 return Err(CatalogError::Invalid(
@@ -9473,7 +9638,7 @@ impl Storage {
         };
         // 参照先側の再検査（自己参照は上の `validate_schema` で検査済み。カタログから読める
         // のは変更前スキーマなので除外する）。`CATALOG_TABLE` のハンドルを持たない状態で呼ぶ。
-        for (child, fk) in referencing_foreign_keys_in_txn(&write_txn, table_name)? {
+        for (child, fk) in referencing_foreign_keys_in_txn(write_txn, table_name)? {
             if child.name == table_name || !fk.parent_columns.iter().any(|c| c == column_name) {
                 continue;
             }
@@ -9484,9 +9649,7 @@ impl Storage {
             let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
-        bump_table_generation_in_txn(&write_txn, table_name)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
-        Ok(())
+        Ok(AlterApply::Applied)
     }
 
     /// `ALTER TABLE ... ALTER COLUMN <column> SET／DROP DEFAULT`（TABLE-39 (1)(2)(6) のポインタ、
@@ -9522,14 +9685,35 @@ impl Storage {
         expected_ty: &ColumnType,
         default_expr: Option<ColumnDefault>,
     ) -> Result<()> {
-        validate_identifier(table_name)?;
-        validate_identifier(column_name)?;
-        if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
-            return Err(CatalogError::ProtectedColumn(column_name.to_string()));
-        }
+        Self::validate_alter_column_target(table_name, column_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        if Self::alter_table_set_default_expr_in_txn(
+            &write_txn,
+            table_name,
+            column_name,
+            expected_ty,
+            default_expr,
+        )? == AlterApply::Unchanged
         {
-            let schema = require_table_schema_write(&write_txn, table_name)?;
+            // 冪等な no-op。txn を commit せず破棄する（世代も進めない）。
+            return Ok(());
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(())
+    }
+
+    /// [`Self::alter_table_set_default_expr`] の write txn 内本体（begin・世代 bump・commit を含まない。
+    /// Issue #1633）。識別子・保護列名の検査は呼び出し側の責務。
+    pub(crate) fn alter_table_set_default_expr_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        column_name: &str,
+        expected_ty: &ColumnType,
+        default_expr: Option<ColumnDefault>,
+    ) -> Result<AlterApply> {
+        {
+            let schema = require_table_schema_write(write_txn, table_name)?;
             let column = schema
                 .columns
                 .iter()
@@ -9542,7 +9726,7 @@ impl Storage {
             }
             if column.default_expr == default_expr {
                 // 既に同じ既定値（既定値なしへの DROP を含む）。冪等な no-op。
-                return Ok(());
+                return Ok(AlterApply::Unchanged);
             }
             if default_expr.is_some() && matches!(column.ty, ColumnType::Vector(_)) {
                 return Err(CatalogError::Invalid(
@@ -9572,9 +9756,7 @@ impl Storage {
             let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
-        bump_table_generation_in_txn(&write_txn, table_name)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
-        Ok(())
+        Ok(AlterApply::Applied)
     }
 
     /// 既存テーブルへ（任意で名前付きの）CHECK 制約を追加する（TABLE-16・
@@ -11455,6 +11637,16 @@ pub(crate) fn get_table_schema_in_txn(
     read_txn: &impl crate::storage::read_source::ReadSource,
     table_name: &str,
 ) -> Result<TableSchema> {
+    get_table_schema_in_txn_impl(read_txn, table_name, true)
+}
+
+/// [`get_table_schema_in_txn`] の本体。`require_live = false` は複数アクション `ALTER TABLE` の
+/// 中間状態（`DROP COLUMN` 直後で生存列 0 本）を読む経路専用（Issue #1633）。
+pub(crate) fn get_table_schema_in_txn_impl(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    table_name: &str,
+    require_live: bool,
+) -> Result<TableSchema> {
     // `alter_table_add_column` と同様、redb キーとして引く前に識別子を検証する。
     // 不正形式の名前は `TableNotFound`（存在しない）ではなく `Invalid`（形式不正）で
     // 拒否し、両 API 間でエラーバリアントを揃える。
@@ -11473,7 +11665,7 @@ pub(crate) fn get_table_schema_in_txn(
     let bytes = guard.value().to_vec();
     drop(guard);
     let mut resolve = |name: &str| get_enum_type_in_read_txn(read_txn, name);
-    decode_schema_with_resolver(table_name, &bytes, &mut resolve)
+    decode_schema_with_resolver_impl(table_name, &bytes, &mut resolve, require_live)
 }
 
 /// [`Storage::list_tables`] が共有するトランザクションスコープの実装本体。
@@ -18639,7 +18831,7 @@ mod tests {
             let mut resolve =
                 |_: &str| -> Result<Arc<EnumTypeDef>> { Ok(EnumTypeDef::unresolved("mood")) };
             assert!(
-                decode_schema_body("docs", text.as_bytes(), &mut resolve).is_err(),
+                decode_schema_body("docs", text.as_bytes(), &mut resolve, true).is_err(),
                 "decode must reject: {text:?}"
             );
             assert!(

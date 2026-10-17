@@ -118,6 +118,10 @@ const MAX_INSERT_ROWS_PER_STATEMENT: usize = 1_000;
 /// 定数。Issue #945）と二重定義しないよう、同じ値をそちらから参照する。
 pub(crate) const MAX_IN_LIST_ITEMS: usize = crate::declarative_filter::MAX_IN_LIST_ITEMS;
 
+/// `ALTER TABLE` 1 文が持てるアクション数の上限（Issue #1633）。`MAX_COLUMN_COUNT` と同値で、
+/// 超過は確保前に `54000` で拒否する（無制限リソース確保の防止）。
+pub const MAX_ALTER_TABLE_ACTIONS: usize = MAX_COLUMN_COUNT;
+
 /// UPDATE の SET 句が持てる代入要素数の上限（SQL-17、TASK-191）。`MAX_COLUMN_COUNT`
 /// とは独立した定数にする（UPDATE は部分更新であり INSERT の列数上限とは意味論が
 /// 異なるため、将来どちらかだけを見直す際に互いへ波及しないようにする）。無制限
@@ -3605,9 +3609,9 @@ pub struct ValidatedTruncate {
 ///
 /// 受理する形は `ALTER TABLE <table> ADD COLUMN <column> <type> [NOT NULL]
 /// [DEFAULT <literal>] [;]`（列制約は順不同・各 1 回まで。Issue #1169）のみ
-/// （`IF NOT EXISTS`・複数 `ADD`・列制約 `UNIQUE`／`PRIMARY KEY`／`REFERENCES`／
-/// `CHECK`・`RETURNING`・`USING OPERATION_ID` の
-/// 併用はいずれも許可リスト外。構造検証段階ではカタログ照会を一切行わない
+/// （`ADD COLUMN` の直後の `IF NOT EXISTS` は Issue #1633 以降受理する。列制約 `UNIQUE`／
+/// `PRIMARY KEY`／`REFERENCES`／`CHECK`・`RETURNING`・`USING OPERATION_ID` の
+/// 併用は許可リスト外。複数アクションは [`ValidatedAlterTableMultiple`]。構造検証段階ではカタログ照会を一切行わない
 /// （テーブル・列の存在確認は `sql::ddl::execute_alter_table_add_column` が
 /// DDL 権限ゲート通過後に行う——権限の無い主体への存在オラクル化を防ぐ
 /// ため）。
@@ -3629,6 +3633,22 @@ pub struct ValidatedAlterTableAddColumn {
     /// 列型への適用可否（文字列系のみ。ENUM 解決後の判定を含む）は実行段が `42804` で判定する。
     /// **BREAKING CHANGE**: pub フィールド追加。
     pub collation: Option<crate::collation::Collation>,
+    /// `ADD COLUMN IF NOT EXISTS`（TABLE-36、Issue #1633）。`true` で同名の生存列が既にあれば
+    /// 何も変えずに成功する（実行段が判定。構造検証はカタログを参照しない）。
+    /// **BREAKING CHANGE**: pub フィールド追加。
+    pub if_not_exists: bool,
+}
+
+/// `ALTER TABLE <table> <アクション>[, <アクション>]*`（2 個以上。TABLE-39 (5) のポインタ、
+/// Issue #1633）。含められるのは列単位のカタログ操作（`ADD COLUMN`・`DROP COLUMN`・
+/// `ALTER COLUMN SET／DROP DEFAULT`・`SET／DROP NOT NULL`）に限り、1 つの write txn で
+/// 原子的に適用する（`sql::ddl::execute_alter_table_multiple`）。`actions` の各要素の
+/// `table_name` は `table_name` と同じ。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableMultiple {
+    pub table_name: String,
+    /// 記述順のアクション（2 個以上、[`MAX_ALTER_TABLE_ACTIONS`] 以下）。
+    pub actions: Vec<ValidatedAlterTable>,
 }
 
 /// 許可形状の構造判定を通過した `ALTER TABLE ... ADD [CONSTRAINT <name>] UNIQUE
@@ -3818,6 +3838,8 @@ pub struct ValidatedAlterTableAlterColumnDropDefault {
 /// 本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedAlterTable {
+    /// 複数アクション（Issue #1633）。**BREAKING CHANGE**: variant 追加。
+    Multiple(ValidatedAlterTableMultiple),
     AddColumn(ValidatedAlterTableAddColumn),
     AddUnique(ValidatedAlterTableAddUnique),
     AddCheck(ValidatedAlterTableAddCheck),
@@ -8858,20 +8880,56 @@ impl<'a> Parser<'a> {
     /// 受理する。`ALTER`／`TABLE`／`ADD`／`COLUMN`／`DROP`／`CONSTRAINT` は
     /// `lexer::Keyword` へ含めない設計方針（`lexer.rs` のモジュールドキュメント
     /// 参照）のため、いずれも `expect_contextual_keyword` で文脈的に照合する。
-    /// `IF NOT EXISTS`・複数 `ADD`／`DROP`・`ADD CONSTRAINT ... CHECK ... NOT VALID`／
+    /// 複数アクション・`ADD COLUMN IF NOT EXISTS` は Issue #1633 以降の受理範囲（下記参照）。
+    /// `ADD CONSTRAINT ... CHECK ... NOT VALID`／
     /// `PRIMARY KEY`・`DROP CONSTRAINT IF EXISTS`／`CASCADE`／
     /// `RESTRICT`・`DROP COLUMN IF EXISTS`・`USING OPERATION_ID` はいずれも
     /// 構造的に受理しない（設計 D6。`expect_end_of_statement` が余剰トークンとして
     /// `42601` で拒否するか、`ADD`／`DROP` の直後に許可形状以外が続いた時点で
     /// `expect_contextual_keyword` が拒否する）。
+    ///
+    /// **Issue #1633（TABLE-36・TABLE-39 (5) のポインタ）**: `ADD COLUMN` の直後の
+    /// `IF NOT EXISTS` を受理し、`,` 区切りの複数アクションを [`ParsedAlterTableShape::Multiple`]
+    /// として返す（1 個なら従来どおり単一 variant。単一アクションの挙動を構造的に変えない）。
+    /// アクション数は [`MAX_ALTER_TABLE_ACTIONS`] を超える前に `54000` で拒否する。複数アクション
+    /// に含められる種別の判定は [`into_validated_alter_table`] が行う。
     fn parse_alter_table(&mut self) -> Result<ParsedAlterTableShape, SqlSurfaceError> {
         self.expect_contextual_keyword("ALTER")?;
         self.expect_contextual_keyword("TABLE")?;
         let table_name = self.expect_ident()?;
+        let first = self.parse_alter_table_action(table_name.clone())?;
+        if !matches!(self.peek(), Some(Token::Punct(','))) {
+            return Ok(first);
+        }
+        let mut actions = vec![first];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            // 確保前に上限を検査する（無制限リソース確保の防止）。
+            if actions.len() >= MAX_ALTER_TABLE_ACTIONS {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "too many ALTER TABLE actions: limit is {MAX_ALTER_TABLE_ACTIONS}"
+                )));
+            }
+            actions.push(self.parse_alter_table_action(table_name.clone())?);
+        }
+        Ok(ParsedAlterTableShape::Multiple {
+            table_name,
+            actions,
+        })
+    }
+
+    /// `ALTER TABLE <table>` の直後に続くアクション 1 個ぶん（`ADD`／`DROP`／`ALTER COLUMN`／
+    /// `RENAME`）を読む。[`Self::parse_alter_table`] が `,` 区切りで繰り返し呼ぶ。
+    fn parse_alter_table_action(
+        &mut self,
+        table_name: String,
+    ) -> Result<ParsedAlterTableShape, SqlSurfaceError> {
         if self.peek_contextual_keyword("ADD") {
             self.advance();
             if self.peek_contextual_keyword("COLUMN") {
                 self.advance();
+                // `IF NOT EXISTS`（TABLE-36、Issue #1633）。列名の直前に置く。
+                let if_not_exists = self.parse_optional_if_not_exists();
                 let column_name = self.expect_ident()?;
                 // 予約列名（`id`／`tenant_id`／`visibility`。ASCII の大文字小文字を
                 // 無視）は `parse_create_table_column` と同じく構造検証段階で拒否する
@@ -8932,6 +8990,7 @@ impl<'a> Parser<'a> {
                         not_null: constraints.not_null,
                         default: constraints.default,
                         collation: constraints.collation,
+                        if_not_exists,
                     },
                 ));
             }
@@ -11616,11 +11675,17 @@ struct ParsedAlterTableAddColumnShape {
     not_null: bool,
     default: Option<InsertLiteral>,
     collation: Option<crate::collation::Collation>,
+    if_not_exists: bool,
 }
 
 /// 構文木（[`ValidatedAlterTable`] の元）。カタログ存在確認前の中間結果
 /// （Issue #1067・#1068）。[`Parser::parse_alter_table`] が返す 9 形状の和。
 enum ParsedAlterTableShape {
+    /// `,` 区切りの複数アクション（Issue #1633）。要素は常に 2 個以上の単一アクション。
+    Multiple {
+        table_name: String,
+        actions: Vec<ParsedAlterTableShape>,
+    },
     AddColumn(ParsedAlterTableAddColumnShape),
     AddUnique {
         table_name: String,
@@ -15176,8 +15241,49 @@ pub fn validate_alter_table_tokens(
     let mut p = Parser::new(tokens);
     let shape = p.parse_alter_table()?;
     p.expect_end_of_statement()?;
+    into_validated_alter_table(shape)
+}
 
+/// 構文木を [`ValidatedAlterTable`] へ変換する。複数アクション（Issue #1633）に含められない
+/// 種別はここで構文段（カタログ非参照）に拒否する: `RENAME` との混在は `42601`
+/// （TABLE-38 (6)・TABLE-39 (5) のポインタ）、制約の追加・削除と `ALTER COLUMN TYPE` との混在は
+/// `0A000`（未対応。fail-closed）。
+fn into_validated_alter_table(
+    shape: ParsedAlterTableShape,
+) -> Result<ValidatedAlterTable, SqlSurfaceError> {
     Ok(match shape {
+        ParsedAlterTableShape::Multiple {
+            table_name,
+            actions,
+        } => {
+            let mut validated = Vec::with_capacity(actions.len());
+            for action in actions {
+                match action {
+                    ParsedAlterTableShape::RenameColumn { .. } => {
+                        return Err(SqlSurfaceError::unsupported(
+                            "RENAME cannot be combined with other ALTER TABLE actions",
+                        ));
+                    }
+                    ParsedAlterTableShape::AddUnique { .. }
+                    | ParsedAlterTableShape::AddCheck { .. }
+                    | ParsedAlterTableShape::DropConstraint { .. }
+                    | ParsedAlterTableShape::AddForeignKey { .. }
+                    | ParsedAlterTableShape::AddPrimaryKey { .. }
+                    | ParsedAlterTableShape::AlterColumnType { .. }
+                    | ParsedAlterTableShape::Multiple { .. } => {
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "multiple ALTER TABLE actions including this action are not supported"
+                                .to_string(),
+                        });
+                    }
+                    other => validated.push(into_validated_alter_table(other)?),
+                }
+            }
+            ValidatedAlterTable::Multiple(ValidatedAlterTableMultiple {
+                table_name,
+                actions: validated,
+            })
+        }
         ParsedAlterTableShape::AddColumn(shape) => {
             ValidatedAlterTable::AddColumn(ValidatedAlterTableAddColumn {
                 table_name: shape.table_name,
@@ -15186,6 +15292,7 @@ pub fn validate_alter_table_tokens(
                 not_null: shape.not_null,
                 default: shape.default,
                 collation: shape.collation,
+                if_not_exists: shape.if_not_exists,
             })
         }
         ParsedAlterTableShape::AddUnique {
@@ -16164,7 +16271,6 @@ mod tests {
             "ALTER TABLE docs ALTER COLUMN a SET DEFAULT",
             "ALTER TABLE docs ALTER COLUMN id SET DEFAULT 1",
             "ALTER TABLE docs ALTER COLUMN id DROP DEFAULT",
-            "ALTER TABLE docs ALTER COLUMN a SET DEFAULT 1, ADD COLUMN b INTEGER",
             "ALTER TABLE docs ALTER COLUMN a DROP DEFAULT extra",
         ] {
             let err = validate_alter_table(sql).expect_err(sql);

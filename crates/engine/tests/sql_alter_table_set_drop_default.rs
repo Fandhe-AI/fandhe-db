@@ -465,7 +465,6 @@ fn unsupported_shapes_are_syntax_errors() {
     for sql in [
         "ALTER TABLE docs ALTER a SET DEFAULT 'x'",
         "ALTER TABLE docs ALTER COLUMN a SET DEFAULT",
-        "ALTER TABLE docs ALTER COLUMN a SET DEFAULT 'x', ALTER COLUMN n SET DEFAULT 1",
         "ALTER TABLE docs ALTER COLUMN a DROP DEFAULT extra",
     ] {
         assert_eq!(code(&core, &mut session, sql), "42601", "{sql}");

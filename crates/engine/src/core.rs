@@ -1587,6 +1587,10 @@ pub enum ParsedSql {
     ///
     /// **BREAKING CHANGE**（Issue #1632）: `ValidatedAlterTable::AlterColumnDropNotNull`
     /// variant（`ALTER COLUMN ... DROP NOT NULL`）を追加した。
+    ///
+    /// **BREAKING CHANGE**（Issue #1633）: `ValidatedAlterTable::Multiple`（複数アクション）
+    /// variant と `ValidatedAlterTableAddColumn::if_not_exists` を追加した。権限ゲート・
+    /// 明示トランザクション内 DDL の拒否は `AlterTable` 単位で判定するため新形状も同じ扱い。
     AlterTable(crate::sql::allowlist::ValidatedAlterTable),
     /// `CREATE VIEW <name> AS <body>`（TABLE-18・SQL-23・TASK-205、
     /// Issue #909）。DDL 実行権限ゲート（`sql::ddl::require_ddl_permission`）の
