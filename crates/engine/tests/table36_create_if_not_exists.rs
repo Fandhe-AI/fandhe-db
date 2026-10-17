@@ -161,6 +161,40 @@ fn index_if_not_exists_is_noop_for_existing_name() {
     assert_eq!(indexes[0].columns, vec!["lang".to_string()]);
 }
 
+/// `USING btree` と名前付き `IF NOT EXISTS` の併用（INDEX-9、Issue #1617）。
+#[test]
+fn index_if_not_exists_combines_with_using_btree() {
+    let (path, _guard) = fixture("t36-btree");
+    {
+        let core = core_at(&path);
+        let mut s = allowed_session();
+        run_ok(
+            &core,
+            &mut s,
+            "CREATE INDEX IF NOT EXISTS i2 ON docs USING btree (lang)",
+        );
+        run_ok(
+            &core,
+            &mut s,
+            "CREATE INDEX IF NOT EXISTS i2 ON docs USING btree (body)",
+        );
+        assert_eq!(
+            run_code(
+                &core,
+                &mut s,
+                "CREATE INDEX IF NOT EXISTS ON docs USING btree (lang)"
+            ),
+            "42601"
+        );
+    }
+    let indexes = Storage::open(&path)
+        .expect("reopen")
+        .list_indexes()
+        .expect("list");
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(indexes[0].columns, vec!["lang".to_string()]);
+}
+
 #[test]
 fn unsupported_shapes_are_rejected_with_42601() {
     let (path, _guard) = fixture("t36-reject");
