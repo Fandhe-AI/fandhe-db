@@ -25,7 +25,7 @@ use crate::sql::cast_value::{array_to_values, values_to_array};
 use crate::sql::udf_call::{ArraySubscript, BindEnv, BoundExpr, Expr, ExprType, ExprValue};
 
 /// 要素 1 個の分類（共通型の決定入力）。
-enum ItemClass {
+pub(super) enum ItemClass {
     /// 裸の `NULL`（どの型にもなれる）。
     Null,
     /// 型なし文字列リテラル（PG の unknown。決まった型の入力として解釈する）。
@@ -43,7 +43,7 @@ enum ItemClass {
 
 impl ItemClass {
     /// 共通型の決定に使う種別（`NULL`・型なしリテラルは持たない）。
-    fn kind(&self) -> Option<CastKind> {
+    pub(super) fn kind(&self) -> Option<CastKind> {
         match self {
             ItemClass::Null | ItemClass::Untyped => None,
             ItemClass::Kind(k) | ItemClass::Bound { kind: k, .. } => Some(*k),
@@ -52,7 +52,7 @@ impl ItemClass {
 }
 
 /// 配列に収められない型・組を示す `0A000`。
-fn unsupported(detail: &str) -> SqlSurfaceError {
+pub(super) fn unsupported(detail: &str) -> SqlSurfaceError {
     SqlSurfaceError::FeatureNotSupported {
         detail: detail.to_string(),
     }
@@ -60,7 +60,7 @@ fn unsupported(detail: &str) -> SqlSurfaceError {
 
 /// 要素 1 個を分類する。AST だけで型が決まるもの（リテラル・明示 CAST）以外は 1 度だけ束縛して
 /// 静的な型を得て、その束縛結果を [`ItemClass::Bound`] に持たせる（ノード予算は実の予算を消費する）。
-fn classify_item(
+pub(super) fn classify_item(
     item: &Expr,
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
@@ -99,7 +99,7 @@ fn classify_item(
 }
 
 /// 要素の種別の集合から共通の要素型を決める（PG の `select_common_type` の部分集合）。
-fn common_element_type(kinds: &[CastKind]) -> Result<CastType, SqlSurfaceError> {
+pub(super) fn common_element_type(kinds: &[CastKind]) -> Result<CastType, SqlSurfaceError> {
     use CastKind as K;
     let Some(&first) = kinds.first() else {
         // 型を持つ要素が無い（`ARRAY[NULL]`・`ARRAY['a']`）。PG は unknown を text に解決する。
@@ -252,7 +252,7 @@ fn elem_expr_type(elem: ArrayElemType) -> Result<ExprType, SqlSurfaceError> {
 /// 添字・境界の式を int4 へ束縛する。整数型（smallint／integer／bigint）・整数リテラル・型なし
 /// 文字列リテラル・`NULL` だけを受理し、float／numeric は丸めの意味論を持ち込まず `0A000`、
 /// それ以外の型は PG と同じ `42804`。
-fn bind_subscript_index(
+pub(super) fn bind_subscript_index(
     expr: &Expr,
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
@@ -372,7 +372,7 @@ pub(super) fn bind_subscript(
 }
 
 /// 配列要素として複製される可変長ペイロードのバイト長（複製前の累計上限検査用）。
-fn payload_len(v: &ExprValue<'_>) -> usize {
+pub(super) fn payload_len(v: &ExprValue<'_>) -> usize {
     match v {
         ExprValue::Text(s) | ExprValue::Json(s) | ExprValue::JsonText(s) => s.len(),
         ExprValue::Bytes(b) => b.len(),
@@ -381,7 +381,7 @@ fn payload_len(v: &ExprValue<'_>) -> usize {
 }
 
 /// 評価値を所有型へ写す（配列の要素として保持するため）。
-fn own(v: ExprValue<'_>) -> Result<ExprValue<'static>, SqlSurfaceError> {
+pub(super) fn own(v: ExprValue<'_>) -> Result<ExprValue<'static>, SqlSurfaceError> {
     use std::borrow::Cow;
     Ok(match v {
         ExprValue::Scalar(x) => ExprValue::Scalar(x),
@@ -408,7 +408,7 @@ fn own(v: ExprValue<'_>) -> Result<ExprValue<'static>, SqlSurfaceError> {
 }
 
 /// 評価値の整数（int4 へ変換済みの添字・境界）を `i64` へ。NULL は `None`。
-fn index_value(v: &ExprValue<'_>) -> Result<Option<i64>, SqlSurfaceError> {
+pub(super) fn index_value(v: &ExprValue<'_>) -> Result<Option<i64>, SqlSurfaceError> {
     match v {
         ExprValue::Null => Ok(None),
         ExprValue::Scalar(x) if x.is_finite() && x.fract() == 0.0 && x.abs() <= 2_147_483_648.0 => {
@@ -421,7 +421,7 @@ fn index_value(v: &ExprValue<'_>) -> Result<Option<i64>, SqlSurfaceError> {
 }
 
 /// 配列値の取り出し（NULL は `None`）。
-fn array_of(v: ExprValue<'_>) -> Result<Option<ArrayValue>, SqlSurfaceError> {
+pub(super) fn array_of(v: ExprValue<'_>) -> Result<Option<ArrayValue>, SqlSurfaceError> {
     match v {
         ExprValue::Null => Ok(None),
         ExprValue::Array(a) => Ok(Some(a)),

@@ -7133,6 +7133,12 @@ impl<'a> Parser<'a> {
         let is_json_fn_call = crate::sql::udf_call::json_fn_from_name(&name).is_some()
             || crate::sql::udf_call::is_deferred_json_srf_name(&name)
             || crate::sql::jsonpath_fn::is_jsonpath_fn_name(&name.to_ascii_lowercase());
+        let is_array_fn_call = crate::sql::array_fn::is_array_fn_name(&name.to_ascii_lowercase());
+        if is_array_fn_call && self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "array functions are not supported in a CHECK constraint".to_string(),
+            });
+        }
         if is_json_fn_call && self.in_check_body {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: "jsonb functions are not supported in a CHECK constraint".to_string(),
@@ -7145,6 +7151,7 @@ impl<'a> Parser<'a> {
             || name.eq_ignore_ascii_case("justify_interval")
             || self.const_expr_null_args
             || is_json_fn_call
+            || is_array_fn_call
             || crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase());
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {

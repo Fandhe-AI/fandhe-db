@@ -574,6 +574,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::ArrayIndex { .. }
         | BoundExpr::ArraySlice { .. }
         | BoundExpr::JsonTextFn(_)
+        | BoundExpr::ArrayFn(_)
         | BoundExpr::JsonPathFn(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::JsonAccess { .. }
@@ -707,6 +708,7 @@ fn compile_node(
         | BoundExpr::ArrayIndex { .. }
         | BoundExpr::ArraySlice { .. }
         | BoundExpr::JsonTextFn(_)
+        | BoundExpr::ArrayFn(_)
         | BoundExpr::JsonPathFn(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::JsonAccess { .. }

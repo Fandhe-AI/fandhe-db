@@ -319,6 +319,188 @@ impl ArrayValue {
     }
 }
 
+/// 配列関数（`sql::array_fn`。TABLE-35・Issue #1604）が使う、要素型ごとの native 操作。
+///
+/// 式評価の数値表現（f64）を経由すると 2^53 超の bigint 要素が `22003` になるため、連結・検索・
+/// 除去・文字列化は `ArrayValue` の variant ごとの native 値で行う。添字アクセスは使わず
+/// `get()`／イテレータで走査する（評価経路の panic 防止）。
+impl ArrayValue {
+    /// 同じ要素型の配列を連結する。要素型が異なれば `None`（呼び出し側は束縛段で型を
+    /// 揃えているため到達しない。到達時は `Internal` として fail-closed にする）。
+    pub(crate) fn concat(&self, other: &ArrayValue) -> Option<ArrayValue> {
+        fn join<T: Clone>(a: &[Option<T>], b: &[Option<T>]) -> Vec<Option<T>> {
+            let mut v = Vec::with_capacity(a.len().saturating_add(b.len()));
+            v.extend_from_slice(a);
+            v.extend_from_slice(b);
+            v
+        }
+        Some(match (self, other) {
+            (ArrayValue::Text(a), ArrayValue::Text(b)) => ArrayValue::Text(join(a, b)),
+            (ArrayValue::Bool(a), ArrayValue::Bool(b)) => ArrayValue::Bool(join(a, b)),
+            (ArrayValue::Integer(a), ArrayValue::Integer(b)) => ArrayValue::Integer(join(a, b)),
+            (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => ArrayValue::BigInt(join(a, b)),
+            (ArrayValue::Real(a), ArrayValue::Real(b)) => ArrayValue::Real(join(a, b)),
+            (ArrayValue::Double(a), ArrayValue::Double(b)) => ArrayValue::Double(join(a, b)),
+            (ArrayValue::Date(a), ArrayValue::Date(b)) => ArrayValue::Date(join(a, b)),
+            (ArrayValue::Timestamp(a), ArrayValue::Timestamp(b)) => {
+                ArrayValue::Timestamp(join(a, b))
+            }
+            (ArrayValue::Uuid(a), ArrayValue::Uuid(b)) => ArrayValue::Uuid(join(a, b)),
+            (ArrayValue::Numeric(a), ArrayValue::Numeric(b)) => ArrayValue::Numeric(join(a, b)),
+            (ArrayValue::Bytea(a), ArrayValue::Bytea(b)) => ArrayValue::Bytea(join(a, b)),
+            (ArrayValue::Json(a), ArrayValue::Json(b)) => ArrayValue::Json(join(a, b)),
+            (ArrayValue::Jsonb(a), ArrayValue::Jsonb(b)) => ArrayValue::Jsonb(join(a, b)),
+            (ArrayValue::Enum(a), ArrayValue::Enum(b)) => ArrayValue::Enum(join(a, b)),
+            _ => return None,
+        })
+    }
+
+    /// 可変長要素（TEXT／JSON／JSONB／ENUM／BYTEA）の本文バイト長の合計（結合結果の累計上限検査用）。
+    pub(crate) fn variable_payload_len(&self) -> usize {
+        match self {
+            ArrayValue::Text(v)
+            | ArrayValue::Json(v)
+            | ArrayValue::Jsonb(v)
+            | ArrayValue::Enum(v) => v
+                .iter()
+                .flatten()
+                .fold(0usize, |acc, s| acc.saturating_add(s.len())),
+            ArrayValue::Bytea(v) => v
+                .iter()
+                .flatten()
+                .fold(0usize, |acc, b| acc.saturating_add(b.len())),
+            _ => 0,
+        }
+    }
+
+    /// 位置 `i`（0 始まり）の要素が、1 要素配列 `needle` の要素と等しいか。`IS NOT DISTINCT FROM`
+    /// の意味（NULL どうしは等しい）。`REAL`／`DOUBLE` は NaN どうしを等しいとみなし、`NUMERIC` は
+    /// 末尾ゼロを無視した値、`JSONB` は正規化テキストで比較する（`equality_payload` の値等価と整合）。
+    /// `JSON` 要素・要素型の不一致・範囲外は等価を定義できず `Err`（束縛段が先に拒否する）。
+    fn element_equals(&self, i: usize, needle: &ArrayValue) -> Result<bool> {
+        fn eq<T>(
+            a: &[Option<T>],
+            i: usize,
+            b: &[Option<T>],
+            f: impl Fn(&T, &T) -> bool,
+        ) -> Result<bool> {
+            let (Some(x), Some(y)) = (a.get(i), b.first()) else {
+                return Err(RowCodecError::Invalid(
+                    "array element position is out of range".to_string(),
+                ));
+            };
+            Ok(match (x, y) {
+                (None, None) => true,
+                (Some(p), Some(q)) => f(p, q),
+                _ => false,
+            })
+        }
+        match (self, needle) {
+            (ArrayValue::Text(a), ArrayValue::Text(b))
+            | (ArrayValue::Enum(a), ArrayValue::Enum(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::Bool(a), ArrayValue::Bool(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::Integer(a), ArrayValue::Integer(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::Real(a), ArrayValue::Real(b)) => {
+                eq(a, i, b, |x, y| x == y || (x.is_nan() && y.is_nan()))
+            }
+            (ArrayValue::Double(a), ArrayValue::Double(b)) => {
+                eq(a, i, b, |x, y| x == y || (x.is_nan() && y.is_nan()))
+            }
+            (ArrayValue::Date(a), ArrayValue::Date(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::Timestamp(a), ArrayValue::Timestamp(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::Uuid(a), ArrayValue::Uuid(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::Numeric(a), ArrayValue::Numeric(b)) => eq(a, i, b, |x, y| {
+                crate::constraint::canonical_numeric_parts(*x)
+                    == crate::constraint::canonical_numeric_parts(*y)
+            }),
+            (ArrayValue::Bytea(a), ArrayValue::Bytea(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::Jsonb(a), ArrayValue::Jsonb(b)) => eq(a, i, b, |x, y| {
+                match (
+                    crate::json::canonical_equality_text(x),
+                    crate::json::canonical_equality_text(y),
+                ) {
+                    (Ok(p), Ok(q)) => p == q,
+                    _ => false,
+                }
+            }),
+            _ => Err(RowCodecError::Invalid(
+                "array element type has no equality for this operation".to_string(),
+            )),
+        }
+    }
+
+    /// `from`（0 始まり）以降で最初に `needle`（1 要素配列）と等しい要素の位置（0 始まり）。
+    pub(crate) fn position_of(&self, needle: &ArrayValue, from: usize) -> Result<Option<usize>> {
+        for i in from..self.len() {
+            if self.element_equals(i, needle)? {
+                return Ok(Some(i));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `needle`（1 要素配列）と等しい要素をすべて除いた配列（`array_remove`）。
+    pub(crate) fn remove_all(&self, needle: &ArrayValue) -> Result<ArrayValue> {
+        let mut keep = Vec::with_capacity(self.len());
+        for i in 0..self.len() {
+            keep.push(!self.element_equals(i, needle)?);
+        }
+        Ok(self.retain_where(&keep))
+    }
+
+    /// `keep` が真の位置だけを残した配列（`keep` が短ければ超過分は落ちる）。
+    fn retain_where(&self, keep: &[bool]) -> ArrayValue {
+        fn pick<T: Clone>(v: &[Option<T>], keep: &[bool]) -> Vec<Option<T>> {
+            v.iter()
+                .zip(keep)
+                .filter(|(_, k)| **k)
+                .map(|(e, _)| e.clone())
+                .collect()
+        }
+        match self {
+            ArrayValue::Text(v) => ArrayValue::Text(pick(v, keep)),
+            ArrayValue::Bool(v) => ArrayValue::Bool(pick(v, keep)),
+            ArrayValue::Integer(v) => ArrayValue::Integer(pick(v, keep)),
+            ArrayValue::BigInt(v) => ArrayValue::BigInt(pick(v, keep)),
+            ArrayValue::Real(v) => ArrayValue::Real(pick(v, keep)),
+            ArrayValue::Double(v) => ArrayValue::Double(pick(v, keep)),
+            ArrayValue::Date(v) => ArrayValue::Date(pick(v, keep)),
+            ArrayValue::Timestamp(v) => ArrayValue::Timestamp(pick(v, keep)),
+            ArrayValue::Uuid(v) => ArrayValue::Uuid(pick(v, keep)),
+            ArrayValue::Numeric(v) => ArrayValue::Numeric(pick(v, keep)),
+            ArrayValue::Bytea(v) => ArrayValue::Bytea(pick(v, keep)),
+            ArrayValue::Json(v) => ArrayValue::Json(pick(v, keep)),
+            ArrayValue::Jsonb(v) => ArrayValue::Jsonb(pick(v, keep)),
+            ArrayValue::Enum(v) => ArrayValue::Enum(pick(v, keep)),
+        }
+    }
+
+    /// 各要素の出力関数のテキスト（`array_to_string` の入力。配列リテラルの引用・エスケープは
+    /// 行わない。NULL 要素は `None`）。`BOOLEAN` は `t`／`f`、`BYTEA` は `\x` 16 進。
+    pub(crate) fn element_texts(&self) -> Vec<Option<String>> {
+        fn map<T>(v: &[Option<T>], f: impl Fn(&T) -> String) -> Vec<Option<String>> {
+            v.iter().map(|e| e.as_ref().map(&f)).collect()
+        }
+        match self {
+            ArrayValue::Text(v)
+            | ArrayValue::Json(v)
+            | ArrayValue::Jsonb(v)
+            | ArrayValue::Enum(v) => v.clone(),
+            ArrayValue::Bool(v) => map(v, |b| if *b { "t" } else { "f" }.to_string()),
+            ArrayValue::Integer(v) => map(v, |x| x.to_string()),
+            ArrayValue::BigInt(v) => map(v, |x| x.to_string()),
+            ArrayValue::Real(v) => map(v, |x| crate::scalar_float::format_real(*x)),
+            ArrayValue::Double(v) => map(v, |x| crate::scalar_float::format_double(*x)),
+            ArrayValue::Date(v) => map(v, |x| crate::datetime::format_date(*x)),
+            ArrayValue::Timestamp(v) => map(v, |x| crate::datetime::format_timestamp(*x)),
+            ArrayValue::Uuid(v) => map(v, |x| x.to_string()),
+            ArrayValue::Numeric(v) => map(v, |d| d.to_string()),
+            ArrayValue::Bytea(v) => map(v, |b| crate::bytea::format_hex_text(b)),
+        }
+    }
+}
+
 /// [`ArrayValue::to_pg_text`] の TEXT 要素 1 個の引用要否判定・エスケープ処理。
 fn quote_pg_array_text_elem(s: &str) -> String {
     let needs_quote = s.is_empty()
