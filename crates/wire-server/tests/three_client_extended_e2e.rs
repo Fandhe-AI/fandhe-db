@@ -430,6 +430,66 @@ fn seed_db() -> (PathBuf, temp_db::CleanupGuard) {
     (path, guard)
 }
 
+/// 型 OID 指定・NULL パラメータ・OID 0 の推論の検証専用 DB（Issue #2440。WIRE-24・SQL-45 の
+/// ポインタ）。表 `param_items` は nullable の数値・文字列・真偽値・日付列と NOT NULL の
+/// `req` を持つ。tenant-a は Public（id 1）と Private（id 2）、tenant-b は Private（id 3）の
+/// 行を持ち、tenant-c は行を持たない（3 テナントで応答が揃うことの確認用）。
+fn seed_param_types_db() -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("three-client-param-types");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "param_items",
+            vec![
+                ColumnDef::new("n", ColumnType::Integer, true),
+                ColumnDef::new("b", ColumnType::BigInt, true),
+                ColumnDef::new("d", ColumnType::Double, true),
+                ColumnDef::new("r", ColumnType::Real, true),
+                ColumnDef::new("s", ColumnType::Text, true),
+                ColumnDef::new("flag", ColumnType::Boolean, true),
+                ColumnDef::new("req", ColumnType::Text, false),
+                ColumnDef::new("day", ColumnType::Date, true),
+            ],
+        ))
+        .expect("create param_items");
+    let ctx_a =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let ctx_b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let row = |n: i32, s: &str| {
+        vec![
+            Value::Integer(n),
+            Value::BigInt(i64::from(n) * 10),
+            Value::Double(1.5),
+            Value::Real(0.5),
+            Value::Text(s.to_string()),
+            Value::Bool(true),
+            Value::Text("req".to_string()),
+            Value::Null,
+        ]
+    };
+    for (ctx, id, vis, n, label) in [
+        (&ctx_a, 1u64, Visibility::Public, 10, "pub-a"),
+        (&ctx_a, 2, Visibility::Private, 20, "priv-a"),
+        (&ctx_b, 3, Visibility::Private, 30, "priv-b"),
+    ] {
+        engine::tenant::insert_typed_row(
+            &storage,
+            "param_items",
+            ctx,
+            id,
+            vis,
+            &row(n, label),
+            &op(&format!("ext-e2e-param-op-{id}")),
+        )
+        .expect("insert param_items row");
+    }
+    (path, guard)
+}
+
 // --- クライアント実行ヘルパー -----------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -454,6 +514,15 @@ struct Opts {
     /// node pg のみ: `params` を `numeric_send` の hex として `Buffer`（format 1・宣言
     /// OID 0）で束縛する。
     binary_hex_params: bool,
+    /// psycopg のみ（Issue #2440。WIRE-24 のポインタ）: 位置ごとの型付きパラメータ
+    /// （`WIRE_PARAMS_TYPED` の JSON。本ファイルの定数のみ）。`params` とは排他。
+    typed_json: Option<&'static str>,
+    /// node pg のみ: Parse で宣言する型 OID（`query({ types })`）。値は `params` の text。
+    param_types: Option<&'static str>,
+    /// node pg のみ: NULL を含みうる値の JSON 配列（`WIRE_PARAMS_NULLABLE`）。`params` とは排他。
+    nullable_json: Option<&'static str>,
+    /// psycopg／node pg: 1 つ目の文が失敗しても同じ接続で実行する 2 つ目の文。
+    sql_after: Option<&'static str>,
 }
 
 /// numeric の 10 進テキスト（例 `-1.01`）を PG の `numeric_send` と同じバイト列（hex）へ
@@ -586,7 +655,17 @@ fn spawn_psycopg_ext(
         .env("WIRE_PASSWORD", password)
         .env("WIRE_SQL", sql);
     assert!(!opts.binary_hex_params, "binary_hex_params is node pg only");
-    if opts.decimal_params {
+    assert!(
+        opts.param_types.is_none() && opts.nullable_json.is_none(),
+        "param_types/nullable_json are node pg only"
+    );
+    if let Some(typed) = opts.typed_json {
+        assert!(
+            params.is_empty() && !opts.decimal_params && !opts.int_params,
+            "typed_json is exclusive with params"
+        );
+        cmd.env("WIRE_PARAMS_TYPED", typed);
+    } else if opts.decimal_params {
         assert!(
             !opts.int_params,
             "decimal_params and int_params are exclusive"
@@ -598,6 +677,9 @@ fn spawn_psycopg_ext(
         cmd.env("WIRE_PARAMS", json_string_array(params));
     } else {
         cmd.env("WIRE_EXTENDED_NOPARAM", "1");
+    }
+    if let Some(after) = opts.sql_after {
+        cmd.env("WIRE_SQL_AFTER", after);
     }
     if opts.binary {
         cmd.env("WIRE_BINARY", "1");
@@ -624,10 +706,19 @@ fn spawn_pg_ext(
         .env("WIRE_PASSWORD", password)
         .env("WIRE_SQL", sql);
     assert!(
-        !opts.decimal_params && !opts.int_params,
-        "decimal_params/int_params are psycopg only"
+        !opts.decimal_params && !opts.int_params && opts.typed_json.is_none(),
+        "decimal_params/int_params/typed_json are psycopg only"
     );
-    if opts.binary_hex_params {
+    if let Some(types) = opts.param_types {
+        cmd.env("WIRE_PARAM_TYPES", types);
+    }
+    if let Some(after) = opts.sql_after {
+        cmd.env("WIRE_SQL_AFTER", after);
+    }
+    if let Some(nullable) = opts.nullable_json {
+        assert!(params.is_empty(), "nullable_json is exclusive with params");
+        cmd.env("WIRE_PARAMS_NULLABLE", nullable);
+    } else if opts.binary_hex_params {
         cmd.env("WIRE_PARAMS_BINARY_HEX", json_string_array(params));
     } else if !params.is_empty() {
         cmd.env("WIRE_PARAMS", json_string_array(params));
@@ -656,6 +747,13 @@ fn spawn_client(
             assert!(
                 !opts.decimal_params && !opts.binary_hex_params && !opts.int_params,
                 "psql has no binary parameter mode"
+            );
+            assert!(
+                opts.typed_json.is_none()
+                    && opts.param_types.is_none()
+                    && opts.nullable_json.is_none()
+                    && opts.sql_after.is_none(),
+                "psql sends OID 0 only and has no NULL/typed/after mode"
             );
             spawn_psql_bind(port, user, password, sql, params, false)
         }
@@ -701,24 +799,43 @@ fn expect_sqlstate(
     opts: Opts,
     sqlstate: &str,
 ) {
+    let _ = rejected_stderr(client, port, user, password, sql, params, opts, sqlstate);
+}
+
+/// [`expect_sqlstate`] と同じ検査をしたうえで、拒否応答の stderr を返す（テナント間・
+/// 宣言有無間で応答が一致することの比較に使う。Issue #2440）。
+#[allow(clippy::too_many_arguments)] // 呼び出し側の可読性のため run_ext と同じ引数並びを保つ
+fn rejected_stderr(
+    client: Client,
+    port: u16,
+    user: &str,
+    password: &str,
+    sql: &str,
+    params: &[&str],
+    opts: Opts,
+    sqlstate: &str,
+) -> String {
     let output = if client == Client::Psql {
         spawn_psql_bind(port, user, password, sql, params, true)
     } else {
         spawn_client(client, port, user, password, sql, params, opts)
     };
     assert!(
-        !output.status.success(),
+        !output.status.success() || opts.sql_after.is_some(),
         "{client:?} must exit non-zero for a rejected statement: `{sql}`"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(
         stderr.contains(sqlstate),
         "{client:?}: expected SQLSTATE {sqlstate} in stderr, got: {stderr}"
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        !String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|l| !l.starts_with("after:") && !l.trim().is_empty()),
         "{client:?}: rejected statement must not return rows"
     );
+    stderr
 }
 
 /// `<型名>:` プレフィックスを各セルから取り除く（psql の出力には無いため no-op）。
@@ -1102,7 +1219,10 @@ fn three_clients_keep_fail_closed_contracts_on_extended_path() {
             "0A000",
         );
     }
-    // 非 text スロットのバイナリパラメータ（Python int）は 0A000。
+    // Python int（int2 を宣言）を TEXT 列と比較する Parse は、宣言が文脈の型へ変換できない
+    // ため Parse の段で 42883 になる（Issue #2437。WIRE-24 (1)・SQL-45 のポインタ）。#2437 より前は
+    // バイナリ非対応スロットの 0A000 が先に返っていた。0A000 側の確認は
+    // `psycopg_natural_binary_params_outside_the_compat_table_fail_closed` が担う。
     let int_params = Opts {
         int_params: true,
         ..d
@@ -1115,7 +1235,7 @@ fn three_clients_keep_fail_closed_contracts_on_extended_path() {
         "SELECT label FROM typed_items WHERE label = $1 LIMIT 10",
         &["1"],
         int_params,
-        "0A000",
+        "42883",
     );
 
     // RLS: tenant-a の Private 行は alice のみに見える。
@@ -1532,4 +1652,929 @@ fn node_binary_fixture_bytes_are_utf8_safe() {
     for v in [A_R, B_R] {
         assert_eq!(f32::from_bits(v.to_bits()), v);
     }
+}
+// --- Issue #2440: 型 OID 指定・NULL パラメータ・OID 0 の推論（WIRE-24・SQL-45 のポインタ） ---
+//
+// 層 A（`wire24_declared_param_oids.rs`）が確定オラクルとして検証した規則が、無改造の実
+// クライアントからも同じ SQLSTATE で観測できることの確認。クライアントごとの能力差:
+// - psql: `\bind` の値は常に文字列で、宣言 OID は常に 0。NULL も送れない（値を省略すると
+//   サーバーが「パラメータ数不一致」で拒否する）。OID 0 の推論だけを担当する。
+// - psycopg: Python の型で宣言 OID が決まる。`None` は OID 0 の NULL。公開 API の
+//   `register_dumper` で 25・705 などを text 形式で宣言する。
+// - node pg: `query({ types })` が Parse の OID 列へそのまま書かれる。値は text 形式。
+
+/// 拒否ケース（表示名・クライアント・SQL・text パラメータ・オプション・期待 SQLSTATE）。
+type RejectionCase<'a> = (&'a str, Client, &'a str, Vec<String>, Opts, &'a str);
+
+const PARAM_UPD_N: &str = "UPDATE param_items SET n = $1 WHERE id = 1 USING OPERATION_ID $2";
+const PARAM_SEL_N: &str = "SELECT n FROM param_items WHERE id = 1 LIMIT 5";
+const PARAM_UPD_REQ: &str = "UPDATE param_items SET req = $1 WHERE id = 1 USING OPERATION_ID $2";
+const PARAM_WHERE_N: &str = "SELECT s FROM param_items WHERE n = $1 LIMIT 5";
+const PARAM_WHERE_S: &str = "SELECT n FROM param_items WHERE s = $1 LIMIT 5";
+/// 推論できる文脈を持たない 2 項演算（OID 0 は `42P18`）。
+const PARAM_INDETERMINATE: &str =
+    "UPDATE param_items SET n = $1 + $2 WHERE id = 1 USING OPERATION_ID 'p2440-indeterminate'";
+
+/// `param_items` を載せたサーバー一式（子プロセス・DB・ユーザーファイルの寿命を束ねる）。
+struct ParamEnv {
+    server: ServerGuard,
+    _db: temp_db::CleanupGuard,
+    _users_dir: temp_db::TempDir,
+}
+
+fn start_param_env(tag: &str) -> ParamEnv {
+    let (db_path, db) = seed_param_types_db();
+    let users_dir = temp_db::TempDir::new(&format!("three-client-param-{tag}-users"));
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+    let server = spawn_wire_server(&users_path, &db_path);
+    ParamEnv {
+        server,
+        _db: db,
+        _users_dir: users_dir,
+    }
+}
+
+/// 同一サーバーに対する operation_id の重複（`23505`）を避ける連番付き ID。
+fn next_op(tag: &str) -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    format!("p2440-{tag}-{}", SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// 動的に組んだ JSON を `Opts`（`'static`）へ渡すためのリーク。テスト専用で数が少ない。
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// JSON 断片（数値・`null`・引用済み文字列）に `\` と制御文字を許さない検査。
+fn assert_plain_json_fragment(frag: &str) {
+    assert!(
+        !frag.contains('\\') && !frag.chars().any(|c| c.is_control()),
+        "unsupported character in test parameter: {frag:?}"
+    );
+}
+
+/// `WIRE_PARAMS_TYPED` の JSON を `[(語彙, JSON 値)]` から組む。語彙の検証は
+/// スクリプト側（fail-closed）が担い、ここでは `\`・制御文字だけを拒否する。
+fn typed_json(items: &[(&str, &str)]) -> &'static str {
+    let body: Vec<String> = items
+        .iter()
+        .map(|(kind, value)| {
+            assert_plain_json_fragment(kind);
+            assert_plain_json_fragment(value);
+            format!("{{\"type\":\"{kind}\",\"value\":{value}}}")
+        })
+        .collect();
+    leak(format!("[{}]", body.join(",")))
+}
+
+/// `WIRE_PARAMS_NULLABLE` の JSON（`None` が NULL）。
+fn nullable_json(items: &[Option<&str>]) -> &'static str {
+    let body: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            None => "null".to_string(),
+            Some(s) => {
+                assert_plain_json_fragment(s);
+                format!("\"{}\"", s.replace('"', "\\\""))
+            }
+        })
+        .collect();
+    leak(format!("[{}]", body.join(",")))
+}
+
+/// `WIRE_PARAM_TYPES` の JSON。
+fn oid_json(oids: &[i32]) -> &'static str {
+    let body: Vec<String> = oids.iter().map(|o| o.to_string()).collect();
+    leak(format!("[{}]", body.join(",")))
+}
+
+fn quoted(s: &str) -> String {
+    assert_plain_json_fragment(s);
+    format!("\"{}\"", s.replace('"', "\\\""))
+}
+
+/// 型付き psycopg 用: 末尾の operation_id を `unknown`（OID 0）の文字列として付ける。
+fn typed_with_op(first: (&str, &str), tag: &str) -> Opts {
+    Opts {
+        typed_json: Some(typed_json(&[first, ("unknown", &quoted(&next_op(tag)))])),
+        ..Opts::default()
+    }
+}
+
+/// node pg 用: 宣言 OID 列 `[oid, 0]` と値 `[value, operation_id]`。
+fn pg_declared(oid: i32) -> Opts {
+    Opts {
+        param_types: Some(oid_json(&[oid, 0])),
+        ..Opts::default()
+    }
+}
+
+/// alice が `param_items` の 1 セルを psycopg の型名付きで読み戻す（NULL は
+/// `NoneType:None`）。クライアント非依存の読み戻しに使う。
+fn read_param_cell(port: u16, col: &str, id: u64) -> String {
+    let sql = format!("SELECT {col} FROM param_items WHERE id = {id} LIMIT 5");
+    run_ext(
+        Client::Psycopg,
+        port,
+        "alice",
+        "pw-alice",
+        &sql,
+        &[],
+        Opts::default(),
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| panic!("no row for {col} id={id}"))
+}
+
+/// 常時実行のガード: JSON 組み立て補助が `\`・制御文字を拒否し、期待形を作ること。
+#[test]
+fn param_json_builders_are_strict() {
+    assert_eq!(
+        typed_json(&[("int", "7"), ("unknown", "\"op\"")]),
+        "[{\"type\":\"int\",\"value\":7},{\"type\":\"unknown\",\"value\":\"op\"}]"
+    );
+    assert_eq!(nullable_json(&[None, Some("a")]), "[null,\"a\"]");
+    assert_eq!(oid_json(&[23, 0]), "[23,0]");
+    for bad in ["a\\b", "a\nb"] {
+        let r = std::panic::catch_unwind(|| quoted(bad));
+        assert!(r.is_err(), "{bad:?} must be rejected");
+    }
+}
+
+/// 3 クライアントすべてで OID 0（宣言なし）の `$n` が文脈から推論され、読み戻した値が
+/// 一致すること。推論できない位置は 3 クライアントとも `42P18`（WIRE-24 (2)）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_infer_types_for_oid_zero_params() {
+    let env = start_param_env("oid0");
+    let port = env.server.port;
+    let d = Opts::default();
+    for (client, tag, insert_id) in [
+        (Client::Psql, "psql", 100u64),
+        (Client::Psycopg, "psycopg", 200),
+        (Client::Pg, "pg", 300),
+    ] {
+        // 代入の位置（INTEGER 列へ文字列 `5` を推論して束縛）。
+        let op1 = next_op(tag);
+        let out = run_ext(
+            client,
+            port,
+            "alice",
+            "pw-alice",
+            PARAM_UPD_N,
+            &["5", &op1],
+            d,
+        );
+        assert!(
+            out.is_empty(),
+            "{client:?}: UPDATE returns no rows: {out:?}"
+        );
+        assert_eq!(
+            read_param_cell(port, "n", 1),
+            "int:5",
+            "{client:?}: SET n = $1"
+        );
+
+        // 式の中（`$1 + 1` は INTEGER と推論）。
+        let op2 = next_op(tag);
+        run_ext(
+            client,
+            port,
+            "alice",
+            "pw-alice",
+            "UPDATE param_items SET n = $1 + 1 WHERE id = 1 USING OPERATION_ID $2",
+            &["5", &op2],
+            d,
+        );
+        assert_eq!(read_param_cell(port, "n", 1), "int:6", "{client:?}: $1 + 1");
+
+        // INSERT の VALUES 位置。
+        let op3 = next_op(tag);
+        let sql = format!(
+            "INSERT INTO param_items (id, n, s, req) VALUES ({insert_id}, $1, $2, 'r') \
+             USING OPERATION_ID $3"
+        );
+        run_ext(
+            client,
+            port,
+            "alice",
+            "pw-alice",
+            &sql,
+            &["41", "ins", &op3],
+            d,
+        );
+        assert_eq!(
+            read_param_cell(port, "n", insert_id),
+            "int:41",
+            "{client:?}: INSERT"
+        );
+        assert_eq!(read_param_cell(port, "s", insert_id), "str:ins");
+
+        // 比較の位置（bob の Private 行 n = 30）。他テナントの Private 行は alice 側に現れない。
+        let rows = untag(&run_ext(
+            client,
+            port,
+            "bob",
+            "pw-bob",
+            PARAM_WHERE_N,
+            &["30"],
+            d,
+        ));
+        assert_eq!(rows, s(&["priv-b"]), "{client:?}: WHERE n = $1");
+        let rows = run_ext(client, port, "alice", "pw-alice", PARAM_WHERE_N, &["30"], d);
+        assert!(
+            rows.is_empty(),
+            "{client:?}: alice must not see bob row: {rows:?}"
+        );
+
+        // 推論できない位置は 42P18。
+        expect_sqlstate(
+            client,
+            port,
+            "alice",
+            "pw-alice",
+            PARAM_INDETERMINATE,
+            &["1", "2"],
+            d,
+            "42P18",
+        );
+    }
+    drop(env);
+}
+
+/// psycopg と node pg が宣言した型 OID は Parse で検証され、受理・拒否が両クライアントで
+/// 一致すること。705（unknown）は OID 0 と同じ推論になる（WIRE-24 (1)(2)(5)・SQL-45）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn psycopg_and_pg_declared_oids_are_used_and_checked() {
+    let env = start_param_env("declared");
+    let port = env.server.port;
+    let d = Opts::default();
+
+    // 受理: 変換できる宣言。psycopg は Python の型と整数ラッパー、node は types の OID。
+    let accepted_psycopg: [(&str, &str, i32); 4] = [
+        ("int", "7", 7),
+        ("int2", "8", 8),
+        ("int4", "9", 9),
+        ("int8", "10", 10),
+    ];
+    for (kind, value, want) in accepted_psycopg {
+        let opts = typed_with_op((kind, value), "decl-py");
+        run_ext(
+            Client::Psycopg,
+            port,
+            "alice",
+            "pw-alice",
+            PARAM_UPD_N,
+            &[],
+            opts,
+        );
+        assert_eq!(
+            read_param_cell(port, "n", 1),
+            format!("int:{want}"),
+            "psycopg {kind}"
+        );
+    }
+    for (oid, want) in [(23, 11), (20, 12), (21, 13), (701, 14)] {
+        let op = next_op("decl-pg");
+        run_ext(
+            Client::Pg,
+            port,
+            "alice",
+            "pw-alice",
+            PARAM_UPD_N,
+            &[&want.to_string(), &op],
+            pg_declared(oid),
+        );
+        assert_eq!(
+            read_param_cell(port, "n", 1),
+            format!("int:{want}"),
+            "node types=[{oid}]"
+        );
+    }
+    // DOUBLE 列へ float（701）、BOOLEAN 列へ bool（16）、numeric（1700）で id を引く。
+    let upd_d = "UPDATE param_items SET d = $1 WHERE id = 1 USING OPERATION_ID $2";
+    run_ext(
+        Client::Psycopg,
+        port,
+        "alice",
+        "pw-alice",
+        upd_d,
+        &[],
+        typed_with_op(("float", "2.5"), "decl-py"),
+    );
+    assert_eq!(read_param_cell(port, "d", 1), "float:2.5");
+    let upd_flag = "UPDATE param_items SET flag = $1 WHERE id = 1 USING OPERATION_ID $2";
+    run_ext(
+        Client::Psycopg,
+        port,
+        "alice",
+        "pw-alice",
+        upd_flag,
+        &[],
+        typed_with_op(("bool", "false"), "decl-py"),
+    );
+    assert_eq!(read_param_cell(port, "flag", 1), "bool:False");
+    let by_id = "SELECT s FROM param_items WHERE id = $1 LIMIT 5";
+    let rows = run_ext(
+        Client::Psycopg,
+        port,
+        "alice",
+        "pw-alice",
+        by_id,
+        &[],
+        Opts {
+            typed_json: Some(typed_json(&[("decimal", "\"1\"")])),
+            ..d
+        },
+    );
+    assert_eq!(untag(&rows), s(&["pub-a"]), "psycopg Decimal vs id");
+
+    // 拒否: 変換できない宣言（代入は 42804、比較は 42883）。両クライアントで同じ SQLSTATE。
+    expect_sqlstate(
+        Client::Psycopg,
+        port,
+        "alice",
+        "pw-alice",
+        PARAM_UPD_N,
+        &[],
+        typed_with_op(("text", "\"7\""), "decl-py"),
+        "42804",
+    );
+    expect_sqlstate(
+        Client::Pg,
+        port,
+        "alice",
+        "pw-alice",
+        PARAM_UPD_N,
+        &["7", &next_op("decl-pg")],
+        pg_declared(25),
+        "42804",
+    );
+    expect_sqlstate(
+        Client::Psycopg,
+        port,
+        "alice",
+        "pw-alice",
+        PARAM_WHERE_S,
+        &[],
+        Opts {
+            typed_json: Some(typed_json(&[("int", "7")])),
+            ..d
+        },
+        "42883",
+    );
+    expect_sqlstate(
+        Client::Pg,
+        port,
+        "alice",
+        "pw-alice",
+        PARAM_WHERE_S,
+        &["t"],
+        Opts {
+            param_types: Some(oid_json(&[16])),
+            ..d
+        },
+        "42883",
+    );
+    // 拒否後も接続は壊れていない（同一接続で続けて実行できる）。
+    let after = Opts {
+        sql_after: Some(PARAM_SEL_N),
+        ..typed_with_op(("text", "\"7\""), "decl-py")
+    };
+    let out = spawn_client(
+        Client::Psycopg,
+        port,
+        "alice",
+        "pw-alice",
+        PARAM_UPD_N,
+        &[],
+        after,
+    );
+    assert!(out.status.success(), "connection must survive 42804");
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("after:"));
+
+    // 705（unknown）は OID 0 と同じ推論: 列スロットでは受理、式の中では 42P18。
+    run_ext(
+        Client::Psycopg,
+        port,
+        "alice",
+        "pw-alice",
+        PARAM_UPD_N,
+        &[],
+        typed_with_op(("oid705", "\"15\""), "decl-py"),
+    );
+    assert_eq!(read_param_cell(port, "n", 1), "int:15", "psycopg 705");
+    run_ext(
+        Client::Pg,
+        port,
+        "alice",
+        "pw-alice",
+        PARAM_UPD_N,
+        &["16", &next_op("decl-pg")],
+        pg_declared(705),
+    );
+    assert_eq!(read_param_cell(port, "n", 1), "int:16", "node 705");
+    expect_sqlstate(
+        Client::Psycopg,
+        port,
+        "alice",
+        "pw-alice",
+        PARAM_INDETERMINATE,
+        &[],
+        Opts {
+            typed_json: Some(typed_json(&[("oid705", "\"1\""), ("oid705", "\"2\"")])),
+            ..d
+        },
+        "42P18",
+    );
+    expect_sqlstate(
+        Client::Pg,
+        port,
+        "alice",
+        "pw-alice",
+        PARAM_INDETERMINATE,
+        &["1", "2"],
+        Opts {
+            param_types: Some(oid_json(&[705, 705])),
+            ..d
+        },
+        "42P18",
+    );
+    drop(env);
+}
+
+/// 配列型 OID を宣言するドライバ（psycopg の `list[int]`＝1005、node の `types=[1007]`）は
+/// `0A000` で拒否され、同じ接続で続けた文は成功すること。存在する表・存在しない表で
+/// 応答が同一であること（WIRE-24 (1)・WIRE-11。#2438 の申し送り (b)）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn psycopg_and_pg_array_oid_is_rejected_and_connection_survives() {
+    let env = start_param_env("array");
+    let port = env.server.port;
+    let d = Opts::default();
+    let py = |sql_after: Option<&'static str>| Opts {
+        sql_after,
+        ..typed_with_op(("int_list", "[1]"), "arr-py")
+    };
+    let node = |sql_after: Option<&'static str>| Opts {
+        sql_after,
+        param_types: Some(oid_json(&[1007, 0])),
+        ..d
+    };
+    let py_err = rejected_stderr(
+        Client::Psycopg,
+        port,
+        "alice",
+        "pw-alice",
+        PARAM_UPD_N,
+        &[],
+        py(Some(PARAM_SEL_N)),
+        "0A000",
+    );
+    let node_err = rejected_stderr(
+        Client::Pg,
+        port,
+        "alice",
+        "pw-alice",
+        PARAM_UPD_N,
+        &["7", &next_op("arr-pg")],
+        node(Some(PARAM_SEL_N)),
+        "0A000",
+    );
+    // 失敗の後に同じ接続で実行した文が成功する（exit 0 かつ `after:` の行がある）。
+    for (client, opts, params) in [
+        (Client::Psycopg, py(Some(PARAM_SEL_N)), vec![]),
+        (
+            Client::Pg,
+            node(Some(PARAM_SEL_N)),
+            vec!["7", "p2440-arr-after"],
+        ),
+    ] {
+        let out = spawn_client(
+            client,
+            port,
+            "alice",
+            "pw-alice",
+            PARAM_UPD_N,
+            &params,
+            opts,
+        );
+        assert!(
+            out.status.success(),
+            "{client:?}: connection must survive 0A000"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).starts_with("after:"),
+            "{client:?}: follow-up statement must run"
+        );
+    }
+    // 存在しない表でも応答は同じ（存在情報を漏らさない）。
+    let missing = "UPDATE no_such_table SET n = $1 WHERE id = 1 USING OPERATION_ID $2";
+    let node_missing = rejected_stderr(
+        Client::Pg,
+        port,
+        "alice",
+        "pw-alice",
+        missing,
+        &["7", &next_op("arr-pg")],
+        node(None),
+        "0A000",
+    );
+    assert_eq!(
+        node_err, node_missing,
+        "0A000 must not depend on the catalog"
+    );
+    assert!(!py_err.contains("param_items"), "{py_err}");
+    drop(env);
+}
+
+/// NULL パラメータはリテラル NULL と同じ扱いになること（WIRE-24 (3)・SQL-45）。nullable 列
+/// への INSERT・UPDATE は成功して NULL が読み戻せ、NOT NULL 列は `23502`、比較の位置は
+/// 同じ文をリテラル `NULL` で書いたときと同じ SQLSTATE になる。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn psycopg_and_pg_null_params_match_literal_null() {
+    let env = start_param_env("null");
+    let port = env.server.port;
+    let d = Opts::default();
+
+    for (client, tag, insert_id) in [(Client::Psycopg, "py", 400u64), (Client::Pg, "pg", 500)] {
+        let opts_for = |values: &[Option<&str>], extra: Opts| -> Opts {
+            match client {
+                Client::Psycopg => {
+                    let items: Vec<(&str, String)> = values
+                        .iter()
+                        .map(|v| match v {
+                            None => ("null", "null".to_string()),
+                            Some(s) => ("unknown", quoted(s)),
+                        })
+                        .collect();
+                    let refs: Vec<(&str, &str)> =
+                        items.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    Opts {
+                        typed_json: Some(typed_json(&refs)),
+                        ..extra
+                    }
+                }
+                _ => Opts {
+                    nullable_json: Some(nullable_json(values)),
+                    ..extra
+                },
+            }
+        };
+        // 値を入れてから NULL へ更新する（UPDATE）。
+        let o = opts_for(&[Some("5"), Some(&next_op(tag))], d);
+        run_ext(client, port, "alice", "pw-alice", PARAM_UPD_N, &[], o);
+        assert_eq!(read_param_cell(port, "n", 1), "int:5");
+        let o = opts_for(&[None, Some(&next_op(tag))], d);
+        let out = run_ext(client, port, "alice", "pw-alice", PARAM_UPD_N, &[], o);
+        assert!(out.is_empty(), "{client:?}: {out:?}");
+        assert_eq!(
+            read_param_cell(port, "n", 1),
+            "NoneType:None",
+            "{client:?}: UPDATE SET n = NULL"
+        );
+        // 型を宣言した NULL（text 形式）も同じ。
+        if client == Client::Pg {
+            let o = Opts {
+                param_types: Some(oid_json(&[23, 0])),
+                ..opts_for(&[None, Some(&next_op(tag))], d)
+            };
+            run_ext(client, port, "alice", "pw-alice", PARAM_UPD_N, &[], o);
+            assert_eq!(read_param_cell(port, "n", 1), "NoneType:None");
+        }
+        // INSERT（nullable 列へ NULL）。
+        let sql = format!(
+            "INSERT INTO param_items (id, n, s, req) VALUES ({insert_id}, $1, $2, 'r') \
+             USING OPERATION_ID $3"
+        );
+        let o = opts_for(&[None, Some("ins-null"), Some(&next_op(tag))], d);
+        run_ext(client, port, "alice", "pw-alice", &sql, &[], o);
+        assert_eq!(read_param_cell(port, "n", insert_id), "NoneType:None");
+        assert_eq!(read_param_cell(port, "s", insert_id), "str:ins-null");
+        // NOT NULL 列への NULL は 23502。
+        let o = opts_for(&[None, Some(&next_op(tag))], d);
+        expect_sqlstate(
+            client,
+            port,
+            "alice",
+            "pw-alice",
+            PARAM_UPD_REQ,
+            &[],
+            o,
+            "23502",
+        );
+        // 比較の位置: リテラル NULL と同じ SQLSTATE（現状は SQL-41 系の `42703`。直書きせず
+        // リテラル側の結果に追従する）。
+        let literal = rejected_stderr(
+            Client::Psycopg,
+            port,
+            "alice",
+            "pw-alice",
+            "SELECT s FROM param_items WHERE n = NULL LIMIT 5",
+            &[],
+            d,
+            "SQLSTATE=",
+        );
+        let literal_state = literal
+            .split("SQLSTATE=")
+            .nth(1)
+            .and_then(|r| r.get(..5))
+            .unwrap_or_else(|| panic!("no SQLSTATE in {literal}"))
+            .to_string();
+        let o = opts_for(&[None], d);
+        expect_sqlstate(
+            client,
+            port,
+            "alice",
+            "pw-alice",
+            PARAM_WHERE_N,
+            &[],
+            o,
+            &literal_state,
+        );
+        // インジェクション: NULL と隣り合う値は不透明なまま保存される。
+        let sql = "UPDATE param_items SET n = $1, s = $2 WHERE id = 2 USING OPERATION_ID $3";
+        let o = opts_for(&[None, Some("' OR '1'='1"), Some(&next_op(tag))], d);
+        run_ext(client, port, "alice", "pw-alice", sql, &[], o);
+        assert_eq!(read_param_cell(port, "s", 2), "str:' OR '1'='1");
+        assert_eq!(
+            read_param_cell(port, "s", 1),
+            "str:pub-a",
+            "other rows untouched"
+        );
+    }
+    drop(env);
+}
+
+/// 3 テナントのいずれでも、型宣言・NULL による拒否の応答（SQLSTATE とメッセージ）が同一で、
+/// 他テナントの表・行の存在を観測できないこと（RLS-11・WIRE-24 (5)）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_param_type_rejections_do_not_reveal_other_tenants() {
+    let env = start_param_env("tenants");
+    let port = env.server.port;
+    let d = Opts::default();
+
+    // クライアントごとの拒否ケース: (表示名, client, sql, params, opts, SQLSTATE)。
+    let upd_param = |tag: &str| -> String { next_op(tag) };
+    let cases: Vec<RejectionCase> = vec![
+        (
+            "psql 42P18",
+            Client::Psql,
+            PARAM_INDETERMINATE,
+            vec!["1".into(), "2".into()],
+            d,
+            "42P18",
+        ),
+        (
+            "psycopg 42804",
+            Client::Psycopg,
+            PARAM_UPD_N,
+            vec![],
+            Opts {
+                typed_json: Some(typed_json(&[
+                    ("text", "\"7\""),
+                    ("unknown", &quoted("p2440-tenants-fixed-1")),
+                ])),
+                ..d
+            },
+            "42804",
+        ),
+        (
+            "psycopg 42883",
+            Client::Psycopg,
+            PARAM_WHERE_S,
+            vec![],
+            Opts {
+                typed_json: Some(typed_json(&[("int", "7")])),
+                ..d
+            },
+            "42883",
+        ),
+        (
+            "psycopg 0A000",
+            Client::Psycopg,
+            PARAM_UPD_N,
+            vec![],
+            Opts {
+                typed_json: Some(typed_json(&[
+                    ("int_list", "[1]"),
+                    ("unknown", &quoted("p2440-tenants-fixed-2")),
+                ])),
+                ..d
+            },
+            "0A000",
+        ),
+        (
+            "psycopg 23502",
+            Client::Psycopg,
+            PARAM_UPD_REQ,
+            vec![],
+            Opts {
+                typed_json: Some(typed_json(&[
+                    ("null", "null"),
+                    ("unknown", &quoted("p2440-tenants-fixed-3")),
+                ])),
+                ..d
+            },
+            "23502",
+        ),
+        (
+            "pg 42804",
+            Client::Pg,
+            PARAM_UPD_N,
+            vec!["7".into(), "p2440-tenants-fixed-4".into()],
+            pg_declared(25),
+            "42804",
+        ),
+        (
+            "pg 0A000",
+            Client::Pg,
+            PARAM_UPD_N,
+            vec!["7".into(), "p2440-tenants-fixed-5".into()],
+            pg_declared(1007),
+            "0A000",
+        ),
+        (
+            "pg 42883",
+            Client::Pg,
+            PARAM_WHERE_S,
+            vec!["t".into()],
+            Opts {
+                param_types: Some(oid_json(&[16])),
+                ..d
+            },
+            "42883",
+        ),
+    ];
+    for (name, client, sql, params, opts, state) in &cases {
+        let refs: Vec<&str> = params.iter().map(String::as_str).collect();
+        let mut seen: Vec<String> = Vec::new();
+        for (user, pw) in USERS {
+            let err = rejected_stderr(*client, port, user, pw, sql, &refs, *opts, state);
+            for needle in [
+                "param_items",
+                "tenant-",
+                "alice",
+                "bob",
+                "carol",
+                "pub-",
+                "priv-",
+            ] {
+                assert!(
+                    !err.contains(needle),
+                    "{name}: leaks `{needle}` to {user}: {err}"
+                );
+            }
+            seen.push(err);
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] == w[1]),
+            "{name}: responses differ across tenants: {seen:?}"
+        );
+    }
+
+    // 宣言 OID 付きの UPDATE: 他テナントの Private 行（id=2）と存在しない行（id=999）は同じ結果
+    // （成功・行なし）で、alice の行は変わらない。
+    let upd_by_id = "UPDATE param_items SET n = $1 WHERE id = $2 USING OPERATION_ID $3";
+    let before = read_param_cell(port, "n", 2);
+    for (client, opts_for) in [
+        (
+            Client::Psycopg,
+            (|id: &str, op: &str| Opts {
+                typed_json: Some(typed_json(&[
+                    ("int4", "99"),
+                    ("unknown", &quoted(id)),
+                    ("unknown", &quoted(op)),
+                ])),
+                ..Opts::default()
+            }) as fn(&str, &str) -> Opts,
+        ),
+        (
+            Client::Pg,
+            (|_id: &str, _op: &str| Opts {
+                param_types: Some(oid_json(&[23, 0, 0])),
+                ..Opts::default()
+            }) as fn(&str, &str) -> Opts,
+        ),
+    ] {
+        let mut results = Vec::new();
+        for id in ["2", "999"] {
+            let op = upd_param("tenants-upd");
+            let params: Vec<&str> = if client == Client::Pg {
+                vec!["99", id, &op]
+            } else {
+                vec![]
+            };
+            let out = spawn_client(
+                client,
+                port,
+                "bob",
+                "pw-bob",
+                upd_by_id,
+                &params,
+                opts_for(id, &op),
+            );
+            assert!(
+                out.status.success(),
+                "{client:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            results.push((
+                String::from_utf8_lossy(&out.stdout).to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            ));
+        }
+        assert_eq!(
+            results[0], results[1],
+            "{client:?}: foreign id must look absent"
+        );
+    }
+    assert_eq!(
+        read_param_cell(port, "n", 2),
+        before,
+        "alice's row is unchanged"
+    );
+
+    // 宣言の有無が 42P01（存在しない表）の応答を変えない。
+    let missing = "SELECT n FROM no_such_table WHERE n = $1 LIMIT 5";
+    let plain = rejected_stderr(
+        Client::Pg,
+        port,
+        "carol",
+        "pw-carol",
+        missing,
+        &["1"],
+        d,
+        "42P01",
+    );
+    let declared = rejected_stderr(
+        Client::Pg,
+        port,
+        "carol",
+        "pw-carol",
+        missing,
+        &["1"],
+        Opts {
+            param_types: Some(oid_json(&[23])),
+            ..d
+        },
+        "42P01",
+    );
+    assert_eq!(
+        plain, declared,
+        "declaration must not become an existence oracle"
+    );
+    drop(env);
+}
+
+/// psycopg の自然な binary 送信のうち互換表に載らない組み合わせは `0A000`（fail-closed）で
+/// 拒否され、接続は保たれること。これは「既知の差分」の固定であり、WIRE-24 (1) を
+/// 満たしたことにはしない（`binary_param_kind` の互換表の見直しは別 Issue。#2496 で据え置き）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn psycopg_natural_binary_params_outside_the_compat_table_fail_closed() {
+    let env = start_param_env("binary");
+    let port = env.server.port;
+    let cases = [
+        (
+            "float (float8) into REAL",
+            "UPDATE param_items SET r = $1 WHERE id = 1 USING OPERATION_ID $2",
+            ("float", "1.5"),
+        ),
+        (
+            "date into DATE",
+            "UPDATE param_items SET day = $1 WHERE id = 1 USING OPERATION_ID $2",
+            ("date", "\"2024-01-02\""),
+        ),
+    ];
+    for (name, sql, first) in cases {
+        let opts = Opts {
+            sql_after: Some(PARAM_SEL_N),
+            ..typed_with_op(first, "binary")
+        };
+        let err = rejected_stderr(
+            Client::Psycopg,
+            port,
+            "alice",
+            "pw-alice",
+            sql,
+            &[],
+            opts,
+            "0A000",
+        );
+        assert!(!err.contains("param_items"), "{name}: {err}");
+        let out = spawn_client(Client::Psycopg, port, "alice", "pw-alice", sql, &[], opts);
+        assert!(out.status.success(), "{name}: connection must survive");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).starts_with("after:"),
+            "{name}"
+        );
+    }
+    drop(env);
 }

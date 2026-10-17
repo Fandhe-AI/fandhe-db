@@ -6,6 +6,9 @@
 //! 推論扱い、text／binary 形式の値の宣言型としての復号・検証、過剰宣言の `08P01`。
 //! 持たない型の OID（配列型・存在しない OID・負値）は Parse で `0A000` となり、
 //! ignore-till-sync の同期回復で接続を維持する（Issue #2438。WIRE-24 (1)・WIRE-11）。
+//!
+//! Issue #2440（WIRE-24・SQL-45 のポインタ）で、NULL パラメータ（リテラル NULL と同じ扱い）・
+//! NOT NULL 列との交差・OID の混在・3 テナントでの拒否応答のバイト一致を追加で固定する。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -19,6 +22,8 @@ use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::recovery::required_op_id::OperationId;
+use engine::row_codec::Value;
 use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
 use engine::sql::SqlOutcome;
@@ -43,6 +48,37 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             ],
         ))
         .expect("create table");
+    // NOT NULL 列を持つ別表（NULL パラメータが 23502 になることの確認用。Issue #2440）。
+    storage
+        .create_table(&TableSchema::new(
+            "nn",
+            vec![
+                ColumnDef::new("req", ColumnType::Text, false),
+                ColumnDef::new("n", ColumnType::Integer, true),
+            ],
+        ))
+        .expect("create nn");
+    // 他テナントの Private 行（テナント境界の非観測性の確認用。Issue #2440）。
+    for (tenant, id, n) in [("tenant-a", 5u64, 50), ("tenant-b", 6, 60)] {
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "t",
+            &ctx,
+            id,
+            Visibility::Private,
+            &[
+                Value::Integer(n),
+                Value::BigInt(i64::from(n)),
+                Value::Double(1.5),
+                Value::Text("private".to_string()),
+            ],
+            &OperationId::parse(&format!("seed-private-{id}")).expect("op id"),
+        )
+        .expect("seed private row");
+    }
     let core = Arc::new(EngineCore::from_storage(
         storage,
         Box::new(CpuScalarProvider),
@@ -625,4 +661,298 @@ fn conversion_check_does_not_depend_on_tenant_rows() {
         send_length_prefixed_message(s, b'P', &parse_declared("", SELECT_N, &[OID_INT8]));
         expect_kind(s, b'1');
     }
+}
+// --- Issue #2440: NULL パラメータ・OID 混在・3 テナントの非観測性（WIRE-24・SQL-45） ---
+
+/// 値に NULL（長さ -1）を含められる Bind 本体（結果形式はすべて text）。
+fn bind_msg_opt(fmts: &[i16], values: &[Option<&[u8]>]) -> Vec<u8> {
+    let mut body = vec![0u8, 0u8];
+    body.extend_from_slice(&(fmts.len() as i16).to_be_bytes());
+    for f in fmts {
+        body.extend_from_slice(&f.to_be_bytes());
+    }
+    body.extend_from_slice(&(values.len() as i16).to_be_bytes());
+    for v in values {
+        match v {
+            None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(v) => {
+                body.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                body.extend_from_slice(v);
+            }
+        }
+    }
+    body.extend_from_slice(&0i16.to_be_bytes());
+    body
+}
+
+/// Parse → Bind → Execute → Sync を送り、成功ならコマンドタグ、失敗なら最初の
+/// ErrorResponse 本文（`C`・`M` フィールド込み）を返す。NULL を含む値を渡せる。
+fn run_full(
+    s: &mut Stream,
+    sql: &str,
+    oids: &[i32],
+    fmts: &[i16],
+    values: &[Option<&[u8]>],
+) -> Result<String, String> {
+    send_length_prefixed_message(s, b'P', &parse_declared("", sql, oids));
+    send_length_prefixed_message(s, b'B', &bind_msg_opt(fmts, values));
+    send_length_prefixed_message(s, b'E', &execute_body("", 0));
+    send_length_prefixed_message(s, b'S', b"");
+    let mut tag = String::new();
+    let mut err: Option<String> = None;
+    loop {
+        let (k, body) = read_message(s);
+        match k {
+            b'C' => {
+                tag = String::from_utf8_lossy(&body)
+                    .trim_end_matches('\0')
+                    .to_string()
+            }
+            b'E' if err.is_none() => err = Some(String::from_utf8_lossy(&body).to_string()),
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    err.map_or(Ok(tag), Err)
+}
+
+/// ErrorResponse 本文から SQLSTATE（`C` フィールド）を取り出す。
+fn sqlstate_of(err_body: &str) -> String {
+    err_body
+        .split('\0')
+        .find_map(|f| f.strip_prefix('C').map(str::to_string))
+        .unwrap_or_else(|| err_body.to_string())
+}
+
+const UPD_N_BY_ID: &str = "UPDATE t SET n = $1 WHERE id = $2 USING OPERATION_ID $3";
+
+/// nullable 列への NULL は宣言 OID 0・int4・705 のいずれでも受理され、NULL が保存される
+/// （WIRE-24 (3)）。INSERT／UPDATE の両方。
+#[test]
+fn null_param_is_stored_as_null_for_nullable_columns() {
+    let (core, _g) = new_core();
+    let mut s = connect(core.clone());
+    for (i, oid) in [0, OID_INT4, OID_UNKNOWN].into_iter().enumerate() {
+        // 値を入れてから NULL へ更新する。
+        let seed = format!("n-set-{i}");
+        let tag = run_declared(
+            &mut s,
+            UPD_N_BY_ID,
+            &[],
+            &[0],
+            &[b"7", b"1", seed.as_bytes()],
+        )
+        .expect("set value");
+        assert_eq!(tag, "UPDATE 1");
+        assert_eq!(cell(&core, "n", 1), Cell::SignedInteger(7));
+        let op = format!("n-null-{i}");
+        let tag = run_full(
+            &mut s,
+            UPD_N_BY_ID,
+            &[oid, 0, 0],
+            &[0],
+            &[None, Some(b"1"), Some(op.as_bytes())],
+        )
+        .expect("null update");
+        assert_eq!(tag, "UPDATE 1", "oid {oid}");
+        assert_eq!(cell(&core, "n", 1), Cell::Null, "oid {oid}");
+
+        let id = 10 + i as u64;
+        let ins = format!("INSERT INTO t (id, n) VALUES ({id}, $1) USING OPERATION_ID $2");
+        let op = format!("n-ins-{i}");
+        let tag = run_full(&mut s, &ins, &[oid, 0], &[0], &[None, Some(op.as_bytes())])
+            .expect("null insert");
+        assert_eq!(tag, "INSERT 0 1", "oid {oid}");
+        assert_eq!(cell(&core, "n", id), Cell::Null, "oid {oid}");
+    }
+    assert_alive(&mut s);
+}
+
+/// NOT NULL 列への NULL は 23502（リテラル NULL と同じ）。接続は維持される。
+#[test]
+fn null_param_into_not_null_column_is_23502() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    for oid in [0, OID_UNKNOWN, OID_TEXT] {
+        let op = format!("nn-{oid}");
+        let err = run_full(
+            &mut s,
+            "INSERT INTO nn (id, req) VALUES (1, $1) USING OPERATION_ID $2",
+            &[oid, 0],
+            &[0],
+            &[None, Some(op.as_bytes())],
+        )
+        .expect_err("not null");
+        assert_eq!(sqlstate_of(&err), "23502", "oid {oid}");
+        assert!(!err.contains("tenant"), "{err:?}");
+    }
+    assert_alive(&mut s);
+}
+
+/// 比較の位置・`USING OPERATION_ID` の NULL パラメータは、同じ位置にリテラル NULL を書いた
+/// 文と同じ SQLSTATE になる。現行の SQLSTATE を直書きせず、リテラル側へ追従する形で
+/// アサートする（SQL-41 側の改善に自然に追従できる）。
+#[test]
+fn null_param_in_rejected_positions_matches_literal_null() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    let pairs = [
+        (
+            "SELECT id FROM t WHERE n = $1 LIMIT 5",
+            "SELECT id FROM t WHERE n = NULL LIMIT 5",
+        ),
+        (
+            "UPDATE t SET n = 1 WHERE id = 1 USING OPERATION_ID $1",
+            "UPDATE t SET n = 1 WHERE id = 1 USING OPERATION_ID NULL",
+        ),
+    ];
+    for (param_sql, literal_sql) in pairs {
+        for oid in [0, OID_INT4] {
+            let p = run_full(&mut s, param_sql, &[oid], &[0], &[None]);
+            let l = run_full(&mut s, literal_sql, &[], &[0], &[]);
+            assert_eq!(
+                p.as_ref().map_err(|e| sqlstate_of(e)),
+                l.as_ref().map_err(|e| sqlstate_of(e)),
+                "{param_sql} (oid {oid})"
+            );
+        }
+        assert_alive(&mut s);
+    }
+}
+
+/// 型付き NULL の判定順: 変換できない宣言は値が NULL でも Parse の段で先に拒否される
+/// （42804）。binary 非対応スロットに format=1 の NULL を送ると 0A000 が先に返る。後者は
+/// PostgreSQL との既知の差分（現行の fail-closed を固定するもので、仕様準拠としての固定では
+/// ない。#2438・#2439 の申し送り）。
+#[test]
+fn typed_null_checks_declaration_before_value() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    let err = run_full(
+        &mut s,
+        UPD_N_BY_ID,
+        &[OID_TEXT, 0, 0],
+        &[0],
+        &[None, Some(b"1"), Some(b"tn-1")],
+    )
+    .expect_err("text into integer");
+    assert_eq!(sqlstate_of(&err), "42804");
+    // date（binary 非対応）のスロットへ format=1 の NULL。
+    let err = run_full(
+        &mut s,
+        "UPDATE t SET n = $2 WHERE id = 1 USING OPERATION_ID $3",
+        &[OID_DATE, 0, 0],
+        &[1, 0, 0],
+        &[None, Some(b"5"), Some(b"tn-2")],
+    )
+    .expect_err("binary null into unsupported slot");
+    assert_eq!(sqlstate_of(&err), "0A000");
+    assert_alive(&mut s);
+}
+
+/// 同じ文の中で OID 0・705・宣言 OID を混ぜても、ParameterDescription は宣言を echo し
+/// 残りを推論し、実行結果が一致する。
+#[test]
+fn mixed_declared_zero_and_unknown_oids_are_inferred_per_slot() {
+    let (core, _g) = new_core();
+    let mut s = connect(core.clone());
+    let sql = "UPDATE t SET n = $1, b = $2, d = $3 WHERE id = 1 USING OPERATION_ID $4";
+    let described = describe_declared(&mut s, sql, &[0, OID_UNKNOWN, OID_FLOAT8]);
+    assert_eq!(described[..3], [OID_INT4, OID_INT8, OID_FLOAT8]);
+    let tag = run_declared(
+        &mut s,
+        sql,
+        &[0, OID_UNKNOWN, OID_FLOAT8],
+        &[0],
+        &[b"3", b"4", b"2.5", b"mix-1"],
+    )
+    .expect("mixed");
+    assert_eq!(tag, "UPDATE 1");
+    assert_eq!(cell(&core, "n", 1), Cell::SignedInteger(3));
+    assert_eq!(cell(&core, "b", 1), Cell::SignedInteger(4));
+    assert_eq!(cell(&core, "d", 1), Cell::Float(2.5));
+}
+
+/// 3 テナント（tenant-a: Public+Private 行、tenant-b: Private 行、tenant-c: 行なし）で、
+/// 拒否の ErrorResponse 本文がバイト一致し、受理（他テナント行・存在しない行への UPDATE）の
+/// コマンドタグが所有の有無だけで決まる。表名・テナント id・値は応答に出ない
+/// （RLS-11・WIRE-24 (5)）。
+#[test]
+fn rejections_and_acceptance_are_identical_across_three_tenants() {
+    let (core, _g) = new_core();
+    let users = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("bob", "tenant-b", "battery-staple"),
+        ("carol", "tenant-c", "tr0ub4dor"),
+    ]);
+    let addr = spawn_server_with_engine(&users, core.clone());
+    let mut conns = [
+        authenticate_to_ready_for_query(addr, "alice", "correct-horse"),
+        authenticate_to_ready_for_query(addr, "bob", "battery-staple"),
+        authenticate_to_ready_for_query(addr, "carol", "tr0ub4dor"),
+    ];
+    let missing_sql = "SELECT id FROM no_such_table WHERE n = $1 LIMIT 5";
+    let mut bodies: Vec<Vec<String>> = vec![Vec::new(); 3];
+    let mut tags: Vec<Vec<String>> = vec![Vec::new(); 3];
+    for (i, s) in conns.iter_mut().enumerate() {
+        // Parse の段の拒否（42804・42883・0A000・42P18）。
+        bodies[i].push(parse_error_text(
+            s,
+            "",
+            "UPDATE t SET n = $1 WHERE id = 1 USING OPERATION_ID 'x'",
+            &[OID_TEXT],
+        ));
+        bodies[i].push(parse_error_text(s, "", SELECT_N, &[OID_TEXT]));
+        bodies[i].push(parse_error_text(s, "", SELECT_N, &[1007]));
+        bodies[i].push(parse_error_text(s, "", EXPR, &[0, 0]));
+        // 実行時の拒否（NOT NULL への NULL）。
+        let op = format!("tenants-nn-{i}");
+        bodies[i].push(
+            run_full(
+                s,
+                "INSERT INTO nn (id, req) VALUES (1, $1) USING OPERATION_ID $2",
+                &[0, 0],
+                &[0],
+                &[None, Some(op.as_bytes())],
+            )
+            .expect_err("not null"),
+        );
+        // 宣言の有無で存在しない表の応答が変わらない（宣言が存在のオラクルにならない）。
+        let missing_plain =
+            run_full(s, missing_sql, &[], &[0], &[Some(b"1")]).expect_err("missing table");
+        let missing_declared =
+            run_full(s, missing_sql, &[OID_INT4], &[0], &[Some(b"1")]).expect_err("missing table");
+        assert_eq!(missing_plain, missing_declared, "tenant #{i}");
+        bodies[i].push(missing_declared);
+        // 受理: 他テナントの Private 行（id 5・6）と存在しない行（999）。
+        for id in ["5", "6", "999"] {
+            let op = format!("tenants-upd-{i}-{id}");
+            let tag = run_full(
+                s,
+                UPD_N_BY_ID,
+                &[OID_INT4, 0, 0],
+                &[0],
+                &[None, Some(id.as_bytes()), Some(op.as_bytes())],
+            )
+            .unwrap_or_else(|e| panic!("tenant #{i} id {id}: {e}"));
+            tags[i].push(tag);
+        }
+    }
+    for i in 1..3 {
+        assert_eq!(
+            bodies[0], bodies[i],
+            "rejection bodies differ for tenant #{i}"
+        );
+    }
+    for body in &bodies[0] {
+        assert!(
+            !body.contains("tenant") && !body.contains("private"),
+            "{body:?}"
+        );
+    }
+    // alice は自分の id 5 だけを 1 件更新し、他は 0 件。bob は id 6、carol はどれも 0 件。
+    // 他テナントの行は存在しない行（999）と同じ「0 件」としてしか観測できない。
+    assert_eq!(tags[0], vec!["UPDATE 1", "UPDATE 0", "UPDATE 0"]);
+    assert_eq!(tags[1], vec!["UPDATE 0", "UPDATE 1", "UPDATE 0"]);
+    assert_eq!(tags[2], vec!["UPDATE 0", "UPDATE 0", "UPDATE 0"]);
 }

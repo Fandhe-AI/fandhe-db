@@ -254,7 +254,8 @@ prepared_params.rs` で固定）。
     先に返すが本実装は `0A000` を先に返す。過剰宣言位置の持たない型も `0A000`（`08P01` より先）。
     存在しない型 OID も `0A000` に統一する。
   - クライアント影響: 配列型 OID を宣言するドライバ（例: 配列パラメータ）は Parse で `0A000` になる。
-    スカラーの主要 OID と、OID 0 を送るクライアントは影響しない。確認は #2440 へ申し送る。
+    スカラーの主要 OID と、OID 0 を送るクライアントは影響しない。実クライアントでの確認は #2440 で
+    完了した（psycopg の `list[int]`＝1005・node の `types=[1007]` は `0A000`、同一接続の後続文は成功）。
 - スロット型: 推論型がある位置は推論型のまま。推論型が無い位置（式内の全出現が推論不能・
   未参照番号）は宣言型を `PreparedParamType::Declared` としてスロット型にし、`42P18` を返さない。
   式の中で扱えない宣言型（`BOOLEAN`・日時・`NUMERIC` 等）は推論時と同じ `0A000`。
@@ -299,7 +300,9 @@ prepared_params.rs` で固定）。
 - 既知の差分: Bind 段の値の変換は変えない（例: INTEGER 列に `float8` を宣言して小数を送ると
   `22P02`。PG は丸める）。`binary_param_kind` の互換表も据え置く。兄弟枝・CAST・COLLATE の
   判定は行わない（PG では兄弟枝は `42804`、CAST の対応なしは `42846`）。JSON の `=` は PG に
-  無いが規則表では恒等として受理する。層 A の網羅と実クライアントの層 B は #2440。
+  無いが規則表では恒等として受理する。層 A の網羅と実クライアントの層 B は #2440 で実施済み
+  （[three-client-e2e-harness.md](three-client-e2e-harness.md) の該当節）。psycopg の自然な binary
+  送信のうち互換表に載らない組（`float`→REAL・`date`→DATE 等）は `0A000` のまま据え置く。
 
 ## 値の形式（型付き置換。Issue #1342）
 
@@ -369,7 +372,7 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
   `bind_prepared_null_matches_literal_null_per_position` で固定する。
 - wire 層の第 1 パスは、binary 非対応スロットに binary format が指定された場合、値が NULL でも
   `0A000` を先に返す（既存の fail-closed）。PostgreSQL では NULL に format は無関係なため
-  差分になりうる。#2436／#2438・#2440 への申し送り。
+  差分になりうる。#2440 で現行の fail-closed を層 A に固定した（仕様準拠としての固定ではない）。
 
 ## 検証
 
@@ -405,7 +408,8 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
 - 非 text スロットで宣言 OID 0 のバイナリ値を UTF-8 恒等で受理していた点は Issue #1345 で
   解消済み。
 - TASK-337 の分担: #2436 OID の公告・復号、#2437 変換可否（#1588 に依存）、#2438 `0A000`、
-  #2439 NULL、#2440 層 A/B。OID 705 の扱いは #2436 で確認し #2440 の層 B で最終確認する。
+  #2439 NULL、#2440 層 A/B（実施済み）。OID 705 は #2440 の層 B で psycopg・node pg とも OID 0 と同じ
+  推論になることを確認した。
 - NULL パラメータ値は #2439 で解消済み（上記節）。リテラル `<列> = NULL` 自体が未対応の
   位置（`42703`）は SQL-41 系の別課題。
 - 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較・`ON CONFLICT ... SET`・

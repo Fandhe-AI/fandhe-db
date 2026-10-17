@@ -19,6 +19,19 @@ node pg と同一の SQL 定数を 3 クライアントで共有できる（既�
   公開 API `conn.adapters.register_dumper` で `DecimalBinaryDumper` を登録し直し、
   numeric（OID 1700）のバイナリパラメータ（WIRE-26。Issue #2445）として送らせる
   （ドライバ無改造）。`WIRE_PARAMS`／`WIRE_PARAMS_INT` とは排他。
+- WIRE_PARAMS_TYPED（任意）: `[{"type": <語彙>, "value": <値|null>}, ...]` の JSON 配列
+  （Issue #2440。WIRE-24・SQL-45 のポインタ）。位置ごとに Python の型を変え、Parse で宣言される
+  型 OID を駆動する。語彙は閉じた集合で、語彙外・型の不一致・余計なキーは終了コード 1:
+  `unknown`(str・OID 0)／`text`(str を OID 25 で宣言)／`oid705`(str を OID 705 で宣言)／
+  `int`(Python int)／`int2`／`int4`／`int8`／`float4`／`float8`(psycopg のラッパー)／
+  `float`／`bool`／`decimal`(str から Decimal)／`date`(ISO 文字列から date)／
+  `int_list`(int の配列。int2[] として送られる)／`null`(値は null。OID 0 の NULL)。
+  任意 OID の宣言は公開 API `conn.adapters.register_dumper` と `StrDumper` 派生の組で行い、
+  ドライバは改造しない。`WIRE_PARAMS`／`WIRE_PARAMS_INT`／`WIRE_PARAMS_DECIMAL` とは排他。
+- WIRE_SQL_AFTER（任意）: 1 つ目の文が失敗しても同じ接続で実行する 2 つ目の文（パラメータ
+  無し）。1 つ目の失敗は stderr に `[SQLSTATE=...]` 付きで出し、2 つ目の結果行は stdout へ
+  `after:` を前置して出す。終了コードは 2 つ目が成功したときだけ 0（接続が失敗後も
+  生きていることの確認用）。
 - WIRE_BINARY（任意）: `1` のみ受理。結果をバイナリ形式で要求する。
 - WIRE_EXTENDED_NOPARAM（任意）: `1` のみ受理。パラメータ無しでも `prepare=True` で
   名前付き文（拡張プロトコル）として送る。
@@ -59,6 +72,85 @@ def _json_list(name: str, elem_type: type):
         )
         sys.exit(1)
     return parsed
+
+
+_TYPED_KEYS = {"type", "value"}
+_STR_TYPES = {"unknown", "text", "oid705", "decimal", "date"}
+_INT_TYPES = {"int", "int2", "int4", "int8"}
+
+
+def _typed_fail(msg: str):
+    print(f"psycopg_extended: WIRE_PARAMS_TYPED {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _typed_params(raw: str):
+    """WIRE_PARAMS_TYPED を検証し、(束縛値, 必要な Dumper 登録 [(クラス, OID)]) を返す。"""
+    from psycopg.types.numeric import Float4, Float8, Int2, Int4, Int8
+
+    try:
+        spec = json.loads(raw)
+    except json.JSONDecodeError as e:
+        _typed_fail(f"is not valid JSON: {e}")
+    if not isinstance(spec, list):
+        _typed_fail("must be a JSON array")
+    oid_classes = {"text": 25, "oid705": 705}
+    made = {}
+    values = []
+    registrations = []
+    for item in spec:
+        if not isinstance(item, dict) or set(item.keys()) != _TYPED_KEYS:
+            _typed_fail("items must be objects with exactly type and value")
+        kind, v = item["type"], item["value"]
+        if kind in _STR_TYPES:
+            if type(v) is not str:
+                _typed_fail(f"{kind} needs a string value")
+            if kind == "unknown":
+                values.append(v)
+            elif kind in oid_classes:
+                if kind not in made:
+                    made[kind] = type(f"Declared{kind}", (str,), {})
+                    registrations.append((made[kind], oid_classes[kind]))
+                values.append(made[kind](v))
+            elif kind == "decimal":
+                import decimal
+
+                try:
+                    values.append(decimal.Decimal(v))
+                except decimal.InvalidOperation:
+                    _typed_fail("decimal value is invalid")
+            else:  # date
+                import datetime
+
+                try:
+                    values.append(datetime.date.fromisoformat(v))
+                except ValueError:
+                    _typed_fail("date value is invalid")
+        elif kind in _INT_TYPES:
+            if type(v) is not int:
+                _typed_fail(f"{kind} needs an integer value")
+            wrap = {"int": int, "int2": Int2, "int4": Int4, "int8": Int8}[kind]
+            values.append(wrap(v))
+        elif kind in ("float", "float4", "float8"):
+            if type(v) not in (int, float):
+                _typed_fail(f"{kind} needs a number value")
+            wrap = {"float": float, "float4": Float4, "float8": Float8}[kind]
+            values.append(wrap(v))
+        elif kind == "bool":
+            if type(v) is not bool:
+                _typed_fail("bool needs a boolean value")
+            values.append(v)
+        elif kind == "int_list":
+            if not isinstance(v, list) or not all(type(x) is int for x in v):
+                _typed_fail("int_list needs an array of integers")
+            values.append(v)
+        elif kind == "null":
+            if v is not None:
+                _typed_fail("null needs a null value")
+            values.append(None)
+        else:
+            _typed_fail(f"has an unknown type {kind!r}")
+    return values, registrations
 
 
 def _cell(v) -> str:
@@ -102,7 +194,18 @@ def main() -> int:
         except decimal.InvalidOperation as e:
             print(f"psycopg_extended: WIRE_PARAMS_DECIMAL has an invalid decimal: {e}", file=sys.stderr)
             return 1
+    typed_raw = os.environ.get("WIRE_PARAMS_TYPED")
+    typed_params = None
+    typed_registrations = []
+    if typed_raw:
+        if str_params is not None or int_params is not None or dec_raw is not None:
+            print("psycopg_extended: WIRE_PARAMS_TYPED is exclusive with other params", file=sys.stderr)
+            return 1
+        typed_params, typed_registrations = _typed_params(typed_raw)
+    sql_after = os.environ.get("WIRE_SQL_AFTER") or None
     params = str_params if str_params is not None else int_params
+    if typed_params is not None:
+        params = typed_params
     if decimal_params is not None:
         params = decimal_params
     binary = _flag("WIRE_BINARY")
@@ -130,16 +233,33 @@ def main() -> int:
                 from psycopg.types.numeric import DecimalBinaryDumper
 
                 conn.adapters.register_dumper(Decimal, DecimalBinaryDumper)
+            for cls, oid in typed_registrations:
+                from psycopg.types.string import StrDumper
+
+                dumper = type(f"Oid{oid}Dumper", (StrDumper,), {"oid": oid})
+                conn.adapters.register_dumper(cls, dumper)
             with psycopg.RawCursor(conn) as cur:
-                cur.execute(
-                    sql,
-                    params,
-                    binary=binary,
-                    prepare=True if noparam_extended else None,
-                )
-                if cur.description is not None:
-                    for row in cur.fetchall():
-                        print("|".join(_cell(v) for v in row))
+                try:
+                    cur.execute(
+                        sql,
+                        params,
+                        binary=binary,
+                        prepare=True if noparam_extended else None,
+                    )
+                    if cur.description is not None:
+                        for row in cur.fetchall():
+                            print("|".join(_cell(v) for v in row))
+                except psycopg.Error as e:
+                    if sql_after is None:
+                        raise
+                    sqlstate = getattr(e, "sqlstate", None)
+                    suffix = f" [SQLSTATE={sqlstate}]" if sqlstate else ""
+                    print(f"psycopg_extended: query failed{suffix}: {e}", file=sys.stderr)
+                if sql_after is not None:
+                    cur.execute(sql_after)
+                    if cur.description is not None:
+                        for row in cur.fetchall():
+                            print("after:" + "|".join(_cell(v) for v in row))
         return 0
     except Exception as e:  # noqa: BLE001 — ハーネスへ理由を伝える最終防波堤
         sqlstate = getattr(e, "sqlstate", None)
