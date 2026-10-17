@@ -866,6 +866,197 @@ pub(crate) fn default_alter_table_check_name(table: &str, used: &[String]) -> St
     resolve_unique_name(&candidate, used)
 }
 
+/// 列改名（`catalog::Storage::alter_table_rename_column`。TABLE-38 のポインタ、
+/// Issue #1620）で、永続化済み `CHECK` 1 件の列参照を `old` から `new` へ追随させた
+/// 制約を返す。制約名は変えない（PostgreSQL と同じ）。
+///
+/// `new_schema` は**改名済み**の列定義を持ち `checks` が空の [`TableSchema`] を渡すこと
+/// （再束縛を新しい列名で行うため）。手順は文字列置換を使わず、再パース → AST 上の
+/// 識別子置換 → [`build_check_constraint`]（束縛・参照列再計算・正規化レンダリング・
+/// 長さ上限・往復一致の既存の唯一の実装）の順で行い、最後に「旧参照列を写像した集合と
+/// 新参照列の集合が一致する」ことを検証する。どの段で失敗しても `Err`
+/// （呼び出し元は `0A000` に写像し txn を破棄する。fail-closed）。
+pub(crate) fn rename_column_in_check(
+    new_schema: &TableSchema,
+    check: &CheckConstraint,
+    old: &str,
+    new: &str,
+) -> Result<CheckConstraint, SqlSurfaceError> {
+    let mut predicates = crate::sql::allowlist::parse_check_predicate_text(&check.predicate_sql)?;
+    for predicate in &mut predicates {
+        *predicate = rename_predicate_column(predicate, old, new)?;
+    }
+    let parsed = ParsedCheck {
+        name: Some(check.name.clone()),
+        column: None,
+        predicates,
+    };
+    let rebuilt = build_check_constraint(new_schema, &parsed, check.name.clone())?;
+    let mut expected: Vec<&str> = check
+        .columns
+        .iter()
+        .map(|c| if c == old { new } else { c.as_str() })
+        .collect();
+    let mut actual: Vec<&str> = rebuilt.columns.iter().map(String::as_str).collect();
+    expected.sort_unstable();
+    actual.sort_unstable();
+    if expected != actual {
+        return Err(SqlSurfaceError::unsupported(
+            "renamed CHECK constraint references a different column set",
+        ));
+    }
+    Ok(rebuilt)
+}
+
+/// 宣言的述語 1 件の列名参照を `old` → `new` に置換した複製を返す（`match` は網羅。
+/// 将来 variant を追加するとここがコンパイルエラーになり、置換漏れ＝旧名を残す
+/// fail-open を防ぐ）。CHECK 本体に現れないサブクエリ系は拒否する。
+fn rename_predicate_column(
+    predicate: &WherePredicate,
+    old: &str,
+    new: &str,
+) -> Result<WherePredicate, SqlSurfaceError> {
+    let col = |c: &String| if c == old { new.to_string() } else { c.clone() };
+    Ok(match predicate {
+        WherePredicate::Equality { column, value } => WherePredicate::Equality {
+            column: col(column),
+            value: value.clone(),
+        },
+        WherePredicate::Prefix { column, pattern } => WherePredicate::Prefix {
+            column: col(column),
+            pattern: pattern.clone(),
+        },
+        WherePredicate::PredicateCall { name } => {
+            WherePredicate::PredicateCall { name: name.clone() }
+        }
+        WherePredicate::Expression(expr) => {
+            WherePredicate::Expression(rename_expr_idents(expr, old, new))
+        }
+        WherePredicate::BoolEquality { column, value } => WherePredicate::BoolEquality {
+            column: col(column),
+            value: *value,
+        },
+        WherePredicate::BoolColumn { column } => WherePredicate::BoolColumn {
+            column: col(column),
+        },
+        WherePredicate::Compare { column, op, value } => WherePredicate::Compare {
+            column: col(column),
+            op: *op,
+            value: value.clone(),
+        },
+        WherePredicate::InList { column, values } => WherePredicate::InList {
+            column: col(column),
+            values: values.clone(),
+        },
+        WherePredicate::Between { column, low, high } => WherePredicate::Between {
+            column: col(column),
+            low: low.clone(),
+            high: high.clone(),
+        },
+        WherePredicate::IsNull { column, negated } => WherePredicate::IsNull {
+            column: col(column),
+            negated: *negated,
+        },
+        WherePredicate::Not(inner) => {
+            WherePredicate::Not(Box::new(rename_predicate_column(inner, old, new)?))
+        }
+        WherePredicate::Or(branches) => WherePredicate::Or(
+            branches
+                .iter()
+                .map(|branch| {
+                    branch
+                        .iter()
+                        .map(|p| rename_predicate_column(p, old, new))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        WherePredicate::IdCompare { op, value } => WherePredicate::IdCompare {
+            op: *op,
+            value: *value,
+        },
+        WherePredicate::InSubquery { .. }
+        | WherePredicate::Exists { .. }
+        | WherePredicate::ScalarSubqueryCompare { .. } => {
+            return Err(SqlSurfaceError::unsupported(
+                "subquery predicates are not allowed in CHECK constraints",
+            ))
+        }
+    })
+}
+
+/// 式中の `Expr::Ident(old)`（完全一致。バインダの列解決と同じ規則）を `new` へ置換した
+/// 複製を返す。文字列リテラル・関数名・`COLLATE`／`CAST` の名前・SQL/JSON の PASSING 変数名
+/// は置換しない。`match` は網羅（`_` を使わない）。
+fn rename_expr_idents(expr: &Expr, old: &str, new: &str) -> Expr {
+    let rec = |e: &Expr| rename_expr_idents(e, old, new);
+    match expr {
+        Expr::Ident(name) => Expr::Ident(if name == old {
+            new.to_string()
+        } else {
+            name.clone()
+        }),
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
+        | Expr::ValueFunction { .. } => expr.clone(),
+        Expr::Call { name, args } => Expr::Call {
+            name: name.clone(),
+            args: args.iter().map(rec).collect(),
+        },
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op: *op,
+            lhs: Box::new(rec(lhs)),
+            rhs: Box::new(rec(rhs)),
+        },
+        Expr::Case { whens, else_result } => Expr::Case {
+            whens: whens.iter().map(|(c, r)| (rec(c), rec(r))).collect(),
+            else_result: else_result.as_deref().map(|e| Box::new(rec(e))),
+        },
+        Expr::JsonAccess { op, lhs, rhs } => Expr::JsonAccess {
+            op: *op,
+            lhs: Box::new(rec(lhs)),
+            rhs: Box::new(rec(rhs)),
+        },
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
+            let mapped = expr.try_map_array_children(&mut |e| {
+                Ok::<Expr, std::convert::Infallible>(rename_expr_idents(e, old, new))
+            });
+            match mapped {
+                Some(Ok(e)) => e,
+                // 配列系 3 variant では常に `Some`。到達しない保険として複製を返すと
+                // 旧名が残るため、その場合は束縛が失敗して拒否される側に倒れる。
+                Some(Err(never)) => match never {},
+                None => expr.clone(),
+            }
+        }
+        Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(rec).collect()),
+        Expr::NullIf(a, b) => Expr::NullIf(Box::new(rec(a)), Box::new(rec(b))),
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(rec(expr)),
+            collation: *collation,
+        },
+        Expr::SqlJsonQuery(q) => {
+            let mapped = q.try_map_children(&mut |e| {
+                Ok::<Expr, std::convert::Infallible>(rename_expr_idents(e, old, new))
+            });
+            match mapped {
+                Ok(q) => Expr::SqlJsonQuery(Box::new(q)),
+                Err(never) => match never {},
+            }
+        }
+        Expr::Cast { expr, ty } => Expr::Cast {
+            expr: Box::new(rec(expr)),
+            ty: ty.clone(),
+        },
+    }
+}
+
 /// 書き込み文ごとに 1 回コンパイルする `CHECK` 制約群
 /// （`constraint::enforce_row_constraints_in_txn` が同一 write トランザクション内で
 /// 呼ぶ）。`schema.checks()` が空なら [`CompiledChecks::compile`] は `None` を
@@ -1076,6 +1267,80 @@ mod tests {
 
     fn schema_of(validated: &crate::sql::allowlist::ValidatedCreateTable) -> TableSchema {
         TableSchema::new(validated.table_name.clone(), validated.columns.clone())
+    }
+
+    /// 列改名（Issue #1620）の CHECK 追随を、`old` を `new` へ改名したスキーマで検証する
+    /// ヘルパー。`create_sql` の最初の CHECK を改名し、改名後の制約を返す。
+    fn rename_in_first_check(
+        create_sql: &str,
+        old: &str,
+        new: &str,
+    ) -> Result<CheckConstraint, SqlSurfaceError> {
+        let v = parse_create_table(create_sql);
+        let schema = schema_of(&v);
+        let check = validate_and_build(&schema, &v.checks)
+            .expect("must validate")
+            .remove(0);
+        let mut columns = v.columns.clone();
+        for c in &mut columns {
+            if c.name == old {
+                c.name = new.to_string();
+            }
+        }
+        let renamed = TableSchema::new(v.table_name.clone(), columns);
+        rename_column_in_check(&renamed, &check, old, new)
+    }
+
+    #[test]
+    fn rename_column_in_check_rewrites_identifiers_only() {
+        let c = rename_in_first_check(
+            "CREATE TABLE t (qty INTEGER, qty2 INTEGER, label TEXT, \
+             CONSTRAINT keep CHECK ((qty + 1) * 2 > qty2 AND label = 'qty'))",
+            "qty",
+            "amount",
+        )
+        .expect("rename");
+        assert_eq!(c.name, "keep");
+        // 部分一致（qty2）・文字列リテラル（'qty'）は置換しない。
+        assert_eq!(
+            c.predicate_sql,
+            "((amount + 1) * 2) > qty2 AND label = 'qty'"
+        );
+        let mut cols = c.columns.clone();
+        cols.sort();
+        assert_eq!(
+            cols,
+            vec![
+                "amount".to_string(),
+                "label".to_string(),
+                "qty2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rename_column_in_check_rewrites_nested_expressions() {
+        let c = rename_in_first_check(
+            "CREATE TABLE t (qty INTEGER, other INTEGER, \
+             CHECK (COALESCE(qty, 0) + abs(qty) > CASE WHEN qty > other THEN 1 ELSE 2 END))",
+            "qty",
+            "amount",
+        )
+        .expect("rename");
+        assert!(!c.predicate_sql.contains("qty"), "{}", c.predicate_sql);
+        assert!(c.predicate_sql.contains("COALESCE(amount, 0)"));
+    }
+
+    #[test]
+    fn rename_column_in_check_fails_closed_when_result_exceeds_limit() {
+        let long = "q_".repeat(30);
+        let preds = vec!["qty > 0"; 200].join(" AND ");
+        let r = rename_in_first_check(
+            &format!("CREATE TABLE t (qty INTEGER, CHECK ({preds}))"),
+            "qty",
+            &long,
+        );
+        assert!(r.is_err());
     }
 
     #[test]
