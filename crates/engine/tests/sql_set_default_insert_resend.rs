@@ -222,3 +222,47 @@ fn resend_after_reopen_is_duplicate() {
         vec![text("old")]
     );
 }
+
+/// 再送 4（NOT NULL）: NOT NULL DEFAULT 列の DROP DEFAULT／SET DEFAULT を挟んでも、
+/// 同一文の再送は束縛で `23502` にならず `23505`（台帳照合が NOT NULL 検査より先）。
+/// 台帳に無い新規の文は DROP DEFAULT 後に `23502` で拒否され、台帳追記も残らない。
+#[test]
+fn resend_after_default_change_on_not_null_column_is_duplicate() {
+    let path = unique_db_path("1629-resend-not-null");
+    let _g = CleanupGuard(path.clone());
+    let core = open_core(&path);
+    ok(
+        &core,
+        "CREATE TABLE nn (a TEXT, c TEXT NOT NULL DEFAULT 'old')",
+    );
+    let single = "INSERT INTO nn (id, a) VALUES (1, 'x') USING OPERATION_ID 'nn-s'";
+    let multi = "INSERT INTO nn (id, a) VALUES (11, 'x'), (12, 'y') USING OPERATION_ID 'nn-m'";
+    ok(&core, single);
+    ok(&core, multi);
+
+    ok(&core, "ALTER TABLE nn ALTER COLUMN c SET DEFAULT 'new'");
+    assert_eq!(code(&core, single), "23505");
+    assert_eq!(code(&core, multi), "23505");
+
+    ok(&core, "ALTER TABLE nn ALTER COLUMN c DROP DEFAULT");
+    assert_eq!(code(&core, single), "23505");
+    assert_eq!(code(&core, multi), "23505");
+    assert_eq!(
+        cells(&core, "SELECT c FROM nn WHERE id = 1"),
+        vec![text("old")]
+    );
+
+    // 新規の文は NOT NULL 違反（fail-closed）。行も台帳も残らない。
+    let fresh = "INSERT INTO nn (id, a) VALUES (2, 'z') USING OPERATION_ID 'nn-new'";
+    let fresh_multi =
+        "INSERT INTO nn (id, a) VALUES (3, 'z'), (4, 'w') USING OPERATION_ID 'nn-new-m'";
+    assert_eq!(code(&core, fresh), "23502");
+    assert_eq!(code(&core, fresh_multi), "23502");
+    assert!(cells(&core, "SELECT c FROM nn WHERE id = 2").is_empty());
+    ok(&core, "ALTER TABLE nn ALTER COLUMN c SET DEFAULT 'again'");
+    ok(&core, fresh);
+    assert_eq!(
+        cells(&core, "SELECT c FROM nn WHERE id = 2"),
+        vec![text("again")]
+    );
+}

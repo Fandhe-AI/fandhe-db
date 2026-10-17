@@ -323,13 +323,21 @@ pub enum VolatileColumn {
     Default(usize),
     /// `VALUES` の要素が単独の時刻関数だった列（位置と構文形。ハッシュ種別 `1`）。
     Values(usize, crate::catalog::TimeDefault),
+    /// 省略された非 nullable 列で DEFAULT も無いもの（`schema.columns` 上の位置）。束縛時には
+    /// `23502` にせず、`Null` の仮値を置いたうえでハッシュ材料から除外して `tenant` の書き込みまで
+    /// 運ぶ。`tenant` は台帳照合（再送判定）を終えた後に `23502` で拒否する（Issue #1629:
+    /// NOT NULL 列の DROP DEFAULT を挟んだ同一文の再送を `23505` にするため）。
+    /// 行形 INSERT（単一行・複数行 VALUES）の束縛だけが生成し、他の束縛経路は即時 `23502` のまま。
+    MissingNotNull(usize),
 }
 
 impl VolatileColumn {
     /// `schema.columns` 上の位置。
     pub fn index(&self) -> usize {
         match self {
-            VolatileColumn::Default(i) | VolatileColumn::Values(i, _) => *i,
+            VolatileColumn::Default(i)
+            | VolatileColumn::Values(i, _)
+            | VolatileColumn::MissingNotNull(i) => *i,
         }
     }
 }
@@ -3041,6 +3049,17 @@ pub fn bind_insert(
     stmt: &ValidatedInsert,
     schema: &TableSchema,
 ) -> Result<BoundInsert, SqlSurfaceError> {
+    bind_insert_impl(stmt, schema, false)
+}
+
+/// [`bind_insert`] の本体。`defer_not_null` が真なら、省略された非 nullable 列（DEFAULT なし）の
+/// `23502` を束縛時に返さず [`VolatileColumn::MissingNotNull`] として書き込み段へ運ぶ
+/// （[`bind_insert_form`] の行形 INSERT だけが真で呼ぶ。Issue #1629）。
+fn bind_insert_impl(
+    stmt: &ValidatedInsert,
+    schema: &TableSchema,
+    defer_not_null: bool,
+) -> Result<BoundInsert, SqlSurfaceError> {
     // 複数行 `VALUES`（SQL-16、TASK-190）は本関数の単一行契約外であり、2 行目
     // 以降を黙って無視する fail-open を避けるため明示的に拒否する（複数行の
     // 束縛は `bind_insert_form` の `RowBatch` 分岐を経由すること）。
@@ -3068,6 +3087,7 @@ pub fn bind_insert(
         values,
         &stmt.operation_id,
         schema,
+        defer_not_null,
     )
 }
 
@@ -3089,6 +3109,7 @@ pub(crate) fn fill_omitted_columns(
     bound_values: &mut [crate::row_codec::Value],
     provided: &[bool],
     clock: Option<crate::sql::time_fn::StatementClock>,
+    defer_not_null: bool,
 ) -> Result<Vec<VolatileColumn>, SqlSurfaceError> {
     // DEFAULT（定数・時刻とも）を適用した列の位置（内容照合ハッシュが材料から除外する対象。
     // `BoundInsert::volatile_default_columns`。Issue #1629）。
@@ -3122,7 +3143,12 @@ pub(crate) fn fill_omitted_columns(
             }
             None => {
                 if !column.nullable {
-                    return Err(SqlSurfaceError::not_null_violation(column.name.clone()));
+                    if defer_not_null && !matches!(column.ty, ColumnType::Vector(_)) {
+                        // 台帳照合の後で `tenant` が `23502` にする（`VolatileColumn::MissingNotNull`）。
+                        volatile.push(VolatileColumn::MissingNotNull(idx));
+                    } else {
+                        return Err(SqlSurfaceError::not_null_violation(column.name.clone()));
+                    }
                 }
             }
         }
@@ -3264,6 +3290,7 @@ fn bind_insert_row(
     values: &[InsertLiteral],
     operation_id: &Option<OperationId>,
     schema: &TableSchema,
+    defer_not_null: bool,
 ) -> Result<BoundInsert, SqlSurfaceError> {
     if columns.len() != values.len() {
         return Err(SqlSurfaceError::invalid_input(
@@ -3557,6 +3584,7 @@ fn bind_insert_row(
         &mut bound_values,
         &provided,
         crate::sql::time_fn::current_default_clock(),
+        defer_not_null,
     )?;
     volatile_default_columns.extend(volatile_values);
 
@@ -4762,7 +4790,7 @@ pub fn bind_insert_form(
         }
         bind_file_insert(stmt, schema).map(BoundInsertForm::File)
     } else if stmt.rows.len() <= 1 {
-        bind_insert(stmt, schema).map(BoundInsertForm::Row)
+        bind_insert_impl(stmt, schema, true).map(BoundInsertForm::Row)
     } else {
         let mut bounds: Vec<BoundInsert> = Vec::new();
         bounds.try_reserve_exact(stmt.rows.len()).map_err(|_| {
@@ -4775,6 +4803,7 @@ pub fn bind_insert_form(
                 values,
                 &stmt.operation_id,
                 schema,
+                true,
             )?);
         }
         Ok(BoundInsertForm::RowBatch(bounds))
@@ -4874,6 +4903,7 @@ fn bind_upsert_form(
             values,
             &stmt.operation_id,
             schema,
+            false,
         )?);
     }
 

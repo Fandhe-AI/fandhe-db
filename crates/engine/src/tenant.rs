@@ -1145,6 +1145,10 @@ fn check_volatile_columns(
                 .columns
                 .get(idx)
                 .is_some_and(|c| t.compatible_with(&c.ty)),
+            VolatileColumn::MissingNotNull(_) => schema
+                .columns
+                .get(idx)
+                .is_some_and(|c| !c.nullable && c.default_expr.is_none()),
         };
         let is_vector = schema
             .columns
@@ -1180,10 +1184,9 @@ fn named_value_columns<'a>(
         if Some(idx) == vector_idx || matches!(column.ty, crate::catalog::ColumnType::Vector(_)) {
             continue;
         }
-        if volatile
-            .iter()
-            .any(|c| matches!(c, VolatileColumn::Default(i) if *i == idx))
-        {
+        if volatile.iter().any(|c| {
+            matches!(c, VolatileColumn::Default(i) | VolatileColumn::MissingNotNull(i) if *i == idx)
+        }) {
             continue;
         }
         if let Some(value) = values.get(idx) {
@@ -1214,7 +1217,7 @@ fn named_expr_columns<'a>(
             continue;
         }
         match volatile.iter().find(|c| c.index() == idx) {
-            Some(VolatileColumn::Default(_)) => {}
+            Some(VolatileColumn::Default(_) | VolatileColumn::MissingNotNull(_)) => {}
             Some(VolatileColumn::Values(_, t)) => out.push((
                 column.name.as_str(),
                 content_hash::HashColumnInput::ValuesTime(*t),
@@ -1230,6 +1233,30 @@ fn named_expr_columns<'a>(
         }
     }
     Ok(out)
+}
+
+/// 台帳照合（再送判定）の後に、省略された非 nullable 列（[`VolatileColumn::MissingNotNull`]）を
+/// `23502` で拒否する（Issue #1629）。台帳に記録済みの同一文の再送は `record_in_txn` が先に
+/// `23505` を返すため、NOT NULL 列の DROP DEFAULT を挟んだ再送もここへ到達しない。
+/// 新規挿入として台帳へ記録された後に返す `Err` は、呼び出し元の write txn を commit しない
+/// （早期 return → drop）ため台帳追記ごと破棄される。列名のみを保持し値・他テナント情報は含めない。
+fn reject_missing_not_null(
+    schema: &crate::catalog::TableSchema,
+    volatile: &[VolatileColumn],
+) -> Result<(), TenantWriteError> {
+    for col in volatile {
+        if let VolatileColumn::MissingNotNull(idx) = col {
+            let name = schema
+                .columns
+                .get(*idx)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            return Err(TenantWriteError::Catalog(
+                CatalogError::NotNullConstraintViolation(name),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 行ごとの揮発性 DEFAULT 列の指定が行数と整合するか（空は「全行なし」）。
@@ -1353,14 +1380,6 @@ pub(crate) fn insert_typed_row_unchecked(
             None => &[],
         };
         schema.validate_row_embedding_dim(embedding.len())?;
-        let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
-            .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-        let row = RowInput {
-            tenant_id: ctx.tenant_id(),
-            visibility,
-            embedding,
-            metadata: &metadata,
-        };
         // 型付き挿入も行形 INSERT と同じ「新規挿入」操作としてハッシュ化する
         // （TASK-101・RECOVER-10。`content_hash::for_typed_insert` ドキュメント参照）。
         // `Err` の場合は行の書き込みへ進まず、`write_txn` が commit されない（早期
@@ -1395,6 +1414,17 @@ pub(crate) fn insert_typed_row_unchecked(
             ledger_write,
             &content_hash,
         )?;
+        reject_missing_not_null(&schema, volatile_default_columns)?;
+        // 行のエンコードは台帳照合と NOT NULL 検査の後に行う（省略された非 nullable 列の仮値
+        // `Null` が、再送判定より先に `22000` を起こさないため。Issue #1629）。
+        let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
+            .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+        let row = RowInput {
+            tenant_id: ctx.tenant_id(),
+            visibility,
+            embedding,
+            metadata: &metadata,
+        };
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -1568,6 +1598,9 @@ pub(crate) fn insert_typed_rows_unchecked(
                 ledger_write,
                 &content_hash,
             )?;
+            for row_volatile in volatile_default_columns {
+                reject_missing_not_null(&schema, row_volatile)?;
+            }
 
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
@@ -1911,6 +1944,7 @@ fn upsert_typed_rows_impl(
                         .get(row_idx)
                         .copied()
                         .unwrap_or(&[]);
+                    reject_missing_not_null(&schema, row_volatile)?;
                     let expr_columns =
                         named_expr_columns(&schema, values, vector_idx, row_volatile)?;
                     expr_rows.push((*id, insert_visibility, embedding, expr_columns));
@@ -1920,6 +1954,7 @@ fn upsert_typed_rows_impl(
                     .get(row_idx)
                     .copied()
                     .unwrap_or(&[]);
+                reject_missing_not_null(&schema, row_volatile)?;
                 let named_columns = named_value_columns(&schema, values, vector_idx, row_volatile)?;
                 hash_rows.push((*id, insert_visibility, embedding, named_columns));
             }

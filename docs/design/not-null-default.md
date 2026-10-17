@@ -309,5 +309,10 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
 - **D4 旧台帳との互換**: DEFAULT を適用していない文のバイト列は不変（golden テスト不変）。DEFAULT を
   適用する文は旧版の記録に対し `22023`（fail-closed）になる。legacy ハッシュは新しい正規ハッシュと
   一致しうるため受理しない（BREAKING）。
+- **D5 NOT NULL 列の DROP DEFAULT 後の再送**: 行形 INSERT（単一行・複数行 `VALUES`）の束縛は、
+  省略された非 nullable 列（DEFAULT なし）を `23502` にせず `VolatileColumn::MissingNotNull` として
+  書き込み段へ運ぶ（ハッシュ材料からは除外）。`tenant` が台帳照合の後に `23502` で拒否するため、
+  記録済みの同一文の再送は `23505`、新規の文は従来どおり `23502`（txn 破棄で台帳追記も残らない）。
+  UPSERT・COPY・ファイル形・NoSQL の束縛は即時 `23502` のまま（これらの NOT NULL 列の再送は対象外）。
 - **範囲外**: `INSERT ... VALUES (DEFAULT)`（SQL-50）と `UPDATE ... SET c = DEFAULT` は未実装。
   実装時は DEFAULT キーワードを構文形としてハッシュし評価値を入れない。
