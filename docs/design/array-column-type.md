@@ -337,9 +337,22 @@ SQL の INSERT／UPDATE／UPSERT／COPY、NoSQL の insert／update／filter `eq
 - **SQLSTATE の判断**: Issue 本文は不整列を `2202E` としているが、spec と PostgreSQL ではリテラルの不整列は
   `22P02`（`2202E` は `ARRAY[[..]]` の次元不一致用）。spec を正として `22P02` を採用した。
 - **出力**: `ArrayValue::to_pg_text` が入れ子の `{{..},{..}}` を描画する（CAST・wire の DataRow 共有。
-  上限つきで打ち切る）。NoSQL の応答は入れ子の JSON 配列。型公告 OID は text のまま（#1606）。
+  上限つきで打ち切る）。NoSQL の応答は入れ子の JSON 配列。型公告 OID は #1606 で配列型 OID へ更新した。
 - **既存の消費側**: 単一添字 `m[1]` は NULL、スライス `m[lo:hi]` は第 1 次元に沿った切り出し、
   配列 → 配列の CAST は次元を保つ。`ARRAY[[..]]`・多重添字 `arr[i][j]` は `0A000` のまま。
 - **対象外（申し送り）**: 入れ子の `ARRAY[[1,2],[3,4]]` コンストラクタと次元不一致の `2202E`、多重添字、
   配列型 OID の公告・NoSQL の入れ子 JSON 束縛（#1606・NOSQL-17）、`[1:2]={..}` の下限装飾、`{{}}` の
   PostgreSQL との一致確認（現状は fail-closed の `22P02`）、添字への代入。
+
+## Issue #1606 追記（wire の型公告と上限設定）
+
+親 #1601・TABLE-35 (3)(4)・SQL-46・WIRE-13・WIRE-14・WIRE-24 のポインタ。
+
+- **型公告**: 配列は要素型ごとの PostgreSQL 配列型 OID で RowDescription に公告する（`int4[]`=1007 など。
+  多次元でも同じ。ENUM[] は text のまま）。写像は [wire-type-oid-mapping.md](wire-type-oid-mapping.md)
+  の「Issue #1606 追記」。テキスト出力（入れ子 `{}`）は #1605 で実装済みで、値は不変。
+- **バイナリ**: 配列のバイナリ形式は対象外のまま（`0A000`・接続維持）。
+- **上限の CLI**: `--max-array-elements`（#1548）が多次元の宣言にも効くことを wire 結合テスト
+  （`wire_array_multidim_output.rs`）で固定した。式の結果や中間値の総数へ設定値を通すことは
+  engine 横断の変更のため対象外（現状は定数 1024 で、既定値の挙動は一致）。
+
