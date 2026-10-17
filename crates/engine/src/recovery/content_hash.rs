@@ -1912,6 +1912,11 @@ fn collect_referenced_udfs(
             }
             Ok(())
         }
+        // 量化比較（TABLE-35・Issue #1603）は左辺・配列式の UDF 呼び出しを再帰的に走査する。
+        Expr::Quantified { lhs, rhs, .. } => {
+            collect_referenced_udfs(lhs, udf_registry, out)?;
+            collect_referenced_udfs(rhs, udf_registry, out)
+        }
         Expr::Subscript { base, subscript } => {
             use crate::sql::udf_call::ArraySubscript;
             collect_referenced_udfs(base, udf_registry, out)?;
@@ -2063,6 +2068,10 @@ fn push_set_expr(
             }
             Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => walk(b, expr),
             Expr::ArrayConstructor(items) => items.iter().for_each(|e| walk(b, e)),
+            Expr::Quantified { lhs, rhs, .. } => {
+                walk(b, lhs);
+                walk(b, rhs);
+            }
             Expr::Subscript { base, subscript } => {
                 use crate::sql::udf_call::ArraySubscript;
                 walk(b, base);
@@ -2314,6 +2323,8 @@ fn push_dml_expr(
                 // Issue #2186: jsonpath 演算子。既存の 1〜11 は不変。
                 crate::sql::udf_call::JsonAccessOp::PathExists => 12,
                 crate::sql::udf_call::JsonAccessOp::PathMatch => 13,
+                // Issue #1603: 配列の重なり `&&`。既存の 1〜13 は不変。
+                crate::sql::udf_call::JsonAccessOp::Overlap => 14,
             });
             push_dml_expr(b, lhs, params)?;
             push_dml_expr(b, rhs, params)?;
@@ -2400,6 +2411,24 @@ fn push_dml_expr(
             for item in items {
                 push_dml_expr(b, item, params)?;
             }
+        }
+        // タグ 19（対象ビヘイビア: TABLE-35。Issue #1603。変更禁止）。量化比較
+        // `lhs op ANY|ALL (rhs)` を「比較演算子 1 バイト・量化子 1 バイト（0=ANY・1=ALL）・左辺・
+        // 右辺」の順で直列化する。演算子・ANY と ALL・左右の入れ替えを同一内容と誤判定しない。
+        Expr::Quantified {
+            op,
+            quantifier,
+            lhs,
+            rhs,
+        } => {
+            b.push_u8(19);
+            b.push_u8(op.hash_tag());
+            b.push_u8(match quantifier {
+                crate::sql::udf_call::Quantifier::Any => 0,
+                crate::sql::udf_call::Quantifier::All => 1,
+            });
+            push_dml_expr(b, lhs, params)?;
+            push_dml_expr(b, rhs, params)?;
         }
         Expr::Subscript { base, subscript } => {
             use crate::sql::udf_call::ArraySubscript;
@@ -5058,6 +5087,20 @@ mod tests {
             rhs: Box::new(r),
         }
     }
+    use crate::sql::udf_call::{ArrayCmpOp, Quantifier};
+    fn quantified(
+        op: ArrayCmpOp,
+        quantifier: Quantifier,
+        l: crate::sql::udf_call::Expr,
+        r: crate::sql::udf_call::Expr,
+    ) -> crate::sql::udf_call::Expr {
+        crate::sql::udf_call::Expr::Quantified {
+            op,
+            quantifier,
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        }
+    }
     fn json_access(
         op: crate::sql::udf_call::JsonAccessOp,
         l: crate::sql::udf_call::Expr,
@@ -5391,6 +5434,36 @@ mod tests {
                     text("a"),
                 ),
                 json_access(crate::sql::udf_call::JsonAccessOp::Exists, n(), text("a")),
+            ),
+            // Issue #1603: 配列の重なり `&&` と量化比較（タグ 19）は互いに・既存の演算子と区別される。
+            (
+                "array overlap vs contains",
+                json_access(crate::sql::udf_call::JsonAccessOp::Overlap, n(), text("{}")),
+                json_access(
+                    crate::sql::udf_call::JsonAccessOp::Contains,
+                    n(),
+                    text("{}"),
+                ),
+            ),
+            (
+                "quantified any vs all",
+                quantified(ArrayCmpOp::Eq, Quantifier::Any, n(), text("{1}")),
+                quantified(ArrayCmpOp::Eq, Quantifier::All, n(), text("{1}")),
+            ),
+            (
+                "quantified eq vs ne",
+                quantified(ArrayCmpOp::Eq, Quantifier::Any, n(), text("{1}")),
+                quantified(ArrayCmpOp::Ne, Quantifier::Any, n(), text("{1}")),
+            ),
+            (
+                "quantified lt vs ge",
+                quantified(ArrayCmpOp::Lt, Quantifier::All, n(), text("{1}")),
+                quantified(ArrayCmpOp::Ge, Quantifier::All, n(), text("{1}")),
+            ),
+            (
+                "quantified operand swap",
+                quantified(ArrayCmpOp::Eq, Quantifier::Any, n(), text("{1}")),
+                quantified(ArrayCmpOp::Eq, Quantifier::Any, text("{1}"), n()),
             ),
             // Issue #2181: 連結・パス削除演算子も種別・左右で区別される（下位タグ 10・11）。
             (

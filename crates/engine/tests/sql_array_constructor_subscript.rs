@@ -530,14 +530,17 @@ fn unsupported_contexts_fail_closed() {
     assert_eq!(code(&core, "SELECT 1 + ARRAY[1] LIMIT 1"), "0A000");
     assert_eq!(code(&core, "SELECT a:b FROM t LIMIT 1"), "42601");
     assert_eq!(code(&core, "SELECT ARRAY[1,2][1]"), "42601");
-    // WHERE の配列の等価述語は従来どおりリテラルのみ（式との比較は後続 Issue #1603）。
-    assert!(!matches!(
+    // 配列式どうしの比較・ANY／ALL・包含は Issue #1603 で対応済み（`sql_array_predicates.rs`）。
+    // 式との等価比較が成功して正しい行を返す。
+    assert_eq!(ids(&core, "alice", "nums = ARRAY[10, 20, 30]"), vec![1]);
+    // `IN (ARRAY[...])` は従来どおり拒否のまま。
+    assert_ne!(
         code(
             &core,
-            "SELECT id FROM t WHERE nums = ARRAY[10, 20, 30] LIMIT 5"
+            "SELECT id FROM t WHERE nums IN (ARRAY[10, 20, 30]) LIMIT 5"
         ),
         "00000"
-    ));
+    );
 }
 
 #[test]
