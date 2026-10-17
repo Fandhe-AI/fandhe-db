@@ -122,7 +122,7 @@ const MAX_INDEX_COUNT: usize = MAX_LIST_TABLES;
 /// 無関係な通常の行 DML（テーブル単位世代のみ進む）ではキャッシュを無効化しない
 /// ようにする。**不変条件**: [`INDEX_CATALOG_TABLE`] を書き込む経路
 /// （[`Storage::create_index`]・[`Storage::drop_index`]・
-/// [`retain_index_defs_in_txn`]）は必ず同一 write txn 内で
+/// [`retain_index_defs_in_txn`]・[`rename_index_def_columns_in_txn`]）は必ず同一 write txn 内で
 /// [`bump_index_catalog_generation_in_txn`] を呼ぶこと。新たに
 /// [`INDEX_CATALOG_TABLE`] への書き込み経路を追加する場合も同様に呼び忘れない
 /// （呼び忘れは古い HNSW 宣言判定の再利用＝fail-open に直結する）。
@@ -889,58 +889,26 @@ fn retain_index_defs_in_txn(
     Ok(())
 }
 
-/// 列改名（[`Storage::alter_table_rename_column`]）の依存オブジェクト検査（TABLE-38 の
-/// ポインタ、Issue #1619）。`table` の列 `column_name` を参照する PRIMARY KEY・UNIQUE・
-/// CHECK・外部キー（子側・親側）・索引宣言、または `table` を参照するビューが 1 件でも
-/// あれば `FeatureNotSupported`（`0A000`）で拒否する。名前だけ書き換えて古い名前の参照を
-/// 残す形は作らない（fail-closed）。
+/// 列改名（[`Storage::alter_table_rename_column`]）のビュー依存検査（TABLE-38 の
+/// ポインタ、Issue #1619・#1620）。`table` を参照するビューが 1 件でもあれば
+/// `FeatureNotSupported`（`0A000`）で拒否する。PRIMARY KEY・UNIQUE・CHECK・外部キー・
+/// 索引宣言の追随は Issue #1620 で [`TableSchema::rename_column_references`] 等へ
+/// 移した（本関数は拒否しない）。
 ///
-/// 兄弟 Issue（制約・索引の追随は #1620、ビュー定義の追随は #1621）はこの関数を
-/// 「拒否」から「参照の書き換え」へ置き換える差し込み点になる。ビューは列単位でなく
-/// 表単位で保守的に拒否する（`SELECT *` 経由の公開列名が変わるため。#1621 で精緻化）。
-/// CHECK の再計算失敗・ビュー本文の再検証失敗は「依存あり」とする。
-fn rename_column_dependents_in_txn(
+/// ビュー定義の追随（Issue #1621）はこの関数を「拒否」から「参照の書き換え」へ置き換える
+/// 差し込み点になる。ビューは列単位でなく表単位で保守的に拒否する（`SELECT *` 経由の
+/// 公開列名が変わるため。#1621 で精緻化）。
+fn refuse_rename_column_with_views_in_txn(
     write_txn: &redb::WriteTransaction,
-    schema: &TableSchema,
     table: &str,
-    column_name: &str,
 ) -> std::result::Result<(), AlterCheckError> {
-    let refused = || {
-        AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
-            detail: "renaming a column referenced by a constraint, index, or view is not supported"
-                .to_string(),
-        })
-    };
-    if schema
-        .primary_key
-        .as_ref()
-        .is_some_and(|pk| pk.iter().any(|c| c == column_name))
-        || schema
-            .unique_constraints
-            .iter()
-            .any(|u| u.columns().iter().any(|c| c == column_name))
-        || schema_check_references_column(schema, column_name)
-        || schema
-            .foreign_keys
-            .iter()
-            .any(|fk| fk.columns.iter().any(|c| c == column_name))
-    {
-        return Err(refused());
-    }
-    // 親側 FK（自己参照を含む）。PK／UNIQUE 検査と重なるが多層防御として明示する。
-    let referencing = referencing_foreign_keys_in_txn(write_txn, table)?;
-    if referencing.iter().any(|(_, fk)| {
-        fk.parent_table == table && fk.parent_columns.iter().any(|c| c == column_name)
-    }) {
-        return Err(refused());
-    }
-    if indexes_reference_column_in_txn(write_txn, table, column_name)? {
-        return Err(refused());
-    }
     match write_txn.open_table(VIEWS_TABLE) {
         Ok(views_table) => {
             if !views_depending_on_in_txn(&views_table, table)?.is_empty() {
-                return Err(refused());
+                return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                    detail: "renaming a column of a table referenced by a view is not supported"
+                        .to_string(),
+                }));
             }
         }
         Err(redb::TableError::TableDoesNotExist(_)) => {}
@@ -949,32 +917,52 @@ fn rename_column_dependents_in_txn(
     Ok(())
 }
 
-/// `table` の索引宣言（scalar・hnsw とも）のいずれかが列 `column_name` を含むか
-/// （[`rename_column_dependents_in_txn`] が使う読み取り専用の走査。
-/// [`retain_index_defs_in_txn`] と同じ [`MAX_INDEX_COUNT`] 打ち切り）。
-fn indexes_reference_column_in_txn(
+/// 列改名（[`Storage::alter_table_rename_column`]）が同一 write txn から呼ぶ。`table` の
+/// 索引宣言（scalar・hnsw とも）のうち列 `old` を含むものの列名を `new` へ書き換え、
+/// 1 件でも書いたら索引カタログ世代を bump する（`INDEX_CATALOG_GENERATION_TABLE` の
+/// 不変条件）。索引名・種別・照合（列と位置対応）は維持する。
+/// [`retain_index_defs_in_txn`] と同じ [`MAX_INDEX_COUNT`] 打ち切り。
+fn rename_index_def_columns_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
-    column_name: &str,
-) -> Result<bool> {
-    let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
-        Err(e) => return Err(e.into()),
+    old: &str,
+    new: &str,
+) -> Result<()> {
+    let rewritten = {
+        let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut updates: Vec<(String, Vec<u8>)> = Vec::new();
+        for (scanned, entry) in index_table.iter()?.enumerate() {
+            if scanned >= MAX_INDEX_COUNT {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                )));
+            }
+            let (key, value) = entry?;
+            let name = key.value().to_string();
+            let mut def = decode_index_def(&name, value.value())?;
+            if def.table != table || !def.columns.iter().any(|c| c == old) {
+                continue;
+            }
+            for c in &mut def.columns {
+                if c == old {
+                    *c = new.to_string();
+                }
+            }
+            updates.push((name, encode_index_def(&def)?));
+        }
+        for (name, bytes) in &updates {
+            index_table.insert(name.as_str(), bytes.as_slice())?;
+        }
+        !updates.is_empty()
     };
-    for (scanned, entry) in index_table.iter()?.enumerate() {
-        if scanned >= MAX_INDEX_COUNT {
-            return Err(CatalogError::CorruptSchema(format!(
-                "index catalog exceeds {MAX_INDEX_COUNT} entries"
-            )));
-        }
-        let (key, value) = entry?;
-        let def = decode_index_def(key.value(), value.value())?;
-        if def.table == table && def.columns.iter().any(|c| c == column_name) {
-            return Ok(true);
-        }
+    if rewritten {
+        bump_index_catalog_generation_in_txn(write_txn)?;
     }
-    Ok(false)
+    Ok(())
 }
 
 /// [`Storage::drop_table`] が同一 write txn から呼ぶ。対象テーブルの索引宣言を
@@ -4586,6 +4574,52 @@ impl TableSchema {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             bytea_defaults: MaterializedDefaultCache::default(),
+        }
+    }
+
+    /// 列改名（[`Storage::alter_table_rename_column`]。TABLE-38 のポインタ、Issue #1620）で、
+    /// 論理列名・PRIMARY KEY・UNIQUE（制約名は維持）・自表の外部キー（子側の `columns` と
+    /// 自己参照の `parent_columns`）の `old` を `new` へ置換する。CHECK は述語テキストの
+    /// 再生成が要るため呼び出し元が別途扱う（[`crate::sql::check_constraint::rename_column_in_check`]）。
+    fn rename_column_references(&mut self, old: &str, new: &str) {
+        let swap = |names: &mut Vec<String>| {
+            for n in names.iter_mut() {
+                if n == old {
+                    *n = new.to_string();
+                }
+            }
+        };
+        for column in &mut self.columns {
+            if column.name == old {
+                column.name = new.to_string();
+            }
+        }
+        if let Some(pk) = self.primary_key.as_mut() {
+            swap(pk);
+        }
+        for u in &mut self.unique_constraints {
+            swap(&mut u.columns);
+        }
+        let own = self.name.clone();
+        for fk in &mut self.foreign_keys {
+            swap(&mut fk.columns);
+            if fk.parent_table == own {
+                swap(&mut fk.parent_columns);
+            }
+        }
+    }
+
+    /// 親テーブル `parent` の列改名に追随して、自表の外部キーのうち `parent` を参照するものの
+    /// `parent_columns` を置換する（Issue #1620。子テーブル側の書き換え）。
+    fn rename_parent_column_references(&mut self, parent: &str, old: &str, new: &str) {
+        for fk in &mut self.foreign_keys {
+            if fk.parent_table == parent {
+                for n in &mut fk.parent_columns {
+                    if n == old {
+                        *n = new.to_string();
+                    }
+                }
+            }
         }
     }
 
@@ -8503,8 +8537,14 @@ impl Storage {
     ///
     /// 判定順序（決定的）: 識別子検証・予約列（`ProtectedColumn`）→ 表の存在
     /// （`TableNotFound`）→ 改名元の列の存在（`ColumnNotFound`）→ 改名先が既存の生存列
-    /// （同名への変更を含む。`ColumnAlreadyExists`）→ 依存オブジェクト
-    /// （[`rename_column_dependents_in_txn`]。`AlterCheckError::Sql(FeatureNotSupported)`）。
+    /// （同名への変更を含む。`ColumnAlreadyExists`）→ ビュー依存
+    /// （[`refuse_rename_column_with_views_in_txn`]。`AlterCheckError::Sql(FeatureNotSupported)`）。
+    ///
+    /// Issue #1620: PRIMARY KEY・UNIQUE・CHECK・外部キー（子側・親側・自己参照）・索引宣言
+    /// の列参照は同一 txn で新しい名前へ書き換える（制約名は維持）。CHECK の書き換えに
+    /// 失敗した場合は `0A000` で全体を破棄する。列名を含む派生索引（`user_uniq`・
+    /// `key_index`）は同一 txn で失効させ、次の検査で遅延再構築する。親側 FK を持つ
+    /// 他テーブルのスキーマとテーブル世代、索引カタログ世代も更新する。
     pub(crate) fn alter_table_rename_column(
         &self,
         table_name: &str,
@@ -8540,20 +8580,82 @@ impl Storage {
             let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
             decode_schema_with_resolver(table_name, &existing, &mut resolve)?
         };
-        let logical_index = schema
-            .columns
-            .iter()
-            .position(|c| c.name == old_name)
-            .ok_or_else(|| CatalogError::ColumnNotFound(old_name.to_string()))?;
+        if !schema.columns.iter().any(|c| c.name == old_name) {
+            return Err(CatalogError::ColumnNotFound(old_name.to_string()).into());
+        }
         if schema.columns.iter().any(|c| c.name == new_name) {
             return Err(CatalogError::ColumnAlreadyExists(new_name.to_string()).into());
         }
-        // CATALOG_TABLE のハンドルを解放してから呼ぶ（`referencing_foreign_keys_in_txn`
-        // の契約）。
-        rename_column_dependents_in_txn(&write_txn, &schema, table_name, old_name)?;
-        if let Some(column) = schema.columns.get_mut(logical_index) {
-            column.name = new_name.to_string();
+        refuse_rename_column_with_views_in_txn(&write_txn, table_name)?;
+        let old_schema = schema.clone();
+        schema.rename_column_references(old_name, new_name);
+        // CHECK は AST 経由で書き換え、再束縛・往復一致・上限検証を通す。1 件でも失敗したら
+        // `0A000` で全体を破棄する（txn を commit しない。名前だけ変えて旧名の参照を残す
+        // fail-open を作らない）。
+        let refuse_check = || {
+            AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail: "renaming a column referenced by this CHECK constraint is not supported"
+                    .to_string(),
+            })
+        };
+        let bare_schema = schema.clone().with_checks(Vec::new());
+        let mut new_checks = Vec::with_capacity(old_schema.checks.len());
+        for check in &old_schema.checks {
+            if check_references_column(&old_schema, check, old_name) {
+                new_checks.push(
+                    crate::sql::check_constraint::rename_column_in_check(
+                        &bare_schema,
+                        check,
+                        old_name,
+                        new_name,
+                    )
+                    .map_err(|_| refuse_check())?,
+                );
+            } else {
+                new_checks.push(check.clone());
+            }
         }
+        schema = bare_schema.with_checks(new_checks);
+        // 親側 FK: `table` を参照する他テーブル（自己参照は自表の書き換えで済む）の
+        // `parent_columns` を追随させる。CATALOG_TABLE のハンドルを解放した状態で呼ぶ
+        // （`referencing_foreign_keys_in_txn` の契約）。
+        let referencing = referencing_foreign_keys_in_txn(&write_txn, table_name)?;
+        let mut seen_children: std::collections::BTreeSet<String> = Default::default();
+        for (child, _) in referencing {
+            if child.name == table_name || !seen_children.insert(child.name.clone()) {
+                continue;
+            }
+            let mut child = child;
+            child.rename_parent_column_references(table_name, old_name, new_name);
+            let child_encoded = encode_schema(&child)?;
+            {
+                let mut table = write_txn
+                    .open_table(CATALOG_TABLE)
+                    .map_err(CatalogError::from)?;
+                table
+                    .insert(child.name.as_str(), child_encoded.as_slice())
+                    .map_err(CatalogError::from)?;
+            }
+            bump_table_generation_in_txn(&write_txn, &child.name)?;
+        }
+        rename_index_def_columns_in_txn(&write_txn, table_name, old_name, new_name)?;
+        // 列名を含む派生索引（永続一意索引・キー索引）を同一 txn で失効させる。stale な
+        // 索引を後の同名列で「構築済み」と誤認する fail-open を防ぐ（Issue #1402 と同じ）。
+        if old_schema
+            .primary_key
+            .as_ref()
+            .is_some_and(|pk| pk.iter().any(|c| c == old_name))
+            || old_schema
+                .unique_constraints
+                .iter()
+                .any(|u| u.columns().iter().any(|c| c == old_name))
+        {
+            write_txn
+                .delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))
+                .map_err(CatalogError::from)?;
+        }
+        crate::key_index::drop_indexes_containing_column_in_txn(&write_txn, table_name, old_name)?;
+        crate::key_index::drop_indexes_containing_column_in_txn(&write_txn, table_name, new_name)?;
         // `validate_schema`（`encode_schema` 内で呼ばれる）が名前の重複等の不変条件を
         // 再検証する。
         let encoded = encode_schema(&schema)?;
@@ -12264,6 +12366,27 @@ mod tests {
             gen6 > gen5,
             "alter_table_drop_column must bump index catalog generation when it removes a declaration"
         );
+
+        // `alter_table_rename_column` は宣言列を書き換えたときだけ進める（Issue #1620）。
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs2", "docs"))
+            .expect("create hnsw index on docs.embedding");
+        let gen7 = read_gen();
+        storage
+            .alter_table_rename_column("docs", "flag", "flag2")
+            .expect("rename column without a declaration");
+        assert_eq!(
+            read_gen(),
+            gen7,
+            "renaming a column no declaration uses must not bump the index catalog generation"
+        );
+        storage
+            .alter_table_rename_column("docs", "embedding", "emb")
+            .expect("rename declared column");
+        assert!(
+            read_gen() > gen7,
+            "alter_table_rename_column must bump index catalog generation when it rewrites a declaration"
+        );
     }
 
     /// 通常の行 DML（`insert_typed_row`）や索引と無関係な DDL（`create_table`・
@@ -15623,12 +15746,190 @@ mod tests {
             err(storage.alter_table_rename_column("missing", "a", "b")),
             AlterCheckError::Catalog(CatalogError::TableNotFound(_))
         ));
-        assert!(matches!(
-            err(storage.alter_table_rename_column("docs", "kind", "k2")),
-            AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported { .. })
-        ));
         let after = storage.get_table_schema("docs").expect("schema");
         assert!(after.columns.iter().any(|c| c.name == "kind"));
+    }
+
+    /// 改名で PK・UNIQUE（名前維持）・CHECK・FK（子側・親側・自己参照）・索引宣言が新しい
+    /// 列名へ追随し、再オープン後も同じ状態であること（TABLE-38 のポインタ、Issue #1620）。
+    #[test]
+    fn alter_table_rename_column_rewrites_constraints_and_indexes() {
+        let path = unique_db_path("rename-column-rewrites");
+        let _guard = CleanupGuard(path.clone());
+        let fk = |cols: &[&str], parent: &str, pcols: &[&str]| {
+            ForeignKeyDef::new(
+                cols.iter().map(|c| c.to_string()).collect(),
+                parent.to_string(),
+                pcols.iter().map(|c| c.to_string()).collect(),
+                ReferentialAction::NoAction,
+                ReferentialAction::NoAction,
+            )
+        };
+        let unique_name;
+        let parent_checks;
+        {
+            let storage = Storage::open(&path).expect("open storage");
+            let parent = TableSchema::new(
+                "pt",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("code", ColumnType::Text, false),
+                    ColumnDef::new("u", ColumnType::Text, true),
+                    ColumnDef::new("qty", ColumnType::Integer, true),
+                    ColumnDef::new("up", ColumnType::Text, true),
+                ],
+            )
+            .with_primary_key(vec!["code".to_string()])
+            .with_unique_constraints(vec![UniqueConstraint::with_name(
+                "my_unique".to_string(),
+                vec!["u".to_string()],
+            )])
+            .with_checks(vec![CheckConstraint {
+                name: "qty_pos".to_string(),
+                columns: vec!["qty".to_string()],
+                predicate_sql: "qty > 0".to_string(),
+            }])
+            .with_foreign_keys(vec![fk(&["up"], "pt", &["code"])]);
+            storage.create_table(&parent).expect("create parent");
+            let child = TableSchema::new(
+                "ct",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("pcode", ColumnType::Text, true),
+                ],
+            )
+            .with_foreign_keys(vec![fk(&["pcode"], "pt", &["code"])]);
+            storage.create_table(&child).expect("create child");
+            storage
+                .create_index(&scalar_def("idx_qty", "pt", &["qty", "u"]))
+                .expect("scalar index");
+            storage
+                .create_index(&hnsw_def("idx_hnsw_pt", "pt"))
+                .expect("hnsw index");
+            let child_gen_before = {
+                let r = storage.db().begin_read().expect("read");
+                crate::storage::current_generation_in_txn(&r).expect("gen")
+            };
+
+            for (old, new) in [("code", "k"), ("u", "uu"), ("qty", "q"), ("up", "upper")] {
+                storage
+                    .alter_table_rename_column("pt", old, new)
+                    .unwrap_or_else(|e| panic!("rename {old}: {e:?}"));
+            }
+            storage
+                .alter_table_rename_column("ct", "pcode", "pk2")
+                .expect("rename child column");
+            let child_gen_after = {
+                let r = storage.db().begin_read().expect("read");
+                crate::storage::current_generation_in_txn(&r).expect("gen")
+            };
+            assert!(child_gen_after > child_gen_before);
+            unique_name = "my_unique".to_string();
+            parent_checks = storage
+                .get_table_schema("pt")
+                .expect("pt")
+                .checks()
+                .to_vec();
+        }
+        assert_eq!(parent_checks.len(), 1);
+        for round in 0..2 {
+            // round 1 は再オープン後。
+            let storage = Storage::open(&path).expect("reopen storage");
+            let pt = storage.get_table_schema("pt").expect("pt");
+            assert_eq!(
+                pt.primary_key(),
+                Some(&["k".to_string()][..]),
+                "round {round}"
+            );
+            assert_eq!(pt.unique_constraints().len(), 1);
+            assert_eq!(pt.unique_constraints()[0].name(), unique_name);
+            assert_eq!(pt.unique_constraints()[0].columns(), ["uu".to_string()]);
+            assert_eq!(pt.checks()[0].name, "qty_pos");
+            assert_eq!(pt.checks()[0].columns, vec!["q".to_string()]);
+            assert_eq!(pt.checks()[0].predicate_sql, "q > 0");
+            assert_eq!(pt.foreign_keys()[0].columns(), ["upper".to_string()]);
+            assert_eq!(pt.foreign_keys()[0].parent_columns(), ["k".to_string()]);
+            let ct = storage.get_table_schema("ct").expect("ct");
+            assert_eq!(ct.foreign_keys()[0].columns(), ["pk2".to_string()]);
+            assert_eq!(ct.foreign_keys()[0].parent_columns(), ["k".to_string()]);
+            let indexes = storage.list_indexes().expect("indexes");
+            let scalar = indexes.iter().find(|d| d.name == "idx_qty").expect("idx");
+            assert_eq!(scalar.columns, vec!["q".to_string(), "uu".to_string()]);
+            let hnsw = indexes
+                .iter()
+                .find(|d| d.name == "idx_hnsw_pt")
+                .expect("hnsw");
+            assert_eq!(hnsw.columns, vec!["embedding".to_string()]);
+        }
+    }
+
+    /// CHECK の書き換えに失敗する改名（述語テキストが長さ上限を超える）は `0A000` で拒否し、自表・子表・索引宣言・世代の
+    /// いずれも変えない（fail-closed・単一 txn）。
+    #[test]
+    fn rename_column_rewrite_failure_is_atomic() {
+        let path = unique_db_path("rename-column-atomic");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let parent = TableSchema::new(
+            "pt",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("code", ColumnType::Text, false),
+                ColumnDef::new("qty", ColumnType::Integer, true),
+            ],
+        )
+        .with_primary_key(vec!["code".to_string()])
+        .with_checks(vec![CheckConstraint {
+            name: "qty_pos".to_string(),
+            columns: vec!["qty".to_string()],
+            // 改名後に述語テキストが長さ上限を超える形（旧名 3 文字を 40 文字へ）。
+            predicate_sql: vec!["qty > 0"; 200].join(" AND "),
+        }]);
+        storage.create_table(&parent).expect("create parent");
+        let child = TableSchema::new(
+            "ct",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("pcode", ColumnType::Text, true),
+            ],
+        )
+        .with_foreign_keys(vec![ForeignKeyDef::new(
+            vec!["pcode".to_string()],
+            "pt".to_string(),
+            vec!["code".to_string()],
+            ReferentialAction::NoAction,
+            ReferentialAction::NoAction,
+        )]);
+        storage.create_table(&child).expect("create child");
+        storage
+            .create_index(&scalar_def("idx_qty", "pt", &["qty"]))
+            .expect("index");
+        let snapshot = |storage: &Storage| {
+            let r = storage.db().begin_read().expect("read");
+            (
+                storage.get_table_schema("pt").expect("pt"),
+                storage.get_table_schema("ct").expect("ct"),
+                storage.list_indexes().expect("indexes"),
+                index_catalog_generation_in_txn(&r).expect("index gen"),
+                crate::storage::current_generation_in_txn(&r).expect("gen"),
+            )
+        };
+        let before = snapshot(&storage);
+        let (old, new) = ("qty", "q_".repeat(20));
+        let result = storage.alter_table_rename_column("pt", old, &new);
+        assert!(
+            matches!(
+                result,
+                Err(AlterCheckError::Sql(
+                    SqlSurfaceError::FeatureNotSupported { .. }
+                ))
+            ),
+            "{old} -> {new}: {result:?}"
+        );
+        assert!(
+            snapshot(&storage) == before,
+            "state changed by {old} -> {new}"
+        );
     }
 
     /// 予約列（`id`／`tenant_id`／`visibility`）・`VECTOR` 列・不存在列・最後の
