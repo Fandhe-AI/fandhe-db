@@ -3,8 +3,8 @@
 //!
 //! `EngineCore::execute_sql_in_session`（構文検証 → `require_ddl_permission` →
 //! `sql::ddl::execute_alter_table_rename_column`）を production 経路として検証する
-//! （`sql_ddl_drop_alter_column.rs` と同じ流儀）。参照オブジェクト（制約・索引・ビュー）の
-//! 追随は兄弟 Issue の範囲で、本 Issue は依存のある列の改名を `0A000` で拒否する契約を固定する。
+//! （`sql_ddl_drop_alter_column.rs` と同じ流儀）。制約・索引の追随は兄弟 Issue の範囲で、依存のある列の改名は `0A000` で拒否する契約を固定する。
+//! ビュー定義の追随（Issue #1621）は単純形を書き換え、評価後射影形は `0A000` で拒否する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -12,7 +12,7 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::allowlist::SqlSurfaceError;
 use engine::sql::ddl::AlterTableAction;
-use engine::sql::exec::Cell;
+use engine::sql::exec::{Cell, ColumnMeta};
 use engine::sql::mode::SessionState;
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
@@ -304,25 +304,285 @@ fn dependent_columns_are_rejected_with_0a000_and_schema_is_unchanged() {
     .expect("independent column");
 }
 
+/// ビュー経由の SELECT の結果列名（先頭行セットの列名一覧）。
+fn view_columns(core: &EngineCore, sql: &str) -> Vec<String> {
+    core.execute_sql(&ctx(), sql)
+        .expect("select via view")
+        .columns
+        .into_iter()
+        .filter_map(|c| match c {
+            ColumnMeta::Scalar { name, .. } => Some(name),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
-fn table_with_view_rejects_rename_conservatively() {
+fn simple_view_projection_follows_rename() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
+    insert(&core, 1, "note, qty", "'hello', 7");
     run(
         &core,
         &mut session,
         "CREATE VIEW v_docs AS SELECT note FROM docs",
     )
     .expect("view");
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN note TO memo",
+    )
+    .expect("rename follows view");
+    let out = core
+        .execute_sql(&ctx(), "SELECT memo FROM v_docs LIMIT 100")
+        .expect("view reads renamed column");
+    assert_eq!(out.rows.len(), 1);
+    assert!(matches!(&out.rows[0].cells[0], Cell::Text(t) if t == "hello"));
+    // 古い名前はビューの公開列から消える。
+    let err = core
+        .execute_sql(&ctx(), "SELECT note FROM v_docs LIMIT 100")
+        .expect_err("old name is gone from the view");
+    assert_eq!(err.wire_code(), "42703");
+}
+
+#[test]
+fn select_star_view_exposes_new_name() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    insert(&core, 1, "note, qty", "'a', 1");
+    run(
+        &core,
+        &mut session,
+        "CREATE VIEW v_all AS SELECT * FROM docs",
+    )
+    .expect("view");
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN note TO memo",
+    )
+    .expect("rename");
+    let cols = view_columns(&core, "SELECT * FROM v_all LIMIT 100");
+    assert!(cols.iter().any(|c| c == "memo"));
+    assert!(!cols.iter().any(|c| c == "note"));
+}
+
+#[test]
+fn view_where_predicates_follow_rename() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    insert(&core, 1, "note, qty, label", "'a', 1, 'x'");
+    insert(&core, 2, "note, qty, label", "'b', 5, 'y'");
+    for sql in [
+        "CREATE VIEW v_eq AS SELECT id FROM docs WHERE note = 'a'",
+        "CREATE VIEW v_like AS SELECT id FROM docs WHERE note LIKE 'a%'",
+        "CREATE VIEW v_cmp AS SELECT id FROM docs WHERE qty >= '3'",
+        "CREATE VIEW v_false AS SELECT id FROM docs WHERE FALSE",
+    ] {
+        run(&core, &mut session, sql).expect("create view");
+    }
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN note TO memo",
+    )
+    .expect("rename note");
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN qty TO amount",
+    )
+    .expect("rename qty");
+    for (view, expected) in [
+        ("v_eq", 1usize),
+        ("v_like", 1),
+        ("v_cmp", 1),
+        ("v_false", 0),
+    ] {
+        let out = core
+            .execute_sql(&ctx(), &format!("SELECT id FROM {view} LIMIT 100"))
+            .expect("view still works");
+        assert_eq!(out.rows.len(), expected, "{view}");
+    }
+}
+
+#[test]
+fn chained_views_follow_only_exposing_branches() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    insert(&core, 1, "note, qty", "'a', 1");
+    for sql in [
+        "CREATE VIEW v1 AS SELECT * FROM docs",
+        "CREATE VIEW v2 AS SELECT note FROM v1",
+        // note を公開しない枝（label のみ）。
+        "CREATE VIEW v3 AS SELECT label FROM docs",
+        "CREATE VIEW v4 AS SELECT label FROM v3",
+    ] {
+        run(&core, &mut session, sql).expect("create view");
+    }
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN note TO memo",
+    )
+    .expect("rename");
+    let out = core
+        .execute_sql(&ctx(), "SELECT memo FROM v2 LIMIT 100")
+        .expect("chained view follows");
+    assert_eq!(out.rows.len(), 1);
+    core.execute_sql(&ctx(), "SELECT label FROM v4 LIMIT 100")
+        .expect("unaffected branch");
+}
+
+#[test]
+fn unrelated_table_view_with_same_column_name_is_untouched() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    run(
+        &core,
+        &mut session,
+        "CREATE TABLE other (embedding VECTOR(2), note TEXT)",
+    )
+    .expect("other table");
+    run(
+        &core,
+        &mut session,
+        "CREATE VIEW v_other AS SELECT note FROM other",
+    )
+    .expect("view");
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN note TO memo",
+    )
+    .expect("rename");
+    core.execute_sql(&ctx(), "SELECT note FROM v_other LIMIT 100")
+        .expect("view on unrelated table keeps the old name");
+}
+
+#[test]
+fn buffered_view_on_table_rejects_rename_and_changes_nothing() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    insert(&core, 1, "note, qty", "'a', 1");
+    run(
+        &core,
+        &mut session,
+        "CREATE VIEW v_simple AS SELECT note FROM docs",
+    )
+    .expect("simple");
+    run(
+        &core,
+        &mut session,
+        "CREATE VIEW v_agg AS SELECT label, COUNT(*) AS n FROM docs GROUP BY label",
+    )
+    .expect("buffered view");
     assert_eq!(
         code_of(
             &core,
             &mut session,
-            "ALTER TABLE docs RENAME COLUMN qty TO q"
+            "ALTER TABLE docs RENAME COLUMN note TO memo"
         ),
         "0A000"
     );
+    // スキーマも単純形ビューも不変（原子性）。
+    core.execute_sql(&ctx(), "SELECT note FROM docs LIMIT 100")
+        .expect("schema unchanged");
+    core.execute_sql(&ctx(), "SELECT note FROM v_simple LIMIT 100")
+        .expect("view unchanged");
+}
+
+#[test]
+fn buffered_view_over_non_exposing_simple_view_allows_rename() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    insert(&core, 1, "note, qty", "'a', 1");
+    run(
+        &core,
+        &mut session,
+        "CREATE VIEW v_label AS SELECT label FROM docs",
+    )
+    .expect("simple");
+    run(
+        &core,
+        &mut session,
+        "CREATE VIEW v_buf AS SELECT label FROM v_label ORDER BY label LIMIT 10",
+    )
+    .expect("buffered over simple view");
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN note TO memo",
+    )
+    .expect("rename of a column the buffered chain never exposes");
+    core.execute_sql(&ctx(), "SELECT label FROM v_buf LIMIT 100")
+        .expect("buffered view still works");
+}
+
+#[test]
+fn view_after_rename_is_tenant_scoped() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    insert(&core, 1, "note", "'mine'");
+    let other =
+        PolicyContext::with_visibilities("other", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let mut s = SessionState::default();
+    core.execute_sql_in_session(
+        &other,
+        &mut s,
+        "INSERT INTO docs (id, embedding, note) VALUES (2, '[0.1,0.2]', 'theirs') USING OPERATION_ID 'op-t2'",
+    )
+    .expect("other tenant insert");
+    run(
+        &core,
+        &mut session,
+        "CREATE VIEW v_docs AS SELECT note FROM docs",
+    )
+    .expect("view");
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN note TO memo",
+    )
+    .expect("rename");
+    let out = core
+        .execute_sql(&ctx(), "SELECT memo FROM v_docs LIMIT 100")
+        .expect("select");
+    assert_eq!(out.rows.len(), 1);
+    assert!(matches!(&out.rows[0].cells[0], Cell::Text(t) if t == "mine"));
+}
+
+#[test]
+fn rename_to_name_needing_quotes_keeps_view_reparsable() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    insert(&core, 1, "note", "'a'");
+    run(
+        &core,
+        &mut session,
+        "CREATE VIEW v_docs AS SELECT note FROM docs",
+    )
+    .expect("view");
+    // 引用付き識別子としてのみ受理される名前（`true` は真偽リテラルと衝突する）。
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN note TO \"true\"",
+    )
+    .expect("rename to a name that needs quoting in the stored body");
+    core.execute_sql(&ctx(), "SELECT \"true\" FROM v_docs LIMIT 100")
+        .expect("rewritten body re-parses");
 }
 
 #[test]
