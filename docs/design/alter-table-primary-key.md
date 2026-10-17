@@ -105,5 +105,5 @@ Issue #1364 で `ErrorClass::InvalidTableDefinition`・`SqlSurfaceError::Invalid
 
 - 解消済み（Issue #1412）: `CREATE TABLE` 内の `CONSTRAINT <name> PRIMARY KEY` と、
   主キーの二重宣言（`42P16`）。
-- 主キー削除後に NOT NULL を外す手段（`ALTER COLUMN ... DROP NOT NULL`）は未対応。
+- 解消済み（Issue #1632）: 主キー削除後に NOT NULL を外す手段（`ALTER COLUMN ... DROP NOT NULL`）。主キーの構成列への発行は `42P16`。
 - NoSQL（HTTP）表層からの追加・削除は未対応。
