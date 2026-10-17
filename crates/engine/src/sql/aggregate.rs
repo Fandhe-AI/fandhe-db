@@ -2441,6 +2441,7 @@ pub(crate) fn execute_aggregate_with_group_limits(
                     bound,
                     schema,
                     fast_path_text_accumulator_bytes,
+                    max_result_bytes,
                 );
             }
         }
@@ -2715,7 +2716,13 @@ pub(crate) fn execute_aggregate_with_group_limits(
         }
     }
 
-    finish_aggregate_result(accumulators, bound, schema, total_text_accumulator_bytes)
+    finish_aggregate_result(
+        accumulators,
+        bound,
+        schema,
+        total_text_accumulator_bytes,
+        max_result_bytes,
+    )
 }
 
 /// 集計項目の結果列の静的型（Issue #1173。WIRE-13・TABLE-13 のポインタ）。
@@ -2874,6 +2881,7 @@ fn finish_aggregate_result(
     bound: &BoundAggregate,
     schema: &TableSchema,
     text_state_bytes: usize,
+    max_result_bytes: usize,
 ) -> Result<QueryResult, SqlSurfaceError> {
     let mut cells = Vec::with_capacity(bound.items.len());
     for accumulator in accumulators {
@@ -2894,7 +2902,7 @@ fn finish_aggregate_result(
             bound,
             schema,
             &cells,
-            MAX_AGGREGATE_RESULT_BYTES,
+            max_result_bytes,
             text_state_bytes,
         )?
     } else {
@@ -3062,6 +3070,7 @@ fn try_scalar_index_aggregate(
         bound,
         schema,
         text_state_bytes,
+        max_result_bytes,
     )?))
 }
 
@@ -3566,11 +3575,18 @@ mod tests {
         }];
         let schema = nullable_vector_schema();
         let accs = || vec![Accumulator::for_item(&bound.items[0]).expect("accumulator")];
-        finish_aggregate_result(accs(), &bound, &schema, 0).expect("no text state fits");
+        finish_aggregate_result(accs(), &bound, &schema, 0, MAX_AGGREGATE_RESULT_BYTES)
+            .expect("no text state fits");
         // 既定の予算（`MAX_AGGREGATE_RESULT_BYTES`）ちょうどの TEXT 状態が既にあれば、
         // CAST 結果の分を足した合計が上限を超えて `54000` になる。
-        let err = finish_aggregate_result(accs(), &bound, &schema, MAX_AGGREGATE_RESULT_BYTES)
-            .expect_err("text state plus cast result must exceed the pool");
+        let err = finish_aggregate_result(
+            accs(),
+            &bound,
+            &schema,
+            MAX_AGGREGATE_RESULT_BYTES,
+            MAX_AGGREGATE_RESULT_BYTES,
+        )
+        .expect_err("text state plus cast result must exceed the pool");
         assert_eq!(err.wire_code(), "54000");
     }
 

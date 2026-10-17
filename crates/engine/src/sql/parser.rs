@@ -6639,8 +6639,12 @@ fn bind_aggregate_projection_expr(
     };
     let rewritten = rewrite_group_row_idents(expr, &resolve)?;
     let view_schema = group_row_schema(schema, keys, items, true);
-    let (bound, _ty, result_ty) =
-        crate::sql::udf_call::bind_projection_expr(&rewritten, &view_schema, udfs, node_budget)?;
+    let (bound, _ty, result_ty) = crate::sql::udf_call::bind_aggregate_projection_expr_top(
+        &rewritten,
+        &view_schema,
+        udfs,
+        node_budget,
+    )?;
     let mut mask = vec![false; keys.len().saturating_add(items.len())];
     crate::sql::udf_call::mark_referenced_scalar_columns(&bound, &mut mask);
     Ok((

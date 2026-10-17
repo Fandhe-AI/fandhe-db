@@ -2727,6 +2727,24 @@ pub(crate) fn bind_projection_expr(
     Ok(r)
 }
 
+/// 集計後の投影項目（`sql::parser::bind_aggregate_projection_expr`）用の束縛（Issue #1592）。
+/// [`bind_projection_expr`] と同じだが、式の最上位が CAST の結果型（numeric・uuid・bytea・配列）
+/// の場合は許可する（集計行の出力セルとして投影される位置。結果バイト予算は `sql::group_by` の
+/// 投影段が計上する）。jsonb／json の結果は従来どおり `0A000`。式の内側（演算の被演算子・
+/// 関数引数・`CASE` 等）の拒否は [`bind_expr_any`] 側の規則のまま維持される。
+pub(crate) fn bind_aggregate_projection_expr_top(
+    expr: &Expr,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    let r = bind_projection_expr_json_ok(expr, schema, registry, node_budget)?;
+    if !is_cast_only_type(r.1) {
+        reject_json_operand(r.1)?;
+    }
+    Ok(r)
+}
+
 /// [`bind_projection_expr`] の jsonb 結果許容版（Issue #1596）。投影項目
 /// （`sql::parser::bind_projection`）だけが使い、HAVING／ORDER BY 等の他の呼び出し元は
 /// jsonb 結果を `0A000` で拒否する [`bind_projection_expr`] を使う。

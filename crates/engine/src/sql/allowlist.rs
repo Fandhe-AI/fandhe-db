@@ -4734,6 +4734,31 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// 現在位置の `CAST ( ... )` の閉じ括弧の直後が算術演算子かを返す（Issue #1592）。
+    /// `CAST(..) + sum(..)` のように CAST が演算の被演算子になる形は従来どおり未対応（`42601`）に
+    /// 保つため、集計 SELECT リストの CAST 項目は項目全体が CAST の形に限って式モードで読む。
+    fn cast_item_is_followed_by_operator(&self) -> bool {
+        let mut depth = 0usize;
+        let mut i = self.pos + 1;
+        while let Some(t) = self.tokens.get(i) {
+            match t {
+                Token::Punct('(') => depth = depth.saturating_add(1),
+                Token::Punct(')') => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return matches!(
+                            self.tokens.get(i + 1),
+                            Some(Token::Punct('+' | '-' | '*' | '/'))
+                        );
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// 集計 SELECT リストの 1 項目（TASK-167・SQL-14 で拡張）。次のトークンが
     /// 集計関数名 `'('` なら従来どおり集計項目（[`Parser::parse_aggregate_item`]）、
     /// それ以外は `GROUP BY` 列と同名の裸の識別子（任意で `AS <alias>`）として
@@ -4763,6 +4788,16 @@ impl<'a> Parser<'a> {
                     None
                 };
                 return Ok(AggregateSelectItem::Aggregate(head));
+            }
+            // `CAST(<集計を含む式> AS <型>)`（Issue #1592）。集計呼び出しの内側ではなく項目の
+            // 先頭が CAST の場合も式モードで読み、結果型（bytea・配列等）は集計後の投影として束縛する。
+            // 集計呼び出しを含まない CAST は式モードの検査で従来どおり `42601`。
+            if self.allow_aggregate_expr_items
+                && name.eq_ignore_ascii_case("cast")
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
+                && !self.cast_item_is_followed_by_operator()
+            {
+                return self.parse_aggregate_expr_item(None);
             }
             // 裸識別子の直後が算術演算子（`g + sum(n)` 等）は式モード。
             if self.allow_aggregate_expr_items
