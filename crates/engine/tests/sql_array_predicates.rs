@@ -377,6 +377,14 @@ fn unsupported_forms_fail_closed() {
         ),
         "22003"
     );
+    // 末尾ドット付き整数（`9007199254740993.`）も同じ exactness ガードで拒否する。
+    assert_eq!(
+        code(
+            &core,
+            "SELECT id FROM t WHERE 9007199254740993. = ANY(ARRAY[9007199254740992::float8]) LIMIT 5"
+        ),
+        "22003"
+    );
     assert_eq!(code(&core, "SELECT ANY(nums) FROM t LIMIT 5"), "42601");
     assert_eq!(
         code(&core, "SELECT id FROM t WHERE ALL(nums) = 1 LIMIT 5"),

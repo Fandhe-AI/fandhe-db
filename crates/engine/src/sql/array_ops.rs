@@ -514,7 +514,12 @@ pub(super) fn bind_quantified(
 /// 小数・指数形は従来どおり許可する。`bind_quantified_lhs` の float 特例の適用可否判定に使う。
 fn number_exact_in_f64(text: &str) -> bool {
     const MAX_EXACT: u128 = 1 << 53;
-    let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
+    // 末尾ドット付き整数（`9007199254740993.`）も整数として扱う（`parse_number_literal` と同じ受理規則）
+    let digits = match unsigned.strip_suffix('.') {
+        Some(d) if !d.is_empty() => d,
+        _ => unsigned,
+    };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return true;
     }
