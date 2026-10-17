@@ -3486,7 +3486,19 @@ fn project_rows(
                             detail: "computed projection program missing at evaluation time"
                                 .to_string(),
                         })?;
-                    match program.eval(id, embedding, &row_scalars, &mut expr_scratch)? {
+                    let computed = program.eval(id, embedding, &row_scalars, &mut expr_scratch)?;
+                    // 式が返したセルは型を問わず（TEXT・BYTEA・配列・JSON 等）、複製・変換の前に
+                    // scan 経路と同じ上限（`MAX_CANDIDATE_SCALAR_BYTES`）で累計を検証する（fail-closed。
+                    // Issue #1592。計上漏れの型を作らないため variant ごとの例外を置かない）。
+                    deferred_budget = try_accumulate_budget(
+                        deferred_budget,
+                        computed.estimated_cell_bytes(),
+                        MAX_CANDIDATE_SCALAR_BYTES,
+                    )
+                    .map_err(|_| {
+                        SqlSurfaceError::payload_too_large("projected result exceeds capacity")
+                    })?;
+                    match computed {
                         udf_call::ExprValue::Scalar(v) => {
                             cells.push(scalar_cell_for(v, result_ty.as_ref())?)
                         }
@@ -3528,34 +3540,8 @@ fn project_rows(
                         udf_call::ExprValue::Numeric(d) => cells.push(Cell::Numeric(d)),
                         // `CAST` の結果（Issue #1592）。列直接投影と同じセルへ写す。
                         udf_call::ExprValue::Uuid(u) => cells.push(Cell::Uuid(u)),
-                        // 式結果の BYTEA／配列は入力より大きくなりうるため、確保前に累計バイト量を
-                        // scan 経路と同じ上限（`MAX_CANDIDATE_SCALAR_BYTES`）で検証する（fail-closed）。
-                        udf_call::ExprValue::Bytes(b) => {
-                            deferred_budget = try_accumulate_budget(
-                                deferred_budget,
-                                b.len(),
-                                MAX_CANDIDATE_SCALAR_BYTES,
-                            )
-                            .map_err(|_| {
-                                SqlSurfaceError::payload_too_large(
-                                    "projected result exceeds capacity",
-                                )
-                            })?;
-                            cells.push(Cell::Bytes(b.into_owned()))
-                        }
-                        udf_call::ExprValue::Array(a) => {
-                            deferred_budget = try_accumulate_budget(
-                                deferred_budget,
-                                a.approx_heap_bytes(),
-                                MAX_CANDIDATE_SCALAR_BYTES,
-                            )
-                            .map_err(|_| {
-                                SqlSurfaceError::payload_too_large(
-                                    "projected result exceeds capacity",
-                                )
-                            })?;
-                            cells.push(Cell::Array(a))
-                        }
+                        udf_call::ExprValue::Bytes(b) => cells.push(Cell::Bytes(b.into_owned())),
+                        udf_call::ExprValue::Array(a) => cells.push(Cell::Array(a)),
                     }
                 }
             }

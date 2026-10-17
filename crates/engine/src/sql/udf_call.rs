@@ -1119,6 +1119,32 @@ pub enum ExprValue<'a> {
     Null,
 }
 
+impl ExprValue<'_> {
+    /// 式の評価結果が出力セルとして保持するバイト数の見積り（ヒープを持つ variant はその長さ、
+    /// それ以外は固定の 8 バイト）。投影段（`sql::exec`・`sql::group_by`・単一行集計）が、生成した
+    /// 全セルを型ごとの例外なく結果バイト予算へ計上するために共有する（Issue #1592。
+    /// `sql::cursor::estimate_cell_bytes` と同じ規約）。セルへ変換・複製する前に呼ぶ。
+    pub(crate) fn estimated_cell_bytes(&self) -> usize {
+        let heap = match self {
+            ExprValue::Text(t) | ExprValue::Json(t) | ExprValue::JsonText(t) => t.len(),
+            ExprValue::Bytes(b) => b.len(),
+            ExprValue::Vector(v) => v.len().saturating_mul(4),
+            ExprValue::Array(a) => a.approx_heap_bytes(),
+            ExprValue::Numeric(_) => 32,
+            ExprValue::Scalar(_)
+            | ExprValue::Bool(_)
+            | ExprValue::Date(_)
+            | ExprValue::Timestamp(_)
+            | ExprValue::Time(_)
+            | ExprValue::TimestampTz(_)
+            | ExprValue::Interval(_)
+            | ExprValue::Uuid(_)
+            | ExprValue::Null => 0,
+        };
+        heap.saturating_add(8)
+    }
+}
+
 /// [`ExprValue::Vector`] を所有 `Vec<f32>` へ変換する（投影段など、評価結果を
 /// 行データより長く保持する必要がある呼び出し元向け）。`Cow::Owned` はそのまま
 /// move するため確保が発生しない（`vec_div` 等、評価内で既に新規構築済みの場合）。

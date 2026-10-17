@@ -1116,3 +1116,54 @@ fn aggregate_cast_item_as_operator_operand_stays_syntax_error() {
         assert_eq!(err.wire_code(), "42601", "{sql}");
     }
 }
+
+/// Issue #1592: 集計後の投影が生成した TEXT（`CAST(.. AS char(n))` の空白埋め）も、型ごとの例外なく
+/// 結果バイト予算（カーソル経由は 16 MiB）へ計上され、超過は `54000`。`GROUP BY` と単一行集計の双方。
+#[test]
+fn aggregate_projection_charges_generated_text_to_result_budget() {
+    use engine::sql::mode::SessionState;
+    let path = unique_db_path("scalar-index-aggregate-char-pool");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let tenant_ctx = ctx("tenant-a");
+    for id in 1..=20u64 {
+        insert_row(
+            &storage,
+            &tenant_ctx,
+            id,
+            Some("a"),
+            Some(&format!("g{id}")),
+            Visibility::Public,
+        );
+    }
+    let core = new_core(storage);
+    let caller = ctx("tenant-a");
+    let try_declare = |select: &str| {
+        let mut session = SessionState::default();
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        let sql = format!("DECLARE c CURSOR FOR {select}");
+        let r = core.execute_sql_in_txn(&caller, &mut session, &mut txn, &sql);
+        core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback");
+        r
+    };
+    let pad = "CAST(MAX(kind) AS char(1048576))";
+    // GROUP BY: 1 MiB × 20 グループは 16 MiB を超える。3 グループ（WHERE で絞る）なら予算内。
+    let grouped =
+        |filter: &str| format!("SELECT lang, {pad} FROM docs WHERE {filter} GROUP BY lang");
+    try_declare(&grouped("lang = 'g1' OR lang = 'g2' OR lang = 'g3'"))
+        .expect("3 groups fit the result budget");
+    let err = try_declare(&grouped("kind = 'a'")).expect_err("20 MiB must exceed the budget");
+    assert_eq!(err.wire_code(), "54000");
+    // 単一行集計: 列 4 個（4 MiB）は予算内、17 個（17 MiB）は超過。
+    let single = |n: usize| {
+        let cols = vec![format!("MAX(kind), {pad}"); n].join(", ");
+        format!("SELECT {cols} FROM docs WHERE kind = 'a'")
+    };
+    try_declare(&single(4)).expect("4 columns fit the result budget");
+    let err = try_declare(&single(17)).expect_err("17 MiB of padding must exceed");
+    assert_eq!(err.wire_code(), "54000");
+}

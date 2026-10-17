@@ -2247,15 +2247,12 @@ fn project_row(
                     .as_ref()
                     .ok_or_else(|| accumulator_bug("projection expression without a row view"))?;
                 let value = program.eval(0, &[], row_scalars, scratch)?;
+                // 式が返したセルは型を問わず（TEXT・BYTEA・配列・JSON 等）、変換・複製の前に累計見積りを
+                // 呼び出し元の `charge`（`ResultBudget::check` へグループ数・キー・TEXT 集計状態と
+                // 同じプールで照会する）へ渡し、超過は `54000` で拒否する（Issue #1592。fail-closed）。
+                *computed_bytes = computed_bytes.saturating_add(value.estimated_cell_bytes());
+                charge(*computed_bytes)?;
                 let cell = expr_value_to_cell(value, result_ty.as_ref())?;
-                // CAST 等が返す BYTEA／配列は入力より大きくなりうるため、累計見積りを呼び出し元の
-                // `charge`（`ResultBudget::check` へグループ数・キー・TEXT 集計状態と同じプールで
-                // 照会する）へ渡し、超過は `54000` で拒否する（Issue #1592。fail-closed）。
-                if matches!(cell, Cell::Bytes(_) | Cell::Array(_)) {
-                    *computed_bytes = computed_bytes
-                        .saturating_add(crate::sql::cursor::estimate_cell_bytes(&cell));
-                    charge(*computed_bytes)?;
-                }
                 cell
             }
         };
