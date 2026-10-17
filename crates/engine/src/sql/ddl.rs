@@ -46,9 +46,10 @@ use crate::schema_limits::SchemaLimits;
 use crate::sql::allowlist::{
     InsertLiteral, SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
     ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnType,
-    ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint, ValidatedCreateIndex,
-    ValidatedCreateTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
-    ValidatedDropTable, ValidatedDropType, ValidatedDropView,
+    ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint,
+    ValidatedAlterTableRenameColumn, ValidatedCreateIndex, ValidatedCreateTable,
+    ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex, ValidatedDropTable,
+    ValidatedDropType, ValidatedDropView,
 };
 use crate::sql::ddl_column_type::{
     alias_spelling, to_static_column_type_with_array_default, SqlColumnTypeName, StaticColumnType,
@@ -395,6 +396,12 @@ pub enum AlterTableAction {
     DropColumn { column_name: String },
     /// `ALTER COLUMN <col> TYPE <型>`（TABLE-19、Issue #1167）。**BREAKING CHANGE**: variant 追加。
     AlterColumnType { column_name: String },
+    /// `RENAME [COLUMN] <old> TO <new>`（TABLE-38 のポインタ、Issue #1619）。
+    /// **BREAKING CHANGE**: variant 追加。
+    RenameColumn {
+        column_name: String,
+        new_column_name: String,
+    },
 }
 
 /// `ALTER TABLE <table> ADD COLUMN <column> <type>` の実行本体（Issue #900）。
@@ -647,6 +654,9 @@ pub(crate) fn execute_alter_table(
         crate::sql::allowlist::ValidatedAlterTable::AddPrimaryKey(stmt) => {
             execute_alter_table_add_primary_key(storage, stmt)
         }
+        crate::sql::allowlist::ValidatedAlterTable::RenameColumn(stmt) => {
+            execute_alter_table_rename_column(storage, stmt)
+        }
     }
 }
 
@@ -805,6 +815,37 @@ pub(crate) fn execute_alter_table_drop_column(
     })
 }
 
+/// `ALTER TABLE <table> RENAME [COLUMN] <old> TO <new>` の実行本体（TABLE-38 の
+/// ポインタ、Issue #1619）。呼び出し元（`core.rs`）は [`require_ddl_permission`] を
+/// 必ず先に呼んでいる前提。
+///
+/// 判定順序（決定的）: テーブル存在確認（`42P01`／`42809`）→
+/// `catalog::Storage::alter_table_rename_column`（単一 write txn 内。改名元の不在
+/// `42703` → 改名先の衝突 `42701` → 依存オブジェクトの拒否 `0A000`。カタログ名のみを
+/// 書き換え行ストアには触れない）。写像は [`map_rename_column_error`]。
+pub(crate) fn execute_alter_table_rename_column(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableRenameColumn,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    storage
+        .alter_table_rename_column(&stmt.table_name, &stmt.column_name, &stmt.new_column_name)
+        .map_err(|e| match e {
+            AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                undefined_table_or_view(storage, &stmt.table_name)
+            }
+            AlterCheckError::Catalog(other) => map_rename_column_error(other),
+            AlterCheckError::Sql(sql_err) => sql_err,
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::RenameColumn {
+            column_name: stmt.column_name.clone(),
+            new_column_name: stmt.new_column_name.clone(),
+        },
+    })
+}
+
 /// `ALTER TABLE <table> ALTER COLUMN <column> TYPE <型>` の実行本体（TABLE-19・
 /// SQL-23、Issue #1167）。前提は [`execute_alter_table_drop_column`] と同じ。
 /// 判定順序: テーブル存在確認 → 目標型の解決（[`resolve_alter_target_type`]。
@@ -940,6 +981,19 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::NotNullConstraintViolation(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
+    }
+}
+
+/// `RENAME COLUMN` の [`CatalogError`] を SQL 表層の契約へ写像する（TABLE-38 の
+/// ポインタ、Issue #1619）。改名先の衝突 `ColumnAlreadyExists` は `42701`、それ以外は
+/// [`map_drop_alter_column_error`] に委譲する（`ColumnAlreadyExists` は同関数では
+/// Internal に落ちるため、ここで先に拾う）。
+fn map_rename_column_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::ColumnAlreadyExists(name) => SqlSurfaceError::duplicate_column(name),
+        // 内部列（`id`／`tenant_id`／`visibility`）は TABLE-38 に従い `42703`。
+        CatalogError::ProtectedColumn(name) => SqlSurfaceError::UndefinedColumn { name },
+        other => map_drop_alter_column_error(other),
     }
 }
 
@@ -1763,6 +1817,24 @@ mod tests {
         assert_eq!(
             map_add_column_error(CatalogError::ColumnAlreadyExists("c".to_string())).wire_code(),
             "42701"
+        );
+    }
+
+    /// `RENAME COLUMN` の写像（Issue #1619）: 衝突は `42701`、不在は `42703`、
+    /// 内部列は `42703`（TABLE-38）、ロック競合は既存写像に従う。
+    #[test]
+    fn rename_column_error_mapping() {
+        assert_eq!(
+            map_rename_column_error(CatalogError::ColumnAlreadyExists("c".to_string())).wire_code(),
+            "42701"
+        );
+        assert_eq!(
+            map_rename_column_error(CatalogError::ColumnNotFound("c".to_string())).wire_code(),
+            "42703"
+        );
+        assert_eq!(
+            map_rename_column_error(CatalogError::ProtectedColumn("id".to_string())).wire_code(),
+            "42703"
         );
     }
 
