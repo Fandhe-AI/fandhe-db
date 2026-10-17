@@ -78,8 +78,8 @@ DROP INDEX <name>
 | 対象テーブルが存在しない | `42P01` | 404 |
 | 索引列の `COLLATE` の名前が許可リストに無い（構文段。カタログを参照しない。Issue #2191） | `42704` | 400 |
 | 照合を持てない列（`id`・数値・`VECTOR` 等）・`USING hnsw` への `COLLATE`（カタログ段。Issue #2191） | `42804` | 400 |
-| `USING` が `hnsw` 以外（`btree`・`bm25` 等）／`USING hnsw` の複数列・非 `VECTOR` 列（`id` を含む）／スカラー宣言が `VECTOR` 列・索引化非対応の型／部分索引の `WHERE`／式・関数呼び出し・リテラルの列指定 | `0A000` | 501 |
-| `UNIQUE`／`CREATE` の `IF NOT EXISTS`／`ASC`・`DESC`／列の重複指定／`DROP` の複数名・`CASCADE`／`(col + 1)` 等の余分なトークン | `42601` | 400 |
+| `USING` が `hnsw`・`btree` 以外（`bm25`・`hash`・`gin` 等）／`USING hnsw` の複数列・非 `VECTOR` 列（`id` を含む）／スカラー宣言が `VECTOR` 列・索引化非対応の型／部分索引の `WHERE`／式・関数呼び出し・リテラルの列指定 | `0A000` | 501 |
+| `UNIQUE`／名前を省いた `CREATE INDEX IF NOT EXISTS`／`ASC`・`DESC`／列の重複指定／`DROP` の複数名・`CASCADE`／`(col + 1)` 等の余分なトークン | `42601` | 400 |
 | 列リストの要素数上限（256）超過・索引宣言の総数上限（10,000）超過 | `54000` | 413 |
 | DDL 実行権限なし | `42501` | 403 |
 
@@ -187,3 +187,12 @@ Issue #1065 で実装済み。詳細・設計判断は
   の前に返す。`IF NOT EXISTS` では `IndexAlreadyExists` を no-op 成功に写す。名前衝突が最初の
   判定のため、同名があれば対象テーブル・列が不正でも成功する（定義は比較しない）。
 - 同名の表・ビューがある場合も no-op。句なしの重複（`42P07`）は不変。
+
+## Issue #1617 追記（INDEX-9・TABLE-36）: `USING btree`
+
+- `CREATE INDEX [IF NOT EXISTS] <name> ON <table> [USING btree｜hnsw] (...)` の `USING btree` を、
+  `USING` 省略時と同一のスカラー宣言として受理する（構文段のみの変更。`ValidatedCreateIndex` の形は不変）。
+- カタログ表現は不変。`btree` はディスク上の種別トークンにならず、`IndexKind::Scalar` のまま書く
+  （カタログ側の `btree` 種別トークンは従来どおり破損として検出する）。
+- `hnsw`・`btree` 以外の手法（`bm25`・`hash`・`gin` 等）は従来どおり `0A000`。
+- 名前付き `IF NOT EXISTS` との併用が可能。名前なしは `42601` のまま。
