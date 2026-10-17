@@ -20,8 +20,8 @@ CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]
   `NUMERIC(p,s)`）・`VECTOR ( <N> )`・配列型（`<型>[]`・`<型>[N]`。TABLE-14）・登録済みの
   ENUM 型名。未知の型名は `42601`。`VECTOR` は従来どおり常に非 nullable で `DEFAULT`・
   `UNIQUE` を持てない。DEFAULT の型別変換は `ADD COLUMN` と同じ純関数
-  （`sql::ddl::add_column_default`）を共有する。`USING OPERATION_ID` の付与はいずれも許可リスト外（構造的に受理しない・
-  `42601`）。列制約 `REFERENCES <table> [(<col>[, ...])]`・表制約
+  （`sql::ddl::add_column_default`）を共有する。
+  `USING OPERATION_ID` の付与はいずれも許可リスト外（構造的に受理しない・`42601`）。列制約 `REFERENCES <table> [(<col>[, ...])]`・表制約
   `FOREIGN KEY (<col>[, ...]) REFERENCES ...`（Issue #907。
   `docs/design/foreign-key.md`）も制約構文として受理する。`CONSTRAINT <name>` は
   `CHECK` の前置にのみ受理する。列制約 `PRIMARY KEY`・表制約 `PRIMARY KEY (<col>[, ...])`（複合キーを

@@ -3283,8 +3283,9 @@ pub enum DeleteStatement {
 /// 避けるため行わない。`sql::ddl` モジュールドキュメント参照）。
 ///
 /// 受理する形は `CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]` の
-/// みで（先頭の `IF NOT EXISTS` は TABLE-36・Issue #1613 で受理）、`<type>` は `TEXT`／`VECTOR ( <N> )` のみ（
-/// `REFERENCES`・`USING OPERATION_ID` の付与はいずれも許可リスト外。
+/// みで（先頭の `IF NOT EXISTS` は TABLE-36・Issue #1613 で受理）、
+/// `<type>` は `TEXT`／`VECTOR ( <N> )` のみ
+/// （`REFERENCES`・`USING OPERATION_ID` の付与はいずれも許可リスト外。
 /// `CONSTRAINT <name>` は `CHECK` の前置にのみ受理する）。列制約・表制約
 /// `[CONSTRAINT <name>] CHECK ( <述語> )`（TABLE-16・TASK-204、Issue #906。
 /// `docs/design/sql-check-constraint.md` 参照）も受理する。列制約 `NOT NULL`／`DEFAULT <literal>`（Issue #904）・
