@@ -338,6 +338,8 @@ fn jsonb_elements_use_value_equality_and_inequality_needs_no_ordering() {
         "ARRAY['1'::jsonb] != ARRAY['2'::jsonb]",
         "NOT ARRAY['1'::jsonb] = ARRAY['2'::jsonb]",
         "NOT ARRAY['1'::jsonb] <> ARRAY['1.0'::jsonb]",
+        "NOT (ARRAY['1'::jsonb] <> ARRAY['1.0'::jsonb])",
+        "NOT (ARRAY['1'::jsonb] = ARRAY['2'::jsonb])",
         "CAST(1 AS smallint) = ANY('{1,2}')",
         "CAST(3 AS smallint) <> ALL('{1,2}')",
     ] {
@@ -347,6 +349,8 @@ fn jsonb_elements_use_value_equality_and_inequality_needs_no_ordering() {
         "ARRAY['1'::jsonb] <> ARRAY['1.0'::jsonb]",
         "NOT ARRAY['1'::jsonb] = ARRAY['1.0'::jsonb]",
         "ARRAY['1'::jsonb] = ARRAY['2'::jsonb]",
+        "NOT (ARRAY['1'::jsonb] = ARRAY['1.0'::jsonb])",
+        "NOT (ARRAY['1'::jsonb] <> ARRAY['2'::jsonb])",
     ] {
         assert_eq!(matching(&core, p), NONE, "{p}");
     }

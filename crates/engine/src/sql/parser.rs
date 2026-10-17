@@ -2234,6 +2234,70 @@ fn bind_array_inequality_pair(
     }
 }
 
+/// AND 列の中の `Expression(l >= r)` と `Expression(l <= r)`（同一の両辺）の組が配列どうしの
+/// 比較なら、等値の束縛式 `ArrayCmpOp::Eq` へ畳む。`NOT (a <> b)` は `where_negation` が
+/// `a < b OR a > b` を否定して `a >= b AND a <= b` へ変えるため、順序比較を持たない要素型
+/// （jsonb）で拒否されないよう、括弧なしの `NOT a <> b`（専用処理）と結果を一致させる
+/// （TABLE-35・Issue #1603）。畳んだ述語の添字を `folded` に記録し、束縛済み式を返す。
+/// 配列でない組は触らず予算も消費しない。
+fn fold_array_equality_range_pairs(
+    predicates: &[WherePredicate],
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> (Vec<bool>, Vec<crate::sql::udf_call::BoundExpr>) {
+    use crate::sql::udf_call::{ArrayCmpOp, BinOp, BoundExpr};
+    let mut folded = vec![false; predicates.len()];
+    let mut bound_eqs = Vec::new();
+    for i in 0..predicates.len() {
+        if folded[i] {
+            continue;
+        }
+        let Some(WherePredicate::Expression(Expr::Binary {
+            op: BinOp::Ge,
+            lhs: l1,
+            rhs: r1,
+        })) = predicates.get(i)
+        else {
+            continue;
+        };
+        let partner = (0..predicates.len()).find(|&j| {
+            j != i
+                && !folded[j]
+                && matches!(
+                    predicates.get(j),
+                    Some(WherePredicate::Expression(Expr::Binary {
+                        op: BinOp::Le,
+                        lhs: l2,
+                        rhs: r2,
+                    })) if l1 == l2 && r1 == r2
+                )
+        });
+        let Some(j) = partner else {
+            continue;
+        };
+        let eq = Expr::Binary {
+            op: BinOp::Eq,
+            lhs: l1.clone(),
+            rhs: r1.clone(),
+        };
+        let mut probe = *node_budget;
+        if let Ok((
+            bound @ BoundExpr::ArrayCompare {
+                op: ArrayCmpOp::Eq, ..
+            },
+            _,
+        )) = crate::sql::udf_call::bind_expr(&eq, schema, udfs, &mut probe)
+        {
+            *node_budget = probe;
+            bound_eqs.push(bound);
+            folded[i] = true;
+            folded[j] = true;
+        }
+    }
+    (folded, bound_eqs)
+}
+
 /// [`bind_where_predicates`]・[`bind_check_predicates`] の再帰本体。トップレベルの
 /// 述語列だけでなく、[`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも
 /// 自分自身を再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。
@@ -2254,7 +2318,13 @@ fn bind_where_predicates_recursive(
     let mut expr_filters = Vec::new();
     let mut rls_predicate_present = false;
     let mut or_filters = Vec::new();
-    for predicate in where_predicates {
+    let (array_folded, array_eqs) =
+        fold_array_equality_range_pairs(where_predicates, schema, udfs, node_budget);
+    expr_filters.extend(array_eqs);
+    for (index, predicate) in where_predicates.iter().enumerate() {
+        if array_folded.get(index).copied().unwrap_or(false) {
+            continue;
+        }
         // Issue #1431・SQL-24: BOOLEAN 列 × 文字列の範囲比較・`IN`・`BETWEEN` は
         // 述語をその場で宣言的に扱える葉へ差し替え、以降の既存経路へ流す
         // （WHERE 文脈限定。CHECK は従来どおり拒否）。
