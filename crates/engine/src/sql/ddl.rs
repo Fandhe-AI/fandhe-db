@@ -45,11 +45,11 @@ use crate::catalog::{
 use crate::schema_limits::SchemaLimits;
 use crate::sql::allowlist::{
     InsertLiteral, SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
-    ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnType,
-    ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint,
-    ValidatedAlterTableRenameColumn, ValidatedCreateIndex, ValidatedCreateTable,
-    ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex, ValidatedDropTable,
-    ValidatedDropType, ValidatedDropView,
+    ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnSetNotNull,
+    ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
+    ValidatedAlterTableDropConstraint, ValidatedAlterTableRenameColumn, ValidatedCreateIndex,
+    ValidatedCreateTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
+    ValidatedDropTable, ValidatedDropType, ValidatedDropView,
 };
 use crate::sql::ddl_column_type::{
     alias_spelling, to_static_column_type_with_array_default, SqlColumnTypeName, StaticColumnType,
@@ -396,6 +396,8 @@ pub enum AlterTableAction {
     DropColumn { column_name: String },
     /// `ALTER COLUMN <col> TYPE <型>`（TABLE-19、Issue #1167）。**BREAKING CHANGE**: variant 追加。
     AlterColumnType { column_name: String },
+    /// `ALTER COLUMN <col> SET NOT NULL`（TABLE-39 (3)、Issue #1631）。**BREAKING CHANGE**: variant 追加。
+    AlterColumnSetNotNull { column_name: String },
     /// `RENAME [COLUMN] <old> TO <new>`（TABLE-38 のポインタ、Issue #1619）。
     /// **BREAKING CHANGE**: variant 追加。
     RenameColumn {
@@ -654,6 +656,9 @@ pub(crate) fn execute_alter_table(
         crate::sql::allowlist::ValidatedAlterTable::AddPrimaryKey(stmt) => {
             execute_alter_table_add_primary_key(storage, stmt)
         }
+        crate::sql::allowlist::ValidatedAlterTable::AlterColumnSetNotNull(stmt) => {
+            execute_alter_table_alter_column_set_not_null(storage, stmt)
+        }
         crate::sql::allowlist::ValidatedAlterTable::RenameColumn(stmt) => {
             execute_alter_table_rename_column(storage, stmt)
         }
@@ -883,6 +888,45 @@ pub(crate) fn execute_alter_table_alter_column_type(
             column_name: stmt.column_name.clone(),
         },
     })
+}
+
+/// `ALTER TABLE <table> ALTER COLUMN <column> SET NOT NULL` の実行本体（TABLE-39 (3)、
+/// Issue #1631）。前提は [`execute_alter_table_drop_column`] と同じ（`core.rs` が
+/// [`require_ddl_permission`] を先に通す）。判定順序: テーブル存在確認 →
+/// `catalog::Storage::alter_table_set_not_null`（単一 write txn 内で全テナント・全可視性の
+/// 既存行の NULL 検査〔`23502`〕と FK 宣言の整合検査〔`42830`〕を行い、拒否時は副作用ゼロ）。
+fn execute_alter_table_alter_column_set_not_null(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAlterColumnSetNotNull,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    storage
+        .alter_table_set_not_null(&stmt.table_name, &stmt.column_name)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_alter_column_nullability_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AlterColumnSetNotNull {
+            column_name: stmt.column_name.clone(),
+        },
+    })
+}
+
+/// 列の nullability 変更（`SET NOT NULL`。Issue #1631）の [`CatalogError`] を SQL 表層の
+/// 契約へ写像する。違反行はスキーマ情報（列名）しか持ち出さない（テナント・行 id・値・件数を
+/// 含めない。ERR-6）。全 variant を明示列挙しワイルドカード腕を置かない（fail-closed）。
+fn map_alter_column_nullability_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::NotNullConstraintViolation(column) => {
+            SqlSurfaceError::not_null_violation(column)
+        }
+        CatalogError::InvalidForeignKey(detail) => SqlSurfaceError::invalid_foreign_key(detail),
+        // 残りは `map_drop_alter_column_error` の契約に従う（`TableNotFound`・
+        // `ColumnNotFound`・`ProtectedColumn`・`Invalid`・`WriteLockTimeout` 等）。
+        other => map_drop_alter_column_error(other),
+    }
 }
 
 /// 列定義の `COLLATE` が列型に付けられるかを判定する（TABLE-28・Issue #1609）。照合を
