@@ -3021,6 +3021,7 @@ fn try_scalar_index_aggregate(
     for item in &bound.items {
         accumulators.push(Accumulator::for_item(item)?);
     }
+    let mut text_state_bytes: usize = 0;
     if count_star_only(&bound.items) {
         // 索引で完全被覆された述語のみ（`classify_scalar_plan` が `PlainScan`
         // 以外・`resolve_candidates` が `Use`）かつ `COUNT(*)` だけの集計は、
@@ -3043,7 +3044,7 @@ fn try_scalar_index_aggregate(
             &mut accumulators,
             max_result_bytes,
         ) {
-            Ok(()) => {}
+            Ok(bytes) => text_state_bytes = bytes,
             // PR #1049 レビュー指摘 codex P1 対応: 候補順に依存しうる一時的な
             // `TEXT` 予算超過は、索引経路の途中結果（`accumulators`）を破棄して
             // 全走査へ退避する（[`is_aggregate_text_budget_error`] 参照）。全走査
@@ -3060,7 +3061,7 @@ fn try_scalar_index_aggregate(
         accumulators,
         bound,
         schema,
-        0, // 索引経路の TEXT 集計状態は走査関数内で完結し、ここでは参照できない
+        text_state_bytes,
     )?))
 }
 
@@ -3242,7 +3243,7 @@ pub(crate) fn observe_candidate_slots(
     // 通常の全走査ループ（本モジュール下部）と別の実行経路のため、同じ予算
     // 検査を独立して適用する。
     max_result_bytes: usize,
-) -> Result<(), SqlSurfaceError> {
+) -> Result<usize, SqlSurfaceError> {
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
     let mut total_text_accumulator_bytes: usize = 0;
@@ -3348,7 +3349,9 @@ pub(crate) fn observe_candidate_slots(
             )?;
         }
     }
-    Ok(())
+    // 確定時点の TEXT 集計状態の累計バイト数。呼び出し元が式列の結果バイト予算と同じプールで
+    // 判定できるよう返す（全走査と索引経路で成否を揃える）。
+    Ok(total_text_accumulator_bytes)
 }
 
 /// Issue #475: `ScalarIndex` 経由の候補削減・`GROUP BY` キー列挙が使う
@@ -3538,6 +3541,37 @@ mod tests {
             "docs",
             vec![ColumnDef::new("embedding", ColumnType::Vector(3), true)],
         )
+    }
+
+    /// Issue #1592: 単一行集計の確定段（全走査・索引経路が共有する `finish_aggregate_result`）は、
+    /// 呼び出し元が渡す TEXT 集計状態の累計を式列の CAST 結果と同じ結果バイト予算で判定する。
+    /// 索引経路が `observe_candidate_slots` の返す累計を渡すことで、全走査と成否が揃う。
+    #[test]
+    fn finish_aggregate_result_counts_text_state_against_the_shared_pool() {
+        use crate::sql::cast_value::{CastDst, CastFn, CastSrc};
+        use crate::sql::udf_call::{BoundExpr, BuiltinFn};
+        let expr = BoundExpr::Builtin {
+            f: BuiltinFn::Cast(CastFn {
+                from: CastSrc::Text,
+                to: CastDst::Bytea,
+            }),
+            args: vec![BoundExpr::Text("abcdefgh".to_string())],
+        };
+        let mut bound = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
+        bound.projection = vec![crate::sql::parser::ProjectionColumn::Expr {
+            program: crate::sql::expr_program::ExprProgram::compile(&expr),
+            name: "b".to_string(),
+            result_ty: Some(ColumnType::Bytea),
+            mask: Vec::new(),
+        }];
+        let schema = nullable_vector_schema();
+        let accs = || vec![Accumulator::for_item(&bound.items[0]).expect("accumulator")];
+        finish_aggregate_result(accs(), &bound, &schema, 0).expect("no text state fits");
+        // 既定の予算（`MAX_AGGREGATE_RESULT_BYTES`）ちょうどの TEXT 状態が既にあれば、
+        // CAST 結果の分を足した合計が上限を超えて `54000` になる。
+        let err = finish_aggregate_result(accs(), &bound, &schema, MAX_AGGREGATE_RESULT_BYTES)
+            .expect_err("text state plus cast result must exceed the pool");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     fn bound_single(func: AggregateFunc, input: AggregateInput) -> BoundAggregate {
