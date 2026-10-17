@@ -201,6 +201,14 @@ const MAX_WHERE_LEAVES: usize = crate::declarative_filter::MAX_METADATA_FILTERS;
 /// 検査し、深いネスト入力によるスタック消費を定数に抑える。
 const MAX_WHERE_GROUP_DEPTH: usize = MAX_EXPR_DEPTH;
 
+/// `tokens[lit_idx]` の文字列リテラルの直後が `::` か（Issue #1593・SQL-47）。真のとき、その
+/// リテラルは `'<lit>'::T`（式）の被演算子であり、`col = '<lit>'` 等の宣言的な構造葉
+/// （`Equality`・`Prefix`・`Compare`）へは当てはめず式述語へ回す。`sql::params` の序数カウンタも
+/// 同じ判定で数え飛ばし、構文段との食い違い（ENUM 語彙照合省略の誤適用）を防ぐ。
+pub(crate) fn literal_followed_by_typecast(tokens: &[Token], lit_idx: usize) -> bool {
+    matches!(tokens.get(lit_idx.saturating_add(1)), Some(Token::TypeCast))
+}
+
 /// `WHERE` の括弧グループ `(...)` の直後のトークンが、値式（`(id + 1) > 5` 等）の
 /// 一部であることを示す比較・算術演算子かどうかを判定する（TASK-208・SQL-24、
 /// Issue #912。[`Parser::parse_where_atom`] の決定的先読みが使う）。それ以外の
@@ -213,6 +221,7 @@ fn is_where_group_operator_token(token: &Token) -> bool {
             | Token::Punct('>')
             | Token::Le
             | Token::Ge
+            | Token::TypeCast
             | Token::Punct('+')
             | Token::Punct('-')
             | Token::Punct('*')
@@ -4209,7 +4218,8 @@ impl<'a> Parser<'a> {
                 let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
                 // TABLE-28・Issue #1609: 識別子の直後の `COLLATE` も式項目の継続。
                 let next_is_op = self.tokens.get(self.pos + 1).is_some_and(|t| {
-                    matches!(t, Token::Punct('+' | '-' | '*' | '/')) || is_json_operator_token(t)
+                    matches!(t, Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
+                        || is_json_operator_token(t)
                 }) || self.peek_ident_matches_at(1, "COLLATE")
                     || (self.peek_ident_matches_at(1, "AT")
                         && (self.peek_ident_matches_at(2, "LOCAL")
@@ -4231,7 +4241,7 @@ impl<'a> Parser<'a> {
                     if self.peek_ident_matches("COLLATE")
                         || self.peek_at_time_zone()
                         || self.peek().is_some_and(|t| {
-                            matches!(t, Token::Punct('+' | '-' | '*' | '/'))
+                            matches!(t, Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
                                 || is_json_operator_token(t)
                         })
                     {
@@ -4264,6 +4274,12 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(Token::Punct('(' | '-')) | Some(Token::Number(_)) => {
+                self.parse_projection_infix(0)?
+            }
+            // Issue #1593: `'1'::int` のように文字列リテラルへ `::` が続く形だけ式項目として扱う。
+            Some(Token::StringLiteral(_))
+                if matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast)) =>
+            {
                 self.parse_projection_infix(0)?
             }
             _ => return Ok(SelectItem::Column(self.expect_ident()?)),
@@ -5662,6 +5678,7 @@ impl<'a> Parser<'a> {
         }
         if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
+            && !literal_followed_by_typecast(&self.tokens, self.pos + 2)
         {
             self.advance();
             self.advance();
@@ -5674,6 +5691,7 @@ impl<'a> Parser<'a> {
         if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('<')))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::Punct('>')))
             && matches!(self.tokens.get(self.pos + 3), Some(Token::StringLiteral(_)))
+            && !literal_followed_by_typecast(&self.tokens, self.pos + 3)
         {
             // `<col> <> '<lit>'`／`<col> != '<lit>'`（字句段が `!=` を `<>` へ写す。
             // Issue #1431・SQL-24 ポインタ）。`NOT <col> = '<lit>'` と同じ
@@ -5692,6 +5710,7 @@ impl<'a> Parser<'a> {
         }
         if matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LIKE"))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
+            && !literal_followed_by_typecast(&self.tokens, self.pos + 2)
         {
             self.advance();
             self.advance();
@@ -5708,6 +5727,7 @@ impl<'a> Parser<'a> {
         if matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT"))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LIKE"))
             && matches!(self.tokens.get(self.pos + 3), Some(Token::StringLiteral(_)))
+            && !literal_followed_by_typecast(&self.tokens, self.pos + 3)
         {
             self.advance();
             self.advance();
@@ -5731,6 +5751,9 @@ impl<'a> Parser<'a> {
         }
         if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false"))
+            // `flag = true::bool` の `true` は `::` の被演算子（式）であり、構造葉の
+            // BoolEquality にはしない（Issue #1593。式述語へ回す）。
+            && !matches!(self.tokens.get(self.pos + 3), Some(Token::TypeCast))
         {
             // BOOLEAN 列の明示等価条件（`<col> = true|false`。Issue #883・
             // D-c）。大小無視は expect_literal の bool リテラルと同じ方針。
@@ -5756,7 +5779,9 @@ impl<'a> Parser<'a> {
             .get(self.pos + 1)
             .and_then(where_compare_op_token)
         {
-            if matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_))) {
+            if matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
+                && !literal_followed_by_typecast(&self.tokens, self.pos + 2)
+            {
                 // `<col> (< | > | <= | >=) '<literal>'`（TABLE-13・
                 // TASK-199、Issue #891・レーン B）。逆向き
                 // （`'x' < col`）は本腕では扱わず式フォールバックへ回す
@@ -6093,6 +6118,7 @@ impl<'a> Parser<'a> {
     fn parse_mul_rest(&mut self, lhs: Expr, depth: usize) -> Result<Expr, SqlSurfaceError> {
         // 先頭の関数呼び出しを先に読み終えた投影項目から継続する場合も、後置 `COLLATE` を
         // 一次式の直後として受理する（`parse_primary_expr` 経由では適用済みで冪等）。
+        let lhs = self.parse_typecast_postfix(lhs, depth)?;
         let lhs = self.parse_collate_postfix(lhs)?;
         let mut lhs = self.parse_at_time_zone_postfix(lhs, depth)?;
         loop {
@@ -6119,6 +6145,7 @@ impl<'a> Parser<'a> {
     /// `WHEN`（`sql::allowlist` 内の他の文脈的キーワード）と同じ判断）。
     fn parse_primary_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         let primary = self.parse_primary_expr_inner(depth)?;
+        let primary = self.parse_typecast_postfix(primary, depth)?;
         let primary = self.parse_collate_postfix(primary)?;
         self.parse_at_time_zone_postfix(primary, depth)
     }
@@ -6173,6 +6200,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.advance();
                 let zone = self.parse_primary_expr_inner(depth + 1)?;
+                let zone = self.parse_typecast_postfix(zone, depth + 1)?;
                 let zone = self.parse_collate_postfix(zone)?;
                 self.consume_expr_node()?;
                 lhs = Expr::Call {
@@ -6196,7 +6224,8 @@ impl<'a> Parser<'a> {
             // （`Expr::Ident`）として扱う。
             Some(Token::Ident(name))
                 if name.eq_ignore_ascii_case("NULL")
-                    && self.allow_null_literal
+                    && (self.allow_null_literal
+                        || matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast)))
                     && !self.quoted_null.contains(&self.pos) =>
             {
                 self.advance();
@@ -6231,6 +6260,19 @@ impl<'a> Parser<'a> {
                     ));
                 };
                 self.consume_expr_node()?;
+                // Issue #1593: `-1::T` は PG と同じく `-(1::T)`（`::` は単項マイナスより強い）。
+                // 負リテラルへ畳むと既定列名・範囲検査（`-2147483648::int` は 22003）が食い違うため、
+                // `::` が続くときは畳まず `0 - (n::T)` へ脱糖する。
+                if matches!(self.peek(), Some(Token::TypeCast)) {
+                    let cast = self.parse_typecast_postfix(Expr::Number(n), depth)?;
+                    self.consume_expr_node()?;
+                    self.consume_expr_node()?;
+                    return Ok(Expr::Binary {
+                        op: BinOp::Sub,
+                        lhs: Box::new(Expr::Number("0".to_string())),
+                        rhs: Box::new(cast),
+                    });
+                }
                 Ok(Expr::Number(format!("-{n}")))
             }
             // Issue #1543: 定数式文脈（INSERT VALUES・DEFAULT）限定の符号付き数値
@@ -7265,6 +7307,12 @@ impl<'a> Parser<'a> {
     /// 先読みだけで判定する（`CASE` は次が `WHEN` のときのみ。列名 `case` の後方互換）。
     fn order_key_starts_expression(&self) -> bool {
         match self.peek() {
+            // Issue #1593: `ORDER BY '2026-10-10'::date`／`1::int`（CAST 形と同じく式キー）。
+            Some(Token::StringLiteral(_) | Token::Number(_))
+                if matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast)) =>
+            {
+                true
+            }
             Some(Token::Ident(name)) => {
                 if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") {
                     return true;
@@ -7284,6 +7332,10 @@ impl<'a> Parser<'a> {
                 // TABLE-28・Issue #1609: `ORDER BY name COLLATE "C"` も式キー
                 // （列名キーでは `COLLATE` を解釈できない）。
                 if self.peek_ident_matches_at(1, "COLLATE") {
+                    return true;
+                }
+                // Issue #1593: `ORDER BY i4::text` も式キー。
+                if matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast)) {
                     return true;
                 }
                 matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
@@ -7672,8 +7724,10 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
-            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/')))
-                && !self.peek_at_time_zone()
+            if !matches!(
+                self.peek(),
+                Some(Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
+            ) && !self.peek_at_time_zone()
             {
                 return Ok(lit);
             }
@@ -7722,8 +7776,10 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
-            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/')))
-                && !self.peek_at_time_zone()
+            if !matches!(
+                self.peek(),
+                Some(Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
+            ) && !self.peek_at_time_zone()
             {
                 return Ok(SetValue::Literal(lit));
             }
@@ -9581,6 +9637,37 @@ impl<'a> Parser<'a> {
         };
         crate::collation::Collation::resolve_name(&name)
             .ok_or(SqlSurfaceError::UndefinedCollation { name })
+    }
+
+    /// 一次式の直後の後置 `::<型名>`（SQL-47。Issue #1593）を左結合で繰り返し受理し、
+    /// `CAST(<式> AS <型名>)` と同一の [`Expr::Cast`] へ脱糖する。束縛・変換規則表・SQLSTATE・
+    /// 既定列名・内容ハッシュはすべて CAST と共有される。PG の優先順位どおり `.` の次に強く、
+    /// 単項 `+`/`-`・`COLLATE`・`AT TIME ZONE`・算術・比較より強い。型名は DDL と同じ型名解決
+    /// （[`Self::parse_cast_target_type`]）で読む。1 段ごとにノード予算と再帰深さ
+    /// （`MAX_EXPR_DEPTH`。後続の再帰走査のスタック保護）を課金する。CHECK 本体では `0A000`。
+    fn parse_typecast_postfix(
+        &mut self,
+        mut lhs: Expr,
+        depth: usize,
+    ) -> Result<Expr, SqlSurfaceError> {
+        let mut links = 0usize;
+        while matches!(self.peek(), Some(Token::TypeCast)) {
+            if self.in_check_body {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "'::' is not supported in a CHECK constraint".to_string(),
+                });
+            }
+            self.advance();
+            let ty = self.parse_cast_target_type()?;
+            self.consume_expr_node()?;
+            links = links.saturating_add(1);
+            self.check_expr_depth(depth.saturating_add(links))?;
+            lhs = Expr::Cast {
+                expr: Box::new(lhs),
+                ty,
+            };
+        }
+        Ok(lhs)
     }
 
     /// 一次式の直後の後置 `COLLATE <name>`（TABLE-28。Issue #1609）を左結合で繰り返し
@@ -16320,15 +16407,77 @@ mod tests {
         assert_eq!(err.wire_code(), "42601", "sql={sql:?} err={err:?}");
     }
 
-    /// SQL-42・Issue #1520: lexer が多文字演算子を単一トークン化しても、構文段は
-    /// 受理しない（fail-closed）。変更前後で 42601 は同じで、受理が広がらないための回帰柵。
+    /// SQL-42・Issue #1520 / Issue #1593: lexer が `::` を単一トークン化し、構文段は
+    /// `CAST` と同一の `Expr::Cast` へ脱糖して受理する。他の多文字演算子の扱いは
+    /// 各 Issue の担当で、ここでは `::` の木の形だけを固定する。
     #[test]
-    fn rejects_multichar_operator_tokens_as_syntax_error() {
-        assert_rejected_as_syntax_error(
+    fn typecast_operator_desugars_to_cast_in_where_expression() {
+        let preds = where_predicates_for(
             "SELECT * FROM documents WHERE lang::text = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
         );
-        // `||` は Issue #2181 で構文段が受理するようになった（jsonb 以外への適用は束縛段が
-        // `0A000`／`42883` で拒否する。`tests/json_modify_operators.rs`）。
+        let [WherePredicate::Expression(Expr::Binary {
+            op: BinOp::Eq, lhs, ..
+        })] = preds.as_slice()
+        else {
+            panic!("expected a single comparison, got {preds:?}");
+        };
+        assert!(
+            matches!(lhs.as_ref(), Expr::Cast { expr, .. } if matches!(expr.as_ref(), Expr::Ident(n) if n == "lang")),
+            "{lhs:?}"
+        );
+    }
+
+    /// Issue #1593: `col = '<lit>'::T` は宣言的な `Equality` ではなく式述語になる。
+    #[test]
+    fn string_literal_followed_by_typecast_is_not_a_structural_equality() {
+        for w in ["id = '5'::bigint", "t < 'a'::text"] {
+            let preds = where_predicates_for(&format!(
+                "SELECT * FROM documents WHERE {w} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            ));
+            assert!(
+                matches!(preds.as_slice(), [WherePredicate::Expression(_)]),
+                "{w}: {preds:?}"
+            );
+        }
+    }
+
+    /// Issue #1593: `::` は単項マイナス・乗算・加算・COLLATE より強い（PG の優先順位）。
+    #[test]
+    fn typecast_binds_tighter_than_arithmetic_and_collate() {
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE 1 + 2 * a::int > 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        let [WherePredicate::Expression(Expr::Binary { lhs, .. })] = preds.as_slice() else {
+            panic!("{preds:?}");
+        };
+        let Expr::Binary {
+            op: BinOp::Add,
+            rhs: mul,
+            ..
+        } = lhs.as_ref()
+        else {
+            panic!("{lhs:?}");
+        };
+        let Expr::Binary {
+            op: BinOp::Mul,
+            rhs: cast,
+            ..
+        } = mul.as_ref()
+        else {
+            panic!("{mul:?}");
+        };
+        assert!(matches!(cast.as_ref(), Expr::Cast { .. }), "{cast:?}");
+        // 連鎖は左結合: `a::text::varchar` = Cast(Cast(a, text), varchar)
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE a::text::varchar = 'x' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        let [WherePredicate::Expression(Expr::Binary { lhs, .. })] = preds.as_slice() else {
+            panic!("{preds:?}");
+        };
+        assert!(
+            matches!(lhs.as_ref(), Expr::Cast { expr, .. } if matches!(expr.as_ref(), Expr::Cast { .. })),
+            "{lhs:?}"
+        );
     }
 
     /// Issue #1596（TABLE-25）: パス演算子は構文段で受理され、PostgreSQL と同じ優先順位
@@ -17724,11 +17873,12 @@ mod tests {
         );
         for (sql, code) in [
             ("DEFAULT now() + 1", "42601"),
-            ("DEFAULT now()::text", "42601"),
+            // `::` は CAST と同じく定数式では未対応（0A000。Issue #1593）。
+            ("DEFAULT now()::text", "0A000"),
             ("DEFAULT now() || 'x'", "42601"),
             ("DEFAULT CURRENT_TIMESTAMP + 1", "42601"),
             ("DEFAULT statement_timestamp() + 1", "42601"),
-            ("DEFAULT clock_timestamp()::text", "42601"),
+            ("DEFAULT clock_timestamp()::text", "0A000"),
             ("DEFAULT CURRENT_TIME", "42601"),
             ("DEFAULT LOCALTIME + 1", "42601"),
         ] {

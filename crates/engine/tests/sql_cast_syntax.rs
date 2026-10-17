@@ -4,7 +4,7 @@
 //! `EngineCore::execute_sql_in_session`（字句解析 → 許可リスト構文検証 → 束縛 → 評価）を
 //! production 経路として検証する。固定する契約: 型の組が `×` のときの `42846`（値が NULL でも同じ）、
 //! 恒等・型なしリテラル・型付き NULL の束縛と結果列の型、未知の型名の `42704`、値の変換が未実装の組の
-//! `0A000`、`::`・定数式・CHECK 本体・UDF 名の従来の拒否の維持、テナント境界、エラー文に値が出ないこと。
+//! `0A000`、定数式・CHECK 本体・UDF 名の従来の拒否の維持、テナント境界、エラー文に値が出ないこと。
 //! 値の変換そのもの（`i`・`a`・`e`・`io/*`）は #1591／#1592 の担当でここでは固定しない。
 
 use engine::catalog::ColumnType;
@@ -531,8 +531,7 @@ fn nesting_depth_and_node_count_limits_apply_to_cast() {
 #[test]
 fn legacy_rejections_are_kept() {
     let (core, _g) = setup("cast-legacy");
-    // `::` は #1593 まで従来どおり
-    assert_eq!(code(&core, "SELECT i4::integer FROM c LIMIT 1"), "42601");
+    // `::` は #1593 で CAST と同一の木へ脱糖される（`tests/sql_typecast_operator.rs`）。
     // 定数式（INSERT VALUES・DEFAULT）の CAST
     assert_eq!(
         code(
