@@ -1465,6 +1465,7 @@ pub(crate) fn decode_bind_values_nullable(
             | Token::JsonExists
             | Token::JsonExistsAny
             | Token::JsonExistsAll
+            | Token::ArrayOverlap
             | Token::TypeCast
             | Token::Concat => 0,
         };

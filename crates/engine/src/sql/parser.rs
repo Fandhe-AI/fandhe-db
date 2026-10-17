@@ -1523,7 +1523,9 @@ fn cast_operand_name(expr: &Expr) -> Option<String> {
         | Expr::ValueFunction { .. } => Some(default_expr_alias(expr)),
         Expr::Cast { expr, .. } => cast_operand_name(expr),
         Expr::Collate { expr, .. } => cast_operand_name(expr),
-        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => Some(default_expr_alias(expr)),
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
+            Some(default_expr_alias(expr))
+        }
         _ => None,
     }
 }
@@ -7554,7 +7556,7 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
         // 照合指定（TABLE-28・Issue #1609）は内側の式の列参照を集める。
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => collect_expr_idents(expr, out),
         // 配列コンストラクタ・添字（TABLE-35・Issue #1602）は子の列参照を集める。
-        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => {
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
             for c in expr.array_expr_children().into_iter().flatten() {
                 collect_expr_idents(c, out);
             }
@@ -8225,7 +8227,7 @@ fn rewrite_group_row_idents(
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
         },
-        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => {
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
             match expr.try_map_array_children(&mut |e| rec(e)) {
                 Some(r) => r?,
                 None => expr.clone(),
