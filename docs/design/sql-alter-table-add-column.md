@@ -26,9 +26,14 @@ ALTER TABLE <table> ADD COLUMN <column> <type>
 - 既存行は書き換えない（TABLE-5。O(1)・既存行のバイト列不変）。`DEFAULT` 付きで追加した列は、
   行バッファ末尾で欠落している既存行を読み出し時に既定値で補う
   （`row_codec::scan_scalar_columns_validated`。PostgreSQL の fast default 相当）。補完値は
-  `INSERT` の列省略補完と同じ `row_codec::column_default_scalar` を通す。列の `DEFAULT` は
-  作成後に変わらないことが前提で、`ALTER COLUMN SET DEFAULT` を導入する場合は補完専用の値の
-  分離が必要。
+  `INSERT` の列省略補完と同じ `row_codec::column_default_scalar` を通す。
+  読み出し時補完値と `INSERT` 既定値は、カタログ上で別の値として持つ（Issue #1627・TABLE-39 の
+  前提）。`ColumnDef::fill_value` が補完専用（`ADD COLUMN` の時点で決まり、後は `ALTER COLUMN TYPE`
+  の変換でのみ変わる。時刻 DEFAULT は持てない）、`ColumnDef::default_expr` が `INSERT` 既定値。
+  現時点の全経路は 2 つを同じ値にそろえる（ミラー）。食い違う列を 1 つでも持つスキーマだけが
+  カタログ v14（列行の 7 番目に `fill`、`pkname:` 行は常に出力）で書かれ、それ以外は従来の版の
+  バイト列のまま。v2〜v13 は読み込み時に `fill_value = default_expr` とみなす。
+  `ALTER COLUMN SET／DROP DEFAULT` は `default_expr` だけを変える（#1628・#1629）。
 - `DEFAULT` なしの `NOT NULL` は、行の有無（自テナント・他テナント・空）にかかわらず構造検証段階で
   一律 `42601` 拒否する（TABLE-16。カタログ・行ストアを参照しない）。行の有無で成否を変えると、
   DDL 主体が他テナントの行の存在を判別できてしまう（テナント境界 P0）ため、判定を行データに
