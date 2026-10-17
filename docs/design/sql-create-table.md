@@ -20,8 +20,7 @@ CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]
   `NUMERIC(p,s)`）・`VECTOR ( <N> )`・配列型（`<型>[]`・`<型>[N]`。TABLE-14）・登録済みの
   ENUM 型名。未知の型名は `42601`。`VECTOR` は従来どおり常に非 nullable で `DEFAULT`・
   `UNIQUE` を持てない。DEFAULT の型別変換は `ADD COLUMN` と同じ純関数
-  （`sql::ddl::add_column_default`）を共有する。`IF NOT EXISTS`・
-  `USING OPERATION_ID` の付与はいずれも許可リスト外（構造的に受理しない・
+  （`sql::ddl::add_column_default`）を共有する。`USING OPERATION_ID` の付与はいずれも許可リスト外（構造的に受理しない・
   `42601`）。列制約 `REFERENCES <table> [(<col>[, ...])]`・表制約
   `FOREIGN KEY (<col>[, ...]) REFERENCES ...`（Issue #907。
   `docs/design/foreign-key.md`）も制約構文として受理する。`CONSTRAINT <name>` は
@@ -212,3 +211,17 @@ PostgreSQL 互換の `CREATE TABLE`（件数なし）。
 `BYTEA`・`JSON`・`JSONB`・ENUM 要素は受理する（Issue #1357。`NUMERIC` の精度・位取りの
 範囲外は `42601`）。`CREATE TABLE` が列型キーワードとして予約する語
 （制約名の衝突判定）は、受理するスカラー型名すべてに広がった。
+
+## Issue #1613 追記（TABLE-36）: `IF NOT EXISTS`
+
+- `CREATE TABLE IF NOT EXISTS <table> (...)` を受理する（`ValidatedCreateTable::if_not_exists`）。
+  句の検出は `Parser::parse_optional_if_not_exists`（`IF` `NOT` `EXISTS` の 3 語が揃ったときだけ
+  消費）で、`if` という表名は従来どおり使える。
+- 判定順序: 構文検証 → DDL 権限ゲート（`42501`）→ `Storage::relation_name_exists` による早期判定
+  （同名の表・ビュー・索引があれば列数・型解決・DEFAULT 等の意味検証より前に no-op 成功）→
+  通常の作成。最終判定は `Storage::create_table` の書き込みトランザクションで、競合で返る
+  `TableAlreadyExists` も no-op に写す（TOCTOU 対策）。定義は比較しない。
+- no-op はカタログ・世代を変えない（名前衝突は commit・世代 bump の前に返る）。
+- 句なしの重複（`42P07`）、`CREATE VIEW`／`CREATE TYPE ... IF NOT EXISTS`（`42601`）は不変。
+- 対象外: no-op 時の NoticeResponse、`ADD COLUMN IF NOT EXISTS`、`CREATE TABLE ... AS`、
+  SEQUENCE・SCHEMA・MATERIALIZED VIEW（本体の CREATE 文が未実装。各 Issue が同ヘルパーを再利用する）。
