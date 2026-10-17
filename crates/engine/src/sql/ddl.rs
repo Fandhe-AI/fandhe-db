@@ -152,7 +152,7 @@ pub(crate) fn execute_create_table(
     // 解決後の列型に対して DEFAULT を束縛検証する（ENUM の語彙外・DATE/NUMERIC の
     // 不正リテラル等を永続化前に SQLSTATE 付きで拒否する）。
     for column in &columns {
-        if let Some(default) = &column.default {
+        if let Some(default) = &column.default_expr {
             // 時刻 DEFAULT は評価せず（型適合は構文段・`validate_schema` が検査済み）、
             // `bind_column_default` へ流さない（あちらは定数 DEFAULT 専用）。
             if !matches!(default, ColumnDefault::CurrentTime(_)) {
@@ -426,7 +426,7 @@ pub(crate) fn execute_alter_table_add_column(
         normalize_timestamptz_default(&mut column)?;
         // 束縛できない DEFAULT（範囲外・桁数超過等）は永続化前に SQLSTATE 付きで拒否する
         // （既存行の読み出し時補完が常に失敗する状態をカタログへ残さない）。
-        if let Some(default) = &column.default {
+        if let Some(default) = &column.default_expr {
             crate::sql::parser::bind_column_default(&column, default)?;
         }
     }
@@ -1051,7 +1051,7 @@ fn reject_time_default_set_default(
         }
         let has_time_default = fk.columns().iter().any(|name| {
             columns.iter().any(|c| {
-                &c.name == name && matches!(c.default, Some(ColumnDefault::CurrentTime(_)))
+                &c.name == name && matches!(c.default_expr, Some(ColumnDefault::CurrentTime(_)))
             })
         });
         if has_time_default {
@@ -1252,17 +1252,28 @@ pub(crate) fn add_column_default(
 /// 当時の DDL セッション＝常に UTC と同じ解釈のまま）。TZ 付きの既定値も同じ UTC 表記へ揃う。
 /// 解釈できない値は DDL を拒否する（エラー文言に値を含めない）。
 fn normalize_timestamptz_default(column: &mut ColumnDef) -> Result<(), SqlSurfaceError> {
-    use crate::datetime::{DateTimeLiteralError, TimestampTzLiteralError};
     if column.ty != ColumnType::TimestampTz {
         return Ok(());
     }
-    let Some(ColumnDefault::Text(text)) = &column.default else {
+    // `default_expr` と `fill_value` の両方を同じ規則で正規化する（Issue #1627。
+    // ミラー状態なら同じ値になる）。
+    normalize_timestamptz_slot(&column.name, &mut column.default_expr)?;
+    normalize_timestamptz_slot(&column.name, &mut column.fill_value)
+}
+
+/// [`normalize_timestamptz_default`] の 1 スロット分（INSERT 既定値または補完値）。
+fn normalize_timestamptz_slot(
+    column_name: &str,
+    slot: &mut Option<ColumnDefault>,
+) -> Result<(), SqlSurfaceError> {
+    use crate::datetime::{DateTimeLiteralError, TimestampTzLiteralError};
+    let Some(ColumnDefault::Text(text)) = &*slot else {
         return Ok(());
     };
     let tz = crate::datetime::current_session_time_zone();
     match crate::datetime::parse_timestamptz(text, &tz) {
         Ok(micros) => {
-            column.default = Some(ColumnDefault::Text(crate::datetime::format_timestamptz(
+            *slot = Some(ColumnDefault::Text(crate::datetime::format_timestamptz(
                 micros,
                 &crate::datetime::SessionTimeZone::utc(),
             )));
@@ -1271,13 +1282,13 @@ fn normalize_timestamptz_default(column: &mut ColumnDef) -> Result<(), SqlSurfac
         Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Format(_))) => {
             Err(SqlSurfaceError::invalid_datetime_format(format!(
                 "column {:?} DEFAULT has an invalid datetime format for its type",
-                column.name
+                column_name
             )))
         }
         Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Overflow(_))) => {
             Err(SqlSurfaceError::datetime_field_overflow(format!(
                 "column {:?} DEFAULT is out of range for its type",
-                column.name
+                column_name
             )))
         }
         Err(TimestampTzLiteralError::UnknownTimeZone) => {

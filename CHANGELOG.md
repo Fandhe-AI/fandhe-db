@@ -9,6 +9,11 @@
 
 ### Breaking Changes
 
+- 列定義の分離（Issue #1627・TABLE-39 の前提）: `engine::catalog::ColumnDef` の公開フィールド
+  `default` を `default_expr`（`INSERT` 既定値）へ改名し、読み出し時補完値 `fill_value` を追加する。
+  `ColumnDef::with_default` は両方を同じ値にする。カタログは補完値が食い違う列を持つ場合のみ
+  新形式 v14 で書く（旧バイナリは v14 を拒否する）。
+
 - 配列型 OID の公告（Issue #1606・TABLE-35）: 配列列と結果型が確定する配列式の `RowDescription` の
   型 OID が `text`（25）から要素型ごとの PostgreSQL 配列型 OID（`int4[]`=1007 など）に変わる。
   `ENUM[]` は 25 のまま。配列のバイナリ形式は従来どおり `0A000`。

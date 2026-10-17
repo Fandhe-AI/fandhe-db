@@ -3540,7 +3540,7 @@ fn apply_referential_action(
                         let column = child_schema.columns.get(idx).ok_or_else(|| {
                             internal("foreign key column index out of range for live schema")
                         })?;
-                        let value = match &column.default {
+                        let value = match &column.default_expr {
                             Some(default) => {
                                 crate::sql::parser::bind_column_default(column, default).map_err(
                                     |_| {

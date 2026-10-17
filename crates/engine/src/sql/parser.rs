@@ -3095,7 +3095,7 @@ pub(crate) fn fill_omitted_columns(
         if is_provided {
             continue;
         }
-        match &column.default {
+        match &column.default_expr {
             Some(ColumnDefault::CurrentTime(time)) => {
                 // 評価時刻の無い文脈は `0A000`（fail-closed。ファイル INSERT・FK の
                 // SET DEFAULT 等は `bind_column_default` 側で常に拒否される）。
@@ -5425,7 +5425,7 @@ fn bind_file_insert(
         if is_provided {
             continue;
         }
-        match &column.default {
+        match &column.default_expr {
             Some(default) => {
                 let value = bind_column_default(column, default)?;
                 if let Some(slot) = template_values.get_mut(idx) {
