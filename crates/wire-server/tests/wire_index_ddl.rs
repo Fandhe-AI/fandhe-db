@@ -186,9 +186,15 @@ fn wire_index_ddl_error_classification() {
         "CREATE INDEX idx_h ON docs USING hnsw (body)",
         "0A000",
     );
-    expect_error(
+    expect_command(
         &mut stream,
         "CREATE INDEX idx_b ON docs USING btree (body)",
+        "CREATE INDEX",
+    );
+    expect_command(&mut stream, "DROP INDEX idx_b", "DROP INDEX");
+    expect_error(
+        &mut stream,
+        "CREATE INDEX idx_x ON docs USING bm25 (body)",
         "0A000",
     );
     expect_error(

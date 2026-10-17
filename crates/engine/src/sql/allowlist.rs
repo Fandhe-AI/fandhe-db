@@ -11132,7 +11132,7 @@ pub(crate) fn validate_create_view_tokens(
     })
 }
 
-/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> [USING hnsw] (<col> [COLLATE <name>][, ...])` の許可形状構造
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> [USING btree｜hnsw] (<col> [COLLATE <name>][, ...])` の許可形状構造
 /// 検証結果（TASK-206・INDEX-7・SQL-23、Issue #908）。[`ValidatedDropTable`] と
 /// 同じくカタログ照会を一切行わない（列の存在・型整合・名前衝突・対象の種別は
 /// `sql::ddl::execute_create_index` → `catalog::Storage::create_index` が単一の
@@ -11143,8 +11143,8 @@ pub struct ValidatedCreateIndex {
     /// `IF NOT EXISTS` 句の有無（TABLE-36、Issue #1613。名前付きのみ）。
     pub(crate) if_not_exists: bool,
     pub(crate) table: String,
-    /// `USING hnsw` 指定の有無（`hnsw` 以外の `USING` 値は構造検証段で `0A000`
-    /// 拒否済み）。
+    /// `USING hnsw` 指定の有無（`btree` は省略時と同じ `false`。`hnsw`・`btree` 以外の
+    /// `USING` 値は構造検証段で `0A000` 拒否済み。Issue #1617）。
     pub(crate) hnsw: bool,
     pub(crate) columns: Vec<String>,
     /// `columns` と同じ長さの列ごとの `COLLATE`（`None` は照合指定なし。Issue #2191・
@@ -11227,7 +11227,8 @@ pub(crate) fn is_drop_index_statement(tokens: &[Token]) -> bool {
 /// [`ValidatedCreateIndex`] の構造検証本体（TASK-206・INDEX-7、Issue #908）。
 /// カタログを参照しない範囲の判定はここで完結させる（fail-closed。権限の無い
 /// 呼び出し元へ存在情報を漏らさないよう、カタログ照会を要する検査は一切行わない）:
-/// - `USING <ident>` が `hnsw` 以外 → `0A000`（`FeatureNotSupported`）。
+/// - `USING <ident>` が `hnsw`・`btree` 以外 → `0A000`（`FeatureNotSupported`）。
+///   `USING btree` は省略時と同一のスカラー宣言（INDEX-9、Issue #1617）。
 /// - `USING hnsw` なのに列が複数 → `0A000`。
 /// - 列リストの要素が式・関数呼び出し・リテラル → `0A000`。
 /// - 部分索引の `WHERE` 句 → `0A000`。
@@ -11266,12 +11267,17 @@ pub(crate) fn validate_create_index_tokens(
     let hnsw = if p.peek_ident_matches("USING") {
         p.advance();
         let method = p.expect_ident()?;
-        if !method.eq_ignore_ascii_case("hnsw") {
+        if method.eq_ignore_ascii_case("hnsw") {
+            true
+        } else if method.eq_ignore_ascii_case("btree") {
+            // PG の既定方式の明示。`USING` 省略時と同一のスカラー宣言として扱う
+            // （カタログ表現は変えない。INDEX-9、Issue #1617）。
+            false
+        } else {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: truncate_for_error(&format!("index method {method} is not supported")),
             });
         }
-        true
     } else {
         false
     };
@@ -15693,6 +15699,44 @@ pub(crate) fn validate_update_form_tokens(
 
 #[cfg(test)]
 mod tests {
+    /// `USING btree` は省略形と同一の宣言で、`hnsw`・`btree` 以外の手法は `0A000`
+    /// （INDEX-9、Issue #1617）。
+    #[test]
+    fn create_index_using_btree_equals_omitted_and_other_methods_rejected() {
+        use super::*;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            validate_create_index_tokens(&tokens)
+        };
+        assert_eq!(
+            parse("CREATE INDEX i ON t USING btree (a, b)").expect("btree"),
+            parse("CREATE INDEX i ON t (a, b)").expect("omitted")
+        );
+        assert_eq!(
+            parse("CREATE INDEX i ON t USING BTREE (a COLLATE \"C\")").expect("upper"),
+            parse("CREATE INDEX i ON t (a COLLATE \"C\")").expect("omitted")
+        );
+        let ine = parse("CREATE INDEX IF NOT EXISTS i ON t USING btree (a)").expect("ine");
+        assert!(ine.if_not_exists());
+        for m in ["bm25", "hash", "gin", "gist"] {
+            assert!(
+                matches!(
+                    parse(&format!("CREATE INDEX i ON t USING {m} (a)")),
+                    Err(SqlSurfaceError::FeatureNotSupported { .. })
+                ),
+                "{m}"
+            );
+        }
+        assert!(matches!(
+            parse("CREATE INDEX i ON t USING (a)"),
+            Err(SqlSurfaceError::UnsupportedSyntax { .. })
+        ));
+        assert!(matches!(
+            parse("CREATE INDEX i ON t USING hnsw (a, b)"),
+            Err(SqlSurfaceError::FeatureNotSupported { .. })
+        ));
+    }
+
     /// `CREATE INDEX` の列ごとの `COLLATE`（TABLE-28、Issue #2191）。名前は構文段で許可リストに
     /// 解決し、二重指定は `42601`、未知の名前は `42704`、式索引は `0A000`。
     #[test]
