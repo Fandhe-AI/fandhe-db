@@ -343,7 +343,18 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             // `{NULL}` と `{"NULL"}` が衝突しない単射性を保つ。
             let has_null = array_value.has_null();
             let mark: u8 = if has_null { 0x80 } else { 0 };
-            match array_value {
+            // 2 次元以上（Issue #1605）は要素型タグの前に未使用のマーカー 0x40・次元数・各次元長を
+            // 積む。1 次元の先頭バイトは要素型タグ（0..=13）または NULL 印付き（0x80 以上）で
+            // 0x40 とは衝突せず、`{{1,2},{3,4}}` と `{1,2,3,4}` が別ハッシュになる。1 次元の
+            // 入力バイト列は従来と同一。
+            if let crate::row_codec::ArrayValue::Multi(m) = array_value {
+                b.push_u8(0x40);
+                b.push_u8(u8::try_from(m.dims().len()).unwrap_or(u8::MAX));
+                for d in m.dims() {
+                    b.push_u64(u64::from(*d));
+                }
+            }
+            match array_value.flat() {
                 crate::row_codec::ArrayValue::Text(items) => {
                     b.push_u8(mark); // 要素型タグ: TEXT
                     b.push_u64(items.len() as u64);
@@ -514,6 +525,12 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
                             b.push_bytes(item.as_bytes())?;
                         }
                     }
+                }
+                // `flat()` は `Multi` を返さない（網羅性のための fail-closed な腕）。
+                crate::row_codec::ArrayValue::Multi(_) => {
+                    return Err(StorageError::Codec(
+                        "nested multi-dimensional array in content hash".to_string(),
+                    ))
                 }
             }
         }

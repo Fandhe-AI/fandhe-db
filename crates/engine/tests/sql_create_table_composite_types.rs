@@ -115,7 +115,7 @@ fn unknown_and_invalid_types_are_rejected_with_42601() {
     for sql in [
         "CREATE TABLE t (a INTEGER[0])",
         "CREATE TABLE t (a INTEGER[1025])",
-        "CREATE TABLE t (a INTEGER[][])",
+        "CREATE TABLE t (a INTEGER[][-1])",
         "CREATE TABLE t (a INTEGER[-1])",
         "CREATE TABLE t (a VECTOR(2)[])",
         "CREATE TABLE t (a INTEGER[ )",

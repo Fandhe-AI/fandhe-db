@@ -168,6 +168,13 @@ pub(crate) fn array_keys(a: &ArrayValue) -> Result<Vec<Option<Key<'_>>>, SqlSurf
         ArrayValue::Numeric(_) | ArrayValue::Json(_) | ArrayValue::Enum(_) => {
             return Err(internal("array element type has no comparator"))
         }
+        // 多次元値（Issue #1605）の比較・包含・量化は次元ヘッダを考慮した意味論が未定義のため、
+        // 平坦化して誤った結果を返さず fail-closed に拒否する（後続 Issue の担当）。
+        ArrayValue::Multi(_) => {
+            return Err(SqlSurfaceError::unsupported(
+                "comparison of multi-dimensional arrays is not supported",
+            ))
+        }
     })
 }
 

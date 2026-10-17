@@ -2061,9 +2061,23 @@ fn is_reserved_function_name(name: &str) -> bool {
     // 消費するため、`case(...)` という呼び出し形は `WHEN` を期待する CASE
     // 構文解析へ吸われて `42601` になる。`is_reserved_function_name` docs の
     // 既存 `min`/`集計` と同じ理由。Bugbot 指摘対応）。
+    //
+    // `ANY`／`SOME`／`ALL`（Issue #1603・TABLE-35 ポインタ）は量化比較の量化子として
+    // 構文解析され、量化子の位置以外の関数呼び出し形は `42601` で拒否される。同名の UDF を
+    // 許すと呼び出せない定義が登録でき、既存の同名 UDF の呼び出しも壊れるため予約する
+    // （互換性変更。`docs/design/implementation-status.md` の Issue #1603 節に記載）。
     matches!(
         upper.as_str(),
-        "VISIBLE" | "HYBRID_RRF" | "HYBRID" | "CASE" | "COALESCE" | "NULLIF" | "CAST"
+        "VISIBLE"
+            | "HYBRID_RRF"
+            | "HYBRID"
+            | "CASE"
+            | "COALESCE"
+            | "NULLIF"
+            | "CAST"
+            | "ANY"
+            | "SOME"
+            | "ALL"
     ) || is_builtin_function_name(name)
         || crate::sql::allowlist::is_aggregate_function_name(name)
 }
@@ -9534,6 +9548,17 @@ mod tests {
             "statement_timestamp",
             "clock_timestamp",
         ] {
+            let mut registry = UdfRegistry::default();
+            let err = define_function(&mut registry, name, &[], &num("1.0")).unwrap_err();
+            assert_eq!(err.wire_code(), "42723", "function name {name}");
+        }
+    }
+
+    #[test]
+    fn quantifier_names_are_reserved_for_udfs() {
+        // Issue #1603（TABLE-35 ポインタ）: ANY／SOME／ALL は量化子として予約され、
+        // 同名 UDF（宣言的・WASM とも）の定義は `42723`（大文字小文字を区別しない）。
+        for name in ["any", "some", "all", "ANY", "Some"] {
             let mut registry = UdfRegistry::default();
             let err = define_function(&mut registry, name, &[], &num("1.0")).unwrap_err();
             assert_eq!(err.wire_code(), "42723", "function name {name}");

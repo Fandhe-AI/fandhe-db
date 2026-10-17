@@ -6325,7 +6325,7 @@ impl<'a> Parser<'a> {
     }
 
     /// 後置の添字 `[i]`・スライス `[lo:hi]`・`[:hi]`・`[lo:]`・`[:]`（TABLE-35・Issue #1602）。
-    /// 添字を 2 つ以上続けた形（`arr[1][2]`）は多次元の意味になるため `0A000`（#1605 の担当）。
+    /// 添字を 2 つ以上続けた形（`arr[1][2]`）は多次元の意味になるため `0A000`（本変更では対象外。Issue #1605 は型・codec・リテラルのみ）。
     /// 要素の式は `NULL` を許す（`arr[NULL]` は NULL）。1 段ごとにノード予算と再帰深さを課金し、
     /// CHECK 本体では `0A000`（永続化する述語の往復保証の範囲外）。
     fn parse_subscript_postfix(
@@ -9359,11 +9359,13 @@ impl<'a> Parser<'a> {
             // 要素が ENUM の配列（Issue #1357）。語彙は未解決マーカーで仮置きし、
             // 実行段（`sql::ddl::execute_create_table`）が DDL 権限ゲートの後で
             // 登録済みの定義へ差し替える（ENUM 列と同じ契約）。
-            StaticColumnType::ArrayOfEnumCandidate(enum_name, max_len) => {
+            StaticColumnType::ArrayOfEnumCandidate(enum_name, max_len, ndims) => {
                 match crate::catalog::ArrayType::new_enum(
                     crate::catalog::EnumTypeDef::unresolved(enum_name),
                     max_len,
-                ) {
+                )
+                .and_then(|a| a.with_ndims(ndims))
+                {
                     Ok(a) => ColumnType::Array(a),
                     Err(e) => {
                         return Err(SqlSurfaceError::unsupported(format!(

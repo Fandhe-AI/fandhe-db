@@ -760,6 +760,9 @@ fn retained_array_bytes(array: &engine::row_codec::ArrayValue) -> usize {
         })
     }
     match array {
+        // 次元付きは平坦な要素列の保持量に次元長の分を足す（Issue #1605）。
+        ArrayValue::Multi(m) => retained_array_bytes(m.inner())
+            .saturating_add(m.dims().len().saturating_mul(std::mem::size_of::<u32>())),
         ArrayValue::Text(v) | ArrayValue::Json(v) | ArrayValue::Jsonb(v) | ArrayValue::Enum(v) => {
             strings(v)
         }

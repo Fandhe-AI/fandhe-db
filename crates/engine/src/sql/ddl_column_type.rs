@@ -23,7 +23,7 @@
 use super::allowlist::SqlSurfaceError;
 use super::lexer::Token;
 use crate::catalog::{
-    ArrayElemType, ArrayType, ColumnType, MAX_ARRAY_ELEMENTS, MAX_CHAR_TYPE_LENGTH,
+    ArrayElemType, ArrayType, ColumnType, MAX_ARRAY_DIMS, MAX_ARRAY_ELEMENTS, MAX_CHAR_TYPE_LENGTH,
 };
 
 /// 構文木を、カタログを参照せずに可能な範囲で `ColumnType` へ写した結果
@@ -42,7 +42,7 @@ pub(crate) enum StaticColumnType {
     /// 要素が ENUM 型名候補の配列（`<enum>[N]`。Issue #1357）。第 2 要素は要素数上限。
     /// 実行段（DDL 権限ゲートの後）が `Storage::get_enum_type` で語彙を解決して
     /// [`ArrayType::new_enum`] へ差し替える。
-    ArrayOfEnumCandidate(String, u32),
+    ArrayOfEnumCandidate(String, u32, u8),
 }
 
 /// 構文木 [`SqlColumnTypeName`] を [`StaticColumnType`] へ写す（カタログ非参照の純関数）。
@@ -98,7 +98,11 @@ pub(crate) fn to_static_column_type_with_array_default(
             return to_static_column_type_with_array_default(target, default_max_len)
         }
         SqlColumnTypeName::Enum(name) => return Ok(StaticColumnType::EnumCandidate(name.clone())),
-        SqlColumnTypeName::Array { elem, max_len } => {
+        SqlColumnTypeName::Array {
+            elem,
+            max_len,
+            ndims,
+        } => {
             let max_len = max_len.unwrap_or(default_max_len);
             let elem_ty = match to_static_column_type_with_array_default(elem, default_max_len)? {
                 StaticColumnType::Resolved(t) => t,
@@ -106,7 +110,9 @@ pub(crate) fn to_static_column_type_with_array_default(
                     // 上限の範囲だけは型名の存在確認より先に検証する（実行段の
                     // 解決を待たずに構文として確定できる誤りのため）。
                     ArrayType::new(ArrayElemType::Text, max_len).map_err(array_size_error)?;
-                    return Ok(StaticColumnType::ArrayOfEnumCandidate(name, max_len));
+                    return Ok(StaticColumnType::ArrayOfEnumCandidate(
+                        name, max_len, *ndims,
+                    ));
                 }
                 StaticColumnType::ArrayOfEnumCandidate(..) => {
                     return Err(nested_array_error());
@@ -164,7 +170,9 @@ pub(crate) fn to_static_column_type_with_array_default(
                     })
                 }
             };
-            let array = ArrayType::new(elem_ty, max_len).map_err(array_size_error)?;
+            let array = ArrayType::new(elem_ty, max_len)
+                .and_then(|a| a.with_ndims(*ndims))
+                .map_err(array_size_error)?;
             ColumnType::Array(array)
         }
     };
@@ -172,7 +180,7 @@ pub(crate) fn to_static_column_type_with_array_default(
 }
 
 fn nested_array_error() -> SqlSurfaceError {
-    SqlSurfaceError::unsupported("nested or multi-dimensional array types are not supported")
+    SqlSurfaceError::unsupported("nested array types are not supported")
 }
 
 /// 配列の要素数上限が範囲外（`catalog::ArrayType::new` の拒否）を `42601` へ写す。
@@ -191,7 +199,8 @@ fn array_size_error(e: crate::catalog::CatalogError) -> SqlSurfaceError {
 /// 未検証のため。詳細は `docs/design/sql-alter-table-add-column.md` 参照）。
 ///
 /// 配列型（`<型>[]`・`<型>[N]`。TABLE-14・Issue #1348）は [`Self::Array`] で表す。
-/// 多次元（`<型>[][]`）は構文段階で `42601`。`[N]` の `N` は書き込み時の要素数上限
+/// 多次元（`<型>[][]`。Issue #1605・TABLE-35 (2)）は `[]` の連続で表し、次元数は
+/// `ndims`（上限 [`MAX_ARRAY_DIMS`]、超過は `54000`）。`[N]` は全体で高々 1 個。`[N]` の `N` は書き込み時の要素数上限
 /// （`catalog::ArrayType::max_len`）として実行段が `1..=MAX_ARRAY_ELEMENTS` を検証する
 /// （PostgreSQL と異なり、サイズ指定は無視されず超過書き込みが `54000` になる）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,6 +262,8 @@ pub enum SqlColumnTypeName {
     Array {
         elem: Box<SqlColumnTypeName>,
         max_len: Option<u32>,
+        /// 宣言次元数（`[]` の連続数。`1..=MAX_ARRAY_DIMS`。Issue #1605）。
+        ndims: u8,
     },
 }
 
@@ -264,26 +275,37 @@ pub(crate) fn parse_column_type_name(
     pos: &mut usize,
 ) -> Result<SqlColumnTypeName, SqlSurfaceError> {
     let base = parse_base_type_name(tokens, pos)?;
-    // 配列サフィックス `[]`／`[N]`（高々 1 個。2 個目の `[` は呼び出し元の余剰
-    // トークン判定が `42601` で拒否するため、ここでは明示的に拒否する）。
+    // 配列サフィックス `[]`／`[N]` の連続（Issue #1605）。`[]` の連続数が次元数で、
+    // 上限 `MAX_ARRAY_DIMS` 超過は `54000`。`[N]`（要素総数の上限）は全体で高々 1 個
+    // （PostgreSQL はサイズを無視するが、本実装は書き込み上限として使うため 2 個目以降は
+    // 曖昧さを避けて `0A000`。fail-closed）。
     if !matches!(tokens.get(*pos), Some(Token::Punct('['))) {
         return Ok(base);
     }
-    *pos += 1;
-    let max_len = if matches!(tokens.get(*pos), Some(Token::Number(_))) {
-        Some(expect_strict_u32(tokens, pos)?)
-    } else {
-        None
-    };
-    expect_punct(tokens, pos, ']')?;
-    if matches!(tokens.get(*pos), Some(Token::Punct('['))) {
-        return Err(SqlSurfaceError::unsupported(
-            "multi-dimensional array types are not supported",
-        ));
+    let mut ndims: u8 = 0;
+    let mut max_len: Option<u32> = None;
+    while matches!(tokens.get(*pos), Some(Token::Punct('['))) {
+        if ndims >= MAX_ARRAY_DIMS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many array dimensions",
+            ));
+        }
+        *pos += 1;
+        if matches!(tokens.get(*pos), Some(Token::Number(_))) {
+            if max_len.is_some() {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "array size may be specified at most once".to_string(),
+                });
+            }
+            max_len = Some(expect_strict_u32(tokens, pos)?);
+        }
+        expect_punct(tokens, pos, ']')?;
+        ndims += 1;
     }
     Ok(SqlColumnTypeName::Array {
         elem: Box::new(base),
         max_len,
+        ndims,
     })
 }
 
@@ -896,7 +918,7 @@ mod tests {
         let (ty, _) = parse_type("INT8[3]").expect("valid");
         assert!(matches!(
             ty,
-            SqlColumnTypeName::Array { ref elem, max_len: Some(3) } if alias_spelling(elem) == Some("INT8")
+            SqlColumnTypeName::Array { ref elem, max_len: Some(3), .. } if alias_spelling(elem) == Some("INT8")
         ));
     }
 
@@ -1123,7 +1145,8 @@ mod tests {
             ty,
             SqlColumnTypeName::Array {
                 elem: Box::new(SqlColumnTypeName::Integer),
-                max_len: None
+                max_len: None,
+                ndims: 1
             }
         );
         assert_eq!(consumed, 3);
@@ -1132,7 +1155,8 @@ mod tests {
             ty,
             SqlColumnTypeName::Array {
                 elem: Box::new(SqlColumnTypeName::Text),
-                max_len: Some(3)
+                max_len: Some(3),
+                ndims: 1
             }
         );
         assert_eq!(consumed, 4);
@@ -1142,11 +1166,28 @@ mod tests {
         assert!(matches!(ty, SqlColumnTypeName::Array { .. }));
     }
 
+    /// 多次元宣言（Issue #1605・TABLE-35 (2)）: `[]` の連続数が次元数、`[N]` は全体で高々 1 個、
+    /// 7 次元は `54000`。
+    #[test]
+    fn parses_multi_dimensional_array_suffix() {
+        let ndims_of = |raw: &str| match parse_type(raw).expect("valid").0 {
+            SqlColumnTypeName::Array { ndims, max_len, .. } => (ndims, max_len),
+            other => panic!("expected array, got {other:?}"),
+        };
+        assert_eq!(ndims_of("INTEGER[][]"), (2, None));
+        assert_eq!(ndims_of("TEXT[][][]"), (3, None));
+        assert_eq!(ndims_of("INTEGER[][4]"), (2, Some(4)));
+        assert_eq!(ndims_of("INTEGER[3][]"), (2, Some(3)));
+        assert_eq!(ndims_of("INTEGER[][][][][][]"), (6, None));
+        let err = parse_type("INTEGER[][][][][][][]").unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+        let err = parse_type("INTEGER[3][3]").unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+    }
+
     #[test]
     fn rejects_malformed_array_suffix() {
         for raw in [
-            "INTEGER[][]",
-            "INTEGER[3][]",
             "INTEGER[-1]",
             "INTEGER[01]",
             "INTEGER[1.5]",

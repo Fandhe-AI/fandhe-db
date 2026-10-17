@@ -20,7 +20,9 @@
 
 use std::fmt;
 
-use crate::catalog::{ArrayElemType, ArrayType, ColumnType, TableSchema, MAX_ARRAY_ELEMENTS};
+use crate::catalog::{
+    ArrayElemType, ArrayType, ColumnType, TableSchema, MAX_ARRAY_DIMS, MAX_ARRAY_ELEMENTS,
+};
 use crate::numeric::Decimal;
 use crate::storage::Visibility;
 use crate::uuid::Uuid;
@@ -242,9 +244,103 @@ pub enum ArrayValue {
     Jsonb(Vec<Option<String>>),
     /// `<enum>[]`（Issue #1357）。ラベル文字列。語彙検査は encode 時のみ。
     Enum(Vec<Option<String>>),
+    /// 2 次元以上の配列（Issue #1605・TABLE-35 (2)）。要素は行優先の平坦な列で `inner` が持ち、
+    /// 各次元の長さを [`MultiArray`] が運ぶ。1 次元の値は決してラップしない（正準性）。
+    Multi(MultiArray),
+}
+
+/// 2 次元以上の配列の次元情報つき表現（[`ArrayValue::Multi`] の中身）。
+///
+/// フィールドを private にし [`ArrayValue::with_dims`] だけを構築経路とすることで、
+/// 不変条件（`2 <= dims.len() <= MAX_ARRAY_DIMS`・各次元 1 以上・次元長の積 ==
+/// `inner.len()`・`inner` は `Multi` でない）を満たさない値を作れないようにする。
+/// engine の SQL 層（リテラル解析・CAST・添字）と行 codec が共有する。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultiArray {
+    dims: Vec<u32>,
+    inner: Box<ArrayValue>,
+}
+
+impl MultiArray {
+    /// 各次元の長さ（外側の次元から順。長さは `2..=MAX_ARRAY_DIMS`）。
+    pub fn dims(&self) -> &[u32] {
+        &self.dims
+    }
+
+    /// 行優先で平坦化した要素列（`Multi` ではない）。
+    pub fn inner(&self) -> &ArrayValue {
+        &self.inner
+    }
 }
 
 impl ArrayValue {
+    /// 平坦な要素列 `flat` に次元の長さ `dims` を与えた配列値を作る唯一の構築経路
+    /// （Issue #1605）。`dims` が 1 個なら `flat` をそのまま返す（1 次元はラップしない）。
+    /// 次元数が `MAX_ARRAY_DIMS` 超・次元長 0・長さの積と要素数の不一致・`flat` が既に
+    /// `Multi` のときは `Err`（積は `checked_mul`。fail-closed）。
+    pub fn with_dims(flat: ArrayValue, dims: Vec<u32>) -> Result<ArrayValue> {
+        let bad = |msg: &str| RowCodecError::Invalid(msg.to_string());
+        if matches!(flat, ArrayValue::Multi(_)) {
+            return Err(bad("array dimensions cannot be nested"));
+        }
+        match dims.as_slice() {
+            [] => return Err(bad("array must have at least one dimension")),
+            [n] => {
+                return if usize::try_from(*n).ok() == Some(flat.len()) {
+                    Ok(flat)
+                } else {
+                    Err(bad("array dimension does not match element count"))
+                };
+            }
+            _ => {}
+        }
+        if dims.len() > usize::from(MAX_ARRAY_DIMS) {
+            return Err(bad("array has too many dimensions"));
+        }
+        let mut product: usize = 1;
+        for d in &dims {
+            if *d == 0 {
+                return Err(bad("array dimension must be at least 1"));
+            }
+            let d = usize::try_from(*d).map_err(|_| bad("array dimension too large"))?;
+            product = product
+                .checked_mul(d)
+                .ok_or_else(|| bad("array dimensions overflow"))?;
+        }
+        if product != flat.len() {
+            return Err(bad("array dimensions do not match element count"));
+        }
+        Ok(ArrayValue::Multi(MultiArray {
+            dims,
+            inner: Box::new(flat),
+        }))
+    }
+
+    /// 行優先の平坦な要素列（`Multi` なら `inner`、それ以外は自身）。
+    pub fn flat(&self) -> &ArrayValue {
+        match self {
+            ArrayValue::Multi(m) => &m.inner,
+            other => other,
+        }
+    }
+
+    /// 次元の長さ（1 次元は `[要素数]`）。
+    pub fn dims(&self) -> Vec<u32> {
+        match self {
+            ArrayValue::Multi(m) => m.dims.clone(),
+            other => vec![u32::try_from(other.len()).unwrap_or(u32::MAX)],
+        }
+    }
+
+    /// 次元ヘッダ（`ndims(1) + dims(4 × ndims)`）のバイト長。1 次元は 0
+    /// （行バイトに次元ヘッダを持たない）。
+    pub(crate) fn dims_header_len(&self) -> usize {
+        match self {
+            ArrayValue::Multi(m) => 1usize.saturating_add(m.dims.len().saturating_mul(4)),
+            _ => 0,
+        }
+    }
+
     /// PostgreSQL 配列テキスト形式（`{a,b}`）へ描画する。wire-server の DataRow 描画と
     /// `CAST(<配列> AS text)`（`sql::cast_value`）が共有する唯一の整形（Issue #1592・SQL-47。
     /// 従来 wire-server に置いていたものを移設し、出力は不変）。
@@ -264,57 +360,86 @@ impl ArrayValue {
     /// 時点で打ち切って `None` を返す（BYTEA 要素を多数含む配列の文字列化が巨大な確保にならない
     /// ようにするため。呼び出し元は `None` を上限超過として拒否する）。
     pub fn to_pg_text_bounded(&self, max_len: usize) -> Option<String> {
-        fn bounded<T>(
+        // `dims` に従い入れ子の `{}` を描画する（1 次元は `[要素数]`）。要素の整形は
+        // `f`、NULL 要素は引用なしの `NULL`。出力が `max_len` を超えた時点で打ち切る。
+        fn write_level<T>(
+            out: &mut String,
             items: &[Option<T>],
+            dims: &[u32],
+            idx: &mut usize,
             max_len: usize,
-            f: impl Fn(&T) -> String,
-        ) -> Option<String> {
-            let mut out = String::from("{");
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                match item {
-                    Some(v) => out.push_str(&f(v)),
-                    None => out.push_str("NULL"),
-                }
-                if out.len() > max_len {
-                    return None;
+            f: &impl Fn(&T) -> String,
+        ) -> Option<()> {
+            out.push('{');
+            if let Some((n, rest)) = dims.split_first() {
+                for i in 0..*n {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    if rest.is_empty() {
+                        match items.get(*idx)? {
+                            Some(v) => out.push_str(&f(v)),
+                            None => out.push_str("NULL"),
+                        }
+                        *idx = idx.checked_add(1)?;
+                    } else {
+                        write_level(out, items, rest, idx, max_len, f)?;
+                    }
+                    if out.len() > max_len {
+                        return None;
+                    }
                 }
             }
             out.push('}');
+            Some(())
+        }
+        fn bounded<T>(
+            items: &[Option<T>],
+            dims: &[u32],
+            max_len: usize,
+            f: impl Fn(&T) -> String,
+        ) -> Option<String> {
+            let mut out = String::new();
+            let mut idx = 0usize;
+            write_level(&mut out, items, dims, &mut idx, max_len, &f)?;
             (out.len() <= max_len).then_some(out)
         }
-        match self {
-            ArrayValue::Text(items) => bounded(items, max_len, |s| quote_pg_array_text_elem(s)),
-            ArrayValue::Bool(items) => {
-                bounded(items, max_len, |b| if *b { "t" } else { "f" }.to_string())
+        let dims = self.dims();
+        let dims = dims.as_slice();
+        match self.flat() {
+            ArrayValue::Text(items) => {
+                bounded(items, dims, max_len, |s| quote_pg_array_text_elem(s))
             }
-            ArrayValue::Integer(items) => bounded(items, max_len, |v| v.to_string()),
-            ArrayValue::BigInt(items) => bounded(items, max_len, |v| v.to_string()),
-            ArrayValue::Real(items) => {
-                bounded(items, max_len, |v| crate::scalar_float::format_real(*v))
-            }
-            ArrayValue::Double(items) => {
-                bounded(items, max_len, |v| crate::scalar_float::format_double(*v))
-            }
+            ArrayValue::Bool(items) => bounded(items, dims, max_len, |b| {
+                if *b { "t" } else { "f" }.to_string()
+            }),
+            ArrayValue::Integer(items) => bounded(items, dims, max_len, |v| v.to_string()),
+            ArrayValue::BigInt(items) => bounded(items, dims, max_len, |v| v.to_string()),
+            ArrayValue::Real(items) => bounded(items, dims, max_len, |v| {
+                crate::scalar_float::format_real(*v)
+            }),
+            ArrayValue::Double(items) => bounded(items, dims, max_len, |v| {
+                crate::scalar_float::format_double(*v)
+            }),
             ArrayValue::Date(items) => {
-                bounded(items, max_len, |v| crate::datetime::format_date(*v))
+                bounded(items, dims, max_len, |v| crate::datetime::format_date(*v))
             }
-            ArrayValue::Timestamp(items) => bounded(items, max_len, |v| {
+            ArrayValue::Timestamp(items) => bounded(items, dims, max_len, |v| {
                 quote_pg_array_text_elem(&crate::datetime::format_timestamp(*v))
             }),
-            ArrayValue::Uuid(items) => bounded(items, max_len, |v| v.to_string()),
+            ArrayValue::Uuid(items) => bounded(items, dims, max_len, |v| v.to_string()),
             // NUMERIC は正規テキスト（引用不要）、BYTEA は `\x` 16 進（`\` を含むため常に引用・
             // エスケープされ PostgreSQL と同形の `"\\x0102"` になる）、JSON／JSONB／ENUM は
             // 格納テキスト／ラベルを引用要否判定へ通す。
-            ArrayValue::Numeric(items) => bounded(items, max_len, |d| d.to_string()),
-            ArrayValue::Bytea(items) => bounded(items, max_len, |b| {
+            ArrayValue::Numeric(items) => bounded(items, dims, max_len, |d| d.to_string()),
+            ArrayValue::Bytea(items) => bounded(items, dims, max_len, |b| {
                 quote_pg_array_text_elem(&crate::bytea::format_hex_text(b))
             }),
             ArrayValue::Json(items) | ArrayValue::Jsonb(items) | ArrayValue::Enum(items) => {
-                bounded(items, max_len, |s| quote_pg_array_text_elem(s))
+                bounded(items, dims, max_len, |s| quote_pg_array_text_elem(s))
             }
+            // `flat()` は `Multi` を返さない。
+            ArrayValue::Multi(_) => None,
         }
     }
 }
@@ -343,8 +468,10 @@ fn quote_pg_array_text_elem(s: &str) -> String {
 /// `ArrayValue` の全 variant に同じ式を適用する内部マクロ（要素型が増えたときの
 /// 網羅漏れを 1 箇所に集約する）。
 macro_rules! array_dispatch {
-    ($value:expr, $items:ident => $body:expr) => {
-        match $value {
+    ($value:expr, $items:ident => $body:expr, nested => $nested:expr) => {
+        // 次元付きは平坦な `inner`（`flat()`）に対して適用する。`flat()` は `Multi` を
+        // 返さないため `nested` 腕は到達しない（網羅性のためだけに置く固定値。Issue #1605）。
+        match $value.flat() {
             ArrayValue::Text($items) => $body,
             ArrayValue::Bool($items) => $body,
             ArrayValue::Integer($items) => $body,
@@ -359,6 +486,8 @@ macro_rules! array_dispatch {
             ArrayValue::Json($items) => $body,
             ArrayValue::Jsonb($items) => $body,
             ArrayValue::Enum($items) => $body,
+            // 次元付きは平坦な `inner` に委譲する（Issue #1605）。
+            ArrayValue::Multi(_) => $nested,
         }
     };
 }
@@ -391,6 +520,7 @@ impl ArrayValue {
             ArrayValue::Json(_) => ArrayElemType::Json,
             ArrayValue::Jsonb(_) => ArrayElemType::Jsonb,
             ArrayValue::Enum(_) => ArrayElemType::Enum,
+            ArrayValue::Multi(m) => m.inner().elem(),
         }
     }
 
@@ -398,6 +528,26 @@ impl ArrayValue {
     /// 逆順なら空配列（配列スライス `arr[lo:hi]` の評価が共有する。TABLE-35・Issue #1602。
     /// 範囲の切り詰めは呼び出し側が行い、本関数は `get()` で添字アクセスを避ける）。
     pub(crate) fn slice(&self, start: usize, end: usize) -> ArrayValue {
+        // 多次元は第 1 次元に沿って切り出し、残りの次元は全範囲を保つ（PostgreSQL の
+        // `arr[lo:hi]` と同じ。Issue #1605）。切り出し結果が空なら 0 要素の 1 次元値。
+        if let ArrayValue::Multi(m) = self {
+            let first = m.dims.first().copied().unwrap_or(0) as usize;
+            let end = end.min(first);
+            let rest = m.dims.get(1..).unwrap_or(&[]);
+            let stride = rest
+                .iter()
+                .try_fold(1usize, |acc, d| acc.checked_mul(*d as usize));
+            let (Some(stride), true) = (stride, start < end) else {
+                return m.inner.slice(0, 0);
+            };
+            let (Some(lo), Some(hi)) = (start.checked_mul(stride), end.checked_mul(stride)) else {
+                return m.inner.slice(0, 0);
+            };
+            let mut dims = vec![(end - start) as u32];
+            dims.extend_from_slice(rest);
+            let flat = m.inner.slice(lo, hi);
+            return ArrayValue::with_dims(flat, dims).unwrap_or_else(|_| m.inner.slice(0, 0));
+        }
         macro_rules! cut {
             ($variant:ident, $v:expr) => {
                 ArrayValue::$variant($v.get(start..end).map(<[_]>::to_vec).unwrap_or_default())
@@ -418,23 +568,24 @@ impl ArrayValue {
             ArrayValue::Json(v) => cut!(Json, v),
             ArrayValue::Jsonb(v) => cut!(Jsonb, v),
             ArrayValue::Enum(v) => cut!(Enum, v),
+            ArrayValue::Multi(_) => self.flat().slice(0, 0),
         }
     }
 
     /// 要素数（`pub(crate)`: 用途は [`Self::elem`] と同じ）。
     pub(crate) fn len(&self) -> usize {
-        array_dispatch!(self, v => v.len())
+        array_dispatch!(self, v => v.len(), nested => 0)
     }
 
     /// 1 個以上の NULL 要素を含むか（含むときだけフレーム flags が
     /// [`ARRAY_FLAG_HAS_NULLS`] になる正準性の根拠）。
     pub fn has_null(&self) -> bool {
-        array_dispatch!(self, v => v.iter().any(|e| e.is_none()))
+        array_dispatch!(self, v => v.iter().any(|e| e.is_none()), nested => false)
     }
 
     /// 要素ごとの NULL フラグ（要素数は `max_len <= 1024` で上限済み）。
     fn null_flags(&self) -> Vec<bool> {
-        array_dispatch!(self, v => v.iter().map(|e| e.is_none()).collect())
+        array_dispatch!(self, v => v.iter().map(|e| e.is_none()).collect(), nested => Vec::new())
     }
 
     /// 複製・保持に要するヒープ量の概算（複製予算・結果サイズ見積もり用。
@@ -443,6 +594,12 @@ impl ArrayValue {
     /// 保守的な見積もりで、`sql::returning`・`sql::cursor`・`sql::join`・`sql::set_op`
     /// が共有する）。
     pub(crate) fn approx_heap_bytes(&self) -> usize {
+        if let ArrayValue::Multi(m) = self {
+            return m
+                .inner
+                .approx_heap_bytes()
+                .saturating_add(m.dims.len().saturating_mul(std::mem::size_of::<u32>()));
+        }
         match self {
             ArrayValue::Text(items)
             | ArrayValue::Json(items)
@@ -474,6 +631,7 @@ impl ArrayValue {
             ArrayValue::Date(v) => v.len().saturating_mul(std::mem::size_of::<Option<i32>>()),
             ArrayValue::Timestamp(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
             ArrayValue::Uuid(v) => v.len().saturating_mul(std::mem::size_of::<Option<Uuid>>()),
+            ArrayValue::Multi(_) => 0,
         }
     }
 
@@ -482,7 +640,7 @@ impl ArrayValue {
     /// [`write_array_elements_payload`] の出力（NULL ビットマップを含む）で、値に
     /// 対して単射になる。`sql::set_op` が第 3 のエンコードを作らず共有する。
     pub(crate) fn canonical_parts(&self) -> Result<(u8, u8, Vec<u8>)> {
-        let ordinal = match self {
+        let ordinal = match self.flat() {
             ArrayValue::Text(_) => 0,
             ArrayValue::Bool(_) => 1,
             ArrayValue::Integer(_) => 2,
@@ -498,6 +656,12 @@ impl ArrayValue {
             ArrayValue::Json(_) => 11,
             ArrayValue::Jsonb(_) => 12,
             ArrayValue::Enum(_) => 13,
+            // `flat()` は `Multi` を返さない。
+            ArrayValue::Multi(_) => {
+                return Err(RowCodecError::Invalid(
+                    "nested multi-dimensional array".to_string(),
+                ))
+            }
         };
         Ok((ordinal, self.frame_flags(), self.equality_payload()?))
     }
@@ -513,6 +677,13 @@ impl ArrayValue {
     /// 既存要素型のバイト列は変わらない。
     pub(crate) fn equality_payload(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
+        // 次元付きは次元ヘッダに続けて平坦な `inner` の正準ペイロードを置く（Issue #1605。
+        // `{{1,2},{3,4}}` と `{1,2,3,4}` を区別する単射性の根拠）。
+        if let ArrayValue::Multi(m) = self {
+            write_array_dims_header(&mut buf, m);
+            buf.extend_from_slice(&m.inner.equality_payload()?);
+            return Ok(buf);
+        }
         match self {
             ArrayValue::Numeric(items) => {
                 write_array_null_bitmap(&mut buf, self);
@@ -548,6 +719,9 @@ impl ArrayValue {
             ArrayValue::Numeric(_) | ArrayValue::Json(_) | ArrayValue::Jsonb(_) => {
                 Ok(self.equality_payload()?.len())
             }
+            ArrayValue::Multi(m) => Ok(self
+                .dims_header_len()
+                .saturating_add(m.inner.canonical_payload_len()?)),
             _ => Ok(array_elements_byte_len(self.elem(), self)? as usize),
         }
     }
@@ -555,10 +729,14 @@ impl ArrayValue {
     /// エンコードされるフレーム flags（NULL 要素を含むときだけ
     /// [`ARRAY_FLAG_HAS_NULLS`]）。
     pub(crate) fn frame_flags(&self) -> u8 {
-        if self.has_null() {
+        let nulls = if self.has_null() {
             ARRAY_FLAG_HAS_NULLS
         } else {
             ARRAY_FLAGS_NONE
+        };
+        match self {
+            ArrayValue::Multi(_) => nulls | ARRAY_FLAG_HAS_DIMS,
+            _ => nulls,
         }
     }
 }
@@ -1034,6 +1212,60 @@ const ARRAY_FLAGS_NONE: u8 = 0x00;
 /// `0x01` 以外は decode 側で fail-closed に拒否する。
 pub(crate) const ARRAY_FLAG_HAS_NULLS: u8 = 0x01;
 
+/// 配列列のフレーム flags ビット（2 次元以上。Issue #1605・TABLE-35 (2)）。立っていると
+/// ペイロード先頭に `ndims(u8)` と各次元長（`u32` LE × ndims）の次元ヘッダが付き、その後ろに
+/// NULL ビットマップ（`0x01` のとき）と要素列が続く。`count` は総要素数のまま。1 次元の
+/// 値には付けない（既存の 1 次元バイト列は不変）。decode は `ndims` が `2..=MAX_ARRAY_DIMS`・
+/// 各次元 1 以上・次元長の積 == `count` の正準形だけを受理する。
+pub(crate) const ARRAY_FLAG_HAS_DIMS: u8 = 0x02;
+
+/// 次元ヘッダ（`ndims(u8)` + 各次元長 `u32` LE）を `buf` へ書く。1 次元値には呼ばない。
+fn write_array_dims_header(buf: &mut Vec<u8>, m: &MultiArray) {
+    // `with_dims` が `ndims <= MAX_ARRAY_DIMS (6)` を保証するため `u8` に収まる。
+    buf.push(u8::try_from(m.dims.len()).unwrap_or(u8::MAX));
+    for d in &m.dims {
+        buf.extend_from_slice(&d.to_le_bytes());
+    }
+}
+
+/// 次元ヘッダを `bytes` の先頭から読み、各次元長と残りの本文を返す。`ndims` の範囲外・次元長 0・
+/// 次元長の積（`checked_mul`）と `count` の不一致・ヘッダ切れは `Err`（fail-closed）。
+fn split_array_dims_header(bytes: &[u8], count: usize) -> Result<(Vec<u32>, &[u8])> {
+    let bad = |msg: &str| RowCodecError::Invalid(msg.to_string());
+    let ndims = usize::from(
+        *bytes
+            .first()
+            .ok_or_else(|| bad("array payload truncated at dimension count"))?,
+    );
+    if !(2..=usize::from(MAX_ARRAY_DIMS)).contains(&ndims) {
+        return Err(bad("array dimension count out of range"));
+    }
+    let header_len = 1usize.saturating_add(ndims.saturating_mul(4));
+    let header = bytes
+        .get(1..header_len)
+        .ok_or_else(|| bad("array payload truncated at dimension header"))?;
+    let rest = bytes
+        .get(header_len..)
+        .ok_or_else(|| bad("array payload truncated after dimension header"))?;
+    let mut dims = Vec::with_capacity(ndims);
+    let mut product: usize = 1;
+    let (chunks, _) = header.as_chunks::<4>();
+    for arr in chunks {
+        let d = u32::from_le_bytes(*arr);
+        if d == 0 {
+            return Err(bad("array dimension must be at least 1"));
+        }
+        product = product
+            .checked_mul(d as usize)
+            .ok_or_else(|| bad("array dimensions overflow"))?;
+        dims.push(d);
+    }
+    if product != count {
+        return Err(bad("array dimensions do not match element count"));
+    }
+    Ok((dims, rest))
+}
+
 /// 配列要素 1 個の BOOL 値バイト表現（スカラー BOOLEAN 列と同じ規約を再利用）。
 const ARRAY_BOOL_FALSE_BYTE: u8 = BOOL_FALSE_BYTE;
 const ARRAY_BOOL_TRUE_BYTE: u8 = BOOL_TRUE_BYTE;
@@ -1075,6 +1307,17 @@ fn array_elements_byte_len(elem: ArrayElemType, value: &ArrayValue) -> Result<u3
             "array value element type does not match column element type".to_string(),
         ));
     }
+    // 次元付きは次元ヘッダ長 + 平坦な `inner` の本文長（Issue #1605。事前検証と実エンコードが
+    // 同じ計算式を共有するため、ここで足す）。
+    if let ArrayValue::Multi(m) = value {
+        let inner = array_elements_byte_len(elem, &m.inner)?;
+        let total = usize::try_from(inner)
+            .ok()
+            .and_then(|n| n.checked_add(value.dims_header_len()))
+            .ok_or_else(|| RowCodecError::Invalid("array payload length overflow".to_string()))?;
+        return u32::try_from(total)
+            .map_err(|_| RowCodecError::Invalid("array payload length overflow".to_string()));
+    }
     let bitmap_len = if value.has_null() {
         value.len().div_ceil(8)
     } else {
@@ -1110,7 +1353,8 @@ fn array_elements_byte_len(elem: ArrayElemType, value: &ArrayValue) -> Result<u3
             let width = array_fixed_width(elem).ok_or_else(|| {
                 RowCodecError::Invalid("array element type has no fixed width".to_string())
             })?;
-            let present = array_dispatch!(other, v => v.iter().filter(|e| e.is_some()).count());
+            let present =
+                array_dispatch!(other, v => v.iter().filter(|e| e.is_some()).count(), nested => 0);
             let body = present.checked_mul(width).ok_or_else(|| {
                 RowCodecError::Invalid("array payload length overflow".to_string())
             })?;
@@ -1176,6 +1420,10 @@ fn write_array_value(buf: &mut Vec<u8>, array_ty: &ArrayType, value: &ArrayValue
 /// 正規化済みであること、`ENUM` は語彙、`BYTEA` は長さ上限を確認する。語彙一覧は
 /// エラー文言に含めない。それ以外の要素型は検査対象なし。
 fn validate_array_elements(array_ty: &ArrayType, value: &ArrayValue) -> Result<()> {
+    // 次元付きは平坦な要素列に対して同じ検証を行う（Issue #1605）。
+    if let ArrayValue::Multi(m) = value {
+        return validate_array_elements(array_ty, &m.inner);
+    }
     match (array_ty.elem(), value) {
         (ArrayElemType::Numeric { precision, scale }, ArrayValue::Numeric(items)) => {
             for d in items.iter().flatten() {
@@ -1273,6 +1521,11 @@ fn write_array_len_prefixed(buf: &mut Vec<u8>, body: &[u8]) -> Result<()> {
 /// 拒否し `-0.0` を正規化、DATE／TIMESTAMP は値域を検証する（永続化バイト列の
 /// 正準性を保つ多層防御）。
 pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue) -> Result<()> {
+    // 次元付きは次元ヘッダ → 平坦な要素列（ビットマップ込み）の順（Issue #1605）。
+    if let ArrayValue::Multi(m) = value {
+        write_array_dims_header(buf, m);
+        return write_array_elements_payload(buf, &m.inner);
+    }
     write_array_null_bitmap(buf, value);
     match value {
         ArrayValue::Json(items) | ArrayValue::Jsonb(items) | ArrayValue::Enum(items) => {
@@ -1379,6 +1632,12 @@ pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue
             for v in items.iter().flatten() {
                 buf.extend_from_slice(v.as_bytes());
             }
+        }
+        // 先頭で `Multi` を処理済みのため到達しない（網羅性のための fail-closed な腕）。
+        ArrayValue::Multi(_) => {
+            return Err(RowCodecError::Invalid(
+                "nested multi-dimensional array".to_string(),
+            ))
         }
     }
     Ok(())
@@ -1551,6 +1810,13 @@ fn decode_array_elements(
     count: u32,
     flags: u8,
 ) -> Result<ArrayValue> {
+    // 次元ヘッダ付き（Issue #1605）は、ヘッダを検証して分離し、残りを平坦な配列として
+    // 復号してから次元を与える（`with_dims` が積と要素数を再確認する）。
+    if flags & ARRAY_FLAG_HAS_DIMS != 0 {
+        let (dims, rest) = split_array_dims_header(bytes, count as usize)?;
+        let flat = decode_array_elements(elem, rest, count, flags & !ARRAY_FLAG_HAS_DIMS)?;
+        return ArrayValue::with_dims(flat, dims);
+    }
     let (nulls, rest) = split_array_null_bitmap(bytes, count as usize, flags)?;
     match elem {
         ArrayElemType::Text => decode_var_array_elements(rest, &nulls, |b| {
@@ -1663,7 +1929,7 @@ fn parse_array_frame<'a>(
     let flags = *buf.get(offset).ok_or_else(|| {
         RowCodecError::Invalid("row buffer truncated at array flags field".to_string())
     })?;
-    if flags != ARRAY_FLAGS_NONE && flags != ARRAY_FLAG_HAS_NULLS {
+    if flags & !(ARRAY_FLAG_HAS_NULLS | ARRAY_FLAG_HAS_DIMS) != 0 {
         return Err(RowCodecError::Invalid(format!(
             "unknown array flags byte: {flags}"
         )));
@@ -6555,6 +6821,176 @@ mod tests {
             decode_row(&schema, &encoded),
             Err(RowCodecError::Invalid(_))
         ));
+    }
+
+    fn multi_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![ColumnDef::new(
+                "m",
+                ColumnType::Array(ArrayType::new(ArrayElemType::Integer, 8).expect("array ty")),
+                false,
+            )],
+        )
+    }
+
+    fn int_multi(flat: Vec<Option<i32>>, dims: Vec<u32>) -> ArrayValue {
+        ArrayValue::with_dims(ArrayValue::Integer(flat), dims).expect("valid dims")
+    }
+
+    /// 次元付き配列（Issue #1605・TABLE-35 (2)）は次元情報込みで往復し、NULL 要素の有無で
+    /// flags が `0x02`／`0x03` になる。1 次元のバイト列は次元ヘッダを持たない。
+    #[test]
+    fn multi_dimensional_array_roundtrips_with_dims_flag() {
+        let schema = multi_schema();
+        let plain = int_multi(vec![Some(1), Some(2), Some(3), Some(4)], vec![2, 2]);
+        let with_null = int_multi(
+            vec![Some(1), None, Some(3), Some(4), Some(5), Some(6)],
+            vec![3, 2],
+        );
+        let cube = int_multi((1..=8).map(Some).collect(), vec![2, 2, 2]);
+        for (value, flags) in [(plain, 0x02u8), (with_null, 0x03), (cube, 0x02)] {
+            assert_eq!(value.frame_flags(), flags);
+            let values = vec![Value::Array(value.clone())];
+            let encoded =
+                encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+            // ヘッダ(3) + tenant_id + presence(1) の直後が flags バイト。
+            assert_eq!(encoded[3 + "tenant-a".len() + 1], flags);
+            let decoded = decode_row(&schema, &encoded).expect("decode");
+            assert_eq!(decoded.values, values);
+        }
+        // 1 次元は flags 0x00 のまま、次元ヘッダを持たない。
+        let flat = ArrayValue::Integer(vec![Some(1), Some(2), Some(3), Some(4)]);
+        assert_eq!(flat.frame_flags(), 0);
+        assert_eq!(flat.dims_header_len(), 0);
+    }
+
+    /// 事前検証（`scalar_array_entry_len`）の長さは実エンコード長と一致する
+    /// （`tenant::validate_set_assignments` と共有する計算式。乖離はテナント境界の漏えい）。
+    #[test]
+    fn multi_dimensional_entry_len_matches_encoded_size() {
+        let schema = multi_schema();
+        let elem = ArrayElemType::Integer;
+        for value in [
+            int_multi(vec![Some(1), Some(2), Some(3), Some(4)], vec![2, 2]),
+            int_multi(vec![Some(1), None, Some(3), Some(4)], vec![2, 2]),
+            int_multi((1..=8).map(Some).collect(), vec![2, 2, 2]),
+        ] {
+            let entry = scalar_array_entry_len(elem, &value).expect("entry len");
+            let empty = encode_row(
+                &schema,
+                "tenant-a",
+                Visibility::Public,
+                &[Value::Array(ArrayValue::Integer(vec![]))],
+            )
+            .expect("encode");
+            let full = encode_row(
+                &schema,
+                "tenant-a",
+                Visibility::Public,
+                &[Value::Array(value)],
+            )
+            .expect("encode");
+            // 空配列のエントリ長は 10（presence + flags + count + payload_len）。
+            assert_eq!(full.len() - empty.len(), entry as usize - 10);
+        }
+    }
+
+    #[test]
+    fn with_dims_validates_shape() {
+        let flat = || ArrayValue::Integer(vec![Some(1), Some(2), Some(3), Some(4)]);
+        assert!(ArrayValue::with_dims(flat(), vec![2, 2]).is_ok());
+        assert_eq!(ArrayValue::with_dims(flat(), vec![4]).expect("1d"), flat());
+        assert!(ArrayValue::with_dims(flat(), vec![]).is_err());
+        assert!(ArrayValue::with_dims(flat(), vec![3]).is_err());
+        assert!(ArrayValue::with_dims(flat(), vec![2, 3]).is_err());
+        assert!(ArrayValue::with_dims(flat(), vec![4, 0]).is_err());
+        assert!(ArrayValue::with_dims(flat(), vec![u32::MAX, u32::MAX, u32::MAX]).is_err());
+        let nested = ArrayValue::with_dims(flat(), vec![2, 2]).expect("2d");
+        assert!(ArrayValue::with_dims(nested, vec![2, 2]).is_err());
+        let seven = ArrayValue::Integer(vec![Some(0); 1]);
+        assert!(ArrayValue::with_dims(seven, vec![1; 7]).is_err());
+    }
+
+    #[test]
+    fn multi_dimensional_decode_rejects_non_canonical_frames() {
+        let schema = multi_schema();
+        let value = int_multi(vec![Some(1), Some(2), Some(3), Some(4)], vec![2, 2]);
+        let encoded = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Array(value)],
+        )
+        .expect("encode");
+        let flags_at = 3 + "tenant-a".len() + 1;
+        // flags(1) + count(4) + payload_len(4) の後ろが ndims(1) + dims(4 x 2)。
+        let ndims_at = flags_at + 9;
+        let tamper = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut bytes = encoded.clone();
+            edit(&mut bytes);
+            decode_row(&schema, &bytes)
+        };
+        assert!(decode_row(&schema, &encoded).is_ok());
+        // 未知 flags ビット。
+        assert!(tamper(&|b| b[flags_at] = 0x04).is_err());
+        assert!(tamper(&|b| b[flags_at] = 0x06).is_err());
+        // ndims が範囲外（0・1・7）。
+        for n in [0u8, 1, 7] {
+            assert!(tamper(&|b| b[ndims_at] = n).is_err(), "ndims {n}");
+        }
+        // 次元長 0、積と要素数の不一致。
+        assert!(tamper(&|b| b[ndims_at + 1] = 0).is_err());
+        assert!(tamper(&|b| b[ndims_at + 1] = 4).is_err());
+        // 次元ヘッダが付いていないのに DIMS ビットだけ立てた 1 次元値（非正準）。
+        let flat = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Array(ArrayValue::Integer(vec![Some(1), Some(2)]))],
+        )
+        .expect("encode");
+        let mut bytes = flat;
+        bytes[flags_at] = 0x02;
+        assert!(decode_row(&schema, &bytes).is_err());
+    }
+
+    /// 同じ要素列でも次元が違えば正準ペイロード・フラグが異なる（UNIQUE キー・集合演算・
+    /// 等価比較の単射性）。
+    #[test]
+    fn multi_dimensional_canonical_forms_are_injective() {
+        let elems = || (1..=4).map(Some).collect::<Vec<_>>();
+        let forms = [
+            ArrayValue::Integer(elems()),
+            int_multi(elems(), vec![2, 2]),
+            int_multi(elems(), vec![1, 4]),
+            int_multi(elems(), vec![4, 1]),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for f in &forms {
+            let (ord, flags, payload) = f.canonical_parts().expect("canonical");
+            assert!(seen.insert((ord, flags, payload.clone())), "{f:?}");
+            assert_eq!(f.canonical_payload_len().expect("len"), payload.len());
+        }
+    }
+
+    #[test]
+    fn multi_dimensional_text_rendering_nests_braces() {
+        let v = ArrayValue::with_dims(
+            ArrayValue::Text(vec![
+                Some("a".to_string()),
+                None,
+                Some("c d".to_string()),
+                Some("NULL".to_string()),
+            ]),
+            vec![2, 2],
+        )
+        .expect("2d");
+        assert_eq!(v.to_pg_text(), r#"{{a,NULL},{"c d","NULL"}}"#);
+        assert_eq!(v.to_pg_text_bounded(8), None);
+        assert_eq!(v.len(), 4);
+        assert_eq!(v.slice(1, 2).to_pg_text(), r#"{{"c d","NULL"}}"#);
+        assert_eq!(v.slice(2, 3).to_pg_text(), "{}");
     }
 
     #[test]

@@ -886,119 +886,212 @@ fn parse_array_literal_with(
         )));
     }
 
-    let trimmed = literal.trim();
-    let inner = trimmed
-        .strip_prefix('{')
-        .and_then(|s| s.strip_suffix('}'))
-        .ok_or_else(|| {
-            SqlSurfaceError::invalid_text_representation(
-                "array literal must be of the form {v1,v2,...}",
-            )
-        })?;
-
     // `[]` 添字ではなく `Peekable<Chars>` を使う（coding-rust.md「untrusted
     // 入力の扱い」: 受信データ経路では添字アクセスを禁止）。`Vec<char>` への
-    // 事前 collect（リテラル長の最大 4 倍のスクラッチ確保）も避け、`inner` を
-    // 1 パスで走査する。
-    let mut raw_elements: Vec<Option<String>> = Vec::new();
-    if !inner.trim().is_empty() {
-        let mut chars = inner.chars().peekable();
+    // 事前 collect（リテラル長の最大 4 倍のスクラッチ確保）も避け、リテラルを
+    // 1 パスで走査する。入れ子 `{}`（Issue #1605・TABLE-35 (2)）は深さ上限つきの
+    // 再帰下降で読む（深さは `MAX_ARRAY_DIMS` 以下なのでスタックは有界）。
+    let mut chars = literal.trim().chars().peekable();
+    if chars.next() != Some('{') {
+        return Err(SqlSurfaceError::invalid_text_representation(
+            "array literal must be of the form {v1,v2,...}",
+        ));
+    }
+    let mut state = ArrayLiteralScan {
+        elements: Vec::new(),
+        dims: Vec::new(),
+        leaf_depth: None,
+        max_len: array_ty.max_len(),
+    };
+    scan_array_literal_level(&mut chars, 0, &mut state)?;
+    if chars.next().is_some() {
+        return Err(SqlSurfaceError::invalid_text_representation(
+            "array literal has trailing characters after the closing brace",
+        ));
+    }
+    let ArrayLiteralScan {
+        elements,
+        dims,
+        leaf_depth,
+        ..
+    } = state;
+    // 要素のある最深の階層までが次元（空配列 `{}` は 0 要素の 1 次元値）。
+    let ndims = leaf_depth.map_or(1, |d| d + 1);
+    let dims: Vec<u32> = dims
+        .into_iter()
+        .take(ndims)
+        .map(|d| d.unwrap_or(0))
+        .collect();
+    let flat = convert_array_elements(array_ty, elements, cast_input)?;
+    crate::row_codec::ArrayValue::with_dims(flat, dims).map_err(|_| {
+        SqlSurfaceError::invalid_text_representation("array literal has inconsistent dimensions")
+    })
+}
+
+/// 配列リテラル走査（[`scan_array_literal_level`]）の蓄積状態。
+struct ArrayLiteralScan {
+    /// 行優先に平坦化した要素（`None` は NULL 要素）。
+    elements: Vec<Option<String>>,
+    /// 階層（外側が 0）ごとに最初に完了した部分配列の長さ。以降の兄弟は一致を要する。
+    dims: Vec<Option<u32>>,
+    /// 要素を持つ階層（全要素で一致を要する）。
+    leaf_depth: Option<usize>,
+    /// 総要素数の上限（列の `max_len`）。確保（`push`）の前に検査する。
+    max_len: u32,
+}
+
+/// 開き括弧 `{` を消費済みの 1 階層を、対応する閉じ括弧まで読む。`depth` は外側からの深さ。
+///
+/// 矩形でない形（兄弟で長さが違う・部分配列と要素の混在・要素の階層が揃わない・部分配列の
+/// 位置の NULL・空の部分配列）は `22P02`、次元数が `MAX_ARRAY_DIMS` を超える入れ子と総要素数
+/// 超過は `54000`（fail-closed。エラー文言に要素値を含めない）。
+fn scan_array_literal_level(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    depth: usize,
+    state: &mut ArrayLiteralScan,
+) -> Result<(), SqlSurfaceError> {
+    let malformed = |msg: &str| SqlSurfaceError::invalid_text_representation(msg.to_string());
+    let skip_ws = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+    };
+    skip_ws(chars);
+    let mut count: u32 = 0;
+    if chars.peek() == Some(&'}') {
+        chars.next();
+        // 空の部分配列 `{{}}` は PostgreSQL との一致が未確認のため拒否する（fail-closed）。
+        if depth > 0 {
+            return Err(malformed("array literal has an empty sub-array"));
+        }
+    } else {
+        // `Some(true)` は部分配列、`Some(false)` は要素を並べる階層。
+        let mut holds_sub_arrays: Option<bool> = None;
         loop {
-            // 要素先頭の空白を読み飛ばす。
-            while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                chars.next();
-            }
-            let Some(&first) = chars.peek() else {
-                return Err(SqlSurfaceError::invalid_text_representation(
-                    "array literal has a trailing comma or is empty after a comma",
-                ));
-            };
-            let element = if first == '"' {
-                // 引用要素: バックスラッシュエスケープ（`\"`・`\\`）を解釈し、
-                // 閉じていない引用は拒否する。
-                chars.next();
-                let mut s = String::new();
-                let mut closed = false;
-                while let Some(c) = chars.next() {
-                    if c == '\\' {
-                        let escaped = chars.next().ok_or_else(|| {
-                            SqlSurfaceError::invalid_text_representation(
-                                "array literal has an unterminated escape sequence",
-                            )
-                        })?;
-                        s.push(escaped);
-                    } else if c == '"' {
-                        closed = true;
-                        break;
-                    } else {
-                        s.push(c);
+            skip_ws(chars);
+            match chars.peek().copied() {
+                None => return Err(malformed("array literal is missing a closing brace")),
+                Some('{') => {
+                    if holds_sub_arrays == Some(false) {
+                        return Err(malformed("array literal mixes elements and sub-arrays"));
                     }
-                }
-                if !closed {
-                    return Err(SqlSurfaceError::invalid_text_representation(
-                        "array literal has an unterminated quoted element",
-                    ));
-                }
-                Some(s)
-            } else {
-                // 引用なし要素: 次のカンマ（またはリテラル末尾）までを前後の
-                // 空白を除いて要素とする。入れ子の `{`/`}` は非対応。
-                let mut raw = String::new();
-                while let Some(&c) = chars.peek() {
-                    if c == ',' {
-                        break;
+                    holds_sub_arrays = Some(true);
+                    if depth + 1 >= usize::from(crate::catalog::MAX_ARRAY_DIMS) {
+                        return Err(SqlSurfaceError::payload_too_large(format!(
+                            "array literal exceeds {} dimensions",
+                            crate::catalog::MAX_ARRAY_DIMS
+                        )));
                     }
-                    if c == '{' || c == '}' {
-                        return Err(SqlSurfaceError::invalid_text_representation(
-                            "array literal must not contain nested braces",
-                        ));
-                    }
-                    raw.push(c);
                     chars.next();
-                }
-                let trimmed_raw = raw.trim();
-                if trimmed_raw.is_empty() {
-                    return Err(SqlSurfaceError::invalid_text_representation(
-                        "array literal has an empty unquoted element (use \"\" for an empty string)",
-                    ));
-                }
-                // 引用なしの `NULL`（大小無視）は NULL 要素（Issue #1193）。
-                if trimmed_raw.eq_ignore_ascii_case("null") {
-                    None
-                } else {
-                    Some(trimmed_raw.to_string())
-                }
-            };
-
-            // 要素数上限は確保（`push`）の**前**に検査する（無制限な `Vec`
-            // 成長を避ける。D-A5）。
-            if raw_elements.len() as u64 >= array_ty.max_len() as u64 {
-                return Err(SqlSurfaceError::payload_too_large(format!(
-                    "array literal element count exceeds limit {}",
-                    array_ty.max_len()
-                )));
-            }
-            raw_elements.push(element);
-
-            // 要素の直後は空白を挟んでカンマか閉じ（走査終端）のいずれか。
-            while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                chars.next();
-            }
-            match chars.peek() {
-                None => break,
-                Some(',') => {
-                    chars.next();
+                    scan_array_literal_level(chars, depth + 1, state)?;
                 }
                 Some(_) => {
-                    return Err(SqlSurfaceError::invalid_text_representation(
+                    if holds_sub_arrays == Some(true) {
+                        return Err(malformed("array literal mixes elements and sub-arrays"));
+                    }
+                    holds_sub_arrays = Some(false);
+                    if state.leaf_depth.is_some_and(|d| d != depth) {
+                        return Err(malformed("array literal has inconsistent dimensions"));
+                    }
+                    state.leaf_depth = Some(depth);
+                    let element = scan_array_literal_element(chars)?;
+                    // 要素数上限は確保（`push`）の**前**に検査する（無制限な `Vec`
+                    // 成長を避ける。D-A5）。
+                    if state.elements.len() as u64 >= u64::from(state.max_len) {
+                        return Err(SqlSurfaceError::payload_too_large(format!(
+                            "array literal element count exceeds limit {}",
+                            state.max_len
+                        )));
+                    }
+                    state.elements.push(element);
+                }
+            }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| malformed("array literal has too many elements"))?;
+            skip_ws(chars);
+            match chars.next() {
+                Some(',') => {}
+                Some('}') => break,
+                None => return Err(malformed("array literal is missing a closing brace")),
+                Some(_) => {
+                    return Err(malformed(
                         "array literal element is not properly delimited by a comma",
                     ))
                 }
             }
         }
     }
+    // 階層ごとの長さを、最初に完了した部分配列と揃える（矩形検査）。
+    if state.dims.len() <= depth {
+        state.dims.resize(depth + 1, None);
+    }
+    match state.dims.get_mut(depth) {
+        Some(slot @ None) => *slot = Some(count),
+        Some(Some(first)) if *first == count => {}
+        _ => return Err(malformed("array literal has inconsistent dimensions")),
+    }
+    Ok(())
+}
 
-    convert_array_elements(array_ty, raw_elements, cast_input)
+/// 配列リテラルの要素 1 個（引用あり／なし）を読む。引用なしの要素は次の `,` か `}` の直前まで
+/// を前後の空白を除いて取る（`{` を含むものと空要素は拒否）。引用なしの `NULL`（大小無視）は
+/// NULL 要素（Issue #1193）。
+fn scan_array_literal_element(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<Option<String>, SqlSurfaceError> {
+    if chars.peek() == Some(&'"') {
+        // 引用要素: バックスラッシュエスケープ（`\"`・`\\`）を解釈し、
+        // 閉じていない引用は拒否する。
+        chars.next();
+        let mut s = String::new();
+        let mut closed = false;
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                let escaped = chars.next().ok_or_else(|| {
+                    SqlSurfaceError::invalid_text_representation(
+                        "array literal has an unterminated escape sequence",
+                    )
+                })?;
+                s.push(escaped);
+            } else if c == '"' {
+                closed = true;
+                break;
+            } else {
+                s.push(c);
+            }
+        }
+        if !closed {
+            return Err(SqlSurfaceError::invalid_text_representation(
+                "array literal has an unterminated quoted element",
+            ));
+        }
+        return Ok(Some(s));
+    }
+    let mut raw = String::new();
+    while let Some(&c) = chars.peek() {
+        if c == ',' || c == '}' {
+            break;
+        }
+        if c == '{' {
+            return Err(SqlSurfaceError::invalid_text_representation(
+                "array literal has an opening brace inside an element",
+            ));
+        }
+        raw.push(c);
+        chars.next();
+    }
+    let trimmed_raw = raw.trim();
+    if trimmed_raw.is_empty() {
+        return Err(SqlSurfaceError::invalid_text_representation(
+            "array literal has an empty unquoted element (use \"\" for an empty string)",
+        ));
+    }
+    if trimmed_raw.eq_ignore_ascii_case("null") {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed_raw.to_string()))
+    }
 }
 
 /// 切り出し済みの配列要素（`None` は NULL 要素）を要素型へ変換する
@@ -8683,6 +8776,88 @@ mod tests {
     fn parse_array_literal_rejects_nested_braces() {
         let err = parse_array_literal("{a,{b,c}}", text_array_ty(4)).unwrap_err();
         assert_eq!(err.wire_code(), "22P02");
+    }
+
+    fn int_array_ty(max_len: u32) -> crate::catalog::ArrayType {
+        array_ty_of(crate::catalog::ArrayElemType::Integer, max_len)
+    }
+
+    /// 入れ子 `{}` は行優先の平坦な要素列＋次元長として読み、1 次元は従来どおり
+    /// ラップしない（Issue #1605・TABLE-35 (2)）。
+    #[test]
+    fn parse_array_literal_accepts_nested_braces_as_multi_dimensional() {
+        use crate::row_codec::ArrayValue;
+        let v = parse_array_literal("{{1,2},{3,4}}", int_array_ty(16)).expect("valid");
+        assert_eq!(v.dims(), vec![2, 2]);
+        assert_eq!(
+            v.flat(),
+            &ArrayValue::Integer(vec![Some(1), Some(2), Some(3), Some(4)])
+        );
+        let v = parse_array_literal("{ {1, NULL} , {3,4} }", int_array_ty(16)).expect("valid");
+        assert_eq!(v.dims(), vec![2, 2]);
+        assert!(v.has_null());
+        let v = parse_array_literal("{{{1,2,3}},{{4,5,6}}}", int_array_ty(16)).expect("valid");
+        assert_eq!(v.dims(), vec![2, 1, 3]);
+        let v = parse_array_literal("{{1},{2},{3}}", int_array_ty(16)).expect("valid");
+        assert_eq!(v.dims(), vec![3, 1]);
+        // 1 次元・空配列はラップしない。
+        let v = parse_array_literal("{1,2}", int_array_ty(16)).expect("valid");
+        assert_eq!(v, ArrayValue::Integer(vec![Some(1), Some(2)]));
+        let v = parse_array_literal("{}", int_array_ty(16)).expect("valid");
+        assert_eq!(v, ArrayValue::Integer(vec![]));
+    }
+
+    /// 揃っていないリテラルはすべて `22P02`（fail-closed。TABLE-35 (2)）。
+    #[test]
+    fn parse_array_literal_rejects_ragged_and_mixed_nesting() {
+        for lit in [
+            "{{1,2},{3}}",
+            "{{1},{2,3}}",
+            "{1,{2}}",
+            "{{1},2}",
+            "{{1},NULL}",
+            "{NULL,{1}}",
+            "{{}}",
+            "{{},{}}",
+            "{{1,2},{3,4}",
+            "{{1,2},{3,4}}}",
+            "{{1,2},{3,4}},",
+            "{{1,2}{3,4}}",
+            "{{1,2},}",
+            "{{1},{{2}}}",
+            "{{{1}},{2}}",
+            "{{1,2},{3,4}} x",
+        ] {
+            let err = parse_array_literal(lit, int_array_ty(16)).unwrap_err();
+            assert_eq!(err.wire_code(), "22P02", "{lit}");
+        }
+    }
+
+    #[test]
+    fn parse_array_literal_limits_dimensions_and_total_elements() {
+        // 6 次元までは受理し、7 次元は 54000。
+        let six = "{{{{{{1}}}}}}";
+        let v = parse_array_literal(six, int_array_ty(16)).expect("valid");
+        assert_eq!(v.dims(), vec![1, 1, 1, 1, 1, 1]);
+        let seven = "{{{{{{{1}}}}}}}";
+        let err = parse_array_literal(seven, int_array_ty(16)).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+        // 総要素数が max_len を超えたら 54000（部分配列をまたいで数える）。
+        let err = parse_array_literal("{{1,2,3},{4,5,6}}", int_array_ty(5)).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+        assert!(parse_array_literal("{{1,2,3},{4,5,6}}", int_array_ty(6)).is_ok());
+    }
+
+    /// `to_pg_text` の出力は同じ値へ往復する（引用・NULL・空白を含む TEXT 要素込み）。
+    #[test]
+    fn parse_array_literal_round_trips_multi_dimensional_text() {
+        let ty = text_array_ty(16);
+        let v =
+            parse_array_literal(r#"{{"a b",NULL},{"NULL","x\"y"}}"#, ty.clone()).expect("valid");
+        assert_eq!(v.dims(), vec![2, 2]);
+        let text = v.to_pg_text();
+        assert_eq!(text, r#"{{"a b",NULL},{"NULL","x\"y"}}"#);
+        assert_eq!(parse_array_literal(&text, ty).expect("round trip"), v);
     }
 
     #[test]

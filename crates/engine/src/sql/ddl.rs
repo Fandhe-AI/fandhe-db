@@ -131,6 +131,7 @@ pub(crate) fn execute_create_table(
             if let Some(def) = array_ty.enum_def() {
                 let resolved = resolve_enum_type(storage, def.name())?;
                 let array = crate::catalog::ArrayType::new_enum(resolved, array_ty.max_len())
+                    .and_then(|a| a.with_ndims(array_ty.ndims()))
                     .map_err(|e| {
                         SqlSurfaceError::unsupported(format!("invalid array type: {e}"))
                     })?;
@@ -986,9 +987,10 @@ fn resolve_column_type(
         }
         // 要素が ENUM の配列（Issue #1357）。型名の存在確認（未登録は 42601）の
         // うえで登録済みの語彙を持つ配列型を組み立てる。
-        StaticColumnType::ArrayOfEnumCandidate(name, max_len) => {
+        StaticColumnType::ArrayOfEnumCandidate(name, max_len, ndims) => {
             let def = resolve_enum_type(storage, &name)?;
             let array = crate::catalog::ArrayType::new_enum(def, max_len)
+                .and_then(|a| a.with_ndims(ndims))
                 .map_err(|e| SqlSurfaceError::unsupported(format!("invalid array type: {e}")))?;
             Ok(ColumnType::Array(array))
         }
