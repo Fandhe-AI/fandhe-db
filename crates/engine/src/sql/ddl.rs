@@ -1658,7 +1658,10 @@ pub(crate) fn execute_create_index(
         kind,
         validated.columns().to_vec(),
     )
-    .with_column_collations(validated.column_collations().to_vec());
+    .with_column_collations(validated.column_collations().to_vec())
+    // `CREATE UNIQUE INDEX`（Issue #1616・INDEX-9）。UNIQUE 制約への展開と既存行の重複検査は
+    // `Storage::create_index` が同一 write txn で行う。
+    .with_unique(validated.is_unique());
     // `IF NOT EXISTS`（TABLE-36、Issue #1613）。`create_index` の write txn は名前衝突を最初に
     // 判定し commit・世代 bump の前に返るため、同名があれば定義を比較せず副作用なしで成功にする。
     match storage.create_index(&def) {
@@ -1705,6 +1708,14 @@ fn map_create_index_error(e: CatalogError) -> SqlSurfaceError {
             SqlSurfaceError::datatype_mismatch(detail)
         }
         CatalogError::IndexLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        // 一意索引（`CREATE UNIQUE INDEX`。Issue #1616・INDEX-9）: 既存行の重複は `23505`
+        // （固定文言。テナント・値・件数を含めない）、制約名前空間の衝突は `42P07`、
+        // 制約数上限は `54000`。
+        CatalogError::UniqueConstraintViolation => SqlSurfaceError::UniqueViolation,
+        CatalogError::ConstraintAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
+        CatalogError::ConstraintLimitExceeded(detail) => {
+            SqlSurfaceError::PayloadTooLarge { detail }
+        }
         // 識別子形状・列数（構文検証段で既に拒否済みのため通常は到達しない）。
         CatalogError::Invalid(_) => {
             SqlSurfaceError::unsupported("malformed index definition in CREATE INDEX")
@@ -1722,6 +1733,10 @@ fn map_drop_index_error(e: CatalogError) -> SqlSurfaceError {
     match e {
         CatalogError::IndexNotFound(name) => SqlSurfaceError::UndefinedObject { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        // 一意索引が他の FOREIGN KEY の参照先になっている（Issue #1616・INDEX-9）。
+        CatalogError::DependentObjectsStillExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
         CatalogError::Invalid(_) => {
             SqlSurfaceError::unsupported("malformed index reference in DROP INDEX")
         }
@@ -2065,7 +2080,7 @@ mod tests {
     /// 同じく `55P03`、索引件数上限は `54000`、未知の内部事象は `XX000`）。
     #[test]
     fn index_ddl_catalog_errors_map_to_err6_codes() {
-        let cases: [(SqlSurfaceError, &str); 10] = [
+        let cases: [(SqlSurfaceError, &str); 14] = [
             (
                 map_create_index_error(CatalogError::IndexAlreadyExists("i".into())),
                 "42P07",
@@ -2093,6 +2108,23 @@ mod tests {
             (
                 map_create_index_error(CatalogError::WriteLockTimeout),
                 "55P03",
+            ),
+            // 一意索引（Issue #1616・INDEX-9）。
+            (
+                map_create_index_error(CatalogError::UniqueConstraintViolation),
+                "23505",
+            ),
+            (
+                map_create_index_error(CatalogError::ConstraintAlreadyExists("c".into())),
+                "42P07",
+            ),
+            (
+                map_create_index_error(CatalogError::ConstraintLimitExceeded("n".into())),
+                "54000",
+            ),
+            (
+                map_drop_index_error(CatalogError::DependentObjectsStillExist("i".into())),
+                "2BP01",
             ),
             (
                 map_drop_index_error(CatalogError::IndexNotFound("i".into())),
@@ -2201,6 +2233,7 @@ mod tests {
             hnsw: false,
             columns: vec!["body".to_string()],
             collations: vec![None],
+            unique: false,
         };
         execute_create_index(&storage, &index).expect("create index");
         let snapshot = |storage: &Storage| {

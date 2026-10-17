@@ -120,6 +120,10 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 
 ## スコープ外・申し送り
 
+- `CREATE UNIQUE INDEX`（Issue #1616・INDEX-9）は UNIQUE 制約へ展開されるため、本ファイルの強制機構
+  （`user_uniq`）がそのまま効く。作成・`DROP INDEX` のたびに `user_uniq/{table}` を無効化し、各テナントは次回書き込みで
+  遅延再構築する（詳細は [index-ddl-declaration.md](index-ddl-declaration.md) の「Issue #1616 追記」）。
+
 - 専有環境（`BENCH_DEDICATED_ENV=1`）でのマイクロベンチマーク
   （`bench-unique-check` 相当）。確保自体がオーナー作業のため引き継ぐ
   （上記「性能改善の証拠」節参照）。

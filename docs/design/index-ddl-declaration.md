@@ -79,7 +79,7 @@ DROP INDEX <name>
 | 索引列の `COLLATE` の名前が許可リストに無い（構文段。カタログを参照しない。Issue #2191） | `42704` | 400 |
 | 照合を持てない列（`id`・数値・`VECTOR` 等）・`USING hnsw` への `COLLATE`（カタログ段。Issue #2191） | `42804` | 400 |
 | `USING` が `hnsw`・`btree` 以外（`bm25`・`hash`・`gin` 等）／`USING hnsw` の複数列・非 `VECTOR` 列（`id` を含む）／スカラー宣言が `VECTOR` 列・索引化非対応の型／部分索引の `WHERE`／式・関数呼び出し・リテラルの列指定 | `0A000` | 501 |
-| `UNIQUE`／名前を省いた `CREATE INDEX IF NOT EXISTS`／`ASC`・`DESC`／列の重複指定／`DROP` の複数名・`CASCADE`／`(col + 1)` 等の余分なトークン | `42601` | 400 |
+| 名前の無い `CREATE [UNIQUE] INDEX`／`ASC`・`DESC`／列の重複指定／`DROP` の複数名・`CASCADE`／`(col + 1)` 等の余分なトークン | `42601` | 400 |
 | 列リストの要素数上限（256）超過・索引宣言の総数上限（10,000）超過 | `54000` | 413 |
 | DDL 実行権限なし | `42501` | 403 |
 
@@ -105,7 +105,7 @@ NoSQL 表層の `op` 許可リストには索引 DDL が無く、両分類とも
   後の同名列の再追加で意図せず復活する事故を防ぐ）。
   ただし UNIQUE 制約（TABLE-16、Issue #905）・`PRIMARY KEY` の構成列は `DROP COLUMN`
   自体が拒否されるため、その場合は索引宣言も含め何も変更しない。
-- UNIQUE 制約は名前を持たないため、relation 名前空間の衝突対象にはならない。
+- UNIQUE 制約の名前は relation 名前空間ではなく、テーブル単位の制約名前空間に属する。`CREATE UNIQUE INDEX` との衝突規則は末尾「Issue #1616 追記」の表に従う。
 - 列リストの重複は SQL 表層（構文検証段・`42601`）だけでなく公開 Rust API
   `Storage::create_index` でも `CatalogError::Invalid`（SQL 表層では `42601`）として
   拒否し、読み出し（カタログ値のデコード）時に重複を含む値は破損として fail-closed に
@@ -187,6 +187,48 @@ Issue #1065 で実装済み。詳細・設計判断は
   の前に返す。`IF NOT EXISTS` では `IndexAlreadyExists` を no-op 成功に写す。名前衝突が最初の
   判定のため、同名があれば対象テーブル・列が不正でも成功する（定義は比較しない）。
 - 同名の表・ビューがある場合も no-op。句なしの重複（`42P07`）は不変。
+
+## Issue #1616 追記（INDEX-9）: `CREATE UNIQUE INDEX`
+
+`CREATE UNIQUE INDEX [IF NOT EXISTS] <name> ON <t> (<cols>)` を受理し、内部では UNIQUE 制約の宣言へ展開する。
+一意性の強制・`ON CONFLICT (<列>)` の推論・FK の参照先判定はすべて `TableSchema::unique_constraints()` を入力に
+するため、制約として登録すれば既存の仕組みがそのまま効く（強制漏れ＝fail-open を作らない）。
+
+- **表現**: 同一 write txn で (a) 対象テーブルのスキーマに索引名と同名の UNIQUE 制約を追加し、(b) 索引カタログに
+  `unique == true` の宣言を書く。`IndexDef` に公開フィールド `unique` を追加した（破壊的変更）。
+  索引カタログは `unique` のときだけ新形式 `v3`（5 行目に固定フラグ `unique`）で書き、`v1`・`v2` のバイト列は不変。
+  TableSchema のカタログ形式は変更しない。
+- **作成の判定順**（`Storage::create_index`。データ依存は最後の重複走査のみ）: 形状 → relation 名前空間（`42P07`）→
+  対象の種別（`42809`）→ 表（`42P01`）→ 列（`42703`）→ 型ゲート（`0A000`）→ 制約名前空間（`42P07`）→ 制約数上限
+  （`54000`）→ 追加後スキーマの検証（同じ列並びの既存 UNIQUE は `42601`）→ 全テナント・全可視性の既存行をテナントごとに
+  独立して走査（重複は `23505`。commit せず破棄するので索引も制約も残らない）→ 保存。
+- **削除**: `DROP INDEX` が同一 txn で同名の UNIQUE 制約も外し、永続一意索引を無効化して索引衛生を行う。
+  FK の参照先になっている間は `2BP01`（他の UNIQUE・PK が同じ列集合を覆っていても救済しない）。
+  `ALTER TABLE DROP CONSTRAINT <索引名>` は `42704`（索引由来の UNIQUE は制約として扱わない）。
+  `ON CONFLICT ON CONSTRAINT <名>` は従来どおり `42601`。
+- **未対応の形（fail-closed）**: `USING hnsw`・`COLLATE`（一意キーの正準化は照合を見ない）は `0A000`（構文段）。
+  暗黙の `id` 列・`BOOLEAN`／`JSON(B)`／`ARRAY` など一意キー許可型または索引化対応型の外は `0A000`（カタログ段）。
+  名前を省いた形は `42601`。`NULLS NOT DISTINCT`・`INCLUDE`・`CONCURRENTLY` は構文として受理しない。
+  エラー文言は固定で、テナント・値・件数を含めない。
+
+名前空間の衝突規則:
+
+| 操作 | 衝突相手 | 結果 |
+| ---- | -------- | ---- |
+| `CREATE UNIQUE INDEX n` | テーブル・ビュー・索引 `n` | `42P07`（`IF NOT EXISTS` なら no-op） |
+| `CREATE UNIQUE INDEX n ON t` | `t` の UNIQUE・CHECK・FK・PK 実効名 `n` | `42P07`（`IF NOT EXISTS` でも拒否） |
+| `CREATE UNIQUE INDEX n ON t` | 他テーブルの制約名 `n` | 許可（制約名はテーブル単位。PG とは異なる） |
+| `ALTER TABLE t ADD [CONSTRAINT n] UNIQUE` | `t` の unique 索引 `n` | 明示名は `42P07`、省略時は既定名が衝突を回避 |
+| `ALTER TABLE t ADD CONSTRAINT n CHECK/FK` | `t` の unique 索引 `n` | 既存の `42710`（PG は許可。fail-closed 側の差分） |
+| `DROP CONSTRAINT n`（n は unique 索引） | — | `42704` |
+
+PG との差分（いずれも fail-closed 側）: 上記の未対応型・`COLLATE`・`id`、既存 UNIQUE と同じ列並びの unique 索引、
+unique 索引の構成列への `DROP COLUMN`（PG は索引ごと削除するが、本実装は UNIQUE 制約の既存規則で拒否）。
+
+対象外: 名前を省いた `CREATE [UNIQUE] INDEX ON ...` の自動命名、`pg_indexes`／`pg_constraint` 相当の照会手段。
+
+テスト: `crates/engine/tests/sql_unique_index.rs`（結合）・`crates/wire-server/tests/wire_index_ddl.rs`（層 A）・
+`crates/engine/examples/crash_tool_unique_index.rs`（`make crash-test-unique-index` が `docs_uidx` で検証）。
 
 ## Issue #1617 追記（INDEX-9・TABLE-36）: `USING btree`
 

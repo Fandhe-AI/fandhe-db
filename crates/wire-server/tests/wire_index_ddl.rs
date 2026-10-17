@@ -235,3 +235,52 @@ fn wire_drop_if_exists_noop_and_dependency_and_permission() {
         expect_error(&mut bob, sql, "42501");
     }
 }
+
+/// `CREATE UNIQUE INDEX`（Issue #1616・INDEX-9）。`CommandComplete` タグは通常の
+/// `CREATE INDEX`、作成時の重複・作成後の重複 INSERT は `23505`、`DROP CONSTRAINT <索引名>` は
+/// `42704`、`DROP INDEX` で強制が外れる。強制の詳細は
+/// `crates/engine/tests/sql_unique_index.rs` が確定オラクル。
+#[test]
+fn wire_create_unique_index_enforces_and_drops() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_with_ddl_allowed_users(&users(), core, &["alice"]);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    expect_command(&mut alice, "CREATE TABLE notes (code TEXT)", "CREATE TABLE");
+    expect_command(
+        &mut alice,
+        "INSERT INTO notes (id, code) VALUES (1, 'x'), (2, 'x') USING OPERATION_ID 'u-1'",
+        "INSERT 0 2",
+    );
+    // 既存行に重複があれば作成は 23505 で失敗する。
+    expect_error(
+        &mut alice,
+        "CREATE UNIQUE INDEX notes_code ON notes (code)",
+        "23505",
+    );
+    expect_command(
+        &mut alice,
+        "DELETE FROM notes WHERE id = 2 USING OPERATION_ID 'u-2'",
+        "DELETE 1",
+    );
+    expect_command(
+        &mut alice,
+        "CREATE UNIQUE INDEX notes_code ON notes (code)",
+        "CREATE INDEX",
+    );
+    expect_error(
+        &mut alice,
+        "INSERT INTO notes (id, code) VALUES (3, 'x') USING OPERATION_ID 'u-3'",
+        "23505",
+    );
+    expect_error(
+        &mut alice,
+        "ALTER TABLE notes DROP CONSTRAINT notes_code",
+        "42704",
+    );
+    expect_command(&mut alice, "DROP INDEX notes_code", "DROP INDEX");
+    expect_command(
+        &mut alice,
+        "INSERT INTO notes (id, code) VALUES (3, 'x') USING OPERATION_ID 'u-4'",
+        "INSERT 0 1",
+    );
+}

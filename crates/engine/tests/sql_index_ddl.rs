@@ -398,7 +398,6 @@ fn structural_rejections_do_not_consult_the_catalog() {
         ),
         ("CREATE INDEX idx ON docs (lang, lang)".into(), "42601"),
         ("CREATE INDEX idx ON docs (lang + 1)".into(), "42601"),
-        ("CREATE UNIQUE INDEX idx ON docs (lang)".into(), "42601"),
         ("CREATE INDEX IF NOT EXISTS ON docs (lang)".into(), "42601"),
         ("CREATE INDEX idx ON docs (lang DESC)".into(), "42601"),
         ("CREATE INDEX idx ON docs ()".into(), "0A000"),
