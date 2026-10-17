@@ -371,6 +371,15 @@ pub(super) fn bind_subscript(
     }
 }
 
+/// 配列要素として複製される可変長ペイロードのバイト長（複製前の累計上限検査用）。
+fn payload_len(v: &ExprValue<'_>) -> usize {
+    match v {
+        ExprValue::Text(s) | ExprValue::Json(s) | ExprValue::JsonText(s) => s.len(),
+        ExprValue::Bytes(b) => b.len(),
+        _ => 0,
+    }
+}
+
 /// 評価値を所有型へ写す（配列の要素として保持するため）。
 fn own(v: ExprValue<'_>) -> Result<ExprValue<'static>, SqlSurfaceError> {
     use std::borrow::Cow;
@@ -436,8 +445,17 @@ pub(crate) fn eval_array_constructor<'a>(
         ));
     }
     let mut values = Vec::with_capacity(items.len());
+    // 要素を所有化（複製）する前にペイロード長を checked 加算し、上限超過で 54000 とする
+    // （巨大 TEXT 列を複数並べた構築による過大なメモリ確保を防ぐ）。
+    let mut total: usize = 0;
     for item in items {
         let v = crate::sql::udf_call::eval_with_scalars(item, id, embedding, row_scalars)?;
+        total = total
+            .checked_add(payload_len(&v))
+            .filter(|t| *t <= crate::row_codec::MAX_SCALAR_PAYLOAD_LEN as usize)
+            .ok_or_else(|| {
+                SqlSurfaceError::payload_too_large("ARRAY constructor payload is too large")
+            })?;
         values.push(own(v)?);
     }
     Ok(ExprValue::Array(values_to_array(values, elem)?))

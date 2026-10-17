@@ -596,3 +596,38 @@ fn deeply_nested_constructors_and_subscripts_bind_in_linear_time() {
         started.elapsed()
     );
 }
+
+/// 巨大な可変長要素を並べた ARRAY[...] は、要素の複製前に累計バイト数で 54000 となる。
+#[test]
+fn constructor_rejects_oversized_cumulative_payload() {
+    let (path, _guard) = setup("array-ctor-bytes");
+    let core = core_at(&path);
+    ok(
+        &core,
+        "alice",
+        "CREATE TABLE w (embedding VECTOR(2) NOT NULL, s TEXT)",
+    );
+    let big = "x".repeat(900_000);
+    ok(
+        &core,
+        "alice",
+        &format!(
+            "INSERT INTO w (id, embedding, s) VALUES (1, '[0.1,0.2]', '{big}') \
+             USING OPERATION_ID 'w1'"
+        ),
+    );
+    // 要素数は上限内でも、累計 4.5MB は複製前に 54000 で拒否される。
+    assert_eq!(
+        code(
+            &core,
+            "SELECT ARRAY[s, s, s, s, s] FROM w WHERE id = 1 LIMIT 10"
+        ),
+        "54000"
+    );
+    // 上限内（3 要素 = 2.7MB）は成功する。
+    ok(
+        &core,
+        "alice",
+        "SELECT ARRAY[s, s, s] FROM w WHERE id = 1 LIMIT 10",
+    );
+}
