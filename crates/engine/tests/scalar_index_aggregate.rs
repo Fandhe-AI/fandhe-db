@@ -1097,3 +1097,22 @@ fn cast_bytea_result_shares_text_state_budget_on_index_path_like_full_scan() {
         "the index path must have been exercised"
     );
 }
+
+/// Issue #1592: 集計 SELECT リストの CAST 項目は項目全体が CAST の形に限る。CAST が演算子
+/// （算術・jsonb 後置演算子・連結）の被演算子になる形は従来どおり `42601`。
+#[test]
+fn aggregate_cast_item_as_operator_operand_stays_syntax_error() {
+    let path = unique_db_path("scalar-index-aggregate-cast-operand");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    let core = new_core(storage);
+    for tail in ["->> 'k'", "-> 'k'", "#> '{k}'", "|| 'x'", "+ 1", "* 2"] {
+        let sql = format!("SELECT MAX(lang), CAST(MAX(lang) AS text) {tail} FROM docs");
+        let err = core
+            .execute_sql(&ctx("tenant-a"), &sql)
+            .expect_err("a CAST operand in an aggregate list stays unsupported");
+        assert_eq!(err.wire_code(), "42601", "{sql}");
+    }
+}
