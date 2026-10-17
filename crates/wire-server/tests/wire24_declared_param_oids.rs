@@ -541,3 +541,88 @@ fn indeterminate_position_with_unsupported_oid_is_0a000_not_42p18() {
     let mut s = connect(core);
     assert_parse_error_declared(&mut s, EXPR, &[1007, OID_INT4], "0A000");
 }
+const OID_TEXT: i32 = 25;
+const OID_BOOL: i32 = 16;
+const OID_VARCHAR: i32 = 1043;
+
+/// 宣言型が文脈の型へ変換できない Parse は拒否される（Issue #2437。WIRE-24 (1)(5)・
+/// SQL-41・SQL-45 のポインタ）: 代入の位置は `42804`、比較の位置は `42883`。
+/// 拒否後も接続は維持され、名前付き statement は保存されない。
+#[test]
+fn unconvertible_declaration_is_rejected_and_connection_survives() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    let assign = "UPDATE t SET n = $1 WHERE id = 1 USING OPERATION_ID 'x'";
+    for oid in [OID_TEXT, OID_VARCHAR, OID_BOOL, OID_DATE] {
+        assert_parse_error_declared(&mut s, assign, &[oid], "42804");
+        let insert = "INSERT INTO t (id, n) VALUES (2, $1) USING OPERATION_ID 'y'";
+        assert_parse_error_declared(&mut s, insert, &[oid], "42804");
+    }
+    for oid in [OID_TEXT, OID_BOOL, OID_DATE] {
+        assert_parse_error_declared(&mut s, SELECT_N, &[oid], "42883");
+    }
+    // 文字列列への int8 の比較も拒否される。
+    assert_parse_error_declared(
+        &mut s,
+        "SELECT id FROM t WHERE s = $1 LIMIT 5",
+        &[OID_INT8],
+        "42883",
+    );
+    // 拒否した名前付き statement は保存されない。
+    let text = parse_error_text(&mut s, "q", SELECT_N, &[OID_TEXT]);
+    assert!(text.contains("C42883"), "{text:?}");
+    send_length_prefixed_message(&mut s, b'D', &describe_statement_msg("q"));
+    let body = expect_kind(&mut s, b'E');
+    assert!(String::from_utf8_lossy(&body).contains("C08P01"));
+    send_length_prefixed_message(&mut s, b'S', b"");
+    expect_kind(&mut s, b'Z');
+}
+
+/// 変換できる宣言は従来どおり受理され、実行まで通って値が保存される。
+#[test]
+fn convertible_declaration_executes_and_stores() {
+    let (core, _g) = new_core();
+    let mut s = connect(core.clone());
+    let upd_n = "UPDATE t SET n = $1 WHERE id = 1 USING OPERATION_ID $2";
+    let tag = run_declared(&mut s, upd_n, &[OID_INT8, 0], &[0], &[b"77", b"o-a"]).expect("int8");
+    assert_eq!(tag, "UPDATE 1");
+    assert_eq!(cell(&core, "n", 1), Cell::SignedInteger(77));
+    let upd_s = "UPDATE t SET s = $1 WHERE id = 1 USING OPERATION_ID $2";
+    let tag = run_declared(&mut s, upd_s, &[OID_INT4, 0], &[0], &[b"5", b"o-b"]).expect("int4");
+    assert_eq!(tag, "UPDATE 1");
+    assert_eq!(cell(&core, "s", 1), Cell::Text("5".to_string()));
+    // 比較の位置は型をまたいでも暗黙の変換があれば受理する。
+    let tag = run_declared(&mut s, SELECT_N, &[OID_INT8], &[0], &[b"77"]).expect("select");
+    assert!(tag.starts_with("SELECT"), "{tag}");
+}
+
+/// `0A000`（持たない型）は変換可否の判定より先に返る。
+#[test]
+fn unsupported_oid_takes_precedence_over_conversion_check() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    let text = parse_error_text(&mut s, "", SELECT_N, &[1007]);
+    assert!(text.contains("C0A000"), "{text:?}");
+}
+
+/// 拒否／受理は他テナントの行の有無に依存しない（テナント境界）。行を持つテナントと
+/// 持たないテナントで、同じ宣言は同じ応答になる。
+#[test]
+fn conversion_check_does_not_depend_on_tenant_rows() {
+    let (core, _g) = new_core();
+    let users = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("bob", "tenant-b", "battery-staple"),
+    ]);
+    let addr = spawn_server_with_engine(&users, core);
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut b = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    let ta = parse_error_text(&mut a, "", SELECT_N, &[OID_TEXT]);
+    let tb = parse_error_text(&mut b, "", SELECT_N, &[OID_TEXT]);
+    assert!(ta.contains("C42883"), "{ta:?}");
+    assert_eq!(ta, tb);
+    for s in [&mut a, &mut b] {
+        send_length_prefixed_message(s, b'P', &parse_declared("", SELECT_N, &[OID_INT8]));
+        expect_kind(s, b'1');
+    }
+}

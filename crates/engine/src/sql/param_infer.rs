@@ -40,6 +40,7 @@ use crate::catalog::ColumnType;
 use crate::sql::allowlist::{self, SqlSurfaceError};
 use crate::sql::exec::ColumnMeta;
 use crate::sql::lexer::Token;
+use crate::sql::param_coerce::ParamContextKind;
 use crate::sql::params::{ExprSegment, PreparedParamType};
 use crate::sql::udf_call::{is_builtin_function_name, BinOp, Expr};
 
@@ -199,10 +200,39 @@ fn builtin_return_type(name: &str) -> Ty {
     }
 }
 
+/// 演算子の相手 `other` の型が信頼できるときだけ変換可否判定の対象にする
+/// （Issue #2437）。列参照・数値リテラル・それらの算術・型を明示した組み込み関数に限り、
+/// 文字列リテラル（PG では unknown 型）や戻り型を近似で置く関数は対象外
+/// （従来より受理を狭めない）。
+fn operator_kind(other: &Expr) -> Option<ParamContextKind> {
+    fn reliable(e: &Expr) -> bool {
+        match e {
+            Expr::Number(_) => true,
+            Expr::Ident(_) => as_param(e).is_none(),
+            Expr::Collate { expr, .. } => reliable(expr),
+            Expr::Binary { op, lhs, rhs } => !is_comparison(*op) && reliable(lhs) && reliable(rhs),
+            Expr::Call { name, .. } => matches!(
+                name.to_ascii_lowercase().as_str(),
+                "lower"
+                    | "upper"
+                    | "trim"
+                    | "replace"
+                    | "concat"
+                    | "substr"
+                    | "length"
+                    | "position"
+            ),
+            _ => false,
+        }
+    }
+    reliable(other).then_some(ParamContextKind::Operator)
+}
+
 struct Inferrer<'a> {
     /// 代入先表の列名から列の型を引く。表・列が引けなければ `None`。
     column_type: &'a dyn Fn(&str) -> Option<PreparedParamType>,
-    out: Vec<(u16, ParamInference)>,
+    /// `(番号, 推論結果, 変換可否判定の位置種別)`。種別 `None` は判定対象外の出現。
+    out: Vec<(u16, ParamInference, Option<ParamContextKind>)>,
 }
 
 impl Inferrer<'_> {
@@ -330,6 +360,16 @@ impl Inferrer<'_> {
 
     /// `$n` に型 `ty` を割り当てる。式の中で扱えない型は `0A000` で fail-closed。
     fn assign(&mut self, n: u16, ty: Ty) -> Result<(), SqlSurfaceError> {
+        self.assign_ctx(n, ty, None)
+    }
+
+    /// [`Self::assign`] に、宣言型の変換可否判定（Issue #2437）の位置種別を添える版。
+    fn assign_ctx(
+        &mut self,
+        n: u16,
+        ty: Ty,
+        kind: Option<ParamContextKind>,
+    ) -> Result<(), SqlSurfaceError> {
         let result = match ty {
             Ty::Known(t) => {
                 if !is_supported_in_expr(&t) {
@@ -344,7 +384,7 @@ impl Inferrer<'_> {
             Ty::Unresolved => ParamInference::Unresolved,
             Ty::Untyped => ParamInference::Indeterminate,
         };
-        self.out.push((n, result));
+        self.out.push((n, result, kind));
         Ok(())
     }
 
@@ -359,12 +399,12 @@ impl Inferrer<'_> {
                     }
                     (Some(a), None) => {
                         let other = self.type_of(rhs);
-                        self.assign(a, other)?;
+                        self.assign_ctx(a, other, operator_kind(rhs))?;
                         self.walk(rhs)?;
                     }
                     (None, Some(b)) => {
                         let other = self.type_of(lhs);
-                        self.assign(b, other)?;
+                        self.assign_ctx(b, other, operator_kind(lhs))?;
                         self.walk(lhs)?;
                     }
                     (None, None) => {
@@ -384,7 +424,12 @@ impl Inferrer<'_> {
                             } else {
                                 Ty::Untyped
                             };
-                            self.assign(n, ty)?;
+                            // `concat` は PG で VARIADIC "any" のため任意型を受ける（判定対象外）。
+                            let kind = (is_builtin_function_name(name)
+                                && builtin_arg_is_text(name, i)
+                                && !name.eq_ignore_ascii_case("concat"))
+                            .then_some(ParamContextKind::FunctionArg);
+                            self.assign_ctx(n, ty, kind)?;
                         }
                         None => self.walk(arg)?,
                     }
@@ -486,14 +531,14 @@ impl Inferrer<'_> {
 /// 式セグメント `tokens[seg.start..seg.end]` の各 `$n` 出現の型を推論する。
 /// `root_type` は代入先の列の型（`None` は表・列がスキーマから引けない）で、セグメント全体が
 /// 括弧付きの `$n` 単独の場合にだけ使う。`column_type` は式中の列参照の型を引く関数。
-/// 戻り値は `(番号, 結果)` の出現順列。
+/// 戻り値は `(番号, 結果, 変換可否判定の位置種別)` の出現順列。
 pub(crate) fn infer_segment(
     tokens: &[Token],
     seg: &ExprSegment,
     for_set: bool,
     root_type: Option<PreparedParamType>,
     column_type: &dyn Fn(&str) -> Option<PreparedParamType>,
-) -> Result<Vec<(u16, ParamInference)>, SqlSurfaceError> {
+) -> Result<Vec<(u16, ParamInference, Option<ParamContextKind>)>, SqlSurfaceError> {
     let slice = tokens.get(seg.start..seg.end).ok_or_else(|| {
         SqlSurfaceError::unsupported("parameter placeholder is not supported at this position")
     })?;
@@ -514,7 +559,7 @@ pub(crate) fn infer_segment(
             Some(t) => Ty::Known(t),
             None => Ty::Unresolved,
         };
-        inferrer.assign(n, ty)?;
+        inferrer.assign_ctx(n, ty, Some(ParamContextKind::Assignment))?;
     } else {
         inferrer.walk(&expr)?;
     }
@@ -553,7 +598,11 @@ mod tests {
                 crate::sql::params::ExprTarget::Set(col) => lookup(col),
                 crate::sql::params::ExprTarget::Insert(_) => Some(int_col("t")),
             };
-            all.extend(infer_segment(&tokens, &seg, for_set, root, &lookup)?);
+            all.extend(
+                infer_segment(&tokens, &seg, for_set, root, &lookup)?
+                    .into_iter()
+                    .map(|(n, i, _)| (n, i)),
+            );
         }
         Ok(all)
     }

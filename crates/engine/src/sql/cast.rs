@@ -502,7 +502,7 @@ fn elem_cast_type(e: ArrayElemType) -> Option<CastType> {
     })
 }
 
-fn kind_of_column(ty: &ColumnType) -> Option<CastKind> {
+pub(crate) fn kind_of_column(ty: &ColumnType) -> Option<CastKind> {
     match ty {
         ColumnType::SmallInt => Some(CastKind::Int2),
         ColumnType::Integer => Some(CastKind::Int4),

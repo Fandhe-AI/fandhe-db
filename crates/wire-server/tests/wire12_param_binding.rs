@@ -401,9 +401,9 @@ fn parameter_description_reports_inferred_and_declared_oids() {
         describe_statement_oids(
             &mut s,
             "SELECT id FROM documents WHERE body = $1 AND body = $2 LIMIT 10",
-            &[20]
+            &[1043]
         ),
-        vec![20, 25]
+        vec![1043, 25]
     );
 }
 

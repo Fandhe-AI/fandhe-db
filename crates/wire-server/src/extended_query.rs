@@ -507,8 +507,8 @@ const BPCHAR_SLOT_DECLARED_OIDS: [i32; 4] = [0, 25, 1043, 1042];
 /// 推論スロット型と実効 OID（宣言 OID が 0 以外ならそれ、0 なら推論 OID）から
 /// バイナリ復号種別を決める（Issue #1345）。推論型との互換表に載らない組み合わせは
 /// すべて `Unsupported`（fail-closed）。PostgreSQL の暗黙キャスト（float4→float8 等）より意図的に厳しい: 値の意味が暗黙キャストと変わりうる
-/// 組み合わせを受理しない。推論スロット側の互換表は #2437（宣言型と文脈型の変換可否判定）が
-/// 置き換える箇所のため、本 Issue（#2436）では変更しない。宣言型をスロット型とする
+/// 組み合わせを受理しない。宣言型と文脈型の変換可否は #2437 が engine の Parse 段で先に判定する
+/// ため、ここは変換可否を担わず、バイナリ形式の受理範囲を fail-closed のまま据え置く。宣言型をスロット型とする
 /// `Declared` だけは宣言型そのものの受信形式を受理する。
 #[deny(clippy::wildcard_enum_match_arm)]
 fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i32) -> BinaryParam {
