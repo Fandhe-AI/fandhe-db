@@ -12,6 +12,16 @@
 // WIRE_PARAMS_BINARY_HEX（任意）: hex 文字列の JSON 配列。各要素を `Buffer` にして values へ
 //   渡す（pg-protocol は Buffer を format 1・宣言 OID 0 で送る。numeric の `numeric_send`
 //   バイト列を呼び出し側が作って渡す。Issue #2445）。`WIRE_PARAMS` とは排他。
+// WIRE_PARAM_TYPES（任意）: Parse で宣言する型 OID（0〜2147483647 の整数）の JSON 配列
+//   （Issue #2440。WIRE-24 のポインタ）。node pg の公開 API `query({ types })` は pg-protocol の
+//   Parse へそのまま OID 列を書く。同じ配列は結果側が `getTypeParser` を持つ前提で読むため、
+//   `pg.types.getTypeParser` を付けて渡す（ドライバ無改造。pg 8.x の内部結合に依存するため、
+//   版が変わると壊れうる）。値は text 形式で送られる。
+// WIRE_PARAMS_NULLABLE（任意）: 文字列と null だけの JSON 配列（values として束縛。null は
+//   長さ -1 の NULL）。`WIRE_PARAMS`／`WIRE_PARAMS_BINARY_HEX` とは排他。
+// WIRE_SQL_AFTER（任意）: 1 つ目の文が失敗しても同じ接続で実行する 2 つ目の文。1 つ目の失敗は
+//   stderr（`[SQLSTATE=...]` 付き）、2 つ目の結果行は stdout へ `after:` を前置して出す。終了
+//   コードは 2 つ目が成功したときだけ 0。
 // WIRE_BINARY（任意）: "1" のみ受理。結果をバイナリ形式で要求する。node pg は bytea(17)・
 //   uuid(2950) のバイナリ parser を持たないため、公開 API `pg.types.setTypeParser` で
 //   登録する（ドライバ無改造）。なお node pg はバイナリ DataRow を UTF-8 文字列として
@@ -73,6 +83,32 @@ if (process.env.WIRE_PARAMS_BINARY_HEX) {
   }
   values = hexes.map((h) => Buffer.from(h, "hex"));
 }
+if (process.env.WIRE_PARAMS_NULLABLE) {
+  if (values !== undefined) fail("WIRE_PARAMS_NULLABLE is exclusive with other params");
+  try {
+    values = JSON.parse(process.env.WIRE_PARAMS_NULLABLE);
+  } catch (e) {
+    fail(`WIRE_PARAMS_NULLABLE is not valid JSON: ${e}`);
+  }
+  if (!Array.isArray(values) || !values.every((s) => s === null || typeof s === "string")) {
+    fail("WIRE_PARAMS_NULLABLE must be a JSON array of strings and nulls");
+  }
+}
+let paramTypes;
+if (process.env.WIRE_PARAM_TYPES) {
+  try {
+    paramTypes = JSON.parse(process.env.WIRE_PARAM_TYPES);
+  } catch (e) {
+    fail(`WIRE_PARAM_TYPES is not valid JSON: ${e}`);
+  }
+  if (
+    !Array.isArray(paramTypes) ||
+    !paramTypes.every((o) => Number.isInteger(o) && o >= 0 && o <= 2147483647)
+  ) {
+    fail("WIRE_PARAM_TYPES must be a JSON array of integers in 0..2147483647");
+  }
+}
+const sqlAfter = process.env.WIRE_SQL_AFTER || undefined;
 const binary = flag("WIRE_BINARY");
 const noparamExtended = flag("WIRE_EXTENDED_NOPARAM");
 
@@ -105,11 +141,19 @@ client.on("error", (e) => {
 
 const config = { text: sql, binary };
 if (values !== undefined) config.values = values;
+if (paramTypes !== undefined) {
+  paramTypes.getTypeParser = pg.types.getTypeParser;
+  config.types = paramTypes;
+}
 if (noparamExtended) config.queryMode = "extended";
 
 function cell(v) {
   if (Buffer.isBuffer(v)) return `Buffer:${v.toString("hex")}`;
   return `${typeof v}:${String(v)}`;
+}
+
+function sqlstateSuffix(err) {
+  return err && err.code ? ` [SQLSTATE=${err.code}]` : "";
 }
 
 client
@@ -119,8 +163,20 @@ client
     for (const row of result.rows) {
       process.stdout.write(`${Object.values(row).map(cell).join("|")}\n`);
     }
-    return client.end();
   })
+  .catch((err) => {
+    if (sqlAfter === undefined) throw err;
+    process.stderr.write(`pg_extended: query failed${sqlstateSuffix(err)}: ${err}\n`);
+  })
+  .then(() => {
+    if (sqlAfter === undefined) return undefined;
+    return client.query({ text: sqlAfter }).then((result) => {
+      for (const row of result.rows) {
+        process.stdout.write(`after:${Object.values(row).map(cell).join("|")}\n`);
+      }
+    });
+  })
+  .then(() => client.end())
   .then(() => process.exit(0))
   .catch((err) => {
     const suffix = err && err.code ? ` [SQLSTATE=${err.code}]` : "";

@@ -975,11 +975,77 @@ psycopg_extended.py`・`pg_extended.js` を追加した。簡易クエリ経路�
   で、`node_numeric_fixture_bytes_are_utf8_safe` が機械検証する。bob のバイナリ集計・パラメータが
   Private 行を観測しないことも確認する。
 - **負のケース**: 受理位置外 `$n` → `42601`、静的型を持たないベクトル式（`vec_div`）を含むバイナリ要求 →
-  `0A000`（numeric は #2442 で対応済みのため負例に使わない）、非 text スロットのバイナリパラメータ（psycopg の Python `int`）→ `0A000`、
+  `0A000`（numeric は #2442 で対応済みのため負例に使わない）、psycopg の Python `int`（int2 を宣言）を TEXT 列と比較する Parse →
+  `42883`（Issue #2437 以降。以前は `0A000`。バイナリ非対応スロットの `0A000` は「Parse の型 OID 指定」節の差分固定が担う）、
   Private 行の他テナント非可視、`' OR '1'='1` 束縛が不透明リテラルのまま 0 行。
 
 実行結果（本開発環境）: psql 18.6・psycopg 3.3.6・node v24.13.0 + pg 8.23.0 で
 `--ignored` 8 件 green（numeric の層 B 2 件〔Issue #2445〕を含む）、非 ignore の fixture ガード 2 件 green。
+（Issue #2440 で `--ignored` は 14 件になった。次節を参照。）
+
+## Parse の型 OID 指定・NULL パラメータ・OID 0 の推論の 3 クライアント検証（Issue #2440・WIRE-24・SQL-45）
+
+親 #2434（TASK-337）の仕上げ。規則そのもの（宣言 OID の echo・変換可否の `42804`／`42883`・
+持たない型の `0A000`・NULL の扱い）は層 A（`wire24_declared_param_oids.rs`）が確定オラクルで、
+本節は同じ挙動が無改造クライアントで観測できることを確かめる。HTTP 表層には Parse が無く対象外。
+新しい `wire_code` と依存は追加していない。
+
+### クライアントごとの能力（実機で確認）
+
+| クライアント | 宣言 OID の送り方 | NULL |
+| --- | --- | --- |
+| psql 18.6（`\bind`） | 常に OID 0（型を指定する手段なし） | 送れない（値を省くとサーバーが「パラメータ数不一致」で拒否） |
+| psycopg 3.3.6（`RawCursor`） | Python の型で決まる（`int`→21／23／20、`float`→701、`bool`→16、`Decimal`→1700、`date`→1082、`list[int]`→1005）。公開 API `register_dumper` と `StrDumper` 派生で 25・705 等も宣言可 | `None` は OID 0・text 形式 |
+| node pg 8.23.0 | 公開 API に無いが `query({ types })` が Parse の OID 列へそのまま書かれる。結果側が `getTypeParser` を要求するため配列にそれを付ける（pg 内部の結合に依存し、版が変わると壊れうる） | `null` は長さ -1・text 形式 |
+
+ハーネスは env `WIRE_PARAMS_TYPED`・`WIRE_SQL_AFTER`（psycopg）、`WIRE_PARAM_TYPES`・
+`WIRE_PARAMS_NULLABLE`・`WIRE_SQL_AFTER`（node pg）を追加した。語彙・型・範囲は閉じた集合で、
+外れると終了コード 1（fail-closed）。`WIRE_SQL_AFTER` は 1 つ目の文が失敗しても同じ接続で
+2 つ目を実行し、失敗後も接続が生きていることを確かめる。
+
+### テストと確認内容（`three_client_extended_e2e.rs`、専用 seed `param_items`）
+
+- `three_clients_infer_types_for_oid_zero_params`: 3 クライアントとも OID 0 で代入・式内
+  （`$1 + 1`）・INSERT・比較が推論され読み戻しが一致、推論不能は `42P18`。
+- `psycopg_and_pg_declared_oids_are_used_and_checked`: 変換できる宣言の受理と読み戻し、
+  変換できない宣言（代入 `42804`・比較 `42883`）の拒否が psycopg と node で一致。拒否後も
+  接続は維持される。705 は OID 0 と同じ推論（列スロットは受理・式内は `42P18`）。
+- `psycopg_and_pg_array_oid_is_rejected_and_connection_survives`: 配列型 OID（1005／1007）は
+  `0A000`、同一接続の後続文は成功、存在しない表でも応答は同一。
+- `psycopg_and_pg_null_params_match_literal_null`: nullable 列への NULL の INSERT／UPDATE、
+  型を宣言した NULL、NOT NULL 列は `23502`、比較の位置は同じ文をリテラル NULL で書いたときと
+  同じ SQLSTATE（現行値を直書きせず追従）、NULL と隣り合う `' OR '1'='1` は不透明な値のまま。
+- `three_clients_param_type_rejections_do_not_reveal_other_tenants`: 3 テナントで各拒否の
+  stderr が一致し表名・テナント id・値が出ない。他テナントの Private 行への宣言付き `UPDATE` は
+  存在しない id と同じ結果で行は不変。宣言の有無が `42P01` の応答を変えない。
+- `psycopg_natural_binary_params_outside_the_compat_table_fail_closed`: 既知の差分の固定（後述）。
+- 常時実行ガード `param_json_builders_are_strict`: JSON 組み立て補助が `\`・制御文字を拒否する。
+
+層 A（`wire24_declared_param_oids.rs`）には NULL の受理（宣言 OID 0／int4／705・INSERT／UPDATE）、
+NOT NULL への NULL（`23502`）、リテラル NULL との SQLSTATE 一致、型付き NULL の判定順、OID 混在、
+3 テナントでの拒否応答のバイト一致と受理タグ（他テナント行は存在しない行と同じ「0 件」）を追加した。
+
+### 先行 PR からの申し送りの結論
+
+- (a) OID 705: psycopg（`oid = 705` の Dumper）・node（`types=[705]`）とも OID 0 と同じ推論で一致した。
+- (b) 配列型 OID を宣言するドライバ: psycopg の `list[int]` と node の `types=[1007]` は Parse で
+  `0A000` になり、接続は維持される。配列パラメータを使うドライバは本実装では使えない（既知の制約）。
+- (c) NULL の値と binary format の判定順: binary 非対応スロットに format=1 の NULL を送ると `0A000` が
+  先に返る。PostgreSQL では NULL に format は無関係で差分だが、現行の fail-closed を層 A で固定した
+  （仕様準拠としての固定ではない）。
+- (d) 層 A の網羅の拡張と実クライアントの層 B 確認は本節のとおり。
+
+### 既知の差分（fail-closed に倒れているもので、WIRE-24 (1) を満たしたことにはしない）
+
+- psycopg の自然な binary 送信のうち `binary_param_kind` の互換表に載らない組（`float`→REAL 列、
+  `date`→DATE 列。`float`／`int`→NUMERIC 列も同類）は `0A000`。互換表の見直しは別課題（#2496 で据え置き）。
+- 比較の位置の NULL パラメータは、リテラル `<列> = NULL` と同じく `42703`（SQL-41 系の別課題。
+  WIRE-24 (3) の「比較は UNKNOWN」との差分）。
+- psql では型の宣言と NULL を送れない。node pg の型の宣言は内部結合に依存する。
+
+実行記録: 実行日 2026-10-17（UTC）・psql 18.6・psycopg 3.3.6・node v24 + pg 8.23.0 で
+`three_client_extended_e2e` の `--ignored` 14 件 green（#2440 の新規 6 件を含む）、層 A
+`wire24_declared_param_oids` 24 件 green。
 
 ## 分割実行 DML の 3 クライアント検証（Issue #1339・SQL-32）
 
