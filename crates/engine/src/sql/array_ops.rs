@@ -14,6 +14,7 @@
 //! 包含・重なりは片側を整列して二分探索する O((n+m) log n) で、要素数上限（1024）での
 //! 二乗の比較を避ける。
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use crate::catalog::ArrayElemType;
@@ -29,7 +30,7 @@ use crate::sql::udf_call::{
 
 /// 要素 1 個の比較用ビュー。整数系（integer・bigint・date・timestamp）は `Int`、浮動小数
 /// （real・double）は `Float`。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum Key<'a> {
     Int(i64),
     Float(f64),
@@ -37,9 +38,9 @@ pub(crate) enum Key<'a> {
     Bool(bool),
     Bytes(&'a [u8]),
     Uuid(crate::uuid::Uuid),
-    /// jsonb の正規化テキスト。全順序は等値と整合するバイト列順だけ（意味順は持たない）で、
-    /// 順序比較の演算子は束縛段が拒否する。
-    Json(&'a str),
+    /// jsonb の値等価の正規化テキスト（[`json_key`]。`1` と `1.0` は同じキー）。全順序は等値と
+    /// 整合するバイト列順だけ（意味順は持たない）で、順序比較の演算子は束縛段が拒否する。
+    Json(Cow<'a, str>),
 }
 
 impl Key<'_> {
@@ -129,6 +130,14 @@ fn operator_missing(op: &str) -> SqlSurfaceError {
     ))
 }
 
+/// jsonb テキストの比較キー。格納形（記法を保つ `canonicalize_jsonb_text`）ではなく、行コーデックの
+/// 配列等価と同じ値等価の正規化（`canonical_equality_text`）を使う。不正な値は fail-closed。
+fn json_key<'a>(s: &str) -> Result<Key<'a>, SqlSurfaceError> {
+    crate::json::canonical_equality_text(s)
+        .map(|t| Key::Json(Cow::Owned(t)))
+        .map_err(|_| internal("jsonb array element is not valid JSON"))
+}
+
 /// 配列値を要素ごとの比較用ビューへ写す（NULL 要素は `None`）。比較器を持たない要素型は
 /// 束縛段が拒否済みのため、ここへ来たら内部エラー。
 pub(crate) fn array_keys(a: &ArrayValue) -> Result<Vec<Option<Key<'_>>>, SqlSurfaceError> {
@@ -146,7 +155,16 @@ pub(crate) fn array_keys(a: &ArrayValue) -> Result<Vec<Option<Key<'_>>>, SqlSurf
         ArrayValue::Timestamp(v) => map(v, |t| Key::Int(*t)),
         ArrayValue::Uuid(v) => map(v, |u| Key::Uuid(*u)),
         ArrayValue::Bytea(v) => map(v, |b| Key::Bytes(b.as_slice())),
-        ArrayValue::Jsonb(v) => map(v, |s| Key::Json(s.as_str())),
+        ArrayValue::Jsonb(v) => {
+            let mut out = Vec::with_capacity(v.len());
+            for e in v {
+                out.push(match e {
+                    Some(s) => Some(json_key(s)?),
+                    None => None,
+                });
+            }
+            out
+        }
         ArrayValue::Numeric(_) | ArrayValue::Json(_) | ArrayValue::Enum(_) => {
             return Err(internal("array element type has no comparator"))
         }
@@ -185,7 +203,7 @@ pub(crate) fn compare_arrays(a: &[Option<Key<'_>>], b: &[Option<Key<'_>>]) -> Or
 
 /// `container` の非 NULL 要素を整列した列（包含・重なりの二分探索用）。
 fn sorted_non_null<'a>(items: &[Option<Key<'a>>]) -> Vec<Key<'a>> {
-    let mut v: Vec<Key<'a>> = items.iter().flatten().copied().collect();
+    let mut v: Vec<Key<'a>> = items.iter().flatten().cloned().collect();
     v.sort_by(key_cmp);
     v
 }
@@ -409,7 +427,9 @@ fn check_lhs_compatible(kind: CastKind, elem: ArrayElemType) -> Result<(), SqlSu
 /// 左辺の種別から、型なしリテラルの配列を解釈する要素の CAST 型を決める。
 fn lhs_elem_cast_type(kind: CastKind) -> Result<CastType, SqlSurfaceError> {
     Ok(match kind {
-        CastKind::Int4 => CastType::Int4,
+        // smallint[] の配列型は無いため、smallint 左辺の型なしリテラル配列は integer[] として解釈する
+        // （値は整数どうしで正確に比較される）。
+        CastKind::Int2 | CastKind::Int4 => CastType::Int4,
         CastKind::Int8 => CastType::Int8,
         CastKind::Float4 => CastType::Float4,
         CastKind::Float8 => CastType::Float8,
@@ -587,7 +607,7 @@ fn value_key<'v>(v: &'v ExprValue<'_>) -> Result<Option<Key<'v>>, SqlSurfaceErro
         ExprValue::Timestamp(t) => Key::Int(*t),
         ExprValue::Uuid(u) => Key::Uuid(*u),
         ExprValue::Bytes(b) => Key::Bytes(b.as_ref()),
-        ExprValue::Json(s) => Key::Json(s.as_ref()),
+        ExprValue::Json(s) => json_key(s.as_ref())?,
         _ => {
             return Err(internal(
                 "ANY/ALL operand evaluated to an unsupported value",

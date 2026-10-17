@@ -2176,6 +2176,64 @@ fn numeric_column_number_compare_as_filter(
     is_numeric.then(|| DeclarativeFilter::compare_numeric_literal(col.clone(), cmp, number.clone()))
 }
 
+/// `[Expression(l < r)] OR [Expression(l > r)]`（`a <> b` の脱糖形）が配列どうしの比較なら、
+/// 等値の否定 `ArrayCmpOp::Ne` の束縛式へ畳む。配列でなければ `None`（予算は消費しない。
+/// 呼び出し元が従来どおり各分岐を束縛する）。`where_negation` が `Eq` を `Lt`／`Gt` の
+/// 2 分岐へ展開する形に対応する（TABLE-35・Issue #1603）。
+fn bind_array_inequality_pair(
+    branches: &[Vec<WherePredicate>],
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Option<crate::sql::udf_call::BoundExpr> {
+    use crate::sql::udf_call::{ArrayCmpOp, BinOp, BoundExpr};
+    let [first, second] = branches else {
+        return None;
+    };
+    let (
+        [WherePredicate::Expression(Expr::Binary {
+            op: BinOp::Lt,
+            lhs: l1,
+            rhs: r1,
+        })],
+        [WherePredicate::Expression(Expr::Binary {
+            op: BinOp::Gt,
+            lhs: l2,
+            rhs: r2,
+        })],
+    ) = (first.as_slice(), second.as_slice())
+    else {
+        return None;
+    };
+    if l1 != l2 || r1 != r2 {
+        return None;
+    }
+    let eq = Expr::Binary {
+        op: BinOp::Eq,
+        lhs: l1.clone(),
+        rhs: r1.clone(),
+    };
+    let mut probe = *node_budget;
+    let (bound, _) = crate::sql::udf_call::bind_expr(&eq, schema, udfs, &mut probe).ok()?;
+    match bound {
+        BoundExpr::ArrayCompare {
+            op: ArrayCmpOp::Eq,
+            elem,
+            lhs,
+            rhs,
+        } => {
+            *node_budget = probe;
+            Some(BoundExpr::ArrayCompare {
+                op: ArrayCmpOp::Ne,
+                elem,
+                lhs,
+                rhs,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// [`bind_where_predicates`]・[`bind_check_predicates`] の再帰本体。トップレベルの
 /// 述語列だけでなく、[`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも
 /// 自分自身を再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。
@@ -2312,6 +2370,13 @@ fn bind_where_predicates_recursive(
                 });
             }
             WherePredicate::Or(branches) => {
+                // 配列の `<>`／`NOT a = b` は `where_negation` が `a < b OR a > b` へ脱糖するが、
+                // 順序比較を持たない要素型（jsonb）で拒否されないよう、等値の否定
+                // （`ArrayCmpOp::Ne`）の単一述語へ戻す（TABLE-35・Issue #1603）。
+                if let Some(ne) = bind_array_inequality_pair(branches, schema, udfs, node_budget) {
+                    expr_filters.push(ne);
+                    continue;
+                }
                 // TASK-208・SQL-24（Issue #912）: 各分岐を自分自身へ再帰的に
                 // 束縛する。`equality_ordinal` は再帰全体で共有するカウンタを
                 // そのまま渡し（ソース出現順＝深さ優先・左から右で数える契約）、

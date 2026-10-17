@@ -320,6 +320,38 @@ fn element_types_are_compared_exactly() {
     );
 }
 
+/// TABLE-35・Issue #1603: jsonb 要素は値として等価比較し（`1` と `1.0` は等しい）、`<>`／`NOT =` は
+/// 順序比較へ脱糖せず等値の否定で評価する。smallint の左辺も型なしリテラル配列と比較できる。
+#[test]
+fn jsonb_elements_use_value_equality_and_inequality_needs_no_ordering() {
+    let (path, _g) = setup("arr-pred-jsonb-eq");
+    let core = core_at(&path);
+    let all = vec![1, 2, 3];
+    for p in [
+        "ARRAY['1'::jsonb] = ARRAY['1.0'::jsonb]",
+        "ARRAY['1'::jsonb] @> ARRAY['1.0'::jsonb]",
+        "ARRAY['1.0'::jsonb] <@ ARRAY['1'::jsonb, '2'::jsonb]",
+        "ARRAY['1'::jsonb] && ARRAY['1.0'::jsonb]",
+        "'1'::jsonb = ANY(ARRAY['1.0'::jsonb])",
+        "'1'::jsonb = ALL(ARRAY['1.0'::jsonb])",
+        "ARRAY['1'::jsonb] <> ARRAY['2'::jsonb]",
+        "ARRAY['1'::jsonb] != ARRAY['2'::jsonb]",
+        "NOT ARRAY['1'::jsonb] = ARRAY['2'::jsonb]",
+        "NOT ARRAY['1'::jsonb] <> ARRAY['1.0'::jsonb]",
+        "CAST(1 AS smallint) = ANY('{1,2}')",
+        "CAST(3 AS smallint) <> ALL('{1,2}')",
+    ] {
+        assert_eq!(matching(&core, p), all, "{p}");
+    }
+    for p in [
+        "ARRAY['1'::jsonb] <> ARRAY['1.0'::jsonb]",
+        "NOT ARRAY['1'::jsonb] = ARRAY['1.0'::jsonb]",
+        "ARRAY['1'::jsonb] = ARRAY['2'::jsonb]",
+    ] {
+        assert_eq!(matching(&core, p), NONE, "{p}");
+    }
+}
+
 /// TABLE-35・Issue #1603: 未対応形は fail-closed（サブクエリ形・否定の押し下げ・CHECK・上限）。
 #[test]
 fn unsupported_forms_fail_closed() {
