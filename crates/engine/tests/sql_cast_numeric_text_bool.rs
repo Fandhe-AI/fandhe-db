@@ -849,3 +849,19 @@ fn value_conversions_never_reach_all_tenant_validation_paths() {
     .unwrap_err();
     assert_eq!(e.wire_code(), "0A000");
 }
+
+#[test]
+fn numeric_cast_in_aggregate_select_never_fails_internally() {
+    // 集計 SELECT（GROUP BY あり・なし）で numeric 変換値を射影しようとしても、内部エラー
+    // （XX000）ではなく構文・機能未対応として fail-closed に拒否される。
+    let (core, _g) = setup("cast-numeric-agg");
+    for sql in [
+        "SELECT CAST(i4 AS numeric) FROM c GROUP BY i4",
+        "SELECT CAST(i4 AS numeric), count(*) FROM c GROUP BY i4",
+        "SELECT count(*) + CAST(i4 AS numeric) FROM c GROUP BY i4",
+        "SELECT count(*) + CAST(1 AS numeric) FROM c",
+    ] {
+        let e = select_as(&core, "alice", sql).unwrap_err();
+        assert_ne!(e.wire_code(), "XX000", "{sql}: {e:?}");
+    }
+}
