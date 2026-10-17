@@ -1322,7 +1322,7 @@ fn name_collides_with_primary_key(schema: &TableSchema, table: &str, name: &str)
 
 /// カタログ値（エンコード済みバイト列）のバイト長上限。デコード前に検証し、
 /// 無制限な文字列アロケーションを防ぐ。
-const MAX_CATALOG_VALUE_LEN: usize = 1024 * 1024;
+const MAX_CATALOG_VALUE_LEN: usize = 2 * 1024 * 1024;
 
 /// [`Storage::list_tables`] が返せるテーブル数の上限（無制限 `Vec` 確保を避ける。
 /// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
@@ -3629,14 +3629,14 @@ impl TimeDefault {
 /// （`.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。
 pub const MAX_COLUMN_DEFAULT_LEN: usize = 1024;
 
-// `MAX_COLUMN_DEFAULT_LEN` を 16 進符号化（最大 2 倍）したうえで
-// `MAX_COLUMN_COUNT` 列ぶん連結しても、カタログ値全体の上限
+// `MAX_COLUMN_DEFAULT_LEN` を 16 進符号化（最大 2 倍）した `default` と `fill`
+// （v14。Issue #1627）の 2 フィールドを `MAX_COLUMN_COUNT` 列ぶん連結しても、カタログ値全体の上限
 // （`MAX_CATALOG_VALUE_LEN`）に十分収まることをコンパイル時に固定する
 // （プレフィックス 1 バイト・区切り文字・列名等の余地として 500,000 バイトの
 // 余裕を残す）。
 const _: () = assert!(
-    MAX_COLUMN_DEFAULT_LEN * 2 * MAX_COLUMN_COUNT + 500_000 <= MAX_CATALOG_VALUE_LEN,
-    "MAX_COLUMN_DEFAULT_LEN * 2 * MAX_COLUMN_COUNT must leave slack under MAX_CATALOG_VALUE_LEN"
+    MAX_COLUMN_DEFAULT_LEN * 2 * 2 * MAX_COLUMN_COUNT + 500_000 <= MAX_CATALOG_VALUE_LEN,
+    "MAX_COLUMN_DEFAULT_LEN * 2 fields * 2 * MAX_COLUMN_COUNT must leave slack under MAX_CATALOG_VALUE_LEN"
 );
 
 impl ColumnDefault {
@@ -17729,6 +17729,25 @@ mod tests {
         );
         assert_eq!(decoded.columns[2].fill_value, None);
         assert_eq!(encode_schema(&decoded).expect("re-encode"), bytes);
+    }
+
+    /// 幅広テーブルで `default`／`fill` が全列で最大長かつ食い違っても v14 の
+    /// エンコードが上限内で成功し、往復する（Issue #1627 Bugbot 指摘）。
+    #[test]
+    fn v14_widest_table_with_max_len_default_and_fill_encodes() {
+        let cols = (0..MAX_COLUMN_COUNT)
+            .map(|i| {
+                ColumnDef::new(format!("c{i}"), ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("a".repeat(MAX_COLUMN_DEFAULT_LEN)))
+                    .with_fill_value(Some(ColumnDefault::Text(
+                        "b".repeat(MAX_COLUMN_DEFAULT_LEN),
+                    )))
+            })
+            .collect::<Vec<_>>();
+        let schema = TableSchema::new("wide", cols);
+        let bytes = encode_schema(&schema).expect("encode");
+        assert!(bytes.len() <= MAX_CATALOG_VALUE_LEN);
+        assert_eq!(decode_schema("wide", &bytes).expect("decode"), schema);
     }
 
     /// 主キー明示名・UNIQUE・FK と v14 を組み合わせても往復する。
