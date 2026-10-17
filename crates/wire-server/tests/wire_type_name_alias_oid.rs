@@ -29,7 +29,8 @@ fn expected_types() -> Vec<(&'static str, i32, i16)> {
         ("c", 20, 8),
         ("d", 700, 4),
         ("e", 701, 8),
-        ("f", 25, -1),
+        // 配列は要素型の配列型 OID を公告する（Issue #1606。INTEGER[] は 1007）。
+        ("f", 1007, -1),
         ("g", 20, 8),
         // Issue #2304: BOOL・FLOAT・FLOAT(24)・FLOAT(53)・TIMESTAMP WITHOUT TIME ZONE。
         ("h", 16, 1),

@@ -28,7 +28,8 @@ float／日付／バイナリ／UUID／JSON 列をネイティブ型へ復元で
 | --- | --- | --- | --- | --- |
 | `Id` | `Numeric` | 1700 | -1 | `numeric` |
 | `Text` | `Text` | 25 | -1 | `text` |
-| `Vector(_)`／`Array(_)`／`Enum(_)`／`Computed{ty: None}`（ベクトル式など型なしの式列） | `Text` | 25 | -1 | `text` |
+| `Vector(_)`／`Enum(_)`／`Array(<ENUM>)`／`Computed{ty: None}`（ベクトル式など型なしの式列） | `Text` | 25 | -1 | `text` |
+| `Array(<要素型>)`（次元数は無関係。Issue #1606・TABLE-35） | `TextArray`／`BoolArray`／`Int4Array`／`Int8Array`／`Float4Array`／`Float8Array`／`DateArray`／`TimestampArray`／`UuidArray`／`NumericArray`／`ByteaArray`／`JsonArray`／`JsonbArray` | 1009／1000／1007／1016／1021／1022／1182／1115／2951／1231／1001／199／3807 | -1 | `_text`／`_bool`／`_int4`／`_int8`／`_float4`／`_float8`／`_date`／`_timestamp`／`_uuid`／`_numeric`／`_bytea`／`_json`／`_jsonb` |
 | `Computed{ty: Some(t)}` | `t` の写像と同じ（Issue #1173。下記「集計・式列の型」参照） | — | — | — |
 | `SmallInt` | `Int2` | 21 | 2 | `int2`（Issue #1561・TABLE-30） |
 | `Integer` | `Int4` | 23 | 4 | `int4` |
@@ -70,7 +71,7 @@ variant 名・型名は既存 `Int4`/`Int8` に倣い PostgreSQL の `typname` �
 | 項目 | 判断 | 理由 |
 | ---- | ---- | ---- |
 | `id` 列 | `numeric`（OID 1700, typlen -1）のまま | engine の行 ID は `u64` 全域（`u64::MAX` を含む）を有効値とし、符号付き 64bit の `int8`（OID 20）ではこれを表現できない（PR #210 レビュー指摘）。受入基準 3（既存の `id` 公告不変）とも整合する |
-| `VECTOR(N)`／`ARRAY`／`ENUM` | `text`（OID 25, typlen -1）のまま | 専用 OID を持たない実装既定値。値そのものはテキスト表現（`[v1,v2,...]`・`{a,b}`・ラベル文字列）のまま変わらない |
+| `VECTOR(N)`／`ENUM` | `text`（OID 25, typlen -1）のまま（`ARRAY` は Issue #1606 で配列型 OID へ更新済み。下記「Issue #1606 追記」） | 専用 OID を持たない実装既定値。値そのものはテキスト表現（`[v1,v2,...]`・`{a,b}`・ラベル文字列）のまま変わらない |
 | `ColumnMeta::Computed`（式・集計結果） | 本 Issue 時点では `text`（OID 25）のまま。**Issue #1173 で型付き OID へ更新済み**（下記「集計・式列の型」） | 静的な型情報を持たなかったため（当時） |
 | バイナリ形式（WIRE-14） | `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／`BOOLEAN`／`BYTEA`／`UUID` は Issue #1172、`TIME` は Issue #1571（0 時起点マイクロ秒の 8 バイト BE）でバイナリ対応（`docs/design/wire-binary-format.md`「Issue #1172 追記」「Issue #1571 追記」参照）。`NUMERIC`／`id` は Issue #2442（結果）・#2443（パラメータ）でバイナリ対応（WIRE-26。実クライアントでの値一致は Issue #2445）。`DATE`／`TIMESTAMP`／`JSON`／`JSONB`／配列／`ENUM`／`VECTOR`／`Computed{ty: None}` は引き続き `supports_binary` / `column_binary_support` が `false`（fail-closed・`0A000`） | 対応拡大は WIRE-14・TASK-218・Issue #1172 で実施済み。float4 の縮小は無損失検査つき |
 | typmod | `VARCHAR(n)`／`CHAR(n)` は `n + 4`、他は `-1` | Issue #1565（TABLE-31）。`NUMERIC(p,s)` の typmod 符号化は未採用。長さの異なる TEXT 系を合成する集合演算は左の長さを外して `-1`（過小公告の防止）。`CHAR(n)` は bpchar（OID 1042）で、text／varchar スロットへの宣言 OID 1042 のバイナリ入力は末尾空白の意味差があるため `0A000` のまま |
@@ -142,3 +143,20 @@ engine の `ColumnMeta::Computed` に静的な結果型 `ty: Option<ColumnType>`
 
 NoSQL（HTTP）表層の `columns[].type` は NOSQL-11 の契約に従い `Computed` を `"text"`
 固定のまま据え置く（wire 側との意図的な非対称。計算列の型名化は spec 判断が必要）。
+
+## Issue #1606 追記（配列型 OID の公告）
+
+親 #1601・TABLE-35 (3)(4)・WIRE-13・WIRE-14・WIRE-24 のポインタ。
+
+- **公告**: 配列列と、結果型が確定する配列式（`ARRAY[...]`・スライス・`CAST(.. AS t[])`）は要素型ごとの
+  PostgreSQL 配列型 OID を公告する（`WireType` に 13 variant を追加。typlen は -1、typmod は -1）。
+  次元数は OID に影響しない（`INTEGER[][]` も 1007）。クライアントから見える OID が 25 から変わるため
+  BREAKING（`feat(wire)!`）。NoSQL（HTTP）の `columns[].type` は独自の型名のまま不変。
+- **ENUM[]**: `ENUM` のスカラーと同じく text（25）のまま。PostgreSQL では型ごとに動的な OID になり、
+  組み込みの OID が無いため。PostgreSQL との差分として据え置く。
+- **Parse の宣言 OID**: `WireType::from_oid` は配列 OID も引けるが、`declared_param_type()` を
+  `Option` 化して配列は `None` とし、宣言された配列 OID は従来どおり `0A000`（WIRE-24）。
+  ParameterDescription は配列列のスロットで配列 OID を返す（テキスト形式のパラメータ受理は不変）。
+- **バイナリ**: 配列は `supports_binary = false`（TABLE-35 (4)・WIRE-14）。結果形式 1 は `0A000` で接続は維持。
+- **制約**: `column_type_for_expr_type` が型を返さない配列式（CASE などで配列を返すもの）は
+  `Computed{ty: None}` のままで text（25）にフォールバックする。`numeric(p,s)[]` の typmod も `-1`。

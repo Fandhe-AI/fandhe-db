@@ -51,7 +51,7 @@ fn expected_types() -> Vec<(&'static str, i32, i16)> {
         ("doc", 114, -1),
         ("docb", 3802, -1),
         ("price", 1700, -1),
-        ("tags", 25, -1),
+        ("tags", 1009, -1),
         ("mood", 25, -1),
         // 長さなし VARCHAR は OID 1043・typlen -1（型修飾子は常に -1。Issue #2305）。
         ("vc", 1043, -1),

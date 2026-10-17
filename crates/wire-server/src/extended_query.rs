@@ -491,7 +491,8 @@ fn declared_param_type_for_oid(oid: i32) -> Result<Option<DeclaredParamType>, Un
         return Ok(None);
     }
     result_encoder::WireType::from_oid(oid)
-        .map(|ty| Some(ty.declared_param_type()))
+        .and_then(|ty| ty.declared_param_type())
+        .map(Some)
         .ok_or(UnsupportedOid)
 }
 

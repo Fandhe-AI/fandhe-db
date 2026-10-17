@@ -51,9 +51,11 @@
 //! - `ColumnMeta::Scalar{ty: Uuid}` → `uuid`（OID 2950, typlen 16。同上）
 //! - `ColumnMeta::Scalar{ty: Json}` → `json`（OID 114, typlen -1。同上）
 //! - `ColumnMeta::Scalar{ty: Jsonb}` → `jsonb`（OID 3802, typlen -1。同上）
-//! - `ColumnMeta::Scalar{ty: Array(_)}`／`Scalar{ty: Enum(_)}` → `text`
-//!   （OID 25。専用 OID は未策定のまま `text` 表現を公告する。受入基準 3
-//!   の対象外＝据え置き判断。WIRE-13・TASK-200・Issue #895）
+//! - `ColumnMeta::Scalar{ty: Array(<要素型>)}`／式の配列結果 → PostgreSQL の配列型 OID
+//!   （`_int4`=1007・`_text`=1009 など 13 種。typlen -1。次元数は OID に影響しない。
+//!   テキスト形式のみで、バイナリは `0A000`。TABLE-35・WIRE-13・WIRE-14・Issue #1606）
+//! - `ColumnMeta::Scalar{ty: Enum(_)}`／`Array(<ENUM>)` → `text`
+//!   （OID 25。ENUM は組み込み OID を持たない据え置き判断。WIRE-13・TASK-200・Issue #895）
 //! - `ColumnMeta::Scalar{ty: Numeric{..}}` → `numeric`（OID 1700, typlen -1。
 //!   値は `Cell::Numeric`（`Decimal` の正規テキスト）のテキスト表現。
 //!   バイナリ形式は PostgreSQL の `numeric_send` 形式〔TASK-197・Issue #885・
@@ -494,7 +496,7 @@ wire_type_enum! {
         /// へ変更しない据え置き判断は WIRE-13・TASK-200・Issue #895 参照。
         Numeric,
         /// `ColumnMeta::Scalar{ty: Text}`／`Scalar{ty: Vector(_)}`／
-        /// `Scalar{ty: Array(_)}`／`Scalar{ty: Enum(_)}`／`Computed{ty: None}`。
+        /// `Scalar{ty: Array(<ENUM>)}`／`Scalar{ty: Enum(_)}`／`Computed{ty: None}`。
         /// 専用 OID を持たない型はすべてここへ写像する（WIRE-13・TASK-200・
         /// Issue #895 の据え置き判断）。
         Text,
@@ -556,6 +558,45 @@ wire_type_enum! {
         /// `ColumnMeta::Scalar{ty: Jsonb}`（同上）。テキスト表現は正規化済み
         /// テキスト。
         Jsonb,
+        /// `ColumnMeta::Scalar{ty: Array(<text>)}`（`_text`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        TextArray,
+        /// `ColumnMeta::Scalar{ty: Array(<boolean>)}`（`_bool`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        BoolArray,
+        /// `ColumnMeta::Scalar{ty: Array(<integer>)}`（`_int4`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        Int4Array,
+        /// `ColumnMeta::Scalar{ty: Array(<bigint>)}`（`_int8`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        Int8Array,
+        /// `ColumnMeta::Scalar{ty: Array(<real>)}`（`_float4`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        Float4Array,
+        /// `ColumnMeta::Scalar{ty: Array(<double precision>)}`（`_float8`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        Float8Array,
+        /// `ColumnMeta::Scalar{ty: Array(<date>)}`（`_date`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        DateArray,
+        /// `ColumnMeta::Scalar{ty: Array(<timestamp>)}`（`_timestamp`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        TimestampArray,
+        /// `ColumnMeta::Scalar{ty: Array(<uuid>)}`（`_uuid`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        UuidArray,
+        /// `ColumnMeta::Scalar{ty: Array(<numeric>)}`（`_numeric`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        NumericArray,
+        /// `ColumnMeta::Scalar{ty: Array(<bytea>)}`（`_bytea`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        ByteaArray,
+        /// `ColumnMeta::Scalar{ty: Array(<json>)}`（`_json`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        JsonArray,
+        /// `ColumnMeta::Scalar{ty: Array(<jsonb>)}`（`_jsonb`。TABLE-35・WIRE-13・Issue #1606）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        JsonbArray,
     }
 }
 
@@ -584,6 +625,19 @@ impl WireType {
             WireType::Uuid => 2950,
             WireType::Json => 114,
             WireType::Jsonb => 3802,
+            WireType::TextArray => 1009,
+            WireType::BoolArray => 1000,
+            WireType::Int4Array => 1007,
+            WireType::Int8Array => 1016,
+            WireType::Float4Array => 1021,
+            WireType::Float8Array => 1022,
+            WireType::DateArray => 1182,
+            WireType::TimestampArray => 1115,
+            WireType::UuidArray => 2951,
+            WireType::NumericArray => 1231,
+            WireType::ByteaArray => 1001,
+            WireType::JsonArray => 199,
+            WireType::JsonbArray => 3807,
         }
     }
 
@@ -596,7 +650,20 @@ impl WireType {
             | WireType::Bpchar
             | WireType::Bytea
             | WireType::Json
-            | WireType::Jsonb => -1,
+            | WireType::Jsonb
+            | WireType::TextArray
+            | WireType::BoolArray
+            | WireType::Int4Array
+            | WireType::Int8Array
+            | WireType::Float4Array
+            | WireType::Float8Array
+            | WireType::DateArray
+            | WireType::TimestampArray
+            | WireType::UuidArray
+            | WireType::NumericArray
+            | WireType::ByteaArray
+            | WireType::JsonArray
+            | WireType::JsonbArray => -1,
             WireType::Int2 => 2,
             WireType::Int4 | WireType::Float4 | WireType::Date => 4,
             WireType::Int8
@@ -632,6 +699,19 @@ impl WireType {
             WireType::Uuid => "uuid",
             WireType::Json => "json",
             WireType::Jsonb => "jsonb",
+            WireType::TextArray => "_text",
+            WireType::BoolArray => "_bool",
+            WireType::Int4Array => "_int4",
+            WireType::Int8Array => "_int8",
+            WireType::Float4Array => "_float4",
+            WireType::Float8Array => "_float8",
+            WireType::DateArray => "_date",
+            WireType::TimestampArray => "_timestamp",
+            WireType::UuidArray => "_uuid",
+            WireType::NumericArray => "_numeric",
+            WireType::ByteaArray => "_bytea",
+            WireType::JsonArray => "_json",
+            WireType::JsonbArray => "_jsonb",
         }
     }
 
@@ -649,28 +729,42 @@ impl WireType {
     /// 増えたらコンパイルエラーで写像漏れを検出する。「持つ型」の判定は本 enum が単一情報源で、
     /// engine 側の宣言型は第 2 の型表ではない。
     #[deny(clippy::wildcard_enum_match_arm)]
-    pub(crate) fn declared_param_type(self) -> engine::sql::params::DeclaredParamType {
+    pub(crate) fn declared_param_type(self) -> Option<engine::sql::params::DeclaredParamType> {
         use engine::sql::params::DeclaredParamType as D;
         match self {
-            WireType::Numeric => D::Numeric,
-            WireType::Text => D::Text,
-            WireType::Varchar => D::Varchar,
-            WireType::Bpchar => D::Bpchar,
-            WireType::Int2 => D::Int2,
-            WireType::Int4 => D::Int4,
-            WireType::Int8 => D::Int8,
-            WireType::Bool => D::Bool,
-            WireType::Float4 => D::Float4,
-            WireType::Float8 => D::Float8,
-            WireType::Date => D::Date,
-            WireType::Timestamp => D::Timestamp,
-            WireType::TimestampTz => D::TimestampTz,
-            WireType::Interval => D::Interval,
-            WireType::Time => D::Time,
-            WireType::Bytea => D::Bytea,
-            WireType::Uuid => D::Uuid,
-            WireType::Json => D::Json,
-            WireType::Jsonb => D::Jsonb,
+            WireType::Numeric => Some(D::Numeric),
+            WireType::Text => Some(D::Text),
+            WireType::Varchar => Some(D::Varchar),
+            WireType::Bpchar => Some(D::Bpchar),
+            WireType::Int2 => Some(D::Int2),
+            WireType::Int4 => Some(D::Int4),
+            WireType::Int8 => Some(D::Int8),
+            WireType::Bool => Some(D::Bool),
+            WireType::Float4 => Some(D::Float4),
+            WireType::Float8 => Some(D::Float8),
+            WireType::Date => Some(D::Date),
+            WireType::Timestamp => Some(D::Timestamp),
+            WireType::TimestampTz => Some(D::TimestampTz),
+            WireType::Interval => Some(D::Interval),
+            WireType::Time => Some(D::Time),
+            WireType::Bytea => Some(D::Bytea),
+            WireType::Uuid => Some(D::Uuid),
+            WireType::Json => Some(D::Json),
+            WireType::Jsonb => Some(D::Jsonb),
+            // 配列型の宣言は engine に宣言型が無く、従来どおり `0A000`（WIRE-24・Issue #1606）。
+            WireType::TextArray
+            | WireType::BoolArray
+            | WireType::Int4Array
+            | WireType::Int8Array
+            | WireType::Float4Array
+            | WireType::Float8Array
+            | WireType::DateArray
+            | WireType::TimestampArray
+            | WireType::UuidArray
+            | WireType::NumericArray
+            | WireType::ByteaArray
+            | WireType::JsonArray
+            | WireType::JsonbArray => None,
         }
     }
 
@@ -711,6 +805,20 @@ impl WireType {
             // `DATE`／`TIMESTAMP`／`JSON`／`JSONB` は WIRE-14 の非対応型のまま
             // fail-closed で `0A000` に拒否する。
             WireType::Date | WireType::Timestamp | WireType::Json | WireType::Jsonb => false,
+            // 配列のバイナリ形式は対象外（TABLE-35 (4)・WIRE-14）。fail-closed で `0A000`。
+            WireType::TextArray
+            | WireType::BoolArray
+            | WireType::Int4Array
+            | WireType::Int8Array
+            | WireType::Float4Array
+            | WireType::Float8Array
+            | WireType::DateArray
+            | WireType::TimestampArray
+            | WireType::UuidArray
+            | WireType::NumericArray
+            | WireType::ByteaArray
+            | WireType::JsonArray
+            | WireType::JsonbArray => false,
         }
     }
 }
@@ -883,9 +991,34 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         // `ARRAY`（Issue #888）・`ENUM`（Issue #890）は据え置き判断
         // （WIRE-13・TASK-200・Issue #895）により専用 OID を持たず、
         // text（`RowDescription`）で公告する。
-        engine::catalog::ColumnType::Array(_) | engine::catalog::ColumnType::Enum(_) => {
-            WireType::Text
-        }
+        // `ENUM` は組み込み OID を持たない据え置き判断のため text。`ARRAY[]` は要素型ごとの
+        // PostgreSQL 配列型 OID を公告する（次元数は無関係。TABLE-35・WIRE-13・Issue #1606）。
+        // `ENUM[]` は型ごとに動的 OID となるため `ENUM` と同じく text に倒す。
+        engine::catalog::ColumnType::Enum(_) => WireType::Text,
+        engine::catalog::ColumnType::Array(array_ty) => array_wire_type(array_ty.elem()),
+    }
+}
+
+/// 配列の要素型から配列型の [`WireType`] を引く（[`scalar_wire_type`] から呼ばれる。
+/// 次元数は OID に影響しない。TABLE-35・Issue #1606）。
+#[deny(clippy::wildcard_enum_match_arm)]
+fn array_wire_type(elem: engine::catalog::ArrayElemType) -> WireType {
+    use engine::catalog::ArrayElemType as E;
+    match elem {
+        E::Text => WireType::TextArray,
+        E::Bool => WireType::BoolArray,
+        E::Integer => WireType::Int4Array,
+        E::BigInt => WireType::Int8Array,
+        E::Real => WireType::Float4Array,
+        E::Double => WireType::Float8Array,
+        E::Date => WireType::DateArray,
+        E::Timestamp => WireType::TimestampArray,
+        E::Uuid => WireType::UuidArray,
+        E::Numeric { .. } => WireType::NumericArray,
+        E::Bytea => WireType::ByteaArray,
+        E::Json => WireType::JsonArray,
+        E::Jsonb => WireType::JsonbArray,
+        E::Enum => WireType::Text,
     }
 }
 
@@ -2572,7 +2705,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 19);
+        assert_eq!(WireType::ALL.len(), 32);
     }
 
     /// Parse の宣言 OID 写像（Issue #2436・WIRE-24 ポインタ）: 全 variant が OID から
@@ -2581,7 +2714,9 @@ mod tests {
     fn wire_type_round_trips_through_oid_and_declared_type() {
         for t in WireType::ALL {
             assert_eq!(WireType::from_oid(t.oid()), Some(t));
-            let _ = t.declared_param_type();
+            // 配列型は宣言型を持たず（None）、Parse では `0A000`（WIRE-24・Issue #1606）。
+            let is_array = t.pg_type_name().starts_with('_');
+            assert_eq!(t.declared_param_type().is_none(), is_array, "{t:?}");
         }
         assert_eq!(WireType::from_oid(0), None);
         assert_eq!(WireType::from_oid(-1), None);
@@ -2593,7 +2728,7 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 19] = [
+        let expected: [(WireType, i32, i16, &str); 32] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
@@ -2613,11 +2748,52 @@ mod tests {
             (WireType::Uuid, 2950, 16, "uuid"),
             (WireType::Json, 114, -1, "json"),
             (WireType::Jsonb, 3802, -1, "jsonb"),
+            (WireType::TextArray, 1009, -1, "_text"),
+            (WireType::BoolArray, 1000, -1, "_bool"),
+            (WireType::Int4Array, 1007, -1, "_int4"),
+            (WireType::Int8Array, 1016, -1, "_int8"),
+            (WireType::Float4Array, 1021, -1, "_float4"),
+            (WireType::Float8Array, 1022, -1, "_float8"),
+            (WireType::DateArray, 1182, -1, "_date"),
+            (WireType::TimestampArray, 1115, -1, "_timestamp"),
+            (WireType::UuidArray, 2951, -1, "_uuid"),
+            (WireType::NumericArray, 1231, -1, "_numeric"),
+            (WireType::ByteaArray, 1001, -1, "_bytea"),
+            (WireType::JsonArray, 199, -1, "_json"),
+            (WireType::JsonbArray, 3807, -1, "_jsonb"),
         ];
         for (wire_type, oid, typlen, name) in expected {
             assert_eq!(wire_type.oid(), oid, "oid mismatch for {name}");
             assert_eq!(wire_type.typlen(), typlen, "typlen mismatch for {name}");
             assert_eq!(wire_type.pg_type_name(), name, "name mismatch for {oid}");
+        }
+    }
+
+    /// 配列列・配列式の公告（TABLE-35・WIRE-13・Issue #1606）: 要素型ごとの配列 OID、
+    /// 次元数は OID に影響せず、ENUM[] は text、バイナリは非対応。
+    #[test]
+    fn array_columns_advertise_postgres_array_oids() {
+        use engine::catalog::{ArrayElemType as E, ArrayType, ColumnType};
+        let cases: [(E, i32); 3] = [(E::Integer, 1007), (E::Text, 1009), (E::Jsonb, 3807)];
+        for (elem, oid) in cases {
+            // 多次元宣言でも OID は 1 次元と同じ。
+            let array_ty = ArrayType::new(elem, 4)
+                .and_then(|t| t.with_ndims(2))
+                .expect("array type");
+            let ty = ColumnType::Array(array_ty);
+            let scalar = ColumnMeta::Scalar {
+                name: "a".to_string(),
+                ty: ty.clone(),
+            };
+            assert_eq!(column_wire_type(&scalar).oid(), oid);
+            assert_eq!(column_wire_type(&scalar).typlen(), -1);
+            assert_eq!(column_type_modifier(&scalar).ok(), Some(-1));
+            assert!(!column_binary_support(&scalar));
+            let computed = ColumnMeta::Computed {
+                name: "c".to_string(),
+                ty: Some(ty),
+            };
+            assert_eq!(column_wire_type(&computed).oid(), oid);
         }
     }
 
@@ -2711,13 +2887,12 @@ mod tests {
             WireType::Numeric
         );
 
-        // 据え置き判断（受入基準外）: `ARRAY`／`ENUM` は専用 OID を持たず
-        // `text` のまま。
+        // `ARRAY` は要素型の配列型 OID（Issue #1606）。`ENUM` は専用 OID を持たず `text` のまま。
         let array_ty = engine::catalog::ArrayType::new(engine::catalog::ArrayElemType::Text, 4)
             .expect("valid array type");
         assert_eq!(
             column_wire_type(&scalar("tags", ColumnType::Array(array_ty))),
-            WireType::Text
+            WireType::TextArray
         );
 
         let db_path = std::env::temp_dir().join(format!(
