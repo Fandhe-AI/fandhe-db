@@ -678,10 +678,11 @@ fn time_slot_binary_params() {
         let o = query(&mut s, ins, &[1083], &[1], &[Some(&bad.to_be_bytes())]);
         expect_err(o, "22008", &mut s);
     }
-    // 宣言 OID 不一致のバイナリは 0A000。
-    for declared in [20, 1114, 25] {
+    // 宣言 OID 不一致のバイナリ: 変換できる宣言（1114）は互換表の `0A000`、変換できない宣言
+    // （20・25）は Parse の変換可否判定（Issue #2437）で `42804`。
+    for (declared, code) in [(20, "42804"), (1114, "0A000"), (25, "42804")] {
         let o = query(&mut s, ins, &[declared], &[1], &[Some(&0i64.to_be_bytes())]);
-        expect_err(o, "0A000", &mut s);
+        expect_err(o, code, &mut s);
     }
     // テキスト形式の書式不正は 22007、範囲外は 22008（engine 経路の回帰）。
     let o = query(&mut s, ins, &[], &[0], &[Some(b"not-a-time")]);
@@ -765,10 +766,11 @@ fn timestamptz_slot_binary_params() {
         let o = query(&mut s, ins, &[1184], &[1], &[Some(&bad.to_be_bytes())]);
         expect_err(o, "22008", &mut s);
     }
-    // 宣言 OID 不一致のバイナリは 0A000。
-    for declared in [20, 1114, 25] {
+    // 宣言 OID 不一致のバイナリ: 変換できる宣言（1114）は互換表の `0A000`、変換できない宣言
+    // （20・25）は Parse の変換可否判定（Issue #2437）で `42804`。
+    for (declared, code) in [(20, "42804"), (1114, "0A000"), (25, "42804")] {
         let o = query(&mut s, ins, &[declared], &[1], &[Some(&0i64.to_be_bytes())]);
-        expect_err(o, "0A000", &mut s);
+        expect_err(o, code, &mut s);
     }
     let after = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
     assert_eq!(before, after, "no side effect");
@@ -850,10 +852,11 @@ fn interval_slot_binary_params() {
         let o = query(&mut s, ins, &[1186], &[1], &[Some(&bad)]);
         expect_err(o, "22008", &mut s);
     }
-    // 宣言 OID 不一致のバイナリは 0A000。
-    for declared in [20, 1083, 25] {
+    // 宣言 OID 不一致のバイナリ: 変換できる宣言（1083）は互換表の `0A000`、変換できない宣言
+    // （20・25）は Parse の変換可否判定（Issue #2437）で `42804`。
+    for (declared, code) in [(20, "42804"), (1083, "0A000"), (25, "42804")] {
         let o = query(&mut s, ins, &[declared], &[1], &[Some(&bin(0, 0, 0))]);
-        expect_err(o, "0A000", &mut s);
+        expect_err(o, code, &mut s);
     }
     let after = query(&mut s, sel, &[], &[], &[]).expect("rows").0.len();
     assert_eq!(before, after, "no side effect");

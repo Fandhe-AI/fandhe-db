@@ -371,7 +371,7 @@ fn parse_with_declared_param_types_is_accepted_and_echoed() {
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
     let mut body = parse_body("s1", "SELECT id FROM documents WHERE body = $1 LIMIT 10", 1);
-    body.extend_from_slice(&23i32.to_be_bytes()); // int4 OID
+    body.extend_from_slice(&1043i32.to_be_bytes()); // varchar OID（TEXT 列へ暗黙変換できる型）
     send_length_prefixed_message(&mut stream, b'P', &body);
     let (kind, _) = read_message(&mut stream);
     assert_eq!(kind, b'1', "expected ParseComplete");
@@ -379,7 +379,7 @@ fn parse_with_declared_param_types_is_accepted_and_echoed() {
     send_length_prefixed_message(&mut stream, b'D', &describe_body(b'S', "s1"));
     let (kind, body) = read_message(&mut stream);
     assert_eq!(kind, b't', "expected ParameterDescription");
-    assert_eq!(body, [0, 1, 0, 0, 0, 23]);
+    assert_eq!(body, [0, 1, 0, 0, 4, 19]);
     let (kind, _) = read_message(&mut stream); // RowDescription
     assert_eq!(kind, b'T');
 

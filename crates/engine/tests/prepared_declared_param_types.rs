@@ -224,14 +224,14 @@ fn inferred_slot_type_is_not_overridden_by_declaration() {
     let prepared = core
         .parse_sql_prepared_with_declared(
             "SELECT id FROM docs WHERE n = $1 ORDER BY id LIMIT 5",
-            &[Some(D::Varchar)],
+            &[Some(D::Int8)],
         )
         .expect("parse");
     assert!(matches!(
         prepared.param_types().first(),
         Some(PreparedParamType::Column(_))
     ));
-    assert_eq!(prepared.declared_param_types(), &[Some(D::Varchar)]);
+    assert_eq!(prepared.declared_param_types(), &[Some(D::Int8)]);
 }
 
 /// 未参照番号（空文字列で残る位置）に宣言型付きで実値を Bind しても、生の Bind 値で

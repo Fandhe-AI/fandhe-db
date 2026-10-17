@@ -4160,23 +4160,24 @@ impl EngineCore {
         // 式内 `$n`（`1 + $1` 等）は文字列ダミーでは定数畳み込み／束縛の型検査に落ちるため、
         // 推論を parse より前に置く。推論不能（`42P18`）のときだけ、構文エラー（`42601`）を
         // 先に返す（PostgreSQL と同じ優先順位）ため文字列ダミーで parse を試す。
-        let param_types = match self.infer_param_types(&tokens, param_count, declared) {
-            Ok(types) => types,
-            Err(e @ crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype { .. }) => {
-                // 文字列ダミーの定数畳み込みで型エラーになっても途中終了しないよう、
-                // 構文エラー以外を無視して文全体を走査する。
-                let _guard = crate::sql::const_expr::defer_all_non_syntax_errors();
-                if let Err(syntax) =
-                    self.parse_tokens(crate::sql::params::substitute_dummy(&tokens))
-                {
-                    if syntax.wire_code() == "42601" {
-                        return Err(syntax);
+        let (param_types, param_checks) =
+            match self.infer_param_types(&tokens, param_count, declared) {
+                Ok(inferred) => inferred,
+                Err(e @ crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype { .. }) => {
+                    // 文字列ダミーの定数畳み込みで型エラーになっても途中終了しないよう、
+                    // 構文エラー以外を無視して文全体を走査する。
+                    let _guard = crate::sql::const_expr::defer_all_non_syntax_errors();
+                    if let Err(syntax) =
+                        self.parse_tokens(crate::sql::params::substitute_dummy(&tokens))
+                    {
+                        if syntax.wire_code() == "42601" {
+                            return Err(syntax);
+                        }
                     }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-            Err(e) => return Err(e),
-        };
+                Err(e) => return Err(e),
+            };
         let kinds: Vec<crate::sql::params::ParamLiteralKind> =
             param_types.iter().map(|t| t.literal_kind()).collect();
         // 等価述語のダミーフラグは種別確定後に求める（非 String 種別は
@@ -4197,6 +4198,19 @@ impl EngineCore {
             crate::datetime::reset_session_time_zone_read();
             self.parse_tokens(dummy_tokens)?
         };
+        // Issue #2437・WIRE-24 (1)(5): 宣言型と文脈の型の変換可否は、構造検証 parse の成功後に
+        // 判定する（構文 `42601`・名前解決 `42P01`／`42703` が型エラーより先に返る）。
+        // 宣言が無い番号は判定しない（従来と完全に同一）。出現順は番号の昇順で決定的。
+        for check in &param_checks {
+            let decl = usize::from(check.param)
+                .checked_sub(1)
+                .and_then(|i| declared.get(i))
+                .copied()
+                .flatten();
+            if let Some(d) = decl {
+                crate::sql::param_coerce::check_declared(d, check)?;
+            }
+        }
         let session_tz_dependent = crate::datetime::take_session_time_zone_read();
         Ok(PreparedSql {
             tokens,
@@ -4230,11 +4244,17 @@ impl EngineCore {
         tokens: &[crate::sql::lexer::Token],
         param_count: u16,
         declared: &[Option<crate::sql::params::DeclaredParamType>],
-    ) -> Result<Vec<crate::sql::params::PreparedParamType>, crate::sql::allowlist::SqlSurfaceError>
-    {
+    ) -> Result<
+        (
+            Vec<crate::sql::params::PreparedParamType>,
+            Vec<crate::sql::param_coerce::ParamCheck>,
+        ),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
         use crate::sql::allowlist::SqlSurfaceError;
         use crate::sql::exec::ColumnMeta;
         use crate::sql::lexer::Token;
+        use crate::sql::param_coerce::{context_kind, ParamCheck, ParamContextKind};
         use crate::sql::param_infer::ParamInference;
         use crate::sql::params::{ExprTarget, ParamPosition, PreparedParamType};
 
@@ -4268,7 +4288,8 @@ impl EngineCore {
 
         // 式内 `$n`（パターン 7）の推論結果を、番号ごとに集める。
         let segments = crate::sql::params::expr_param_segments(tokens);
-        let mut expr_results: Vec<Vec<ParamInference>> = vec![Vec::new(); usize::from(param_count)];
+        let mut expr_results: Vec<Vec<(ParamInference, Option<ParamContextKind>)>> =
+            vec![Vec::new(); usize::from(param_count)];
         for seg in &segments {
             let (table, root_col, for_set): (Option<&str>, Option<&str>, bool) = match &seg.target {
                 ExprTarget::Set(col) => (where_table.as_deref(), Some(col.as_str()), true),
@@ -4283,52 +4304,80 @@ impl EngineCore {
             };
             let root_type = table.zip(root_col).and_then(|(t, c)| column_type(t, c));
             let lookup = |name: &str| table.and_then(|t| column_type(t, name));
-            for (n, inferred) in
+            for (n, inferred, kind) in
                 crate::sql::param_infer::infer_segment(tokens, seg, for_set, root_type, &lookup)?
             {
                 if let Some(slot) = usize::from(n)
                     .checked_sub(1)
                     .and_then(|k| expr_results.get_mut(k))
                 {
-                    slot.push(inferred);
+                    slot.push((inferred, kind));
                 }
             }
         }
 
         let mut out: Vec<PreparedParamType> = Vec::with_capacity(usize::from(param_count));
+        // Issue #2437: 宣言型の変換可否判定の入力（出現ごとの位置種別と文脈の型）。
+        let mut checks: Vec<ParamCheck> = Vec::new();
         for (idx, positions) in crate::sql::params::infer_param_positions(tokens, param_count)
             .into_iter()
             .enumerate()
         {
             let mut resolved: Vec<PreparedParamType> = Vec::new();
+            let param_no = u16::try_from(idx.saturating_add(1)).unwrap_or(u16::MAX);
             for pos in &positions {
-                let ty = match pos {
-                    ParamPosition::Vector => PreparedParamType::VectorText,
-                    ParamPosition::Text => PreparedParamType::Text,
-                    ParamPosition::WhereColumn(col) => where_table
-                        .as_deref()
-                        .and_then(|t| column_type(t, col))
-                        .unwrap_or(PreparedParamType::Text),
-                    ParamPosition::SetColumn(col) => where_table
-                        .as_deref()
-                        .and_then(|t| column_type(t, col))
-                        .unwrap_or(PreparedParamType::Text),
-                    ParamPosition::InsertValue(k) => insert_target
-                        .as_ref()
-                        .and_then(|(table, cols)| {
-                            cols.get(*k).and_then(|col| column_type(table, col))
-                        })
-                        .unwrap_or(PreparedParamType::Text),
-                    // 式内の出現は下で `expr_results` から合流させる。
-                    ParamPosition::InExpr(_) => continue,
-                };
-                resolved.push(ty);
+                // 列が引けた位置だけ変換可否判定の対象にする（引けない位置は従来どおり
+                // `Text` へ倒し、判定せず後段の既存エラーに委ねる）。
+                let (resolved_ty, kind): (Option<PreparedParamType>, Option<ParamContextKind>) =
+                    match pos {
+                        ParamPosition::Vector => (
+                            Some(PreparedParamType::VectorText),
+                            Some(ParamContextKind::Operator),
+                        ),
+                        // `USING PLAN`／`USING OPERATION_ID` は本 DB 固有の句で判定対象外。
+                        ParamPosition::Text => (Some(PreparedParamType::Text), None),
+                        ParamPosition::WhereColumn(col) => (
+                            where_table.as_deref().and_then(|t| column_type(t, col)),
+                            Some(ParamContextKind::Operator),
+                        ),
+                        ParamPosition::SetColumn(col) => (
+                            where_table.as_deref().and_then(|t| column_type(t, col)),
+                            Some(ParamContextKind::Assignment),
+                        ),
+                        ParamPosition::InsertValue(k) => (
+                            insert_target.as_ref().and_then(|(table, cols)| {
+                                cols.get(*k).and_then(|col| column_type(table, col))
+                            }),
+                            Some(ParamContextKind::Assignment),
+                        ),
+                        // 式内の出現は下で `expr_results` から合流させる。
+                        ParamPosition::InExpr(_) => continue,
+                    };
+                if let (Some(t), Some(kind)) = (&resolved_ty, kind) {
+                    if let Some(ctx) = context_kind(t) {
+                        checks.push(ParamCheck {
+                            param: param_no,
+                            kind,
+                            ctx,
+                        });
+                    }
+                }
+                resolved.push(resolved_ty.unwrap_or(PreparedParamType::Text));
             }
             // 式内の出現。推論不能の出現は無視し、全出現が推論不能のときだけ `42P18`。
             let mut expr_indeterminate = false;
-            for inferred in expr_results.get(idx).map(Vec::as_slice).unwrap_or_default() {
+            for (inferred, kind) in expr_results.get(idx).map(Vec::as_slice).unwrap_or_default() {
                 match inferred {
-                    ParamInference::Known(t) => resolved.push(t.clone()),
+                    ParamInference::Known(t) => {
+                        if let (Some(kind), Some(ctx)) = (*kind, context_kind(t)) {
+                            checks.push(ParamCheck {
+                                param: param_no,
+                                kind,
+                                ctx,
+                            });
+                        }
+                        resolved.push(t.clone());
+                    }
                     ParamInference::Unresolved => resolved.push(PreparedParamType::Text),
                     ParamInference::Indeterminate => expr_indeterminate = true,
                 }
@@ -4374,7 +4423,7 @@ impl EngineCore {
                 }
             });
         }
-        Ok(out)
+        Ok((out, checks))
     }
 
     /// Bind（拡張クエリプロトコルの 'B' 種別。Issue #935・WIRE-12・TASK-217）:
