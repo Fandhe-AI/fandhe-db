@@ -45,7 +45,8 @@ use crate::catalog::{
 use crate::schema_limits::SchemaLimits;
 use crate::sql::allowlist::{
     InsertLiteral, SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
-    ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnSetNotNull,
+    ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnDropDefault,
+    ValidatedAlterTableAlterColumnSetDefault, ValidatedAlterTableAlterColumnSetNotNull,
     ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
     ValidatedAlterTableDropConstraint, ValidatedAlterTableRenameColumn, ValidatedCreateIndex,
     ValidatedCreateTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
@@ -416,6 +417,10 @@ pub enum AlterTableAction {
     AlterColumnType { column_name: String },
     /// `ALTER COLUMN <col> SET NOT NULL`（TABLE-39 (3)、Issue #1631）。**BREAKING CHANGE**: variant 追加。
     AlterColumnSetNotNull { column_name: String },
+    /// `ALTER COLUMN <col> SET DEFAULT <式>`（TABLE-39 (1)、Issue #1628）。**BREAKING CHANGE**: variant 追加。
+    AlterColumnSetDefault { column_name: String },
+    /// `ALTER COLUMN <col> DROP DEFAULT`（TABLE-39 (2)、Issue #1628）。**BREAKING CHANGE**: variant 追加。
+    AlterColumnDropDefault { column_name: String },
     /// `RENAME [COLUMN] <old> TO <new>`（TABLE-38 のポインタ、Issue #1619）。
     /// **BREAKING CHANGE**: variant 追加。
     RenameColumn {
@@ -639,9 +644,10 @@ pub(crate) fn execute_alter_table_add_check(
 /// `ParsedSql::AlterTable`（[`crate::sql::allowlist::ValidatedAlterTable`]）の
 /// 唯一の実行入口（Issue #1067・#1068・#1069）。`core.rs::EngineCore::
 /// execute_parsed_in_session` から `require_ddl_permission` 通過後に呼ばれ、
-/// 7 つの許可形状（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
+/// 許可形状（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
 /// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT`／`ADD [CONSTRAINT] FOREIGN KEY`／
-/// `DROP COLUMN`／`ALTER COLUMN TYPE`）
+/// `DROP COLUMN`／`ALTER COLUMN TYPE`／`ALTER COLUMN SET NOT NULL`／
+/// `ALTER COLUMN SET／DROP DEFAULT`〔Issue #1628〕／`RENAME COLUMN`）
 /// を対応する実行本体へ振り分ける（構文の許可リスト判定は `sql::allowlist` の
 /// 管轄、ディスパッチはここと `core.rs` の管轄という既存の責務分担を維持する）。
 pub(crate) fn execute_alter_table(
@@ -676,6 +682,12 @@ pub(crate) fn execute_alter_table(
         }
         crate::sql::allowlist::ValidatedAlterTable::AlterColumnSetNotNull(stmt) => {
             execute_alter_table_alter_column_set_not_null(storage, stmt)
+        }
+        crate::sql::allowlist::ValidatedAlterTable::AlterColumnSetDefault(stmt) => {
+            execute_alter_table_alter_column_set_default(storage, stmt)
+        }
+        crate::sql::allowlist::ValidatedAlterTable::AlterColumnDropDefault(stmt) => {
+            execute_alter_table_alter_column_drop_default(storage, stmt)
         }
         crate::sql::allowlist::ValidatedAlterTable::RenameColumn(stmt) => {
             execute_alter_table_rename_column(storage, stmt)
@@ -930,6 +942,127 @@ fn execute_alter_table_alter_column_set_not_null(
             column_name: stmt.column_name.clone(),
         },
     })
+}
+
+/// `ALTER TABLE <table> ALTER COLUMN <column> SET DEFAULT <式>` の実行本体（TABLE-39 (1)、
+/// Issue #1628）。前提は [`execute_alter_table_drop_column`] と同じ（`core.rs` が
+/// [`require_ddl_permission`] を先に通す）。変えるのは以後の書き込みで使う INSERT 既定値
+/// （`default_expr`）だけで、既存行の読み出し時補完値（`fill_value`）は変えない。
+///
+/// 判定順序: (1) テーブル存在確認（`42P01`／`42809`） (2) 列の取得（`42703`。保護列は
+/// catalog 側で拒否） (3) 既定値の生成（リテラル→[`set_column_default_value`]、時刻値関数→
+/// [`time_column_default_for_set`]。型不一致は `42804`） (4) `TIMESTAMPTZ` の正規化 (5) 値の束縛検証
+/// （`22003`／`22P02` 等） (6) 時刻既定値と FK `SET DEFAULT` の組の拒否（`0A000`）
+/// (7) `catalog::Storage::alter_table_set_default_expr`（単一 write txn 内で列型の一致・
+/// 再検証・FK 宣言整合〔`42830`〕を行い、拒否時は副作用ゼロ）。
+fn execute_alter_table_alter_column_set_default(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAlterColumnSetDefault,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    let schema = match storage.get_table_schema(&stmt.table_name) {
+        Ok(s) => s,
+        Err(CatalogError::TableNotFound(_)) => {
+            return Err(undefined_table_or_view(storage, &stmt.table_name));
+        }
+        Err(other) => return Err(map_drop_alter_column_error(other)),
+    };
+    let column = schema
+        .columns
+        .iter()
+        .find(|c| c.name == stmt.column_name)
+        .ok_or_else(|| SqlSurfaceError::UndefinedColumn {
+            name: stmt.column_name.clone(),
+        })?;
+    let new_default = match (&stmt.time_default, &stmt.default) {
+        (Some(time), _) => Some(time_column_default_for_set(
+            &column.name,
+            &column.ty,
+            *time,
+        )?),
+        (None, Some(literal)) => Some(set_column_default_value(&column.name, &column.ty, literal)?),
+        (None, None) => None,
+    };
+    let mut probe = column.clone();
+    probe.set_default_expr(new_default);
+    // 補完値（`fill_value`）まで書き換える `normalize_timestamptz_default` は使わず、
+    // 変更対象の `default_expr` スロットだけを正規化する。
+    normalize_timestamptz_slot_if_needed(&mut probe)?;
+    if let Some(default) = &probe.default_expr {
+        if !matches!(default, ColumnDefault::CurrentTime(_)) {
+            crate::sql::parser::bind_column_default(&probe, default)?;
+        }
+    }
+    let mut columns = schema.columns.clone();
+    for c in columns.iter_mut() {
+        if c.name == probe.name {
+            *c = probe.clone();
+        }
+    }
+    reject_time_default_set_default(&columns, schema.foreign_keys())?;
+    storage
+        .alter_table_set_default_expr(
+            &stmt.table_name,
+            &stmt.column_name,
+            &column.ty,
+            probe.default_expr.clone(),
+        )
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_alter_column_default_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AlterColumnSetDefault {
+            column_name: stmt.column_name.clone(),
+        },
+    })
+}
+
+/// `ALTER TABLE <table> ALTER COLUMN <column> DROP DEFAULT` の実行本体（TABLE-39 (2)、
+/// Issue #1628）。前提・判定順序の骨格は [`execute_alter_table_alter_column_set_default`] と
+/// 同じ（テーブル存在確認 → 列取得 → `catalog::Storage::alter_table_set_default_expr` に
+/// `None` を渡す）。既定値の無い列への DROP は冪等に成功する。`fill_value` は変えない。
+fn execute_alter_table_alter_column_drop_default(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAlterColumnDropDefault,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    let schema = match storage.get_table_schema(&stmt.table_name) {
+        Ok(s) => s,
+        Err(CatalogError::TableNotFound(_)) => {
+            return Err(undefined_table_or_view(storage, &stmt.table_name));
+        }
+        Err(other) => return Err(map_drop_alter_column_error(other)),
+    };
+    let column = schema
+        .columns
+        .iter()
+        .find(|c| c.name == stmt.column_name)
+        .ok_or_else(|| SqlSurfaceError::UndefinedColumn {
+            name: stmt.column_name.clone(),
+        })?;
+    storage
+        .alter_table_set_default_expr(&stmt.table_name, &stmt.column_name, &column.ty, None)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_alter_column_default_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AlterColumnDropDefault {
+            column_name: stmt.column_name.clone(),
+        },
+    })
+}
+
+/// 列 DEFAULT 変更（`SET／DROP DEFAULT`。Issue #1628）の [`CatalogError`] を SQL 表層の契約へ
+/// 写像する。FK の `SET DEFAULT` 参照アクションと整合しない変更は `42830`。全 variant を
+/// 明示列挙する [`map_drop_alter_column_error`] へ残りを委譲する（ワイルドカード腕を置かない。
+/// fail-closed）。
+fn map_alter_column_default_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::InvalidForeignKey(detail) => SqlSurfaceError::invalid_foreign_key(detail),
+        other => map_drop_alter_column_error(other),
+    }
 }
 
 /// 列の nullability 変更（`SET NOT NULL`。Issue #1631）の [`CatalogError`] を SQL 表層の
@@ -1209,10 +1342,31 @@ pub(crate) fn time_column_default(
     ty: &ColumnType,
     time: crate::catalog::TimeDefault,
 ) -> Result<ColumnDefault, SqlSurfaceError> {
+    time_column_default_with(column_name, ty, time, SqlSurfaceError::unsupported)
+}
+
+/// `ALTER COLUMN SET DEFAULT` 用の [`time_column_default`]（Issue #1628）。不一致は
+/// `42804`（`ADD COLUMN`／`CREATE TABLE` の `42601` は既存契約のため据え置き、SET DEFAULT
+/// の経路でだけ `42804` にする）。
+fn time_column_default_for_set(
+    column_name: &str,
+    ty: &ColumnType,
+    time: crate::catalog::TimeDefault,
+) -> Result<ColumnDefault, SqlSurfaceError> {
+    time_column_default_with(column_name, ty, time, SqlSurfaceError::datatype_mismatch)
+}
+
+/// [`time_column_default`] の本体。型不一致のエラー生成を呼び出し側が選ぶ。
+fn time_column_default_with(
+    column_name: &str,
+    ty: &ColumnType,
+    time: crate::catalog::TimeDefault,
+    mismatch: fn(String) -> SqlSurfaceError,
+) -> Result<ColumnDefault, SqlSurfaceError> {
     if time.compatible_with(ty) {
         Ok(ColumnDefault::CurrentTime(time))
     } else {
-        Err(SqlSurfaceError::unsupported(format!(
+        Err(mismatch(format!(
             "column {column_name:?} DEFAULT time function does not match the column type"
         )))
     }
@@ -1226,6 +1380,28 @@ pub(crate) fn add_column_default(
     column_name: &str,
     ty: &ColumnType,
     literal: &InsertLiteral,
+) -> Result<ColumnDefault, SqlSurfaceError> {
+    column_default_from_literal(column_name, ty, literal, SqlSurfaceError::unsupported)
+}
+
+/// `ALTER COLUMN SET DEFAULT` 用の [`add_column_default`]（Issue #1628）。変換規則は同一で、
+/// リテラル種別と列型の不一致だけを `42804`（DATATYPE_MISMATCH）で返す。
+fn set_column_default_value(
+    column_name: &str,
+    ty: &ColumnType,
+    literal: &InsertLiteral,
+) -> Result<ColumnDefault, SqlSurfaceError> {
+    column_default_from_literal(column_name, ty, literal, SqlSurfaceError::datatype_mismatch)
+}
+
+/// [`add_column_default`]・[`set_column_default_value`] の共通本体。種別不一致のエラー生成
+/// （`mismatch_error`）だけを呼び出し側が選び、その他の SQLSTATE（`0A000`・`54000`・
+/// `22001`・`22P02` 等）は両経路で同一にする。
+fn column_default_from_literal(
+    column_name: &str,
+    ty: &ColumnType,
+    literal: &InsertLiteral,
+    mismatch_error: fn(String) -> SqlSurfaceError,
 ) -> Result<ColumnDefault, SqlSurfaceError> {
     let kind = match ty {
         ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => "text",
@@ -1265,7 +1441,7 @@ pub(crate) fn add_column_default(
         }
     };
     let mismatch = || {
-        SqlSurfaceError::unsupported(format!(
+        mismatch_error(format!(
             "column {column_name:?} DEFAULT expects a {kind} literal"
         ))
     };
@@ -1396,6 +1572,16 @@ fn normalize_timestamptz_default(column: &mut ColumnDef) -> Result<(), SqlSurfac
     // ミラー状態なら同じ値になる）。
     normalize_timestamptz_slot(&column.name, &mut column.default_expr)?;
     normalize_timestamptz_slot(&column.name, &mut column.fill_value)
+}
+
+/// `default_expr` スロットだけを `TIMESTAMPTZ` 向けに正規化する（`ALTER COLUMN SET DEFAULT`。
+/// Issue #1628）。[`normalize_timestamptz_default`] は `fill_value` まで書き換えるため、補完値を
+/// 変えてはならない本経路では使わない。
+fn normalize_timestamptz_slot_if_needed(column: &mut ColumnDef) -> Result<(), SqlSurfaceError> {
+    if column.ty != ColumnType::TimestampTz {
+        return Ok(());
+    }
+    normalize_timestamptz_slot(&column.name, &mut column.default_expr)
 }
 
 /// [`normalize_timestamptz_default`] の 1 スロット分（INSERT 既定値または補完値）。

@@ -4087,9 +4087,10 @@ pub struct ColumnDef {
     /// 不変条件: (a) `ColumnDefault::CurrentTime` を持たない（補完値は定数。例外は
     /// `default_expr` と等しいミラー状態で、CREATE TABLE の時刻 DEFAULT 列の旧来表現）。
     /// (b) 決まるのは `alter_table_add_column` の時点だけで、その後は ALTER COLUMN TYPE の
-    /// 変換でのみ変わる。(c) 現時点では全構築経路で `default_expr` と同じ値（ミラー）に
-    /// なり、食い違うのは #1628 以降。食い違う列を持つスキーマだけがカタログ v14 で
-    /// 永続化される。
+    /// 変換でのみ変わる（`ALTER COLUMN SET／DROP DEFAULT` は `default_expr` だけを変える。
+    /// 例外として、時刻値関数のミラーだった補完値は SET／DROP で `None` に落ちる。Issue #1628）。
+    /// (c) 構築直後は `default_expr` と同じ値（ミラー）で、`ALTER COLUMN SET／DROP DEFAULT`
+    /// （Issue #1628）で食い違う。食い違う列を持つスキーマだけがカタログ v14 で永続化される。
     pub fill_value: Option<ColumnDefault>,
     /// 列に明示した照合（`COLLATE "C"`／`"POSIX"`／`"und-x-icu"`／`"ja-x-icu"`。TABLE-28・
     /// Issue #1609・#2190）。`None` は「照合指定なし」で、明示した `C`／`POSIX` とは区別して
@@ -4144,9 +4145,9 @@ impl ColumnDef {
         self
     }
 
-    /// INSERT 既定値だけを変える内部 seam（#1628 の SET／DROP DEFAULT 用）。
+    /// INSERT 既定値だけを変える内部 seam（`alter_table_set_default_expr` と
+    /// `sql::ddl` の SET／DROP DEFAULT 検証用の複製列。Issue #1628）。
     /// `fill_value` は既存行の読み出し結果を守るため意図的に触らない。
-    #[allow(dead_code)]
     pub(crate) fn set_default_expr(&mut self, default_expr: Option<ColumnDefault>) {
         self.default_expr = default_expr;
     }
@@ -5551,9 +5552,10 @@ fn validate_foreign_keys(schema: &TableSchema, allow_unresolved: bool) -> Result
                 "duplicate foreign key declaration".to_string(),
             ));
         }
-        // 参照アクションの宣言時検査（Issue #1076 A8）。ALTER で FK 列の DEFAULT を
-        // 後から変える経路は無く、nullability を変える `SET NOT NULL`（Issue #1631）は
-        // 変更後スキーマで本検査を再実行してから永続化するため、宣言後も恒久的に有効。
+        // 参照アクションの宣言時検査（Issue #1076 A8）。FK 列の DEFAULT を後から変える
+        // `ALTER COLUMN SET／DROP DEFAULT`（Issue #1628）と nullability を変える `SET NOT NULL`
+        // （Issue #1631）は、変更後スキーマで本検査を再実行してから永続化するため、
+        // 宣言後も恒久的に有効。
         validate_referential_action_declaration(schema, fk)?;
         // 自己参照は参照先の宣言がこのスキーマ自身にあるため、参照先の照合まで
         // 静的に検証できる（解決済みの宣言のみ。未解決は `create_table` の
@@ -8645,8 +8647,9 @@ impl Storage {
     ///   [`CatalogError::Invalid`] で拒否する（TABLE-16。行ストアは参照しない）。
     ///   行の有無で成否を変えると、DDL 主体が他テナントの行の存在を判別できて
     ///   しまう（テナント境界 P0）ため、判定を行データに依存させない
-    /// - 列の `DEFAULT` は作成後に変わらない前提（`ALTER COLUMN SET DEFAULT` は
-    ///   存在しない）。将来導入する場合は補完専用の値を分離する必要がある
+    /// - 追加時に決めた補完値（`fill_value`）は `ALTER COLUMN SET／DROP DEFAULT`
+    ///   （[`Self::alter_table_set_default_expr`]、Issue #1628）でも変わらない
+    ///   （変わるのは INSERT 既定値 `default_expr` だけ）
     ///
     /// 対象テーブル不存在・列名重複も `Err`。
     pub fn alter_table_add_column(&self, table_name: &str, column: ColumnDef) -> Result<()> {
@@ -8679,7 +8682,8 @@ impl Storage {
             ));
         }
         // 補完値を決めるのはこの ADD COLUMN の時点だけ（Issue #1627 不変条件 (b)）。
-        // 現状は INSERT 既定値と同じ値のみ受け付ける（食い違いは #1628 以降の ALTER で生じる）。
+        // この呼び出しでは INSERT 既定値と同じ値のみ受け付ける（食い違いは追加後の
+        // `ALTER COLUMN SET／DROP DEFAULT`〔Issue #1628〕で生じる）。
         if column.fill_value != column.default_expr {
             return Err(CatalogError::Invalid(
                 "column added via ALTER TABLE ADD COLUMN must have a fill value equal to its DEFAULT"
@@ -9396,6 +9400,94 @@ impl Storage {
                 }
                 Err(e) => return Err(map_row_table_error(e)),
             }
+
+            let encoded = encode_schema(&updated)?;
+            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            catalog_table.insert(table_name, encoded.as_slice())?;
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(())
+    }
+
+    /// `ALTER TABLE ... ALTER COLUMN <column> SET／DROP DEFAULT`（TABLE-39 (1)(2)(6) のポインタ、
+    /// Issue #1628）。SQL 表層 `sql::ddl::execute_alter_table_alter_column_set_default`／
+    /// `execute_alter_table_alter_column_drop_default` から呼ばれる唯一の実装で、`default_expr`
+    /// に `Some` で SET、`None` で DROP を表す。変えるのは以後の書き込みで使う INSERT 既定値
+    /// （[`ColumnDef::default_expr`]）だけで、既存行の読み出し時補完値
+    /// （[`ColumnDef::fill_value`]）は変えない（TABLE-39 (1)。ADD COLUMN 時に決めた既存行の
+    /// 見え方を DDL で動かさない）。行ストアは参照しない（O(1)）。
+    ///
+    /// 判定順序（fail-closed。拒否はすべて commit 前に return し副作用ゼロ）:
+    /// (1) 識別子・保護列名（`ProtectedColumn`） (2) テーブル取得（`TableNotFound`）
+    /// (3) 列取得（`ColumnNotFound`） (4) 列型が呼び出し元の検証時（`expected_ty`）と一致すること
+    /// （SQL 表層が write txn の外で読んだ型で既定値を作るため、並行 DDL による型変更を
+    /// `Invalid` で拒否する TOCTOU 対策） (5) 変更後の `default_expr` が現在値と等しければ冪等に
+    /// 成功（commit・世代 bump なし） (6) VECTOR 列への SET は `Invalid` (7) 変更後スキーマの
+    /// 再検証（[`crate::row_codec::validate_column_default`]・[`validate_schema`]。型適合・
+    /// 長さ・ENUM 語彙・FK 参照アクションの宣言検査〔`ON DELETE／UPDATE SET DEFAULT` で参照される
+    /// NOT NULL 列の DROP DEFAULT や時刻既定値は `InvalidForeignKey`〕）。
+    ///
+    /// 補完値が時刻値関数のミラー（CREATE TABLE の `DEFAULT now()` 列の旧来表現）の列は、
+    /// `fill_value` を `None` へ落としてから検証する。`ADD COLUMN` は時刻値関数の DEFAULT を
+    /// 拒否するため、`CurrentTime` の補完値は CREATE TABLE 由来に限られ、その列の全行は物理的に
+    /// 値を持つので補完値は参照されない（そもそも時刻値関数は読み出し時に実体化できない）。
+    /// 定数のミラーは `fill_value` を変えない。
+    ///
+    /// 成功時はカタログを更新し世代を bump する。食い違い（`fill_value != default_expr`）が生じた
+    /// スキーマはカタログ v14 で永続化される。
+    pub fn alter_table_set_default_expr(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        expected_ty: &ColumnType,
+        default_expr: Option<ColumnDefault>,
+    ) -> Result<()> {
+        validate_identifier(table_name)?;
+        validate_identifier(column_name)?;
+        if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
+            return Err(CatalogError::ProtectedColumn(column_name.to_string()));
+        }
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        {
+            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| c.name == column_name)
+                .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+            if &column.ty != expected_ty {
+                return Err(CatalogError::Invalid(format!(
+                    "column {column_name:?} type changed concurrently; retry the statement"
+                )));
+            }
+            if column.default_expr == default_expr {
+                // 既に同じ既定値（既定値なしへの DROP を含む）。冪等な no-op。
+                return Ok(());
+            }
+            if default_expr.is_some() && matches!(column.ty, ColumnType::Vector(_)) {
+                return Err(CatalogError::Invalid(
+                    "DEFAULT is not supported for a VECTOR column".to_string(),
+                ));
+            }
+
+            let mut updated = schema.clone();
+            for c in updated.columns.iter_mut() {
+                if c.name == column_name {
+                    c.set_default_expr(default_expr.clone());
+                    // 時刻値関数のミラーだった補完値は、`validate_schema` の不変条件 (a) を
+                    // 満たすため落とす（上記ドキュメントの根拠参照）。定数の補完値は保持する。
+                    if matches!(c.fill_value, Some(ColumnDefault::CurrentTime(_))) {
+                        c.fill_value = None;
+                    }
+                    if crate::row_codec::validate_column_default(c).is_err() {
+                        return Err(CatalogError::Invalid(format!(
+                            "column {column_name:?} has an invalid DEFAULT for its type"
+                        )));
+                    }
+                }
+            }
+            validate_schema(&updated)?;
 
             let encoded = encode_schema(&updated)?;
             let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
@@ -18609,6 +18701,212 @@ mod tests {
             );
             assert!(encode_schema(&schema).is_err(), "{ty:?} must be rejected");
         }
+    }
+
+    // ---- Issue #1628: ALTER COLUMN SET／DROP DEFAULT（alter_table_set_default_expr）----
+
+    fn open_default_alter_storage(label: &str) -> (Storage, CleanupGuard) {
+        let path = unique_db_path(label);
+        let guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "t",
+                vec![
+                    ColumnDef::new("a", ColumnType::Text, true),
+                    ColumnDef::new("at", ColumnType::Timestamp, true)
+                        .with_default(ColumnDefault::CurrentTime(TimeDefault::Now)),
+                ],
+            ))
+            .expect("create table");
+        (storage, guard)
+    }
+
+    fn column_of(storage: &Storage, name: &str) -> ColumnDef {
+        storage
+            .get_table_schema("t")
+            .expect("schema")
+            .columns
+            .into_iter()
+            .find(|c| c.name == name)
+            .expect("column")
+    }
+
+    /// SET は `default_expr` だけを変え、ADD COLUMN 時の `fill_value` を保つ。食い違うスキーマは
+    /// v14 で永続化され、再 open 後も同じ。DROP は `default_expr` だけを `None` にする。
+    #[test]
+    fn set_and_drop_default_keep_fill_value_across_reopen() {
+        let (storage, guard) = open_default_alter_storage("catalog-set-default-fill");
+        let path = guard.0.clone();
+        storage
+            .alter_table_add_column(
+                "t",
+                ColumnDef::new("c", ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("a".to_string())),
+            )
+            .expect("add column");
+        let before = storage.table_generation("t").expect("generation");
+        storage
+            .alter_table_set_default_expr(
+                "t",
+                "c",
+                &ColumnType::Text,
+                Some(ColumnDefault::Text("b".to_string())),
+            )
+            .expect("set default");
+        let col = column_of(&storage, "c");
+        assert_eq!(col.default_expr, Some(ColumnDefault::Text("b".to_string())));
+        assert_eq!(col.fill_value, Some(ColumnDefault::Text("a".to_string())));
+        assert!(storage.table_generation("t").expect("generation") > before);
+        drop(storage);
+        let storage = Storage::open(&path).expect("reopen");
+        let col = column_of(&storage, "c");
+        assert_eq!(col.default_expr, Some(ColumnDefault::Text("b".to_string())));
+        assert_eq!(col.fill_value, Some(ColumnDefault::Text("a".to_string())));
+        storage
+            .alter_table_set_default_expr("t", "c", &ColumnType::Text, None)
+            .expect("drop default");
+        let col = column_of(&storage, "c");
+        assert_eq!(col.default_expr, None);
+        assert_eq!(col.fill_value, Some(ColumnDefault::Text("a".to_string())));
+    }
+
+    /// 同じ既定値への変更（既定値なしへの DROP を含む）は冪等に成功し、世代を進めない。
+    #[test]
+    fn set_default_is_idempotent_without_generation_bump() {
+        let (storage, _guard) = open_default_alter_storage("catalog-set-default-noop");
+        let before = storage.table_generation("t").expect("generation");
+        storage
+            .alter_table_set_default_expr("t", "a", &ColumnType::Text, None)
+            .expect("drop on column without default");
+        assert_eq!(storage.table_generation("t").expect("generation"), before);
+        let d = Some(ColumnDefault::Text("x".to_string()));
+        storage
+            .alter_table_set_default_expr("t", "a", &ColumnType::Text, d.clone())
+            .expect("set");
+        let mid = storage.table_generation("t").expect("generation");
+        assert!(mid > before);
+        storage
+            .alter_table_set_default_expr("t", "a", &ColumnType::Text, d)
+            .expect("same set");
+        assert_eq!(storage.table_generation("t").expect("generation"), mid);
+    }
+
+    /// CREATE TABLE の `DEFAULT now()`（補完値もミラー）の列へ定数を SET／DROP しても、
+    /// 補完値は `None` に落ちて再 open できる（時刻値の補完値は不変条件 (a) に反するため）。
+    #[test]
+    fn set_default_on_time_default_mirror_column_drops_time_fill_value() {
+        let (storage, guard) = open_default_alter_storage("catalog-set-default-time-mirror");
+        let path = guard.0.clone();
+        storage
+            .alter_table_set_default_expr(
+                "t",
+                "at",
+                &ColumnType::Timestamp,
+                Some(ColumnDefault::Text("2020-01-01 00:00:00".to_string())),
+            )
+            .expect("set constant over time default");
+        let col = column_of(&storage, "at");
+        assert_eq!(col.fill_value, None);
+        drop(storage);
+        let storage = Storage::open(&path).expect("reopen");
+        assert_eq!(column_of(&storage, "at").fill_value, None);
+        storage
+            .alter_table_set_default_expr("t", "at", &ColumnType::Timestamp, None)
+            .expect("drop");
+        assert_eq!(column_of(&storage, "at").default_expr, None);
+    }
+
+    /// 検証時の列型と write txn 内の列型が食い違えば `Invalid`（並行 DDL の TOCTOU 対策）。
+    #[test]
+    fn set_default_rejects_stale_expected_type() {
+        let (storage, _guard) = open_default_alter_storage("catalog-set-default-stale");
+        let err = storage
+            .alter_table_set_default_expr(
+                "t",
+                "a",
+                &ColumnType::Integer,
+                Some(ColumnDefault::Number("1".to_string())),
+            )
+            .expect_err("stale type");
+        assert!(matches!(err, CatalogError::Invalid(_)), "{err:?}");
+        assert_eq!(column_of(&storage, "a").default_expr, None);
+    }
+
+    /// 保護列・不在列・型に合わない既定値は拒否され、カタログは変わらない。
+    #[test]
+    fn set_default_rejects_protected_missing_and_mismatched() {
+        let (storage, _guard) = open_default_alter_storage("catalog-set-default-reject");
+        let before = storage.table_generation("t").expect("generation");
+        assert!(matches!(
+            storage.alter_table_set_default_expr("t", "id", &ColumnType::Text, None),
+            Err(CatalogError::ProtectedColumn(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_set_default_expr("t", "zzz", &ColumnType::Text, None),
+            Err(CatalogError::ColumnNotFound(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_set_default_expr("nope", "a", &ColumnType::Text, None),
+            Err(CatalogError::TableNotFound(_))
+        ));
+        assert!(storage
+            .alter_table_set_default_expr(
+                "t",
+                "a",
+                &ColumnType::Text,
+                Some(ColumnDefault::Bool(true))
+            )
+            .is_err());
+        assert_eq!(storage.table_generation("t").expect("generation"), before);
+    }
+
+    /// `ON DELETE SET DEFAULT` で参照される NOT NULL 列の DROP DEFAULT は `InvalidForeignKey`
+    /// （宣言が常に失敗する状態を作らない）。副作用なし。
+    #[test]
+    fn drop_default_rejected_for_fk_set_default_not_null_column() {
+        let path = unique_db_path("catalog-drop-default-fk");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(
+                &TableSchema::new("parent", vec![ColumnDef::new("k", ColumnType::Text, true)])
+                    .with_unique_constraints(vec![UniqueConstraint::new(vec!["k".to_string()])]),
+            )
+            .expect("parent");
+        storage
+            .create_table(
+                &TableSchema::new(
+                    "t",
+                    vec![ColumnDef::new("r", ColumnType::Text, false)
+                        .with_default(ColumnDefault::Text("x".to_string()))],
+                )
+                .with_foreign_keys(vec![ForeignKeyDef::new(
+                    vec!["r".to_string()],
+                    "parent".to_string(),
+                    vec!["k".to_string()],
+                    ReferentialAction::SetDefault,
+                    ReferentialAction::NoAction,
+                )]),
+            )
+            .expect("child");
+        let err = storage
+            .alter_table_set_default_expr("t", "r", &ColumnType::Text, None)
+            .expect_err("must fail");
+        assert!(matches!(err, CatalogError::InvalidForeignKey(_)), "{err:?}");
+        assert_eq!(
+            column_of(&storage, "r").default_expr,
+            Some(ColumnDefault::Text("x".to_string()))
+        );
+        // 別の定数への SET は宣言を保つので成功する。
+        storage
+            .alter_table_set_default_expr(
+                "t",
+                "r",
+                &ColumnType::Text,
+                Some(ColumnDefault::Text("y".to_string())),
+            )
+            .expect("set constant");
     }
 
     // ---- Issue #1627: 補完値（fill_value）と INSERT 既定値（default_expr）の分離 ----
