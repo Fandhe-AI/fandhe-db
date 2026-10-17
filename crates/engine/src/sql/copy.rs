@@ -619,6 +619,7 @@ fn bind_copy_record(
         &mut bound_values,
         &provided,
         Some(clock),
+        false,
     )?;
 
     Ok(BoundInsert {

@@ -941,12 +941,10 @@ pub(crate) fn for_typed_upsert(
 pub(crate) enum HashColumnInput<'a> {
     /// 束縛済みの値（種別バイト `0`。[`push_value`]。`Value::Null` は従来どおり除外）。
     Value(&'a Value),
-    /// 省略列へ適用した揮発性 DEFAULT（種別バイト `2`）。評価値ではなく DEFAULT の構文形を
-    /// ハッシュする。同じ文の再送は評価時刻によらず同一ハッシュになる（設計 D1）。
-    VolatileDefault(crate::catalog::TimeDefault),
     /// `INSERT … VALUES` の要素に書かれた単独の時刻関数（種別バイト `1`。Issue #2188・
-    /// SQL-37）。評価値ではなく構文形をハッシュする（[`HashColumnInput::VolatileDefault`]
-    /// と同じ理由）。DEFAULT 適用（種別 `2`）とは別ハッシュになる。
+    /// SQL-37）。評価値ではなく構文形をハッシュするため、再送で評価時刻が変わっても同一
+    /// ハッシュになる。省略列へ DEFAULT を適用した列は材料に含めない（Issue #1629 D1。
+    /// 旧種別バイト `2` は退役・再利用禁止）。
     ValuesTime(crate::catalog::TimeDefault),
 }
 
@@ -1007,8 +1005,8 @@ fn time_default_expr(time: crate::catalog::TimeDefault) -> crate::sql::udf_call:
 ///
 /// `id` → `visibility` → [`push_vector`] → 列数（`Value::Null` 除外後。LE u32）→ 列ごとに
 /// 「列名 → 種別バイト → 本体」。種別 `0` は値（[`push_value`]）、種別 `1` は
-/// VALUES 内の単独時刻関数（#2188。構文形を `push_dml_expr` で直列化）、種別 `2` は揮発性 DEFAULT
-/// （構文形を `push_dml_expr` で直列化）。列数プレフィクスは単一行でも常に置く
+/// VALUES 内の単独時刻関数（#2188。構文形を `push_dml_expr` で直列化）。種別 `2`（旧・揮発性
+/// DEFAULT の構文形）は Issue #1629 で退役した（DEFAULT 適用列は材料に含めない。再利用禁止）。列数プレフィクスは単一行でも常に置く
 /// （[`for_typed_insert_batch`] の行境界曖昧性回避と同じ理由で、全 `*Expr` 形に共通のレイアウトにする）。
 fn push_expr_row(
     b: &mut HashInputBuilder,
@@ -1040,13 +1038,6 @@ fn push_expr_row(
                 b.push_u8(1);
                 push_dml_expr(b, &time_default_expr(*time), None).map_err(|_| {
                     StorageError::Codec("content hash values expression too large".to_string())
-                })?;
-            }
-            HashColumnInput::VolatileDefault(time) => {
-                b.push_bytes(name.as_bytes())?;
-                b.push_u8(2);
-                push_dml_expr(b, &time_default_expr(*time), None).map_err(|_| {
-                    StorageError::Codec("content hash default expression too large".to_string())
                 })?;
             }
         }
@@ -2485,7 +2476,7 @@ mod tests {
         let hash_with = |time: TimeDefault| {
             let cols = [
                 ("lang", HashColumnInput::Value(&lang)),
-                ("at", HashColumnInput::VolatileDefault(time)),
+                ("at", HashColumnInput::ValuesTime(time)),
             ];
             for_typed_insert_expr(1, Visibility::Private, &embedding, &cols).expect("hash")
         };
@@ -2522,7 +2513,7 @@ mod tests {
         // 列名が違えば別内容。
         let renamed = [
             ("lang", HashColumnInput::Value(&lang)),
-            ("at2", HashColumnInput::VolatileDefault(TimeDefault::Now)),
+            ("at2", HashColumnInput::ValuesTime(TimeDefault::Now)),
         ];
         assert_ne!(
             for_typed_insert_expr(1, Visibility::Private, &embedding, &renamed).expect("hash"),
@@ -2532,7 +2523,7 @@ mod tests {
         let with_null = [
             ("lang", HashColumnInput::Value(&lang)),
             ("note", HashColumnInput::Value(&Value::Null)),
-            ("at", HashColumnInput::VolatileDefault(TimeDefault::Now)),
+            ("at", HashColumnInput::ValuesTime(TimeDefault::Now)),
         ];
         assert_eq!(
             for_typed_insert_expr(1, Visibility::Private, &embedding, &with_null).expect("hash"),
@@ -2540,10 +2531,9 @@ mod tests {
         );
     }
 
-    /// Issue #2188: `VALUES` の単独時刻関数（種別 1）は DEFAULT 適用（種別 2）と別ハッシュで、
-    /// 新しい時刻形（statement／clock／LOCALTIME）も互いに別内容になる。同じ構文形は安定。
+    /// Issue #2188: `VALUES` の単独時刻関数（種別 1）について、新しい時刻形（statement／clock／LOCALTIME）も互いに別内容になる。同じ構文形は安定。
     #[test]
-    fn values_time_kind_is_distinct_from_default_and_between_forms() {
+    fn values_time_kind_is_distinct_between_forms() {
         use crate::catalog::TimeDefault;
         let embedding = [1.0_f32, 0.0];
         let hash = |col: HashColumnInput<'_>| {
@@ -2551,9 +2541,7 @@ mod tests {
             for_typed_insert_expr(1, Visibility::Private, &embedding, &cols).expect("hash")
         };
         let values = |t| hash(HashColumnInput::ValuesTime(t));
-        let default = |t| hash(HashColumnInput::VolatileDefault(t));
         assert_eq!(values(TimeDefault::Now), values(TimeDefault::Now));
-        assert_ne!(values(TimeDefault::Now), default(TimeDefault::Now));
         let forms = [
             TimeDefault::Now,
             TimeDefault::StatementTimestamp,
@@ -2565,7 +2553,6 @@ mod tests {
         for (i, a) in forms.iter().enumerate() {
             for b in forms.iter().skip(i + 1) {
                 assert_ne!(values(*a), values(*b), "{a:?} vs {b:?}");
-                assert_ne!(default(*a), default(*b), "{a:?} vs {b:?}");
             }
         }
     }
@@ -2579,7 +2566,7 @@ mod tests {
         let lang = Value::Text("ja".to_string());
         let cols = [
             ("lang", HashColumnInput::Value(&lang)),
-            ("at", HashColumnInput::VolatileDefault(TimeDefault::Now)),
+            ("at", HashColumnInput::ValuesTime(TimeDefault::Now)),
         ];
         let no_cols: [(&str, HashColumnInput<'_>); 0] = [];
         let rows: [TypedInsertExprBatchRow<'_>; 2] = [

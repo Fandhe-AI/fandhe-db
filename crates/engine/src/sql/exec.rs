@@ -4268,6 +4268,11 @@ pub(crate) fn map_write_error(
         TenantWriteError::Catalog(CatalogError::TableNotFound(name)) => {
             SqlSurfaceError::UndefinedTable { name }
         }
+        // 省略された非 nullable 列（DEFAULT なし）の `23502`。台帳照合（再送判定）の後に
+        // `tenant` が返す（`VolatileColumn::MissingNotNull`。Issue #1629）。列名のみを運ぶ。
+        TenantWriteError::Catalog(CatalogError::NotNullConstraintViolation(column)) => {
+            SqlSurfaceError::not_null_violation(column)
+        }
         // 入力値に起因すると型で確認できるものだけを「受理構文だが値が不正」として
         // `22000` へ丸め込む（`CatalogError::Invalid` は識別子・次元・スキーマ検証の
         // 失敗、`StorageError::Codec` は行エンコード時の不正値）。エラー文言に行内容・
@@ -5324,6 +5329,7 @@ pub(crate) fn execute_file_insert(
         path: &bound.path,
         body: &bound.body,
         template_values: &bound.template_values,
+        default_applied_columns: &bound.default_applied_columns,
         path_column_index: bound.path_column_index,
         body_column_index: bound.body_column_index,
         vector_column_index: bound.vector_column_index,

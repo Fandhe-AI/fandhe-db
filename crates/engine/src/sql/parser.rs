@@ -302,31 +302,42 @@ pub struct BoundInsert {
     /// `None` を `23502` で拒否済みのため常に `Some`。`CompareOnlyWithoutLedger`
     /// でのみ `None` になり得る。
     pub operation_id: Option<OperationId>,
-    /// 時刻値関数の `DEFAULT`（`DEFAULT now()` 系。SQL-37・TABLE-16・Issue #1587）を
-    /// 省略列へ適用した列の `schema.columns` 上の位置。`values` には評価済みの時刻が入るが、
-    /// 内容照合ハッシュは評価値ではなく列の DEFAULT 構文形から計算する（設計 D1・D2。
-    /// 再送で評価時刻が変わっても同一ハッシュにするため）。空なら従来どおり値だけでハッシュする。
+    /// 省略列へ `DEFAULT`（定数・時刻値関数とも。SQL-37・TABLE-16・TABLE-39・Issue #1587・#1629）
+    /// を適用した列の `schema.columns` 上の位置（[`VolatileColumn::Default`]）と、`VALUES` 内の
+    /// 単独時刻関数の列（[`VolatileColumn::Values`]）。`values` には評価済みの値が入るが、
+    /// 内容照合ハッシュは DEFAULT 適用列を材料から除外し、送られた文に書かれた列だけで計算する
+    /// （DEFAULT の変更・追加・削除を挟んだ再送を一致させるため。設計は `docs/design/not-null-default.md`）。
+    /// 名前は Issue #1587 当時の経緯を引き継いでいる。
     ///
     /// Issue #2188: `VALUES` の要素に書かれた単独の時刻関数（`now()` 等）の列も同じ一覧に
     /// 含め（[`VolatileColumn::Values`]）、ハッシュは種別バイト `1` の構文形を使う。
     pub volatile_default_columns: Vec<VolatileColumn>,
 }
 
-/// 内容照合ハッシュが評価値ではなく構文形を使う列（時刻関数を評価した列。SQL-37・
-/// Issue #1587・#2188）。`tenant` の INSERT 系書き込みと `sql::exec` が共有する。
+/// 内容照合ハッシュが評価値をそのまま使わない列（DEFAULT 適用列は除外、`VALUES` 内の時刻関数列は
+/// 構文形。SQL-37・Issue #1587・#1629・#2188）。`tenant` の INSERT 系書き込みと `sql::exec` が共有する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolatileColumn {
-    /// 省略列へ適用した列 `DEFAULT now()` 系（`schema.columns` 上の位置。ハッシュ種別 `2`）。
+    /// 省略列へ `DEFAULT`（定数・時刻とも）を適用した列（`schema.columns` 上の位置）。
+    /// 内容照合ハッシュの材料から除外する（Issue #1629。旧ハッシュ種別 `2` は退役・再利用禁止）。
     Default(usize),
     /// `VALUES` の要素が単独の時刻関数だった列（位置と構文形。ハッシュ種別 `1`）。
     Values(usize, crate::catalog::TimeDefault),
+    /// 省略された非 nullable 列で DEFAULT も無いもの（`schema.columns` 上の位置）。束縛時には
+    /// `23502` にせず、`Null` の仮値を置いたうえでハッシュ材料から除外して `tenant` の書き込みまで
+    /// 運ぶ。`tenant` は台帳照合（再送判定）を終えた後に `23502` で拒否する（Issue #1629:
+    /// NOT NULL 列の DROP DEFAULT を挟んだ同一文の再送を `23505` にするため）。
+    /// 行形 INSERT（単一行・複数行 VALUES）の束縛だけが生成し、他の束縛経路は即時 `23502` のまま。
+    MissingNotNull(usize),
 }
 
 impl VolatileColumn {
     /// `schema.columns` 上の位置。
     pub fn index(&self) -> usize {
         match self {
-            VolatileColumn::Default(i) | VolatileColumn::Values(i, _) => *i,
+            VolatileColumn::Default(i)
+            | VolatileColumn::Values(i, _)
+            | VolatileColumn::MissingNotNull(i) => *i,
         }
     }
 }
@@ -3038,6 +3049,17 @@ pub fn bind_insert(
     stmt: &ValidatedInsert,
     schema: &TableSchema,
 ) -> Result<BoundInsert, SqlSurfaceError> {
+    bind_insert_impl(stmt, schema, false)
+}
+
+/// [`bind_insert`] の本体。`defer_not_null` が真なら、省略された非 nullable 列（DEFAULT なし）の
+/// `23502` を束縛時に返さず [`VolatileColumn::MissingNotNull`] として書き込み段へ運ぶ
+/// （[`bind_insert_form`] の行形 INSERT だけが真で呼ぶ。Issue #1629）。
+fn bind_insert_impl(
+    stmt: &ValidatedInsert,
+    schema: &TableSchema,
+    defer_not_null: bool,
+) -> Result<BoundInsert, SqlSurfaceError> {
     // 複数行 `VALUES`（SQL-16、TASK-190）は本関数の単一行契約外であり、2 行目
     // 以降を黙って無視する fail-open を避けるため明示的に拒否する（複数行の
     // 束縛は `bind_insert_form` の `RowBatch` 分岐を経由すること）。
@@ -3065,6 +3087,7 @@ pub fn bind_insert(
         values,
         &stmt.operation_id,
         schema,
+        defer_not_null,
     )
 }
 
@@ -3086,9 +3109,10 @@ pub(crate) fn fill_omitted_columns(
     bound_values: &mut [crate::row_codec::Value],
     provided: &[bool],
     clock: Option<crate::sql::time_fn::StatementClock>,
+    defer_not_null: bool,
 ) -> Result<Vec<VolatileColumn>, SqlSurfaceError> {
-    // 時刻 DEFAULT を適用した列の位置（内容照合ハッシュが評価値の代わりに DEFAULT 構文形を
-    // 使う対象。`BoundInsert::volatile_default_columns`）。
+    // DEFAULT（定数・時刻とも）を適用した列の位置（内容照合ハッシュが材料から除外する対象。
+    // `BoundInsert::volatile_default_columns`。Issue #1629）。
     let mut volatile: Vec<VolatileColumn> = Vec::new();
     for (idx, column) in columns.iter().enumerate() {
         let is_provided = provided.get(idx).copied().unwrap_or(false);
@@ -3113,10 +3137,18 @@ pub(crate) fn fill_omitted_columns(
                 if let Some(slot) = bound_values.get_mut(idx) {
                     *slot = value;
                 }
+                // 定数 DEFAULT も「省略列へ DEFAULT を適用した位置」として記録する
+                // （Issue #1629 D2。内容照合ハッシュはこの列を材料から除外する）。
+                volatile.push(VolatileColumn::Default(idx));
             }
             None => {
                 if !column.nullable {
-                    return Err(SqlSurfaceError::not_null_violation(column.name.clone()));
+                    if defer_not_null && !matches!(column.ty, ColumnType::Vector(_)) {
+                        // 台帳照合の後で `tenant` が `23502` にする（`VolatileColumn::MissingNotNull`）。
+                        volatile.push(VolatileColumn::MissingNotNull(idx));
+                    } else {
+                        return Err(SqlSurfaceError::not_null_violation(column.name.clone()));
+                    }
                 }
             }
         }
@@ -3258,6 +3290,7 @@ fn bind_insert_row(
     values: &[InsertLiteral],
     operation_id: &Option<OperationId>,
     schema: &TableSchema,
+    defer_not_null: bool,
 ) -> Result<BoundInsert, SqlSurfaceError> {
     if columns.len() != values.len() {
         return Err(SqlSurfaceError::invalid_input(
@@ -3551,6 +3584,7 @@ fn bind_insert_row(
         &mut bound_values,
         &provided,
         crate::sql::time_fn::current_default_clock(),
+        defer_not_null,
     )?;
     volatile_default_columns.extend(volatile_values);
 
@@ -4618,6 +4652,10 @@ pub struct BoundFileInsert {
     pub body_column_index: usize,
     pub vector_column_index: usize,
     pub template_values: Vec<crate::row_codec::Value>,
+    /// 省略列へ `DEFAULT` を適用した列の `schema.columns` 上の位置（Issue #1629）。
+    /// `template_values` には既定値が入るが、内容照合ハッシュはこれらの列を材料から除外する
+    /// （DEFAULT の変更を挟んだ再送を一致させるため。行形 `INSERT` と同じ規則）。
+    pub default_applied_columns: Vec<usize>,
     /// TASK-92（RECOVER-1）: [`BoundInsert::operation_id`] と同じく
     /// `ValidatedInsert.operation_id` をそのまま素通しする（行形・ファイル形で
     /// `sql::allowlist::validate_insert` の必須化ガードを共有するため、
@@ -4752,7 +4790,7 @@ pub fn bind_insert_form(
         }
         bind_file_insert(stmt, schema).map(BoundInsertForm::File)
     } else if stmt.rows.len() <= 1 {
-        bind_insert(stmt, schema).map(BoundInsertForm::Row)
+        bind_insert_impl(stmt, schema, true).map(BoundInsertForm::Row)
     } else {
         let mut bounds: Vec<BoundInsert> = Vec::new();
         bounds.try_reserve_exact(stmt.rows.len()).map_err(|_| {
@@ -4765,6 +4803,7 @@ pub fn bind_insert_form(
                 values,
                 &stmt.operation_id,
                 schema,
+                true,
             )?);
         }
         Ok(BoundInsertForm::RowBatch(bounds))
@@ -4864,6 +4903,7 @@ fn bind_upsert_form(
             values,
             &stmt.operation_id,
             schema,
+            false,
         )?);
     }
 
@@ -5417,6 +5457,7 @@ fn bind_file_insert(
     // 埋める）ため、この判定自体の対象外として読み飛ばす
     // （`fill_omitted_columns` を素朴に適用すると VECTOR 列が
     // 「省略・DEFAULT なし・非 nullable」として誤って拒否されるため専用ループを保つ）。
+    let mut default_applied_columns: Vec<usize> = Vec::new();
     for (idx, column) in schema.columns.iter().enumerate() {
         if matches!(column.ty, ColumnType::Vector(_)) {
             continue;
@@ -5431,6 +5472,7 @@ fn bind_file_insert(
                 if let Some(slot) = template_values.get_mut(idx) {
                     *slot = value;
                 }
+                default_applied_columns.push(idx);
             }
             None => {
                 if !column.nullable {
@@ -5464,6 +5506,7 @@ fn bind_file_insert(
         body_column_index,
         vector_column_index,
         template_values,
+        default_applied_columns,
         operation_id: stmt.operation_id.clone(),
     })
 }
