@@ -1048,7 +1048,10 @@ fn cell_to_text(
         Cell::TimestampTz(micros) => Ok(Some(engine::datetime::format_timestamptz(*micros, tz))),
         // INTERVAL は `IntervalStyle=postgres` の整形（OID 1186。Issue #1579・#1583）。
         Cell::Interval(v) => Ok(Some(engine::datetime::format_interval(v))),
-        Cell::Array(array_value) => Ok(Some(pg_array_text(array_value))),
+        // 配列の描画は engine の `ArrayValue::to_pg_text` に集約（`CAST(.. AS text)` と共有。
+        // 空配列は `{}`、NULL 要素は引用なしの `NULL`、TEXT 要素の引用規則も同所。
+        // RowDescription の OID は他の非 VECTOR スカラー列と同じ text（25）のまま。WIRE-13）。
+        Cell::Array(array_value) => Ok(Some(array_value.to_pg_text())),
         // `BYTEA` のテキスト表現は PostgreSQL 既定の `bytea_output=hex`（`\x` ＋
         // 小文字 16 進）と同形にする（B5・Issue #886）。
         Cell::Bytes(b) => Ok(Some(engine::bytea::format_hex_text(b))),
@@ -1064,77 +1067,6 @@ fn cell_to_text(
         // Issue #887・U4）。
         Cell::Uuid(u) => Ok(Some(u.to_string())),
     }
-}
-
-/// 配列列（TABLE-14・TASK-198、Issue #888・D-A4、Issue #1193）を PostgreSQL 配列
-/// テキスト形式（`{a,b}`）へ描画する。空配列は `{}`、NULL 要素は引用なしの `NULL`、
-/// `BOOLEAN` 要素は `t`/`f`、整数は 10 進、`REAL`／`DOUBLE PRECISION` は
-/// `engine::scalar_float` の整形（スカラー列と同じ表現）、`DATE`／`TIMESTAMP` は
-/// `engine::datetime` の ISO 整形（`TIMESTAMP` は空白を含むため引用する）、`UUID` は
-/// 正規テキスト。`TEXT` 要素のうち、空文字列・`,{}"\` や空白を含むもの・大小無視で
-/// `NULL` に一致するものは `"..."` で囲み `"`・`\` をバックスラッシュでエスケープする
-/// ため、文字列 `NULL` は NULL 要素と区別される（`RowDescription` の OID は他の
-/// 非 VECTOR スカラー列と同じ text（25）のまま変更しない。WIRE-13）。
-fn pg_array_text(array_value: &engine::row_codec::ArrayValue) -> String {
-    use engine::row_codec::ArrayValue;
-
-    fn render<T>(items: &[Option<T>], f: impl Fn(&T) -> String) -> Vec<String> {
-        items
-            .iter()
-            .map(|item| match item {
-                Some(v) => f(v),
-                None => "NULL".to_string(),
-            })
-            .collect()
-    }
-
-    let elements: Vec<String> = match array_value {
-        ArrayValue::Text(items) => render(items, |s| quote_pg_array_text_elem(s)),
-        ArrayValue::Bool(items) => render(items, |b| if *b { "t" } else { "f" }.to_string()),
-        ArrayValue::Integer(items) => render(items, |v| v.to_string()),
-        ArrayValue::BigInt(items) => render(items, |v| v.to_string()),
-        ArrayValue::Real(items) => render(items, |v| engine::scalar_float::format_real(*v)),
-        ArrayValue::Double(items) => render(items, |v| engine::scalar_float::format_double(*v)),
-        ArrayValue::Date(items) => render(items, |v| engine::datetime::format_date(*v)),
-        ArrayValue::Timestamp(items) => render(items, |v| {
-            quote_pg_array_text_elem(&engine::datetime::format_timestamp(*v))
-        }),
-        ArrayValue::Uuid(items) => render(items, |v| v.to_string()),
-        // Issue #1357: NUMERIC は正規テキスト（引用不要）、BYTEA は `\x` 16 進（`\` を
-        // 含むため常に引用・エスケープされ PostgreSQL と同形の `"\\x0102"` になる）、
-        // JSON／JSONB／ENUM は格納テキスト／ラベルを引用要否判定へ通す。出力は
-        // `engine::sql::parser::parse_array_literal` で同じ値へ往復できる。
-        ArrayValue::Numeric(items) => render(items, |d| d.to_string()),
-        ArrayValue::Bytea(items) => render(items, |b| {
-            quote_pg_array_text_elem(&engine::bytea::format_hex_text(b))
-        }),
-        ArrayValue::Json(items) | ArrayValue::Jsonb(items) => {
-            render(items, |s| quote_pg_array_text_elem(s))
-        }
-        ArrayValue::Enum(items) => render(items, |s| quote_pg_array_text_elem(s)),
-    };
-    format!("{{{}}}", elements.join(","))
-}
-
-/// [`pg_array_text`] の TEXT 要素 1 個の引用要否判定・エスケープ処理。
-fn quote_pg_array_text_elem(s: &str) -> String {
-    let needs_quote = s.is_empty()
-        || s.eq_ignore_ascii_case("null")
-        || s.chars()
-            .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace());
-    if !needs_quote {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        if c == '"' || c == '\\' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('"');
-    out
 }
 
 /// `DataRow`（'D'）を `out` の末尾へ追記する（Issue #481。行ごとに新規

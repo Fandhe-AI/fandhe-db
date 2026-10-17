@@ -935,3 +935,235 @@ fn count_star_index_trusted_path_reflects_writes_after_generation_bump() {
         "stale index must never be trusted across a table generation bump"
     );
 }
+
+/// Issue #1592: 集計後の投影で CAST の結果型（bytea・配列）を許可し、全走査（cold）と索引経路
+/// （hot）の双方で同じ値を返す。先頭項目が集計呼び出しの SELECT リストに限る（構文の制約）。
+#[test]
+fn aggregate_projection_allows_cast_bytea_and_array_on_both_paths() {
+    let path = unique_db_path("scalar-index-aggregate-cast-projection");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let tenant_ctx = ctx("tenant-a");
+    insert_row(
+        &storage,
+        &tenant_ctx,
+        1,
+        Some("a"),
+        Some("{ab}"),
+        Visibility::Public,
+    );
+    insert_row(
+        &storage,
+        &tenant_ctx,
+        2,
+        Some("a"),
+        Some("{cd}"),
+        Visibility::Public,
+    );
+    // 索引の選択度ゲートを通すため、述語に合わない行を十分に足す。
+    for id in 3..=40u64 {
+        insert_row(
+            &storage,
+            &tenant_ctx,
+            id,
+            Some("b"),
+            Some("{zz}"),
+            Visibility::Public,
+        );
+    }
+    let core = new_core(storage);
+
+    let bytea_sql = "SELECT MAX(lang), CAST(MAX(lang) AS bytea) FROM docs WHERE kind = 'a'";
+    let delta = assert_cold_hot_equivalent(&core, "tenant-a", bytea_sql);
+    assert!(delta >= 1, "the index path must be exercised");
+    assert_eq!(
+        single_row_cells(&run(&core, "tenant-a", bytea_sql)),
+        vec![
+            Cell::Text("{cd}".to_string()),
+            Cell::Bytes(b"{cd}".to_vec())
+        ]
+    );
+
+    let array_sql = "SELECT MAX(lang), CAST(MAX(lang) AS text[]) FROM docs WHERE kind = 'a'";
+    let delta = assert_cold_hot_equivalent(&core, "tenant-a", array_sql);
+    assert!(delta >= 1, "the index path must be exercised");
+    let cells = single_row_cells(&run(&core, "tenant-a", array_sql));
+    assert!(
+        matches!(
+            cells.get(1),
+            Some(Cell::Array(engine::row_codec::ArrayValue::Text(v)))
+                if v.as_slice() == [Some("cd".to_string())]
+        ),
+        "{cells:?}"
+    );
+}
+
+/// Issue #1592: 索引経路でも TEXT 集計状態と CAST 結果が同じ結果バイト予算（カーソル経由は 16 MiB）
+/// で判定され、全走査と同じ `54000` になる。`CAST(MAX(d) AS bytea)` の内部集計項目 `MAX(d)` も
+/// TEXT 集計状態に数えるため、`MAX(a)`・`MAX(b)` と並べた 12,000,000＋4,000,000 は予算内、
+/// `MAX(c)` も足した 16,000,000＋4,000,000 は 16 MiB を超える。
+#[test]
+fn cast_bytea_result_shares_text_state_budget_on_index_path_like_full_scan() {
+    use engine::sql::mode::SessionState;
+    let path = unique_db_path("scalar-index-aggregate-cast-pool");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let pool_schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("kind", ColumnType::Text, true),
+            ColumnDef::new("a", ColumnType::Text, true),
+            ColumnDef::new("b", ColumnType::Text, true),
+            ColumnDef::new("c", ColumnType::Text, true),
+            ColumnDef::new("d", ColumnType::Text, true),
+        ],
+    );
+    storage.create_table(&pool_schema).expect("create table");
+    let big = "z".repeat(4_000_000);
+    let tenant_ctx = ctx("tenant-a");
+    // 1 行 1 列だけ大きな値を持たせ（行サイズ上限を避ける）、列ごとに別行へ置く。
+    // 述語に合わない小さな行を足し、索引の選択度ゲートを通す。
+    for id in 5..=44u64 {
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &tenant_ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![id as f32, 0.0]),
+                Value::Text("b".to_string()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            &op_id(&format!("seed-pool-b-{id}")),
+        )
+        .expect("insert filler row");
+    }
+    for id in 1..=4u64 {
+        let cell = |col: u64| {
+            if id == col {
+                Value::Text(big.clone())
+            } else {
+                Value::Null
+            }
+        };
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &tenant_ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![id as f32, 0.0]),
+                Value::Text("a".to_string()),
+                cell(1),
+                cell(2),
+                cell(3),
+                cell(4),
+            ],
+            &op_id(&format!("seed-pool-{id}")),
+        )
+        .expect("insert row");
+    }
+    let core = new_core(storage);
+    let caller = ctx("tenant-a");
+    let try_declare = |select: &str| {
+        let mut session = SessionState::default();
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        let sql = format!("DECLARE c CURSOR FOR SELECT {select} FROM {TABLE} WHERE kind = 'a'");
+        let r = core.execute_sql_in_txn(&caller, &mut session, &mut txn, &sql);
+        core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback");
+        r
+    };
+    let index_before = core.scalar_index_cache_stats().aggregate_index_scans;
+    // 全走査（索引キャッシュが冷たい初回）・索引経路（温まった 2 回目以降）の双方で同じ結果になる。
+    for round in 0..3 {
+        try_declare("MAX(a), MAX(b), CAST(MAX(d) AS bytea)")
+            .unwrap_or_else(|e| panic!("within the shared pool (round {round}): {e}"));
+        let err = try_declare("MAX(a), MAX(b), MAX(c), CAST(MAX(d) AS bytea)")
+            .expect_err("text state plus the cast result must exceed the shared pool");
+        assert_eq!(err.wire_code(), "54000", "round {round}");
+    }
+    assert!(
+        core.scalar_index_cache_stats().aggregate_index_scans > index_before,
+        "the index path must have been exercised"
+    );
+}
+
+/// Issue #1592: 集計 SELECT リストの CAST 項目は項目全体が CAST の形に限る。CAST が演算子
+/// （算術・jsonb 後置演算子・連結）の被演算子になる形は従来どおり `42601`。
+#[test]
+fn aggregate_cast_item_as_operator_operand_stays_syntax_error() {
+    let path = unique_db_path("scalar-index-aggregate-cast-operand");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    let core = new_core(storage);
+    for tail in ["->> 'k'", "-> 'k'", "#> '{k}'", "|| 'x'", "+ 1", "* 2"] {
+        let sql = format!("SELECT MAX(lang), CAST(MAX(lang) AS text) {tail} FROM docs");
+        let err = core
+            .execute_sql(&ctx("tenant-a"), &sql)
+            .expect_err("a CAST operand in an aggregate list stays unsupported");
+        assert_eq!(err.wire_code(), "42601", "{sql}");
+    }
+}
+
+/// Issue #1592: 集計後の投影が生成した TEXT（`CAST(.. AS char(n))` の空白埋め）も、型ごとの例外なく
+/// 結果バイト予算（カーソル経由は 16 MiB）へ計上され、超過は `54000`。`GROUP BY` と単一行集計の双方。
+#[test]
+fn aggregate_projection_charges_generated_text_to_result_budget() {
+    use engine::sql::mode::SessionState;
+    let path = unique_db_path("scalar-index-aggregate-char-pool");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let tenant_ctx = ctx("tenant-a");
+    for id in 1..=20u64 {
+        insert_row(
+            &storage,
+            &tenant_ctx,
+            id,
+            Some("a"),
+            Some(&format!("g{id}")),
+            Visibility::Public,
+        );
+    }
+    let core = new_core(storage);
+    let caller = ctx("tenant-a");
+    let try_declare = |select: &str| {
+        let mut session = SessionState::default();
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        let sql = format!("DECLARE c CURSOR FOR {select}");
+        let r = core.execute_sql_in_txn(&caller, &mut session, &mut txn, &sql);
+        core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback");
+        r
+    };
+    let pad = "CAST(MAX(kind) AS char(1048576))";
+    // GROUP BY: 1 MiB × 20 グループは 16 MiB を超える。3 グループ（WHERE で絞る）なら予算内。
+    let grouped =
+        |filter: &str| format!("SELECT lang, {pad} FROM docs WHERE {filter} GROUP BY lang");
+    try_declare(&grouped("lang = 'g1' OR lang = 'g2' OR lang = 'g3'"))
+        .expect("3 groups fit the result budget");
+    let err = try_declare(&grouped("kind = 'a'")).expect_err("20 MiB must exceed the budget");
+    assert_eq!(err.wire_code(), "54000");
+    // 単一行集計: 列 4 個（4 MiB）は予算内、17 個（17 MiB）は超過。
+    let single = |n: usize| {
+        let cols = vec![format!("MAX(kind), {pad}"); n].join(", ");
+        format!("SELECT {cols} FROM docs WHERE kind = 'a'")
+    };
+    try_declare(&single(4)).expect("4 columns fit the result budget");
+    let err = try_declare(&single(17)).expect_err("17 MiB of padding must exceed");
+    assert_eq!(err.wire_code(), "54000");
+}

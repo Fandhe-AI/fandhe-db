@@ -718,6 +718,18 @@ pub enum BoundExpr {
     BoolColumnRef {
         index: usize,
     },
+    /// nullable `UUID` 列の参照（Issue #1592・SQL-47）。`CAST` の被演算子の位置でだけ生成する。
+    UuidColumnRef {
+        index: usize,
+    },
+    /// nullable `BYTEA` 列の参照（Issue #1592・SQL-47）。`CAST` の被演算子の位置でだけ生成する。
+    ByteaColumnRef {
+        index: usize,
+    },
+    /// nullable 配列列の参照（Issue #1592・SQL-47）。`CAST` の被演算子の位置でだけ生成する。
+    ArrayColumnRef {
+        index: usize,
+    },
     /// `json_*` 関数・`to_json`・`json_build_*` の束縛結果（Issue #2180。束縛・評価は
     /// `sql::json_fn`）。
     JsonTextFn(Box<crate::sql::json_fn::BoundJsonFn>),
@@ -910,6 +922,15 @@ impl PartialEq for BoundExpr {
             (BoundExpr::BoolColumnRef { index: a }, BoundExpr::BoolColumnRef { index: b }) => {
                 a == b
             }
+            (BoundExpr::UuidColumnRef { index: a }, BoundExpr::UuidColumnRef { index: b }) => {
+                a == b
+            }
+            (BoundExpr::ByteaColumnRef { index: a }, BoundExpr::ByteaColumnRef { index: b }) => {
+                a == b
+            }
+            (BoundExpr::ArrayColumnRef { index: a }, BoundExpr::ArrayColumnRef { index: b }) => {
+                a == b
+            }
             (BoundExpr::JsonTextFn(a), BoundExpr::JsonTextFn(b)) => a == b,
             (BoundExpr::JsonPathFn(a), BoundExpr::JsonPathFn(b)) => a == b,
             (
@@ -1035,6 +1056,15 @@ pub enum ExprType {
     /// 比較・算術・関数引数・`CASE` 等・集計・代入は `0A000` で拒否する（f64 を経由すると
     /// 丸めが狂うため、正確な [`crate::numeric::Decimal`] のまま運ぶ）。
     Numeric,
+    /// `UUID` 値（Issue #1592・SQL-47）。`CAST` の結果と、`CAST` の被演算子としての UUID 列だけが
+    /// 生成する。消費できるのは投影と `CAST` の被演算子だけで、比較・算術・関数引数・`CASE` 等・
+    /// 集計・代入は `0A000` で拒否する。
+    Uuid,
+    /// `BYTEA` 値（Issue #1592・SQL-47。[`ExprType::Uuid`] と同じ消費規則）。
+    Bytea,
+    /// 配列値（Issue #1592・SQL-47。[`ExprType::Uuid`] と同じ消費規則）。要素型は式の型では持たず、
+    /// `CAST` の変換先・列のスキーマから導く（`ExprType` を `Copy` に保つため）。
+    Array,
 }
 
 /// 評価結果の値。
@@ -1073,6 +1103,12 @@ pub enum ExprValue<'a> {
     JsonText(Cow<'a, str>),
     /// `NUMERIC` 値（Issue #1591・SQL-47。[`ExprType::Numeric`] 参照）。
     Numeric(crate::numeric::Decimal),
+    /// `UUID` 値（Issue #1592・SQL-47。[`ExprType::Uuid`] 参照）。
+    Uuid(crate::uuid::Uuid),
+    /// `BYTEA` 値（Issue #1592・SQL-47。[`ExprType::Bytea`] 参照）。列参照は借用、変換結果は所有。
+    Bytes(Cow<'a, [u8]>),
+    /// 配列値（Issue #1592・SQL-47。[`ExprType::Array`] 参照）。
+    Array(crate::row_codec::ArrayValue),
     /// SQL の NULL（Issue #919・SQL-26、AC2 と Issue #921・SQL-26 の共有
     /// variant）。nullable TEXT 列参照・strict な関数への NULL 入力、および
     /// `CASE`／`COALESCE`／`NULLIF` の評価結果から生じる。呼び出し元
@@ -1081,6 +1117,32 @@ pub enum ExprValue<'a> {
     /// 扱う: `WHERE`/`CHECK` では非該当・充足、投影では `Cell::Null`、
     /// `SUM`/`AVG`/`MIN`/`MAX`/`COUNT(expr)` では当該行をスキップする。
     Null,
+}
+
+impl ExprValue<'_> {
+    /// 式の評価結果が出力セルとして保持するバイト数の見積り（ヒープを持つ variant はその長さ、
+    /// それ以外は固定の 8 バイト）。投影段（`sql::exec`・`sql::group_by`・単一行集計）が、生成した
+    /// 全セルを型ごとの例外なく結果バイト予算へ計上するために共有する（Issue #1592。
+    /// `sql::cursor::estimate_cell_bytes` と同じ規約）。セルへ変換・複製する前に呼ぶ。
+    pub(crate) fn estimated_cell_bytes(&self) -> usize {
+        let heap = match self {
+            ExprValue::Text(t) | ExprValue::Json(t) | ExprValue::JsonText(t) => t.len(),
+            ExprValue::Bytes(b) => b.len(),
+            ExprValue::Vector(v) => v.len().saturating_mul(4),
+            ExprValue::Array(a) => a.approx_heap_bytes(),
+            ExprValue::Numeric(_) => 32,
+            ExprValue::Scalar(_)
+            | ExprValue::Bool(_)
+            | ExprValue::Date(_)
+            | ExprValue::Timestamp(_)
+            | ExprValue::Time(_)
+            | ExprValue::TimestampTz(_)
+            | ExprValue::Interval(_)
+            | ExprValue::Uuid(_)
+            | ExprValue::Null => 0,
+        };
+        heap.saturating_add(8)
+    }
 }
 
 /// [`ExprValue::Vector`] を所有 `Vec<f32>` へ変換する（投影段など、評価結果を
@@ -1530,6 +1592,16 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
                 CastSrc::Numeric => &[ExprType::Numeric],
                 CastSrc::Bool => &[ExprType::Bool],
                 CastSrc::Text => &[ExprType::Text],
+                CastSrc::Date => &[ExprType::Date],
+                CastSrc::Time => &[ExprType::Time],
+                CastSrc::Timestamp => &[ExprType::Timestamp],
+                CastSrc::TimestampTz => &[ExprType::TimestampTz],
+                CastSrc::Interval => &[ExprType::Interval],
+                CastSrc::Json => &[ExprType::JsonText],
+                CastSrc::Jsonb => &[ExprType::Json],
+                CastSrc::Uuid => &[ExprType::Uuid],
+                CastSrc::Bytea => &[ExprType::Bytea],
+                CastSrc::Array(_) => &[ExprType::Array],
             };
             let ret = match c.to {
                 CastDst::Int2
@@ -1540,6 +1612,16 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
                 CastDst::Numeric(_) => ExprType::Numeric,
                 CastDst::Bool => ExprType::Bool,
                 CastDst::Text | CastDst::Varchar(_) | CastDst::Bpchar(_) => ExprType::Text,
+                CastDst::Date => ExprType::Date,
+                CastDst::Time => ExprType::Time,
+                CastDst::Timestamp => ExprType::Timestamp,
+                CastDst::TimestampTz => ExprType::TimestampTz,
+                CastDst::Interval => ExprType::Interval,
+                CastDst::Json => ExprType::JsonText,
+                CastDst::Jsonb => ExprType::Json,
+                CastDst::Uuid => ExprType::Uuid,
+                CastDst::Bytea => ExprType::Bytea,
+                CastDst::Array(_) => ExprType::Array,
             };
             (args, ret)
         }
@@ -2141,6 +2223,9 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
         | BoundExpr::DecimalColumnRef { .. }
+        | BoundExpr::UuidColumnRef { .. }
+        | BoundExpr::ByteaColumnRef { .. }
+        | BoundExpr::ArrayColumnRef { .. }
         | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => 1,
@@ -2227,6 +2312,9 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
         | BoundExpr::DecimalColumnRef { .. }
+        | BoundExpr::UuidColumnRef { .. }
+        | BoundExpr::ByteaColumnRef { .. }
+        | BoundExpr::ArrayColumnRef { .. }
         | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => 0,
@@ -2309,6 +2397,9 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
         | BoundExpr::DecimalColumnRef { .. }
+        | BoundExpr::UuidColumnRef { .. }
+        | BoundExpr::ByteaColumnRef { .. }
+        | BoundExpr::ArrayColumnRef { .. }
         | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => false,
@@ -2364,6 +2455,9 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::JsonbColumnRef { index }
         | BoundExpr::JsonColumnRef { index }
         | BoundExpr::DecimalColumnRef { index }
+        | BoundExpr::UuidColumnRef { index }
+        | BoundExpr::ByteaColumnRef { index }
+        | BoundExpr::ArrayColumnRef { index }
         | BoundExpr::BoolColumnRef { index }
         | BoundExpr::ColumnRef { index } => visit(*index),
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
@@ -2468,6 +2562,9 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::JsonbColumnRef { index }
         | BoundExpr::JsonColumnRef { index }
         | BoundExpr::DecimalColumnRef { index }
+        | BoundExpr::UuidColumnRef { index }
+        | BoundExpr::ByteaColumnRef { index }
+        | BoundExpr::ArrayColumnRef { index }
         | BoundExpr::BoolColumnRef { index }
         | BoundExpr::ColumnRef { index } => {
             if let Some(slot) = mask.get_mut(*index) {
@@ -2656,6 +2753,24 @@ pub(crate) fn bind_projection_expr(
     Ok(r)
 }
 
+/// 集計後の投影項目（`sql::parser::bind_aggregate_projection_expr`）用の束縛（Issue #1592）。
+/// [`bind_projection_expr`] と同じだが、式の最上位が CAST の結果型（numeric・uuid・bytea・配列）
+/// の場合は許可する（集計行の出力セルとして投影される位置。結果バイト予算は `sql::group_by` の
+/// 投影段が計上する）。jsonb／json の結果は従来どおり `0A000`。式の内側（演算の被演算子・
+/// 関数引数・`CASE` 等）の拒否は [`bind_expr_any`] 側の規則のまま維持される。
+pub(crate) fn bind_aggregate_projection_expr_top(
+    expr: &Expr,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    let r = bind_projection_expr_json_ok(expr, schema, registry, node_budget)?;
+    if !is_cast_only_type(r.1) {
+        reject_json_operand(r.1)?;
+    }
+    Ok(r)
+}
+
 /// [`bind_projection_expr`] の jsonb 結果許容版（Issue #1596）。投影項目
 /// （`sql::parser::bind_projection`）だけが使い、HAVING／ORDER BY 等の他の呼び出し元は
 /// jsonb 結果を `0A000` で拒否する [`bind_projection_expr`] を使う。
@@ -2822,6 +2937,11 @@ pub(crate) fn column_type_for_expr_type(ty: ExprType) -> Option<ColumnType> {
         ExprType::Json => Some(ColumnType::Jsonb),
         ExprType::JsonText => Some(ColumnType::Json),
         ExprType::Numeric => Some(crate::sql::cast::CAST_NUMERIC_RESULT_TYPE),
+        ExprType::Uuid => Some(ColumnType::Uuid),
+        ExprType::Bytea => Some(ColumnType::Bytea),
+        // 配列の要素型は式の型から分からない。`CAST` の結果は `expr_result_column_type` が
+        // 変換先の型から決める。
+        ExprType::Array => None,
         ExprType::Vector => None,
     }
 }
@@ -3120,10 +3240,20 @@ pub(super) fn in_check_binding() -> bool {
     CHECK_BINDING.with(std::cell::Cell::get)
 }
 
-/// numeric 値（[`ExprType::Numeric`]）を消費できない位置へ流れた場合の `0A000`（Issue #1591）。
+/// 投影と `CAST` の被演算子だけが消費できる式の型（Issue #1591・#1592）か。比較・算術・関数引数・
+/// `CASE` 等・集計・代入へ流れた場合は [`numeric_operand_unsupported`] で拒否する。
+pub(super) fn is_cast_only_type(ty: ExprType) -> bool {
+    matches!(
+        ty,
+        ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array
+    )
+}
+
+/// numeric／uuid／bytea／配列の値（[`ExprType::Numeric`]・[`ExprType::Uuid`]・[`ExprType::Bytea`]・
+/// [`ExprType::Array`]）を消費できない位置へ流れた場合の `0A000`（Issue #1591・#1592）。
 pub(super) fn numeric_operand_unsupported() -> SqlSurfaceError {
     SqlSurfaceError::FeatureNotSupported {
-        detail: "a numeric value produced by CAST can only be projected or cast again".to_string(),
+        detail: "a value produced by CAST can only be projected or cast again".to_string(),
     }
 }
 
@@ -3132,7 +3262,7 @@ pub(super) fn numeric_operand_unsupported() -> SqlSurfaceError {
 /// 投影・パス演算子の左辺は Issue #1597 までに対応済みで、それ以外は fail-closed に拒否する）。
 fn reject_json_operand(ty: ExprType) -> Result<(), SqlSurfaceError> {
     // numeric 値（Issue #1591）は投影と CAST の被演算子だけが消費できる。
-    if ty == ExprType::Numeric {
+    if is_cast_only_type(ty) {
         return Err(numeric_operand_unsupported());
     }
     if ty == ExprType::Json {
@@ -4585,7 +4715,7 @@ fn bind_unknown_literal_against(
     *node_budget = node_budget
         .checked_sub(1)
         .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
-    if other_ty == ExprType::Numeric {
+    if is_cast_only_type(other_ty) {
         return Err(numeric_operand_unsupported());
     }
     if s.len() > crate::row_codec::MAX_TEXT_FIELD_LEN as usize {
@@ -4897,7 +5027,7 @@ fn bind_binary(
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
     // numeric 式（CAST の結果。Issue #1591）は比較・算術の演算子を持たない。型の取り違え
     // （42804）ではなく、未対応であることを `0A000` で fail-closed に示す。
-    if lt == ExprType::Numeric || rt == ExprType::Numeric {
+    if is_cast_only_type(lt) || is_cast_only_type(rt) {
         return Err(numeric_operand_unsupported());
     }
     let mk = |op, l, r| BoundExpr::Binary {
@@ -6296,10 +6426,11 @@ pub(crate) fn json_value_from_expr_value(
                 detail: "json text value reached a jsonb function".to_string(),
             })
         }
-        // numeric 値は束縛段が jsonb 関数の引数から弾く（0A000）ため到達しない（Issue #1591）。
-        ExprValue::Numeric(_) => {
+        // numeric／uuid／bytea／配列の値は束縛段が jsonb 関数の引数から弾く（0A000）ため到達しない
+        // （Issue #1591・#1592）。
+        ExprValue::Numeric(_) | ExprValue::Uuid(_) | ExprValue::Bytes(_) | ExprValue::Array(_) => {
             return Err(SqlSurfaceError::FeatureNotSupported {
-                detail: "a numeric value cannot be converted to json yet".to_string(),
+                detail: "a value produced by CAST cannot be converted to json yet".to_string(),
             })
         }
     })
@@ -6324,9 +6455,11 @@ fn json_object_key(v: &ExprValue<'_>) -> Result<String, SqlSurfaceError> {
         ExprValue::Interval(_) => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "an interval value cannot be converted to json yet".to_string(),
         }),
-        ExprValue::Numeric(_) => Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "a numeric value cannot be converted to json yet".to_string(),
-        }),
+        ExprValue::Numeric(_) | ExprValue::Uuid(_) | ExprValue::Bytes(_) | ExprValue::Array(_) => {
+            Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "a value produced by CAST cannot be converted to json yet".to_string(),
+            })
+        }
         ExprValue::Json(_) | ExprValue::JsonText(_) | ExprValue::Vector(_) => {
             Err(SqlSurfaceError::InvalidParameterValue {
                 detail: "key value must be scalar, not array, composite, or json",
@@ -6654,6 +6787,44 @@ pub(crate) fn eval_with_scalars<'a>(
             Some(Some(ScalarRef::Numeric(d))) => Ok(ExprValue::Numeric(*d)),
             Some(Some(_)) => Err(SqlSurfaceError::Internal {
                 detail: "NUMERIC column reference resolved to a non-NUMERIC row scalar value"
+                    .to_string(),
+            }),
+        },
+        BoundExpr::UuidColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "UUID column reference is outside the decoded row scalar view".to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Uuid(u))) => Ok(ExprValue::Uuid(*u)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "UUID column reference resolved to a non-UUID row scalar value".to_string(),
+            }),
+        },
+        BoundExpr::ByteaColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "BYTEA column reference is outside the decoded row scalar view".to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Bytes(b))) => Ok(ExprValue::Bytes(Cow::Borrowed(b))),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "BYTEA column reference resolved to a non-BYTEA row scalar value"
+                    .to_string(),
+            }),
+        },
+        BoundExpr::ArrayColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "ARRAY column reference is outside the decoded row scalar view".to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Array(a))) => {
+                a.to_value()
+                    .map(ExprValue::Array)
+                    .map_err(|_| SqlSurfaceError::Internal {
+                        detail: "ARRAY column value could not be decoded".to_string(),
+                    })
+            }
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "ARRAY column reference resolved to a non-ARRAY row scalar value"
                     .to_string(),
             }),
         },
