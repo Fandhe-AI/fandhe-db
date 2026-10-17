@@ -392,4 +392,3 @@ SQL の INSERT／UPDATE／UPSERT／COPY、NoSQL の insert／update／filter `eq
 - **上限の CLI**: `--max-array-elements`（#1548）が多次元の宣言にも効くことを wire 結合テスト
   （`wire_array_multidim_output.rs`）で固定した。式の結果や中間値の総数へ設定値を通すことは
   engine 横断の変更のため対象外（現状は定数 1024 で、既定値の挙動は一致）。
-
