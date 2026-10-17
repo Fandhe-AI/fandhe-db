@@ -360,6 +360,22 @@ fn update_set_assigns_array_expressions() {
         arr(&core, "SELECT tags FROM t WHERE id = 3 LIMIT 1"),
         V::Text(vec![Some("1".into()), Some("2".into())])
     );
+    // 配列列の直接参照（同型・要素型変換）。
+    ok(
+        &core,
+        "alice",
+        "UPDATE t SET big = nums WHERE id = 1 USING OPERATION_ID 'u3a'",
+    );
+    assert_eq!(
+        arr(&core, "SELECT big FROM t WHERE id = 1 LIMIT 1"),
+        V::BigInt(vec![Some(20), Some(30)])
+    );
+    ok(
+        &core,
+        "alice",
+        "UPDATE t SET nums = nums WHERE id = 1 USING OPERATION_ID 'u3b'",
+    );
+    assert_eq!(nums(1), ints(&[Some(20), Some(30)]));
     // 空配列。
     ok(
         &core,
@@ -468,6 +484,27 @@ fn column_default_accepts_a_constructor() {
     assert_eq!(
         arr(&core, "SELECT a FROM d WHERE id = 1 LIMIT 1"),
         ints(&[Some(1), Some(2)])
+    );
+}
+
+#[test]
+fn quoted_array_identifier_is_not_a_constructor() {
+    let (path, _g) = setup("arr-quoted");
+    let core = core_at(&path);
+    // 引用付き "array" は識別子（該当列が無ければ 42703）で、コンストラクタには化けない。
+    assert_eq!(code(&core, "SELECT \"array\"[1] FROM t LIMIT 1"), "42703");
+    assert_eq!(code(&core, "SELECT \"Array\"[1] FROM t LIMIT 1"), "42703");
+    assert_eq!(
+        code(&core, "SELECT id FROM t WHERE \"array\"[1] = 1 LIMIT 1"),
+        "42703"
+    );
+    let sql = "UPDATE t SET nums = \"array\"[1] WHERE id = 3 USING OPERATION_ID 'q1'";
+    assert_eq!(code(&core, sql), "42703");
+    // 引用なしは従来どおりコンストラクタ。
+    ok(
+        &core,
+        "alice",
+        "UPDATE t SET nums = ARRAY[1] WHERE id = 3 USING OPERATION_ID 'q2'",
     );
 }
 

@@ -2994,6 +2994,30 @@ pub(crate) fn bind_projection_expr_json_ok(
     Ok((bound, ty, col))
 }
 
+/// 配列列への `UPDATE ... SET` 右辺を束縛する（TABLE-35・Issue #1602。`sql::set_expr` から呼ばれる）。
+///
+/// 通常の投影束縛と同じだが、右辺が裸の列名のときは CAST の被演算子と同じ規則（配列列を
+/// `ArrayColumnRef` の葉として受理）で解決する。これで `SET nums = other_nums` が到達できる。
+pub(crate) fn bind_array_assignment_source(
+    expr: &Expr,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    let mut env = BindEnv {
+        schema: Some(schema),
+        params: std::collections::HashMap::new(),
+        registry,
+        case_nesting: 0,
+        typed_arith: true,
+        clock: time_fn::current_clock(),
+        collation_leaf: false,
+    };
+    let (bound, ty) = crate::sql::cast::bind_operand(expr, &mut env, node_budget)?;
+    let col = expr_result_column_type(expr, &bound, ty);
+    Ok((bound, ty, col))
+}
+
 /// 式内の TEXT 系列参照が持つ照合（列定義の `collation`）を引く。範囲外・スキーマなしは
 /// `None`（照合指定なし＝既定）として扱う。
 fn column_collation(

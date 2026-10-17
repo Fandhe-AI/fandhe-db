@@ -21,8 +21,8 @@ use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::row_codec::{ScalarRef, Value};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::udf_call::{
-    bind_projection_expr, bind_projection_expr_json_ok, eval_with_scalars,
-    first_non_builtin_call_with, BoundExpr, Expr, ExprType, ExprValue, UdfRegistry, MAX_EXPR_NODES,
+    bind_projection_expr, eval_with_scalars, first_non_builtin_call_with, BoundExpr, Expr,
+    ExprType, ExprValue, UdfRegistry, MAX_EXPR_NODES,
 };
 
 /// f64 で整数を正確に表現できる上限（2^53）。これを超える BIGINT への代入は精度欠落の
@@ -104,7 +104,7 @@ pub(crate) fn bind_set_expr(
     // 配列列への代入だけ、式の最上位が配列値であることを許す（他の位置の cast-only 型の拒否規則は
     // 変えない）。配列以外の型が来たら下の `assignable` が `42804` にする。
     let (bound, ty, _) = if matches!(column.ty, ColumnType::Array(_)) {
-        bind_projection_expr_json_ok(expr, schema, &registry, &mut budget)?
+        crate::sql::udf_call::bind_array_assignment_source(expr, schema, &registry, &mut budget)?
     } else {
         bind_projection_expr(expr, schema, &registry, &mut budget)?
     };
