@@ -976,12 +976,20 @@ pub(crate) fn push_canonical_component(
             let mut payload = Vec::new();
             // NULL 要素を含む配列は要素タグへ 0x80 を立て、NULL を含まない配列の
             // キー（既存値。バイト列不変）と先頭バイトで区別する（Issue #1193）。
-            let null_mark = if a.flags() == 0 {
+            let null_mark = if a.flags() & crate::row_codec::ARRAY_FLAG_HAS_NULLS == 0 {
                 0
             } else {
                 ARRAY_KEY_NULL_MARK
             };
-            payload.push(array_elem_tag(a.elem()) | null_mark);
+            // 2 次元以上（Issue #1605）は要素タグへ 0x40 を立てる。次元ヘッダ（次元数・各次元長）は
+            // `equality_payload` の先頭に含まれるため、`{{1,2},{3,4}}` と `{1,2,3,4}` は
+            // タグとペイロードの両方で区別される。1 次元のキーはバイト列不変。
+            let dims_mark = if a.flags() & crate::row_codec::ARRAY_FLAG_HAS_DIMS == 0 {
+                0
+            } else {
+                ARRAY_KEY_DIMS_MARK
+            };
+            payload.push(array_elem_tag(a.elem()) | null_mark | dims_mark);
             payload.extend_from_slice(&a.count().to_be_bytes());
             // JSON／NUMERIC 要素は値等価の正準形へ差し替える（Issue #1357 D4）。
             let eq = a
@@ -1120,6 +1128,10 @@ fn array_elem_tag(elem: crate::catalog::ArrayElemType) -> u8 {
 
 /// NULL 要素を含む配列の一意キー要素タグへ立てるマーカービット（Issue #1193）。
 const ARRAY_KEY_NULL_MARK: u8 = 0x80;
+
+/// 2 次元以上の配列の一意キー要素タグへ立てるマーカービット（Issue #1605）。要素型タグ
+/// （0〜13）・[`ARRAY_KEY_NULL_MARK`] のどちらとも重ならない。永続化されるため値は固定。
+const ARRAY_KEY_DIMS_MARK: u8 = 0x40;
 
 /// `FOREIGN KEY` 1 件分の参照元側の検査仕様（TABLE-17・TASK-205、Issue #907）。
 struct ForeignKeySpec<'a> {
@@ -3631,9 +3643,12 @@ mod tests {
         for (elem, expected) in elems {
             let tag = array_elem_tag(elem);
             assert_eq!(tag, expected, "persisted tag must not be renumbered");
-            assert!(tag < ARRAY_KEY_NULL_MARK);
+            assert!(tag < ARRAY_KEY_DIMS_MARK);
             assert!(seen.insert(tag), "duplicate tag {tag}");
         }
+        // 永続化されるマーカーの値も固定する（Issue #1605）。
+        assert_eq!(ARRAY_KEY_NULL_MARK, 0x80);
+        assert_eq!(ARRAY_KEY_DIMS_MARK, 0x40);
     }
 
     fn tmp_storage(label: &str) -> (Storage, CleanupGuard) {

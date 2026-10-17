@@ -1556,7 +1556,7 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
     for (elem, value) in cases {
         // NULL 要素あり・NULL 要素なし・空配列・全要素 NULL のいずれも往復する。
         roundtrip_single(array_schema_of(elem), Value::Array(value.clone()));
-        let empty = match &value {
+        let empty = match value.flat() {
             ArrayValue::Text(_) => ArrayValue::Text(vec![]),
             ArrayValue::Bool(_) => ArrayValue::Bool(vec![]),
             ArrayValue::Integer(_) => ArrayValue::Integer(vec![]),
@@ -1571,6 +1571,8 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
             ArrayValue::Json(_) => ArrayValue::Json(vec![]),
             ArrayValue::Jsonb(_) => ArrayValue::Jsonb(vec![]),
             ArrayValue::Enum(_) => ArrayValue::Enum(vec![]),
+            // `flat()` は `Multi` を返さない（網羅性のための腕。Issue #1605）。
+            ArrayValue::Multi(_) => unreachable!("flat() never returns Multi"),
         };
         roundtrip_single(array_schema_of(elem), Value::Array(empty));
     }

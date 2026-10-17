@@ -366,3 +366,59 @@ fn wire_array_extended_element_types_roundtrip() {
         read_ready_for_query(&mut stream);
     }
 }
+/// 多次元配列（TABLE-35 (2)・Issue #1605）が simple query 経由で往復する。`DataRow` は入れ子の
+/// PostgreSQL 配列テキストで、`RowDescription` の型公告は他の配列列と同じ text のまま
+/// （配列型 OID の公告は WIRE-13 の後続 Issue の範囲）。不整列リテラルは `22P02`。
+#[test]
+fn wire_multi_dimensional_array_roundtrips_and_rejects_ragged_literals() {
+    let path = temp_db::unique_db_path("wire-array-column-multidim");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "grid",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new(
+                    "m",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Integer, 16)
+                            .and_then(|a| a.with_ndims(2))
+                            .expect("array ty"),
+                    ),
+                    true,
+                ),
+            ],
+        ))
+        .expect("create table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addrs = spawn_with_users(core, &[("alice", "tenant-alice", "pw-alice")]);
+    let mut stream = authenticate_to_ready_for_query(addrs[0], "alice", "pw-alice");
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO grid (id, embedding, m) VALUES (1, '[0.1,0.2]', '{{1,2},{3,NULL}}') \
+         USING OPERATION_ID 'op-m1'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT id, m FROM grid WHERE id = 1 LIMIT 1");
+    let names = read_row_description(&mut stream);
+    assert_eq!(names, vec!["id".to_string(), "m".to_string()]);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[1].as_deref(), Some("{{1,2},{3,NULL}}"));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO grid (id, embedding, m) VALUES (2, '[0.1,0.2]', '{{1,2},{3}}') \
+         USING OPERATION_ID 'op-m2'",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "22P02");
+    read_ready_for_query(&mut stream);
+}
