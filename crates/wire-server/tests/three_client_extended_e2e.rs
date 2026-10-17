@@ -1669,6 +1669,10 @@ type RejectionCase<'a> = (&'a str, Client, &'a str, Vec<String>, Opts, &'a str);
 const PARAM_UPD_N: &str = "UPDATE param_items SET n = $1 WHERE id = 1 USING OPERATION_ID $2";
 const PARAM_SEL_N: &str = "SELECT n FROM param_items WHERE id = 1 LIMIT 5";
 const PARAM_UPD_REQ: &str = "UPDATE param_items SET req = $1 WHERE id = 1 USING OPERATION_ID $2";
+/// 各テナントが自分の行として INSERT する NOT NULL 違反（id=1 は tenant-a の行で、他テナントの
+/// UPDATE は 23502 に到達しないため、テナント越しの同一応答検証にはこちらを使う）。
+const PARAM_INS_REQ_NULL: &str =
+    "INSERT INTO param_items (id, n, s, req) VALUES (9001, 1, 'x', $1) USING OPERATION_ID $2";
 const PARAM_WHERE_N: &str = "SELECT s FROM param_items WHERE n = $1 LIMIT 5";
 const PARAM_WHERE_S: &str = "SELECT n FROM param_items WHERE s = $1 LIMIT 5";
 /// 推論できる文脈を持たない 2 項演算（OID 0 は `42P18`）。
@@ -2373,7 +2377,7 @@ fn three_clients_param_type_rejections_do_not_reveal_other_tenants() {
         (
             "psycopg 23502",
             Client::Psycopg,
-            PARAM_UPD_REQ,
+            PARAM_INS_REQ_NULL,
             vec![],
             Opts {
                 typed_json: Some(typed_json(&[
