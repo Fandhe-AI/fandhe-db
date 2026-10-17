@@ -10,10 +10,11 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 ## 構文
 
 ```
-DROP TABLE <table>
+DROP TABLE [IF EXISTS] <table>
 ```
 
-- `IF EXISTS`・`CASCADE`・`RESTRICT`・複数テーブル列挙・`USING OPERATION_ID` 句は
+- `IF EXISTS` は Issue #1614 で受理に変わった（末尾の「Issue #1614 追記」参照）。
+- `CASCADE`・`RESTRICT`・複数テーブル列挙・`USING OPERATION_ID` 句は
   いずれも構造的に受理しない（許可リスト外・`42601`）。SQL-8 の「受理形以外は
   `42601`」方針に従う。`CASCADE` は spec でも対象外と明示されている。
 - `EXPLAIN DROP TABLE ...` は既存の `EXPLAIN` 分岐（次トークンが `SELECT` である
@@ -83,7 +84,7 @@ wire-server）へ配線すると、任意の認証済みテナントが他テナ
 ## 判定順序（fail-closed）: 構文 → 権限 → 存在
 
 1. **構文検証**（`sql::allowlist::validate_drop_table_tokens`）。カタログ照会を
-   一切行わない。`IF EXISTS`・`CASCADE` 等は許可リスト外として `42601`。
+   一切行わない。`CASCADE` 等は許可リスト外として `42601`（`IF EXISTS` は Issue #1614 で受理）。
 2. **DDL 実行権限ゲート**（`sql::ddl::require_ddl_permission`）。カタログ照会・
    書き込みトランザクション開始のいずれよりも前に判定する。`42501`。
 3. **実行本体**（`sql::ddl::execute_drop_table` → `catalog::Storage::
@@ -149,3 +150,26 @@ drop_table_without_permission_is_rejected_with_42501_regardless_of_table_existen
 - ドロップ済みテーブルのキャッシュエントリの能動的解放（現状は世代照合による
   遅延失効で正しさは担保済み）
 - `ErrorClass::ForbiddenTenantMismatch` の改名・汎化（ラベル変更は別 Issue 相当）
+
+## Issue #1614 追記: `IF EXISTS`（TABLE・INDEX・VIEW・TYPE 共通）
+
+対象ビヘイビア: TABLE-36（親 Issue #1612）。`DROP TABLE|INDEX|VIEW|TYPE IF EXISTS <name>` を
+受理する。PostgreSQL 17 の公開挙動に揃え、対象が無ければ何もせず成功する。
+
+- **構文**: `IF`・`EXISTS` は予約語化していないため、`Parser::consume_if_exists` が
+  2 トークン先読みで判定する（`DROP TABLE if` のように `if` という名前を指す従来解釈を保つ）。
+  `ValidatedDropTable.if_exists`（pub）と `ValidatedDrop{View,Index,Type}::if_exists()` に保持する。
+- **no-op の判定は `sql::ddl` 層**: `execute_drop_*` が、`if_exists` かつ対応する
+  `*NotFound`（`TableNotFound`／`ViewNotFound`／`IndexNotFound`／`TypeNotFound`）の場合だけ
+  成功に読み替える。`Storage::drop_*` はこれらを commit 前に返し write txn が破棄されるため、
+  カタログ・行・`operation_id` 台帳・各世代は変わらない（副作用ゼロ）。`Storage::drop_*` の
+  fail-closed 契約は変えない。
+- **従来どおり**: 種類違い（`42809`）・依存あり（`2BP01`）・`55P03` 等は読み替えない。
+  判定順序（構文 → DDL 権限 `42501` → 存在）も不変で、権限の無いセッションは存否に関わらず
+  `42501`（no-op を存在オラクルにしない）。明示トランザクション内の DDL は `0A000`。
+- **成功応答**: `Drop*Outcome::skipped()` で no-op かを取得できる。`CommandComplete` タグは
+  通常の DROP と同一。
+- **対象外**: NoticeResponse（`... does not exist, skipping`）の送出（wire-server に encoder が
+  無く後続課題）、複数名・`CASCADE`／`RESTRICT`、NoSQL 表層 `drop_table` op への `if_exists` 追加。
+- **破壊的変更**: `ValidatedDropTable` へのフィールド追加と `Drop*Outcome` の非公開フィールド追加
+  により、crate 外での構造体リテラル構築ができなくなる。

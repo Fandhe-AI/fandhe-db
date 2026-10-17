@@ -112,7 +112,6 @@ fn malformed_statements_are_syntax_errors_regardless_of_permission() {
         "CREATE TYPE IF NOT EXISTS t1 AS ENUM ('a')",
         "CREATE TYPE s.t1 AS ENUM ('a')",
         "CREATE TYPE t1 AS ENUM ('a') junk",
-        "DROP TYPE IF EXISTS t1",
         "DROP TYPE t1 CASCADE",
         "DROP TYPE a, b",
         "DROP TYPE",
