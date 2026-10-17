@@ -950,6 +950,22 @@ fn build_projected_cells(
                     }
                     // `CAST(.. AS numeric)` の結果（Issue #1591）。固定長の値で確保は伴わない。
                     ExprValue::Numeric(d) => cells.push(Cell::Numeric(d)),
+                    ExprValue::Uuid(u) => cells.push(Cell::Uuid(u)),
+                    // `CAST` の結果の BYTEA・配列（Issue #1592）は、列直接投影と同じ累計バイト予算に
+                    // 計上する（行数分の蓄積で予算を回避させない）。
+                    ExprValue::Bytes(b) => {
+                        *byte_budget =
+                            try_accumulate_budget(*byte_budget, b.len(), max_result_bytes)?;
+                        cells.push(Cell::Bytes(b.into_owned()));
+                    }
+                    ExprValue::Array(a) => {
+                        *byte_budget = try_accumulate_budget(
+                            *byte_budget,
+                            a.approx_heap_bytes(),
+                            max_result_bytes,
+                        )?;
+                        cells.push(Cell::Array(a));
+                    }
                 }
             }
         }

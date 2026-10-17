@@ -345,9 +345,9 @@ fn typed_null(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
         }
         // numeric 値は CAST の結果としてのみ生じ、INSERT VALUES の定数式では CAST 自体を拒否する
         // ため到達しない（fail-closed）。
-        ExprType::Numeric => {
+        ExprType::Numeric | ExprType::Uuid | ExprType::Bytea | ExprType::Array => {
             return Err(SqlSurfaceError::unsupported(
-                "a numeric value is not allowed in a constant expression",
+                "a value produced by CAST is not allowed in a constant expression",
             ))
         }
         // `INTERVAL` は `NULLIF` が比較を要する（#1580 まで未対応）ため、分岐なしの
@@ -679,9 +679,11 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         ExprValue::Json(_) | ExprValue::JsonText(_) => Err(SqlSurfaceError::unsupported(
             "a json value is not allowed in a constant expression",
         )),
-        ExprValue::Numeric(_) => Err(SqlSurfaceError::unsupported(
-            "a numeric value is not allowed in a constant expression",
-        )),
+        ExprValue::Numeric(_) | ExprValue::Uuid(_) | ExprValue::Bytes(_) | ExprValue::Array(_) => {
+            Err(SqlSurfaceError::unsupported(
+                "a value produced by CAST is not allowed in a constant expression",
+            ))
+        }
     }
 }
 

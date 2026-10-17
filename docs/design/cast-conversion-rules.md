@@ -231,9 +231,9 @@ TABLE-39・TABLE-40・INDEX-9）では、他テナントの値が呼び出し元
   Integer・BigInt・Real・Double・Boolean・Date・Timestamp・Time・TimestampTz・Interval・
   Array・Bytea・Json・Jsonb・Enum・Numeric・Uuid
 - `crates/engine/src/sql/udf_call.rs` の `ExprType`: Scalar・Vector・Bool・Text・Date・
-  Timestamp・Time・TimestampTz・Interval・Json・JsonText・Numeric（数値は `NumericKind` で区別。
-  `Numeric` は Issue #1591 で追加した厳密値の型）。Uuid・Bytea・配列を表す式の型は未整備で、
-  #1592 の前提となる
+  Timestamp・Time・TimestampTz・Interval・Json・JsonText・Numeric・Uuid・Bytea・Array（数値は
+  `NumericKind` で区別。`Numeric` は Issue #1591、`Uuid`・`Bytea`・`Array` は Issue #1592 で
+  追加した。`Array` は要素型を持たず、要素型は `CAST` の変換先・列のスキーマから導く）
 - `crates/engine/src/error_format.rs` の `ErrorClass` に `42846`（`CannotCoerce`）を登録済み
   （Issue #1590。wire-server の HTTP 写像〔400〕・`nosql-api.md` も追従）。構文は `Expr::Cast`
   （`sql::udf_call`）、規則表と束縛は新モジュール `sql::cast`（表を 400 セル照合する単体テスト付き）
@@ -322,3 +322,64 @@ PostgreSQL 17 との照合は実機を使えなかったため、本書の「系
 修飾子なしの `numeric`／`decimal` と `numeric(p)`（`= numeric(p,0)`）は、CAST と
 `<型名> '<文字列リテラル>'` の型名に限って受け付ける。DDL の型名解析は変えていない
 （修飾子なしの `numeric` 列は従来どおり `42601`）。
+
+### Issue #1592 で確定した差分
+
+日付時刻・JSON・UUID・BYTEA・配列が絡む残りの 300 セル（新しい 10 行 × 20 列 ＋ 数値 6 型・BOOLEAN・
+文字列 3 型の 10 行 × 新しい 10 列）の値の変換を実装した。評価は `sql::cast_value`
+（`apply_cast_ext`）、束縛は `sql::cast::bind_cast`。テストは
+`crates/engine/tests/sql_cast_datetime_json_misc.rs`（300 セルをセルキー `<変換元>-><変換先>` で網羅。
+`×` は `42846`、それ以外は値と結果列の型、NULL 伝播）。PostgreSQL 17 実機との照合は未実施で、本書の
+「系統ごとの値レベルの規則」を拠り所にした。
+
+#### 実装した範囲
+
+- 日付時刻間: date → timestamp／timestamptz、timestamp → date／time／timestamptz、
+  timestamptz → date／time／timestamp、time → interval、interval → time。timestamptz が絡む変換と
+  文字列化・解析は**評価時**のセッション `TimeZone` に従う（束縛時に固定しない）。interval → time は
+  月・日を捨て、時刻部分を 1 日の剰余（`rem_euclid`）にする（`-1 hour` は `23:00:00`、`24:00:00` は
+  `00:00:00`）。範囲外は `22008`
+- 日付時刻 ⇄ 文字列型: 出力は `format_*`（timestamptz は評価時のセッション TZ）、入力は `parse_*`
+  （ゾーンの無い timestamptz は評価時のセッション TZ の壁時計）。エラーの SQLSTATE は型なし
+  リテラル（束縛時）と文字列式（評価時）で共有する（`22007`／`22008`／`22015`／`22023`。interval の
+  無限大は `0A000`）
+- json ⇄ jsonb: json → jsonb は重複キーを最後の値で畳んで正規化、jsonb → json は正規化テキストのまま。
+  文字列型 → json は構文検証のみで原文を保持し、→ jsonb は正規化する（不正は `22P02`）
+- jsonb → 数値 6 型・boolean（`e`）: 数値は numeric を経由して #1591 の変換（四捨五入・範囲検査 `22003`・
+  `numeric(p,s)` の丸め）を共有する。型の合わない JSON は `22023`（`cannot cast jsonb <string|numeric|
+  boolean|null|array|object> to type <型名>`。値を含まない固定文言）
+- uuid ⇄ 文字列型: 出力は小文字の正規形、入力は厳密な 36 文字形（不正は `22P02`）
+- bytea ⇄ 文字列型: 出力は `\x` ＋ 小文字 16 進、入力は PostgreSQL の `byteain` に従う（`\x` 始まりは
+  16 進、それ以外は escape 形式。`'abc'` は `\x616263`）。16 進の奇数桁・不正桁は `22023`、
+  escape 形式の不正は `22P02`
+- 配列 → 文字列型: engine の `ArrayValue::to_pg_text`（wire-server から移設。出力は不変）。結果が
+  TEXT の上限を超えるときは描画の途中で打ち切って `54000`
+- 文字列型 → 配列: `parse_array_literal` を共有する（形式不正は `22P02`、要素数の上限超過は `54000`、
+  要素の不正は要素型の SQLSTATE）
+- 配列 → 配列: 要素型の組で規則を引き直し（`×` なら `42846`）、要素ごとに変換する。NULL 要素は NULL の
+  まま、要素のエラーはその SQLSTATE のまま。同じ要素型どうしは値を変えない
+- 結果列の型: uuid／bytea は `Uuid`／`Bytea`、配列は `ArrayType`（要素数上限は `MAX_ARRAY_ELEMENTS`）
+- 型なし文字列リテラルと列の値が同じ入力関数を通る（json・uuid・bytea・配列は束縛時に 1 度検証する）
+- `UUID`／`BYTEA`／配列列は、NUMERIC／BOOLEAN 列と同じく CAST の被演算子の位置でだけ式の中で参照できる
+
+#### PostgreSQL との差分（fail-closed 側）
+
+| 項目 | 本エンジン | 理由 |
+| ---- | ---------- | ---- |
+| uuid の入力形式 | 厳密な 36 文字形のみ。波括弧・ハイフンなし・`urn:uuid:` 等は `22P02` | 文法を閉じる（#887 の列リテラルと共有） |
+| bytea の 16 進本体の空白 | `22023`（PostgreSQL は許容） | 列リテラルの入力関数と文法を揃える |
+| bytea の escape 形式の入力 | `CAST` の入力関数でのみ受理。INSERT のリテラル束縛は `\x` 形式のみのまま | INSERT の束縛は本 Issue の対象外 |
+| escape 形式の入力が上限（4 MiB）を超える | `54000`（`\\`・`\ooo` で縮む場合も入力長で判定） | 確保前の上限判定を単純に保つ |
+| 日付時刻の文字列入力の前後空白 | `22007`（PostgreSQL は許容） | 既存の型付きリテラルと文法を共有する |
+| 配列の変換先にできる要素型 | boolean・text・integer・bigint・real・double precision・date・timestamp・uuid・`numeric(p,s)`・bytea・json・jsonb。それ以外（smallint・time・timestamptz・interval・`varchar(n)`・`char(n)`・修飾子なしの numeric・ENUM）は規則表で `×` でなければ `0A000` | 配列列の行内表現（`ArrayElemType`）に対応が無い |
+| 多次元配列・添字範囲装飾（`[1:2]={..}`） | `22P02` | 1 次元のみ |
+| bigint 配列の 2^53 を超える要素の変換 | `22003` | 式評価が整数を f64 で運ぶ（スカラーの int8 と同じ） |
+| 配列・uuid・bytea 値の消費位置 | 投影と CAST の被演算子だけ（比較・算術・関数引数・CASE・集計・ORDER BY・代入は `0A000`） | 式評価にこれらの演算が無い |
+| enum 要素の配列 | 文字列型への変換のみ可（配列への変換は `0A000`） | 要素型を CAST の型で表せない |
+
+#### 対象外
+
+- uuid・bytea・配列・numeric・bool 列の式の一般位置での利用（比較・関数引数等）
+- 多次元配列、`ArrayElemType` に無い要素型の配列への変換
+- INSERT のリテラル束縛での bytea escape 形式
+- PostgreSQL の配列エラー文言（`malformed array literal` 等）との完全一致

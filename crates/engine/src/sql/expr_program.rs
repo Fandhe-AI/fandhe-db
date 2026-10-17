@@ -266,6 +266,12 @@ pub(crate) enum StackValue {
     /// `NUMERIC` 値（Issue #1591。`CAST` の結果・NUMERIC 列の被演算子。[`ExprStep::JsonSubtree`]
     /// と同じ再帰評価の結果として積まれる）。
     Decimal(crate::numeric::Decimal),
+    /// `UUID` 値（Issue #1592。`CAST` の結果・UUID 列の被演算子。[`StackValue::Decimal`] と同じ経路）。
+    Uuid(crate::uuid::Uuid),
+    /// `BYTEA` 値（Issue #1592。[`StackValue::Uuid`] と同じ経路）。
+    Bytes(Vec<u8>),
+    /// 配列値（Issue #1592。[`StackValue::Uuid`] と同じ経路）。
+    Array(crate::row_codec::ArrayValue),
 }
 
 /// [`StackValue`] を、eval 呼び出しスコープに閉じたライフタイム `'a` を持つ
@@ -367,6 +373,9 @@ fn stack_to_expr_value<'a>(
         StackValue::Json(s) => Ok(ExprValue::Json(Cow::Owned(s))),
         StackValue::JsonText(s) => Ok(ExprValue::JsonText(Cow::Owned(s))),
         StackValue::Decimal(d) => Ok(ExprValue::Numeric(d)),
+        StackValue::Uuid(u) => Ok(ExprValue::Uuid(u)),
+        StackValue::Bytes(b) => Ok(ExprValue::Bytes(Cow::Owned(b))),
+        StackValue::Array(a) => Ok(ExprValue::Array(a)),
         StackValue::NumericColumnRef(index) => match row_scalars.get(index) {
             None => Err(SqlSurfaceError::Internal {
                 detail: "NUMERIC column reference is outside the decoded row scalar view"
@@ -408,6 +417,9 @@ fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
         ExprValue::Json(j) => StackValue::Json(j.into_owned()),
         ExprValue::JsonText(j) => StackValue::JsonText(j.into_owned()),
         ExprValue::Numeric(d) => StackValue::Decimal(d),
+        ExprValue::Uuid(u) => StackValue::Uuid(u),
+        ExprValue::Bytes(b) => StackValue::Bytes(b.into_owned()),
+        ExprValue::Array(a) => StackValue::Array(a),
     }
 }
 
@@ -476,6 +488,9 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
                 | ExprValue::Json(_)
                 | ExprValue::JsonText(_)
                 | ExprValue::Numeric(_)
+                | ExprValue::Uuid(_)
+                | ExprValue::Bytes(_)
+                | ExprValue::Array(_)
                 | ExprValue::Null => None,
             }
         }
@@ -552,6 +567,9 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::Numeric(_)
         | BoundExpr::DecimalColumnRef { .. }
         | BoundExpr::BoolColumnRef { .. }
+        | BoundExpr::UuidColumnRef { .. }
+        | BoundExpr::ByteaColumnRef { .. }
+        | BoundExpr::ArrayColumnRef { .. }
         | BoundExpr::JsonTextFn(_)
         | BoundExpr::JsonPathFn(_)
         | BoundExpr::JsonbLiteral(_)
@@ -679,6 +697,9 @@ fn compile_node(
         | BoundExpr::Numeric(_)
         | BoundExpr::DecimalColumnRef { .. }
         | BoundExpr::BoolColumnRef { .. }
+        | BoundExpr::UuidColumnRef { .. }
+        | BoundExpr::ByteaColumnRef { .. }
+        | BoundExpr::ArrayColumnRef { .. }
         | BoundExpr::JsonTextFn(_)
         | BoundExpr::JsonPathFn(_)
         | BoundExpr::JsonbLiteral(_)
@@ -1145,6 +1166,9 @@ impl ExprProgram {
                             | ExprValue::Interval(_)
                             | ExprValue::JsonText(_)
                             | ExprValue::Numeric(_)
+                            | ExprValue::Uuid(_)
+                            | ExprValue::Bytes(_)
+                            | ExprValue::Array(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
                         let s = match scalar_ev {
@@ -1160,6 +1184,9 @@ impl ExprProgram {
                             | ExprValue::Interval(_)
                             | ExprValue::JsonText(_)
                             | ExprValue::Numeric(_)
+                            | ExprValue::Uuid(_)
+                            | ExprValue::Bytes(_)
+                            | ExprValue::Array(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
                         // バックエンドの失敗（deadline 超過・トラップ・メモリ確保

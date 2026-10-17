@@ -7,13 +7,15 @@
 //! で CAST 用の閉じた型集合へ写す（カタログは参照しない静的な判定）。
 //!
 //! 規則表（20 型 × 20 型）は `docs/design/cast-conversion-rules.md` の表をデータとして
-//! 持つ（[`cast_rule`]）。型の組だけで決まる `×`（`42846`）は束縛時に判定する。値の変換のうち
-//! 数値 6 型・BOOLEAN・文字列 3 型どうし（Issue #1591）は `BuiltinFn::Cast`（評価は
-//! `sql::cast_value`）として束縛し、日時・JSON・UUID・BYTEA・配列（Issue #1592）は本モジュールでは
-//! 未実装の組を `0A000` で拒否する（黙って別の型として評価しない。fail-closed）。
+//! 持つ（[`cast_rule`]）。型の組だけで決まる `×`（`42846`）は束縛時に判定する。値の変換は
+//! `BuiltinFn::Cast`（評価は `sql::cast_value`）として束縛する。数値 6 型・BOOLEAN・文字列 3 型
+//! どうし（Issue #1591）に加え、日時・JSON・UUID・BYTEA・配列（Issue #1592）も同じ経路で扱う。
+//! 配列は要素型の組で規則を引き直し（[`cast_rule_types`]）、行内表現を持つ要素型
+//! （[`CastType::array_elem_type`]）だけを変換先にできる。実装の無い組（対応する要素型の無い配列・
+//! 種別を静的に決められない数値）は `0A000` で拒否する（黙って別の型として評価しない。fail-closed）。
 //! 判定の順序は「型名の解決（`42704`／`42601`／`22023`／`0A000`）→ 型の組（`42846`）→ 実装の有無（`0A000`）」。
 
-use crate::catalog::{ColumnType, TableSchema};
+use crate::catalog::{ArrayElemType, ArrayType, ColumnType, TableSchema, MAX_ARRAY_ELEMENTS};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::cast_value::{CastDst, CastFn, CastSrc};
 use crate::sql::ddl_column_type::SqlColumnTypeName;
@@ -364,7 +366,36 @@ impl CastType {
         )
     }
 
-    /// 束縛段の式の型。対応が無い型（uuid・bytea・配列）は `None`。
+    /// 配列の変換先・変換元としての要素型（`CastType::Array(elem)` の `elem`）を、行内表現を
+    /// 持つ `ArrayElemType` へ写す。対応が無い要素（`smallint`・`time`・`timestamptz`・
+    /// `interval`・`varchar(n)`・`char(n)`・修飾子なしの `numeric`・ENUM）と、配列でない型は
+    /// `None`（束縛段が `0A000` にする。fail-closed）。
+    pub fn array_elem_type(&self) -> Option<ArrayElemType> {
+        let CastType::Array(elem) = self else {
+            return None;
+        };
+        Some(match elem.as_ref() {
+            CastType::Text => ArrayElemType::Text,
+            CastType::Bool => ArrayElemType::Bool,
+            CastType::Int4 => ArrayElemType::Integer,
+            CastType::Int8 => ArrayElemType::BigInt,
+            CastType::Float4 => ArrayElemType::Real,
+            CastType::Float8 => ArrayElemType::Double,
+            CastType::Date => ArrayElemType::Date,
+            CastType::Timestamp => ArrayElemType::Timestamp,
+            CastType::Uuid => ArrayElemType::Uuid,
+            CastType::Numeric(Some((precision, scale))) => ArrayElemType::Numeric {
+                precision: *precision,
+                scale: *scale,
+            },
+            CastType::Bytea => ArrayElemType::Bytea,
+            CastType::Json => ArrayElemType::Json,
+            CastType::Jsonb => ArrayElemType::Jsonb,
+            _ => return None,
+        })
+    }
+
+    /// 束縛段の式の型。対応が無い型（対応する要素型の無い配列）は `None`。
     pub fn expr_type(&self) -> Option<ExprType> {
         match self {
             CastType::Int2
@@ -382,7 +413,9 @@ impl CastType {
             CastType::Jsonb => Some(ExprType::Json),
             CastType::Json => Some(ExprType::JsonText),
             CastType::Numeric(_) => Some(ExprType::Numeric),
-            CastType::Uuid | CastType::Bytea | CastType::Array(_) => None,
+            CastType::Uuid => Some(ExprType::Uuid),
+            CastType::Bytea => Some(ExprType::Bytea),
+            CastType::Array(_) => self.array_elem_type().map(|_| ExprType::Array),
         }
     }
 
@@ -411,7 +444,14 @@ impl CastType {
                 scale: *scale,
             }),
             CastType::Numeric(None) => Some(CAST_NUMERIC_RESULT_TYPE),
-            CastType::Uuid | CastType::Bytea | CastType::Array(_) => None,
+            CastType::Uuid => Some(ColumnType::Uuid),
+            CastType::Bytea => Some(ColumnType::Bytea),
+            CastType::Array(_) => {
+                let elem = self.array_elem_type()?;
+                ArrayType::new(elem, MAX_ARRAY_ELEMENTS)
+                    .ok()
+                    .map(ColumnType::Array)
+            }
         }
     }
 
@@ -435,8 +475,31 @@ enum SourceKind {
     /// 数値だが種別（整数・float・numeric）を静的に決められない
     /// （`id` 疑似列・関数・算術・CASE など）。
     UnknownNumeric,
+    /// 配列。`Some` は要素型が確定したもの、`None` は要素型を `CastType` で表せない
+    /// （ENUM 要素）もの。
+    Array(Option<CastType>),
     /// 規則表の外（`vector`）。
     Outside,
+}
+
+/// 配列の要素型を CAST の型へ写す（ENUM は `None`）。
+fn elem_cast_type(e: ArrayElemType) -> Option<CastType> {
+    Some(match e {
+        ArrayElemType::Text => CastType::Text,
+        ArrayElemType::Bool => CastType::Bool,
+        ArrayElemType::Integer => CastType::Int4,
+        ArrayElemType::BigInt => CastType::Int8,
+        ArrayElemType::Real => CastType::Float4,
+        ArrayElemType::Double => CastType::Float8,
+        ArrayElemType::Date => CastType::Date,
+        ArrayElemType::Timestamp => CastType::Timestamp,
+        ArrayElemType::Uuid => CastType::Uuid,
+        ArrayElemType::Numeric { precision, scale } => CastType::Numeric(Some((precision, scale))),
+        ArrayElemType::Bytea => CastType::Bytea,
+        ArrayElemType::Json => CastType::Json,
+        ArrayElemType::Jsonb => CastType::Jsonb,
+        ArrayElemType::Enum => return None,
+    })
 }
 
 fn kind_of_column(ty: &ColumnType) -> Option<CastKind> {
@@ -492,7 +555,10 @@ fn source_cast_kind(
     // 入れ子の CAST の結果は、内側の変換先の型（恒等・リテラル・型付き NULL のいずれも）。
     // COLLATE は型を変えないため剥がして見る。
     if let Expr::Cast { ty: inner, .. } = strip_collate(operand) {
-        return SourceKind::Known(inner.kind());
+        return match inner {
+            CastType::Array(elem) => SourceKind::Array(Some(elem.as_ref().clone())),
+            other => SourceKind::Known(other.kind()),
+        };
     }
     match ty {
         ExprType::Scalar => {
@@ -535,6 +601,20 @@ fn source_cast_kind(
         ExprType::Interval => SourceKind::Known(CastKind::Interval),
         ExprType::Json => SourceKind::Known(CastKind::Jsonb),
         ExprType::JsonText => SourceKind::Known(CastKind::Json),
+        ExprType::Uuid => SourceKind::Known(CastKind::Uuid),
+        ExprType::Bytea => SourceKind::Known(CastKind::Bytea),
+        // 配列を生成するのは配列列の参照（CAST の被演算子の位置）と CAST の結果（上で処理済み）だけ。
+        ExprType::Array => match bound {
+            BoundExpr::ArrayColumnRef { index } => {
+                SourceKind::Array(schema.and_then(|s| s.columns.get(*index)).and_then(|c| {
+                    match &c.ty {
+                        ColumnType::Array(at) => elem_cast_type(at.elem()),
+                        _ => None,
+                    }
+                }))
+            }
+            _ => SourceKind::Array(None),
+        },
         ExprType::Vector => SourceKind::Outside,
     }
 }
@@ -660,10 +740,20 @@ pub(crate) fn parse_cast_type(
     CastType::from_sql_type_name(&name)
 }
 
-/// 規則表の見出しと式の静的型から、値の変換の変換元を決める。変換元として扱えない組
-/// （日時・JSON・UUID・BYTEA・配列。Issue #1592 の担当）と、式の型が見出しと食い違う組は `None`。
-fn cast_src(kind: CastKind, ty: ExprType) -> Option<CastSrc> {
+/// 規則表の見出しと式の静的型から、値の変換の変換元を決める。式の型が見出しと食い違う組と、
+/// 要素型を確定できない配列は `None`。
+fn cast_src(kind: CastKind, ty: ExprType, array_elem: Option<ArrayElemType>) -> Option<CastSrc> {
     match (kind, ty) {
+        (CastKind::Date, ExprType::Date) => Some(CastSrc::Date),
+        (CastKind::Time, ExprType::Time) => Some(CastSrc::Time),
+        (CastKind::Timestamp, ExprType::Timestamp) => Some(CastSrc::Timestamp),
+        (CastKind::TimestampTz, ExprType::TimestampTz) => Some(CastSrc::TimestampTz),
+        (CastKind::Interval, ExprType::Interval) => Some(CastSrc::Interval),
+        (CastKind::Json, ExprType::JsonText) => Some(CastSrc::Json),
+        (CastKind::Jsonb, ExprType::Json) => Some(CastSrc::Jsonb),
+        (CastKind::Uuid, ExprType::Uuid) => Some(CastSrc::Uuid),
+        (CastKind::Bytea, ExprType::Bytea) => Some(CastSrc::Bytea),
+        (CastKind::Array, ExprType::Array) => array_elem.map(CastSrc::Array),
         (CastKind::Int2, ExprType::Scalar) => Some(CastSrc::Int2),
         (CastKind::Int4, ExprType::Scalar) => Some(CastSrc::Int4),
         (CastKind::Int8, ExprType::Scalar) => Some(CastSrc::Int8),
@@ -691,7 +781,16 @@ fn cast_dst(target: &CastType) -> Option<CastDst> {
         CastType::Text => Some(CastDst::Text),
         CastType::Varchar(n) => Some(CastDst::Varchar(*n)),
         CastType::Bpchar(n) => Some(CastDst::Bpchar(*n)),
-        _ => None,
+        CastType::Date => Some(CastDst::Date),
+        CastType::Time => Some(CastDst::Time),
+        CastType::Timestamp => Some(CastDst::Timestamp),
+        CastType::TimestampTz => Some(CastDst::TimestampTz),
+        CastType::Interval => Some(CastDst::Interval),
+        CastType::Json => Some(CastDst::Json),
+        CastType::Jsonb => Some(CastDst::Jsonb),
+        CastType::Uuid => Some(CastDst::Uuid),
+        CastType::Bytea => Some(CastDst::Bytea),
+        CastType::Array(_) => target.array_elem_type().map(CastDst::Array),
     }
 }
 
@@ -705,9 +804,10 @@ fn cast_node(f: CastFn, arg: BoundExpr) -> BoundExpr {
 
 /// 型なし文字列リテラルを変換先の型の入力として解釈する束縛。対応する変換先は
 /// date／time／timestamp／timestamptz／interval（既存の型付きリテラルと同じ解析）・jsonb・
-/// 数値 6 型・boolean・文字列 3 型（Issue #1591）。それ以外は未実装（`0A000`）。
+/// 数値 6 型・boolean・文字列 3 型（Issue #1591）・json／uuid／bytea／配列（Issue #1592。
+/// 対応する要素型の無い配列は未実装の `0A000`）。
 ///
-/// 数値・boolean・型修飾子つき文字列は、束縛時に実行時と同じ入力関数
+/// 数値・boolean・型修飾子つき文字列・json・uuid・bytea・配列は、束縛時に実行時と同じ入力関数
 /// （`sql::cast_value::apply_cast`）を 1 度呼んで形式不正・範囲外を早期に報告し、評価は
 /// 変換ノードに委ねる（第 2 の文法を作らない）。CHECK 本体では値の変換を持ち込まない。
 fn bind_string_literal_as(
@@ -716,11 +816,7 @@ fn bind_string_literal_as(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
-    use crate::datetime::{DateTimeLiteralError, IntervalLiteralError};
-    let datetime_err = |e: DateTimeLiteralError| match e {
-        DateTimeLiteralError::Format(detail) => SqlSurfaceError::invalid_datetime_format(detail),
-        DateTimeLiteralError::Overflow(detail) => SqlSurfaceError::datetime_field_overflow(detail),
-    };
+    use crate::sql::cast_value::{datetime_literal_error as datetime_err, interval_literal_error};
     let literal = match target {
         CastType::Date => Expr::DateLiteral(crate::datetime::parse_date(s).map_err(datetime_err)?),
         CastType::Time => Expr::TimeLiteral(crate::datetime::parse_time(s).map_err(datetime_err)?),
@@ -728,23 +824,9 @@ fn bind_string_literal_as(
             Expr::TimestampLiteral(crate::datetime::parse_timestamp(s).map_err(datetime_err)?)
         }
         CastType::TimestampTz => crate::sql::allowlist::parse_timestamptz_expr_literal(s)?,
-        CastType::Interval => match crate::datetime::parse_interval(s) {
-            Ok(v) => Expr::IntervalLiteral(v),
-            Err(IntervalLiteralError::Format(detail)) => {
-                return Err(SqlSurfaceError::invalid_datetime_format(detail))
-            }
-            Err(e @ IntervalLiteralError::FieldOverflow) => {
-                return Err(SqlSurfaceError::interval_field_overflow(e.to_string()))
-            }
-            Err(e @ IntervalLiteralError::OutOfRange) => {
-                return Err(SqlSurfaceError::datetime_field_overflow(e.to_string()))
-            }
-            Err(IntervalLiteralError::Infinity) => {
-                return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "infinite interval values are not supported yet".to_string(),
-                })
-            }
-        },
+        CastType::Interval => Expr::IntervalLiteral(
+            crate::datetime::parse_interval(s).map_err(interval_literal_error)?,
+        ),
         CastType::Jsonb => {
             // 文字列リテラルのノード 1 個分を課金する（`bind_expr_any` を通らないため）。
             charge_node(node_budget)?;
@@ -761,7 +843,11 @@ fn bind_string_literal_as(
         | CastType::Numeric(_)
         | CastType::Bool
         | CastType::Varchar(Some(_))
-        | CastType::Bpchar(_) => {
+        | CastType::Bpchar(_)
+        | CastType::Json
+        | CastType::Uuid
+        | CastType::Bytea
+        | CastType::Array(_) => {
             let (Some(dst), Some(ty)) = (cast_dst(target), target.expr_type()) else {
                 return Err(not_implemented("unknown", target));
             };
@@ -787,7 +873,6 @@ fn bind_string_literal_as(
             )?;
             return Ok((cast_node(f, BoundExpr::Text(s.to_string())), ty));
         }
-        _ => return Err(not_implemented("unknown", target)),
     };
     // 解析済みの定数ノードを通常の束縛へ流す（TIMESTAMPTZ のセッション TZ 確定もここで行う）。
     bind_expr_any(&literal, env, node_budget)
@@ -808,7 +893,7 @@ fn exceeds_exact_integer(raw: &str) -> bool {
     }
 }
 
-/// `CAST` の被演算子になる NUMERIC／BOOLEAN 列の参照を、CAST の位置でだけ受理して葉にする。
+/// `CAST` の被演算子になる NUMERIC／BOOLEAN／UUID／BYTEA／配列列の参照を、CAST の位置でだけ受理して葉にする。
 /// それ以外の位置の参照は従来どおり束縛段が拒否する。UDF 本体（スキーマなし）は対象外。
 fn bind_cast_operand_column(name: &str, env: &BindEnv<'_>) -> Option<(BoundExpr, ExprType)> {
     let schema = env.schema()?;
@@ -826,6 +911,9 @@ fn bind_cast_operand_column(name: &str, env: &BindEnv<'_>) -> Option<(BoundExpr,
             Some((BoundExpr::DecimalColumnRef { index }, ExprType::Numeric))
         }
         ColumnType::Boolean => Some((BoundExpr::BoolColumnRef { index }, ExprType::Bool)),
+        ColumnType::Uuid => Some((BoundExpr::UuidColumnRef { index }, ExprType::Uuid)),
+        ColumnType::Bytea => Some((BoundExpr::ByteaColumnRef { index }, ExprType::Bytea)),
+        ColumnType::Array(_) => Some((BoundExpr::ArrayColumnRef { index }, ExprType::Array)),
         _ => None,
     }
 }
@@ -835,10 +923,10 @@ fn bind_cast_operand_column(name: &str, env: &BindEnv<'_>) -> Option<(BoundExpr,
 /// 束縛の結果は次のいずれか。
 /// - `42846`: 規則表で `×` の組（型の組だけで決まり、値が NULL でも同じ）。
 /// - 恒等（同一型で型修飾子なし）や値を変えない拡幅: 内側の束縛結果をそのまま返す。
-/// - 数値 6 型・BOOLEAN・文字列 3 型どうしの値の変換: `BuiltinFn::Cast`（Issue #1591）。
-///   CHECK 本体では値の変換を持ち込まず `0A000`（全テナントを走査する検証経路を避ける）。
+/// - 値の変換（数値 6 型・BOOLEAN・文字列 3 型・日時・JSON・UUID・BYTEA・配列。Issue #1591・#1592）:
+///   `BuiltinFn::Cast`。CHECK 本体では値の変換を持ち込まず `0A000`（全テナントを走査する検証経路を避ける）。
 /// - 型なし文字列リテラルを入力として解釈、または型付き NULL。
-/// - それ以外（日時・JSON・UUID・BYTEA・配列。Issue #1592）は `0A000`。
+/// - それ以外（対応する要素型の無い配列・種別不明の数値）は `0A000`。
 pub(super) fn bind_cast(
     operand: &Expr,
     target: &CastType,
@@ -877,8 +965,14 @@ pub(super) fn bind_cast(
         _ => bind_expr_any(operand, env, node_budget)?,
     };
     let source = source_cast_kind(operand, &bound, ty, env.schema());
+    // 配列は要素型つきで規則を引く（`Some(None)` は要素型を CAST の型で表せない ENUM 配列）。
+    let mut array_from: Option<Option<CastType>> = None;
     let from_kind = match source {
         SourceKind::Known(k) => k,
+        SourceKind::Array(elem) => {
+            array_from = Some(elem);
+            CastKind::Array
+        }
         SourceKind::Outside => return Err(not_implemented("vector", target)),
         SourceKind::UnknownNumeric => {
             // 数値の行どうしは変換先によって規則が異なる（numeric と float で丸め・表記が異なる）。
@@ -902,20 +996,47 @@ pub(super) fn bind_cast(
             CastKind::Int4
         }
     };
-    // 配列は式の型を持たないため、変換元に配列が現れることはない。
-    let rule = cast_rule(from_kind, target.kind());
+    // 配列 → 配列は要素型の組で規則を引き直す。変換元の要素型を確定できない（ENUM 要素の）配列は、
+    // 配列への変換を未実装（`0A000`）とする（文字列型への変換と `×` の判定は種別だけで足りる）。
+    let source_array_ty = match &array_from {
+        Some(Some(elem)) => Some(CastType::Array(Box::new(elem.clone()))),
+        _ => None,
+    };
+    let rule = match (&source_array_ty, target) {
+        (Some(from_ty), CastType::Array(_)) => cast_rule_types(from_ty, target),
+        (None, CastType::Array(_)) if array_from.is_some() => {
+            return Err(not_implemented("enum[]", target))
+        }
+        _ => cast_rule(from_kind, target.kind()),
+    };
     if rule == CastRule::None {
         return Err(SqlSurfaceError::CannotCoerce {
-            from: from_kind.label().to_string(),
+            from: match &source_array_ty {
+                Some(from_ty) => from_ty.pg_label(),
+                None => from_kind.label().to_string(),
+            },
             to: target.pg_label(),
         });
     }
-    if rule == CastRule::Identity && !target.has_modifier() && target_ty == Some(ty) {
+    // 同じ要素型の配列どうしは値を変えない（修飾子つきの要素型は `array_elem_type` が拒否済み）。
+    let same_array = source_array_ty.as_ref() == Some(target);
+    if ((rule == CastRule::Identity && !target.has_modifier()) || same_array)
+        && target_ty == Some(ty)
+    {
         return Ok((bound, ty));
     }
-    let (Some(src), Some(dst), Some(result_ty)) =
-        (cast_src(from_kind, ty), cast_dst(target), target_ty)
-    else {
+    let source_elem = match (&source_array_ty, &array_from) {
+        (Some(from_ty), _) => from_ty.array_elem_type(),
+        // 要素型を CAST の型で表せない（ENUM 要素の）配列。配列への変換は上で `0A000` にしており、
+        // ここへ来るのは文字列型への変換だけ（描画は要素型に依らない）。
+        (None, Some(None)) => Some(ArrayElemType::Enum),
+        _ => None,
+    };
+    let (Some(src), Some(dst), Some(result_ty)) = (
+        cast_src(from_kind, ty, source_elem),
+        cast_dst(target),
+        target_ty,
+    ) else {
         return Err(not_implemented(from_kind.label(), target));
     };
     let f = CastFn { from: src, to: dst };
@@ -1205,7 +1326,72 @@ mod tests {
         assert_eq!(CastType::Json.expr_type(), Some(ExprType::JsonText));
         assert_eq!(CastType::Bpchar(2).expr_type(), Some(ExprType::Text));
         assert_eq!(CastType::Numeric(None).expr_type(), Some(ExprType::Numeric));
-        assert_eq!(CastType::Uuid.expr_type(), None);
-        assert_eq!(CastType::Array(Box::new(CastType::Int4)).expr_type(), None);
+        assert_eq!(CastType::Uuid.expr_type(), Some(ExprType::Uuid));
+        assert_eq!(CastType::Bytea.expr_type(), Some(ExprType::Bytea));
+        let arr = |e: CastType| CastType::Array(Box::new(e));
+        assert_eq!(arr(CastType::Int4).expr_type(), Some(ExprType::Array));
+        // 対応する要素型の無い配列は式の型を持たない（束縛段が `0A000` にする）。
+        assert_eq!(arr(CastType::Int2).expr_type(), None);
+        assert_eq!(arr(CastType::Numeric(None)).expr_type(), None);
+    }
+
+    #[test]
+    fn array_element_types_map_to_row_codec_types() {
+        let arr = |e: CastType| CastType::Array(Box::new(e));
+        for (elem, want) in [
+            (CastType::Text, ArrayElemType::Text),
+            (CastType::Bool, ArrayElemType::Bool),
+            (CastType::Int4, ArrayElemType::Integer),
+            (CastType::Int8, ArrayElemType::BigInt),
+            (CastType::Float4, ArrayElemType::Real),
+            (CastType::Float8, ArrayElemType::Double),
+            (CastType::Date, ArrayElemType::Date),
+            (CastType::Timestamp, ArrayElemType::Timestamp),
+            (CastType::Uuid, ArrayElemType::Uuid),
+            (
+                CastType::Numeric(Some((10, 2))),
+                ArrayElemType::Numeric {
+                    precision: 10,
+                    scale: 2,
+                },
+            ),
+            (CastType::Bytea, ArrayElemType::Bytea),
+            (CastType::Json, ArrayElemType::Json),
+            (CastType::Jsonb, ArrayElemType::Jsonb),
+        ] {
+            assert_eq!(arr(elem.clone()).array_elem_type(), Some(want), "{elem:?}");
+            assert!(arr(elem).result_column_type().is_some());
+        }
+        for elem in [
+            CastType::Int2,
+            CastType::Time,
+            CastType::TimestampTz,
+            CastType::Interval,
+            CastType::Varchar(Some(3)),
+            CastType::Bpchar(3),
+            CastType::Numeric(None),
+        ] {
+            assert_eq!(arr(elem.clone()).array_elem_type(), None, "{elem:?}");
+            assert_eq!(arr(elem).result_column_type(), None);
+        }
+        assert_eq!(CastType::Int4.array_elem_type(), None);
+    }
+
+    #[test]
+    fn array_rule_follows_the_element_pair() {
+        let arr = |e: CastType| CastType::Array(Box::new(e));
+        // 要素の組が `×`（uuid -> 整数）なら配列も `×`、そうでなければ `elem`。
+        assert_eq!(
+            cast_rule_types(&arr(CastType::Uuid), &arr(CastType::Int4)),
+            CastRule::None
+        );
+        assert_eq!(
+            cast_rule_types(&arr(CastType::Int4), &arr(CastType::Int8)),
+            CastRule::Element
+        );
+        assert_eq!(
+            cast_rule_types(&arr(CastType::Text), &arr(CastType::Date)),
+            CastRule::Element
+        );
     }
 }

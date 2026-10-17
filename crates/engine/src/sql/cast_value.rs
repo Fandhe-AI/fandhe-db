@@ -1,14 +1,21 @@
-//! `CAST` の値変換（数値・文字列・BOOLEAN の 10 型どうし。Issue #1591・SQL-47 のポインタ）。
+//! `CAST` の値変換（Issue #1591・#1592・SQL-47 のポインタ）。
 //!
 //! 責務境界: 束縛段（`sql::cast::bind_cast`）が規則表から [`CastFn`]（Copy な変換記述子）を
 //! 組み立てて `BuiltinFn::Cast` に載せ、評価段（`sql::udf_call::apply_builtin`）が
 //! [`apply_cast`] を呼ぶ。型なし文字列リテラルの束縛（`bind_string_literal_as`）も同じ
 //! 入力関数を束縛時に 1 度呼んで形式不正・範囲外を早期に報告する（第 2 の文法を作らない）。
 //!
+//! 変換は 2 系統に分かれる。数値 6 型・BOOLEAN・文字列 3 型どうし（Issue #1591）は
+//! [`convert_basic`]、日付時刻・JSON・UUID・BYTEA・配列が絡むもの（Issue #1592）は
+//! [`apply_cast_ext`] が担う（jsonb → 数値・BOOLEAN は抽出した値を [`convert_basic`] へ流して
+//! 丸め・範囲検査を共有する）。
+//!
 //! 規則の拠り所は `docs/design/cast-conversion-rules.md`（PostgreSQL 17 の公開挙動）。
 //! - 整数への変換: 浮動小数は偶数丸め、numeric は 0 から遠い側への四捨五入の後に範囲検査（`22003`）。
 //! - 文字列からの変換: 形式不正は `22P02`、範囲外は `22003`。本エンジンが値として持たない
 //!   `NaN`／`Infinity` 入力は `0A000`（fail-closed。`22P02` にもしない）。
+//! - 日付時刻: 形式不正は `22007`、範囲外は `22008`／`22015`。timestamptz が絡む変換と文字列化は
+//!   評価時のセッション `TimeZone` に従う。
 //! - 式評価は整数も f64 で運ぶため、|v| > 2^53 の int8 は丸めずに `22003` で拒否する
 //!   （PostgreSQL との既知の差分。設計書に記録）。
 //!
@@ -17,8 +24,9 @@
 
 use std::borrow::Cow;
 
-use crate::catalog::MAX_CHAR_TYPE_LENGTH;
+use crate::catalog::{ArrayElemType, ArrayType, MAX_ARRAY_ELEMENTS, MAX_CHAR_TYPE_LENGTH};
 use crate::numeric::{self, Decimal, NumericError};
+use crate::row_codec::ArrayValue;
 use crate::scalar_float::{format_double, format_real};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::udf_call::ExprValue;
@@ -40,6 +48,20 @@ pub enum CastSrc {
     Numeric,
     Bool,
     Text,
+    Date,
+    Time,
+    Timestamp,
+    TimestampTz,
+    Interval,
+    /// `json`（原文保存。式の型は `ExprType::JsonText`）。
+    Json,
+    /// `jsonb`（正規化テキスト。式の型は `ExprType::Json`）。
+    Jsonb,
+    Uuid,
+    Bytea,
+    /// 配列。要素型を `Copy` な `ArrayElemType` で運び、要素の変換記述子は
+    /// （変換元の要素型, 変換先の要素型）から導く（`CastFn` を再帰させない）。
+    Array(ArrayElemType),
 }
 
 /// 変換先の型。型修飾子は値の変換（丸め・切り詰め・空白埋め）を伴うため記述子へ含める。
@@ -57,6 +79,94 @@ pub enum CastDst {
     /// `None` は長さ修飾なし。
     Varchar(Option<u32>),
     Bpchar(u32),
+    Date,
+    Time,
+    Timestamp,
+    TimestampTz,
+    Interval,
+    Json,
+    Jsonb,
+    Uuid,
+    Bytea,
+    /// 配列（要素型は [`CastSrc::Array`] と同じ運び方。`varchar(n)[]` 等の対応要素型の無い
+    /// 変換先は束縛段が `0A000` にするため、ここへは来ない）。
+    Array(ArrayElemType),
+}
+
+impl CastSrc {
+    /// 数値 6 型・BOOLEAN・文字列（Issue #1591 の範囲）か。
+    fn is_basic(self) -> bool {
+        matches!(
+            self,
+            CastSrc::Int2
+                | CastSrc::Int4
+                | CastSrc::Int8
+                | CastSrc::Float4
+                | CastSrc::Float8
+                | CastSrc::Numeric
+                | CastSrc::Bool
+                | CastSrc::Text
+        )
+    }
+}
+
+impl CastDst {
+    /// 数値 6 型・BOOLEAN・文字列（Issue #1591 の範囲）か。
+    fn is_basic(self) -> bool {
+        matches!(
+            self,
+            CastDst::Int2
+                | CastDst::Int4
+                | CastDst::Int8
+                | CastDst::Float4
+                | CastDst::Float8
+                | CastDst::Numeric(_)
+                | CastDst::Bool
+                | CastDst::Text
+                | CastDst::Varchar(_)
+                | CastDst::Bpchar(_)
+        )
+    }
+}
+
+/// 配列の要素型から、要素の変換元の記述子を導く（`enum` 要素は対象外で `None`）。
+pub(crate) fn elem_cast_src(e: ArrayElemType) -> Option<CastSrc> {
+    Some(match e {
+        ArrayElemType::Text => CastSrc::Text,
+        ArrayElemType::Bool => CastSrc::Bool,
+        ArrayElemType::Integer => CastSrc::Int4,
+        ArrayElemType::BigInt => CastSrc::Int8,
+        ArrayElemType::Real => CastSrc::Float4,
+        ArrayElemType::Double => CastSrc::Float8,
+        ArrayElemType::Date => CastSrc::Date,
+        ArrayElemType::Timestamp => CastSrc::Timestamp,
+        ArrayElemType::Uuid => CastSrc::Uuid,
+        ArrayElemType::Numeric { .. } => CastSrc::Numeric,
+        ArrayElemType::Bytea => CastSrc::Bytea,
+        ArrayElemType::Json => CastSrc::Json,
+        ArrayElemType::Jsonb => CastSrc::Jsonb,
+        ArrayElemType::Enum => return None,
+    })
+}
+
+/// 配列の要素型から、要素の変換先の記述子を導く（`numeric(p,s)` は修飾子つき）。
+pub(crate) fn elem_cast_dst(e: ArrayElemType) -> Option<CastDst> {
+    Some(match e {
+        ArrayElemType::Text => CastDst::Text,
+        ArrayElemType::Bool => CastDst::Bool,
+        ArrayElemType::Integer => CastDst::Int4,
+        ArrayElemType::BigInt => CastDst::Int8,
+        ArrayElemType::Real => CastDst::Float4,
+        ArrayElemType::Double => CastDst::Float8,
+        ArrayElemType::Date => CastDst::Date,
+        ArrayElemType::Timestamp => CastDst::Timestamp,
+        ArrayElemType::Uuid => CastDst::Uuid,
+        ArrayElemType::Numeric { precision, scale } => CastDst::Numeric(Some((precision, scale))),
+        ArrayElemType::Bytea => CastDst::Bytea,
+        ArrayElemType::Json => CastDst::Json,
+        ArrayElemType::Jsonb => CastDst::Jsonb,
+        ArrayElemType::Enum => return None,
+    })
 }
 
 /// `BuiltinFn::Cast` が持つ変換記述子。`BuiltinFn` が `Copy` のため `CastType`（`Box` を含む）
@@ -82,7 +192,16 @@ impl CastFn {
                 | (S::Numeric, D::Numeric(None))
                 | (S::Bool, D::Bool)
                 | (S::Text, D::Text | D::Varchar(None))
-        )
+                | (S::Date, D::Date)
+                | (S::Time, D::Time)
+                | (S::Timestamp, D::Timestamp)
+                | (S::TimestampTz, D::TimestampTz)
+                | (S::Interval, D::Interval)
+                | (S::Json, D::Json)
+                | (S::Jsonb, D::Jsonb)
+                | (S::Uuid, D::Uuid)
+                | (S::Bytea, D::Bytea)
+        ) || matches!((self.from, self.to), (S::Array(a), D::Array(b)) if a == b)
     }
 }
 
@@ -519,11 +638,23 @@ pub(crate) fn apply_cast<'a>(
     if matches!(v, ExprValue::Null) {
         return Ok(ExprValue::Null);
     }
+    if !(f.from.is_basic() && f.to.is_basic()) {
+        return apply_cast_ext(f, v);
+    }
     let src = extract_src(f.from, v)?;
-    let single_src = f.from == CastSrc::Float4;
-    match f.to {
+    convert_basic(src, f.from == CastSrc::Float4, f.to)
+}
+
+/// 数値 6 型・BOOLEAN・文字列の変換先へ、正規化済みの変換元の値を変換する（Issue #1591）。
+/// jsonb → 数値・BOOLEAN（Issue #1592）も抽出した値をここへ流し、丸め・範囲検査を共有する。
+fn convert_basic<'a>(
+    src: SrcValue<'a>,
+    single_src: bool,
+    to: CastDst,
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    match to {
         CastDst::Int2 | CastDst::Int4 | CastDst::Int8 => {
-            let w = IntWidth::from_dst(f.to).ok_or_else(|| internal("integer width"))?;
+            let w = IntWidth::from_dst(to).ok_or_else(|| internal("integer width"))?;
             let i = match src {
                 SrcValue::Int(i) => finish_int(i128::from(i), w)?,
                 SrcValue::Float(x) => {
@@ -609,9 +740,507 @@ pub(crate) fn apply_cast<'a>(
                 SrcValue::Bool(b) => Cow::Borrowed(if b { "true" } else { "false" }),
                 SrcValue::Text(s) => s,
             };
-            Ok(ExprValue::Text(apply_char_typmod(s, f.to)?))
+            Ok(ExprValue::Text(apply_char_typmod(s, to)?))
+        }
+        // 日付時刻・JSON・UUID・BYTEA・配列は `apply_cast_ext` が担う（呼び出し元が振り分ける）。
+        _ => Err(internal("non-basic cast destination reached convert_basic")),
+    }
+}
+
+/// `DateTimeLiteralError` の SQLSTATE 写像（`22007` 書式・`22008` 範囲外）。型なしリテラルの
+/// 束縛（`sql::cast::bind_string_literal_as`）と文字列式からの評価時変換が共有する。
+pub(crate) fn datetime_literal_error(e: crate::datetime::DateTimeLiteralError) -> SqlSurfaceError {
+    use crate::datetime::DateTimeLiteralError;
+    match e {
+        DateTimeLiteralError::Format(detail) => SqlSurfaceError::invalid_datetime_format(detail),
+        DateTimeLiteralError::Overflow(detail) => SqlSurfaceError::datetime_field_overflow(detail),
+    }
+}
+
+/// `IntervalLiteralError` の SQLSTATE 写像（`22007`／`22015`／`22008`、無限大は `0A000`）。
+pub(crate) fn interval_literal_error(e: crate::datetime::IntervalLiteralError) -> SqlSurfaceError {
+    use crate::datetime::IntervalLiteralError;
+    match e {
+        IntervalLiteralError::Format(detail) => SqlSurfaceError::invalid_datetime_format(detail),
+        IntervalLiteralError::FieldOverflow => {
+            SqlSurfaceError::interval_field_overflow(e.to_string())
+        }
+        IntervalLiteralError::OutOfRange => SqlSurfaceError::datetime_field_overflow(e.to_string()),
+        IntervalLiteralError::Infinity => SqlSurfaceError::FeatureNotSupported {
+            detail: "infinite interval values are not supported yet".to_string(),
+        },
+    }
+}
+
+/// `TimestampTzLiteralError` の SQLSTATE 写像（未知の TZ 名は `22023`）。
+fn timestamptz_literal_error(e: crate::datetime::TimestampTzLiteralError) -> SqlSurfaceError {
+    use crate::datetime::TimestampTzLiteralError;
+    match e {
+        TimestampTzLiteralError::Literal(inner) => datetime_literal_error(inner),
+        TimestampTzLiteralError::UnknownTimeZone => SqlSurfaceError::InvalidParameterValue {
+            detail: crate::datetime::UNRECOGNIZED_TIME_ZONE_DETAIL,
+        },
+    }
+}
+
+/// `json`／`jsonb` の入力検査エラーの写像（形式不正は `22P02`、長さ超過は `54000`）。
+fn json_column_error(e: crate::json::JsonColumnError, type_name: &str) -> SqlSurfaceError {
+    match e {
+        crate::json::JsonColumnError::TooLong => {
+            SqlSurfaceError::payload_too_large("JSON value exceeds the maximum field length")
+        }
+        crate::json::JsonColumnError::Invalid => SqlSurfaceError::invalid_text_representation(
+            format!("invalid input syntax for type {type_name}"),
+        ),
+    }
+}
+
+fn bytea_cast_error(e: crate::bytea::ByteaCastError) -> SqlSurfaceError {
+    use crate::bytea::ByteaCastError;
+    match e {
+        ByteaCastError::TooLong => {
+            SqlSurfaceError::payload_too_large("bytea value exceeds the maximum field length")
+        }
+        ByteaCastError::OddLength => SqlSurfaceError::InvalidParameterValue {
+            detail: "invalid hexadecimal data: odd number of digits",
+        },
+        ByteaCastError::InvalidDigit => SqlSurfaceError::InvalidParameterValue {
+            detail: "invalid hexadecimal digit",
+        },
+        ByteaCastError::InvalidSyntax => {
+            SqlSurfaceError::invalid_text_representation("invalid input syntax for type bytea")
         }
     }
+}
+
+/// 日付時刻・JSON・UUID・BYTEA・配列が変換元または変換先に絡む変換（Issue #1592）。
+///
+/// 文字列型への変換は各型の出力関数、文字列型からの変換は入力関数を通す（規則表の `io/a`・
+/// `io/e`）。それ以外は型どうしの個別の変換（日付時刻間・json ⇄ jsonb・jsonb → 数値/BOOLEAN・
+/// 配列 → 配列）。型の組み合わせは束縛段が規則表で絞っており、ここへ来ない組は `Internal`。
+fn apply_cast_ext<'a>(f: CastFn, v: ExprValue<'a>) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    if matches!(
+        f.to,
+        CastDst::Text | CastDst::Varchar(_) | CastDst::Bpchar(_)
+    ) {
+        let s = render_to_text(f.from, v)?;
+        return Ok(ExprValue::Text(apply_char_typmod(s, f.to)?));
+    }
+    if f.from == CastSrc::Text {
+        let ExprValue::Text(s) = v else {
+            return Err(internal("cast argument type mismatch at evaluation time"));
+        };
+        return parse_from_text(&s, f.to);
+    }
+    convert_between(f, v)
+}
+
+fn mismatch() -> SqlSurfaceError {
+    internal("cast argument type mismatch at evaluation time")
+}
+
+/// 各型 → 文字列型（`io/a`）の文字列表現。BYTEA と配列は結果が TEXT の上限を超えるときは
+/// 確保前（配列は描画の途中）に `54000` で拒否する。
+fn render_to_text<'a>(from: CastSrc, v: ExprValue<'a>) -> Result<Cow<'a, str>, SqlSurfaceError> {
+    let max_text = crate::row_codec::MAX_TEXT_FIELD_LEN as usize;
+    match (from, v) {
+        (CastSrc::Date, ExprValue::Date(d)) => Ok(Cow::Owned(crate::datetime::format_date(d))),
+        (CastSrc::Time, ExprValue::Time(t)) => Ok(Cow::Owned(crate::datetime::format_time(t))),
+        (CastSrc::Timestamp, ExprValue::Timestamp(t)) => {
+            Ok(Cow::Owned(crate::datetime::format_timestamp(t)))
+        }
+        (CastSrc::TimestampTz, ExprValue::TimestampTz(t)) => {
+            Ok(Cow::Owned(crate::datetime::with_current_session_time_zone(
+                |tz| crate::datetime::format_timestamptz(t, tz),
+            )))
+        }
+        (CastSrc::Interval, ExprValue::Interval(iv)) => {
+            Ok(Cow::Owned(crate::datetime::format_interval(&iv)))
+        }
+        (CastSrc::Json, ExprValue::JsonText(t)) | (CastSrc::Jsonb, ExprValue::Json(t)) => Ok(t),
+        (CastSrc::Uuid, ExprValue::Uuid(u)) => Ok(Cow::Owned(u.to_string())),
+        (CastSrc::Bytea, ExprValue::Bytes(b)) => {
+            // `\x` ＋ 2 桁/バイト。確保前に長さを計算する。
+            let hex_len = b.len().checked_mul(2).and_then(|n| n.checked_add(2));
+            if hex_len.is_none_or(|n| n > max_text) {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "bytea hex text exceeds the maximum TEXT field length",
+                ));
+            }
+            Ok(Cow::Owned(crate::bytea::format_hex_text(&b)))
+        }
+        (CastSrc::Array(_), ExprValue::Array(a)) => a
+            .to_pg_text_bounded(max_text)
+            .map(Cow::Owned)
+            .ok_or_else(|| {
+                SqlSurfaceError::payload_too_large(
+                    "array text exceeds the maximum TEXT field length",
+                )
+            }),
+        _ => Err(mismatch()),
+    }
+}
+
+/// 文字列型 → 各型（`io/e`）の入力関数。
+fn parse_from_text(s: &str, to: CastDst) -> Result<ExprValue<'static>, SqlSurfaceError> {
+    match to {
+        CastDst::Date => crate::datetime::parse_date(s)
+            .map(ExprValue::Date)
+            .map_err(datetime_literal_error),
+        CastDst::Time => crate::datetime::parse_time(s)
+            .map(ExprValue::Time)
+            .map_err(datetime_literal_error),
+        CastDst::Timestamp => crate::datetime::parse_timestamp(s)
+            .map(ExprValue::Timestamp)
+            .map_err(datetime_literal_error),
+        CastDst::TimestampTz => {
+            // ゾーンの無い入力は評価時のセッション TimeZone の壁時計として解釈する。
+            crate::datetime::with_current_session_time_zone(|tz| {
+                crate::datetime::parse_timestamptz(s, tz)
+            })
+            .map(ExprValue::TimestampTz)
+            .map_err(timestamptz_literal_error)
+        }
+        CastDst::Interval => crate::datetime::parse_interval(s)
+            .map(ExprValue::Interval)
+            .map_err(interval_literal_error),
+        CastDst::Json => {
+            crate::json::validate_json_column_text(s).map_err(|e| json_column_error(e, "json"))?;
+            Ok(ExprValue::JsonText(Cow::Owned(s.to_string())))
+        }
+        CastDst::Jsonb => crate::json::canonicalize_jsonb_text(s)
+            .map(|t| ExprValue::Json(Cow::Owned(t)))
+            .map_err(|e| json_column_error(e, "jsonb")),
+        CastDst::Uuid => crate::uuid::parse_uuid_text(s)
+            .map(ExprValue::Uuid)
+            .map_err(|_| syntax_error("uuid", s)),
+        CastDst::Bytea => crate::bytea::parse_cast_text(s)
+            .map(|b| ExprValue::Bytes(Cow::Owned(b)))
+            .map_err(bytea_cast_error),
+        CastDst::Array(elem) => {
+            let ty = ArrayType::new(elem, MAX_ARRAY_ELEMENTS)
+                .map_err(|_| internal("array element type is not supported as a cast target"))?;
+            crate::sql::parser::parse_array_literal(s, &ty).map(ExprValue::Array)
+        }
+        _ => Err(internal("unexpected cast destination for a text source")),
+    }
+}
+
+/// `json`（原文）→ `jsonb`。`json` 列は重複キーを保持しうる（取り出し時は最後の値が有効）ため、
+/// PostgreSQL の `json::jsonb` と同じく最後の値を採って正規化する。
+fn json_text_to_jsonb(text: &str) -> Result<String, SqlSurfaceError> {
+    if text.len() > crate::json::MAX_JSON_FIELD_LEN {
+        return Err(json_column_error(
+            crate::json::JsonColumnError::TooLong,
+            "jsonb",
+        ));
+    }
+    let value = crate::json::parse_json_with(text, crate::json::DuplicateKeys::LastWins)
+        .map_err(|_| json_column_error(crate::json::JsonColumnError::Invalid, "jsonb"))?;
+    let mut out = String::new();
+    crate::json::write_canonical(&value, &mut out);
+    if out.len() > crate::json::MAX_JSON_FIELD_LEN {
+        return Err(json_column_error(
+            crate::json::JsonColumnError::TooLong,
+            "jsonb",
+        ));
+    }
+    Ok(out)
+}
+
+/// jsonb の値の種別（`22023` の文言用）。
+#[derive(Clone, Copy)]
+enum JsonbKind {
+    String,
+    Numeric,
+    Boolean,
+    Null,
+    Array,
+    Object,
+}
+
+/// `cannot cast jsonb <種別> to type <型名>`（`22023`）。値を含まない固定文言で、
+/// `InvalidParameterValue` が静的文字列のみを持つため種別 × 型名を `concat!` で列挙する。
+fn jsonb_cast_error(kind: JsonbKind, to: CastDst) -> SqlSurfaceError {
+    macro_rules! detail {
+        ($ty:literal) => {
+            match kind {
+                JsonbKind::String => concat!("cannot cast jsonb string to type ", $ty),
+                JsonbKind::Numeric => concat!("cannot cast jsonb numeric to type ", $ty),
+                JsonbKind::Boolean => concat!("cannot cast jsonb boolean to type ", $ty),
+                JsonbKind::Null => concat!("cannot cast jsonb null to type ", $ty),
+                JsonbKind::Array => concat!("cannot cast jsonb array to type ", $ty),
+                JsonbKind::Object => concat!("cannot cast jsonb object to type ", $ty),
+            }
+        };
+    }
+    let detail = match to {
+        CastDst::Int2 => detail!("smallint"),
+        CastDst::Int4 => detail!("integer"),
+        CastDst::Int8 => detail!("bigint"),
+        CastDst::Float4 => detail!("real"),
+        CastDst::Float8 => detail!("double precision"),
+        CastDst::Numeric(_) => detail!("numeric"),
+        _ => detail!("boolean"),
+    };
+    SqlSurfaceError::InvalidParameterValue { detail }
+}
+
+/// jsonb → 数値 6 型・BOOLEAN（`e`）。数値は numeric を経由して既存の変換（四捨五入・範囲検査・
+/// `numeric(p,s)` の丸め）を共有し、型の合わない JSON は `22023`。
+fn jsonb_to_scalar<'a>(text: &str, to: CastDst) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    use crate::json::{JsonNumber, JsonValue};
+    let value = crate::json::parse_json(text)
+        .map_err(|_| internal("stored jsonb text could not be parsed"))?;
+    match value {
+        JsonValue::Bool(b) if matches!(to, CastDst::Bool) => Ok(ExprValue::Bool(b)),
+        JsonValue::Bool(_) => Err(jsonb_cast_error(JsonbKind::Boolean, to)),
+        JsonValue::Number(_) if matches!(to, CastDst::Bool) => {
+            Err(jsonb_cast_error(JsonbKind::Numeric, to))
+        }
+        JsonValue::Number(n) => {
+            let overflow = || out_of_range("value overflows numeric format");
+            let d = match n {
+                JsonNumber::PosInt(u) => {
+                    Decimal::from_parts(i128::from(u), 0).map_err(|_| overflow())?
+                }
+                JsonNumber::NegInt(i) => {
+                    Decimal::from_parts(i128::from(i), 0).map_err(|_| overflow())?
+                }
+                JsonNumber::Float { text, .. } => {
+                    numeric::parse_literal_exact(&text).map_err(|_| overflow())?
+                }
+            };
+            // 抽出した numeric を既存の数値変換（四捨五入・範囲検査・修飾子）へ流す。
+            match convert_basic(SrcValue::Dec(d), false, to)? {
+                ExprValue::Scalar(x) => Ok(ExprValue::Scalar(x)),
+                ExprValue::Numeric(d) => Ok(ExprValue::Numeric(d)),
+                _ => Err(internal(
+                    "jsonb numeric conversion produced an unexpected value",
+                )),
+            }
+        }
+        JsonValue::String(_) => Err(jsonb_cast_error(JsonbKind::String, to)),
+        JsonValue::Null => Err(jsonb_cast_error(JsonbKind::Null, to)),
+        JsonValue::Array(_) => Err(jsonb_cast_error(JsonbKind::Array, to)),
+        JsonValue::Object(_) => Err(jsonb_cast_error(JsonbKind::Object, to)),
+    }
+}
+
+/// 型どうしの個別の変換（文字列型が絡まないもの）。
+fn convert_between<'a>(f: CastFn, v: ExprValue<'a>) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    use crate::datetime::MICROS_PER_DAY;
+    use crate::sql::datetime_fn::{date_to_timestamp, tz_out_of_range};
+    match (f.from, f.to, v) {
+        (CastSrc::Date, CastDst::Timestamp, ExprValue::Date(d)) => {
+            Ok(ExprValue::Timestamp(date_to_timestamp(d)))
+        }
+        (CastSrc::Date, CastDst::TimestampTz, ExprValue::Date(d)) => {
+            crate::datetime::with_current_session_time_zone(|tz| tz.date_to_timestamptz(d))
+                .map(ExprValue::TimestampTz)
+                .ok_or_else(tz_out_of_range)
+        }
+        (CastSrc::Timestamp, CastDst::TimestampTz, ExprValue::Timestamp(t)) => {
+            crate::datetime::with_current_session_time_zone(|tz| tz.timestamp_to_timestamptz(t))
+                .map(ExprValue::TimestampTz)
+                .ok_or_else(tz_out_of_range)
+        }
+        (CastSrc::TimestampTz, CastDst::Timestamp, ExprValue::TimestampTz(t)) => {
+            crate::datetime::with_current_session_time_zone(|tz| tz.timestamptz_to_timestamp(t))
+                .map(ExprValue::Timestamp)
+                .ok_or_else(tz_out_of_range)
+        }
+        (CastSrc::TimestampTz, CastDst::Date, ExprValue::TimestampTz(t)) => {
+            crate::datetime::with_current_session_time_zone(|tz| tz.timestamptz_to_date(t))
+                .map(ExprValue::Date)
+                .ok_or_else(tz_out_of_range)
+        }
+        (CastSrc::Timestamp, CastDst::Date, ExprValue::Timestamp(t)) => {
+            let days =
+                i32::try_from(t.div_euclid(MICROS_PER_DAY)).map_err(|_| tz_out_of_range())?;
+            if !crate::datetime::validate_date_days(days) {
+                return Err(tz_out_of_range());
+            }
+            Ok(ExprValue::Date(days))
+        }
+        (CastSrc::Timestamp, CastDst::Time, ExprValue::Timestamp(t)) => {
+            Ok(ExprValue::Time(t.rem_euclid(MICROS_PER_DAY)))
+        }
+        (CastSrc::TimestampTz, CastDst::Time, ExprValue::TimestampTz(t)) => {
+            // セッション TZ の壁時計にしてから時刻部分を取る。
+            let local = crate::datetime::with_current_session_time_zone(|tz| {
+                tz.timestamptz_to_timestamp(t)
+            })
+            .ok_or_else(tz_out_of_range)?;
+            Ok(ExprValue::Time(local.rem_euclid(MICROS_PER_DAY)))
+        }
+        (CastSrc::Time, CastDst::Interval, ExprValue::Time(t)) => {
+            Ok(ExprValue::Interval(crate::datetime::Interval {
+                months: 0,
+                days: 0,
+                micros: t,
+            }))
+        }
+        (CastSrc::Interval, CastDst::Time, ExprValue::Interval(iv)) => {
+            // 月・日は捨て、時刻部分を 1 日の剰余にする（`interval_time`）。
+            Ok(ExprValue::Time(iv.micros.rem_euclid(MICROS_PER_DAY)))
+        }
+        (CastSrc::Json, CastDst::Jsonb, ExprValue::JsonText(t)) => {
+            json_text_to_jsonb(&t).map(|s| ExprValue::Json(Cow::Owned(s)))
+        }
+        (CastSrc::Jsonb, CastDst::Json, ExprValue::Json(t)) => Ok(ExprValue::JsonText(t)),
+        (
+            CastSrc::Jsonb,
+            CastDst::Int2
+            | CastDst::Int4
+            | CastDst::Int8
+            | CastDst::Float4
+            | CastDst::Float8
+            | CastDst::Numeric(_)
+            | CastDst::Bool,
+            ExprValue::Json(t),
+        ) => jsonb_to_scalar(&t, f.to),
+        (CastSrc::Array(from_elem), CastDst::Array(to_elem), ExprValue::Array(a)) => {
+            cast_array(from_elem, to_elem, &a).map(ExprValue::Array)
+        }
+        _ => Err(mismatch()),
+    }
+}
+
+/// 配列の要素を評価値へ写す（NULL 要素は `ExprValue::Null`）。bigint は式評価の整数表現の
+/// 上限（2^53）を超える要素を `22003` で拒否する（スカラーの int8 と同じ既知の差分）。
+fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>, SqlSurfaceError> {
+    fn map<T>(
+        items: &[Option<T>],
+        f: impl Fn(&T) -> Result<ExprValue<'static>, SqlSurfaceError>,
+    ) -> Result<Vec<ExprValue<'static>>, SqlSurfaceError> {
+        items
+            .iter()
+            .map(|e| match e {
+                Some(v) => f(v),
+                None => Ok(ExprValue::Null),
+            })
+            .collect()
+    }
+    let text = |s: &String| Ok(ExprValue::Text(Cow::Owned(s.clone())));
+    match a {
+        ArrayValue::Text(v) => map(v, text),
+        ArrayValue::Bool(v) => map(v, |b| Ok(ExprValue::Bool(*b))),
+        ArrayValue::Integer(v) => map(v, |i| Ok(ExprValue::Scalar(f64::from(*i)))),
+        ArrayValue::BigInt(v) => map(v, |i| {
+            if i.unsigned_abs() > EXACT_INT_MAX as u64 {
+                return Err(out_of_range(
+                    "bigint value exceeds the range this engine can evaluate exactly",
+                ));
+            }
+            Ok(ExprValue::Scalar(*i as f64))
+        }),
+        ArrayValue::Real(v) => map(v, |x| Ok(ExprValue::Scalar(f64::from(*x)))),
+        ArrayValue::Double(v) => map(v, |x| Ok(ExprValue::Scalar(*x))),
+        ArrayValue::Date(v) => map(v, |d| Ok(ExprValue::Date(*d))),
+        ArrayValue::Timestamp(v) => map(v, |t| Ok(ExprValue::Timestamp(*t))),
+        ArrayValue::Uuid(v) => map(v, |u| Ok(ExprValue::Uuid(*u))),
+        ArrayValue::Numeric(v) => map(v, |d| Ok(ExprValue::Numeric(*d))),
+        ArrayValue::Bytea(v) => map(v, |b| Ok(ExprValue::Bytes(Cow::Owned(b.clone())))),
+        ArrayValue::Json(v) => map(v, |s| Ok(ExprValue::JsonText(Cow::Owned(s.clone())))),
+        ArrayValue::Jsonb(v) => map(v, |s| Ok(ExprValue::Json(Cow::Owned(s.clone())))),
+        ArrayValue::Enum(_) => Err(internal("enum array reached an array cast")),
+    }
+}
+
+/// 要素ごとの評価値を、変換先の要素型の配列へ詰め直す。
+fn values_to_array(
+    values: Vec<ExprValue<'static>>,
+    to: ArrayElemType,
+) -> Result<ArrayValue, SqlSurfaceError> {
+    fn collect<T>(
+        values: Vec<ExprValue<'static>>,
+        f: impl Fn(ExprValue<'static>) -> Result<T, SqlSurfaceError>,
+    ) -> Result<Vec<Option<T>>, SqlSurfaceError> {
+        values
+            .into_iter()
+            .map(|v| match v {
+                ExprValue::Null => Ok(None),
+                other => f(other).map(Some),
+            })
+            .collect()
+    }
+    let bad = || internal("array element conversion produced an unexpected value");
+    let int_of = |v: ExprValue<'static>| match v {
+        ExprValue::Scalar(x) if x.is_finite() && x.fract() == 0.0 => Ok(x as i64),
+        _ => Err(internal(
+            "array element conversion produced an unexpected value",
+        )),
+    };
+    Ok(match to {
+        ArrayElemType::Text => ArrayValue::Text(collect(values, |v| match v {
+            ExprValue::Text(s) => Ok(s.into_owned()),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Bool => ArrayValue::Bool(collect(values, |v| match v {
+            ExprValue::Bool(b) => Ok(b),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Integer => ArrayValue::Integer(collect(values, |v| {
+            i32::try_from(int_of(v)?).map_err(|_| out_of_range("integer out of range"))
+        })?),
+        ArrayElemType::BigInt => ArrayValue::BigInt(collect(values, int_of)?),
+        ArrayElemType::Real => ArrayValue::Real(collect(values, |v| match v {
+            ExprValue::Scalar(x) => Ok(x as f32),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Double => ArrayValue::Double(collect(values, |v| match v {
+            ExprValue::Scalar(x) => Ok(x),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Date => ArrayValue::Date(collect(values, |v| match v {
+            ExprValue::Date(d) => Ok(d),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Timestamp => ArrayValue::Timestamp(collect(values, |v| match v {
+            ExprValue::Timestamp(t) => Ok(t),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Uuid => ArrayValue::Uuid(collect(values, |v| match v {
+            ExprValue::Uuid(u) => Ok(u),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Numeric { .. } => ArrayValue::Numeric(collect(values, |v| match v {
+            ExprValue::Numeric(d) => Ok(d),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Bytea => ArrayValue::Bytea(collect(values, |v| match v {
+            ExprValue::Bytes(b) => Ok(b.into_owned()),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Json => ArrayValue::Json(collect(values, |v| match v {
+            ExprValue::JsonText(s) => Ok(s.into_owned()),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Jsonb => ArrayValue::Jsonb(collect(values, |v| match v {
+            ExprValue::Json(s) => Ok(s.into_owned()),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Enum => return Err(internal("enum array is not a cast target")),
+    })
+}
+
+/// 配列 → 配列（`elem`）。要素ごとに（変換元の要素型, 変換先の要素型）の変換を適用し、
+/// NULL 要素は NULL のまま、要素のエラーはその SQLSTATE のまま返す。要素数は入力と同じ。
+fn cast_array(
+    from: ArrayElemType,
+    to: ArrayElemType,
+    a: &ArrayValue,
+) -> Result<ArrayValue, SqlSurfaceError> {
+    let (Some(src), Some(dst)) = (elem_cast_src(from), elem_cast_dst(to)) else {
+        return Err(internal("array element type is not supported for casts"));
+    };
+    let element = CastFn { from: src, to: dst };
+    let converted = array_to_values(a)?
+        .into_iter()
+        .map(|v| apply_cast(element, v))
+        .collect::<Result<Vec<_>, _>>()?;
+    values_to_array(converted, to)
 }
 
 #[cfg(test)]
@@ -1076,6 +1705,114 @@ mod tests {
         assert!(!f(CastSrc::Numeric, CastDst::Numeric(Some((5, 2)))).is_noop());
         assert!(f(CastSrc::Text, CastDst::Varchar(None)).is_noop());
         assert!(!f(CastSrc::Text, CastDst::Bpchar(3)).is_noop());
+    }
+
+    #[test]
+    fn noop_classification_for_ext_types() {
+        let f = |from, to| CastFn { from, to };
+        assert!(f(CastSrc::Date, CastDst::Date).is_noop());
+        assert!(f(CastSrc::Uuid, CastDst::Uuid).is_noop());
+        assert!(f(
+            CastSrc::Array(ArrayElemType::Integer),
+            CastDst::Array(ArrayElemType::Integer)
+        )
+        .is_noop());
+        // 値を変える変換は noop にしない（json -> jsonb は正規化、型が変わる組は別の値）。
+        assert!(!f(CastSrc::Json, CastDst::Jsonb).is_noop());
+        assert!(!f(CastSrc::Date, CastDst::Timestamp).is_noop());
+        assert!(!f(CastSrc::Uuid, CastDst::Text).is_noop());
+        assert!(!f(
+            CastSrc::Array(ArrayElemType::Integer),
+            CastDst::Array(ArrayElemType::BigInt)
+        )
+        .is_noop());
+    }
+
+    #[test]
+    fn bytea_to_text_over_the_text_limit_is_rejected_before_allocation() {
+        // 4 MiB の TEXT 上限に対し、2 MiB + 1 バイトの bytea は 16 進で上限を超える。
+        let max = crate::row_codec::MAX_TEXT_FIELD_LEN as usize;
+        let big = ExprValue::Bytes(Cow::Owned(vec![0u8; max / 2 + 1]));
+        let e = cast(CastSrc::Bytea, CastDst::Text, big).expect_err("too long");
+        assert_eq!(e.wire_code(), "54000");
+        let exact = ExprValue::Bytes(Cow::Owned(vec![0u8; (max - 2) / 2]));
+        assert_eq!(
+            as_text(cast(CastSrc::Bytea, CastDst::Text, exact)).len(),
+            max - (max - 2) % 2
+        );
+    }
+
+    #[test]
+    fn array_to_text_is_bounded() {
+        // 1 MiB の BYTEA 要素 3 個の配列は文字列化すると TEXT の上限を超える。
+        let items = vec![Some(vec![0u8; 1 << 20]); 3];
+        let e = cast(
+            CastSrc::Array(ArrayElemType::Bytea),
+            CastDst::Text,
+            ExprValue::Array(ArrayValue::Bytea(items)),
+        )
+        .expect_err("too long");
+        assert_eq!(e.wire_code(), "54000");
+    }
+
+    #[test]
+    fn array_element_conversion_keeps_nulls_and_element_errors() {
+        let src = ExprValue::Array(ArrayValue::Integer(vec![Some(1), None, Some(300)]));
+        let out = cast(
+            CastSrc::Array(ArrayElemType::Integer),
+            CastDst::Array(ArrayElemType::BigInt),
+            src.clone(),
+        )
+        .expect("widen");
+        assert_eq!(
+            out,
+            ExprValue::Array(ArrayValue::BigInt(vec![Some(1), None, Some(300)]))
+        );
+        // 数値配列の縮小変換の失敗はその要素の SQLSTATE（ここでは numeric(2,0) の桁あふれ）
+        let nums = ExprValue::Array(ArrayValue::Integer(vec![Some(1), Some(300)]));
+        let e = cast(
+            CastSrc::Array(ArrayElemType::Integer),
+            CastDst::Array(ArrayElemType::Numeric {
+                precision: 2,
+                scale: 0,
+            }),
+            nums,
+        )
+        .expect_err("overflow");
+        assert_eq!(e.wire_code(), "22003");
+        // 空配列も要素型を変えて通る
+        let empty = cast(
+            CastSrc::Array(ArrayElemType::Integer),
+            CastDst::Array(ArrayElemType::Text),
+            ExprValue::Array(ArrayValue::Integer(vec![])),
+        )
+        .expect("empty");
+        assert_eq!(empty, ExprValue::Array(ArrayValue::Text(vec![])));
+    }
+
+    #[test]
+    fn calendar_boundaries_for_timestamp_to_date_and_time() {
+        // エポック前でも日は負の側へ丸め、時刻は 0 以上の剰余になる。
+        let t = crate::datetime::parse_timestamp("1969-12-31 23:59:59").expect("ts");
+        assert_eq!(
+            cast(CastSrc::Timestamp, CastDst::Date, ExprValue::Timestamp(t)).expect("date"),
+            ExprValue::Date(-1)
+        );
+        assert_eq!(
+            cast(CastSrc::Timestamp, CastDst::Time, ExprValue::Timestamp(t)).expect("time"),
+            ExprValue::Time(86_399_000_000)
+        );
+        // 24:00:00 -> interval -> time は 00:00:00
+        let iv = cast(
+            CastSrc::Time,
+            CastDst::Interval,
+            ExprValue::Time(86_400_000_000),
+        )
+        .expect("interval");
+        assert_eq!(
+            cast(CastSrc::Interval, CastDst::Time, iv).expect("time"),
+            ExprValue::Time(0)
+        );
     }
 
     #[test]

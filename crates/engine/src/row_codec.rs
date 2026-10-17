@@ -244,6 +244,102 @@ pub enum ArrayValue {
     Enum(Vec<Option<String>>),
 }
 
+impl ArrayValue {
+    /// PostgreSQL 配列テキスト形式（`{a,b}`）へ描画する。wire-server の DataRow 描画と
+    /// `CAST(<配列> AS text)`（`sql::cast_value`）が共有する唯一の整形（Issue #1592・SQL-47。
+    /// 従来 wire-server に置いていたものを移設し、出力は不変）。
+    ///
+    /// 空配列は `{}`、NULL 要素は引用なしの `NULL`、`BOOLEAN` 要素は `t`/`f`、整数は 10 進、
+    /// `REAL`／`DOUBLE PRECISION` は [`crate::scalar_float`] の整形、`DATE`／`TIMESTAMP` は
+    /// [`crate::datetime`] の ISO 整形（`TIMESTAMP` は空白を含むため引用する）、`UUID` は正規
+    /// テキスト。`TEXT` 要素のうち、空文字列・`,{}"\` や空白を含むもの・大小無視で `NULL` に
+    /// 一致するものは `"..."` で囲み `"`・`\` をバックスラッシュでエスケープするため、文字列
+    /// `NULL` は NULL 要素と区別される。出力は `sql::parser::parse_array_literal` で同じ値へ
+    /// 往復できる。
+    pub fn to_pg_text(&self) -> String {
+        self.to_pg_text_bounded(usize::MAX).unwrap_or_default()
+    }
+
+    /// [`Self::to_pg_text`] の長さ上限つき版。描画結果が `max_len` バイトを超えると確定した
+    /// 時点で打ち切って `None` を返す（BYTEA 要素を多数含む配列の文字列化が巨大な確保にならない
+    /// ようにするため。呼び出し元は `None` を上限超過として拒否する）。
+    pub fn to_pg_text_bounded(&self, max_len: usize) -> Option<String> {
+        fn bounded<T>(
+            items: &[Option<T>],
+            max_len: usize,
+            f: impl Fn(&T) -> String,
+        ) -> Option<String> {
+            let mut out = String::from("{");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                match item {
+                    Some(v) => out.push_str(&f(v)),
+                    None => out.push_str("NULL"),
+                }
+                if out.len() > max_len {
+                    return None;
+                }
+            }
+            out.push('}');
+            (out.len() <= max_len).then_some(out)
+        }
+        match self {
+            ArrayValue::Text(items) => bounded(items, max_len, |s| quote_pg_array_text_elem(s)),
+            ArrayValue::Bool(items) => {
+                bounded(items, max_len, |b| if *b { "t" } else { "f" }.to_string())
+            }
+            ArrayValue::Integer(items) => bounded(items, max_len, |v| v.to_string()),
+            ArrayValue::BigInt(items) => bounded(items, max_len, |v| v.to_string()),
+            ArrayValue::Real(items) => {
+                bounded(items, max_len, |v| crate::scalar_float::format_real(*v))
+            }
+            ArrayValue::Double(items) => {
+                bounded(items, max_len, |v| crate::scalar_float::format_double(*v))
+            }
+            ArrayValue::Date(items) => {
+                bounded(items, max_len, |v| crate::datetime::format_date(*v))
+            }
+            ArrayValue::Timestamp(items) => bounded(items, max_len, |v| {
+                quote_pg_array_text_elem(&crate::datetime::format_timestamp(*v))
+            }),
+            ArrayValue::Uuid(items) => bounded(items, max_len, |v| v.to_string()),
+            // NUMERIC は正規テキスト（引用不要）、BYTEA は `\x` 16 進（`\` を含むため常に引用・
+            // エスケープされ PostgreSQL と同形の `"\\x0102"` になる）、JSON／JSONB／ENUM は
+            // 格納テキスト／ラベルを引用要否判定へ通す。
+            ArrayValue::Numeric(items) => bounded(items, max_len, |d| d.to_string()),
+            ArrayValue::Bytea(items) => bounded(items, max_len, |b| {
+                quote_pg_array_text_elem(&crate::bytea::format_hex_text(b))
+            }),
+            ArrayValue::Json(items) | ArrayValue::Jsonb(items) | ArrayValue::Enum(items) => {
+                bounded(items, max_len, |s| quote_pg_array_text_elem(s))
+            }
+        }
+    }
+}
+
+/// [`ArrayValue::to_pg_text`] の TEXT 要素 1 個の引用要否判定・エスケープ処理。
+fn quote_pg_array_text_elem(s: &str) -> String {
+    let needs_quote = s.is_empty()
+        || s.eq_ignore_ascii_case("null")
+        || s.chars()
+            .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace());
+    if !needs_quote {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 /// `ArrayValue` の全 variant に同じ式を適用する内部マクロ（要素型が増えたときの
 /// 網羅漏れを 1 箇所に集約する）。
 macro_rules! array_dispatch {

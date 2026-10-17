@@ -119,9 +119,110 @@ pub fn format_hex_text(bytes: &[u8]) -> String {
     s
 }
 
+/// [`parse_cast_text`] の失敗種別。値は含めない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteaCastError {
+    /// 復号後の長さが [`MAX_BYTEA_FIELD_LEN`] を超える。
+    TooLong,
+    /// `\x` 形式の本体が奇数桁（PostgreSQL は `22023`）。
+    OddLength,
+    /// `\x` 形式の本体に 16 進以外の文字（空白を含む）がある（PostgreSQL は `22023`）。
+    InvalidDigit,
+    /// escape 形式の不正（孤立した `\`、`\` の後が `\` でも 3 桁の 8 進でもない。`22P02`）。
+    InvalidSyntax,
+}
+
+/// `CAST(<文字列> AS bytea)` の入力関数（Issue #1592・SQL-47。`sql::cast_value` が呼ぶ）。
+///
+/// PostgreSQL の `byteain` に従い、`\x` 始まりは 16 進形式、それ以外は escape 形式
+/// （生バイト・`\\`・`\ooo`〔先頭桁 0〜3 の 8 進 3 桁〕）として読む。`'abc'` は `\x616263`。
+/// 16 進本体の空白は PostgreSQL では許容されるが、本エンジンは [`parse_hex_text`] と揃えて
+/// 拒否する（fail-closed。既知の差分）。INSERT のリテラル束縛（[`parse_hex_text`]）は変えない。
+///
+/// 復号後の長さは入力長以下のため、上限は確保前に入力長から判定する。
+pub fn parse_cast_text(s: &str) -> Result<Vec<u8>, ByteaCastError> {
+    let bytes = s.as_bytes();
+    let max = MAX_BYTEA_FIELD_LEN as usize;
+    if matches!(bytes.get(..2), Some([b'\\', b'x'])) {
+        let body = bytes.get(2..).unwrap_or(&[]);
+        if body.len() / 2 > max {
+            return Err(ByteaCastError::TooLong);
+        }
+        if body.len() % 2 != 0 {
+            return Err(ByteaCastError::OddLength);
+        }
+        let mut out = Vec::new();
+        out.try_reserve_exact(body.len() / 2)
+            .map_err(|_| ByteaCastError::TooLong)?;
+        for [hi, lo] in body.as_chunks::<2>().0 {
+            let hi = hex_digit(*hi).ok_or(ByteaCastError::InvalidDigit)?;
+            let lo = hex_digit(*lo).ok_or(ByteaCastError::InvalidDigit)?;
+            out.push((hi << 4) | lo);
+        }
+        return Ok(out);
+    }
+    // escape 形式。出力は入力以下の長さのため、入力長で確保前に上限を判定する
+    // （入力が上限を超える場合は `\\`・`\ooo` で縮んでも拒否する。fail-closed の既知の差分）。
+    if bytes.len() > max {
+        return Err(ByteaCastError::TooLong);
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| ByteaCastError::TooLong)?;
+    let mut i = 0usize;
+    while let Some(&c) = bytes.get(i) {
+        if c != b'\\' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match (bytes.get(i + 1), bytes.get(i + 2), bytes.get(i + 3)) {
+            (Some(b'\\'), _, _) => {
+                out.push(b'\\');
+                i += 2;
+            }
+            (Some(&a @ b'0'..=b'3'), Some(&b @ b'0'..=b'7'), Some(&d @ b'0'..=b'7')) => {
+                out.push(((a - b'0') << 6) | ((b - b'0') << 3) | (d - b'0'));
+                i += 4;
+            }
+            _ => return Err(ByteaCastError::InvalidSyntax),
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cast_text_reads_escape_form_like_postgres() {
+        assert_eq!(parse_cast_text("abc").unwrap(), b"abc".to_vec());
+        assert_eq!(parse_cast_text("").unwrap(), Vec::<u8>::new());
+        assert_eq!(parse_cast_text("a\\\\b").unwrap(), b"a\\b".to_vec());
+        assert_eq!(parse_cast_text("\\101\\000").unwrap(), vec![0x41, 0x00]);
+        assert_eq!(parse_cast_text("\\377").unwrap(), vec![0xff]);
+    }
+
+    #[test]
+    fn cast_text_hex_form_and_errors() {
+        assert_eq!(parse_cast_text("\\x616263").unwrap(), b"abc".to_vec());
+        assert_eq!(parse_cast_text("\\x").unwrap(), Vec::<u8>::new());
+        assert_eq!(parse_cast_text("\\xabc"), Err(ByteaCastError::OddLength));
+        assert_eq!(parse_cast_text("\\xzz"), Err(ByteaCastError::InvalidDigit));
+        assert_eq!(parse_cast_text("\\x a"), Err(ByteaCastError::InvalidDigit));
+    }
+
+    #[test]
+    fn cast_text_rejects_malformed_escapes() {
+        for bad in ["\\", "a\\", "\\9", "\\400", "\\1", "\\18x", "\\q"] {
+            assert_eq!(
+                parse_cast_text(bad),
+                Err(ByteaCastError::InvalidSyntax),
+                "{bad}"
+            );
+        }
+    }
 
     #[test]
     fn parse_accepts_lower_upper_and_mixed_case() {

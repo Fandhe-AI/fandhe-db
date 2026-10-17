@@ -2276,6 +2276,9 @@ fn expr_value_to_cell(
             ))
         }
         ExprValue::Numeric(d) => Cell::Numeric(d),
+        ExprValue::Uuid(u) => Cell::Uuid(u),
+        ExprValue::Bytes(b) => Cell::Bytes(b.into_owned()),
+        ExprValue::Array(a) => Cell::Array(a),
         ExprValue::Vector(_) => {
             return Err(accumulator_bug(
                 "aggregate projection expression produced a vector",

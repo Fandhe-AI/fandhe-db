@@ -5,7 +5,8 @@
 //! production 経路として検証する。固定する契約: 型の組が `×` のときの `42846`（値が NULL でも同じ）、
 //! 恒等・型なしリテラル・型付き NULL の束縛と結果列の型、未知の型名の `42704`、値の変換が未実装の組の
 //! `0A000`、定数式・CHECK 本体・UDF 名の従来の拒否の維持、テナント境界、エラー文に値が出ないこと。
-//! 値の変換そのもの（`i`・`a`・`e`・`io/*`）は #1591／#1592 の担当でここでは固定しない。
+//! 値の変換そのもの（`i`・`a`・`e`・`io/*`）は #1591／#1592 の担当でここでは固定しない
+//! （`sql_cast_numeric_text_bool.rs`・`sql_cast_datetime_json_misc.rs`）。
 
 use engine::catalog::ColumnType;
 use engine::core::EngineCore;
@@ -325,12 +326,12 @@ fn cannot_coerce_message_names_only_types() {
 fn unimplemented_conversions_are_rejected_not_evaluated() {
     let (core, _g) = setup("cast-unimpl");
     // 数値・文字列・BOOLEAN どうしの変換は #1591 で実装済み（`sql_cast_numeric_text_bool.rs`）。
-    // ここには、日時・JSON・UUID・BYTEA・配列（#1592）と、種別を静的に決められない数値
-    // （関数・`id` 疑似列）の変換が評価されずに拒否されることを固定する。
+    // 日時・JSON・UUID・BYTEA・配列は #1592 で実装済み（`sql_cast_datetime_json_misc.rs`）。
+    // ここには、種別を静的に決められない数値（関数・`id` 疑似列）の変換と、対応する要素型の無い
+    // 配列への変換が評価されずに拒否されることを固定する。
     for expr in [
-        "CAST('x' AS uuid)",
-        "CAST(NULL AS uuid)",
-        "CAST('{1}' AS integer[])",
+        "CAST('{1}' AS smallint[])",
+        "CAST(NULL AS character varying(3)[])",
         "CAST(abs(i4) AS integer)",
         "CAST(abs(i4) AS text)",
         "CAST(id AS integer)",
@@ -632,11 +633,10 @@ fn cast_never_exposes_other_tenants_rows() {
         .execute_sql(&ctx("carol"), "SELECT CAST(t AS text) FROM c LIMIT 10")
         .unwrap();
     assert!(bob.rows.is_empty());
-    // エラー文に値・他テナントの情報を含めない
+    // 入力関数の失敗は呼び出し元から見える行の値だけを含む（他テナントの行は評価されない）
     let e = select(&core, "SELECT CAST(t AS uuid) FROM c LIMIT 1").unwrap_err();
-    let msg = e.to_string();
-    assert_eq!(e.wire_code(), "0A000");
-    assert!(!msg.contains("abc"), "{msg}");
+    assert_eq!(e.wire_code(), "22P02");
+    assert!(e.to_string().contains("abc"), "{e}");
     let e = select(&core, "SELECT CAST(dt AS time) FROM c LIMIT 1").unwrap_err();
     assert_eq!(e.wire_code(), "42846");
     assert!(!e.to_string().contains("2026"), "{e}");

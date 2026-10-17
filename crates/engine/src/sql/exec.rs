@@ -3526,6 +3526,10 @@ fn project_rows(
                         }
                         // `CAST(.. AS numeric)` の結果（Issue #1591）。`Cell::Numeric` は列直接投影と共通。
                         udf_call::ExprValue::Numeric(d) => cells.push(Cell::Numeric(d)),
+                        // `CAST` の結果（Issue #1592）。列直接投影と同じセルへ写す。
+                        udf_call::ExprValue::Uuid(u) => cells.push(Cell::Uuid(u)),
+                        udf_call::ExprValue::Bytes(b) => cells.push(Cell::Bytes(b.into_owned())),
+                        udf_call::ExprValue::Array(a) => cells.push(Cell::Array(a)),
                     }
                 }
             }
