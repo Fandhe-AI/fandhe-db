@@ -3283,8 +3283,9 @@ pub enum DeleteStatement {
 /// 避けるため行わない。`sql::ddl` モジュールドキュメント参照）。
 ///
 /// 受理する形は `CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]` の
-/// みで、`<type>` は `TEXT`／`VECTOR ( <N> )` のみ（`IF NOT EXISTS`・
-/// `REFERENCES`・`USING OPERATION_ID` の付与はいずれも許可リスト外。
+/// みで（先頭の `IF NOT EXISTS` は TABLE-36・Issue #1613 で受理）、
+/// `<type>` は `TEXT`／`VECTOR ( <N> )` のみ
+/// （`REFERENCES`・`USING OPERATION_ID` の付与はいずれも許可リスト外。
 /// `CONSTRAINT <name>` は `CHECK` の前置にのみ受理する）。列制約・表制約
 /// `[CONSTRAINT <name>] CHECK ( <述語> )`（TABLE-16・TASK-204、Issue #906。
 /// `docs/design/sql-check-constraint.md` 参照）も受理する。列制約 `NOT NULL`／`DEFAULT <literal>`（Issue #904）・
@@ -3305,6 +3306,10 @@ pub enum DeleteStatement {
 pub struct ValidatedCreateTable {
     /// カタログ存在確認前のテーブル名（識別子形式のみ検証済み）。
     pub table_name: String,
+    /// `IF NOT EXISTS` 句の有無（TABLE-36、Issue #1613）。真なら同名の関係が既にある
+    /// とき実行段（`sql::ddl::execute_create_table`）は何もせず成功を返す。
+    /// BREAKING CHANGE: 公開フィールド追加。構造体リテラルで作る外部コードは追従が要る。
+    pub if_not_exists: bool,
     /// 宣言順を保持した列定義（1 件以上）。`VECTOR` 列は `nullable = false`・
     /// `TEXT` 列は `nullable = true`（PostgreSQL の既定に倣う。TABLE-1）。
     /// 主キー構成列（[`Self::primary_key`] が `Some` の場合）は列制約・表制約の
@@ -4137,6 +4142,25 @@ impl<'a> Parser<'a> {
             self.tokens.get(self.pos.saturating_add(offset)),
             Some(Token::Ident(name)) if name.eq_ignore_ascii_case(word)
         )
+    }
+
+    /// 現在位置が `IF NOT EXISTS`（3 語すべて文脈的識別子）なら消費して `true`、
+    /// 揃わなければ何も消費せず `false` を返す（TABLE-36、Issue #1613）。
+    /// `CREATE TABLE`・名前付き `CREATE INDEX` が受理に使い、後続の SEQUENCE・
+    /// SCHEMA・MATERIALIZED VIEW の CREATE も再利用する想定。3 語揃ったときだけ消費する
+    /// ため、`if` という表名・索引名を使う既存の形は変わらない。
+    fn parse_optional_if_not_exists(&mut self) -> bool {
+        if self.peek_ident_matches("IF")
+            && self.peek_ident_matches_at(1, "NOT")
+            && self.peek_ident_matches_at(2, "EXISTS")
+        {
+            self.advance();
+            self.advance();
+            self.advance();
+            true
+        } else {
+            false
+        }
     }
 
     /// 現在位置が `Token::Ident` かつ大文字小文字を区別せず `word` と一致する場合のみ
@@ -8991,6 +9015,7 @@ impl<'a> Parser<'a> {
     fn parse_create_table(&mut self) -> Result<ValidatedCreateTable, SqlSurfaceError> {
         self.expect_contextual_keyword("CREATE")?;
         self.expect_contextual_keyword("TABLE")?;
+        let if_not_exists = self.parse_optional_if_not_exists();
         let table_name = self.expect_ident()?;
         crate::catalog::validate_identifier(&table_name)
             .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
@@ -9245,6 +9270,7 @@ impl<'a> Parser<'a> {
 
         Ok(ValidatedCreateTable {
             table_name,
+            if_not_exists,
             columns,
             alias_type_names,
             array_len_defaulted,
@@ -10169,11 +10195,17 @@ impl<'a> Parser<'a> {
     }
 
     /// `CREATE VIEW <name> AS <body> [;]`（TABLE-18・SQL-23・TASK-205、
-    /// Issue #909）。`CREATE OR REPLACE`・`IF NOT EXISTS`・`TEMP`／
+    /// Issue #909）。`CREATE OR REPLACE`・`TEMP`／
     /// `MATERIALIZED`・列別名リスト `v (a, b)` はいずれも構造的に受理しない。
     fn parse_create_view(&mut self) -> Result<(String, &[Token]), SqlSurfaceError> {
         self.expect_ident_matching("CREATE")?;
         self.expect_ident_matching("VIEW")?;
+        // PostgreSQL 17 に無い形。意図を明示して `42601` にする（TABLE-36、Issue #1613）。
+        if self.parse_optional_if_not_exists() {
+            return Err(SqlSurfaceError::unsupported(
+                "CREATE VIEW does not support IF NOT EXISTS",
+            ));
+        }
         let name = self.expect_ident()?;
         self.expect_ident_matching("AS")?;
         // 本文の構造検証（単純形／評価後射影形の判定。Issue #1192）は呼び出し元
@@ -11053,6 +11085,8 @@ pub(crate) fn validate_create_view_tokens(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedCreateIndex {
     pub(crate) name: String,
+    /// `IF NOT EXISTS` 句の有無（TABLE-36、Issue #1613。名前付きのみ）。
+    pub(crate) if_not_exists: bool,
     pub(crate) table: String,
     /// `USING hnsw` 指定の有無（`hnsw` 以外の `USING` 値は構造検証段で `0A000`
     /// 拒否済み）。
@@ -11064,6 +11098,11 @@ pub struct ValidatedCreateIndex {
 }
 
 impl ValidatedCreateIndex {
+    /// `IF NOT EXISTS` 句の有無。真なら同名の関係があるとき実行段は何もせず成功を返す。
+    pub fn if_not_exists(&self) -> bool {
+        self.if_not_exists
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -11121,7 +11160,7 @@ pub(crate) fn is_drop_index_statement(tokens: &[Token]) -> bool {
 /// - 部分索引の `WHERE` 句 → `0A000`。
 /// - 列リストに重複する列名 → `42601`。列数上限超過 → `54000`。
 ///
-/// `UNIQUE`／`CONCURRENTLY`／`IF NOT EXISTS`／`INCLUDE`／`WITH (...)`／
+/// `UNIQUE`／`CONCURRENTLY`／`INCLUDE`／`WITH (...)`／
 /// `ASC|DESC`／opclass・スキーマ修飾名・`$n` 等は、いずれも期待するトークン列と
 /// 一致しないため `expect_*` ヘルパー経由で構造的に `42601` へ落ちる。
 pub(crate) fn validate_create_index_tokens(
@@ -11130,6 +11169,14 @@ pub(crate) fn validate_create_index_tokens(
     let mut p = Parser::new(tokens);
     p.expect_ident_matching("CREATE")?;
     p.expect_ident_matching("INDEX")?;
+    let if_not_exists = p.parse_optional_if_not_exists();
+    // 名前を省いた `CREATE INDEX IF NOT EXISTS ON t (c)` は PostgreSQL 17 でも名前が
+    // 要る形。索引名 `on` の場合（直後がさらに `ON`）は名前として扱う（TABLE-36）。
+    if if_not_exists && p.peek_ident_matches("ON") && !p.peek_ident_matches_at(1, "ON") {
+        return Err(SqlSurfaceError::unsupported(
+            "CREATE INDEX IF NOT EXISTS requires an index name",
+        ));
+    }
     let name = p.expect_ident()?;
     p.expect_ident_matching("ON")?;
     let table = p.expect_ident()?;
@@ -11182,6 +11229,7 @@ pub(crate) fn validate_create_index_tokens(
     p.expect_end_of_statement()?;
     Ok(ValidatedCreateIndex {
         name,
+        if_not_exists,
         table,
         hnsw,
         columns,
@@ -11288,6 +11336,12 @@ pub(crate) fn validate_create_type_tokens(
     let mut p = Parser::new(tokens);
     p.expect_ident_matching("CREATE")?;
     p.expect_ident_matching("TYPE")?;
+    // PostgreSQL 17 に無い形。意図を明示して `42601` にする（TABLE-36、Issue #1613）。
+    if p.parse_optional_if_not_exists() {
+        return Err(SqlSurfaceError::unsupported(
+            "CREATE TYPE does not support IF NOT EXISTS",
+        ));
+    }
     let name = p.expect_ident()?;
     crate::catalog::validate_identifier(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid type name in CREATE TYPE"))?;
@@ -21979,6 +22033,23 @@ mod tests {
     fn parse_create_table_ok(sql: &str) -> ValidatedCreateTable {
         let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
         validate_create_table_tokens(&tokens).unwrap_or_else(|e| panic!("expected ok, got {e:?}"))
+    }
+
+    /// `IF NOT EXISTS` 句の解析（TABLE-36、Issue #1613）。
+    #[test]
+    fn create_table_if_not_exists_clause() {
+        assert!(parse_create_table_ok("CREATE TABLE IF NOT EXISTS t (a TEXT)").if_not_exists);
+        assert!(parse_create_table_ok("create table if not exists t (a TEXT)").if_not_exists);
+        assert!(!parse_create_table_ok("CREATE TABLE t (a TEXT)").if_not_exists);
+        // 3 語揃わない `if` は表名として読む。
+        assert!(!parse_create_table_ok("CREATE TABLE if (a TEXT)").if_not_exists);
+        for sql in [
+            "CREATE TABLE IF NOT EXISTS (a TEXT)",
+            "CREATE TABLE IF EXISTS t (a TEXT)",
+            "CREATE TABLE IF NOT t (a TEXT)",
+        ] {
+            assert_eq!(parse_create_table_err(sql).wire_code(), "42601", "{sql}");
+        }
     }
 
     fn parse_create_table_err(sql: &str) -> SqlSurfaceError {
