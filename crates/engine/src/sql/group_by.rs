@@ -2131,7 +2131,16 @@ fn finish_groups(
             &cells,
             &mut project_scratch,
             &mut computed_bytes,
-            budget.max_result_bytes,
+            &|computed| {
+                budget.check(
+                    total_group_count,
+                    total_key_bytes,
+                    total_text_accumulator_bytes
+                        .saturating_add(order_key_bytes)
+                        .saturating_add(computed),
+                    RESULT_BUDGET_EXCEEDED_DETAIL,
+                )
+            },
         )?;
         rows.push(ResultRow {
             id: 0,
@@ -2157,7 +2166,7 @@ fn project_row(
     cells: &[Cell],
     scratch: &mut Vec<StackValue>,
     computed_bytes: &mut usize,
-    max_result_bytes: usize,
+    charge: &dyn Fn(usize) -> Result<(), SqlSurfaceError>,
 ) -> Result<Vec<Cell>, SqlSurfaceError> {
     let group_keys: &[crate::sql::parser::BoundOrderKey] = bound
         .group_by
@@ -2239,17 +2248,13 @@ fn project_row(
                     .ok_or_else(|| accumulator_bug("projection expression without a row view"))?;
                 let value = program.eval(0, &[], row_scalars, scratch)?;
                 let cell = expr_value_to_cell(value, result_ty.as_ref())?;
-                // CAST 等が返す BYTEA／配列は入力より大きくなりうるため、結果バイト予算
-                // （`max_result_bytes`）へ累計課金し超過は `54000` で拒否する（Issue #1592。
-                // 通常 SELECT の投影段〔`sql::exec`〕の予算計上と同方針・fail-closed）。
+                // CAST 等が返す BYTEA／配列は入力より大きくなりうるため、累計見積りを呼び出し元の
+                // `charge`（`ResultBudget::check` へグループ数・キー・TEXT 集計状態と同じプールで
+                // 照会する）へ渡し、超過は `54000` で拒否する（Issue #1592。fail-closed）。
                 if matches!(cell, Cell::Bytes(_) | Cell::Array(_)) {
                     *computed_bytes = computed_bytes
                         .saturating_add(crate::sql::cursor::estimate_cell_bytes(&cell));
-                    if *computed_bytes > max_result_bytes {
-                        return Err(SqlSurfaceError::payload_too_large(
-                            RESULT_BUDGET_EXCEEDED_DETAIL,
-                        ));
-                    }
+                    charge(*computed_bytes)?;
                 }
                 cell
             }
@@ -2266,6 +2271,7 @@ pub(crate) fn project_ungrouped_row(
     schema: &TableSchema,
     cells: &[Cell],
     max_result_bytes: usize,
+    text_state_bytes: usize,
 ) -> Result<Vec<Cell>, SqlSurfaceError> {
     if bound
         .projection
@@ -2275,6 +2281,7 @@ pub(crate) fn project_ungrouped_row(
         return Err(accumulator_bug("group key projected without GROUP BY"));
     }
     let mut scratch: Vec<StackValue> = Vec::new();
+    let budget = ResultBudget::new(bound, max_result_bytes, MAX_GROUPS)?;
     let mut computed_bytes: usize = 0;
     project_row(
         bound,
@@ -2283,7 +2290,15 @@ pub(crate) fn project_ungrouped_row(
         cells,
         &mut scratch,
         &mut computed_bytes,
-        max_result_bytes,
+        &|computed| {
+            // 単一行は 1 グループ・キーなし。結果バイト予算は `ResultBudget` と同じ判定器で共有する。
+            budget.check(
+                1,
+                0,
+                text_state_bytes.saturating_add(computed),
+                RESULT_BUDGET_EXCEEDED_DETAIL,
+            )
+        },
     )
 }
 
@@ -2497,7 +2512,13 @@ impl<'a> GroupedRowAccumulator<'a> {
                 cells.push(acc.finish()?);
             }
             let columns = crate::sql::aggregate::aggregate_projection_columns(bound, schema)?;
-            let row_cells = project_ungrouped_row(bound, schema, &cells, budget.max_result_bytes)?;
+            let row_cells = project_ungrouped_row(
+                bound,
+                schema,
+                &cells,
+                budget.max_result_bytes,
+                total_text_accumulator_bytes,
+            )?;
             return Ok(QueryResult {
                 columns,
                 rows: vec![ResultRow {
@@ -3065,10 +3086,20 @@ mod tests {
             mask: Vec::new(),
         }];
         let schema = schema_with_text_group_column();
-        let cells = project_ungrouped_row(&bound, &schema, &[], 1_000).expect("within budget");
+        let cells = project_ungrouped_row(&bound, &schema, &[], 1_000, 0).expect("within budget");
         assert!(matches!(cells.as_slice(), [Cell::Bytes(b)] if b.len() == 8));
-        let err = project_ungrouped_row(&bound, &schema, &[], 8)
+        let err = project_ungrouped_row(&bound, &schema, &[], 8, 0)
             .expect_err("bytea result over the budget must be rejected");
+        assert_eq!(err.wire_code(), "54000");
+        // TEXT 集計状態など他の消費者と同じプールを使う: CAST 単独では上限内でも、
+        // 既に消費済みのバイト数との合計が上限を超えれば拒否する。
+        let per_row = ResultBudget::new(&bound, 1_000, MAX_GROUPS)
+            .expect("budget")
+            .per_group_bytes;
+        let cap = per_row + 16; // 1 グループ分の固定分＋bytea セルの見積り（8 バイト＋固定 8 バイト）
+        project_ungrouped_row(&bound, &schema, &[], cap, 0).expect("fits the shared pool");
+        let err = project_ungrouped_row(&bound, &schema, &[], cap, 1)
+            .expect_err("other pool consumers must count against the same budget");
         assert_eq!(err.wire_code(), "54000");
     }
 

@@ -1188,3 +1188,21 @@ fn enum_element_arrays_can_only_be_rendered_as_text() {
     assert_eq!(q("CAST(m AS text[])").unwrap_err().wire_code(), "0A000");
     assert_eq!(q("CAST(m AS integer)").unwrap_err().wire_code(), "42846");
 }
+
+/// CAST の配列解析は BYTEA 要素をスカラー CAST と同じ入力関数（byteain 相当）で読む。
+#[test]
+fn bytea_array_cast_elements_follow_the_scalar_cast_input_function() {
+    let (core, _g) = setup("cast-bytea-array");
+    // escape 形式の要素は `text[]` 経由でも直接でも同じ値になる。
+    let direct = value(&core, "CAST('{abc}' AS bytea[])");
+    let via_text = value(&core, "CAST(CAST('{abc}' AS text[]) AS bytea[])");
+    assert_eq!(direct, via_text);
+    // 不正な 16 進要素はスカラー CAST と同じ 22023。
+    for lit in ["{\\xabc}", "{\\xzz}"] {
+        assert_eq!(
+            err_of(&core, &format!("CAST('{lit}' AS bytea[])")).wire_code(),
+            "22023",
+            "{lit}"
+        );
+    }
+}

@@ -2436,7 +2436,12 @@ pub(crate) fn execute_aggregate_with_group_limits(
                         )?;
                     }
                 }
-                return finish_aggregate_result(accumulators, bound, schema);
+                return finish_aggregate_result(
+                    accumulators,
+                    bound,
+                    schema,
+                    fast_path_text_accumulator_bytes,
+                );
             }
         }
     }
@@ -2710,7 +2715,7 @@ pub(crate) fn execute_aggregate_with_group_limits(
         }
     }
 
-    finish_aggregate_result(accumulators, bound, schema)
+    finish_aggregate_result(accumulators, bound, schema, total_text_accumulator_bytes)
 }
 
 /// 集計項目の結果列の静的型（Issue #1173。WIRE-13・TABLE-13 のポインタ）。
@@ -2868,6 +2873,7 @@ fn finish_aggregate_result(
     accumulators: Vec<Accumulator>,
     bound: &BoundAggregate,
     schema: &TableSchema,
+    text_state_bytes: usize,
 ) -> Result<QueryResult, SqlSurfaceError> {
     let mut cells = Vec::with_capacity(bound.items.len());
     for accumulator in accumulators {
@@ -2889,6 +2895,7 @@ fn finish_aggregate_result(
             schema,
             &cells,
             MAX_AGGREGATE_RESULT_BYTES,
+            text_state_bytes,
         )?
     } else {
         cells
@@ -3049,7 +3056,12 @@ fn try_scalar_index_aggregate(
         }
     }
     scalar_access.cache.record_aggregate_index_scan();
-    Ok(Some(finish_aggregate_result(accumulators, bound, schema)?))
+    Ok(Some(finish_aggregate_result(
+        accumulators,
+        bound,
+        schema,
+        0, // 索引経路の TEXT 集計状態は走査関数内で完結し、ここでは参照できない
+    )?))
 }
 
 /// Issue #475: `WHERE` なし・索引対応述語のみの `WHERE` を持つ `GROUP BY` の

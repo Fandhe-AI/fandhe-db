@@ -795,7 +795,7 @@ fn json_column_error(e: crate::json::JsonColumnError, type_name: &str) -> SqlSur
     }
 }
 
-fn bytea_cast_error(e: crate::bytea::ByteaCastError) -> SqlSurfaceError {
+pub(crate) fn bytea_cast_error(e: crate::bytea::ByteaCastError) -> SqlSurfaceError {
     use crate::bytea::ByteaCastError;
     match e {
         ByteaCastError::TooLong => {
@@ -920,7 +920,7 @@ fn parse_from_text(s: &str, to: CastDst) -> Result<ExprValue<'static>, SqlSurfac
         CastDst::Array(elem) => {
             let ty = ArrayType::new(elem, MAX_ARRAY_ELEMENTS)
                 .map_err(|_| internal("array element type is not supported as a cast target"))?;
-            crate::sql::parser::parse_array_literal(s, &ty).map(ExprValue::Array)
+            crate::sql::parser::parse_array_literal_for_cast(s, &ty).map(ExprValue::Array)
         }
         _ => Err(internal("unexpected cast destination for a text source")),
     }

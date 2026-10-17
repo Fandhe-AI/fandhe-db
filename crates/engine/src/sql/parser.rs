@@ -855,6 +855,27 @@ pub fn parse_array_literal(
     literal: &str,
     array_ty: impl std::borrow::Borrow<crate::catalog::ArrayType>,
 ) -> Result<crate::row_codec::ArrayValue, SqlSurfaceError> {
+    parse_array_literal_with(literal, array_ty, false)
+}
+
+/// `CAST(<文字列> AS <型>[])` 用の配列リテラル解析（Issue #1592。`sql::cast_value` が呼ぶ）。
+/// 構文・上限は [`parse_array_literal`] と同一で、BYTEA 要素だけを INSERT の束縛
+/// （[`bind_bytea_literal`]）ではなく CAST の入力関数（`bytea::parse_cast_text`。byteain 相当）で
+/// 読み、スカラー CAST と同じ受理範囲・SQLSTATE にする。INSERT 側の挙動は変えない。
+pub(crate) fn parse_array_literal_for_cast(
+    literal: &str,
+    array_ty: &crate::catalog::ArrayType,
+) -> Result<crate::row_codec::ArrayValue, SqlSurfaceError> {
+    parse_array_literal_with(literal, array_ty, true)
+}
+
+/// [`parse_array_literal`]／[`parse_array_literal_for_cast`] の共通本体。`cast_input` が真なら
+/// BYTEA 要素を CAST の入力関数で変換する。
+fn parse_array_literal_with(
+    literal: &str,
+    array_ty: impl std::borrow::Borrow<crate::catalog::ArrayType>,
+    cast_input: bool,
+) -> Result<crate::row_codec::ArrayValue, SqlSurfaceError> {
     // `ArrayType` は `ENUM` 要素の語彙（`Arc`）を持ち `Copy` ではないため、値渡し・
     // 参照渡しのどちらの呼び出し元も受けられるよう `Borrow` で受ける（Issue #1357）。
     let array_ty: &crate::catalog::ArrayType = array_ty.borrow();
@@ -977,7 +998,7 @@ pub fn parse_array_literal(
         }
     }
 
-    convert_array_elements(array_ty, raw_elements)
+    convert_array_elements(array_ty, raw_elements, cast_input)
 }
 
 /// 切り出し済みの配列要素（`None` は NULL 要素）を要素型へ変換する
@@ -989,6 +1010,7 @@ pub fn parse_array_literal(
 fn convert_array_elements(
     array_ty: &crate::catalog::ArrayType,
     raw_elements: Vec<Option<String>>,
+    cast_input: bool,
 ) -> Result<crate::row_codec::ArrayValue, SqlSurfaceError> {
     use crate::catalog::ArrayElemType as E;
     let elem = array_ty.elem();
@@ -1100,6 +1122,10 @@ fn convert_array_elements(
             })
             .map(ArrayValue::Numeric)
         }
+        E::Bytea if cast_input => map_all(&raw_elements, |raw| {
+            crate::bytea::parse_cast_text(raw).map_err(crate::sql::cast_value::bytea_cast_error)
+        })
+        .map(ArrayValue::Bytea),
         E::Bytea => map_all(&raw_elements, |raw| match bind_bytea_literal(raw, NAME)? {
             Value::Bytes(v) => Ok(v),
             _ => Err(SqlSurfaceError::Internal {
