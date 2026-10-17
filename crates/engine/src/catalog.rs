@@ -1543,8 +1543,9 @@ pub enum CatalogError {
     /// 制約追加を拒否した。文言・variant 自体にテナント名・値・行を含めない
     /// （security.md P0。`TenantWriteError::ForeignKeyViolation` と同じ秘匿方針）。
     ForeignKeyViolation,
-    /// [`Storage::alter_table_add_primary_key`]（TABLE-22 (d)・TASK-233、Issue #1196）が、
-    /// 既存行（全テナント）の中に主キー構成列が NULL の行を検出したため主キー追加を
+    /// [`Storage::alter_table_add_primary_key`]（TABLE-22 (d)・TASK-233、Issue #1196）および
+    /// [`Storage::alter_table_set_not_null`]（TABLE-39 (3)、Issue #1631）が、
+    /// 既存行（全テナント）の中に対象列が NULL の行を検出したため DDL を
     /// 拒否した（ERR-6: `23502`）。保持するのは**列名のみ**（スキーマ情報）で、
     /// テナント・行 ID・値・件数は含めない（security.md P0）。
     ///
@@ -5188,9 +5189,9 @@ fn validate_foreign_keys(schema: &TableSchema, allow_unresolved: bool) -> Result
                 "duplicate foreign key declaration".to_string(),
             ));
         }
-        // 参照アクションの宣言時検査（Issue #1076 A8）。ALTER で FK 列の
-        // nullability・DEFAULT を後から変える経路が無い（DROP COLUMN は FK 構成列を
-        // 拒否する）ため、この検査は宣言後も恒久的に有効であり続ける。
+        // 参照アクションの宣言時検査（Issue #1076 A8）。ALTER で FK 列の DEFAULT を
+        // 後から変える経路は無く、nullability を変える `SET NOT NULL`（Issue #1631）は
+        // 変更後スキーマで本検査を再実行してから永続化するため、宣言後も恒久的に有効。
         validate_referential_action_declaration(schema, fk)?;
         // 自己参照は参照先の宣言がこのスキーマ自身にあるため、参照先の照合まで
         // 静的に検証できる（解決済みの宣言のみ。未解決は `create_table` の
@@ -8650,6 +8651,100 @@ impl Storage {
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(confirmed_name)
+    }
+
+    /// `ALTER TABLE ... ALTER COLUMN <column> SET NOT NULL`（TABLE-39 (3)・TABLE-22 (e)
+    /// のポインタ、Issue #1631）。SQL 表層 `sql::ddl::execute_alter_table_alter_column_set_not_null`
+    /// から呼ばれる唯一の実装で、単一の write txn（書き込みロック保持中）で既存行の検証と
+    /// カタログ更新を行う。
+    ///
+    /// 判定順序（fail-closed。拒否はすべて commit 前に return し副作用ゼロ）:
+    /// (1) 識別子・保護列名 (2) テーブル取得（`TableNotFound`） (3) 列取得
+    /// （`ColumnNotFound`） (4) 既に NOT NULL なら冪等に成功（commit・世代 bump なし）
+    /// (5) NULL 許容 VECTOR 列は検証手段が無いため `Invalid`（TABLE-26 の後続で置換）
+    /// (6) 変更後スキーマの [`validate_schema`]（`SET NULL`／`SET DEFAULT` の FK 参照
+    /// アクションが常に失敗する宣言になる場合は `InvalidForeignKey`） (7) 対象列を含む
+    /// 子側 FK の参照先照合の再実行（`ON UPDATE CASCADE` と親列 nullable の組。
+    /// `InvalidForeignKey`） (8) 既存行の**全件**（全テナント・`Public`／`Private` を問わない。
+    /// DDL は `PolicyContext` を取らない共有資源操作のため可視性で母集合を縮めない。行数上限
+    /// なし）の NULL 検査（`NotNullConstraintViolation`。**変更前スキーマ**で走査する理由は
+    /// [`crate::constraint::table_first_null_in_columns`] 参照）。
+    /// 成功時はカタログを更新し世代を bump する（nullability はキーの正準エンコードを
+    /// 変えないため索引の失効は不要）。
+    pub fn alter_table_set_not_null(&self, table_name: &str, column_name: &str) -> Result<()> {
+        validate_identifier(table_name)?;
+        validate_identifier(column_name)?;
+        if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
+            return Err(CatalogError::ProtectedColumn(column_name.to_string()));
+        }
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        {
+            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| c.name == column_name)
+                .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+            if !column.nullable {
+                // 既に NOT NULL（PK 構成列・VECTOR 列を含む）。冪等な no-op。
+                return Ok(());
+            }
+            if matches!(column.ty, ColumnType::Vector(_)) {
+                // 行コーデックのスカラー走査は VECTOR 列を常に `None` として返すため NULL 検査が
+                // 全行偽陽性になる。NULL 許容 VECTOR は現状作れないが、到達した場合は
+                // fail-closed で拒否する（TABLE-26 の後続 Issue で埋め込み有無の検査へ置換）。
+                return Err(CatalogError::Invalid(
+                    "SET NOT NULL on a VECTOR column is not supported".to_string(),
+                ));
+            }
+
+            let mut updated = schema.clone();
+            for c in updated.columns.iter_mut() {
+                if c.name == column_name {
+                    c.nullable = false;
+                }
+            }
+            validate_schema(&updated)?;
+            for fk in updated.foreign_keys.iter() {
+                if !fk.columns.iter().any(|c| c == column_name) || fk.parent_table == table_name {
+                    continue;
+                }
+                let parent = match require_table_schema_write(&write_txn, &fk.parent_table) {
+                    Ok(p) => p,
+                    Err(CatalogError::TableNotFound(_)) | Err(CatalogError::WrongObjectKind(_)) => {
+                        return Err(CatalogError::CorruptSchema(
+                            "foreign key parent is missing".to_string(),
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                };
+                resolve_foreign_key_target(&updated, fk, &parent)?;
+            }
+
+            let row_table_name = user_rows_table_name(table_name);
+            match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+                Ok(row_table) => {
+                    if let Some(col) = crate::constraint::table_first_null_in_columns(
+                        &row_table,
+                        &schema,
+                        &[column_name.to_string()],
+                    )? {
+                        return Err(CatalogError::NotNullConstraintViolation(col));
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    // 行ストア未作成（既存行 0 件）。
+                }
+                Err(e) => return Err(map_row_table_error(e)),
+            }
+
+            let encoded = encode_schema(&updated)?;
+            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            catalog_table.insert(table_name, encoded.as_slice())?;
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(())
     }
 
     /// 既存テーブルへ（任意で名前付きの）CHECK 制約を追加する（TABLE-16・
