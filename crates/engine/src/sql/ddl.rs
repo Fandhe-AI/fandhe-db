@@ -94,6 +94,19 @@ pub(crate) fn execute_create_table(
     validated: &ValidatedCreateTable,
     limits: &SchemaLimits,
 ) -> Result<CreateTableOutcome, SqlSurfaceError> {
+    // `IF NOT EXISTS`（TABLE-36、Issue #1613）。同名の関係（表・ビュー・索引）が既にあれば、
+    // 定義の意味検証（列数・型解決・DEFAULT 等）より前に何もせず成功を返す（定義は比較しない）。
+    // 権限ゲート（`42501`）は呼び出し元で通過済みのため存在オラクルにならない。最終判定は
+    // 下の `create_table` の書き込みトランザクションで、競合時の `TableAlreadyExists` も no-op に写す。
+    if validated.if_not_exists
+        && storage
+            .relation_name_exists(&validated.table_name)
+            .map_err(|_| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?
+    {
+        return Ok(CreateTableOutcome {});
+    }
     // 起動時設定 `--max-table-columns`（Issue #1548）。構文段の上限（ハード上限）は
     // 変えず、定義が増えるここでだけ設定値と比較する（decode 経路には入れない）。
     // カタログを参照しない判定のため存在オラクルにならず、storage 呼び出しより前に
@@ -194,7 +207,15 @@ pub(crate) fn execute_create_table(
     if !validated.foreign_keys.is_empty() {
         schema = schema.with_foreign_keys(validated.foreign_keys.clone());
     }
-    storage.create_table(&schema).map_err(|e| match e {
+    // 早期判定〔上〕と書き込みの間に他セッションが同名を作った場合の TOCTOU 対策。名前衝突は
+    // commit・世代 bump の前に返るため、no-op は副作用を残さない。
+    match storage.create_table(&schema) {
+        Err(CatalogError::TableAlreadyExists(_)) if validated.if_not_exists => {
+            return Ok(CreateTableOutcome {});
+        }
+        result => result,
+    }
+    .map_err(|e| match e {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::duplicate_table(name),
         // `FOREIGN KEY` の参照先（TABLE-17・TASK-205、Issue #907）。`create_table` が
         // `TableNotFound` を返すのは参照先テーブルの不在のみ（作成対象自身の重複は
@@ -1527,7 +1548,12 @@ pub(crate) fn execute_create_index(
         validated.columns().to_vec(),
     )
     .with_column_collations(validated.column_collations().to_vec());
-    storage.create_index(&def).map_err(map_create_index_error)?;
+    // `IF NOT EXISTS`（TABLE-36、Issue #1613）。`create_index` の write txn は名前衝突を最初に
+    // 判定し commit・世代 bump の前に返るため、同名があれば定義を比較せず副作用なしで成功にする。
+    match storage.create_index(&def) {
+        Err(CatalogError::IndexAlreadyExists(_)) if validated.if_not_exists() => {}
+        result => result.map_err(map_create_index_error)?,
+    }
     Ok(CreateIndexOutcome {})
 }
 
@@ -1742,6 +1768,7 @@ mod tests {
     fn undefined_table_or_view_distinguishes_view_and_missing() {
         let (storage, _guard) = tmp_storage("undefined-or-view");
         let validated = ValidatedCreateTable {
+            if_not_exists: false,
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
@@ -1898,6 +1925,7 @@ mod tests {
     fn execute_create_table_succeeds_for_new_table() {
         let (storage, _guard) = tmp_storage("succeeds");
         let validated = ValidatedCreateTable {
+            if_not_exists: false,
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
@@ -1921,10 +1949,57 @@ mod tests {
         assert_eq!(schema.columns.len(), 2);
     }
 
+    /// `IF NOT EXISTS`（TABLE-36）の no-op は表・索引カタログの世代を変えない。
+    #[test]
+    fn if_not_exists_noop_leaves_generations_unchanged() {
+        let (storage, _guard) = tmp_storage("if-not-exists-gen");
+        let mut validated = ValidatedCreateTable {
+            if_not_exists: true,
+            primary_key_name: None,
+            alias_type_names: Vec::new(),
+            array_len_defaulted: Vec::new(),
+            table_name: "docs".to_string(),
+            columns: vec![crate::catalog::ColumnDef::new(
+                "body",
+                crate::catalog::ColumnType::Text,
+                true,
+            )],
+            primary_key: None,
+            unique_constraints: Vec::new(),
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+        execute_create_table(&storage, &validated, &SchemaLimits::default()).expect("create");
+        let index = ValidatedCreateIndex {
+            name: "i".to_string(),
+            if_not_exists: true,
+            table: "docs".to_string(),
+            hnsw: false,
+            columns: vec!["body".to_string()],
+            collations: vec![None],
+        };
+        execute_create_index(&storage, &index).expect("create index");
+        let snapshot = |storage: &Storage| {
+            use redb::ReadableDatabase;
+            let read = storage.db().begin_read().expect("read");
+            (
+                crate::catalog::table_generation_in_txn(&read, "docs").expect("table gen"),
+                crate::catalog::index_catalog_generation_in_txn(&read).expect("index gen"),
+            )
+        };
+        let before = snapshot(&storage);
+        execute_create_table(&storage, &validated, &SchemaLimits::default()).expect("noop table");
+        validated.table_name = "i".to_string();
+        execute_create_table(&storage, &validated, &SchemaLimits::default()).expect("noop name");
+        execute_create_index(&storage, &index).expect("noop index");
+        assert_eq!(before, snapshot(&storage));
+    }
+
     #[test]
     fn execute_create_table_rejects_duplicate_name() {
         let (storage, _guard) = tmp_storage("duplicate-name");
         let validated = ValidatedCreateTable {
+            if_not_exists: false,
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
@@ -1951,6 +2026,7 @@ mod tests {
     fn execute_create_table_rejects_two_vector_columns() {
         let (storage, _guard) = tmp_storage("two-vector");
         let validated = ValidatedCreateTable {
+            if_not_exists: false,
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
