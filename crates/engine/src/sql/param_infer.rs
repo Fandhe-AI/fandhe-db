@@ -23,8 +23,8 @@
 //!   （PostgreSQL の数値オーバーロードの曖昧さに倣う fail-closed）。登録 UDF など
 //!   組み込みでない関数の引数は型を引かず `Text` へ倒す（関数の存在を応答コードで
 //!   観測させない）。
-//! - `$n::T`／`CAST($n AS T)`: 変換先 `T` が整数・浮動小数・`text`・`varchar` のとき `T`
-//!   （それ以外は不定。宣言型が無ければ `42P18`）。
+//! - `$n::T`／`CAST($n AS T)`: 変換先 `T` が `integer`・`text`・`varchar` のとき `T`
+//!   （smallint・bigint・real・double precision を含むそれ以外は不定。宣言型が無ければ `42P18`）。
 //! - `CASE` の THEN／ELSE・`COALESCE`・`NULLIF` の `$n`: 兄弟のうち型が決まるものの型。
 //!   どこからも決まらない（`$1 + $2`・`COALESCE($1, $2)`）場合は `42P18`。
 //!
@@ -422,20 +422,17 @@ impl Inferrer<'_> {
                 None => self.walk(expr)?,
             },
             // `CAST($n AS t)`／`$n::t`（Issue #1593。構文段で同一の `Expr::Cast` へ脱糖される）の
-            // `$n` は、変換先が式の中で扱える型（整数・浮動小数・テキスト）のときその型で推論する
-            // （PG の `$1::int` と同じ）。それ以外（日付・jsonb・bool・numeric・配列等）は Describe の
-            // 仮値置換が成り立たないため従来どおり `Untyped`（不定。宣言型が無ければ `42P18`）。
+            // `$n` は、変換先が int4／text／varchar のときその型で推論する
+            // （PG の `$1::int` と同じ）。置換後の数値リテラルは int4／numeric として束縛され、数値間の
+            // 変換（smallint・bigint・real・double precision 宛て）は `bind_cast` が未実装（`0A000`）の
+            // ため、これらは推論せず `Untyped` に留める。それ以外（日付・jsonb・bool・numeric・配列等）も
+            // Describe の仮値置換が成り立たないため従来どおり `Untyped`（不定。宣言型が無ければ `42P18`）。
             Expr::Cast { expr, ty } => match as_param(expr) {
                 Some(n) => {
                     let inferred = match ty.result_column_type() {
-                        Some(
-                            ct @ (ColumnType::SmallInt
-                            | ColumnType::Integer
-                            | ColumnType::BigInt
-                            | ColumnType::Real
-                            | ColumnType::Double
-                            | ColumnType::Varchar(_)),
-                        ) => Ty::Known(scalar("?column?", ct)),
+                        Some(ct @ (ColumnType::Integer | ColumnType::Varchar(_))) => {
+                            Ty::Known(scalar("?column?", ct))
+                        }
                         Some(ColumnType::Text) => Ty::Known(PreparedParamType::Text),
                         _ => Ty::Untyped,
                     };

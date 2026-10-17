@@ -242,6 +242,16 @@ fn string_literal_typecast_in_where_is_an_expression_predicate() {
         let b = outcome(&core, &format!("SELECT id FROM c WHERE {sugar} LIMIT 5"));
         assert_eq!(a, b, "{sugar}");
     }
+    // boolean 語の直後の `::` は BoolEquality にせず式として解析する（CAST 形式と同じ結果）。
+    for (sugar, cast) in [
+        ("id = true::bool", "id = CAST(true AS bool)"),
+        ("id = FALSE::boolean", "id = CAST(FALSE AS boolean)"),
+    ] {
+        let a = outcome(&core, &format!("SELECT id FROM c WHERE {cast} LIMIT 5"));
+        let b = outcome(&core, &format!("SELECT id FROM c WHERE {sugar} LIMIT 5"));
+        assert_eq!(a, b, "{sugar}");
+        assert_ne!(b, Err("42601"), "{sugar}");
+    }
     // IN／BETWEEN／LIKE の中の `::` は受理しない（fail-closed）。
     for sql in [
         "SELECT id FROM c WHERE t IN ('a'::text) LIMIT 5",
@@ -386,6 +396,18 @@ fn param_placeholder_with_typecast_infers_target_type() {
         ),
         "42P18"
     );
+    // 数値間の変換は未実装のため、smallint・bigint・real・double precision 宛ての `$n` も
+    // 不定（42P18）に留める（置換後のリテラルが int4／numeric となり束縛で 0A000 になるのを避ける）。
+    for ty in ["smallint", "bigint", "real", "double precision"] {
+        assert_eq!(
+            parse_code(
+                &core,
+                &format!("UPDATE c SET i4 = $1::{ty} WHERE id = 1 USING OPERATION_ID $2")
+            ),
+            "42P18",
+            "{ty}"
+        );
+    }
     // 許可位置外の `$n::T` は 42601。
     for sql in [
         "SELECT id FROM c WHERE id = $1::int LIMIT 1",

@@ -5751,6 +5751,9 @@ impl<'a> Parser<'a> {
         }
         if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false"))
+            // `flag = true::bool` の `true` は `::` の被演算子（式）であり、構造葉の
+            // BoolEquality にはしない（Issue #1593。式述語へ回す）。
+            && !matches!(self.tokens.get(self.pos + 3), Some(Token::TypeCast))
         {
             // BOOLEAN 列の明示等価条件（`<col> = true|false`。Issue #883・
             // D-c）。大小無視は expect_literal の bool リテラルと同じ方針。
