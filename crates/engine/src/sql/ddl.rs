@@ -753,9 +753,8 @@ pub(crate) fn execute_alter_table(
 ///
 /// 全アクションを `Storage::alter_table_in_single_txn` の単一 write txn 内で適用する。途中の
 /// アクションが失敗したら txn ごと破棄され何も適用されない（カタログ・世代とも不変）。適用順は
-/// PostgreSQL の `AlterTablePass` に倣い、pass（`DROP`〔DROP COLUMN・DROP NOT NULL・
-/// DROP DEFAULT〕→ `ADD COLUMN` → `SET NOT NULL` → `SET DEFAULT`）の昇順で、同じ pass 内は
-/// 記述順。応答の `actions` は記述順に並べ直す。各アクションは txn 内のスキーマ（前のアクションの
+/// PostgreSQL の `AlterTablePass` に倣い、pass（`DROP COLUMN` → `ADD COLUMN` →
+/// 列属性変更〔SET／DROP NOT NULL・SET／DROP DEFAULT〕）の昇順で、同じ pass 内は記述順。応答の `actions` は記述順に並べ直す。各アクションは txn 内のスキーマ（前のアクションの
 /// 結果を含む）に対して判定し、エラーの SQLSTATE は単一アクション経路と同じ写像を使う。
 /// いずれのアクションもカタログを変えなかった場合（`IF NOT EXISTS` の skip・冪等な no-op のみ）は
 /// commit せず世代も進めない。
@@ -772,10 +771,18 @@ pub(crate) fn execute_alter_table_multiple(
         .alter_table_in_single_txn(&stmt.table_name, |txn| {
             let mut results: Vec<Option<AlterTableAction>> = vec![None; stmt.actions.len()];
             let mut changed = false;
+            let mut live_checked = false;
             for &i in &order {
                 let Some(action) = stmt.actions.get(i) else {
                     continue;
                 };
+                // 列属性変更 pass に入る前に、DROP／ADD pass の結果として生存列が残っていることを
+                // 確かめる（0 本のまま属性変更が内部エラーにならないよう、ここで 42601 にする）。
+                if !live_checked && alter_action_pass(action) >= ALTER_PASS_ATTRIBUTES {
+                    Storage::ensure_table_has_live_column_in_txn(txn, &stmt.table_name)
+                        .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
+                    live_checked = true;
+                }
                 let (done, apply) =
                     apply_alter_action_in_txn(storage, txn, &stmt.table_name, action, limits)?;
                 changed |= apply == AlterApply::Applied;
@@ -783,6 +790,11 @@ pub(crate) fn execute_alter_table_multiple(
                     *slot = Some(done);
                 }
             }
+            // DROP COLUMN の「生存列 1 本以上」検証は中間状態では保留しているため、全アクション
+            // 適用後にここで検証する（最後の列を置き換える `ADD COLUMN b, DROP COLUMN a` 等を許す。
+            // 0 本のままなら単一 DROP と同じ 42601 で txn ごと破棄）。
+            Storage::ensure_table_has_live_column_in_txn(txn, &stmt.table_name)
+                .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
             Ok((results, changed))
         })
         .map_err(|e| match e {
@@ -800,16 +812,21 @@ pub(crate) fn execute_alter_table_multiple(
     })
 }
 
+/// 複数アクションの列属性変更 pass の番号（[`alter_action_pass`] 参照）。
+const ALTER_PASS_ATTRIBUTES: u8 = 2;
+
 /// 複数アクションの適用順（PostgreSQL の `AlterTablePass` 相当）。数値が小さいほど先に適用する。
 /// 複数アクションに含められない種別は構文段で拒否済みのため最後尾（到達しない）に置く。
 fn alter_action_pass(action: &ValidatedAlterTable) -> u8 {
     match action {
-        ValidatedAlterTable::DropColumn(_)
-        | ValidatedAlterTable::AlterColumnDropNotNull(_)
-        | ValidatedAlterTable::AlterColumnDropDefault(_) => 0,
+        ValidatedAlterTable::DropColumn(_) => 0,
         ValidatedAlterTable::AddColumn(_) => 1,
-        ValidatedAlterTable::AlterColumnSetNotNull(_) => 2,
-        ValidatedAlterTable::AlterColumnSetDefault(_) => 3,
+        // 列属性変更（SET／DROP NOT NULL・SET／DROP DEFAULT）は ADD COLUMN の後に記述順で適用する
+        // （同一 pass 内は安定ソートで記述順を保つ）。
+        ValidatedAlterTable::AlterColumnSetNotNull(_)
+        | ValidatedAlterTable::AlterColumnDropNotNull(_)
+        | ValidatedAlterTable::AlterColumnSetDefault(_)
+        | ValidatedAlterTable::AlterColumnDropDefault(_) => ALTER_PASS_ATTRIBUTES,
         _ => u8::MAX,
     }
 }
@@ -838,10 +855,11 @@ fn apply_alter_action_in_txn(
     action: &ValidatedAlterTable,
     limits: &SchemaLimits,
 ) -> Result<(AlterTableAction, AlterApply), AlterCheckError> {
-    use crate::catalog::get_table_schema_in_txn;
+    use crate::catalog::{get_table_schema_in_txn, get_table_schema_in_txn_impl};
     match action {
         ValidatedAlterTable::AddColumn(stmt) => {
-            let schema = get_table_schema_in_txn(txn, table_name)
+            // DROP COLUMN pass 直後は生存列 0 本の中間状態がありうる（全アクション適用後に検証する）。
+            let schema = get_table_schema_in_txn_impl(txn, table_name, false)
                 .map_err(|e| alter_in_txn_error(e, map_add_column_error))?;
             if stmt.if_not_exists && schema.columns.iter().any(|c| c.name == stmt.column_name) {
                 return Ok((
@@ -856,7 +874,7 @@ fn apply_alter_action_in_txn(
             let max_columns =
                 Storage::prevalidate_add_column(table_name, &column, limits.max_table_columns())
                     .map_err(|e| alter_in_txn_error(e, map_add_column_error))?;
-            Storage::alter_table_add_column_in_txn(txn, table_name, column, max_columns)
+            Storage::alter_table_add_column_in_txn(txn, table_name, column, max_columns, true)
                 .map_err(|e| alter_in_txn_error(e, map_add_column_error))?;
             Ok((
                 AlterTableAction::AddColumn {
@@ -869,7 +887,7 @@ fn apply_alter_action_in_txn(
             let map = map_drop_alter_column_error;
             Storage::validate_alter_column_target(table_name, &stmt.column_name)
                 .map_err(|e| alter_in_txn_error(e, map))?;
-            Storage::alter_table_drop_column_in_txn(txn, table_name, &stmt.column_name)
+            Storage::alter_table_drop_column_in_txn(txn, table_name, &stmt.column_name, true)
                 .map_err(|e| alter_in_txn_error(e, map))?;
             Ok((
                 AlterTableAction::DropColumn {

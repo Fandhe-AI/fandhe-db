@@ -334,6 +334,91 @@ fn multi_action_unsupported_mixes_are_rejected() {
     assert_eq!(column_names(&core), ["a", "n"]);
 }
 
+/// 最後の生存列を置き換える複数アクションは、中間状態の「生存列 0 本」で拒否されず、
+/// 全アクション適用後の検証で受理される。生存列 0 本のままなら `42601` で何も適用されない。
+#[test]
+fn multi_action_may_replace_all_columns() {
+    let (core, path, mut session) = setup("multi-replace-all");
+    let _guard = CleanupGuard(path);
+    // 全列を別名で置き換える。
+    ok(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ADD COLUMN b TEXT, DROP COLUMN a, DROP COLUMN n",
+    );
+    assert_eq!(column_names(&core), ["b"]);
+    // 最後の 1 列を同名で置き換える（DROP が先に適用され、ADD が新しい列を作る）。
+    ok(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ADD COLUMN b INTEGER, DROP COLUMN b",
+    );
+    assert_eq!(column_names(&core), ["b"]);
+    // 生存列が 0 本のままになる文は 42601 で、何も適用されない。
+    assert_eq!(
+        code(&core, &mut session, "ALTER TABLE docs DROP COLUMN b"),
+        "42601"
+    );
+    assert_eq!(
+        code(
+            &core,
+            &mut session,
+            "ALTER TABLE docs DROP COLUMN b, ADD COLUMN IF NOT EXISTS b TEXT, DROP COLUMN b"
+        ),
+        "42703"
+    );
+    assert_eq!(column_names(&core), ["b"]);
+}
+
+/// 列属性変更（DROP DEFAULT／DROP NOT NULL を含む）は ADD COLUMN の後に記述順で適用される。
+#[test]
+fn multi_action_attribute_changes_follow_add_column_in_written_order() {
+    let (core, path, mut session) = setup("multi-attr-order");
+    let _guard = CleanupGuard(path);
+    // ADD COLUMN ... DEFAULT と DROP DEFAULT の同時指定: 列が先に作られるので 42703 にならない。
+    ok(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ADD COLUMN x INTEGER DEFAULT 5, ALTER COLUMN x DROP DEFAULT",
+    );
+    ok(
+        &core,
+        &mut session,
+        "INSERT INTO docs (id, a) VALUES (1, 'p') USING OPERATION_ID 'op-attr-1'",
+    );
+    let rows = core
+        .execute_sql(&ctx("owner"), "SELECT x FROM docs WHERE id = 1 LIMIT 1")
+        .expect("select");
+    let dump = format!("{:?}", rows.rows[0].cells);
+    assert!(!dump.contains('5'), "DEFAULT must be dropped: {dump}");
+    // SET NOT NULL → DROP NOT NULL は記述順どおり最終的に NULL 許容。
+    ok(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ALTER COLUMN a SET NOT NULL, ALTER COLUMN a DROP NOT NULL",
+    );
+    ok(
+        &core,
+        &mut session,
+        "INSERT INTO docs (id, a) VALUES (2, NULL) USING OPERATION_ID 'op-attr-2'",
+    );
+    // DROP NOT NULL → SET NOT NULL は最終的に NOT NULL（NULL の明示挿入は 23502）。
+    ok(&core, &mut session, "CREATE TABLE t2 (n INTEGER)");
+    ok(
+        &core,
+        &mut session,
+        "ALTER TABLE t2 ALTER COLUMN n DROP NOT NULL, ALTER COLUMN n SET NOT NULL",
+    );
+    assert_eq!(
+        code(
+            &core,
+            &mut session,
+            "INSERT INTO t2 (id, n) VALUES (3, NULL) USING OPERATION_ID 'op-attr-3'"
+        ),
+        "23502"
+    );
+}
+
 /// アクション数の上限超過は確保前に `54000`。
 #[test]
 fn multi_action_count_limit_is_enforced() {
