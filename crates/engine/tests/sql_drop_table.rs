@@ -200,7 +200,7 @@ fn drop_table_missing_table_is_rejected_with_42p01() {
     assert_eq!(err.wire_code(), "42P01");
 }
 
-/// SQL-8 の許可リスト原則: `IF EXISTS`・`CASCADE`・`RESTRICT`・複数テーブル
+/// SQL-8 の許可リスト原則: `CASCADE`・`RESTRICT`・複数テーブル
 /// 列挙・`USING OPERATION_ID` 句・`EXPLAIN DROP TABLE` はいずれも `42601`
 /// （構造上受理しない。権限の有無に関わらない——構文検証はカタログ照会・
 /// 権限判定より前段のため）。
@@ -212,7 +212,6 @@ fn drop_table_rejects_unsupported_shapes_with_42601() {
     let mut session = allowed_session();
 
     for sql in [
-        format!("DROP TABLE IF EXISTS {TABLE}"),
         format!("DROP TABLE {TABLE} CASCADE"),
         format!("DROP TABLE {TABLE} RESTRICT"),
         format!("DROP TABLE {TABLE}, other_table"),

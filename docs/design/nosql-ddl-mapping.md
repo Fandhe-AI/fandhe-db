@@ -1,5 +1,8 @@
 # NoSQL 表層 DDL（`create_table`／`alter_table`／`drop_table`）の設計判断
 
+> 注記（Issue #1614）: SQL 表層の `DROP ... IF EXISTS` は受理されるが、`drop_table` op は
+> `if_exists` を持たないままである（[drop-table.md](drop-table.md) の「Issue #1614 追記」）。
+
 Issue #910・対象ビヘイビア: NOSQL-13（TASK-207）。関連ポインタ: SQL-23（DDL 本体）・
 TABLE-6, TABLE-13, TABLE-14（型集合）・ERR-4（エラー射影）・NOSQL-1・NOSQL-9
 （語彙の改訂注記）。
