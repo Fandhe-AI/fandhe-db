@@ -178,3 +178,12 @@ Issue #1065 で実装済み。詳細・設計判断は
 ## 追記（Issue #2191・TABLE-28）: 索引列の `COLLATE`
 
 列リストの各要素は `<識別子> [COLLATE <照合名>]`。照合名は固定の許可リスト（`C`・`POSIX`・`und-x-icu`・`ja-x-icu`）の完全一致で解決する。二重の `COLLATE` は `42601`、式索引は従来どおり `0A000`。カタログは照合を明示した列があるときだけ `v2`（5 行目に列ごとの照合トークン）で書き、無いときは従来の `v1` とバイト単位で同一。設計と判断は [collation-aware-index.md](collation-aware-index.md)。
+
+## Issue #1613 追記（TABLE-36）: `IF NOT EXISTS`
+
+- 名前付きの `CREATE INDEX IF NOT EXISTS <name> ON ...` を受理する。名前を省いた
+  `CREATE INDEX IF NOT EXISTS ON ...` は構文段で `42601`（カタログ非参照）。
+- `Storage::create_index` の書き込みトランザクションは名前衝突を最初に判定し、commit・世代 bump
+  の前に返す。`IF NOT EXISTS` では `IndexAlreadyExists` を no-op 成功に写す。名前衝突が最初の
+  判定のため、同名があれば対象テーブル・列が不正でも成功する（定義は比較しない）。
+- 同名の表・ビューがある場合も no-op。句なしの重複（`42P07`）は不変。

@@ -9,6 +9,10 @@
 
 ### Breaking Changes
 
+- `CREATE TABLE`／名前付き `CREATE INDEX` の `IF NOT EXISTS`（Issue #1613・TABLE-36）: 従来 `42601` だった
+  句を受理し、同名の表・ビュー・索引があれば何もせず成功する。公開構造体 `ValidatedCreateTable` に
+  公開フィールド `if_not_exists` を追加した（構造体リテラルで作る外部コードは追従が必要）。
+  `CREATE VIEW`／`CREATE TYPE`／名前なし `CREATE INDEX` の `IF NOT EXISTS` は `42601` のまま。
 - 配列型 OID の公告（Issue #1606・TABLE-35）: 配列列と結果型が確定する配列式の `RowDescription` の
   型 OID が `text`（25）から要素型ごとの PostgreSQL 配列型 OID（`int4[]`=1007 など）に変わる。
   `ENUM[]` は 25 のまま。配列のバイナリ形式は従来どおり `0A000`。
