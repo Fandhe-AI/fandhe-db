@@ -417,6 +417,11 @@ fn char_modifiers_truncate_silently_and_pad() {
         q("CAST(CAST(t AS char(12)) AS text)"),
         Cell::Text("abcdefgh".into())
     );
+    // COLLATE は型を変えないため、挟んでも同じ（末尾空白を除く）。
+    assert_eq!(
+        q("CAST((CAST(t AS char(12)) COLLATE \"C\") AS text)"),
+        Cell::Text("abcdefgh".into())
+    );
 }
 
 #[test]
@@ -747,6 +752,7 @@ fn numeric_type_modifier_ranges() {
         "numeric(0)",
         "numeric(1001,0)",
         "numeric(5000,1)",
+        "numeric(5,-1001)",
     ] {
         assert_eq!(
             code_of(
@@ -757,7 +763,13 @@ fn numeric_type_modifier_ranges() {
             "{ty}"
         );
     }
-    for ty in ["numeric(50,2)", "numeric(3,5)", "numeric(39)"] {
+    for ty in [
+        "numeric(50,2)",
+        "numeric(3,5)",
+        "numeric(39)",
+        "numeric(5,-1)",
+        "numeric(5,-1000)",
+    ] {
         assert_eq!(
             code_of(
                 &core,

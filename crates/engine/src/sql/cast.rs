@@ -274,7 +274,7 @@ impl CastType {
             SqlColumnTypeName::Jsonb => CastType::Jsonb,
             SqlColumnTypeName::Uuid => CastType::Uuid,
             SqlColumnTypeName::Numeric { precision, scale } => CastType::Numeric(Some(
-                numeric_typmod(u32::from(*precision), u32::from(*scale))?,
+                numeric_typmod(u32::from(*precision), i64::from(*scale))?,
             )),
             SqlColumnTypeName::Vector(_) => {
                 return Err(SqlSurfaceError::FeatureNotSupported {
@@ -469,6 +469,14 @@ fn column_kind(schema: Option<&TableSchema>, index: usize) -> Option<CastKind> {
     kind_of_column(&schema?.columns.get(index)?.ty)
 }
 
+/// 型を変えない `COLLATE` ラッパーを剥がした式を返す（変換元の型追跡用）。
+fn strip_collate(mut e: &Expr) -> &Expr {
+    while let Expr::Collate { expr, .. } = e {
+        e = expr;
+    }
+    e
+}
+
 /// 変換元の静的な型を、束縛済みの式から導く。
 ///
 /// 数値は列参照・整数／小数リテラル・型付き算術・入れ子の CAST から種別を決め、決められないものは
@@ -482,7 +490,8 @@ fn source_cast_kind(
     schema: Option<&TableSchema>,
 ) -> SourceKind {
     // 入れ子の CAST の結果は、内側の変換先の型（恒等・リテラル・型付き NULL のいずれも）。
-    if let Expr::Cast { ty: inner, .. } = operand {
+    // COLLATE は型を変えないため剥がして見る。
+    if let Expr::Cast { ty: inner, .. } = strip_collate(operand) {
         return SourceKind::Known(inner.kind());
     }
     match ty {
@@ -549,15 +558,23 @@ fn not_implemented(from: &str, to: &CastType) -> SqlSurfaceError {
 /// 位取り `-1000..=1000` を受理する。精度 0・精度または位取りの上限超過は PostgreSQL と同じ
 /// `22023`。PostgreSQL では有効でも本エンジンの `Decimal`（最大 38 桁・scale は精度以下の
 /// 非負）で表せない指定は、`22023` の誤報を避けて `0A000`（fail-closed）にする。
-fn numeric_typmod(precision: u32, scale: u32) -> Result<(u8, u8), SqlSurfaceError> {
+fn numeric_typmod(precision: u32, scale: i64) -> Result<(u8, u8), SqlSurfaceError> {
     if precision == 0 || precision > PG_NUMERIC_MAX_PRECISION {
         return Err(SqlSurfaceError::InvalidParameterValue {
             detail: "NUMERIC precision must be between 1 and 1000",
         });
     }
-    if scale > PG_NUMERIC_MAX_PRECISION {
+    if !(-i64::from(PG_NUMERIC_MAX_PRECISION)..=i64::from(PG_NUMERIC_MAX_PRECISION))
+        .contains(&scale)
+    {
         return Err(SqlSurfaceError::InvalidParameterValue {
             detail: "NUMERIC scale must be between -1000 and 1000",
+        });
+    }
+    // PostgreSQL では有効な負の位取り（-1000 以上）は、本エンジンの非負 scale で表せないため未対応。
+    if scale < 0 {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "negative numeric scale is not supported".to_string(),
         });
     }
     match (u8::try_from(precision), u8::try_from(scale)) {
@@ -619,11 +636,21 @@ pub(crate) fn parse_cast_type(
                 }
                 // `numeric(p,s)`。p・s が u8 を超える指定も PostgreSQL では有効な形のため、
                 // 構文違反（`42601`）ではなく上限の判定（`22023`／`0A000`）に揃える。
-                if is_punct(*pos + 3, ',') && is_punct(*pos + 5, ')') && !array_follows(*pos + 6) {
-                    if let Some(sc) = strict_u32_token(tokens.get(*pos + 4)) {
-                        let typmod = numeric_typmod(p, sc)?;
-                        *pos += 6;
-                        return Ok(CastType::Numeric(Some(typmod)));
+                // 位取りは負も受け付ける（`-` ＋ 数値トークン）。
+                if is_punct(*pos + 3, ',') {
+                    let negative = is_punct(*pos + 4, '-');
+                    let sc_at = *pos + 4 + usize::from(negative);
+                    if is_punct(sc_at + 1, ')') && !array_follows(sc_at + 2) {
+                        if let Some(sc) = strict_u32_token(tokens.get(sc_at)) {
+                            let sc = if negative {
+                                -i64::from(sc)
+                            } else {
+                                i64::from(sc)
+                            };
+                            let typmod = numeric_typmod(p, sc)?;
+                            *pos = sc_at + 2;
+                            return Ok(CastType::Numeric(Some(typmod)));
+                        }
                     }
                 }
             }
@@ -895,7 +922,7 @@ pub(super) fn bind_cast(
     // CHAR(n) への変換結果（末尾空白で埋めた値）は、別の型へ変換する前に bpchar → text と同じく
     // 末尾の半角空白を除く（列参照は束縛時に除去済み）。
     let inner_is_bpchar = matches!(
-        operand,
+        strip_collate(operand),
         Expr::Cast { ty: inner, .. } if matches!(inner, CastType::Bpchar(_))
     );
     let bound = if inner_is_bpchar && src == CastSrc::Text {
@@ -1132,6 +1159,8 @@ mod tests {
             "numeric(1001)",
             "numeric(5000,1)",
             "numeric(5,1001)",
+            "numeric(5,-1001)",
+            "numeric(5,-99999999999)",
         ] {
             assert!(
                 matches!(
@@ -1146,6 +1175,8 @@ mod tests {
             "numeric(50,2)",
             "numeric(3,5)",
             "numeric(1000,0)",
+            "numeric(5,-1)",
+            "numeric(5, -1000)",
         ] {
             assert!(
                 matches!(
