@@ -245,21 +245,51 @@ fn write_array(
 ) -> Result<(), ResponseEncodeError> {
     use engine::row_codec::ArrayValue;
 
-    fn each<T>(
+    // `dims` に従い入れ子の JSON 配列を書く（1 次元は `[要素数]`。2 次元以上は Issue #1605・
+    // TABLE-35 (6)）。NULL 要素は `null`。深さは `MAX_ARRAY_DIMS` 以下で有界。
+    fn level<T>(
         out: &mut String,
         items: &[Option<T>],
-        mut f: impl FnMut(&mut String, &T) -> Result<(), ResponseEncodeError>,
+        dims: &[u32],
+        idx: &mut usize,
+        f: &mut impl FnMut(&mut String, &T) -> Result<(), ResponseEncodeError>,
     ) -> Result<(), ResponseEncodeError> {
-        for (i, item) in items.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            match item {
-                None => out.push_str("null"),
-                Some(v) => f(out, v)?,
+        out.push('[');
+        if let Some((n, rest)) = dims.split_first() {
+            for i in 0..*n {
+                if i > 0 {
+                    out.push(',');
+                }
+                if rest.is_empty() {
+                    match items.get(*idx).ok_or(ResponseEncodeError)? {
+                        None => out.push_str("null"),
+                        Some(v) => f(out, v)?,
+                    }
+                    *idx = idx.checked_add(1).ok_or(ResponseEncodeError)?;
+                } else {
+                    level(out, items, rest, idx, f)?;
+                }
             }
         }
+        out.push(']');
         Ok(())
+    }
+
+    let dims = array_value.dims();
+    let dims = dims.as_slice();
+    fn each_dims<T>(
+        out: &mut String,
+        items: &[Option<T>],
+        dims: &[u32],
+        mut f: impl FnMut(&mut String, &T) -> Result<(), ResponseEncodeError>,
+    ) -> Result<(), ResponseEncodeError> {
+        let mut idx = 0usize;
+        level(out, items, dims, &mut idx, &mut f)
+    }
+    macro_rules! each {
+        ($out:expr, $items:expr, $f:expr) => {
+            each_dims($out, $items, dims, $f)
+        };
     }
 
     fn quoted(out: &mut String, text: &str) {
@@ -268,21 +298,20 @@ fn write_array(
         out.push('"');
     }
 
-    out.push('[');
-    match array_value {
-        ArrayValue::Text(items) => each(out, items, |out, s| {
+    match array_value.flat() {
+        ArrayValue::Text(items) => each!(out, items, |out, s| {
             quoted(out, s);
             Ok(())
         })?,
-        ArrayValue::Bool(items) => each(out, items, |out, b| {
+        ArrayValue::Bool(items) => each!(out, items, |out, b| {
             out.push_str(if *b { "true" } else { "false" });
             Ok(())
         })?,
-        ArrayValue::Integer(items) => each(out, items, |out, v| {
+        ArrayValue::Integer(items) => each!(out, items, |out, v| {
             let _ = write!(out, "{v}");
             Ok(())
         })?,
-        ArrayValue::BigInt(items) => each(out, items, |out, v| {
+        ArrayValue::BigInt(items) => each!(out, items, |out, v| {
             if v.unsigned_abs() > MAX_SAFE_INTEGER.unsigned_abs() {
                 out.push('"');
                 let _ = write!(out, "{v}");
@@ -292,27 +321,27 @@ fn write_array(
             }
             Ok(())
         })?,
-        ArrayValue::Real(items) => each(out, items, |out, v| write_finite_f32(out, *v))?,
-        ArrayValue::Double(items) => each(out, items, |out, v| write_finite_f64(out, *v))?,
-        ArrayValue::Date(items) => each(out, items, |out, v| {
+        ArrayValue::Real(items) => each!(out, items, |out, v| write_finite_f32(out, *v))?,
+        ArrayValue::Double(items) => each!(out, items, |out, v| write_finite_f64(out, *v))?,
+        ArrayValue::Date(items) => each!(out, items, |out, v| {
             quoted(out, &engine::datetime::format_date(*v));
             Ok(())
         })?,
-        ArrayValue::Timestamp(items) => each(out, items, |out, v| {
+        ArrayValue::Timestamp(items) => each!(out, items, |out, v| {
             quoted(out, &engine::datetime::format_timestamp(*v));
             Ok(())
         })?,
-        ArrayValue::Uuid(items) => each(out, items, |out, v| {
+        ArrayValue::Uuid(items) => each!(out, items, |out, v| {
             quoted(out, &v.to_string());
             Ok(())
         })?,
         // Issue #1357: スカラー列の `Cell::Numeric`／`Cell::Bytes`／`Cell::Json`／
         // `Cell::Text`（ENUM）と同じ JSON 表現を要素ごとに使う。
-        ArrayValue::Numeric(items) => each(out, items, |out, d| {
+        ArrayValue::Numeric(items) => each!(out, items, |out, d| {
             let _ = write!(out, "{d}");
             Ok(())
         })?,
-        ArrayValue::Bytea(items) => each(out, items, |out, b| {
+        ArrayValue::Bytea(items) => each!(out, items, |out, b| {
             out.push('"');
             out.push_str(&crate::http::query::base64_std::encode_base64_std(b));
             out.push('"');
@@ -320,18 +349,19 @@ fn write_array(
         })?,
         // JSON／JSONB 要素は再パース＋`write_canonical` で埋め込み、格納テキストを
         // 生連結しない（`Cell::Json` と同じ安全側の設計）。再パース失敗は fail-closed。
-        ArrayValue::Json(items) | ArrayValue::Jsonb(items) => each(out, items, |out, text| {
+        ArrayValue::Json(items) | ArrayValue::Jsonb(items) => each!(out, items, |out, text| {
             let value = engine::json::parse_json_with(text, engine::json::DuplicateKeys::LastWins)
                 .map_err(|_| ResponseEncodeError)?;
             engine::json::write_canonical(&value, out);
             Ok(())
         })?,
-        ArrayValue::Enum(items) => each(out, items, |out, label| {
+        ArrayValue::Enum(items) => each!(out, items, |out, label| {
             quoted(out, label);
             Ok(())
         })?,
+        // `flat()` は `Multi` を返さない（網羅性のための fail-closed な腕）。
+        ArrayValue::Multi(_) => return Err(ResponseEncodeError),
     }
-    out.push(']');
     Ok(())
 }
 
@@ -901,6 +931,17 @@ mod tests {
                 "uuid[]",
                 V::Uuid(vec![Some(uuid), None]),
                 r#"["11111111-1111-1111-1111-111111111111",null]"#,
+            ),
+            // 多次元配列は入れ子の JSON 配列（TABLE-35 (6)・Issue #1605）。
+            (
+                ArrayElemType::Integer,
+                "integer[]",
+                V::with_dims(
+                    V::Integer(vec![Some(1), None, Some(3), Some(4)]),
+                    vec![2, 2],
+                )
+                .expect("2d"),
+                "[[1,null],[3,4]]",
             ),
         ];
         for (elem, type_name, value, expected_cell) in cases {
