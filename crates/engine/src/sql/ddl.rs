@@ -970,6 +970,8 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
 fn map_rename_column_error(e: CatalogError) -> SqlSurfaceError {
     match e {
         CatalogError::ColumnAlreadyExists(name) => SqlSurfaceError::duplicate_column(name),
+        // 内部列（`id`／`tenant_id`／`visibility`）は TABLE-38 に従い `42703`。
+        CatalogError::ProtectedColumn(name) => SqlSurfaceError::UndefinedColumn { name },
         other => map_drop_alter_column_error(other),
     }
 }
@@ -1792,7 +1794,7 @@ mod tests {
     }
 
     /// `RENAME COLUMN` の写像（Issue #1619）: 衝突は `42701`、不在は `42703`、
-    /// 保護列は `42601`、ロック競合は既存写像に従う。
+    /// 内部列は `42703`（TABLE-38）、ロック競合は既存写像に従う。
     #[test]
     fn rename_column_error_mapping() {
         assert_eq!(
@@ -1805,7 +1807,7 @@ mod tests {
         );
         assert_eq!(
             map_rename_column_error(CatalogError::ProtectedColumn("id".to_string())).wire_code(),
-            "42601"
+            "42703"
         );
     }
 

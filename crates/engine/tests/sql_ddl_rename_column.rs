@@ -198,13 +198,14 @@ fn error_contract_and_decision_order() {
         // 既存列との衝突・同名への変更
         ("ALTER TABLE docs RENAME COLUMN note TO qty", "42701"),
         ("ALTER TABLE docs RENAME COLUMN note TO note", "42701"),
-        // 予約名（構文段。表の存在より先に判定される）
-        ("ALTER TABLE docs RENAME COLUMN id TO x", "42601"),
-        ("ALTER TABLE docs RENAME COLUMN tenant_id TO x", "42601"),
-        ("ALTER TABLE docs RENAME COLUMN note TO id", "42601"),
-        ("ALTER TABLE docs RENAME COLUMN note TO visibility", "42601"),
+        // 内部列は TABLE-38 に従い 42703、キーワード衝突名は 42601
+        // （構文段。表の存在より先に判定される）
+        ("ALTER TABLE docs RENAME COLUMN id TO x", "42703"),
+        ("ALTER TABLE docs RENAME COLUMN tenant_id TO x", "42703"),
+        ("ALTER TABLE docs RENAME COLUMN note TO id", "42703"),
+        ("ALTER TABLE docs RENAME COLUMN note TO visibility", "42703"),
         ("ALTER TABLE docs RENAME COLUMN note TO \"check\"", "42601"),
-        ("ALTER TABLE nope RENAME COLUMN id TO x", "42601"),
+        ("ALTER TABLE nope RENAME COLUMN id TO x", "42703"),
         // 未対応の形
         ("ALTER TABLE docs RENAME TO other", "42601"),
         ("ALTER TABLE docs RENAME CONSTRAINT a TO b", "42601"),

@@ -8960,10 +8960,10 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
             let column_name = self.expect_ident()?;
-            reject_reserved_alter_column_name(&column_name)?;
+            reject_reserved_rename_column_name(&column_name)?;
             self.expect_contextual_keyword("TO")?;
             let new_column_name = self.expect_ident()?;
-            reject_reserved_alter_column_name(&new_column_name)?;
+            reject_reserved_rename_column_name(&new_column_name)?;
             crate::catalog::validate_identifier(&new_column_name)
                 .map_err(|e| SqlSurfaceError::unsupported(format!("invalid column name: {e}")))?;
             return Ok(ParsedAlterTableShape::RenameColumn {
@@ -14836,6 +14836,23 @@ fn reject_reserved_alter_column_name(column_name: &str) -> Result<(), SqlSurface
         )));
     }
     Ok(())
+}
+
+/// `RENAME COLUMN` の改名元・改名先が予約名なら拒否する（Issue #1619）。内部列
+/// （`id`／`tenant_id`／`visibility`。ASCII 大文字小文字無視）は TABLE-38 に従い
+/// `42703`（利用者列としては存在しない扱い）、キーワード衝突名（`check`／
+/// `constraint`）は `42601`。カタログを照会しないため権限ゲートより前に置いても
+/// 存在オラクルにならない。
+fn reject_reserved_rename_column_name(column_name: &str) -> Result<(), SqlSurfaceError> {
+    if column_name.eq_ignore_ascii_case("id")
+        || column_name.eq_ignore_ascii_case("tenant_id")
+        || column_name.eq_ignore_ascii_case("visibility")
+    {
+        return Err(SqlSurfaceError::UndefinedColumn {
+            name: column_name.to_string(),
+        });
+    }
+    reject_reserved_alter_column_name(column_name)
 }
 
 /// `ALTER TABLE` 文（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
