@@ -196,6 +196,36 @@ fn wire_index_ddl_error_classification() {
         "CREATE INDEX idx_p ON docs (body) WHERE body = 'x'",
         "0A000",
     );
-    expect_error(&mut stream, "DROP INDEX IF EXISTS idx_body", "42601");
     expect_command(&mut stream, "DROP INDEX idx_body", "DROP INDEX");
+    // 削除済みでも `IF EXISTS` は no-op で成功する（Issue #1614）。
+    expect_command(&mut stream, "DROP INDEX IF EXISTS idx_body", "DROP INDEX");
+}
+
+/// `DROP TABLE|VIEW|INDEX|TYPE IF EXISTS`（Issue #1614・TABLE-36 ポインタ）: 対象不在でも
+/// 通常の DROP と同じ `CommandComplete` タグで成功し、依存ありは従来どおり `2BP01`、
+/// 権限の無いユーザーは対象の有無に関わらず `42501`。NoticeResponse は送出しない。
+#[test]
+fn wire_drop_if_exists_noop_and_dependency_and_permission() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_with_ddl_allowed_users(&users(), core, &["alice"]);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    for (sql, tag) in [
+        ("DROP TABLE IF EXISTS ghost", "DROP TABLE"),
+        ("DROP VIEW IF EXISTS ghost", "DROP VIEW"),
+        ("DROP INDEX IF EXISTS ghost", "DROP INDEX"),
+        ("DROP TYPE IF EXISTS ghost", "DROP TYPE"),
+    ] {
+        expect_command(&mut alice, sql, tag);
+    }
+    expect_command(
+        &mut alice,
+        "CREATE VIEW v_docs AS SELECT * FROM docs",
+        "CREATE VIEW",
+    );
+    expect_error(&mut alice, "DROP TABLE IF EXISTS docs", "2BP01");
+
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "pw-bob");
+    for sql in ["DROP TABLE IF EXISTS docs", "DROP TABLE IF EXISTS ghost"] {
+        expect_error(&mut bob, sql, "42501");
+    }
 }

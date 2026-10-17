@@ -3815,6 +3815,10 @@ pub struct ValidatedDropTable {
     /// DROP TABLE に指定されたテーブル名（識別子構文の検証のみ済み。カタログ
     /// 存在確認は未実施）。
     pub table_name: String,
+    /// `IF EXISTS` 句の有無（Issue #1614・TABLE-36 ポインタ）。真のとき、対象
+    /// テーブルが無ければ `sql::ddl::execute_drop_table` が副作用ゼロの no-op で
+    /// 成功させる。権限ゲート・種類違い・依存検査の判定順序は変えない。
+    pub if_exists: bool,
 }
 
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
@@ -4119,6 +4123,21 @@ impl<'a> Parser<'a> {
             self.tokens.get(self.pos.saturating_add(offset)),
             Some(Token::Ident(name)) if name.eq_ignore_ascii_case(word)
         )
+    }
+
+    /// `IF EXISTS` 句（Issue #1614・TABLE-36 ポインタ）を 2 トークン先読みで判定し、
+    /// 一致した場合のみ 2 語を消費して `true` を返す。`IF`・`EXISTS` は予約語化して
+    /// いないため、`if` という名前のオブジェクトを `DROP ... if` で指す従来の解釈を
+    /// 変えないよう、1 トークン先読みでは判定しない。`DROP TABLE|INDEX|VIEW|TYPE` の
+    /// 構造検証からのみ呼ばれる（CREATE 側の `IF NOT EXISTS` は対象外）。
+    fn consume_if_exists(&mut self) -> bool {
+        if self.peek_ident_matches("IF") && self.peek_ident_matches_at(1, "EXISTS") {
+            self.advance();
+            self.advance();
+            true
+        } else {
+            false
+        }
     }
 
     /// 現在位置が `Token::Ident` かつ大文字小文字を区別せず `word` と一致する場合のみ
@@ -10098,14 +10117,16 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// `DROP TABLE <table> [;]` の単一テーブル形のみを受理する（SQL-23、
-    /// TASK-203、Issue #902）。`IF EXISTS`・`CASCADE`・`RESTRICT`・複数テーブル
-    /// 列挙・`USING OPERATION_ID` 句は構造的に受理しない（`expect_end_of_statement`
-    /// が余剰トークンとして `42601` で拒否する）。
-    fn parse_drop_table(&mut self) -> Result<String, SqlSurfaceError> {
+    /// `DROP TABLE [IF EXISTS] <table> [;]` の単一テーブル形のみを受理する（SQL-23、
+    /// TASK-203、Issue #902。`IF EXISTS` は Issue #1614）。`CASCADE`・`RESTRICT`・
+    /// 複数テーブル列挙・`USING OPERATION_ID` 句は構造的に受理しない
+    /// （`expect_end_of_statement` が余剰トークンとして `42601` で拒否する）。
+    /// 戻り値は `(テーブル名, IF EXISTS の有無)`。
+    fn parse_drop_table(&mut self) -> Result<(String, bool), SqlSurfaceError> {
         self.expect_contextual_keyword("DROP")?;
         self.expect_contextual_keyword("TABLE")?;
-        self.expect_ident()
+        let if_exists = self.consume_if_exists();
+        Ok((self.expect_ident()?, if_exists))
     }
 
     /// 現在位置から末尾までの未消費トークン列（TABLE-18・SQL-23・TASK-205、
@@ -10133,12 +10154,14 @@ impl<'a> Parser<'a> {
         Ok((name, self.remaining()))
     }
 
-    /// `DROP VIEW <name> [;]`（TABLE-18・SQL-23・TASK-205、Issue #909）。
-    /// `IF EXISTS`・`CASCADE`／`RESTRICT`・複数ビュー列挙は構造的に受理しない。
-    fn parse_drop_view(&mut self) -> Result<String, SqlSurfaceError> {
+    /// `DROP VIEW [IF EXISTS] <name> [;]`（TABLE-18・SQL-23・TASK-205、Issue #909。
+    /// `IF EXISTS` は Issue #1614）。`CASCADE`／`RESTRICT`・複数ビュー列挙は構造的に
+    /// 受理しない。戻り値は `(ビュー名, IF EXISTS の有無)`。
+    fn parse_drop_view(&mut self) -> Result<(String, bool), SqlSurfaceError> {
         self.expect_ident_matching("DROP")?;
         self.expect_ident_matching("VIEW")?;
-        self.expect_ident()
+        let if_exists = self.consume_if_exists();
+        Ok((self.expect_ident()?, if_exists))
     }
 
     /// `WITH <name> AS (<body>)[, <name> AS (<body>)]*`（非再帰 CTE。SQL-29 (b)・
@@ -10931,9 +10954,16 @@ impl ValidatedCreateView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedDropView {
     pub(crate) name: String,
+    /// `IF EXISTS` 句の有無（Issue #1614・TABLE-36 ポインタ）。
+    pub(crate) if_exists: bool,
 }
 
 impl ValidatedDropView {
+    /// `IF EXISTS` が指定されたか。真のとき対象不在は副作用ゼロの no-op 成功になる。
+    pub fn if_exists(&self) -> bool {
+        self.if_exists
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -11041,9 +11071,16 @@ impl ValidatedCreateIndex {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedDropIndex {
     pub(crate) name: String,
+    /// `IF EXISTS` 句の有無（Issue #1614・TABLE-36 ポインタ）。
+    pub(crate) if_exists: bool,
 }
 
 impl ValidatedDropIndex {
+    /// `IF EXISTS` が指定されたか。真のとき対象不在は副作用ゼロの no-op 成功になる。
+    pub fn if_exists(&self) -> bool {
+        self.if_exists
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -11166,7 +11203,7 @@ fn parse_index_column(
     Ok((name, collation))
 }
 
-/// [`ValidatedDropIndex`] の構造検証本体。`IF EXISTS`・`CASCADE`・複数名の同時
+/// [`ValidatedDropIndex`] の構造検証本体。`CASCADE`・複数名の同時
 /// 指定はいずれもトレイリングトークン検査により構造的に `42601` へ落ちる。
 pub(crate) fn validate_drop_index_tokens(
     tokens: &[Token],
@@ -11174,9 +11211,10 @@ pub(crate) fn validate_drop_index_tokens(
     let mut p = Parser::new(tokens);
     p.expect_ident_matching("DROP")?;
     p.expect_ident_matching("INDEX")?;
+    let if_exists = p.consume_if_exists();
     let name = p.expect_ident()?;
     p.expect_end_of_statement()?;
-    Ok(ValidatedDropIndex { name })
+    Ok(ValidatedDropIndex { name, if_exists })
 }
 
 /// `CREATE TYPE <name> AS ENUM ('<label>'[, ...])` の許可形状構造検証結果
@@ -11206,9 +11244,16 @@ impl ValidatedCreateType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedDropType {
     pub(crate) name: String,
+    /// `IF EXISTS` 句の有無（Issue #1614・TABLE-36 ポインタ）。
+    pub(crate) if_exists: bool,
 }
 
 impl ValidatedDropType {
+    /// `IF EXISTS` が指定されたか。真のとき対象不在は副作用ゼロの no-op 成功になる。
+    pub fn if_exists(&self) -> bool {
+        self.if_exists
+    }
+
     /// 削除対象の型名。
     pub fn name(&self) -> &str {
         &self.name
@@ -11257,7 +11302,7 @@ pub(crate) fn validate_create_type_tokens(
     Ok(ValidatedCreateType { name, labels })
 }
 
-/// [`ValidatedDropType`] の構造検証本体（Issue #1194）。`IF EXISTS`・`CASCADE`・
+/// [`ValidatedDropType`] の構造検証本体（Issue #1194）。`CASCADE`・
 /// 複数名の同時指定はトレイリングトークン検査により構造的に `42601` へ落ちる。
 pub(crate) fn validate_drop_type_tokens(
     tokens: &[Token],
@@ -11265,11 +11310,12 @@ pub(crate) fn validate_drop_type_tokens(
     let mut p = Parser::new(tokens);
     p.expect_ident_matching("DROP")?;
     p.expect_ident_matching("TYPE")?;
+    let if_exists = p.consume_if_exists();
     let name = p.expect_ident()?;
     crate::catalog::validate_identifier(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid type name in DROP TYPE"))?;
     p.expect_end_of_statement()?;
-    Ok(ValidatedDropType { name })
+    Ok(ValidatedDropType { name, if_exists })
 }
 
 /// [`ValidatedDropView`] の構造検証本体。
@@ -11277,9 +11323,9 @@ pub(crate) fn validate_drop_view_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedDropView, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
-    let name = p.parse_drop_view()?;
+    let (name, if_exists) = p.parse_drop_view()?;
     p.expect_end_of_statement()?;
-    Ok(ValidatedDropView { name })
+    Ok(ValidatedDropView { name, if_exists })
 }
 
 /// 構文木（[`ValidatedTruncate`] の元）。カタログ存在確認前の中間結果
@@ -14911,9 +14957,12 @@ pub fn validate_drop_table_tokens(
     tokens: &[lexer::Token],
 ) -> Result<ValidatedDropTable, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
-    let table_name = p.parse_drop_table()?;
+    let (table_name, if_exists) = p.parse_drop_table()?;
     p.expect_end_of_statement()?;
-    Ok(ValidatedDropTable { table_name })
+    Ok(ValidatedDropTable {
+        table_name,
+        if_exists,
+    })
 }
 
 /// `COPY ... FROM STDIN`／`COPY (...) TO STDOUT` の転送形式（Issue #939・

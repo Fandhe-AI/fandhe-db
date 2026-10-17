@@ -12,7 +12,7 @@ SQL から発生しなかった。本 Issue で `sql::ddl` へ結線した。
 
 - `CREATE TYPE <name> AS ENUM ('<label>'[, '<label>']*)`
 - `DROP TYPE <name>`
-- 上記以外（`IF [NOT] EXISTS`・`CASCADE`／`RESTRICT`・スキーマ修飾名・複合型・空リスト・
+- 上記以外（`CREATE TYPE` の `IF NOT EXISTS`・`CASCADE`／`RESTRICT`・スキーマ修飾名・複合型・空リスト・
   非文字列リテラルのラベル・`$n`・`ALTER TYPE`）は構造検証で `42601`。
 - 型名は識別子形状（`validate_identifier`）のみ構文検証段で確認し、大文字小文字は区別して保持する。
 - ラベル数は push 前に `MAX_ENUM_LABELS`（256）で打ち切り `54000`。ラベルの重複・空・
