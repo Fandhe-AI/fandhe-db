@@ -16,7 +16,7 @@
 | 含められない種別 | RENAME は `42601`。ADD UNIQUE／CHECK／FOREIGN KEY／PRIMARY KEY・DROP CONSTRAINT・ALTER COLUMN TYPE は `0A000`（固定文言）。いずれも構文段で判定 |
 | アクション数上限 | `MAX_ALTER_TABLE_ACTIONS`（= `MAX_COLUMN_COUNT`）。超過は確保前に `54000` |
 | 原子性 | `Storage::alter_table_in_single_txn` の単一 write txn。途中の失敗は txn を破棄し何も適用しない。世代 bump は commit 直前に 1 回だけ。全アクションが no-op なら commit しない |
-| 適用順 | PostgreSQL の `AlterTablePass` に倣う pass 順（DROP 系 → ADD COLUMN → SET NOT NULL → SET DEFAULT）。同じ pass 内は記述順。応答の `actions` は記述順 |
+| 適用順 | PostgreSQL の `AlterTablePass` に倣う pass 順（DROP COLUMN → ADD COLUMN → 列属性変更）。列属性変更（SET/DROP NOT NULL・SET/DROP DEFAULT）は同一 pass で記述順に適用する。応答の `actions` は記述順 |
 | エラー写像 | 各アクションは単一アクション経路と同じ `map_*` で SQLSTATE を写す |
 
 ## 実装上の要点
