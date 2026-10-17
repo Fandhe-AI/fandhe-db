@@ -308,6 +308,36 @@ SQL の INSERT／UPDATE／UPSERT／COPY、NoSQL の insert／update／filter `eq
   （#1603〜#1606 の担当）、添字への代入、CHECK／UDF 本体での使用（`0A000`）、jsonb の添字、
   `WHERE <配列列> = ARRAY[...]`（従来どおり式との比較は拒否）、`ORDER BY`／`GROUP BY` での添字。
 
+## Issue #1604 追記: 配列関数
+
+TABLE-35 の配列関数 8 種（`array_length`・`cardinality`・`array_append`・`array_prepend`・`array_cat`・
+`array_position`・`array_remove`・`array_to_string`）を追加した。
+
+- **構成**: 新モジュール `sql::array_fn` が束縛（`bind_call` から委譲）と評価（`eval_with_scalars`
+  から委譲）を持つ。`BoundExpr::ArrayFn` を追加した（`pub enum` のため破壊的変更）。`Expr` は
+  `Expr::Call` のままで AST・内容ハッシュは変えない。要素型の共通化は `array_expr::common_element_type`
+  を共有し、要素の変換は `sql::cast` に委ねる。
+- **要素型の解決**: 配列と要素の共通型へ寄せる（`int[]` と bigint 値は `bigint[]`）。型なし文字列リテラルと
+  裸の `NULL` は決まった型の入力として解釈。配列でない引数・共通型の無い組は `42883`、他の引数から型が
+  決まらない裸の `NULL`・型なし文字列リテラルの配列引数は `42804`、アリティ違いは `42883`。
+- **意味論**: `array_length`・`cardinality`・`array_to_string` は strict（空配列の `array_length` と
+  1 以外の次元は NULL、`cardinality` は 0）。append／prepend／cat／position／remove は NULL 配列と
+  NULL 要素を PG と同じに扱う（NULL 配列に追加すると 1 要素配列、`array_cat` は NULL でない側を返す、
+  `array_position`・`array_remove` は NULL 要素を `IS NOT DISTINCT FROM` で検索する。開始位置 NULL は
+  `22004`）。`array_to_string` は NULL 要素を既定で飛ばし（区切りも出さない）、NULL 文字列があればそれで出力。
+- **native 比較**: 検索・除去・連結・文字列化は `ArrayValue` の variant ごとの値で行い、f64 を経由しない
+  （2^53 超の bigint 要素を含む配列でも `22003` にならない）。`real`／`double` は NaN どうしを等しく、
+  `numeric` は末尾ゼロを無視、`jsonb` は正規化テキストで比較する。
+- **上限**: 結果の要素数（`MAX_ARRAY_ELEMENTS`）・可変長本文の累計・`array_to_string` の出力長を、確保前に検査して
+  `54000`。
+- **PG との差分（記録）**:
+  - `array_length` の次元・`array_position` の開始位置に float／numeric を使う形は `0A000`（PG は `42883`）。
+  - numeric 要素・ENUM 要素の配列に対する要素を取る関数、`json` 要素の検索は拒否（`0A000`／`42883`）。
+  - 検索値・追加する要素は式評価の整数表現（2^53 以内）に限られる（配列に格納済みの要素は 2^53 超でも扱える）。
+  - CHECK 本体・UDF 本体での使用は `0A000`。
+- **対象外**: `||`・`ANY`/`ALL`・`@>` などの演算子と配列比較（#1603）、多次元（#1605・#1606）、
+  `array_dims`・`array_lower`・`array_upper`・`array_fill`・`unnest` など。
+
 ## Issue #1603 追記: ANY／ALL と配列の比較・包含演算子
 
 対象ビヘイビアは TABLE-35（ポインタのみ。spec 本文は転記しない）。親 #1601。

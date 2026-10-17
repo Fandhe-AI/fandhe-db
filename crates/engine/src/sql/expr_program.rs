@@ -577,6 +577,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::ArrayContainment { .. }
         | BoundExpr::ArrayQuantified { .. }
         | BoundExpr::JsonTextFn(_)
+        | BoundExpr::ArrayFn(_)
         | BoundExpr::JsonPathFn(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::JsonAccess { .. }
@@ -713,6 +714,7 @@ fn compile_node(
         | BoundExpr::ArrayContainment { .. }
         | BoundExpr::ArrayQuantified { .. }
         | BoundExpr::JsonTextFn(_)
+        | BoundExpr::ArrayFn(_)
         | BoundExpr::JsonPathFn(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::JsonAccess { .. }

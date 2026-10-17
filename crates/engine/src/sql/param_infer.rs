@@ -165,6 +165,8 @@ fn builtin_arg_is_text(name: &str, index: usize) -> bool {
         "replace" | "position" | "concat" => true,
         // jsonb_extract_path(_text) のパス要素（2 番目以降）は text（Issue #1599）。
         "jsonb_extract_path" | "jsonb_extract_path_text" => index >= 1,
+        // array_to_string の区切り・NULL 文字列は text（Issue #1604）。
+        "array_to_string" => index >= 1,
         _ => false,
     }
 }
@@ -176,6 +178,12 @@ fn builtin_return_type(name: &str) -> Ty {
             Ty::Known(PreparedParamType::Text)
         }
         "length" | "position" => Ty::Known(scalar("?column?", ColumnType::Integer)),
+        // 配列関数（Issue #1604）。配列を返すものは `$n` の型付け対象外（Double と誤推論しない）。
+        "array_length" | "cardinality" | "array_position" => {
+            Ty::Known(scalar("?column?", ColumnType::Integer))
+        }
+        "array_to_string" => Ty::Known(PreparedParamType::Text),
+        "array_append" | "array_prepend" | "array_cat" | "array_remove" => Ty::Untyped,
         // jsonb 関数（Issue #1599）。jsonb を返すものは `$n` の型付け対象外（型なし）。
         "jsonb_typeof" | "jsonb_extract_path_text" => Ty::Known(PreparedParamType::Text),
         "jsonb_array_length" => Ty::Known(scalar("?column?", ColumnType::Integer)),

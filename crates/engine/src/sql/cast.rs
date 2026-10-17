@@ -575,6 +575,8 @@ pub(super) fn source_cast_kind(
                     Some(t) => SourceKind::Known(t.kind()),
                     None => SourceKind::UnknownNumeric,
                 },
+                // 配列関数の長さ・位置は int4（TABLE-35・Issue #1604）。
+                BoundExpr::ArrayFn(f) if f.result_is_int4() => SourceKind::Known(CastKind::Int4),
                 BoundExpr::Builtin {
                     f: BuiltinFn::TypedArith(_, kind),
                     ..
@@ -622,6 +624,11 @@ pub(super) fn source_cast_kind(
             BoundExpr::ArrayConstructor { elem, .. } | BoundExpr::ArraySlice { elem, .. } => {
                 SourceKind::Array(elem_cast_type(*elem))
             }
+            // 配列を返す配列関数の結果も束縛結果が持つ共通の要素型（Issue #1604）。
+            BoundExpr::ArrayFn(f) => match f.elem {
+                Some(elem) => SourceKind::Array(elem_cast_type(elem)),
+                None => SourceKind::Array(None),
+            },
             _ => SourceKind::Array(None),
         },
         ExprType::Vector => SourceKind::Outside,

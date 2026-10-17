@@ -983,6 +983,10 @@ pub enum BoundExpr {
     /// `json_*` 関数・`to_json`・`json_build_*` の束縛結果（Issue #2180。束縛・評価は
     /// `sql::json_fn`）。
     JsonTextFn(Box<crate::sql::json_fn::BoundJsonFn>),
+    /// 配列関数（`array_length`／`cardinality`／`array_append`／`array_prepend`／`array_cat`／
+    /// `array_position`／`array_remove`／`array_to_string`）の束縛結果（TABLE-35・Issue #1604。
+    /// 束縛・評価は `sql::array_fn`）。
+    ArrayFn(Box<crate::sql::array_fn::BoundArrayFn>),
     /// `jsonb_path_*` の束縛結果（Issue #2185・TABLE-25。束縛・評価は `sql::jsonpath_fn`）。
     /// 解析済みの jsonpath を保持するため `JsonFn { f, args }` とは別 variant にしている。
     JsonPathFn(Box<crate::sql::jsonpath_fn::BoundJsonPathFn>),
@@ -1262,6 +1266,7 @@ impl PartialEq for BoundExpr {
                 },
             ) => oa == ob && aa == ab && ea == eb && la == lb && ya == yb,
             (BoundExpr::JsonTextFn(a), BoundExpr::JsonTextFn(b)) => a == b,
+            (BoundExpr::ArrayFn(a), BoundExpr::ArrayFn(b)) => a == b,
             (BoundExpr::JsonPathFn(a), BoundExpr::JsonPathFn(b)) => a == b,
             (
                 BoundExpr::JsonAccess {
@@ -1655,6 +1660,7 @@ pub(crate) fn is_builtin_function_name(name: &str) -> bool {
         || is_variadic_or_overloaded_builtin_name(name)
         || is_current_time_function_name(name)
         || crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase())
+        || crate::sql::array_fn::is_array_fn_name(&name.to_ascii_lowercase())
         || json_fn_from_name(name).is_some()
         || is_deferred_json_srf_name(name)
         || crate::sql::jsonpath_fn::is_jsonpath_fn_name(&name.to_ascii_lowercase())
@@ -2351,6 +2357,12 @@ fn validate_closed_expr(
                         args.len()
                     )));
                 }
+            } else if crate::sql::array_fn::is_array_fn_name(&name.to_ascii_lowercase()) {
+                // 配列関数（TABLE-35・Issue #1604）。関数本体は列参照も配列コンストラクタも
+                // 持てず配列型の引数も存在しないため、定義時に fail-closed で拒否する。
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "array functions are not supported in a function body".to_string(),
+                });
             } else if crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase()) {
                 // json 型の式を要する関数（Issue #2180）。関数本体は列参照を持てず json 型の
                 // 引数も存在しないため、定義時に fail-closed で拒否する。
@@ -2612,6 +2624,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
                 }
         }
         BoundExpr::JsonTextFn(f) => 1 + f.args.iter().map(count_bound_nodes).sum::<usize>(),
+        BoundExpr::ArrayFn(f) => 1 + f.args.iter().map(count_bound_nodes).sum::<usize>(),
         BoundExpr::JsonPathFn(f) => {
             // path は解析済み AST（1 ノード扱い）。target・vars・PASSING の部分木を数える。
             2 + count_bound_nodes(&f.target)
@@ -2709,6 +2722,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
             max_bound_case_nesting(lhs).max(rhs.expr().map_or(0, max_bound_case_nesting))
         }
         BoundExpr::JsonTextFn(f) => f.args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
+        BoundExpr::ArrayFn(f) => f.args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
         BoundExpr::JsonPathFn(f) => max_bound_case_nesting(&f.target)
             .max(f.vars.as_ref().map_or(0, max_bound_case_nesting))
             .max(
@@ -2804,6 +2818,7 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
             references_embedding(lhs) || rhs.expr().is_some_and(references_embedding)
         }
         BoundExpr::JsonTextFn(f) => f.args.iter().any(references_embedding),
+        BoundExpr::ArrayFn(f) => f.args.iter().any(references_embedding),
         BoundExpr::JsonPathFn(f) => {
             references_embedding(&f.target)
                 || f.vars.as_ref().is_some_and(references_embedding)
@@ -2892,6 +2907,11 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => {}
         BoundExpr::JsonTextFn(f) => {
+            for a in &f.args {
+                visit_referenced_scalar_columns(a, visit);
+            }
+        }
+        BoundExpr::ArrayFn(f) => {
             for a in &f.args {
                 visit_referenced_scalar_columns(a, visit);
             }
@@ -3036,6 +3056,16 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         // 使用とは異なり、ここでは「1 つでも該当するか」だけでなく「該当する
         // 添字をすべて `mask` へ反映する」副作用が主目的）。
         BoundExpr::JsonTextFn(f) => {
+            let mut any = false;
+            for a in &f.args {
+                if mark_referenced_scalar_columns(a, mask) {
+                    any = true;
+                }
+            }
+            any
+        }
+        BoundExpr::ArrayFn(f) => {
+            // 短絡させず全引数をマークする（配列列がマスク外になると評価時に `Internal` になる）。
             let mut any = false;
             for a in &f.args {
                 if mark_referenced_scalar_columns(a, mask) {
@@ -3333,6 +3363,19 @@ pub(crate) fn expr_result_column_type(
     if let BoundExpr::JsonTextFn(f) = bound {
         if f.result_is_int4() {
             return Some(ColumnType::Integer);
+        }
+    }
+    // 配列関数（TABLE-35・Issue #1604）。長さ・位置は int4、配列を返す関数は要素型つきの配列。
+    if let BoundExpr::ArrayFn(f) = bound {
+        if f.result_is_int4() {
+            return Some(ColumnType::Integer);
+        }
+        if let Some(elem) = f.elem {
+            if ty == ExprType::Array {
+                return crate::catalog::ArrayType::new(elem, crate::catalog::MAX_ARRAY_ELEMENTS)
+                    .ok()
+                    .map(ColumnType::Array);
+            }
         }
     }
     // 配列コンストラクタ・スライスの結果は要素型つきの配列、添字の結果は要素型そのもの
@@ -5059,6 +5102,8 @@ pub(super) fn numeric_kind(
         } => Some(*k),
         // `json_array_length` は int4（Issue #2180）。整数除算・添字の型解決に反映する。
         BoundExpr::JsonTextFn(f) if f.result_is_int4() => Some(NumericKind::Int4),
+        // 配列関数の長さ・位置は int4（TABLE-35・Issue #1604）。
+        BoundExpr::ArrayFn(f) if f.result_is_int4() => Some(NumericKind::Int4),
         // 整数・real 要素の添字は要素型どおりの整数演算にする（TABLE-35・Issue #1602）。
         BoundExpr::ArrayIndex { elem, .. } => match elem {
             crate::catalog::ArrayElemType::Integer => Some(NumericKind::Int4),
@@ -5781,6 +5826,9 @@ fn bind_call(
     let lower_name = name.to_ascii_lowercase();
     if crate::sql::json_fn::is_json_fn_name(&lower_name) {
         return crate::sql::json_fn::bind_json_fn(&lower_name, args, env, node_budget);
+    }
+    if crate::sql::array_fn::is_array_fn_name(&lower_name) {
+        return crate::sql::array_fn::bind_array_fn(&lower_name, args, env, node_budget);
     }
     if crate::sql::jsonpath_fn::is_jsonpath_fn_name(&lower_name) {
         return crate::sql::jsonpath_fn::bind_jsonpath_fn(&lower_name, args, env, node_budget);
@@ -7428,6 +7476,7 @@ pub(crate) fn eval_with_scalars<'a>(
         BoundExpr::JsonTextFn(f) => {
             crate::sql::json_fn::eval_json_fn(f, id, embedding, row_scalars)
         }
+        BoundExpr::ArrayFn(f) => crate::sql::array_fn::eval_array_fn(f, id, embedding, row_scalars),
         BoundExpr::JsonPathFn(f) => {
             crate::sql::jsonpath_fn::eval_jsonpath_fn(f, id, embedding, row_scalars)
         }
