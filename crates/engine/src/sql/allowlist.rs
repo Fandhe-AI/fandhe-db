@@ -3722,7 +3722,17 @@ pub struct ValidatedAlterTableAlterColumnType {
     pub collation: Option<crate::collation::Collation>,
 }
 
-/// `ALTER TABLE` の許可形状 9 種の和（Issue #1067・#1068・#1069・#1167・#1196・#1619）。`ParsedSql::AlterTable` が
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> SET NOT
+/// NULL` 文（TABLE-39 (3)、Issue #1631）。列・表の存在確認と既存行の NULL 検証は実行段
+/// （`sql::ddl::execute_alter_table_alter_column_set_not_null`）が DDL 権限ゲートの後で
+/// 担う（権限の無い主体への存在オラクル化を防ぐ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAlterColumnSetNotNull {
+    pub table_name: String,
+    pub column_name: String,
+}
+
+/// `ALTER TABLE` の許可形状 10 種の和（Issue #1067・#1068・#1069・#1167・#1196・#1619・#1631）。`ParsedSql::AlterTable` が
 /// 保持する型で、`sql::ddl::execute_alter_table` が対応する実行本体へ振り分ける
 /// （構文の許可リスト判定は `sql::allowlist` の管轄、ディスパッチは `sql::ddl`・
 /// `core.rs` の管轄という既存の責務分担を維持する）。
@@ -3744,6 +3754,9 @@ pub struct ValidatedAlterTableAlterColumnType {
 /// **BREAKING CHANGE**（Issue #1196）: `AddPrimaryKey` variant を追加した。
 /// 本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 ///
+/// **BREAKING CHANGE**（Issue #1631）: `AlterColumnSetNotNull` variant を追加した。
+/// 本 enum を網羅的に `match` するクレート外のコードは追随が必要。
+///
 /// **BREAKING CHANGE**（Issue #1619）: `RenameColumn` variant を追加した。
 /// 本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 #[derive(Debug, Clone, PartialEq)]
@@ -3756,6 +3769,7 @@ pub enum ValidatedAlterTable {
     DropColumn(ValidatedAlterTableDropColumn),
     AlterColumnType(ValidatedAlterTableAlterColumnType),
     AddPrimaryKey(ValidatedAlterTableAddPrimaryKey),
+    AlterColumnSetNotNull(ValidatedAlterTableAlterColumnSetNotNull),
     RenameColumn(ValidatedAlterTableRenameColumn),
 }
 
@@ -8947,6 +8961,17 @@ impl<'a> Parser<'a> {
             self.expect_contextual_keyword("COLUMN")?;
             let column_name = self.expect_ident()?;
             reject_reserved_alter_column_name(&column_name)?;
+            // `ALTER COLUMN <col> SET NOT NULL`（TABLE-39 (3)、Issue #1631）。`SET DEFAULT`・
+            // `SET DATA TYPE` 等は `42601`。
+            if self.peek_contextual_keyword("SET") {
+                self.advance();
+                self.expect_contextual_keyword("NOT")?;
+                self.expect_contextual_keyword("NULL")?;
+                return Ok(ParsedAlterTableShape::AlterColumnSetNotNull {
+                    table_name,
+                    column_name,
+                });
+            }
             self.expect_contextual_keyword("TYPE")?;
             let column_type =
                 crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut self.pos)?;
@@ -11440,6 +11465,10 @@ enum ParsedAlterTableShape {
         table_name: String,
         constraint_name: Option<String>,
         columns: Vec<String>,
+    },
+    AlterColumnSetNotNull {
+        table_name: String,
+        column_name: String,
     },
     RenameColumn {
         table_name: String,
@@ -14999,6 +15028,13 @@ pub fn validate_alter_table_tokens(
             table_name,
             constraint_name,
             columns,
+        }),
+        ParsedAlterTableShape::AlterColumnSetNotNull {
+            table_name,
+            column_name,
+        } => ValidatedAlterTable::AlterColumnSetNotNull(ValidatedAlterTableAlterColumnSetNotNull {
+            table_name,
+            column_name,
         }),
         ParsedAlterTableShape::RenameColumn {
             table_name,

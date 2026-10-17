@@ -204,7 +204,7 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
 
 - （Issue #1169 で実装済み）`ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT ...` の受理と、
   既存行への読み出し時の `DEFAULT` 補完（TABLE-5・TABLE-16）。
-- `ALTER COLUMN SET/DROP DEFAULT`・`SET/DROP NOT NULL`。
+- `ALTER COLUMN SET/DROP DEFAULT`・`DROP NOT NULL`。（`SET NOT NULL` は Issue #1631 で実装済み）
 - （Issue #1523 で実装済み）SQL `VALUES` 内の `NULL` リテラル。
 - （Issue #1524 で実装済み）`UPDATE ... SET`・`DO UPDATE SET`・`DEFAULT` の `NULL`。
   VECTOR 列への NULL（`SET` は `22000`・`DO UPDATE SET` は `23502` で不揃い）の整理と
@@ -222,3 +222,29 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
   `DEFAULT` は適用しない）。
 - `23505` の `UNIQUE_VIOLATION`／`DUPLICATE_OPERATION_ID` ラベル分離は Issue #1180 で
   実装済み（ERR-6。`SHARED_WIRE_CODES` の仕組みを再利用）。
+
+## Issue #1631 追記: `ALTER COLUMN SET NOT NULL`
+
+ポインタ: TABLE-39 (3)・TABLE-22 (e)・TABLE-26・ERR-6、TASK-277。
+
+- **構文**: `ALTER TABLE <表> ALTER COLUMN <列> SET NOT NULL [;]` のみ受理する。`COLUMN` 省略形、
+  `SET DEFAULT`／`DROP DEFAULT`／`DROP NOT NULL`／`SET DATA TYPE`、カンマ区切りの複数アクションは
+  従来どおり `42601`。予約列名は `42601`。
+- **検証**: 単一の write トランザクション（書き込みロック保持中）で、全テナント・全可視性の既存行を
+  走査し、対象列に NULL が 1 行でもあれば `23502`。行数上限は設けない。**変更前スキーマ**で走査する
+  （`ADD COLUMN`〔DEFAULT なし〕より前の行は列バイトが無く、変更後スキーマだと decode エラーになる
+  ため）。拒否時はカタログ・世代・行とも不変。応答には列名のみを含める。
+- **no-op**: 既に NOT NULL の列（PK 構成列・VECTOR 列を含む）は commit・世代 bump なしで成功する。
+  NULL 許容の VECTOR 列に到達した場合は検査手段が無いため `42601` で fail-closed とし、TABLE-26 の
+  後続 Issue で埋め込みの有無を見る検査へ置き換える。
+- **FK との整合**: 変更後スキーマで FK 参照アクションの宣言時検査を再実行し、`ON DELETE／UPDATE
+  SET NULL`（または DEFAULT なしの `SET DEFAULT`）を持つ FK 構成列は `42830` で拒否する。
+  `ON UPDATE CASCADE` の子列を NOT NULL にして親列が nullable になる組も `42830`。
+- **エラー写像**: 表なし `42P01`／ビュー等 `42809`／列なし `42703`／書き込みロック待機超過 `55P03`／
+  NULL 行あり `23502`／FK 不整合 `42830`／内部矛盾 `XX000`。
+- **PostgreSQL との既知差分**: (1) `23502` の文言は既存の NOT NULL 違反と同じ
+  （`null value in column "c" violates not-null constraint`）。(2) FK 参照アクションとの不整合を
+  DDL 時点で `42830` として拒否する（PostgreSQL は実行時に `23502`）。(3) 引用符付きの `"NULL"` も
+  キーワードとして受理される（ALTER TABLE の構文段が引用符付き識別子を区別しないため）。
+- **範囲外**: `DROP NOT NULL`（#1632）、`SET／DROP DEFAULT`、`COLUMN` 省略形、複数アクション、
+  NoSQL 表層。
