@@ -510,6 +510,17 @@ pub(super) fn bind_quantified(
     ))
 }
 
+/// 数値リテラル文字列が f64 へ無損失で変換できるか。整数形（数字のみ）は絶対値 2^53 以下、
+/// 小数・指数形は従来どおり許可する。`bind_quantified_lhs` の float 特例の適用可否判定に使う。
+fn number_exact_in_f64(text: &str) -> bool {
+    const MAX_EXACT: u128 = 1 << 53;
+    let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    digits.parse::<u128>().is_ok_and(|v| v <= MAX_EXACT)
+}
+
 /// 量化比較の左辺を束縛し、種別を返す。`elem` があれば（配列側が確定済み）型なしリテラルをその要素型へ
 /// 解釈し、非リテラルは要素型との適合を検査する。`elem` が無い（配列側がリテラル）ときは、リテラルの左辺を
 /// text として扱う。
@@ -530,7 +541,9 @@ fn bind_quantified_lhs(
     }
     // 小数形の数値リテラルを浮動小数の要素と比べるときは float8 同士の比較（PG の numeric = float8 は
     // float8 へ寄せる）。f64 を経由しない numeric のまま比べる形は未対応（`0A000`）。
-    if matches!(lhs, Expr::Number(_))
+    // 整数形のリテラルは f64 で正確に表せる範囲（絶対値 2^53 以下）に限る。範囲外は丸めで別要素へ
+    // 誤一致しうるため特例に入れず、従来経路（`0A000` 拒否）へ落とす。
+    if matches!(lhs, Expr::Number(n) if number_exact_in_f64(n))
         && matches!(elem, Some(ArrayElemType::Real | ArrayElemType::Double))
     {
         let (bound, _) = bind_cast(lhs, &CastType::Float8, env, node_budget)?;

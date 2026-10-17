@@ -368,6 +368,15 @@ fn unsupported_forms_fail_closed() {
         ),
         "0A000"
     );
+    // 2^53 を超える整数リテラルは float 配列との比較で丸め誤一致を避けるため、
+    // 範囲外 int8 と同じ fail-closed の拒否（22003）に倒す。
+    assert_eq!(
+        code(
+            &core,
+            "SELECT id FROM t WHERE 9007199254740993 = ANY(ARRAY[9007199254740992::float8]) LIMIT 5"
+        ),
+        "22003"
+    );
     assert_eq!(code(&core, "SELECT ANY(nums) FROM t LIMIT 5"), "42601");
     assert_eq!(
         code(&core, "SELECT id FROM t WHERE ALL(nums) = 1 LIMIT 5"),
