@@ -1116,7 +1116,7 @@ fn convert_between<'a>(f: CastFn, v: ExprValue<'a>) -> Result<ExprValue<'a>, Sql
 
 /// 配列の要素を評価値へ写す（NULL 要素は `ExprValue::Null`）。bigint は式評価の整数表現の
 /// 上限（2^53）を超える要素を `22003` で拒否する（スカラーの int8 と同じ既知の差分）。
-fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>, SqlSurfaceError> {
+pub(crate) fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>, SqlSurfaceError> {
     fn map<T>(
         items: &[Option<T>],
         f: impl Fn(&T) -> Result<ExprValue<'static>, SqlSurfaceError>,
@@ -1156,7 +1156,7 @@ fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>, SqlSurface
 }
 
 /// 要素ごとの評価値を、変換先の要素型の配列へ詰め直す。
-fn values_to_array(
+pub(crate) fn values_to_array(
     values: Vec<ExprValue<'static>>,
     to: ArrayElemType,
 ) -> Result<ArrayValue, SqlSurfaceError> {

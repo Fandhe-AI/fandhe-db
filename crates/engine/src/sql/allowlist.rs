@@ -19,7 +19,7 @@ use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::relation::{ColumnRef, TableRef};
 use crate::sql::udf_call::{
-    BinOp, Expr, JsonAccessOp, SqlJsonBehavior, SqlJsonQueryExpr, SqlJsonQueryKind,
+    ArraySubscript, BinOp, Expr, JsonAccessOp, SqlJsonBehavior, SqlJsonQueryExpr, SqlJsonQueryKind,
     ValueFunctionKind, MAX_CALL_ARGS, MAX_CASE_BRANCHES, MAX_CASE_NESTING, MAX_EXPR_DEPTH,
     MAX_EXPR_NODES, MAX_UDF_PARAMS,
 };
@@ -4217,15 +4217,21 @@ impl<'a> Parser<'a> {
                     name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
                 let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
                 // TABLE-28・Issue #1609: 識別子の直後の `COLLATE` も式項目の継続。
+                // TABLE-35・Issue #1602: 識別子の直後の `[`（添字・スライス）と、引用なしの
+                // `ARRAY[...]`／`ARRAY(...)`（配列コンストラクタ）も式項目の開始。
+                let starts_array = name.eq_ignore_ascii_case("ARRAY")
+                    && !self.quoted_null.contains(&self.pos)
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('[' | '(')));
                 let next_is_op = self.tokens.get(self.pos + 1).is_some_and(|t| {
-                    matches!(t, Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
+                    matches!(t, Token::Punct('+' | '-' | '*' | '/' | '['))
+                        || matches!(t, Token::TypeCast)
                         || is_json_operator_token(t)
                 }) || self.peek_ident_matches_at(1, "COLLATE")
                     || (self.peek_ident_matches_at(1, "AT")
                         && (self.peek_ident_matches_at(2, "LOCAL")
                             || (self.peek_ident_matches_at(2, "TIME")
                                 && self.peek_ident_matches_at(3, "ZONE"))));
-                if starts_case || self.is_value_function_keyword_at(self.pos) {
+                if starts_case || starts_array || self.is_value_function_keyword_at(self.pos) {
                     // 括弧なし SQL 値関数（SQL-37・Issue #1586）は列名ではなく式項目。
                     self.parse_projection_infix(0)?
                 } else if starts_call {
@@ -6183,10 +6189,142 @@ impl<'a> Parser<'a> {
     /// キーワードとして扱う（対象ビヘイビア: SQL-26。Issue #921。既存の `AS`／
     /// `WHEN`（`sql::allowlist` 内の他の文脈的キーワード）と同じ判断）。
     fn parse_primary_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        let start = self.pos;
         let primary = self.parse_primary_expr_inner(depth)?;
+        // 添字は `::` より強く結合する（`arr[1]::text` は要素の CAST。PG と同じ）。
+        let subscriptable = self.is_subscriptable_primary(start, &primary);
+        let primary = self.parse_subscript_postfix(primary, subscriptable, depth)?;
         let primary = self.parse_typecast_postfix(primary, depth)?;
         let primary = self.parse_collate_postfix(primary)?;
         self.parse_at_time_zone_postfix(primary, depth)
+    }
+
+    /// 直前に読んだ一次式（`start` から現在位置まで）が添字を付けられる形か。PG の文法
+    /// （`c_expr opt_indirection`）に合わせ、列参照（引用なし・引用付きの単一識別子）と括弧式だけ
+    /// を許す。`ARRAY[..][1]`・関数呼び出し・リテラルの直後の `[` はここで `false` になり、
+    /// 呼び出し元の後続の構文解析が `42601` で拒否する（TABLE-35・Issue #1602）。
+    fn is_subscriptable_primary(&self, start: usize, primary: &Expr) -> bool {
+        match self.tokens.get(start) {
+            Some(Token::Punct('(')) => true,
+            Some(Token::Ident(_)) => {
+                matches!(primary, Expr::Ident(_)) && self.pos == start.saturating_add(1)
+            }
+            _ => false,
+        }
+    }
+
+    /// 後置の添字 `[i]`・スライス `[lo:hi]`・`[:hi]`・`[lo:]`・`[:]`（TABLE-35・Issue #1602）。
+    /// 添字を 2 つ以上続けた形（`arr[1][2]`）は多次元の意味になるため `0A000`（#1605 の担当）。
+    /// 要素の式は `NULL` を許す（`arr[NULL]` は NULL）。1 段ごとにノード予算と再帰深さを課金し、
+    /// CHECK 本体では `0A000`（永続化する述語の往復保証の範囲外）。
+    fn parse_subscript_postfix(
+        &mut self,
+        base: Expr,
+        subscriptable: bool,
+        depth: usize,
+    ) -> Result<Expr, SqlSurfaceError> {
+        if !subscriptable || !matches!(self.peek(), Some(Token::Punct('['))) {
+            return Ok(base);
+        }
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "array subscripts are not supported in a CHECK constraint".to_string(),
+            });
+        }
+        self.check_expr_depth(depth.saturating_add(1))?;
+        self.advance();
+        let subscript = if matches!(self.peek(), Some(Token::Punct(':'))) {
+            self.advance();
+            let hi = self.parse_optional_subscript_bound(depth)?;
+            ArraySubscript::Slice { lo: None, hi }
+        } else {
+            let first = self.parse_value_expr_with_null_context(depth.saturating_add(1), true)?;
+            if matches!(self.peek(), Some(Token::Punct(':'))) {
+                self.advance();
+                let hi = self.parse_optional_subscript_bound(depth)?;
+                ArraySubscript::Slice {
+                    lo: Some(Box::new(first)),
+                    hi,
+                }
+            } else {
+                ArraySubscript::Index(Box::new(first))
+            }
+        };
+        self.expect_punct(']')?;
+        self.consume_expr_node()?;
+        if matches!(self.peek(), Some(Token::Punct('['))) {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "multidimensional array subscripts are not supported".to_string(),
+            });
+        }
+        Ok(Expr::Subscript {
+            base: Box::new(base),
+            subscript,
+        })
+    }
+
+    /// スライスの `:` の直後の境界（`]` が続けば省略）。
+    fn parse_optional_subscript_bound(
+        &mut self,
+        depth: usize,
+    ) -> Result<Option<Box<Expr>>, SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Punct(']'))) {
+            return Ok(None);
+        }
+        let bound = self.parse_value_expr_with_null_context(depth.saturating_add(1), true)?;
+        Ok(Some(Box::new(bound)))
+    }
+
+    /// 配列コンストラクタ `ARRAY[<expr>, ...]`（TABLE-35・Issue #1602）。呼び出し元は現在位置が
+    /// 引用なしの `ARRAY` であることを確かめ済み。要素数は `MAX_ARRAY_ELEMENTS` を超えた時点で
+    /// `54000` にし、`Vec` へ積む前に検査する（無制限確保の防止）。入れ子（多次元）・
+    /// `ARRAY(<subquery>)`・CHECK 本体は `0A000`。空の `ARRAY[]` は構文上は受理し、型の決定は
+    /// 束縛段に任せる（`ARRAY[]::int[]` だけが有効）。
+    fn parse_array_constructor(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.check_expr_depth(depth)?;
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "ARRAY constructors are not supported in a CHECK constraint".to_string(),
+            });
+        }
+        self.advance();
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "ARRAY(subquery) is not supported".to_string(),
+            });
+        }
+        self.expect_punct('[')?;
+        let mut items: Vec<Expr> = Vec::new();
+        if !matches!(self.peek(), Some(Token::Punct(']'))) {
+            loop {
+                if matches!(self.peek(), Some(Token::Punct('['))) {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "multidimensional arrays are not supported".to_string(),
+                    });
+                }
+                if items.len() >= crate::catalog::MAX_ARRAY_ELEMENTS as usize {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "ARRAY constructor has too many elements",
+                    ));
+                }
+                let item =
+                    self.parse_value_expr_with_null_context(depth.saturating_add(1), true)?;
+                if matches!(item, Expr::ArrayConstructor(_)) {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "multidimensional arrays are not supported".to_string(),
+                    });
+                }
+                items.push(item);
+                if matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_punct(']')?;
+        self.consume_expr_node()?;
+        Ok(Expr::ArrayConstructor(items))
     }
 
     /// `TIMESTAMP` の直後が `WITH TIME ZONE <文字列>`／`WITHOUT TIME ZONE <文字列>` なら、
@@ -6270,6 +6408,15 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.consume_expr_node()?;
                 Ok(Expr::Null)
+            }
+            // 配列コンストラクタ `ARRAY[...]`・`ARRAY(<subquery>)`（TABLE-35・Issue #1602）。
+            // 引用されていない `ARRAY` の直後が `[`／`(` のときだけ（引用識別子 `"array"` は列参照）。
+            Some(Token::Ident(name))
+                if name.eq_ignore_ascii_case("ARRAY")
+                    && !self.quoted_null.contains(&self.pos)
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('[' | '('))) =>
+            {
+                self.parse_array_constructor(depth)
             }
             // codex-review P1 指摘対応（Issue #921 PR #1101）: `parse_select_item`
             // と同じ方針で、次のトークンが `WHEN` のときのみ `CASE` 式として扱う。
@@ -12749,6 +12896,8 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         Expr::Collate { .. } | Expr::SqlJsonQuery(_) => true,
         // `CAST`（SQL-47・Issue #1590）も従来形では書けない式。
         Expr::Cast { .. } => true,
+        // 配列コンストラクタ・添字（TABLE-35・Issue #1602）も従来形では書けない式。
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => true,
         Expr::Number(_)
         | Expr::String(_)
         | Expr::Ident(_)

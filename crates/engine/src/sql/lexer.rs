@@ -55,7 +55,8 @@ pub enum Token {
     /// `(` `)` `,` `*` `=` `;` `+` `-` `/` `>` `<` `[` `]` `%` `#`（`%`・単独 `#` は
     /// SQL-42・Issue #1521 で字句化のみ追加。構文段（`sql::allowlist`）は受理せず
     /// `42601` で拒否する＝fail-closed。TASK-79・SQL-9 で `+ - / > <` を追加。
-    /// `[`／`]` は配列型の列宣言 `<型>[N]`（SQL-23・TABLE-14。Issue #1348）専用で、
+    /// `:` は配列スライス `arr[lo:hi]`（TABLE-35・Issue #1602）専用。
+    /// `[`／`]` は配列型の列宣言 `<型>[N]`（SQL-23・TABLE-14。Issue #1348）と、配列コンストラクタ・添字（Issue #1602）で、
     /// 構文上の受理位置は `sql::ddl_column_type` の型名解析に限る（それ以外の位置に
     /// 現れた場合は各パーサーが `42601` で拒否する）。
     /// `*` は SELECT リストの `*` と式内の乗算の両方を表す。文脈による使い分けは
@@ -468,7 +469,11 @@ pub fn demote_quoted_null(tokens: Vec<Token>) -> Vec<Token> {
             // 引用付きの SQL 値関数予約語（`"current_date"` 等。SQL-37・Issue #1586）は
             // 引用情報を保持する（`Parser::new` が式項で列参照として扱うために必要。
             // 引用付き `NULL` だけを `Ident` へ戻す）。
-            Token::QuotedNull(s) if !is_value_function_keyword(&s) => Token::Ident(s),
+            Token::QuotedNull(s)
+                if !is_value_function_keyword(&s) && !s.eq_ignore_ascii_case("ARRAY") =>
+            {
+                Token::Ident(s)
+            }
             other => other,
         })
         .collect()
@@ -619,7 +624,10 @@ fn tokenize_impl(
             chars = lookahead;
             continue;
         }
-        // `::`・`||`。単独の `:`・`|` は未対応文字として拒否する。
+        // `::`・`||`。単独の `|` は未対応文字として拒否する。単独の `:` は配列スライス
+        // `arr[lo:hi]`（TABLE-35・Issue #1602）専用の `Punct(':')` にする。`:` を受理する
+        // 位置は構文段（allowlist の添字解析）だけで、他の位置に現れた `:` は各パーサーの
+        // 不一致分岐で `42601` になる（fail-closed）。
         if c == ':' || c == '|' {
             let mut lookahead = chars.clone();
             lookahead.next();
@@ -631,6 +639,11 @@ fn tokenize_impl(
                     Token::Concat
                 });
                 chars = lookahead;
+                continue;
+            }
+            if c == ':' {
+                tokens.push(Token::Punct(':'));
+                chars.next();
                 continue;
             }
         }
@@ -671,10 +684,12 @@ fn tokenize_impl(
             }
             if content.eq_ignore_ascii_case("true") || content.eq_ignore_ascii_case("false") {
                 tokens.push(Token::QuotedBoolWord(content.to_string()));
-            } else if (mark_quoted_null && content.eq_ignore_ascii_case("NULL"))
+            } else if (mark_quoted_null
+                && (content.eq_ignore_ascii_case("NULL") || content.eq_ignore_ascii_case("ARRAY")))
                 || is_value_function_keyword(content)
             {
-                // 引用付きの `NULL`・SQL 値関数予約語（`"current_date"` 等。SQL-37・Issue #1586）は
+                // 引用付きの `NULL`・`ARRAY`（配列コンストラクタと区別する。TABLE-35・Issue #1602）・
+                // SQL 値関数予約語（`"current_date"` 等。SQL-37・Issue #1586）は
                 // 裸のキーワードと区別するため専用トークンにする（`Parser::new` が `Ident` へ
                 // 戻しつつ位置を記録し、式項では列参照として扱う）。
                 tokens.push(Token::QuotedNull(content.to_string()));
@@ -1573,9 +1588,13 @@ mod tests {
             assert_eq!(toks(&format!("'{lit}'")), vec![StringLiteral(lit.into())]);
         }
         assert_eq!(toks("a # b"), vec![a(), Punct('#'), b()]);
-        for bad in ["a : b", "a | b", "a:::b", "a|||b"] {
+        for bad in ["a | b", "a|||b"] {
             assert!(tokenize(bad).is_err(), "{bad} should be rejected");
         }
+        // 単独 `:` は配列スライス専用の `Punct(':')`（TABLE-35・Issue #1602）。字句段では受理し、
+        // 添字の外に現れた `:` は各パーサーが `42601` で拒否する（結合テストで固定）。
+        assert_eq!(toks("a : b"), vec![a(), Punct(':'), b()]);
+        assert_eq!(toks("a:::b"), vec![a(), TypeCast, Punct(':'), b()]);
     }
 
     /// SQL-42・Issue #1520: 新トークンの描画 → 再字句化で同一列に戻る（最小ケース）。
@@ -2010,6 +2029,59 @@ mod tests {
         let tokens = tokenize("1e+").expect("tokenize should succeed");
         assert_eq!(tokens.first(), Some(&Token::Number("1".to_string())));
         assert!(tokens.len() >= 2);
+    }
+
+    #[test]
+    fn tokenize_reads_a_lone_colon_as_punct_for_array_slices() {
+        // Issue #1602（TABLE-35）: 配列スライス `arr[lo:hi]` のため単独 `:` を `Punct(':')` にする。
+        // `::` は従来どおり最長一致で `TypeCast`。
+        let n = |s: &str| Token::Number(s.to_string());
+        let id = |s: &str| Token::Ident(s.to_string());
+        assert_eq!(
+            tokenize("a[1:2]").expect("tokenize"),
+            vec![
+                id("a"),
+                Token::Punct('['),
+                n("1"),
+                Token::Punct(':'),
+                n("2"),
+                Token::Punct(']')
+            ]
+        );
+        assert_eq!(
+            tokenize("a[:2]").expect("tokenize"),
+            vec![
+                id("a"),
+                Token::Punct('['),
+                Token::Punct(':'),
+                n("2"),
+                Token::Punct(']')
+            ]
+        );
+        assert_eq!(
+            tokenize("a[1::int]").expect("tokenize"),
+            vec![
+                id("a"),
+                Token::Punct('['),
+                n("1"),
+                Token::TypeCast,
+                id("int"),
+                Token::Punct(']')
+            ]
+        );
+        assert_eq!(
+            tokenize("a[1:2::int]").expect("tokenize"),
+            vec![
+                id("a"),
+                Token::Punct('['),
+                n("1"),
+                Token::Punct(':'),
+                n("2"),
+                Token::TypeCast,
+                id("int"),
+                Token::Punct(']')
+            ]
+        );
     }
 
     #[test]

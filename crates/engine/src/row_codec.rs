@@ -394,6 +394,33 @@ impl ArrayValue {
         }
     }
 
+    /// 半開区間 `start..end`（0 始まり）の要素を同じ要素型の配列として切り出す。区間が範囲外・
+    /// 逆順なら空配列（配列スライス `arr[lo:hi]` の評価が共有する。TABLE-35・Issue #1602。
+    /// 範囲の切り詰めは呼び出し側が行い、本関数は `get()` で添字アクセスを避ける）。
+    pub(crate) fn slice(&self, start: usize, end: usize) -> ArrayValue {
+        macro_rules! cut {
+            ($variant:ident, $v:expr) => {
+                ArrayValue::$variant($v.get(start..end).map(<[_]>::to_vec).unwrap_or_default())
+            };
+        }
+        match self {
+            ArrayValue::Text(v) => cut!(Text, v),
+            ArrayValue::Bool(v) => cut!(Bool, v),
+            ArrayValue::Integer(v) => cut!(Integer, v),
+            ArrayValue::BigInt(v) => cut!(BigInt, v),
+            ArrayValue::Real(v) => cut!(Real, v),
+            ArrayValue::Double(v) => cut!(Double, v),
+            ArrayValue::Date(v) => cut!(Date, v),
+            ArrayValue::Timestamp(v) => cut!(Timestamp, v),
+            ArrayValue::Uuid(v) => cut!(Uuid, v),
+            ArrayValue::Numeric(v) => cut!(Numeric, v),
+            ArrayValue::Bytea(v) => cut!(Bytea, v),
+            ArrayValue::Json(v) => cut!(Json, v),
+            ArrayValue::Jsonb(v) => cut!(Jsonb, v),
+            ArrayValue::Enum(v) => cut!(Enum, v),
+        }
+    }
+
     /// 要素数（`pub(crate)`: 用途は [`Self::elem`] と同じ）。
     pub(crate) fn len(&self) -> usize {
         array_dispatch!(self, v => v.len())

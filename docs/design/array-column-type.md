@@ -273,3 +273,37 @@ SQL の INSERT／UPDATE／UPSERT／COPY、NoSQL の insert／update／filter `eq
 - **対象外（申し送り）**: NoSQL の DDL での配列宣言、配列列への DEFAULT（`0A000` を維持）、
   `numeric[]` の `ALTER COLUMN TYPE` による精度拡大（`42804` を維持）、配列要素・JSON パス
   演算子による述語、配列・JSON 列の二次索引化、NoSQL filter の `in` の配列列への適用。
+
+## Issue #1602 追記: 配列コンストラクタと添字・スライス
+
+対象ビヘイビアは TABLE-35（ポインタのみ。spec 本文は転記しない）。親 #1601。
+
+- **構文**: `ARRAY[<式>, ...]`、`<列>[i]`、`<列>[lo:hi]`（`[:hi]`・`[lo:]`・`[:]` を含む）、括弧式への添字
+  （`(<式>)[i]`）を受理する。字句は単独の `:` を `Punct(':')` にした（スライス専用。添字の外の `:` は
+  各パーサーが `42601`）。添字は PG の文法（`c_expr opt_indirection`）どおり列参照と括弧式にだけ付き、
+  `::` より強く結合する（`arr[1]::text` は要素の CAST）。引用された `"array"` は列参照のまま。
+- **AST・束縛**: `Expr::{ArrayConstructor, Subscript}` と `BoundExpr::{ArrayConstructor, ArrayIndex, ArraySlice}`
+  を追加した（`pub enum` のため破壊的変更）。束縛・評価は新モジュール `sql::array_expr`。要素の変換は
+  `sql::cast::bind_cast` に委ねる（変換の実装を増やさない）。内容ハッシュは新タグ 17（コンストラクタ）・
+  18（添字・スライス）。
+- **要素型の統一**: 暗黙・代入変換で届く型だけを共通型にする。整数 → bigint → real/double の拡幅、
+  型なし文字列リテラルと `NULL` は決まった型の入力として解釈（要素が全て不明なら text）、
+  text 系は text、date と timestamp は timestamp。カテゴリが異なる組は `42804`、リテラルの形式不正は
+  `22P02`。
+- **添字の意味**: 1 始まり。範囲外・NULL 添字・NULL 配列は NULL。スライスは範囲を切り詰め、空なら `{}`、
+  指定した境界が NULL なら NULL。添字の型は整数型・整数リテラル・型なし文字列リテラルのみ。
+- **利用箇所**: 投影、`INSERT ... VALUES`（評価後に配列テキストへ畳み、列側の `parse_array_literal` が列の
+  要素型で解釈し直す）、列 `DEFAULT`、`UPDATE ... SET <配列列> = <配列式>`（要素型が違えば代入変換を挟み、
+  行ごとに要素数上限を再検証して `54000`）、`WHERE` の式述語内の添字（スカラーとして比較・算術に流れる）。
+  添字を含む述語は従来の式述語の経路で、二次索引では被覆されず全走査になる。
+- **PG との差分（記録）**:
+  - 小数リテラル・numeric を含む要素（`ARRAY[1.5]`）、smallint のみ・`character(n)` のみ・時刻系・
+    interval・ENUM・vector の要素は `0A000`（`::float8` 等で型を指定する）。
+  - 空の `ARRAY[]`（CAST の直下以外）は PG の `42P18` ではなく `42804`。
+  - `INSERT ... VALUES` は配列テキスト経由のため、PG なら `42804` になる要素型の食い違い
+    （`ARRAY['1']` を `integer[]` 列へ等）が値を変えずに受理される、または `22P02` になる。
+  - 添字に float／numeric を使う形は `0A000`（PG は丸めて受理）。
+  - `INSERT ... VALUES` の定数式では CAST が未対応（`0A000`）のため、`ARRAY[...::T]` は使えない。
+- **対象外**: 多次元（`ARRAY[[...]]`・`arr[i][j]`・入れ子）と配列関数・比較・`ANY`/`ALL`・包含演算子
+  （#1603〜#1606 の担当）、添字への代入、CHECK／UDF 本体での使用（`0A000`）、jsonb の添字、
+  `WHERE <配列列> = ARRAY[...]`（従来どおり式との比較は拒否）、`ORDER BY`／`GROUP BY` での添字。

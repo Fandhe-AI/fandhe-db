@@ -52,6 +52,11 @@ pub(crate) fn expr_node_count(expr: &Expr) -> usize {
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
             1usize.saturating_add(expr_node_count(expr))
         }
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => expr
+            .array_expr_children()
+            .into_iter()
+            .flatten()
+            .fold(1usize, |acc, c| acc.saturating_add(expr_node_count(c))),
         Expr::SqlJsonQuery(q) => q
             .children()
             .into_iter()

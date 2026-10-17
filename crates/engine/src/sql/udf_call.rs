@@ -327,6 +327,95 @@ pub enum Expr {
         expr: Box<Expr>,
         ty: crate::sql::cast::CastType,
     },
+    /// 配列コンストラクタ `ARRAY[<expr>, ...]`（対象ビヘイビア: TABLE-35。Issue #1602）。
+    /// 要素型の統一は束縛段（`sql::array_expr`）が行う。多次元・`ARRAY(<subquery>)` は構文段が拒否する。
+    ArrayConstructor(Vec<Expr>),
+    /// 配列の添字 `<base>[<i>]`・スライス `<base>[<lo>:<hi>]`（TABLE-35。Issue #1602）。
+    /// 基底は列参照または括弧式に限る（PG の `c_expr opt_indirection` と同じ）。
+    Subscript {
+        base: Box<Expr>,
+        subscript: ArraySubscript,
+    },
+}
+
+impl BoundExpr {
+    /// 配列コンストラクタ・添字・スライスの子の束縛式を出現順に返す（それ以外は `None`）。
+    /// 子を再帰で辿るだけの網羅 match が同じ分解を共有するための補助（TABLE-35・Issue #1602）。
+    pub(crate) fn array_children(&self) -> Option<Vec<&BoundExpr>> {
+        match self {
+            BoundExpr::ArrayConstructor { items, .. } => Some(items.iter().collect()),
+            BoundExpr::ArrayIndex { base, index, .. } => Some(vec![base.as_ref(), index.as_ref()]),
+            BoundExpr::ArraySlice { base, lo, hi, .. } => {
+                let mut out: Vec<&BoundExpr> = vec![base.as_ref()];
+                out.extend([lo, hi].into_iter().flatten().map(|b| b.as_ref()));
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Expr {
+    /// 配列コンストラクタ・添字の子式を出現順に返す（それ以外の variant は `None`）。
+    /// 子を再帰で辿るだけの網羅 match（ビューの参照列収集・名前収集・CHECK 描画等）が
+    /// 同じ分解を共有するための補助（TABLE-35。Issue #1602）。
+    pub(crate) fn array_expr_children(&self) -> Option<Vec<&Expr>> {
+        match self {
+            Expr::ArrayConstructor(items) => Some(items.iter().collect()),
+            Expr::Subscript { base, subscript } => {
+                let mut out: Vec<&Expr> = vec![base.as_ref()];
+                match subscript {
+                    ArraySubscript::Index(i) => out.push(i.as_ref()),
+                    ArraySubscript::Slice { lo, hi } => {
+                        out.extend([lo, hi].into_iter().flatten().map(|b| b.as_ref()));
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// 配列コンストラクタ・添字の子式を `f` で写した新しい式を返す（それ以外は `None`）。
+    /// 識別子の書き換えなど、構造を保ったまま子を置換する走査が共有する補助。
+    pub(crate) fn try_map_array_children<E>(
+        &self,
+        f: &mut dyn FnMut(&Expr) -> Result<Expr, E>,
+    ) -> Option<Result<Expr, E>> {
+        match self {
+            Expr::ArrayConstructor(items) => Some(
+                items
+                    .iter()
+                    .map(&mut *f)
+                    .collect::<Result<Vec<_>, E>>()
+                    .map(Expr::ArrayConstructor),
+            ),
+            Expr::Subscript { base, subscript } => Some((|| {
+                let base = Box::new(f(base)?);
+                let subscript = match subscript {
+                    ArraySubscript::Index(i) => ArraySubscript::Index(Box::new(f(i)?)),
+                    ArraySubscript::Slice { lo, hi } => ArraySubscript::Slice {
+                        lo: lo.as_deref().map(|e| f(e).map(Box::new)).transpose()?,
+                        hi: hi.as_deref().map(|e| f(e).map(Box::new)).transpose()?,
+                    },
+                };
+                Ok(Expr::Subscript { base, subscript })
+            })()),
+            _ => None,
+        }
+    }
+}
+
+/// 添字の種別（[`Expr::Subscript`]）。スライスの境界は片側省略を `None` で表す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArraySubscript {
+    /// `[i]`。
+    Index(Box<Expr>),
+    /// `[lo:hi]`・`[:hi]`・`[lo:]`・`[:]`。
+    Slice {
+        lo: Option<Box<Expr>>,
+        hi: Option<Box<Expr>>,
+    },
 }
 
 /// SQL/JSON 問い合わせ関数の種別（[`Expr::SqlJsonQuery`]）。
@@ -730,6 +819,26 @@ pub enum BoundExpr {
     ArrayColumnRef {
         index: usize,
     },
+    /// 配列コンストラクタ `ARRAY[...]`（TABLE-35・Issue #1602。束縛・評価は `sql::array_expr`）。
+    /// 各要素は統一後の要素型 `elem` へ変換済みの束縛式で、評価は要素値を `elem` の配列へ詰める。
+    ArrayConstructor {
+        elem: crate::catalog::ArrayElemType,
+        items: Vec<BoundExpr>,
+    },
+    /// 配列の添字 `base[index]`（1 始まり。範囲外・NULL は NULL。`index` は int4 へ変換済み）。
+    /// `elem` は基底配列の要素型。
+    ArrayIndex {
+        elem: crate::catalog::ArrayElemType,
+        base: Box<BoundExpr>,
+        index: Box<BoundExpr>,
+    },
+    /// 配列のスライス `base[lo:hi]`（境界は int4 へ変換済み。省略は `None`。結果は同じ要素型の配列）。
+    ArraySlice {
+        elem: crate::catalog::ArrayElemType,
+        base: Box<BoundExpr>,
+        lo: Option<Box<BoundExpr>>,
+        hi: Option<Box<BoundExpr>>,
+    },
     /// `json_*` 関数・`to_json`・`json_build_*` の束縛結果（Issue #2180。束縛・評価は
     /// `sql::json_fn`）。
     JsonTextFn(Box<crate::sql::json_fn::BoundJsonFn>),
@@ -931,6 +1040,42 @@ impl PartialEq for BoundExpr {
             (BoundExpr::ArrayColumnRef { index: a }, BoundExpr::ArrayColumnRef { index: b }) => {
                 a == b
             }
+            (
+                BoundExpr::ArrayConstructor {
+                    elem: ea,
+                    items: ia,
+                },
+                BoundExpr::ArrayConstructor {
+                    elem: eb,
+                    items: ib,
+                },
+            ) => ea == eb && ia == ib,
+            (
+                BoundExpr::ArrayIndex {
+                    elem: ea,
+                    base: ba,
+                    index: xa,
+                },
+                BoundExpr::ArrayIndex {
+                    elem: eb,
+                    base: bb,
+                    index: xb,
+                },
+            ) => ea == eb && ba == bb && xa == xb,
+            (
+                BoundExpr::ArraySlice {
+                    elem: ea,
+                    base: ba,
+                    lo: la,
+                    hi: ha,
+                },
+                BoundExpr::ArraySlice {
+                    elem: eb,
+                    base: bb,
+                    lo: lb,
+                    hi: hb,
+                },
+            ) => ea == eb && ba == bb && la == lb && ha == hb,
             (BoundExpr::JsonTextFn(a), BoundExpr::JsonTextFn(b)) => a == b,
             (BoundExpr::JsonPathFn(a), BoundExpr::JsonPathFn(b)) => a == b,
             (
@@ -1424,6 +1569,12 @@ pub(crate) fn first_non_builtin_call_with(
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
             first_non_builtin_call_with(expr, allow_current_time, allow_json_fns)
         }
+        // 配列コンストラクタ・添字（TABLE-35・Issue #1602）は子を検査するだけ。
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => expr
+            .array_expr_children()
+            .into_iter()
+            .flatten()
+            .find_map(|c| first_non_builtin_call_with(c, allow_current_time, allow_json_fns)),
         // SQL/JSON 問い合わせ関数（TABLE-25・Issue #2187）は jsonb 関数と同じ扱い（CHECK 本体・
         // 連鎖ビュー本文では禁止要素として報告し、許可される文脈では部分式を検査する）。
         Expr::SqlJsonQuery(q) => {
@@ -1949,6 +2100,14 @@ fn validate_closed_expr(
         Expr::Collate { expr, .. } => validate_closed_expr(expr, params, registry, node_budget),
         // `CAST`（SQL-47・Issue #1590）は被演算子を検査する（変換先の型名は構文段で解決済み）。
         Expr::Cast { expr, .. } => validate_closed_expr(expr, params, registry, node_budget),
+        // 配列コンストラクタ・添字は UDF 本体（スキーマが無く要素型を決められない閉じた式）では
+        // 受理しない（TABLE-35・Issue #1602。`0A000`）。
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => {
+            Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "array constructors and subscripts are not supported in a function body"
+                    .to_string(),
+            })
+        }
         // SQL/JSON 問い合わせ関数は UDF 本体（閉じた式）では受理しない（jsonb 関数と同じ `0A000`）。
         Expr::SqlJsonQuery(_) => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "SQL/JSON query functions are not supported in a function body".to_string(),
@@ -2229,6 +2388,13 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => 1,
+        BoundExpr::ArrayConstructor { .. }
+        | BoundExpr::ArrayIndex { .. }
+        | BoundExpr::ArraySlice { .. } => expr
+            .array_children()
+            .into_iter()
+            .flatten()
+            .fold(1usize, |acc, c| acc.saturating_add(count_bound_nodes(c))),
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             1 + count_bound_nodes(lhs)
                 + match rhs {
@@ -2318,6 +2484,15 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => 0,
+        BoundExpr::ArrayConstructor { .. }
+        | BoundExpr::ArrayIndex { .. }
+        | BoundExpr::ArraySlice { .. } => expr
+            .array_children()
+            .into_iter()
+            .flatten()
+            .map(max_bound_case_nesting)
+            .max()
+            .unwrap_or(0),
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             let r = match rhs {
                 JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) => max_bound_case_nesting(e),
@@ -2403,6 +2578,13 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => false,
+        BoundExpr::ArrayConstructor { .. }
+        | BoundExpr::ArrayIndex { .. }
+        | BoundExpr::ArraySlice { .. } => expr
+            .array_children()
+            .into_iter()
+            .flatten()
+            .any(references_embedding),
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             references_embedding(lhs)
                 || match rhs {
@@ -2460,6 +2642,13 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::ArrayColumnRef { index }
         | BoundExpr::BoolColumnRef { index }
         | BoundExpr::ColumnRef { index } => visit(*index),
+        BoundExpr::ArrayConstructor { .. }
+        | BoundExpr::ArrayIndex { .. }
+        | BoundExpr::ArraySlice { .. } => {
+            for c in expr.array_children().into_iter().flatten() {
+                visit_referenced_scalar_columns(c, visit);
+            }
+        }
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             visit_referenced_scalar_columns(lhs, visit);
             if let JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) = rhs {
@@ -2587,6 +2776,17 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::Null => false,
         // 左辺の jsonb 列と、キー／添字の式が参照する列を両方マスクへ反映する
         // （取りこぼすとマスク外参照＝実 NULL の誤判定になるため全て走査する）。
+        BoundExpr::ArrayConstructor { .. }
+        | BoundExpr::ArrayIndex { .. }
+        | BoundExpr::ArraySlice { .. } => {
+            let mut any = false;
+            for c in expr.array_children().into_iter().flatten() {
+                if mark_referenced_scalar_columns(c, mask) {
+                    any = true;
+                }
+            }
+            any
+        }
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             let mut any = mark_referenced_scalar_columns(lhs, mask);
             if let JsonAccessRhs::Key(e) | JsonAccessRhs::Index(e) = rhs {
@@ -2794,6 +2994,30 @@ pub(crate) fn bind_projection_expr_json_ok(
     Ok((bound, ty, col))
 }
 
+/// 配列列への `UPDATE ... SET` 右辺を束縛する（TABLE-35・Issue #1602。`sql::set_expr` から呼ばれる）。
+///
+/// 通常の投影束縛と同じだが、右辺が裸の列名のときは CAST の被演算子と同じ規則（配列列を
+/// `ArrayColumnRef` の葉として受理）で解決する。これで `SET nums = other_nums` が到達できる。
+pub(crate) fn bind_array_assignment_source(
+    expr: &Expr,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    let mut env = BindEnv {
+        schema: Some(schema),
+        params: std::collections::HashMap::new(),
+        registry,
+        case_nesting: 0,
+        typed_arith: true,
+        clock: time_fn::current_clock(),
+        collation_leaf: false,
+    };
+    let (bound, ty) = crate::sql::cast::bind_operand(expr, &mut env, node_budget)?;
+    let col = expr_result_column_type(expr, &bound, ty);
+    Ok((bound, ty, col))
+}
+
 /// 式内の TEXT 系列参照が持つ照合（列定義の `collation`）を引く。範囲外・スキーマなしは
 /// `None`（照合指定なし＝既定）として扱う。
 fn column_collation(
@@ -2897,6 +3121,21 @@ pub(crate) fn expr_result_column_type(
             return Some(ColumnType::Integer);
         }
     }
+    // 配列コンストラクタ・スライスの結果は要素型つきの配列、添字の結果は要素型そのもの
+    // （TABLE-35・Issue #1602。整数要素は倍精度ではなく元の整数型を公告する）。
+    match bound {
+        BoundExpr::ArrayConstructor { elem, .. } | BoundExpr::ArraySlice { elem, .. } => {
+            return crate::catalog::ArrayType::new(*elem, crate::catalog::MAX_ARRAY_ELEMENTS)
+                .ok()
+                .map(ColumnType::Array);
+        }
+        BoundExpr::ArrayIndex { elem, .. } => {
+            return crate::sql::cast::elem_cast_type(*elem)
+                .and_then(|t| t.result_column_type())
+                .or_else(|| column_type_for_expr_type(ty));
+        }
+        _ => {}
+    }
     column_type_for_expr_type(ty)
 }
 
@@ -2993,6 +3232,32 @@ pub(crate) fn bind_const_expr(
         collation_leaf: false,
     };
     let (bound, ty) = bind_expr_in(expr, &mut env, node_budget)?;
+    let col = expr_result_column_type(expr, &bound, ty);
+    Ok((bound, ty, col))
+}
+
+/// [`bind_const_expr`] の最上位だけ配列値を許す版（`INSERT ... VALUES` の定数式の畳み込み用。
+/// 配列は評価後に PG 配列テキストへ畳まれ、列側の入力関数が列の要素型で解釈し直す。
+/// TABLE-35・Issue #1602）。式の内側（演算の被演算子・関数引数・`CASE` 等）の拒否規則は
+/// [`bind_expr_any`] 側のまま維持される。
+pub(crate) fn bind_const_expr_array_top(
+    expr: &Expr,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    let mut env = BindEnv {
+        schema: None,
+        params: std::collections::HashMap::new(),
+        registry,
+        case_nesting: 0,
+        typed_arith: true,
+        clock: time_fn::current_clock(),
+        collation_leaf: false,
+    };
+    let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
+    if ty != ExprType::Array {
+        reject_json_operand(ty)?;
+    }
     let col = expr_result_column_type(expr, &bound, ty);
     Ok((bound, ty, col))
 }
@@ -3666,6 +3931,13 @@ pub(super) fn bind_expr_any(
         Expr::SqlJsonQuery(q) => crate::sql::jsonpath_fn::bind_sql_json_query(q, env, node_budget),
         // `CAST`／`<type> '<literal>'`（SQL-47・Issue #1590）。規則表の判定と束縛は `sql::cast`。
         Expr::Cast { expr: inner, ty } => crate::sql::cast::bind_cast(inner, ty, env, node_budget),
+        // 配列コンストラクタ・添字・スライス（TABLE-35・Issue #1602）。束縛は `sql::array_expr`。
+        Expr::ArrayConstructor(items) => {
+            crate::sql::array_expr::bind_array_constructor(items, env, node_budget)
+        }
+        Expr::Subscript { base, subscript } => {
+            crate::sql::array_expr::bind_subscript(base, subscript, env, node_budget)
+        }
     }
 }
 
@@ -4518,6 +4790,13 @@ pub(super) fn numeric_kind(
         } => Some(*k),
         // `json_array_length` は int4（Issue #2180）。整数除算・添字の型解決に反映する。
         BoundExpr::JsonTextFn(f) if f.result_is_int4() => Some(NumericKind::Int4),
+        // 整数・real 要素の添字は要素型どおりの整数演算にする（TABLE-35・Issue #1602）。
+        BoundExpr::ArrayIndex { elem, .. } => match elem {
+            crate::catalog::ArrayElemType::Integer => Some(NumericKind::Int4),
+            crate::catalog::ArrayElemType::BigInt => Some(NumericKind::Int8),
+            crate::catalog::ArrayElemType::Real => Some(NumericKind::Float4),
+            _ => None,
+        },
         // `jsonb_array_length` は int4 なので、算術でも整数演算に解決する（Issue #1599）。
         BoundExpr::JsonFn {
             f: JsonFnKind::ArrayLength,
@@ -6840,6 +7119,21 @@ pub(crate) fn eval_with_scalars<'a>(
                     .to_string(),
             }),
         },
+        // 配列コンストラクタ・添字・スライス（TABLE-35・Issue #1602）。評価は `sql::array_expr`。
+        BoundExpr::ArrayConstructor { elem, items } => {
+            crate::sql::array_expr::eval_array_constructor(*elem, items, id, embedding, row_scalars)
+        }
+        BoundExpr::ArrayIndex { base, index, .. } => {
+            crate::sql::array_expr::eval_array_index(base, index, id, embedding, row_scalars)
+        }
+        BoundExpr::ArraySlice { base, lo, hi, .. } => crate::sql::array_expr::eval_array_slice(
+            base,
+            lo.as_deref(),
+            hi.as_deref(),
+            id,
+            embedding,
+            row_scalars,
+        ),
         BoundExpr::JsonTextFn(f) => {
             crate::sql::json_fn::eval_json_fn(f, id, embedding, row_scalars)
         }

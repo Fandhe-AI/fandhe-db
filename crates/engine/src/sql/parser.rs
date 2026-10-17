@@ -33,7 +33,7 @@ const MAX_VECTOR_LITERAL_BYTES: usize = 64 * 1024;
 /// 列 1 個分のペイロード上限（`row_codec::MAX_TEXT_FIELD_LEN` と同値の
 /// 実装既定値）と揃え、走査（`Vec<String>` の確保・要素切り出し）に入る前に
 /// この長さで拒否する。
-const MAX_ARRAY_LITERAL_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_ARRAY_LITERAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// 投影対象の 1 列。`Id` は疑似列（[`crate::storage::Row::id`] 由来。スキーマの列では
 /// ないため `column_index` を持たない）。`Column` の `index` は `TableSchema::columns`
@@ -1501,6 +1501,12 @@ pub(crate) fn default_expr_alias(expr: &Expr) -> String {
         Expr::Cast { expr, ty } => {
             cast_operand_name(expr).unwrap_or_else(|| ty.catalog_name().to_string())
         }
+        // 配列コンストラクタの既定列名は `array`、添字・スライスは基底の列名（PostgreSQL の
+        // `FigureColname` と同じ。`SELECT tags[1]` は `tags`。TABLE-35・Issue #1602）。
+        Expr::ArrayConstructor(_) => "array".to_string(),
+        Expr::Subscript { base, .. } => {
+            cast_operand_name(base).unwrap_or_else(|| ANONYMOUS_COLUMN_NAME.to_string())
+        }
         // PostgreSQL の既定列名（Issue #1539・SQL-42。従来は `expr`）。
         _ => ANONYMOUS_COLUMN_NAME.to_string(),
     }
@@ -1517,6 +1523,7 @@ fn cast_operand_name(expr: &Expr) -> Option<String> {
         | Expr::ValueFunction { .. } => Some(default_expr_alias(expr)),
         Expr::Cast { expr, .. } => cast_operand_name(expr),
         Expr::Collate { expr, .. } => cast_operand_name(expr),
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => Some(default_expr_alias(expr)),
         _ => None,
     }
 }
@@ -7546,6 +7553,12 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
         Expr::Null | Expr::ValueFunction { .. } => {}
         // 照合指定（TABLE-28・Issue #1609）は内側の式の列参照を集める。
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => collect_expr_idents(expr, out),
+        // 配列コンストラクタ・添字（TABLE-35・Issue #1602）は子の列参照を集める。
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => {
+            for c in expr.array_expr_children().into_iter().flatten() {
+                collect_expr_idents(c, out);
+            }
+        }
         Expr::SqlJsonQuery(q) => {
             for c in q.children() {
                 collect_expr_idents(c, out);
@@ -8212,6 +8225,12 @@ fn rewrite_group_row_idents(
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
         },
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => {
+            match expr.try_map_array_children(&mut |e| rec(e)) {
+                Some(r) => r?,
+                None => expr.clone(),
+            }
+        }
         Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(rec).collect::<Result<_, _>>()?),
         Expr::NullIf(a, b) => Expr::NullIf(Box::new(rec(a)?), Box::new(rec(b)?)),
         Expr::Collate { expr, collation } => Expr::Collate {

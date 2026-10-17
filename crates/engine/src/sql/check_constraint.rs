@@ -180,6 +180,23 @@ fn render_expr(expr: &Expr) -> String {
         // `CAST`（SQL-47・Issue #1590）。構文段が CHECK 本体での使用を `0A000` で拒否するため通常は
         // 到達しないが、全 variant 網羅と往復のため、変換先は `CastType::to_sql` の固定語彙で出す。
         Expr::Cast { expr, ty } => format!("CAST({} AS {})", render_expr(expr), ty.to_sql()),
+        // 配列コンストラクタ・添字（TABLE-35・Issue #1602）。構文段が CHECK 本体での使用を `0A000` で
+        // 拒否するため通常は到達しないが、全 variant 網羅のため PG 構文で出す（基底は括弧付き）。
+        Expr::ArrayConstructor(items) => format!(
+            "ARRAY[{}]",
+            items.iter().map(render_expr).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Subscript { base, subscript } => {
+            let b = render_expr(base);
+            match subscript {
+                udf_call::ArraySubscript::Index(i) => format!("({b})[{}]", render_expr(i)),
+                udf_call::ArraySubscript::Slice { lo, hi } => format!(
+                    "({b})[{}:{}]",
+                    lo.as_deref().map(render_expr).unwrap_or_default(),
+                    hi.as_deref().map(render_expr).unwrap_or_default()
+                ),
+            }
+        }
         // jsonb パス演算子（Issue #1596）。構文段が CHECK 本体での使用を `0A000` で拒否する
         // ため通常は到達しないが、`Expr` の全 variant を網羅するため、往復できる丸括弧付きで出す。
         Expr::JsonAccess { op, lhs, rhs } => format!(
@@ -593,6 +610,11 @@ fn referenced_column_names(
             }
             Expr::Null | Expr::ValueFunction { .. } => {}
             Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => collect_idents(expr, acc),
+            Expr::ArrayConstructor(_) | Expr::Subscript { .. } => {
+                for child in expr.array_expr_children().into_iter().flatten() {
+                    collect_idents(child, acc);
+                }
+            }
             Expr::SqlJsonQuery(q) => {
                 collect_idents(&q.context, acc);
                 collect_idents(&q.path, acc);
