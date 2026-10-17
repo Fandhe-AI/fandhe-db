@@ -20,14 +20,14 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 
 - `ExprType` は `Scalar`／`Vector`／`Bool`／`Text`／`Date`／`Timestamp` の 6 値で、
   JSON 用の variant はない。
-- 字句化済み（構文段が `42601` で拒否）: `->` `->>` `#>` `#>>` `::` `||`。
+- 字句化済み: `::` は #1593 で CAST へ脱糖して受理する（他の演算子は各 Issue の構文段が受理）。
   JSON 関連の他の演算子は未字句化。
 - `json.rs` に `parse_json`・`write_canonical`・`canonical_equality_text`・`JsonPath`／
   `extract_path` 等（Rust API 限定）と上限定数がある。
 - JSON 列の `=`／`IN`／`IS NULL` は宣言的述語経路で処理され、式評価器を経由しない。
   `GROUP BY`／`DISTINCT` は `Cell::Json` を拒否する。
 - wire 側は `ColumnMeta::Scalar{ty: Json|Jsonb}` から OID 114／3802 への写像が実装済み。
-- 集合返却関数の基盤（#2220）と CAST／`::`（#1588〜#1593）は未実装。
+- 集合返却関数の基盤（#2220）は未実装。CAST と `::` は #1590・#1593 で追加済み。
 
 ## Issue #1596 での変更（パス演算子の構文・束縛・評価）
 

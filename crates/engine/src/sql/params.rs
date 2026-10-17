@@ -286,6 +286,12 @@ pub(crate) fn where_equality_literal_is_param_typed(
         if matches!(tokens.get(i), Some(Token::Ident(_) | Token::QuotedNull(_)))
             && matches!(tokens.get(i + 1), Some(Token::Punct('=')))
         {
+            // Issue #1593: `col = '<lit>'::T` は構文段が構造葉（`Equality`）にせず式述語へ回す
+            // ため、序数カウンタにも数えない（`allowlist::literal_followed_by_typecast`）。
+            if super::allowlist::literal_followed_by_typecast(tokens, i + 2) {
+                i += 3;
+                continue;
+            }
             match tokens.get(i + 2) {
                 Some(Token::Param(n)) => {
                     if kind_of(kinds, *n) == ParamLiteralKind::String {
@@ -310,6 +316,7 @@ pub(crate) fn where_equality_literal_is_param_typed(
             && matches!(tokens.get(i + 1), Some(Token::Punct('<')))
             && matches!(tokens.get(i + 2), Some(Token::Punct('>')))
             && matches!(tokens.get(i + 3), Some(Token::StringLiteral(_)))
+            && !super::allowlist::literal_followed_by_typecast(tokens, i + 3)
         {
             flags.push(false);
             i += 4;
@@ -769,6 +776,17 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         // パターン 7: SET 右辺／VALUES 要素の式の内側（Issue #1546）。型を決められない
         // 場合の `42P18` は Parse の型推論段が返す（ここは構造上の受理だけを判定する）。
         let is_in_expr = layout.segment_index_at(i).is_some();
+
+        // Issue #1593: パターン 1〜4 の `$n` に `::` が続く形（`WHERE id = $1::int`・
+        // `<=> $1::vector` 等）は許可しない。構文段で構造葉でなくなる述語と序数カウンタを
+        // ずらさないための fail-closed（型推論は式の内側のパターン 7 だけが担う）。
+        if matches!(next1, Some(Token::TypeCast))
+            && (is_distance || is_using_plan || is_operation_id || is_where_equality)
+        {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "parameter placeholder ${n} followed by '::' is not supported at this position"
+            )));
+        }
 
         if !(is_distance
             || is_using_plan
@@ -1233,9 +1251,22 @@ fn substitute_with<E>(
     mut value_for: impl FnMut(u16) -> Result<Vec<Token>, E>,
 ) -> Result<Vec<Token>, E> {
     let mut out = Vec::with_capacity(tokens.len());
-    for token in tokens {
+    for (i, token) in tokens.iter().enumerate() {
         match token {
-            Token::Param(n) => out.extend(value_for(*n)?),
+            Token::Param(n) => {
+                let produced = value_for(*n)?;
+                // Issue #1593: `$n::T` の `$n` が負値（`-` + 数値の 2 トークン）になる場合は括弧で
+                // 包む。`::` は単項マイナスより強いため、包まないと `-5::int` が `-(5::int)` と
+                // 読まれ、リテラル `(-5)::int` と値の意味が食い違う。`Punct` の長さは
+                // バイト計上で 0 のため上限計算は変わらない。
+                if produced.len() >= 2 && matches!(tokens.get(i + 1), Some(Token::TypeCast)) {
+                    out.push(Token::Punct('('));
+                    out.extend(produced);
+                    out.push(Token::Punct(')'));
+                } else {
+                    out.extend(produced);
+                }
+            }
             other => out.push(other.clone()),
         }
     }
@@ -1486,6 +1517,45 @@ mod tests {
                 "{op}"
             );
         }
+    }
+
+    /// Issue #1593: `col = '<lit>'::T` は構文段が構造葉（`Equality`）にしないため、序数カウンタも
+    /// 数えない（数えると後続の `b = $1` の序数がずれ、ENUM 語彙照合の省略が誤適用される）。
+    #[test]
+    fn typecast_string_literal_is_not_counted_as_equality_literal() {
+        for op in ["=", "<>"] {
+            let sql = format!("SELECT id FROM t WHERE a {op} 'x'::text AND b = $1");
+            let tokens = crate::sql::lexer::tokenize_with_params(&sql).expect("tokenize");
+            assert_eq!(
+                where_equality_literal_is_param_typed(&tokens, &[]),
+                vec![true],
+                "{op}"
+            );
+        }
+    }
+
+    /// Issue #1593: 許可位置 1〜4 の `$n` に `::` が続く形は 42601。負値の置換は括弧で包む。
+    #[test]
+    fn typecast_after_param_is_rejected_and_negative_values_are_parenthesized() {
+        let tokens = crate::sql::lexer::tokenize_with_params("SELECT id FROM t WHERE a = $1::int")
+            .expect("tokenize");
+        assert_eq!(
+            validate_param_positions(&tokens).unwrap_err().wire_code(),
+            "42601"
+        );
+        let tokens = crate::sql::lexer::tokenize_with_params(
+            "UPDATE t SET a = $1::integer WHERE id = 1 USING OPERATION_ID $2",
+        )
+        .expect("tokenize");
+        let kinds = [ParamLiteralKind::Integer, ParamLiteralKind::String];
+        let out = substitute_values_typed(
+            &tokens,
+            &[Some("-5".to_string()), Some("k".to_string())],
+            &kinds,
+        )
+        .expect("substitute");
+        let rendered = crate::sql::lexer::render_tokens(&out).unwrap_or_default();
+        assert!(rendered.contains("( - 5 ) :: integer"), "{rendered}");
     }
 
     use super::*;
