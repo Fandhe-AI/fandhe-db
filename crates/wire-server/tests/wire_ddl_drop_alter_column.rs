@@ -138,8 +138,8 @@ fn wire_error_sqlstates_and_ready_for_query_recovery() {
         ("ALTER TABLE docs DROP COLUMN note CASCADE", "42601"),
         ("ALTER TABLE docs DROP COLUMN IF EXISTS note", "42601"),
         (
-            "ALTER TABLE docs ALTER COLUMN amount SET DATA TYPE NUMERIC(9,2)",
-            "42601",
+            "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING amount",
+            "0A000",
         ),
     ] {
         send_simple_query(&mut stream, sql);

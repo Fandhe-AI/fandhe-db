@@ -3758,6 +3758,11 @@ pub struct ValidatedAlterTableAlterColumnType {
     /// `... TYPE <型> COLLATE <name>` の照合（TABLE-28・Issue #1609）。`None`（`COLLATE`
     /// 省略）は新しい型の既定（照合指定なし）へ戻す。**BREAKING CHANGE**: pub フィールド追加。
     pub collation: Option<crate::collation::Collation>,
+    /// `... TYPE <型> [COLLATE <name>] USING <式>` の変換式（TABLE-40、Issue #1635）。
+    /// 式の許可範囲は `UPDATE ... SET` の右辺（SQL-45）と同じ構文木で、列参照の解決・型検査は
+    /// 実行段（`sql::alter_using`）が DDL 権限ゲートの後で担う。`None`（`USING` 省略）は
+    /// 代入変換での型変更。**BREAKING CHANGE**: pub フィールド追加。
+    pub using: Option<crate::sql::udf_call::Expr>,
 }
 
 /// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> SET NOT
@@ -8256,6 +8261,12 @@ impl<'a> Parser<'a> {
             }
             self.pos = start;
         }
+        Ok(SetValue::Expr(self.parse_bounded_value_expr()?))
+    }
+
+    /// 値式 1 個をノード予算（`MAX_EXPR_NODES`）つきで解析する。`UPDATE ... SET` の右辺
+    /// （SQL-45）と `ALTER COLUMN TYPE ... USING`（TABLE-40、Issue #1635）が共有する。
+    fn parse_bounded_value_expr(&mut self) -> Result<Expr, SqlSurfaceError> {
         let saved = self.expr_node_budget;
         self.expr_node_budget = MAX_EXPR_NODES;
         // `-a`（単項マイナス）は式解析中だけ許可する（`0 - a` へ脱糖される）。
@@ -8265,7 +8276,7 @@ impl<'a> Parser<'a> {
         self.allow_unary_minus = prev_minus;
         self.allow_plus_number = prev_plus;
         self.expr_node_budget = saved;
-        Ok(SetValue::Expr(parsed?))
+        parsed
     }
 
     /// リテラル 1 要素（文字列・数値・`true`/`false`・大小無視の `NULL`・符号付き
@@ -9092,16 +9103,22 @@ impl<'a> Parser<'a> {
             });
         }
         // `ALTER COLUMN <col> TYPE <型名> [COLLATE <name>]`（TABLE-19、Issue #1167。
-        // `COLLATE` は TABLE-28・Issue #1609）。`SET DATA TYPE`・`USING` は `TYPE` 不一致／
-        // 余剰トークンとして `42601`。
+        // `COLLATE` は TABLE-28・Issue #1609）。`SET DATA TYPE` と `USING <式>` は
+        // TABLE-40（Issue #1635）。`USING` は `COLLATE` の後ろにだけ置ける（逆順は余剰トークンで `42601`）。
         if self.peek_contextual_keyword("ALTER") {
             self.advance();
             self.expect_contextual_keyword("COLUMN")?;
             let column_name = self.expect_ident()?;
             reject_reserved_alter_column_name(&column_name)?;
             // `ALTER COLUMN <col> SET NOT NULL`（TABLE-39 (3)、Issue #1631）・
-            // `SET DEFAULT <式>`（TABLE-39 (1)、Issue #1628）。`SET DATA TYPE` 等は `42601`。
-            if self.peek_contextual_keyword("SET") {
+            // `SET DEFAULT <式>`（TABLE-39 (1)、Issue #1628）。`SET DATA TYPE` は `TYPE` と
+            // 同義（TABLE-40、Issue #1635）で下の `TYPE` 処理へ合流する。それ以外は `42601`。
+            let set_data_type = self.peek_contextual_keyword("SET")
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("DATA"));
+            if set_data_type {
+                self.advance();
+                self.advance();
+            } else if self.peek_contextual_keyword("SET") {
                 self.advance();
                 if self.peek_ident_matches("DEFAULT") {
                     self.advance();
@@ -9137,7 +9154,7 @@ impl<'a> Parser<'a> {
             }
             // `ALTER COLUMN <col> DROP DEFAULT`（TABLE-39 (2)、Issue #1628）・
             // `DROP NOT NULL`（TABLE-39 (4)、Issue #1632）。それ以外は `42601`。
-            if self.peek_contextual_keyword("DROP") {
+            if !set_data_type && self.peek_contextual_keyword("DROP") {
                 self.advance();
                 if self.peek_contextual_keyword("NOT") {
                     self.advance();
@@ -9163,11 +9180,19 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            // 任意の `USING <式>`（TABLE-40、Issue #1635）。ノード予算つきで `,`・`;`・文末まで読む。
+            let using = if self.peek_ident_matches("USING") {
+                self.advance();
+                Some(self.parse_bounded_value_expr()?)
+            } else {
+                None
+            };
             return Ok(ParsedAlterTableShape::AlterColumnType {
                 table_name,
                 column_name,
                 column_type,
                 collation,
+                using,
             });
         }
         // `RENAME [COLUMN] <old> TO <new>`（TABLE-38 のポインタ、Issue #1619）。
@@ -11714,6 +11739,7 @@ enum ParsedAlterTableShape {
         column_name: String,
         column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
         collation: Option<crate::collation::Collation>,
+        using: Option<crate::sql::udf_call::Expr>,
     },
     AddPrimaryKey {
         table_name: String,
@@ -15389,11 +15415,13 @@ fn into_validated_alter_table(
             column_name,
             column_type,
             collation,
+            using,
         } => ValidatedAlterTable::AlterColumnType(ValidatedAlterTableAlterColumnType {
             table_name,
             column_name,
             column_type,
             collation,
+            using,
         }),
     })
 }
@@ -15952,6 +15980,34 @@ pub(crate) fn validate_update_form_tokens(
 
 #[cfg(test)]
 mod tests {
+    /// TABLE-40・Issue #1635: `ALTER COLUMN TYPE` の `SET DATA TYPE`・`USING` の構文。
+    #[test]
+    fn alter_column_type_parses_set_data_type_and_using() {
+        use super::*;
+        let using_of = |sql: &str| match validate_alter_table(sql).expect(sql) {
+            ValidatedAlterTable::AlterColumnType(a) => a,
+            other => panic!("unexpected: {other:?}"),
+        };
+        let plain = using_of("ALTER TABLE t ALTER COLUMN a TYPE BIGINT");
+        assert!(plain.using.is_none());
+        let set_data = using_of("ALTER TABLE t ALTER COLUMN a SET DATA TYPE BIGINT");
+        assert_eq!(plain, set_data);
+        let with_using = using_of("ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING a + 1;");
+        assert!(with_using.using.is_some());
+        let both = using_of("ALTER TABLE t ALTER COLUMN a TYPE TEXT COLLATE \"C\" USING a::text");
+        assert!(both.using.is_some() && both.collation.is_some());
+        for bad in [
+            "ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING",
+            "ALTER TABLE t ALTER COLUMN a TYPE TEXT USING a COLLATE \"C\" x",
+            "ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING a USING b",
+            "ALTER TABLE t ALTER COLUMN a SET DATA BIGINT",
+            "ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING OPERATION_ID 'x'",
+        ] {
+            let err = validate_alter_table(bad).expect_err(bad);
+            assert_eq!(err.wire_code(), "42601", "{bad}");
+        }
+    }
+
     /// `USING btree` は省略形と同一の宣言で、`hnsw`・`btree` 以外の手法は `0A000`
     /// （INDEX-9、Issue #1617）。
     #[test]

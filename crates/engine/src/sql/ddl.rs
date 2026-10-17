@@ -1185,7 +1185,8 @@ pub(crate) fn execute_alter_table_rename_column(
 /// `ALTER TABLE <table> ALTER COLUMN <column> TYPE <型>` の実行本体（TABLE-19・
 /// SQL-23、Issue #1167）。前提は [`execute_alter_table_drop_column`] と同じ。
 /// 判定順序: テーブル存在確認 → 目標型の解決（[`resolve_alter_target_type`]。
-/// 未登録 ENUM は `42601`）→ `catalog::Storage::alter_table_alter_column_type`
+/// 未登録 ENUM は `42601`）→ 変換可否の事前判定（[`precheck_alter_type_conversion`]。
+/// TABLE-40・Issue #1635）→ `catalog::Storage::alter_table_alter_column_type`
 /// （単一 write txn 内で NUMERIC 範囲検証〔`42601`〕→ 列・型互換性判定〔`42804`〕→
 /// 拡大変換なら全テナント既存行の再エンコード〔Issue #1361。PK／UNIQUE／FK 列も受理し
 /// 索引を失効させる。Issue #1402〕。文字列系の縮小・`CHAR(n)` 変換は超過行を `22001`・重複を
@@ -1198,6 +1199,7 @@ pub(crate) fn execute_alter_table_alter_column_type(
     ensure_table_exists(storage, &stmt.table_name)?;
     let target = resolve_alter_target_type(storage, &stmt.column_type, limits)?;
     check_column_collation(&target, stmt.collation)?;
+    precheck_alter_type_conversion(storage, stmt, &target)?;
     storage
         .alter_table_alter_column_type_collated(
             &stmt.table_name,
@@ -1219,6 +1221,53 @@ pub(crate) fn execute_alter_table_alter_column_type(
             column_name: stmt.column_name.clone(),
         },
     })
+}
+
+/// `ALTER COLUMN TYPE` の変換可否の事前判定（TABLE-40、Issue #1635）。DDL 権限ゲート・表の
+/// 存在確認・目標型の解決の後に呼ばれる（権限の無い主体への存在オラクルにしない）。
+///
+/// - `USING` あり: 式を旧スキーマで束縛・型検査し（[`crate::sql::alter_using`]）、成功しても
+///   行の書き換え（Issue #1636）が未実装のため `0A000` で拒否する（式を無視して従来経路へ
+///   流さない。fail-closed）。副作用は無い。
+/// - `USING` 省略: 旧型から新型への代入変換が規則表（SQL-47）に無い組を `42804`（`USING` の
+///   指定を促す固定文言）で拒否する。代入変換はあるが未実装の組や規則表の外の型は、従来どおり
+///   カタログの互換性判定（`42804`。TABLE-19 の契約）に任せる。
+/// - 列が見つからない場合はカタログの既存判定（`42703`）に委ねる。
+fn precheck_alter_type_conversion(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAlterColumnType,
+    target: &ColumnType,
+) -> Result<(), SqlSurfaceError> {
+    let schema = storage
+        .get_table_schema(&stmt.table_name)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_drop_alter_column_error(other),
+        })?;
+    let Some((index, column)) = schema
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.name == stmt.column_name)
+    else {
+        return Ok(());
+    };
+    if let Some(using) = &stmt.using {
+        crate::sql::alter_using::check_alter_using(using, &schema, index, target)?;
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "ALTER COLUMN TYPE with a USING expression is not supported yet".to_string(),
+        });
+    }
+    if crate::sql::cast::column_assignment_convertible(&column.ty, target) == Some(false) {
+        return Err(SqlSurfaceError::datatype_mismatch(format!(
+            "column {:?} cannot be cast automatically to type {}; specify a USING expression",
+            stmt.column_name,
+            crate::sql::cast::cast_type_of_column(target)
+                .map(|t| t.pg_label())
+                .unwrap_or_default()
+        )));
+    }
+    Ok(())
 }
 
 /// `ALTER TABLE <table> ALTER COLUMN <column> SET NOT NULL` の実行本体（TABLE-39 (3)、

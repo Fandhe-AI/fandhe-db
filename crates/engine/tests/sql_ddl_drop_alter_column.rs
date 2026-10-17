@@ -367,13 +367,34 @@ fn unsupported_qualifiers_are_rejected_with_42601() {
         "ALTER TABLE IF EXISTS docs DROP COLUMN note",
         "ALTER TABLE ONLY docs DROP COLUMN note",
         "ALTER TABLE docs ALTER amount TYPE NUMERIC(9,2)",
-        "ALTER TABLE docs ALTER COLUMN amount SET DATA TYPE NUMERIC(9,2)",
-        "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING amount",
         "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) RETURNING id",
         "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2); SELECT 1",
     ] {
         assert_eq!(code_of(&core, &mut session, sql), "42601", "{sql}");
     }
+}
+
+/// TABLE-40・Issue #1635: `SET DATA TYPE` は `TYPE` と同義で受理し、`USING` 付きは束縛・型検査
+/// 後に `0A000`（行の書き換えは Issue #1636 の担当）。
+#[test]
+fn set_data_type_is_accepted_and_using_is_not_supported_yet() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    assert_eq!(
+        code_of(
+            &core,
+            &mut session,
+            "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING amount"
+        ),
+        "0A000"
+    );
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ALTER COLUMN amount SET DATA TYPE NUMERIC(9,2)",
+    )
+    .expect("SET DATA TYPE widening");
 }
 
 /// TABLE-28・Issue #1609: `COLLATE` は構文対応済み。未知の照合名は `42704`（照合名の
