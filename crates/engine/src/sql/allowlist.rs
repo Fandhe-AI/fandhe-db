@@ -3732,7 +3732,30 @@ pub struct ValidatedAlterTableAlterColumnSetNotNull {
     pub column_name: String,
 }
 
-/// `ALTER TABLE` の許可形状 10 種の和（Issue #1067・#1068・#1069・#1167・#1196・#1619・#1631）。`ParsedSql::AlterTable` が
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> SET DEFAULT
+/// <式>` 文（TABLE-39 (1)、Issue #1628）。式は `CREATE TABLE` の列 DEFAULT と同じ許可範囲
+/// （定数リテラル・定数式・時刻値関数）で、`default` と `time_default` は高々一方が `Some`
+/// （`SET DEFAULT NULL` は両方 `None` に正規化済みで `DROP DEFAULT` と同義）。列型との適合・
+/// 値の束縛・表と列の存在確認は実行段（`sql::ddl::execute_alter_table_alter_column_set_default`）が
+/// DDL 権限ゲートの後で担う（権限の無い主体への存在オラクル化を防ぐ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAlterColumnSetDefault {
+    pub table_name: String,
+    pub column_name: String,
+    pub default: Option<InsertLiteral>,
+    pub time_default: Option<crate::catalog::TimeDefault>,
+}
+
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> DROP DEFAULT`
+/// 文（TABLE-39 (2)、Issue #1628）。存在確認は実行段
+/// （`sql::ddl::execute_alter_table_alter_column_drop_default`）が権限ゲートの後で担う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAlterColumnDropDefault {
+    pub table_name: String,
+    pub column_name: String,
+}
+
+/// `ALTER TABLE` の許可形状 12 種の和（Issue #1067・#1068・#1069・#1167・#1196・#1619・#1628・#1631）。`ParsedSql::AlterTable` が
 /// 保持する型で、`sql::ddl::execute_alter_table` が対応する実行本体へ振り分ける
 /// （構文の許可リスト判定は `sql::allowlist` の管轄、ディスパッチは `sql::ddl`・
 /// `core.rs` の管轄という既存の責務分担を維持する）。
@@ -3759,6 +3782,9 @@ pub struct ValidatedAlterTableAlterColumnSetNotNull {
 ///
 /// **BREAKING CHANGE**（Issue #1619）: `RenameColumn` variant を追加した。
 /// 本 enum を網羅的に `match` するクレート外のコードは追随が必要。
+///
+/// **BREAKING CHANGE**（Issue #1628）: `AlterColumnSetDefault`・`AlterColumnDropDefault`
+/// variant を追加した。本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedAlterTable {
     AddColumn(ValidatedAlterTableAddColumn),
@@ -3770,6 +3796,8 @@ pub enum ValidatedAlterTable {
     AlterColumnType(ValidatedAlterTableAlterColumnType),
     AddPrimaryKey(ValidatedAlterTableAddPrimaryKey),
     AlterColumnSetNotNull(ValidatedAlterTableAlterColumnSetNotNull),
+    AlterColumnSetDefault(ValidatedAlterTableAlterColumnSetDefault),
+    AlterColumnDropDefault(ValidatedAlterTableAlterColumnDropDefault),
     RenameColumn(ValidatedAlterTableRenameColumn),
 }
 
@@ -8980,13 +9008,48 @@ impl<'a> Parser<'a> {
             self.expect_contextual_keyword("COLUMN")?;
             let column_name = self.expect_ident()?;
             reject_reserved_alter_column_name(&column_name)?;
-            // `ALTER COLUMN <col> SET NOT NULL`（TABLE-39 (3)、Issue #1631）。`SET DEFAULT`・
-            // `SET DATA TYPE` 等は `42601`。
+            // `ALTER COLUMN <col> SET NOT NULL`（TABLE-39 (3)、Issue #1631）・
+            // `SET DEFAULT <式>`（TABLE-39 (1)、Issue #1628）。`SET DATA TYPE` 等は `42601`。
             if self.peek_contextual_keyword("SET") {
                 self.advance();
+                if self.peek_ident_matches("DEFAULT") {
+                    self.advance();
+                    // 式の許可範囲は `CREATE TABLE` の列 DEFAULT と同じ（時刻値関数を先に試し、
+                    // 該当しなければ定数リテラル・定数式）。複合式は定数式経路が拒否する。
+                    if let Some(t) = self.try_parse_time_default()? {
+                        return Ok(ParsedAlterTableShape::AlterColumnSetDefault {
+                            table_name,
+                            column_name,
+                            default: None,
+                            time_default: Some(t),
+                        });
+                    }
+                    // `SET DEFAULT NULL` は既定値なしと同義（`CREATE TABLE` と同じ正規化。
+                    // SQL-41）。以降の束縛・カタログは `InsertLiteral::Null` を受け取らない。
+                    let default = match self.expect_literal_or_const_expr()? {
+                        InsertLiteral::Null => None,
+                        lit => Some(lit),
+                    };
+                    return Ok(ParsedAlterTableShape::AlterColumnSetDefault {
+                        table_name,
+                        column_name,
+                        default,
+                        time_default: None,
+                    });
+                }
                 self.expect_contextual_keyword("NOT")?;
                 self.expect_contextual_keyword("NULL")?;
                 return Ok(ParsedAlterTableShape::AlterColumnSetNotNull {
+                    table_name,
+                    column_name,
+                });
+            }
+            // `ALTER COLUMN <col> DROP DEFAULT`（TABLE-39 (2)、Issue #1628）。`DROP NOT NULL` は
+            // 兄弟 Issue の範囲のため本段階では `42601`（`DEFAULT` 不一致）。
+            if self.peek_contextual_keyword("DROP") {
+                self.advance();
+                self.expect_contextual_keyword("DEFAULT")?;
+                return Ok(ParsedAlterTableShape::AlterColumnDropDefault {
                     table_name,
                     column_name,
                 });
@@ -11553,6 +11616,16 @@ enum ParsedAlterTableShape {
         columns: Vec<String>,
     },
     AlterColumnSetNotNull {
+        table_name: String,
+        column_name: String,
+    },
+    AlterColumnSetDefault {
+        table_name: String,
+        column_name: String,
+        default: Option<InsertLiteral>,
+        time_default: Option<crate::catalog::TimeDefault>,
+    },
+    AlterColumnDropDefault {
         table_name: String,
         column_name: String,
     },
@@ -15122,6 +15195,26 @@ pub fn validate_alter_table_tokens(
             table_name,
             column_name,
         }),
+        ParsedAlterTableShape::AlterColumnSetDefault {
+            table_name,
+            column_name,
+            default,
+            time_default,
+        } => ValidatedAlterTable::AlterColumnSetDefault(ValidatedAlterTableAlterColumnSetDefault {
+            table_name,
+            column_name,
+            default,
+            time_default,
+        }),
+        ParsedAlterTableShape::AlterColumnDropDefault {
+            table_name,
+            column_name,
+        } => {
+            ValidatedAlterTable::AlterColumnDropDefault(ValidatedAlterTableAlterColumnDropDefault {
+                table_name,
+                column_name,
+            })
+        }
         ParsedAlterTableShape::RenameColumn {
             table_name,
             column_name,
@@ -15959,6 +16052,58 @@ mod tests {
         let err = validate_alter_table("ALTER TABLE docs ADD PRIMARY KEY (a, a)")
             .expect_err("duplicate column");
         assert_eq!(err.wire_code(), "42701");
+    }
+
+    /// `ALTER COLUMN ... SET DEFAULT <式>`／`DROP DEFAULT` の構文受理・拒否（Issue #1628・
+    /// TABLE-39 (1)(2)）。`SET DEFAULT NULL` は既定値なしに正規化される。
+    #[test]
+    fn alter_column_set_and_drop_default_syntax() {
+        let set = |sql: &str| match validate_alter_table(sql) {
+            Ok(ValidatedAlterTable::AlterColumnSetDefault(s)) => s,
+            other => panic!("{sql}: unexpected {other:?}"),
+        };
+        let s = set("ALTER TABLE docs ALTER COLUMN a SET DEFAULT 'x';");
+        assert_eq!(s.table_name, "docs");
+        assert_eq!(s.column_name, "a");
+        assert_eq!(s.default, Some(InsertLiteral::String("x".to_string())));
+        assert_eq!(s.time_default, None);
+        assert_eq!(
+            set("ALTER TABLE docs ALTER COLUMN a SET DEFAULT 12").default,
+            Some(InsertLiteral::Number("12".to_string()))
+        );
+        assert_eq!(
+            set("ALTER TABLE docs ALTER COLUMN a SET DEFAULT true").default,
+            Some(InsertLiteral::Bool(true))
+        );
+        let null = set("ALTER TABLE docs ALTER COLUMN a SET DEFAULT NULL");
+        assert_eq!((null.default, null.time_default), (None, None));
+        for sql in [
+            "ALTER TABLE docs ALTER COLUMN a SET DEFAULT now()",
+            "ALTER TABLE docs ALTER COLUMN a SET DEFAULT CURRENT_TIMESTAMP",
+        ] {
+            let t = set(sql);
+            assert_eq!(t.default, None, "{sql}");
+            assert!(t.time_default.is_some(), "{sql}");
+        }
+        match validate_alter_table("ALTER TABLE docs ALTER COLUMN a DROP DEFAULT;") {
+            Ok(ValidatedAlterTable::AlterColumnDropDefault(d)) => {
+                assert_eq!(d.table_name, "docs");
+                assert_eq!(d.column_name, "a");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        for sql in [
+            "ALTER TABLE docs ALTER COLUMN a DROP NOT NULL",
+            "ALTER TABLE docs ALTER a SET DEFAULT 1",
+            "ALTER TABLE docs ALTER COLUMN a SET DEFAULT",
+            "ALTER TABLE docs ALTER COLUMN id SET DEFAULT 1",
+            "ALTER TABLE docs ALTER COLUMN id DROP DEFAULT",
+            "ALTER TABLE docs ALTER COLUMN a SET DEFAULT 1, ADD COLUMN b INTEGER",
+            "ALTER TABLE docs ALTER COLUMN a DROP DEFAULT extra",
+        ] {
+            let err = validate_alter_table(sql).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     /// storage 非依存の単体テスト用フェイク（`Storage` を必要としないための軽量抽象）。

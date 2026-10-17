@@ -248,3 +248,42 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
   キーワードとして受理される（ALTER TABLE の構文段が引用符付き識別子を区別しないため）。
 - **範囲外**: `DROP NOT NULL`（#1632）、`SET／DROP DEFAULT`、`COLUMN` 省略形、複数アクション、
   NoSQL 表層。
+
+## Issue #1628 追記: `ALTER COLUMN SET／DROP DEFAULT`
+
+ポインタ: TABLE-39 (1)(2)(6)・TABLE-5・TABLE-16・TABLE-20・ERR-6、Issue #1627（補完値の分離）。
+
+- **構文**: `ALTER TABLE <表> ALTER COLUMN <列> SET DEFAULT <式>`／`... DROP DEFAULT`。式の許可範囲は
+  `CREATE TABLE` の列 DEFAULT と同じ（定数リテラル・定数式・時刻値関数・`NULL`）。`SET DEFAULT NULL`
+  は `DROP DEFAULT` と同じ扱い（SQL-41 の正規化）。`COLUMN` 省略形・`DROP NOT NULL`・カンマ区切りの
+  複数アクションは `42601` のまま。
+- **変えるもの／変えないもの**: 変えるのは以後の書き込みで使う INSERT 既定値（`default_expr`）だけで、
+  ADD COLUMN 時に決めた既存行の読み出し時補完値（`fill_value`）は変えない。食い違うスキーマは
+  カタログ v14 で永続化される。変更時はテーブル単位の世代を進める。
+- **判定順序**: 表の存在（`42P01`／`42809`）→ 列の存在（`42703`）→ 既定値の生成（型不一致 `42804`）
+  → TIMESTAMPTZ の正規化（`default_expr` のみ）→ 値の束縛検証（`22003`／`22P02` 等）→ 時刻既定値と
+  FK `SET DEFAULT` の組（`0A000`）→ カタログ更新（単一 write txn 内で列型一致・再検証・FK 宣言整合
+  `42830`）。拒否はすべて commit 前で、カタログ・世代・行に痕跡を残さない。
+- **D1 型不一致は SET DEFAULT でだけ `42804`**: `ADD COLUMN`／`CREATE TABLE` の種別不一致 `42601` は
+  既存契約（TABLE-16、SQL-45 の確定待ち）のため据え置く。変換規則は共通化し、不一致エラーの生成だけ
+  を経路ごとに差し替える。DEFAULT を付けられない型（VECTOR 等）の `0A000`、長さ超過 `54000`、
+  VARCHAR(n) 超過 `22001`、書式不正 `22P02`／`22007`／`22008`、範囲外 `22003` は両経路で同一。
+- **D3 時刻値関数のミラー**: `CREATE TABLE ... DEFAULT now()` の列は `fill_value == default_expr ==
+  CurrentTime`（ミラー）。`fill_value` は定数に限る不変条件のため、SET／DROP で `default_expr` を変える
+  ときは `CurrentTime` の補完値を `None` に落とす。`ADD COLUMN` は時刻値関数の DEFAULT を拒否するので
+  `CurrentTime` の補完値は CREATE TABLE 由来に限られ、その列の全行は物理的に値を持つため補完値は
+  参照されない。定数のミラーの `fill_value` は変えない。
+- **D4 冪等**: 変更後の `default_expr` が現在値と等しければ commit・世代 bump なしで成功する
+  （既定値の無い列への DROP を含む。PostgreSQL と同じ）。
+- **D5 FK 参照アクション**: 変更後スキーマで宣言時検査を再実行する。`ON DELETE／UPDATE SET DEFAULT`
+  で参照される NOT NULL 列への DROP DEFAULT は `42830`、同じ列への時刻値関数の SET DEFAULT は
+  SQL 表層で `0A000`（カタログ側は多層防御で `42830`）。
+- **D6 並行 DDL**: 既定値は write txn の外で読んだ列型で作るため、カタログ API は期待する列型を受け取り、
+  write txn 内の列型と一致しなければ `Invalid`（`42601`）で拒否する。
+- **PostgreSQL との既知差分**: (1) ADD COLUMN の型不一致は `42601`、SET DEFAULT は `42804`。
+  (2) PostgreSQL は DROP DEFAULT を受理し FK の `SET DEFAULT` 実行時に `23502` を返すが、本 DB は宣言時
+  に `42830` で拒否する。(3) DEFAULT 式の列参照の `42P10`・部分クエリの `0A000` など SQL-45 の範囲は
+  CREATE TABLE と同じ現状のまま。
+- **範囲外**: 各書き込み経路（INSERT／UPSERT／COPY／NoSQL／`UPDATE ... SET c = DEFAULT`）が新しい
+  既定値を使うことの網羅的検証と content_hash／台帳の整合（#1629）、`DROP NOT NULL`（#1632）、
+  `COLUMN` 省略形・複数アクション、NoSQL 表層、wire-server 側の結合テスト。

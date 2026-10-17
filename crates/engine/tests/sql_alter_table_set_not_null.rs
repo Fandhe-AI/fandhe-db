@@ -216,8 +216,6 @@ fn unsupported_shapes_are_syntax_errors() {
     let (core, path, mut session) = setup("set-nn-shapes");
     let _guard = CleanupGuard(path);
     for sql in [
-        "ALTER TABLE docs ALTER COLUMN a SET DEFAULT 'x'",
-        "ALTER TABLE docs ALTER COLUMN a DROP DEFAULT",
         "ALTER TABLE docs ALTER COLUMN a DROP NOT NULL",
         "ALTER TABLE docs ALTER COLUMN a SET DATA TYPE TEXT",
         "ALTER TABLE docs ALTER a SET NOT NULL",
