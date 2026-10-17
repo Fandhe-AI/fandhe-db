@@ -13,6 +13,11 @@
 //! 起動され SIGKILL される想定、続けて `verify` サブコマンドで再オープン後の
 //! 索引と行データの整合性を検証される想定で作られている。
 //!
+//! Issue #1616（INDEX-9）で、`CREATE UNIQUE INDEX` 由来の一意制約も同じオラクルで検証する
+//! ため、2 つ目の表 `docs_uidx (code TEXT)` ＋ `CREATE UNIQUE INDEX IF NOT EXISTS
+//! docs_uidx_code ON docs_uidx (code)` を追加した。2 表は独立に id を採番・再開し、`verify` は
+//! 両表へ同じオラクルを適用する（`docs` は列制約 `UNIQUE`、`docs_uidx` は索引宣言由来）。
+//!
 //! サブコマンド:
 //! - `write <db_path>`: `docs (code TEXT UNIQUE)` テーブル（無ければ作成）へ、
 //!   `BATCH` 件の行を 1 `INSERT` 文（＝1 write トランザクション。UNIQUE 索引の
@@ -47,6 +52,10 @@ const CRASH_TOOL_TENANT_ID: &str = "crash-tool-unique-index-tenant";
 /// 1 `INSERT` 文（＝1 write トランザクション）で書き込む行数。行総数はこの値の
 /// 倍数になる（verify のバッチ整合オラクル。`crash_tool_cross_table.rs` と同方針）。
 const BATCH: u64 = 10;
+/// 検証対象の表。`docs` は列制約 `UNIQUE`、`docs_uidx` は `CREATE UNIQUE INDEX` 由来
+/// （Issue #1616・INDEX-9）の一意制約を持つ。
+const TABLES: [&str; 2] = ["docs", "docs_uidx"];
+
 /// 再開時に既存行の最大 id を求める `SELECT id FROM docs LIMIT n` の上限件数。
 /// `sql::allowlist` が SELECT の `LIMIT` に課す上限（1..=10000）と同じ値を使う
 /// （本ツール固有の制限ではなく SQL 表層の既存上限。この値を超える行数は
@@ -102,15 +111,28 @@ fn tenant_ctx() -> Result<PolicyContext, String> {
 }
 
 /// テーブルが無ければ作成する（既存 DB を再オープンした場合は
-/// `SqlSurfaceError::DuplicateTable` を無視して継続する）。
+/// `SqlSurfaceError::DuplicateTable` を無視して継続する）。`docs_uidx` の一意索引は
+/// `IF NOT EXISTS` で冪等に宣言する（Issue #1616・INDEX-9）。
 fn ensure_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
     let mut session = SessionState::default();
     session.allow_ddl();
     match core.execute_sql_in_session(ctx, &mut session, "CREATE TABLE docs (code TEXT UNIQUE)") {
-        Ok(_) => Ok(()),
-        Err(engine::sql::allowlist::SqlSurfaceError::DuplicateTable { .. }) => Ok(()),
-        Err(e) => Err(format!("create table failed: {e}")),
+        Ok(_) => {}
+        Err(engine::sql::allowlist::SqlSurfaceError::DuplicateTable { .. }) => {}
+        Err(e) => return Err(format!("create table failed: {e}")),
     }
+    match core.execute_sql_in_session(ctx, &mut session, "CREATE TABLE docs_uidx (code TEXT)") {
+        Ok(_) => {}
+        Err(engine::sql::allowlist::SqlSurfaceError::DuplicateTable { .. }) => {}
+        Err(e) => return Err(format!("create table failed: {e}")),
+    }
+    core.execute_sql_in_session(
+        ctx,
+        &mut session,
+        "CREATE UNIQUE INDEX IF NOT EXISTS docs_uidx_code ON docs_uidx (code)",
+    )
+    .map_err(|e| format!("create unique index failed: {e}"))?;
+    Ok(())
 }
 
 /// スキャン結果の件数が [`SCAN_LIMIT`] に達していないことを確認する。達して
@@ -128,12 +150,12 @@ fn check_scan_not_truncated(row_count: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// `SELECT id FROM docs` で最大 id を求め、次に書き込む行 id を返す
+/// `SELECT id FROM <table>` で最大 id を求め、次に書き込む行 id を返す
 /// （空テーブルなら 0 から。`crash_tool_cross_table.rs::find_resume_state` と
 /// 同じ「再起動のたびに既存状態から採番を続ける」設計）。
-fn find_next_row_id(core: &EngineCore, ctx: &PolicyContext) -> Result<u64, String> {
+fn find_next_row_id(core: &EngineCore, ctx: &PolicyContext, table: &str) -> Result<u64, String> {
     let result = core
-        .execute_sql(ctx, &format!("SELECT id FROM docs LIMIT {SCAN_LIMIT}"))
+        .execute_sql(ctx, &format!("SELECT id FROM {table} LIMIT {SCAN_LIMIT}"))
         .map_err(|e| format!("resume scan failed: {e}"))?;
     check_scan_not_truncated(result.rows.len())?;
     let max_id = result.rows.iter().map(|row| row.id).max();
@@ -159,48 +181,58 @@ fn write_inner(path: &str) -> Result<(), String> {
     let core = open_core(path)?;
     let ctx = tenant_ctx()?;
     ensure_table(&core, &ctx)?;
-    let mut next_row_id = find_next_row_id(&core, &ctx)?;
-    if !next_row_id.is_multiple_of(BATCH) {
-        return Err(format!(
-            "resumed row id {next_row_id} is not a multiple of BATCH ({BATCH}); \
-             a previous run must have left a partial batch, which the atomic \
-             per-statement commit contract should make impossible"
-        ));
+    // 2 表は独立に採番・再開する（kill が 2 表の INSERT の間に入っても各表の 0 起点連続性と
+    // BATCH の倍数性は崩れない）。
+    let mut next_row_ids = [0u64; TABLES.len()];
+    for (slot, table) in next_row_ids.iter_mut().zip(TABLES) {
+        *slot = find_next_row_id(&core, &ctx, table)?;
+        if !slot.is_multiple_of(BATCH) {
+            return Err(format!(
+                "resumed row id {slot} of {table} is not a multiple of BATCH ({BATCH}); \
+                 a previous run must have left a partial batch, which the atomic \
+                 per-statement commit contract should make impossible"
+            ));
+        }
     }
 
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
 
     for batch_no in 0..MAX_BATCHES {
-        // バッチ通番は「これまでにコミットした行数 / BATCH」からそのまま導出する
-        // （`crash_tool_cross_table.rs` と異なり専用の台帳テーブルを持たないため、
-        // 行 id の採番自体が単調増加かつ BATCH 単位でしか進まないことを利用する）。
-        let batch_seq = next_row_id / BATCH;
         let _ = batch_no;
-
-        let mut values = String::new();
-        for offset in 0..BATCH {
-            let id = next_row_id
-                .checked_add(offset)
-                .ok_or_else(|| "row id overflow while writing".to_string())?;
-            if offset > 0 {
-                values.push(',');
+        let mut progress = (0u64, 0u64);
+        for (index, (table, slot)) in TABLES.iter().zip(next_row_ids.iter_mut()).enumerate() {
+            // バッチ通番は「これまでにコミットした行数 / BATCH」からそのまま導出する
+            // （専用の台帳テーブルを持たないため、行 id の採番自体が単調増加かつ BATCH 単位
+            // でしか進まないことを利用する）。
+            let batch_seq = *slot / BATCH;
+            let mut values = String::new();
+            for offset in 0..BATCH {
+                let id = slot
+                    .checked_add(offset)
+                    .ok_or_else(|| "row id overflow while writing".to_string())?;
+                if offset > 0 {
+                    values.push(',');
+                }
+                values.push_str(&format!("({id}, 'code-{id}')"));
             }
-            values.push_str(&format!("({id}, 'code-{id}')"));
+            let sql = format!(
+                "INSERT INTO {table} (id, code) VALUES {values} USING OPERATION_ID 'op-{table}-{batch_seq}'"
+            );
+            core.execute_insert_sql(&ctx, &sql)
+                .map_err(|e| format!("insert failed at {table} batch_seq={batch_seq}: {e}"))?;
+            *slot = slot
+                .checked_add(BATCH)
+                .ok_or_else(|| "row id overflow after insert".to_string())?;
+            if index == 0 {
+                progress = (batch_seq, *slot);
+            }
         }
-        let sql = format!(
-            "INSERT INTO docs (id, code) VALUES {values} USING OPERATION_ID 'op-{batch_seq}'"
-        );
-        core.execute_insert_sql(&ctx, &sql)
-            .map_err(|e| format!("insert failed at batch_seq={batch_seq}: {e}"))?;
-        next_row_id = next_row_id
-            .checked_add(BATCH)
-            .ok_or_else(|| "row id overflow after insert".to_string())?;
 
         // 進捗行はスクリプト側が「書き込みが実際に進み始めた」ことを検知する同期点
         // なので、バッファリングで遅延しないよう毎回明示的に flush する
         // （`crash_tool_cross_table.rs` と同方針）。
-        writeln!(handle, "COMMITTED batch={batch_seq} rows={next_row_id}")
+        writeln!(handle, "COMMITTED batch={} rows={}", progress.0, progress.1)
             .map_err(|e| format!("stdout write failed: {e}"))?;
         handle
             .flush()
@@ -235,9 +267,22 @@ fn run_verify(path: &str) -> i32 {
 fn verify_inner(path: &str) -> Result<(u64, u64), String> {
     let core = open_core(path)?;
     let ctx = tenant_ctx()?;
+    // 両表に同じオラクルを適用する。報告する行数・バッチ数は `docs` のもの。
+    let mut summary = (0, 0);
+    for (index, table) in TABLES.iter().enumerate() {
+        let totals =
+            verify_table(&core, &ctx, table).map_err(|reason| format!("{table}: {reason}"))?;
+        if index == 0 {
+            summary = totals;
+        }
+    }
+    Ok(summary)
+}
 
+/// 1 表分の検証本体（行 id の連続性・BATCH 整合・読み取り専用の索引検証・重複プローブ）。
+fn verify_table(core: &EngineCore, ctx: &PolicyContext, table: &str) -> Result<(u64, u64), String> {
     let result = core
-        .execute_sql(&ctx, &format!("SELECT id FROM docs LIMIT {SCAN_LIMIT}"))
+        .execute_sql(ctx, &format!("SELECT id FROM {table} LIMIT {SCAN_LIMIT}"))
         .map_err(|e| format!("verify scan failed: {e}"))?;
     check_scan_not_truncated(result.rows.len())?;
     let mut ids: Vec<u64> = result.rows.iter().map(|row| row.id).collect();
@@ -280,7 +325,7 @@ fn verify_inner(path: &str) -> Result<(u64, u64), String> {
     // 前に、マーカーと各行の正引きエントリを読み取るだけで検証し、書き込みは
     // 一切行わない `verify_unique_index_read_only` を通す——ここで失敗すれば、
     // クラッシュ後の索引復旧が壊れていることを、再構築に隠蔽されずに検出できる。
-    core.verify_unique_index_read_only(&ctx, "docs")
+    core.verify_unique_index_read_only(ctx, table)
         .map_err(|e| {
             format!("read-only unique index verification failed before duplicate probes: {e}")
         })?;
@@ -294,8 +339,8 @@ fn verify_inner(path: &str) -> Result<(u64, u64), String> {
             .checked_add(id)
             .ok_or_else(|| "probe id overflow during verify".to_string())?;
         let probe_sql =
-            format!("INSERT INTO docs (id, code) VALUES ({probe_id}, 'code-{id}') USING OPERATION_ID 'verify-dup-{probe_id}'");
-        match core.execute_insert_sql(&ctx, &probe_sql) {
+            format!("INSERT INTO {table} (id, code) VALUES ({probe_id}, 'code-{id}') USING OPERATION_ID 'verify-dup-{probe_id}'");
+        match core.execute_insert_sql(ctx, &probe_sql) {
             Err(e) if e.wire_code() == "23505" => {}
             Err(e) => {
                 return Err(format!(

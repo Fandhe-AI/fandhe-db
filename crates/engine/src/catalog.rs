@@ -196,6 +196,11 @@ pub struct IndexDef {
     /// `USING hnsw`・`id`・照合を持てない型の列への指定は [`Storage::create_index`] が
     /// [`CatalogError::IndexCollationNotSupported`] で拒否する。
     pub collations: Vec<Option<crate::collation::Collation>>,
+    /// `CREATE UNIQUE INDEX` 由来の宣言か（Issue #1616・INDEX-9）。`true` の宣言は
+    /// [`Storage::create_index`] が対象テーブルの UNIQUE 制約（同名）と同一 write txn で
+    /// 登録し、[`Storage::drop_index`] が同一 txn で取り除く。強制は制約側が担い、本フラグは
+    /// 「この UNIQUE 制約は索引由来で `DROP CONSTRAINT` の対象外」の判定にだけ使う。
+    pub unique: bool,
 }
 
 impl IndexDef {
@@ -208,7 +213,15 @@ impl IndexDef {
             kind,
             columns,
             collations,
+            unique: false,
         }
+    }
+
+    /// 一意索引（`CREATE UNIQUE INDEX`。Issue #1616・INDEX-9）として宣言する。
+    /// [`Storage::create_index`] が UNIQUE 制約への展開を同一 txn で行う。
+    pub fn with_unique(mut self, unique: bool) -> Self {
+        self.unique = unique;
+        self
     }
 
     /// 列ごとの照合指定を与える（`collations` は `columns` と同じ長さであること。長さの
@@ -227,11 +240,22 @@ impl IndexDef {
 /// 5 行目に列と同じ数の照合トークン（`-` は指定なし、それ以外は
 /// [`crate::collation::Collation::catalog_token`]）をカンマ区切りで並べた `v2`
 /// （Issue #2191。旧バイナリは `v2` を未知の版として拒否する。前方互換はない）。
+/// 一意索引（Issue #1616・INDEX-9）は 5 行目に固定フラグ `unique` を持つ `v3`
+/// （スカラー・照合なしのみ。`v1`／`v2` のバイト列は不変）。
 /// 列名・テーブル名は [`validate_identifier`] を通過済みの前提（`,`・改行のいずれも
 /// 含み得ない）のため、区切り文字として安全に使える。
 fn encode_index_def(def: &IndexDef) -> Result<Vec<u8>> {
     let columns_csv = def.columns.join(",");
-    let text = if def.collations.iter().all(Option::is_none) {
+    let text = if def.unique {
+        // 一意索引（Issue #1616・INDEX-9）は `v3`。スカラー宣言かつ照合なしに限る
+        // （`create_index` が事前に保証する。破れていれば保存せず拒否する）。
+        if !matches!(def.kind, IndexKind::Scalar) || def.collations.iter().any(Option::is_some) {
+            return Err(CatalogError::Invalid(
+                "unique index must be a scalar index without collations".to_string(),
+            ));
+        }
+        format!("v3\n{}\nscalar\n{}\nunique", def.table, columns_csv)
+    } else if def.collations.iter().all(Option::is_none) {
         format!("v1\n{}\n{}\n{}", def.table, def.kind.as_str(), columns_csv)
     } else {
         let tokens: Vec<&str> = def
@@ -270,12 +294,13 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     let version = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema(format!("missing format version for index {name}"))
     })?;
-    if version != "v1" && version != "v2" {
+    if version != "v1" && version != "v2" && version != "v3" {
         return Err(CatalogError::CorruptSchema(format!(
             "unknown index catalog format version for index {name}"
         )));
     }
     let is_v2 = version == "v2";
+    let is_v3 = version == "v3";
     let table = lines
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema(format!("missing table for index {name}")))?
@@ -305,6 +330,14 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     } else {
         None
     };
+    if is_v3 {
+        // `v3` は一意索引専用: 種別は scalar、5 行目は固定フラグ `unique`（それ以外は破損）。
+        if !matches!(kind, IndexKind::Scalar) || lines.next() != Some("unique") {
+            return Err(CatalogError::CorruptSchema(format!(
+                "invalid unique index record for index {name}"
+            )));
+        }
+    }
     if lines.next().is_some() {
         return Err(CatalogError::CorruptSchema(format!(
             "unexpected trailing data for index {name}"
@@ -339,6 +372,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         kind,
         columns,
         collations,
+        unique: is_v3,
     })
 }
 
@@ -831,6 +865,147 @@ pub(crate) fn hnsw_targeted_in_txn(
             false
         }
     }
+}
+
+/// `name` が `table` に対する一意索引（`CREATE UNIQUE INDEX`。Issue #1616・INDEX-9）として
+/// [`INDEX_CATALOG_TABLE`] に登録済みかを write txn 内で判定する。`ALTER TABLE ... DROP
+/// CONSTRAINT` が索引由来の UNIQUE 制約を制約として扱わないための判定に使う。索引カタログ未作成は
+/// `false`。値の破損は `CorruptSchema` で fail-closed に返す。
+fn unique_index_def_for_table_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    name: &str,
+) -> Result<bool> {
+    let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(guard) = index_table.get(name)? else {
+        return Ok(false);
+    };
+    let def = decode_index_def(name, guard.value())?;
+    Ok(def.unique && def.table == table)
+}
+
+/// [`Storage::create_index`] の一意索引分岐（Issue #1616・INDEX-9）。`def`（`unique == true`）を
+/// 対象テーブルの UNIQUE 制約（索引名と同名）として追加した後のスキーマを返す。同一 write txn
+/// 内で呼ばれ、拒否は commit 前に返る（副作用ゼロ）。判定順（fail-closed。データに依存するのは
+/// 最後の重複走査だけ）: (1) 型ゲート（暗黙の `id`・一意キー許可型外は `IndexKindMismatch`）
+/// (2) 制約名前空間の衝突（UNIQUE・CHECK・FOREIGN KEY・主キー実効名。`ConstraintAlreadyExists`。
+/// `IF NOT EXISTS` でも握りつぶさない） (3) 制約数上限 (4) 追加後スキーマの [`validate_schema`]
+/// （同じ列並びの既存 UNIQUE との重複は `Invalid`） (5) 全テナント・全行の重複走査
+/// （テナントごとに独立。`UniqueConstraintViolation`）。
+fn build_unique_index_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    def: &IndexDef,
+    schema: &TableSchema,
+) -> Result<TableSchema> {
+    for col in &def.columns {
+        let allowed = schema
+            .columns
+            .iter()
+            .find(|c| &c.name == col)
+            .is_some_and(|c| c.ty.is_unique_constraint_allowed());
+        if !allowed {
+            return Err(CatalogError::IndexKindMismatch(format!(
+                "column {col} cannot be used in a unique index"
+            )));
+        }
+    }
+    let name = def.name.as_str();
+    let collides = schema.unique_constraints.iter().any(|u| u.name() == name)
+        || schema.checks.iter().any(|c| c.name == name)
+        || schema.foreign_keys.iter().any(|f| f.name() == name)
+        || name_collides_with_primary_key(schema, &def.table, name);
+    if collides {
+        return Err(CatalogError::ConstraintAlreadyExists(name.to_string()));
+    }
+    if schema.unique_constraints.len() >= MAX_UNIQUE_CONSTRAINTS {
+        return Err(CatalogError::ConstraintLimitExceeded(format!(
+            "table {} already has {MAX_UNIQUE_CONSTRAINTS} unique constraints",
+            def.table
+        )));
+    }
+    let mut constraints = schema.unique_constraints.clone();
+    constraints.push(UniqueConstraint::with_name(
+        def.name.clone(),
+        def.columns.clone(),
+    ));
+    let updated =
+        assign_unique_constraint_names(schema.clone().with_unique_constraints(constraints));
+    validate_schema(&updated)?;
+    let row_table_name = user_rows_table_name(&def.table);
+    match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+        Ok(row_table) => {
+            if crate::constraint::table_has_duplicate_unique_key(
+                &row_table,
+                &updated,
+                &def.columns,
+            )? {
+                return Err(CatalogError::UniqueConstraintViolation);
+            }
+        }
+        // 初回挿入前で行ストアが物理的に未作成（既存行 0 件）。
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(map_row_table_error(e)),
+    }
+    Ok(updated)
+}
+
+/// [`Storage::drop_index`] の一意索引分岐（Issue #1616・INDEX-9）。`def`（`unique == true`）と
+/// 同名の UNIQUE 制約を同一 write txn でスキーマから取り除く。制約が見つからなければ
+/// `CorruptSchema`（索引宣言とスキーマの不整合。fail-closed）。他の `FOREIGN KEY`（自己参照を
+/// 含む）の `parent_columns` の集合が一致する場合は `DependentObjectsStillExist`
+/// （`alter_table_drop_constraint` の UNIQUE 削除と対称。他の UNIQUE・PK が同じ集合を覆っていても
+/// 救済しない）。成功時は永続一意索引を無効化し、索引衛生（stale な `key_index` の刈り込み）を行う。
+fn drop_unique_index_constraint_in_txn(
+    write_txn: &redb::WriteTransaction,
+    def: &IndexDef,
+) -> Result<()> {
+    let corrupt = || {
+        CatalogError::CorruptSchema(format!(
+            "unique index {} has no matching unique constraint",
+            def.name
+        ))
+    };
+    let schema = match require_table_schema_write(write_txn, &def.table) {
+        Ok(s) => s,
+        Err(CatalogError::TableNotFound(_)) => return Err(corrupt()),
+        Err(e) => return Err(e),
+    };
+    let target_index = schema
+        .unique_constraints
+        .iter()
+        .position(|u| u.name() == def.name)
+        .ok_or_else(corrupt)?;
+    let target_set: std::collections::HashSet<&str> = schema
+        .unique_constraints
+        .get(target_index)
+        .ok_or_else(corrupt)?
+        .columns()
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    for (_referencing_schema, fk) in referencing_foreign_keys_in_txn(write_txn, &def.table)? {
+        let parent_set: std::collections::HashSet<&str> =
+            fk.parent_columns().iter().map(|s| s.as_str()).collect();
+        if parent_set == target_set {
+            return Err(CatalogError::DependentObjectsStillExist(def.name.clone()));
+        }
+    }
+    let mut constraints = schema.unique_constraints.clone();
+    constraints.remove(target_index);
+    let updated = schema.clone().with_unique_constraints(constraints);
+    let encoded = encode_schema(&updated)?;
+    {
+        let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+        catalog_table.insert(def.table.as_str(), encoded.as_slice())?;
+    }
+    write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
+    let required = required_key_index_names_in_txn(write_txn, &def.table)?;
+    crate::key_index::prune_unneeded_indexes_in_txn(write_txn, &def.table, &required)?;
+    Ok(())
 }
 
 /// `name` が [`INDEX_CATALOG_TABLE`] に索引名として登録済みかを write txn 内で
@@ -9347,6 +9522,12 @@ impl Storage {
         validate_identifier(table_name)?;
         validate_identifier(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        // `CREATE UNIQUE INDEX` 由来の UNIQUE 制約は制約としては扱わない（Issue #1616・
+        // INDEX-9）。名前解決より前に索引カタログで判定し、`DROP INDEX` でのみ外せるようにする
+        // （無ければ `schema.unique_constraints` の検索で成功してしまう）。
+        if unique_index_def_for_table_in_txn(&write_txn, table_name, name)? {
+            return Err(CatalogError::ConstraintNotFound(name.to_string()));
+        }
         let mut dropped_fk_parent_table: Option<String> = None;
         let mut dropped_primary_key = false;
         {
@@ -10266,6 +10447,14 @@ impl Storage {
             }
             let schema = require_table_schema_write(&write_txn, &def.table)?;
             validate_index_columns(def, &schema)?;
+            // 一意索引（Issue #1616・INDEX-9）: 型ゲート → 制約名前空間 → 件数上限 →
+            // 追加後スキーマの検証 → 既存行の重複走査 の順で、スキーマ側の UNIQUE 制約
+            // （強制の唯一の入力）を組み立てる。データに依存するのは最後の走査だけ。
+            let unique_schema = if def.unique {
+                Some(build_unique_index_schema_in_txn(&write_txn, def, &schema)?)
+            } else {
+                None
+            };
             let mut index_table = write_txn.open_table(INDEX_CATALOG_TABLE)?;
             if index_table.len()? >= MAX_INDEX_COUNT as u64 {
                 return Err(CatalogError::IndexLimitExceeded(
@@ -10273,6 +10462,16 @@ impl Storage {
                 ));
             }
             index_table.insert(def.name.as_str(), encoded.as_slice())?;
+            if let Some(updated) = &unique_schema {
+                let encoded_schema = encode_schema(updated)?;
+                let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+                catalog_table.insert(def.table.as_str(), encoded_schema.as_slice())?;
+            }
+        }
+        if def.unique {
+            // 永続一意索引を無効化する（`ADD UNIQUE` と同じ二重の安全策。各テナントは
+            // 次回の書き込み時に遅延再構築される）。
+            write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
         }
         bump_table_generation_in_txn(&write_txn, &def.table)?;
         // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。
@@ -10318,6 +10517,9 @@ impl Storage {
             }
             return Err(CatalogError::IndexNotFound(name.to_string()));
         };
+        if def.unique {
+            drop_unique_index_constraint_in_txn(&write_txn, &def)?;
+        }
         bump_table_generation_in_txn(&write_txn, &def.table)?;
         // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。理由は
         // `Storage::create_index` と同じ）。
@@ -11926,6 +12128,50 @@ mod tests {
                 String::from_utf8_lossy(bytes)
             );
         }
+    }
+
+    /// 一意索引（Issue #1616・INDEX-9）は `v3` で往復し、`unique == false` の `v1` を変えない。
+    /// 手で書き換えられた `v3`（hnsw・フラグ違い・フラグ欠落・余剰行）は fail-closed に拒否する。
+    #[test]
+    fn index_def_encoding_v3_round_trips_and_rejects_corruption() {
+        let unique = IndexDef::new(
+            "i".to_string(),
+            "docs".to_string(),
+            IndexKind::Scalar,
+            vec!["a".to_string(), "b".to_string()],
+        )
+        .with_unique(true);
+        let bytes = encode_index_def(&unique).expect("encode");
+        assert_eq!(bytes, b"v3\ndocs\nscalar\na,b\nunique".to_vec());
+        assert_eq!(decode_index_def("i", &bytes).expect("decode"), unique);
+        assert!(
+            !decode_index_def("i", b"v1\ndocs\nscalar\na,b")
+                .expect("decode")
+                .unique
+        );
+        for bytes in [
+            &b"v3\ndocs\nhnsw\na\nunique"[..],
+            b"v3\ndocs\nscalar\na\nuniq",
+            b"v3\ndocs\nscalar\na",
+            b"v3\ndocs\nscalar\na\nunique\nextra",
+        ] {
+            assert!(
+                matches!(
+                    decode_index_def("i", bytes),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        // 照合付き・hnsw の一意索引は保存しない。
+        let collated = unique
+            .clone()
+            .with_column_collations(vec![None, Some(crate::collation::Collation::JaIcu)]);
+        assert!(matches!(
+            encode_index_def(&collated),
+            Err(CatalogError::Invalid(_))
+        ));
     }
 
     /// 索引の照合は照合を持てる型のスカラー宣言の列にだけ付けられる（Issue #2191）。

@@ -11132,7 +11132,7 @@ pub(crate) fn validate_create_view_tokens(
     })
 }
 
-/// `CREATE INDEX <name> ON <table> [USING hnsw] (<col> [COLLATE <name>][, ...])` の許可形状構造
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> [USING hnsw] (<col> [COLLATE <name>][, ...])` の許可形状構造
 /// 検証結果（TASK-206・INDEX-7・SQL-23、Issue #908）。[`ValidatedDropTable`] と
 /// 同じくカタログ照会を一切行わない（列の存在・型整合・名前衝突・対象の種別は
 /// `sql::ddl::execute_create_index` → `catalog::Storage::create_index` が単一の
@@ -11150,9 +11150,17 @@ pub struct ValidatedCreateIndex {
     /// `columns` と同じ長さの列ごとの `COLLATE`（`None` は照合指定なし。Issue #2191・
     /// TABLE-28）。名前の解決は固定の許可リストとの完全一致だけで、カタログを参照しない。
     pub(crate) collations: Vec<Option<crate::collation::Collation>>,
+    /// `CREATE UNIQUE INDEX` か（Issue #1616・INDEX-9）。UNIQUE 制約への展開は
+    /// `catalog::Storage::create_index` が担う。
+    pub(crate) unique: bool,
 }
 
 impl ValidatedCreateIndex {
+    /// `CREATE UNIQUE INDEX` か。真のとき実行段は `IndexDef::with_unique(true)` で渡す。
+    pub fn is_unique(&self) -> bool {
+        self.unique
+    }
+
     /// `IF NOT EXISTS` 句の有無。真なら同名の関係があるとき実行段は何もせず成功を返す。
     pub fn if_not_exists(&self) -> bool {
         self.if_not_exists
@@ -11204,7 +11212,10 @@ impl ValidatedDropIndex {
 /// 分岐判定。`CREATE`・`INDEX` は予約語化せず文頭でのみ文脈的に照合する）。
 pub(crate) fn is_create_index_statement(tokens: &[Token]) -> bool {
     matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE"))
-        && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("INDEX"))
+        && (matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("INDEX"))
+            // `CREATE UNIQUE INDEX`（Issue #1616・INDEX-9）。
+            || (matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("UNIQUE"))
+                && matches!(tokens.get(2), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("INDEX"))))
 }
 
 /// 先頭 2 トークンが `DROP INDEX` か（[`is_create_index_statement`] と同じ流儀）。
@@ -11222,7 +11233,10 @@ pub(crate) fn is_drop_index_statement(tokens: &[Token]) -> bool {
 /// - 部分索引の `WHERE` 句 → `0A000`。
 /// - 列リストに重複する列名 → `42601`。列数上限超過 → `54000`。
 ///
-/// `UNIQUE`／`CONCURRENTLY`／`INCLUDE`／`WITH (...)`／
+/// - `UNIQUE` は `CREATE` 直後のみ受理（Issue #1616・INDEX-9）。`UNIQUE` かつ `USING hnsw`／
+///   `COLLATE` → `0A000`。
+///
+/// `CONCURRENTLY`／`INCLUDE`／`WITH (...)`／
 /// `ASC|DESC`／opclass・スキーマ修飾名・`$n` 等は、いずれも期待するトークン列と
 /// 一致しないため `expect_*` ヘルパー経由で構造的に `42601` へ落ちる。
 pub(crate) fn validate_create_index_tokens(
@@ -11230,6 +11244,13 @@ pub(crate) fn validate_create_index_tokens(
 ) -> Result<ValidatedCreateIndex, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     p.expect_ident_matching("CREATE")?;
+    // `UNIQUE` は `CREATE` と `INDEX` の間でだけ受理する（Issue #1616・INDEX-9）。
+    let unique = if p.peek_ident_matches("UNIQUE") {
+        p.advance();
+        true
+    } else {
+        false
+    };
     p.expect_ident_matching("INDEX")?;
     let if_not_exists = p.parse_optional_if_not_exists();
     // 名前を省いた `CREATE INDEX IF NOT EXISTS ON t (c)` は PostgreSQL 17 でも名前が
@@ -11281,6 +11302,18 @@ pub(crate) fn validate_create_index_tokens(
             )));
         }
     }
+    // 一意索引の未対応の組み合わせ（Issue #1616・INDEX-9。カタログ非参照の構文段で拒否）。
+    // 一意キーの正準化は照合を見ないため `COLLATE` 付きは受理しない。
+    if unique && hnsw {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "CREATE UNIQUE INDEX does not support USING hnsw".to_string(),
+        });
+    }
+    if unique && collations.iter().any(Option::is_some) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "CREATE UNIQUE INDEX does not support COLLATE".to_string(),
+        });
+    }
     // 部分索引（PostgreSQL 拡張構文）の `WHERE` 句は許可形状外の「機能」として
     // `0A000`（`expect_end_of_statement` の汎用検査に落とすと `42601` になる）。
     if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
@@ -11296,6 +11329,7 @@ pub(crate) fn validate_create_index_tokens(
         hnsw,
         columns,
         collations,
+        unique,
     })
 }
 
@@ -15690,6 +15724,38 @@ mod tests {
             ("CREATE INDEX i ON t (a COLLATE 'C')", "42601"),
             ("CREATE INDEX i ON t (lower(a) COLLATE \"C\")", "0A000"),
             ("CREATE INDEX i ON t (a COLLATE \"C\", a)", "42601"),
+        ] {
+            assert_eq!(parse(sql).expect_err(sql).wire_code(), code, "{sql}");
+        }
+    }
+
+    /// `CREATE UNIQUE INDEX`（Issue #1616・INDEX-9）。`UNIQUE` は `CREATE` 直後だけ受理し、
+    /// `USING hnsw`・`COLLATE` との組み合わせは構文段で `0A000`、分岐判定は両形を拾う。
+    #[test]
+    fn create_unique_index_parses_and_rejects_unsupported_combinations() {
+        use super::*;
+        let tokens = |sql: &str| crate::sql::lexer::tokenize(sql).expect("tokenize");
+        let parse = |sql: &str| validate_create_index_tokens(&tokens(sql));
+        let ok = parse("CREATE UNIQUE INDEX IF NOT EXISTS i ON t (a, b)").expect("accepted");
+        assert!(ok.is_unique() && ok.if_not_exists());
+        assert_eq!(ok.columns(), ["a", "b"]);
+        assert!(!parse("CREATE INDEX i ON t (a)").expect("plain").is_unique());
+        assert!(is_create_index_statement(&tokens(
+            "CREATE UNIQUE INDEX i ON t (a)"
+        )));
+        assert!(is_create_index_statement(&tokens(
+            "CREATE INDEX i ON t (a)"
+        )));
+        assert!(!is_create_index_statement(&tokens(
+            "CREATE UNIQUE i ON t (a)"
+        )));
+        for (sql, code) in [
+            ("CREATE UNIQUE INDEX i ON t USING hnsw (v)", "0A000"),
+            ("CREATE UNIQUE INDEX i ON t (a COLLATE \"C\")", "0A000"),
+            ("CREATE UNIQUE INDEX ON t (a)", "42601"),
+            ("CREATE INDEX UNIQUE i ON t (a)", "42601"),
+            ("CREATE UNIQUE UNIQUE INDEX i ON t (a)", "42601"),
+            ("CREATE UNIQUE INDEX i ON t (a, a)", "42601"),
         ] {
             assert_eq!(parse(sql).expect_err(sql).wire_code(), code, "{sql}");
         }
