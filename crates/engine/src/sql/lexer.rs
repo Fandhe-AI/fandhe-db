@@ -88,6 +88,8 @@ pub enum Token {
     JsonExistsAny,
     /// `?&`（すべてのキーが存在。最長一致で `?` より優先。TABLE-25・Issue #1598）。
     JsonExistsAll,
+    /// `&&`（配列の重なり。TABLE-35・Issue #1603）。単独の `&` は未対応文字のまま。
+    ArrayOverlap,
     /// `::`（SQL-42・Issue #1520）。
     TypeCast,
     /// `||`（SQL-42・Issue #1520）。
@@ -229,6 +231,7 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
             Token::JsonExists => out.push('?'),
             Token::JsonExistsAny => out.push_str("?|"),
             Token::JsonExistsAll => out.push_str("?&"),
+            Token::ArrayOverlap => out.push_str("&&"),
             Token::TypeCast => out.push_str("::"),
             Token::Concat => out.push_str("||"),
             Token::QualifiedIdent { qualifier, name } => {
@@ -602,6 +605,17 @@ fn tokenize_impl(
             if let Some(token) = token {
                 lookahead.next();
                 tokens.push(token);
+                chars = lookahead;
+                continue;
+            }
+        }
+        // `&&`（配列の重なり。TABLE-35・Issue #1603）。単独の `&` は未対応文字として拒否する。
+        if c == '&' {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if matches!(lookahead.peek(), Some(&(_, '&'))) {
+                lookahead.next();
+                tokens.push(Token::ArrayOverlap);
                 chars = lookahead;
                 continue;
             }
@@ -1527,6 +1541,11 @@ mod tests {
         assert_eq!(toks("a<@b"), vec![a(), JsonContainedBy, b()]);
         assert_eq!(toks("a ? b"), vec![a(), JsonExists, b()]);
         assert_eq!(toks("a ?| b"), vec![a(), JsonExistsAny, b()]);
+        assert_eq!(toks("a ?& b"), vec![a(), JsonExistsAll, b()]);
+        // Issue #1603（TABLE-35）: `&&` は配列の重なり。単独の `&` は字句エラーのまま。
+        assert_eq!(toks("a&&b"), vec![a(), ArrayOverlap, b()]);
+        assert_eq!(toks("a && b"), vec![a(), ArrayOverlap, b()]);
+        assert!(tokenize("a & b").is_err());
         assert_eq!(toks("a ?& b"), vec![a(), JsonExistsAll, b()]);
         // 既存の `<` 系の最長一致は不変。
         assert_eq!(toks("a <=> b")[1], DistanceOp);

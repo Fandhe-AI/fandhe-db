@@ -1616,7 +1616,9 @@ fn cast_operand_name(expr: &Expr) -> Option<String> {
         | Expr::ValueFunction { .. } => Some(default_expr_alias(expr)),
         Expr::Cast { expr, .. } => cast_operand_name(expr),
         Expr::Collate { expr, .. } => cast_operand_name(expr),
-        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => Some(default_expr_alias(expr)),
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
+            Some(default_expr_alias(expr))
+        }
         _ => None,
     }
 }
@@ -2267,6 +2269,128 @@ fn numeric_column_number_compare_as_filter(
     is_numeric.then(|| DeclarativeFilter::compare_numeric_literal(col.clone(), cmp, number.clone()))
 }
 
+/// `[Expression(l < r)] OR [Expression(l > r)]`（`a <> b` の脱糖形）が配列どうしの比較なら、
+/// 等値の否定 `ArrayCmpOp::Ne` の束縛式へ畳む。配列でなければ `None`（予算は消費しない。
+/// 呼び出し元が従来どおり各分岐を束縛する）。`where_negation` が `Eq` を `Lt`／`Gt` の
+/// 2 分岐へ展開する形に対応する（TABLE-35・Issue #1603）。
+fn bind_array_inequality_pair(
+    branches: &[Vec<WherePredicate>],
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Option<crate::sql::udf_call::BoundExpr> {
+    use crate::sql::udf_call::{ArrayCmpOp, BinOp, BoundExpr};
+    let [first, second] = branches else {
+        return None;
+    };
+    let (
+        [WherePredicate::Expression(Expr::Binary {
+            op: BinOp::Lt,
+            lhs: l1,
+            rhs: r1,
+        })],
+        [WherePredicate::Expression(Expr::Binary {
+            op: BinOp::Gt,
+            lhs: l2,
+            rhs: r2,
+        })],
+    ) = (first.as_slice(), second.as_slice())
+    else {
+        return None;
+    };
+    if l1 != l2 || r1 != r2 {
+        return None;
+    }
+    let eq = Expr::Binary {
+        op: BinOp::Eq,
+        lhs: l1.clone(),
+        rhs: r1.clone(),
+    };
+    let mut probe = *node_budget;
+    let (bound, _) = crate::sql::udf_call::bind_expr(&eq, schema, udfs, &mut probe).ok()?;
+    match bound {
+        BoundExpr::ArrayCompare {
+            op: ArrayCmpOp::Eq,
+            elem,
+            lhs,
+            rhs,
+        } => {
+            *node_budget = probe;
+            Some(BoundExpr::ArrayCompare {
+                op: ArrayCmpOp::Ne,
+                elem,
+                lhs,
+                rhs,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// AND 列の中の `Expression(l >= r)` と `Expression(l <= r)`（同一の両辺）の組が配列どうしの
+/// 比較なら、等値の束縛式 `ArrayCmpOp::Eq` へ畳む。`NOT (a <> b)` は `where_negation` が
+/// `a < b OR a > b` を否定して `a >= b AND a <= b` へ変えるため、順序比較を持たない要素型
+/// （jsonb）で拒否されないよう、括弧なしの `NOT a <> b`（専用処理）と結果を一致させる
+/// （TABLE-35・Issue #1603）。畳んだ述語の添字を `folded` に記録し、束縛済み式を返す。
+/// 配列でない組は触らず予算も消費しない。
+fn fold_array_equality_range_pairs(
+    predicates: &[WherePredicate],
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> (Vec<bool>, Vec<crate::sql::udf_call::BoundExpr>) {
+    use crate::sql::udf_call::{ArrayCmpOp, BinOp, BoundExpr};
+    let mut folded = vec![false; predicates.len()];
+    let mut bound_eqs = Vec::new();
+    for i in 0..predicates.len() {
+        if folded[i] {
+            continue;
+        }
+        let Some(WherePredicate::Expression(Expr::Binary {
+            op: BinOp::Ge,
+            lhs: l1,
+            rhs: r1,
+        })) = predicates.get(i)
+        else {
+            continue;
+        };
+        let partner = (0..predicates.len()).find(|&j| {
+            j != i
+                && !folded[j]
+                && matches!(
+                    predicates.get(j),
+                    Some(WherePredicate::Expression(Expr::Binary {
+                        op: BinOp::Le,
+                        lhs: l2,
+                        rhs: r2,
+                    })) if l1 == l2 && r1 == r2
+                )
+        });
+        let Some(j) = partner else {
+            continue;
+        };
+        let eq = Expr::Binary {
+            op: BinOp::Eq,
+            lhs: l1.clone(),
+            rhs: r1.clone(),
+        };
+        let mut probe = *node_budget;
+        if let Ok((
+            bound @ BoundExpr::ArrayCompare {
+                op: ArrayCmpOp::Eq, ..
+            },
+            _,
+        )) = crate::sql::udf_call::bind_expr(&eq, schema, udfs, &mut probe)
+        {
+            *node_budget = probe;
+            bound_eqs.push(bound);
+            folded[i] = true;
+            folded[j] = true;
+        }
+    }
+    (folded, bound_eqs)
+}
+
 /// [`bind_where_predicates`]・[`bind_check_predicates`] の再帰本体。トップレベルの
 /// 述語列だけでなく、[`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも
 /// 自分自身を再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。
@@ -2287,7 +2411,13 @@ fn bind_where_predicates_recursive(
     let mut expr_filters = Vec::new();
     let mut rls_predicate_present = false;
     let mut or_filters = Vec::new();
-    for predicate in where_predicates {
+    let (array_folded, array_eqs) =
+        fold_array_equality_range_pairs(where_predicates, schema, udfs, node_budget);
+    expr_filters.extend(array_eqs);
+    for (index, predicate) in where_predicates.iter().enumerate() {
+        if array_folded.get(index).copied().unwrap_or(false) {
+            continue;
+        }
         // Issue #1431・SQL-24: BOOLEAN 列 × 文字列の範囲比較・`IN`・`BETWEEN` は
         // 述語をその場で宣言的に扱える葉へ差し替え、以降の既存経路へ流す
         // （WHERE 文脈限定。CHECK は従来どおり拒否）。
@@ -2403,6 +2533,13 @@ fn bind_where_predicates_recursive(
                 });
             }
             WherePredicate::Or(branches) => {
+                // 配列の `<>`／`NOT a = b` は `where_negation` が `a < b OR a > b` へ脱糖するが、
+                // 順序比較を持たない要素型（jsonb）で拒否されないよう、等値の否定
+                // （`ArrayCmpOp::Ne`）の単一述語へ戻す（TABLE-35・Issue #1603）。
+                if let Some(ne) = bind_array_inequality_pair(branches, schema, udfs, node_budget) {
+                    expr_filters.push(ne);
+                    continue;
+                }
                 // TASK-208・SQL-24（Issue #912）: 各分岐を自分自身へ再帰的に
                 // 束縛する。`equality_ordinal` は再帰全体で共有するカウンタを
                 // そのまま渡し（ソース出現順＝深さ優先・左から右で数える契約）、
@@ -7647,7 +7784,7 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
         // 照合指定（TABLE-28・Issue #1609）は内側の式の列参照を集める。
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => collect_expr_idents(expr, out),
         // 配列コンストラクタ・添字（TABLE-35・Issue #1602）は子の列参照を集める。
-        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => {
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
             for c in expr.array_expr_children().into_iter().flatten() {
                 collect_expr_idents(c, out);
             }
@@ -8318,7 +8455,7 @@ fn rewrite_group_row_idents(
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
         },
-        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => {
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
             match expr.try_map_array_children(&mut |e| rec(e)) {
                 Some(r) => r?,
                 None => expr.clone(),

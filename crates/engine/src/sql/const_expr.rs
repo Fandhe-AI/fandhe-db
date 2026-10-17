@@ -159,7 +159,7 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
         }),
         // 配列コンストラクタ・添字（TABLE-35・Issue #1602）は子を再帰で検査する（列参照は
         // `Expr::Ident` の腕で `42703`）。評価結果の配列は `fold_const_literal` が配列テキストへ畳む。
-        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => expr
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
             .array_expr_children()
             .into_iter()
             .flatten()
@@ -253,7 +253,7 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         // 到達しない（`prescan` が拒否済み）。
         Expr::SqlJsonQuery(_) | Expr::Cast { .. } => Ok(()),
         // 配列の要素・添字は子ごとに精度を検査する（要素値の範囲は配列の構築側が検査する）。
-        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => expr
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
             .array_expr_children()
             .into_iter()
             .flatten()

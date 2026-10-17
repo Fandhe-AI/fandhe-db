@@ -24,7 +24,8 @@
 //! | `IsNull` | `negated` を反転（IS NULL は UNKNOWN にならず厳密に同値） |
 //! | 宣言的な葉 | `Not(leaf)` |
 //! | `Expression(a > b)` 等 | 演算子反転（`>`↔`<=`、`<`↔`>=`） |
-//! | `Expression(a = b)` | `Or([a < b], [a > b])`（`BinOp` に `<>` が無いため） |
+//! | `Expression(a = b)` | `Or([a < b], [a > b])`（`BinOp` に `<>` が無いため。`a <> b` もこの形へ脱糖） |
+//! | `Expression(x op ANY\|ALL (a))` | 量化子を反転し演算子を否定（TABLE-35・Issue #1603） |
 //! | `visible()` | `42601`（RLS-7: 否定越しに RLS 述語を扱わせない） |
 //! | `IN (SELECT)`／`EXISTS` | `Not(..)`（解決段 `sql::subquery` が NULL 規則込みで否定形を評価する。Issue #1191） |
 //! | `<col> <op> (SELECT)` | 演算子反転（`=`↔`<>`・`<`↔`>=`・`>`↔`<=`。Issue #1191） |
@@ -52,7 +53,7 @@ pub(crate) fn expr_node_count(expr: &Expr) -> usize {
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
             1usize.saturating_add(expr_node_count(expr))
         }
-        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => expr
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
             .array_expr_children()
             .into_iter()
             .flatten()
@@ -152,6 +153,20 @@ fn negate_one(
             inner_tokens,
             depth,
         }]),
+        // 量化比較の否定は量化子の反転と演算子の否定（`NOT (x = ANY a)` = `x <> ALL a`）。量化子の
+        // De Morgan は Kleene の三値論理でも厳密に成り立つ（空配列・NULL 要素・左辺 NULL を含む。
+        // TABLE-35・Issue #1603）。
+        WherePredicate::Expression(Expr::Quantified {
+            op,
+            quantifier,
+            lhs,
+            rhs,
+        }) => Ok(vec![WherePredicate::Expression(Expr::Quantified {
+            op: op.negated(),
+            quantifier: quantifier.flipped(),
+            lhs,
+            rhs,
+        })]),
         WherePredicate::Expression(Expr::Binary { op, lhs, rhs }) => match op {
             BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le => {
                 let flipped = match op {
@@ -254,6 +269,32 @@ mod tests {
             negate_conjunction(vec![cmp(BinOp::Eq, "id", "1")], &mut zero),
             Err(SqlSurfaceError::PayloadTooLarge { .. })
         ));
+    }
+
+    /// TABLE-35・Issue #1603: 量化比較の否定は量化子の反転と演算子の否定（二重否定で元に戻る）。
+    #[test]
+    fn quantified_negation_flips_quantifier_and_operator() {
+        use crate::sql::udf_call::{ArrayCmpOp, Quantifier};
+        let q = |op, quantifier| {
+            WherePredicate::Expression(Expr::Quantified {
+                op,
+                quantifier,
+                lhs: Box::new(Expr::Number("1".into())),
+                rhs: Box::new(Expr::Ident("a".into())),
+            })
+        };
+        let mut b = 100;
+        for (op, neg) in [
+            (ArrayCmpOp::Eq, ArrayCmpOp::Ne),
+            (ArrayCmpOp::Lt, ArrayCmpOp::Ge),
+            (ArrayCmpOp::Le, ArrayCmpOp::Gt),
+        ] {
+            let once =
+                negate_conjunction(vec![q(op, Quantifier::Any)], &mut b).expect("negate once");
+            assert_eq!(once, vec![q(neg, Quantifier::All)]);
+            let twice = negate_conjunction(once, &mut b).expect("negate twice");
+            assert_eq!(twice, vec![q(op, Quantifier::Any)]);
+        }
     }
 
     #[test]

@@ -147,7 +147,7 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
             reject_non_constant_with(expr, allow_placeholders)
         }
         // 配列コンストラクタ・添字（TABLE-35・Issue #1602）は子ごとに検査する。
-        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => expr
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
             .array_expr_children()
             .into_iter()
             .flatten()
