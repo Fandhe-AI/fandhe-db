@@ -1138,7 +1138,10 @@ fn named_expr_columns<'a>(
         // （VALUES の時刻関数列は構文形を自前で持つため DEFAULT の有無を問わない）。
         let ok = match col {
             VolatileColumn::Default(_) => matches!(
-                schema.columns.get(idx).and_then(|c| c.default.as_ref()),
+                schema
+                    .columns
+                    .get(idx)
+                    .and_then(|c| c.default_expr.as_ref()),
                 Some(crate::catalog::ColumnDefault::CurrentTime(_))
             ),
             VolatileColumn::Values(_, t) => schema
@@ -1166,7 +1169,7 @@ fn named_expr_columns<'a>(
             match col {
                 VolatileColumn::Default(_) => {
                     if let Some(crate::catalog::ColumnDefault::CurrentTime(t)) =
-                        column.default.as_ref()
+                        column.default_expr.as_ref()
                     {
                         out.push((
                             column.name.as_str(),

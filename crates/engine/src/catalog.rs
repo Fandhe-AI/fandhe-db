@@ -1157,19 +1157,33 @@ const CATALOG_FORMAT_VERSION_V12: &str = "v12";
 /// 拒否する（前方互換は持たない）。
 const CATALOG_FORMAT_VERSION_V13: &str = "v13";
 
+/// カタログ v14（TABLE-39・TABLE-5・TABLE-16、Issue #1627）。v13 の上位集合で、
+/// 列行が 7 フィールド `name:type:param:nullable:state:default:fill` になる
+/// （`default` は INSERT 既定値 `default_expr`、`fill` は読み出し時補完値
+/// `fill_value`。どちらも [`ColumnDefault::encode_catalog_field`] の形）。
+/// `pkname:` 行は常に書き（本体が空なら明示名なし）、`uniq:`／`checks:`／`fks:` は
+/// 0 件を許す（選択理由は補完値の食い違いのみで他の宣言とは独立なため）。
+/// **生存列のどれかが `fill_value != default_expr` のスキーマだけ**がこの版で書かれ、
+/// 食い違う列が無いスキーマは従来の版（v2〜v13）のバイト列のまま（正規形の一意性。
+/// 食い違い 0 件の v14 は decode で拒否する）。墓標の `default`／`fill` は `-` 固定。
+/// v14 を知らない旧バイナリは「未知のフォーマットバージョン」として fail-closed に
+/// 拒否する（前方互換は持たない）。
+const CATALOG_FORMAT_VERSION_V14: &str = "v14";
+
 /// `FOREIGN KEY` を持ちうるカタログフォーマット版の一覧（TABLE-17・TASK-205・
 /// TABLE-22・TASK-233、Issue #907・#1069）。[`referencing_foreign_keys_in_txn`]
 /// が候補行の絞り込みに使う唯一の情報源。**P0**: 新しい FK 保持版を追加する際は
 /// 必ずここへ追記すること——見落とすと参照先側の書き込み検査
 /// （`constraint::enforce_referencing_rows_in_txn`）と `DROP TABLE` の依存検査
 /// （`2BP01`）の双方が fail-open になる（advisor 指摘・codex-review 指摘）。
-const FK_BEARING_FORMAT_VERSIONS: [&str; 6] = [
+const FK_BEARING_FORMAT_VERSIONS: [&str; 7] = [
     CATALOG_FORMAT_VERSION_V8,
     CATALOG_FORMAT_VERSION_V9,
     CATALOG_FORMAT_VERSION_V10,
     CATALOG_FORMAT_VERSION_V11,
     CATALOG_FORMAT_VERSION_V12,
     CATALOG_FORMAT_VERSION_V13,
+    CATALOG_FORMAT_VERSION_V14,
 ];
 
 /// 1 テーブルが持てる `CHECK` 制約数の上限（TABLE-16・TASK-204、Issue #906。
@@ -1384,7 +1398,7 @@ fn name_collides_with_primary_key(schema: &TableSchema, table: &str, name: &str)
 
 /// カタログ値（エンコード済みバイト列）のバイト長上限。デコード前に検証し、
 /// 無制限な文字列アロケーションを防ぐ。
-const MAX_CATALOG_VALUE_LEN: usize = 1024 * 1024;
+const MAX_CATALOG_VALUE_LEN: usize = 2 * 1024 * 1024;
 
 /// [`Storage::list_tables`] が返せるテーブル数の上限（無制限 `Vec` 確保を避ける。
 /// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
@@ -3692,14 +3706,14 @@ impl TimeDefault {
 /// （`.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。
 pub const MAX_COLUMN_DEFAULT_LEN: usize = 1024;
 
-// `MAX_COLUMN_DEFAULT_LEN` を 16 進符号化（最大 2 倍）したうえで
-// `MAX_COLUMN_COUNT` 列ぶん連結しても、カタログ値全体の上限
+// `MAX_COLUMN_DEFAULT_LEN` を 16 進符号化（最大 2 倍）した `default` と `fill`
+// （v14。Issue #1627）の 2 フィールドを `MAX_COLUMN_COUNT` 列ぶん連結しても、カタログ値全体の上限
 // （`MAX_CATALOG_VALUE_LEN`）に十分収まることをコンパイル時に固定する
 // （プレフィックス 1 バイト・区切り文字・列名等の余地として 500,000 バイトの
 // 余裕を残す）。
 const _: () = assert!(
-    MAX_COLUMN_DEFAULT_LEN * 2 * MAX_COLUMN_COUNT + 500_000 <= MAX_CATALOG_VALUE_LEN,
-    "MAX_COLUMN_DEFAULT_LEN * 2 * MAX_COLUMN_COUNT must leave slack under MAX_CATALOG_VALUE_LEN"
+    MAX_COLUMN_DEFAULT_LEN * 2 * 2 * MAX_COLUMN_COUNT + 500_000 <= MAX_CATALOG_VALUE_LEN,
+    "MAX_COLUMN_DEFAULT_LEN * 2 fields * 2 * MAX_COLUMN_COUNT must leave slack under MAX_CATALOG_VALUE_LEN"
 );
 
 impl ColumnDefault {
@@ -3886,11 +3900,22 @@ pub struct ColumnDef {
     /// `DEFAULT <literal>` 句（TABLE-16・TASK-204、Issue #904）。`INSERT` で
     /// この列が省略された場合に補われる値。明示的な `NULL` には適用しない
     /// （TABLE-16。`sql::parser::bind_literal_for_column`／
-    /// `fill_omitted_columns` が唯一の適用点）。`ALTER TABLE ADD COLUMN` 後の既存行
-    /// の読み出し時補完（`row_codec::scan_scalar_columns_validated`）にも同じ値を
-    /// 使うため、作成後に変わらないこと（`ALTER COLUMN SET DEFAULT` を導入する場合は
-    /// 補完専用の値の分離が必要）が不変条件。
-    pub default: Option<ColumnDefault>,
+    /// `fill_omitted_columns` が唯一の適用点）。既存行の読み出し時補完には使わない
+    /// （それは [`ColumnDef::fill_value`] の責務。Issue #1627・TABLE-39 の前提として
+    /// 2 つの値を分離した。`ALTER COLUMN SET／DROP DEFAULT` は #1628 でこの値だけを変える）。
+    pub default_expr: Option<ColumnDefault>,
+    /// 読み出し時補完値（TABLE-5・Issue #1627）。`ALTER TABLE ADD COLUMN ... DEFAULT` より
+    /// 前に書かれた行（物理ペイロードが当該列を持たない行）を読むときに補う値で、
+    /// `row_codec` の読み出し経路（`decode_row`・`scan_scalar_columns_validated`・
+    /// `column_default_scalar_for_read`）と `TableSchema::materialized_default` だけが参照する。
+    ///
+    /// 不変条件: (a) `ColumnDefault::CurrentTime` を持たない（補完値は定数。例外は
+    /// `default_expr` と等しいミラー状態で、CREATE TABLE の時刻 DEFAULT 列の旧来表現）。
+    /// (b) 決まるのは `alter_table_add_column` の時点だけで、その後は ALTER COLUMN TYPE の
+    /// 変換でのみ変わる。(c) 現時点では全構築経路で `default_expr` と同じ値（ミラー）に
+    /// なり、食い違うのは #1628 以降。食い違う列を持つスキーマだけがカタログ v14 で
+    /// 永続化される。
+    pub fill_value: Option<ColumnDefault>,
     /// 列に明示した照合（`COLLATE "C"`／`"POSIX"`／`"und-x-icu"`／`"ja-x-icu"`。TABLE-28・
     /// Issue #1609・#2190）。`None` は「照合指定なし」で、明示した `C`／`POSIX` とは区別して
     /// 保存する。付けられるのは [`crate::collation::is_collatable`] な型だけ（encode・decode
@@ -3905,7 +3930,8 @@ impl ColumnDef {
             name: name.into(),
             ty,
             nullable,
-            default: None,
+            default_expr: None,
+            fill_value: None,
             collation: None,
         }
     }
@@ -3927,9 +3953,27 @@ impl ColumnDef {
     /// [`ColumnDef::new`] に `DEFAULT` を追加した版（TABLE-16・TASK-204、
     /// Issue #904）。`ColumnDef::new` の呼び出し元（約 1,200 箇所）を変えずに
     /// 済むよう、既定値の付与だけを別メソッドへ切り出す。
+    ///
+    /// `fill_value` も同じ値にする（ミラー。Issue #1627 の不変条件 (c)）。
     pub fn with_default(mut self, default: ColumnDefault) -> Self {
-        self.default = Some(default);
+        self.fill_value = Some(default.clone());
+        self.default_expr = Some(default);
         self
+    }
+
+    /// 読み出し時補完値だけを差し替える（Issue #1627）。`default_expr` と食い違わせる
+    /// 用途（カタログ v14 の往復検証・#1628 以降の ALTER COLUMN SET DEFAULT の前提構築）。
+    /// `ColumnDefault::CurrentTime` は `validate_schema` が拒否する。
+    pub fn with_fill_value(mut self, fill_value: Option<ColumnDefault>) -> Self {
+        self.fill_value = fill_value;
+        self
+    }
+
+    /// INSERT 既定値だけを変える内部 seam（#1628 の SET／DROP DEFAULT 用）。
+    /// `fill_value` は既存行の読み出し結果を守るため意図的に触らない。
+    #[allow(dead_code)]
+    pub(crate) fn set_default_expr(&mut self, default_expr: Option<ColumnDefault>) {
+        self.default_expr = default_expr;
     }
 }
 
@@ -4444,7 +4488,7 @@ impl TableSchema {
         let entries = self.bytea_defaults.0.get_or_init(|| {
             let mut out = Vec::new();
             for (i, c) in self.columns.iter().enumerate() {
-                let Some(ColumnDefault::Text(text)) = &c.default else {
+                let Some(ColumnDefault::Text(text)) = &c.fill_value else {
                     continue;
                 };
                 match &c.ty {
@@ -4488,7 +4532,7 @@ impl TableSchema {
             out
         });
         let entry = entries.iter().find(|e| e.logical_index == logical_index)?;
-        match self.columns.get(logical_index)?.default.as_ref()? {
+        match self.columns.get(logical_index)?.fill_value.as_ref()? {
             ColumnDefault::Text(current) if *current == entry.source => Some(entry),
             _ => None,
         }
@@ -4958,6 +5002,74 @@ fn validate_column(column: &ColumnDef) -> Result<()> {
     Ok(())
 }
 
+/// 列の `DEFAULT`（INSERT 既定値 `default_expr` と読み出し補完値 `fill_value`）が
+/// 列型に適合するかを検証する（[`validate_schema`] から 2 フィールドへ適用。Issue #1627）。
+fn validate_default_value(column: &ColumnDef, default: &ColumnDefault) -> Result<()> {
+    if !default.compatible_with(&column.ty) {
+        return Err(CatalogError::Invalid(format!(
+            "column {:?} has a DEFAULT that is not compatible with its type",
+            column.name
+        )));
+    }
+    // `VARCHAR(n)` の既定値は文字数が n 以下であること（超過した既定値は INSERT のたびに
+    // 長さ超過になるため定義時に拒否する。通常は DDL 段の `22001`〔Issue #1564〕が先に弾く最後の砦）。
+    if let (ColumnType::Varchar(Some(n)), ColumnDefault::Text(s)) = (&column.ty, default) {
+        if u32::try_from(s.chars().count()).map_or(true, |len| len > *n) {
+            return Err(CatalogError::Invalid(format!(
+                "column {:?} has a DEFAULT longer than its declared length",
+                column.name
+            )));
+        }
+    }
+    // `CHAR(n)` の既定値は n 文字へ空白詰め済みの形で保持する（保持値＝格納形。
+    // TABLE-31・Issue #1566）。詰め前の値は DDL 段が詰めてから渡す最後の砦。
+    if let (ColumnType::Bpchar(n), ColumnDefault::Text(s)) = (&column.ty, default) {
+        if !matches!(u32::try_from(s.chars().count()), Ok(len) if len == *n) {
+            return Err(CatalogError::Invalid(format!(
+                "column {:?} has a DEFAULT that is not blank-padded to its declared length",
+                column.name
+            )));
+        }
+    }
+    // JSON／JSONB の既定値は構文（JSONB は正規形も）を永続化前に検証する。
+    // カタログ decode 側が同じ検証を必須とする（`decode_schema_body`）ため、
+    // ここで拒否しないと Rust API 経由の作成が成功した後にスキーマが読み込み
+    // 不能になる（Issue #1337）。
+    if matches!(column.ty, ColumnType::Json | ColumnType::Jsonb)
+        && crate::row_codec::default_scalar(&column.ty, default).is_err()
+    {
+        return Err(CatalogError::Invalid(format!(
+            "column {:?} has a malformed JSON DEFAULT",
+            column.name
+        )));
+    }
+    // BYTEA の 16 進原文も同様に検証する（Issue #1373）。
+    if matches!(column.ty, ColumnType::Bytea)
+        && crate::row_codec::validate_default(&column.ty, default).is_err()
+    {
+        return Err(CatalogError::Invalid(format!(
+            "column {:?} has a malformed BYTEA DEFAULT",
+            column.name
+        )));
+    }
+    // 配列の `{..}` 原文も同様に検証する（Issue #1374）。ENUM 要素の配列は
+    // 呼び出し元の語彙が未解決の場合があり（スカラー ENUM の DEFAULT と同じ扱い）、
+    // ここでは照合しない。write txn 内の再検証（`create_table`・
+    // `alter_table_add_column`）と読み出し時のキャッシュ参照（失敗は拒否）で
+    // fail-closed を保つ。
+    if let ColumnType::Array(at) = &column.ty {
+        if at.enum_def().is_none()
+            && crate::row_codec::validate_default(&column.ty, default).is_err()
+        {
+            return Err(CatalogError::Invalid(format!(
+                "column {:?} has a malformed ARRAY DEFAULT",
+                column.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// スキーマ全体の検証（テーブル名・列定義・列数上限・列名重複・`VECTOR` 列数）。
 /// `create_table`・`alter_table_add_column`（追加後のスキーマ）の両方から呼ばれる。
 ///
@@ -4998,68 +5110,21 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
         // ものだけを許可する（`VECTOR` は常に不可）。SQL 表層の構文検証
         // （`sql::allowlist::parse_create_table_column`）をすり抜けた場合も、
         // Rust API 直接構築の場合も、ここで fail-closed に拒否する。
-        if let Some(default) = &column.default {
-            if !default.compatible_with(&column.ty) {
-                return Err(CatalogError::Invalid(format!(
-                    "column {:?} has a DEFAULT that is not compatible with its type",
-                    column.name
-                )));
-            }
-            // `VARCHAR(n)` の既定値は文字数が n 以下であること（超過した既定値は INSERT のたびに
-            // 長さ超過になるため定義時に拒否する。通常は DDL 段の `22001`〔Issue #1564〕が先に弾く最後の砦）。
-            if let (ColumnType::Varchar(Some(n)), ColumnDefault::Text(s)) = (&column.ty, default) {
-                if u32::try_from(s.chars().count()).map_or(true, |len| len > *n) {
-                    return Err(CatalogError::Invalid(format!(
-                        "column {:?} has a DEFAULT longer than its declared length",
-                        column.name
-                    )));
-                }
-            }
-            // `CHAR(n)` の既定値は n 文字へ空白詰め済みの形で保持する（保持値＝格納形。
-            // TABLE-31・Issue #1566）。詰め前の値は DDL 段が詰めてから渡す最後の砦。
-            if let (ColumnType::Bpchar(n), ColumnDefault::Text(s)) = (&column.ty, default) {
-                if !matches!(u32::try_from(s.chars().count()), Ok(len) if len == *n) {
-                    return Err(CatalogError::Invalid(format!(
-                        "column {:?} has a DEFAULT that is not blank-padded to its declared length",
-                        column.name
-                    )));
-                }
-            }
-            // JSON／JSONB の既定値は構文（JSONB は正規形も）を永続化前に検証する。
-            // カタログ decode 側が同じ検証を必須とする（`decode_schema_body`）ため、
-            // ここで拒否しないと Rust API 経由の作成が成功した後にスキーマが読み込み
-            // 不能になる（Issue #1337）。
-            if matches!(column.ty, ColumnType::Json | ColumnType::Jsonb)
-                && crate::row_codec::default_scalar(&column.ty, default).is_err()
+        if let Some(default) = &column.default_expr {
+            validate_default_value(column, default)?;
+        }
+        if let Some(fill) = &column.fill_value {
+            validate_default_value(column, fill)?;
+            // 補完値は定数に限る（不変条件 (a)）。時刻 DEFAULT は読み出し時補完が常に
+            // 失敗するため、INSERT 既定値と等しいミラー状態（CREATE TABLE の旧来表現）
+            // 以外では拒否する。
+            if matches!(fill, ColumnDefault::CurrentTime(_))
+                && column.default_expr.as_ref() != Some(fill)
             {
                 return Err(CatalogError::Invalid(format!(
-                    "column {:?} has a malformed JSON DEFAULT",
+                    "column {:?} has a fill value that is not a constant",
                     column.name
                 )));
-            }
-            // BYTEA の 16 進原文も同様に検証する（Issue #1373）。
-            if matches!(column.ty, ColumnType::Bytea)
-                && crate::row_codec::validate_default(&column.ty, default).is_err()
-            {
-                return Err(CatalogError::Invalid(format!(
-                    "column {:?} has a malformed BYTEA DEFAULT",
-                    column.name
-                )));
-            }
-            // 配列の `{..}` 原文も同様に検証する（Issue #1374）。ENUM 要素の配列は
-            // 呼び出し元の語彙が未解決の場合があり（スカラー ENUM の DEFAULT と同じ扱い）、
-            // ここでは照合しない。write txn 内の再検証（`create_table`・
-            // `alter_table_add_column`）と読み出し時のキャッシュ参照（失敗は拒否）で
-            // fail-closed を保つ。
-            if let ColumnType::Array(at) = &column.ty {
-                if at.enum_def().is_none()
-                    && crate::row_codec::validate_default(&column.ty, default).is_err()
-                {
-                    return Err(CatalogError::Invalid(format!(
-                        "column {:?} has a malformed ARRAY DEFAULT",
-                        column.name
-                    )));
-                }
             }
         }
     }
@@ -5359,12 +5424,12 @@ fn validate_referential_action_declaration(schema: &TableSchema, fk: &ForeignKey
         // 主体の文が無く、評価時刻を再送で再現できないため。SQL-37・Issue #1587、設計 D9）。
         // SQL 表層は `sql::ddl` が先に `0A000` で拒否するため、ここは Rust API・decode の
         // 多層防御（fail-closed）。
-        if uses_set_default && matches!(column.default, Some(ColumnDefault::CurrentTime(_))) {
+        if uses_set_default && matches!(column.default_expr, Some(ColumnDefault::CurrentTime(_))) {
             return Err(CatalogError::InvalidForeignKey(format!(
                 "column {name} has a time function DEFAULT and cannot use the SET DEFAULT referential action"
             )));
         }
-        if uses_set_default && !column.nullable && column.default.is_none() {
+        if uses_set_default && !column.nullable && column.default_expr.is_none() {
             return Err(CatalogError::InvalidForeignKey(format!(
                 "column {name} is NOT NULL without a DEFAULT and cannot use the SET DEFAULT referential action"
             )));
@@ -6037,6 +6102,29 @@ fn encode_column_line_v5(
     ))
 }
 
+/// [`encode_column_line_v5`] の v14 版（7 フィールド。末尾に `fill`。Issue #1627）。
+/// 墓標行は `default`／`fill` とも `None`（`-`）で渡す。
+fn encode_column_line_v14(
+    name: &str,
+    type_name: &str,
+    param_field: &str,
+    nullable: bool,
+    state: char,
+    default: Option<&ColumnDefault>,
+    fill: Option<&ColumnDefault>,
+) -> Result<String> {
+    let mut line = encode_column_line_v5(name, type_name, param_field, nullable, state, default)?;
+    // 末尾の改行を fill フィールドの後ろへ移す。
+    line.pop();
+    line.push(':');
+    match fill {
+        None => line.push('-'),
+        Some(d) => line.push_str(&d.encode_catalog_field()?),
+    }
+    line.push('\n');
+    Ok(line)
+}
+
 /// `schema` のいずれかの `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が列
 /// `column_name` を参照しているか（`ALTER TABLE` の依存オブジェクト検査用）。
 ///
@@ -6686,7 +6774,16 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     let schema = assign_foreign_key_constraint_names(schema);
     let schema = &schema;
     validate_schema(schema)?;
-    let has_default = schema.columns.iter().any(|c| c.default.is_some());
+    let has_default = schema
+        .columns
+        .iter()
+        .any(|c| c.default_expr.is_some() || c.fill_value.is_some());
+    // v14 選択条件（Issue #1627）: 補完値が INSERT 既定値と食い違う生存列を 1 つでも
+    // 持つスキーマのみ（最優先）。食い違いが無ければ従来の版のバイト列を変えない。
+    let has_fill_divergence = schema
+        .columns
+        .iter()
+        .any(|c| c.fill_value != c.default_expr);
     let has_unique = !schema.unique_constraints.is_empty();
     let has_check = !schema.checks.is_empty();
     let has_fk = !schema.foreign_keys.is_empty();
@@ -6756,7 +6853,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         .primary_key_name
         .as_deref()
         .filter(|n| *n != primary_key_constraint_name(&schema.name));
-    if has_named_fk || pk_name_explicit.is_some() {
+    if has_fill_divergence || has_named_fk || pk_name_explicit.is_some() {
         // カタログ v12（設計 F4。TABLE-22・TASK-233、Issue #1069）: v11 の
         // 上位集合で、`uniq:`／`checks:` セクションは 0 件を許し（この枝へ来る
         // 判断材料は FK の実名のみで UNIQUE・CHECK の有無とは独立なため）、
@@ -6765,7 +6862,9 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         // v13（Issue #1364）は v12 と同じ本体に `pk:` 行の直後の `pkname:` 行を
         // 足しただけの上位集合で、同じ出力経路を共有する（UNIQUE・FK の名前は
         // 常に明示形で書く）。
-        out.push_str(if pk_name_explicit.is_some() {
+        out.push_str(if has_fill_divergence {
+            CATALOG_FORMAT_VERSION_V14
+        } else if pk_name_explicit.is_some() {
             CATALOG_FORMAT_VERSION_V13
         } else {
             CATALOG_FORMAT_VERSION_V12
@@ -6780,30 +6879,58 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         out.push_str(&format!("pk:{pk_field}\n"));
         if let Some(pk_name) = pk_name_explicit {
             out.push_str(&format!("pkname:{pk_name}\n"));
+        } else if has_fill_divergence {
+            // v14 は `pkname:` 行を常に書く（空＝明示名なし。`pkname` という列名の列行と
+            // 区別できなくなるため任意行にしない）。
+            out.push_str("pkname:\n");
         }
         for slot in schema.physical_slots() {
             match slot {
                 PhysicalSlot::Live(_, column) => {
                     let (type_name, param_field) = column.catalog_fields()?;
-                    out.push_str(&encode_column_line_v5(
-                        &column.name,
-                        type_name,
-                        &param_field,
-                        column.nullable,
-                        'L',
-                        column.default.as_ref(),
-                    )?);
+                    if has_fill_divergence {
+                        out.push_str(&encode_column_line_v14(
+                            &column.name,
+                            type_name,
+                            &param_field,
+                            column.nullable,
+                            'L',
+                            column.default_expr.as_ref(),
+                            column.fill_value.as_ref(),
+                        )?);
+                    } else {
+                        out.push_str(&encode_column_line_v5(
+                            &column.name,
+                            type_name,
+                            &param_field,
+                            column.nullable,
+                            'L',
+                            column.default_expr.as_ref(),
+                        )?);
+                    }
                 }
                 PhysicalSlot::Dropped(dropped) => {
                     let (type_name, param_field) = dropped.ty().catalog_fields();
-                    out.push_str(&encode_column_line_v5(
-                        dropped.name(),
-                        type_name,
-                        &param_field,
-                        true,
-                        'D',
-                        None,
-                    )?);
+                    if has_fill_divergence {
+                        out.push_str(&encode_column_line_v14(
+                            dropped.name(),
+                            type_name,
+                            &param_field,
+                            true,
+                            'D',
+                            None,
+                            None,
+                        )?);
+                    } else {
+                        out.push_str(&encode_column_line_v5(
+                            dropped.name(),
+                            type_name,
+                            &param_field,
+                            true,
+                            'D',
+                            None,
+                        )?);
+                    }
                 }
             }
         }
@@ -6852,7 +6979,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
                         &param_field,
                         column.nullable,
                         'L',
-                        column.default.as_ref(),
+                        column.default_expr.as_ref(),
                     )?);
                 }
                 PhysicalSlot::Dropped(dropped) => {
@@ -6929,7 +7056,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
                         &param_field,
                         column.nullable,
                         'L',
-                        column.default.as_ref(),
+                        column.default_expr.as_ref(),
                     )?);
                 }
                 PhysicalSlot::Dropped(dropped) => {
@@ -7095,6 +7222,53 @@ fn decode_schema_with_resolver(
     })
 }
 
+/// カタログ列行の `default`／`fill` フィールド 1 つをデコードし、型別の完全検証を行う
+/// （`decode_schema_body` から INSERT 既定値と読み出し補完値の両方へ適用。Issue #1627）。
+/// 不正なものはスキーマを読み込み不能にする（fail-closed）。`column` は `ty` と `name`
+/// だけを参照する。
+fn decode_column_default_checked(column: &ColumnDef, field: &str) -> Result<Option<ColumnDefault>> {
+    let decoded = ColumnDefault::decode_catalog_field(field)?;
+    let Some(default) = &decoded else {
+        return Ok(decoded);
+    };
+    // JSON／JSONB の既定値は読み出し時補完が再検証を省く
+    // （`row_codec::default_scalar_for_read`。Issue #1337）ため、
+    // 構文・JSONB 正規形の完全検証をここ（デコード時）で済ませ、
+    // 破損カタログ値を読み込み不能にする（fail-closed）。
+    if matches!(column.ty, ColumnType::Json | ColumnType::Jsonb) {
+        crate::row_codec::default_scalar(&column.ty, default).map_err(|_| {
+            CatalogError::Invalid(format!(
+                "column {:?} has a malformed JSON DEFAULT",
+                column.name
+            ))
+        })?;
+    }
+    // BYTEA の既定値も読み出し時にキャッシュへデコードするため、
+    // 破損した 16 進はここで読み込み不能にする（fail-closed。Issue #1373）。
+    if matches!(column.ty, ColumnType::Bytea) {
+        crate::row_codec::validate_default(&column.ty, default).map_err(|_| {
+            CatalogError::Invalid(format!(
+                "column {:?} has a malformed BYTEA DEFAULT",
+                column.name
+            ))
+        })?;
+    }
+    // 配列の既定値も読み出し時にキャッシュへ実体化するため、破損した
+    // `{..}` 原文はここで読み込み不能にする（fail-closed。Issue #1374）。
+    // ENUM 要素は `validate_schema` と同じ理由で照合しない。
+    if let ColumnType::Array(at) = &column.ty {
+        if at.enum_def().is_none() {
+            crate::row_codec::validate_default(&column.ty, default).map_err(|_| {
+                CatalogError::Invalid(format!(
+                    "column {:?} has a malformed ARRAY DEFAULT",
+                    column.name
+                ))
+            })?;
+        }
+    }
+    Ok(decoded)
+}
+
 fn decode_schema_body(
     table_name: &str,
     bytes: &[u8],
@@ -7137,6 +7311,7 @@ fn decode_schema_body(
         V11,
         V12,
         V13,
+        V14,
     }
     let format_version = match version_line {
         CATALOG_FORMAT_VERSION_LINE => FormatVersion::V2,
@@ -7151,6 +7326,7 @@ fn decode_schema_body(
         CATALOG_FORMAT_VERSION_V11 => FormatVersion::V11,
         CATALOG_FORMAT_VERSION_V12 => FormatVersion::V12,
         CATALOG_FORMAT_VERSION_V13 => FormatVersion::V13,
+        CATALOG_FORMAT_VERSION_V14 => FormatVersion::V14,
         other => {
             return Err(CatalogError::Invalid(format!(
                 "unknown catalog format version: {other:?}"
@@ -7177,6 +7353,7 @@ fn decode_schema_body(
             | FormatVersion::V11
             | FormatVersion::V12
             | FormatVersion::V13
+            | FormatVersion::V14
     );
     // `pk:` 行を持つのは v4〜v13（v4 は非空必須、v5〜v12 は空を「主キー
     // なし」として許容する）。
@@ -7192,6 +7369,7 @@ fn decode_schema_body(
             | FormatVersion::V11
             | FormatVersion::V12
             | FormatVersion::V13
+            | FormatVersion::V14
     );
 
     let cols_line = lines.next().ok_or_else(|| {
@@ -7251,14 +7429,19 @@ fn decode_schema_body(
         None
     };
     // v13 専用: `pk:` 行の直後の `pkname:` 行（Issue #1364）。
-    let primary_key_name: Option<String> = if format_version == FormatVersion::V13 {
-        Some(
-            parse_primary_key_name_line(&mut lines, primary_key.as_deref(), Some(table_name))
-                .map_err(CatalogError::Invalid)?,
-        )
-    } else {
-        None
-    };
+    // v14（Issue #1627）は `pkname:` を常に持ち、空本体を許す。
+    let primary_key_name: Option<String> =
+        if matches!(format_version, FormatVersion::V13 | FormatVersion::V14) {
+            parse_primary_key_name_line(
+                &mut lines,
+                primary_key.as_deref(),
+                Some(table_name),
+                format_version == FormatVersion::V14,
+            )
+            .map_err(CatalogError::Invalid)?
+        } else {
+            None
+        };
 
     // 残り行を、宣言スロット数（slot_count。上で MAX_COLUMN_COUNT 以下と検証済み）を
     // 超えない範囲でのみ構築する。旧実装の `lines.collect()` は残り行数が
@@ -7312,6 +7495,15 @@ fn decode_schema_body(
             } else {
                 None
             };
+        // v14（Issue #1627）は 7 番目に読み出し時補完値 `fill` を必須で持つ。
+        let fill_field =
+            if format_version == FormatVersion::V14 {
+                Some(fields.next().ok_or_else(|| {
+                    CatalogError::Invalid(format!("malformed column line: {line:?}"))
+                })?)
+            } else {
+                None
+            };
         if fields.next().is_some() {
             return Err(CatalogError::Invalid(format!(
                 "malformed column line: {line:?}"
@@ -7344,52 +7536,23 @@ fn decode_schema_body(
                     // decode 側は「fail-closed（不正な default はスキーマ自体を
                     // 読み込み不能にする）」方針。`ColumnDefault::compatible_with`
                     // による型整合は後続の `validate_schema` が担う。
-                    column.default = ColumnDefault::decode_catalog_field(field)?;
-                    // JSON／JSONB の既定値は読み出し時補完が再検証を省く
-                    // （`row_codec::default_scalar_for_read`。Issue #1337）ため、
-                    // 構文・JSONB 正規形の完全検証をここ（デコード時）で済ませ、
-                    // 破損カタログ値を読み込み不能にする（fail-closed）。
-                    if matches!(column.ty, ColumnType::Json | ColumnType::Jsonb) {
-                        if let Some(default) = &column.default {
-                            crate::row_codec::default_scalar(&column.ty, default).map_err(
-                                |_| {
-                                    CatalogError::Invalid(format!(
-                                        "column {:?} has a malformed JSON DEFAULT",
-                                        column.name
-                                    ))
-                                },
-                            )?;
-                        }
+                    column.default_expr = decode_column_default_checked(&column, field)?;
+                    // v2〜v13 は補完値と INSERT 既定値が常に同じ（ミラー。Issue #1627）。
+                    column.fill_value = column.default_expr.clone();
+                }
+                if let Some(field) = fill_field {
+                    // v14 は補完値を別フィールドから読む。時刻 DEFAULT の補完値は
+                    // INSERT 既定値と等しいミラー状態以外では拒否する（不変条件 (a)）。
+                    let fill = decode_column_default_checked(&column, field)?;
+                    if matches!(fill, Some(ColumnDefault::CurrentTime(_)))
+                        && fill != column.default_expr
+                    {
+                        return Err(CatalogError::Invalid(format!(
+                            "column {:?} has a fill value that is not a constant",
+                            column.name
+                        )));
                     }
-                    // BYTEA の既定値も読み出し時にキャッシュへデコードするため、
-                    // 破損した 16 進はここで読み込み不能にする（fail-closed。Issue #1373）。
-                    if matches!(column.ty, ColumnType::Bytea) {
-                        if let Some(default) = &column.default {
-                            crate::row_codec::validate_default(&column.ty, default).map_err(
-                                |_| {
-                                    CatalogError::Invalid(format!(
-                                        "column {:?} has a malformed BYTEA DEFAULT",
-                                        column.name
-                                    ))
-                                },
-                            )?;
-                        }
-                    }
-                    // 配列の既定値も読み出し時にキャッシュへ実体化するため、破損した
-                    // `{..}` 原文はここで読み込み不能にする（fail-closed。Issue #1374）。
-                    // ENUM 要素は `validate_schema` と同じ理由で照合しない。
-                    if let ColumnType::Array(at) = &column.ty {
-                        if let (None, Some(default)) = (at.enum_def(), &column.default) {
-                            crate::row_codec::validate_default(&column.ty, default).map_err(
-                                |_| {
-                                    CatalogError::Invalid(format!(
-                                        "column {:?} has a malformed ARRAY DEFAULT",
-                                        column.name
-                                    ))
-                                },
-                            )?;
-                        }
-                    }
+                    column.fill_value = fill;
                 }
                 columns.push(column);
             }
@@ -7402,6 +7565,11 @@ fn decode_schema_body(
                             "dropped column {name:?} must not declare a DEFAULT"
                         )));
                     }
+                }
+                if fill_field.is_some_and(|f| f != "-") {
+                    return Err(CatalogError::Invalid(format!(
+                        "dropped column {name:?} must not declare a fill value"
+                    )));
                 }
                 // 墓標は照合を持たない（encode 側は合成しない。TABLE-28・Issue #1609）。
                 if collation.is_some() {
@@ -7454,9 +7622,19 @@ fn decode_schema_body(
     // v5 なのに DEFAULT 0 件は形式の一意性に反する（同一スキーマが v2／v3／v4
     // と v5 の 2 通りにエンコードされ得る状態を許さない。TABLE-16・TASK-204、
     // Issue #904。TABLE-19 D2 と同じ設計判断）。
-    if format_version == FormatVersion::V5 && !columns.iter().any(|c| c.default.is_some()) {
+    if format_version == FormatVersion::V5 && !columns.iter().any(|c| c.default_expr.is_some()) {
         return Err(CatalogError::Invalid(
             "v5 catalog format requires at least one column with a DEFAULT".to_string(),
+        ));
+    }
+    // v14 なのに補完値が INSERT 既定値と食い違う列が 0 件は形式の一意性に反する
+    // （食い違いが無ければ従来の版で書く。Issue #1627。v3／v5 と同じ設計判断）。
+    if format_version == FormatVersion::V14
+        && !columns.iter().any(|c| c.fill_value != c.default_expr)
+    {
+        return Err(CatalogError::Invalid(
+            "v14 catalog format requires at least one column whose fill value differs from its DEFAULT"
+                .to_string(),
         ));
     }
 
@@ -7488,11 +7666,13 @@ fn decode_schema_body(
             .collect(),
         // v12（設計 F4・Issue #1069）は名前付き FK の有無のみで選ばれる形式で
         // あり UNIQUE の有無とは独立なため、0 件を許容する（`allow_empty = true`）。
-        FormatVersion::V12 | FormatVersion::V13 => parse_unique_section(&mut lines, true, true)
-            .map_err(CatalogError::Invalid)?
-            .into_iter()
-            .map(|(name, cols)| UniqueConstraint::with_name(name.unwrap_or_default(), cols))
-            .collect(),
+        FormatVersion::V12 | FormatVersion::V13 | FormatVersion::V14 => {
+            parse_unique_section(&mut lines, true, true)
+                .map_err(CatalogError::Invalid)?
+                .into_iter()
+                .map(|(name, cols)| UniqueConstraint::with_name(name.unwrap_or_default(), cols))
+                .collect()
+        }
         _ => Vec::new(),
     };
     // v7 専用の `checks:` セクション（TABLE-16・TASK-204、Issue #906）。構造は
@@ -7505,7 +7685,8 @@ fn decode_schema_body(
         | FormatVersion::V10
         | FormatVersion::V11
         | FormatVersion::V12
-        | FormatVersion::V13 => {
+        | FormatVersion::V13
+        | FormatVersion::V14 => {
             parse_check_section(&mut lines, format_version != FormatVersion::V7)
                 .map_err(CatalogError::Invalid)?
         }
@@ -7535,7 +7716,7 @@ fn decode_schema_body(
         FormatVersion::V12 => {
             parse_foreign_key_section_v12(&mut lines, false).map_err(CatalogError::Invalid)?
         }
-        FormatVersion::V13 => {
+        FormatVersion::V13 | FormatVersion::V14 => {
             parse_foreign_key_section_v12(&mut lines, true).map_err(CatalogError::Invalid)?
         }
         _ => Vec::new(),
@@ -7570,7 +7751,11 @@ fn decode_schema_body(
     // 呼んでも安全だが、意図を明示するため分岐する）。
     let schema = if matches!(
         format_version,
-        FormatVersion::V10 | FormatVersion::V11 | FormatVersion::V12 | FormatVersion::V13
+        FormatVersion::V10
+            | FormatVersion::V11
+            | FormatVersion::V12
+            | FormatVersion::V13
+            | FormatVersion::V14
     ) {
         schema
     } else {
@@ -7580,7 +7765,10 @@ fn decode_schema_body(
     // F3・Issue #1069）。v12 はすでに実名を持つため素通しする
     // （`assign_foreign_key_constraint_names` は空名の制約にのみ作用するため
     // 呼んでも安全だが、意図を明示するため分岐する）。
-    let schema = if matches!(format_version, FormatVersion::V12 | FormatVersion::V13) {
+    let schema = if matches!(
+        format_version,
+        FormatVersion::V12 | FormatVersion::V13 | FormatVersion::V14
+    ) {
         schema
     } else {
         assign_foreign_key_constraint_names(schema)
@@ -7602,6 +7790,8 @@ type ParsedUniqueConstraints = Vec<(Option<String>, Vec<String>)>;
 /// [`catalog_value_references_enum_type`] の両方が使い、fail-closed 判定を
 /// 1 か所に揃える（[`parse_unique_section`] と同じ理由）。
 ///
+/// v14（Issue #1627）は `allow_empty = true` で空の本体を `None`（明示名なし）として受ける。
+///
 /// 検証項目: 行の存在・`pkname:` 接頭辞・識別子として妥当（長さ上限を含む）・
 /// 主キー宣言（`pk:` 行が非空）を伴うこと・導出名 `<table>_pkey` と異なること
 /// （導出名は無名と同じ正規形で書くため、v13 には現れない）。UNIQUE・CHECK・FK
@@ -7610,13 +7800,18 @@ fn parse_primary_key_name_line<'a>(
     lines: &mut impl Iterator<Item = &'a str>,
     primary_key: Option<&[String]>,
     table_name: Option<&str>,
-) -> std::result::Result<String, String> {
+    allow_empty: bool,
+) -> std::result::Result<Option<String>, String> {
     let line = lines
         .next()
         .ok_or_else(|| "catalog value truncated: missing pkname line".to_string())?;
     let name = line
         .strip_prefix("pkname:")
         .ok_or_else(|| "malformed pkname line".to_string())?;
+    // v14（Issue #1627）は `pkname:` 行を常に書き、空は「明示名なし」を表す。
+    if name.is_empty() && allow_empty {
+        return Ok(None);
+    }
     if name.is_empty() || name.len() > MAX_IDENTIFIER_LEN {
         return Err("malformed pkname line".to_string());
     }
@@ -7627,7 +7822,7 @@ fn parse_primary_key_name_line<'a>(
     if table_name.is_some_and(|t| name == primary_key_constraint_name(t)) {
         return Err("pkname must differ from the derived primary key name".to_string());
     }
-    Ok(name.to_string())
+    Ok(Some(name.to_string()))
 }
 
 /// カタログ v6 の `uniq:` セクション（`uniq:<n>` 行と `n` 個の
@@ -8072,13 +8267,15 @@ impl Storage {
                 if let ColumnType::Array(array_ty) = &column.ty {
                     if let Some(def) = array_ty.enum_def() {
                         let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
-                        if column.default.is_some() {
+                        if column.default_expr.is_some() || column.fill_value.is_some() {
                             let mut checked = column.clone();
                             checked.ty = ColumnType::Array(
                                 ArrayType::new_enum(registered, array_ty.max_len())?
                                     .with_ndims(array_ty.ndims())?,
                             );
-                            if crate::row_codec::validate_column_default(&checked).is_err() {
+                            if crate::row_codec::validate_column_default(&checked).is_err()
+                                || crate::row_codec::validate_column_fill_value(&checked).is_err()
+                            {
                                 return Err(CatalogError::Invalid(
                                     "column has an ARRAY DEFAULT that is not valid for its \
                                      element type"
@@ -8090,10 +8287,12 @@ impl Storage {
                 }
                 if let ColumnType::Enum(def) = &column.ty {
                     let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
-                    if column.default.is_some() {
+                    if column.default_expr.is_some() || column.fill_value.is_some() {
                         let mut checked = column.clone();
                         checked.ty = ColumnType::Enum(registered);
-                        if crate::row_codec::validate_column_default(&checked).is_err() {
+                        if crate::row_codec::validate_column_default(&checked).is_err()
+                            || crate::row_codec::validate_column_fill_value(&checked).is_err()
+                        {
                             return Err(CatalogError::Invalid(
                                 "column has a DEFAULT that is not a registered ENUM label"
                                     .to_string(),
@@ -8297,12 +8496,24 @@ impl Storage {
         // 時刻値関数の DEFAULT は既存行の補完値を固定できず、読み出し時補完が常に失敗して
         // テーブルを読めなくするため、Rust API 直接呼び出しでも拒否する（多層防御。SQL 表層は
         // `sql::allowlist` が `0A000` で先に拒否する。SQL-37・Issue #1587、設計 D10）。
-        if matches!(column.default, Some(ColumnDefault::CurrentTime(_))) {
+        if matches!(column.default_expr, Some(ColumnDefault::CurrentTime(_)))
+            || matches!(column.fill_value, Some(ColumnDefault::CurrentTime(_)))
+        {
             return Err(CatalogError::Invalid(
                 "time function DEFAULT is not supported in ALTER TABLE ADD COLUMN".to_string(),
             ));
         }
-        if crate::row_codec::validate_column_default(&column).is_err() {
+        // 補完値を決めるのはこの ADD COLUMN の時点だけ（Issue #1627 不変条件 (b)）。
+        // 現状は INSERT 既定値と同じ値のみ受け付ける（食い違いは #1628 以降の ALTER で生じる）。
+        if column.fill_value != column.default_expr {
+            return Err(CatalogError::Invalid(
+                "column added via ALTER TABLE ADD COLUMN must have a fill value equal to its DEFAULT"
+                    .to_string(),
+            ));
+        }
+        if crate::row_codec::validate_column_default(&column).is_err()
+            || crate::row_codec::validate_column_fill_value(&column).is_err()
+        {
             return Err(CatalogError::Invalid(
                 "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT".to_string(),
             ));
@@ -8311,7 +8522,7 @@ impl Storage {
         // 関係なく拒否する（fail-closed）。行ストア（全テナント）を調べて成否を
         // 変えると、他テナントの行の存在が DDL 主体へ漏れる（テナント境界 P0）。
         // 判定はカタログ・行に依存しないためここ（txn 開始前）で行う。
-        if !column.nullable && column.default.is_none() {
+        if !column.nullable && column.default_expr.is_none() {
             return Err(CatalogError::Invalid(
                 "NOT NULL column added via ALTER TABLE ADD COLUMN requires a DEFAULT".to_string(),
             ));
@@ -8331,7 +8542,9 @@ impl Storage {
                             .with_ndims(array_ty.ndims())?,
                     );
                     // 登録済みの語彙で DEFAULT を再検証する（Issue #1374）。
-                    if crate::row_codec::validate_column_default(&column).is_err() {
+                    if crate::row_codec::validate_column_default(&column).is_err()
+                        || crate::row_codec::validate_column_fill_value(&column).is_err()
+                    {
                         return Err(CatalogError::Invalid(
                             "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT"
                                 .to_string(),
@@ -8345,7 +8558,9 @@ impl Storage {
                 // 定義へ置き換えた後で DEFAULT を再検証する。省略すると未登録ラベルが
                 // 既定値として永続化され、既存行の読み出し時補完が常に失敗する
                 // （Issue #1282）。
-                if crate::row_codec::validate_column_default(&column).is_err() {
+                if crate::row_codec::validate_column_default(&column).is_err()
+                    || crate::row_codec::validate_column_fill_value(&column).is_err()
+                {
                     return Err(CatalogError::Invalid(
                         "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT"
                             .to_string(),
@@ -9739,12 +9954,14 @@ impl Storage {
                 AlterPlan::ValidateSmallIntRange
                     | AlterPlan::Rewrite(crate::column_rewrite::WideningKind::BigIntToSmallInt)
             ) {
-                if let Some(ColumnDefault::Number(raw) | ColumnDefault::Text(raw)) = &column.default
-                {
-                    if raw.trim().parse::<i16>().is_err() {
-                        return Err(AlterCheckError::Sql(SqlSurfaceError::numeric_out_of_range(
-                            "smallint out of range",
-                        )));
+                // INSERT 既定値と読み出し補完値の両方を検査する（Issue #1627）。
+                for slot in [&column.default_expr, &column.fill_value] {
+                    if let Some(ColumnDefault::Number(raw) | ColumnDefault::Text(raw)) = slot {
+                        if raw.trim().parse::<i16>().is_err() {
+                            return Err(AlterCheckError::Sql(
+                                SqlSurfaceError::numeric_out_of_range("smallint out of range"),
+                            ));
+                        }
                     }
                 }
             }
@@ -9757,16 +9974,19 @@ impl Storage {
                 plan,
                 AlterPlan::Rewrite(crate::column_rewrite::WideningKind::CharFamily)
             ) {
-                if let Some(ColumnDefault::Text(raw)) = &column.default {
-                    let converted = crate::row_codec::convert_char_family(
-                        &column.ty,
-                        &new_ty,
-                        raw,
-                        MAX_COLUMN_DEFAULT_LEN,
-                    )
-                    .map_err(|e| AlterCheckError::Sql(e.into()))?
-                    .into_owned();
-                    column.default = Some(ColumnDefault::Text(converted));
+                // INSERT 既定値と読み出し補完値の両方を変換する（Issue #1627）。
+                for slot in [&mut column.default_expr, &mut column.fill_value] {
+                    if let Some(ColumnDefault::Text(raw)) = slot {
+                        let converted = crate::row_codec::convert_char_family(
+                            &column.ty,
+                            &new_ty,
+                            raw,
+                            MAX_COLUMN_DEFAULT_LEN,
+                        )
+                        .map_err(|e| AlterCheckError::Sql(e.into()))?
+                        .into_owned();
+                        *slot = Some(ColumnDefault::Text(converted));
+                    }
                 }
             }
             column.ty = new_ty;
@@ -10990,6 +11210,9 @@ fn catalog_value_references_enum_type_in_table(
         // v13（Issue #1364）は v12 の上位集合で、`pk:` 行の直後に `pkname:` 行を
         // 持つ（下記で `decode_schema_body` と同じ共有パーサーで検証する）。
         CATALOG_FORMAT_VERSION_V13 => (true, true),
+        // v14（Issue #1627）は v13 の上位集合で、`pkname:` 行を常に持ち、列行が
+        // 7 番目に `fill` を持つ（下記で `decode_schema_body` と同じ契約を検証する）。
+        CATALOG_FORMAT_VERSION_V14 => (true, true),
         other => {
             return Err(CatalogError::CorruptSchema(format!(
                 "unknown catalog format version: {other:?}"
@@ -11006,8 +11229,18 @@ fn catalog_value_references_enum_type_in_table(
     let is_v11 = version_line == CATALOG_FORMAT_VERSION_V11;
     let is_v12 = version_line == CATALOG_FORMAT_VERSION_V12;
     let is_v13 = version_line == CATALOG_FORMAT_VERSION_V13;
-    let has_pk_line =
-        is_v4 || is_v5 || is_v6 || is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13;
+    let is_v14 = version_line == CATALOG_FORMAT_VERSION_V14;
+    let has_pk_line = is_v4
+        || is_v5
+        || is_v6
+        || is_v7
+        || is_v8
+        || is_v9
+        || is_v10
+        || is_v11
+        || is_v12
+        || is_v13
+        || is_v14;
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema("catalog value truncated: missing cols line".to_string())
@@ -11073,11 +11306,9 @@ fn catalog_value_references_enum_type_in_table(
     };
     // v13 の `pkname:` 行（Issue #1364）。名前空間の衝突検査は列・制約セクションを
     // 読み終えてから行う。
-    let pk_name: Option<String> = if is_v13 {
-        Some(
-            parse_primary_key_name_line(&mut lines, pk_cols.as_deref(), table_name)
-                .map_err(CatalogError::CorruptSchema)?,
-        )
+    let pk_name: Option<String> = if is_v13 || is_v14 {
+        parse_primary_key_name_line(&mut lines, pk_cols.as_deref(), table_name, is_v14)
+            .map_err(CatalogError::CorruptSchema)?
     } else {
         None
     };
@@ -11093,8 +11324,11 @@ fn catalog_value_references_enum_type_in_table(
     // `DROP TYPE`／`ALTER TYPE` の fail-closed 依存関係検査だけがすり抜けて
     // しまう）。
     let mut seen_default = false;
+    let mut seen_fill_divergence = false;
     let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for _ in 0..col_count {
+        // 列ごとにデコードした INSERT 既定値（v14 の `fill` との比較用。Issue #1627）。
+        let mut v14_default_seen: Option<ColumnDefault> = None;
         let line = lines.next().ok_or_else(|| {
             CatalogError::CorruptSchema("catalog value truncated: missing column line".to_string())
         })?;
@@ -11150,17 +11384,50 @@ fn catalog_value_references_enum_type_in_table(
             if is_live {
                 let decoded = ColumnDefault::decode_catalog_field(default_field)
                     .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
-                if let Some(default) = decoded {
-                    if !column_default_compatible_with_tag(&default, tag) {
+                if let Some(default) = &decoded {
+                    if !column_default_compatible_with_tag(default, tag) {
                         return Err(CatalogError::CorruptSchema(format!(
                             "column {name:?} has a DEFAULT that is not compatible with its type"
                         )));
                     }
                     seen_default = true;
                 }
+                v14_default_seen = decoded;
             } else if default_field != "-" {
                 return Err(CatalogError::CorruptSchema(format!(
                     "dropped column {name:?} must not declare a DEFAULT"
+                )));
+            }
+        }
+        // v14 の 7 番目フィールド `fill`（Issue #1627）。`decode_schema_body` と同じ
+        // fail-closed 契約: 墓標は `-` 固定、生存列は既存デコーダで検証し型タグと整合し、
+        // 時刻 DEFAULT は INSERT 既定値と等しいミラー状態以外では拒否する。
+        // 補完値が INSERT 既定値と食い違う列が 0 件の v14 も拒否する（正規形の一意性）。
+        if is_v14 {
+            let fill_field = fields.next().ok_or_else(|| {
+                CatalogError::CorruptSchema(format!("malformed column line: {line:?}"))
+            })?;
+            if is_live {
+                let fill = ColumnDefault::decode_catalog_field(fill_field)
+                    .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+                if let Some(fill_default) = &fill {
+                    if !column_default_compatible_with_tag(fill_default, tag) {
+                        return Err(CatalogError::CorruptSchema(format!(
+                            "column {name:?} has a fill value that is not compatible with its type"
+                        )));
+                    }
+                }
+                if fill != v14_default_seen {
+                    seen_fill_divergence = true;
+                }
+                if matches!(fill, Some(ColumnDefault::CurrentTime(_))) && fill != v14_default_seen {
+                    return Err(CatalogError::CorruptSchema(format!(
+                        "column {name:?} has a fill value that is not a constant"
+                    )));
+                }
+            } else if fill_field != "-" {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "dropped column {name:?} must not declare a fill value"
                 )));
             }
         }
@@ -11211,7 +11478,7 @@ fn catalog_value_references_enum_type_in_table(
         // カタログが本関数だけ「依存なし」に丸められ、ENUM 依存判定の
         // fail-closed 判定が `validate_schema` 側と食い違う）。
         parse_unique_section(&mut lines, false, true).map_err(CatalogError::CorruptSchema)?
-    } else if is_v12 || is_v13 {
+    } else if is_v12 || is_v13 || is_v14 {
         // v12（設計 F4・Issue #1069）は名前付き FK の有無のみで選ばれる形式で
         // あり UNIQUE の有無とは独立なため、0 件を許容する（`allow_empty = true`）。
         // v13（Issue #1364）も主キーの明示名のみで選ばれるため同様。
@@ -11225,10 +11492,10 @@ fn catalog_value_references_enum_type_in_table(
     // られるため、`decode_schema_body` と同じ共有パーサーで構造を検証し、
     // 参照列の実在・制約名の一意性も下で検証する。
     let checks: Vec<CheckConstraint> =
-        if is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13 {
+        if is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13 || is_v14 {
             parse_check_section(
                 &mut lines,
-                is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13,
+                is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13 || is_v14,
             )
             .map_err(CatalogError::CorruptSchema)?
         } else {
@@ -11253,7 +11520,7 @@ fn catalog_value_references_enum_type_in_table(
         parse_foreign_key_section(&mut lines, false, true).map_err(CatalogError::CorruptSchema)?
     } else if is_v12 {
         parse_foreign_key_section_v12(&mut lines, false).map_err(CatalogError::CorruptSchema)?
-    } else if is_v13 {
+    } else if is_v13 || is_v14 {
         parse_foreign_key_section_v12(&mut lines, true).map_err(CatalogError::CorruptSchema)?
     } else {
         Vec::new()
@@ -11301,6 +11568,12 @@ fn catalog_value_references_enum_type_in_table(
     // 返し続ける（codex-review P1 指摘・Issue #904・PR #1051）。
     // v6 は UNIQUE 制約の有無で選ばれる形式であり DEFAULT 0 件でも正当なため、
     // この不変条件は v5 に限る（`decode_schema_body` と同じ）。
+    if is_v14 && !seen_fill_divergence {
+        return Err(CatalogError::CorruptSchema(
+            "v14 catalog format requires at least one column whose fill value differs from its DEFAULT"
+                .to_string(),
+        ));
+    }
     if is_v5 && !seen_default {
         return Err(CatalogError::CorruptSchema(
             "v5 catalog format requires at least one column with a DEFAULT".to_string(),
@@ -12866,7 +13139,9 @@ mod tests {
     fn validate_schema_checks_json_and_jsonb_defaults() {
         let build = |ty: ColumnType, text: &str| {
             let mut col = ColumnDef::new("j", ty, true);
-            col.default = Some(ColumnDefault::Text(text.to_string()));
+            let default = ColumnDefault::Text(text.to_string());
+            col.default_expr = Some(default.clone());
+            col.fill_value = Some(default);
             TableSchema::new("docs", vec![col])
         };
         assert!(validate_schema(&build(ColumnType::Json, "{\"a\": 1}")).is_ok());
@@ -13037,7 +13312,10 @@ mod tests {
             .iter()
             .find(|c| c.name == "lang")
             .expect("lang column present");
-        assert_eq!(lang.default, Some(ColumnDefault::Text("ja".to_string())));
+        assert_eq!(
+            lang.default_expr,
+            Some(ColumnDefault::Text("ja".to_string()))
+        );
     }
 
     /// 主キーの導出擬似名（Issue #1196）: 通常長は `<table>_pkey`、識別子長の上限に
@@ -18084,6 +18362,249 @@ mod tests {
                 vec![ColumnDef::new("a", ty.clone(), true).with_collation(Collation::C)],
             );
             assert!(encode_schema(&schema).is_err(), "{ty:?} must be rejected");
+        }
+    }
+
+    // ---- Issue #1627: 補完値（fill_value）と INSERT 既定値（default_expr）の分離 ----
+
+    fn diverging_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, false),
+                ColumnDef::new("b", ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("ins".to_string()))
+                    .with_fill_value(Some(ColumnDefault::Text("old".to_string()))),
+                ColumnDef::new("c", ColumnType::Integer, true)
+                    .with_default(ColumnDefault::Number("5".to_string()))
+                    .with_fill_value(None),
+                ColumnDef::new("d", ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("same".to_string())),
+            ],
+        )
+    }
+
+    /// 食い違う列があるときだけ v14 で書かれ、往復で `default_expr`／`fill_value` が一致する。
+    #[test]
+    fn v14_roundtrips_diverging_fill_value() {
+        let schema = diverging_schema();
+        let bytes = encode_schema(&schema).expect("encode");
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        assert!(text.starts_with("v14\n"), "{text}");
+        assert!(text.contains("\npkname:\n"), "{text}");
+        let decoded = decode_schema("docs", &bytes).expect("decode");
+        assert_eq!(decoded, schema);
+        assert_eq!(
+            decoded.columns[1].fill_value,
+            Some(ColumnDefault::Text("old".to_string()))
+        );
+        assert_eq!(decoded.columns[2].fill_value, None);
+        assert_eq!(encode_schema(&decoded).expect("re-encode"), bytes);
+    }
+
+    /// 幅広テーブルで `default`／`fill` が全列で最大長かつ食い違っても v14 の
+    /// エンコードが上限内で成功し、往復する（Issue #1627 Bugbot 指摘）。
+    #[test]
+    fn v14_widest_table_with_max_len_default_and_fill_encodes() {
+        let cols = (0..MAX_COLUMN_COUNT)
+            .map(|i| {
+                ColumnDef::new(format!("c{i}"), ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("a".repeat(MAX_COLUMN_DEFAULT_LEN)))
+                    .with_fill_value(Some(ColumnDefault::Text(
+                        "b".repeat(MAX_COLUMN_DEFAULT_LEN),
+                    )))
+            })
+            .collect::<Vec<_>>();
+        let schema = TableSchema::new("wide", cols);
+        let bytes = encode_schema(&schema).expect("encode");
+        assert!(bytes.len() <= MAX_CATALOG_VALUE_LEN);
+        assert_eq!(decode_schema("wide", &bytes).expect("decode"), schema);
+    }
+
+    /// 主キー明示名・UNIQUE・FK と v14 を組み合わせても往復する。
+    #[test]
+    fn v14_roundtrips_with_pk_name_unique_and_fk() {
+        let mut schema = diverging_schema()
+            .with_primary_key(vec!["a".to_string()])
+            .with_primary_key_name(Some("custom_pk".to_string()))
+            .with_unique_constraints(vec![UniqueConstraint::new(vec!["d".to_string()])]);
+        schema = schema.with_foreign_keys(vec![ForeignKeyDef::new(
+            vec!["d".to_string()],
+            "parent".to_string(),
+            vec!["k".to_string()],
+            ReferentialAction::NoAction,
+            ReferentialAction::NoAction,
+        )]);
+        let bytes = encode_schema(&schema).expect("encode");
+        assert!(bytes.starts_with(b"v14\n"));
+        let decoded = decode_schema("docs", &bytes).expect("decode");
+        assert_eq!(decoded.primary_key_name.as_deref(), Some("custom_pk"));
+        assert_eq!(decoded.columns, schema.columns);
+        assert_eq!(decoded.foreign_keys.len(), 1);
+        assert_eq!(encode_schema(&decoded).expect("re-encode"), bytes);
+    }
+
+    /// 食い違いが無いスキーマは v14 にならず、従来の版のバイト列のまま（正規形の一意性）。
+    #[test]
+    fn mirrored_schema_never_uses_v14() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("b", ColumnType::Text, true)
+                .with_default(ColumnDefault::Text("x".to_string()))],
+        );
+        let bytes = encode_schema(&schema).expect("encode");
+        assert!(
+            bytes.starts_with(b"v5\n"),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        // 補完値と既定値を明示的に揃えた構築でも同じ。
+        let aligned = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("b", ColumnType::Text, true)
+                .with_default(ColumnDefault::Text("x".to_string()))
+                .with_fill_value(Some(ColumnDefault::Text("x".to_string())))],
+        );
+        assert_eq!(encode_schema(&aligned).expect("encode"), bytes);
+    }
+
+    /// 旧形式（v5）の生バイト列は `fill_value == default_expr` として読め、再 encode しても
+    /// 元のバイト列と一致する（旧データの読み出し結果を変えない）。
+    #[test]
+    fn legacy_v5_bytes_decode_as_mirrored_and_reencode_identically() {
+        let raw = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("b", ColumnType::Bytea, true)
+                    .with_default(ColumnDefault::Text("\\x01".to_string())),
+                ColumnDef::new("t", ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("x".to_string())),
+            ],
+        );
+        let bytes = encode_schema(&raw).expect("encode");
+        assert!(bytes.starts_with(b"v5\n"));
+        let decoded = decode_schema("docs", &bytes).expect("decode");
+        for column in &decoded.columns {
+            assert_eq!(column.fill_value, column.default_expr);
+            assert!(column.fill_value.is_some());
+        }
+        assert_eq!(encode_schema(&decoded).expect("re-encode"), bytes);
+    }
+
+    /// 不正な v14 値は fail-closed に拒否する。
+    #[test]
+    fn decode_rejects_malformed_v14() {
+        let good =
+            String::from_utf8(encode_schema(&diverging_schema()).expect("encode")).expect("utf8");
+        assert!(decode_schema("docs", good.as_bytes()).is_ok());
+        let mirrored_v14 = "v14\ncols:1\npk:\npkname:\nb:text:-:1:L:-:-\nuniq:0\nchecks:0\nfks:0\n";
+        let fill_current_time = {
+            let schema = TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("t", ColumnType::Timestamp, true)
+                    .with_default(ColumnDefault::CurrentTime(TimeDefault::Now))],
+            );
+            let line = String::from_utf8(encode_schema(&schema).expect("encode")).expect("utf8");
+            // 時刻 DEFAULT のミラー列と、食い違う別列を持つ v14 を手で組む。
+            let field = line
+                .lines()
+                .find(|l| l.starts_with("t:"))
+                .and_then(|l| l.rsplit(':').next())
+                .expect("default field")
+                .to_string();
+            format!(
+                "v14\ncols:2\npk:\npkname:\nt:timestamp:-:1:L:-:{field}\nz:text:-:1:L:-:-\nuniq:0\nchecks:0\nfks:0\n"
+            )
+        };
+        let bad_pkname_derived = good.replace("pkname:\n", "pkname:docs_pkey\n");
+        let bad_tombstone_fill = "v14\ncols:2\npk:\npkname:\nb:text:-:1:L:-:6162\nx:text:-:1:D:-:6162\nuniq:0\nchecks:0\nfks:0\n";
+        let bad_hex = good.replacen(":s6f6c64\n", ":s6f6c6\n", 1);
+        for (label, bad) in [
+            ("v14 without divergence", mirrored_v14.to_string()),
+            ("fill is CurrentTime", fill_current_time),
+            ("pkname equals derived name", bad_pkname_derived),
+            ("tombstone fill", bad_tombstone_fill.to_string()),
+            ("missing fill field", good.replacen(":s6f6c64\n", "\n", 1)),
+            ("bad hex fill", bad_hex),
+        ] {
+            assert!(
+                decode_schema("docs", bad.as_bytes()).is_err(),
+                "must reject: {label}: {bad:?}"
+            );
+        }
+    }
+
+    /// `validate_schema` は時刻 DEFAULT の補完値（INSERT 既定値と等しいミラー以外）を拒否する。
+    #[test]
+    fn validate_schema_rejects_non_constant_fill_value() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("t", ColumnType::Timestamp, true)
+                .with_fill_value(Some(ColumnDefault::CurrentTime(TimeDefault::Now)))],
+        );
+        assert!(validate_schema(&schema).is_err());
+        let mirrored = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("t", ColumnType::Timestamp, true)
+                .with_default(ColumnDefault::CurrentTime(TimeDefault::Now))],
+        );
+        assert!(validate_schema(&mirrored).is_ok());
+    }
+
+    /// P0: v14 は FK 保持版として登録されている（漏れると DROP TABLE の依存検査が fail-open）。
+    #[test]
+    fn v14_is_registered_as_foreign_key_bearing_version() {
+        assert!(FK_BEARING_FORMAT_VERSIONS.contains(&CATALOG_FORMAT_VERSION_V14));
+        assert_eq!(FK_BEARING_FORMAT_VERSIONS.len(), 7);
+    }
+
+    /// 軽量パーサーも v14 を扱い、`decode_schema_body` と同じ不変条件を敷く。
+    #[test]
+    fn lightweight_parser_handles_v14() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("m", ColumnType::Text, true),
+                ColumnDef::new("b", ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("ins".to_string()))
+                    .with_fill_value(None),
+            ],
+        );
+        let bytes = encode_schema(&schema).expect("encode");
+        assert!(bytes.starts_with(b"v14\n"));
+        assert!(
+            !catalog_value_references_enum_type_in_table(&bytes, "mood", Some("docs"))
+                .expect("valid v14")
+        );
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        // 食い違い 0 件（fill を default と同じ値へ書き換え）・不正な fill・墓標 fill は拒否。
+        let default_field = text
+            .lines()
+            .find(|l| l.starts_with("b:"))
+            .and_then(|l| l.split(':').nth(5))
+            .expect("default field")
+            .to_string();
+        let no_divergence = text.replace(
+            &format!(":{default_field}:-\n"),
+            &format!(":{default_field}:{default_field}\n"),
+        );
+        let bad_hex = text.replace(
+            &format!(":{default_field}:-\n"),
+            &format!(":{default_field}:zz\n"),
+        );
+        for bad in [no_divergence, bad_hex] {
+            assert!(
+                matches!(
+                    catalog_value_references_enum_type_in_table(
+                        bad.as_bytes(),
+                        "mood",
+                        Some("docs")
+                    ),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "lightweight parser must reject: {bad:?}"
+            );
+            assert!(decode_schema("docs", bad.as_bytes()).is_err());
         }
     }
 }

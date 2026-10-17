@@ -2796,7 +2796,7 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
             Some(&b) => b,
             None => {
                 // BYTEA の既定値は `TableSchema` のキャッシュから補う（Issue #1373）。
-                if column.default.is_some() && matches!(column.ty, ColumnType::Bytea) {
+                if column.fill_value.is_some() && matches!(column.ty, ColumnType::Bytea) {
                     let bytes = schema.bytea_default_bytes(logical_index).ok_or_else(|| {
                         RowCodecError::Invalid(format!(
                             "column {:?} has an invalid DEFAULT for its type",
@@ -2807,7 +2807,7 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     continue;
                 }
                 // 配列の既定値も同じキャッシュから補う（Issue #1374）。
-                if column.default.is_some() && matches!(column.ty, ColumnType::Array(_)) {
+                if column.fill_value.is_some() && matches!(column.ty, ColumnType::Array(_)) {
                     let arr = schema.array_default_ref(logical_index).ok_or_else(|| {
                         RowCodecError::Invalid(format!(
                             "column {:?} has an invalid DEFAULT for its type",
@@ -2819,7 +2819,7 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                 }
                 // 欠落列は `DEFAULT` があれば既定値で補う（`scan_scalar_columns_validated`
                 // と同じ規則。Issue #1169）。
-                if column.default.is_some() {
+                if column.fill_value.is_some() {
                     let scalar = column_default_scalar_for_read(column).map_err(|_| {
                         RowCodecError::Invalid(format!(
                             "column {:?} has an invalid DEFAULT for its type",
@@ -4793,9 +4793,10 @@ struct ScalarSlotView<'a> {
     name: &'a str,
     ty: &'a ColumnType,
     nullable: bool,
-    /// 生存列の `DEFAULT`。バッファ末尾で欠落した列（`ALTER TABLE ADD COLUMN`
-    /// 後の既存行）を読み出し時に補う値の出どころ（Issue #1169）。墓標は常に `None`。
-    default: Option<&'a crate::catalog::ColumnDefault>,
+    /// 生存列の読み出し時補完値（`ColumnDef::fill_value`）。バッファ末尾で欠落した列
+    /// （`ALTER TABLE ADD COLUMN` 後の既存行）を補う値の出どころ（Issue #1169・#1627）。
+    /// INSERT 既定値（`default_expr`）ではない。墓標は常に `None`。
+    fill: Option<&'a crate::catalog::ColumnDefault>,
 }
 
 impl<'a> From<&'a crate::catalog::ColumnDef> for ScalarSlotView<'a> {
@@ -4804,7 +4805,7 @@ impl<'a> From<&'a crate::catalog::ColumnDef> for ScalarSlotView<'a> {
             name: c.name.as_str(),
             ty: &c.ty,
             nullable: c.nullable,
-            default: c.default.as_ref(),
+            fill: c.fill_value.as_ref(),
         }
     }
 }
@@ -4818,7 +4819,7 @@ impl<'a> From<&'a crate::catalog::DroppedSlot> for ScalarSlotView<'a> {
             // （削除前は non-nullable でも、削除後の新規行は当該位置を常に
             // NULL として書くため。TABLE-19 D1）。
             nullable: true,
-            default: None,
+            fill: None,
         }
     }
 }
@@ -4849,16 +4850,15 @@ pub(crate) enum DefaultBindError {
     IntervalInfinity,
 }
 
-/// 列の `DEFAULT` を型付きスカラー値へ変換する読み出し時補完版（JSON／JSONB は
-/// 再検証を省く。Issue #1169）。変換本体は [`default_scalar`]（`INSERT` の列省略補完
-/// `sql::parser::bind_column_default` と共有）。列の `DEFAULT` は作成後に変わらない
-/// （`ALTER COLUMN SET DEFAULT` は存在しない）ことが前提で、将来導入する場合は
-/// 補完専用の値を分離する必要がある。
+/// 列の読み出し時補完値（`ColumnDef::fill_value`）を型付きスカラー値へ変換する
+/// 読み出し時補完版（JSON／JSONB は再検証を省く。Issue #1169・#1627）。変換本体は
+/// [`default_scalar`]（`INSERT` の列省略補完 `sql::parser::bind_column_default` と共有）。
+/// INSERT 既定値（`default_expr`）は参照しない（TABLE-39 の前提となる分離）。
 /// [`default_scalar_for_read`] を参照。
 pub(crate) fn column_default_scalar_for_read(
     column: &crate::catalog::ColumnDef,
 ) -> std::result::Result<Option<ScalarRef<'_>>, DefaultBindError> {
-    match &column.default {
+    match &column.fill_value {
         None => Ok(None),
         Some(default) => default_scalar_for_read(&column.ty, default).map(Some),
     }
@@ -4873,7 +4873,17 @@ pub(crate) fn column_default_scalar_for_read(
 pub(crate) fn validate_column_default(
     column: &crate::catalog::ColumnDef,
 ) -> std::result::Result<(), DefaultBindError> {
-    match &column.default {
+    match &column.default_expr {
+        None => Ok(()),
+        Some(default) => validate_default(&column.ty, default),
+    }
+}
+
+/// [`validate_column_default`] の読み出し時補完値（`fill_value`）版（Issue #1627）。
+pub(crate) fn validate_column_fill_value(
+    column: &crate::catalog::ColumnDef,
+) -> std::result::Result<(), DefaultBindError> {
+    match &column.fill_value {
         None => Ok(()),
         Some(default) => validate_default(&column.ty, default),
     }
@@ -5156,7 +5166,7 @@ fn scan_scalar_columns_validated<'a>(
                 // TABLE-5・TABLE-16、Issue #1169）。生存列で `DEFAULT` があれば
                 // 読み出し時に既定値を補い（行は書き換えない）、なければ nullable
                 // のみ NULL として許容する。墓標は `default == None` のため従来どおり。
-                if column.default.is_some() && matches!(column.ty, ColumnType::Bytea) {
+                if column.fill.is_some() && matches!(column.ty, ColumnType::Bytea) {
                     // BYTEA の既定値は原文（`\x..`）からのデコード結果を
                     // `TableSchema` のキャッシュから借用する（Issue #1373）。
                     // 参照できなければ invalid DEFAULT として拒否する（fail-closed）。
@@ -5175,7 +5185,7 @@ fn scan_scalar_columns_validated<'a>(
                     }
                     continue;
                 }
-                if column.default.is_some() && matches!(column.ty, ColumnType::Array(_)) {
+                if column.fill.is_some() && matches!(column.ty, ColumnType::Array(_)) {
                     // 配列の既定値は原文から作ったペイロードを `TableSchema` の
                     // キャッシュから借用する（Issue #1374）。参照できなければ
                     // invalid DEFAULT として拒否する（fail-closed）。マスク外でも検証する。
@@ -5194,7 +5204,7 @@ fn scan_scalar_columns_validated<'a>(
                     }
                     continue;
                 }
-                if let Some(default) = column.default {
+                if let Some(default) = column.fill {
                     // マスク外でも DEFAULT の妥当性は検証する（参照列の選択で
                     // カタログ破損の検出結果が変わらないようにする。fail-closed）。
                     // 出力の保持だけを `wanted` で省略する。
@@ -8117,14 +8127,45 @@ mod tests {
         assert_eq!(schema, pristine, "cache must not affect equality");
 
         let mut cloned = schema.clone();
-        cloned.columns[1].default = Some(ColumnDefault::Text("\\x02".to_string()));
+        cloned.columns[1].fill_value = Some(ColumnDefault::Text("\\x02".to_string()));
         assert_eq!(cloned.bytea_default_bytes(1), Some(&[0x02u8][..]));
 
         let mut mutated = schema;
-        mutated.columns[1].default = Some(ColumnDefault::Text("\\x03".to_string()));
+        mutated.columns[1].fill_value = Some(ColumnDefault::Text("\\x03".to_string()));
         assert_eq!(mutated.bytea_default_bytes(1), None);
         assert!(scan_scalar_columns(&mutated, &buf).is_err());
         assert!(decode_scalar_columns(&mutated, &buf).is_err());
+    }
+
+    /// 読み出し時補完は `fill_value` だけを見る（TABLE-5・TABLE-16 の分離。Issue #1627）。
+    /// `default_expr` が補完値と食い違っても、欠落列はスカラー・BYTEA・配列のいずれの
+    /// 経路でも `fill_value` で読める。`fill_value` が無ければ INSERT 既定値があっても NULL。
+    #[test]
+    fn missing_columns_are_read_from_fill_value_not_default_expr() {
+        let arr_ty = ColumnType::Array(ArrayType::new(ArrayElemType::Integer, 4).expect("array"));
+        let (buf, schema) = old_row_and_extended_schema(vec![
+            ColumnDef::new("t", ColumnType::Text, true)
+                .with_default(ColumnDefault::Text("insert".to_string()))
+                .with_fill_value(Some(ColumnDefault::Text("fill".to_string()))),
+            ColumnDef::new("b", ColumnType::Bytea, true)
+                .with_default(ColumnDefault::Text("\\x02".to_string()))
+                .with_fill_value(Some(ColumnDefault::Text("\\x01".to_string()))),
+            ColumnDef::new("a", arr_ty, true)
+                .with_default(ColumnDefault::Text("{9}".to_string()))
+                .with_fill_value(Some(ColumnDefault::Text("{1,2}".to_string()))),
+            ColumnDef::new("n", ColumnType::Text, true)
+                .with_default(ColumnDefault::Text("insert".to_string()))
+                .with_fill_value(None),
+        ]);
+        let scanned = scan_scalar_columns(&schema, &buf).expect("scan");
+        assert_eq!(scanned[1], Some(ScalarRef::Text("fill")));
+        assert_eq!(schema.bytea_default_bytes(2), Some(&[0x01u8][..]));
+        assert!(matches!(scanned[3], Some(ScalarRef::Array(_))));
+        assert_eq!(scanned[4], None);
+        let decoded = decode_scalar_columns(&schema, &buf).expect("decode scalar");
+        assert_eq!(decoded[1], Value::Text("fill".to_string()));
+        assert_eq!(decoded[2], Value::Bytes(vec![0x01]));
+        assert_eq!(decoded[4], Value::Null);
     }
 
     fn array_col(name: &str, elem: ArrayElemType, max_len: u32, lit: &str) -> ColumnDef {
@@ -8226,12 +8267,12 @@ mod tests {
         assert_eq!(schema, pristine, "cache must not affect equality");
 
         let mut cloned = schema.clone();
-        cloned.columns[1].default = Some(ColumnDefault::Text("{1,2}".to_string()));
+        cloned.columns[1].fill_value = Some(ColumnDefault::Text("{1,2}".to_string()));
         assert_eq!(cloned.array_default_ref(1).map(|a| a.count()), Some(2));
 
         // キャッシュを初期化済みの `schema` 自体をその場で書き換える。
         let mut mutated = schema;
-        mutated.columns[1].default = Some(ColumnDefault::Text("{9}".to_string()));
+        mutated.columns[1].fill_value = Some(ColumnDefault::Text("{9}".to_string()));
         assert!(mutated.array_default_ref(1).is_none());
         assert!(scan_scalar_columns(&mutated, &buf).is_err());
         assert!(decode_scalar_columns(&mutated, &buf).is_err());

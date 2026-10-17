@@ -122,7 +122,7 @@ fn create_table_accepts_default_and_primary_key_on_the_same_column() {
         .expect("code column present");
     assert!(!code.nullable, "PRIMARY KEY column must be non-nullable");
     assert_eq!(
-        code.default,
+        code.default_expr,
         Some(engine::catalog::ColumnDefault::Text("draft".to_string())),
         "DEFAULT must survive alongside PRIMARY KEY in a catalog v5 round trip"
     );
@@ -253,7 +253,7 @@ fn catalog_v5_roundtrips_default_value_across_reopen() {
             .expect("lang column present");
         assert!(!lang.nullable);
         assert_eq!(
-            lang.default,
+            lang.default_expr,
             Some(engine::catalog::ColumnDefault::Text("ja".to_string())),
             "DEFAULT must survive a catalog v5 round trip through reopen"
         );
@@ -285,7 +285,7 @@ fn catalog_v2_v3_bytes_are_unchanged_when_no_column_declares_default() {
     let schema = storage
         .get_table_schema("docs")
         .expect("get schema after reopen");
-    assert!(schema.columns.iter().all(|c| c.default.is_none()));
+    assert!(schema.columns.iter().all(|c| c.default_expr.is_none()));
 }
 
 // --- エラー経路 -----------------------------------------------------------
