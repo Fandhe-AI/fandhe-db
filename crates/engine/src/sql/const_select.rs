@@ -146,6 +146,12 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
             reject_non_constant_with(expr, allow_placeholders)
         }
+        // 配列コンストラクタ・添字（TABLE-35・Issue #1602）は子ごとに検査する。
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } => expr
+            .array_expr_children()
+            .into_iter()
+            .flatten()
+            .try_for_each(|c| reject_non_constant_with(c, allow_placeholders)),
         Expr::SqlJsonQuery(q) => {
             reject_non_constant_with(&q.context, allow_placeholders)?;
             reject_non_constant_with(&q.path, allow_placeholders)?;

@@ -21,8 +21,8 @@ use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::row_codec::{ScalarRef, Value};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::udf_call::{
-    bind_projection_expr, eval_with_scalars, first_non_builtin_call_with, BoundExpr, Expr,
-    ExprType, ExprValue, UdfRegistry, MAX_EXPR_NODES,
+    bind_projection_expr, bind_projection_expr_json_ok, eval_with_scalars,
+    first_non_builtin_call_with, BoundExpr, Expr, ExprType, ExprValue, UdfRegistry, MAX_EXPR_NODES,
 };
 
 /// f64 で整数を正確に表現できる上限（2^53）。これを超える BIGINT への代入は精度欠落の
@@ -89,7 +89,9 @@ pub(crate) fn bind_set_expr(
         | ColumnType::Timestamp
         | ColumnType::TimestampTz
         | ColumnType::Interval
-        | ColumnType::Time => {}
+        | ColumnType::Time
+        // 配列列（TABLE-35・Issue #1602）。右辺は配列式（コンストラクタ・スライス・CAST・配列列）。
+        | ColumnType::Array(_) => {}
         _ => {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: format!("column {name:?} does not support an expression in SET"),
@@ -99,7 +101,13 @@ pub(crate) fn bind_set_expr(
 
     let registry = UdfRegistry::default();
     let mut budget = MAX_EXPR_NODES;
-    let (bound, ty, _) = bind_projection_expr(expr, schema, &registry, &mut budget)?;
+    // 配列列への代入だけ、式の最上位が配列値であることを許す（他の位置の cast-only 型の拒否規則は
+    // 変えない）。配列以外の型が来たら下の `assignable` が `42804` にする。
+    let (bound, ty, _) = if matches!(column.ty, ColumnType::Array(_)) {
+        bind_projection_expr_json_ok(expr, schema, &registry, &mut budget)?
+    } else {
+        bind_projection_expr(expr, schema, &registry, &mut budget)?
+    };
 
     let assignable = matches!(
         (&column.ty, ty),
@@ -125,6 +133,7 @@ pub(crate) fn bind_set_expr(
                 ExprType::TimestampTz | ExprType::Timestamp | ExprType::Date
             )
             | (ColumnType::Timestamp | ColumnType::Date, ExprType::TimestampTz)
+            | (ColumnType::Array(_), ExprType::Array)
     );
     if !assignable {
         return Err(SqlSurfaceError::datatype_mismatch(format!(
@@ -132,7 +141,10 @@ pub(crate) fn bind_set_expr(
         )));
     }
 
-    let bound = convert_for_assignment(&column.ty, ty, bound);
+    let bound = match &column.ty {
+        ColumnType::Array(at) => crate::sql::cast::bind_array_assignment(expr, bound, schema, at)?,
+        _ => convert_for_assignment(&column.ty, ty, bound),
+    };
     Ok(BoundSetExpr {
         source: expr.clone(),
         bound,
@@ -205,8 +217,26 @@ pub(crate) fn eval_set_expr_to_value<'a>(
         | ExprValue::JsonText(_)
         | ExprValue::Numeric(_)
         | ExprValue::Uuid(_)
-        | ExprValue::Bytes(_)
-        | ExprValue::Array(_) => Err(internal()),
+        | ExprValue::Bytes(_) => Err(internal()),
+        // 配列値（TABLE-35・Issue #1602）。束縛段が要素型を列に合わせ済みで、ここでは要素型の一致と
+        // 要素数・フレーム長の上限を行ごとの評価結果に対して再検証する（`54000`。encode と同じ上限）。
+        ExprValue::Array(a) => match &set.target_ty {
+            ColumnType::Array(at) => {
+                if !crate::row_codec::array_elem_kind_eq(a.elem(), at.elem()) {
+                    return Err(internal());
+                }
+                if a.len() as u64 > u64::from(at.max_len()) {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "array element count exceeds the column limit",
+                    ));
+                }
+                crate::row_codec::scalar_array_entry_len(at.elem(), &a).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("array value exceeds the maximum size")
+                })?;
+                Ok(Value::Array(a))
+            }
+            _ => Err(internal()),
+        },
         ExprValue::Date(d) => match &set.target_ty {
             ColumnType::Date => Ok(Value::Date(d)),
             ColumnType::Timestamp => i64::from(d)
