@@ -273,3 +273,9 @@ wire 応答は pg 互換の `CommandComplete` タグ `ALTER TABLE`（件数を�
 - 配列型の DDL 表記: Issue #1348 で対応済み
 - `VECTOR` 列の `ADD COLUMN` 解禁: 検証を伴う後続作業（本ドキュメント「`VECTOR` 列を
   保留した理由」参照）
+
+## Issue #1633 追記（TABLE-36）: IF NOT EXISTS
+
+`ALTER TABLE <表> ADD COLUMN IF NOT EXISTS <列> <型> ...` を受理する。同名の生存列があれば型解決・DEFAULT の
+束縛より前に副作用なしで成功する。判定の詳細・複数アクションとの関係は
+[alter-table-multi-action.md](alter-table-multi-action.md) を参照。

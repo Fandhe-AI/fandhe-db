@@ -369,7 +369,6 @@ fn unsupported_shapes_are_syntax_errors() {
     let _guard = CleanupGuard(path);
     for sql in [
         "ALTER TABLE docs ALTER a DROP NOT NULL",
-        "ALTER TABLE docs ALTER COLUMN a DROP NOT NULL, ALTER COLUMN b DROP NOT NULL",
         "ALTER TABLE docs ALTER COLUMN a DROP NOT NULL extra",
         "ALTER TABLE docs ALTER COLUMN a DROP NULL",
     ] {

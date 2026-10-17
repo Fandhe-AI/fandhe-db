@@ -203,7 +203,8 @@ SQL-23・ERR-6・NOSQL-13）。
   `ALTER TABLE <t> ALTER COLUMN <c> TYPE <型名> [COLLATE <名前>]` のみ（`COLLATE` は
   TABLE-28・Issue #1609 で追加。未知の照合名は `42704`、照合を持てない型は `42804`）。`COLUMN` 省略・
   `IF EXISTS`・`ONLY`・`CASCADE`／`RESTRICT`・`SET DATA TYPE`・`USING`・
-  複数アクション・`RETURNING`・`USING OPERATION_ID` はいずれも `42601`。
+  `RETURNING`・`USING OPERATION_ID` はいずれも `42601`。複数アクションは Issue #1633 以降、
+  DROP COLUMN は受理し（[alter-table-multi-action.md](alter-table-multi-action.md)）、ALTER COLUMN TYPE との混在は `0A000`。
   予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`。大文字小文字
   無視）は構造検証段で `42601`（カタログ非照会のため存在オラクルにならない）。
 - **判定順序**: 構文検証 → DDL 権限ゲート（`42501`）→ テーブル存在確認

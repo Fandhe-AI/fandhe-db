@@ -361,7 +361,6 @@ fn unsupported_qualifiers_are_rejected_with_42601() {
         "ALTER TABLE docs DROP COLUMN IF EXISTS note",
         "ALTER TABLE docs DROP COLUMN note CASCADE",
         "ALTER TABLE docs DROP COLUMN note RESTRICT",
-        "ALTER TABLE docs DROP COLUMN note, DROP COLUMN qty",
         "ALTER TABLE docs DROP COLUMN note USING OPERATION_ID 'op-1'",
         "ALTER TABLE docs DROP COLUMN note RETURNING id",
         "ALTER TABLE docs DROP COLUMN note; SELECT 1",
@@ -370,7 +369,6 @@ fn unsupported_qualifiers_are_rejected_with_42601() {
         "ALTER TABLE docs ALTER amount TYPE NUMERIC(9,2)",
         "ALTER TABLE docs ALTER COLUMN amount SET DATA TYPE NUMERIC(9,2)",
         "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING amount",
-        "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2), ALTER COLUMN qty TYPE BIGINT",
         "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) RETURNING id",
         "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2); SELECT 1",
     ] {

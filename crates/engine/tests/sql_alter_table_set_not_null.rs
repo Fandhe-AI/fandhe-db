@@ -218,7 +218,6 @@ fn unsupported_shapes_are_syntax_errors() {
     for sql in [
         "ALTER TABLE docs ALTER COLUMN a SET DATA TYPE TEXT",
         "ALTER TABLE docs ALTER a SET NOT NULL",
-        "ALTER TABLE docs ALTER COLUMN a SET NOT NULL, ALTER COLUMN b SET NOT NULL",
         "ALTER TABLE docs ALTER COLUMN a SET NOT NULL extra",
     ] {
         assert_eq!(code(&core, &mut session, sql), "42601", "{sql}");
