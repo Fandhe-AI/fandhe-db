@@ -454,6 +454,25 @@ fn scan_literal(text: &str) -> Result<LiteralParts<'_>, NumericError> {
     })
 }
 
+/// `Decimal` を 0 から遠い側へ四捨五入した整数にする（PostgreSQL の numeric → 整数変換と同じ
+/// half away from zero。Issue #1591・SQL-47 の `CAST(numeric AS integer)` が使う）。
+/// `scale` は構築時に `0..=MAX_PRECISION` へ収まるため `10^scale` は `i128` に収まるが、
+/// 範囲外が来ても panic せず `None`（呼び出し元は 22003）にする。
+pub(crate) fn round_to_integer(d: &Decimal) -> Option<i128> {
+    let p = pow10(d.scale)?;
+    let q = d.unscaled / p;
+    let r = d.unscaled % p;
+    // |r| < p <= 10^38 のため |r| * 2 は i128 を超えうる。`|r| >= p - |r|` で等価に判定する。
+    let abs_r = r.unsigned_abs();
+    let p_abs = p.unsigned_abs();
+    if abs_r >= p_abs.saturating_sub(abs_r) && abs_r != 0 {
+        let step = if d.unscaled < 0 { -1 } else { 1 };
+        q.checked_add(step)
+    } else {
+        Some(q)
+    }
+}
+
 /// `NUMERIC(precision, scale)` 列向けにリテラル文字列を解析し、束縛値
 /// `Decimal` を返す（D4・D5）。
 ///

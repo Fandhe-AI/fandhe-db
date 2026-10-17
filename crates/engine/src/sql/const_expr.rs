@@ -343,6 +343,13 @@ fn typed_null(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
                 "a json value is not allowed in a constant expression",
             ))
         }
+        // numeric 値は CAST の結果としてのみ生じ、INSERT VALUES の定数式では CAST 自体を拒否する
+        // ため到達しない（fail-closed）。
+        ExprType::Numeric => {
+            return Err(SqlSurfaceError::unsupported(
+                "a numeric value is not allowed in a constant expression",
+            ))
+        }
         // `INTERVAL` は `NULLIF` が比較を要する（#1580 まで未対応）ため、分岐なしの
         // `CASE WHEN 1 = 0 THEN INTERVAL '0' END` で型付き NULL を表す（Issue #1581）。
         ExprType::Interval => Expr::Case {
@@ -671,6 +678,9 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         }),
         ExprValue::Json(_) | ExprValue::JsonText(_) => Err(SqlSurfaceError::unsupported(
             "a json value is not allowed in a constant expression",
+        )),
+        ExprValue::Numeric(_) => Err(SqlSurfaceError::unsupported(
+            "a numeric value is not allowed in a constant expression",
         )),
     }
 }

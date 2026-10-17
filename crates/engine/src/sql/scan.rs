@@ -948,6 +948,8 @@ fn build_projected_cells(
                             max_result_bytes,
                         )?));
                     }
+                    // `CAST(.. AS numeric)` の結果（Issue #1591）。固定長の値で確保は伴わない。
+                    ExprValue::Numeric(d) => cells.push(Cell::Numeric(d)),
                 }
             }
         }

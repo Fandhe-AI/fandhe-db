@@ -7,17 +7,31 @@
 //! で CAST 用の閉じた型集合へ写す（カタログは参照しない静的な判定）。
 //!
 //! 規則表（20 型 × 20 型）は `docs/design/cast-conversion-rules.md` の表をデータとして
-//! 持つ（[`cast_rule`]）。型の組だけで決まる `×`（`42846`）は束縛時に判定し、値の変換
-//! （`i`・`a`・`e`・`io/*`・型修飾子の適用）は兄弟 Issue（#1591・#1592）の担当で、本モジュールでは
+//! 持つ（[`cast_rule`]）。型の組だけで決まる `×`（`42846`）は束縛時に判定する。値の変換のうち
+//! 数値 6 型・BOOLEAN・文字列 3 型どうし（Issue #1591）は `BuiltinFn::Cast`（評価は
+//! `sql::cast_value`）として束縛し、日時・JSON・UUID・BYTEA・配列（Issue #1592）は本モジュールでは
 //! 未実装の組を `0A000` で拒否する（黙って別の型として評価しない。fail-closed）。
-//! 判定の順序は「型名の解決（`42704`／`42601`／`0A000`）→ 型の組（`42846`）→ 実装の有無（`0A000`）」。
+//! 判定の順序は「型名の解決（`42704`／`42601`／`22023`／`0A000`）→ 型の組（`42846`）→ 実装の有無（`0A000`）」。
 
 use crate::catalog::{ColumnType, TableSchema};
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::cast_value::{CastDst, CastFn, CastSrc};
 use crate::sql::ddl_column_type::SqlColumnTypeName;
 use crate::sql::udf_call::{
     bind_expr_any, bind_jsonb_literal, BindEnv, BoundExpr, BuiltinFn, Expr, ExprType, NumericKind,
 };
+
+/// 修飾子なしの `CAST(.. AS numeric)` の結果列型。セルは値ごとの scale を持つ `Decimal` で、
+/// wire の typmod は numeric で常に -1 のため scale は外部に出ない。scale を 0 以外にするのは、
+/// サブクエリが scale 0 の numeric を整数とみなす判定を避けるため（`AVG_INTEGER_RESULT_TYPE`
+/// と同じ前例）。
+pub(crate) const CAST_NUMERIC_RESULT_TYPE: ColumnType = ColumnType::Numeric {
+    precision: crate::numeric::MAX_PRECISION,
+    scale: 16,
+};
+
+/// numeric の型修飾子 `(p, s)` の上限（PostgreSQL 17 は精度 1..=1000）。
+const PG_NUMERIC_MAX_PRECISION: u32 = 1000;
 
 /// 変換先（または変換元）の型。CAST が扱う 20 型（配列は要素型つきで 1 種）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,10 +41,8 @@ pub enum CastType {
     Int8,
     Float4,
     Float8,
-    Numeric {
-        precision: u8,
-        scale: u8,
-    },
+    /// `None` は修飾子なし（任意精度。丸めない）。`Some((precision, scale))` は `numeric(p,s)`。
+    Numeric(Option<(u8, u8)>),
     Bool,
     Text,
     /// `None` は長さ修飾なし。
@@ -216,7 +228,7 @@ impl CastType {
             CastType::Int8 => CastKind::Int8,
             CastType::Float4 => CastKind::Float4,
             CastType::Float8 => CastKind::Float8,
-            CastType::Numeric { .. } => CastKind::Numeric,
+            CastType::Numeric(_) => CastKind::Numeric,
             CastType::Bool => CastKind::Bool,
             CastType::Text => CastKind::Text,
             CastType::Varchar(_) => CastKind::Varchar,
@@ -261,10 +273,9 @@ impl CastType {
             SqlColumnTypeName::Json => CastType::Json,
             SqlColumnTypeName::Jsonb => CastType::Jsonb,
             SqlColumnTypeName::Uuid => CastType::Uuid,
-            SqlColumnTypeName::Numeric { precision, scale } => CastType::Numeric {
-                precision: *precision,
-                scale: *scale,
-            },
+            SqlColumnTypeName::Numeric { precision, scale } => CastType::Numeric(Some(
+                numeric_typmod(u32::from(*precision), u32::from(*scale))?,
+            )),
             SqlColumnTypeName::Vector(_) => {
                 return Err(SqlSurfaceError::FeatureNotSupported {
                     detail: "cast to or from type vector is not supported".to_string(),
@@ -289,7 +300,8 @@ impl CastType {
             CastType::Int8 => "bigint".to_string(),
             CastType::Float4 => "real".to_string(),
             CastType::Float8 => "double precision".to_string(),
-            CastType::Numeric { precision, scale } => format!("numeric({precision},{scale})"),
+            CastType::Numeric(Some((precision, scale))) => format!("numeric({precision},{scale})"),
+            CastType::Numeric(None) => "numeric".to_string(),
             CastType::Bool => "boolean".to_string(),
             CastType::Text => "text".to_string(),
             CastType::Varchar(None) => "character varying".to_string(),
@@ -325,7 +337,7 @@ impl CastType {
             CastType::Int8 => "int8",
             CastType::Float4 => "float4",
             CastType::Float8 => "float8",
-            CastType::Numeric { .. } => "numeric",
+            CastType::Numeric(_) => "numeric",
             CastType::Bool => "bool",
             CastType::Text => "text",
             CastType::Varchar(_) => "varchar",
@@ -343,16 +355,16 @@ impl CastType {
         }
     }
 
-    /// 型修飾子（長さ・精度）を持つか。修飾子の適用は値の変換を伴うため、恒等でも
-    /// 本 Issue では素通しにしない。
+    /// 型修飾子（長さ・精度）を持つか。修飾子の適用は値の変換（丸め・切り詰め・空白埋め）を
+    /// 伴うため、同一型でも素通しにしない。
     pub fn has_modifier(&self) -> bool {
         matches!(
             self,
-            CastType::Varchar(Some(_)) | CastType::Bpchar(_) | CastType::Numeric { .. }
+            CastType::Varchar(Some(_)) | CastType::Bpchar(_) | CastType::Numeric(Some(_))
         )
     }
 
-    /// 束縛段の式の型。対応が無い型（numeric・uuid・bytea・配列）は `None`。
+    /// 束縛段の式の型。対応が無い型（uuid・bytea・配列）は `None`。
     pub fn expr_type(&self) -> Option<ExprType> {
         match self {
             CastType::Int2
@@ -369,9 +381,8 @@ impl CastType {
             CastType::Interval => Some(ExprType::Interval),
             CastType::Jsonb => Some(ExprType::Json),
             CastType::Json => Some(ExprType::JsonText),
-            CastType::Numeric { .. } | CastType::Uuid | CastType::Bytea | CastType::Array(_) => {
-                None
-            }
+            CastType::Numeric(_) => Some(ExprType::Numeric),
+            CastType::Uuid | CastType::Bytea | CastType::Array(_) => None,
         }
     }
 
@@ -395,9 +406,12 @@ impl CastType {
             CastType::Interval => Some(ColumnType::Interval),
             CastType::Json => Some(ColumnType::Json),
             CastType::Jsonb => Some(ColumnType::Jsonb),
-            CastType::Numeric { .. } | CastType::Uuid | CastType::Bytea | CastType::Array(_) => {
-                None
-            }
+            CastType::Numeric(Some((precision, scale))) => Some(ColumnType::Numeric {
+                precision: *precision,
+                scale: *scale,
+            }),
+            CastType::Numeric(None) => Some(CAST_NUMERIC_RESULT_TYPE),
+            CastType::Uuid | CastType::Bytea | CastType::Array(_) => None,
         }
     }
 
@@ -504,6 +518,7 @@ fn source_cast_kind(
             _ => SourceKind::Known(CastKind::Text),
         },
         ExprType::Bool => SourceKind::Known(CastKind::Bool),
+        ExprType::Numeric => SourceKind::Known(CastKind::Numeric),
         ExprType::Date => SourceKind::Known(CastKind::Date),
         ExprType::Timestamp => SourceKind::Known(CastKind::Timestamp),
         ExprType::Time => SourceKind::Known(CastKind::Time),
@@ -530,9 +545,144 @@ fn not_implemented(from: &str, to: &CastType) -> SqlSurfaceError {
     }
 }
 
+/// numeric の型修飾子 `(precision, scale)` を検査して返す。PostgreSQL 17 は精度 `1..=1000`・
+/// 位取り `-1000..=1000` を受理する。精度 0・精度または位取りの上限超過は PostgreSQL と同じ
+/// `22023`。PostgreSQL では有効でも本エンジンの `Decimal`（最大 38 桁・scale は精度以下の
+/// 非負）で表せない指定は、`22023` の誤報を避けて `0A000`（fail-closed）にする。
+fn numeric_typmod(precision: u32, scale: u32) -> Result<(u8, u8), SqlSurfaceError> {
+    if precision == 0 || precision > PG_NUMERIC_MAX_PRECISION {
+        return Err(SqlSurfaceError::InvalidParameterValue {
+            detail: "NUMERIC precision must be between 1 and 1000",
+        });
+    }
+    if scale > PG_NUMERIC_MAX_PRECISION {
+        return Err(SqlSurfaceError::InvalidParameterValue {
+            detail: "NUMERIC scale must be between -1000 and 1000",
+        });
+    }
+    match (u8::try_from(precision), u8::try_from(scale)) {
+        (Ok(p), Ok(sc)) if p <= crate::numeric::MAX_PRECISION && sc <= p => Ok((p, sc)),
+        _ => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "numeric precision above 38 or scale above precision is not supported"
+                .to_string(),
+        }),
+    }
+}
+
+/// 先頭ゼロ・小数・符号なしの 10 進整数トークンを `u32` として読む（u32 をあふれる桁数は
+/// 上限超過として `u32::MAX`）。形が合わなければ `None`（従来の型名解析へ回す）。
+fn strict_u32_token(t: Option<&crate::sql::lexer::Token>) -> Option<u32> {
+    match t {
+        Some(crate::sql::lexer::Token::Number(n))
+            if !n.is_empty()
+                && n.bytes().all(|b| b.is_ascii_digit())
+                && !(n.len() > 1 && n.starts_with('0')) =>
+        {
+            Some(n.parse::<u32>().unwrap_or(u32::MAX))
+        }
+        _ => None,
+    }
+}
+
+/// `CAST`／`<type> '<literal>'` の型名を読む（`sql::allowlist::Parser` の
+/// `parse_cast_target_type`・`peek_typed_string_literal` が共有する唯一の入口）。
+///
+/// DDL の型名解析（`parse_column_type_name`。修飾子なしの `numeric`・`numeric(p)` は `42601`）は
+/// 変えず、CAST の型名に限り PostgreSQL と同じく修飾子なしの `numeric`／`decimal` と
+/// `numeric(p)`（`= numeric(p,0)`）を受け付ける。それ以外の型名・配列は従来の解析と
+/// [`CastType::from_sql_type_name`] に任せる。
+pub(crate) fn parse_cast_type(
+    tokens: &[crate::sql::lexer::Token],
+    pos: &mut usize,
+) -> Result<CastType, SqlSurfaceError> {
+    use crate::sql::lexer::Token;
+    let is_numeric_head = matches!(
+        tokens.get(*pos),
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("numeric") || w.eq_ignore_ascii_case("decimal")
+    );
+    if is_numeric_head {
+        let is_punct =
+            |p: usize, c: char| matches!(tokens.get(p), Some(Token::Punct(x)) if *x == c);
+        let array_follows = |p: usize| is_punct(p, '[');
+        if !is_punct(*pos + 1, '(') && !array_follows(*pos + 1) {
+            // 修飾子なし。
+            *pos += 1;
+            return Ok(CastType::Numeric(None));
+        }
+        if is_punct(*pos + 1, '(') {
+            // `numeric(p)`。
+            if let Some(p) = strict_u32_token(tokens.get(*pos + 2)) {
+                if is_punct(*pos + 3, ')') && !array_follows(*pos + 4) {
+                    let typmod = numeric_typmod(p, 0)?;
+                    *pos += 4;
+                    return Ok(CastType::Numeric(Some(typmod)));
+                }
+                // `numeric(p,s)`。p・s が u8 を超える指定も PostgreSQL では有効な形のため、
+                // 構文違反（`42601`）ではなく上限の判定（`22023`／`0A000`）に揃える。
+                if is_punct(*pos + 3, ',') && is_punct(*pos + 5, ')') && !array_follows(*pos + 6) {
+                    if let Some(sc) = strict_u32_token(tokens.get(*pos + 4)) {
+                        let typmod = numeric_typmod(p, sc)?;
+                        *pos += 6;
+                        return Ok(CastType::Numeric(Some(typmod)));
+                    }
+                }
+            }
+        }
+    }
+    let name = crate::sql::ddl_column_type::parse_column_type_name(tokens, pos)?;
+    CastType::from_sql_type_name(&name)
+}
+
+/// 規則表の見出しと式の静的型から、値の変換の変換元を決める。変換元として扱えない組
+/// （日時・JSON・UUID・BYTEA・配列。Issue #1592 の担当）と、式の型が見出しと食い違う組は `None`。
+fn cast_src(kind: CastKind, ty: ExprType) -> Option<CastSrc> {
+    match (kind, ty) {
+        (CastKind::Int2, ExprType::Scalar) => Some(CastSrc::Int2),
+        (CastKind::Int4, ExprType::Scalar) => Some(CastSrc::Int4),
+        (CastKind::Int8, ExprType::Scalar) => Some(CastSrc::Int8),
+        (CastKind::Float4, ExprType::Scalar) => Some(CastSrc::Float4),
+        (CastKind::Float8, ExprType::Scalar) => Some(CastSrc::Float8),
+        (CastKind::Numeric, ExprType::Numeric) => Some(CastSrc::Numeric),
+        (CastKind::Bool, ExprType::Bool) => Some(CastSrc::Bool),
+        (CastKind::Text | CastKind::Varchar | CastKind::Bpchar, ExprType::Text) => {
+            Some(CastSrc::Text)
+        }
+        _ => None,
+    }
+}
+
+/// 変換先の型から値の変換の変換先を決める（対象外の型は `None`）。
+fn cast_dst(target: &CastType) -> Option<CastDst> {
+    match target {
+        CastType::Int2 => Some(CastDst::Int2),
+        CastType::Int4 => Some(CastDst::Int4),
+        CastType::Int8 => Some(CastDst::Int8),
+        CastType::Float4 => Some(CastDst::Float4),
+        CastType::Float8 => Some(CastDst::Float8),
+        CastType::Numeric(typmod) => Some(CastDst::Numeric(*typmod)),
+        CastType::Bool => Some(CastDst::Bool),
+        CastType::Text => Some(CastDst::Text),
+        CastType::Varchar(n) => Some(CastDst::Varchar(*n)),
+        CastType::Bpchar(n) => Some(CastDst::Bpchar(*n)),
+        _ => None,
+    }
+}
+
+/// 変換ノードを組み立てる（引数 1 個の `BuiltinFn::Cast`）。
+fn cast_node(f: CastFn, arg: BoundExpr) -> BoundExpr {
+    BoundExpr::Builtin {
+        f: BuiltinFn::Cast(f),
+        args: vec![arg],
+    }
+}
+
 /// 型なし文字列リテラルを変換先の型の入力として解釈する束縛。対応する変換先は
 /// date／time／timestamp／timestamptz／interval（既存の型付きリテラルと同じ解析）・jsonb・
-/// 修飾子なしの text／varchar。それ以外は未実装（`0A000`）。
+/// 数値 6 型・boolean・文字列 3 型（Issue #1591）。それ以外は未実装（`0A000`）。
+///
+/// 数値・boolean・型修飾子つき文字列は、束縛時に実行時と同じ入力関数
+/// （`sql::cast_value::apply_cast`）を 1 度呼んで形式不正・範囲外を早期に報告し、評価は
+/// 変換ノードに委ねる（第 2 の文法を作らない）。CHECK 本体では値の変換を持ち込まない。
 fn bind_string_literal_as(
     s: &str,
     target: &CastType,
@@ -576,6 +726,40 @@ fn bind_string_literal_as(
         CastType::Text | CastType::Varchar(None) => {
             return bind_expr_any(&Expr::String(s.to_string()), env, node_budget)
         }
+        CastType::Int2
+        | CastType::Int4
+        | CastType::Int8
+        | CastType::Float4
+        | CastType::Float8
+        | CastType::Numeric(_)
+        | CastType::Bool
+        | CastType::Varchar(Some(_))
+        | CastType::Bpchar(_) => {
+            let (Some(dst), Some(ty)) = (cast_dst(target), target.expr_type()) else {
+                return Err(not_implemented("unknown", target));
+            };
+            if crate::sql::udf_call::in_check_binding() {
+                return Err(not_implemented("unknown", target));
+            }
+            if s.len() > crate::row_codec::MAX_TEXT_FIELD_LEN as usize {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "string literal exceeds the maximum TEXT field length",
+                ));
+            }
+            // 文字列リテラルと変換ノードの 2 ノード分を課金する（`bind_expr_any` を通らないため）。
+            charge_node(node_budget)?;
+            charge_node(node_budget)?;
+            let f = CastFn {
+                from: CastSrc::Text,
+                to: dst,
+            };
+            // 早期検証（形式不正・範囲外・未対応の非有限値を束縛時に報告する）。
+            crate::sql::cast_value::apply_cast(
+                f,
+                crate::sql::udf_call::ExprValue::Text(std::borrow::Cow::Borrowed(s)),
+            )?;
+            return Ok((cast_node(f, BoundExpr::Text(s.to_string())), ty));
+        }
         _ => return Err(not_implemented("unknown", target)),
     };
     // 解析済みの定数ノードを通常の束縛へ流す（TIMESTAMPTZ のセッション TZ 確定もここで行う）。
@@ -589,13 +773,45 @@ fn charge_node(node_budget: &mut usize) -> Result<(), SqlSurfaceError> {
     Ok(())
 }
 
+/// 2^53（式評価が整数を f64 で正確に運べる上限）を超える整数形リテラルか。
+fn exceeds_exact_integer(raw: &str) -> bool {
+    match crate::sql::udf_call::classify_integer_literal(raw) {
+        Some((v, _)) => v.unsigned_abs() > (1u64 << 53),
+        None => false,
+    }
+}
+
+/// `CAST` の被演算子になる NUMERIC／BOOLEAN 列の参照を、CAST の位置でだけ受理して葉にする。
+/// それ以外の位置の参照は従来どおり束縛段が拒否する。UDF 本体（スキーマなし）は対象外。
+fn bind_cast_operand_column(name: &str, env: &BindEnv<'_>) -> Option<(BoundExpr, ExprType)> {
+    let schema = env.schema()?;
+    // UDF の仮引数は列より優先される（`Expr::Ident` の通常の束縛順序と同じ）。
+    if env.has_param(name) {
+        return None;
+    }
+    let (index, column) = schema
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.name == name)?;
+    match column.ty {
+        ColumnType::Numeric { .. } => {
+            Some((BoundExpr::DecimalColumnRef { index }, ExprType::Numeric))
+        }
+        ColumnType::Boolean => Some((BoundExpr::BoolColumnRef { index }, ExprType::Bool)),
+        _ => None,
+    }
+}
+
 /// `CAST(<operand> AS <target>)` の束縛（`udf_call::bind_expr_any` の `Expr::Cast` 腕から呼ばれる）。
 ///
-/// 束縛の結果は次のいずれか。ここで値の変換は行わない（兄弟 Issue の担当）。
+/// 束縛の結果は次のいずれか。
 /// - `42846`: 規則表で `×` の組（型の組だけで決まり、値が NULL でも同じ）。
-/// - 恒等: 同一型で型修飾子なし。内側の束縛結果をそのまま返す。
+/// - 恒等（同一型で型修飾子なし）や値を変えない拡幅: 内側の束縛結果をそのまま返す。
+/// - 数値 6 型・BOOLEAN・文字列 3 型どうしの値の変換: `BuiltinFn::Cast`（Issue #1591）。
+///   CHECK 本体では値の変換を持ち込まず `0A000`（全テナントを走査する検証経路を避ける）。
 /// - 型なし文字列リテラルを入力として解釈、または型付き NULL。
-/// - それ以外は `0A000`。
+/// - それ以外（日時・JSON・UUID・BYTEA・配列。Issue #1592）は `0A000`。
 pub(super) fn bind_cast(
     operand: &Expr,
     target: &CastType,
@@ -603,60 +819,105 @@ pub(super) fn bind_cast(
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
     let target_ty = target.expr_type();
-    match operand {
+    let (bound, ty) = match operand {
         // 型付き NULL（`CAST(NULL AS integer)`）。変換先に式の型が無ければ未実装。
         Expr::Null => {
             charge_node(node_budget)?;
-            match target_ty {
+            return match target_ty {
                 Some(ty) => Ok((BoundExpr::Null, ty)),
                 None => Err(not_implemented("unknown", target)),
-            }
-        }
-        Expr::String(s) => bind_string_literal_as(s, target, env, node_budget),
-        _ => {
-            let (bound, ty) = bind_expr_any(operand, env, node_budget)?;
-            let source = source_cast_kind(operand, &bound, ty, env.schema());
-            let from_kind = match source {
-                SourceKind::Known(k) => k,
-                SourceKind::Outside => return Err(not_implemented("vector", target)),
-                SourceKind::UnknownNumeric => {
-                    // 数値の行どうしは変換先によって規則が異なる。数値 6 型と bool では
-                    // 誤った `42846`／恒等を作らないよう未実装とする。他の変換先では全数値行が同じ規則。
-                    if matches!(
-                        target.kind(),
-                        CastKind::Int4
-                            | CastKind::Int8
-                            | CastKind::Int2
-                            | CastKind::Float4
-                            | CastKind::Float8
-                            | CastKind::Numeric
-                            | CastKind::Bool
-                    ) {
-                        return Err(not_implemented("numeric", target));
-                    }
-                    CastKind::Int4
-                }
             };
-            // 配列は式の型を持たないため、変換元に配列が現れることはない。
-            let from_ty_rule = cast_rule(from_kind, target.kind());
-            match from_ty_rule {
-                CastRule::None => Err(SqlSurfaceError::CannotCoerce {
-                    from: from_kind.label().to_string(),
-                    to: target.pg_label(),
-                }),
-                CastRule::Identity if !target.has_modifier() && target_ty == Some(ty) => {
-                    Ok((bound, ty))
-                }
-                _ => Err(not_implemented(from_kind.label(), target)),
-            }
         }
+        Expr::String(s) => return bind_string_literal_as(s, target, env, node_budget),
+        // 小数形・2^53 を超える整数形のリテラルは、f64 を経由せず正確な numeric 定数にする
+        // （f64 では numeric の丸め〔`2.5` → 3〕が狂う）。
+        Expr::Number(raw)
+            if number_literal_kind(raw) == CastKind::Numeric || exceeds_exact_integer(raw) =>
+        {
+            charge_node(node_budget)?;
+            let d = crate::numeric::parse_literal_exact(raw).map_err(|_| {
+                SqlSurfaceError::numeric_out_of_range("value overflows numeric format")
+            })?;
+            (BoundExpr::Numeric(d), ExprType::Numeric)
+        }
+        Expr::Ident(name) => match bind_cast_operand_column(name, env) {
+            Some(leaf) => {
+                charge_node(node_budget)?;
+                leaf
+            }
+            None => bind_expr_any(operand, env, node_budget)?,
+        },
+        _ => bind_expr_any(operand, env, node_budget)?,
+    };
+    let source = source_cast_kind(operand, &bound, ty, env.schema());
+    let from_kind = match source {
+        SourceKind::Known(k) => k,
+        SourceKind::Outside => return Err(not_implemented("vector", target)),
+        SourceKind::UnknownNumeric => {
+            // 数値の行どうしは変換先によって規則が異なる（numeric と float で丸め・表記が異なる）。
+            // 数値 6 型・bool・文字列 3 型では誤った値・`42846`・恒等を作らないよう未実装とする。
+            // 他の変換先では全数値行が同じ規則。
+            if matches!(
+                target.kind(),
+                CastKind::Int4
+                    | CastKind::Int8
+                    | CastKind::Int2
+                    | CastKind::Float4
+                    | CastKind::Float8
+                    | CastKind::Numeric
+                    | CastKind::Bool
+                    | CastKind::Text
+                    | CastKind::Varchar
+                    | CastKind::Bpchar
+            ) {
+                return Err(not_implemented("numeric", target));
+            }
+            CastKind::Int4
+        }
+    };
+    // 配列は式の型を持たないため、変換元に配列が現れることはない。
+    let rule = cast_rule(from_kind, target.kind());
+    if rule == CastRule::None {
+        return Err(SqlSurfaceError::CannotCoerce {
+            from: from_kind.label().to_string(),
+            to: target.pg_label(),
+        });
     }
+    if rule == CastRule::Identity && !target.has_modifier() && target_ty == Some(ty) {
+        return Ok((bound, ty));
+    }
+    let (Some(src), Some(dst), Some(result_ty)) =
+        (cast_src(from_kind, ty), cast_dst(target), target_ty)
+    else {
+        return Err(not_implemented(from_kind.label(), target));
+    };
+    let f = CastFn { from: src, to: dst };
+    // CHAR(n) への変換結果（末尾空白で埋めた値）は、別の型へ変換する前に bpchar → text と同じく
+    // 末尾の半角空白を除く（列参照は束縛時に除去済み）。
+    let inner_is_bpchar = matches!(
+        operand,
+        Expr::Cast { ty: inner, .. } if matches!(inner, CastType::Bpchar(_))
+    );
+    let bound = if inner_is_bpchar && src == CastSrc::Text {
+        BoundExpr::Builtin {
+            f: BuiltinFn::BpcharToText,
+            args: vec![bound],
+        }
+    } else {
+        bound
+    };
+    if f.is_noop() && result_ty == ty {
+        return Ok((bound, ty));
+    }
+    if crate::sql::udf_call::in_check_binding() {
+        return Err(not_implemented(from_kind.label(), target));
+    }
+    charge_node(node_budget)?;
+    Ok((cast_node(f, bound), result_ty))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::ddl_column_type::parse_column_type_name;
     use crate::sql::lexer::tokenize;
 
     /// 設計書の表（`docs/design/cast-conversion-rules.md`）を 20 行の記号列として持つ。
@@ -765,9 +1026,9 @@ mod tests {
     fn parse_ty(sql: &str) -> Result<CastType, SqlSurfaceError> {
         let tokens = tokenize(sql).expect("tokenize");
         let mut pos = 0;
-        let name = parse_column_type_name(&tokens, &mut pos)?;
+        let ty = parse_cast_type(&tokens, &mut pos)?;
         assert_eq!(pos, tokens.len(), "all tokens consumed for {sql}");
-        CastType::from_sql_type_name(&name)
+        Ok(ty)
     }
 
     #[test]
@@ -819,10 +1080,8 @@ mod tests {
             CastType::Int8,
             CastType::Float4,
             CastType::Float8,
-            CastType::Numeric {
-                precision: 10,
-                scale: 2,
-            },
+            CastType::Numeric(Some((10, 2))),
+            CastType::Numeric(None),
             CastType::Bool,
             CastType::Text,
             CastType::Varchar(None),
@@ -846,6 +1105,58 @@ mod tests {
         }
     }
 
+    /// `to_sql` の `(p,s)` 形はバイト列が content_hash（tag 16）と台帳の再送に使われるため不変。
+    #[test]
+    fn numeric_to_sql_bytes_are_stable() {
+        assert_eq!(CastType::Numeric(Some((10, 2))).to_sql(), "numeric(10,2)");
+        assert_eq!(CastType::Numeric(Some((38, 0))).to_sql(), "numeric(38,0)");
+        assert_eq!(CastType::Numeric(None).to_sql(), "numeric");
+    }
+
+    #[test]
+    fn cast_numeric_type_name_forms() {
+        assert_eq!(parse_ty("numeric").expect("bare"), CastType::Numeric(None));
+        assert_eq!(parse_ty("DECIMAL").expect("bare"), CastType::Numeric(None));
+        assert_eq!(
+            parse_ty("numeric(7)").expect("p"),
+            CastType::Numeric(Some((7, 0)))
+        );
+        assert_eq!(
+            parse_ty("numeric(7, 3)").expect("ps"),
+            CastType::Numeric(Some((7, 3)))
+        );
+        // PostgreSQL では無効な精度は 22023、有効だが本エンジンで表せない指定は 0A000。
+        for bad in [
+            "numeric(0)",
+            "numeric(0,0)",
+            "numeric(1001)",
+            "numeric(5000,1)",
+            "numeric(5,1001)",
+        ] {
+            assert!(
+                matches!(
+                    parse_ty(bad),
+                    Err(SqlSurfaceError::InvalidParameterValue { .. })
+                ),
+                "{bad}"
+            );
+        }
+        for unsupported in [
+            "numeric(39)",
+            "numeric(50,2)",
+            "numeric(3,5)",
+            "numeric(1000,0)",
+        ] {
+            assert!(
+                matches!(
+                    parse_ty(unsupported),
+                    Err(SqlSurfaceError::FeatureNotSupported { .. })
+                ),
+                "{unsupported}"
+            );
+        }
+    }
+
     #[test]
     fn pg_label_is_static_and_unqualified() {
         assert_eq!(CastType::Varchar(Some(3)).pg_label(), "character varying");
@@ -862,6 +1173,7 @@ mod tests {
         assert_eq!(CastType::Jsonb.expr_type(), Some(ExprType::Json));
         assert_eq!(CastType::Json.expr_type(), Some(ExprType::JsonText));
         assert_eq!(CastType::Bpchar(2).expr_type(), Some(ExprType::Text));
+        assert_eq!(CastType::Numeric(None).expr_type(), Some(ExprType::Numeric));
         assert_eq!(CastType::Uuid.expr_type(), None);
         assert_eq!(CastType::Array(Box::new(CastType::Int4)).expr_type(), None);
     }

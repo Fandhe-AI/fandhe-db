@@ -6728,8 +6728,7 @@ impl<'a> Parser<'a> {
     /// 現在位置から型名 1 個を読み、CAST の変換先の型へ写す（[`Self::parse_cast_expr`] の下請け）。
     fn parse_cast_target_type(&mut self) -> Result<crate::sql::cast::CastType, SqlSurfaceError> {
         let mut pos = self.pos;
-        let name = crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut pos)?;
-        let ty = crate::sql::cast::CastType::from_sql_type_name(&name)?;
+        let ty = crate::sql::cast::parse_cast_type(&self.tokens, &mut pos)?;
         self.pos = pos;
         Ok(ty)
     }
@@ -6748,7 +6747,7 @@ impl<'a> Parser<'a> {
             return None;
         }
         let mut pos = self.pos;
-        crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut pos).ok()?;
+        crate::sql::cast::parse_cast_type(&self.tokens, &mut pos).ok()?;
         match self.tokens.get(pos) {
             Some(Token::StringLiteral(s)) => Some((pos, s.clone())),
             _ => None,

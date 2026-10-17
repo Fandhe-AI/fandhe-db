@@ -263,6 +263,9 @@ pub(crate) enum StackValue {
     Json(String),
     /// `json`（原文保存）値の原文テキスト（Issue #2180。[`ExprStep::JsonSubtree`] の結果）。
     JsonText(String),
+    /// `NUMERIC` 値（Issue #1591。`CAST` の結果・NUMERIC 列の被演算子。[`ExprStep::JsonSubtree`]
+    /// と同じ再帰評価の結果として積まれる）。
+    Decimal(crate::numeric::Decimal),
 }
 
 /// [`StackValue`] を、eval 呼び出しスコープに閉じたライフタイム `'a` を持つ
@@ -363,6 +366,7 @@ fn stack_to_expr_value<'a>(
         },
         StackValue::Json(s) => Ok(ExprValue::Json(Cow::Owned(s))),
         StackValue::JsonText(s) => Ok(ExprValue::JsonText(Cow::Owned(s))),
+        StackValue::Decimal(d) => Ok(ExprValue::Numeric(d)),
         StackValue::NumericColumnRef(index) => match row_scalars.get(index) {
             None => Err(SqlSurfaceError::Internal {
                 detail: "NUMERIC column reference is outside the decoded row scalar view"
@@ -403,6 +407,7 @@ fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
         ExprValue::Interval(v) => StackValue::Interval(v),
         ExprValue::Json(j) => StackValue::Json(j.into_owned()),
         ExprValue::JsonText(j) => StackValue::JsonText(j.into_owned()),
+        ExprValue::Numeric(d) => StackValue::Decimal(d),
     }
 }
 
@@ -470,6 +475,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
                 | ExprValue::Interval(_)
                 | ExprValue::Json(_)
                 | ExprValue::JsonText(_)
+                | ExprValue::Numeric(_)
                 | ExprValue::Null => None,
             }
         }
@@ -543,6 +549,9 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::Coalesce(_)
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
+        | BoundExpr::Numeric(_)
+        | BoundExpr::DecimalColumnRef { .. }
+        | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonTextFn(_)
         | BoundExpr::JsonPathFn(_)
         | BoundExpr::JsonbLiteral(_)
@@ -663,8 +672,13 @@ fn compile_node(
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);
         }
+        // `NUMERIC`／`BOOLEAN` 列と NUMERIC 定数（Issue #1591）も、専用ステップを増やさず
+        // 参照実装 `eval_with_scalars` の部分木評価に委ねる（意味論を 1 実装に保つ）。
         BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
+        | BoundExpr::Numeric(_)
+        | BoundExpr::DecimalColumnRef { .. }
+        | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonTextFn(_)
         | BoundExpr::JsonPathFn(_)
         | BoundExpr::JsonbLiteral(_)
@@ -1130,6 +1144,7 @@ impl ExprProgram {
                             | ExprValue::TimestampTz(_)
                             | ExprValue::Interval(_)
                             | ExprValue::JsonText(_)
+                            | ExprValue::Numeric(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
                         let s = match scalar_ev {
@@ -1144,6 +1159,7 @@ impl ExprProgram {
                             | ExprValue::TimestampTz(_)
                             | ExprValue::Interval(_)
                             | ExprValue::JsonText(_)
+                            | ExprValue::Numeric(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
                         // バックエンドの失敗（deadline 超過・トラップ・メモリ確保

@@ -706,6 +706,18 @@ pub enum BoundExpr {
     JsonColumnRef {
         index: usize,
     },
+    /// `NUMERIC` 定数（Issue #1591・SQL-47）。`CAST` の被演算子になる小数リテラルを f64 へ
+    /// 落とさず正確に運ぶ。
+    Numeric(crate::numeric::Decimal),
+    /// nullable `NUMERIC` 列の参照（Issue #1591・SQL-47）。`CAST` の被演算子の位置でだけ
+    /// 生成する（それ以外の位置は従来どおり束縛段が拒否する）。
+    DecimalColumnRef {
+        index: usize,
+    },
+    /// nullable `BOOLEAN` 列の参照（Issue #1591・SQL-47）。`CAST` の被演算子の位置でだけ生成する。
+    BoolColumnRef {
+        index: usize,
+    },
     /// `json_*` 関数・`to_json`・`json_build_*` の束縛結果（Issue #2180。束縛・評価は
     /// `sql::json_fn`）。
     JsonTextFn(Box<crate::sql::json_fn::BoundJsonFn>),
@@ -890,6 +902,14 @@ impl PartialEq for BoundExpr {
             (BoundExpr::JsonColumnRef { index: a }, BoundExpr::JsonColumnRef { index: b }) => {
                 a == b
             }
+            (BoundExpr::Numeric(a), BoundExpr::Numeric(b)) => a == b,
+            (
+                BoundExpr::DecimalColumnRef { index: a },
+                BoundExpr::DecimalColumnRef { index: b },
+            ) => a == b,
+            (BoundExpr::BoolColumnRef { index: a }, BoundExpr::BoolColumnRef { index: b }) => {
+                a == b
+            }
             (BoundExpr::JsonTextFn(a), BoundExpr::JsonTextFn(b)) => a == b,
             (BoundExpr::JsonPathFn(a), BoundExpr::JsonPathFn(b)) => a == b,
             (
@@ -1010,6 +1030,11 @@ pub enum ExprType {
     /// 保持する。比較・並べ替え・グループ化には演算子が無い（`42883`）。算術・集計・
     /// `CASE` 等・代入は `0A000` で拒否する。
     JsonText,
+    /// `NUMERIC` 値（Issue #1591・SQL-47）。`CAST(.. AS numeric[(p,s)])` の結果と、`CAST` の
+    /// 被演算子としての NUMERIC 列だけが生成する。消費できるのは投影と `CAST` の被演算子だけで、
+    /// 比較・算術・関数引数・`CASE` 等・集計・代入は `0A000` で拒否する（f64 を経由すると
+    /// 丸めが狂うため、正確な [`crate::numeric::Decimal`] のまま運ぶ）。
+    Numeric,
 }
 
 /// 評価結果の値。
@@ -1046,6 +1071,8 @@ pub enum ExprValue<'a> {
     /// 取り出し・`json_build_*` の結果は所有。[`ExprValue::Json`]（jsonb の正規化テキスト）
     /// とは別 variant にして、型の取り違え（原文と正規形）を型で防ぐ。
     JsonText(Cow<'a, str>),
+    /// `NUMERIC` 値（Issue #1591・SQL-47。[`ExprType::Numeric`] 参照）。
+    Numeric(crate::numeric::Decimal),
     /// SQL の NULL（Issue #919・SQL-26、AC2 と Issue #921・SQL-26 の共有
     /// variant）。nullable TEXT 列参照・strict な関数への NULL 入力、および
     /// `CASE`／`COALESCE`／`NULLIF` の評価結果から生じる。呼び出し元
@@ -1201,6 +1228,11 @@ pub enum BuiltinFn {
     /// 全走査へ縮退する（EXPLAIN の縮退理由は `sql::explain::expr_text_equality` が `=` 比較に
     /// ついて検出する。照合込みの索引は #2191）。
     TextCompare(BinOp, crate::collation::Collation),
+    /// `CAST`／`<type> '<literal>'` の値変換（数値・文字列・BOOLEAN の 10 型どうし。
+    /// Issue #1591・SQL-47）。名前では解決できない内部専用関数で、`sql::cast::bind_cast` だけが
+    /// 規則表に沿って組み立てる。引数は 1 個で、NULL は strict ガードにより NULL のまま通る。
+    /// 評価は `sql::cast_value::apply_cast`。
+    Cast(crate::sql::cast_value::CastFn),
 }
 
 /// 型付き算術（[`BuiltinFn::TypedArith`]）の結果種別。`float8` は既存の
@@ -1487,6 +1519,30 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         // 戻り値型は TIMESTAMP（D8 の暫定。TIMESTAMPTZ 型の実装時に切り替える）。
         BuiltinFn::ClockTimestamp => (&[], ExprType::Timestamp),
         BuiltinFn::TextCompare(_, _) => (&[ExprType::Text, ExprType::Text], ExprType::Bool),
+        BuiltinFn::Cast(c) => {
+            use crate::sql::cast_value::{CastDst, CastSrc};
+            let args: &'static [ExprType] = match c.from {
+                CastSrc::Int2
+                | CastSrc::Int4
+                | CastSrc::Int8
+                | CastSrc::Float4
+                | CastSrc::Float8 => &[ExprType::Scalar],
+                CastSrc::Numeric => &[ExprType::Numeric],
+                CastSrc::Bool => &[ExprType::Bool],
+                CastSrc::Text => &[ExprType::Text],
+            };
+            let ret = match c.to {
+                CastDst::Int2
+                | CastDst::Int4
+                | CastDst::Int8
+                | CastDst::Float4
+                | CastDst::Float8 => ExprType::Scalar,
+                CastDst::Numeric(_) => ExprType::Numeric,
+                CastDst::Bool => ExprType::Bool,
+                CastDst::Text | CastDst::Varchar(_) | CastDst::Bpchar(_) => ExprType::Text,
+            };
+            (args, ret)
+        }
     }
 }
 
@@ -1554,6 +1610,9 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         BuiltinFn::ClockTimestamp => false,
         // 引数が TEXT のため畳み込み表現（`Scalar`／`Bool` のみ）に載らない。
         BuiltinFn::TextCompare(_, _) => false,
+        // 値変換（Issue #1591）は `FoldedConst`（`Scalar`／`Bool` のみ）で表せない結果も返し、
+        // 範囲外・形式不正は評価時のエラーで defer-on-error にする必要があるため畳み込まない。
+        BuiltinFn::Cast(_) => false,
         // Issue #1539・SQL-42: 型付き算術は `Binary` と同じく `Scalar` を返す純関数で、
         // 0 除算・オーバーフローは defer-on-error（畳み込み失敗時は実行時に評価）。
         BuiltinFn::TypedArith(_, _) => true,
@@ -2032,6 +2091,12 @@ impl BindEnv<'_> {
                 .schema
                 .is_some_and(|sc| sc.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)))
     }
+
+    /// `name` が UDF 仮引数か（大小無視。仮引数は列より優先して解決される）。`sql::cast` が
+    /// CAST の被演算子の列参照を葉にする前に、仮引数との衝突を除くために使う。
+    pub(super) fn has_param(&self, name: &str) -> bool {
+        self.params.contains_key(name.to_ascii_lowercase().as_str())
+    }
 }
 
 /// 展開済み [`BoundExpr`] のノード数を数える。UDF 連鎖のパラメータ参照展開時に
@@ -2074,6 +2139,9 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::VectorRef
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
+        | BoundExpr::Numeric(_)
+        | BoundExpr::DecimalColumnRef { .. }
+        | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => 1,
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
@@ -2157,6 +2225,9 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::VectorRef
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
+        | BoundExpr::Numeric(_)
+        | BoundExpr::DecimalColumnRef { .. }
+        | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => 0,
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
@@ -2236,6 +2307,9 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         | BoundExpr::IdCompare { .. }
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
+        | BoundExpr::Numeric(_)
+        | BoundExpr::DecimalColumnRef { .. }
+        | BoundExpr::BoolColumnRef { .. }
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => false,
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
@@ -2289,6 +2363,8 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::IntervalColumnRef { index }
         | BoundExpr::JsonbColumnRef { index }
         | BoundExpr::JsonColumnRef { index }
+        | BoundExpr::DecimalColumnRef { index }
+        | BoundExpr::BoolColumnRef { index }
         | BoundExpr::ColumnRef { index } => visit(*index),
         BoundExpr::JsonAccess { lhs, rhs, .. } => {
             visit_referenced_scalar_columns(lhs, visit);
@@ -2318,6 +2394,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
+        | BoundExpr::Numeric(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => {}
         BoundExpr::JsonTextFn(f) => {
@@ -2390,6 +2467,8 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::IntervalColumnRef { index }
         | BoundExpr::JsonbColumnRef { index }
         | BoundExpr::JsonColumnRef { index }
+        | BoundExpr::DecimalColumnRef { index }
+        | BoundExpr::BoolColumnRef { index }
         | BoundExpr::ColumnRef { index } => {
             if let Some(slot) = mask.get_mut(*index) {
                 *slot = true;
@@ -2406,6 +2485,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
+        | BoundExpr::Numeric(_)
         | BoundExpr::JsonbLiteral(_)
         | BoundExpr::Null => false,
         // 左辺の jsonb 列と、キー／添字の式が参照する列を両方マスクへ反映する
@@ -2659,6 +2739,13 @@ pub(crate) fn expr_result_column_type(
     bound: &BoundExpr,
     ty: ExprType,
 ) -> Option<ColumnType> {
+    // `CAST`／`<type> '<literal>'` の結果列の型は変換先の型で決める（SQL-47・Issue #1590）。
+    // 値を変えない変換は被演算子の束縛結果をそのまま返す（Issue #1591）ため、型付き算術など
+    // 内側の束縛結果より先に判定する。これを欠くと `CAST(NULL AS integer)` が double precision、
+    // `CAST(i4 + 1 AS bigint)` が integer として公告される。
+    if let Expr::Cast { ty, .. } = expr {
+        return ty.result_column_type();
+    }
     // `jsonb_array_length` は int4（PostgreSQL と同じ。Issue #1599）。
     if matches!(
         bound,
@@ -2688,11 +2775,6 @@ pub(crate) fn expr_result_column_type(
                 _ => ColumnType::Integer,
             });
         }
-    }
-    // `CAST`／`<type> '<literal>'` の結果列の型は変換先の型で決める（SQL-47・Issue #1590）。
-    // これを欠くと `CAST(NULL AS integer)` が double precision として公告される。
-    if let Expr::Cast { ty, .. } = expr {
-        return ty.result_column_type();
     }
     // `json_array_length` は int4（Issue #2180）。
     if let BoundExpr::JsonTextFn(f) = bound {
@@ -2739,6 +2821,7 @@ pub(crate) fn column_type_for_expr_type(ty: ExprType) -> Option<ColumnType> {
         ExprType::Interval => Some(ColumnType::Interval),
         ExprType::Json => Some(ColumnType::Jsonb),
         ExprType::JsonText => Some(ColumnType::Json),
+        ExprType::Numeric => Some(crate::sql::cast::CAST_NUMERIC_RESULT_TYPE),
         ExprType::Vector => None,
     }
 }
@@ -3031,10 +3114,27 @@ fn bind_expr_in(
     Ok((bound, ty))
 }
 
+/// CHECK 述語の束縛中か（`sql::cast::bind_cast` が、全テナントを走査する検証経路へ値の変換を
+/// 持ち込まないために参照する。Issue #1591）。
+pub(super) fn in_check_binding() -> bool {
+    CHECK_BINDING.with(std::cell::Cell::get)
+}
+
+/// numeric 値（[`ExprType::Numeric`]）を消費できない位置へ流れた場合の `0A000`（Issue #1591）。
+pub(super) fn numeric_operand_unsupported() -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: "a numeric value produced by CAST can only be projected or cast again".to_string(),
+    }
+}
+
 /// jsonb 値（[`ExprType::Json`]）を消費できない位置（算術・関数引数・`CASE`／
 /// `COALESCE`／`NULLIF`・集計・代入）へ流れた場合の `0A000`（Issue #1596。比較・ORDER BY・
 /// 投影・パス演算子の左辺は Issue #1597 までに対応済みで、それ以外は fail-closed に拒否する）。
 fn reject_json_operand(ty: ExprType) -> Result<(), SqlSurfaceError> {
+    // numeric 値（Issue #1591）は投影と CAST の被演算子だけが消費できる。
+    if ty == ExprType::Numeric {
+        return Err(numeric_operand_unsupported());
+    }
     if ty == ExprType::Json {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "a jsonb value can only be projected, compared, ordered, or used as an operand of a JSON operator or jsonb function"
@@ -4485,6 +4585,9 @@ fn bind_unknown_literal_against(
     *node_budget = node_budget
         .checked_sub(1)
         .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+    if other_ty == ExprType::Numeric {
+        return Err(numeric_operand_unsupported());
+    }
     if s.len() > crate::row_codec::MAX_TEXT_FIELD_LEN as usize {
         return Err(SqlSurfaceError::payload_too_large(
             "string literal exceeds the maximum TEXT field length",
@@ -4792,6 +4895,11 @@ fn bind_binary(
     r: BoundExpr,
     rt: ExprType,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    // numeric 式（CAST の結果。Issue #1591）は比較・算術の演算子を持たない。型の取り違え
+    // （42804）ではなく、未対応であることを `0A000` で fail-closed に示す。
+    if lt == ExprType::Numeric || rt == ExprType::Numeric {
+        return Err(numeric_operand_unsupported());
+    }
     let mk = |op, l, r| BoundExpr::Binary {
         op,
         lhs: Box::new(l),
@@ -6188,6 +6296,12 @@ pub(crate) fn json_value_from_expr_value(
                 detail: "json text value reached a jsonb function".to_string(),
             })
         }
+        // numeric 値は束縛段が jsonb 関数の引数から弾く（0A000）ため到達しない（Issue #1591）。
+        ExprValue::Numeric(_) => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "a numeric value cannot be converted to json yet".to_string(),
+            })
+        }
     })
 }
 
@@ -6209,6 +6323,9 @@ fn json_object_key(v: &ExprValue<'_>) -> Result<String, SqlSurfaceError> {
         }),
         ExprValue::Interval(_) => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "an interval value cannot be converted to json yet".to_string(),
+        }),
+        ExprValue::Numeric(_) => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "a numeric value cannot be converted to json yet".to_string(),
         }),
         ExprValue::Json(_) | ExprValue::JsonText(_) | ExprValue::Vector(_) => {
             Err(SqlSurfaceError::InvalidParameterValue {
@@ -6525,6 +6642,31 @@ pub(crate) fn eval_with_scalars<'a>(
             Some(Some(ScalarRef::Json(text))) => Ok(ExprValue::JsonText(Cow::Borrowed(text))),
             Some(Some(_)) => Err(SqlSurfaceError::Internal {
                 detail: "JSON column reference resolved to a non-JSON row scalar value".to_string(),
+            }),
+        },
+        BoundExpr::Numeric(d) => Ok(ExprValue::Numeric(*d)),
+        BoundExpr::DecimalColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "NUMERIC column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Numeric(d))) => Ok(ExprValue::Numeric(*d)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "NUMERIC column reference resolved to a non-NUMERIC row scalar value"
+                    .to_string(),
+            }),
+        },
+        BoundExpr::BoolColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "BOOLEAN column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Bool(b))) => Ok(ExprValue::Bool(*b)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "BOOLEAN column reference resolved to a non-BOOLEAN row scalar value"
+                    .to_string(),
             }),
         },
         BoundExpr::JsonTextFn(f) => {
@@ -7066,6 +7208,12 @@ pub(crate) fn apply_builtin<'a>(
                 s.truncate(s.trim_end_matches(' ').len());
                 Ok(ExprValue::Text(Cow::Owned(s)))
             }
+        },
+        BuiltinFn::Cast(c) => match args.get_mut(0).and_then(Option::take) {
+            Some(v) => crate::sql::cast_value::apply_cast(c, v),
+            None => Err(SqlSurfaceError::Internal {
+                detail: "missing function argument at evaluation time".to_string(),
+            }),
         },
         BuiltinFn::TypedArith(op, kind) => {
             let a = take_scalar_arg(args, 0)?;
@@ -8338,6 +8486,10 @@ mod tests {
             BuiltinFn::JustifyDays,
             BuiltinFn::JustifyInterval,
             BuiltinFn::TypedArith(BinOp::Add, NumericKind::Int4),
+            BuiltinFn::Cast(crate::sql::cast_value::CastFn {
+                from: crate::sql::cast_value::CastSrc::Int4,
+                to: crate::sql::cast_value::CastDst::Int8,
+            }),
         ] {
             let (params, _) = builtin_signature(f);
             assert!(

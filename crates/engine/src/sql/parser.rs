@@ -6198,6 +6198,10 @@ fn resolve_aggregate_input(
                     detail: "aggregates over INTERVAL expressions are not supported yet"
                         .to_string(),
                 }),
+                // numeric 式（CAST の結果）の集計は未対応（Issue #1591）。fail-closed で拒否する。
+                ExprType::Numeric => Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "aggregates over NUMERIC expressions are not supported yet".to_string(),
+                }),
             }
         }
     }
@@ -6323,6 +6327,10 @@ fn resolve_count_distinct_input(
                 ExprType::Interval => Err(SqlSurfaceError::FeatureNotSupported {
                     detail: "aggregates over INTERVAL expressions are not supported yet"
                         .to_string(),
+                }),
+                // numeric 式（CAST の結果）の集計は未対応（Issue #1591）。fail-closed で拒否する。
+                ExprType::Numeric => Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "aggregates over NUMERIC expressions are not supported yet".to_string(),
                 }),
             }
         }
@@ -6830,6 +6838,10 @@ fn order_kind_for_expr_type(
         ExprType::JsonText => Err(SqlSurfaceError::undefined_function(
             "could not identify an ordering operator for type json",
         )),
+        // numeric 式の並べ替えは未対応（Issue #1591。消費できるのは投影と CAST の被演算子だけ）。
+        ExprType::Numeric => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "ORDER BY a NUMERIC expression is not supported yet".to_string(),
+        }),
     }
 }
 

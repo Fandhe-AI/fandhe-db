@@ -324,21 +324,15 @@ fn cannot_coerce_message_names_only_types() {
 #[test]
 fn unimplemented_conversions_are_rejected_not_evaluated() {
     let (core, _g) = setup("cast-unimpl");
+    // 数値・文字列・BOOLEAN どうしの変換は #1591 で実装済み（`sql_cast_numeric_text_bool.rs`）。
+    // ここには、日時・JSON・UUID・BYTEA・配列（#1592）と、種別を静的に決められない数値
+    // （関数・`id` 疑似列）の変換が評価されずに拒否されることを固定する。
     for expr in [
-        "CAST(i4 AS bigint)",
-        "CAST(t AS integer)",
-        "CAST('1' AS integer)",
-        "CAST(i4 AS boolean)",
-        "CAST(t AS varchar(3))",
-        "CAST(v AS text)",
-        "CAST(ch AS text)",
-        "CAST(v AS varchar(3))",
-        "CAST(i4 AS numeric(5,2))",
         "CAST('x' AS uuid)",
         "CAST(NULL AS uuid)",
         "CAST('{1}' AS integer[])",
         "CAST(abs(i4) AS integer)",
-        "CAST(i4 + 1 AS text)",
+        "CAST(abs(i4) AS text)",
         "CAST(id AS integer)",
         "CAST(abs(i4) AS date)",
     ] {
@@ -355,6 +349,72 @@ fn unimplemented_conversions_are_rejected_not_evaluated() {
         };
         assert_eq!(got, want, "{expr}");
     }
+}
+
+/// #1590 では `0A000` だった組が #1591 で成功へ変わったことを、値と結果列の型で固定する。
+#[test]
+fn conversions_implemented_by_1591_return_values() {
+    let (core, _g) = setup("cast-impl");
+    for (expr, cell, ty) in [
+        (
+            "CAST(i4 AS bigint)",
+            Cell::SignedInteger(2),
+            ColumnType::BigInt,
+        ),
+        (
+            "CAST(t AS varchar(2))",
+            Cell::Text("ab".into()),
+            ColumnType::Varchar(Some(2)),
+        ),
+        (
+            "CAST('1' AS integer)",
+            Cell::SignedInteger(1),
+            ColumnType::Integer,
+        ),
+        ("CAST(i4 AS boolean)", Cell::Bool(true), ColumnType::Boolean),
+        ("CAST(v AS text)", Cell::Text("vv".into()), ColumnType::Text),
+        (
+            "CAST(ch AS text)",
+            Cell::Text("ab".into()),
+            ColumnType::Text,
+        ),
+        (
+            "CAST(v AS varchar(1))",
+            Cell::Text("v".into()),
+            ColumnType::Varchar(Some(1)),
+        ),
+        (
+            "CAST(i4 + 1 AS text)",
+            Cell::Text("3".into()),
+            ColumnType::Text,
+        ),
+    ] {
+        let (got, meta) = first(&core, expr);
+        assert_eq!(got, cell, "{expr}");
+        assert_eq!(meta_type(&meta), Some(ty), "{expr}");
+    }
+    let (got, meta) = first(&core, "CAST(i4 AS numeric(5,2))");
+    assert!(
+        matches!(&got, Cell::Numeric(d) if d.to_string() == "2.00"),
+        "{got:?}"
+    );
+    assert_eq!(
+        meta_type(&meta),
+        Some(ColumnType::Numeric {
+            precision: 5,
+            scale: 2
+        })
+    );
+    // 形式不正の文字列は 22P02（この行の `t` は 'abc'）。
+    assert_eq!(
+        select(
+            &core,
+            "SELECT CAST(t AS integer) FROM c WHERE id = 1 LIMIT 1"
+        )
+        .unwrap_err()
+        .wire_code(),
+        "22P02"
+    );
 }
 
 #[test]
