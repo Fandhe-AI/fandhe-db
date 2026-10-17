@@ -3997,6 +3997,11 @@ struct Parser<'a> {
     /// 定数式（INSERT VALUES・列 `DEFAULT`）の解析中だけ立ち、関数引数の `NULL` を
     /// `NULL` 定数として受理する（Issue #1543。他文脈の関数引数は従来どおり列参照）。
     const_expr_null_args: bool,
+    /// `ALTER COLUMN TYPE ... USING <式>` の解析中だけ立ち、引用なしの `NULL`・`true`・
+    /// `false` を列参照ではなくリテラルとして受理する（Issue #1635。`UPDATE ... SET` の
+    /// リテラル経路と受理範囲を揃える）。`true`／`false` は束縛段が型を決められるよう
+    /// `CAST('true' AS boolean)` 相当の [`Expr::Cast`] へ脱糖する。
+    using_keyword_literals: bool,
     /// 単項マイナス（`-<primary>`）を `0 - <primary>` へ脱糖して受理してよい文脈かどうか
     /// （Issue #1538・SQL-42）。単一テーブル SELECT の投影項目（[`Self::parse_select_item`]
     /// の式モード）の解析中だけ `true` にする。`parse_primary_expr` は WHERE・CHECK 本体・
@@ -4087,6 +4092,7 @@ impl<'a> Parser<'a> {
             case_nesting: 0,
             allow_null_literal: false,
             const_expr_null_args: false,
+            using_keyword_literals: false,
             allow_unary_minus: false,
             allow_plus_number: false,
             in_check_body: false,
@@ -6673,8 +6679,23 @@ impl<'a> Parser<'a> {
             // の後方互換を優先し、下の一般識別子分岐へフォールスルーして列参照
             // （`Expr::Ident`）として扱う。
             Some(Token::Ident(name))
+                if self.using_keyword_literals
+                    && (name.eq_ignore_ascii_case("true")
+                        || name.eq_ignore_ascii_case("false"))
+                    && !self.quoted_null.contains(&self.pos) =>
+            {
+                let literal = name.to_ascii_lowercase();
+                self.advance();
+                self.consume_expr_node()?;
+                Ok(Expr::Cast {
+                    expr: Box::new(Expr::String(literal)),
+                    ty: crate::sql::cast::CastType::Bool,
+                })
+            }
+            Some(Token::Ident(name))
                 if name.eq_ignore_ascii_case("NULL")
                     && (self.allow_null_literal
+                        || self.using_keyword_literals
                         || matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast)))
                     && !self.quoted_null.contains(&self.pos) =>
             {
@@ -9183,7 +9204,10 @@ impl<'a> Parser<'a> {
             // 任意の `USING <式>`（TABLE-40、Issue #1635）。ノード予算つきで `,`・`;`・文末まで読む。
             let using = if self.peek_ident_matches("USING") {
                 self.advance();
-                Some(self.parse_bounded_value_expr()?)
+                let prev = std::mem::replace(&mut self.using_keyword_literals, true);
+                let parsed = self.parse_bounded_value_expr();
+                self.using_keyword_literals = prev;
+                Some(parsed?)
             } else {
                 None
             };
@@ -15996,6 +16020,20 @@ mod tests {
         assert!(with_using.using.is_some());
         let both = using_of("ALTER TABLE t ALTER COLUMN a TYPE TEXT COLLATE \"C\" USING a::text");
         assert!(both.using.is_some() && both.collation.is_some());
+        // 引用なしの NULL・true・false はリテラルとして受理する（SET のリテラル経路と同じ）。
+        for ok in [
+            "ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING NULL",
+            "ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING null",
+            "ALTER TABLE t ALTER COLUMN a TYPE INTEGER USING true::int",
+            "ALTER TABLE t ALTER COLUMN a TYPE BOOLEAN USING false",
+            "ALTER TABLE t ALTER COLUMN a TYPE BOOLEAN USING TRUE;",
+        ] {
+            assert!(using_of(ok).using.is_some(), "{ok}");
+        }
+        match using_of("ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING \"null\"").using {
+            Some(crate::sql::udf_call::Expr::Ident(n)) => assert_eq!(n, "null"),
+            other => panic!("quoted null must stay an identifier: {other:?}"),
+        }
         for bad in [
             "ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING",
             "ALTER TABLE t ALTER COLUMN a TYPE TEXT USING a COLLATE \"C\" x",

@@ -389,6 +389,15 @@ fn set_data_type_is_accepted_and_using_is_not_supported_yet() {
         ),
         "0A000"
     );
+    // 引用なしの NULL・true・false は列名ではなくリテラルとして束縛・型検査を通る
+    // （列参照扱いの `42703` にならない）。
+    for sql in [
+        "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING NULL",
+        "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING true::int",
+        "ALTER TABLE docs ALTER COLUMN amount TYPE BOOLEAN USING false",
+    ] {
+        assert_eq!(code_of(&core, &mut session, sql), "0A000", "{sql}");
+    }
     run(
         &core,
         &mut session,

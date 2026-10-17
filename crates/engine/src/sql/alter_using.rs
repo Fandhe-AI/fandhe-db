@@ -75,6 +75,10 @@ pub(crate) fn check_alter_using(
         ));
     };
 
+    // 単独の `NULL` はどの型へも代入変換できる（束縛段は CASE 等の外の `NULL` を拒否するため先に受理）。
+    if matches!(expr, Expr::Null) {
+        return Ok(());
+    }
     let registry = UdfRegistry::default();
     let mut budget = MAX_EXPR_NODES;
     let (bound, ty, _) = bind_array_assignment_source(expr, schema, &registry, &mut budget)?;
