@@ -5619,7 +5619,8 @@ impl EngineCore {
     /// `CreateView` 腕が DDL 権限ゲートと列別名の突合の後に呼ぶ。同名ビューがあれば、旧定義と新定義の
     /// 出力列（名前・型・順序）を [`Self::view_output_columns`] で同じ規則により導出して
     /// `sql::view_replace::check_replace_compatible`（非互換は `42P16`）に通し、通ったときだけ
-    /// `Storage::create_or_replace_view` が旧定義との compare-and-swap で置換する。検査後に旧定義が
+    /// `Storage::create_or_replace_view_checked` が旧定義・参照スキーマ指紋との compare-and-swap で
+    /// 置換する。自己参照・循環（`42P17`）は互換性検査より先に判定する。検査後に旧定義または参照先が
     /// 変わっていた場合は検査からやり直す（有界。超過は `55P03`）。同名がテーブル・索引なら
     /// カタログ側が `42809` を返す。
     fn create_or_replace_view_in_session(
@@ -5637,15 +5638,42 @@ impl EngineCore {
                     detail: "CREATE VIEW failed".to_string(),
                 }
             })?;
+            let mut fingerprint = None;
             if let Some(old) = &old {
+                // 自己参照・循環（`42P17`）は列互換性（`42P16`）より先に判定する。
+                let reaches_self = self
+                    .storage
+                    .view_body_reaches_self(stmt.name(), stmt.body_sql())
+                    .map_err(crate::sql::ddl::map_replace_view_error)?;
+                if reaches_self {
+                    return Err(crate::sql::ddl::map_replace_view_error(
+                        CatalogError::ViewReferenceCycle(stmt.name().to_string()),
+                    ));
+                }
+                // 互換性検査が前提にする参照スキーマの指紋は、列の導出より前に取る。
+                // 置換時に同一 write txn 内の指紋と照合し、検査後の参照先変更を検出する。
+                fingerprint = Some(
+                    self.storage
+                        .replace_view_fingerprint(
+                            stmt.name(),
+                            stmt.base_relation(),
+                            stmt.body_sql(),
+                            Some(old),
+                        )
+                        .map_err(crate::sql::ddl::map_replace_view_error)?,
+                );
                 let old_cols =
                     self.view_output_columns(session, &old.body_sql, &old.column_aliases)?;
                 let new_cols =
                     self.view_output_columns(session, stmt.body_sql(), stmt.column_aliases())?;
                 crate::sql::view_replace::check_replace_compatible(&old_cols, &new_cols)?;
             }
-            match crate::sql::ddl::execute_create_or_replace_view(&self.storage, stmt, old.as_ref())
-            {
+            match crate::sql::ddl::execute_create_or_replace_view(
+                &self.storage,
+                stmt,
+                old.as_ref(),
+                fingerprint.as_deref(),
+            ) {
                 Ok(outcome) => return Ok(outcome),
                 Err(CatalogError::ViewDefinitionChanged(_)) => continue,
                 Err(e) => return Err(crate::sql::ddl::map_replace_view_error(e)),

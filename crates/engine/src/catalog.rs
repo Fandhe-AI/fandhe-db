@@ -4263,12 +4263,76 @@ fn drop_foreign_key_in_txn(
     Ok(())
 }
 
+/// `CREATE OR REPLACE VIEW`（Issue #1660）の互換性検査が前提にした参照スキーマの指紋を作る。
+/// `starts` からビューの参照を推移的に辿り、到達した relation ごとに「テーブル定義またはビュー
+/// 定義の格納バイト列（不存在は印のみ）」を名前順に連結する。検査時（read）と置換時（同一 write
+/// txn）で同じ関数を使い、差異があれば検査後に参照先スキーマが変わったとして置換を拒否する
+/// （TOCTOU 回避）。`lookup_table` / `lookup_view` は格納バイト列の取得（不存在は `None`）。
+/// 探索は [`MAX_VIEW_CHAIN_WALK`] で打ち切り、超過は `ViewLimitExceeded`（fail-closed）。
+fn replace_fingerprint(
+    starts: Vec<String>,
+    lookup_table: &dyn Fn(&str) -> Result<Option<Vec<u8>>>,
+    lookup_view: &dyn Fn(&str) -> Result<Option<Vec<u8>>>,
+) -> Result<Vec<u8>> {
+    let mut stack = starts;
+    let mut visited: std::collections::BTreeMap<String, Vec<u8>> =
+        std::collections::BTreeMap::new();
+    while let Some(current) = stack.pop() {
+        if visited.contains_key(&current) {
+            continue;
+        }
+        if visited.len() > MAX_VIEW_CHAIN_WALK {
+            return Err(CatalogError::ViewLimitExceeded(
+                "view reference chain too long".to_string(),
+            ));
+        }
+        let mut entry = Vec::new();
+        if let Some(bytes) = lookup_table(&current)? {
+            entry.push(b'T');
+            entry.extend_from_slice(&bytes);
+        } else if let Some(bytes) = lookup_view(&current)? {
+            entry.push(b'V');
+            entry.extend_from_slice(&bytes);
+            let def = decode_view_def(&bytes)?;
+            stack.push(def.base_relation);
+            stack.extend(view_body_shape(&def.body_sql)?.relations);
+        } else {
+            entry.push(b'-');
+        }
+        visited.insert(current, entry);
+    }
+    let mut out = Vec::new();
+    for (name, entry) in visited {
+        out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&(entry.len() as u64).to_le_bytes());
+        out.extend_from_slice(&entry);
+    }
+    Ok(out)
+}
+
+/// 置換前後の本文（旧定義があれば旧本文も）が読む relation 群（指紋探索の起点）。
+fn replace_fingerprint_starts(
+    name: &str,
+    base_relation: &str,
+    body_sql: &str,
+    old: Option<&ViewDef>,
+) -> Result<Vec<String>> {
+    let mut starts = vec![name.to_string(), base_relation.to_string()];
+    starts.extend(view_body_shape(body_sql)?.relations);
+    if let Some(old) = old {
+        starts.push(old.base_relation.clone());
+        starts.extend(view_body_shape(&old.body_sql)?.relations);
+    }
+    Ok(starts)
+}
+
 /// `starts`（新本文が読む relation 群）から、ビューの参照を推移的に辿って `target` へ到達するか。
 /// `CREATE OR REPLACE VIEW` が自己参照・循環を作らないための検査（Issue #1660）。訪問済み集合と
 /// [`MAX_VIEW_CHAIN_WALK`] で打ち切る再帰なしの探索で、上限超過や格納本文を読めない場合は
 /// 到達ありとみなす（fail-closed）。
-fn view_body_reaches_in_txn(
-    views_table: &redb::Table<'_, &str, &[u8]>,
+fn view_body_reaches_in_txn<V: ReadableTable<&'static str, &'static [u8]>>(
+    views_table: &V,
     starts: &[String],
     target: &str,
 ) -> Result<bool> {
@@ -12730,6 +12794,29 @@ impl Storage {
         column_aliases: &[String],
         expected_old: Option<&ViewDef>,
     ) -> Result<()> {
+        self.create_or_replace_view_checked(
+            name,
+            base_relation,
+            body_sql,
+            column_aliases,
+            expected_old,
+            None,
+        )
+    }
+
+    /// 検査時の参照スキーマ指紋（[`Self::replace_view_fingerprint`]）を `expected_fingerprint` で受け、
+    /// 同一 write txn 内の指紋と一致するときだけ置換する [`Self::create_or_replace_view`] の本体。
+    /// 不一致は `Err(ViewDefinitionChanged)`（互換性検査の前提になった参照先テーブル・ビューが
+    /// 検査後に変わった。呼び出し元が検査からやり直す）。`None` は指紋照合を省く。
+    pub(crate) fn create_or_replace_view_checked(
+        &self,
+        name: &str,
+        base_relation: &str,
+        body_sql: &str,
+        column_aliases: &[String],
+        expected_old: Option<&ViewDef>,
+        expected_fingerprint: Option<&[u8]>,
+    ) -> Result<()> {
         validate_identifier(name)?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
             return Err(CatalogError::ViewLimitExceeded(
@@ -12770,6 +12857,18 @@ impl Storage {
             if current.as_ref() != expected_old {
                 return Err(CatalogError::ViewDefinitionChanged(name.to_string()));
             }
+            if let Some(expected) = expected_fingerprint {
+                let starts =
+                    replace_fingerprint_starts(name, base_relation, body_sql, current.as_ref())?;
+                let actual = replace_fingerprint(
+                    starts,
+                    &|n| Ok(catalog_table.get(n)?.map(|g| g.value().to_vec())),
+                    &|n| Ok(views_table.get(n)?.map(|g| g.value().to_vec())),
+                )?;
+                if actual != expected {
+                    return Err(CatalogError::ViewDefinitionChanged(name.to_string()));
+                }
+            }
             if current.is_some() {
                 if view_body_reaches_in_txn(&views_table, &shape.relations, name)? {
                     return Err(CatalogError::ViewReferenceCycle(name.to_string()));
@@ -12803,6 +12902,55 @@ impl Storage {
             views_table.insert(name, encoded.as_slice())?;
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// `CREATE OR REPLACE VIEW`（Issue #1660）の互換性検査が前提にする参照スキーマの指紋を
+    /// スナップショット読み取りで返す（[`Self::create_or_replace_view_checked`] へ渡す）。
+    pub(crate) fn replace_view_fingerprint(
+        &self,
+        name: &str,
+        base_relation: &str,
+        body_sql: &str,
+        old: Option<&ViewDef>,
+    ) -> Result<Vec<u8>> {
+        let starts = replace_fingerprint_starts(name, base_relation, body_sql, old)?;
+        let read_txn = self.db().begin_read()?;
+        let catalog_table = match read_txn.open_table(CATALOG_TABLE) {
+            Ok(t) => Some(t),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let views_table = match read_txn.open_table(VIEWS_TABLE) {
+            Ok(t) => Some(t),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        replace_fingerprint(
+            starts,
+            &|n| match &catalog_table {
+                Some(t) => Ok(t.get(n)?.map(|g| g.value().to_vec())),
+                None => Ok(None),
+            },
+            &|n| match &views_table {
+                Some(t) => Ok(t.get(n)?.map(|g| g.value().to_vec())),
+                None => Ok(None),
+            },
+        )
+    }
+
+    /// 新本文 `body_sql` がビュー `name` 自身へ（ビュー連鎖を介して）到達するか
+    /// （`CREATE OR REPLACE VIEW` の自己参照・循環検査。Issue #1660）。互換性検査より前に
+    /// 判定して `42P17` を優先させるための読み取り版で、置換時の write txn 内の検査とは別に
+    /// 二重に行う（最終的な権威は write txn 側）。
+    pub(crate) fn view_body_reaches_self(&self, name: &str, body_sql: &str) -> Result<bool> {
+        let shape = view_body_shape(body_sql)?;
+        let read_txn = self.db().begin_read()?;
+        let views_table = match read_txn.open_table(VIEWS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        view_body_reaches_in_txn(&views_table, &shape.relations, name)
     }
 
     /// ビュー定義をスナップショット読み取りで取得する（[`TableLookup::

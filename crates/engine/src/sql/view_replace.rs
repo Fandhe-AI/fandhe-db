@@ -40,19 +40,33 @@ pub(crate) fn check_replace_compatible(
                 ),
             });
         }
-        match (&o.ty, &n.ty) {
-            (Some(a), Some(b)) if a == b => {}
-            (Some(_), Some(_)) => {
+        if let (Some(a), Some(b)) = (&o.ty, &n.ty) {
+            if a != b {
                 return Err(SqlSurfaceError::InvalidViewReplacement {
                     detail: format!("cannot change data type of view column \"{}\"", o.name),
                 });
             }
-            _ => {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "cannot verify type compatibility of a view column without a static type",
-                ));
-            }
         }
+    }
+    // 追加された末尾列: 名前は既存列・追加列の双方と重複させない（`42P16`）。
+    let mut seen: std::collections::HashSet<&str> = old.iter().map(|c| c.name.as_str()).collect();
+    for n in new.iter().skip(old.len()) {
+        if !seen.insert(n.name.as_str()) {
+            return Err(SqlSurfaceError::InvalidViewReplacement {
+                detail: format!("duplicate view column name \"{}\"", n.name),
+            });
+        }
+    }
+    // 静的な型を持たない列は同一性を検証できないため、重なる部分・追加列とも fail-closed。
+    if old
+        .iter()
+        .zip(new.iter())
+        .any(|(o, n)| o.ty.is_none() || n.ty.is_none())
+        || new.iter().skip(old.len()).any(|n| n.ty.is_none())
+    {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "cannot verify type compatibility of a view column without a static type",
+        ));
     }
     Ok(())
 }
@@ -82,6 +96,23 @@ mod tests {
         assert!(check_replace_compatible(&old, &old).is_ok());
         assert!(check_replace_compatible(&old, &[text("a"), text("b"), text("c")]).is_ok());
         assert!(check_replace_compatible(&[], &[text("x")]).is_ok());
+    }
+
+    #[test]
+    fn appended_columns_must_be_unique_and_statically_typed() {
+        let old = [text("a")];
+        assert!(is_42p16(check_replace_compatible(
+            &old,
+            &[text("a"), text("a")]
+        )));
+        assert!(is_42p16(check_replace_compatible(
+            &old,
+            &[text("a"), text("b"), text("b")]
+        )));
+        assert!(matches!(
+            check_replace_compatible(&old, &[text("a"), col("b", None)]),
+            Err(SqlSurfaceError::FeatureNotSupported { .. })
+        ));
     }
 
     #[test]

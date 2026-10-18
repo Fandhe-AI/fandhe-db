@@ -322,6 +322,17 @@ fn self_reference_is_rejected_as_invalid_object_definition() {
 }
 
 #[test]
+fn self_reference_takes_precedence_over_column_incompatibility() {
+    let (core, _g) = open_core("t41r-self-order");
+    create_ok(&core, "CREATE VIEW v AS SELECT lang, body FROM docs");
+    // 列数減少（42P16）より先に自己参照（42P17）が判定される。
+    assert_eq!(
+        create_err(&core, "CREATE OR REPLACE VIEW v AS SELECT lang FROM v"),
+        "42P17"
+    );
+}
+
+#[test]
 fn syntax_and_body_errors_use_existing_codes() {
     let (core, _g) = open_core("t41r-syntax");
     create_ok(&core, "CREATE VIEW v AS SELECT lang FROM docs");
