@@ -68,8 +68,8 @@ fn table_44_register_get_remove_and_duplicate() {
     assert_eq!(cat.get("t").map(|e| e.id), Some(id));
     let dup = cat.register(schema("t", &["x"]), 4).expect_err("dup");
     assert_eq!(code(&dup), "42P07");
-    assert!(cat.remove("t"));
-    assert!(!cat.remove("t"));
+    assert_eq!(cat.remove("t"), Some(id));
+    assert_eq!(cat.remove("t"), None);
     // 取り除いた後は再登録でき、識別子は別物になる。
     let id2 = cat.register(schema("t", &["x"]), 4).expect("re-register");
     assert_ne!(id, id2);
