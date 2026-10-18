@@ -355,6 +355,12 @@ fn namespace_is_shared_with_tables_views_and_indexes() {
         s.create_view("mv", "base", "SELECT embedding FROM base"),
         Err(CatalogError::TableAlreadyExists(_))
     ));
+    // CREATE OR REPLACE VIEW も matview 名とは衝突し、VIEWS_TABLE へ書かない（fail-closed）。
+    assert!(matches!(
+        s.create_or_replace_view("mv", "base", "SELECT embedding FROM base", &[], None),
+        Err(CatalogError::WrongObjectKind(_))
+    ));
+    assert!(s.view_definition("mv").expect("view").is_none());
     s.create_table(&TableSchema::new(
         "other",
         vec![ColumnDef::new("e", ColumnType::Vector(2), false)],

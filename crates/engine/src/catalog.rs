@@ -12955,7 +12955,11 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
-            if catalog_table.get(name)?.is_some() || index_name_exists_in_txn(&write_txn, name)? {
+            // matview とも名前空間を共有する（TABLE-42 (2)、Issue #1663）。
+            if catalog_table.get(name)?.is_some()
+                || index_name_exists_in_txn(&write_txn, name)?
+                || materialized_view_exists_in_txn(&write_txn, name)?
+            {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
             let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
