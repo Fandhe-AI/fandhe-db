@@ -74,7 +74,7 @@ name }` を追加した（**BREAKING CHANGE**）。空白を挟まず「識別�
 他の DML 実行器の対象選定は経路ごとに異なる。SQL 経路の `UPDATE`／`DELETE`
 （`delete_row_impl` の `DeleteScope::OwnedVisible` を含む）は #1253 で「所有かつ可視」
 （`ctx.is_owner && ctx.is_visible`）へ揃え済みである。Rust の行 API
-（`tenant::update_row_unchecked`・`delete_row_unchecked`）と `truncate_table_unchecked` は
+（`tenant::update_row_unchecked`・`delete_row_unchecked`）と `truncate_tables_unchecked` は
 従来どおり `(ctx.tenant_id(), id)` キー取得＋`ctx.is_owner` の二重防御のみで判定し、
 可視性は問わない（Rust API の契約は変えない）。
 

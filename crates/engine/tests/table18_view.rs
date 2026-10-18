@@ -781,6 +781,16 @@ fn writes_to_a_view_are_rejected_with_no_side_effects() {
         .expect_err("truncate a view must be rejected");
     assert_eq!(err.wire_code(), "42809");
 
+    // 複数テーブル TRUNCATE の 2 番目がビューでも 42809 で、1 番目の表は無変更（SQL-48）。
+    let err = core
+        .execute_sql_in_session(
+            &ctx("alice"),
+            &mut write_session,
+            "TRUNCATE docs, v USING OPERATION_ID 'op-view-write-3'",
+        )
+        .expect_err("truncate including a view must be rejected");
+    assert_eq!(err.wire_code(), "42809");
+
     let after = scan(&core, "alice", "SELECT id FROM docs LIMIT 100").expect("after");
     assert_eq!(result_ids(&before), result_ids(&after), "no side effects");
 }

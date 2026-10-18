@@ -27,7 +27,7 @@
   `crates/engine/src/sql/expr_program.rs`（`ExprProgram::compile`）・
   `crates/engine/src/wasm_udf.rs`（`WasmUdfBackend`）・
   `crates/engine/src/tenant.rs`（`delete_row_ledgered_unchecked`・
-  `update_row_unchecked` 系・`truncate_table_unchecked`）
+  `update_row_unchecked` 系・`truncate_tables_unchecked`）
 - 関連 doc: `docs/design/predicate-dml-where.md`（Issue #869。述語つき `UPDATE` の
   許可リスト・束縛）・`docs/design/delete-predicate-form.md`（Issue #870。述語つき
   `DELETE` の許可リスト・束縛。RECOVER-11 節が本 ADR への窓口）・
@@ -78,7 +78,7 @@ commit 済みである」ことの確定的な根拠になり、再送時はハ�
 - 台帳キーは `(tenant, table, operation_id)`、値は v2＝バージョンバイト＋
   SHA-256（32 バイト）。keep-first（先着優先）であり、`record_in_txn` は
   行の書き込みと**同一の `WriteTransaction` 内**で呼ぶ（`update_row_unchecked`
-  系・`delete_row_ledgered_unchecked`・`truncate_table_unchecked` の共通順序:
+  系・`delete_row_ledgered_unchecked`・`truncate_tables_unchecked` の共通順序:
   スキーマ取得 → ハッシュ計算 → `record_in_txn` → 行操作 → 世代カウンタ更新
   → `commit_boundary::commit`）。
 - ハッシュ入力の正規化方針（`content_hash.rs` モジュールドキュメント）は
