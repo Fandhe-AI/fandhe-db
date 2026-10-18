@@ -493,6 +493,25 @@ fn column_append_gate_for_set_operation_dependents() {
     q(&core, "SELECT * FROM v2 LIMIT 100");
 }
 
+/// 列追加ゲート: 評価後射影形（`LIMIT`）の親へ到達する単純形の別名付き依存ビューも、
+/// 末尾列の追加で別名と衝突しうるため `0A000`（旧定義が残り、依存ビューは参照可能なまま）。
+#[test]
+fn column_append_gate_for_aliased_simple_view_over_buffered_parent() {
+    let (core, _g) = open_core("t41r-gate-alias");
+    create_ok(&core, "CREATE VIEW v1 AS SELECT lang FROM docs LIMIT 10");
+    create_ok(&core, "CREATE VIEW v2 (body) AS SELECT * FROM v1");
+    let before = snap(&core, "v1");
+    assert_eq!(
+        create_err(
+            &core,
+            "CREATE OR REPLACE VIEW v1 AS SELECT lang, body FROM docs LIMIT 10"
+        ),
+        "0A000"
+    );
+    assert_eq!(snap(&core, "v1"), before);
+    q(&core, "SELECT * FROM v2 LIMIT 100");
+}
+
 /// 公開 API からの置換でも依存ビューの再検証が失敗すれば旧定義が残る（原子性）。
 #[test]
 fn catalog_replace_failure_leaves_old_definition() {

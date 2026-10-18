@@ -4630,7 +4630,12 @@ fn revalidate_dependent_views_in_txn(
                     )
                 })
                 .count();
-            if selects >= 2 || (shape.buffered && !def.column_aliases.is_empty()) {
+            // 列別名付きビューは、本文自体が評価後射影形か、単純形でも評価後射影形の親へ
+            // 到達する場合に、追加列と別名が衝突しうる（参照時に重複名 `42702`）ため拒否する。
+            let aliased_over_buffered = !def.column_aliases.is_empty()
+                && (shape.buffered
+                    || view_reaches_buffered_in_txn(views_table, &def.base_relation, false)?);
+            if selects >= 2 || aliased_over_buffered {
                 return Err(broken());
             }
         }
