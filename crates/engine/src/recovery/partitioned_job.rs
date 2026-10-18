@@ -785,6 +785,81 @@ pub(crate) fn delete_table_in_txn(
     Ok(())
 }
 
+/// `ALTER TABLE ... RENAME TO`（[`crate::catalog::Storage::alter_table_rename`]、TABLE-38 の
+/// ポインタ、Issue #1625）と同一 write txn で、ジョブ記録と active 索引の表名を `old` から
+/// `new` へ付け替える。両表を同じ txn で同じように移すため、不変条件「active 索引がある ⇔
+/// `Running` 記録がある」は保たれる。値は無加工でコピーする。テーブル未作成なら no-op。
+/// 移送先に同じキーが既にあれば fail-closed で `Codec` エラー（呼び出し元が直前に新名分を
+/// 掃除するため通常は到達しない）。
+pub(crate) fn rename_table_in_txn(
+    write_txn: &redb::WriteTransaction,
+    old: &str,
+    new: &str,
+) -> Result<(), StorageError> {
+    let existing: std::collections::HashSet<String> = write_txn
+        .list_tables()
+        .map_err(StorageError::from)?
+        .map(|handle| handle.name().to_string())
+        .collect();
+    for def in [PARTITIONED_JOB_TABLE, PARTITIONED_JOB_ACTIVE_TABLE] {
+        if existing.contains(def.name()) {
+            move_table_rows(write_txn, def, old, new)?;
+        }
+    }
+    Ok(())
+}
+
+/// 3 要素キーの表で `table_name == old` のエントリを `new` へ有界バッチで移す
+/// （[`purge_table_rows`] と対になる前方一方向走査）。
+fn move_table_rows(
+    write_txn: &redb::WriteTransaction,
+    def: TableDefinition<(&str, &str, &str), &[u8]>,
+    old: &str,
+    new: &str,
+) -> Result<(), StorageError> {
+    let mut handle = write_txn.open_table(def)?;
+    let mut resume_after: Option<(String, String, String)> = None;
+    loop {
+        let mut batch: Vec<(String, String, Vec<u8>)> = Vec::new();
+        let mut reached_limit = false;
+        {
+            let lower = match resume_after.as_ref() {
+                Some((t, tb, op)) => Bound::Excluded((t.as_str(), tb.as_str(), op.as_str())),
+                None => Bound::Unbounded,
+            };
+            let iter = handle.range::<(&str, &str, &str)>((lower, Bound::Unbounded))?;
+            for entry in iter {
+                let (k, v) = entry?;
+                let (t, tb, op) = k.value();
+                if tb == old {
+                    batch.push((t.to_string(), op.to_string(), v.value().to_vec()));
+                    if batch.len() >= DELETE_BATCH_SIZE {
+                        reached_limit = true;
+                        break;
+                    }
+                }
+            }
+        }
+        resume_after = batch
+            .last()
+            .map(|(t, op, _)| (t.clone(), old.to_string(), op.clone()));
+        for (t, op, value) in &batch {
+            let occupied = handle
+                .insert((t.as_str(), new, op.as_str()), value.as_slice())?
+                .is_some();
+            if occupied {
+                return Err(StorageError::Codec(
+                    "partitioned job rename target already has entries".into(),
+                ));
+            }
+            handle.remove((t.as_str(), old, op.as_str()))?;
+        }
+        if !reached_limit {
+            return Ok(());
+        }
+    }
+}
+
 /// 3 要素キーの表から `table_name == table` のキーを有界バッチで前方一方向に削除する。
 fn purge_table_rows(
     write_txn: &redb::WriteTransaction,
@@ -2023,5 +2098,36 @@ mod tests {
         ledger::record_in_txn(&wt, "t1", "docs", LedgerWrite::Record(&id), &hash("n")).expect("r");
         assert!(ledger::lookup_in_write_txn(&wt, "t1", "docs", &id).expect("l"));
         assert!(!ledger::lookup_in_write_txn(&wt, "t2", "docs", &id).expect("l"));
+    }
+
+    // --- RENAME TABLE -------------------------------------------------------
+
+    #[test]
+    fn rename_table_moves_job_records_and_active_index() {
+        let (db, _g) = open_db("pj-rename");
+        let id = op("op-1");
+        let wt = db.begin_write().expect("w");
+        for (t, tb) in [("t1", "docs"), ("t2", "docs"), ("t1", "keep")] {
+            record_chunk_progress_in_txn(&wt, &key(t, tb, &id), &hash("h"), 1, 1, 100, None)
+                .expect("p");
+        }
+        wt.commit().expect("c");
+        let wt = db.begin_write().expect("w");
+        rename_table_in_txn(&wt, "docs", "docs2").expect("rename");
+        wt.commit().expect("c");
+        assert_eq!(read_job(&db, &key("t1", "docs", &id)), None);
+        assert!(read_job(&db, &key("t1", "docs2", &id)).is_some());
+        assert!(read_job(&db, &key("t2", "docs2", &id)).is_some());
+        assert!(read_job(&db, &key("t1", "keep", &id)).is_some());
+        // active 索引も同数のまま移る（不変条件: active 索引 ⇔ Running）。
+        assert_eq!(active_count(&db), 3);
+    }
+
+    #[test]
+    fn rename_table_does_not_create_job_tables() {
+        let (db, _g) = open_db("pj-rename-noop");
+        let wt = db.begin_write().expect("w");
+        rename_table_in_txn(&wt, "docs", "docs2").expect("noop");
+        assert_eq!(wt.list_tables().expect("list").count(), 0);
     }
 }

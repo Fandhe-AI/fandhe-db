@@ -3,8 +3,9 @@
 //! `EngineCore::execute_sql_in_session`（構文検証 → `require_ddl_permission` →
 //! `sql::ddl::execute_alter_table_rename_table`）を production 経路として検証する
 //! （`sql_ddl_rename_column.rs` と同じ流儀）。PK・UNIQUE・CHECK・FK（参照元・参照先）・
-//! 索引宣言は改名に追随すること（Issue #1624）を、ビューに依存される表の改名は
-//! Issue #1625 で追随させるまで `0A000` で拒否することを固定する。
+//! 索引宣言は改名に追随すること（Issue #1624）、単純形ビューの定義と `operation_id` 台帳の
+//! 記録が改名に追随すること・評価後射影形ビューに依存される表の改名は `0A000` で拒否される
+//! こと（Issue #1625）を固定する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -111,6 +112,22 @@ fn notes(core: &EngineCore, tenant: &str, table: &str) -> Result<Vec<String>, Sq
     let out = core.execute_sql(
         &ctx(tenant),
         &format!("SELECT note FROM {table} ORDER BY id LIMIT 100"),
+    )?;
+    Ok(out
+        .rows
+        .into_iter()
+        .map(|r| match r.cells.into_iter().next().expect("one cell") {
+            Cell::Text(s) => s,
+            other => panic!("unexpected cell {other:?}"),
+        })
+        .collect())
+}
+
+/// ビュー経由の SELECT（ビューは `id` を公開しないことがあるため `note` で並べる）。
+fn view_notes(core: &EngineCore, tenant: &str, view: &str) -> Result<Vec<String>, SqlSurfaceError> {
+    let out = core.execute_sql(
+        &ctx(tenant),
+        &format!("SELECT note FROM {view} ORDER BY note LIMIT 100"),
     )?;
     Ok(out
         .rows
@@ -340,14 +357,15 @@ fn rename_inside_explicit_transaction_is_rejected() {
     assert!(notes(&core, "alice", "docs").is_ok());
 }
 
+/// 評価後射影形（集計）ビューが読む表の改名は `0A000` で拒否され、何も変わらない。
 #[test]
-fn rename_with_dependent_view_is_refused_without_changes() {
+fn rename_with_buffered_view_is_refused_without_changes() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
     for ddl in [
         "CREATE TABLE view_t (note TEXT)",
-        "CREATE VIEW v_view_t AS SELECT note FROM view_t",
+        "CREATE VIEW v_view_t AS SELECT note FROM view_t ORDER BY note LIMIT 5",
     ] {
         run(&core, &mut session, ddl).unwrap_or_else(|e| panic!("{ddl}: {e:?}"));
     }
@@ -355,11 +373,148 @@ fn rename_with_dependent_view_is_refused_without_changes() {
     assert_eq!(code_of(&core, &mut session, sql), "0A000", "{sql}");
     // 何も変わっていない: 旧名は存在し、新名は存在しない。
     assert!(notes(&core, "alice", "view_t").is_ok());
+    assert!(view_notes(&core, "alice", "v_view_t").is_ok());
     assert_eq!(
         notes(&core, "alice", "renamed_x")
             .expect_err("no new name")
             .wire_code(),
         "42P01"
+    );
+}
+
+/// 単純形ビュー（`*`・列リスト・`WHERE` 述語つき・ビューの連鎖）は改名に追随し、
+/// ビュー経由の SELECT が改名前と同じ結果を返す。他テナントの行は見えない。
+#[test]
+fn rename_follows_simple_views_and_select_through_view_works() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    for ddl in [
+        "CREATE VIEW v_all AS SELECT * FROM docs",
+        "CREATE VIEW v_note AS SELECT note FROM docs",
+        "CREATE VIEW v_pred AS SELECT note FROM docs WHERE note = 'x'",
+        "CREATE VIEW v_chain AS SELECT note FROM v_note",
+    ] {
+        exec(&core, &mut session, ddl);
+    }
+    insert(&core, "alice", "docs", 1, "x");
+    insert(&core, "alice", "docs", 2, "y");
+    insert(&core, "bob", "docs", 3, "bob-x");
+    let before: Vec<_> = ["v_all", "v_note", "v_pred", "v_chain"]
+        .iter()
+        .map(|v| view_notes(&core, "alice", v).expect("before"))
+        .collect();
+    exec(&core, &mut session, "ALTER TABLE docs RENAME TO docs2");
+    let after: Vec<_> = ["v_all", "v_note", "v_pred", "v_chain"]
+        .iter()
+        .map(|v| view_notes(&core, "alice", v).expect("after"))
+        .collect();
+    assert_eq!(before, after);
+    assert_eq!(view_notes(&core, "alice", "v_pred").unwrap(), vec!["x"]);
+    assert_eq!(view_notes(&core, "bob", "v_note").unwrap(), vec!["bob-x"]);
+    // 往復改名でも追随する。
+    exec(&core, &mut session, "ALTER TABLE docs2 RENAME TO docs");
+    assert_eq!(
+        view_notes(&core, "alice", "v_chain").unwrap(),
+        vec!["x", "y"]
+    );
+}
+
+/// 別の表を読むビューは改名の影響を受けない。
+#[test]
+fn rename_unrelated_views_untouched() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    exec(&core, &mut session, "CREATE TABLE other (note TEXT)");
+    exec(
+        &core,
+        &mut session,
+        "CREATE VIEW v_other AS SELECT note FROM other ORDER BY note LIMIT 5",
+    );
+    exec(&core, &mut session, "ALTER TABLE docs RENAME TO docs2");
+    assert!(view_notes(&core, "alice", "v_other").is_ok());
+}
+
+/// 改名前に記録した `operation_id` を新名で再送すると、改名前の台帳で判定される。
+/// 旧名への文は `42P01`。行は二重に挿入されない。
+#[test]
+fn resend_after_rename_is_judged_by_pre_rename_ledger() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    let ins = |table: &str, note: &str| {
+        format!(
+            "INSERT INTO {table} (id, embedding, note) VALUES (1, '[0.1,0.2]', '{note}') \
+             USING OPERATION_ID 'op-a'"
+        )
+    };
+    exec(&core, &mut session, &ins("docs", "first"));
+    exec(&core, &mut session, "ALTER TABLE docs RENAME TO docs2");
+    assert_eq!(
+        code_of(&core, &mut session, &ins("docs2", "first")),
+        "23505"
+    );
+    assert_eq!(
+        code_of(&core, &mut session, &ins("docs2", "other")),
+        "22023"
+    );
+    assert_eq!(code_of(&core, &mut session, &ins("docs", "first")), "42P01");
+    assert_eq!(notes(&core, "alice", "docs2").unwrap(), vec!["first"]);
+}
+
+/// 表名をハッシュに含む述語つき UPDATE の再送は、改名後は fail-closed で `22023`
+/// （二重適用は起きない）。
+#[test]
+fn resend_of_predicate_update_after_rename_is_22023() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    insert(&core, "alice", "docs", 1, "a");
+    exec(
+        &core,
+        &mut session,
+        "UPDATE docs SET note = 'b' WHERE note = 'a' USING OPERATION_ID 'op-u'",
+    );
+    exec(&core, &mut session, "ALTER TABLE docs RENAME TO docs2");
+    let sql = "UPDATE docs2 SET note = 'b' WHERE note = 'a' USING OPERATION_ID 'op-u'";
+    assert_eq!(code_of(&core, &mut session, sql), "22023");
+    assert_eq!(notes(&core, "alice", "docs2").unwrap(), vec!["b"]);
+}
+
+/// `last_operation_id` は改名前の最後の `operation_id` を新名で返し、旧名では `NotFound`。
+/// 他テナントの記録は見えない。改名後に旧名で再作成した表は旧記録を引き継がない。
+#[test]
+fn last_operation_id_follows_rename() {
+    use engine::recovery::ledger::LastOperationLookup;
+    use engine::recovery::required_op_id::OperationId;
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    insert(&core, "alice", "docs", 1, "a");
+    exec(&core, &mut session, "ALTER TABLE docs RENAME TO docs2");
+    let op = OperationId::parse("op-alice-docs-1").expect("op");
+    assert_eq!(
+        core.last_operation_id(&ctx("alice"), "docs2")
+            .expect("lookup"),
+        LastOperationLookup::Committed(op)
+    );
+    assert_eq!(
+        core.last_operation_id(&ctx("alice"), "docs")
+            .expect("lookup"),
+        LastOperationLookup::NotFound
+    );
+    assert_eq!(
+        core.last_operation_id(&ctx("bob"), "docs2")
+            .expect("lookup"),
+        LastOperationLookup::NotFound
+    );
+    // 旧名で再作成した表は旧記録を引き継がない（同じ operation_id の INSERT が成功する）。
+    exec(&core, &mut session, "CREATE TABLE docs (note TEXT)");
+    exec(
+        &core,
+        &mut session,
+        "INSERT INTO docs (id, note) VALUES (1, 'n') USING OPERATION_ID 'op-alice-docs-1'",
     );
 }
 

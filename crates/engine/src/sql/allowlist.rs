@@ -11354,7 +11354,7 @@ pub(crate) fn render_view_body(body: &ParsedViewBody) -> String {
         Projection::Items(_) => out.push('*'),
     }
     out.push_str(" FROM ");
-    out.push_str(&body.table_name);
+    out.push_str(&render_table_name(&body.table_name));
     if !body.where_predicates.is_empty() {
         out.push_str(" WHERE ");
         let rendered: Vec<String> = body
@@ -11458,6 +11458,16 @@ fn render_column_name(column: &str) -> String {
     } else {
         column.to_string()
     }
+}
+
+/// FROM 句の表名をビュー正規化 SQL 用に描画する。`true`／`false`・SQL 値関数予約語と
+/// 大小無視で一致する名前（引用付き識別子で作られた表）は二重引用符付きで出力し、
+/// 再トークン化で真偽リテラル等へ化けて往復検証が失敗するのを防ぐ（[`render_column_name`]
+/// と同じ規則）。lexer は引用付きでも SQL キーワード（`"order"` 等）を拒否するため、
+/// それらの名前はそもそも本文へ書けず、ここで扱う必要がない。それ以外は裸で出力する
+/// （保存形式を変えない）。
+fn render_table_name(table: &str) -> String {
+    render_column_name(table)
 }
 
 /// [`WherePredicate`] のうち [`parse_view_body`] が受理する形状のみを描画する
