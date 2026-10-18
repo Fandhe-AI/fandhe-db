@@ -4737,6 +4737,9 @@ impl EngineCore {
             // 順序（DDL 実行権限ゲート → カタログ照会を含む実行本体）。
             ParsedSql::CreateView(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
+                // TABLE-41 (1)・Issue #1659: 列別名リストと本文の出力列数の突合は、カタログを
+                // 照会するため DDL 権限ゲートの後に行う（権限の無い主体へ列構成を返さない）。
+                self.check_create_view_column_aliases(session, stmt)?;
                 let outcome = crate::sql::ddl::execute_create_view(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateView(outcome))
             }
@@ -5467,6 +5470,74 @@ impl EngineCore {
             };
         }
         self.describe_parsed_in_session(session, parsed)
+    }
+
+    /// `CREATE VIEW v (a, b) AS ...`（TABLE-41 (1)・Issue #1659）の列別名リストを、本文の出力列に
+    /// 突き合わせる。別名が出力列より多ければ `42601`、別名を重ねた後の最終的な列名（別名＋残りの
+    /// 導出名）に重複があれば `42701`。列別名が無い `CREATE VIEW` は何もしない（従来の挙動を変えない）。
+    /// `execute_sql_in_session` の `CreateView` 腕が DDL 権限ゲートの後に呼ぶ。本文の出力列は
+    /// `sql::view::body_output` が参照時の別名適用と同じ規則で導出する。ここと `create_view` の
+    /// write txn の間で基底表の列が変わる競合は、参照時の再検査（`42601`／`42702`）が fail-closed で塞ぐ。
+    fn check_create_view_column_aliases(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedCreateView,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
+        use crate::sql::exec::ColumnMeta;
+        let aliases = stmt.column_aliases();
+        if aliases.is_empty() {
+            return Ok(());
+        }
+        let invalid_body = || SqlSurfaceError::Internal {
+            detail: "invalid view definition".to_string(),
+        };
+        let tokens = crate::sql::lexer::tokenize_stored_view_body(stmt.body_sql())
+            .map_err(|_| invalid_body())?;
+        let kind = crate::sql::allowlist::classify_view_body(
+            &tokens,
+            &self.storage,
+            crate::sql::allowlist::ViewBodyCheck::Resolved,
+        )?;
+        let names: Vec<String> = match crate::sql::view::body_output(&self.storage, kind)? {
+            crate::sql::view::BodyOutput::Names(names) => names,
+            crate::sql::view::BodyOutput::Statement(body) => {
+                let metas = self
+                    .describe_parsed_in_session_impl(
+                        session,
+                        &ParsedSql::Statement(*body),
+                        false,
+                        &[],
+                        &crate::result_limits::ResultLimits::default(),
+                    )?
+                    .ok_or_else(invalid_body)?;
+                metas
+                    .into_iter()
+                    .map(|m| match m {
+                        ColumnMeta::Id => "id".to_string(),
+                        ColumnMeta::AliasedId { name }
+                        | ColumnMeta::Scalar { name, .. }
+                        | ColumnMeta::Computed { name, .. } => name,
+                    })
+                    .collect()
+            }
+        };
+        if aliases.len() > names.len() {
+            return Err(SqlSurfaceError::unsupported(
+                "view column alias list is longer than the view's output columns",
+            ));
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let finals = aliases
+            .iter()
+            .map(String::as_str)
+            .chain(names.iter().skip(aliases.len()).map(String::as_str));
+        for name in finals {
+            if !seen.insert(name) {
+                return Err(SqlSurfaceError::duplicate_column(name));
+            }
+        }
+        Ok(())
     }
 
     /// [`Self::describe_parsed_in_session`]／[`Self::describe_prepared_in_session`]

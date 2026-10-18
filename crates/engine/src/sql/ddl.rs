@@ -2126,10 +2126,11 @@ pub(crate) fn execute_create_view(
     validated: &ValidatedCreateView,
 ) -> Result<CreateViewOutcome, SqlSurfaceError> {
     storage
-        .create_view(
+        .create_view_with_column_aliases(
             validated.name(),
             validated.base_relation(),
             validated.body_sql(),
+            validated.column_aliases(),
         )
         .map_err(map_create_view_error)?;
     Ok(CreateViewOutcome {})

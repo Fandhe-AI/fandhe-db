@@ -220,6 +220,7 @@ pub(crate) mod time_fn;
 pub mod transaction;
 pub mod udf_call;
 pub(crate) mod view;
+pub(crate) mod view_alias;
 pub(crate) mod view_buffered;
 pub(crate) mod visible_cache;
 pub(crate) mod where_negation;

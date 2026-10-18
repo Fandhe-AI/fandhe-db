@@ -941,6 +941,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: この表層でまだ実装していない機能の拒否（`0A000`）。ビューの列別名
+    /// （TABLE-41・Issue #1659）が未対応の参照形を fail-closed に拒否するために使う。
+    pub(crate) fn feature_not_supported(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::FeatureNotSupported {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `CREATE TABLE`（Issue #899）の列リスト構造検証が同一文内の
     /// 列名重複を報告するために使う。
     pub(crate) fn duplicate_column(name: impl Into<String>) -> Self {
@@ -2204,6 +2212,11 @@ pub struct ValidatedBufferedView {
     pub(crate) body: Box<Statement>,
     /// 本文の結果に対する外側クエリ（行形または集計形。Issue #1411）。
     pub(crate) outer: BufferedOuter,
+    /// 本文の結果列を先頭から順に改名する列別名（`CREATE VIEW v (a, b) AS ...`。TABLE-41 (1)・
+    /// Issue #1659）。空なら改名なし。非空になるのは `sql::view::resolve_from` が重ねる
+    /// 素通しの層だけで、`sql::view_buffered::plan_outer` が外側の束縛より前に改名する
+    /// （Describe と Execute が同じ入口を通るため列名が一致する）。
+    pub(crate) column_aliases: Vec<String>,
 }
 
 /// 評価後射影形ビューへの外側クエリの形（Issue #1411）。どちらも本文の評価済みセルに
@@ -10521,10 +10534,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `CREATE VIEW <name> AS <body> [;]`（TABLE-18・SQL-23・TASK-205、
-    /// Issue #909）。`CREATE OR REPLACE`・`TEMP`／
-    /// `MATERIALIZED`・列別名リスト `v (a, b)` はいずれも構造的に受理しない。
-    fn parse_create_view(&mut self) -> Result<(String, &[Token]), SqlSurfaceError> {
+    /// `CREATE VIEW <name> [(<alias> [, <alias>]*)] AS <body> [;]`（TABLE-18・SQL-23・
+    /// TASK-205、Issue #909。列別名リストは TABLE-41 (1)・Issue #1659）。`CREATE OR REPLACE`・
+    /// `TEMP`／`MATERIALIZED` は構造的に受理しない。戻り値は `(ビュー名, 列別名, 本文)`。
+    ///
+    /// 列別名リストの構造検証（カタログは照会しない）: 空 `()`・末尾カンマ・識別子でない
+    /// 要素は `42601`、件数が [`crate::catalog::MAX_COLUMN_COUNT`] 超は `54000`（長さ検査の
+    /// 前に件数で打ち切り、過大な確保をしない）、リスト内の同名は `42701`。出力列数との
+    /// 突合は本文を導出できる実行段（`core`）が担う。
+    #[allow(clippy::type_complexity)]
+    fn parse_create_view(&mut self) -> Result<(String, Vec<String>, &[Token]), SqlSurfaceError> {
         self.expect_ident_matching("CREATE")?;
         self.expect_ident_matching("VIEW")?;
         // PostgreSQL 17 に無い形。意図を明示して `42601` にする（TABLE-36、Issue #1613）。
@@ -10534,12 +10553,37 @@ impl<'a> Parser<'a> {
             ));
         }
         let name = self.expect_ident()?;
+        let mut aliases: Vec<String> = Vec::new();
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            self.advance();
+            loop {
+                let alias = self.expect_ident()?;
+                if aliases.len() >= crate::catalog::MAX_COLUMN_COUNT {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many view column aliases",
+                    ));
+                }
+                if aliases.iter().any(|a| a == &alias) {
+                    return Err(SqlSurfaceError::duplicate_column(alias));
+                }
+                aliases.push(alias);
+                match self.advance() {
+                    Some(Token::Punct(',')) => {}
+                    Some(Token::Punct(')')) => break,
+                    _ => {
+                        return Err(SqlSurfaceError::unsupported(
+                            "expected ',' or ')' in view column alias list",
+                        ))
+                    }
+                }
+            }
+        }
         self.expect_ident_matching("AS")?;
         // 本文の構造検証（単純形／評価後射影形の判定。Issue #1192）は呼び出し元
         // （[`validate_create_view_tokens`]）が [`classify_view_body`] で行う。
         // 本文が末尾まで消費し尽くされたことの検証も同関数群が担うため、この
         // Parser 側で追加のトークンを消費する必要はない。
-        Ok((name, self.remaining()))
+        Ok((name, aliases, self.remaining()))
     }
 
     /// `DROP VIEW [IF EXISTS] <name> [;]`（TABLE-18・SQL-23・TASK-205、Issue #909。
@@ -11015,7 +11059,34 @@ pub(crate) fn buffered_layer_statement(
             limit_explicit: false,
             offset: 0,
         })),
+        column_aliases: Vec::new(),
     }))
+}
+
+/// 列別名付きビュー（TABLE-41 (1)・Issue #1659）の層を、下位の文 `body` の上へ素通しで
+/// 重ねる（`sql::view::resolve_from` が評価後射影形ビューの本文・その上の単純形の段に別名が
+/// 付いているとき呼ぶ）。全列射影・`WHERE` なし・`LIMIT` なしで、行は 1 件も増減しない。
+/// 本文の結果列を先頭から改名する処理は `sql::view_buffered::plan_outer` が担う。
+pub(crate) fn buffered_alias_layer(
+    view_name: &str,
+    body: Statement,
+    column_aliases: Vec<String>,
+) -> Statement {
+    Statement::BufferedView(ValidatedBufferedView {
+        view_name: view_name.to_string(),
+        body: Box::new(body),
+        outer: BufferedOuter::Rows(Box::new(BufferedRows {
+            projection: Projection::All,
+            where_predicates: Vec::new(),
+            order_by: Vec::new(),
+            order_keys: Vec::new(),
+            window_items: Vec::new(),
+            limit: u32::MAX,
+            limit_explicit: false,
+            offset: 0,
+        })),
+        column_aliases,
+    })
 }
 
 /// 単純形ビュー本文 `parsed` が評価後射影形ビューの上に重ねられる形か
@@ -11396,9 +11467,17 @@ pub struct ValidatedCreateView {
     pub(crate) base_relation: String,
     /// [`render_view_body`] で描画した正規化 SQL（永続化される値そのもの）。
     pub(crate) body_sql: String,
+    /// 列別名リスト（`CREATE VIEW v (a, b) AS ...`。TABLE-41 (1)・Issue #1659）。空なら
+    /// 別名なし。構文段で件数上限・リスト内の重複を検査済み（出力列数との突合は実行段）。
+    pub(crate) column_aliases: Vec<String>,
 }
 
 impl ValidatedCreateView {
+    /// 列別名リスト（空なら指定なし）。
+    pub fn column_aliases(&self) -> &[String] {
+        &self.column_aliases
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -11438,7 +11517,7 @@ pub(crate) fn validate_create_view_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedCreateView, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
-    let (name, body_tokens) = p.parse_create_view()?;
+    let (name, column_aliases, body_tokens) = p.parse_create_view()?;
     // 判定順序（構文 `42601` → 本文サイズ `54000`）を保つため、本文の構造検証は
     // カタログを照会しない [`StructuralOnlyLookup`] で行う。
     let (base_relation, body_sql) = match classify_view_body(
@@ -11447,6 +11526,15 @@ pub(crate) fn validate_create_view_tokens(
         ViewBodyCheck::Structural,
     )? {
         ViewBodyKind::Simple(body) => {
+            // 列名を明示した単純形本文は出力列数が構造から確定するため、別名の件数超過を
+            // カタログ照会なしで `42601` にする（`*` の本文は実行段が導出して突合する）。
+            if let Projection::Columns(cols) = &body.projection {
+                if column_aliases.len() > cols.len() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "view column alias list is longer than the view's output columns",
+                    ));
+                }
+            }
             let sql = render_stored_simple_view_body(&body)?;
             (body.table_name, sql)
         }
@@ -11478,6 +11566,7 @@ pub(crate) fn validate_create_view_tokens(
         name,
         base_relation,
         body_sql,
+        column_aliases,
     })
 }
 
@@ -12983,7 +13072,14 @@ fn parse_set_branch(
             base_table,
             view_predicates,
             view_columns,
+            column_map,
         } => {
+            // 列別名付きビュー（TABLE-41・Issue #1659）は集合演算の枝では未対応（fail-closed）。
+            if column_map.is_some() {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "a view with column aliases cannot be used in a set operation",
+                ));
+            }
             super::view::check_columns_within_view(
                 view_columns.as_deref(),
                 &projection,
@@ -14135,6 +14231,7 @@ fn build_scan_from_resolved(
             base_table,
             view_predicates,
             view_columns,
+            column_map,
         } => {
             super::view::check_columns_within_view(
                 view_columns.as_deref(),
@@ -14146,7 +14243,29 @@ fn build_scan_from_resolved(
             // Issue #1188: 式キーが参照する列もビューの公開列に限定する（非公開列を
             // `ORDER BY` の式経由で並べ替えの oracle にさせない）。
             super::view::check_order_exprs_within_view(view_columns.as_deref(), &order_keys)?;
-            let projection = if let (Projection::All, Some(cols)) = (&projection, &view_columns) {
+            // 列別名付きビュー（TABLE-41・Issue #1659）: 公開名に対する検査の後で外側を物理名へ
+            // 書き換える。ウィンドウ項目・投影位置のスカラーサブクエリは未対応（fail-closed）。
+            let (projection, where_predicates, order_by, order_keys) = match &column_map {
+                Some(map) => {
+                    if !window_items.is_empty() || !scalar_subquery_items.is_empty() {
+                        return Err(SqlSurfaceError::feature_not_supported(
+                            "window functions and scalar subqueries over a view with column \
+                             aliases are not supported",
+                        ));
+                    }
+                    let map = super::view_alias::ColumnMap::new(map);
+                    (
+                        super::view_alias::rewrite_projection(&map, projection)?,
+                        super::view_alias::rewrite_where(&map, where_predicates)?,
+                        super::view_alias::rewrite_order_by(&map, order_by)?,
+                        super::view_alias::rewrite_order_keys(&map, order_keys)?,
+                    )
+                }
+                None => (projection, where_predicates, order_by, order_keys),
+            };
+            let projection = if let (Projection::All, Some(cols), None) =
+                (&projection, &view_columns, &column_map)
+            {
                 Projection::Columns(cols.clone())
             } else {
                 projection
@@ -14199,6 +14318,7 @@ fn build_aggregate_from_resolved(
             base_table,
             view_predicates,
             view_columns,
+            column_map,
         } => {
             super::view::check_aggregate_columns_within_view(
                 view_columns.as_deref(),
@@ -14206,6 +14326,16 @@ fn build_aggregate_from_resolved(
                 group_by.as_ref(),
                 &where_predicates,
             )?;
+            // 列別名付きビュー（TABLE-41・Issue #1659）: 公開名に対する検査の後で物理名へ書き換える。
+            let (items, where_predicates, group_by) = match &column_map {
+                Some(map) => super::view_alias::rewrite_aggregate(
+                    &super::view_alias::ColumnMap::new(map),
+                    items,
+                    where_predicates,
+                    group_by,
+                )?,
+                None => (items, where_predicates, group_by),
+            };
             let mut merged = view_predicates;
             merged.extend(where_predicates);
             Ok(ValidatedAggregate {
@@ -14272,6 +14402,7 @@ fn aggregate_statement_from_resolved(
                 where_predicates,
                 group_by,
             })),
+            column_aliases: Vec::new(),
         }));
     }
     Ok(Statement::Aggregate(build_aggregate_from_resolved(
@@ -14864,6 +14995,7 @@ fn validate_select_statement(
                         limit_explicit: true,
                         offset: shape.offset,
                     })),
+                    column_aliases: Vec::new(),
                 }));
             }
             Ok(Statement::Scan(build_scan_from_resolved(
@@ -23847,6 +23979,7 @@ mod tests {
                     Ok(Some(crate::catalog::ViewDef {
                         base_relation: "documents".to_string(),
                         body_sql: "SELECT id FROM documents".to_string(),
+                        column_aliases: Vec::new(),
                     }))
                 } else {
                     Ok(None)
@@ -24331,5 +24464,48 @@ mod body_expr_policy_tests {
         let tokens = crate::sql::lexer::tokenize("SELECT * FROM docs").expect("tok");
         let mut body = parse_view_body(&tokens).expect("parse");
         assert!(!rename_column_in_view_body(&mut body, "note", "memo").expect("noop"));
+    }
+
+    /// `CREATE VIEW v (a, b) AS ...` の列別名リストの構造検証（TABLE-41 (1)・Issue #1659）。
+    /// カタログは照会しない: 空・末尾カンマ・識別子でない要素は `42601`、件数超過は `54000`、
+    /// リスト内の重複は `42701`、明示列より長いリストは `42601`。短いリストと `*` は構造段では通る。
+    #[test]
+    fn create_view_column_alias_list_structural_checks() {
+        let check = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tok");
+            validate_create_view_tokens(&tokens)
+        };
+        let ok = check("CREATE VIEW v (a, b) AS SELECT x, y FROM docs").expect("ok");
+        assert_eq!(ok.column_aliases(), ["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            check("CREATE VIEW v (a) AS SELECT x, y FROM docs")
+                .expect("short")
+                .column_aliases()
+                .len(),
+            1
+        );
+        assert!(check("CREATE VIEW v (a, b, c) AS SELECT * FROM docs").is_ok());
+        assert!(check("CREATE VIEW v AS SELECT * FROM docs")
+            .expect("none")
+            .column_aliases()
+            .is_empty());
+        for sql in [
+            "CREATE VIEW v () AS SELECT * FROM docs",
+            "CREATE VIEW v (a,) AS SELECT * FROM docs",
+            "CREATE VIEW v (a b) AS SELECT * FROM docs",
+            "CREATE VIEW v (1) AS SELECT * FROM docs",
+            "CREATE VIEW v (a, b, c) AS SELECT x, y FROM docs",
+            "CREATE VIEW v (a AS SELECT * FROM docs",
+        ] {
+            let err = check(sql).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+        let dup = check("CREATE VIEW v (a, a) AS SELECT * FROM docs").expect_err("dup");
+        assert_eq!(dup.wire_code(), "42701");
+        let many: Vec<String> = (0..=crate::catalog::MAX_COLUMN_COUNT)
+            .map(|i| format!("c{i}"))
+            .collect();
+        let sql = format!("CREATE VIEW v ({}) AS SELECT * FROM docs", many.join(", "));
+        assert_eq!(check(&sql).expect_err("too many").wire_code(), "54000");
     }
 }

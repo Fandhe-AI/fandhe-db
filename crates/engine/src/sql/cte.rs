@@ -151,7 +151,16 @@ fn compose(inner: Resolved, def: &CteDef) -> Result<Resolved, SqlSurfaceError> {
             base_table,
             view_predicates,
             view_columns,
-        } => (base_table, view_predicates, view_columns),
+            column_map,
+        } => {
+            // 列別名付きビュー（TABLE-41・Issue #1659）は CTE の本文からは未対応（fail-closed）。
+            if column_map.is_some() {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "a view with column aliases cannot be used in a CTE",
+                ));
+            }
+            (base_table, view_predicates, view_columns)
+        }
         // Issue #1192: 評価後射影形ビューは CTE から参照できない
         // （外側の合成ができないため）。
         Resolved::Buffered { .. } => {
@@ -185,6 +194,7 @@ fn compose(inner: Resolved, def: &CteDef) -> Result<Resolved, SqlSurfaceError> {
         base_table,
         view_predicates: acc_predicates,
         view_columns: next_exposed,
+        column_map: None,
     })
 }
 

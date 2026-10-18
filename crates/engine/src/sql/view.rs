@@ -39,6 +39,12 @@ pub(crate) enum Resolved {
         /// （連鎖の各段の投影を内側から積み上げた結果。`None` は連鎖のどの
         /// 段も列を絞り込んでいない——全段が `SELECT *`——ことを意味する）。
         view_columns: Option<Vec<String>>,
+        /// 列別名リスト付きビュー（TABLE-41 (1)・Issue #1659）が連鎖に含まれるときの、
+        /// `view_columns`（公開名）と同じ並びの「公開名 → 基底表の物理列名」対応。連鎖に別名の段が
+        /// 無ければ `None`（従来どおり公開名＝物理名）。`Some` のときの消費側は、列スコープ検査を
+        /// 公開名に対して先に行ってから `sql::view_alias` で物理名へ書き換えるか、書き換えに
+        /// 未対応の形を `0A000` で拒否する（fail-closed）。
+        column_map: Option<Vec<(String, String)>>,
     },
     /// 評価後射影形ビュー（Issue #1192。`LIMIT`・`ORDER BY`・集計・JOIN を含む
     /// 本文）。インライン展開できない（外側の `WHERE` を合成すると `LIMIT`／集計の
@@ -79,7 +85,7 @@ pub(crate) fn resolve_from(
     // 行わない——内側の露出列が確定するまでは外側の参照が妥当かどうか
     // 判断できないため、確定は第 2 パスへ分離する）。
     let mut current = name.to_string();
-    let mut chain: Vec<(String, super::allowlist::ParsedViewBody)> = Vec::new();
+    let mut chain: Vec<(String, super::allowlist::ParsedViewBody, Vec<String>)> = Vec::new();
     let mut depth: u32 = 0;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -94,6 +100,7 @@ pub(crate) fn resolve_from(
             Some(ViewDef {
                 base_relation,
                 body_sql,
+                column_aliases,
             }) => {
                 let parsed = match reparse_stored_body(&body_sql) {
                     Ok(parsed) => parsed,
@@ -104,12 +111,28 @@ pub(crate) fn resolve_from(
                         // Issue #1411）、クエリとの間にある単純形ビューの段は内側から順に
                         // 行形の外側として重ねる。
                         let mut stmt = reparse_buffered_body(lookup, &body_sql)?;
-                        for (layer_name, layer) in chain.into_iter().rev() {
+                        // 列別名（TABLE-41・Issue #1659）は、その段の出力列を先頭から改名する
+                        // 素通しの層として本文・各段の直後に重ねる（`plan_outer` が改名する）。
+                        if !column_aliases.is_empty() {
+                            stmt = super::allowlist::buffered_alias_layer(
+                                &current,
+                                stmt,
+                                column_aliases,
+                            );
+                        }
+                        for (layer_name, layer, layer_aliases) in chain.into_iter().rev() {
                             stmt = super::allowlist::buffered_layer_statement(
                                 &layer_name,
                                 stmt,
                                 layer,
                             )?;
+                            if !layer_aliases.is_empty() {
+                                stmt = super::allowlist::buffered_alias_layer(
+                                    &layer_name,
+                                    stmt,
+                                    layer_aliases,
+                                );
+                            }
                         }
                         return Ok(Resolved::Buffered {
                             view_name: name.to_string(),
@@ -123,7 +146,7 @@ pub(crate) fn resolve_from(
                         "view nesting depth exceeds limit",
                     ));
                 }
-                chain.push((current.clone(), parsed));
+                chain.push((current.clone(), parsed, column_aliases));
                 current = base_relation;
             }
             None => {
@@ -149,8 +172,11 @@ pub(crate) fn resolve_from(
     // 参照した場合（`CREATE VIEW` 自体はカタログ照会を行わないため作成時
     // には検出されない）も、連鎖のどの段であれ参照時に一様に拒否できる。
     let mut exposed: Option<Vec<String>> = None;
+    // 列別名の段（TABLE-41・Issue #1659）を含むときの「公開名 → 物理名」対応。別名の段が
+    // まだ現れていない間は `None`（公開名＝物理名）。
+    let mut column_map: Option<Vec<(String, String)>> = None;
     let mut acc_predicates: Vec<WherePredicate> = Vec::new();
-    for (_, view) in chain.into_iter().rev() {
+    for (_, mut view, aliases) in chain.into_iter().rev() {
         // ビュー本文（`ParsedViewBody`）は構文上 `ORDER BY` を持たない
         // （[`parse_view_body`] のドキュメント参照）ため、連鎖の各段の検査には
         // 空スライスを渡す（クエリ自身の ORDER BY 検査は呼び出し元
@@ -161,19 +187,149 @@ pub(crate) fn resolve_from(
             &view.where_predicates,
             &[],
         )?;
-        if let Projection::Columns(cols) = view.projection {
-            exposed = Some(cols);
+        // この段の `WHERE` は親の公開名で書かれている。親が列別名を持つなら、別名を重ねる前の
+        // 対応（親の `column_map`）で物理名へ書き換えてから合成する（TABLE-41・Issue #1659）。
+        let layer_predicates = match &column_map {
+            Some(map) => super::view_alias::rewrite_where(
+                &super::view_alias::ColumnMap::new(map),
+                std::mem::take(&mut view.where_predicates),
+            )?,
+            None => std::mem::take(&mut view.where_predicates),
+        };
+        if aliases.is_empty() {
+            if let Projection::Columns(cols) = view.projection {
+                if let Some(map) = &column_map {
+                    // 親の別名対応を通して物理名を引き継ぐ（親に無い列は検査済みのため到達しない）。
+                    let next = cols
+                        .iter()
+                        .map(|c| (c.clone(), physical_of(map, c)))
+                        .collect::<Vec<_>>();
+                    column_map = Some(next);
+                }
+                exposed = Some(cols);
+            }
+        } else {
+            let out_names: Vec<String> = match &view.projection {
+                Projection::Columns(cols) => cols.clone(),
+                Projection::All => match &exposed {
+                    Some(cols) => cols.clone(),
+                    None => star_columns_of_table(lookup, &base_table)?,
+                },
+                // 単純形の段は列射影のみを許す（式項目への別名は未対応。fail-closed）。
+                Projection::Items(_) => {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "view column aliases over a computed projection are not supported",
+                    ));
+                }
+            };
+            if aliases.len() > out_names.len() {
+                return Err(SqlSurfaceError::unsupported(
+                    "view column alias list is longer than the view's output columns",
+                ));
+            }
+            let mut next: Vec<(String, String)> = Vec::with_capacity(out_names.len());
+            for (i, out) in out_names.iter().enumerate() {
+                let physical = match &column_map {
+                    Some(map) => physical_of(map, out),
+                    None => out.clone(),
+                };
+                let public = aliases.get(i).cloned().unwrap_or_else(|| out.clone());
+                // 公開名の重複は曖昧なまま片方を選ばず拒否する（`42702`。fail-closed）。
+                if next.iter().any(|(p, _)| p == &public) {
+                    return Err(SqlSurfaceError::ambiguous_column(public));
+                }
+                next.push((public, physical));
+            }
+            exposed = Some(next.iter().map(|(p, _)| p.clone()).collect());
+            column_map = Some(next);
         }
         // 内側（より深い）のビューの述語を先頭に置く（§設計「述語合成」）。
         // ここでは内側から外側へ順に処理しているため、単純な追記でよい。
-        acc_predicates.extend(view.where_predicates);
+        acc_predicates.extend(layer_predicates);
     }
 
     Ok(Resolved::View {
         base_table,
         view_predicates: acc_predicates,
         view_columns: exposed,
+        column_map,
     })
+}
+
+/// `CREATE VIEW` 本文の出力列の導出結果（[`body_output`]）。
+pub(crate) enum BodyOutput {
+    /// 出力列名が確定した（単純形本文。`SELECT *` は `id` 先頭＋利用者列）。
+    Names(Vec<String>),
+    /// 評価後射影形の本文（または評価後射影形ビューの上に重なる単純形の段）。列名は文の
+    /// Describe（本文を実行しない）で得る。
+    Statement(Box<Statement>),
+}
+
+/// `CREATE VIEW v (a, b) AS <body>`（TABLE-41 (1)・Issue #1659）の列別名の長さ検査・最終名の
+/// 重複検査のために、本文の出力列を実カタログ `lookup` で導出する。単純形本文は参照時の別名適用と
+/// 同じ規則（[`star_columns_of_table`]・[`resolve_from`]）で名前を確定し、`*` の展開規則を 2 か所に
+/// 複製しない。参照先が存在しない場合は `42P01`（`resolve_from` と同じ）。
+pub(crate) fn body_output(
+    lookup: &impl TableLookup,
+    kind: super::allowlist::ViewBodyKind,
+) -> Result<BodyOutput, SqlSurfaceError> {
+    let parsed = match kind {
+        ViewBodyKind::Buffered { stmt, .. } => return Ok(BodyOutput::Statement(stmt)),
+        ViewBodyKind::Simple(parsed) => parsed,
+    };
+    let parent: Vec<String> = match resolve_from(lookup, &parsed.table_name)? {
+        Resolved::Table => star_columns_of_table(lookup, &parsed.table_name)?,
+        Resolved::View {
+            base_table,
+            view_columns,
+            ..
+        } => match view_columns {
+            Some(cols) => cols,
+            None => star_columns_of_table(lookup, &base_table)?,
+        },
+        Resolved::Buffered { body, .. } => {
+            let layer = super::allowlist::buffered_layer_statement(
+                &parsed.table_name,
+                *body,
+                parsed.clone(),
+            )?;
+            return Ok(BodyOutput::Statement(Box::new(layer)));
+        }
+    };
+    match &parsed.projection {
+        Projection::Columns(cols) => Ok(BodyOutput::Names(cols.clone())),
+        Projection::All => Ok(BodyOutput::Names(parent)),
+        Projection::Items(_) => Err(SqlSurfaceError::feature_not_supported(
+            "view column aliases over a computed projection are not supported",
+        )),
+    }
+}
+
+/// 公開名 `public` に対応する物理列名（対応表に無ければ同名。呼び出し元は公開列の範囲検査を
+/// 済ませているため、無い場合は別名を持たない段の列）。
+fn physical_of(map: &[(String, String)], public: &str) -> String {
+    map.iter()
+        .find(|(p, _)| p == public)
+        .map(|(_, phys)| phys.clone())
+        .unwrap_or_else(|| public.to_string())
+}
+
+/// 基底表に対する `SELECT *` の出力列名（`id` が先頭で、利用者列がスキーマ順に続く。
+/// `parser::bind_projection` の `Projection::All` と同じ並び。`tenant_id`・`visibility` は含めない）。
+/// 列を導出できない lookup（構造検証専用など）は `0A000`（fail-closed）。
+/// `sql::view::star_output_columns`（CREATE 時の長さ検査）と参照時の別名適用が共有する。
+pub(crate) fn star_columns_of_table(
+    lookup: &impl TableLookup,
+    table: &str,
+) -> Result<Vec<String>, SqlSurfaceError> {
+    let Some(columns) = lookup.table_columns(table)? else {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "view column aliases need the table's columns, which are unavailable here",
+        ));
+    };
+    let mut out = vec!["id".to_string()];
+    out.extend(columns.into_iter().filter(|c| c != "id"));
+    Ok(out)
 }
 
 /// 格納済み `body_sql`（`sql::allowlist::render_view_body` の出力）を再トークン化・
@@ -670,6 +826,7 @@ mod tests {
         ViewDef {
             base_relation: base.to_string(),
             body_sql: body.to_string(),
+            column_aliases: Vec::new(),
         }
     }
 
