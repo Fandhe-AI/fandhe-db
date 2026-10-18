@@ -226,6 +226,17 @@ impl<L: TableLookup + ?Sized> TableLookup for SessionRelationLookup<'_, L> {
     fn buffered_depth(&self) -> usize {
         self.inner.buffered_depth()
     }
+
+    fn materialized_view_columns(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<crate::catalog::ColumnDef>>, SqlSurfaceError> {
+        if self.temp_entry(name).is_some() {
+            // 一時表は同名の永続 matview を隠す。
+            return Ok(None);
+        }
+        self.inner.materialized_view_columns(name)
+    }
 }
 
 /// トークン列に、一時表の名前と ASCII 大小無視で一致する識別子があるか。一致しすぎても

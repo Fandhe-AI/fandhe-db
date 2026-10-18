@@ -63,6 +63,8 @@ use crate::search_engine;
 use crate::storage::{Row, Storage, StorageError};
 use redb::ReadableDatabase;
 
+mod matview_exec;
+
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
 /// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は
 /// `OFFSET`・集合演算の枝行数・サブクエリ内側行数など他の内部上限として固定のまま残す。
@@ -1198,6 +1200,11 @@ pub struct EngineCore {
     /// のみ（起動時 1 回）。文の `LIMIT`・`FETCH n`・集合演算／JOIN 文の `LIMIT` の
     /// 範囲判定にだけ効き、`OFFSET`・枝行数・サブクエリ内側行数の上限とは連動しない。
     result_limits: crate::result_limits::ResultLimits,
+    /// MATERIALIZED VIEW の初回実体化の対象文脈（TABLE-42・Issue #1664）。`None` は未設定で、
+    /// 作成したセッションの文脈だけを実体化する（安全側。それ以外の文脈からの読み取りは `55000`）。
+    /// 差し替えは [`Self::with_materialization_contexts`] のみ（起動時 1 回）。クライアントの
+    /// 申告値は使わず、認証構成から導出した文脈だけを注入する。
+    materialization_contexts: Option<std::sync::Arc<Vec<PolicyContext>>>,
     /// 述語形 UPDATE／DELETE の分割実行（Issue #1128・ADR `docs/design/partitioned-dml.md`
     /// §15.2）のチャンク幅・走査予算・writer 保持時間。差し替えは
     /// [`Self::with_partitioned_dml_limits`] のみ（起動時に 1 回）。
@@ -1616,6 +1623,15 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `ParsedSql` を
     /// 網羅的にマッチする既存コードはすべて更新済み。
     DropView(crate::sql::allowlist::ValidatedDropView),
+    /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <name> [(<alias>, ...)] AS <body>
+    /// [WITH [NO] DATA]`（TABLE-42・Issue #1664）。DDL 実行権限ゲートの判定と初回実体化は
+    /// `EngineCore::execute_parsed_in_session` の同名腕が担い、構文検証
+    /// （`validate_create_materialized_view_tokens`）はカタログを一切照会しない（`CreateView` と
+    /// 同じ設計）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1664）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    CreateMaterializedView(crate::sql::allowlist::ValidatedCreateMaterializedView),
     /// `CREATE INDEX <name> ON <table> [USING hnsw] (<col>[, ...])`（TASK-206・
     /// INDEX-7・SQL-23、Issue #908）。DDL 実行権限ゲート
     /// （`sql::ddl::require_ddl_permission`）の判定は `EngineCore::
@@ -1675,6 +1691,8 @@ fn statement_clock_scope(
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateView(_)
         | ParsedSql::DropView(_)
+        // TABLE-42・Issue #1664: `CreateView` と同じく本文の時刻関数は束縛段で拒否する（fail-closed）。
+        | ParsedSql::CreateMaterializedView(_)
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_)
         | ParsedSql::CreateType(_)
@@ -1718,6 +1736,7 @@ fn insert_default_clock_scope(
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateView(_)
         | ParsedSql::DropView(_)
+        | ParsedSql::CreateMaterializedView(_)
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_)
         | ParsedSql::CreateType(_)
@@ -2309,6 +2328,7 @@ impl EngineCore {
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             join_limits: crate::join_limits::JoinSizeLimits::default(),
             result_limits: crate::result_limits::ResultLimits::default(),
+            materialization_contexts: None,
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
@@ -2675,6 +2695,28 @@ impl EngineCore {
     /// （現行挙動）。
     pub fn with_result_limits(mut self, limits: crate::result_limits::ResultLimits) -> Self {
         self.result_limits = limits;
+        self
+    }
+
+    /// MATERIALIZED VIEW の初回実体化の対象文脈を差し替えたビルダーを返す（TABLE-42・Issue #1664）。
+    /// `wire-server` が起動時に認証構成（UserStore）のテナント集合から導出した文脈を 1 回だけ
+    /// 注入する。文脈は [`crate::catalog::materialized::ContextKey`] で重複を除き、決定的な順序に
+    /// 並べる。未呼び出し（Rust API の埋め込み・テスト）なら作成セッションの文脈だけを実体化する。
+    pub fn with_materialization_contexts(mut self, contexts: Vec<PolicyContext>) -> Self {
+        let mut keyed: Vec<(crate::catalog::materialized::ContextKey, PolicyContext)> = contexts
+            .into_iter()
+            .map(|c| {
+                (
+                    crate::catalog::materialized::ContextKey::from_context(&c),
+                    c,
+                )
+            })
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        keyed.dedup_by(|a, b| a.0 == b.0);
+        self.materialization_contexts = Some(std::sync::Arc::new(
+            keyed.into_iter().map(|(_, c)| c).collect(),
+        ));
         self
     }
 
@@ -3376,6 +3418,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::CreateMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
@@ -3420,6 +3463,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::CreateMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
@@ -3461,6 +3505,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::CreateMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
@@ -3509,6 +3554,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::CreateMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
@@ -3536,6 +3582,13 @@ impl EngineCore {
             // 経路を通るため、同じくセッションを要する実行本体へ委譲する。
             // SQL-43（Issue #1531）: `FROM` なし定数式 SELECT もセッション UDF
             // レジストリを参照しうるため、同じくセッション付き実行本体へ委譲する。
+            // TABLE-42・Issue #1664: matview の葉は `BufferedView` の本文としてのみ現れ、
+            // 単独の文としては生成されない（防御的に fail-closed）。
+            crate::sql::allowlist::Statement::MaterializedView(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "unexpected materialized view statement".to_string(),
+                })
+            }
             stmt @ (crate::sql::allowlist::Statement::Join(_)
             | crate::sql::allowlist::Statement::BufferedView(_)
             | crate::sql::allowlist::Statement::ConstSelect(_)) => {
@@ -3556,6 +3609,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::CreateMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
@@ -3695,7 +3749,14 @@ impl EngineCore {
             let wrong_kind = match self.storage.view_definition(name) {
                 Ok(Some(_)) => true,
                 Ok(None) => match self.storage.index_exists(name) {
-                    Ok(found) => found,
+                    Ok(true) => true,
+                    // matview（TABLE-42・Issue #1664）も行を直接書けないオブジェクト。表・ビュー・
+                    // 索引と名前空間を共有するため、書き込み対象にされたら `42809` へ揃える。
+                    // 照会の失敗は「存在しない」と同一視せず、同じ写像で `XX000` にする。
+                    Ok(false) => match self.storage.materialized_view_definition(name) {
+                        Ok(def) => def.is_some(),
+                        Err(lookup_err) => return crate::catalog::table_lookup_error(lookup_err),
+                    },
                     Err(lookup_err) => return crate::catalog::table_lookup_error(lookup_err),
                 },
                 Err(lookup_err) => return crate::catalog::table_lookup_error(lookup_err),
@@ -3704,6 +3765,28 @@ impl EngineCore {
                 return crate::sql::allowlist::SqlSurfaceError::WrongObjectType {
                     name: name.clone(),
                 };
+            }
+        }
+        e
+    }
+
+    /// `COPY FROM` の対象が matview のとき `42809` へ読み替える（TABLE-42・Issue #1664。行を直接書けない
+    /// オブジェクトへの書き込みは、`UndefinedTable` ではなく種別違いで報告する）。ビュー・索引の読み替えは
+    /// 従来どおりこの経路では行わない（既存挙動を変えない）。照会の失敗は「存在しない」と同一視せず
+    /// `table_lookup_error` で写す（fail-closed）。
+    fn reclassify_matview_write_error(
+        &self,
+        e: crate::sql::allowlist::SqlSurfaceError,
+    ) -> crate::sql::allowlist::SqlSurfaceError {
+        if let crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name } = &e {
+            match self.storage.materialized_view_definition(name) {
+                Ok(Some(_)) => {
+                    return crate::sql::allowlist::SqlSurfaceError::WrongObjectType {
+                        name: name.clone(),
+                    }
+                }
+                Ok(None) => {}
+                Err(lookup_err) => return crate::catalog::table_lookup_error(lookup_err),
             }
         }
         e
@@ -4154,6 +4237,13 @@ impl EngineCore {
                 Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case(word)
             )
         };
+        // TABLE-42・Issue #1664: `CREATE MATERIALIZED VIEW` は `CREATE VIEW` の判定より前に分岐する。
+        // 構造検証のみでカタログを照会しない（`CreateView` と同じ設計）。`CREATE OR REPLACE
+        // MATERIALIZED` は下の `CREATE VIEW` 経路が `OR REPLACE` の後の `VIEW` を要求して `42601`。
+        if crate::sql::allowlist::is_create_materialized_view_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_materialized_view_tokens(&tokens)?;
+            return Ok(ParsedSql::CreateMaterializedView(stmt));
+        }
         // `CREATE VIEW` に加え `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）も同じ経路へ
         // 入れる。`CREATE OR REPLACE` の後が `VIEW` 以外（`TABLE`・`INDEX` 等）は従来どおり汎用経路で
         // `42601` になる。
@@ -5009,6 +5099,14 @@ impl EngineCore {
                 };
                 Ok(crate::sql::SqlOutcome::CreateView(outcome))
             }
+            // TABLE-42・Issue #1664: DDL 権限ゲートを名前解決・カタログ照会より先に置く
+            // （権限の無い主体へ relation の有無・列構成を返さない）。以降は write txn 内で
+            // 列の確定・本文の評価・定義と実体の原子的な作成を行う。
+            ParsedSql::CreateMaterializedView(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = self.execute_create_materialized_view(ctx, session, stmt)?;
+                Ok(crate::sql::SqlOutcome::CreateMaterializedView(outcome))
+            }
             ParsedSql::DropView(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 let outcome = crate::sql::ddl::execute_drop_view(&self.storage, stmt)?;
@@ -5674,6 +5772,7 @@ impl EngineCore {
             | Statement::SetTimeZone { .. }
             | Statement::ShowTimeZone
             | Statement::CreateFunction { .. }
+            | Statement::MaterializedView(_)
             | Statement::ConstSelect(_) => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "unexpected statement in transactional read path".to_string(),
             }),
@@ -6030,6 +6129,8 @@ impl EngineCore {
             // TABLE-18・SQL-23・TASK-205（Issue #909）: DDL につき結果列を持たない
             // （`DropTable` と同じ扱い）。
             ParsedSql::CreateView(_) => Ok(None),
+            // TABLE-42・Issue #1664: DDL につき結果列を持たない（Describe は本体を実行しない）。
+            ParsedSql::CreateMaterializedView(_) => Ok(None),
             ParsedSql::DropView(_) => Ok(None),
             // TASK-206・INDEX-7（Issue #908）: 索引 DDL も結果列を持たない。
             ParsedSql::CreateIndex(_) => Ok(None),
@@ -6158,6 +6259,11 @@ impl EngineCore {
                     limits,
                 )?;
                 Ok(Some(columns))
+            }
+            // TABLE-42・Issue #1664: matview の葉。列は参照時に束縛した定義の列で、実体の有無は
+            // Describe では判定しない（本体を実行しない契約）。
+            ParsedSql::Statement(Statement::MaterializedView(v)) => {
+                Ok(Some(crate::sql::matview::describe_columns(v)))
             }
             // Issue #1192（TABLE-18）: 評価後射影形ビュー。本文の結果列を
             // （本文は実行せずに）導出し、外側の射影だけを適用する。
@@ -6628,6 +6734,13 @@ impl EngineCore {
                 let result = crate::sql::const_select::run(&validated, session.udfs())?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
+            // TABLE-42・Issue #1664: matview の葉は `BufferedView` の本文としてのみ現れ、単独の
+            // 文としては生成されない（防御的に fail-closed）。
+            crate::sql::allowlist::Statement::MaterializedView(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "unexpected materialized view statement".to_string(),
+                })
+            }
         }
     }
 
@@ -6828,6 +6941,13 @@ impl EngineCore {
                         detail: "internal error".to_string(),
                     }),
                 }
+            }
+            // TABLE-42・Issue #1664: matview の葉。読み手の `ctx`（RLS 暗黙適用と同じ文脈）に
+            // 完全一致する文脈の実体だけを、同一の `read_txn`（単一スナップショット）から読む。
+            // 外側の WHERE・ORDER BY・射影・LIMIT は呼び出し元の `BufferedView` 腕が適用する。
+            crate::sql::allowlist::Statement::MaterializedView(validated) => {
+                let result = crate::sql::matview::execute_read(read_txn, ctx, &validated)?;
+                Ok(crate::sql::SqlOutcome::Query(result))
             }
             _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "internal error".to_string(),
@@ -8436,7 +8556,8 @@ impl EngineCore {
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         Self::copy_temp_gate(session, sql)?;
-        let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)?;
+        let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)
+            .map_err(|e| self.reclassify_matview_write_error(e))?;
         self.begin_copy_validated(ctx, session, stmt, None)
     }
 
@@ -8450,7 +8571,9 @@ impl EngineCore {
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         match stmt {
             crate::sql::allowlist::CopyStatement::From(v) => {
-                let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
+                let (_read_txn, schema) = self
+                    .read_txn_with_schema(&v.table_name)
+                    .map_err(|e| self.reclassify_matview_write_error(e))?;
                 // SQL-37・Issue #1587: COPY の行ごとの束縛は複数の wire メッセージにまたがるため、
                 // 列 `DEFAULT now()` 系の評価時刻（文の開始時刻・明示トランザクションでは
                 // トランザクション開始時刻）をここで確定してセッションへ持たせる。
@@ -8525,7 +8648,8 @@ impl EngineCore {
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         Self::copy_temp_gate(session, sql)?;
-        let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)?;
+        let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)
+            .map_err(|e| self.reclassify_matview_write_error(e))?;
         if let crate::sql::allowlist::CopyStatement::To(v) = &stmt {
             // 通常の読み取り文と同じ文実行前チェック（文数・持続時間の上限。
             // 超過時は `Failed` へ遷移して拒否する）。`COPY FROM` は

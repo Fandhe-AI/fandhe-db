@@ -1173,6 +1173,7 @@ Date: <IMF-fixdate>
 | `23505` | `DUPLICATE_OPERATION_ID` | 409 | Conflict | 台帳照合で内容一致と判定された `operation_id` の再送（`insert`／`update`／`delete`。`wire_code` は `UNIQUE_VIOLATION` と共有し `code` で区別。commit 済み確定の根拠。Issue #1180） |
 | `23514` | `CHECK_VIOLATION` | 409 | Conflict | `insert`／`update` が書き込む行が `CHECK` 制約（TABLE-16・TASK-204）を満たさない |
 | `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`／`CREATE VIEW`／`CREATE INDEX` は op 許可リスト外。後述） |
+| `55000` | `OBJECT_NOT_IN_PREREQUISITE_STATE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（未実体化の MATERIALIZED VIEW〔TABLE-42〕の読み取りは SQL 表層のみ。後述） |
 | `VD001` | `PARTIAL_COMPLETION` | 409 | Conflict | 分割実行 DML（`update`／`delete` の `mode: "partitioned"`。SQL 表層は `... PARTITIONED`）が 1 チャンク以上 commit した後に止まった（Issue #1130。本文に `data` が付く。後述） |
 | `VD002` | `PARTITIONED_DML_CANCELLED` | 409 | Conflict | `cancel_partitioned_dml`（SQL 表層は `CANCEL PARTITIONED DML`）で取り消された分割実行 DML、または取り消し済みジョブへの再送（Issue #1130。本文に `data` が付く。後述） |
 | `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過、`FOREIGN KEY` 参照アクション連鎖（`ON DELETE CASCADE` 等。宣言が SQL／NoSQL いずれでも。Issue #1148）の深さ・行数上限超過（副作用ゼロ） |
@@ -1181,8 +1182,8 @@ Date: <IMF-fixdate>
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 16 分類（`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
-`42809`・`42703`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 17 分類（`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
+`42809`・`42703`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`・`55000`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
@@ -1210,6 +1211,8 @@ SQL-28・RLS-10）は複数テーブル参照スコープの束縛基盤（`sql:
 `42P16`（400）になる（Issue #1412。到達不能の一覧からは外した）。名前付き主キー
 （`primary_key` の `name`）は Issue #1437 で受け付けるようになった（SQL の
 `CONSTRAINT <name> PRIMARY KEY` と同じカタログ表現・同じ `wire_code`）。
+`ObjectNotInPrerequisiteState`（`55000`。TABLE-42、Issue #1664）は未実体化の MATERIALIZED VIEW を
+読んだときの分類で、NoSQL 表層は matview を表として解決しない（実要求は表の不在として拒否される）ため到達しない。
 `CardinalityViolation`（`21000`。SQL-29、Issue #1404）はスカラーサブクエリの
 2 行以上返却で、NoSQL 表層にサブクエリ構文が無いため到達しない。
 `PartialCompletion`（`VD001`）・`PartitionedDmlCancelled`（`VD002`。SQL-19・

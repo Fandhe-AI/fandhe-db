@@ -1782,7 +1782,12 @@ fn undefined_table_or_view(storage: &Storage, name: &str) -> SqlSurfaceError {
     let wrong_kind = match storage.view_definition(name) {
         Ok(Some(_)) => true,
         Ok(None) => match storage.index_exists(name) {
-            Ok(found) => found,
+            Ok(true) => true,
+            // matview（TABLE-42・Issue #1664）も表と名前空間を共有する別種のオブジェクト。
+            Ok(false) => match storage.materialized_view_definition(name) {
+                Ok(def) => def.is_some(),
+                Err(e) => return crate::catalog::table_lookup_error(e),
+            },
             Err(e) => return crate::catalog::table_lookup_error(e),
         },
         Err(e) => return crate::catalog::table_lookup_error(e),
@@ -2287,6 +2292,57 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
 /// ないが、`Insert`／`Truncate` と異なり返す値自体がないため設計を揃える）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateViewOutcome {}
+
+/// `CREATE MATERIALIZED VIEW ...`（TABLE-42・Issue #1664）の成功応答。
+///
+/// テナント境界（P0）: 行数は **作成したセッション自身の文脈の実体の行数だけ**を運ぶ。他の文脈
+/// （他テナント・別の可視性集合）の件数を合算すると、DDL 権限を持つ主体に他テナントの件数が
+/// 漏れるため、合算は構造的にできない（フィールドを 1 つの `Option<u64>` に限る）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateMaterializedViewOutcome {
+    /// `IF NOT EXISTS` により同名の relation があって何もしなかったか。
+    pub(crate) skipped: bool,
+    /// `WITH DATA` で初回実体化したか（`WITH NO DATA`・`skipped` では偽）。
+    pub(crate) populated: bool,
+    /// 作成者の文脈の実体の行数（`WITH DATA` で作成者の文脈が実体化対象だったときだけ `Some`）。
+    pub(crate) own_rows: Option<u64>,
+}
+
+impl CreateMaterializedViewOutcome {
+    /// `IF NOT EXISTS` の no-op か。
+    pub fn skipped(&self) -> bool {
+        self.skipped
+    }
+
+    /// 初回実体化を行ったか。
+    pub fn populated(&self) -> bool {
+        self.populated
+    }
+
+    /// 作成者自身の文脈の実体の行数（`SELECT <n>` タグ用）。他文脈の件数は含まない。
+    /// 実体化していない場合・作成者の文脈が実体化対象外の場合は `None`。
+    pub fn own_rows(&self) -> Option<u64> {
+        self.own_rows
+    }
+}
+
+/// `CatalogError` を `CREATE MATERIALIZED VIEW`（TABLE-42・Issue #1664）の SQL 表層の契約へ写像する。
+/// 名前衝突 `42P07`、参照先不存在 `42P01`、件数・行数・本文サイズ上限 `54000`、書き込みゲート待機の
+/// 超過 `55P03`。文言に他テナントの情報・内部詳細を含めない。
+pub(crate) fn map_create_matview_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::TableAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
+        CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
+        CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        CatalogError::Invalid(_) => SqlSurfaceError::feature_not_supported(
+            "materialized view definition or data cannot be stored",
+        ),
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "CREATE MATERIALIZED VIEW failed".to_string(),
+        },
+    }
+}
 
 /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）の成功応答。
 #[derive(Debug, Clone, PartialEq, Eq)]

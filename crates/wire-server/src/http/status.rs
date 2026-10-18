@@ -65,6 +65,9 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // 待ちタイムアウト。NoSQL 表層からは `insert`／`update`／`delete` op が
         // 待たされて到達しうる（一時的なサーバー側の輻輳として 503 に射影する）。
         ErrorClass::LockNotAvailable => 503,
+        // TABLE-42・Issue #1664: 未実体化の MATERIALIZED VIEW の読み取り。対象の状態と
+        // 矛盾する操作として 409（NoSQL 表層からは matview へ到達できないが網羅 match のため定義）。
+        ErrorClass::ObjectNotInPrerequisiteState => 409,
         ErrorClass::ProtocolViolation
         | ErrorClass::UnsupportedSqlSyntax
         | ErrorClass::InvalidInput
@@ -217,6 +220,7 @@ mod tests {
         (ErrorClass::IntervalFieldOverflow, 400),
         (ErrorClass::InvalidTextRepresentation, 400),
         (ErrorClass::LockNotAvailable, 503),
+        (ErrorClass::ObjectNotInPrerequisiteState, 409),
         (ErrorClass::InvalidTransactionState, 400),
         (ErrorClass::ActiveSqlTransaction, 400),
         (ErrorClass::NoActiveSqlTransaction, 400),

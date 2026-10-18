@@ -484,3 +484,133 @@ fn cascade_closure_views_referenced_by_matview_are_rejected() {
     assert!(s.relation_name_exists("v2").expect("v2"));
     assert!(s.relation_name_exists("mv_v2").expect("mv"));
 }
+/// 定義と全文脈の実体を 1 つの write txn で作る（TABLE-42 (2)(3)・Issue #1664）。commit 前に
+/// 失敗（行数超過・文脈キー重複・列に合わない行・名前衝突）すれば何も残らない。
+fn create_with_entities(
+    s: &Storage,
+    d: &MaterializedViewDef,
+    entities: Option<&[ContextEntity]>,
+    max_rows: usize,
+) -> Result<()> {
+    let write_txn = s
+        .begin_write_txn()
+        .map_err(crate::catalog::convert_storage_error)?;
+    create_materialized_view_in_txn(&write_txn, d, entities, max_rows)?;
+    crate::storage::commit_write_txn(write_txn, true).map_err(crate::catalog::convert_storage_error)
+}
+
+#[test]
+fn create_in_txn_writes_definition_and_all_entities_atomically() {
+    let (_g, path, s) = open("mv-create-in-txn");
+    let entities = vec![
+        (ctx("a"), vec![row("a1", 1), row("a2", 2)]),
+        (ctx("b"), vec![row("b1", 3)]),
+    ];
+    create_with_entities(&s, &def("mv"), Some(&entities), 10).expect("create");
+    assert!(
+        s.materialized_view_definition("mv")
+            .unwrap()
+            .unwrap()
+            .populated
+    );
+    assert_eq!(
+        s.read_materialized_view("mv", &ctx("a"))
+            .unwrap()
+            .unwrap()
+            .rows,
+        vec![row("a1", 1), row("a2", 2)]
+    );
+    assert_eq!(
+        s.read_materialized_view("mv", &ctx("b"))
+            .unwrap()
+            .unwrap()
+            .rows,
+        vec![row("b1", 3)]
+    );
+    assert!(s.read_materialized_view("mv", &ctx("c")).unwrap().is_none());
+    drop(s);
+    let reopened = Storage::open(&path).expect("reopen");
+    assert_eq!(
+        reopened
+            .read_materialized_view("mv", &ctx("a"))
+            .unwrap()
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn create_in_txn_without_entities_is_unpopulated() {
+    let (_g, _p, s) = open("mv-create-no-data");
+    create_with_entities(&s, &def("mv"), None, 10).expect("create");
+    assert!(
+        !s.materialized_view_definition("mv")
+            .unwrap()
+            .unwrap()
+            .populated
+    );
+    assert!(s.read_materialized_view("mv", &ctx("a")).unwrap().is_none());
+}
+
+#[test]
+fn create_in_txn_failure_leaves_nothing() {
+    let (_g, _p, s) = open("mv-create-fail");
+    // 文脈ごとの行数超過（合計ではなく 1 文脈の件数で判定する）。
+    let over = vec![(ctx("a"), vec![row("x", 1), row("y", 2), row("z", 3)])];
+    assert!(matches!(
+        create_with_entities(&s, &def("mv"), Some(&over), 2),
+        Err(CatalogError::ViewLimitExceeded(_))
+    ));
+    let per_context_ok = vec![
+        (ctx("a"), vec![row("x", 1), row("y", 2)]),
+        (ctx("b"), vec![row("x", 1), row("y", 2)]),
+    ];
+    create_with_entities(&s, &def("mv_ok"), Some(&per_context_ok), 2).expect("per-context");
+    // 文脈キーの重複。
+    let dup = vec![(ctx("a"), vec![]), (ctx("a"), vec![])];
+    assert!(matches!(
+        create_with_entities(&s, &def("mv_dup"), Some(&dup), 10),
+        Err(CatalogError::Invalid(_))
+    ));
+    // 列に合わない行。
+    let bad = vec![(ctx("a"), vec![vec![Value::Integer(1)]])];
+    assert!(matches!(
+        create_with_entities(&s, &def("mv_bad"), Some(&bad), 10),
+        Err(CatalogError::Invalid(_))
+    ));
+    // 失敗した 3 件は定義も実体も行表も残さない。
+    for name in ["mv", "mv_dup", "mv_bad"] {
+        assert!(
+            s.materialized_view_definition(name).unwrap().is_none(),
+            "{name}"
+        );
+    }
+    let tables = table_names(&s);
+    for name in ["mv", "mv_dup", "mv_bad"] {
+        assert!(
+            !tables.contains(&format!("matview_rows/{name}")),
+            "{name} rows table leaked"
+        );
+    }
+    // 名前衝突は何も書かない。
+    assert!(matches!(
+        create_with_entities(&s, &def("base"), None, 10),
+        Err(CatalogError::TableAlreadyExists(_))
+    ));
+}
+
+#[test]
+fn read_in_works_over_a_write_txn_snapshot() {
+    let (_g, _p, s) = open("mv-read-in-write");
+    let entities = vec![(ctx("a"), vec![row("a1", 1)])];
+    let write_txn = s.begin_write_txn().expect("write");
+    create_materialized_view_in_txn(&write_txn, &def("mv"), Some(&entities), 10).expect("create");
+    // 未 commit の実体を同じ txn から読める（確定済みスナップショットからは見えない）。
+    let in_txn = read_materialized_view_in(&*write_txn, "mv", &ctx("a")).expect("read");
+    assert_eq!(in_txn.unwrap().rows, vec![row("a1", 1)]);
+    assert!(s.materialized_view_definition("mv").unwrap().is_none());
+    drop(write_txn);
+    assert!(s.materialized_view_definition("mv").unwrap().is_none());
+}

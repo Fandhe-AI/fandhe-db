@@ -2223,6 +2223,16 @@ fn run_server(args: &[String]) -> ExitCode {
     core = core.with_join_limits(join_limits);
     // Issue #1555: 未指定でも常に呼ぶ（既定は従来の 10,000 と同値で、未注入と挙動が同一）。
     core = core.with_result_limits(result_limits);
+    // Issue #1664（TABLE-42）: MATERIALIZED VIEW の初回実体化の対象文脈は、認証構成（ユーザー
+    // ストア）のテナント集合から導出して 1 回だけ注入する（クライアントの申告値は使わない）。
+    // 導出に失敗したら起動エラーにする（作成者の文脈だけへ黙って縮退する fail-open を作らない）。
+    match store.materialization_contexts() {
+        Ok(contexts) => core = core.with_materialization_contexts(contexts),
+        Err(e) => {
+            engine::log_stderr!("wire-server: failed to derive materialization contexts: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     // Issue #1554: 未指定でも常に呼ぶ（既定は `DEFAULT_WRITE_LOCK_WAIT` で、未注入と
     // 挙動がビット同一）。
     core = core.with_write_lock_wait(write_lock_wait);
