@@ -15,6 +15,13 @@
   `DROP COLUMN`／`ALTER TYPE` は依存ありとして拒否する（保守側）。公開 API は `ViewDef.column_aliases` の追加
   （格納形式 v2。別名なしは従来と同一のバイト列）と `Storage::create_view_with_column_aliases`・
   `ValidatedCreateView::column_aliases` の追加。
+- 式索引の parser と式の決定性検査（Issue #1647・INDEX-10）: `CREATE INDEX` の列リストで
+  `((<式>))` と関数呼び出し形 `(f(col))` を構文上受理し、非決定式を `42P17`、集計を `42803`、
+  ウィンドウを `42P20`、部分クエリ・SRF・組み込み以外の関数を `0A000` で拒否する（従来はいずれも
+  一律 `0A000`）。決定的な式も後続 Issue（#1648〜#1651）までは `0A000`（式索引は作成できない）。
+  `((col))` は通常の列索引として作成できる。公開 API は `SqlSurfaceError`（`InvalidObjectDefinition`・
+  `GroupingError`・`WindowingError`）・`ErrorClass`（同名 3 分類）への variant 追加と
+  `ValidatedCreateIndex::expression_keys` の追加。
 - `DROP TABLE a, b`（Issue #1639・TABLE-37 (1)）: 従来 `42601` だった複数テーブル指定を受理する。
   文全体を 1 つの write txn で原子的に実行し（不在・種類違い・依存のどれか 1 つでもあれば何も削除しない）、
   同じ文に並べた名前どうしの依存は数えない。`CASCADE`／`RESTRICT` は従来どおり `42601`。公開 API は

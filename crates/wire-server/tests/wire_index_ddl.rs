@@ -202,6 +202,17 @@ fn wire_index_ddl_error_classification() {
         "CREATE INDEX idx_p ON docs (body) WHERE body = 'x'",
         "0A000",
     );
+    // 式索引の式の拒否（INDEX-10、Issue #1647）。ErrorResponse の SQLSTATE として観測でき、
+    // エラー後もセッションは継続する。
+    for (sql, code) in [
+        ("CREATE INDEX idx_e ON docs ((now()))", "42P17"),
+        ("CREATE INDEX idx_e ON docs ((count(body)))", "42803"),
+        ("CREATE INDEX idx_e ON docs ((sum(id) OVER ()))", "42P20"),
+        ("CREATE INDEX idx_e ON docs ((SELECT 1))", "0A000"),
+        ("CREATE INDEX idx_e ON docs (lower(body))", "0A000"),
+    ] {
+        expect_error(&mut stream, sql, code);
+    }
     expect_command(&mut stream, "DROP INDEX idx_body", "DROP INDEX");
     // 削除済みでも `IF EXISTS` は no-op で成功する（Issue #1614）。
     expect_command(&mut stream, "DROP INDEX IF EXISTS idx_body", "DROP INDEX");
