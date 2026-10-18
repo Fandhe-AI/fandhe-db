@@ -4354,11 +4354,10 @@ impl<'a> Parser<'a> {
             self.tokens.get(self.pos.saturating_add(1)),
             Some(Token::Punct(',' | '*'))
         ) || (self.peek_ident_matches_at(1, "USING")
-            && self.peek_ident_matches_at(2, "OPERATION_ID"))
-            // `TRUNCATE only CASCADE USING ...` の `only` も表名（Issue #1644）。
-            || ((self.peek_ident_matches_at(1, "CASCADE")
-                || self.peek_ident_matches_at(1, "RESTRICT"))
-                && self.peek_ident_matches_at(2, "USING"));
+            && self.peek_ident_matches_at(2, "OPERATION_ID"));
+        // `TABLE`／`ONLY` の直後の識別子は常に表名として扱う。`CASCADE`／`RESTRICT` の
+        // 先読みは表名確定後（`parse_truncate` の `parse_optional_drop_behavior`）だけで
+        // 行い、`cascade`／`restrict` という名前の表を壊さない（Issue #1644）。
         // 直後に表名候補（識別子）が無い場合（文末・`;`）も `word` 自体を表名とみなす。
         // `CompareOnlyWithoutLedger` では OPERATION_ID 句を省略でき、`TRUNCATE TABLE only`
         // が従来どおり受理される互換性を保つ。
@@ -21202,10 +21201,18 @@ mod tests {
             truncate_behavior(&format!("TRUNCATE a CASCADE {op};"), &["a"]).0,
             DropBehavior::Cascade
         );
-        let (b, names) = truncate_behavior(&format!("TRUNCATE \"only\" CASCADE {op}"), &["only"]);
+        // 字句上 `ONLY` と引用付き `"only"` は区別できないため、`only` を表名にする
+        // 場合は後続を `,`・`*`・`USING OPERATION_ID` にする（`ONLY cascade` は修飾子＋表名）。
+        let (b, names) = truncate_behavior(
+            &format!("TRUNCATE \"only\", a CASCADE {op}"),
+            &["only", "a"],
+        );
         assert_eq!(
             (b, names),
-            (DropBehavior::Cascade, vec!["only".to_string()])
+            (
+                DropBehavior::Cascade,
+                vec!["only".to_string(), "a".to_string()]
+            )
         );
     }
 
@@ -21222,6 +21229,33 @@ mod tests {
         assert_eq!(
             (b, names),
             (DropBehavior::Cascade, vec!["cascade".to_string()])
+        );
+    }
+
+    /// `TABLE`／`ONLY` 修飾子の直後の `cascade`／`restrict` は常に表名（レビュー指摘の回帰）。
+    #[test]
+    fn truncate_modifier_followed_by_cascade_word_keeps_it_as_table_name() {
+        let op = "USING OPERATION_ID 'op-0001'";
+        for (sql, name) in [
+            (format!("TRUNCATE TABLE cascade {op}"), "cascade"),
+            (format!("TRUNCATE ONLY cascade {op}"), "cascade"),
+            (format!("TRUNCATE only cascade {op}"), "cascade"),
+            // `USING` なし（CompareOnlyWithoutLedger）でも同じ解釈（PostgreSQL 互換）。
+            ("TRUNCATE only CASCADE".to_string(), "CASCADE"),
+        ] {
+            let lookup = catalog_with(&["cascade", "CASCADE"]);
+            let v =
+                validate_truncate(&sql, &lookup, LedgerMode::CompareOnlyWithoutLedger).expect(&sql);
+            assert_eq!(
+                (v.behavior, v.table_names),
+                (DropBehavior::Restrict, vec![name.to_string()]),
+                "{sql}"
+            );
+        }
+        let (b, names) = truncate_behavior(&format!("TRUNCATE TABLE restrict {op}"), &["restrict"]);
+        assert_eq!(
+            (b, names),
+            (DropBehavior::Restrict, vec!["restrict".to_string()])
         );
     }
 
