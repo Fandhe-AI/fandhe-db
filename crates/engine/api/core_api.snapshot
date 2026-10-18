@@ -286,6 +286,8 @@ pub enum CatalogError {
     ViewNotFound(String),
     WrongObjectKind(String),
     DependentViewsExist(String),
+    ViewDefinitionChanged(String),
+    ViewReferenceCycle(String),
     ViewLimitExceeded(String),
     WriteLockTimeout,
     ColumnNotFound(String),
