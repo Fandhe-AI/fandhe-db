@@ -5103,7 +5103,10 @@ impl EngineCore {
                     stmt,
                     self.ledger_mode,
                 )?;
-                txn.mark_written(ctx.tenant_id(), &stmt.table_name);
+                // 全表に印を付ける（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
+                for table in &stmt.table_names {
+                    txn.mark_written(ctx.tenant_id(), table);
+                }
                 Ok(crate::sql::SqlOutcome::Truncate(outcome))
             }
             ParsedSql::Statement(

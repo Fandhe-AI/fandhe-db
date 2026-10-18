@@ -434,7 +434,7 @@ pub(crate) fn verify_unique_index_read_only(
     )
 }
 
-/// TRUNCATE（`tenant.rs::truncate_table_unchecked`）が、行ストアの `retain_in`
+/// TRUNCATE（`tenant.rs::truncate_tables_unchecked`）が、行ストアの `retain_in`
 /// 後・`row_table` を drop した後の同一 write トランザクション内から呼ぶ、
 /// テナント範囲の永続一意索引クリア窓口（[`unique_index::clear_tenant_in_txn`]
 /// の薄いラッパー。Issue #1070）。他テナントの索引エントリには一切触れない。
@@ -2458,7 +2458,7 @@ pub(crate) fn enforce_referencing_rows_in_txn(
                 // `clear_tenant_in_txn(table_name, ..)` は自己参照分の索引も
                 // 同じ登録簿エントリ（table = table_name）として既に消去済み
                 // であり、かつ `TRUNCATE` は本関数の呼び出し前に対象テナントの
-                // 全行を物理削除済み（`tenant::truncate_table_unchecked`）
+                // 全行を物理削除済み（`tenant::truncate_tables_unchecked`）
                 // のため、参照元行自体がこのテナントに 1 件も残り得ない。
                 Some(())
             } else {

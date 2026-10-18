@@ -3738,10 +3738,10 @@ pub(crate) fn execute_insert_with_schema_in(
     })
 }
 
-/// SQL 表層 `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`
+/// SQL 表層 `TRUNCATE [TABLE] [ONLY] <table> [*] [, ...] USING OPERATION_ID '<id>'`（複数テーブルは SQL-48 (4)、Issue #1643）
 /// （SQL-22、TASK-193）の実行入口。`validated`（`sql::allowlist::validate_truncate`
 /// 済み構造）の `operation_id` を `ledger_mode` で台帳書き込み指示へ解決してから
-/// [`crate::tenant::truncate_table_unchecked`] へ委譲する（[`execute_insert`] と
+/// [`crate::tenant::truncate_tables_unchecked`] へ委譲する（[`execute_insert`] と
 /// 同じ設計）。
 ///
 /// `LedgerMode::Ledgered`（既定）で `operation_id` が `None` の場合は `resolve` が
@@ -3775,7 +3775,7 @@ pub(crate) fn execute_truncate_in(
         .resolve(validated.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
-    crate::tenant::truncate_table_unchecked(target, &validated.table_name, ctx, ledger_write)
+    crate::tenant::truncate_tables_unchecked(target, &validated.table_names, ctx, ledger_write)
         .map_err(map_insert_write_error)?;
 
     Ok(TruncateOutcome {})
