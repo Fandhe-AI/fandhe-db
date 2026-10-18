@@ -208,7 +208,7 @@ fn error_contract_and_decision_order() {
         ("ALTER TABLE docs RENAME COLUMN note TO \"check\"", "42601"),
         ("ALTER TABLE nope RENAME COLUMN id TO x", "42703"),
         // 未対応の形
-        ("ALTER TABLE docs RENAME TO other", "42601"),
+        ("ALTER TABLE docs RENAME TO s.other", "42601"),
         ("ALTER TABLE docs RENAME CONSTRAINT a TO b", "42601"),
         (
             "ALTER TABLE IF EXISTS docs RENAME COLUMN note TO memo",
