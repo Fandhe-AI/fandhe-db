@@ -1157,7 +1157,8 @@ pub(crate) fn execute_alter_table_drop_column(
 ///
 /// 判定順序（決定的）: テーブル存在確認（`42P01`／`42809`）→
 /// `catalog::Storage::alter_table_rename_column`（単一 write txn 内。改名元の不在
-/// `42703` → 改名先の衝突 `42701` → 依存オブジェクトの拒否 `0A000`。カタログ名のみを
+/// `42703` → 改名先の衝突 `42701` → 依存オブジェクトの拒否 `0A000` → ビュー定義の追随
+/// 〔追随できない形は `0A000`、本文サイズ超過は `54000`。Issue #1621〕。カタログ名のみを
 /// 書き換え行ストアには触れない）。写像は [`map_rename_column_error`]。
 pub(crate) fn execute_alter_table_rename_column(
     storage: &Storage,

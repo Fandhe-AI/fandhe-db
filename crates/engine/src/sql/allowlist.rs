@@ -11155,6 +11155,81 @@ pub(crate) fn render_view_body(body: &ParsedViewBody) -> String {
     out
 }
 
+/// 単純形ビュー本文の保存用描画（TABLE-18・Issue #909／#1526、Issue #1621）。
+/// [`render_view_body`] の出力に、恒偽（`FALSE` で描画される分岐 0 個の `Or`）が残る
+/// 本文向けのマーカーを必要なら付与する。`CREATE VIEW`
+/// （[`validate_create_view_tokens`]）と `RENAME COLUMN` のビュー定義追随
+/// （`catalog::rewrite_views_for_renamed_column_in_txn`）が共有する唯一の実装で、
+/// 保存形式を両者で食い違わせない。
+pub(crate) fn render_stored_simple_view_body(
+    body: &ParsedViewBody,
+) -> Result<String, SqlSurfaceError> {
+    let mut sql = render_view_body(body);
+    // 恒偽が残る本文には、複雑形と同じくマーカーを付け、旧版の列参照保存形式として
+    // 再解析されるのを防ぐ（Issue #1526）。
+    let rendered_tokens = super::lexer::tokenize(&sql)
+        .map_err(|_| SqlSurfaceError::unsupported("view body is not supported"))?;
+    if super::lexer::stored_body_needs_bool_literal_marker(&rendered_tokens) {
+        sql.insert_str(0, super::lexer::STORED_BODY_BOOL_LITERAL_MARKER);
+    }
+    Ok(sql)
+}
+
+/// 単純形ビュー本文 AST の列参照 `old` を `new` へ付け替える（TABLE-38 のポインタ、
+/// Issue #1621）。文字列置換でなく AST を書き換え、保存時は
+/// [`render_stored_simple_view_body`] で再描画する（リテラルのエスケープ・列名の
+/// 引用は既存レンダラーに任せる）。投影の列リストと `WHERE` 述語の列を対象とし、
+/// 変更があれば `true`。`parse_view_body` が受理しない述語形は到達しないが、
+/// 将来 variant が増えても追随漏れを起こさないよう `Err`（fail-closed）にする。
+pub(crate) fn rename_column_in_view_body(
+    body: &mut ParsedViewBody,
+    old: &str,
+    new: &str,
+) -> Result<bool, SqlSurfaceError> {
+    fn swap(column: &mut String, old: &str, new: &str) -> bool {
+        if column == old {
+            *column = new.to_string();
+            true
+        } else {
+            false
+        }
+    }
+    let mut changed = false;
+    if let Projection::Columns(cols) = &mut body.projection {
+        for c in cols.iter_mut() {
+            changed |= swap(c, old, new);
+        }
+    }
+    for pred in &mut body.where_predicates {
+        match pred {
+            WherePredicate::Equality { column, .. }
+            | WherePredicate::Prefix { column, .. }
+            | WherePredicate::BoolEquality { column, .. }
+            | WherePredicate::BoolColumn { column }
+            | WherePredicate::Compare { column, .. } => {
+                changed |= swap(column, old, new);
+            }
+            WherePredicate::Or(branches) if branches.is_empty() => {}
+            WherePredicate::Or(_)
+            | WherePredicate::PredicateCall { .. }
+            | WherePredicate::Expression(_)
+            | WherePredicate::InList { .. }
+            | WherePredicate::Between { .. }
+            | WherePredicate::IsNull { .. }
+            | WherePredicate::Not(_)
+            | WherePredicate::InSubquery { .. }
+            | WherePredicate::Exists { .. }
+            | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::IdCompare { .. } => {
+                return Err(SqlSurfaceError::unsupported(
+                    "view body WHERE predicate form is not supported",
+                ));
+            }
+        }
+    }
+    Ok(changed)
+}
+
 /// 文字列リテラルを `'` の二重化でエスケープする（[`render_view_body`] 参照）。
 fn escape_string_literal(s: &str) -> String {
     s.replace('\'', "''")
@@ -11312,14 +11387,7 @@ pub(crate) fn validate_create_view_tokens(
         ViewBodyCheck::Structural,
     )? {
         ViewBodyKind::Simple(body) => {
-            let mut sql = render_view_body(&body);
-            // 恒偽（`FALSE` で描画される分岐 0 個の `Or`）が残る本文には、複雑形と同じく
-            // マーカーを付け、旧版の列参照保存形式として再解析されるのを防ぐ（Issue #1526）。
-            let rendered_tokens = super::lexer::tokenize(&sql)
-                .map_err(|_| SqlSurfaceError::unsupported("view body is not supported"))?;
-            if super::lexer::stored_body_needs_bool_literal_marker(&rendered_tokens) {
-                sql.insert_str(0, super::lexer::STORED_BODY_BOOL_LITERAL_MARKER);
-            }
+            let sql = render_stored_simple_view_body(&body)?;
             (body.table_name, sql)
         }
         ViewBodyKind::Buffered { relations, .. } => {
@@ -24059,5 +24127,46 @@ mod body_expr_policy_tests {
                 .unwrap_or_else(|| panic!("{sql} should be rejected"));
             assert_eq!(err.wire_code(), "42601", "{sql}");
         }
+    }
+
+    /// 単純形ビュー本文の列改名（TABLE-38 のポインタ、Issue #1621）。投影・全述語形の列を
+    /// 付け替え、保存形式で再描画した本文が再パースして同じ AST に戻る。
+    #[test]
+    fn rename_column_in_view_body_rewrites_all_predicate_forms_and_round_trips() {
+        let sql = "SELECT note, qty FROM docs WHERE note = 'a''b' AND note LIKE 'x%' \
+                   AND flag = true AND flag AND qty >= '3'";
+        let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        let mut body = parse_view_body(&tokens).expect("parse");
+        let untouched = body.clone();
+        assert!(!rename_column_in_view_body(&mut body.clone(), "absent", "zzz").expect("noop"));
+        assert!(rename_column_in_view_body(&mut body, "note", "memo").expect("rename"));
+        assert!(rename_column_in_view_body(&mut body, "flag", "on").expect("rename flag"));
+        assert_ne!(body, untouched);
+        let stored = render_stored_simple_view_body(&body).expect("render");
+        assert!(!stored.contains("note"));
+        let retokens = crate::sql::lexer::tokenize_stored_view_body(&stored).expect("retokenize");
+        assert_eq!(parse_view_body(&retokens).expect("reparse"), body);
+    }
+
+    /// 引用が必要な新しい名前（真偽リテラル・SQL 値関数予約語と同名）でも再描画した本文が
+    /// 再パースでき、恒偽マーカーも維持される（Issue #1621・#1526）。
+    #[test]
+    fn rename_column_in_view_body_quotes_reserved_names_and_keeps_false_marker() {
+        let tokens = crate::sql::lexer::tokenize("SELECT note FROM docs WHERE FALSE").expect("tok");
+        let mut body = parse_view_body(&tokens).expect("parse");
+        assert!(rename_column_in_view_body(&mut body, "note", "true").expect("rename"));
+        let stored = render_stored_simple_view_body(&body).expect("render");
+        assert!(stored.contains("\"true\""));
+        assert!(stored.starts_with(crate::sql::lexer::STORED_BODY_BOOL_LITERAL_MARKER));
+        let retokens = crate::sql::lexer::tokenize_stored_view_body(&stored).expect("retokenize");
+        assert_eq!(parse_view_body(&retokens).expect("reparse"), body);
+    }
+
+    /// `SELECT *` と述語なしの本文は改名元を参照しないため変更なし（`false`）。
+    #[test]
+    fn rename_column_in_view_body_reports_no_change_for_star() {
+        let tokens = crate::sql::lexer::tokenize("SELECT * FROM docs").expect("tok");
+        let mut body = parse_view_body(&tokens).expect("parse");
+        assert!(!rename_column_in_view_body(&mut body, "note", "memo").expect("noop"));
     }
 }

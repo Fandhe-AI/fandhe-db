@@ -1065,30 +1065,143 @@ fn retain_index_defs_in_txn(
     Ok(())
 }
 
-/// 列改名（[`Storage::alter_table_rename_column`]）のビュー依存検査（TABLE-38 の
-/// ポインタ、Issue #1619・#1620）。`table` を参照するビューが 1 件でもあれば
-/// `FeatureNotSupported`（`0A000`）で拒否する。PRIMARY KEY・UNIQUE・CHECK・外部キー・
-/// 索引宣言の追随は Issue #1620 で [`TableSchema::rename_column_references`] 等へ
-/// 移した（本関数は拒否しない）。
+/// 列改名（[`Storage::alter_table_rename_column`]）に伴うビュー定義の追随（TABLE-38 の
+/// ポインタ、Issue #1621）。`table` の列 `old` を、直接または単純形ビューの連鎖経由で
+/// 公開しているビューについて、保存本文の列参照（投影・`WHERE` 述語）を `new` へ付け替える。
+/// 本文は AST で書き換えて既存レンダラーで再描画する（文字列置換はしない。リテラルの
+/// エスケープ・列名の引用は `render_view_body` に任せる）。改名元を公開しない親を参照する
+/// ビュー、無関係な表で同名の列を使うビューには触れない。
 ///
-/// ビュー定義の追随（Issue #1621）はこの関数を「拒否」から「参照の書き換え」へ置き換える
-/// 差し込み点になる。ビューは列単位でなく表単位で保守的に拒否する（`SELECT *` 経由の
-/// 公開列名が変わるため。#1621 で精緻化）。
-fn refuse_rename_column_with_views_in_txn(
+/// 評価後射影形（集計・JOIN・CTE・`ORDER BY`・`LIMIT`・集合演算・式）の本文は
+/// トークン単位の書き換えが別名・関数名・JOIN 相手側の同名列と区別できず安全でないため、
+/// `table` を読む、または改名元を公開する単純形ビューを読む場合は `FeatureNotSupported`
+/// （`0A000`）で拒否する（fail-closed）。再検証できない本文・公開列の導出失敗も拒否。
+/// 追随後の本文が [`MAX_VIEW_BODY_BYTES`] を超えれば `54000`。計画をすべて確定してから
+/// 書き込むため、拒否時にビュー定義は変更されない。[`Storage::alter_table_rename_column`]
+/// から、スキーマ書き込みの前に同一 write txn で呼ばれる。`schema` は改名前のもの。
+fn rewrite_views_for_renamed_column_in_txn(
     write_txn: &redb::WriteTransaction,
+    schema: &TableSchema,
     table: &str,
+    old: &str,
+    new: &str,
 ) -> std::result::Result<(), AlterCheckError> {
-    match write_txn.open_table(VIEWS_TABLE) {
-        Ok(views_table) => {
-            if !views_depending_on_in_txn(&views_table, table)?.is_empty() {
-                return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
-                    detail: "renaming a column of a table referenced by a view is not supported"
-                        .to_string(),
-                }));
-            }
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
+    let refused = || {
+        AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+            detail: "renaming a column referenced by a view with an aggregate, join, or other \
+                     complex body is not supported"
+                .to_string(),
+        })
+    };
+    let mut views_table = match write_txn.open_table(VIEWS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
         Err(e) => return Err(CatalogError::from(e).into()),
+    };
+    // 1. 単純形ビューと評価後射影形ビューの読む relation を収集する（書き込みは後段）。
+    let mut defs: std::collections::HashMap<String, ViewDef> = std::collections::HashMap::new();
+    let mut buffered_relations: Vec<Vec<String>> = Vec::new();
+    for entry in views_table.iter().map_err(CatalogError::from)? {
+        let (key, value) = entry.map_err(CatalogError::from)?;
+        if defs.len().saturating_add(buffered_relations.len()) >= MAX_VIEWS {
+            return Err(CatalogError::ViewLimitExceeded("too many views".to_string()).into());
+        }
+        let def = decode_view_def(value.value())?;
+        match view_body_shape(&def.body_sql) {
+            Ok(shape) if shape.buffered => {
+                buffered_relations.push(shape.relations);
+                continue;
+            }
+            Ok(_) => {}
+            // 再検証できない本文は追随できない（fail-closed）。
+            Err(_) => return Err(refused()),
+        }
+        defs.insert(key.value().to_string(), def);
+    }
+    // 2. 改名前の公開列を導出する（表は予約列＋生存列。ビューは連鎖を基底側から）。
+    let table_columns: Vec<String> = ["id", "tenant_id", "visibility"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(schema.columns.iter().map(|c| c.name.clone()))
+        .collect();
+    let mut exposed: std::collections::HashMap<String, Option<Vec<String>>> =
+        std::collections::HashMap::new();
+    let names: Vec<String> = defs.keys().cloned().collect();
+    for name in &names {
+        match exposed_columns_of_view(&defs, &mut exposed, name, table, &table_columns) {
+            Ok(ViewExposure::Broken) | Err(CatalogError::CorruptSchema(_)) => {
+                return Err(refused());
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let exposes_old = |relation: &str| -> bool {
+        if relation == table {
+            return true;
+        }
+        matches!(exposed.get(relation), Some(Some(cols)) if cols.iter().any(|c| c == old))
+    };
+    // 3. 評価後射影形ビューは、表を読む／改名元を公開するビューを読むなら拒否する。
+    for relations in &buffered_relations {
+        if relations.iter().any(|r| exposes_old(r)) {
+            return Err(refused());
+        }
+    }
+    // 4. 単純形ビューの書き換えを計画する。
+    let mut planned: Vec<(String, Vec<u8>)> = Vec::new();
+    for (name, def) in &defs {
+        let parent_columns: &[String] = if def.base_relation == table {
+            &table_columns
+        } else {
+            match exposed.get(def.base_relation.as_str()) {
+                Some(Some(cols)) => cols,
+                _ => continue,
+            }
+        };
+        if !parent_columns.iter().any(|c| c == old) {
+            continue;
+        }
+        let tokens =
+            crate::sql::lexer::tokenize_stored_view_body(&def.body_sql).map_err(|_| refused())?;
+        let mut parsed = parse_view_body(&tokens).map_err(|_| refused())?;
+        let changed = crate::sql::allowlist::rename_column_in_view_body(&mut parsed, old, new)
+            .map_err(AlterCheckError::Sql)?;
+        if !changed {
+            continue;
+        }
+        let body_sql = crate::sql::allowlist::render_stored_simple_view_body(&parsed)
+            .map_err(AlterCheckError::Sql)?;
+        if body_sql.len() > MAX_VIEW_BODY_BYTES {
+            return Err(AlterCheckError::Sql(SqlSurfaceError::payload_too_large(
+                "view body exceeds the allowed size after column rename",
+            )));
+        }
+        // 多層防御: 再描画した本文が再パースでき、改名後の親の公開列に収まることを確かめる。
+        validate_view_body_matches_base_relation(&body_sql, &def.base_relation)
+            .map_err(|_| refused())?;
+        let renamed_parent: Vec<String> = parent_columns
+            .iter()
+            .map(|c| if c == old { new.to_string() } else { c.clone() })
+            .collect();
+        crate::sql::view::check_columns_within_view(
+            Some(&renamed_parent),
+            &parsed.projection,
+            &parsed.where_predicates,
+            &[],
+        )
+        .map_err(|_| refused())?;
+        let encoded = encode_view_def(&ViewDef {
+            base_relation: def.base_relation.clone(),
+            body_sql,
+        })?;
+        planned.push((name.clone(), encoded));
+    }
+    // 5. 計画が確定した後にだけ書き込む。
+    for (name, encoded) in &planned {
+        views_table
+            .insert(name.as_str(), encoded.as_slice())
+            .map_err(CatalogError::from)?;
     }
     Ok(())
 }
@@ -9279,8 +9392,9 @@ impl Storage {
     ///
     /// 判定順序（決定的）: 識別子検証・予約列（`ProtectedColumn`）→ 表の存在
     /// （`TableNotFound`）→ 改名元の列の存在（`ColumnNotFound`）→ 改名先が既存の生存列
-    /// （同名への変更を含む。`ColumnAlreadyExists`）→ ビュー依存
-    /// （[`refuse_rename_column_with_views_in_txn`]。`AlterCheckError::Sql(FeatureNotSupported)`）。
+    /// （同名への変更を含む。`ColumnAlreadyExists`）→ ビュー定義の追随
+    /// （[`rewrite_views_for_renamed_column_in_txn`]。追随できない形は `0A000`、追随後の
+    /// 本文サイズ超過は `54000`。Issue #1621）。
     ///
     /// Issue #1620: PRIMARY KEY・UNIQUE・CHECK・外部キー（子側・親側・自己参照）・索引宣言
     /// の列参照は同一 txn で新しい名前へ書き換える（制約名は維持）。CHECK の書き換えに
@@ -9328,7 +9442,11 @@ impl Storage {
         if schema.columns.iter().any(|c| c.name == new_name) {
             return Err(CatalogError::ColumnAlreadyExists(new_name.to_string()).into());
         }
-        refuse_rename_column_with_views_in_txn(&write_txn, table_name)?;
+        // ビュー定義の追随（TABLE-38、Issue #1621）。拒否・計画失敗時は何も書かない。
+        // CATALOG_TABLE のハンドルは解放済み。`schema` は改名前のもの。
+        rewrite_views_for_renamed_column_in_txn(
+            &write_txn, &schema, table_name, old_name, new_name,
+        )?;
         let old_schema = schema.clone();
         schema.rename_column_references(old_name, new_name);
         // CHECK は AST 経由で書き換え、再束縛・往復一致・上限検証を通す。1 件でも失敗したら
@@ -16851,6 +16969,218 @@ mod tests {
         let reopened = Storage::open(&path).expect("reopen");
         let schema = reopened.get_table_schema("docs").expect("schema");
         assert!(schema.columns.iter().any(|c| c.name == "lang"));
+    }
+
+    /// 単純形ビューの保存本文が AST 経由で書き換わり、reopen 後も保持される。改名元を
+    /// 公開しないビュー・無関係な表のビューは本文がバイト単位で不変（TABLE-38 のポインタ、
+    /// Issue #1621）。
+    #[test]
+    fn alter_table_rename_column_rewrites_simple_view_bodies_and_persists() {
+        let path = unique_db_path("rename-column-view-rewrite");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let cols = || {
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("kind", ColumnType::Text, true),
+            ]
+        };
+        storage
+            .create_table(&TableSchema::new("docs", cols()))
+            .expect("docs");
+        storage
+            .create_table(&TableSchema::new("other", cols()))
+            .expect("other");
+        storage
+            .create_view(
+                "v_kind",
+                "docs",
+                "SELECT kind, body FROM docs WHERE kind = 'it''s'",
+            )
+            .expect("v_kind");
+        storage
+            .create_view("v_body", "docs", "SELECT body FROM docs")
+            .expect("v_body");
+        storage
+            .create_view("v_other", "other", "SELECT kind FROM other")
+            .expect("v_other");
+        storage
+            .create_view(
+                "v_chain",
+                "v_kind",
+                "SELECT kind FROM v_kind WHERE kind LIKE 'a%'",
+            )
+            .expect("v_chain");
+        let before_body = storage
+            .view_definition("v_body")
+            .expect("get")
+            .expect("some");
+        let before_other = storage
+            .view_definition("v_other")
+            .expect("get")
+            .expect("some");
+
+        storage
+            .alter_table_rename_column("docs", "kind", "lang")
+            .expect("rename follows views");
+
+        let body_of =
+            |s: &Storage, n: &str| s.view_definition(n).expect("get").expect("some").body_sql;
+        assert_eq!(
+            body_of(&storage, "v_kind"),
+            "SELECT lang, body FROM docs WHERE lang = 'it''s'"
+        );
+        assert_eq!(
+            body_of(&storage, "v_chain"),
+            "SELECT lang FROM v_kind WHERE lang LIKE 'a%'"
+        );
+        assert_eq!(
+            storage
+                .view_definition("v_body")
+                .expect("get")
+                .expect("some"),
+            before_body
+        );
+        assert_eq!(
+            storage
+                .view_definition("v_other")
+                .expect("get")
+                .expect("some"),
+            before_other
+        );
+        drop(storage);
+        let reopened = Storage::open(&path).expect("reopen");
+        assert_eq!(
+            body_of(&reopened, "v_kind"),
+            "SELECT lang, body FROM docs WHERE lang = 'it''s'"
+        );
+    }
+
+    /// 追随できない形（評価後射影形ビュー・破損した本文）は `0A000` で拒否し、スキーマも
+    /// 他のビュー定義も変更しない（原子性。Issue #1621）。
+    #[test]
+    fn alter_table_rename_column_view_rejection_changes_nothing() {
+        let path = unique_db_path("rename-column-view-reject");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                    ColumnDef::new("kind", ColumnType::Text, true),
+                ],
+            ))
+            .expect("docs");
+        storage
+            .create_view("v_simple", "docs", "SELECT kind FROM docs")
+            .expect("simple");
+        let simple_before = storage
+            .view_definition("v_simple")
+            .expect("get")
+            .expect("some");
+        let is_unsupported = |e: AlterCheckError| {
+            matches!(
+                e,
+                AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported { .. })
+            )
+        };
+
+        // 評価後射影形ビュー（表を読む）。
+        storage
+            .create_view(
+                "v_buf",
+                "docs",
+                "SELECT body FROM docs ORDER BY body LIMIT 5",
+            )
+            .expect("buffered");
+        let err = storage
+            .alter_table_rename_column("docs", "kind", "lang")
+            .expect_err("buffered view blocks rename");
+        assert!(is_unsupported(err));
+        storage.drop_view("v_buf").expect("drop buffered");
+
+        // 破損した本文（再検証できない）も fail-closed。
+        {
+            // 破損注入専用のテスト補助。本番の commit 境界（`commit_boundary` モジュール）は
+            // テーブル世代 bump を前提とするため、既存の破損注入テスト
+            // （`insert_corrupt_index_entry`）と同じく redb の write txn を直接 commit する。
+            let write_txn = storage.db().begin_write().expect("txn");
+            {
+                let mut views = write_txn.open_table(VIEWS_TABLE).expect("views");
+                let bad = encode_view_def(&ViewDef {
+                    base_relation: "docs".to_string(),
+                    body_sql: "NOT A VIEW BODY".to_string(),
+                })
+                .expect("encode");
+                views.insert("v_bad", bad.as_slice()).expect("insert");
+            }
+            write_txn.commit().expect("commit");
+        }
+        let err = storage
+            .alter_table_rename_column("docs", "kind", "lang")
+            .expect_err("corrupt view body blocks rename");
+        assert!(is_unsupported(err));
+
+        let schema = storage.get_table_schema("docs").expect("schema");
+        assert!(schema.columns.iter().any(|c| c.name == "kind"));
+        assert!(schema.columns.iter().all(|c| c.name != "lang"));
+        assert_eq!(
+            storage
+                .view_definition("v_simple")
+                .expect("get")
+                .expect("some"),
+            simple_before
+        );
+    }
+
+    /// 追随後の本文が上限を超えるときは `54000` で拒否し、何も変更しない（Issue #1621）。
+    #[test]
+    fn alter_table_rename_column_view_body_overflow_is_54000() {
+        let path = unique_db_path("rename-column-view-overflow");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("k", ColumnType::Text, true),
+                ],
+            ))
+            .expect("docs");
+        // WHERE 葉の上限（256）に収まる範囲で値を長くし、改名による列名の伸びだけで
+        // 上限を超える本文を作る。
+        let predicate = format!("k = '{}'", "x".repeat(230));
+        let predicates = vec![predicate; 256].join(" AND ");
+        let body = format!("SELECT k FROM docs WHERE {predicates}");
+        assert!(body.len() < MAX_VIEW_BODY_BYTES);
+        storage
+            .create_view("v_big", "docs", &body)
+            .expect("big view");
+        let before = storage
+            .view_definition("v_big")
+            .expect("get")
+            .expect("some");
+        let long_name = "n".repeat(40);
+        let err = storage
+            .alter_table_rename_column("docs", "k", &long_name)
+            .expect_err("rewritten body exceeds the limit");
+        match err {
+            AlterCheckError::Sql(e) => assert_eq!(e.wire_code(), "54000"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            storage
+                .view_definition("v_big")
+                .expect("get")
+                .expect("some"),
+            before
+        );
+        let schema = storage.get_table_schema("docs").expect("schema");
+        assert!(schema.columns.iter().any(|c| c.name == "k"));
     }
 
     /// 予約列・不存在列・衝突・依存ありは拒否し、カタログを変更しない。
