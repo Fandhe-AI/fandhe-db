@@ -32,6 +32,7 @@ use super::{
 use crate::policy::PolicyContext;
 use crate::result_limits::MAX_RESULT_ROWS_HARD_CAP;
 use crate::row_codec::{self, Value};
+use crate::storage::read_source::ReadSource;
 use crate::storage::Visibility;
 
 /// matview 定義を格納する専用カタログ表。キーは matview 名（表・ビュー・索引と名前空間を
@@ -74,7 +75,7 @@ fn matview_rows_table_name(name: &str) -> String {
 /// 文脈ごとの実体を識別するキー。`PolicyContext` から決定的に導出し、テナント ID だけでなく
 /// 許可可視性の集合も含めて完全一致で照合する（`Public` のみの文脈と `Public + Private` の
 /// 文脈は別キー）。バイト列は `[版][可視性フラグ（bit0 = Public, bit1 = Private）][tenant_id]`。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ContextKey(Vec<u8>);
 
 impl ContextKey {
@@ -110,6 +111,9 @@ pub(crate) struct MaterializedViewDef {
     /// `WITH NO DATA` のままなら false。`REFRESH ... CONCURRENTLY` の可否判定に使われる。
     pub populated: bool,
 }
+
+/// 1 文脈ぶんの書き込み入力（文脈と、その文脈で評価した結果行）。
+pub(crate) type ContextEntity = (PolicyContext, Vec<Vec<Value>>);
 
 /// 1 文脈ぶんの実体。行は書き込んだ順（結果内の順序キーの昇順）。
 #[derive(Debug, Clone, PartialEq)]
@@ -419,6 +423,208 @@ pub(crate) fn materialized_views_referencing_in_txn(
     Ok(out)
 }
 
+/// 定義 1 件の挿入（write txn 内）。判定順は名前の衝突（`TableAlreadyExists`）→ 参照先の存在
+/// （`TableNotFound`）→ 件数上限（`ViewLimitExceeded`）→ 保存。世代の bump は呼び出し元が行う。
+fn insert_def_in_txn(
+    write_txn: &redb::WriteTransaction,
+    def: &MaterializedViewDef,
+    encoded: &[u8],
+) -> Result<()> {
+    if super::table_exists_in_txn(write_txn, &def.name)?
+        || super::view_exists_in_txn(write_txn, &def.name)?
+        || super::index_name_exists_in_txn(write_txn, &def.name)?
+        || super::materialized_view_exists_in_txn(write_txn, &def.name)?
+    {
+        return Err(CatalogError::TableAlreadyExists(def.name.clone()));
+    }
+    for rel in &def.base_relations {
+        if !(super::table_exists_in_txn(write_txn, rel)?
+            || super::view_exists_in_txn(write_txn, rel)?
+            || super::materialized_view_exists_in_txn(write_txn, rel)?)
+        {
+            return Err(CatalogError::TableNotFound(rel.clone()));
+        }
+    }
+    let mut table = write_txn.open_table(MATERIALIZED_VIEWS_TABLE)?;
+    if table.len()? >= MAX_MATERIALIZED_VIEWS as u64 {
+        return Err(CatalogError::ViewLimitExceeded(
+            "too many materialized views".to_string(),
+        ));
+    }
+    table.insert(def.name.as_str(), encoded)?;
+    Ok(())
+}
+
+/// 全文脈の実体の入力検査（文脈数上限・文脈キー重複・文脈ごとの行数上限）を行い、
+/// 文脈キーを返す。確保・書き込みより前に呼ぶ。行数は文脈ごとに数え、合計では数えない。
+fn check_entities(
+    entities: &[(PolicyContext, Vec<Vec<Value>>)],
+    max_rows_per_context: usize,
+) -> Result<Vec<ContextKey>> {
+    if entities.len() > MAX_MATVIEW_CONTEXTS {
+        return Err(CatalogError::ViewLimitExceeded(
+            "too many materialized view contexts".to_string(),
+        ));
+    }
+    let row_limit = max_rows_per_context.min(MAX_RESULT_ROWS_HARD_CAP);
+    let keys: Vec<ContextKey> = entities
+        .iter()
+        .map(|(ctx, _)| ContextKey::from_context(ctx))
+        .collect();
+    for (i, key) in keys.iter().enumerate() {
+        if keys.iter().take(i).any(|k| k == key) {
+            return Err(CatalogError::Invalid(
+                "duplicate materialized view context".to_string(),
+            ));
+        }
+    }
+    if entities.iter().any(|(_, rows)| rows.len() > row_limit) {
+        return Err(CatalogError::ViewLimitExceeded(
+            "materialized view result exceeds row limit".to_string(),
+        ));
+    }
+    Ok(keys)
+}
+
+/// matview `name` の既存実体（メタ・行表）を消して `entities` を書く（write txn 内）。
+/// `keys` は [`check_entities`] が `entities` と同じ並びで返したもの。定義の `populated` と
+/// 世代の更新は呼び出し元が行う。
+fn write_entities_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+    columns: &[ColumnDef],
+    entities: &[(PolicyContext, Vec<Vec<Value>>)],
+    keys: &[ContextKey],
+) -> Result<()> {
+    let schema = TableSchema::new(name.to_string(), columns.to_vec());
+    delete_all_meta_in_txn(write_txn, name)?;
+    delete_rows_table_in_txn(write_txn, name)?;
+    let table_name = matview_rows_table_name(name);
+    let rows_def: MatviewRowsDef = TableDefinition::new(&table_name);
+    let mut rows_table = write_txn.open_table(rows_def)?;
+    let mut meta_table = write_txn.open_table(MATVIEW_ENTITY_META_TABLE)?;
+    for ((ctx, rows), key) in entities.iter().zip(keys) {
+        for (i, values) in rows.iter().enumerate() {
+            let encoded =
+                row_codec::encode_row(&schema, ctx.tenant_id(), Visibility::Private, values)
+                    .map_err(|_| {
+                        CatalogError::Invalid(
+                            "materialized view row does not match its columns".to_string(),
+                        )
+                    })?;
+            rows_table.insert((key.as_bytes(), i as u64), encoded.as_slice())?;
+        }
+        meta_table.insert(
+            (name, key.as_bytes()),
+            encode_meta(rows.len() as u64).as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
+/// 定義の登録と（`entities` が `Some` なら）全文脈の実体の書き込みを、呼び出し元の write txn
+/// 内で行う（`CREATE MATERIALIZED VIEW`。TABLE-42 (2)(3)・Issue #1664）。commit は呼び出し元が
+/// 1 回だけ行う。`def.populated` は `entities.is_some()` で上書きする。入力の検査
+/// （文脈キー重複は `Invalid`、文脈数・行数の超過は `ViewLimitExceeded`）と符号化のいずれかが失敗
+/// したら `Err` を返す。呼び出し元は txn を破棄して副作用をゼロにする。世代も本関数内で bump する。
+pub(crate) fn create_materialized_view_in_txn(
+    write_txn: &redb::WriteTransaction,
+    def: &MaterializedViewDef,
+    entities: Option<&[ContextEntity]>,
+    max_rows_per_context: usize,
+) -> Result<()> {
+    let mut def = def.clone();
+    def.populated = entities.is_some();
+    let keys = match entities {
+        Some(e) => check_entities(e, max_rows_per_context)?,
+        None => Vec::new(),
+    };
+    let encoded = encode_materialized_view_def(&def)?;
+    insert_def_in_txn(write_txn, &def, &encoded)?;
+    if let Some(e) = entities {
+        write_entities_in_txn(write_txn, &def.name, &def.columns, e, &keys)?;
+    }
+    bump_table_generation_in_txn(write_txn, &def.name)?;
+    Ok(())
+}
+
+/// `ctx` に対応する実体を、呼び出し元の読み取り源 `read_txn` から読む。定義が無ければ
+/// `Err(ViewNotFound)`、その文脈の実体が無ければ `Ok(None)`（未実体化）。確定済みスナップ
+/// ショットでも明示トランザクション／実体化中の write txn でも同じコードで読めるよう
+/// [`ReadSource`] を取る。破損（件数不一致・ヘッダのテナント／可視性不一致・decode 失敗）は
+/// 行を返さず `CorruptSchema`（fail-closed）。
+pub(crate) fn read_materialized_view_in<R: ReadSource>(
+    read_txn: &R,
+    name: &str,
+    ctx: &PolicyContext,
+) -> Result<Option<MaterializedViewEntity>> {
+    validate_identifier(name)?;
+    let def = {
+        let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(CatalogError::ViewNotFound(name.to_string()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let guard = table
+            .get(name)?
+            .ok_or_else(|| CatalogError::ViewNotFound(name.to_string()))?;
+        decode_materialized_view_def(name, guard.value())?
+    };
+    let key = ContextKey::from_context(ctx);
+    let row_count = {
+        let meta = match read_txn.open_table(MATVIEW_ENTITY_META_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let guard = meta.get((name, key.as_bytes()))?;
+        match guard {
+            Some(g) => decode_meta(g.value())?,
+            None => return Ok(None),
+        }
+    };
+    if row_count > MAX_RESULT_ROWS_HARD_CAP as u64 {
+        return Err(corrupt("materialized view entity row count out of range"));
+    }
+    let expected = row_count as usize;
+    let schema = TableSchema::new(name.to_string(), def.columns.clone());
+    let rows_table_name = matview_rows_table_name(name);
+    let rows_def: MatviewRowsDef = TableDefinition::new(&rows_table_name);
+    let rows_table = match read_txn.open_table(rows_def) {
+        Ok(t) => Some(t),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    rows.try_reserve_exact(expected)
+        .map_err(|_| corrupt("materialized view allocation failed"))?;
+    if let Some(rows_table) = rows_table {
+        let lo = (key.as_bytes(), 0u64);
+        let hi = (key.as_bytes(), u64::MAX);
+        for entry in rows_table.range::<(&[u8], u64)>(lo..=hi)? {
+            let (k, v) = entry?;
+            if rows.len() >= expected || k.value().1 != rows.len() as u64 {
+                return Err(corrupt("materialized view entity row count mismatch"));
+            }
+            let decoded = row_codec::decode_row(&schema, v.value())
+                .map_err(|_| corrupt("materialized view entity row is corrupt"))?;
+            if !ctx.is_owner(&decoded.tenant_id) || decoded.visibility != Visibility::Private {
+                return Err(corrupt("materialized view entity header mismatch"));
+            }
+            rows.push(decoded.values);
+        }
+    }
+    if rows.len() != expected {
+        return Err(corrupt("materialized view entity row count mismatch"));
+    }
+    Ok(Some(MaterializedViewEntity {
+        columns: def.columns,
+        rows,
+    }))
+}
+
 impl Storage {
     /// matview 定義を登録する（実体なし・`populated = false`）。判定順は同一 write txn 内で
     /// 名前の衝突（`TableAlreadyExists`）→ 参照先の存在（`TableNotFound`）→ 件数上限
@@ -430,30 +636,7 @@ impl Storage {
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        if super::table_exists_in_txn(&write_txn, &def.name)?
-            || super::view_exists_in_txn(&write_txn, &def.name)?
-            || super::index_name_exists_in_txn(&write_txn, &def.name)?
-            || super::materialized_view_exists_in_txn(&write_txn, &def.name)?
-        {
-            return Err(CatalogError::TableAlreadyExists(def.name.clone()));
-        }
-        for rel in &def.base_relations {
-            if !(super::table_exists_in_txn(&write_txn, rel)?
-                || super::view_exists_in_txn(&write_txn, rel)?
-                || super::materialized_view_exists_in_txn(&write_txn, rel)?)
-            {
-                return Err(CatalogError::TableNotFound(rel.clone()));
-            }
-        }
-        {
-            let mut table = write_txn.open_table(MATERIALIZED_VIEWS_TABLE)?;
-            if table.len()? >= MAX_MATERIALIZED_VIEWS as u64 {
-                return Err(CatalogError::ViewLimitExceeded(
-                    "too many materialized views".to_string(),
-                ));
-            }
-            table.insert(def.name.as_str(), encoded.as_slice())?;
-        }
+        insert_def_in_txn(&write_txn, &def, &encoded)?;
         bump_table_generation_in_txn(&write_txn, &def.name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
     }
@@ -487,62 +670,13 @@ impl Storage {
         max_rows_per_context: usize,
     ) -> Result<()> {
         validate_identifier(name)?;
-        if entities.len() > MAX_MATVIEW_CONTEXTS {
-            return Err(CatalogError::ViewLimitExceeded(
-                "too many materialized view contexts".to_string(),
-            ));
-        }
-        let row_limit = max_rows_per_context.min(MAX_RESULT_ROWS_HARD_CAP);
-        let keys: Vec<ContextKey> = entities
-            .iter()
-            .map(|(ctx, _)| ContextKey::from_context(ctx))
-            .collect();
-        for (i, key) in keys.iter().enumerate() {
-            if keys.iter().take(i).any(|k| k == key) {
-                return Err(CatalogError::Invalid(
-                    "duplicate materialized view context".to_string(),
-                ));
-            }
-        }
-        if entities.iter().any(|(_, rows)| rows.len() > row_limit) {
-            return Err(CatalogError::ViewLimitExceeded(
-                "materialized view result exceeds row limit".to_string(),
-            ));
-        }
+        let keys = check_entities(entities, max_rows_per_context)?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
         let mut def = load_def_in_txn(&write_txn, name)?
             .ok_or_else(|| CatalogError::ViewNotFound(name.to_string()))?;
-        let schema = TableSchema::new(name.to_string(), def.columns.clone());
-        delete_all_meta_in_txn(&write_txn, name)?;
-        delete_rows_table_in_txn(&write_txn, name)?;
-        let table_name = matview_rows_table_name(name);
-        {
-            let rows_def: MatviewRowsDef = TableDefinition::new(&table_name);
-            let mut rows_table = write_txn.open_table(rows_def)?;
-            let mut meta_table = write_txn.open_table(MATVIEW_ENTITY_META_TABLE)?;
-            for ((ctx, rows), key) in entities.iter().zip(&keys) {
-                for (i, values) in rows.iter().enumerate() {
-                    let encoded = row_codec::encode_row(
-                        &schema,
-                        ctx.tenant_id(),
-                        Visibility::Private,
-                        values,
-                    )
-                    .map_err(|_| {
-                        CatalogError::Invalid(
-                            "materialized view row does not match its columns".to_string(),
-                        )
-                    })?;
-                    rows_table.insert((key.as_bytes(), i as u64), encoded.as_slice())?;
-                }
-                meta_table.insert(
-                    (name, key.as_bytes()),
-                    encode_meta(rows.len() as u64).as_slice(),
-                )?;
-            }
-        }
+        write_entities_in_txn(&write_txn, name, &def.columns, entities, &keys)?;
         def.populated = true;
         store_def_in_txn(&write_txn, &def)?;
         bump_table_generation_in_txn(&write_txn, name)?;
@@ -566,80 +700,16 @@ impl Storage {
     }
 
     /// `ctx` に対応する実体を読む。定義が無ければ `Err(ViewNotFound)`、その文脈の実体が無ければ
-    /// `Ok(None)`（未実体化。SQL の `55000` への写像は #1664）。1 つの read txn で読み、
-    /// 破損（件数不一致・ヘッダのテナント／可視性不一致・decode 失敗）は行を返さず
-    /// `CorruptSchema`（fail-closed）。
+    /// `Ok(None)`（未実体化。SQL の `55000` への写像は呼び出し元 `core.rs`）。新しい read txn を
+    /// 開いて [`read_materialized_view_in`] に委ねる薄いラッパー。
+    #[cfg(test)]
     pub(crate) fn read_materialized_view(
         &self,
         name: &str,
         ctx: &PolicyContext,
     ) -> Result<Option<MaterializedViewEntity>> {
-        validate_identifier(name)?;
         let read_txn = self.db().begin_read()?;
-        let def = {
-            let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
-                Ok(t) => t,
-                Err(redb::TableError::TableDoesNotExist(_)) => {
-                    return Err(CatalogError::ViewNotFound(name.to_string()));
-                }
-                Err(e) => return Err(e.into()),
-            };
-            let guard = table
-                .get(name)?
-                .ok_or_else(|| CatalogError::ViewNotFound(name.to_string()))?;
-            decode_materialized_view_def(name, guard.value())?
-        };
-        let key = ContextKey::from_context(ctx);
-        let row_count = {
-            let meta = match read_txn.open_table(MATVIEW_ENTITY_META_TABLE) {
-                Ok(t) => t,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                Err(e) => return Err(e.into()),
-            };
-            let guard = meta.get((name, key.as_bytes()))?;
-            match guard {
-                Some(g) => decode_meta(g.value())?,
-                None => return Ok(None),
-            }
-        };
-        if row_count > MAX_RESULT_ROWS_HARD_CAP as u64 {
-            return Err(corrupt("materialized view entity row count out of range"));
-        }
-        let expected = row_count as usize;
-        let schema = TableSchema::new(name.to_string(), def.columns.clone());
-        let rows_table_name = matview_rows_table_name(name);
-        let rows_def: MatviewRowsDef = TableDefinition::new(&rows_table_name);
-        let rows_table = match read_txn.open_table(rows_def) {
-            Ok(t) => Some(t),
-            Err(redb::TableError::TableDoesNotExist(_)) => None,
-            Err(e) => return Err(e.into()),
-        };
-        let mut rows: Vec<Vec<Value>> = Vec::new();
-        rows.try_reserve_exact(expected)
-            .map_err(|_| corrupt("materialized view allocation failed"))?;
-        if let Some(rows_table) = rows_table {
-            let lo = (key.as_bytes(), 0u64);
-            let hi = (key.as_bytes(), u64::MAX);
-            for entry in rows_table.range::<(&[u8], u64)>(lo..=hi)? {
-                let (k, v) = entry?;
-                if rows.len() >= expected || k.value().1 != rows.len() as u64 {
-                    return Err(corrupt("materialized view entity row count mismatch"));
-                }
-                let decoded = row_codec::decode_row(&schema, v.value())
-                    .map_err(|_| corrupt("materialized view entity row is corrupt"))?;
-                if !ctx.is_owner(&decoded.tenant_id) || decoded.visibility != Visibility::Private {
-                    return Err(corrupt("materialized view entity header mismatch"));
-                }
-                rows.push(decoded.values);
-            }
-        }
-        if rows.len() != expected {
-            return Err(corrupt("materialized view entity row count mismatch"));
-        }
-        Ok(Some(MaterializedViewEntity {
-            columns: def.columns,
-            rows,
-        }))
+        read_materialized_view_in(&read_txn, name, ctx)
     }
 
     /// matview の定義・全文脈のメタ・行表を同一 write txn で削除する（行表を残すと同名で

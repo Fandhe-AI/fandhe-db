@@ -172,6 +172,7 @@ pub(crate) mod ddl_column_type;
 pub mod declarative_predicate;
 pub(crate) mod describe;
 pub(crate) mod interval_arith;
+pub(crate) mod matview;
 pub(crate) mod set_expr;
 pub(crate) mod temp_catalog;
 #[cfg(test)]
@@ -451,6 +452,12 @@ pub enum SqlOutcome {
     /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `SqlOutcome`
     /// を網羅的にマッチする既存コードはすべて更新済み。
     CreateView(ddl::CreateViewOutcome),
+    /// `CREATE MATERIALIZED VIEW ...`（TABLE-42・Issue #1664）がセッション経由の実行経路で成功した
+    /// ことを示す応答（[`ddl::CreateMaterializedViewOutcome`] を運ぶ薄いラッパー）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1664）: 本 variant の追加により `SqlOutcome` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    CreateMaterializedView(ddl::CreateMaterializedViewOutcome),
     /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）がセッション
     /// 経由の実行経路で成功したことを示す応答。
     ///

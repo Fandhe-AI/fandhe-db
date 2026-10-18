@@ -151,6 +151,23 @@ pub(crate) fn resolve_from(
             }
             None => {
                 if !lookup.table_exists(&current)? {
+                    // TABLE-42・Issue #1664: 表にもビューにも該当しない名前に限り matview を
+                    // 照会する（一時表・表・ビューの遮蔽順を変えない）。クエリが直接参照した
+                    // 名前（連鎖が空）のときだけ葉として解決し、ビュー経由で matview に
+                    // 到達する形は従来どおり `42P01`（ビューから matview の参照は後続課題）。
+                    if chain.is_empty() {
+                        if let Some(columns) = lookup.materialized_view_columns(&current)? {
+                            return Ok(Resolved::Buffered {
+                                view_name: name.to_string(),
+                                body: Box::new(Statement::MaterializedView(
+                                    super::allowlist::ValidatedMaterializedViewRead {
+                                        name: current,
+                                        columns,
+                                    },
+                                )),
+                            });
+                        }
+                    }
                     return Err(SqlSurfaceError::undefined_table(name));
                 }
                 break current;
@@ -421,6 +438,13 @@ impl TableLookup for BufferedBodyLookup<'_> {
 
     fn buffered_depth(&self) -> usize {
         self.depth
+    }
+
+    fn materialized_view_columns(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<crate::catalog::ColumnDef>>, SqlSurfaceError> {
+        self.inner.materialized_view_columns(name)
     }
 }
 

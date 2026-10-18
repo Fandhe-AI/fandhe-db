@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 69;
+    count = 70;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -235,6 +235,11 @@ define_error_classes! {
     /// [`crate::catalog::CatalogError::WriteLockTimeout`]・
     /// [`crate::sql::allowlist::SqlSurfaceError::LockNotAvailable`] の写像。
     LockNotAvailable => ("55P03", "LOCK_NOT_AVAILABLE"),
+    /// 前提状態を満たさない対象への操作（`55000`）。TABLE-42・Issue #1664 が追加。
+    /// 未実体化の MATERIALIZED VIEW（`WITH NO DATA`、または読み手の文脈に実体が無い）を
+    /// 読もうとした場合に返す。他文脈の実体の有無・件数は含めない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::MaterializedViewNotPopulated`] の写像。
+    ObjectNotInPrerequisiteState => ("55000", "OBJECT_NOT_IN_PREREQUISITE_STATE"),
     /// `CREATE TABLE` が指定したテーブル名が既に存在する（`42P07`）。TABLE-4・
     /// TASK-85（Issue #899）が追加。上書きしない設計（既存スキーマは変更されない）。
     /// `CREATE VIEW`（TABLE-18・SQL-23・TASK-205、Issue #909）が既存のテーブル
