@@ -23,10 +23,11 @@ ON CONFLICT (id) DO UPDATE SET <col> = (EXCLUDED.<col> | <lit>)[, ...]
 USING OPERATION_ID '<id>'
 ```
 
-- 対象列リストは `(id)`、または宣言済み `UNIQUE` 制約（単一列・複数列）の構成列
-  集合と一致する列名の並びを受理する（TABLE-16、Issue #1074。「ON CONFLICT 対象の
-  UNIQUE 制約列への拡張」節参照）。`ON CONSTRAINT` 形・PRIMARY KEY 宣言列・部分一意
-  制約はいずれも対象外のまま `42601`。
+- 対象列リストは `(id)`、または宣言済み `UNIQUE` 制約・`PRIMARY KEY`（単一列・
+  複数列）の構成列集合と一致する列名の並びを受理する（TABLE-16、Issue #1074・
+  SQL-49、Issue #1707。「ON CONFLICT 対象の UNIQUE 制約列への拡張」節・
+  「Issue #1707 追記」節参照）。どれとも一致しない対象は `42P10`。`ON CONSTRAINT` 形・
+  式索引・部分索引の推論形は対象外のまま `42601`。
 - `ON CONFLICT` は複数行 `VALUES`（SQL-16、TASK-190）と併用でき、全行が同じ衝突分岐を
   共有する。
 - `ON CONFLICT` はファイル形 `INSERT`（`path`/`body` 列指定。TASK-120）とは併用できない
@@ -106,9 +107,9 @@ PR #1053（Issue #905・UNIQUE 制約）が対象外とした「UPSERT の衝突
   unique_constraints()`）のいずれかの構成列集合と一致する場合にのみ
   `BoundConflictTarget::Unique(indices)` へ解決する。`indices` は**対象リストに
   書いた順ではなく解決した制約の宣言順**になる（`(a,b)` と `(b,a)` は同じ制約として
-  同じ並びに解決される）。次はいずれも `42601`: `id` と他列の混在、未知列、大小文字
-  違い、`PRIMARY KEY` 宣言列（`schema.primary_key()` は対象に含めない）、どの
-  `UNIQUE` 制約とも一致しない列集合。
+  同じ並びに解決される）。Issue #1707 以降は `PRIMARY KEY` 宣言列も対象に含め、次は
+  いずれも `42P10`: `id` と他列の混在、未知列、大小文字違い、どの `UNIQUE` 制約・
+  `PRIMARY KEY` とも一致しない列集合（「Issue #1707 追記」節参照）。
 - **衝突判定**（`tenant::upsert_typed_rows_unchecked`）: `UpsertTarget::Unique` は
   書き込み**前**に対象テナントの既存行を 1 回だけ走査し（`constraint::
   scan_tenant_rows_by_unique_key`。`enforce_unique_keys_in_txn` と同じ
@@ -242,10 +243,41 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
 - `RETURNING` 句は Issue #1182 で結線済み（`docs/design/sql-returning.md` 参照）。
 - `UNIQUE` 制約を衝突対象にする拡張（TABLE-16）は Issue #1074 で実装済み
   （「ON CONFLICT 対象の UNIQUE 制約列への拡張」節参照）。`PRIMARY KEY` 宣言列を
-  対象にすること・`ON CONFLICT ON CONSTRAINT <name>`・部分一意制約の
-  `ON CONFLICT` は引き続き対象外（`42601`）。
+  対象にすることは Issue #1707 で実装済み（「Issue #1707 追記」節参照）。
+  `ON CONFLICT ON CONSTRAINT <name>`・部分一意制約の `ON CONFLICT` は引き続き対象外
+  （`42601`）。
 - `23505` の `code` ラベル分離（`DUPLICATE_OPERATION_ID` vs `UNIQUE_VIOLATION`）は
   Issue #1180 で実装済み。
 - NoSQL 表層の UPSERT（`on_conflict` キーの規範化）。
 - 3 クライアント統合ハーネス（層 B）への UPSERT ケース追加（層 A で契約を固定済み。
   層 B への追加は別 Issue の担当範囲）。
+
+## Issue #1707 追記: PRIMARY KEY 列を衝突対象にする（SQL-49 ポインタ）
+
+- **解決**: `resolve_conflict_target` は `UNIQUE` 制約を宣言順に先に照合し、一致しなければ
+  `schema.primary_key()` の列集合と照合して `BoundConflictTarget::Unique(indices)` を返す。
+  新しい variant は作らない（実行時の機構は UNIQUE 対象とバイト単位で同じ）。複合 PK は
+  列順を問わず集合が一致すれば解決する。
+- **UNIQUE 優先の理由**: 既に受理していた文の解決結果と `content_hash::for_typed_upsert`
+  （解決した列名の並びを含む）を変えないため。
+- **`indices` は PK の宣言順**: 永続索引の序数照合
+  （`constraint::unique_index::recover_forward_keys_for_rows`）が `key_specs` の宣言順
+  `indices` との完全一致で序数を探すため、書いた順やソート順にすると不可視の破損行の補完が
+  効かなくなる。
+- **SQLSTATE の変更（破壊的）**: 束縛段の「一致なし」は `42601` から `42P10`
+  （`SqlSurfaceError::InvalidColumnReference`、`ErrorClass::InvalidColumnReference`。
+  PostgreSQL と同じコード。固定文言で列名・値を含めない）へ変更した。対象は、どの制約とも
+  一致しない列集合（部分集合・上位集合を含む）、`id` と他列の混在、未知列・大小文字違い。
+  未知列は PostgreSQL では `42703` だが、本 Issue は「一致なし」の `42P10` のみを定めるため
+  別分岐は設けていない（差異として記録。寄せるかは別途判断）。
+- **`42601` のまま**: 構文段（`parse_on_conflict_clause`）で拒否する形——式索引推論
+  `((<式>))`、部分索引推論 `(<列>) WHERE ...`、`ON CONSTRAINT`、空リスト、対象の省略、
+  重複列、列数超過、ファイル形 `INSERT` との併用。
+- **NULL**: PK 構成列は NOT NULL。`VALUES` の NULL は衝突せず新規挿入分岐へ進み `23502`
+  になる（結合テストで固定）。既存行側の PK 列は NOT NULL のため事前走査の
+  `NullPolicy::Skip` は実害がない。
+- **テナント境界**: 事前走査は自テナント所有の全行が母集合（既存の UNIQUE 対象と同一）。
+  他テナントの同じ PK 値は非衝突、自テナントの不可視行との衝突は `DO NOTHING` でスキップ。
+- **#1708 との境界**: PK 対象の `DO UPDATE` は既存の Unique 用経路をそのまま通る
+  （結合テストのスモーク 1 本のみ）。`EXCLUDED` の網羅、PK 列自体の更新と `23505`、
+  再送不変性は #1708 の担当。
