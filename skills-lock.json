@@ -5,7 +5,7 @@
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/amd-rocm/SKILL.md",
-      "computedHash": "9c351cdf8b86e70241fd1ae3d7c5c7d8aa6f91737c52a4e5858344c0a574032f"
+      "computedHash": "5de984b27420f605dffa4b8a53704ab875ba4fd3c107364f0136ea4dd1584333"
     },
     "apple-silicon": {
       "source": "Fandhe-AI/agent-reference-skills",
@@ -71,7 +71,7 @@
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/github-docs/SKILL.md",
-      "computedHash": "4a756a4500ccbaee07d099871ee54e0da6be18c47fa6cb401019002c15aff73c"
+      "computedHash": "4c67db82f33610564d10ca685c26fd5d8f87f2d33c458d8d01dbb954a70c7cd9"
     },
     "implement-issue": {
       "source": "Fandhe-AI/agent-cli-skills",
@@ -113,13 +113,13 @@
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/make/SKILL.md",
-      "computedHash": "1f31950974ee19d19907e4c508a1b052d3aa104c4831cad582a24fd3fa8df733"
+      "computedHash": "d0ea071b89cccec0e765324ac12533858e7cb6f979c1309a29444c54c1881a49"
     },
     "nvidia-cuda": {
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/nvidia-cuda/SKILL.md",
-      "computedHash": "cbc7e89fe4dfadf9c3a9ceaa932d164fa91e2aff3b608286e4339cbc99a79257"
+      "computedHash": "995bc379a5ec9f87d0665509a6cffd4217569c748c6d1240a99ab7d25eedc980"
     },
     "rust": {
       "source": "Fandhe-AI/agent-reference-skills",
