@@ -275,6 +275,35 @@ fn wire_drop_table_multiple_names_atomic_and_permission() {
     }
 }
 
+/// `DROP TABLE|VIEW ... CASCADE／RESTRICT`（Issue #1641・TABLE-37 (2)(3) ポインタ）:
+/// `RESTRICT` は依存ありで `2BP01`、`CASCADE` は通常の DROP と同じ `CommandComplete` タグで
+/// 依存ビューと FK 制約を連鎖削除する。権限の無いユーザーは `42501`、併記は `42601`。
+#[test]
+fn wire_drop_cascade_and_restrict() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_with_ddl_allowed_users(&users(), core, &["alice"]);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    expect_command(&mut alice, "CREATE TABLE cp (name TEXT)", "CREATE TABLE");
+    expect_command(
+        &mut alice,
+        "CREATE TABLE cc (pid BIGINT REFERENCES cp, note TEXT)",
+        "CREATE TABLE",
+    );
+    expect_command(
+        &mut alice,
+        "CREATE VIEW cv AS SELECT id FROM cp LIMIT 5",
+        "CREATE VIEW",
+    );
+    expect_error(&mut alice, "DROP TABLE cp RESTRICT", "2BP01");
+    expect_error(&mut alice, "DROP TABLE cp", "2BP01");
+    expect_error(&mut alice, "DROP TABLE cp CASCADE RESTRICT", "42601");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "pw-bob");
+    expect_error(&mut bob, "DROP TABLE cp CASCADE", "42501");
+    expect_command(&mut alice, "DROP TABLE cp CASCADE", "DROP TABLE");
+    expect_error(&mut alice, "DROP VIEW cv", "42P01");
+    expect_command(&mut alice, "DROP TABLE cc", "DROP TABLE");
+}
+
 /// `CREATE UNIQUE INDEX`（Issue #1616・INDEX-9）。`CommandComplete` タグは通常の
 /// `CREATE INDEX`、作成時の重複・作成後の重複 INSERT は `23505`、`DROP CONSTRAINT <索引名>` は
 /// `42704`、`DROP INDEX` で強制が外れる。強制の詳細は

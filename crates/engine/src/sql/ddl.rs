@@ -39,8 +39,8 @@
 //! 一切変更しない。
 
 use crate::catalog::{
-    AlterApply, AlterCheckError, CatalogError, ColumnDef, ColumnDefault, ColumnType, IndexDef,
-    IndexKind, TableSchema, MAX_COLUMN_DEFAULT_LEN,
+    AlterApply, AlterCheckError, CascadedObject, CatalogError, ColumnDef, ColumnDefault,
+    ColumnType, IndexDef, IndexKind, TableSchema, MAX_COLUMN_DEFAULT_LEN,
 };
 use crate::schema_limits::SchemaLimits;
 use crate::sql::allowlist::{
@@ -300,18 +300,27 @@ pub(crate) fn execute_create_table(
 /// 推測できないようにする（RLS-9 と同じ設計判断。`DROP TABLE` はテナント
 /// スコープの操作ではないため、そもそも「自テナント分の件数」という概念を
 /// 持たない）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropTableOutcome {
     /// `IF EXISTS` で全対象が無く何も削除しなかったか（Issue #1614・TABLE-36 ポインタ。
     /// 複数指定〔TABLE-37 (1)〕では「1 件も削除しなかった」）。
     /// CommandComplete のタグは通常の DROP と同一のため、wire 側は参照しない。
     pub(crate) skipped: bool,
+    /// `CASCADE` で連鎖削除したオブジェクト（適用順。TABLE-37 (3)、Issue #1641。NOTICE 相当の
+    /// 報告用）。オブジェクト名のみで行数・テナント情報は持たない。
+    /// **BREAKING CHANGE**: 本フィールドのため `Copy` を外した。
+    pub(crate) cascaded: Vec<CascadedObject>,
 }
 
 impl DropTableOutcome {
     /// `IF EXISTS` により対象不在で no-op 成功した場合に真。
     pub fn skipped(&self) -> bool {
         self.skipped
+    }
+
+    /// `CASCADE` で連鎖削除した依存オブジェクト（`RESTRICT` 時は空）。
+    pub fn cascaded(&self) -> &[CascadedObject] {
+        &self.cascaded
     }
 }
 
@@ -334,9 +343,14 @@ pub(crate) fn execute_drop_table(
     // （TABLE-37 (1)。`Storage::drop_tables`）。種類違い（`42809`）・依存（`2BP01`）・
     // ロック timeout 等は読み替えず従来の写像へ流す（fail-closed。権限ゲートは呼び出し元で
     // 通過済みのため存在オラクルにならない）。
-    match storage.drop_tables(&validated.table_names, validated.if_exists) {
+    match storage.drop_tables(
+        &validated.table_names,
+        validated.if_exists,
+        validated.behavior,
+    ) {
         Ok(report) => Ok(DropTableOutcome {
             skipped: report.dropped == 0,
+            cascaded: report.cascaded,
         }),
         Err(e) => Err(map_drop_table_error(e)),
     }
@@ -2141,18 +2155,26 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
 pub struct CreateViewOutcome {}
 
 /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）の成功応答。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropViewOutcome {
     /// `IF EXISTS` で全対象が無く何も削除しなかったか（Issue #1614・TABLE-36 ポインタ。
     /// 複数指定〔TABLE-37 (1)〕では「1 件も削除しなかった」）。
     /// CommandComplete のタグは通常の DROP と同一のため、wire 側は参照しない。
     pub(crate) skipped: bool,
+    /// `CASCADE` で連鎖削除した依存ビュー（適用順。TABLE-37、Issue #1641）。
+    /// **BREAKING CHANGE**: 本フィールドのため `Copy` を外した。
+    pub(crate) cascaded: Vec<CascadedObject>,
 }
 
 impl DropViewOutcome {
     /// `IF EXISTS` により対象不在で no-op 成功した場合に真。
     pub fn skipped(&self) -> bool {
         self.skipped
+    }
+
+    /// `CASCADE` で連鎖削除した依存オブジェクト（`RESTRICT` 時は空）。
+    pub fn cascaded(&self) -> &[CascadedObject] {
+        &self.cascaded
     }
 }
 
@@ -2186,11 +2208,15 @@ pub(crate) fn execute_drop_view(
     // `ViewNotFound` を commit 前に返し txn が破棄されるため、カタログ・台帳・世代は変わらない。
     // 種類違い（`42809`）・依存（`2BP01`）・ロック timeout 等は読み替えず従来の写像へ流す
     // （fail-closed。権限ゲートは呼び出し元で通過済みのため存在オラクルにならない）。
-    match storage.drop_view(validated.name()) {
-        Ok(()) => Ok(DropViewOutcome { skipped: false }),
-        Err(CatalogError::ViewNotFound(_)) if validated.if_exists() => {
-            Ok(DropViewOutcome { skipped: true })
-        }
+    match storage.drop_view_with_behavior(validated.name(), validated.behavior()) {
+        Ok(cascaded) => Ok(DropViewOutcome {
+            skipped: false,
+            cascaded,
+        }),
+        Err(CatalogError::ViewNotFound(_)) if validated.if_exists() => Ok(DropViewOutcome {
+            skipped: true,
+            cascaded: Vec::new(),
+        }),
         Err(e) => Err(map_drop_view_error(e)),
     }
 }
@@ -2509,11 +2535,13 @@ mod tests {
         let t = ValidatedDropTable {
             table_names: vec!["ghost".into()],
             if_exists: true,
+            behavior: crate::catalog::DropBehavior::Restrict,
         };
         assert!(execute_drop_table(&storage, &t).expect("table").skipped());
         let v = ValidatedDropView {
             name: "ghost".into(),
             if_exists: true,
+            behavior: crate::catalog::DropBehavior::Restrict,
         };
         assert!(execute_drop_view(&storage, &v).expect("view").skipped());
         let i = ValidatedDropIndex {
