@@ -3746,6 +3746,17 @@ pub struct ValidatedAlterTableRenameColumn {
     pub new_column_name: String,
 }
 
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> RENAME TO <new>` 文（TABLE-38 のポインタ、
+/// Issue #1623）。新しい表名の識別子検証は構造検証段で `42601` に落とし済み。表の存在確認・
+/// 改名先の衝突・依存オブジェクト検査は DDL 権限ゲート通過後の実行段
+/// （`sql::ddl::execute_alter_table_rename_table`）が担う（存在オラクル化を防ぐ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableRenameTable {
+    pub table_name: String,
+    /// 改名先の表名。
+    pub new_table_name: String,
+}
+
 /// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> TYPE
 /// <型名>` 文（TABLE-19・SQL-23、Issue #1167）。型名の意味づけ（ENUM 型名の
 /// 存在確認・`ColumnType` への変換）と互換性判定は実行段
@@ -3841,6 +3852,9 @@ pub struct ValidatedAlterTableAlterColumnDropDefault {
 ///
 /// **BREAKING CHANGE**（Issue #1632）: `AlterColumnDropNotNull` variant を追加した。
 /// 本 enum を網羅的に `match` するクレート外のコードは追随が必要。
+///
+/// **BREAKING CHANGE**（Issue #1623）: `RenameTable` variant を追加した。
+/// 本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedAlterTable {
     /// 複数アクション（Issue #1633）。**BREAKING CHANGE**: variant 追加。
@@ -3858,6 +3872,8 @@ pub enum ValidatedAlterTable {
     AlterColumnDropDefault(ValidatedAlterTableAlterColumnDropDefault),
     AlterColumnDropNotNull(ValidatedAlterTableAlterColumnDropNotNull),
     RenameColumn(ValidatedAlterTableRenameColumn),
+    /// 表の改名（Issue #1623）。**BREAKING CHANGE**: variant 追加。
+    RenameTable(ValidatedAlterTableRenameTable),
 }
 
 /// `UPDATE ... SET <col> = <右辺>` の右辺 1 個ぶんの構文表現（Issue #1544・SQL-45 の
@@ -9230,15 +9246,23 @@ impl<'a> Parser<'a> {
             });
         }
         // `RENAME [COLUMN] <old> TO <new>`（TABLE-38 のポインタ、Issue #1619）。
-        // `RENAME TO <name>`（表の改名）・`RENAME CONSTRAINT` は未対応のため `42601`。
+        // `RENAME CONSTRAINT` は未対応のため `42601`。
         // 予約列名は改名元・改名先とも構造検証段で拒否する（カタログを見ない判定のため
         // 権限ゲートより前に置いても存在オラクルにならない）。
         if self.peek_contextual_keyword("RENAME") {
             self.advance();
             if self.peek_contextual_keyword("TO") {
-                return Err(SqlSurfaceError::unsupported(
-                    "RENAME TO (table rename) is not supported",
-                ));
+                // `RENAME TO <name>`（表の改名。TABLE-38 のポインタ、Issue #1623）。修飾名は
+                // `.` が残るため呼び出し元の `expect_end_of_statement` が `42601` にする。
+                self.advance();
+                let new_table_name = self.expect_ident()?;
+                crate::catalog::validate_identifier(&new_table_name).map_err(|e| {
+                    SqlSurfaceError::unsupported(format!("invalid table name: {e}"))
+                })?;
+                return Ok(ParsedAlterTableShape::RenameTable {
+                    table_name,
+                    new_table_name,
+                });
             }
             if self.peek_contextual_keyword("CONSTRAINT") {
                 return Err(SqlSurfaceError::unsupported(
@@ -11870,6 +11894,10 @@ enum ParsedAlterTableShape {
         table_name: String,
         column_name: String,
         new_column_name: String,
+    },
+    RenameTable {
+        table_name: String,
+        new_table_name: String,
     },
 }
 
@@ -15387,7 +15415,8 @@ fn into_validated_alter_table(
             let mut validated = Vec::with_capacity(actions.len());
             for action in actions {
                 match action {
-                    ParsedAlterTableShape::RenameColumn { .. } => {
+                    ParsedAlterTableShape::RenameColumn { .. }
+                    | ParsedAlterTableShape::RenameTable { .. } => {
                         return Err(SqlSurfaceError::unsupported(
                             "RENAME cannot be combined with other ALTER TABLE actions",
                         ));
@@ -15511,6 +15540,13 @@ fn into_validated_alter_table(
             table_name,
             column_name,
             new_column_name,
+        }),
+        ParsedAlterTableShape::RenameTable {
+            table_name,
+            new_table_name,
+        } => ValidatedAlterTable::RenameTable(ValidatedAlterTableRenameTable {
+            table_name,
+            new_table_name,
         }),
         ParsedAlterTableShape::AlterColumnType {
             table_name,
@@ -24168,5 +24204,28 @@ mod body_expr_policy_tests {
         let tokens = crate::sql::lexer::tokenize("SELECT * FROM docs").expect("tok");
         let mut body = parse_view_body(&tokens).expect("parse");
         assert!(!rename_column_in_view_body(&mut body, "note", "memo").expect("noop"));
+    }
+
+    /// `RENAME TO` は表の改名として受理し、不正な形は構文段（カタログ非参照）で `42601`。
+    #[test]
+    fn alter_table_rename_to_parses_and_rejects_bad_forms() {
+        match validate_alter_table("ALTER TABLE docs RENAME TO papers;").expect("rename") {
+            ValidatedAlterTable::RenameTable(stmt) => {
+                assert_eq!(stmt.table_name, "docs");
+                assert_eq!(stmt.new_table_name, "papers");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        for bad in [
+            "ALTER TABLE docs RENAME TO",
+            "ALTER TABLE docs RENAME TO s.papers",
+            "ALTER TABLE docs RENAME TO \"bad name\"",
+            "ALTER TABLE docs RENAME TO x, ADD COLUMN z TEXT",
+            "ALTER TABLE docs ADD COLUMN z TEXT, RENAME TO x",
+            "ALTER TABLE docs RENAME CONSTRAINT a TO b",
+        ] {
+            let err = validate_alter_table(bad).expect_err(bad);
+            assert_eq!(err.wire_code(), "42601", "{bad}");
+        }
     }
 }

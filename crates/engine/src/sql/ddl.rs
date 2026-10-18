@@ -50,9 +50,9 @@ use crate::sql::allowlist::{
     ValidatedAlterTableAlterColumnSetDefault, ValidatedAlterTableAlterColumnSetNotNull,
     ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
     ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
-    ValidatedAlterTableRenameColumn, ValidatedCreateIndex, ValidatedCreateTable,
-    ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex, ValidatedDropTable,
-    ValidatedDropType, ValidatedDropView,
+    ValidatedAlterTableRenameColumn, ValidatedAlterTableRenameTable, ValidatedCreateIndex,
+    ValidatedCreateTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
+    ValidatedDropTable, ValidatedDropType, ValidatedDropView,
 };
 use crate::sql::ddl_column_type::{
     alias_spelling, to_static_column_type_with_array_default, SqlColumnTypeName, StaticColumnType,
@@ -438,6 +438,9 @@ pub enum AlterTableAction {
         column_name: String,
         new_column_name: String,
     },
+    /// `RENAME TO <new>`（表の改名。TABLE-38 のポインタ、Issue #1623）。
+    /// **BREAKING CHANGE**: variant 追加。
+    RenameTable { new_table_name: String },
 }
 
 /// `ALTER TABLE <table> ADD COLUMN <column> <type>` の実行本体（Issue #900）。
@@ -744,6 +747,9 @@ pub(crate) fn execute_alter_table(
         crate::sql::allowlist::ValidatedAlterTable::RenameColumn(stmt) => {
             execute_alter_table_rename_column(storage, stmt)
         }
+        crate::sql::allowlist::ValidatedAlterTable::RenameTable(stmt) => {
+            execute_alter_table_rename_table(storage, stmt)
+        }
     }
 }
 
@@ -986,7 +992,8 @@ fn apply_alter_action_in_txn(
         | ValidatedAlterTable::AddForeignKey(_)
         | ValidatedAlterTable::AddPrimaryKey(_)
         | ValidatedAlterTable::AlterColumnType(_)
-        | ValidatedAlterTable::RenameColumn(_) => {
+        | ValidatedAlterTable::RenameColumn(_)
+        | ValidatedAlterTable::RenameTable(_) => {
             Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
                 detail: "multiple ALTER TABLE actions including this action are not supported"
                     .to_string(),
@@ -1179,6 +1186,37 @@ pub(crate) fn execute_alter_table_rename_column(
         action: AlterTableAction::RenameColumn {
             column_name: stmt.column_name.clone(),
             new_column_name: stmt.new_column_name.clone(),
+        },
+    })
+}
+
+/// `ALTER TABLE <table> RENAME TO <new>` の実行本体（TABLE-38 のポインタ、Issue #1623）。
+/// 呼び出し元（`core.rs`）は [`require_ddl_permission`] を必ず先に呼んでいる前提。
+///
+/// 判定順序（決定的）: テーブル存在確認（`42P01`／`42809`）→
+/// `catalog::Storage::alter_table_rename`（単一 write txn 内。改名先の衝突 `42P07` →
+/// 依存オブジェクトの暫定拒否 `0A000` → カタログ・行ストア・世代の付け替え）。
+pub(crate) fn execute_alter_table_rename_table(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableRenameTable,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    storage
+        .alter_table_rename(&stmt.table_name, &stmt.new_table_name)
+        .map_err(|e| match e {
+            AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                undefined_table_or_view(storage, &stmt.table_name)
+            }
+            AlterCheckError::Catalog(CatalogError::TableAlreadyExists(name)) => {
+                SqlSurfaceError::duplicate_table(name)
+            }
+            AlterCheckError::Catalog(other) => map_drop_alter_column_error(other),
+            AlterCheckError::Sql(sql_err) => sql_err,
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::RenameTable {
+            new_table_name: stmt.new_table_name.clone(),
         },
     })
 }
