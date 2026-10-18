@@ -238,6 +238,14 @@ pub(crate) fn convert_column_default_for_alter(
             _ => return Err(fail()),
         },
     };
+    // 保存可能長の検査: カタログは DEFAULT／補完値を `MAX_COLUMN_DEFAULT_LEN` バイトまでしか
+    // 保存できない（CHAR(n) の空白詰め等で変換後に超過しうる）。超過を保存段階の 42601 に
+    // 漏らさず、ここで固定文言の 42804 にする。呼び出し側は DEFAULT なら拒否、補完値なら破棄する。
+    if let ColumnDefault::Text(s) | ColumnDefault::Number(s) = &candidate {
+        if s.len() > crate::catalog::MAX_COLUMN_DEFAULT_LEN {
+            return Err(fail());
+        }
+    }
     // 再束縛検証: 正準形が新しい型の DEFAULT として束縛できること。完全一致は、整数・bool・文字列
     // など正準 text 表現が一意な型だけで要求する。REAL／DOUBLE PRECISION／NUMERIC の scale／
     // TIMESTAMPTZ は text 表現が元と異なっても代入変換自体は成功しているため、束縛成功をもって可とする

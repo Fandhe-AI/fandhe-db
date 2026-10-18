@@ -545,3 +545,26 @@ fn array_to_text_assignment_is_accepted() {
     ok(&core, "ALTER TABLE u ALTER COLUMN a TYPE VARCHAR(20)");
     assert_eq!(firsts(&core, "SELECT a FROM u LIMIT 5").len(), 1);
 }
+
+/// 変換後の DEFAULT が CHAR(n) の空白詰めでカタログの保存上限（`MAX_COLUMN_DEFAULT_LEN`）を
+/// 超える場合は、保存段階の 42601 ではなく固定文言の 42804 で拒否し、表は不変（Issue #1637）。
+#[test]
+fn default_exceeding_catalog_limit_after_conversion_is_rejected_with_42804() {
+    let (_path, _g, core) = open("rw-default-too-long");
+    ok(&core, "CREATE TABLE t (k BIGINT, c BIGINT DEFAULT 1)");
+    let err = fail(&core, "ALTER TABLE t ALTER COLUMN c TYPE CHAR(1025)");
+    assert_eq!(err.wire_code(), "42804", "{err}");
+    assert_eq!(column_type(&core, "t", "c"), ColumnType::BigInt);
+}
+
+/// DEFAULT を外して補完値だけが残る列は、変換後の補完値が保存上限を超えるなら補完値を破棄して
+/// 変換を受理する（変換不能な補完値は破棄する方針。Issue #1637）。
+#[test]
+fn fill_only_exceeding_catalog_limit_after_conversion_is_discarded() {
+    let (_path, _g, core) = open("rw-fill-too-long");
+    ok(&core, "CREATE TABLE t (k BIGINT)");
+    ok(&core, "ALTER TABLE t ADD COLUMN c BIGINT DEFAULT 1");
+    ok(&core, "ALTER TABLE t ALTER COLUMN c DROP DEFAULT");
+    ok(&core, "ALTER TABLE t ALTER COLUMN c TYPE CHAR(1025)");
+    assert_eq!(column_type(&core, "t", "c"), ColumnType::Bpchar(1025));
+}
