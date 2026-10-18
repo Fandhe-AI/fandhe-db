@@ -1014,6 +1014,9 @@ pub(crate) fn push_canonical_component(
 /// または列欠落の場合は `Ok(None)`（NULLS DISTINCT。本関数は UNIQUE 制約専用の
 /// 呼び出しを想定し、`NullPolicy::Reject`〔主キー〕は扱わない）。
 ///
+/// `ON CONFLICT (<PK 列>)`（SQL-49、Issue #1707）の対象解決でも同じ関数を使う
+/// （PK 構成列は NOT NULL のため NULL キーは新規挿入分岐で `23502` になる）。
+///
 /// `ColumnType::is_unique_constraint_allowed`（Issue #1073）が PK 許可型の
 /// 上位集合として REAL／DOUBLE PRECISION／NUMERIC／JSON／JSONB／ARRAY を
 /// UNIQUE 制約の構成列として許可するため、`resolve_conflict_target` が解決する
