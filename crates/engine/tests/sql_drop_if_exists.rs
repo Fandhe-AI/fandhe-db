@@ -9,7 +9,8 @@
 //! - 対象不在は副作用ゼロの no-op 成功（`skipped() == true`）
 //! - 対象が存在すれば従来どおり削除、依存（`2BP01`）・種類違い（`42809`）は不変
 //! - 権限の無いセッションは存否に関わらず `42501`（no-op を存在オラクルにしない）
-//! - 明示トランザクション内 DDL は `0A000`、対象外の形（複数名・`CASCADE` 等）は `42601`
+//! - 明示トランザクション内 DDL は `0A000`、対象外の形（TABLE 以外の複数名・`CASCADE` 等）は `42601`
+//!   （`DROP TABLE` の複数名は TABLE-37 (1)、Issue #1639 で受理に変わった。`sql_drop_table_multi.rs`）
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -252,13 +253,17 @@ fn unsupported_shapes_stay_42601() {
     let mut allowed = allowed_session();
     let mut denied = SessionState::default();
     for kind in KINDS {
-        for sql in [
+        let mut shapes = vec![
             format!("DROP {kind} IF EXISTS"),
-            format!("DROP {kind} IF EXISTS a, b"),
             format!("DROP {kind} IF EXISTS a CASCADE"),
             format!("DROP {kind} IF a"),
             format!("DROP {kind} EXISTS a"),
-        ] {
+        ];
+        // `DROP TABLE` の複数名は受理される（TABLE-37 (1)）。他種別は従来どおり拒否。
+        if kind != "TABLE" {
+            shapes.push(format!("DROP {kind} IF EXISTS a, b"));
+        }
+        for sql in shapes {
             assert_eq!(code(&core, &mut allowed, &sql), "42601", "allowed: {sql}");
             assert_eq!(code(&core, &mut denied, &sql), "42601", "denied: {sql}");
         }

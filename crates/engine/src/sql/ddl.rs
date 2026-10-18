@@ -302,7 +302,8 @@ pub(crate) fn execute_create_table(
 /// 持たない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropTableOutcome {
-    /// `IF EXISTS` で対象が無く何もしなかったか（Issue #1614・TABLE-36 ポインタ）。
+    /// `IF EXISTS` で全対象が無く何も削除しなかったか（Issue #1614・TABLE-36 ポインタ。
+    /// 複数指定〔TABLE-37 (1)〕では「1 件も削除しなかった」）。
     /// CommandComplete のタグは通常の DROP と同一のため、wire 側は参照しない。
     pub(crate) skipped: bool,
 }
@@ -314,8 +315,10 @@ impl DropTableOutcome {
     }
 }
 
-/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体。
-/// `crate::catalog::Storage::drop_table`（カタログエントリ・全テナント行
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体。複数テーブル指定は
+/// 文全体が 1 つの write txn で原子的（TABLE-37 (1)、Issue #1639。判定順は構文 → 権限 →
+/// 解決 → 依存）。
+/// `crate::catalog::Storage::drop_tables`（カタログエントリ・全テナント行
 /// ストア・`operation_id` 台帳エントリの単一 write txn 削除。テーブル単位
 /// 世代 bump を含む）へ委譲し、`CatalogError` を SQL 表層の契約へ写像する。
 ///
@@ -327,15 +330,14 @@ pub(crate) fn execute_drop_table(
     storage: &Storage,
     validated: &ValidatedDropTable,
 ) -> Result<DropTableOutcome, SqlSurfaceError> {
-    // `IF EXISTS` かつ対象不在（`TableNotFound`）だけを成功へ読み替える。`Storage::drop_table` は
-    // `TableNotFound` を commit 前に返し txn が破棄されるため、カタログ・台帳・世代は変わらない。
-    // 種類違い（`42809`）・依存（`2BP01`）・ロック timeout 等は読み替えず従来の写像へ流す
-    // （fail-closed。権限ゲートは呼び出し元で通過済みのため存在オラクルにならない）。
-    match storage.drop_table(&validated.table_name) {
-        Ok(()) => Ok(DropTableOutcome { skipped: false }),
-        Err(CatalogError::TableNotFound(_)) if validated.if_exists => {
-            Ok(DropTableOutcome { skipped: true })
-        }
+    // 複数指定・`IF EXISTS` の判定（不在の skip を含む）はカタログ層が単一 write txn 内で行う
+    // （TABLE-37 (1)。`Storage::drop_tables`）。種類違い（`42809`）・依存（`2BP01`）・
+    // ロック timeout 等は読み替えず従来の写像へ流す（fail-closed。権限ゲートは呼び出し元で
+    // 通過済みのため存在オラクルにならない）。
+    match storage.drop_tables(&validated.table_names, validated.if_exists) {
+        Ok(report) => Ok(DropTableOutcome {
+            skipped: report.dropped == 0,
+        }),
         Err(e) => Err(map_drop_table_error(e)),
     }
 }
@@ -2101,7 +2103,8 @@ pub struct CreateViewOutcome {}
 /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）の成功応答。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropViewOutcome {
-    /// `IF EXISTS` で対象が無く何もしなかったか（Issue #1614・TABLE-36 ポインタ）。
+    /// `IF EXISTS` で全対象が無く何も削除しなかったか（Issue #1614・TABLE-36 ポインタ。
+    /// 複数指定〔TABLE-37 (1)〕では「1 件も削除しなかった」）。
     /// CommandComplete のタグは通常の DROP と同一のため、wire 側は参照しない。
     pub(crate) skipped: bool,
 }
@@ -2204,7 +2207,8 @@ pub struct CreateIndexOutcome {}
 /// `DROP INDEX`（TASK-206・INDEX-7・SQL-23、Issue #908）の成功応答。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropIndexOutcome {
-    /// `IF EXISTS` で対象が無く何もしなかったか（Issue #1614・TABLE-36 ポインタ）。
+    /// `IF EXISTS` で全対象が無く何も削除しなかったか（Issue #1614・TABLE-36 ポインタ。
+    /// 複数指定〔TABLE-37 (1)〕では「1 件も削除しなかった」）。
     /// CommandComplete のタグは通常の DROP と同一のため、wire 側は参照しない。
     pub(crate) skipped: bool,
 }
@@ -2332,7 +2336,8 @@ pub struct CreateTypeOutcome {}
 /// `DROP TYPE`（TABLE-14・SQL-23・TASK-198、Issue #1194）の成功応答。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropTypeOutcome {
-    /// `IF EXISTS` で対象が無く何もしなかったか（Issue #1614・TABLE-36 ポインタ）。
+    /// `IF EXISTS` で全対象が無く何も削除しなかったか（Issue #1614・TABLE-36 ポインタ。
+    /// 複数指定〔TABLE-37 (1)〕では「1 件も削除しなかった」）。
     /// CommandComplete のタグは通常の DROP と同一のため、wire 側は参照しない。
     pub(crate) skipped: bool,
 }
@@ -2454,7 +2459,7 @@ mod tests {
         let before = snapshot(&storage);
 
         let t = ValidatedDropTable {
-            table_name: "ghost".into(),
+            table_names: vec!["ghost".into()],
             if_exists: true,
         };
         assert!(execute_drop_table(&storage, &t).expect("table").skipped());
