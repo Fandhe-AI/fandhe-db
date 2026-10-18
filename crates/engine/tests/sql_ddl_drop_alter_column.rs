@@ -237,10 +237,11 @@ fn alter_type_error_contract() {
         // 予約名。
         ("ALTER TABLE docs ALTER COLUMN id TYPE TEXT", "42601"),
         ("ALTER TABLE docs ALTER COLUMN TENANT_ID TYPE TEXT", "42601"),
-        // CHECK が参照する列への一般変換は、Issue #1637（依存オブジェクトの再構築）まで暫定の
-        // `0A000`（TABLE-40・Issue #1636。拡大変換の BIGINT 化は Issue #1427 で受理。成功系は
-        // sql_alter_column_type_check_columns.rs）。
-        ("ALTER TABLE checked ALTER COLUMN a TYPE TEXT", "0A000"),
+        // CHECK が参照する列への一般変換は、CHECK を新しい型で束縛し直せなければその束縛エラー
+        // （`a > 0` は TEXT と数値を比較できず `42883`。TABLE-40・Issue #1637。拡大変換の BIGINT 化は
+        // Issue #1427 で受理。成功系は sql_alter_column_type_check_columns.rs・
+        // sql_alter_column_type_dependents.rs）。
+        ("ALTER TABLE checked ALTER COLUMN a TYPE TEXT", "42883"),
     ] {
         assert_eq!(code_of(&core, &mut session, sql), code, "{sql}");
     }

@@ -346,7 +346,7 @@ Issue #1637 の担当で、本 Issue では型検査に通った USING 付きの
   応答へ載せない
 - **依存ゲート（暫定）**: PK／UNIQUE／この表の FK／他表の FK 参照先／CHECK／索引宣言／ビューが参照する列と、
   DEFAULT・補完値を持つ列への一般変換は `0A000`。型付きの正準キー・旧型の DEFAULT・古い索引が新しい値と
-  食い違う fail-open を避けるため。**Issue #1637 で再構築を実装して解除する**。既存の受理経路
+  食い違う fail-open を避けるため。**Issue #1637 で解除した**（下の「Issue #1637 追記」）。既存の受理経路
   （INTEGER→BIGINT 等）は依存があっても不変
 - **`USING <対象列>`**: 省略と同じ扱い（既存の拡大経路を通る）
 - **従来どおりの拒否**: 複数アクション内の `TYPE`（`0A000`）・明示トランザクション内の DDL（`0A000`）・
@@ -355,3 +355,39 @@ Issue #1637 の担当で、本 Issue では型検査に通った USING 付きの
   ENUM→TEXT などの代入変換は未対応
 - **セッション TZ**: TIMESTAMP↔TIMESTAMPTZ の変換は評価時にセッション TimeZone を読む。ALTER TABLE の
   実行は `core.rs` の `session_time_zone_scope` の内側で行われる
+
+## Issue #1637 追記（ALTER COLUMN TYPE の依存オブジェクト再構築。TABLE-40 (3)(4)・TASK-278 ポインタ）
+
+Issue #1636 の暫定ゲート（依存を持つ列を一律 `0A000`）を外し、一般変換（`AlterPlan::RewriteExpr`）が依存する
+索引・制約・DEFAULT を新しい型で再構築・再検証する。ビューが参照する列だけは PostgreSQL と同じ `0A000`
+（固定文言 `cannot alter type of a column used by a view or rule`）で拒否する。
+
+- **処理順（単一 write txn。`catalog::alter_column_type_rewrite_expr_in_txn`）**:
+  1. ビューのゲート（`column_referenced_by_views_in_txn`。直接参照・`SELECT *` 展開・連鎖を検出し、導出不能は
+     fail-closed。データを読まない）
+  2. 旧スキーマへの束縛し直し → 新スキーマの組み立て
+  3. 静的検証（`validate_dependents_statically_in_txn`。行を読まない）: 変更列を含む索引宣言へ
+     `validate_index_columns` を再適用（索引化未対応の型 `0A000`・照合を持てない型への照合 `42804`）、
+     PK／UNIQUE の許可型（`0A000`）、FK 参照元の許可型（`42804`）、変更列を参照する CHECK の再束縛
+     （失敗はその束縛エラーのまま。`XX000` に丸めない）
+  4. DEFAULT・補完値の変換（下記）
+  5. 全行の書き換え → `user_uniq` と `key_index` の失効 → 変更列を参照する CHECK の全行再検証（`23514`）→
+     スキーマの書き戻し
+  6. 呼び出し元が `revalidate_keys_after_type_change` で PK／UNIQUE の重複（`23505`）・FK の型照合（`42804`）・
+     参照整合性（`23503`。自表・他表・自己参照）を再検証し、世代 bump と commit（唯一の commit 点）
+- **再検証の範囲**: 全テナント・全可視性の行（`PolicyContext` で絞らない）。拒否時は commit せず表は不変。
+  エラー文言は固定で、値・テナント・行 id を含めない
+- **DEFAULT**: 旧型から新型への**代入変換**（SQL-47。`USING` 式は使わない。PG と同じ）で変換し、新しい型の
+  正準形へ戻して再束縛した値が一致することを確かめる（`sql::alter_using::convert_column_default_for_alter`）。
+  変換不能・往復不一致は値を含まない固定文言の `42804`。例: `TEXT DEFAULT '5'` を `INTEGER` へは代入変換が
+  無いため `42804`（PG の "default for column cannot be cast automatically" と同じ）。`BIGINT DEFAULT 300`
+  を `INTEGER` へは受理。時刻値関数の DEFAULT は新しい型と整合するときだけ保持し、それ以外は `42804`
+- **補完値（`fill_value`）**: 全行の再エンコードで各行へ実体化される（読み出し時の補完は旧スキーマで適用済み）。
+  変換後の `fill_value` は `default_expr` とミラーなら同じ値、食い違うときは変換できなければ破棄する
+- **対象外・PG との差分**: 拡大経路（INTEGER→BIGINT 等）はビュー依存があっても従来どおり受理する
+  （変更すると破壊的になるため別途）。BOOLEAN・JSONB など PG では索引・キーにできる型への変換は `0A000`。
+  時刻 DEFAULT の非互換型への変換は `42804`（PG は受理）。式索引・部分索引（INDEX-10）・マテリアライズド
+  ビュー（TABLE-42）は未実装のため対象外。複数アクション内の `TYPE` は `0A000` のまま。`VECTOR(N)` の次元変更は
+  TABLE-19 の `42804` のまま
+- テスト: `crates/engine/tests/sql_alter_column_type_dependents.rs`（新規）・既存の `*_rewrite`／`*_check_columns`／
+  `*_key_columns`／`sql_ddl_drop_alter_column`・wire は `wire_ddl_drop_alter_column.rs`

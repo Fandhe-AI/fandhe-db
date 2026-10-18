@@ -1413,69 +1413,21 @@ fn delete_indexes_referencing_column_in_txn(
     })
 }
 
-/// 列型変換の一般変換（`AlterPlan::RewriteExpr`。TABLE-40・Issue #1636）が、依存オブジェクトを
-/// 持つ列を新しい経路で処理しないための暫定ゲート（fail-closed）。型付きの正準キー・旧型の
-/// DEFAULT／補完値・古い索引・ビューの束縛が新しい値と食い違う fail-open を避ける。
-/// 依存の再構築と解除は Issue #1637 の担当（そのとき本関数のゲートを外す）。
+/// 列型変換の一般変換（`AlterPlan::RewriteExpr`。TABLE-40 (4)・Issue #1636・#1637）が、
+/// ビューの参照する列を拒否するためのゲート（PostgreSQL と同じ `0A000`）。ビューの束縛済みの
+/// 列型・結果型が新しい型と食い違う fail-open を避けるため、データを読む前に判定する。
 ///
-/// 依存あり: PK／UNIQUE／この表の FK（参照元）の構成列、他表の FK が参照先にする列、CHECK が
-/// 参照する列、索引宣言の構成列、ビューが参照する列、DEFAULT／補完値を持つ列。
+/// 対象列を直接参照するビュー、`SELECT *` 展開で対象列を公開するビュー、それらを連鎖経由で
+/// 読むビューが依存あり。導出不能・破損は fail-closed で `true`。ビューが存在しなければ `false`。
 /// 呼び出し元は `CATALOG_TABLE` のハンドルを保持していない状態で呼ぶこと。
-fn column_has_alter_dependents_in_txn(
+fn column_referenced_by_views_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
     schema: &TableSchema,
     column_name: &str,
 ) -> Result<bool> {
-    let Some(column) = schema.columns.iter().find(|c| c.name == column_name) else {
+    if !schema.columns.iter().any(|c| c.name == column_name) {
         return Err(CatalogError::ColumnNotFound(column_name.to_string()));
-    };
-    if column.default_expr.is_some() || column.fill_value.is_some() {
-        return Ok(true);
-    }
-    if schema
-        .primary_key
-        .as_ref()
-        .is_some_and(|pk| pk.iter().any(|c| c == column_name))
-        || schema
-            .unique_constraints
-            .iter()
-            .any(|u| u.columns().iter().any(|c| c == column_name))
-        || schema_check_references_column(schema, column_name)
-        || schema
-            .foreign_keys
-            .iter()
-            .any(|fk| fk.columns.iter().any(|c| c == column_name))
-    {
-        return Ok(true);
-    }
-    // 他表（自己参照を含む）の FK がこの表のこの列を参照先にしている。参照先列が未解決（空）の
-    // FK は主キーを指すため、保守的に依存ありとする。
-    if referencing_foreign_keys_in_txn(write_txn, table_name)?
-        .iter()
-        .any(|(_, fk)| {
-            fk.parent_columns.is_empty() || fk.parent_columns.iter().any(|c| c == column_name)
-        })
-    {
-        return Ok(true);
-    }
-    match write_txn.open_table(INDEX_CATALOG_TABLE) {
-        Ok(index_table) => {
-            for (scanned, entry) in index_table.iter()?.enumerate() {
-                if scanned >= MAX_INDEX_COUNT {
-                    return Err(CatalogError::CorruptSchema(format!(
-                        "index catalog exceeds {MAX_INDEX_COUNT} entries"
-                    )));
-                }
-                let (key, value) = entry?;
-                let def = decode_index_def(key.value(), value.value())?;
-                if def.table == table_name && def.columns.iter().any(|c| c == column_name) {
-                    return Ok(true);
-                }
-            }
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
-        Err(e) => return Err(CatalogError::from(e)),
     }
     match write_txn.open_table(VIEWS_TABLE) {
         Ok(views_table) => {
@@ -1551,12 +1503,21 @@ fn views_expose_column_in_txn(
     Ok(false)
 }
 
-/// `alter_column_type_with` の `AlterPlan::RewriteExpr` 腕の本体（TABLE-40 (1)(2)(5)・
-/// Issue #1636）。呼び出し元の write txn 内で、依存ゲート（`0A000`）→ 旧スキーマへの束縛し直し
-/// （事前判定との TOCTOU を作らない）→ 全テナント・全可視性の全行の変換と再エンコード →
-/// 変更列を含む派生索引の失効（多層防御）→ スキーマの書き戻しを行う。変換・評価エラーは
-/// 固定文言（`sql::alter_using::redact_row_conversion_error`）で返し、commit しないため副作用はゼロ。
-/// 世代の bump と commit は呼び出し元が唯一の commit 点で行う。
+/// [`Storage::alter_column_type_with`] が `AlterPlan::RewriteExpr` のとき、`CATALOG_TABLE` の
+/// ハンドルを手放した後に呼ぶ本体（TABLE-40 (1)〜(5)・Issue #1636・#1637）。同一 write txn 内で
+/// 次の順に処理し、新スキーマを返す（呼び出し元が世代 bump の前に
+/// [`revalidate_keys_after_type_change`] で PK／UNIQUE・FK を再検証する）。
+///
+/// 1. ビューのゲート（`0A000`。データを読まない）→ 旧スキーマへの束縛し直し（事前判定との
+///    TOCTOU を作らない）→ 新スキーマの組み立て
+/// 2. 静的検証（行を読まない）: 索引宣言の列型・照合、PK／UNIQUE の許可型、変更列を参照する
+///    CHECK の再束縛
+/// 3. DEFAULT・補完値の代入変換（`default_expr` の失敗は `42804`、`fill_value` の失敗は破棄）
+/// 4. 全テナント・全可視性の全行の変換と再エンコード → 派生索引（`key_index`・`user_uniq`）の
+///    失効 → 変更列を参照する CHECK の全行再検証（`23514`）→ スキーマの書き戻し
+///
+/// 変換・評価エラーは固定文言（`sql::alter_using::redact_row_conversion_error`）で返し、
+/// commit しないため副作用はゼロ。世代の bump と commit は呼び出し元が唯一の commit 点で行う。
 #[allow(clippy::too_many_arguments)]
 fn alter_column_type_rewrite_expr_in_txn(
     write_txn: &redb::WriteTransaction,
@@ -1567,12 +1528,10 @@ fn alter_column_type_rewrite_expr_in_txn(
     logical_index: usize,
     new_ty: ColumnType,
     new_collation: Option<crate::collation::Collation>,
-) -> std::result::Result<(), AlterCheckError> {
-    if column_has_alter_dependents_in_txn(write_txn, table_name, old_schema, column_name)? {
+) -> std::result::Result<TableSchema, AlterCheckError> {
+    if column_referenced_by_views_in_txn(write_txn, table_name, old_schema, column_name)? {
         return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
-            detail: "ALTER COLUMN TYPE with a value conversion is not supported yet for a column \
-                     with dependent indexes, constraints, views or defaults"
-                .to_string(),
+            detail: "cannot alter type of a column used by a view or rule".to_string(),
         }));
     }
     let conv =
@@ -1584,9 +1543,42 @@ fn alter_column_type_rewrite_expr_in_txn(
             .columns
             .get_mut(logical_index)
             .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
-        column.ty = new_ty;
+        column.ty = new_ty.clone();
         column.collation = new_collation;
     }
+    validate_dependents_statically_in_txn(write_txn, table_name, old_schema, &schema, column_name)?;
+
+    // DEFAULT・補完値。`default_expr` は INSERT で使われ続けるため変換不能なら拒否する。
+    // `fill_value` は下の全行再エンコードで各行へ実体化されるため、変換できなければ捨てる。
+    {
+        let old_column = old_schema
+            .columns
+            .get(logical_index)
+            .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+        let converted_default = old_column
+            .default_expr
+            .as_ref()
+            .map(|d| {
+                crate::sql::alter_using::convert_column_default_for_alter(old_column, d, &new_ty)
+            })
+            .transpose()
+            .map_err(AlterCheckError::Sql)?;
+        let converted_fill = if old_column.fill_value == old_column.default_expr {
+            converted_default.clone()
+        } else {
+            old_column.fill_value.as_ref().and_then(|d| {
+                crate::sql::alter_using::convert_column_default_for_alter(old_column, d, &new_ty)
+                    .ok()
+            })
+        };
+        let column = schema
+            .columns
+            .get_mut(logical_index)
+            .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+        column.default_expr = converted_default;
+        column.fill_value = converted_fill;
+    }
+
     match crate::column_rewrite::rewrite_rows_with_conversion_in_txn(
         write_txn,
         table_name,
@@ -1598,7 +1590,17 @@ fn alter_column_type_rewrite_expr_in_txn(
         crate::column_rewrite::ConversionOutcome::Done => {}
         crate::column_rewrite::ConversionOutcome::Failed(e) => return Err(AlterCheckError::Sql(e)),
     }
+    invalidate_user_uniq_if_key_column_in_txn(write_txn, table_name, &schema, column_name)?;
     crate::key_index::drop_indexes_containing_column_in_txn(write_txn, table_name, column_name)?;
+    if schema_check_references_column(old_schema, column_name) {
+        revalidate_checks_after_type_change_in_txn(
+            write_txn,
+            table_name,
+            old_schema,
+            &schema,
+            column_name,
+        )?;
+    }
     let encoded = encode_schema(&schema)?;
     let mut table = write_txn
         .open_table(CATALOG_TABLE)
@@ -1606,6 +1608,203 @@ fn alter_column_type_rewrite_expr_in_txn(
     table
         .insert(table_name, encoded.as_slice())
         .map_err(CatalogError::from)?;
+    Ok(schema)
+}
+
+/// 一般変換（`RewriteExpr`）の静的検証（行を読まない。TABLE-40 (3)・Issue #1637）。新しい型が
+/// 依存する宣言を満たすかを、全行の書き換えより前に fail-closed で判定する。
+///
+/// - 索引宣言: 変更列を含む宣言に [`validate_index_columns`] を再適用する（索引化に未対応の型は
+///   `0A000`、照合を持てない型への照合指定は `42804`。固定文言）
+/// - PK は [`ColumnType::is_primary_key_allowed`]、UNIQUE は
+///   [`ColumnType::is_unique_constraint_allowed`] を満たす型であること（`0A000`）
+/// - 変更列を参照する CHECK は新スキーマで再束縛できること（失敗はその SQLSTATE のまま返す）
+fn validate_dependents_statically_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    old_schema: &TableSchema,
+    new_schema: &TableSchema,
+    column_name: &str,
+) -> std::result::Result<(), AlterCheckError> {
+    match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(index_table) => {
+            for (scanned, entry) in index_table.iter().map_err(CatalogError::from)?.enumerate() {
+                if scanned >= MAX_INDEX_COUNT {
+                    return Err(CatalogError::CorruptSchema(format!(
+                        "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                    ))
+                    .into());
+                }
+                let (key, value) = entry.map_err(CatalogError::from)?;
+                let def = decode_index_def(key.value(), value.value())?;
+                if def.table != table_name || !def.columns.iter().any(|c| c == column_name) {
+                    continue;
+                }
+                match validate_index_columns(&def, new_schema) {
+                    Ok(()) => {}
+                    Err(CatalogError::IndexKindMismatch(_)) => {
+                        return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                            detail: "the new column type cannot be used by an existing index"
+                                .to_string(),
+                        }));
+                    }
+                    Err(CatalogError::IndexCollationNotSupported(_)) => {
+                        return Err(AlterCheckError::Sql(SqlSurfaceError::datatype_mismatch(
+                            "the new column type does not support the collation of an existing index",
+                        )));
+                    }
+                    Err(other) => return Err(other.into()),
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(CatalogError::from(e).into()),
+    }
+    let new_ty = new_schema
+        .columns
+        .iter()
+        .find(|c| c.name == column_name)
+        .map(|c| &c.ty)
+        .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+    let key_type_unsupported = |what: &str| {
+        AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+            detail: format!("the new column type cannot be used by an existing {what}"),
+        })
+    };
+    if new_schema
+        .primary_key
+        .as_ref()
+        .is_some_and(|pk| pk.iter().any(|c| c == column_name))
+        && !new_ty.is_primary_key_allowed()
+    {
+        return Err(key_type_unsupported("primary key"));
+    }
+    if new_schema
+        .unique_constraints
+        .iter()
+        .any(|u| u.columns().iter().any(|c| c == column_name))
+        && !new_ty.is_unique_constraint_allowed()
+    {
+        return Err(key_type_unsupported("unique constraint"));
+    }
+    // FK の型整合を、後段の `encode_schema`（`validate_foreign_keys` の `InvalidForeignKey` が
+    // `XX000` に化ける）より前に宣言時と同じ基準で判定し、固定文言の `42804` で返す。対象は
+    // (a) 参照元列が PK 許可型でない、(b) `REFERENCES id` の参照元列が整数型でない、
+    // (c) 自己参照 FK の参照元・参照先の型の組が不整合（参照先列だけが変更列の場合を含む）。
+    // 他表を参照する FK の型の組は参照先スキーマが要るため `revalidate_keys_after_type_change`
+    // が担う。ここは型に起因する拒否だけを写像し、他原因の `InvalidForeignKey` は変換しない。
+    let fk_mismatch = || {
+        AlterCheckError::Sql(SqlSurfaceError::datatype_mismatch(
+            "foreign key column types are incompatible after the column type change",
+        ))
+    };
+    let new_col_ty = |name: &str| {
+        new_schema
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| &c.ty)
+    };
+    for fk in &new_schema.foreign_keys {
+        let child_side = fk.columns.iter().any(|c| c == column_name);
+        let self_ref = fk.parent_table == table_name;
+        let self_parent_side = self_ref && fk.parent_columns.iter().any(|c| c == column_name);
+        if !child_side && !self_parent_side {
+            continue;
+        }
+        if child_side && !new_ty.is_primary_key_allowed() {
+            return Err(fk_mismatch());
+        }
+        if fk.references_parent_id() {
+            for name in &fk.columns {
+                if new_col_ty(name).is_none_or(|t| t.integer_rank().is_none()) {
+                    return Err(fk_mismatch());
+                }
+            }
+        } else if self_ref {
+            for (child_col, parent_col) in fk.columns.iter().zip(&fk.parent_columns) {
+                match (new_col_ty(child_col), new_col_ty(parent_col)) {
+                    (Some(c), Some(p)) if ColumnType::fk_types_compatible(c, p) => {}
+                    _ => return Err(fk_mismatch()),
+                }
+            }
+        }
+    }
+    for check in old_schema
+        .checks
+        .iter()
+        .filter(|c| check_references_column(old_schema, c, column_name))
+    {
+        crate::sql::check_constraint::recompute_referenced_columns(new_schema, check)
+            .map_err(AlterCheckError::Sql)?;
+    }
+    Ok(())
+}
+
+/// 変更列が PK／UNIQUE の構成列なら、型タグ付きの正準キーを持つ永続一意索引
+/// （`user_uniq/{table}`）を同一 txn 内で失効させる（Issue #1402・#1637）。旧型のまま残ると一意性
+/// 検査をすり抜ける fail-open になるため。次の書き込み・検査で新しい型により遅延再構築される。
+/// 行ストアのハンドルを保持していない状態で呼ぶこと。
+fn invalidate_user_uniq_if_key_column_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    column_name: &str,
+) -> Result<()> {
+    if schema
+        .primary_key
+        .as_ref()
+        .is_some_and(|pk| pk.iter().any(|c| c == column_name))
+        || schema
+            .unique_constraints
+            .iter()
+            .any(|u| u.columns().iter().any(|c| c == column_name))
+    {
+        write_txn
+            .delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))
+            .map_err(CatalogError::from)?;
+    }
+    Ok(())
+}
+
+/// 変更列を参照する CHECK を新スキーマで再コンパイルし、全テナント・全可視性の既存行を
+/// 再検証する（Issue #1427・#1637。拡大変換と一般変換が共有する）。違反は `23514`・評価エラーは
+/// 透過、他は fail-closed。`PolicyContext` で絞らない（不可視行の違反を見逃さない）。
+fn revalidate_checks_after_type_change_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    old_schema: &TableSchema,
+    new_schema: &TableSchema,
+    column_name: &str,
+) -> std::result::Result<(), AlterCheckError> {
+    let referencing: Vec<CheckConstraint> = old_schema
+        .checks
+        .iter()
+        .filter(|c| check_references_column(old_schema, c, column_name))
+        .cloned()
+        .collect();
+    let subset_schema = new_schema.clone().with_checks(referencing);
+    let compiled = crate::sql::check_constraint::CompiledChecks::compile(&subset_schema)
+        .map_err(map_tenant_write_error_to_alter_check_redacted)?
+        .ok_or_else(|| {
+            AlterCheckError::Catalog(CatalogError::CorruptSchema(
+                "CHECK constraint failed to recompile after column type change".to_string(),
+            ))
+        })?;
+    match write_txn.open_table(user_rows_table_def(&user_rows_table_name(table_name))) {
+        Ok(row_table) => {
+            crate::constraint::validate_existing_rows_for_check(
+                &row_table,
+                &subset_schema,
+                &compiled,
+            )
+            .map_err(map_tenant_write_error_to_alter_check_redacted)?;
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            // 行ストア未作成（既存行 0 件）。
+        }
+        Err(e) => return Err(AlterCheckError::Catalog(map_row_table_error(e))),
+    }
     Ok(())
 }
 
@@ -2463,8 +2662,8 @@ pub(crate) enum AlterPlan {
     Rewrite(crate::column_rewrite::WideningKind),
     /// `USING` 式または代入変換で全行を書き換える一般変換（TABLE-40・Issue #1636）。
     /// 束縛は write txn 内でやり直す（[`Storage::alter_column_type_with`] の `RewriteExpr` 腕）。
-    /// 依存する索引・制約・ビュー・DEFAULT の再構築は Issue #1637 の担当のため、それらを持つ列は
-    /// `0A000` で fail-closed する（#1637 で解除）。
+    /// 依存する索引・制約・DEFAULT は新しい型で再検証・変換する。ビューが参照する列だけは
+    /// PostgreSQL と同じ `0A000` で拒否する（TABLE-40 (3)(4)・Issue #1637）。
     RewriteExpr,
 }
 
@@ -2514,6 +2713,21 @@ fn map_tenant_write_error_to_alter_check(e: crate::tenant::TenantWriteError) -> 
         TenantWriteError::CheckEvaluationFailed(inner) => AlterCheckError::Sql(inner),
         TenantWriteError::Catalog(c) => AlterCheckError::Catalog(c),
         other => AlterCheckError::Catalog(CatalogError::CorruptSchema(other.to_string())),
+    }
+}
+
+/// ALTER TYPE の CHECK 再検証用の写像。[`map_tenant_write_error_to_alter_check`] と同じだが、
+/// 全テナント・全可視性の行を評価するため、`CheckEvaluationFailed` が運ぶ式評価エラー
+/// （`cast_value` の入力エコー等で他テナントの行の値を含みうる）を SQLSTATE を保った固定文言へ
+/// 置換する（`redact_row_conversion_error`）。呼び出し元セッションから見えない行の値を応答に出さない。
+fn map_tenant_write_error_to_alter_check_redacted(
+    e: crate::tenant::TenantWriteError,
+) -> AlterCheckError {
+    match e {
+        crate::tenant::TenantWriteError::CheckEvaluationFailed(inner) => {
+            AlterCheckError::Sql(crate::sql::alter_using::redact_row_conversion_error(inner))
+        }
+        other => map_tenant_write_error_to_alter_check(other),
     }
 }
 
@@ -6476,9 +6690,9 @@ fn resolve_foreign_key_target(
     Ok(resolved)
 }
 
-/// 文字列系の列型変換（Issue #1567）の後に、新スキーマ `new_schema`（カタログへ書き込み済み・
-/// 未 commit）で制約を再検証する。`alter_column_type_with` が `Rewrite(CharFamily)` の
-/// 場合にだけ、カタログのハンドルを手放した後・世代 bump の前に呼ぶ。
+/// 文字列系（Issue #1567）・一般変換（Issue #1637）の列型変換の後に、新スキーマ `new_schema`
+/// （カタログへ書き込み済み・未 commit）で制約を再検証する。`alter_column_type_with` が
+/// `Rewrite(CharFamily)`／`RewriteExpr` の場合にだけ、カタログのハンドルを手放した後・世代 bump の前に呼ぶ。
 ///
 /// 1. 変更列を含む PK／UNIQUE の重複を全テナントの全行で探す（テナントごとに独立。
 ///    他テナントの同値は重複としない）。重複は `23505`。
@@ -6490,7 +6704,7 @@ fn resolve_foreign_key_target(
 ///
 /// 可視性で絞らない（不可視行の違反を見逃す fail-open を避ける。`PolicyContext` は取らない）。
 /// エラーは固定文言で、値・テナント・行 id を含めない。
-fn revalidate_after_char_family_change(
+fn revalidate_keys_after_type_change(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
     new_schema: &TableSchema,
@@ -6543,7 +6757,7 @@ fn revalidate_after_char_family_change(
         // 自己参照 FK は参照先列だけが変更列の場合もここで検証する（他表の FK は下のループ）。
         let self_parent_side =
             fk.parent_table == table_name && fk.parent_columns().iter().any(|c| c == column_name);
-        if !(child_side || self_parent_side) || fk.references_parent_id() {
+        if !(child_side || self_parent_side) {
             continue;
         }
         let parent = if fk.parent_table == table_name {
@@ -6551,6 +6765,23 @@ fn revalidate_after_char_family_change(
         } else {
             require_table_schema_write(write_txn, &fk.parent_table)?
         };
+        if fk.references_parent_id() {
+            // `id` 疑似列参照は参照元列が整数型であることだけを宣言時と同じ基準で照合し
+            // （`resolve_foreign_key_target`）、USING で作られた孤児値を下の全テナント検証で
+            // `23503` として拒否する（親側に変更列は無いので `child_side` の場合だけ到達する）。
+            for child_col in fk.columns() {
+                let Some(c) = col_ty(new_schema, child_col) else {
+                    return Err(AlterCheckError::Catalog(CatalogError::CorruptSchema(
+                        "foreign key column not found after column type change".to_string(),
+                    )));
+                };
+                if c.integer_rank().is_none() {
+                    return Err(mismatch());
+                }
+            }
+            to_verify.push((new_schema.clone(), fk.clone(), parent));
+            continue;
+        }
         for (child_col, parent_col) in fk.columns().iter().zip(fk.parent_columns()) {
             let (Some(c), Some(p)) = (col_ty(new_schema, child_col), col_ty(&parent, parent_col))
             else {
@@ -11572,19 +11803,12 @@ impl Storage {
                 // 残り一意性・参照整合性検査をすり抜ける（fail-open）ため、同一 txn 内で
                 // 失効させる（Issue #1402）。次の書き込み・検査で新しい型により遅延再構築
                 // される。行ストアのハンドルは上の関数内で drop 済み。
-                if schema
-                    .primary_key
-                    .as_ref()
-                    .is_some_and(|pk| pk.iter().any(|c| c == column_name))
-                    || schema
-                        .unique_constraints
-                        .iter()
-                        .any(|u| u.columns().iter().any(|c| c == column_name))
-                {
-                    write_txn
-                        .delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))
-                        .map_err(CatalogError::from)?;
-                }
+                invalidate_user_uniq_if_key_column_in_txn(
+                    &write_txn,
+                    table_name,
+                    &schema,
+                    column_name,
+                )?;
                 crate::key_index::drop_indexes_containing_column_in_txn(
                     &write_txn,
                     table_name,
@@ -11596,38 +11820,13 @@ impl Storage {
                 // 全可視性の既存行を再検証する（多層防御。評価結果が変わらない前提を
                 // コードで担保する。違反は `23514`・評価エラーは透過、他は fail-closed）。
                 if check_dependent {
-                    let referencing: Vec<CheckConstraint> = old_schema
-                        .checks
-                        .iter()
-                        .filter(|c| check_references_column(&old_schema, c, column_name))
-                        .cloned()
-                        .collect();
-                    let subset_schema = schema.clone().with_checks(referencing);
-                    let compiled =
-                        crate::sql::check_constraint::CompiledChecks::compile(&subset_schema)
-                            .map_err(map_tenant_write_error_to_alter_check)?
-                            .ok_or_else(|| {
-                                AlterCheckError::Catalog(CatalogError::CorruptSchema(
-                                    "CHECK constraint failed to recompile after column type change"
-                                        .to_string(),
-                                ))
-                            })?;
-                    match write_txn
-                        .open_table(user_rows_table_def(&user_rows_table_name(table_name)))
-                    {
-                        Ok(row_table) => {
-                            crate::constraint::validate_existing_rows_for_check(
-                                &row_table,
-                                &subset_schema,
-                                &compiled,
-                            )
-                            .map_err(map_tenant_write_error_to_alter_check)?;
-                        }
-                        Err(redb::TableError::TableDoesNotExist(_)) => {
-                            // 行ストア未作成（既存行 0 件）。
-                        }
-                        Err(e) => return Err(AlterCheckError::Catalog(map_row_table_error(e))),
-                    }
+                    revalidate_checks_after_type_change_in_txn(
+                        &write_txn,
+                        table_name,
+                        &old_schema,
+                        &schema,
+                        column_name,
+                    )?;
                 }
             }
             let encoded = encode_schema(&schema)?;
@@ -11642,7 +11841,9 @@ impl Storage {
             }
         }
         if let Some((old_schema, logical_index, new_ty, new_collation)) = expr_rewrite {
-            alter_column_type_rewrite_expr_in_txn(
+            // 一般変換は値を変えうるため、新スキーマで PK／UNIQUE の重複・FK の型照合と
+            // 参照整合性を下で再検証する（TABLE-40 (3)(4)・Issue #1637）。
+            revalidate_schema = Some(alter_column_type_rewrite_expr_in_txn(
                 &write_txn,
                 table_name,
                 column_name,
@@ -11651,15 +11852,15 @@ impl Storage {
                 logical_index,
                 new_ty,
                 new_collation,
-            )?;
+            )?);
         }
-        // 文字列系の変換は値を変えうる（`'ab'` と `'ab '` が `CHAR(3)` で同値になる・rtrim で
+        // 文字列系・一般変換は値を変えうる（`'ab'` と `'ab '` が `CHAR(3)` で同値になる・rtrim で
         // FK の一致関係が変わる）ため、新スキーマで PK／UNIQUE の重複と FOREIGN KEY の型照合・
         // 既存行の参照整合性を再検証する（TABLE-31・Issue #1567）。カタログのハンドルを
         // 手放した後（検証が開き直すため）・世代 bump と commit の前に行う。違反は commit せず
         // txn を破棄するので表（カタログ・行・索引）は一切変わらない。
         if let Some(new_schema) = &revalidate_schema {
-            revalidate_after_char_family_change(&write_txn, table_name, new_schema, column_name)?;
+            revalidate_keys_after_type_change(&write_txn, table_name, new_schema, column_name)?;
         }
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
@@ -21216,6 +21417,24 @@ mod tests {
                 "lightweight parser must reject: {bad:?}"
             );
             assert!(decode_schema("docs", bad.as_bytes()).is_err());
+        }
+    }
+
+    /// ALTER TYPE の CHECK 再検証写像は、式評価エラーが運ぶ他テナント行の値（入力エコー）を
+    /// SQLSTATE を保ったまま固定文言へ置換する（Issue #1637 レビュー対応）。
+    #[test]
+    fn alter_type_check_eval_error_is_redacted() {
+        let e = crate::tenant::TenantWriteError::CheckEvaluationFailed(
+            SqlSurfaceError::InvalidTextRepresentation {
+                detail: "invalid input syntax for type integer: \"zzLEAKMARKERzz\"".to_string(),
+            },
+        );
+        match map_tenant_write_error_to_alter_check_redacted(e) {
+            AlterCheckError::Sql(inner) => {
+                assert_eq!(inner.wire_code(), "22P02");
+                assert!(!format!("{inner} {inner:?}").contains("zzLEAKMARKERzz"));
+            }
+            AlterCheckError::Catalog(c) => panic!("unexpected catalog error: {c:?}"),
         }
     }
 }
