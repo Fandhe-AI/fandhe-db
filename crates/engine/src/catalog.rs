@@ -9703,6 +9703,13 @@ impl Storage {
                 .delete_table(user_uniq_table_def(&user_uniq_table_name(name)))
                 .map_err(CatalogError::from)?;
             crate::key_index::drop_indexes_for_table_in_txn(&write_txn, name)?;
+            // 表名キーの operation_id 台帳・分割実行ジョブも旧名・新名とも掃除する。残すと
+            // 旧名の再作成後に同じ operation_id が旧記録に当たり、書き込みが重複扱いで
+            // 無音に落ちる（`drop_table` の旧台帳引き継ぎ防止と同種）。安全側に消す。
+            crate::recovery::ledger::delete_table_in_txn(&write_txn, name)
+                .map_err(convert_storage_error)?;
+            crate::recovery::partitioned_job::delete_table_in_txn(&write_txn, name)
+                .map_err(convert_storage_error)?;
             bump_table_generation_in_txn(&write_txn, name)?;
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
