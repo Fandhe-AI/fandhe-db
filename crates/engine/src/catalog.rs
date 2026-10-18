@@ -1090,31 +1090,80 @@ fn retain_index_defs_in_txn(
     Ok(())
 }
 
-/// 表の改名（[`Storage::alter_table_rename`]、Issue #1623）が、ビューから参照される表を
-/// 追随できないうちは受理しないための暫定ゲート（fail-closed。`0A000`）。カタログ情報だけで
-/// 判定し、テナントの行・台帳の有無で成否を変えない（存在オラクルにしない）。
+/// 表の改名（[`Storage::alter_table_rename`]、TABLE-38 のポインタ、Issue #1625）に伴う
+/// ビュー定義の追随。表 `old` を直接読む単純形ビューの `base_relation` と保存本文の `FROM`
+/// を `new` へ付け替える。本文は AST（`parse_view_body`）で書き換えて既存レンダラーで
+/// 再描画する（文字列置換はしない）。ビュー名（キー）は変えず、ビューを読むビューは親ビューの
+/// 名前を参照するため触れない。
 ///
-/// 拒否対象と解除の担当: ビューからの参照（Issue #1625）のみ。PK・UNIQUE・CHECK・FK（参照元・
-/// 参照先）・索引宣言は Issue #1624 で追随するようになり、本関数では見ない
-/// （[`TableSchema::rename_table_references`]・[`rename_index_def_table_in_txn`]）。
+/// 評価後射影形（集計・JOIN・CTE・`ORDER BY`・`LIMIT`・集合演算・式）の本文は、別名・修飾子を
+/// トークン単位で安全に区別できないため、`old` を読むなら `FeatureNotSupported`（`0A000`）で
+/// 拒否する（fail-closed。列改名〔[`rewrite_views_for_renamed_column_in_txn`]〕と同じ線）。
+/// 再検証できない本文・再描画後の往復検証の失敗も `0A000`。追随後の本文が
+/// [`MAX_VIEW_BODY_BYTES`] を超えれば `54000`。計画をすべて確定してから書き込むため、拒否時に
+/// ビュー定義は変更されない。判定はカタログ情報だけで行い、行・台帳の有無で成否を変えない。
 /// 呼び出し元は `CATALOG_TABLE` のハンドルを保持していない状態で呼ぶこと。
-fn refuse_rename_table_with_dependents_in_txn(
+fn rewrite_views_for_renamed_table_in_txn(
     write_txn: &redb::WriteTransaction,
-    schema: &TableSchema,
+    old: &str,
+    new: &str,
 ) -> std::result::Result<(), AlterCheckError> {
-    let refused = |what: &str| {
+    let refused = || {
         AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
-            detail: format!("renaming a table that has {what} is not supported"),
+            detail: "renaming a table referenced by a view with an aggregate, join, or other \
+                     complex body is not supported"
+                .to_string(),
         })
     };
-    match write_txn.open_table(VIEWS_TABLE) {
-        Ok(views_table) => {
-            if !views_depending_on_in_txn(&views_table, &schema.name)?.is_empty() {
-                return Err(refused("dependent views"));
-            }
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
+    let mut views_table = match write_txn.open_table(VIEWS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
         Err(e) => return Err(CatalogError::from(e).into()),
+    };
+    let mut planned: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut scanned = 0usize;
+    for entry in views_table.iter().map_err(CatalogError::from)? {
+        let (key, value) = entry.map_err(CatalogError::from)?;
+        if scanned >= MAX_VIEWS {
+            return Err(CatalogError::ViewLimitExceeded("too many views".to_string()).into());
+        }
+        scanned = scanned.saturating_add(1);
+        let def = decode_view_def(value.value())?;
+        match view_def_dependence_on(&def, old) {
+            ViewDependence::No => continue,
+            ViewDependence::Unverifiable => return Err(refused()),
+            ViewDependence::Direct => {}
+        }
+        match view_body_shape(&def.body_sql) {
+            Ok(shape) if !shape.buffered && def.base_relation == old => {}
+            _ => return Err(refused()),
+        }
+        let tokens =
+            crate::sql::lexer::tokenize_stored_view_body(&def.body_sql).map_err(|_| refused())?;
+        let mut parsed = parse_view_body(&tokens).map_err(|_| refused())?;
+        if parsed.table_name != old {
+            return Err(refused());
+        }
+        parsed.table_name = new.to_string();
+        let body_sql = crate::sql::allowlist::render_stored_simple_view_body(&parsed)
+            .map_err(AlterCheckError::Sql)?;
+        if body_sql.len() > MAX_VIEW_BODY_BYTES {
+            return Err(AlterCheckError::Sql(SqlSurfaceError::payload_too_large(
+                "view body exceeds the allowed size after table rename",
+            )));
+        }
+        // 多層防御: 再描画した本文が再パースでき、新しい親の名前と一致することを確かめる。
+        validate_view_body_matches_base_relation(&body_sql, new).map_err(|_| refused())?;
+        let mut updated = def.clone();
+        updated.base_relation = new.to_string();
+        updated.body_sql = body_sql;
+        planned.push((key.value().to_string(), encode_view_def(&updated)?));
+    }
+    // 計画が確定した後にだけ書き込む。
+    for (name, encoded) in &planned {
+        views_table
+            .insert(name.as_str(), encoded.as_slice())
+            .map_err(CatalogError::from)?;
     }
     Ok(())
 }
@@ -9808,8 +9857,9 @@ impl Storage {
     /// 破棄され、クラッシュ後に見えるのは旧名か新名のどちらか一方だけになる。
     ///
     /// 判定順序（決定的）: 識別子検証 → 表の存在（`TableNotFound`）→ 改名先の衝突（表・ビュー・
-    /// 索引と同じ名前空間。同名への改名を含む。`TableAlreadyExists`）→ ビュー依存の暫定
-    /// 拒否（[`refuse_rename_table_with_dependents_in_txn`]。`0A000`）→ 付け替え。
+    /// 索引と同じ名前空間。同名への改名を含む。`TableAlreadyExists`）→ ビュー定義の追随
+    /// （[`rewrite_views_for_renamed_table_in_txn`]。単純形は付け替え、評価後射影形は `0A000`、
+    /// 本文超過は `54000`）→ 付け替え。
     /// 付け替えは自表の制約（制約名は不変。[`TableSchema::rename_table_references`]）・他表から
     /// 参照される FK（子の世代も bump）・索引宣言の所有テーブル名
     /// （[`rename_index_def_table_in_txn`]。索引カタログ世代も bump）を同一 txn で追随させる
@@ -9819,9 +9869,10 @@ impl Storage {
     /// 旧名・新名の両方を進める（旧名のキャッシュ失効と、新名で過去にキャッシュされた
     /// エントリとの衝突回避）。
     ///
-    /// 既知の制約（Issue #1625 で追随）: `operation_id` 台帳（`last_op` を含む）・分割実行
-    /// ジョブは表名をキーに持つため、旧名・新名の両方について同一 txn で削除する。改名後は
-    /// 直前の操作情報（`last_op`）も失われ、改名前の `operation_id` の再送も判定されない。
+    /// `operation_id` 台帳・`last_op`・分割実行ジョブは表名をキーに持つため、旧名から新名へ
+    /// 同一 txn で移す（Issue #1625。[`crate::recovery::ledger::rename_table_in_txn`]）。
+    /// 改名前の `operation_id` を新名で再送すると改名前の記録で判定される（表名を内容ハッシュに
+    /// 含む操作は fail-closed で `22023`）。新名側に残っていた孤児の記録は移送前に掃除する。
     pub(crate) fn alter_table_rename(
         &self,
         table_name: &str,
@@ -9873,7 +9924,7 @@ impl Storage {
         if index_name_exists_in_txn(&write_txn, new_table_name)? {
             return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
         }
-        refuse_rename_table_with_dependents_in_txn(&write_txn, &schema)?;
+        rewrite_views_for_renamed_table_in_txn(&write_txn, table_name, new_table_name)?;
 
         // 他表から参照される FK の付け替え（Issue #1624）。自表のカタログを書き換える前に、
         // `CATALOG_TABLE` のハンドルを解放した状態で列挙する（`referencing_foreign_keys_in_txn`
@@ -9954,20 +10005,27 @@ impl Storage {
         }
         // 派生データ（永続一意索引・キー索引）は旧名・新名とも掃除する。遅延再構築されるため
         // 消して安全で、残留が同名の再作成後に「構築済み」と誤認される fail-open を防ぐ。
+        // 表名キーの台帳・分割実行ジョブは、新名側の孤児だけを掃除してから旧名の記録を移す
+        // （移送で旧名のキーは消える。削除すると改名後の再送が未記録と誤判定される）。
         for name in [table_name, new_table_name] {
             write_txn
                 .delete_table(user_uniq_table_def(&user_uniq_table_name(name)))
                 .map_err(CatalogError::from)?;
             crate::key_index::drop_indexes_for_table_in_txn(&write_txn, name)?;
-            // 表名キーの operation_id 台帳・分割実行ジョブも旧名・新名とも掃除する。残すと
-            // 旧名の再作成後に同じ operation_id が旧記録に当たり、書き込みが重複扱いで
-            // 無音に落ちる（`drop_table` の旧台帳引き継ぎ防止と同種）。安全側に消す。
-            crate::recovery::ledger::delete_table_in_txn(&write_txn, name)
-                .map_err(convert_storage_error)?;
-            crate::recovery::partitioned_job::delete_table_in_txn(&write_txn, name)
-                .map_err(convert_storage_error)?;
             bump_table_generation_in_txn(&write_txn, name)?;
         }
+        crate::recovery::ledger::delete_table_in_txn(&write_txn, new_table_name)
+            .map_err(convert_storage_error)?;
+        crate::recovery::partitioned_job::delete_table_in_txn(&write_txn, new_table_name)
+            .map_err(convert_storage_error)?;
+        crate::recovery::ledger::rename_table_in_txn(&write_txn, table_name, new_table_name)
+            .map_err(convert_storage_error)?;
+        crate::recovery::partitioned_job::rename_table_in_txn(
+            &write_txn,
+            table_name,
+            new_table_name,
+        )
+        .map_err(convert_storage_error)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(())
     }
@@ -17831,6 +17889,125 @@ mod tests {
         );
         let schema = storage.get_table_schema("docs").expect("schema");
         assert!(schema.columns.iter().any(|c| c.name == "k"));
+    }
+
+    /// 表の改名でビュー本文が上限を超えるなら `54000` で拒否し、何も変えない
+    /// （台帳の移送を含む同一 txn を commit しない）。
+    #[test]
+    fn alter_table_rename_view_body_overflow_is_54000() {
+        let path = unique_db_path("rename-table-view-overflow");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("k", ColumnType::Text, true),
+                ],
+            ))
+            .expect("docs");
+        // 本文長が上限の直下になるよう最後の述語の値を伸ばす（述語値の長さ上限に収まる範囲）。
+        let build = |pad: usize| {
+            let mut preds = vec![format!("k = '{}'", "x".repeat(230)); 255];
+            preds.push(format!("k = '{}'", "x".repeat(pad)));
+            format!("SELECT k FROM docs WHERE {}", preds.join(" AND "))
+        };
+        let pad = 230 + (MAX_VIEW_BODY_BYTES - 30).saturating_sub(build(230).len());
+        let body = build(pad);
+        let mut created = false;
+        let mut stored_len = 0usize;
+        if body.len() <= MAX_VIEW_BODY_BYTES {
+            storage
+                .create_view("v_big", "docs", &body)
+                .expect("big view");
+            created = true;
+            stored_len = storage
+                .view_definition("v_big")
+                .expect("get")
+                .expect("some")
+                .body_sql
+                .len();
+        }
+        assert!(created, "failed to build a near-limit view body");
+        assert!(stored_len <= MAX_VIEW_BODY_BYTES);
+        let before = storage
+            .view_definition("v_big")
+            .expect("get")
+            .expect("some");
+        let long_name = "n".repeat(60);
+        let err = storage
+            .alter_table_rename("docs", &long_name)
+            .expect_err("rewritten body exceeds the limit");
+        match err {
+            AlterCheckError::Sql(e) => assert_eq!(e.wire_code(), "54000"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            storage
+                .view_definition("v_big")
+                .expect("get")
+                .expect("some"),
+            before
+        );
+        assert!(storage.get_table_schema("docs").is_ok());
+    }
+
+    /// 表の改名で単純形ビューの `base_relation` と本文が新名へ付け替わり、再オープン後も残る。
+    /// 評価後射影形ビューが表を読むときは `0A000` で拒否し、何も変えない。
+    #[test]
+    fn alter_table_rename_rewrites_simple_views_and_refuses_buffered() {
+        let path = unique_db_path("rename-table-views");
+        let _guard = CleanupGuard(path.clone());
+        {
+            let storage = Storage::open(&path).expect("open storage");
+            storage
+                .create_table(&TableSchema::new(
+                    "docs",
+                    vec![
+                        ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                        ColumnDef::new("k", ColumnType::Text, true),
+                    ],
+                ))
+                .expect("docs");
+            storage
+                .create_view("v_star", "docs", "SELECT * FROM docs")
+                .expect("v_star");
+            storage
+                .create_view("v_pred", "docs", "SELECT k FROM docs WHERE k = 'a'")
+                .expect("v_pred");
+            storage
+                .create_view("v_chain", "v_star", "SELECT k FROM v_star")
+                .expect("v_chain");
+            storage.alter_table_rename("docs", "docs2").expect("rename");
+        }
+        let storage = Storage::open(&path).expect("reopen");
+        for name in ["v_star", "v_pred"] {
+            let def = storage.view_definition(name).expect("get").expect("some");
+            assert_eq!(def.base_relation, "docs2", "{name}");
+            assert!(def.body_sql.contains("docs2"), "{name}: {}", def.body_sql);
+        }
+        let chain = storage
+            .view_definition("v_chain")
+            .expect("get")
+            .expect("some");
+        assert_eq!(chain.base_relation, "v_star");
+        storage
+            .create_view("v_buf", "docs2", "SELECT k FROM docs2 ORDER BY k LIMIT 5")
+            .expect("v_buf");
+        let err = storage
+            .alter_table_rename("docs2", "docs3")
+            .expect_err("buffered view blocks rename");
+        match err {
+            AlterCheckError::Sql(e) => assert_eq!(e.wire_code(), "0A000"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(storage.get_table_schema("docs2").is_ok());
+        let def = storage
+            .view_definition("v_pred")
+            .expect("get")
+            .expect("some");
+        assert_eq!(def.base_relation, "docs2");
     }
 
     /// 予約列・不存在列・衝突・依存ありは拒否し、カタログを変更しない。
