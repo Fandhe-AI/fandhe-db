@@ -1066,6 +1066,63 @@ fn retain_index_defs_in_txn(
     Ok(())
 }
 
+/// 表の改名（[`Storage::alter_table_rename`]、Issue #1623）が、依存オブジェクトを持つ表を
+/// 追随できないうちは受理しないための暫定ゲート（fail-closed。`0A000`）。カタログ情報だけで
+/// 判定し、テナントの行・台帳の有無で成否を変えない（存在オラクルにしない）。
+///
+/// 拒否対象と解除の担当: PK・UNIQUE・CHECK・FK（参照元・参照先）・索引宣言（Issue #1624）、
+/// ビューからの参照（Issue #1625）。解除は項目ごとに本関数から外していく。
+/// 呼び出し元は `CATALOG_TABLE` のハンドルを保持していない状態で呼ぶこと。
+fn refuse_rename_table_with_dependents_in_txn(
+    write_txn: &redb::WriteTransaction,
+    schema: &TableSchema,
+) -> std::result::Result<(), AlterCheckError> {
+    let refused = |what: &str| {
+        AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+            detail: format!("renaming a table that has {what} is not supported"),
+        })
+    };
+    if schema.primary_key.is_some()
+        || !schema.unique_constraints.is_empty()
+        || !schema.checks.is_empty()
+        || !schema.foreign_keys.is_empty()
+    {
+        return Err(refused("constraints"));
+    }
+    if !referencing_foreign_keys_in_txn(write_txn, &schema.name)?.is_empty() {
+        return Err(refused("foreign keys referencing it"));
+    }
+    match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(index_table) => {
+            for (scanned, entry) in index_table.iter().map_err(CatalogError::from)?.enumerate() {
+                if scanned >= MAX_INDEX_COUNT {
+                    return Err(CatalogError::CorruptSchema(format!(
+                        "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                    ))
+                    .into());
+                }
+                let (key, value) = entry.map_err(CatalogError::from)?;
+                let def = decode_index_def(key.value(), value.value())?;
+                if def.table == schema.name {
+                    return Err(refused("indexes"));
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(CatalogError::from(e).into()),
+    }
+    match write_txn.open_table(VIEWS_TABLE) {
+        Ok(views_table) => {
+            if !views_depending_on_in_txn(&views_table, &schema.name)?.is_empty() {
+                return Err(refused("dependent views"));
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(CatalogError::from(e).into()),
+    }
+    Ok(())
+}
+
 /// 列改名（[`Storage::alter_table_rename_column`]）に伴うビュー定義の追随（TABLE-38 の
 /// ポインタ、Issue #1621）。`table` の列 `old` を、直接または単純形ビューの連鎖経由で
 /// 公開しているビューについて、保存本文の列参照（投影・`WHERE` 述語）を `new` へ付け替える。
@@ -9650,6 +9707,151 @@ impl Storage {
         Ok(())
     }
 
+    /// 表を改名する（`ALTER TABLE <old> RENAME TO <new>`。TABLE-38 のポインタ、Issue #1623）。
+    /// `sql::ddl::execute_alter_table_rename_table` が唯一の呼び出し元。
+    ///
+    /// カタログのエントリ・行ストア（`user_rows/{table}`）・テーブル世代を**単一の write txn**
+    /// で付け替える。行ストアは redb の `rename_table`（マスターツリーのエントリ付け替えのみ。
+    /// 行のコピーなし）で改名するため、物理キー `(tenant_id, id)` がバイト単位で保たれ、
+    /// テナント境界（RLS 相当）はそのまま新しい名前へ移る。commit までに失敗すれば txn ごと
+    /// 破棄され、クラッシュ後に見えるのは旧名か新名のどちらか一方だけになる。
+    ///
+    /// 判定順序（決定的）: 識別子検証 → 表の存在（`TableNotFound`）→ 改名先の衝突（表・ビュー・
+    /// 索引と同じ名前空間。同名への改名を含む。`TableAlreadyExists`）→ 依存オブジェクトの暫定
+    /// 拒否（[`refuse_rename_table_with_dependents_in_txn`]。`0A000`）→ 付け替え。
+    /// 改名先に孤児の行テーブルが残っていた場合は統合も削除もせず fail-closed で拒否する。
+    /// 遅延再構築される派生索引（`user_uniq`・`key_index`）は旧名・新名とも掃除し、世代は
+    /// 旧名・新名の両方を進める（旧名のキャッシュ失効と、新名で過去にキャッシュされた
+    /// エントリとの衝突回避）。
+    ///
+    /// 既知の制約（Issue #1625 で追随）: `operation_id` 台帳（`last_op` を含む）・分割実行
+    /// ジョブは表名をキーに持つため、旧名・新名の両方について同一 txn で削除する。改名後は
+    /// 直前の操作情報（`last_op`）も失われ、改名前の `operation_id` の再送も判定されない。
+    pub(crate) fn alter_table_rename(
+        &self,
+        table_name: &str,
+        new_table_name: &str,
+    ) -> std::result::Result<(), AlterCheckError> {
+        validate_identifier(table_name)?;
+        validate_identifier(new_table_name)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let mut schema = {
+            let table = write_txn
+                .open_table(CATALOG_TABLE)
+                .map_err(CatalogError::from)?;
+            let existing: Vec<u8> = {
+                let guard = table
+                    .get(table_name)
+                    .map_err(CatalogError::from)?
+                    .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
+                guard.value().to_vec()
+            };
+            let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
+            decode_schema_with_resolver(table_name, &existing, &mut resolve)?
+        };
+        // 改名先の衝突判定（`create_table` と同じ名前空間: 表・ビュー・索引）。
+        {
+            let table = write_txn
+                .open_table(CATALOG_TABLE)
+                .map_err(CatalogError::from)?;
+            if table
+                .get(new_table_name)
+                .map_err(CatalogError::from)?
+                .is_some()
+            {
+                return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
+            }
+        }
+        match write_txn.open_table(VIEWS_TABLE) {
+            Ok(views_table) => {
+                if views_table
+                    .get(new_table_name)
+                    .map_err(CatalogError::from)?
+                    .is_some()
+                {
+                    return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(CatalogError::from(e).into()),
+        }
+        if index_name_exists_in_txn(&write_txn, new_table_name)? {
+            return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
+        }
+        refuse_rename_table_with_dependents_in_txn(&write_txn, &schema)?;
+
+        // カタログの付け替え（`encode_schema` が不変条件を再検証する）。
+        schema.name = new_table_name.to_string();
+        let encoded = encode_schema(&schema)?;
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .map_err(CatalogError::from)?;
+            table
+                .insert(new_table_name, encoded.as_slice())
+                .map_err(CatalogError::from)?;
+            let removed = table.remove(table_name).map_err(CatalogError::from)?;
+            if removed.is_none() {
+                return Err(CatalogError::CorruptSchema(
+                    "table disappeared during rename".to_string(),
+                )
+                .into());
+            }
+        }
+        // 行ストアの付け替え。行テーブルは遅延作成のため未作成（`TableDoesNotExist`）は成功扱い。
+        // 改名先に行テーブルが既に在る（`TableExists`）のは孤児であり、統合も削除もしない。
+        let old_rows = user_rows_table_name(table_name);
+        let new_rows = user_rows_table_name(new_table_name);
+        match write_txn.rename_table(
+            user_rows_table_def(&old_rows),
+            user_rows_table_def(&new_rows),
+        ) {
+            Ok(()) => {}
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                // 改名元が未作成でも、改名先の孤児行テーブルは露出させない。
+                // `open_table` は未存在を作成してしまうため `list_tables` で存在確認する。
+                let target_exists = {
+                    use redb::TableHandle;
+                    write_txn
+                        .list_tables()
+                        .map_err(CatalogError::from)?
+                        .any(|handle| handle.name() == new_rows)
+                };
+                if target_exists {
+                    return Err(CatalogError::CorruptSchema(
+                        "row store already exists for rename target".to_string(),
+                    )
+                    .into());
+                }
+            }
+            Err(redb::TableError::TableExists(_)) => {
+                return Err(CatalogError::CorruptSchema(
+                    "row store already exists for rename target".to_string(),
+                )
+                .into());
+            }
+            Err(e) => return Err(map_row_table_error(e).into()),
+        }
+        // 派生データ（永続一意索引・キー索引）は旧名・新名とも掃除する。遅延再構築されるため
+        // 消して安全で、残留が同名の再作成後に「構築済み」と誤認される fail-open を防ぐ。
+        for name in [table_name, new_table_name] {
+            write_txn
+                .delete_table(user_uniq_table_def(&user_uniq_table_name(name)))
+                .map_err(CatalogError::from)?;
+            crate::key_index::drop_indexes_for_table_in_txn(&write_txn, name)?;
+            // 表名キーの operation_id 台帳・分割実行ジョブも旧名・新名とも掃除する。残すと
+            // 旧名の再作成後に同じ operation_id が旧記録に当たり、書き込みが重複扱いで
+            // 無音に落ちる（`drop_table` の旧台帳引き継ぎ防止と同種）。安全側に消す。
+            crate::recovery::ledger::delete_table_in_txn(&write_txn, name)
+                .map_err(convert_storage_error)?;
+            crate::recovery::partitioned_job::delete_table_in_txn(&write_txn, name)
+                .map_err(convert_storage_error)?;
+            bump_table_generation_in_txn(&write_txn, name)?;
+        }
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(())
+    }
+
     /// 既存テーブルへ UNIQUE 制約を追加する（Rust API 専用。TABLE-16・TASK-204、
     /// Issue #905）。名前は常に既定名で確定する薄いラッパーで、実体は
     /// [`Self::alter_table_add_named_unique_constraint`]（Issue #1067。SQL 表層
@@ -17139,6 +17341,161 @@ mod tests {
         let reopened = Storage::open(&path).expect("reopen");
         let schema = reopened.get_table_schema("docs").expect("schema");
         assert!(schema.columns.iter().any(|c| c.name == "lang"));
+    }
+
+    /// 表の改名（TABLE-38 のポインタ、Issue #1623）は行バイトを変えずに行ストアを付け替え、
+    /// 旧名・新名の世代を両方進める。拒否（依存あり・衝突）では世代もカタログも変えない。
+    #[test]
+    fn alter_table_rename_moves_rows_and_bumps_both_generations() {
+        let path = unique_db_path("rename-table-moves-rows");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = |name: &str| {
+            TableSchema::new(
+                name,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            )
+        };
+        storage.create_table(&schema("docs")).expect("create docs");
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![1.0, 2.0]),
+                    RowCodecValue::Text("hello".to_string()),
+                ],
+            )
+            .expect("insert");
+        let before = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("row before");
+        let old_gen = storage.table_generation("docs").expect("gen");
+        let new_gen = storage.table_generation("papers").expect("gen");
+
+        // 衝突は何も変えない。
+        storage.create_table(&schema("other")).expect("other");
+        let gen_other = storage.table_generation("docs").expect("gen");
+        assert!(matches!(
+            storage.alter_table_rename("docs", "other"),
+            Err(AlterCheckError::Catalog(CatalogError::TableAlreadyExists(
+                _
+            )))
+        ));
+        assert_eq!(gen_other, storage.table_generation("docs").expect("gen"));
+
+        storage
+            .alter_table_rename("docs", "papers")
+            .expect("rename");
+        let after = storage
+            .get_row_from_table("papers", "tenant-a", 1)
+            .expect("row after");
+        assert_eq!(before.metadata, after.metadata);
+        assert!(storage.get_table_schema("docs").is_err());
+        assert_eq!(
+            storage.get_table_schema("papers").expect("schema").name,
+            "papers"
+        );
+        assert_ne!(old_gen, storage.table_generation("docs").expect("gen"));
+        assert_ne!(new_gen, storage.table_generation("papers").expect("gen"));
+        drop(storage);
+        let reopened = Storage::open(&path).expect("reopen");
+        reopened
+            .get_row_from_table("papers", "tenant-a", 1)
+            .expect("row after reopen");
+    }
+
+    /// 改名先に孤児の行テーブルが残っている場合は統合も削除もせず fail-closed で拒否し、
+    /// カタログ・世代は変わらない（TABLE-38 のポインタ、Issue #1623）。
+    #[test]
+    fn alter_table_rename_refuses_orphan_row_store_at_target() {
+        let path = unique_db_path("rename-table-orphan");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = |name: &str| {
+            TableSchema::new(
+                name,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            )
+        };
+        storage.create_table(&schema("docs")).expect("create");
+        let row = [
+            RowCodecValue::Vector(vec![1.0, 2.0]),
+            RowCodecValue::Text("x".to_string()),
+        ];
+        storage
+            .insert_typed_row("docs", 1, "t", Visibility::Public, &row)
+            .expect("insert");
+        // `orphan` を作って行を入れ、カタログだけ消して行テーブルを孤児にする。
+        storage.create_table(&schema("orphan")).expect("orphan");
+        storage
+            .insert_typed_row("orphan", 7, "t", Visibility::Public, &row)
+            .expect("insert orphan");
+        {
+            let w = storage.begin_write_txn().expect("txn");
+            {
+                let mut t = w.open_table(CATALOG_TABLE).expect("catalog");
+                t.remove("orphan").expect("remove");
+            }
+            bump_table_generation_in_txn(&w, "orphan").expect("bump");
+            crate::recovery::commit_boundary::commit(w).expect("commit");
+        }
+        let gen_before = storage.table_generation("docs").expect("gen");
+        assert!(storage.alter_table_rename("docs", "orphan").is_err());
+        assert_eq!(gen_before, storage.table_generation("docs").expect("gen"));
+        storage
+            .get_row_from_table("docs", "t", 1)
+            .expect("docs rows untouched");
+        assert!(storage.get_table_schema("orphan").is_err());
+    }
+
+    /// 改名元の行テーブルが未作成（一度も書かれていない）でも、改名先の孤児行テーブルは
+    /// fail-closed で拒否する（TABLE-38 のポインタ、Issue #1623）。
+    #[test]
+    fn alter_table_rename_refuses_orphan_row_store_when_source_has_no_rows() {
+        let path = unique_db_path("rename-table-orphan-empty-src");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = |name: &str| {
+            TableSchema::new(
+                name,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            )
+        };
+        storage.create_table(&schema("docs")).expect("create");
+        let row = [
+            RowCodecValue::Vector(vec![1.0, 2.0]),
+            RowCodecValue::Text("x".to_string()),
+        ];
+        storage.create_table(&schema("orphan")).expect("orphan");
+        storage
+            .insert_typed_row("orphan", 7, "t", Visibility::Public, &row)
+            .expect("insert orphan");
+        {
+            let w = storage.begin_write_txn().expect("txn");
+            {
+                let mut t = w.open_table(CATALOG_TABLE).expect("catalog");
+                t.remove("orphan").expect("remove");
+            }
+            bump_table_generation_in_txn(&w, "orphan").expect("bump");
+            crate::recovery::commit_boundary::commit(w).expect("commit");
+        }
+        let gen_before = storage.table_generation("docs").expect("gen");
+        assert!(storage.alter_table_rename("docs", "orphan").is_err());
+        assert_eq!(gen_before, storage.table_generation("docs").expect("gen"));
+        assert!(storage.get_table_schema("docs").is_ok());
+        assert!(storage.get_table_schema("orphan").is_err());
     }
 
     /// 単純形ビューの保存本文が AST 経由で書き換わり、reopen 後も保持される。改名元を
