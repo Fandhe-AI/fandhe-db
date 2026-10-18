@@ -13101,14 +13101,7 @@ impl TableLookup for Storage {
         name: &str,
     ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
         match self.get_table_schema(name) {
-            Ok(schema) => {
-                let mut columns: Vec<String> =
-                    schema.columns.iter().map(|c| c.name.clone()).collect();
-                if !columns.iter().any(|c| c == "id") {
-                    columns.push("id".to_string());
-                }
-                Ok(Some(columns))
-            }
+            Ok(schema) => Ok(Some(lookup_columns_of(&schema))),
             Err(CatalogError::TableNotFound(_)) => Ok(None),
             Err(other) => Err(table_lookup_error(other)),
         }
@@ -13121,15 +13114,31 @@ impl TableLookup for Storage {
         name: &str,
     ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
         match self.get_table_schema(name) {
-            Ok(schema) => {
-                let mut columns = vec!["id".to_string()];
-                columns.extend(schema.columns.iter().map(|c| c.name.clone()));
-                Ok(Some(columns))
-            }
+            Ok(schema) => Ok(Some(lookup_star_columns_of(&schema))),
             Err(CatalogError::TableNotFound(_)) => Ok(None),
             Err(other) => Err(table_lookup_error(other)),
         }
     }
+}
+
+/// [`TableLookup::table_columns`] の列名組み立て（実カラム名 ＋ 実カラム `id` が
+/// 無ければ疑似列 `id`）。`impl TableLookup for Storage` と、セッション一時カタログの
+/// `sql::temp_catalog::SessionRelationLookup`（Issue #1681・TABLE-44）が共有し、
+/// `sql::parser::bind_projection` との整合を 1 か所で保つ。
+pub(crate) fn lookup_columns_of(schema: &TableSchema) -> Vec<String> {
+    let mut columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    if !columns.iter().any(|c| c == "id") {
+        columns.push("id".to_string());
+    }
+    columns
+}
+
+/// [`TableLookup::table_star_columns`] の列名組み立て（疑似列 `id` が先頭、続けて
+/// 宣言済みの実カラム）。[`lookup_columns_of`] と同じ理由で共有する。
+pub(crate) fn lookup_star_columns_of(schema: &TableSchema) -> Vec<String> {
+    let mut columns = vec!["id".to_string()];
+    columns.extend(schema.columns.iter().map(|c| c.name.clone()));
+    columns
 }
 
 /// [`TableLookup::table_exists`]（`impl TableLookup for Storage`）と

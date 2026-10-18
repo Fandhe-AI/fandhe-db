@@ -216,6 +216,11 @@ pub struct SessionState {
     /// `SET TIME ZONE DEFAULT|LOCAL` の戻り先（reset 値）。StartupMessage の `TimeZone` が
     /// あればその値、無ければサーバー既定の UTC。
     time_zone_reset: crate::datetime::SessionTimeZone,
+    /// セッション単位の一時カタログ（TABLE-44・Issue #1681）。接続単位の値型である
+    /// ため他接続・他テナントへ漏れる経路は構造上存在せず、永続化もしない。ROLLBACK／abort
+    /// の `SessionState` 巻き戻しに乗って取り消される。スキーマは `Arc` 共有のため
+    /// BEGIN／メッセージ単位の `clone` は安い。行データは持たない（行ストアは #1682）。
+    temp_tables: crate::sql::temp_catalog::SessionTempCatalog,
 }
 
 impl SessionState {
@@ -244,6 +249,18 @@ impl SessionState {
 
     pub fn search_mode(&self) -> Option<SearchMode> {
         self.search_mode
+    }
+
+    /// このセッションの一時カタログ（読み取り専用。TABLE-44・Issue #1681）。
+    pub(crate) fn temp_tables(&self) -> &crate::sql::temp_catalog::SessionTempCatalog {
+        &self.temp_tables
+    }
+
+    /// このセッションの一時カタログ（更新用。#1683 の `CREATE TEMP TABLE` 実行腕が使う。
+    /// 本 Issue の時点では SQL から到達できない）。
+    #[allow(dead_code)] // #1683 の CREATE TEMP TABLE 実行腕が使うまで、テストからのみ到達する
+    pub(crate) fn temp_tables_mut(&mut self) -> &mut crate::sql::temp_catalog::SessionTempCatalog {
+        &mut self.temp_tables
     }
 
     /// このセッションに登録済みの UDF レジストリ（読み取り専用）。
