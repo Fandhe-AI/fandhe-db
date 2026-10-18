@@ -380,25 +380,163 @@ fn explain_truncate_is_rejected_as_unsupported_syntax() {
     assert_eq!(err.wire_code(), "42601");
 }
 
-/// `TRUNCATE TABLE` 複数指定（PostgreSQL 拡張句）は許可リスト外として `42601`
-/// で拒否される。
+/// SQL-48 (1)(4)（Issue #1643）: `TABLE` 省略・複数テーブル・`ONLY`／`*` を受理し、
+/// 全表の自テナント行だけを消す。他テナントの行は全表で残る（Private のみで組み、
+/// Public のグローバル可視に依存しないオラクルにする）。
 #[test]
-fn truncate_with_multiple_tables_is_rejected_as_unsupported_syntax() {
+fn truncate_multiple_tables_removes_own_rows_in_all_tables_only() {
     let (core, path) = new_core_with_tables();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
+    for (i, t) in [TABLE, OTHER_TABLE].into_iter().enumerate() {
+        insert_row(&core, &alice, t, 1, Visibility::Private, i as u64);
+        insert_row(&core, &bob, t, 1, Visibility::Private, i as u64);
+    }
+
+    let mut session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            &format!("TRUNCATE ONLY {TABLE} *, {OTHER_TABLE} USING OPERATION_ID 'op-multi'"),
+        )
+        .expect("TABLE-less multi-table TRUNCATE must be accepted");
+    assert!(matches!(outcome, SqlOutcome::Truncate(_)));
+    for t in [TABLE, OTHER_TABLE] {
+        assert_eq!(count_star(&core, &alice, t), 0, "alice rows in {t}");
+        assert_eq!(count_star(&core, &bob, t), 1, "bob rows in {t}");
+    }
+}
+
+/// 同じ表を重複指定しても 1 表として扱われ、成功する（PostgreSQL 互換）。
+#[test]
+fn truncate_duplicate_table_names_collapse_to_one() {
+    let (core, path) = new_core_with_tables();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    insert_row(&core, &alice, TABLE, 1, Visibility::Private, 1);
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        &format!("TRUNCATE {TABLE}, {TABLE} USING OPERATION_ID 'op-dup-names'"),
+    )
+    .expect("duplicate names must collapse");
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
+}
+
+/// 原子性: 2 番目の表が不在なら 1 番目の表の行も残り、台帳も書かれない
+/// （同じ operation_id で正しい文を送れば成功する）。
+#[test]
+fn truncate_multi_with_undefined_second_table_is_atomic() {
+    let (core, path) = new_core_with_tables();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    insert_row(&core, &alice, TABLE, 1, Visibility::Private, 1);
     let mut session = SessionState::default();
 
     let err = core
         .execute_sql_in_session(
             &alice,
             &mut session,
-            &format!("TRUNCATE TABLE {TABLE}, {OTHER_TABLE} USING OPERATION_ID 'op-multi-table'"),
+            &format!("TRUNCATE {TABLE}, ghost USING OPERATION_ID 'op-atomic'"),
         )
-        .expect_err("multiple tables must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+        .expect_err("undefined second table must be rejected");
+    assert_eq!(err.wire_code(), "42P01");
+    assert_eq!(count_star(&core, &alice, TABLE), 1, "first table untouched");
+
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        &format!("TRUNCATE {TABLE} USING OPERATION_ID 'op-atomic'"),
+    )
+    .expect("no ledger entry may remain from the rejected statement");
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
 }
 
+/// RECOVER-10 x SQL-48: 複数テーブル文は 1 つの書き込みとして再送判定する。
+/// 同じ表集合（順序違いを含む）は `23505`、異なる集合は `22023`。いずれも行は変わらない。
+#[test]
+fn truncate_multi_resend_uses_normalized_table_set_for_ledger_check() {
+    let (core, path) = new_core_with_tables();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        &format!("TRUNCATE {TABLE}, {OTHER_TABLE} USING OPERATION_ID 'op-set'"),
+    )
+    .expect("first multi-table TRUNCATE");
+    insert_row(&core, &alice, TABLE, 1, Visibility::Private, 10);
+    insert_row(&core, &alice, OTHER_TABLE, 1, Visibility::Private, 10);
+
+    for sql in [
+        format!("TRUNCATE {TABLE}, {OTHER_TABLE} USING OPERATION_ID 'op-set'"),
+        format!("TRUNCATE {OTHER_TABLE}, {TABLE} USING OPERATION_ID 'op-set'"),
+    ] {
+        let err = core
+            .execute_sql_in_session(&alice, &mut session, &sql)
+            .expect_err("same table set resend must be a duplicate");
+        assert_eq!(err.wire_code(), "23505", "{sql}");
+    }
+    // 単一表の文は集合が異なるため内容不一致。
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            &format!("TRUNCATE {TABLE} USING OPERATION_ID 'op-set'"),
+        )
+        .expect_err("different table set must be a content mismatch");
+    assert_eq!(err.wire_code(), "22023");
+    assert_eq!(count_star(&core, &alice, TABLE), 1);
+    assert_eq!(count_star(&core, &alice, OTHER_TABLE), 1);
+}
+
+/// 単一表の `TRUNCATE a` の台帳エントリは、重複指定（`a, a`）の再送とも一致する
+/// （正規化後に同じ形になる）。
+#[test]
+fn truncate_single_and_deduplicated_forms_share_ledger_content() {
+    let (core, path) = new_core_with_tables();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        &format!("TRUNCATE TABLE {TABLE} USING OPERATION_ID 'op-single-form'"),
+    )
+    .expect("first");
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            &format!("TRUNCATE {TABLE}, {TABLE} USING OPERATION_ID 'op-single-form'"),
+        )
+        .expect_err("resend");
+    assert_eq!(err.wire_code(), "23505");
+}
+
+/// 拡張句（`CASCADE`／`RESTRICT`／`RESTART IDENTITY`）は後続 Issue の範囲で、
+/// 引き続き `42601`。
+#[test]
+fn truncate_extension_clauses_remain_rejected() {
+    let (core, path) = new_core_with_tables();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    for clause in ["CASCADE", "RESTRICT", "RESTART IDENTITY"] {
+        let err = core
+            .execute_sql_in_session(
+                &alice,
+                &mut session,
+                &format!("TRUNCATE {TABLE} {clause} USING OPERATION_ID 'op-ext'"),
+            )
+            .expect_err("extension clause must be rejected");
+        assert_eq!(err.wire_code(), "42601", "{clause}");
+    }
+}
 /// 存在しないテーブルへの TRUNCATE は `42P01`（`UndefinedTable`）。
 #[test]
 fn truncate_undefined_table_is_rejected_with_42p01() {
@@ -741,4 +879,131 @@ fn truncate_aborted_by_fk_violation_leaves_no_side_effects_even_after_reopen() {
         sql_ids(&core, &bob, "SELECT id FROM parents LIMIT 100").len(),
         3
     );
+}
+/// SQL-48 (4) x TABLE-17: 親子を同じ文で指定すれば、子に自テナントの行があっても
+/// `23503` にならず両表が空になる。親だけを指定した場合は従来どおり `23503`。
+#[test]
+fn truncate_parent_and_child_in_one_statement_succeeds_but_parent_alone_is_rejected() {
+    let path = unique_db_path("truncate-table-1643-fk");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    create_fk_pair(&core);
+    for ctx in [&alice, &bob] {
+        let t = ctx.tenant_id();
+        sql_ok(
+            &core,
+            ctx,
+            &format!(
+                "INSERT INTO parents (id, code) VALUES (1, 'c1') USING OPERATION_ID 'op-p-{t}'"
+            ),
+        );
+        sql_ok(
+            &core,
+            ctx,
+            &format!(
+                "INSERT INTO children (id, parent_id) VALUES (1, 1) USING OPERATION_ID 'op-c-{t}'"
+            ),
+        );
+    }
+
+    assert_eq!(
+        sql_err_code(
+            &core,
+            &alice,
+            "TRUNCATE parents USING OPERATION_ID 'op-fk-1'"
+        ),
+        "23503"
+    );
+    assert_eq!(
+        sql_ids(&core, &alice, "SELECT id FROM parents LIMIT 10"),
+        vec![1]
+    );
+
+    let outcome = sql_ok(
+        &core,
+        &alice,
+        "TRUNCATE parents, children USING OPERATION_ID 'op-fk-2'",
+    );
+    assert!(matches!(outcome, SqlOutcome::Truncate(_)));
+    assert!(sql_ids(&core, &alice, "SELECT id FROM parents LIMIT 10").is_empty());
+    assert!(sql_ids(&core, &alice, "SELECT id FROM children LIMIT 10").is_empty());
+    // 他テナントの親子は無傷。
+    assert_eq!(
+        sql_ids(&core, &bob, "SELECT id FROM parents LIMIT 10"),
+        vec![1]
+    );
+    assert_eq!(
+        sql_ids(&core, &bob, "SELECT id FROM children LIMIT 10"),
+        vec![1]
+    );
+
+    // 親が空になったので、子の再投入は FK 違反になる（キー索引が壊れていない確認）。
+    assert_eq!(
+        sql_err_code(
+            &core,
+            &alice,
+            "INSERT INTO children (id, parent_id) VALUES (2, 1) USING OPERATION_ID 'op-c-again'"
+        ),
+        "23503"
+    );
+}
+
+/// 原子性（FK）: 複数テーブル文の途中で `23503` になれば、先に並べた表の行も残り、
+/// 台帳も書かれない。
+#[test]
+fn truncate_multi_aborted_by_fk_violation_keeps_all_tables() {
+    let path = unique_db_path("truncate-table-1643-fk-abort");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx_for("alice", true);
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    create_fk_pair(&core);
+    sql_ok(&core, &alice, "CREATE TABLE loose (note TEXT)");
+    sql_ok(
+        &core,
+        &alice,
+        "INSERT INTO loose (id, note) VALUES (1, 'x') USING OPERATION_ID 'op-l'",
+    );
+    sql_ok(
+        &core,
+        &alice,
+        "INSERT INTO parents (id, code) VALUES (1, 'c1') USING OPERATION_ID 'op-p'",
+    );
+    sql_ok(
+        &core,
+        &alice,
+        "INSERT INTO children (id, parent_id) VALUES (1, 1) USING OPERATION_ID 'op-c'",
+    );
+
+    assert_eq!(
+        sql_err_code(
+            &core,
+            &alice,
+            "TRUNCATE loose, parents USING OPERATION_ID 'op-abort-multi'"
+        ),
+        "23503"
+    );
+    assert_eq!(
+        sql_ids(&core, &alice, "SELECT id FROM loose LIMIT 10"),
+        vec![1]
+    );
+    assert_eq!(
+        sql_ids(&core, &alice, "SELECT id FROM parents LIMIT 10"),
+        vec![1]
+    );
+    // 台帳が書かれていない: 子を消せば同じ operation_id で成功する。
+    sql_ok(
+        &core,
+        &alice,
+        "DELETE FROM children WHERE id = 1 USING OPERATION_ID 'op-cd'",
+    );
+    sql_ok(
+        &core,
+        &alice,
+        "TRUNCATE loose, parents USING OPERATION_ID 'op-abort-multi'",
+    );
+    assert!(sql_ids(&core, &alice, "SELECT id FROM loose LIMIT 10").is_empty());
 }

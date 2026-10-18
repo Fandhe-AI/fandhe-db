@@ -339,7 +339,7 @@ v9 対応が前提）の両方について、COMMIT 直前の事後状態を全�
 
 参照先側（`enforce_referencing_rows_in_txn`）: `delete_row_impl`（単一行 DELETE・
 `RETURNING` を包含。実際に削除した場合のみ）・`delete_rows_where_unchecked`・
-`truncate_table_unchecked`（明示トランザクション内の `TRUNCATE` を含む）・
+`truncate_tables_unchecked`（明示トランザクション内の `TRUNCATE` を含む）・
 `update_row_unchecked`・`update_row_columns_unchecked`・
 `update_rows_where_unchecked`・`upsert_typed_rows_unchecked`（`DO UPDATE`）・
 `replace_typed_rows_by_text_key`（置換で消える旧行）。

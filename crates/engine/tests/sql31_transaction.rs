@@ -675,6 +675,64 @@ fn truncate_inside_transaction_is_committed_atomically_with_inserts() {
     }
 }
 
+/// SQL-48 (4)（Issue #1643）: 明示トランザクション内の複数テーブル TRUNCATE は
+/// ROLLBACK で全表が戻り、COMMIT で全表が消える。
+#[test]
+fn multi_table_truncate_inside_transaction_rolls_back_and_commits_all_tables() {
+    let path = unique_db_path("sql31-transaction-multi-truncate");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema(TABLE)).expect("create table");
+    storage
+        .create_table(&schema("second"))
+        .expect("create second table");
+    let engine = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let caller = ctx("tenant-a");
+    let seed = |sql: &str| {
+        engine
+            .execute_sql_in_session(&caller, &mut SessionState::default(), sql)
+            .expect("seed");
+    };
+    let reseed = |tag: &str| {
+        seed(&insert_sql(1, &format!("pre-1-{tag}")));
+        seed(&format!(
+            "INSERT INTO second (id, embedding) VALUES (1, '[1.0, 0.0]') USING OPERATION_ID 'pre-2-{tag}'"
+        ));
+    };
+    let count = |table: &str| match engine
+        .execute_sql_in_session(
+            &caller,
+            &mut SessionState::default(),
+            &format!("SELECT id FROM {table} ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 10"),
+        )
+        .expect("select")
+    {
+        SqlOutcome::Query(result) => result.rows.len(),
+        other => panic!("expected Query, got {other:?}"),
+    };
+
+    reseed("a");
+    for (finish, expected) in [("ROLLBACK", 1), ("COMMIT", 0)] {
+        let mut session = SessionState::default();
+        let mut txn = engine.new_session_transaction();
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                &format!("TRUNCATE {TABLE}, second USING OPERATION_ID 'multi-{finish}'"),
+            )
+            .expect("multi-table truncate");
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, finish)
+            .expect("finish");
+        assert_eq!(count(TABLE), expected, "{finish}: {TABLE}");
+        assert_eq!(count("second"), expected, "{finish}: second");
+    }
+}
 #[test]
 fn dropping_an_active_transaction_without_commit_leaves_no_trace() {
     let (engine, path) = new_core();

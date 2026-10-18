@@ -199,6 +199,7 @@ fn decode_entry(value: &[u8]) -> Result<StoredEntry, UnknownLedgerEntryFormat> {
 /// 「台帳へ書くか」を型で明示する（[`crate::recovery::required_op_id::LedgerMode::resolve`]
 /// が生成する）。`Option` の `None` を黙って skip 扱いにしない（呼び出し元に判断を
 /// 委ねず、`Disabled` という意図を型で残す）。
+#[derive(Clone, Copy)]
 pub(crate) enum LedgerWrite<'a> {
     /// 台帳あり構成（`LedgerMode::Ledgered`）。検証済み `operation_id` を記録する。
     Record(&'a OperationId),
