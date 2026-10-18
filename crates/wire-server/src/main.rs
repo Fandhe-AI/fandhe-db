@@ -139,6 +139,15 @@
 //! `EngineCore::with_group_by_limits` へ 1 回だけ注入する
 //! （`docs/design/group-by-limits-cli.md`）。
 //!
+//! `--max-temp-tables`／`--max-temp-bytes`（Issue #1683。TABLE-44）: 一時表
+//! （`CREATE TEMP TABLE`）のセッションあたりの件数（`1`〜`64`）・論理総バイト数
+//! （`1`〜`67108864`）の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定できる
+//! opt-in 注入点（未指定は現行のハード上限と同値＝挙動不変。メモリの最悪値は
+//! 「最大接続数 × バイト上限」）。超過は `54000`。範囲外・非数値・値欠落・重複指定は
+//! いずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::temp_table_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_temp_table_limits` へ 1 回だけ注入する。
+//!
 //! `--max-jsonpath-steps`／`--max-jsonpath-depth`（Issue #2184。TABLE-25）: jsonpath 評価器の
 //! ステップ数（`1`〜`4000000`）・再帰深さ（`1`〜`1024`）の上限を、プロセス全体に対して
 //! 起動時に**下げる方向だけ**設定できる opt-in 注入点（未指定は評価器のハード上限と同値）。
@@ -419,6 +428,8 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_scanned_rows_raw: Option<String> = None;
     let mut max_group_by_columns_raw: Option<String> = None;
     let mut max_groups_raw: Option<String> = None;
+    let mut max_temp_tables_raw: Option<String> = None;
+    let mut max_temp_bytes_raw: Option<String> = None;
     let mut max_jsonpath_steps_raw: Option<String> = None;
     let mut max_jsonpath_depth_raw: Option<String> = None;
     let mut max_subquery_depth_raw: Option<String> = None;
@@ -843,6 +854,46 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_groups_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::temp_table_limits_opt::MAX_TEMP_TABLES_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::temp_table_limits_opt::MAX_TEMP_TABLES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1683: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_temp_tables_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::temp_table_limits_opt::MAX_TEMP_TABLES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_temp_tables_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::temp_table_limits_opt::MAX_TEMP_BYTES_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::temp_table_limits_opt::MAX_TEMP_BYTES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1683: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_temp_bytes_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::temp_table_limits_opt::MAX_TEMP_BYTES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_temp_bytes_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::jsonpath_limits_opt::MAX_JSONPATH_STEPS_FLAG => {
@@ -1630,6 +1681,22 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1683: 一時表のセッションあたり件数・総バイト数上限を bind・ユーザーストア読込より
+    // 前に解決する（fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
+    // `TempTableLimits::default()`＝ハード上限＝現行挙動。
+    let temp_table_limits = match wire_server::temp_table_limits_opt::resolve(
+        wire_server::temp_table_limits_opt::TempTableLimitsRawFlags {
+            max_temp_tables: max_temp_tables_raw.as_deref(),
+            max_temp_bytes: max_temp_bytes_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid temp table limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #2184: jsonpath 評価のステップ数・再帰深さ上限を bind・ユーザーストア読込より
     // 前に解決する（fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
     // `JsonPathLimits::default()`＝ハード上限。
@@ -2142,6 +2209,9 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #1550: 未指定でも常に呼ぶ（`group_by_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_group_by_limits(group_by_limits);
+    // Issue #1683: 未指定でも常に呼ぶ（`temp_table_limits` は既定まで解決済み。既定は
+    // ハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_temp_table_limits(temp_table_limits);
     // Issue #2184: 未指定でも常に呼ぶ（`jsonpath_limits` は既定まで解決済み。既定は
     // ハード上限と同値）。SQL 表層からの利用は Issue #2185 以降。
     core = core.with_jsonpath_limits(jsonpath_limits);
