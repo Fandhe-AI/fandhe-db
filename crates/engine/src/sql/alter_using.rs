@@ -156,6 +156,117 @@ pub(crate) fn bind_alter_conversion(
     })
 }
 
+/// 型変換の対象列の `DEFAULT`／補完値 1 つを、旧型から新型へ**代入変換**（SQL-47。`USING` 式は
+/// 使わない。PostgreSQL と同じ）して新しい型の正準な [`ColumnDefault`] に直す（TABLE-40 (3)・
+/// Issue #1637）。`catalog` の `ALTER COLUMN TYPE` の一般変換経路が、スキーマ書き戻しの前に
+/// 呼ぶ。行は読まない。
+///
+/// - `CurrentTime`（時刻値関数）は構文形のまま、新しい型と整合するときだけ保持する。
+/// - それ以外は旧型の値として実体化 → 1 列だけのスキーマ上で代入変換を評価 → 正準形へ戻す。
+///   正準形は新しい型で束縛し直せることを確かめる（整数・bool・文字列は値も一致を要求し、
+///   浮動小数・NUMERIC・日時は束縛成功をもって可とする）。
+///
+/// 失敗（変換不能・評価エラー・再束縛不能）はすべて値を含まない固定文言の `42804`。
+pub(crate) fn convert_column_default_for_alter(
+    old_column: &crate::catalog::ColumnDef,
+    default: &crate::catalog::ColumnDefault,
+    new_ty: &ColumnType,
+) -> Result<crate::catalog::ColumnDefault, SqlSurfaceError> {
+    use crate::catalog::{ColumnDef, ColumnDefault};
+    use crate::row_codec::Value;
+    let fail = || {
+        SqlSurfaceError::datatype_mismatch(format!(
+            "default for column {:?} cannot be cast automatically to the new column type",
+            old_column.name
+        ))
+    };
+    if let ColumnDefault::CurrentTime(t) = default {
+        return if t.compatible_with(new_ty) {
+            Ok(default.clone())
+        } else {
+            Err(fail())
+        };
+    }
+    // 1 列だけの作業用スキーマ（NULL 許可）。旧列の名前・型・照合で値を実体化する。
+    let eval_one = |col_ty: &ColumnType,
+                    value: Value,
+                    target: &ColumnType|
+     -> Result<Value, SqlSurfaceError> {
+        let mini = TableSchema::new(
+            "alter_default_probe",
+            vec![ColumnDef::new(
+                old_column.name.clone(),
+                col_ty.clone(),
+                true,
+            )],
+        );
+        let conv = bind_alter_conversion(None, &mini, 0, target).map_err(|_| fail())?;
+        let metadata =
+            crate::row_codec::encode_scalar_columns(&mini, &[value]).map_err(|_| fail())?;
+        let view = crate::row_codec::scan_scalar_columns(&mini, &metadata).map_err(|_| fail())?;
+        let evaluated = crate::sql::udf_call::eval_with_scalars(&conv.bound, 0, &[], &view)
+            .map_err(|_| fail())?;
+        crate::sql::set_expr::expr_value_to_column_value(
+            &conv.target_ty,
+            true,
+            &conv.column_name,
+            evaluated,
+        )
+        .map_err(|_| fail())
+    };
+    let old_value =
+        crate::sql::parser::bind_column_default(old_column, default).map_err(|_| fail())?;
+    let new_value = eval_one(&old_column.ty, old_value, new_ty)?;
+    let candidate = match &new_value {
+        Value::Bool(b) => ColumnDefault::Bool(*b),
+        Value::Text(s) => ColumnDefault::Text(s.clone()),
+        Value::TimestampTz(micros) => ColumnDefault::Text(crate::datetime::format_timestamptz(
+            *micros,
+            &crate::datetime::SessionTimeZone::utc(),
+        )),
+        Value::Integer(_)
+        | Value::BigInt(_)
+        | Value::Real(_)
+        | Value::Double(_)
+        | Value::Numeric(_) => match eval_one(new_ty, new_value.clone(), &ColumnType::Text)? {
+            Value::Text(s) => ColumnDefault::Number(s),
+            _ => return Err(fail()),
+        },
+        Value::Null => return Err(fail()),
+        _ => match eval_one(new_ty, new_value.clone(), &ColumnType::Text)? {
+            Value::Text(s) => ColumnDefault::Text(s),
+            _ => return Err(fail()),
+        },
+    };
+    // 保存可能長の検査: カタログは DEFAULT／補完値を `MAX_COLUMN_DEFAULT_LEN` バイトまでしか
+    // 保存できない（CHAR(n) の空白詰め等で変換後に超過しうる）。超過を保存段階の 42601 に
+    // 漏らさず、ここで固定文言の 42804 にする。呼び出し側は DEFAULT なら拒否、補完値なら破棄する。
+    if let ColumnDefault::Text(s) | ColumnDefault::Number(s) = &candidate {
+        if s.len() > crate::catalog::MAX_COLUMN_DEFAULT_LEN {
+            return Err(fail());
+        }
+    }
+    // 再束縛検証: 正準形が新しい型の DEFAULT として束縛できること。完全一致は、整数・bool・文字列
+    // など正準 text 表現が一意な型だけで要求する。REAL／DOUBLE PRECISION／NUMERIC の scale／
+    // TIMESTAMPTZ は text 表現が元と異なっても代入変換自体は成功しているため、束縛成功をもって可とする
+    // （変換不能のみ 42804 で fail-closed）。
+    let probe = ColumnDef::new(old_column.name.clone(), new_ty.clone(), true);
+    match crate::sql::parser::bind_column_default(&probe, &candidate) {
+        Ok(v) => {
+            let exact = matches!(
+                new_value,
+                Value::Bool(_) | Value::Text(_) | Value::Integer(_) | Value::BigInt(_)
+            );
+            if !exact || v == new_value {
+                Ok(candidate)
+            } else {
+                Err(fail())
+            }
+        }
+        Err(_) => Err(fail()),
+    }
+}
+
 /// 全行の変換で発生した評価・変換エラーを、SQLSTATE を保ったまま固定文言へ置き換える
 /// （`column_rewrite` が呼ぶ）。書き換えは全テナント・全可視性の行が対象のため、呼び出し元
 /// セッションから見えない行の値が、`cast_value` の入力エコー等でエラー文言に混ざりうる。

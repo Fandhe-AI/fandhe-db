@@ -4,8 +4,8 @@
 //! `EngineCore::execute_sql_in_session` を production 経路として、(1) USING 省略の縮小・非互換変換
 //! （代入変換がある組だけ受理）、(2) USING 式の評価と代入変換、(3) 1 行でも変換・評価に失敗すれば
 //! 文全体を拒否して表が一切変わらないこと（違反行が呼び出し元から見えない他テナントの Private 行でも
-//! 同じで、エラー文言に値・テナント・行 id が出ないこと）、(4) 依存を持つ列の暫定 `0A000`
-//! （Issue #1637 まで）、(5) 永続性とキャッシュの失効を固定する。
+//! 同じで、エラー文言に値・テナント・行 id が出ないこと）、(4) 依存を持つ列の再構築とビュー参照列の
+//! `0A000`（Issue #1637）、(5) 永続性とキャッシュの失効を固定する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -405,10 +405,11 @@ fn datetime_conversions_succeed() {
     assert_eq!(firsts(&core, "SELECT ts FROM t LIMIT 5").len(), 1);
 }
 
-/// 依存を持つ列は、新しい一般変換では暫定的に `0A000`（索引・制約・ビューの再構築は Issue #1637）。
-/// 副作用はなく、既存の受理経路（INTEGER→BIGINT）は依存があっても従来どおり成功する。
+/// 依存を持つ列の一般変換（TABLE-40 (3)(4)・Issue #1637）: PK・UNIQUE・CHECK・DEFAULT・索引・
+/// FK 参照元／参照先の列は新しい型へ再構築されて受理され、ビューが参照する列だけが `0A000` で
+/// 拒否される（表は不変）。詳細な再検証は sql_alter_column_type_dependents.rs。
 #[test]
-fn dependent_columns_are_fail_closed_until_rebuild_support() {
+fn dependent_columns_are_rebuilt_and_only_view_columns_are_rejected() {
     let (_path, _g, core) = open("rw-dependents");
     ok(
         &core,
@@ -417,22 +418,19 @@ fn dependent_columns_are_fail_closed_until_rebuild_support() {
     ok(&core, "CREATE TABLE ch (r BIGINT REFERENCES p (k))");
     ok(&core, "CREATE INDEX p_ix ON p (ix)");
     ok(&core, "CREATE VIEW pv AS SELECT vw FROM p");
-    for col in ["k", "u", "c", "d", "ix", "vw"] {
-        let err = fail(
+    for col in ["k", "u", "c", "d", "ix", "n"] {
+        ok(
             &core,
             &format!("ALTER TABLE p ALTER COLUMN {col} TYPE INTEGER"),
         );
-        assert_eq!(err.wire_code(), "0A000", "{col}: {err}");
-        assert_eq!(column_type(&core, "p", col), ColumnType::BigInt, "{col}");
+        assert_eq!(column_type(&core, "p", col), ColumnType::Integer, "{col}");
     }
-    // 子表の FK 参照元の列も同様。
-    assert_eq!(
-        fail(&core, "ALTER TABLE ch ALTER COLUMN r TYPE INTEGER").wire_code(),
-        "0A000"
-    );
-    // 依存の無い列は成功する。
-    ok(&core, "ALTER TABLE p ALTER COLUMN n TYPE INTEGER");
-    assert_eq!(column_type(&core, "p", "n"), ColumnType::Integer);
+    // 子表の FK 参照元の列も受理される。
+    ok(&core, "ALTER TABLE ch ALTER COLUMN r TYPE INTEGER");
+    // ビューが参照する列は拒否され、型は変わらない。
+    let err = fail(&core, "ALTER TABLE p ALTER COLUMN vw TYPE INTEGER");
+    assert_eq!(err.wire_code(), "0A000", "{err}");
+    assert_eq!(column_type(&core, "p", "vw"), ColumnType::BigInt);
 }
 
 /// `SELECT *` ビューは旧スキーマで全列を公開するため、どの列の一般変換も `0A000` で拒否する
@@ -546,4 +544,27 @@ fn array_to_text_assignment_is_accepted() {
     insert(&core, "u", 1, "a", "ARRAY[1, 2]");
     ok(&core, "ALTER TABLE u ALTER COLUMN a TYPE VARCHAR(20)");
     assert_eq!(firsts(&core, "SELECT a FROM u LIMIT 5").len(), 1);
+}
+
+/// 変換後の DEFAULT が CHAR(n) の空白詰めでカタログの保存上限（`MAX_COLUMN_DEFAULT_LEN`）を
+/// 超える場合は、保存段階の 42601 ではなく固定文言の 42804 で拒否し、表は不変（Issue #1637）。
+#[test]
+fn default_exceeding_catalog_limit_after_conversion_is_rejected_with_42804() {
+    let (_path, _g, core) = open("rw-default-too-long");
+    ok(&core, "CREATE TABLE t (k BIGINT, c BIGINT DEFAULT 1)");
+    let err = fail(&core, "ALTER TABLE t ALTER COLUMN c TYPE CHAR(1025)");
+    assert_eq!(err.wire_code(), "42804", "{err}");
+    assert_eq!(column_type(&core, "t", "c"), ColumnType::BigInt);
+}
+
+/// DEFAULT を外して補完値だけが残る列は、変換後の補完値が保存上限を超えるなら補完値を破棄して
+/// 変換を受理する（変換不能な補完値は破棄する方針。Issue #1637）。
+#[test]
+fn fill_only_exceeding_catalog_limit_after_conversion_is_discarded() {
+    let (_path, _g, core) = open("rw-fill-too-long");
+    ok(&core, "CREATE TABLE t (k BIGINT)");
+    ok(&core, "ALTER TABLE t ADD COLUMN c BIGINT DEFAULT 1");
+    ok(&core, "ALTER TABLE t ALTER COLUMN c DROP DEFAULT");
+    ok(&core, "ALTER TABLE t ALTER COLUMN c TYPE CHAR(1025)");
+    assert_eq!(column_type(&core, "t", "c"), ColumnType::Bpchar(1025));
 }

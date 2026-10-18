@@ -235,7 +235,8 @@ fn real_to_double_keeps_check_outcome() {
     assert!(matches!(rows.rows[0].cells[0], Cell::Float(f) if f == 0.75));
 }
 
-/// 縮小・同一型・非互換は CHECK 参照列でも `42804`、状態は不変。
+/// 同一型・CHECK を束縛し直せない変換は CHECK 参照列でも拒否され状態は不変。束縛できる縮小・
+/// DOUBLE PRECISION 化は受理され CHECK が強制される（TABLE-40・Issue #1637）。
 #[test]
 fn non_widening_on_check_column_is_42804_and_changes_nothing() {
     let (core, path) = new_core("ackc-reject");
@@ -251,16 +252,11 @@ fn non_widening_on_check_column_is_42804_and_changes_nothing() {
         &o,
         "INSERT INTO t (id, a, b) VALUES (1, 1, 1) USING OPERATION_ID 'a1'",
     );
-    // 代入変換のある一般変換は、CHECK が参照する列では Issue #1637（依存オブジェクトの再構築）
-    // まで暫定の `0A000`（TABLE-40・Issue #1636）。同一型は従来どおり `42804`。
+    // 同一型は `42804`。CHECK を新しい型で束縛できない一般変換は束縛エラー（`a > 0` は TEXT と
+    // 数値を比較できず `42883`。TABLE-40・Issue #1637）。いずれも状態は不変。
     for (sql, expected) in [
-        ("ALTER TABLE t ALTER COLUMN a TYPE TEXT", "0A000"),
-        ("ALTER TABLE t ALTER COLUMN b TYPE INTEGER", "0A000"),
+        ("ALTER TABLE t ALTER COLUMN a TYPE TEXT", "42883"),
         ("ALTER TABLE t ALTER COLUMN b TYPE BIGINT", "42804"),
-        (
-            "ALTER TABLE t ALTER COLUMN a TYPE DOUBLE PRECISION",
-            "0A000",
-        ),
     ] {
         assert_eq!(code(&core, &o, sql), expected, "{sql}");
     }
@@ -273,6 +269,28 @@ fn non_widening_on_check_column_is_42804_and_changes_nothing() {
         ),
         "23514"
     );
+    // 束縛できる一般変換（縮小・DOUBLE PRECISION 化）は受理され、CHECK は新しい型で強制される。
+    ok(&core, &o, "ALTER TABLE t ALTER COLUMN b TYPE INTEGER");
+    ok(
+        &core,
+        &o,
+        "ALTER TABLE t ALTER COLUMN a TYPE DOUBLE PRECISION",
+    );
+    for col in ["a", "b"] {
+        assert_eq!(
+            code(
+                &core,
+                &o,
+                &format!(
+                    "INSERT INTO t (id, a, b) VALUES (3, {}, {}) USING OPERATION_ID 'y{col}'",
+                    if col == "a" { 0 } else { 1 },
+                    if col == "b" { 0 } else { 1 },
+                )
+            ),
+            "23514",
+            "{col}"
+        );
+    }
 }
 
 /// 拡大後に開き直しても型は BIGINT で CHECK は強制される。PK／UNIQUE と CHECK を併せ持つ列でも

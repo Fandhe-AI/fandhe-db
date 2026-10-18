@@ -226,11 +226,11 @@ fn wire_dependent_check_column_is_rejected_with_2bp01() {
     read_ready_for_query(&mut stream);
 }
 
-/// CHECK 参照列でも拡大変換（INTEGER→BIGINT）は受理され（Issue #1427）、
-/// 値の変換を伴う一般変換は Issue #1637（依存オブジェクトの再構築）まで暫定の 0A000
-/// （TABLE-40・Issue #1636）。
+/// CHECK 参照列でも拡大変換（INTEGER→BIGINT）は受理され（Issue #1427）、値の変換を伴う
+/// 一般変換は CHECK を新しい型で束縛できなければ束縛エラー（`qty > 0` は TEXT と数値を比較
+/// できず 42883）、違反する値になる変換は 23514（TABLE-40・Issue #1637）。
 #[test]
-fn wire_check_column_widening_is_accepted_and_conversion_is_gated_with_0a000() {
+fn wire_check_column_widening_is_accepted_and_conversion_revalidates_the_check() {
     let (core, _guard) = new_core_with_docs_table();
     let mut stream = spawn_with_alice_as_ddl_principal(core);
     send_simple_query(
@@ -240,9 +240,32 @@ fn wire_check_column_widening_is_accepted_and_conversion_is_gated_with_0a000() {
     assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
     read_ready_for_query(&mut stream);
     send_simple_query(&mut stream, "ALTER TABLE docs ALTER COLUMN qty TYPE TEXT");
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    expect_error_response_with_sqlstate(&mut stream, "42883");
     read_ready_for_query(&mut stream);
     send_simple_query(&mut stream, "ALTER TABLE docs ALTER COLUMN qty TYPE BIGINT");
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+}
+
+/// 依存オブジェクトを持つ列の一般変換（TABLE-40・Issue #1637）: ビューが参照する列は 0A000、
+/// 参照しない列は受理される。
+#[test]
+fn wire_view_column_conversion_is_rejected_with_0a000_and_unreferenced_is_accepted() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+    send_simple_query(&mut stream, "CREATE VIEW v_qty AS SELECT qty FROM docs");
+    assert_eq!(read_command_complete(&mut stream), "CREATE VIEW");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE docs ALTER COLUMN qty TYPE SMALLINT USING qty * 1",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE docs ALTER COLUMN note TYPE VARCHAR(8) USING note",
+    );
     assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
     read_ready_for_query(&mut stream);
 }

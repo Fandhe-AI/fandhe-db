@@ -425,22 +425,23 @@ fn unique_and_primary_key_checks_hold_across_tenants_after_widening() {
     );
 }
 
-/// PK／FK 構成列への縮小・異種の ALTER は暫定の `0A000`（Issue #1637 まで）。INTEGER／BIGINT が混在する宣言は受理され、
-/// 参照整合性が拡大変換後と同じ規則で働く。整数以外の混在宣言は `42830` のまま
+/// FK 参照元を比較できない型へ変える ALTER は `42804` で不変（TABLE-40・Issue #1637。PK 列の縮小は
+/// 再構築されて受理される。成功系は sql_alter_column_type_dependents.rs）。INTEGER／BIGINT が混在する
+/// 宣言は受理され、参照整合性が拡大変換後と同じ規則で働く。整数以外の混在宣言は `42830` のまま
 /// （Issue #1435・TABLE-17・TABLE-22）。
 #[test]
 fn non_widening_is_gated_and_mixed_integer_declarations_are_enforced() {
     let (core, path) = setup_parent_child("akc-strict", "BIGINT", "BIGINT", "");
     let _g = CleanupGuard(path);
     let o = ctx("owner");
-    for sql in [
-        "ALTER TABLE kp ALTER COLUMN k TYPE INTEGER",
-        "ALTER TABLE kc ALTER COLUMN ref TYPE DOUBLE PRECISION",
-    ] {
-        // PK／FK の構成列への一般変換は、索引・制約の再構築（Issue #1637）まで暫定の `0A000`
-        // （TABLE-40・Issue #1636）。表は変わらない。
-        assert_eq!(code(&core, &o, sql), "0A000", "{sql}");
-    }
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "ALTER TABLE kc ALTER COLUMN ref TYPE DOUBLE PRECISION"
+        ),
+        "42804"
+    );
     assert_eq!(ints(&core, &o, "SELECT k FROM kp LIMIT 10"), vec![1, 2, 3]);
     // 親 BIGINT・子 INTEGER の混在宣言（表制約・ADD FOREIGN KEY）は受理する。
     ok(
@@ -720,5 +721,40 @@ fn widening_real_unique_column_preserves_values_and_uniqueness_per_tenant() {
         &core,
         &tenants[1],
         "INSERT INTO fu (id, r) VALUES (30, 2.25) USING OPERATION_ID 'f'",
+    );
+}
+
+/// `id` 疑似列を参照する FK の参照元列を USING 付き一般変換で書き換え、親に存在しない値
+/// （孤児）が生じる場合は `23503` で拒否する（Issue #1637 レビュー指摘）。
+#[test]
+fn general_conversion_on_id_referencing_fk_rejects_orphans() {
+    let (core, path) = new_core("akc-idfk");
+    let _g = CleanupGuard(path);
+    let o = ctx("owner");
+    ok(&core, &o, "CREATE TABLE ip (v INTEGER)");
+    ok(&core, &o, "CREATE TABLE ic (r INTEGER REFERENCES ip(id))");
+    ok(
+        &core,
+        &o,
+        "INSERT INTO ip (id, v) VALUES (1, 0) USING OPERATION_ID 'p1'",
+    );
+    ok(
+        &core,
+        &o,
+        "INSERT INTO ic (id, r) VALUES (1, 1) USING OPERATION_ID 'c1'",
+    );
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "ALTER TABLE ic ALTER COLUMN r TYPE BIGINT USING r + 1"
+        ),
+        "23503"
+    );
+    // 孤児を作らない変換は成功する。
+    ok(
+        &core,
+        &o,
+        "ALTER TABLE ic ALTER COLUMN r TYPE BIGINT USING r",
     );
 }
