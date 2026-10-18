@@ -939,6 +939,31 @@ mod tests {
         write_txn.abort().expect("abort");
     }
 
+    /// ENUM 型だけがある新規 DB でも、列挙は空のカタログ表を作らない（PR #2521 指摘）。
+    #[test]
+    fn t11c_enum_enumeration_does_not_create_catalog_table() {
+        use redb::TableHandle;
+        let (storage, _g) = open("dep-t11c");
+        storage
+            .create_enum_type("mood", vec!["x".to_string(), "y".to_string()])
+            .expect("enum");
+        let write_txn = storage.db().begin_write().expect("begin");
+        let has_catalog = |txn: &redb::WriteTransaction| {
+            txn.list_tables()
+                .expect("list")
+                .any(|h| h.name() == CATALOG_TABLE.name())
+        };
+        assert!(!has_catalog(&write_txn));
+        let closure = enumerate_drop_dependents_in_txn(
+            &write_txn,
+            &[DropTarget::EnumType("mood".to_string())],
+        )
+        .expect("enum");
+        assert!(closure.objects.is_empty());
+        assert!(!has_catalog(&write_txn));
+        write_txn.abort().expect("abort");
+    }
+
     /// 列挙は何も書かない: 列挙後も既存の DROP の判定結果が変わらない。
     #[test]
     fn t12_enumeration_does_not_change_existing_drop_behavior() {

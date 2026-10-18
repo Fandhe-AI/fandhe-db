@@ -12818,7 +12818,10 @@ fn dependent_tables_in_txn(
     write_txn: &redb::WriteTransaction,
     type_name: &str,
 ) -> Result<Vec<String>> {
-    let table = match write_txn.open_table(CATALOG_TABLE) {
+    // 読み取り専用オープン（欠落時に空のカタログ表を作らない。依存列挙
+    // `catalog::dependency` の read-only 契約を commit 後も保つため。Issue #1640）。
+    let table = match crate::storage::read_source::ReadSource::open_table(write_txn, CATALOG_TABLE)
+    {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
