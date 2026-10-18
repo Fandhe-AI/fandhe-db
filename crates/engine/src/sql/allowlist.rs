@@ -674,6 +674,10 @@ pub enum SqlSurfaceError {
     /// ERR-6: `42P16`（`InvalidTableDefinition` と同じ分類）。`column` はクライアント自身が
     /// 指定した列名のみ。
     ColumnInPrimaryKey { column: String },
+    /// `CREATE OR REPLACE VIEW` の新定義が既存ビューの出力列と互換でない（列の削除・名前変更・
+    /// 型変更・順序変更。TABLE-41 (2)・Issue #1660）。ERR-6: `42P16`（`InvalidTableDefinition` と
+    /// 同じ分類）。`detail` は英語固定文言＋クライアント自身が書いた列名のみ。
+    InvalidViewReplacement { detail: String },
     /// 分割実行 DML が 1 チャンク以上 commit した後に止まった（Issue #1129・
     /// RECOVER-11。`VD001`）。`cause` は止めた原因の分類（コードのみを応答へ載せ、
     /// 内側のメッセージは載せない）。`operation_id` はクライアント自身が指定した値。
@@ -1194,7 +1198,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateObject { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::DuplicateType { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::InvalidTableDefinition { .. }
-            | SqlSurfaceError::ColumnInPrimaryKey { .. } => ErrorClass::InvalidTableDefinition,
+            | SqlSurfaceError::ColumnInPrimaryKey { .. }
+            | SqlSurfaceError::InvalidViewReplacement { .. } => ErrorClass::InvalidTableDefinition,
             SqlSurfaceError::PartialCompletion { .. } => ErrorClass::PartialCompletion,
             SqlSurfaceError::PartitionedDmlCancelled { .. } => ErrorClass::PartitionedDmlCancelled,
             SqlSurfaceError::PartitionedDmlInTransaction => ErrorClass::ActiveSqlTransaction,
@@ -1362,6 +1367,8 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::ColumnInPrimaryKey { column } => {
                 write!(f, "column \"{column}\" is in a primary key")
             }
+            // 英語固定文言＋クライアント自身の定義に現れる列名のみ（security.md P0）。
+            SqlSurfaceError::InvalidViewReplacement { detail } => f.write_str(detail),
             // 件数（自テナントで commit 済み）・原因コード・クライアント自身の operation_id
             // だけを載せる。内側のメッセージ・テーブル名・他テナント情報は含めない。
             SqlSurfaceError::PartialCompletion {
@@ -10644,22 +10651,36 @@ impl<'a> Parser<'a> {
     }
 
     /// `CREATE VIEW <name> [(<alias> [, <alias>]*)] AS <body> [;]`（TABLE-18・SQL-23・
-    /// TASK-205、Issue #909。列別名リストは TABLE-41 (1)・Issue #1659）。`CREATE OR REPLACE`・
-    /// `TEMP`／`MATERIALIZED` は構造的に受理しない。戻り値は `(ビュー名, 列別名, 本文)`。
+    /// TASK-205、Issue #909。列別名リストは TABLE-41 (1)・Issue #1659）。`CREATE OR REPLACE VIEW`
+    /// （TABLE-41 (2)・Issue #1660）は受理し、`or_replace` で返す。`CREATE OR REPLACE` の後が `VIEW`
+    /// 以外・`TEMP`／`MATERIALIZED` は構造的に受理しない。
+    /// 戻り値は `(ビュー名, 列別名, 本文, OR REPLACE の有無)`。
     ///
     /// 列別名リストの構造検証（カタログは照会しない）: 空 `()`・末尾カンマ・識別子でない
     /// 要素は `42601`、件数が [`crate::catalog::MAX_COLUMN_COUNT`] 超は `54000`（長さ検査の
     /// 前に件数で打ち切り、過大な確保をしない）、リスト内の同名は `42701`。出力列数との
     /// 突合は本文を導出できる実行段（`core`）が担う。
     #[allow(clippy::type_complexity)]
-    fn parse_create_view(&mut self) -> Result<(String, Vec<String>, &[Token]), SqlSurfaceError> {
+    fn parse_create_view(
+        &mut self,
+    ) -> Result<(String, Vec<String>, &[Token], bool), SqlSurfaceError> {
         self.expect_ident_matching("CREATE")?;
+        // `OR REPLACE` は VIEW 専用（Issue #1660）。`OR` だけ・後続が `VIEW` 以外は `42601`。
+        let or_replace = if self.peek_ident_matches("OR") {
+            self.advance();
+            self.expect_ident_matching("REPLACE")?;
+            true
+        } else {
+            false
+        };
         self.expect_ident_matching("VIEW")?;
         // PostgreSQL 17 に無い形。意図を明示して `42601` にする（TABLE-36、Issue #1613）。
         if self.parse_optional_if_not_exists() {
-            return Err(SqlSurfaceError::unsupported(
-                "CREATE VIEW does not support IF NOT EXISTS",
-            ));
+            return Err(SqlSurfaceError::unsupported(if or_replace {
+                "CREATE OR REPLACE VIEW does not support IF NOT EXISTS"
+            } else {
+                "CREATE VIEW does not support IF NOT EXISTS"
+            }));
         }
         let name = self.expect_ident()?;
         let mut aliases: Vec<String> = Vec::new();
@@ -10692,7 +10713,7 @@ impl<'a> Parser<'a> {
         // （[`validate_create_view_tokens`]）が [`classify_view_body`] で行う。
         // 本文が末尾まで消費し尽くされたことの検証も同関数群が担うため、この
         // Parser 側で追加のトークンを消費する必要はない。
-        Ok((name, aliases, self.remaining()))
+        Ok((name, aliases, self.remaining(), or_replace))
     }
 
     /// `DROP VIEW [IF EXISTS] <name> [CASCADE | RESTRICT] [;]`（TABLE-18・SQL-23・TASK-205、
@@ -11604,9 +11625,17 @@ pub struct ValidatedCreateView {
     /// 列別名リスト（`CREATE VIEW v (a, b) AS ...`。TABLE-41 (1)・Issue #1659）。空なら
     /// 別名なし。構文段で件数上限・リスト内の重複を検査済み（出力列数との突合は実行段）。
     pub(crate) column_aliases: Vec<String>,
+    /// `CREATE OR REPLACE VIEW` か（TABLE-41 (2)・Issue #1660）。真のとき実行段が既存定義との
+    /// 互換性検査を行ったうえで定義を置き換える。
+    pub(crate) or_replace: bool,
 }
 
 impl ValidatedCreateView {
+    /// `CREATE OR REPLACE VIEW` か。
+    pub fn or_replace(&self) -> bool {
+        self.or_replace
+    }
+
     /// 列別名リスト（空なら指定なし）。
     pub fn column_aliases(&self) -> &[String] {
         &self.column_aliases
@@ -11658,7 +11687,7 @@ pub(crate) fn validate_create_view_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedCreateView, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
-    let (name, column_aliases, body_tokens) = p.parse_create_view()?;
+    let (name, column_aliases, body_tokens, or_replace) = p.parse_create_view()?;
     // 判定順序（構文 `42601` → 本文サイズ `54000`）を保つため、本文の構造検証は
     // カタログを照会しない [`StructuralOnlyLookup`] で行う。
     let (base_relation, body_sql) = match classify_view_body(
@@ -11708,6 +11737,7 @@ pub(crate) fn validate_create_view_tokens(
         base_relation,
         body_sql,
         column_aliases,
+        or_replace,
     })
 }
 
@@ -24945,6 +24975,36 @@ mod body_expr_policy_tests {
         let tokens = crate::sql::lexer::tokenize("SELECT * FROM docs").expect("tok");
         let mut body = parse_view_body(&tokens).expect("parse");
         assert!(!rename_column_in_view_body(&mut body, "note", "memo").expect("noop"));
+    }
+
+    /// `CREATE OR REPLACE VIEW` の構文（TABLE-41 (2)・Issue #1660）: 大文字小文字を問わず受理し、
+    /// `OR` 単独・`OR REPLACE` の後が `VIEW` 以外・`IF NOT EXISTS` 併用は `42601`。
+    #[test]
+    fn create_or_replace_view_structural_checks() {
+        let check = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tok");
+            validate_create_view_tokens(&tokens)
+        };
+        assert!(check("create or replace view v as select * from docs")
+            .expect("lower")
+            .or_replace());
+        assert!(check("CREATE OR REPLACE VIEW v (a) AS SELECT x FROM docs")
+            .expect("alias")
+            .or_replace());
+        assert!(!check("CREATE VIEW v AS SELECT * FROM docs")
+            .expect("plain")
+            .or_replace());
+        for bad in [
+            "CREATE OR VIEW v AS SELECT * FROM docs",
+            "CREATE OR REPLACE TABLE v AS SELECT * FROM docs",
+            "CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT * FROM docs",
+            "CREATE OR REPLACE",
+        ] {
+            assert!(
+                matches!(check(bad), Err(SqlSurfaceError::UnsupportedSyntax { .. })),
+                "{bad}"
+            );
+        }
     }
 
     /// `CREATE VIEW v (a, b) AS ...` の列別名リストの構造検証（TABLE-41 (1)・Issue #1659）。

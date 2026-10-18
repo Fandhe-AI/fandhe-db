@@ -235,7 +235,9 @@ fn disallowed_view_body_forms_are_rejected_and_not_persisted() {
         "CREATE VIEW v AS SELECT id FROM docs WHERE lower(lang) = 'ja' LIMIT 5",
         "CREATE VIEW v AS SELECT SUM(id + 1) FROM docs",
         "CREATE VIEW v AS EXPLAIN SELECT * FROM docs LIMIT 5",
-        "CREATE OR REPLACE VIEW v AS SELECT * FROM docs",
+        "CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT * FROM docs",
+        "CREATE OR REPLACE TABLE v AS SELECT * FROM docs",
+        "CREATE OR VIEW v AS SELECT * FROM docs",
         "CREATE VIEW IF NOT EXISTS v AS SELECT * FROM docs",
     ];
     for sql in forms {
