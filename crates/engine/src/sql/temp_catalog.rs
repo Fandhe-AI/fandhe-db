@@ -5,7 +5,7 @@
 //!
 //! - `SessionTempCatalog`: 接続（セッション）ごとの一時表のスキーマ台帳。
 //!   [`crate::sql::mode::SessionState`] が保持するため、他接続・他テナントへ漏れる経路は
-//!   構造上存在しない。永続化しない。行データは持たない（行ストアは #1682）。
+//!   構造上存在しない。永続化しない。行データは持たない（行は `temp_rows` の行ストアが持つ）。
 //! - `ResolvedRelation`・`SessionRelationLookup`: 修飾なしの名前を「一時カタログ →
 //!   永続カタログ」の順に解決する。`sql::allowlist::TableLookup` を包むラッパーで、trait
 //!   自体は変更しない。呼び出し元は `core.rs` の `EngineCore::parse_tokens_in`。
@@ -21,8 +21,9 @@
 //!
 //! # 後続 Issue への申し送り
 //!
-//! 行ストアと切断時の破棄は #1682、`CREATE TEMP TABLE` と `ON COMMIT` は #1683、一時表への
-//! DML・索引・制約とゲートの解除は #1684、テナント境界・crash 耐性の検査は #1685。
+//! 行ストアと切断時の破棄は `temp_rows`（#1682 で実装済み）、`CREATE TEMP TABLE` と
+//! `ON COMMIT` は #1683、一時表への DML・索引・制約とゲートの解除は #1684、
+//! テナント境界・crash 耐性の検査は #1685。
 //! 修飾名（`pg_temp.<名前>`）はスキーマ・`search_path`（TABLE-27）の実装へ申し送る。
 
 // 登録・削除・解決の API は #1683 以降の実行腕から呼ばれる。本 Issue の時点では
@@ -44,13 +45,19 @@ use crate::sql::lexer::Token;
 pub(crate) const DEFAULT_MAX_TEMP_TABLES_PER_SESSION: usize = 64;
 
 /// 一時表のプロセス内で一意な識別子。永続化しない（再起動で採番し直す）。
-/// #1682 の行領域のキーに使う想定で、同名の再作成と区別するために登録ごとに採番する。
+/// `temp_rows` の行領域のキーに使い、同名の再作成と区別するために登録ごとに採番する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TempRelationId(u64);
 
 impl TempRelationId {
     pub(crate) fn get(self) -> u64 {
         self.0
+    }
+
+    /// 行ストア（`temp_rows`）が行領域のテーブル名から復元した値を戻すための生成口。
+    /// 採番は `register` だけが行う（ここで作った値をカタログへ登録する経路は無い）。
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
     }
 }
 
@@ -130,9 +137,10 @@ impl SessionTempCatalog {
         Ok(id)
     }
 
-    /// 一時表を取り除く。存在したかを返す。
-    pub(crate) fn remove(&mut self, name: &str) -> bool {
-        self.tables.remove(name).is_some()
+    /// 一時表を取り除き、その識別子を返す（無ければ `None`）。呼び出し元（#1683 の DROP）は
+    /// 返った識別子で行ストアの `drop_relation` を呼び、行領域を解放する。
+    pub(crate) fn remove(&mut self, name: &str) -> Option<TempRelationId> {
+        self.tables.remove(name).map(|e| e.id)
     }
 }
 
