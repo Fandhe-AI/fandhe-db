@@ -56,6 +56,11 @@ use crate::storage::{Row as StorageRow, Storage, StorageError};
 #[cfg(test)]
 use crate::storage::{RowInput, Visibility};
 
+// DROP の依存オブジェクト列挙層（TABLE-37・Issue #1640）。呼び出し元の `Storage::drop_*`
+// （Issue #1639・#1641）が結線されるまでは単体テストのみが使うため dead_code を許容する。
+#[allow(dead_code)]
+mod dependency;
+
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
 /// エンコードしたバイト列。`ROWS_TABLE`（`storage.rs`）とは別テーブルとし、
 /// カタログの読み書き（TABLE-4/TABLE-5）が行データに触れないようにする。
@@ -989,12 +994,10 @@ fn drop_unique_index_constraint_in_txn(
         .iter()
         .map(|s| s.as_str())
         .collect();
-    for (_referencing_schema, fk) in referencing_foreign_keys_in_txn(write_txn, &def.table)? {
-        let parent_set: std::collections::HashSet<&str> =
-            fk.parent_columns().iter().map(|s| s.as_str()).collect();
-        if parent_set == target_set {
-            return Err(CatalogError::DependentObjectsStillExist(def.name.clone()));
-        }
+    if !foreign_keys_relying_on_unique_columns_in_txn(write_txn, &def.table, &target_set)?
+        .is_empty()
+    {
+        return Err(CatalogError::DependentObjectsStillExist(def.name.clone()));
     }
     let mut constraints = schema.unique_constraints.clone();
     constraints.remove(target_index);
@@ -1008,6 +1011,27 @@ fn drop_unique_index_constraint_in_txn(
     let required = required_key_index_names_in_txn(write_txn, &def.table)?;
     crate::key_index::prune_unneeded_indexes_in_txn(write_txn, &def.table, &required)?;
     Ok(())
+}
+
+/// テーブル `table` を参照先とする `FOREIGN KEY` のうち、参照先列の集合が `target_set` と
+/// 一致するものを返す（自己参照を含む）。一意索引・UNIQUE 制約の削除可否判定
+/// （[`drop_unique_index_constraint_in_txn`]）と、DROP の依存列挙
+/// （`dependency::enumerate_drop_dependents_in_txn`、Issue #1640）が共有する判定の本体で、
+/// 双方の判定がずれないよう集合比較をここだけに置く。呼び出し元は `CATALOG_TABLE` の
+/// ハンドルを保持していない状態で呼ぶこと（[`referencing_foreign_keys_in_txn`] の契約）。
+fn foreign_keys_relying_on_unique_columns_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    target_set: &std::collections::HashSet<&str>,
+) -> Result<Vec<(TableSchema, ForeignKeyDef)>> {
+    Ok(referencing_foreign_keys_in_txn(write_txn, table)?
+        .into_iter()
+        .filter(|(_, fk)| {
+            let parent_set: std::collections::HashSet<&str> =
+                fk.parent_columns().iter().map(|s| s.as_str()).collect();
+            &parent_set == target_set
+        })
+        .collect())
 }
 
 /// `name` が [`INDEX_CATALOG_TABLE`] に索引名として登録済みかを write txn 内で
@@ -3705,21 +3729,38 @@ fn views_depending_on_in_txn(
             ));
         }
         let def = decode_view_def(value.value())?;
-        if def.base_relation == target {
-            dependents.push(key.value().to_string());
-            continue;
-        }
-        // Issue #1192: 評価後射影形本文（JOIN 右辺など）は `base_relation` 以外の
-        // relation も読む。再検証に失敗した本文は fail-closed で「依存あり」とする。
-        let depends = match view_body_shape(&def.body_sql) {
-            Ok(shape) => shape.relations.iter().any(|r| r == target),
-            Err(_) => true,
-        };
-        if depends {
+        if view_def_dependence_on(&def, target) != ViewDependence::No {
             dependents.push(key.value().to_string());
         }
     }
     Ok(dependents)
+}
+
+/// [`view_def_dependence_on`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewDependence {
+    /// `target` を読まない。
+    No,
+    /// `base_relation` または本文が読む relation として `target` を参照する。
+    Direct,
+    /// 本文を再検証できず、`target` を読まないと言い切れないため fail-closed で依存とみなす。
+    Unverifiable,
+}
+
+/// ビュー定義 `def` が relation `target` に依存するかを判定する
+/// （[`views_depending_on_in_txn`] と DROP の依存列挙〔`dependency`、Issue #1640〕が共有する。
+/// 判定がずれると DROP の拒否と列挙結果が食い違うため、本体をここだけに置く）。
+/// Issue #1192: 評価後射影形本文（JOIN 右辺など）は `base_relation` 以外の relation も読む。
+/// 再検証に失敗した本文は fail-closed で依存あり（[`ViewDependence::Unverifiable`]）とする。
+fn view_def_dependence_on(def: &ViewDef, target: &str) -> ViewDependence {
+    if def.base_relation == target {
+        return ViewDependence::Direct;
+    }
+    match view_body_shape(&def.body_sql) {
+        Ok(shape) if shape.relations.iter().any(|r| r == target) => ViewDependence::Direct,
+        Ok(_) => ViewDependence::No,
+        Err(_) => ViewDependence::Unverifiable,
+    }
 }
 
 /// `table` を（直接または連鎖したビュー経由で）参照するビューのいずれかが、
@@ -12979,7 +13020,10 @@ fn dependent_tables_in_txn(
     write_txn: &redb::WriteTransaction,
     type_name: &str,
 ) -> Result<Vec<String>> {
-    let table = match write_txn.open_table(CATALOG_TABLE) {
+    // 読み取り専用オープン（欠落時に空のカタログ表を作らない。依存列挙
+    // `catalog::dependency` の read-only 契約を commit 後も保つため。Issue #1640）。
+    let table = match crate::storage::read_source::ReadSource::open_table(write_txn, CATALOG_TABLE)
+    {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
