@@ -216,7 +216,8 @@ fn truncate_response_is_identical_regardless_of_other_tenant_row_count() {
     }
 }
 
-/// RECOVER-1: `operation_id` 句の省略（明示 `NULL` を含む）は `Ledgered`（既定）
+/// RECOVER-1: `operation_id` 句の省略（明示 `NULL` を含む）は
+/// `Ledgered`（`--require-operation-id`）
 /// 構成では `23502` で書き込みトランザクション開始前に拒否される。
 #[test]
 fn truncate_missing_operation_id_is_rejected_with_23502_before_any_write() {

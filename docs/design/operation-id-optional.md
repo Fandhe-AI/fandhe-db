@@ -36,6 +36,7 @@
 - 省略した書き込み（句の欠落・明示 `NULL`）は `LedgerWrite::Omitted` に写像し、台帳にもジョブ表にも触れない通常の書き込みとして実行する（再送の検出はしない）。指定した場合の記録・重複拒否（`23505`）・内容不一致（`22023`）・照会は不変
 - `LedgerWrite::Disabled`（台帳テーブルを持たない構成）は流用しない。意味が異なり、分割実行器が `op_id()==None` を `0A000` に写すため、`23502` という契約とずれるため
 - 分割実行 DML は構成に関わらず operation_id 必須（`require_partitioned`）。SQL 検証（述語形 UPDATE／DELETE。`EXPLAIN ... PARTITIONED` を含む）・NoSQL から呼ばれる engine 入口・共通本体の 3 箇所で検査し、実行器の `0A000` は最後の防御として残す。構成が `CompareOnlyWithoutLedger` でも `23502` になる
+- 省略した書き込みは台帳に触れないため `last_op`（RECOVER-7 の `last_operation_id` 照会）を更新しない。照会の対象は指定付き書き込みのみで、省略書き込みの後も直前の指定付き operation_id を返す（最終書き込みとは限らない）
 - 切り替えは起動時のフラグのみ。セッション・SQL からは変更できない
 - 既定に依存して省略の拒否を検証していた既存テストは `LedgerMode::Ledgered`（またはバイナリ起動時の `--require-operation-id`）を明示して固定した（アサーションは変更していない）
 - 保護が必要な運用（冪等な再送を前提とするクライアント）は `--require-operation-id` を使う
