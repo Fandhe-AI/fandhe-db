@@ -604,7 +604,7 @@ fn deleting_referenced_rows_is_rejected_until_referencing_rows_are_gone() {
             &alice,
             "TRUNCATE TABLE parents USING OPERATION_ID 'op-t1'"
         ),
-        "23503"
+        "0A000"
     );
     assert_eq!(row_count(&core, &alice, "parents"), 2);
     // 参照されていない行は削除できる。
@@ -618,16 +618,27 @@ fn deleting_referenced_rows_is_rejected_until_referencing_rows_are_gone() {
         &alice,
         "DELETE FROM children WHERE id = 1 USING OPERATION_ID 'op-d4'",
     );
+    // RESTRICT はカタログ宣言だけで判定するため、子の行が無くなっても拒否のまま
+    // （Issue #1644）。CASCADE なら通る。
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "TRUNCATE TABLE parents USING OPERATION_ID 'op-t2'"
+        ),
+        "0A000"
+    );
     ok(
         &core,
         &alice,
-        "TRUNCATE TABLE parents USING OPERATION_ID 'op-t2'",
+        "TRUNCATE TABLE parents CASCADE USING OPERATION_ID 'op-t3'",
     );
     assert_eq!(row_count(&core, &alice, "parents"), 0);
 }
 
 /// 参照整合性の判定はテナントごとに独立: alice の参照元行は bob の同じ `id` の
-/// 参照先行の削除・TRUNCATE を阻止しない（他テナントの行は走査対象外）。
+/// 参照先行の削除・TRUNCATE CASCADE を阻止せず、bob の CASCADE は alice の子行に触れない
+/// （他テナントの行は走査対象外）。RESTRICT の TRUNCATE は行の有無に依存せず `0A000`。
 #[test]
 fn other_tenant_referencing_rows_do_not_block_parent_changes() {
     let (core, path) = new_core("fk-tenant-isolation");
@@ -654,11 +665,20 @@ fn other_tenant_referencing_rows_do_not_block_parent_changes() {
         &bob,
         "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-d-b'",
     );
+    assert_eq!(
+        err_code(
+            &core,
+            &bob,
+            "TRUNCATE TABLE parents USING OPERATION_ID 'op-t-b0'"
+        ),
+        "0A000"
+    );
     ok(
         &core,
         &bob,
-        "TRUNCATE TABLE parents USING OPERATION_ID 'op-t-b'",
+        "TRUNCATE TABLE parents CASCADE USING OPERATION_ID 'op-t-b'",
     );
+    assert_eq!(row_count(&core, &alice, "children"), 1);
     // alice 側は依然として阻止され、alice の参照先行は残っている。
     assert_eq!(
         err_code(
@@ -1029,7 +1049,7 @@ fn explicit_transaction_sees_its_own_parent_rows_and_rejects_violations() {
             "TRUNCATE TABLE parents USING OPERATION_ID 'op-t'",
         )
         .expect_err("truncating a referenced table inside a transaction must fail");
-    assert_eq!(err.wire_code(), "23503");
+    assert_eq!(err.wire_code(), "0A000");
     core.execute_sql_in_txn(&alice, &mut session, &mut txn, "ROLLBACK")
         .expect("rollback");
 
@@ -1446,9 +1466,11 @@ fn commit_duration_limit_is_judged_before_deferred_foreign_key_check() {
     assert_eq!(row_count(&core, &alice, "c"), 0);
 }
 
-/// R1: 親を `TRUNCATE` してから同じキーで再挿入した場合、COMMIT 時点の事後
-/// 状態だけを見るため成功する。`TRUNCATE` だけで終えた場合は COMMIT が違反に
-/// なり、親の行は残る（TABLE-17・TASK-205、Issue #1077）。
+/// R1（Issue #1644 で改訂）: 親表だけの `TRUNCATE`（RESTRICT）は遅延 FK でも文の実行時点で
+/// `0A000`（カタログ宣言だけで判定。遅延させない）。`CASCADE` は参照元の表も空にして
+/// COMMIT 時の遅延検査の対象に含め（`mark_written`）、再挿入後の事後状態だけを見て成功する。
+/// 連鎖で空にした表に残った違反はなく、COMMIT 時の遅延検査自体は引き続き働く
+/// （TABLE-17・TASK-205、Issue #1077）。
 #[test]
 fn deferred_foreign_key_checks_post_commit_state_around_truncate() {
     let (core, path) = new_core("fk-deferred-truncate");
@@ -1472,35 +1494,61 @@ fn deferred_foreign_key_checks_post_commit_state_around_truncate() {
         "INSERT INTO c (id, parent_id) VALUES (1, 1) USING OPERATION_ID 'op-c0'",
     );
 
-    // シナリオ 1: TRUNCATE してから同じキーで再挿入 → COMMIT 成功。
+    // シナリオ 1: CASCADE で両表を空にして親を再挿入 → COMMIT 成功（子は空のまま）。
     let mut session = SessionState::default();
     let mut txn = core.new_session_transaction();
     for sql in [
         "BEGIN",
-        "TRUNCATE TABLE p USING OPERATION_ID 'op-t1'",
+        "TRUNCATE TABLE p CASCADE USING OPERATION_ID 'op-t1'",
         "INSERT INTO p (id, name) VALUES (1, 'p2') USING OPERATION_ID 'op-p1'",
         "COMMIT",
     ] {
         core.execute_sql_in_txn(&alice, &mut session, &mut txn, sql)
             .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
     }
-    assert_eq!(row_count(&core, &alice, "c"), 1);
+    assert_eq!(row_count(&core, &alice, "p"), 1);
+    assert_eq!(row_count(&core, &alice, "c"), 0);
 
-    // シナリオ 2: TRUNCATE のみ → COMMIT が違反、親行は残る。
+    // シナリオ 2: RESTRICT は遅延 FK でも文の実行時点で 0A000。親行は残る。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO c (id, parent_id) VALUES (1, 1) USING OPERATION_ID 'op-c1'",
+    );
     core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    core.execute_sql_in_txn(
-        &alice,
-        &mut session,
-        &mut txn,
-        "TRUNCATE TABLE p USING OPERATION_ID 'op-t2'",
-    )
-    .expect("truncate must succeed at statement time (check is deferred)");
+    let err = core
+        .execute_sql_in_txn(
+            &alice,
+            &mut session,
+            &mut txn,
+            "TRUNCATE TABLE p USING OPERATION_ID 'op-t2'",
+        )
+        .expect_err("RESTRICT must reject at statement time even for a deferred FK");
+    assert_eq!(err.wire_code(), "0A000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(row_count(&core, &alice, "p"), 1);
+    assert_eq!(row_count(&core, &alice, "c"), 1);
+
+    // シナリオ 3: CASCADE の後に宙に浮く参照を作れば、COMMIT 時の遅延検査が違反にする
+    // （連鎖で空にした表も検査対象に入っている）。
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    for sql in [
+        "TRUNCATE TABLE p CASCADE USING OPERATION_ID 'op-t3'",
+        "INSERT INTO c (id, parent_id) VALUES (2, 999) USING OPERATION_ID 'op-c2'",
+    ] {
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+    }
     let err = core
         .execute_sql_in_txn(&alice, &mut session, &mut txn, "COMMIT")
-        .expect_err("COMMIT must fail: the deferred child row would dangle");
+        .expect_err("COMMIT must fail: the deferred child row dangles");
     assert_eq!(err.wire_code(), "23503");
     assert_eq!(row_count(&core, &alice, "p"), 1);
+    assert_eq!(row_count(&core, &alice, "c"), 1);
 }
 
 /// 自己参照の遅延 FK は、後から挿入される行を先に参照しても COMMIT 時点の
@@ -1635,7 +1683,7 @@ fn deferred_foreign_key_commit_violation_does_not_reveal_other_tenant_rows() {
             .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
     }
 
-    // bob の `TRUNCATE TABLE p`・COMMIT は、alice が今テナント境界を越えて
+    // bob の `TRUNCATE TABLE p CASCADE`（RESTRICT は行の有無に依らず 0A000。Issue #1644）・COMMIT は、alice が今テナント境界を越えて
     // bob の id 1 を（もう存在しないダングリング参照として）指す子行
     // （`c.id=1`）を残していても成功する——COMMIT 時の逆引き走査が bob
     // 自身のテナント範囲に閉じており、alice の行を「参照元」として拾わない
@@ -1646,7 +1694,7 @@ fn deferred_foreign_key_commit_violation_does_not_reveal_other_tenant_rows() {
     let mut bob_txn = core.new_session_transaction();
     for sql in [
         "BEGIN",
-        "TRUNCATE TABLE p USING OPERATION_ID 'op-bob-t'",
+        "TRUNCATE TABLE p CASCADE USING OPERATION_ID 'op-bob-t'",
         "COMMIT",
     ] {
         core.execute_sql_in_txn(&bob, &mut bob_session, &mut bob_txn, sql)
@@ -1657,7 +1705,7 @@ fn deferred_foreign_key_commit_violation_does_not_reveal_other_tenant_rows() {
 }
 
 /// P0 回帰: `MATCH FULL`／`DEFERRABLE` 宣言を持つ FK（カタログ v9）は、
-/// 通常の（オプション既定の）FK と同じく `DELETE`／`TRUNCATE`（`23503`）・
+/// 通常の（オプション既定の）FK と同じく `DELETE`（`23503`）／`TRUNCATE`（`0A000`。Issue #1644）・
 /// `DROP TABLE`（`2BP01`）・子の `DROP COLUMN`（依存エラー）の逆引き検査が効く
 /// （`catalog::referencing_foreign_keys_in_txn` の v9 対応。TABLE-17・TASK-205、
 /// Issue #1077）。v9 をこの逆引きが見落とすと、これらすべてが fail-open になる。
@@ -1693,7 +1741,7 @@ fn v9_catalog_children_are_covered_by_reverse_lookup_checks() {
     );
     assert_eq!(
         err_code(&core, &alice, "TRUNCATE TABLE p USING OPERATION_ID 'op-t'"),
-        "23503"
+        "0A000"
     );
     assert_eq!(err_code(&core, &sys, "DROP TABLE p"), "2BP01");
     drop(core);

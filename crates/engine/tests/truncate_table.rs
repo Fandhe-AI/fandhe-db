@@ -518,15 +518,15 @@ fn truncate_single_and_deduplicated_forms_share_ledger_content() {
     assert_eq!(err.wire_code(), "23505");
 }
 
-/// 拡張句（`CASCADE`／`RESTRICT`／`RESTART IDENTITY`）は後続 Issue の範囲で、
-/// 引き続き `42601`。
+/// 拡張句のうち `RESTART IDENTITY` は後続 Issue の範囲で、引き続き `42601`
+/// （`CASCADE`／`RESTRICT` は Issue #1644 で受理する）。
 #[test]
 fn truncate_extension_clauses_remain_rejected() {
     let (core, path) = new_core_with_tables();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice", true);
     let mut session = SessionState::default();
-    for clause in ["CASCADE", "RESTRICT", "RESTART IDENTITY"] {
+    for clause in ["RESTART IDENTITY", "CASCADE RESTRICT"] {
         let err = core
             .execute_sql_in_session(
                 &alice,
@@ -816,9 +816,8 @@ fn assert_parents_untouched(core: &EngineCore, alice: &PolicyContext, bob: &Poli
     );
 }
 
-/// SQL-22（TABLE-17 との相互作用）: TRUNCATE は行削除後に FK 検査で `23503`
-/// になる経路があるが、その write txn 全体が abort し副作用が一切残らない
-/// （行・一意索引・台帳）。再オープン後も同じ。
+/// SQL-48 (2) x TABLE-17: 参照される親表だけの TRUNCATE（RESTRICT）はカタログ宣言だけで
+/// `0A000` になり、副作用が一切残らない（行・一意索引・台帳）。再オープン後も同じ。
 #[test]
 fn truncate_aborted_by_fk_violation_leaves_no_side_effects_even_after_reopen() {
     let path = unique_db_path("truncate-table-1200-abort");
@@ -851,7 +850,7 @@ fn truncate_aborted_by_fk_violation_leaves_no_side_effects_even_after_reopen() {
                 &alice,
                 "TRUNCATE TABLE parents USING OPERATION_ID 'op-abort'"
             ),
-            "23503"
+            "0A000"
         );
         assert_parents_untouched(&core, &alice, &bob);
     }
@@ -861,17 +860,12 @@ fn truncate_aborted_by_fk_violation_leaves_no_side_effects_even_after_reopen() {
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     assert_parents_untouched(&core, &alice, &bob);
 
-    // 台帳が書かれていない証明: 子行を消せば同じ operation_id で成功する
-    // （abort 済み txn の台帳記録が残っていれば 23505 になる）。
-    sql_ok(
-        &core,
-        &alice,
-        "DELETE FROM children WHERE id = 1 USING OPERATION_ID 'op-cd'",
-    );
+    // 台帳が書かれていない証明: 子も指定すれば同じ operation_id で成功する
+    // （abort 済み txn の台帳記録が残っていれば、内容の違う再利用で 22023 になる）。
     let outcome = sql_ok(
         &core,
         &alice,
-        "TRUNCATE TABLE parents USING OPERATION_ID 'op-abort'",
+        "TRUNCATE TABLE parents, children USING OPERATION_ID 'op-abort'",
     );
     assert!(matches!(outcome, SqlOutcome::Truncate(_)));
     assert!(sql_ids(&core, &alice, "SELECT id FROM parents LIMIT 100").is_empty());
@@ -881,7 +875,7 @@ fn truncate_aborted_by_fk_violation_leaves_no_side_effects_even_after_reopen() {
     );
 }
 /// SQL-48 (4) x TABLE-17: 親子を同じ文で指定すれば、子に自テナントの行があっても
-/// `23503` にならず両表が空になる。親だけを指定した場合は従来どおり `23503`。
+/// 拒否されず両表が空になる。親だけを指定した場合は `0A000`（Issue #1644）。
 #[test]
 fn truncate_parent_and_child_in_one_statement_succeeds_but_parent_alone_is_rejected() {
     let path = unique_db_path("truncate-table-1643-fk");
@@ -915,7 +909,7 @@ fn truncate_parent_and_child_in_one_statement_succeeds_but_parent_alone_is_rejec
             &alice,
             "TRUNCATE parents USING OPERATION_ID 'op-fk-1'"
         ),
-        "23503"
+        "0A000"
     );
     assert_eq!(
         sql_ids(&core, &alice, "SELECT id FROM parents LIMIT 10"),
@@ -951,8 +945,8 @@ fn truncate_parent_and_child_in_one_statement_succeeds_but_parent_alone_is_rejec
     );
 }
 
-/// 原子性（FK）: 複数テーブル文の途中で `23503` になれば、先に並べた表の行も残り、
-/// 台帳も書かれない。
+/// 原子性（FK）: 複数テーブル文が RESTRICT の `0A000` で拒否されれば、先に並べた表の行も
+/// 残り、台帳も書かれない。
 #[test]
 fn truncate_multi_aborted_by_fk_violation_keeps_all_tables() {
     let path = unique_db_path("truncate-table-1643-fk-abort");
@@ -984,7 +978,7 @@ fn truncate_multi_aborted_by_fk_violation_keeps_all_tables() {
             &alice,
             "TRUNCATE loose, parents USING OPERATION_ID 'op-abort-multi'"
         ),
-        "23503"
+        "0A000"
     );
     assert_eq!(
         sql_ids(&core, &alice, "SELECT id FROM loose LIMIT 10"),
@@ -994,16 +988,294 @@ fn truncate_multi_aborted_by_fk_violation_keeps_all_tables() {
         sql_ids(&core, &alice, "SELECT id FROM parents LIMIT 10"),
         vec![1]
     );
-    // 台帳が書かれていない: 子を消せば同じ operation_id で成功する。
+    // 台帳が書かれていない: 子も指定すれば同じ operation_id で成功する。
     sql_ok(
         &core,
         &alice,
-        "DELETE FROM children WHERE id = 1 USING OPERATION_ID 'op-cd'",
-    );
-    sql_ok(
-        &core,
-        &alice,
-        "TRUNCATE loose, parents USING OPERATION_ID 'op-abort-multi'",
+        "TRUNCATE loose, parents, children USING OPERATION_ID 'op-abort-multi'",
     );
     assert!(sql_ids(&core, &alice, "SELECT id FROM loose LIMIT 10").is_empty());
+}
+// --- Issue #1644: TRUNCATE CASCADE／RESTRICT（SQL-48 (2)） ---------------------
+
+/// 親 ← 子 ← 孫 の 3 段の FK 連鎖を作る（`create_fk_pair` に孫を足す）。
+fn create_fk_chain(core: &EngineCore) {
+    create_fk_pair(core);
+    sql_ok(
+        core,
+        &ctx_for("sys", true),
+        "CREATE TABLE grandchildren (child_id BIGINT REFERENCES children, note TEXT)",
+    );
+}
+
+/// 親・子・孫を 1 行ずつ入れる（`tag` は operation_id の重複回避用）。
+fn seed_fk_chain(core: &EngineCore, ctx: &PolicyContext, tag: &str) {
+    let t = ctx.tenant_id();
+    for (sql, label) in [
+        ("INSERT INTO parents (id, code) VALUES (1, 'c1')", "p"),
+        ("INSERT INTO children (id, parent_id) VALUES (1, 1)", "c"),
+        (
+            "INSERT INTO grandchildren (id, child_id) VALUES (1, 1)",
+            "g",
+        ),
+    ] {
+        sql_ok(
+            core,
+            ctx,
+            &format!("{sql} USING OPERATION_ID 'seed-{label}-{t}-{tag}'"),
+        );
+    }
+}
+
+fn ids_of(core: &EngineCore, ctx: &PolicyContext, table: &str) -> Vec<u64> {
+    sql_ids(core, ctx, &format!("SELECT id FROM {table} LIMIT 10"))
+}
+
+fn open_core(label: &str) -> (EngineCore, CleanupGuard, std::path::PathBuf) {
+    let path = unique_db_path(label);
+    let guard = CleanupGuard(path.clone());
+    let core = EngineCore::from_storage(
+        Storage::open(&path).expect("open storage"),
+        Box::new(CpuScalarProvider),
+    );
+    (core, guard, path)
+}
+
+/// RESTRICT（省略・明示とも）は、参照元の行が自テナントに無くても・他テナントにしか
+/// 無くても同じ `0A000` で拒否する（カタログ宣言だけで判定し、存在オラクルにならない）。
+#[test]
+fn truncate_restrict_rejects_by_catalog_declaration_regardless_of_rows() {
+    let (core, _guard, _path) = open_core("truncate-table-1644-restrict");
+    let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
+    create_fk_pair(&core);
+    sql_ok(
+        &core,
+        &alice,
+        "INSERT INTO parents (id, code) VALUES (1, 'c1') USING OPERATION_ID 'op-pa-only'",
+    );
+
+    // 参照元の行がどこにも無い場合。
+    let mut messages = Vec::new();
+    for sql in [
+        "TRUNCATE parents USING OPERATION_ID 'op-r-1'",
+        "TRUNCATE parents RESTRICT USING OPERATION_ID 'op-r-2'",
+    ] {
+        let mut session = SessionState::default();
+        let err = core
+            .execute_sql_in_session(&alice, &mut session, sql)
+            .expect_err("restrict must reject");
+        assert_eq!(err.wire_code(), "0A000", "{sql}");
+        messages.push(err.to_string());
+    }
+    assert_eq!(ids_of(&core, &alice, "parents"), vec![1]);
+
+    // 他テナントにだけ参照元の行がある場合も、応答は同一。
+    sql_ok(
+        &core,
+        &bob,
+        "INSERT INTO parents (id, code) VALUES (1, 'c1') USING OPERATION_ID 'op-bp'",
+    );
+    sql_ok(
+        &core,
+        &bob,
+        "INSERT INTO children (id, parent_id) VALUES (1, 1) USING OPERATION_ID 'op-bc'",
+    );
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            "TRUNCATE parents USING OPERATION_ID 'op-r-3'",
+        )
+        .expect_err("restrict must reject");
+    assert_eq!(err.wire_code(), "0A000");
+    assert_eq!(
+        Some(&err.to_string()),
+        messages.first(),
+        "response must not depend on other tenants' rows"
+    );
+    assert_eq!(ids_of(&core, &bob, "children"), vec![1]);
+
+    // 拒否は台帳を残さない: 同じ operation_id を CASCADE の別内容で使っても 22023 にならない。
+    sql_ok(
+        &core,
+        &alice,
+        "TRUNCATE parents CASCADE USING OPERATION_ID 'op-r-1'",
+    );
+    assert!(ids_of(&core, &alice, "parents").is_empty());
+}
+
+/// CASCADE は参照元を推移的に空にし（自テナントのみ）、連鎖した表を結果で返す。
+/// 台帳は連鎖した表にも記録される。
+#[test]
+fn truncate_cascade_empties_referencing_tables_transitively_for_own_tenant_only() {
+    let (core, _guard, _path) = open_core("truncate-table-1644-cascade");
+    let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
+    create_fk_chain(&core);
+    seed_fk_chain(&core, &alice, "a");
+    seed_fk_chain(&core, &bob, "a");
+
+    let outcome = sql_ok(
+        &core,
+        &alice,
+        "TRUNCATE parents CASCADE USING OPERATION_ID 'op-casc'",
+    );
+    match outcome {
+        SqlOutcome::Truncate(o) => assert_eq!(o.cascaded(), ["children", "grandchildren"]),
+        other => panic!("expected Truncate outcome, got {other:?}"),
+    }
+    for table in ["parents", "children", "grandchildren"] {
+        assert!(ids_of(&core, &alice, table).is_empty(), "{table}");
+        assert_eq!(ids_of(&core, &bob, table), vec![1], "bob {table}");
+    }
+
+    // 同一 operation_id・同一内容の再送は 23505。
+    assert_eq!(
+        sql_err_code(
+            &core,
+            &alice,
+            "TRUNCATE parents CASCADE USING OPERATION_ID 'op-casc'"
+        ),
+        "23505"
+    );
+    // 連鎖した表にも台帳が記録されている（内容が違えば 22023）。
+    assert_eq!(
+        sql_err_code(
+            &core,
+            &alice,
+            "TRUNCATE grandchildren USING OPERATION_ID 'op-casc'"
+        ),
+        "22023"
+    );
+    // CASCADE の表集合は利用者が書いた表で決まる（別の表集合は 22023）。
+    assert_eq!(
+        sql_err_code(
+            &core,
+            &alice,
+            "TRUNCATE children CASCADE USING OPERATION_ID 'op-casc'"
+        ),
+        "22023"
+    );
+}
+
+/// 明示した表どうしの参照は RESTRICT でも通り連鎖した表は無い。CASCADE は書いていない
+/// 参照元だけを `cascaded()` に入れる。
+#[test]
+fn truncate_explicit_referencing_tables_need_no_cascade() {
+    let (core, _guard, _path) = open_core("truncate-table-1644-explicit");
+    let alice = ctx_for("alice", true);
+    create_fk_chain(&core);
+    seed_fk_chain(&core, &alice, "a");
+
+    match sql_ok(
+        &core,
+        &alice,
+        "TRUNCATE parents, children, grandchildren USING OPERATION_ID 'op-ex-1'",
+    ) {
+        SqlOutcome::Truncate(o) => assert!(o.cascaded().is_empty()),
+        other => panic!("expected Truncate outcome, got {other:?}"),
+    }
+    seed_fk_chain(&core, &alice, "b");
+    match sql_ok(
+        &core,
+        &alice,
+        "TRUNCATE parents, children CASCADE USING OPERATION_ID 'op-ex-2'",
+    ) {
+        SqlOutcome::Truncate(o) => assert_eq!(o.cascaded(), ["grandchildren"]),
+        other => panic!("expected Truncate outcome, got {other:?}"),
+    }
+    assert!(ids_of(&core, &alice, "grandchildren").is_empty());
+}
+
+/// 明示トランザクション: CASCADE で連鎖した表も COMMIT で確定し、ROLLBACK で全表が戻る。
+#[test]
+fn truncate_cascade_in_explicit_transaction_commits_and_rolls_back_all_tables() {
+    let (core, _guard, _path) = open_core("truncate-table-1644-txn");
+    let alice = ctx_for("alice", true);
+    create_fk_chain(&core);
+    seed_fk_chain(&core, &alice, "a");
+
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    for sql in [
+        "BEGIN",
+        "TRUNCATE parents CASCADE USING OPERATION_ID 'op-tx-1'",
+        "ROLLBACK",
+    ] {
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+    }
+    for table in ["parents", "children", "grandchildren"] {
+        assert_eq!(ids_of(&core, &alice, table), vec![1], "{table} rollback");
+    }
+
+    for sql in [
+        "BEGIN",
+        "TRUNCATE parents CASCADE USING OPERATION_ID 'op-tx-2'",
+        "COMMIT",
+    ] {
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+    }
+    for table in ["parents", "children", "grandchildren"] {
+        assert!(ids_of(&core, &alice, table).is_empty(), "{table} commit");
+    }
+
+    // RESTRICT は明示トランザクション内でも文の実行時点で 0A000。
+    seed_fk_chain(&core, &alice, "b");
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(
+            &alice,
+            &mut session,
+            &mut txn,
+            "TRUNCATE parents USING OPERATION_ID 'op-tx-3'",
+        )
+        .expect_err("restrict must reject");
+    assert_eq!(err.wire_code(), "0A000");
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(ids_of(&core, &alice, "parents"), vec![1]);
+}
+
+/// CASCADE の結果は再オープン後も永続し、拒否された RESTRICT は何も残さない。
+#[test]
+fn truncate_cascade_is_durable_after_reopen() {
+    let (core, _guard, path) = open_core("truncate-table-1644-reopen");
+    let alice = ctx_for("alice", true);
+    create_fk_chain(&core);
+    seed_fk_chain(&core, &alice, "a");
+    assert_eq!(
+        sql_err_code(
+            &core,
+            &alice,
+            "TRUNCATE parents USING OPERATION_ID 'op-d-1'"
+        ),
+        "0A000"
+    );
+    sql_ok(
+        &core,
+        &alice,
+        "TRUNCATE parents CASCADE USING OPERATION_ID 'op-d-2'",
+    );
+    drop(core);
+
+    let core = EngineCore::from_storage(
+        Storage::open(&path).expect("reopen storage"),
+        Box::new(CpuScalarProvider),
+    );
+    for table in ["parents", "children", "grandchildren"] {
+        assert!(ids_of(&core, &alice, table).is_empty(), "{table}");
+    }
+    assert_eq!(
+        sql_err_code(
+            &core,
+            &alice,
+            "TRUNCATE parents CASCADE USING OPERATION_ID 'op-d-2'"
+        ),
+        "23505"
+    );
 }
