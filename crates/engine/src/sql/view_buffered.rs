@@ -199,10 +199,60 @@ pub(crate) fn plan_outer(
     view: &ValidatedBufferedView,
     udfs: &UdfRegistry,
 ) -> Result<OuterPlan, SqlSurfaceError> {
+    // 列別名付きビュー（TABLE-41 (1)・Issue #1659）の層は、外側の束縛より前に本文の結果列を
+    // 先頭から改名する。Describe と Execute はどちらもこの入口を通るため列名が一致する。
+    let renamed;
+    let body_columns = if view.column_aliases.is_empty() {
+        body_columns
+    } else {
+        renamed = rename_body_columns(body_columns, &view.column_aliases)?;
+        renamed.as_slice()
+    };
     match &view.outer {
         BufferedOuter::Rows(rows) => plan_rows(body_columns, &view.view_name, rows, udfs),
         BufferedOuter::Aggregate(agg) => plan_aggregate(body_columns, agg, udfs),
     }
+}
+
+/// 本文の結果列を先頭から `aliases` で改名した列メタデータを返す（型・値は変えない）。
+/// 別名が結果列より多ければ `42601`（作成時の突合と参照時の列数変化の双方を塞ぐ。fail-closed）。
+fn rename_body_columns(
+    body_columns: &[ColumnMeta],
+    aliases: &[String],
+) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+    if aliases.len() > body_columns.len() {
+        return Err(SqlSurfaceError::unsupported(
+            "view column alias list is longer than the view's output columns",
+        ));
+    }
+    let renamed: Vec<ColumnMeta> = body_columns
+        .iter()
+        .enumerate()
+        .map(|(i, meta)| match (aliases.get(i), meta) {
+            (None, _) => meta.clone(),
+            (Some(alias), ColumnMeta::Id | ColumnMeta::AliasedId { .. }) => {
+                super::exec::aliased_id_column_meta(alias)
+            }
+            (Some(alias), ColumnMeta::Scalar { ty, .. }) => ColumnMeta::Scalar {
+                name: alias.clone(),
+                ty: ty.clone(),
+            },
+            (Some(alias), ColumnMeta::Computed { ty, .. }) => ColumnMeta::Computed {
+                name: alias.clone(),
+                ty: ty.clone(),
+            },
+        })
+        .collect();
+    // 改名後の全列名の重複は曖昧なまま通さず拒否する（`42702`。単純形経路と同じ fail-closed。
+    // 作成後に基底表へ列が追加されて重複が生じる場合も塞ぐ）。
+    let mut seen: HashSet<&str> = HashSet::with_capacity(renamed.len());
+    for meta in &renamed {
+        let name = column_name(meta);
+        if !seen.insert(name) {
+            return Err(SqlSurfaceError::ambiguous_column(name));
+        }
+    }
+    Ok(renamed)
 }
 
 fn plan_rows(
@@ -430,6 +480,7 @@ fn bind_scan_plan(
         window_items: rows.window_items.clone(),
         scalar_subquery_items: Vec::new(),
         order_keys: rows.order_keys.clone(),
+        physical_order_keys: Vec::new(),
     };
     let bound = super::parser::bind_scan(&scan, &schema, udfs)?;
     Ok(ScanPlan {
@@ -916,6 +967,7 @@ mod tests {
                 limit_explicit: true,
                 offset,
             })),
+            column_aliases: Vec::new(),
         }
     }
 
@@ -1192,6 +1244,7 @@ mod tests {
                 where_predicates,
                 group_by: None,
             })),
+            column_aliases: Vec::new(),
         }
     }
 
@@ -1302,6 +1355,7 @@ mod tests {
                 limit_explicit: true,
                 offset: 0,
             })),
+            column_aliases: Vec::new(),
         };
         let out = run(result(), &mk(vec![expr_key("a", true)])).unwrap();
         let ids: Vec<u64> = out.rows.iter().map(|r| r.id).collect();

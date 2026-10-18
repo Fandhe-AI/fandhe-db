@@ -916,7 +916,32 @@ fn rename_predicate_column(
     old: &str,
     new: &str,
 ) -> Result<WherePredicate, SqlSurfaceError> {
-    let col = |c: &String| if c == old { new.to_string() } else { c.clone() };
+    map_predicate_columns(
+        predicate,
+        &|c| {
+            if c == old {
+                new.to_string()
+            } else {
+                c.to_string()
+            }
+        },
+        &|| {
+            SqlSurfaceError::unsupported("subquery predicates are not allowed in CHECK constraints")
+        },
+    )
+}
+
+/// 宣言的述語 1 件の列名参照を写像 `f` で置換した複製を返す（CHECK の列改名と、ビューの
+/// 列別名の物理名への書き換え〔`sql::view_alias`。TABLE-41・Issue #1659〕が共有する唯一の
+/// 走査器。第 2 の走査器を作らない）。`f` は 1 回の走査で全列に一括適用されるため、
+/// 列名の入れ替え（a→b かつ b→a）でも連鎖置換が起きない。`match` は網羅（`_` を使わない）。
+/// サブクエリ系の述語は列の写像が内側へ及ばないため `on_subquery` のエラーで拒否する。
+pub(crate) fn map_predicate_columns(
+    predicate: &WherePredicate,
+    f: &dyn Fn(&str) -> String,
+    on_subquery: &dyn Fn() -> SqlSurfaceError,
+) -> Result<WherePredicate, SqlSurfaceError> {
+    let col = |c: &String| f(c);
     Ok(match predicate {
         WherePredicate::Equality { column, value } => WherePredicate::Equality {
             column: col(column),
@@ -929,9 +954,7 @@ fn rename_predicate_column(
         WherePredicate::PredicateCall { name } => {
             WherePredicate::PredicateCall { name: name.clone() }
         }
-        WherePredicate::Expression(expr) => {
-            WherePredicate::Expression(rename_expr_idents(expr, old, new))
-        }
+        WherePredicate::Expression(expr) => WherePredicate::Expression(map_expr_idents(expr, f)),
         WherePredicate::BoolEquality { column, value } => WherePredicate::BoolEquality {
             column: col(column),
             value: *value,
@@ -958,7 +981,7 @@ fn rename_predicate_column(
             negated: *negated,
         },
         WherePredicate::Not(inner) => {
-            WherePredicate::Not(Box::new(rename_predicate_column(inner, old, new)?))
+            WherePredicate::Not(Box::new(map_predicate_columns(inner, f, on_subquery)?))
         }
         WherePredicate::Or(branches) => WherePredicate::Or(
             branches
@@ -966,7 +989,7 @@ fn rename_predicate_column(
                 .map(|branch| {
                     branch
                         .iter()
-                        .map(|p| rename_predicate_column(p, old, new))
+                        .map(|p| map_predicate_columns(p, f, on_subquery))
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -977,25 +1000,16 @@ fn rename_predicate_column(
         },
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
-        | WherePredicate::ScalarSubqueryCompare { .. } => {
-            return Err(SqlSurfaceError::unsupported(
-                "subquery predicates are not allowed in CHECK constraints",
-            ))
-        }
+        | WherePredicate::ScalarSubqueryCompare { .. } => return Err(on_subquery()),
     })
 }
 
-/// 式中の `Expr::Ident(old)`（完全一致。バインダの列解決と同じ規則）を `new` へ置換した
-/// 複製を返す。文字列リテラル・関数名・`COLLATE`／`CAST` の名前・SQL/JSON の PASSING 変数名
-/// は置換しない。`match` は網羅（`_` を使わない）。
-fn rename_expr_idents(expr: &Expr, old: &str, new: &str) -> Expr {
-    let rec = |e: &Expr| rename_expr_idents(e, old, new);
+/// 式中の `Expr::Ident(name)` を写像 `f` で置換した複製を返す（[`map_predicate_columns`]
+/// と同じ共有走査器。`match` は網羅）。
+pub(crate) fn map_expr_idents(expr: &Expr, f: &dyn Fn(&str) -> String) -> Expr {
+    let rec = |e: &Expr| map_expr_idents(e, f);
     match expr {
-        Expr::Ident(name) => Expr::Ident(if name == old {
-            new.to_string()
-        } else {
-            name.clone()
-        }),
+        Expr::Ident(name) => Expr::Ident(f(name)),
         Expr::Number(_)
         | Expr::String(_)
         | Expr::Null
@@ -1024,9 +1038,8 @@ fn rename_expr_idents(expr: &Expr, old: &str, new: &str) -> Expr {
             rhs: Box::new(rec(rhs)),
         },
         Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
-            let mapped = expr.try_map_array_children(&mut |e| {
-                Ok::<Expr, std::convert::Infallible>(rename_expr_idents(e, old, new))
-            });
+            let mapped =
+                expr.try_map_array_children(&mut |e| Ok::<Expr, std::convert::Infallible>(rec(e)));
             match mapped {
                 Some(Ok(e)) => e,
                 // 配列系 3 variant では常に `Some`。到達しない保険として複製を返すと
@@ -1042,9 +1055,7 @@ fn rename_expr_idents(expr: &Expr, old: &str, new: &str) -> Expr {
             collation: *collation,
         },
         Expr::SqlJsonQuery(q) => {
-            let mapped = q.try_map_children(&mut |e| {
-                Ok::<Expr, std::convert::Infallible>(rename_expr_idents(e, old, new))
-            });
+            let mapped = q.try_map_children(&mut |e| Ok::<Expr, std::convert::Infallible>(rec(e)));
             match mapped {
                 Ok(q) => Expr::SqlJsonQuery(Box::new(q)),
                 Err(never) => match never {},

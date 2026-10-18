@@ -7329,6 +7329,7 @@ fn resolve_scan_order_aliases<'a>(
     bound_projection: &[ProjectedColumn],
     keys: Vec<std::borrow::Cow<'a, crate::sql::allowlist::ScanOrderKey>>,
     has_windows: bool,
+    physical_keys: &[usize],
 ) -> Result<Vec<ResolvedScanOrderKey<'a>>, SqlSurfaceError> {
     use crate::sql::allowlist::{ScalarOrderKey, ScanOrderKey, SelectItem};
     let Projection::Items(items) = projection else {
@@ -7367,11 +7368,17 @@ fn resolve_scan_order_aliases<'a>(
     };
 
     let mut resolved = Vec::with_capacity(keys.len());
-    for key in keys {
+    for (key_pos, key) in keys.into_iter().enumerate() {
         let ScanOrderKey::Column(k) = key.as_ref() else {
             resolved.push(ResolvedScanOrderKey::Plain(key));
             continue;
         };
+        // 列別名付きビューの公開名から基底の物理名へ書き換え済みのキーは、出力別名として
+        // 再解決しない（物理名が生成投影の別名と一致しても基底列で並べ替える）。
+        if physical_keys.contains(&key_pos) {
+            resolved.push(ResolvedScanOrderKey::Plain(key));
+            continue;
+        }
         if !has_explicit(&k.column) {
             resolved.push(ResolvedScanOrderKey::Plain(key));
             continue;
@@ -8003,6 +8010,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         &projection,
         raw_keys,
         !stmt.window_items.is_empty(),
+        &stmt.physical_order_keys,
     )?;
     let (order_by, order_exprs) =
         bind_scan_order_keys(&resolved_keys, schema, udfs, &mut node_budget)?;

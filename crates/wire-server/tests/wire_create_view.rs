@@ -363,3 +363,56 @@ fn wire_buffered_view_outer_forms_and_chain() {
     expect_error_response_with_sqlstate(&mut alice, "54000");
     read_ready_for_query(&mut alice);
 }
+
+/// 列別名付き `CREATE VIEW v (a, b) AS ...`（TABLE-41 (1)・Issue #1659）が wire 越しでも
+/// `RowDescription` の列名を別名にし、長さ超過は `42601`・重複は `42701` の
+/// `ErrorResponse` になる（意味論の確定オラクルは
+/// `crates/engine/tests/table41_view_column_aliases.rs`）。
+#[test]
+fn wire_view_column_aliases() {
+    let (core, _guard) = new_core_with_docs_table();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID 'op-alias-1'",
+    );
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "CREATE VIEW v (doc_id, vec, language) AS SELECT * FROM docs",
+    );
+    assert_eq!(read_command_complete(&mut stream), "CREATE VIEW");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT language, doc_id FROM v LIMIT 10");
+    assert_eq!(
+        read_row_description(&mut stream),
+        vec!["language".to_string(), "doc_id".to_string()]
+    );
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("ja".to_string()), Some("1".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT lang FROM v LIMIT 10");
+    expect_error_response_with_sqlstate(&mut stream, "42703");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "CREATE VIEW w (a, b, c, d) AS SELECT * FROM docs",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "CREATE VIEW w (a, a) AS SELECT * FROM docs");
+    expect_error_response_with_sqlstate(&mut stream, "42701");
+    read_ready_for_query(&mut stream);
+}

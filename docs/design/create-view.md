@@ -18,14 +18,16 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 ## 受理する構文（Phase 1）
 
 ```
-CREATE VIEW <name> AS SELECT <* | 列名リスト> FROM <table | view> [WHERE <単純述語> [AND ...]]
+CREATE VIEW <name> [(<列別名> [, ...])] AS SELECT <* | 列名リスト> FROM <table | view> [WHERE <単純述語> [AND ...]]
 DROP VIEW <name>
 ```
+
+列別名リスト（Issue #1659）は末尾の「Issue #1659 追記」節を参照。
 
 - body の `LIMIT`・`ORDER BY ... <=>`・`HYBRID`・`USING PLAN`・集計形・式項目
   （`Projection::Items`）・UDF 呼び出し述語（`WherePredicate::PredicateCall`／
   `Expression`）・`EXPLAIN`・`CREATE OR REPLACE`・`IF NOT EXISTS`・`TEMP`／
-  `MATERIALIZED`・列別名リスト・`WITH CHECK OPTION`・末尾の余剰トークンは
+  `MATERIALIZED`・`WITH CHECK OPTION`・末尾の余剰トークンは
   いずれも構造的に受理しない（`42601`）。使える単純述語は
   `Equality`／`Prefix`／`BoolEquality`／`BoolColumn`／`Compare`（列 対
   リテラル）のみ。
@@ -384,3 +386,70 @@ body のリテラル値・破損理由の詳細をクライアントへ運ばな
   運ばないため権限昇格にはならない）。
 - PR #1041（明示トランザクション。SQL-31）とのトランザクション内 DDL 拒否
   ガードの統合はマージ順に依存する申し送り事項。
+
+## Issue #1659 追記: 列別名リスト `CREATE VIEW v (a, b) AS ...`
+
+TABLE-41 (1) のポインタ。TABLE-18 の RLS 契約（参照したセッションの文脈で評価する）は変えない。
+兄弟の `OR REPLACE`（互換性検査）は #1660、依存ビューの再検証は #1661 が扱う。
+
+### 構文と構造検証（`sql::allowlist`、カタログは照会しない）
+
+- `CREATE VIEW <name> [(<alias> [, <alias>]*)] AS <body>`。`IF NOT EXISTS` の `42601` が先に判定される
+- 空のリスト・末尾カンマ・識別子でない要素は `42601`、件数が `catalog::MAX_COLUMN_COUNT`（256）を
+  超えれば `54000`、リスト内の同名は `42701`
+- 本文が列名を明示する単純形のとき、別名が列数より多ければ構造段で `42601`
+- 判定順序は「構文 → 本文サイズ → DDL 権限（`42501`）→ カタログ判定」を保つ。`*` の本文・評価後射影形の
+  本文との長さ突合と最終名の重複検査（`42701`）は権限ゲートの後（`EngineCore::check_create_view_column_aliases`）。
+  権限のない主体へ列構成を返さない
+
+### 出力列の規則
+
+- 別名は出力列に先頭から順に名前を付け、短いリストの残りは本文から導いた名前を保つ。長いリストは `42601`
+- 単純形の `SELECT *` の出力列は `id` が先頭で、利用者列がスキーマ順に続く（`tenant_id`・`visibility`
+  は出さない）。したがって `v (x) AS SELECT * FROM t` の `x` は `id` に当たる。このリポの `*` の意味に
+  揃えた規則で、作成時の導出（`sql::view::body_output`）と参照時の適用が同じ関数（`star_columns_of_table`）を
+  共有する
+- 別名を付けた後の最終的な名前が重複すれば `42701`（別名のないビューの既存挙動は変えない）
+
+### 格納形式（`catalog::ViewDef`）
+
+- `ViewDef` に `column_aliases: Vec<String>` を追加（公開型へのフィールド追加。破壊的変更）。
+  別名が空なら従来の v1 と同一のバイト列、非空なら v2（v1 の 2 部分の後に `u32` LE の件数と、
+  各別名の `u32` LE 長 + UTF-8）。件数（256）・長さ（63）は構文段・`Storage::create_view_with_column_aliases`・
+  decode の 3 か所で bound し、上限検査の前に確保しない。破損は `CorruptSchema`（参照時は固定文言の `XX000`）
+- `Storage::create_view` は空の別名で `create_view_with_column_aliases` に委譲する
+
+### 参照時の 2 経路（本文の形で分ける）
+
+- 単純形本文: インライン展開を保つ。`sql::view::resolve_from` の第 2 パスが連鎖の各段の公開名と
+  基底表の物理名の対応（`Resolved::View::column_map`）を積み、`sql::view_alias` が列スコープ検査
+  **の後に**外側の投影・`WHERE`・`ORDER BY`・集計を物理名へ書き換える。出力名は SQL-42 の
+  「別名付き列参照」で公開名に保つ。段の `WHERE` も親の対応で物理名へ書き換えてから合成する。
+  書き換えは `check_constraint` の列改名と同じ走査器（`map_predicate_columns`・`map_expr_idents`）を共有し、
+  一括適用なので別名の入れ替え（`(lang, body) AS SELECT body, lang`）でも連鎖置換しない
+- 評価後射影形本文（集計・`LIMIT` 等）と、評価後射影形ビューの上に重なる別名付きの段: 素通しの
+  `Statement::BufferedView` 層（`column_aliases` 付き）を重ね、`sql::view_buffered::plan_outer` が
+  外側の束縛より前に本文の結果列を先頭から改名する。Describe と Execute は同じ入口を通るため一致する
+- 単純形本文を評価後射影形へ回さない理由: 単純形本文には `LIMIT` がなく、評価後射影形に回すと本文の
+  行数上限（`ResultLimits` の既定 10,000 行）で選択的な外側 `WHERE` の対象行が黙って欠ける。
+  「別名を付けても返る行は変わらない」ことを回帰テストで固定している
+
+### 公開範囲と fail-closed
+
+- 外側の列は別名（公開名）だけが見え、物理名・`tenant_id`・`visibility` での参照は `42703`。
+  別名を `tenant_id` 等にしても、外側は別名の利用者列として束縛される
+- 公開名の重複は `42702`、別名が出力列より長くなった（`*` の基底表の列が変わった）場合は `42601`。
+  作成時の検査と書き込みの間の TOCTOU は、この参照時の再検査が塞ぐ
+- 未対応の位置は `0A000` で拒否する（状態は変えない）: 集合演算の枝（括弧なし）、CTE の本文、ウィンドウ項目、
+  投影位置のスカラーサブクエリ、サブクエリ述語、集計式項目・式の `HAVING`・項目名でない列を指す
+  集計の `ORDER BY`、疑似列 `id` へ別名で写る列の投影以外での参照（`IdCompare` の意味の取り違え防止）。
+  JOIN の辺のビューは従来どおり拒否
+- 別名はテナントの可視性に関与しない名前の写像であり、RLS-10 (b) は展開後または本文の実行経路で
+  参照したセッションの `PolicyContext` により判定される
+
+### DDL 依存ゲート（保守側）
+
+別名付きビューは `catalog::view_def_shape` で評価後射影形と同じ保守側（`buffered = true`）に分類する。
+結果、別名付きビューが読む表への `RENAME COLUMN` は `0A000`、`DROP COLUMN`／`ALTER TYPE` は依存ありとして
+拒否される（PostgreSQL は受理するため、精密な追随は後続課題）。連鎖の深さ・到達判定は本文の形のまま。
+`RENAME COLUMN` で別のビューの定義を書き換える際は `column_aliases` を保つ。

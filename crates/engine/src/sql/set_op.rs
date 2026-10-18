@@ -1037,6 +1037,7 @@ mod tests {
             window_items: Vec::new(),
             order_keys: Vec::new(),
             scalar_subquery_items: Vec::new(),
+            physical_order_keys: Vec::new(),
         }))
     }
 
@@ -1263,6 +1264,7 @@ mod tests {
             window_items: Vec::new(),
             order_keys: Vec::new(),
             scalar_subquery_items: Vec::new(),
+            physical_order_keys: Vec::new(),
         }))
     }
 
@@ -1431,6 +1433,7 @@ mod tests {
             window_items: Vec::new(),
             order_keys: Vec::new(),
             scalar_subquery_items: Vec::new(),
+            physical_order_keys: Vec::new(),
         }))
     }
 

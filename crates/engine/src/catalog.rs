@@ -1209,7 +1209,7 @@ fn rewrite_views_for_renamed_column_in_txn(
             return Err(CatalogError::ViewLimitExceeded("too many views".to_string()).into());
         }
         let def = decode_view_def(value.value())?;
-        match view_body_shape(&def.body_sql) {
+        match view_def_shape(&def) {
             Ok(shape) if shape.buffered => {
                 buffered_relations.push(shape.relations);
                 continue;
@@ -1296,6 +1296,7 @@ fn rewrite_views_for_renamed_column_in_txn(
         let encoded = encode_view_def(&ViewDef {
             base_relation: def.base_relation.clone(),
             body_sql,
+            column_aliases: def.column_aliases.clone(),
         })?;
         planned.push((name.clone(), encoded));
     }
@@ -1480,7 +1481,7 @@ fn views_expose_column_in_txn(
             ));
         }
         let def = decode_view_def(value.value())?;
-        match view_body_shape(&def.body_sql) {
+        match view_def_shape(&def) {
             // 評価後射影形は views_reference_column_in_txn が保守的に検出済み。
             Ok(shape) if shape.buffered => continue,
             Ok(_) => {}
@@ -3550,15 +3551,30 @@ pub struct ViewDef {
     /// の round-trip テストが「描画 → 再トークン化 → 再パース」で元の AST と
     /// 一致することを固定する）。
     pub body_sql: String,
+    /// `CREATE VIEW v (a, b) AS ...` の列別名リスト（TABLE-41 (1)・Issue #1659）。
+    /// 出力列に先頭から順に名前を付ける。空なら別名なし（本文から導いた名前のまま）。
+    /// 件数は [`MAX_COLUMN_COUNT`]、各別名は識別子の長さ上限以下に限る。
+    pub column_aliases: Vec<String>,
 }
 
+/// 列別名リストの符号化後の最大バイト数（件数 4 + 各別名の長さ 4 + 識別子上限）。
+/// [`encode_view_def`] の全体上限へ加算し、本文の上限とは独立に bound する。
+const MAX_VIEW_ALIAS_BYTES: usize = 4 + MAX_COLUMN_COUNT * (4 + MAX_IDENTIFIER_LEN);
+
 /// [`ViewDef`] のバイト表現（`u8` バージョン・`base_relation`／`body_sql` それぞれ
-/// `u32`（LE）長 + UTF-8 本体）。[`encode_enum_type_def`] と同じく untrusted
+/// `u32`（LE）長 + UTF-8 本体）。列別名が空ならバージョン 1（従来と同一のバイト列）、
+/// 別名があればバージョン 2（v1 の 2 部分の後に `u32` LE の件数と、各別名の `u32` LE 長 +
+/// UTF-8 を続ける。Issue #1659）。[`encode_enum_type_def`] と同じく untrusted
 /// クライアント入力の直接デコード対象ではなく、格納済みカタログ値のデコード
 /// （破損は `CorruptSchema`）。
 fn encode_view_def(def: &ViewDef) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.push(1u8); // バージョン
+    // バージョン（別名なしは従来の v1 と同一バイト列を保つ）。
+    out.push(if def.column_aliases.is_empty() {
+        1u8
+    } else {
+        2u8
+    });
     for part in [def.base_relation.as_str(), def.body_sql.as_str()] {
         let len = u32::try_from(part.len()).map_err(|_| {
             CatalogError::Invalid("view definition part too long to encode".to_string())
@@ -3566,7 +3582,32 @@ fn encode_view_def(def: &ViewDef) -> Result<Vec<u8>> {
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(part.as_bytes());
     }
-    if out.len() > MAX_VIEW_BODY_BYTES.saturating_add(64) {
+    if !def.column_aliases.is_empty() {
+        if def.column_aliases.len() > MAX_COLUMN_COUNT {
+            return Err(CatalogError::Invalid(
+                "too many view column aliases".to_string(),
+            ));
+        }
+        let count = u32::try_from(def.column_aliases.len())
+            .map_err(|_| CatalogError::Invalid("too many view column aliases".to_string()))?;
+        out.extend_from_slice(&count.to_le_bytes());
+        for alias in &def.column_aliases {
+            if alias.len() > MAX_IDENTIFIER_LEN {
+                return Err(CatalogError::Invalid(
+                    "view column alias too long".to_string(),
+                ));
+            }
+            let len = u32::try_from(alias.len())
+                .map_err(|_| CatalogError::Invalid("view column alias too long".to_string()))?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(alias.as_bytes());
+        }
+    }
+    if out.len()
+        > MAX_VIEW_BODY_BYTES
+            .saturating_add(64)
+            .saturating_add(MAX_VIEW_ALIAS_BYTES)
+    {
         return Err(CatalogError::ViewLimitExceeded(
             "view body too large".to_string(),
         ));
@@ -3589,7 +3630,7 @@ fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
     let version = *bytes
         .first()
         .ok_or_else(|| CatalogError::Invalid("view definition value is empty".to_string()))?;
-    if version != 1 {
+    if version != 1 && version != 2 {
         return Err(CatalogError::Invalid(format!(
             "unknown view definition format version: {version}"
         )));
@@ -3625,6 +3666,52 @@ fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
         parts.push(part);
         offset = end;
     }
+    let mut column_aliases: Vec<String> = Vec::new();
+    if version == 2 {
+        let count_bytes: [u8; 4] = bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| CatalogError::Invalid("view definition value truncated".to_string()))?
+            .try_into()
+            .map_err(|_| CatalogError::Invalid("view definition value truncated".to_string()))?;
+        offset += 4;
+        let count = u32::from_le_bytes(count_bytes) as usize;
+        // 件数は確保の前に上限検査する（破損値による過大確保の防止）。
+        if count == 0 || count > MAX_COLUMN_COUNT {
+            return Err(CatalogError::Invalid(
+                "view column alias count out of range".to_string(),
+            ));
+        }
+        column_aliases.reserve(count);
+        for _ in 0..count {
+            let len_bytes: [u8; 4] = bytes
+                .get(offset..offset + 4)
+                .ok_or_else(|| {
+                    CatalogError::Invalid("view definition value truncated".to_string())
+                })?
+                .try_into()
+                .map_err(|_| {
+                    CatalogError::Invalid("view definition value truncated".to_string())
+                })?;
+            offset += 4;
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            if len > MAX_IDENTIFIER_LEN {
+                return Err(CatalogError::Invalid(
+                    "view column alias too long".to_string(),
+                ));
+            }
+            let end = offset.checked_add(len).ok_or_else(|| {
+                CatalogError::Invalid("view definition offset overflow".to_string())
+            })?;
+            let alias_bytes = bytes.get(offset..end).ok_or_else(|| {
+                CatalogError::Invalid("view definition value truncated at alias".to_string())
+            })?;
+            let alias = std::str::from_utf8(alias_bytes).map_err(|_| {
+                CatalogError::Invalid("view column alias is not valid UTF-8".to_string())
+            })?;
+            column_aliases.push(alias.to_string());
+            offset = end;
+        }
+    }
     if offset != bytes.len() {
         return Err(CatalogError::Invalid(
             "view definition value has trailing bytes".to_string(),
@@ -3640,6 +3727,7 @@ fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
     Ok(ViewDef {
         base_relation,
         body_sql,
+        column_aliases,
     })
 }
 
@@ -3716,13 +3804,31 @@ fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
     })
 }
 
+/// ビュー定義の DDL 依存ゲート用の形状（Issue #1659）。列別名を持つビューは、列名の追随
+/// （RENAME COLUMN）・依存列の検査（DROP COLUMN／ALTER TYPE）を単純形の導出列では
+/// 精密に行えないため、評価後射影形と同じ保守側（`buffered = true`）に分類する
+/// （fail-closed。PostgreSQL は受理するため、精密な追随は後続課題）。連鎖の深さ・到達判定は
+/// 本文の形のまま（[`view_body_shape`]）で行う。
+fn view_def_shape(def: &ViewDef) -> Result<ViewBodyShape> {
+    let mut shape = view_body_shape(&def.body_sql)?;
+    if !def.column_aliases.is_empty() {
+        shape.buffered = true;
+    }
+    Ok(shape)
+}
+
 /// `name` が評価後射影形（[`ViewBodyShape::buffered`]）のビュー、または単純形ビューの
 /// 連鎖を経て評価後射影形ビューへ到達するビューなら `true`（テーブル・未登録は `false`。
 /// Issue #1411）。格納本文の再検証失敗・循環・過大な連鎖はカタログ破損として
 /// `CorruptSchema`。
+///
+/// `include_aliased` が `true` のときは列別名付きビュー（[`view_def_shape`] が保守側に倒す
+/// もの。Issue #1659）も到達先として数える。集合演算の枝などから別名付きビューを読む本文は
+/// 参照時に必ず拒否されるため、作成時に実カタログで再検証する判定に使う。
 fn view_reaches_buffered_in_txn(
     views_table: &redb::Table<'_, &str, &[u8]>,
     name: &str,
+    include_aliased: bool,
 ) -> Result<bool> {
     let mut current = name.to_string();
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3743,7 +3849,7 @@ fn view_reaches_buffered_in_txn(
         let def = decode_view_def(guard.value())?;
         let shape = view_body_shape(&def.body_sql)
             .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
-        if shape.buffered {
+        if shape.buffered || (include_aliased && !def.column_aliases.is_empty()) {
             return Ok(true);
         }
         current = def.base_relation;
@@ -3754,6 +3860,8 @@ fn view_reaches_buffered_in_txn(
 /// （[`TableLookup`]）を提供する（Issue #1411。評価後射影形ビューを読む本文を、参照時の
 /// 再検証 `sql::view::resolve_from` と同一の経路で作成前に検証するために使う）。
 struct TxnViewLookup<'a, 'txn> {
+    /// ENUM 列の語彙解決（スキーマのデコード）に使う同一 write txn。
+    write_txn: &'a redb::WriteTransaction,
     catalog_table: &'a redb::Table<'txn, &'static str, &'static [u8]>,
     views_table: &'a redb::Table<'txn, &'static str, &'static [u8]>,
 }
@@ -3777,6 +3885,49 @@ impl TableLookup for TxnViewLookup<'_, '_> {
                 .map(Some)
                 .map_err(table_lookup_error),
         }
+    }
+
+    fn table_columns(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
+        Ok(self.txn_schema(name)?.map(|schema| {
+            let mut columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            if !columns.iter().any(|c| c == "id") {
+                columns.push("id".to_string());
+            }
+            columns
+        }))
+    }
+
+    fn table_star_columns(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
+        Ok(self.txn_schema(name)?.map(|schema| {
+            let mut columns = vec!["id".to_string()];
+            columns.extend(schema.columns.iter().map(|c| c.name.clone()));
+            columns
+        }))
+    }
+}
+
+impl TxnViewLookup<'_, '_> {
+    /// 同一 write txn のカタログから表スキーマを読む（`impl TableLookup for Storage` と同じ
+    /// 列導出のため。表が無ければ `None`）。
+    fn txn_schema(&self, name: &str) -> std::result::Result<Option<TableSchema>, SqlSurfaceError> {
+        let bytes = match self
+            .catalog_table
+            .get(name)
+            .map_err(|e| table_lookup_error(CatalogError::from(e)))?
+        {
+            None => return Ok(None),
+            Some(guard) => guard.value().to_vec(),
+        };
+        let mut resolve = |n: &str| get_enum_type_in_write_txn(self.write_txn, n);
+        decode_schema_with_resolver(name, &bytes, &mut resolve)
+            .map(Some)
+            .map_err(table_lookup_error)
     }
 }
 
@@ -3972,7 +4123,7 @@ fn drop_targets_with_dependents_in_txn(
                 if target_set.contains(def.base_relation.as_str()) {
                     view_dependent.insert(def.base_relation.clone());
                 }
-                match view_body_shape(&def.body_sql) {
+                match view_def_shape(&def) {
                     Ok(shape) => {
                         for r in &shape.relations {
                             if target_set.contains(r.as_str()) {
@@ -4181,7 +4332,7 @@ fn views_reference_column_in_txn(
         // （`defs`。単純形ビューの公開列の導出）には含めない。評価後射影形ビューを参照する
         // ビュー（Issue #1411 の連鎖）も、最下段の評価後射影形ビューが基底テーブルを読む限り
         // そちらで保守的に「依存あり」と検出されるため、連鎖下でも結果は変わらない。
-        match view_body_shape(&def.body_sql) {
+        match view_def_shape(&def) {
             Ok(shape) if shape.buffered => {
                 buffered_relations.extend(shape.relations);
                 continue;
@@ -12009,16 +12160,46 @@ impl Storage {
     /// 落ち、何も永続化されない。行ストア・世代カウンタは持たないため
     /// [`bump_table_generation_in_txn`] は呼ばない。
     pub fn create_view(&self, name: &str, base_relation: &str, body_sql: &str) -> Result<()> {
+        self.create_view_with_column_aliases(name, base_relation, body_sql, &[])
+    }
+
+    /// [`Self::create_view`] に列別名リスト（`CREATE VIEW v (a, b) AS ...`。TABLE-41 (1)・
+    /// Issue #1659）を加えた版。別名は出力列に先頭から順に名前を付ける。公開 Rust API
+    /// からの直接呼び出しに対する多層防御として、各別名の識別子検証・件数上限
+    /// （[`MAX_COLUMN_COUNT`]）・重複を保存前に検査する（違反は `Invalid`）。出力列数との
+    /// 突合は列を導出できる SQL 表層（`core`）が作成前に行う。
+    pub fn create_view_with_column_aliases(
+        &self,
+        name: &str,
+        base_relation: &str,
+        body_sql: &str,
+        column_aliases: &[String],
+    ) -> Result<()> {
         validate_identifier(name)?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
             return Err(CatalogError::ViewLimitExceeded(
                 "view body too large".to_string(),
             ));
         }
+        if column_aliases.len() > MAX_COLUMN_COUNT {
+            return Err(CatalogError::Invalid(
+                "too many view column aliases".to_string(),
+            ));
+        }
+        let mut seen_aliases: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for alias in column_aliases {
+            validate_identifier(alias)?;
+            if !seen_aliases.insert(alias.as_str()) {
+                return Err(CatalogError::Invalid(
+                    "duplicate view column alias".to_string(),
+                ));
+            }
+        }
         let shape = validate_view_body_matches_base_relation(body_sql, base_relation)?;
         let encoded = encode_view_def(&ViewDef {
             base_relation: base_relation.to_string(),
             body_sql: body_sql.to_string(),
+            column_aliases: column_aliases.to_vec(),
         })?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
@@ -12049,9 +12230,15 @@ impl Storage {
             // `Invalid`（`42601`）にする。単純形ビューは、評価後射影形ビューの上に重ねられる形
             // （列射影・宣言的 `WHERE` のみ）に限る。
             let mut reaches_buffered = false;
+            // 列別名付きビューへ到達する評価後射影形の本文（Issue #1659）。別名付きビューを
+            // 集合演算の枝などから読む形は参照時に拒否されるため、実カタログで再検証する。
+            let mut reaches_aliased = false;
             for rel in &shape.relations {
-                if view_reaches_buffered_in_txn(&views_table, rel)? {
+                if view_reaches_buffered_in_txn(&views_table, rel, false)? {
                     reaches_buffered = true;
+                }
+                if view_reaches_buffered_in_txn(&views_table, rel, true)? {
+                    reaches_aliased = true;
                 }
                 if shape.join && catalog_table.get(rel.as_str())?.is_none() {
                     return Err(CatalogError::Invalid(
@@ -12063,7 +12250,7 @@ impl Storage {
             // 実カタログで確定させる。FROM が評価後射影形ビューの連鎖なら受理され、テーブル
             // （または単純形ビュー経由でテーブル）直下なら `Resolved` の検証で `Invalid`
             // （`42601`）になる。作成できても参照時に必ず失敗する定義を作らない。
-            if reaches_buffered || shape.deferred_expr {
+            if reaches_buffered || shape.deferred_expr || (shape.buffered && reaches_aliased) {
                 let invalid = || {
                     CatalogError::Invalid(
                         "a view cannot reference a view with an aggregate/LIMIT body in this position"
@@ -12072,6 +12259,7 @@ impl Storage {
                 };
                 if shape.buffered {
                     let lookup = TxnViewLookup {
+                        write_txn: &write_txn,
                         catalog_table: &catalog_table,
                         views_table: &views_table,
                     };
@@ -12092,6 +12280,46 @@ impl Storage {
                     let parsed = parse_view_body(&tokens).map_err(|_| invalid())?;
                     crate::sql::allowlist::check_simple_layer_over_buffered(&parsed)
                         .map_err(|_| invalid())?;
+                }
+            }
+            // 列別名付きビューへ到達する単純形の本文（Issue #1659）: 参照時は親の「公開名 → 物理名」
+            // 対応で本文の `WHERE` を書き換える（`sql::view::resolve_from`）。書き換えられない形
+            // （疑似列 `id` へ写る公開名の参照など）を含む定義は、作成できても以後の参照がすべて
+            // 失敗するため、参照時と同じ検査（列スコープ・`rewrite_where`）を作成前に通す。
+            if reaches_aliased && !shape.buffered {
+                let invalid = || {
+                    CatalogError::Invalid(
+                        "a view over a view with column aliases cannot use this predicate or column"
+                            .to_string(),
+                    )
+                };
+                let lookup = TxnViewLookup {
+                    write_txn: &write_txn,
+                    catalog_table: &catalog_table,
+                    views_table: &views_table,
+                };
+                let tokens = crate::sql::lexer::tokenize_stored_view_body(body_sql)
+                    .map_err(|_| invalid())?;
+                let parsed = parse_view_body(&tokens).map_err(|_| invalid())?;
+                if let crate::sql::view::Resolved::View {
+                    view_columns,
+                    column_map: Some(map),
+                    ..
+                } =
+                    crate::sql::view::resolve_from(&lookup, base_relation).map_err(|_| invalid())?
+                {
+                    crate::sql::view::check_columns_within_view(
+                        view_columns.as_deref(),
+                        &parsed.projection,
+                        &parsed.where_predicates,
+                        &[],
+                    )
+                    .map_err(|_| invalid())?;
+                    crate::sql::view_alias::rewrite_where(
+                        &crate::sql::view_alias::ColumnMap::new(&map),
+                        parsed.where_predicates,
+                    )
+                    .map_err(|_| invalid())?;
                 }
             }
             // テーブル自身が深さ 0 のため、それを直接参照する新規ビューの深さは
@@ -12791,6 +13019,23 @@ impl TableLookup for Storage {
                 if !columns.iter().any(|c| c == "id") {
                     columns.push("id".to_string());
                 }
+                Ok(Some(columns))
+            }
+            Err(CatalogError::TableNotFound(_)) => Ok(None),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
+    /// `SELECT *` の実際の列並び（疑似列 `id` が先頭、続けて宣言済みの実カラム。実カラム `id` を
+    /// 宣言していれば `id` が 2 回現れる）。`sql::parser::bind_projection` の `Projection::All` と一致させる。
+    fn table_star_columns(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
+        match self.get_table_schema(name) {
+            Ok(schema) => {
+                let mut columns = vec!["id".to_string()];
+                columns.extend(schema.columns.iter().map(|c| c.name.clone()));
                 Ok(Some(columns))
             }
             Err(CatalogError::TableNotFound(_)) => Ok(None),
@@ -13924,6 +14169,7 @@ mod tests {
                 ViewDef {
                     base_relation: base.to_string(),
                     body_sql: format!("SELECT * FROM {base}"),
+                    column_aliases: Vec::new(),
                 },
             );
         }
@@ -18203,6 +18449,7 @@ mod tests {
                 let bad = encode_view_def(&ViewDef {
                     base_relation: "docs".to_string(),
                     body_sql: "NOT A VIEW BODY".to_string(),
+                    column_aliases: Vec::new(),
                 })
                 .expect("encode");
                 views.insert("v_bad", bad.as_slice()).expect("insert");
@@ -18920,6 +19167,115 @@ mod tests {
             .expect("unreferenced column can be dropped");
     }
 
+    /// 列別名なしの定義は従来の v1 と同一のバイト列で、別名ありは v2 で往復する
+    /// （TABLE-41 (1)・Issue #1659）。
+    #[test]
+    fn view_def_codec_keeps_v1_bytes_and_round_trips_v2_aliases() {
+        let plain = ViewDef {
+            base_relation: "docs".to_string(),
+            body_sql: "SELECT a FROM docs".to_string(),
+            column_aliases: Vec::new(),
+        };
+        let v1 = encode_view_def(&plain).expect("encode v1");
+        assert_eq!(v1.first(), Some(&1u8));
+        assert_eq!(decode_view_def(&v1).expect("decode v1"), plain);
+
+        let aliased = ViewDef {
+            column_aliases: vec!["x".to_string(), "yy".to_string()],
+            ..plain.clone()
+        };
+        let v2 = encode_view_def(&aliased).expect("encode v2");
+        assert_eq!(v2.first(), Some(&2u8));
+        assert_eq!(
+            v2.get(1..v1.len()),
+            v1.get(1..),
+            "v2 は v1 の 2 部分を先頭に持つ"
+        );
+        assert_eq!(decode_view_def(&v2).expect("decode v2"), aliased);
+    }
+
+    /// v2 の破損（切り詰め・件数 0／超過・長さ超過・不正 UTF-8・余剰バイト）は
+    /// `CorruptSchema` で拒否し、過大な件数で確保しない。
+    #[test]
+    fn view_def_v2_rejects_corrupt_alias_sections() {
+        let aliased = ViewDef {
+            base_relation: "docs".to_string(),
+            body_sql: "SELECT a FROM docs".to_string(),
+            column_aliases: vec!["x".to_string()],
+        };
+        let good = encode_view_def(&aliased).expect("encode");
+        let corrupt = |bytes: &[u8]| {
+            assert!(
+                matches!(decode_view_def(bytes), Err(CatalogError::CorruptSchema(_))),
+                "must be CorruptSchema: {bytes:?}"
+            );
+        };
+        // 切り詰め（別名本体の途中・件数の途中）。
+        corrupt(&good[..good.len() - 1]);
+        corrupt(&good[..good.len() - 6]);
+        // 余剰バイト。
+        let mut trailing = good.clone();
+        trailing.push(0);
+        corrupt(&trailing);
+        // 件数 0（v2 は 1 件以上）と上限超過。
+        let count_at = good.len() - (4 + 4 + 1);
+        let mut zero = good.clone();
+        zero[count_at..count_at + 4].copy_from_slice(&0u32.to_le_bytes());
+        corrupt(&zero);
+        let mut huge = good.clone();
+        huge[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        corrupt(&huge);
+        // 別名の長さが識別子の上限超過。
+        let mut long = good.clone();
+        let len_at = good.len() - (4 + 1);
+        long[len_at..len_at + 4].copy_from_slice(&((MAX_IDENTIFIER_LEN as u32) + 1).to_le_bytes());
+        corrupt(&long);
+        // 不正 UTF-8。
+        let mut bad_utf8 = good.clone();
+        let last = bad_utf8.len() - 1;
+        bad_utf8[last] = 0xFF;
+        corrupt(&bad_utf8);
+    }
+
+    /// 公開 API からの直接呼び出しでも、別名の件数・識別子・重複を保存前に検査する。
+    #[test]
+    fn create_view_with_column_aliases_validates_aliases_before_writing() {
+        let path = unique_db_path("view-alias-api-validation");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("a", ColumnType::Text, false)],
+            ))
+            .expect("create table");
+        let body = "SELECT a FROM docs";
+        let too_many: Vec<String> = (0..=MAX_COLUMN_COUNT).map(|i| format!("c{i}")).collect();
+        for bad in [
+            too_many,
+            vec!["a b".to_string()],
+            vec!["x".to_string(), "x".to_string()],
+            vec!["1x".to_string()],
+        ] {
+            assert!(
+                matches!(
+                    storage.create_view_with_column_aliases("v", "docs", body, &bad),
+                    Err(CatalogError::Invalid(_))
+                ),
+                "must reject aliases: {bad:?}"
+            );
+        }
+        assert!(storage.view_definition("v").expect("lookup").is_none());
+        storage
+            .create_view_with_column_aliases("v", "docs", body, &["x".to_string()])
+            .expect("valid aliases");
+        let def = storage
+            .view_definition("v")
+            .expect("lookup")
+            .expect("stored");
+        assert_eq!(def.column_aliases, vec!["x".to_string()]);
+    }
+
     /// ビュー数がちょうど [`MAX_VIEWS`] 件（`create_view` が許可する上限）でも、
     /// DROP COLUMN の依存ビュー走査は `ViewLimitExceeded` にならず、上限超過
     /// （`MAX_VIEWS + 1` 件の破損カタログ）のみ fail-closed に拒否する
@@ -18933,6 +19289,7 @@ mod tests {
         let def = ViewDef {
             base_relation: "docs".to_string(),
             body_sql: "SELECT a FROM docs".to_string(),
+            column_aliases: Vec::new(),
         };
         let encoded = encode_view_def(&def).expect("encode view def");
 

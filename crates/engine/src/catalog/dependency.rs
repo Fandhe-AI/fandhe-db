@@ -932,6 +932,7 @@ mod tests {
         let encoded = encode_view_def(&ViewDef {
             base_relation: "other".to_string(),
             body_sql: "SELECT a FROM other".to_string(),
+            column_aliases: Vec::new(),
         })
         .expect("encode");
         let write_txn = storage.db().begin_write().expect("begin");
@@ -963,6 +964,7 @@ mod tests {
             let encoded = encode_view_def(&ViewDef {
                 base_relation: base.to_string(),
                 body_sql: body.to_string(),
+                column_aliases: Vec::new(),
             })
             .expect("encode");
             let txn = storage.db().begin_write().expect("begin");
@@ -995,6 +997,7 @@ mod tests {
             let encoded = encode_view_def(&ViewDef {
                 base_relation: base.to_string(),
                 body_sql: body.to_string(),
+                column_aliases: Vec::new(),
             })
             .expect("encode");
             let txn = storage.db().begin_write().expect("begin");
