@@ -11,8 +11,9 @@
 //!
 //! - 指定あり: 書き込み文の `USING OPERATION_ID` 省略を `23502` で拒否する従来の
 //!   必須契約（`LedgerMode::Ledgered`）
-//! - 指定なし: engine の既定（[`LedgerMode::default`]）。operation_id を任意にする
-//!   モードの追加と既定の移行は #1704 の担当で、本モジュールは配線のみを持つ
+//! - 指定なし: engine の既定（[`LedgerMode::default`]＝`LedgerMode::Optional`。Issue
+//!   #1704）。省略した書き込みは台帳に記録しない通常の書き込みとして実行する。分割実行
+//!   DML だけは構成に関わらず operation_id 必須。本モジュールは配線のみを持つ
 //!
 //! 方針の経緯は `docs/design/operation-id-optional.md` を参照。
 
@@ -28,9 +29,7 @@ pub const STARTUP_NOTICE: &str = "operation_id is required for write statements 
 /// `explicit`（フラグが指定されたか）を [`LedgerMode`] へ写像する。
 ///
 /// - `true` は常に [`LedgerMode::Ledgered`]（現行の必須契約）。
-/// - `false` は [`LedgerMode::default`]。engine の既定は現時点で `Ledgered` で、
-///   #1704 が任意モードの variant を追加して既定を移す（既定を据え置く場合は
-///   本関数のこの分岐を 1 行変更する）。
+/// - `false` は [`LedgerMode::default`]（Issue #1704 以降は `LedgerMode::Optional`）。
 ///
 /// `CompareOnlyWithoutLedger` は台帳書き込みを無効化する本番非推奨のモードで、
 /// 再送の冪等性が壊れ fail-open になるため、どの分岐でも返さない。
@@ -54,6 +53,7 @@ mod tests {
     #[test]
     fn unspecified_maps_to_engine_default() {
         assert_eq!(resolve(false), LedgerMode::default());
+        assert_eq!(resolve(false), LedgerMode::Optional);
     }
 
     #[test]

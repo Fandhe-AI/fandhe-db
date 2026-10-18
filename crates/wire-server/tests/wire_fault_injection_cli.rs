@@ -318,6 +318,9 @@ mod armed {
                 "127.0.0.1:0",
                 "--fault-inject",
                 "post-commit-panic",
+                // 既定は operation_id 任意（Issue #1704）。本テストは「拒否された INSERT は
+                // arm を消費しない」ことを見るため、必須化して 23502 拒否を成立させる。
+                "--require-operation-id",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

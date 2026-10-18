@@ -68,6 +68,26 @@ fn execute_insert_batch_writes_multiple_rows_under_one_operation_id() {
     assert_eq!(outcome.rows_affected, 2);
 }
 
+/// Issue #1704・RECOVER-1: `LedgerMode::Optional` では operation_id 省略の一括投入が
+/// 成功し、`Ledgered` では従来どおり `23502` で全体が拒否される。
+#[test]
+fn execute_insert_batch_omitted_operation_id_follows_ledger_mode() {
+    let path = unique_db_path("sql-insert-batch-omitted-optional");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let policy = ctx("tenant-a", [Visibility::Public, Visibility::Private]);
+
+    let bounds = vec![bound(1, None), bound(2, None)];
+    let err = execute_insert_batch(&storage, &policy, &bounds, LedgerMode::Ledgered)
+        .expect_err("Ledgered must reject omitted operation_id");
+    assert_eq!(err.wire_code(), "23502");
+
+    let outcome = execute_insert_batch(&storage, &policy, &bounds, LedgerMode::Optional)
+        .expect("Optional accepts omitted operation_id");
+    assert_eq!(outcome.rows_affected, 2);
+}
+
 #[test]
 fn execute_insert_batch_same_operation_id_same_content_is_duplicate() {
     let path = unique_db_path("sql-insert-batch-duplicate");
@@ -210,7 +230,8 @@ fn open_engine(name: &str) -> (EngineCore, std::path::PathBuf) {
     let path = unique_db_path(name);
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (core, path)
 }
 
@@ -221,8 +242,9 @@ fn open_engine_with_limits(
     let path = unique_db_path(name);
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    let core =
-        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_batch_limits(limits);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
+        .with_batch_limits(limits);
     (core, path)
 }
 
@@ -401,6 +423,7 @@ fn execute_bound_insert_in_session_compare_only_without_ledger_accepts_none() {
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
         .with_ledger_mode(LedgerMode::CompareOnlyWithoutLedger);
     let policy = ctx("tenant-a", [Visibility::Private]);
 

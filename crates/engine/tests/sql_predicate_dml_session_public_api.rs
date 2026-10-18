@@ -46,7 +46,8 @@ fn open_core(label: &str) -> (EngineCore, CleanupGuard) {
     let guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(engine::kernel::CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(engine::kernel::CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (core, guard)
 }
 
@@ -363,7 +364,8 @@ fn open_numeric_core(label: &str) -> (EngineCore, CleanupGuard) {
     storage
         .create_table(&numeric_table_schema())
         .expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(engine::kernel::CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(engine::kernel::CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (core, guard)
 }
 

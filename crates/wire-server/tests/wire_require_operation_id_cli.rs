@@ -8,8 +8,10 @@
 //! - R3: 起動ログ行は指定時のみ、`listening on` より前に出る
 //! - R4: 指定時は `USING OPERATION_ID` 省略の書き込みが `23502`、付与すれば成功
 //!
-//! 未指定時の挙動（任意モード）は engine 側の #1704、切替の回帰は #1705 が固定
-//! するため、本ファイルでは固定しない。
+//! - R5: 未指定（既定）では `USING OPERATION_ID` 省略の書き込みが成功する（Issue #1704）
+//!
+//! 既定と必須の全組み合わせの行列回帰は #1705 が固定するため、本ファイルでは R5 の
+//! 代表経路のみを持つ。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -164,6 +166,38 @@ fn flag_rejects_insert_without_operation_id_with_23502() {
     common::send_simple_query(
         &mut stream,
         "INSERT INTO docs (id, embedding) VALUES (1, '[0.1,0.2,0.3]') USING OPERATION_ID 'cli-op-1'",
+    );
+    assert_eq!(common::read_command_complete(&mut stream), "INSERT 0 1");
+    common::read_ready_for_query(&mut stream);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// R5: フラグ未指定（既定）では `USING OPERATION_ID` 省略の INSERT が成功する
+/// （Issue #1704・RECOVER-1。台帳に記録しない通常の書き込み）。
+#[test]
+fn default_accepts_insert_without_operation_id() {
+    let fixture = common::TempFixtureDir::new("r5");
+    write_user_store_with_alice(&fixture.users_path_str());
+    let mut args = base_args(&fixture);
+    args.extend(
+        ["--ddl-allowed-users", "alice"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+    let mut child = spawn(&args);
+    let (addr, _lines) =
+        common::wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
+    let mut stream = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    common::send_simple_query(&mut stream, "CREATE TABLE docs (embedding VECTOR(3))");
+    let _ = common::read_command_complete(&mut stream);
+    common::read_ready_for_query(&mut stream);
+
+    common::send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding) VALUES (1, '[0.1,0.2,0.3]')",
     );
     assert_eq!(common::read_command_complete(&mut stream), "INSERT 0 1");
     common::read_ready_for_query(&mut stream);
