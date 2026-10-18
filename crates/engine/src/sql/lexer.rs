@@ -279,9 +279,17 @@ pub const MAX_TOKEN_COUNT: usize = 20_000;
 /// 取り違えても葉解析側が引用付き語を列参照として扱うため fail-closed を保つ。
 fn demote_unneeded_quoted_bool_words(tokens: &mut [Token]) {
     let mut seen_where = false;
+    // ALTER 文かどうかと `USING` 出現済みかを走査中に保持し、再走査（O(n^2)）を避ける。
+    let is_alter =
+        matches!(tokens.first(), Some(Token::Ident(a)) if a.eq_ignore_ascii_case("ALTER"));
+    let mut seen_using = false;
     for i in 0..tokens.len() {
         if matches!(tokens.get(i), Some(Token::Keyword(Keyword::Where))) {
             seen_where = true;
+            continue;
+        }
+        if matches!(tokens.get(i), Some(Token::Ident(u)) if u.eq_ignore_ascii_case("USING")) {
+            seen_using = true;
             continue;
         }
         if !matches!(tokens.get(i), Some(Token::QuotedBoolWord(_))) {
@@ -289,11 +297,7 @@ fn demote_unneeded_quoted_bool_words(tokens: &mut [Token]) {
         }
         // ALTER 文の `USING` 句以降（ALTER COLUMN TYPE の式。Issue #1635）は、`"true"`／`"false"`
         // を裸のリテラルと区別するため印を残す（`Parser::new` が `Ident` へ戻して列参照にする）。
-        let alter_using = matches!(tokens.first(), Some(Token::Ident(a)) if a.eq_ignore_ascii_case("ALTER"))
-            && tokens
-                .iter()
-                .take(i)
-                .any(|t| matches!(t, Token::Ident(u) if u.eq_ignore_ascii_case("USING")));
+        let alter_using = is_alter && seen_using;
         if !alter_using && !(seen_where && quoted_bool_word_in_leaf_position(tokens, i)) {
             if let Some(Token::QuotedBoolWord(s)) = tokens.get(i).cloned() {
                 if let Some(slot) = tokens.get_mut(i) {
