@@ -2,10 +2,10 @@
 //! ポインタ: `docs/spec/04-behavior/data-model.md` の TABLE-44（SQL-23・SQL-31・SQL-46 を併用）。
 //!
 //! `EngineCore::execute_sql_in_session`／`execute_sql_in_txn`／`execute_parsed_in_session` を
-//! production 経路として使う。一時表への DML は #1684 の担当のため、ここでは DDL の受理・
+//! production 経路として使う。一時表への DML は `table44_temp_table_dml.rs`（#1684）が担い、ここでは DDL の受理・
 //! `ON COMMIT` の可視な結果（`DROP` の消滅・名前解決）・DDL 権限ゲートの対象外・未対応の形の
 //! fail-closed な拒否・上限・セッション分離を検証する。`DELETE ROWS` の行の消え方は
-//! `sql/temp_on_commit_tests.rs`（行ストアへ直接行を置く単体テスト）が担う。
+//! `sql/temp_on_commit_tests.rs`・`table44_temp_table_dml.rs` が担う。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -366,7 +366,8 @@ fn parsed_statements_pass_the_coarse_gate_for_temp_ddl() {
     let parsed = core.parse_sql("CREATE TEMP TABLE a (x TEXT)").unwrap();
     core.execute_parsed_in_session(&c, &mut s, &parsed)
         .expect("a was dropped");
-    // 一時表の行を読み書きしうる文は暫定ゲートで 0A000 のまま（#1684 で解除）。
+    // セッションを持たない parse で作られた文は、一時カタログが空でないセッションでは粗いゲートで
+    // 0A000 のまま（名前が一時表かを判定できないため。セッション対応の parse は #1684）。
     let sel = core
         .parse_sql("SELECT id FROM docs ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 1")
         .unwrap();

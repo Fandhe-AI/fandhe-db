@@ -63,6 +63,11 @@ use crate::search_engine;
 use crate::storage::{Row, Storage, StorageError};
 use redb::ReadableDatabase;
 
+// 一時表（TABLE-44・Issue #1684）の振り分けと実行。永続コアの私的な項目に触れるため子モジュールに
+// 置く（`core.rs` の肥大化を避ける目的も兼ねる）。
+mod temp_route;
+pub use temp_route::SessionRoutedSql;
+
 mod matview_exec;
 
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
@@ -1556,6 +1561,12 @@ pub enum ParsedSql {
     /// 網羅 `match` をコンパイル時に強制する。DDL 実行権限ゲートの対象外（セッション内で閉じる）。
     /// 実行は `EngineCore::execute_parsed_in_session` の本 variant の分岐が担う。
     CreateTempTable(crate::sql::allowlist::ValidatedCreateTempTable),
+    /// 一時表だけを参照する文を、セッション専用の一時コアで実行する形（TABLE-44・Issue #1684）。
+    /// `INSERT`／`UPDATE`／`DELETE`／`TRUNCATE`／読み取り系／索引 DDL を包む。永続コアの実行器へ
+    /// 渡すと同名の永続表へ作用してしまうため、永続側の [`ParsedSql`] とは別 variant にして、
+    /// 網羅 `match` の確認漏れをコンパイル時に検出する（`CreateTempTable` と同じ理由）。
+    /// 一時カタログの世代を持ち、一時表の作成・削除・索引 DDL の後に実行すると `0A000` で拒否する。
+    SessionRouted(Box<SessionRoutedSql>),
     /// `DECLARE`/`FETCH`/`CLOSE`（カーソル。WIRE-15・TASK-218）。トランザクション
     /// 文脈を持たない [`EngineCore::execute_parsed_in_session`] はこの variant を
     /// `DECLARE` なら `25P01`（`NoActiveSqlTransaction`）、`FETCH`／`CLOSE` なら
@@ -1663,6 +1674,19 @@ fn show_time_zone_columns() -> Vec<crate::sql::exec::ColumnMeta> {
     }]
 }
 
+impl ParsedSql {
+    /// セッションの一時カタログに対する振り分けの包み（[`ParsedSql::SessionRouted`]）を外した、
+    /// 文そのものの構文形を返す。包まれていなければ自分自身。wire-server が、実行した文の種類
+    /// （書き込みか・カーソルの `FETCH` か等）を判定するために使う。包みを外した形を永続コアの
+    /// 実行入口へ渡してはならない（一時表の文は一時コアでしか実行できない）。
+    pub fn peel_session_route(&self) -> &ParsedSql {
+        match self {
+            ParsedSql::SessionRouted(routed) => routed.inner(),
+            other => other,
+        }
+    }
+}
+
 /// セッション TimeZone を現在の文の束縛区間へ張る（`execute_parsed_in_session` 等の
 /// セッション入口が呼ぶ。TZ を持たない `TIMESTAMPTZ` リテラルの解釈とDDL既定値の正規化が
 /// 読む。TABLE-33・Issue #1575）。
@@ -1677,6 +1701,10 @@ fn statement_clock_scope(
     txn_start_micros: Option<i64>,
 ) -> Result<Option<crate::sql::time_fn::ClockScope>, crate::sql::allowlist::SqlSurfaceError> {
     let is_read = match parsed {
+        // 一時表の文は、中身の文種で判定する（時刻の確定は永続側と同じ規則）。
+        ParsedSql::SessionRouted(routed) => {
+            return statement_clock_scope(routed.inner(), txn_start_micros)
+        }
         ParsedSql::Statement(_)
         | ParsedSql::Insert(_)
         | ParsedSql::Delete(_)
@@ -1722,6 +1750,9 @@ fn insert_default_clock_scope(
 ) -> Result<Option<crate::sql::time_fn::DefaultClockScope>, crate::sql::allowlist::SqlSurfaceError>
 {
     let is_insert = match parsed {
+        ParsedSql::SessionRouted(routed) => {
+            return insert_default_clock_scope(routed.inner(), txn_start_micros)
+        }
         ParsedSql::Insert(_) => true,
         ParsedSql::Statement(_)
         | ParsedSql::Truncate(_)
@@ -1879,6 +1910,10 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         ParsedSql::Update(crate::sql::allowlist::ValidatedUpdateForm::Predicate(v)) => {
             v.operation_id().map(|id| id.as_str())
         }
+        // 永続側の文を包んだ形は中身の `operation_id` を使う（一時表の文は `operation_id` を持たない）。
+        ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
+            parsed_operation_id(routed.inner())
+        }
         _ => None,
     }
 }
@@ -1895,6 +1930,9 @@ fn is_partitioned_write(parsed: &ParsedSql) -> bool {
             v.partitioned().is_some()
         }
         ParsedSql::Partitioned(control) => control.writes(),
+        ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
+            is_partitioned_write(routed.inner())
+        }
         _ => false,
     }
 }
@@ -1917,6 +1955,10 @@ pub struct PreparedSql {
     tokens: Vec<crate::sql::lexer::Token>,
     param_count: u16,
     dummy_parsed: ParsedSql,
+    /// 一時表（TABLE-44・Issue #1684）の経路。セッションを持たない Parse は常に `Plain`。
+    /// セッション対応の Parse が一時表だけを参照する文を一時コアで構造検証したときは `Temp`
+    /// （`dummy_parsed` も一時コア向けの形で包む。`core/temp_route.rs`）。
+    route: temp_route::PreparedRoute,
     /// `dummy_parsed` の `ORDER BY` ベクトルリテラル（`Distance` 形。
     /// [`crate::sql::allowlist::OrderByForm::Distance`]）が、元の SQL テキストの
     /// `$n`（[`crate::sql::params::order_by_distance_literal_is_param`]）に由来する
@@ -3852,19 +3894,20 @@ impl EngineCore {
         }
     }
 
-    /// セッション一時カタログ対応の構文検証（TABLE-44・Issue #1681。暫定ゲート。#1684 で置換）。
+    /// セッション一時カタログ対応の構文検証（TABLE-44・Issue #1681。一時表への振り分けは Issue #1684）。
     ///
-    /// 一時カタログが空なら [`Self::parse_tokens`] と同一。空でなければ、(i) トークン列が
-    /// 一時表の名前と ASCII 大小無視で一致する識別子を含む、または (ii) 一時カタログ優先の
-    /// lookup が parse 中に一時表を引いた、のいずれでも `0A000` で拒否する。一時表の行ストア・
-    /// 実行器が無い間に通すと、同名の**永続表**へ作用してしまう（fail-open）ため。(i) は
-    /// カタログを引かない文（DROP・ALTER・CREATE INDEX 等）も覆う。トランザクション制御文は
-    /// 関係名を持たないため走査しない。
+    /// 一時カタログが空なら [`Self::parse_tokens`] と同一。空でなければ、トランザクション制御文と
+    /// `CREATE [TEMP] TABLE`／`DROP TABLE`（関係を読み書きせず、実行段が自セッションの一時カタログで
+    /// 名前を解決する）を除き、トークン列に一時表の名前と ASCII 大小無視で一致する識別子が無ければ
+    /// 通常の parse、あれば [`Self::route_temp_statement`]（一時コアへの振り分け。混在・対象外の
+    /// 文種は `0A000`）に回す。トークン走査は保守的（一致しすぎても拒否側＝fail-closed）で、
+    /// カタログを引かない文（`ALTER`・ビュー・カーソル等）や永続ビュー本文の再検証も覆う。
     fn parse_tokens_gated(
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
-        temp: &crate::sql::temp_catalog::SessionTempCatalog,
+        session: &crate::sql::mode::SessionState,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        let temp = session.temp_tables();
         if temp.is_empty() {
             return self.parse_tokens(tokens);
         }
@@ -3883,35 +3926,47 @@ impl EngineCore {
         let scan_exempt = is_drop_table
             || crate::sql::allowlist::is_create_table_statement(&tokens)
             || crate::sql::allowlist::is_create_temp_table_statement(&tokens);
-        if !txn_control_head
-            && !scan_exempt
-            && crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp)
-        {
-            return Err(crate::sql::temp_catalog::temp_table_unsupported());
+        if txn_control_head || scan_exempt {
+            let hits = crate::sql::temp_catalog::RelationHits::default();
+            let parsed = self.parse_tokens_in(tokens, temp, &hits, self.ledger_mode)?;
+            if hits.temp_hit() {
+                return Err(crate::sql::temp_catalog::temp_table_unsupported());
+            }
+            return Ok(parsed);
         }
-        let hit = std::cell::Cell::new(false);
-        let parsed = self.parse_tokens_in(tokens, temp, &hit)?;
-        if hit.get() {
-            return Err(crate::sql::temp_catalog::temp_table_unsupported());
+        // `DROP INDEX <名前>` は索引名しか持たず、一時表の名前がトークンに現れない。一時表の索引かどうかは
+        // 一時 DB のカタログで決まる（一時表の索引は永続側の DDL 権限ゲートの対象外）。
+        if crate::sql::allowlist::is_drop_index_statement(&tokens) {
+            return self.route_drop_index(tokens, session);
         }
-        Ok(parsed)
+        if !crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
+            return self.parse_tokens(tokens);
+        }
+        self.route_temp_statement(tokens, session)
     }
 
-    /// 粗いゲート（暫定。TABLE-44・Issue #1681）。既に parse 済みの [`ParsedSql`] を受ける入口
-    /// （拡張クエリの Parse はセッションを持たず、名前が一時表かを判定できない）では、
-    /// 一時カタログが空でないセッションの文を（トランザクション制御以外）一律 `0A000` で
-    /// 拒否する。一時カタログが空なら何もしない。細かいゲートを済ませた SQL テキスト入口は
-    /// 本ゲートを持たない内部版（`*_inner`）を呼ぶ。#1684 でセッションを受ける Parse を導入して解除する。
+    /// 粗いゲート（TABLE-44・Issue #1681。#1684 で振り分け済みの文の世代検査を足した）。既に parse
+    /// 済みの [`ParsedSql`] を受ける入口（`execute_parsed_*`・`describe_*`）では、セッションを持たない
+    /// parse で作られた文（名前が一時表かを判定できていない）を、一時カタログが空でないセッションで
+    /// （トランザクション制御・`CREATE [TEMP] TABLE`・`DROP TABLE` 以外）一律 `0A000` で拒否する。
+    /// セッション対応の parse／Bind が振り分けた文（[`ParsedSql::SessionRouted`]）は、一時カタログの
+    /// 世代が振り分け時から変わっていなければ通す。一時カタログが空なら何もしない。細かい振り分けを
+    /// 済ませた SQL テキスト入口は本ゲートを持たない内部版（`*_inner`）を呼ぶ。
     ///
     /// | 入口 | ゲート |
     /// | ---- | ------ |
-    /// | `execute_sql_in_session`・`execute_sql_in_txn` | 細かい（`parse_tokens_gated`） |
-    /// | `begin_copy`・`begin_copy_in_txn` | 細かい（トークン走査 `copy_temp_gate`） |
-    /// | `execute_parsed_in_session`・`execute_parsed_in_txn`・`describe_*` | 粗い |
+    /// | `execute_sql_in_session`・`execute_sql_in_txn` | 細かい（`parse_tokens_gated` の振り分け） |
+    /// | `begin_copy`・`begin_copy_in_txn` | 細かい（`begin_copy_temp` の振り分け） |
+    /// | `execute_parsed_in_session`・`execute_parsed_in_txn`・`describe_*` | 粗い（世代検査つき） |
     fn coarse_temp_gate(
         session: &crate::sql::mode::SessionState,
         parsed: &ParsedSql,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        // 振り分け済みの文（一時表向け・永続側）は、一時カタログの世代・参照する一時表が振り分け時から
+        // 変わっていなければ通す。変わっていれば陳腐化として `0A000`（TABLE-44・Issue #1684）。
+        if let ParsedSql::SessionRouted(routed) = parsed {
+            return routed.require_current(session);
+        }
         // TABLE-44・Issue #1683: トランザクション制御に加え、一時表の行を読み書きしない
         // `CREATE [TEMP] TABLE`・`DROP TABLE` を通す（実行段がセッションの一時カタログで
         // 名前を解決する）。これらを通さないと、一時表を作った直後のセッションが拡張クエリで
@@ -3928,24 +3983,6 @@ impl EngineCore {
             return Ok(());
         }
         Err(crate::sql::temp_catalog::temp_table_unsupported())
-    }
-
-    /// `COPY` 入口の細かいゲート（SQL テキストのトークン走査。字句解析に失敗する入力は
-    /// 通常の検証へ任せる）。
-    fn copy_temp_gate(
-        session: &crate::sql::mode::SessionState,
-        sql: &str,
-    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-        let temp = session.temp_tables();
-        if temp.is_empty() {
-            return Ok(());
-        }
-        if let Ok(tokens) = crate::sql::lexer::tokenize_marked(sql) {
-            if crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
-                return Err(crate::sql::temp_catalog::temp_table_unsupported());
-            }
-        }
-        Ok(())
     }
 
     /// [`Self::execute_parsed_in_session_inner`] の公開入口。一時カタログが空でないセッションでは
@@ -3994,23 +4031,31 @@ impl EngineCore {
         // セッションを持たない入口（`parse_sql`・拡張クエリの Parse 等）は空の一時カタログで
         // 解決する（挙動は一時カタログ導入前と同一。TABLE-44・Issue #1681）。
         let temp = crate::sql::temp_catalog::SessionTempCatalog::default();
-        let hit = std::cell::Cell::new(false);
-        self.parse_tokens_in(tokens, &temp, &hit)
+        let hits = crate::sql::temp_catalog::RelationHits::default();
+        self.parse_tokens_in(tokens, &temp, &hits, self.ledger_mode)
     }
 
     /// [`Self::parse_tokens`] のセッション一時カタログ対応版（TABLE-44・Issue #1681）。
     /// カタログを引く検証器へ、一時カタログ優先の
     /// [`crate::sql::temp_catalog::SessionRelationLookup`] を渡す。一時表に当たると
-    /// `hit` が立つ（呼び出し元の暫定ゲートが `0A000` で拒否する）。`temp` が空なら
-    /// 永続カタログ（`Storage`）だけを引き、`parse_tokens` と完全に同一に振る舞う。
+    /// `hits` の一時側が、永続の関係（表・ビュー）に当たると永続側が立つ（呼び出し元の振り分け
+    /// [`Self::route_temp_statement`] が使う）。`temp` が空なら永続カタログ（`Storage`）だけを引き、
+    /// `parse_tokens` と完全に同一に振る舞う。`ledger_mode` は書き込み文の `operation_id` 必須化の
+    /// 判定に使う台帳モードで、通常は `self.ledger_mode`。一時表への書き込みの分類 parse だけが
+    /// 緩めたモードを渡す。
     fn parse_tokens_in(
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
         temp: &crate::sql::temp_catalog::SessionTempCatalog,
-        hit: &std::cell::Cell<bool>,
+        hits: &crate::sql::temp_catalog::RelationHits,
+        ledger_mode: LedgerMode,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
-        let storage_lookup =
-            crate::sql::temp_catalog::SessionRelationLookup::new(&self.storage, temp, hit);
+        let storage_lookup = crate::sql::temp_catalog::SessionRelationLookup::new(
+            &self.storage,
+            temp,
+            hits.temp_cell(),
+        )
+        .with_persistent_hit(hits.persistent_cell());
         // 引用付き `NULL`（`Token::QuotedNull`）を値位置で区別する必要があるのは
         // INSERT／UPDATE／CREATE／ALTER（`WITH` 先頭の DML 含む）の許可リスト検証だけ
         // （Issue #1524）。それ以外の文種は従来どおり `Ident` として扱う（識別子位置の
@@ -4097,12 +4142,16 @@ impl EngineCore {
         );
         if is_insert_statement {
             let insert_inner = InsertSchemaLookup::new(&self.storage);
-            let lookup =
-                crate::sql::temp_catalog::SessionRelationLookup::new(&insert_inner, temp, hit);
+            let lookup = crate::sql::temp_catalog::SessionRelationLookup::new(
+                &insert_inner,
+                temp,
+                hits.temp_cell(),
+            )
+            .with_persistent_hit(hits.persistent_cell());
             let stmt = crate::sql::allowlist::validate_insert_tokens_with_limit(
                 &tokens,
                 &lookup,
-                self.ledger_mode,
+                ledger_mode,
                 self.dml_limits.max_insert_rows_per_statement,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
@@ -4117,7 +4166,7 @@ impl EngineCore {
             let stmt = crate::sql::allowlist::validate_truncate_tokens(
                 &tokens,
                 &storage_lookup,
-                self.ledger_mode,
+                ledger_mode,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return Ok(ParsedSql::Truncate(stmt));
@@ -4131,7 +4180,7 @@ impl EngineCore {
             let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
                 &tokens,
                 &storage_lookup,
-                self.ledger_mode,
+                ledger_mode,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
             if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
@@ -4148,7 +4197,7 @@ impl EngineCore {
             let stmt = crate::sql::allowlist::validate_update_form_tokens(
                 &tokens,
                 &storage_lookup,
-                self.ledger_mode,
+                ledger_mode,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
             if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
@@ -4508,6 +4557,7 @@ impl EngineCore {
                 .map(|i| declared.get(i).copied().flatten())
                 .collect(),
             session_tz_dependent,
+            route: temp_route::PreparedRoute::Plain,
         })
     }
 
@@ -4821,7 +4871,7 @@ impl EngineCore {
         // `bind_aggregate_with_dummy_flags`／`bind_projection_for_describe`／
         // `bind_scan_with_dummy_flags` の
         // いずれが呼ばれても同じ配列を共有する）。
-        Self::coarse_temp_gate(session, &prepared.dummy_parsed)?;
+        Self::check_prepared_for_session(session, prepared)?;
         self.describe_parsed_in_session_impl(
             session,
             &prepared.dummy_parsed,
@@ -4843,6 +4893,12 @@ impl EngineCore {
         session: &mut crate::sql::mode::SessionState,
         parsed: &ParsedSql,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 永続側の文を包んだ形（世代の検査は公開入口の粗いゲートが済ませている）は中身を実行する。
+        if let ParsedSql::SessionRouted(routed) = parsed {
+            if routed.is_persistent() {
+                return self.execute_parsed_in_session_inner(ctx, session, routed.inner());
+            }
+        }
         let outcome = self.execute_parsed_statement(ctx, session, parsed)?;
         // 自動コミットの文が成功した直後に、一時表の `ON COMMIT` 動作を適用する
         // （TABLE-44・Issue #1683。失敗した文では適用しない。明示・暗黙トランザクションの
@@ -4992,6 +5048,14 @@ impl EngineCore {
             ParsedSql::Partitioned(control) => {
                 self.execute_partitioned_control(ctx, session, control)
             }
+            // TABLE-44・Issue #1684: 一時表だけを参照する文は一時コアで実行する
+            // （`core/temp_route.rs`）。永続コアの実行器へは渡さない。
+            ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
+                self.execute_parsed_statement(ctx, session, routed.inner())
+            }
+            ParsedSql::SessionRouted(routed) => {
+                self.execute_temp_routed_autocommit(ctx, session, routed)
+            }
             // SQL-23・TASK-203（Issue #902）: DDL 実行権限ゲート
             // （`sql::ddl::require_ddl_permission`）を、カタログ照会（対象
             // テーブルの存在確認）を含む `execute_drop_table` より必ず先に
@@ -5069,6 +5133,7 @@ impl EngineCore {
                     stmt,
                     &self.schema_limits,
                     self.temp_table_limits,
+                    self,
                 )?;
                 Ok(crate::sql::SqlOutcome::CreateTable(outcome))
             }
@@ -5209,7 +5274,7 @@ impl EngineCore {
         // TimeZone を parse 区間へも張る（ゾーン無し `TIMESTAMPTZ` リテラル・`AT LOCAL`。Issue #1576）。
         let parsed = {
             let _session_tz_scope = session_time_zone_scope(session);
-            self.parse_tokens_gated(tokens, session.temp_tables())?
+            self.parse_tokens_gated(tokens, session)?
         };
         // 一時カタログに対する細かいゲートは上の parse で通過済みのため、粗いゲートを持たない
         // 内部版を呼ぶ（TABLE-44・Issue #1681）。
@@ -5251,7 +5316,7 @@ impl EngineCore {
             // `parse_sql` と同じ字句解析 → 構文検証に、一時カタログの細かいゲートを足したもの。
             let parsed = (|| {
                 let tokens = crate::sql::lexer::tokenize_marked(sql)?;
-                self.parse_tokens_gated(tokens, session.temp_tables())
+                self.parse_tokens_gated(tokens, session)
             })();
             match parsed {
                 Ok(parsed) => parsed,
@@ -5291,6 +5356,12 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::transaction::{TransactionStatus, TxnControl};
 
+        // 永続側の文を包んだ形（世代の検査は公開入口の粗いゲートが済ませている）は中身を実行する。
+        if let ParsedSql::SessionRouted(routed) = parsed {
+            if routed.is_persistent() {
+                return self.execute_parsed_in_txn_inner(ctx, session, txn, routed.inner());
+            }
+        }
         if let ParsedSql::Transaction(ctrl) = parsed {
             return match ctrl {
                 TxnControl::Begin => {
@@ -5516,6 +5587,14 @@ impl EngineCore {
                 self.execute_partitioned_control(ctx, session, control)
             }
             ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
+            // TABLE-44・Issue #1684: 一時表の文は、一時側の書き込みトランザクション（最初の一時表の
+            // 文で開く）の上で一時コアが実行する。永続側の write txn・dirty 判定には触れない。
+            ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
+                self.execute_in_active_txn(ctx, session, txn, routed.inner())
+            }
+            ParsedSql::SessionRouted(routed) => {
+                self.execute_temp_routed_in_txn(ctx, session, txn, routed)
+            }
             // COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
@@ -5822,7 +5901,20 @@ impl EngineCore {
         parsed: &ParsedSql,
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
-        if let ParsedSql::Cursor(stmt) = parsed {
+        // 永続側の文を包んだ形（拡張クエリの Bind が一時カタログが空でないセッションで作る）の中身が
+        // カーソル文なら、包みを外した文として扱う（世代の検査は先に済ませる）。
+        let cursor = match parsed {
+            ParsedSql::Cursor(stmt) => Some(stmt),
+            ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
+                routed.require_current(session)?;
+                match routed.inner() {
+                    ParsedSql::Cursor(stmt) => Some(stmt),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(stmt) = cursor {
             return match stmt {
                 crate::sql::cursor::CursorStatement::Declare { .. }
                 | crate::sql::cursor::CursorStatement::Close { .. } => Ok(None),
@@ -6102,6 +6194,24 @@ impl EngineCore {
         let _session_tz_scope = session_time_zone_scope(session);
 
         match parsed {
+            // TABLE-44・Issue #1684: 一時表の文は一時コアが結果列を導出する。
+            ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
+                routed.require_current(session)?;
+                self.describe_parsed_in_session_impl(
+                    session,
+                    routed.inner(),
+                    skip_vector_literal_validation,
+                    dummy_equality_flags,
+                    limits,
+                )
+            }
+            ParsedSql::SessionRouted(routed) => self.describe_temp_routed(
+                session,
+                routed,
+                skip_vector_literal_validation,
+                dummy_equality_flags,
+                limits,
+            ),
             ParsedSql::Insert(stmt) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&stmt.table_name)?;
                 match crate::sql::parser::bind_returning(stmt.returning.as_ref(), &schema)? {
@@ -8555,7 +8665,14 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
-        Self::copy_temp_gate(session, sql)?;
+        if let Some(plan) = self.begin_copy_temp(
+            ctx,
+            session,
+            None::<&mut crate::sql::transaction::SessionTransaction<'_>>,
+            sql,
+        )? {
+            return Ok(plan);
+        }
         let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)
             .map_err(|e| self.reclassify_matview_write_error(e))?;
         self.begin_copy_validated(ctx, session, stmt, None)
@@ -8647,7 +8764,9 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
-        Self::copy_temp_gate(session, sql)?;
+        if let Some(plan) = self.begin_copy_temp(ctx, session, Some(&mut *txn), sql)? {
+            return Ok(plan);
+        }
         let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)
             .map_err(|e| self.reclassify_matview_write_error(e))?;
         if let crate::sql::allowlist::CopyStatement::To(v) = &stmt {
@@ -8693,6 +8812,11 @@ impl EngineCore {
         ctx: &PolicyContext,
         batch: crate::sql::copy::CopyInBatch,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 一時表向けのバッチはセッションを要する `commit_copy_in_txn_in_session` だけが扱う
+        // （`ON COMMIT` の適用に `SessionState` が要る。永続 DB へ書く経路には絶対に載せない）。
+        if batch.temp.is_some() {
+            return Err(crate::sql::temp_catalog::temp_table_unsupported());
+        }
         self.commit_copy_in_with_target(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
             ctx,
@@ -8716,6 +8840,9 @@ impl EngineCore {
         batch: crate::sql::copy::CopyInBatch,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::transaction::TransactionStatus;
+        if batch.temp.is_some() {
+            return Err(crate::sql::temp_catalog::temp_table_unsupported());
+        }
         match txn.status() {
             TransactionStatus::Idle => self.commit_copy_in(ctx, batch),
             TransactionStatus::Failed => Err(txn.take_failed_error()),
@@ -8761,6 +8888,8 @@ impl EngineCore {
             bounds,
             schema: bound_schema,
             evaluated_at,
+            // 一時表向けの印は呼び出し元（`commit_copy_in*` の各入口）が振り分け済み。ここでは使わない。
+            temp: _,
         } = batch;
         // COPY の束縛は wire メッセージをまたいで完了済みのため、台帳 v3 の評価時刻を
         // 書き込み区間へ明示的に渡す（Issue #2188。None は v2 の権威値）。

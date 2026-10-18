@@ -17,7 +17,7 @@
 /// 1 セッションが持てる一時表の数のハード上限（かつ既定値）。
 pub const MAX_TEMP_TABLES_PER_SESSION: usize = 64;
 
-/// 1 セッションの一時表の論理総バイト数のハード上限（かつ既定値。64 MiB）。
+/// 1 セッションの一時表の総バイト数（確保済みページ総量）のハード上限（かつ既定値。64 MiB）。
 pub const MAX_TEMP_BYTES_PER_SESSION: u64 = 64 * 1024 * 1024;
 
 /// 2 上限に設定できる最小値。
@@ -56,7 +56,7 @@ impl TempTableLimits {
         self.max_tables_per_session
     }
 
-    /// 1 セッションの一時表の論理総バイト数の上限。
+    /// 1 セッションの一時表の総バイト数（確保済みページ総量）の上限。
     pub fn max_bytes_per_session(&self) -> u64 {
         self.max_bytes_per_session
     }

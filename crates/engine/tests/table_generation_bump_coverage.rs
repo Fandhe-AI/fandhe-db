@@ -76,8 +76,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （旧: 652／683）。
     // Issue #1179（`storage::read_source` モジュール宣言の追加）で行番号が移動したための追随（旧: 804／835）。
     // Issue #1128（`begin_partitioned_chunk_txn` の追加）で行番号が移動したための追随（旧: 820／851）。
-    ("storage.rs", 930),
-    ("storage.rs", 961),
+    // TABLE-44・Issue #1684（`Storage::from_db`・`open_with_backend` の追加）で行番号が移動した
+    // ための追随（旧: 930／961）。
+    ("storage.rs", 950),
+    ("storage.rs", 981),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 201),
     ("txn.rs", 372),
@@ -426,7 +428,15 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 抽出し、Issue #1179 で COMMIT 時の遅延 FK 検査対象を dirty テーブル（世代の変化
     // から検出）へ拡張したことでさらに移動（旧: 330）。書き込み内容・commit の意味は不変。
     // Issue #1553（明示トランザクションの最大時間・最大文数の CLI 設定化）の行追加でさらに移動（旧: 793）。
-    ("sql/transaction.rs", 899),
+    // TABLE-44・Issue #1684（一時表の DML）: `commit_active` に一時側の確定・`ON COMMIT` 適用が加わり
+    // 行が移動したための追随（旧: 899）。書き込み内容・commit の意味は不変。
+    ("sql/transaction.rs", 955),
+    // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
+    // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
+    // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が
+    // 開いているトランザクションに積んだ変更だけで、本箇所自体は新たな `user_rows/{table}` 書き込みを
+    // 行わない。一時 DB の世代は一時コア専用のキャッシュ（永続コアと共有しない）だけが読む。
+    ("sql/temp_rows.rs", 264),
     // Issue #1129（分割実行 DML の取り消し）: 取り消し済み記録への縮小（`partitioned_job::
     // cancel_in_txn`）はジョブ表（`PARTITIONED_JOB_TABLE`・索引表）だけを書き、
     // `CATALOG_TABLE`／`user_rows/{table}` のいずれにも触れない（commit 済みチャンクの行は

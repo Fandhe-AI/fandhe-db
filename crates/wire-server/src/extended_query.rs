@@ -448,7 +448,13 @@ fn parse_execute_body(body: &[u8]) -> Result<ExecuteMessage, BodyError> {
 /// クエリテキスト——PostgreSQL は空文の Parse を構文エラーにせず受理する）。
 pub(crate) enum PreparedStatement {
     Empty,
-    Parsed(ParsedSql),
+    /// `$n` を含まない文。Parse 時点の構文形 `parsed` に加え、一時表（TABLE-44・Issue #1684）を持つ
+    /// セッションで Bind のたびにセッション対応の経路で検証し直せるよう、元の [`PreparedSql`] も
+    /// 保持する（一時表を持たないセッションでは `parsed` をそのまま使い、従来と挙動が同一）。
+    Parsed {
+        parsed: ParsedSql,
+        prepared: Box<PreparedSql>,
+    },
     /// `$n` を含む文（WIRE-12）。engine の [`PreparedSql`] テンプレートと、
     /// `$n` ごとの公告 OID・バイナリ可否（[`ParamSlot`]）を保持する。Bind が
     /// `engine.bind_prepared` で値を束縛して [`ParsedSql`] を得る。
@@ -1447,6 +1453,15 @@ pub(crate) fn handle_parse<S: WireStream>(
     }
 }
 
+/// 準備済みの `$n` なし文を、Describe でセッション対応の経路（一時カタログに照らした検証）に
+/// 通す必要があるか（TABLE-44・Issue #1684）。一時表を持つセッション、または一時表の経路で
+/// 準備した文が対象。カーソル文は列メタデータをトランザクションのカーソル集合から引くため
+/// 従来の経路のまま。
+fn needs_session_revalidation(session: &SessionState, parsed: &ParsedSql) -> bool {
+    !matches!(parsed.peel_session_route(), ParsedSql::Cursor(_))
+        && (session.has_temp_tables() || matches!(parsed, ParsedSql::SessionRouted(_)))
+}
+
 fn handle_parse_body(
     engine: &EngineCore,
     session: &SessionState,
@@ -1502,7 +1517,7 @@ fn handle_parse_body(
             let _session_tz_scope =
                 engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
             engine
-                .parse_sql_prepared_with_declared(&msg.query, &declared_types)
+                .parse_sql_prepared_with_declared_in_session(session, &msg.query, &declared_types)
                 .map_err(HandlerError::Sql)?
         };
         match prepared.parsed_if_unparameterized() {
@@ -1512,7 +1527,10 @@ fn handle_parse_body(
                 if msg.num_param_types > 0 {
                     return Err(HandlerError::DeclaredParamTypesExceedPlaceholders);
                 }
-                PreparedStatement::Parsed(parsed.clone())
+                PreparedStatement::Parsed {
+                    parsed: parsed.clone(),
+                    prepared: Box::new(prepared),
+                }
             }
             None => {
                 let slots = build_param_slots(&prepared, &declared_oids)?;
@@ -1721,9 +1739,19 @@ fn handle_describe_body(
                 // `txn` が保持する開いているカーソルの列メタデータを返す
                 // （それ以外の `ParsedSql` は `describe_parsed_in_session` と
                 // 完全に同一の判定へ委譲する）。
-                PreparedStatement::Parsed(parsed) => engine
-                    .describe_parsed_in_txn(session, txn, parsed)
-                    .map_err(HandlerError::Sql)?,
+                // 一時表を持つセッション（または一時表の経路で準備した文）では、一時カタログの
+                // 変化を検出するためセッション対応の検証を通す（カーソル文は従来の経路）。
+                PreparedStatement::Parsed { parsed, prepared } => {
+                    if needs_session_revalidation(session, parsed) {
+                        engine
+                            .describe_prepared_in_session(session, prepared)
+                            .map_err(HandlerError::Sql)?
+                    } else {
+                        engine
+                            .describe_parsed_in_txn(session, txn, parsed)
+                            .map_err(HandlerError::Sql)?
+                    }
+                }
             };
             Ok(DescribeResult::Statement(columns, param_oids))
         }
@@ -1819,9 +1847,12 @@ fn handle_bind_body(
             state.statements.get(&msg.statement_name),
             Some(
                 PreparedStatement::Empty
-                    | PreparedStatement::Parsed(ParsedSql::Transaction(
-                        engine::sql::transaction::TxnControl::Rollback
-                    ))
+                    | PreparedStatement::Parsed {
+                        parsed: ParsedSql::Transaction(
+                            engine::sql::transaction::TxnControl::Rollback
+                        ),
+                        ..
+                    }
             )
         );
         if !is_exit_or_empty {
@@ -1842,7 +1873,7 @@ fn handle_bind_body(
     // ならない（`08P01`）。
     let required = match statement {
         PreparedStatement::Parameterized { slots, .. } => slots.len(),
-        PreparedStatement::Empty | PreparedStatement::Parsed(_) => 0,
+        PreparedStatement::Empty | PreparedStatement::Parsed { .. } => 0,
     };
     if num_params != required {
         return Err(HandlerError::ParamCountMismatch);
@@ -1910,7 +1941,7 @@ fn handle_bind_body(
                 let _session_tz_scope =
                     engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
                 engine
-                    .bind_prepared(prepared, &decoded)
+                    .bind_prepared_in_session(session, prepared, &decoded)
                     .map_err(HandlerError::Sql)?
             };
             let columns = engine
@@ -1918,8 +1949,20 @@ fn handle_bind_body(
                 .map_err(HandlerError::Sql)?;
             (PortalBody::Parsed(Box::new(bound)), columns)
         }
-        PreparedStatement::Parsed(parsed) => {
-            let parsed = parsed.clone();
+        PreparedStatement::Parsed { parsed, prepared } => {
+            // 一時表（TABLE-44・Issue #1684）を持つセッション、または一時表の経路で準備した文は、
+            // Bind のたびにセッション対応の経路で検証し直す（一時カタログが Parse 時から変わって
+            // いれば陳腐化として `0A000`）。一時表を持たないセッションは従来どおり `parsed` を使う。
+            let parsed =
+                if session.has_temp_tables() || matches!(parsed, ParsedSql::SessionRouted(_)) {
+                    let _session_tz_scope =
+                        engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
+                    engine
+                        .bind_prepared_in_session(session, prepared, &[])
+                        .map_err(HandlerError::Sql)?
+                } else {
+                    parsed.clone()
+                };
             // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替える
             // （`handle_describe_body` と同じ理由。`FETCH` の portal 列メタは
             // Bind 時点で開いているカーソルの列を反映する）。
@@ -2178,7 +2221,9 @@ fn execute_portal<'e, S: WireStream>(
         // `Insert`/`Truncate`/`Delete`/`Update` は常に単独 commit で成立し
         // 問題にならなかった）。
         let was_active_before_execution = txn.is_active();
-        let is_write_statement = match &parsed {
+        // 一時カタログに対する振り分けの包みは外した文の種類で判定する（TABLE-44・Issue #1684。
+        // 実行は包んだ形のまま `execute_parsed_in_txn` に渡す）。
+        let is_write_statement = match parsed.peel_session_route() {
             ParsedSql::Statement(_) => false,
             ParsedSql::Transaction(engine::sql::transaction::TxnControl::Commit) => true,
             ParsedSql::Transaction(_) => false,
@@ -2222,7 +2267,7 @@ fn execute_portal<'e, S: WireStream>(
         // （`PortalState::Suspended`）へ回った場合はこの束縛を再送出前の
         // 検証に使い、`CLOSE`／`COMMIT`／`ROLLBACK`／再 `DECLARE` を挟んで
         // いれば以降の再 Execute を拒否する（本関数冒頭の検証ブロック参照）。
-        let cursor_binding = match &parsed {
+        let cursor_binding = match parsed.peel_session_route() {
             ParsedSql::Cursor(engine::sql::cursor::CursorStatement::Fetch { name, .. }) => {
                 txn.active_generation().and_then(|txn_generation| {
                     txn.cursor_id(name).map(|cursor_id| CursorBinding {

@@ -341,6 +341,7 @@ pub(crate) fn execute_create_temp_table(
     validated: &ValidatedCreateTempTable,
     schema_limits: &SchemaLimits,
     temp_limits: crate::temp_table_limits::TempTableLimits,
+    template: &crate::core::EngineCore,
 ) -> Result<CreateTableOutcome, SqlSurfaceError> {
     let table = &validated.table;
     if table.if_not_exists && session.temp_tables().contains(&table.table_name) {
@@ -376,10 +377,23 @@ pub(crate) fn execute_create_temp_table(
             "too many temporary tables in this session",
         ));
     }
-    session.temp_rows_or_init(tenant_id, temp_limits.max_bytes_per_session())?;
-    session
+    session.temp_rows_or_init(tenant_id, temp_limits.max_bytes_per_session(), template)?;
+    let store = session
+        .temp_rows_arc()
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "temporary storage error".to_string(),
+        })?;
+    // 一時 DB のカタログへ先に実体を作る。以降の DML・索引・制約は一時コアが永続表と同じ
+    // 実行器でこの定義を読む。カタログ登録に失敗した場合は作った実体を戻す（孤児を残さない）。
+    store.create_table(&schema)?;
+    let name = schema.name.clone();
+    if let Err(e) = session
         .temp_tables_mut()
-        .register(schema, validated.on_commit, max_tables)?;
+        .register(schema, validated.on_commit, max_tables)
+    {
+        let _ = store.drop_tables(&[name]);
+        return Err(e);
+    }
     Ok(CreateTableOutcome {})
 }
 
@@ -403,19 +417,19 @@ pub(crate) fn classify_drop_targets(session: &SessionState, names: &[String]) ->
 /// 一時表の `DROP TABLE`（TABLE-44・Issue #1683）。DDL 権限ゲートの対象外で、永続カタログには
 /// 触れない。呼び出し元は [`classify_drop_targets`] が `Some(true)`（全名が一時表）を返した
 /// 場合に限る。一時表には依存物（ビュー・FOREIGN KEY）が無いため `CASCADE`／`RESTRICT` は
-/// 同じ挙動。カタログから外してから行領域を破棄する（失敗しても孤児は掃除できる）。
+/// 同じ挙動。一時 DB から実体を削除してから一時カタログから外す（実体の削除に失敗した場合は
+/// カタログを変えず、固定文言のエラーを返す）。
 pub(crate) fn execute_drop_temp_tables(
     session: &mut SessionState,
     validated: &ValidatedDropTable,
 ) -> Result<DropTableOutcome, SqlSurfaceError> {
-    let mut ids = Vec::new();
+    if let Some(store) = session.temp_rows_arc() {
+        store.drop_tables(&validated.table_names)?;
+    }
     for name in &validated.table_names {
         // 重複指定（`DROP TABLE t, t`）は 1 回として扱う（永続側と同じ）。
-        if let Some(id) = session.temp_tables_mut().remove(name) {
-            ids.push(id);
-        }
+        session.temp_tables_mut().remove(name);
     }
-    session.apply_temp_row_ops(&[], &ids)?;
     Ok(DropTableOutcome {
         skipped: false,
         cascaded: Vec::new(),
