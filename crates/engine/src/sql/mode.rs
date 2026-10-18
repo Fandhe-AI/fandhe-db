@@ -219,8 +219,13 @@ pub struct SessionState {
     /// セッション単位の一時カタログ（TABLE-44・Issue #1681）。接続単位の値型である
     /// ため他接続・他テナントへ漏れる経路は構造上存在せず、永続化もしない。ROLLBACK／abort
     /// の `SessionState` 巻き戻しに乗って取り消される。スキーマは `Arc` 共有のため
-    /// BEGIN／メッセージ単位の `clone` は安い。行データは持たない（行ストアは #1682）。
+    /// BEGIN／メッセージ単位の `clone` は安い。行データは持たない（行は `temp_rows` の行ストアが持つ）。
     temp_tables: crate::sql::temp_catalog::SessionTempCatalog,
+    /// 一時表の行ストア（TABLE-44・Issue #1682）。最初に行領域が要るとき
+    /// （[`Self::temp_rows_or_init`]）まで `None`（使わない接続のコストはゼロ）。
+    /// `Arc` を持つのは本構造体とその巻き戻し用 clone だけで、全部 drop されるとメモリごと
+    /// 消える（切断時の破棄）。詳細は `sql::temp_rows` のモジュールドキュメント。
+    temp_rows: Option<std::sync::Arc<crate::sql::temp_rows::TempRowStore>>,
 }
 
 impl SessionState {
@@ -261,6 +266,44 @@ impl SessionState {
     #[allow(dead_code)] // #1683 の CREATE TEMP TABLE 実行腕が使うまで、テストからのみ到達する
     pub(crate) fn temp_tables_mut(&mut self) -> &mut crate::sql::temp_catalog::SessionTempCatalog {
         &mut self.temp_tables
+    }
+
+    /// このセッションの一時表の行ストア（生成済みなら）。
+    #[allow(dead_code)] // #1683 以降の実行腕が使うまで、テストからのみ到達する
+    pub(crate) fn temp_rows(&self) -> Option<&crate::sql::temp_rows::TempRowStore> {
+        self.temp_rows.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn temp_rows_arc_for_test(
+        &self,
+    ) -> Option<std::sync::Arc<crate::sql::temp_rows::TempRowStore>> {
+        self.temp_rows.clone()
+    }
+
+    /// 行ストアを返す。未生成なら `tenant_id` 所有で生成する（遅延生成）。生成済みで所有
+    /// テナントが違う場合は fail-closed で拒否する。#1683 の `CREATE TEMP TABLE` が呼ぶ。
+    #[allow(dead_code)] // #1683 の CREATE TEMP TABLE 実行腕が使うまで、テストからのみ到達する
+    pub(crate) fn temp_rows_or_init(
+        &mut self,
+        tenant_id: &str,
+        max_total_bytes: u64,
+    ) -> Result<&crate::sql::temp_rows::TempRowStore, crate::sql::allowlist::SqlSurfaceError> {
+        let store = match self.temp_rows.take() {
+            Some(s) => s,
+            None => std::sync::Arc::new(crate::sql::temp_rows::TempRowStore::new(
+                tenant_id,
+                max_total_bytes,
+            )?),
+        };
+        let mismatch = !store.owner_matches(tenant_id);
+        let store = self.temp_rows.insert(store);
+        if mismatch {
+            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "temporary storage error".to_string(),
+            });
+        }
+        Ok(store)
     }
 
     /// このセッションに登録済みの UDF レジストリ（読み取り専用）。
