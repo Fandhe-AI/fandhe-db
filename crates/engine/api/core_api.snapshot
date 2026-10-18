@@ -222,6 +222,10 @@ impl PolicyContext {
     pub(crate) fn allows_public(&self) -> bool {
         self.allowed.public
     }
+    #[inline]
+    pub(crate) fn allows_private(&self) -> bool {
+        self.allowed.private
+    }
 }
 
 # source: crates/engine/src/policy.rs :: PolicyError
