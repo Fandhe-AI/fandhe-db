@@ -81,6 +81,10 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::IndeterminateDatatype
         // Issue #2190: 照合の不一致（`42P21`）・照合を決められない（`42P22`）も入力起因で 400。
         | ErrorClass::CollationMismatch
+        // Issue #1647・INDEX-10: 式索引の式の拒否（`42P17`・`42803`・`42P20`）も入力起因で 400。
+        | ErrorClass::InvalidObjectDefinition
+        | ErrorClass::GroupingError
+        | ErrorClass::WindowingError
         | ErrorClass::CannotCoerce
         | ErrorClass::IndeterminateCollation
         // Issue #1599: `jsonb_build_object` の NULL キー（`22004`）も入力起因の拒否として 400。
@@ -181,7 +185,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 66] = [
+    const EXPECTED: [(ErrorClass, u16); 69] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -233,6 +237,9 @@ mod tests {
         (ErrorClass::InvalidParameterValue, 400),
         (ErrorClass::IndeterminateDatatype, 400),
         (ErrorClass::CollationMismatch, 400),
+        (ErrorClass::InvalidObjectDefinition, 400),
+        (ErrorClass::GroupingError, 400),
+        (ErrorClass::WindowingError, 400),
         (ErrorClass::CannotCoerce, 400),
         (ErrorClass::IndeterminateCollation, 400),
         (ErrorClass::NullValueNotAllowed, 400),

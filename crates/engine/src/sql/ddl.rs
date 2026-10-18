@@ -2229,6 +2229,13 @@ pub(crate) fn execute_create_index(
     storage: &Storage,
     validated: &ValidatedCreateIndex,
 ) -> Result<CreateIndexOutcome, SqlSurfaceError> {
+    // 防御ゲート（INDEX-10、Issue #1647）: 式要素は構文段の最終ゲートで拒否済みだが、将来の
+    // 経路変更で式を含む宣言が届いても、式を黙って落として列だけで保存しない（fail-closed）。
+    if validated.expression_keys().iter().any(Option::is_some) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "expression indexes are not supported yet".to_string(),
+        });
+    }
     let kind = if validated.is_hnsw() {
         IndexKind::Hnsw
     } else {
@@ -2815,6 +2822,7 @@ mod tests {
             table: "docs".to_string(),
             hnsw: false,
             columns: vec!["body".to_string()],
+            expressions: vec![None],
             collations: vec![None],
             unique: false,
         };

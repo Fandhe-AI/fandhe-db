@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 66;
+    count = 69;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -365,6 +365,16 @@ define_error_classes! {
     /// のポインタ）。照合名は固定の許可リスト由来で、テーブル名・列名・値は文言に含めない。
     /// [`crate::sql::allowlist::SqlSurfaceError::CollationMismatch`] の写像。
     CollationMismatch => ("42P21", "COLLATION_MISMATCH"),
+    /// 式索引の式が IMMUTABLE 相当でない（`42P17`。Issue #1647・INDEX-10 のポインタ）。
+    /// 構文だけで決まる確定の非決定式を拒否する。文言は固定で、値・列名・テナント情報を含めない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidObjectDefinition`] の写像。
+    InvalidObjectDefinition => ("42P17", "INVALID_OBJECT_DEFINITION"),
+    /// 式索引の式に集計関数がある（`42803`。Issue #1647・INDEX-10 のポインタ）。固定文言のみ。
+    /// [`crate::sql::allowlist::SqlSurfaceError::GroupingError`] の写像。
+    GroupingError => ("42803", "GROUPING_ERROR"),
+    /// 式索引の式にウィンドウ関数がある（`42P20`。Issue #1647・INDEX-10 のポインタ）。固定文言のみ。
+    /// [`crate::sql::allowlist::SqlSurfaceError::WindowingError`] の写像。
+    WindowingError => ("42P20", "WINDOWING_ERROR"),
     /// 明示の `CAST`／`::` で、型の組に変換の対応が無い（`42846`。Issue #1590・SQL-47 のポインタ。
     /// 規則表は `docs/design/cast-conversion-rules.md`）。型の組だけで束縛時に決まり、値が NULL でも
     /// 同じく返る。文言は静的な型名だけで、値・列名・テナント情報を含めない。
