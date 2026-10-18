@@ -1197,7 +1197,8 @@ pub(crate) fn execute_alter_table_rename_column(
 ///
 /// 判定順序（決定的）: テーブル存在確認（`42P01`／`42809`）→
 /// `catalog::Storage::alter_table_rename`（単一 write txn 内。改名先の衝突 `42P07` →
-/// 依存オブジェクトの暫定拒否 `0A000` → カタログ・行ストア・世代の付け替え）。
+/// ビュー依存の暫定拒否 `0A000`〔Issue #1625 で解除予定〕→ 制約・FK・索引宣言を含む
+/// カタログ・行ストア・世代の付け替え。Issue #1624）。
 pub(crate) fn execute_alter_table_rename_table(
     storage: &Storage,
     stmt: &ValidatedAlterTableRenameTable,
