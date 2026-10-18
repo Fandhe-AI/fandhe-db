@@ -425,11 +425,11 @@ fn unique_and_primary_key_checks_hold_across_tenants_after_widening() {
     );
 }
 
-/// 縮小・異種の ALTER は `42804` のまま。INTEGER／BIGINT が混在する宣言は受理され、
+/// PK／FK 構成列への縮小・異種の ALTER は暫定の `0A000`（Issue #1637 まで）。INTEGER／BIGINT が混在する宣言は受理され、
 /// 参照整合性が拡大変換後と同じ規則で働く。整数以外の混在宣言は `42830` のまま
 /// （Issue #1435・TABLE-17・TABLE-22）。
 #[test]
-fn non_widening_stays_42804_and_mixed_integer_declarations_are_enforced() {
+fn non_widening_is_gated_and_mixed_integer_declarations_are_enforced() {
     let (core, path) = setup_parent_child("akc-strict", "BIGINT", "BIGINT", "");
     let _g = CleanupGuard(path);
     let o = ctx("owner");
@@ -437,7 +437,9 @@ fn non_widening_stays_42804_and_mixed_integer_declarations_are_enforced() {
         "ALTER TABLE kp ALTER COLUMN k TYPE INTEGER",
         "ALTER TABLE kc ALTER COLUMN ref TYPE DOUBLE PRECISION",
     ] {
-        assert_eq!(code(&core, &o, sql), "42804", "{sql}");
+        // PK／FK の構成列への一般変換は、索引・制約の再構築（Issue #1637）まで暫定の `0A000`
+        // （TABLE-40・Issue #1636）。表は変わらない。
+        assert_eq!(code(&core, &o, sql), "0A000", "{sql}");
     }
     assert_eq!(ints(&core, &o, "SELECT k FROM kp LIMIT 10"), vec![1, 2, 3]);
     // 親 BIGINT・子 INTEGER の混在宣言（表制約・ADD FOREIGN KEY）は受理する。

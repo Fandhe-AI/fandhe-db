@@ -320,3 +320,38 @@ Issue #1637 の担当で、本 Issue では型検査に通った USING 付きの
   だけの参照）を省略と同値に扱う最適化。`check_alter_using` は現在 `Result<(), _>` で、束縛結果を
   返す形へ広げる
 - **公開 API（BREAKING）**: `ValidatedAlterTableAlterColumnType.using: Option<Expr>` の追加
+
+## Issue #1636 追記（ALTER COLUMN TYPE の全行書き換え変換エンジン。TABLE-40 (1)(2)(5)・TASK-278 ポインタ）
+
+`USING <式>` 付きの変換と、代入変換（SQL-47）のある組の `USING` 省略変換を受理し、全行を書き換える。
+
+- **判定順（カタログの write txn 内。`alter_table_alter_column_type_collated`）**:
+  1. 型が同じで照合だけが変わる（`USING` なしまたは `USING <対象列>`）→ 従来の `CatalogOnly`
+  2. `USING` なしまたは `USING <対象列>` で `decide_alter_type` が受理する組 → 従来の計画（不変）
+  3. `USING` なしまたは `USING <対象列>` で同一型・規則表の外（VECTOR・ENUM）・代入変換が無い組 → 従来の
+     `IncompatibleTypeChange`（`42804`。表層の事前判定と同じ判定を txn 内でもう一度行う）
+  4. 上記以外 → `AlterPlan::RewriteExpr`
+- **`RewriteExpr` の処理**（`catalog::alter_column_type_rewrite_expr_in_txn`）: カタログのハンドルを
+  手放した後で、依存ゲート → txn 内の旧スキーマへの束縛し直し（事前判定との TOCTOU を作らない）→
+  全行の評価・代入変換・再エンコード（`column_rewrite::rewrite_rows_with_conversion_in_txn`）→
+  派生索引の失効（多層防御）→ スキーマの書き戻し。世代 bump と commit は既存の唯一の commit 点
+- **代入変換**: `sql::cast::bind_scalar_assignment` が `sql::alter_using::bind_alter_conversion` から
+  変換ノードを作る。`VARCHAR(n)`／`CHAR(n)` の長さは変換ノードで切り詰めず、評価後の列値化
+  （`sql::set_expr::expr_value_to_column_value`。`UPDATE SET` と共有の単一の変換器）で `22001`／空白詰め
+- **範囲**: 全テナント・全可視性の行を行数の上限なしで走査する（不可視な行の違反を見逃すと
+  読み出し時の decode 失敗を招くため `PolicyContext` で絞らない）。単一 write txn のため書き込み
+  ロックを保持し続ける（仕様上の前提）
+- **失敗**: 評価・変換エラーは commit せず表は不変。`redact_row_conversion_error`（全 variant を
+  ワイルドカード無しで列挙する網羅 match）が SQLSTATE を保ったまま固定文言へ置き換え、値・テナント・行 id を
+  応答へ載せない
+- **依存ゲート（暫定）**: PK／UNIQUE／この表の FK／他表の FK 参照先／CHECK／索引宣言／ビューが参照する列と、
+  DEFAULT・補完値を持つ列への一般変換は `0A000`。型付きの正準キー・旧型の DEFAULT・古い索引が新しい値と
+  食い違う fail-open を避けるため。**Issue #1637 で再構築を実装して解除する**。既存の受理経路
+  （INTEGER→BIGINT 等）は依存があっても不変
+- **`USING <対象列>`**: 省略と同じ扱い（既存の拡大経路を通る）
+- **従来どおりの拒否**: 複数アクション内の `TYPE`（`0A000`）・明示トランザクション内の DDL（`0A000`）・
+  VECTOR（`42804`）・ENUM が変換元／先になる組（USING あり `0A000`／省略 `42804`）
+- **PG との差分**: 2^53 を超える BIGINT への変換は式評価が f64 で運ぶため `22003`。PG は受理する。
+  ENUM→TEXT などの代入変換は未対応
+- **セッション TZ**: TIMESTAMP↔TIMESTAMPTZ の変換は評価時にセッション TimeZone を読む。ALTER TABLE の
+  実行は `core.rs` の `session_time_zone_scope` の内側で行われる

@@ -2,8 +2,9 @@
 //! （TABLE-40・TABLE-19、Issue #1635）の構文・束縛・事前判定の SQL 表層結合テスト。
 //!
 //! `EngineCore::execute_sql_in_session` を production 経路として検証する。型検査に成功した
-//! USING 付きの文は行の書き換え（Issue #1636）が未実装のため `0A000` で拒否され、副作用が
-//! 無いこと（fail-closed）を固定する。
+//! USING 付きの文は、全行の書き換え（Issue #1636。結合テストは `sql_alter_column_type_rewrite.rs`）
+//! で受理される。本ファイルは構文・束縛エラーと、従来どおりの拒否（複数アクション内・
+//! 明示トランザクション内・権限ゲート先行）を固定する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -160,10 +161,11 @@ fn using_binding_errors() {
 }
 
 #[test]
-fn type_checked_using_is_not_supported_yet_and_has_no_side_effects() {
+fn type_checked_using_is_accepted_on_empty_table() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let mut s = ddl_session();
+    // 行が無い表でも、型検査に成功した USING 付きの文は受理される（Issue #1636）。
     for sql in [
         "ALTER TABLE docs ALTER COLUMN note TYPE INTEGER USING note::integer",
         "ALTER TABLE docs ALTER COLUMN big TYPE INTEGER USING big::integer",
@@ -171,17 +173,8 @@ fn type_checked_using_is_not_supported_yet_and_has_no_side_effects() {
         "ALTER TABLE docs ALTER COLUMN note TYPE VARCHAR(8) USING qty",
         "ALTER TABLE docs ALTER COLUMN note TYPE TEXT COLLATE \"C\" USING upper(note)",
     ] {
-        let err = err_of(&core, &mut s, sql);
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
-        assert!(err.to_string().contains("USING"), "fixed message: {err}");
+        run(&core, &mut s, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
-    // 副作用なし: qty は INTEGER のままで、拡大変換が従来どおり通る。
-    run(
-        &core,
-        &mut s,
-        "ALTER TABLE docs ALTER COLUMN qty TYPE BIGINT",
-    )
-    .expect("qty is still INTEGER and widens");
 }
 
 #[test]
@@ -198,15 +191,13 @@ fn omitted_using_requires_assignment_cast() {
         assert_eq!(err.wire_code(), "42804", "{sql}");
         assert!(err.to_string().contains("USING"), "{err}");
     }
-    // 代入変換はあるが未実装の縮小は従来どおり 42804（TABLE-19 の契約）。
-    assert_eq!(
-        code_of(
-            &core,
-            &mut s,
-            "ALTER TABLE docs ALTER COLUMN big TYPE INTEGER"
-        ),
-        "42804"
-    );
+    // 代入変換がある縮小は、USING 省略でも全行を検査・変換して受理する（Issue #1636）。
+    run(
+        &core,
+        &mut s,
+        "ALTER TABLE docs ALTER COLUMN big TYPE INTEGER",
+    )
+    .expect("assignment-castable narrowing");
     // 既存の拡大変換は成功する。
     run(
         &core,

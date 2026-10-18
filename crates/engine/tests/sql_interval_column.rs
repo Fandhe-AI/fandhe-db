@@ -393,7 +393,8 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
         "SELECT INTERVAL '1 day' FROM t LIMIT 5",
         "CREATE TABLE a (v INTERVAL PRIMARY KEY)",
         "CREATE TABLE a (v INTERVAL UNIQUE)",
-        "ALTER TABLE t ALTER COLUMN v TYPE TEXT",
+        // INTERVAL→TEXT は TABLE-40 の一般変換（Issue #1636）で受理される。
+        // INTEGER→INTERVAL は代入変換が無く拒否のまま。
         "ALTER TABLE t ALTER COLUMN n TYPE INTERVAL",
     ] {
         assert!(exec(&core, sql).is_err(), "{sql} must be rejected");

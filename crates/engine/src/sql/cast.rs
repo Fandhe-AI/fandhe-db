@@ -1041,6 +1041,84 @@ pub(super) fn bind_array_assignment(
     Ok(cast_node(CastFn { from: src, to: dst }, bound))
 }
 
+/// `ALTER COLUMN ... TYPE ... [USING <式>]` の変換結果を、新しい列型への**代入変換**として
+/// 包む（TABLE-40・SQL-47 のポインタ、Issue #1636。呼び出し元は `sql::alter_using`）。
+///
+/// 明示 CAST（[`cast_bound`]）との違いは 2 点。規則が恒等・暗黙・代入・文字列型への I/O 代入に
+/// 限られる（満たさなければ `42804`）ことと、`VARCHAR(n)`／`CHAR(n)` の長さを変換ノードでは
+/// 扱わないこと。明示 CAST は n 超過を黙って切り詰めるが、PG の ALTER TYPE は代入変換で
+/// `22001` になるため、修飾子なしの文字列型へ変換して長さは評価後の列値化
+/// （`sql::set_expr::expr_value_to_column_value` の `bind_text_literal`）に任せる。
+/// 配列は [`bind_array_assignment`] に委ねる。種別を静的に決められない数値式は、
+/// 数値 6 型・NUMERIC への変換だけを f64 経由で受理し、それ以外は `0A000`。
+pub(super) fn bind_scalar_assignment(
+    expr: &Expr,
+    bound: BoundExpr,
+    ty: ExprType,
+    schema: &TableSchema,
+    target: &ColumnType,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    if let ColumnType::Array(at) = target {
+        return bind_array_assignment(expr, bound, schema, at);
+    }
+    let Some(target_cast) = cast_type_of_column(target) else {
+        return Err(not_implemented("unknown", &CastType::Text));
+    };
+    let mut array_elem: Option<ArrayElemType> = None;
+    let from_kind = match source_cast_kind(expr, &bound, ty, Some(schema)) {
+        SourceKind::Known(k) => k,
+        SourceKind::UnknownNumeric => match target_cast.kind() {
+            CastKind::Int2
+            | CastKind::Int4
+            | CastKind::Int8
+            | CastKind::Float4
+            | CastKind::Float8
+            | CastKind::Numeric => CastKind::Float8,
+            _ => return Err(not_implemented("numeric", &target_cast)),
+        },
+        // 配列 → 文字列型は I/O 変換の代入（`cast_bound` と同じく要素型を保持して描画する）。
+        // 要素型を CAST の型で表せない配列（ENUM 要素）は `Enum` として扱い、配列への変換は未対応。
+        SourceKind::Array(elem) => {
+            array_elem = match &elem {
+                Some(e) => CastType::Array(Box::new(e.clone())).array_elem_type(),
+                None => Some(ArrayElemType::Enum),
+            };
+            CastKind::Array
+        }
+        SourceKind::Outside => return Err(not_implemented("unknown", &target_cast)),
+    };
+    if !is_assignment_rule(cast_rule(from_kind, target_cast.kind())) {
+        return Err(SqlSurfaceError::CannotCoerce {
+            from: from_kind.label().to_string(),
+            to: target_cast.pg_label(),
+        });
+    }
+    let dst_ty = match &target_cast {
+        CastType::Varchar(Some(_)) | CastType::Bpchar(_) => CastType::Text,
+        other => other.clone(),
+    };
+    let (Some(src), Some(dst), Some(result_ty)) = (
+        cast_src(
+            from_kind,
+            if array_elem.is_some() {
+                ExprType::Array
+            } else {
+                ty
+            },
+            array_elem,
+        ),
+        cast_dst(&dst_ty),
+        dst_ty.expr_type(),
+    ) else {
+        return Err(not_implemented(from_kind.label(), &target_cast));
+    };
+    let f = CastFn { from: src, to: dst };
+    if f.is_noop() && result_ty == ty {
+        return Ok(bound);
+    }
+    Ok(cast_node(f, bound))
+}
+
 /// 配列の要素・添字の基底など、CAST の被演算子と同じ規則で式を束縛する（列参照は numeric／bool／
 /// uuid／bytea／配列の列も葉として受理する。TABLE-35・Issue #1602 の `sql::array_expr` が使う）。
 pub(super) fn bind_operand(

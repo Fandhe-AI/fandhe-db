@@ -369,21 +369,20 @@ fn narrowing_checks_column_default_range() {
     assert_eq!(firsts(&core, "SELECT z FROM d LIMIT 10"), vec![Some(7)]);
 }
 
-/// スコープ境界: `BIGINT→INTEGER` などの一般の縮小は従来どおり `42804`。
+/// `BIGINT→INTEGER` などの一般の縮小・異種変換は、代入変換のある組として全行変換で受理される
+/// （TABLE-40・Issue #1636。以前は `42804`）。代入変換の無い組は引き続き `42804`。
 #[test]
-fn general_narrowing_stays_rejected() {
+fn general_narrowing_is_accepted_by_value_conversion() {
     let (_p, _g, core) = open("sw-general");
-    ok(&core, "CREATE TABLE g (b BIGINT, i INTEGER, s SMALLINT)");
-    assert_eq!(
-        code(&core, "ALTER TABLE g ALTER COLUMN b TYPE INTEGER"),
-        "42804"
+    ok(
+        &core,
+        "CREATE TABLE g (b BIGINT, i INTEGER, s SMALLINT, t BOOLEAN)",
     );
+    ok(&core, "ALTER TABLE g ALTER COLUMN b TYPE INTEGER");
+    ok(&core, "ALTER TABLE g ALTER COLUMN s TYPE REAL");
+    ok(&core, "ALTER TABLE g ALTER COLUMN i TYPE REAL");
     assert_eq!(
-        code(&core, "ALTER TABLE g ALTER COLUMN s TYPE REAL"),
-        "42804"
-    );
-    assert_eq!(
-        code(&core, "ALTER TABLE g ALTER COLUMN i TYPE REAL"),
+        code(&core, "ALTER TABLE g ALTER COLUMN t TYPE INTEGER"),
         "42804"
     );
 }
