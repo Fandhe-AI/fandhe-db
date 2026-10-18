@@ -28,7 +28,19 @@
 - 指定時は `LedgerMode::Ledgered`（現行の必須契約）。未指定時は `LedgerMode::default()` を注入するだけで、現時点の挙動は変わらない。任意モードの variant 追加と既定の移行は #1704 の担当
 - 未指定を `CompareOnlyWithoutLedger` へ写像しない（台帳書き込みが無効になり再送の冪等性が失われるため）
 - 重複指定・`=` 連結形・後続の値は起動エラー（fail-closed）。指定時のみ起動ログに英語 1 行を出す
-- 受け入れ条件のうち「未指定時に省略を受理する」実挙動は #1704 マージ後に成立する
+- 受け入れ条件のうち「未指定時に省略を受理する」実挙動は #1704 で成立した（下記）
+
+## Issue #1704 追記
+
+- `LedgerMode::Optional` を追加し、engine の既定を `Ledgered` から `Optional` へ移した。`--require-operation-id`（`Ledgered`）は従来の必須契約のまま。wire-server の `resolve(false)` は `LedgerMode::default()` を返すためソース変更は不要
+- 省略した書き込み（句の欠落・明示 `NULL`）は `LedgerWrite::Omitted` に写像し、台帳にもジョブ表にも触れない通常の書き込みとして実行する（再送の検出はしない）。指定した場合の記録・重複拒否（`23505`）・内容不一致（`22023`）・照会は不変
+- `LedgerWrite::Disabled`（台帳テーブルを持たない構成）は流用しない。意味が異なり、分割実行器が `op_id()==None` を `0A000` に写すため、`23502` という契約とずれるため
+- 分割実行 DML は構成に関わらず operation_id 必須（`require_partitioned`）。SQL 検証（述語形 UPDATE／DELETE。`EXPLAIN ... PARTITIONED` を含む）・NoSQL から呼ばれる engine 入口・共通本体の 3 箇所で検査し、実行器の `0A000` は最後の防御として残す。構成が `CompareOnlyWithoutLedger` でも `23502` になる
+- 省略した書き込みは台帳に触れないため `last_op`（RECOVER-7 の `last_operation_id` 照会）を更新しない。照会の対象は指定付き書き込みのみで、省略書き込みの後も直前の指定付き operation_id を返す（最終書き込みとは限らない）
+- 切り替えは起動時のフラグのみ。セッション・SQL からは変更できない
+- 既定に依存して省略の拒否を検証していた既存テストは `LedgerMode::Ledgered`（またはバイナリ起動時の `--require-operation-id`）を明示して固定した（アサーションは変更していない）
+- 保護が必要な運用（冪等な再送を前提とするクライアント）は `--require-operation-id` を使う
+- 対象外: NoSQL／HTTP 経路の wire 層検査（#2203）、既定と必須の行列回帰（#1705）
 
 ## スコープ外
 

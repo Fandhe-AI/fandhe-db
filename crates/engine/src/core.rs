@@ -8931,8 +8931,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
-        self.ledger_mode
-            .resolve(operation_id)
+        // 分割実行は構成に関わらず operation_id 必須（Issue #1704・RECOVER-1）。
+        crate::recovery::required_op_id::require_partitioned(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
         let clause = crate::sql::partitioned::PartitionedClause { chunk_rows };
         let limits =
@@ -8979,8 +8979,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
-        self.ledger_mode
-            .resolve(operation_id)
+        // 分割実行は構成に関わらず operation_id 必須（Issue #1704・RECOVER-1）。
+        crate::recovery::required_op_id::require_partitioned(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
         let clause = crate::sql::partitioned::PartitionedClause { chunk_rows };
         let limits =
@@ -9713,7 +9713,7 @@ impl EngineCore {
     ///
     /// `sql::allowlist::validate_insert`（構造検証。文末専用句
     /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
-    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// が `LedgerMode::Ledgered`（`--require-operation-id`）である限りこの段階で `23502` として拒否され、
     /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
     /// RECOVER-1）→ `Storage::get_table_schema`（スキーマ取得）→
     /// `sql::parser::bind_insert`（意味論検証・束縛）→ `sql::exec::execute_insert`
@@ -9973,7 +9973,7 @@ impl EngineCore {
     ///
     /// `sql::allowlist::validate_truncate`（構造検証。文末専用句
     /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
-    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// が `LedgerMode::Ledgered`（`--require-operation-id`）である限りこの段階で `23502` として拒否され、
     /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
     /// RECOVER-1）→ [`Self::execute_truncate_form`]（実行本体）の順に呼ぶ。
     pub fn execute_truncate_sql(
@@ -10004,7 +10004,7 @@ impl EngineCore {
     ///
     /// `sql::allowlist::validate_delete`（構造検証。文末専用句
     /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
-    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// が `LedgerMode::Ledgered`（`--require-operation-id`）である限りこの段階で `23502` として拒否され、
     /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
     /// RECOVER-1）→ [`Self::execute_delete_form`]（実行本体）の順に呼ぶ。
     pub fn execute_delete_sql(
@@ -10170,6 +10170,9 @@ impl EngineCore {
         schema: &crate::catalog::TableSchema,
         limits: &crate::sql::parser::PartitionedDmlLimits,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 多層防御: 外部で組み立てた文でも構成に関わらず operation_id 必須（Issue #1704）。
+        crate::recovery::required_op_id::require_partitioned(stmt.operation_id())
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
         // 時刻値関数を含む文は、ジョブ開始時に確定・永続化した固定時刻で全チャンクを束縛する
         // （再開時も同じ値。SQL-37・RECOVER-11・Issue #1587、設計 D6）。束縛 → ハッシュ計算の
         // 失敗順序は従来どおり。
@@ -10210,6 +10213,9 @@ impl EngineCore {
         schema: &crate::catalog::TableSchema,
         limits: &crate::sql::parser::PartitionedDmlLimits,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 多層防御: 外部で組み立てた文でも構成に関わらず operation_id 必須（Issue #1704）。
+        crate::recovery::required_op_id::require_partitioned(stmt.operation_id())
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
         let assignment_refs: Vec<(&str, &crate::sql::allowlist::SetValue)> = stmt
             .assignments()
             .iter()
@@ -10542,7 +10548,7 @@ impl EngineCore {
     ///
     /// `sql::allowlist::validate_update`（構造検証。文末専用句
     /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
-    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// が `LedgerMode::Ledgered`（`--require-operation-id`）である限りこの段階で `23502` として拒否され、
     /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
     /// RECOVER-1）→ [`Self::execute_update_form`]（束縛・実行本体）の順に呼ぶ。
     ///

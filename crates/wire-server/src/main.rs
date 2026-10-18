@@ -282,8 +282,9 @@
 //! 値（未知引数として扱われる）はいずれも fail-closed で起動エラー。解決は
 //! `wire_server::require_operation_id_opt::resolve` に一本化し、
 //! `EngineCore::with_ledger_mode` へ 1 回だけ注入する（セッション・SQL からは
-//! 変更できない）。未指定時の扱い（任意モード）は engine 側の #1704 で実装され、
-//! それまでは従来の必須契約のまま（`docs/design/operation-id-optional.md` 参照）。
+//! 変更できない）。未指定時は operation_id 任意（Issue #1704。省略した書き込みは
+//! 台帳に記録しない通常の書き込み。分割実行 DML のみ常に必須。
+//! `docs/design/operation-id-optional.md` 参照）。
 //!
 //! `--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
 //! WIRE-7, WIRE-9 ポインタ）: TLS opt-in の唯一の入口。`--tls-cert`（証明書

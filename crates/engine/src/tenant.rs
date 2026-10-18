@@ -298,7 +298,7 @@ pub enum TenantWriteError {
     /// 行の破壊を遮断しつつ、所有テナントの存在情報を漏らさない）。
     IdConflict,
     /// `operation_id` の省略（句の欠落・明示 `NULL` を含む）。台帳あり構成
-    /// （`recovery::required_op_id::LedgerMode::Ledgered`、既定）では書き込み系操作に
+    /// （`recovery::required_op_id::LedgerMode::Ledgered`、`--require-operation-id`）では書き込み系操作に
     /// `operation_id` の指定を必須とする（TASK-92・対象ビヘイビア: RECOVER-1）。
     /// `crate::core::EngineCore::{insert_row, update_row, delete_row}` が
     /// `crate::tenant::*_unchecked` へ委譲する**前**に `self.ledger_mode` でガードを

@@ -49,7 +49,8 @@ fn open_engine(name: &str) -> (EngineCore, std::path::PathBuf) {
     let path = unique_db_path(name);
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (core, path)
 }
 
@@ -60,8 +61,9 @@ fn open_engine_with_limits(
     let path = unique_db_path(name);
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    let core =
-        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_batch_limits(limits);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
+        .with_batch_limits(limits);
     (core, path)
 }
 
@@ -518,6 +520,7 @@ fn compare_only_without_ledger_mode_allows_upsert_without_operation_id() {
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
         .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::CompareOnlyWithoutLedger);
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");

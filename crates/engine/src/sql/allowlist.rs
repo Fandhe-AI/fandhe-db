@@ -3228,7 +3228,7 @@ pub struct ValidatedInsert {
     pub rows: Vec<Vec<InsertLiteral>>,
     /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-10）。句の欠落・明示
     /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。`validate_insert` は
-    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション開始前に
+    /// `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を書き込みトランザクション開始前に
     /// `23502` で拒否するため、この構成では常に `Some` になる。
     /// `LedgerMode::CompareOnlyWithoutLedger` では `None` を許す。
     pub operation_id: Option<OperationId>,
@@ -3267,7 +3267,7 @@ pub struct ValidatedDelete {
     pub id_literal: String,
     /// 文末専用句で搬送された、検証済みの `operation_id`。句の欠落・明示
     /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。`validate_delete` は
-    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
+    /// `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を書き込みトランザクション
     /// 開始前に `23502` で拒否するため、この構成では常に `Some`。
     pub operation_id: Option<OperationId>,
     /// `RETURNING` 句（Issue #873・SQL-21）。単一行・`id` 完全一致形は実行結線
@@ -3299,7 +3299,7 @@ pub struct ValidatedPredicateDelete {
     pub(crate) where_predicates: Vec<WherePredicate>,
     /// 文末専用句で搬送された、検証済みの `operation_id`。句の欠落・明示
     /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。[`validate_delete_statement`]
-    /// は `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
+    /// は `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を書き込みトランザクション
     /// 開始前に `23502` で拒否するため、この構成では常に `Some`。
     pub(crate) operation_id: Option<OperationId>,
     /// `RETURNING` 句（Issue #1182・SQL-21）。削除前の値を返す
@@ -3679,7 +3679,7 @@ pub struct ValidatedTruncate {
     pub table_names: Vec<String>,
     /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-22）。句の欠落・明示
     /// `NULL` はいずれも `None`（`ValidatedInsert::operation_id` と同じ契約）。
-    /// `validate_truncate` は `LedgerMode::Ledgered`（既定）では `None` を
+    /// `validate_truncate` は `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を
     /// 書き込みトランザクション開始前に `23502` で拒否するため、この構成では
     /// 常に `Some` になる。
     pub operation_id: Option<OperationId>,
@@ -4003,7 +4003,7 @@ pub struct ValidatedUpdate {
     pub id_literal: String,
     /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-17）。句の欠落・明示
     /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。`validate_update` は
-    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション開始前に
+    /// `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を書き込みトランザクション開始前に
     /// `23502` で拒否するため、この構成では常に `Some` になる。
     /// `LedgerMode::CompareOnlyWithoutLedger` では `None` を許す。
     pub operation_id: Option<OperationId>,
@@ -15645,6 +15645,10 @@ pub(crate) fn validate_delete_statement_tokens(
 ) -> Result<DeleteStatement, SqlSurfaceError> {
     let shape = parse_delete_statement_shape(tokens)?;
 
+    // 分割実行はジョブ識別に operation_id を使うため、構成に関わらず必須（Issue #1704）。
+    if shape.partitioned.is_some() {
+        crate::recovery::required_op_id::require_partitioned(shape.operation_id.as_ref())?;
+    }
     mode.require(shape.operation_id.as_ref())?;
 
     let exists = lookup.table_exists(&shape.table_name)?;
@@ -16254,7 +16258,7 @@ pub struct ValidatedCopyFrom {
     pub format: CopyFormat,
     /// 文末専用句で搬送された、検証済みの `operation_id`。句の欠落・明示
     /// `NULL` はいずれも `None`（`ValidatedInsert::operation_id` と同じ契約。
-    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
+    /// `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を書き込みトランザクション
     /// 開始前に `23502` で拒否するため、この構成では常に `Some`）。
     pub operation_id: Option<OperationId>,
 }
@@ -16720,6 +16724,10 @@ pub(crate) fn validate_update_form_tokens(
     let shape = p.parse_update()?;
     p.expect_end_of_statement()?;
 
+    // 分割実行はジョブ識別に operation_id を使うため、構成に関わらず必須（Issue #1704）。
+    if shape.partitioned.is_some() {
+        crate::recovery::required_op_id::require_partitioned(shape.operation_id.as_ref())?;
+    }
     mode.require(shape.operation_id.as_ref())?;
 
     let exists = lookup.table_exists(&shape.table_name)?;

@@ -38,6 +38,7 @@ fn open_storage(path: &std::path::Path) -> Storage {
 
 fn new_core(storage: Storage) -> EngineCore {
     EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
 }
 
 fn result_ids(result: &QueryResult) -> Vec<u64> {

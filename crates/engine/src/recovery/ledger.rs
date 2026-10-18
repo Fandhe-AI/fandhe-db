@@ -215,15 +215,21 @@ pub(crate) enum LedgerWrite<'a> {
     /// 台帳を持たない構成（`LedgerMode::CompareOnlyWithoutLedger`）。台帳テーブルへは
     /// 一切触れない（テーブル自体も作らない）。
     Disabled,
+    /// 台帳構成はあるが、書き込み文が `operation_id` を省略した（`LedgerMode::Optional`。
+    /// Issue #1704・RECOVER-1）。台帳にもジョブ表にも触れず、通常の書き込みとして実行する
+    /// （再送の検出はしない）。台帳テーブル自体を持たない [`LedgerWrite::Disabled`] とは
+    /// 意味が異なる。分割実行の実行器はこれを `op_id()==None` として受け取るが、
+    /// 上流の `require_partitioned` が先に `23502` で拒否するため通常は到達しない。
+    Omitted,
 }
 
 impl<'a> LedgerWrite<'a> {
-    /// 記録対象の `operation_id`。[`LedgerWrite::Disabled`] は `None`。
+    /// 記録対象の `operation_id`。[`LedgerWrite::Disabled`]・[`LedgerWrite::Omitted`] は `None`。
     pub(crate) fn op_id(&self) -> Option<&'a OperationId> {
         match self {
             LedgerWrite::Record(op_id) => Some(op_id),
             LedgerWrite::RecordEvaluated { op_id, .. } => Some(op_id),
-            LedgerWrite::Disabled => None,
+            LedgerWrite::Disabled | LedgerWrite::Omitted => None,
         }
     }
 
