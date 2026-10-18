@@ -1090,12 +1090,13 @@ fn retain_index_defs_in_txn(
     Ok(())
 }
 
-/// 表の改名（[`Storage::alter_table_rename`]、Issue #1623）が、依存オブジェクトを持つ表を
+/// 表の改名（[`Storage::alter_table_rename`]、Issue #1623）が、ビューから参照される表を
 /// 追随できないうちは受理しないための暫定ゲート（fail-closed。`0A000`）。カタログ情報だけで
 /// 判定し、テナントの行・台帳の有無で成否を変えない（存在オラクルにしない）。
 ///
-/// 拒否対象と解除の担当: PK・UNIQUE・CHECK・FK（参照元・参照先）・索引宣言（Issue #1624）、
-/// ビューからの参照（Issue #1625）。解除は項目ごとに本関数から外していく。
+/// 拒否対象と解除の担当: ビューからの参照（Issue #1625）のみ。PK・UNIQUE・CHECK・FK（参照元・
+/// 参照先）・索引宣言は Issue #1624 で追随するようになり、本関数では見ない
+/// （[`TableSchema::rename_table_references`]・[`rename_index_def_table_in_txn`]）。
 /// 呼び出し元は `CATALOG_TABLE` のハンドルを保持していない状態で呼ぶこと。
 fn refuse_rename_table_with_dependents_in_txn(
     write_txn: &redb::WriteTransaction,
@@ -1106,35 +1107,6 @@ fn refuse_rename_table_with_dependents_in_txn(
             detail: format!("renaming a table that has {what} is not supported"),
         })
     };
-    if schema.primary_key.is_some()
-        || !schema.unique_constraints.is_empty()
-        || !schema.checks.is_empty()
-        || !schema.foreign_keys.is_empty()
-    {
-        return Err(refused("constraints"));
-    }
-    if !referencing_foreign_keys_in_txn(write_txn, &schema.name)?.is_empty() {
-        return Err(refused("foreign keys referencing it"));
-    }
-    match write_txn.open_table(INDEX_CATALOG_TABLE) {
-        Ok(index_table) => {
-            for (scanned, entry) in index_table.iter().map_err(CatalogError::from)?.enumerate() {
-                if scanned >= MAX_INDEX_COUNT {
-                    return Err(CatalogError::CorruptSchema(format!(
-                        "index catalog exceeds {MAX_INDEX_COUNT} entries"
-                    ))
-                    .into());
-                }
-                let (key, value) = entry.map_err(CatalogError::from)?;
-                let def = decode_index_def(key.value(), value.value())?;
-                if def.table == schema.name {
-                    return Err(refused("indexes"));
-                }
-            }
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
-        Err(e) => return Err(CatalogError::from(e).into()),
-    }
     match write_txn.open_table(VIEWS_TABLE) {
         Ok(views_table) => {
             if !views_depending_on_in_txn(&views_table, &schema.name)?.is_empty() {
@@ -1323,6 +1295,49 @@ fn rename_index_def_columns_in_txn(
                     *c = new.to_string();
                 }
             }
+            updates.push((name, encode_index_def(&def)?));
+        }
+        for (name, bytes) in &updates {
+            index_table.insert(name.as_str(), bytes.as_slice())?;
+        }
+        !updates.is_empty()
+    };
+    if rewritten {
+        bump_index_catalog_generation_in_txn(write_txn)?;
+    }
+    Ok(())
+}
+
+/// 表改名（[`Storage::alter_table_rename`]、Issue #1624）が同一 write txn から呼ぶ。
+/// 所有テーブルが `old` の索引宣言（scalar・hnsw・unique とも）の `table` を `new` へ
+/// 書き換え、1 件でも書いたら索引カタログ世代を bump する（`INDEX_CATALOG_GENERATION_TABLE`
+/// の不変条件。HNSW 判定のキャッシュに旧名の宣言を残さない）。索引名・種別・列・照合は
+/// 維持する。[`retain_index_defs_in_txn`] と同じ [`MAX_INDEX_COUNT`] 打ち切り。
+fn rename_index_def_table_in_txn(
+    write_txn: &redb::WriteTransaction,
+    old: &str,
+    new: &str,
+) -> Result<()> {
+    let rewritten = {
+        let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut updates: Vec<(String, Vec<u8>)> = Vec::new();
+        for (scanned, entry) in index_table.iter()?.enumerate() {
+            if scanned >= MAX_INDEX_COUNT {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                )));
+            }
+            let (key, value) = entry?;
+            let name = key.value().to_string();
+            let mut def = decode_index_def(&name, value.value())?;
+            if def.table != old {
+                continue;
+            }
+            def.table = new.to_string();
             updates.push((name, encode_index_def(&def)?));
         }
         for (name, bytes) in &updates {
@@ -5347,6 +5362,41 @@ impl TableSchema {
             swap(&mut fk.columns);
             if fk.parent_table == own {
                 swap(&mut fk.parent_columns);
+            }
+        }
+    }
+
+    /// 表改名（[`Storage::alter_table_rename`]、Issue #1624）に伴う自表側の書き換え。
+    /// 表名を `new` にし、自己参照 FK の `parent_table` を付け替える。制約名は変えない
+    /// （PostgreSQL と同じ）。主キーは「導出名 `<table>_pkey`」を無名で表すため、名前を
+    /// 変えるだけでは制約名が `<new>_pkey` へ変わってしまう。改名前の実効名を明示名として
+    /// 固定する（導出名と一致する往復改名では `with_primary_key_name` が `None` へ正規化する）。
+    /// UNIQUE・FK・CHECK は実名を保持しており、encode が実名と導出名の食い違いから
+    /// 名前を明示する版を自動で選ぶため触らない。
+    fn rename_table_references(&mut self, new: &str) {
+        let old = std::mem::replace(&mut self.name, new.to_string());
+        let pk_name = self.primary_key.as_ref().map(|_| {
+            self.primary_key_name
+                .clone()
+                .unwrap_or_else(|| primary_key_constraint_name(&old))
+        });
+        for fk in &mut self.foreign_keys {
+            if fk.parent_table == old {
+                fk.parent_table = new.to_string();
+            }
+        }
+        self.primary_key_name = None;
+        let rebuilt = self.clone().with_primary_key_name(pk_name);
+        *self = rebuilt;
+    }
+
+    /// 親テーブル `old` の改名（Issue #1624）に追随して、自表の外部キーのうち `old` を
+    /// 参照するものの `parent_table` を `new` へ付け替える（子テーブル側の書き換え）。
+    /// `parent_columns`（`["id"]` を含む）・参照アクション・制約名は変えない。
+    fn rename_parent_table_references(&mut self, old: &str, new: &str) {
+        for fk in &mut self.foreign_keys {
+            if fk.parent_table == old {
+                fk.parent_table = new.to_string();
             }
         }
     }
@@ -9758,8 +9808,12 @@ impl Storage {
     /// 破棄され、クラッシュ後に見えるのは旧名か新名のどちらか一方だけになる。
     ///
     /// 判定順序（決定的）: 識別子検証 → 表の存在（`TableNotFound`）→ 改名先の衝突（表・ビュー・
-    /// 索引と同じ名前空間。同名への改名を含む。`TableAlreadyExists`）→ 依存オブジェクトの暫定
+    /// 索引と同じ名前空間。同名への改名を含む。`TableAlreadyExists`）→ ビュー依存の暫定
     /// 拒否（[`refuse_rename_table_with_dependents_in_txn`]。`0A000`）→ 付け替え。
+    /// 付け替えは自表の制約（制約名は不変。[`TableSchema::rename_table_references`]）・他表から
+    /// 参照される FK（子の世代も bump）・索引宣言の所有テーブル名
+    /// （[`rename_index_def_table_in_txn`]。索引カタログ世代も bump）を同一 txn で追随させる
+    /// （Issue #1624）。
     /// 改名先に孤児の行テーブルが残っていた場合は統合も削除もせず fail-closed で拒否する。
     /// 遅延再構築される派生索引（`user_uniq`・`key_index`）は旧名・新名とも掃除し、世代は
     /// 旧名・新名の両方を進める（旧名のキャッシュ失効と、新名で過去にキャッシュされた
@@ -9821,8 +9875,33 @@ impl Storage {
         }
         refuse_rename_table_with_dependents_in_txn(&write_txn, &schema)?;
 
+        // 他表から参照される FK の付け替え（Issue #1624）。自表のカタログを書き換える前に、
+        // `CATALOG_TABLE` のハンドルを解放した状態で列挙する（`referencing_foreign_keys_in_txn`
+        // の契約）。自己参照は自表の書き換えで済むため除外し、同じ子は 1 回だけ書く。
+        let referencing = referencing_foreign_keys_in_txn(&write_txn, table_name)?;
+        let mut seen_children: std::collections::BTreeSet<String> = Default::default();
+        for (child, _) in referencing {
+            if child.name == table_name || !seen_children.insert(child.name.clone()) {
+                continue;
+            }
+            let mut child = child;
+            child.rename_parent_table_references(table_name, new_table_name);
+            let child_encoded = encode_schema(&child)?;
+            {
+                let mut table = write_txn
+                    .open_table(CATALOG_TABLE)
+                    .map_err(CatalogError::from)?;
+                table
+                    .insert(child.name.as_str(), child_encoded.as_slice())
+                    .map_err(CatalogError::from)?;
+            }
+            bump_table_generation_in_txn(&write_txn, &child.name)?;
+        }
+        // 索引宣言の所有テーブル名の付け替え（索引カタログ世代も bump する）。
+        rename_index_def_table_in_txn(&write_txn, table_name, new_table_name)?;
+
         // カタログの付け替え（`encode_schema` が不変条件を再検証する）。
-        schema.name = new_table_name.to_string();
+        schema.rename_table_references(new_table_name);
         let encoded = encode_schema(&schema)?;
         {
             let mut table = write_txn
@@ -17906,6 +17985,173 @@ mod tests {
                 .expect("hnsw");
             assert_eq!(hnsw.columns, vec!["embedding".to_string()]);
         }
+    }
+
+    /// 表改名が制約・他表からの FK・索引宣言を追随させる（TABLE-38 のポインタ、Issue #1624）。
+    /// 制約名は変えず（PK は明示名へ固定）、往復改名でカタログ値のバイト列が元に戻り、
+    /// 失敗する改名（改名先に孤児の行テーブル）は何も変えない。
+    #[test]
+    fn alter_table_rename_follows_constraints_foreign_keys_and_indexes() {
+        let path = unique_db_path("rename-table-follows-refs");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let fk = |cols: &[&str], parent: &str, pcols: &[&str]| {
+            ForeignKeyDef::new(
+                cols.iter().map(|c| c.to_string()).collect(),
+                parent.to_string(),
+                pcols.iter().map(|c| c.to_string()).collect(),
+                ReferentialAction::Cascade,
+                ReferentialAction::NoAction,
+            )
+        };
+        let docs = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("code", ColumnType::Text, false),
+                ColumnDef::new("u", ColumnType::Text, true),
+                ColumnDef::new("qty", ColumnType::Integer, true),
+                ColumnDef::new("up", ColumnType::Text, true),
+            ],
+        )
+        .with_primary_key(vec!["code".to_string()])
+        .with_unique_constraints(vec![UniqueConstraint::with_name(
+            "docs_u_key".to_string(),
+            vec!["u".to_string()],
+        )])
+        .with_checks(vec![CheckConstraint {
+            name: "docs_qty_check".to_string(),
+            columns: vec!["qty".to_string()],
+            predicate_sql: "qty > 0".to_string(),
+        }])
+        .with_foreign_keys(vec![fk(&["up"], "docs", &["code"])]);
+        storage.create_table(&docs).expect("create docs");
+        let kids = TableSchema::new(
+            "kids",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("pcode", ColumnType::Text, true),
+                ColumnDef::new("pid", ColumnType::Integer, true),
+            ],
+        )
+        .with_foreign_keys(vec![
+            fk(&["pcode"], "docs", &["code"]),
+            fk(&["pid"], "docs", &["id"]),
+        ]);
+        storage.create_table(&kids).expect("create kids");
+        storage
+            .create_index(&scalar_def("idx_qty", "docs", &["qty"]))
+            .expect("scalar");
+        storage
+            .create_index(&hnsw_def("idx_hnsw", "docs"))
+            .expect("hnsw");
+        storage
+            .create_index(&scalar_def("idx_other", "kids", &["pcode"]))
+            .expect("other");
+        let raw = |name: &str| -> Vec<u8> {
+            let r = storage.db().begin_read().expect("read");
+            let t = r.open_table(CATALOG_TABLE).expect("catalog");
+            let v = t.get(name).expect("get").expect("exists").value().to_vec();
+            v
+        };
+        let docs_bytes = raw("docs");
+        let kids_bytes = raw("kids");
+        let idx_gen_before = {
+            let r = storage.db().begin_read().expect("read");
+            index_catalog_generation_in_txn(&r).expect("gen")
+        };
+        let kids_gen_before = storage.table_generation("kids").expect("gen");
+
+        storage
+            .alter_table_rename("docs", "papers")
+            .expect("rename to papers");
+        let papers = storage.get_table_schema("papers").expect("papers");
+        assert_eq!(
+            papers.primary_key_constraint_name_effective().as_deref(),
+            Some("docs_pkey")
+        );
+        assert_eq!(papers.unique_constraints()[0].name(), "docs_u_key");
+        assert_eq!(papers.checks()[0].name, "docs_qty_check");
+        assert_eq!(papers.foreign_keys()[0].parent_table(), "papers");
+        let kids_schema = storage.get_table_schema("kids").expect("kids");
+        assert_eq!(kids_schema.foreign_keys().len(), 2);
+        for f in kids_schema.foreign_keys() {
+            assert_eq!(f.parent_table(), "papers");
+        }
+        assert_ne!(
+            kids_gen_before,
+            storage.table_generation("kids").expect("gen")
+        );
+        let idx_gen_after = {
+            let r = storage.db().begin_read().expect("read");
+            index_catalog_generation_in_txn(&r).expect("gen")
+        };
+        assert!(idx_gen_after > idx_gen_before);
+        let indexes = storage.list_indexes().expect("indexes");
+        for (name, table) in [
+            ("idx_qty", "papers"),
+            ("idx_hnsw", "papers"),
+            ("idx_other", "kids"),
+        ] {
+            let d = indexes.iter().find(|d| d.name == name).expect(name);
+            assert_eq!(d.table, table, "{name}");
+        }
+
+        // 往復でカタログ値のバイト列が完全に戻る（PK 名の `None` 正規化を含む）。
+        storage
+            .alter_table_rename("papers", "docs")
+            .expect("rename back");
+        assert_eq!(raw("docs"), docs_bytes);
+        assert_eq!(raw("kids"), kids_bytes);
+
+        // 失敗する改名（改名先に孤児の行テーブル）は子・索引宣言・世代を一切変えない。
+        let row = [
+            RowCodecValue::Vector(vec![1.0, 2.0]),
+            RowCodecValue::Text("x".to_string()),
+        ];
+        let orphan = TableSchema::new(
+            "orphan",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        );
+        storage.create_table(&orphan).expect("orphan");
+        storage
+            .insert_typed_row("orphan", 7, "t", Visibility::Public, &row)
+            .expect("insert orphan");
+        {
+            let w = storage.begin_write_txn().expect("txn");
+            {
+                let mut t = w.open_table(CATALOG_TABLE).expect("catalog");
+                t.remove("orphan").expect("remove");
+            }
+            bump_table_generation_in_txn(&w, "orphan").expect("bump");
+            crate::recovery::commit_boundary::commit(w).expect("commit");
+        }
+        let kids_gen = storage.table_generation("kids").expect("gen");
+        let idx_gen = {
+            let r = storage.db().begin_read().expect("read");
+            index_catalog_generation_in_txn(&r).expect("gen")
+        };
+        assert!(storage.alter_table_rename("docs", "orphan").is_err());
+        assert_eq!(raw("docs"), docs_bytes);
+        assert_eq!(raw("kids"), kids_bytes);
+        assert_eq!(kids_gen, storage.table_generation("kids").expect("gen"));
+        let idx_gen_now = {
+            let r = storage.db().begin_read().expect("read");
+            index_catalog_generation_in_txn(&r).expect("gen")
+        };
+        assert_eq!(idx_gen, idx_gen_now);
+        let indexes = storage.list_indexes().expect("indexes");
+        assert_eq!(
+            indexes
+                .iter()
+                .find(|d| d.name == "idx_qty")
+                .expect("idx")
+                .table,
+            "docs"
+        );
     }
 
     /// CHECK の書き換えに失敗する改名（述語テキストが長さ上限を超える）は `0A000` で拒否し、自表・子表・索引宣言・世代の
