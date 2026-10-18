@@ -162,9 +162,23 @@ impl EngineCore {
                     detail: "internal error".to_string(),
                 })?;
             for ctx in contexts {
-                let rows =
-                    self.eval_matview_body_for(&*write_txn, &ctx, session, &plan, &columns, cap)?;
-                if ContextKey::from_context(&ctx) == creator_key {
+                let is_creator = ContextKey::from_context(&ctx) == creator_key;
+                let rows = match self.eval_matview_body_for(
+                    &*write_txn,
+                    &ctx,
+                    session,
+                    &plan,
+                    &columns,
+                    cap,
+                ) {
+                    Ok(rows) => rows,
+                    // 作成者以外の文脈の評価失敗（行数超過・実行時エラー等）は他テナントのデータに
+                    // 依存するため作成者へ返さない（成否の差で不可視な一致件数を探れてしまう。
+                    // テナント境界・fail-closed）。その文脈の実体は空にし、行は 1 件も露出しない。
+                    Err(_) if !is_creator => Vec::new(),
+                    Err(e) => return Err(e),
+                };
+                if is_creator {
                     own_rows = Some(rows.len() as u64);
                 }
                 out.push((ctx, rows));

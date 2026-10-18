@@ -409,22 +409,37 @@ fn if_not_exists_is_a_noop_for_any_relation_kind() {
 }
 
 #[test]
-fn row_limit_is_per_context_and_failure_creates_nothing() {
+fn row_limit_is_per_context_and_other_context_failure_is_hidden() {
     let (storage, _p, _g) = open_storage("t42-limit");
-    // alice の可視行は 5 行、bob は 6 行、carol は 5 行。上限 5 なら bob で超過する。
+    // alice の可視行は 5 行、bob は 6 行、carol は 5 行。上限 5 なら bob だけが超過する。
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
         .with_result_limits(ResultLimits::new(5))
         .with_materialization_contexts(all_contexts());
+    // 作成者以外の文脈の超過は作成者へ報告されない（成否の差による一致件数の探りを防ぐ）。
+    let outcome = create_ok(
+        &core,
+        "CREATE MATERIALIZED VIEW mv_l AS SELECT body FROM docs",
+    );
+    assert_eq!(tag_rows(&outcome), (false, true, Some(5)));
+    // 超過した文脈（bob）の実体は空で、行は露出しない。
+    let r = query(&core, "bob", "SELECT body FROM mv_l LIMIT 5").unwrap();
+    assert_eq!(r.rows.len(), 0);
+    let r = query(&core, "alice", "SELECT body FROM mv_l LIMIT 5").unwrap();
+    assert_eq!(r.rows.len(), 5);
+    // 作成者自身の文脈が超過するなら従来どおり 54000 で何も作られない。
+    let (storage3, _p3, _g3) = open_storage("t42-limit-own");
+    let core3 = EngineCore::from_storage(storage3, Box::new(CpuScalarProvider))
+        .with_result_limits(ResultLimits::new(4))
+        .with_materialization_contexts(all_contexts());
     assert_eq!(
         create_err(
-            &core,
+            &core3,
             "CREATE MATERIALIZED VIEW mv_l AS SELECT body FROM docs"
         ),
         "54000"
     );
-    // 何も作られていない（読み取りは 42P01・同名で再作成できる）。
     assert_eq!(
-        err_code(&core, "alice", "SELECT body FROM mv_l LIMIT 1"),
+        err_code(&core3, "alice", "SELECT body FROM mv_l LIMIT 1"),
         "42P01"
     );
     // 合計では数えない: alice だけを対象にすれば（5 行 = 上限ちょうど）成功する。
