@@ -548,6 +548,82 @@ pub(crate) fn create_materialized_view_in_txn(
     Ok(())
 }
 
+/// 文脈ごとに評価・保存する逐次書き込み用に、定義の登録と既存実体の消去だけを行う
+/// （`CREATE MATERIALIZED VIEW ... WITH DATA` の第 1 段。Issue #1664）。
+/// 続けて文脈ごとに [`write_context_entity_in_txn`] を呼び、最後に
+/// [`finish_streamed_create_in_txn`] で世代を bump する。commit は呼び出し元が 1 回だけ行い、
+/// 途中で失敗したら txn を破棄して副作用をゼロにする。
+pub(crate) fn begin_streamed_create_in_txn(
+    write_txn: &redb::WriteTransaction,
+    def: &MaterializedViewDef,
+) -> Result<()> {
+    let encoded = encode_materialized_view_def(def)?;
+    insert_def_in_txn(write_txn, def, &encoded)?;
+    if def.populated {
+        delete_all_meta_in_txn(write_txn, &def.name)?;
+        delete_rows_table_in_txn(write_txn, &def.name)?;
+    }
+    Ok(())
+}
+
+/// 1 文脈分の実体を write txn へ書く。評価結果の行値を呼び出し元が即座に解放できるよう、
+/// 文脈ごとに検査（文脈数上限・キー重複・行数上限）と符号化を済ませる。`seen` は書き込み済みの
+/// 文脈キーで、重複検出と文脈数上限の判定に使う。
+pub(crate) fn write_context_entity_in_txn(
+    write_txn: &redb::WriteTransaction,
+    def: &MaterializedViewDef,
+    ctx: &PolicyContext,
+    rows: &[Vec<Value>],
+    seen: &mut Vec<ContextKey>,
+    max_rows_per_context: usize,
+) -> Result<()> {
+    if seen.len() >= MAX_MATVIEW_CONTEXTS {
+        return Err(CatalogError::ViewLimitExceeded(
+            "too many materialized view contexts".to_string(),
+        ));
+    }
+    let key = ContextKey::from_context(ctx);
+    if seen.contains(&key) {
+        return Err(CatalogError::Invalid(
+            "duplicate materialized view context".to_string(),
+        ));
+    }
+    if rows.len() > max_rows_per_context.min(MAX_RESULT_ROWS_HARD_CAP) {
+        return Err(CatalogError::ViewLimitExceeded(
+            "materialized view result exceeds row limit".to_string(),
+        ));
+    }
+    let schema = TableSchema::new(def.name.clone(), def.columns.clone());
+    let table_name = matview_rows_table_name(&def.name);
+    let rows_def: MatviewRowsDef = TableDefinition::new(&table_name);
+    let mut rows_table = write_txn.open_table(rows_def)?;
+    let mut meta_table = write_txn.open_table(MATVIEW_ENTITY_META_TABLE)?;
+    for (i, values) in rows.iter().enumerate() {
+        let encoded = row_codec::encode_row(&schema, ctx.tenant_id(), Visibility::Private, values)
+            .map_err(|_| {
+                CatalogError::Invalid(
+                    "materialized view row does not match its columns".to_string(),
+                )
+            })?;
+        rows_table.insert((key.as_bytes(), i as u64), encoded.as_slice())?;
+    }
+    meta_table.insert(
+        (def.name.as_str(), key.as_bytes()),
+        encode_meta(rows.len() as u64).as_slice(),
+    )?;
+    seen.push(key);
+    Ok(())
+}
+
+/// 逐次書き込みの最終段。表単位の世代を同じ txn 内で bump する。
+pub(crate) fn finish_streamed_create_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<()> {
+    bump_table_generation_in_txn(write_txn, name)?;
+    Ok(())
+}
+
 /// `ctx` に対応する実体を、呼び出し元の読み取り源 `read_txn` から読む。定義が無ければ
 /// `Err(ViewNotFound)`、その文脈の実体が無ければ `Ok(None)`（未実体化）。確定済みスナップ
 /// ショットでも明示トランザクション／実体化中の write txn でも同じコードで読めるよう

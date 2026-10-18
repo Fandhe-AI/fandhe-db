@@ -18,7 +18,8 @@
 
 use super::EngineCore;
 use crate::catalog::materialized::{
-    create_materialized_view_in_txn, ContextKey, MaterializedViewDef, MAX_MATVIEW_CONTEXTS,
+    begin_streamed_create_in_txn, finish_streamed_create_in_txn, write_context_entity_in_txn,
+    ContextKey, MaterializedViewDef, MAX_MATVIEW_CONTEXTS,
 };
 use crate::catalog::CatalogError;
 use crate::policy::PolicyContext;
@@ -152,15 +153,19 @@ impl EngineCore {
         let plan = self.matview_eval_plan(stmt.body_sql(), cap)?;
         self.check_matview_body_collations(&*write_txn, &plan.stmt)?;
 
+        // 定義の登録。`WITH DATA` では文脈ごとに評価した直後に同じ write txn へ保存し行値を解放する
+        // （全文脈の行をメモリへ蓄積するとピークが文脈数に比例するため）。途中失敗は txn 破棄で
+        // 原子性を保つ。
         let mut own_rows: Option<u64> = None;
-        let entities: Option<Vec<(PolicyContext, Vec<Vec<Value>>)>> = if stmt.with_data() {
+        match begin_streamed_create_in_txn(&write_txn, &def) {
+            Ok(()) => {}
+            Err(CatalogError::TableAlreadyExists(_)) if stmt.if_not_exists() => return Ok(skipped),
+            Err(e) => return Err(map_create_matview_error(e)),
+        }
+        if stmt.with_data() {
             let contexts = self.materialization_contexts_for(creator)?;
             let creator_key = ContextKey::from_context(creator);
-            let mut out: Vec<(PolicyContext, Vec<Vec<Value>>)> = Vec::new();
-            out.try_reserve_exact(contexts.len())
-                .map_err(|_| SqlSurfaceError::Internal {
-                    detail: "internal error".to_string(),
-                })?;
+            let mut seen: Vec<ContextKey> = Vec::new();
             for ctx in contexts {
                 let is_creator = ContextKey::from_context(&ctx) == creator_key;
                 let rows = match self.eval_matview_body_for(
@@ -182,19 +187,12 @@ impl EngineCore {
                 if is_creator {
                     own_rows = Some(rows.len() as u64);
                 }
-                out.push((ctx, rows));
+                write_context_entity_in_txn(&write_txn, &def, &ctx, &rows, &mut seen, cap)
+                    .map_err(map_create_matview_error)?;
+                drop(rows);
             }
-            Some(out)
-        } else {
-            None
-        };
-
-        match create_materialized_view_in_txn(&write_txn, &def, entities.as_deref(), cap) {
-            Ok(()) => {}
-            // 競合は評価前の早期判定と write txn の間にしか起きないが、起きても副作用は無い。
-            Err(CatalogError::TableAlreadyExists(_)) if stmt.if_not_exists() => return Ok(skipped),
-            Err(e) => return Err(map_create_matview_error(e)),
         }
+        finish_streamed_create_in_txn(&write_txn, &def.name).map_err(map_create_matview_error)?;
         // 表単位の世代の bump は `create_materialized_view_in_txn` が同じ txn 内で
         // `bump_table_generation_in_txn` により済ませている（commit は唯一のこの 1 回）。
         crate::recovery::commit_boundary::commit(write_txn)
