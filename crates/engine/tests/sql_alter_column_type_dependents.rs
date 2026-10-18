@@ -339,6 +339,39 @@ fn default_and_fill_value_are_converted_or_rejected() {
     );
 }
 
+/// (3) DEFAULT: 変換後の正準 text 表現が元と異なりうる型（REAL・DOUBLE PRECISION・NUMERIC の scale・
+/// TIMESTAMPTZ）でも、代入変換が成功する限り `42804` にならず DEFAULT が新しい型へ変換される。
+#[test]
+fn default_converts_to_inexact_text_types() {
+    let (_p, _g, core) = open("dep-default-inexact");
+    ok(
+        &core,
+        "CREATE TABLE t (r DOUBLE PRECISION DEFAULT 0.1, d REAL DEFAULT 0.1, \
+         n DOUBLE PRECISION DEFAULT 1.005, ts DATE DEFAULT '2024-01-02')",
+    );
+    for sql in [
+        "ALTER TABLE t ALTER COLUMN r TYPE REAL",
+        "ALTER TABLE t ALTER COLUMN d TYPE DOUBLE PRECISION",
+        "ALTER TABLE t ALTER COLUMN n TYPE NUMERIC(10, 2)",
+        "ALTER TABLE t ALTER COLUMN ts TYPE TIMESTAMPTZ",
+    ] {
+        ok(&core, sql);
+    }
+    ok(
+        &core,
+        "INSERT INTO t (id) VALUES (1) USING OPERATION_ID 'x1'",
+    );
+    let rows = core
+        .execute_sql(
+            &ctx("alice"),
+            "SELECT r, d, n, ts FROM t WHERE id = 1 LIMIT 10",
+        )
+        .expect("select")
+        .rows;
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].cells.iter().all(|c| !matches!(c, Cell::Null)));
+}
+
 /// (3) 補完値: ADD COLUMN DEFAULT より前の既存行は変換後の値、以後の省略は変換後の DEFAULT。
 #[test]
 fn fill_value_is_materialized_into_existing_rows() {

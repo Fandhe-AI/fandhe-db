@@ -163,9 +163,10 @@ pub(crate) fn bind_alter_conversion(
 ///
 /// - `CurrentTime`（時刻値関数）は構文形のまま、新しい型と整合するときだけ保持する。
 /// - それ以外は旧型の値として実体化 → 1 列だけのスキーマ上で代入変換を評価 → 正準形へ戻す。
-///   正準形は新しい型で束縛し直して**値が一致すること**を確かめる（往復で値が変わる変換は拒否）。
+///   正準形は新しい型で束縛し直せることを確かめる（整数・bool・文字列は値も一致を要求し、
+///   浮動小数・NUMERIC・日時は束縛成功をもって可とする）。
 ///
-/// 失敗（変換不能・評価エラー・往復不一致）はすべて値を含まない固定文言の `42804`。
+/// 失敗（変換不能・評価エラー・再束縛不能）はすべて値を含まない固定文言の `42804`。
 pub(crate) fn convert_column_default_for_alter(
     old_column: &crate::catalog::ColumnDef,
     default: &crate::catalog::ColumnDefault,
@@ -237,11 +238,24 @@ pub(crate) fn convert_column_default_for_alter(
             _ => return Err(fail()),
         },
     };
-    // 往復検証: 正準形を新しい型で束縛し直して同じ値になること。
+    // 再束縛検証: 正準形が新しい型の DEFAULT として束縛できること。完全一致は、整数・bool・文字列
+    // など正準 text 表現が一意な型だけで要求する。REAL／DOUBLE PRECISION／NUMERIC の scale／
+    // TIMESTAMPTZ は text 表現が元と異なっても代入変換自体は成功しているため、束縛成功をもって可とする
+    // （変換不能のみ 42804 で fail-closed）。
     let probe = ColumnDef::new(old_column.name.clone(), new_ty.clone(), true);
     match crate::sql::parser::bind_column_default(&probe, &candidate) {
-        Ok(v) if v == new_value => Ok(candidate),
-        _ => Err(fail()),
+        Ok(v) => {
+            let exact = matches!(
+                new_value,
+                Value::Bool(_) | Value::Text(_) | Value::Integer(_) | Value::BigInt(_)
+            );
+            if !exact || v == new_value {
+                Ok(candidate)
+            } else {
+                Err(fail())
+            }
+        }
+        Err(_) => Err(fail()),
     }
 }
 
