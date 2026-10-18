@@ -21,8 +21,9 @@
 //!
 //! # 後続 Issue への申し送り
 //!
-//! 行ストアと切断時の破棄は `temp_rows`（#1682 で実装済み）、`CREATE TEMP TABLE` と `ON COMMIT` は #1683、一時表への
-//! DML・索引・制約とゲートの解除は #1684、テナント境界・crash 耐性の検査は #1685。
+//! 行ストアと切断時の破棄は `temp_rows`（#1682 で実装済み）、`CREATE TEMP TABLE` と
+//! `ON COMMIT` は #1683、一時表への DML・索引・制約とゲートの解除は #1684、
+//! テナント境界・crash 耐性の検査は #1685。
 //! 修飾名（`pg_temp.<名前>`）はスキーマ・`search_path`（TABLE-27）の実装へ申し送る。
 
 // 登録・削除・解決の API は #1683 以降の実行腕から呼ばれる。本 Issue の時点では
@@ -44,7 +45,7 @@ use crate::sql::lexer::Token;
 pub(crate) const DEFAULT_MAX_TEMP_TABLES_PER_SESSION: usize = 64;
 
 /// 一時表のプロセス内で一意な識別子。永続化しない（再起動で採番し直す）。
-/// `temp_rows` の行領域のキーに使い、、同名の再作成と区別するために登録ごとに採番する。
+/// `temp_rows` の行領域のキーに使い、同名の再作成と区別するために登録ごとに採番する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TempRelationId(u64);
 
