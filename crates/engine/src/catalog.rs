@@ -2367,6 +2367,13 @@ pub enum CatalogError {
     /// [`CatalogError::DependentObjectsStillExist`] とは独立させ、依存元・
     /// 依存先の意味論が混ざらないようにする。
     DependentViewsExist(String),
+    /// `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）の互換性検査と置換の間に、置換対象の
+    /// ビュー定義が他の書き込みで変わった（検査した旧定義と現在の定義が不一致）。置換せず、
+    /// SQL 表層が検査からやり直す（上限超過は `55P03`）。中身はクライアント自身が指定したビュー名のみ。
+    ViewDefinitionChanged(String),
+    /// `CREATE OR REPLACE VIEW` の新本文が置換対象のビュー自身へ（直接または他のビューを経由して）
+    /// 到達する（TABLE-41 (2)・Issue #1660。ERR-6: `42P17`）。中身はクライアント自身が指定したビュー名のみ。
+    ViewReferenceCycle(String),
     /// ビュー関連の DoS 対策上限超過（ビュー総数・本文バイト数・ネスト深さ。
     /// TABLE-18・SQL-23・TASK-205、Issue #909。ERR-6: `54000`）。`detail` は
     /// 固定文言のみ（テナント・行内容を含まない）。
@@ -2498,6 +2505,12 @@ impl fmt::Display for CatalogError {
             CatalogError::DependentViewsExist(name) => {
                 write!(f, "dependent views still exist for: {name}")
             }
+            CatalogError::ViewDefinitionChanged(name) => {
+                write!(f, "view definition changed concurrently: {name}")
+            }
+            CatalogError::ViewReferenceCycle(name) => {
+                write!(f, "view definition references itself: {name}")
+            }
             CatalogError::ViewLimitExceeded(detail) => {
                 write!(f, "view limit exceeded: {detail}")
             }
@@ -2581,6 +2594,8 @@ impl std::error::Error for CatalogError {
             | CatalogError::ViewNotFound(_)
             | CatalogError::WrongObjectKind(_)
             | CatalogError::DependentViewsExist(_)
+            | CatalogError::ViewDefinitionChanged(_)
+            | CatalogError::ViewReferenceCycle(_)
             | CatalogError::ViewLimitExceeded(_)
             | CatalogError::ColumnNotFound(_)
             | CatalogError::ProtectedColumn(_)
@@ -4245,6 +4260,173 @@ fn drop_foreign_key_in_txn(
     }
     let required = required_key_index_names_in_txn(write_txn, child_table)?;
     crate::key_index::prune_unneeded_indexes_in_txn(write_txn, child_table, &required)?;
+    Ok(())
+}
+
+/// `starts`（新本文が読む relation 群）から、ビューの参照を推移的に辿って `target` へ到達するか。
+/// `CREATE OR REPLACE VIEW` が自己参照・循環を作らないための検査（Issue #1660）。訪問済み集合と
+/// [`MAX_VIEW_CHAIN_WALK`] で打ち切る再帰なしの探索で、上限超過や格納本文を読めない場合は
+/// 到達ありとみなす（fail-closed）。
+fn view_body_reaches_in_txn(
+    views_table: &redb::Table<'_, &str, &[u8]>,
+    starts: &[String],
+    target: &str,
+) -> Result<bool> {
+    let mut stack: Vec<String> = starts.to_vec();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(current) = stack.pop() {
+        if current == target {
+            return Ok(true);
+        }
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        if visited.len() > MAX_VIEW_CHAIN_WALK {
+            return Ok(true);
+        }
+        let Some(guard) = views_table.get(current.as_str())? else {
+            continue;
+        };
+        let def = decode_view_def(guard.value())?;
+        stack.push(def.base_relation);
+        match view_body_shape(&def.body_sql) {
+            Ok(shape) => stack.extend(shape.relations),
+            Err(_) => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+/// 新しいビュー本文（`CREATE VIEW`／`CREATE OR REPLACE VIEW`）を同一 write txn 内で検証する
+/// 共有実装（Issue #909・#1192・#1411・#1436・#1659・#1660）。`Storage::create_view_with_column_aliases`
+/// と `Storage::create_or_replace_view` が呼ぶ（検証の第 2 実装を作らない）。判定: 本文が読む全
+/// relation の存在（不存在は `TableNotFound`）→ JOIN 辺はテーブルに限る → 評価後射影形・別名付き
+/// ビューへ到達する本文の参照時と同じ再検証 → ネスト深さ上限（`ViewLimitExceeded`）。
+/// 名前衝突・登録件数・書き込みは呼び出し元が担う。
+fn validate_new_view_body_in_txn(
+    write_txn: &redb::WriteTransaction,
+    catalog_table: &redb::Table<'_, &'static str, &'static [u8]>,
+    views_table: &redb::Table<'_, &'static str, &'static [u8]>,
+    body_sql: &str,
+    base_relation: &str,
+    shape: &ViewBodyShape,
+) -> Result<()> {
+    // 本文が読む全 relation の存在確認（不存在は `TableNotFound`。JOIN の
+    // 右辺を含む）と、連鎖の最大深さの算出。
+    let mut depth = 0u32;
+    for rel in &shape.relations {
+        let d = resolve_reference_depth_in_txn(catalog_table, views_table, rel)?;
+        depth = depth.max(d);
+    }
+    // Issue #1192・#1411: JOIN 本文の両辺はテーブルに限る（参照時に JOIN 内のビュー
+    // 参照は拒否されるため、作成できても参照できない定義を作らない）。評価後射影形
+    // ビュー（または単純形の連鎖でそこへ到達するビュー）を読む本文は、参照時と同じ
+    // 再検証（`sql::view::resolve_from`。実カタログ照会）を作成前に通し、CTE・
+    // サブクエリ・集合演算の枝・JOIN の辺からの参照など参照時に必ず拒否される形は
+    // `Invalid`（`42601`）にする。単純形ビューは、評価後射影形ビューの上に重ねられる形
+    // （列射影・宣言的 `WHERE` のみ）に限る。
+    let mut reaches_buffered = false;
+    // 列別名付きビューへ到達する評価後射影形の本文（Issue #1659）。別名付きビューを
+    // 集合演算の枝などから読む形は参照時に拒否されるため、実カタログで再検証する。
+    let mut reaches_aliased = false;
+    for rel in &shape.relations {
+        if view_reaches_buffered_in_txn(views_table, rel, false)? {
+            reaches_buffered = true;
+        }
+        if view_reaches_buffered_in_txn(views_table, rel, true)? {
+            reaches_aliased = true;
+        }
+        if shape.join && catalog_table.get(rel.as_str())?.is_none() {
+            return Err(CatalogError::Invalid(
+                "JOIN in a view body cannot reference a view".to_string(),
+            ));
+        }
+    }
+    // Issue #1436: 構造検証で保留した式述語（トップレベルの `Scan`／`Aggregate`）は、
+    // 実カタログで確定させる。FROM が評価後射影形ビューの連鎖なら受理され、テーブル
+    // （または単純形ビュー経由でテーブル）直下なら `Resolved` の検証で `Invalid`
+    // （`42601`）になる。作成できても参照時に必ず失敗する定義を作らない。
+    if reaches_buffered || shape.deferred_expr || (shape.buffered && reaches_aliased) {
+        let invalid = || {
+            CatalogError::Invalid(
+                "a view cannot reference a view with an aggregate/LIMIT body in this position"
+                    .to_string(),
+            )
+        };
+        if shape.buffered {
+            let lookup = TxnViewLookup {
+                write_txn,
+                catalog_table,
+                views_table,
+            };
+            let tokens =
+                crate::sql::lexer::tokenize_stored_view_body(body_sql).map_err(|_| invalid())?;
+            classify_view_body(&tokens, &lookup, ViewBodyCheck::Resolved).map_err(|e| {
+                match e {
+                    // 深さ超過は `54000` のまま（`Invalid`〔42601〕へ丸めない）。
+                    SqlSurfaceError::PayloadTooLarge { detail } => {
+                        CatalogError::ViewLimitExceeded(detail)
+                    }
+                    _ => invalid(),
+                }
+            })?;
+        } else {
+            let tokens =
+                crate::sql::lexer::tokenize_stored_view_body(body_sql).map_err(|_| invalid())?;
+            let parsed = parse_view_body(&tokens).map_err(|_| invalid())?;
+            crate::sql::allowlist::check_simple_layer_over_buffered(&parsed)
+                .map_err(|_| invalid())?;
+        }
+    }
+    // 列別名付きビューへ到達する単純形の本文（Issue #1659）: 参照時は親の「公開名 → 物理名」
+    // 対応で本文の `WHERE` を書き換える（`sql::view::resolve_from`）。書き換えられない形
+    // （疑似列 `id` へ写る公開名の参照など）を含む定義は、作成できても以後の参照がすべて
+    // 失敗するため、参照時と同じ検査（列スコープ・`rewrite_where`）を作成前に通す。
+    if reaches_aliased && !shape.buffered {
+        let invalid = || {
+            CatalogError::Invalid(
+                "a view over a view with column aliases cannot use this predicate or column"
+                    .to_string(),
+            )
+        };
+        let lookup = TxnViewLookup {
+            write_txn,
+            catalog_table,
+            views_table,
+        };
+        let tokens =
+            crate::sql::lexer::tokenize_stored_view_body(body_sql).map_err(|_| invalid())?;
+        let parsed = parse_view_body(&tokens).map_err(|_| invalid())?;
+        if let crate::sql::view::Resolved::View {
+            view_columns,
+            column_map: Some(map),
+            ..
+        } = crate::sql::view::resolve_from(&lookup, base_relation).map_err(|_| invalid())?
+        {
+            crate::sql::view::check_columns_within_view(
+                view_columns.as_deref(),
+                &parsed.projection,
+                &parsed.where_predicates,
+                &[],
+            )
+            .map_err(|_| invalid())?;
+            crate::sql::view_alias::rewrite_where(
+                &crate::sql::view_alias::ColumnMap::new(&map),
+                parsed.where_predicates,
+            )
+            .map_err(|_| invalid())?;
+        }
+    }
+    // テーブル自身が深さ 0 のため、それを直接参照する新規ビューの深さは
+    // `depth`（参照先の深さ）+ 1。
+    let new_depth = depth.checked_add(1).ok_or_else(|| {
+        CatalogError::ViewLimitExceeded("view nesting depth overflow".to_string())
+    })?;
+    if new_depth > MAX_VIEW_NESTING_DEPTH {
+        return Err(CatalogError::ViewLimitExceeded(
+            "view nesting depth exceeds limit".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -12215,123 +12397,14 @@ impl Storage {
             if index_name_exists_in_txn(&write_txn, name)? {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
-            // 本文が読む全 relation の存在確認（不存在は `TableNotFound`。JOIN の
-            // 右辺を含む）と、連鎖の最大深さの算出。
-            let mut depth = 0u32;
-            for rel in &shape.relations {
-                let d = resolve_reference_depth_in_txn(&catalog_table, &views_table, rel)?;
-                depth = depth.max(d);
-            }
-            // Issue #1192・#1411: JOIN 本文の両辺はテーブルに限る（参照時に JOIN 内のビュー
-            // 参照は拒否されるため、作成できても参照できない定義を作らない）。評価後射影形
-            // ビュー（または単純形の連鎖でそこへ到達するビュー）を読む本文は、参照時と同じ
-            // 再検証（`sql::view::resolve_from`。実カタログ照会）を作成前に通し、CTE・
-            // サブクエリ・集合演算の枝・JOIN の辺からの参照など参照時に必ず拒否される形は
-            // `Invalid`（`42601`）にする。単純形ビューは、評価後射影形ビューの上に重ねられる形
-            // （列射影・宣言的 `WHERE` のみ）に限る。
-            let mut reaches_buffered = false;
-            // 列別名付きビューへ到達する評価後射影形の本文（Issue #1659）。別名付きビューを
-            // 集合演算の枝などから読む形は参照時に拒否されるため、実カタログで再検証する。
-            let mut reaches_aliased = false;
-            for rel in &shape.relations {
-                if view_reaches_buffered_in_txn(&views_table, rel, false)? {
-                    reaches_buffered = true;
-                }
-                if view_reaches_buffered_in_txn(&views_table, rel, true)? {
-                    reaches_aliased = true;
-                }
-                if shape.join && catalog_table.get(rel.as_str())?.is_none() {
-                    return Err(CatalogError::Invalid(
-                        "JOIN in a view body cannot reference a view".to_string(),
-                    ));
-                }
-            }
-            // Issue #1436: 構造検証で保留した式述語（トップレベルの `Scan`／`Aggregate`）は、
-            // 実カタログで確定させる。FROM が評価後射影形ビューの連鎖なら受理され、テーブル
-            // （または単純形ビュー経由でテーブル）直下なら `Resolved` の検証で `Invalid`
-            // （`42601`）になる。作成できても参照時に必ず失敗する定義を作らない。
-            if reaches_buffered || shape.deferred_expr || (shape.buffered && reaches_aliased) {
-                let invalid = || {
-                    CatalogError::Invalid(
-                        "a view cannot reference a view with an aggregate/LIMIT body in this position"
-                            .to_string(),
-                    )
-                };
-                if shape.buffered {
-                    let lookup = TxnViewLookup {
-                        write_txn: &write_txn,
-                        catalog_table: &catalog_table,
-                        views_table: &views_table,
-                    };
-                    let tokens = crate::sql::lexer::tokenize_stored_view_body(body_sql)
-                        .map_err(|_| invalid())?;
-                    classify_view_body(&tokens, &lookup, ViewBodyCheck::Resolved).map_err(|e| {
-                        match e {
-                            // 深さ超過は `54000` のまま（`Invalid`〔42601〕へ丸めない）。
-                            SqlSurfaceError::PayloadTooLarge { detail } => {
-                                CatalogError::ViewLimitExceeded(detail)
-                            }
-                            _ => invalid(),
-                        }
-                    })?;
-                } else {
-                    let tokens = crate::sql::lexer::tokenize_stored_view_body(body_sql)
-                        .map_err(|_| invalid())?;
-                    let parsed = parse_view_body(&tokens).map_err(|_| invalid())?;
-                    crate::sql::allowlist::check_simple_layer_over_buffered(&parsed)
-                        .map_err(|_| invalid())?;
-                }
-            }
-            // 列別名付きビューへ到達する単純形の本文（Issue #1659）: 参照時は親の「公開名 → 物理名」
-            // 対応で本文の `WHERE` を書き換える（`sql::view::resolve_from`）。書き換えられない形
-            // （疑似列 `id` へ写る公開名の参照など）を含む定義は、作成できても以後の参照がすべて
-            // 失敗するため、参照時と同じ検査（列スコープ・`rewrite_where`）を作成前に通す。
-            if reaches_aliased && !shape.buffered {
-                let invalid = || {
-                    CatalogError::Invalid(
-                        "a view over a view with column aliases cannot use this predicate or column"
-                            .to_string(),
-                    )
-                };
-                let lookup = TxnViewLookup {
-                    write_txn: &write_txn,
-                    catalog_table: &catalog_table,
-                    views_table: &views_table,
-                };
-                let tokens = crate::sql::lexer::tokenize_stored_view_body(body_sql)
-                    .map_err(|_| invalid())?;
-                let parsed = parse_view_body(&tokens).map_err(|_| invalid())?;
-                if let crate::sql::view::Resolved::View {
-                    view_columns,
-                    column_map: Some(map),
-                    ..
-                } =
-                    crate::sql::view::resolve_from(&lookup, base_relation).map_err(|_| invalid())?
-                {
-                    crate::sql::view::check_columns_within_view(
-                        view_columns.as_deref(),
-                        &parsed.projection,
-                        &parsed.where_predicates,
-                        &[],
-                    )
-                    .map_err(|_| invalid())?;
-                    crate::sql::view_alias::rewrite_where(
-                        &crate::sql::view_alias::ColumnMap::new(&map),
-                        parsed.where_predicates,
-                    )
-                    .map_err(|_| invalid())?;
-                }
-            }
-            // テーブル自身が深さ 0 のため、それを直接参照する新規ビューの深さは
-            // `depth`（参照先の深さ）+ 1。
-            let new_depth = depth.checked_add(1).ok_or_else(|| {
-                CatalogError::ViewLimitExceeded("view nesting depth overflow".to_string())
-            })?;
-            if new_depth > MAX_VIEW_NESTING_DEPTH {
-                return Err(CatalogError::ViewLimitExceeded(
-                    "view nesting depth exceeds limit".to_string(),
-                ));
-            }
+            validate_new_view_body_in_txn(
+                &write_txn,
+                &catalog_table,
+                &views_table,
+                body_sql,
+                base_relation,
+                &shape,
+            )?;
             let count = views_table.len()?;
             if count >= MAX_VIEWS as u64 {
                 return Err(CatalogError::ViewLimitExceeded(
@@ -12635,6 +12708,101 @@ impl Storage {
             out.push(decode_index_def(key.value(), value.value())?);
         }
         Ok(out)
+    }
+
+    /// `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）の永続化。`expected_old` は SQL 表層が
+    /// 互換性検査（列の名前・型・順序）に使った旧定義（無ければ `None`）で、同一 write txn 内で
+    /// 現在の定義と突き合わせる（compare-and-swap）。不一致は `Err(ViewDefinitionChanged)` で何も
+    /// 書かない。公開 Rust API からの直接呼び出しでは互換性検査は行わない（SQL 表層の責務）。
+    ///
+    /// 判定順序（同一 write txn 内。TOCTOU 回避）: 本文・別名の前処理（[`Self::create_view_with_column_aliases`]
+    /// と同じ）→ 名前がテーブル・索引なら `Err(WrongObjectKind)` → 旧定義の CAS →
+    /// 旧定義なしなら通常の作成（名前衝突・件数上限を含む）→ 旧定義ありなら、新本文が自身へ到達
+    /// すれば `Err(ViewReferenceCycle)`、新本文の検証（[`validate_new_view_body_in_txn`]）、
+    /// 置換対象に依存するビューがあれば `Err(DependentViewsExist)`（依存ビューの再検証と復旧は
+    /// Issue #1661 までの暫定制限。fail-closed）→ 上書き。ビューは行ストア・世代を持たないため
+    /// [`bump_table_generation_in_txn`] は呼ばない。
+    pub fn create_or_replace_view(
+        &self,
+        name: &str,
+        base_relation: &str,
+        body_sql: &str,
+        column_aliases: &[String],
+        expected_old: Option<&ViewDef>,
+    ) -> Result<()> {
+        validate_identifier(name)?;
+        if body_sql.len() > MAX_VIEW_BODY_BYTES {
+            return Err(CatalogError::ViewLimitExceeded(
+                "view body too large".to_string(),
+            ));
+        }
+        if column_aliases.len() > MAX_COLUMN_COUNT {
+            return Err(CatalogError::Invalid(
+                "too many view column aliases".to_string(),
+            ));
+        }
+        let mut seen_aliases: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for alias in column_aliases {
+            validate_identifier(alias)?;
+            if !seen_aliases.insert(alias.as_str()) {
+                return Err(CatalogError::Invalid(
+                    "duplicate view column alias".to_string(),
+                ));
+            }
+        }
+        let shape = validate_view_body_matches_base_relation(body_sql, base_relation)?;
+        let encoded = encode_view_def(&ViewDef {
+            base_relation: base_relation.to_string(),
+            body_sql: body_sql.to_string(),
+            column_aliases: column_aliases.to_vec(),
+        })?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        {
+            let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            if catalog_table.get(name)?.is_some() || index_name_exists_in_txn(&write_txn, name)? {
+                return Err(CatalogError::WrongObjectKind(name.to_string()));
+            }
+            let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+            let current = match views_table.get(name)? {
+                Some(guard) => Some(decode_view_def(guard.value())?),
+                None => None,
+            };
+            if current.as_ref() != expected_old {
+                return Err(CatalogError::ViewDefinitionChanged(name.to_string()));
+            }
+            if current.is_some() {
+                if view_body_reaches_in_txn(&views_table, &shape.relations, name)? {
+                    return Err(CatalogError::ViewReferenceCycle(name.to_string()));
+                }
+                validate_new_view_body_in_txn(
+                    &write_txn,
+                    &catalog_table,
+                    &views_table,
+                    body_sql,
+                    base_relation,
+                    &shape,
+                )?;
+                if !views_depending_on_in_txn(&views_table, name)?.is_empty() {
+                    return Err(CatalogError::DependentViewsExist(name.to_string()));
+                }
+            } else {
+                validate_new_view_body_in_txn(
+                    &write_txn,
+                    &catalog_table,
+                    &views_table,
+                    body_sql,
+                    base_relation,
+                    &shape,
+                )?;
+                if views_table.len()? >= MAX_VIEWS as u64 {
+                    return Err(CatalogError::ViewLimitExceeded(
+                        "too many views".to_string(),
+                    ));
+                }
+            }
+            views_table.insert(name, encoded.as_slice())?;
+        }
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
     /// ビュー定義をスナップショット読み取りで取得する（[`TableLookup::
@@ -13076,6 +13244,8 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::ViewNotFound(_)
         | CatalogError::WrongObjectKind(_)
         | CatalogError::DependentViewsExist(_)
+            | CatalogError::ViewDefinitionChanged(_)
+            | CatalogError::ViewReferenceCycle(_)
         | CatalogError::ViewLimitExceeded(_)
         | CatalogError::ColumnNotFound(_)
         | CatalogError::ProtectedColumn(_)

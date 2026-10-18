@@ -255,6 +255,8 @@ pub(crate) fn execute_create_table(
         // 専用の変種で、`Storage::create_table` からは返らない（到達不能）。
         | CatalogError::ViewNotFound(_)
         | CatalogError::DependentViewsExist(_)
+        | CatalogError::ViewDefinitionChanged(_)
+        | CatalogError::ViewReferenceCycle(_)
         | CatalogError::ViewLimitExceeded(_)
         // `TooManyColumns` は `ALTER TABLE ADD COLUMN`（Issue #900・
         // `Storage::alter_table_add_column`）専用の変種で、`Storage::create_table`
@@ -1135,6 +1137,8 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::TypeAlreadyExists(_)
         | CatalogError::ViewNotFound(_)
         | CatalogError::DependentViewsExist(_)
+        | CatalogError::ViewDefinitionChanged(_)
+        | CatalogError::ViewReferenceCycle(_)
         | CatalogError::ViewLimitExceeded(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
@@ -1605,6 +1609,8 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::TypeAlreadyExists(_)
         | CatalogError::ViewNotFound(_)
         | CatalogError::DependentViewsExist(_)
+        | CatalogError::ViewDefinitionChanged(_)
+        | CatalogError::ViewReferenceCycle(_)
         | CatalogError::ViewLimitExceeded(_)
         | CatalogError::TooManyColumns { .. }
         | CatalogError::IndexAlreadyExists(_)
@@ -2115,6 +2121,8 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IncompatibleTypeChange { .. }
         | CatalogError::ViewNotFound(_)
         | CatalogError::DependentViewsExist(_)
+        | CatalogError::ViewDefinitionChanged(_)
+        | CatalogError::ViewReferenceCycle(_)
         | CatalogError::ViewLimitExceeded(_)
         // `UniqueConstraintViolation` は `Storage::alter_table_add_unique_constraint`
         // 専用（TABLE-16・TASK-204、Issue #905）で、`alter_table_add_column` からは
@@ -2240,6 +2248,42 @@ fn map_create_view_error(e: CatalogError) -> SqlSurfaceError {
         _ => SqlSurfaceError::Internal {
             detail: "CREATE VIEW failed".to_string(),
         },
+    }
+}
+
+/// `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）の実行本体。`require_ddl_permission` と
+/// 互換性検査（`core`）を通過したセッションに限り呼ばれ、`expected_old`（検査に使った旧定義）を
+/// `Storage::create_or_replace_view` の compare-and-swap へ渡す。旧定義が検査後に変わっていた
+/// 場合は [`CatalogError::ViewDefinitionChanged`] が返り、呼び出し元が検査からやり直す。
+pub(crate) fn execute_create_or_replace_view(
+    storage: &Storage,
+    validated: &ValidatedCreateView,
+    expected_old: Option<&crate::catalog::ViewDef>,
+) -> Result<CreateViewOutcome, CatalogError> {
+    storage.create_or_replace_view(
+        validated.name(),
+        validated.base_relation(),
+        validated.body_sql(),
+        validated.column_aliases(),
+        expected_old,
+    )?;
+    Ok(CreateViewOutcome {})
+}
+
+/// [`execute_create_or_replace_view`] の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （種別違い `42809`、自己参照・循環 `42P17`、依存ビューあり `0A000`〔Issue #1661 までの暫定制限〕、
+/// 競合による旧定義の変化 `55P03`。他は [`map_create_view_error`] と同じ）。
+pub(crate) fn map_replace_view_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::ViewReferenceCycle(_) => SqlSurfaceError::InvalidObjectDefinition {
+            detail: "view definition must not reference the view itself",
+        },
+        CatalogError::DependentViewsExist(_) => SqlSurfaceError::feature_not_supported(
+            "replacing a view that other views depend on is not supported",
+        ),
+        CatalogError::ViewDefinitionChanged(_) => SqlSurfaceError::LockNotAvailable,
+        other => map_create_view_error(other),
     }
 }
 

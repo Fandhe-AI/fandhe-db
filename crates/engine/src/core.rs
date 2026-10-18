@@ -3972,13 +3972,18 @@ impl EngineCore {
             return Ok(ParsedSql::DropTable(stmt));
         }
 
-        let is_create_view_statement = matches!(
-            tokens.first(),
-            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE")
-        ) && matches!(
-            tokens.get(1),
-            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("VIEW")
-        );
+        let ident_at = |i: usize, word: &str| {
+            matches!(
+                tokens.get(i),
+                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case(word)
+            )
+        };
+        // `CREATE VIEW` に加え `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）も同じ経路へ
+        // 入れる。`CREATE OR REPLACE` の後が `VIEW` 以外（`TABLE`・`INDEX` 等）は従来どおり汎用経路で
+        // `42601` になる。
+        let is_create_view_statement = ident_at(0, "CREATE")
+            && (ident_at(1, "VIEW")
+                || (ident_at(1, "OR") && ident_at(2, "REPLACE") && ident_at(3, "VIEW")));
         if is_create_view_statement {
             // TABLE-18・SQL-23・TASK-205（Issue #909）: `validate_create_view_tokens`
             // もカタログ照会を一切行わない（`DropTable`・`DropView` と同じ設計。
@@ -4740,7 +4745,12 @@ impl EngineCore {
                 // TABLE-41 (1)・Issue #1659: 列別名リストと本文の出力列数の突合は、カタログを
                 // 照会するため DDL 権限ゲートの後に行う（権限の無い主体へ列構成を返さない）。
                 self.check_create_view_column_aliases(session, stmt)?;
-                let outcome = crate::sql::ddl::execute_create_view(&self.storage, stmt)?;
+                // TABLE-41 (2)・Issue #1660: `OR REPLACE` は互換性検査付きの置換経路へ。
+                let outcome = if stmt.or_replace() {
+                    self.create_or_replace_view_in_session(session, stmt)?
+                } else {
+                    crate::sql::ddl::execute_create_view(&self.storage, stmt)?
+                };
                 Ok(crate::sql::SqlOutcome::CreateView(outcome))
             }
             ParsedSql::DropView(stmt) => {
@@ -5470,6 +5480,128 @@ impl EngineCore {
             };
         }
         self.describe_parsed_in_session(session, parsed)
+    }
+
+    /// `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）の実行本体。`execute_sql_in_session` の
+    /// `CreateView` 腕が DDL 権限ゲートと列別名の突合の後に呼ぶ。同名ビューがあれば、旧定義と新定義の
+    /// 出力列（名前・型・順序）を [`Self::view_output_columns`] で同じ規則により導出して
+    /// `sql::view_replace::check_replace_compatible`（非互換は `42P16`）に通し、通ったときだけ
+    /// `Storage::create_or_replace_view` が旧定義との compare-and-swap で置換する。検査後に旧定義が
+    /// 変わっていた場合は検査からやり直す（有界。超過は `55P03`）。同名がテーブル・索引なら
+    /// カタログ側が `42809` を返す。
+    fn create_or_replace_view_in_session(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedCreateView,
+    ) -> Result<crate::sql::ddl::CreateViewOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::catalog::CatalogError;
+        use crate::sql::allowlist::SqlSurfaceError;
+        // 検査と置換の間の競合による再試行の上限（無制限ループにしない）。
+        const MAX_ATTEMPTS: usize = 3;
+        for _ in 0..MAX_ATTEMPTS {
+            let old = self.storage.view_definition(stmt.name()).map_err(|_| {
+                SqlSurfaceError::Internal {
+                    detail: "CREATE VIEW failed".to_string(),
+                }
+            })?;
+            if let Some(old) = &old {
+                let old_cols =
+                    self.view_output_columns(session, &old.body_sql, &old.column_aliases)?;
+                let new_cols =
+                    self.view_output_columns(session, stmt.body_sql(), stmt.column_aliases())?;
+                crate::sql::view_replace::check_replace_compatible(&old_cols, &new_cols)?;
+            }
+            match crate::sql::ddl::execute_create_or_replace_view(&self.storage, stmt, old.as_ref())
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(CatalogError::ViewDefinitionChanged(_)) => continue,
+                Err(e) => return Err(crate::sql::ddl::map_replace_view_error(e)),
+            }
+        }
+        Err(SqlSurfaceError::LockNotAvailable)
+    }
+
+    /// ビュー本文 `body_sql`（格納形）と列別名 `column_aliases` から、出力列（名前と静的な型）を
+    /// 導出する。`CREATE OR REPLACE VIEW` の旧定義・新定義の両方に同じ関数を使い、比較の非対称を
+    /// 作らない（Issue #1660）。本文は実行せず Describe で型を得る。単純形本文は
+    /// `sql::view::body_output` の名前と Describe の名前が一致することを確認し、食い違えば
+    /// fail-closed で `XX000`。`SELECT *` は参照時の展開結果（置換時点）で比較する。
+    fn view_output_columns(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        body_sql: &str,
+        column_aliases: &[String],
+    ) -> Result<Vec<crate::sql::view_replace::ViewColumn>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        use crate::sql::allowlist::SqlSurfaceError;
+        use crate::sql::exec::ColumnMeta;
+        use crate::sql::view_replace::ViewColumn;
+        let invalid_body = || SqlSurfaceError::Internal {
+            detail: "invalid view definition".to_string(),
+        };
+        let tokens =
+            crate::sql::lexer::tokenize_stored_view_body(body_sql).map_err(|_| invalid_body())?;
+        let kind = crate::sql::allowlist::classify_view_body(
+            &tokens,
+            &self.storage,
+            crate::sql::allowlist::ViewBodyCheck::Resolved,
+        )?;
+        let (statement, expected_names) = match crate::sql::view::body_output(&self.storage, kind)?
+        {
+            crate::sql::view::BodyOutput::Statement(body) => (*body, None),
+            // 単純形本文は `LIMIT` を持たず、読み取り文として検証するには `LIMIT` が要る。
+            // Describe は本文を実行しないため、検証用に `LIMIT 1` を足した写しで型を得る。
+            crate::sql::view::BodyOutput::Names(names) => {
+                let mut limited = tokens.clone();
+                limited.push(crate::sql::lexer::Token::Keyword(
+                    crate::sql::lexer::Keyword::Limit,
+                ));
+                limited.push(crate::sql::lexer::Token::Number("1".to_string()));
+                (
+                    crate::sql::allowlist::validate_sql_tokens(&limited, &self.storage)?,
+                    Some(names),
+                )
+            }
+        };
+        let metas = self
+            .describe_parsed_in_session_impl(
+                session,
+                &ParsedSql::Statement(statement),
+                false,
+                &[],
+                &crate::result_limits::ResultLimits::default(),
+            )?
+            .ok_or_else(invalid_body)?;
+        let mut columns: Vec<ViewColumn> = metas
+            .into_iter()
+            .map(|m| match m {
+                ColumnMeta::Id => ViewColumn {
+                    name: "id".to_string(),
+                    ty: Some(crate::sql::exec::ALIASED_ID_TYPE.clone()),
+                },
+                ColumnMeta::AliasedId { name } => ViewColumn {
+                    name,
+                    ty: Some(crate::sql::exec::ALIASED_ID_TYPE.clone()),
+                },
+                ColumnMeta::Scalar { name, ty } => ViewColumn { name, ty: Some(ty) },
+                ColumnMeta::Computed { name, ty } => ViewColumn { name, ty },
+            })
+            .collect();
+        if let Some(names) = expected_names {
+            let described: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+            if described != names.iter().map(String::as_str).collect::<Vec<_>>() {
+                return Err(invalid_body());
+            }
+        }
+        if column_aliases.len() > columns.len() {
+            return Err(SqlSurfaceError::unsupported(
+                "view column alias list is longer than the view's output columns",
+            ));
+        }
+        for (col, alias) in columns.iter_mut().zip(column_aliases.iter()) {
+            col.name = alias.clone();
+        }
+        Ok(columns)
     }
 
     /// `CREATE VIEW v (a, b) AS ...`（TABLE-41 (1)・Issue #1659）の列別名リストを、本文の出力列に
