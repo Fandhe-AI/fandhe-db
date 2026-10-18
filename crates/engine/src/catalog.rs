@@ -103,7 +103,8 @@ const MAX_VIEW_CHAIN_WALK: usize = MAX_VIEWS;
 /// [`Storage::create_index`] はいずれも [`CATALOG_TABLE`]・[`VIEWS_TABLE`]・本テーブルの
 /// 3 者を同一 write txn で確認する）、値は [`encode_index_def`] でエンコードした
 /// バイト列。対象テーブルが [`Storage::drop_table`] で削除された場合は同一 write
-/// トランザクションで該当エントリも削除する（[`delete_indexes_for_table_in_txn`]）。
+/// トランザクションで該当エントリも削除する（[`Storage::drop_tables`]。残置すると同名再作成に
+/// 伴う `CREATE INDEX` を無関係に `42P07` で塞ぐ）。
 ///
 /// 責務境界: 本テーブルは宣言（索引の存在・種別・対象列）のみを保持し、索引の
 /// 物理表現（`sql::scalar_index::ScalarIndexCache`・`sql::hnsw_cache::HnswIndexCache`
@@ -1021,9 +1022,9 @@ fn index_name_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> R
 }
 
 /// [`INDEX_CATALOG_TABLE`] の全エントリのうち `keep` が `false` を返す宣言を同一
-/// write txn 内で削除する（[`delete_indexes_for_table_in_txn`]・
+/// write txn 内で削除する（[`Storage::drop_tables`] と
 /// [`delete_indexes_referencing_column_in_txn`] の共通本体。呼び出し元は
-/// `Storage::drop_table`・`Storage::alter_table_drop_column`）。索引カタログ未作成は
+/// `Storage::drop_tables`・`Storage::alter_table_drop_column`）。索引カタログ未作成は
 /// 何もせず `Ok(())`（[`bump_index_catalog_generation_in_txn`] も呼ばない。宣言が
 /// 1 件も無い状態からは何も変わらないため）。走査件数は [`MAX_INDEX_COUNT`] で
 /// 打ち切る（fail-closed）。実際に 1 件でも削除した場合は
@@ -1309,18 +1310,6 @@ fn rename_index_def_columns_in_txn(
         bump_index_catalog_generation_in_txn(write_txn)?;
     }
     Ok(())
-}
-
-/// [`Storage::drop_table`] が同一 write txn から呼ぶ。対象テーブルの索引宣言を
-/// すべて削除する（残置した宣言名が drop 後の同名テーブル再作成に伴う
-/// `CREATE INDEX` を無関係に `42P07` で塞ぐ事故を防ぐ。
-/// `recovery::ledger::delete_table_in_txn` と同じ「テーブルのライフサイクルに
-/// 追随して掃除する」設計判断）。
-fn delete_indexes_for_table_in_txn(
-    write_txn: &redb::WriteTransaction,
-    table_name: &str,
-) -> Result<()> {
-    retain_index_defs_in_txn(write_txn, |def| def.table != table_name)
 }
 
 /// [`Storage::alter_table_drop_column`] が同一 write txn から呼ぶ。削除する列を
@@ -3594,6 +3583,109 @@ fn resolve_reference_depth_in_txn(
             parent.max_child = parent.max_child.max(depth);
         }
     }
+}
+
+/// [`Storage::drop_tables`] の結果（TABLE-37 (1)、Issue #1639）。件数以外のテナント固有の
+/// 情報は持たない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropTablesReport {
+    /// 実際に削除した表の数（重複除去後）。0 なら全対象が `IF EXISTS` で skip された。
+    pub dropped: usize,
+    /// `IF EXISTS` で不在のため skip した名前（記述順。将来の NoticeResponse 用）。
+    pub skipped: Vec<String>,
+}
+
+/// `DROP TABLE` の対象集合 `targets` に依存するものを単一パスで調べる（計算量は
+/// O(ビュー数 + カタログ表数)）。戻り値は `(ビュー依存のある対象, FK 依存のある対象)`。
+/// カタログ情報のみで判定し、テナントの行は読まない。
+/// - ビュー: `base_relation` または評価後射影形本文の relation が対象に含まれるもの。
+///   再検証に失敗した本文は fail-closed で全対象を依存ありとする。
+/// - FK: 親が対象で、子（自己参照を含む）が対象に含まれないもの。同じ文に並べた名前どうし
+///   の参照は数えない。
+///
+/// **P0**: FK の候補は [`FK_BEARING_FORMAT_VERSIONS`] の全版接頭辞で絞る
+/// （[`referencing_foreign_keys_in_txn`] と同じ。見落とすと fail-open）。
+/// #1640（依存列挙）で置き換えられる前提の private helper。
+fn drop_targets_with_dependents_in_txn(
+    write_txn: &redb::WriteTransaction,
+    targets: &[&str],
+) -> Result<(
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+)> {
+    use std::collections::HashSet;
+    let target_set: HashSet<&str> = targets.iter().copied().collect();
+    let mut view_dependent: HashSet<String> = HashSet::new();
+    match write_txn.open_table(VIEWS_TABLE) {
+        Ok(views_table) => {
+            for (scanned, entry) in views_table.iter()?.enumerate() {
+                if scanned >= MAX_VIEWS {
+                    return Err(CatalogError::ViewLimitExceeded(
+                        "too many views".to_string(),
+                    ));
+                }
+                let (_key, value) = entry?;
+                let def = decode_view_def(value.value())?;
+                if target_set.contains(def.base_relation.as_str()) {
+                    view_dependent.insert(def.base_relation.clone());
+                }
+                match view_body_shape(&def.body_sql) {
+                    Ok(shape) => {
+                        for r in &shape.relations {
+                            if target_set.contains(r.as_str()) {
+                                view_dependent.insert(r.clone());
+                            }
+                        }
+                    }
+                    Err(_) => view_dependent.extend(targets.iter().map(|t| (*t).to_string())),
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(CatalogError::from(e)),
+    }
+    let prefixes: Vec<Vec<u8>> = FK_BEARING_FORMAT_VERSIONS
+        .iter()
+        .map(|v| format!("{v}\n").into_bytes())
+        .collect();
+    let candidates: Vec<(String, Vec<u8>)> = {
+        let table = match write_txn.open_table(CATALOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Ok((view_dependent, HashSet::new()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut candidates = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            // 削除対象の子は依存に数えないため decode 不要。
+            if target_set.contains(key.value()) {
+                continue;
+            }
+            if !prefixes.iter().any(|p| value.value().starts_with(p)) {
+                continue;
+            }
+            if candidates.len() >= MAX_LIST_TABLES {
+                return Err(CatalogError::Invalid(format!(
+                    "too many tables: exceeds {MAX_LIST_TABLES}"
+                )));
+            }
+            candidates.push((key.value().to_string(), value.value().to_vec()));
+        }
+        candidates
+    };
+    let mut fk_dependent: HashSet<String> = HashSet::new();
+    for (name, bytes) in candidates {
+        let mut resolve = |type_name: &str| get_enum_type_in_write_txn(write_txn, type_name);
+        let schema = decode_schema_with_resolver(&name, &bytes, &mut resolve)?;
+        for fk in &schema.foreign_keys {
+            if target_set.contains(fk.parent_table.as_str()) {
+                fk_dependent.insert(fk.parent_table.clone());
+            }
+        }
+    }
+    Ok((view_dependent, fk_dependent))
 }
 
 /// `target`（テーブルまたはビュー名）を直接参照している既存ビュー名の一覧
@@ -8962,93 +9054,119 @@ impl Storage {
     /// 分割実行ジョブ表（Issue #1127）の当該テーブル分も同じ理由で同一 txn 内で
     /// 削除する。
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
-        validate_identifier(table_name)?;
+        // 単一表は `drop_tables` の特殊形（TABLE-37 (1)、Issue #1639）。エラー variant・
+        // 同期点の発火回数・世代 bump 回数は従来どおり。
+        self.drop_tables(&[table_name.to_string()], false)
+            .map(|_| ())
+    }
+
+    /// 複数テーブルを単一 write txn・単一 commit で原子的に削除する
+    /// （`DROP TABLE a, b`。TABLE-37 (1)、Issue #1639）。`sql::ddl::execute_drop_table` が
+    /// DDL 実行権限ゲート通過後に呼ぶ。[`Self::drop_table`] はその単一表版 wrapper。
+    ///
+    /// 3 段階で判定する。いずれかで失敗すれば commit 前の return で txn を破棄し、何も削除しない。
+    /// 1. 解決（記述順）: ビュー／索引名なら `WrongObjectKind`、不在なら `TableNotFound`
+    ///    （`if_exists` なら skip）。エラーの優先順位は記述順で決定的になる。
+    /// 2. 依存（カタログ情報のみ。テナントの行は読まない）: ビュー、または削除対象外の
+    ///    テーブルの `FOREIGN KEY` が対象を参照していれば `DependentViewsExist`／
+    ///    `DependentObjectsStillExist`（記述順で最初の該当表名）。同じ文に並べた名前どうしの
+    ///    参照（自己参照を含む）は数えない。なお判定順は旧単一表版（ビュー依存 → 索引名）から
+    ///    索引名 → 依存に変わるが、索引名・表・ビューは名前空間を共有するため整合した
+    ///    カタログでは観測できない。
+    /// 3. 削除: 各表の行ストア・一意索引・台帳・分割実行ジョブ・キー索引と表世代を処理し、
+    ///    索引宣言は 1 回にまとめる。同期点は commit 直前に 1 回だけ発火する。
+    ///
+    /// 重複した名前は初出の 1 回として扱う。全件が `if_exists` で skip された場合は commit
+    /// せず（世代不変）、`dropped == 0` の報告を返す。
+    pub fn drop_tables(&self, table_names: &[String], if_exists: bool) -> Result<DropTablesReport> {
+        let mut targets: Vec<&str> = Vec::new();
+        for name in table_names {
+            validate_identifier(name)?;
+            if !targets.contains(&name.as_str()) {
+                targets.push(name.as_str());
+            }
+        }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        {
-            // ビュー名前空間との判別・依存検査（TABLE-18・SQL-23・TASK-205、
-            // Issue #909）。テーブル削除より前の同一 write txn 内で判定する
-            // （TOCTOU 回避）。`name` がビューなら `WrongObjectKind`（`42809`）、
-            // このテーブルを参照するビューが 1 つでも残っていれば
-            // `DependentViewsExist`（`2BP01`）。
+        // Phase 1: 解決。
+        let mut existing: Vec<&str> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        for &name in &targets {
             match write_txn.open_table(VIEWS_TABLE) {
                 Ok(views_table) => {
-                    if views_table.get(table_name)?.is_some() {
-                        return Err(CatalogError::WrongObjectKind(table_name.to_string()));
-                    }
-                    let dependents = views_depending_on_in_txn(&views_table, table_name)?;
-                    if !dependents.is_empty() {
-                        return Err(CatalogError::DependentViewsExist(table_name.to_string()));
+                    if views_table.get(name)?.is_some() {
+                        return Err(CatalogError::WrongObjectKind(name.to_string()));
                     }
                 }
                 Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(e) => return Err(CatalogError::from(e)),
             }
-            // 索引名を指定された場合もビューと同じく種別不一致（`42809`）とする
-            // （TASK-206・INDEX-7、Issue #908）。
-            if index_name_exists_in_txn(&write_txn, table_name)? {
-                return Err(CatalogError::WrongObjectKind(table_name.to_string()));
+            // 索引名を指定された場合もビューと同じく種別不一致（`42809`。TASK-206・INDEX-7、
+            // Issue #908）。
+            if index_name_exists_in_txn(&write_txn, name)? {
+                return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
-        }
-        // `FOREIGN KEY` からの参照（TABLE-17・TASK-205、Issue #907。TABLE-15）:
-        // 他テーブルがこのテーブルを参照先にしている場合はデータの有無を問わず
-        // カタログ情報のみで `DependentObjectsStillExist`（`2BP01`）として拒否する
-        // （テナントデータを一切参照しないため、他テナントの行の有無は結果に
-        // 影響しない）。このテーブル自身の自己参照は、参照元ごと削除されるため
-        // 依存に数えない。
-        if referencing_foreign_keys_in_txn(&write_txn, table_name)?
-            .iter()
-            .any(|(child, _)| child.name != table_name)
-        {
-            return Err(CatalogError::DependentObjectsStillExist(
-                table_name.to_string(),
-            ));
-        }
-        {
-            let mut table = match write_txn.open_table(CATALOG_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => {
-                    return Err(CatalogError::TableNotFound(table_name.to_string()));
-                }
+            let found = match write_txn.open_table(CATALOG_TABLE) {
+                Ok(table) => table.get(name)?.is_some(),
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
                 Err(e) => return Err(CatalogError::from(e)),
             };
-            if table.remove(table_name)?.is_none() {
-                return Err(CatalogError::TableNotFound(table_name.to_string()));
+            if found {
+                existing.push(name);
+            } else if if_exists {
+                skipped.push(name.to_string());
+            } else {
+                return Err(CatalogError::TableNotFound(name.to_string()));
             }
         }
-        // `CATALOG_TABLE` のハンドルは上のブロックを抜けた時点で解放済み。ここで
-        // 行ストアを同一 txn 内で `open_table` すると `TableAlreadyOpen` になるため、
-        // `delete_table` は既存ハンドルを介さず直接呼ぶ。
-        write_txn.delete_table(user_rows_table_def(&user_rows_table_name(table_name)))?;
-        // 永続一意索引（TABLE-16・TASK-204、Issue #1070）も行ストアと同一 txn・
-        // 同一 commit で削除する（存在しない場合は `delete_table` が `Ok(false)`
-        // を返すだけで、`PRIMARY KEY`・`UNIQUE` のいずれも宣言しないテーブルでも
-        // エラーにならない）。放置すると同名テーブルを再作成した際に旧索引の
-        // マーカー・エントリが残り、新テーブルの行を旧テナントの索引と誤って
-        // 突き合わせてしまう（[`user_rows_table_def`] ドキュメントの「残留を
-        // 許すと～」と同種の事故）。
-        write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
-        // op_ledger も同一 txn・同一 commit で整合させる（上記ドキュメンテーション
-        // コメント参照）。行ストア削除と異なりテーブル自体は残す（他テーブル分の
-        // エントリが同居するため）。
-        crate::recovery::ledger::delete_table_in_txn(&write_txn, table_name)
-            .map_err(convert_storage_error)?;
-        // 分割実行ジョブ表（Issue #1127）も同一 txn で整合させる（同名再作成での旧ジョブ
-        // 記録の引き継ぎ防止）。
-        crate::recovery::partitioned_job::delete_table_in_txn(&write_txn, table_name)
-            .map_err(convert_storage_error)?;
-        // 索引宣言（TASK-206・INDEX-7、Issue #908）も同一 txn・同一 commit で整合
-        // させる（[`delete_indexes_for_table_in_txn`] 参照）。
-        delete_indexes_for_table_in_txn(&write_txn, table_name)?;
-        // 永続キー索引（`key_index.rs`、Issue #1071）も同一 txn・同一 commit で
-        // 削除する。残置すると同名テーブルの再作成後に旧テナント・旧スキーマ
-        // 由来のキーが混入し、参照整合性検査が fail-open に誤判定しうる
-        // （`key_index::drop_indexes_for_table_in_txn` ドキュメント参照）。
-        crate::key_index::drop_indexes_for_table_in_txn(&write_txn, table_name)?;
-        bump_table_generation_in_txn(&write_txn, table_name)?;
+        if existing.is_empty() {
+            // 副作用ゼロ（世代も不変）。txn は commit せず破棄する。
+            return Ok(DropTablesReport {
+                dropped: 0,
+                skipped,
+            });
+        }
+        // Phase 2: 依存（TABLE-15・TABLE-17・TABLE-18、Issue #907・#909）。
+        let (view_dependent, fk_dependent) =
+            drop_targets_with_dependents_in_txn(&write_txn, &existing)?;
+        if let Some(name) = existing.iter().find(|n| view_dependent.contains(**n)) {
+            return Err(CatalogError::DependentViewsExist((*name).to_string()));
+        }
+        if let Some(name) = existing.iter().find(|n| fk_dependent.contains(**n)) {
+            return Err(CatalogError::DependentObjectsStillExist(
+                (*name).to_string(),
+            ));
+        }
+        // Phase 3: 削除。
+        for &name in &existing {
+            {
+                let mut table = write_txn.open_table(CATALOG_TABLE)?;
+                if table.remove(name)?.is_none() {
+                    return Err(CatalogError::TableNotFound(name.to_string()));
+                }
+            }
+            // `CATALOG_TABLE` のハンドルは上のブロックを抜けた時点で解放済み
+            // （`TableAlreadyOpen` 回避）。
+            write_txn.delete_table(user_rows_table_def(&user_rows_table_name(name)))?;
+            // 永続一意索引（TABLE-16・TASK-204、Issue #1070）。残置すると同名再作成で旧索引が
+            // 新テーブルの行と突き合わされる。
+            write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(name)))?;
+            // 台帳・分割実行ジョブ表（Issue #226・#1127）は同名再作成での引き継ぎ防止。
+            crate::recovery::ledger::delete_table_in_txn(&write_txn, name)
+                .map_err(convert_storage_error)?;
+            crate::recovery::partitioned_job::delete_table_in_txn(&write_txn, name)
+                .map_err(convert_storage_error)?;
+            // 永続キー索引（Issue #1071）。残置すると参照整合性検査が fail-open になりうる。
+            crate::key_index::drop_indexes_for_table_in_txn(&write_txn, name)?;
+            bump_table_generation_in_txn(&write_txn, name)?;
+        }
+        // 索引宣言（TASK-206・INDEX-7、Issue #908）は 1 回にまとめる（カタログ世代の bump も 1 回）。
+        retain_index_defs_in_txn(&write_txn, |def| !existing.contains(&def.table.as_str()))?;
         // TABLE-15・Issue #1363: 全削除済み・commit 前の同期点（feature 限定。既定ビルドでは消える）。
         #[cfg(feature = "test-sync-points")]
         self.sync_point(crate::test_sync::SyncPoint::DropTableBeforeCommit);
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        let dropped = existing.len();
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(DropTablesReport { dropped, skipped })
     }
 
     /// 既存テーブルへ列を末尾追記する（TABLE-5）。既存行のバイト列には一切触れない
@@ -16647,6 +16765,58 @@ mod tests {
         let after = storage.current_generation().expect("read generation");
 
         assert_eq!(after, before + 1);
+    }
+
+    // TABLE-37 (1)・Issue #1639: 複数表の drop は表ごとに世代を 1 回ずつ進め、重複名は
+    // 1 回として扱う。失敗時と全件 skip 時は世代が不変（commit しない）。
+    #[test]
+    fn drop_tables_bumps_each_generation_once_and_failure_changes_nothing() {
+        let path = unique_db_path("drop-tables-generation");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        for n in ["ta", "tb"] {
+            storage
+                .create_table(&TableSchema::new(
+                    n,
+                    vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+                ))
+                .expect("create table");
+        }
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // 不在を含む（IF EXISTS なし）: 全体が失敗し、何も変わらない。
+        let before = storage.current_generation().expect("generation");
+        let err = storage
+            .drop_tables(&names(&["ta", "ghost"]), false)
+            .expect_err("missing name must abort");
+        assert!(matches!(err, CatalogError::TableNotFound(_)));
+        assert_eq!(storage.current_generation().expect("generation"), before);
+        assert!(storage.get_table_schema("ta").is_ok());
+
+        // 全件 skip: commit せず世代不変。
+        let report = storage
+            .drop_tables(&names(&["g1", "g2"]), true)
+            .expect("all skipped");
+        assert_eq!(report.dropped, 0);
+        assert_eq!(report.skipped, names(&["g1", "g2"]));
+        assert_eq!(storage.current_generation().expect("generation"), before);
+
+        // 重複を含む成功: 文全体で全体世代は 1 回、表世代は表ごとに 1 回。
+        let (ga, gb) = (
+            storage.table_generation("ta").expect("gen"),
+            storage.table_generation("tb").expect("gen"),
+        );
+        let report = storage
+            .drop_tables(&names(&["ta", "tb", "ta", "ghost"]), true)
+            .expect("drop");
+        assert_eq!(report.dropped, 2);
+        assert_eq!(report.skipped, names(&["ghost"]));
+        assert_eq!(
+            storage.current_generation().expect("generation"),
+            before + 1
+        );
+        assert_eq!(storage.table_generation("ta").expect("gen"), ga + 1);
+        assert_eq!(storage.table_generation("tb").expect("gen"), gb + 1);
     }
 
     // drop 後の同名テーブル再作成で旧 `op_ledger` エントリが引き継がれ、正当な

@@ -3938,10 +3938,10 @@ pub struct ValidatedUpdate {
 /// [`crate::policy::PolicyContext`] を取らない（`catalog::Storage::drop_table`
 /// ドキュメント参照）。
 ///
-/// 受理する形は `DROP TABLE <table> [;]` のみ（`IF EXISTS`・`CASCADE`・
-/// `RESTRICT`・複数テーブル列挙・`USING OPERATION_ID` 句は許可リスト外として
-/// `42601`。`operation_id` を要求しない——`CREATE TABLE`・`ALTER TABLE` と
-/// 同じく DDL は台帳の対象外。詳細は `docs/design/drop-table.md` 参照）。
+/// 受理する形は `DROP TABLE [IF EXISTS] <table> [, <table>]* [;]`（複数テーブル列挙は
+/// TABLE-37 (1)・Issue #1639）。`CASCADE`・`RESTRICT`・`USING OPERATION_ID` 句は
+/// 許可リスト外として `42601`。`operation_id` を要求しない——`CREATE TABLE`・
+/// `ALTER TABLE` と同じく DDL は台帳の対象外。詳細は `docs/design/drop-table.md` 参照。
 ///
 /// **本構造体はカタログ照会を一切行わない**（`validate_drop_table_tokens` の
 /// ドキュメント参照）: DDL 実行権限ゲート（[`crate::sql::ddl::
@@ -3953,8 +3953,10 @@ pub struct ValidatedUpdate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedDropTable {
     /// DROP TABLE に指定されたテーブル名（識別子構文の検証のみ済み。カタログ
-    /// 存在確認は未実施）。
-    pub table_name: String,
+    /// 存在確認は未実施）。非空・記述順。重複は構文段では保持し、カタログ層
+    /// （`Storage::drop_tables`）が 1 回として扱う（TABLE-37 (1)、Issue #1639）。
+    /// **BREAKING CHANGE**: 旧 `table_name: String` を置き換えた。
+    pub table_names: Vec<String>,
     /// `IF EXISTS` 句の有無（Issue #1614・TABLE-36 ポインタ）。真のとき、対象
     /// テーブルが無ければ `sql::ddl::execute_drop_table` が副作用ゼロの no-op で
     /// 成功させる。権限ゲート・種類違い・依存検査の判定順序は変えない。
@@ -10463,16 +10465,22 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// `DROP TABLE [IF EXISTS] <table> [;]` の単一テーブル形のみを受理する（SQL-23、
-    /// TASK-203、Issue #902。`IF EXISTS` は Issue #1614）。`CASCADE`・`RESTRICT`・
-    /// 複数テーブル列挙・`USING OPERATION_ID` 句は構造的に受理しない
-    /// （`expect_end_of_statement` が余剰トークンとして `42601` で拒否する）。
-    /// 戻り値は `(テーブル名, IF EXISTS の有無)`。
-    fn parse_drop_table(&mut self) -> Result<(String, bool), SqlSurfaceError> {
+    /// `DROP TABLE [IF EXISTS] <table> [, <table>]* [;]` を受理する（SQL-23、
+    /// TASK-203、Issue #902。`IF EXISTS` は Issue #1614、複数列挙は TABLE-37 (1)・
+    /// Issue #1639）。`CASCADE`・`RESTRICT`・`USING OPERATION_ID` 句は構造的に
+    /// 受理しない（`expect_end_of_statement` が余剰トークンとして `42601` で拒否する）。
+    /// 末尾カンマ・空要素は `expect_ident` の失敗で `42601`。名前数は字句解析の
+    /// トークン数上限で頭打ちになる。戻り値は `(テーブル名の列, IF EXISTS の有無)`。
+    fn parse_drop_table(&mut self) -> Result<(Vec<String>, bool), SqlSurfaceError> {
         self.expect_contextual_keyword("DROP")?;
         self.expect_contextual_keyword("TABLE")?;
         let if_exists = self.consume_if_exists();
-        Ok((self.expect_ident()?, if_exists))
+        let mut names = vec![self.expect_ident()?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            names.push(self.expect_ident()?);
+        }
+        Ok((names, if_exists))
     }
 
     /// 現在位置から末尾までの未消費トークン列（TABLE-18・SQL-23・TASK-205、
@@ -15587,10 +15595,10 @@ pub fn validate_drop_table_tokens(
     tokens: &[lexer::Token],
 ) -> Result<ValidatedDropTable, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
-    let (table_name, if_exists) = p.parse_drop_table()?;
+    let (table_names, if_exists) = p.parse_drop_table()?;
     p.expect_end_of_statement()?;
     Ok(ValidatedDropTable {
-        table_name,
+        table_names,
         if_exists,
     })
 }
