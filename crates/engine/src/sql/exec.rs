@@ -384,11 +384,24 @@ pub struct InsertOutcome {
 
 /// `EngineCore::execute_truncate_sql` の成功応答（SQL-22、TASK-193）。削除件数を
 /// 一切返さない契約（SQL-22。自テナント件数であっても再送側が件数推定に使えない
-/// ようにする設計）を型で表現する固定タグのみの応答。フィールドを持たないが、
+/// ようにする設計）を型で表現するタグ中心の応答。公開フィールドは持たず、
 /// 将来の拡張余地を残すため `#[non_exhaustive]` にする。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `CASCADE`（SQL-48 (2)、Issue #1644）で連鎖して加わった表名だけを [`Self::cascaded`] で
+/// 返す（カタログ上の表名のみ。行数・テナント情報は含めない）。wire 層が NOTICE を送る際の
+/// 材料で、RESTRICT では常に空。**BREAKING CHANGE**: `Copy` を外した。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
-pub struct TruncateOutcome {}
+pub struct TruncateOutcome {
+    cascaded: Vec<String>,
+}
+
+impl TruncateOutcome {
+    /// CASCADE で連鎖して対象に加わった表（決定的な順序。明示した表は含まない）。
+    pub fn cascaded(&self) -> &[String] {
+        &self.cascaded
+    }
+}
 
 /// `EngineCore::execute_delete_sql` の成功応答（SQL-18、TASK-191、#867）。
 /// 単一行・`id` 等価指定形（[`execute_delete`]）では `rows_affected` は `0`
@@ -3775,10 +3788,16 @@ pub(crate) fn execute_truncate_in(
         .resolve(validated.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
-    crate::tenant::truncate_tables_unchecked(target, &validated.table_names, ctx, ledger_write)
-        .map_err(map_insert_write_error)?;
+    let cascaded = crate::tenant::truncate_tables_unchecked(
+        target,
+        &validated.table_names,
+        validated.behavior,
+        ctx,
+        ledger_write,
+    )
+    .map_err(map_insert_write_error)?;
 
-    Ok(TruncateOutcome {})
+    Ok(TruncateOutcome { cascaded })
 }
 
 /// SQL 表層 `DELETE FROM <table> WHERE id = <n> USING OPERATION_ID '<id>'`
@@ -4254,6 +4273,16 @@ pub(crate) fn map_write_error(
         TenantWriteError::TooManyRowsScanned { .. } => {
             SqlSurfaceError::payload_too_large("too many rows scanned")
         }
+        // `TRUNCATE ... RESTRICT` が指定外の表の FK に参照される表を拒否した（SQL-48 (2)、
+        // Issue #1644）。`_` 節（`XX000`）へ丸めず `0A000` を維持する。文言は全テナント共有の
+        // カタログ上の表名のみ（行・テナントの情報は含めない）。
+        TenantWriteError::TruncateReferencedByForeignKey {
+            table,
+            referencing_table,
+        } => SqlSurfaceError::feature_not_supported(format!(
+            "cannot truncate a table referenced in a foreign key constraint: \
+             table \"{referencing_table}\" references \"{table}\""
+        )),
         // `FOREIGN KEY` の参照アクション（`CASCADE`・`SET NULL`・`SET DEFAULT`。
         // Issue #1076）の連鎖が深さ・行数の上限を超えた。`_` 節（`XX000`）へ丸めると
         // クライアントが上限超過をサーバー内部事象と取り違える。

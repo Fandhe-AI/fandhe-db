@@ -5249,7 +5249,8 @@ impl EngineCore {
                     self.ledger_mode,
                 )?;
                 // 全表に印を付ける（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
-                for table in &stmt.table_names {
+                // CASCADE（Issue #1644）で連鎖して空にした表も書き込み済みとして扱う。
+                for table in stmt.table_names.iter().chain(outcome.cascaded()) {
                     txn.mark_written(ctx.tenant_id(), table);
                 }
                 Ok(crate::sql::SqlOutcome::Truncate(outcome))

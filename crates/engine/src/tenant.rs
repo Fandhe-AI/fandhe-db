@@ -379,6 +379,16 @@ pub enum TenantWriteError {
     /// （`PayloadTooLarge`）へ写像する。
     /// `max` は超過時点の実効上限（`--max-scanned-rows` の設定値。Issue #1549）。
     TooManyRowsScanned { max: usize },
+    /// `TRUNCATE ... RESTRICT`（省略時を含む）で、指定した表 `table` を指定外の表
+    /// `referencing_table` の `FOREIGN KEY` が参照している（SQL-48 (2)、Issue #1644）。
+    /// 判定はカタログの宣言だけで行い、参照元の行の有無・他テナントの行には依存しない。
+    /// 両者ともテナント共有のカタログ上の表名で、行・テナントの情報は含まない。
+    /// 行を消す前に abort するため副作用ゼロ。`0A000`（`FeatureNotSupported`）へ写像する。
+    /// **BREAKING CHANGE**（Issue #1644）: variant を追加した。
+    TruncateReferencedByForeignKey {
+        table: String,
+        referencing_table: String,
+    },
     /// `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。いずれも TABLE-16・
     /// TASK-204）を宣言したテーブルへの書き込みがテナント内一意性制約に違反した
     /// （`constraint::enforce_unique_keys_in_txn`）。
@@ -570,6 +580,9 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::ReturningProjectionTooLarge(_) => ErrorClass::PayloadTooLarge,
             TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
             TenantWriteError::TooManyRowsScanned { .. } => ErrorClass::PayloadTooLarge,
+            TenantWriteError::TruncateReferencedByForeignKey { .. } => {
+                ErrorClass::FeatureNotSupported
+            }
             TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
             TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
             // 内側の `SqlSurfaceError`（`sql::allowlist`）が既に
@@ -635,6 +648,14 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::TooManyRowsScanned { max } => {
                 write!(f, "too many rows scanned: limit={max}")
             }
+            // カタログ上の表名だけを含む（行・テナントの情報は含めない。security.md P0）。
+            TenantWriteError::TruncateReferencedByForeignKey {
+                table,
+                referencing_table,
+            } => write!(
+                f,
+                "cannot truncate table {table:?}: referenced by foreign key of {referencing_table:?}"
+            ),
             TenantWriteError::UniqueViolation => write!(f, "unique constraint violation"),
             // 制約名のみを含む固定文言（行の値・id・テナントは含めない。
             // security.md P0）。
@@ -697,6 +718,9 @@ impl std::fmt::Debug for TenantWriteError {
                 f.write_str("CapturedRowDecodeFailed(<redacted>)")
             }
             TenantWriteError::TooManyRowsScanned { .. } => f.write_str("TooManyRowsScanned"),
+            TenantWriteError::TruncateReferencedByForeignKey { .. } => {
+                f.write_str("TruncateReferencedByForeignKey")
+            }
             TenantWriteError::UniqueViolation => f.write_str("UniqueViolation"),
             TenantWriteError::CheckViolation { .. } => f.write_str("CheckViolation(<redacted>)"),
             TenantWriteError::CheckEvaluationFailed(_) => {
@@ -5059,12 +5083,25 @@ fn apply_predicate_update_in_txn<E>(
     Ok(applied)
 }
 
+/// 複数表 `TRUNCATE`（SQL-22・SQL-48）の本体。`sql::exec::execute_truncate_in` から呼ばれ、
+/// 返り値は CASCADE で連鎖して加わった表名（通知用。RESTRICT では常に空）。
+///
+/// `behavior`（SQL-48 (2)、Issue #1644）: パス 0 で行を消す前にカタログの FK 宣言だけから
+/// 対象集合を確定する。`Restrict` は指定外の表の FK が参照していれば（参照元の行の有無・
+/// 他テナントの行に関係なく）[`TenantWriteError::TruncateReferencedByForeignKey`]（`0A000`）で
+/// abort する。`Cascade` は参照元の表を推移的に加え、同じ write txn で自テナント行を削除する
+/// （参照アクションは発火しない）。台帳は明示表の正規化集合のハッシュを、連鎖した表を含む
+/// 最終集合の全表へ同じ `operation_id` で記録する。パス 2 の事後 FK 検査は多層防御として残す。
+///
+/// 権限検査（#1968）を結線する際は、**連鎖後の最終集合**に対して検査する必要がある
+/// （名前を書いていない表まで削除するため）。
 pub(crate) fn truncate_tables_unchecked(
     target: WriteTarget<'_>,
     tables: &[String],
+    behavior: crate::catalog::DropBehavior,
     ctx: &PolicyContext,
     ledger_write: LedgerWrite<'_>,
-) -> Result<(), TenantWriteError> {
+) -> Result<Vec<String>, TenantWriteError> {
     // 空集合は構文層が作らない。fail-closed に倒す（何も削除せず拒否）。
     if tables.is_empty() {
         return Err(
@@ -5079,16 +5116,35 @@ pub(crate) fn truncate_tables_unchecked(
     // トランザクションの drop（abort）で全表の副作用を破棄する。
     target.with_txn(|write_txn| {
         let tenant = ctx.tenant_id();
-        // パス 0: 全表のスキーマを確定する（並行 DDL で不在になっていれば `42P01` で全体 abort）。
-        let mut schemas = Vec::with_capacity(tables.len());
-        for table in tables {
+        // パス 0: 対象集合の確定。RESTRICT の判定・CASCADE の連鎖はカタログの FK 宣言だけで
+        // 行い（行ストアは読まない）、行を消す前に済ませる（拒否時は何も書かれない）。
+        let closure = crate::catalog::truncate_closure_in_txn(write_txn, tables, behavior)
+            .map_err(|e| match e {
+                crate::catalog::TruncateClosureError::Referenced {
+                    table,
+                    referencing_table,
+                } => TenantWriteError::TruncateReferencedByForeignKey {
+                    table,
+                    referencing_table,
+                },
+                crate::catalog::TruncateClosureError::Catalog(c) => TenantWriteError::from(c),
+            })?;
+        let all_tables: &[String] = &closure.tables;
+
+        // 全表のスキーマを確定する（並行 DDL で不在になっていれば `42P01` で全体 abort）。
+        let mut schemas = Vec::with_capacity(all_tables.len());
+        for table in all_tables {
             schemas.push(require_table_schema_write(write_txn, table)?);
         }
 
-        // 台帳ハッシュ: 1 表なら既存エントリ互換の `for_truncate()`（バイト列不変）、
-        // 2 表以上なら正規化した表集合のハッシュ（`TRUNCATE a, b` と `b, a` は同一、
-        // `a` と `a, b` は内容不一致）。台帳キーは表ごとに `(tenant, table, operation_id)`。
-        let content_hash = if tables.len() == 1 {
+        // 台帳ハッシュ: CASCADE は利用者が書いた表の正規化集合（別ドメイン）。RESTRICT は
+        // 1 表なら既存エントリ互換の `for_truncate()`（バイト列不変）、2 表以上なら正規化した
+        // 表集合のハッシュ（`TRUNCATE a, b` と `b, a` は同一、`a` と `a, b` は内容不一致）。
+        // 台帳キーは表ごとに `(tenant, table, operation_id)`。連鎖した表にも同じ値を記録する。
+        let content_hash = if behavior == crate::catalog::DropBehavior::Cascade {
+            let names: Vec<&str> = tables.iter().map(String::as_str).collect();
+            content_hash::for_truncate_tables_cascade(&names).map_err(TenantWriteError::from)?
+        } else if tables.len() == 1 {
             content_hash::for_truncate()
         } else {
             let names: Vec<&str> = tables.iter().map(String::as_str).collect();
@@ -5098,7 +5154,7 @@ pub(crate) fn truncate_tables_unchecked(
         // パス 1: 台帳記録 → 行削除 → 一意索引・キー索引のテナント範囲クリアを全表で先に行う。
         // 親子を同じ文で指定した場合に、パス 2 の FK 判定が「同じ文で消える子の行」を
         // 見て誤って `23503` にしないため（子のキー索引も先に空になる）。
-        for (table, schema) in tables.iter().zip(&schemas) {
+        for (table, schema) in all_tables.iter().zip(&schemas) {
             ledger::record_in_txn(write_txn, tenant, table, ledger_write, &content_hash)?;
 
             let row_table_name = user_rows_table_name(table);
@@ -5122,7 +5178,7 @@ pub(crate) fn truncate_tables_unchecked(
         // パス 2: 参照先側の `FOREIGN KEY` 検査（TABLE-17・TASK-205、Issue #907）と世代 bump。
         // 自テナントの参照元行が（同じ文の対象外の表に）残れば `23503`。他テナントの行は
         // 走査も削除もしない。`Truncated` は参照アクション（Issue #1076）を発火させない。
-        for (table, schema) in tables.iter().zip(&schemas) {
+        for (table, schema) in all_tables.iter().zip(&schemas) {
             crate::constraint::enforce_referencing_rows_in_txn(
                 write_txn,
                 table,
@@ -5134,7 +5190,7 @@ pub(crate) fn truncate_tables_unchecked(
             )?;
             crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         }
-        Ok(((), TxnEffect::Wrote))
+        Ok((closure.cascaded, TxnEffect::Wrote))
     })
 }
 

@@ -59,6 +59,7 @@ use crate::storage::{RowInput, Visibility};
 // DROP の依存オブジェクト列挙層（TABLE-37・Issue #1640）。呼び出し元の `Storage::drop_*`
 // （Issue #1639・#1641）が結線済み（`drop_tables` の CASCADE と `drop_view_with_behavior`）。
 mod dependency;
+pub(crate) use dependency::{truncate_closure_in_txn, TruncateClosureError};
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
 /// エンコードしたバイト列。`ROWS_TABLE`（`storage.rs`）とは別テーブルとし、

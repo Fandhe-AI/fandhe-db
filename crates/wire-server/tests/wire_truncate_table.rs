@@ -228,3 +228,44 @@ fn wire_truncate_error_contract_keeps_connection_usable() {
     read_ready_for_query(&mut stream);
     assert_eq!(count_over_wire(&mut stream), "0");
 }
+
+/// SQL-48 (2)（Issue #1644）: 参照される親表だけの `TRUNCATE`（RESTRICT）は `0A000`、
+/// `CASCADE` は参照元の表も空にして通常のタグを返す。どちらの後も接続は継続利用できる。
+#[test]
+fn wire_truncate_restrict_rejects_and_cascade_empties_referencing_table() {
+    // DDL は `--ddl-allowed-users` の配線を避けるため、サーバー起動前に engine へ直接発行する。
+    let (core, _g) = new_core_with_docs_table();
+    let mut ddl_session = engine::sql::mode::SessionState::default();
+    ddl_session.allow_ddl();
+    let sys = PolicyContext::new("sys").expect("valid tenant id");
+    for sql in [
+        "CREATE TABLE p (name TEXT)",
+        "CREATE TABLE kids (parent_id BIGINT REFERENCES p)",
+    ] {
+        core.execute_sql_in_session(&sys, &mut ddl_session, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+    }
+    let addr = spawn_server_with_engine(&users_file(), core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(
+        &mut stream,
+        "TRUNCATE TABLE p USING OPERATION_ID 'op-wire-restrict'",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "TRUNCATE TABLE p CASCADE USING OPERATION_ID 'op-wire-cascade'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "TRUNCATE TABLE");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT COUNT(*) FROM kids");
+    let _cols = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+    assert_eq!(row.into_iter().next().flatten().as_deref(), Some("0"));
+}

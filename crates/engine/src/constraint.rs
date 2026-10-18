@@ -1838,8 +1838,10 @@ pub(crate) enum ReferencedRowsChange<'a> {
     /// `TRUNCATE`。このテナントの全行が失われる。個々の id・キー値は追跡せず、
     /// 呼び出し元が [`crate::key_index::clear_tenant_in_txn`] を未実行である前提
     /// で本関数が呼ぶ。PostgreSQL の `TRUNCATE` と同様に参照アクションを発火
-    /// させない（`TRUNCATE ... CASCADE` は別構文で未実装のまま `42601`）。事後
-    /// 検証（NO ACTION の背後保証）のみ行う。
+    /// させない（`TRUNCATE ... CASCADE` も参照元の表を対象集合へ加えて空にするだけで、
+    /// 参照アクションは発火しない。Issue #1644）。RESTRICT の拒否（`0A000`）は
+    /// 呼び出し元がカタログ宣言から行う前段の判定で、ここでの事後検証は多層防御として
+    /// 残す。事後検証（NO ACTION の背後保証）のみ行う。
     Truncated,
 }
 
