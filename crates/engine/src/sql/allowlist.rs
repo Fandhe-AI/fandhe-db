@@ -4066,12 +4066,22 @@ enum ExprLeaf {
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
         let mut quoted_null = Vec::new();
-        let tokens = if tokens.iter().any(|t| matches!(t, Token::QuotedNull(_))) {
+        // ALTER 文には WHERE 述語葉が無いため、字句段が残した `"true"`／`"false"` の印は
+        // 引用付き識別子として `quoted_null` に記録する（Issue #1635 USING 式の列参照保護）。
+        let is_alter =
+            matches!(tokens.first(), Some(Token::Ident(a)) if a.eq_ignore_ascii_case("ALTER"));
+        let tokens = if tokens.iter().any(|t| {
+            matches!(t, Token::QuotedNull(_)) || (is_alter && matches!(t, Token::QuotedBoolWord(_)))
+        }) {
             let demoted = tokens
                 .iter()
                 .enumerate()
                 .map(|(i, t)| match t {
                     Token::QuotedNull(s) => {
+                        quoted_null.push(i);
+                        Token::Ident(s.clone())
+                    }
+                    Token::QuotedBoolWord(s) if is_alter => {
                         quoted_null.push(i);
                         Token::Ident(s.clone())
                     }
@@ -16033,6 +16043,13 @@ mod tests {
         match using_of("ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING \"null\"").using {
             Some(crate::sql::udf_call::Expr::Ident(n)) => assert_eq!(n, "null"),
             other => panic!("quoted null must stay an identifier: {other:?}"),
+        }
+        for word in ["true", "false", "TRUE"] {
+            let sql = format!("ALTER TABLE t ALTER COLUMN a TYPE BOOLEAN USING \"{word}\"");
+            match using_of(&sql).using {
+                Some(crate::sql::udf_call::Expr::Ident(n)) => assert_eq!(n, word),
+                other => panic!("quoted {word} must stay an identifier: {other:?}"),
+            }
         }
         for bad in [
             "ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING",

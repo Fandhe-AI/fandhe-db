@@ -287,7 +287,14 @@ fn demote_unneeded_quoted_bool_words(tokens: &mut [Token]) {
         if !matches!(tokens.get(i), Some(Token::QuotedBoolWord(_))) {
             continue;
         }
-        if !(seen_where && quoted_bool_word_in_leaf_position(tokens, i)) {
+        // ALTER 文の `USING` 句以降（ALTER COLUMN TYPE の式。Issue #1635）は、`"true"`／`"false"`
+        // を裸のリテラルと区別するため印を残す（`Parser::new` が `Ident` へ戻して列参照にする）。
+        let alter_using = matches!(tokens.first(), Some(Token::Ident(a)) if a.eq_ignore_ascii_case("ALTER"))
+            && tokens
+                .iter()
+                .take(i)
+                .any(|t| matches!(t, Token::Ident(u) if u.eq_ignore_ascii_case("USING")));
+        if !alter_using && !(seen_where && quoted_bool_word_in_leaf_position(tokens, i)) {
             if let Some(Token::QuotedBoolWord(s)) = tokens.get(i).cloned() {
                 if let Some(slot) = tokens.get_mut(i) {
                     *slot = Token::Ident(s);
