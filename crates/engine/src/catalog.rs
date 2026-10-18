@@ -17953,6 +17953,42 @@ mod tests {
         assert!(storage.get_table_schema("docs").is_ok());
     }
 
+    /// 引用付きの真偽語・SQL 値関数予約語を新表名にしても、ビュー本文の FROM が引用付きで描画され
+    /// 往復検証を通って追随する（`0A000` で拒否されない）。
+    #[test]
+    fn alter_table_rename_to_reserved_word_keeps_view_body_roundtrip() {
+        for (i, new_name) in ["true", "false", "current_date"].iter().enumerate() {
+            let path = unique_db_path(&format!("rename-table-reserved-{i}"));
+            let _guard = CleanupGuard(path.clone());
+            let storage = Storage::open(&path).expect("open storage");
+            storage
+                .create_table(&TableSchema::new(
+                    "docs",
+                    vec![
+                        ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                        ColumnDef::new("k", ColumnType::Text, true),
+                    ],
+                ))
+                .expect("docs");
+            storage
+                .create_view("v_pred", "docs", "SELECT k FROM docs WHERE k = 'a'")
+                .expect("v_pred");
+            storage
+                .alter_table_rename("docs", new_name)
+                .unwrap_or_else(|e| panic!("rename to {new_name}: {e:?}"));
+            let def = storage
+                .view_definition("v_pred")
+                .expect("get")
+                .expect("some");
+            assert_eq!(def.base_relation, *new_name);
+            assert!(
+                def.body_sql.contains(&format!("FROM \"{new_name}\"")),
+                "{}",
+                def.body_sql
+            );
+        }
+    }
+
     /// 表の改名で単純形ビューの `base_relation` と本文が新名へ付け替わり、再オープン後も残る。
     /// 評価後射影形ビューが表を読むときは `0A000` で拒否し、何も変えない。
     #[test]
