@@ -4690,7 +4690,25 @@ fn revalidate_dependent_views_in_txn(
             let aliased_over_buffered = !def.column_aliases.is_empty()
                 && (shape.buffered
                     || view_reaches_buffered_in_txn(views_table, &def.base_relation, false)?);
-            if selects >= 2 || aliased_over_buffered {
+            // 防御的ゲート: 評価後射影形で `*`（`t.*` 含む）に `GROUP BY`／`ORDER BY`／`DISTINCT`
+            // が付く本文は、`SELECT` が 1 個でも `*` が新出力の末尾列まで展開されグルーピング・
+            // 出力列が変わりうるため拒否する（`count(*)` との併用も含む過剰拒否は許容。fail-closed）。
+            // 現行の本文形状検査はこの組み合わせの作成自体を拒否するが、形状の拡張に備える。
+            // `LIMIT` のみの `*` は展開が素直に追随するため対象外。
+            let has_star = tokens.iter().any(|t| {
+                matches!(
+                    t,
+                    crate::sql::lexer::Token::Punct('*')
+                        | crate::sql::lexer::Token::QualifiedStar { .. }
+                )
+            });
+            let has_grouping = tokens.iter().any(|t| match t {
+                crate::sql::lexer::Token::Keyword(crate::sql::lexer::Keyword::By) => true,
+                crate::sql::lexer::Token::Ident(w) => w.eq_ignore_ascii_case("DISTINCT"),
+                _ => false,
+            });
+            let buffered_star = shape.buffered && has_star && has_grouping;
+            if selects >= 2 || aliased_over_buffered || buffered_star {
                 return Err(broken());
             }
         }

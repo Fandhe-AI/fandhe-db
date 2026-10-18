@@ -512,6 +512,41 @@ fn column_append_gate_for_aliased_simple_view_over_buffered_parent() {
     q(&core, "SELECT * FROM v2 LIMIT 100");
 }
 
+/// 列追加ゲート: `*` を使う集計形（`SELECT * ... GROUP BY`）の依存ビューは、現行の本文形状検査が
+/// 作成時点で拒否する（`*` の展開が出力列・グルーピングを変えうるため）。そのため列追加で
+/// 破綻する依存ビューは作れない。一方 `LIMIT` のみの `*` 依存ビューは末尾列に追随し、
+/// 置換後も参照可能なまま（過剰拒否しない）。
+#[test]
+fn star_group_by_dependent_cannot_exist_and_limit_star_follows_append() {
+    use engine::catalog::CatalogError;
+    let path = unique_db_path("t41r-gate-star-agg");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    storage
+        .create_view("v1", "docs", "SELECT lang FROM docs")
+        .expect("v1");
+    assert!(matches!(
+        storage.create_view("v3", "v1", "SELECT * FROM v1 GROUP BY lang"),
+        Err(CatalogError::Invalid(_))
+    ));
+    storage
+        .create_view("v4", "v1", "SELECT * FROM v1 LIMIT 5")
+        .expect("v4");
+    let before_v1 = storage.view_definition("v1").expect("read");
+    storage
+        .create_or_replace_view(
+            "v1",
+            "docs",
+            "SELECT lang, body FROM docs",
+            &[],
+            before_v1.as_ref(),
+        )
+        .expect("append with LIMIT-star dependent");
+    assert_ne!(storage.view_definition("v1").expect("read"), before_v1);
+    assert!(storage.view_definition("v4").expect("read").is_some());
+}
+
 /// 公開 API からの置換でも依存ビューの再検証が失敗すれば旧定義が残る（原子性）。
 #[test]
 fn catalog_replace_failure_leaves_old_definition() {
