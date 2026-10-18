@@ -10,7 +10,7 @@
 //! 後続タスクが [`ValidatedStatement`] を土台に実装する。本モジュールは
 //! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
-use crate::catalog::{ColumnDef, ColumnType, MAX_COLUMN_COUNT};
+use crate::catalog::{ColumnDef, ColumnType, DropBehavior, MAX_COLUMN_COUNT};
 use crate::datetime::DateTimeLiteralError;
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
@@ -3954,9 +3954,10 @@ pub struct ValidatedUpdate {
 /// [`crate::policy::PolicyContext`] を取らない（`catalog::Storage::drop_table`
 /// ドキュメント参照）。
 ///
-/// 受理する形は `DROP TABLE [IF EXISTS] <table> [, <table>]* [;]`（複数テーブル列挙は
-/// TABLE-37 (1)・Issue #1639）。`CASCADE`・`RESTRICT`・`USING OPERATION_ID` 句は
-/// 許可リスト外として `42601`。`operation_id` を要求しない——`CREATE TABLE`・
+/// 受理する形は `DROP TABLE [IF EXISTS] <table> [, <table>]* [CASCADE | RESTRICT] [;]`
+/// （複数テーブル列挙は TABLE-37 (1)・Issue #1639、`CASCADE`／`RESTRICT` は TABLE-37 (2)(3)・
+/// Issue #1641）。`USING OPERATION_ID` 句や `CASCADE RESTRICT` の併記は許可リスト外として
+/// `42601`。`operation_id` を要求しない——`CREATE TABLE`・
 /// `ALTER TABLE` と同じく DDL は台帳の対象外。詳細は `docs/design/drop-table.md` 参照。
 ///
 /// **本構造体はカタログ照会を一切行わない**（`validate_drop_table_tokens` の
@@ -3977,6 +3978,9 @@ pub struct ValidatedDropTable {
     /// テーブルが無ければ `sql::ddl::execute_drop_table` が副作用ゼロの no-op で
     /// 成功させる。権限ゲート・種類違い・依存検査の判定順序は変えない。
     pub if_exists: bool,
+    /// `CASCADE`／`RESTRICT` 句（TABLE-37 (2)(3)、Issue #1641）。省略時は `Restrict`。
+    /// **BREAKING CHANGE**: pub フィールドの追加（構造体リテラルで生成する側は指定が必要）。
+    pub behavior: DropBehavior,
 }
 
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
@@ -10547,13 +10551,14 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// `DROP TABLE [IF EXISTS] <table> [, <table>]* [;]` を受理する（SQL-23、
-    /// TASK-203、Issue #902。`IF EXISTS` は Issue #1614、複数列挙は TABLE-37 (1)・
-    /// Issue #1639）。`CASCADE`・`RESTRICT`・`USING OPERATION_ID` 句は構造的に
-    /// 受理しない（`expect_end_of_statement` が余剰トークンとして `42601` で拒否する）。
+    /// `DROP TABLE [IF EXISTS] <table> [, <table>]* [CASCADE | RESTRICT] [;]` を受理する
+    /// （SQL-23、TASK-203、Issue #902。`IF EXISTS` は Issue #1614、複数列挙は TABLE-37 (1)・
+    /// Issue #1639、`CASCADE`／`RESTRICT` は TABLE-37 (2)(3)・Issue #1641）。
+    /// `USING OPERATION_ID` 句や 2 語目の `CASCADE`／`RESTRICT` は構造的に受理しない
+    /// （`expect_end_of_statement` が余剰トークンとして `42601` で拒否する）。
     /// 末尾カンマ・空要素は `expect_ident` の失敗で `42601`。名前数は字句解析の
-    /// トークン数上限で頭打ちになる。戻り値は `(テーブル名の列, IF EXISTS の有無)`。
-    fn parse_drop_table(&mut self) -> Result<(Vec<String>, bool), SqlSurfaceError> {
+    /// トークン数上限で頭打ちになる。戻り値は `(テーブル名の列, IF EXISTS の有無, 動作)`。
+    fn parse_drop_table(&mut self) -> Result<(Vec<String>, bool, DropBehavior), SqlSurfaceError> {
         self.expect_contextual_keyword("DROP")?;
         self.expect_contextual_keyword("TABLE")?;
         let if_exists = self.consume_if_exists();
@@ -10562,7 +10567,24 @@ impl<'a> Parser<'a> {
             self.advance();
             names.push(self.expect_ident()?);
         }
-        Ok((names, if_exists))
+        let behavior = self.parse_optional_drop_behavior();
+        Ok((names, if_exists, behavior))
+    }
+
+    /// DROP 文の名前列の直後にある省略可能な `CASCADE`／`RESTRICT` を 1 語だけ消費する
+    /// （TABLE-37 (2)(3)、Issue #1641）。名前は `expect_ident` で先に読み終えているため、
+    /// `cascade` という名前の表は従来どおり名前として解釈される。無指定は `Restrict`
+    /// （PostgreSQL 既定）。2 語目は呼び出し元の `expect_end_of_statement` が `42601` にする。
+    fn parse_optional_drop_behavior(&mut self) -> DropBehavior {
+        if self.peek_ident_matches("CASCADE") {
+            self.advance();
+            DropBehavior::Cascade
+        } else if self.peek_ident_matches("RESTRICT") {
+            self.advance();
+            DropBehavior::Restrict
+        } else {
+            DropBehavior::Restrict
+        }
     }
 
     /// 現在位置から末尾までの未消費トークン列（TABLE-18・SQL-23・TASK-205、
@@ -10596,14 +10618,16 @@ impl<'a> Parser<'a> {
         Ok((name, self.remaining()))
     }
 
-    /// `DROP VIEW [IF EXISTS] <name> [;]`（TABLE-18・SQL-23・TASK-205、Issue #909。
-    /// `IF EXISTS` は Issue #1614）。`CASCADE`／`RESTRICT`・複数ビュー列挙は構造的に
-    /// 受理しない。戻り値は `(ビュー名, IF EXISTS の有無)`。
-    fn parse_drop_view(&mut self) -> Result<(String, bool), SqlSurfaceError> {
+    /// `DROP VIEW [IF EXISTS] <name> [CASCADE | RESTRICT] [;]`（TABLE-18・SQL-23・TASK-205、
+    /// Issue #909。`IF EXISTS` は Issue #1614、`CASCADE`／`RESTRICT` は TABLE-37・Issue #1641）。
+    /// 複数ビュー列挙は構造的に受理しない。戻り値は `(ビュー名, IF EXISTS の有無, 動作)`。
+    fn parse_drop_view(&mut self) -> Result<(String, bool, DropBehavior), SqlSurfaceError> {
         self.expect_ident_matching("DROP")?;
         self.expect_ident_matching("VIEW")?;
         let if_exists = self.consume_if_exists();
-        Ok((self.expect_ident()?, if_exists))
+        let name = self.expect_ident()?;
+        let behavior = self.parse_optional_drop_behavior();
+        Ok((name, if_exists, behavior))
     }
 
     /// `WITH <name> AS (<body>)[, <name> AS (<body>)]*`（非再帰 CTE。SQL-29 (b)・
@@ -11483,9 +11507,16 @@ pub struct ValidatedDropView {
     pub(crate) name: String,
     /// `IF EXISTS` 句の有無（Issue #1614・TABLE-36 ポインタ）。
     pub(crate) if_exists: bool,
+    /// `CASCADE`／`RESTRICT` 句（TABLE-37、Issue #1641）。省略時は `Restrict`。
+    pub(crate) behavior: DropBehavior,
 }
 
 impl ValidatedDropView {
+    /// `CASCADE`／`RESTRICT` 句の指定（省略時は `Restrict`）。
+    pub fn behavior(&self) -> DropBehavior {
+        self.behavior
+    }
+
     /// `IF EXISTS` が指定されたか。真のとき対象不在は副作用ゼロの no-op 成功になる。
     pub fn if_exists(&self) -> bool {
         self.if_exists
@@ -11896,8 +11927,9 @@ fn parse_index_collation(
     }
 }
 
-/// [`ValidatedDropIndex`] の構造検証本体。`CASCADE`・複数名の同時
-/// 指定はいずれもトレイリングトークン検査により構造的に `42601` へ落ちる。
+/// [`ValidatedDropIndex`] の構造検証本体。`RESTRICT`（既定と同義）は受理し、`CASCADE`
+/// （一意索引に依存する FK の連鎖削除。Issue #1641 の対象外）は明示的に `42601`、複数名の
+/// 同時指定はトレイリングトークン検査により構造的に `42601` へ落ちる。
 pub(crate) fn validate_drop_index_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedDropIndex, SqlSurfaceError> {
@@ -11906,6 +11938,11 @@ pub(crate) fn validate_drop_index_tokens(
     p.expect_ident_matching("INDEX")?;
     let if_exists = p.consume_if_exists();
     let name = p.expect_ident()?;
+    if p.parse_optional_drop_behavior() == DropBehavior::Cascade {
+        return Err(SqlSurfaceError::unsupported(
+            "DROP INDEX ... CASCADE is not supported",
+        ));
+    }
     p.expect_end_of_statement()?;
     Ok(ValidatedDropIndex { name, if_exists })
 }
@@ -12001,7 +12038,8 @@ pub(crate) fn validate_create_type_tokens(
     Ok(ValidatedCreateType { name, labels })
 }
 
-/// [`ValidatedDropType`] の構造検証本体（Issue #1194）。`CASCADE`・
+/// [`ValidatedDropType`] の構造検証本体（Issue #1194）。`RESTRICT`（既定と同義）は受理し、
+/// `CASCADE`（型を使う列と制約の連鎖削除。Issue #1641 の対象外）は明示的に `42601`、
 /// 複数名の同時指定はトレイリングトークン検査により構造的に `42601` へ落ちる。
 pub(crate) fn validate_drop_type_tokens(
     tokens: &[Token],
@@ -12013,6 +12051,11 @@ pub(crate) fn validate_drop_type_tokens(
     let name = p.expect_ident()?;
     crate::catalog::validate_identifier(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid type name in DROP TYPE"))?;
+    if p.parse_optional_drop_behavior() == DropBehavior::Cascade {
+        return Err(SqlSurfaceError::unsupported(
+            "DROP TYPE ... CASCADE is not supported",
+        ));
+    }
     p.expect_end_of_statement()?;
     Ok(ValidatedDropType { name, if_exists })
 }
@@ -12022,9 +12065,13 @@ pub(crate) fn validate_drop_view_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedDropView, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
-    let (name, if_exists) = p.parse_drop_view()?;
+    let (name, if_exists, behavior) = p.parse_drop_view()?;
     p.expect_end_of_statement()?;
-    Ok(ValidatedDropView { name, if_exists })
+    Ok(ValidatedDropView {
+        name,
+        if_exists,
+        behavior,
+    })
 }
 
 /// 構文木（[`ValidatedTruncate`] の元）。カタログ存在確認前の中間結果
@@ -15806,11 +15853,12 @@ pub fn validate_drop_table_tokens(
     tokens: &[lexer::Token],
 ) -> Result<ValidatedDropTable, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
-    let (table_names, if_exists) = p.parse_drop_table()?;
+    let (table_names, if_exists, behavior) = p.parse_drop_table()?;
     p.expect_end_of_statement()?;
     Ok(ValidatedDropTable {
         table_names,
         if_exists,
+        behavior,
     })
 }
 
@@ -24641,5 +24689,68 @@ mod body_expr_policy_tests {
             let err = validate_alter_table(bad).expect_err(bad);
             assert_eq!(err.wire_code(), "42601", "{bad}");
         }
+    }
+}
+/// `DROP ... CASCADE／RESTRICT` 句の構文検証（TABLE-37 (2)(3)、Issue #1641）。
+#[cfg(test)]
+mod drop_behavior_tests {
+    use super::*;
+
+    fn table(sql: &str) -> Result<ValidatedDropTable, SqlSurfaceError> {
+        validate_drop_table(sql)
+    }
+
+    fn view(sql: &str) -> Result<ValidatedDropView, SqlSurfaceError> {
+        validate_drop_view_tokens(&lexer::tokenize(sql).expect("tokenize"))
+    }
+
+    #[test]
+    fn table_accepts_cascade_restrict_and_defaults_to_restrict() {
+        assert_eq!(
+            table("DROP TABLE a").unwrap().behavior,
+            DropBehavior::Restrict
+        );
+        assert_eq!(
+            table("DROP TABLE a RESTRICT").unwrap().behavior,
+            DropBehavior::Restrict
+        );
+        let v = table("drop table if exists a, b cascade;").unwrap();
+        assert_eq!(v.behavior, DropBehavior::Cascade);
+        assert!(v.if_exists);
+        assert_eq!(v.table_names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn cascade_named_table_is_a_name_and_double_keyword_is_rejected() {
+        let v = table("DROP TABLE cascade").unwrap();
+        assert_eq!(v.table_names, vec!["cascade".to_string()]);
+        assert_eq!(v.behavior, DropBehavior::Restrict);
+        for sql in [
+            "DROP TABLE a CASCADE RESTRICT",
+            "DROP TABLE a CASCADE CASCADE",
+        ] {
+            assert_eq!(table(sql).unwrap_err().wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn view_accepts_behavior_but_index_and_type_reject_cascade() {
+        assert_eq!(
+            view("DROP VIEW v CASCADE").unwrap().behavior,
+            DropBehavior::Cascade
+        );
+        assert_eq!(
+            view("DROP VIEW v").unwrap().behavior(),
+            DropBehavior::Restrict
+        );
+        let index = |sql: &str| validate_drop_index_tokens(&lexer::tokenize(sql).expect("lex"));
+        let ty = |sql: &str| validate_drop_type_tokens(&lexer::tokenize(sql).expect("lex"));
+        assert_eq!(
+            index("DROP INDEX i CASCADE").unwrap_err().wire_code(),
+            "42601"
+        );
+        assert_eq!(ty("DROP TYPE t CASCADE").unwrap_err().wire_code(), "42601");
+        index("DROP INDEX i RESTRICT").expect("restrict index");
+        ty("DROP TYPE t RESTRICT").expect("restrict type");
     }
 }
