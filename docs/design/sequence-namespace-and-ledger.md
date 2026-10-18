@@ -33,7 +33,7 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
 | ---- | ---- |
 | カタログは名前をキーにした平らな redb テーブルで、テナントもスキーマも持たない。表・ビュー・索引は relation の名前空間を共有し、作成時は複数テーブルを同じ write txn で確認する（衝突は `42P07`）。ENUM 型は別の名前空間 | `catalog.rs` |
 | 台帳のキーは `(tenant_id, table_name, operation_id)`。照合はハッシュのみで、一致は `23505`、不一致は `22023`（keep-first）。行の書き込みと同じ txn で永続化する（RECOVER-12） | `ledger.rs` |
-| 揮発性の式・DEFAULT を含む INSERT 系は、構文形をハッシュする別ドメインの `OpTag`（14〜16）と、列の種別バイト `2`（揮発性 DEFAULT の適用）を実装済み | `content_hash.rs`・[now-evaluated-value-ledger.md](now-evaluated-value-ledger.md) |
+| 揮発性の式を含む INSERT 系は、構文形をハッシュする別ドメインの `OpTag`（14〜16）を実装済み。省略列へ適用した DEFAULT は内容照合ハッシュの材料から除外され、旧・列の種別バイト `2`（揮発性 DEFAULT の適用）は退役済みで再利用しない | `content_hash.rs`・[now-evaluated-value-ledger.md](now-evaluated-value-ledger.md) |
 | 明示トランザクションはセッションごとに共有 `redb::WriteTransaction` を 1 本持ち、ROLLBACK／接続断で drop する。redb は単一ライター | `sql/transaction.rs`・`storage.rs` |
 | DDL は `--ddl-allowed-users` で許可したユーザーだけが実行でき、既定では全 DDL が `42501` | `ddl_permission_opt.rs` |
 | SCHEMA（#1711）・`operation_id` の任意化（#1701）は未着手 | Issue |
@@ -53,7 +53,11 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
   `INSERT VALUES` 内の `nextval` は定数へ畳み込まない。`nextval` を含む INSERT・バッチ INSERT・
   UPSERT は既存の `InsertExpr`／`InsertBatchExpr`／`UpsertExpr` に乗せる
 - `DEFAULT nextval('s')`（将来の SERIAL・IDENTITY を含む）は、`ColumnDefault` に新 variant と
-  新しいカタログタグを足し、ハッシュには列の種別バイト `2` を使う。未知タグは既存どおり fail-closed
+  新しいカタログタグを足す。ただし省略列へ適用した DEFAULT は既存方針
+  （[not-null-default.md](not-null-default.md) の「Issue #1629 追記」）どおり内容照合ハッシュの
+  材料から除外し、送られた文に書かれた列だけでハッシュする。退役済みの列の種別バイト `2` は
+  再利用しない。DEFAULT 変更後に同じ `operation_id`・同じ INSERT を再送しても、内容不一致にならず
+  `23505`（再実行しない）になる。未知のカタログタグは既存どおり fail-closed
 - `nextval` を含まない文のハッシュは既存とバイト単位で同一に保つ。golden テストの不変を
   #1690・#1692 の必須条件とする
 - 述語形 UPDATE の `SET c = nextval(...)` は既存の構文形ハッシュにそのまま乗る

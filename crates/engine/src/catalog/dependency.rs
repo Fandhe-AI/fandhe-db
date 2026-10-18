@@ -11,7 +11,7 @@
 //! 呼び出し元の想定: `Storage::drop_*` と同じ write txn 内で呼び（TOCTOU 回避）、読み取りのみ
 //! 行う。カタログ表（`CATALOG_TABLE`／`VIEWS_TABLE`／`INDEX_CATALOG_TABLE`／`ENUM_TYPES_TABLE`）
 //! だけを読み、`user_rows/*` など行ストアには触れないため、他テナントの行の有無は結果に
-//! 影響しない。返す名前は内部判断用で、エラー文言や wire へ出すかどうかは呼び出し元（#1641）が決める。
+//! 影響しない（`TRUNCATE` の対象閉包 [`truncate_closure_in_txn`]、Issue #1644 も同じ読み取り専用契約）。返す名前は内部判断用で、エラー文言や wire へ出すかどうかは呼び出し元（#1641）が決める。
 //!
 //! 依存に数えないもの: 表に付随するオブジェクト（その表自身の索引・PK・UNIQUE・CHECK・
 //! 自己参照を含む自分が持つ FK）は表と一緒に消える付随物であり、依存ではない
@@ -63,6 +63,92 @@ pub(crate) enum DropTarget {
     Index(String),
     #[allow(dead_code)]
     EnumType(String),
+}
+
+/// `TRUNCATE` の対象表集合（SQL-48 (2)、Issue #1644）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TruncateClosure {
+    /// 実際に空にする表の全体。利用者が書いた表（文中の順）に、CASCADE で加わった表
+    /// （発見順・同じ親の子は名前順）が続く。重複しない。
+    pub tables: Vec<String>,
+    /// `tables` のうち CASCADE で加わった表（通知用。順序は `tables` と同じ）。
+    pub cascaded: Vec<String>,
+}
+
+/// [`truncate_closure_in_txn`] の失敗。
+#[derive(Debug)]
+pub(crate) enum TruncateClosureError {
+    /// RESTRICT で、`table` を指定外の表 `referencing_table` の FK が参照している。
+    Referenced {
+        table: String,
+        referencing_table: String,
+    },
+    /// カタログ読み取りの失敗・走査上限超過（fail-closed に全体 abort する）。
+    Catalog(CatalogError),
+}
+
+impl From<CatalogError> for TruncateClosureError {
+    fn from(e: CatalogError) -> Self {
+        Self::Catalog(e)
+    }
+}
+
+/// `TRUNCATE` の対象表 `tables` に対し、FK で参照している表を推移的に求める（SQL-48 (2)）。
+///
+/// 呼び出し元は `tenant::truncate_tables_unchecked`（行の削除より前の同一 write txn 内）。
+/// 判定材料はカタログの FK 宣言だけで行ストアには触れないため、他テナントの行の有無は
+/// 結果に影響しない（存在オラクルにならない）。自己参照 FK は依存に数えない。
+/// `Restrict` は指定外の参照元が 1 つでもあれば最初の違反（文中の順の表 → 名前順の参照元）で
+/// [`TruncateClosureError::Referenced`]。`Cascade` は参照元を対象へ加えて走査を続ける。
+/// 再帰せずキューで反復し、対象数が [`MAX_LIST_TABLES`] を超えたら `Err`（DoS 対策）。
+pub(crate) fn truncate_closure_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tables: &[String],
+    behavior: super::DropBehavior,
+) -> std::result::Result<TruncateClosure, TruncateClosureError> {
+    let mut all: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for t in tables {
+        if seen.insert(t.clone()) {
+            all.push(t.clone());
+        }
+    }
+    let explicit_len = all.len();
+    let mut cursor = 0usize;
+    while let Some(parent) = all.get(cursor).cloned() {
+        cursor += 1;
+        let mut children: Vec<String> = referencing_foreign_keys_in_txn(write_txn, &parent)?
+            .into_iter()
+            .map(|(child, _)| child.name)
+            .filter(|name| *name != parent)
+            .collect();
+        children.sort();
+        children.dedup();
+        for child in children {
+            if seen.contains(&child) {
+                continue;
+            }
+            if behavior == super::DropBehavior::Restrict {
+                return Err(TruncateClosureError::Referenced {
+                    table: parent,
+                    referencing_table: child,
+                });
+            }
+            if all.len() >= MAX_LIST_TABLES {
+                return Err(CatalogError::Invalid(format!(
+                    "too many tables: TRUNCATE CASCADE exceeds {MAX_LIST_TABLES}"
+                ))
+                .into());
+            }
+            seen.insert(child.clone());
+            all.push(child);
+        }
+    }
+    let cascaded = all.get(explicit_len..).unwrap_or(&[]).to_vec();
+    Ok(TruncateClosure {
+        tables: all,
+        cascaded,
+    })
 }
 
 /// 根に依存するオブジェクト。`Ord` は決定的な整列に使う。
@@ -686,6 +772,53 @@ mod tests {
 
     fn is_fk_of(obj: Option<&DependentObject>, child: &str) -> bool {
         matches!(obj, Some(DependentObject::ForeignKey { table, .. }) if table == child)
+    }
+
+    fn truncate_run(
+        storage: &Storage,
+        tables: &[&str],
+        behavior: super::super::DropBehavior,
+    ) -> std::result::Result<TruncateClosure, TruncateClosureError> {
+        let txn = storage.begin_write_txn().expect("begin write");
+        let names: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
+        let r = truncate_closure_in_txn(&txn, &names, behavior);
+        drop(txn);
+        r
+    }
+
+    /// SQL-48 (2): RESTRICT は指定外の参照元で拒否、指定済みなら通る。CASCADE は推移的に加える。
+    #[test]
+    fn truncate_closure_restrict_cascade_transitive_and_cycle() {
+        use super::super::DropBehavior::{Cascade, Restrict};
+        let (storage, _g) = open("dep-trunc");
+        storage.create_table(&parent_table("a")).expect("a");
+        // b -> a, c -> b（c は PK を持たせ b を親にできるよう b も PK 付き）
+        let b = TableSchema::new("b", cols())
+            .with_primary_key(vec!["a".to_string()])
+            .with_foreign_keys(vec![fk(&["b"], "a", &["a"])]);
+        storage.create_table(&b).expect("b");
+        storage.create_table(&child_table("c", "b")).expect("c");
+        let selfref = TableSchema::new("s", cols())
+            .with_primary_key(vec!["a".to_string()])
+            .with_foreign_keys(vec![fk(&["b"], "s", &["a"])]);
+        storage.create_table(&selfref).expect("s");
+
+        match truncate_run(&storage, &["a"], Restrict) {
+            Err(TruncateClosureError::Referenced {
+                table,
+                referencing_table,
+            }) => assert_eq!((table.as_str(), referencing_table.as_str()), ("a", "b")),
+            other => panic!("expected Referenced, got {other:?}"),
+        }
+        let ok = truncate_run(&storage, &["a", "b", "c"], Restrict).expect("all explicit");
+        assert_eq!(ok.tables, vec!["a", "b", "c"]);
+        assert!(ok.cascaded.is_empty());
+        let casc = truncate_run(&storage, &["a"], Cascade).expect("cascade");
+        assert_eq!(casc.tables, vec!["a", "b", "c"]);
+        assert_eq!(casc.cascaded, vec!["b", "c"]);
+        // 自己参照は依存に数えない。
+        let s = truncate_run(&storage, &["s"], Restrict).expect("self reference");
+        assert_eq!(s.tables, vec!["s"]);
     }
 
     /// 他表の FK は `ForeignKey` として列挙され、自己参照 FK だけの表は依存なし（TABLE-37）。

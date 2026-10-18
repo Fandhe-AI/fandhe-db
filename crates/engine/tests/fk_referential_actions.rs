@@ -824,18 +824,55 @@ fn truncate_does_not_fire_referential_actions() {
         &alice,
         "INSERT INTO children (id, parent_id) VALUES (10, 1) USING OPERATION_ID 'op-c'",
     );
-    // `TRUNCATE` は `CASCADE` を発火させない（A4）。自テナントの参照元行が
-    // 残っているため `23503` で拒否され、`parents` の内容も変化しない。
+    // `TRUNCATE` は `CASCADE` を発火させない（A4）。RESTRICT（既定）は参照元の表が指定外
+    // なので、行の有無に関わらずカタログ宣言だけで `0A000` で拒否され（Issue #1644）、
+    // `parents` の内容も変化しない。
     assert_eq!(
         err_code(
             &core,
             &alice,
             "TRUNCATE TABLE parents USING OPERATION_ID 'op-t'"
         ),
-        "23503"
+        "0A000"
     );
     assert_eq!(row_count(&core, &alice, "parents"), 1);
     assert_eq!(row_count(&core, &alice, "children"), 1);
+}
+
+/// `TRUNCATE ... CASCADE` は参照アクション（`ON DELETE SET NULL`）を発火させず、参照元の
+/// 表を対象へ加えて**行ごと**空にする（SQL-48 (2)、Issue #1644）。
+#[test]
+fn truncate_cascade_empties_referencing_table_without_firing_set_null() {
+    let (core, path) = new_core("fkact-truncate-cascade");
+    let _guard = CleanupGuard(path);
+    create_id_parent_with_action(&core, "SET NULL");
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO parents (id, name) VALUES (1, 'p1') USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO children (id, parent_id) VALUES (10, 1) USING OPERATION_ID 'op-c'",
+    );
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "TRUNCATE TABLE parents USING OPERATION_ID 'op-t1'"
+        ),
+        "0A000"
+    );
+    ok(
+        &core,
+        &alice,
+        "TRUNCATE TABLE parents CASCADE USING OPERATION_ID 'op-t2'",
+    );
+    // SET NULL なら子行が残る（親キーが NULL になる）はずだが、行ごと削除される。
+    assert_eq!(row_count(&core, &alice, "parents"), 0);
+    assert_eq!(row_count(&core, &alice, "children"), 0);
 }
 
 // --- 連鎖対象の限定（Issue #1076 codex-review 指摘対応） -----------------------
