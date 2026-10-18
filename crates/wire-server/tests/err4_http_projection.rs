@@ -279,7 +279,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 63] = [
+const EXPECTED_STATUS: [(&str, u16); 66] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -350,6 +350,11 @@ const EXPECTED_STATUS: [(&str, u16); 63] = [
     // `CollationMismatch`（`42P21`）・`IndeterminateCollation`（`42P22`。Issue #2190）:
     // SQL 表層専用の照合エラーで 400。
     ("42P21", 400),
+    // `InvalidObjectDefinition`（`42P17`）・`GroupingError`（`42803`）・`WindowingError`（`42P20`。
+    // Issue #1647）: 式索引の式の拒否。SQL 表層専用で 400。
+    ("42P17", 400),
+    ("42803", 400),
+    ("42P20", 400),
     ("42P22", 400),
     // `CannotCoerce`（`42846`。Issue #1590）: 明示の `CAST` で型の組に変換の対応が無い。
     // SQL 表層専用の分類で 400。
@@ -467,7 +472,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 66);
+const _: () = assert!(ErrorClass::ALL.len() == 69);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -965,6 +970,10 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // `CollationMismatch`（`42P21`）・`IndeterminateCollation`（`42P22`。Issue #2190）:
         // 式の `COLLATE` は NoSQL 表層の `op` 語彙に無く到達不能。
         ErrorClass::CollationMismatch,
+        // 式索引の式の拒否（Issue #1647）: `CREATE INDEX` は NoSQL 表層の `op` 語彙に無く到達不能。
+        ErrorClass::InvalidObjectDefinition,
+        ErrorClass::GroupingError,
+        ErrorClass::WindowingError,
         ErrorClass::IndeterminateCollation,
         // `CannotCoerce`（`42846`。Issue #1590）: `CAST` は NoSQL 表層の `op` 語彙に無く到達不能。
         ErrorClass::CannotCoerce,

@@ -391,6 +391,17 @@ fn structural_rejections_do_not_consult_the_catalog() {
             "0A000",
         ),
         ("CREATE INDEX idx ON docs (lower(lang))".into(), "0A000"),
+        // 式索引（INDEX-10、Issue #1647）: 構文段の分類。カタログ非参照のため権限・対象の有無に
+        // 依存しない。
+        ("CREATE INDEX idx ON docs ((now()))".into(), "42P17"),
+        ("CREATE INDEX idx ON docs ((lang || body))".into(), "0A000"),
+        ("CREATE INDEX idx ON docs ((count(lang)))".into(), "42803"),
+        (
+            "CREATE INDEX idx ON docs ((sum(id) OVER ()))".into(),
+            "42P20",
+        ),
+        ("CREATE INDEX idx ON docs ((SELECT 1))".into(), "0A000"),
+        ("CREATE INDEX idx ON docs ((lang) + 1)".into(), "42601"),
         ("CREATE INDEX idx ON docs ('lang')".into(), "0A000"),
         (
             "CREATE INDEX idx ON docs USING hnsw (embedding, lang)".into(),
