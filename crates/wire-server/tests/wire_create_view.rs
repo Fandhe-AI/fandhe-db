@@ -416,3 +416,43 @@ fn wire_view_column_aliases() {
     expect_error_response_with_sqlstate(&mut stream, "42701");
     read_ready_for_query(&mut stream);
 }
+
+/// `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）が wire 越しでも互換な置換に
+/// `CREATE VIEW` タグを返し、非互換は `42P16`・テーブル名との衝突は `42809` の
+/// `ErrorResponse` になる（意味論の確定オラクルは
+/// `crates/engine/tests/table41_view_or_replace.rs`）。
+#[test]
+fn wire_create_or_replace_view_compatibility() {
+    let (core, _guard) = new_core_with_docs_table();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(
+        &mut stream,
+        "CREATE OR REPLACE VIEW v AS SELECT id, lang FROM docs",
+    );
+    assert_eq!(read_command_complete(&mut stream), "CREATE VIEW");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "CREATE OR REPLACE VIEW v AS SELECT id, lang FROM docs WHERE lang = 'ja'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "CREATE VIEW");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "CREATE OR REPLACE VIEW v AS SELECT lang, id FROM docs",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42P16");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "CREATE OR REPLACE VIEW docs AS SELECT id, lang FROM docs",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42809");
+    read_ready_for_query(&mut stream);
+}

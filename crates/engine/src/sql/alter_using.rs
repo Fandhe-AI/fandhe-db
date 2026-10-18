@@ -355,6 +355,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::DuplicateType { .. }
         | E::InvalidTableDefinition { .. }
         | E::ColumnInPrimaryKey { .. }
+        | E::InvalidViewReplacement { .. }
         | E::DuplicateColumn { .. }
         | E::DependentObjectsStillExist { .. }
         | E::WrongObjectType { .. }

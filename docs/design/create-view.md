@@ -26,7 +26,7 @@ DROP VIEW <name>
 
 - body の `LIMIT`・`ORDER BY ... <=>`・`HYBRID`・`USING PLAN`・集計形・式項目
   （`Projection::Items`）・UDF 呼び出し述語（`WherePredicate::PredicateCall`／
-  `Expression`）・`EXPLAIN`・`CREATE OR REPLACE`・`IF NOT EXISTS`・`TEMP`／
+  `Expression`）・`EXPLAIN`・`CREATE OR REPLACE` の `VIEW` 以外への適用・`IF NOT EXISTS`・`TEMP`／
   `MATERIALIZED`・`WITH CHECK OPTION`・末尾の余剰トークンは
   いずれも構造的に受理しない（`42601`）。使える単純述語は
   `Equality`／`Prefix`／`BoolEquality`／`BoolColumn`／`Compare`（列 対
@@ -322,8 +322,9 @@ view_read_applies_referencing_session_rls_not_creator_visibility` で
 - 循環は正常な経路からは構造的に作れない: `CREATE VIEW` は参照先の存在を
   作成前に要求するため自己参照は `42P01` になり、何も永続化されない。
   他から参照されているビュー・テーブルの `DROP` は `2BP01` になるため、
-  「削除して作り直す」ことで循環を組めない。`CREATE OR REPLACE VIEW`・
-  `ALTER VIEW` は `42601`。
+  「削除して作り直す」ことで循環を組めない。`ALTER VIEW` は `42601`。
+  `CREATE OR REPLACE VIEW` は Issue #1660 で受理し、自己参照・循環は置換時に `42P17` で拒否する
+  （末尾の「Issue #1660 追記」参照）。
 - それでもカタログ破損に備え、`resolve_from`・深さ計算のいずれも visited
   集合と上限付き反復（ループ。再帰なし）を使う。循環を検出した場合は
   `XX000`（固定文言）、上限超過は `54000`。
@@ -453,3 +454,46 @@ TABLE-41 (1) のポインタ。TABLE-18 の RLS 契約（参照したセッシ�
 結果、別名付きビューが読む表への `RENAME COLUMN` は `0A000`、`DROP COLUMN`／`ALTER TYPE` は依存ありとして
 拒否される（PostgreSQL は受理するため、精密な追随は後続課題）。連鎖の深さ・到達判定は本文の形のまま。
 `RENAME COLUMN` で別のビューの定義を書き換える際は `column_aliases` を保つ。
+
+## Issue #1660 追記: `CREATE OR REPLACE VIEW` の互換性検査
+
+TABLE-41 (2) のポインタ（TABLE-18 の RLS 契約は変えない）。兄弟: 列別名リストは #1659、依存ビューの
+再検証と原子的置換・途中失敗時の復旧は #1661。
+
+### 構文と判定順序
+
+- `CREATE OR REPLACE VIEW <name> [(<alias>, ...)] AS <body>`。`OR REPLACE` は VIEW 専用で、`OR` 単独・
+  `OR REPLACE TABLE`／`INDEX`／`TYPE` 等と `IF NOT EXISTS` 併用は `42601`（`Parser::parse_create_view`）
+- 順序: 構文 → 本文サイズ → DDL 権限（`42501`。互換性の情報を権限のない主体へ返さない）→ 別名の突合
+  （`42601`／`42701`）→ 同名が表・索引なら `42809` → 新本文の検証（参照先不存在 `42P01` 等）→
+  自己参照・循環 `42P17` → 互換性 `42P16` → 依存ビューあり `0A000` → ネスト深さ `54000` → 置換。
+  不在なら通常の `CREATE VIEW` と同じ。明示トランザクション内の DDL は従来どおり `0A000`
+
+### 互換性規則（`sql::view_replace::check_replace_compatible`）
+
+- 新定義の出力列が、既存の出力列を同じ名前・同じ型・同じ順で保ち、末尾に列を足すだけのときに限り置換できる
+- 列数の減少・位置ごとの名前不一致（改名・順序変更）・型不一致（`VARCHAR(n)` の n 等の typmod も完全一致）は
+  `42P16`。静的な型を持たない列（ベクトル式等）は同一性を検証できないため `0A000`（fail-closed）
+- 旧定義・新定義の出力列は同一関数 `EngineCore::view_output_columns`（`body_output` ＋ 本文を実行しない
+  Describe。別名適用込み）で導出する。`SELECT *` は参照時に動的展開する方針のため、旧ビューの列は
+  置換時点の展開結果で比較する（作成時に列を固定する PostgreSQL とは異なる）
+- 照合順序（collation）は現行の列メタデータが保持しないため比較対象外
+
+### 原子性と競合
+
+- 置換は単一 write txn の 1 回の insert（`Storage::create_or_replace_view`）。互換性検査に使った旧定義を
+  txn 内で現在の定義と突き合わせる compare-and-swap で、不一致は `ViewDefinitionChanged`。SQL 表層は
+  検査からやり直し（最大 3 回。超過は `55P03`）、旧定義は変えない
+- 新本文の検証は `validate_new_view_body_in_txn` を `create_view` と共有する（第 2 の検証実装を作らない）。
+  自己参照・循環の探索は訪問済み集合と `MAX_VIEW_CHAIN_WALK` で打ち切る再帰なしの反復で、読めない場合は
+  到達ありとみなす（fail-closed）
+- ビューは行ストア・世代を持たないため `bump_table_generation_in_txn` は呼ばない
+
+### 暫定制限（Issue #1661 で解除）
+
+- 置換対象に依存するビューがある場合は `0A000` で拒否し、状態を変えない（依存ビューの再検証と
+  途中失敗時の復旧は #1661）
+- 検査と commit の間の基底表 DDL による残余 TOCTOU は、依存ビュー不在の制限下では置換対象自身の出力に
+  限られる（#1661 で txn 内検査化を検討）
+- 公開型の変更: `CatalogError::{ViewDefinitionChanged, ViewReferenceCycle}`・
+  `SqlSurfaceError::InvalidViewReplacement`・`ValidatedCreateView::or_replace` を追加（破壊的変更）
