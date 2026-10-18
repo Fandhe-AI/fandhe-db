@@ -12413,6 +12413,23 @@ impl TableLookup for Storage {
             Err(other) => Err(table_lookup_error(other)),
         }
     }
+
+    /// `SELECT *` の実際の列並び（疑似列 `id` が先頭、続けて宣言済みの実カラム。実カラム `id` を
+    /// 宣言していれば `id` が 2 回現れる）。`sql::parser::bind_projection` の `Projection::All` と一致させる。
+    fn table_star_columns(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
+        match self.get_table_schema(name) {
+            Ok(schema) => {
+                let mut columns = vec!["id".to_string()];
+                columns.extend(schema.columns.iter().map(|c| c.name.clone()));
+                Ok(Some(columns))
+            }
+            Err(CatalogError::TableNotFound(_)) => Ok(None),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
 }
 
 /// [`TableLookup::table_exists`]（`impl TableLookup for Storage`）と

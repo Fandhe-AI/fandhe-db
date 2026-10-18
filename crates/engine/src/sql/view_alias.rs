@@ -212,6 +212,10 @@ pub(crate) fn rewrite_projection(
                         let mut idents = HashSet::new();
                         super::parser::collect_expr_idents(&expr, &mut idents);
                         map.reject_aliased_id_refs(&idents)?;
+                        // 既定の出力名は書き換え前の式（公開名）から確定する。物理名へ書き換えた後の
+                        // 式から導くと `CAST(x AS TEXT)`・`x[1]` の出力名が隠れた物理名になる。
+                        let alias =
+                            Some(alias.unwrap_or_else(|| super::parser::default_expr_alias(&expr)));
                         out.push(SelectItem::Expr {
                             expr: map_expr_idents(&expr, &|c| map.physical(c)),
                             alias,

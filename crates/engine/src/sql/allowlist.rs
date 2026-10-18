@@ -1536,6 +1536,20 @@ pub trait TableLookup {
         Ok(None)
     }
 
+    /// `name` が実テーブルのとき、`SELECT *` が返す列名を実際の並び（疑似列 `id` が先頭、
+    /// 続けてスキーマ宣言の実カラムを宣言順）で返す。スキーマが実カラム `id` を宣言していれば
+    /// `id` は 2 回現れる（疑似列と実カラム。`parser::bind_projection` の `Projection::All` と同じ）。
+    /// 既定実装は [`Self::table_columns`] から「`id` 先頭＋残り」を組み立てる（実カラム `id` を
+    /// 宣言するテーブルを区別できない。`catalog::Storage` は正確な並びで上書きする）。
+    /// 導出できない lookup は `Ok(None)`。
+    fn table_star_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+        Ok(self.table_columns(name)?.map(|columns| {
+            let mut out = vec!["id".to_string()];
+            out.extend(columns.into_iter().filter(|c| c != "id"));
+            out
+        }))
+    }
+
     /// 評価後射影形ビューの本文を参照時に再検証する入れ子の深さ（Issue #1411。
     /// 既定は 0）。評価後射影形ビューの連鎖（`sql::view::resolve_from` が本文を再検証する
     /// たびに +1 するラッパーが上書きする）を `MAX_VIEW_NESTING_DEPTH` で打ち切り、

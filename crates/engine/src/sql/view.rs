@@ -322,13 +322,18 @@ pub(crate) fn star_columns_of_table(
     lookup: &impl TableLookup,
     table: &str,
 ) -> Result<Vec<String>, SqlSurfaceError> {
-    let Some(columns) = lookup.table_columns(table)? else {
+    let Some(out) = lookup.table_star_columns(table)? else {
         return Err(SqlSurfaceError::feature_not_supported(
             "view column aliases need the table's columns, which are unavailable here",
         ));
     };
-    let mut out = vec!["id".to_string()];
-    out.extend(columns.into_iter().filter(|c| c != "id"));
+    // 実カラム `id` を宣言する表の `*` は `id` が 2 回現れる（疑似列と実カラム）。投影は名前で
+    // 物理列を引くため疑似列を実カラムと区別して写せない。値を取り違えないよう拒否する（fail-closed）。
+    if out.iter().filter(|c| c.as_str() == "id").count() > 1 {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "view column aliases over SELECT * of a table with a declared id column are not supported",
+        ));
+    }
     Ok(out)
 }
 
@@ -404,6 +409,10 @@ impl TableLookup for BufferedBodyLookup<'_> {
 
     fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
         self.inner.table_columns(name)
+    }
+
+    fn table_star_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+        self.inner.table_star_columns(name)
     }
 
     fn buffered_depth(&self) -> usize {

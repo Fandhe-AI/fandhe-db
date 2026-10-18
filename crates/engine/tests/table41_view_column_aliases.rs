@@ -624,3 +624,57 @@ fn alter_type_gate_and_order_by_over_buffered_alias() {
         .expect("has columns");
     assert_eq!(described, r.columns);
 }
+
+// --- 7. レビュー指摘の回帰（Issue #1659） -------------------------------------
+
+/// `CAST`・`::`・添字の既定出力名は、書き換え前の公開名から導く（隠れた物理名にしない）。
+#[test]
+fn default_output_name_of_cast_follows_the_public_alias() {
+    let (core, _g) = open_core("t41-cast-name");
+    create_ok(&core, "CREATE VIEW vc (x) AS SELECT lang FROM docs");
+    let r = q(&core, "SELECT CAST(x AS TEXT) FROM vc LIMIT 10");
+    assert_eq!(names(&r), ["x"]);
+    let r = q(&core, "SELECT x::TEXT FROM vc LIMIT 10");
+    assert_eq!(names(&r), ["x"]);
+}
+
+/// 評価後射影形の本文: 作成後に基底表へ追加された列が別名と衝突したら、参照時に `42702` で
+/// 拒否する（`SELECT *` が同名列を 2 つ返さない。単純形経路と同じ fail-closed）。
+#[test]
+fn buffered_alias_collision_after_add_column_is_42702() {
+    let (core, _g) = open_core("t41-buffered-collision");
+    create_ok(
+        &core,
+        "CREATE VIEW vd (extra) AS SELECT * FROM docs LIMIT 10",
+    );
+    assert_eq!(names(&q(&core, "SELECT * FROM vd LIMIT 10"))[0], "extra");
+    create_ok(&core, "ALTER TABLE docs ADD COLUMN extra TEXT");
+    assert_eq!(q_code(&core, "SELECT * FROM vd LIMIT 10"), "42702");
+}
+
+/// 実カラム `id` を宣言する表の `SELECT *` は疑似列 `id` と実カラム `id` の 2 列を返す。名前で
+/// 疑似列を指せないため、別名付きビューは値を取り違えず `0A000` で拒否する。
+#[test]
+fn star_over_table_with_declared_id_column_is_rejected_not_misaligned() {
+    let path = unique_db_path("t41-declared-id");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "rid",
+            vec![
+                ColumnDef::new("id", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let core = new_core(storage);
+    assert_eq!(
+        create_err(&core, "CREATE VIEW vr (a, b, c) AS SELECT * FROM rid"),
+        "0A000"
+    );
+    assert_eq!(
+        create_err(&core, "CREATE VIEW vr (a) AS SELECT * FROM rid"),
+        "0A000"
+    );
+}

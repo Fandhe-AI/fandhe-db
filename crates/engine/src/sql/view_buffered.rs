@@ -225,7 +225,7 @@ fn rename_body_columns(
             "view column alias list is longer than the view's output columns",
         ));
     }
-    Ok(body_columns
+    let renamed: Vec<ColumnMeta> = body_columns
         .iter()
         .enumerate()
         .map(|(i, meta)| match (aliases.get(i), meta) {
@@ -242,7 +242,17 @@ fn rename_body_columns(
                 ty: ty.clone(),
             },
         })
-        .collect())
+        .collect();
+    // 改名後の全列名の重複は曖昧なまま通さず拒否する（`42702`。単純形経路と同じ fail-closed。
+    // 作成後に基底表へ列が追加されて重複が生じる場合も塞ぐ）。
+    let mut seen: HashSet<&str> = HashSet::with_capacity(renamed.len());
+    for meta in &renamed {
+        let name = column_name(meta);
+        if !seen.insert(name) {
+            return Err(SqlSurfaceError::ambiguous_column(name));
+        }
+    }
+    Ok(renamed)
 }
 
 fn plan_rows(
