@@ -102,6 +102,38 @@ fn wire_truncate_simple_query_returns_bare_tag() {
     assert_eq!(count_over_wire(&mut stream), "0");
 }
 
+/// SQL-48 (1)(4)（Issue #1643）: `TABLE` 省略・`ONLY`・複数テーブルの文でも
+/// タグは件数なしの `TRUNCATE TABLE` のまま（簡易クエリ）。
+#[test]
+fn wire_truncate_multi_table_without_table_keyword_returns_bare_tag() {
+    let path = temp_db::unique_db_path("wire-truncate-multi");
+    let _g = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    for name in ["docs", "docs2"] {
+        storage
+            .create_table(&TableSchema::new(
+                name,
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+    }
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    seed_private_rows(&core, "tenant-a", 1..4);
+    let addr = spawn_server_with_engine(&users_file(), core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(
+        &mut stream,
+        "TRUNCATE ONLY docs *, docs2 USING OPERATION_ID 'op-wire-multi'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "TRUNCATE TABLE");
+    read_ready_for_query(&mut stream);
+    assert_eq!(count_over_wire(&mut stream), "0");
+}
+
 /// 拡張クエリ: Parse/Bind/Execute/Sync でも同じタグで、RowDescription は出ない。
 #[test]
 fn wire_truncate_extended_query_returns_bare_tag() {

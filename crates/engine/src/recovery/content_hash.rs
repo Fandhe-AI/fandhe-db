@@ -139,6 +139,10 @@ enum OpTag {
     InsertBatchExpr = 15,
     /// 揮発性 DEFAULT を適用した行を含む UPSERT 用。[`for_typed_upsert_expr`] 参照。
     UpsertExpr = 16,
+    /// 複数テーブル `TRUNCATE`（SQL-48、Issue #1643）用。単一テーブル形
+    /// （[`OpTag::Truncate`]・入力なし）の既存台帳エントリのバイト列を変えないよう
+    /// 別ドメインに分離する。[`for_truncate_tables`] 参照。
+    TruncateMulti = 17,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -1240,7 +1244,7 @@ pub(crate) fn for_update_columns_with_exprs(
 /// ドキュメント参照: `ALTER TABLE ADD COLUMN` を挟むと同一クライアント要求の
 /// 再送でも配列幅・位置がずれる）。呼び出し元 `tenant::replace_typed_rows_by_text_key`
 /// が現在のスキーマから（列名, 値）ペアへ変換して渡す。
-/// `truncate_table_unchecked`（SQL-22。`TRUNCATE TABLE <table> USING
+/// `truncate_tables_unchecked`（SQL-22。`TRUNCATE TABLE <table> USING
 /// OPERATION_ID '<id>'`）用。入力: なし（台帳キー自体が `(tenant, table,
 /// operation_id)` でテーブル名を既に一意に識別しており、TRUNCATE 要求は
 /// クライアント由来の可変フィールドをテーブル名以外に持たないため、他の
@@ -1250,6 +1254,23 @@ pub(crate) fn for_update_columns_with_exprs(
 /// 台帳照合の実装を一貫させる）。
 pub(crate) fn for_truncate() -> ContentHash {
     HashInputBuilder::new(OpTag::Truncate).finish()
+}
+
+/// 2 表以上を対象とする `TRUNCATE`（SQL-48、Issue #1643）用。入力は**正規化した
+/// 表集合**（辞書順に整列・重複除去し、件数と各名を長さプレフィクス付きで連結する）。
+/// 文中の表の並びが違っても集合が同じなら同一ハッシュになり（再送は `23505`）、集合が
+/// 違えば `22023` になる。表が 1 つだけの文は互換のため [`for_truncate`] を使う
+/// （呼び出し元 `tenant::truncate_tables_unchecked` が分岐する）。
+pub(crate) fn for_truncate_tables(tables: &[&str]) -> Result<ContentHash, StorageError> {
+    let mut sorted: Vec<&str> = tables.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut b = HashInputBuilder::new(OpTag::TruncateMulti);
+    b.push_u64(u64::try_from(sorted.len()).unwrap_or(u64::MAX));
+    for t in sorted {
+        b.push_bytes(t.as_bytes())?;
+    }
+    Ok(b.finish())
 }
 
 pub(crate) fn for_replace_by_text_key(
@@ -2822,6 +2843,35 @@ mod tests {
     fn for_truncate_is_deterministic_and_differs_from_other_ops() {
         assert_eq!(for_truncate(), for_truncate());
         assert_ne!(for_truncate(), for_delete(1));
+    }
+
+    // 単一テーブル形の `for_truncate()` は既存台帳エントリとの互換のためバイト列を変えない
+    // （変わると既存エントリの再送が `22023` に化ける。Issue #1643）。固定値で守る。
+    #[test]
+    fn for_truncate_digest_is_pinned_for_ledger_compatibility() {
+        let hex: String = for_truncate()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "edd17e4c793e1bf81341681803354c408f7345e0a7e65fb131489a30c6d9b618"
+        );
+    }
+
+    #[test]
+    fn for_truncate_tables_is_order_insensitive_and_distinct_from_single_form() {
+        let ab = for_truncate_tables(&["a", "b"]).expect("hash");
+        assert_eq!(ab, for_truncate_tables(&["b", "a"]).expect("hash"));
+        assert_ne!(ab, for_truncate_tables(&["a", "c"]).expect("hash"));
+        assert_ne!(ab, for_truncate_tables(&["ab"]).expect("hash"));
+        assert_ne!(ab, for_truncate());
+        assert_ne!(
+            for_truncate_tables(&["a"]).expect("hash"),
+            for_truncate(),
+            "multi-form domain must be separate from the single form"
+        );
     }
 
     // for_replace_by_text_key はクライアント要求由来の body/template_values の

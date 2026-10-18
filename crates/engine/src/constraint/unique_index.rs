@@ -308,7 +308,7 @@ fn clear_tenant_chunk(
 }
 
 /// テナント `tenant_id` の索引エントリ（マーカー含む）をすべて削除する。
-/// [`crate::tenant::truncate_table_unchecked`]（TRUNCATE）から、行ストアの
+/// [`crate::tenant::truncate_tables_unchecked`]（TRUNCATE）から、行ストアの
 /// `retain_in` 後・`row_table` を drop した後の同一 write トランザクション
 /// 内で呼ぶ。`PRIMARY KEY`・`UNIQUE` のいずれも宣言しないテーブル、または
 /// 索引テーブルがまだ物理的に作成されていない（[`ensure_tenant_index`] に

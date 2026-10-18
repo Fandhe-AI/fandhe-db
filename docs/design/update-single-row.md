@@ -65,7 +65,7 @@ encode → write を**単一の write トランザクション内**で行う設�
 対象行が「他テナントの行」「未存在 id」「所有者ではあるが RLS 可視集合外
 （`PolicyContext::is_visible` が false）」のいずれであっても、行書き込みだけを
 スキップし、台帳記録（内容照合ハッシュの計算・記録）・テーブル世代進行・
-commit は 1 行更新の場合とまったく同じ手順で行う（`truncate_table_unchecked` と
+commit は 1 行更新の場合とまったく同じ手順で行う（`truncate_tables_unchecked` と
 同じ非対称設計）。
 
 `update_row_unchecked`（全行置換 API）の既存契約は `NotFound` を早期 return

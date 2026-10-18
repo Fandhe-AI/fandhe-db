@@ -3586,13 +3586,15 @@ fn finalize_primary_key(
 /// （カタログ）は残したまま、セッションのテナントが所有する全行を削除する
 /// 書き込み系操作（DDL ではない）として扱う。
 ///
-/// 受理する形は `TRUNCATE TABLE <table> USING OPERATION_ID '<id>' [;]` のみ
-/// （複数テーブル指定・`CASCADE`/`RESTART IDENTITY` 等の PostgreSQL 拡張句は
-/// 許可リスト外）。
+/// 受理する形は `TRUNCATE [TABLE] [ONLY] <table> [*] [, [ONLY] <table> [*] ...]
+/// USING OPERATION_ID '<id>' [;]`（SQL-48 (1)(4)、Issue #1643。継承が無いため
+/// `ONLY`／`*` は意味を変えない no-op）。`CASCADE`／`RESTRICT`／
+/// `RESTART IDENTITY` 等の拡張句は許可リスト外（後続 Issue の範囲）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedTruncate {
-    /// TABLE に指定され、カタログ存在確認を通過したテーブル名。
-    pub table_name: String,
+    /// 指定され、カタログ存在確認を通過したテーブル名。非空・重複除去済みで、
+    /// 文中の初出順を保つ。全表を 1 つの write トランザクションで処理する。
+    pub table_names: Vec<String>,
     /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-22）。句の欠落・明示
     /// `NULL` はいずれも `None`（`ValidatedInsert::operation_id` と同じ契約）。
     /// `validate_truncate` は `LedgerMode::Ledgered`（既定）では `None` を
@@ -4263,6 +4265,23 @@ impl<'a> Parser<'a> {
             self.tokens.get(self.pos.saturating_add(offset)),
             Some(Token::Ident(name)) if name.eq_ignore_ascii_case(word)
         )
+    }
+
+    /// `TRUNCATE` 文の文脈キーワード（`TABLE`／`ONLY`）を判定する（Issue #1643）。
+    /// 現在位置が `word` で、直後が「表名の後に来るはずのトークン」（`,`・`*`・
+    /// `USING OPERATION_ID` の導入部）でなければ真。後者の場合は `word` 自体が同名の
+    /// 表名なので偽を返し、従来の解釈を変えない。文末などでは真になり、後続の
+    /// `expect_ident` が `42601` で拒否する（`TRUNCATE TABLE` 単独を表名と取らない）。
+    fn peek_truncate_keyword(&self, word: &str) -> bool {
+        if !self.peek_ident_matches(word) {
+            return false;
+        }
+        let next_is_name_follower = matches!(
+            self.tokens.get(self.pos.saturating_add(1)),
+            Some(Token::Punct(',' | '*'))
+        ) || (self.peek_ident_matches_at(1, "USING")
+            && self.peek_ident_matches_at(2, "OPERATION_ID"));
+        !next_is_name_follower
     }
 
     /// `IF EXISTS` 句（Issue #1614・TABLE-36 ポインタ）を 2 トークン先読みで判定し、
@@ -8892,14 +8911,39 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `TRUNCATE TABLE <table> USING OPERATION_ID '<id>' [;]` の単一テーブル形
-    /// のみを受理する（SQL-22、TASK-193）。複数テーブル指定・`CASCADE`／
-    /// `RESTART IDENTITY` 等の PostgreSQL 拡張句は構造的に受理しない
+    /// `TRUNCATE [TABLE] [ONLY] <table> [*] [, [ONLY] <table> [*] ...]
+    /// USING OPERATION_ID '<id>' [;]` を受理する（SQL-22、TASK-193。TABLE 省略・
+    /// 複数テーブル・`ONLY`／`*` は SQL-48 (1)(4)、Issue #1643）。`CASCADE`／
+    /// `RESTRICT`／`RESTART IDENTITY` 等の拡張句は構造的に受理しない
     /// （`expect_end_of_statement` が余剰トークンとして `42601` で拒否する）。
+    ///
+    /// `TABLE`／`ONLY` は予約語ではないため、直後が `,`・`*`・`USING OPERATION_ID`
+    /// の場合は同名の表名として扱い（[`Self::peek_truncate_keyword`]）、従来の
+    /// 解釈を変えない。重複するテーブル名は初出順を保って 1 つに畳む。
     fn parse_truncate(&mut self) -> Result<ParsedTruncateShape, SqlSurfaceError> {
         self.expect_contextual_keyword("TRUNCATE")?;
-        self.expect_contextual_keyword("TABLE")?;
-        let table_name = self.expect_ident()?;
+        if self.peek_truncate_keyword("TABLE") {
+            self.advance();
+        }
+        let mut table_names: Vec<String> = Vec::new();
+        loop {
+            if self.peek_truncate_keyword("ONLY") {
+                self.advance();
+            }
+            let name = self.expect_ident()?;
+            // 継承が無いため、表名直後の `*` は意味を変えない。
+            if matches!(self.peek(), Some(Token::Punct('*'))) {
+                self.advance();
+            }
+            if !table_names.contains(&name) {
+                table_names.push(name);
+            }
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
 
         // 文末専用句の構造パースのみをここで行う（`parse_insert` と同じ設計。
         // 必須化の判定は `validate_truncate` が `mode.require` へ委譲する。
@@ -8908,7 +8952,7 @@ impl<'a> Parser<'a> {
         let operation_id = self.parse_operation_id_clause()?;
 
         Ok(ParsedTruncateShape {
-            table_name,
+            table_names,
             operation_id,
         })
     }
@@ -11789,7 +11833,7 @@ pub(crate) fn validate_drop_view_tokens(
 /// 構文木（[`ValidatedTruncate`] の元）。カタログ存在確認前の中間結果
 /// （SQL-22、TASK-193）。
 struct ParsedTruncateShape {
-    table_name: String,
+    table_names: Vec<String>,
     operation_id: Option<OperationId>,
 }
 
@@ -15287,13 +15331,15 @@ pub(crate) fn validate_truncate_tokens(
 
     mode.require(shape.operation_id.as_ref())?;
 
-    let exists = lookup.table_exists(&shape.table_name)?;
-    if !exists {
-        return Err(SqlSurfaceError::undefined_table(shape.table_name));
+    // 文中の順に確認し、最初の不在を `42P01` で返す（決定的な順序）。
+    for table_name in &shape.table_names {
+        if !lookup.table_exists(table_name)? {
+            return Err(SqlSurfaceError::undefined_table(table_name.clone()));
+        }
     }
 
     Ok(ValidatedTruncate {
-        table_name: shape.table_name,
+        table_names: shape.table_names,
         operation_id: shape.operation_id,
     })
 }
@@ -20455,7 +20501,7 @@ mod tests {
             LedgerMode::Ledgered,
         )
         .expect("basic TRUNCATE shape should be accepted");
-        assert_eq!(stmt.table_name, "documents");
+        assert_eq!(stmt.table_names, vec!["documents".to_string()]);
         assert_eq!(
             stmt.operation_id.as_ref().map(OperationId::as_str),
             Some("op-0001")
@@ -20473,28 +20519,106 @@ mod tests {
         .is_ok());
     }
 
-    #[test]
-    fn rejects_truncate_missing_table_keyword() {
-        let lookup = catalog_with(&["documents"]);
-        let err = validate_truncate(
-            "TRUNCATE documents USING OPERATION_ID 'op-0001'",
-            &lookup,
-            LedgerMode::Ledgered,
-        )
-        .expect_err("missing TABLE keyword must be rejected");
-        assert_eq!(err.wire_code(), "42601");
+    fn truncate_names(
+        sql: &str,
+        tables: &'static [&'static str],
+    ) -> Result<Vec<String>, SqlSurfaceError> {
+        let lookup = catalog_with(tables);
+        validate_truncate(sql, &lookup, LedgerMode::Ledgered).map(|v| v.table_names)
     }
 
     #[test]
-    fn rejects_truncate_with_multiple_tables() {
-        let lookup = catalog_with(&["documents", "other"]);
-        let err = validate_truncate(
-            "TRUNCATE TABLE documents, other USING OPERATION_ID 'op-0001'",
-            &lookup,
-            LedgerMode::Ledgered,
+    fn accepts_truncate_without_table_keyword() {
+        let names = truncate_names(
+            "TRUNCATE documents USING OPERATION_ID 'op-0001'",
+            &["documents"],
         )
-        .expect_err("multiple tables must be rejected");
-        assert_eq!(err.wire_code(), "42601");
+        .expect("TABLE keyword is optional");
+        assert_eq!(names, vec!["documents".to_string()]);
+    }
+
+    #[test]
+    fn accepts_truncate_with_only_and_star() {
+        for sql in [
+            "TRUNCATE ONLY documents USING OPERATION_ID 'op-0001'",
+            "TRUNCATE documents * USING OPERATION_ID 'op-0001'",
+            "TRUNCATE TABLE ONLY documents * USING OPERATION_ID 'op-0001'",
+        ] {
+            let names = truncate_names(sql, &["documents"]).expect(sql);
+            assert_eq!(names, vec!["documents".to_string()], "{sql}");
+        }
+    }
+
+    #[test]
+    fn accepts_truncate_with_multiple_tables_in_statement_order() {
+        let names = truncate_names(
+            "TRUNCATE TABLE ONLY documents *, other, ONLY third * USING OPERATION_ID 'op-0001'",
+            &["documents", "other", "third"],
+        )
+        .expect("multiple tables must be accepted");
+        assert_eq!(names, vec!["documents", "other", "third"]);
+    }
+
+    #[test]
+    fn truncate_deduplicates_repeated_tables_keeping_first_occurrence() {
+        let names = truncate_names("TRUNCATE a, b, a USING OPERATION_ID 'op-0001'", &["a", "b"])
+            .expect("duplicates collapse");
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn truncate_keyword_words_are_table_names_when_not_followed_by_identifier() {
+        // `TABLE`／`ONLY` という名前の表（引用識別子）は、直後が識別子でなければ表名。
+        let names = truncate_names("TRUNCATE \"only\" USING OPERATION_ID 'op-0001'", &["only"])
+            .expect("`only` followed by USING OPERATION_ID is a table name");
+        assert_eq!(names, vec!["only".to_string()]);
+        let names = truncate_names(
+            "TRUNCATE TABLE, other USING OPERATION_ID 'op-0001'",
+            &["TABLE", "other"],
+        )
+        .expect("`TABLE` followed by comma is a table name");
+        assert_eq!(names, vec!["TABLE", "other"]);
+    }
+
+    #[test]
+    fn rejects_truncate_with_dangling_comma_or_no_table() {
+        for sql in [
+            "TRUNCATE a, USING OPERATION_ID 'op-0001'",
+            "TRUNCATE a,",
+            "TRUNCATE",
+            "TRUNCATE TABLE",
+            "TRUNCATE , a USING OPERATION_ID 'op-0001'",
+        ] {
+            let err = truncate_names(sql, &["a"]).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_truncate_with_qualified_star_or_extension_clauses() {
+        for sql in [
+            "TRUNCATE a.* USING OPERATION_ID 'op-0001'",
+            "TRUNCATE a CASCADE USING OPERATION_ID 'op-0001'",
+            "TRUNCATE a RESTRICT USING OPERATION_ID 'op-0001'",
+            "TRUNCATE a RESTART IDENTITY USING OPERATION_ID 'op-0001'",
+        ] {
+            let err = truncate_names(sql, &["a"]).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn truncate_reports_first_undefined_table_in_statement_order() {
+        let err = truncate_names(
+            "TRUNCATE a, missing_one, missing_two USING OPERATION_ID 'op-0001'",
+            &["a"],
+        )
+        .expect_err("undefined table must be rejected");
+        assert_eq!(err.wire_code(), "42P01");
+        assert!(
+            format!("{err:?}").contains("missing_one"),
+            "first undefined table name must be reported: {err:?}"
+        );
     }
 
     #[test]
