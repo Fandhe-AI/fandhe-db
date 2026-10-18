@@ -204,7 +204,7 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
 
 - （Issue #1169 で実装済み）`ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT ...` の受理と、
   既存行への読み出し時の `DEFAULT` 補完（TABLE-5・TABLE-16）。
-- `ALTER COLUMN SET/DROP DEFAULT`・`DROP NOT NULL`。（`SET NOT NULL` は Issue #1631 で実装済み）
+- `ALTER COLUMN SET/DROP DEFAULT`・`DROP NOT NULL`。（`SET NOT NULL` は Issue #1631、`DROP NOT NULL` は Issue #1632 で実装済み）
 - （Issue #1523 で実装済み）SQL `VALUES` 内の `NULL` リテラル。
 - （Issue #1524 で実装済み）`UPDATE ... SET`・`DO UPDATE SET`・`DEFAULT` の `NULL`。
   VECTOR 列への NULL（`SET` は `22000`・`DO UPDATE SET` は `23502` で不揃い）の整理と
@@ -228,7 +228,7 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
 ポインタ: TABLE-39 (3)・TABLE-22 (e)・TABLE-26・ERR-6、TASK-277。
 
 - **構文**: `ALTER TABLE <表> ALTER COLUMN <列> SET NOT NULL [;]` のみ受理する。`COLUMN` 省略形、
-  `SET DEFAULT`／`DROP DEFAULT`／`DROP NOT NULL`／`SET DATA TYPE`、カンマ区切りの複数アクションは
+  `SET DEFAULT`／`DROP DEFAULT`／`DROP NOT NULL`／`SET DATA TYPE`（#1628・#1632 で実装済みの形を除く）、カンマ区切りの複数アクションは
   従来どおり `42601`。予約列名は `42601`。
 - **検証**: 単一の write トランザクション（書き込みロック保持中）で、全テナント・全可視性の既存行を
   走査し、対象列に NULL が 1 行でもあれば `23502`。行数上限は設けない。**変更前スキーマ**で走査する
@@ -246,5 +246,100 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
   （`null value in column "c" violates not-null constraint`）。(2) FK 参照アクションとの不整合を
   DDL 時点で `42830` として拒否する（PostgreSQL は実行時に `23502`）。(3) 引用符付きの `"NULL"` も
   キーワードとして受理される（ALTER TABLE の構文段が引用符付き識別子を区別しないため）。
-- **範囲外**: `DROP NOT NULL`（#1632）、`SET／DROP DEFAULT`、`COLUMN` 省略形、複数アクション、
+- **範囲外**: `DROP NOT NULL`（#1632 で実装済み）、`SET／DROP DEFAULT`（#1628 で実装済み）、`COLUMN` 省略形、複数アクション、
   NoSQL 表層。
+
+## Issue #1628 追記: `ALTER COLUMN SET／DROP DEFAULT`
+
+ポインタ: TABLE-39 (1)(2)(6)・TABLE-5・TABLE-16・TABLE-20・ERR-6、Issue #1627（補完値の分離）。
+
+- **構文**: `ALTER TABLE <表> ALTER COLUMN <列> SET DEFAULT <式>`／`... DROP DEFAULT`。式の許可範囲は
+  `CREATE TABLE` の列 DEFAULT と同じ（定数リテラル・定数式・時刻値関数・`NULL`）。`SET DEFAULT NULL`
+  は `DROP DEFAULT` と同じ扱い（SQL-41 の正規化）。`COLUMN` 省略形・カンマ区切りの
+  複数アクションは Issue #1633 で受理した（[alter-table-multi-action.md](alter-table-multi-action.md)）。
+- **変えるもの／変えないもの**: 変えるのは以後の書き込みで使う INSERT 既定値（`default_expr`）だけで、
+  ADD COLUMN 時に決めた既存行の読み出し時補完値（`fill_value`）は変えない。食い違うスキーマは
+  カタログ v14 で永続化される。変更時はテーブル単位の世代を進める。
+- **判定順序**: 表の存在（`42P01`／`42809`）→ 列の存在（`42703`）→ 既定値の生成（型不一致 `42804`）
+  → TIMESTAMPTZ の正規化（`default_expr` のみ）→ 値の束縛検証（`22003`／`22P02` 等）→ 時刻既定値と
+  FK `SET DEFAULT` の組（`0A000`）→ カタログ更新（単一 write txn 内で列型一致・再検証・FK 宣言整合
+  `42830`）。拒否はすべて commit 前で、カタログ・世代・行に痕跡を残さない。
+- **D1 型不一致は SET DEFAULT でだけ `42804`**: `ADD COLUMN`／`CREATE TABLE` の種別不一致 `42601` は
+  既存契約（TABLE-16、SQL-45 の確定待ち）のため据え置く。変換規則は共通化し、不一致エラーの生成だけ
+  を経路ごとに差し替える。DEFAULT を付けられない型（VECTOR 等）の `0A000`、長さ超過 `54000`、
+  VARCHAR(n) 超過 `22001`、書式不正 `22P02`／`22007`／`22008`、範囲外 `22003` は両経路で同一。
+- **D3 時刻値関数のミラー**: `CREATE TABLE ... DEFAULT now()` の列は `fill_value == default_expr ==
+  CurrentTime`（ミラー）。`fill_value` は定数に限る不変条件のため、SET／DROP で `default_expr` を変える
+  ときは `CurrentTime` の補完値を `None` に落とす。`ADD COLUMN` は時刻値関数の DEFAULT を拒否するので
+  `CurrentTime` の補完値は CREATE TABLE 由来に限られ、その列の全行は物理的に値を持つため補完値は
+  参照されない。定数のミラーの `fill_value` は変えない。
+- **D4 冪等**: 変更後の `default_expr` が現在値と等しければ commit・世代 bump なしで成功する
+  （既定値の無い列への DROP を含む。PostgreSQL と同じ）。
+- **D5 FK 参照アクション**: 変更後スキーマで宣言時検査を再実行する。`ON DELETE／UPDATE SET DEFAULT`
+  で参照される NOT NULL 列への DROP DEFAULT は `42830`、同じ列への時刻値関数の SET DEFAULT は
+  SQL 表層で `0A000`（カタログ側は多層防御で `42830`）。
+- **D6 並行 DDL**: 既定値は write txn の外で読んだ列型で作るため、カタログ API は期待する列型を受け取り、
+  write txn 内の列型と一致しなければ `Invalid`（`42601`）で拒否する。
+- **PostgreSQL との既知差分**: (1) ADD COLUMN の型不一致は `42601`、SET DEFAULT は `42804`。
+  (2) PostgreSQL は DROP DEFAULT を受理し FK の `SET DEFAULT` 実行時に `23502` を返すが、本 DB は宣言時
+  に `42830` で拒否する。(3) DEFAULT 式の列参照の `42P10`・部分クエリの `0A000` など SQL-45 の範囲は
+  CREATE TABLE と同じ現状のまま。
+- **範囲外**: 各書き込み経路（INSERT／UPSERT／COPY／NoSQL／`UPDATE ... SET c = DEFAULT`）が新しい
+  既定値を使うことの網羅的検証と content_hash／台帳の整合（#1629）、`DROP NOT NULL`（#1632）、
+  `COLUMN` 省略形・複数アクション、NoSQL 表層、wire-server 側の結合テスト。
+
+## Issue #1629 追記: SET DEFAULT の INSERT 反映と content_hash／台帳の整合
+
+ポインタ: TABLE-39 (1)(2)(6)、RECOVER-10、RECOVER-11、TABLE-5、TABLE-16。
+
+- **反映**: INSERT（単一行・複数行）・UPSERT・COPY・NoSQL `insert`・ファイル形 INSERT の省略列補完は
+  `fill_omitted_columns`（ファイル形は `bind_file_insert` の同型ループ）が現在の `default_expr` を使う
+  （#1628 までに実装済み。本 Issue では結合テスト `sql_set_default_insert_resend.rs` で固定）。
+- **D1 内容照合ハッシュの材料**: 省略列に適用した DEFAULT（定数・時刻とも）は材料から除外し、
+  送られた文に書かれた列だけでハッシュする。SET／DROP DEFAULT・DEFAULT 付き ADD COLUMN を挟んだ
+  同一文の再送は `23505`（再実行しない）になる。旧・時刻 DEFAULT の構文形（種別バイト `2`）は
+  退役し再利用しない。Expr ドメイン（`*Expr`）は `VALUES` 内の単独時刻関数（種別 `1`）がある文だけが使う。
+- **D2 信号の運び方**: `VolatileColumn::Default(idx)` を「DEFAULT 適用列」に意味を広げ、定数 DEFAULT も
+  push する（フィールド名は据え置き）。`tenant.rs` の `named_value_columns`／`named_expr_columns` が
+  書き込み txn 内のスキーマと照合したうえで除外する（不整合は `Invalid` で fail-closed）。
+  ファイル形は `BoundFileInsert::default_applied_columns`（BREAKING）で位置を運ぶ。
+- **D3 既知の衝突**: 明示 `NULL` と、省略して DEFAULT が適用される文は同一ハッシュになる
+  （明示 NULL を除外する既存規則と同じ分類。op_id の誤再利用時のみ）。解消には明示 NULL の種別化が
+  必要で、#1525 と同種の互換性判断になるため別 Issue とする。
+- **D4 旧台帳との互換**: DEFAULT を適用していない文のバイト列は不変（golden テスト不変）。DEFAULT を
+  適用する文は旧版の記録に対し `22023`（fail-closed）になる。legacy ハッシュは新しい正規ハッシュと
+  一致しうるため受理しない（BREAKING）。
+- **D5 NOT NULL 列の DROP DEFAULT 後の再送**: 行形 INSERT（単一行・複数行 `VALUES`）の束縛は、
+  省略された非 nullable 列（DEFAULT なし）を `23502` にせず `VolatileColumn::MissingNotNull` として
+  書き込み段へ運ぶ（ハッシュ材料からは除外）。`tenant` が台帳照合の後に `23502` で拒否するため、
+  記録済みの同一文の再送は `23505`、新規の文は従来どおり `23502`（txn 破棄で台帳追記も残らない）。
+  UPSERT・COPY・ファイル形・NoSQL の束縛は即時 `23502` のまま（これらの NOT NULL 列の再送は対象外）。
+- **範囲外**: `INSERT ... VALUES (DEFAULT)`（SQL-50）と `UPDATE ... SET c = DEFAULT` は未実装。
+  実装時は DEFAULT キーワードを構文形としてハッシュし評価値を入れない。
+
+## Issue #1632 追記: `ALTER COLUMN DROP NOT NULL`
+
+ポインタ: TABLE-39 (4)・TABLE-26・ERR-6、TASK-277。
+
+- **構文**: `ALTER TABLE <表> ALTER COLUMN <列> DROP NOT NULL [;]`。`COLUMN` 省略形・複数アクション・
+  余剰トークンは `42601` のまま。予約列名（`id`・`tenant_id`・`visibility`）も `42601`。
+- **判定順（`Storage::alter_table_drop_not_null`。拒否は commit 前で副作用ゼロ）**: 識別子・保護列 →
+  表取得 → 列取得（`42703`）→ 主キー構成列は `42P16`（複合キーの一部も対象。no-op 判定より先）→
+  既に nullable なら冪等成功（世代 bump なし）→ VECTOR 列は `42601`（NULL 許容 VECTOR は未実装。
+  TABLE-26 の後続で置換）→ 変更後スキーマの再検証 → この表を参照する他表の FK の参照先照合の再実行。
+- **既存行は走査しない**: 制約を緩める変更で、行コーデックは nullable に関係なく presence バイトを
+  書き、末尾欠落行の補完は `fill_value` を nullable より先に評価するため、既存行の見え方は変わらない。
+  補完値（`fill_value`）と INSERT 既定値（`default_expr`）も変えない。
+- **FK の参照先側**: 参照元の列が NOT NULL で `ON UPDATE CASCADE` の FK が参照する列を nullable に
+  すると常に失敗する宣言になるため `42830`（#1631 は子側だけを再検査した。本 Issue は親側を再検査する）。
+  子側の列を nullable にする変更は検査を緩める方向にしか働かない。
+- **主キー削除後**: `DROP CONSTRAINT <表>_pkey` は構成列の NOT NULL を残すため、削除後に本構文で
+  nullable にできる（alter-table-primary-key.md 参照）。
+- **PostgreSQL との既知差分**: FK 参照先側の `42830` は DDL 時点の拒否（PostgreSQL は受理して実行時に
+  `23502`）。documents 表の `path`／`body` を nullable にしても宣言上は拒否せず、辞書抽出や
+  `USING PLAN` は実行時に fail-closed（`22000`）になる。
+- **エラー**: 新 variant `CatalogError::ColumnInPrimaryKey`・`SqlSurfaceError::ColumnInPrimaryKey`
+  （`ErrorClass::InvalidTableDefinition`、`42P16`）。文言は `column "<列>" is in a primary key` で
+  クライアント指定の列名のみ。
+- **範囲外**: `COLUMN` 省略形・複数アクション、NoSQL 表層の `alter_table`、wire-server 側の結合テスト、
+  NULL 許容 VECTOR（TABLE-26）。

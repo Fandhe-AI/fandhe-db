@@ -619,6 +619,7 @@ fn bind_copy_record(
         &mut bound_values,
         &provided,
         Some(clock),
+        false,
     )?;
 
     Ok(BoundInsert {
@@ -767,7 +768,7 @@ impl CopyInSession {
             // 無くても [`bind_copy_record`]（`fill_omitted_columns` 経由）が
             // 補うため、事前検証の対象から外す。
             if !column.nullable
-                && column.default.is_none()
+                && column.default_expr.is_none()
                 && !columns.iter().any(|c| c == &column.name)
             {
                 // `bind_copy_record`（`fill_omitted_columns` 経由）・INSERT・行内

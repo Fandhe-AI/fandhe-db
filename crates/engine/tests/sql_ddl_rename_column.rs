@@ -3,8 +3,9 @@
 //!
 //! `EngineCore::execute_sql_in_session`（構文検証 → `require_ddl_permission` →
 //! `sql::ddl::execute_alter_table_rename_column`）を production 経路として検証する
-//! （`sql_ddl_drop_alter_column.rs` と同じ流儀）。制約・索引の追随は兄弟 Issue の範囲で、依存のある列の改名は `0A000` で拒否する契約を固定する。
-//! ビュー定義の追随（Issue #1621）は単純形を書き換え、評価後射影形は `0A000` で拒否する。
+//! （`sql_ddl_drop_alter_column.rs` と同じ流儀）。制約・索引の追随は Issue #1620 で、
+//! 改名後も一意性・CHECK・参照整合性・索引宣言が新しい名前で効くことを固定する。ビュー定義の
+//! 追随は Issue #1621 で、単純形ビューは書き換え、評価後射影形は `0A000` で拒否する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -269,33 +270,151 @@ fn permission_denial_is_identical_regardless_of_existence() {
         .expect("note still exists");
 }
 
-#[test]
-fn dependent_columns_are_rejected_with_0a000_and_schema_is_unchanged() {
-    let (core, path) = new_core();
-    let _guard = CleanupGuard(path);
-    let mut session = ddl_session();
+/// 制約・索引つきの表群を作る（`parents`: PK・UNIQUE・CHECK、`children`: 親への FK、
+/// `tree`: 自己参照 FK、`docs`: scalar 索引）。
+fn setup_constrained(core: &EngineCore, session: &mut SessionState) {
     for sql in [
         "CREATE TABLE parents (code TEXT PRIMARY KEY, u TEXT UNIQUE, c INTEGER, free TEXT, CHECK (c > 0))",
         "CREATE TABLE children (pcode TEXT, y TEXT, FOREIGN KEY (pcode) REFERENCES parents (code))",
+        "CREATE TABLE tree (nid TEXT PRIMARY KEY, up TEXT, FOREIGN KEY (up) REFERENCES tree (nid))",
         "CREATE INDEX idx_note ON docs (note)",
     ] {
-        run(&core, &mut session, sql).expect(sql);
+        run(core, session, sql).expect(sql);
     }
+    seed_constrained(core, session);
+}
+
+fn seed_constrained(core: &EngineCore, session: &mut SessionState) {
+    for sql in [
+        "INSERT INTO parents (id, code, u, c, free) VALUES (101, 'p1', 'u1', 5, 'f') USING OPERATION_ID 'op-p1'",
+        "INSERT INTO children (id, pcode, y) VALUES (102, 'p1', 'y1') USING OPERATION_ID 'op-c1'",
+        "INSERT INTO tree (id, nid, up) VALUES (103, 't1', NULL) USING OPERATION_ID 'op-t1'",
+    ] {
+        run(core, session, sql).expect(sql);
+    }
+}
+
+/// 改名後の新しい名前で一意性・CHECK・参照整合性が効くことを確かめる。
+fn assert_constraints_effective(core: &EngineCore, session: &mut SessionState) {
+    // PK（旧 code → k）。
+    assert_eq!(
+        code_of(
+            core,
+            session,
+            "INSERT INTO parents (id, k, uu, cc, free) VALUES (104, 'p1', 'u2', 5, 'f') USING OPERATION_ID 'op-d1'"
+        ),
+        "23505"
+    );
+    // UNIQUE（旧 u → uu）。
+    assert_eq!(
+        code_of(
+            core,
+            session,
+            "INSERT INTO parents (id, k, uu, cc, free) VALUES (105, 'p2', 'u1', 5, 'f') USING OPERATION_ID 'op-d2'"
+        ),
+        "23505"
+    );
+    // CHECK（旧 c → cc）。
+    assert_eq!(
+        code_of(
+            core,
+            session,
+            "INSERT INTO parents (id, k, uu, cc, free) VALUES (106, 'p3', 'u3', -1, 'f') USING OPERATION_ID 'op-d3'"
+        ),
+        "23514"
+    );
+    assert_eq!(
+        code_of(
+            core,
+            session,
+            "UPDATE parents SET cc = -2 WHERE id = 101 USING OPERATION_ID 'op-u1'"
+        ),
+        "23514"
+    );
+    // 子側 FK（旧 pcode → pk2）・親側 FK（parents.k）。
+    assert_eq!(
+        code_of(
+            core,
+            session,
+            "INSERT INTO children (id, pk2, y) VALUES (107, 'nope', 'y') USING OPERATION_ID 'op-d4'"
+        ),
+        "23503"
+    );
+    assert_eq!(
+        code_of(
+            core,
+            session,
+            "DELETE FROM parents WHERE id = 101 USING OPERATION_ID 'op-x1'"
+        ),
+        "23503"
+    );
+    // 自己参照 FK（旧 up → upper_id・旧 nid → node_id）。
+    assert_eq!(
+        code_of(
+            core,
+            session,
+            "INSERT INTO tree (id, node_id, upper_id) VALUES (108, 't2', 'zz') USING OPERATION_ID 'op-d5'"
+        ),
+        "23503"
+    );
+    // 正しい行は通る。
+    run(
+        core,
+        session,
+        "INSERT INTO parents (id, k, uu, cc, free) VALUES (109, 'p4', 'u4', 7, 'f') USING OPERATION_ID 'op-ok1'",
+    )
+    .expect("valid parent");
+    run(
+        core,
+        session,
+        "INSERT INTO children (id, pk2, y) VALUES (110, 'p4', 'y') USING OPERATION_ID 'op-ok2'",
+    )
+    .expect("valid child");
+    run(
+        core,
+        session,
+        "INSERT INTO tree (id, node_id, upper_id) VALUES (111, 't3', 't1') USING OPERATION_ID 'op-ok3'",
+    )
+    .expect("valid self reference");
+}
+
+fn rename_all(core: &EngineCore, session: &mut SessionState) {
     for sql in [
         "ALTER TABLE parents RENAME COLUMN code TO k",
-        "ALTER TABLE parents RENAME COLUMN u TO k",
-        "ALTER TABLE parents RENAME COLUMN c TO k",
-        "ALTER TABLE children RENAME COLUMN pcode TO k",
+        "ALTER TABLE parents RENAME COLUMN u TO uu",
+        "ALTER TABLE parents RENAME COLUMN c TO cc",
+        "ALTER TABLE children RENAME COLUMN pcode TO pk2",
+        "ALTER TABLE tree RENAME COLUMN nid TO node_id",
+        "ALTER TABLE tree RENAME COLUMN up TO upper_id",
         "ALTER TABLE docs RENAME COLUMN note TO memo",
     ] {
-        assert_eq!(code_of(&core, &mut session, sql), "0A000", "{sql}");
+        run(core, session, sql).expect(sql);
     }
-    // 古い名前で引き続き動く。
-    core.execute_sql(&ctx(), "SELECT code FROM parents LIMIT 1")
-        .expect("code still exists");
-    core.execute_sql(&ctx(), "SELECT note FROM docs LIMIT 1")
-        .expect("note still exists");
-    // 依存のない列は改名できる。
+}
+
+#[test]
+fn dependent_columns_follow_rename_and_constraints_stay_effective() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    setup_constrained(&core, &mut session);
+    rename_all(&core, &mut session);
+    assert_constraints_effective(&core, &mut session);
+    // 旧名は存在しない。
+    assert_eq!(
+        code_of(&core, &mut session, "SELECT code FROM parents LIMIT 1"),
+        "42703"
+    );
+    // 索引宣言は新しい名前を指す（再宣言は同名で 42P07、DROP INDEX は成功、
+    // 新しい列名での DROP COLUMN は宣言を連鎖削除する）。
+    assert_eq!(
+        code_of(&core, &mut session, "CREATE INDEX idx_note ON docs (memo)"),
+        "42P07"
+    );
+    run(&core, &mut session, "ALTER TABLE docs DROP COLUMN memo").expect("drop renamed column");
+    run(&core, &mut session, "CREATE INDEX idx_note ON docs (label)")
+        .expect("declaration was cascaded away");
+    // 依存のない列は引き続き改名できる。
     run(
         &core,
         &mut session,
@@ -315,6 +434,54 @@ fn view_columns(core: &EngineCore, sql: &str) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+fn constraints_stay_effective_after_reopen() {
+    let path = unique_db_path("sql-ddl-rename-column-dep-reopen");
+    let _guard = CleanupGuard(path.clone());
+    {
+        let storage = Storage::open(&path).expect("open");
+        storage.create_table(&schema()).expect("create");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let mut session = ddl_session();
+        setup_constrained(&core, &mut session);
+        rename_all(&core, &mut session);
+    }
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut session = ddl_session();
+    assert_constraints_effective(&core, &mut session);
+}
+
+#[test]
+fn rename_there_and_back_keeps_key_checks_correct() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    setup_constrained(&core, &mut session);
+    for sql in [
+        "ALTER TABLE parents RENAME COLUMN code TO k",
+        "ALTER TABLE parents RENAME COLUMN k TO code",
+    ] {
+        run(&core, &mut session, sql).expect(sql);
+    }
+    assert_eq!(
+        code_of(
+            &core,
+            &mut session,
+            "INSERT INTO parents (id, code, u, c, free) VALUES (112, 'p1', 'u9', 5, 'f') USING OPERATION_ID 'op-b1'"
+        ),
+        "23505"
+    );
+    assert_eq!(
+        code_of(
+            &core,
+            &mut session,
+            "INSERT INTO children (id, pcode, y) VALUES (113, 'nope', 'y') USING OPERATION_ID 'op-b2'"
+        ),
+        "23503"
+    );
 }
 
 #[test]

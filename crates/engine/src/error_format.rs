@@ -328,6 +328,8 @@ define_error_classes! {
     /// PRIMARY KEY` を重ねて宣言した（`42P16`、Issue #1364・TABLE-22 (d)・
     /// ERR-4・ERR-6）。HTTP 射影は 400（DDL 宣言不正）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidTableDefinition`] の写像。
+    /// 主キー構成列への `ALTER COLUMN ... DROP NOT NULL`（Issue #1632・TABLE-39 (4)）の
+    /// [`crate::sql::allowlist::SqlSurfaceError::ColumnInPrimaryKey`] も同じ分類を共有する。
     InvalidTableDefinition => ("42P16", "INVALID_TABLE_DEFINITION"),
     /// 分割実行 DML（`UPDATE`／`DELETE ... PARTITIONED`。Issue #1129・SQL-19・
     /// RECOVER-11・ERR-1）が 1 チャンク以上 commit した後に止まった（`VD001`）。

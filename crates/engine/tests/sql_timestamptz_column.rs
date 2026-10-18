@@ -464,7 +464,8 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
         "SELECT v + 1 FROM t LIMIT 5",
         "CREATE TABLE a (v TIMESTAMPTZ PRIMARY KEY)",
         "CREATE TABLE a (v TIMESTAMPTZ UNIQUE)",
-        "ALTER TABLE t ALTER COLUMN v TYPE TIMESTAMP",
+        // TIMESTAMPTZ→TIMESTAMP は TABLE-40 の一般変換（Issue #1636）で受理される。
+        // INTEGER→TIMESTAMPTZ は代入変換が無く拒否のまま。
         "ALTER TABLE t ALTER COLUMN n TYPE TIMESTAMPTZ",
     ] {
         assert!(exec(&core, sql).is_err(), "{sql} must be rejected");

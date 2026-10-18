@@ -258,7 +258,7 @@ fn bind_row(
     // `wire_code` の分岐（TABLE-16・TASK-204、Issue #904 レビュー指摘）: 対象列が
     // `nullable == false` の場合、SQL 表層の同一操作（`fill_omitted_columns`
     // 経由。`ColumnType::Vector` に `DEFAULT` は付けられないため常に
-    // `column.default.is_none()`）は `23502`（`NotNullViolation`）を返す。
+    // `column.default_expr.is_none()`）は `23502`（`NotNullViolation`）を返す。
     // NoSQL 表層だけが `22000` のまま据え置くと表層間で `wire_code` が食い違う
     // ため、非 nullable な VECTOR 列に限り SQL 表層と同じ `NotNullViolation`
     // へ写像する。`nullable == true` な VECTOR 列の省略拒否（PR #823 が導入した

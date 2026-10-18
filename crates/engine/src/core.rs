@@ -1584,6 +1584,13 @@ pub enum ParsedSql {
     /// `AlterColumnType` variant（`DROP COLUMN`／`ALTER COLUMN ... TYPE`）を追加した。
     /// 権限ゲート・Describe・明示トランザクション内 DDL の拒否は本 variant 単位で
     /// 判定するため、新形状も既存形状と同じ扱いになる。
+    ///
+    /// **BREAKING CHANGE**（Issue #1632）: `ValidatedAlterTable::AlterColumnDropNotNull`
+    /// variant（`ALTER COLUMN ... DROP NOT NULL`）を追加した。
+    ///
+    /// **BREAKING CHANGE**（Issue #1633）: `ValidatedAlterTable::Multiple`（複数アクション）
+    /// variant と `ValidatedAlterTableAddColumn::if_not_exists` を追加した。権限ゲート・
+    /// 明示トランザクション内 DDL の拒否は `AlterTable` 単位で判定するため新形状も同じ扱い。
     AlterTable(crate::sql::allowlist::ValidatedAlterTable),
     /// `CREATE VIEW <name> AS <body>`（TABLE-18・SQL-23・TASK-205、
     /// Issue #909）。DDL 実行権限ゲート（`sql::ddl::require_ddl_permission`）の
@@ -10549,6 +10556,7 @@ impl EngineCore {
                 path: &bound.path,
                 body: &bound.body,
                 template_values: &bound.template_values,
+                default_applied_columns: &bound.default_applied_columns,
                 path_column_index: bound.path_column_index,
                 body_column_index: bound.body_column_index,
                 vector_column_index: bound.vector_column_index,

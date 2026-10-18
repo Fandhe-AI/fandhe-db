@@ -203,7 +203,8 @@ SQL-23・ERR-6・NOSQL-13）。
   `ALTER TABLE <t> ALTER COLUMN <c> TYPE <型名> [COLLATE <名前>]` のみ（`COLLATE` は
   TABLE-28・Issue #1609 で追加。未知の照合名は `42704`、照合を持てない型は `42804`）。`COLUMN` 省略・
   `IF EXISTS`・`ONLY`・`CASCADE`／`RESTRICT`・`SET DATA TYPE`・`USING`・
-  複数アクション・`RETURNING`・`USING OPERATION_ID` はいずれも `42601`。
+  `RETURNING`・`USING OPERATION_ID` はいずれも `42601`。複数アクションは Issue #1633 以降、
+  DROP COLUMN は受理し（[alter-table-multi-action.md](alter-table-multi-action.md)）、ALTER COLUMN TYPE との混在は `0A000`。
   予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`。大文字小文字
   無視）は構造検証段で `42601`（カタログ非照会のため存在オラクルにならない）。
 - **判定順序**: 構文検証 → DDL 権限ゲート（`42501`）→ テーブル存在確認
@@ -293,3 +294,64 @@ TABLE-12）。物理フレーム幅が変わる（presence 1 + 4 → presence 1 
 - `crates/engine/src/catalog.rs`（`#[cfg(test)] mod tests`）: DROP COLUMN・
   NUMERIC 精度拡大の単体テスト（バイト不変性・保護列/存在検査・同名再追加・
   DB 再オープン後の永続性・`merge_encode_scalar_columns` の NULL 書き込み）
+
+## Issue #1635 追記（ALTER COLUMN TYPE の USING 句の構文と式の束縛。TABLE-40 ポインタ）
+
+`ALTER TABLE <t> ALTER COLUMN <c> [SET DATA] TYPE <型> [COLLATE <名前>] [USING <式>]` のうち、
+構文解析と式の束縛・型検査までを実装した。行の書き換えは #1636、依存オブジェクトの再構築は
+Issue #1637 の担当で、本 Issue では型検査に通った USING 付きの文を `0A000` で拒否する（式を
+無視して従来経路へ流さない fail-closed）。
+
+- **構文**: `SET DATA TYPE` を `TYPE` と同義で受理する。`USING` は `COLLATE` の後ろにだけ置け、
+  式は `UPDATE ... SET` 右辺と同じ構文木・ノード予算で解析する。`ALTER <c>`（`COLUMN` 省略）は
+  従来どおり `42601`。複数アクション内の `TYPE ... USING` は従来どおり `0A000`
+- **実行段の順序**: DDL 権限ゲート → 表の存在確認 → 目標型の解決 → 照合の検査 →
+  事前判定（`sql::ddl::precheck_alter_type_conversion`）→ カタログ。束縛エラーが権限の無い主体への
+  存在オラクルにならない
+- **USING あり**（`sql::alter_using::check_alter_using`）: 組み込み以外の関数・現在時刻関数は
+  `42601`、VECTOR は変換元・先とも `42804`、ENUM 変換先と型を決められない式は `0A000`、
+  未定義列は `42703`、結果型を代入変換できなければ `42804`。成功時は `0A000`（固定文言）
+- **USING 省略**: 旧型から新型への代入変換が SQL-47 の規則表に無い組を `42804`（USING の指定を
+  促す固定文言）で拒否する。代入変換はあるが未実装の縮小などは、TABLE-19 の契約どおりカタログの
+  `42804` のまま（`catalog::decide_alter_type` は変更しない）
+- **PG との差分**: 集計・ウィンドウ関数は `42601`（PG は `42803`・`42P20`）、部分クエリは
+  `42601`（PG は `0A000`）、USING 内の `now()` 等は `42601`（PG は受理）
+- **#1636 への引き継ぎ**: txn 内での再束縛と世代照合、代入変換ノードの生成、`USING c`（同じ列
+  だけの参照）を省略と同値に扱う最適化。`check_alter_using` は現在 `Result<(), _>` で、束縛結果を
+  返す形へ広げる
+- **公開 API（BREAKING）**: `ValidatedAlterTableAlterColumnType.using: Option<Expr>` の追加
+
+## Issue #1636 追記（ALTER COLUMN TYPE の全行書き換え変換エンジン。TABLE-40 (1)(2)(5)・TASK-278 ポインタ）
+
+`USING <式>` 付きの変換と、代入変換（SQL-47）のある組の `USING` 省略変換を受理し、全行を書き換える。
+
+- **判定順（カタログの write txn 内。`alter_table_alter_column_type_collated`）**:
+  1. 型が同じで照合だけが変わる（`USING` なしまたは `USING <対象列>`）→ 従来の `CatalogOnly`
+  2. `USING` なしまたは `USING <対象列>` で `decide_alter_type` が受理する組 → 従来の計画（不変）
+  3. `USING` なしまたは `USING <対象列>` で同一型・規則表の外（VECTOR・ENUM）・代入変換が無い組 → 従来の
+     `IncompatibleTypeChange`（`42804`。表層の事前判定と同じ判定を txn 内でもう一度行う）
+  4. 上記以外 → `AlterPlan::RewriteExpr`
+- **`RewriteExpr` の処理**（`catalog::alter_column_type_rewrite_expr_in_txn`）: カタログのハンドルを
+  手放した後で、依存ゲート → txn 内の旧スキーマへの束縛し直し（事前判定との TOCTOU を作らない）→
+  全行の評価・代入変換・再エンコード（`column_rewrite::rewrite_rows_with_conversion_in_txn`）→
+  派生索引の失効（多層防御）→ スキーマの書き戻し。世代 bump と commit は既存の唯一の commit 点
+- **代入変換**: `sql::cast::bind_scalar_assignment` が `sql::alter_using::bind_alter_conversion` から
+  変換ノードを作る。`VARCHAR(n)`／`CHAR(n)` の長さは変換ノードで切り詰めず、評価後の列値化
+  （`sql::set_expr::expr_value_to_column_value`。`UPDATE SET` と共有の単一の変換器）で `22001`／空白詰め
+- **範囲**: 全テナント・全可視性の行を行数の上限なしで走査する（不可視な行の違反を見逃すと
+  読み出し時の decode 失敗を招くため `PolicyContext` で絞らない）。単一 write txn のため書き込み
+  ロックを保持し続ける（仕様上の前提）
+- **失敗**: 評価・変換エラーは commit せず表は不変。`redact_row_conversion_error`（全 variant を
+  ワイルドカード無しで列挙する網羅 match）が SQLSTATE を保ったまま固定文言へ置き換え、値・テナント・行 id を
+  応答へ載せない
+- **依存ゲート（暫定）**: PK／UNIQUE／この表の FK／他表の FK 参照先／CHECK／索引宣言／ビューが参照する列と、
+  DEFAULT・補完値を持つ列への一般変換は `0A000`。型付きの正準キー・旧型の DEFAULT・古い索引が新しい値と
+  食い違う fail-open を避けるため。**Issue #1637 で再構築を実装して解除する**。既存の受理経路
+  （INTEGER→BIGINT 等）は依存があっても不変
+- **`USING <対象列>`**: 省略と同じ扱い（既存の拡大経路を通る）
+- **従来どおりの拒否**: 複数アクション内の `TYPE`（`0A000`）・明示トランザクション内の DDL（`0A000`）・
+  VECTOR（`42804`）・ENUM が変換元／先になる組（USING あり `0A000`／省略 `42804`）
+- **PG との差分**: 2^53 を超える BIGINT への変換は式評価が f64 で運ぶため `22003`。PG は受理する。
+  ENUM→TEXT などの代入変換は未対応
+- **セッション TZ**: TIMESTAMP↔TIMESTAMPTZ の変換は評価時にセッション TimeZone を読む。ALTER TABLE の
+  実行は `core.rs` の `session_time_zone_scope` の内側で行われる

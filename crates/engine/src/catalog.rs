@@ -48,6 +48,7 @@ use crate::sql::allowlist::{
     classify_view_body, parse_view_body, SqlSurfaceError, StructuralOnlyLookup, TableLookup,
     ViewBodyCheck, ViewBodyKind,
 };
+use crate::sql::udf_call::Expr;
 // `RowInput` / `Visibility` は `insert_row_into_table` / `insert_rows_into_table` /
 // `insert_typed_row`（いずれも `#[cfg(test)]` 限定。Issue #1078）とユニットテストのみが
 // 使う。
@@ -122,7 +123,7 @@ const MAX_INDEX_COUNT: usize = MAX_LIST_TABLES;
 /// 無関係な通常の行 DML（テーブル単位世代のみ進む）ではキャッシュを無効化しない
 /// ようにする。**不変条件**: [`INDEX_CATALOG_TABLE`] を書き込む経路
 /// （[`Storage::create_index`]・[`Storage::drop_index`]・
-/// [`retain_index_defs_in_txn`]）は必ず同一 write txn 内で
+/// [`retain_index_defs_in_txn`]・[`rename_index_def_columns_in_txn`]）は必ず同一 write txn 内で
 /// [`bump_index_catalog_generation_in_txn`] を呼ぶこと。新たに
 /// [`INDEX_CATALOG_TABLE`] への書き込み経路を追加する場合も同様に呼び忘れない
 /// （呼び忘れは古い HNSW 宣言判定の再利用＝fail-open に直結する）。
@@ -196,6 +197,11 @@ pub struct IndexDef {
     /// `USING hnsw`・`id`・照合を持てない型の列への指定は [`Storage::create_index`] が
     /// [`CatalogError::IndexCollationNotSupported`] で拒否する。
     pub collations: Vec<Option<crate::collation::Collation>>,
+    /// `CREATE UNIQUE INDEX` 由来の宣言か（Issue #1616・INDEX-9）。`true` の宣言は
+    /// [`Storage::create_index`] が対象テーブルの UNIQUE 制約（同名）と同一 write txn で
+    /// 登録し、[`Storage::drop_index`] が同一 txn で取り除く。強制は制約側が担い、本フラグは
+    /// 「この UNIQUE 制約は索引由来で `DROP CONSTRAINT` の対象外」の判定にだけ使う。
+    pub unique: bool,
 }
 
 impl IndexDef {
@@ -208,7 +214,15 @@ impl IndexDef {
             kind,
             columns,
             collations,
+            unique: false,
         }
+    }
+
+    /// 一意索引（`CREATE UNIQUE INDEX`。Issue #1616・INDEX-9）として宣言する。
+    /// [`Storage::create_index`] が UNIQUE 制約への展開を同一 txn で行う。
+    pub fn with_unique(mut self, unique: bool) -> Self {
+        self.unique = unique;
+        self
     }
 
     /// 列ごとの照合指定を与える（`collations` は `columns` と同じ長さであること。長さの
@@ -227,11 +241,22 @@ impl IndexDef {
 /// 5 行目に列と同じ数の照合トークン（`-` は指定なし、それ以外は
 /// [`crate::collation::Collation::catalog_token`]）をカンマ区切りで並べた `v2`
 /// （Issue #2191。旧バイナリは `v2` を未知の版として拒否する。前方互換はない）。
+/// 一意索引（Issue #1616・INDEX-9）は 5 行目に固定フラグ `unique` を持つ `v3`
+/// （スカラー・照合なしのみ。`v1`／`v2` のバイト列は不変）。
 /// 列名・テーブル名は [`validate_identifier`] を通過済みの前提（`,`・改行のいずれも
 /// 含み得ない）のため、区切り文字として安全に使える。
 fn encode_index_def(def: &IndexDef) -> Result<Vec<u8>> {
     let columns_csv = def.columns.join(",");
-    let text = if def.collations.iter().all(Option::is_none) {
+    let text = if def.unique {
+        // 一意索引（Issue #1616・INDEX-9）は `v3`。スカラー宣言かつ照合なしに限る
+        // （`create_index` が事前に保証する。破れていれば保存せず拒否する）。
+        if !matches!(def.kind, IndexKind::Scalar) || def.collations.iter().any(Option::is_some) {
+            return Err(CatalogError::Invalid(
+                "unique index must be a scalar index without collations".to_string(),
+            ));
+        }
+        format!("v3\n{}\nscalar\n{}\nunique", def.table, columns_csv)
+    } else if def.collations.iter().all(Option::is_none) {
         format!("v1\n{}\n{}\n{}", def.table, def.kind.as_str(), columns_csv)
     } else {
         let tokens: Vec<&str> = def
@@ -270,12 +295,13 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     let version = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema(format!("missing format version for index {name}"))
     })?;
-    if version != "v1" && version != "v2" {
+    if version != "v1" && version != "v2" && version != "v3" {
         return Err(CatalogError::CorruptSchema(format!(
             "unknown index catalog format version for index {name}"
         )));
     }
     let is_v2 = version == "v2";
+    let is_v3 = version == "v3";
     let table = lines
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema(format!("missing table for index {name}")))?
@@ -305,6 +331,14 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     } else {
         None
     };
+    if is_v3 {
+        // `v3` は一意索引専用: 種別は scalar、5 行目は固定フラグ `unique`（それ以外は破損）。
+        if !matches!(kind, IndexKind::Scalar) || lines.next() != Some("unique") {
+            return Err(CatalogError::CorruptSchema(format!(
+                "invalid unique index record for index {name}"
+            )));
+        }
+    }
     if lines.next().is_some() {
         return Err(CatalogError::CorruptSchema(format!(
             "unexpected trailing data for index {name}"
@@ -339,6 +373,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         kind,
         columns,
         collations,
+        unique: is_v3,
     })
 }
 
@@ -833,6 +868,147 @@ pub(crate) fn hnsw_targeted_in_txn(
     }
 }
 
+/// `name` が `table` に対する一意索引（`CREATE UNIQUE INDEX`。Issue #1616・INDEX-9）として
+/// [`INDEX_CATALOG_TABLE`] に登録済みかを write txn 内で判定する。`ALTER TABLE ... DROP
+/// CONSTRAINT` が索引由来の UNIQUE 制約を制約として扱わないための判定に使う。索引カタログ未作成は
+/// `false`。値の破損は `CorruptSchema` で fail-closed に返す。
+fn unique_index_def_for_table_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    name: &str,
+) -> Result<bool> {
+    let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(guard) = index_table.get(name)? else {
+        return Ok(false);
+    };
+    let def = decode_index_def(name, guard.value())?;
+    Ok(def.unique && def.table == table)
+}
+
+/// [`Storage::create_index`] の一意索引分岐（Issue #1616・INDEX-9）。`def`（`unique == true`）を
+/// 対象テーブルの UNIQUE 制約（索引名と同名）として追加した後のスキーマを返す。同一 write txn
+/// 内で呼ばれ、拒否は commit 前に返る（副作用ゼロ）。判定順（fail-closed。データに依存するのは
+/// 最後の重複走査だけ）: (1) 型ゲート（暗黙の `id`・一意キー許可型外は `IndexKindMismatch`）
+/// (2) 制約名前空間の衝突（UNIQUE・CHECK・FOREIGN KEY・主キー実効名。`ConstraintAlreadyExists`。
+/// `IF NOT EXISTS` でも握りつぶさない） (3) 制約数上限 (4) 追加後スキーマの [`validate_schema`]
+/// （同じ列並びの既存 UNIQUE との重複は `Invalid`） (5) 全テナント・全行の重複走査
+/// （テナントごとに独立。`UniqueConstraintViolation`）。
+fn build_unique_index_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    def: &IndexDef,
+    schema: &TableSchema,
+) -> Result<TableSchema> {
+    for col in &def.columns {
+        let allowed = schema
+            .columns
+            .iter()
+            .find(|c| &c.name == col)
+            .is_some_and(|c| c.ty.is_unique_constraint_allowed());
+        if !allowed {
+            return Err(CatalogError::IndexKindMismatch(format!(
+                "column {col} cannot be used in a unique index"
+            )));
+        }
+    }
+    let name = def.name.as_str();
+    let collides = schema.unique_constraints.iter().any(|u| u.name() == name)
+        || schema.checks.iter().any(|c| c.name == name)
+        || schema.foreign_keys.iter().any(|f| f.name() == name)
+        || name_collides_with_primary_key(schema, &def.table, name);
+    if collides {
+        return Err(CatalogError::ConstraintAlreadyExists(name.to_string()));
+    }
+    if schema.unique_constraints.len() >= MAX_UNIQUE_CONSTRAINTS {
+        return Err(CatalogError::ConstraintLimitExceeded(format!(
+            "table {} already has {MAX_UNIQUE_CONSTRAINTS} unique constraints",
+            def.table
+        )));
+    }
+    let mut constraints = schema.unique_constraints.clone();
+    constraints.push(UniqueConstraint::with_name(
+        def.name.clone(),
+        def.columns.clone(),
+    ));
+    let updated =
+        assign_unique_constraint_names(schema.clone().with_unique_constraints(constraints));
+    validate_schema(&updated)?;
+    let row_table_name = user_rows_table_name(&def.table);
+    match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+        Ok(row_table) => {
+            if crate::constraint::table_has_duplicate_unique_key(
+                &row_table,
+                &updated,
+                &def.columns,
+            )? {
+                return Err(CatalogError::UniqueConstraintViolation);
+            }
+        }
+        // 初回挿入前で行ストアが物理的に未作成（既存行 0 件）。
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(map_row_table_error(e)),
+    }
+    Ok(updated)
+}
+
+/// [`Storage::drop_index`] の一意索引分岐（Issue #1616・INDEX-9）。`def`（`unique == true`）と
+/// 同名の UNIQUE 制約を同一 write txn でスキーマから取り除く。制約が見つからなければ
+/// `CorruptSchema`（索引宣言とスキーマの不整合。fail-closed）。他の `FOREIGN KEY`（自己参照を
+/// 含む）の `parent_columns` の集合が一致する場合は `DependentObjectsStillExist`
+/// （`alter_table_drop_constraint` の UNIQUE 削除と対称。他の UNIQUE・PK が同じ集合を覆っていても
+/// 救済しない）。成功時は永続一意索引を無効化し、索引衛生（stale な `key_index` の刈り込み）を行う。
+fn drop_unique_index_constraint_in_txn(
+    write_txn: &redb::WriteTransaction,
+    def: &IndexDef,
+) -> Result<()> {
+    let corrupt = || {
+        CatalogError::CorruptSchema(format!(
+            "unique index {} has no matching unique constraint",
+            def.name
+        ))
+    };
+    let schema = match require_table_schema_write(write_txn, &def.table) {
+        Ok(s) => s,
+        Err(CatalogError::TableNotFound(_)) => return Err(corrupt()),
+        Err(e) => return Err(e),
+    };
+    let target_index = schema
+        .unique_constraints
+        .iter()
+        .position(|u| u.name() == def.name)
+        .ok_or_else(corrupt)?;
+    let target_set: std::collections::HashSet<&str> = schema
+        .unique_constraints
+        .get(target_index)
+        .ok_or_else(corrupt)?
+        .columns()
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    for (_referencing_schema, fk) in referencing_foreign_keys_in_txn(write_txn, &def.table)? {
+        let parent_set: std::collections::HashSet<&str> =
+            fk.parent_columns().iter().map(|s| s.as_str()).collect();
+        if parent_set == target_set {
+            return Err(CatalogError::DependentObjectsStillExist(def.name.clone()));
+        }
+    }
+    let mut constraints = schema.unique_constraints.clone();
+    constraints.remove(target_index);
+    let updated = schema.clone().with_unique_constraints(constraints);
+    let encoded = encode_schema(&updated)?;
+    {
+        let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+        catalog_table.insert(def.table.as_str(), encoded.as_slice())?;
+    }
+    write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
+    let required = required_key_index_names_in_txn(write_txn, &def.table)?;
+    crate::key_index::prune_unneeded_indexes_in_txn(write_txn, &def.table, &required)?;
+    Ok(())
+}
+
 /// `name` が [`INDEX_CATALOG_TABLE`] に索引名として登録済みかを write txn 内で
 /// 判定する（relation 名前空間の衝突・種別判定用）。索引カタログ自体が未作成
 /// （宣言 0 件）の場合は `false`。
@@ -889,57 +1065,6 @@ fn retain_index_defs_in_txn(
     Ok(())
 }
 
-/// 列改名（[`Storage::alter_table_rename_column`]）の依存オブジェクト検査（TABLE-38 の
-/// ポインタ、Issue #1619）。`table` の列 `column_name` を参照する PRIMARY KEY・UNIQUE・
-/// CHECK・外部キー（子側・親側）・索引宣言が 1 件でもあれば `FeatureNotSupported`
-/// （`0A000`）で拒否する。名前だけ書き換えて古い名前の参照を残す形は作らない
-/// （fail-closed）。
-///
-/// 兄弟 Issue（制約・索引の追随は #1620）はこの関数を「拒否」から「参照の書き換え」へ
-/// 置き換える差し込み点になる。ビュー定義の追随は Issue #1621 で
-/// [`rewrite_views_for_renamed_column_in_txn`] へ分離した（本関数はビューを扱わない）。
-/// CHECK の再計算失敗は「依存あり」とする。
-fn rename_column_dependents_in_txn(
-    write_txn: &redb::WriteTransaction,
-    schema: &TableSchema,
-    table: &str,
-    column_name: &str,
-) -> std::result::Result<(), AlterCheckError> {
-    let refused = || {
-        AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
-            detail: "renaming a column referenced by a constraint, index, or view is not supported"
-                .to_string(),
-        })
-    };
-    if schema
-        .primary_key
-        .as_ref()
-        .is_some_and(|pk| pk.iter().any(|c| c == column_name))
-        || schema
-            .unique_constraints
-            .iter()
-            .any(|u| u.columns().iter().any(|c| c == column_name))
-        || schema_check_references_column(schema, column_name)
-        || schema
-            .foreign_keys
-            .iter()
-            .any(|fk| fk.columns.iter().any(|c| c == column_name))
-    {
-        return Err(refused());
-    }
-    // 親側 FK（自己参照を含む）。PK／UNIQUE 検査と重なるが多層防御として明示する。
-    let referencing = referencing_foreign_keys_in_txn(write_txn, table)?;
-    if referencing.iter().any(|(_, fk)| {
-        fk.parent_table == table && fk.parent_columns.iter().any(|c| c == column_name)
-    }) {
-        return Err(refused());
-    }
-    if indexes_reference_column_in_txn(write_txn, table, column_name)? {
-        return Err(refused());
-    }
-    Ok(())
-}
-
 /// 列改名（[`Storage::alter_table_rename_column`]）に伴うビュー定義の追随（TABLE-38 の
 /// ポインタ、Issue #1621）。`table` の列 `old` を、直接または単純形ビューの連鎖経由で
 /// 公開しているビューについて、保存本文の列参照（投影・`WHERE` 述語）を `new` へ付け替える。
@@ -953,8 +1078,7 @@ fn rename_column_dependents_in_txn(
 /// （`0A000`）で拒否する（fail-closed）。再検証できない本文・公開列の導出失敗も拒否。
 /// 追随後の本文が [`MAX_VIEW_BODY_BYTES`] を超えれば `54000`。計画をすべて確定してから
 /// 書き込むため、拒否時にビュー定義は変更されない。[`Storage::alter_table_rename_column`]
-/// から、スキーマ書き込みの前に同一 write txn で呼ばれる（`rename_column_dependents_in_txn`
-/// とは別関数にして、拒否文言と責務を分離している）。`schema` は改名前のもの。
+/// から、スキーマ書き込みの前に同一 write txn で呼ばれる。`schema` は改名前のもの。
 fn rewrite_views_for_renamed_column_in_txn(
     write_txn: &redb::WriteTransaction,
     schema: &TableSchema,
@@ -1082,32 +1206,52 @@ fn rewrite_views_for_renamed_column_in_txn(
     Ok(())
 }
 
-/// `table` の索引宣言（scalar・hnsw とも）のいずれかが列 `column_name` を含むか
-/// （[`rename_column_dependents_in_txn`] が使う読み取り専用の走査。
-/// [`retain_index_defs_in_txn`] と同じ [`MAX_INDEX_COUNT`] 打ち切り）。
-fn indexes_reference_column_in_txn(
+/// 列改名（[`Storage::alter_table_rename_column`]）が同一 write txn から呼ぶ。`table` の
+/// 索引宣言（scalar・hnsw とも）のうち列 `old` を含むものの列名を `new` へ書き換え、
+/// 1 件でも書いたら索引カタログ世代を bump する（`INDEX_CATALOG_GENERATION_TABLE` の
+/// 不変条件）。索引名・種別・照合（列と位置対応）は維持する。
+/// [`retain_index_defs_in_txn`] と同じ [`MAX_INDEX_COUNT`] 打ち切り。
+fn rename_index_def_columns_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
-    column_name: &str,
-) -> Result<bool> {
-    let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
-        Err(e) => return Err(e.into()),
+    old: &str,
+    new: &str,
+) -> Result<()> {
+    let rewritten = {
+        let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut updates: Vec<(String, Vec<u8>)> = Vec::new();
+        for (scanned, entry) in index_table.iter()?.enumerate() {
+            if scanned >= MAX_INDEX_COUNT {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                )));
+            }
+            let (key, value) = entry?;
+            let name = key.value().to_string();
+            let mut def = decode_index_def(&name, value.value())?;
+            if def.table != table || !def.columns.iter().any(|c| c == old) {
+                continue;
+            }
+            for c in &mut def.columns {
+                if c == old {
+                    *c = new.to_string();
+                }
+            }
+            updates.push((name, encode_index_def(&def)?));
+        }
+        for (name, bytes) in &updates {
+            index_table.insert(name.as_str(), bytes.as_slice())?;
+        }
+        !updates.is_empty()
     };
-    for (scanned, entry) in index_table.iter()?.enumerate() {
-        if scanned >= MAX_INDEX_COUNT {
-            return Err(CatalogError::CorruptSchema(format!(
-                "index catalog exceeds {MAX_INDEX_COUNT} entries"
-            )));
-        }
-        let (key, value) = entry?;
-        let def = decode_index_def(key.value(), value.value())?;
-        if def.table == table && def.columns.iter().any(|c| c == column_name) {
-            return Ok(true);
-        }
+    if rewritten {
+        bump_index_catalog_generation_in_txn(write_txn)?;
     }
-    Ok(false)
+    Ok(())
 }
 
 /// [`Storage::drop_table`] が同一 write txn から呼ぶ。対象テーブルの索引宣言を
@@ -1134,6 +1278,202 @@ fn delete_indexes_referencing_column_in_txn(
     retain_index_defs_in_txn(write_txn, |def| {
         def.table != table_name || !def.columns.iter().any(|c| c == column_name)
     })
+}
+
+/// 列型変換の一般変換（`AlterPlan::RewriteExpr`。TABLE-40・Issue #1636）が、依存オブジェクトを
+/// 持つ列を新しい経路で処理しないための暫定ゲート（fail-closed）。型付きの正準キー・旧型の
+/// DEFAULT／補完値・古い索引・ビューの束縛が新しい値と食い違う fail-open を避ける。
+/// 依存の再構築と解除は Issue #1637 の担当（そのとき本関数のゲートを外す）。
+///
+/// 依存あり: PK／UNIQUE／この表の FK（参照元）の構成列、他表の FK が参照先にする列、CHECK が
+/// 参照する列、索引宣言の構成列、ビューが参照する列、DEFAULT／補完値を持つ列。
+/// 呼び出し元は `CATALOG_TABLE` のハンドルを保持していない状態で呼ぶこと。
+fn column_has_alter_dependents_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    column_name: &str,
+) -> Result<bool> {
+    let Some(column) = schema.columns.iter().find(|c| c.name == column_name) else {
+        return Err(CatalogError::ColumnNotFound(column_name.to_string()));
+    };
+    if column.default_expr.is_some() || column.fill_value.is_some() {
+        return Ok(true);
+    }
+    if schema
+        .primary_key
+        .as_ref()
+        .is_some_and(|pk| pk.iter().any(|c| c == column_name))
+        || schema
+            .unique_constraints
+            .iter()
+            .any(|u| u.columns().iter().any(|c| c == column_name))
+        || schema_check_references_column(schema, column_name)
+        || schema
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.columns.iter().any(|c| c == column_name))
+    {
+        return Ok(true);
+    }
+    // 他表（自己参照を含む）の FK がこの表のこの列を参照先にしている。参照先列が未解決（空）の
+    // FK は主キーを指すため、保守的に依存ありとする。
+    if referencing_foreign_keys_in_txn(write_txn, table_name)?
+        .iter()
+        .any(|(_, fk)| {
+            fk.parent_columns.is_empty() || fk.parent_columns.iter().any(|c| c == column_name)
+        })
+    {
+        return Ok(true);
+    }
+    match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(index_table) => {
+            for (scanned, entry) in index_table.iter()?.enumerate() {
+                if scanned >= MAX_INDEX_COUNT {
+                    return Err(CatalogError::CorruptSchema(format!(
+                        "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                    )));
+                }
+                let (key, value) = entry?;
+                let def = decode_index_def(key.value(), value.value())?;
+                if def.table == table_name && def.columns.iter().any(|c| c == column_name) {
+                    return Ok(true);
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(CatalogError::from(e)),
+    }
+    match write_txn.open_table(VIEWS_TABLE) {
+        Ok(views_table) => {
+            let remaining: Vec<String> = ["id", "tenant_id", "visibility"]
+                .iter()
+                .map(|s| s.to_string())
+                .chain(
+                    schema
+                        .columns
+                        .iter()
+                        .filter(|c| c.name != column_name)
+                        .map(|c| c.name.clone()),
+                )
+                .collect();
+            if views_reference_column_in_txn(&views_table, table_name, &remaining)? {
+                return Ok(true);
+            }
+            // `SELECT *` ビューは削除後の列集合へ展開されるため上の判定では検出できない。
+            // 旧スキーマ（対象列を含む）での公開列を導出し、対象列を公開するビューも依存とする。
+            let full: Vec<String> = ["id", "tenant_id", "visibility"]
+                .iter()
+                .map(|s| s.to_string())
+                .chain(schema.columns.iter().map(|c| c.name.clone()))
+                .collect();
+            if views_expose_column_in_txn(&views_table, table_name, &full, column_name)? {
+                return Ok(true);
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(CatalogError::from(e)),
+    }
+    Ok(false)
+}
+
+/// `table` を（直接または連鎖経由で）読む単純形ビューのいずれかが、旧スキーマ
+/// （`full_columns`）で `column` を公開列として持つなら `true`（型変更ゲート用。
+/// `SELECT *` の展開を含む）。導出不能・破損は fail-closed で `true`。
+fn views_expose_column_in_txn(
+    views_table: &redb::Table<'_, &str, &[u8]>,
+    table: &str,
+    full_columns: &[String],
+    column: &str,
+) -> Result<bool> {
+    let mut defs: std::collections::HashMap<String, ViewDef> = std::collections::HashMap::new();
+    for entry in views_table.iter()? {
+        let (key, value) = entry?;
+        if defs.len() >= MAX_VIEWS {
+            return Err(CatalogError::ViewLimitExceeded(
+                "too many views".to_string(),
+            ));
+        }
+        let def = decode_view_def(value.value())?;
+        match view_body_shape(&def.body_sql) {
+            // 評価後射影形は views_reference_column_in_txn が保守的に検出済み。
+            Ok(shape) if shape.buffered => continue,
+            Ok(_) => {}
+            Err(_) => return Ok(true),
+        }
+        defs.insert(key.value().to_string(), def);
+    }
+    let mut exposed: std::collections::HashMap<String, Option<Vec<String>>> =
+        std::collections::HashMap::new();
+    let names: Vec<String> = defs.keys().cloned().collect();
+    for name in names {
+        match exposed_columns_of_view(&defs, &mut exposed, &name, table, full_columns)? {
+            ViewExposure::Broken => return Ok(true),
+            ViewExposure::Columns(cols) if cols.iter().any(|c| c == column) => {
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+/// `alter_column_type_with` の `AlterPlan::RewriteExpr` 腕の本体（TABLE-40 (1)(2)(5)・
+/// Issue #1636）。呼び出し元の write txn 内で、依存ゲート（`0A000`）→ 旧スキーマへの束縛し直し
+/// （事前判定との TOCTOU を作らない）→ 全テナント・全可視性の全行の変換と再エンコード →
+/// 変更列を含む派生索引の失効（多層防御）→ スキーマの書き戻しを行う。変換・評価エラーは
+/// 固定文言（`sql::alter_using::redact_row_conversion_error`）で返し、commit しないため副作用はゼロ。
+/// 世代の bump と commit は呼び出し元が唯一の commit 点で行う。
+#[allow(clippy::too_many_arguments)]
+fn alter_column_type_rewrite_expr_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    column_name: &str,
+    using: Option<&Expr>,
+    old_schema: &TableSchema,
+    logical_index: usize,
+    new_ty: ColumnType,
+    new_collation: Option<crate::collation::Collation>,
+) -> std::result::Result<(), AlterCheckError> {
+    if column_has_alter_dependents_in_txn(write_txn, table_name, old_schema, column_name)? {
+        return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+            detail: "ALTER COLUMN TYPE with a value conversion is not supported yet for a column \
+                     with dependent indexes, constraints, views or defaults"
+                .to_string(),
+        }));
+    }
+    let conv =
+        crate::sql::alter_using::bind_alter_conversion(using, old_schema, logical_index, &new_ty)
+            .map_err(AlterCheckError::Sql)?;
+    let mut schema = old_schema.clone();
+    {
+        let column = schema
+            .columns
+            .get_mut(logical_index)
+            .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+        column.ty = new_ty;
+        column.collation = new_collation;
+    }
+    match crate::column_rewrite::rewrite_rows_with_conversion_in_txn(
+        write_txn,
+        table_name,
+        old_schema,
+        &schema,
+        logical_index,
+        &conv,
+    )? {
+        crate::column_rewrite::ConversionOutcome::Done => {}
+        crate::column_rewrite::ConversionOutcome::Failed(e) => return Err(AlterCheckError::Sql(e)),
+    }
+    crate::key_index::drop_indexes_containing_column_in_txn(write_txn, table_name, column_name)?;
+    let encoded = encode_schema(&schema)?;
+    let mut table = write_txn
+        .open_table(CATALOG_TABLE)
+        .map_err(CatalogError::from)?;
+    table
+        .insert(table_name, encoded.as_slice())
+        .map_err(CatalogError::from)?;
+    Ok(())
 }
 
 /// カタログのテキスト形式フォーマットバージョン識別子。値の追加・変更は
@@ -1302,19 +1642,33 @@ const CATALOG_FORMAT_VERSION_V12: &str = "v12";
 /// 拒否する（前方互換は持たない）。
 const CATALOG_FORMAT_VERSION_V13: &str = "v13";
 
+/// カタログ v14（TABLE-39・TABLE-5・TABLE-16、Issue #1627）。v13 の上位集合で、
+/// 列行が 7 フィールド `name:type:param:nullable:state:default:fill` になる
+/// （`default` は INSERT 既定値 `default_expr`、`fill` は読み出し時補完値
+/// `fill_value`。どちらも [`ColumnDefault::encode_catalog_field`] の形）。
+/// `pkname:` 行は常に書き（本体が空なら明示名なし）、`uniq:`／`checks:`／`fks:` は
+/// 0 件を許す（選択理由は補完値の食い違いのみで他の宣言とは独立なため）。
+/// **生存列のどれかが `fill_value != default_expr` のスキーマだけ**がこの版で書かれ、
+/// 食い違う列が無いスキーマは従来の版（v2〜v13）のバイト列のまま（正規形の一意性。
+/// 食い違い 0 件の v14 は decode で拒否する）。墓標の `default`／`fill` は `-` 固定。
+/// v14 を知らない旧バイナリは「未知のフォーマットバージョン」として fail-closed に
+/// 拒否する（前方互換は持たない）。
+const CATALOG_FORMAT_VERSION_V14: &str = "v14";
+
 /// `FOREIGN KEY` を持ちうるカタログフォーマット版の一覧（TABLE-17・TASK-205・
 /// TABLE-22・TASK-233、Issue #907・#1069）。[`referencing_foreign_keys_in_txn`]
 /// が候補行の絞り込みに使う唯一の情報源。**P0**: 新しい FK 保持版を追加する際は
 /// 必ずここへ追記すること——見落とすと参照先側の書き込み検査
 /// （`constraint::enforce_referencing_rows_in_txn`）と `DROP TABLE` の依存検査
 /// （`2BP01`）の双方が fail-open になる（advisor 指摘・codex-review 指摘）。
-const FK_BEARING_FORMAT_VERSIONS: [&str; 6] = [
+const FK_BEARING_FORMAT_VERSIONS: [&str; 7] = [
     CATALOG_FORMAT_VERSION_V8,
     CATALOG_FORMAT_VERSION_V9,
     CATALOG_FORMAT_VERSION_V10,
     CATALOG_FORMAT_VERSION_V11,
     CATALOG_FORMAT_VERSION_V12,
     CATALOG_FORMAT_VERSION_V13,
+    CATALOG_FORMAT_VERSION_V14,
 ];
 
 /// 1 テーブルが持てる `CHECK` 制約数の上限（TABLE-16・TASK-204、Issue #906。
@@ -1529,7 +1883,7 @@ fn name_collides_with_primary_key(schema: &TableSchema, table: &str, name: &str)
 
 /// カタログ値（エンコード済みバイト列）のバイト長上限。デコード前に検証し、
 /// 無制限な文字列アロケーションを防ぐ。
-const MAX_CATALOG_VALUE_LEN: usize = 1024 * 1024;
+const MAX_CATALOG_VALUE_LEN: usize = 2 * 1024 * 1024;
 
 /// [`Storage::list_tables`] が返せるテーブル数の上限（無制限 `Vec` 確保を避ける。
 /// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
@@ -1750,6 +2104,9 @@ pub enum CatalogError {
     /// ERR-6: `42P16`）。中身はクライアント自身が指定したテーブル名のみで
     /// テナントデータを含まない。
     MultiplePrimaryKeys(String),
+    /// 主キーの構成列への `ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL`（TABLE-39 (4)、
+    /// Issue #1632。ERR-6: `42P16`）。中身はクライアント自身が指定した列名のみ。
+    ColumnInPrimaryKey(String),
     /// `ALTER TABLE ... DROP CONSTRAINT <name>` の対象名が、UNIQUE・CHECK・
     /// FOREIGN KEY いずれの制約としても存在しない（Issue #1067・#1069。
     /// ERR-6: `42704`）。
@@ -1848,6 +2205,9 @@ impl fmt::Display for CatalogError {
             CatalogError::MultiplePrimaryKeys(table) => {
                 write!(f, "multiple primary keys for table {table} are not allowed")
             }
+            CatalogError::ColumnInPrimaryKey(column) => {
+                write!(f, "column \"{column}\" is in a primary key")
+            }
             CatalogError::ConstraintNotFound(name) => {
                 write!(f, "constraint not found: {name}")
             }
@@ -1903,6 +2263,7 @@ impl std::error::Error for CatalogError {
             | CatalogError::InvalidForeignKey(_)
             | CatalogError::ConstraintAlreadyExists(_)
             | CatalogError::MultiplePrimaryKeys(_)
+            | CatalogError::ColumnInPrimaryKey(_)
             | CatalogError::ConstraintNotFound(_)
             | CatalogError::ConstraintLimitExceeded(_)
             | CatalogError::ForeignKeyViolation
@@ -1944,6 +2305,16 @@ impl From<CatalogError> for AlterCheckError {
     }
 }
 
+/// 単一の write txn 内で 1 アクションを適用した結果（Issue #1633）。`*_in_txn` 本体が返し、
+/// 単独 wrapper は `Applied` のときだけ世代 bump と commit を行う（`Unchanged` は冪等な
+/// no-op で commit しない既存契約）。複数アクション経路（`sql::ddl` の
+/// `execute_alter_table_multiple`）は全アクションが `Unchanged` のときだけ commit を省く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlterApply {
+    Applied,
+    Unchanged,
+}
+
 /// 列型変更の実行計画（`alter_column_type_with` の `decide` が返す。Issue #1560）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AlterPlan {
@@ -1957,6 +2328,11 @@ pub(crate) enum AlterPlan {
     ValidateSmallIntRange,
     /// 全テナントの既存行を再エンコードする。
     Rewrite(crate::column_rewrite::WideningKind),
+    /// `USING` 式または代入変換で全行を書き換える一般変換（TABLE-40・Issue #1636）。
+    /// 束縛は write txn 内でやり直す（[`Storage::alter_column_type_with`] の `RewriteExpr` 腕）。
+    /// 依存する索引・制約・ビュー・DEFAULT の再構築は Issue #1637 の担当のため、それらを持つ列は
+    /// `0A000` で fail-closed する（#1637 で解除）。
+    RewriteExpr,
 }
 
 /// 文字列系の列型変換（`TEXT`／`VARCHAR`／`VARCHAR(n)`／`CHAR(n)`。TABLE-19・TABLE-31・
@@ -3837,14 +4213,14 @@ impl TimeDefault {
 /// （`.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。
 pub const MAX_COLUMN_DEFAULT_LEN: usize = 1024;
 
-// `MAX_COLUMN_DEFAULT_LEN` を 16 進符号化（最大 2 倍）したうえで
-// `MAX_COLUMN_COUNT` 列ぶん連結しても、カタログ値全体の上限
+// `MAX_COLUMN_DEFAULT_LEN` を 16 進符号化（最大 2 倍）した `default` と `fill`
+// （v14。Issue #1627）の 2 フィールドを `MAX_COLUMN_COUNT` 列ぶん連結しても、カタログ値全体の上限
 // （`MAX_CATALOG_VALUE_LEN`）に十分収まることをコンパイル時に固定する
 // （プレフィックス 1 バイト・区切り文字・列名等の余地として 500,000 バイトの
 // 余裕を残す）。
 const _: () = assert!(
-    MAX_COLUMN_DEFAULT_LEN * 2 * MAX_COLUMN_COUNT + 500_000 <= MAX_CATALOG_VALUE_LEN,
-    "MAX_COLUMN_DEFAULT_LEN * 2 * MAX_COLUMN_COUNT must leave slack under MAX_CATALOG_VALUE_LEN"
+    MAX_COLUMN_DEFAULT_LEN * 2 * 2 * MAX_COLUMN_COUNT + 500_000 <= MAX_CATALOG_VALUE_LEN,
+    "MAX_COLUMN_DEFAULT_LEN * 2 fields * 2 * MAX_COLUMN_COUNT must leave slack under MAX_CATALOG_VALUE_LEN"
 );
 
 impl ColumnDefault {
@@ -4031,11 +4407,23 @@ pub struct ColumnDef {
     /// `DEFAULT <literal>` 句（TABLE-16・TASK-204、Issue #904）。`INSERT` で
     /// この列が省略された場合に補われる値。明示的な `NULL` には適用しない
     /// （TABLE-16。`sql::parser::bind_literal_for_column`／
-    /// `fill_omitted_columns` が唯一の適用点）。`ALTER TABLE ADD COLUMN` 後の既存行
-    /// の読み出し時補完（`row_codec::scan_scalar_columns_validated`）にも同じ値を
-    /// 使うため、作成後に変わらないこと（`ALTER COLUMN SET DEFAULT` を導入する場合は
-    /// 補完専用の値の分離が必要）が不変条件。
-    pub default: Option<ColumnDefault>,
+    /// `fill_omitted_columns` が唯一の適用点）。既存行の読み出し時補完には使わない
+    /// （それは [`ColumnDef::fill_value`] の責務。Issue #1627・TABLE-39 の前提として
+    /// 2 つの値を分離した。`ALTER COLUMN SET／DROP DEFAULT` は #1628 でこの値だけを変える）。
+    pub default_expr: Option<ColumnDefault>,
+    /// 読み出し時補完値（TABLE-5・Issue #1627）。`ALTER TABLE ADD COLUMN ... DEFAULT` より
+    /// 前に書かれた行（物理ペイロードが当該列を持たない行）を読むときに補う値で、
+    /// `row_codec` の読み出し経路（`decode_row`・`scan_scalar_columns_validated`・
+    /// `column_default_scalar_for_read`）と `TableSchema::materialized_default` だけが参照する。
+    ///
+    /// 不変条件: (a) `ColumnDefault::CurrentTime` を持たない（補完値は定数。例外は
+    /// `default_expr` と等しいミラー状態で、CREATE TABLE の時刻 DEFAULT 列の旧来表現）。
+    /// (b) 決まるのは `alter_table_add_column` の時点だけで、その後は ALTER COLUMN TYPE の
+    /// 変換でのみ変わる（`ALTER COLUMN SET／DROP DEFAULT` は `default_expr` だけを変える。
+    /// 例外として、時刻値関数のミラーだった補完値は SET／DROP で `None` に落ちる。Issue #1628）。
+    /// (c) 構築直後は `default_expr` と同じ値（ミラー）で、`ALTER COLUMN SET／DROP DEFAULT`
+    /// （Issue #1628）で食い違う。食い違う列を持つスキーマだけがカタログ v14 で永続化される。
+    pub fill_value: Option<ColumnDefault>,
     /// 列に明示した照合（`COLLATE "C"`／`"POSIX"`／`"und-x-icu"`／`"ja-x-icu"`。TABLE-28・
     /// Issue #1609・#2190）。`None` は「照合指定なし」で、明示した `C`／`POSIX` とは区別して
     /// 保存する。付けられるのは [`crate::collation::is_collatable`] な型だけ（encode・decode
@@ -4050,7 +4438,8 @@ impl ColumnDef {
             name: name.into(),
             ty,
             nullable,
-            default: None,
+            default_expr: None,
+            fill_value: None,
             collation: None,
         }
     }
@@ -4072,9 +4461,27 @@ impl ColumnDef {
     /// [`ColumnDef::new`] に `DEFAULT` を追加した版（TABLE-16・TASK-204、
     /// Issue #904）。`ColumnDef::new` の呼び出し元（約 1,200 箇所）を変えずに
     /// 済むよう、既定値の付与だけを別メソッドへ切り出す。
+    ///
+    /// `fill_value` も同じ値にする（ミラー。Issue #1627 の不変条件 (c)）。
     pub fn with_default(mut self, default: ColumnDefault) -> Self {
-        self.default = Some(default);
+        self.fill_value = Some(default.clone());
+        self.default_expr = Some(default);
         self
+    }
+
+    /// 読み出し時補完値だけを差し替える（Issue #1627）。`default_expr` と食い違わせる
+    /// 用途（カタログ v14 の往復検証・#1628 以降の ALTER COLUMN SET DEFAULT の前提構築）。
+    /// `ColumnDefault::CurrentTime` は `validate_schema` が拒否する。
+    pub fn with_fill_value(mut self, fill_value: Option<ColumnDefault>) -> Self {
+        self.fill_value = fill_value;
+        self
+    }
+
+    /// INSERT 既定値だけを変える内部 seam（`alter_table_set_default_expr` と
+    /// `sql::ddl` の SET／DROP DEFAULT 検証用の複製列。Issue #1628）。
+    /// `fill_value` は既存行の読み出し結果を守るため意図的に触らない。
+    pub(crate) fn set_default_expr(&mut self, default_expr: Option<ColumnDefault>) {
+        self.default_expr = default_expr;
     }
 }
 
@@ -4589,7 +4996,7 @@ impl TableSchema {
         let entries = self.bytea_defaults.0.get_or_init(|| {
             let mut out = Vec::new();
             for (i, c) in self.columns.iter().enumerate() {
-                let Some(ColumnDefault::Text(text)) = &c.default else {
+                let Some(ColumnDefault::Text(text)) = &c.fill_value else {
                     continue;
                 };
                 match &c.ty {
@@ -4633,7 +5040,7 @@ impl TableSchema {
             out
         });
         let entry = entries.iter().find(|e| e.logical_index == logical_index)?;
-        match self.columns.get(logical_index)?.default.as_ref()? {
+        match self.columns.get(logical_index)?.fill_value.as_ref()? {
             ColumnDefault::Text(current) if *current == entry.source => Some(entry),
             _ => None,
         }
@@ -4719,6 +5126,52 @@ impl TableSchema {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             bytea_defaults: MaterializedDefaultCache::default(),
+        }
+    }
+
+    /// 列改名（[`Storage::alter_table_rename_column`]。TABLE-38 のポインタ、Issue #1620）で、
+    /// 論理列名・PRIMARY KEY・UNIQUE（制約名は維持）・自表の外部キー（子側の `columns` と
+    /// 自己参照の `parent_columns`）の `old` を `new` へ置換する。CHECK は述語テキストの
+    /// 再生成が要るため呼び出し元が別途扱う（[`crate::sql::check_constraint::rename_column_in_check`]）。
+    fn rename_column_references(&mut self, old: &str, new: &str) {
+        let swap = |names: &mut Vec<String>| {
+            for n in names.iter_mut() {
+                if n == old {
+                    *n = new.to_string();
+                }
+            }
+        };
+        for column in &mut self.columns {
+            if column.name == old {
+                column.name = new.to_string();
+            }
+        }
+        if let Some(pk) = self.primary_key.as_mut() {
+            swap(pk);
+        }
+        for u in &mut self.unique_constraints {
+            swap(&mut u.columns);
+        }
+        let own = self.name.clone();
+        for fk in &mut self.foreign_keys {
+            swap(&mut fk.columns);
+            if fk.parent_table == own {
+                swap(&mut fk.parent_columns);
+            }
+        }
+    }
+
+    /// 親テーブル `parent` の列改名に追随して、自表の外部キーのうち `parent` を参照するものの
+    /// `parent_columns` を置換する（Issue #1620。子テーブル側の書き換え）。
+    fn rename_parent_column_references(&mut self, parent: &str, old: &str, new: &str) {
+        for fk in &mut self.foreign_keys {
+            if fk.parent_table == parent {
+                for n in &mut fk.parent_columns {
+                    if n == old {
+                        *n = new.to_string();
+                    }
+                }
+            }
         }
     }
 
@@ -5057,6 +5510,74 @@ fn validate_column(column: &ColumnDef) -> Result<()> {
     Ok(())
 }
 
+/// 列の `DEFAULT`（INSERT 既定値 `default_expr` と読み出し補完値 `fill_value`）が
+/// 列型に適合するかを検証する（[`validate_schema`] から 2 フィールドへ適用。Issue #1627）。
+fn validate_default_value(column: &ColumnDef, default: &ColumnDefault) -> Result<()> {
+    if !default.compatible_with(&column.ty) {
+        return Err(CatalogError::Invalid(format!(
+            "column {:?} has a DEFAULT that is not compatible with its type",
+            column.name
+        )));
+    }
+    // `VARCHAR(n)` の既定値は文字数が n 以下であること（超過した既定値は INSERT のたびに
+    // 長さ超過になるため定義時に拒否する。通常は DDL 段の `22001`〔Issue #1564〕が先に弾く最後の砦）。
+    if let (ColumnType::Varchar(Some(n)), ColumnDefault::Text(s)) = (&column.ty, default) {
+        if u32::try_from(s.chars().count()).map_or(true, |len| len > *n) {
+            return Err(CatalogError::Invalid(format!(
+                "column {:?} has a DEFAULT longer than its declared length",
+                column.name
+            )));
+        }
+    }
+    // `CHAR(n)` の既定値は n 文字へ空白詰め済みの形で保持する（保持値＝格納形。
+    // TABLE-31・Issue #1566）。詰め前の値は DDL 段が詰めてから渡す最後の砦。
+    if let (ColumnType::Bpchar(n), ColumnDefault::Text(s)) = (&column.ty, default) {
+        if !matches!(u32::try_from(s.chars().count()), Ok(len) if len == *n) {
+            return Err(CatalogError::Invalid(format!(
+                "column {:?} has a DEFAULT that is not blank-padded to its declared length",
+                column.name
+            )));
+        }
+    }
+    // JSON／JSONB の既定値は構文（JSONB は正規形も）を永続化前に検証する。
+    // カタログ decode 側が同じ検証を必須とする（`decode_schema_body`）ため、
+    // ここで拒否しないと Rust API 経由の作成が成功した後にスキーマが読み込み
+    // 不能になる（Issue #1337）。
+    if matches!(column.ty, ColumnType::Json | ColumnType::Jsonb)
+        && crate::row_codec::default_scalar(&column.ty, default).is_err()
+    {
+        return Err(CatalogError::Invalid(format!(
+            "column {:?} has a malformed JSON DEFAULT",
+            column.name
+        )));
+    }
+    // BYTEA の 16 進原文も同様に検証する（Issue #1373）。
+    if matches!(column.ty, ColumnType::Bytea)
+        && crate::row_codec::validate_default(&column.ty, default).is_err()
+    {
+        return Err(CatalogError::Invalid(format!(
+            "column {:?} has a malformed BYTEA DEFAULT",
+            column.name
+        )));
+    }
+    // 配列の `{..}` 原文も同様に検証する（Issue #1374）。ENUM 要素の配列は
+    // 呼び出し元の語彙が未解決の場合があり（スカラー ENUM の DEFAULT と同じ扱い）、
+    // ここでは照合しない。write txn 内の再検証（`create_table`・
+    // `alter_table_add_column`）と読み出し時のキャッシュ参照（失敗は拒否）で
+    // fail-closed を保つ。
+    if let ColumnType::Array(at) = &column.ty {
+        if at.enum_def().is_none()
+            && crate::row_codec::validate_default(&column.ty, default).is_err()
+        {
+            return Err(CatalogError::Invalid(format!(
+                "column {:?} has a malformed ARRAY DEFAULT",
+                column.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// スキーマ全体の検証（テーブル名・列定義・列数上限・列名重複・`VECTOR` 列数）。
 /// `create_table`・`alter_table_add_column`（追加後のスキーマ）の両方から呼ばれる。
 ///
@@ -5064,8 +5585,16 @@ fn validate_column(column: &ColumnDef) -> Result<()> {
 /// [`TableSchema::vector_dim`] が先頭列のみを見て後続列を黙殺する fail-open な
 /// 状態になり得るため、ここで拒否する（.claude/rules/security.md「不安全な設計」）。
 fn validate_schema(schema: &TableSchema) -> Result<()> {
+    validate_schema_impl(schema, true)
+}
+
+/// [`validate_schema`] の本体。`require_live` が `false` のときだけ「生存列 1 本以上」の検査を
+/// 省く。複数アクション `ALTER TABLE` の中間状態（`DROP COLUMN` 直後で `ADD COLUMN` 前）を
+/// 同一 write txn 内に限って許すための経路で、全アクション適用後に呼び出し側が
+/// `require_live = true` 相当の検証を必ず行う（Issue #1633）。
+fn validate_schema_impl(schema: &TableSchema, require_live: bool) -> Result<()> {
     validate_identifier(&schema.name)?;
-    if schema.columns.is_empty() {
+    if require_live && schema.columns.is_empty() {
         return Err(CatalogError::Invalid(
             "table must have at least one column".to_string(),
         ));
@@ -5097,68 +5626,21 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
         // ものだけを許可する（`VECTOR` は常に不可）。SQL 表層の構文検証
         // （`sql::allowlist::parse_create_table_column`）をすり抜けた場合も、
         // Rust API 直接構築の場合も、ここで fail-closed に拒否する。
-        if let Some(default) = &column.default {
-            if !default.compatible_with(&column.ty) {
-                return Err(CatalogError::Invalid(format!(
-                    "column {:?} has a DEFAULT that is not compatible with its type",
-                    column.name
-                )));
-            }
-            // `VARCHAR(n)` の既定値は文字数が n 以下であること（超過した既定値は INSERT のたびに
-            // 長さ超過になるため定義時に拒否する。通常は DDL 段の `22001`〔Issue #1564〕が先に弾く最後の砦）。
-            if let (ColumnType::Varchar(Some(n)), ColumnDefault::Text(s)) = (&column.ty, default) {
-                if u32::try_from(s.chars().count()).map_or(true, |len| len > *n) {
-                    return Err(CatalogError::Invalid(format!(
-                        "column {:?} has a DEFAULT longer than its declared length",
-                        column.name
-                    )));
-                }
-            }
-            // `CHAR(n)` の既定値は n 文字へ空白詰め済みの形で保持する（保持値＝格納形。
-            // TABLE-31・Issue #1566）。詰め前の値は DDL 段が詰めてから渡す最後の砦。
-            if let (ColumnType::Bpchar(n), ColumnDefault::Text(s)) = (&column.ty, default) {
-                if !matches!(u32::try_from(s.chars().count()), Ok(len) if len == *n) {
-                    return Err(CatalogError::Invalid(format!(
-                        "column {:?} has a DEFAULT that is not blank-padded to its declared length",
-                        column.name
-                    )));
-                }
-            }
-            // JSON／JSONB の既定値は構文（JSONB は正規形も）を永続化前に検証する。
-            // カタログ decode 側が同じ検証を必須とする（`decode_schema_body`）ため、
-            // ここで拒否しないと Rust API 経由の作成が成功した後にスキーマが読み込み
-            // 不能になる（Issue #1337）。
-            if matches!(column.ty, ColumnType::Json | ColumnType::Jsonb)
-                && crate::row_codec::default_scalar(&column.ty, default).is_err()
+        if let Some(default) = &column.default_expr {
+            validate_default_value(column, default)?;
+        }
+        if let Some(fill) = &column.fill_value {
+            validate_default_value(column, fill)?;
+            // 補完値は定数に限る（不変条件 (a)）。時刻 DEFAULT は読み出し時補完が常に
+            // 失敗するため、INSERT 既定値と等しいミラー状態（CREATE TABLE の旧来表現）
+            // 以外では拒否する。
+            if matches!(fill, ColumnDefault::CurrentTime(_))
+                && column.default_expr.as_ref() != Some(fill)
             {
                 return Err(CatalogError::Invalid(format!(
-                    "column {:?} has a malformed JSON DEFAULT",
+                    "column {:?} has a fill value that is not a constant",
                     column.name
                 )));
-            }
-            // BYTEA の 16 進原文も同様に検証する（Issue #1373）。
-            if matches!(column.ty, ColumnType::Bytea)
-                && crate::row_codec::validate_default(&column.ty, default).is_err()
-            {
-                return Err(CatalogError::Invalid(format!(
-                    "column {:?} has a malformed BYTEA DEFAULT",
-                    column.name
-                )));
-            }
-            // 配列の `{..}` 原文も同様に検証する（Issue #1374）。ENUM 要素の配列は
-            // 呼び出し元の語彙が未解決の場合があり（スカラー ENUM の DEFAULT と同じ扱い）、
-            // ここでは照合しない。write txn 内の再検証（`create_table`・
-            // `alter_table_add_column`）と読み出し時のキャッシュ参照（失敗は拒否）で
-            // fail-closed を保つ。
-            if let ColumnType::Array(at) = &column.ty {
-                if at.enum_def().is_none()
-                    && crate::row_codec::validate_default(&column.ty, default).is_err()
-                {
-                    return Err(CatalogError::Invalid(format!(
-                        "column {:?} has a malformed ARRAY DEFAULT",
-                        column.name
-                    )));
-                }
             }
         }
     }
@@ -5410,9 +5892,10 @@ fn validate_foreign_keys(schema: &TableSchema, allow_unresolved: bool) -> Result
                 "duplicate foreign key declaration".to_string(),
             ));
         }
-        // 参照アクションの宣言時検査（Issue #1076 A8）。ALTER で FK 列の DEFAULT を
-        // 後から変える経路は無く、nullability を変える `SET NOT NULL`（Issue #1631）は
-        // 変更後スキーマで本検査を再実行してから永続化するため、宣言後も恒久的に有効。
+        // 参照アクションの宣言時検査（Issue #1076 A8）。FK 列の DEFAULT を後から変える
+        // `ALTER COLUMN SET／DROP DEFAULT`（Issue #1628）と nullability を変える `SET NOT NULL`
+        // （Issue #1631）は、変更後スキーマで本検査を再実行してから永続化するため、
+        // 宣言後も恒久的に有効。
         validate_referential_action_declaration(schema, fk)?;
         // 自己参照は参照先の宣言がこのスキーマ自身にあるため、参照先の照合まで
         // 静的に検証できる（解決済みの宣言のみ。未解決は `create_table` の
@@ -5458,12 +5941,12 @@ fn validate_referential_action_declaration(schema: &TableSchema, fk: &ForeignKey
         // 主体の文が無く、評価時刻を再送で再現できないため。SQL-37・Issue #1587、設計 D9）。
         // SQL 表層は `sql::ddl` が先に `0A000` で拒否するため、ここは Rust API・decode の
         // 多層防御（fail-closed）。
-        if uses_set_default && matches!(column.default, Some(ColumnDefault::CurrentTime(_))) {
+        if uses_set_default && matches!(column.default_expr, Some(ColumnDefault::CurrentTime(_))) {
             return Err(CatalogError::InvalidForeignKey(format!(
                 "column {name} has a time function DEFAULT and cannot use the SET DEFAULT referential action"
             )));
         }
-        if uses_set_default && !column.nullable && column.default.is_none() {
+        if uses_set_default && !column.nullable && column.default_expr.is_none() {
             return Err(CatalogError::InvalidForeignKey(format!(
                 "column {name} is NOT NULL without a DEFAULT and cannot use the SET DEFAULT referential action"
             )));
@@ -6136,6 +6619,29 @@ fn encode_column_line_v5(
     ))
 }
 
+/// [`encode_column_line_v5`] の v14 版（7 フィールド。末尾に `fill`。Issue #1627）。
+/// 墓標行は `default`／`fill` とも `None`（`-`）で渡す。
+fn encode_column_line_v14(
+    name: &str,
+    type_name: &str,
+    param_field: &str,
+    nullable: bool,
+    state: char,
+    default: Option<&ColumnDefault>,
+    fill: Option<&ColumnDefault>,
+) -> Result<String> {
+    let mut line = encode_column_line_v5(name, type_name, param_field, nullable, state, default)?;
+    // 末尾の改行を fill フィールドの後ろへ移す。
+    line.pop();
+    line.push(':');
+    match fill {
+        None => line.push('-'),
+        Some(d) => line.push_str(&d.encode_catalog_field()?),
+    }
+    line.push('\n');
+    Ok(line)
+}
+
 /// `schema` のいずれかの `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が列
 /// `column_name` を参照しているか（`ALTER TABLE` の依存オブジェクト検査用）。
 ///
@@ -6771,6 +7277,12 @@ fn parse_foreign_key_section_v12<'a>(
 /// v2／v3（墓標の有無で選択）のまま、バイト列を変えない（既存ゴールデン
 /// テストへ影響しない）。
 fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
+    encode_schema_impl(schema, true)
+}
+
+/// [`encode_schema`] の本体。`require_live = false` は複数アクション `ALTER TABLE` の
+/// 中間状態専用（[`validate_schema_impl`] 参照）。
+fn encode_schema_impl(schema: &TableSchema, require_live: bool) -> Result<Vec<u8>> {
     // UNIQUE 制約の名前未確定（空名）分を確定する（設計 D2・Issue #1067）。
     // `encode_schema` は「スキーマ検証を集約する唯一の choke point」（本関数
     // ドキュメント参照）であるため、名前確定もここへ集約し、`Storage::
@@ -6784,8 +7296,17 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     // `assign_foreign_key_constraint_names` ドキュメント参照）。
     let schema = assign_foreign_key_constraint_names(schema);
     let schema = &schema;
-    validate_schema(schema)?;
-    let has_default = schema.columns.iter().any(|c| c.default.is_some());
+    validate_schema_impl(schema, require_live)?;
+    let has_default = schema
+        .columns
+        .iter()
+        .any(|c| c.default_expr.is_some() || c.fill_value.is_some());
+    // v14 選択条件（Issue #1627）: 補完値が INSERT 既定値と食い違う生存列を 1 つでも
+    // 持つスキーマのみ（最優先）。食い違いが無ければ従来の版のバイト列を変えない。
+    let has_fill_divergence = schema
+        .columns
+        .iter()
+        .any(|c| c.fill_value != c.default_expr);
     let has_unique = !schema.unique_constraints.is_empty();
     let has_check = !schema.checks.is_empty();
     let has_fk = !schema.foreign_keys.is_empty();
@@ -6855,7 +7376,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         .primary_key_name
         .as_deref()
         .filter(|n| *n != primary_key_constraint_name(&schema.name));
-    if has_named_fk || pk_name_explicit.is_some() {
+    if has_fill_divergence || has_named_fk || pk_name_explicit.is_some() {
         // カタログ v12（設計 F4。TABLE-22・TASK-233、Issue #1069）: v11 の
         // 上位集合で、`uniq:`／`checks:` セクションは 0 件を許し（この枝へ来る
         // 判断材料は FK の実名のみで UNIQUE・CHECK の有無とは独立なため）、
@@ -6864,7 +7385,9 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         // v13（Issue #1364）は v12 と同じ本体に `pk:` 行の直後の `pkname:` 行を
         // 足しただけの上位集合で、同じ出力経路を共有する（UNIQUE・FK の名前は
         // 常に明示形で書く）。
-        out.push_str(if pk_name_explicit.is_some() {
+        out.push_str(if has_fill_divergence {
+            CATALOG_FORMAT_VERSION_V14
+        } else if pk_name_explicit.is_some() {
             CATALOG_FORMAT_VERSION_V13
         } else {
             CATALOG_FORMAT_VERSION_V12
@@ -6879,30 +7402,58 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         out.push_str(&format!("pk:{pk_field}\n"));
         if let Some(pk_name) = pk_name_explicit {
             out.push_str(&format!("pkname:{pk_name}\n"));
+        } else if has_fill_divergence {
+            // v14 は `pkname:` 行を常に書く（空＝明示名なし。`pkname` という列名の列行と
+            // 区別できなくなるため任意行にしない）。
+            out.push_str("pkname:\n");
         }
         for slot in schema.physical_slots() {
             match slot {
                 PhysicalSlot::Live(_, column) => {
                     let (type_name, param_field) = column.catalog_fields()?;
-                    out.push_str(&encode_column_line_v5(
-                        &column.name,
-                        type_name,
-                        &param_field,
-                        column.nullable,
-                        'L',
-                        column.default.as_ref(),
-                    )?);
+                    if has_fill_divergence {
+                        out.push_str(&encode_column_line_v14(
+                            &column.name,
+                            type_name,
+                            &param_field,
+                            column.nullable,
+                            'L',
+                            column.default_expr.as_ref(),
+                            column.fill_value.as_ref(),
+                        )?);
+                    } else {
+                        out.push_str(&encode_column_line_v5(
+                            &column.name,
+                            type_name,
+                            &param_field,
+                            column.nullable,
+                            'L',
+                            column.default_expr.as_ref(),
+                        )?);
+                    }
                 }
                 PhysicalSlot::Dropped(dropped) => {
                     let (type_name, param_field) = dropped.ty().catalog_fields();
-                    out.push_str(&encode_column_line_v5(
-                        dropped.name(),
-                        type_name,
-                        &param_field,
-                        true,
-                        'D',
-                        None,
-                    )?);
+                    if has_fill_divergence {
+                        out.push_str(&encode_column_line_v14(
+                            dropped.name(),
+                            type_name,
+                            &param_field,
+                            true,
+                            'D',
+                            None,
+                            None,
+                        )?);
+                    } else {
+                        out.push_str(&encode_column_line_v5(
+                            dropped.name(),
+                            type_name,
+                            &param_field,
+                            true,
+                            'D',
+                            None,
+                        )?);
+                    }
                 }
             }
         }
@@ -6951,7 +7502,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
                         &param_field,
                         column.nullable,
                         'L',
-                        column.default.as_ref(),
+                        column.default_expr.as_ref(),
                     )?);
                 }
                 PhysicalSlot::Dropped(dropped) => {
@@ -7028,7 +7579,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
                         &param_field,
                         column.nullable,
                         'L',
-                        column.default.as_ref(),
+                        column.default_expr.as_ref(),
                     )?);
                 }
                 PhysicalSlot::Dropped(dropped) => {
@@ -7183,7 +7734,18 @@ fn decode_schema_with_resolver(
     bytes: &[u8],
     resolve_enum: &mut dyn FnMut(&str) -> Result<Arc<EnumTypeDef>>,
 ) -> Result<TableSchema> {
-    decode_schema_body(table_name, bytes, resolve_enum).map_err(|e| match e {
+    decode_schema_with_resolver_impl(table_name, bytes, resolve_enum, true)
+}
+
+/// [`decode_schema_with_resolver`] の本体。`require_live = false` は複数アクション
+/// `ALTER TABLE` の中間状態（生存列 0 本）を読み戻す経路専用（Issue #1633）。
+fn decode_schema_with_resolver_impl(
+    table_name: &str,
+    bytes: &[u8],
+    resolve_enum: &mut dyn FnMut(&str) -> Result<Arc<EnumTypeDef>>,
+    require_live: bool,
+) -> Result<TableSchema> {
+    decode_schema_body(table_name, bytes, resolve_enum, require_live).map_err(|e| match e {
         // `FOREIGN KEY` の自己参照照合（`validate_foreign_keys`）が返す
         // `InvalidForeignKey` も、格納済み値の破損として同じく読み替える
         // （TABLE-17・TASK-205、Issue #907）。
@@ -7194,10 +7756,58 @@ fn decode_schema_with_resolver(
     })
 }
 
+/// カタログ列行の `default`／`fill` フィールド 1 つをデコードし、型別の完全検証を行う
+/// （`decode_schema_body` から INSERT 既定値と読み出し補完値の両方へ適用。Issue #1627）。
+/// 不正なものはスキーマを読み込み不能にする（fail-closed）。`column` は `ty` と `name`
+/// だけを参照する。
+fn decode_column_default_checked(column: &ColumnDef, field: &str) -> Result<Option<ColumnDefault>> {
+    let decoded = ColumnDefault::decode_catalog_field(field)?;
+    let Some(default) = &decoded else {
+        return Ok(decoded);
+    };
+    // JSON／JSONB の既定値は読み出し時補完が再検証を省く
+    // （`row_codec::default_scalar_for_read`。Issue #1337）ため、
+    // 構文・JSONB 正規形の完全検証をここ（デコード時）で済ませ、
+    // 破損カタログ値を読み込み不能にする（fail-closed）。
+    if matches!(column.ty, ColumnType::Json | ColumnType::Jsonb) {
+        crate::row_codec::default_scalar(&column.ty, default).map_err(|_| {
+            CatalogError::Invalid(format!(
+                "column {:?} has a malformed JSON DEFAULT",
+                column.name
+            ))
+        })?;
+    }
+    // BYTEA の既定値も読み出し時にキャッシュへデコードするため、
+    // 破損した 16 進はここで読み込み不能にする（fail-closed。Issue #1373）。
+    if matches!(column.ty, ColumnType::Bytea) {
+        crate::row_codec::validate_default(&column.ty, default).map_err(|_| {
+            CatalogError::Invalid(format!(
+                "column {:?} has a malformed BYTEA DEFAULT",
+                column.name
+            ))
+        })?;
+    }
+    // 配列の既定値も読み出し時にキャッシュへ実体化するため、破損した
+    // `{..}` 原文はここで読み込み不能にする（fail-closed。Issue #1374）。
+    // ENUM 要素は `validate_schema` と同じ理由で照合しない。
+    if let ColumnType::Array(at) = &column.ty {
+        if at.enum_def().is_none() {
+            crate::row_codec::validate_default(&column.ty, default).map_err(|_| {
+                CatalogError::Invalid(format!(
+                    "column {:?} has a malformed ARRAY DEFAULT",
+                    column.name
+                ))
+            })?;
+        }
+    }
+    Ok(decoded)
+}
+
 fn decode_schema_body(
     table_name: &str,
     bytes: &[u8],
     resolve_enum: &mut dyn FnMut(&str) -> Result<Arc<EnumTypeDef>>,
+    require_live: bool,
 ) -> Result<TableSchema> {
     if bytes.len() > MAX_CATALOG_VALUE_LEN {
         return Err(CatalogError::Invalid(format!(
@@ -7236,6 +7846,7 @@ fn decode_schema_body(
         V11,
         V12,
         V13,
+        V14,
     }
     let format_version = match version_line {
         CATALOG_FORMAT_VERSION_LINE => FormatVersion::V2,
@@ -7250,6 +7861,7 @@ fn decode_schema_body(
         CATALOG_FORMAT_VERSION_V11 => FormatVersion::V11,
         CATALOG_FORMAT_VERSION_V12 => FormatVersion::V12,
         CATALOG_FORMAT_VERSION_V13 => FormatVersion::V13,
+        CATALOG_FORMAT_VERSION_V14 => FormatVersion::V14,
         other => {
             return Err(CatalogError::Invalid(format!(
                 "unknown catalog format version: {other:?}"
@@ -7276,6 +7888,7 @@ fn decode_schema_body(
             | FormatVersion::V11
             | FormatVersion::V12
             | FormatVersion::V13
+            | FormatVersion::V14
     );
     // `pk:` 行を持つのは v4〜v13（v4 は非空必須、v5〜v12 は空を「主キー
     // なし」として許容する）。
@@ -7291,6 +7904,7 @@ fn decode_schema_body(
             | FormatVersion::V11
             | FormatVersion::V12
             | FormatVersion::V13
+            | FormatVersion::V14
     );
 
     let cols_line = lines.next().ok_or_else(|| {
@@ -7350,14 +7964,19 @@ fn decode_schema_body(
         None
     };
     // v13 専用: `pk:` 行の直後の `pkname:` 行（Issue #1364）。
-    let primary_key_name: Option<String> = if format_version == FormatVersion::V13 {
-        Some(
-            parse_primary_key_name_line(&mut lines, primary_key.as_deref(), Some(table_name))
-                .map_err(CatalogError::Invalid)?,
-        )
-    } else {
-        None
-    };
+    // v14（Issue #1627）は `pkname:` を常に持ち、空本体を許す。
+    let primary_key_name: Option<String> =
+        if matches!(format_version, FormatVersion::V13 | FormatVersion::V14) {
+            parse_primary_key_name_line(
+                &mut lines,
+                primary_key.as_deref(),
+                Some(table_name),
+                format_version == FormatVersion::V14,
+            )
+            .map_err(CatalogError::Invalid)?
+        } else {
+            None
+        };
 
     // 残り行を、宣言スロット数（slot_count。上で MAX_COLUMN_COUNT 以下と検証済み）を
     // 超えない範囲でのみ構築する。旧実装の `lines.collect()` は残り行数が
@@ -7411,6 +8030,15 @@ fn decode_schema_body(
             } else {
                 None
             };
+        // v14（Issue #1627）は 7 番目に読み出し時補完値 `fill` を必須で持つ。
+        let fill_field =
+            if format_version == FormatVersion::V14 {
+                Some(fields.next().ok_or_else(|| {
+                    CatalogError::Invalid(format!("malformed column line: {line:?}"))
+                })?)
+            } else {
+                None
+            };
         if fields.next().is_some() {
             return Err(CatalogError::Invalid(format!(
                 "malformed column line: {line:?}"
@@ -7443,52 +8071,23 @@ fn decode_schema_body(
                     // decode 側は「fail-closed（不正な default はスキーマ自体を
                     // 読み込み不能にする）」方針。`ColumnDefault::compatible_with`
                     // による型整合は後続の `validate_schema` が担う。
-                    column.default = ColumnDefault::decode_catalog_field(field)?;
-                    // JSON／JSONB の既定値は読み出し時補完が再検証を省く
-                    // （`row_codec::default_scalar_for_read`。Issue #1337）ため、
-                    // 構文・JSONB 正規形の完全検証をここ（デコード時）で済ませ、
-                    // 破損カタログ値を読み込み不能にする（fail-closed）。
-                    if matches!(column.ty, ColumnType::Json | ColumnType::Jsonb) {
-                        if let Some(default) = &column.default {
-                            crate::row_codec::default_scalar(&column.ty, default).map_err(
-                                |_| {
-                                    CatalogError::Invalid(format!(
-                                        "column {:?} has a malformed JSON DEFAULT",
-                                        column.name
-                                    ))
-                                },
-                            )?;
-                        }
+                    column.default_expr = decode_column_default_checked(&column, field)?;
+                    // v2〜v13 は補完値と INSERT 既定値が常に同じ（ミラー。Issue #1627）。
+                    column.fill_value = column.default_expr.clone();
+                }
+                if let Some(field) = fill_field {
+                    // v14 は補完値を別フィールドから読む。時刻 DEFAULT の補完値は
+                    // INSERT 既定値と等しいミラー状態以外では拒否する（不変条件 (a)）。
+                    let fill = decode_column_default_checked(&column, field)?;
+                    if matches!(fill, Some(ColumnDefault::CurrentTime(_)))
+                        && fill != column.default_expr
+                    {
+                        return Err(CatalogError::Invalid(format!(
+                            "column {:?} has a fill value that is not a constant",
+                            column.name
+                        )));
                     }
-                    // BYTEA の既定値も読み出し時にキャッシュへデコードするため、
-                    // 破損した 16 進はここで読み込み不能にする（fail-closed。Issue #1373）。
-                    if matches!(column.ty, ColumnType::Bytea) {
-                        if let Some(default) = &column.default {
-                            crate::row_codec::validate_default(&column.ty, default).map_err(
-                                |_| {
-                                    CatalogError::Invalid(format!(
-                                        "column {:?} has a malformed BYTEA DEFAULT",
-                                        column.name
-                                    ))
-                                },
-                            )?;
-                        }
-                    }
-                    // 配列の既定値も読み出し時にキャッシュへ実体化するため、破損した
-                    // `{..}` 原文はここで読み込み不能にする（fail-closed。Issue #1374）。
-                    // ENUM 要素は `validate_schema` と同じ理由で照合しない。
-                    if let ColumnType::Array(at) = &column.ty {
-                        if let (None, Some(default)) = (at.enum_def(), &column.default) {
-                            crate::row_codec::validate_default(&column.ty, default).map_err(
-                                |_| {
-                                    CatalogError::Invalid(format!(
-                                        "column {:?} has a malformed ARRAY DEFAULT",
-                                        column.name
-                                    ))
-                                },
-                            )?;
-                        }
-                    }
+                    column.fill_value = fill;
                 }
                 columns.push(column);
             }
@@ -7501,6 +8100,11 @@ fn decode_schema_body(
                             "dropped column {name:?} must not declare a DEFAULT"
                         )));
                     }
+                }
+                if fill_field.is_some_and(|f| f != "-") {
+                    return Err(CatalogError::Invalid(format!(
+                        "dropped column {name:?} must not declare a fill value"
+                    )));
                 }
                 // 墓標は照合を持たない（encode 側は合成しない。TABLE-28・Issue #1609）。
                 if collation.is_some() {
@@ -7553,9 +8157,19 @@ fn decode_schema_body(
     // v5 なのに DEFAULT 0 件は形式の一意性に反する（同一スキーマが v2／v3／v4
     // と v5 の 2 通りにエンコードされ得る状態を許さない。TABLE-16・TASK-204、
     // Issue #904。TABLE-19 D2 と同じ設計判断）。
-    if format_version == FormatVersion::V5 && !columns.iter().any(|c| c.default.is_some()) {
+    if format_version == FormatVersion::V5 && !columns.iter().any(|c| c.default_expr.is_some()) {
         return Err(CatalogError::Invalid(
             "v5 catalog format requires at least one column with a DEFAULT".to_string(),
+        ));
+    }
+    // v14 なのに補完値が INSERT 既定値と食い違う列が 0 件は形式の一意性に反する
+    // （食い違いが無ければ従来の版で書く。Issue #1627。v3／v5 と同じ設計判断）。
+    if format_version == FormatVersion::V14
+        && !columns.iter().any(|c| c.fill_value != c.default_expr)
+    {
+        return Err(CatalogError::Invalid(
+            "v14 catalog format requires at least one column whose fill value differs from its DEFAULT"
+                .to_string(),
         ));
     }
 
@@ -7587,11 +8201,13 @@ fn decode_schema_body(
             .collect(),
         // v12（設計 F4・Issue #1069）は名前付き FK の有無のみで選ばれる形式で
         // あり UNIQUE の有無とは独立なため、0 件を許容する（`allow_empty = true`）。
-        FormatVersion::V12 | FormatVersion::V13 => parse_unique_section(&mut lines, true, true)
-            .map_err(CatalogError::Invalid)?
-            .into_iter()
-            .map(|(name, cols)| UniqueConstraint::with_name(name.unwrap_or_default(), cols))
-            .collect(),
+        FormatVersion::V12 | FormatVersion::V13 | FormatVersion::V14 => {
+            parse_unique_section(&mut lines, true, true)
+                .map_err(CatalogError::Invalid)?
+                .into_iter()
+                .map(|(name, cols)| UniqueConstraint::with_name(name.unwrap_or_default(), cols))
+                .collect()
+        }
         _ => Vec::new(),
     };
     // v7 専用の `checks:` セクション（TABLE-16・TASK-204、Issue #906）。構造は
@@ -7604,7 +8220,8 @@ fn decode_schema_body(
         | FormatVersion::V10
         | FormatVersion::V11
         | FormatVersion::V12
-        | FormatVersion::V13 => {
+        | FormatVersion::V13
+        | FormatVersion::V14 => {
             parse_check_section(&mut lines, format_version != FormatVersion::V7)
                 .map_err(CatalogError::Invalid)?
         }
@@ -7634,7 +8251,7 @@ fn decode_schema_body(
         FormatVersion::V12 => {
             parse_foreign_key_section_v12(&mut lines, false).map_err(CatalogError::Invalid)?
         }
-        FormatVersion::V13 => {
+        FormatVersion::V13 | FormatVersion::V14 => {
             parse_foreign_key_section_v12(&mut lines, true).map_err(CatalogError::Invalid)?
         }
         _ => Vec::new(),
@@ -7669,7 +8286,11 @@ fn decode_schema_body(
     // 呼んでも安全だが、意図を明示するため分岐する）。
     let schema = if matches!(
         format_version,
-        FormatVersion::V10 | FormatVersion::V11 | FormatVersion::V12 | FormatVersion::V13
+        FormatVersion::V10
+            | FormatVersion::V11
+            | FormatVersion::V12
+            | FormatVersion::V13
+            | FormatVersion::V14
     ) {
         schema
     } else {
@@ -7679,7 +8300,10 @@ fn decode_schema_body(
     // F3・Issue #1069）。v12 はすでに実名を持つため素通しする
     // （`assign_foreign_key_constraint_names` は空名の制約にのみ作用するため
     // 呼んでも安全だが、意図を明示するため分岐する）。
-    let schema = if matches!(format_version, FormatVersion::V12 | FormatVersion::V13) {
+    let schema = if matches!(
+        format_version,
+        FormatVersion::V12 | FormatVersion::V13 | FormatVersion::V14
+    ) {
         schema
     } else {
         assign_foreign_key_constraint_names(schema)
@@ -7687,7 +8311,7 @@ fn decode_schema_body(
     // デコード結果を再度検証する（列数上限・列名重複・識別子・墓標の不変条件）。
     // 手書きの不正データがフィールドごとの検証をすり抜けても、スキーマ全体の
     // 不変条件はここで担保する。
-    validate_schema(&schema)?;
+    validate_schema_impl(&schema, require_live)?;
     Ok(schema)
 }
 
@@ -7701,6 +8325,8 @@ type ParsedUniqueConstraints = Vec<(Option<String>, Vec<String>)>;
 /// [`catalog_value_references_enum_type`] の両方が使い、fail-closed 判定を
 /// 1 か所に揃える（[`parse_unique_section`] と同じ理由）。
 ///
+/// v14（Issue #1627）は `allow_empty = true` で空の本体を `None`（明示名なし）として受ける。
+///
 /// 検証項目: 行の存在・`pkname:` 接頭辞・識別子として妥当（長さ上限を含む）・
 /// 主キー宣言（`pk:` 行が非空）を伴うこと・導出名 `<table>_pkey` と異なること
 /// （導出名は無名と同じ正規形で書くため、v13 には現れない）。UNIQUE・CHECK・FK
@@ -7709,13 +8335,18 @@ fn parse_primary_key_name_line<'a>(
     lines: &mut impl Iterator<Item = &'a str>,
     primary_key: Option<&[String]>,
     table_name: Option<&str>,
-) -> std::result::Result<String, String> {
+    allow_empty: bool,
+) -> std::result::Result<Option<String>, String> {
     let line = lines
         .next()
         .ok_or_else(|| "catalog value truncated: missing pkname line".to_string())?;
     let name = line
         .strip_prefix("pkname:")
         .ok_or_else(|| "malformed pkname line".to_string())?;
+    // v14（Issue #1627）は `pkname:` 行を常に書き、空は「明示名なし」を表す。
+    if name.is_empty() && allow_empty {
+        return Ok(None);
+    }
     if name.is_empty() || name.len() > MAX_IDENTIFIER_LEN {
         return Err("malformed pkname line".to_string());
     }
@@ -7726,7 +8357,7 @@ fn parse_primary_key_name_line<'a>(
     if table_name.is_some_and(|t| name == primary_key_constraint_name(t)) {
         return Err("pkname must differ from the derived primary key name".to_string());
     }
-    Ok(name.to_string())
+    Ok(Some(name.to_string()))
 }
 
 /// カタログ v6 の `uniq:` セクション（`uniq:<n>` 行と `n` 個の
@@ -8171,13 +8802,15 @@ impl Storage {
                 if let ColumnType::Array(array_ty) = &column.ty {
                     if let Some(def) = array_ty.enum_def() {
                         let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
-                        if column.default.is_some() {
+                        if column.default_expr.is_some() || column.fill_value.is_some() {
                             let mut checked = column.clone();
                             checked.ty = ColumnType::Array(
                                 ArrayType::new_enum(registered, array_ty.max_len())?
                                     .with_ndims(array_ty.ndims())?,
                             );
-                            if crate::row_codec::validate_column_default(&checked).is_err() {
+                            if crate::row_codec::validate_column_default(&checked).is_err()
+                                || crate::row_codec::validate_column_fill_value(&checked).is_err()
+                            {
                                 return Err(CatalogError::Invalid(
                                     "column has an ARRAY DEFAULT that is not valid for its \
                                      element type"
@@ -8189,10 +8822,12 @@ impl Storage {
                 }
                 if let ColumnType::Enum(def) = &column.ty {
                     let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
-                    if column.default.is_some() {
+                    if column.default_expr.is_some() || column.fill_value.is_some() {
                         let mut checked = column.clone();
                         checked.ty = ColumnType::Enum(registered);
-                        if crate::row_codec::validate_column_default(&checked).is_err() {
+                        if crate::row_codec::validate_column_default(&checked).is_err()
+                            || crate::row_codec::validate_column_fill_value(&checked).is_err()
+                        {
                             return Err(CatalogError::Invalid(
                                 "column has a DEFAULT that is not a registered ENUM label"
                                     .to_string(),
@@ -8370,8 +9005,9 @@ impl Storage {
     ///   [`CatalogError::Invalid`] で拒否する（TABLE-16。行ストアは参照しない）。
     ///   行の有無で成否を変えると、DDL 主体が他テナントの行の存在を判別できて
     ///   しまう（テナント境界 P0）ため、判定を行データに依存させない
-    /// - 列の `DEFAULT` は作成後に変わらない前提（`ALTER COLUMN SET DEFAULT` は
-    ///   存在しない）。将来導入する場合は補完専用の値を分離する必要がある
+    /// - 追加時に決めた補完値（`fill_value`）は `ALTER COLUMN SET／DROP DEFAULT`
+    ///   （[`Self::alter_table_set_default_expr`]、Issue #1628）でも変わらない
+    ///   （変わるのは INSERT 既定値 `default_expr` だけ）
     ///
     /// 対象テーブル不存在・列名重複も `Err`。
     pub fn alter_table_add_column(&self, table_name: &str, column: ColumnDef) -> Result<()> {
@@ -8387,21 +9023,79 @@ impl Storage {
     pub fn alter_table_add_column_with_limit(
         &self,
         table_name: &str,
-        mut column: ColumnDef,
+        column: ColumnDef,
         max_columns: usize,
     ) -> Result<()> {
+        let max_columns = Self::prevalidate_add_column(table_name, &column, max_columns)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Self::alter_table_add_column_in_txn(&write_txn, table_name, column, max_columns, false)?;
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// 複数の ALTER アクションを単一の write txn で適用する共通入口（Issue #1633・TABLE-39 (5)
+    /// のポインタ）。`f` が txn 内で各アクションの `*_in_txn` 本体を順に呼ぶ。`f` が `Err` なら
+    /// txn は commit されず破棄され、何も適用されない。`f` が返す `bool` は「いずれかのアクションが
+    /// カタログを変更した」で、`false`（全アクションが冪等な no-op）なら commit も世代 bump も
+    /// 行わない。世代 bump は commit の直前に 1 回だけ行う（`USING PLAN` の世代照合の失効契約）。
+    pub(crate) fn alter_table_in_single_txn<T>(
+        &self,
+        table_name: &str,
+        f: impl FnOnce(&redb::WriteTransaction) -> std::result::Result<(T, bool), AlterCheckError>,
+    ) -> std::result::Result<T, AlterCheckError> {
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let (out, changed) = f(&write_txn)?;
+        if !changed {
+            return Ok(out);
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(out)
+    }
+
+    /// 列単位の ALTER（DROP COLUMN／SET・DROP NOT NULL／SET・DROP DEFAULT）共通の txn 前検査
+    /// （識別子・保護列名。Issue #1633 で複数アクション経路と共有するため切り出し）。
+    pub(crate) fn validate_alter_column_target(table_name: &str, column_name: &str) -> Result<()> {
+        validate_identifier(table_name)?;
+        validate_identifier(column_name)?;
+        if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
+            return Err(CatalogError::ProtectedColumn(column_name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// [`Self::alter_table_add_column_with_limit`] の txn 開始前検査（カタログ・行に依存しない
+    /// 判定のみ）。複数アクション経路（Issue #1633）も同じ検査を通す。有効列数上限を返す。
+    pub(crate) fn prevalidate_add_column(
+        table_name: &str,
+        column: &ColumnDef,
+        max_columns: usize,
+    ) -> Result<usize> {
         let max_columns = max_columns.min(MAX_COLUMN_COUNT);
         validate_identifier(table_name)?;
-        validate_column(&column)?;
+        validate_column(column)?;
         // 時刻値関数の DEFAULT は既存行の補完値を固定できず、読み出し時補完が常に失敗して
         // テーブルを読めなくするため、Rust API 直接呼び出しでも拒否する（多層防御。SQL 表層は
         // `sql::allowlist` が `0A000` で先に拒否する。SQL-37・Issue #1587、設計 D10）。
-        if matches!(column.default, Some(ColumnDefault::CurrentTime(_))) {
+        if matches!(column.default_expr, Some(ColumnDefault::CurrentTime(_)))
+            || matches!(column.fill_value, Some(ColumnDefault::CurrentTime(_)))
+        {
             return Err(CatalogError::Invalid(
                 "time function DEFAULT is not supported in ALTER TABLE ADD COLUMN".to_string(),
             ));
         }
-        if crate::row_codec::validate_column_default(&column).is_err() {
+        // 補完値を決めるのはこの ADD COLUMN の時点だけ（Issue #1627 不変条件 (b)）。
+        // この呼び出しでは INSERT 既定値と同じ値のみ受け付ける（食い違いは追加後の
+        // `ALTER COLUMN SET／DROP DEFAULT`〔Issue #1628〕で生じる）。
+        if column.fill_value != column.default_expr {
+            return Err(CatalogError::Invalid(
+                "column added via ALTER TABLE ADD COLUMN must have a fill value equal to its DEFAULT"
+                    .to_string(),
+            ));
+        }
+        if crate::row_codec::validate_column_default(column).is_err()
+            || crate::row_codec::validate_column_fill_value(column).is_err()
+        {
             return Err(CatalogError::Invalid(
                 "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT".to_string(),
             ));
@@ -8410,13 +9104,26 @@ impl Storage {
         // 関係なく拒否する（fail-closed）。行ストア（全テナント）を調べて成否を
         // 変えると、他テナントの行の存在が DDL 主体へ漏れる（テナント境界 P0）。
         // 判定はカタログ・行に依存しないためここ（txn 開始前）で行う。
-        if !column.nullable && column.default.is_none() {
+        if !column.nullable && column.default_expr.is_none() {
             return Err(CatalogError::Invalid(
                 "NOT NULL column added via ALTER TABLE ADD COLUMN requires a DEFAULT".to_string(),
             ));
         }
-        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Ok(max_columns)
+    }
 
+    /// [`Self::alter_table_add_column_with_limit`] の write txn 内本体（begin・世代 bump・commit
+    /// を含まない。Issue #1633）。単独 wrapper と、複数アクションを単一 txn で適用する
+    /// `sql::ddl::execute_alter_table_multiple` の双方から呼ばれる。txn 前検査
+    /// （[`Self::prevalidate_add_column`]）は呼び出し側の責務。列名重複は
+    /// [`CatalogError::ColumnAlreadyExists`]、列数上限超過は [`CatalogError::TooManyColumns`]。
+    pub(crate) fn alter_table_add_column_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        mut column: ColumnDef,
+        max_columns: usize,
+        allow_empty_before: bool,
+    ) -> Result<()> {
         {
             // 呼び出し元が渡した `ColumnType::Enum` の `Arc<EnumTypeDef>` は信頼せず、
             // この write txn から見えるカタログ登録済みの定義で必ず置き換える
@@ -8424,13 +9131,15 @@ impl Storage {
             // `<enum>[]` 列も同様に登録済みの定義（語彙）へ置き換える（Issue #1357）。
             if let ColumnType::Array(array_ty) = &column.ty {
                 if let Some(def) = array_ty.enum_def() {
-                    let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
+                    let registered = get_enum_type_in_write_txn(write_txn, def.name())?;
                     column.ty = ColumnType::Array(
                         ArrayType::new_enum(registered, array_ty.max_len())?
                             .with_ndims(array_ty.ndims())?,
                     );
                     // 登録済みの語彙で DEFAULT を再検証する（Issue #1374）。
-                    if crate::row_codec::validate_column_default(&column).is_err() {
+                    if crate::row_codec::validate_column_default(&column).is_err()
+                        || crate::row_codec::validate_column_fill_value(&column).is_err()
+                    {
                         return Err(CatalogError::Invalid(
                             "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT"
                                 .to_string(),
@@ -8439,12 +9148,14 @@ impl Storage {
                 }
             }
             if let ColumnType::Enum(def) = &column.ty {
-                column.ty = ColumnType::Enum(get_enum_type_in_write_txn(&write_txn, def.name())?);
+                column.ty = ColumnType::Enum(get_enum_type_in_write_txn(write_txn, def.name())?);
                 // txn 前の検査は呼び出し元の `Arc` の語彙で行っているため、登録済みの
                 // 定義へ置き換えた後で DEFAULT を再検証する。省略すると未登録ラベルが
                 // 既定値として永続化され、既存行の読み出し時補完が常に失敗する
                 // （Issue #1282）。
-                if crate::row_codec::validate_column_default(&column).is_err() {
+                if crate::row_codec::validate_column_default(&column).is_err()
+                    || crate::row_codec::validate_column_fill_value(&column).is_err()
+                {
                     return Err(CatalogError::Invalid(
                         "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT"
                             .to_string(),
@@ -8458,8 +9169,13 @@ impl Storage {
                     .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
                 guard.value().to_vec()
             };
-            let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
-            let mut schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
+            let mut resolve = |name: &str| get_enum_type_in_write_txn(write_txn, name);
+            let mut schema = decode_schema_with_resolver_impl(
+                table_name,
+                &existing,
+                &mut resolve,
+                !allow_empty_before,
+            )?;
             if schema.columns.iter().any(|c| c.name == column.name) {
                 return Err(CatalogError::ColumnAlreadyExists(column.name.clone()));
             }
@@ -8477,8 +9193,7 @@ impl Storage {
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
         }
-        bump_table_generation_in_txn(&write_txn, table_name)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        Ok(())
     }
 
     /// 既存列を削除する（`ALTER TABLE ... DROP COLUMN`。TABLE-19・TASK-203、
@@ -8507,6 +9222,43 @@ impl Storage {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()));
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Self::alter_table_drop_column_in_txn(&write_txn, table_name, column_name, false)?;
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// 複数アクション `ALTER TABLE` の最後に呼ぶ検証。txn 内の現在のスキーマに生存列が 1 本以上
+    /// あることを確かめ、0 本なら `Invalid`（SQL 表層で `42601`）で拒否する（Issue #1633。
+    /// `defer_live_check` で保留した中間検証の本検証。fail-closed）。
+    pub(crate) fn ensure_table_has_live_column_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+    ) -> Result<()> {
+        let table = write_txn.open_table(CATALOG_TABLE)?;
+        let existing: Vec<u8> = {
+            let guard = table
+                .get(table_name)?
+                .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
+            guard.value().to_vec()
+        };
+        let mut resolve = |name: &str| get_enum_type_in_write_txn(write_txn, name);
+        let schema = decode_schema_with_resolver_impl(table_name, &existing, &mut resolve, false)?;
+        validate_schema(&schema)
+    }
+
+    /// [`Self::alter_table_drop_column`] の write txn 内本体（begin・世代 bump・commit を含まない。
+    /// Issue #1633）。単独 wrapper と複数アクション経路が共有する。識別子・保護列名の検査は
+    /// 呼び出し側（wrapper／`sql::ddl`）の責務。
+    ///
+    /// `defer_live_check = true` は複数アクション経路専用で、削除後の生存列 0 本を中間状態として
+    /// 許す（後続の `ADD COLUMN` で埋まる場合のため）。この場合、呼び出し側は全アクション適用後に
+    /// [`Self::ensure_table_has_live_column_in_txn`] を必ず呼ぶ。`false` は従来どおり即時拒否。
+    pub(crate) fn alter_table_drop_column_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        column_name: &str,
+        defer_live_check: bool,
+    ) -> Result<()> {
         {
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             let existing: Vec<u8> = {
@@ -8515,8 +9267,13 @@ impl Storage {
                     .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
                 guard.value().to_vec()
             };
-            let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
-            let mut schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
+            let mut resolve = |name: &str| get_enum_type_in_write_txn(write_txn, name);
+            let mut schema = decode_schema_with_resolver_impl(
+                table_name,
+                &existing,
+                &mut resolve,
+                !defer_live_check,
+            )?;
 
             // 対象列の物理位置は、削除前のスキーマの物理走査（`.enumerate()`
             // の添字がそのまま物理位置に一致する。[`TableSchema::physical_slots`]
@@ -8614,14 +9371,13 @@ impl Storage {
 
             // `validate_schema`（`encode_schema` 内で呼ばれる）が「生存列 1 本以上」
             // を含む全ての不変条件を検証する。ここでの追加検証は不要。
-            let encoded = encode_schema(&schema)?;
+            let encoded = encode_schema_impl(&schema, !defer_live_check)?;
             table.insert(table_name, encoded.as_slice())?;
         }
         // 削除した列を含む索引宣言（TASK-206・INDEX-7、Issue #908）も同一 txn で
         // 削除する（[`delete_indexes_referencing_column_in_txn`] 参照）。
-        delete_indexes_referencing_column_in_txn(&write_txn, table_name, column_name)?;
-        bump_table_generation_in_txn(&write_txn, table_name)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        delete_indexes_referencing_column_in_txn(write_txn, table_name, column_name)?;
+        Ok(())
     }
 
     /// 既存テーブルの列名を変更する（`ALTER TABLE ... RENAME [COLUMN] <old> TO <new>`。
@@ -8636,10 +9392,15 @@ impl Storage {
     ///
     /// 判定順序（決定的）: 識別子検証・予約列（`ProtectedColumn`）→ 表の存在
     /// （`TableNotFound`）→ 改名元の列の存在（`ColumnNotFound`）→ 改名先が既存の生存列
-    /// （同名への変更を含む。`ColumnAlreadyExists`）→ 依存オブジェクト
-    /// （[`rename_column_dependents_in_txn`]。`AlterCheckError::Sql(FeatureNotSupported)`）
-    /// → ビュー定義の追随（[`rewrite_views_for_renamed_column_in_txn`]。追随できない形は
-    /// `0A000`、追随後の本文サイズ超過は `54000`）。
+    /// （同名への変更を含む。`ColumnAlreadyExists`）→ ビュー定義の追随
+    /// （[`rewrite_views_for_renamed_column_in_txn`]。追随できない形は `0A000`、追随後の
+    /// 本文サイズ超過は `54000`。Issue #1621）。
+    ///
+    /// Issue #1620: PRIMARY KEY・UNIQUE・CHECK・外部キー（子側・親側・自己参照）・索引宣言
+    /// の列参照は同一 txn で新しい名前へ書き換える（制約名は維持）。CHECK の書き換えに
+    /// 失敗した場合は `0A000` で全体を破棄する。列名を含む派生索引（`user_uniq`・
+    /// `key_index`）は同一 txn で失効させ、次の検査で遅延再構築する。親側 FK を持つ
+    /// 他テーブルのスキーマとテーブル世代、索引カタログ世代も更新する。
     pub(crate) fn alter_table_rename_column(
         &self,
         table_name: &str,
@@ -8675,24 +9436,86 @@ impl Storage {
             let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
             decode_schema_with_resolver(table_name, &existing, &mut resolve)?
         };
-        let logical_index = schema
-            .columns
-            .iter()
-            .position(|c| c.name == old_name)
-            .ok_or_else(|| CatalogError::ColumnNotFound(old_name.to_string()))?;
+        if !schema.columns.iter().any(|c| c.name == old_name) {
+            return Err(CatalogError::ColumnNotFound(old_name.to_string()).into());
+        }
         if schema.columns.iter().any(|c| c.name == new_name) {
             return Err(CatalogError::ColumnAlreadyExists(new_name.to_string()).into());
         }
-        // CATALOG_TABLE のハンドルを解放してから呼ぶ（`referencing_foreign_keys_in_txn`
-        // の契約）。
-        rename_column_dependents_in_txn(&write_txn, &schema, table_name, old_name)?;
         // ビュー定義の追随（TABLE-38、Issue #1621）。拒否・計画失敗時は何も書かない。
+        // CATALOG_TABLE のハンドルは解放済み。`schema` は改名前のもの。
         rewrite_views_for_renamed_column_in_txn(
             &write_txn, &schema, table_name, old_name, new_name,
         )?;
-        if let Some(column) = schema.columns.get_mut(logical_index) {
-            column.name = new_name.to_string();
+        let old_schema = schema.clone();
+        schema.rename_column_references(old_name, new_name);
+        // CHECK は AST 経由で書き換え、再束縛・往復一致・上限検証を通す。1 件でも失敗したら
+        // `0A000` で全体を破棄する（txn を commit しない。名前だけ変えて旧名の参照を残す
+        // fail-open を作らない）。
+        let refuse_check = || {
+            AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail: "renaming a column referenced by this CHECK constraint is not supported"
+                    .to_string(),
+            })
+        };
+        let bare_schema = schema.clone().with_checks(Vec::new());
+        let mut new_checks = Vec::with_capacity(old_schema.checks.len());
+        for check in &old_schema.checks {
+            if check_references_column(&old_schema, check, old_name) {
+                new_checks.push(
+                    crate::sql::check_constraint::rename_column_in_check(
+                        &bare_schema,
+                        check,
+                        old_name,
+                        new_name,
+                    )
+                    .map_err(|_| refuse_check())?,
+                );
+            } else {
+                new_checks.push(check.clone());
+            }
         }
+        schema = bare_schema.with_checks(new_checks);
+        // 親側 FK: `table` を参照する他テーブル（自己参照は自表の書き換えで済む）の
+        // `parent_columns` を追随させる。CATALOG_TABLE のハンドルを解放した状態で呼ぶ
+        // （`referencing_foreign_keys_in_txn` の契約）。
+        let referencing = referencing_foreign_keys_in_txn(&write_txn, table_name)?;
+        let mut seen_children: std::collections::BTreeSet<String> = Default::default();
+        for (child, _) in referencing {
+            if child.name == table_name || !seen_children.insert(child.name.clone()) {
+                continue;
+            }
+            let mut child = child;
+            child.rename_parent_column_references(table_name, old_name, new_name);
+            let child_encoded = encode_schema(&child)?;
+            {
+                let mut table = write_txn
+                    .open_table(CATALOG_TABLE)
+                    .map_err(CatalogError::from)?;
+                table
+                    .insert(child.name.as_str(), child_encoded.as_slice())
+                    .map_err(CatalogError::from)?;
+            }
+            bump_table_generation_in_txn(&write_txn, &child.name)?;
+        }
+        rename_index_def_columns_in_txn(&write_txn, table_name, old_name, new_name)?;
+        // 列名を含む派生索引（永続一意索引・キー索引）を同一 txn で失効させる。stale な
+        // 索引を後の同名列で「構築済み」と誤認する fail-open を防ぐ（Issue #1402 と同じ）。
+        if old_schema
+            .primary_key
+            .as_ref()
+            .is_some_and(|pk| pk.iter().any(|c| c == old_name))
+            || old_schema
+                .unique_constraints
+                .iter()
+                .any(|u| u.columns().iter().any(|c| c == old_name))
+        {
+            write_txn
+                .delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))
+                .map_err(CatalogError::from)?;
+        }
+        crate::key_index::drop_indexes_containing_column_in_txn(&write_txn, table_name, old_name)?;
+        crate::key_index::drop_indexes_containing_column_in_txn(&write_txn, table_name, new_name)?;
         // `validate_schema`（`encode_schema` 内で呼ばれる）が名前の重複等の不変条件を
         // 再検証する。
         let encoded = encode_schema(&schema)?;
@@ -8978,14 +9801,28 @@ impl Storage {
     /// 成功時はカタログを更新し世代を bump する（nullability はキーの正準エンコードを
     /// 変えないため索引の失効は不要）。
     pub fn alter_table_set_not_null(&self, table_name: &str, column_name: &str) -> Result<()> {
-        validate_identifier(table_name)?;
-        validate_identifier(column_name)?;
-        if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
-            return Err(CatalogError::ProtectedColumn(column_name.to_string()));
-        }
+        Self::validate_alter_column_target(table_name, column_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        if Self::alter_table_set_not_null_in_txn(&write_txn, table_name, column_name)?
+            == AlterApply::Unchanged
         {
-            let schema = require_table_schema_write(&write_txn, table_name)?;
+            // 冪等な no-op。txn を commit せず破棄する（世代も進めない）。
+            return Ok(());
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(())
+    }
+
+    /// [`Self::alter_table_set_not_null`] の write txn 内本体（begin・世代 bump・commit を含まない。
+    /// Issue #1633）。識別子・保護列名の検査は呼び出し側の責務。
+    pub(crate) fn alter_table_set_not_null_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<AlterApply> {
+        {
+            let schema = require_table_schema_write(write_txn, table_name)?;
             let column = schema
                 .columns
                 .iter()
@@ -8993,7 +9830,7 @@ impl Storage {
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
             if !column.nullable {
                 // 既に NOT NULL（PK 構成列・VECTOR 列を含む）。冪等な no-op。
-                return Ok(());
+                return Ok(AlterApply::Unchanged);
             }
             if matches!(column.ty, ColumnType::Vector(_)) {
                 // 行コーデックのスカラー走査は VECTOR 列を常に `None` として返すため NULL 検査が
@@ -9015,7 +9852,7 @@ impl Storage {
                 if !fk.columns.iter().any(|c| c == column_name) || fk.parent_table == table_name {
                     continue;
                 }
-                let parent = match require_table_schema_write(&write_txn, &fk.parent_table) {
+                let parent = match require_table_schema_write(write_txn, &fk.parent_table) {
                     Ok(p) => p,
                     Err(CatalogError::TableNotFound(_)) | Err(CatalogError::WrongObjectKind(_)) => {
                         return Err(CatalogError::CorruptSchema(
@@ -9048,9 +9885,198 @@ impl Storage {
             let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
+        Ok(AlterApply::Applied)
+    }
+
+    /// `ALTER TABLE ... ALTER COLUMN <column> DROP NOT NULL`（TABLE-39 (4) のポインタ、
+    /// Issue #1632）。SQL 表層 `sql::ddl::execute_alter_table_alter_column_drop_not_null` から
+    /// 呼ばれる唯一の実装で、単一の write txn（書き込みロック保持中）でカタログを更新する。
+    /// 制約を緩める変更なので既存行は走査しない（行コーデックは nullable に関係なく presence
+    /// バイトを書き、末尾欠落行の補完は `fill_value` を nullable より先に評価するため、
+    /// 既存行の見え方は変わらない）。
+    ///
+    /// 判定順序（fail-closed。拒否はすべて commit 前に return し副作用ゼロ）:
+    /// (1) 識別子・保護列名 (2) テーブル取得（`TableNotFound`） (3) 列取得
+    /// （`ColumnNotFound`） (4) 主キー構成列は `ColumnInPrimaryKey`（`42P16`。no-op 判定より
+    /// 先） (5) 既に nullable なら冪等に成功（commit・世代 bump なし） (6) VECTOR 列は
+    /// NULL 許容 VECTOR が未実装のため `Invalid`（TABLE-26 の後続で置換） (7) 変更後スキーマの
+    /// [`validate_schema`]（自己参照 FK の整合） (8) この表を参照する他表の FK の参照先照合の
+    /// 再実行（参照元列 NOT NULL かつ `ON UPDATE CASCADE` の組は `InvalidForeignKey`）。
+    /// 成功時はカタログを更新し世代を bump する（nullability はキーの正準エンコードを
+    /// 変えないため索引の失効は不要）。
+    pub fn alter_table_drop_not_null(&self, table_name: &str, column_name: &str) -> Result<()> {
+        Self::validate_alter_column_target(table_name, column_name)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        if Self::alter_table_drop_not_null_in_txn(&write_txn, table_name, column_name)?
+            == AlterApply::Unchanged
+        {
+            // 冪等な no-op。txn を commit せず破棄する（世代も進めない）。
+            return Ok(());
+        }
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(())
+    }
+
+    /// [`Self::alter_table_drop_not_null`] の write txn 内本体（begin・世代 bump・commit を含まない。
+    /// Issue #1633）。識別子・保護列名の検査は呼び出し側の責務。
+    pub(crate) fn alter_table_drop_not_null_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<AlterApply> {
+        let updated = {
+            let schema = require_table_schema_write(write_txn, table_name)?;
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| c.name == column_name)
+                .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+            if schema
+                .primary_key()
+                .is_some_and(|pk| pk.iter().any(|c| c == column_name))
+            {
+                return Err(CatalogError::ColumnInPrimaryKey(column_name.to_string()));
+            }
+            if column.nullable {
+                // 既に nullable。冪等な no-op。
+                return Ok(AlterApply::Unchanged);
+            }
+            if matches!(column.ty, ColumnType::Vector(_)) {
+                return Err(CatalogError::Invalid(
+                    "DROP NOT NULL on a VECTOR column is not supported".to_string(),
+                ));
+            }
+            let mut updated = schema.clone();
+            for c in updated.columns.iter_mut() {
+                if c.name == column_name {
+                    c.nullable = true;
+                }
+            }
+            validate_schema(&updated)?;
+            updated
+        };
+        // 参照先側の再検査（自己参照は上の `validate_schema` で検査済み。カタログから読める
+        // のは変更前スキーマなので除外する）。`CATALOG_TABLE` のハンドルを持たない状態で呼ぶ。
+        for (child, fk) in referencing_foreign_keys_in_txn(write_txn, table_name)? {
+            if child.name == table_name || !fk.parent_columns.iter().any(|c| c == column_name) {
+                continue;
+            }
+            resolve_foreign_key_target(&child, &fk, &updated)?;
+        }
+        {
+            let encoded = encode_schema(&updated)?;
+            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            catalog_table.insert(table_name, encoded.as_slice())?;
+        }
+        Ok(AlterApply::Applied)
+    }
+
+    /// `ALTER TABLE ... ALTER COLUMN <column> SET／DROP DEFAULT`（TABLE-39 (1)(2)(6) のポインタ、
+    /// Issue #1628）。SQL 表層 `sql::ddl::execute_alter_table_alter_column_set_default`／
+    /// `execute_alter_table_alter_column_drop_default` から呼ばれる唯一の実装で、`default_expr`
+    /// に `Some` で SET、`None` で DROP を表す。変えるのは以後の書き込みで使う INSERT 既定値
+    /// （[`ColumnDef::default_expr`]）だけで、既存行の読み出し時補完値
+    /// （[`ColumnDef::fill_value`]）は変えない（TABLE-39 (1)。ADD COLUMN 時に決めた既存行の
+    /// 見え方を DDL で動かさない）。行ストアは参照しない（O(1)）。
+    ///
+    /// 判定順序（fail-closed。拒否はすべて commit 前に return し副作用ゼロ）:
+    /// (1) 識別子・保護列名（`ProtectedColumn`） (2) テーブル取得（`TableNotFound`）
+    /// (3) 列取得（`ColumnNotFound`） (4) 列型が呼び出し元の検証時（`expected_ty`）と一致すること
+    /// （SQL 表層が write txn の外で読んだ型で既定値を作るため、並行 DDL による型変更を
+    /// `Invalid` で拒否する TOCTOU 対策） (5) 変更後の `default_expr` が現在値と等しければ冪等に
+    /// 成功（commit・世代 bump なし） (6) VECTOR 列への SET は `Invalid` (7) 変更後スキーマの
+    /// 再検証（[`crate::row_codec::validate_column_default`]・[`validate_schema`]。型適合・
+    /// 長さ・ENUM 語彙・FK 参照アクションの宣言検査〔`ON DELETE／UPDATE SET DEFAULT` で参照される
+    /// NOT NULL 列の DROP DEFAULT や時刻既定値は `InvalidForeignKey`〕）。
+    ///
+    /// 補完値が時刻値関数のミラー（CREATE TABLE の `DEFAULT now()` 列の旧来表現）の列は、
+    /// `fill_value` を `None` へ落としてから検証する。`ADD COLUMN` は時刻値関数の DEFAULT を
+    /// 拒否するため、`CurrentTime` の補完値は CREATE TABLE 由来に限られ、その列の全行は物理的に
+    /// 値を持つので補完値は参照されない（そもそも時刻値関数は読み出し時に実体化できない）。
+    /// 定数のミラーは `fill_value` を変えない。
+    ///
+    /// 成功時はカタログを更新し世代を bump する。食い違い（`fill_value != default_expr`）が生じた
+    /// スキーマはカタログ v14 で永続化される。
+    pub fn alter_table_set_default_expr(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        expected_ty: &ColumnType,
+        default_expr: Option<ColumnDefault>,
+    ) -> Result<()> {
+        Self::validate_alter_column_target(table_name, column_name)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        if Self::alter_table_set_default_expr_in_txn(
+            &write_txn,
+            table_name,
+            column_name,
+            expected_ty,
+            default_expr,
+        )? == AlterApply::Unchanged
+        {
+            // 冪等な no-op。txn を commit せず破棄する（世代も進めない）。
+            return Ok(());
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(())
+    }
+
+    /// [`Self::alter_table_set_default_expr`] の write txn 内本体（begin・世代 bump・commit を含まない。
+    /// Issue #1633）。識別子・保護列名の検査は呼び出し側の責務。
+    pub(crate) fn alter_table_set_default_expr_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        column_name: &str,
+        expected_ty: &ColumnType,
+        default_expr: Option<ColumnDefault>,
+    ) -> Result<AlterApply> {
+        {
+            let schema = require_table_schema_write(write_txn, table_name)?;
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| c.name == column_name)
+                .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+            if &column.ty != expected_ty {
+                return Err(CatalogError::Invalid(format!(
+                    "column {column_name:?} type changed concurrently; retry the statement"
+                )));
+            }
+            if column.default_expr == default_expr {
+                // 既に同じ既定値（既定値なしへの DROP を含む）。冪等な no-op。
+                return Ok(AlterApply::Unchanged);
+            }
+            if default_expr.is_some() && matches!(column.ty, ColumnType::Vector(_)) {
+                return Err(CatalogError::Invalid(
+                    "DEFAULT is not supported for a VECTOR column".to_string(),
+                ));
+            }
+
+            let mut updated = schema.clone();
+            for c in updated.columns.iter_mut() {
+                if c.name == column_name {
+                    c.set_default_expr(default_expr.clone());
+                    // 時刻値関数のミラーだった補完値は、`validate_schema` の不変条件 (a) を
+                    // 満たすため落とす（上記ドキュメントの根拠参照）。定数の補完値は保持する。
+                    if matches!(c.fill_value, Some(ColumnDefault::CurrentTime(_))) {
+                        c.fill_value = None;
+                    }
+                    if crate::row_codec::validate_column_default(c).is_err() {
+                        return Err(CatalogError::Invalid(format!(
+                            "column {column_name:?} has an invalid DEFAULT for its type"
+                        )));
+                    }
+                }
+            }
+            validate_schema(&updated)?;
+
+            let encoded = encode_schema(&updated)?;
+            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            catalog_table.insert(table_name, encoded.as_slice())?;
+        }
+        Ok(AlterApply::Applied)
     }
 
     /// 既存テーブルへ（任意で名前付きの）CHECK 制約を追加する（TABLE-16・
@@ -9384,6 +10410,12 @@ impl Storage {
         validate_identifier(table_name)?;
         validate_identifier(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        // `CREATE UNIQUE INDEX` 由来の UNIQUE 制約は制約としては扱わない（Issue #1616・
+        // INDEX-9）。名前解決より前に索引カタログで判定し、`DROP INDEX` でのみ外せるようにする
+        // （無ければ `schema.unique_constraints` の検索で成功してしまう）。
+        if unique_index_def_for_table_in_txn(&write_txn, table_name, name)? {
+            return Err(CatalogError::ConstraintNotFound(name.to_string()));
+        }
         let mut dropped_fk_parent_table: Option<String> = None;
         let mut dropped_primary_key = false;
         {
@@ -9540,7 +10572,7 @@ impl Storage {
         column_name: &str,
         new_precision: u8,
     ) -> Result<()> {
-        self.alter_column_type_with(table_name, column_name, |col| {
+        self.alter_column_type_with(table_name, column_name, None, |col| {
             let current = &col.ty;
             let (old_precision, old_scale) = match current {
                 ColumnType::Numeric { precision, scale } => (*precision, *scale),
@@ -9609,7 +10641,7 @@ impl Storage {
         column_name: &str,
         target: &ColumnType,
     ) -> std::result::Result<(), AlterCheckError> {
-        self.alter_table_alter_column_type_collated(table_name, column_name, target, None)
+        self.alter_table_alter_column_type_collated(table_name, column_name, target, None, None)
     }
 
     /// [`Self::alter_table_alter_column_type`] に照合（`... TYPE <型> COLLATE <名前>`。
@@ -9625,6 +10657,7 @@ impl Storage {
         column_name: &str,
         target: &ColumnType,
         collation: Option<crate::collation::Collation>,
+        using: Option<&Expr>,
     ) -> std::result::Result<(), AlterCheckError> {
         if let ColumnType::Numeric { precision, scale } = target {
             validate_numeric_precision_scale(*precision, *scale)?;
@@ -9635,12 +10668,31 @@ impl Storage {
             )
             .into());
         }
-        self.alter_column_type_with(table_name, column_name, |col| {
-            if col.ty == *target && col.collation != collation {
-                return Ok((target.clone(), collation, AlterPlan::CatalogOnly));
+        self.alter_column_type_with(table_name, column_name, using, |col| {
+            // `USING` 省略と `USING <対象列>` は同じ（行の値をそのまま代入変換する）。それ以外の
+            // 式は、同じ型への変更でも既存の経路へ流さず必ず一般変換で評価する（式を無視する
+            // fail-open を作らない）。
+            let plain =
+                using.is_none_or(|e| crate::sql::alter_using::is_identity_using(e, column_name));
+            if plain {
+                if col.ty == *target && col.collation != collation {
+                    return Ok((target.clone(), collation, AlterPlan::CatalogOnly));
+                }
+                match Self::decide_alter_type(&col.ty, column_name, target) {
+                    Ok((new_ty, plan)) => return Ok((new_ty, collation, plan)),
+                    // 同一型・規則表の外（VECTOR・ENUM）・代入変換が無い組は従来の拒否（`42804`）。
+                    // 事前判定（`sql::ddl`）と同じ判定を txn 内でもう一度行う（TOCTOU 対策）。
+                    Err(e) => {
+                        let convertible = col.ty != *target
+                            && crate::sql::cast::column_assignment_convertible(&col.ty, target)
+                                == Some(true);
+                        if !convertible {
+                            return Err(e);
+                        }
+                    }
+                }
             }
-            let (new_ty, plan) = Self::decide_alter_type(&col.ty, column_name, target)?;
-            Ok((new_ty, collation, plan))
+            Ok((target.clone(), collation, AlterPlan::RewriteExpr))
         })
     }
 
@@ -9732,6 +10784,7 @@ impl Storage {
         &self,
         table_name: &str,
         column_name: &str,
+        using: Option<&Expr>,
         decide: impl FnOnce(
             &ColumnDef,
         )
@@ -9744,7 +10797,15 @@ impl Storage {
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let mut revalidate_schema: Option<TableSchema> = None;
-        {
+        // `RewriteExpr` のとき、カタログのハンドルを手放した後で処理するための持ち越し
+        // （旧スキーマ・変更列の論理 index・新しい型・新しい照合）。
+        let mut expr_rewrite: Option<(
+            TableSchema,
+            usize,
+            ColumnType,
+            Option<crate::collation::Collation>,
+        )> = None;
+        'apply: {
             let mut table = write_txn
                 .open_table(CATALOG_TABLE)
                 .map_err(CatalogError::from)?;
@@ -9768,6 +10829,10 @@ impl Storage {
                 .get_mut(logical_index)
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
             let (new_ty, new_collation, plan) = decide(column)?;
+            if matches!(plan, AlterPlan::RewriteExpr) {
+                expr_rewrite = Some((old_schema, logical_index, new_ty, new_collation));
+                break 'apply;
+            }
             // SMALLINT への縮小では列 DEFAULT も範囲内であること。`ADD COLUMN ... NOT NULL
             // DEFAULT` の列は既存行にバイトが無く読み出し時に DEFAULT で補われるため、
             // 行の走査だけでは範囲外の DEFAULT を見逃す（Issue #1560）。
@@ -9776,12 +10841,14 @@ impl Storage {
                 AlterPlan::ValidateSmallIntRange
                     | AlterPlan::Rewrite(crate::column_rewrite::WideningKind::BigIntToSmallInt)
             ) {
-                if let Some(ColumnDefault::Number(raw) | ColumnDefault::Text(raw)) = &column.default
-                {
-                    if raw.trim().parse::<i16>().is_err() {
-                        return Err(AlterCheckError::Sql(SqlSurfaceError::numeric_out_of_range(
-                            "smallint out of range",
-                        )));
+                // INSERT 既定値と読み出し補完値の両方を検査する（Issue #1627）。
+                for slot in [&column.default_expr, &column.fill_value] {
+                    if let Some(ColumnDefault::Number(raw) | ColumnDefault::Text(raw)) = slot {
+                        if raw.trim().parse::<i16>().is_err() {
+                            return Err(AlterCheckError::Sql(
+                                SqlSurfaceError::numeric_out_of_range("smallint out of range"),
+                            ));
+                        }
                     }
                 }
             }
@@ -9794,16 +10861,19 @@ impl Storage {
                 plan,
                 AlterPlan::Rewrite(crate::column_rewrite::WideningKind::CharFamily)
             ) {
-                if let Some(ColumnDefault::Text(raw)) = &column.default {
-                    let converted = crate::row_codec::convert_char_family(
-                        &column.ty,
-                        &new_ty,
-                        raw,
-                        MAX_COLUMN_DEFAULT_LEN,
-                    )
-                    .map_err(|e| AlterCheckError::Sql(e.into()))?
-                    .into_owned();
-                    column.default = Some(ColumnDefault::Text(converted));
+                // INSERT 既定値と読み出し補完値の両方を変換する（Issue #1627）。
+                for slot in [&mut column.default_expr, &mut column.fill_value] {
+                    if let Some(ColumnDefault::Text(raw)) = slot {
+                        let converted = crate::row_codec::convert_char_family(
+                            &column.ty,
+                            &new_ty,
+                            raw,
+                            MAX_COLUMN_DEFAULT_LEN,
+                        )
+                        .map_err(|e| AlterCheckError::Sql(e.into()))?
+                        .into_owned();
+                        *slot = Some(ColumnDefault::Text(converted));
+                    }
                 }
             }
             column.ty = new_ty;
@@ -9927,6 +10997,18 @@ impl Storage {
             ) {
                 revalidate_schema = Some(schema);
             }
+        }
+        if let Some((old_schema, logical_index, new_ty, new_collation)) = expr_rewrite {
+            alter_column_type_rewrite_expr_in_txn(
+                &write_txn,
+                table_name,
+                column_name,
+                using,
+                &old_schema,
+                logical_index,
+                new_ty,
+                new_collation,
+            )?;
         }
         // 文字列系の変換は値を変えうる（`'ab'` と `'ab '` が `CHAR(3)` で同値になる・rtrim で
         // FK の一致関係が変わる）ため、新スキーマで PK／UNIQUE の重複と FOREIGN KEY の型照合・
@@ -10303,6 +11385,14 @@ impl Storage {
             }
             let schema = require_table_schema_write(&write_txn, &def.table)?;
             validate_index_columns(def, &schema)?;
+            // 一意索引（Issue #1616・INDEX-9）: 型ゲート → 制約名前空間 → 件数上限 →
+            // 追加後スキーマの検証 → 既存行の重複走査 の順で、スキーマ側の UNIQUE 制約
+            // （強制の唯一の入力）を組み立てる。データに依存するのは最後の走査だけ。
+            let unique_schema = if def.unique {
+                Some(build_unique_index_schema_in_txn(&write_txn, def, &schema)?)
+            } else {
+                None
+            };
             let mut index_table = write_txn.open_table(INDEX_CATALOG_TABLE)?;
             if index_table.len()? >= MAX_INDEX_COUNT as u64 {
                 return Err(CatalogError::IndexLimitExceeded(
@@ -10310,6 +11400,16 @@ impl Storage {
                 ));
             }
             index_table.insert(def.name.as_str(), encoded.as_slice())?;
+            if let Some(updated) = &unique_schema {
+                let encoded_schema = encode_schema(updated)?;
+                let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+                catalog_table.insert(def.table.as_str(), encoded_schema.as_slice())?;
+            }
+        }
+        if def.unique {
+            // 永続一意索引を無効化する（`ADD UNIQUE` と同じ二重の安全策。各テナントは
+            // 次回の書き込み時に遅延再構築される）。
+            write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
         }
         bump_table_generation_in_txn(&write_txn, &def.table)?;
         // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。
@@ -10355,6 +11455,9 @@ impl Storage {
             }
             return Err(CatalogError::IndexNotFound(name.to_string()));
         };
+        if def.unique {
+            drop_unique_index_constraint_in_txn(&write_txn, &def)?;
+        }
         bump_table_generation_in_txn(&write_txn, &def.table)?;
         // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。理由は
         // `Storage::create_index` と同じ）。
@@ -10873,6 +11976,7 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         // テーブル存在確認からは到達しない（網羅性のため `Internal` へ丸める）。
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::MultiplePrimaryKeys(_)
+        | CatalogError::ColumnInPrimaryKey(_)
         | CatalogError::ConstraintNotFound(_)
         | CatalogError::ConstraintLimitExceeded(_)
         // `ALTER TABLE ... ADD FOREIGN KEY` の既存行検証違反（TABLE-22・
@@ -10898,6 +12002,16 @@ pub(crate) fn get_table_schema_in_txn(
     read_txn: &impl crate::storage::read_source::ReadSource,
     table_name: &str,
 ) -> Result<TableSchema> {
+    get_table_schema_in_txn_impl(read_txn, table_name, true)
+}
+
+/// [`get_table_schema_in_txn`] の本体。`require_live = false` は複数アクション `ALTER TABLE` の
+/// 中間状態（`DROP COLUMN` 直後で生存列 0 本）を読む経路専用（Issue #1633）。
+pub(crate) fn get_table_schema_in_txn_impl(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    table_name: &str,
+    require_live: bool,
+) -> Result<TableSchema> {
     // `alter_table_add_column` と同様、redb キーとして引く前に識別子を検証する。
     // 不正形式の名前は `TableNotFound`（存在しない）ではなく `Invalid`（形式不正）で
     // 拒否し、両 API 間でエラーバリアントを揃える。
@@ -10916,7 +12030,7 @@ pub(crate) fn get_table_schema_in_txn(
     let bytes = guard.value().to_vec();
     drop(guard);
     let mut resolve = |name: &str| get_enum_type_in_read_txn(read_txn, name);
-    decode_schema_with_resolver(table_name, &bytes, &mut resolve)
+    decode_schema_with_resolver_impl(table_name, &bytes, &mut resolve, require_live)
 }
 
 /// [`Storage::list_tables`] が共有するトランザクションスコープの実装本体。
@@ -11027,6 +12141,9 @@ fn catalog_value_references_enum_type_in_table(
         // v13（Issue #1364）は v12 の上位集合で、`pk:` 行の直後に `pkname:` 行を
         // 持つ（下記で `decode_schema_body` と同じ共有パーサーで検証する）。
         CATALOG_FORMAT_VERSION_V13 => (true, true),
+        // v14（Issue #1627）は v13 の上位集合で、`pkname:` 行を常に持ち、列行が
+        // 7 番目に `fill` を持つ（下記で `decode_schema_body` と同じ契約を検証する）。
+        CATALOG_FORMAT_VERSION_V14 => (true, true),
         other => {
             return Err(CatalogError::CorruptSchema(format!(
                 "unknown catalog format version: {other:?}"
@@ -11043,8 +12160,18 @@ fn catalog_value_references_enum_type_in_table(
     let is_v11 = version_line == CATALOG_FORMAT_VERSION_V11;
     let is_v12 = version_line == CATALOG_FORMAT_VERSION_V12;
     let is_v13 = version_line == CATALOG_FORMAT_VERSION_V13;
-    let has_pk_line =
-        is_v4 || is_v5 || is_v6 || is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13;
+    let is_v14 = version_line == CATALOG_FORMAT_VERSION_V14;
+    let has_pk_line = is_v4
+        || is_v5
+        || is_v6
+        || is_v7
+        || is_v8
+        || is_v9
+        || is_v10
+        || is_v11
+        || is_v12
+        || is_v13
+        || is_v14;
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema("catalog value truncated: missing cols line".to_string())
@@ -11110,11 +12237,9 @@ fn catalog_value_references_enum_type_in_table(
     };
     // v13 の `pkname:` 行（Issue #1364）。名前空間の衝突検査は列・制約セクションを
     // 読み終えてから行う。
-    let pk_name: Option<String> = if is_v13 {
-        Some(
-            parse_primary_key_name_line(&mut lines, pk_cols.as_deref(), table_name)
-                .map_err(CatalogError::CorruptSchema)?,
-        )
+    let pk_name: Option<String> = if is_v13 || is_v14 {
+        parse_primary_key_name_line(&mut lines, pk_cols.as_deref(), table_name, is_v14)
+            .map_err(CatalogError::CorruptSchema)?
     } else {
         None
     };
@@ -11130,8 +12255,11 @@ fn catalog_value_references_enum_type_in_table(
     // `DROP TYPE`／`ALTER TYPE` の fail-closed 依存関係検査だけがすり抜けて
     // しまう）。
     let mut seen_default = false;
+    let mut seen_fill_divergence = false;
     let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for _ in 0..col_count {
+        // 列ごとにデコードした INSERT 既定値（v14 の `fill` との比較用。Issue #1627）。
+        let mut v14_default_seen: Option<ColumnDefault> = None;
         let line = lines.next().ok_or_else(|| {
             CatalogError::CorruptSchema("catalog value truncated: missing column line".to_string())
         })?;
@@ -11187,17 +12315,50 @@ fn catalog_value_references_enum_type_in_table(
             if is_live {
                 let decoded = ColumnDefault::decode_catalog_field(default_field)
                     .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
-                if let Some(default) = decoded {
-                    if !column_default_compatible_with_tag(&default, tag) {
+                if let Some(default) = &decoded {
+                    if !column_default_compatible_with_tag(default, tag) {
                         return Err(CatalogError::CorruptSchema(format!(
                             "column {name:?} has a DEFAULT that is not compatible with its type"
                         )));
                     }
                     seen_default = true;
                 }
+                v14_default_seen = decoded;
             } else if default_field != "-" {
                 return Err(CatalogError::CorruptSchema(format!(
                     "dropped column {name:?} must not declare a DEFAULT"
+                )));
+            }
+        }
+        // v14 の 7 番目フィールド `fill`（Issue #1627）。`decode_schema_body` と同じ
+        // fail-closed 契約: 墓標は `-` 固定、生存列は既存デコーダで検証し型タグと整合し、
+        // 時刻 DEFAULT は INSERT 既定値と等しいミラー状態以外では拒否する。
+        // 補完値が INSERT 既定値と食い違う列が 0 件の v14 も拒否する（正規形の一意性）。
+        if is_v14 {
+            let fill_field = fields.next().ok_or_else(|| {
+                CatalogError::CorruptSchema(format!("malformed column line: {line:?}"))
+            })?;
+            if is_live {
+                let fill = ColumnDefault::decode_catalog_field(fill_field)
+                    .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+                if let Some(fill_default) = &fill {
+                    if !column_default_compatible_with_tag(fill_default, tag) {
+                        return Err(CatalogError::CorruptSchema(format!(
+                            "column {name:?} has a fill value that is not compatible with its type"
+                        )));
+                    }
+                }
+                if fill != v14_default_seen {
+                    seen_fill_divergence = true;
+                }
+                if matches!(fill, Some(ColumnDefault::CurrentTime(_))) && fill != v14_default_seen {
+                    return Err(CatalogError::CorruptSchema(format!(
+                        "column {name:?} has a fill value that is not a constant"
+                    )));
+                }
+            } else if fill_field != "-" {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "dropped column {name:?} must not declare a fill value"
                 )));
             }
         }
@@ -11248,7 +12409,7 @@ fn catalog_value_references_enum_type_in_table(
         // カタログが本関数だけ「依存なし」に丸められ、ENUM 依存判定の
         // fail-closed 判定が `validate_schema` 側と食い違う）。
         parse_unique_section(&mut lines, false, true).map_err(CatalogError::CorruptSchema)?
-    } else if is_v12 || is_v13 {
+    } else if is_v12 || is_v13 || is_v14 {
         // v12（設計 F4・Issue #1069）は名前付き FK の有無のみで選ばれる形式で
         // あり UNIQUE の有無とは独立なため、0 件を許容する（`allow_empty = true`）。
         // v13（Issue #1364）も主キーの明示名のみで選ばれるため同様。
@@ -11262,10 +12423,10 @@ fn catalog_value_references_enum_type_in_table(
     // られるため、`decode_schema_body` と同じ共有パーサーで構造を検証し、
     // 参照列の実在・制約名の一意性も下で検証する。
     let checks: Vec<CheckConstraint> =
-        if is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13 {
+        if is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13 || is_v14 {
             parse_check_section(
                 &mut lines,
-                is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13,
+                is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13 || is_v14,
             )
             .map_err(CatalogError::CorruptSchema)?
         } else {
@@ -11290,7 +12451,7 @@ fn catalog_value_references_enum_type_in_table(
         parse_foreign_key_section(&mut lines, false, true).map_err(CatalogError::CorruptSchema)?
     } else if is_v12 {
         parse_foreign_key_section_v12(&mut lines, false).map_err(CatalogError::CorruptSchema)?
-    } else if is_v13 {
+    } else if is_v13 || is_v14 {
         parse_foreign_key_section_v12(&mut lines, true).map_err(CatalogError::CorruptSchema)?
     } else {
         Vec::new()
@@ -11338,6 +12499,12 @@ fn catalog_value_references_enum_type_in_table(
     // 返し続ける（codex-review P1 指摘・Issue #904・PR #1051）。
     // v6 は UNIQUE 制約の有無で選ばれる形式であり DEFAULT 0 件でも正当なため、
     // この不変条件は v5 に限る（`decode_schema_body` と同じ）。
+    if is_v14 && !seen_fill_divergence {
+        return Err(CatalogError::CorruptSchema(
+            "v14 catalog format requires at least one column whose fill value differs from its DEFAULT"
+                .to_string(),
+        ));
+    }
     if is_v5 && !seen_default {
         return Err(CatalogError::CorruptSchema(
             "v5 catalog format requires at least one column with a DEFAULT".to_string(),
@@ -11965,6 +13132,50 @@ mod tests {
         }
     }
 
+    /// 一意索引（Issue #1616・INDEX-9）は `v3` で往復し、`unique == false` の `v1` を変えない。
+    /// 手で書き換えられた `v3`（hnsw・フラグ違い・フラグ欠落・余剰行）は fail-closed に拒否する。
+    #[test]
+    fn index_def_encoding_v3_round_trips_and_rejects_corruption() {
+        let unique = IndexDef::new(
+            "i".to_string(),
+            "docs".to_string(),
+            IndexKind::Scalar,
+            vec!["a".to_string(), "b".to_string()],
+        )
+        .with_unique(true);
+        let bytes = encode_index_def(&unique).expect("encode");
+        assert_eq!(bytes, b"v3\ndocs\nscalar\na,b\nunique".to_vec());
+        assert_eq!(decode_index_def("i", &bytes).expect("decode"), unique);
+        assert!(
+            !decode_index_def("i", b"v1\ndocs\nscalar\na,b")
+                .expect("decode")
+                .unique
+        );
+        for bytes in [
+            &b"v3\ndocs\nhnsw\na\nunique"[..],
+            b"v3\ndocs\nscalar\na\nuniq",
+            b"v3\ndocs\nscalar\na",
+            b"v3\ndocs\nscalar\na\nunique\nextra",
+        ] {
+            assert!(
+                matches!(
+                    decode_index_def("i", bytes),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        // 照合付き・hnsw の一意索引は保存しない。
+        let collated = unique
+            .clone()
+            .with_column_collations(vec![None, Some(crate::collation::Collation::JaIcu)]);
+        assert!(matches!(
+            encode_index_def(&collated),
+            Err(CatalogError::Invalid(_))
+        ));
+    }
+
     /// 索引の照合は照合を持てる型のスカラー宣言の列にだけ付けられる（Issue #2191）。
     #[test]
     fn create_index_collation_requires_a_collatable_scalar_column() {
@@ -12402,6 +13613,27 @@ mod tests {
         assert!(
             gen6 > gen5,
             "alter_table_drop_column must bump index catalog generation when it removes a declaration"
+        );
+
+        // `alter_table_rename_column` は宣言列を書き換えたときだけ進める（Issue #1620）。
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs2", "docs"))
+            .expect("create hnsw index on docs.embedding");
+        let gen7 = read_gen();
+        storage
+            .alter_table_rename_column("docs", "flag", "flag2")
+            .expect("rename column without a declaration");
+        assert_eq!(
+            read_gen(),
+            gen7,
+            "renaming a column no declaration uses must not bump the index catalog generation"
+        );
+        storage
+            .alter_table_rename_column("docs", "embedding", "emb")
+            .expect("rename declared column");
+        assert!(
+            read_gen() > gen7,
+            "alter_table_rename_column must bump index catalog generation when it rewrites a declaration"
         );
     }
 
@@ -12882,7 +14114,9 @@ mod tests {
     fn validate_schema_checks_json_and_jsonb_defaults() {
         let build = |ty: ColumnType, text: &str| {
             let mut col = ColumnDef::new("j", ty, true);
-            col.default = Some(ColumnDefault::Text(text.to_string()));
+            let default = ColumnDefault::Text(text.to_string());
+            col.default_expr = Some(default.clone());
+            col.fill_value = Some(default);
             TableSchema::new("docs", vec![col])
         };
         assert!(validate_schema(&build(ColumnType::Json, "{\"a\": 1}")).is_ok());
@@ -13053,7 +14287,10 @@ mod tests {
             .iter()
             .find(|c| c.name == "lang")
             .expect("lang column present");
-        assert_eq!(lang.default, Some(ColumnDefault::Text("ja".to_string())));
+        assert_eq!(
+            lang.default_expr,
+            Some(ColumnDefault::Text("ja".to_string()))
+        );
     }
 
     /// 主キーの導出擬似名（Issue #1196）: 通常長は `<table>_pkey`、識別子長の上限に
@@ -13186,13 +14423,22 @@ mod tests {
         storage
             .alter_table_add_column("docs", ColumnDef::new("amt", numeric(5, 3), true))
             .expect("re-add with other scale");
-        let err = storage
+        // 現在の scale（3）に対して判定される。scale の変更は代入変換のある一般変換として
+        // 受理される（TABLE-40・Issue #1636）。古い scale（2）の同一 scale 拡大として
+        // カタログだけを書き換えると、再追加後の列の値表現を取り違える。
+        storage
             .alter_table_alter_column_type("docs", "amt", &numeric(10, 2))
-            .expect_err("scale mismatch must be rejected");
-        assert!(matches!(
-            err,
-            AlterCheckError::Catalog(CatalogError::IncompatibleTypeChange { .. })
-        ));
+            .expect("scale change is a value conversion");
+        assert_eq!(
+            storage
+                .get_table_schema("docs")
+                .expect("schema")
+                .columns
+                .iter()
+                .find(|c| c.name == "amt")
+                .map(|c| c.ty.clone()),
+            Some(numeric(10, 2))
+        );
         // 範囲不正は互換性判定より先に Invalid。
         let err = storage
             .alter_table_alter_column_type("docs", "amt", &numeric(5, 6))
@@ -15858,7 +17104,10 @@ mod tests {
 
         // 破損した本文（再検証できない）も fail-closed。
         {
-            let write_txn = storage.begin_write_txn().expect("txn");
+            // 破損注入専用のテスト補助。本番の commit 境界（`commit_boundary` モジュール）は
+            // テーブル世代 bump を前提とするため、既存の破損注入テスト
+            // （`insert_corrupt_index_entry`）と同じく redb の write txn を直接 commit する。
+            let write_txn = storage.db().begin_write().expect("txn");
             {
                 let mut views = write_txn.open_table(VIEWS_TABLE).expect("views");
                 let bad = encode_view_def(&ViewDef {
@@ -15868,7 +17117,7 @@ mod tests {
                 .expect("encode");
                 views.insert("v_bad", bad.as_slice()).expect("insert");
             }
-            crate::recovery::commit_boundary::commit(write_txn).expect("commit");
+            write_txn.commit().expect("commit");
         }
         let err = storage
             .alter_table_rename_column("docs", "kind", "lang")
@@ -15971,12 +17220,190 @@ mod tests {
             err(storage.alter_table_rename_column("missing", "a", "b")),
             AlterCheckError::Catalog(CatalogError::TableNotFound(_))
         ));
-        assert!(matches!(
-            err(storage.alter_table_rename_column("docs", "kind", "k2")),
-            AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported { .. })
-        ));
         let after = storage.get_table_schema("docs").expect("schema");
         assert!(after.columns.iter().any(|c| c.name == "kind"));
+    }
+
+    /// 改名で PK・UNIQUE（名前維持）・CHECK・FK（子側・親側・自己参照）・索引宣言が新しい
+    /// 列名へ追随し、再オープン後も同じ状態であること（TABLE-38 のポインタ、Issue #1620）。
+    #[test]
+    fn alter_table_rename_column_rewrites_constraints_and_indexes() {
+        let path = unique_db_path("rename-column-rewrites");
+        let _guard = CleanupGuard(path.clone());
+        let fk = |cols: &[&str], parent: &str, pcols: &[&str]| {
+            ForeignKeyDef::new(
+                cols.iter().map(|c| c.to_string()).collect(),
+                parent.to_string(),
+                pcols.iter().map(|c| c.to_string()).collect(),
+                ReferentialAction::NoAction,
+                ReferentialAction::NoAction,
+            )
+        };
+        let unique_name;
+        let parent_checks;
+        {
+            let storage = Storage::open(&path).expect("open storage");
+            let parent = TableSchema::new(
+                "pt",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("code", ColumnType::Text, false),
+                    ColumnDef::new("u", ColumnType::Text, true),
+                    ColumnDef::new("qty", ColumnType::Integer, true),
+                    ColumnDef::new("up", ColumnType::Text, true),
+                ],
+            )
+            .with_primary_key(vec!["code".to_string()])
+            .with_unique_constraints(vec![UniqueConstraint::with_name(
+                "my_unique".to_string(),
+                vec!["u".to_string()],
+            )])
+            .with_checks(vec![CheckConstraint {
+                name: "qty_pos".to_string(),
+                columns: vec!["qty".to_string()],
+                predicate_sql: "qty > 0".to_string(),
+            }])
+            .with_foreign_keys(vec![fk(&["up"], "pt", &["code"])]);
+            storage.create_table(&parent).expect("create parent");
+            let child = TableSchema::new(
+                "ct",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("pcode", ColumnType::Text, true),
+                ],
+            )
+            .with_foreign_keys(vec![fk(&["pcode"], "pt", &["code"])]);
+            storage.create_table(&child).expect("create child");
+            storage
+                .create_index(&scalar_def("idx_qty", "pt", &["qty", "u"]))
+                .expect("scalar index");
+            storage
+                .create_index(&hnsw_def("idx_hnsw_pt", "pt"))
+                .expect("hnsw index");
+            let child_gen_before = {
+                let r = storage.db().begin_read().expect("read");
+                crate::storage::current_generation_in_txn(&r).expect("gen")
+            };
+
+            for (old, new) in [("code", "k"), ("u", "uu"), ("qty", "q"), ("up", "upper")] {
+                storage
+                    .alter_table_rename_column("pt", old, new)
+                    .unwrap_or_else(|e| panic!("rename {old}: {e:?}"));
+            }
+            storage
+                .alter_table_rename_column("ct", "pcode", "pk2")
+                .expect("rename child column");
+            let child_gen_after = {
+                let r = storage.db().begin_read().expect("read");
+                crate::storage::current_generation_in_txn(&r).expect("gen")
+            };
+            assert!(child_gen_after > child_gen_before);
+            unique_name = "my_unique".to_string();
+            parent_checks = storage
+                .get_table_schema("pt")
+                .expect("pt")
+                .checks()
+                .to_vec();
+        }
+        assert_eq!(parent_checks.len(), 1);
+        for round in 0..2 {
+            // round 1 は再オープン後。
+            let storage = Storage::open(&path).expect("reopen storage");
+            let pt = storage.get_table_schema("pt").expect("pt");
+            assert_eq!(
+                pt.primary_key(),
+                Some(&["k".to_string()][..]),
+                "round {round}"
+            );
+            assert_eq!(pt.unique_constraints().len(), 1);
+            assert_eq!(pt.unique_constraints()[0].name(), unique_name);
+            assert_eq!(pt.unique_constraints()[0].columns(), ["uu".to_string()]);
+            assert_eq!(pt.checks()[0].name, "qty_pos");
+            assert_eq!(pt.checks()[0].columns, vec!["q".to_string()]);
+            assert_eq!(pt.checks()[0].predicate_sql, "q > 0");
+            assert_eq!(pt.foreign_keys()[0].columns(), ["upper".to_string()]);
+            assert_eq!(pt.foreign_keys()[0].parent_columns(), ["k".to_string()]);
+            let ct = storage.get_table_schema("ct").expect("ct");
+            assert_eq!(ct.foreign_keys()[0].columns(), ["pk2".to_string()]);
+            assert_eq!(ct.foreign_keys()[0].parent_columns(), ["k".to_string()]);
+            let indexes = storage.list_indexes().expect("indexes");
+            let scalar = indexes.iter().find(|d| d.name == "idx_qty").expect("idx");
+            assert_eq!(scalar.columns, vec!["q".to_string(), "uu".to_string()]);
+            let hnsw = indexes
+                .iter()
+                .find(|d| d.name == "idx_hnsw_pt")
+                .expect("hnsw");
+            assert_eq!(hnsw.columns, vec!["embedding".to_string()]);
+        }
+    }
+
+    /// CHECK の書き換えに失敗する改名（述語テキストが長さ上限を超える）は `0A000` で拒否し、自表・子表・索引宣言・世代の
+    /// いずれも変えない（fail-closed・単一 txn）。
+    #[test]
+    fn rename_column_rewrite_failure_is_atomic() {
+        let path = unique_db_path("rename-column-atomic");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let parent = TableSchema::new(
+            "pt",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("code", ColumnType::Text, false),
+                ColumnDef::new("qty", ColumnType::Integer, true),
+            ],
+        )
+        .with_primary_key(vec!["code".to_string()])
+        .with_checks(vec![CheckConstraint {
+            name: "qty_pos".to_string(),
+            columns: vec!["qty".to_string()],
+            // 改名後に述語テキストが長さ上限を超える形（旧名 3 文字を 40 文字へ）。
+            predicate_sql: vec!["qty > 0"; 200].join(" AND "),
+        }]);
+        storage.create_table(&parent).expect("create parent");
+        let child = TableSchema::new(
+            "ct",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("pcode", ColumnType::Text, true),
+            ],
+        )
+        .with_foreign_keys(vec![ForeignKeyDef::new(
+            vec!["pcode".to_string()],
+            "pt".to_string(),
+            vec!["code".to_string()],
+            ReferentialAction::NoAction,
+            ReferentialAction::NoAction,
+        )]);
+        storage.create_table(&child).expect("create child");
+        storage
+            .create_index(&scalar_def("idx_qty", "pt", &["qty"]))
+            .expect("index");
+        let snapshot = |storage: &Storage| {
+            let r = storage.db().begin_read().expect("read");
+            (
+                storage.get_table_schema("pt").expect("pt"),
+                storage.get_table_schema("ct").expect("ct"),
+                storage.list_indexes().expect("indexes"),
+                index_catalog_generation_in_txn(&r).expect("index gen"),
+                crate::storage::current_generation_in_txn(&r).expect("gen"),
+            )
+        };
+        let before = snapshot(&storage);
+        let (old, new) = ("qty", "q_".repeat(20));
+        let result = storage.alter_table_rename_column("pt", old, &new);
+        assert!(
+            matches!(
+                result,
+                Err(AlterCheckError::Sql(
+                    SqlSurfaceError::FeatureNotSupported { .. }
+                ))
+            ),
+            "{old} -> {new}: {result:?}"
+        );
+        assert!(
+            snapshot(&storage) == before,
+            "state changed by {old} -> {new}"
+        );
     }
 
     /// 予約列（`id`／`tenant_id`／`visibility`）・`VECTOR` 列・不存在列・最後の
@@ -16647,16 +18074,14 @@ mod tests {
             storage.table_generation("docs").expect("generation"),
             generation
         );
-        // BIGINT→INTEGER は引き続き拒否（TABLE-40 の担当）。
+        // BIGINT→INTEGER は代入変換のある縮小として全行を検査して受理する
+        // （TABLE-40・Issue #1636。範囲外の行があれば `22003` で表は不変）。
         storage
             .alter_table_alter_column_type("docs", "n", &ColumnType::BigInt)
             .expect("widen");
-        assert!(matches!(
-            storage.alter_table_alter_column_type("docs", "n", &ColumnType::Integer),
-            Err(AlterCheckError::Catalog(
-                CatalogError::IncompatibleTypeChange { .. }
-            ))
-        ));
+        storage
+            .alter_table_alter_column_type("docs", "n", &ColumnType::Integer)
+            .expect("narrowing with an assignment cast");
     }
 
     /// 行ストア未作成（既存行 0 件）のテーブルでも拡大変換は成功する（Issue #1361）。
@@ -17990,7 +19415,7 @@ mod tests {
             let mut resolve =
                 |_: &str| -> Result<Arc<EnumTypeDef>> { Ok(EnumTypeDef::unresolved("mood")) };
             assert!(
-                decode_schema_body("docs", text.as_bytes(), &mut resolve).is_err(),
+                decode_schema_body("docs", text.as_bytes(), &mut resolve, true).is_err(),
                 "decode must reject: {text:?}"
             );
             assert!(
@@ -18131,6 +19556,455 @@ mod tests {
                 vec![ColumnDef::new("a", ty.clone(), true).with_collation(Collation::C)],
             );
             assert!(encode_schema(&schema).is_err(), "{ty:?} must be rejected");
+        }
+    }
+
+    // ---- Issue #1628: ALTER COLUMN SET／DROP DEFAULT（alter_table_set_default_expr）----
+
+    fn open_default_alter_storage(label: &str) -> (Storage, CleanupGuard) {
+        let path = unique_db_path(label);
+        let guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "t",
+                vec![
+                    ColumnDef::new("a", ColumnType::Text, true),
+                    ColumnDef::new("at", ColumnType::Timestamp, true)
+                        .with_default(ColumnDefault::CurrentTime(TimeDefault::Now)),
+                ],
+            ))
+            .expect("create table");
+        (storage, guard)
+    }
+
+    fn column_of(storage: &Storage, name: &str) -> ColumnDef {
+        storage
+            .get_table_schema("t")
+            .expect("schema")
+            .columns
+            .into_iter()
+            .find(|c| c.name == name)
+            .expect("column")
+    }
+
+    /// SET は `default_expr` だけを変え、ADD COLUMN 時の `fill_value` を保つ。食い違うスキーマは
+    /// v14 で永続化され、再 open 後も同じ。DROP は `default_expr` だけを `None` にする。
+    #[test]
+    fn set_and_drop_default_keep_fill_value_across_reopen() {
+        let (storage, guard) = open_default_alter_storage("catalog-set-default-fill");
+        let path = guard.0.clone();
+        storage
+            .alter_table_add_column(
+                "t",
+                ColumnDef::new("c", ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("a".to_string())),
+            )
+            .expect("add column");
+        let before = storage.table_generation("t").expect("generation");
+        storage
+            .alter_table_set_default_expr(
+                "t",
+                "c",
+                &ColumnType::Text,
+                Some(ColumnDefault::Text("b".to_string())),
+            )
+            .expect("set default");
+        let col = column_of(&storage, "c");
+        assert_eq!(col.default_expr, Some(ColumnDefault::Text("b".to_string())));
+        assert_eq!(col.fill_value, Some(ColumnDefault::Text("a".to_string())));
+        assert!(storage.table_generation("t").expect("generation") > before);
+        drop(storage);
+        let storage = Storage::open(&path).expect("reopen");
+        let col = column_of(&storage, "c");
+        assert_eq!(col.default_expr, Some(ColumnDefault::Text("b".to_string())));
+        assert_eq!(col.fill_value, Some(ColumnDefault::Text("a".to_string())));
+        storage
+            .alter_table_set_default_expr("t", "c", &ColumnType::Text, None)
+            .expect("drop default");
+        let col = column_of(&storage, "c");
+        assert_eq!(col.default_expr, None);
+        assert_eq!(col.fill_value, Some(ColumnDefault::Text("a".to_string())));
+    }
+
+    /// 同じ既定値への変更（既定値なしへの DROP を含む）は冪等に成功し、世代を進めない。
+    #[test]
+    fn set_default_is_idempotent_without_generation_bump() {
+        let (storage, _guard) = open_default_alter_storage("catalog-set-default-noop");
+        let before = storage.table_generation("t").expect("generation");
+        storage
+            .alter_table_set_default_expr("t", "a", &ColumnType::Text, None)
+            .expect("drop on column without default");
+        assert_eq!(storage.table_generation("t").expect("generation"), before);
+        let d = Some(ColumnDefault::Text("x".to_string()));
+        storage
+            .alter_table_set_default_expr("t", "a", &ColumnType::Text, d.clone())
+            .expect("set");
+        let mid = storage.table_generation("t").expect("generation");
+        assert!(mid > before);
+        storage
+            .alter_table_set_default_expr("t", "a", &ColumnType::Text, d)
+            .expect("same set");
+        assert_eq!(storage.table_generation("t").expect("generation"), mid);
+    }
+
+    /// CREATE TABLE の `DEFAULT now()`（補完値もミラー）の列へ定数を SET／DROP しても、
+    /// 補完値は `None` に落ちて再 open できる（時刻値の補完値は不変条件 (a) に反するため）。
+    #[test]
+    fn set_default_on_time_default_mirror_column_drops_time_fill_value() {
+        let (storage, guard) = open_default_alter_storage("catalog-set-default-time-mirror");
+        let path = guard.0.clone();
+        storage
+            .alter_table_set_default_expr(
+                "t",
+                "at",
+                &ColumnType::Timestamp,
+                Some(ColumnDefault::Text("2020-01-01 00:00:00".to_string())),
+            )
+            .expect("set constant over time default");
+        let col = column_of(&storage, "at");
+        assert_eq!(col.fill_value, None);
+        drop(storage);
+        let storage = Storage::open(&path).expect("reopen");
+        assert_eq!(column_of(&storage, "at").fill_value, None);
+        storage
+            .alter_table_set_default_expr("t", "at", &ColumnType::Timestamp, None)
+            .expect("drop");
+        assert_eq!(column_of(&storage, "at").default_expr, None);
+    }
+
+    /// 検証時の列型と write txn 内の列型が食い違えば `Invalid`（並行 DDL の TOCTOU 対策）。
+    #[test]
+    fn set_default_rejects_stale_expected_type() {
+        let (storage, _guard) = open_default_alter_storage("catalog-set-default-stale");
+        let err = storage
+            .alter_table_set_default_expr(
+                "t",
+                "a",
+                &ColumnType::Integer,
+                Some(ColumnDefault::Number("1".to_string())),
+            )
+            .expect_err("stale type");
+        assert!(matches!(err, CatalogError::Invalid(_)), "{err:?}");
+        assert_eq!(column_of(&storage, "a").default_expr, None);
+    }
+
+    /// 保護列・不在列・型に合わない既定値は拒否され、カタログは変わらない。
+    #[test]
+    fn set_default_rejects_protected_missing_and_mismatched() {
+        let (storage, _guard) = open_default_alter_storage("catalog-set-default-reject");
+        let before = storage.table_generation("t").expect("generation");
+        assert!(matches!(
+            storage.alter_table_set_default_expr("t", "id", &ColumnType::Text, None),
+            Err(CatalogError::ProtectedColumn(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_set_default_expr("t", "zzz", &ColumnType::Text, None),
+            Err(CatalogError::ColumnNotFound(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_set_default_expr("nope", "a", &ColumnType::Text, None),
+            Err(CatalogError::TableNotFound(_))
+        ));
+        assert!(storage
+            .alter_table_set_default_expr(
+                "t",
+                "a",
+                &ColumnType::Text,
+                Some(ColumnDefault::Bool(true))
+            )
+            .is_err());
+        assert_eq!(storage.table_generation("t").expect("generation"), before);
+    }
+
+    /// `ON DELETE SET DEFAULT` で参照される NOT NULL 列の DROP DEFAULT は `InvalidForeignKey`
+    /// （宣言が常に失敗する状態を作らない）。副作用なし。
+    #[test]
+    fn drop_default_rejected_for_fk_set_default_not_null_column() {
+        let path = unique_db_path("catalog-drop-default-fk");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(
+                &TableSchema::new("parent", vec![ColumnDef::new("k", ColumnType::Text, true)])
+                    .with_unique_constraints(vec![UniqueConstraint::new(vec!["k".to_string()])]),
+            )
+            .expect("parent");
+        storage
+            .create_table(
+                &TableSchema::new(
+                    "t",
+                    vec![ColumnDef::new("r", ColumnType::Text, false)
+                        .with_default(ColumnDefault::Text("x".to_string()))],
+                )
+                .with_foreign_keys(vec![ForeignKeyDef::new(
+                    vec!["r".to_string()],
+                    "parent".to_string(),
+                    vec!["k".to_string()],
+                    ReferentialAction::SetDefault,
+                    ReferentialAction::NoAction,
+                )]),
+            )
+            .expect("child");
+        let err = storage
+            .alter_table_set_default_expr("t", "r", &ColumnType::Text, None)
+            .expect_err("must fail");
+        assert!(matches!(err, CatalogError::InvalidForeignKey(_)), "{err:?}");
+        assert_eq!(
+            column_of(&storage, "r").default_expr,
+            Some(ColumnDefault::Text("x".to_string()))
+        );
+        // 別の定数への SET は宣言を保つので成功する。
+        storage
+            .alter_table_set_default_expr(
+                "t",
+                "r",
+                &ColumnType::Text,
+                Some(ColumnDefault::Text("y".to_string())),
+            )
+            .expect("set constant");
+    }
+
+    // ---- Issue #1627: 補完値（fill_value）と INSERT 既定値（default_expr）の分離 ----
+
+    fn diverging_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, false),
+                ColumnDef::new("b", ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("ins".to_string()))
+                    .with_fill_value(Some(ColumnDefault::Text("old".to_string()))),
+                ColumnDef::new("c", ColumnType::Integer, true)
+                    .with_default(ColumnDefault::Number("5".to_string()))
+                    .with_fill_value(None),
+                ColumnDef::new("d", ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("same".to_string())),
+            ],
+        )
+    }
+
+    /// 食い違う列があるときだけ v14 で書かれ、往復で `default_expr`／`fill_value` が一致する。
+    #[test]
+    fn v14_roundtrips_diverging_fill_value() {
+        let schema = diverging_schema();
+        let bytes = encode_schema(&schema).expect("encode");
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        assert!(text.starts_with("v14\n"), "{text}");
+        assert!(text.contains("\npkname:\n"), "{text}");
+        let decoded = decode_schema("docs", &bytes).expect("decode");
+        assert_eq!(decoded, schema);
+        assert_eq!(
+            decoded.columns[1].fill_value,
+            Some(ColumnDefault::Text("old".to_string()))
+        );
+        assert_eq!(decoded.columns[2].fill_value, None);
+        assert_eq!(encode_schema(&decoded).expect("re-encode"), bytes);
+    }
+
+    /// 幅広テーブルで `default`／`fill` が全列で最大長かつ食い違っても v14 の
+    /// エンコードが上限内で成功し、往復する（Issue #1627 Bugbot 指摘）。
+    #[test]
+    fn v14_widest_table_with_max_len_default_and_fill_encodes() {
+        let cols = (0..MAX_COLUMN_COUNT)
+            .map(|i| {
+                ColumnDef::new(format!("c{i}"), ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("a".repeat(MAX_COLUMN_DEFAULT_LEN)))
+                    .with_fill_value(Some(ColumnDefault::Text(
+                        "b".repeat(MAX_COLUMN_DEFAULT_LEN),
+                    )))
+            })
+            .collect::<Vec<_>>();
+        let schema = TableSchema::new("wide", cols);
+        let bytes = encode_schema(&schema).expect("encode");
+        assert!(bytes.len() <= MAX_CATALOG_VALUE_LEN);
+        assert_eq!(decode_schema("wide", &bytes).expect("decode"), schema);
+    }
+
+    /// 主キー明示名・UNIQUE・FK と v14 を組み合わせても往復する。
+    #[test]
+    fn v14_roundtrips_with_pk_name_unique_and_fk() {
+        let mut schema = diverging_schema()
+            .with_primary_key(vec!["a".to_string()])
+            .with_primary_key_name(Some("custom_pk".to_string()))
+            .with_unique_constraints(vec![UniqueConstraint::new(vec!["d".to_string()])]);
+        schema = schema.with_foreign_keys(vec![ForeignKeyDef::new(
+            vec!["d".to_string()],
+            "parent".to_string(),
+            vec!["k".to_string()],
+            ReferentialAction::NoAction,
+            ReferentialAction::NoAction,
+        )]);
+        let bytes = encode_schema(&schema).expect("encode");
+        assert!(bytes.starts_with(b"v14\n"));
+        let decoded = decode_schema("docs", &bytes).expect("decode");
+        assert_eq!(decoded.primary_key_name.as_deref(), Some("custom_pk"));
+        assert_eq!(decoded.columns, schema.columns);
+        assert_eq!(decoded.foreign_keys.len(), 1);
+        assert_eq!(encode_schema(&decoded).expect("re-encode"), bytes);
+    }
+
+    /// 食い違いが無いスキーマは v14 にならず、従来の版のバイト列のまま（正規形の一意性）。
+    #[test]
+    fn mirrored_schema_never_uses_v14() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("b", ColumnType::Text, true)
+                .with_default(ColumnDefault::Text("x".to_string()))],
+        );
+        let bytes = encode_schema(&schema).expect("encode");
+        assert!(
+            bytes.starts_with(b"v5\n"),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        // 補完値と既定値を明示的に揃えた構築でも同じ。
+        let aligned = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("b", ColumnType::Text, true)
+                .with_default(ColumnDefault::Text("x".to_string()))
+                .with_fill_value(Some(ColumnDefault::Text("x".to_string())))],
+        );
+        assert_eq!(encode_schema(&aligned).expect("encode"), bytes);
+    }
+
+    /// 旧形式（v5）の生バイト列は `fill_value == default_expr` として読め、再 encode しても
+    /// 元のバイト列と一致する（旧データの読み出し結果を変えない）。
+    #[test]
+    fn legacy_v5_bytes_decode_as_mirrored_and_reencode_identically() {
+        let raw = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("b", ColumnType::Bytea, true)
+                    .with_default(ColumnDefault::Text("\\x01".to_string())),
+                ColumnDef::new("t", ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("x".to_string())),
+            ],
+        );
+        let bytes = encode_schema(&raw).expect("encode");
+        assert!(bytes.starts_with(b"v5\n"));
+        let decoded = decode_schema("docs", &bytes).expect("decode");
+        for column in &decoded.columns {
+            assert_eq!(column.fill_value, column.default_expr);
+            assert!(column.fill_value.is_some());
+        }
+        assert_eq!(encode_schema(&decoded).expect("re-encode"), bytes);
+    }
+
+    /// 不正な v14 値は fail-closed に拒否する。
+    #[test]
+    fn decode_rejects_malformed_v14() {
+        let good =
+            String::from_utf8(encode_schema(&diverging_schema()).expect("encode")).expect("utf8");
+        assert!(decode_schema("docs", good.as_bytes()).is_ok());
+        let mirrored_v14 = "v14\ncols:1\npk:\npkname:\nb:text:-:1:L:-:-\nuniq:0\nchecks:0\nfks:0\n";
+        let fill_current_time = {
+            let schema = TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("t", ColumnType::Timestamp, true)
+                    .with_default(ColumnDefault::CurrentTime(TimeDefault::Now))],
+            );
+            let line = String::from_utf8(encode_schema(&schema).expect("encode")).expect("utf8");
+            // 時刻 DEFAULT のミラー列と、食い違う別列を持つ v14 を手で組む。
+            let field = line
+                .lines()
+                .find(|l| l.starts_with("t:"))
+                .and_then(|l| l.rsplit(':').next())
+                .expect("default field")
+                .to_string();
+            format!(
+                "v14\ncols:2\npk:\npkname:\nt:timestamp:-:1:L:-:{field}\nz:text:-:1:L:-:-\nuniq:0\nchecks:0\nfks:0\n"
+            )
+        };
+        let bad_pkname_derived = good.replace("pkname:\n", "pkname:docs_pkey\n");
+        let bad_tombstone_fill = "v14\ncols:2\npk:\npkname:\nb:text:-:1:L:-:6162\nx:text:-:1:D:-:6162\nuniq:0\nchecks:0\nfks:0\n";
+        let bad_hex = good.replacen(":s6f6c64\n", ":s6f6c6\n", 1);
+        for (label, bad) in [
+            ("v14 without divergence", mirrored_v14.to_string()),
+            ("fill is CurrentTime", fill_current_time),
+            ("pkname equals derived name", bad_pkname_derived),
+            ("tombstone fill", bad_tombstone_fill.to_string()),
+            ("missing fill field", good.replacen(":s6f6c64\n", "\n", 1)),
+            ("bad hex fill", bad_hex),
+        ] {
+            assert!(
+                decode_schema("docs", bad.as_bytes()).is_err(),
+                "must reject: {label}: {bad:?}"
+            );
+        }
+    }
+
+    /// `validate_schema` は時刻 DEFAULT の補完値（INSERT 既定値と等しいミラー以外）を拒否する。
+    #[test]
+    fn validate_schema_rejects_non_constant_fill_value() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("t", ColumnType::Timestamp, true)
+                .with_fill_value(Some(ColumnDefault::CurrentTime(TimeDefault::Now)))],
+        );
+        assert!(validate_schema(&schema).is_err());
+        let mirrored = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("t", ColumnType::Timestamp, true)
+                .with_default(ColumnDefault::CurrentTime(TimeDefault::Now))],
+        );
+        assert!(validate_schema(&mirrored).is_ok());
+    }
+
+    /// P0: v14 は FK 保持版として登録されている（漏れると DROP TABLE の依存検査が fail-open）。
+    #[test]
+    fn v14_is_registered_as_foreign_key_bearing_version() {
+        assert!(FK_BEARING_FORMAT_VERSIONS.contains(&CATALOG_FORMAT_VERSION_V14));
+        assert_eq!(FK_BEARING_FORMAT_VERSIONS.len(), 7);
+    }
+
+    /// 軽量パーサーも v14 を扱い、`decode_schema_body` と同じ不変条件を敷く。
+    #[test]
+    fn lightweight_parser_handles_v14() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("m", ColumnType::Text, true),
+                ColumnDef::new("b", ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("ins".to_string()))
+                    .with_fill_value(None),
+            ],
+        );
+        let bytes = encode_schema(&schema).expect("encode");
+        assert!(bytes.starts_with(b"v14\n"));
+        assert!(
+            !catalog_value_references_enum_type_in_table(&bytes, "mood", Some("docs"))
+                .expect("valid v14")
+        );
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        // 食い違い 0 件（fill を default と同じ値へ書き換え）・不正な fill・墓標 fill は拒否。
+        let default_field = text
+            .lines()
+            .find(|l| l.starts_with("b:"))
+            .and_then(|l| l.split(':').nth(5))
+            .expect("default field")
+            .to_string();
+        let no_divergence = text.replace(
+            &format!(":{default_field}:-\n"),
+            &format!(":{default_field}:{default_field}\n"),
+        );
+        let bad_hex = text.replace(
+            &format!(":{default_field}:-\n"),
+            &format!(":{default_field}:zz\n"),
+        );
+        for bad in [no_divergence, bad_hex] {
+            assert!(
+                matches!(
+                    catalog_value_references_enum_type_in_table(
+                        bad.as_bytes(),
+                        "mood",
+                        Some("docs")
+                    ),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "lightweight parser must reject: {bad:?}"
+            );
+            assert!(decode_schema("docs", bad.as_bytes()).is_err());
         }
     }
 }

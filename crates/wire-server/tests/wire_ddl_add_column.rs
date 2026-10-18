@@ -289,7 +289,6 @@ fn wire_malformed_syntax_is_rejected_with_42601() {
 
     for sql in [
         "ALTER TABLE docs ADD note TEXT",
-        "ALTER TABLE docs ADD COLUMN IF NOT EXISTS note TEXT",
         // 列制約のうち `UNIQUE`／リテラル種別不一致は引き続き拒否する
         // （`NOT NULL`／`DEFAULT <literal>` は Issue #1169、`DEFAULT NULL` は Issue #1524 で受理）。
         "ALTER TABLE docs ADD COLUMN note TEXT UNIQUE",
@@ -304,6 +303,62 @@ fn wire_malformed_syntax_is_rejected_with_42601() {
         expect_error_response_with_sqlstate(&mut stream, "42601");
         read_ready_for_query(&mut stream);
     }
+}
+
+/// `ADD COLUMN IF NOT EXISTS`（TABLE-36、Issue #1633）は既存列に対して成功（no-op）し、
+/// 句なしの重複は `42701` のまま。応答タグはどちらの成功でも `ALTER TABLE`。
+#[test]
+fn wire_add_column_if_not_exists_is_noop_on_existing_column() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+
+    for sql in [
+        "ALTER TABLE docs ADD COLUMN IF NOT EXISTS note TEXT",
+        "ALTER TABLE docs ADD COLUMN IF NOT EXISTS note TEXT",
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), "ALTER TABLE", "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+    send_simple_query(&mut stream, "ALTER TABLE docs ADD COLUMN note TEXT");
+    expect_error_response_with_sqlstate(&mut stream, "42701");
+    read_ready_for_query(&mut stream);
+}
+
+/// 複数アクション（TABLE-39 (5)、Issue #1633）は wire 越しでも原子的に適用される。
+/// 途中のアクションが失敗した文は ErrorResponse を返し、先行アクションの列も残らない。
+#[test]
+fn wire_multi_action_alter_table_is_atomic() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE docs ADD COLUMN a TEXT, ADD COLUMN b INTEGER DEFAULT 3",
+    );
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+
+    // 2 個目が存在しない列の DROP で失敗する。1 個目の列 `c` は残らない。
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE docs ADD COLUMN c TEXT, DROP COLUMN missing",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42703");
+    read_ready_for_query(&mut stream);
+
+    // `c` が追加されていないので、改めて追加できる。
+    send_simple_query(&mut stream, "ALTER TABLE docs ADD COLUMN c TEXT");
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+
+    // RENAME との混在は構文エラー。
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE docs ADD COLUMN d TEXT, RENAME COLUMN a TO a2",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
 }
 
 /// 別のユーザー（`bob`）は `--ddl-allowed-users` に含まれていなくても、`alice` の

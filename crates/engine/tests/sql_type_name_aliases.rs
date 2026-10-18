@@ -317,10 +317,18 @@ fn alter_column_type_alias_failures_match_canonical_and_leave_schema() {
         let sql = format!("ALTER TABLE t ALTER COLUMN a TYPE {ty}");
         assert_eq!(err(&core, &mut s, &sql).wire_code(), "0A000", "{sql}");
     }
-    // 長さ付き型への変更は構文を通り、INTEGER からは非互換変更（42804）で拒否する（Issue #1563）。
+    // 長さ付き型への変更は構文を通り、INTEGER からは文字列型への代入変換として全行変換で受理される
+    // （TABLE-40・Issue #1636。Issue #1563 では非互換変更として拒否していた）。INTEGER へ戻して
+    // 後続の検証（スキーマ不変）を保つ。
     for ty in ["VARCHAR(10)", "CHAR(10)"] {
         let sql = format!("ALTER TABLE t ALTER COLUMN a TYPE {ty}");
-        assert_eq!(err(&core, &mut s, &sql).wire_code(), "42804", "{sql}");
+        run(&core, &mut s, &sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        run(
+            &core,
+            &mut s,
+            "ALTER TABLE t ALTER COLUMN a TYPE INTEGER USING a::integer",
+        )
+        .expect("restore integer");
     }
     let mut denied = SessionState::default();
     assert_eq!(

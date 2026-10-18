@@ -13,6 +13,10 @@
 //! （`user_uniq`・`key_index`）の失効は本モジュールの責務ではなく、呼び出し元の
 //! `alter_column_type_with` が同一 txn 内で行う。
 //!
+//! 一般の列型変換（`USING` 式・代入変換。TABLE-40・Issue #1636）の全行書き換えは
+//! [`rewrite_rows_with_conversion_in_txn`]。評価・変換エラーは固定文言（値・テナント・行 id を
+//! 含まない）の [`ConversionOutcome::Failed`] で返し、破損（`CorruptSchema`）と区別する。
+//!
 //! 契約（fail-closed）:
 //! - 書き換えるのは対象テーブルの行だけで、行キー `(tenant_id, id)`・tenant・
 //!   visibility・embedding は保存する（行の追加・削除・テナント移動は行わない）
@@ -27,7 +31,11 @@ use redb::ReadableTable;
 use crate::catalog::{
     map_row_table_error, user_rows_table_def, user_rows_table_name, CatalogError, TableSchema,
 };
-use crate::row_codec::{decode_scalar_columns, encode_scalar_columns, Value};
+use crate::row_codec::{decode_scalar_columns, encode_scalar_columns, scan_scalar_columns, Value};
+use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::alter_using::{redact_row_conversion_error, BoundAlterConversion};
+use crate::sql::set_expr::expr_value_to_column_value;
+use crate::sql::udf_call::eval_with_scalars;
 use crate::storage::{decode_row_for_key, encode_row, RowInput};
 
 /// 1 バッチで集めるキー数の上限。redb は走査中の insert を許さないため、
@@ -115,6 +123,120 @@ pub(crate) fn validate_rows_fit_smallint_in_txn(
         logical_index,
         Mode::ValidateSmallInt,
     )
+}
+
+/// 一般変換（`USING` 式・代入変換。TABLE-40・Issue #1636）の走査結果。変換エラーは破損
+/// （`CorruptSchema`・`XX000`）と区別するため、固定文言化済み（`redact_row_conversion_error`）の
+/// [`SqlSurfaceError`] を `Failed` で返す。呼び出し元は commit せず txn を破棄する。
+#[derive(Debug)]
+pub(crate) enum ConversionOutcome {
+    Done,
+    Failed(SqlSurfaceError),
+}
+
+/// `conv`（旧スキーマに束縛済みの変換式）を全テナント・全可視性の既存行へ適用し、
+/// `new_schema` で再エンコードする（`catalog::alter_column_type_with` の `RewriteExpr` 腕が
+/// 同一 write txn 内で呼ぶ。TABLE-40 (1)(2)(5)）。
+///
+/// 可視性・テナントで絞らない理由: 不可視な行の変換違反を見逃すと、読み出し時の decode 失敗
+/// （fail-open の温床）を招く。そのため `PolicyContext` は取らず全行を対象にし、違反時のエラー
+/// 文言は値・テナント・行 id を含まない固定文言に丸める。式は行ごとに**変換前の行値**に対して評価する。
+/// 行数に上限は設けない（キーは [`REWRITE_BATCH_KEYS`] 単位で集めてから書き換える）。
+pub(crate) fn rewrite_rows_with_conversion_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    old_schema: &TableSchema,
+    new_schema: &TableSchema,
+    logical_index: usize,
+    conv: &BoundAlterConversion,
+) -> Result<ConversionOutcome, CatalogError> {
+    let row_table_name = user_rows_table_name(table_name);
+    let mut row_table = match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+        Ok(t) => t,
+        // 行ストア未作成（既存行 0 件）。
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(ConversionOutcome::Done),
+        Err(e) => return Err(map_row_table_error(e)),
+    };
+
+    let mut resume: Option<(String, u64)> = None;
+    loop {
+        let mut keys: Vec<(String, u64)> = Vec::new();
+        keys.try_reserve_exact(REWRITE_BATCH_KEYS)
+            .map_err(|_| corrupt("failed to reserve row rewrite batch"))?;
+        {
+            let start = match &resume {
+                Some((t, id)) => Bound::Excluded((t.as_str(), *id)),
+                None => Bound::Unbounded,
+            };
+            for entry in row_table.range::<(&str, u64)>((start, Bound::Unbounded))? {
+                let (k, _v) = entry?;
+                let (tenant, id) = k.value();
+                keys.push((tenant.to_string(), id));
+                if keys.len() >= REWRITE_BATCH_KEYS {
+                    break;
+                }
+            }
+        }
+        let Some(last) = keys.last().cloned() else {
+            return Ok(ConversionOutcome::Done);
+        };
+        let full = keys.len() >= REWRITE_BATCH_KEYS;
+
+        for (tenant, id) in &keys {
+            let raw: Vec<u8> = match row_table.get((tenant.as_str(), *id))? {
+                Some(g) => g.value().to_vec(),
+                None => return Err(corrupt("row vanished during column rewrite")),
+            };
+            // 行キーとヘッダのテナントの整合もここで検証される（不整合は破損として固定文言）。
+            let row = decode_row_for_key(tenant, *id, &raw)
+                .map_err(|_| corrupt("failed to decode row during column rewrite"))?;
+            let mut values = decode_scalar_columns(old_schema, &row.metadata)
+                .map_err(|_| corrupt("failed to decode row payload during column rewrite"))?;
+            let converted = {
+                let view = scan_scalar_columns(old_schema, &row.metadata)
+                    .map_err(|_| corrupt("failed to scan row payload during column rewrite"))?;
+                let evaluated = match eval_with_scalars(&conv.bound, *id, &row.embedding, &view) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(ConversionOutcome::Failed(redact_row_conversion_error(e))),
+                };
+                match expr_value_to_column_value(
+                    &conv.target_ty,
+                    conv.nullable,
+                    &conv.column_name,
+                    evaluated,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(ConversionOutcome::Failed(redact_row_conversion_error(e))),
+                }
+            };
+            let slot = values
+                .get_mut(logical_index)
+                .ok_or_else(|| corrupt("column index out of range during column rewrite"))?;
+            *slot = converted;
+            let metadata = match encode_scalar_columns(new_schema, &values) {
+                Ok(m) => m,
+                // 新しい型の不変条件（長さ・精度等）を満たさない値。値を含まない固定文言にする。
+                Err(_) => {
+                    return Ok(ConversionOutcome::Failed(SqlSurfaceError::InvalidInput {
+                        detail: "converted value is not valid for the new column type".to_string(),
+                    }))
+                }
+            };
+            let encoded = encode_row(&RowInput {
+                tenant_id: &row.tenant_id,
+                visibility: row.visibility,
+                embedding: &row.embedding,
+                metadata: &metadata,
+            })
+            .map_err(|_| corrupt("failed to encode row during column rewrite"))?;
+            row_table.insert((tenant.as_str(), *id), encoded.as_slice())?;
+        }
+
+        if !full {
+            return Ok(ConversionOutcome::Done);
+        }
+        resume = Some(last);
+    }
 }
 
 fn scan_rows_in_txn(

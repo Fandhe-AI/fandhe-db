@@ -18,7 +18,7 @@
 //! - 索引宣言の有無でクエリ結果集合・RLS 境界が変わらない
 //! - 宣言の永続化と `DROP TABLE` による一掃
 
-use engine::catalog::{ColumnDef, ColumnType, IndexKind, TableSchema};
+use engine::catalog::{ColumnDef, ColumnType, IndexDef, IndexKind, TableSchema};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
@@ -219,6 +219,74 @@ fn create_and_drop_index_succeed_and_persist_across_reopen() {
     assert_eq!(vec_idx.columns, vec!["embedding".to_string()]);
 }
 
+/// `USING btree` は `USING` 省略時と同一のスカラー宣言を作る（名前以外すべて一致。
+/// INDEX-9・TABLE-36、Issue #1617）。VECTOR・BOOLEAN 列は省略形と同じく `0A000`。
+#[test]
+fn using_btree_creates_same_declaration_as_omitted() {
+    let (path, _guard) = open_fixture("index-ddl-using-btree");
+    {
+        let core = core_at(&path);
+        let mut session = allowed_session();
+        for sql in [
+            "CREATE INDEX a ON docs (lang, body)",
+            "CREATE INDEX b ON docs USING btree (lang, body)",
+            "CREATE INDEX c ON docs (lang COLLATE \"C\")",
+            "CREATE INDEX d ON docs USING BTREE (lang COLLATE \"C\")",
+        ] {
+            assert!(
+                matches!(
+                    run(&core, &mut session, sql),
+                    Ok(SqlOutcome::CreateIndex(_))
+                ),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "CREATE INDEX e ON docs USING btree (embedding)",
+            "CREATE INDEX f ON docs USING btree (flag)",
+        ] {
+            assert!(
+                matches!(
+                    run_err(&core, &mut session, sql),
+                    SqlSurfaceError::FeatureNotSupported { .. }
+                ),
+                "{sql}"
+            );
+        }
+        let mut denied = SessionState::default();
+        let err = run_err(
+            &core,
+            &mut denied,
+            "CREATE INDEX g ON docs USING btree (lang)",
+        );
+        assert_eq!(err.wire_code(), "42501");
+        assert!(matches!(
+            run(&core, &mut session, "DROP INDEX b"),
+            Ok(SqlOutcome::DropIndex(_))
+        ));
+    }
+    let defs = Storage::open(&path)
+        .expect("reopen storage")
+        .list_indexes()
+        .expect("list indexes");
+    let get = |n: &str| defs.iter().find(|d| d.name == n).cloned();
+    assert!(get("b").is_none());
+    let (a, c, d) = (get("a").unwrap(), get("c").unwrap(), get("d").unwrap());
+    assert_eq!(a.kind, IndexKind::Scalar);
+    assert_eq!(d.kind, IndexKind::Scalar);
+    assert_eq!(
+        IndexDef {
+            name: String::new(),
+            ..c
+        },
+        IndexDef {
+            name: String::new(),
+            ..d
+        }
+    );
+    assert_eq!(defs.len(), 3);
+}
+
 /// `BYTEA` 列のスカラー宣言（単独・`id` との複合）は受理され永続化され、
 /// `DROP INDEX` で消える（Issue #1362・INDEX-7）。
 #[test]
@@ -315,10 +383,8 @@ fn structural_rejections_do_not_consult_the_catalog() {
     let too_many: Vec<String> = (0..257).map(|i| format!("c{i}")).collect();
     let too_many_sql = format!("CREATE INDEX idx ON docs ({})", too_many.join(", "));
     let cases: Vec<(String, &str)> = vec![
-        (
-            "CREATE INDEX idx ON docs USING btree (lang)".into(),
-            "0A000",
-        ),
+        ("CREATE INDEX idx ON docs USING hash (lang)".into(), "0A000"),
+        ("CREATE INDEX idx ON docs USING gin (lang)".into(), "0A000"),
         ("CREATE INDEX idx ON docs USING bm25 (body)".into(), "0A000"),
         (
             "CREATE INDEX idx ON docs (lang) WHERE lang = 'ja'".into(),
@@ -332,7 +398,6 @@ fn structural_rejections_do_not_consult_the_catalog() {
         ),
         ("CREATE INDEX idx ON docs (lang, lang)".into(), "42601"),
         ("CREATE INDEX idx ON docs (lang + 1)".into(), "42601"),
-        ("CREATE UNIQUE INDEX idx ON docs (lang)".into(), "42601"),
         ("CREATE INDEX IF NOT EXISTS ON docs (lang)".into(), "42601"),
         ("CREATE INDEX idx ON docs (lang DESC)".into(), "42601"),
         ("CREATE INDEX idx ON docs ()".into(), "0A000"),

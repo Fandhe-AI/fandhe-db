@@ -118,6 +118,10 @@ const MAX_INSERT_ROWS_PER_STATEMENT: usize = 1_000;
 /// 定数。Issue #945）と二重定義しないよう、同じ値をそちらから参照する。
 pub(crate) const MAX_IN_LIST_ITEMS: usize = crate::declarative_filter::MAX_IN_LIST_ITEMS;
 
+/// `ALTER TABLE` 1 文が持てるアクション数の上限（Issue #1633）。`MAX_COLUMN_COUNT` と同値で、
+/// 超過は確保前に `54000` で拒否する（無制限リソース確保の防止）。
+pub const MAX_ALTER_TABLE_ACTIONS: usize = MAX_COLUMN_COUNT;
+
 /// UPDATE の SET 句が持てる代入要素数の上限（SQL-17、TASK-191）。`MAX_COLUMN_COUNT`
 /// とは独立した定数にする（UPDATE は部分更新であり INSERT の列数上限とは意味論が
 /// 異なるため、将来どちらかだけを見直す際に互いへ波及しないようにする）。無制限
@@ -659,6 +663,10 @@ pub enum SqlSurfaceError {
     /// （TABLE-22 (d)）。ERR-6: `42P16`。`table` はクライアント自身が
     /// 指定したテーブル名。
     InvalidTableDefinition { table: String },
+    /// 主キーの構成列への `ALTER COLUMN ... DROP NOT NULL`（TABLE-39 (4)、Issue #1632）。
+    /// ERR-6: `42P16`（`InvalidTableDefinition` と同じ分類）。`column` はクライアント自身が
+    /// 指定した列名のみ。
+    ColumnInPrimaryKey { column: String },
     /// 分割実行 DML が 1 チャンク以上 commit した後に止まった（Issue #1129・
     /// RECOVER-11。`VD001`）。`cause` は止めた原因の分類（コードのみを応答へ載せ、
     /// 内側のメッセージは載せない）。`operation_id` はクライアント自身が指定した値。
@@ -900,6 +908,15 @@ impl SqlSurfaceError {
     pub(crate) fn invalid_table_definition(table: impl Into<String>) -> Self {
         SqlSurfaceError::InvalidTableDefinition {
             table: truncate_for_error(&table.into()),
+        }
+    }
+
+    /// `pub(crate)`: `sql::ddl` の `ALTER COLUMN ... DROP NOT NULL` が主キー構成列を拒否する
+    /// 際に `catalog::CatalogError::ColumnInPrimaryKey` を写像する（Issue #1632）。列名は
+    /// untrusted な字句解析結果のため切り詰める。
+    pub(crate) fn column_in_primary_key(column: impl Into<String>) -> Self {
+        SqlSurfaceError::ColumnInPrimaryKey {
+            column: truncate_for_error(&column.into()),
         }
     }
 
@@ -1158,7 +1175,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateObject { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::DuplicateType { .. } => ErrorClass::DuplicateObject,
-            SqlSurfaceError::InvalidTableDefinition { .. } => ErrorClass::InvalidTableDefinition,
+            SqlSurfaceError::InvalidTableDefinition { .. }
+            | SqlSurfaceError::ColumnInPrimaryKey { .. } => ErrorClass::InvalidTableDefinition,
             SqlSurfaceError::PartialCompletion { .. } => ErrorClass::PartialCompletion,
             SqlSurfaceError::PartitionedDmlCancelled { .. } => ErrorClass::PartitionedDmlCancelled,
             SqlSurfaceError::PartitionedDmlInTransaction => ErrorClass::ActiveSqlTransaction,
@@ -1318,6 +1336,10 @@ impl std::fmt::Display for SqlSurfaceError {
             // クライアント自身が指定したテーブル名のみ。他テナント情報は含めない。
             SqlSurfaceError::InvalidTableDefinition { table } => {
                 write!(f, "multiple primary keys for table {table} are not allowed")
+            }
+            // クライアント自身が指定した列名のみ。他テナント情報は含めない。
+            SqlSurfaceError::ColumnInPrimaryKey { column } => {
+                write!(f, "column \"{column}\" is in a primary key")
             }
             // 件数（自テナントで commit 済み）・原因コード・クライアント自身の operation_id
             // だけを載せる。内側のメッセージ・テーブル名・他テナント情報は含めない。
@@ -3587,9 +3609,9 @@ pub struct ValidatedTruncate {
 ///
 /// 受理する形は `ALTER TABLE <table> ADD COLUMN <column> <type> [NOT NULL]
 /// [DEFAULT <literal>] [;]`（列制約は順不同・各 1 回まで。Issue #1169）のみ
-/// （`IF NOT EXISTS`・複数 `ADD`・列制約 `UNIQUE`／`PRIMARY KEY`／`REFERENCES`／
-/// `CHECK`・`RETURNING`・`USING OPERATION_ID` の
-/// 併用はいずれも許可リスト外。構造検証段階ではカタログ照会を一切行わない
+/// （`ADD COLUMN` の直後の `IF NOT EXISTS` は Issue #1633 以降受理する。列制約 `UNIQUE`／
+/// `PRIMARY KEY`／`REFERENCES`／`CHECK`・`RETURNING`・`USING OPERATION_ID` の
+/// 併用は許可リスト外。複数アクションは [`ValidatedAlterTableMultiple`]。構造検証段階ではカタログ照会を一切行わない
 /// （テーブル・列の存在確認は `sql::ddl::execute_alter_table_add_column` が
 /// DDL 権限ゲート通過後に行う——権限の無い主体への存在オラクル化を防ぐ
 /// ため）。
@@ -3611,6 +3633,22 @@ pub struct ValidatedAlterTableAddColumn {
     /// 列型への適用可否（文字列系のみ。ENUM 解決後の判定を含む）は実行段が `42804` で判定する。
     /// **BREAKING CHANGE**: pub フィールド追加。
     pub collation: Option<crate::collation::Collation>,
+    /// `ADD COLUMN IF NOT EXISTS`（TABLE-36、Issue #1633）。`true` で同名の生存列が既にあれば
+    /// 何も変えずに成功する（実行段が判定。構造検証はカタログを参照しない）。
+    /// **BREAKING CHANGE**: pub フィールド追加。
+    pub if_not_exists: bool,
+}
+
+/// `ALTER TABLE <table> <アクション>[, <アクション>]*`（2 個以上。TABLE-39 (5) のポインタ、
+/// Issue #1633）。含められるのは列単位のカタログ操作（`ADD COLUMN`・`DROP COLUMN`・
+/// `ALTER COLUMN SET／DROP DEFAULT`・`SET／DROP NOT NULL`）に限り、1 つの write txn で
+/// 原子的に適用する（`sql::ddl::execute_alter_table_multiple`）。`actions` の各要素の
+/// `table_name` は `table_name` と同じ。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableMultiple {
+    pub table_name: String,
+    /// 記述順のアクション（2 個以上、[`MAX_ALTER_TABLE_ACTIONS`] 以下）。
+    pub actions: Vec<ValidatedAlterTable>,
 }
 
 /// 許可形状の構造判定を通過した `ALTER TABLE ... ADD [CONSTRAINT <name>] UNIQUE
@@ -3720,6 +3758,11 @@ pub struct ValidatedAlterTableAlterColumnType {
     /// `... TYPE <型> COLLATE <name>` の照合（TABLE-28・Issue #1609）。`None`（`COLLATE`
     /// 省略）は新しい型の既定（照合指定なし）へ戻す。**BREAKING CHANGE**: pub フィールド追加。
     pub collation: Option<crate::collation::Collation>,
+    /// `... TYPE <型> [COLLATE <name>] USING <式>` の変換式（TABLE-40、Issue #1635）。
+    /// 式の許可範囲は `UPDATE ... SET` の右辺（SQL-45）と同じ構文木で、列参照の解決・型検査は
+    /// 実行段（`sql::alter_using`）が DDL 権限ゲートの後で担う。`None`（`USING` 省略）は
+    /// 代入変換での型変更。**BREAKING CHANGE**: pub フィールド追加。
+    pub using: Option<crate::sql::udf_call::Expr>,
 }
 
 /// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> SET NOT
@@ -3732,7 +3775,40 @@ pub struct ValidatedAlterTableAlterColumnSetNotNull {
     pub column_name: String,
 }
 
-/// `ALTER TABLE` の許可形状 10 種の和（Issue #1067・#1068・#1069・#1167・#1196・#1619・#1631）。`ParsedSql::AlterTable` が
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> DROP NOT
+/// NULL` 文（TABLE-39 (4)、Issue #1632）。列・表の存在確認と主キー構成列・VECTOR 列・
+/// FK 参照先側の整合検査は実行段（`sql::ddl::execute_alter_table_alter_column_drop_not_null`）が
+/// DDL 権限ゲートの後で担う（権限の無い主体への存在オラクル化を防ぐ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAlterColumnDropNotNull {
+    pub table_name: String,
+    pub column_name: String,
+}
+
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> SET DEFAULT
+/// <式>` 文（TABLE-39 (1)、Issue #1628）。式は `CREATE TABLE` の列 DEFAULT と同じ許可範囲
+/// （定数リテラル・定数式・時刻値関数）で、`default` と `time_default` は高々一方が `Some`
+/// （`SET DEFAULT NULL` は両方 `None` に正規化済みで `DROP DEFAULT` と同義）。列型との適合・
+/// 値の束縛・表と列の存在確認は実行段（`sql::ddl::execute_alter_table_alter_column_set_default`）が
+/// DDL 権限ゲートの後で担う（権限の無い主体への存在オラクル化を防ぐ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAlterColumnSetDefault {
+    pub table_name: String,
+    pub column_name: String,
+    pub default: Option<InsertLiteral>,
+    pub time_default: Option<crate::catalog::TimeDefault>,
+}
+
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> DROP DEFAULT`
+/// 文（TABLE-39 (2)、Issue #1628）。存在確認は実行段
+/// （`sql::ddl::execute_alter_table_alter_column_drop_default`）が権限ゲートの後で担う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAlterColumnDropDefault {
+    pub table_name: String,
+    pub column_name: String,
+}
+
+/// `ALTER TABLE` の許可形状 13 種の和（Issue #1067・#1068・#1069・#1167・#1196・#1619・#1628・#1631・#1632）。`ParsedSql::AlterTable` が
 /// 保持する型で、`sql::ddl::execute_alter_table` が対応する実行本体へ振り分ける
 /// （構文の許可リスト判定は `sql::allowlist` の管轄、ディスパッチは `sql::ddl`・
 /// `core.rs` の管轄という既存の責務分担を維持する）。
@@ -3759,8 +3835,16 @@ pub struct ValidatedAlterTableAlterColumnSetNotNull {
 ///
 /// **BREAKING CHANGE**（Issue #1619）: `RenameColumn` variant を追加した。
 /// 本 enum を網羅的に `match` するクレート外のコードは追随が必要。
+///
+/// **BREAKING CHANGE**（Issue #1628）: `AlterColumnSetDefault`・`AlterColumnDropDefault`
+/// variant を追加した。本 enum を網羅的に `match` するクレート外のコードは追随が必要。
+///
+/// **BREAKING CHANGE**（Issue #1632）: `AlterColumnDropNotNull` variant を追加した。
+/// 本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedAlterTable {
+    /// 複数アクション（Issue #1633）。**BREAKING CHANGE**: variant 追加。
+    Multiple(ValidatedAlterTableMultiple),
     AddColumn(ValidatedAlterTableAddColumn),
     AddUnique(ValidatedAlterTableAddUnique),
     AddCheck(ValidatedAlterTableAddCheck),
@@ -3770,6 +3854,9 @@ pub enum ValidatedAlterTable {
     AlterColumnType(ValidatedAlterTableAlterColumnType),
     AddPrimaryKey(ValidatedAlterTableAddPrimaryKey),
     AlterColumnSetNotNull(ValidatedAlterTableAlterColumnSetNotNull),
+    AlterColumnSetDefault(ValidatedAlterTableAlterColumnSetDefault),
+    AlterColumnDropDefault(ValidatedAlterTableAlterColumnDropDefault),
+    AlterColumnDropNotNull(ValidatedAlterTableAlterColumnDropNotNull),
     RenameColumn(ValidatedAlterTableRenameColumn),
 }
 
@@ -3910,6 +3997,11 @@ struct Parser<'a> {
     /// 定数式（INSERT VALUES・列 `DEFAULT`）の解析中だけ立ち、関数引数の `NULL` を
     /// `NULL` 定数として受理する（Issue #1543。他文脈の関数引数は従来どおり列参照）。
     const_expr_null_args: bool,
+    /// `ALTER COLUMN TYPE ... USING <式>` の解析中だけ立ち、引用なしの `NULL`・`true`・
+    /// `false` を列参照ではなくリテラルとして受理する（Issue #1635。`UPDATE ... SET` の
+    /// リテラル経路と受理範囲を揃える）。`true`／`false` は束縛段が型を決められるよう
+    /// `CAST('true' AS boolean)` 相当の [`Expr::Cast`] へ脱糖する。
+    using_keyword_literals: bool,
     /// 単項マイナス（`-<primary>`）を `0 - <primary>` へ脱糖して受理してよい文脈かどうか
     /// （Issue #1538・SQL-42）。単一テーブル SELECT の投影項目（[`Self::parse_select_item`]
     /// の式モード）の解析中だけ `true` にする。`parse_primary_expr` は WHERE・CHECK 本体・
@@ -3974,12 +4066,22 @@ enum ExprLeaf {
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
         let mut quoted_null = Vec::new();
-        let tokens = if tokens.iter().any(|t| matches!(t, Token::QuotedNull(_))) {
+        // ALTER 文には WHERE 述語葉が無いため、字句段が残した `"true"`／`"false"` の印は
+        // 引用付き識別子として `quoted_null` に記録する（Issue #1635 USING 式の列参照保護）。
+        let is_alter =
+            matches!(tokens.first(), Some(Token::Ident(a)) if a.eq_ignore_ascii_case("ALTER"));
+        let tokens = if tokens.iter().any(|t| {
+            matches!(t, Token::QuotedNull(_)) || (is_alter && matches!(t, Token::QuotedBoolWord(_)))
+        }) {
             let demoted = tokens
                 .iter()
                 .enumerate()
                 .map(|(i, t)| match t {
                     Token::QuotedNull(s) => {
+                        quoted_null.push(i);
+                        Token::Ident(s.clone())
+                    }
+                    Token::QuotedBoolWord(s) if is_alter => {
                         quoted_null.push(i);
                         Token::Ident(s.clone())
                     }
@@ -4000,6 +4102,7 @@ impl<'a> Parser<'a> {
             case_nesting: 0,
             allow_null_literal: false,
             const_expr_null_args: false,
+            using_keyword_literals: false,
             allow_unary_minus: false,
             allow_plus_number: false,
             in_check_body: false,
@@ -6586,8 +6689,23 @@ impl<'a> Parser<'a> {
             // の後方互換を優先し、下の一般識別子分岐へフォールスルーして列参照
             // （`Expr::Ident`）として扱う。
             Some(Token::Ident(name))
+                if self.using_keyword_literals
+                    && (name.eq_ignore_ascii_case("true")
+                        || name.eq_ignore_ascii_case("false"))
+                    && !self.quoted_null.contains(&self.pos) =>
+            {
+                let literal = name.to_ascii_lowercase();
+                self.advance();
+                self.consume_expr_node()?;
+                Ok(Expr::Cast {
+                    expr: Box::new(Expr::String(literal)),
+                    ty: crate::sql::cast::CastType::Bool,
+                })
+            }
+            Some(Token::Ident(name))
                 if name.eq_ignore_ascii_case("NULL")
                     && (self.allow_null_literal
+                        || self.using_keyword_literals
                         || matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast)))
                     && !self.quoted_null.contains(&self.pos) =>
             {
@@ -8174,6 +8292,12 @@ impl<'a> Parser<'a> {
             }
             self.pos = start;
         }
+        Ok(SetValue::Expr(self.parse_bounded_value_expr()?))
+    }
+
+    /// 値式 1 個をノード予算（`MAX_EXPR_NODES`）つきで解析する。`UPDATE ... SET` の右辺
+    /// （SQL-45）と `ALTER COLUMN TYPE ... USING`（TABLE-40、Issue #1635）が共有する。
+    fn parse_bounded_value_expr(&mut self) -> Result<Expr, SqlSurfaceError> {
         let saved = self.expr_node_budget;
         self.expr_node_budget = MAX_EXPR_NODES;
         // `-a`（単項マイナス）は式解析中だけ許可する（`0 - a` へ脱糖される）。
@@ -8183,7 +8307,7 @@ impl<'a> Parser<'a> {
         self.allow_unary_minus = prev_minus;
         self.allow_plus_number = prev_plus;
         self.expr_node_budget = saved;
-        Ok(SetValue::Expr(parsed?))
+        parsed
     }
 
     /// リテラル 1 要素（文字列・数値・`true`/`false`・大小無視の `NULL`・符号付き
@@ -8798,20 +8922,56 @@ impl<'a> Parser<'a> {
     /// 受理する。`ALTER`／`TABLE`／`ADD`／`COLUMN`／`DROP`／`CONSTRAINT` は
     /// `lexer::Keyword` へ含めない設計方針（`lexer.rs` のモジュールドキュメント
     /// 参照）のため、いずれも `expect_contextual_keyword` で文脈的に照合する。
-    /// `IF NOT EXISTS`・複数 `ADD`／`DROP`・`ADD CONSTRAINT ... CHECK ... NOT VALID`／
+    /// 複数アクション・`ADD COLUMN IF NOT EXISTS` は Issue #1633 以降の受理範囲（下記参照）。
+    /// `ADD CONSTRAINT ... CHECK ... NOT VALID`／
     /// `PRIMARY KEY`・`DROP CONSTRAINT IF EXISTS`／`CASCADE`／
     /// `RESTRICT`・`DROP COLUMN IF EXISTS`・`USING OPERATION_ID` はいずれも
     /// 構造的に受理しない（設計 D6。`expect_end_of_statement` が余剰トークンとして
     /// `42601` で拒否するか、`ADD`／`DROP` の直後に許可形状以外が続いた時点で
     /// `expect_contextual_keyword` が拒否する）。
+    ///
+    /// **Issue #1633（TABLE-36・TABLE-39 (5) のポインタ）**: `ADD COLUMN` の直後の
+    /// `IF NOT EXISTS` を受理し、`,` 区切りの複数アクションを [`ParsedAlterTableShape::Multiple`]
+    /// として返す（1 個なら従来どおり単一 variant。単一アクションの挙動を構造的に変えない）。
+    /// アクション数は [`MAX_ALTER_TABLE_ACTIONS`] を超える前に `54000` で拒否する。複数アクション
+    /// に含められる種別の判定は [`into_validated_alter_table`] が行う。
     fn parse_alter_table(&mut self) -> Result<ParsedAlterTableShape, SqlSurfaceError> {
         self.expect_contextual_keyword("ALTER")?;
         self.expect_contextual_keyword("TABLE")?;
         let table_name = self.expect_ident()?;
+        let first = self.parse_alter_table_action(table_name.clone())?;
+        if !matches!(self.peek(), Some(Token::Punct(','))) {
+            return Ok(first);
+        }
+        let mut actions = vec![first];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            // 確保前に上限を検査する（無制限リソース確保の防止）。
+            if actions.len() >= MAX_ALTER_TABLE_ACTIONS {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "too many ALTER TABLE actions: limit is {MAX_ALTER_TABLE_ACTIONS}"
+                )));
+            }
+            actions.push(self.parse_alter_table_action(table_name.clone())?);
+        }
+        Ok(ParsedAlterTableShape::Multiple {
+            table_name,
+            actions,
+        })
+    }
+
+    /// `ALTER TABLE <table>` の直後に続くアクション 1 個ぶん（`ADD`／`DROP`／`ALTER COLUMN`／
+    /// `RENAME`）を読む。[`Self::parse_alter_table`] が `,` 区切りで繰り返し呼ぶ。
+    fn parse_alter_table_action(
+        &mut self,
+        table_name: String,
+    ) -> Result<ParsedAlterTableShape, SqlSurfaceError> {
         if self.peek_contextual_keyword("ADD") {
             self.advance();
             if self.peek_contextual_keyword("COLUMN") {
                 self.advance();
+                // `IF NOT EXISTS`（TABLE-36、Issue #1633）。列名の直前に置く。
+                let if_not_exists = self.parse_optional_if_not_exists();
                 let column_name = self.expect_ident()?;
                 // 予約列名（`id`／`tenant_id`／`visibility`。ASCII の大文字小文字を
                 // 無視）は `parse_create_table_column` と同じく構造検証段階で拒否する
@@ -8872,6 +9032,7 @@ impl<'a> Parser<'a> {
                         not_null: constraints.not_null,
                         default: constraints.default,
                         collation: constraints.collation,
+                        if_not_exists,
                     },
                 ));
             }
@@ -8973,20 +9134,69 @@ impl<'a> Parser<'a> {
             });
         }
         // `ALTER COLUMN <col> TYPE <型名> [COLLATE <name>]`（TABLE-19、Issue #1167。
-        // `COLLATE` は TABLE-28・Issue #1609）。`SET DATA TYPE`・`USING` は `TYPE` 不一致／
-        // 余剰トークンとして `42601`。
+        // `COLLATE` は TABLE-28・Issue #1609）。`SET DATA TYPE` と `USING <式>` は
+        // TABLE-40（Issue #1635）。`USING` は `COLLATE` の後ろにだけ置ける（逆順は余剰トークンで `42601`）。
         if self.peek_contextual_keyword("ALTER") {
             self.advance();
             self.expect_contextual_keyword("COLUMN")?;
             let column_name = self.expect_ident()?;
             reject_reserved_alter_column_name(&column_name)?;
-            // `ALTER COLUMN <col> SET NOT NULL`（TABLE-39 (3)、Issue #1631）。`SET DEFAULT`・
-            // `SET DATA TYPE` 等は `42601`。
-            if self.peek_contextual_keyword("SET") {
+            // `ALTER COLUMN <col> SET NOT NULL`（TABLE-39 (3)、Issue #1631）・
+            // `SET DEFAULT <式>`（TABLE-39 (1)、Issue #1628）。`SET DATA TYPE` は `TYPE` と
+            // 同義（TABLE-40、Issue #1635）で下の `TYPE` 処理へ合流する。それ以外は `42601`。
+            let set_data_type = self.peek_contextual_keyword("SET")
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("DATA"));
+            if set_data_type {
                 self.advance();
+                self.advance();
+            } else if self.peek_contextual_keyword("SET") {
+                self.advance();
+                if self.peek_ident_matches("DEFAULT") {
+                    self.advance();
+                    // 式の許可範囲は `CREATE TABLE` の列 DEFAULT と同じ（時刻値関数を先に試し、
+                    // 該当しなければ定数リテラル・定数式）。複合式は定数式経路が拒否する。
+                    if let Some(t) = self.try_parse_time_default()? {
+                        return Ok(ParsedAlterTableShape::AlterColumnSetDefault {
+                            table_name,
+                            column_name,
+                            default: None,
+                            time_default: Some(t),
+                        });
+                    }
+                    // `SET DEFAULT NULL` は既定値なしと同義（`CREATE TABLE` と同じ正規化。
+                    // SQL-41）。以降の束縛・カタログは `InsertLiteral::Null` を受け取らない。
+                    let default = match self.expect_literal_or_const_expr()? {
+                        InsertLiteral::Null => None,
+                        lit => Some(lit),
+                    };
+                    return Ok(ParsedAlterTableShape::AlterColumnSetDefault {
+                        table_name,
+                        column_name,
+                        default,
+                        time_default: None,
+                    });
+                }
                 self.expect_contextual_keyword("NOT")?;
                 self.expect_contextual_keyword("NULL")?;
                 return Ok(ParsedAlterTableShape::AlterColumnSetNotNull {
+                    table_name,
+                    column_name,
+                });
+            }
+            // `ALTER COLUMN <col> DROP DEFAULT`（TABLE-39 (2)、Issue #1628）・
+            // `DROP NOT NULL`（TABLE-39 (4)、Issue #1632）。それ以外は `42601`。
+            if !set_data_type && self.peek_contextual_keyword("DROP") {
+                self.advance();
+                if self.peek_contextual_keyword("NOT") {
+                    self.advance();
+                    self.expect_contextual_keyword("NULL")?;
+                    return Ok(ParsedAlterTableShape::AlterColumnDropNotNull {
+                        table_name,
+                        column_name,
+                    });
+                }
+                self.expect_contextual_keyword("DEFAULT")?;
+                return Ok(ParsedAlterTableShape::AlterColumnDropDefault {
                     table_name,
                     column_name,
                 });
@@ -9001,11 +9211,22 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            // 任意の `USING <式>`（TABLE-40、Issue #1635）。ノード予算つきで `,`・`;`・文末まで読む。
+            let using = if self.peek_ident_matches("USING") {
+                self.advance();
+                let prev = std::mem::replace(&mut self.using_keyword_literals, true);
+                let parsed = self.parse_bounded_value_expr();
+                self.using_keyword_literals = prev;
+                Some(parsed?)
+            } else {
+                None
+            };
             return Ok(ParsedAlterTableShape::AlterColumnType {
                 table_name,
                 column_name,
                 column_type,
                 collation,
+                using,
             });
         }
         // `RENAME [COLUMN] <old> TO <new>`（TABLE-38 のポインタ、Issue #1619）。
@@ -11200,7 +11421,7 @@ pub(crate) fn validate_create_view_tokens(
     })
 }
 
-/// `CREATE INDEX <name> ON <table> [USING hnsw] (<col> [COLLATE <name>][, ...])` の許可形状構造
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> [USING btree｜hnsw] (<col> [COLLATE <name>][, ...])` の許可形状構造
 /// 検証結果（TASK-206・INDEX-7・SQL-23、Issue #908）。[`ValidatedDropTable`] と
 /// 同じくカタログ照会を一切行わない（列の存在・型整合・名前衝突・対象の種別は
 /// `sql::ddl::execute_create_index` → `catalog::Storage::create_index` が単一の
@@ -11211,16 +11432,24 @@ pub struct ValidatedCreateIndex {
     /// `IF NOT EXISTS` 句の有無（TABLE-36、Issue #1613。名前付きのみ）。
     pub(crate) if_not_exists: bool,
     pub(crate) table: String,
-    /// `USING hnsw` 指定の有無（`hnsw` 以外の `USING` 値は構造検証段で `0A000`
-    /// 拒否済み）。
+    /// `USING hnsw` 指定の有無（`btree` は省略時と同じ `false`。`hnsw`・`btree` 以外の
+    /// `USING` 値は構造検証段で `0A000` 拒否済み。Issue #1617）。
     pub(crate) hnsw: bool,
     pub(crate) columns: Vec<String>,
     /// `columns` と同じ長さの列ごとの `COLLATE`（`None` は照合指定なし。Issue #2191・
     /// TABLE-28）。名前の解決は固定の許可リストとの完全一致だけで、カタログを参照しない。
     pub(crate) collations: Vec<Option<crate::collation::Collation>>,
+    /// `CREATE UNIQUE INDEX` か（Issue #1616・INDEX-9）。UNIQUE 制約への展開は
+    /// `catalog::Storage::create_index` が担う。
+    pub(crate) unique: bool,
 }
 
 impl ValidatedCreateIndex {
+    /// `CREATE UNIQUE INDEX` か。真のとき実行段は `IndexDef::with_unique(true)` で渡す。
+    pub fn is_unique(&self) -> bool {
+        self.unique
+    }
+
     /// `IF NOT EXISTS` 句の有無。真なら同名の関係があるとき実行段は何もせず成功を返す。
     pub fn if_not_exists(&self) -> bool {
         self.if_not_exists
@@ -11272,7 +11501,10 @@ impl ValidatedDropIndex {
 /// 分岐判定。`CREATE`・`INDEX` は予約語化せず文頭でのみ文脈的に照合する）。
 pub(crate) fn is_create_index_statement(tokens: &[Token]) -> bool {
     matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE"))
-        && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("INDEX"))
+        && (matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("INDEX"))
+            // `CREATE UNIQUE INDEX`（Issue #1616・INDEX-9）。
+            || (matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("UNIQUE"))
+                && matches!(tokens.get(2), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("INDEX"))))
 }
 
 /// 先頭 2 トークンが `DROP INDEX` か（[`is_create_index_statement`] と同じ流儀）。
@@ -11284,13 +11516,17 @@ pub(crate) fn is_drop_index_statement(tokens: &[Token]) -> bool {
 /// [`ValidatedCreateIndex`] の構造検証本体（TASK-206・INDEX-7、Issue #908）。
 /// カタログを参照しない範囲の判定はここで完結させる（fail-closed。権限の無い
 /// 呼び出し元へ存在情報を漏らさないよう、カタログ照会を要する検査は一切行わない）:
-/// - `USING <ident>` が `hnsw` 以外 → `0A000`（`FeatureNotSupported`）。
+/// - `USING <ident>` が `hnsw`・`btree` 以外 → `0A000`（`FeatureNotSupported`）。
+///   `USING btree` は省略時と同一のスカラー宣言（INDEX-9、Issue #1617）。
 /// - `USING hnsw` なのに列が複数 → `0A000`。
 /// - 列リストの要素が式・関数呼び出し・リテラル → `0A000`。
 /// - 部分索引の `WHERE` 句 → `0A000`。
 /// - 列リストに重複する列名 → `42601`。列数上限超過 → `54000`。
 ///
-/// `UNIQUE`／`CONCURRENTLY`／`INCLUDE`／`WITH (...)`／
+/// - `UNIQUE` は `CREATE` 直後のみ受理（Issue #1616・INDEX-9）。`UNIQUE` かつ `USING hnsw`／
+///   `COLLATE` → `0A000`。
+///
+/// `CONCURRENTLY`／`INCLUDE`／`WITH (...)`／
 /// `ASC|DESC`／opclass・スキーマ修飾名・`$n` 等は、いずれも期待するトークン列と
 /// 一致しないため `expect_*` ヘルパー経由で構造的に `42601` へ落ちる。
 pub(crate) fn validate_create_index_tokens(
@@ -11298,6 +11534,13 @@ pub(crate) fn validate_create_index_tokens(
 ) -> Result<ValidatedCreateIndex, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     p.expect_ident_matching("CREATE")?;
+    // `UNIQUE` は `CREATE` と `INDEX` の間でだけ受理する（Issue #1616・INDEX-9）。
+    let unique = if p.peek_ident_matches("UNIQUE") {
+        p.advance();
+        true
+    } else {
+        false
+    };
     p.expect_ident_matching("INDEX")?;
     let if_not_exists = p.parse_optional_if_not_exists();
     // 名前を省いた `CREATE INDEX IF NOT EXISTS ON t (c)` は PostgreSQL 17 でも名前が
@@ -11313,12 +11556,17 @@ pub(crate) fn validate_create_index_tokens(
     let hnsw = if p.peek_ident_matches("USING") {
         p.advance();
         let method = p.expect_ident()?;
-        if !method.eq_ignore_ascii_case("hnsw") {
+        if method.eq_ignore_ascii_case("hnsw") {
+            true
+        } else if method.eq_ignore_ascii_case("btree") {
+            // PG の既定方式の明示。`USING` 省略時と同一のスカラー宣言として扱う
+            // （カタログ表現は変えない。INDEX-9、Issue #1617）。
+            false
+        } else {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: truncate_for_error(&format!("index method {method} is not supported")),
             });
         }
-        true
     } else {
         false
     };
@@ -11349,6 +11597,18 @@ pub(crate) fn validate_create_index_tokens(
             )));
         }
     }
+    // 一意索引の未対応の組み合わせ（Issue #1616・INDEX-9。カタログ非参照の構文段で拒否）。
+    // 一意キーの正準化は照合を見ないため `COLLATE` 付きは受理しない。
+    if unique && hnsw {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "CREATE UNIQUE INDEX does not support USING hnsw".to_string(),
+        });
+    }
+    if unique && collations.iter().any(Option::is_some) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "CREATE UNIQUE INDEX does not support COLLATE".to_string(),
+        });
+    }
     // 部分索引（PostgreSQL 拡張構文）の `WHERE` 句は許可形状外の「機能」として
     // `0A000`（`expect_end_of_statement` の汎用検査に落とすと `42601` になる）。
     if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
@@ -11364,6 +11624,7 @@ pub(crate) fn validate_create_index_tokens(
         hnsw,
         columns,
         collations,
+        unique,
     })
 }
 
@@ -11541,11 +11802,17 @@ struct ParsedAlterTableAddColumnShape {
     not_null: bool,
     default: Option<InsertLiteral>,
     collation: Option<crate::collation::Collation>,
+    if_not_exists: bool,
 }
 
 /// 構文木（[`ValidatedAlterTable`] の元）。カタログ存在確認前の中間結果
 /// （Issue #1067・#1068）。[`Parser::parse_alter_table`] が返す 9 形状の和。
 enum ParsedAlterTableShape {
+    /// `,` 区切りの複数アクション（Issue #1633）。要素は常に 2 個以上の単一アクション。
+    Multiple {
+        table_name: String,
+        actions: Vec<ParsedAlterTableShape>,
+    },
     AddColumn(ParsedAlterTableAddColumnShape),
     AddUnique {
         table_name: String,
@@ -11574,6 +11841,7 @@ enum ParsedAlterTableShape {
         column_name: String,
         column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
         collation: Option<crate::collation::Collation>,
+        using: Option<crate::sql::udf_call::Expr>,
     },
     AddPrimaryKey {
         table_name: String,
@@ -11581,6 +11849,20 @@ enum ParsedAlterTableShape {
         columns: Vec<String>,
     },
     AlterColumnSetNotNull {
+        table_name: String,
+        column_name: String,
+    },
+    AlterColumnDropNotNull {
+        table_name: String,
+        column_name: String,
+    },
+    AlterColumnSetDefault {
+        table_name: String,
+        column_name: String,
+        default: Option<InsertLiteral>,
+        time_default: Option<crate::catalog::TimeDefault>,
+    },
+    AlterColumnDropDefault {
         table_name: String,
         column_name: String,
     },
@@ -15087,8 +15369,49 @@ pub fn validate_alter_table_tokens(
     let mut p = Parser::new(tokens);
     let shape = p.parse_alter_table()?;
     p.expect_end_of_statement()?;
+    into_validated_alter_table(shape)
+}
 
+/// 構文木を [`ValidatedAlterTable`] へ変換する。複数アクション（Issue #1633）に含められない
+/// 種別はここで構文段（カタログ非参照）に拒否する: `RENAME` との混在は `42601`
+/// （TABLE-38 (6)・TABLE-39 (5) のポインタ）、制約の追加・削除と `ALTER COLUMN TYPE` との混在は
+/// `0A000`（未対応。fail-closed）。
+fn into_validated_alter_table(
+    shape: ParsedAlterTableShape,
+) -> Result<ValidatedAlterTable, SqlSurfaceError> {
     Ok(match shape {
+        ParsedAlterTableShape::Multiple {
+            table_name,
+            actions,
+        } => {
+            let mut validated = Vec::with_capacity(actions.len());
+            for action in actions {
+                match action {
+                    ParsedAlterTableShape::RenameColumn { .. } => {
+                        return Err(SqlSurfaceError::unsupported(
+                            "RENAME cannot be combined with other ALTER TABLE actions",
+                        ));
+                    }
+                    ParsedAlterTableShape::AddUnique { .. }
+                    | ParsedAlterTableShape::AddCheck { .. }
+                    | ParsedAlterTableShape::DropConstraint { .. }
+                    | ParsedAlterTableShape::AddForeignKey { .. }
+                    | ParsedAlterTableShape::AddPrimaryKey { .. }
+                    | ParsedAlterTableShape::AlterColumnType { .. }
+                    | ParsedAlterTableShape::Multiple { .. } => {
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "multiple ALTER TABLE actions including this action are not supported"
+                                .to_string(),
+                        });
+                    }
+                    other => validated.push(into_validated_alter_table(other)?),
+                }
+            }
+            ValidatedAlterTable::Multiple(ValidatedAlterTableMultiple {
+                table_name,
+                actions: validated,
+            })
+        }
         ParsedAlterTableShape::AddColumn(shape) => {
             ValidatedAlterTable::AddColumn(ValidatedAlterTableAddColumn {
                 table_name: shape.table_name,
@@ -15097,6 +15420,7 @@ pub fn validate_alter_table_tokens(
                 not_null: shape.not_null,
                 default: shape.default,
                 collation: shape.collation,
+                if_not_exists: shape.if_not_exists,
             })
         }
         ParsedAlterTableShape::AddUnique {
@@ -15150,6 +15474,35 @@ pub fn validate_alter_table_tokens(
             table_name,
             column_name,
         }),
+        ParsedAlterTableShape::AlterColumnDropNotNull {
+            table_name,
+            column_name,
+        } => {
+            ValidatedAlterTable::AlterColumnDropNotNull(ValidatedAlterTableAlterColumnDropNotNull {
+                table_name,
+                column_name,
+            })
+        }
+        ParsedAlterTableShape::AlterColumnSetDefault {
+            table_name,
+            column_name,
+            default,
+            time_default,
+        } => ValidatedAlterTable::AlterColumnSetDefault(ValidatedAlterTableAlterColumnSetDefault {
+            table_name,
+            column_name,
+            default,
+            time_default,
+        }),
+        ParsedAlterTableShape::AlterColumnDropDefault {
+            table_name,
+            column_name,
+        } => {
+            ValidatedAlterTable::AlterColumnDropDefault(ValidatedAlterTableAlterColumnDropDefault {
+                table_name,
+                column_name,
+            })
+        }
         ParsedAlterTableShape::RenameColumn {
             table_name,
             column_name,
@@ -15164,11 +15517,13 @@ pub fn validate_alter_table_tokens(
             column_name,
             column_type,
             collation,
+            using,
         } => ValidatedAlterTable::AlterColumnType(ValidatedAlterTableAlterColumnType {
             table_name,
             column_name,
             column_type,
             collation,
+            using,
         }),
     })
 }
@@ -15727,6 +16082,93 @@ pub(crate) fn validate_update_form_tokens(
 
 #[cfg(test)]
 mod tests {
+    /// TABLE-40・Issue #1635: `ALTER COLUMN TYPE` の `SET DATA TYPE`・`USING` の構文。
+    #[test]
+    fn alter_column_type_parses_set_data_type_and_using() {
+        use super::*;
+        let using_of = |sql: &str| match validate_alter_table(sql).expect(sql) {
+            ValidatedAlterTable::AlterColumnType(a) => a,
+            other => panic!("unexpected: {other:?}"),
+        };
+        let plain = using_of("ALTER TABLE t ALTER COLUMN a TYPE BIGINT");
+        assert!(plain.using.is_none());
+        let set_data = using_of("ALTER TABLE t ALTER COLUMN a SET DATA TYPE BIGINT");
+        assert_eq!(plain, set_data);
+        let with_using = using_of("ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING a + 1;");
+        assert!(with_using.using.is_some());
+        let both = using_of("ALTER TABLE t ALTER COLUMN a TYPE TEXT COLLATE \"C\" USING a::text");
+        assert!(both.using.is_some() && both.collation.is_some());
+        // 引用なしの NULL・true・false はリテラルとして受理する（SET のリテラル経路と同じ）。
+        for ok in [
+            "ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING NULL",
+            "ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING null",
+            "ALTER TABLE t ALTER COLUMN a TYPE INTEGER USING true::int",
+            "ALTER TABLE t ALTER COLUMN a TYPE BOOLEAN USING false",
+            "ALTER TABLE t ALTER COLUMN a TYPE BOOLEAN USING TRUE;",
+        ] {
+            assert!(using_of(ok).using.is_some(), "{ok}");
+        }
+        match using_of("ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING \"null\"").using {
+            Some(crate::sql::udf_call::Expr::Ident(n)) => assert_eq!(n, "null"),
+            other => panic!("quoted null must stay an identifier: {other:?}"),
+        }
+        for word in ["true", "false", "TRUE"] {
+            let sql = format!("ALTER TABLE t ALTER COLUMN a TYPE BOOLEAN USING \"{word}\"");
+            match using_of(&sql).using {
+                Some(crate::sql::udf_call::Expr::Ident(n)) => assert_eq!(n, word),
+                other => panic!("quoted {word} must stay an identifier: {other:?}"),
+            }
+        }
+        for bad in [
+            "ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING",
+            "ALTER TABLE t ALTER COLUMN a TYPE TEXT USING a COLLATE \"C\" x",
+            "ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING a USING b",
+            "ALTER TABLE t ALTER COLUMN a SET DATA BIGINT",
+            "ALTER TABLE t ALTER COLUMN a TYPE BIGINT USING OPERATION_ID 'x'",
+        ] {
+            let err = validate_alter_table(bad).expect_err(bad);
+            assert_eq!(err.wire_code(), "42601", "{bad}");
+        }
+    }
+
+    /// `USING btree` は省略形と同一の宣言で、`hnsw`・`btree` 以外の手法は `0A000`
+    /// （INDEX-9、Issue #1617）。
+    #[test]
+    fn create_index_using_btree_equals_omitted_and_other_methods_rejected() {
+        use super::*;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            validate_create_index_tokens(&tokens)
+        };
+        assert_eq!(
+            parse("CREATE INDEX i ON t USING btree (a, b)").expect("btree"),
+            parse("CREATE INDEX i ON t (a, b)").expect("omitted")
+        );
+        assert_eq!(
+            parse("CREATE INDEX i ON t USING BTREE (a COLLATE \"C\")").expect("upper"),
+            parse("CREATE INDEX i ON t (a COLLATE \"C\")").expect("omitted")
+        );
+        let ine = parse("CREATE INDEX IF NOT EXISTS i ON t USING btree (a)").expect("ine");
+        assert!(ine.if_not_exists());
+        for m in ["bm25", "hash", "gin", "gist"] {
+            assert!(
+                matches!(
+                    parse(&format!("CREATE INDEX i ON t USING {m} (a)")),
+                    Err(SqlSurfaceError::FeatureNotSupported { .. })
+                ),
+                "{m}"
+            );
+        }
+        assert!(matches!(
+            parse("CREATE INDEX i ON t USING (a)"),
+            Err(SqlSurfaceError::UnsupportedSyntax { .. })
+        ));
+        assert!(matches!(
+            parse("CREATE INDEX i ON t USING hnsw (a, b)"),
+            Err(SqlSurfaceError::FeatureNotSupported { .. })
+        ));
+    }
+
     /// `CREATE INDEX` の列ごとの `COLLATE`（TABLE-28、Issue #2191）。名前は構文段で許可リストに
     /// 解決し、二重指定は `42601`、未知の名前は `42704`、式索引は `0A000`。
     #[test]
@@ -15758,6 +16200,38 @@ mod tests {
             ("CREATE INDEX i ON t (a COLLATE 'C')", "42601"),
             ("CREATE INDEX i ON t (lower(a) COLLATE \"C\")", "0A000"),
             ("CREATE INDEX i ON t (a COLLATE \"C\", a)", "42601"),
+        ] {
+            assert_eq!(parse(sql).expect_err(sql).wire_code(), code, "{sql}");
+        }
+    }
+
+    /// `CREATE UNIQUE INDEX`（Issue #1616・INDEX-9）。`UNIQUE` は `CREATE` 直後だけ受理し、
+    /// `USING hnsw`・`COLLATE` との組み合わせは構文段で `0A000`、分岐判定は両形を拾う。
+    #[test]
+    fn create_unique_index_parses_and_rejects_unsupported_combinations() {
+        use super::*;
+        let tokens = |sql: &str| crate::sql::lexer::tokenize(sql).expect("tokenize");
+        let parse = |sql: &str| validate_create_index_tokens(&tokens(sql));
+        let ok = parse("CREATE UNIQUE INDEX IF NOT EXISTS i ON t (a, b)").expect("accepted");
+        assert!(ok.is_unique() && ok.if_not_exists());
+        assert_eq!(ok.columns(), ["a", "b"]);
+        assert!(!parse("CREATE INDEX i ON t (a)").expect("plain").is_unique());
+        assert!(is_create_index_statement(&tokens(
+            "CREATE UNIQUE INDEX i ON t (a)"
+        )));
+        assert!(is_create_index_statement(&tokens(
+            "CREATE INDEX i ON t (a)"
+        )));
+        assert!(!is_create_index_statement(&tokens(
+            "CREATE UNIQUE i ON t (a)"
+        )));
+        for (sql, code) in [
+            ("CREATE UNIQUE INDEX i ON t USING hnsw (v)", "0A000"),
+            ("CREATE UNIQUE INDEX i ON t (a COLLATE \"C\")", "0A000"),
+            ("CREATE UNIQUE INDEX ON t (a)", "42601"),
+            ("CREATE INDEX UNIQUE i ON t (a)", "42601"),
+            ("CREATE UNIQUE UNIQUE INDEX i ON t (a)", "42601"),
+            ("CREATE UNIQUE INDEX i ON t (a, a)", "42601"),
         ] {
             assert_eq!(parse(sql).expect_err(sql).wire_code(), code, "{sql}");
         }
@@ -15917,6 +16391,70 @@ mod tests {
         let err = validate_alter_table("ALTER TABLE docs ADD PRIMARY KEY (a, a)")
             .expect_err("duplicate column");
         assert_eq!(err.wire_code(), "42701");
+    }
+
+    /// `ALTER COLUMN ... SET DEFAULT <式>`／`DROP DEFAULT` の構文受理・拒否（Issue #1628・
+    /// TABLE-39 (1)(2)）。`SET DEFAULT NULL` は既定値なしに正規化される。
+    #[test]
+    fn alter_column_set_and_drop_default_syntax() {
+        let set = |sql: &str| match validate_alter_table(sql) {
+            Ok(ValidatedAlterTable::AlterColumnSetDefault(s)) => s,
+            other => panic!("{sql}: unexpected {other:?}"),
+        };
+        let s = set("ALTER TABLE docs ALTER COLUMN a SET DEFAULT 'x';");
+        assert_eq!(s.table_name, "docs");
+        assert_eq!(s.column_name, "a");
+        assert_eq!(s.default, Some(InsertLiteral::String("x".to_string())));
+        assert_eq!(s.time_default, None);
+        assert_eq!(
+            set("ALTER TABLE docs ALTER COLUMN a SET DEFAULT 12").default,
+            Some(InsertLiteral::Number("12".to_string()))
+        );
+        assert_eq!(
+            set("ALTER TABLE docs ALTER COLUMN a SET DEFAULT true").default,
+            Some(InsertLiteral::Bool(true))
+        );
+        let null = set("ALTER TABLE docs ALTER COLUMN a SET DEFAULT NULL");
+        assert_eq!((null.default, null.time_default), (None, None));
+        for sql in [
+            "ALTER TABLE docs ALTER COLUMN a SET DEFAULT now()",
+            "ALTER TABLE docs ALTER COLUMN a SET DEFAULT CURRENT_TIMESTAMP",
+        ] {
+            let t = set(sql);
+            assert_eq!(t.default, None, "{sql}");
+            assert!(t.time_default.is_some(), "{sql}");
+        }
+        match validate_alter_table("ALTER TABLE docs ALTER COLUMN a DROP DEFAULT;") {
+            Ok(ValidatedAlterTable::AlterColumnDropDefault(d)) => {
+                assert_eq!(d.table_name, "docs");
+                assert_eq!(d.column_name, "a");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match validate_alter_table("ALTER TABLE docs ALTER COLUMN a DROP NOT NULL;") {
+            Ok(ValidatedAlterTable::AlterColumnDropNotNull(d)) => {
+                assert_eq!(d.table_name, "docs");
+                assert_eq!(d.column_name, "a");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let e = SqlSurfaceError::column_in_primary_key("c");
+        assert_eq!(e.wire_code(), "42P16");
+        assert_eq!(e.to_string(), "column \"c\" is in a primary key");
+        for sql in [
+            "ALTER TABLE docs ALTER a DROP NOT NULL",
+            "ALTER TABLE docs ALTER COLUMN a DROP NOT NULL extra",
+            "ALTER TABLE docs ALTER COLUMN a DROP NULL",
+            "ALTER TABLE docs ALTER COLUMN id DROP NOT NULL",
+            "ALTER TABLE docs ALTER a SET DEFAULT 1",
+            "ALTER TABLE docs ALTER COLUMN a SET DEFAULT",
+            "ALTER TABLE docs ALTER COLUMN id SET DEFAULT 1",
+            "ALTER TABLE docs ALTER COLUMN id DROP DEFAULT",
+            "ALTER TABLE docs ALTER COLUMN a DROP DEFAULT extra",
+        ] {
+            let err = validate_alter_table(sql).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     /// storage 非依存の単体テスト用フェイク（`Storage` を必要としないための軽量抽象）。
