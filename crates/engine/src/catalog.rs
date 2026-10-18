@@ -9724,8 +9724,9 @@ impl Storage {
     /// 旧名・新名の両方を進める（旧名のキャッシュ失効と、新名で過去にキャッシュされた
     /// エントリとの衝突回避）。
     ///
-    /// 既知の制約（Issue #1625 で追随）: `operation_id` 台帳・`last_op`・分割実行ジョブは
-    /// 表名をキーに持つが本関数では触れない。
+    /// 既知の制約（Issue #1625 で追随）: `operation_id` 台帳（`last_op` を含む）・分割実行
+    /// ジョブは表名をキーに持つため、旧名・新名の両方について同一 txn で削除する。改名後は
+    /// 直前の操作情報（`last_op`）も失われ、改名前の `operation_id` の再送も判定されない。
     pub(crate) fn alter_table_rename(
         &self,
         table_name: &str,
@@ -9805,7 +9806,24 @@ impl Storage {
             user_rows_table_def(&old_rows),
             user_rows_table_def(&new_rows),
         ) {
-            Ok(()) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Ok(()) => {}
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                // 改名元が未作成でも、改名先の孤児行テーブルは露出させない。
+                // `open_table` は未存在を作成してしまうため `list_tables` で存在確認する。
+                let target_exists = {
+                    use redb::TableHandle;
+                    write_txn
+                        .list_tables()
+                        .map_err(CatalogError::from)?
+                        .any(|handle| handle.name() == new_rows)
+                };
+                if target_exists {
+                    return Err(CatalogError::CorruptSchema(
+                        "row store already exists for rename target".to_string(),
+                    )
+                    .into());
+                }
+            }
             Err(redb::TableError::TableExists(_)) => {
                 return Err(CatalogError::CorruptSchema(
                     "row store already exists for rename target".to_string(),
@@ -17436,6 +17454,47 @@ mod tests {
         storage
             .get_row_from_table("docs", "t", 1)
             .expect("docs rows untouched");
+        assert!(storage.get_table_schema("orphan").is_err());
+    }
+
+    /// 改名元の行テーブルが未作成（一度も書かれていない）でも、改名先の孤児行テーブルは
+    /// fail-closed で拒否する（TABLE-38 のポインタ、Issue #1623）。
+    #[test]
+    fn alter_table_rename_refuses_orphan_row_store_when_source_has_no_rows() {
+        let path = unique_db_path("rename-table-orphan-empty-src");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = |name: &str| {
+            TableSchema::new(
+                name,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            )
+        };
+        storage.create_table(&schema("docs")).expect("create");
+        let row = [
+            RowCodecValue::Vector(vec![1.0, 2.0]),
+            RowCodecValue::Text("x".to_string()),
+        ];
+        storage.create_table(&schema("orphan")).expect("orphan");
+        storage
+            .insert_typed_row("orphan", 7, "t", Visibility::Public, &row)
+            .expect("insert orphan");
+        {
+            let w = storage.begin_write_txn().expect("txn");
+            {
+                let mut t = w.open_table(CATALOG_TABLE).expect("catalog");
+                t.remove("orphan").expect("remove");
+            }
+            bump_table_generation_in_txn(&w, "orphan").expect("bump");
+            crate::recovery::commit_boundary::commit(w).expect("commit");
+        }
+        let gen_before = storage.table_generation("docs").expect("gen");
+        assert!(storage.alter_table_rename("docs", "orphan").is_err());
+        assert_eq!(gen_before, storage.table_generation("docs").expect("gen"));
+        assert!(storage.get_table_schema("docs").is_ok());
         assert!(storage.get_table_schema("orphan").is_err());
     }
 
