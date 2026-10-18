@@ -532,3 +532,18 @@ fn unchanged_rejections() {
         "42804"
     );
 }
+
+/// 配列 → 文字列型は I/O 変換の代入変換として受理される（SQL-47 のポインタ）。空の表でも
+/// 行のある表でも `0A000` にならず、全行が文字列へ書き換わる。
+#[test]
+fn array_to_text_assignment_is_accepted() {
+    let (_path, _g, core) = open("rw-array-to-text");
+    ok(&core, "CREATE TABLE t (a INTEGER[])");
+    ok(&core, "ALTER TABLE t ALTER COLUMN a TYPE TEXT");
+    assert_eq!(column_type(&core, "t", "a"), ColumnType::Text);
+
+    ok(&core, "CREATE TABLE u (a INTEGER[])");
+    insert(&core, "u", 1, "a", "ARRAY[1, 2]");
+    ok(&core, "ALTER TABLE u ALTER COLUMN a TYPE VARCHAR(20)");
+    assert_eq!(firsts(&core, "SELECT a FROM u LIMIT 5").len(), 1);
+}

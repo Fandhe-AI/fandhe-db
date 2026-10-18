@@ -1064,6 +1064,7 @@ pub(super) fn bind_scalar_assignment(
     let Some(target_cast) = cast_type_of_column(target) else {
         return Err(not_implemented("unknown", &CastType::Text));
     };
+    let mut array_elem: Option<ArrayElemType> = None;
     let from_kind = match source_cast_kind(expr, &bound, ty, Some(schema)) {
         SourceKind::Known(k) => k,
         SourceKind::UnknownNumeric => match target_cast.kind() {
@@ -1075,9 +1076,16 @@ pub(super) fn bind_scalar_assignment(
             | CastKind::Numeric => CastKind::Float8,
             _ => return Err(not_implemented("numeric", &target_cast)),
         },
-        SourceKind::Array(_) | SourceKind::Outside => {
-            return Err(not_implemented("unknown", &target_cast))
+        // 配列 → 文字列型は I/O 変換の代入（`cast_bound` と同じく要素型を保持して描画する）。
+        // 要素型を CAST の型で表せない配列（ENUM 要素）は `Enum` として扱い、配列への変換は未対応。
+        SourceKind::Array(elem) => {
+            array_elem = match &elem {
+                Some(e) => CastType::Array(Box::new(e.clone())).array_elem_type(),
+                None => Some(ArrayElemType::Enum),
+            };
+            CastKind::Array
         }
+        SourceKind::Outside => return Err(not_implemented("unknown", &target_cast)),
     };
     if !is_assignment_rule(cast_rule(from_kind, target_cast.kind())) {
         return Err(SqlSurfaceError::CannotCoerce {
@@ -1090,7 +1098,15 @@ pub(super) fn bind_scalar_assignment(
         other => other.clone(),
     };
     let (Some(src), Some(dst), Some(result_ty)) = (
-        cast_src(from_kind, ty, None),
+        cast_src(
+            from_kind,
+            if array_elem.is_some() {
+                ExprType::Array
+            } else {
+                ty
+            },
+            array_elem,
+        ),
         cast_dst(&dst_ty),
         dst_ty.expr_type(),
     ) else {
