@@ -19,7 +19,9 @@
 //! `INDEX_CATALOG_TABLE` から表名で引く）。
 //!
 //! 根集合の除外: 依存先が同じ文で DROP する対象（根集合）に含まれるなら、列挙結果に入れない
-//! （参照元の表ごと消える FK、同時に消えるビュー、同時に消える表の列）。
+//! （参照元の表ごと消える FK、同時に消えるビュー、同時に消える表の列）。ただし辺
+//! （`(依存される側, Target(根))`）は残す。残るオブジェクトが根に依存される関係を失うと、
+//! 削除順の入力として使う `edges` が不完全になるため。
 //!
 //! 走査: 再帰せず明示スタックと訪問済み集合で反復する（深い連鎖でスタックを消費しない）。
 //! 子は名前順、出力は帰りがけ順で「依存する側が先」。ビューの循環は構造上作れない
@@ -96,6 +98,10 @@ pub(crate) struct DependencyClosure {
 struct Child {
     obj: DependentObject,
     soft: bool,
+    /// 依存側が同じ文の根集合の要素（そのビュー・表）である場合の根。`objects` には入れず
+    /// 辺（`(依存される側, Target(根))`）だけを出す（削除順の入力として、残るオブジェクトが
+    /// まだ根に依存されている関係を `edges` から失わないため）。
+    root: Option<DropTarget>,
 }
 
 /// 走査中の 1 オブジェクト分の状態（明示スタックの要素）。
@@ -150,6 +156,14 @@ pub(crate) fn enumerate_drop_dependents_in_txn(
             if let Some(child) = top.children.get(top.next).cloned() {
                 top.next = top.next.saturating_add(1);
                 let parent = top.node.clone();
+                if let Some(root) = child.root {
+                    // 依存側が根: オブジェクトには入れず辺だけ残す（根自体は最上位ループが走査する）。
+                    if closure.edges.len() >= MAX_DEPENDENCY_WALK {
+                        return Err(walk_limit_error());
+                    }
+                    closure.edges.insert((parent, DependencyNode::Target(root)));
+                    continue;
+                }
                 if on_stack.contains(&child.obj) {
                     if child.soft {
                         continue;
@@ -263,18 +277,20 @@ struct Walker<'a> {
     conservative: bool,
 }
 
-fn fk_object(child: &TableSchema, fk: &ForeignKeyDef) -> Child {
+fn fk_object(child: &TableSchema, fk: &ForeignKeyDef, root: Option<DropTarget>) -> Child {
     Child {
         obj: DependentObject::ForeignKey {
             table: child.name.clone(),
             constraint: fk.name().to_string(),
         },
         soft: false,
+        root,
     }
 }
 
 impl Walker<'_> {
-    /// `node` に直接依存するオブジェクトを名前順で返す（根集合に含まれるものは除く）。
+    /// `node` に直接依存するオブジェクトを名前順で返す（根集合に含まれるものは `Child::root` を付けて返し、
+    /// 走査側が辺だけを記録する）。
     fn children(&mut self, node: &DependencyNode) -> Result<Vec<Child>> {
         let mut out = match node {
             DependencyNode::Target(DropTarget::Table(name)) => self.table_children(name)?,
@@ -293,11 +309,25 @@ impl Walker<'_> {
         Ok(out)
     }
 
-    /// 他表の FK（参照元が根集合の表なら除く。自己参照も除く）。
+    /// 根集合の表なら対応する根（`Child::root` 用）。
+    fn root_for_table(&self, name: &str) -> Option<DropTarget> {
+        self.root_tables
+            .contains(name)
+            .then(|| DropTarget::Table(name.to_string()))
+    }
+
+    /// 根集合のビューなら対応する根（`Child::root` 用）。
+    fn root_for_view(&self, name: &str) -> Option<DropTarget> {
+        self.root_views
+            .contains(name)
+            .then(|| DropTarget::View(name.to_string()))
+    }
+
+    /// 他表の FK（自己参照は除く。参照元が根集合の表でも返し、`fk_object` が根を付ける）。
     fn foreign_keys_into(&self, table: &str) -> Result<Vec<(TableSchema, ForeignKeyDef)>> {
         Ok(referencing_foreign_keys_in_txn(self.write_txn, table)?
             .into_iter()
-            .filter(|(child, _)| child.name != table && !self.root_tables.contains(&child.name))
+            .filter(|(child, _)| child.name != table)
             .collect())
     }
 
@@ -305,19 +335,16 @@ impl Walker<'_> {
         let mut out: Vec<Child> = self
             .foreign_keys_into(table)?
             .iter()
-            .map(|(child, fk)| fk_object(child, fk))
+            .map(|(child, fk)| fk_object(child, fk, self.root_for_table(&child.name)))
             .collect();
         out.extend(self.views_reading(table));
         Ok(out)
     }
 
-    /// relation `relation` を読むビュー（根集合のビューは除く）。
+    /// relation `relation` を読むビュー（根集合のビューは `root` 付きで返す）。
     fn views_reading(&mut self, relation: &str) -> Vec<Child> {
         let mut out = Vec::new();
         for (name, def) in &self.views {
-            if self.root_views.contains(name) {
-                continue;
-            }
             let soft = match view_def_dependence_on(def, relation) {
                 ViewDependence::No => continue,
                 ViewDependence::Direct => false,
@@ -329,6 +356,7 @@ impl Walker<'_> {
             out.push(Child {
                 obj: DependentObject::View { name: name.clone() },
                 soft,
+                root: self.root_for_view(name),
             });
         }
         out
@@ -371,8 +399,7 @@ impl Walker<'_> {
         Ok(
             foreign_keys_relying_on_unique_columns_in_txn(self.write_txn, &def.table, &target_set)?
                 .iter()
-                .filter(|(child, _)| !self.root_tables.contains(&child.name))
-                .map(|(child, fk)| fk_object(child, fk))
+                .map(|(child, fk)| fk_object(child, fk, self.root_for_table(&child.name)))
                 .collect(),
         )
     }
@@ -381,9 +408,7 @@ impl Walker<'_> {
     fn enum_children(&mut self, type_name: &str) -> Result<Vec<Child>> {
         let mut out = Vec::new();
         for table in dependent_tables_in_txn(self.write_txn, type_name)? {
-            if self.root_tables.contains(&table) {
-                continue;
-            }
+            let root = self.root_for_table(&table);
             let schema = require_table_schema_write(self.write_txn, &table)?;
             for column in &schema.columns {
                 let uses = match &column.ty {
@@ -400,6 +425,7 @@ impl Walker<'_> {
                             column: column.name.clone(),
                         },
                         soft: false,
+                        root: root.clone(),
                     });
                 }
             }
@@ -414,7 +440,7 @@ impl Walker<'_> {
             .foreign_keys_into(table)?
             .iter()
             .filter(|(_, fk)| fk.parent_columns().iter().any(|c| c == column))
-            .map(|(child, fk)| fk_object(child, fk))
+            .map(|(child, fk)| fk_object(child, fk, self.root_for_table(&child.name)))
             .collect();
         let schema = require_table_schema_write(self.write_txn, table)?;
         out.extend(self.views_affected_by_column(&schema, column)?);
@@ -454,9 +480,6 @@ impl Walker<'_> {
         let mut simple: HashMap<String, ViewDef> = HashMap::new();
         let mut buffered: Vec<(String, Vec<String>)> = Vec::new();
         for (name, def) in &self.views {
-            if self.root_views.contains(name) {
-                continue;
-            }
             match view_body_shape(&def.body_sql) {
                 Ok(shape) if shape.buffered => buffered.push((name.clone(), shape.relations)),
                 Ok(_) => {
@@ -514,9 +537,11 @@ impl Walker<'_> {
             if conservative {
                 self.conservative = true;
             }
+            let root = self.root_for_view(&name);
             out.push(Child {
                 obj: DependentObject::View { name },
                 soft: conservative,
+                root,
             });
         }
         Ok(out)
@@ -629,6 +654,30 @@ mod tests {
         assert!(views.objects.is_empty());
         let only_v1 = run(&storage, &[DropTarget::View("v1".to_string())]).expect("enumerate");
         assert_eq!(only_v1.objects, vec![view("v2")]);
+    }
+
+    /// 根のビューに依存される非根ビューの辺は残る（`DROP TABLE t` + `DROP VIEW v2`、v2→v1→t）。
+    #[test]
+    fn t2b_edge_to_root_dependent_is_kept() {
+        let (storage, _g) = open("dep-t2b");
+        storage.create_table(&parent_table("t")).expect("t");
+        storage
+            .create_view("v1", "t", "SELECT a FROM t")
+            .expect("v1");
+        storage
+            .create_view("v2", "v1", "SELECT a FROM v1")
+            .expect("v2");
+        let closure =
+            run(&storage, &[table("t"), DropTarget::View("v2".to_string())]).expect("enumerate");
+        assert_eq!(closure.objects, vec![view("v1")]);
+        assert!(closure.edges.contains(&(
+            DependencyNode::Object(view("v1")),
+            DependencyNode::Target(DropTarget::View("v2".to_string()))
+        )));
+        assert!(closure.edges.contains(&(
+            DependencyNode::Target(table("t")),
+            DependencyNode::Object(view("v1"))
+        )));
     }
 
     /// ビューの連鎖は推移的に辿り、依存する側が先に並ぶ。複数の枝でも重複しない（TABLE-37）。
