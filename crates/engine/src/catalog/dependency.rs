@@ -4,7 +4,7 @@
 //! 推移的に・決定的な順序で列挙する（[`enumerate_drop_dependents_in_txn`]）。従来の依存検査は
 //! 種別ごと（`Storage::drop_table`・`drop_view`・`drop_index` の一意索引分岐・`drop_enum_type`）
 //! に散在し「1 件でも依存があれば `2BP01`」という真偽しか返せなかった。本層は #1641
-//! （CASCADE／RESTRICT の適用と NOTICE）と #1639（複数指定の原子実行）が共通に使う前段で、
+//! （CASCADE の適用は Issue #1641 で `drop_tables`・`drop_view_with_behavior` に結線済み）と #1639（複数指定の原子実行）が共通に使う前段で、
 //! **列挙のみ**を担う。削除の適用・`2BP01` の判定切り替え・NOTICE 送出・SQL 構文は持たない
 //! （既存の DROP／ALTER の挙動は変えない）。
 //!
@@ -57,7 +57,11 @@ const MAX_DEPENDENCY_WALK: usize = MAX_LIST_TABLES * 2;
 pub(crate) enum DropTarget {
     Table(String),
     View(String),
+    // `Index`／`EnumType` は列挙のみ対応済みで、`DROP INDEX／TYPE ... CASCADE` の適用は
+    // 未対応（Issue #1641 の対象外）。適用側が結線されるまでは単体テストのみが構築する。
+    #[allow(dead_code)]
     Index(String),
+    #[allow(dead_code)]
     EnumType(String),
 }
 

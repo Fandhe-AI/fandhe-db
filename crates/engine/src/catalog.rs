@@ -57,8 +57,7 @@ use crate::storage::{Row as StorageRow, Storage, StorageError};
 use crate::storage::{RowInput, Visibility};
 
 // DROP の依存オブジェクト列挙層（TABLE-37・Issue #1640）。呼び出し元の `Storage::drop_*`
-// （Issue #1639・#1641）が結線されるまでは単体テストのみが使うため dead_code を許容する。
-#[allow(dead_code)]
+// （Issue #1639・#1641）が結線済み（`drop_tables` の CASCADE と `drop_view_with_behavior`）。
 mod dependency;
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
@@ -3673,6 +3672,28 @@ fn resolve_reference_depth_in_txn(
     }
 }
 
+/// DROP 文の `CASCADE`／`RESTRICT` 句（TABLE-37 (2)(3)、Issue #1641）。SQL 表層
+/// （`sql::allowlist` の DROP parser）が構文から決め、`sql::ddl::execute_drop_*` が
+/// [`Storage::drop_tables`]・[`Storage::drop_view_with_behavior`] へ渡す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DropBehavior {
+    /// 依存オブジェクトがあれば `2BP01` で拒否する（無指定時の既定）。
+    #[default]
+    Restrict,
+    /// 依存する FK 制約・ビューを連鎖して削除する。参照元の表そのものは残る。
+    Cascade,
+}
+
+/// `CASCADE` で連鎖削除したオブジェクト（TABLE-37 (3)。NOTICE 相当の報告用）。名前は
+/// 全テナント共有の public カタログのオブジェクト名のみで、行数・テナント情報は持たない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CascadedObject {
+    /// 連鎖削除したビュー。
+    View { name: String },
+    /// 連鎖で外した FK 制約（参照元 `table` は残る）。
+    ForeignKey { table: String, constraint: String },
+}
+
 /// [`Storage::drop_tables`] の結果（TABLE-37 (1)、Issue #1639）。件数以外のテナント固有の
 /// 情報は持たない。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3681,6 +3702,25 @@ pub struct DropTablesReport {
     pub dropped: usize,
     /// `IF EXISTS` で不在のため skip した名前（記述順。将来の NoticeResponse 用）。
     pub skipped: Vec<String>,
+    /// `CASCADE` で連鎖削除したオブジェクト（適用順。依存する側が先。TABLE-37 (3)、
+    /// Issue #1641）。`Restrict` 時と全件 skip 時は空。
+    pub cascaded: Vec<CascadedObject>,
+}
+
+impl CascadedObject {
+    /// 列挙層の依存オブジェクトから変換する。ENUM 型の列依存は本 Issue の CASCADE 対象外
+    /// （`DROP TYPE ... CASCADE` は未対応）のため、現れたらカタログ破損として fail-closed。
+    fn from_dependent(obj: dependency::DependentObject) -> Result<Self> {
+        match obj {
+            dependency::DependentObject::View { name } => Ok(Self::View { name }),
+            dependency::DependentObject::ForeignKey { table, constraint } => {
+                Ok(Self::ForeignKey { table, constraint })
+            }
+            dependency::DependentObject::Column { .. } => Err(CatalogError::CorruptSchema(
+                "unexpected column dependency for DROP TABLE".to_string(),
+            )),
+        }
+    }
 }
 
 /// `DROP TABLE` の対象集合 `targets` に依存するものを単一パスで調べる（計算量は
@@ -3693,7 +3733,8 @@ pub struct DropTablesReport {
 ///
 /// **P0**: FK の候補は [`FK_BEARING_FORMAT_VERSIONS`] の全版接頭辞で絞る
 /// （[`referencing_foreign_keys_in_txn`] と同じ。見落とすと fail-open）。
-/// #1640（依存列挙）で置き換えられる前提の private helper。
+/// RESTRICT 判定（従来契約の `DependentViewsExist`／`DependentObjectsStillExist`）に使う。
+/// CASCADE の適用対象は列挙層（`dependency`）が決める（Issue #1641）。
 fn drop_targets_with_dependents_in_txn(
     write_txn: &redb::WriteTransaction,
     targets: &[&str],
@@ -3774,6 +3815,72 @@ fn drop_targets_with_dependents_in_txn(
         }
     }
     Ok((view_dependent, fk_dependent))
+}
+
+/// `CASCADE` で列挙された依存オブジェクトを、返された順（依存する側が先）に同じ write txn
+/// 内で削除する（TABLE-37 (3)、Issue #1641）。FK を外した参照元の表は世代を 1 回だけ bump
+/// する（`USING PLAN` の世代照合の失効契約）。呼び出し元（[`Storage::drop_tables`]・
+/// [`Storage::drop_view_with_behavior`]）が単一 commit するため、途中失敗は txn ごと破棄され
+/// 何も適用されない。戻り値は適用した内容（NOTICE 相当の報告用）。
+fn apply_cascaded_objects_in_txn(
+    write_txn: &redb::WriteTransaction,
+    objects: Vec<dependency::DependentObject>,
+) -> Result<Vec<CascadedObject>> {
+    let mut applied = Vec::with_capacity(objects.len());
+    let mut fk_children: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for obj in objects {
+        let obj = CascadedObject::from_dependent(obj)?;
+        match &obj {
+            CascadedObject::View { name } => drop_view_in_txn(write_txn, name)?,
+            CascadedObject::ForeignKey { table, constraint } => {
+                drop_foreign_key_in_txn(write_txn, table, constraint)?;
+                fk_children.insert(table.clone());
+            }
+        }
+        applied.push(obj);
+    }
+    for child in &fk_children {
+        bump_table_generation_in_txn(write_txn, child)?;
+    }
+    Ok(applied)
+}
+
+/// ビュー定義を `VIEWS_TABLE` から削除する（無ければ `ViewNotFound`）。ビューは行ストア・
+/// 世代を持たないため bump しない（[`Storage::drop_view`] と同じ）。
+fn drop_view_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<()> {
+    let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+    if views_table.remove(name)?.is_none() {
+        return Err(CatalogError::ViewNotFound(name.to_string()));
+    }
+    Ok(())
+}
+
+/// 子表 `child_table` の FK 制約 `constraint` をカタログから外し、子表側の不要になったキー
+/// 索引を刈り込む（TABLE-37 (3)、Issue #1641。[`Storage::alter_table_drop_constraint`] の FK
+/// 分岐と同じ書き換え）。既存行には触れない。世代 bump は呼び出し元が行う。親表側の刈り込みは
+/// 省く（CASCADE では親は同じ文で削除される根であり、その索引は根の削除で丸ごと消えるため）。
+fn drop_foreign_key_in_txn(
+    write_txn: &redb::WriteTransaction,
+    child_table: &str,
+    constraint: &str,
+) -> Result<()> {
+    {
+        let schema = require_table_schema_write(write_txn, child_table)?;
+        let fk_index = schema
+            .foreign_keys
+            .iter()
+            .position(|f| f.name() == constraint)
+            .ok_or_else(|| CatalogError::ConstraintNotFound(constraint.to_string()))?;
+        let mut fks = schema.foreign_keys.clone();
+        fks.remove(fk_index);
+        let updated = schema.with_foreign_keys(fks);
+        let encoded = encode_schema(&updated)?;
+        let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+        catalog_table.insert(child_table, encoded.as_slice())?;
+    }
+    let required = required_key_index_names_in_txn(write_txn, child_table)?;
+    crate::key_index::prune_unneeded_indexes_in_txn(write_txn, child_table, &required)?;
+    Ok(())
 }
 
 /// `target`（テーブルまたはビュー名）を直接参照している既存ビュー名の一覧
@@ -9196,7 +9303,7 @@ impl Storage {
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
         // 単一表は `drop_tables` の特殊形（TABLE-37 (1)、Issue #1639）。エラー variant・
         // 同期点の発火回数・世代 bump 回数は従来どおり。
-        self.drop_tables(&[table_name.to_string()], false)
+        self.drop_tables(&[table_name.to_string()], false, DropBehavior::Restrict)
             .map(|_| ())
     }
 
@@ -9218,7 +9325,21 @@ impl Storage {
     ///
     /// 重複した名前は初出の 1 回として扱う。全件が `if_exists` で skip された場合は commit
     /// せず（世代不変）、`dropped == 0` の報告を返す。
-    pub fn drop_tables(&self, table_names: &[String], if_exists: bool) -> Result<DropTablesReport> {
+    ///
+    /// `behavior`（TABLE-37 (2)(3)、Issue #1641）:
+    /// - `Restrict`: 上記 2 のとおり、依存があれば `2BP01`。
+    /// - `Cascade`: 列挙層（`dependency::enumerate_drop_dependents_in_txn`）が返した依存する
+    ///   FK 制約（参照元の表は残る）とビューを、根の削除（3）より前に同じ write txn・同じ
+    ///   単一 commit で適用する。適用順は列挙の返した順（依存する側が先）。依存を列挙で
+    ///   正確に判定できない（`conservative`）場合は不可逆な連鎖削除をせず
+    ///   `DependentObjectsStillExist` で拒否する（fail-closed）。連鎖削除した内容は
+    ///   [`DropTablesReport::cascaded`] で返す。FK を外した参照元の表は世代を bump する。
+    pub fn drop_tables(
+        &self,
+        table_names: &[String],
+        if_exists: bool,
+        behavior: DropBehavior,
+    ) -> Result<DropTablesReport> {
         let mut targets: Vec<&str> = Vec::new();
         for name in table_names {
             validate_identifier(name)?;
@@ -9263,18 +9384,38 @@ impl Storage {
             return Ok(DropTablesReport {
                 dropped: 0,
                 skipped,
+                cascaded: Vec::new(),
             });
         }
-        // Phase 2: 依存（TABLE-15・TABLE-17・TABLE-18、Issue #907・#909）。
-        let (view_dependent, fk_dependent) =
-            drop_targets_with_dependents_in_txn(&write_txn, &existing)?;
-        if let Some(name) = existing.iter().find(|n| view_dependent.contains(**n)) {
-            return Err(CatalogError::DependentViewsExist((*name).to_string()));
-        }
-        if let Some(name) = existing.iter().find(|n| fk_dependent.contains(**n)) {
-            return Err(CatalogError::DependentObjectsStillExist(
-                (*name).to_string(),
-            ));
+        let mut cascaded: Vec<CascadedObject> = Vec::new();
+        match behavior {
+            DropBehavior::Restrict => {
+                // Phase 2: 依存（TABLE-15・TABLE-17・TABLE-18、Issue #907・#909）。
+                let (view_dependent, fk_dependent) =
+                    drop_targets_with_dependents_in_txn(&write_txn, &existing)?;
+                if let Some(name) = existing.iter().find(|n| view_dependent.contains(**n)) {
+                    return Err(CatalogError::DependentViewsExist((*name).to_string()));
+                }
+                if let Some(name) = existing.iter().find(|n| fk_dependent.contains(**n)) {
+                    return Err(CatalogError::DependentObjectsStillExist(
+                        (*name).to_string(),
+                    ));
+                }
+            }
+            DropBehavior::Cascade => {
+                // Phase 2': 依存の連鎖削除（TABLE-37 (3)、Issue #1641）。
+                let roots: Vec<dependency::DropTarget> = existing
+                    .iter()
+                    .map(|n| dependency::DropTarget::Table((*n).to_string()))
+                    .collect();
+                let closure = dependency::enumerate_drop_dependents_in_txn(&write_txn, &roots)?;
+                if closure.conservative {
+                    // 依存を正確に検証できないまま不可逆な連鎖削除をしない（fail-closed）。
+                    let first = existing.first().copied().unwrap_or_default();
+                    return Err(CatalogError::DependentObjectsStillExist(first.to_string()));
+                }
+                cascaded = apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
+            }
         }
         // Phase 3: 削除。
         for &name in &existing {
@@ -9306,7 +9447,11 @@ impl Storage {
         self.sync_point(crate::test_sync::SyncPoint::DropTableBeforeCommit);
         let dropped = existing.len();
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
-        Ok(DropTablesReport { dropped, skipped })
+        Ok(DropTablesReport {
+            dropped,
+            skipped,
+            cascaded,
+        })
     }
 
     /// 既存テーブルへ列を末尾追記する（TABLE-5）。既存行のバイト列には一切触れない
@@ -11774,8 +11919,24 @@ impl Storage {
     /// 循環構築を阻止する）。`name` がテーブルとして存在する場合は
     /// `Err(WrongObjectKind)`。いずれの名前空間にも存在しない場合は
     /// `Err(ViewNotFound)`。行ストア・世代カウンタは持たないため
-    /// テーブル単位の世代 bump は行わない。
+    /// テーブル単位の世代 bump は行わない。[`DropBehavior::Restrict`] 固定の
+    /// [`Self::drop_view_with_behavior`] wrapper。
     pub fn drop_view(&self, name: &str) -> Result<()> {
+        self.drop_view_with_behavior(name, DropBehavior::Restrict)
+            .map(|_| ())
+    }
+
+    /// `DROP VIEW <name> [CASCADE | RESTRICT]`（TABLE-37、Issue #1641）。
+    /// `Restrict` は [`Self::drop_view`] の従来契約（種別違い → 依存 → 不在の順）。
+    /// `Cascade` は種別違いを判定した後、列挙層で依存ビュー（推移的）を求めて
+    /// 依存する側から順に削除し、最後に根を削除する（単一 write txn・単一 commit）。
+    /// 根が無ければ `ViewNotFound`、依存を正確に判定できない場合は `DependentViewsExist`
+    /// （fail-closed）。戻り値は連鎖削除したオブジェクト（適用順）。
+    pub fn drop_view_with_behavior(
+        &self,
+        name: &str,
+        behavior: DropBehavior,
+    ) -> Result<Vec<CascadedObject>> {
         validate_identifier(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
@@ -11789,17 +11950,33 @@ impl Storage {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
         }
-        {
-            let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
-            let dependents = views_depending_on_in_txn(&views_table, name)?;
-            if !dependents.is_empty() {
-                return Err(CatalogError::DependentViewsExist(name.to_string()));
+        let cascaded = match behavior {
+            DropBehavior::Restrict => {
+                let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+                let dependents = views_depending_on_in_txn(&views_table, name)?;
+                if !dependents.is_empty() {
+                    return Err(CatalogError::DependentViewsExist(name.to_string()));
+                }
+                if views_table.remove(name)?.is_none() {
+                    return Err(CatalogError::ViewNotFound(name.to_string()));
+                }
+                Vec::new()
             }
-            if views_table.remove(name)?.is_none() {
-                return Err(CatalogError::ViewNotFound(name.to_string()));
+            DropBehavior::Cascade => {
+                let closure = dependency::enumerate_drop_dependents_in_txn(
+                    &write_txn,
+                    &[dependency::DropTarget::View(name.to_string())],
+                )?;
+                if closure.conservative {
+                    return Err(CatalogError::DependentViewsExist(name.to_string()));
+                }
+                let cascaded = apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
+                drop_view_in_txn(&write_txn, name)?;
+                cascaded
             }
-        }
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        };
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(cascaded)
     }
 
     /// 索引を宣言する（`CREATE INDEX`。TASK-206・INDEX-7、Issue #908）。カタログ
@@ -16986,7 +17163,7 @@ mod tests {
         // 不在を含む（IF EXISTS なし）: 全体が失敗し、何も変わらない。
         let before = storage.current_generation().expect("generation");
         let err = storage
-            .drop_tables(&names(&["ta", "ghost"]), false)
+            .drop_tables(&names(&["ta", "ghost"]), false, DropBehavior::Restrict)
             .expect_err("missing name must abort");
         assert!(matches!(err, CatalogError::TableNotFound(_)));
         assert_eq!(storage.current_generation().expect("generation"), before);
@@ -16994,7 +17171,7 @@ mod tests {
 
         // 全件 skip: commit せず世代不変。
         let report = storage
-            .drop_tables(&names(&["g1", "g2"]), true)
+            .drop_tables(&names(&["g1", "g2"]), true, DropBehavior::Restrict)
             .expect("all skipped");
         assert_eq!(report.dropped, 0);
         assert_eq!(report.skipped, names(&["g1", "g2"]));
@@ -17006,7 +17183,11 @@ mod tests {
             storage.table_generation("tb").expect("gen"),
         );
         let report = storage
-            .drop_tables(&names(&["ta", "tb", "ta", "ghost"]), true)
+            .drop_tables(
+                &names(&["ta", "tb", "ta", "ghost"]),
+                true,
+                DropBehavior::Restrict,
+            )
             .expect("drop");
         assert_eq!(report.dropped, 2);
         assert_eq!(report.skipped, names(&["ghost"]));

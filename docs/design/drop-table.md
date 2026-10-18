@@ -10,14 +10,14 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 ## 構文
 
 ```
-DROP TABLE [IF EXISTS] <table> [, <table>]*
+DROP TABLE [IF EXISTS] <table> [, <table>]* [CASCADE | RESTRICT]
 ```
 
 - `IF EXISTS` は Issue #1614 で受理に変わった（末尾の「Issue #1614 追記」参照）。
 - 複数テーブル列挙は Issue #1639 で受理に変わった（末尾の「Issue #1639 追記」参照）。
-- `CASCADE`・`RESTRICT`・`USING OPERATION_ID` 句は
-  いずれも構造的に受理しない（許可リスト外・`42601`）。SQL-8 の「受理形以外は
-  `42601`」方針に従う。`CASCADE` は spec でも対象外と明示されている。
+- `CASCADE`／`RESTRICT` は Issue #1641 で受理に変わった（末尾の「Issue #1641 追記」参照）。
+- `USING OPERATION_ID` 句は構造的に受理しない（許可リスト外・`42601`）。SQL-8 の
+  「受理形以外は `42601`」方針に従う。
 - `EXPLAIN DROP TABLE ...` は既存の `EXPLAIN` 分岐（次トークンが `SELECT` である
   ことを要求）へ流れて自然に `42601` になる（`TRUNCATE`・`INSERT` と同じ経路）。
 - `operation_id` を要求しない——`CREATE TABLE`・`ALTER TABLE` と同じく、DDL は
@@ -227,3 +227,29 @@ drop_table_without_permission_is_rejected_with_42501_regardless_of_table_existen
 - **NoSQL 表層**: `drop_table` op は単一の表のまま（TABLE-37 (6)。JSON の `table` は 1 トークン限定）。
 - **対象外**: `CASCADE`／`RESTRICT`（#1641）、依存オブジェクトの汎用列挙（#1640）、複数指定の
   `DROP VIEW`／`INDEX`／`TYPE`、skip した名前ごとの NoticeResponse。
+
+## Issue #1641 追記: CASCADE／RESTRICT
+
+親 #1638。TABLE-37 (2)(3)(4)(5) のポインタ。依存列挙層（#1640。`catalog/dependency.rs`）を
+`Storage::drop_tables`・`Storage::drop_view_with_behavior` へ結線した。
+
+- **構文**: `DROP TABLE [IF EXISTS] a[, b...] [CASCADE | RESTRICT]`・`DROP VIEW [IF EXISTS] v
+  [CASCADE | RESTRICT]`。名前列の直後の 1 語だけを動作として読む（`DROP TABLE cascade` は
+  従来どおり表名）。2 語の併記は余剰トークンとして `42601`。無指定は `RESTRICT`。
+- **RESTRICT**: 従来の契約のまま。依存（ビュー・他表の FK）があれば `2BP01` で何も削除しない。
+- **CASCADE**: 依存する FK 制約（参照元の表は残る）とビュー（推移的）を、根の削除より前に
+  同じ write txn・単一 commit で適用する。順序は列挙層の返した順（依存する側が先）。FK を
+  外した参照元の表は世代を 1 回 bump し、不要になった子側キー索引を刈り込む。行には触れない。
+  同じ文に並べた名前どうしの依存は連鎖対象に入れない。
+- **fail-closed**: 列挙が依存を正確に判定できない（`conservative`）場合は連鎖削除せず `2BP01`。
+- **報告**: `DropTablesReport.cascaded`・`DropTableOutcome::cascaded()`・
+  `DropViewOutcome::cascaded()` が連鎖削除したオブジェクト名（`CascadedObject`）を適用順で返す。
+  行数・テナント情報は含めない。
+- **原子性**: commit は 1 回。クラッシュ後は削除前か削除後のどちらかだけが見える
+  （`table37_drop_cascade_crash_atomicity.rs`）。
+- **テスト**: `sql_drop_table_cascade.rs`・`wire_index_ddl.rs`（`wire_drop_cascade_and_restrict`）。
+- **対象外**: `DROP INDEX|TYPE ... CASCADE`（`42601` のまま。`RESTRICT` は受理）、VIEW／INDEX／TYPE
+  の複数名、wire の NoticeResponse 送出（engine は `cascaded()`・`skipped()` で情報を持つ
+  ところまで）、NoSQL `drop_table` の CASCADE（TABLE-37 (6)）。
+- **破壊的変更**: `ValidatedDropTable.behavior` の追加、`DropTablesReport.cascaded` の追加、
+  `Drop{Table,View}Outcome` から `Copy` を外した、`Storage::drop_tables` の引数追加。
