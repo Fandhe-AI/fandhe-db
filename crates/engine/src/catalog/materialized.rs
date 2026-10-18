@@ -227,12 +227,13 @@ fn validate_def_shape(def: &MaterializedViewDef) -> Result<()> {
             "materialized view column count out of range".to_string(),
         ));
     }
-    // ENUM 列は decode 時に型の解決が要るため、列型の確定を担う後続 Issue（#1664）まで拒否する。
-    if def
-        .columns
-        .iter()
-        .any(|c| matches!(c.ty, ColumnType::Enum(_)))
-    {
+    // ENUM 列・ENUM 配列列は decode 時に型の解決が要るため、列型の確定を担う後続 Issue（#1664）まで拒否する。
+    if def.columns.iter().any(|c| match &c.ty {
+        ColumnType::Enum(_) => true,
+        // ENUM 配列（多次元を含む。次元数は ArrayType 内で保持される）も語彙解決が要る。
+        ColumnType::Array(a) => a.enum_def().is_some(),
+        _ => false,
+    }) {
         return Err(CatalogError::Invalid(
             "ENUM columns are not supported in materialized views".to_string(),
         ));
@@ -579,7 +580,7 @@ impl Storage {
             let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
                 Ok(t) => t,
                 Err(redb::TableError::TableDoesNotExist(_)) => {
-                    return Err(CatalogError::ViewNotFound(name.to_string()))
+                    return Err(CatalogError::ViewNotFound(name.to_string()));
                 }
                 Err(e) => return Err(e.into()),
             };

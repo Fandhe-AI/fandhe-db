@@ -1,7 +1,7 @@
 //! TABLE-42 (2) のポインタ。matview の定義 codec・文脈単位の実体ストア・名前空間・暫定ガードを
 //! Storage 水準で検証する（SQL 表層の配線は後続 Issue #1664〜#1667）。
 use super::*;
-use crate::catalog::{DropBehavior, IndexDef, IndexKind};
+use crate::catalog::{ArrayType, DropBehavior, EnumTypeDef, IndexDef, IndexKind};
 use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
 use redb::TableHandle;
 
@@ -78,6 +78,30 @@ fn def_codec_roundtrips_and_rejects_corruption() {
         encode_materialized_view_def(&huge),
         Err(CatalogError::ViewLimitExceeded(_))
     ));
+}
+
+#[test]
+fn enum_and_enum_array_columns_are_rejected_on_save() {
+    let enum_def = std::sync::Arc::new(EnumTypeDef {
+        name: "mood".to_string(),
+        labels: vec!["a".to_string(), "b".to_string()],
+    });
+    let arr = ArrayType::new_enum(enum_def.clone(), 4).expect("array");
+    let arr2 = ArrayType::new_enum(enum_def.clone(), 4)
+        .and_then(|a| a.with_ndims(2))
+        .expect("array2");
+    for ty in [
+        ColumnType::Enum(enum_def),
+        ColumnType::Array(arr),
+        ColumnType::Array(arr2),
+    ] {
+        let mut d = def("mv");
+        d.columns.push(ColumnDef::new("e", ty, true));
+        assert!(matches!(
+            encode_materialized_view_def(&d),
+            Err(CatalogError::Invalid(_))
+        ));
+    }
 }
 
 #[test]
