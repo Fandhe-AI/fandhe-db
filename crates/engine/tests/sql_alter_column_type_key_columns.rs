@@ -723,3 +723,38 @@ fn widening_real_unique_column_preserves_values_and_uniqueness_per_tenant() {
         "INSERT INTO fu (id, r) VALUES (30, 2.25) USING OPERATION_ID 'f'",
     );
 }
+
+/// `id` 疑似列を参照する FK の参照元列を USING 付き一般変換で書き換え、親に存在しない値
+/// （孤児）が生じる場合は `23503` で拒否する（Issue #1637 レビュー指摘）。
+#[test]
+fn general_conversion_on_id_referencing_fk_rejects_orphans() {
+    let (core, path) = new_core("akc-idfk");
+    let _g = CleanupGuard(path);
+    let o = ctx("owner");
+    ok(&core, &o, "CREATE TABLE ip (v INTEGER)");
+    ok(&core, &o, "CREATE TABLE ic (r INTEGER REFERENCES ip(id))");
+    ok(
+        &core,
+        &o,
+        "INSERT INTO ip (id, v) VALUES (1, 0) USING OPERATION_ID 'p1'",
+    );
+    ok(
+        &core,
+        &o,
+        "INSERT INTO ic (id, r) VALUES (1, 1) USING OPERATION_ID 'c1'",
+    );
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "ALTER TABLE ic ALTER COLUMN r TYPE BIGINT USING r + 1"
+        ),
+        "23503"
+    );
+    // 孤児を作らない変換は成功する。
+    ok(
+        &core,
+        &o,
+        "ALTER TABLE ic ALTER COLUMN r TYPE BIGINT USING r",
+    );
+}

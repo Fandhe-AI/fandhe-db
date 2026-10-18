@@ -358,7 +358,7 @@ Issue #1637 の担当で、本 Issue では型検査に通った USING 付きの
 
 ## Issue #1637 追記（ALTER COLUMN TYPE の依存オブジェクト再構築。TABLE-40 (3)(4)・TASK-278 ポインタ）
 
-#1636 の暫定ゲート（依存を持つ列を一律 `0A000`）を外し、一般変換（`AlterPlan::RewriteExpr`）が依存する
+Issue #1636 の暫定ゲート（依存を持つ列を一律 `0A000`）を外し、一般変換（`AlterPlan::RewriteExpr`）が依存する
 索引・制約・DEFAULT を新しい型で再構築・再検証する。ビューが参照する列だけは PostgreSQL と同じ `0A000`
 （固定文言 `cannot alter type of a column used by a view or rule`）で拒否する。
 

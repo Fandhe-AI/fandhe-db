@@ -6315,7 +6315,7 @@ fn revalidate_keys_after_type_change(
         // 自己参照 FK は参照先列だけが変更列の場合もここで検証する（他表の FK は下のループ）。
         let self_parent_side =
             fk.parent_table == table_name && fk.parent_columns().iter().any(|c| c == column_name);
-        if !(child_side || self_parent_side) || fk.references_parent_id() {
+        if !(child_side || self_parent_side) {
             continue;
         }
         let parent = if fk.parent_table == table_name {
@@ -6323,6 +6323,23 @@ fn revalidate_keys_after_type_change(
         } else {
             require_table_schema_write(write_txn, &fk.parent_table)?
         };
+        if fk.references_parent_id() {
+            // `id` 疑似列参照は参照元列が整数型であることだけを宣言時と同じ基準で照合し
+            // （`resolve_foreign_key_target`）、USING で作られた孤児値を下の全テナント検証で
+            // `23503` として拒否する（親側に変更列は無いので `child_side` の場合だけ到達する）。
+            for child_col in fk.columns() {
+                let Some(c) = col_ty(new_schema, child_col) else {
+                    return Err(AlterCheckError::Catalog(CatalogError::CorruptSchema(
+                        "foreign key column not found after column type change".to_string(),
+                    )));
+                };
+                if c.integer_rank().is_none() {
+                    return Err(mismatch());
+                }
+            }
+            to_verify.push((new_schema.clone(), fk.clone(), parent));
+            continue;
+        }
         for (child_col, parent_col) in fk.columns().iter().zip(fk.parent_columns()) {
             let (Some(c), Some(p)) = (col_ty(new_schema, child_col), col_ty(&parent, parent_col))
             else {
