@@ -423,3 +423,34 @@ fn referenced_relations_cannot_be_dropped_or_renamed() {
         Err(CatalogError::DependentViewsExist(_))
     ));
 }
+
+#[test]
+fn cascade_closure_views_referenced_by_matview_are_rejected() {
+    // 表 base -> ビュー v1 -> ビュー v2 -> matview mv_v2。
+    // 指定対象（base／v1）は matview の直接の参照元ではないが、CASCADE の閉包に含まれる
+    // v2 を削除すると mv_v2 の参照先が欠落するため、削除前に fail-closed で拒否する。
+    let (_g, _p, s) = open("mv-cascade-closure");
+    s.create_view("v1", "base", "SELECT embedding FROM base")
+        .expect("v1");
+    s.create_view("v2", "v1", "SELECT embedding FROM v1")
+        .expect("v2");
+    let mut on_v2 = def("mv_v2");
+    on_v2.base_relations = vec!["v2".to_string()];
+    s.create_materialized_view(&on_v2).expect("create matview");
+
+    // 表 -> ビュー -> matview 経路（DROP TABLE CASCADE）。
+    assert!(matches!(
+        s.drop_tables(&["base".to_string()], false, DropBehavior::Cascade),
+        Err(CatalogError::DependentViewsExist(_))
+    ));
+    // ビュー -> ビュー -> matview 経路（DROP VIEW CASCADE）。
+    assert!(matches!(
+        s.drop_view_with_behavior("v1", DropBehavior::Cascade),
+        Err(CatalogError::DependentViewsExist(_))
+    ));
+    // 拒否は副作用なし: 表・ビュー・matview がすべて残る。
+    assert!(s.relation_name_exists("base").expect("base"));
+    assert!(s.relation_name_exists("v1").expect("v1"));
+    assert!(s.relation_name_exists("v2").expect("v2"));
+    assert!(s.relation_name_exists("mv_v2").expect("mv"));
+}

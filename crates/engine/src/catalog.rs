@@ -4219,6 +4219,24 @@ fn drop_targets_with_dependents_in_txn(
     Ok((view_dependent, fk_dependent))
 }
 
+/// CASCADE の閉包に含まれるビューのうち、matview の参照元になっているものがあれば
+/// `DependentViewsExist` で拒否する（Issue #1663 の暫定ガード。CASCADE での matview 削除の
+/// 適用は #1667。指定対象の直接検査だけでは「表 -> ビュー -> matview」「ビュー -> ビュー ->
+/// matview」の連鎖で参照先が欠落するため、適用前に閉包全体を同一 txn 内で走査する。fail-closed）。
+fn reject_cascade_closure_referenced_by_matview_in_txn(
+    write_txn: &redb::WriteTransaction,
+    objects: &[dependency::DependentObject],
+) -> Result<()> {
+    for obj in objects {
+        if let dependency::DependentObject::View { name } = obj {
+            if !materialized::materialized_views_referencing_in_txn(write_txn, name)?.is_empty() {
+                return Err(CatalogError::DependentViewsExist(name.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `CASCADE` で列挙された依存オブジェクトを、返された順（依存する側が先）に同じ write txn
 /// 内で削除する（TABLE-37 (3)、Issue #1641）。FK を外した参照元の表は世代を 1 回だけ bump
 /// する（`USING PLAN` の世代照合の失効契約）。呼び出し元（[`Storage::drop_tables`]・
@@ -9848,6 +9866,7 @@ impl Storage {
                     let first = existing.first().copied().unwrap_or_default();
                     return Err(CatalogError::DependentObjectsStillExist(first.to_string()));
                 }
+                reject_cascade_closure_referenced_by_matview_in_txn(&write_txn, &closure.objects)?;
                 cascaded = apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
             }
         }
@@ -12469,6 +12488,7 @@ impl Storage {
                 if closure.conservative {
                     return Err(CatalogError::DependentViewsExist(name.to_string()));
                 }
+                reject_cascade_closure_referenced_by_matview_in_txn(&write_txn, &closure.objects)?;
                 let cascaded = apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
                 drop_view_in_txn(&write_txn, name)?;
                 cascaded
