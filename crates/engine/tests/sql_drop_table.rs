@@ -214,7 +214,8 @@ fn drop_table_rejects_unsupported_shapes_with_42601() {
     for sql in [
         format!("DROP TABLE {TABLE} CASCADE"),
         format!("DROP TABLE {TABLE} RESTRICT"),
-        format!("DROP TABLE {TABLE}, other_table"),
+        // 複数テーブル指定は TABLE-37 (1)（Issue #1639）で受理に変わった。
+        // `sql_drop_table_multi.rs` が受理側と不正形の拒否を検証する。
         format!("DROP TABLE {TABLE} USING OPERATION_ID 'op-1'"),
         format!("EXPLAIN DROP TABLE {TABLE}"),
         "DROP TABLE".to_string(),

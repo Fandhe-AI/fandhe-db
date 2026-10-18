@@ -236,6 +236,34 @@ fn wire_drop_if_exists_noop_and_dependency_and_permission() {
     }
 }
 
+/// `DROP TABLE a, b`（Issue #1639・TABLE-37 (1) ポインタ）: 複数名は通常の DROP と同じ
+/// `CommandComplete` タグで成功し、途中で不在があれば全体が `42P01` で何も削除しない。
+/// 権限の無いユーザーは存否に関わらず `42501`。
+#[test]
+fn wire_drop_table_multiple_names_atomic_and_permission() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_with_ddl_allowed_users(&users(), core, &["alice"]);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    expect_command(
+        &mut alice,
+        "CREATE TABLE multi_a (name TEXT)",
+        "CREATE TABLE",
+    );
+    expect_command(
+        &mut alice,
+        "CREATE TABLE multi_b (name TEXT)",
+        "CREATE TABLE",
+    );
+    expect_error(&mut alice, "DROP TABLE multi_a, ghost", "42P01");
+    expect_command(&mut alice, "DROP TABLE multi_a, multi_b", "DROP TABLE");
+    expect_error(&mut alice, "DROP TABLE multi_a", "42P01");
+
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "pw-bob");
+    for sql in ["DROP TABLE docs, ghost", "DROP TABLE ghost1, ghost2"] {
+        expect_error(&mut bob, sql, "42501");
+    }
+}
+
 /// `CREATE UNIQUE INDEX`（Issue #1616・INDEX-9）。`CommandComplete` タグは通常の
 /// `CREATE INDEX`、作成時の重複・作成後の重複 INSERT は `23505`、`DROP CONSTRAINT <索引名>` は
 /// `42704`、`DROP INDEX` で強制が外れる。強制の詳細は
