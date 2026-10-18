@@ -73,7 +73,7 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 - `insert_row_unchecked`（Rust API の行形 INSERT）
 - `insert_rows_unchecked`（同・バッチ）
 - `insert_typed_row_unchecked`（SQL 表層の単一行 typed INSERT）
-- `truncate_table_unchecked`（`TRUNCATE TABLE`）
+- `truncate_tables_unchecked`（`TRUNCATE TABLE`）
 - （Issue #1179）`insert_typed_rows_unchecked`（複数行 `VALUES`・COPY）・
   `upsert_typed_rows_unchecked`（`ON CONFLICT`）・`update_row_unchecked`・
   `update_row_columns_unchecked`（単一行 `UPDATE`）・`delete_row_impl`
@@ -127,7 +127,7 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 同じく commit せずに `write_txn` を abort する（`TxnEffect::NoOp`）。当初の実装は
 空の `write_txn` を `commit_boundary::commit` で commit していたため、グローバル
 世代が進み、世代で失効するキャッシュを無駄に捨てていた（PR #1041 レビュー指摘）。
-他の関数は基本的に常に書き込む（`truncate_table_unchecked` は 0 行でも台帳記録と
+他の関数は基本的に常に書き込む（`truncate_tables_unchecked` は 0 行でも台帳記録と
 テーブル世代の進行を行う既存契約）ため `TxnEffect::Wrote` を返す（述語形 DML の
 件数上限超過は `TxnEffect::NoOp` で、呼び出し元が `54000` を返し `Failed` へ遷移する）。
 

@@ -2609,7 +2609,7 @@ pub(crate) fn update_row_unchecked(
 ///
 /// 0 行更新（他テナントの行・未存在 id・RLS 可視集合外の行のいずれも区別しない。
 /// security.md P0）でも台帳記録・テーブル世代進行・commit は**必ず**行う
-/// （`truncate_table_unchecked` と同じ非対称設計。`update_row_unchecked` の
+/// （`truncate_tables_unchecked` と同じ非対称設計。`update_row_unchecked` の
 /// `NotFound` 早期 return とは意図的に異なる契約: 応答・`wire_code`・
 /// レイテンシ・台帳の有無のいずれからも「対象行の有無」を観測できないようにする
 /// ため）。台帳の内容照合ハッシュ（`content_hash::for_update_columns`。TASK-101・
@@ -4146,7 +4146,7 @@ fn delete_row_impl(
 /// [`delete_row_unchecked`] との違いは `NotFound`（対象行が不存在／他テナント
 /// 所有。いずれも区別しない）の場合の台帳の扱いのみ: 本関数は `NotFound` でも
 /// 台帳への tentative 追記を同一トランザクションで **commit する**
-/// （[`truncate_table_unchecked`] の「0 件でも必ず台帳記録」契約と同じ考え方。
+/// （[`truncate_tables_unchecked`] の「0 件でも必ず台帳記録」契約と同じ考え方。
 /// テーブル世代は進行させない——対象行が変化していないため既存のキャッシュ
 /// 失効契約はそのまま維持する）。
 ///
@@ -4209,7 +4209,7 @@ pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
     )
 }
 
-/// SQL 表層 `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`（SQL-22、TASK-193）
+/// SQL 表層 `TRUNCATE [TABLE] [ONLY] <table> [*] [, ...] USING OPERATION_ID '<id>'`（SQL-22、TASK-193。TABLE 省略・複数テーブルは SQL-48 (1)(4)、Issue #1643）
 /// の実体。テーブル定義（カタログ）は残したまま、セッションのテナントが所有する
 /// 全行（`Visibility` を問わない）を単一 write トランザクションで削除する
 /// （[`delete_row_unchecked`]・[`replace_typed_rows_by_text_key`] と並ぶ 3 つ目の
@@ -5059,59 +5059,81 @@ fn apply_predicate_update_in_txn<E>(
     Ok(applied)
 }
 
-pub(crate) fn truncate_table_unchecked(
+pub(crate) fn truncate_tables_unchecked(
     target: WriteTarget<'_>,
-    table: &str,
+    tables: &[String],
     ctx: &PolicyContext,
     ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
-    validate_identifier(table)?;
+    // 空集合は構文層が作らない。fail-closed に倒す（何も削除せず拒否）。
+    if tables.is_empty() {
+        return Err(
+            CatalogError::Invalid("TRUNCATE requires at least one table".to_string()).into(),
+        );
+    }
+    for table in tables {
+        validate_identifier(table)?;
+    }
+    // 全表を **単一** の write トランザクションで処理する（SQL-48 (4)。表ごとに commit する
+    // ループは Autocommit で N 回 commit され原子性を失うため禁止）。途中の `?` は
+    // トランザクションの drop（abort）で全表の副作用を破棄する。
     target.with_txn(|write_txn| {
-        // テーブル不存在の判定・並行 DDL との整合のため他の書き込み系操作と
-        // 同じ前段を通す。
-        let schema = require_table_schema_write(write_txn, table)?;
-        // TRUNCATE 要求のクライアント由来の内容はテーブル名（台帳キー
-        // `(tenant, table, operation_id)` に既に含まれる）以外に存在しない
-        // （`content_hash::for_truncate` ドキュメント参照）。
-        let content_hash = content_hash::for_truncate();
-        ledger::record_in_txn(
-            write_txn,
-            ctx.tenant_id(),
-            table,
-            ledger_write,
-            &content_hash,
-        )?;
-
         let tenant = ctx.tenant_id();
-        let row_table_name = user_rows_table_name(table);
-        let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
-            .map_err(map_row_table_error)?;
-        let start = std::ops::Bound::Included((tenant, 0u64));
-        let end = std::ops::Bound::Included((tenant, u64::MAX));
-        row_table
-            .retain_in((start, end), |_, _| false)
-            .map_err(CatalogError::from)?;
-        drop(row_table);
-        // 永続一意索引（TABLE-16・TASK-204、Issue #1070）のテナント範囲を
-        // クリアする（他テナントの索引エントリには触れない）。次回の書き込み
-        // で行数 0 の状態から遅延再構築される。
-        crate::constraint::clear_unique_index_for_tenant_in_txn(write_txn, table, &schema, tenant)?;
-        // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）
-        // の参照先側の検査。自テナントの参照元行が 1 件でも残れば `23503`（他テナントの
-        // 行は削除も走査もしないため、他テナントの参照元行の有無は結果に影響しない）。
-        // `TRUNCATE` は参照アクション（Issue #1076 A4）を発火させないため
-        // `Truncated`（`Removed` とは異なり連鎖を起こさない）を渡す。
-        crate::constraint::enforce_referencing_rows_in_txn(
-            write_txn,
-            table,
-            &schema,
-            tenant,
-            crate::constraint::ReferencedRowsChange::Truncated,
-            None,
-            target.fk_check_mode(),
-        )?;
-        crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        // パス 0: 全表のスキーマを確定する（並行 DDL で不在になっていれば `42P01` で全体 abort）。
+        let mut schemas = Vec::with_capacity(tables.len());
+        for table in tables {
+            schemas.push(require_table_schema_write(write_txn, table)?);
+        }
+
+        // 台帳ハッシュ: 1 表なら既存エントリ互換の `for_truncate()`（バイト列不変）、
+        // 2 表以上なら正規化した表集合のハッシュ（`TRUNCATE a, b` と `b, a` は同一、
+        // `a` と `a, b` は内容不一致）。台帳キーは表ごとに `(tenant, table, operation_id)`。
+        let content_hash = if tables.len() == 1 {
+            content_hash::for_truncate()
+        } else {
+            let names: Vec<&str> = tables.iter().map(String::as_str).collect();
+            content_hash::for_truncate_tables(&names).map_err(TenantWriteError::from)?
+        };
+
+        // パス 1: 台帳記録 → 行削除 → 一意索引・キー索引のテナント範囲クリアを全表で先に行う。
+        // 親子を同じ文で指定した場合に、パス 2 の FK 判定が「同じ文で消える子の行」を
+        // 見て誤って `23503` にしないため（子のキー索引も先に空になる）。
+        for (table, schema) in tables.iter().zip(&schemas) {
+            ledger::record_in_txn(write_txn, tenant, table, ledger_write, &content_hash)?;
+
+            let row_table_name = user_rows_table_name(table);
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(map_row_table_error)?;
+            let start = std::ops::Bound::Included((tenant, 0u64));
+            let end = std::ops::Bound::Included((tenant, u64::MAX));
+            row_table
+                .retain_in((start, end), |_, _| false)
+                .map_err(CatalogError::from)?;
+            drop(row_table);
+            // 永続一意索引（TABLE-16・TASK-204、Issue #1070）のテナント範囲をクリアする
+            // （他テナントの索引エントリには触れない）。
+            crate::constraint::clear_unique_index_for_tenant_in_txn(
+                write_txn, table, schema, tenant,
+            )?;
+            crate::key_index::clear_tenant_in_txn(write_txn, table, tenant)?;
+        }
+
+        // パス 2: 参照先側の `FOREIGN KEY` 検査（TABLE-17・TASK-205、Issue #907）と世代 bump。
+        // 自テナントの参照元行が（同じ文の対象外の表に）残れば `23503`。他テナントの行は
+        // 走査も削除もしない。`Truncated` は参照アクション（Issue #1076）を発火させない。
+        for (table, schema) in tables.iter().zip(&schemas) {
+            crate::constraint::enforce_referencing_rows_in_txn(
+                write_txn,
+                table,
+                schema,
+                tenant,
+                crate::constraint::ReferencedRowsChange::Truncated,
+                None,
+                target.fk_check_mode(),
+            )?;
+            crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        }
         Ok(((), TxnEffect::Wrote))
     })
 }
@@ -6298,7 +6320,7 @@ mod tests {
         assert_eq!(read_gen("sibling"), sibling_gen);
 
         // 0 行更新（未存在 id）でも台帳記録・世代進行が必ず発生する（判断 B。
-        // `truncate_table_unchecked` と同じ非対称設計）。
+        // `truncate_tables_unchecked` と同じ非対称設計）。
         let update_columns_zero_op = op("bump-update-row-columns-zero");
         let ledger_write_zero = LedgerWrite::Record(&update_columns_zero_op);
         let rows_affected = update_row_columns_unchecked(
