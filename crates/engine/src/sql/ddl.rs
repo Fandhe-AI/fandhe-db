@@ -2254,13 +2254,15 @@ fn map_create_view_error(e: CatalogError) -> SqlSurfaceError {
 /// `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）の実行本体。`require_ddl_permission` と
 /// 互換性検査（`core`）を通過したセッションに限り呼ばれ、`expected_old`（検査に使った旧定義）を
 /// `Storage::create_or_replace_view_checked` の compare-and-swap へ渡す（旧定義と、検査が参照した
-/// スキーマの指紋）。旧定義または参照スキーマが検査後に変わっていた
+/// スキーマの指紋）と、新定義が列を末尾に追加するか（`appends_columns`。依存ビューの保守的ゲート用。
+/// Issue #1661）。旧定義または参照スキーマが検査後に変わっていた
 /// 場合は [`CatalogError::ViewDefinitionChanged`] が返り、呼び出し元が検査からやり直す。
 pub(crate) fn execute_create_or_replace_view(
     storage: &Storage,
     validated: &ValidatedCreateView,
     expected_old: Option<&crate::catalog::ViewDef>,
     expected_fingerprint: Option<&[u8]>,
+    appends_columns: bool,
 ) -> Result<CreateViewOutcome, CatalogError> {
     storage.create_or_replace_view_checked(
         validated.name(),
@@ -2269,12 +2271,13 @@ pub(crate) fn execute_create_or_replace_view(
         validated.column_aliases(),
         expected_old,
         expected_fingerprint,
+        appends_columns,
     )?;
     Ok(CreateViewOutcome {})
 }
 
 /// [`execute_create_or_replace_view`] の [`CatalogError`] を SQL 表層の契約へ写像する
-/// （種別違い `42809`、自己参照・循環 `42P17`、依存ビューあり `0A000`〔Issue #1661 までの暫定制限〕、
+/// （種別違い `42809`、自己参照・循環 `42P17`、依存ビューを無効化する置換 `0A000`〔Issue #1661〕、
 /// 競合による旧定義の変化 `55P03`。他は [`map_create_view_error`] と同じ）。
 pub(crate) fn map_replace_view_error(e: CatalogError) -> SqlSurfaceError {
     match e {
@@ -2283,7 +2286,7 @@ pub(crate) fn map_replace_view_error(e: CatalogError) -> SqlSurfaceError {
             detail: "view definition must not reference the view itself",
         },
         CatalogError::DependentViewsExist(_) => SqlSurfaceError::feature_not_supported(
-            "replacing a view that other views depend on is not supported",
+            "cannot replace view because a dependent view would become invalid",
         ),
         CatalogError::ViewDefinitionChanged(_) => SqlSurfaceError::LockNotAvailable,
         other => map_create_view_error(other),

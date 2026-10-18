@@ -5640,6 +5640,7 @@ impl EngineCore {
                 }
             })?;
             let mut fingerprint = None;
+            let mut appends_columns = false;
             if let Some(old) = &old {
                 // 自己参照・循環（`42P17`）は列互換性（`42P16`）より先に判定する。
                 let reaches_self = self
@@ -5668,12 +5669,16 @@ impl EngineCore {
                 let new_cols =
                     self.view_output_columns(session, stmt.body_sql(), stmt.column_aliases())?;
                 crate::sql::view_replace::check_replace_compatible(&old_cols, &new_cols)?;
+                // 互換検査通過後の列数増は末尾追加。依存ビューの `*` 展開への影響を
+                // カタログ層（同一 write txn）が保守的に検査する（Issue #1661）。
+                appends_columns = new_cols.len() > old_cols.len();
             }
             match crate::sql::ddl::execute_create_or_replace_view(
                 &self.storage,
                 stmt,
                 old.as_ref(),
                 fingerprint.as_deref(),
+                appends_columns,
             ) {
                 Ok(outcome) => return Ok(outcome),
                 Err(CatalogError::ViewDefinitionChanged(_)) => continue,

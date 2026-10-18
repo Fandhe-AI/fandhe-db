@@ -8,7 +8,7 @@
 //! 1. 不在なら通常の作成、既存なら「既存列を同名・同型・同順で保ち末尾に足すだけ」の置換のみ成功
 //! 2. 列の削除・改名・順序変更・型変更は `42P16` で、既存定義は変わらない
 //! 3. 同名がテーブル・索引なら `42809`、自己参照は `42P17`
-//! 4. 依存ビューを持つビューの置換は `0A000`（Issue #1661 までの暫定制限。状態不変）
+//! 4. 依存ビューは同一 txn で再検証され、破綻・深さ超過なら旧定義が残る（TABLE-41 (3)・Issue #1661）
 //! 5. DDL 権限ゲートが先（`42501`）、明示トランザクション内 DDL は `0A000`
 //! 6. RLS は参照セッションの `PolicyContext` で評価され、置換後も永続化される
 
@@ -143,6 +143,12 @@ fn names(result: &QueryResult) -> Vec<String> {
             | ColumnMeta::Computed { name, .. } => name.clone(),
         })
         .collect()
+}
+
+/// ビューの観測可能な状態（列名と alice から見える行 id）。置換失敗時の「旧定義が残る」比較用。
+fn snap(core: &EngineCore, view: &str) -> (Vec<String>, Vec<u64>) {
+    let r = q(core, &format!("SELECT * FROM {view} LIMIT 100"));
+    (names(&r), ids(&r))
 }
 
 fn ids(result: &QueryResult) -> Vec<u64> {
@@ -361,13 +367,121 @@ fn syntax_and_body_errors_use_existing_codes() {
     assert_eq!(names(&q(&core, "SELECT * FROM v LIMIT 100")), ["lang"]);
 }
 
-// --- 4. 依存ビュー（Issue #1661 までの暫定制限） --------------------------------------
+// --- 4. 依存ビュー（TABLE-41 (3)・Issue #1661） ----------------------------------------
 
+/// 依存ビューを持つビューも置換でき、依存ビューは引き続き問い合わせられる。
 #[test]
-fn replacing_a_view_with_dependents_is_not_supported_yet() {
+fn replacing_a_view_with_dependents_succeeds_and_dependents_keep_working() {
     let (core, _g) = open_core("t41r-dep");
     create_ok(&core, "CREATE VIEW v1 AS SELECT lang FROM docs");
     create_ok(&core, "CREATE VIEW v2 AS SELECT lang FROM v1");
+    create_ok(&core, "CREATE VIEW v3 AS SELECT lang FROM v2");
+    create_ok(
+        &core,
+        "CREATE OR REPLACE VIEW v1 AS SELECT lang, body FROM docs WHERE lang = 'ja'",
+    );
+    assert_eq!(
+        names(&q(&core, "SELECT * FROM v1 LIMIT 100")),
+        ["lang", "body"]
+    );
+    for v in ["v2", "v3"] {
+        let r = q(&core, &format!("SELECT * FROM {v} LIMIT 100"));
+        assert_eq!(names(&r), ["lang"], "{v}");
+        assert_eq!(ids(&r), vec![1, 2, 4, 5], "{v}");
+    }
+}
+
+/// `SELECT *` の依存ビューは参照時に動的展開され、既存列の位置は変わらず末尾に新列が現れる。
+#[test]
+fn star_dependent_view_expands_appended_columns_dynamically() {
+    let (core, _g) = open_core("t41r-star");
+    create_ok(&core, "CREATE VIEW v1 AS SELECT lang FROM docs");
+    create_ok(&core, "CREATE VIEW v2 AS SELECT * FROM v1");
+    create_ok(
+        &core,
+        "CREATE OR REPLACE VIEW v1 AS SELECT lang, body FROM docs",
+    );
+    assert_eq!(
+        names(&q(&core, "SELECT * FROM v2 LIMIT 100")),
+        ["lang", "body"]
+    );
+}
+
+/// 非互換の置換は依存ビューがあっても `42P16` が先に返り、状態は変わらない。
+#[test]
+fn incompatible_replacement_is_rejected_before_dependents_are_considered() {
+    let (core, _g) = open_core("t41r-dep-incompat");
+    create_ok(&core, "CREATE VIEW v1 AS SELECT lang FROM docs");
+    create_ok(&core, "CREATE VIEW v2 AS SELECT lang FROM v1");
+    assert_eq!(
+        create_err(&core, "CREATE OR REPLACE VIEW v1 AS SELECT body FROM docs"),
+        "42P16"
+    );
+    assert_eq!(names(&q(&core, "SELECT * FROM v1 LIMIT 100")), ["lang"]);
+    assert_eq!(names(&q(&core, "SELECT * FROM v2 LIMIT 100")), ["lang"]);
+}
+
+/// 新定義のせいで依存ビューのネスト深さが上限を超えるなら `54000` で、旧定義が残る。
+#[test]
+fn dependent_depth_overflow_rolls_back_and_keeps_old_definition() {
+    let (core, _g) = open_core("t41r-dep-depth");
+    create_ok(&core, "CREATE VIEW w1 AS SELECT lang FROM docs");
+    create_ok(&core, "CREATE VIEW w2 AS SELECT lang FROM w1");
+    create_ok(&core, "CREATE VIEW w3 AS SELECT lang FROM w2");
+    create_ok(&core, "CREATE VIEW v1 AS SELECT lang FROM docs");
+    create_ok(&core, "CREATE VIEW v2 AS SELECT lang FROM v1");
+    create_ok(&core, "CREATE VIEW v3 AS SELECT lang FROM v2");
+    let before = snap(&core, "v1");
+    assert_eq!(
+        create_err(&core, "CREATE OR REPLACE VIEW v1 AS SELECT lang FROM w3"),
+        "54000"
+    );
+    assert_eq!(snap(&core, "v1"), before);
+    for v in ["v1", "v2", "v3"] {
+        assert_eq!(
+            names(&q(&core, &format!("SELECT * FROM {v} LIMIT 100"))),
+            ["lang"]
+        );
+    }
+}
+
+/// 別名付きビューへの置換で、集合演算の枝から読む依存ビューが参照時に壊れる形は `0A000`。
+#[test]
+fn replacement_breaking_a_dependent_is_rejected_and_old_definition_remains() {
+    let (core, _g) = open_core("t41r-dep-break");
+    create_ok(&core, "CREATE VIEW v1 AS SELECT lang, body FROM docs");
+    create_ok(
+        &core,
+        "CREATE VIEW v2 AS SELECT lang FROM v1 UNION ALL SELECT lang FROM docs",
+    );
+    let before = snap(&core, "v1");
+    assert_eq!(
+        create_err(
+            &core,
+            "CREATE OR REPLACE VIEW v1 (lang, body) AS SELECT lang, body FROM docs"
+        ),
+        "0A000"
+    );
+    assert_eq!(snap(&core, "v1"), before);
+    assert_eq!(names(&q(&core, "SELECT * FROM v2 LIMIT 100")), ["lang"]);
+}
+
+/// 列追加ゲート: 集合演算の枝を持つ依存ビューがあるとき、列を保つ置換は成功し、
+/// 末尾列を足す置換は `0A000`（旧定義が残る）。
+#[test]
+fn column_append_gate_for_set_operation_dependents() {
+    let (core, _g) = open_core("t41r-gate");
+    create_ok(&core, "CREATE VIEW v1 AS SELECT lang FROM docs");
+    create_ok(
+        &core,
+        "CREATE VIEW v2 AS SELECT * FROM v1 UNION ALL SELECT lang FROM docs",
+    );
+    create_ok(
+        &core,
+        "CREATE OR REPLACE VIEW v1 AS SELECT lang FROM docs WHERE lang = 'ja'",
+    );
+    q(&core, "SELECT * FROM v2 LIMIT 100");
+    let before = snap(&core, "v1");
     assert_eq!(
         create_err(
             &core,
@@ -375,13 +489,83 @@ fn replacing_a_view_with_dependents_is_not_supported_yet() {
         ),
         "0A000"
     );
-    assert_eq!(names(&q(&core, "SELECT * FROM v1 LIMIT 100")), ["lang"]);
-    assert_eq!(names(&q(&core, "SELECT * FROM v2 LIMIT 100")), ["lang"]);
-    // 非互換は依存より先に判定する（PostgreSQL と同じ `42P16`）。
+    assert_eq!(snap(&core, "v1"), before);
+    q(&core, "SELECT * FROM v2 LIMIT 100");
+}
+
+/// 公開 API からの置換でも依存ビューの再検証が失敗すれば旧定義が残る（原子性）。
+#[test]
+fn catalog_replace_failure_leaves_old_definition() {
+    use engine::catalog::CatalogError;
+    let path = unique_db_path("t41r-dep-atomic");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    storage
+        .create_view("w1", "docs", "SELECT lang FROM docs")
+        .expect("w1");
+    storage
+        .create_view("w2", "w1", "SELECT lang FROM w1")
+        .expect("w2");
+    storage
+        .create_view("w3", "w2", "SELECT lang FROM w2")
+        .expect("w3");
+    storage
+        .create_view("v1", "docs", "SELECT lang FROM docs")
+        .expect("v1");
+    storage
+        .create_view("v2", "v1", "SELECT lang FROM v1")
+        .expect("v2");
+    let before_v1 = storage.view_definition("v1").expect("read");
+    let before_v2 = storage.view_definition("v2").expect("read");
+    let err = storage
+        .create_or_replace_view("v1", "w3", "SELECT lang FROM w3", &[], before_v1.as_ref())
+        .expect_err("depth overflow");
+    assert!(matches!(err, CatalogError::ViewLimitExceeded(_)), "{err:?}");
+    assert_eq!(storage.view_definition("v1").expect("read"), before_v1);
+    assert_eq!(storage.view_definition("v2").expect("read"), before_v2);
+}
+
+/// 依存ビューありの置換は永続化され、再オープン後も依存ビューが動く。
+#[test]
+fn replacement_with_dependents_survives_reopen() {
+    let path = unique_db_path("t41r-dep-persist");
+    let _guard = CleanupGuard(path.clone());
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema()).expect("create table");
+        seed(&storage);
+        let core = new_core(storage);
+        create_ok(&core, "CREATE VIEW v1 AS SELECT lang FROM docs");
+        create_ok(&core, "CREATE VIEW v2 AS SELECT lang FROM v1");
+        create_ok(
+            &core,
+            "CREATE OR REPLACE VIEW v1 AS SELECT lang, body FROM docs",
+        );
+    }
+    let storage = Storage::open(&path).expect("reopen storage");
+    let core = new_core(storage);
     assert_eq!(
-        create_err(&core, "CREATE OR REPLACE VIEW v1 AS SELECT body FROM docs"),
-        "42P16"
+        names(&q(&core, "SELECT * FROM v1 LIMIT 100")),
+        ["lang", "body"]
     );
+    assert_eq!(names(&q(&core, "SELECT * FROM v2 LIMIT 100")), ["lang"]);
+}
+
+/// 置換後の依存ビューも参照者の `PolicyContext` で評価される（他テナントの private 行は見えない）。
+#[test]
+fn dependent_view_after_replacement_respects_caller_policy() {
+    let (core, _g) = open_core("t41r-dep-rls");
+    create_ok(&core, "CREATE VIEW v1 AS SELECT lang FROM docs");
+    create_ok(&core, "CREATE VIEW v2 AS SELECT lang FROM v1");
+    create_ok(
+        &core,
+        "CREATE OR REPLACE VIEW v1 AS SELECT lang, body FROM docs",
+    );
+    let bob = query(&core, "bob", "SELECT * FROM v2 LIMIT 100").expect("bob query");
+    assert_eq!(ids(&bob), vec![1, 2, 3, 5]);
+    let alice = q(&core, "SELECT * FROM v2 LIMIT 100");
+    assert_eq!(ids(&alice), vec![1, 2, 3, 4, 5]);
 }
 
 // --- 5. 権限・トランザクション -------------------------------------------------------

@@ -2367,6 +2367,10 @@ pub enum CatalogError {
     /// （TABLE-18・SQL-23・TASK-205、Issue #909。ERR-6: `2BP01`）。ENUM 型専用の
     /// [`CatalogError::DependentObjectsStillExist`] とは独立させ、依存元・
     /// 依存先の意味論が混ざらないようにする。
+    ///
+    /// 用途は 2 つ。DROP では依存ビューが残存する（`2BP01`）。`CREATE OR REPLACE VIEW`
+    /// （Issue #1661）では、置換が依存ビューを無効化する（`0A000`）。後者の名前は
+    /// クライアントが指定した置換対象名であり、依存ビュー名は含まない。
     DependentViewsExist(String),
     /// `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）の互換性検査と置換の間に、置換対象の
     /// ビュー定義が他の書き込みで変わった（検査した旧定義と現在の定義が不一致）。置換せず、
@@ -4544,6 +4548,120 @@ fn view_def_dependence_on(def: &ViewDef, target: &str) -> ViewDependence {
         Ok(_) => ViewDependence::No,
         Err(_) => ViewDependence::Unverifiable,
     }
+}
+
+/// 置換対象 `target` を直接・連鎖で読むビューの推移閉包を名前順で返す（Issue #1661）。
+/// [`revalidate_dependent_views_in_txn`] が呼ぶ。全定義を [`MAX_VIEWS`] 上限付きで 1 回走査し、
+/// `view_def_dependence_on` の逆辺を再帰なしの BFS で辿る（打ち切りは [`MAX_VIEW_CHAIN_WALK`]）。
+/// 本文を再検証できないビュー（`Unverifiable`）と上限超過は fail-closed で拒否する
+/// （`DependentViewsExist(target)`／`ViewLimitExceeded`）。
+fn dependent_views_closure_in_txn(
+    views_table: &redb::Table<'_, &str, &[u8]>,
+    target: &str,
+) -> Result<Vec<(String, ViewDef)>> {
+    let mut all: Vec<(String, ViewDef)> = Vec::new();
+    for entry in views_table.iter()? {
+        let (key, value) = entry?;
+        if all.len() >= MAX_VIEWS {
+            return Err(CatalogError::ViewLimitExceeded(
+                "too many views".to_string(),
+            ));
+        }
+        all.push((key.value().to_string(), decode_view_def(value.value())?));
+    }
+    let mut closure: std::collections::BTreeMap<String, ViewDef> =
+        std::collections::BTreeMap::new();
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    queue.push_back(target.to_string());
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(target.to_string());
+    while let Some(current) = queue.pop_front() {
+        for (name, def) in &all {
+            match view_def_dependence_on(def, &current) {
+                ViewDependence::No => {}
+                ViewDependence::Unverifiable => {
+                    return Err(CatalogError::DependentViewsExist(target.to_string()));
+                }
+                ViewDependence::Direct => {
+                    if visited.insert(name.clone()) {
+                        if visited.len() > MAX_VIEW_CHAIN_WALK {
+                            return Err(CatalogError::ViewLimitExceeded(
+                                "view reference chain too long".to_string(),
+                            ));
+                        }
+                        closure.insert(name.clone(), def.clone());
+                        queue.push_back(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(closure.into_iter().collect())
+}
+
+/// `CREATE OR REPLACE VIEW` の置換 txn 内で、未 commit の新定義を前提に `target` の依存ビュー
+/// （推移閉包）を再検証する（TABLE-41 (3)・Issue #1661。[`Storage::create_or_replace_view_checked`]
+/// が insert 後に呼ぶ）。依存ビューごとに (1) 作成時と同じ [`validate_new_view_body_in_txn`]
+/// （参照先の存在・ネスト深さ `54000` を含む）と (2) 参照時と同じ `sql::view::resolve_from`
+/// （単純形の連鎖の列スコープ・別名の重複）を通す。さらに `appends_columns`（新定義が列を末尾に
+/// 追加する）で、`*` の動的展開が集合演算・部分クエリ・CTE の枝で列数を変えうる依存ビュー
+/// （本文に `SELECT` が 2 個以上）や、列別名付きの評価後射影形ビューは保守的に拒否する
+/// （過剰拒否は許容。fail-closed）。形・列の破綻は `DependentViewsExist(target)`（`0A000`）。
+/// エラーには依存ビュー名・本文を含めない（クライアントが指定した `target` のみ）。
+fn revalidate_dependent_views_in_txn(
+    write_txn: &redb::WriteTransaction,
+    catalog_table: &redb::Table<'_, &'static str, &'static [u8]>,
+    views_table: &redb::Table<'_, &'static str, &'static [u8]>,
+    target: &str,
+    appends_columns: bool,
+) -> Result<()> {
+    let broken = || CatalogError::DependentViewsExist(target.to_string());
+    for (dep_name, def) in dependent_views_closure_in_txn(views_table, target)? {
+        let shape = view_body_shape(&def.body_sql).map_err(|_| broken())?;
+        if appends_columns {
+            let tokens = crate::sql::lexer::tokenize_stored_view_body(&def.body_sql)
+                .map_err(|_| broken())?;
+            let selects = tokens
+                .iter()
+                .filter(|t| {
+                    matches!(
+                        t,
+                        crate::sql::lexer::Token::Keyword(crate::sql::lexer::Keyword::Select)
+                    )
+                })
+                .count();
+            if selects >= 2 || (shape.buffered && !def.column_aliases.is_empty()) {
+                return Err(broken());
+            }
+        }
+        validate_new_view_body_in_txn(
+            write_txn,
+            catalog_table,
+            views_table,
+            &def.body_sql,
+            &def.base_relation,
+            &shape,
+        )
+        .map_err(|e| match e {
+            e @ (CatalogError::ViewLimitExceeded(_)
+            | CatalogError::CorruptSchema(_)
+            | CatalogError::Backend(_)) => e,
+            _ => broken(),
+        })?;
+        let lookup = TxnViewLookup {
+            write_txn,
+            catalog_table,
+            views_table,
+        };
+        match crate::sql::view::resolve_from(&lookup, &dep_name) {
+            Ok(_) => {}
+            Err(SqlSurfaceError::PayloadTooLarge { detail }) => {
+                return Err(CatalogError::ViewLimitExceeded(detail));
+            }
+            Err(_) => return Err(broken()),
+        }
+    }
+    Ok(())
 }
 
 /// `table` を（直接または連鎖したビュー経由で）参照するビューのいずれかが、
@@ -12783,9 +12901,10 @@ impl Storage {
     /// 判定順序（同一 write txn 内。TOCTOU 回避）: 本文・別名の前処理（[`Self::create_view_with_column_aliases`]
     /// と同じ）→ 名前がテーブル・索引なら `Err(WrongObjectKind)` → 旧定義の CAS →
     /// 旧定義なしなら通常の作成（名前衝突・件数上限を含む）→ 旧定義ありなら、新本文が自身へ到達
-    /// すれば `Err(ViewReferenceCycle)`、新本文の検証（[`validate_new_view_body_in_txn`]）、
-    /// 置換対象に依存するビューがあれば `Err(DependentViewsExist)`（依存ビューの再検証と復旧は
-    /// Issue #1661 までの暫定制限。fail-closed）→ 上書き。ビューは行ストア・世代を持たないため
+    /// すれば `Err(ViewReferenceCycle)`、新本文の検証（[`validate_new_view_body_in_txn`]）→
+    /// 上書き（未 commit）→ 依存ビュー（推移閉包）の同一 txn 内再検証
+    /// （[`revalidate_dependent_views_in_txn`]。TABLE-41 (3)・Issue #1661。失敗は txn 破棄で
+    /// 旧定義が残る）→ commit。ビューは行ストア・世代を持たないため
     /// [`bump_table_generation_in_txn`] は呼ばない。
     pub fn create_or_replace_view(
         &self,
@@ -12802,6 +12921,9 @@ impl Storage {
             column_aliases,
             expected_old,
             None,
+            // 互換性検査を経ない公開 API では列追加の有無が分からないため、fail-closed で
+            // 「追加あり」として依存ビューの保守的ゲートを適用する。
+            true,
         )
     }
 
@@ -12809,6 +12931,7 @@ impl Storage {
     /// 同一 write txn 内の指紋と一致するときだけ置換する [`Self::create_or_replace_view`] の本体。
     /// 不一致は `Err(ViewDefinitionChanged)`（互換性検査の前提になった参照先テーブル・ビューが
     /// 検査後に変わった。呼び出し元が検査からやり直す）。`None` は指紋照合を省く。
+    #[allow(clippy::too_many_arguments)] // CAS・指紋・列追加フラグを SQL 表層から受けるため 8 引数。
     pub(crate) fn create_or_replace_view_checked(
         &self,
         name: &str,
@@ -12817,6 +12940,7 @@ impl Storage {
         column_aliases: &[String],
         expected_old: Option<&ViewDef>,
         expected_fingerprint: Option<&[u8]>,
+        appends_columns: bool,
     ) -> Result<()> {
         validate_identifier(name)?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
@@ -12882,9 +13006,6 @@ impl Storage {
                     base_relation,
                     &shape,
                 )?;
-                if !views_depending_on_in_txn(&views_table, name)?.is_empty() {
-                    return Err(CatalogError::DependentViewsExist(name.to_string()));
-                }
             } else {
                 validate_new_view_body_in_txn(
                     &write_txn,
@@ -12901,6 +13022,17 @@ impl Storage {
                 }
             }
             views_table.insert(name, encoded.as_slice())?;
+            // 置換（旧定義あり）では、未 commit の新定義を前提に依存ビューを同一 txn で
+            // 再検証する。失敗は `?` で txn ごと破棄され、旧定義が残る（原子性）。
+            if current.is_some() {
+                revalidate_dependent_views_in_txn(
+                    &write_txn,
+                    &catalog_table,
+                    &views_table,
+                    name,
+                    appends_columns,
+                )?;
+            }
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
