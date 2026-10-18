@@ -144,6 +144,9 @@ pub(crate) fn enumerate_drop_dependents_in_txn(
     let mut closure = DependencyClosure::default();
     let mut visited: BTreeSet<DependentObject> = BTreeSet::new();
     let mut on_stack: BTreeSet<DependentObject> = BTreeSet::new();
+    // 本文を確認できた（soft でない）ビュー→ビュー辺。根ビューは `continue` で辺だけになり
+    // `on_stack` 検査を通らないため、根を経由する循環（v1→v2→v1）はこの辺集合で最後に検出する。
+    let mut hard_view_edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for root in roots {
         let node = DependencyNode::Target(root);
         let children = walker.children(&node)?;
@@ -156,6 +159,19 @@ pub(crate) fn enumerate_drop_dependents_in_txn(
             if let Some(child) = top.children.get(top.next).cloned() {
                 top.next = top.next.saturating_add(1);
                 let parent = top.node.clone();
+                if let (false, Some(from), DependentObject::View { name: to }) =
+                    (child.soft, view_name_of(&parent), &child.obj)
+                {
+                    if hard_view_edges.values().map(BTreeSet::len).sum::<usize>()
+                        >= MAX_DEPENDENCY_WALK
+                    {
+                        return Err(walk_limit_error());
+                    }
+                    hard_view_edges
+                        .entry(from.to_string())
+                        .or_default()
+                        .insert(to.clone());
+                }
                 if let Some(root) = child.root {
                     // 依存側が根: オブジェクトには入れず辺だけ残す（根自体は最上位ループが走査する）。
                     if closure.edges.len() >= MAX_DEPENDENCY_WALK {
@@ -199,8 +215,62 @@ pub(crate) fn enumerate_drop_dependents_in_txn(
             }
         }
     }
+    if has_view_cycle(&hard_view_edges) {
+        return Err(CatalogError::CorruptSchema(
+            "dependency cycle detected".to_string(),
+        ));
+    }
     closure.conservative = walker.conservative;
     Ok(closure)
+}
+
+/// 走査ノードがビュー（根または依存オブジェクト）ならその名前。
+fn view_name_of(node: &DependencyNode) -> Option<&str> {
+    match node {
+        DependencyNode::Target(DropTarget::View(n))
+        | DependencyNode::Object(DependentObject::View { name: n }) => Some(n.as_str()),
+        _ => None,
+    }
+}
+
+/// ビュー間の確定辺に循環（自己参照を含む）があるか。明示スタックの 3 色 DFS（再帰しない）。
+fn has_view_cycle(edges: &BTreeMap<String, BTreeSet<String>>) -> bool {
+    let mut done: BTreeSet<&str> = BTreeSet::new();
+    for start in edges.keys() {
+        if done.contains(start.as_str()) {
+            continue;
+        }
+        let mut path: BTreeSet<&str> = BTreeSet::new();
+        path.insert(start.as_str());
+        let mut stack: Vec<(&str, std::collections::btree_set::Iter<'_, String>)> = vec![(
+            start.as_str(),
+            edges.get(start).map(BTreeSet::iter).unwrap_or_default(),
+        )];
+        while let Some((node, iter)) = stack.last_mut() {
+            let node = *node;
+            match iter.next() {
+                Some(next) => {
+                    if path.contains(next.as_str()) {
+                        return true;
+                    }
+                    if done.contains(next.as_str()) {
+                        continue;
+                    }
+                    path.insert(next.as_str());
+                    stack.push((
+                        next.as_str(),
+                        edges.get(next).map(BTreeSet::iter).unwrap_or_default(),
+                    ));
+                }
+                None => {
+                    path.remove(node);
+                    done.insert(node);
+                    stack.pop();
+                }
+            }
+        }
+    }
+    false
 }
 
 fn walk_limit_error() -> CatalogError {
@@ -350,13 +420,19 @@ impl Walker<'_> {
                 ViewDependence::Direct => false,
                 ViewDependence::Unverifiable => true,
             };
+            let root = self.root_for_view(name);
+            // 本文を再検証できない根ビュー自身を自分の依存として数えない（自己辺・保守フラグとも
+            // 立てると削除順が循環に見え CASCADE が不当に拒否される。根は objects に入らない）。
+            if soft && name == relation && root.is_some() {
+                continue;
+            }
             if soft {
                 self.conservative = true;
             }
             out.push(Child {
                 obj: DependentObject::View { name: name.clone() },
                 soft,
-                root: self.root_for_view(name),
+                root,
             });
         }
         out
@@ -903,6 +979,45 @@ mod tests {
         inject("c1", "c4", "SELECT a FROM c4");
         let err = run(&storage, &[table("t")]).expect_err("cycle");
         assert!(matches!(err, CatalogError::CorruptSchema(_)), "{err:?}");
+    }
+
+    /// 本文を再検証できない根ビュー自身は自己辺・保守フラグを生まない（PR #2521 指摘）。
+    /// 根集合に含まれるビューの循環（v1→v2→v1）も `CorruptSchema`（根の `continue` を素通りしない）。
+    #[test]
+    fn t9b_root_views_no_self_loop_and_root_cycle_is_corrupt() {
+        let (storage, _g) = open("dep-t9b");
+        storage.create_table(&parent_table("t")).expect("t");
+        let inject = |name: &str, base: &str, body: &str| {
+            let encoded = encode_view_def(&ViewDef {
+                base_relation: base.to_string(),
+                body_sql: body.to_string(),
+            })
+            .expect("encode");
+            let txn = storage.db().begin_write().expect("begin");
+            {
+                let mut views = txn.open_table(VIEWS_TABLE).expect("views");
+                views.insert(name, encoded.as_slice()).expect("insert");
+            }
+            txn.commit().expect("commit");
+        };
+        inject("broken", "other", "THIS IS NOT SQL");
+        let closure = run(&storage, &[DropTarget::View("broken".to_string())]).expect("enum");
+        assert!(closure.objects.is_empty());
+        assert!(closure.edges.is_empty(), "{:?}", closure.edges);
+        assert!(!closure.conservative);
+
+        inject("c4", "t", "SELECT a FROM c1");
+        inject("c1", "c4", "SELECT a FROM c4");
+        for roots in [
+            vec![DropTarget::View("c1".to_string())],
+            vec![
+                DropTarget::View("c1".to_string()),
+                DropTarget::View("c4".to_string()),
+            ],
+        ] {
+            let err = run(&storage, &roots).expect_err("cycle");
+            assert!(matches!(err, CatalogError::CorruptSchema(_)), "{err:?}");
+        }
     }
 
     /// テナントの行データは結果に影響しない（カタログのみを読む。TABLE-37）。
