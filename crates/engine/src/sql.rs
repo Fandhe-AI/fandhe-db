@@ -173,6 +173,9 @@ pub mod declarative_predicate;
 pub(crate) mod describe;
 pub(crate) mod interval_arith;
 pub(crate) mod set_expr;
+pub(crate) mod temp_catalog;
+#[cfg(test)]
+mod temp_catalog_tests;
 #[cfg(test)]
 mod write_time_ledger_tests;
 // `SELECT DISTINCT`・`COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）が共有する
