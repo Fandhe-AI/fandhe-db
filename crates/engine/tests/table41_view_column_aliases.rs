@@ -528,6 +528,19 @@ fn ddl_gates_are_conservative_for_aliased_views() {
     .expect("plain view follows the rename");
 }
 
+/// 表改名（TABLE-38・Issue #1625）は列別名付きの単純形ビューの参照先を付け替え、別名は保たれる
+/// （別名は位置で出力列に付くため、表名の変更に影響されない）。
+#[test]
+fn table_rename_keeps_aliased_view_working() {
+    let (core, _g) = open_core("t41-rename-table");
+    create_ok(&core, "CREATE VIEW v (a, b, c, d) AS SELECT * FROM docs");
+    let mut session = allowed_session();
+    ddl(&core, &mut session, "ALTER TABLE docs RENAME TO docs2").expect("rename follows");
+    let r = q(&core, "SELECT c FROM v WHERE c = 'ja' LIMIT 10");
+    assert_eq!(names(&r), ["c"]);
+    assert_eq!(ids(&r), vec![1, 2, 4, 5]);
+}
+
 /// 再起動（再オープン）後も別名は保たれる。
 #[test]
 fn aliases_persist_across_reopen() {
@@ -730,4 +743,44 @@ fn set_operation_over_aliased_view_is_rejected_at_create() {
     assert_eq!(code, "42601");
     // 副作用なし: b は作られていない。
     assert_eq!(q_code(&core, "SELECT * FROM b LIMIT 10"), "42P01");
+}
+
+/// 利用者列を `id` として公開するビュー（Issue #1659 PR レビュー指摘）: 外側の `id` 参照は
+/// 行 identity ではなく別名元の利用者列へ束縛され、行 identity 宛ての解決はできない形を拒否する。
+#[test]
+fn user_column_exposed_as_id_binds_the_user_column_everywhere() {
+    let (core, _g) = open_core("t41-user-id");
+    create_ok(&core, "CREATE VIEW vi (id) AS SELECT lang FROM docs");
+    create_ok(&core, "CREATE VIEW vc AS SELECT id FROM vi");
+    create_ok(
+        &core,
+        "CREATE VIEW vb AS SELECT id FROM vi ORDER BY id LIMIT 100",
+    );
+    for view in ["vi", "vc", "vb"] {
+        let r = q(
+            &core,
+            &format!("SELECT id FROM {view} WHERE id = 'en' LIMIT 10"),
+        );
+        assert_eq!(ids(&r), vec![3], "{view}");
+        assert_eq!(r.rows[0].cells[0], Cell::Text("en".into()), "{view}");
+    }
+    let r = q(&core, "SELECT id FROM vi WHERE id IN ('en') LIMIT 10");
+    assert_eq!(ids(&r), vec![3]);
+    let r = q(&core, "SELECT id FROM vi ORDER BY id LIMIT 1");
+    assert_eq!(ids(&r), vec![3]);
+    let r = q(&core, "SELECT id, COUNT(*) FROM vi GROUP BY id");
+    assert_eq!(r.rows.len(), 2);
+    // 数値との比較は行 identity ではなく利用者列（TEXT）との比較になり、型エラーで拒否される。
+    assert_eq!(
+        q_code(&core, "SELECT id FROM vi WHERE id = 1 LIMIT 10"),
+        "42883"
+    );
+    // 行 identity 宛てへ解決されうるサブクエリ形は書き換えずに拒否する。
+    for sql in [
+        "SELECT id FROM vi WHERE id IN (SELECT id FROM docs) LIMIT 10",
+        "SELECT id FROM vi WHERE id = (SELECT MAX(id) FROM docs) LIMIT 10",
+        "SELECT id FROM vi WHERE id NOT IN (SELECT id FROM docs) LIMIT 10",
+    ] {
+        assert_eq!(q_code(&core, sql), "0A000", "{sql}");
+    }
 }

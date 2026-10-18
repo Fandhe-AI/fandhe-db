@@ -59,6 +59,25 @@ impl<'a> ColumnMap<'a> {
         }
         Ok(())
     }
+
+    /// 利用者列を公開名 `id` で公開しているか。このとき疑似列 `id`（行 identity）と公開名 `id`
+    /// （別名元の利用者列）は別物になる。
+    fn exposes_user_column_as_id(&self) -> bool {
+        self.0
+            .iter()
+            .any(|(public, phys)| public == "id" && phys != "id")
+    }
+}
+
+/// 述語木に行 identity 比較の葉 [`WherePredicate::IdCompare`]（`sql::subquery` の解決段が
+/// 疑似列 `id` 宛てに生成する内部専用の葉）が含まれるか。`Not`／`Or` の内側も再帰する。
+fn contains_id_compare(predicates: &[WherePredicate]) -> bool {
+    predicates.iter().any(|p| match p {
+        WherePredicate::IdCompare { .. } => true,
+        WherePredicate::Not(inner) => contains_id_compare(std::slice::from_ref(inner.as_ref())),
+        WherePredicate::Or(branches) => branches.iter().any(|b| contains_id_compare(b)),
+        _ => false,
+    })
 }
 
 fn unsupported_position() -> SqlSurfaceError {
@@ -75,6 +94,12 @@ pub(crate) fn rewrite_where(
     let mut idents = HashSet::new();
     super::parser::collect_where_predicate_idents(&predicates, &mut idents);
     map.reject_aliased_id_refs(&idents)?;
+    // 利用者列を `id` として公開するビューでは、疑似列 `id`（行 identity）宛ての比較葉は
+    // 公開名 `id`（別名元の利用者列）へ写せない。物理名への書き換えを素通りして行 identity で
+    // 絞り込むと誤った行を返すため、書き換えず拒否する（fail-closed）。
+    if map.exposes_user_column_as_id() && contains_id_compare(&predicates) {
+        return Err(unsupported_position());
+    }
     predicates
         .iter()
         .map(|p| map_predicate_columns(p, &|c| map.physical(c), &unsupported_position))
@@ -293,4 +318,39 @@ pub(crate) fn rewrite_aggregate(
     };
     let new_where = rewrite_where(map, where_predicates)?;
     Ok((new_items, new_where, new_group_by))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::udf_call::BinOp;
+
+    fn id_compare() -> WherePredicate {
+        WherePredicate::IdCompare {
+            op: BinOp::Eq,
+            value: 1,
+        }
+    }
+
+    /// 利用者列を `id` として公開するビューでは、行 identity 比較の葉を（ネスト越しでも）拒否する。
+    #[test]
+    fn id_compare_is_rejected_when_user_column_is_exposed_as_id() {
+        let pairs = vec![("id".to_string(), "lang".to_string())];
+        let map = ColumnMap::new(&pairs);
+        for preds in [
+            vec![id_compare()],
+            vec![WherePredicate::Not(Box::new(id_compare()))],
+            vec![WherePredicate::Or(vec![vec![id_compare()]])],
+        ] {
+            assert!(rewrite_where(&map, preds).is_err());
+        }
+    }
+
+    /// `id` を別名で公開しないビューでは従来どおり通る（行 identity のまま）。
+    #[test]
+    fn id_compare_passes_when_id_is_not_user_column() {
+        let pairs = vec![("a".to_string(), "lang".to_string())];
+        let map = ColumnMap::new(&pairs);
+        assert!(rewrite_where(&map, vec![id_compare()]).is_ok());
+    }
 }
