@@ -59,7 +59,7 @@ static NEXT_TEMP_RELATION_ID: AtomicU64 = AtomicU64::new(1);
 /// 次の識別子を採番する。`u64` が尽きた場合は `Internal`（fail-closed。到達しない想定）。
 fn next_temp_relation_id() -> Result<TempRelationId, SqlSurfaceError> {
     let id = NEXT_TEMP_RELATION_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
         .map_err(|_| SqlSurfaceError::Internal {
             detail: "temporary relation id space exhausted".to_string(),
         })?;
@@ -220,7 +220,7 @@ pub(crate) fn tokens_reference_temp(tokens: &[Token], catalog: &SessionTempCatal
         return false;
     }
     tokens.iter().any(|t| match t {
-        Token::Ident(s) | Token::QuotedBoolWord(s) => {
+        Token::Ident(s) | Token::QuotedBoolWord(s) | Token::QuotedNull(s) => {
             catalog.names().any(|n| n.eq_ignore_ascii_case(s))
         }
         _ => false,

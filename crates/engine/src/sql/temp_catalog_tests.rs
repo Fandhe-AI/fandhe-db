@@ -176,6 +176,14 @@ fn table_44_token_scan_is_case_insensitive_and_empty_safe() {
     assert!(!tokens_reference_temp(&other, &cat));
 }
 
+#[test]
+fn table_44_token_scan_matches_quoted_null_relation_name() {
+    let mut cat = SessionTempCatalog::default();
+    cat.register(schema("null", &["x"]), 4).expect("register");
+    let toks = crate::sql::lexer::tokenize_marked("DROP TABLE \"NULL\"").expect("lex");
+    assert!(tokens_reference_temp(&toks, &cat));
+}
+
 // ---- EngineCore 経由（受入基準: 同名の永続表を隠す） ----
 
 fn ctx(tenant: &str) -> PolicyContext {
@@ -342,4 +350,41 @@ fn table_44_coarse_gate_rejects_prebuilt_statements() {
     core.execute_parsed_in_session(&c, &mut empty, &parsed)
         .expect("no gate when empty");
     assert!(core.describe_parsed_in_session(&empty, &parsed).is_ok());
+}
+
+#[test]
+fn table_44_quoted_null_temp_name_never_touches_the_persistent_table() {
+    let path = unique_db_path("temp-catalog-quoted-null");
+    let _g = CleanupGuard(path.clone());
+    let core = open_core(&path);
+    let mut p = SessionState::default();
+    p.allow_ddl();
+    run(
+        &core,
+        &mut p,
+        "tenant-a",
+        "CREATE TABLE \"NULL\" (embedding VECTOR(2), a TEXT)",
+    )
+    .expect("persistent quoted NULL table");
+    let mut a = SessionState::default();
+    a.allow_ddl();
+    a.temp_tables_mut()
+        .register(schema("null", &["x"]), DEFAULT_MAX_TEMP_TABLES_PER_SESSION)
+        .expect("register temp");
+    for sql in [
+        "DROP TABLE \"NULL\"",
+        "ALTER TABLE \"NULL\" ADD COLUMN b TEXT",
+        "CREATE INDEX i ON \"NULL\" (a)",
+        "TRUNCATE \"NULL\"",
+    ] {
+        assert_eq!(
+            run(&core, &mut a, "tenant-a", sql),
+            Err("0A000".to_string()),
+            "{sql}"
+        );
+    }
+    let err = core
+        .begin_copy(&ctx("tenant-a"), &a, "COPY \"NULL\" FROM STDIN")
+        .expect_err("copy gate");
+    assert_eq!(err.wire_code(), "0A000");
 }
