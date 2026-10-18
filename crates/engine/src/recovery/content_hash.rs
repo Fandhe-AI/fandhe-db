@@ -143,6 +143,10 @@ enum OpTag {
     /// （[`OpTag::Truncate`]・入力なし）の既存台帳エントリのバイト列を変えないよう
     /// 別ドメインに分離する。[`for_truncate_tables`] 参照。
     TruncateMulti = 17,
+    /// `TRUNCATE ... CASCADE`（SQL-48 (2)、Issue #1644）用。RESTRICT（省略・明示とも）は
+    /// 既定値のため従来の [`OpTag::Truncate`]／[`OpTag::TruncateMulti`] を使い、CASCADE だけを
+    /// 別ドメインに分離する。[`for_truncate_tables_cascade`] 参照。
+    TruncateCascade = 18,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -1266,6 +1270,24 @@ pub(crate) fn for_truncate_tables(tables: &[&str]) -> Result<ContentHash, Storag
     sorted.sort_unstable();
     sorted.dedup();
     let mut b = HashInputBuilder::new(OpTag::TruncateMulti);
+    b.push_u64(u64::try_from(sorted.len()).unwrap_or(u64::MAX));
+    for t in sorted {
+        b.push_bytes(t.as_bytes())?;
+    }
+    Ok(b.finish())
+}
+
+/// `TRUNCATE ... CASCADE`（SQL-48 (2)、Issue #1644）用。入力は**利用者が文に書いた表の
+/// 正規化集合**（辞書順に整列・重複除去し、件数と各名を長さプレフィクス付きで連結する）。
+/// 連鎖して加わる参照元の表はカタログの状態で変わりクライアント要求由来ではないため、
+/// ハッシュに含めない（再送判定を DB 状態に依存させない。モジュール冒頭の方針）。
+/// 表が 1 つでも [`for_truncate`] とは別ドメインで、RESTRICT の文と取り違えた再送は
+/// `22023` になる。呼び出し元は `tenant::truncate_tables_unchecked`。
+pub(crate) fn for_truncate_tables_cascade(tables: &[&str]) -> Result<ContentHash, StorageError> {
+    let mut sorted: Vec<&str> = tables.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut b = HashInputBuilder::new(OpTag::TruncateCascade);
     b.push_u64(u64::try_from(sorted.len()).unwrap_or(u64::MAX));
     for t in sorted {
         b.push_bytes(t.as_bytes())?;
@@ -2871,6 +2893,25 @@ mod tests {
             for_truncate_tables(&["a"]).expect("hash"),
             for_truncate(),
             "multi-form domain must be separate from the single form"
+        );
+    }
+
+    #[test]
+    fn for_truncate_tables_cascade_is_order_insensitive_and_separate_domain() {
+        let ab = for_truncate_tables_cascade(&["a", "b"]).expect("hash");
+        assert_eq!(
+            ab,
+            for_truncate_tables_cascade(&["b", "a", "a"]).expect("hash")
+        );
+        assert_ne!(ab, for_truncate_tables_cascade(&["a", "c"]).expect("hash"));
+        assert_ne!(ab, for_truncate_tables(&["a", "b"]).expect("hash"));
+        assert_ne!(
+            for_truncate_tables_cascade(&["a"]).expect("hash"),
+            for_truncate()
+        );
+        assert_ne!(
+            for_truncate_tables_cascade(&["a"]).expect("hash"),
+            for_truncate_tables(&["a"]).expect("hash")
         );
     }
 

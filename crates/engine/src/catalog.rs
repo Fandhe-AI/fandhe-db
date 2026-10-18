@@ -59,6 +59,7 @@ use crate::storage::{RowInput, Visibility};
 // DROP の依存オブジェクト列挙層（TABLE-37・Issue #1640）。呼び出し元の `Storage::drop_*`
 // （Issue #1639・#1641）が結線済み（`drop_tables` の CASCADE と `drop_view_with_behavior`）。
 mod dependency;
+pub(crate) use dependency::{truncate_closure_in_txn, TruncateClosureError};
 
 // matview のカタログと文脈単位の実体ストア（TABLE-42 (2)、Issue #1663）。SQL 表層からの
 // 配線は後続 Issue（#1664〜#1667）が行うため、それまでは crate 内の呼び出し元が
