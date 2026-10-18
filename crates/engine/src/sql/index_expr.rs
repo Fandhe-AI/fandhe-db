@@ -186,6 +186,7 @@ fn is_known_non_immutable_name(lower: &str) -> bool {
             | "session_user"
             | "current_setting"
     ) || is_current_time_function_name(lower)
+        || crate::sql::udf_call::ValueFunctionKind::from_keyword(lower).is_some()
 }
 
 fn not_immutable() -> SqlSurfaceError {

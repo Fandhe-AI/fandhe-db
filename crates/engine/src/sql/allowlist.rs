@@ -11814,6 +11814,10 @@ fn parse_index_column(p: &mut Parser<'_>) -> Result<IndexColumnElement, SqlSurfa
             p.tokens.get(p.pos.saturating_add(1)),
             Some(Token::Punct('('))
         );
+    // 引用されていない括弧なし SQL 値関数（`CURRENT_TIMESTAMP` 等）は列名ではなく式キー
+    // として扱う（PostgreSQL は予約語のため列にならない。決定性検査で `42P17` に倒す）。
+    let is_value_fn = p.is_value_function_keyword_at(p.pos);
+    let is_call = is_call || is_value_fn;
     let is_paren = matches!(p.peek(), Some(Token::Punct('(')));
     if is_call || is_paren {
         let end = crate::sql::index_expr::element_end(&p.tokens, p.pos);
@@ -16512,6 +16516,13 @@ mod tests {
             ("CREATE INDEX i ON t ((now()))", "42P17"),
             ("CREATE INDEX i ON t ((CURRENT_TIMESTAMP))", "42P17"),
             ("CREATE INDEX i ON t (clock_timestamp())", "42P17"),
+            // 括弧なし／空括弧の SQL 値関数はカタログ非依存で 42P17（Bugbot 指摘の回帰）。
+            ("CREATE INDEX i ON t (CURRENT_TIMESTAMP)", "42P17"),
+            ("CREATE INDEX i ON t (current_date)", "42P17"),
+            ("CREATE INDEX i ON t (LOCALTIME, b)", "42P17"),
+            ("CREATE INDEX i ON t (CURRENT_TIMESTAMP())", "42P17"),
+            ("CREATE INDEX i ON t ((CURRENT_DATE()))", "42P17"),
+            ("CREATE INDEX i ON t (localtimestamp())", "42P17"),
             ("CREATE INDEX i ON t ((random()))", "42P17"),
             ("CREATE INDEX i ON t ((nextval('s')))", "42P17"),
             ("CREATE INDEX i ON t ((concat(a, b)))", "42P17"),
