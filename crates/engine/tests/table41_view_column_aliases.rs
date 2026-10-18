@@ -716,3 +716,18 @@ fn buffered_body_over_aliased_view_is_consistent_between_create_and_read() {
     let r = q(&core, "SELECT * FROM b LIMIT 10");
     assert_eq!(names(&r), ["x"]);
 }
+
+/// 別名なしビューが別名付きビューを集合演算の枝で読む定義は、参照時と同じく作成時に拒否する
+/// （作成できても参照時に `XX000` になる契約の不一致を作らない）。
+#[test]
+fn set_operation_over_aliased_view_is_rejected_at_create() {
+    let (core, _g) = open_core("t41-setop-over-alias");
+    create_ok(&core, "CREATE VIEW a (x) AS SELECT body FROM docs");
+    let code = create_err(
+        &core,
+        "CREATE VIEW b AS SELECT x FROM a UNION SELECT body FROM docs",
+    );
+    assert_eq!(code, "42601");
+    // 副作用なし: b は作られていない。
+    assert_eq!(q_code(&core, "SELECT * FROM b LIMIT 10"), "42P01");
+}

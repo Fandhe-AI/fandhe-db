@@ -3559,9 +3559,14 @@ fn view_def_shape(def: &ViewDef) -> Result<ViewBodyShape> {
 /// 連鎖を経て評価後射影形ビューへ到達するビューなら `true`（テーブル・未登録は `false`。
 /// Issue #1411）。格納本文の再検証失敗・循環・過大な連鎖はカタログ破損として
 /// `CorruptSchema`。
+///
+/// `include_aliased` が `true` のときは列別名付きビュー（[`view_def_shape`] が保守側に倒す
+/// もの。Issue #1659）も到達先として数える。集合演算の枝などから別名付きビューを読む本文は
+/// 参照時に必ず拒否されるため、作成時に実カタログで再検証する判定に使う。
 fn view_reaches_buffered_in_txn(
     views_table: &redb::Table<'_, &str, &[u8]>,
     name: &str,
+    include_aliased: bool,
 ) -> Result<bool> {
     let mut current = name.to_string();
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3582,7 +3587,7 @@ fn view_reaches_buffered_in_txn(
         let def = decode_view_def(guard.value())?;
         let shape = view_body_shape(&def.body_sql)
             .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
-        if shape.buffered {
+        if shape.buffered || (include_aliased && !def.column_aliases.is_empty()) {
             return Ok(true);
         }
         current = def.base_relation;
@@ -11821,9 +11826,15 @@ impl Storage {
             // `Invalid`（`42601`）にする。単純形ビューは、評価後射影形ビューの上に重ねられる形
             // （列射影・宣言的 `WHERE` のみ）に限る。
             let mut reaches_buffered = false;
+            // 列別名付きビューへ到達する評価後射影形の本文（Issue #1659）。別名付きビューを
+            // 集合演算の枝などから読む形は参照時に拒否されるため、実カタログで再検証する。
+            let mut reaches_aliased = false;
             for rel in &shape.relations {
-                if view_reaches_buffered_in_txn(&views_table, rel)? {
+                if view_reaches_buffered_in_txn(&views_table, rel, false)? {
                     reaches_buffered = true;
+                }
+                if view_reaches_buffered_in_txn(&views_table, rel, true)? {
+                    reaches_aliased = true;
                 }
                 if shape.join && catalog_table.get(rel.as_str())?.is_none() {
                     return Err(CatalogError::Invalid(
@@ -11835,7 +11846,7 @@ impl Storage {
             // 実カタログで確定させる。FROM が評価後射影形ビューの連鎖なら受理され、テーブル
             // （または単純形ビュー経由でテーブル）直下なら `Resolved` の検証で `Invalid`
             // （`42601`）になる。作成できても参照時に必ず失敗する定義を作らない。
-            if reaches_buffered || shape.deferred_expr {
+            if reaches_buffered || shape.deferred_expr || (shape.buffered && reaches_aliased) {
                 let invalid = || {
                     CatalogError::Invalid(
                         "a view cannot reference a view with an aggregate/LIMIT body in this position"
