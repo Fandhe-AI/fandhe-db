@@ -10,14 +10,14 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 ## 構文
 
 ```
-DROP TABLE [IF EXISTS] <table> [, <table>]*
+DROP TABLE [IF EXISTS] <table> [, <table>]* [CASCADE | RESTRICT]
 ```
 
 - `IF EXISTS` は Issue #1614 で受理に変わった（末尾の「Issue #1614 追記」参照）。
 - 複数テーブル列挙は Issue #1639 で受理に変わった（末尾の「Issue #1639 追記」参照）。
-- `CASCADE`・`RESTRICT`・`USING OPERATION_ID` 句は
-  いずれも構造的に受理しない（許可リスト外・`42601`）。SQL-8 の「受理形以外は
-  `42601`」方針に従う。`CASCADE` は spec でも対象外と明示されている。
+- `CASCADE`／`RESTRICT` は Issue #1641 で受理に変わった（末尾の「Issue #1641 追記」参照）。
+- `USING OPERATION_ID` 句は構造的に受理しない（許可リスト外・`42601`）。SQL-8 の
+  「受理形以外は `42601`」方針に従う。
 - `EXPLAIN DROP TABLE ...` は既存の `EXPLAIN` 分岐（次トークンが `SELECT` である
   ことを要求）へ流れて自然に `42601` になる（`TRUNCATE`・`INSERT` と同じ経路）。
 - `operation_id` を要求しない——`CREATE TABLE`・`ALTER TABLE` と同じく、DDL は
@@ -175,6 +175,37 @@ drop_table_without_permission_is_rejected_with_42501_regardless_of_table_existen
 - **破壊的変更**: `ValidatedDropTable` へのフィールド追加と `Drop*Outcome` の非公開フィールド追加
   により、crate 外での構造体リテラル構築ができなくなる。
 
+## Issue #1640 追記: 依存オブジェクトの列挙層
+
+親 #1638（DROP の複数指定と CASCADE）の前段。TABLE-37 のポインタ。CASCADE／RESTRICT の適用
+（#1641）と複数指定の原子実行（#1639）が共通に使う、**列挙のみ**の層を
+`catalog::dependency::enumerate_drop_dependents_in_txn` に置いた。既存の DROP／ALTER の挙動は
+変えない（`pub(crate)` のみで公開 API の変更なし）。
+
+- **位置づけ**: `Storage::drop_*` と同じ write txn 内で呼び、読み取りだけを行う。カタログ表だけ
+  を読み、行ストアには触れないため、他テナントの行の有無は結果に影響しない。
+- **辺の規則**: 表 → 他表の FK 制約・その表を読むビュー、ビュー → それを読むビュー（推移的）、
+  一意索引 → 参照先の列集合が一致する FK（自己参照 FK を含む）、ENUM 型 → 使う列 → その列に
+  依存する FK・ビュー（推移的）。FK 制約は葉。
+- **依存に数えないもの**: 表自身の索引・PK・UNIQUE・CHECK・自己参照を含む自分が持つ FK は
+  表と一緒に消える付随物で、依存ではない（PostgreSQL の挙動に合わせる）。付随する索引名は
+  返さない（必要なら呼び出し側が表名で引く）。
+- **根集合の除外**: 同じ文で DROP する対象（複数指定）に含まれる依存先は結果に入れない。
+- **順序と決定性**: 反復型（再帰しない）の帰りがけ順で「依存する側が先」。子は名前順で、
+  ダイヤ型の合流でも重複しない。作成順に依存しない。
+- **循環・上限**: ビューの循環は構造上作れないため、検出したらカタログ破損として
+  `CorruptSchema`。FK の相互参照は FK を葉として扱うため循環にならない。走査するビュー数と
+  訪問数・辺数は上限で頭打ちにし、超過は `Err`（fail-closed）。
+- **保守フラグ**: 本文を再検証できないビュー、列単位で判定できない評価後射影形ビューは、
+  黙って省かず依存に加えたうえで `DependencyClosure::conservative` を立てる。
+- **共有した判定**: 一意索引の FK 集合比較（`foreign_keys_relying_on_unique_columns_in_txn`）
+  とビュー依存の判定（`view_def_dependence_on`）は既存の DROP 検査と同一実装を共有する。
+- **UDF は対象外**: UDF はセッション単位で永続化されず、永続オブジェクト（ビュー本文・CHECK・
+  索引）は作成時に非組み込み呼び出しを拒否するため、辺が構造的に存在しない。永続関数の導入時に
+  辺を追加する。
+- **引き継ぎ（#1641）**: 返す名前をエラーや NOTICE に出すか、出す場合の秘匿は呼び出し側の判断。
+  シーケンス・マテリアライズドビュー・トリガは本体が未実装のため対象外。
+
 ## Issue #1639 追記: 複数テーブル指定（`DROP TABLE a, b`）
 
 対象ビヘイビア: TABLE-37 (1)・(6)（親 Issue #1638）。`DROP TABLE [IF EXISTS] a, b, ...` を受理し、
@@ -196,3 +227,29 @@ drop_table_without_permission_is_rejected_with_42501_regardless_of_table_existen
 - **NoSQL 表層**: `drop_table` op は単一の表のまま（TABLE-37 (6)。JSON の `table` は 1 トークン限定）。
 - **対象外**: `CASCADE`／`RESTRICT`（#1641）、依存オブジェクトの汎用列挙（#1640）、複数指定の
   `DROP VIEW`／`INDEX`／`TYPE`、skip した名前ごとの NoticeResponse。
+
+## Issue #1641 追記: CASCADE／RESTRICT
+
+親 #1638。TABLE-37 (2)(3)(4)(5) のポインタ。依存列挙層（#1640。`catalog/dependency.rs`）を
+`Storage::drop_tables`・`Storage::drop_view_with_behavior` へ結線した。
+
+- **構文**: `DROP TABLE [IF EXISTS] a[, b...] [CASCADE | RESTRICT]`・`DROP VIEW [IF EXISTS] v
+  [CASCADE | RESTRICT]`。名前列の直後の 1 語だけを動作として読む（`DROP TABLE cascade` は
+  従来どおり表名）。2 語の併記は余剰トークンとして `42601`。無指定は `RESTRICT`。
+- **RESTRICT**: 従来の契約のまま。依存（ビュー・他表の FK）があれば `2BP01` で何も削除しない。
+- **CASCADE**: 依存する FK 制約（参照元の表は残る）とビュー（推移的）を、根の削除より前に
+  同じ write txn・単一 commit で適用する。順序は列挙層の返した順（依存する側が先）。FK を
+  外した参照元の表は世代を 1 回 bump し、不要になった子側キー索引を刈り込む。行には触れない。
+  同じ文に並べた名前どうしの依存は連鎖対象に入れない。
+- **fail-closed**: 列挙が依存を正確に判定できない（`conservative`）場合は連鎖削除せず `2BP01`。
+- **報告**: `DropTablesReport.cascaded`・`DropTableOutcome::cascaded()`・
+  `DropViewOutcome::cascaded()` が連鎖削除したオブジェクト名（`CascadedObject`）を適用順で返す。
+  行数・テナント情報は含めない。
+- **原子性**: commit は 1 回。クラッシュ後は削除前か削除後のどちらかだけが見える
+  （`table37_drop_cascade_crash_atomicity.rs`）。
+- **テスト**: `sql_drop_table_cascade.rs`・`wire_index_ddl.rs`（`wire_drop_cascade_and_restrict`）。
+- **対象外**: `DROP INDEX|TYPE ... CASCADE`（`42601` のまま。`RESTRICT` は受理）、VIEW／INDEX／TYPE
+  の複数名、wire の NoticeResponse 送出（engine は `cascaded()`・`skipped()` で情報を持つ
+  ところまで）、NoSQL `drop_table` の CASCADE（TABLE-37 (6)）。
+- **破壊的変更**: `ValidatedDropTable.behavior` の追加、`DropTablesReport.cascaded` の追加、
+  `Drop{Table,View}Outcome` から `Copy` を外した、`Storage::drop_tables` の引数追加。

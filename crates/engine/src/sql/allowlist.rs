@@ -10,7 +10,7 @@
 //! 後続タスクが [`ValidatedStatement`] を土台に実装する。本モジュールは
 //! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
-use crate::catalog::{ColumnDef, ColumnType, MAX_COLUMN_COUNT};
+use crate::catalog::{ColumnDef, ColumnType, DropBehavior, MAX_COLUMN_COUNT};
 use crate::datetime::DateTimeLiteralError;
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
@@ -571,6 +571,13 @@ pub enum SqlSurfaceError {
     /// ポインタ）。`param` は 1 始まりの `$n` 番号で、エラー文言には番号だけを含める
     /// （値・表の存在情報は含めない）。
     IndeterminateDatatype { param: u16 },
+    /// 式索引の式が IMMUTABLE 相当でない（`42P17`。Issue #1647・INDEX-10）。`detail` は固定文言
+    /// で、値・列名・テナント情報を載せられない型にしている。
+    InvalidObjectDefinition { detail: &'static str },
+    /// 式索引の式に集計関数がある（`42803`。Issue #1647・INDEX-10）。固定文言のみ。
+    GroupingError { detail: &'static str },
+    /// 式索引の式にウィンドウ関数がある（`42P20`。Issue #1647・INDEX-10）。固定文言のみ。
+    WindowingError { detail: &'static str },
     /// 明示的な `COLLATE` 同士の食い違い（`42P21`。Issue #2190・TABLE-28）。固定文言のみ。
     CollationMismatch,
     /// 暗黙の照合の衝突を照合が必要な演算が消費した（`42P22`。Issue #2190・TABLE-28）。
@@ -1150,6 +1157,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
             SqlSurfaceError::IndeterminateDatatype { .. } => ErrorClass::IndeterminateDatatype,
+            SqlSurfaceError::InvalidObjectDefinition { .. } => ErrorClass::InvalidObjectDefinition,
+            SqlSurfaceError::GroupingError { .. } => ErrorClass::GroupingError,
+            SqlSurfaceError::WindowingError { .. } => ErrorClass::WindowingError,
             SqlSurfaceError::CollationMismatch => ErrorClass::CollationMismatch,
             SqlSurfaceError::CannotCoerce { .. } => ErrorClass::CannotCoerce,
             SqlSurfaceError::IndeterminateCollation => ErrorClass::IndeterminateCollation,
@@ -1267,6 +1277,9 @@ impl std::fmt::Display for SqlSurfaceError {
             // 接頭辞なしで固定文言をそのまま出す（PostgreSQL と同じ文言。値は埋め込まない）。
             SqlSurfaceError::InvalidParameterValue { detail } => f.write_str(detail),
             SqlSurfaceError::NullValueNotAllowed { detail } => f.write_str(detail),
+            SqlSurfaceError::InvalidObjectDefinition { detail }
+            | SqlSurfaceError::GroupingError { detail }
+            | SqlSurfaceError::WindowingError { detail } => f.write_str(detail),
             SqlSurfaceError::MoreThanOneSqlJsonItem { detail }
             | SqlSurfaceError::NoSqlJsonItem { detail }
             | SqlSurfaceError::SqlJsonScalarRequired { detail } => f.write_str(detail),
@@ -2614,8 +2627,9 @@ pub(crate) enum WindowFunc {
 
 impl WindowFunc {
     /// ウィンドウ関数名の許可リスト照合（大文字小文字を区別しない）。未知の
-    /// 名前は `None`（呼び出し元が `42601` へ変換する）。
-    fn from_name(name: &str) -> Option<Self> {
+    /// 名前は `None`（呼び出し元が `42601` へ変換する）。式索引の先読み検査
+    /// （`sql::index_expr`、Issue #1647）も名前表を共有する。
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name.to_ascii_uppercase().as_str() {
             "ROW_NUMBER" => Some(WindowFunc::RowNumber),
             "RANK" => Some(WindowFunc::Rank),
@@ -3940,9 +3954,10 @@ pub struct ValidatedUpdate {
 /// [`crate::policy::PolicyContext`] を取らない（`catalog::Storage::drop_table`
 /// ドキュメント参照）。
 ///
-/// 受理する形は `DROP TABLE [IF EXISTS] <table> [, <table>]* [;]`（複数テーブル列挙は
-/// TABLE-37 (1)・Issue #1639）。`CASCADE`・`RESTRICT`・`USING OPERATION_ID` 句は
-/// 許可リスト外として `42601`。`operation_id` を要求しない——`CREATE TABLE`・
+/// 受理する形は `DROP TABLE [IF EXISTS] <table> [, <table>]* [CASCADE | RESTRICT] [;]`
+/// （複数テーブル列挙は TABLE-37 (1)・Issue #1639、`CASCADE`／`RESTRICT` は TABLE-37 (2)(3)・
+/// Issue #1641）。`USING OPERATION_ID` 句や `CASCADE RESTRICT` の併記は許可リスト外として
+/// `42601`。`operation_id` を要求しない——`CREATE TABLE`・
 /// `ALTER TABLE` と同じく DDL は台帳の対象外。詳細は `docs/design/drop-table.md` 参照。
 ///
 /// **本構造体はカタログ照会を一切行わない**（`validate_drop_table_tokens` の
@@ -3963,6 +3978,9 @@ pub struct ValidatedDropTable {
     /// テーブルが無ければ `sql::ddl::execute_drop_table` が副作用ゼロの no-op で
     /// 成功させる。権限ゲート・種類違い・依存検査の判定順序は変えない。
     pub if_exists: bool,
+    /// `CASCADE`／`RESTRICT` 句（TABLE-37 (2)(3)、Issue #1641）。省略時は `Restrict`。
+    /// **BREAKING CHANGE**: pub フィールドの追加（構造体リテラルで生成する側は指定が必要）。
+    pub behavior: DropBehavior,
 }
 
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
@@ -8355,6 +8373,22 @@ impl<'a> Parser<'a> {
         parsed
     }
 
+    /// 一次式 1 個（関数呼び出し・`CAST(...)` 等。後置の `::`・`COLLATE`・添字は読まない）を
+    /// ノード予算つきで解析する。式索引の関数呼び出し形 `(f(col))`（PostgreSQL の
+    /// `func_expr_windowless` 相当。INDEX-10、Issue #1647）の入口。直後が `,`／`)`／`COLLATE`
+    /// 以外なら呼び出し元の後続検査が `42601` にする。
+    fn parse_bounded_primary_expr(&mut self) -> Result<Expr, SqlSurfaceError> {
+        let saved = self.expr_node_budget;
+        self.expr_node_budget = MAX_EXPR_NODES;
+        let prev_minus = std::mem::replace(&mut self.allow_unary_minus, true);
+        let prev_plus = std::mem::replace(&mut self.allow_plus_number, true);
+        let parsed = self.parse_primary_expr_inner(0);
+        self.allow_unary_minus = prev_minus;
+        self.allow_plus_number = prev_plus;
+        self.expr_node_budget = saved;
+        parsed
+    }
+
     /// リテラル 1 要素（文字列・数値・`true`/`false`・大小無視の `NULL`・符号付き
     /// 数値のみ。関数呼び出し・括弧等は許可リスト外）。INSERT の VALUES 要素・
     /// `UPDATE ... SET`・`ON CONFLICT ... DO UPDATE SET`・列制約 `DEFAULT` の
@@ -10517,13 +10551,14 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// `DROP TABLE [IF EXISTS] <table> [, <table>]* [;]` を受理する（SQL-23、
-    /// TASK-203、Issue #902。`IF EXISTS` は Issue #1614、複数列挙は TABLE-37 (1)・
-    /// Issue #1639）。`CASCADE`・`RESTRICT`・`USING OPERATION_ID` 句は構造的に
-    /// 受理しない（`expect_end_of_statement` が余剰トークンとして `42601` で拒否する）。
+    /// `DROP TABLE [IF EXISTS] <table> [, <table>]* [CASCADE | RESTRICT] [;]` を受理する
+    /// （SQL-23、TASK-203、Issue #902。`IF EXISTS` は Issue #1614、複数列挙は TABLE-37 (1)・
+    /// Issue #1639、`CASCADE`／`RESTRICT` は TABLE-37 (2)(3)・Issue #1641）。
+    /// `USING OPERATION_ID` 句や 2 語目の `CASCADE`／`RESTRICT` は構造的に受理しない
+    /// （`expect_end_of_statement` が余剰トークンとして `42601` で拒否する）。
     /// 末尾カンマ・空要素は `expect_ident` の失敗で `42601`。名前数は字句解析の
-    /// トークン数上限で頭打ちになる。戻り値は `(テーブル名の列, IF EXISTS の有無)`。
-    fn parse_drop_table(&mut self) -> Result<(Vec<String>, bool), SqlSurfaceError> {
+    /// トークン数上限で頭打ちになる。戻り値は `(テーブル名の列, IF EXISTS の有無, 動作)`。
+    fn parse_drop_table(&mut self) -> Result<(Vec<String>, bool, DropBehavior), SqlSurfaceError> {
         self.expect_contextual_keyword("DROP")?;
         self.expect_contextual_keyword("TABLE")?;
         let if_exists = self.consume_if_exists();
@@ -10532,7 +10567,24 @@ impl<'a> Parser<'a> {
             self.advance();
             names.push(self.expect_ident()?);
         }
-        Ok((names, if_exists))
+        let behavior = self.parse_optional_drop_behavior();
+        Ok((names, if_exists, behavior))
+    }
+
+    /// DROP 文の名前列の直後にある省略可能な `CASCADE`／`RESTRICT` を 1 語だけ消費する
+    /// （TABLE-37 (2)(3)、Issue #1641）。名前は `expect_ident` で先に読み終えているため、
+    /// `cascade` という名前の表は従来どおり名前として解釈される。無指定は `Restrict`
+    /// （PostgreSQL 既定）。2 語目は呼び出し元の `expect_end_of_statement` が `42601` にする。
+    fn parse_optional_drop_behavior(&mut self) -> DropBehavior {
+        if self.peek_ident_matches("CASCADE") {
+            self.advance();
+            DropBehavior::Cascade
+        } else if self.peek_ident_matches("RESTRICT") {
+            self.advance();
+            DropBehavior::Restrict
+        } else {
+            DropBehavior::Restrict
+        }
     }
 
     /// 現在位置から末尾までの未消費トークン列（TABLE-18・SQL-23・TASK-205、
@@ -10566,14 +10618,16 @@ impl<'a> Parser<'a> {
         Ok((name, self.remaining()))
     }
 
-    /// `DROP VIEW [IF EXISTS] <name> [;]`（TABLE-18・SQL-23・TASK-205、Issue #909。
-    /// `IF EXISTS` は Issue #1614）。`CASCADE`／`RESTRICT`・複数ビュー列挙は構造的に
-    /// 受理しない。戻り値は `(ビュー名, IF EXISTS の有無)`。
-    fn parse_drop_view(&mut self) -> Result<(String, bool), SqlSurfaceError> {
+    /// `DROP VIEW [IF EXISTS] <name> [CASCADE | RESTRICT] [;]`（TABLE-18・SQL-23・TASK-205、
+    /// Issue #909。`IF EXISTS` は Issue #1614、`CASCADE`／`RESTRICT` は TABLE-37・Issue #1641）。
+    /// 複数ビュー列挙は構造的に受理しない。戻り値は `(ビュー名, IF EXISTS の有無, 動作)`。
+    fn parse_drop_view(&mut self) -> Result<(String, bool, DropBehavior), SqlSurfaceError> {
         self.expect_ident_matching("DROP")?;
         self.expect_ident_matching("VIEW")?;
         let if_exists = self.consume_if_exists();
-        Ok((self.expect_ident()?, if_exists))
+        let name = self.expect_ident()?;
+        let behavior = self.parse_optional_drop_behavior();
+        Ok((name, if_exists, behavior))
     }
 
     /// `WITH <name> AS (<body>)[, <name> AS (<body>)]*`（非再帰 CTE。SQL-29 (b)・
@@ -11226,7 +11280,7 @@ pub(crate) fn render_view_body(body: &ParsedViewBody) -> String {
         Projection::Items(_) => out.push('*'),
     }
     out.push_str(" FROM ");
-    out.push_str(&body.table_name);
+    out.push_str(&render_table_name(&body.table_name));
     if !body.where_predicates.is_empty() {
         out.push_str(" WHERE ");
         let rendered: Vec<String> = body
@@ -11330,6 +11384,16 @@ fn render_column_name(column: &str) -> String {
     } else {
         column.to_string()
     }
+}
+
+/// FROM 句の表名をビュー正規化 SQL 用に描画する。`true`／`false`・SQL 値関数予約語と
+/// 大小無視で一致する名前（引用付き識別子で作られた表）は二重引用符付きで出力し、
+/// 再トークン化で真偽リテラル等へ化けて往復検証が失敗するのを防ぐ（[`render_column_name`]
+/// と同じ規則）。lexer は引用付きでも SQL キーワード（`"order"` 等）を拒否するため、
+/// それらの名前はそもそも本文へ書けず、ここで扱う必要がない。それ以外は裸で出力する
+/// （保存形式を変えない）。
+fn render_table_name(table: &str) -> String {
+    render_column_name(table)
 }
 
 /// [`WherePredicate`] のうち [`parse_view_body`] が受理する形状のみを描画する
@@ -11443,9 +11507,16 @@ pub struct ValidatedDropView {
     pub(crate) name: String,
     /// `IF EXISTS` 句の有無（Issue #1614・TABLE-36 ポインタ）。
     pub(crate) if_exists: bool,
+    /// `CASCADE`／`RESTRICT` 句（TABLE-37、Issue #1641）。省略時は `Restrict`。
+    pub(crate) behavior: DropBehavior,
 }
 
 impl ValidatedDropView {
+    /// `CASCADE`／`RESTRICT` 句の指定（省略時は `Restrict`）。
+    pub fn behavior(&self) -> DropBehavior {
+        self.behavior
+    }
+
     /// `IF EXISTS` が指定されたか。真のとき対象不在は副作用ゼロの no-op 成功になる。
     pub fn if_exists(&self) -> bool {
         self.if_exists
@@ -11519,7 +11590,12 @@ pub struct ValidatedCreateIndex {
     /// `USING hnsw` 指定の有無（`btree` は省略時と同じ `false`。`hnsw`・`btree` 以外の
     /// `USING` 値は構造検証段で `0A000` 拒否済み。Issue #1617）。
     pub(crate) hnsw: bool,
+    /// 列名。式要素の位置は空文字列（`expressions` が `Some` の位置。式要素は構文段の最終ゲートが
+    /// 拒否するため、現状は実行段に到達しない。Issue #1647）。
     pub(crate) columns: Vec<String>,
+    /// `columns` と同じ長さの式要素（`None` は列。INDEX-10、Issue #1647）。後続 Issue #1648 が
+    /// 束縛・永続化する入口で、それまでは常に全要素 `None` の状態でしか構築されない。
+    pub(crate) expressions: Vec<Option<Expr>>,
     /// `columns` と同じ長さの列ごとの `COLLATE`（`None` は照合指定なし。Issue #2191・
     /// TABLE-28）。名前の解決は固定の許可リストとの完全一致だけで、カタログを参照しない。
     pub(crate) collations: Vec<Option<crate::collation::Collation>>,
@@ -11553,6 +11629,13 @@ impl ValidatedCreateIndex {
 
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    /// `columns` と同じ長さの式要素（`None` は列。INDEX-10、Issue #1647）。式要素を含む宣言は
+    /// 構文段の最終ゲート（`reject_unimplemented_expression_keys`）が拒否するため、現状の
+    /// 実行段が受け取る値は全要素 `None`。
+    pub fn expression_keys(&self) -> &[Option<Expr>] {
+        &self.expressions
     }
 
     /// `columns` と同じ長さの列ごとの照合指定（`None` は指定なし）。
@@ -11603,7 +11686,10 @@ pub(crate) fn is_drop_index_statement(tokens: &[Token]) -> bool {
 /// - `USING <ident>` が `hnsw`・`btree` 以外 → `0A000`（`FeatureNotSupported`）。
 ///   `USING btree` は省略時と同一のスカラー宣言（INDEX-9、Issue #1617）。
 /// - `USING hnsw` なのに列が複数 → `0A000`。
-/// - 列リストの要素が式・関数呼び出し・リテラル → `0A000`。
+/// - 列リストの要素: 式（`((<式>))`・関数呼び出し形 `(f(col))`）は先読み検査で集計 `42803`・
+///   ウィンドウ `42P20`・部分クエリ／SRF `0A000`、決定性検査で非決定式 `42P17`・組み込み以外の
+///   関数 `0A000`、通過した式も後続 Issue（#1648〜）までは最終ゲートで `0A000`
+///   （INDEX-10、Issue #1647）。リテラルは `0A000`。
 /// - 部分索引の `WHERE` 句 → `0A000`。
 /// - 列リストに重複する列名 → `42601`。列数上限超過 → `54000`。
 ///
@@ -11655,17 +11741,22 @@ pub(crate) fn validate_create_index_tokens(
         false
     };
     p.expect_punct('(')?;
-    let (first, first_collation) = parse_index_column(&mut p)?;
-    let mut columns = vec![first];
-    let mut collations = vec![first_collation];
-    while matches!(p.peek(), Some(Token::Punct(','))) {
-        p.advance();
+    let mut columns = Vec::new();
+    let mut expressions: Vec<Option<Expr>> = Vec::new();
+    let mut collations = Vec::new();
+    loop {
         if columns.len() >= MAX_COLUMN_COUNT {
             return Err(SqlSurfaceError::payload_too_large("too many index columns"));
         }
-        let (column, collation) = parse_index_column(&mut p)?;
+        let (column, expression, collation) = parse_index_column(&mut p)?;
         columns.push(column);
+        expressions.push(expression);
         collations.push(collation);
+        if matches!(p.peek(), Some(Token::Punct(','))) {
+            p.advance();
+        } else {
+            break;
+        }
     }
     p.expect_punct(')')?;
     if hnsw && columns.len() != 1 {
@@ -11674,8 +11765,9 @@ pub(crate) fn validate_create_index_tokens(
         });
     }
     let mut seen = std::collections::HashSet::new();
-    for c in &columns {
-        if !seen.insert(c.as_str()) {
+    for (c, e) in columns.iter().zip(&expressions) {
+        // 式要素の位置（空の列名）は重複判定の対象外。
+        if e.is_none() && !seen.insert(c.as_str()) {
             return Err(SqlSurfaceError::unsupported(format!(
                 "duplicate index column: {c}"
             )));
@@ -11693,6 +11785,11 @@ pub(crate) fn validate_create_index_tokens(
             detail: "CREATE UNIQUE INDEX does not support COLLATE".to_string(),
         });
     }
+    // 式要素の決定性（`42P17`／組み込み以外の関数は `0A000`。INDEX-10、Issue #1647）。判定順は
+    // 要素の構文・集計/ウィンドウ/部分クエリ → 上の構造検査 → 決定性 → `WHERE` → 最終ゲート。
+    for expr in expressions.iter().flatten() {
+        crate::sql::index_expr::check_index_expression_determinism(expr)?;
+    }
     // 部分索引（PostgreSQL 拡張構文）の `WHERE` 句は許可形状外の「機能」として
     // `0A000`（`expect_end_of_statement` の汎用検査に落とすと `42601` になる）。
     if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
@@ -11701,46 +11798,138 @@ pub(crate) fn validate_create_index_tokens(
         });
     }
     p.expect_end_of_statement()?;
+    // 最終ゲート（INDEX-10、Issue #1647）。決定性検査は部分索引の `WHERE` 判定より前に済ませてある。
+    reject_unimplemented_expression_keys(&expressions, hnsw)?;
     Ok(ValidatedCreateIndex {
         name,
         if_not_exists,
         table,
         hnsw,
         columns,
+        expressions,
         collations,
         unique,
     })
 }
 
-/// [`validate_create_index_tokens`] の列リスト 1 要素。裸の識別子と、その直後の任意の
-/// `COLLATE <name>`（Issue #2191・TABLE-28）のみを受理する（式・関数呼び出し・括弧・
-/// リテラルは `0A000`、2 回目の `COLLATE` は `42601`、未知の照合名は `42704`）。照合を
-/// 持てない型への指定の拒否（`42804`）は型を知るカタログ段（`Storage::create_index`）が担う。
-fn parse_index_column(
-    p: &mut Parser<'_>,
-) -> Result<(String, Option<crate::collation::Collation>), SqlSurfaceError> {
-    if !matches!(p.peek(), Some(Token::Ident(_))) {
+/// 式索引の最終ゲート（INDEX-10、Issue #1647）。決定性検査を通った式も、キー計算・DML 維持・
+/// プランナ選択（後続 Issue #1648〜#1651）が無い間は宣言だけ残すと効かない索引（`UNIQUE` なら
+/// 一意性の強制漏れ）になるため、カタログ非参照の構文段で `0A000` に倒す。Issue #1648 は
+/// この呼び出しを外し、`Storage::create_index` の書き込みトランザクション内で束縛と永続化を行う。
+fn reject_unimplemented_expression_keys(
+    expressions: &[Option<Expr>],
+    hnsw: bool,
+) -> Result<(), SqlSurfaceError> {
+    if !expressions.iter().any(Option::is_some) {
+        return Ok(());
+    }
+    if hnsw {
         return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "index columns must be plain identifiers".to_string(),
+            detail: "USING hnsw does not support expression indexes".to_string(),
         });
     }
-    let name = p.expect_ident()?;
-    if matches!(p.peek(), Some(Token::Punct('('))) {
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "expression indexes are not supported".to_string(),
-        });
-    }
-    let collation = if p.peek_ident_matches("COLLATE") {
-        p.advance();
-        Some(p.parse_collation_name()?)
-    } else {
-        None
-    };
-    Ok((name, collation))
+    Err(SqlSurfaceError::FeatureNotSupported {
+        detail: "expression indexes are not supported yet".to_string(),
+    })
 }
 
-/// [`ValidatedDropIndex`] の構造検証本体。`CASCADE`・複数名の同時
-/// 指定はいずれもトレイリングトークン検査により構造的に `42601` へ落ちる。
+/// [`parse_index_column`] の戻り値（列名・式要素・照合）。式要素の位置の列名は空文字列。
+type IndexColumnElement = (String, Option<Expr>, Option<crate::collation::Collation>);
+
+/// [`validate_create_index_tokens`] の列リスト 1 要素（列名・式・照合）。次の 3 形を受理する
+/// （INDEX-10、Issue #1647）:
+/// 1. 裸の識別子 + 任意の `COLLATE <name>`（Issue #2191・TABLE-28。未知の照合名は `42704`、
+///    二重の `COLLATE` は `42601`。照合を持てない型への指定の拒否〔`42804`〕は型を知る
+///    カタログ段が担う）。
+/// 2. 関数呼び出し形 `f(...)`（PostgreSQL の `func_expr_windowless` 相当）+ 任意の `COLLATE`。
+/// 3. 括弧式 `(<式>)` + 任意の `COLLATE`。閉じ括弧で式がちょうど終わらない形
+///    （`(a) + 1`）は `42601`。式が単なる列参照なら通常の列要素へ正規化する。
+///
+/// 式の解析前に要素のトークン区間を先読み検査し（`sql::index_expr::precheck_element_tokens`）、
+/// 集計・ウィンドウ・部分クエリ・SRF を PostgreSQL と同じ SQLSTATE で拒否する。式は
+/// ノード予算（`MAX_EXPR_NODES`）と深さ上限の内側でのみ解析する。リテラル・空括弧等は
+/// 従来どおり `0A000`。
+fn parse_index_column(p: &mut Parser<'_>) -> Result<IndexColumnElement, SqlSurfaceError> {
+    let is_call = matches!(p.peek(), Some(Token::Ident(_)))
+        && matches!(
+            p.tokens.get(p.pos.saturating_add(1)),
+            Some(Token::Punct('('))
+        );
+    // 引用されていない括弧なし SQL 値関数（`CURRENT_TIMESTAMP` 等）は列名ではなく式キー
+    // として扱う（PostgreSQL は予約語のため列にならない。決定性検査で `42P17` に倒す）。
+    let is_value_fn = p.is_value_function_keyword_at(p.pos);
+    let is_call = is_call || is_value_fn;
+    let is_paren = matches!(p.peek(), Some(Token::Punct('(')));
+    if is_call || is_paren {
+        let end = crate::sql::index_expr::element_end(&p.tokens, p.pos);
+        let element = p.tokens.get(p.pos..end).unwrap_or(&[]);
+        crate::sql::index_expr::precheck_element_tokens(element)?;
+    }
+    let expr = if is_call {
+        p.parse_bounded_primary_expr()?
+    } else if is_paren {
+        p.advance();
+        // 空の `()` は式として解析できない。リテラル要素と同じ文言の `0A000` に揃える。
+        if matches!(p.peek(), Some(Token::Punct(')'))) {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "index columns must be plain identifiers".to_string(),
+            });
+        }
+        let expr = p.parse_bounded_value_expr()?;
+        p.expect_punct(')')?;
+        expr
+    } else {
+        if !matches!(p.peek(), Some(Token::Ident(_))) {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "index columns must be plain identifiers".to_string(),
+            });
+        }
+        let name = p.expect_ident()?;
+        let collation = parse_index_collation(p)?;
+        return Ok((name, None, collation));
+    };
+    let collation = parse_index_collation(p)?;
+    // 式が単なる列参照なら列要素へ正規化する（`((col))`・`((col COLLATE "C"))`）。
+    match expr {
+        Expr::Ident(name) => Ok((name, None, collation)),
+        Expr::Collate {
+            expr: inner,
+            collation: inner_collation,
+        } => match *inner {
+            Expr::Ident(name) => {
+                if collation.is_some() {
+                    return Err(SqlSurfaceError::unsupported("multiple COLLATE clauses"));
+                }
+                Ok((name, None, Some(inner_collation)))
+            }
+            other => Ok((
+                String::new(),
+                Some(Expr::Collate {
+                    expr: Box::new(other),
+                    collation: inner_collation,
+                }),
+                collation,
+            )),
+        },
+        other => Ok((String::new(), Some(other), collation)),
+    }
+}
+
+/// 列リスト要素の直後の任意の `COLLATE <name>`（[`parse_index_column`] の共通部）。
+fn parse_index_collation(
+    p: &mut Parser<'_>,
+) -> Result<Option<crate::collation::Collation>, SqlSurfaceError> {
+    if p.peek_ident_matches("COLLATE") {
+        p.advance();
+        Ok(Some(p.parse_collation_name()?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// [`ValidatedDropIndex`] の構造検証本体。`RESTRICT`（既定と同義）は受理し、`CASCADE`
+/// （一意索引に依存する FK の連鎖削除。Issue #1641 の対象外）は明示的に `42601`、複数名の
+/// 同時指定はトレイリングトークン検査により構造的に `42601` へ落ちる。
 pub(crate) fn validate_drop_index_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedDropIndex, SqlSurfaceError> {
@@ -11749,6 +11938,11 @@ pub(crate) fn validate_drop_index_tokens(
     p.expect_ident_matching("INDEX")?;
     let if_exists = p.consume_if_exists();
     let name = p.expect_ident()?;
+    if p.parse_optional_drop_behavior() == DropBehavior::Cascade {
+        return Err(SqlSurfaceError::unsupported(
+            "DROP INDEX ... CASCADE is not supported",
+        ));
+    }
     p.expect_end_of_statement()?;
     Ok(ValidatedDropIndex { name, if_exists })
 }
@@ -11844,7 +12038,8 @@ pub(crate) fn validate_create_type_tokens(
     Ok(ValidatedCreateType { name, labels })
 }
 
-/// [`ValidatedDropType`] の構造検証本体（Issue #1194）。`CASCADE`・
+/// [`ValidatedDropType`] の構造検証本体（Issue #1194）。`RESTRICT`（既定と同義）は受理し、
+/// `CASCADE`（型を使う列と制約の連鎖削除。Issue #1641 の対象外）は明示的に `42601`、
 /// 複数名の同時指定はトレイリングトークン検査により構造的に `42601` へ落ちる。
 pub(crate) fn validate_drop_type_tokens(
     tokens: &[Token],
@@ -11856,6 +12051,11 @@ pub(crate) fn validate_drop_type_tokens(
     let name = p.expect_ident()?;
     crate::catalog::validate_identifier(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid type name in DROP TYPE"))?;
+    if p.parse_optional_drop_behavior() == DropBehavior::Cascade {
+        return Err(SqlSurfaceError::unsupported(
+            "DROP TYPE ... CASCADE is not supported",
+        ));
+    }
     p.expect_end_of_statement()?;
     Ok(ValidatedDropType { name, if_exists })
 }
@@ -11865,9 +12065,13 @@ pub(crate) fn validate_drop_view_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedDropView, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
-    let (name, if_exists) = p.parse_drop_view()?;
+    let (name, if_exists, behavior) = p.parse_drop_view()?;
     p.expect_end_of_statement()?;
-    Ok(ValidatedDropView { name, if_exists })
+    Ok(ValidatedDropView {
+        name,
+        if_exists,
+        behavior,
+    })
 }
 
 /// 構文木（[`ValidatedTruncate`] の元）。カタログ存在確認前の中間結果
@@ -15649,11 +15853,12 @@ pub fn validate_drop_table_tokens(
     tokens: &[lexer::Token],
 ) -> Result<ValidatedDropTable, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
-    let (table_names, if_exists) = p.parse_drop_table()?;
+    let (table_names, if_exists, behavior) = p.parse_drop_table()?;
     p.expect_end_of_statement()?;
     Ok(ValidatedDropTable {
         table_names,
         if_exists,
+        behavior,
     })
 }
 
@@ -16333,6 +16538,100 @@ mod tests {
         ] {
             assert_eq!(parse(sql).expect_err(sql).wire_code(), code, "{sql}");
         }
+    }
+
+    /// 式索引の列リスト要素の構文と SQLSTATE の分類（INDEX-10、Issue #1647）。決定的な式も最終
+    /// ゲートで `0A000` になる（カタログ非参照）。`((col))` は通常の列要素へ正規化する。
+    #[test]
+    fn create_index_expression_elements_classify_without_catalog() {
+        use super::*;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            validate_create_index_tokens(&tokens)
+        };
+        // `((col))` は列へ正規化され、重複列の判定対象になる。
+        let ok = parse("CREATE INDEX i ON t ((a), b)").expect("normalised");
+        assert_eq!(ok.columns(), ["a", "b"]);
+        assert!(ok.expression_keys().iter().all(Option::is_none));
+        let ok = parse("CREATE INDEX i ON t ((a COLLATE \"C\"))").expect("normalised collate");
+        assert_eq!(
+            ok.column_collations(),
+            [Some(crate::collation::Collation::C)]
+        );
+        for (sql, code) in [
+            // 重複列（正規化後）。
+            ("CREATE INDEX i ON t ((a), a)", "42601"),
+            // 決定的な式・型依存の式は構文段の最終ゲートで 0A000。
+            ("CREATE INDEX i ON t (lower(a))", "0A000"),
+            ("CREATE INDEX i ON t ((a + 1))", "0A000"),
+            ("CREATE INDEX i ON t ((lower(a)), b)", "0A000"),
+            ("CREATE INDEX i ON t ((a::text))", "0A000"),
+            ("CREATE INDEX i ON t ((date_part('year', ts)))", "0A000"),
+            ("CREATE INDEX i ON t (lower(a) COLLATE \"C\")", "0A000"),
+            ("CREATE UNIQUE INDEX i ON t ((a + 1))", "0A000"),
+            ("CREATE INDEX i ON t USING hnsw ((a + 1))", "0A000"),
+            // 非決定的な式は 42P17（UNIQUE・入れ子・複数要素でも検出）。
+            ("CREATE INDEX i ON t ((now()))", "42P17"),
+            ("CREATE INDEX i ON t ((CURRENT_TIMESTAMP))", "42P17"),
+            ("CREATE INDEX i ON t (clock_timestamp())", "42P17"),
+            // 括弧なし／空括弧の SQL 値関数はカタログ非依存で 42P17（Bugbot 指摘の回帰）。
+            ("CREATE INDEX i ON t (CURRENT_TIMESTAMP)", "42P17"),
+            ("CREATE INDEX i ON t (current_date)", "42P17"),
+            ("CREATE INDEX i ON t (LOCALTIME, b)", "42P17"),
+            ("CREATE INDEX i ON t (CURRENT_TIMESTAMP())", "42P17"),
+            ("CREATE INDEX i ON t ((CURRENT_DATE()))", "42P17"),
+            ("CREATE INDEX i ON t (localtimestamp())", "42P17"),
+            ("CREATE INDEX i ON t ((random()))", "42P17"),
+            ("CREATE INDEX i ON t ((nextval('s')))", "42P17"),
+            ("CREATE INDEX i ON t ((concat(a, b)))", "42P17"),
+            ("CREATE INDEX i ON t ((to_jsonb(a)))", "42P17"),
+            ("CREATE INDEX i ON t ((timezone(ts)))", "42P17"),
+            (
+                "CREATE INDEX i ON t ((lower(coalesce(a, now()::text))))",
+                "42P17",
+            ),
+            ("CREATE UNIQUE INDEX i ON t (b, (now()))", "42P17"),
+            // 組み込み以外の関数（セッション UDF・未知名）は 0A000。
+            ("CREATE INDEX i ON t ((my_udf(a)))", "0A000"),
+            // 集計・ウィンドウ・部分クエリ・SRF（左端優先）。
+            ("CREATE INDEX i ON t ((count(*)))", "42803"),
+            ("CREATE INDEX i ON t (sum(a))", "42803"),
+            ("CREATE INDEX i ON t ((sum(a) OVER ()))", "42P20"),
+            ("CREATE INDEX i ON t ((row_number() OVER ()))", "42P20"),
+            ("CREATE INDEX i ON t ((SELECT 1))", "0A000"),
+            ("CREATE INDEX i ON t ((a IN (SELECT b FROM u)))", "0A000"),
+            ("CREATE INDEX i ON t ((unnest(a)))", "0A000"),
+            // 構文: 括弧で式がちょうど終わらない形・関数呼び出し形の後置は 42601。
+            ("CREATE INDEX i ON t ((a) + 1)", "42601"),
+            ("CREATE INDEX i ON t (lower(a) + 1)", "42601"),
+            ("CREATE INDEX i ON t (lower(a)::text)", "42601"),
+            ("CREATE INDEX i ON t ((a + ))", "42601"),
+            // 空括弧・リテラルは従来どおり 0A000。
+            ("CREATE INDEX i ON t ()", "0A000"),
+            ("CREATE INDEX i ON t ('a')", "0A000"),
+        ] {
+            assert_eq!(parse(sql).expect_err(sql).wire_code(), code, "{sql}");
+        }
+    }
+
+    /// 式索引の式のノード数・深さの上限（無制限確保なし）。上限超過は `54000`。
+    #[test]
+    fn create_index_expression_is_bounded() {
+        use super::*;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            validate_create_index_tokens(&tokens)
+        };
+        let long = vec!["a"; MAX_EXPR_NODES + 8].join(" + ");
+        let err = parse(&format!("CREATE INDEX i ON t (({long}))")).expect_err("too many nodes");
+        assert_eq!(err.wire_code(), "54000");
+        let deep = format!(
+            "CREATE INDEX i ON t (({}a{}))",
+            "(".repeat(MAX_EXPR_DEPTH + 8),
+            ")".repeat(MAX_EXPR_DEPTH + 8)
+        );
+        let err = parse(&deep).expect_err("too deep");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]
@@ -24390,5 +24689,68 @@ mod body_expr_policy_tests {
             let err = validate_alter_table(bad).expect_err(bad);
             assert_eq!(err.wire_code(), "42601", "{bad}");
         }
+    }
+}
+/// `DROP ... CASCADE／RESTRICT` 句の構文検証（TABLE-37 (2)(3)、Issue #1641）。
+#[cfg(test)]
+mod drop_behavior_tests {
+    use super::*;
+
+    fn table(sql: &str) -> Result<ValidatedDropTable, SqlSurfaceError> {
+        validate_drop_table(sql)
+    }
+
+    fn view(sql: &str) -> Result<ValidatedDropView, SqlSurfaceError> {
+        validate_drop_view_tokens(&lexer::tokenize(sql).expect("tokenize"))
+    }
+
+    #[test]
+    fn table_accepts_cascade_restrict_and_defaults_to_restrict() {
+        assert_eq!(
+            table("DROP TABLE a").unwrap().behavior,
+            DropBehavior::Restrict
+        );
+        assert_eq!(
+            table("DROP TABLE a RESTRICT").unwrap().behavior,
+            DropBehavior::Restrict
+        );
+        let v = table("drop table if exists a, b cascade;").unwrap();
+        assert_eq!(v.behavior, DropBehavior::Cascade);
+        assert!(v.if_exists);
+        assert_eq!(v.table_names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn cascade_named_table_is_a_name_and_double_keyword_is_rejected() {
+        let v = table("DROP TABLE cascade").unwrap();
+        assert_eq!(v.table_names, vec!["cascade".to_string()]);
+        assert_eq!(v.behavior, DropBehavior::Restrict);
+        for sql in [
+            "DROP TABLE a CASCADE RESTRICT",
+            "DROP TABLE a CASCADE CASCADE",
+        ] {
+            assert_eq!(table(sql).unwrap_err().wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn view_accepts_behavior_but_index_and_type_reject_cascade() {
+        assert_eq!(
+            view("DROP VIEW v CASCADE").unwrap().behavior,
+            DropBehavior::Cascade
+        );
+        assert_eq!(
+            view("DROP VIEW v").unwrap().behavior(),
+            DropBehavior::Restrict
+        );
+        let index = |sql: &str| validate_drop_index_tokens(&lexer::tokenize(sql).expect("lex"));
+        let ty = |sql: &str| validate_drop_type_tokens(&lexer::tokenize(sql).expect("lex"));
+        assert_eq!(
+            index("DROP INDEX i CASCADE").unwrap_err().wire_code(),
+            "42601"
+        );
+        assert_eq!(ty("DROP TYPE t CASCADE").unwrap_err().wire_code(), "42601");
+        index("DROP INDEX i RESTRICT").expect("restrict index");
+        ty("DROP TYPE t RESTRICT").expect("restrict type");
     }
 }

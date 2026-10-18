@@ -495,3 +495,59 @@ fn narrowing_referenced_primary_key_keeps_integrity() {
         "23503"
     );
 }
+
+/// 自己参照 FK の参照元列・参照先列の型変更で型の組が不整合になる場合は、カタログ検証の内部エラー
+/// (`XX000`) ではなく `42804` で拒否し、拒否後も列型・行・以後の参照整合性が変わらない。
+#[test]
+fn self_referencing_foreign_key_type_mismatch_is_42804_and_leaves_table_unchanged() {
+    let (_p, _g, core) = open("dep-fk-self");
+    ok(
+        &core,
+        "CREATE TABLE s (k BIGINT PRIMARY KEY, up BIGINT REFERENCES s (k))",
+    );
+    insert(&core, "s", 1, "k, up", "3, 3");
+    for sql in [
+        "ALTER TABLE s ALTER COLUMN up TYPE TEXT USING up::text",
+        "ALTER TABLE s ALTER COLUMN k TYPE TEXT USING k::text",
+    ] {
+        assert_eq!(code(&core, sql), "42804", "{sql}");
+        assert_eq!(firsts(&core, "SELECT k FROM s"), vec!["SignedInteger(3)"]);
+        assert_eq!(firsts(&core, "SELECT up FROM s"), vec!["SignedInteger(3)"]);
+    }
+    assert_eq!(
+        code(
+            &core,
+            "INSERT INTO s (id, k, up) VALUES (2, 4, 9) USING OPERATION_ID 'sf1'"
+        ),
+        "23503"
+    );
+}
+
+/// `REFERENCES <親> (id)`（自己参照を含む）の参照元列を整数以外へ変換すると `42804` で拒否し、
+/// 拒否後も列型・行が変わらない。
+#[test]
+fn references_id_type_mismatch_is_42804_and_leaves_table_unchanged() {
+    let (_p, _g, core) = open("dep-fk-id");
+    ok(&core, "CREATE TABLE p (k INTEGER)");
+    ok(&core, "CREATE TABLE c (r BIGINT REFERENCES p (id))");
+    ok(&core, "CREATE TABLE s (up BIGINT REFERENCES s (id))");
+    insert(&core, "p", 1, "k", "1");
+    insert(&core, "c", 1, "r", "1");
+    insert(&core, "s", 1, "up", "1");
+    for (table, col) in [("c", "r"), ("s", "up")] {
+        assert_eq!(
+            code(
+                &core,
+                &format!("ALTER TABLE {table} ALTER COLUMN {col} TYPE TEXT USING {col}::text")
+            ),
+            "42804",
+            "{table}"
+        );
+        assert_eq!(
+            firsts(&core, &format!("SELECT {col} FROM {table}")),
+            vec!["SignedInteger(1)"]
+        );
+    }
+    // 整数同士の変換は従来どおり受理される。
+    ok(&core, "ALTER TABLE c ALTER COLUMN r TYPE INTEGER");
+}

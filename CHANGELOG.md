@@ -14,6 +14,18 @@
   （従来は一律 `0A000`。重複 `23505`・CHECK 違反 `23514`・FK の型照合 `42804`／参照整合性 `23503`・
   DEFAULT の変換不能 `42804`）。再検証は全テナント・全可視性の行で、拒否時は表不変・エラー文言に値を含めない。
   ビューが参照する列（`SELECT *`・連鎖を含む）は PostgreSQL と同じ `0A000` のまま。公開 API の変更なし。
+- DROP の CASCADE／RESTRICT（Issue #1641・TABLE-37）: `DROP TABLE|VIEW` が `CASCADE`／`RESTRICT` を受理し、`CASCADE` は依存する FK 制約とビューを連鎖削除する。`ValidatedDropTable` に `pub behavior: DropBehavior` を追加、`DropTablesReport` に `cascaded` を追加、`DropTableOutcome`／`DropViewOutcome` から `Copy` を外し（`cascaded()` を追加）、`Storage::drop_tables` に `DropBehavior` 引数を追加した。`Storage::drop_view_with_behavior` を追加。`DROP INDEX|TYPE ... CASCADE` は `42601` のまま。
+- 表の改名でビュー・台帳を追随（Issue #1625・TABLE-38）: `ALTER TABLE ... RENAME TO` が単純形ビューの
+  定義を新名へ付け替え、`operation_id` 台帳・`last_op`・分割実行ジョブ記録を新名へ移す（従来は
+  ビュー依存の表の改名を `0A000` で拒否し、台帳は削除していた）。評価後射影形ビューが読む表の改名は
+  引き続き `0A000`。公開 API の型変更なし。
+- 式索引の parser と式の決定性検査（Issue #1647・INDEX-10）: `CREATE INDEX` の列リストで
+  `((<式>))` と関数呼び出し形 `(f(col))` を構文上受理し、非決定式を `42P17`、集計を `42803`、
+  ウィンドウを `42P20`、部分クエリ・SRF・組み込み以外の関数を `0A000` で拒否する（従来はいずれも
+  一律 `0A000`）。決定的な式も後続 Issue（#1648〜#1651）までは `0A000`（式索引は作成できない）。
+  `((col))` は通常の列索引として作成できる。公開 API は `SqlSurfaceError`（`InvalidObjectDefinition`・
+  `GroupingError`・`WindowingError`）・`ErrorClass`（同名 3 分類）への variant 追加と
+  `ValidatedCreateIndex::expression_keys` の追加。
 - `DROP TABLE a, b`（Issue #1639・TABLE-37 (1)）: 従来 `42601` だった複数テーブル指定を受理する。
   文全体を 1 つの write txn で原子的に実行し（不在・種類違い・依存のどれか 1 つでもあれば何も削除しない）、
   同じ文に並べた名前どうしの依存は数えない。`CASCADE`／`RESTRICT` は従来どおり `42601`。公開 API は

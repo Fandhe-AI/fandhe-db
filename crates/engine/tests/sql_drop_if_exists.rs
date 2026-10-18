@@ -255,13 +255,18 @@ fn unsupported_shapes_stay_42601() {
     for kind in KINDS {
         let mut shapes = vec![
             format!("DROP {kind} IF EXISTS"),
-            format!("DROP {kind} IF EXISTS a CASCADE"),
+            format!("DROP {kind} IF EXISTS a CASCADE RESTRICT"),
             format!("DROP {kind} IF a"),
             format!("DROP {kind} EXISTS a"),
         ];
         // `DROP TABLE` の複数名は受理される（TABLE-37 (1)）。他種別は従来どおり拒否。
         if kind != "TABLE" {
             shapes.push(format!("DROP {kind} IF EXISTS a, b"));
+        }
+        // `DROP TABLE`／`DROP VIEW` の `CASCADE` は TABLE-37（Issue #1641）で受理に変わった。
+        // INDEX／TYPE の `CASCADE` は対象外のため従来どおり拒否する。
+        if kind == "INDEX" || kind == "TYPE" {
+            shapes.push(format!("DROP {kind} IF EXISTS a CASCADE"));
         }
         for sql in shapes {
             assert_eq!(code(&core, &mut allowed, &sql), "42601", "allowed: {sql}");

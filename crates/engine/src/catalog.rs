@@ -56,6 +56,10 @@ use crate::storage::{Row as StorageRow, Storage, StorageError};
 #[cfg(test)]
 use crate::storage::{RowInput, Visibility};
 
+// DROP の依存オブジェクト列挙層（TABLE-37・Issue #1640）。呼び出し元の `Storage::drop_*`
+// （Issue #1639・#1641）が結線済み（`drop_tables` の CASCADE と `drop_view_with_behavior`）。
+mod dependency;
+
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
 /// エンコードしたバイト列。`ROWS_TABLE`（`storage.rs`）とは別テーブルとし、
 /// カタログの読み書き（TABLE-4/TABLE-5）が行データに触れないようにする。
@@ -989,12 +993,10 @@ fn drop_unique_index_constraint_in_txn(
         .iter()
         .map(|s| s.as_str())
         .collect();
-    for (_referencing_schema, fk) in referencing_foreign_keys_in_txn(write_txn, &def.table)? {
-        let parent_set: std::collections::HashSet<&str> =
-            fk.parent_columns().iter().map(|s| s.as_str()).collect();
-        if parent_set == target_set {
-            return Err(CatalogError::DependentObjectsStillExist(def.name.clone()));
-        }
+    if !foreign_keys_relying_on_unique_columns_in_txn(write_txn, &def.table, &target_set)?
+        .is_empty()
+    {
+        return Err(CatalogError::DependentObjectsStillExist(def.name.clone()));
     }
     let mut constraints = schema.unique_constraints.clone();
     constraints.remove(target_index);
@@ -1008,6 +1010,27 @@ fn drop_unique_index_constraint_in_txn(
     let required = required_key_index_names_in_txn(write_txn, &def.table)?;
     crate::key_index::prune_unneeded_indexes_in_txn(write_txn, &def.table, &required)?;
     Ok(())
+}
+
+/// テーブル `table` を参照先とする `FOREIGN KEY` のうち、参照先列の集合が `target_set` と
+/// 一致するものを返す（自己参照を含む）。一意索引・UNIQUE 制約の削除可否判定
+/// （[`drop_unique_index_constraint_in_txn`]）と、DROP の依存列挙
+/// （`dependency::enumerate_drop_dependents_in_txn`、Issue #1640）が共有する判定の本体で、
+/// 双方の判定がずれないよう集合比較をここだけに置く。呼び出し元は `CATALOG_TABLE` の
+/// ハンドルを保持していない状態で呼ぶこと（[`referencing_foreign_keys_in_txn`] の契約）。
+fn foreign_keys_relying_on_unique_columns_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    target_set: &std::collections::HashSet<&str>,
+) -> Result<Vec<(TableSchema, ForeignKeyDef)>> {
+    Ok(referencing_foreign_keys_in_txn(write_txn, table)?
+        .into_iter()
+        .filter(|(_, fk)| {
+            let parent_set: std::collections::HashSet<&str> =
+                fk.parent_columns().iter().map(|s| s.as_str()).collect();
+            &parent_set == target_set
+        })
+        .collect())
 }
 
 /// `name` が [`INDEX_CATALOG_TABLE`] に索引名として登録済みかを write txn 内で
@@ -1066,59 +1089,80 @@ fn retain_index_defs_in_txn(
     Ok(())
 }
 
-/// 表の改名（[`Storage::alter_table_rename`]、Issue #1623）が、依存オブジェクトを持つ表を
-/// 追随できないうちは受理しないための暫定ゲート（fail-closed。`0A000`）。カタログ情報だけで
-/// 判定し、テナントの行・台帳の有無で成否を変えない（存在オラクルにしない）。
+/// 表の改名（[`Storage::alter_table_rename`]、TABLE-38 のポインタ、Issue #1625）に伴う
+/// ビュー定義の追随。表 `old` を直接読む単純形ビューの `base_relation` と保存本文の `FROM`
+/// を `new` へ付け替える。本文は AST（`parse_view_body`）で書き換えて既存レンダラーで
+/// 再描画する（文字列置換はしない）。ビュー名（キー）は変えず、ビューを読むビューは親ビューの
+/// 名前を参照するため触れない。
 ///
-/// 拒否対象と解除の担当: PK・UNIQUE・CHECK・FK（参照元・参照先）・索引宣言（Issue #1624）、
-/// ビューからの参照（Issue #1625）。解除は項目ごとに本関数から外していく。
+/// 評価後射影形（集計・JOIN・CTE・`ORDER BY`・`LIMIT`・集合演算・式）の本文は、別名・修飾子を
+/// トークン単位で安全に区別できないため、`old` を読むなら `FeatureNotSupported`（`0A000`）で
+/// 拒否する（fail-closed。列改名〔[`rewrite_views_for_renamed_column_in_txn`]〕と同じ線）。
+/// 再検証できない本文・再描画後の往復検証の失敗も `0A000`。追随後の本文が
+/// [`MAX_VIEW_BODY_BYTES`] を超えれば `54000`。計画をすべて確定してから書き込むため、拒否時に
+/// ビュー定義は変更されない。判定はカタログ情報だけで行い、行・台帳の有無で成否を変えない。
 /// 呼び出し元は `CATALOG_TABLE` のハンドルを保持していない状態で呼ぶこと。
-fn refuse_rename_table_with_dependents_in_txn(
+fn rewrite_views_for_renamed_table_in_txn(
     write_txn: &redb::WriteTransaction,
-    schema: &TableSchema,
+    old: &str,
+    new: &str,
 ) -> std::result::Result<(), AlterCheckError> {
-    let refused = |what: &str| {
+    let refused = || {
         AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
-            detail: format!("renaming a table that has {what} is not supported"),
+            detail: "renaming a table referenced by a view with an aggregate, join, or other \
+                     complex body is not supported"
+                .to_string(),
         })
     };
-    if schema.primary_key.is_some()
-        || !schema.unique_constraints.is_empty()
-        || !schema.checks.is_empty()
-        || !schema.foreign_keys.is_empty()
-    {
-        return Err(refused("constraints"));
-    }
-    if !referencing_foreign_keys_in_txn(write_txn, &schema.name)?.is_empty() {
-        return Err(refused("foreign keys referencing it"));
-    }
-    match write_txn.open_table(INDEX_CATALOG_TABLE) {
-        Ok(index_table) => {
-            for (scanned, entry) in index_table.iter().map_err(CatalogError::from)?.enumerate() {
-                if scanned >= MAX_INDEX_COUNT {
-                    return Err(CatalogError::CorruptSchema(format!(
-                        "index catalog exceeds {MAX_INDEX_COUNT} entries"
-                    ))
-                    .into());
-                }
-                let (key, value) = entry.map_err(CatalogError::from)?;
-                let def = decode_index_def(key.value(), value.value())?;
-                if def.table == schema.name {
-                    return Err(refused("indexes"));
-                }
-            }
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
+    let mut views_table = match write_txn.open_table(VIEWS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
         Err(e) => return Err(CatalogError::from(e).into()),
-    }
-    match write_txn.open_table(VIEWS_TABLE) {
-        Ok(views_table) => {
-            if !views_depending_on_in_txn(&views_table, &schema.name)?.is_empty() {
-                return Err(refused("dependent views"));
-            }
+    };
+    let mut planned: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut scanned = 0usize;
+    for entry in views_table.iter().map_err(CatalogError::from)? {
+        let (key, value) = entry.map_err(CatalogError::from)?;
+        if scanned >= MAX_VIEWS {
+            return Err(CatalogError::ViewLimitExceeded("too many views".to_string()).into());
         }
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
-        Err(e) => return Err(CatalogError::from(e).into()),
+        scanned = scanned.saturating_add(1);
+        let def = decode_view_def(value.value())?;
+        match view_def_dependence_on(&def, old) {
+            ViewDependence::No => continue,
+            ViewDependence::Unverifiable => return Err(refused()),
+            ViewDependence::Direct => {}
+        }
+        match view_body_shape(&def.body_sql) {
+            Ok(shape) if !shape.buffered && def.base_relation == old => {}
+            _ => return Err(refused()),
+        }
+        let tokens =
+            crate::sql::lexer::tokenize_stored_view_body(&def.body_sql).map_err(|_| refused())?;
+        let mut parsed = parse_view_body(&tokens).map_err(|_| refused())?;
+        if parsed.table_name != old {
+            return Err(refused());
+        }
+        parsed.table_name = new.to_string();
+        let body_sql = crate::sql::allowlist::render_stored_simple_view_body(&parsed)
+            .map_err(AlterCheckError::Sql)?;
+        if body_sql.len() > MAX_VIEW_BODY_BYTES {
+            return Err(AlterCheckError::Sql(SqlSurfaceError::payload_too_large(
+                "view body exceeds the allowed size after table rename",
+            )));
+        }
+        // 多層防御: 再描画した本文が再パースでき、新しい親の名前と一致することを確かめる。
+        validate_view_body_matches_base_relation(&body_sql, new).map_err(|_| refused())?;
+        let mut updated = def.clone();
+        updated.base_relation = new.to_string();
+        updated.body_sql = body_sql;
+        planned.push((key.value().to_string(), encode_view_def(&updated)?));
+    }
+    // 計画が確定した後にだけ書き込む。
+    for (name, encoded) in &planned {
+        views_table
+            .insert(name.as_str(), encoded.as_slice())
+            .map_err(CatalogError::from)?;
     }
     Ok(())
 }
@@ -1299,6 +1343,49 @@ fn rename_index_def_columns_in_txn(
                     *c = new.to_string();
                 }
             }
+            updates.push((name, encode_index_def(&def)?));
+        }
+        for (name, bytes) in &updates {
+            index_table.insert(name.as_str(), bytes.as_slice())?;
+        }
+        !updates.is_empty()
+    };
+    if rewritten {
+        bump_index_catalog_generation_in_txn(write_txn)?;
+    }
+    Ok(())
+}
+
+/// 表改名（[`Storage::alter_table_rename`]、Issue #1624）が同一 write txn から呼ぶ。
+/// 所有テーブルが `old` の索引宣言（scalar・hnsw・unique とも）の `table` を `new` へ
+/// 書き換え、1 件でも書いたら索引カタログ世代を bump する（`INDEX_CATALOG_GENERATION_TABLE`
+/// の不変条件。HNSW 判定のキャッシュに旧名の宣言を残さない）。索引名・種別・列・照合は
+/// 維持する。[`retain_index_defs_in_txn`] と同じ [`MAX_INDEX_COUNT`] 打ち切り。
+fn rename_index_def_table_in_txn(
+    write_txn: &redb::WriteTransaction,
+    old: &str,
+    new: &str,
+) -> Result<()> {
+    let rewritten = {
+        let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut updates: Vec<(String, Vec<u8>)> = Vec::new();
+        for (scanned, entry) in index_table.iter()?.enumerate() {
+            if scanned >= MAX_INDEX_COUNT {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                )));
+            }
+            let (key, value) = entry?;
+            let name = key.value().to_string();
+            let mut def = decode_index_def(&name, value.value())?;
+            if def.table != old {
+                continue;
+            }
+            def.table = new.to_string();
             updates.push((name, encode_index_def(&def)?));
         }
         for (name, bytes) in &updates {
@@ -1600,17 +1687,48 @@ fn validate_dependents_statically_in_txn(
     {
         return Err(key_type_unsupported("unique constraint"));
     }
-    // FK の参照元列は PK 許可型に限る（宣言時と同じ。満たさないとスキーマ検証が内部エラーに
-    // なるため、ここで宣言時と同じ `42804` にそろえる）。
-    if new_schema
-        .foreign_keys
-        .iter()
-        .any(|fk| fk.columns.iter().any(|c| c == column_name))
-        && !new_ty.is_primary_key_allowed()
-    {
-        return Err(AlterCheckError::Sql(SqlSurfaceError::datatype_mismatch(
+    // FK の型整合を、後段の `encode_schema`（`validate_foreign_keys` の `InvalidForeignKey` が
+    // `XX000` に化ける）より前に宣言時と同じ基準で判定し、固定文言の `42804` で返す。対象は
+    // (a) 参照元列が PK 許可型でない、(b) `REFERENCES id` の参照元列が整数型でない、
+    // (c) 自己参照 FK の参照元・参照先の型の組が不整合（参照先列だけが変更列の場合を含む）。
+    // 他表を参照する FK の型の組は参照先スキーマが要るため `revalidate_keys_after_type_change`
+    // が担う。ここは型に起因する拒否だけを写像し、他原因の `InvalidForeignKey` は変換しない。
+    let fk_mismatch = || {
+        AlterCheckError::Sql(SqlSurfaceError::datatype_mismatch(
             "foreign key column types are incompatible after the column type change",
-        )));
+        ))
+    };
+    let new_col_ty = |name: &str| {
+        new_schema
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| &c.ty)
+    };
+    for fk in &new_schema.foreign_keys {
+        let child_side = fk.columns.iter().any(|c| c == column_name);
+        let self_ref = fk.parent_table == table_name;
+        let self_parent_side = self_ref && fk.parent_columns.iter().any(|c| c == column_name);
+        if !child_side && !self_parent_side {
+            continue;
+        }
+        if child_side && !new_ty.is_primary_key_allowed() {
+            return Err(fk_mismatch());
+        }
+        if fk.references_parent_id() {
+            for name in &fk.columns {
+                if new_col_ty(name).is_none_or(|t| t.integer_rank().is_none()) {
+                    return Err(fk_mismatch());
+                }
+            }
+        } else if self_ref {
+            for (child_col, parent_col) in fk.columns.iter().zip(&fk.parent_columns) {
+                match (new_col_ty(child_col), new_col_ty(parent_col)) {
+                    (Some(c), Some(p)) if ColumnType::fk_types_compatible(c, p) => {}
+                    _ => return Err(fk_mismatch()),
+                }
+            }
+        }
     }
     for check in old_schema
         .checks
@@ -3768,6 +3886,28 @@ fn resolve_reference_depth_in_txn(
     }
 }
 
+/// DROP 文の `CASCADE`／`RESTRICT` 句（TABLE-37 (2)(3)、Issue #1641）。SQL 表層
+/// （`sql::allowlist` の DROP parser）が構文から決め、`sql::ddl::execute_drop_*` が
+/// [`Storage::drop_tables`]・[`Storage::drop_view_with_behavior`] へ渡す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DropBehavior {
+    /// 依存オブジェクトがあれば `2BP01` で拒否する（無指定時の既定）。
+    #[default]
+    Restrict,
+    /// 依存する FK 制約・ビューを連鎖して削除する。参照元の表そのものは残る。
+    Cascade,
+}
+
+/// `CASCADE` で連鎖削除したオブジェクト（TABLE-37 (3)。NOTICE 相当の報告用）。名前は
+/// 全テナント共有の public カタログのオブジェクト名のみで、行数・テナント情報は持たない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CascadedObject {
+    /// 連鎖削除したビュー。
+    View { name: String },
+    /// 連鎖で外した FK 制約（参照元 `table` は残る）。
+    ForeignKey { table: String, constraint: String },
+}
+
 /// [`Storage::drop_tables`] の結果（TABLE-37 (1)、Issue #1639）。件数以外のテナント固有の
 /// 情報は持たない。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3776,6 +3916,25 @@ pub struct DropTablesReport {
     pub dropped: usize,
     /// `IF EXISTS` で不在のため skip した名前（記述順。将来の NoticeResponse 用）。
     pub skipped: Vec<String>,
+    /// `CASCADE` で連鎖削除したオブジェクト（適用順。依存する側が先。TABLE-37 (3)、
+    /// Issue #1641）。`Restrict` 時と全件 skip 時は空。
+    pub cascaded: Vec<CascadedObject>,
+}
+
+impl CascadedObject {
+    /// 列挙層の依存オブジェクトから変換する。ENUM 型の列依存は本 Issue の CASCADE 対象外
+    /// （`DROP TYPE ... CASCADE` は未対応）のため、現れたらカタログ破損として fail-closed。
+    fn from_dependent(obj: dependency::DependentObject) -> Result<Self> {
+        match obj {
+            dependency::DependentObject::View { name } => Ok(Self::View { name }),
+            dependency::DependentObject::ForeignKey { table, constraint } => {
+                Ok(Self::ForeignKey { table, constraint })
+            }
+            dependency::DependentObject::Column { .. } => Err(CatalogError::CorruptSchema(
+                "unexpected column dependency for DROP TABLE".to_string(),
+            )),
+        }
+    }
 }
 
 /// `DROP TABLE` の対象集合 `targets` に依存するものを単一パスで調べる（計算量は
@@ -3788,7 +3947,8 @@ pub struct DropTablesReport {
 ///
 /// **P0**: FK の候補は [`FK_BEARING_FORMAT_VERSIONS`] の全版接頭辞で絞る
 /// （[`referencing_foreign_keys_in_txn`] と同じ。見落とすと fail-open）。
-/// #1640（依存列挙）で置き換えられる前提の private helper。
+/// RESTRICT 判定（従来契約の `DependentViewsExist`／`DependentObjectsStillExist`）に使う。
+/// CASCADE の適用対象は列挙層（`dependency`）が決める（Issue #1641）。
 fn drop_targets_with_dependents_in_txn(
     write_txn: &redb::WriteTransaction,
     targets: &[&str],
@@ -3871,6 +4031,72 @@ fn drop_targets_with_dependents_in_txn(
     Ok((view_dependent, fk_dependent))
 }
 
+/// `CASCADE` で列挙された依存オブジェクトを、返された順（依存する側が先）に同じ write txn
+/// 内で削除する（TABLE-37 (3)、Issue #1641）。FK を外した参照元の表は世代を 1 回だけ bump
+/// する（`USING PLAN` の世代照合の失効契約）。呼び出し元（[`Storage::drop_tables`]・
+/// [`Storage::drop_view_with_behavior`]）が単一 commit するため、途中失敗は txn ごと破棄され
+/// 何も適用されない。戻り値は適用した内容（NOTICE 相当の報告用）。
+fn apply_cascaded_objects_in_txn(
+    write_txn: &redb::WriteTransaction,
+    objects: Vec<dependency::DependentObject>,
+) -> Result<Vec<CascadedObject>> {
+    let mut applied = Vec::with_capacity(objects.len());
+    let mut fk_children: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for obj in objects {
+        let obj = CascadedObject::from_dependent(obj)?;
+        match &obj {
+            CascadedObject::View { name } => drop_view_in_txn(write_txn, name)?,
+            CascadedObject::ForeignKey { table, constraint } => {
+                drop_foreign_key_in_txn(write_txn, table, constraint)?;
+                fk_children.insert(table.clone());
+            }
+        }
+        applied.push(obj);
+    }
+    for child in &fk_children {
+        bump_table_generation_in_txn(write_txn, child)?;
+    }
+    Ok(applied)
+}
+
+/// ビュー定義を `VIEWS_TABLE` から削除する（無ければ `ViewNotFound`）。ビューは行ストア・
+/// 世代を持たないため bump しない（[`Storage::drop_view`] と同じ）。
+fn drop_view_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<()> {
+    let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+    if views_table.remove(name)?.is_none() {
+        return Err(CatalogError::ViewNotFound(name.to_string()));
+    }
+    Ok(())
+}
+
+/// 子表 `child_table` の FK 制約 `constraint` をカタログから外し、子表側の不要になったキー
+/// 索引を刈り込む（TABLE-37 (3)、Issue #1641。[`Storage::alter_table_drop_constraint`] の FK
+/// 分岐と同じ書き換え）。既存行には触れない。世代 bump は呼び出し元が行う。親表側の刈り込みは
+/// 省く（CASCADE では親は同じ文で削除される根であり、その索引は根の削除で丸ごと消えるため）。
+fn drop_foreign_key_in_txn(
+    write_txn: &redb::WriteTransaction,
+    child_table: &str,
+    constraint: &str,
+) -> Result<()> {
+    {
+        let schema = require_table_schema_write(write_txn, child_table)?;
+        let fk_index = schema
+            .foreign_keys
+            .iter()
+            .position(|f| f.name() == constraint)
+            .ok_or_else(|| CatalogError::ConstraintNotFound(constraint.to_string()))?;
+        let mut fks = schema.foreign_keys.clone();
+        fks.remove(fk_index);
+        let updated = schema.with_foreign_keys(fks);
+        let encoded = encode_schema(&updated)?;
+        let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+        catalog_table.insert(child_table, encoded.as_slice())?;
+    }
+    let required = required_key_index_names_in_txn(write_txn, child_table)?;
+    crate::key_index::prune_unneeded_indexes_in_txn(write_txn, child_table, &required)?;
+    Ok(())
+}
+
 /// `target`（テーブルまたはビュー名）を直接参照している既存ビュー名の一覧
 /// （[`Storage::drop_table`]／[`Storage::drop_view`] の依存検査が使う。
 /// [`dependent_tables_in_txn`] と同じ「上限超過は無制限 `Vec` 確保を避けて
@@ -3888,21 +4114,38 @@ fn views_depending_on_in_txn(
             ));
         }
         let def = decode_view_def(value.value())?;
-        if def.base_relation == target {
-            dependents.push(key.value().to_string());
-            continue;
-        }
-        // Issue #1192: 評価後射影形本文（JOIN 右辺など）は `base_relation` 以外の
-        // relation も読む。再検証に失敗した本文は fail-closed で「依存あり」とする。
-        let depends = match view_body_shape(&def.body_sql) {
-            Ok(shape) => shape.relations.iter().any(|r| r == target),
-            Err(_) => true,
-        };
-        if depends {
+        if view_def_dependence_on(&def, target) != ViewDependence::No {
             dependents.push(key.value().to_string());
         }
     }
     Ok(dependents)
+}
+
+/// [`view_def_dependence_on`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewDependence {
+    /// `target` を読まない。
+    No,
+    /// `base_relation` または本文が読む relation として `target` を参照する。
+    Direct,
+    /// 本文を再検証できず、`target` を読まないと言い切れないため fail-closed で依存とみなす。
+    Unverifiable,
+}
+
+/// ビュー定義 `def` が relation `target` に依存するかを判定する
+/// （[`views_depending_on_in_txn`] と DROP の依存列挙〔`dependency`、Issue #1640〕が共有する。
+/// 判定がずれると DROP の拒否と列挙結果が食い違うため、本体をここだけに置く）。
+/// Issue #1192: 評価後射影形本文（JOIN 右辺など）は `base_relation` 以外の relation も読む。
+/// 再検証に失敗した本文は fail-closed で依存あり（[`ViewDependence::Unverifiable`]）とする。
+fn view_def_dependence_on(def: &ViewDef, target: &str) -> ViewDependence {
+    if def.base_relation == target {
+        return ViewDependence::Direct;
+    }
+    match view_body_shape(&def.body_sql) {
+        Ok(shape) if shape.relations.iter().any(|r| r == target) => ViewDependence::Direct,
+        Ok(_) => ViewDependence::No,
+        Err(_) => ViewDependence::Unverifiable,
+    }
 }
 
 /// `table` を（直接または連鎖したビュー経由で）参照するビューのいずれかが、
@@ -5489,6 +5732,41 @@ impl TableSchema {
             swap(&mut fk.columns);
             if fk.parent_table == own {
                 swap(&mut fk.parent_columns);
+            }
+        }
+    }
+
+    /// 表改名（[`Storage::alter_table_rename`]、Issue #1624）に伴う自表側の書き換え。
+    /// 表名を `new` にし、自己参照 FK の `parent_table` を付け替える。制約名は変えない
+    /// （PostgreSQL と同じ）。主キーは「導出名 `<table>_pkey`」を無名で表すため、名前を
+    /// 変えるだけでは制約名が `<new>_pkey` へ変わってしまう。改名前の実効名を明示名として
+    /// 固定する（導出名と一致する往復改名では `with_primary_key_name` が `None` へ正規化する）。
+    /// UNIQUE・FK・CHECK は実名を保持しており、encode が実名と導出名の食い違いから
+    /// 名前を明示する版を自動で選ぶため触らない。
+    fn rename_table_references(&mut self, new: &str) {
+        let old = std::mem::replace(&mut self.name, new.to_string());
+        let pk_name = self.primary_key.as_ref().map(|_| {
+            self.primary_key_name
+                .clone()
+                .unwrap_or_else(|| primary_key_constraint_name(&old))
+        });
+        for fk in &mut self.foreign_keys {
+            if fk.parent_table == old {
+                fk.parent_table = new.to_string();
+            }
+        }
+        self.primary_key_name = None;
+        let rebuilt = self.clone().with_primary_key_name(pk_name);
+        *self = rebuilt;
+    }
+
+    /// 親テーブル `old` の改名（Issue #1624）に追随して、自表の外部キーのうち `old` を
+    /// 参照するものの `parent_table` を `new` へ付け替える（子テーブル側の書き換え）。
+    /// `parent_columns`（`["id"]` を含む）・参照アクション・制約名は変えない。
+    fn rename_parent_table_references(&mut self, old: &str, new: &str) {
+        for fk in &mut self.foreign_keys {
+            if fk.parent_table == old {
+                fk.parent_table = new.to_string();
             }
         }
     }
@@ -9256,7 +9534,7 @@ impl Storage {
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
         // 単一表は `drop_tables` の特殊形（TABLE-37 (1)、Issue #1639）。エラー variant・
         // 同期点の発火回数・世代 bump 回数は従来どおり。
-        self.drop_tables(&[table_name.to_string()], false)
+        self.drop_tables(&[table_name.to_string()], false, DropBehavior::Restrict)
             .map(|_| ())
     }
 
@@ -9278,7 +9556,21 @@ impl Storage {
     ///
     /// 重複した名前は初出の 1 回として扱う。全件が `if_exists` で skip された場合は commit
     /// せず（世代不変）、`dropped == 0` の報告を返す。
-    pub fn drop_tables(&self, table_names: &[String], if_exists: bool) -> Result<DropTablesReport> {
+    ///
+    /// `behavior`（TABLE-37 (2)(3)、Issue #1641）:
+    /// - `Restrict`: 上記 2 のとおり、依存があれば `2BP01`。
+    /// - `Cascade`: 列挙層（`dependency::enumerate_drop_dependents_in_txn`）が返した依存する
+    ///   FK 制約（参照元の表は残る）とビューを、根の削除（3）より前に同じ write txn・同じ
+    ///   単一 commit で適用する。適用順は列挙の返した順（依存する側が先）。依存を列挙で
+    ///   正確に判定できない（`conservative`）場合は不可逆な連鎖削除をせず
+    ///   `DependentObjectsStillExist` で拒否する（fail-closed）。連鎖削除した内容は
+    ///   [`DropTablesReport::cascaded`] で返す。FK を外した参照元の表は世代を bump する。
+    pub fn drop_tables(
+        &self,
+        table_names: &[String],
+        if_exists: bool,
+        behavior: DropBehavior,
+    ) -> Result<DropTablesReport> {
         let mut targets: Vec<&str> = Vec::new();
         for name in table_names {
             validate_identifier(name)?;
@@ -9323,18 +9615,38 @@ impl Storage {
             return Ok(DropTablesReport {
                 dropped: 0,
                 skipped,
+                cascaded: Vec::new(),
             });
         }
-        // Phase 2: 依存（TABLE-15・TABLE-17・TABLE-18、Issue #907・#909）。
-        let (view_dependent, fk_dependent) =
-            drop_targets_with_dependents_in_txn(&write_txn, &existing)?;
-        if let Some(name) = existing.iter().find(|n| view_dependent.contains(**n)) {
-            return Err(CatalogError::DependentViewsExist((*name).to_string()));
-        }
-        if let Some(name) = existing.iter().find(|n| fk_dependent.contains(**n)) {
-            return Err(CatalogError::DependentObjectsStillExist(
-                (*name).to_string(),
-            ));
+        let mut cascaded: Vec<CascadedObject> = Vec::new();
+        match behavior {
+            DropBehavior::Restrict => {
+                // Phase 2: 依存（TABLE-15・TABLE-17・TABLE-18、Issue #907・#909）。
+                let (view_dependent, fk_dependent) =
+                    drop_targets_with_dependents_in_txn(&write_txn, &existing)?;
+                if let Some(name) = existing.iter().find(|n| view_dependent.contains(**n)) {
+                    return Err(CatalogError::DependentViewsExist((*name).to_string()));
+                }
+                if let Some(name) = existing.iter().find(|n| fk_dependent.contains(**n)) {
+                    return Err(CatalogError::DependentObjectsStillExist(
+                        (*name).to_string(),
+                    ));
+                }
+            }
+            DropBehavior::Cascade => {
+                // Phase 2': 依存の連鎖削除（TABLE-37 (3)、Issue #1641）。
+                let roots: Vec<dependency::DropTarget> = existing
+                    .iter()
+                    .map(|n| dependency::DropTarget::Table((*n).to_string()))
+                    .collect();
+                let closure = dependency::enumerate_drop_dependents_in_txn(&write_txn, &roots)?;
+                if closure.conservative {
+                    // 依存を正確に検証できないまま不可逆な連鎖削除をしない（fail-closed）。
+                    let first = existing.first().copied().unwrap_or_default();
+                    return Err(CatalogError::DependentObjectsStillExist(first.to_string()));
+                }
+                cascaded = apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
+            }
         }
         // Phase 3: 削除。
         for &name in &existing {
@@ -9366,7 +9678,11 @@ impl Storage {
         self.sync_point(crate::test_sync::SyncPoint::DropTableBeforeCommit);
         let dropped = existing.len();
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
-        Ok(DropTablesReport { dropped, skipped })
+        Ok(DropTablesReport {
+            dropped,
+            skipped,
+            cascaded,
+        })
     }
 
     /// 既存テーブルへ列を末尾追記する（TABLE-5）。既存行のバイト列には一切触れない
@@ -9917,16 +10233,22 @@ impl Storage {
     /// 破棄され、クラッシュ後に見えるのは旧名か新名のどちらか一方だけになる。
     ///
     /// 判定順序（決定的）: 識別子検証 → 表の存在（`TableNotFound`）→ 改名先の衝突（表・ビュー・
-    /// 索引と同じ名前空間。同名への改名を含む。`TableAlreadyExists`）→ 依存オブジェクトの暫定
-    /// 拒否（[`refuse_rename_table_with_dependents_in_txn`]。`0A000`）→ 付け替え。
+    /// 索引と同じ名前空間。同名への改名を含む。`TableAlreadyExists`）→ ビュー定義の追随
+    /// （[`rewrite_views_for_renamed_table_in_txn`]。単純形は付け替え、評価後射影形は `0A000`、
+    /// 本文超過は `54000`）→ 付け替え。
+    /// 付け替えは自表の制約（制約名は不変。[`TableSchema::rename_table_references`]）・他表から
+    /// 参照される FK（子の世代も bump）・索引宣言の所有テーブル名
+    /// （[`rename_index_def_table_in_txn`]。索引カタログ世代も bump）を同一 txn で追随させる
+    /// （Issue #1624）。
     /// 改名先に孤児の行テーブルが残っていた場合は統合も削除もせず fail-closed で拒否する。
     /// 遅延再構築される派生索引（`user_uniq`・`key_index`）は旧名・新名とも掃除し、世代は
     /// 旧名・新名の両方を進める（旧名のキャッシュ失効と、新名で過去にキャッシュされた
     /// エントリとの衝突回避）。
     ///
-    /// 既知の制約（Issue #1625 で追随）: `operation_id` 台帳（`last_op` を含む）・分割実行
-    /// ジョブは表名をキーに持つため、旧名・新名の両方について同一 txn で削除する。改名後は
-    /// 直前の操作情報（`last_op`）も失われ、改名前の `operation_id` の再送も判定されない。
+    /// `operation_id` 台帳・`last_op`・分割実行ジョブは表名をキーに持つため、旧名から新名へ
+    /// 同一 txn で移す（Issue #1625。[`crate::recovery::ledger::rename_table_in_txn`]）。
+    /// 改名前の `operation_id` を新名で再送すると改名前の記録で判定される（表名を内容ハッシュに
+    /// 含む操作は fail-closed で `22023`）。新名側に残っていた孤児の記録は移送前に掃除する。
     pub(crate) fn alter_table_rename(
         &self,
         table_name: &str,
@@ -9978,10 +10300,35 @@ impl Storage {
         if index_name_exists_in_txn(&write_txn, new_table_name)? {
             return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
         }
-        refuse_rename_table_with_dependents_in_txn(&write_txn, &schema)?;
+        rewrite_views_for_renamed_table_in_txn(&write_txn, table_name, new_table_name)?;
+
+        // 他表から参照される FK の付け替え（Issue #1624）。自表のカタログを書き換える前に、
+        // `CATALOG_TABLE` のハンドルを解放した状態で列挙する（`referencing_foreign_keys_in_txn`
+        // の契約）。自己参照は自表の書き換えで済むため除外し、同じ子は 1 回だけ書く。
+        let referencing = referencing_foreign_keys_in_txn(&write_txn, table_name)?;
+        let mut seen_children: std::collections::BTreeSet<String> = Default::default();
+        for (child, _) in referencing {
+            if child.name == table_name || !seen_children.insert(child.name.clone()) {
+                continue;
+            }
+            let mut child = child;
+            child.rename_parent_table_references(table_name, new_table_name);
+            let child_encoded = encode_schema(&child)?;
+            {
+                let mut table = write_txn
+                    .open_table(CATALOG_TABLE)
+                    .map_err(CatalogError::from)?;
+                table
+                    .insert(child.name.as_str(), child_encoded.as_slice())
+                    .map_err(CatalogError::from)?;
+            }
+            bump_table_generation_in_txn(&write_txn, &child.name)?;
+        }
+        // 索引宣言の所有テーブル名の付け替え（索引カタログ世代も bump する）。
+        rename_index_def_table_in_txn(&write_txn, table_name, new_table_name)?;
 
         // カタログの付け替え（`encode_schema` が不変条件を再検証する）。
-        schema.name = new_table_name.to_string();
+        schema.rename_table_references(new_table_name);
         let encoded = encode_schema(&schema)?;
         {
             let mut table = write_txn
@@ -10034,20 +10381,27 @@ impl Storage {
         }
         // 派生データ（永続一意索引・キー索引）は旧名・新名とも掃除する。遅延再構築されるため
         // 消して安全で、残留が同名の再作成後に「構築済み」と誤認される fail-open を防ぐ。
+        // 表名キーの台帳・分割実行ジョブは、新名側の孤児だけを掃除してから旧名の記録を移す
+        // （移送で旧名のキーは消える。削除すると改名後の再送が未記録と誤判定される）。
         for name in [table_name, new_table_name] {
             write_txn
                 .delete_table(user_uniq_table_def(&user_uniq_table_name(name)))
                 .map_err(CatalogError::from)?;
             crate::key_index::drop_indexes_for_table_in_txn(&write_txn, name)?;
-            // 表名キーの operation_id 台帳・分割実行ジョブも旧名・新名とも掃除する。残すと
-            // 旧名の再作成後に同じ operation_id が旧記録に当たり、書き込みが重複扱いで
-            // 無音に落ちる（`drop_table` の旧台帳引き継ぎ防止と同種）。安全側に消す。
-            crate::recovery::ledger::delete_table_in_txn(&write_txn, name)
-                .map_err(convert_storage_error)?;
-            crate::recovery::partitioned_job::delete_table_in_txn(&write_txn, name)
-                .map_err(convert_storage_error)?;
             bump_table_generation_in_txn(&write_txn, name)?;
         }
+        crate::recovery::ledger::delete_table_in_txn(&write_txn, new_table_name)
+            .map_err(convert_storage_error)?;
+        crate::recovery::partitioned_job::delete_table_in_txn(&write_txn, new_table_name)
+            .map_err(convert_storage_error)?;
+        crate::recovery::ledger::rename_table_in_txn(&write_txn, table_name, new_table_name)
+            .map_err(convert_storage_error)?;
+        crate::recovery::partitioned_job::rename_table_in_txn(
+            &write_txn,
+            table_name,
+            new_table_name,
+        )
+        .map_err(convert_storage_error)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(())
     }
@@ -11766,8 +12120,24 @@ impl Storage {
     /// 循環構築を阻止する）。`name` がテーブルとして存在する場合は
     /// `Err(WrongObjectKind)`。いずれの名前空間にも存在しない場合は
     /// `Err(ViewNotFound)`。行ストア・世代カウンタは持たないため
-    /// テーブル単位の世代 bump は行わない。
+    /// テーブル単位の世代 bump は行わない。[`DropBehavior::Restrict`] 固定の
+    /// [`Self::drop_view_with_behavior`] wrapper。
     pub fn drop_view(&self, name: &str) -> Result<()> {
+        self.drop_view_with_behavior(name, DropBehavior::Restrict)
+            .map(|_| ())
+    }
+
+    /// `DROP VIEW <name> [CASCADE | RESTRICT]`（TABLE-37、Issue #1641）。
+    /// `Restrict` は [`Self::drop_view`] の従来契約（種別違い → 依存 → 不在の順）。
+    /// `Cascade` は種別違いを判定した後、列挙層で依存ビュー（推移的）を求めて
+    /// 依存する側から順に削除し、最後に根を削除する（単一 write txn・単一 commit）。
+    /// 根が無ければ `ViewNotFound`、依存を正確に判定できない場合は `DependentViewsExist`
+    /// （fail-closed）。戻り値は連鎖削除したオブジェクト（適用順）。
+    pub fn drop_view_with_behavior(
+        &self,
+        name: &str,
+        behavior: DropBehavior,
+    ) -> Result<Vec<CascadedObject>> {
         validate_identifier(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
@@ -11781,17 +12151,33 @@ impl Storage {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
         }
-        {
-            let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
-            let dependents = views_depending_on_in_txn(&views_table, name)?;
-            if !dependents.is_empty() {
-                return Err(CatalogError::DependentViewsExist(name.to_string()));
+        let cascaded = match behavior {
+            DropBehavior::Restrict => {
+                let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+                let dependents = views_depending_on_in_txn(&views_table, name)?;
+                if !dependents.is_empty() {
+                    return Err(CatalogError::DependentViewsExist(name.to_string()));
+                }
+                if views_table.remove(name)?.is_none() {
+                    return Err(CatalogError::ViewNotFound(name.to_string()));
+                }
+                Vec::new()
             }
-            if views_table.remove(name)?.is_none() {
-                return Err(CatalogError::ViewNotFound(name.to_string()));
+            DropBehavior::Cascade => {
+                let closure = dependency::enumerate_drop_dependents_in_txn(
+                    &write_txn,
+                    &[dependency::DropTarget::View(name.to_string())],
+                )?;
+                if closure.conservative {
+                    return Err(CatalogError::DependentViewsExist(name.to_string()));
+                }
+                let cascaded = apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
+                drop_view_in_txn(&write_txn, name)?;
+                cascaded
             }
-        }
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        };
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(cascaded)
     }
 
     /// 索引を宣言する（`CREATE INDEX`。TASK-206・INDEX-7、Issue #908）。カタログ
@@ -13149,7 +13535,10 @@ fn dependent_tables_in_txn(
     write_txn: &redb::WriteTransaction,
     type_name: &str,
 ) -> Result<Vec<String>> {
-    let table = match write_txn.open_table(CATALOG_TABLE) {
+    // 読み取り専用オープン（欠落時に空のカタログ表を作らない。依存列挙
+    // `catalog::dependency` の read-only 契約を commit 後も保つため。Issue #1640）。
+    let table = match crate::storage::read_source::ReadSource::open_table(write_txn, CATALOG_TABLE)
+    {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
@@ -16975,7 +17364,7 @@ mod tests {
         // 不在を含む（IF EXISTS なし）: 全体が失敗し、何も変わらない。
         let before = storage.current_generation().expect("generation");
         let err = storage
-            .drop_tables(&names(&["ta", "ghost"]), false)
+            .drop_tables(&names(&["ta", "ghost"]), false, DropBehavior::Restrict)
             .expect_err("missing name must abort");
         assert!(matches!(err, CatalogError::TableNotFound(_)));
         assert_eq!(storage.current_generation().expect("generation"), before);
@@ -16983,7 +17372,7 @@ mod tests {
 
         // 全件 skip: commit せず世代不変。
         let report = storage
-            .drop_tables(&names(&["g1", "g2"]), true)
+            .drop_tables(&names(&["g1", "g2"]), true, DropBehavior::Restrict)
             .expect("all skipped");
         assert_eq!(report.dropped, 0);
         assert_eq!(report.skipped, names(&["g1", "g2"]));
@@ -16995,7 +17384,11 @@ mod tests {
             storage.table_generation("tb").expect("gen"),
         );
         let report = storage
-            .drop_tables(&names(&["ta", "tb", "ta", "ghost"]), true)
+            .drop_tables(
+                &names(&["ta", "tb", "ta", "ghost"]),
+                true,
+                DropBehavior::Restrict,
+            )
             .expect("drop");
         assert_eq!(report.dropped, 2);
         assert_eq!(report.skipped, names(&["ghost"]));
@@ -17880,6 +18273,161 @@ mod tests {
         assert!(schema.columns.iter().any(|c| c.name == "k"));
     }
 
+    /// 表の改名でビュー本文が上限を超えるなら `54000` で拒否し、何も変えない
+    /// （台帳の移送を含む同一 txn を commit しない）。
+    #[test]
+    fn alter_table_rename_view_body_overflow_is_54000() {
+        let path = unique_db_path("rename-table-view-overflow");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("k", ColumnType::Text, true),
+                ],
+            ))
+            .expect("docs");
+        // 本文長が上限の直下になるよう最後の述語の値を伸ばす（述語値の長さ上限に収まる範囲）。
+        let build = |pad: usize| {
+            let mut preds = vec![format!("k = '{}'", "x".repeat(230)); 255];
+            preds.push(format!("k = '{}'", "x".repeat(pad)));
+            format!("SELECT k FROM docs WHERE {}", preds.join(" AND "))
+        };
+        let pad = 230 + (MAX_VIEW_BODY_BYTES - 30).saturating_sub(build(230).len());
+        let body = build(pad);
+        let mut created = false;
+        let mut stored_len = 0usize;
+        if body.len() <= MAX_VIEW_BODY_BYTES {
+            storage
+                .create_view("v_big", "docs", &body)
+                .expect("big view");
+            created = true;
+            stored_len = storage
+                .view_definition("v_big")
+                .expect("get")
+                .expect("some")
+                .body_sql
+                .len();
+        }
+        assert!(created, "failed to build a near-limit view body");
+        assert!(stored_len <= MAX_VIEW_BODY_BYTES);
+        let before = storage
+            .view_definition("v_big")
+            .expect("get")
+            .expect("some");
+        let long_name = "n".repeat(60);
+        let err = storage
+            .alter_table_rename("docs", &long_name)
+            .expect_err("rewritten body exceeds the limit");
+        match err {
+            AlterCheckError::Sql(e) => assert_eq!(e.wire_code(), "54000"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            storage
+                .view_definition("v_big")
+                .expect("get")
+                .expect("some"),
+            before
+        );
+        assert!(storage.get_table_schema("docs").is_ok());
+    }
+
+    /// 引用付きの真偽語・SQL 値関数予約語を新表名にしても、ビュー本文の FROM が引用付きで描画され
+    /// 往復検証を通って追随する（`0A000` で拒否されない）。
+    #[test]
+    fn alter_table_rename_to_reserved_word_keeps_view_body_roundtrip() {
+        for (i, new_name) in ["true", "false", "current_date"].iter().enumerate() {
+            let path = unique_db_path(&format!("rename-table-reserved-{i}"));
+            let _guard = CleanupGuard(path.clone());
+            let storage = Storage::open(&path).expect("open storage");
+            storage
+                .create_table(&TableSchema::new(
+                    "docs",
+                    vec![
+                        ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                        ColumnDef::new("k", ColumnType::Text, true),
+                    ],
+                ))
+                .expect("docs");
+            storage
+                .create_view("v_pred", "docs", "SELECT k FROM docs WHERE k = 'a'")
+                .expect("v_pred");
+            storage
+                .alter_table_rename("docs", new_name)
+                .unwrap_or_else(|e| panic!("rename to {new_name}: {e:?}"));
+            let def = storage
+                .view_definition("v_pred")
+                .expect("get")
+                .expect("some");
+            assert_eq!(def.base_relation, *new_name);
+            assert!(
+                def.body_sql.contains(&format!("FROM \"{new_name}\"")),
+                "{}",
+                def.body_sql
+            );
+        }
+    }
+
+    /// 表の改名で単純形ビューの `base_relation` と本文が新名へ付け替わり、再オープン後も残る。
+    /// 評価後射影形ビューが表を読むときは `0A000` で拒否し、何も変えない。
+    #[test]
+    fn alter_table_rename_rewrites_simple_views_and_refuses_buffered() {
+        let path = unique_db_path("rename-table-views");
+        let _guard = CleanupGuard(path.clone());
+        {
+            let storage = Storage::open(&path).expect("open storage");
+            storage
+                .create_table(&TableSchema::new(
+                    "docs",
+                    vec![
+                        ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                        ColumnDef::new("k", ColumnType::Text, true),
+                    ],
+                ))
+                .expect("docs");
+            storage
+                .create_view("v_star", "docs", "SELECT * FROM docs")
+                .expect("v_star");
+            storage
+                .create_view("v_pred", "docs", "SELECT k FROM docs WHERE k = 'a'")
+                .expect("v_pred");
+            storage
+                .create_view("v_chain", "v_star", "SELECT k FROM v_star")
+                .expect("v_chain");
+            storage.alter_table_rename("docs", "docs2").expect("rename");
+        }
+        let storage = Storage::open(&path).expect("reopen");
+        for name in ["v_star", "v_pred"] {
+            let def = storage.view_definition(name).expect("get").expect("some");
+            assert_eq!(def.base_relation, "docs2", "{name}");
+            assert!(def.body_sql.contains("docs2"), "{name}: {}", def.body_sql);
+        }
+        let chain = storage
+            .view_definition("v_chain")
+            .expect("get")
+            .expect("some");
+        assert_eq!(chain.base_relation, "v_star");
+        storage
+            .create_view("v_buf", "docs2", "SELECT k FROM docs2 ORDER BY k LIMIT 5")
+            .expect("v_buf");
+        let err = storage
+            .alter_table_rename("docs2", "docs3")
+            .expect_err("buffered view blocks rename");
+        match err {
+            AlterCheckError::Sql(e) => assert_eq!(e.wire_code(), "0A000"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(storage.get_table_schema("docs2").is_ok());
+        let def = storage
+            .view_definition("v_pred")
+            .expect("get")
+            .expect("some");
+        assert_eq!(def.base_relation, "docs2");
+    }
+
     /// 予約列・不存在列・衝突・依存ありは拒否し、カタログを変更しない。
     #[test]
     fn alter_table_rename_column_rejects_invalid_requests_without_changes() {
@@ -18032,6 +18580,173 @@ mod tests {
                 .expect("hnsw");
             assert_eq!(hnsw.columns, vec!["embedding".to_string()]);
         }
+    }
+
+    /// 表改名が制約・他表からの FK・索引宣言を追随させる（TABLE-38 のポインタ、Issue #1624）。
+    /// 制約名は変えず（PK は明示名へ固定）、往復改名でカタログ値のバイト列が元に戻り、
+    /// 失敗する改名（改名先に孤児の行テーブル）は何も変えない。
+    #[test]
+    fn alter_table_rename_follows_constraints_foreign_keys_and_indexes() {
+        let path = unique_db_path("rename-table-follows-refs");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let fk = |cols: &[&str], parent: &str, pcols: &[&str]| {
+            ForeignKeyDef::new(
+                cols.iter().map(|c| c.to_string()).collect(),
+                parent.to_string(),
+                pcols.iter().map(|c| c.to_string()).collect(),
+                ReferentialAction::Cascade,
+                ReferentialAction::NoAction,
+            )
+        };
+        let docs = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("code", ColumnType::Text, false),
+                ColumnDef::new("u", ColumnType::Text, true),
+                ColumnDef::new("qty", ColumnType::Integer, true),
+                ColumnDef::new("up", ColumnType::Text, true),
+            ],
+        )
+        .with_primary_key(vec!["code".to_string()])
+        .with_unique_constraints(vec![UniqueConstraint::with_name(
+            "docs_u_key".to_string(),
+            vec!["u".to_string()],
+        )])
+        .with_checks(vec![CheckConstraint {
+            name: "docs_qty_check".to_string(),
+            columns: vec!["qty".to_string()],
+            predicate_sql: "qty > 0".to_string(),
+        }])
+        .with_foreign_keys(vec![fk(&["up"], "docs", &["code"])]);
+        storage.create_table(&docs).expect("create docs");
+        let kids = TableSchema::new(
+            "kids",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("pcode", ColumnType::Text, true),
+                ColumnDef::new("pid", ColumnType::Integer, true),
+            ],
+        )
+        .with_foreign_keys(vec![
+            fk(&["pcode"], "docs", &["code"]),
+            fk(&["pid"], "docs", &["id"]),
+        ]);
+        storage.create_table(&kids).expect("create kids");
+        storage
+            .create_index(&scalar_def("idx_qty", "docs", &["qty"]))
+            .expect("scalar");
+        storage
+            .create_index(&hnsw_def("idx_hnsw", "docs"))
+            .expect("hnsw");
+        storage
+            .create_index(&scalar_def("idx_other", "kids", &["pcode"]))
+            .expect("other");
+        let raw = |name: &str| -> Vec<u8> {
+            let r = storage.db().begin_read().expect("read");
+            let t = r.open_table(CATALOG_TABLE).expect("catalog");
+            let v = t.get(name).expect("get").expect("exists").value().to_vec();
+            v
+        };
+        let docs_bytes = raw("docs");
+        let kids_bytes = raw("kids");
+        let idx_gen_before = {
+            let r = storage.db().begin_read().expect("read");
+            index_catalog_generation_in_txn(&r).expect("gen")
+        };
+        let kids_gen_before = storage.table_generation("kids").expect("gen");
+
+        storage
+            .alter_table_rename("docs", "papers")
+            .expect("rename to papers");
+        let papers = storage.get_table_schema("papers").expect("papers");
+        assert_eq!(
+            papers.primary_key_constraint_name_effective().as_deref(),
+            Some("docs_pkey")
+        );
+        assert_eq!(papers.unique_constraints()[0].name(), "docs_u_key");
+        assert_eq!(papers.checks()[0].name, "docs_qty_check");
+        assert_eq!(papers.foreign_keys()[0].parent_table(), "papers");
+        let kids_schema = storage.get_table_schema("kids").expect("kids");
+        assert_eq!(kids_schema.foreign_keys().len(), 2);
+        for f in kids_schema.foreign_keys() {
+            assert_eq!(f.parent_table(), "papers");
+        }
+        assert_ne!(
+            kids_gen_before,
+            storage.table_generation("kids").expect("gen")
+        );
+        let idx_gen_after = {
+            let r = storage.db().begin_read().expect("read");
+            index_catalog_generation_in_txn(&r).expect("gen")
+        };
+        assert!(idx_gen_after > idx_gen_before);
+        let indexes = storage.list_indexes().expect("indexes");
+        for (name, table) in [
+            ("idx_qty", "papers"),
+            ("idx_hnsw", "papers"),
+            ("idx_other", "kids"),
+        ] {
+            let d = indexes.iter().find(|d| d.name == name).expect(name);
+            assert_eq!(d.table, table, "{name}");
+        }
+
+        // 往復でカタログ値のバイト列が完全に戻る（PK 名の `None` 正規化を含む）。
+        storage
+            .alter_table_rename("papers", "docs")
+            .expect("rename back");
+        assert_eq!(raw("docs"), docs_bytes);
+        assert_eq!(raw("kids"), kids_bytes);
+
+        // 失敗する改名（改名先に孤児の行テーブル）は子・索引宣言・世代を一切変えない。
+        let row = [
+            RowCodecValue::Vector(vec![1.0, 2.0]),
+            RowCodecValue::Text("x".to_string()),
+        ];
+        let orphan = TableSchema::new(
+            "orphan",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        );
+        storage.create_table(&orphan).expect("orphan");
+        storage
+            .insert_typed_row("orphan", 7, "t", Visibility::Public, &row)
+            .expect("insert orphan");
+        {
+            let w = storage.begin_write_txn().expect("txn");
+            {
+                let mut t = w.open_table(CATALOG_TABLE).expect("catalog");
+                t.remove("orphan").expect("remove");
+            }
+            bump_table_generation_in_txn(&w, "orphan").expect("bump");
+            crate::recovery::commit_boundary::commit(w).expect("commit");
+        }
+        let kids_gen = storage.table_generation("kids").expect("gen");
+        let idx_gen = {
+            let r = storage.db().begin_read().expect("read");
+            index_catalog_generation_in_txn(&r).expect("gen")
+        };
+        assert!(storage.alter_table_rename("docs", "orphan").is_err());
+        assert_eq!(raw("docs"), docs_bytes);
+        assert_eq!(raw("kids"), kids_bytes);
+        assert_eq!(kids_gen, storage.table_generation("kids").expect("gen"));
+        let idx_gen_now = {
+            let r = storage.db().begin_read().expect("read");
+            index_catalog_generation_in_txn(&r).expect("gen")
+        };
+        assert_eq!(idx_gen, idx_gen_now);
+        let indexes = storage.list_indexes().expect("indexes");
+        assert_eq!(
+            indexes
+                .iter()
+                .find(|d| d.name == "idx_qty")
+                .expect("idx")
+                .table,
+            "docs"
+        );
     }
 
     /// CHECK の書き換えに失敗する改名（述語テキストが長さ上限を超える）は `0A000` で拒否し、自表・子表・索引宣言・世代の

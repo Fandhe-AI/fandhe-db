@@ -7,8 +7,8 @@
 //! `sql::ddl::execute_drop_table` → `catalog::Storage::drop_tables`）を production 経路として
 //! 検証する。契約: 文全体が単一 write txn で原子的（不在・種類違い・依存のどれか 1 つでも
 //! あれば何も削除しない）、`IF EXISTS` はリスト全体に掛かる、同じ文に並べた名前どうしの
-//! 依存は数えない、権限の無いセッションは存否に関わらず `42501`、`CASCADE`／`RESTRICT` は
-//! 引き続き `42601`。
+//! 依存は数えない、権限の無いセッションは存否に関わらず `42501`、`CASCADE`／`RESTRICT` 単独は
+//! 受理（Issue #1641。`sql_drop_table_cascade.rs`）で、2 語の併記は引き続き `42601`。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -264,9 +264,9 @@ fn malformed_and_unsupported_shapes_stay_42601() {
         "DROP TABLE , a",
         "DROP TABLE a,,b",
         "DROP TABLE a b",
-        "DROP TABLE a, b CASCADE",
-        "DROP TABLE a, b RESTRICT",
-        "DROP TABLE IF EXISTS a, b CASCADE",
+        // `CASCADE`／`RESTRICT` 単独は TABLE-37 (2)(3)（Issue #1641）で受理に変わった。
+        "DROP TABLE a, b CASCADE RESTRICT",
+        "DROP TABLE IF EXISTS a, b CASCADE CASCADE",
     ] {
         assert_eq!(code(&core, sql), "42601", "granted: {sql}");
         let err = core

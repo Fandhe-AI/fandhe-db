@@ -202,6 +202,17 @@ fn wire_index_ddl_error_classification() {
         "CREATE INDEX idx_p ON docs (body) WHERE body = 'x'",
         "0A000",
     );
+    // 式索引の式の拒否（INDEX-10、Issue #1647）。ErrorResponse の SQLSTATE として観測でき、
+    // エラー後もセッションは継続する。
+    for (sql, code) in [
+        ("CREATE INDEX idx_e ON docs ((now()))", "42P17"),
+        ("CREATE INDEX idx_e ON docs ((count(body)))", "42803"),
+        ("CREATE INDEX idx_e ON docs ((sum(id) OVER ()))", "42P20"),
+        ("CREATE INDEX idx_e ON docs ((SELECT 1))", "0A000"),
+        ("CREATE INDEX idx_e ON docs (lower(body))", "0A000"),
+    ] {
+        expect_error(&mut stream, sql, code);
+    }
     expect_command(&mut stream, "DROP INDEX idx_body", "DROP INDEX");
     // 削除済みでも `IF EXISTS` は no-op で成功する（Issue #1614）。
     expect_command(&mut stream, "DROP INDEX IF EXISTS idx_body", "DROP INDEX");
@@ -262,6 +273,35 @@ fn wire_drop_table_multiple_names_atomic_and_permission() {
     for sql in ["DROP TABLE docs, ghost", "DROP TABLE ghost1, ghost2"] {
         expect_error(&mut bob, sql, "42501");
     }
+}
+
+/// `DROP TABLE|VIEW ... CASCADE／RESTRICT`（Issue #1641・TABLE-37 (2)(3) ポインタ）:
+/// `RESTRICT` は依存ありで `2BP01`、`CASCADE` は通常の DROP と同じ `CommandComplete` タグで
+/// 依存ビューと FK 制約を連鎖削除する。権限の無いユーザーは `42501`、併記は `42601`。
+#[test]
+fn wire_drop_cascade_and_restrict() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_with_ddl_allowed_users(&users(), core, &["alice"]);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    expect_command(&mut alice, "CREATE TABLE cp (name TEXT)", "CREATE TABLE");
+    expect_command(
+        &mut alice,
+        "CREATE TABLE cc (pid BIGINT REFERENCES cp, note TEXT)",
+        "CREATE TABLE",
+    );
+    expect_command(
+        &mut alice,
+        "CREATE VIEW cv AS SELECT id FROM cp LIMIT 5",
+        "CREATE VIEW",
+    );
+    expect_error(&mut alice, "DROP TABLE cp RESTRICT", "2BP01");
+    expect_error(&mut alice, "DROP TABLE cp", "2BP01");
+    expect_error(&mut alice, "DROP TABLE cp CASCADE RESTRICT", "42601");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "pw-bob");
+    expect_error(&mut bob, "DROP TABLE cp CASCADE", "42501");
+    expect_command(&mut alice, "DROP TABLE cp CASCADE", "DROP TABLE");
+    expect_error(&mut alice, "DROP VIEW cv", "42P01");
+    expect_command(&mut alice, "DROP TABLE cc", "DROP TABLE");
 }
 
 /// `CREATE UNIQUE INDEX`（Issue #1616・INDEX-9）。`CommandComplete` タグは通常の

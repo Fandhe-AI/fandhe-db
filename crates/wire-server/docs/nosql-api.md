@@ -1149,13 +1149,16 @@ Date: <IMF-fixdate>
 | `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | 未登録の ENUM 型名（`create_table`／`alter_table`。Issue #2306）で到達可能。`DROP INDEX` 由来は op 許可リスト外 |
 | `42710` | `DUPLICATE_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`ALTER TABLE ... ADD CONSTRAINT` は SQL 表層専用。後述） |
 | `42723` | `DUPLICATE_FUNCTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE FUNCTION` は SQL 表層専用。後述） |
+| `42803` | `GROUPING_ERROR` | 400 | Bad Request | 式索引の式に集計関数がある（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |
 | `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CASE`／`COALESCE`／`NULLIF`・集合演算・`INNER JOIN` の結合キー型不一致〔SQL-28・RLS-10、Issue #925〕・式層の演算子／関数引数の型不一致〔Issue #1186〕のいずれも SQL 表層専用。後述） |
 | `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
 | `42830` | `INVALID_FOREIGN_KEY` | 400 | Bad Request | `create_table.constraints[kind=foreign_key].references.on_delete`／`on_update`（Issue #1148）が宣言時に常に失敗する組み合わせ（`NOT NULL` 列への `set_null`・DEFAULT の無い `NOT NULL` 列への `set_default` 等） |
 | `42846` | `CANNOT_COERCE` | 400 | Bad Request | 明示の `CAST` で型の組に変換の対応が無い（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1590 |
 | `42883` | `UNDEFINED_FUNCTION` | 400 | Bad Request | `aggregate` の `sum`／`avg` を `DATE`／`TIMESTAMP` 列に指定した場合（SQL-26、Issue #1186）、または `sum`／`avg`（TEXT 以外は `min`／`max` も）を非数値型（TEXT・BOOLEAN・BYTEA・JSON・ARRAY・UUID・ENUM・VECTOR）の列に指定した場合（Issue #1349。未知関数・非決定的関数の呼び出しは SQL 表層専用で到達しない） |
 | `42P16` | `INVALID_TABLE_DEFINITION` | 400 | Bad Request | `create_table.constraints` に `primary_key` を 2 個以上指定した場合（名前付きを含む。TABLE-22 (d)、Issue #1412・#1437。`ALTER TABLE ... ADD PRIMARY KEY` の重複宣言は SQL 表層専用。後述） |
+| `42P17` | `INVALID_OBJECT_DEFINITION` | 400 | Bad Request | 式索引の式が IMMUTABLE 相当でない（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |
 | `42P18` | `INDETERMINATE_DATATYPE` | 400 | Bad Request | 拡張クエリプロトコル（SQL 表層）の Parse で `$n` の型を決められない。NoSQL の `op` 語彙からは到達しない。Issue #1546 |
+| `42P20` | `WINDOWING_ERROR` | 400 | Bad Request | 式索引の式にウィンドウ関数がある（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |
 | `42P21` | `COLLATION_MISMATCH` | 400 | Bad Request | 式の明示的な `COLLATE` 同士の食い違い（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #2190 |
 | `42P22` | `INDETERMINATE_COLLATION` | 400 | Bad Request | 暗黙の照合の衝突を照合が必要な演算が消費した（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #2190 |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
