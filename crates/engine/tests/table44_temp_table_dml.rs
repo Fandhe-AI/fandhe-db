@@ -1013,3 +1013,41 @@ fn cursors_over_temp_tables_are_rejected() {
     assert_eq!(t.status(), TransactionStatus::Failed);
     tx(&core, &mut s, &mut t, "ROLLBACK").unwrap();
 }
+
+// ---- DDL の容量上限・準備済み DROP INDEX の再検証 ---------------------------------------------
+
+#[test]
+fn temp_ddl_cannot_exceed_the_byte_limit() {
+    let path = unique_db_path("t44-dml-ddl-limit");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_temp_table_limits(TempTableLimits::new(4, 1));
+    let mut s = SessionState::default();
+    let err = core
+        .execute_sql_in_session(&ctx(TENANT), &mut s, "CREATE TEMP TABLE big (body TEXT)")
+        .expect_err("DDL over the byte limit");
+    assert_eq!(err.wire_code(), "54000");
+    // 確定されていない（同名の表は存在しない）。
+    let err = core
+        .execute_sql_in_session(&ctx(TENANT), &mut s, "SELECT id FROM big LIMIT 1")
+        .expect_err("table must not exist");
+    assert_eq!(err.wire_code(), "42P01");
+}
+
+#[test]
+fn prepared_drop_index_does_not_hit_a_later_temp_index_of_the_same_name() {
+    let (core, _g) = new_core("t44-dml-prep-drop-ix", LedgerMode::CompareOnlyWithoutLedger);
+    let mut s = ddl_session();
+    run_ok(&core, &mut s, "CREATE TABLE p (name TEXT)");
+    run_ok(&core, &mut s, "CREATE INDEX ix ON p (name)");
+    let prepared = core
+        .parse_sql_prepared_with_declared_in_session(&s, "DROP INDEX ix", &[])
+        .expect("prepare");
+    run_ok(&core, &mut s, "CREATE TEMP TABLE tmp (name TEXT)");
+    run_ok(&core, &mut s, "CREATE INDEX ix ON tmp (name)");
+    let err = core
+        .bind_prepared_in_session(&s, &prepared, &[])
+        .expect_err("stale prepared DROP INDEX");
+    assert_eq!(err.wire_code(), "0A000");
+}

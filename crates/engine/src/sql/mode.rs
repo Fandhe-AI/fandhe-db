@@ -350,8 +350,7 @@ impl SessionState {
                 detail: "temporary storage error".to_string(),
             });
         };
-        store.truncate_tables(&delete_rows)?;
-        store.drop_tables(&dropped)?;
+        store.apply_on_commit(&delete_rows, &dropped)?;
         for name in &dropped {
             self.temp_tables.remove(name);
         }

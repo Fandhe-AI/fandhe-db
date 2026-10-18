@@ -657,6 +657,21 @@ impl EngineCore {
             }
             PreparedRoute::Plain => {
                 let parsed = self.bind_prepared(prepared, values)?;
+                // `DROP INDEX <名前>` は一時表の名前トークンが現れない。準備後に同名の一時索引が
+                // 作られていれば、通常の Parse（`route_drop_index`）なら一時索引に当たるため、
+                // 永続の索引を黙って削除せず陳腐化として拒否する（fail-closed）。
+                if let (ParsedSql::DropIndex(stmt), Some(store)) =
+                    (&parsed, session.temp_rows_arc())
+                {
+                    let is_temp_index = store
+                        .core()?
+                        .storage
+                        .index_exists(stmt.name())
+                        .map_err(|_| internal())?;
+                    if is_temp_index {
+                        return Err(crate::sql::temp_catalog::temp_statement_stale());
+                    }
+                }
                 if temp.is_empty() || is_session_exempt(&parsed) {
                     return Ok(parsed);
                 }
@@ -698,6 +713,11 @@ impl EngineCore {
         match inner {
             ParsedSql::CreateIndex(stmt) => {
                 let outcome = crate::sql::ddl::execute_create_index(&core.storage, stmt)?;
+                // 確定後に容量上限を検査し、超過なら作った索引を戻して `54000`（DDL も上限を迂回させない）。
+                if let Err(e) = store.enforce_budget_after_ddl() {
+                    let _ = core.storage.drop_index(stmt.name());
+                    return Err(e);
+                }
                 session.temp_tables_mut().bump_epoch()?;
                 Ok(crate::sql::SqlOutcome::CreateIndex(outcome))
             }

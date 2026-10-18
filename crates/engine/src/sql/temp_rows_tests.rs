@@ -85,12 +85,16 @@ fn table_44_budget_is_enforced_with_54000_and_released_by_delete() {
     assert!(used > 0);
 
     // 現在の使用量より小さい上限のストアでは、文の後・commit の前の判定が 54000 になる。
+    // DDL（CREATE TEMP TABLE）も上限を迂回できない。超過なら作った表は戻る。
     let small = store(1, &tpl);
-    small.create_table(&schema("a")).unwrap();
-    let w = small.begin_write().unwrap();
-    let err = small.enforce_budget(&w).expect_err("over budget");
+    let err = small
+        .create_table(&schema("a"))
+        .expect_err("DDL over budget");
     assert_eq!(code(&err), "54000");
-    drop(w);
+    assert_eq!(
+        insert(small.core().unwrap(), "a", 1, "x"),
+        Err("42P01".to_string())
+    );
 
     let ample = store(used.saturating_mul(4), &tpl);
     ample.create_table(&schema("a")).unwrap();
@@ -210,4 +214,20 @@ fn table_44_physical_backstop_fails_closed() {
     let err = s.core().err().expect("exhausted store");
     assert_eq!(code(&err), "54000");
     assert!(s.begin_write().is_err());
+}
+
+#[test]
+fn table_44_apply_on_commit_truncates_and_drops_in_one_txn() {
+    let (tpl, _dir) = template();
+    let s = store(DEFAULT_MAX_TEMP_BYTES_PER_SESSION, &tpl);
+    s.create_table(&schema("a")).unwrap();
+    s.create_table(&schema("b")).unwrap();
+    let core = s.core().unwrap();
+    insert(core, "a", 1, "aa").unwrap();
+    insert(core, "b", 1, "bb").unwrap();
+    s.apply_on_commit(&["a".to_string()], &["b".to_string()])
+        .unwrap();
+    // a は行だけ消え（同じ id を再挿入できる）、b は実体ごと消える。
+    insert(core, "a", 1, "again").unwrap();
+    assert_eq!(insert(core, "b", 1, "x"), Err("42P01".to_string()));
 }

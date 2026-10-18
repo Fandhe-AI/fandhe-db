@@ -306,8 +306,28 @@ impl TempRowStore {
 
     /// 一時表を一時 DB のカタログへ作る（`CREATE TEMP TABLE`。スキーマは呼び出し元が永続表と
     /// 同じ規則で構築・検証済み）。
+    ///
+    /// 作成後に容量上限を検査し、超過なら作った実体を戻して `54000` を返す（DDL も上限を迂回
+    /// させない。`--max-temp-bytes` 超過のまま確定した状態を残さない）。
     pub(crate) fn create_table(&self, schema: &TableSchema) -> Result<(), SqlSurfaceError> {
-        self.storage()?.create_table(schema).map_err(|_| internal())
+        self.storage()?
+            .create_table(schema)
+            .map_err(|_| internal())?;
+        if let Err(e) = self.enforce_budget_after_ddl() {
+            let _ = self.drop_tables(std::slice::from_ref(&schema.name));
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// DDL（確定済み）の直後に容量上限を検査する。新しい書き込みトランザクションで
+    /// [`Self::enforce_budget`] を呼び、変更せず abort する。超過なら `54000`。
+    /// 呼び出し元は超過時に DDL を戻す責務を持つ。
+    pub(crate) fn enforce_budget_after_ddl(&self) -> Result<(), SqlSurfaceError> {
+        let txn = self.begin_write()?;
+        let result = self.enforce_budget(&txn);
+        drop(txn);
+        result
     }
 
     /// 一時表を一時 DB から削除する（行・索引・世代を含む）。存在しない名前は無視する。
@@ -321,8 +341,42 @@ impl TempRowStore {
             .map_err(|_| internal())
     }
 
+    /// `ON COMMIT DELETE ROWS` の行全削除と `ON COMMIT DROP` の表削除を単一の書き込み
+    /// トランザクションで原子的に適用する（片方だけ確定した状態を残さない）。
+    pub(crate) fn apply_on_commit(
+        &self,
+        delete_rows: &[String],
+        dropped: &[String],
+    ) -> Result<(), SqlSurfaceError> {
+        if delete_rows.is_empty() && dropped.is_empty() {
+            return Ok(());
+        }
+        let ctx = self.owner_ctx()?;
+        let txn = self.begin_write()?;
+        if !delete_rows.is_empty() {
+            crate::tenant::truncate_tables_unchecked(
+                crate::tenant::WriteTarget::InTxn(&txn),
+                delete_rows,
+                crate::catalog::DropBehavior::Restrict,
+                &ctx,
+                crate::recovery::ledger::LedgerWrite::Disabled,
+            )
+            .map_err(|_| internal())?;
+        }
+        if !dropped.is_empty() {
+            self.core()?
+                .storage_handle()
+                .drop_tables_in_txn(&txn, dropped, true, crate::catalog::DropBehavior::Restrict)
+                .map_err(|_| internal())?;
+        }
+        // `Err` を返すと `txn` が drop され abort する（部分適用を残さない）。
+        self.commit(txn)
+    }
+
     /// 一時表の全行を消す（`ON COMMIT DELETE ROWS`）。永続側の `TRUNCATE` と同じ本体を使い、
-    /// 台帳には触れない（`LedgerWrite::Disabled`）。
+    /// 台帳には触れない（`LedgerWrite::Disabled`）。実行経路は [`Self::apply_on_commit`] で、
+    /// これは単体テスト用。
+    #[cfg(test)]
     pub(crate) fn truncate_tables(&self, names: &[String]) -> Result<(), SqlSurfaceError> {
         if names.is_empty() {
             return Ok(());
