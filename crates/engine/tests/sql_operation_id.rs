@@ -42,6 +42,7 @@ fn new_core_with_documents_table(path: &std::path::Path) -> EngineCore {
         ))
         .expect("create table");
     EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
 }
 
 // --- 受理系 -----------------------------------------------------------------

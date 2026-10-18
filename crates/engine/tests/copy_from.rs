@@ -40,7 +40,8 @@ fn open_engine(name: &str) -> (EngineCore, std::path::PathBuf) {
     let path = unique_db_path(name);
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (core, path)
 }
 
@@ -117,7 +118,8 @@ fn open_engine_ext(name: &str) -> (EngineCore, std::path::PathBuf) {
     storage
         .create_table(&extended_schema(enum_def))
         .expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (core, path)
 }
 
@@ -337,6 +339,32 @@ fn copy_from_stdin_missing_operation_id_is_rejected_before_any_row_is_visible() 
     assert_eq!(err.wire_code(), "23502");
 }
 
+/// Issue #1704・RECOVER-1: 既定（`LedgerMode::Optional`）では `USING OPERATION_ID` を
+/// 省略した COPY FROM が成功し、台帳には記録されない。
+#[test]
+fn copy_from_stdin_without_operation_id_succeeds_by_default() {
+    let path = unique_db_path("copy-from-default-optional");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+
+    let sql = format!("COPY {TABLE} (id, embedding, lang) FROM STDIN");
+    run_copy_from(
+        &core,
+        "acme",
+        &sql,
+        &[b"1\t[1.0,0.0]\tja\n2\t[0.0,1.0]\ten\n"],
+    )
+    .expect("omitted operation_id must be accepted by default");
+    assert_eq!(read_back_ids(&core, "acme").len(), 2);
+    assert_eq!(
+        core.last_operation_id(&ctx("acme"), TABLE)
+            .expect("last_operation_id"),
+        engine::recovery::ledger::LastOperationLookup::NotFound
+    );
+}
+
 #[test]
 fn copy_from_stdin_rejects_invalid_row_with_zero_side_effects() {
     let (core, path) = open_engine("copy-from-invalid-row");
@@ -378,8 +406,9 @@ fn copy_from_stdin_rejects_batch_over_row_count_limit() {
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    let core =
-        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_batch_limits(limits);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
+        .with_batch_limits(limits);
 
     let sql =
         format!("COPY {TABLE} (id, embedding, lang) FROM STDIN USING OPERATION_ID 'copy-op-6'");
@@ -412,8 +441,9 @@ fn copy_from_stdin_rejects_batch_over_total_byte_limit_before_copy_done() {
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    let core =
-        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_batch_limits(limits);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
+        .with_batch_limits(limits);
 
     let sql =
         format!("COPY {TABLE} (id, embedding, lang) FROM STDIN USING OPERATION_ID 'copy-op-7'");
@@ -957,8 +987,9 @@ fn open_engine_with_limits(
     let guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    let core =
-        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_batch_limits(limits);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
+        .with_batch_limits(limits);
     (core, guard)
 }
 

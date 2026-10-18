@@ -45,7 +45,8 @@ fn new_core_with_tables() -> (EngineCore, std::path::PathBuf) {
         .create_table(&schema(OTHER_TABLE))
         .expect("create other table");
     (
-        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+            .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered),
         path,
     )
 }
@@ -613,7 +614,8 @@ fn new_docs_core(limits: Option<DmlLimits>) -> (EngineCore, CleanupGuard) {
     let path = unique_db_path("truncate-table-1200");
     let guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
-    let mut core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     if let Some(limits) = limits {
         core = core.with_dml_limits(limits);
     }
@@ -826,7 +828,8 @@ fn truncate_aborted_by_fk_violation_leaves_no_side_effects_even_after_reopen() {
     let bob = ctx_for("bob", true);
     {
         let storage = Storage::open(&path).expect("open storage");
-        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+            .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
         create_fk_pair(&core);
         sql_ok(
             &core,
@@ -857,7 +860,8 @@ fn truncate_aborted_by_fk_violation_leaves_no_side_effects_even_after_reopen() {
 
     // 再オープン後も副作用ゼロ。
     let storage = Storage::open(&path).expect("reopen storage");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     assert_parents_untouched(&core, &alice, &bob);
 
     // 台帳が書かれていない証明: 子も指定すれば同じ operation_id で成功する
@@ -883,7 +887,8 @@ fn truncate_parent_and_child_in_one_statement_succeeds_but_parent_alone_is_rejec
     let alice = ctx_for("alice", true);
     let bob = ctx_for("bob", true);
     let storage = Storage::open(&path).expect("open storage");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     create_fk_pair(&core);
     for ctx in [&alice, &bob] {
         let t = ctx.tenant_id();
@@ -953,7 +958,8 @@ fn truncate_multi_aborted_by_fk_violation_keeps_all_tables() {
     let _guard = CleanupGuard(path.clone());
     let alice = ctx_for("alice", true);
     let storage = Storage::open(&path).expect("open storage");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     create_fk_pair(&core);
     sql_ok(&core, &alice, "CREATE TABLE loose (note TEXT)");
     sql_ok(

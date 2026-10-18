@@ -31,6 +31,7 @@ fn new_core_with_documents_table(path: &std::path::Path) -> EngineCore {
         ))
         .expect("create table");
     EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
 }
 
 /// ENUM 列（`mood`）を持つ `documents` テーブル（PR #1012 Cursor Bugbot 指摘の
@@ -59,6 +60,7 @@ fn new_core_with_enum_documents_table(path: &std::path::Path) -> EngineCore {
         ))
         .expect("create table");
     EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
 }
 
 fn some(s: &str) -> Option<Vec<u8>> {
@@ -825,6 +827,7 @@ fn new_core_with_quoted_null_names(path: &std::path::Path) -> EngineCore {
         ))
         .expect("create table");
     EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
 }
 
 /// ENUM 列 `"null"` への `WHERE "null" = $1` は Describe 時点でダミー値の語彙照合を省略する。
@@ -1228,6 +1231,7 @@ fn new_core_with_typed_table(path: &std::path::Path) -> EngineCore {
         ))
         .expect("create table");
     EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
 }
 
 fn assert_bind_matches_literal(
@@ -1511,6 +1515,7 @@ fn new_core_with_seven_type_table(path: &std::path::Path) -> EngineCore {
         ))
         .expect("create table");
     EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
 }
 
 fn seven_ctx() -> PolicyContext {

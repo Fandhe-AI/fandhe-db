@@ -3671,7 +3671,7 @@ pub fn project_id_only_rows(
 /// RECOVER-2。台帳への追記が行書き込みと同一 write トランザクションで行われる点は
 /// `tenant.rs` モジュールドキュメント参照）。この `resolve` 呼び出しが
 /// `bound.operation_id` の必須化（TASK-92・RECOVER-1）そのものであり、
-/// `LedgerMode::Ledgered`（既定）で `None` を渡すと `resolve` が `Err` を返し
+/// `LedgerMode::Ledgered`（`--require-operation-id`）で `None` を渡すと `resolve` が `Err` を返し
 /// [`SqlSurfaceError::MissingOperationId`]（`23502`）へ写像される——SQL 表層
 /// 経由（`core.rs`）では `sql::allowlist::validate_insert` の事前検査が同じ
 /// 判定を本関数の呼び出し前に既に行っているため通常は到達しないが、
@@ -3757,7 +3757,7 @@ pub(crate) fn execute_insert_with_schema_in(
 /// [`crate::tenant::truncate_tables_unchecked`] へ委譲する（[`execute_insert`] と
 /// 同じ設計）。
 ///
-/// `LedgerMode::Ledgered`（既定）で `operation_id` が `None` の場合は `resolve` が
+/// `LedgerMode::Ledgered`（`--require-operation-id`）で `operation_id` が `None` の場合は `resolve` が
 /// `Err` を返し [`SqlSurfaceError::MissingOperationId`]（`23502`）へ写像される——
 /// SQL 表層経由（`core.rs`）では `sql::allowlist::validate_truncate` の事前検査が
 /// 同じ判定を本関数の呼び出し前に既に行っているため通常は到達しないが、
@@ -3825,7 +3825,7 @@ pub(crate) fn execute_truncate_in(
 /// sql-delete-single-row.md` 参照。旧実装は `delete_row_unchecked` を流用し
 /// `NotFound` で台帳を commit しなかったため、この再送安全性違反があった）。
 ///
-/// `LedgerMode::Ledgered`（既定）で `operation_id` が `None` の場合は `resolve` が
+/// `LedgerMode::Ledgered`（`--require-operation-id`）で `operation_id` が `None` の場合は `resolve` が
 /// `Err` を返し [`SqlSurfaceError::MissingOperationId`]（`23502`）へ写像される——
 /// SQL 表層経由（`core.rs`）では `sql::allowlist::validate_delete` の事前検査が
 /// 同じ判定を本関数の呼び出し前に既に行っているため通常は到達しないが、
@@ -4033,7 +4033,7 @@ pub(crate) fn execute_delete_returning_in(
 /// 台帳書き込み指示へ解決してから [`crate::tenant::update_row_columns_unchecked`]
 /// へ委譲する（[`execute_truncate`] と同じ設計）。
 ///
-/// `LedgerMode::Ledgered`（既定）で `operation_id` が `None` の場合は `resolve` が
+/// `LedgerMode::Ledgered`（`--require-operation-id`）で `operation_id` が `None` の場合は `resolve` が
 /// `Err` を返し [`SqlSurfaceError::MissingOperationId`]（`23502`）へ写像される——
 /// SQL 表層経由（`core.rs`）では `sql::allowlist::validate_update` の事前検査が
 /// 同じ判定を本関数の呼び出し前に既に行っているため通常は到達しないが、

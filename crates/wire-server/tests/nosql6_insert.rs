@@ -108,7 +108,8 @@ fn new_core(limits: Option<BatchLimits>) -> (Arc<EngineCore>, temp_db::CleanupGu
     let guard = temp_db::CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    let mut core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     if let Some(limits) = limits {
         core = core.with_batch_limits(limits);
     }
