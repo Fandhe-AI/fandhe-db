@@ -4270,8 +4270,9 @@ impl<'a> Parser<'a> {
     /// `TRUNCATE` 文の文脈キーワード（`TABLE`／`ONLY`）を判定する（Issue #1643）。
     /// 現在位置が `word` で、直後が「表名の後に来るはずのトークン」（`,`・`*`・
     /// `USING OPERATION_ID` の導入部）でなければ真。後者の場合は `word` 自体が同名の
-    /// 表名なので偽を返し、従来の解釈を変えない。文末などでは真になり、後続の
-    /// `expect_ident` が `42601` で拒否する（`TRUNCATE TABLE` 単独を表名と取らない）。
+    /// 表名なので偽を返し、従来の解釈を変えない。直後が識別子でない場合（文末・`;`）も
+    /// 偽（`word` を表名として扱う）。`TRUNCATE TABLE` 単独の拒否は後続の
+    /// OPERATION_ID 必須化（`42601`）またはカタログ照会が担う。
     fn peek_truncate_keyword(&self, word: &str) -> bool {
         if !self.peek_ident_matches(word) {
             return false;
@@ -4281,7 +4282,14 @@ impl<'a> Parser<'a> {
             Some(Token::Punct(',' | '*'))
         ) || (self.peek_ident_matches_at(1, "USING")
             && self.peek_ident_matches_at(2, "OPERATION_ID"));
-        !next_is_name_follower
+        // 直後に表名候補（識別子）が無い場合（文末・`;`）も `word` 自体を表名とみなす。
+        // `CompareOnlyWithoutLedger` では OPERATION_ID 句を省略でき、`TRUNCATE TABLE only`
+        // が従来どおり受理される互換性を保つ。
+        let next_is_ident = matches!(
+            self.tokens.get(self.pos.saturating_add(1)),
+            Some(Token::Ident(_))
+        );
+        next_is_ident && !next_is_name_follower
     }
 
     /// `IF EXISTS` 句（Issue #1614・TABLE-36 ポインタ）を 2 トークン先読みで判定し、
@@ -20581,17 +20589,40 @@ mod tests {
     }
 
     #[test]
+    fn truncate_trailing_only_is_table_name_without_ledger() {
+        // CompareOnlyWithoutLedger では OPERATION_ID を省略できるため、文末の `only` は表名。
+        let lookup = catalog_with(&["only"]);
+        for sql in [
+            "TRUNCATE TABLE only",
+            "TRUNCATE TABLE only;",
+            "TRUNCATE TABLE \"only\"",
+            "TRUNCATE TABLE \"only\";",
+            "TRUNCATE only",
+        ] {
+            let v =
+                validate_truncate(sql, &lookup, LedgerMode::CompareOnlyWithoutLedger).expect(sql);
+            assert_eq!(v.table_names, vec!["only".to_string()], "{sql}");
+        }
+    }
+
+    #[test]
     fn rejects_truncate_with_dangling_comma_or_no_table() {
         for sql in [
             "TRUNCATE a, USING OPERATION_ID 'op-0001'",
             "TRUNCATE a,",
             "TRUNCATE",
-            "TRUNCATE TABLE",
             "TRUNCATE , a USING OPERATION_ID 'op-0001'",
         ] {
             let err = truncate_names(sql, &["a"]).expect_err(sql);
             assert_eq!(err.wire_code(), "42601", "{sql}");
         }
+    }
+
+    #[test]
+    fn truncate_bare_table_word_is_table_name_not_keyword() {
+        // 従来互換: 末尾の `TABLE` は表名扱い。台帳モードでは OPERATION_ID 欠落で拒否される。
+        let err = truncate_names("TRUNCATE TABLE", &["a"]).expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "23502");
     }
 
     #[test]
