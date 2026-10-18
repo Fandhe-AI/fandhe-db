@@ -392,7 +392,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_
-    // unchecked`／`truncate_table_unchecked` の `WriteTarget::InTxn` 経路）が
+    // unchecked`／`truncate_tables_unchecked` の `WriteTarget::InTxn` 経路）が
     // 既に同一 `write_txn` 内で `bump_table_generation_in_txn` を呼び終えている
     // （`sql/exec.rs::execute_insert_with_schema_in`／`execute_truncate_in` →
     // `tenant.rs` 各関数のドキュメント参照）。本呼び出し箇所自体は複数文を
@@ -420,7 +420,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("sql/partitioned.rs", 333),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
-    // `truncate_table_unchecked` が autocommit／明示トランザクションの本体を
+    // `truncate_tables_unchecked` が autocommit／明示トランザクションの本体を
     // 共有するための choke point）: この汎用ヘルパー自身は `f`（呼び出し元が
     // 渡すクロージャ）を実行してから commit するだけで、`user_rows/{table}` へ
     // 直接触れない。近傍走査（テキスト上の近さ）では検出できないが、`f` を渡す
