@@ -64,13 +64,14 @@
 //!
 //! # 後続 Issue への申し送り
 //!
-//! #1683: `CREATE TEMP TABLE` で `temp_rows_or_init`、DROP で `remove` が返す id により
+//! #1683（実装済み）: `CREATE TEMP TABLE` で `temp_rows_or_init`、DROP で `remove` が返す id により
 //! `drop_relation`、ON COMMIT DELETE ROWS で `truncate_relation`、上限の CLI。
 //! #1684: `TempReadTxn` の executor 結線・行 id 採番・`23505` 判断・暫定ゲート解除。
 //! #1685: テナント境界と crash 耐性の CI 検査。
 
-// 行ストアの API は #1683 以降の実行腕から呼ばれる。本 Issue の時点ではテストからのみ
-// 到達するため dead_code 警告を抑止する（`temp_catalog.rs` と同じ前例）。
+// 行の読み書きの API は一時表への DML／SELECT の実行腕（#1684）が使う。本 Issue（#1683）の
+// 時点では `truncate_relation`・`drop_relation` 以外はテストからのみ到達するため dead_code
+// 警告を抑止する（`temp_catalog.rs` と同じ前例）。
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;

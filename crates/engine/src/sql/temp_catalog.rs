@@ -14,20 +14,22 @@
 //!
 //! # 暫定ゲート（#1684 で置換）
 //!
-//! 一時表の行ストアと実行器はまだ無い。実行すると同名の**永続表**へ作用してしまうため、
+//! 一時表への DML／SELECT の実行器はまだ無い。実行すると同名の**永続表**へ作用してしまうため、
 //! 一時カタログが空でないセッションで一時表を参照する文は `core.rs` の入口が `0A000` で
-//! 拒否する（fail-closed）。一時カタログが空なら（本 Issue の時点では全セッション）
-//! ゲートは何もせず、既存の挙動と同一である。
+//! 拒否する（fail-closed）。一時カタログが空なら（一時表を作っていないセッション）ゲートは
+//! 何もせず、既存の挙動と同一である。`CREATE [TEMP] TABLE`・`DROP TABLE` だけは一時表の行を
+//! 読み書きせず、実行段が自セッションの一時カタログで名前を解決するため例外として通す
+//! （`docs/design/temp-table.md`「Issue #1683」）。
 //!
 //! # 後続 Issue への申し送り
 //!
 //! 行ストアと切断時の破棄は `temp_rows`（#1682 で実装済み）、`CREATE TEMP TABLE` と
-//! `ON COMMIT` は #1683、一時表への DML・索引・制約とゲートの解除は #1684、
-//! テナント境界・crash 耐性の検査は #1685。
+//! `ON COMMIT`（`SessionState::apply_temp_on_commit`）・一時表の `DROP` は #1683 で実装済み、
+//! 一時表への DML・索引・制約とゲートの解除は #1684、テナント境界・crash 耐性の検査は #1685。
 //! 修飾名（`pg_temp.<名前>`）はスキーマ・`search_path`（TABLE-27）の実装へ申し送る。
 
-// 登録・削除・解決の API は #1683 以降の実行腕から呼ばれる。本 Issue の時点では
-// テストからのみ到達するため dead_code 警告を抑止する。
+// 名前解決（`resolve_unqualified`）・`from_raw` 等は一時表への DML／SELECT の実行腕（#1684）が
+// 使う。本 Issue（#1683）の時点ではテストからのみ到達するため dead_code 警告を抑止する。
 #![allow(dead_code)]
 
 use std::cell::Cell;
@@ -36,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::catalog::TableSchema;
-use crate::sql::allowlist::{SqlSurfaceError, TableLookup};
+use crate::sql::allowlist::{SqlSurfaceError, TableLookup, TempOnCommit};
 use crate::sql::lexer::Token;
 
 /// 1 セッションに登録できる一時表の数の既定上限（TABLE-44 (6)）。スキーマ 1 件は小さいが、
@@ -78,6 +80,9 @@ fn next_temp_relation_id() -> Result<TempRelationId, SqlSurfaceError> {
 pub(crate) struct TempTableEntry {
     pub(crate) id: TempRelationId,
     pub(crate) schema: Arc<TableSchema>,
+    /// `ON COMMIT` の動作（TABLE-44・Issue #1683）。commit フック
+    /// （`SessionState::apply_temp_on_commit`）が読む。
+    pub(crate) on_commit: TempOnCommit,
 }
 
 /// セッション単位の一時カタログ（モジュールドキュメント参照）。
@@ -113,6 +118,7 @@ impl SessionTempCatalog {
     pub(crate) fn register(
         &mut self,
         schema: TableSchema,
+        on_commit: TempOnCommit,
         max_tables: usize,
     ) -> Result<TempRelationId, SqlSurfaceError> {
         crate::catalog::validate_identifier(&schema.name)
@@ -132,6 +138,7 @@ impl SessionTempCatalog {
             TempTableEntry {
                 id,
                 schema: Arc::new(schema),
+                on_commit,
             },
         );
         Ok(id)

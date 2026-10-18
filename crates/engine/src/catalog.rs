@@ -14495,6 +14495,16 @@ pub(crate) fn changed_table_generations_in_write_txn(
     Ok(changed)
 }
 
+/// 一時表の定義を一時カタログへ登録する前に正規化・検証する（TABLE-44・Issue #1683）。
+/// 永続表の [`Storage::create_table`] が write txn の前に行う UNIQUE 制約名の確定と
+/// スキーマ検証だけを切り出したもので、永続カタログには一切触れない。呼び出し元は
+/// `sql::ddl::execute_create_temp_table`。
+pub(crate) fn prepare_temp_table_schema(schema: &TableSchema) -> Result<TableSchema> {
+    let schema = assign_unique_constraint_names(schema.clone());
+    validate_schema(&schema)?;
+    Ok(schema)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
