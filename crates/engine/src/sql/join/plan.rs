@@ -807,6 +807,7 @@ pub(super) fn build_plan<'a>(
             window_items: Vec::new(),
             order_keys: Vec::new(),
             scalar_subquery_items: Vec::new(),
+            physical_order_keys: Vec::new(),
         });
     }
 

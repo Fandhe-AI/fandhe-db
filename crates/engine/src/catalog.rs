@@ -12282,6 +12282,46 @@ impl Storage {
                         .map_err(|_| invalid())?;
                 }
             }
+            // 列別名付きビューへ到達する単純形の本文（Issue #1659）: 参照時は親の「公開名 → 物理名」
+            // 対応で本文の `WHERE` を書き換える（`sql::view::resolve_from`）。書き換えられない形
+            // （疑似列 `id` へ写る公開名の参照など）を含む定義は、作成できても以後の参照がすべて
+            // 失敗するため、参照時と同じ検査（列スコープ・`rewrite_where`）を作成前に通す。
+            if reaches_aliased && !shape.buffered {
+                let invalid = || {
+                    CatalogError::Invalid(
+                        "a view over a view with column aliases cannot use this predicate or column"
+                            .to_string(),
+                    )
+                };
+                let lookup = TxnViewLookup {
+                    write_txn: &write_txn,
+                    catalog_table: &catalog_table,
+                    views_table: &views_table,
+                };
+                let tokens = crate::sql::lexer::tokenize_stored_view_body(body_sql)
+                    .map_err(|_| invalid())?;
+                let parsed = parse_view_body(&tokens).map_err(|_| invalid())?;
+                if let crate::sql::view::Resolved::View {
+                    view_columns,
+                    column_map: Some(map),
+                    ..
+                } =
+                    crate::sql::view::resolve_from(&lookup, base_relation).map_err(|_| invalid())?
+                {
+                    crate::sql::view::check_columns_within_view(
+                        view_columns.as_deref(),
+                        &parsed.projection,
+                        &parsed.where_predicates,
+                        &[],
+                    )
+                    .map_err(|_| invalid())?;
+                    crate::sql::view_alias::rewrite_where(
+                        &crate::sql::view_alias::ColumnMap::new(&map),
+                        parsed.where_predicates,
+                    )
+                    .map_err(|_| invalid())?;
+                }
+            }
             // テーブル自身が深さ 0 のため、それを直接参照する新規ビューの深さは
             // `depth`（参照先の深さ）+ 1。
             let new_depth = depth.checked_add(1).ok_or_else(|| {

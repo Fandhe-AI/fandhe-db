@@ -784,3 +784,86 @@ fn user_column_exposed_as_id_binds_the_user_column_everywhere() {
         assert_eq!(q_code(&core, sql), "0A000", "{sql}");
     }
 }
+
+/// 入れ替え別名（`lang` と `body` を取り違える）での `ORDER BY`／`GROUP BY`／`DISTINCT`:
+/// 物理名へ書き換えたキーが生成投影の別名として再解決されず、公開名どおりの列で並ぶ。
+#[test]
+fn swapped_aliases_order_by_uses_the_public_column() {
+    let (core, _g) = open_core("t41-swap-order");
+    create_ok(
+        &core,
+        "CREATE VIEW vs (lang, body) AS SELECT body, lang FROM docs",
+    );
+    // 公開 lang は物理 body（a1..a4・b1）、公開 body は物理 lang（ja/en）。
+    let first = |sql: &str| -> (u64, Vec<Cell>) {
+        let r = q(&core, sql);
+        (r.rows[0].id, r.rows[0].cells.clone())
+    };
+    assert_eq!(first("SELECT * FROM vs ORDER BY lang LIMIT 1").0, 1);
+    assert_eq!(first("SELECT * FROM vs ORDER BY lang DESC LIMIT 1").0, 5);
+    assert_eq!(
+        first("SELECT * FROM vs ORDER BY body, lang DESC LIMIT 1").0,
+        3
+    );
+    // 投影に現れない公開列で並べる（書き換えたキーが生成別名と一致しうる形）。
+    let (id, cells) = first("SELECT body FROM vs ORDER BY lang DESC LIMIT 1");
+    assert_eq!((id, cells), (5, vec![Cell::Text("ja".into())]));
+    assert_eq!(
+        first("SELECT lang FROM vs ORDER BY body DESC, lang LIMIT 1").0,
+        1
+    );
+    // 利用者の明示別名は出力別名として解決される。
+    assert_eq!(
+        first("SELECT lang AS body FROM vs ORDER BY body DESC LIMIT 1").0,
+        5
+    );
+    // 式キーは物理名へ書き換えて評価される。
+    assert_eq!(
+        first("SELECT lang, body FROM vs ORDER BY lower(lang) DESC LIMIT 1").0,
+        5
+    );
+    let r = q(
+        &core,
+        "SELECT lang, COUNT(*) FROM vs GROUP BY lang ORDER BY lang DESC",
+    );
+    assert_eq!(r.rows[0].cells[0], Cell::Text("b1".into()));
+    let r = q(
+        &core,
+        "SELECT body, COUNT(*) FROM vs GROUP BY body ORDER BY count DESC",
+    );
+    assert_eq!(r.rows[0].cells[0], Cell::Text("ja".into()));
+    let r = q(
+        &core,
+        "SELECT DISTINCT lang FROM vs ORDER BY lang DESC LIMIT 10",
+    );
+    assert_eq!(r.rows[0].cells[0], Cell::Text("b1".into()));
+    assert_eq!(r.rows.len(), 5);
+    assert_eq!(
+        q_code(
+            &core,
+            "SELECT DISTINCT ON (lang) lang, body FROM vs ORDER BY lang LIMIT 10"
+        ),
+        "42601"
+    );
+}
+
+/// 作成時の再検証（Issue #1659 PR レビュー指摘）: 列別名付きビューの上の単純ビューが、参照時に
+/// 必ず拒否される定義（疑似列 `id` へ写る公開名を `WHERE` で参照する）なら作成を拒否する。
+#[test]
+fn simple_view_over_aliased_view_is_revalidated_at_create() {
+    let (core, _g) = open_core("t41-create-recheck");
+    // 公開 a は物理の疑似列 id に写る（`SELECT *` の先頭）。
+    create_ok(&core, "CREATE VIEW v (a, b, c, d) AS SELECT * FROM docs");
+    assert_eq!(
+        create_err(&core, "CREATE VIEW w AS SELECT c FROM v WHERE a = '1'"),
+        "42601"
+    );
+    // 読める定義は従来どおり作成でき、参照も一致して動く。
+    create_ok(&core, "CREATE VIEW w2 AS SELECT c, d FROM v WHERE c = 'ja'");
+    assert_eq!(
+        ids(&q(&core, "SELECT * FROM w2 LIMIT 10")),
+        vec![1, 2, 4, 5]
+    );
+    // 拒否された定義は保存されていない（同名で作り直せる）。
+    create_ok(&core, "CREATE VIEW w AS SELECT c FROM v WHERE c = 'en'");
+}

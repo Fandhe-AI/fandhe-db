@@ -2990,6 +2990,12 @@ pub struct ValidatedScan {
     /// [`Self::projection`] はこれらを含まず、`core.rs` が解決して結果列へ合流する
     /// （合流前に束縛へ渡すと `sql::parser::bind_scan` が拒否する）。
     pub(crate) scalar_subquery_items: Vec<ScalarSubqueryItem>,
+    /// 列別名付きビュー（TABLE-41・Issue #1659）の公開名から基底の物理名へ書き換え済みの
+    /// `ORDER BY` キーの位置（`order_keys` が空でなければ `order_keys`、空なら `order_by` の添字）。
+    /// 束縛段の出力別名解決（`sql::parser::resolve_scan_order_aliases`）はこの位置のキーを
+    /// 別名として再解決せず、基底列名として束縛する（物理名が生成投影の別名と偶然一致して
+    /// 別の列で並べ替わるのを防ぐ）。通常の文では空。
+    pub(crate) physical_order_keys: Vec<usize>,
 }
 
 impl ValidatedScan {
@@ -13326,6 +13332,7 @@ fn parse_set_branch(
             window_items: Vec::new(),
             order_keys: Vec::new(),
             scalar_subquery_items: Vec::new(),
+            physical_order_keys: Vec::new(),
         },
         super::view::Resolved::View {
             base_table,
@@ -13363,6 +13370,7 @@ fn parse_set_branch(
                 window_items: Vec::new(),
                 order_keys: Vec::new(),
                 scalar_subquery_items: Vec::new(),
+                physical_order_keys: Vec::new(),
             }
         }
         // Issue #1192: 評価後射影形ビューは集合演算の枝として参照できない。
@@ -14485,6 +14493,7 @@ fn build_scan_from_resolved(
             window_items,
             order_keys,
             scalar_subquery_items,
+            physical_order_keys: Vec::new(),
         }),
         super::view::Resolved::View {
             base_table,
@@ -14504,6 +14513,7 @@ fn build_scan_from_resolved(
             super::view::check_order_exprs_within_view(view_columns.as_deref(), &order_keys)?;
             // 列別名付きビュー（TABLE-41・Issue #1659）: 公開名に対する検査の後で外側を物理名へ
             // 書き換える。ウィンドウ項目・投影位置のスカラーサブクエリは未対応（fail-closed）。
+            let mut physical_order_keys: Vec<usize> = Vec::new();
             let (projection, where_predicates, order_by, order_keys) = match &column_map {
                 Some(map) => {
                     if !window_items.is_empty() || !scalar_subquery_items.is_empty() {
@@ -14513,12 +14523,19 @@ fn build_scan_from_resolved(
                         ));
                     }
                     let map = super::view_alias::ColumnMap::new(map);
-                    (
-                        super::view_alias::rewrite_projection(&map, projection)?,
-                        super::view_alias::rewrite_where(&map, where_predicates)?,
-                        super::view_alias::rewrite_order_by(&map, order_by)?,
-                        super::view_alias::rewrite_order_keys(&map, order_keys)?,
-                    )
+                    let projection = super::view_alias::rewrite_projection(&map, projection)?;
+                    let where_predicates =
+                        super::view_alias::rewrite_where(&map, where_predicates)?;
+                    let (order_by, by_positions) =
+                        super::view_alias::rewrite_order_by(&map, &projection, order_by)?;
+                    let (order_keys, key_positions) =
+                        super::view_alias::rewrite_order_keys(&map, &projection, order_keys)?;
+                    physical_order_keys = if order_keys.is_empty() {
+                        by_positions
+                    } else {
+                        key_positions
+                    };
+                    (projection, where_predicates, order_by, order_keys)
                 }
                 None => (projection, where_predicates, order_by, order_keys),
             };
@@ -14541,6 +14558,7 @@ fn build_scan_from_resolved(
                 window_items,
                 order_keys,
                 scalar_subquery_items,
+                physical_order_keys,
             })
         }
         // 評価後射影形ビュー（Issue #1192）は CTE・集合演算の枝など、広域取得の

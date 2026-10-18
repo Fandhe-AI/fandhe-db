@@ -334,7 +334,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+131 行。旧: 11389）。
-    ("catalog.rs", 12303),
+    ("catalog.rs", 12343),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -400,7 +400,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+131 行。旧: 11422）。
-    ("catalog.rs", 12367),
+    ("catalog.rs", 12407),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_

@@ -106,27 +106,74 @@ pub(crate) fn rewrite_where(
         .collect()
 }
 
-/// 列名キーの `ORDER BY` を物理名へ書き換える。
-pub(crate) fn rewrite_order_by(
-    map: &ColumnMap<'_>,
-    keys: Vec<ScalarOrderKey>,
-) -> Result<Vec<ScalarOrderKey>, SqlSurfaceError> {
-    let idents: HashSet<String> = keys.iter().map(|k| k.column.clone()).collect();
-    map.reject_aliased_id_refs(&idents)?;
-    Ok(keys
-        .into_iter()
-        .map(|k| ScalarOrderKey {
-            column: map.physical(&k.column),
-            descending: k.descending,
-        })
-        .collect())
+/// 書き換え後の投影が持つ明示別名（`SelectItem::Expr` の `alias`）の集合。外側クエリの
+/// `ORDER BY` はこの名前を出力別名として解決する（`sql::parser::resolve_scan_order_aliases`）。
+fn explicit_aliases(projection: &Projection) -> HashSet<&str> {
+    match projection {
+        Projection::Items(items) => items
+            .iter()
+            .filter_map(|i| match i {
+                SelectItem::Expr { alias: Some(a), .. } => Some(a.as_str()),
+                _ => None,
+            })
+            .collect(),
+        _ => HashSet::new(),
+    }
 }
 
-/// 式キーを含む `ORDER BY` を物理名へ書き換える。
+/// `ORDER BY` の列名キー 1 件を書き換える。戻り値の第 2 要素は「物理名へ書き換えた」か。
+///
+/// キー名が書き換え後の投影の明示別名に一致するときは**書き換えない**: 束縛段の出力別名解決が
+/// その別名（生成投影は `物理名 AS 公開名`）を基底列へ辿るため、公開名のままで正しい列になる。
+/// 一致しないとき（投影に現れない公開列）は物理名へ書き換え、呼び出し元が位置を記録して
+/// 束縛段に別名として再解決させない（物理名が別の生成別名と一致する入れ替え別名対策）。
+fn rewrite_order_column(
+    map: &ColumnMap<'_>,
+    aliases: &HashSet<&str>,
+    key: ScalarOrderKey,
+) -> (ScalarOrderKey, bool) {
+    if aliases.contains(key.column.as_str()) {
+        return (key, false);
+    }
+    let physical = map.physical(&key.column);
+    (
+        ScalarOrderKey {
+            column: physical,
+            descending: key.descending,
+        },
+        true,
+    )
+}
+
+/// 列名キーの `ORDER BY` を物理名へ書き換える。第 2 要素は物理名へ書き換えたキーの位置
+/// （[`crate::sql::allowlist::ValidatedScan::physical_order_keys`] の元）。
+/// `projection` は書き換え済みの外側投影。
+pub(crate) fn rewrite_order_by(
+    map: &ColumnMap<'_>,
+    projection: &Projection,
+    keys: Vec<ScalarOrderKey>,
+) -> Result<(Vec<ScalarOrderKey>, Vec<usize>), SqlSurfaceError> {
+    let idents: HashSet<String> = keys.iter().map(|k| k.column.clone()).collect();
+    map.reject_aliased_id_refs(&idents)?;
+    let aliases = explicit_aliases(projection);
+    let mut positions = Vec::new();
+    let mut out = Vec::with_capacity(keys.len());
+    for (i, key) in keys.into_iter().enumerate() {
+        let (key, physical) = rewrite_order_column(map, &aliases, key);
+        if physical {
+            positions.push(i);
+        }
+        out.push(key);
+    }
+    Ok((out, positions))
+}
+
+/// 式キーを含む `ORDER BY` を物理名へ書き換える（位置の意味は [`rewrite_order_by`] と同じ）。
 pub(crate) fn rewrite_order_keys(
     map: &ColumnMap<'_>,
+    projection: &Projection,
     keys: Vec<ScanOrderKey>,
-) -> Result<Vec<ScanOrderKey>, SqlSurfaceError> {
+) -> Result<(Vec<ScanOrderKey>, Vec<usize>), SqlSurfaceError> {
     let mut idents = HashSet::new();
     for key in &keys {
         match key {
@@ -139,19 +186,25 @@ pub(crate) fn rewrite_order_keys(
         }
     }
     map.reject_aliased_id_refs(&idents)?;
-    Ok(keys
-        .into_iter()
-        .map(|key| match key {
-            ScanOrderKey::Column(k) => ScanOrderKey::Column(ScalarOrderKey {
-                column: map.physical(&k.column),
-                descending: k.descending,
-            }),
+    let aliases = explicit_aliases(projection);
+    let mut positions = Vec::new();
+    let mut out = Vec::with_capacity(keys.len());
+    for (i, key) in keys.into_iter().enumerate() {
+        out.push(match key {
+            ScanOrderKey::Column(k) => {
+                let (k, physical) = rewrite_order_column(map, &aliases, k);
+                if physical {
+                    positions.push(i);
+                }
+                ScanOrderKey::Column(k)
+            }
             ScanOrderKey::Expr { expr, descending } => ScanOrderKey::Expr {
                 expr: map_expr_idents(&expr, &|c| map.physical(c)),
                 descending,
             },
-        })
-        .collect())
+        });
+    }
+    Ok((out, positions))
 }
 
 /// 公開列 `public` を 1 件の投影項目へ変換する。公開名と物理名が違うときは SQL-42 の
