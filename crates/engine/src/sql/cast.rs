@@ -528,6 +528,59 @@ pub(crate) fn kind_of_column(ty: &ColumnType) -> Option<CastKind> {
     }
 }
 
+/// 代入（`UPDATE ... SET`・`ALTER COLUMN TYPE` の USING 省略時）として許される規則か
+/// （恒等・暗黙・代入・文字列型への I/O 代入。TABLE-40・SQL-47 のポインタ）。判定表を
+/// 複数持たないため、配列代入の束縛（[`bind_array_assignment`]）と共有する。
+pub(crate) fn is_assignment_rule(rule: CastRule) -> bool {
+    matches!(
+        rule,
+        CastRule::Identity | CastRule::Implicit | CastRule::Assignment | CastRule::IoAssignment
+    )
+}
+
+/// 列型を CAST の型へ写す。`VECTOR`・`ENUM`（規則表の外）は `None`。
+pub(crate) fn cast_type_of_column(ty: &ColumnType) -> Option<CastType> {
+    Some(match ty {
+        ColumnType::SmallInt => CastType::Int2,
+        ColumnType::Integer => CastType::Int4,
+        ColumnType::BigInt => CastType::Int8,
+        ColumnType::Real => CastType::Float4,
+        ColumnType::Double => CastType::Float8,
+        ColumnType::Text => CastType::Text,
+        ColumnType::Varchar(n) => CastType::Varchar(*n),
+        ColumnType::Bpchar(n) => CastType::Bpchar(*n),
+        ColumnType::Numeric { precision, scale } => CastType::Numeric(Some((*precision, *scale))),
+        ColumnType::Boolean => CastType::Bool,
+        ColumnType::Date => CastType::Date,
+        ColumnType::Time => CastType::Time,
+        ColumnType::Timestamp => CastType::Timestamp,
+        ColumnType::TimestampTz => CastType::TimestampTz,
+        ColumnType::Interval => CastType::Interval,
+        ColumnType::Json => CastType::Json,
+        ColumnType::Jsonb => CastType::Jsonb,
+        ColumnType::Uuid => CastType::Uuid,
+        ColumnType::Bytea => CastType::Bytea,
+        ColumnType::Array(at) => CastType::Array(Box::new(elem_cast_type(at.elem())?)),
+        ColumnType::Vector(_) | ColumnType::Enum(_) => return None,
+    })
+}
+
+/// 列型 `from` の値を列型 `to` へ代入変換できるか（`ALTER COLUMN TYPE` の USING 省略時の
+/// 事前判定。TABLE-40・SQL-47 のポインタ）。配列は要素型の組で引き直す。規則表の外にある型
+/// （`VECTOR`・`ENUM`）は `None` で、判定を呼び出し元（カタログの互換性判定）に委ねる。
+pub(crate) fn column_assignment_convertible(from: &ColumnType, to: &ColumnType) -> Option<bool> {
+    let (f, t) = (cast_type_of_column(from)?, cast_type_of_column(to)?);
+    Some(cast_type_assignable(&f, &t))
+}
+
+/// CAST の型 `from` の値を `to` へ代入変換できるか。配列どうしは要素型の組で判定する。
+pub(crate) fn cast_type_assignable(from: &CastType, to: &CastType) -> bool {
+    match (from, to) {
+        (CastType::Array(a), CastType::Array(b)) => is_assignment_rule(cast_rule_types(a, b)),
+        _ => is_assignment_rule(cast_rule_types(from, to)),
+    }
+}
+
 fn column_kind(schema: Option<&TableSchema>, index: usize) -> Option<CastKind> {
     kind_of_column(&schema?.columns.get(index)?.ty)
 }
@@ -970,10 +1023,7 @@ pub(super) fn bind_array_assignment(
     if src_ty == tgt_ty {
         return Ok(bound);
     }
-    if !matches!(
-        cast_rule(src_ty.kind(), tgt_ty.kind()),
-        CastRule::Identity | CastRule::Implicit | CastRule::Assignment | CastRule::IoAssignment
-    ) {
+    if !is_assignment_rule(cast_rule(src_ty.kind(), tgt_ty.kind())) {
         return Err(SqlSurfaceError::datatype_mismatch(
             "column cannot be assigned an array with a different element type",
         ));
@@ -1508,5 +1558,52 @@ mod tests {
             cast_rule_types(&arr(CastType::Text), &arr(CastType::Date)),
             CastRule::Element
         );
+    }
+    /// TABLE-40・Issue #1635: USING 省略時の代入変換の事前判定。catalog が現在受理する組が
+    /// すべて `Some(true)` であること（退行防止）と、変換の無い組が `Some(false)` であること。
+    #[test]
+    fn column_assignment_convertible_matches_catalog_widenings() {
+        use crate::catalog::ColumnType as C;
+        let num = |p, s| C::Numeric {
+            precision: p,
+            scale: s,
+        };
+        let yes = [
+            (num(5, 2), num(9, 2)),
+            (C::Text, C::Varchar(Some(8))),
+            (C::Varchar(Some(8)), C::Text),
+            (C::Varchar(Some(8)), C::Bpchar(8)),
+            (C::Bpchar(8), C::Text),
+            (C::SmallInt, C::Integer),
+            (C::Integer, C::SmallInt),
+            (C::Integer, C::BigInt),
+            (C::SmallInt, C::BigInt),
+            (C::BigInt, C::SmallInt),
+            (C::BigInt, C::Integer),
+            (C::Real, C::Double),
+            (C::Text, C::Text),
+        ];
+        for (f, t) in &yes {
+            assert_eq!(
+                column_assignment_convertible(f, t),
+                Some(true),
+                "{f:?}->{t:?}"
+            );
+        }
+        let no = [
+            (C::Text, C::Integer),
+            (C::Boolean, C::Integer),
+            (C::Integer, C::Boolean),
+            (C::Date, C::Integer),
+        ];
+        for (f, t) in &no {
+            assert_eq!(
+                column_assignment_convertible(f, t),
+                Some(false),
+                "{f:?}->{t:?}"
+            );
+        }
+        assert_eq!(column_assignment_convertible(&C::Vector(2), &C::Text), None);
+        assert_eq!(column_assignment_convertible(&C::Text, &C::Vector(2)), None);
     }
 }

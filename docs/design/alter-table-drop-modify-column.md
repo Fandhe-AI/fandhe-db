@@ -294,3 +294,29 @@ TABLE-12）。物理フレーム幅が変わる（presence 1 + 4 → presence 1 
 - `crates/engine/src/catalog.rs`（`#[cfg(test)] mod tests`）: DROP COLUMN・
   NUMERIC 精度拡大の単体テスト（バイト不変性・保護列/存在検査・同名再追加・
   DB 再オープン後の永続性・`merge_encode_scalar_columns` の NULL 書き込み）
+
+## Issue #1635 追記（ALTER COLUMN TYPE の USING 句の構文と式の束縛。TABLE-40 ポインタ）
+
+`ALTER TABLE <t> ALTER COLUMN <c> [SET DATA] TYPE <型> [COLLATE <名前>] [USING <式>]` のうち、
+構文解析と式の束縛・型検査までを実装した。行の書き換えは #1636、依存オブジェクトの再構築は
+Issue #1637 の担当で、本 Issue では型検査に通った USING 付きの文を `0A000` で拒否する（式を
+無視して従来経路へ流さない fail-closed）。
+
+- **構文**: `SET DATA TYPE` を `TYPE` と同義で受理する。`USING` は `COLLATE` の後ろにだけ置け、
+  式は `UPDATE ... SET` 右辺と同じ構文木・ノード予算で解析する。`ALTER <c>`（`COLUMN` 省略）は
+  従来どおり `42601`。複数アクション内の `TYPE ... USING` は従来どおり `0A000`
+- **実行段の順序**: DDL 権限ゲート → 表の存在確認 → 目標型の解決 → 照合の検査 →
+  事前判定（`sql::ddl::precheck_alter_type_conversion`）→ カタログ。束縛エラーが権限の無い主体への
+  存在オラクルにならない
+- **USING あり**（`sql::alter_using::check_alter_using`）: 組み込み以外の関数・現在時刻関数は
+  `42601`、VECTOR は変換元・先とも `42804`、ENUM 変換先と型を決められない式は `0A000`、
+  未定義列は `42703`、結果型を代入変換できなければ `42804`。成功時は `0A000`（固定文言）
+- **USING 省略**: 旧型から新型への代入変換が SQL-47 の規則表に無い組を `42804`（USING の指定を
+  促す固定文言）で拒否する。代入変換はあるが未実装の縮小などは、TABLE-19 の契約どおりカタログの
+  `42804` のまま（`catalog::decide_alter_type` は変更しない）
+- **PG との差分**: 集計・ウィンドウ関数は `42601`（PG は `42803`・`42P20`）、部分クエリは
+  `42601`（PG は `0A000`）、USING 内の `now()` 等は `42601`（PG は受理）
+- **#1636 への引き継ぎ**: txn 内での再束縛と世代照合、代入変換ノードの生成、`USING c`（同じ列
+  だけの参照）を省略と同値に扱う最適化。`check_alter_using` は現在 `Result<(), _>` で、束縛結果を
+  返す形へ広げる
+- **公開 API（BREAKING）**: `ValidatedAlterTableAlterColumnType.using: Option<Expr>` の追加
