@@ -277,15 +277,19 @@ pub(crate) fn body_output(
         ViewBodyKind::Buffered { stmt, .. } => return Ok(BodyOutput::Statement(stmt)),
         ViewBodyKind::Simple(parsed) => parsed,
     };
+    // 親の出力列は `SELECT *` のときだけ必要（明示列の本文は星の展開を行わない）。
+    let need_star = matches!(parsed.projection, Projection::All);
     let parent: Vec<String> = match resolve_from(lookup, &parsed.table_name)? {
-        Resolved::Table => star_columns_of_table(lookup, &parsed.table_name)?,
+        Resolved::Table if need_star => star_columns_of_table(lookup, &parsed.table_name)?,
+        Resolved::Table => Vec::new(),
         Resolved::View {
             base_table,
             view_columns,
             ..
         } => match view_columns {
             Some(cols) => cols,
-            None => star_columns_of_table(lookup, &base_table)?,
+            None if need_star => star_columns_of_table(lookup, &base_table)?,
+            None => Vec::new(),
         },
         Resolved::Buffered { body, .. } => {
             let layer = super::allowlist::buffered_layer_statement(

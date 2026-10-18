@@ -11186,10 +11186,23 @@ fn check_body_scan(
 ) -> Result<(), SqlSurfaceError> {
     // Issue #1352: 投影位置のスカラーサブクエリは参照時の本文評価で解決されない
     // ため、ビュー本体には含めさせない（fail-closed）。
-    if !v.window_items.is_empty()
-        || !v.scalar_subquery_items.is_empty()
-        || matches!(v.projection, Projection::Items(_))
-    {
+    // 式項目は禁止する。ただし「別名付きの列参照」（`Expr::Ident` ＋ `alias`。SQL-42）は式評価器を
+    // 通らない裸列の改名であり、列別名付きビュー（TABLE-41 (1)・Issue #1659）の参照が内部生成する
+    // 形と区別できないため許可する（作成時と参照時の契約を一致させる）。
+    let computed_items = match &v.projection {
+        Projection::Items(items) => items.iter().any(|i| {
+            !matches!(
+                i,
+                SelectItem::Column(_)
+                    | SelectItem::Expr {
+                        expr: Expr::Ident(_),
+                        alias: Some(_),
+                    }
+            )
+        }),
+        _ => false,
+    };
+    if !v.window_items.is_empty() || !v.scalar_subquery_items.is_empty() || computed_items {
         return Err(body_form_unsupported());
     }
     push_relation(out, &v.table_name);

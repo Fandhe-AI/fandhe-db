@@ -3578,6 +3578,8 @@ fn view_reaches_buffered_in_txn(
 /// （[`TableLookup`]）を提供する（Issue #1411。評価後射影形ビューを読む本文を、参照時の
 /// 再検証 `sql::view::resolve_from` と同一の経路で作成前に検証するために使う）。
 struct TxnViewLookup<'a, 'txn> {
+    /// ENUM 列の語彙解決（スキーマのデコード）に使う同一 write txn。
+    write_txn: &'a redb::WriteTransaction,
     catalog_table: &'a redb::Table<'txn, &'static str, &'static [u8]>,
     views_table: &'a redb::Table<'txn, &'static str, &'static [u8]>,
 }
@@ -3601,6 +3603,49 @@ impl TableLookup for TxnViewLookup<'_, '_> {
                 .map(Some)
                 .map_err(table_lookup_error),
         }
+    }
+
+    fn table_columns(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
+        Ok(self.txn_schema(name)?.map(|schema| {
+            let mut columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            if !columns.iter().any(|c| c == "id") {
+                columns.push("id".to_string());
+            }
+            columns
+        }))
+    }
+
+    fn table_star_columns(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
+        Ok(self.txn_schema(name)?.map(|schema| {
+            let mut columns = vec!["id".to_string()];
+            columns.extend(schema.columns.iter().map(|c| c.name.clone()));
+            columns
+        }))
+    }
+}
+
+impl TxnViewLookup<'_, '_> {
+    /// 同一 write txn のカタログから表スキーマを読む（`impl TableLookup for Storage` と同じ
+    /// 列導出のため。表が無ければ `None`）。
+    fn txn_schema(&self, name: &str) -> std::result::Result<Option<TableSchema>, SqlSurfaceError> {
+        let bytes = match self
+            .catalog_table
+            .get(name)
+            .map_err(|e| table_lookup_error(CatalogError::from(e)))?
+        {
+            None => return Ok(None),
+            Some(guard) => guard.value().to_vec(),
+        };
+        let mut resolve = |n: &str| get_enum_type_in_write_txn(self.write_txn, n);
+        decode_schema_with_resolver(name, &bytes, &mut resolve)
+            .map(Some)
+            .map_err(table_lookup_error)
     }
 }
 
@@ -11720,6 +11765,7 @@ impl Storage {
                 };
                 if shape.buffered {
                     let lookup = TxnViewLookup {
+                        write_txn: &write_txn,
                         catalog_table: &catalog_table,
                         views_table: &views_table,
                     };

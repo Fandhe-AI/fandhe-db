@@ -678,3 +678,41 @@ fn star_over_table_with_declared_id_column_is_rejected_not_misaligned() {
         "0A000"
     );
 }
+
+/// 実カラム `id` を宣言する表でも、明示列だけの本文は星の展開を行わず別名付きで作成できる。
+#[test]
+fn explicit_columns_over_table_with_declared_id_column_are_accepted() {
+    let path = unique_db_path("t41-declared-id-explicit");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "rid",
+            vec![
+                ColumnDef::new("id", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let core = new_core(storage);
+    create_ok(&core, "CREATE VIEW vr (x) AS SELECT body FROM rid");
+}
+
+/// 評価後射影形ビューの連鎖（星の列並びが必要）を write txn 内の再検証でも解決できる。
+#[test]
+fn chained_buffered_views_over_aliased_star_view_are_creatable() {
+    let (core, _g) = open_core("t41-txn-chain");
+    create_ok(&core, "CREATE VIEW a (x) AS SELECT * FROM docs");
+    create_ok(&core, "CREATE VIEW b AS SELECT COUNT(*) AS n FROM a");
+    create_ok(&core, "CREATE VIEW c AS SELECT COUNT(*) FROM b");
+}
+
+/// 別名付きビューの上の LIMIT 付き本文は、作成時と参照時の契約が一致する（保存できれば参照できる）。
+#[test]
+fn buffered_body_over_aliased_view_is_consistent_between_create_and_read() {
+    let (core, _g) = open_core("t41-buffered-over-alias");
+    create_ok(&core, "CREATE VIEW a (x) AS SELECT body FROM docs");
+    create_ok(&core, "CREATE VIEW b AS SELECT x FROM a LIMIT 2");
+    let r = q(&core, "SELECT * FROM b LIMIT 10");
+    assert_eq!(names(&r), ["x"]);
+}
