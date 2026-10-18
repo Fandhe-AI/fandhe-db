@@ -10,11 +10,12 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 ## 構文
 
 ```
-DROP TABLE [IF EXISTS] <table>
+DROP TABLE [IF EXISTS] <table> [, <table>]*
 ```
 
 - `IF EXISTS` は Issue #1614 で受理に変わった（末尾の「Issue #1614 追記」参照）。
-- `CASCADE`・`RESTRICT`・複数テーブル列挙・`USING OPERATION_ID` 句は
+- 複数テーブル列挙は Issue #1639 で受理に変わった（末尾の「Issue #1639 追記」参照）。
+- `CASCADE`・`RESTRICT`・`USING OPERATION_ID` 句は
   いずれも構造的に受理しない（許可リスト外・`42601`）。SQL-8 の「受理形以外は
   `42601`」方針に従う。`CASCADE` は spec でも対象外と明示されている。
 - `EXPLAIN DROP TABLE ...` は既存の `EXPLAIN` 分岐（次トークンが `SELECT` である
@@ -173,3 +174,25 @@ drop_table_without_permission_is_rejected_with_42501_regardless_of_table_existen
   無く後続課題）、複数名・`CASCADE`／`RESTRICT`、NoSQL 表層 `drop_table` op への `if_exists` 追加。
 - **破壊的変更**: `ValidatedDropTable` へのフィールド追加と `Drop*Outcome` の非公開フィールド追加
   により、crate 外での構造体リテラル構築ができなくなる。
+
+## Issue #1639 追記: 複数テーブル指定（`DROP TABLE a, b`）
+
+対象ビヘイビア: TABLE-37 (1)・(6)（親 Issue #1638）。`DROP TABLE [IF EXISTS] a, b, ...` を受理し、
+文全体を 1 つの write txn・1 回の commit で原子的に実行する。
+
+- **構文**: `ValidatedDropTable.table_names: Vec<String>`（非空・記述順。旧 `table_name` を置き換えた
+  破壊的変更）。末尾カンマ・空要素・カンマ無しの並びは `42601`。`CASCADE`／`RESTRICT` は従来どおり `42601`。
+- **実行**: `Storage::drop_tables(&[String], if_exists) -> DropTablesReport`。`Storage::drop_table` は
+  その単一表 wrapper で、エラー variant・同期点の発火回数・世代 bump は従来どおり。
+- **判定順（決定的）**: 名前を記述順に解決（種類違い `42809`・不在 `42P01`。`IF EXISTS` は不在だけ skip）→
+  依存（`2BP01`）→ 削除。どこで失敗しても commit 前に txn を破棄し何も削除しない。全件 skip なら
+  commit せず世代も不変（`DropTableOutcome::skipped()` は「1 件も削除しなかった」）。
+- **依存**: カタログ情報だけを単一パスで調べる（ビュー本文の参照、削除対象外の表の `FOREIGN KEY`）。
+  同じ文に並べた名前どうしの参照（自己参照を含む）は数えない。参照元の表名・テナント情報はエラーに含めない。
+  FK 保持版の接頭辞は既存と同じ `FK_BEARING_FORMAT_VERSIONS` を使う（見落とすと fail-open）。
+- **重複名**: 初出の 1 回として扱う。表世代の bump も 1 回。
+- **権限**: ゲートは名前数に関係なく 1 回、存在確認より前に通す（存否のオラクルにならない）。
+  明示トランザクション内は `0A000`。
+- **NoSQL 表層**: `drop_table` op は単一の表のまま（TABLE-37 (6)。JSON の `table` は 1 トークン限定）。
+- **対象外**: `CASCADE`／`RESTRICT`（#1641）、依存オブジェクトの汎用列挙（#1640）、複数指定の
+  `DROP VIEW`／`INDEX`／`TYPE`、skip した名前ごとの NoticeResponse。

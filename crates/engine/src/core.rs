@@ -1515,7 +1515,8 @@ pub enum ParsedSql {
     /// `0A000` で拒否する（トランザクション対応の実行入口は
     /// [`EngineCore::execute_sql_in_txn`]／[`EngineCore::execute_parsed_in_txn`]）。
     Transaction(crate::sql::transaction::TxnControl),
-    /// `DROP TABLE <table>`（SQL-23・TASK-203、Issue #902）。DDL 実行権限ゲート
+    /// `DROP TABLE [IF EXISTS] <table> [, <table>]*`（SQL-23・TASK-203、Issue #902。複数指定は
+    /// TABLE-37 (1)・Issue #1639）。DDL 実行権限ゲート
     /// （`sql::ddl::require_ddl_permission`）の判定は
     /// `EngineCore::execute_parsed_in_session` が担い、`validate_drop_table_tokens`
     /// 自体はカタログ照会を一切行わない（`ValidatedDropTable` ドキュメント参照）。
