@@ -1247,9 +1247,60 @@ fn column_has_alter_dependents_in_txn(
             if views_reference_column_in_txn(&views_table, table_name, &remaining)? {
                 return Ok(true);
             }
+            // `SELECT *` ビューは削除後の列集合へ展開されるため上の判定では検出できない。
+            // 旧スキーマ（対象列を含む）での公開列を導出し、対象列を公開するビューも依存とする。
+            let full: Vec<String> = ["id", "tenant_id", "visibility"]
+                .iter()
+                .map(|s| s.to_string())
+                .chain(schema.columns.iter().map(|c| c.name.clone()))
+                .collect();
+            if views_expose_column_in_txn(&views_table, table_name, &full, column_name)? {
+                return Ok(true);
+            }
         }
         Err(redb::TableError::TableDoesNotExist(_)) => {}
         Err(e) => return Err(CatalogError::from(e)),
+    }
+    Ok(false)
+}
+
+/// `table` を（直接または連鎖経由で）読む単純形ビューのいずれかが、旧スキーマ
+/// （`full_columns`）で `column` を公開列として持つなら `true`（型変更ゲート用。
+/// `SELECT *` の展開を含む）。導出不能・破損は fail-closed で `true`。
+fn views_expose_column_in_txn(
+    views_table: &redb::Table<'_, &str, &[u8]>,
+    table: &str,
+    full_columns: &[String],
+    column: &str,
+) -> Result<bool> {
+    let mut defs: std::collections::HashMap<String, ViewDef> = std::collections::HashMap::new();
+    for entry in views_table.iter()? {
+        let (key, value) = entry?;
+        if defs.len() >= MAX_VIEWS {
+            return Err(CatalogError::ViewLimitExceeded(
+                "too many views".to_string(),
+            ));
+        }
+        let def = decode_view_def(value.value())?;
+        match view_body_shape(&def.body_sql) {
+            // 評価後射影形は views_reference_column_in_txn が保守的に検出済み。
+            Ok(shape) if shape.buffered => continue,
+            Ok(_) => {}
+            Err(_) => return Ok(true),
+        }
+        defs.insert(key.value().to_string(), def);
+    }
+    let mut exposed: std::collections::HashMap<String, Option<Vec<String>>> =
+        std::collections::HashMap::new();
+    let names: Vec<String> = defs.keys().cloned().collect();
+    for name in names {
+        match exposed_columns_of_view(&defs, &mut exposed, &name, table, full_columns)? {
+            ViewExposure::Broken => return Ok(true),
+            ViewExposure::Columns(cols) if cols.iter().any(|c| c == column) => {
+                return Ok(true);
+            }
+            _ => {}
+        }
     }
     Ok(false)
 }

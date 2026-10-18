@@ -435,6 +435,18 @@ fn dependent_columns_are_fail_closed_until_rebuild_support() {
     assert_eq!(column_type(&core, "p", "n"), ColumnType::Integer);
 }
 
+/// `SELECT *` ビューは旧スキーマで全列を公開するため、どの列の一般変換も `0A000` で拒否する
+/// （公開列型が変わる fail-open を避ける。表は不変）。
+#[test]
+fn select_star_view_blocks_general_conversion() {
+    let (_path, _g, core) = open("rw-star-view");
+    ok(&core, "CREATE TABLE t (n BIGINT)");
+    ok(&core, "CREATE VIEW v AS SELECT * FROM t");
+    let err = fail(&core, "ALTER TABLE t ALTER COLUMN n TYPE INTEGER");
+    assert_eq!(err.wire_code(), "0A000", "{err}");
+    assert_eq!(column_type(&core, "t", "n"), ColumnType::BigInt);
+}
+
 /// `USING <対象列>` は USING 省略と同じ扱いで、既存の拡大経路（カタログのみ）を通る。
 #[test]
 fn using_target_column_is_treated_as_omitted() {
