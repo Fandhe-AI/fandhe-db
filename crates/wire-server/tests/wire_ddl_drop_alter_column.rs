@@ -131,21 +131,84 @@ fn wire_error_sqlstates_and_ready_for_query_recovery() {
         ("ALTER TABLE docs DROP COLUMN embedding", "42601"),
         ("ALTER TABLE docs DROP COLUMN tenant_id", "42601"),
         ("ALTER TABLE docs ALTER COLUMN note TYPE INTEGER", "42804"),
-        (
-            "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(4,2)",
-            "42804",
-        ),
+        // 同一型への変更は 42804（NUMERIC の精度縮小は代入変換のある一般変換として受理される。
+        // TABLE-40・Issue #1636）。
+        ("ALTER TABLE docs ALTER COLUMN qty TYPE INTEGER", "42804"),
         ("ALTER TABLE docs DROP COLUMN note CASCADE", "42601"),
         ("ALTER TABLE docs DROP COLUMN IF EXISTS note", "42601"),
+        // USING の式が未定義列を参照する束縛エラー。
         (
-            "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING amount",
-            "0A000",
+            "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING missing",
+            "42703",
         ),
     ] {
         send_simple_query(&mut stream, sql);
         expect_error_response_with_sqlstate(&mut stream, code);
         read_ready_for_query(&mut stream);
     }
+}
+
+/// ErrorResponse（'E'）の本文を読み、SQLSTATE を確認して本文を返す。
+fn read_error_body_with_sqlstate(stream: &mut std::net::TcpStream, sqlstate: &str) -> String {
+    use std::io::Read;
+    let mut header = [0u8; 1];
+    stream.read_exact(&mut header).expect("read type");
+    assert_eq!(header[0], b'E', "expected ErrorResponse");
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read len");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).expect("read body");
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(text.contains(sqlstate), "expected {sqlstate}, got {text:?}");
+    text
+}
+
+/// USING 付きの型変換が wire 経由で成功し（CommandComplete）、行の変換に失敗した場合は
+/// `22P02` の ErrorResponse でメッセージに行の値が含まれず、表も変わらない
+/// （TABLE-40・Issue #1636）。
+#[test]
+fn wire_using_conversion_succeeds_and_row_error_does_not_leak_values() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
+    let ctx = engine::policy::PolicyContext::with_visibilities(
+        "tenant-a",
+        [engine::storage::Visibility::Public],
+    )
+    .expect("tenant");
+    for (id, note) in [(1, "10"), (2, "not-a-number-SECRET")] {
+        core.execute_sql_in_session(
+            &ctx,
+            &mut session,
+            &format!(
+                "INSERT INTO docs (id, embedding, note) VALUES ({id}, '[0.1,0.2]', '{note}') \
+                 USING OPERATION_ID 'wire-using-{id}'"
+            ),
+        )
+        .expect("seed row");
+    }
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE docs ALTER COLUMN note TYPE INTEGER USING note::integer",
+    );
+    let body = read_error_body_with_sqlstate(&mut stream, "22P02");
+    assert!(!body.contains("SECRET"), "value leaked: {body:?}");
+    read_ready_for_query(&mut stream);
+    // 違反行を除くと同じ文が成功する。
+    send_simple_query(
+        &mut stream,
+        "DELETE FROM docs WHERE id = 2 USING OPERATION_ID 'wire-using-del'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "DELETE 1");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE docs ALTER COLUMN note TYPE INTEGER USING note::integer",
+    );
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
 }
 
 #[test]
@@ -164,9 +227,10 @@ fn wire_dependent_check_column_is_rejected_with_2bp01() {
 }
 
 /// CHECK 参照列でも拡大変換（INTEGER→BIGINT）は受理され（Issue #1427）、
-/// 非互換な変換は 42804 のまま。
+/// 値の変換を伴う一般変換は Issue #1637（依存オブジェクトの再構築）まで暫定の 0A000
+/// （TABLE-40・Issue #1636）。
 #[test]
-fn wire_check_column_widening_is_accepted_and_incompatible_is_42804() {
+fn wire_check_column_widening_is_accepted_and_conversion_is_gated_with_0a000() {
     let (core, _guard) = new_core_with_docs_table();
     let mut stream = spawn_with_alice_as_ddl_principal(core);
     send_simple_query(
@@ -176,7 +240,7 @@ fn wire_check_column_widening_is_accepted_and_incompatible_is_42804() {
     assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
     read_ready_for_query(&mut stream);
     send_simple_query(&mut stream, "ALTER TABLE docs ALTER COLUMN qty TYPE TEXT");
-    expect_error_response_with_sqlstate(&mut stream, "42804");
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
     read_ready_for_query(&mut stream);
     send_simple_query(&mut stream, "ALTER TABLE docs ALTER COLUMN qty TYPE BIGINT");
     assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");

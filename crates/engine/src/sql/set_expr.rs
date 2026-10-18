@@ -186,41 +186,81 @@ pub(crate) fn eval_set_expr_to_value<'a>(
     row_scalars: &'a [Option<ScalarRef<'a>>],
 ) -> Result<Value, SqlSurfaceError> {
     let evaluated = eval_with_scalars(&set.bound, id, embedding, row_scalars)?;
+    expr_value_to_column_value(&set.target_ty, set.nullable, &set.column_name, evaluated)
+}
+
+/// 式の評価結果 `evaluated` を列型 `target_ty` の [`Value`] へ変換する（列値化）。
+/// `UPDATE ... SET` の [`eval_set_expr_to_value`] と、`ALTER COLUMN TYPE` の全行変換
+/// （`column_rewrite`。TABLE-40・Issue #1636）が共有する単一の変換器で、第 2 の変換器は
+/// 作らない。`nullable` が偽の列への NULL は `23502`（`column_name` はスキーマ由来）。
+/// 型の食い違いは `Internal`（束縛段の不変条件が崩れた場合の保険。fail-closed）。
+pub(crate) fn expr_value_to_column_value(
+    target_ty: &ColumnType,
+    nullable: bool,
+    column_name: &str,
+    evaluated: ExprValue<'_>,
+) -> Result<Value, SqlSurfaceError> {
     let internal = || SqlSurfaceError::Internal {
-        detail: "SET expression result does not match the target column type".to_string(),
+        detail: "expression result does not match the target column type".to_string(),
     };
     match evaluated {
         ExprValue::Null => {
-            if set.nullable {
+            if nullable {
                 Ok(Value::Null)
             } else {
-                Err(SqlSurfaceError::not_null_violation(set.column_name.clone()))
+                Err(SqlSurfaceError::not_null_violation(column_name))
             }
         }
-        ExprValue::Scalar(v) => scalar_to_value(&set.target_ty, v).ok_or_else(internal)?,
-        ExprValue::Text(t) => match &set.target_ty {
+        ExprValue::Scalar(v) => scalar_to_value(target_ty, v).ok_or_else(internal)?,
+        ExprValue::Text(t) => match target_ty {
             // `VARCHAR(n)` の n 超過は `22001`（超過部分が半角空白のみなら切り詰め。
             // TABLE-31・Issue #1564）。行ごとの評価結果にしか値が決まらないためここで判定する。
             ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
                 // `CHAR(n)` は空白詰めして保存する（TABLE-31・Issue #1566）。
-                crate::sql::parser::bind_text_literal(&set.target_ty, &t)
+                crate::sql::parser::bind_text_literal(target_ty, &t)
             }
             _ => Err(internal()),
         },
-        ExprValue::Bool(b) => match &set.target_ty {
+        ExprValue::Bool(b) => match target_ty {
             ColumnType::Boolean => Ok(Value::Bool(b)),
             _ => Err(internal()),
         },
-        // jsonb 値の代入は #1597 まで束縛段が `0A000` で拒否するため到達しない（fail-closed）。
-        // json 値（原文保存）の代入も束縛段が `0A000` で拒否するため到達しない（Issue #2180）。
-        ExprValue::Json(_)
-        | ExprValue::JsonText(_)
-        | ExprValue::Numeric(_)
-        | ExprValue::Uuid(_)
-        | ExprValue::Bytes(_) => Err(internal()),
+        // `UPDATE ... SET` では jsonb・json・numeric・uuid・bytea の代入を束縛段（`bind_set_expr`）が
+        // `0A000` で拒否するためこれらの腕には到達しない。`ALTER COLUMN TYPE` の全行変換
+        // （Issue #1636）だけが、代入変換ノードの結果としてここへ運ぶ。
+        // jsonb の列には正規化済みのテキスト、json の列には原文テキストだけを入れる。
+        ExprValue::Json(t) => match target_ty {
+            ColumnType::Jsonb => Ok(Value::Json(t.into_owned())),
+            _ => Err(internal()),
+        },
+        ExprValue::JsonText(t) => match target_ty {
+            ColumnType::Json => Ok(Value::Json(t.into_owned())),
+            _ => Err(internal()),
+        },
+        // 変換ノードの型修飾子適用で列の位取りへ正規化済みであることを再検証する
+        // （行 codec は位取りを持たず、不一致を黙って受理すると値の意味が変わる）。
+        ExprValue::Numeric(d) => match target_ty {
+            ColumnType::Numeric { precision, scale }
+                if d.scale() == *scale && d.fits_precision(*precision) =>
+            {
+                Ok(Value::Numeric(d))
+            }
+            ColumnType::Numeric { .. } => Err(SqlSurfaceError::numeric_out_of_range(
+                "numeric field overflow",
+            )),
+            _ => Err(internal()),
+        },
+        ExprValue::Uuid(u) => match target_ty {
+            ColumnType::Uuid => Ok(Value::Uuid(u)),
+            _ => Err(internal()),
+        },
+        ExprValue::Bytes(b) => match target_ty {
+            ColumnType::Bytea => Ok(Value::Bytes(b.into_owned())),
+            _ => Err(internal()),
+        },
         // 配列値（TABLE-35・Issue #1602）。束縛段が要素型を列に合わせ済みで、ここでは要素型の一致と
         // 要素数・フレーム長の上限を行ごとの評価結果に対して再検証する（`54000`。encode と同じ上限）。
-        ExprValue::Array(a) => match &set.target_ty {
+        ExprValue::Array(a) => match target_ty {
             ColumnType::Array(at) => {
                 if !crate::row_codec::array_elem_kind_eq(a.elem(), at.elem()) {
                     return Err(internal());
@@ -237,7 +277,7 @@ pub(crate) fn eval_set_expr_to_value<'a>(
             }
             _ => Err(internal()),
         },
-        ExprValue::Date(d) => match &set.target_ty {
+        ExprValue::Date(d) => match target_ty {
             ColumnType::Date => Ok(Value::Date(d)),
             ColumnType::Timestamp => i64::from(d)
                 .checked_mul(MICROS_PER_DAY)
@@ -245,13 +285,13 @@ pub(crate) fn eval_set_expr_to_value<'a>(
                 .ok_or_else(|| SqlSurfaceError::datetime_field_overflow("timestamp out of range")),
             _ => Err(internal()),
         },
-        ExprValue::Timestamp(t) => match &set.target_ty {
+        ExprValue::Timestamp(t) => match target_ty {
             ColumnType::Timestamp => Ok(Value::Timestamp(t)),
             _ => Err(internal()),
         },
         // `TIME` は `0..=24:00:00`（両端含む）を再検証し、範囲外は `22008`（Issue #1570）。
         // 行 codec の encode も最後の砦として検査するが、エラー分類をここで確定させる。
-        ExprValue::Time(t) => match &set.target_ty {
+        ExprValue::Time(t) => match target_ty {
             ColumnType::Time if (0..=MICROS_PER_DAY).contains(&t) => Ok(Value::Time(t)),
             ColumnType::Time => Err(SqlSurfaceError::datetime_field_overflow(
                 "time field value out of range",
@@ -260,7 +300,7 @@ pub(crate) fn eval_set_expr_to_value<'a>(
         },
         // `INTERVAL` は無限大の予約値（番兵）と一致しないことを再検証し、一致したら `22008`
         // （Issue #1581。行 codec の encode も最後の砦として検査する）。
-        ExprValue::Interval(v) => match &set.target_ty {
+        ExprValue::Interval(v) => match target_ty {
             ColumnType::Interval if crate::datetime::validate_interval(&v) => {
                 Ok(Value::Interval(v))
             }
@@ -270,7 +310,7 @@ pub(crate) fn eval_set_expr_to_value<'a>(
             _ => Err(internal()),
         },
         // `TIMESTAMPTZ` は UTC の表現範囲を再検証し、範囲外は `22008`（Issue #1576）。
-        ExprValue::TimestampTz(t) => match &set.target_ty {
+        ExprValue::TimestampTz(t) => match target_ty {
             ColumnType::TimestampTz if crate::datetime::validate_timestamptz_micros(t) => {
                 Ok(Value::TimestampTz(t))
             }

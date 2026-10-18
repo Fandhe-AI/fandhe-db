@@ -840,7 +840,8 @@ fn features_still_disabled_are_rejected_fail_closed() {
     for sql in [
         "CREATE TABLE a (v INTERVAL PRIMARY KEY)",
         "CREATE TABLE a (v INTERVAL UNIQUE)",
-        "ALTER TABLE docs ALTER COLUMN v TYPE TEXT",
+        // INTERVAL→TEXT は TABLE-40 の一般変換（Issue #1636）で受理されるためここでは扱わない。
+        "ALTER TABLE docs ALTER COLUMN v TYPE INTEGER",
     ] {
         let mut session = SessionState::default();
         session.allow_ddl();

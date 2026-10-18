@@ -1206,6 +1206,7 @@ pub(crate) fn execute_alter_table_alter_column_type(
             &stmt.column_name,
             &target,
             stmt.collation,
+            stmt.using.as_ref(),
         )
         .map_err(|e| match e {
             AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
@@ -1226,12 +1227,13 @@ pub(crate) fn execute_alter_table_alter_column_type(
 /// `ALTER COLUMN TYPE` の変換可否の事前判定（TABLE-40、Issue #1635）。DDL 権限ゲート・表の
 /// 存在確認・目標型の解決の後に呼ばれる（権限の無い主体への存在オラクルにしない）。
 ///
-/// - `USING` あり: 式を旧スキーマで束縛・型検査し（[`crate::sql::alter_using`]）、成功しても
-///   行の書き換え（Issue #1636）が未実装のため `0A000` で拒否する（式を無視して従来経路へ
-///   流さない。fail-closed）。副作用は無い。
+/// - `USING` あり: 式を旧スキーマで束縛・型検査する（[`crate::sql::alter_using`]）。早期検証
+///   だけで、行の書き換えはカタログが write txn 内で式を束縛し直して行う（Issue #1636）。
+///   副作用は無い。
 /// - `USING` 省略: 旧型から新型への代入変換が規則表（SQL-47）に無い組を `42804`（`USING` の
-///   指定を促す固定文言）で拒否する。代入変換はあるが未実装の組や規則表の外の型は、従来どおり
-///   カタログの互換性判定（`42804`。TABLE-19 の契約）に任せる。
+///   指定を促す固定文言）で拒否する。代入変換がある組は、カタログが全行を書き換えて受理する。
+///   規則表の外の型（VECTOR・ENUM）は、従来どおりカタログの互換性判定（`42804`。TABLE-19 の
+///   契約）に任せる。
 /// - 列が見つからない場合はカタログの既存判定（`42703`）に委ねる。
 fn precheck_alter_type_conversion(
     storage: &Storage,
@@ -1253,10 +1255,10 @@ fn precheck_alter_type_conversion(
         return Ok(());
     };
     if let Some(using) = &stmt.using {
-        crate::sql::alter_using::check_alter_using(using, &schema, index, target)?;
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "ALTER COLUMN TYPE with a USING expression is not supported yet".to_string(),
-        });
+        // 早期検証（束縛エラー・`42804`）だけを行う。式の束縛は、カタログが write txn 内で
+        // 旧スキーマに対してやり直す（TOCTOU 対策）。行は読まない。
+        crate::sql::alter_using::bind_alter_conversion(Some(using), &schema, index, target)?;
+        return Ok(());
     }
     if crate::sql::cast::column_assignment_convertible(&column.ty, target) == Some(false) {
         return Err(SqlSurfaceError::datatype_mismatch(format!(

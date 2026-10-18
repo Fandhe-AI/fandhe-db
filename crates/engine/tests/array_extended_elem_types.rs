@@ -326,7 +326,7 @@ fn drop_type_sees_enum_array_dependency_and_alter_type_extends_vocabulary() {
 }
 
 #[test]
-fn add_column_accepts_new_element_types_and_alter_column_type_still_rejects_arrays() {
+fn add_column_accepts_new_element_types_and_alter_column_type_widens_array_elements() {
     let path = unique_db_path("ext-add-column");
     let _g = CleanupGuard(path.clone());
     let core = core_at(&path);
@@ -355,11 +355,9 @@ fn add_column_accepts_new_element_types_and_alter_column_type_still_rejects_arra
         code(&core, "ALTER TABLE a ADD COLUMN xe BYTEA[] DEFAULT '{zz}'"),
         "22P02"
     );
-    // `NUMERIC(p,s)[]` の精度拡大を含め、配列の型変更は 42804 のまま。
-    assert_eq!(
-        code(&core, "ALTER TABLE a ALTER COLUMN n TYPE NUMERIC(10,2)[]"),
-        "42804"
-    );
+    // `NUMERIC(p,s)[]` の精度拡大は、要素型の代入変換がある一般変換として受理される
+    // （TABLE-40・Issue #1636。行が無い表でも成功し、型だけが変わる）。
+    ok(&core, "ALTER TABLE a ALTER COLUMN n TYPE NUMERIC(10,2)[]");
     // 追加列へ書いて読める（既存行の補完は NULL）。
     ok(
         &core,

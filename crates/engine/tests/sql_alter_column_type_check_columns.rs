@@ -251,13 +251,18 @@ fn non_widening_on_check_column_is_42804_and_changes_nothing() {
         &o,
         "INSERT INTO t (id, a, b) VALUES (1, 1, 1) USING OPERATION_ID 'a1'",
     );
-    for sql in [
-        "ALTER TABLE t ALTER COLUMN a TYPE TEXT",
-        "ALTER TABLE t ALTER COLUMN b TYPE INTEGER",
-        "ALTER TABLE t ALTER COLUMN b TYPE BIGINT",
-        "ALTER TABLE t ALTER COLUMN a TYPE DOUBLE PRECISION",
+    // 代入変換のある一般変換は、CHECK が参照する列では Issue #1637（依存オブジェクトの再構築）
+    // まで暫定の `0A000`（TABLE-40・Issue #1636）。同一型は従来どおり `42804`。
+    for (sql, expected) in [
+        ("ALTER TABLE t ALTER COLUMN a TYPE TEXT", "0A000"),
+        ("ALTER TABLE t ALTER COLUMN b TYPE INTEGER", "0A000"),
+        ("ALTER TABLE t ALTER COLUMN b TYPE BIGINT", "42804"),
+        (
+            "ALTER TABLE t ALTER COLUMN a TYPE DOUBLE PRECISION",
+            "0A000",
+        ),
     ] {
-        assert_eq!(code(&core, &o, sql), "42804", "{sql}");
+        assert_eq!(code(&core, &o, sql), expected, "{sql}");
     }
     assert_eq!(ints(&core, &o, "SELECT a FROM t LIMIT 10"), vec![1]);
     assert_eq!(

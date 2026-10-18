@@ -9,6 +9,14 @@
 
 ### Breaking Changes
 
+- `ALTER COLUMN TYPE` の全行書き換え（Issue #1636・TABLE-40 (1)(2)(5)・TASK-278）:
+  `USING <式>` 付きの変換と、代入変換（SQL-47）のある組の `USING` 省略変換（BIGINT→INTEGER・
+  NUMERIC の位取り変更・数値↔文字列等）を受理する。従来の `0A000`（USING 付き）・`42804`（縮小・異種）
+  から変わる。全テナント・全可視性の行を 1 つの write txn で書き換え、1 行でも変換に失敗
+  （`22P02`／`22003`／`22001`／`23502` 等）すれば表は不変で、エラー文言に値・テナント・行 id を含めない。
+  PK／UNIQUE／FK／CHECK／索引宣言／ビューが参照する列と DEFAULT を持つ列への一般変換は、Issue #1637
+  まで暫定の `0A000`（従来の受理経路は不変）。`USING <対象列>` は省略と同じ扱い。公開 API は
+  `Storage::alter_table_alter_column_type_collated` の引数追加（crate 内部）で、外部公開面の変更なし。
 - `ALTER TABLE ... ALTER COLUMN ... TYPE ... USING <式>` と `SET DATA TYPE`（Issue #1635・TABLE-40）:
   従来 `42601` だった構文を受理する。USING は旧スキーマで束縛・型検査し（未定義列 `42703`、
   代入変換不可 `42804`、組み込み以外の関数 `42601`）、通ったものは行の書き換え未実装のため

@@ -48,6 +48,7 @@ use crate::sql::allowlist::{
     classify_view_body, parse_view_body, SqlSurfaceError, StructuralOnlyLookup, TableLookup,
     ViewBodyCheck, ViewBodyKind,
 };
+use crate::sql::udf_call::Expr;
 // `RowInput` / `Visibility` は `insert_row_into_table` / `insert_rows_into_table` /
 // `insert_typed_row`（いずれも `#[cfg(test)]` 限定。Issue #1078）とユニットテストのみが
 // 使う。
@@ -1166,6 +1167,151 @@ fn delete_indexes_referencing_column_in_txn(
     })
 }
 
+/// 列型変換の一般変換（`AlterPlan::RewriteExpr`。TABLE-40・Issue #1636）が、依存オブジェクトを
+/// 持つ列を新しい経路で処理しないための暫定ゲート（fail-closed）。型付きの正準キー・旧型の
+/// DEFAULT／補完値・古い索引・ビューの束縛が新しい値と食い違う fail-open を避ける。
+/// 依存の再構築と解除は Issue #1637 の担当（そのとき本関数のゲートを外す）。
+///
+/// 依存あり: PK／UNIQUE／この表の FK（参照元）の構成列、他表の FK が参照先にする列、CHECK が
+/// 参照する列、索引宣言の構成列、ビューが参照する列、DEFAULT／補完値を持つ列。
+/// 呼び出し元は `CATALOG_TABLE` のハンドルを保持していない状態で呼ぶこと。
+fn column_has_alter_dependents_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    column_name: &str,
+) -> Result<bool> {
+    let Some(column) = schema.columns.iter().find(|c| c.name == column_name) else {
+        return Err(CatalogError::ColumnNotFound(column_name.to_string()));
+    };
+    if column.default_expr.is_some() || column.fill_value.is_some() {
+        return Ok(true);
+    }
+    if schema
+        .primary_key
+        .as_ref()
+        .is_some_and(|pk| pk.iter().any(|c| c == column_name))
+        || schema
+            .unique_constraints
+            .iter()
+            .any(|u| u.columns().iter().any(|c| c == column_name))
+        || schema_check_references_column(schema, column_name)
+        || schema
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.columns.iter().any(|c| c == column_name))
+    {
+        return Ok(true);
+    }
+    // 他表（自己参照を含む）の FK がこの表のこの列を参照先にしている。参照先列が未解決（空）の
+    // FK は主キーを指すため、保守的に依存ありとする。
+    if referencing_foreign_keys_in_txn(write_txn, table_name)?
+        .iter()
+        .any(|(_, fk)| {
+            fk.parent_columns.is_empty() || fk.parent_columns.iter().any(|c| c == column_name)
+        })
+    {
+        return Ok(true);
+    }
+    match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(index_table) => {
+            for (scanned, entry) in index_table.iter()?.enumerate() {
+                if scanned >= MAX_INDEX_COUNT {
+                    return Err(CatalogError::CorruptSchema(format!(
+                        "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                    )));
+                }
+                let (key, value) = entry?;
+                let def = decode_index_def(key.value(), value.value())?;
+                if def.table == table_name && def.columns.iter().any(|c| c == column_name) {
+                    return Ok(true);
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(CatalogError::from(e)),
+    }
+    match write_txn.open_table(VIEWS_TABLE) {
+        Ok(views_table) => {
+            let remaining: Vec<String> = ["id", "tenant_id", "visibility"]
+                .iter()
+                .map(|s| s.to_string())
+                .chain(
+                    schema
+                        .columns
+                        .iter()
+                        .filter(|c| c.name != column_name)
+                        .map(|c| c.name.clone()),
+                )
+                .collect();
+            if views_reference_column_in_txn(&views_table, table_name, &remaining)? {
+                return Ok(true);
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(CatalogError::from(e)),
+    }
+    Ok(false)
+}
+
+/// `alter_column_type_with` の `AlterPlan::RewriteExpr` 腕の本体（TABLE-40 (1)(2)(5)・
+/// Issue #1636）。呼び出し元の write txn 内で、依存ゲート（`0A000`）→ 旧スキーマへの束縛し直し
+/// （事前判定との TOCTOU を作らない）→ 全テナント・全可視性の全行の変換と再エンコード →
+/// 変更列を含む派生索引の失効（多層防御）→ スキーマの書き戻しを行う。変換・評価エラーは
+/// 固定文言（`sql::alter_using::redact_row_conversion_error`）で返し、commit しないため副作用はゼロ。
+/// 世代の bump と commit は呼び出し元が唯一の commit 点で行う。
+#[allow(clippy::too_many_arguments)]
+fn alter_column_type_rewrite_expr_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    column_name: &str,
+    using: Option<&Expr>,
+    old_schema: &TableSchema,
+    logical_index: usize,
+    new_ty: ColumnType,
+    new_collation: Option<crate::collation::Collation>,
+) -> std::result::Result<(), AlterCheckError> {
+    if column_has_alter_dependents_in_txn(write_txn, table_name, old_schema, column_name)? {
+        return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+            detail: "ALTER COLUMN TYPE with a value conversion is not supported yet for a column \
+                     with dependent indexes, constraints, views or defaults"
+                .to_string(),
+        }));
+    }
+    let conv =
+        crate::sql::alter_using::bind_alter_conversion(using, old_schema, logical_index, &new_ty)
+            .map_err(AlterCheckError::Sql)?;
+    let mut schema = old_schema.clone();
+    {
+        let column = schema
+            .columns
+            .get_mut(logical_index)
+            .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+        column.ty = new_ty;
+        column.collation = new_collation;
+    }
+    match crate::column_rewrite::rewrite_rows_with_conversion_in_txn(
+        write_txn,
+        table_name,
+        old_schema,
+        &schema,
+        logical_index,
+        &conv,
+    )? {
+        crate::column_rewrite::ConversionOutcome::Done => {}
+        crate::column_rewrite::ConversionOutcome::Failed(e) => return Err(AlterCheckError::Sql(e)),
+    }
+    crate::key_index::drop_indexes_containing_column_in_txn(write_txn, table_name, column_name)?;
+    let encoded = encode_schema(&schema)?;
+    let mut table = write_txn
+        .open_table(CATALOG_TABLE)
+        .map_err(CatalogError::from)?;
+    table
+        .insert(table_name, encoded.as_slice())
+        .map_err(CatalogError::from)?;
+    Ok(())
+}
+
 /// カタログのテキスト形式フォーマットバージョン識別子。値の追加・変更は
 /// 破壊的変更として扱い、この値を更新する。旧バージョンの読み出しは
 /// マイグレーションを提供せず fail-closed に拒否する
@@ -2018,6 +2164,11 @@ pub(crate) enum AlterPlan {
     ValidateSmallIntRange,
     /// 全テナントの既存行を再エンコードする。
     Rewrite(crate::column_rewrite::WideningKind),
+    /// `USING` 式または代入変換で全行を書き換える一般変換（TABLE-40・Issue #1636）。
+    /// 束縛は write txn 内でやり直す（[`Storage::alter_column_type_with`] の `RewriteExpr` 腕）。
+    /// 依存する索引・制約・ビュー・DEFAULT の再構築は Issue #1637 の担当のため、それらを持つ列は
+    /// `0A000` で fail-closed する（#1637 で解除）。
+    RewriteExpr,
 }
 
 /// 文字列系の列型変換（`TEXT`／`VARCHAR`／`VARCHAR(n)`／`CHAR(n)`。TABLE-19・TABLE-31・
@@ -10252,7 +10403,7 @@ impl Storage {
         column_name: &str,
         new_precision: u8,
     ) -> Result<()> {
-        self.alter_column_type_with(table_name, column_name, |col| {
+        self.alter_column_type_with(table_name, column_name, None, |col| {
             let current = &col.ty;
             let (old_precision, old_scale) = match current {
                 ColumnType::Numeric { precision, scale } => (*precision, *scale),
@@ -10321,7 +10472,7 @@ impl Storage {
         column_name: &str,
         target: &ColumnType,
     ) -> std::result::Result<(), AlterCheckError> {
-        self.alter_table_alter_column_type_collated(table_name, column_name, target, None)
+        self.alter_table_alter_column_type_collated(table_name, column_name, target, None, None)
     }
 
     /// [`Self::alter_table_alter_column_type`] に照合（`... TYPE <型> COLLATE <名前>`。
@@ -10337,6 +10488,7 @@ impl Storage {
         column_name: &str,
         target: &ColumnType,
         collation: Option<crate::collation::Collation>,
+        using: Option<&Expr>,
     ) -> std::result::Result<(), AlterCheckError> {
         if let ColumnType::Numeric { precision, scale } = target {
             validate_numeric_precision_scale(*precision, *scale)?;
@@ -10347,12 +10499,31 @@ impl Storage {
             )
             .into());
         }
-        self.alter_column_type_with(table_name, column_name, |col| {
-            if col.ty == *target && col.collation != collation {
-                return Ok((target.clone(), collation, AlterPlan::CatalogOnly));
+        self.alter_column_type_with(table_name, column_name, using, |col| {
+            // `USING` 省略と `USING <対象列>` は同じ（行の値をそのまま代入変換する）。それ以外の
+            // 式は、同じ型への変更でも既存の経路へ流さず必ず一般変換で評価する（式を無視する
+            // fail-open を作らない）。
+            let plain =
+                using.is_none_or(|e| crate::sql::alter_using::is_identity_using(e, column_name));
+            if plain {
+                if col.ty == *target && col.collation != collation {
+                    return Ok((target.clone(), collation, AlterPlan::CatalogOnly));
+                }
+                match Self::decide_alter_type(&col.ty, column_name, target) {
+                    Ok((new_ty, plan)) => return Ok((new_ty, collation, plan)),
+                    // 同一型・規則表の外（VECTOR・ENUM）・代入変換が無い組は従来の拒否（`42804`）。
+                    // 事前判定（`sql::ddl`）と同じ判定を txn 内でもう一度行う（TOCTOU 対策）。
+                    Err(e) => {
+                        let convertible = col.ty != *target
+                            && crate::sql::cast::column_assignment_convertible(&col.ty, target)
+                                == Some(true);
+                        if !convertible {
+                            return Err(e);
+                        }
+                    }
+                }
             }
-            let (new_ty, plan) = Self::decide_alter_type(&col.ty, column_name, target)?;
-            Ok((new_ty, collation, plan))
+            Ok((target.clone(), collation, AlterPlan::RewriteExpr))
         })
     }
 
@@ -10444,6 +10615,7 @@ impl Storage {
         &self,
         table_name: &str,
         column_name: &str,
+        using: Option<&Expr>,
         decide: impl FnOnce(
             &ColumnDef,
         )
@@ -10456,7 +10628,15 @@ impl Storage {
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let mut revalidate_schema: Option<TableSchema> = None;
-        {
+        // `RewriteExpr` のとき、カタログのハンドルを手放した後で処理するための持ち越し
+        // （旧スキーマ・変更列の論理 index・新しい型・新しい照合）。
+        let mut expr_rewrite: Option<(
+            TableSchema,
+            usize,
+            ColumnType,
+            Option<crate::collation::Collation>,
+        )> = None;
+        'apply: {
             let mut table = write_txn
                 .open_table(CATALOG_TABLE)
                 .map_err(CatalogError::from)?;
@@ -10480,6 +10660,10 @@ impl Storage {
                 .get_mut(logical_index)
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
             let (new_ty, new_collation, plan) = decide(column)?;
+            if matches!(plan, AlterPlan::RewriteExpr) {
+                expr_rewrite = Some((old_schema, logical_index, new_ty, new_collation));
+                break 'apply;
+            }
             // SMALLINT への縮小では列 DEFAULT も範囲内であること。`ADD COLUMN ... NOT NULL
             // DEFAULT` の列は既存行にバイトが無く読み出し時に DEFAULT で補われるため、
             // 行の走査だけでは範囲外の DEFAULT を見逃す（Issue #1560）。
@@ -10644,6 +10828,18 @@ impl Storage {
             ) {
                 revalidate_schema = Some(schema);
             }
+        }
+        if let Some((old_schema, logical_index, new_ty, new_collation)) = expr_rewrite {
+            alter_column_type_rewrite_expr_in_txn(
+                &write_txn,
+                table_name,
+                column_name,
+                using,
+                &old_schema,
+                logical_index,
+                new_ty,
+                new_collation,
+            )?;
         }
         // 文字列系の変換は値を変えうる（`'ab'` と `'ab '` が `CHAR(3)` で同値になる・rtrim で
         // FK の一致関係が変わる）ため、新スキーマで PK／UNIQUE の重複と FOREIGN KEY の型照合・
@@ -14058,13 +14254,22 @@ mod tests {
         storage
             .alter_table_add_column("docs", ColumnDef::new("amt", numeric(5, 3), true))
             .expect("re-add with other scale");
-        let err = storage
+        // 現在の scale（3）に対して判定される。scale の変更は代入変換のある一般変換として
+        // 受理される（TABLE-40・Issue #1636）。古い scale（2）の同一 scale 拡大として
+        // カタログだけを書き換えると、再追加後の列の値表現を取り違える。
+        storage
             .alter_table_alter_column_type("docs", "amt", &numeric(10, 2))
-            .expect_err("scale mismatch must be rejected");
-        assert!(matches!(
-            err,
-            AlterCheckError::Catalog(CatalogError::IncompatibleTypeChange { .. })
-        ));
+            .expect("scale change is a value conversion");
+        assert_eq!(
+            storage
+                .get_table_schema("docs")
+                .expect("schema")
+                .columns
+                .iter()
+                .find(|c| c.name == "amt")
+                .map(|c| c.ty.clone()),
+            Some(numeric(10, 2))
+        );
         // 範囲不正は互換性判定より先に Invalid。
         let err = storage
             .alter_table_alter_column_type("docs", "amt", &numeric(5, 6))
@@ -17488,16 +17693,14 @@ mod tests {
             storage.table_generation("docs").expect("generation"),
             generation
         );
-        // BIGINT→INTEGER は引き続き拒否（TABLE-40 の担当）。
+        // BIGINT→INTEGER は代入変換のある縮小として全行を検査して受理する
+        // （TABLE-40・Issue #1636。範囲外の行があれば `22003` で表は不変）。
         storage
             .alter_table_alter_column_type("docs", "n", &ColumnType::BigInt)
             .expect("widen");
-        assert!(matches!(
-            storage.alter_table_alter_column_type("docs", "n", &ColumnType::Integer),
-            Err(AlterCheckError::Catalog(
-                CatalogError::IncompatibleTypeChange { .. }
-            ))
-        ));
+        storage
+            .alter_table_alter_column_type("docs", "n", &ColumnType::Integer)
+            .expect("narrowing with an assignment cast");
     }
 
     /// 行ストア未作成（既存行 0 件）のテーブルでも拡大変換は成功する（Issue #1361）。

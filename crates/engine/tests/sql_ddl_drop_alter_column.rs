@@ -213,14 +213,8 @@ fn alter_type_error_contract() {
         ("ALTER TABLE docs ALTER COLUMN missing TYPE TEXT", "42703"),
         ("ALTER TABLE docs ALTER COLUMN note TYPE INTEGER", "42804"),
         ("ALTER TABLE docs ALTER COLUMN note TYPE TEXT", "42804"),
-        (
-            "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(4,2)",
-            "42804",
-        ),
-        (
-            "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(10,3)",
-            "42804",
-        ),
+        // NUMERIC の精度縮小・位取り変更は代入変換のある一般変換として受理される
+        // （TABLE-40・Issue #1636。成功系は sql_alter_column_type_rewrite.rs）。
         (
             "ALTER TABLE docs ALTER COLUMN embedding TYPE VECTOR(3)",
             "42804",
@@ -243,9 +237,10 @@ fn alter_type_error_contract() {
         // 予約名。
         ("ALTER TABLE docs ALTER COLUMN id TYPE TEXT", "42601"),
         ("ALTER TABLE docs ALTER COLUMN TENANT_ID TYPE TEXT", "42601"),
-        // CHECK が参照する列でも、非互換な型変更は 42804（拡大変換の BIGINT 化は
-        // Issue #1427 で受理。成功系は sql_alter_column_type_check_columns.rs）。
-        ("ALTER TABLE checked ALTER COLUMN a TYPE TEXT", "42804"),
+        // CHECK が参照する列への一般変換は、Issue #1637（依存オブジェクトの再構築）まで暫定の
+        // `0A000`（TABLE-40・Issue #1636。拡大変換の BIGINT 化は Issue #1427 で受理。成功系は
+        // sql_alter_column_type_check_columns.rs）。
+        ("ALTER TABLE checked ALTER COLUMN a TYPE TEXT", "0A000"),
     ] {
         assert_eq!(code_of(&core, &mut session, sql), code, "{sql}");
     }
@@ -374,36 +369,34 @@ fn unsupported_qualifiers_are_rejected_with_42601() {
     }
 }
 
-/// TABLE-40・Issue #1635: `SET DATA TYPE` は `TYPE` と同義で受理し、`USING` 付きは束縛・型検査
-/// 後に `0A000`（行の書き換えは Issue #1636 の担当）。
+/// TABLE-40・Issue #1635・#1636: `SET DATA TYPE` は `TYPE` と同義で受理し、`USING` 付きは束縛・型検査
+/// 後に全行を書き換えて受理する（`USING <対象列>` は省略と同じ扱い）。
 #[test]
-fn set_data_type_is_accepted_and_using_is_not_supported_yet() {
+fn set_data_type_is_accepted_and_using_is_applied() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
-    assert_eq!(
-        code_of(
-            &core,
-            &mut session,
-            "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING amount"
-        ),
-        "0A000"
-    );
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING amount",
+    )
+    .expect("USING <column> is the same as omitted");
     // 引用なしの NULL・true・false は列名ではなくリテラルとして束縛・型検査を通る
     // （列参照扱いの `42703` にならない）。
     for sql in [
-        "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING NULL",
-        "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(9,2) USING true::int",
+        "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(10,2) USING NULL",
+        "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(11,2) USING true::int",
         "ALTER TABLE docs ALTER COLUMN amount TYPE BOOLEAN USING false",
     ] {
-        assert_eq!(code_of(&core, &mut session, sql), "0A000", "{sql}");
+        run(&core, &mut session, sql).unwrap_or_else(|e| panic!("{sql} must succeed: {e:?}"));
     }
     run(
         &core,
         &mut session,
-        "ALTER TABLE docs ALTER COLUMN amount SET DATA TYPE NUMERIC(9,2)",
+        "ALTER TABLE docs ALTER COLUMN note SET DATA TYPE VARCHAR(20)",
     )
-    .expect("SET DATA TYPE widening");
+    .expect("SET DATA TYPE");
 }
 
 /// TABLE-28・Issue #1609: `COLLATE` は構文対応済み。未知の照合名は `42704`（照合名の
@@ -615,7 +608,7 @@ fn alter_type_widening_rewrites_rows_of_every_tenant_and_keeps_isolation() {
 }
 
 #[test]
-fn alter_type_non_widening_numeric_changes_stay_42804_and_leave_data_intact() {
+fn alter_type_numeric_conversions_apply_assignment_casts_and_same_type_stays_42804() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
@@ -638,23 +631,30 @@ fn alter_type_non_widening_numeric_changes_stay_42804_and_leave_data_intact() {
     )
     .expect("add double");
     insert(&core, 1, "qty, big, r, d", "7, 8, 1.5, 2.5");
+    // 同一型への変更は従来どおり 42804。
     for sql in [
-        "ALTER TABLE docs ALTER COLUMN big TYPE INTEGER",
-        "ALTER TABLE docs ALTER COLUMN d TYPE REAL",
         "ALTER TABLE docs ALTER COLUMN qty TYPE INTEGER",
         "ALTER TABLE docs ALTER COLUMN r TYPE REAL",
-        "ALTER TABLE docs ALTER COLUMN r TYPE BIGINT",
-        "ALTER TABLE docs ALTER COLUMN qty TYPE DOUBLE PRECISION",
     ] {
         assert_eq!(code_of(&core, &mut session, sql), "42804", "{sql}");
     }
+    // 代入変換のある縮小・異種変換は全行を変換して受理する（TABLE-40・Issue #1636）。
+    for sql in [
+        "ALTER TABLE docs ALTER COLUMN big TYPE INTEGER",
+        "ALTER TABLE docs ALTER COLUMN d TYPE REAL",
+        "ALTER TABLE docs ALTER COLUMN r TYPE BIGINT",
+        "ALTER TABLE docs ALTER COLUMN qty TYPE DOUBLE PRECISION",
+    ] {
+        run(&core, &mut session, sql).unwrap_or_else(|e| panic!("{sql} must succeed: {e:?}"));
+    }
     assert!(matches!(
         select_cells(&core, &ctx(), "qty")[0],
-        Cell::SignedInteger(7)
+        Cell::Float(f) if f == 7.0
     ));
+    // REAL 1.5 → BIGINT は偶数丸め（2）。
     assert!(matches!(
         select_cells(&core, &ctx(), "r")[0],
-        Cell::Float(f) if f == 1.5
+        Cell::SignedInteger(2)
     ));
 }
 
