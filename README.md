@@ -87,6 +87,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-table-columns <1-256>] [--max-array-elements <1-1024>] [--max-enum-labels <1-256>] \
   [--max-scanned-rows <1-1000000>] \
   [--max-group-by-columns <1-8>] [--max-groups <1-10000>] \
+  [--max-temp-tables <1-64>] [--max-temp-bytes <1-67108864>] \
   [--max-jsonpath-steps <1-4000000>] [--max-jsonpath-depth <1-1024>] \
   [--max-subquery-depth <1-4>] [--max-subquery-executions <1-16>] \
   [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] \
@@ -351,6 +352,13 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 パーティション上限はハード上限のままです。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で
 起動エラーです。上限を引き上げることはできません
 （詳細: [docs/design/group-by-limits-cli.md](docs/design/group-by-limits-cli.md)）。
+
+`--max-temp-tables <N>`（既定 64・範囲 `1`〜`64`）・`--max-temp-bytes <N>`（既定 67,108,864・範囲
+`1`〜`67,108,864`）（Issue #1683・TABLE-44）は、一時表（`CREATE TEMP TABLE`）の 1 セッション（接続）あたりの
+件数と論理総バイト数の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は
+既定のハード上限と同じ値で、挙動は変わりません。メモリの最悪値は「最大接続数 × バイト上限」です）。
+超過時の SQLSTATE は `54000` です。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で
+起動エラーです。上限を引き上げることはできません（詳細: [docs/design/temp-table.md](docs/design/temp-table.md)）。
 
 `--max-jsonpath-steps <N>`（既定 4,000,000・範囲 `1`〜`4,000,000`）・`--max-jsonpath-depth <N>`（既定 1,024・
 範囲 `1`〜`1,024`）（Issue #2184・TABLE-25）は、jsonpath 評価器の評価ステップ数と再帰深さの上限を、

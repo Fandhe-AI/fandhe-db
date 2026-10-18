@@ -1180,6 +1180,9 @@ pub struct EngineCore {
     /// [`Self::with_group_by_limits`] のみ（起動時 1 回）。集計の実行段
     /// （単一表・集合演算枝・サブクエリ内側・ビュー外側・JOIN）にだけ効く。
     group_by_limits: crate::group_by_limits::GroupByLimits,
+    /// 一時表のセッションあたりの件数・総バイト数の上限（TABLE-44・Issue #1683）。差し替えは
+    /// [`Self::with_temp_table_limits`] のみ（起動時 1 回）。`CREATE TEMP TABLE` の実行段にだけ効く。
+    temp_table_limits: crate::temp_table_limits::TempTableLimits,
     /// jsonpath 評価のステップ数・再帰深さの上限（Issue #2184・TABLE-25 ポインタ）。
     /// 差し替えは [`Self::with_jsonpath_limits`] のみ（起動時 1 回）。SQL 表層の `jsonb_path_*`
     /// （Issue #2185）は、文実行入口が張る `JsonPathLimitsScope` 経由で束縛時にこの値を焼き込む。
@@ -1540,6 +1543,12 @@ pub enum ParsedSql {
     /// 更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードがあれば
     /// 追随が必要。
     CreateTable(crate::sql::allowlist::ValidatedCreateTable),
+    /// `CREATE [GLOBAL|LOCAL] {TEMP|TEMPORARY} TABLE ... [ON COMMIT ...]`
+    /// （TABLE-44・Issue #1683）。永続表の [`CreateTable`](Self::CreateTable) とは別 variant
+    /// にして、確認漏れが「一時表の定義が全テナント共有の永続表になる」fail-open にならないよう、
+    /// 網羅 `match` をコンパイル時に強制する。DDL 実行権限ゲートの対象外（セッション内で閉じる）。
+    /// 実行は `EngineCore::execute_parsed_in_session` の本 variant の分岐が担う。
+    CreateTempTable(crate::sql::allowlist::ValidatedCreateTempTable),
     /// `DECLARE`/`FETCH`/`CLOSE`（カーソル。WIRE-15・TASK-218）。トランザクション
     /// 文脈を持たない [`EngineCore::execute_parsed_in_session`] はこの variant を
     /// `DECLARE` なら `25P01`（`NoActiveSqlTransaction`）、`FETCH`／`CLOSE` なら
@@ -1660,6 +1669,7 @@ fn statement_clock_scope(
         | ParsedSql::Transaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
+        | ParsedSql::CreateTempTable(_)
         | ParsedSql::Cursor(_)
         | ParsedSql::Partitioned(_)
         | ParsedSql::AlterTable(_)
@@ -1702,6 +1712,7 @@ fn insert_default_clock_scope(
         | ParsedSql::Transaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
+        | ParsedSql::CreateTempTable(_)
         | ParsedSql::Cursor(_)
         | ParsedSql::Partitioned(_)
         | ParsedSql::AlterTable(_)
@@ -2293,6 +2304,7 @@ impl EngineCore {
             schema_limits: crate::schema_limits::SchemaLimits::default(),
             scan_limits: crate::scan_limits::ScanLimits::default(),
             group_by_limits: crate::group_by_limits::GroupByLimits::default(),
+            temp_table_limits: crate::temp_table_limits::TempTableLimits::default(),
             jsonpath_limits: crate::jsonpath_limits::JsonPathLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             join_limits: crate::join_limits::JoinSizeLimits::default(),
@@ -2563,6 +2575,23 @@ impl EngineCore {
     /// 現在の `GROUP BY` 上限（Issue #1550）。
     pub fn group_by_limits(&self) -> crate::group_by_limits::GroupByLimits {
         self.group_by_limits
+    }
+
+    /// 一時表の件数・総バイト数上限（[`crate::temp_table_limits::TempTableLimits`]）を
+    /// 差し替えたビルダーを返す（TABLE-44・Issue #1683）。`wire-server` の起動時 CLI フラグ
+    /// （`--max-temp-tables`・`--max-temp-bytes`）からのみ呼ぶ。未呼び出しならハード上限と
+    /// 同値の既定（現行挙動）。
+    pub fn with_temp_table_limits(
+        mut self,
+        limits: crate::temp_table_limits::TempTableLimits,
+    ) -> Self {
+        self.temp_table_limits = limits;
+        self
+    }
+
+    /// 現在の一時表上限（TABLE-44・Issue #1683）。
+    pub fn temp_table_limits(&self) -> crate::temp_table_limits::TempTableLimits {
+        self.temp_table_limits
     }
 
     /// jsonpath 評価のステップ数・再帰深さ上限（[`crate::jsonpath_limits::JsonPathLimits`]）を
@@ -3763,7 +3792,18 @@ impl EngineCore {
                     || name.eq_ignore_ascii_case("COMMIT")
                     || name.eq_ignore_ascii_case("ROLLBACK")
         );
-        if !txn_control_head && crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
+        // TABLE-44・Issue #1683: 次の 3 種は一時表の行を読み書きしないためトークン走査を飛ばす。
+        // `CREATE [TEMP] TABLE` は列定義だけで（FOREIGN KEY の参照先が一時表の名前なら実行段が
+        // `42P16`／`0A000`）、`DROP TABLE` は実行段が自セッションの一時カタログで名前を解決する。
+        let is_drop_table = matches!(tokens.first(), Some(crate::sql::lexer::Token::Ident(a)) if a.eq_ignore_ascii_case("DROP"))
+            && matches!(tokens.get(1), Some(crate::sql::lexer::Token::Ident(b)) if b.eq_ignore_ascii_case("TABLE"));
+        let scan_exempt = is_drop_table
+            || crate::sql::allowlist::is_create_table_statement(&tokens)
+            || crate::sql::allowlist::is_create_temp_table_statement(&tokens);
+        if !txn_control_head
+            && !scan_exempt
+            && crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp)
+        {
             return Err(crate::sql::temp_catalog::temp_table_unsupported());
         }
         let hit = std::cell::Cell::new(false);
@@ -3789,7 +3829,19 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         parsed: &ParsedSql,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-        if session.temp_tables().is_empty() || matches!(parsed, ParsedSql::Transaction(_)) {
+        // TABLE-44・Issue #1683: トランザクション制御に加え、一時表の行を読み書きしない
+        // `CREATE [TEMP] TABLE`・`DROP TABLE` を通す（実行段がセッションの一時カタログで
+        // 名前を解決する）。これらを通さないと、一時表を作った直後のセッションが拡張クエリで
+        // 一時表の `DROP` も永続表の DDL も実行できなくなる。
+        if session.temp_tables().is_empty()
+            || matches!(
+                parsed,
+                ParsedSql::Transaction(_)
+                    | ParsedSql::CreateTable(_)
+                    | ParsedSql::CreateTempTable(_)
+                    | ParsedSql::DropTable(_)
+            )
+        {
             return Ok(());
         }
         Err(crate::sql::temp_catalog::temp_table_unsupported())
@@ -4139,6 +4191,12 @@ impl EngineCore {
         if crate::sql::allowlist::is_create_table_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_table_tokens(&tokens)?;
             return Ok(ParsedSql::CreateTable(stmt));
+        }
+        // TABLE-44・Issue #1683: `CREATE [GLOBAL|LOCAL] TEMP|TEMPORARY TABLE` は永続表の
+        // `CreateTable` とは別 variant へ束縛する（カタログ照会なしの構造検証のみ）。
+        if crate::sql::allowlist::is_create_temp_table_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_temp_table_tokens(&tokens)?;
+            return Ok(ParsedSql::CreateTempTable(stmt));
         }
 
         // TASK-202（SQL-23。Issue #900）: `ALTER TABLE ... ADD COLUMN ...` は
@@ -4695,6 +4753,24 @@ impl EngineCore {
         session: &mut crate::sql::mode::SessionState,
         parsed: &ParsedSql,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let outcome = self.execute_parsed_statement(ctx, session, parsed)?;
+        // 自動コミットの文が成功した直後に、一時表の `ON COMMIT` 動作を適用する
+        // （TABLE-44・Issue #1683。失敗した文では適用しない。明示・暗黙トランザクションの
+        // COMMIT は `sql::transaction::commit_active` が適用する）。
+        if !matches!(parsed, ParsedSql::Transaction(_)) {
+            session.apply_temp_on_commit()?;
+        }
+        Ok(outcome)
+    }
+
+    /// [`Self::execute_parsed_in_session_inner`] の本体（文の種類ごとの実行。`ON COMMIT` の
+    /// 適用は呼び出し元が行う）。
+    fn execute_parsed_statement(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        parsed: &ParsedSql,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // SQL-37（Issue #1586）: autocommit の読み取り文は文の開始時刻を `now()` 系の
         // 値として確定する（`now()` と `statement_timestamp()` は同値）。
         let _clock_scope = statement_clock_scope(parsed, None)?;
@@ -4833,6 +4909,24 @@ impl EngineCore {
             // 参照）。`ctx`（テナント境界）は `Storage::drop_table` が取らない
             // ため未使用のまま——`DROP TABLE` はテナントスコープの操作ではない。
             ParsedSql::DropTable(stmt) => {
+                // TABLE-44・Issue #1683: 名前がすべて自セッションの一時表なら、DDL 権限ゲートの
+                // 対象外で一時表を削除する。一時表と永続表の混在は、2 つのストアにまたがる原子的な
+                // 削除ができないため `0A000`（fail-closed）。判定は自セッションの一時カタログだけ
+                // で決まり、永続表の存否は観測できない。
+                match crate::sql::ddl::classify_drop_targets(session, &stmt.table_names) {
+                    Some(true) => {
+                        let outcome = crate::sql::ddl::execute_drop_temp_tables(session, stmt)?;
+                        return Ok(crate::sql::SqlOutcome::DropTable(outcome));
+                    }
+                    Some(false) => {}
+                    None => {
+                        return Err(
+                            crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                                "DROP TABLE cannot mix temporary and permanent tables",
+                            ),
+                        );
+                    }
+                }
                 crate::sql::ddl::require_ddl_permission(session)?;
                 let outcome = crate::sql::ddl::execute_drop_table(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropTable(outcome))
@@ -4844,10 +4938,36 @@ impl EngineCore {
             // ため未使用のまま——`CREATE TABLE` はテナントスコープの操作ではない。
             ParsedSql::CreateTable(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
+                // TABLE-44・Issue #1683: 永続表の FOREIGN KEY がこのセッションの一時表の名前に
+                // 解決される場合は `42P16`（永続表は一時表を参照できない）。同名の永続表を
+                // 黙って参照する fail-open を避ける。
+                if stmt
+                    .foreign_keys
+                    .iter()
+                    .any(|fk| session.temp_tables().contains(fk.parent_table()))
+                {
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::invalid_table_definition(
+                            stmt.table_name.clone(),
+                        ),
+                    );
+                }
                 let outcome = crate::sql::ddl::execute_create_table(
                     &self.storage,
                     stmt,
                     &self.schema_limits,
+                )?;
+                Ok(crate::sql::SqlOutcome::CreateTable(outcome))
+            }
+            // TABLE-44・Issue #1683: 一時表の作成は DDL 実行権限ゲートの対象外（セッション内で
+            // 閉じる）。永続カタログには触れず、セッションの一時カタログへ登録する。
+            ParsedSql::CreateTempTable(stmt) => {
+                let outcome = crate::sql::ddl::execute_create_temp_table(
+                    session,
+                    ctx.tenant_id(),
+                    stmt,
+                    &self.schema_limits,
+                    self.temp_table_limits,
                 )?;
                 Ok(crate::sql::SqlOutcome::CreateTable(outcome))
             }
@@ -5890,7 +6010,7 @@ impl EngineCore {
             // `CREATE TABLE`（Issue #899）も同じく `CommandComplete` のみを返す
             // DDL のため結果列を持たない。DDL 実行権限判定・カタログへの反映は
             // 一切行わない（Describe は本体を実行しない契約）。
-            ParsedSql::CreateTable(_) => Ok(None),
+            ParsedSql::CreateTable(_) | ParsedSql::CreateTempTable(_) => Ok(None),
             // `ALTER TABLE ADD COLUMN`（TASK-202・SQL-23。Issue #900）も
             // `CommandComplete` のみを返す DDL のため結果列を持たない。DDL 実行
             // 権限判定・カタログへの反映は一切行わない（Describe は本体を実行

@@ -152,6 +152,7 @@ pub mod search_engine_opt;
 pub mod server;
 pub mod simple_query;
 pub mod surface;
+pub mod temp_table_limits_opt;
 pub mod tls;
 pub mod tls_opt;
 pub mod transaction_limits_opt;

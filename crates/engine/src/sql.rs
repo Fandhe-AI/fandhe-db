@@ -176,6 +176,8 @@ pub(crate) mod set_expr;
 pub(crate) mod temp_catalog;
 #[cfg(test)]
 mod temp_catalog_tests;
+#[cfg(test)]
+mod temp_on_commit_tests;
 pub(crate) mod temp_rows;
 #[cfg(test)]
 mod temp_rows_tests;

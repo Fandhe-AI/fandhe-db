@@ -51,8 +51,8 @@ use crate::sql::allowlist::{
     ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
     ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
     ValidatedAlterTableRenameColumn, ValidatedAlterTableRenameTable, ValidatedCreateIndex,
-    ValidatedCreateTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
-    ValidatedDropTable, ValidatedDropType, ValidatedDropView,
+    ValidatedCreateTable, ValidatedCreateTempTable, ValidatedCreateType, ValidatedCreateView,
+    ValidatedDropIndex, ValidatedDropTable, ValidatedDropType, ValidatedDropView,
 };
 use crate::sql::ddl_column_type::{
     alias_spelling, to_static_column_type_with_array_default, SqlColumnTypeName, StaticColumnType,
@@ -77,39 +77,16 @@ pub(crate) fn require_ddl_permission(session: &SessionState) -> Result<(), SqlSu
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CreateTableOutcome {}
 
-/// 構造検証済みの `CREATE TABLE`（[`ValidatedCreateTable`]）をカタログへ反映する
-/// （SQL-23・TASK-85・TABLE-4）。実行本体は既存の [`Storage::create_table`]
-/// （単一 write トランザクション内で存在確認・挿入・世代進行・commit を行う。
-/// TOCTOU なし）にそのまま委譲し、第 2 の DDL 実行器を作らない。
-///
-/// `CatalogError` の写像:
-/// - `TableAlreadyExists` → [`SqlSurfaceError::DuplicateTable`]（`42P07`）
-/// - `Invalid`（列数・`VECTOR` 列複数宣言等の意味論的不正。列数・識別子形状の
-///   大半は [`crate::sql::allowlist::validate_create_table_tokens`] が構造検証
-///   段階で既に拒否済みのため、ここに到達するのは主に `VECTOR` の次元範囲・
-///   複数 `VECTOR` 列宣言）→ [`SqlSurfaceError::unsupported`]（`42601`）
-/// - `WriteLockTimeout`（書き込みゲートの待機上限超過。SQL-31）→
-///   `SqlSurfaceError::LockNotAvailable`（`55P03`）
-/// - その他（`redb` I/O 等）→ `SqlSurfaceError::Internal`（`XX000`。詳細を
-///   クライアントへ渡さない。security.md「情報漏えい」対応）
-pub(crate) fn execute_create_table(
-    storage: &Storage,
+/// `CREATE TABLE`／`CREATE TEMP TABLE` が共有する、ストレージへ書く前のスキーマ構築
+/// （列数上限・配列要素数・ENUM 解決・COLLATE・既定値の正規化と束縛・各種制約）。
+/// 永続表の挙動とエラーの順序は切り出し前と同一。`storage` が `None` の場合
+/// （`CREATE TEMP TABLE`。TABLE-44・Issue #1683）は永続カタログを一切参照しない:
+/// ENUM 列は構文段が `0A000` で拒否済みで、ここへ来た場合も `0A000`（多層防御）。
+pub(crate) fn build_table_schema(
+    storage: Option<&Storage>,
     validated: &ValidatedCreateTable,
     limits: &SchemaLimits,
-) -> Result<CreateTableOutcome, SqlSurfaceError> {
-    // `IF NOT EXISTS`（TABLE-36、Issue #1613）。同名の関係（表・ビュー・索引）が既にあれば、
-    // 定義の意味検証（列数・型解決・DEFAULT 等）より前に何もせず成功を返す（定義は比較しない）。
-    // 権限ゲート（`42501`）は呼び出し元で通過済みのため存在オラクルにならない。最終判定は
-    // 下の `create_table` の書き込みトランザクションで、競合時の `TableAlreadyExists` も no-op に写す。
-    if validated.if_not_exists
-        && storage
-            .relation_name_exists(&validated.table_name)
-            .map_err(|_| SqlSurfaceError::Internal {
-                detail: "internal error".to_string(),
-            })?
-    {
-        return Ok(CreateTableOutcome {});
-    }
+) -> Result<TableSchema, SqlSurfaceError> {
     // 起動時設定 `--max-table-columns`（Issue #1548）。構文段の上限（ハード上限）は
     // 変えず、定義が増えるここでだけ設定値と比較する（decode 経路には入れない）。
     // カタログを参照しない判定のため存在オラクルにならず、storage 呼び出しより前に
@@ -123,8 +100,10 @@ pub(crate) fn execute_create_table(
     // DDL 権限ゲート（`core.rs` の `require_ddl_permission`）の後のここでのみ行い、
     // 未登録は `ADD COLUMN` と同じ `42704`（Issue #2306）。解決から `create_table` までの間に
     // `DROP TYPE` が割り込んだ場合も `create_table` 側の `TypeNotFound` を `42704` へ写す。
-    for alias in &validated.alias_type_names {
-        reject_alias_enum_collision(storage, alias)?;
+    if let Some(storage) = storage {
+        for alias in &validated.alias_type_names {
+            reject_alias_enum_collision(storage, alias)?;
+        }
     }
     let mut columns = validated.columns.clone();
     for column in &mut columns {
@@ -142,11 +121,14 @@ pub(crate) fn execute_create_table(
             }
         }
         if let ColumnType::Enum(def) = &column.ty {
-            column.ty = ColumnType::Enum(resolve_enum_type(storage, def.name())?);
+            column.ty = ColumnType::Enum(resolve_enum_type(
+                require_enum_storage(storage)?,
+                def.name(),
+            )?);
         } else if let ColumnType::Array(array_ty) = &column.ty {
             // `<enum>[]` 列（Issue #1357）も同様に登録済みの語彙へ差し替える。
             if let Some(def) = array_ty.enum_def() {
-                let resolved = resolve_enum_type(storage, def.name())?;
+                let resolved = resolve_enum_type(require_enum_storage(storage)?, def.name())?;
                 let array = crate::catalog::ArrayType::new_enum(resolved, array_ty.max_len())
                     .and_then(|a| a.with_ndims(array_ty.ndims()))
                     .map_err(|e| {
@@ -210,6 +192,51 @@ pub(crate) fn execute_create_table(
     if !validated.foreign_keys.is_empty() {
         schema = schema.with_foreign_keys(validated.foreign_keys.clone());
     }
+    Ok(schema)
+}
+
+/// ENUM 解決に使う永続ストレージ。一時表の定義（`storage` なし）に ENUM が残っていた場合は
+/// `0A000`（一時表は永続カタログの型依存を追跡できないため。fail-closed）。
+fn require_enum_storage(storage: Option<&Storage>) -> Result<&Storage, SqlSurfaceError> {
+    storage.ok_or_else(|| {
+        SqlSurfaceError::feature_not_supported("ENUM columns are not supported in temporary tables")
+    })
+}
+
+/// 構造検証済みの `CREATE TABLE`（[`ValidatedCreateTable`]）をカタログへ反映する
+/// （SQL-23・TASK-85・TABLE-4）。実行本体は既存の [`Storage::create_table`]
+/// （単一 write トランザクション内で存在確認・挿入・世代進行・commit を行う。
+/// TOCTOU なし）にそのまま委譲し、第 2 の DDL 実行器を作らない。
+///
+/// `CatalogError` の写像:
+/// - `TableAlreadyExists` → [`SqlSurfaceError::DuplicateTable`]（`42P07`）
+/// - `Invalid`（列数・`VECTOR` 列複数宣言等の意味論的不正。列数・識別子形状の
+///   大半は [`crate::sql::allowlist::validate_create_table_tokens`] が構造検証
+///   段階で既に拒否済みのため、ここに到達するのは主に `VECTOR` の次元範囲・
+///   複数 `VECTOR` 列宣言）→ [`SqlSurfaceError::unsupported`]（`42601`）
+/// - `WriteLockTimeout`（書き込みゲートの待機上限超過。SQL-31）→
+///   `SqlSurfaceError::LockNotAvailable`（`55P03`）
+/// - その他（`redb` I/O 等）→ `SqlSurfaceError::Internal`（`XX000`。詳細を
+///   クライアントへ渡さない。security.md「情報漏えい」対応）
+pub(crate) fn execute_create_table(
+    storage: &Storage,
+    validated: &ValidatedCreateTable,
+    limits: &SchemaLimits,
+) -> Result<CreateTableOutcome, SqlSurfaceError> {
+    // `IF NOT EXISTS`（TABLE-36、Issue #1613）。同名の関係（表・ビュー・索引）が既にあれば、
+    // 定義の意味検証（列数・型解決・DEFAULT 等）より前に何もせず成功を返す（定義は比較しない）。
+    // 権限ゲート（`42501`）は呼び出し元で通過済みのため存在オラクルにならない。最終判定は
+    // 下の `create_table` の書き込みトランザクションで、競合時の `TableAlreadyExists` も no-op に写す。
+    if validated.if_not_exists
+        && storage
+            .relation_name_exists(&validated.table_name)
+            .map_err(|_| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?
+    {
+        return Ok(CreateTableOutcome {});
+    }
+    let schema = build_table_schema(Some(storage), validated, limits)?;
     // 早期判定〔上〕と書き込みの間に他セッションが同名を作った場合の TOCTOU 対策。名前衝突は
     // commit・世代 bump の前に返るため、no-op は副作用を残さない。
     match storage.create_table(&schema) {
@@ -294,6 +321,103 @@ pub(crate) fn execute_create_table(
         },
     })?;
     Ok(CreateTableOutcome {})
+}
+
+/// 構造検証済みの `CREATE TEMP TABLE`（[`ValidatedCreateTempTable`]）をセッションの一時カタログへ
+/// 登録する（TABLE-44・Issue #1683）。永続カタログ・永続ストレージには一切触れない。
+///
+/// **DDL 実行権限ゲート（[`require_ddl_permission`]）の対象外**: 一時表の作成は呼び出し
+/// セッションの中で閉じ、他セッション・他テナントに影響しないため（TABLE-44 (6)）。呼び出し元は
+/// `core.rs` の `ParsedSql::CreateTempTable` 分岐。
+///
+/// 判定順序（fail-closed）: `IF NOT EXISTS` の既存一時表 → `FOREIGN KEY`（一時表の制約は
+/// 一時表だけを参照できるため、永続表の参照は `42P16`。一時表どうしは実行段が未実装で `0A000`）→
+/// スキーマ構築・検証（永続表と共有）→ 件数上限（`54000`）と同名重複（`42P07`）→ 行ストアの
+/// 遅延生成 → 登録。重い確保（行ストア）は上限・重複の判定の後に行い、拒否された文は
+/// セッションを変えない。同名の永続表があっても作成できる（一時表が名前解決で優先される）。
+pub(crate) fn execute_create_temp_table(
+    session: &mut SessionState,
+    tenant_id: &str,
+    validated: &ValidatedCreateTempTable,
+    schema_limits: &SchemaLimits,
+    temp_limits: crate::temp_table_limits::TempTableLimits,
+) -> Result<CreateTableOutcome, SqlSurfaceError> {
+    let table = &validated.table;
+    if table.if_not_exists && session.temp_tables().contains(&table.table_name) {
+        return Ok(CreateTableOutcome {});
+    }
+    if let Some(fk) = table.foreign_keys.first() {
+        let parent = fk.parent_table();
+        return Err(
+            if parent == table.table_name || session.temp_tables().contains(parent) {
+                SqlSurfaceError::feature_not_supported(
+                    "FOREIGN KEY constraints between temporary tables are not supported",
+                )
+            } else {
+                SqlSurfaceError::invalid_table_definition(table.table_name.clone())
+            },
+        );
+    }
+    let schema = build_table_schema(None, table, schema_limits)?;
+    let schema = crate::catalog::prepare_temp_table_schema(&schema).map_err(|e| match e {
+        CatalogError::Invalid(detail) => {
+            SqlSurfaceError::unsupported(format!("invalid table schema: {detail}"))
+        }
+        _ => SqlSurfaceError::Internal {
+            detail: "internal error".to_string(),
+        },
+    })?;
+    let max_tables = temp_limits.max_tables_per_session();
+    if session.temp_tables().contains(&schema.name) {
+        return Err(SqlSurfaceError::duplicate_table(schema.name.clone()));
+    }
+    if session.temp_tables().len() >= max_tables {
+        return Err(SqlSurfaceError::payload_too_large(
+            "too many temporary tables in this session",
+        ));
+    }
+    session.temp_rows_or_init(tenant_id, temp_limits.max_bytes_per_session())?;
+    session
+        .temp_tables_mut()
+        .register(schema, validated.on_commit, max_tables)?;
+    Ok(CreateTableOutcome {})
+}
+
+/// 名前がすべてセッションの一時表なら `Some(true)`、一つも一時表でなければ `Some(false)`、
+/// 混在していれば `None`（TABLE-44・Issue #1683）。`DROP TABLE` の振り分けに使う。自セッションの
+/// 一時カタログだけで決まるため、他セッション・他テナントの存在を観測するオラクルにならない。
+pub(crate) fn classify_drop_targets(session: &SessionState, names: &[String]) -> Option<bool> {
+    let temp = session.temp_tables();
+    let hits = names.iter().filter(|n| temp.contains(n)).count();
+    if hits == names.len() {
+        Some(true)
+    } else if hits == 0 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// 一時表の `DROP TABLE`（TABLE-44・Issue #1683）。DDL 権限ゲートの対象外で、永続カタログには
+/// 触れない。呼び出し元は [`classify_drop_targets`] が `Some(true)`（全名が一時表）を返した
+/// 場合に限る。一時表には依存物（ビュー・FOREIGN KEY）が無いため `CASCADE`／`RESTRICT` は
+/// 同じ挙動。カタログから外してから行領域を破棄する（失敗しても孤児は掃除できる）。
+pub(crate) fn execute_drop_temp_tables(
+    session: &mut SessionState,
+    validated: &ValidatedDropTable,
+) -> Result<DropTableOutcome, SqlSurfaceError> {
+    let mut ids = Vec::new();
+    for name in &validated.table_names {
+        // 重複指定（`DROP TABLE t, t`）は 1 回として扱う（永続側と同じ）。
+        if let Some(id) = session.temp_tables_mut().remove(name) {
+            ids.push(id);
+        }
+    }
+    session.apply_temp_row_ops(&[], &ids)?;
+    Ok(DropTableOutcome {
+        skipped: false,
+        cascaded: Vec::new(),
+    })
 }
 
 /// `DROP TABLE <table>`（SQL-23、TASK-203、Issue #902）の成功応答。

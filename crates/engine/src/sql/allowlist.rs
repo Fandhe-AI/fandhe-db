@@ -3430,6 +3430,30 @@ pub struct ValidatedCreateTable {
     pub primary_key_name: Option<String>,
 }
 
+/// `ON COMMIT` 句の動作（TABLE-44・Issue #1683）。一時表にだけ指定できる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TempOnCommit {
+    /// 行も表も保持する（既定）。
+    #[default]
+    PreserveRows,
+    /// 各 commit（自動コミットの文を含む）で行を消す。表は残る。
+    DeleteRows,
+    /// 作成したトランザクションの commit で表を消す。
+    Drop,
+}
+
+/// 構造検証済みの `CREATE TEMP TABLE`（TABLE-44・Issue #1683）。永続表の
+/// [`ValidatedCreateTable`] とは別の型にして、`ParsedSql::CreateTempTable` を別 variant で
+/// 運ぶ。`temp` フラグを `ValidatedCreateTable` に足すと、永続表の分岐の確認漏れが
+/// 「一時表のつもりの定義が全テナント共有の永続表になる」fail-open を招くため。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedCreateTempTable {
+    /// 列定義・制約（永続表と同じ構造検証を通過済み）。
+    pub table: ValidatedCreateTable,
+    /// `ON COMMIT` の動作（省略時は [`TempOnCommit::PreserveRows`]）。
+    pub on_commit: TempOnCommit,
+}
+
 /// [`Parser::parse_create_table`] が列リスト全体の構文判定を終えた後に呼ぶ、
 /// `FOREIGN KEY` 制約の参照元列の解決（TABLE-17・TASK-205、Issue #907）。表制約は
 /// 宣言順に関わらず任意位置の列を参照できるため、全列が出揃った後にまとめて行う。
@@ -9445,11 +9469,95 @@ impl<'a> Parser<'a> {
     fn parse_create_table(&mut self) -> Result<ValidatedCreateTable, SqlSurfaceError> {
         self.expect_contextual_keyword("CREATE")?;
         self.expect_contextual_keyword("TABLE")?;
+        let (if_not_exists, table_name) = self.parse_create_table_name()?;
+        self.parse_create_table_body(if_not_exists, table_name)
+    }
+
+    /// `[IF NOT EXISTS] <名前>` を読み、識別子形式を検証する（`CREATE TABLE` と
+    /// `CREATE TEMP TABLE` で共通。TABLE-44・Issue #1683）。
+    fn parse_create_table_name(&mut self) -> Result<(bool, String), SqlSurfaceError> {
         let if_not_exists = self.parse_optional_if_not_exists();
         let table_name = self.expect_ident()?;
         crate::catalog::validate_identifier(&table_name)
             .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
+        Ok((if_not_exists, table_name))
+    }
 
+    /// `CREATE [GLOBAL|LOCAL] {TEMP|TEMPORARY} TABLE [IF NOT EXISTS] <名前> (...)
+    /// [ON COMMIT {PRESERVE ROWS|DELETE ROWS|DROP}]`（TABLE-44・Issue #1683）。
+    /// 列定義・制約の本体は [`Self::parse_create_table_body`] を永続表と共有する
+    /// （第 2 の列定義パーサーを作らない）。構造段で判定できる未対応の形
+    /// （`CREATE TEMP TABLE ... AS`・`VECTOR` 列・ENUM 列）は `0A000` で拒否する。
+    /// カタログは参照しない。
+    fn parse_create_temp_table(&mut self) -> Result<ValidatedCreateTempTable, SqlSurfaceError> {
+        self.expect_contextual_keyword("CREATE")?;
+        if self.peek_ident_matches("GLOBAL") || self.peek_ident_matches("LOCAL") {
+            // `GLOBAL` は `LOCAL` と同義（PG 互換。非推奨警告は出さない）。
+            self.advance();
+        }
+        if self.peek_ident_matches("TEMP") || self.peek_ident_matches("TEMPORARY") {
+            self.advance();
+        } else {
+            return Err(SqlSurfaceError::unsupported("expected keyword TEMPORARY"));
+        }
+        self.expect_contextual_keyword("TABLE")?;
+        let (if_not_exists, table_name) = self.parse_create_table_name()?;
+        if self.peek_ident_matches("AS") {
+            // `CREATE TEMP TABLE ... AS`（SQL-52）は未確定のため `0A000`。
+            return Err(SqlSurfaceError::feature_not_supported(
+                "CREATE TEMPORARY TABLE ... AS is not supported",
+            ));
+        }
+        let table = self.parse_create_table_body(if_not_exists, table_name)?;
+        let on_commit = self.parse_optional_on_commit()?;
+        for column in &table.columns {
+            let unsupported = match &column.ty {
+                crate::catalog::ColumnType::Vector(_) | crate::catalog::ColumnType::Enum(_) => true,
+                crate::catalog::ColumnType::Array(a) => a.enum_def().is_some(),
+                _ => false,
+            };
+            if unsupported {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "VECTOR and ENUM columns are not supported in temporary tables",
+                ));
+            }
+        }
+        Ok(ValidatedCreateTempTable { table, on_commit })
+    }
+
+    /// 省略可能な `ON COMMIT {PRESERVE ROWS|DELETE ROWS|DROP}` 句。省略時は
+    /// `PRESERVE ROWS`（PG の既定）。綴り違い・重複は `42601`。
+    fn parse_optional_on_commit(&mut self) -> Result<TempOnCommit, SqlSurfaceError> {
+        if !self.peek_ident_matches("ON") {
+            return Ok(TempOnCommit::PreserveRows);
+        }
+        self.advance();
+        self.expect_contextual_keyword("COMMIT")?;
+        if self.peek_ident_matches("DROP") {
+            self.advance();
+            return Ok(TempOnCommit::Drop);
+        }
+        let on_commit = if self.peek_ident_matches("PRESERVE") {
+            TempOnCommit::PreserveRows
+        } else if self.peek_ident_matches("DELETE") {
+            TempOnCommit::DeleteRows
+        } else {
+            return Err(SqlSurfaceError::unsupported(
+                "expected PRESERVE ROWS, DELETE ROWS or DROP after ON COMMIT",
+            ));
+        };
+        self.advance();
+        self.expect_contextual_keyword("ROWS")?;
+        Ok(on_commit)
+    }
+
+    /// `CREATE TABLE` の `(` 以降（列定義・表制約）の構文検証。表名は
+    /// [`Self::parse_create_table_name`] が読み済み。
+    fn parse_create_table_body(
+        &mut self,
+        if_not_exists: bool,
+        table_name: String,
+    ) -> Result<ValidatedCreateTable, SqlSurfaceError> {
         self.expect_punct('(')?;
         let mut columns: Vec<ColumnDef> = Vec::new();
         let mut alias_type_names: Vec<String> = Vec::new();
@@ -15753,6 +15861,41 @@ pub fn validate_create_table_tokens(
 ) -> Result<ValidatedCreateTable, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     let validated = p.parse_create_table()?;
+    // `ON COMMIT` は一時表にしか使えない（TABLE-44・Issue #1683。PG と同じ `42P16`）。
+    if p.peek_ident_matches("ON") && p.peek_ident_matches_at(1, "COMMIT") {
+        return Err(SqlSurfaceError::invalid_table_definition(
+            validated.table_name,
+        ));
+    }
+    p.expect_end_of_statement()?;
+    Ok(validated)
+}
+
+/// 先頭が `CREATE [GLOBAL|LOCAL] {TEMP|TEMPORARY} TABLE` かを判定する（TABLE-44・
+/// Issue #1683）。`core.rs::EngineCore::parse_tokens_in` が `is_create_table_statement`
+/// より先にこれで分岐する（一時表の定義を永続表の `CreateTable` として束縛しない）。
+/// `CREATE TEMP VIEW` 等は一致しない（従来どおりの拒否経路へ流れる）。
+pub(crate) fn is_create_temp_table_statement(tokens: &[Token]) -> bool {
+    let ident_at = |i: usize, word: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word));
+    if !ident_at(0, "CREATE") {
+        return false;
+    }
+    let mut i = 1;
+    if ident_at(i, "GLOBAL") || ident_at(i, "LOCAL") {
+        i += 1;
+    }
+    (ident_at(i, "TEMP") || ident_at(i, "TEMPORARY")) && ident_at(i + 1, "TABLE")
+}
+
+/// [`is_create_temp_table_statement`] が真のトークン列から `CREATE TEMP TABLE` の
+/// 許可形状を構造検証する（TABLE-44・Issue #1683）。カタログ照会はしない。
+/// 実行（セッションの一時カタログへの登録）は `EngineCore::execute_parsed_in_session`
+/// の `ParsedSql::CreateTempTable` 分岐が担う。
+pub(crate) fn validate_create_temp_table_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedCreateTempTable, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let validated = p.parse_create_temp_table()?;
     p.expect_end_of_statement()?;
     Ok(validated)
 }
@@ -23547,6 +23690,114 @@ mod tests {
         ] {
             assert_eq!(parse_create_table_err(sql).wire_code(), "42601", "{sql}");
         }
+    }
+
+    fn parse_temp_ok(sql: &str) -> ValidatedCreateTempTable {
+        let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        assert!(is_create_temp_table_statement(&tokens), "{sql}");
+        validate_create_temp_table_tokens(&tokens)
+            .unwrap_or_else(|e| panic!("expected ok, got {e:?} for {sql}"))
+    }
+
+    fn parse_temp_err(sql: &str) -> SqlSurfaceError {
+        let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        match validate_create_temp_table_tokens(&tokens) {
+            Ok(v) => panic!("expected error, got ok: {v:?}"),
+            Err(e) => e,
+        }
+    }
+
+    /// `CREATE TEMP TABLE` の先頭部の全組み合わせと `ON COMMIT` 句（TABLE-44・Issue #1683）。
+    #[test]
+    fn create_temp_table_prefix_and_on_commit_forms() {
+        for prefix in [
+            "CREATE TEMP TABLE",
+            "create temporary table",
+            "CREATE LOCAL TEMP TABLE",
+            "CREATE LOCAL TEMPORARY TABLE",
+            "CREATE GLOBAL TEMP TABLE",
+            "CREATE GLOBAL TEMPORARY TABLE",
+        ] {
+            let v = parse_temp_ok(&format!("{prefix} t (a TEXT)"));
+            assert_eq!(v.table.table_name, "t", "{prefix}");
+            assert_eq!(v.on_commit, TempOnCommit::PreserveRows, "{prefix}");
+            assert!(!v.table.if_not_exists);
+        }
+        assert!(
+            parse_temp_ok("CREATE TEMP TABLE IF NOT EXISTS t (a TEXT)")
+                .table
+                .if_not_exists
+        );
+        for (clause, expected) in [
+            ("ON COMMIT PRESERVE ROWS", TempOnCommit::PreserveRows),
+            ("on commit delete rows", TempOnCommit::DeleteRows),
+            ("ON COMMIT DROP", TempOnCommit::Drop),
+            ("ON COMMIT DROP;", TempOnCommit::Drop),
+        ] {
+            let v = parse_temp_ok(&format!("CREATE TEMP TABLE t (a TEXT) {clause}"));
+            assert_eq!(v.on_commit, expected, "{clause}");
+        }
+        // 制約付きの列定義は永続表と同じ本体パーサーを通る。
+        let v = parse_temp_ok(
+            "CREATE TEMP TABLE t (a TEXT PRIMARY KEY, b INTEGER UNIQUE) ON COMMIT DELETE ROWS",
+        );
+        assert_eq!(v.table.primary_key, Some(vec!["a".to_string()]));
+        assert_eq!(v.table.unique_constraints.len(), 1);
+    }
+
+    /// 綴り違い・重複・欠落した `ON COMMIT` は `42601`。
+    #[test]
+    fn create_temp_table_on_commit_syntax_errors() {
+        for sql in [
+            "CREATE TEMP TABLE t (a TEXT) ON COMMIT",
+            "CREATE TEMP TABLE t (a TEXT) ON COMMIT PRESERVE",
+            "CREATE TEMP TABLE t (a TEXT) ON COMMIT DELETE",
+            "CREATE TEMP TABLE t (a TEXT) ON COMMIT KEEP ROWS",
+            "CREATE TEMP TABLE t (a TEXT) ON COMMIT DROP ON COMMIT DROP",
+            "CREATE TEMP TABLE t (a TEXT) ON ROLLBACK DROP",
+            "CREATE TEMP TABLE t (a TEXT) ON COMMIT DROP extra",
+            "CREATE TEMP TABLE t (a TEXT) extra",
+        ] {
+            assert_eq!(parse_temp_err(sql).wire_code(), "42601", "{sql}");
+        }
+    }
+
+    /// 構造段で判定できる未対応の形は `0A000`（fail-closed）。
+    #[test]
+    fn create_temp_table_unsupported_forms_are_feature_not_supported() {
+        for sql in [
+            "CREATE TEMP TABLE t AS SELECT 1",
+            "CREATE TEMP TABLE t (e VECTOR(3))",
+            "CREATE TEMP TABLE t (a TEXT, e VECTOR(3))",
+            "CREATE TEMP TABLE t (c mood)",
+            "CREATE TEMP TABLE t (c mood[2])",
+        ] {
+            assert_eq!(parse_temp_err(sql).wire_code(), "0A000", "{sql}");
+        }
+    }
+
+    /// `CREATE TEMP VIEW` 等は一時表の経路に入らない。素の `CREATE TABLE ... ON COMMIT` は `42P16`。
+    #[test]
+    fn create_temp_table_detection_and_plain_table_on_commit() {
+        for sql in [
+            "CREATE TEMP VIEW v AS SELECT 1",
+            "CREATE TABLE t (a TEXT)",
+            "CREATE GLOBAL TABLE t (a TEXT)",
+            "CREATE TEMP t (a TEXT)",
+            "CREATE UNIQUE INDEX i ON t (a)",
+        ] {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            assert!(!is_create_temp_table_statement(&tokens), "{sql}");
+        }
+        assert_eq!(
+            parse_create_table_err("CREATE TABLE t (a TEXT) ON COMMIT DROP").wire_code(),
+            "42P16"
+        );
+        // `ON COMMIT` を伴わない末尾トークンは従来どおり `42601`。
+        assert_eq!(
+            parse_create_table_err("CREATE TABLE t (a TEXT) ON ROLLBACK").wire_code(),
+            "42601"
+        );
     }
 
     fn parse_create_table_err(sql: &str) -> SqlSurfaceError {
