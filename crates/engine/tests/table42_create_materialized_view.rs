@@ -421,9 +421,11 @@ fn row_limit_is_per_context_and_other_context_failure_is_hidden() {
         "CREATE MATERIALIZED VIEW mv_l AS SELECT body FROM docs",
     );
     assert_eq!(tag_rows(&outcome), (false, true, Some(5)));
-    // 超過した文脈（bob）の実体は空で、行は露出しない。
-    let r = query(&core, "bob", "SELECT body FROM mv_l LIMIT 5").unwrap();
-    assert_eq!(r.rows.len(), 0);
+    // 超過した文脈（bob）は実体を持たず、空の正常結果ではなく 55000 で拒否される。
+    assert_eq!(
+        err_code(&core, "bob", "SELECT body FROM mv_l LIMIT 5"),
+        "55000"
+    );
     let r = query(&core, "alice", "SELECT body FROM mv_l LIMIT 5").unwrap();
     assert_eq!(r.rows.len(), 5);
     // 作成者自身の文脈が超過するなら従来どおり 54000 で何も作られない。

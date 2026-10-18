@@ -174,8 +174,9 @@ impl EngineCore {
                     Ok(rows) => rows,
                     // 作成者以外の文脈の評価失敗（行数超過・実行時エラー等）は他テナントのデータに
                     // 依存するため作成者へ返さない（成否の差で不可視な一致件数を探れてしまう。
-                    // テナント境界・fail-closed）。その文脈の実体は空にし、行は 1 件も露出しない。
-                    Err(_) if !is_creator => Vec::new(),
+                    // テナント境界・fail-closed）。その文脈の実体メタは保存せず、読み取りは
+                    // 「未実体化」と同じ 55000 で拒否される（空の正常結果へは変換しない）。
+                    Err(_) if !is_creator => continue,
                     Err(e) => return Err(e),
                 };
                 if is_creator {
