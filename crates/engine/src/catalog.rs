@@ -4630,24 +4630,49 @@ fn dependent_views_closure_in_txn(
     queue.push_back(target.to_string());
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     visited.insert(target.to_string());
-    while let Some(current) = queue.pop_front() {
-        for (name, def) in &all {
-            match view_def_dependence_on(def, &current) {
-                ViewDependence::No => {}
-                ViewDependence::Unverifiable => {
-                    return Err(CatalogError::DependentViewsExist(target.to_string()));
-                }
-                ViewDependence::Direct => {
-                    if visited.insert(name.clone()) {
-                        if visited.len() > MAX_VIEW_CHAIN_WALK {
-                            return Err(CatalogError::ViewLimitExceeded(
-                                "view reference chain too long".to_string(),
-                            ));
-                        }
-                        closure.insert(name.clone(), def.clone());
-                        queue.push_back(name.clone());
+    // 各ビュー本文を 1 回だけ解析して relation 名 → 依存ビュー添字の逆辺を構築する
+    // （BFS の取り出しごとに全ビューを再解析する二次的増加を避ける）。
+    // 本文を再検証できないビューは `view_def_dependence_on` と同じく、`base_relation` が
+    // 取り出した名前と一致する場合のみ Direct、それ以外は fail-closed で拒否する。
+    let mut reverse: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut unverifiable: Vec<usize> = Vec::new();
+    for (idx, (_, def)) in all.iter().enumerate() {
+        reverse
+            .entry(def.base_relation.clone())
+            .or_default()
+            .push(idx);
+        match view_body_shape(&def.body_sql) {
+            Ok(shape) => {
+                for r in &shape.relations {
+                    if r != &def.base_relation {
+                        reverse.entry(r.clone()).or_default().push(idx);
                     }
                 }
+            }
+            Err(_) => unverifiable.push(idx),
+        }
+    }
+    while let Some(current) = queue.pop_front() {
+        if unverifiable
+            .iter()
+            .any(|&i| all[i].1.base_relation != current)
+        {
+            return Err(CatalogError::DependentViewsExist(target.to_string()));
+        }
+        let Some(indices) = reverse.get(current.as_str()) else {
+            continue;
+        };
+        for &i in indices {
+            let (name, def) = &all[i];
+            if visited.insert(name.clone()) {
+                if visited.len() > MAX_VIEW_CHAIN_WALK {
+                    return Err(CatalogError::ViewLimitExceeded(
+                        "view reference chain too long".to_string(),
+                    ));
+                }
+                closure.insert(name.clone(), def.clone());
+                queue.push_back(name.clone());
             }
         }
     }
