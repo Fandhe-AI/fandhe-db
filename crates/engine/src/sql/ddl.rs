@@ -386,6 +386,8 @@ pub(crate) fn execute_create_temp_table(
 /// 名前がすべてセッションの一時表なら `Some(true)`、一つも一時表でなければ `Some(false)`、
 /// 混在していれば `None`（TABLE-44・Issue #1683）。`DROP TABLE` の振り分けに使う。自セッションの
 /// 一時カタログだけで決まるため、他セッション・他テナントの存在を観測するオラクルにならない。
+/// 一時表以外の名前は存在有無によらず「永続側」扱いのため、`IF EXISTS` 付きで未存在の名前が
+/// 一時表と混在した場合も `None`（拒否側に倒す既知の制約）。
 pub(crate) fn classify_drop_targets(session: &SessionState, names: &[String]) -> Option<bool> {
     let temp = session.temp_tables();
     let hits = names.iter().filter(|n| temp.contains(n)).count();

@@ -908,7 +908,9 @@ fn commit_active(
         internal_error()
     })?;
     // commit 成功後にだけ、一時表の `ON COMMIT` 動作を適用する（TABLE-44・Issue #1683。
-    // ROLLBACK・commit 失敗では呼ばない）。
+    // ROLLBACK・commit 失敗では呼ばない）。永続側は既に commit 済みのため、ここが失敗すると
+    // クライアントには commit 失敗（`XX000`）が返るが実際には commit 済み、という食い違いが
+    // 起こりうる（一時表は in-memory redb で発生確率は極めて低い既知の制約。docs/design/temp-table.md）。
     session.apply_temp_on_commit()
 }
 
