@@ -1051,3 +1051,31 @@ fn prepared_drop_index_does_not_hit_a_later_temp_index_of_the_same_name() {
         .expect_err("stale prepared DROP INDEX");
     assert_eq!(err.wire_code(), "0A000");
 }
+
+#[test]
+fn temp_table_name_colliding_with_a_temp_index_follows_the_persistent_rules() {
+    let (core, _g) = new_core("t44-dml-ix-name", LedgerMode::CompareOnlyWithoutLedger);
+    let mut s = ddl_session();
+    run_ok(&core, &mut s, "CREATE TEMP TABLE t (a TEXT)");
+    run_ok(&core, &mut s, "CREATE INDEX ix ON t (a)");
+    assert_eq!(
+        code(&core, &mut s, "CREATE TEMP TABLE ix (a TEXT)"),
+        "42P07"
+    );
+    assert!(
+        code(&core, &mut s, "CREATE TEMP TABLE IF NOT EXISTS ix (a TEXT)").starts_with("ok:"),
+        "IF NOT EXISTS must be a no-op success"
+    );
+}
+
+#[test]
+fn temp_create_index_if_not_exists_keeps_the_existing_index() {
+    let (core, _g) = new_core("t44-dml-ix-noop", LedgerMode::CompareOnlyWithoutLedger);
+    let mut s = ddl_session();
+    run_ok(&core, &mut s, "CREATE TEMP TABLE t (a TEXT)");
+    run_ok(&core, &mut s, "CREATE INDEX ix ON t (a)");
+    assert!(code(&core, &mut s, "CREATE INDEX IF NOT EXISTS ix ON t (a)").starts_with("ok:"));
+    // 既存索引が残っている（DROP INDEX が成功し、再度の DROP は 42704）。
+    assert!(code(&core, &mut s, "DROP INDEX ix").starts_with("ok:"));
+    assert_eq!(code(&core, &mut s, "DROP INDEX ix"), "42704");
+}

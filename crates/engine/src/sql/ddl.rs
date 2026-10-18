@@ -383,6 +383,11 @@ pub(crate) fn execute_create_temp_table(
         .ok_or_else(|| SqlSurfaceError::Internal {
             detail: "temporary storage error".to_string(),
         })?;
+    // 一時索引など一時カタログに載らない同名関係との衝突は `IF NOT EXISTS` なら no-op 成功にする
+    // （無指定なら `create_table` が `42P07` を返す）。
+    if table.if_not_exists && store.relation_name_exists(&schema.name)? {
+        return Ok(CreateTableOutcome {});
+    }
     // 一時 DB のカタログへ先に実体を作る。以降の DML・索引・制約は一時コアが永続表と同じ
     // 実行器でこの定義を読む。カタログ登録に失敗した場合は作った実体を戻す（孤児を残さない）。
     store.create_table(&schema)?;

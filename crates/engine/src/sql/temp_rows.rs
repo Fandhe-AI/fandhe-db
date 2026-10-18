@@ -310,14 +310,26 @@ impl TempRowStore {
     /// 作成後に容量上限を検査し、超過なら作った実体を戻して `54000` を返す（DDL も上限を迂回
     /// させない。`--max-temp-bytes` 超過のまま確定した状態を残さない）。
     pub(crate) fn create_table(&self, schema: &TableSchema) -> Result<(), SqlSurfaceError> {
-        self.storage()?
-            .create_table(schema)
-            .map_err(|_| internal())?;
+        self.storage()?.create_table(schema).map_err(|e| match e {
+            // 一時索引など、一時カタログ（表名のみ）に載らない関係との名前衝突は永続表と同じ `42P07`。
+            crate::catalog::CatalogError::TableAlreadyExists(name) => {
+                SqlSurfaceError::duplicate_table(name)
+            }
+            _ => internal(),
+        })?;
         if let Err(e) = self.enforce_budget_after_ddl() {
             let _ = self.drop_tables(std::slice::from_ref(&schema.name));
             return Err(e);
         }
         Ok(())
+    }
+
+    /// 一時 DB に同名の関係（表・ビュー・索引）が既にあるか。`CREATE TEMP TABLE IF NOT EXISTS` の
+    /// 一時索引との衝突判定に使う（自セッション専用の一時 DB だけを見るため存在オラクルにならない）。
+    pub(crate) fn relation_name_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        self.storage()?
+            .relation_name_exists(name)
+            .map_err(|_| internal())
     }
 
     /// DDL（確定済み）の直後に容量上限を検査する。新しい書き込みトランザクションで

@@ -712,11 +712,19 @@ impl EngineCore {
         let inner = routed.inner();
         match inner {
             ParsedSql::CreateIndex(stmt) => {
+                // `IF NOT EXISTS` で既存索引に当たる no-op を区別する（戻す対象は今回作った索引だけ）。
+                let existed = core
+                    .storage
+                    .relation_name_exists(stmt.name())
+                    .map_err(|_| internal())?;
                 let outcome = crate::sql::ddl::execute_create_index(&core.storage, stmt)?;
-                // 確定後に容量上限を検査し、超過なら作った索引を戻して `54000`（DDL も上限を迂回させない）。
-                if let Err(e) = store.enforce_budget_after_ddl() {
-                    let _ = core.storage.drop_index(stmt.name());
-                    return Err(e);
+                // 確定後に容量上限を検査し、超過なら今回作った索引を戻して `54000`（DDL も上限を
+                // 迂回させない）。既存索引への no-op 成功では何も戻さない。
+                if !existed {
+                    if let Err(e) = store.enforce_budget_after_ddl() {
+                        let _ = core.storage.drop_index(stmt.name());
+                        return Err(e);
+                    }
                 }
                 session.temp_tables_mut().bump_epoch()?;
                 Ok(crate::sql::SqlOutcome::CreateIndex(outcome))
