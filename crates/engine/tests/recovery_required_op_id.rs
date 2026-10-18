@@ -39,16 +39,18 @@ fn open_storage_with_table(path: &std::path::Path) -> Storage {
     storage
 }
 
-// --- T1: 既定構成（Ledgered）は SQL INSERT の句省略・明示 NULL をいずれも
+// --- T1: Ledgered 構成は SQL INSERT の句省略・明示 NULL をいずれも
 //         書き込みトランザクション開始前に 23502 で拒否する -----------------------
 
 #[test]
-fn t1_default_ledgered_rejects_missing_and_explicit_null_operation_id() {
+fn t1_ledgered_rejects_missing_and_explicit_null_operation_id() {
     let path = unique_db_path("recover1-t1");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage_with_table(&path);
-    // `with_ledger_mode` を呼ばない: 既定が `Ledgered` であることそのものを検証する。
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    // `--require-operation-id` 相当の `Ledgered` を明示する（既定は Issue #1704 で
+    // `Optional` に移った。既定の挙動は `recovery_optional_op_id.rs` が検証する）。
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(LedgerMode::Ledgered);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
     let missing = core
@@ -88,7 +90,8 @@ fn t2_engine_core_write_guard_rejects_none_before_reaching_storage() {
     let path = unique_db_path("recover1-t2");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage_with_table(&path);
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(LedgerMode::Ledgered);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let row = RowInput {
         tenant_id: "tenant-a",
@@ -143,7 +146,8 @@ fn t3_protection_is_determined_only_by_server_configuration() {
     let ledgered = EngineCore::from_storage(
         open_storage_with_table(&path_a),
         Box::new(CpuScalarProvider),
-    );
+    )
+    .with_ledger_mode(LedgerMode::Ledgered);
 
     let path_b = unique_db_path("recover1-t3-compare-only");
     let _guard_b = CleanupGuard(path_b.clone());

@@ -298,7 +298,7 @@ pub struct BoundInsert {
     /// `tenant::insert_typed_row` の `values` 契約と同一。`id` 疑似列は含まない）。
     pub values: Vec<crate::row_codec::Value>,
     /// TASK-92（RECOVER-1）: `ValidatedInsert.operation_id` をそのまま素通しする。
-    /// `LedgerMode::Ledgered`（既定）では `sql::allowlist::validate_insert` が既に
+    /// `LedgerMode::Ledgered`（`--require-operation-id`）では `sql::allowlist::validate_insert` が既に
     /// `None` を `23502` で拒否済みのため常に `Some`。`CompareOnlyWithoutLedger`
     /// でのみ `None` になり得る。
     pub operation_id: Option<OperationId>,
@@ -400,7 +400,7 @@ pub struct BoundDelete {
     pub table: String,
     pub id: u64,
     /// TASK-92（RECOVER-1）: `ValidatedDelete.operation_id` をそのまま
-    /// 素通しする。`LedgerMode::Ledgered`（既定）では
+    /// 素通しする。`LedgerMode::Ledgered`（`--require-operation-id`）では
     /// `sql::allowlist::validate_delete` が既に `None` を `23502` で
     /// 拒否済みのため常に `Some`。`CompareOnlyWithoutLedger` でのみ
     /// `None` になり得る。
@@ -3753,7 +3753,7 @@ pub struct BoundUpdate {
     /// **BREAKING CHANGE**（Issue #1544）: フィールドを追加した。
     pub set_exprs: Vec<(usize, crate::sql::set_expr::BoundSetExpr)>,
     /// TASK-92（RECOVER-1）: [`ValidatedUpdate::operation_id`] をそのまま素通しする。
-    /// `LedgerMode::Ledgered`（既定）では `sql::allowlist::validate_update` が既に
+    /// `LedgerMode::Ledgered`（`--require-operation-id`）では `sql::allowlist::validate_update` が既に
     /// `None` を `23502` で拒否済みのため常に `Some`。`CompareOnlyWithoutLedger`
     /// でのみ `None` になり得る。
     pub operation_id: Option<OperationId>,
@@ -4659,7 +4659,7 @@ pub struct BoundFileInsert {
     /// TASK-92（RECOVER-1）: [`BoundInsert::operation_id`] と同じく
     /// `ValidatedInsert.operation_id` をそのまま素通しする（行形・ファイル形で
     /// `sql::allowlist::validate_insert` の必須化ガードを共有するため、
-    /// `LedgerMode::Ledgered`（既定）では常に `Some`）。
+    /// `LedgerMode::Ledgered`（`--require-operation-id`）では常に `Some`）。
     pub operation_id: Option<OperationId>,
 }
 

@@ -55,7 +55,8 @@ fn open_engine(name: &str) -> (EngineCore, std::path::PathBuf) {
     storage
         .create_table(&no_vector_schema())
         .expect("create table without a VECTOR column");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (core, path)
 }
 
@@ -351,7 +352,8 @@ fn sql_insert_dim_mismatch_and_missing_value_on_table_with_vector_column_are_unc
         ],
     );
     storage.create_table(&schema).expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     let policy = ctx("tenant-a");
 
     // 次元不一致は 22000。

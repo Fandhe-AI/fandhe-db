@@ -22,8 +22,15 @@ pub use crate::sql::using_operation_id::OperationId;
 /// クエリ・セッション変数からは差し替えられない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LedgerMode {
-    /// 台帳あり構成（既定・fail-closed）。
+    /// 台帳あり構成で `operation_id` を任意にする（既定。Issue #1704・RECOVER-1）。
+    /// 省略した書き込み（句の欠落・明示 `NULL`）は台帳に記録しない通常の書き込みとして
+    /// 実行する（再送の検出はしない）。指定した場合の記録・重複拒否・内容照合は
+    /// [`LedgerMode::Ledgered`] と同じ。分割実行 DML は構成に関わらず
+    /// [`require_partitioned`] で必須。
     #[default]
+    Optional,
+    /// 台帳あり構成で `operation_id` を必須にする（`--require-operation-id`。
+    /// 省略は `23502`）。
     Ledgered,
     /// 台帳を持たない限定用途の構成（本番運用では使わない）。
     CompareOnlyWithoutLedger,
@@ -56,7 +63,7 @@ impl LedgerMode {
                 Some(id) => Ok(Some(id)),
                 None => Err(MissingOperationId),
             },
-            LedgerMode::CompareOnlyWithoutLedger => Ok(op_id),
+            LedgerMode::Optional | LedgerMode::CompareOnlyWithoutLedger => Ok(op_id),
         }
     }
 
@@ -77,11 +84,25 @@ impl LedgerMode {
                 Some(id) => Ok(crate::recovery::ledger::LedgerWrite::Record(id)),
                 None => Err(MissingOperationId),
             },
+            LedgerMode::Optional => Ok(match op_id {
+                Some(id) => crate::recovery::ledger::LedgerWrite::Record(id),
+                None => crate::recovery::ledger::LedgerWrite::Omitted,
+            }),
             LedgerMode::CompareOnlyWithoutLedger => {
                 Ok(crate::recovery::ledger::LedgerWrite::Disabled)
             }
         }
     }
+}
+
+/// 分割実行 DML（`PARTITIONED`）の `operation_id` 必須判定（Issue #1704・RECOVER-1）。
+/// ジョブを operation_id で識別するため、[`LedgerMode`] に関わらず省略を拒否する。
+/// SQL 表層の検証（`sql::allowlist`）と、NoSQL から呼ばれる engine 入口
+/// （`core.rs` の `execute_bound_partitioned_*`）・共通本体の多層防御で使う。
+pub(crate) fn require_partitioned(
+    op_id: Option<&OperationId>,
+) -> Result<&OperationId, MissingOperationId> {
+    op_id.ok_or(MissingOperationId)
 }
 
 /// [`crate::sql::allowlist::validate_insert`] が `?` 演算子で本ガードの結果を
@@ -106,8 +127,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_ledgered() {
-        assert_eq!(LedgerMode::default(), LedgerMode::Ledgered);
+    fn default_is_optional() {
+        assert_eq!(LedgerMode::default(), LedgerMode::Optional);
+    }
+
+    #[test]
+    fn optional_accepts_missing_and_present_operation_id() {
+        assert_eq!(LedgerMode::Optional.require(None), Ok(None));
+        let id = OperationId::parse("op-0004").expect("valid operation_id");
+        assert_eq!(LedgerMode::Optional.require(Some(&id)), Ok(Some(&id)));
+    }
+
+    #[test]
+    fn resolve_optional_maps_none_to_omitted_and_some_to_record() {
+        use crate::recovery::ledger::LedgerWrite;
+        let w = LedgerMode::Optional.resolve(None).expect("accept");
+        assert!(matches!(w, LedgerWrite::Omitted));
+        let id = OperationId::parse("op-0005").expect("valid operation_id");
+        let w = LedgerMode::Optional.resolve(Some(&id)).expect("accept");
+        assert!(matches!(w, LedgerWrite::Record(r) if r == &id));
+    }
+
+    #[test]
+    fn require_partitioned_rejects_none_regardless_of_mode() {
+        assert_eq!(require_partitioned(None), Err(MissingOperationId));
+        let id = OperationId::parse("op-0006").expect("valid operation_id");
+        assert_eq!(require_partitioned(Some(&id)), Ok(&id));
     }
 
     #[test]
@@ -162,7 +207,8 @@ mod tests {
                 assert_eq!(recorded, &id);
             }
             crate::recovery::ledger::LedgerWrite::RecordEvaluated { .. }
-            | crate::recovery::ledger::LedgerWrite::Disabled => {
+            | crate::recovery::ledger::LedgerWrite::Disabled
+            | crate::recovery::ledger::LedgerWrite::Omitted => {
                 panic!("Ledgered must resolve to Record")
             }
         }
