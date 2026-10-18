@@ -193,6 +193,25 @@ fn walk_limit_error() -> CatalogError {
     CatalogError::ViewLimitExceeded("too many dependent objects".to_string())
 }
 
+/// テーブルを読み取り専用で開く。欠落なら `None`（書き込みトランザクションでも作成せず、
+/// 読み取り列挙が空テーブルを COMMIT で永続化しないようにする。列挙の read-only 契約）。
+fn open_existing<'t, K, V>(
+    write_txn: &'t redb::WriteTransaction,
+    def: redb::TableDefinition<'_, K, V>,
+) -> Result<
+    Option<<redb::WriteTransaction as crate::storage::read_source::ReadSource>::Table<'t, K, V>>,
+>
+where
+    K: redb::Key + 'static,
+    V: redb::Value + 'static,
+{
+    match crate::storage::read_source::ReadSource::open_table(write_txn, def) {
+        Ok(t) => Ok(Some(t)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// 根の存在を確認する（無ければ種類ごとの `*NotFound`。`Ok(空)` へ丸めない）。
 fn require_root_exists(write_txn: &redb::WriteTransaction, root: &DropTarget) -> Result<()> {
     let (def, name, missing) = match root {
@@ -205,7 +224,11 @@ fn require_root_exists(write_txn: &redb::WriteTransaction, root: &DropTarget) ->
         ),
         DropTarget::EnumType(n) => (ENUM_TYPES_TABLE, n, CatalogError::TypeNotFound(n.clone())),
     };
-    let table = write_txn.open_table(def)?;
+    // `WriteTransaction::open_table` は欠落テーブルを作成するため、作成しない
+    // `ReadSource` 経由で開く（欠落は「根なし」＝ `*NotFound`）。
+    let Some(table) = open_existing(write_txn, def)? else {
+        return Err(missing);
+    };
     if table.get(name.as_str())?.is_none() {
         return Err(missing);
     }
@@ -215,7 +238,10 @@ fn require_root_exists(write_txn: &redb::WriteTransaction, root: &DropTarget) ->
 /// 全ビュー定義を名前順に 1 回だけ読む（以降の走査で表ハンドルを保持しないため。
 /// 件数は [`MAX_VIEWS`] で頭打ちにし、超過は `Err`）。
 fn load_views(write_txn: &redb::WriteTransaction) -> Result<Vec<(String, ViewDef)>> {
-    let table = write_txn.open_table(VIEWS_TABLE)?;
+    // VIEWS_TABLE 欠落は「ビュー無し」（既存 DROP 経路と同じ扱い。空テーブルを作らない）。
+    let Some(table) = open_existing(write_txn, VIEWS_TABLE)? else {
+        return Ok(Vec::new());
+    };
     let mut views = Vec::new();
     for entry in table.iter()? {
         let (key, value) = entry?;
@@ -312,7 +338,8 @@ impl Walker<'_> {
     /// 索引だけを消しても表は残るため）。非 unique 索引に依存はない。
     fn index_children(&mut self, index: &str) -> Result<Vec<Child>> {
         let def: IndexDef = {
-            let table = self.write_txn.open_table(INDEX_CATALOG_TABLE)?;
+            let table = open_existing(self.write_txn, INDEX_CATALOG_TABLE)?
+                .ok_or_else(|| CatalogError::IndexNotFound(index.to_string()))?;
             let guard = table
                 .get(index)?
                 .ok_or_else(|| CatalogError::IndexNotFound(index.to_string()))?;
@@ -877,6 +904,39 @@ mod tests {
             run(&storage, &[DropTarget::EnumType("nope".to_string())]),
             Err(CatalogError::TypeNotFound(_))
         ));
+    }
+
+    /// 列挙は欠落したカタログ表を作成しない（空の VIEWS／INDEX／ENUM 表を COMMIT で永続化しない）。
+    #[test]
+    fn t11b_enumeration_does_not_create_missing_tables() {
+        use redb::TableHandle;
+        let (storage, _g) = open("dep-t11b");
+        storage.create_table(&parent_table("t")).expect("t");
+        let guarded = [
+            VIEWS_TABLE.name().to_string(),
+            INDEX_CATALOG_TABLE.name().to_string(),
+            ENUM_TYPES_TABLE.name().to_string(),
+        ];
+        let existing = |txn: &redb::WriteTransaction| -> Vec<String> {
+            txn.list_tables()
+                .expect("list")
+                .map(|h| h.name().to_string())
+                .filter(|n| guarded.contains(n))
+                .collect()
+        };
+        let write_txn = storage.db().begin_write().expect("begin");
+        let before = existing(&write_txn);
+        let closure = enumerate_drop_dependents_in_txn(&write_txn, &[table("t")]).expect("enum");
+        assert!(closure.objects.is_empty());
+        for missing in [
+            DropTarget::View("nope".to_string()),
+            DropTarget::Index("nope".to_string()),
+            DropTarget::EnumType("nope".to_string()),
+        ] {
+            assert!(enumerate_drop_dependents_in_txn(&write_txn, &[missing]).is_err());
+        }
+        assert_eq!(existing(&write_txn), before);
+        write_txn.abort().expect("abort");
     }
 
     /// 列挙は何も書かない: 列挙後も既存の DROP の判定結果が変わらない。
