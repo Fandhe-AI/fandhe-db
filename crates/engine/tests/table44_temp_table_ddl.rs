@@ -270,6 +270,23 @@ fn foreign_keys_involving_temp_tables_are_rejected() {
         ),
         "42P16"
     );
+    // IF NOT EXISTS ＋既存の永続表なら、一時表への FK を含む定義でも検証より先に no-op 成功
+    // （既存名の判定が FK 検証に優先する）。実際に新規作成する場合だけ 42P16。
+    run(&core, &mut s, "CREATE TABLE p (a TEXT)").unwrap();
+    run(
+        &core,
+        &mut s,
+        "CREATE TABLE IF NOT EXISTS p (a TEXT, FOREIGN KEY (a) REFERENCES tp (k))",
+    )
+    .unwrap();
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "CREATE TABLE IF NOT EXISTS pn (a TEXT, FOREIGN KEY (a) REFERENCES tp (k))"
+        ),
+        "42P16"
+    );
     // 一時表が無い別セッションでは、通常どおり名前解決の結果（存在しない）になる。
     let mut other = ddl_session();
     assert_eq!(

@@ -4941,10 +4941,21 @@ impl EngineCore {
                 // TABLE-44・Issue #1683: 永続表の FOREIGN KEY がこのセッションの一時表の名前に
                 // 解決される場合は `42P16`（永続表は一時表を参照できない）。同名の永続表を
                 // 黙って参照する fail-open を避ける。
-                if stmt
-                    .foreign_keys
-                    .iter()
-                    .any(|fk| session.temp_tables().contains(fk.parent_table()))
+                // `IF NOT EXISTS` で同名の関係が既にあるときは、`execute_create_table` が定義の
+                // 意味検証より前に no-op 成功を返す契約のため、この検査も行わない（権限確認後の
+                // 既存名判定を FK 検証より先に維持する）。実際に新規作成する場合だけ拒否する。
+                let existing_noop = stmt.if_not_exists
+                    && self
+                        .storage
+                        .relation_name_exists(&stmt.table_name)
+                        .map_err(|_| crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "internal error".to_string(),
+                        })?;
+                if !existing_noop
+                    && stmt
+                        .foreign_keys
+                        .iter()
+                        .any(|fk| session.temp_tables().contains(fk.parent_table()))
                 {
                     return Err(
                         crate::sql::allowlist::SqlSurfaceError::invalid_table_definition(
