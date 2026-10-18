@@ -699,6 +699,10 @@ pub enum SqlSurfaceError {
     /// `CREATE TABLE` の列リストに同名の列が複数回宣言された（TABLE-6、
     /// Issue #899）。ERR-6: `42701`。
     DuplicateColumn { name: String },
+    /// `ON CONFLICT (<列>)` の衝突対象が、どの PRIMARY KEY・UNIQUE 制約の構成列集合とも
+    /// 一致しない（`42P10`。SQL-49・ERR-6、Issue #1707。`id` と他列の混在・未知列を含む）。
+    /// 束縛段（`sql::parser::resolve_conflict_target`）が返す。固定文言で列名・値を含めない。
+    InvalidColumnReference,
     /// DDL 文（`CREATE TABLE`・`DROP TABLE` 等。SQL-23、TASK-202・TASK-203、
     /// Issue #899・#902）を、DDL 実行権限（[`crate::sql::mode::SessionState::
     /// ddl_allowed`]）を持たないセッションが実行しようとした（ERR-2 拡張:
@@ -1205,6 +1209,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PartitionedDmlInTransaction => ErrorClass::ActiveSqlTransaction,
             SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
+            SqlSurfaceError::InvalidColumnReference => ErrorClass::InvalidColumnReference,
             SqlSurfaceError::InsufficientPrivilege | SqlSurfaceError::ConflictTargetNotVisible => {
                 ErrorClass::ForbiddenTenantMismatch
             }
@@ -1398,6 +1403,11 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::DuplicateColumn { name } => {
                 write!(f, "duplicate column name: {name}")
             }
+            // 列名・値を含めない固定文言（PostgreSQL の公開メッセージと同形）。
+            SqlSurfaceError::InvalidColumnReference => write!(
+                f,
+                "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+            ),
             // テーブル名・ユーザー名を含めない固定文言（security.md P0。
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
@@ -3194,8 +3204,8 @@ pub enum OnConflictAction {
 
 /// `ON CONFLICT (<col>[, <col>]*) DO NOTHING | DO UPDATE SET ...`（SQL-20・
 /// TABLE-16、Issue #1074）。対象列リストは構文段階（本モジュール）では列名の
-/// 宣言順の並びとしてのみ受理し、スキーマ照合（`id` 疑似列か、UNIQUE 制約の
-/// 構成列集合と一致するか）は `sql::parser::bind_upsert_form` の責務とする
+/// 宣言順の並びとしてのみ受理し、スキーマ照合（`id` 疑似列か、UNIQUE 制約または
+/// PRIMARY KEY の構成列集合と一致するか。SQL-49、Issue #1707）は `sql::parser::bind_upsert_form` の責務とする
 /// （`ValidatedStatement` の一般契約と同じ「構造検証はここまで」の分担）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnConflictClause {
@@ -8634,8 +8644,10 @@ impl<'a> Parser<'a> {
     /// 対象列リストは `id` に限らず任意の識別子の列（TABLE-16、Issue #1074）を
     /// 構文段階で受理する。列数上限（[`crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS`]）
     /// 超過・列名の重複はここで `42601` として拒否するが、対象列が実在する
-    /// スキーマ列か・`id` 単独か・宣言済み UNIQUE 制約の構成列集合と一致するかの
-    /// 意味論的検証は本モジュールの管轄外（`sql::parser::bind_upsert_form`）。
+    /// スキーマ列か・`id` 単独か・宣言済み UNIQUE 制約／PRIMARY KEY の構成列集合と
+    /// 一致するかの意味論的検証は本モジュールの管轄外（`sql::parser::bind_upsert_form`。
+    /// 一致なしは `42P10`、SQL-49・Issue #1707）。式・部分索引の推論形
+    /// （`((<式>))`・`(<列>) WHERE ...`）は本関数で `42601` のまま拒否する。
     /// `ON CONFLICT ON CONSTRAINT ...`・空の対象リスト（`ON CONFLICT ()`）は
     /// 未対応のまま `42601`（対象外・申し送り: Issue #1074 §8）。
     fn parse_on_conflict_clause(&mut self) -> Result<Option<OnConflictClause>, SqlSurfaceError> {
@@ -20055,7 +20067,7 @@ mod tests {
         // 構文段階（本モジュール）では `id` に限らず任意の列名を対象列として
         // 受理する（TABLE-16、Issue #1074）。宣言済み UNIQUE 制約の構成列
         // 集合と一致するかの意味論的検証は `sql::parser::bind_upsert_form` の
-        // 責務であり、`lang` に UNIQUE 制約が無いスキーマでは最終的に `42601`
+        // 責務であり、`lang` に UNIQUE 制約が無いスキーマでは最終的に `42P10`
         // になることを `sql::parser` の結合テストで固定する
         // （`rejects_upsert_target_not_matching_any_unique_constraint` 参照）。
         let lookup = catalog_with(&["documents"]);

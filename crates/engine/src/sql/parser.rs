@@ -4692,9 +4692,10 @@ pub enum BoundConflictTarget {
     /// 完全に不変）。
     RowId,
     /// `ON CONFLICT (<col>[, <col>]*)` が、宣言済み UNIQUE 制約のいずれか
-    /// （`schema.unique_constraints()`）の構成列**集合**と一致した場合の解決結果。
+    /// （`schema.unique_constraints()`）または PRIMARY KEY（`schema.primary_key()`。
+    /// SQL-49、Issue #1707）の構成列**集合**と一致した場合の解決結果。
     /// `Vec<usize>` は `schema.columns` に対する論理インデックスで、**解決した
-    /// 制約の宣言順**（対象リストに書いた順ではない。`(a,b)` と `(b,a)` は
+    /// 制約（PRIMARY KEY は宣言）の宣言順**（対象リストに書いた順ではない。`(a,b)` と `(b,a)` は
     /// 同じ制約に解決され、同じ並びになる——`content_hash::for_typed_upsert`
     /// の再送判定・golden ハッシュがこの順序に依存する）。
     Unique(Vec<usize>),
@@ -4810,48 +4811,45 @@ pub fn bind_insert_form(
     }
 }
 
-/// [`bind_upsert_form`] の対象列解決本体（TABLE-16、Issue #1074）。
+/// [`bind_upsert_form`] の対象列解決本体（TABLE-16・SQL-49、Issue #1074・#1707）。
 /// `sql::allowlist::OnConflictClause::target`（構文段階では検証していない
 /// 列名の並び）を `schema` と照合し、`(id)` 単独なら [`BoundConflictTarget::
 /// RowId`]（本 Issue 導入前と完全に同じ挙動）、それ以外は宣言済み UNIQUE
-/// 制約（`schema.unique_constraints()`。`schema.primary_key()` は対象外——
-/// PRIMARY KEY 宣言列を対象にすることは本 Issue のスコープ外・申し送り）の
-/// いずれかと**列名の集合**が一致する場合にのみ解決する（`(a,b)` と `(b,a)` は
-/// 同じ制約として解決され、`Unique` が返す列インデックスは対象リストに書いた
-/// 順ではなく**解決した制約の宣言順**になる。`content_hash::for_typed_upsert`
-/// の再送判定・golden ハッシュがこの順序に依存する）。
+/// 制約（`CREATE UNIQUE INDEX` 由来を含む）または PRIMARY KEY のいずれかと
+/// **列名の集合**が一致する場合にのみ [`BoundConflictTarget::Unique`] へ解決する
+/// （`(a,b)` と `(b,a)` は同じ制約として解決される）。
 ///
-/// 次のいずれかに該当する入力はすべて `42601`
-/// （[`SqlSurfaceError::unsupported`]。固定文言）で拒否する:
+/// - 判定順は「UNIQUE 制約を宣言順に先、PRIMARY KEY は後」で固定する。既に受理して
+///   いた文の解決結果と `content_hash::for_typed_upsert`（解決した列名の並びを含む）
+///   の再送判定・golden ハッシュを変えないため。
+/// - `Unique` が返す列インデックスは対象リストの順ではなく**解決した制約の宣言順**
+///   （PRIMARY KEY は宣言順）。永続索引の序数照合
+///   （`constraint::unique_index::recover_forward_keys_for_rows`）が `key_specs` の
+///   各 spec の宣言順 `indices` との完全一致で序数を探すため、順序を崩すと
+///   不可視の破損行の補完が効かなくなる。
+///
+/// 次のいずれかに該当する入力はすべて `42P10`
+/// （[`SqlSurfaceError::InvalidColumnReference`]。固定文言）で拒否する:
 /// - `id` と他の列が混在する対象リスト
-/// - どの UNIQUE 制約の構成列集合とも一致しない（未知列・大小文字違い・
-///   PRIMARY KEY 宣言列を含む場合も、一致する UNIQUE 制約が無い以上ここに
-///   丸め込まれる）
+/// - どの UNIQUE 制約・PRIMARY KEY の構成列集合とも一致しない（部分集合・上位集合・
+///   未知列・大小文字違いを含む）
+///
+/// 式・部分索引の推論形は構文段（`sql::allowlist::parse_on_conflict_clause`）で
+/// `42601` として拒否済みでここへは来ない。
 fn resolve_conflict_target(
     target: &[String],
     schema: &TableSchema,
 ) -> Result<BoundConflictTarget, SqlSurfaceError> {
-    if target.len() == 1 && target[0] == "id" {
+    if matches!(target, [only] if only == "id") {
         return Ok(BoundConflictTarget::RowId);
     }
     if target.iter().any(|c| c == "id") {
-        return Err(SqlSurfaceError::unsupported(
-            "ON CONFLICT target list must be exactly (id) or match a UNIQUE constraint's columns",
-        ));
+        return Err(SqlSurfaceError::InvalidColumnReference);
     }
     let target_set: std::collections::BTreeSet<&str> =
         target.iter().map(std::string::String::as_str).collect();
-    for constraint in schema.unique_constraints() {
-        let constraint_set: std::collections::BTreeSet<&str> = constraint
-            .columns()
-            .iter()
-            .map(std::string::String::as_str)
-            .collect();
-        if constraint_set != target_set {
-            continue;
-        }
-        let indices: Vec<usize> = constraint
-            .columns()
+    let to_indices = |columns: &[String]| -> Result<Vec<usize>, SqlSurfaceError> {
+        columns
             .iter()
             .map(|name| {
                 schema
@@ -4859,16 +4857,30 @@ fn resolve_conflict_target(
                     .iter()
                     .position(|c| &c.name == name)
                     .ok_or_else(|| SqlSurfaceError::Internal {
-                        detail: "internal: unique constraint column not found in live schema"
+                        detail: "internal: conflict target column not found in live schema"
                             .to_string(),
                     })
             })
-            .collect::<Result<_, _>>()?;
-        return Ok(BoundConflictTarget::Unique(indices));
+            .collect()
+    };
+    let matches_target = |columns: &[String]| -> bool {
+        columns
+            .iter()
+            .map(std::string::String::as_str)
+            .collect::<std::collections::BTreeSet<&str>>()
+            == target_set
+    };
+    for constraint in schema.unique_constraints() {
+        if matches_target(constraint.columns()) {
+            return Ok(BoundConflictTarget::Unique(to_indices(
+                constraint.columns(),
+            )?));
+        }
     }
-    Err(SqlSurfaceError::unsupported(
-        "ON CONFLICT target list does not match any declared UNIQUE constraint",
-    ))
+    if let Some(pk) = schema.primary_key().filter(|pk| matches_target(pk)) {
+        return Ok(BoundConflictTarget::Unique(to_indices(pk)?));
+    }
+    Err(SqlSurfaceError::InvalidColumnReference)
 }
 
 /// [`bind_insert_form`] が `stmt.on_conflict` を検出した場合の束縛本体
@@ -10967,7 +10979,7 @@ mod tests {
             &schema,
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        assert_eq!(err.wire_code(), "42P10");
     }
 
     #[test]
@@ -10979,7 +10991,7 @@ mod tests {
             &schema,
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        assert_eq!(err.wire_code(), "42P10");
     }
 
     #[test]
@@ -10991,7 +11003,7 @@ mod tests {
             &schema,
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        assert_eq!(err.wire_code(), "42P10");
     }
 
     #[test]
@@ -11003,7 +11015,7 @@ mod tests {
             &schema,
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        assert_eq!(err.wire_code(), "42P10");
     }
 
     #[test]
@@ -11015,31 +11027,52 @@ mod tests {
             &schema,
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        assert_eq!(err.wire_code(), "42P10");
+    }
+
+    /// PRIMARY KEY 対象の束縛テスト共通スキーマ: 複合 PK `(code, region)` と、
+    /// 宣言順が列順と異なる点を確認するため `note` を先頭に置く（SQL-49、Issue #1707）。
+    fn primary_key_target_schema() -> TableSchema {
+        TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("note", ColumnType::Text, true),
+                ColumnDef::new("region", ColumnType::Text, false),
+                ColumnDef::new("code", ColumnType::Text, false),
+            ],
+        )
+        .with_primary_key(vec!["code".to_string(), "region".to_string()])
     }
 
     #[test]
-    fn bind_upsert_form_rejects_primary_key_column_as_target() {
-        // PRIMARY KEY 宣言列を対象にすることは本 Issue（#1074）のスコープ外
-        // （§8 対象外・申し送り）。`schema.unique_constraints()` には含まれない
-        // ため、UNIQUE 制約と同じ経路には解決されず `42601` になる。
-        let schema = TableSchema::new(
-            "documents",
-            vec![ColumnDef::new("code", ColumnType::Text, false)],
-        )
-        .with_primary_key(vec!["code".to_string()]);
-        let lookup = FakeCatalog {
-            tables: ["documents"].into_iter().collect(),
-        };
-        let stmt = crate::sql::allowlist::validate_insert(
+    fn bind_upsert_form_resolves_primary_key_target_in_declared_order() {
+        let schema = primary_key_target_schema();
+        for target in ["(code, region)", "(region, code)"] {
+            let sql = format!(
+                "INSERT INTO documents (id, code, region) VALUES (1, 'x', 'y') \
+                 ON CONFLICT {target} DO NOTHING USING OPERATION_ID 'op-pk-target'"
+            );
+            let bound = bind_upsert_sql(&sql, &schema).expect("PK target should resolve");
+            match bound {
+                // PK の宣言順（`code` → `region`）の列位置。対象リストの書き順には依存しない。
+                BoundInsertForm::Upsert(upsert) => {
+                    assert_eq!(upsert.target, BoundConflictTarget::Unique(vec![2, 1]));
+                }
+                other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_primary_key_subset_as_target() {
+        let schema = primary_key_target_schema();
+        let err = bind_upsert_sql(
             "INSERT INTO documents (id, code) VALUES (1, 'x') ON CONFLICT (code) DO NOTHING \
-             USING OPERATION_ID 'op-pk-target'",
-            &lookup,
-            crate::recovery::required_op_id::LedgerMode::Ledgered,
+             USING OPERATION_ID 'op-pk-subset'",
+            &schema,
         )
-        .expect("must pass allowlist");
-        let err = bind_insert_form(&stmt, &schema).unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42P10");
     }
 
     #[test]

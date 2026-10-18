@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 69;
+    count = 70;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -246,6 +246,13 @@ define_error_classes! {
     /// TABLE-6・TASK-85（Issue #899）が追加。
     /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateColumn`] の写像。
     DuplicateColumn => ("42701", "DUPLICATE_COLUMN"),
+    /// `INSERT ... ON CONFLICT (<列>)` の衝突対象が、宣言済みの PRIMARY KEY・UNIQUE
+    /// 制約・UNIQUE 索引のどれの構成列集合とも一致しない（`42P10`。SQL-49・ERR-6、
+    /// Issue #1707）。従来 `42601` で拒否していた束縛段の「一致なし」を PostgreSQL と
+    /// 同じコードへ寄せた分類。構文段で拒否する形（式・部分索引の推論等）は
+    /// [`ErrorClass::UnsupportedSqlSyntax`]（`42601`）のまま。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidColumnReference`] の写像。
+    InvalidColumnReference => ("42P10", "INVALID_COLUMN_REFERENCE"),
     /// `FETCH`／`CLOSE` が参照したカーソル名が、現在のトランザクション内に
     /// 存在しない（`34000`）。WIRE-15・TASK-218 が追加。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidCursorName`] の写像。

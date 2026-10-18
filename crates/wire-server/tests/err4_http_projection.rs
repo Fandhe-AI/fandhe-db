@@ -279,7 +279,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 66] = [
+const EXPECTED_STATUS: [(&str, u16); 67] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -314,6 +314,8 @@ const EXPECTED_STATUS: [(&str, u16); 66] = [
     // 同じ分類・同じステータスを共有する。
     ("42P07", 409),
     ("42701", 400),
+    // Issue #1707・SQL-49・ERR-6: `ON CONFLICT` 衝突対象の不一致。SQL 表層専用で 400。
+    ("42P10", 400),
     // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW` が
     // 新設する残り 2 分類。SQL 表層専用の DDL であり NoSQL `op` 許可リストには
     // 含めない（本ファイル冒頭 doc の「到達不能類型」と同じ扱い。
@@ -472,7 +474,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 69);
+const _: () = assert!(ErrorClass::ALL.len() == 70);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -996,6 +998,8 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // `UntranslatableCharacter`（`22P05`。Issue #2185）: jsonpath リテラルの NUL 文字。
         // SQL 表層専用で NoSQL 表層からは到達不能。
         ErrorClass::UntranslatableCharacter,
+        // `InvalidColumnReference`（`42P10`。Issue #1707）: `ON CONFLICT` 対象の束縛は SQL 表層専用。
+        ErrorClass::InvalidColumnReference,
         // `InvalidBinaryRepresentation`（`22P03`。Issue #2443）: SQL 表層専用で NoSQL 表層からは到達不能。
         ErrorClass::InvalidBinaryRepresentation,
         // （`IntervalFieldOverflow`〔`22015`〕は Issue #1583 で NoSQL の INTERVAL 型束縛から
