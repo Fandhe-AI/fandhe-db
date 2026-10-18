@@ -22,6 +22,14 @@
 
 任意モードの既定値・例外・照会契約・設定制約・経路別の扱いなどの詳細は、公開境界の確認後に各 Issue で確定し、必要なら本メモを追記する。
 
+## Issue #1703 追記
+
+- `--require-operation-id` は値を取らない起動時スイッチ。解決は `crates/wire-server/src/require_operation_id_opt.rs` の `resolve` に一本化し、`EngineCore::with_ledger_mode` へ 1 回だけ注入する（セッション・SQL・HTTP からは変更できない）
+- 指定時は `LedgerMode::Ledgered`（現行の必須契約）。未指定時は `LedgerMode::default()` を注入するだけで、現時点の挙動は変わらない。任意モードの variant 追加と既定の移行は #1704 の担当
+- 未指定を `CompareOnlyWithoutLedger` へ写像しない（台帳書き込みが無効になり再送の冪等性が失われるため）
+- 重複指定・`=` 連結形・後続の値は起動エラー（fail-closed）。指定時のみ起動ログに英語 1 行を出す
+- 受け入れ条件のうち「未指定時に省略を受理する」実挙動は #1704 マージ後に成立する
+
 ## スコープ外
 
 - コード変更（後続 Issue で実施）

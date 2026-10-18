@@ -82,6 +82,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--hnsw-sparse-visited-max <N>] \
   [--hnsw-scope all|declared] \
   [--durability immediate|none] \
+  [--require-operation-id] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--batch-max-files <1-1000000>] \
   [--max-table-columns <1-256>] [--max-array-elements <1-1024>] [--max-enum-labels <1-256>] \
@@ -261,6 +262,13 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 含意を運用者が見落とさないよう、`none` を選んだ場合に限り起動ログへ英語の
 `WARNING` 行を 1 行出します（`immediate`・未指定では出力されません）。
 `EXPLAIN` への durability 設定の露出は対象外です。
+
+`--require-operation-id`（Issue #1703）は値を取らないスイッチで、指定すると
+書き込み文の `USING OPERATION_ID` 省略を `23502` で拒否します（現行の必須
+契約）。プロセス起動時にのみ指定でき、セッション・SQL からは変更できません。
+重複指定・`=` 連結形・後続の値は fail-closed で起動エラーとなり、指定時に
+限り起動ログへ英語の 1 行を出します。未指定時に省略を受理する任意モードは
+engine 側の実装（Issue #1704）以降で、それまでは現行どおり必須です。
 
 `--max-dml-affected-rows`・`--max-insert-rows`（Issue #997。オーナー判断の
 改訂・2026-09-27）は、それぞれ述語形 `UPDATE`／`DELETE`（`WHERE` 句付き）の

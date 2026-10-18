@@ -267,6 +267,15 @@
 //! `EngineCore::with_hnsw_scope` へ 1 回だけ注入する（`docs/design/
 //! index-declaration-effects.md` 参照）。
 //!
+//! `--require-operation-id`（Issue #1703・親 #1701・RECOVER-1 ポインタ）: 値を
+//! 取らないスイッチ。指定すると書き込み文の `USING OPERATION_ID` 省略を `23502`
+//! で拒否する従来の必須契約で起動する。2 回目以降の重複指定・`=` 連結形・後続の
+//! 値（未知引数として扱われる）はいずれも fail-closed で起動エラー。解決は
+//! `wire_server::require_operation_id_opt::resolve` に一本化し、
+//! `EngineCore::with_ledger_mode` へ 1 回だけ注入する（セッション・SQL からは
+//! 変更できない）。未指定時の扱い（任意モード）は engine 側の #1704 で実装され、
+//! それまでは従来の必須契約のまま（`docs/design/operation-id-optional.md` 参照）。
+//!
 //! `--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
 //! WIRE-7, WIRE-9 ポインタ）: TLS opt-in の唯一の入口。`--tls-cert`（証明書
 //! チェーン PEM）・`--tls-key`（Ed25519 PKCS#8 秘密鍵 PEM）は両方揃って
@@ -400,6 +409,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut sparse_visited_max_raw: Option<String> = None;
     let mut durability_raw: Option<String> = None;
     let mut hnsw_scope_raw: Option<String> = None;
+    let mut require_operation_id = false;
     let mut max_dml_affected_rows_raw: Option<String> = None;
     let mut max_insert_rows_raw: Option<String> = None;
     let mut batch_max_files_raw: Option<String> = None;
@@ -618,6 +628,19 @@ fn run_server(args: &[String]) -> ExitCode {
                 }
                 durability_raw = Some(v.clone());
                 i += 2;
+            }
+            wire_server::require_operation_id_opt::FLAG => {
+                // Issue #1703: 値なしスイッチ。起動後に変更できない構成値のため、
+                // 他フラグと同じ理由で 2 回目以降の指定を fail-closed に拒否する。
+                if require_operation_id {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::require_operation_id_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                require_operation_id = true;
+                i += 1;
             }
             wire_server::hnsw_scope_opt::FLAG => {
                 let Some(v) = args.get(i + 1) else {
@@ -2143,6 +2166,12 @@ fn run_server(args: &[String]) -> ExitCode {
     // `with_hnsw_scope` を呼ばない構築とビット同一）。HNSW opt-in なしの構築
     // では engine 側で参照されない。
     core = core.with_hnsw_scope(hnsw_scope);
+    // Issue #1703: 未指定でも常に呼ぶ（未指定は `LedgerMode::default()` で、
+    // 呼ばない構築とビット同一）。SQL・NoSQL 両表層が同一の `Arc<EngineCore>` を
+    // 共有するため両方に効く（HTTP 側の任意化の意味付けは #2203）。
+    core = core.with_ledger_mode(wire_server::require_operation_id_opt::resolve(
+        require_operation_id,
+    ));
     let core = Arc::new(core);
 
     // `guarded.bind()` は検証済みの数値アドレスへ直接 bind し、`bind_addr`
@@ -2166,6 +2195,15 @@ fn run_server(args: &[String]) -> ExitCode {
     if let Some(kind) = fault_kind {
         wire_server::fault_injection::arm(kind);
         engine::log_stderr!("wire-server: fault injection armed: post-commit-panic (test only)");
+    }
+
+    // Issue #1703: フラグ指定時に限り必須契約で起動した旨を 1 行出す（未指定時は
+    // 何も出さず既存 stderr をビット同一に保つ。`listening on` より前・bind 成功後）。
+    if require_operation_id {
+        engine::log_stderr!(
+            "wire-server: {}",
+            wire_server::require_operation_id_opt::STARTUP_NOTICE
+        );
     }
 
     // Issue #850: 非既定 durability（`WriteDurability::None`）を選んだ場合に
