@@ -609,6 +609,113 @@ pub(crate) fn delete_table_in_txn(
     Ok(())
 }
 
+/// `ALTER TABLE ... RENAME TO`（[`crate::catalog::Storage::alter_table_rename`]、TABLE-38 の
+/// ポインタ、Issue #1625）と同一 write txn で、台帳（[`OP_LEDGER_TABLE`]）と `last_op`
+/// （[`LAST_OP_TABLE`]）の表名を `old` から `new` へ付け替える。改名前の `operation_id` を
+/// 新しい表名で再送したとき、改名前の記録で重複判定できるようにする（削除すると二重適用の
+/// 余地が残るため移す）。値のバイト列は無加工でコピーする（v1/v2/v3 を保つ。デコードしない）。
+///
+/// 台帳テーブルが未作成なら no-op（`list_tables` で存在確認し、`open_table` の自動作成で
+/// 空テーブルを作らない。[`delete_table_in_txn`] と同じ契約）。移送先に同じキーが既にあれば
+/// fail-closed で `Codec` エラーにする（呼び出し元が直前に新名分を掃除するため通常は到達
+/// しない。メッセージにテナント・表名・`operation_id` を含めない）。走査は
+/// [`DELETE_BATCH_SIZE`] 件単位の有界バッチで前方一方向に進める。
+pub(crate) fn rename_table_in_txn(
+    write_txn: &redb::WriteTransaction,
+    old: &str,
+    new: &str,
+) -> Result<(), StorageError> {
+    let existing_table_names: std::collections::HashSet<String> = write_txn
+        .list_tables()
+        .map_err(StorageError::from)?
+        .map(|handle| handle.name().to_string())
+        .collect();
+    let target_exists = || StorageError::Codec("ledger rename target already has entries".into());
+
+    if existing_table_names.contains(OP_LEDGER_TABLE.name()) {
+        let mut ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
+        let mut resume_after: Option<(String, String, String)> = None;
+        loop {
+            let mut batch: Vec<(String, String, Vec<u8>)> = Vec::new();
+            let mut reached_batch_limit = false;
+            {
+                let lower = match resume_after.as_ref() {
+                    Some((t, tb, op)) => Bound::Excluded((t.as_str(), tb.as_str(), op.as_str())),
+                    None => Bound::Unbounded,
+                };
+                let iter = ledger_table.range::<(&str, &str, &str)>((lower, Bound::Unbounded))?;
+                for entry in iter {
+                    let (k, v) = entry?;
+                    let (tenant_id, table_name, op_id) = k.value();
+                    if table_name == old {
+                        batch.push((tenant_id.to_string(), op_id.to_string(), v.value().to_vec()));
+                        if batch.len() >= DELETE_BATCH_SIZE {
+                            reached_batch_limit = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            resume_after = batch
+                .last()
+                .map(|(t, op, _)| (t.clone(), old.to_string(), op.clone()));
+            for (tenant_id, op_id, value) in &batch {
+                let occupied = ledger_table
+                    .insert((tenant_id.as_str(), new, op_id.as_str()), value.as_slice())?
+                    .is_some();
+                if occupied {
+                    return Err(target_exists());
+                }
+                ledger_table.remove((tenant_id.as_str(), old, op_id.as_str()))?;
+            }
+            if !reached_batch_limit {
+                break;
+            }
+        }
+    }
+
+    if existing_table_names.contains(LAST_OP_TABLE.name()) {
+        let mut last_op_table = write_txn.open_table(LAST_OP_TABLE)?;
+        let mut resume_after: Option<(String, String)> = None;
+        loop {
+            let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut reached_batch_limit = false;
+            {
+                let lower = match resume_after.as_ref() {
+                    Some((t, tb)) => Bound::Excluded((t.as_str(), tb.as_str())),
+                    None => Bound::Unbounded,
+                };
+                let iter = last_op_table.range::<(&str, &str)>((lower, Bound::Unbounded))?;
+                for entry in iter {
+                    let (k, v) = entry?;
+                    let (tenant_id, table_name) = k.value();
+                    if table_name == old {
+                        batch.push((tenant_id.to_string(), v.value().to_vec()));
+                        if batch.len() >= DELETE_BATCH_SIZE {
+                            reached_batch_limit = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            resume_after = batch.last().map(|(t, _)| (t.clone(), old.to_string()));
+            for (tenant_id, value) in &batch {
+                let occupied = last_op_table
+                    .insert((tenant_id.as_str(), new), value.as_slice())?
+                    .is_some();
+                if occupied {
+                    return Err(target_exists());
+                }
+                last_op_table.remove((tenant_id.as_str(), old))?;
+            }
+            if !reached_batch_limit {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// write txn 内で `(tenant_id, table, op_id)` が台帳に記録済みかを照会する
 /// （Issue #1127。分割実行の各チャンクが走査前に台帳を引く #1128 の土台）。
 /// 台帳テーブルが未作成なら `false`（`list_tables` で存在確認し、write txn の
@@ -1751,5 +1858,82 @@ mod tests {
         )
         .expect("disabled");
         assert_eq!(out, RecordOutcome::Skipped);
+    }
+
+    // (R) rename_table_in_txn は old のキーだけを new へ移し（複数バッチ・複数テナント）、
+    // 他表と last_op は保たれる。台帳表が無ければ何も作らない。
+    #[test]
+    fn rename_table_in_txn_moves_only_old_entries_across_batches() {
+        let path = unique_db_path("ledger-rename");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+        let wt = db.begin_write().expect("w");
+        rename_table_in_txn(&wt, "documents", "docs2").expect("noop");
+        assert_eq!(wt.list_tables().expect("list").count(), 0);
+        let n = DELETE_BATCH_SIZE + 5;
+        for i in 0..n {
+            for tenant in ["tenant-a", "tenant-b"] {
+                record_in_txn(
+                    &wt,
+                    tenant,
+                    "documents",
+                    LedgerWrite::Record(&op(&format!("op-{i}"))),
+                    &hash("c"),
+                )
+                .expect("record");
+            }
+        }
+        record_in_txn(
+            &wt,
+            "tenant-a",
+            "other",
+            LedgerWrite::Record(&op("op-o")),
+            &hash("c"),
+        )
+        .expect("record other");
+        wt.commit().expect("commit");
+
+        let wt = db.begin_write().expect("w");
+        rename_table_in_txn(&wt, "documents", "docs2").expect("rename");
+        wt.commit().expect("commit");
+
+        let rt = db.begin_read().expect("r");
+        for i in [0, n / 2, n - 1] {
+            for tenant in ["tenant-a", "tenant-b"] {
+                let o = op(&format!("op-{i}"));
+                assert!(contains_in_read_txn(&rt, tenant, "docs2", &o).expect("c"));
+                assert!(!contains_in_read_txn(&rt, tenant, "documents", &o).expect("c"));
+            }
+        }
+        assert!(contains_in_read_txn(&rt, "tenant-a", "other", &op("op-o")).expect("c"));
+        let t = rt.open_table(OP_LEDGER_TABLE).expect("open");
+        assert_eq!(
+            redb::ReadableTableMetadata::len(&t).expect("len"),
+            (n * 2 + 1) as u64
+        );
+        let last = rt.open_table(LAST_OP_TABLE).expect("open last_op");
+        assert!(last.get(("tenant-a", "docs2")).expect("get").is_some());
+        assert!(last.get(("tenant-a", "documents")).expect("get").is_none());
+        assert!(last.get(("tenant-a", "other")).expect("get").is_some());
+    }
+
+    // (R-2) 移送先に同じキーが残っていれば fail-closed。
+    #[test]
+    fn rename_table_in_txn_refuses_occupied_target() {
+        let path = unique_db_path("ledger-rename-occupied");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+        let wt = db.begin_write().expect("w");
+        for table in ["documents", "docs2"] {
+            record_in_txn(
+                &wt,
+                "tenant-a",
+                table,
+                LedgerWrite::Record(&op("op-x")),
+                &hash("c"),
+            )
+            .expect("record");
+        }
+        assert!(rename_table_in_txn(&wt, "documents", "docs2").is_err());
     }
 }
