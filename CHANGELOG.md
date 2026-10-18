@@ -9,6 +9,13 @@
 
 ### Breaking Changes
 
+- `TRUNCATE ... [CASCADE | RESTRICT]`（Issue #1644・SQL-48 (2)）: 従来 `42601` だった `CASCADE`／`RESTRICT` を
+  受理する（省略時は RESTRICT）。RESTRICT は指定していない表の FK が参照する表の `TRUNCATE` を、参照元の
+  行の有無・他テナントの行に関係なくカタログ宣言だけで `0A000` で拒否する（従来は行を消した後の事後検査で
+  自テナントの子の行が残れば `23503`。子が空なら成功していた）。CASCADE は FK の参照元の表を推移的に
+  対象へ加え、同じトランザクションで自テナントの行を削除する（参照アクションは発火しない）。公開 API は
+  `ValidatedTruncate::behavior` の追加、`TruncateOutcome` の `Copy` 削除と `cascaded()` の追加、
+  `TenantWriteError::TruncateReferencedByForeignKey` の追加。
 - `CREATE VIEW v (a, b) AS ...`（Issue #1659・TABLE-41 (1)）: 従来 `42601` だった列別名リストを受理する。
   別名は出力列に先頭から名前を付け、短いリストの残りは導出名のまま。出力列より長いリストは `42601`、
   リスト内または最終名の重複は `42701`。別名付きビューが読む表への `RENAME COLUMN` は `0A000`、

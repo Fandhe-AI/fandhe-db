@@ -43,6 +43,7 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::ReturningProjectionTooLarge(_) => ErrorClass::PayloadTooLarge,
         TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
         TenantWriteError::TooManyRowsScanned { .. } => ErrorClass::PayloadTooLarge,
+        TenantWriteError::TruncateReferencedByForeignKey { .. } => ErrorClass::FeatureNotSupported,
         TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
         TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
         // オーナー判断（2026-09-28・Issue #1075）: 内側の `SqlSurfaceError` の
@@ -74,6 +75,10 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
         TenantWriteError::ReturningProjectionTooLarge("test".to_string()),
         TenantWriteError::CapturedRowDecodeFailed("test".to_string()),
         TenantWriteError::TooManyRowsScanned { max: 1 },
+        TenantWriteError::TruncateReferencedByForeignKey {
+            table: "p".to_string(),
+            referencing_table: "c".to_string(),
+        },
         TenantWriteError::UniqueViolation,
         TenantWriteError::ForeignKeyViolation,
         TenantWriteError::ReferentialActionLimitExceeded,

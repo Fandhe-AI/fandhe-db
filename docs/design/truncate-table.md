@@ -21,11 +21,12 @@ TRUNCATE TABLE <table> USING OPERATION_ID '<id>'
   場合は既存の `EXPLAIN` 分岐（次トークンが `SELECT` であることを要求）へ流れて
   自然に `42601` になる（`INSERT` と同じ経路）。
 - `FOREIGN KEY` の参照アクション（`CASCADE`／`SET NULL`／`SET DEFAULT`。TABLE-17・
-  TASK-205、Issue #1076）は発火しない（`TRUNCATE ... CASCADE` は上記のとおり
-  許可リスト外で未対応のまま）。PostgreSQL の `TRUNCATE` も `ON DELETE` アクションを
+  TASK-205、Issue #1076）は発火しない（`TRUNCATE ... CASCADE` も参照元の表を
+  対象へ加えて空にするだけ。Issue #1644。`truncate-multi-table.md` 参照）。PostgreSQL の `TRUNCATE` も `ON DELETE` アクションを
   発火させない挙動に合わせた設計判断で、`constraint::ReferencedRowsChange::Truncated`
-  （`Removed` と区別する専用 variant）を渡すことで事後検証（`NO ACTION` 相当。
-  自テナントの参照元行が残れば `23503`）のみを行う。詳細は
+  （`Removed` と区別する専用 variant）を渡すことで事後検証（`NO ACTION` 相当）のみを行う。
+  RESTRICT の拒否は Issue #1644 以降、行を消す前のカタログ宣言による判定（`0A000`）が先に働き、
+  この事後検証は多層防御として残る。詳細は
   `docs/design/foreign-key.md`「D15」節参照。
 
 ## 削除スコープ: 「RLS 可視集合」ではなく「テナント所有」

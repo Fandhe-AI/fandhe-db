@@ -3634,11 +3634,15 @@ fn finalize_primary_key(
 /// 書き込み系操作（DDL ではない）として扱う。
 ///
 /// 受理する形は `TRUNCATE [TABLE] [ONLY] <table> [*] [, [ONLY] <table> [*] ...]
-/// USING OPERATION_ID '<id>' [;]`（SQL-48 (1)(4)、Issue #1643。継承が無いため
-/// `ONLY`／`*` は意味を変えない no-op）。`CASCADE`／`RESTRICT`／
-/// `RESTART IDENTITY` 等の拡張句は許可リスト外（後続 Issue の範囲）。
+/// [CASCADE | RESTRICT] USING OPERATION_ID '<id>' [;]`（SQL-48 (1)(2)(4)、Issue #1643・
+/// #1644。継承が無いため `ONLY`／`*` は意味を変えない no-op）。`RESTART IDENTITY` 等の
+/// 拡張句は許可リスト外（後続 Issue の範囲。`42601`）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedTruncate {
+    /// 参照元表の扱い（SQL-48 (2)、Issue #1644）。省略時は `Restrict`。RESTRICT は指定表を
+    /// 指定外の表の FK が参照していればカタログ宣言だけで `0A000` で拒否し、CASCADE は
+    /// 参照元の表を推移的に対象へ加える（判定・適用は `tenant::truncate_tables_unchecked`）。
+    pub behavior: DropBehavior,
     /// 指定され、カタログ存在確認を通過したテーブル名。非空・重複除去済みで、
     /// 文中の初出順を保つ。全表を 1 つの write トランザクションで処理する。
     pub table_names: Vec<String>,
@@ -4350,7 +4354,11 @@ impl<'a> Parser<'a> {
             self.tokens.get(self.pos.saturating_add(1)),
             Some(Token::Punct(',' | '*'))
         ) || (self.peek_ident_matches_at(1, "USING")
-            && self.peek_ident_matches_at(2, "OPERATION_ID"));
+            && self.peek_ident_matches_at(2, "OPERATION_ID"))
+            // `TRUNCATE only CASCADE USING ...` の `only` も表名（Issue #1644）。
+            || ((self.peek_ident_matches_at(1, "CASCADE")
+                || self.peek_ident_matches_at(1, "RESTRICT"))
+                && self.peek_ident_matches_at(2, "USING"));
         // 直後に表名候補（識別子）が無い場合（文末・`;`）も `word` 自体を表名とみなす。
         // `CompareOnlyWithoutLedger` では OPERATION_ID 句を省略でき、`TRUNCATE TABLE only`
         // が従来どおり受理される互換性を保つ。
@@ -9005,10 +9013,11 @@ impl<'a> Parser<'a> {
     }
 
     /// `TRUNCATE [TABLE] [ONLY] <table> [*] [, [ONLY] <table> [*] ...]
-    /// USING OPERATION_ID '<id>' [;]` を受理する（SQL-22、TASK-193。TABLE 省略・
-    /// 複数テーブル・`ONLY`／`*` は SQL-48 (1)(4)、Issue #1643）。`CASCADE`／
-    /// `RESTRICT`／`RESTART IDENTITY` 等の拡張句は構造的に受理しない
-    /// （`expect_end_of_statement` が余剰トークンとして `42601` で拒否する）。
+    /// [CASCADE | RESTRICT] USING OPERATION_ID '<id>' [;]` を受理する（SQL-22、TASK-193。
+    /// TABLE 省略・複数テーブル・`ONLY`／`*` は SQL-48 (1)(4)、Issue #1643。
+    /// `CASCADE`／`RESTRICT` は SQL-48 (2)、Issue #1644）。`RESTART IDENTITY` 等の
+    /// 拡張句は構造的に受理しない（`expect_end_of_statement` が余剰トークンとして
+    /// `42601` で拒否する。識別句は後続 Issue がこの behavior の手前に差し込む）。
     ///
     /// `TABLE`／`ONLY` は予約語ではないため、直後が `,`・`*`・`USING OPERATION_ID`
     /// の場合は同名の表名として扱い（[`Self::peek_truncate_keyword`]）、従来の
@@ -9038,6 +9047,10 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // 表名は先に `expect_ident` で読み切るため、`cascade` という名前の表は
+        // 従来どおり表名として扱われ、ここで読むのは表リスト直後の句だけになる。
+        let behavior = self.parse_optional_drop_behavior();
+
         // 文末専用句の構造パースのみをここで行う（`parse_insert` と同じ設計。
         // 必須化の判定は `validate_truncate` が `mode.require` へ委譲する。
         // TASK-92・RECOVER-1 と同じ理由で、この時点ではまだカタログ照会を
@@ -9046,6 +9059,7 @@ impl<'a> Parser<'a> {
 
         Ok(ParsedTruncateShape {
             table_names,
+            behavior,
             operation_id,
         })
     }
@@ -12200,6 +12214,7 @@ pub(crate) fn validate_drop_view_tokens(
 /// （SQL-22、TASK-193）。
 struct ParsedTruncateShape {
     table_names: Vec<String>,
+    behavior: DropBehavior,
     operation_id: Option<OperationId>,
 }
 
@@ -15764,6 +15779,7 @@ pub(crate) fn validate_truncate_tokens(
     }
 
     Ok(ValidatedTruncate {
+        behavior: shape.behavior,
         table_names: shape.table_names,
         operation_id: shape.operation_id,
     })
@@ -21149,13 +21165,64 @@ mod tests {
     fn rejects_truncate_with_qualified_star_or_extension_clauses() {
         for sql in [
             "TRUNCATE a.* USING OPERATION_ID 'op-0001'",
-            "TRUNCATE a CASCADE USING OPERATION_ID 'op-0001'",
-            "TRUNCATE a RESTRICT USING OPERATION_ID 'op-0001'",
             "TRUNCATE a RESTART IDENTITY USING OPERATION_ID 'op-0001'",
+            "TRUNCATE a CASCADE RESTRICT USING OPERATION_ID 'op-0001'",
+            "TRUNCATE a CASCADE, b USING OPERATION_ID 'op-0001'",
+            "TRUNCATE a USING OPERATION_ID 'op-0001' CASCADE",
         ] {
-            let err = truncate_names(sql, &["a"]).expect_err(sql);
+            let err = truncate_names(sql, &["a", "b"]).expect_err(sql);
             assert_eq!(err.wire_code(), "42601", "{sql}");
         }
+    }
+
+    fn truncate_behavior(sql: &str, tables: &[&'static str]) -> (DropBehavior, Vec<String>) {
+        let lookup = catalog_with(tables);
+        let v = validate_truncate(sql, &lookup, LedgerMode::Ledgered).expect(sql);
+        (v.behavior, v.table_names)
+    }
+
+    /// SQL-48 (2): `CASCADE`／`RESTRICT` は表リスト直後に 1 つだけ書け、省略時は RESTRICT。
+    #[test]
+    fn accepts_truncate_cascade_and_restrict_with_default_restrict() {
+        let op = "USING OPERATION_ID 'op-0001'";
+        assert_eq!(
+            truncate_behavior(&format!("TRUNCATE a {op}"), &["a"]).0,
+            DropBehavior::Restrict
+        );
+        assert_eq!(
+            truncate_behavior(&format!("TRUNCATE a RESTRICT {op}"), &["a"]).0,
+            DropBehavior::Restrict
+        );
+        let (b, names) =
+            truncate_behavior(&format!("TRUNCATE TABLE a, b cascade {op}"), &["a", "b"]);
+        assert_eq!(b, DropBehavior::Cascade);
+        assert_eq!(names, vec!["a", "b"]);
+        // 末尾 `;` と、`only` を表名として使う形。
+        assert_eq!(
+            truncate_behavior(&format!("TRUNCATE a CASCADE {op};"), &["a"]).0,
+            DropBehavior::Cascade
+        );
+        let (b, names) = truncate_behavior(&format!("TRUNCATE \"only\" CASCADE {op}"), &["only"]);
+        assert_eq!(
+            (b, names),
+            (DropBehavior::Cascade, vec!["only".to_string()])
+        );
+    }
+
+    /// `cascade` という名前の表は従来どおり表名として扱う（先に `expect_ident` で読むため）。
+    #[test]
+    fn truncate_cascade_word_can_be_a_table_name() {
+        let op = "USING OPERATION_ID 'op-0001'";
+        let (b, names) = truncate_behavior(&format!("TRUNCATE cascade {op}"), &["cascade"]);
+        assert_eq!(
+            (b, names),
+            (DropBehavior::Restrict, vec!["cascade".to_string()])
+        );
+        let (b, names) = truncate_behavior(&format!("TRUNCATE cascade CASCADE {op}"), &["cascade"]);
+        assert_eq!(
+            (b, names),
+            (DropBehavior::Cascade, vec!["cascade".to_string()])
+        );
     }
 
     #[test]

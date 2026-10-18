@@ -46,7 +46,7 @@ TABLE-20（2026-09-28 新設。spec 側判断記録は
 | --- | ---- | ---- |
 | D16 | `ON DELETE`／`ON UPDATE` は `NO ACTION`・`RESTRICT`（`NoAction` へ正規化）・`CASCADE`・`SET NULL`・`SET DEFAULT` を受理する。列リスト形の `SET NULL (col, ...)`／`SET DEFAULT (col, ...)`・`CONSTRAINT <name>` は引き続き `42601` | PostgreSQL の基本形に揃えつつ、対応しない形は fail-closed に拒否する |
 | D17 | 実行順序: (1) 参照アクションを再帰的にすべて適用する → (2) 元の文の対象テーブルと連鎖で変更した各テーブルについて、それを参照する全 FK（アクションを問わない）の事後状態検証（既存の `NO ACTION` 検証）を行う。`RESTRICT` は `NO ACTION` と区別して永続化せず、両方とも (2) の文末検証に統一する（PG は `RESTRICT` を即時検査するため、本実装は PG が拒否する一部の文を受理しうる既知の差分がある） | PG の `NO ACTION` が文末に検査される意味論に合わせつつ、アクション実装の不具合があっても最終状態の参照整合性を fail-closed な最終防御として保証する |
-| D18 | `TRUNCATE` は参照アクションを発火させない（`ReferencedRowsChange::Truncated`。事後検証のみ行う） | PostgreSQL の `TRUNCATE` も `ON DELETE` アクションを発火させない（`TRUNCATE ... CASCADE` は別構文で未対応のまま） |
+| D18 | `TRUNCATE` は参照アクションを発火させない（`ReferencedRowsChange::Truncated`。事後検証のみ行う） | PostgreSQL の `TRUNCATE` も `ON DELETE` アクションを発火させない（`TRUNCATE ... CASCADE` も参照元の表を空にするだけで発火させない。Issue #1644。RESTRICT の拒否はカタログ宣言による `0A000` が先に働く） |
 | D19 | 宣言時検査（`42830`）: (a) `SET NULL` で参照元列に `NOT NULL` の列がある、(b) `SET DEFAULT` で参照元列に「`DEFAULT` 無し・`NOT NULL`」の列がある、(c) `ON UPDATE CASCADE` で参照元列が `NOT NULL` なのに参照先列が nullable、のいずれも拒否する | `ALTER` で FK 列の nullability・`DEFAULT` を変える経路が無いため、宣言時検査が恒久的に有効であり続ける |
 | D20 | 連鎖の深さ・1 文あたりの対象行数に実装既定の上限（`constraint::MAX_REFERENTIAL_ACTION_DEPTH`＝16・`MAX_REFERENTIAL_ACTION_ROWS`＝10,000。spec 由来ではない）を設け、超過は `TenantWriteError::ReferentialActionLimitExceeded`（`54000`）で副作用ゼロに拒否する | 永続索引を持たないテナント範囲走査の再帰であり、無制限だと DoS になり得る（coding-rust.md「不安全な設計」） |
 | D21 | FK の重複判定は構造（`columns`・`parent_table`・`parent_columns`）のみで行い、アクション・`MATCH`・遅延属性の違いは無視する（`ForeignKeyDef::shares_reference_shape`） | 同じ列の組に矛盾するアクション・オプションを 2 つ宣言できる抜け穴を塞ぐ |
@@ -435,7 +435,7 @@ nosql13_ddl.rs`・`crates/wire-server/tests/err4_http_projection.rs` の
   [alter-table-foreign-key-constraint.md](./alter-table-foreign-key-constraint.md)
   参照）
 - `SET NULL (col, ...)`／`SET DEFAULT (col, ...)`（列リスト形。Issue #1076）
-- `TRUNCATE ... CASCADE`（`TRUNCATE` 自体は参照アクションを発火させない。D18）
+- `TRUNCATE ... CASCADE` による参照アクションの発火（`TRUNCATE ... CASCADE` 自体は Issue #1644 で実装済みで、参照元の表を空にするだけ。D18）
 - `RESTRICT` を `NO ACTION` と区別して永続化し即時検査すること（現状は両方とも
   文末の事後検証に統一。既知の差分として D17 の理由欄に記録）
 - `SET CONSTRAINTS { ALL | name } { DEFERRED | IMMEDIATE }`（`DEFERRABLE
