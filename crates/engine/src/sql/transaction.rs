@@ -852,7 +852,7 @@ fn internal_error() -> SqlSurfaceError {
 /// 書き込みがあれば、commit の**前**に `written_by_tenant` の各要素について遅延
 /// `FOREIGN KEY` を検査し（TABLE-17・TASK-205、Issue #1077）、違反すれば abort して
 /// `session` を開始時点へ復元し `23503` を返す。commit 自体の失敗も同様にロールバック
-/// 扱いで `XX000`。呼び出し元は事前に `state` を `Idle` にしてあること。
+/// 扱いで `XX000`。成功時は `ON COMMIT` を適用する。呼び出し元は事前に `state` を `Idle` にすること。
 fn commit_active(
     storage: &crate::storage::Storage,
     write_txn: crate::storage::GatedWriteTxn,
@@ -906,7 +906,12 @@ fn commit_active(
         // 解放されている）。
         *session = session_at_begin;
         internal_error()
-    })
+    })?;
+    // commit 成功後にだけ、一時表の `ON COMMIT` 動作を適用する（TABLE-44・Issue #1683。
+    // ROLLBACK・commit 失敗では呼ばない）。永続側は既に commit 済みのため、ここが失敗すると
+    // クライアントには commit 失敗（`XX000`）が返るが実際には commit 済み、という食い違いが
+    // 起こりうる（一時表は in-memory redb で発生確率は極めて低い既知の制約。docs/design/temp-table.md）。
+    session.apply_temp_on_commit()
 }
 
 /// [`crate::storage::StorageError::WriteLockTimeout`]／

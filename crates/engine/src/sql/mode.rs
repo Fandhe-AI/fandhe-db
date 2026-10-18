@@ -261,15 +261,14 @@ impl SessionState {
         &self.temp_tables
     }
 
-    /// このセッションの一時カタログ（更新用。#1683 の `CREATE TEMP TABLE` 実行腕が使う。
-    /// 本 Issue の時点では SQL から到達できない）。
-    #[allow(dead_code)] // #1683 の CREATE TEMP TABLE 実行腕が使うまで、テストからのみ到達する
+    /// このセッションの一時カタログ（更新用。`core.rs` の `CREATE TEMP TABLE`／一時表の
+    /// `DROP TABLE` 実行腕が使う。TABLE-44・Issue #1683）。
     pub(crate) fn temp_tables_mut(&mut self) -> &mut crate::sql::temp_catalog::SessionTempCatalog {
         &mut self.temp_tables
     }
 
     /// このセッションの一時表の行ストア（生成済みなら）。
-    #[allow(dead_code)] // #1683 以降の実行腕が使うまで、テストからのみ到達する
+    #[allow(dead_code)] // 一時表への DML／SELECT の実行腕（#1684）が使うまで、テストからのみ到達する
     pub(crate) fn temp_rows(&self) -> Option<&crate::sql::temp_rows::TempRowStore> {
         self.temp_rows.as_deref()
     }
@@ -282,8 +281,8 @@ impl SessionState {
     }
 
     /// 行ストアを返す。未生成なら `tenant_id` 所有で生成する（遅延生成）。生成済みで所有
-    /// テナントが違う場合は fail-closed で拒否する。#1683 の `CREATE TEMP TABLE` が呼ぶ。
-    #[allow(dead_code)] // #1683 の CREATE TEMP TABLE 実行腕が使うまで、テストからのみ到達する
+    /// テナントが違う場合は fail-closed で拒否する。`CREATE TEMP TABLE` の実行腕が呼ぶ
+    /// （TABLE-44・Issue #1683）。
     pub(crate) fn temp_rows_or_init(
         &mut self,
         tenant_id: &str,
@@ -304,6 +303,73 @@ impl SessionState {
             });
         }
         Ok(store)
+    }
+
+    /// commit 時の `ON COMMIT` 動作を適用する（TABLE-44・Issue #1683）。`DROP` の一時表は
+    /// 一時カタログから外して行領域を破棄し、`DELETE ROWS` の一時表は行を消す。
+    /// 呼び出し元は自動コミットの文の成功直後（`core.rs`）と、明示・暗黙トランザクションの
+    /// commit 成功直後（`sql::transaction`）。ROLLBACK・失敗した文では呼ばない。
+    ///
+    /// 対象が無ければ何もしない（一時表を使わない接続のコストはゼロ）。カタログを正とし、
+    /// 先にカタログから外す。行領域の更新に失敗した場合は固定文言の `XX000` を返し詳細を
+    /// 渡さない（孤児の行領域は `TempWriteTxn::retain_relations` で掃除できる）。
+    pub(crate) fn apply_temp_on_commit(
+        &mut self,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::TempOnCommit;
+        let mut delete_rows = Vec::new();
+        let mut dropped = Vec::new();
+        for name in self
+            .temp_tables
+            .names()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        {
+            let Some(entry) = self.temp_tables.get(&name) else {
+                continue;
+            };
+            match entry.on_commit {
+                TempOnCommit::PreserveRows => {}
+                TempOnCommit::DeleteRows => delete_rows.push(entry.id),
+                TempOnCommit::Drop => dropped.push((name, entry.id)),
+            }
+        }
+        if delete_rows.is_empty() && dropped.is_empty() {
+            return Ok(());
+        }
+        for (name, _) in &dropped {
+            self.temp_tables.remove(name);
+        }
+        let ids: Vec<_> = dropped.iter().map(|(_, id)| *id).collect();
+        self.apply_temp_row_ops(&delete_rows, &ids)
+    }
+
+    /// 一時表の行領域の更新（`truncate` は行を消し、`drop` は行領域ごと破棄する）を、行ストアの
+    /// 単一の書き込みトランザクションで原子的に適用する。行ストアが未生成なら行領域も無いので
+    /// 何もしない。一時表の `DROP TABLE`（`sql::ddl`）と [`Self::apply_temp_on_commit`] が使う。
+    pub(crate) fn apply_temp_row_ops(
+        &self,
+        truncate: &[crate::sql::temp_catalog::TempRelationId],
+        drop: &[crate::sql::temp_catalog::TempRelationId],
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let Some(store) = self.temp_rows.as_deref() else {
+            return Ok(());
+        };
+        if truncate.is_empty() && drop.is_empty() {
+            return Ok(());
+        }
+        let txn = store.begin_write()?;
+        let applied = truncate
+            .iter()
+            .try_for_each(|id| txn.truncate_relation(*id))
+            .and_then(|()| drop.iter().try_for_each(|id| txn.drop_relation(*id)));
+        match applied {
+            Ok(()) => txn.commit(),
+            Err(e) => {
+                let _ = txn.abort();
+                Err(e)
+            }
+        }
     }
 
     /// このセッションに登録済みの UDF レジストリ（読み取り専用）。

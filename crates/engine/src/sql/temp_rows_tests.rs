@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::catalog::{ColumnDef, ColumnType, TableSchema};
-use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::allowlist::{SqlSurfaceError, TempOnCommit};
 use crate::sql::mode::SessionState;
 use crate::sql::temp_catalog::{SessionTempCatalog, TempRelationId};
 use crate::sql::temp_rows::{TempRowStore, DEFAULT_MAX_TEMP_BYTES_PER_SESSION};
@@ -115,8 +115,12 @@ fn table_44_oversized_value_is_rejected_before_allocation() {
 fn table_44_relations_are_isolated_and_orphans_are_swept() {
     let s = store(DEFAULT_MAX_TEMP_BYTES_PER_SESSION);
     let mut cat = SessionTempCatalog::default();
-    let a = cat.register(schema("a"), 8).expect("register a");
-    let b = cat.register(schema("b"), 8).expect("register b");
+    let a = cat
+        .register(schema("a"), TempOnCommit::PreserveRows, 8)
+        .expect("register a");
+    let b = cat
+        .register(schema("b"), TempOnCommit::PreserveRows, 8)
+        .expect("register b");
     let w = s.begin_write().unwrap();
     w.insert_row(a, T, 1, b"a1").unwrap();
     w.insert_row(b, T, 1, b"b1").unwrap();
@@ -126,7 +130,9 @@ fn table_44_relations_are_isolated_and_orphans_are_swept() {
     // DROP 相当: 同名を新しい id で作り直しても古い行は見えない。
     let removed = cat.remove("a").expect("removed");
     w.drop_relation(removed).unwrap();
-    let a2 = cat.register(schema("a"), 8).expect("re-register");
+    let a2 = cat
+        .register(schema("a"), TempOnCommit::PreserveRows, 8)
+        .expect("re-register");
     assert_ne!(a2, removed);
     assert!(w.get_row(a2, T, 1).unwrap().is_none());
 
