@@ -12,6 +12,9 @@
 pub enum SyncPoint {
     /// `drop_table` の write txn 内で全削除を終え、commit する直前。
     DropTableBeforeCommit,
+    /// `REFRESH MATERIALIZED VIEW ... WITH DATA` の write txn で全文脈の書き込みを終え、
+    /// commit する直前（Issue #1666。更新中も読み取りが止まらないことの検証用）。
+    RefreshMaterializedViewBeforeCommit,
     /// 読み取り文の実行開始時点（読み取りスナップショット確定後・スキーマ解決前）。
     ReadStatementSnapshotAcquired,
 }

@@ -517,6 +517,20 @@ pub(crate) fn unique_index_columns_for_matview_in_txn(
     Ok(out)
 }
 
+/// `REFRESH ... CONCURRENTLY` の前提（TABLE-42 (4)・Issue #1666）を満たす UNIQUE 索引が
+/// matview `name` に 1 件以上あるか。全要素が素の列（空名＝式要素でない）の宣言だけを適格とする。
+/// 部分索引の `WHERE` は構文段で拒否済みで `IndexDef` に述語は無いため、述語や式を持つ宣言が
+/// 将来加わったらここで除外すること（fail-closed）。走査上限・decode 失敗は
+/// [`unique_index_columns_for_matview_in_txn`] と同じく `Err`。
+pub(crate) fn has_concurrent_refresh_unique_index_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<bool> {
+    Ok(unique_index_columns_for_matview_in_txn(write_txn, name)?
+        .iter()
+        .any(|cols| !cols.is_empty() && cols.iter().all(|c| !c.is_empty())))
+}
+
 /// UNIQUE 索引宣言の列名を、matview の列位置の組へ解決する。宣言が列に解決できないのは
 /// カタログ破損（`CorruptSchema`）。
 fn unique_column_sets_in_txn(

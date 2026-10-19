@@ -310,6 +310,39 @@ fn wire_refresh_with_no_data_then_read_is_55000() {
     assert_eq!(bob_ids, vec!["3".to_string()]);
 }
 
+/// `REFRESH ... CONCURRENTLY`（TABLE-42 (4)・Issue #1666）: 適格な UNIQUE 索引が無ければ `55000`、
+/// 作成後は固定タグ `REFRESH MATERIALIZED VIEW` で成功し、他テナントは更新後の実体を読める。
+#[test]
+fn wire_refresh_concurrently_prereqs_and_tag() {
+    let (addr, _guard) = spawn("wire-mv-refresh-conc");
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    insert(&mut bob, 3, "ja");
+    send_simple_query(
+        &mut alice,
+        "CREATE MATERIALIZED VIEW mv AS SELECT id FROM docs",
+    );
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+    insert(&mut bob, 4, "en");
+
+    send_simple_query(&mut alice, "REFRESH MATERIALIZED VIEW CONCURRENTLY mv");
+    expect_error_response_with_sqlstate(&mut alice, "55000");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(&mut alice, "CREATE UNIQUE INDEX mv_id ON mv (id)");
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+    send_simple_query(&mut alice, "REFRESH MATERIALIZED VIEW CONCURRENTLY mv");
+    assert_eq!(
+        read_command_complete(&mut alice),
+        "REFRESH MATERIALIZED VIEW"
+    );
+    read_ready_for_query(&mut alice);
+    let (bob_ids, _) = read_ids(&mut bob, "SELECT id FROM mv LIMIT 100");
+    assert_eq!(bob_ids, vec!["3".to_string(), "4".to_string()]);
+}
+
 /// matview への索引と `DROP MATERIALIZED VIEW`（TABLE-42 (5)・Issue #1667）の CommandComplete タグ・
 /// 権限ゲート・他テナント不可視。意味論は `crates/engine/tests/table42_matview_index_drop.rs`
 /// が確定オラクル。

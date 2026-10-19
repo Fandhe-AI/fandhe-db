@@ -223,10 +223,15 @@ impl EngineCore {
     /// `REFRESH MATERIALIZED VIEW` の実行本体（DDL 権限ゲートは呼び出し元が通過済み。
     /// TABLE-42 (1)(3)(4)・Issue #1665）。
     ///
-    /// 判定順: `CONCURRENTLY`（暫定 `0A000`）→ 書き込みゲート → 定義のロード（無ければ `42P01`、
-    /// 表・ビュー・索引の名前なら `42809`）→ 列形状の再検証 → 照合順序 → 文脈ごとの評価と逐次書き込み
+    /// 判定順: 書き込みゲート → 定義のロード（無ければ `42P01`、表・ビュー・索引の名前なら
+    /// `42809`）→ （`CONCURRENTLY` なら）未実体化 `0A000` → 適格な UNIQUE 索引なし `55000`
+    /// → 列形状の再検証 → 照合順序 → 文脈ごとの評価と逐次書き込み
     /// → commit（1 回だけ）。評価の読み取り源と書き込みは同一 write txn で、読み手は MVCC
     /// スナップショットで旧実体を読み続けブロックされない。
+    ///
+    /// `CONCURRENTLY` は前提検査を通れば非 CONCURRENTLY と同じ経路・同じ結果（差分適用は採らない。
+    /// 読み手は MVCC で旧実体を読み続け元からブロックされず、実体の行キーは連番で差分でも振り直しが
+    /// 要るため）。
     ///
     /// 失敗方針（fail-closed・テナント境界）: 実行者自身の文脈の評価失敗はそのまま返し、txn 破棄で
     /// 全文脈の旧実体を残す。他の文脈の評価失敗は実行者へ返さず（成否の差から他テナントの件数・内容を
@@ -238,13 +243,6 @@ impl EngineCore {
         session: &SessionState,
         stmt: &ValidatedRefreshMaterializedView,
     ) -> Result<RefreshMaterializedViewOutcome, SqlSurfaceError> {
-        // TODO(#1666): CONCURRENTLY の本実装（UNIQUE 索引の前提検査）に置き換える。matview への索引は
-        // #1667 まで作れず前提を満たす状態が存在しないため、それまでは fail-closed の 0A000 とする。
-        if stmt.concurrently() {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "REFRESH MATERIALIZED VIEW CONCURRENTLY is not supported",
-            ));
-        }
         let write_txn = self
             .storage
             .begin_write_txn()
@@ -262,6 +260,25 @@ impl EngineCore {
             }
             Err(e) => return Err(map_refresh_matview_error(e)),
         };
+
+        // CONCURRENTLY の前提検査（TABLE-42 (4)・Issue #1666）。判定はカタログ構造だけで決まり
+        // テナントのデータに依存しないため、成否から他テナントの情報は漏れない。ここでの Err は
+        // txn ごと破棄され、begin_streamed_refresh_in_txn が消した旧実体・定義はそのまま残る。
+        // 未実体化（0A000）を索引の有無（55000）より先に判定する（PostgreSQL と同順）。
+        if stmt.concurrently() {
+            if !def.populated {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "REFRESH MATERIALIZED VIEW CONCURRENTLY cannot be used when the materialized view is not populated",
+                ));
+            }
+            if !crate::catalog::materialized::has_concurrent_refresh_unique_index_in_txn(
+                &write_txn, &def.name,
+            )
+            .map_err(map_refresh_matview_error)?
+            {
+                return Err(SqlSurfaceError::MaterializedViewNotRefreshableConcurrently);
+            }
+        }
 
         if !stmt.with_data() {
             finish_streamed_refresh_in_txn(&write_txn, &def, false)
@@ -323,6 +340,9 @@ impl EngineCore {
             .map_err(map_refresh_matview_error)?;
         // 表単位の世代の bump は finish_streamed_refresh_in_txn が同じ txn 内で
         // bump_table_generation_in_txn により済ませている（commit は唯一のこの 1 回）。
+        #[cfg(feature = "test-sync-points")]
+        self.storage
+            .sync_point(crate::test_sync::SyncPoint::RefreshMaterializedViewBeforeCommit);
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(crate::catalog::convert_storage_error)
             .map_err(map_refresh_matview_error)?;
