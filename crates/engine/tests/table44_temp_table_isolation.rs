@@ -119,6 +119,9 @@ fn setup_secret_temp_table(core: &EngineCore, a: &mut SessionState) {
     );
 }
 
+/// セッションを持たない入口 1 つ分の呼び出し（応答の要約を返す）。
+type Probe = fn(&EngineCore, &PolicyContext) -> String;
+
 /// 他者が試す文種の一覧（一時表を壊す・読む・隠す全ての入口）。
 const FOREIGN_STATEMENTS: &[&str] = &[
     "SELECT id, code FROM secret_t LIMIT 10",
@@ -463,7 +466,7 @@ fn sessionless_entry_points_never_resolve_temp_tables() {
 
     // 一時表にしか無い名前は、一度も存在しなかった DB と同じ応答。
     let c = ctx(TENANT_A);
-    let probes: [(&str, fn(&EngineCore, &PolicyContext) -> String); 5] = [
+    let probes: [(&str, Probe); 5] = [
         ("select", |e, c| {
             outcome(e.execute_sql(c, "SELECT id FROM secret_t LIMIT 5"), true)
         }),
