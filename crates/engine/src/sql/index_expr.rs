@@ -521,6 +521,16 @@ pub(crate) fn check_bound_index_expression_determinism(
             if !two_arg_timezone && args.iter().any(|a| ty_of(a) == Some(ExprType::TimestampTz)) {
                 return Err(not_immutable());
             }
+            // 2 引数 `timezone(<zone>, <値>)` は、値が型なし文字列リテラル（セッション TZ で
+            // `TIMESTAMPTZ` として解釈）または `DATE`（セッション TZ の 0 時へ変換）のとき、束縛が
+            // セッション TZ 依存の暗黙変換を挿入し、再構築するセッションでキーが変わるため拒否する。
+            if two_arg_timezone {
+                if let Some(value) = args.get(1) {
+                    if matches!(value, Expr::String(_)) || ty_of(value) == Some(ExprType::Date) {
+                        return Err(not_immutable());
+                    }
+                }
+            }
             // 3 引数 `date_trunc(<単位>, <値>, <ゾーン>)` は、束縛が非 TIMESTAMPTZ の値へ
             // セッション TZ 依存の暗黙変換を挿入するため、引数の型によらず拒否する。
             if name.eq_ignore_ascii_case("date_trunc") && args.len() == 3 {
@@ -840,6 +850,8 @@ mod tests {
             "CASE WHEN at_tz > '2024-01-01 00:00:00' THEN 1 ELSE 0 END",
             "CASE WHEN '2024-01-01 00:00:00' < at_tz THEN 1 ELSE 0 END",
             "date_trunc('day', at, 'UTC')",
+            "timezone('UTC', '2024-01-01 00:00:00')",
+            "timezone('UTC', DATE '2024-01-01')",
         ] {
             // 最後の例は列そのものの型が同じで通る。除外して個別に確認する。
             if not_immutable.starts_with("COALESCE") {
