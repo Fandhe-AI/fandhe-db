@@ -7,6 +7,9 @@ RLS-10 (b)（複数のテーブル参照を持つ読み取り経路での暗黙�
 spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠）。本ドキュメントは
 本リポ側の実装判断・設計記録のみを扱う。
 
+`MATERIALIZED VIEW`（TABLE-42）は本ファイル末尾の「Issue #1668 追記」にまとめる。以降の節は
+非マテリアライズドビューの記録である。
+
 ## 概要
 
 保存したクエリをビューとして登録し、`FROM` に書いて読めるようにする。
@@ -27,7 +30,8 @@ DROP VIEW <name>
 - body の `LIMIT`・`ORDER BY ... <=>`・`HYBRID`・`USING PLAN`・集計形・式項目
   （`Projection::Items`）・UDF 呼び出し述語（`WherePredicate::PredicateCall`／
   `Expression`）・`EXPLAIN`・`CREATE OR REPLACE` の `VIEW` 以外への適用・`IF NOT EXISTS`・`TEMP`／
-  `MATERIALIZED`・`WITH CHECK OPTION`・末尾の余剰トークンは
+  `MATERIALIZED`（`CREATE VIEW` の中では受理しない。`CREATE MATERIALIZED VIEW` は別の文として
+  Issue #1664 で受理済み。「Issue #1668 追記」参照）・`WITH CHECK OPTION`・末尾の余剰トークンは
   いずれも構造的に受理しない（`42601`）。使える単純述語は
   `Equality`／`Prefix`／`BoolEquality`／`BoolColumn`／`Compare`（列 対
   リテラル）のみ。
@@ -377,6 +381,8 @@ body のリテラル値・破損理由の詳細をクライアントへ運ばな
   束縛・実行経路でそのまま評価されるため、この検査はビューが宣言した列
   スコープ契約のためのものであり安全性の境界ではない。
 - 更新可能ビュー。
+- `MATERIALIZED VIEW`（TABLE-42）は Issue #1663〜#1667 で実装済み。設計は「Issue #1668 追記」、
+  未対応事項も同節の「対象外」に集約した。
 - NoSQL 表層の `scan`／`aggregate` op でビューを対象にすると従来どおり
   `42P01`（fail-closed のまま）。NOSQL-13 の DDL op はスコープ外。
 - FOREIGN KEY 由来の `2BP01`（#907）。
@@ -547,5 +553,143 @@ TABLE-41 (2)(3) のポインタ（TABLE-18 の RLS 契約は変えない）。#1
 ### 対象外
 
 - 新状態に対して依存ビューを Describe する完全な再検証（列追加ゲートの過剰拒否の解消）
-- 照合順序の比較、静的な型を持たない列、ALTER VIEW、TABLE-42／43
+- 照合順序の比較、静的な型を持たない列、ALTER VIEW、TABLE-42（#1663〜#1667 で実装済み。「Issue #1668 追記」参照）／43
 - prepared statement の列メタデータ（`*` 依存ビューの列増加）
+
+## Issue #1668 追記: MATERIALIZED VIEW（TABLE-42）
+
+親 #1662。実装は #1663（カタログと実体ストア）・#1664（`CREATE`・読み取り）・
+Issue #1665（`REFRESH`）・#1666（`REFRESH ... CONCURRENTLY`）・#1667（索引・`DROP`・CASCADE）で
+完了している。
+本節はそれらの設計判断をまとめた記録で、コードは変更しない。Issue 単位の経緯は
+[implementation-status.md](implementation-status.md) の各エントリを参照する。
+
+### 概要と非マテリアライズドビューとの境界（#1663）
+
+- 定義は `VIEWS_TABLE` と分けた専用カタログ表 `materialized_views`
+  （`catalog::materialized::MATERIALIZED_VIEWS_TABLE`）に置く。既存のビュー展開が matview を
+  「展開できるビュー」と誤認しないため。名前空間は表・ビュー・索引と共有する
+  （重複は `42P07`、種別不一致は `42809`）。
+- 参照のたびに定義を展開する通常ビューと違い、matview は保存済みの実体を読む。
+  `FROM <matview>` は `Resolved::Buffered` の葉（`Statement::MaterializedView`）として、
+  評価後射影形ビューの外側処理（WHERE・ORDER BY・射影・集計・LIMIT）に乗る。
+- 本文は `CREATE VIEW` と同じ許可形。`OR REPLACE`・`TEMP`・保存パラメータ・ベクトル順位付けは
+  `42601`。
+
+### 文脈単位の実体とテナント境界の不変条件（#1663・#1664）
+
+- 実体は `PolicyContext` ごとに redb へ確保する。キー（`ContextKey`）はテナント ID と許可可視性の
+  集合の完全一致で、`Public` のみの文脈が `Private` 込みの実体を読む経路を作らない。
+- 「全文脈を読む」API は作らない。読み取りは読み手の文脈に完全一致する実体だけを返す。
+- 実体が無い文脈（`WITH NO DATA`・実体化対象外）は `55000`。他文脈の有無・件数は観測できない。
+- 件数不一致や行ヘッダのテナント不一致は `CorruptSchema` で拒否し、行を 1 件も返さない。
+- RLS-10 (b) の暗黙適用は評価時（CREATE／REFRESH の文脈別評価）に既存経路を通る。
+  読み取りで再評価はしない。実体は評価済みの行である。
+
+### 実体化対象の文脈（#1664）
+
+- wire-server が起動時に認証構成のテナント集合から `session_policy_context` で導出し、
+  `EngineCore::with_materialization_contexts` で 1 回だけ注入する。導出に失敗したら起動エラー。
+- Rust API で未設定なら、作成セッションの文脈だけが対象になる。
+
+### 構文と判定順序（fail-closed）
+
+- `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <名前> [(<別名>, ...)] AS <本文> [WITH [NO] DATA]`
+  （#1664）: 構文 `42601` → DDL 権限 `42501`（名前解決より先）→ 明示トランザクション内 `0A000`
+  → 列型の確定（型なし・ENUM・ICU 照合の列を読む本文は `0A000`、不正な列名 `42601`、重複 `42701`）
+  → 文脈ごとの評価（行数が `--max-result-rows` 超過で `54000`）。
+- `REFRESH MATERIALIZED VIEW [CONCURRENTLY] <名前> [WITH [NO] DATA]`（#1665）: 構文 → 明示
+  トランザクション内 `0A000` → `42501` → 書き込みゲート（待機超過 `55P03`）→ 定義のロード
+  （無ければ `42P01`、表・ビュー・索引の名前なら `42809`）→ 列形状の再検証（`0A000`）→
+  照合順序 → 文脈ごとの評価と逐次書き込み → commit（1 回）。
+- `DROP MATERIALIZED VIEW [IF EXISTS] n1[, n2 ...] [CASCADE|RESTRICT]`（#1667）: `42501` →
+  種別不一致 `42809`（`IF EXISTS` でも）／不在 `42P01` → 依存があれば `2BP01`。
+- matview への INSERT／UPDATE／DELETE／TRUNCATE／COPY FROM／ALTER は `42809`。
+- 成功タグ: `CREATE` は `SELECT <n>` で、`n` は作成者自身の文脈の行数だけ（他文脈の件数は
+  合算しない）。`REFRESH`・`DROP` は件数を持たない固定タグ
+  （`REFRESH MATERIALIZED VIEW`・`DROP MATERIALIZED VIEW`）。
+
+### 原子性と失敗方針（#1664・#1665）
+
+- CREATE と REFRESH は、書き込みゲートを取った 1 つの write txn を読み取り源と書き込みに兼用する。
+  旧実体の消去・全文脈の再評価・書き込みは同一スナップショットで行い、commit は 1 回。
+- 実行者自身の文脈の評価失敗は返して txn を破棄し、全文脈の旧実体と定義を残す。
+- 他の文脈の失敗は実行者へ返さず、その文脈の実体を書かない（読み取りは `55000`）。成否の差から
+  他テナントの件数を探れないようにするため。
+- 「失敗した文脈だけ旧実体を残す」案は新旧スナップショットの実体が混在するため採らない。
+- 読み手は MVCC スナップショットで旧実体を読み続け、REFRESH にブロックされない。
+- `WITH NO DATA` は全文脈の実体を破棄して `populated=false` にする。
+
+### 索引（#1667）
+
+- 表と同じ `INDEX_CATALOG_TABLE` に `IndexDef { table: <matview 名> }` として宣言だけを置く。
+  `MaterializedViewDef` は不変で `DEF_FORMAT_VERSION` は上げない。物理構造は持たない
+  （matview の読み取りは実体全体を外側処理に渡すので、索引の有無で結果は変わらない）。
+- 対象はスカラー列のみ。`USING hnsw` は `0A000`、暗黙の `id` 列は無く `42703`、COLLATE 不可型は
+  `42804`。索引カタログの読み手は `def.table` で絞り込むため、他表の索引解決には影響しない。
+- UNIQUE は文脈ごとに判定する（NULL は distinct、文脈をまたぐ同値は重複にしない）。強制箇所は
+  `CREATE UNIQUE INDEX` 時の既存実体の走査と、実体の書き込みプリミティブ
+  （`write_entities_in_txn`・`write_context_entity_in_txn`）の 2 つ。
+  違反は `23505`（固定文言でテナント・値・件数を含めない）で、書き込みでは txn ごと破棄して
+  旧実体を残す。REFRESH は共通プリミティブを通るため索引との整合が自動で満たされる。
+
+### REFRESH CONCURRENTLY の方式（#1666）
+
+- 前提検査は定義のロード後に行う。未実体化 `0A000` → WHERE を持たない列だけの UNIQUE 索引が
+  無ければ `55000`（固定文言） → 以降は非 CONCURRENTLY と同一経路。
+- 検査はカタログ構造だけで決まり、テナントのデータに依存しない（`populated` は定義単位の
+  フラグ）ので、成否から他テナントの情報は漏れない。失敗は txn ごと破棄する。
+- 差分適用は採らず全置換のままにした。理由: (a) MVCC により読み手は CONCURRENTLY の有無に
+  よらず元からブロックされない、(b) 行キーが文脈キーと連番の組で、差分適用でも振り直しが要り
+  利点が無い、(c) 書き込みプリミティブを二重化するとテナント境界のリスクだけが増える。
+
+### CASCADE と依存（#1667・#1663・#1664）
+
+- `dependency.rs` の `DropTarget::MaterializedView`／`DependentObject::MaterializedView` により、
+  表・ビュー・matview の `DROP ... CASCADE` が依存 matview を依存する側から推移的に削除する。
+  RESTRICT は `2BP01`。`CascadedObject::MaterializedView` は共有カタログの名前だけを運ぶ。
+- DROP は定義・全文脈のメタ・行表・索引宣言の削除と世代 bump を同一 txn で行い、同名の
+  再作成で旧実体・旧索引宣言が復活しない。
+- #1663 の暫定ガードのうち、参照元の表・ビューの DROP に関する 3 箇所（直接ガード 2 箇所と
+  閉包ガード）は #1667 で撤去した（RESTRICT 側の直接検査は残置）。
+- 残した暫定ガード（表単位の保守的な判定）: 参照元の表の改名は `2BP01`、`DROP COLUMN` は
+  `2BP01`、`ALTER COLUMN TYPE`・`RENAME COLUMN` は `0A000`。
+
+### 上限値
+
+- 定義数・文脈数の列挙は `MAX_LIST_TABLES`（10,000）。
+- `MAX_MATVIEW_BASE_RELATIONS` = 64、本文は `MAX_VIEW_BODY_BYTES`（64 KiB）、
+  スキーマ blob は 2 MiB、`DEF_FORMAT_VERSION` = 1。
+- 文脈ごとの行数上限は `--max-result-rows`。設定がハード上限のときは超過検出のため
+  1 つ手前（99,999 行）に丸める。
+
+### PostgreSQL との差異
+
+- 単純形本文の `*` は作成時に展開せず保存する。基表への `ADD COLUMN` で出力列がずれたら
+  REFRESH は `0A000` で拒否し旧実体を残す（PostgreSQL は成功する）。
+- 明示トランザクション内の CREATE／REFRESH は `0A000`（PostgreSQL は REFRESH を許す）。
+- `CONCURRENTLY` と `WITH NO DATA` の併用は構文段で `42601`。
+- CONCURRENTLY の重複行は `21000` ではなく `23505`（非 CONCURRENTLY と同結果にする方針）。
+- 単一ライタのため、REFRESH 中は基表への書き込みが待たされる。
+- NOTICE は送出しない（`IF NOT EXISTS`・`IF EXISTS`）。
+
+### テスト
+
+- `crates/engine/tests/table42_create_materialized_view.rs`・
+  `table42_refresh_materialized_view.rs`・`table42_refresh_concurrently_reads.rs`
+  （`test-sync-points`）・`table42_matview_index_drop.rs`
+- `crates/wire-server/tests/wire_create_materialized_view.rs`
+- `catalog::materialized::tests`・`sql::matview`・`sql::allowlist` の単体テスト
+
+### 対象外
+
+- ENUM／ENUM 配列列の matview 化。
+- JOIN・CTE・部分クエリ・集合演算の枝・EXPLAIN・カーソルからの matview 参照（`42601` のまま）。
+- ビューから matview を参照すること。
+- NoSQL 表層からの matview 参照・REFRESH（fail-closed のまま）。
+- `IF NOT EXISTS`・`DROP` の NoticeResponse。
+- 表改名・列 DDL への列単位の追随と、matview→ビュー→表の推移依存。
+- matview 索引による読み取りの高速化、`DROP INDEX ... CASCADE`。
+- DROP CASCADE のクラッシュ原子性テスト。
+- 式索引の取り込み時に、適格判定 `has_concurrent_refresh_unique_index_in_txn` から式を含む宣言を
+  除く追随。
