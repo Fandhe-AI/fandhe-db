@@ -19,6 +19,12 @@ if [ "${FULL:-0}" = "1" ]; then
 else
   cargo test -p fandhe-db-wire-server --no-run
   cargo test -p fandhe-db-engine --lib --no-run
+  # 一時表のテスト（Issue #1685・TABLE-44）は専用の結合テストバイナリのため個別にビルドする。
+  cargo test -p fandhe-db-engine \
+    --test table44_temp_table_ddl \
+    --test table44_temp_table_dml \
+    --test table44_temp_table_isolation \
+    --no-run
 fi
 
 LEAK_DIR="$(mktemp -d)"
@@ -28,7 +34,8 @@ if [ "${FULL:-0}" = "1" ]; then
   TMPDIR="${LEAK_DIR}" cargo test --workspace --all-features
 else
   # in-process + user store / throwaway DB / 子プロセス起動 / TLS フィクスチャ /
-  # ガード自身の回帰テスト / wire-server の auth unit test / engine の temp_db。
+  # ガード自身の回帰テスト / wire-server の auth unit test / engine の temp_db /
+  # 一時表（Issue #1685）の wire・engine 結合テスト。
   TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-wire-server \
     --test wire1_simple_query \
     --test wire_auth \
@@ -40,6 +47,12 @@ else
     --test tmp_fixture_cleanup
   TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-wire-server --lib auth::
   TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-engine --lib test_util
+  # 一時表（TABLE-44）のテスト: 一時ストアがディスク（TMPDIR）へ spill しないこと。
+  TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-wire-server --test wire_temp_table
+  TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-engine \
+    --test table44_temp_table_ddl \
+    --test table44_temp_table_dml \
+    --test table44_temp_table_isolation
 fi
 
 # 外部ツール由来で除外が必要なエントリが出た場合のみ、理由コメント付きでここへ列挙する。

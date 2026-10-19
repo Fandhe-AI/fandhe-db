@@ -244,6 +244,28 @@ jobs:
         run: make crash-test-partitioned-dml
 
   # --------------------------------------------------
+  # crash-test-temp-table（一時表の異常終了後残骸検査。
+  # Issue #1685・対象ビヘイビア TABLE-44 (2)）
+  # --------------------------------------------------
+  # 一時表を生かしたまま永続表へ書き込むプロセスを SIGKILL し、永続カタログ・redb・データ
+  # ディレクトリ・専用 TMPDIR に一時表の痕跡が残らないことを検証する
+  # （scripts/crash_test_temp_table.sh。負の対照 self-check を含む）。
+  # 既存の crash-test 系と同じ理由で独立ジョブとし、actions/checkout は SHA 固定で参照する。
+  # private submodule（docs/spec）は取得しない。
+  crash-test-temp-table:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run crash-test-temp-table
+        run: make crash-test-temp-table
+
+  # --------------------------------------------------
   # core-api-check（コア API シグネチャ差分検知。TASK-125・対象ビヘイビア CORE-1）
   # --------------------------------------------------
   # プロトコル層（wire-server 等）の追加・変更がコア API（VectorCore/SearchProvider）の
