@@ -366,6 +366,27 @@ fn eval_error(e: PredicateEvalError) -> TenantWriteError {
     }
 }
 
+/// 部分索引 1 本の保存済み述語を再解析・再束縛し、往復で同じテキストに戻ることを確かめる。漂流は
+/// `CorruptSchema`（`XX000`）で fail-closed に拒否する。[`CompiledPartialIndexes::compile`] と
+/// `constraint::UniqueKeyPlan`（部分 UNIQUE 索引の強制。Issue #1657）が共有する（第 2 の束縛経路を
+/// 作らない）。
+pub(crate) fn compile_stored_predicate(
+    schema: &TableSchema,
+    decl: &DeclaredPartialIndex,
+) -> Result<BoundIndexPredicate, TenantWriteError> {
+    let predicate =
+        rebind_stored_index_predicate(&decl.predicate_sql, schema, None).map_err(|_| drifted())?;
+    if predicate.sql != decl.predicate_sql {
+        return Err(drifted());
+    }
+    Ok(predicate)
+}
+
+/// 述語の評価失敗を DML ゲート用のエラーへ写像する（`constraint::UniqueKeyPlan` も共有）。
+pub(crate) fn map_predicate_eval_error(e: PredicateEvalError) -> TenantWriteError {
+    eval_error(e)
+}
+
 /// 1 本の部分索引をコンパイルした DML ゲート用の評価器。
 struct CompiledPartial {
     predicate: BoundIndexPredicate,
@@ -395,11 +416,7 @@ impl CompiledPartialIndexes {
             .try_reserve_exact(decls.len())
             .map_err(|_| drifted())?;
         for decl in decls {
-            let predicate = rebind_stored_index_predicate(&decl.predicate_sql, schema, None)
-                .map_err(|_| drifted())?;
-            if predicate.sql != decl.predicate_sql {
-                return Err(drifted());
-            }
+            let predicate = compile_stored_predicate(schema, decl)?;
             let keys: Vec<DeclaredExpressionKey> = decl.expression_keys();
             let elements =
                 crate::sql::expression_key_index::CompiledIndexExpressions::compile(schema, &keys)?;
@@ -591,6 +608,7 @@ mod tests {
         let expr_sql = bind_index_expression_text("100 / n");
         let decl = DeclaredPartialIndex {
             index_name: "p".to_string(),
+            unique: false,
             predicate_sql: bind("n <> 0").expect("bind").sql,
             elements: vec![PartialElementDecl::Expr(expr_sql)],
         };
@@ -611,6 +629,7 @@ mod tests {
         // 述語を `n >= 0` にすると n = 0 が述語内へ入り、式要素が 22012 になる。
         let decl = DeclaredPartialIndex {
             index_name: "q".to_string(),
+            unique: false,
             predicate_sql: bind("n >= 0").expect("bind").sql,
             elements: vec![PartialElementDecl::Expr(bind_index_expression_text(
                 "100 / n",
@@ -641,6 +660,7 @@ mod tests {
         for sql in ["nope = 'x'", "n >", "n > 3 -- x", "n  >  3"] {
             let decl = DeclaredPartialIndex {
                 index_name: "p".to_string(),
+                unique: false,
                 predicate_sql: sql.to_string(),
                 elements: vec![],
             };

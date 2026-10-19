@@ -51,9 +51,9 @@ use crate::sql::allowlist::{
     ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
     ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
     ValidatedAlterTableRenameColumn, ValidatedAlterTableRenameTable, ValidatedCreateIndex,
-    ValidatedCreateTable, ValidatedCreateTempTable, ValidatedCreateType, ValidatedCreateView,
-    ValidatedDropIndex, ValidatedDropMaterializedView, ValidatedDropTable, ValidatedDropType,
-    ValidatedDropView,
+    ValidatedCreateSequence, ValidatedCreateTable, ValidatedCreateTempTable, ValidatedCreateType,
+    ValidatedCreateView, ValidatedDropIndex, ValidatedDropMaterializedView, ValidatedDropSequence,
+    ValidatedDropTable, ValidatedDropType, ValidatedDropView,
 };
 use crate::sql::ddl_column_type::{
     alias_spelling, to_static_column_type_with_array_default, SqlColumnTypeName, StaticColumnType,
@@ -2667,14 +2667,12 @@ pub(crate) fn execute_create_index(
             detail: "expression indexes are not supported for this index kind yet".to_string(),
         });
     }
-    // 防御ゲート（INDEX-11、Issue #1653・#1654）: 述語付きの未対応の組み合わせ（部分 UNIQUE・hnsw・
-    // COLLATE）は構文段の最終ゲートで拒否済みだが、将来の経路変更で届いても、述語を黙って落として
+    // 防御ゲート（INDEX-11、Issue #1653・#1654）: 述語付きの未対応の組み合わせ（hnsw・COLLATE。
+    // 部分 UNIQUE は Issue #1657 で受理）は構文段の最終ゲートで拒否済みだが、将来の経路変更で届いても、述語を黙って落として
     // 列だけの索引を保存しない（fail-closed）。述語そのものは `create_index_bound` が書き込み txn 内で
     // 束縛して正規化テキストと参照列を確定する。
     if validated.predicate().is_some()
-        && (validated.is_unique()
-            || validated.is_hnsw()
-            || validated.column_collations().iter().any(Option::is_some))
+        && (validated.is_hnsw() || validated.column_collations().iter().any(Option::is_some))
     {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "partial indexes are not supported for this index definition yet".to_string(),
@@ -2781,6 +2779,102 @@ fn map_drop_index_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
         _ => SqlSurfaceError::Internal {
             detail: "DROP INDEX failed".to_string(),
+        },
+    }
+}
+
+/// `CREATE SEQUENCE`（TABLE-24・SQL-23、Issue #1688）の成功応答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateSequenceOutcome {}
+
+/// `DROP SEQUENCE`（TABLE-24・SQL-23、Issue #1688）の成功応答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropSequenceOutcome {}
+
+/// SEQUENCE 定義の意味検証と既定値の補完（bigint 前提。PostgreSQL 17 の公開挙動）。
+/// 昇順の既定は `MINVALUE 1`・`MAXVALUE i64::MAX`・`START = MINVALUE`、降順の既定は
+/// `MINVALUE i64::MIN`・`MAXVALUE -1`・`START = MAXVALUE`。違反は `22023`（固定文言。値を含めない）。
+fn resolve_sequence_params(
+    validated: &ValidatedCreateSequence,
+) -> Result<crate::catalog::sequence::SequenceParams, SqlSurfaceError> {
+    let invalid = |detail: &'static str| SqlSurfaceError::InvalidParameterValue { detail };
+    let increment = validated.increment.unwrap_or(1);
+    if increment == 0 {
+        return Err(invalid("INCREMENT must not be zero"));
+    }
+    let ascending = increment > 0;
+    let min_value = validated
+        .min_value
+        .unwrap_or(if ascending { 1 } else { i64::MIN });
+    let max_value = validated
+        .max_value
+        .unwrap_or(if ascending { i64::MAX } else { -1 });
+    if min_value >= max_value {
+        return Err(invalid("MINVALUE must be less than MAXVALUE"));
+    }
+    let start = validated
+        .start
+        .unwrap_or(if ascending { min_value } else { max_value });
+    if start < min_value {
+        return Err(invalid("START value cannot be less than MINVALUE"));
+    }
+    if start > max_value {
+        return Err(invalid("START value cannot be greater than MAXVALUE"));
+    }
+    Ok(crate::catalog::sequence::SequenceParams {
+        increment,
+        min_value,
+        max_value,
+        start,
+        cycle: validated.cycle.unwrap_or(false),
+    })
+}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体（Issue #1688）。
+/// 意味検証の後、`Storage::create_sequence`（単一 write txn 内で名前空間の衝突判定・件数上限）へ
+/// 委譲する。SEQUENCE の定義は全テナント共有カタログのため `PolicyContext` は取らない。
+pub(crate) fn execute_create_sequence(
+    storage: &Storage,
+    validated: &ValidatedCreateSequence,
+) -> Result<CreateSequenceOutcome, SqlSurfaceError> {
+    let params = resolve_sequence_params(validated)?;
+    storage
+        .create_sequence(validated.name(), &params)
+        .map_err(|e| map_sequence_error(e, "CREATE SEQUENCE failed"))?;
+    Ok(CreateSequenceOutcome {})
+}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体（Issue #1688）。
+/// `Storage::drop_sequence`（同一 write txn 内で依存 DEFAULT の検査・定義と全テナント分の
+/// 状態行の削除）へ委譲する。
+pub(crate) fn execute_drop_sequence(
+    storage: &Storage,
+    validated: &ValidatedDropSequence,
+) -> Result<DropSequenceOutcome, SqlSurfaceError> {
+    storage
+        .drop_sequence(validated.name())
+        .map_err(|e| map_sequence_error(e, "DROP SEQUENCE failed"))?;
+    Ok(DropSequenceOutcome {})
+}
+
+/// SEQUENCE DDL の [`CatalogError`] を SQL 表層の契約へ写像する（名前重複 `42P07`・不在 `42P01`・
+/// 種別違い `42809`・依存あり `2BP01`・上限超過 `54000`・ロック timeout `55P03`）。
+/// 不在は未知の名前も（#1711 以降の）他テナントの名前も同じ経路で、エラー文言に存在情報を
+/// 含めない（security.md P0）。
+fn map_sequence_error(e: CatalogError, internal_detail: &str) -> SqlSurfaceError {
+    match e {
+        CatalogError::TableAlreadyExists(name) => SqlSurfaceError::duplicate_table(name),
+        CatalogError::TableNotFound(name) => SqlSurfaceError::undefined_table(name),
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::DependentObjectsStillExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
+        CatalogError::ViewLimitExceeded(_) => {
+            SqlSurfaceError::payload_too_large("too many sequences")
+        }
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: internal_detail.to_string(),
         },
     }
 }

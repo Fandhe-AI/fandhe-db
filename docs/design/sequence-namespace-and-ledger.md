@@ -168,3 +168,49 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
 - 状態キー先頭の `tenant_id` と `42P01` 一本化により、他テナントの存在・採番量を漏らさない
 - 未知の格納版・カタログタグは拒否する（fail-closed）。依存は追加しない
 - SEQUENCE 名は `validate_identifier` で検証した識別子のみを使い、SQL／プラン文字列へ連結しない
+
+## 7. Issue #1688 実装記録（カタログと CREATE／DROP SEQUENCE）
+
+D3・D8 を実装した。コードは `catalog/sequence.rs`（Storage 水準）と `sql::allowlist`・`sql::ddl`（SQL 表層）にある。
+
+### 7.1 格納
+
+| テーブル | キー | 値 |
+| -------- | ---- | -- |
+| `sequences`（定義） | `(schema, name)`。#1711 より前の schema は `public` 固定。組み立ては `sequence_key` の 1 箇所 | 固定長 blob（版 1・内部 ID・型タグ・increment・min・max・start・cache〔1 固定〕・cycle・owned_by〔なし固定〕） |
+| `sequence_state`（採番状態） | `(tenant_id, sequence_id)` | 本 Issue では書き込み経路なし。形式は #1690 が決める |
+| `sequence_id_counter` | 固定キー 1 行 | 単調カウンタ。1 始まり・`checked_add`・再利用しない |
+
+- decode は未知の版・型タグ・長さ不一致・cycle の不正値・範囲不変条件違反を `CorruptSchema` にする（fail-closed）
+- 定義数の上限は `MAX_LIST_TABLES`（超過は `54000`）
+- 公開 API（`core_api.snapshot`）を変えないため、エラーは既存の `CatalogError` variant を流用した。`Storage::create_sequence`／`drop_sequence` は `pub(crate)`
+
+### 7.2 relation 名前空間
+
+`index_name_exists_in_txn` を呼ぶ全箇所（表・ビュー・索引・matview の作成、`ALTER TABLE ... RENAME TO`、FK の参照先、`DROP TABLE`／`VIEW`／`INDEX`／`MATERIALIZED VIEW`、`CREATE INDEX` の対象）に SEQUENCE の照合を併記した。衝突は `42P07`、種別違いは `42809`。ENUM 型と一時表は別の名前空間のまま。
+
+### 7.3 構文と意味検証
+
+- 受理: `CREATE SEQUENCE <name>` に `START [WITH]`・`INCREMENT [BY]`・`MINVALUE`／`NO MINVALUE`・`MAXVALUE`／`NO MAXVALUE`・`CYCLE`／`NO CYCLE` を任意順。`DROP SEQUENCE <name> [RESTRICT]`
+- `0A000`: `IF [NOT] EXISTS`・`AS`・`CACHE`・`OWNED BY`・`TEMP`／`UNLOGGED`・修飾名・`CASCADE`・複数名。修飾名は表も未対応のため、SEQUENCE だけ先に受理すると不整合になる。#1717 で入れる
+- `42601`: 同種オプションの重複（`MINVALUE` と `NO MINVALUE` の組を含む）・小数・指数・未知のトークン。`22003`: i64 の範囲外
+- `22023`: `INCREMENT 0`・`MINVALUE >= MAXVALUE`・`START` が範囲外。既定値は昇順が `1`〜`i64::MAX`・`START = MINVALUE`、降順が `i64::MIN`〜`-1`・`START = MAXVALUE`
+- 権限ゲートは構文検証の後・カタログ照会の前に置く。権限の無い主体には、対象の有無を問わず `42501`
+
+### 7.4 DROP
+
+同一 write txn で、依存 DEFAULT の検査 → 定義の削除 → 全テナント分の状態行の削除（`retain` の走査削除）を行う。
+
+- 状態テーブルが未作成なら何もせず、テーブルを作らない
+- 依存検査は `column_default_references_sequence`（ワイルドカードなしの網羅 match）を呼ぶフックだけで、現時点では常に偽。`ColumnDefault` に SEQUENCE を参照する variant を足す #1690 でコンパイルエラーになり、判定の書き漏れを防ぐ。2BP01 の正例のテストは #1690 で追加する
+- 走査コストの実測: 1 万テナント × 2 SEQUENCE（状態 2 万行）で、片方の DROP が約 1.5 ms（最適化ビルドのテスト。`catalog::sequence::tests::drop_scan_cost_measurement`）。DDL の頻度と許可ユーザーの限定を考えると十分小さいため、全走査を維持し、`sequence_id` の逆引き索引は作らない
+
+### 7.5 受け入れ条件「他テナントの SEQUENCE が見えない」の範囲
+
+Issue #1711 より前の定義は全テナント共有の `public` に属するため（D3）、本 Issue が保証するのは次の範囲に限る。
+
+- 状態行のキー先頭が `tenant_id` で、あるテナントのキーから他テナントの状態行を読めない
+- DROP は全テナントの状態行を定義の削除と同じ txn で消し、内部 ID を再利用しないため、同名で作り直しても古い状態を拾わない
+- 未知の名前の `42P01` はテナントによらず同一の応答で、文言にテナント情報を含めない
+
+**既知の残課題**: 他テナントのスキーマに属する SEQUENCE を名前で解決できないことの完全な実現は、#1711（tenant 所有のスキーマ）と #1717（SEQUENCE の修飾名）に属する。`sequence_key` が差し替え点。

@@ -387,7 +387,7 @@ fn structural_rejections_do_not_consult_the_catalog() {
         ("CREATE INDEX idx ON docs USING gin (lang)".into(), "0A000"),
         ("CREATE INDEX idx ON docs USING bm25 (body)".into(), "0A000"),
         (
-            "CREATE UNIQUE INDEX idx ON docs (lang) WHERE lang = 'ja'".into(),
+            "CREATE INDEX idx ON docs USING hnsw (embedding) WHERE lang = 'ja'".into(),
             "0A000",
         ),
         // 部分索引の述語の分類（INDEX-11、Issue #1653）もカタログ非参照。
