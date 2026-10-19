@@ -51,6 +51,17 @@ pub(crate) struct BoundIndexPredicate {
 }
 
 impl BoundIndexPredicate {
+    /// 述語の唯一の AND 連言（含意判定 `sql::index_implication` の入力）。分岐が 1 個でなければ
+    /// `None`（呼び出し側は含意しない扱いにする。束縛は常に単一分岐で作るため防御的な戻り値）。
+    /// プランナ（Issue #1656）が結線するまで呼び出し元はテストのみ。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn conjunction(&self) -> Option<&BoundConjunction> {
+        match self.group.branches.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
     /// 1 行の述語を評価する。TRUE のときだけ `true`（NULL・FALSE は `false`＝索引外）。評価エラー
     /// （0 除算等）は `Err` で、呼び出し元が文の拒否（DML）・構築の断念（派生キー）へ振り分ける。
     /// `scratch` は呼び出し元が行ループの外で 1 回確保して使い回すスクラッチ。
