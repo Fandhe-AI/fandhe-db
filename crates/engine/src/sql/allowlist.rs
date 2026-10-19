@@ -12498,11 +12498,11 @@ pub(crate) fn validate_create_index_tokens(
     p.expect_end_of_statement()?;
     // 最終ゲート（INDEX-10、Issue #1647）。決定性検査は部分索引の `WHERE` 判定より前に済ませてある。
     reject_unimplemented_expression_keys(&expressions, &collations, hnsw)?;
-    // 部分索引の最終ゲート（INDEX-11、Issue #1653・#1654）。述語の格納・DML 維持は Issue #1654 で
-    // 実装済みのため、残すのは強制や照合の永続形が無い組み合わせだけ（宣言だけ残って効かない索引や
-    // 強制漏れ〔fail-open〕を作らない）。部分 UNIQUE の強制は #1657。
+    // 部分索引の最終ゲート（INDEX-11、Issue #1653・#1654）。述語の格納・DML 維持は Issue #1654、
+    // 部分 UNIQUE の強制は Issue #1657 で実装済みのため、残すのは照合や hnsw の永続形が無い組み合わせ
+    // だけ（宣言だけ残って効かない索引を作らない）。
     if predicate.is_some() {
-        reject_unimplemented_partial_index(unique, hnsw, &collations, &expressions)?;
+        reject_unimplemented_partial_index(hnsw, &collations, &expressions)?;
     }
     Ok(ValidatedCreateIndex {
         name,
@@ -12518,11 +12518,10 @@ pub(crate) fn validate_create_index_tokens(
 }
 
 /// 部分索引の最終ゲート（INDEX-11、Issue #1654）。カタログ非参照の構文段で `0A000` に倒す組み合わせ:
-/// `UNIQUE`（部分 UNIQUE の強制は #1657。強制漏れの fail-open を作らない）・`USING hnsw`・`COLLATE`
-/// （`v6` の永続形は照合を持たない。素の列・式のどちらへの指定も）。matview への `WHERE` は対象の種別を
-/// 知る書き込みトランザクション内（`Storage::create_index_bound`）で拒否する。
+/// `USING hnsw`・`COLLATE`（`v6`／`v7` の永続形は照合を持たない。素の列・式のどちらへの指定も）。
+/// 部分 UNIQUE は Issue #1657 で受理に変わった（強制は `constraint::UniqueKeyPlan`）。matview への
+/// `WHERE` は対象の種別を知る書き込みトランザクション内（`Storage::create_index_bound`）で拒否する。
 fn reject_unimplemented_partial_index(
-    unique: bool,
     hnsw: bool,
     collations: &[Option<crate::collation::Collation>],
     expressions: &[Option<Expr>],
@@ -12530,9 +12529,6 @@ fn reject_unimplemented_partial_index(
     let unsupported = |detail: &str| SqlSurfaceError::FeatureNotSupported {
         detail: detail.to_string(),
     };
-    if unique {
-        return Err(unsupported("partial unique indexes are not supported yet"));
-    }
     if hnsw {
         return Err(unsupported(
             "partial indexes are not supported for this index kind yet",

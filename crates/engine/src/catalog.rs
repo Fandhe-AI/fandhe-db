@@ -259,9 +259,13 @@ const INDEX_DEF_EXPRESSION_VERSION: &str = "v4";
 const INDEX_DEF_EXPRESSION_UNIQUE_VERSION: &str = "v5";
 /// 部分索引の永続形の版（INDEX-11、Issue #1654）。`v4` の行構成の末尾に、述語の正規化 SQL（小文字
 /// 16 進）と述語の参照列 CSV の 2 行を足す。式要素は 0 個でもよい（列だけの部分索引）。非一意に限る
-/// （部分 UNIQUE は後続 Issue）。`v1`〜`v5` のバイト列は変えない（旧バイナリは `v6` を未知の版として
+/// （一意は `v7`）。`v1`〜`v5` のバイト列は変えない（旧バイナリは `v6` を未知の版として
 /// 拒否する。前方互換はない）。
 const INDEX_DEF_PARTIAL_VERSION: &str = "v6";
+/// 部分 UNIQUE 索引の永続形の版（INDEX-11 (4)、Issue #1657）。`v6` の行構成のうち、参照列行と述語行
+/// の間に固定行 `unique` を挟む（`…参照列行 / unique / 述語 hex / 述語の参照列 CSV`）。`v1`〜`v6`
+/// のバイト列は変えない（旧バイナリは `v7` を未知の版として拒否する。前方互換はない）。
+const INDEX_DEF_PARTIAL_UNIQUE_VERSION: &str = "v7";
 
 impl IndexDef {
     /// 照合指定なしの索引宣言を作る（`collations` はすべて `None`・式要素なし）。
@@ -404,7 +408,8 @@ fn encode_index_def(def: &IndexDef) -> Result<Vec<u8>> {
 /// （列の位置は `-`、式の位置は正規化 SQL の UTF-8 を小文字 16 進にしたもの）／参照列行
 /// （式ごとに `;` 区切り、各式の中は `,` 区切り）。式テキストは `,`・改行・`'` を含み得るため、
 /// 区切り文字と衝突しない 16 進で格納する。一意の式索引（Issue #1651）は版を `v5` にして末尾へ
-/// 固定行 `unique` を足す。`hnsw`・照合付きの式要素は保存しない（構文段が拒否済みの組み合わせの
+/// 固定行 `unique` を足す。述語付き（部分索引）は非一意が `v6`、一意が `v7`（述語行の前に `unique` 行。
+/// Issue #1657）。`hnsw`・照合付きの式要素は保存しない（構文段が拒否済みの組み合わせの
 /// 多層防御）。
 fn encode_expression_index_def(def: &IndexDef, columns_csv: &str) -> Result<String> {
     let invalid = |msg: &str| CatalogError::Invalid(msg.to_string());
@@ -455,11 +460,7 @@ fn encode_expression_index_def(def: &IndexDef, columns_csv: &str) -> Result<Stri
     }
     let collation_tokens = vec!["-"; def.columns.len()].join(",");
     if let Some(p) = &def.predicate {
-        // 部分索引（`v6`）。非一意に限る（部分 UNIQUE は後続 Issue。強制の永続形を持たないまま
-        // 宣言を残すと fail-open になるため保存しない）。
-        if def.unique {
-            return Err(invalid("partial unique index is not supported yet"));
-        }
+        // 部分索引。非一意は `v6`、一意は `v7`（`unique` 行を述語行の前に挟む）。
         if p.sql.is_empty() || p.sql.len() > MAX_INDEX_EXPRESSION_SQL_LEN {
             return Err(invalid("index predicate text length is out of range"));
         }
@@ -469,8 +470,13 @@ fn encode_expression_index_def(def: &IndexDef, columns_csv: &str) -> Result<Stri
         for r in &p.referenced_columns {
             validate_identifier(r)?;
         }
+        let (version, unique_row) = if def.unique {
+            (INDEX_DEF_PARTIAL_UNIQUE_VERSION, "\nunique")
+        } else {
+            (INDEX_DEF_PARTIAL_VERSION, "")
+        };
         return Ok(format!(
-            "{INDEX_DEF_PARTIAL_VERSION}\n{}\nscalar\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{version}\n{}\nscalar\n{}\n{}\n{}\n{}{unique_row}\n{}\n{}",
             def.table,
             columns_csv,
             collation_tokens,
@@ -511,7 +517,7 @@ fn decode_expression_index_tail<'a>(
     let collations_line = lines.next().ok_or_else(corrupt)?;
     let exprs_line = lines.next().ok_or_else(corrupt)?;
     let refs_line = lines.next().ok_or_else(corrupt)?;
-    // `v5`（一意の式索引）は末尾に固定行 `unique` を持つ。それ以外の値・欠落は破損。
+    // `v5`（一意の式索引）は末尾、`v7`（部分 UNIQUE）は述語行の前に固定行 `unique` を持つ。それ以外の値・欠落は破損。
     if unique && lines.next() != Some("unique") {
         return Err(corrupt());
     }
@@ -621,6 +627,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         && version != INDEX_DEF_EXPRESSION_VERSION
         && version != INDEX_DEF_EXPRESSION_UNIQUE_VERSION
         && version != INDEX_DEF_PARTIAL_VERSION
+        && version != INDEX_DEF_PARTIAL_UNIQUE_VERSION
     {
         return Err(CatalogError::CorruptSchema(format!(
             "unknown index catalog format version for index {name}"
@@ -631,7 +638,8 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     let is_v5 = version == INDEX_DEF_EXPRESSION_UNIQUE_VERSION;
     // 式索引（`v4`: 非一意、`v5`: 一意）。以降の式索引向けの分岐は両版で共通。
     let is_v6 = version == INDEX_DEF_PARTIAL_VERSION;
-    let is_v4 = version == INDEX_DEF_EXPRESSION_VERSION || is_v5 || is_v6;
+    let is_v7 = version == INDEX_DEF_PARTIAL_UNIQUE_VERSION;
+    let is_v4 = version == INDEX_DEF_EXPRESSION_VERSION || is_v5 || is_v6 || is_v7;
     let table = lines
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema(format!("missing table for index {name}")))?
@@ -702,7 +710,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         )));
     }
     let (expressions, predicate) = if is_v4 {
-        decode_expression_index_tail(name, &columns, is_v5, is_v6, lines)?
+        decode_expression_index_tail(name, &columns, is_v5 || is_v7, is_v6 || is_v7, lines)?
     } else {
         (vec![None; columns.len()], None)
     };
@@ -716,7 +724,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         kind,
         columns,
         collations,
-        unique: is_v3 || is_v5,
+        unique: is_v3 || is_v5 || is_v7,
         expressions,
         predicate,
     })
@@ -919,6 +927,9 @@ pub(crate) struct DeclaredPartialIndex {
     pub(crate) index_name: String,
     /// 保存済みの述語の正規化 SQL テキスト（untrusted として再解析・再束縛する）。
     pub(crate) predicate_sql: String,
+    /// 部分 UNIQUE 索引か（INDEX-11 (4)、Issue #1657）。真なら `constraint::UniqueKeyPlan` が述語 TRUE の
+    /// 行だけを対象に一意性を強制する。DML ゲート・派生キーの構築には影響しない。
+    pub(crate) unique: bool,
     /// 要素の並び（宣言順）。
     pub(crate) elements: Vec<PartialElementDecl>,
 }
@@ -954,6 +965,7 @@ impl DeclaredPartialIndex {
         Some(Self {
             index_name: def.name.clone(),
             predicate_sql: p.sql.clone(),
+            unique: def.unique,
             elements,
         })
     }
@@ -1552,10 +1564,10 @@ fn build_unique_index_schema_in_txn(
     def: &IndexDef,
     schema: &TableSchema,
 ) -> Result<TableSchema> {
-    // 式要素付きの一意索引は UNIQUE 制約へ展開せず、索引カタログだけが持つ（Issue #1651。
-    // `create_index_bound` が [`check_unique_index_gate`] を通す）。ここへ届くのは内部の呼び出し
-    // 契約違反で、列だけにして黙って作らず拒否する（多層防御）。
-    if def.has_expressions() {
+    // 式要素付き・述語付き（部分 UNIQUE。Issue #1657）の一意索引は UNIQUE 制約へ展開せず、索引
+    // カタログだけが持つ（Issue #1651。`create_index_bound` が [`check_unique_index_gate`] を通す）。
+    // ここへ届くのは内部の呼び出し契約違反で、列だけにして黙って作らず拒否する（多層防御）。
+    if def.has_expressions() || def.has_predicate() {
         return Err(CatalogError::IndexKindMismatch(
             "expression elements must not be expanded into a unique constraint".to_string(),
         ));
@@ -2097,7 +2109,7 @@ fn rename_index_def_columns_in_txn(
                     });
                 }
             }
-            if def.unique && def.has_expressions() {
+            if def.unique && (def.has_expressions() || def.has_predicate()) {
                 unique_expression_touched = true;
             }
             updates.push((name, encode_index_def(&def)?));
@@ -2170,7 +2182,7 @@ fn delete_indexes_referencing_column_in_txn(
     let mut removed_unique_expression_index = false;
     retain_index_defs_in_txn(write_txn, |def| {
         let keep = def.table != table_name || !def.referenced_columns().any(|c| c == column_name);
-        if !keep && def.unique && def.has_expressions() {
+        if !keep && def.unique && (def.has_expressions() || def.has_predicate()) {
             removed_unique_expression_index = true;
         }
         keep
@@ -14022,10 +14034,10 @@ impl Storage {
             .into());
         }
         // 部分索引（INDEX-11、Issue #1654）の未対応の組み合わせは `0A000`。構文段の最終ゲートの
-        // 多層防御で、強制や照合の永続形が無いまま宣言を残さない（fail-closed）。
+        // 多層防御で、強制や照合の永続形が無いまま宣言を残さない（fail-closed）。部分 UNIQUE は
+        // 永続一意索引の序数として強制する（Issue #1657）ため、ここでは拒否しない。
         if predicate.is_some()
-            && (def.unique
-                || !matches!(def.kind, IndexKind::Scalar)
+            && (!matches!(def.kind, IndexKind::Scalar)
                 || def.collations.iter().any(Option::is_some))
         {
             return Err(CreateIndexError::Sql(
@@ -14170,19 +14182,21 @@ impl Storage {
             // 一意の式索引（INDEX-9・INDEX-10、Issue #1651）の前提ゲート: 列要素の型ゲート →
             // 制約名前空間の衝突。式一意索引は UNIQUE 制約へ展開しない（式には列リストが無いため
             // 索引カタログだけが持つ）ので、制約数上限・追加後スキーマの検証は通さない。
-            if def.unique && has_exprs {
+            // 部分 UNIQUE 索引（INDEX-11 (4)、Issue #1657）も同じゲートを通す（列だけでも UNIQUE 制約へは
+            // 展開しないため、素の列の型ゲートと制約名前空間の衝突をここで確かめる）。
+            if def.unique && (has_exprs || predicate.is_some()) {
                 check_unique_index_gate(&stored, &schema)?;
             }
             // 既存行の検証（INDEX-10、Issue #1649）: 全テナント・全可視性の行で式が評価でき索引化
             // できなければ、保存前に拒否する（作れない式索引を残さない）。評価エラーは SQLSTATE を
             // 保った固定文言へ置換し、不可視行の値を応答へ出さない。一意の式索引は続けて同じ行で
             // テナントごとの重複を走査する（`23505`。テナント・値・件数は応答に含めない）。
-            if let Some(partial) = DeclaredPartialIndex::from_def(&stored) {
+            if let Some(partial_decl) = DeclaredPartialIndex::from_def(&stored) {
                 // 部分索引（INDEX-11、Issue #1654）: 全行で述語が評価でき、述語 TRUE の行で式要素も
                 // 索引化できなければ保存前に拒否する（述語外の行では式要素を評価しない）。
                 let compiled = crate::sql::index_predicate::CompiledPartialIndexes::compile(
                     &schema,
-                    &[partial],
+                    std::slice::from_ref(&partial_decl),
                 )
                 .map_err(map_index_validation_error)?;
                 if let Some(compiled) = compiled {
@@ -14193,6 +14207,18 @@ impl Storage {
                                 &row_table, &schema, &compiled,
                             )
                             .map_err(map_index_validation_error)?;
+                            // 部分 UNIQUE 索引（Issue #1657）: 述語 TRUE の行だけを対象に、テナントごとの
+                            // 重複を走査する（`23505`。テナント・値・件数は応答に含めない）。
+                            if def.unique
+                                && crate::constraint::table_has_duplicate_partial_unique_key(
+                                    &row_table,
+                                    &schema,
+                                    &partial_decl,
+                                )
+                                .map_err(map_index_validation_error)?
+                            {
+                                return Err(CatalogError::UniqueConstraintViolation.into());
+                            }
                         }
                         // 行テーブル未作成は行 0 件として扱う。
                         Err(redb::TableError::TableDoesNotExist(_)) => {}
@@ -14245,7 +14271,7 @@ impl Storage {
             // 一意索引（Issue #1616・INDEX-9）: 型ゲート → 制約名前空間 → 件数上限 →
             // 追加後スキーマの検証 → 既存行の重複走査 の順で、スキーマ側の UNIQUE 制約
             // （強制の唯一の入力）を組み立てる。データに依存するのは最後の走査だけ。
-            let unique_schema = if def.unique && !has_exprs {
+            let unique_schema = if def.unique && !has_exprs && predicate.is_none() {
                 Some(build_unique_index_schema_in_txn(&write_txn, def, &schema)?)
             } else {
                 None
@@ -14319,8 +14345,9 @@ impl Storage {
         };
         // matview の索引宣言（Issue #1667）は表の UNIQUE 制約を持たないので外す制約が無い。
         if def.unique && !materialized_view_exists_in_txn(&write_txn, &def.table)? {
-            if def.has_expressions() {
-                // 一意の式索引（Issue #1651）は UNIQUE 制約へ展開していないので外す制約が無い。
+            if def.has_expressions() || def.has_predicate() {
+                // 一意の式索引（Issue #1651）・部分 UNIQUE 索引（Issue #1657）は UNIQUE 制約へ展開して
+                // いないので外す制約が無い。
                 // 永続一意索引だけ失効させる（強制はカタログの宣言が無くなった時点で外れ、
                 // 残りのキーは次回の書き込みで再構築される）。
                 write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
@@ -24210,15 +24237,73 @@ mod tests {
         }
     }
 
-    /// 述語付きの宣言は、部分 UNIQUE・hnsw・照合付き・空や超過の述語をエンコード時に拒否する（多層防御）。
+    /// 部分 UNIQUE 索引（`v7`）は往復でき、`v6` の行構成のうち述語行の前に固定行 `unique` を持つ
+    /// （INDEX-11 (4)、Issue #1657）。非一意の `v6` のバイト列は変わらない。
+    #[test]
+    fn partial_unique_index_def_round_trips_through_v7() {
+        let cases = [
+            partial_def("p", &["kind"], "kind = 'a,b;c\n''d'", &["kind"]).with_unique(true),
+            partial_def("p", &["a", "b"], "id > 3", &[]).with_unique(true),
+            expr_def("p", &["", "body"], &[Some(("lower(a)", &["a"])), None])
+                .with_unique(true)
+                .with_predicate(Some(IndexPredicateDef {
+                    sql: "a IS NOT NULL".to_string(),
+                    referenced_columns: vec!["a".to_string()],
+                })),
+        ];
+        for def in cases {
+            let bytes = encode_index_def(&def).expect("encode");
+            assert!(bytes.starts_with(b"v7\n"), "{def:?}");
+            let decoded = decode_index_def("p", &bytes).expect("decode");
+            assert!(decoded.unique);
+            assert_eq!(decoded, def);
+        }
+        let def = partial_def("p", &["a"], "n > 1", &["n"]);
+        assert_eq!(
+            encode_index_def(&def.clone().with_unique(true)).expect("encode"),
+            b"v7\ndocs\nscalar\na\n-\n-\n\nunique\n6e203e2031\nn".to_vec()
+        );
+        assert!(encode_index_def(&def).expect("encode").starts_with(b"v6\n"));
+    }
+
+    /// 破損した `v7` は fail-closed の `CorruptSchema`（`unique` 行の欠落・別値・行順違い・`v6` への
+    /// `unique` 行の混入）。
+    #[test]
+    fn corrupt_v7_records_are_rejected() {
+        let good = "v7\ndocs\nscalar\na\n-\n-\n\nunique\n6e203e2031\nn";
+        assert!(decode_index_def("p", good.as_bytes()).is_ok(), "{good}");
+        for bad in [
+            // `unique` 行の欠落（`v6` の構成のまま）。
+            "v7\ndocs\nscalar\na\n-\n-\n\n6e203e2031\nn",
+            // `unique` 以外の値。
+            "v7\ndocs\nscalar\na\n-\n-\n\nUNIQUE\n6e203e2031\nn",
+            // 行順違い（述語の後ろに `unique`）。
+            "v7\ndocs\nscalar\na\n-\n-\n\n6e203e2031\nn\nunique",
+            // `v6` へ `unique` 行が混入。
+            "v6\ndocs\nscalar\na\n-\n-\n\nunique\n6e203e2031\nn",
+            // 述語行の不足。
+            "v7\ndocs\nscalar\na\n-\n-\n\nunique",
+            // 余剰行。
+            "v7\ndocs\nscalar\na\n-\n-\n\nunique\n6e203e2031\nn\nextra",
+            // 種別 hnsw。
+            "v7\ndocs\nhnsw\na\n-\n-\n\nunique\n6e203e2031\nn",
+        ] {
+            assert!(
+                matches!(
+                    decode_index_def("p", bad.as_bytes()),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// 述語付きの宣言は、hnsw・照合付き・空や超過の述語をエンコード時に拒否する（多層防御）。
     #[test]
     fn partial_index_encode_rejects_unsupported_combinations() {
         let ok = partial_def("p", &["a"], "n > 1", &["n"]);
         assert!(encode_index_def(&ok).is_ok());
-        assert!(matches!(
-            encode_index_def(&ok.clone().with_unique(true)),
-            Err(CatalogError::Invalid(_))
-        ));
+        assert!(encode_index_def(&ok.clone().with_unique(true)).is_ok());
         let mut hnsw = ok.clone();
         hnsw.kind = IndexKind::Hnsw;
         assert!(matches!(

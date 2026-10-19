@@ -39,6 +39,13 @@
 //! コミット済みの全行で述語が評価できること（`n = -5` の行が無い）、述語外の `n = 0` の行が永続化
 //! されていること（退場側の受理）を確かめる。
 //!
+//! Issue #1657（INDEX-11 (4)）で、同じ表へ部分 UNIQUE 索引 `(code) WHERE n > 0` を加えた。`code` は
+//! `code-{id}` で恒久的に一意なので書き込みは不変で、先頭行の符号反転による入退場が一意索引の正引き・
+//! 逆引きの更新を kill の対象経路に乗せる。`verify` は読み取り専用の `verify_unique_index_read_only` が
+//! 部分 UNIQUE 仕様を含めて成功すること（永続一意索引がクラッシュ後も述語 TRUE の行と一致する）と、
+//! 述語内の既存 code を新しい id・`n > 0` で再挿入すると再起動後も必ず `23505` で拒否されることを確かめる
+//! （述語外の重複を受理する側のプローブは行を残してしまうため、結合テストが担当する）。
+//!
 //! サブコマンド:
 //! - `write <db_path>`: `docs (code TEXT UNIQUE)` テーブル（無ければ作成）へ、
 //!   `BATCH` 件の行を 1 `INSERT` 文（＝1 write トランザクション。UNIQUE 索引の
@@ -189,6 +196,8 @@ fn ensure_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
         "CREATE INDEX IF NOT EXISTS docs_pidx_div ON docs_pidx ((100 / n)) WHERE n > 0",
         // 述語自体が `n = -5` で 0 除算になる。`write` は -5 を書かない。
         "CREATE INDEX IF NOT EXISTS docs_pidx_pred ON docs_pidx (code) WHERE 100 / (n + 5) > 1",
+        // 部分 UNIQUE 索引（Issue #1657）。`code` は恒久的に一意なので `write` は違反しない。
+        "CREATE UNIQUE INDEX IF NOT EXISTS docs_pidx_code_u ON docs_pidx (code) WHERE n > 0",
     ] {
         core.execute_sql_in_session(ctx, &mut session, sql)
             .map_err(|e| format!("create partial index failed: {e}"))?;
@@ -578,6 +587,47 @@ fn verify_partial_index_table(
     ctx: &PolicyContext,
     total_rows: u64,
 ) -> Result<(), String> {
+    // (0) 部分 UNIQUE 索引（Issue #1657）の永続一意索引を、書き込みを一切しない読み取り専用の検証で
+    //     確かめる。以降のプローブは書き込み経路の `ensure_tenant_index` で索引を再構築しうるため、
+    //     必ず最初に行う。
+    core.verify_unique_index_read_only(ctx, PIDX_TABLE)
+        .map_err(|e| {
+            format!("read-only partial unique index verification failed before probes: {e}")
+        })?;
+    // (0b) 述語内の既存行の code を新しい id・`n > 0` で再挿入すると `23505` で拒否される
+    //      （部分 UNIQUE の正引きエントリがクラッシュ後も生きている）。
+    let inside = core
+        .execute_sql(
+            ctx,
+            &format!("SELECT id FROM {PIDX_TABLE} WHERE n > 0 LIMIT 1"),
+        )
+        .map_err(|e| format!("verify inside-predicate scan failed: {e}"))?;
+    if let Some(row) = inside.rows.first() {
+        // `write` は code を `code-{id}` で書く（[`row_tuple`]）。
+        let code = format!("code-{}", row.id);
+        let dup_id = total_rows.saturating_add(1);
+        let sql = format!(
+            "INSERT INTO {PIDX_TABLE} (id, n, code) VALUES ({dup_id}, 1, '{code}') \
+             USING OPERATION_ID 'verify-pidx-uniq-{dup_id}'"
+        );
+        match core.execute_insert_sql(ctx, &sql) {
+            Err(e) if e.wire_code() == "23505" => {}
+            Err(e) => {
+                return Err(format!(
+                    "partial unique probe failed with an unexpected wire_code {} \
+                     (expected 23505): {e}",
+                    e.wire_code()
+                ));
+            }
+            Ok(_) => {
+                return Err(
+                    "partial unique probe insert was wrongly accepted; the partial unique \
+                     index is not enforced after crash recovery"
+                        .to_string(),
+                );
+            }
+        }
+    }
     // (a) 述語の評価エラー（`n = -5`）の INSERT は `22012` で拒否され、その id の行が残らない。
     let probe_id = total_rows;
     let insert_sql = format!(

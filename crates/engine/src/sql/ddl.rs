@@ -2667,14 +2667,12 @@ pub(crate) fn execute_create_index(
             detail: "expression indexes are not supported for this index kind yet".to_string(),
         });
     }
-    // 防御ゲート（INDEX-11、Issue #1653・#1654）: 述語付きの未対応の組み合わせ（部分 UNIQUE・hnsw・
-    // COLLATE）は構文段の最終ゲートで拒否済みだが、将来の経路変更で届いても、述語を黙って落として
+    // 防御ゲート（INDEX-11、Issue #1653・#1654）: 述語付きの未対応の組み合わせ（hnsw・COLLATE。
+    // 部分 UNIQUE は Issue #1657 で受理）は構文段の最終ゲートで拒否済みだが、将来の経路変更で届いても、述語を黙って落として
     // 列だけの索引を保存しない（fail-closed）。述語そのものは `create_index_bound` が書き込み txn 内で
     // 束縛して正規化テキストと参照列を確定する。
     if validated.predicate().is_some()
-        && (validated.is_unique()
-            || validated.is_hnsw()
-            || validated.column_collations().iter().any(Option::is_some))
+        && (validated.is_hnsw() || validated.column_collations().iter().any(Option::is_some))
     {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "partial indexes are not supported for this index definition yet".to_string(),
