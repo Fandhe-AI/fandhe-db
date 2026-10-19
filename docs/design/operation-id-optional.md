@@ -42,6 +42,14 @@
 - 保護が必要な運用（冪等な再送を前提とするクライアント）は `--require-operation-id` を使う
 - 対象外: NoSQL／HTTP 経路の wire 層検査（#2203）、既定と必須の行列回帰（#1705）
 
+## Issue #1705 追記
+
+- 実装は変えず、「`operation_id` 省略／指定」×「既定（任意）／`--require-operation-id`（必須）」の行列を回帰テストで固定した（RECOVER-1 ポインタ）
+- engine 層: `crates/engine/tests/recovery_ledger_mode_matrix.rs`。省略形（INSERT 単一・複数行・UPSERT・UPDATE／DELETE の id 形と述語形・TRUNCATE・明示 `NULL`）のモード別結果、指定時の契約（記録・再送 `23505`・内容不一致 `22023`）がモード間で一致すること、分割実行 DML（SQL・束縛済み入口）が両モードで `23502` であること、SQL の `SET`／`RESET`／`ALTER SYSTEM` で両方向とも切り替えられない（`42601`）ことを固定する
+- wire 層: `crates/wire-server/tests/wire_require_operation_id_matrix.rs`。簡易クエリ・拡張クエリ・COPY の行列に加え、wire 越しの `SET`、StartupMessage の追加パラメータ（`options`・素のキー）、HTTP のクエリ文字列でモードが変わらないことを固定する。モードは CLI の解決関数経由で決める
+- 追跡事項: 拡張クエリの `USING OPERATION_ID $n` に `NULL` を束縛すると、既定でも bind 段で `23502` になる（リテラルの `NULL` は既定で受理）。任意化との整合は別途扱うため、本 Issue では固定していない
+- 対象外: HTTP の書き込み op の省略時の挙動（#2203）
+
 ## スコープ外
 
 - コード変更（後続 Issue で実施）
