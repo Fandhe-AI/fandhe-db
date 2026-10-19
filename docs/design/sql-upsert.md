@@ -153,8 +153,10 @@ PR #1053（Issue #905・UNIQUE 制約）が対象外とした「UPSERT の衝突
 
 ## 行制約由来 `23505` が構造的に発生しないこと
 
-本構文で `23505` が返るのは**台帳由来（`DuplicateOperationId`）のみ**。行制約由来
-（`TenantWriteError::IdConflict`）は上記の衝突判定スコープにより構造的に到達しない。
+本構文で arbiter（行 `id` の `TenantWriteError::IdConflict`）由来の `23505` は、上記の
+衝突判定スコープにより構造的に到達しない。arbiter 以外の PK／UNIQUE 制約の違反
+（`DO UPDATE` の結果によるもの、Issue #1708 参照）は行制約由来の `UniqueViolation` として
+`23505` になる。台帳由来（`DuplicateOperationId`）と合わせ、`23505` は 2 分類となる。
 両者は `SqlSurfaceError` の**variant**で区別する（`error_format.rs` は Issue #1180 で
 `23505` の `code` ラベルを分離済み。台帳由来は `ErrorClass::DuplicateOperationId`
 （`DUPLICATE_OPERATION_ID`）、行制約由来は `UniqueViolation`（`UNIQUE_VIOLATION`）。
@@ -278,6 +280,35 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
   `NullPolicy::Skip` は実害がない。
 - **テナント境界**: 事前走査は自テナント所有の全行が母集合（既存の UNIQUE 対象と同一）。
   他テナントの同じ PK 値は非衝突、自テナントの不可視行との衝突は `DO NOTHING` でスキップ。
-- **#1708 との境界**: PK 対象の `DO UPDATE` は既存の Unique 用経路をそのまま通る
-  （結合テストのスモーク 1 本のみ）。`EXCLUDED` の網羅、PK 列自体の更新と `23505`、
-  再送不変性は #1708 の担当。
+- **#1708 との境界**: PK 対象の `DO UPDATE` は既存の Unique 用経路をそのまま通る。
+  `EXCLUDED` の網羅、PK 列自体の更新と `23505`、再送不変性は #1708 で網羅済み（次節）。
+
+## Issue #1708 追記: PK 列指定の DO UPDATE（SQL-49 (3)(5) ポインタ）
+
+実装変更は無く、既存経路（#1707 の解決結果 → Unique 用経路）の振る舞いを
+`crates/engine/tests/table16_primary_key.rs` の結合テストで固定した。
+
+- **`EXCLUDED` の反映**: 単一・複合 PK とも衝突した既存行の `id` のまま更新され、`VALUES` 側の
+  `id` の行は作られない。複合 PK は対象列の書き順に依らない。
+- **PK 列自体の SET**: リテラル・`EXCLUDED.<PK 列>` とも受理する（束縛が拒否するのは
+  `id`／`tenant_id`／`visibility` のみ）。自分自身の値への SET は自己衝突にならない。
+  変更後は永続キー索引の旧キーが解放され、新キーが以後の衝突対象になる。
+- **`23505` の分類**: 更新結果が他行の PK と衝突（複数行が同じ値へ収束する場合を含む）すると
+  行制約由来の `UniqueViolation` で拒否され、行・台帳とも副作用は残らない。台帳由来の
+  `DuplicateOperationId` とは `error_class` で区別して検証している。
+- **再送の不変性**: 台帳照合は行ごとの衝突分岐より先に行うため、PK を変更した後の同一
+  `operation_id` 再送は事前走査が衝突を見つけなくても台帳重複（`23505`／
+  `DuplicateOperationId`）になり、行は変わらない。content_hash は解決した PK の宣言順の
+  列名を連結するので、複合 PK の対象列順を変えた再送も同じ扱いになる。SET の内容だけを
+  変えた再送は `22023`。
+- **テナント境界**: 不可視な自テナント行への衝突は `42501` で文全体を拒否し台帳にも残さない。
+  他テナントの同じ PK 値は衝突しない。
+- **PostgreSQL との差異（記録のみ・挙動は変更しない）**:
+  (a) 対象キー→既存行の対応表は文の書き込み前に 1 回だけ作るため、先行行が PK を `'a'→'b'`
+  に変えたあと後続行が `'b'` を持つ場合、PostgreSQL は再衝突として `21000` だが、本実装は
+  新規挿入し文末の検査で `23505` になる（`21000` 化は SQL-49 (4) の範囲）。
+  (b) 一意性は文末にまとめて検査する（既存 `UPDATE` 経路と同じ）ため、複数行の `DO UPDATE` で
+  PK 値を入れ替える文は本実装では成功する（PostgreSQL は行ごとに検査し `23505`）。
+  いずれも PostgreSQL と異なる挙動を固めないため回帰テストでは固定しない。
+- **対象外**: バッチ内の対象キー重複の `21000` 化、`ON CONFLICT ON CONSTRAINT`、対象省略の
+  `DO NOTHING`、`DO UPDATE ... WHERE`、SET 右辺の式、NoSQL 表層の `upsert`。
