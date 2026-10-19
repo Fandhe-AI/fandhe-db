@@ -2006,3 +2006,58 @@ fn create_table_new_types_without_ddl_permission_is_42501() {
         );
     }
 }
+// --- 一時表との境界（TABLE-44 (6)・Issue #1685） ---------------------------------
+
+/// TABLE-44 (6): pg wire の接続が作った一時表は、同じ engine を共有する HTTP（NoSQL）表層からは
+/// 存在しない表と区別できない。HTTP 側の DDL も一時表を作る経路を持たない。
+#[test]
+fn temp_table_from_pg_wire_is_invisible_to_nosql_surface() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", TENANT_A, "pw-alice")]);
+    let wire_addr = common::spawn_server_with_engine(&users_path, core.clone());
+    let mut pg = common::authenticate_to_ready_for_query(wire_addr, "alice", "pw-alice");
+    common::send_simple_query(&mut pg, "CREATE TEMP TABLE nosql_tmp (v TEXT)");
+    assert_eq!(common::read_command_complete(&mut pg), "CREATE TABLE");
+    common::read_ready_for_query(&mut pg);
+    common::send_simple_query(
+        &mut pg,
+        "INSERT INTO nosql_tmp (id, v) VALUES (1, 'canary-tmp')",
+    );
+    assert_eq!(common::read_command_complete(&mut pg), "INSERT 0 1");
+    common::read_ready_for_query(&mut pg);
+
+    let http = non_ddl_session(core);
+    // 一時表名と、一度も存在しなかった表名で、応答（状態・エラーコード・本文の表名以外）が一致する。
+    let ops = [
+        (r#"{"op":"scan","table":"@T","limit":10}"#, "scan"),
+        (
+            r#"{"op":"insert","table":"@T","rows":[{"id":9,"v":"x"}],"operation_id":"op-n1"}"#,
+            "insert",
+        ),
+        (r#"{"op":"drop_table","table":"@T"}"#, "drop_table"),
+    ];
+    for (template, name) in ops {
+        let on_temp = query(&http, template.replace("@T", "nosql_tmp").as_bytes());
+        let on_none = query(&http, template.replace("@T", "nosql_never").as_bytes());
+        assert_eq!(on_temp.status, on_none.status, "{name}: {on_temp:?}");
+        assert_eq!(
+            http_common::wire_code_of(&on_temp),
+            http_common::wire_code_of(&on_none),
+            "{name}"
+        );
+        let body = String::from_utf8_lossy(&on_temp.body).replace("nosql_tmp", "nosql_never");
+        assert_eq!(body, String::from_utf8_lossy(&on_none.body), "{name}");
+        assert!(!body.contains("canary-tmp"), "{name}: leaked row data");
+    }
+
+    // pg wire 側の一時表は HTTP 側の操作で影響を受けない。
+    common::send_simple_query(&mut pg, "SELECT id, v FROM nosql_tmp LIMIT 10");
+    let _ = common::read_row_description(&mut pg);
+    let row = common::read_data_row(&mut pg);
+    assert_eq!(
+        row,
+        vec![Some("1".to_string()), Some("canary-tmp".to_string())]
+    );
+    assert_eq!(common::read_command_complete(&mut pg), "SELECT 1");
+    common::read_ready_for_query(&mut pg);
+}

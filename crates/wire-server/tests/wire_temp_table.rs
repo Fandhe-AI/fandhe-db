@@ -603,3 +603,197 @@ fn copy_from_and_to_work_on_temp_tables() {
         "0A000",
     );
 }
+// ---------------------------------------------------------------------------------------------
+// 別テナントの不可視・異常切断後の破棄（TABLE-44 (1)(2)・Issue #1685）
+// ---------------------------------------------------------------------------------------------
+
+/// 簡易クエリを 1 文送り、成功なら `Ok(CommandComplete タグ)`、失敗なら `Err(ErrorResponse 本文)`。
+/// どちらでも ReadyForQuery まで読み切る。
+fn try_simple(stream: &mut TcpStream, sql: &str) -> Result<String, String> {
+    send_simple_query(stream, sql);
+    let mut outcome = None;
+    loop {
+        let (kind, body) = read_message(stream);
+        match kind {
+            b'C' => {
+                outcome = Some(Ok(String::from_utf8_lossy(
+                    &body[..body.len().saturating_sub(1)],
+                )
+                .into_owned()))
+            }
+            b'E' => outcome = Some(Err(String::from_utf8_lossy(&body).into_owned())),
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    outcome.expect("response must contain CommandComplete or ErrorResponse")
+}
+
+/// 他者が試す文種。応答が「その一時表が存在しない場合」と一致することを比べる。
+const FOREIGN_PROBES: &[&str] = &[
+    "SELECT id, v FROM secret_t LIMIT 10",
+    "INSERT INTO secret_t (id, v) VALUES (9, 'x')",
+    "UPDATE secret_t SET v = 'x' WHERE id = 1",
+    "DELETE FROM secret_t WHERE id = 1",
+    "TRUNCATE secret_t",
+    "CREATE INDEX secret_idx2 ON secret_t (v)",
+    "DROP TABLE secret_t",
+];
+
+const CANARY: &str = "tmp-canary-9c1d";
+
+fn probe_all(stream: &mut TcpStream) -> Vec<String> {
+    FOREIGN_PROBES
+        .iter()
+        .map(|sql| match try_simple(stream, sql) {
+            Ok(tag) => format!("OK {tag}"),
+            Err(body) => format!("ERR {body}"),
+        })
+        .collect()
+}
+
+/// TABLE-44 (1): 別テナントの接続からは、一時表の存在・内容が応答差分でも読み取れない。
+#[test]
+fn temp_tables_are_invisible_to_another_tenant_over_wire() {
+    let (core, _guard) = new_core();
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("bob", "tenant-b", "battery-staple"),
+    ]);
+    let addr = spawn_server_with_engine(&users_path, core);
+
+    // 基準: alice が作る前の bob の応答（一時表が存在しない場合の応答）。
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    let baseline = probe_all(&mut bob);
+    assert!(
+        baseline.iter().all(|r| r.starts_with("ERR")),
+        "baseline must be all errors: {baseline:?}"
+    );
+
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    assert_eq!(
+        simple_ok(&mut alice, "CREATE TEMP TABLE secret_t (v TEXT)"),
+        "CREATE TABLE"
+    );
+    assert_eq!(
+        simple_ok(
+            &mut alice,
+            &format!("INSERT INTO secret_t (id, v) VALUES (1, '{CANARY}')")
+        ),
+        "INSERT 0 1"
+    );
+
+    // alice が一時表を持った後も、bob の既存接続・新規接続の応答は基準と完全に一致する。
+    assert_eq!(probe_all(&mut bob), baseline);
+    let mut bob2 = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    let seen = probe_all(&mut bob2);
+    assert_eq!(seen, baseline);
+    assert!(
+        !seen.iter().any(|r| r.contains(CANARY)),
+        "canary leaked to another tenant: {seen:?}"
+    );
+
+    // bob も同名の一時表を作れ、互いに独立している。
+    assert_eq!(
+        simple_ok(&mut bob2, "CREATE TEMP TABLE secret_t (v TEXT)"),
+        "CREATE TABLE"
+    );
+    assert_eq!(
+        simple_ok(
+            &mut bob2,
+            "INSERT INTO secret_t (id, v) VALUES (1, 'bob-row')"
+        ),
+        "INSERT 0 1"
+    );
+    let (_, bob_rows) = simple_rows(&mut bob2, "SELECT id, v FROM secret_t LIMIT 10");
+    assert_eq!(bob_rows, [cells(&["1", "bob-row"])]);
+    let (_, alice_rows) = simple_rows(&mut alice, "SELECT id, v FROM secret_t LIMIT 10");
+    assert_eq!(alice_rows, [cells(&["1", CANARY])]);
+}
+
+/// TABLE-44 (2): トランザクション途中で TCP を切っても、一時表・未コミットの書き込みは残らず、
+/// 保持していた永続側の書き込みロックも解放される。
+#[test]
+fn abnormal_disconnect_mid_transaction_discards_temp_table() {
+    let (core, _guard) = new_core_with_perm();
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("bob", "tenant-b", "battery-staple"),
+    ]);
+    let addr = spawn_server_with_engine(&users_path, core);
+
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    let baseline = probe_all(&mut bob);
+
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    assert_eq!(
+        simple_ok(&mut alice, "CREATE TEMP TABLE secret_t (v TEXT)"),
+        "CREATE TABLE"
+    );
+    assert_eq!(simple_ok(&mut alice, "BEGIN"), "BEGIN");
+    assert_eq!(
+        simple_ok(
+            &mut alice,
+            &format!("INSERT INTO secret_t (id, v) VALUES (1, '{CANARY}')")
+        ),
+        "INSERT 0 1"
+    );
+    assert_eq!(
+        simple_ok(
+            &mut alice,
+            "INSERT INTO perm (id, a) VALUES (1, 'uncommitted') USING OPERATION_ID 'abort-1'"
+        ),
+        "INSERT 0 1"
+    );
+    // Terminate を送らずに TCP を落とす（クライアントのクラッシュ・ネットワーク断に相当）。
+    alice
+        .shutdown(std::net::Shutdown::Both)
+        .expect("shutdown tcp");
+    drop(alice);
+
+    // サーバーが接続を片付けるまで、永続側の書き込みが通るのを有限回待つ（無限ループにしない）。
+    let mut alice2 = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut inserted = false;
+    for _ in 0..50 {
+        if try_simple(
+            &mut alice2,
+            "INSERT INTO perm (id, a) VALUES (2, 'after') USING OPERATION_ID 'after-1'",
+        )
+        .is_ok()
+        {
+            inserted = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        inserted,
+        "persistent write lock was not released after disconnect"
+    );
+
+    // 未コミットの永続書き込み（id=1）は残らず、コミットした id=2 だけが見える。
+    let (_, perm_rows) = simple_rows(&mut alice2, "SELECT id, a FROM perm ORDER BY id LIMIT 10");
+    assert_eq!(perm_rows, [cells(&["2", "after"])]);
+
+    // 一時表は別テナント・同一テナントの新規接続のどちらからも解決されない。
+    assert_eq!(probe_all(&mut bob), baseline);
+    let mut bob2 = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    assert_eq!(probe_all(&mut bob2), baseline);
+    let alice_view = try_simple(&mut alice2, "SELECT id, v FROM secret_t LIMIT 10")
+        .expect_err("temp table must not survive the disconnect");
+    assert!(!alice_view.contains(CANARY));
+    // 同名を作り直すと空の表になる（行が復活しない）。
+    assert_eq!(
+        simple_ok(&mut alice2, "CREATE TEMP TABLE secret_t (v TEXT)"),
+        "CREATE TABLE"
+    );
+    assert!(
+        simple_rows(&mut alice2, "SELECT id, v FROM secret_t LIMIT 10")
+            .1
+            .is_empty()
+    );
+    // 永続カタログへの非到達（`list_tables` が永続表名だけであること）は、サーバーがコアを保持し
+    // 続けるためここでは直接読めない。engine 側の
+    // `table44_temp_table_isolation::temp_tables_never_reach_the_persistent_catalog_or_file` と
+    // `scripts/crash_test_temp_table.sh` が担う。
+}
