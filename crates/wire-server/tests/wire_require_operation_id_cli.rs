@@ -10,8 +10,9 @@
 //!
 //! - R5: 未指定（既定）では `USING OPERATION_ID` 省略の書き込みが成功する（Issue #1704）
 //!
-//! 既定と必須の全組み合わせの行列回帰は #1705 が固定するため、本ファイルでは R5 の
-//! 代表経路のみを持つ。
+//! 既定と必須の全組み合わせの行列回帰は `tests/wire_require_operation_id_matrix.rs`
+//! （Issue #1705）と engine の `tests/recovery_ledger_mode_matrix.rs` が担うため、本ファイル
+//! では R5 の代表経路のみを持つ。
 
 #[path = "common/mod.rs"]
 mod common;
