@@ -118,6 +118,36 @@ pub(crate) fn rewrite_view_insert(
     })
 }
 
+/// ビューへの INSERT の列 `public`（公開名）が書き込む基表名と物理列名（Parse 時のパラメータ型推論用）。
+/// 自動更新不可・解決失敗・公開されていない列・疑似列 `id` への写像は `None`（呼び出し元は型を
+/// 決めず従来どおり `Text` へ倒す。公告だけの問題で値の検証は Execute 時の書き換えが担う）。
+pub(crate) fn resolve_insert_column(
+    lookup: &impl TableLookup,
+    view_name: &str,
+    public: &str,
+) -> Option<(String, String)> {
+    match view_updatability(lookup, view_name).ok()? {
+        ViewUpdatability::AutoUpdatable => {}
+        ViewUpdatability::NotAutoUpdatable(_) => return None,
+    }
+    match resolve_from(lookup, view_name).ok()? {
+        Resolved::View {
+            base_table,
+            view_columns,
+            column_map,
+            ..
+        } => {
+            let mapper = Mapper {
+                columns: view_columns.as_deref(),
+                map: column_map.as_deref(),
+            };
+            let physical = mapper.physical(public).ok()?;
+            Some((base_table, physical))
+        }
+        _ => None,
+    }
+}
+
 /// `ON CONFLICT` の対象列・`DO UPDATE SET` の左辺・`EXCLUDED.<col>` を物理名へ写す。
 fn rewrite_on_conflict(
     mapper: &Mapper<'_>,

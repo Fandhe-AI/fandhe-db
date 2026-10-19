@@ -2074,6 +2074,15 @@ impl<'a> InsertSchemaLookup<'a> {
         }
     }
 
+    /// 呼び出し元が取得済みのスキーマ（ビュー書き込みの同一スナップショット由来。TABLE-43）を
+    /// 最初から保持する。`take_schema` が基表名一致のときだけ返す点は [`Self::new`] と同じ。
+    fn with_schema(storage: &'a Storage, table_name: &str, schema: TableSchema) -> Self {
+        Self {
+            storage,
+            cached: std::cell::RefCell::new(Some((table_name.to_string(), schema))),
+        }
+    }
+
     /// `table_exists` が最後に取得したスキーマを、要求されたテーブル名と
     /// 一致する場合にのみ返す（消費型。1 回取り出したら空になる）。
     fn take_schema(&self, table_name: &str) -> Option<TableSchema> {
@@ -4251,7 +4260,11 @@ impl EngineCore {
             if matches!(self.storage.view_definition(&stmt.table_name), Ok(Some(_))) {
                 let view_stmt = crate::sql::allowlist::ValidatedViewInsert::new(stmt);
                 // 自動更新不可は `55000`、判定・解決の失敗はそのまま返す（fail-closed）。
-                crate::sql::view_insert::check_view_insert(&self.storage, &view_stmt)?;
+                self.storage
+                    .with_view_write_snapshot(view_stmt.view_name(), |snap, _| {
+                        crate::sql::view_insert::check_view_insert(snap, &view_stmt)
+                    })
+                    .map_err(crate::catalog::table_lookup_error)??;
                 return Ok(ParsedSql::ViewInsert(view_stmt));
             }
             // 表でもビューでもない名前は従来どおり（索引・matview は `42809`、その他は `42P01`）。
@@ -4735,11 +4748,29 @@ impl EngineCore {
         // `INSERT INTO <表> ( <列> {, <列>} ) VALUES`（構文は `Parser::parse_insert` が
         // 保証する形。ここでは型の引き当てだけに使い、崩れていれば未解決として扱う）。
         let insert_target: Option<(String, Vec<String>)> = insert_target_from_tokens(tokens);
+        let is_insert = matches!(
+            tokens.first(),
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("INSERT")
+        );
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
             if column == "id" {
                 return Some(PreparedParamType::Column(ColumnMeta::Id));
             }
-            let schema = self.storage.get_table_schema(table).ok()?;
+            let (schema, column) = match self.storage.get_table_schema(table) {
+                Ok(schema) => (schema, column.to_string()),
+                // 表でなければ、INSERT に限りビューの公開列を基表の列へ解決して型を引く
+                // （TABLE-43・Issue #1671）。解決できなければ従来どおり未解決（`Text`）。
+                Err(_) if is_insert => self
+                    .storage
+                    .with_view_write_snapshot(table, |snap, _| {
+                        let (base, physical) =
+                            crate::sql::view_insert::resolve_insert_column(snap, table, column)?;
+                        snap.table_schema(&base).ok().map(|s| (s, physical))
+                    })
+                    .ok()
+                    .flatten()?,
+                Err(_) => return None,
+            };
             let def = schema.columns.iter().find(|c| c.name == column)?;
             Some(PreparedParamType::Column(ColumnMeta::Scalar {
                 name: def.name.clone(),
@@ -6390,9 +6421,23 @@ impl EngineCore {
             // ビューへの INSERT（TABLE-43・Issue #1671）: 現在のカタログで書き換え、`RETURNING` の
             // 列メタは基表の型で導き、列名だけビューの公開名へ上書きする。
             ParsedSql::ViewInsert(stmt) => {
-                let rewritten = crate::sql::view_insert::rewrite_view_insert(&self.storage, stmt)?;
-                let (_read_txn, schema) =
-                    self.read_txn_with_schema(&rewritten.insert.table_name)?;
+                // 書き換えと基表スキーマは同一スナップショットから取る（A→B→A の置換で別の表を
+                // 引かないため）。
+                let (rewritten, schema) = self
+                    .storage
+                    .with_view_write_snapshot(stmt.view_name(), |snap, _| {
+                        let rewritten = crate::sql::view_insert::rewrite_view_insert(snap, stmt)?;
+                        let schema = snap.table_schema(&rewritten.insert.table_name).map_err(
+                            |e| match e {
+                                CatalogError::TableNotFound(name) => {
+                                    crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                                }
+                                other => crate::catalog::table_lookup_error(other),
+                            },
+                        )?;
+                        Ok::<_, crate::sql::allowlist::SqlSurfaceError>((rewritten, schema))
+                    })
+                    .map_err(crate::catalog::table_lookup_error)??;
                 match crate::sql::parser::bind_returning(
                     rewritten.insert.returning.as_ref(),
                     &schema,
@@ -10307,17 +10352,31 @@ impl EngineCore {
         // 並行 DDL による再試行の上限（`CREATE OR REPLACE VIEW` の再試行と同じ小さな固定値の考え方）。
         const MAX_ATTEMPTS: usize = 8;
         for _ in 0..MAX_ATTEMPTS {
-            // 指紋を先に取る: 書き換えが指紋より新しい状態を読んでも照合が不一致になるだけで
-            // （再試行）、古い状態で書き込まれることはない。
-            let fingerprint = self
+            // 指紋・ビュー解決・基表スキーマを同一 read スナップショットから取る（別々の読み取りだと、
+            // ビューが A→B→A と置換されたとき指紋は一致するのに別の表へ書く状態を作れる）。
+            let snapshot = self
                 .storage
-                .view_write_fingerprint(stmt.view_name())
+                .with_view_write_snapshot(stmt.view_name(), |snap, fingerprint| {
+                    let rewritten = crate::sql::view_insert::rewrite_view_insert(snap, stmt)?;
+                    let schema = snap
+                        .table_schema(&rewritten.insert.table_name)
+                        .map_err(|e| match e {
+                            CatalogError::TableNotFound(name) => {
+                                SqlSurfaceError::UndefinedTable { name }
+                            }
+                            other => crate::catalog::table_lookup_error(other),
+                        })?;
+                    Ok::<_, SqlSurfaceError>((fingerprint, rewritten, schema))
+                })
                 .map_err(crate::catalog::table_lookup_error)?;
-            let rewritten = crate::sql::view_insert::rewrite_view_insert(&self.storage, stmt)?;
+            // スナップショット内の解決エラーはその時点の状態に対する正当なエラー。
+            let (fingerprint, rewritten, schema) = snapshot?;
             let base_table = rewritten.insert.table_name.clone();
-            let scope =
-                crate::sql::view_write_scope::ViewWriteScope::enter(stmt.view_name(), fingerprint);
-            let lookup = InsertSchemaLookup::new(&self.storage);
+            let scope = crate::sql::view_write_scope::ViewWriteScope::enter(
+                stmt.view_name(),
+                fingerprint.clone(),
+            );
+            let lookup = InsertSchemaLookup::with_schema(&self.storage, &base_table, schema);
             let result = if rewritten.insert.returning.is_some() {
                 self.execute_insert_returning_form(make_target(), ctx, &rewritten.insert, &lookup)
                     .map(|mut outcome| {
@@ -10333,6 +10392,16 @@ impl EngineCore {
             };
             if scope.mismatched() {
                 continue;
+            }
+            // 書き込み txn 前に失敗した場合（`verify_in_txn` に到達しなかった）でも、その間に
+            // 並行 DDL が入っていたなら失敗はスナップショット由来の陳腐化なので再試行する。
+            // 指紋の再取得に失敗したときは元のエラーを返す（fail-closed）。
+            if result.is_err() {
+                if let Ok(current) = self.storage.view_write_fingerprint(stmt.view_name()) {
+                    if current != fingerprint {
+                        continue;
+                    }
+                }
             }
             return result.map(|outcome| (outcome, base_table));
         }

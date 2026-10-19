@@ -1061,6 +1061,24 @@ impl Storage {
         }
     }
 
+    /// matview 定義を既存の read txn（同一スナップショット）から取得する（無ければ `None`）。
+    /// ビュー書き込みの書き換え（TABLE-43）が指紋と同じスナップショットで解決するために使う。
+    pub(crate) fn materialized_view_definition_in(
+        read_txn: &redb::ReadTransaction,
+        name: &str,
+    ) -> Result<Option<MaterializedViewDef>> {
+        validate_identifier(name)?;
+        let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        match table.get(name)? {
+            Some(g) => Ok(Some(decode_materialized_view_def(name, g.value())?)),
+            None => Ok(None),
+        }
+    }
+
     /// 全文脈の実体を 1 つの write txn で置き換える（`CREATE ... WITH DATA`〔#1664〕と
     /// `REFRESH`〔#1665〕が共用する原子的プリミティブ）。入力の検査（文脈キー重複は `Invalid`、
     /// 文脈数・文脈ごとの行数超過は `ViewLimitExceeded`）と行の符号化のいずれかが失敗したら

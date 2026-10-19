@@ -551,3 +551,45 @@ fn max_insert_rows_applies_through_views() {
     );
     assert_eq!(ids(&core, "alice", "docs"), vec![1, 2, 3]);
 }
+/// Parse 時のパラメータ型推論（WIRE-12）は、ビューの公開列を基表の列へ解決して型を引く。
+/// 基表が INTEGER の列にビュー経由で `$n` を渡すと、Text に倒れず整数として束縛される。
+#[test]
+fn prepared_view_insert_infers_param_types_from_base_columns() {
+    let (core, _g) = open_core("view-insert-param-types");
+    ddl(&core, "CREATE TABLE nums (n INTEGER, flag BOOLEAN, t TEXT)");
+    ddl(&core, "CREATE VIEW nv AS SELECT n, flag, t FROM nums");
+    ddl(
+        &core,
+        "CREATE VIEW nv_alias (renamed) AS SELECT n FROM nums",
+    );
+    let prepared = core
+        .parse_sql_prepared(
+            "INSERT INTO nv (n, flag, t) VALUES ($1, $2, $3) USING OPERATION_ID 'op-pt-1'",
+        )
+        .expect("parse");
+    let types = prepared.param_types();
+    assert_eq!(types.len(), 3);
+    assert_ne!(types[0], engine::sql::params::PreparedParamType::Text);
+    assert_ne!(types[1], engine::sql::params::PreparedParamType::Text);
+    assert!(matches!(
+        &types[2],
+        engine::sql::params::PreparedParamType::Column(_)
+    ));
+    let binds = [
+        Some(b"42".to_vec()),
+        Some(b"true".to_vec()),
+        Some(b"x".to_vec()),
+    ];
+    core.bind_prepared(&prepared, &binds).expect("bind");
+
+    // 列別名ビューでも公開名から基表の列型を引く。
+    let aliased = core
+        .parse_sql_prepared(
+            "INSERT INTO nv_alias (renamed) VALUES ($1) USING OPERATION_ID 'op-pt-2'",
+        )
+        .expect("parse aliased");
+    assert_ne!(
+        aliased.param_types()[0],
+        engine::sql::params::PreparedParamType::Text
+    );
+}

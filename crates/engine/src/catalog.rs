@@ -4572,6 +4572,80 @@ impl TxnViewLookup<'_, '_> {
     }
 }
 
+/// 1 つの read スナップショットを読む [`TableLookup`]（[`Storage::with_view_write_snapshot`] 専用）。
+/// `impl TableLookup for Storage` と同じ写像だが、呼び出しごとに新しい read txn を開かず、
+/// 全照会が同一スナップショットを見る（ビュー書き込みの書き換えの TOCTOU 回避）。
+pub(crate) struct ViewWriteSnapshot<'a> {
+    read_txn: &'a redb::ReadTransaction,
+}
+
+impl ViewWriteSnapshot<'_> {
+    /// 同一スナップショットから表スキーマを読む（束縛用）。
+    pub(crate) fn table_schema(&self, name: &str) -> Result<TableSchema> {
+        get_table_schema_in_txn(self.read_txn, name)
+    }
+}
+
+impl TableLookup for ViewWriteSnapshot<'_> {
+    fn table_exists(&self, name: &str) -> std::result::Result<bool, SqlSurfaceError> {
+        match self.table_schema(name) {
+            Ok(_) => Ok(true),
+            Err(CatalogError::TableNotFound(_)) => Ok(false),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
+    fn view_definition(&self, name: &str) -> std::result::Result<Option<ViewDef>, SqlSurfaceError> {
+        let table = match self.read_txn.open_table(VIEWS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(table_lookup_error(CatalogError::from(e))),
+        };
+        match table
+            .get(name)
+            .map_err(|e| table_lookup_error(CatalogError::from(e)))?
+        {
+            Some(guard) => decode_view_def(guard.value())
+                .map(Some)
+                .map_err(table_lookup_error),
+            None => Ok(None),
+        }
+    }
+
+    fn table_columns(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
+        match self.table_schema(name) {
+            Ok(schema) => Ok(Some(lookup_columns_of(&schema))),
+            Err(CatalogError::TableNotFound(_)) => Ok(None),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
+    fn table_star_columns(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
+        match self.table_schema(name) {
+            Ok(schema) => Ok(Some(lookup_star_columns_of(&schema))),
+            Err(CatalogError::TableNotFound(_)) => Ok(None),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
+    fn materialized_view_columns(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Vec<ColumnDef>>, SqlSurfaceError> {
+        match Storage::materialized_view_definition_in(self.read_txn, name) {
+            Ok(def) => Ok(def.map(|d| d.columns)),
+            Err(CatalogError::Invalid(_)) => Ok(None),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+}
+
 /// `start` から始めてテーブルへ到達するまでの参照段数（テーブル自身が深さ 0、
 /// それを直接参照するビューが深さ 1）を計算する（[`Storage::create_view`] が
 /// 新規ビューのネスト深さ判定に使う。同一 write txn 内で完結させ TOCTOU を
@@ -14258,6 +14332,44 @@ impl Storage {
                 None => Ok(None),
             },
         )
+    }
+
+    /// ビューへの書き込み（TABLE-43・Issue #1671）の書き換えを、指紋と**同一の read スナップショット**
+    /// で行うための入口。`f` には、そのスナップショットを読む [`TableLookup`]
+    /// （[`ViewWriteSnapshot`]）と、同じスナップショットから計算した指紋を渡す。指紋・ビュー解決・
+    /// 基表スキーマの束縛が別々の読み取りになると、ビューが A→B→A と置換されたとき指紋は一致するのに
+    /// B へ書き込む状態を作れてしまうため、3 つを必ずこの 1 つのスナップショットから取る。
+    pub(crate) fn with_view_write_snapshot<T>(
+        &self,
+        view_name: &str,
+        f: impl FnOnce(&ViewWriteSnapshot<'_>, Vec<u8>) -> T,
+    ) -> Result<T> {
+        let read_txn = self.db().begin_read()?;
+        let snapshot = ViewWriteSnapshot {
+            read_txn: &read_txn,
+        };
+        let catalog_table = match read_txn.open_table(CATALOG_TABLE) {
+            Ok(t) => Some(t),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let views_table = match read_txn.open_table(VIEWS_TABLE) {
+            Ok(t) => Some(t),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let fingerprint = replace_fingerprint(
+            vec![view_name.to_string()],
+            &|n| match &catalog_table {
+                Some(t) => Ok(t.get(n)?.map(|g| g.value().to_vec())),
+                None => Ok(None),
+            },
+            &|n| match &views_table {
+                Some(t) => Ok(t.get(n)?.map(|g| g.value().to_vec())),
+                None => Ok(None),
+            },
+        )?;
+        Ok(f(&snapshot, fingerprint))
     }
 
     /// 新本文 `body_sql` がビュー `name` 自身へ（ビュー連鎖を介して）到達するか
