@@ -197,10 +197,17 @@ fn wire_index_ddl_error_classification() {
         "CREATE INDEX idx_x ON docs USING bm25 (body)",
         "0A000",
     );
+    // 部分 UNIQUE の強制は後続 Issue（#1657）。宣言だけ残らないよう `0A000`（INDEX-11、Issue #1654）。
     expect_error(
         &mut stream,
-        "CREATE INDEX idx_p ON docs (body) WHERE body = 'x'",
+        "CREATE UNIQUE INDEX idx_p ON docs (body) WHERE body = 'x'",
         "0A000",
+    );
+    // 部分索引の述語の拒否（INDEX-11、Issue #1653）。非決定は 42P17 で、エラー後もセッションは継続する。
+    expect_error(
+        &mut stream,
+        "CREATE INDEX idx_p ON docs (body) WHERE id < now()",
+        "42P17",
     );
     // 式索引の式の拒否（INDEX-10、Issue #1647）。ErrorResponse の SQLSTATE として観測でき、
     // エラー後もセッションは継続する。
@@ -209,10 +216,46 @@ fn wire_index_ddl_error_classification() {
         ("CREATE INDEX idx_e ON docs ((count(body)))", "42803"),
         ("CREATE INDEX idx_e ON docs ((sum(id) OVER ()))", "42P20"),
         ("CREATE INDEX idx_e ON docs ((SELECT 1))", "0A000"),
-        ("CREATE INDEX idx_e ON docs (lower(body))", "0A000"),
+        // 型・組み合わせの拒否（Issue #1648）。束縛側の SQLSTATE がそのまま届く。
+        ("CREATE INDEX idx_e ON docs ((lower(nope)))", "42703"),
+        ("CREATE INDEX idx_e ON docs ((CAST(body AS uuid)))", "0A000"),
     ] {
         expect_error(&mut stream, sql, code);
     }
+    // 決定的な式は束縛・永続化され、`CREATE INDEX` で完了する（Issue #1648）。
+    expect_command(
+        &mut stream,
+        "CREATE INDEX idx_lower ON docs (lower(body))",
+        "CREATE INDEX",
+    );
+    expect_command(
+        &mut stream,
+        "CREATE INDEX IF NOT EXISTS idx_lower ON docs ((upper(body)))",
+        "CREATE INDEX",
+    );
+    expect_error(
+        &mut stream,
+        "CREATE INDEX idx_lower ON docs ((upper(body)))",
+        "42P07",
+    );
+    // 一意の式索引は作成でき（Issue #1651）、参照列の改名は式テキストを追随させて成功する。
+    expect_command(
+        &mut stream,
+        "CREATE UNIQUE INDEX idx_ue ON docs ((lower(body)))",
+        "CREATE INDEX",
+    );
+    expect_command(
+        &mut stream,
+        "ALTER TABLE docs RENAME COLUMN body TO body2",
+        "ALTER TABLE",
+    );
+    expect_command(
+        &mut stream,
+        "ALTER TABLE docs RENAME COLUMN body2 TO body",
+        "ALTER TABLE",
+    );
+    expect_command(&mut stream, "DROP INDEX idx_ue", "DROP INDEX");
+    expect_command(&mut stream, "DROP INDEX idx_lower", "DROP INDEX");
     expect_command(&mut stream, "DROP INDEX idx_body", "DROP INDEX");
     // 削除済みでも `IF EXISTS` は no-op で成功する（Issue #1614）。
     expect_command(&mut stream, "DROP INDEX IF EXISTS idx_body", "DROP INDEX");
@@ -351,4 +394,49 @@ fn wire_create_unique_index_enforces_and_drops() {
         "INSERT INTO notes (id, code) VALUES (3, 'x') USING OPERATION_ID 'u-4'",
         "INSERT 0 1",
     );
+}
+
+/// 部分索引（INDEX-11、Issue #1654）: 決定的な述語の `CREATE INDEX ... WHERE` は成功し、続く DML は
+/// 述語外の行を受理する。述語の評価エラーは `22012` の ErrorResponse で、セッションは継続する。
+/// 入退場・クラッシュ整合の詳細は `crates/engine/tests/sql_partial_index_dml.rs`・
+/// `make crash-test-unique-index` が確定オラクル。
+#[test]
+fn wire_create_partial_index_maintains_on_dml() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_with_ddl_allowed_users(&users(), core, &["alice"]);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    expect_command(
+        &mut alice,
+        "CREATE TABLE nums (n INTEGER, code TEXT)",
+        "CREATE TABLE",
+    );
+    expect_command(
+        &mut alice,
+        "CREATE INDEX nums_div ON nums ((100 / n)) WHERE n <> 0",
+        "CREATE INDEX",
+    );
+    // 述語外（n = 0）の行は式要素を評価せずに受理される。
+    expect_command(
+        &mut alice,
+        "INSERT INTO nums (id, n, code) VALUES (1, 0, 'a'), (2, 5, 'b') USING OPERATION_ID 'p-1'",
+        "INSERT 0 2",
+    );
+    // 述語外の行が更新で述語内へ入場する（式要素が評価できる値なので成功する）。
+    expect_command(
+        &mut alice,
+        "UPDATE nums SET n = 4 WHERE id = 1 USING OPERATION_ID 'p-2'",
+        "UPDATE 1",
+    );
+    expect_command(
+        &mut alice,
+        "CREATE INDEX nums_pred ON nums (code) WHERE 100 / (n + 5) > 1",
+        "CREATE INDEX",
+    );
+    expect_error(
+        &mut alice,
+        "INSERT INTO nums (id, n, code) VALUES (3, -5, 'c') USING OPERATION_ID 'p-3'",
+        "22012",
+    );
+    expect_command(&mut alice, "DROP INDEX nums_pred", "DROP INDEX");
+    expect_command(&mut alice, "DROP INDEX nums_div", "DROP INDEX");
 }

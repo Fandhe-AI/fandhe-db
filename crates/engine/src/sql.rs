@@ -191,11 +191,14 @@ pub(crate) mod distinct;
 pub mod exec;
 pub mod explain;
 pub(crate) mod expr_program;
+pub(crate) mod expression_key_index;
 pub mod generation_key;
 pub mod group_by;
 pub(crate) mod hnsw_cache;
 pub(crate) mod hnsw_hybrid;
 pub(crate) mod index_expr;
+pub(crate) mod index_implication;
+pub(crate) mod index_predicate;
 /// `[INNER|LEFT|RIGHT|FULL] JOIN`（等価結合の left-deep 連鎖・集計形・スカラー
 /// `ORDER BY`）の束縛・実行本体（SQL-28・RLS-10、TASK-212、Issue #925・#926・
 /// #1190）。`sql::allowlist::ValidatedJoin` を受け取り、
@@ -232,7 +235,10 @@ pub mod udf_call;
 pub(crate) mod view;
 pub(crate) mod view_alias;
 pub(crate) mod view_buffered;
+pub(crate) mod view_insert;
 pub(crate) mod view_replace;
+pub(crate) mod view_updatable;
+pub(crate) mod view_write_scope;
 pub(crate) mod visible_cache;
 pub(crate) mod where_negation;
 pub(crate) mod where_tree;
@@ -460,12 +466,24 @@ pub enum SqlOutcome {
     /// **BREAKING CHANGE**（Issue #1664）: 本 variant の追加により `SqlOutcome` を網羅的に
     /// マッチする既存コードはすべて更新済み。
     CreateMaterializedView(ddl::CreateMaterializedViewOutcome),
+    /// `REFRESH MATERIALIZED VIEW ...`（TABLE-42・Issue #1665）が成功したことを示す応答
+    /// （[`ddl::RefreshMaterializedViewOutcome`]。件数は運ばない）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1665）: 本 variant の追加により `SqlOutcome` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    RefreshMaterializedView(ddl::RefreshMaterializedViewOutcome),
     /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）がセッション
     /// 経由の実行経路で成功したことを示す応答。
     ///
     /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `SqlOutcome`
     /// を網羅的にマッチする既存コードはすべて更新済み。
     DropView(ddl::DropViewOutcome),
+    /// `DROP MATERIALIZED VIEW [IF EXISTS] <name>[, ...] [CASCADE | RESTRICT]`（TABLE-42 (5)・
+    /// TABLE-37、Issue #1667）がセッション経由の実行経路で成功したことを示す応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #1667）: 本 variant の追加により `SqlOutcome` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    DropMaterializedView(ddl::DropMaterializedViewOutcome),
     /// `CREATE INDEX <name> ON <table> [USING hnsw] (<col>[, ...])`（TASK-206・
     /// INDEX-7・SQL-23、Issue #908）がセッション経由の実行経路で成功したことを
     /// 示す応答（[`ddl::CreateIndexOutcome`] を運ぶ薄いラッパー）。

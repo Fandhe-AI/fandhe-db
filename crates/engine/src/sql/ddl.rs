@@ -40,7 +40,7 @@
 
 use crate::catalog::{
     AlterApply, AlterCheckError, CascadedObject, CatalogError, ColumnDef, ColumnDefault,
-    ColumnType, IndexDef, IndexKind, TableSchema, MAX_COLUMN_DEFAULT_LEN,
+    ColumnType, CreateIndexError, IndexDef, IndexKind, TableSchema, MAX_COLUMN_DEFAULT_LEN,
 };
 use crate::schema_limits::SchemaLimits;
 use crate::sql::allowlist::{
@@ -52,7 +52,8 @@ use crate::sql::allowlist::{
     ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
     ValidatedAlterTableRenameColumn, ValidatedAlterTableRenameTable, ValidatedCreateIndex,
     ValidatedCreateTable, ValidatedCreateTempTable, ValidatedCreateType, ValidatedCreateView,
-    ValidatedDropIndex, ValidatedDropTable, ValidatedDropType, ValidatedDropView,
+    ValidatedDropIndex, ValidatedDropMaterializedView, ValidatedDropTable, ValidatedDropType,
+    ValidatedDropView,
 };
 use crate::sql::ddl_column_type::{
     alias_spelling, to_static_column_type_with_array_default, SqlColumnTypeName, StaticColumnType,
@@ -2358,12 +2359,53 @@ pub(crate) fn map_create_matview_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        // 一意索引（Issue #1667）の宣言がある matview の実体書き込みで文脈内に重複があった。
+        // 固定文言で、テナント・値・件数を含めない。
+        CatalogError::UniqueConstraintViolation => SqlSurfaceError::UniqueViolation,
         CatalogError::Invalid(_) => SqlSurfaceError::feature_not_supported(
             "materialized view definition or data cannot be stored",
         ),
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
         _ => SqlSurfaceError::Internal {
             detail: "CREATE MATERIALIZED VIEW failed".to_string(),
+        },
+    }
+}
+
+/// `REFRESH MATERIALIZED VIEW ...`（TABLE-42・Issue #1665）の成功応答。
+///
+/// テナント境界（P0）: 件数を運ばない（pg の固定タグ `REFRESH MATERIALIZED VIEW` に件数は無く、
+/// 他文脈の件数を DDL 権限を持つ主体へ返せない構造にする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshMaterializedViewOutcome {
+    /// `WITH DATA` で再実体化したか（`WITH NO DATA` では偽）。
+    pub(crate) populated: bool,
+}
+
+impl RefreshMaterializedViewOutcome {
+    /// 再実体化を行ったか（`WITH NO DATA` なら偽）。
+    pub fn populated(&self) -> bool {
+        self.populated
+    }
+}
+
+/// `CatalogError` を `REFRESH MATERIALIZED VIEW`（TABLE-42・Issue #1665）の SQL 表層の契約へ写像する。
+/// 不存在 `42P01`、種別違い `42809`、行数上限 `54000`、書き込みゲート待機の超過 `55P03`。
+/// 文言に他テナントの情報・内部詳細を含めない。
+pub(crate) fn map_refresh_matview_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::ViewNotFound(name) | CatalogError::TableNotFound(name) => {
+            SqlSurfaceError::UndefinedTable { name }
+        }
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        CatalogError::UniqueConstraintViolation => SqlSurfaceError::UniqueViolation,
+        CatalogError::Invalid(_) => SqlSurfaceError::feature_not_supported(
+            "materialized view definition or data cannot be stored",
+        ),
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "REFRESH MATERIALIZED VIEW failed".to_string(),
         },
     }
 }
@@ -2432,6 +2474,69 @@ pub(crate) fn execute_drop_view(
             cascaded: Vec::new(),
         }),
         Err(e) => Err(map_drop_view_error(e)),
+    }
+}
+
+/// `DROP MATERIALIZED VIEW ...`（TABLE-42 (5)・TABLE-37、Issue #1667）の成功応答。
+/// 連鎖削除の報告には共有カタログのオブジェクト名だけを含み、テナント・行数の情報は持たない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropMaterializedViewOutcome {
+    /// `IF EXISTS` で 1 件も削除しなかったか（全対象が不在）。
+    pub(crate) skipped: bool,
+    /// `CASCADE` で連鎖削除した依存オブジェクト（適用順。依存する側が先）。
+    pub(crate) cascaded: Vec<CascadedObject>,
+}
+
+impl DropMaterializedViewOutcome {
+    /// `IF EXISTS` により全対象が不在で no-op 成功した場合に真。
+    pub fn skipped(&self) -> bool {
+        self.skipped
+    }
+
+    /// `CASCADE` で連鎖削除した依存オブジェクト（`RESTRICT` 時は空）。
+    pub fn cascaded(&self) -> &[CascadedObject] {
+        &self.cascaded
+    }
+}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体。
+/// `Storage::drop_materialized_views` へ委譲する（全体で単一 write txn・単一 commit）。
+pub(crate) fn execute_drop_materialized_view(
+    storage: &Storage,
+    validated: &ValidatedDropMaterializedView,
+) -> Result<DropMaterializedViewOutcome, SqlSurfaceError> {
+    let report = storage
+        .drop_materialized_views(
+            validated.names(),
+            validated.if_exists(),
+            validated.behavior(),
+        )
+        .map_err(map_drop_matview_error)?;
+    Ok(DropMaterializedViewOutcome {
+        skipped: report.dropped == 0,
+        cascaded: report.cascaded,
+    })
+}
+
+/// `Storage::drop_materialized_views` の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （対象不存在 `42P01`、表・ビュー・索引名を指定 `42809`、依存が残存 `2BP01`、書き込みゲート
+/// 待機の超過 `55P03`）。文言に他テナントの情報・内部詳細を含めない。
+pub(crate) fn map_drop_matview_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::ViewNotFound(name) => SqlSurfaceError::UndefinedTable { name },
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::DependentViewsExist(name)
+        | CatalogError::DependentObjectsStillExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
+        CatalogError::Invalid(_) => {
+            SqlSurfaceError::unsupported("malformed relation reference in DROP MATERIALIZED VIEW")
+        }
+        CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "DROP MATERIALIZED VIEW failed".to_string(),
+        },
     }
 }
 
@@ -2552,11 +2657,27 @@ pub(crate) fn execute_create_index(
     storage: &Storage,
     validated: &ValidatedCreateIndex,
 ) -> Result<CreateIndexOutcome, SqlSurfaceError> {
-    // 防御ゲート（INDEX-10、Issue #1647）: 式要素は構文段の最終ゲートで拒否済みだが、将来の
-    // 経路変更で式を含む宣言が届いても、式を黙って落として列だけで保存しない（fail-closed）。
-    if validated.expression_keys().iter().any(Option::is_some) {
+    // 防御ゲート（INDEX-10、Issue #1648）: hnsw と式要素の組み合わせは構文段の最終ゲートで拒否
+    // 済みだが、将来の経路変更で届いても、式を黙って落として列だけで保存しない（fail-closed）。
+    // 式要素そのものは `create_index_bound` が書き込み txn 内で束縛する。一意索引と式要素の組
+    // （Issue #1651）は受理し、`create_index_bound` が強制の前提を同一 txn で整える。
+    let has_expressions = validated.expression_keys().iter().any(Option::is_some);
+    if has_expressions && validated.is_hnsw() {
         return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "expression indexes are not supported yet".to_string(),
+            detail: "expression indexes are not supported for this index kind yet".to_string(),
+        });
+    }
+    // 防御ゲート（INDEX-11、Issue #1653・#1654）: 述語付きの未対応の組み合わせ（部分 UNIQUE・hnsw・
+    // COLLATE）は構文段の最終ゲートで拒否済みだが、将来の経路変更で届いても、述語を黙って落として
+    // 列だけの索引を保存しない（fail-closed）。述語そのものは `create_index_bound` が書き込み txn 内で
+    // 束縛して正規化テキストと参照列を確定する。
+    if validated.predicate().is_some()
+        && (validated.is_unique()
+            || validated.is_hnsw()
+            || validated.column_collations().iter().any(Option::is_some))
+    {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "partial indexes are not supported for this index definition yet".to_string(),
         });
     }
     let kind = if validated.is_hnsw() {
@@ -2576,9 +2697,14 @@ pub(crate) fn execute_create_index(
     .with_unique(validated.is_unique());
     // `IF NOT EXISTS`（TABLE-36、Issue #1613）。`create_index` の write txn は名前衝突を最初に
     // 判定し commit・世代 bump の前に返るため、同名があれば定義を比較せず副作用なしで成功にする。
-    match storage.create_index(&def) {
-        Err(CatalogError::IndexAlreadyExists(_)) if validated.if_not_exists() => {}
-        result => result.map_err(map_create_index_error)?,
+    // 式要素（INDEX-10、Issue #1648）の束縛エラーは `Sql` としてそのまま透過し、カタログ側の
+    // 失敗だけを `map_create_index_error` で写像する。
+    match storage.create_index_bound(&def, validated.expression_keys(), validated.predicate()) {
+        Ok(()) => {}
+        Err(CreateIndexError::Catalog(CatalogError::IndexAlreadyExists(_)))
+            if validated.if_not_exists() => {}
+        Err(CreateIndexError::Catalog(e)) => return Err(map_create_index_error(e)),
+        Err(CreateIndexError::Sql(e)) => return Err(e),
     }
     Ok(CreateIndexOutcome {})
 }
@@ -3150,6 +3276,7 @@ mod tests {
             expressions: vec![None],
             collations: vec![None],
             unique: false,
+            predicate: None,
         };
         execute_create_index(&storage, &index).expect("create index");
         let snapshot = |storage: &Storage| {

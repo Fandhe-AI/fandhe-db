@@ -1,5 +1,9 @@
 //! `CREATE MATERIALIZED VIEW` の実行本体（TABLE-42 (2)(3)・Issue #1664。親: #1662）。
 //!
+//! 本モジュールは `REFRESH MATERIALIZED VIEW`（TABLE-42 (1)(3)(4)・Issue #1665）の実行本体も担う。
+//! `CREATE` と同じ骨格（writer gate を保持した 1 つの write txn で、旧実体の消去・全文脈の再評価・
+//! 書き込みを行い、commit は 1 回だけ）で、失敗時は txn 破棄により旧実体と定義が丸ごと残る。
+//!
 //! 責務境界: 構文検証は `sql::allowlist`（`ValidatedCreateMaterializedView`）、カタログと文脈単位の
 //! 実体ストアは `catalog::materialized`（Issue #1663）、列の確定とセル変換は `sql::matview` が担う。
 //! 本モジュールは `core.rs` の `execute_parsed_in_session_inner` の `CreateMaterializedView` 腕
@@ -18,7 +22,8 @@
 
 use super::EngineCore;
 use crate::catalog::materialized::{
-    begin_streamed_create_in_txn, finish_streamed_create_in_txn, write_context_entity_in_txn,
+    begin_streamed_create_in_txn, begin_streamed_refresh_in_txn, finish_streamed_create_in_txn,
+    finish_streamed_refresh_in_txn, is_context_local_failure, write_context_entity_in_txn,
     ContextKey, MaterializedViewDef, MAX_MATVIEW_CONTEXTS,
 };
 use crate::catalog::CatalogError;
@@ -27,9 +32,12 @@ use crate::result_limits::{ResultLimits, MAX_RESULT_ROWS_HARD_CAP};
 use crate::row_codec::Value;
 use crate::sql::allowlist::{
     classify_view_body, validate_sql_tokens, SqlSurfaceError, Statement,
-    ValidatedCreateMaterializedView, ViewBodyCheck, ViewBodyKind,
+    ValidatedCreateMaterializedView, ValidatedRefreshMaterializedView, ViewBodyCheck, ViewBodyKind,
 };
-use crate::sql::ddl::{map_create_matview_error, CreateMaterializedViewOutcome};
+use crate::sql::ddl::{
+    map_create_matview_error, map_refresh_matview_error, CreateMaterializedViewOutcome,
+    RefreshMaterializedViewOutcome,
+};
 use crate::sql::lexer::{Keyword, Token};
 use crate::sql::mode::SessionState;
 
@@ -187,8 +195,15 @@ impl EngineCore {
                 if is_creator {
                     own_rows = Some(rows.len() as u64);
                 }
-                write_context_entity_in_txn(&write_txn, &def, &ctx, &rows, &mut seen, cap)
-                    .map_err(map_create_matview_error)?;
+                // 他文脈の符号化・書き込み失敗（テナント ID 長等で結果の有無により成否が分かれうる）も
+                // 評価失敗と同様に作成者へ返さない。write_context_entity_in_txn は失敗時に行・メタを
+                // 残さないため、その文脈は未実体化（読み取りは 55000）になる。
+                // ストレージエラー等（部分書き込みが残りうる失敗）は隠さず txn ごと破棄して返す。
+                match write_context_entity_in_txn(&write_txn, &def, &ctx, &rows, &mut seen, cap) {
+                    Ok(()) => {}
+                    Err(ref e) if !is_creator && is_context_local_failure(e) => continue,
+                    Err(e) => return Err(map_create_matview_error(e)),
+                }
                 drop(rows);
             }
         }
@@ -203,6 +218,135 @@ impl EngineCore {
             populated: stmt.with_data(),
             own_rows,
         })
+    }
+
+    /// `REFRESH MATERIALIZED VIEW` の実行本体（DDL 権限ゲートは呼び出し元が通過済み。
+    /// TABLE-42 (1)(3)(4)・Issue #1665）。
+    ///
+    /// 判定順: 書き込みゲート → 定義のロード（無ければ `42P01`、表・ビュー・索引の名前なら
+    /// `42809`）→ （`CONCURRENTLY` なら）未実体化 `0A000` → 適格な UNIQUE 索引なし `55000`
+    /// → 列形状の再検証 → 照合順序 → 文脈ごとの評価と逐次書き込み
+    /// → commit（1 回だけ）。評価の読み取り源と書き込みは同一 write txn で、読み手は MVCC
+    /// スナップショットで旧実体を読み続けブロックされない。
+    ///
+    /// `CONCURRENTLY` は前提検査を通れば非 CONCURRENTLY と同じ経路・同じ結果（差分適用は採らない。
+    /// 読み手は MVCC で旧実体を読み続け元からブロックされず、実体の行キーは連番で差分でも振り直しが
+    /// 要るため）。
+    ///
+    /// 失敗方針（fail-closed・テナント境界）: 実行者自身の文脈の評価失敗はそのまま返し、txn 破棄で
+    /// 全文脈の旧実体を残す。他の文脈の評価失敗は実行者へ返さず（成否の差から他テナントの件数・内容を
+    /// 探れないため）、その文脈の実体を書かない＝以後の読み取りは `55000`。「その文脈だけ旧実体を残す」
+    /// 案は、1 回の REFRESH で新旧スナップショットの実体が混在するため採らない（TABLE-42 (2)）。
+    pub(super) fn execute_refresh_materialized_view(
+        &self,
+        refresher: &PolicyContext,
+        session: &SessionState,
+        stmt: &ValidatedRefreshMaterializedView,
+    ) -> Result<RefreshMaterializedViewOutcome, SqlSurfaceError> {
+        let write_txn = self
+            .storage
+            .begin_write_txn()
+            .map_err(crate::catalog::convert_storage_error)
+            .map_err(map_refresh_matview_error)?;
+        let def = match begin_streamed_refresh_in_txn(&write_txn, stmt.name()) {
+            Ok(def) => def,
+            Err(CatalogError::ViewNotFound(name)) => {
+                // 表・ビュー・索引と名前空間を共有する。存在すれば種別違い（42809）。
+                return match self.storage.relation_name_exists(&name) {
+                    Ok(true) => Err(SqlSurfaceError::WrongObjectType { name }),
+                    Ok(false) => Err(SqlSurfaceError::UndefinedTable { name }),
+                    Err(e) => Err(map_refresh_matview_error(e)),
+                };
+            }
+            Err(e) => return Err(map_refresh_matview_error(e)),
+        };
+
+        // CONCURRENTLY の前提検査（TABLE-42 (4)・Issue #1666）。判定はカタログ構造だけで決まり
+        // テナントのデータに依存しないため、成否から他テナントの情報は漏れない。ここでの Err は
+        // txn ごと破棄され、begin_streamed_refresh_in_txn が消した旧実体・定義はそのまま残る。
+        // 未実体化（0A000）を索引の有無（55000）より先に判定する（PostgreSQL と同順）。
+        if stmt.concurrently() {
+            if !def.populated {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "REFRESH MATERIALIZED VIEW CONCURRENTLY cannot be used when the materialized view is not populated",
+                ));
+            }
+            if !crate::catalog::materialized::has_concurrent_refresh_unique_index_in_txn(
+                &write_txn, &def.name,
+            )
+            .map_err(map_refresh_matview_error)?
+            {
+                return Err(SqlSurfaceError::MaterializedViewNotRefreshableConcurrently);
+            }
+        }
+
+        if !stmt.with_data() {
+            finish_streamed_refresh_in_txn(&write_txn, &def, false)
+                .map_err(map_refresh_matview_error)?;
+            // 表単位の世代の bump は finish_streamed_refresh_in_txn が同じ txn 内で
+            // bump_table_generation_in_txn により済ませている（commit は唯一のこの 1 回）。
+            crate::recovery::commit_boundary::commit(write_txn)
+                .map_err(crate::catalog::convert_storage_error)
+                .map_err(map_refresh_matview_error)?;
+            return Ok(RefreshMaterializedViewOutcome { populated: false });
+        }
+
+        // 列形状の再検証。単純形本文の `*` は展開されず保存されるため、基表への `ADD COLUMN` で
+        // 出力列が保存済みの列とずれうる。カタログ構造だけに依存しテナントのデータに依存しないため、
+        // 実行者へ返しても他テナントの情報は漏れない。ずれたら旧実体を残して拒否する。
+        let current = {
+            let view_columns =
+                self.view_output_columns(session, &def.body_sql, &def.column_aliases)?;
+            crate::sql::matview::column_defs_from_view_columns(&view_columns)?
+        };
+        if current != def.columns {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "materialized view definition no longer matches its source columns",
+            ));
+        }
+
+        let cap = self.matview_row_cap();
+        let plan = self.matview_eval_plan(&def.body_sql, cap)?;
+        self.check_matview_body_collations(&*write_txn, &plan.stmt)?;
+
+        let contexts = self.materialization_contexts_for(refresher)?;
+        let refresher_key = ContextKey::from_context(refresher);
+        let mut seen: Vec<ContextKey> = Vec::new();
+        for ctx in contexts {
+            let is_refresher = ContextKey::from_context(&ctx) == refresher_key;
+            let rows = match self.eval_matview_body_for(
+                &*write_txn,
+                &ctx,
+                session,
+                &plan,
+                &def.columns,
+                cap,
+            ) {
+                Ok(rows) => rows,
+                Err(_) if !is_refresher => continue,
+                Err(e) => return Err(e),
+            };
+            // 他文脈の符号化・書き込み失敗も評価失敗と同様に実行者へ返さない（失敗時は行・メタを
+            // 残さず、その文脈は未実体化＝読み取りは 55000）。
+            // ストレージエラー等（部分書き込みが残りうる失敗）は隠さず txn ごと破棄して返す。
+            match write_context_entity_in_txn(&write_txn, &def, &ctx, &rows, &mut seen, cap) {
+                Ok(()) => {}
+                Err(ref e) if !is_refresher && is_context_local_failure(e) => continue,
+                Err(e) => return Err(map_refresh_matview_error(e)),
+            }
+            drop(rows);
+        }
+        finish_streamed_refresh_in_txn(&write_txn, &def, true)
+            .map_err(map_refresh_matview_error)?;
+        // 表単位の世代の bump は finish_streamed_refresh_in_txn が同じ txn 内で
+        // bump_table_generation_in_txn により済ませている（commit は唯一のこの 1 回）。
+        #[cfg(feature = "test-sync-points")]
+        self.storage
+            .sync_point(crate::test_sync::SyncPoint::RefreshMaterializedViewBeforeCommit);
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(crate::catalog::convert_storage_error)
+            .map_err(map_refresh_matview_error)?;
+        Ok(RefreshMaterializedViewOutcome { populated: true })
     }
 
     /// 非バイト順照合の列を持つ表を本文が読むなら `0A000`（`check_buffered_view_collations` と同じ判定）。

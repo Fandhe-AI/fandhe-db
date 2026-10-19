@@ -372,6 +372,25 @@ pub(crate) fn record_in_txn_accepting(
     // 用いたトランザクション開始時刻を v3 エントリとして残す（Issue #2188・SQL-37。
     // 呼び出し元の `tenant.rs` は同一スタック上で `core.rs` のスコープ内にいる）。
     let ledger = ledger.with_evaluated_at(crate::sql::time_fn::ledger_evaluated_at());
+    // ビュー経由の書き込み（TABLE-43・Issue #1671）では、内容ハッシュへビュー名のドメインを被せる。
+    // 同じ `operation_id` を基表へ直接再送した場合は別内容として `22023` になる。台帳のキー
+    // （`table`）は基表名のまま。スコープ外のハッシュは従来とビット同一。
+    if let Some(view_name) = crate::sql::view_write_scope::current_view_name() {
+        let wrapped = super::content_hash::for_view_write(&view_name, content_hash);
+        let wrapped_legacy: Vec<ContentHash> = legacy_hashes
+            .iter()
+            .map(|h| super::content_hash::for_view_write(&view_name, h))
+            .collect();
+        return record_core(
+            write_txn,
+            tenant_id,
+            table,
+            ledger,
+            &wrapped,
+            &wrapped_legacy,
+            JobTableCheck::Enforce,
+        );
+    }
     record_core(
         write_txn,
         tenant_id,

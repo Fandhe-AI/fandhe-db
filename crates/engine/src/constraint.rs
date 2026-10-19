@@ -204,6 +204,224 @@ fn key_specs(schema: &TableSchema) -> Result<(Vec<KeySpec>, Vec<bool>), CatalogE
     Ok((specs, mask))
 }
 
+/// 一意の式索引（INDEX-9・INDEX-10、Issue #1651）の要素 1 個。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExprUniqueElem {
+    /// 素の列（スキーマ上の論理インデックス）。
+    Column(usize),
+    /// 式要素（[`crate::sql::expression_key_index::CompiledIndexExpressions`] 内の通し番号）。
+    Expr(usize),
+}
+
+/// 一意の式索引 1 本の検査仕様。NULLS DISTINCT（どれか 1 要素でも NULL ならキーを持たない）。
+pub(crate) struct ExprUniqueSpec {
+    index_name: String,
+    elements: Vec<ExprUniqueElem>,
+}
+
+/// 永続一意索引（`user_uniq/{table}`）が強制する全キーの仕様。序数（ordinal）は主キー → UNIQUE 制約
+/// （[`key_specs`] の順）→ 一意の式索引（索引名の昇順）の順に振る。列だけのキーのバイト列は式一意索引の
+/// 有無に関わらず従来と同一（Issue #1651）。
+pub(crate) struct UniqueKeyPlan {
+    specs: Vec<KeySpec>,
+    expr_specs: Vec<ExprUniqueSpec>,
+    /// 列要素（`specs` と式一意索引の素の列）の和集合マスク。
+    mask: Vec<bool>,
+}
+
+impl UniqueKeyPlan {
+    /// `schema` の主キー・UNIQUE 制約と、索引カタログの一意の式索引 `decls` から仕様を組み立てる。
+    /// 列名の解決失敗は内部矛盾（`DROP COLUMN` が参照する式索引を同一 txn で消すため通常は起きない）
+    /// で、fail-closed に拒否する。
+    pub(crate) fn build(
+        schema: &TableSchema,
+        decls: &crate::catalog::TableExpressionDecls,
+    ) -> Result<Self, TenantWriteError> {
+        let (specs, mut mask) = key_specs(schema)?;
+        let mut expr_specs: Vec<ExprUniqueSpec> = Vec::new();
+        for unique in &decls.uniques {
+            let mut elements: Vec<ExprUniqueElem> = Vec::with_capacity(unique.elements.len());
+            for element in &unique.elements {
+                match element {
+                    crate::catalog::UniqueElementDecl::Column(name) => {
+                        let idx = schema
+                            .columns
+                            .iter()
+                            .position(|c| &c.name == name)
+                            .ok_or_else(|| {
+                                internal("unique expression index column not found in live schema")
+                            })?;
+                        if let Some(slot) = mask.get_mut(idx) {
+                            *slot = true;
+                        }
+                        elements.push(ExprUniqueElem::Column(idx));
+                    }
+                    crate::catalog::UniqueElementDecl::Expr(pos) => {
+                        elements.push(ExprUniqueElem::Expr(*pos));
+                    }
+                }
+            }
+            expr_specs.push(ExprUniqueSpec {
+                index_name: unique.index_name.clone(),
+                elements,
+            });
+        }
+        let total = specs.len().saturating_add(expr_specs.len());
+        if total > usize::from(u16::MAX) {
+            return Err(internal("unique key ordinal exceeds u16 range"));
+        }
+        Ok(Self {
+            specs,
+            expr_specs,
+            mask,
+        })
+    }
+
+    /// 作成中の一意の式索引 1 本だけの仕様（重複走査用。主キー・UNIQUE 制約は含めない）。
+    pub(crate) fn for_single_expression_index(
+        schema: &TableSchema,
+        elements: &[crate::catalog::UniqueElementDecl],
+    ) -> Result<Self, TenantWriteError> {
+        let decls = crate::catalog::TableExpressionDecls {
+            keys: Vec::new(),
+            uniques: vec![crate::catalog::DeclaredUniqueExpressionIndex {
+                index_name: String::new(),
+                elements: elements.to_vec(),
+            }],
+            partials: Vec::new(),
+        };
+        let mut plan = Self::build(schema, &decls)?;
+        plan.specs.clear();
+        // 主キー・UNIQUE 制約の列を復元しないよう、マスクを式一意索引の素の列だけへ絞る。
+        let mut mask = vec![false; schema.columns.len()];
+        for spec in &plan.expr_specs {
+            for element in &spec.elements {
+                if let ExprUniqueElem::Column(idx) = element {
+                    if let Some(slot) = mask.get_mut(*idx) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        plan.mask = mask;
+        Ok(plan)
+    }
+
+    /// 検査すべきキーが 1 つも無いか。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.specs.is_empty() && self.expr_specs.is_empty()
+    }
+
+    /// 序数の個数。
+    pub(crate) fn ordinal_count(&self) -> usize {
+        self.specs.len().saturating_add(self.expr_specs.len())
+    }
+
+    /// 列だけのキー仕様（主キー・UNIQUE 制約）。
+    pub(crate) fn column_specs(&self) -> &[KeySpec] {
+        &self.specs
+    }
+
+    /// 1 行の物理バイト列 `buf`（行ヘッダ付き）から、序数順の正準キー（NULL を含む行は `None`）を
+    /// 計算する。列要素は [`push_canonical_component`]、式要素は式の評価結果の分類
+    /// （[`crate::sql::expression_key_index::CompiledIndexExpressions::push_unique_key_component`]）
+    /// から作る。書き込み検査・バックフィル・読み戻し・作成時の重複走査が必ずこの関数を通る
+    /// （2 系統に分けない）。式の評価エラーは文を拒否する側のエラーで返す。
+    pub(crate) fn row_keys(
+        &self,
+        schema: &TableSchema,
+        compiled: Option<&crate::sql::expression_key_index::CompiledIndexExpressions>,
+        id: u64,
+        buf: &[u8],
+    ) -> Result<Vec<Option<Vec<u8>>>, TenantWriteError> {
+        let mut out: Vec<Option<Vec<u8>>> = Vec::new();
+        out.try_reserve_exact(self.ordinal_count())
+            .map_err(|_| internal("unique key allocation failed"))?;
+        let values = if self.mask.iter().any(|&m| m) {
+            decode_key_columns(schema, &self.mask, buf)?
+        } else {
+            Vec::new()
+        };
+        for spec in &self.specs {
+            out.push(key_bytes(spec, &values).map_err(internal)?);
+        }
+        if self.expr_specs.is_empty() {
+            return Ok(out);
+        }
+        let compiled =
+            compiled.ok_or_else(|| internal("unique expression index is not compiled"))?;
+        let mut embedding: Vec<f32> = Vec::new();
+        let (_dim, metadata) =
+            crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
+        for spec in &self.expr_specs {
+            let mut key: Vec<u8> = Vec::new();
+            let mut has_key = true;
+            for element in &spec.elements {
+                match element {
+                    ExprUniqueElem::Column(idx) => {
+                        match values.get(*idx).and_then(|v| v.as_ref()) {
+                            Some(value) => {
+                                push_canonical_component(&mut key, *value).map_err(internal)?;
+                            }
+                            None => {
+                                has_key = false;
+                                break;
+                            }
+                        }
+                    }
+                    ExprUniqueElem::Expr(pos) => {
+                        if !compiled.push_unique_key_component(
+                            *pos, schema, id, &embedding, metadata, &mut key,
+                        )? {
+                            has_key = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            out.push(has_key.then_some(key));
+        }
+        Ok(out)
+    }
+
+    /// 永続一意索引のマーカーに載せるシグネチャの式一意索引部分を `out` へ足す。索引名・要素の
+    /// 種別（列名と型タグ、または式の正規化 SQL・結果型・参照列の名前と型の指紋）を含めるため、
+    /// 作成・削除・式の変更・参照列の改名や型変更のたびに変わり、古い正引きエントリは再構築で捨てられる。
+    pub(crate) fn push_expression_signature(
+        &self,
+        schema: &TableSchema,
+        compiled: Option<&crate::sql::expression_key_index::CompiledIndexExpressions>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), TenantWriteError> {
+        out.extend_from_slice(&(self.expr_specs.len() as u32).to_be_bytes());
+        for spec in &self.expr_specs {
+            let name = spec.index_name.as_bytes();
+            out.push(u8::try_from(name.len()).unwrap_or(u8::MAX));
+            out.extend_from_slice(name);
+            out.extend_from_slice(&(spec.elements.len() as u32).to_be_bytes());
+            for element in &spec.elements {
+                match element {
+                    ExprUniqueElem::Column(idx) => {
+                        out.push(0);
+                        let column = schema.columns.get(*idx);
+                        out.push(column.map(|c| c.ty.unique_key_tag()).unwrap_or(0));
+                        let col_name = column.map(|c| c.name.as_bytes()).unwrap_or(&[]);
+                        out.push(u8::try_from(col_name.len()).unwrap_or(u8::MAX));
+                        out.extend_from_slice(col_name);
+                    }
+                    ExprUniqueElem::Expr(pos) => {
+                        out.push(1);
+                        let compiled = compiled
+                            .ok_or_else(|| internal("unique expression index is not compiled"))?;
+                        compiled.push_signature(*pos, schema, out)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// COMMIT 時に検査すべき遅延 `FOREIGN KEY` の範囲（TABLE-17・TASK-205、
 /// Issue #1077）。autocommit（1 文＝1 トランザクション）は常に `All`——遅延指定
 /// （`DEFERRABLE`／`INITIALLY DEFERRED`）でも「検査しない」ことにはならず、
@@ -233,7 +451,8 @@ impl FkCheckMode {
 
 /// `tenant.rs` の各書き込み関数が書き込み後・commit 前に呼ぶ唯一の入口
 /// （TABLE-16・TASK-204）。永続キー索引（`key_index.rs`、Issue #1071）の同期 →
-/// `CHECK` 制約（Issue #906）→ 一意性制約（主キー・UNIQUE）→ `FOREIGN KEY` の
+/// `CHECK` 制約（Issue #906）→ 式索引の式評価（INDEX-10、Issue #1649。
+/// [`enforce_index_expressions_in_txn`]）→ 一意性制約（主キー・UNIQUE）→ `FOREIGN KEY` の
 /// 参照元側（TABLE-17・TASK-205、Issue #907。書いた行が参照する値の組が
 /// 参照先に存在するか）の順に検査する。`written_ids` の契約は
 /// [`enforce_unique_keys_in_txn`] と同じ。いずれの制約も宣言しないテーブルは
@@ -261,7 +480,44 @@ pub(crate) fn enforce_row_constraints_in_txn(
     let delta =
         crate::key_index::sync_rows_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
     enforce_check_constraints_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
-    enforce_unique_keys_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
+    // 式索引の宣言の読み込みとコンパイルは 1 文につき 1 回だけ行い、式の評価段と一意検査段で
+    // 共有する（式索引の無い表のコストは「索引カタログの 1 回走査」のまま。Issue #1651 D4）。
+    if !written_ids.is_empty() {
+        let decls = crate::catalog::table_expression_decls_in_txn(write_txn, table_name)?;
+        let compiled = crate::sql::expression_key_index::CompiledIndexExpressions::compile(
+            schema,
+            &decls.keys,
+        )?;
+        enforce_index_expressions_in_txn(
+            write_txn,
+            table_name,
+            schema,
+            tenant_id,
+            written_ids,
+            compiled.as_ref(),
+        )?;
+        // 部分索引（INDEX-11、Issue #1654）。述語 TRUE の行だけ式要素を評価する。検査順は
+        // 索引同期 → CHECK → 式評価 → 部分索引 → UNIQUE → FK。
+        let partials =
+            crate::sql::index_predicate::CompiledPartialIndexes::compile(schema, &decls.partials)?;
+        enforce_partial_indexes_in_txn(
+            write_txn,
+            table_name,
+            schema,
+            tenant_id,
+            written_ids,
+            partials.as_ref(),
+        )?;
+        enforce_unique_keys_with_decls(
+            write_txn,
+            table_name,
+            schema,
+            tenant_id,
+            written_ids,
+            &decls,
+            compiled.as_ref(),
+        )?;
+    }
     enforce_foreign_keys_in_txn(
         write_txn,
         table_name,
@@ -316,6 +572,177 @@ fn enforce_check_constraints_in_txn(
     Ok(())
 }
 
+/// 式索引（INDEX-10、Issue #1649）の式を `written_ids` の各行で評価し、「式索引があるなら全行で
+/// 式が評価でき索引化できる」不変条件を維持する検査。式キー索引はコミット済みの行から世代ごとに
+/// 作り直す派生物のため、この不変条件こそが「INSERT／UPDATE の新キーが次回の再構築に必ず入る」
+/// ことの保証になる。DELETE／TRUNCATE・UPDATE の旧値は再構築で自然に消える。
+///
+/// 評価エラーは [`TenantWriteError::IndexExpressionEvaluationFailed`]（内側の SQLSTATE を透過）、
+/// 非有限値は `22003`、型不一致は `XX000`、保存式の漂流は `Catalog(CorruptSchema)` で拒否し、
+/// 呼び出し元は `write_txn` を commit しない（副作用ゼロ）。`declarations_enabled`（起動時 opt-in）
+/// には依存せず、カタログに宣言があれば常に発火する。物理キーはサーバー側導出の `tenant_id` で
+/// 名前空間化済みで、書き込んだ自テナントの行だけを読むため他テナントの存在オラクルにならない
+/// （RLS-9・TABLE-12）。読み戻せない id は [`enforce_check_constraints_in_txn`] と同じく対象外。
+fn enforce_index_expressions_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    written_ids: &[u64],
+    compiled: Option<&crate::sql::expression_key_index::CompiledIndexExpressions>,
+) -> Result<(), TenantWriteError> {
+    if written_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(compiled) = compiled else {
+        return Ok(());
+    };
+    let row_table_name = crate::catalog::user_rows_table_name(table_name);
+    let row_table = write_txn
+        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .map_err(crate::catalog::map_row_table_error)?;
+    let mut embedding: Vec<f32> = Vec::new();
+    for &id in written_ids {
+        let Some(guard) = row_table
+            .get((tenant_id, id))
+            .map_err(crate::catalog::CatalogError::from)?
+        else {
+            continue;
+        };
+        let buf = guard.value();
+        let (_dim, metadata) =
+            crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
+        compiled.enforce(schema, id, &embedding, metadata)?;
+    }
+    Ok(())
+}
+
+/// 部分索引（INDEX-11、Issue #1654）の述語を `written_ids` の各行で評価し、「部分索引があるなら全行で
+/// 述語が評価でき、述語が TRUE の行では式要素も評価・索引化できる」不変条件を維持する検査。部分索引の
+/// 派生キーはコミット済みの行からテーブル世代ごとに作り直すため、この不変条件が「INSERT／UPDATE の
+/// 入場・退場が次回の再構築に必ず反映される」ことの保証になる。述語が NULL・FALSE の行は索引外で、
+/// 式要素は評価しない（UPDATE で述語を外れる行を過剰に拒否しない）。
+///
+/// 評価エラーは [`TenantWriteError::IndexExpressionEvaluationFailed`]（内側の SQLSTATE を透過）、保存
+/// テキストの漂流は `Catalog(CorruptSchema)` で拒否し、呼び出し元は `write_txn` を commit しない。
+/// `declarations_enabled`（起動時 opt-in）には依存せず、カタログに宣言があれば常に発火する。物理キーは
+/// サーバー側導出の `tenant_id` で名前空間化済みで、書き込んだ自テナントの行だけを読むため他テナントの
+/// 存在オラクルにならない（RLS-9・TABLE-12）。読み戻せない id は対象外（[`enforce_check_constraints_in_txn`]
+/// と同じ）。
+fn enforce_partial_indexes_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    written_ids: &[u64],
+    compiled: Option<&crate::sql::index_predicate::CompiledPartialIndexes>,
+) -> Result<(), TenantWriteError> {
+    if written_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(compiled) = compiled else {
+        return Ok(());
+    };
+    let row_table_name = crate::catalog::user_rows_table_name(table_name);
+    let row_table = write_txn
+        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .map_err(crate::catalog::map_row_table_error)?;
+    let mut embedding: Vec<f32> = Vec::new();
+    for &id in written_ids {
+        let Some(guard) = row_table
+            .get((tenant_id, id))
+            .map_err(crate::catalog::CatalogError::from)?
+        else {
+            continue;
+        };
+        let buf = guard.value();
+        let (_dim, metadata) =
+            crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
+        compiled.enforce(schema, id, &embedding, metadata)?;
+    }
+    Ok(())
+}
+
+/// `CREATE INDEX ... WHERE <述語>`（INDEX-11、Issue #1654）が索引宣言を保存する前に、対象テーブルの
+/// **既存行全件**（全テナント・可視性を問わない）で述語が評価でき、述語 TRUE の行で式要素も索引化できる
+/// ことを検証する。可視性で絞ると不可視行の失敗を見逃し、恒久的に書き込めなくなる索引が残る。DDL は
+/// 運用者権限（`42501` ゲートの後）の共有カタログ操作で、[`validate_existing_rows_for_index_expressions`]
+/// と同じ設計判断。評価エラーは透過し、それ以外（デコード失敗・ヘッダのテナント不整合・漂流）は
+/// `Catalog(CorruptSchema)` へ揃える。呼び出し元は write トランザクションを commit せず破棄する。
+pub(crate) fn validate_existing_rows_for_partial_indexes<T>(
+    row_table: &T,
+    schema: &TableSchema,
+    compiled: &crate::sql::index_predicate::CompiledPartialIndexes,
+) -> Result<(), TenantWriteError>
+where
+    T: ReadableTable<(&'static str, u64), &'static [u8]>,
+{
+    let mut embedding: Vec<f32> = Vec::new();
+    for entry in row_table
+        .iter()
+        .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?
+    {
+        let (k, v) = entry.map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
+        let (key_tenant, id) = k.value();
+        let buf = v.value();
+        let (row_tenant, _visibility, _offset) = crate::storage::decode_row_header(buf)
+            .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        crate::storage::verify_row_key_tenant(key_tenant, row_tenant)
+            .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        let (_dim, metadata) =
+            crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)
+                .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        compiled
+            .enforce(schema, id, &embedding, metadata)
+            .map_err(|e| match e {
+                TenantWriteError::IndexExpressionEvaluationFailed(_) => e,
+                other => corrupt_check_scan(other.to_string()),
+            })?;
+    }
+    Ok(())
+}
+
+/// `CREATE INDEX ... ((<式>))`（INDEX-10、Issue #1649）が索引宣言を保存する前に、対象テーブルの
+/// **既存行全件**（全テナント・可視性を問わない）で `compiled` が評価でき索引化できることを検証する。
+/// 可視性で絞ると不可視行の失敗を見逃し、恒久的に作れない式索引が残る。DDL は運用者権限
+/// （`42501` ゲートの後）の共有カタログ操作で、[`validate_existing_rows_for_check`] と同じ設計判断。
+///
+/// 評価エラー（[`TenantWriteError::IndexExpressionEvaluationFailed`]）は透過し、それ以外
+/// （デコード失敗・ヘッダのテナント不整合・漂流）は `Catalog(CorruptSchema)`（`XX000`）へ揃える。
+/// 呼び出し元は write トランザクションを commit せず破棄するため、拒否は痕跡を残さない。
+pub(crate) fn validate_existing_rows_for_index_expressions<T>(
+    row_table: &T,
+    schema: &TableSchema,
+    compiled: &crate::sql::expression_key_index::CompiledIndexExpressions,
+) -> Result<(), TenantWriteError>
+where
+    T: ReadableTable<(&'static str, u64), &'static [u8]>,
+{
+    let mut embedding: Vec<f32> = Vec::new();
+    for entry in row_table
+        .iter()
+        .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?
+    {
+        let (k, v) = entry.map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
+        let (key_tenant, id) = k.value();
+        let buf = v.value();
+        let (row_tenant, _visibility, _offset) = crate::storage::decode_row_header(buf)
+            .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        crate::storage::verify_row_key_tenant(key_tenant, row_tenant)
+            .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        let (_dim, metadata) =
+            crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)
+                .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        compiled
+            .enforce(schema, id, &embedding, metadata)
+            .map_err(|e| match e {
+                TenantWriteError::IndexExpressionEvaluationFailed(_) => e,
+                other => corrupt_check_scan(other.to_string()),
+            })?;
+    }
+    Ok(())
+}
+
 /// 一意性制約（主キー・UNIQUE）の検査点（[`enforce_row_constraints_in_txn`] から
 /// 呼ばれる）。主キーも UNIQUE 制約も宣言しないテーブルは即座に成功する。
 ///
@@ -331,20 +758,24 @@ fn enforce_check_constraints_in_txn(
 /// ドキュメント参照。Issue #1070）。衝突を検出した時点で
 /// [`TenantWriteError::UniqueViolation`] を返し、呼び出し元は `write_txn` を
 /// commit しない（索引への書き込みも同じ txn に含まれるため副作用は残らない）。
-pub(crate) fn enforce_unique_keys_in_txn(
+pub(crate) fn enforce_unique_keys_with_decls(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
     written_ids: &[u64],
+    decls: &crate::catalog::TableExpressionDecls,
+    compiled: Option<&crate::sql::expression_key_index::CompiledIndexExpressions>,
 ) -> Result<(), TenantWriteError> {
-    if schema.primary_key().is_none() && schema.unique_constraints().is_empty() {
-        return Ok(());
-    }
     if written_ids.is_empty() {
         return Ok(());
     }
-    let (specs, mask) = key_specs(schema)?;
+    // 主キー・UNIQUE 制約に加え、一意の式索引（INDEX-9・INDEX-10、Issue #1651）も同じ永続一意索引で
+    // 強制する。どちらも無い表は即座に成功する（この判定を落とすと式一意索引が強制されない）。
+    let plan = UniqueKeyPlan::build(schema, decls)?;
+    if plan.is_empty() {
+        return Ok(());
+    }
 
     let row_table_name = crate::catalog::user_rows_table_name(table_name);
     let row_table = write_txn
@@ -360,8 +791,8 @@ pub(crate) fn enforce_unique_keys_in_txn(
         &row_table,
         &mut index_table,
         schema,
-        &specs,
-        &mask,
+        &plan,
+        compiled,
         tenant_id,
         &written_id_set,
     )?;
@@ -369,10 +800,34 @@ pub(crate) fn enforce_unique_keys_in_txn(
         &row_table,
         &mut index_table,
         schema,
-        &specs,
+        &plan,
+        compiled,
         tenant_id,
         &written_id_set,
-        &mask,
+    )
+}
+
+/// [`enforce_unique_keys_with_decls`] を、式索引の宣言を自分で読み込んで呼ぶ単体テスト用の入口
+/// （検査点 [`enforce_row_constraints_in_txn`] は宣言を 1 回だけ読んで共有する）。
+#[cfg(test)]
+pub(crate) fn enforce_unique_keys_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    written_ids: &[u64],
+) -> Result<(), TenantWriteError> {
+    let decls = crate::catalog::table_expression_decls_in_txn(write_txn, table_name)?;
+    let compiled =
+        crate::sql::expression_key_index::CompiledIndexExpressions::compile(schema, &decls.keys)?;
+    enforce_unique_keys_with_decls(
+        write_txn,
+        table_name,
+        schema,
+        tenant_id,
+        written_ids,
+        &decls,
+        compiled.as_ref(),
     )
 }
 
@@ -412,10 +867,13 @@ pub(crate) fn verify_unique_index_read_only(
     schema: &TableSchema,
     tenant_id: &str,
 ) -> Result<(), TenantWriteError> {
-    if schema.primary_key().is_none() && schema.unique_constraints().is_empty() {
+    let decls = crate::catalog::table_expression_decls_in_read_txn(read_txn, table_name)?;
+    let plan = UniqueKeyPlan::build(schema, &decls)?;
+    if plan.is_empty() {
         return Ok(());
     }
-    let (specs, mask) = key_specs(schema)?;
+    let compiled =
+        crate::sql::expression_key_index::CompiledIndexExpressions::compile(schema, &decls.keys)?;
     let row_table_name = crate::catalog::user_rows_table_name(table_name);
     let row_table = read_txn
         .open_table(crate::catalog::user_rows_table_def(&row_table_name))
@@ -428,8 +886,8 @@ pub(crate) fn verify_unique_index_read_only(
         &row_table,
         &index_table,
         schema,
-        &specs,
-        &mask,
+        &plan,
+        compiled.as_ref(),
         tenant_id,
     )
 }
@@ -572,13 +1030,17 @@ pub(crate) fn recover_unique_keys_of_corrupt_rows(
     if corrupt_ids.is_empty() {
         return Ok(());
     }
-    let (specs, _mask) = key_specs(schema)?;
+    let decls = crate::catalog::table_expression_decls_in_txn(write_txn, table_name)?;
+    let compiled =
+        crate::sql::expression_key_index::CompiledIndexExpressions::compile(schema, &decls.keys)?;
+    let plan = UniqueKeyPlan::build(schema, &decls)?;
     let mut recovered: HashSet<u64> = HashSet::new();
     for (id, key) in unique_index::recover_forward_keys_for_rows(
         write_txn,
         table_name,
         schema,
-        &specs,
+        &plan,
+        compiled.as_ref(),
         indices,
         tenant_id,
         corrupt_ids,
@@ -673,6 +1135,57 @@ where
             .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
         let Some(key) =
             key_bytes(&spec, &values).map_err(|m| CatalogError::Invalid(m.to_string()))?
+        else {
+            continue;
+        };
+        if !seen.insert(key) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 一意の式索引（INDEX-9・INDEX-10、Issue #1651）の作成時（`CREATE UNIQUE INDEX ... ((式))`）と
+/// `ALTER COLUMN TYPE` 後の再検証が、対象テーブルの**全テナント・全可視性**の既存行で
+/// テナントごとに独立して式一意キーの重複を探す。キーの計算は書き込み時の検査点・バックフィルと同じ
+/// [`UniqueKeyPlan::row_keys`] を通す（判定がずれて作成後の最初の書き込みが `XX000` になる事故を
+/// 構造的に防ぐ）。物理キー順で同一テナントの行は連続するため、テナントが変わるたびに集合を
+/// リセットする。NULL を含む行は対象外（NULLS DISTINCT）。評価エラーは
+/// [`TenantWriteError::IndexExpressionEvaluationFailed`] で返し、呼び出し元が応答用に値を伏せる。
+/// `elements` の `Expr(k)` は `compiled` の通し番号。
+pub(crate) fn table_has_duplicate_expression_unique_key<T>(
+    row_table: &T,
+    schema: &TableSchema,
+    compiled: &crate::sql::expression_key_index::CompiledIndexExpressions,
+    elements: &[crate::catalog::UniqueElementDecl],
+) -> Result<bool, TenantWriteError>
+where
+    T: ReadableTable<(&'static str, u64), &'static [u8]>,
+{
+    let plan = UniqueKeyPlan::for_single_expression_index(schema, elements)?;
+    let mut current_tenant: Option<String> = None;
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    for entry in row_table
+        .iter()
+        .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?
+    {
+        let (k, v) = entry.map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
+        let (key_tenant, id) = k.value();
+        if current_tenant.as_deref() != Some(key_tenant) {
+            current_tenant = Some(key_tenant.to_string());
+            seen.clear();
+        }
+        let buf = v.value();
+        // 行ヘッダのテナントと物理キーのテナントの整合（TABLE-12）を確認してから値を読む。
+        let (row_tenant, _visibility, _offset) = crate::storage::decode_row_header(buf)
+            .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        crate::storage::verify_row_key_tenant(key_tenant, row_tenant)
+            .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        let Some(key) = plan
+            .row_keys(schema, Some(compiled), id, buf)?
+            .into_iter()
+            .next()
+            .flatten()
         else {
             continue;
         };

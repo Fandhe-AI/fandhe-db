@@ -1424,13 +1424,35 @@ pub(crate) fn execute_statement_with_cache(
     // するため、`bound.metadata_filters`／`expr_filters` が変わらないこの
     // クエリ内で 1 回だけ計算する（`sql::hnsw_cache::classify_ann_plan` を
     // 一度だけ呼ぶ既存の流儀と同じ）。
-    let scalar_plan_kind =
-        crate::sql::scalar_plan::classify_scalar_plan(&crate::sql::scalar_plan::ScalarShapeInput {
+    //
+    // INDEX-10（Issue #1650）: 式索引の式一致を分類に加えるため、クエリと同一の `read_txn` から
+    // 対象テーブルの式宣言（`resolve_expression_matcher_in_txn`）を解決する。opt-in なし・
+    // 式候補なし（構造フィルタ）・`scalar_cache` なし・カタログ読み取り失敗では空のマッチャ
+    // （＝従来の分類とビット単位で同じ）になる。以降の分類・候補収集は同じ `expr_finder` を通す。
+    let expr_matcher = match (scalar_cache.as_ref(), read_txn.snapshot()) {
+        (Some(scalar_access), Some(snapshot_txn)) if plan.scalar_prefilter => {
+            crate::sql::scalar_index::resolve_expression_matcher_in_txn(
+                snapshot_txn,
+                &bound.table,
+                schema,
+                scalar_access.declarations_enabled,
+                &bound.expr_filters,
+            )
+        }
+        _ => crate::sql::expression_key_index::ExpressionIndexMatcher::empty(),
+    };
+    let expr_finder = |e: &crate::sql::udf_call::BoundExpr, ty: crate::sql::udf_call::ExprType| {
+        expr_matcher.find(e, ty)
+    };
+    let scalar_plan_kind = crate::sql::scalar_plan::classify_scalar_plan_with(
+        &crate::sql::scalar_plan::ScalarShapeInput {
             scalar_prefilter: plan.scalar_prefilter,
             metadata_filters: &bound.metadata_filters,
             expr_filters: &bound.expr_filters,
             or_filters: &bound.or_filters,
-        });
+        },
+        &expr_finder,
+    );
 
     let rls_hook = ImplicitRlsHook::new(ctx);
     // 借用元を関数スコープ末尾まで生かすための保持先（`arena` はこのいずれかを
@@ -1616,7 +1638,7 @@ pub(crate) fn execute_statement_with_cache(
                                     // 渡り、`ScalarIndex::candidates_for` が
                                     // 内部で振り分ける（Issue #893 production
                                     // 接続）。
-                                    match match crate::sql::scalar_plan::collect_expr_index_predicates(&bound.expr_filters) {
+                                    match match crate::sql::scalar_plan::collect_expr_index_predicates_with(&bound.expr_filters, &expr_finder) {
                                         Some(expr_preds) => index.resolve_candidates(&bound.metadata_filters, &expr_preds),
                                         // 分類が `PlainScan` 以外なら到達しないが、式述語を 1 件でも落とすと
                                         // 候補が上位集合になり fail-open になるため、非対応は全走査へ倒す。
@@ -1881,16 +1903,19 @@ pub(crate) fn execute_statement_with_cache(
                 // 断念する（`resolve_scalar_index_target_in_txn` ドキュメント
                 // 参照。構築断念はこの派生キャッシュの fail-soft 契約の範囲内で、
                 // クエリ自体は plain scan へ縮退するだけで失敗しない）。
-                match crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
-                    crate::storage::read_source::require_snapshot(read_txn)?,
-                    &bound.table,
-                    scalar_access.declarations_enabled,
-                ) {
+                let (resolved_target, expression_keys) =
+                    crate::sql::scalar_index::resolve_scalar_index_target_and_expression_keys_in_txn(
+                        crate::storage::read_source::require_snapshot(read_txn)?,
+                        &bound.table,
+                        scalar_access.declarations_enabled,
+                    );
+                match resolved_target {
                     Ok(target) => {
-                        match crate::sql::scalar_index::ScalarIndex::build_targeted(
+                        match crate::sql::scalar_index::ScalarIndex::build_targeted_with_expressions(
                             schema,
                             snapshot_for_scalar,
                             target.as_target(),
+                            &expression_keys,
                         ) {
                             Ok(index) => {
                                 let _ = scalar_access.cache.insert(
@@ -4232,6 +4257,8 @@ pub(crate) fn map_write_error(
         // 変換不要（`tenant::TenantWriteError::CheckEvaluationFailed` のドキュ
         // メント参照）。
         TenantWriteError::CheckEvaluationFailed(inner) => inner,
+        // 式索引の式の評価エラー（INDEX-10、Issue #1649）も内側の `SqlSurfaceError` を透過する。
+        TenantWriteError::IndexExpressionEvaluationFailed(inner) => inner,
         // SET 右辺式の評価エラー（Issue #1544・SQL-45 のポインタ）も内側の
         // `SqlSurfaceError` を透過する（通常の式評価と同じ `wire_code`）。
         TenantWriteError::SetExpressionEvaluationFailed(inner) => inner,
@@ -4261,6 +4288,11 @@ pub(crate) fn map_write_error(
         // ロック競合とサーバー内部エラーを判別できなくなる。`catalog::table_lookup_error`・
         // `tenant::ClassifiedError` と同じ写像先（codex-review 指摘）。
         TenantWriteError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        // ビュー経由の INSERT（TABLE-43・Issue #1671）で、書き換え後にビュー連鎖・基表スキーマが変わった
+        // （通常は core の再試行が吸収する。上限到達時は `CREATE OR REPLACE VIEW` と同じ `55P03`）。
+        TenantWriteError::Catalog(CatalogError::ViewDefinitionChanged(_)) => {
+            SqlSurfaceError::LockNotAvailable
+        }
         // `RETURNING` 句（Issue #873・SQL-21）の捕捉行投影が容量上限超過で失敗した
         // （[`execute_delete_returning`] の `project` コールバック。commit **前**に
         // 検出し `write_txn` を abort させる設計のため、この写像に到達する時点で
@@ -5441,6 +5473,7 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         // INSERT でも通常の式評価と同じ `SqlSurfaceError` をそのまま透過する
         // （`_` 節の `XX000` へ丸めない）。
         IncrementalError::Write(TenantWriteError::CheckEvaluationFailed(inner)) => inner,
+        IncrementalError::Write(TenantWriteError::IndexExpressionEvaluationFailed(inner)) => inner,
         // `FOREIGN KEY` 制約違反（`23503`。TABLE-17・TASK-205、Issue #907）: ファイル形
         // `INSERT` の置換（`replace_typed_rows_by_text_key`）で旧チャンク行を削除しようと
         // して参照先側の検査に違反した場合、または新規チャンク行の参照元列が参照元側の

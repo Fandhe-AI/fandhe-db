@@ -460,10 +460,14 @@ pub(crate) fn select_decode_tier(
 /// [`crate::sql::scalar_index::scalar_plan_under_target`] で `PlainScan` へ
 /// 補正し、`ensure_scalar_index_snapshot` が実際に構築する索引（宣言列だけ）と
 /// 表示を一致させる。
+///
+/// `expr_finder`（INDEX-10、Issue #1650）: 実行時（[`execute_aggregate_with_group_limits`]）と同じ
+/// 式索引の一致判定。呼び出し元が同一の `read_txn` から解決したマッチャを渡す。
 pub(crate) fn classify_aggregate_access(
     schema: &TableSchema,
     bound: &BoundAggregate,
     target: &Result<crate::sql::scalar_index::ScalarIndexTargetOwned, ()>,
+    expr_finder: crate::sql::scalar_plan::ExprFinder<'_>,
 ) -> (
     crate::sql::scalar_plan::ScalarPlan,
     Option<crate::sql::scalar_index::ScalarFallbackReason>,
@@ -471,7 +475,7 @@ pub(crate) fn classify_aggregate_access(
 ) {
     use crate::sql::explain::AccessPath;
     use crate::sql::scalar_index::scalar_plan_under_target_with_reason;
-    use crate::sql::scalar_plan::{classify_scalar_plan, ScalarPlan, ScalarShapeInput};
+    use crate::sql::scalar_plan::{classify_scalar_plan_with, ScalarPlan, ScalarShapeInput};
 
     let has_vector = schema.vector_dim().is_some();
     let where_less = !bound.has_where_filters();
@@ -496,7 +500,7 @@ pub(crate) fn classify_aggregate_access(
     // の同時出力〕を防ぐ）。宣言による対象外化（Issue #1153）は
     // `scalar_plan_under_target` で織り込む。
     let scalar_plan_before_target = if has_vector {
-        classify_scalar_plan(&scalar_shape)
+        classify_scalar_plan_with(&scalar_shape, expr_finder)
     } else {
         ScalarPlan::PlainScan
     };
@@ -2380,7 +2384,20 @@ pub(crate) fn execute_aggregate_with_group_limits(
             expr_filters: &bound.expr_filters,
             or_filters: &bound.or_filters,
         };
-        if crate::sql::scalar_plan::classify_scalar_plan(&scalar_shape)
+        // INDEX-10（Issue #1650）: 式索引の式一致を分類・候補収集の双方へ同じ `finder` で渡す
+        // （`sql::exec` と同じ単一情報源。opt-in なし・式候補なしは空のマッチャ＝従来どおり）。
+        let expr_matcher = crate::sql::scalar_index::resolve_expression_matcher_in_txn(
+            crate::storage::read_source::require_snapshot(read_txn)?,
+            &bound.table,
+            schema,
+            scalar_access.declarations_enabled,
+            &bound.expr_filters,
+        );
+        let expr_finder = |e: &crate::sql::udf_call::BoundExpr,
+                           ty: crate::sql::udf_call::ExprType| {
+            expr_matcher.find(e, ty)
+        };
+        if crate::sql::scalar_plan::classify_scalar_plan_with(&scalar_shape, &expr_finder)
             != crate::sql::scalar_plan::ScalarPlan::PlainScan
         {
             if let Some(result) = try_scalar_index_aggregate(
@@ -2393,6 +2410,7 @@ pub(crate) fn execute_aggregate_with_group_limits(
                 arena_access,
                 scalar_access,
                 max_result_bytes,
+                &expr_finder,
             )? {
                 return Ok(result);
             }
@@ -2983,6 +3001,9 @@ fn try_scalar_index_aggregate(
     // PR #1049 レビュー指摘 P0 対応: [`observe_candidate_slots`] へそのまま渡す
     // 結果バイト予算（[`execute_aggregate_with_group_limits`] ドキュメント参照）。
     max_result_bytes: usize,
+    // 分類（呼び出し元の `classify_scalar_plan_with`）と同じ式索引の一致判定
+    // （INDEX-10、Issue #1650）。候補収集が分類と異なる述語集合を見ないための共有。
+    expr_finder: crate::sql::scalar_plan::ExprFinder<'_>,
 ) -> Result<Option<QueryResult>, SqlSurfaceError> {
     // Cursor Bugbot Medium 指摘（PR #603）: キャッシュ照会・再利用ロジックを
     // [`ensure_scalar_index_snapshot`] へ一本化した（`sql::group_by` の
@@ -3010,20 +3031,22 @@ fn try_scalar_index_aggregate(
     // Issue #891・TASK-199 で production 結線済み）は `bound.metadata_filters`
     // に混在したまま渡り、`ScalarIndex::candidates_for` が内部で振り分ける
     // （Issue #893 production 接続）。
-    let slots =
-        match match crate::sql::scalar_plan::collect_expr_index_predicates(&bound.expr_filters) {
-            Some(expr_preds) => index.resolve_candidates(&bound.metadata_filters, &expr_preds),
-            // 分類が `PlainScan` 以外なら到達しないが、式述語を 1 件でも落とすと
-            // 候補が上位集合になり fail-open になるため、非対応は全走査へ倒す。
-            None => crate::sql::scalar_index::CandidateResolution::FallbackNoIndex,
-        } {
-            crate::sql::scalar_index::CandidateResolution::Use(slots) => slots,
-            crate::sql::scalar_index::CandidateResolution::FallbackNoIndex
-            | crate::sql::scalar_index::CandidateResolution::FallbackSelectivity => {
-                scalar_access.cache.record_aggregate_plain_scan_fallback();
-                return Ok(None);
-            }
-        };
+    let slots = match match crate::sql::scalar_plan::collect_expr_index_predicates_with(
+        &bound.expr_filters,
+        expr_finder,
+    ) {
+        Some(expr_preds) => index.resolve_candidates(&bound.metadata_filters, &expr_preds),
+        // 分類が `PlainScan` 以外なら到達しないが、式述語を 1 件でも落とすと
+        // 候補が上位集合になり fail-open になるため、非対応は全走査へ倒す。
+        None => crate::sql::scalar_index::CandidateResolution::FallbackNoIndex,
+    } {
+        crate::sql::scalar_index::CandidateResolution::Use(slots) => slots,
+        crate::sql::scalar_index::CandidateResolution::FallbackNoIndex
+        | crate::sql::scalar_index::CandidateResolution::FallbackSelectivity => {
+            scalar_access.cache.record_aggregate_plain_scan_fallback();
+            return Ok(None);
+        }
+    };
 
     let mut accumulators = Vec::with_capacity(bound.items.len());
     for item in &bound.items {
@@ -3144,11 +3167,13 @@ pub(crate) fn ensure_scalar_index_snapshot(
     // `read_txn` から解決する。カタログ読み取り失敗は「宣言なし→自動」へは
     // 倒さず即座に構築不能（plain scan フォールバック）とする
     // （`resolve_scalar_index_target_in_txn` ドキュメント参照）。
-    let target = match crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
-        read_txn,
-        table,
-        scalar_access.declarations_enabled,
-    ) {
+    let (resolved_target, expression_keys) =
+        crate::sql::scalar_index::resolve_scalar_index_target_and_expression_keys_in_txn(
+            read_txn,
+            table,
+            scalar_access.declarations_enabled,
+        );
+    let target = match resolved_target {
         Ok(t) => t,
         Err(()) => {
             scalar_access.cache.record_build_failure();
@@ -3175,10 +3200,11 @@ pub(crate) fn ensure_scalar_index_snapshot(
         {
             return None;
         }
-        return match crate::sql::scalar_index::ScalarIndex::build_targeted(
+        return match crate::sql::scalar_index::ScalarIndex::build_targeted_with_expressions(
             schema,
             &snapshot,
             target.as_target(),
+            &expression_keys,
         ) {
             Ok(index) => scalar_access
                 .cache
@@ -3214,6 +3240,7 @@ pub(crate) fn ensure_scalar_index_snapshot(
         table,
         expected_dim,
         target.as_target(),
+        &expression_keys,
     ) {
         Some(pair) => pair,
         None => {
@@ -3384,6 +3411,7 @@ fn capture_scalar_index_snapshot(
     table: &str,
     expected_dim: u32,
     target: crate::sql::scalar_index::ScalarIndexTarget<'_>,
+    expression_keys: &crate::sql::scalar_index::DerivedKeyDecls,
 ) -> Option<(
     crate::sql::arena_cache::SqlArenaSnapshot,
     crate::sql::scalar_index::ScalarIndex,
@@ -3461,8 +3489,13 @@ fn capture_scalar_index_snapshot(
     let generation = crate::catalog::table_generation_in_txn(read_txn, table).ok()?;
     let snapshot =
         crate::sql::arena_cache::SqlArenaSnapshot::new(arena, metadata, ctx.clone(), generation);
-    let index =
-        crate::sql::scalar_index::ScalarIndex::build_targeted(schema, &snapshot, target).ok()?;
+    let index = crate::sql::scalar_index::ScalarIndex::build_targeted_with_expressions(
+        schema,
+        &snapshot,
+        target,
+        expression_keys,
+    )
+    .ok()?;
     Some((snapshot, index))
 }
 
@@ -4475,7 +4508,8 @@ mod tests {
                 &schema,
                 "docs",
                 expected_dim,
-                crate::sql::scalar_index::ScalarIndexTarget::Auto
+                crate::sql::scalar_index::ScalarIndexTarget::Auto,
+                &crate::sql::scalar_index::DerivedKeyDecls::default(),
             )
             .is_none(),
             "a generation containing a nullable-VECTOR NULL row must not be captured"
@@ -4507,6 +4541,7 @@ mod tests {
             "docs",
             expected_dim,
             crate::sql::scalar_index::ScalarIndexTarget::Auto,
+            &crate::sql::scalar_index::DerivedKeyDecls::default(),
         )
         .expect("capture should succeed when no row is NULL");
         assert_eq!(snapshot.arena().len(), 2);
@@ -4556,6 +4591,7 @@ mod tests {
                 "docs",
                 expected_dim,
                 crate::sql::scalar_index::ScalarIndexTarget::Auto,
+                &crate::sql::scalar_index::DerivedKeyDecls::default(),
             )
             .expect("initial capture should succeed");
             arena_cache.insert(&storage, "docs", &ctx, snapshot);

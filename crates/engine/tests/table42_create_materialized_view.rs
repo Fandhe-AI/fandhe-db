@@ -627,7 +627,7 @@ fn materialized_view_over_materialized_view_reads_inner_entities_per_context() {
         "SELECT body FROM mv_out LIMIT 100",
         "SELECT body FROM docs WHERE lang = 'en' LIMIT 100",
     );
-    // 参照される matview は削除できない（#1663 のガード）ため、基表の列 DDL も拒否される。
+    // 参照元の基表は RESTRICT では削除できず、列 DDL も保守的に拒否される（次のテスト）。
 }
 
 #[test]

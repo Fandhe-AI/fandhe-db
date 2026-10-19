@@ -387,14 +387,25 @@ fn structural_rejections_do_not_consult_the_catalog() {
         ("CREATE INDEX idx ON docs USING gin (lang)".into(), "0A000"),
         ("CREATE INDEX idx ON docs USING bm25 (body)".into(), "0A000"),
         (
-            "CREATE INDEX idx ON docs (lang) WHERE lang = 'ja'".into(),
+            "CREATE UNIQUE INDEX idx ON docs (lang) WHERE lang = 'ja'".into(),
             "0A000",
         ),
-        ("CREATE INDEX idx ON docs (lower(lang))".into(), "0A000"),
-        // 式索引（INDEX-10、Issue #1647）: 構文段の分類。カタログ非参照のため権限・対象の有無に
-        // 依存しない。
+        // 部分索引の述語の分類（INDEX-11、Issue #1653）もカタログ非参照。
+        (
+            "CREATE INDEX idx ON docs (lang) WHERE body < now()".into(),
+            "42P17",
+        ),
+        (
+            "CREATE INDEX idx ON docs (lang) WHERE count(*) > 0".into(),
+            "42803",
+        ),
+        // 式索引（INDEX-10、Issue #1647・#1648）: 構文段の分類。カタログ非参照のため権限・対象の
+        // 有無に依存しない。UNIQUE・hnsw・式への COLLATE との組み合わせは最終ゲートの 0A000。
         ("CREATE INDEX idx ON docs ((now()))".into(), "42P17"),
-        ("CREATE INDEX idx ON docs ((lang || body))".into(), "0A000"),
+        (
+            "CREATE INDEX idx ON docs USING hnsw ((lower(lang)))".into(),
+            "0A000",
+        ),
         ("CREATE INDEX idx ON docs ((count(lang)))".into(), "42803"),
         (
             "CREATE INDEX idx ON docs ((sum(id) OVER ()))".into(),

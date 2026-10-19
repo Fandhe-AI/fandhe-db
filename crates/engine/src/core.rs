@@ -1518,6 +1518,10 @@ pub enum ParsedSql {
     /// `INSERT`（単一行・複数行 `VALUES`・`ON CONFLICT`・`RETURNING` を含む。
     /// SQL-10・SQL-16・SQL-20・SQL-21）。
     Insert(crate::sql::allowlist::ValidatedInsert),
+    /// 自動更新可能なビューへの `INSERT`（TABLE-43・Issue #1671）。送られた文の形のまま保持し、
+    /// 基表への書き換えは Execute／Describe 時に現在のカタログで行う（Parse と Execute の間の
+    /// `CREATE OR REPLACE VIEW`／`DROP VIEW` を取り込む）。自動更新不可のビューは Parse で `55000`。
+    ViewInsert(crate::sql::allowlist::ValidatedViewInsert),
     /// `TRUNCATE TABLE ... USING OPERATION_ID '<id>'`（SQL-22）。
     Truncate(crate::sql::allowlist::ValidatedTruncate),
     /// `DELETE`（単一行・`id` 完全一致形／述語形。SQL-18・SQL-19）。
@@ -1634,6 +1638,9 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `ParsedSql` を
     /// 網羅的にマッチする既存コードはすべて更新済み。
     DropView(crate::sql::allowlist::ValidatedDropView),
+    /// `DROP MATERIALIZED VIEW`（TABLE-42 (5)・TABLE-37、Issue #1667）。構造検証のみで
+    /// カタログを照会しない（`DropView` と同じ設計）。
+    DropMaterializedView(crate::sql::allowlist::ValidatedDropMaterializedView),
     /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <name> [(<alias>, ...)] AS <body>
     /// [WITH [NO] DATA]`（TABLE-42・Issue #1664）。DDL 実行権限ゲートの判定と初回実体化は
     /// `EngineCore::execute_parsed_in_session` の同名腕が担い、構文検証
@@ -1643,6 +1650,14 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #1664）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチする既存コードはすべて更新済み。
     CreateMaterializedView(crate::sql::allowlist::ValidatedCreateMaterializedView),
+    /// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] <name> [WITH [NO] DATA]`（TABLE-42・Issue #1665）。
+    /// DDL 権限ゲートと再実体化は `execute_parsed_in_session` の同名腕が担い、構文検証は
+    /// カタログを照会しない。明示トランザクション内は汎用フォールバックで `0A000`
+    /// （`CreateMaterializedView` と同じ）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1665）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    RefreshMaterializedView(crate::sql::allowlist::ValidatedRefreshMaterializedView),
     /// `CREATE INDEX <name> ON <table> [USING hnsw] (<col>[, ...])`（TASK-206・
     /// INDEX-7・SQL-23、Issue #908）。DDL 実行権限ゲート
     /// （`sql::ddl::require_ddl_permission`）の判定は `EngineCore::
@@ -1707,6 +1722,7 @@ fn statement_clock_scope(
         }
         ParsedSql::Statement(_)
         | ParsedSql::Insert(_)
+        | ParsedSql::ViewInsert(_)
         | ParsedSql::Delete(_)
         | ParsedSql::Update(_) => true,
         ParsedSql::Truncate(_)
@@ -1719,8 +1735,10 @@ fn statement_clock_scope(
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateView(_)
         | ParsedSql::DropView(_)
+        | ParsedSql::DropMaterializedView(_)
         // TABLE-42・Issue #1664: `CreateView` と同じく本文の時刻関数は束縛段で拒否する（fail-closed）。
         | ParsedSql::CreateMaterializedView(_)
+        | ParsedSql::RefreshMaterializedView(_)
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_)
         | ParsedSql::CreateType(_)
@@ -1753,7 +1771,7 @@ fn insert_default_clock_scope(
         ParsedSql::SessionRouted(routed) => {
             return insert_default_clock_scope(routed.inner(), txn_start_micros)
         }
-        ParsedSql::Insert(_) => true,
+        ParsedSql::Insert(_) | ParsedSql::ViewInsert(_) => true,
         ParsedSql::Statement(_)
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
@@ -1767,7 +1785,9 @@ fn insert_default_clock_scope(
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateView(_)
         | ParsedSql::DropView(_)
+        | ParsedSql::DropMaterializedView(_)
         | ParsedSql::CreateMaterializedView(_)
+        | ParsedSql::RefreshMaterializedView(_)
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_)
         | ParsedSql::CreateType(_)
@@ -1897,6 +1917,7 @@ fn table_schemas_in(
 fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
     match parsed {
         ParsedSql::Insert(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
+        ParsedSql::ViewInsert(stmt) => stmt.operation_id().map(|id| id.as_str()),
         ParsedSql::Truncate(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
         ParsedSql::Delete(crate::sql::allowlist::DeleteStatement::SingleRow(v)) => {
             v.operation_id.as_ref().map(|id| id.as_str())
@@ -2050,6 +2071,15 @@ impl<'a> InsertSchemaLookup<'a> {
         Self {
             storage,
             cached: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// 呼び出し元が取得済みのスキーマ（ビュー書き込みの同一スナップショット由来。TABLE-43）を
+    /// 最初から保持する。`take_schema` が基表名一致のときだけ返す点は [`Self::new`] と同じ。
+    fn with_schema(storage: &'a Storage, table_name: &str, schema: TableSchema) -> Self {
+        Self {
+            storage,
+            cached: std::cell::RefCell::new(Some((table_name.to_string(), schema))),
         }
     }
 
@@ -2210,6 +2240,32 @@ fn scalar_index_names_for_columns(
         remaining.retain(|col| !covers.contains(col));
     }
     chosen
+}
+
+/// `scalar_plan:` の `index=` 注記へ出すスカラー索引名（INDEX-10、Issue #1650）。列述語の被覆名
+/// （[`scalar_index_names_for_columns`]）に、WHERE の式述語が一致した式索引名を合流させる。
+///
+/// - 列述語が無い（`column_names` が空）: 式索引名だけ。
+/// - 列述語がある: 全列が宣言で被覆されている場合に限り、被覆名と式索引名の和集合。被覆されない
+///   列が 1 つでもある・宣言を読めていない（`scalar_decls == None`）なら空（実行時は全走査へ縮退
+///   するため索引使用を主張しない）。昇順・重複排除は呼び出し元 `ExplainIndexNames::new` に委ねる。
+fn scalar_index_names_with_expressions(
+    scalar_decls: Option<&[(String, Vec<String>)]>,
+    column_names: &[&str],
+    expression_names: &[String],
+) -> Vec<String> {
+    if column_names.is_empty() {
+        return expression_names.to_vec();
+    }
+    let Some(decls) = scalar_decls else {
+        return Vec::new();
+    };
+    let mut names = scalar_index_names_for_columns(decls, column_names);
+    if names.is_empty() {
+        return Vec::new();
+    }
+    names.extend(expression_names.iter().cloned());
+    names
 }
 
 impl EngineCore {
@@ -3461,7 +3517,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::CreateMaterializedView(_)
+                    | crate::sql::SqlOutcome::RefreshMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::DropMaterializedView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
@@ -3506,7 +3564,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::CreateMaterializedView(_)
+                    | crate::sql::SqlOutcome::RefreshMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::DropMaterializedView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
@@ -3548,7 +3608,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::CreateMaterializedView(_)
+                    | crate::sql::SqlOutcome::RefreshMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::DropMaterializedView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
@@ -3597,7 +3659,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::CreateMaterializedView(_)
+                    | crate::sql::SqlOutcome::RefreshMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::DropMaterializedView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
@@ -3652,7 +3716,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::CreateMaterializedView(_)
+                    | crate::sql::SqlOutcome::RefreshMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::DropMaterializedView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
@@ -3784,12 +3850,44 @@ impl EngineCore {
         &self,
         e: crate::sql::allowlist::SqlSurfaceError,
     ) -> crate::sql::allowlist::SqlSurfaceError {
+        self.reclassify_write_to_view_error_for(None, e)
+    }
+
+    /// [`Self::reclassify_write_to_view_error`] の文種別つき版（TABLE-43 (3)・Issue #1670）。
+    /// `op` が `Some`（`INSERT`／`UPDATE`／`DELETE`）で対象がビューのとき、自動更新可能性を
+    /// `sql::view_updatable` で判定し、自動更新不可なら `55000`
+    /// （`ViewNotAutoUpdatable`）で拒否する。自動更新可能なビューは、INSERT なら
+    /// `parse_tokens` が先に `ParsedSql::ViewInsert` として受理する（Issue #1671）ため本関数には来ない。
+    /// UPDATE／DELETE は基表への書き換えが入る（Issue #1672）まで従来どおり `42809`（fail-closed）。`op` が `None`
+    /// （`TRUNCATE`・`EXPLAIN` 系）は常に従来の `42809`。判定自体の失敗（破損 `XX000`・深さ超過
+    /// `54000` 等）はそのまま返し、「ビューではない」側へは倒さない。
+    fn reclassify_write_to_view_error_for(
+        &self,
+        op: Option<crate::sql::allowlist::ViewWriteOp>,
+        e: crate::sql::allowlist::SqlSurfaceError,
+    ) -> crate::sql::allowlist::SqlSurfaceError {
         if let crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name } = &e {
             // 索引名（TASK-206・INDEX-7、Issue #908）もビューと同じくテーブルと
             // relation 名前空間を共有する行を持たないオブジェクトのため、書き込み
             // 系 DML の対象にされた場合は `42809` へ揃える。
             let wrong_kind = match self.storage.view_definition(name) {
-                Ok(Some(_)) => true,
+                Ok(Some(_)) => {
+                    if let Some(op) = op {
+                        match crate::sql::view_updatable::view_updatability(&self.storage, name) {
+                            Ok(crate::sql::view_updatable::ViewUpdatability::NotAutoUpdatable(
+                                reason,
+                            )) => {
+                                return crate::sql::allowlist::SqlSurfaceError::ViewNotAutoUpdatable {
+                                    op,
+                                    reason,
+                                };
+                            }
+                            Ok(crate::sql::view_updatable::ViewUpdatability::AutoUpdatable) => {}
+                            Err(judge_err) => return judge_err,
+                        }
+                    }
+                    true
+                }
                 Ok(None) => match self.storage.index_exists(name) {
                     Ok(true) => true,
                     // matview（TABLE-42・Issue #1664）も行を直接書けないオブジェクト。表・ビュー・
@@ -4148,14 +4246,33 @@ impl EngineCore {
                 hits.temp_cell(),
             )
             .with_persistent_hit(hits.persistent_cell());
-            let stmt = crate::sql::allowlist::validate_insert_tokens_with_limit(
+            // 構造検証 → 存在確認の順序は `validate_insert_tokens_with_limit` と同じ。INTO の名前が
+            // 表でなくビューなら、自動更新可能なものに限りビューへの INSERT として受理する
+            // （TABLE-43・Issue #1671。書き換えは Execute 時）。
+            let stmt = crate::sql::allowlist::parse_insert_shape_tokens_with_limit(
                 &tokens,
-                &lookup,
                 ledger_mode,
                 self.dml_limits.max_insert_rows_per_statement,
-            )
-            .map_err(|e| self.reclassify_write_to_view_error(e))?;
-            return Ok(ParsedSql::Insert(stmt));
+            )?;
+            if crate::sql::allowlist::TableLookup::table_exists(&lookup, &stmt.table_name)? {
+                return Ok(ParsedSql::Insert(stmt));
+            }
+            if matches!(self.storage.view_definition(&stmt.table_name), Ok(Some(_))) {
+                let view_stmt = crate::sql::allowlist::ValidatedViewInsert::new(stmt);
+                // 自動更新不可は `55000`、判定・解決の失敗はそのまま返す（fail-closed）。
+                self.storage
+                    .with_view_write_snapshot(view_stmt.view_name(), |snap, _| {
+                        crate::sql::view_insert::check_view_insert(snap, &view_stmt)
+                    })
+                    .map_err(crate::catalog::table_lookup_error)??;
+                return Ok(ParsedSql::ViewInsert(view_stmt));
+            }
+            // 表でもビューでもない名前は従来どおり（索引・matview は `42809`、その他は `42P01`）。
+            // 照会の失敗は再照会する `reclassify_write_to_view_error_for` が `XX000` へ写す。
+            return Err(self.reclassify_write_to_view_error_for(
+                Some(crate::sql::allowlist::ViewWriteOp::Insert),
+                crate::sql::allowlist::SqlSurfaceError::undefined_table(stmt.table_name),
+            ));
         }
 
         let is_truncate_statement = matches!(
@@ -4182,7 +4299,12 @@ impl EngineCore {
                 &storage_lookup,
                 ledger_mode,
             )
-            .map_err(|e| self.reclassify_write_to_view_error(e))?;
+            .map_err(|e| {
+                self.reclassify_write_to_view_error_for(
+                    Some(crate::sql::allowlist::ViewWriteOp::Delete),
+                    e,
+                )
+            })?;
             if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
                 self.check_partitioned_chunk(v.partitioned())?;
             }
@@ -4199,7 +4321,12 @@ impl EngineCore {
                 &storage_lookup,
                 ledger_mode,
             )
-            .map_err(|e| self.reclassify_write_to_view_error(e))?;
+            .map_err(|e| {
+                self.reclassify_write_to_view_error_for(
+                    Some(crate::sql::allowlist::ViewWriteOp::Update),
+                    e,
+                )
+            })?;
             if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
                 self.check_partitioned_chunk(v.partitioned())?;
             }
@@ -4253,6 +4380,13 @@ impl EngineCore {
             return Ok(ParsedSql::DropIndex(stmt));
         }
 
+        // TABLE-42 (5)・Issue #1667: `DROP MATERIALIZED VIEW` も汎用 `DROP`（`DROP TABLE` 扱い）より
+        // 前に分岐する。構造検証のみでカタログを照会しない（`DropView` と同じ設計）。
+        if crate::sql::allowlist::is_drop_materialized_view_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_drop_materialized_view_tokens(&tokens)?;
+            return Ok(ParsedSql::DropMaterializedView(stmt));
+        }
+
         let is_drop_view_statement = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DROP")
@@ -4292,6 +4426,11 @@ impl EngineCore {
         if crate::sql::allowlist::is_create_materialized_view_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_materialized_view_tokens(&tokens)?;
             return Ok(ParsedSql::CreateMaterializedView(stmt));
+        }
+        // TABLE-42・Issue #1665: `REFRESH MATERIALIZED VIEW`。構造検証のみでカタログを照会しない。
+        if crate::sql::allowlist::is_refresh_materialized_view_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_refresh_materialized_view_tokens(&tokens)?;
+            return Ok(ParsedSql::RefreshMaterializedView(stmt));
         }
         // `CREATE VIEW` に加え `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）も同じ経路へ
         // 入れる。`CREATE OR REPLACE` の後が `VIEW` 以外（`TABLE`・`INDEX` 等）は従来どおり汎用経路で
@@ -4609,11 +4748,42 @@ impl EngineCore {
         // `INSERT INTO <表> ( <列> {, <列>} ) VALUES`（構文は `Parser::parse_insert` が
         // 保証する形。ここでは型の引き当てだけに使い、崩れていれば未解決として扱う）。
         let insert_target: Option<(String, Vec<String>)> = insert_target_from_tokens(tokens);
+        let is_insert = matches!(
+            tokens.first(),
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("INSERT")
+        );
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
+            let id_type = || Some(PreparedParamType::Column(ColumnMeta::Id));
+            let (schema, column) = match self.storage.get_table_schema(table) {
+                Ok(_) if column == "id" => return id_type(),
+                Ok(schema) => (schema, column.to_string()),
+                // 表でなければ、INSERT に限りビューの公開列を基表の列へ解決して型を引く
+                // （TABLE-43・Issue #1671）。公開名 `id` でも物理列へ解決してから疑似列かを
+                // 判定する（TEXT 列を `id` として公開するビューで `$n` を整数と誤推論しない）。
+                // 解決できなければ、`id` は従来どおり疑似列、他は未解決（`Text`）。
+                Err(_) if is_insert => {
+                    let resolved = self
+                        .storage
+                        .with_view_write_snapshot(table, |snap, _| {
+                            let (base, physical) = crate::sql::view_insert::resolve_insert_column(
+                                snap, table, column,
+                            )?;
+                            snap.table_schema(&base).ok().map(|s| (s, physical))
+                        })
+                        .ok()
+                        .flatten();
+                    match resolved {
+                        Some(r) => r,
+                        None if column == "id" => return id_type(),
+                        None => return None,
+                    }
+                }
+                Err(_) if column == "id" => return id_type(),
+                Err(_) => return None,
+            };
             if column == "id" {
-                return Some(PreparedParamType::Column(ColumnMeta::Id));
+                return id_type();
             }
-            let schema = self.storage.get_table_schema(table).ok()?;
             let def = schema.columns.iter().find(|c| c.name == column)?;
             Some(PreparedParamType::Column(ColumnMeta::Scalar {
                 name: def.name.clone(),
@@ -4958,6 +5128,13 @@ impl EngineCore {
                 )?;
                 Ok(crate::sql::SqlOutcome::Insert(outcome))
             }
+            ParsedSql::ViewInsert(stmt) => self
+                .execute_view_insert(
+                    || crate::tenant::WriteTarget::Autocommit(&self.storage),
+                    ctx,
+                    stmt,
+                )
+                .map(|(outcome, _base_table)| outcome),
             ParsedSql::Truncate(stmt) => {
                 let outcome = self.execute_truncate_form(ctx, stmt)?;
                 Ok(crate::sql::SqlOutcome::Truncate(outcome))
@@ -5172,10 +5349,23 @@ impl EngineCore {
                 let outcome = self.execute_create_materialized_view(ctx, session, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateMaterializedView(outcome))
             }
+            // TABLE-42・Issue #1665: 権限ゲートを名前解決より先に置く（`CREATE` と同じ）。
+            ParsedSql::RefreshMaterializedView(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = self.execute_refresh_materialized_view(ctx, session, stmt)?;
+                Ok(crate::sql::SqlOutcome::RefreshMaterializedView(outcome))
+            }
             ParsedSql::DropView(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 let outcome = crate::sql::ddl::execute_drop_view(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropView(outcome))
+            }
+            // TABLE-42 (5)・Issue #1667: `DropView` と同じ判定順序（DDL 権限ゲート → カタログ照会を
+            // 含む実行本体）。権限の無い主体には対象の有無を問わず常に `42501` のみを返す。
+            ParsedSql::DropMaterializedView(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_drop_materialized_view(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::DropMaterializedView(outcome))
             }
             // TASK-206・INDEX-7・SQL-23（Issue #908）: `DropTable`・`CreateView` と
             // 同じ判定順序（DDL 実行権限ゲート → カタログ照会を含む実行本体）。
@@ -5469,6 +5659,20 @@ impl EngineCore {
                     )
                 };
                 txn.mark_written(ctx.tenant_id(), &stmt.table_name);
+                Ok(outcome)
+            }
+            // ビューへの INSERT（TABLE-43・Issue #1671）。基表形へ書き換えて同じフォーム関数へ
+            // `InTxn` を渡す。台帳・`mark_written` は基表の単位（ビュー名ではない）。
+            ParsedSql::ViewInsert(stmt) => {
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let (outcome, base_table) = self.execute_view_insert(
+                    || crate::tenant::WriteTarget::InTxn(write_txn),
+                    ctx,
+                    stmt,
+                )?;
+                txn.mark_written(ctx.tenant_id(), &base_table);
                 Ok(outcome)
             }
             ParsedSql::Delete(stmt) => {
@@ -6227,6 +6431,41 @@ impl EngineCore {
                     None => Ok(None),
                 }
             }
+            // ビューへの INSERT（TABLE-43・Issue #1671）: 現在のカタログで書き換え、`RETURNING` の
+            // 列メタは基表の型で導き、列名だけビューの公開名へ上書きする。
+            ParsedSql::ViewInsert(stmt) => {
+                // 書き換えと基表スキーマは同一スナップショットから取る（A→B→A の置換で別の表を
+                // 引かないため）。
+                let (rewritten, schema) = self
+                    .storage
+                    .with_view_write_snapshot(stmt.view_name(), |snap, _| {
+                        let rewritten = crate::sql::view_insert::rewrite_view_insert(snap, stmt)?;
+                        let schema = snap.table_schema(&rewritten.insert.table_name).map_err(
+                            |e| match e {
+                                CatalogError::TableNotFound(name) => {
+                                    crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                                }
+                                other => crate::catalog::table_lookup_error(other),
+                            },
+                        )?;
+                        Ok::<_, crate::sql::allowlist::SqlSurfaceError>((rewritten, schema))
+                    })
+                    .map_err(crate::catalog::table_lookup_error)??;
+                match crate::sql::parser::bind_returning(
+                    rewritten.insert.returning.as_ref(),
+                    &schema,
+                )? {
+                    Some(projection) => {
+                        let mut columns = crate::sql::returning::column_meta(&projection, &schema)?;
+                        crate::sql::view_insert::apply_public_names(
+                            &mut columns,
+                            rewritten.public_names.as_deref(),
+                        );
+                        Ok(Some(columns))
+                    }
+                    None => Ok(None),
+                }
+            }
             ParsedSql::Truncate(_) => Ok(None),
             // `DROP TABLE`（Issue #902）は `CommandComplete` のみを返す DDL の
             // ため、`Truncate` と同じく結果列を持たない。DDL 実行権限判定・
@@ -6246,7 +6485,10 @@ impl EngineCore {
             ParsedSql::CreateView(_) => Ok(None),
             // TABLE-42・Issue #1664: DDL につき結果列を持たない（Describe は本体を実行しない）。
             ParsedSql::CreateMaterializedView(_) => Ok(None),
+            // TABLE-42・Issue #1665: REFRESH も結果列を持たない。
+            ParsedSql::RefreshMaterializedView(_) => Ok(None),
             ParsedSql::DropView(_) => Ok(None),
+            ParsedSql::DropMaterializedView(_) => Ok(None),
             // TASK-206・INDEX-7（Issue #908）: 索引 DDL も結果列を持たない。
             ParsedSql::CreateIndex(_) => Ok(None),
             ParsedSql::DropIndex(_) => Ok(None),
@@ -7687,6 +7929,25 @@ impl EngineCore {
             self.hnsw_state.is_some(),
         );
 
+        // INDEX-10（Issue #1650）: 式索引の式一致を、世代照合を通過した `post_check_txn`（`bind` 時と
+        // 同じ世代のカタログ）から確定する。式候補が無いクエリはカタログを読まない。opt-in なし
+        // （`declarations_enabled == false`）は空のマッチャで、実行時と同じく式候補は全走査になる。
+        let (explain_scalar_plan, expression_index_names) =
+            if explain_shape.needs_expression_matcher() {
+                let matcher = if self.hnsw_state.is_some() {
+                    crate::sql::scalar_index::resolve_expression_matcher_for_table_in_txn(
+                        &post_check_txn,
+                        table,
+                        &post_check_schema,
+                    )
+                } else {
+                    crate::sql::expression_key_index::ExpressionIndexMatcher::empty()
+                };
+                explain_shape.resolve_expressions(&matcher)
+            } else {
+                (explain_shape.scalar_plan(), Vec::new())
+            };
+
         // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する（多層防御。
         // `Statement::Select` アームの `USING PLAN` 経路と同じ理由）。
         dictionary_required_columns(&post_check_schema)
@@ -7732,7 +7993,7 @@ impl EngineCore {
         // Issue #2191: 照合込みの使用可否と縮退理由（実行時の `candidates_for` と同じ判定関数）。
         let scalar_plan_with_reason =
             crate::sql::scalar_index::scalar_plan_under_target_with_reason(
-                explain_shape.scalar_plan(),
+                explain_scalar_plan,
                 explain_shape.metadata_filter_columns(),
                 &explain_shape.text_uses(),
                 &post_check_schema,
@@ -7758,6 +8019,7 @@ impl EngineCore {
             scalar_plan_with_reason.0,
             scalar_plan_with_reason.1,
             scalar_filter_column_names.as_deref(),
+            &expression_index_names,
         );
         drop(post_check_txn);
         Ok(crate::sql::explain::build_explain_result_with_indexes(
@@ -7842,6 +8104,7 @@ impl EngineCore {
         scalar_plan: crate::sql::scalar_plan::ScalarPlan,
         scalar_fallback: Option<crate::sql::scalar_index::ScalarFallbackReason>,
         scalar_filter_columns: Option<&[&str]>,
+        expression_index_names: &[String],
     ) -> (
         crate::sql::explain::ExplainEngine,
         crate::sql::explain::ExplainIndexNames,
@@ -7907,10 +8170,19 @@ impl EngineCore {
         // 未キャッシュな走査が `EXPLAIN` の呼び出しごとに発生してしまう。
         // 両条件のいずれかが真の場合に限りカタログを読む（走査自体は
         // キャッシュしないが、不要な呼び出しでは行わない）。
+        //
+        // INDEX-10（Issue #1650）: 式索引の名前は呼び出し元が一致判定で確定済みなので、式述語だけの
+        // WHERE（列述語なし）でも名前を出せる。列名を確定できない（`scalar_filter_columns == None`）
+        // ときは従来どおり名前を出さない。索引カタログの読み取り（列被覆の判定用）が要るのは
+        // 列述語があるときだけ。
+        let scalar_columns_nonempty = scalar_filter_columns.is_some_and(|cols| !cols.is_empty());
         let scalar_names_eligible = declarations_enabled
             && !matches!(scalar_plan, crate::sql::scalar_plan::ScalarPlan::PlainScan)
-            && scalar_filter_columns.is_some_and(|cols| !cols.is_empty());
-        let index_decls = if declarations_enabled && (ann_names_eligible || scalar_names_eligible) {
+            && scalar_filter_columns.is_some()
+            && (scalar_columns_nonempty || !expression_index_names.is_empty());
+        let index_decls = if declarations_enabled
+            && (ann_names_eligible || (scalar_names_eligible && scalar_columns_nonempty))
+        {
             // Issue #1066: `Err`（走査上限超過・デコード失敗）は「名前を
             // 出さない」へ fail-closed に倒す（`EXPLAIN` 自体は失敗させ
             // ない。トークン〔`hnsw_enabled`〕は上記判定のまま変えない）。
@@ -7931,10 +8203,12 @@ impl EngineCore {
         // テーブル内容・行数に依存する実行時縮退を観測しない既存契約
         // （`docs/design/explain-search-engine-exposure.md`「決定 1」節）を
         // 優先し、意図的に静的判定のみを報告する。
-        let scalar_names = match (&index_decls, scalar_filter_columns) {
-            (Some(decls), Some(cols)) if scalar_names_eligible => {
-                scalar_index_names_for_columns(&decls.scalar, cols)
-            }
+        let scalar_names = match scalar_filter_columns {
+            Some(cols) if scalar_names_eligible => scalar_index_names_with_expressions(
+                index_decls.as_ref().map(|decls| decls.scalar.as_slice()),
+                cols,
+                expression_index_names,
+            ),
             _ => Vec::new(),
         };
 
@@ -8016,14 +8290,37 @@ impl EngineCore {
         let scalar_prefilter =
             crate::sql::plan::ExecutionPlan::from_evaluation_order(bound.evaluation_order())
                 .scalar_prefilter;
-        let scalar_plan_before_target = crate::sql::scalar_plan::classify_scalar_plan(
+        // INDEX-10（Issue #1650）: 実行時（`sql::exec`）と同じ式索引の一致判定を同一の `read_txn` から
+        // 解決して分類へ加える（式候補が無い・opt-in なしのクエリは空のマッチャ＝従来どおり）。
+        let expr_matcher = if scalar_prefilter {
+            crate::sql::scalar_index::resolve_expression_matcher_in_txn(
+                read_txn,
+                bound.table(),
+                schema,
+                self.hnsw_state.is_some(),
+                bound.expr_filters(),
+            )
+        } else {
+            crate::sql::expression_key_index::ExpressionIndexMatcher::empty()
+        };
+        let expr_finder = |e: &crate::sql::udf_call::BoundExpr,
+                           ty: crate::sql::udf_call::ExprType| {
+            expr_matcher.find(e, ty)
+        };
+        let scalar_plan_before_target = crate::sql::scalar_plan::classify_scalar_plan_with(
             &crate::sql::scalar_plan::ScalarShapeInput {
                 scalar_prefilter,
                 metadata_filters: bound.metadata_filters(),
                 expr_filters: bound.expr_filters(),
                 or_filters: bound.or_filters(),
             },
+            &expr_finder,
         );
+        let expression_index_names = crate::sql::scalar_plan::matched_expression_index_names(
+            bound.expr_filters(),
+            &expr_finder,
+        )
+        .unwrap_or_default();
         // Issue #1066: `metadata_filters` が参照する列を同一 `schema` で
         // 列名へ写像する（添字は `MetadataFilter::column_index` のドキュメント
         // どおり `schema.columns` と同一空間）。写像に失敗する列があれば
@@ -8073,6 +8370,7 @@ impl EngineCore {
             scalar_plan,
             scalar_fallback,
             scalar_filter_column_names.as_deref(),
+            &expression_index_names,
         );
         crate::sql::explain::build_search_explain_result(bound.mode(), &engine, &index_names)
     }
@@ -8143,8 +8441,20 @@ impl EngineCore {
             &schema.name,
             self.hnsw_state.is_some(),
         );
+        // INDEX-10（Issue #1650）: 実行時と同じ式索引の一致判定を同一の `read_txn` から解決する。
+        let expr_matcher = crate::sql::scalar_index::resolve_expression_matcher_in_txn(
+            read_txn,
+            &schema.name,
+            schema,
+            self.hnsw_state.is_some(),
+            bound.expr_filters(),
+        );
+        let expr_finder = |e: &crate::sql::udf_call::BoundExpr,
+                           ty: crate::sql::udf_call::ExprType| {
+            expr_matcher.find(e, ty)
+        };
         let (scalar_plan, scalar_fallback, access_path) =
-            crate::sql::aggregate::classify_aggregate_access(schema, bound, &target);
+            crate::sql::aggregate::classify_aggregate_access(schema, bound, &target, &expr_finder);
         // Issue #1066: `access_path`（上記 `target` 補正後の値）が
         // `ScalarIndexCandidates` のときに限り、`metadata_filters` の列が
         // すべて対象テーブルのスカラー宣言で被覆されているかを確認して索引名を
@@ -8156,6 +8466,11 @@ impl EngineCore {
             crate::sql::explain::AccessPath::ScalarIndexCandidates
         ) && self.hnsw_state.is_some()
         {
+            let expression_names = crate::sql::scalar_plan::matched_expression_index_names(
+                bound.expr_filters(),
+                &expr_finder,
+            )
+            .unwrap_or_default();
             match scalar_filter_column_names_with_numeric(
                 schema,
                 bound.metadata_filters(),
@@ -8165,12 +8480,20 @@ impl EngineCore {
                     match self.read_explain_index_names_in_txn(read_txn, bound.table()) {
                         Ok(decls) => crate::sql::explain::ExplainIndexNames::new(
                             Vec::new(),
-                            scalar_index_names_for_columns(&decls.scalar, &cols),
+                            scalar_index_names_with_expressions(
+                                Some(decls.scalar.as_slice()),
+                                &cols,
+                                &expression_names,
+                            ),
                         ),
                         Err(_) => crate::sql::explain::ExplainIndexNames::default(),
                     }
                 }
-                _ => crate::sql::explain::ExplainIndexNames::default(),
+                // 列述語が無く式述語だけ: 索引カタログを読まず、一致済みの式索引名だけを出す。
+                Some(_) => {
+                    crate::sql::explain::ExplainIndexNames::new(Vec::new(), expression_names)
+                }
+                None => crate::sql::explain::ExplainIndexNames::default(),
             }
         } else {
             crate::sql::explain::ExplainIndexNames::default()
@@ -10018,6 +10341,84 @@ impl EngineCore {
             &stmt,
             &lookup,
         )
+    }
+
+    /// ビューへの `INSERT`（TABLE-43・Issue #1671）の実行本体。autocommit 腕・明示トランザクション腕
+    /// から呼ばれる。現在のカタログでビューを基表形の INSERT へ書き換え
+    /// （[`crate::sql::view_insert::rewrite_view_insert`]）、既存の基表 INSERT 経路
+    /// （[`Self::execute_insert_form`]／[`Self::execute_insert_returning_form`]）へ流す。制約・
+    /// `--max-insert-rows`・INDEX-4 上限・テナント所有・台帳は基表への書き込みと同じ。
+    ///
+    /// 書き換え後に並行 DDL でビュー連鎖・基表スキーマが変わる TOCTOU は、書き換えの**前に**取った
+    /// 指紋（[`Storage::view_write_fingerprint`]）を [`crate::sql::view_write_scope`] 経由で書き込み
+    /// txn の冒頭に照合して検出する（不一致は書き込み前に中断。`CREATE OR REPLACE VIEW` と同じ型の
+    /// 上限つき再試行。上限到達は `55P03`）。明示トランザクションでも照合は書き込み前に失敗するため、
+    /// 共有 write txn は汚れず再試行できる。`make_target` は試行ごとに書き込み先を作る。
+    /// 戻り値の第 2 要素は書き換え後の基表名（`mark_written` 用）。
+    fn execute_view_insert<'t>(
+        &self,
+        make_target: impl Fn() -> crate::tenant::WriteTarget<'t>,
+        ctx: &PolicyContext,
+        stmt: &crate::sql::allowlist::ValidatedViewInsert,
+    ) -> Result<(crate::sql::SqlOutcome, String), crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
+        // 並行 DDL による再試行の上限（`CREATE OR REPLACE VIEW` の再試行と同じ小さな固定値の考え方）。
+        const MAX_ATTEMPTS: usize = 8;
+        for _ in 0..MAX_ATTEMPTS {
+            // 指紋・ビュー解決・基表スキーマを同一 read スナップショットから取る（別々の読み取りだと、
+            // ビューが A→B→A と置換されたとき指紋は一致するのに別の表へ書く状態を作れる）。
+            let snapshot = self
+                .storage
+                .with_view_write_snapshot(stmt.view_name(), |snap, fingerprint| {
+                    let rewritten = crate::sql::view_insert::rewrite_view_insert(snap, stmt)?;
+                    let schema = snap
+                        .table_schema(&rewritten.insert.table_name)
+                        .map_err(|e| match e {
+                            CatalogError::TableNotFound(name) => {
+                                SqlSurfaceError::UndefinedTable { name }
+                            }
+                            other => crate::catalog::table_lookup_error(other),
+                        })?;
+                    Ok::<_, SqlSurfaceError>((fingerprint, rewritten, schema))
+                })
+                .map_err(crate::catalog::table_lookup_error)?;
+            // スナップショット内の解決エラーはその時点の状態に対する正当なエラー。
+            let (fingerprint, rewritten, schema) = snapshot?;
+            let base_table = rewritten.insert.table_name.clone();
+            let scope = crate::sql::view_write_scope::ViewWriteScope::enter(
+                stmt.view_name(),
+                fingerprint.clone(),
+            );
+            let lookup = InsertSchemaLookup::with_schema(&self.storage, &base_table, schema);
+            let result = if rewritten.insert.returning.is_some() {
+                self.execute_insert_returning_form(make_target(), ctx, &rewritten.insert, &lookup)
+                    .map(|mut outcome| {
+                        crate::sql::view_insert::apply_public_names(
+                            &mut outcome.result.columns,
+                            rewritten.public_names.as_deref(),
+                        );
+                        crate::sql::SqlOutcome::Returning(outcome)
+                    })
+            } else {
+                self.execute_insert_form(make_target(), ctx, &rewritten.insert, &lookup)
+                    .map(crate::sql::SqlOutcome::Insert)
+            };
+            if scope.mismatched() {
+                continue;
+            }
+            // 書き込み txn 前に失敗した場合（`verify_in_txn` に到達しなかった）でも、その間に
+            // 並行 DDL が入っていたなら失敗はスナップショット由来の陳腐化なので再試行する。
+            // 指紋の再取得に失敗したときは元のエラーを返す（fail-closed）。
+            if result.is_err() {
+                if let Ok(current) = self.storage.view_write_fingerprint(stmt.view_name()) {
+                    if current != fingerprint {
+                        continue;
+                    }
+                }
+            }
+            return result.map(|outcome| (outcome, base_table));
+        }
+        Err(SqlSurfaceError::LockNotAvailable)
     }
 
     /// [`Self::execute_insert_sql`]・[`Self::execute_sql_in_session`] の

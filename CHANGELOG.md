@@ -9,6 +9,64 @@
 
 ### Breaking Changes
 
+- 部分索引の格納と DML 維持（Issue #1654・INDEX-11）: 従来 `0A000` だった `CREATE INDEX ... WHERE <述語>` の
+  決定的な述語を、書き込みトランザクション内で束縛して正規化テキストを永続化する（SQLSTATE が `0A000` から
+  成功、または未知列 `42703`・セッション依存の述語 `42P17`・予約列と `visible()` `42601` 等へ変わる）。
+  述語を満たす行だけが索引化され、`INSERT`／`UPDATE`／UPSERT／`COPY` は述語が TRUE の行でだけ式要素を評価する
+  （NULL・FALSE の行は索引外。述語の評価エラーは文を拒否し、`CREATE INDEX` は既存行を全件検証する）。
+  `UNIQUE`・`USING hnsw`・`COLLATE`・マテリアライズドビューとの組み合わせは引き続き `0A000`。参照列の
+  `DROP COLUMN` は部分索引を連鎖削除し、`RENAME COLUMN` は述語を追随させ、述語・要素が参照する列の
+  `ALTER COLUMN TYPE` は `0A000`。部分索引はプランナ選択（#1656）まで結果・`EXPLAIN` に影響しない。
+  公開 API は `IndexDef.predicate`（pub フィールド追加）・`IndexPredicateDef`・`IndexDef::with_predicate`・
+  `IndexDef::has_predicate` の追加。述語付きの宣言のカタログ形式は新版 `v6`（`v1`〜`v5` のバイト列は不変。旧バイナリは
+  `v6` を読めない）。公開の `Storage::create_index` は述語付きの `IndexDef` を `Invalid` で拒否する
+  （SQL 表層のみが作成できる）。
+- 式索引の UNIQUE と失効管理（Issue #1651・INDEX-9・INDEX-10）: 従来 `0A000` だった
+  `CREATE UNIQUE INDEX ... ((<式>))`（列要素との複合を含む）を受理し、式の値の一意性を全書き込み経路で
+  `23505` により強制する（NULL は重複しない・テナントごとに独立・不可視行とも衝突）。作成時に既存行へ
+  重複があれば `23505` で拒否する（索引は残らない）。参照列の `DROP COLUMN` は一意の式索引も連鎖削除し、
+  `RENAME COLUMN` は式テキストを追随させ、`ALTER COLUMN TYPE` は式を再束縛して既存行を再検証する
+  （従来の `0A000` を撤去）。一意の式索引のカタログ形式は新版 `v5`（`v1`〜`v4` のバイト列は不変。旧バイナリは
+  `v5` を読めない）。永続一意索引（`user_uniq`）の `FORMAT_VERSION` を 2 から 3 へ上げたため、既存の
+  全テナントは初回の書き込み時に一意索引を 1 回だけ再構築する（その回のみ O(n)）。
+- 式索引のプランナ選択（Issue #1650・INDEX-10・INDEX-7）: WHERE の `<式> op <リテラル>`（`op` は `=`／`<`／`<=`／
+  `>`／`>=`）が宣言済みの式索引と構造一致したときだけ、式キー索引で候補を絞る。一致しない形・宣言なし・
+  起動時 opt-in なしは従来どおりの全走査で、結果は変わらない。`EXPLAIN` の `scalar_plan:` 行（検索・集計・
+  `USING PLAN`）に `index=<式索引名>` を出す（語彙は増やさない）。公開 API は `sql::explain::ExplainShape` が
+  `Copy`・`Eq` でなくなる（式候補を保持するため。`from_filters` のシグネチャは不変）。
+- 式索引の DML 維持（Issue #1649・INDEX-10）: 式索引を持つテーブルへの `INSERT`／`UPDATE`／UPSERT／`COPY`
+  （参照アクションによる子表の更新を含む）が、式の評価エラー（0 除算 `22012` 等）・非有限値（`22003`）で
+  失敗する（副作用ゼロ）。NULL を返す行は許容する。`CREATE INDEX ... ((<式>))` は保存前に既存行を全件検証し、
+  失敗行があれば拒否する（応答は固定文言）。公開 API は `TenantWriteError::IndexExpressionEvaluationFailed`
+  の追加（`#[non_exhaustive]` ではないため網羅的 `match` の下流は追随が必要）。
+- 式索引の格納（Issue #1648・INDEX-10）: 従来 `0A000` だった `CREATE INDEX ... ((<式>))`／`(f(col))` のうち
+  決定的な式を、書き込みトランザクション内で束縛して永続化する（未知列 `42703`・型不整合は束縛側の
+  SQLSTATE・型で決まる非決定性 `42P17`・索引化できない結果型 `0A000`）。`UNIQUE`・`USING hnsw`・式への
+  `COLLATE` との組み合わせは引き続き `0A000`。参照列の `DROP COLUMN` は式索引を連鎖削除し、
+  `RENAME COLUMN`／`ALTER COLUMN TYPE` は `0A000`。公開 API は `IndexDef.expressions`（pub フィールド追加）・
+  `IndexExpressionDef`・`IndexDef::with_expressions` の追加。式を含む宣言のカタログ形式は新版 `v4`
+  （`v1`／`v2`／`v3` のバイト列は不変。旧バイナリは `v4` を読めない）。公開の `Storage::create_index` は
+  式付きの `IndexDef` を `Invalid` で拒否する（SQL 表層のみが作成できる）。
+- `REFRESH MATERIALIZED VIEW [CONCURRENTLY] <名前> [WITH [NO] DATA]`（Issue #1665・TABLE-42）:
+  従来 `42601` だった構文を受理し、全文脈の実体を同じスナップショットから単一トランザクションで作り直す。
+  失敗時は旧実体が残る。`WITH NO DATA` は実体を破棄して未実体化（`55000`）にする。タグは固定の
+  `REFRESH MATERIALIZED VIEW`。`CONCURRENTLY` は #1666 で本実装済み。公開 API は
+  `ParsedSql::RefreshMaterializedView`・`SqlOutcome::RefreshMaterializedView`・
+  `ddl::RefreshMaterializedViewOutcome` を追加する。
+
+- `REFRESH MATERIALIZED VIEW CONCURRENTLY`（Issue #1666・TABLE-42 (4)）: 従来の暫定 `0A000` をやめて受理する。
+  未実体化は `0A000`、WHERE を持たない列の UNIQUE 索引が無ければ `55000`（固定文言）で、いずれも旧実体が残る。
+  前提を満たせば非 CONCURRENTLY と同じ結果になる。`CONCURRENTLY` と `WITH NO DATA` の併用は `42601`。公開 API は
+  `SqlSurfaceError::MaterializedViewNotRefreshableConcurrently` を追加する。
+
+- `DROP MATERIALIZED VIEW [IF EXISTS] <名前>[, ...] [CASCADE | RESTRICT]` と matview への索引（Issue #1667・
+  TABLE-42 (5)(6)・TABLE-37）: 従来 `42601` だった `DROP MATERIALIZED VIEW` を受理する（複数指定は単一 txn で原子的、
+  表・ビュー・索引名の指定は `IF EXISTS` でも `42809`、依存する matview は RESTRICT で `2BP01`、CASCADE で依存する
+  側から削除）。表・ビューの `DROP ... CASCADE` は依存 matview を推移的に削除する（従来は #1663 の暫定ガードで
+  `2BP01`）。matview への `CREATE [UNIQUE] INDEX` は従来 `42809` だったが宣言を受理する（スカラーのみ。
+  `USING hnsw` は `0A000`、暗黙の `id` 列は無く `42703`）。UNIQUE 索引は文脈（テナント）ごとに一意性を強制し、
+  重複は `23505`（固定文言）。公開 API は `ParsedSql::DropMaterializedView`・`SqlOutcome::DropMaterializedView`・
+  `CascadedObject::MaterializedView` の追加。
 - `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <名前> [(<別名>, ...)] AS <本文> [WITH [NO] DATA]`（Issue #1664・TABLE-42）:
   従来 `42601` だった構文を受理し、実体化対象の文脈ごとに本文を評価した結果を単一トランザクションで保存する。
   読み取りは読み手の文脈に一致する実体だけを返し、実体が無ければ新分類 `55000`（HTTP 射影は 409）。
@@ -17,7 +75,7 @@
   `SqlOutcome::CreateMaterializedView`・`SqlSurfaceError::MaterializedViewNotPopulated`・
   `ErrorClass::ObjectNotInPrerequisiteState` の追加と、`TableLookup::materialized_view_columns`（既定実装あり）の追加。
   matview が直接参照する表への `DROP COLUMN`（`2BP01`）・`ALTER COLUMN TYPE`／`RENAME COLUMN`（`0A000`）は
-  列単位の追随（#1667）まで拒否する。
+  列単位の追随（別 Issue で追跡）まで拒否する。
 - `TRUNCATE ... [CASCADE | RESTRICT]`（Issue #1644・SQL-48 (2)）: 従来 `42601` だった `CASCADE`／`RESTRICT` を
   受理する（省略時は RESTRICT）。RESTRICT は指定していない表の FK が参照する表の `TRUNCATE` を、参照元の
   行の有無・他テナントの行に関係なくカタログ宣言だけで `0A000` で拒否する（従来は行を消した後の事後検査で
@@ -48,6 +106,11 @@
   `((col))` は通常の列索引として作成できる。公開 API は `SqlSurfaceError`（`InvalidObjectDefinition`・
   `GroupingError`・`WindowingError`）・`ErrorClass`（同名 3 分類）への variant 追加と
   `ValidatedCreateIndex::expression_keys` の追加。
+- 部分索引の述語 parser と決定性検査（Issue #1653・INDEX-11）: `CREATE INDEX ... WHERE <述語>` の述語を
+  解析し、非決定を `42P17`、集計を `42803`、ウィンドウを `42P20`、部分クエリ・SRF・組み込み以外の
+  関数を `0A000`、`visible()` と構文誤りを `42601` で拒否する（従来は `WHERE` を一律 `0A000`）。
+  決定的な述語も後続 Issue（#1654）までは `0A000`（部分索引は作成できない）。公開 API は
+  `ValidatedCreateIndex::predicate` の追加。
 - `DROP TABLE a, b`（Issue #1639・TABLE-37 (1)）: 従来 `42601` だった複数テーブル指定を受理する。
   文全体を 1 つの write txn で原子的に実行し（不在・種類違い・依存のどれか 1 つでもあれば何も削除しない）、
   同じ文に並べた名前どうしの依存は数えない。`CASCADE`／`RESTRICT` は従来どおり `42601`。公開 API は

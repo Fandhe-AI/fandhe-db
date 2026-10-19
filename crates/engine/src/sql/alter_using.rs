@@ -340,6 +340,8 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::InFailedSqlTransaction
         | E::LockNotAvailable
         | E::MaterializedViewNotPopulated
+        | E::MaterializedViewNotRefreshableConcurrently
+        | E::ViewNotAutoUpdatable { .. }
         | E::PartitionedDmlInTransaction
         | E::InsufficientPrivilege
         | E::ConflictTargetNotVisible

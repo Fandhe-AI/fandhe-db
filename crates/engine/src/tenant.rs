@@ -418,6 +418,16 @@ pub enum TenantWriteError {
     /// 再束縛失敗（漂流）は本 variant ではなく引き続き
     /// [`TenantWriteError::Catalog`]（`CorruptSchema`。`XX000`）が担う。
     CheckEvaluationFailed(SqlSurfaceError),
+    /// 式索引（`CREATE INDEX ... ((<式>))`。INDEX-10、Issue #1649）の式を、書き込もうとした
+    /// 行の値で評価できなかった（0 除算 `22012`・範囲外／非有限 `22003` 等）。式索引は
+    /// 「全行で式が評価でき索引化できる」不変条件の下でだけ派生索引を作り直せるため、
+    /// 評価エラーを握りつぶさず fail-closed に文を拒否する（副作用ゼロ）。
+    /// [`TenantWriteError::CheckEvaluationFailed`] と同じく内側の [`SqlSurfaceError`] を
+    /// そのまま保持して通常の式評価と同じ `wire_code` で返す。評価は書き込んだ自テナントの
+    /// 行だけに対して行い、他テナントの存在オラクルにならない。`Display`／`Debug` は値を含めない。
+    /// **BREAKING CHANGE**（Issue #1649）: variant を追加した（本 enum は `#[non_exhaustive]`
+    /// ではないため網羅的 `match` の下流は追随が必要）。
+    IndexExpressionEvaluationFailed(SqlSurfaceError),
     /// `UPDATE ... SET <col> = <式>` の右辺式の評価・列型への変換が失敗した、または
     /// 式を含む SET の `content_hash` を計算できなかった（Issue #1544・SQL-45 のポインタ。
     /// 0 除算 `22012`・範囲外 `22003`・NOT NULL 列への NULL `23502` 等）。
@@ -511,6 +521,9 @@ impl<'a> WriteTarget<'a> {
                 let write_txn = storage
                     .begin_write_txn()
                     .map_err(|e| Er::from(convert_write_txn_err(e)))?;
+                // ビュー経由の書き込み（TABLE-43・Issue #1671）なら、書き換え時点の定義と照合する。
+                // 不一致は書き込み前に `Err` で返り、`write_txn` は drop（abort）される。
+                verify_view_write_scope(&write_txn).map_err(Er::from)?;
                 let (value, effect) = f(&write_txn)?;
                 match effect {
                     TxnEffect::Wrote => crate::recovery::commit_boundary::commit(write_txn)
@@ -520,7 +533,11 @@ impl<'a> WriteTarget<'a> {
                 }
                 Ok(value)
             }
-            WriteTarget::InTxn(write_txn) => f(write_txn).map(|(value, _)| value),
+            WriteTarget::InTxn(write_txn) => {
+                // 照合は書き込み前に失敗するため、共有 `write_txn` は汚れない（再試行しても安全）。
+                verify_view_write_scope(write_txn).map_err(Er::from)?;
+                f(write_txn).map(|(value, _)| value)
+            }
         }
     }
 
@@ -538,6 +555,12 @@ impl<'a> WriteTarget<'a> {
             WriteTarget::InTxn(_) => crate::constraint::FkCheckMode::ImmediateOnly,
         }
     }
+}
+
+/// [`WriteTarget::with_txn`] の冒頭で呼ぶ、ビュー経由の書き込み区間の指紋照合
+/// （`sql::view_write_scope`。区間外では何もしない。TABLE-43・Issue #1671）。
+fn verify_view_write_scope(write_txn: &redb::WriteTransaction) -> Result<(), TenantWriteError> {
+    crate::sql::view_write_scope::verify_in_txn(write_txn).map_err(TenantWriteError::Catalog)
 }
 
 /// [`WriteTarget::with_txn`] に渡すクロージャが、書き込みを行ったかどうかを
@@ -590,6 +613,9 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             // （通常の式評価と同じ分類。ERR-2 の SSOT を経由するため、CHECK 専用の
             // 分類テーブルを別途持たない）。
             TenantWriteError::CheckEvaluationFailed(inner) => {
+                crate::error_format::ClassifiedError::error_class(inner)
+            }
+            TenantWriteError::IndexExpressionEvaluationFailed(inner) => {
                 crate::error_format::ClassifiedError::error_class(inner)
             }
             TenantWriteError::SetExpressionEvaluationFailed(inner) => {
@@ -669,6 +695,9 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::CheckEvaluationFailed(inner) => {
                 write!(f, "{}", inner.client_message())
             }
+            TenantWriteError::IndexExpressionEvaluationFailed(inner) => {
+                write!(f, "{}", inner.client_message())
+            }
             TenantWriteError::SetExpressionEvaluationFailed(inner) => {
                 write!(f, "{}", inner.client_message())
             }
@@ -725,6 +754,9 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::CheckViolation { .. } => f.write_str("CheckViolation(<redacted>)"),
             TenantWriteError::CheckEvaluationFailed(_) => {
                 f.write_str("CheckEvaluationFailed(<redacted>)")
+            }
+            TenantWriteError::IndexExpressionEvaluationFailed(_) => {
+                f.write_str("IndexExpressionEvaluationFailed(<redacted>)")
             }
             TenantWriteError::SetExpressionEvaluationFailed(_) => {
                 f.write_str("SetExpressionEvaluationFailed(<redacted>)")

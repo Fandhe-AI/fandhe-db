@@ -772,3 +772,68 @@ fn create_index_defers_scalar_index_build_to_next_query() {
         core.scalar_index_cache_stats()
     );
 }
+/// 式索引の宣言（INDEX-10、Issue #1648）は、opt-in の有無にかかわらず、クエリ結果・RLS 境界・
+/// 列索引の経路を変えない（式キーは現状どこからも消費されない派生物で、候補を狭めるだけ）。
+/// 式のみの宣言は列宣言ではないため、`Declared` の絞り込み（宣言外列の plain scan 縮退）を
+/// 起こさない。
+#[test]
+fn expression_declaration_does_not_change_query_results_or_column_index_paths() {
+    let path = unique_db_path("index-decl-expression");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_with_vector("docs"))
+        .expect("create table");
+    let vectors = gen_vectors(6, DIM as usize, HNSW_ROWS);
+    seed_rows(&storage, "docs", "tenant-a", &vectors, "base");
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+    let mut session = allowed_session();
+    let q0 = &vectors[0];
+    let dist = |col: &str, val: &str| {
+        format!(
+            "SELECT id FROM docs WHERE {col} = '{val}' ORDER BY embedding <=> '{}' LIMIT 5",
+            vec_literal(q0)
+        )
+    };
+    let ids = |sql: &str| -> Vec<u64> {
+        core.execute_sql(&ctx("tenant-a"), sql)
+            .expect("query")
+            .rows
+            .iter()
+            .map(|r| r.id)
+            .collect()
+    };
+    let (lang_before, topic_before) = (ids(&dist("lang", "ja")), ids(&dist("topic", "alpha")));
+    assert!(!lang_before.is_empty() && !topic_before.is_empty());
+
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_expr ON docs ((lower(lang)))",
+    )
+    .expect("declare expression index");
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_expr2 ON docs ((length(topic) + 1))",
+    )
+    .expect("declare second expression index");
+
+    // 結果は不変。式のみの宣言は Auto のまま（宣言外列を plain scan へ縮退させない）。
+    assert_eq!(ids(&dist("lang", "ja")), lang_before);
+    assert_eq!(ids(&dist("topic", "alpha")), topic_before);
+    let before = core.scalar_index_cache_stats().plain_scan_fallbacks;
+    assert_eq!(ids(&dist("topic", "alpha")), topic_before);
+    assert_eq!(
+        core.scalar_index_cache_stats().plain_scan_fallbacks,
+        before,
+        "expression-only declarations must not narrow the column index target"
+    );
+
+    // 式索引を落としても結果は同じ。
+    core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "DROP INDEX idx_expr")
+        .expect("drop expression index");
+    assert_eq!(ids(&dist("lang", "ja")), lang_before);
+}

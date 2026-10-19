@@ -500,6 +500,44 @@ fn truncate_for_error(s: &str) -> String {
     }
 }
 
+/// ビューへの書き込み文の種別（TABLE-43・Issue #1670）。自動更新可能でないビューへの書き込みを
+/// `55000` で拒否するときの固定文言の選択にだけ使う（`core.rs` の書き込み経路が渡す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewWriteOp {
+    /// `INSERT`（`ON CONFLICT`・UPSERT を含む）。
+    Insert,
+    /// `UPDATE`。
+    Update,
+    /// `DELETE`。
+    Delete,
+}
+
+/// ビューが自動更新可能でない理由（TABLE-43・Issue #1670）。`sql::view_updatable` の判定結果で、
+/// wire 文言には出さない（固定文言のみ）。テストと将来の診断用に区別して保持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewNotUpdatableReason {
+    /// `SELECT DISTINCT`。
+    Distinct,
+    /// `GROUP BY`。
+    GroupBy,
+    /// `HAVING`。
+    Having,
+    /// `UNION`／`INTERSECT`／`EXCEPT`。
+    SetOperation,
+    /// `WITH`（CTE）。
+    With,
+    /// `LIMIT`／`OFFSET`。
+    LimitOffset,
+    /// 集計関数（`COUNT` 等）。
+    Aggregate,
+    /// ウィンドウ関数（`OVER`）。
+    Window,
+    /// 単一の表・ビューではない（`JOIN`）。
+    NotSingleRelation,
+    /// 下位の relation（ビュー連鎖の内側・matview）が自動更新可能でない。
+    UnderlyingNotUpdatable,
+}
+
 /// SQL 表層のエラー型。ERR-2 参照（docs/spec/04-behavior/error-format.md）。
 /// engine 全体の共通エラー型統合は他タスクの管轄のため、本モジュールローカルの
 /// 型として定義する。
@@ -640,6 +678,17 @@ pub enum SqlSurfaceError {
     /// 未実体化の MATERIALIZED VIEW を読んだ（`55000`。TABLE-42・Issue #1664）。
     /// 文言は固定で、名前・件数・他文脈の情報を含めない。
     MaterializedViewNotPopulated,
+    /// `REFRESH MATERIALIZED VIEW CONCURRENTLY` の前提（WHERE を持たない列の UNIQUE 索引）を
+    /// 満たさない（`55000`。TABLE-42 (4)・Issue #1666）。文言は固定で、名前・索引・件数を含めない。
+    MaterializedViewNotRefreshableConcurrently,
+    /// 自動更新可能でないビューへの `INSERT`／`UPDATE`／`DELETE`（`55000`。TABLE-43 (3)・
+    /// Issue #1670）。文言は文種別ごとの固定文言で、ビュー名・理由・本文を含めない。
+    ViewNotAutoUpdatable {
+        /// 拒否した書き込み文の種別。
+        op: ViewWriteOp,
+        /// 自動更新不可と判定した理由（wire へは出さない）。
+        reason: ViewNotUpdatableReason,
+    },
     /// 明示トランザクション（SQL-31・TASK-221）内で構文としては受理されるものの、
     /// 本実装がトランザクション文脈での実行に未対応な文（複数行/ファイル形/
     /// `ON CONFLICT` の `INSERT`・`UPDATE`・`DELETE`・`UPSERT`・COPY・既に書き込んだ
@@ -1197,7 +1246,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::NoActiveSqlTransaction => ErrorClass::NoActiveSqlTransaction,
             SqlSurfaceError::InFailedSqlTransaction => ErrorClass::InFailedSqlTransaction,
             SqlSurfaceError::LockNotAvailable => ErrorClass::LockNotAvailable,
-            SqlSurfaceError::MaterializedViewNotPopulated => {
+            SqlSurfaceError::MaterializedViewNotPopulated
+            | SqlSurfaceError::MaterializedViewNotRefreshableConcurrently
+            | SqlSurfaceError::ViewNotAutoUpdatable { .. } => {
                 ErrorClass::ObjectNotInPrerequisiteState
             }
             SqlSurfaceError::TransactionFeatureNotSupported { .. } => {
@@ -1352,6 +1403,14 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::MaterializedViewNotPopulated => {
                 write!(f, "materialized view has not been populated")
             }
+            SqlSurfaceError::MaterializedViewNotRefreshableConcurrently => {
+                write!(f, "cannot refresh materialized view concurrently")
+            }
+            SqlSurfaceError::ViewNotAutoUpdatable { op, .. } => match op {
+                ViewWriteOp::Insert => write!(f, "cannot insert into view"),
+                ViewWriteOp::Update => write!(f, "cannot update view"),
+                ViewWriteOp::Delete => write!(f, "cannot delete from view"),
+            },
             SqlSurfaceError::TransactionFeatureNotSupported { detail } => {
                 write!(f, "not supported inside an explicit transaction: {detail}")
             }
@@ -3299,6 +3358,33 @@ pub struct ValidatedInsert {
     /// （全行が同じ衝突分岐を共有する）。ファイル形 INSERT との併用は
     /// `sql::parser::bind_insert_form` が `42601` で拒否する。
     pub on_conflict: Option<OnConflictClause>,
+}
+
+/// 構造検証を通過した、ビューへの `INSERT` 文（TABLE-43・Issue #1671）。送られた文の形
+/// （ビュー名と公開名の列）をそのまま保持し、基表への書き換えは Execute 時に現在のカタログで行う
+/// （拡張クエリプロトコルでは Parse と Execute の間に `CREATE OR REPLACE VIEW`／`DROP VIEW` が入りうる
+/// ため、Parse 時点の写像を持ち越さない）。`core.rs` の `ParsedSql::ViewInsert` が保持し、
+/// `sql::view_insert::rewrite_view_insert` が基表形の [`ValidatedInsert`] へ写す。
+/// フィールドは非公開（将来の拡張を非破壊に保つ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedViewInsert {
+    pub(crate) shape: ValidatedInsert,
+}
+
+impl ValidatedViewInsert {
+    pub(crate) fn new(shape: ValidatedInsert) -> Self {
+        ValidatedViewInsert { shape }
+    }
+
+    /// INTO に指定されたビュー名。
+    pub fn view_name(&self) -> &str {
+        &self.shape.table_name
+    }
+
+    /// 文末句で搬送された `operation_id`（`USING OPERATION_ID`）。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        self.shape.operation_id.as_ref()
+    }
 }
 
 /// 許可形状の構造判定を通過した単一行・`id` 指定形 `DELETE` 文（SQL-18・
@@ -10905,6 +10991,26 @@ impl<'a> Parser<'a> {
         Ok((name, if_not_exists, aliases, self.remaining()))
     }
 
+    /// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] <name>` の前置部を読む（TABLE-42・Issue #1665）。
+    /// 戻り値は `(名前, CONCURRENTLY の有無, 名前以降の残りトークン)`。残りの
+    /// `WITH [NO] DATA` と `;` の剥離・余剰トークンの拒否は呼び出し元
+    /// （[`validate_refresh_materialized_view_tokens`]）が担う。
+    fn parse_refresh_materialized_view(
+        &mut self,
+    ) -> Result<(String, bool, &[Token]), SqlSurfaceError> {
+        self.expect_ident_matching("REFRESH")?;
+        self.expect_ident_matching("MATERIALIZED")?;
+        self.expect_ident_matching("VIEW")?;
+        let concurrently = if self.peek_ident_matches("CONCURRENTLY") {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        Ok((name, concurrently, self.remaining()))
+    }
+
     /// `DROP VIEW [IF EXISTS] <name> [CASCADE | RESTRICT] [;]`（TABLE-18・SQL-23・TASK-205、
     /// Issue #909。`IF EXISTS` は Issue #1614、`CASCADE`／`RESTRICT` は TABLE-37・Issue #1641）。
     /// 複数ビュー列挙は構造的に受理しない。戻り値は `(ビュー名, IF EXISTS の有無, 動作)`。
@@ -10915,6 +11021,25 @@ impl<'a> Parser<'a> {
         let name = self.expect_ident()?;
         let behavior = self.parse_optional_drop_behavior();
         Ok((name, if_exists, behavior))
+    }
+
+    /// `DROP MATERIALIZED VIEW [IF EXISTS] <name>[, <name> ...] [CASCADE | RESTRICT] [;]`
+    /// （TABLE-42 (5)・TABLE-37、Issue #1667）。複数指定の構文は `DROP TABLE` と同じ。
+    /// 戻り値は `(名前の列, IF EXISTS の有無, 動作)`。
+    fn parse_drop_materialized_view(
+        &mut self,
+    ) -> Result<(Vec<String>, bool, DropBehavior), SqlSurfaceError> {
+        self.expect_ident_matching("DROP")?;
+        self.expect_ident_matching("MATERIALIZED")?;
+        self.expect_ident_matching("VIEW")?;
+        let if_exists = self.consume_if_exists();
+        let mut names = vec![self.expect_ident()?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            names.push(self.expect_ident()?);
+        }
+        let behavior = self.parse_optional_drop_behavior();
+        Ok((names, if_exists, behavior))
     }
 
     /// `WITH <name> AS (<body>)[, <name> AS (<body>)]*`（非再帰 CTE。SQL-29 (b)・
@@ -11843,6 +11968,36 @@ impl ValidatedCreateView {
     }
 }
 
+/// `DROP MATERIALIZED VIEW [IF EXISTS] <name>[, <name> ...] [CASCADE | RESTRICT]` の許可形状構造
+/// 検証結果（TABLE-42 (5)・TABLE-37・TABLE-36 (4)、Issue #1667）。[`ValidatedDropTable`] と同じく
+/// カタログ照会を一切行わない（DDL 権限ゲートを名前解決より先に通す契約）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedDropMaterializedView {
+    /// 名前（記述順。重複は実行側で除去する）。
+    pub(crate) names: Vec<String>,
+    /// `IF EXISTS` 句の有無。
+    pub(crate) if_exists: bool,
+    /// `CASCADE`／`RESTRICT` 句。省略時は `Restrict`。
+    pub(crate) behavior: DropBehavior,
+}
+
+impl ValidatedDropMaterializedView {
+    /// 対象 matview 名（記述順）。
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// `IF EXISTS` が指定されたか。
+    pub fn if_exists(&self) -> bool {
+        self.if_exists
+    }
+
+    /// `CASCADE`／`RESTRICT` 句の指定（省略時は `Restrict`）。
+    pub fn behavior(&self) -> DropBehavior {
+        self.behavior
+    }
+}
+
 /// `DROP VIEW <name>` の許可形状構造検証結果（TABLE-18・SQL-23・TASK-205、
 /// Issue #909）。[`ValidatedDropTable`] と同じくカタログ照会を一切行わない。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12040,6 +12195,66 @@ pub(crate) fn validate_create_materialized_view_tokens(
     })
 }
 
+/// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] <name> [WITH [NO] DATA] [;]` の許可形状構造検証結果
+/// （TABLE-42 (1)(3)(4)・Issue #1665）。カタログを一切照会しない（DDL 権限ゲート・存在確認・種別判定・
+/// 再実体化は実行段 `core/matview_exec.rs` が担う。判定順序は `CreateMaterializedView` と同じ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedRefreshMaterializedView {
+    pub(crate) name: String,
+    /// `CONCURRENTLY` の有無（実行段で未実体化 `0A000`／適格な UNIQUE 索引なし `55000` を検査。Issue #1666）。
+    pub(crate) concurrently: bool,
+    /// `WITH DATA`（省略時の既定）なら真、`WITH NO DATA` なら偽。
+    pub(crate) with_data: bool,
+}
+
+impl ValidatedRefreshMaterializedView {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// `CONCURRENTLY` が指定されたか。
+    pub fn concurrently(&self) -> bool {
+        self.concurrently
+    }
+
+    /// 再実体化するか（`WITH DATA`。省略時も真）。偽なら実体を破棄して未実体化にする。
+    pub fn with_data(&self) -> bool {
+        self.with_data
+    }
+}
+
+/// `REFRESH MATERIALIZED VIEW ...` で始まる文か（`core.rs::parse_tokens` の分岐述語。Issue #1665）。
+pub(crate) fn is_refresh_materialized_view_statement(tokens: &[Token]) -> bool {
+    let ident_at = |i: usize, word: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word));
+    ident_at(0, "REFRESH") && ident_at(1, "MATERIALIZED")
+}
+
+/// [`ValidatedRefreshMaterializedView`] の構造検証本体（`core.rs::parse_tokens` から呼ばれる。
+/// Issue #1665）。名前の後ろは `WITH [NO] DATA` と `;` だけを許し、余剰トークンは `42601`。
+pub(crate) fn validate_refresh_materialized_view_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedRefreshMaterializedView, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let (name, concurrently, rest) = p.parse_refresh_materialized_view()?;
+    let (leftover, with_data) = split_matview_data_clause(rest);
+    if !leftover.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "unexpected tokens after REFRESH MATERIALIZED VIEW target",
+        ));
+    }
+    // PostgreSQL と同じく CONCURRENTLY と WITH NO DATA の併用は構文エラー（Issue #1666）。
+    if concurrently && !with_data {
+        return Err(SqlSurfaceError::unsupported(
+            "CONCURRENTLY and WITH NO DATA options cannot be used together",
+        ));
+    }
+    Ok(ValidatedRefreshMaterializedView {
+        name,
+        concurrently,
+        with_data,
+    })
+}
+
 /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> [USING btree｜hnsw] (<col> [COLLATE <name>][, ...])` の許可形状構造
 /// 検証結果（TASK-206・INDEX-7・SQL-23、Issue #908）。[`ValidatedDropTable`] と
 /// 同じくカタログ照会を一切行わない（列の存在・型整合・名前衝突・対象の種別は
@@ -12054,11 +12269,12 @@ pub struct ValidatedCreateIndex {
     /// `USING hnsw` 指定の有無（`btree` は省略時と同じ `false`。`hnsw`・`btree` 以外の
     /// `USING` 値は構造検証段で `0A000` 拒否済み。Issue #1617）。
     pub(crate) hnsw: bool,
-    /// 列名。式要素の位置は空文字列（`expressions` が `Some` の位置。式要素は構文段の最終ゲートが
-    /// 拒否するため、現状は実行段に到達しない。Issue #1647）。
+    /// 列名。式要素の位置は空文字列（`expressions` が `Some` の位置。Issue #1647・#1648）。
     pub(crate) columns: Vec<String>,
-    /// `columns` と同じ長さの式要素（`None` は列。INDEX-10、Issue #1647）。後続 Issue #1648 が
-    /// 束縛・永続化する入口で、それまでは常に全要素 `None` の状態でしか構築されない。
+    /// `columns` と同じ長さの式要素（`None` は列。INDEX-10、Issue #1647）。実行段
+    /// （`sql::ddl::execute_create_index`）が `IndexDef` へ渡し、`Storage::create_index` が
+    /// 書き込みトランザクション内で束縛・永続化する（Issue #1648）。UNIQUE／hnsw／COLLATE と
+    /// 組み合わさった宣言は構文段の最終ゲートが拒否済み。
     pub(crate) expressions: Vec<Option<Expr>>,
     /// `columns` と同じ長さの列ごとの `COLLATE`（`None` は照合指定なし。Issue #2191・
     /// TABLE-28）。名前の解決は固定の許可リストとの完全一致だけで、カタログを参照しない。
@@ -12066,9 +12282,17 @@ pub struct ValidatedCreateIndex {
     /// `CREATE UNIQUE INDEX` か（Issue #1616・INDEX-9）。UNIQUE 制約への展開は
     /// `catalog::Storage::create_index` が担う。
     pub(crate) unique: bool,
+    /// 部分索引の述語（INDEX-11、Issue #1653）。最終ゲートが拒否するため現状は常に `None`
+    /// （#1654 が格納を実装するまで）。
+    pub(crate) predicate: Option<Vec<WherePredicate>>,
 }
 
 impl ValidatedCreateIndex {
+    /// 部分索引の述語（`None` は全行対象）。
+    pub fn predicate(&self) -> Option<&[WherePredicate]> {
+        self.predicate.as_deref()
+    }
+
     /// `CREATE UNIQUE INDEX` か。真のとき実行段は `IndexDef::with_unique(true)` で渡す。
     pub fn is_unique(&self) -> bool {
         self.unique
@@ -12095,9 +12319,7 @@ impl ValidatedCreateIndex {
         &self.columns
     }
 
-    /// `columns` と同じ長さの式要素（`None` は列。INDEX-10、Issue #1647）。式要素を含む宣言は
-    /// 構文段の最終ゲート（`reject_unimplemented_expression_keys`）が拒否するため、現状の
-    /// 実行段が受け取る値は全要素 `None`。
+    /// `columns` と同じ長さの式要素（`None` は列。INDEX-10、Issue #1647・#1648）。
     pub fn expression_keys(&self) -> &[Option<Expr>] {
         &self.expressions
     }
@@ -12152,8 +12374,8 @@ pub(crate) fn is_drop_index_statement(tokens: &[Token]) -> bool {
 /// - `USING hnsw` なのに列が複数 → `0A000`。
 /// - 列リストの要素: 式（`((<式>))`・関数呼び出し形 `(f(col))`）は先読み検査で集計 `42803`・
 ///   ウィンドウ `42P20`・部分クエリ／SRF `0A000`、決定性検査で非決定式 `42P17`・組み込み以外の
-///   関数 `0A000`、通過した式も後続 Issue（#1648〜）までは最終ゲートで `0A000`
-///   （INDEX-10、Issue #1647）。リテラルは `0A000`。
+///   関数 `0A000`。通過した式は最終ゲートで `UNIQUE`／hnsw／`COLLATE` との組み合わせだけ
+///   `0A000`、それ以外は実行段の束縛へ渡す（INDEX-10、Issue #1647・#1648）。リテラルは `0A000`。
 /// - 部分索引の `WHERE` 句 → `0A000`。
 /// - 列リストに重複する列名 → `42601`。列数上限超過 → `54000`。
 ///
@@ -12252,18 +12474,36 @@ pub(crate) fn validate_create_index_tokens(
     // 式要素の決定性（`42P17`／組み込み以外の関数は `0A000`。INDEX-10、Issue #1647）。判定順は
     // 要素の構文・集計/ウィンドウ/部分クエリ → 上の構造検査 → 決定性 → `WHERE` → 最終ゲート。
     for expr in expressions.iter().flatten() {
-        crate::sql::index_expr::check_index_expression_determinism(expr)?;
+        crate::sql::index_expr::check_index_expression_determinism(
+            expr,
+            crate::sql::index_expr::IndexExprSite::Key,
+        )?;
     }
-    // 部分索引（PostgreSQL 拡張構文）の `WHERE` 句は許可形状外の「機能」として
-    // `0A000`（`expect_end_of_statement` の汎用検査に落とすと `42601` になる）。
-    if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "partial indexes (WHERE clause) are not supported".to_string(),
-        });
-    }
+    // 部分索引の述語（INDEX-11、Issue #1653）。判定順は 述語の先読み（集計・ウィンドウ・部分
+    // クエリ・SRF を PostgreSQL と同じ SQLSTATE へ）→ 解析 → 決定性 → 文末 → 最終ゲート。
+    // 汎用の `parse_where` は既定状態（部分クエリ・CHECK 文脈なし）で使い、第 2 のパーサを作らない。
+    let predicate = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
+        p.advance();
+        let rest = p.tokens.get(p.pos..).unwrap_or(&[]);
+        crate::sql::index_expr::precheck_index_tokens(
+            rest,
+            crate::sql::index_expr::IndexExprSite::Predicate,
+        )?;
+        let preds = p.parse_where()?;
+        crate::sql::index_expr::check_index_predicate_determinism(&preds)?;
+        Some(preds)
+    } else {
+        None
+    };
     p.expect_end_of_statement()?;
     // 最終ゲート（INDEX-10、Issue #1647）。決定性検査は部分索引の `WHERE` 判定より前に済ませてある。
-    reject_unimplemented_expression_keys(&expressions, hnsw)?;
+    reject_unimplemented_expression_keys(&expressions, &collations, hnsw)?;
+    // 部分索引の最終ゲート（INDEX-11、Issue #1653・#1654）。述語の格納・DML 維持は Issue #1654 で
+    // 実装済みのため、残すのは強制や照合の永続形が無い組み合わせだけ（宣言だけ残って効かない索引や
+    // 強制漏れ〔fail-open〕を作らない）。部分 UNIQUE の強制は #1657。
+    if predicate.is_some() {
+        reject_unimplemented_partial_index(unique, hnsw, &collations, &expressions)?;
+    }
     Ok(ValidatedCreateIndex {
         name,
         if_not_exists,
@@ -12273,15 +12513,54 @@ pub(crate) fn validate_create_index_tokens(
         expressions,
         collations,
         unique,
+        predicate,
     })
 }
 
-/// 式索引の最終ゲート（INDEX-10、Issue #1647）。決定性検査を通った式も、キー計算・DML 維持・
-/// プランナ選択（後続 Issue #1648〜#1651）が無い間は宣言だけ残すと効かない索引（`UNIQUE` なら
-/// 一意性の強制漏れ）になるため、カタログ非参照の構文段で `0A000` に倒す。Issue #1648 は
-/// この呼び出しを外し、`Storage::create_index` の書き込みトランザクション内で束縛と永続化を行う。
+/// 部分索引の最終ゲート（INDEX-11、Issue #1654）。カタログ非参照の構文段で `0A000` に倒す組み合わせ:
+/// `UNIQUE`（部分 UNIQUE の強制は #1657。強制漏れの fail-open を作らない）・`USING hnsw`・`COLLATE`
+/// （`v6` の永続形は照合を持たない。素の列・式のどちらへの指定も）。matview への `WHERE` は対象の種別を
+/// 知る書き込みトランザクション内（`Storage::create_index_bound`）で拒否する。
+fn reject_unimplemented_partial_index(
+    unique: bool,
+    hnsw: bool,
+    collations: &[Option<crate::collation::Collation>],
+    expressions: &[Option<Expr>],
+) -> Result<(), SqlSurfaceError> {
+    let unsupported = |detail: &str| SqlSurfaceError::FeatureNotSupported {
+        detail: detail.to_string(),
+    };
+    if unique {
+        return Err(unsupported("partial unique indexes are not supported yet"));
+    }
+    if hnsw {
+        return Err(unsupported(
+            "partial indexes are not supported for this index kind yet",
+        ));
+    }
+    if collations.iter().any(Option::is_some)
+        || expressions
+            .iter()
+            .flatten()
+            .any(crate::sql::index_expr::expr_contains_collate)
+    {
+        return Err(unsupported(
+            "COLLATE on a partial index is not supported yet",
+        ));
+    }
+    Ok(())
+}
+
+/// 式索引の最終ゲート（INDEX-10、Issue #1647・#1648）。束縛・永続化・キー計算は
+/// `Storage::create_index` の書き込みトランザクション内（`sql::index_expr::bind_index_expression`）が
+/// 担うため、ここには「強制や追随が未実装の組み合わせ」だけを残し、カタログ非参照の構文段で
+/// `0A000` に倒す（宣言だけ残って効かない索引を作らない。fail-closed）:
+/// - `USING hnsw` かつ式要素
+/// - 式要素を含む索引の `COLLATE`（式への指定は要素末尾・式の最上位とも、素の列への指定も。
+///   式キーの辞書はバイト列順のみで、v4 の永続形は照合を持たない）
 fn reject_unimplemented_expression_keys(
     expressions: &[Option<Expr>],
+    collations: &[Option<crate::collation::Collation>],
     hnsw: bool,
 ) -> Result<(), SqlSurfaceError> {
     if !expressions.iter().any(Option::is_some) {
@@ -12292,9 +12571,33 @@ fn reject_unimplemented_expression_keys(
             detail: "USING hnsw does not support expression indexes".to_string(),
         });
     }
-    Err(SqlSurfaceError::FeatureNotSupported {
-        detail: "expression indexes are not supported yet".to_string(),
-    })
+    // `UNIQUE` かつ式要素（INDEX-9・INDEX-10、Issue #1651）は受理する。強制は永続一意索引が担う。
+    // 式要素を含む索引では、素の列要素の `COLLATE` も受理しない（v4 の永続形は照合を持たず、
+    // 宣言と永続形が食い違う fail-open になるため。式への照合と合わせて後続対応）。
+    let collated = collations.iter().any(Option::is_some)
+        || expressions
+            .iter()
+            .flatten()
+            .any(crate::sql::index_expr::expr_contains_collate);
+    if collated {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: crate::sql::index_expr::MSG_COLLATE.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// 保存済みの式索引の要素テキスト（`sql::index_expr::bind_index_expression` が描画した正規化 SQL）を
+/// 再解析する唯一の経路（作成時の往復一致検証と、構築時の再束縛が共有する。第 2 のパーサーを
+/// 作らない）。構文段と同じ文法（`parse_bounded_value_expr`）・同じノード予算で解析し、末尾に
+/// 余剰トークンがあれば `42601`。永続データは untrusted として扱う（手書きの破損データも
+/// ここで拒否される）。
+pub(crate) fn parse_index_expression_text(sql: &str) -> Result<Expr, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    let mut p = Parser::new(&tokens);
+    let expr = p.parse_bounded_value_expr()?;
+    p.expect_end_of_statement()?;
+    Ok(expr)
 }
 
 /// [`parse_index_column`] の戻り値（列名・式要素・照合）。式要素の位置の列名は空文字列。
@@ -12309,7 +12612,7 @@ type IndexColumnElement = (String, Option<Expr>, Option<crate::collation::Collat
 /// 3. 括弧式 `(<式>)` + 任意の `COLLATE`。閉じ括弧で式がちょうど終わらない形
 ///    （`(a) + 1`）は `42601`。式が単なる列参照なら通常の列要素へ正規化する。
 ///
-/// 式の解析前に要素のトークン区間を先読み検査し（`sql::index_expr::precheck_element_tokens`）、
+/// 式の解析前に要素のトークン区間を先読み検査し（`sql::index_expr::precheck_index_tokens`）、
 /// 集計・ウィンドウ・部分クエリ・SRF を PostgreSQL と同じ SQLSTATE で拒否する。式は
 /// ノード予算（`MAX_EXPR_NODES`）と深さ上限の内側でのみ解析する。リテラル・空括弧等は
 /// 従来どおり `0A000`。
@@ -12327,7 +12630,10 @@ fn parse_index_column(p: &mut Parser<'_>) -> Result<IndexColumnElement, SqlSurfa
     if is_call || is_paren {
         let end = crate::sql::index_expr::element_end(&p.tokens, p.pos);
         let element = p.tokens.get(p.pos..end).unwrap_or(&[]);
-        crate::sql::index_expr::precheck_element_tokens(element)?;
+        crate::sql::index_expr::precheck_index_tokens(
+            element,
+            crate::sql::index_expr::IndexExprSite::Key,
+        )?;
     }
     let expr = if is_call {
         p.parse_bounded_primary_expr()?
@@ -12522,6 +12828,28 @@ pub(crate) fn validate_drop_type_tokens(
     }
     p.expect_end_of_statement()?;
     Ok(ValidatedDropType { name, if_exists })
+}
+
+/// 先頭 3 トークンが `DROP MATERIALIZED VIEW` か（`core.rs::EngineCore::parse_tokens` の分岐判定。
+/// 汎用 `DROP`（`DROP TABLE` 扱い）より前に分岐するために使う。TABLE-42、Issue #1667）。
+pub(crate) fn is_drop_materialized_view_statement(tokens: &[Token]) -> bool {
+    let ident_at = |i: usize, word: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word));
+    ident_at(0, "DROP") && ident_at(1, "MATERIALIZED")
+}
+
+/// [`ValidatedDropMaterializedView`] の構造検証本体（カタログ照会なし）。`IF EXISTS`・複数指定・
+/// `CASCADE`／`RESTRICT` を受理し、余剰トークン・末尾カンマ・空要素は `42601`。
+pub(crate) fn validate_drop_materialized_view_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedDropMaterializedView, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let (names, if_exists, behavior) = p.parse_drop_materialized_view()?;
+    p.expect_end_of_statement()?;
+    Ok(ValidatedDropMaterializedView {
+        names,
+        if_exists,
+        behavior,
+    })
 }
 
 /// [`ValidatedDropView`] の構造検証本体。
@@ -15961,16 +16289,30 @@ pub(crate) fn validate_insert_tokens_with_limit(
     mode: LedgerMode,
     max_insert_rows: Option<std::num::NonZeroUsize>,
 ) -> Result<ValidatedInsert, SqlSurfaceError> {
-    let mut p = Parser::new(tokens).with_max_insert_rows(max_insert_rows);
-    let shape = p.parse_insert()?;
-    p.expect_end_of_statement()?;
-
-    mode.require(shape.operation_id.as_ref())?;
+    let shape = parse_insert_shape_tokens_with_limit(tokens, mode, max_insert_rows)?;
 
     let exists = lookup.table_exists(&shape.table_name)?;
     if !exists {
         return Err(SqlSurfaceError::undefined_table(shape.table_name));
     }
+
+    Ok(shape)
+}
+
+/// [`validate_insert_tokens_with_limit`] の前半（構造検証と `operation_id` 必須化ガードまで。
+/// カタログ照会はしない。判定順序は元の関数と同じ）。`core.rs` の `parse_tokens` が、INTO の名前が
+/// 表でなかったときにビューへの INSERT として扱う（`ParsedSql::ViewInsert`。TABLE-43・Issue #1671）
+/// ために、構造検証を二重に行わず形だけを取り出す入口。返す `table_name` は存在確認前の名前。
+pub(crate) fn parse_insert_shape_tokens_with_limit(
+    tokens: &[lexer::Token],
+    mode: LedgerMode,
+    max_insert_rows: Option<std::num::NonZeroUsize>,
+) -> Result<ValidatedInsert, SqlSurfaceError> {
+    let mut p = Parser::new(tokens).with_max_insert_rows(max_insert_rows);
+    let shape = p.parse_insert()?;
+    p.expect_end_of_statement()?;
+
+    mode.require(shape.operation_id.as_ref())?;
 
     Ok(ValidatedInsert {
         table_name: shape.table_name,
@@ -16114,6 +16456,21 @@ pub(crate) fn parse_check_predicate_text(
     // 旧版は時刻キーワード名の列参照を引用なしで保存した。CHECK は値関数を禁止しているため、
     // 保存本文中の未引用の予約語は旧形式の列参照として復元する（書き込み不能化を防ぐ）。
     lexer::requote_legacy_value_function_columns(&mut tokens);
+    let mut p = Parser::new(&tokens);
+    let predicates = p.parse_where()?;
+    p.expect_end_of_statement()?;
+    Ok(predicates)
+}
+
+/// カタログに永続化された部分索引の述語（`sql::index_predicate::bind_index_predicate` が描画した
+/// 正規化テキスト。INDEX-11、Issue #1654）を、`WHERE` 句と同じ文法で再パースする。構文段
+/// （`validate_create_index_tokens`）と同じ既定状態の `parse_where` を使い、第 2 のパーサを作らない。
+/// 保存テキストは untrusted で、末尾に余剰トークンが残る場合は `42601`（往復不能・手書きの破損の
+/// どちらもここで検知する）。CHECK 用の旧形式の再引用（legacy requote）は持ち込まない。
+pub(crate) fn parse_index_predicate_text(
+    sql: &str,
+) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
     let mut p = Parser::new(&tokens);
     let predicates = p.parse_where()?;
     p.expect_end_of_statement()?;
@@ -17128,17 +17485,34 @@ mod tests {
             ok.column_collations(),
             [Some(crate::collation::Collation::C)]
         );
+        // 決定的な式・型依存の式は構文段を通り、実行段（`Storage::create_index` の書き込み
+        // トランザクション）が束縛する（Issue #1648）。
+        for sql in [
+            "CREATE INDEX i ON t (lower(a))",
+            "CREATE INDEX i ON t ((a + 1))",
+            "CREATE INDEX i ON t ((lower(a)), b)",
+            "CREATE INDEX i ON t ((a::text))",
+            "CREATE INDEX i ON t ((date_part('year', ts)))",
+            // 一意の式索引は構文段を通る（INDEX-9・INDEX-10、Issue #1651）。
+            "CREATE UNIQUE INDEX i ON t ((a + 1))",
+            "CREATE UNIQUE INDEX i ON t ((lower(a)), b)",
+        ] {
+            let ok = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert!(ok.expression_keys().iter().any(Option::is_some), "{sql}");
+        }
         for (sql, code) in [
             // 重複列（正規化後）。
             ("CREATE INDEX i ON t ((a), a)", "42601"),
-            // 決定的な式・型依存の式は構文段の最終ゲートで 0A000。
-            ("CREATE INDEX i ON t (lower(a))", "0A000"),
-            ("CREATE INDEX i ON t ((a + 1))", "0A000"),
-            ("CREATE INDEX i ON t ((lower(a)), b)", "0A000"),
-            ("CREATE INDEX i ON t ((a::text))", "0A000"),
-            ("CREATE INDEX i ON t ((date_part('year', ts)))", "0A000"),
+            // hnsw・式への COLLATE と式の組み合わせは構文段の最終ゲートで 0A000。
             ("CREATE INDEX i ON t (lower(a) COLLATE \"C\")", "0A000"),
-            ("CREATE UNIQUE INDEX i ON t ((a + 1))", "0A000"),
+            ("CREATE INDEX i ON t ((lower(a) COLLATE \"C\"))", "0A000"),
+            // 入れ子の COLLATE（引数・CASE・CAST 内）も 0A000（v4 永続形が照合を持たないため）。
+            ("CREATE INDEX i ON t (lower(a COLLATE \"C\"))", "0A000"),
+            ("CREATE INDEX i ON t ((a COLLATE \"C\" || 'x'))", "0A000"),
+            (
+                "CREATE INDEX i ON t ((CASE WHEN a > 'x' THEN lower(a COLLATE \"C\") END))",
+                "0A000",
+            ),
             ("CREATE INDEX i ON t USING hnsw ((a + 1))", "0A000"),
             // 非決定的な式は 42P17（UNIQUE・入れ子・複数要素でも検出）。
             ("CREATE INDEX i ON t ((now()))", "42P17"),
@@ -25458,6 +25832,44 @@ mod body_expr_policy_tests {
         ] {
             assert!(
                 matches!(check(bad), Err(SqlSurfaceError::UnsupportedSyntax { .. })),
+                "{bad}"
+            );
+        }
+    }
+
+    /// `REFRESH MATERIALIZED VIEW` の構文検証（TABLE-42・Issue #1665）。
+    #[test]
+    fn refresh_materialized_view_structural_checks() {
+        let check = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tok");
+            validate_refresh_materialized_view_tokens(&tokens)
+        };
+        let tokens = crate::sql::lexer::tokenize("REFRESH MATERIALIZED VIEW mv").expect("tok");
+        assert!(is_refresh_materialized_view_statement(&tokens));
+        let plain = check("REFRESH MATERIALIZED VIEW mv").expect("plain");
+        assert!(plain.with_data() && !plain.concurrently());
+        assert_eq!(plain.name(), "mv");
+        assert!(check("refresh materialized view mv with data;")
+            .expect("with data")
+            .with_data());
+        assert!(!check("REFRESH MATERIALIZED VIEW mv WITH NO DATA")
+            .expect("no data")
+            .with_data());
+        let conc = check("REFRESH MATERIALIZED VIEW CONCURRENTLY mv").expect("conc");
+        assert!(conc.concurrently() && conc.with_data());
+        for bad in [
+            "REFRESH VIEW mv",
+            "REFRESH MATERIALIZED VIEW",
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY",
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY mv WITH NO DATA",
+            "REFRESH MATERIALIZED VIEW mv WITH DATA extra",
+            "REFRESH MATERIALIZED VIEW mv WITH",
+            "REFRESH MATERIALIZED VIEW mv DATA",
+            "REFRESH MATERIALIZED VIEW mv, other",
+        ] {
+            let tokens = crate::sql::lexer::tokenize(bad).expect("tok");
+            assert!(
+                validate_refresh_materialized_view_tokens(&tokens).is_err(),
                 "{bad}"
             );
         }
