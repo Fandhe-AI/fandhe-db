@@ -2088,6 +2088,9 @@ fn is_reserved_function_name(name: &str) -> bool {
             // 構文形としてだけ解釈される。同名の UDF を許すと呼び出せない定義が登録できてしまう。
             | "NEXTVAL"
             | "CURRVAL"
+            // `setval`／`lastval`（TABLE-24・Issue #1691）は単独の `SELECT` 形としてだけ解釈される。
+            | "SETVAL"
+            | "LASTVAL"
     ) || is_builtin_function_name(name)
         || crate::sql::allowlist::is_aggregate_function_name(name)
 }
@@ -5834,6 +5837,13 @@ fn bind_call(
     if lower_name == "nextval" || lower_name == "currval" {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "nextval and currval are not supported in this context".to_string(),
+        });
+    }
+    // `setval`／`lastval`（TABLE-24・Issue #1691）は単独の `SELECT` 形だけ。式位置は書き込み txn を
+    // 伴う評価経路が無いため `0A000` で拒否する（固定文言。副作用は起こさない）。
+    if lower_name == "setval" || lower_name == "lastval" {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "setval and lastval are not supported in this context".to_string(),
         });
     }
     if crate::sql::json_fn::is_json_fn_name(&lower_name) {

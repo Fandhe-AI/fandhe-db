@@ -2936,7 +2936,7 @@ pub(crate) fn execute_alter_sequence(
 /// 種別違い `42809`・依存あり `2BP01`・上限超過 `54000`・ロック timeout `55P03`）。
 /// 不在は未知の名前も（#1711 以降の）他テナントの名前も同じ経路で、エラー文言に存在情報を
 /// 含めない（security.md P0）。
-fn map_sequence_error(e: CatalogError, internal_detail: &str) -> SqlSurfaceError {
+pub(crate) fn map_sequence_error(e: CatalogError, internal_detail: &str) -> SqlSurfaceError {
     match e {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::duplicate_table(name),
         CatalogError::TableNotFound(name) => SqlSurfaceError::undefined_table(name),

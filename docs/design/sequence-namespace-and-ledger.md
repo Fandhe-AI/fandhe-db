@@ -293,3 +293,34 @@ CACHE は引き続き `0A000` で、内部の値は 1 固定のまま。永続�
 
 - 同種オプションの重複は構文段で検出するため、未知の名前と重複が同時にあると、PG（リレーション解決が先で `42P01`）と違い `42601` が先に返る
 - `ALTER TABLE <sequence> RENAME TO ...`（PG は許す）は現状の挙動のまま
+
+## 10. Issue #1691 実装記録（setval と lastval）
+
+### 10.1 構文と置き場
+
+- 受理: `SELECT setval('<名>', <符号付き整数>[, TRUE|FALSE]) [AS <別名>] [;]` と `SELECT lastval() [AS <別名>] [;]` の単独形だけ。結果は 1 行 1 列の `bigint`（列名は関数名か別名）
+- 専用の `ParsedSql::SequenceFunction` として受ける。`ConstSelect`（#1531）はストレージに触れない契約で、書き込み txn を伴う関数を式として評価できない。wire の `is_write_statement` は `ParsedSql::Statement` を常に「commit なし」と扱うため、`ConstSelect` に乗せると autocommit の `setval` が `committed = false` と誤分類され、RECOVER-5 の `state=may_be_committed` 契約に反する
+- 検出は「先頭が `SELECT` + `setval`／`lastval` + `(`」に限り、検出後は専用の検証器だけが結論を出す（`ConstSelect` へ流さない）
+- `22003`: 値が i64 の範囲外。`42601`: 小数・文字列・引数の過不足・識別子規則違反の名前。`0A000`: `NULL`・`$n`・式・キャスト・修飾名・引用付きの名前・`is_called` が `TRUE`／`FALSE` 以外・単独形以外（`FROM`・追加項目・演算子・`WHERE`・`LIMIT`・複数文）
+- 式位置（`SELECT 1, setval(...)`・`WHERE`・`UPDATE SET`・`INSERT VALUES`・ビュー本文など）は許可リスト外の関数呼び出しとして `42601` で閉じ、実行されない（FROM なしの `SELECT 1, setval(...)` だけは式束縛の拒否で `0A000`。`nextval`／`currval` の式位置と同じ振り分けで、SQLSTATE も揃っている）。`CREATE FUNCTION setval` は予約名として `42723`。式束縛にも `0A000` の拒否を置いた（多層防御）
+- `$n` は拡張プロトコルの Parse で `0A000`（ダミー置換より前に判定する）
+
+### 10.2 決定
+
+- **範囲外は `22003`**（`min_value <= n <= max_value`）。ALTER の `22023` は流用しない。文言は値・名前を含まない固定文（ERR-6 のポインタ）
+- **状態は `SeqCursor { last_value: n, is_called }`**。既存の純関数 `advance` が `is_called = true` なら次は `n + increment`（範囲外は CYCLE で折り返し、NO CYCLE で `2200H`）、`false` なら次は `n` そのものを満たす。戻り値は `is_called` によらず `n`
+- **作用は呼び出し元テナントの状態行 `(tenant_id, sequence_id)` だけ**（TABLE-24 (2)）。operation_id 台帳は開かない（D1。冪等で、台帳には採番値を保存しない）
+- **DDL 権限ゲートはかけない**。PostgreSQL でも UPDATE 権限相当で、作用範囲が自テナントに閉じるため（全テナントへ作用する RESTART とは異なる）。自動運転下で安全側に倒した判断のため、人間の確認が要る
+- **メモリ上の現在値（D4）**: アロケータはメモリを優先して読むため、`setval` が後退させうる。トランザクション内は共有 write txn へ状態行を書いた直後にメモリも更新する（ROLLBACK しても戻らず、PostgreSQL の `setval` の非トランザクション性と一致。戻るのは永続値だけ）。autocommit は `commit_and_finish` の commit 後クロージャでメモリを更新する（writer permit を保持したまま）。commit 前に更新すると、commit 失敗でメモリが永続値より後ろに下がり、払い出し済みの値を再び払い出しうる
+- **`has_writes`**: `commit_active` は `has_writes == false` で write txn を破棄する。`setval` は表を書かず `mark_written` の相手がないため、`SessionTransaction::mark_sequence_written` が `has_writes` だけを立てる（`written_tables` に偽の名前を入れない）。これが無いと `BEGIN; setval; COMMIT` の永続化が落ちる
+- **セッション状態（D6）**: `setval(..., true)` は `currval` を更新するが、`lastval` の対象（`last`）は変えない（PostgreSQL 17 の `do_setval` は `last_used_seq` に触れない）。`is_called = false` はどちらも更新しない。件数上限（`54000`）は commit の前に検査する
+- **`lastval`**: `last` が無い、または別テナントのものは `55000`。対象の SEQUENCE の存在は**内部 ID**で確認する（RENAME は ID を保つため生き、DROP 後は同名で作り直しても別 ID なので `55000`）。消えていたらセッションの該当エントリ（`currval` と `last`）を捨てる。走査は `MAX_SEQUENCES` で有界、復号失敗は `CorruptSchema`
+- 未知の名前は `42P01`、他種別は `42809`（DROP・ALTER と同じ写像。テナント非依存の同一応答）
+
+### 10.3 対象外・申し送り
+
+- SELECT 位置の `nextval`／`currval`（#1690 からの申し送り）: 本 Issue では拡張していない。`SequenceFnKind` に `Nextval`／`Currval` を足せば小差分で対応できる。追記先（既存 Issue か新規起票か）はユーザー確認が要る
+- ROLLBACK の後にクラッシュした場合の `setval` の消失（PostgreSQL は即時に永続化する）。#1692 の補強 txn と同じ系統として扱う
+- `INSERT VALUES (lastval())`・`setval` の `$n`・`NULL` 引数（PostgreSQL は strict で `NULL` を返す）・キャスト付き引数は `0A000`／`42601`
+- 修飾名（#1717）、CACHE（後続）
+- テスト: `tests/table24_sequence_setval.rs`（冒頭に PG 17 の期待値表）・`catalog::sequence::setval_tests`・`sql::allowlist::sequence_function_tests`・`sql::sequence_scope::tests`・`wire_sequence_setval.rs`

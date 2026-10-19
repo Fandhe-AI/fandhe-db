@@ -2225,6 +2225,9 @@ fn execute_portal<'e, S: WireStream>(
         // 実行は包んだ形のまま `execute_parsed_in_txn` に渡す）。
         let is_write_statement = match parsed.peel_session_route() {
             ParsedSql::Statement(_) => false,
+            // `lastval()` は読み取りのみ。`setval` は永続状態を書くため下の既定（autocommit なら
+            // commit 成功境界を越える）へ落とす（TABLE-24・Issue #1691）。
+            ParsedSql::SequenceFunction(f) if !f.writes() => false,
             ParsedSql::Transaction(engine::sql::transaction::TxnControl::Commit) => true,
             ParsedSql::Transaction(_) => false,
             // Issue #1129: `SHOW`・`EXPLAIN ... PARTITIONED` は読み取りのみで commit を伴わない
