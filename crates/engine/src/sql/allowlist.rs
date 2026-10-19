@@ -13165,6 +13165,205 @@ pub(crate) fn validate_drop_sequence_tokens(
     p.expect_end_of_statement()?;
     Ok(ValidatedDropSequence { name })
 }
+/// `ALTER SEQUENCE <name> ...` の変更内容（TABLE-24・SQL-23、Issue #1689）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AlterSequenceAction {
+    /// オプション変更（1 個以上）。範囲の意味検証（`22023`）は Storage 側が担う。
+    Options(crate::catalog::sequence::SequenceAlter),
+    /// `RENAME TO <新名>`（他のオプションとは併用できない）。
+    Rename { new_name: String },
+}
+
+/// `ALTER SEQUENCE <name> <action>` の許可形状構造検証結果（TABLE-24・SQL-23、Issue #1689）。
+/// カタログ照会は一切行わない（不在・種別・衝突は Storage 側の判定に一本化する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedAlterSequence {
+    pub(crate) name: String,
+    pub(crate) action: AlterSequenceAction,
+}
+
+impl ValidatedAlterSequence {
+    /// 変更対象の SEQUENCE 名。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// 先頭 2 トークンが `ALTER SEQUENCE` か（先頭が `ALTER` なら何でも `ALTER TABLE` へ流す
+/// 分岐より前に判定するために使う）。
+pub(crate) fn is_alter_sequence_statement(tokens: &[Token]) -> bool {
+    matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("ALTER"))
+        && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("SEQUENCE"))
+}
+
+/// [`ValidatedAlterSequence`] の構造検証本体（TABLE-24、Issue #1689）。受理するのは
+/// `RESTART [[WITH] n]`・`START [WITH]`・`INCREMENT [BY]`・`MINVALUE`／`NO MINVALUE`・
+/// `MAXVALUE`／`NO MAXVALUE`・`CYCLE`／`NO CYCLE` の任意順（同種の重複は `42601`）と、
+/// 単独の `RENAME TO <新名>`。オプションなしは `42601`。未対応の句（`IF EXISTS`・`AS`・`CACHE`・
+/// `OWNED BY`・`SET SCHEMA`・`OWNER TO`・`SET LOGGED`／`UNLOGGED`・修飾名）は黙って無視せず
+/// `0A000` で拒否する（fail-closed。設計記録 D8）。
+pub(crate) fn validate_alter_sequence_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedAlterSequence, SqlSurfaceError> {
+    use crate::catalog::sequence::{BoundChange, SequenceAlter};
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("ALTER")?;
+    p.expect_ident_matching("SEQUENCE")?;
+    if p.consume_if_exists() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "ALTER SEQUENCE ... IF EXISTS is not supported",
+        ));
+    }
+    if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "schema-qualified sequence names are not supported",
+        ));
+    }
+    let name = p.expect_ident()?;
+    crate::catalog::validate_identifier(&name)
+        .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name in ALTER SEQUENCE"))?;
+    if p.peek_ident_matches("RENAME") {
+        p.advance();
+        p.expect_ident_matching("TO")?;
+        if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "schema-qualified sequence names are not supported",
+            ));
+        }
+        let new_name = p.expect_ident()?;
+        crate::catalog::validate_identifier(&new_name).map_err(|_| {
+            SqlSurfaceError::unsupported("invalid sequence name in ALTER SEQUENCE RENAME")
+        })?;
+        p.expect_end_of_statement()?;
+        return Ok(ValidatedAlterSequence {
+            name,
+            action: AlterSequenceAction::Rename { new_name },
+        });
+    }
+    let mut alter = SequenceAlter {
+        restart: None,
+        start: None,
+        increment: None,
+        min_value: BoundChange::Keep,
+        max_value: BoundChange::Keep,
+        cycle: None,
+    };
+    let dup = || SqlSurfaceError::unsupported("conflicting or redundant sequence options");
+    let mut any = false;
+    while !matches!(p.peek(), None | Some(Token::Punct(';'))) {
+        let Some(word) = p.peek_upper_ident() else {
+            return Err(SqlSurfaceError::unsupported(
+                "unexpected token in ALTER SEQUENCE",
+            ));
+        };
+        p.advance();
+        any = true;
+        match word.as_str() {
+            "RESTART" => {
+                if alter.restart.is_some() {
+                    return Err(dup());
+                }
+                if p.peek_ident_matches("WITH") {
+                    p.advance();
+                    alter.restart = Some(Some(p.expect_signed_i64()?));
+                } else if matches!(
+                    p.peek(),
+                    Some(Token::Number(_)) | Some(Token::Punct('-')) | Some(Token::Punct('+'))
+                ) {
+                    alter.restart = Some(Some(p.expect_signed_i64()?));
+                } else {
+                    alter.restart = Some(None);
+                }
+            }
+            "START" => {
+                if p.peek_ident_matches("WITH") {
+                    p.advance();
+                }
+                if alter.start.is_some() {
+                    return Err(dup());
+                }
+                alter.start = Some(p.expect_signed_i64()?);
+            }
+            "INCREMENT" => {
+                if matches!(p.peek(), Some(Token::Keyword(Keyword::By))) {
+                    p.advance();
+                }
+                if alter.increment.is_some() {
+                    return Err(dup());
+                }
+                alter.increment = Some(p.expect_signed_i64()?);
+            }
+            "MINVALUE" => {
+                if alter.min_value != BoundChange::Keep {
+                    return Err(dup());
+                }
+                alter.min_value = BoundChange::Set(p.expect_signed_i64()?);
+            }
+            "MAXVALUE" => {
+                if alter.max_value != BoundChange::Keep {
+                    return Err(dup());
+                }
+                alter.max_value = BoundChange::Set(p.expect_signed_i64()?);
+            }
+            "CYCLE" => {
+                if alter.cycle.is_some() {
+                    return Err(dup());
+                }
+                alter.cycle = Some(true);
+            }
+            "NO" => {
+                let next = p.peek_upper_ident();
+                p.advance();
+                match next.as_deref() {
+                    Some("MINVALUE") => {
+                        if alter.min_value != BoundChange::Keep {
+                            return Err(dup());
+                        }
+                        alter.min_value = BoundChange::Default;
+                    }
+                    Some("MAXVALUE") => {
+                        if alter.max_value != BoundChange::Keep {
+                            return Err(dup());
+                        }
+                        alter.max_value = BoundChange::Default;
+                    }
+                    Some("CYCLE") => {
+                        if alter.cycle.is_some() {
+                            return Err(dup());
+                        }
+                        alter.cycle = Some(false);
+                    }
+                    _ => {
+                        return Err(SqlSurfaceError::unsupported(
+                            "unexpected token after NO in ALTER SEQUENCE",
+                        ))
+                    }
+                }
+            }
+            "AS" | "CACHE" | "OWNED" | "OWNER" | "SET" | "IF" | "SEQUENCE" => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "unsupported ALTER SEQUENCE option",
+                ));
+            }
+            _ => {
+                return Err(SqlSurfaceError::unsupported(
+                    "unexpected token in ALTER SEQUENCE",
+                ))
+            }
+        }
+    }
+    if !any {
+        return Err(SqlSurfaceError::unsupported(
+            "ALTER SEQUENCE requires at least one option",
+        ));
+    }
+    p.expect_end_of_statement()?;
+    Ok(ValidatedAlterSequence {
+        name,
+        action: AlterSequenceAction::Options(alter),
+    })
+}
+
 /// 先頭 3 トークンが `DROP MATERIALIZED VIEW` か（`core.rs::EngineCore::parse_tokens` の分岐判定。
 /// 汎用 `DROP`（`DROP TABLE` 扱い）より前に分岐するために使う。TABLE-42、Issue #1667）。
 pub(crate) fn is_drop_materialized_view_statement(tokens: &[Token]) -> bool {

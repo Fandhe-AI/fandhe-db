@@ -490,10 +490,14 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // SEQUENCE の定義表・状態表・ID カウンタだけを書く。表の行スキーマ（`user_rows/{table}`）も
     // 表のスキーマ世代も変えないため、`bump_table_generation_in_txn` を伴わない。末尾 2 件は
     // 同ファイルの `#[cfg(test)]` 内（状態行の種まき）で、同じ理由で対象外。
-    ("catalog/sequence.rs", 252),
-    ("catalog/sequence.rs", 287),
-    ("catalog/sequence.rs", 334),
-    ("catalog/sequence.rs", 475),
+    // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence` も同じ表だけを書く
+    // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
+    ("catalog/sequence.rs", 507),
+    ("catalog/sequence.rs", 528),
+    ("catalog/sequence.rs", 566),
+    ("catalog/sequence.rs", 601),
+    ("catalog/sequence.rs", 656),
+    ("catalog/sequence.rs", 1051),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
