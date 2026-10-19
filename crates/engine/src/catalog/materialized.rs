@@ -625,17 +625,26 @@ pub(crate) fn write_context_entity_in_txn(
         ));
     }
     let schema = TableSchema::new(def.name.clone(), def.columns.clone());
-    let table_name = matview_rows_table_name(&def.name);
-    let rows_def: MatviewRowsDef = TableDefinition::new(&table_name);
-    let mut rows_table = write_txn.open_table(rows_def)?;
-    let mut meta_table = write_txn.open_table(MATVIEW_ENTITY_META_TABLE)?;
-    for (i, values) in rows.iter().enumerate() {
+    // 符号化の失敗（テナント ID 長などの文脈依存の要因）で部分的な行を残さないよう、
+    // 行表へ書く前に全行を符号化する。失敗時は何も書かない（呼び出し元が他文脈の失敗を隠せる）。
+    let mut encoded_rows: Vec<Vec<u8>> = Vec::new();
+    encoded_rows
+        .try_reserve_exact(rows.len())
+        .map_err(|_| CatalogError::Invalid("materialized view allocation failed".to_string()))?;
+    for values in rows {
         let encoded = row_codec::encode_row(&schema, ctx.tenant_id(), Visibility::Private, values)
             .map_err(|_| {
                 CatalogError::Invalid(
                     "materialized view row does not match its columns".to_string(),
                 )
             })?;
+        encoded_rows.push(encoded);
+    }
+    let table_name = matview_rows_table_name(&def.name);
+    let rows_def: MatviewRowsDef = TableDefinition::new(&table_name);
+    let mut rows_table = write_txn.open_table(rows_def)?;
+    let mut meta_table = write_txn.open_table(MATVIEW_ENTITY_META_TABLE)?;
+    for (i, encoded) in encoded_rows.iter().enumerate() {
         rows_table.insert((key.as_bytes(), i as u64), encoded.as_slice())?;
     }
     meta_table.insert(

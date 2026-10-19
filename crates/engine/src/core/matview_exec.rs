@@ -195,8 +195,14 @@ impl EngineCore {
                 if is_creator {
                     own_rows = Some(rows.len() as u64);
                 }
-                write_context_entity_in_txn(&write_txn, &def, &ctx, &rows, &mut seen, cap)
-                    .map_err(map_create_matview_error)?;
+                // 他文脈の符号化・書き込み失敗（テナント ID 長等で結果の有無により成否が分かれうる）も
+                // 評価失敗と同様に作成者へ返さない。write_context_entity_in_txn は失敗時に行・メタを
+                // 残さないため、その文脈は未実体化（読み取りは 55000）になる。
+                match write_context_entity_in_txn(&write_txn, &def, &ctx, &rows, &mut seen, cap) {
+                    Ok(()) => {}
+                    Err(_) if !is_creator => continue,
+                    Err(e) => return Err(map_create_matview_error(e)),
+                }
                 drop(rows);
             }
         }
@@ -302,8 +308,13 @@ impl EngineCore {
                 Err(_) if !is_refresher => continue,
                 Err(e) => return Err(e),
             };
-            write_context_entity_in_txn(&write_txn, &def, &ctx, &rows, &mut seen, cap)
-                .map_err(map_refresh_matview_error)?;
+            // 他文脈の符号化・書き込み失敗も評価失敗と同様に実行者へ返さない（失敗時は行・メタを
+            // 残さず、その文脈は未実体化＝読み取りは 55000）。
+            match write_context_entity_in_txn(&write_txn, &def, &ctx, &rows, &mut seen, cap) {
+                Ok(()) => {}
+                Err(_) if !is_refresher => continue,
+                Err(e) => return Err(map_refresh_matview_error(e)),
+            }
             drop(rows);
         }
         finish_streamed_refresh_in_txn(&write_txn, &def, true)

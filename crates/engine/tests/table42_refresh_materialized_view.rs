@@ -311,6 +311,41 @@ fn other_context_failure_is_hidden_and_that_context_becomes_unpopulated() {
     assert_eq!(err_code(&core, "bob", q), "55000");
 }
 
+/// 他文脈の行符号化失敗（256 バイトのテナント ID は row_codec の長さ上限を超える）も実行者へ返さない。
+/// 長い ID の文脈の結果が空でも非空でも、実行者の REFRESH は同一（成功）で、その文脈は未実体化（55000）。
+#[test]
+fn other_context_encode_failure_is_hidden_regardless_of_emptiness() {
+    let long_tenant = "t".repeat(256);
+    for (label, seed_long) in [("t42r-enc-empty", false), ("t42r-enc-rows", true)] {
+        let (storage, _p, _g) = open_storage(label);
+        if seed_long {
+            insert_row(
+                &storage,
+                &long_tenant,
+                50,
+                "ja",
+                "long1",
+                Visibility::Private,
+            );
+        }
+        let mut contexts = all_contexts();
+        contexts.push(ctx(&long_tenant));
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+            .with_materialization_contexts(contexts);
+        create_ok(
+            &core,
+            "CREATE MATERIALIZED VIEW mv AS SELECT body FROM docs WITH NO DATA",
+        );
+        assert!(refresh_ok(&core, "alice", "REFRESH MATERIALIZED VIEW mv"));
+        assert!(has(&core, "alice", "SELECT body FROM mv LIMIT 6", "a1"));
+        assert!(!has(&core, "alice", "SELECT body FROM mv LIMIT 6", "long1"));
+        assert_eq!(
+            err_code(&core, &long_tenant, "SELECT body FROM mv LIMIT 6"),
+            "55000"
+        );
+    }
+}
+
 /// TABLE-42 (1): WITH NO DATA で未実体化（55000）になり、続く REFRESH で再実体化できる。
 /// CREATE ... WITH NO DATA の matview も REFRESH で実体化できる。
 #[test]
