@@ -36,7 +36,7 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
 | 揮発性の式を含む INSERT 系は、構文形をハッシュする別ドメインの `OpTag`（14〜16）を実装済み。省略列へ適用した DEFAULT は内容照合ハッシュの材料から除外され、旧・列の種別バイト `2`（揮発性 DEFAULT の適用）は退役済みで再利用しない | `content_hash.rs`・[now-evaluated-value-ledger.md](now-evaluated-value-ledger.md) |
 | 明示トランザクションはセッションごとに共有 `redb::WriteTransaction` を 1 本持ち、ROLLBACK／接続断で drop する。redb は単一ライター | `sql/transaction.rs`・`storage.rs` |
 | DDL は `--ddl-allowed-users` で許可したユーザーだけが実行でき、既定では全 DDL が `42501` | `ddl_permission_opt.rs` |
-| SCHEMA（#1711）・`operation_id` の任意化（#1701）は未着手 | Issue |
+| SCHEMA（#1711）は未着手。`operation_id` の任意化（#1701）は #1704 で engine 既定を任意モード（`LedgerMode::Optional`）へ移し済み（`--require-operation-id` で従来の必須へ戻せる） | Issue・[operation-id-optional.md](operation-id-optional.md) |
 
 ## 3. 決定
 
@@ -110,10 +110,11 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
 - **分割実行 DML**（`partitioned_job.rs`）: 部分ごとに commit した行の値は各部分の txn で高水位に覆われる。
   再開時は永続化済み高水位から続け、ジョブ記録の版は変えない
 
-### D5. `operation_id` を省略した書き込み（#1701 着地後）
+### D5. `operation_id` を省略した書き込み
 
 - 省略時の再送動作の契約は RECOVER-1・TABLE-24 (3) を参照する（本書では再掲しない）。
-  #1701 着地までは `operation_id` 必須のままなので、着地時に適用する
+  engine 既定は #1704 で任意モード（`LedgerWrite::Omitted`）になっており、SEQUENCE の採番もこの前提で扱う。
+  `--require-operation-id` を指定した構成では従来どおり省略を拒否する
 
 ### D6. セッション状態
 
@@ -152,7 +153,7 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
 | #1691 | D4（`setval` は高水位も更新する）・D6（`lastval`）・D7（数値契約） |
 | #1692 | D1・D2（golden 不変）・D4（クラッシュ注入での検証。契約は TABLE-24 (4)。既存 crash-test の流儀）・D5 |
 
-外部依存: #1711（D3 のキーの形）・#1701（D5 の適用時期）。
+外部依存: #1711（D3 のキーの形）。D5 の前提となる #1704（`operation_id` の任意化）は着地済み。
 
 ## 5. 対象外
 
