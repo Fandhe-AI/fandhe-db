@@ -521,6 +521,9 @@ impl<'a> WriteTarget<'a> {
                 let write_txn = storage
                     .begin_write_txn()
                     .map_err(|e| Er::from(convert_write_txn_err(e)))?;
+                // ビュー経由の書き込み（TABLE-43・Issue #1671）なら、書き換え時点の定義と照合する。
+                // 不一致は書き込み前に `Err` で返り、`write_txn` は drop（abort）される。
+                verify_view_write_scope(&write_txn).map_err(Er::from)?;
                 let (value, effect) = f(&write_txn)?;
                 match effect {
                     TxnEffect::Wrote => crate::recovery::commit_boundary::commit(write_txn)
@@ -530,7 +533,11 @@ impl<'a> WriteTarget<'a> {
                 }
                 Ok(value)
             }
-            WriteTarget::InTxn(write_txn) => f(write_txn).map(|(value, _)| value),
+            WriteTarget::InTxn(write_txn) => {
+                // 照合は書き込み前に失敗するため、共有 `write_txn` は汚れない（再試行しても安全）。
+                verify_view_write_scope(write_txn).map_err(Er::from)?;
+                f(write_txn).map(|(value, _)| value)
+            }
         }
     }
 
@@ -548,6 +555,12 @@ impl<'a> WriteTarget<'a> {
             WriteTarget::InTxn(_) => crate::constraint::FkCheckMode::ImmediateOnly,
         }
     }
+}
+
+/// [`WriteTarget::with_txn`] の冒頭で呼ぶ、ビュー経由の書き込み区間の指紋照合
+/// （`sql::view_write_scope`。区間外では何もしない。TABLE-43・Issue #1671）。
+fn verify_view_write_scope(write_txn: &redb::WriteTransaction) -> Result<(), TenantWriteError> {
+    crate::sql::view_write_scope::verify_in_txn(write_txn).map_err(TenantWriteError::Catalog)
 }
 
 /// [`WriteTarget::with_txn`] に渡すクロージャが、書き込みを行ったかどうかを

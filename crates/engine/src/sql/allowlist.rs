@@ -3360,6 +3360,33 @@ pub struct ValidatedInsert {
     pub on_conflict: Option<OnConflictClause>,
 }
 
+/// 構造検証を通過した、ビューへの `INSERT` 文（TABLE-43・Issue #1671）。送られた文の形
+/// （ビュー名と公開名の列）をそのまま保持し、基表への書き換えは Execute 時に現在のカタログで行う
+/// （拡張クエリプロトコルでは Parse と Execute の間に `CREATE OR REPLACE VIEW`／`DROP VIEW` が入りうる
+/// ため、Parse 時点の写像を持ち越さない）。`core.rs` の `ParsedSql::ViewInsert` が保持し、
+/// `sql::view_insert::rewrite_view_insert` が基表形の [`ValidatedInsert`] へ写す。
+/// フィールドは非公開（将来の拡張を非破壊に保つ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedViewInsert {
+    pub(crate) shape: ValidatedInsert,
+}
+
+impl ValidatedViewInsert {
+    pub(crate) fn new(shape: ValidatedInsert) -> Self {
+        ValidatedViewInsert { shape }
+    }
+
+    /// INTO に指定されたビュー名。
+    pub fn view_name(&self) -> &str {
+        &self.shape.table_name
+    }
+
+    /// 文末句で搬送された `operation_id`（`USING OPERATION_ID`）。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        self.shape.operation_id.as_ref()
+    }
+}
+
 /// 許可形状の構造判定を通過した単一行・`id` 指定形 `DELETE` 文（SQL-18・
 /// TASK-191）。`ValidatedInsert` と同様、本モジュールが保証するのはここまでの
 /// 構造情報のみで、`id` 値の意味論的妥当性（`u64` として解釈可能か）は
@@ -16198,16 +16225,30 @@ pub(crate) fn validate_insert_tokens_with_limit(
     mode: LedgerMode,
     max_insert_rows: Option<std::num::NonZeroUsize>,
 ) -> Result<ValidatedInsert, SqlSurfaceError> {
-    let mut p = Parser::new(tokens).with_max_insert_rows(max_insert_rows);
-    let shape = p.parse_insert()?;
-    p.expect_end_of_statement()?;
-
-    mode.require(shape.operation_id.as_ref())?;
+    let shape = parse_insert_shape_tokens_with_limit(tokens, mode, max_insert_rows)?;
 
     let exists = lookup.table_exists(&shape.table_name)?;
     if !exists {
         return Err(SqlSurfaceError::undefined_table(shape.table_name));
     }
+
+    Ok(shape)
+}
+
+/// [`validate_insert_tokens_with_limit`] の前半（構造検証と `operation_id` 必須化ガードまで。
+/// カタログ照会はしない。判定順序は元の関数と同じ）。`core.rs` の `parse_tokens` が、INTO の名前が
+/// 表でなかったときにビューへの INSERT として扱う（`ParsedSql::ViewInsert`。TABLE-43・Issue #1671）
+/// ために、構造検証を二重に行わず形だけを取り出す入口。返す `table_name` は存在確認前の名前。
+pub(crate) fn parse_insert_shape_tokens_with_limit(
+    tokens: &[lexer::Token],
+    mode: LedgerMode,
+    max_insert_rows: Option<std::num::NonZeroUsize>,
+) -> Result<ValidatedInsert, SqlSurfaceError> {
+    let mut p = Parser::new(tokens).with_max_insert_rows(max_insert_rows);
+    let shape = p.parse_insert()?;
+    p.expect_end_of_statement()?;
+
+    mode.require(shape.operation_id.as_ref())?;
 
     Ok(ValidatedInsert {
         table_name: shape.table_name,

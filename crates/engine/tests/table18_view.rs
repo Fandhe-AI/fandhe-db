@@ -759,6 +759,14 @@ fn writes_to_a_view_are_rejected_with_no_side_effects() {
     let mut session = allowed_session();
 
     create_view(&core, &mut session, "CREATE VIEW v AS SELECT * FROM docs").expect("create v");
+    // 評価後射影形（`LIMIT` つき）のビューは自動更新不可（TABLE-43 (3)・Issue #1670）。単純形
+    // ビューへの INSERT は基表へ書き換わる（Issue #1671。`table43_view_insert.rs`）。
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW vb AS SELECT * FROM docs LIMIT 5",
+    )
+    .expect("create vb");
 
     let before = scan(&core, "alice", "SELECT id FROM docs LIMIT 100").expect("before");
 
@@ -767,10 +775,10 @@ fn writes_to_a_view_are_rejected_with_no_side_effects() {
         .execute_sql_in_session(
             &ctx("alice"),
             &mut write_session,
-            "INSERT INTO v (id, embedding, lang, body) VALUES (200, '[1,1]', 'ja', 'x') USING OPERATION_ID 'op-view-write-1'",
+            "INSERT INTO vb (id, embedding, lang, body) VALUES (200, '[1,1]', 'ja', 'x') USING OPERATION_ID 'op-view-write-1'",
         )
-        .expect_err("insert into a view must be rejected");
-    assert_eq!(err.wire_code(), "42809");
+        .expect_err("insert into a non-updatable view must be rejected");
+    assert_eq!(err.wire_code(), "55000");
 
     let err = core
         .execute_sql_in_session(

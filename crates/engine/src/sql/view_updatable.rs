@@ -5,7 +5,7 @@
 //! 解析で `UndefinedTable` になった名前がビューだったとき。`EngineCore::
 //! reclassify_write_to_view_error_for`）で、結果が [`ViewUpdatability::NotAutoUpdatable`] なら
 //! `55000`（[`SqlSurfaceError::ViewNotAutoUpdatable`]）で拒否する。後続の書き換え実装
-//! （INSERT: Issue #1671、UPDATE／DELETE: Issue #1672）と `WITH CHECK OPTION` の宣言検査
+//! （INSERT: Issue #1671〔`sql::view_insert`で結線済み〕、UPDATE／DELETE: Issue #1672）と `WITH CHECK OPTION` の宣言検査
 //! （Issue #1673）も、この判定を前提にする。
 //!
 //! 判定は第 2 の分類器を作らず、読み取り経路と同じ [`resolve_from`] の結果に乗る。
