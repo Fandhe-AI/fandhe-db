@@ -226,6 +226,10 @@ pub struct SessionState {
     /// `Arc` を持つのは本構造体とその巻き戻し用 clone だけで、全部 drop されるとメモリごと
     /// 消える（切断時の破棄）。詳細は `sql::temp_rows` のモジュールドキュメント。
     temp_rows: Option<std::sync::Arc<crate::sql::temp_rows::TempRowStore>>,
+    /// `currval` 用の状態（TABLE-24・Issue #1690）。接続単位の値型であるため他接続・他テナントへ
+    /// 漏れる経路は構造上存在しない。`Arc` 共有なので、BEGIN 時のコピーを ROLLBACK／abort で
+    /// 戻しても値は消えない（PostgreSQL の `currval` と同じ。`sql/transaction.rs` 参照）。
+    sequences: crate::sql::sequence_scope::SharedSessionSequences,
 }
 
 impl SessionState {
@@ -261,6 +265,12 @@ impl SessionState {
     /// 検証し直すかどうかの判定に使う。一時表を持たないセッションの挙動は従来と同一。
     pub fn has_temp_tables(&self) -> bool {
         !self.temp_tables.is_empty()
+    }
+
+    /// `currval` 用の状態の共有ハンドル（INSERT 実行区間の `SequenceScope` が受け取る。
+    /// TABLE-24・Issue #1690）。
+    pub(crate) fn sequences_handle(&self) -> crate::sql::sequence_scope::SharedSessionSequences {
+        std::sync::Arc::clone(&self.sequences)
     }
 
     /// このセッションの一時カタログ（読み取り専用。TABLE-44・Issue #1681）。

@@ -1118,6 +1118,7 @@ Date: <IMF-fixdate>
 | `22004` | `NULL_VALUE_NOT_ALLOWED` | 400 | Bad Request | SQL 表層の `jsonb_build_object` のキーが NULL。NoSQL の `op` 語彙からは到達しない。Issue #1599 |
 | `22007` | `INVALID_DATETIME_FORMAT` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの書式違反（`insert`／`update`／`filter`。Issue #1187） |
 | `22008` | `DATETIME_FIELD_OVERFLOW` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正（`update` の `set` 経由） |
+| `2200H` | `SEQUENCE_GENERATOR_LIMIT_EXCEEDED` | 400 | Bad Request | `DEFAULT nextval('<SEQUENCE>')` を持つ列を省略した `insert` で、NO CYCLE の SEQUENCE が上限・下限に達した（TABLE-24・Issue #1690。副作用ゼロ。値・SEQUENCE 名は含めない） |
 | `22012` | `DIVISION_BY_ZERO` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約（TABLE-16・TASK-204）の式評価での 0 除算 |
 | `22015` | `INTERVAL_FIELD_OVERFLOW` | 400 | Bad Request | `INTERVAL` リテラルのフィールド値が範囲外（数値が `i64` に収まらない・単位換算や累積があふれる）。SQL 表層に加え、NoSQL の INTERVAL 列への `insert`／`update`／`filter` の文字列束縛からも到達する（型束縛は #1583 で対応）。Issue #1579 |
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |

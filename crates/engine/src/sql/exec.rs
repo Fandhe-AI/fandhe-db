@@ -4309,6 +4309,9 @@ pub(crate) fn map_write_error(
         // SET 右辺式の評価エラー（Issue #1544・SQL-45 のポインタ）も内側の
         // `SqlSurfaceError` を透過する（通常の式評価と同じ `wire_code`）。
         TenantWriteError::SetExpressionEvaluationFailed(inner) => inner,
+        // `nextval`／`currval` の採番・解決の失敗（`2200H`・`55000`・`22003`・`0A000` 等。
+        // TABLE-24・Issue #1690）も内側の `SqlSurfaceError` を透過する。
+        TenantWriteError::SequenceEvaluationFailed(inner) => inner,
         // `FOREIGN KEY` 制約違反（`23503`。TABLE-17・TASK-205、Issue #907）。`_` 節
         // （`XX000`）へ丸めると、クライアントが参照整合性違反をサーバー内部事象と
         // 取り違える。値・参照先の有無の理由を含まない固定文言。
@@ -5116,6 +5119,50 @@ pub fn execute_insert_returning(
     )
 }
 
+/// 採番が要る列（`nextval`／`currval` の値・`DEFAULT nextval`。TABLE-24・Issue #1690）の印か。
+fn is_sequence_mark(c: &crate::sql::parser::VolatileColumn) -> bool {
+    matches!(
+        c,
+        crate::sql::parser::VolatileColumn::Sequence(..)
+            | crate::sql::parser::VolatileColumn::DefaultSequence(..)
+    )
+}
+
+/// `bound.values` の採番列を、列位置から引いた整数 `pick` で列型の値に差し替えた複製を返す
+/// （`RETURNING` の投影用。`pick` が `None`・整数 3 型以外・範囲外は内部不整合として `Internal`。
+/// 書き込み側（`tenant::assign_sequence_values`）が同じ検査を済ませているため通常到達しない）。
+fn sequence_patched_values(
+    bound: &crate::sql::parser::BoundInsert,
+    schema: &TableSchema,
+    pick: impl Fn(usize) -> Option<i64>,
+) -> Result<Vec<crate::row_codec::Value>, SqlSurfaceError> {
+    use crate::catalog::ColumnType;
+    use crate::row_codec::Value;
+    let internal = || SqlSurfaceError::Internal {
+        detail: "RETURNING sequence column mismatch".to_string(),
+    };
+    let mut values = bound.values.clone();
+    for mark in bound
+        .volatile_default_columns
+        .iter()
+        .filter(|c| is_sequence_mark(c))
+    {
+        let idx = mark.index();
+        let column = schema.columns.get(idx).ok_or_else(internal)?;
+        let v = pick(idx).ok_or_else(internal)?;
+        let patched = match column.ty {
+            ColumnType::SmallInt => {
+                Value::Integer(i32::from(i16::try_from(v).map_err(|_| internal())?))
+            }
+            ColumnType::Integer => Value::Integer(i32::try_from(v).map_err(|_| internal())?),
+            ColumnType::BigInt => Value::BigInt(v),
+            _ => return Err(internal()),
+        };
+        *values.get_mut(idx).ok_or_else(internal)? = patched;
+    }
+    Ok(values)
+}
+
 /// `INSERT` の挿入行に固定で付く可視性（書き込み側と RETURNING の可視性検査で共有する）。
 const INSERT_ROW_VISIBILITY: crate::storage::Visibility = crate::storage::Visibility::Private;
 
@@ -5154,19 +5201,61 @@ pub(crate) fn execute_insert_returning_in(
             detail: "RETURNING row is not visible under the policy context".to_string(),
         });
     }
+    // `nextval`／`currval` の列（TABLE-24・Issue #1690）は束縛時点では仮値 `Null` のため、書き込み前の
+    // 投影（バイト予算の検査）には列型の代表値を置き、書き込み後に払い出された値で投影し直す
+    // （どちらも整数セルで大きさが同じなので、再投影は失敗しない）。印が無い文は従来どおり。
+    let has_sequence = bounds
+        .iter()
+        .any(|b| b.volatile_default_columns.iter().any(is_sequence_mark));
     let mut rows = Vec::new();
     let mut budget = 0usize;
     for bound in bounds {
-        rows.push(crate::sql::returning::project_row(
-            bound.id,
-            &bound.values,
-            returning,
-            &mut budget,
-        )?);
+        if has_sequence {
+            let probe = sequence_patched_values(bound, schema, |_| Some(0))?;
+            rows.push(crate::sql::returning::project_row(
+                bound.id,
+                &probe,
+                returning,
+                &mut budget,
+            )?);
+        } else {
+            rows.push(crate::sql::returning::project_row(
+                bound.id,
+                &bound.values,
+                returning,
+                &mut budget,
+            )?);
+        }
+    }
+    if has_sequence {
+        // 前の文の受け渡し値を持ち越さない。
+        let _ = crate::sql::sequence_scope::take_assigned();
     }
 
     let insert_outcome =
         execute_insert_batch_with_schema_in(target, ctx, bounds, ledger_mode, Some(schema))?;
+
+    if has_sequence {
+        let assigned = crate::sql::sequence_scope::take_assigned();
+        rows.clear();
+        let mut budget = 0usize;
+        for (row_idx, bound) in bounds.iter().enumerate() {
+            // 払い出し値が記録されていない列は黙って 0 にせず内部不整合として拒否する
+            // （fail-closed。書き込みは commit 済みだが、誤った値を返すより失敗を返す）。
+            let values = sequence_patched_values(bound, schema, |col| {
+                assigned
+                    .iter()
+                    .find(|(r, c, _)| *r == row_idx && *c == col)
+                    .map(|(_, _, v)| *v)
+            })?;
+            rows.push(crate::sql::returning::project_row(
+                bound.id,
+                &values,
+                returning,
+                &mut budget,
+            )?);
+        }
+    }
 
     Ok(ReturningOutcome {
         command: crate::sql::returning::DmlCommand::Insert,

@@ -957,6 +957,15 @@ pub(crate) enum HashColumnInput<'a> {
     /// ハッシュになる。省略列へ DEFAULT を適用した列は材料に含めない（Issue #1629 D1。
     /// 旧種別バイト `2` は退役・再利用禁止）。
     ValuesTime(crate::catalog::TimeDefault),
+    /// `INSERT … VALUES` の要素に書かれた単独の `nextval('<名前>')`／`currval('<名前>')`
+    /// （種別バイト `1`。TABLE-24・Issue #1690）。評価値（採番結果）ではなく構文形
+    /// （関数名と SEQUENCE 名）をハッシュするため、再送で値が変わっても同一ハッシュになる
+    /// （RECOVER-10・RECOVER-11）。省略列へ適用した `DEFAULT nextval` は時刻 DEFAULT と同じく
+    /// 材料に含めない（Issue #1629 D1）。
+    ValuesSequence {
+        func: crate::sql::allowlist::SequenceFunc,
+        name: &'a str,
+    },
 }
 
 /// [`for_typed_insert_batch_expr`]・[`for_typed_upsert_expr`]・`tenant.rs` が共有する
@@ -1048,6 +1057,17 @@ fn push_expr_row(
                 b.push_bytes(name.as_bytes())?;
                 b.push_u8(1);
                 push_dml_expr(b, &time_default_expr(*time), None).map_err(|_| {
+                    StorageError::Codec("content hash values expression too large".to_string())
+                })?;
+            }
+            HashColumnInput::ValuesSequence { func, name: seq } => {
+                b.push_bytes(name.as_bytes())?;
+                b.push_u8(1);
+                let expr = crate::sql::udf_call::Expr::Call {
+                    name: func.name().to_string(),
+                    args: vec![crate::sql::udf_call::Expr::String((*seq).to_string())],
+                };
+                push_dml_expr(b, &expr, None).map_err(|_| {
                     StorageError::Codec("content hash values expression too large".to_string())
                 })?;
             }
@@ -1705,6 +1725,11 @@ fn push_dml_assignments(
                 return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                     "time function literal is not valid in UPDATE SET",
                 ));
+            }
+            // `nextval`／`currval` の単独形（TABLE-24・Issue #1690）も UPDATE の `SET` リテラルには
+            // 現れない（束縛段が `0A000` で拒否済み）。到達は fail-closed で拒否する。
+            InsertLiteral::SequenceCall { .. } => {
+                return Err(crate::sql::parser::reject_sequence_call_literal());
             }
         }
     }
@@ -2634,6 +2659,37 @@ mod tests {
                 assert_ne!(values(*a), values(*b), "{a:?} vs {b:?}");
             }
         }
+    }
+
+    /// TABLE-24・Issue #1690: `VALUES` の単独 `nextval`／`currval`（種別 1）は構文形（関数名と
+    /// SEQUENCE 名）だけで決まり、同じ構文形は安定、関数名・SEQUENCE 名が違えば別内容になる。
+    /// 時刻関数の構文形とも衝突しない。
+    #[test]
+    fn values_sequence_kind_is_stable_and_distinct() {
+        use crate::catalog::TimeDefault;
+        use crate::sql::allowlist::SequenceFunc;
+        let embedding = [1.0_f32, 0.0];
+        let hash = |col: HashColumnInput<'_>| {
+            let cols = [("n", col)];
+            for_typed_insert_expr(1, Visibility::Private, &embedding, &cols).expect("hash")
+        };
+        let seq = |func, name| hash(HashColumnInput::ValuesSequence { func, name });
+        assert_eq!(
+            seq(SequenceFunc::Nextval, "s"),
+            seq(SequenceFunc::Nextval, "s")
+        );
+        assert_ne!(
+            seq(SequenceFunc::Nextval, "s"),
+            seq(SequenceFunc::Nextval, "t")
+        );
+        assert_ne!(
+            seq(SequenceFunc::Nextval, "s"),
+            seq(SequenceFunc::Currval, "s")
+        );
+        assert_ne!(
+            seq(SequenceFunc::Nextval, "now"),
+            hash(HashColumnInput::ValuesTime(TimeDefault::Now))
+        );
     }
 
     /// バッチ・UPSERT の `*Expr` 形は、単一行形・従来形・互いに別ドメインで、行境界を

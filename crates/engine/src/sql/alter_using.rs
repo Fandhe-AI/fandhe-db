@@ -161,7 +161,7 @@ pub(crate) fn bind_alter_conversion(
 /// Issue #1637）。`catalog` の `ALTER COLUMN TYPE` の一般変換経路が、スキーマ書き戻しの前に
 /// 呼ぶ。行は読まない。
 ///
-/// - `CurrentTime`（時刻値関数）は構文形のまま、新しい型と整合するときだけ保持する。
+/// - `CurrentTime`（時刻値関数）・`Sequence`（`DEFAULT nextval`）は構文形のまま、新しい型と整合するときだけ保持する。
 /// - それ以外は旧型の値として実体化 → 1 列だけのスキーマ上で代入変換を評価 → 正準形へ戻す。
 ///   正準形は新しい型で束縛し直せることを確かめる（整数・bool・文字列は値も一致を要求し、
 ///   浮動小数・NUMERIC・日時は束縛成功をもって可とする）。
@@ -182,6 +182,17 @@ pub(crate) fn convert_column_default_for_alter(
     };
     if let ColumnDefault::CurrentTime(t) = default {
         return if t.compatible_with(new_ty) {
+            Ok(default.clone())
+        } else {
+            Err(fail())
+        };
+    }
+    // `DEFAULT nextval`（TABLE-24・Issue #1690）は構文形のまま、新しい型が整数 3 型のときだけ保持する。
+    if let ColumnDefault::Sequence(_) = default {
+        return if matches!(
+            new_ty,
+            ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt
+        ) {
             Ok(default.clone())
         } else {
             Err(fail())
@@ -340,6 +351,8 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::InFailedSqlTransaction
         | E::LockNotAvailable
         | E::MaterializedViewNotPopulated
+        | E::SequenceNotYetDefined
+        | E::SequenceGeneratorLimitExceeded { .. }
         | E::MaterializedViewNotRefreshableConcurrently
         | E::ViewNotAutoUpdatable { .. }
         | E::PartitionedDmlInTransaction

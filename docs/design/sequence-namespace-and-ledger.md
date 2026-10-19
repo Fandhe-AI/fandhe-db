@@ -214,3 +214,51 @@ Issue #1711 より前の定義は全テナント共有の `public` に属する�
 - 未知の名前の `42P01` はテナントによらず同一の応答で、文言にテナント情報を含めない
 
 **既知の残課題**: 他テナントのスキーマに属する SEQUENCE を名前で解決できないことの完全な実現は、#1711（tenant 所有のスキーマ）と #1717（SEQUENCE の修飾名）に属する。`sequence_key` が差し替え点。
+
+## 8. Issue #1690 実装記録（nextval と currval）
+
+親 #1686。ポインタ: TABLE-24 (1)〜(5)・ERR-6・RECOVER-10・RECOVER-11。
+
+### 8.1 採番は書き込み txn の中で、台帳照合の後に行う
+
+束縛段（`bind_insert_row`・`fill_omitted_columns`）は値を作らず、該当列に仮値 `Null` を置いて印（`VolatileColumn::Sequence`／`DefaultSequence`）だけを運ぶ。`tenant` の INSERT 系書き込みが `ledger::record_in_txn` の後に、書き込み txn 内で名前を解決して払い出し、行のエンコードと制約検査より前に値を差し込む。
+
+- 同じ `operation_id` の再送は台帳照合で `23505` になるため、値を消費しない（TABLE-24 (3)）
+- 束縛から書き込みまでの間に `DROP SEQUENCE` が挟まっても、書き込み txn 内の解決で古い ID へ書かない。未知の名前はテナントによらず同一の `42P01`
+- 評価順は行は文の順、行の中は列順。同じ行の `VALUES (nextval('s'), currval('s'))` の `currval` は直前の値を返す
+- 内容照合ハッシュは構文形（関数名と SEQUENCE 名）だけを使う（種別バイト `1`）。省略列へ適用した `DEFAULT nextval` は材料から除外する（時刻 DEFAULT と同じ）。印を持たない文のハッシュはバイト単位で不変
+
+### 8.2 アロケータと永続化
+
+`catalog::sequence::SequenceAllocator`（`Storage` が 1 つ所有）が `(tenant_id, sequence_id)` ごとの現在値（`last_value`・`is_called`）をプロセス内に持つ。
+
+- 払い出しは初回が START、以降は `checked_add(increment)`。範囲外は CYCLE なら反対側の端へ折り返し、NO CYCLE なら `2200H`（現在値は進めない）
+- 払い出した時点で、同じ write txn の `sequence_state` へ現在値を書く。状態値は `[版 1][last_value i64 LE][is_called]` の 10 バイト固定で、未知の版・長さ不一致・`is_called` の不正値は `CorruptSchema`
+- メモリに無いときは永続化済みの状態行から種を作り、無ければ START・未呼び出しから始める
+- ROLLBACK は永続値だけを戻し、メモリ上の現在値は戻さない。同じプロセスでは同じ値を再び払い出さない（欠番は許容。TABLE-24 (1)）。明示トランザクションは単一ライタを保持するので、commit 済みの行に入った値は必ず同じ txn が永続化した現在値で覆われる（TABLE-24 (4)）
+- `DROP SEQUENCE` は commit 成功後に全テナント分のメモリ上の現在値を捨てる
+- 保持件数（アロケータ・セッション）は上限つきで、超過は `54000`。ロックの毒化は `XX000`
+- ROLLBACK 後にクラッシュした場合の再払い出しを補強 txn で防ぐ設計と、クラッシュ注入による検証は #1692 に残す
+
+### 8.3 CACHE の扱い（D4 が #1690 に割り当てた判断）
+
+CACHE は引き続き `0A000` で、内部の値は 1 固定のまま。永続化の刻み幅は 1（払い出しのたびに書く）なので、共有カウンタとセッション別確保の観測差は生じない。方式の確定は、CACHE を受理する Issue で行う。
+
+### 8.4 セッションの currval と RETURNING
+
+- `currval` 用の状態は `SessionState` が `Arc<Mutex<..>>` で持つ。BEGIN 時のコピーは `Arc` を共有するので、ROLLBACK で `SessionState` を巻き戻しても保持される（PostgreSQL と同じ）。未呼び出しは `55000`
+- 書き込み区間の文脈（アロケータとセッション状態）は `sql::sequence_scope::SequenceScope`（スレッドローカルの RAII。`core.rs` の INSERT 入口が autocommit・明示トランザクションの双方で開く）で `WriteTarget::InTxn` まで運ぶ。スコープが無い `Autocommit` は `Storage` のアロケータだけを使う（NoSQL の `DEFAULT nextval`。`currval` は `0A000`）。明示トランザクションでスコープが無ければ `0A000`
+- `RETURNING` は書き込み前に列型の代表値でバイト予算を検査し、書き込み後にスコープへ記録された払い出し値で投影し直す。記録が無い列は内部不整合として拒否する（黙って 0 にしない）
+
+### 8.5 DEFAULT
+
+- `ColumnDefault::Sequence(名前)`（カタログタグ `q`）。整数 3 型（SMALLINT・INTEGER・BIGINT）の列だけが受理する。範囲外は採番時に `22003`（値は消費済み）
+- CREATE TABLE と `ALTER COLUMN SET DEFAULT` は、永続化と同じ write txn で SEQUENCE の存在を確認する（無ければ `42P01`）。`ADD COLUMN`・FK の `SET DEFAULT`・COPY・ファイル形 INSERT・UPSERT は `0A000`
+- `DROP SEQUENCE` の依存検査（`column_default_references_sequence`）は `DEFAULT nextval` を参照として数え、`2BP01` を返す（#1688 が先送りした正例）
+
+### 8.6 受理する構文と対象外
+
+- 受理: INSERT の `VALUES` 要素と列 DEFAULT の単独形 `nextval('<名前>')`・`currval('<名前>')`（`currval` は VALUES のみ）。名前は文字列リテラル（regclass 相当）で、大文字小文字は保持する
+- `0A000`: 修飾名・引用付きの名前（#1717）、SELECT 投影・WHERE・UPDATE SET・ビュー本文などの式位置（書き込み txn を伴う読み取り文の経路が無い。#1691 の `lastval` と合わせて判断する）、UPSERT・COPY・ファイル形 INSERT・分割実行、DEFAULT の `currval`
+- 合成式（`nextval('s') + 1` 等）は単独形にならず従来の定数式経路で拒否される。`nextval`／`currval` は UDF 名として予約する
+- #1689（ALTER SEQUENCE）は RESTART でアロケータの現在値を捨てる処理を担う

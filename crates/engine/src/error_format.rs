@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 71;
+    count = 72;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -244,6 +244,10 @@ define_error_classes! {
     /// [`crate::sql::allowlist::SqlSurfaceError::MaterializedViewNotRefreshableConcurrently`]・
     /// [`crate::sql::allowlist::SqlSurfaceError::ViewNotAutoUpdatable`] の写像。
     ObjectNotInPrerequisiteState => ("55000", "OBJECT_NOT_IN_PREREQUISITE_STATE"),
+    /// SEQUENCE の上限・下限に達した（NO CYCLE。`2200H`。TABLE-24・ERR-6、Issue #1690）。
+    /// 値・SEQUENCE 名・テナントは含めない固定文言。
+    /// [`crate::sql::allowlist::SqlSurfaceError::SequenceGeneratorLimitExceeded`] の写像。
+    SequenceGeneratorLimitExceeded => ("2200H", "SEQUENCE_GENERATOR_LIMIT_EXCEEDED"),
     /// `CREATE TABLE` が指定したテーブル名が既に存在する（`42P07`）。TABLE-4・
     /// TASK-85（Issue #899）が追加。上書きしない設計（既存スキーマは変更されない）。
     /// `CREATE VIEW`（TABLE-18・SQL-23・TASK-205、Issue #909）が既存のテーブル

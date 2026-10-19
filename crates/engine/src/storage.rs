@@ -710,6 +710,10 @@ pub struct Storage {
     #[allow(dead_code)]
     // #1128 の実行器が結線するまで [`Self::partitioned_job_registry`] 経由のみ
     partitioned_jobs: std::sync::Arc<crate::recovery::partitioned_job::JobRegistry>,
+    /// SEQUENCE の現在値アロケータ（TABLE-24・Issue #1690）。1 DB ファイルにつき 1 つの
+    /// プロセス内状態という点で [`Self::writer_gate`] と同形。`Arc` なのは明示トランザクション用の
+    /// スコープ（`sql::sequence_scope`）へ渡すため。
+    sequence_allocator: std::sync::Arc<crate::catalog::sequence::SequenceAllocator>,
     /// 書き込みトランザクション取得（autocommit・明示トランザクション双方）が
     /// [`Self::writer_gate`] を待つ上限（既定 30 秒）。超過時は
     /// [`StorageError::WriteLockTimeout`]（`55P03`）を返す。
@@ -748,6 +752,7 @@ impl Storage {
             write_txn_creations: std::sync::atomic::AtomicU64::new(0),
             writer_gate: writer_gate::WriterGate::new(),
             partitioned_jobs: Default::default(),
+            sequence_allocator: Default::default(),
             write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             #[cfg(feature = "test-sync-points")]
             sync_hook: std::sync::Mutex::new(None),
@@ -803,6 +808,14 @@ impl Storage {
         &self,
     ) -> &std::sync::Arc<crate::recovery::partitioned_job::JobRegistry> {
         &self.partitioned_jobs
+    }
+
+    /// SEQUENCE の現在値アロケータ（TABLE-24・Issue #1690）。書き込み経路（`tenant`）と
+    /// `catalog::sequence`（DROP 時の破棄）が使う。
+    pub(crate) fn sequence_allocator(
+        &self,
+    ) -> &std::sync::Arc<crate::catalog::sequence::SequenceAllocator> {
+        &self.sequence_allocator
     }
 
     /// 書き込みロック待ちの上限（[`Self::writer_gate`]）を明示指定する（短くしたテスト用。
@@ -3200,6 +3213,7 @@ mod tests {
                 write_txn_creations: std::sync::atomic::AtomicU64::new(0),
                 writer_gate: writer_gate::WriterGate::new(),
                 partitioned_jobs: Default::default(),
+                sequence_allocator: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3265,6 +3279,7 @@ mod tests {
                 write_txn_creations: std::sync::atomic::AtomicU64::new(0),
                 writer_gate: writer_gate::WriterGate::new(),
                 partitioned_jobs: Default::default(),
+                sequence_allocator: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3326,6 +3341,7 @@ mod tests {
                 write_txn_creations: std::sync::atomic::AtomicU64::new(0),
                 writer_gate: writer_gate::WriterGate::new(),
                 partitioned_jobs: Default::default(),
+                sequence_allocator: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3367,6 +3383,7 @@ mod tests {
                 write_txn_creations: std::sync::atomic::AtomicU64::new(0),
                 writer_gate: writer_gate::WriterGate::new(),
                 partitioned_jobs: Default::default(),
+                sequence_allocator: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),

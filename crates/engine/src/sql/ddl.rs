@@ -153,9 +153,9 @@ pub(crate) fn build_table_schema(
     // 不正リテラル等を永続化前に SQLSTATE 付きで拒否する）。
     for column in &columns {
         if let Some(default) = &column.default_expr {
-            // 時刻 DEFAULT は評価せず（型適合は構文段・`validate_schema` が検査済み）、
+            // 時刻・SEQUENCE の DEFAULT は評価せず（型適合は構文段・`validate_schema` が検査済み）、
             // `bind_column_default` へ流さない（あちらは定数 DEFAULT 専用）。
-            if !matches!(default, ColumnDefault::CurrentTime(_)) {
+            if !default.is_statement_evaluated() {
                 crate::sql::parser::bind_column_default(column, default)?;
             }
         }
@@ -1562,7 +1562,7 @@ fn prepare_set_default_probe(
     // 変更対象の `default_expr` スロットだけを正規化する。
     normalize_timestamptz_slot_if_needed(&mut probe)?;
     if let Some(default) = &probe.default_expr {
-        if !matches!(default, ColumnDefault::CurrentTime(_)) {
+        if !default.is_statement_evaluated() {
             crate::sql::parser::bind_column_default(&probe, default)?;
         }
     }
@@ -1930,7 +1930,10 @@ fn reject_time_default_set_default(
         }
         let has_time_default = fk.columns().iter().any(|name| {
             columns.iter().any(|c| {
-                &c.name == name && matches!(c.default_expr, Some(ColumnDefault::CurrentTime(_)))
+                &c.name == name
+                    && c.default_expr
+                        .as_ref()
+                        .is_some_and(ColumnDefault::is_statement_evaluated)
             })
         });
         if has_time_default {
@@ -2055,6 +2058,25 @@ fn column_default_from_literal(
         ))
     };
     match literal {
+        // `DEFAULT nextval('<名前>')`（TABLE-24・Issue #1690）。整数 3 型の列だけが受理する。
+        // SEQUENCE の存在確認は永続化と同じ write txn 内で行う（`catalog` の作成・SET DEFAULT）ため、
+        // ここでは構文形を保存形にするだけ。`currval` の DEFAULT は PostgreSQL では可能だが未対応。
+        InsertLiteral::SequenceCall { func, name } => {
+            if *func != crate::sql::allowlist::SequenceFunc::Nextval {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "currval is not supported as a column DEFAULT".to_string(),
+                });
+            }
+            if !matches!(
+                ty,
+                ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt
+            ) {
+                return Err(mismatch_error(format!(
+                    "column {column_name:?} DEFAULT nextval requires an integer column"
+                )));
+            }
+            Ok(ColumnDefault::Sequence(name.clone()))
+        }
         // 定数式（`TIMESTAMPTZ '...'`・`timezone(...)`／`AT TIME ZONE` の結果）が畳み込まれた
         // 絶対時刻（Issue #1576・TABLE-33）。日時列の保持形（テキスト）へ DDL 時点の
         // セッション TimeZone で変換する。TIMESTAMPTZ は UTC の明示 offset 付き表記へ

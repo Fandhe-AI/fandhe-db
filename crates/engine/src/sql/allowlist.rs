@@ -678,6 +678,12 @@ pub enum SqlSurfaceError {
     /// 未実体化の MATERIALIZED VIEW を読んだ（`55000`。TABLE-42・Issue #1664）。
     /// 文言は固定で、名前・件数・他文脈の情報を含めない。
     MaterializedViewNotPopulated,
+    /// `currval` を、そのセッションで `nextval` を一度も呼んでいない SEQUENCE に対して呼んだ
+    /// （TABLE-24・ERR-6: `55000`。Issue #1690）。名前・値・テナントを含まない固定文言。
+    SequenceNotYetDefined,
+    /// NO CYCLE の SEQUENCE が上限（昇順）または下限（降順）に達した（TABLE-24・ERR-6:
+    /// `2200H`。Issue #1690）。`ascending` は文言の方向のみを選ぶ（値・名前は含めない）。
+    SequenceGeneratorLimitExceeded { ascending: bool },
     /// `REFRESH MATERIALIZED VIEW CONCURRENTLY` の前提（WHERE を持たない列の UNIQUE 索引）を
     /// 満たさない（`55000`。TABLE-42 (4)・Issue #1666）。文言は固定で、名前・索引・件数を含めない。
     MaterializedViewNotRefreshableConcurrently,
@@ -1248,8 +1254,12 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::LockNotAvailable => ErrorClass::LockNotAvailable,
             SqlSurfaceError::MaterializedViewNotPopulated
             | SqlSurfaceError::MaterializedViewNotRefreshableConcurrently
+            | SqlSurfaceError::SequenceNotYetDefined
             | SqlSurfaceError::ViewNotAutoUpdatable { .. } => {
                 ErrorClass::ObjectNotInPrerequisiteState
+            }
+            SqlSurfaceError::SequenceGeneratorLimitExceeded { .. } => {
+                ErrorClass::SequenceGeneratorLimitExceeded
             }
             SqlSurfaceError::TransactionFeatureNotSupported { .. } => {
                 ErrorClass::FeatureNotSupported
@@ -1405,6 +1415,16 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::MaterializedViewNotRefreshableConcurrently => {
                 write!(f, "cannot refresh materialized view concurrently")
+            }
+            SqlSurfaceError::SequenceNotYetDefined => {
+                write!(f, "currval of sequence is not yet defined in this session")
+            }
+            SqlSurfaceError::SequenceGeneratorLimitExceeded { ascending } => {
+                if *ascending {
+                    write!(f, "nextval: reached maximum value of sequence")
+                } else {
+                    write!(f, "nextval: reached minimum value of sequence")
+                }
             }
             SqlSurfaceError::ViewNotAutoUpdatable { op, .. } => match op {
                 ViewWriteOp::Insert => write!(f, "cannot insert into view"),
@@ -3276,6 +3296,37 @@ pub enum InsertLiteral {
     /// セッション TZ の局所値へ。`sql::parser::bind_tstz_literal`）。文字列化して列側 parse へ
     /// 渡すと TIMESTAMP・DATE 列が offset を拒否するため、型を保持する。
     TimestampTz(i64),
+    /// `VALUES` 要素・列 `DEFAULT` が単独の `nextval('<名前>')`／`currval('<名前>')` だった場合の
+    /// 構文形（TABLE-24・Issue #1690。名前は文字列リテラル＝regclass 相当）。採番は束縛段では
+    /// 行わず（再送で値を消費しないため）、書き込み txn 内の台帳照合の後に `tenant` が行う
+    /// （`sql::parser::VolatileColumn::Sequence`）。内容照合ハッシュは評価値ではなくこの構文形から
+    /// 計算する。`bind_insert_row` 以外の束縛経路（UPDATE／UPSERT／COPY／ファイル形 INSERT／
+    /// NoSQL）は受理せず拒否する（fail-closed）。`DEFAULT` として保存できるのは `nextval` のみ
+    /// （`sql::ddl::add_column_default` が `ColumnDefault::Sequence` へ変換する）。
+    /// 合成式（`nextval('s') + 1` 等）はこの variant にならず、従来どおり定数式経路で拒否される。
+    SequenceCall {
+        func: SequenceFunc,
+        name: String,
+    },
+}
+
+/// [`InsertLiteral::SequenceCall`] の関数種別（許可リスト。TABLE-24・Issue #1690）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceFunc {
+    /// `nextval('<名前>')`（次の値を払い出す）。
+    Nextval,
+    /// `currval('<名前>')`（このセッションで直近に払い出した値を返す）。
+    Currval,
+}
+
+impl SequenceFunc {
+    /// SQL 上の関数名（小文字。内容照合ハッシュの構文形とエラー文言で共有する）。
+    pub fn name(self) -> &'static str {
+        match self {
+            SequenceFunc::Nextval => "nextval",
+            SequenceFunc::Currval => "currval",
+        }
+    }
 }
 
 /// `ON CONFLICT (id) DO UPDATE SET <col> = <value>` の SET 右辺（SQL-20・
@@ -8932,6 +8983,9 @@ impl<'a> Parser<'a> {
         if let Some(t) = self.try_parse_time_default()? {
             return Ok(InsertLiteral::CurrentTime(t));
         }
+        if let Some(call) = self.try_parse_sequence_call()? {
+            return Ok(call);
+        }
         self.expect_literal_or_const_expr()
     }
 
@@ -9417,6 +9471,17 @@ impl<'a> Parser<'a> {
                             .to_string(),
                     });
                 }
+                // SEQUENCE の DEFAULT も既存行への評価（行ごとの採番）が要るため拒否する
+                // （fail-closed。TABLE-24・Issue #1690）。
+                if matches!(
+                    constraints.default,
+                    Some(InsertLiteral::SequenceCall { .. })
+                ) {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "sequence DEFAULT is not supported in ALTER TABLE ADD COLUMN"
+                            .to_string(),
+                    });
+                }
                 // `DEFAULT` を欠く `NOT NULL` は行の有無にかかわらず `42601` で拒否する
                 // （TABLE-16）。`NOT NULL DEFAULT NULL` は既定値なしに正規化されるため
                 // ここで同じく拒否される（Issue #1524・fail-closed）。カタログ・行を参照しない構造判定のため、存在オラクル・
@@ -9563,6 +9628,17 @@ impl<'a> Parser<'a> {
                             column_name,
                             default: None,
                             time_default: Some(t),
+                        });
+                    }
+                    // `SET DEFAULT nextval('<名前>')`（TABLE-24・Issue #1690）。構文形のまま
+                    // `default` に載せ、`sql::ddl::set_column_default_value` が `ColumnDefault::Sequence`
+                    // へ変換する（型検査・SEQUENCE の存在確認は実行段）。
+                    if let Some(call) = self.try_parse_sequence_call()? {
+                        return Ok(ParsedAlterTableShape::AlterColumnSetDefault {
+                            table_name,
+                            column_name,
+                            default: Some(call),
+                            time_default: None,
                         });
                     }
                     // `SET DEFAULT NULL` は既定値なしと同義（`CREATE TABLE` と同じ正規化。
@@ -10750,6 +10826,12 @@ impl<'a> Parser<'a> {
                     time_default = Some(t);
                     continue;
                 }
+                // `DEFAULT nextval('<名前>')`（TABLE-24・Issue #1690）。構文形のまま `default` へ
+                // 載せ、`sql::ddl::add_column_default` が `ColumnDefault::Sequence` へ変換する。
+                if let Some(call) = self.try_parse_sequence_call()? {
+                    default = Some(call);
+                    continue;
+                }
                 // `DEFAULT NULL` は既定値の宣言なしと同義（PostgreSQL も NULL 定数の
                 // 既定値は保存しない）。以降の束縛・カタログ・fast default は
                 // `InsertLiteral::Null` を受け取らない（Issue #1524・SQL-41）。
@@ -10922,6 +11004,51 @@ impl<'a> Parser<'a> {
         }
         self.pos = pos + consumed;
         Ok(parsed)
+    }
+
+    /// `nextval('<名前>')`／`currval('<名前>')` が要素全体を占める単独形のときだけ消費して
+    /// [`InsertLiteral::SequenceCall`] を返す（TABLE-24・Issue #1690。`VALUES` 要素・列 `DEFAULT`
+    /// 位置で時刻関数の次に試す）。単独形でない場合（引数が文字列リテラルでない・直後が演算子・
+    /// `::` 等・関数名だけの識別子）は何も消費せず `None` を返し、従来の定数式経路が従来どおりの
+    /// SQLSTATE で判定する。名前は文字列リテラル（regclass 相当）で、修飾名（`.` を含む）・
+    /// 引用付きの名前（`"` を含む）は `0A000`（#1717 で対応）、識別子規則に反する名前は `42601`。
+    /// 名前は SQL・プラン文字列へ連結せず、検証済みのまま構文形として運ぶ（P0）。
+    /// `DEFAULT` では `nextval` のみ保存できる（`currval` は `sql::ddl` が `0A000`）。
+    fn try_parse_sequence_call(&mut self) -> Result<Option<InsertLiteral>, SqlSurfaceError> {
+        let pos = self.pos;
+        if self.quoted_null.contains(&pos) {
+            return Ok(None);
+        }
+        let Some(Token::Ident(word)) = self.tokens.get(pos) else {
+            return Ok(None);
+        };
+        let func = if word.eq_ignore_ascii_case("nextval") {
+            SequenceFunc::Nextval
+        } else if word.eq_ignore_ascii_case("currval") {
+            SequenceFunc::Currval
+        } else {
+            return Ok(None);
+        };
+        let (Some(Token::Punct('(')), Some(Token::StringLiteral(name)), Some(Token::Punct(')'))) = (
+            self.tokens.get(pos + 1),
+            self.tokens.get(pos + 2),
+            self.tokens.get(pos + 3),
+        ) else {
+            return Ok(None);
+        };
+        if !self.time_default_tail_is_terminal(pos + 4) {
+            return Ok(None);
+        }
+        if name.contains('.') || name.contains('"') {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "schema-qualified or quoted sequence names are not supported",
+            ));
+        }
+        crate::catalog::validate_identifier(name)
+            .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name"))?;
+        let name = name.clone();
+        self.pos = pos + 4;
+        Ok(Some(InsertLiteral::SequenceCall { func, name }))
     }
 
     /// 時刻 DEFAULT の直後のトークンが「式の続き」でないか（`+ - * /`・`::`・`||`・
@@ -20103,6 +20230,76 @@ mod tests {
             stmt.operation_id.as_ref().map(OperationId::as_str),
             Some("op-0001")
         );
+    }
+
+    // --- nextval／currval の単独形（TABLE-24・Issue #1690） ---
+
+    fn insert_values(values: &str) -> Result<Vec<Vec<InsertLiteral>>, SqlSurfaceError> {
+        let lookup = catalog_with(&["documents"]);
+        validate_insert(
+            &format!(
+                "INSERT INTO documents (id, n) VALUES (1, {values}) USING OPERATION_ID 'op-0001'"
+            ),
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .map(|s| s.rows)
+    }
+
+    #[test]
+    fn accepts_standalone_nextval_and_currval_in_values() {
+        for (sql, func) in [
+            ("nextval('s')", SequenceFunc::Nextval),
+            ("NEXTVAL ( 's' )", SequenceFunc::Nextval),
+            ("currval('s')", SequenceFunc::Currval),
+        ] {
+            let rows = insert_values(sql).expect(sql);
+            assert_eq!(
+                rows[0][1],
+                InsertLiteral::SequenceCall {
+                    func,
+                    name: "s".to_string()
+                },
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn nextval_composite_expressions_and_bad_names_are_rejected() {
+        // 合成式は単独形にならず、定数式経路が拒否する。
+        for sql in ["nextval('s') + 1", "nextval('s')::int", "nextval(1)"] {
+            assert!(insert_values(sql).is_err(), "{sql}");
+        }
+        // 修飾名・引用付きの名前は 0A000、識別子規則に反する名前は 42601。
+        for sql in ["nextval('public.s')", "nextval('\"s\"')"] {
+            assert_eq!(
+                insert_values(sql).unwrap_err().wire_code(),
+                "0A000",
+                "{sql}"
+            );
+        }
+        for sql in ["nextval('')", "nextval('a b')", "nextval('1s')"] {
+            assert_eq!(
+                insert_values(sql).unwrap_err().wire_code(),
+                "42601",
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn nextval_default_is_carried_as_a_literal_and_add_column_rejects_it() {
+        let tokens = lexer::tokenize("CREATE TABLE t (n BIGINT DEFAULT nextval('s') NOT NULL)")
+            .expect("lex");
+        let v = validate_create_table_tokens(&tokens).expect("create table");
+        assert_eq!(
+            v.columns[0].default_expr,
+            Some(crate::catalog::ColumnDefault::Sequence("s".to_string()))
+        );
+        let err = validate_alter_table("ALTER TABLE t ADD COLUMN m BIGINT DEFAULT nextval('s')")
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
     }
 
     // --- 単項マイナス（Issue #881・TABLE-13・TASK-196） ---
