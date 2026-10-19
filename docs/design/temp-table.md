@@ -47,7 +47,7 @@ TEMP TABLE（親 Issue #1680・ビヘイビア TABLE-44）の設計記録。仕�
 - #1682: 行ストア・切断時の破棄・総バイト数の上限（完了。下記「Issue #1682 行ストア」）
 - #1683: `CREATE [GLOBAL|LOCAL] TEMP TABLE`、`ON COMMIT`、DDL 権限ゲートの対象外とすること、上限の CLI（完了。下記「Issue #1683」）
 - #1684: 一時表への DML・索引・制約、暫定ゲートの解除（セッションを受ける拡張クエリ Parse の導入を含む）。永続ビュー本文は永続カタログで解決する
-- #1685: テナント境界・crash 耐性の CI 検査
+- #1685: 実装済み（下の「Issue #1685」）
 - 修飾名（`pg_temp.<名前>`）はスキーマ・`search_path`（TABLE-27）の実装へ申し送る
 
 ## Issue #1682 行ストア
@@ -168,7 +168,7 @@ commit 成功後に `ON COMMIT` 適用が失敗した場合（一時表の行ス
 ### 後続への申し送り
 
 - #1684: 実装済み（下の「Issue #1684」。`COPY` の自動コミット経路への `ON COMMIT` フック統合を含む）
-- #1685: テナント境界・crash 耐性の CI 検査
+- #1685: 実装済み（下の「Issue #1685」）
 - 未対応: ENUM 列・`CREATE TEMP TABLE ... AS`（SQL-52）・`GLOBAL` の警告・修飾名（TABLE-27）
 
 ## Issue #1684 DML・索引・制約の適用
@@ -285,4 +285,44 @@ commit 成功後に `ON COMMIT` 適用が失敗した場合（一時表の行ス
 - 2 つの DB の commit が非原子（上記）
 - `ON COMMIT DELETE ROWS` は commit のたびに一時 DB の該当表を `TRUNCATE` する（対象表の行が空でも
   書き込みトランザクションを 1 回張る）
-- テナント境界・crash 耐性の CI 検査は #1685
+- テナント境界・crash 耐性の CI 検査: 実装済み（下の「Issue #1685」）
+
+## Issue #1685 テナント境界・crash 耐性の検査
+
+TABLE-44 (1)(2)(6) のポインタ。一時表は接続ごとのインメモリ領域に閉じる設計のため、他セッション・
+他テナントからの不可視と、永続側に残骸が無いことは構造上成り立つ。本 Issue は実装を変えず、その性質を
+回帰テストと CI で固定する（将来の spill 化や、文を永続コアへ誤って振り分ける変更を CI で検出する）。
+
+### 追加したテスト
+
+| 観点 | 場所 |
+| ---- | ---- |
+| 全文種（SELECT/INSERT/UPDATE/DELETE/TRUNCATE/CREATE INDEX/DROP INDEX/DROP TABLE/COPY）で、他セッション・他テナントの応答が「一度も存在しなかった DB」の応答（`wire_code` と `Display`）と一致 | `crates/engine/tests/table44_temp_table_isolation.rs` |
+| 同名の一時表が 3 者（A・同一テナント別セッション・別テナント）で独立 | 同上 |
+| 他テナントの行が同名の永続表に大量にあっても結果が不変（Public のみ・Public+Private の 2 モード） | 同上 |
+| 他セッションが同名の一時表を持つか否かでエラー応答が変わらない（行データの非混入） | 同上 |
+| 一時表・一時索引・トランザクション中の書き込みが永続カタログ・ファイルに到達しない（コア破棄・再オープン後も） | 同上 |
+| `SessionState` を受け取らない入口（NoSQL 表層と同形）が一時表名を解決しない | 同上 |
+| wire 越しの別テナント接続の不可視（応答差分とカナリア文字列）、トランザクション途中の異常切断後の破棄と永続側の書き込みロック解放 | `crates/wire-server/tests/wire_temp_table.rs` |
+| pg wire で作った一時表が HTTP（NoSQL）表層からは存在しない表と同じ応答 | `crates/wire-server/tests/nosql13_ddl.rs` |
+
+### crash 耐性の検査
+
+- `crates/engine/examples/crash_tool_temp_table.rs` の `write` が、複数の一時セッション（永続表と同名の一時表・
+  一時索引・`ON COMMIT DELETE ROWS`・別テナントの同名一時表）を生かしたまま、明示トランザクション内で一時表と
+  永続表へ同時に書き込む。`scripts/crash_test_temp_table.sh` が SIGKILL し、`verify` が次を検査する。
+  永続カタログと redb の生テーブルに一時表・一時索引由来の名前が無いこと、永続表の行が `perm-` 始まりで
+  0 起点連続かつバッチ単位であること、データディレクトリに DB ファイル以外が無いこと、新しいセッションから
+  一時表が見えないこと、同名で作り直すと空であること。
+- 負の対照 `self-check`: 健全な DB を受理し、永続表 `scratch_tmp` のある DB・永続表に `tmp-` 行がある DB・
+  DB の隣に余分なファイルがある DB を拒否できることを、反復の前に 1 回確かめる（「何も無いから通る」を排除）。
+- 専用の空 `TMPDIR` を writer と verify に与え、全反復の後に空であることを確かめる（spill の検出）。
+- CI ジョブ `crash-test-temp-table`（独立ジョブ）と `make crash-test-temp-table`。`make ci` の依存にも含む。
+- `scripts/check_tmp_leak.sh` の対象に一時表のテスト（engine の 3 本と `wire_temp_table`）を追加した。
+
+### 対象外・現状維持
+
+- 同一 `SessionState` を別テナントの ctx で使った場合の固定文言 `XX000` は、wire からは到達できない
+  防御経路のため変更しない（データは返さない）。
+- 修飾名 `pg_temp.` は TABLE-27、2 つの DB の commit の非原子性は #1684 の既知の制約のまま。
+- 新ジョブ `crash-test-temp-table` を必須チェックへ登録するには ruleset の更新が必要で、運用者が行う。
