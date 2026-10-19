@@ -30,7 +30,7 @@ branch protection（classic）は未設定。主なジョブ名:
 
 | 区分 | 必須チェック名 |
 | ---- | -------------- |
-| `ci.yml` の独立ジョブ | `test-default-build`・`crash-test`・`crash-test-interrupt`・`crash-test-cross-table`・`crash-test-unique-index`・`crash-test-partitioned-dml`・`crash-test-temp-table`・`tmp-leak-check`・`core-api-check`・`sort-determinism-check`・`scripts-test`・`simd-codegen-check`・`cross-check` |
+| `ci.yml` の独立ジョブ | `test-default-build`・`crash-test`・`crash-test-interrupt`・`crash-test-cross-table`・`crash-test-unique-index`・`crash-test-partitioned-dml`・`crash-test-temp-table`・`crash-test-view-write`・`tmp-leak-check`・`core-api-check`・`sort-determinism-check`・`scripts-test`・`simd-codegen-check`・`cross-check` |
 | `ci.yml` の reusable（lint-docs） | `lint-docs / markdownlint`・`lint-docs / yamllint`・`lint-docs / editorconfig-checker`・`lint-docs / commitlint`・`lint-docs / lint-docs-complete`（集約） |
 | `ci.yml` の reusable（rust-ci） | `rust-ci / cargo fmt --check`・`rust-ci / cargo clippy`・`rust-ci / cargo test`・`rust-ci / cargo deny check`・`rust-ci / rust-base-ci-complete`（集約） |
 | `ai-review.yml` | `skip-guard`・`codex / preflight`・`codex / review`・`codex / post_feedback` |
