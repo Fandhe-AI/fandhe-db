@@ -77,7 +77,10 @@ impl ExpressionKeyIndex {
             _ => std::mem::size_of::<(i64, u32)>(),
         };
         // 配列は `row_count` 件ちょうどを一括確保する（確保前に予算へ計上して検査する）。
-        let mut used = row_count.saturating_mul(entry_size);
+        // 索引名の複製（`approx_heap_bytes` が計上する分）も合わせて見込む。
+        let mut used = row_count
+            .saturating_mul(entry_size)
+            .saturating_add(decl.index_name.len());
         crate::sql::scalar_index::check_scalar_index_budget(running_bytes, used)?;
         let mut keys = match bound.ty {
             ExprType::Text => {
@@ -132,8 +135,27 @@ impl ExpressionKeyIndex {
                 .map_err(|_| ScalarIndexBuildError::Unbuildable)?;
             match (&mut keys, value) {
                 (_, ExprValue::Null) => {
+                    // 確保前に増分（容量が伸びる分は倍々なので最大 2 倍まで見込む）を予算へ計上する。
+                    let grow = if null_slots.len() == null_slots.capacity() {
+                        null_slots
+                            .capacity()
+                            .max(4)
+                            .saturating_mul(std::mem::size_of::<u32>())
+                    } else {
+                        0
+                    };
+                    crate::sql::scalar_index::check_scalar_index_budget(
+                        running_bytes.saturating_add(used),
+                        grow.max(std::mem::size_of::<u32>()),
+                    )?;
+                    let before = null_slots.capacity();
                     reserve_exact_one(&mut null_slots)?;
-                    used = used.saturating_add(std::mem::size_of::<u32>());
+                    used = used.saturating_add(
+                        null_slots
+                            .capacity()
+                            .saturating_sub(before)
+                            .saturating_mul(std::mem::size_of::<u32>()),
+                    );
                     null_slots.push(slot_u32);
                 }
                 (ExpressionKeys::Bytes(v), ExprValue::Text(s)) => {

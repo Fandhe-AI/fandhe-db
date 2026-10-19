@@ -285,6 +285,9 @@ pub(crate) fn check_index_expression_determinism(expr: &Expr) -> Result<(), SqlS
 const MSG_RESULT_TYPE: &str = "index expression result type is not supported yet";
 /// 正規化テキストへ往復できない式の拒否文言（fail-closed。壊れた式を永続化しない）。
 const MSG_NOT_STORABLE: &str = "index expression cannot be stored in normalized form";
+/// セッション TZ での畳み込み失敗の拒否文言（固定。値を含めない）。
+const MSG_TZ_FOLD: &str =
+    "timestamp with time zone literal is out of range or does not exist in the session time zone";
 /// 式への `COLLATE` の拒否文言（式キーの辞書はバイト列順のみ。後続対応）。
 pub(crate) const MSG_COLLATE: &str = "COLLATE on an index expression is not supported yet";
 
@@ -312,18 +315,22 @@ pub(crate) struct BoundIndexExpression {
 /// 畳んだ複製を返す。`check_constraint::render_expr` が描く `+00` 形と一致させ、描画→再解析の
 /// 往復一致と、セッション TZ に依存しない永続化を両立する。`Expr` の全 variant を網羅する
 /// （`_ =>` 無し）。CHECK 側の同名処理は `Cast` 等の内側を再帰しないため流用しない。
-pub(crate) fn fold_session_local_literals(expr: &Expr) -> Expr {
+pub(crate) fn fold_session_local_literals(expr: &Expr) -> Result<Expr, SqlSurfaceError> {
     let rec = |e: &Expr| fold_session_local_literals(e);
-    match expr {
+    Ok(match expr {
         Expr::TimestampTzLiteral {
             micros,
             session_local,
         } => {
             if *session_local {
+                // 変換できない（DST の欠落時刻・範囲外）場合は fail-closed で拒否する。元の
+                // micros を UTC として残すと、誤った時刻が永続化される。
                 let utc = crate::datetime::with_current_session_time_zone(|tz| {
                     tz.timestamp_to_timestamptz(*micros)
                 })
-                .unwrap_or(*micros);
+                .ok_or_else(|| SqlSurfaceError::DatetimeFieldOverflow {
+                    detail: MSG_TZ_FOLD.to_string(),
+                })?;
                 Expr::TimestampTzLiteral {
                     micros: utc,
                     session_local: false,
@@ -343,47 +350,46 @@ pub(crate) fn fold_session_local_literals(expr: &Expr) -> Expr {
         | Expr::ValueFunction { .. } => expr.clone(),
         Expr::Call { name, args } => Expr::Call {
             name: name.clone(),
-            args: args.iter().map(rec).collect(),
+            args: args.iter().map(rec).collect::<Result<_, _>>()?,
         },
         Expr::Binary { op, lhs, rhs } => Expr::Binary {
             op: *op,
-            lhs: Box::new(rec(lhs)),
-            rhs: Box::new(rec(rhs)),
+            lhs: Box::new(rec(lhs)?),
+            rhs: Box::new(rec(rhs)?),
         },
         Expr::Case { whens, else_result } => Expr::Case {
-            whens: whens.iter().map(|(c, r)| (rec(c), rec(r))).collect(),
-            else_result: else_result.as_deref().map(|e| Box::new(rec(e))),
+            whens: whens
+                .iter()
+                .map(|(c, r)| Ok((rec(c)?, rec(r)?)))
+                .collect::<Result<_, SqlSurfaceError>>()?,
+            else_result: match else_result.as_deref() {
+                Some(e) => Some(Box::new(rec(e)?)),
+                None => None,
+            },
         },
         Expr::JsonAccess { op, lhs, rhs } => Expr::JsonAccess {
             op: *op,
-            lhs: Box::new(rec(lhs)),
-            rhs: Box::new(rec(rhs)),
+            lhs: Box::new(rec(lhs)?),
+            rhs: Box::new(rec(rhs)?),
         },
         Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
-            match expr.try_map_array_children(&mut |e| Ok::<Expr, std::convert::Infallible>(rec(e)))
-            {
-                Some(Ok(e)) => e,
-                Some(Err(never)) => match never {},
+            match expr.try_map_array_children(&mut |e| rec(e)) {
+                Some(r) => r?,
                 None => expr.clone(),
             }
         }
-        Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(rec).collect()),
-        Expr::NullIf(a, b) => Expr::NullIf(Box::new(rec(a)), Box::new(rec(b))),
+        Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(rec).collect::<Result<_, _>>()?),
+        Expr::NullIf(a, b) => Expr::NullIf(Box::new(rec(a)?), Box::new(rec(b)?)),
         Expr::Collate { expr, collation } => Expr::Collate {
-            expr: Box::new(rec(expr)),
+            expr: Box::new(rec(expr)?),
             collation: *collation,
         },
-        Expr::SqlJsonQuery(q) => {
-            match q.try_map_children(&mut |e| Ok::<Expr, std::convert::Infallible>(rec(e))) {
-                Ok(q) => Expr::SqlJsonQuery(Box::new(q)),
-                Err(never) => match never {},
-            }
-        }
+        Expr::SqlJsonQuery(q) => Expr::SqlJsonQuery(Box::new(q.try_map_children(&mut |e| rec(e))?)),
         Expr::Cast { expr, ty } => Expr::Cast {
-            expr: Box::new(rec(expr)),
+            expr: Box::new(rec(expr)?),
             ty: ty.clone(),
         },
-    }
+    })
 }
 
 /// 部分式 `sub` の静的な結果型。束縛できない（文脈依存の型なし `NULL` 等）場合は `None`。
@@ -580,7 +586,7 @@ pub(crate) fn bind_index_expression(
             detail: MSG_COLLATE.to_string(),
         });
     }
-    let folded = fold_session_local_literals(expr);
+    let folded = fold_session_local_literals(expr)?;
     let udfs = crate::sql::udf_call::UdfRegistry::default();
     let mut budget = crate::sql::udf_call::MAX_EXPR_NODES;
     let (bound, ty) = crate::sql::udf_call::bind_order_expr(&folded, schema, &udfs, &mut budget)?;
@@ -788,6 +794,28 @@ mod tests {
         let tz = crate::datetime::SessionTimeZone::parse_setting("America/New_York").expect("tz");
         let _scope = crate::datetime::SessionTimeZoneScope::enter(tz);
         assert_eq!(bind_sql(&tokyo).expect("rebind").sql, tokyo);
+    }
+
+    /// DST の欠落時刻は変換器が決定的に解決した UTC 値で保存される（元の micros を UTC として
+    /// 流用しない）。
+    #[test]
+    fn session_local_timestamptz_literal_in_dst_gap_is_resolved_not_passed_through() {
+        let tz = crate::datetime::SessionTimeZone::parse_setting("America/New_York").expect("tz");
+        let _scope = crate::datetime::SessionTimeZoneScope::enter(tz);
+        let sql = bind_sql("COALESCE(at_tz, TIMESTAMPTZ '2024-03-10 02:30:00')")
+            .expect("bind")
+            .sql;
+        assert!(sql.contains("2024-03-10 07:30:00+00"), "{sql}");
+    }
+
+    /// 変換結果が範囲外になる `TIMESTAMPTZ` リテラルも拒否する。
+    #[test]
+    fn session_local_timestamptz_literal_out_of_range_fold_is_rejected() {
+        let expr = Expr::TimestampTzLiteral {
+            micros: i64::MAX,
+            session_local: true,
+        };
+        assert!(fold_session_local_literals(&expr).is_err());
     }
 
     /// 式の最上位の `COLLATE` は束縛段でも `0A000`（構文段の最終ゲートの多層防御）。

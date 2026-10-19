@@ -2018,7 +2018,13 @@ impl ScalarIndex {
                 decl,
                 self.approx_bytes,
             ) {
-                self.approx_bytes = self.approx_bytes.saturating_add(key.approx_heap_bytes());
+                // 構築中の検査は概算のため、確定した容量ベースの保持量でも上限を再確認する
+                // （超える場合はこの式キーだけ捨てる。fail-soft）。
+                let total = self.approx_bytes.saturating_add(key.approx_heap_bytes());
+                if total > MAX_SCALAR_INDEX_BYTES {
+                    continue;
+                }
+                self.approx_bytes = total;
                 self.expression_keys.push(key);
             }
         }
@@ -6554,6 +6560,36 @@ mod tests {
         )
         .expect_err("budget exhausted");
         assert!(matches!(err, ScalarIndexBuildError::TooLarge));
+    }
+
+    /// 全行 NULL になる式でも、NULL スロットの確保前に予算を検査する（残り予算が NULL 配列の
+    /// 増分に足りなければ `TooLarge`）。
+    #[test]
+    fn expression_key_null_slots_respect_the_byte_budget() {
+        let db_path = unique_db_path("expr-key-null-budget");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        for id in 1..=3 {
+            insert(&storage, &c, id, Some("a"), None, Visibility::Public);
+        }
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let decl = expr_decl(&schema, "i", 0, "nullif(kind, kind)");
+        // 事前計上分（キー配列 + 索引名）ちょうどを除いた残りを NULL 配列 1 要素分に満たなくする。
+        let upfront = 3 * std::mem::size_of::<(Vec<u8>, u32)>() + 1;
+        let running = MAX_SCALAR_INDEX_BYTES - upfront - 1;
+        let err = crate::sql::expression_key_index::ExpressionKeyIndex::build(
+            &schema, &snapshot, &decl, running,
+        )
+        .expect_err("null slots exceed budget");
+        assert!(matches!(err, ScalarIndexBuildError::TooLarge));
+        // 予算に余裕があれば全行 NULL の式キーが作れる。
+        let ok = crate::sql::expression_key_index::ExpressionKeyIndex::build(
+            &schema, &snapshot, &decl, 0,
+        )
+        .expect("build");
+        assert_eq!(ok.null_slots().len(), 3);
     }
 
     /// 式キーは RLS 適用済みスナップショットからだけ構築される（他テナントの行を含まない）。
