@@ -144,16 +144,16 @@ fn bodies_ctx(core: &EngineCore, c: &PolicyContext) -> Vec<(u64, String)> {
         .rows
         .iter()
         .map(|r| {
+            // 書込みで入る body（'a'・'new'・'z' 等）も含め、全 text セルを連結して保持する。
             let body = r
                 .cells
                 .iter()
-                .find_map(|c| match c {
-                    Cell::Text(s) if s.starts_with("body") || s.starts_with("new") => {
-                        Some(s.clone())
-                    }
+                .filter_map(|c| match c {
+                    Cell::Text(s) => Some(s.as_str()),
                     _ => None,
                 })
-                .unwrap_or_default();
+                .collect::<Vec<_>>()
+                .join("|");
             (r.id, body)
         })
         .collect();
@@ -660,13 +660,12 @@ fn operation_id_namespace_across_tenants_matches_base_table() {
         "bob",
         "UPDATE docs SET body = 'new' WHERE id = 3 USING OPERATION_ID 'op-n-1'",
     );
-    assert_eq!(
-        summary(&rv).split(':').next(),
-        summary(&rd).split(':').next(),
-        "{} / {}",
-        summary(&rv),
-        summary(&rd)
-    );
+    // 影響行数（Ok 時）と wire_code（Err 時）まで基表直送と等価比較する（メッセージ文は除く）。
+    let key = |r: &Result<SqlOutcome, SqlSurfaceError>| match r {
+        Ok(o) => format!("ok:{}", affected(o)),
+        Err(e) => format!("err:{}", e.wire_code()),
+    };
+    assert_eq!(key(&rv), key(&rd), "{} / {}", summary(&rv), summary(&rd));
     assert_eq!(
         lookup(&via, "alice", "docs", "op-n-1"),
         LedgerLookup::Recorded
