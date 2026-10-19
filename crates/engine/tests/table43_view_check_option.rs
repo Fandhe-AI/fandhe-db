@@ -678,3 +678,23 @@ fn violation_inside_explicit_transaction() {
         .expect("rollback");
     assert_eq!(ids(&core, "alice"), vec![1, 2, 3]);
 }
+
+/// 循環を作る `CREATE OR REPLACE VIEW ... WITH CHECK OPTION` も、宣言なしと同じ `42P17` を返す
+/// （宣言検査が `XX000` を返さない）。
+#[test]
+fn cyclic_or_replace_with_check_option_is_42p17() {
+    let (core, _g) = open_core("t43c-cycle");
+    ddl(&core, "CREATE VIEW v1 AS SELECT * FROM docs");
+    ddl(&core, "CREATE VIEW v2 AS SELECT * FROM v1");
+    assert_eq!(
+        ddl_code(
+            &core,
+            "CREATE OR REPLACE VIEW v1 AS SELECT * FROM v2 WITH CHECK OPTION"
+        ),
+        "42P17"
+    );
+    assert_eq!(
+        ddl_code(&core, "CREATE OR REPLACE VIEW v1 AS SELECT * FROM v2"),
+        "42P17"
+    );
+}

@@ -5436,6 +5436,23 @@ impl EngineCore {
                 self.check_create_view_column_aliases(session, stmt)?;
                 // TABLE-43 (2)・Issue #1673: `WITH CHECK OPTION` の宣言先が自動更新できる形か・検査
                 // できる述語かを、カタログ書き込みの前に判定する（宣言なしは何もしない）。
+                // 新定義による循環（`42P17`）は、新定義を重ねて連鎖を辿る宣言検査より先に判定する
+                // （CHECK OPTION の有無でエラー契約が割れて `XX000` になるのを防ぐ）。
+                if stmt.or_replace()
+                    && self
+                        .storage
+                        .view_definition(stmt.name())
+                        .map_err(crate::sql::ddl::map_replace_view_error)?
+                        .is_some()
+                    && self
+                        .storage
+                        .view_body_reaches_self(stmt.name(), stmt.body_sql())
+                        .map_err(crate::sql::ddl::map_replace_view_error)?
+                {
+                    return Err(crate::sql::ddl::map_replace_view_error(
+                        crate::catalog::CatalogError::ViewReferenceCycle(stmt.name().to_string()),
+                    ));
+                }
                 crate::sql::view_check::check_declaration(
                     &self.storage,
                     stmt.name(),
