@@ -583,3 +583,37 @@ fn catalog_api_roundtrips_a_sequence_default() {
         ))
         .is_err());
 }
+
+/// 一時表（セッション専用の別 DB）は永続 SEQUENCE を解決できないため、`DEFAULT nextval` の作成と
+/// INSERT VALUES の `nextval` はどちらも `42P01` ではなく `0A000` で明示的に拒否される。
+#[test]
+fn temp_table_with_nextval_is_rejected_explicitly() {
+    let (_path, _g, core, mut s) = fixture("seq-temp");
+    assert_eq!(
+        code(
+            &core,
+            "sys",
+            &mut s,
+            "CREATE TEMP TABLE tt_def (n BIGINT DEFAULT nextval('s'))"
+        ),
+        "0A000"
+    );
+    ok(&core, "sys", &mut s, "CREATE TEMP TABLE tt (n BIGINT)");
+    assert_eq!(
+        code(
+            &core,
+            "sys",
+            &mut s,
+            "INSERT INTO tt (id, n) VALUES (1, nextval('s'))"
+        ),
+        "0A000"
+    );
+    // 永続 SEQUENCE の状態は消費されない（拒否は採番前）。
+    ok(
+        &core,
+        "sys",
+        &mut s,
+        "INSERT INTO t (id, n) VALUES (1, nextval('s'))",
+    );
+    assert_eq!(column_n(&core, "sys"), vec![1]);
+}

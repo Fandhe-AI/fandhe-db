@@ -94,6 +94,14 @@ impl SequenceScope {
         SequenceScope { prev }
     }
 
+    /// 現スレッドの文脈を一時的に外す（一時表の文を一時コアで実行する区間用。一時 DB は永続 DB の
+    /// SEQUENCE カタログを持たないため、外側の INSERT が張った採番文脈を一時表の書き込みへ
+    /// 持ち込ませない。スコープ無しの採番は `tenant::assign_sequence_values` が `0A000` で拒否する）。
+    pub(crate) fn suspend() -> Self {
+        let prev = CURRENT.with(|c| c.replace(None));
+        SequenceScope { prev }
+    }
+
     /// セッション状態を持たない文脈を張る（公開入口 `execute_insert_returning` を直接呼ぶ経路用。
     /// 払い出し値の受け渡し（`RETURNING` 用）だけを有効にし、`currval` は `0A000` になる）。
     pub(crate) fn enter_sessionless(allocator: Arc<SequenceAllocator>) -> Self {

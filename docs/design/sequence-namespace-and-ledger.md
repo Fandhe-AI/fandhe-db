@@ -254,6 +254,7 @@ CACHE は引き続き `0A000` で、内部の値は 1 固定のまま。永続�
 
 - `ColumnDefault::Sequence(名前)`（カタログタグ `q`）。整数 3 型（SMALLINT・INTEGER・BIGINT）の列だけが受理する。範囲外は採番時に `22003`（値は消費済み）
 - CREATE TABLE と `ALTER COLUMN SET DEFAULT` は、永続化と同じ write txn で SEQUENCE の存在を確認する（無ければ `42P01`）。`ADD COLUMN`・FK の `SET DEFAULT`・COPY・ファイル形 INSERT・UPSERT は `0A000`
+- 一時表（TABLE-44）はセッション専用の別 DB で永続 SEQUENCE を解決できないため、`CREATE TEMP TABLE ... DEFAULT nextval` と一時表への `INSERT ... nextval` は `0A000` で明示的に拒否する（`42P01` へ化けさせない）。一時コアの実行区間は外側の採番文脈を外す（`SequenceScope::suspend`）
 - `DROP SEQUENCE` の依存検査（`column_default_references_sequence`）は `DEFAULT nextval` を参照として数え、`2BP01` を返す（#1688 が先送りした正例）
 
 ### 8.6 受理する構文と対象外

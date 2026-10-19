@@ -714,6 +714,9 @@ pub struct Storage {
     /// プロセス内状態という点で [`Self::writer_gate`] と同形。`Arc` なのは明示トランザクション用の
     /// スコープ（`sql::sequence_scope`）へ渡すため。
     sequence_allocator: std::sync::Arc<crate::catalog::sequence::SequenceAllocator>,
+    /// セッション専用の一時表 DB か（[`Storage::open_with_backend`] だけが真）。永続 DB の SEQUENCE
+    /// カタログを持たないため、`nextval`／`currval` を拒否する判定（TABLE-24・TABLE-44）に使う。
+    temp_scoped: bool,
     /// 書き込みトランザクション取得（autocommit・明示トランザクション双方）が
     /// [`Self::writer_gate`] を待つ上限（既定 30 秒）。超過時は
     /// [`StorageError::WriteLockTimeout`]（`55P03`）を返す。
@@ -753,6 +756,7 @@ impl Storage {
             writer_gate: writer_gate::WriterGate::new(),
             partitioned_jobs: Default::default(),
             sequence_allocator: Default::default(),
+            temp_scoped: false,
             write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             #[cfg(feature = "test-sync-points")]
             sync_hook: std::sync::Mutex::new(None),
@@ -771,7 +775,15 @@ impl Storage {
         let db = redb::Builder::new()
             .set_cache_size(cache_size)
             .create_with_backend(backend)?;
-        Ok(Self::from_db(db, WriteDurability::default()))
+        let mut storage = Self::from_db(db, WriteDurability::default());
+        storage.temp_scoped = true;
+        Ok(storage)
+    }
+
+    /// セッション専用の一時表 DB か。一時表は永続 DB の SEQUENCE を解決できないため、
+    /// 採番を伴う書き込みを `0A000` で拒否する判定に使う（TABLE-24・TABLE-44）。
+    pub(crate) fn is_temp_scoped(&self) -> bool {
+        self.temp_scoped
     }
 
     /// 同期点コールバックを設定・解除する（テスト専用。feature `test-sync-points` 限定、
@@ -3214,6 +3226,7 @@ mod tests {
                 writer_gate: writer_gate::WriterGate::new(),
                 partitioned_jobs: Default::default(),
                 sequence_allocator: Default::default(),
+                temp_scoped: false,
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3280,6 +3293,7 @@ mod tests {
                 writer_gate: writer_gate::WriterGate::new(),
                 partitioned_jobs: Default::default(),
                 sequence_allocator: Default::default(),
+                temp_scoped: false,
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3342,6 +3356,7 @@ mod tests {
                 writer_gate: writer_gate::WriterGate::new(),
                 partitioned_jobs: Default::default(),
                 sequence_allocator: Default::default(),
+                temp_scoped: false,
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3384,6 +3399,7 @@ mod tests {
                 writer_gate: writer_gate::WriterGate::new(),
                 partitioned_jobs: Default::default(),
                 sequence_allocator: Default::default(),
+                temp_scoped: false,
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),

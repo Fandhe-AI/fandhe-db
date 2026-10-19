@@ -302,7 +302,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 69] = [
+const EXPECTED_STATUS: [(&str, u16); 70] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),

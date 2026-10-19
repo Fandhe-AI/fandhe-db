@@ -811,6 +811,9 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, SqlSurfaceError> {
         let write_txn: &redb::WriteTransaction = gated;
         let target = crate::tenant::WriteTarget::InTxn(write_txn);
+        // 外側（永続コア）が張った SEQUENCE の採番文脈を一時表の書き込みへ持ち込まない
+        // （一時 DB は永続の SEQUENCE を解決できず、カーソルを一時 DB へ書いてしまうため。TABLE-24）。
+        let _no_sequence_scope = crate::sql::sequence_scope::SequenceScope::suspend();
         match inner {
             ParsedSql::Insert(stmt) => {
                 let lookup = InsertSchemaLookup::new(&self.storage);

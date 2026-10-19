@@ -373,6 +373,18 @@ pub(crate) fn execute_create_temp_table(
         );
     }
     let schema = build_table_schema(None, table, schema_limits)?;
+    // 一時表は永続 DB の SEQUENCE カタログを参照できないため、`DEFAULT nextval(...)` は
+    // 作成時に `0A000` で拒否する（INSERT 時に `42P01` へ化けさせない。TABLE-24・TABLE-44）。
+    if schema.columns.iter().any(|c| {
+        matches!(
+            c.default_expr,
+            Some(crate::catalog::ColumnDefault::Sequence(_))
+        )
+    }) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "DEFAULT nextval is not supported for temporary tables",
+        ));
+    }
     let schema = crate::catalog::prepare_temp_table_schema(&schema).map_err(|e| match e {
         CatalogError::Invalid(detail) => {
             SqlSurfaceError::unsupported(format!("invalid table schema: {detail}"))

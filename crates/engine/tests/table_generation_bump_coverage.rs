@@ -79,8 +79,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // TABLE-44・Issue #1684（`Storage::from_db`・`open_with_backend` の追加）で行番号が移動した
     // ための追随（旧: 930／961）。
     // Issue #1690（`Storage::sequence_allocator` の追加）で行番号が移動したための追随（旧: 950／981）。
-    ("storage.rs", 963),
-    ("storage.rs", 994),
+    // PR #2566 レビュー対応（一時 DB 判定 `Storage::is_temp_scoped` の追加。+12 行）で追随（旧: 963／994）。
+    ("storage.rs", 975),
+    ("storage.rs", 1006),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 201),
     ("txn.rs", 372),

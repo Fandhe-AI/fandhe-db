@@ -1422,6 +1422,13 @@ fn assign_sequence_values(
         return Ok(None);
     }
     let sql_err = |e: SqlSurfaceError| TenantWriteError::SequenceEvaluationFailed(e);
+    // 一時表（セッション専用の別 DB）は永続 DB の SEQUENCE カタログを解決できず、カーソルも
+    // 一時 DB へ永続化してしまうため、採番を伴う書き込みは明示的に拒否する（`42P01` の誤報を避ける）。
+    if matches!(target, WriteTarget::Autocommit(storage) if storage.is_temp_scoped()) {
+        return Err(sql_err(SqlSurfaceError::FeatureNotSupported {
+            detail: "nextval is not supported for temporary tables".to_string(),
+        }));
+    }
     let (allocator, session) = match sequence_scope::current() {
         Some(c) => (c.allocator, c.session),
         None => match target {

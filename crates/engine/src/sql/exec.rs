@@ -5252,17 +5252,20 @@ pub(crate) fn execute_insert_returning_in(
         execute_insert_batch_with_schema_in(target, ctx, bounds, ledger_mode, Some(schema))?;
 
     if has_sequence {
-        let assigned = crate::sql::sequence_scope::take_assigned();
+        // 行・列をキーにした索引を一度だけ構築し、RETURNING の検索を線形時間に保つ
+        // （重複記録は先頭を優先。従来の線形 `find` と同じ意味論）。
+        let mut assigned: std::collections::HashMap<(usize, usize), i64> =
+            std::collections::HashMap::new();
+        for (r, c, v) in crate::sql::sequence_scope::take_assigned() {
+            assigned.entry((r, c)).or_insert(v);
+        }
         rows.clear();
         let mut budget = 0usize;
         for (row_idx, bound) in bounds.iter().enumerate() {
             // 払い出し値が記録されていない列は黙って 0 にせず内部不整合として拒否する
             // （fail-closed。書き込みは commit 済みだが、誤った値を返すより失敗を返す）。
             let values = sequence_patched_values(bound, schema, |col| {
-                assigned
-                    .iter()
-                    .find(|(r, c, _)| *r == row_idx && *c == col)
-                    .map(|(_, _, v)| *v)
+                assigned.get(&(row_idx, col)).copied()
             })?;
             rows.push(crate::sql::returning::project_row(
                 bound.id,
