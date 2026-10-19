@@ -1772,6 +1772,54 @@ fn statement_clock_scope(
     )))
 }
 
+/// INSERT 文だけが SEQUENCE の採番文脈（アロケータとセッションの `currval` 状態）を持つ
+/// スコープを開く（TABLE-24・Issue #1690。許可リスト型の fail-closed）。`tenant` の INSERT 書き込みが
+/// 台帳照合の後に読む（`sql::sequence_scope`）。autocommit・明示トランザクションの両入口が呼ぶ。
+/// `ParsedSql` を網羅 `match` にして variant 追加時の判定漏れをコンパイルエラーで検出する。
+fn insert_sequence_scope(
+    storage: &Storage,
+    session: &crate::sql::mode::SessionState,
+    parsed: &ParsedSql,
+) -> Option<crate::sql::sequence_scope::SequenceScope> {
+    let is_insert = match parsed {
+        ParsedSql::SessionRouted(routed) => {
+            return insert_sequence_scope(storage, session, routed.inner())
+        }
+        ParsedSql::Insert(_) | ParsedSql::ViewInsert(_) => true,
+        ParsedSql::Statement(_)
+        | ParsedSql::Truncate(_)
+        | ParsedSql::Delete(_)
+        | ParsedSql::Update(_)
+        | ParsedSql::ViewDelete(_)
+        | ParsedSql::ViewUpdate(_)
+        | ParsedSql::Transaction(_)
+        | ParsedSql::DropTable(_)
+        | ParsedSql::CreateTable(_)
+        | ParsedSql::CreateTempTable(_)
+        | ParsedSql::Cursor(_)
+        | ParsedSql::Partitioned(_)
+        | ParsedSql::AlterTable(_)
+        | ParsedSql::CreateView(_)
+        | ParsedSql::DropView(_)
+        | ParsedSql::DropMaterializedView(_)
+        | ParsedSql::CreateMaterializedView(_)
+        | ParsedSql::RefreshMaterializedView(_)
+        | ParsedSql::CreateIndex(_)
+        | ParsedSql::DropIndex(_)
+        | ParsedSql::CreateType(_)
+        | ParsedSql::DropType(_)
+        | ParsedSql::CreateSequence(_)
+        | ParsedSql::DropSequence(_)
+        | ParsedSql::AlterSequence(_) => false,
+    };
+    is_insert.then(|| {
+        crate::sql::sequence_scope::SequenceScope::enter(
+            std::sync::Arc::clone(storage.sequence_allocator()),
+            session.sequences_handle(),
+        )
+    })
+}
+
 /// INSERT 文だけが列 `DEFAULT now()` 系の評価時刻を持つ束縛スコープを開く（SQL-37・
 /// TABLE-16・Issue #1587。許可リスト型の fail-closed）。`txn_start_micros` は `Active`
 /// トランザクション中のトランザクション開始時刻（`None` は autocommit で、文の開始時刻と
@@ -5183,6 +5231,8 @@ impl EngineCore {
         let _session_tz_scope = session_time_zone_scope(session);
         // SQL-37・Issue #1587: INSERT の列 `DEFAULT now()` 系の評価時刻（autocommit は文の開始時刻）。
         let _default_clock_scope = insert_default_clock_scope(parsed, None)?;
+        // TABLE-24・Issue #1690: INSERT の `nextval`／`currval`（VALUES・列 DEFAULT）の採番文脈。
+        let _sequence_scope = insert_sequence_scope(&self.storage, session, parsed);
         match parsed {
             ParsedSql::Insert(stmt) => {
                 // Issue #933: Parse 時点のスキーマキャッシュ（`InsertSchemaLookup`）
@@ -5781,6 +5831,8 @@ impl EngineCore {
                     })?,
             ),
         )?;
+        // TABLE-24・Issue #1690: INSERT の `nextval`／`currval`（VALUES・列 DEFAULT）の採番文脈。
+        let _sequence_scope = insert_sequence_scope(&self.storage, session, parsed);
 
         // 注意（Issue #1182・#1272）: 明示トランザクション内の `RETURNING` は `INSERT`
         // （単一行・複数行）・`DELETE`・`UPDATE`（単一行・述語形）・UPSERT に対応する
@@ -10080,6 +10132,25 @@ impl EngineCore {
                         "INSERT batch row byte size overflow",
                     )
                 })?;
+            }
+            // 採番の印（`nextval`／`currval`・`DEFAULT nextval`）の列は仮値 `Null`（0 バイト計上）で
+            // 運ばれるが、書き込み時は整数 1 値が入る。採番せずに固定幅の上限（BIGINT 相当の 8 バイト。
+            // SMALLINT／INTEGER 列でも上限側へ倒す fail-closed）を計上し、INDEX-4 の行別・バッチ合計
+            // バイト上限を迂回できないようにする（Issue #1690・codex-review P1）。
+            for volatile in &bound.volatile_default_columns {
+                if matches!(
+                    volatile,
+                    crate::sql::parser::VolatileColumn::Sequence(..)
+                        | crate::sql::parser::VolatileColumn::DefaultSequence(_)
+                ) {
+                    row_bytes = row_bytes
+                        .checked_add(std::mem::size_of::<i64>())
+                        .ok_or_else(|| {
+                            crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                                "INSERT batch row byte size overflow",
+                            )
+                        })?;
+                }
             }
             shapes.push((0, row_bytes));
         }

@@ -215,9 +215,58 @@ Issue #1711 より前の定義は全テナント共有の `public` に属する�
 
 **既知の残課題**: 他テナントのスキーマに属する SEQUENCE を名前で解決できないことの完全な実現は、#1711（tenant 所有のスキーマ）と #1717（SEQUENCE の修飾名）に属する。`sequence_key` が差し替え点。
 
-## 8. Issue #1689 実装記録（ALTER SEQUENCE）
+## 8. Issue #1690 実装記録（nextval と currval）
 
-### 8.1 構文と検査順
+親 #1686。ポインタ: TABLE-24 (1)〜(5)・ERR-6・RECOVER-10・RECOVER-11。
+
+### 8.1 採番は書き込み txn の中で、台帳照合の後に行う
+
+束縛段（`bind_insert_row`・`fill_omitted_columns`）は値を作らず、該当列に仮値 `Null` を置いて印（`VolatileColumn::Sequence`／`DefaultSequence`）だけを運ぶ。`tenant` の INSERT 系書き込みが `ledger::record_in_txn` の後に、書き込み txn 内で名前を解決して払い出し、行のエンコードと制約検査より前に値を差し込む。
+
+- 同じ `operation_id` の再送は台帳照合で `23505` になるため、値を消費しない（TABLE-24 (3)）
+- 束縛から書き込みまでの間に `DROP SEQUENCE` が挟まっても、書き込み txn 内の解決で古い ID へ書かない。未知の名前はテナントによらず同一の `42P01`
+- 評価順は行は文の順、行の中は列順。同じ行の `VALUES (nextval('s'), currval('s'))` の `currval` は直前の値を返す
+- 内容照合ハッシュは構文形（関数名と SEQUENCE 名）だけを使う（種別バイト `1`）。省略列へ適用した `DEFAULT nextval` は材料から除外する（時刻 DEFAULT と同じ）。印を持たない文のハッシュはバイト単位で不変
+
+### 8.2 アロケータと永続化
+
+`catalog::sequence::SequenceAllocator`（`Storage` が 1 つ所有）が `(tenant_id, sequence_id)` ごとの現在値（`last_value`・`is_called`）をプロセス内に持つ。
+
+- 払い出しは初回が START、以降は `checked_add(increment)`。範囲外は CYCLE なら反対側の端へ折り返し、NO CYCLE なら `2200H`（現在値は進めない）
+- 払い出した時点で、同じ write txn の `sequence_state` へ現在値を書く。状態値は `[版 1][last_value i64 LE][is_called]` の 10 バイト固定で、未知の版・長さ不一致・`is_called` の不正値は `CorruptSchema`
+- メモリに無いときは永続化済みの状態行から種を作り、無ければ START・未呼び出しから始める
+- ROLLBACK は永続値だけを戻し、メモリ上の現在値は戻さない。同じプロセスでは同じ値を再び払い出さない（欠番は許容。TABLE-24 (1)）。明示トランザクションは単一ライタを保持するので、commit 済みの行に入った値は必ず同じ txn が永続化した現在値で覆われる（TABLE-24 (4)）
+- `DROP SEQUENCE` は commit 成功後に全テナント分のメモリ上の現在値を捨てる
+- 保持件数（アロケータ・セッション）は上限つきで、超過は `54000`。ロックの毒化は `XX000`
+- ROLLBACK 後にクラッシュした場合の再払い出しを補強 txn で防ぐ設計と、クラッシュ注入による検証は #1692 に残す
+
+### 8.3 CACHE の扱い（D4 が #1690 に割り当てた判断）
+
+CACHE は引き続き `0A000` で、内部の値は 1 固定のまま。永続化の刻み幅は 1（払い出しのたびに書く）なので、共有カウンタとセッション別確保の観測差は生じない。方式の確定は、CACHE を受理する Issue で行う。
+
+### 8.4 セッションの currval と RETURNING
+
+- `currval` 用の状態は `SessionState` が `Arc<Mutex<..>>` で持つ。BEGIN 時のコピーは `Arc` を共有するので、ROLLBACK で `SessionState` を巻き戻しても保持される（PostgreSQL と同じ）。未呼び出しは `55000`
+- 書き込み区間の文脈（アロケータとセッション状態）は `sql::sequence_scope::SequenceScope`（スレッドローカルの RAII。`core.rs` の INSERT 入口が autocommit・明示トランザクションの双方で開く）で `WriteTarget::InTxn` まで運ぶ。スコープが無い `Autocommit` は `Storage` のアロケータだけを使う（NoSQL の `DEFAULT nextval`。`currval` は `0A000`）。明示トランザクションでスコープが無ければ `0A000`
+- `RETURNING` は書き込み前に列型の代表値でバイト予算を検査し、書き込み後にスコープへ記録された払い出し値で投影し直す。記録が無い列は内部不整合として拒否する（黙って 0 にしない）
+
+### 8.5 DEFAULT
+
+- `ColumnDefault::Sequence(名前)`（カタログタグ `q`）。整数 3 型（SMALLINT・INTEGER・BIGINT）の列だけが受理する。範囲外は採番時に `22003`（値は消費済み）
+- CREATE TABLE と `ALTER COLUMN SET DEFAULT` は、永続化と同じ write txn で SEQUENCE の存在を確認する（無ければ `42P01`）。`ADD COLUMN`・FK の `SET DEFAULT`・COPY・ファイル形 INSERT・UPSERT は `0A000`
+- 一時表（TABLE-44）はセッション専用の別 DB で永続 SEQUENCE を解決できないため、`CREATE TEMP TABLE ... DEFAULT nextval` と一時表への `INSERT ... nextval` は `0A000` で明示的に拒否する（`42P01` へ化けさせない）。一時コアの実行区間は外側の採番文脈を外す（`SequenceScope::suspend`）
+- `DROP SEQUENCE` の依存検査（`column_default_references_sequence`）は `DEFAULT nextval` を参照として数え、`2BP01` を返す（#1688 が先送りした正例）
+
+### 8.6 受理する構文と対象外
+
+- 受理: INSERT の `VALUES` 要素と列 DEFAULT の単独形 `nextval('<名前>')`・`currval('<名前>')`（`currval` は VALUES のみ）。名前は文字列リテラル（regclass 相当）で、大文字小文字は保持する
+- `0A000`: 修飾名・引用付きの名前（#1717）、SELECT 投影・WHERE・UPDATE SET・ビュー本文などの式位置（書き込み txn を伴う読み取り文の経路が無い。#1691 の `lastval` と合わせて判断する）、UPSERT・COPY・ファイル形 INSERT・分割実行、DEFAULT の `currval`
+- 合成式（`nextval('s') + 1` 等）は単独形にならず従来の定数式経路で拒否される。`nextval`／`currval` は UDF 名として予約する
+- `ALTER SEQUENCE` の commit 後の `SequenceAllocator::evict`（当該 SEQUENCE の現在値を全テナント分破棄）は `RESTART` を含むときだけ行う。それ以外のオプション変更（INCREMENT・MIN・MAX・CYCLE 等）は現在値を保持する。破棄すると ROLLBACK 済みで消費された値を再払い出ししうるため。破棄は commit 直後に writer permit を保持したまま行う
+
+## 9. Issue #1689 実装記録（ALTER SEQUENCE）
+
+### 9.1 構文と検査順
 
 - 受理: `RESTART [[WITH] n]`・`START [WITH]`・`INCREMENT [BY]`・`MINVALUE`／`NO MINVALUE`・`MAXVALUE`／`NO MAXVALUE`・`CYCLE`／`NO CYCLE` の任意順（1 個以上）と、単独の `RENAME TO <新名>`。タグは `ALTER SEQUENCE`（RENAME も同じ）
 - `42601`: オプションなし・同種の重複・`RENAME TO` と他オプションの併用・小数・未知のトークン。`22003`: i64 の範囲外
@@ -225,7 +274,7 @@ Issue #1711 より前の定義は全テナント共有の `public` に属する�
 - `22023` の検査順（PostgreSQL 17 の `init_params` と同じ）: `INCREMENT` ≠ 0 → MIN／MAX の決定（`NO MINVALUE`／`NO MAXVALUE` は変更後の INCREMENT の符号から既定値を再導出。未指定は現行値を維持）→ MIN < MAX → START ∈ [MIN, MAX]（START を指定しなくても現行値を常に検査）→ RESTART 値（値なしは START）または現在値 ∈ [MIN, MAX]。文言は値を含まない固定文言
 - 判定の順序: 構文 → DDL 権限（`42501`。対象の有無を問わない）→ 名前の解決（`42P01`／`42809`）→ RENAME 先の衝突（`42P07`。同名も）→ 範囲（`22023`）
 
-### 8.2 決定
+### 9.2 決定
 
 - **定義 blob v2**: v1 の末尾に `restart_value`（i64）を足す。意味は「状態行を持たないテナントの last_value（`is_called = false`）」。CREATE 時は START、RESTART で更新する。v1 は `restart_value = start` として読み、書き込みは常に v2。`restart_value` が範囲外の blob は `CorruptSchema`
 - **RESTART は全テナントへ作用する**: 定義の `restart_value` の更新と、全テナント分の状態行の削除を同一 txn で行う（DROP と同じ `retain` の走査削除）。#1711 より前は定義が全テナント共有で、呼び出し元だけをリセットすると他テナントに新しい範囲の外の現在値が残りうるため。結果が他テナントの状態に依存しない（TABLE-24 (2) のポインタ）。ただし spec が作用範囲を明示していないため自動運転下で安全側に決めた判断で、人間の確認が要る
@@ -233,14 +282,14 @@ Issue #1711 より前の定義は全テナント共有の `public` に属する�
 - **RENAME は定義のキーだけを付け替える**: 内部 ID・状態行は不変（D3）。依存 DEFAULT があれば `0A000`（現状は常に偽。#1690 の `ColumnDefault` の variant が名前で SEQUENCE を保持する場合の fail-closed。`sequence_id` で保持すれば外せる）
 - `CatalogError` は公開型なので variant を足さず、`catalog::sequence` の `AlterSequenceError`（範囲違反とカタログ系）で区別する
 
-### 8.3 #1690 への申し送り
+### 9.3 #1690 への申し送り
 
 - 状態行の値の形式は #1690 が決める。呼び出し元テナントの状態行を読むフック `caller_current_value_in_txn` は、行が存在する間は形式が未確定のため `CorruptSchema` で拒否する。#1690 は状態の decode へ置き換える。置き換えを忘れても ALTER が拒否側に倒れるだけで、黙って検査が飛ぶことはない
-- ALTER の commit 後の結線点 `on_sequence_altered` は空。#1690 のプロセス内アロケータ（D4）は、ここで該当 `sequence_id` のエントリを全テナント分破棄する。RESTART だけでなく INCREMENT・MIN・MAX・CYCLE の変更も次の値に影響する
+- ALTER の commit 後の結線点 `on_sequence_altered` は空。#1690 のプロセス内アロケータ（D4）は、ここで該当 `sequence_id` のエントリを全テナント分破棄する。破棄の対象は RESTART のみで、INCREMENT・MIN・MAX・CYCLE の変更では現在値を保持する（実装は §8.6 を参照）
 - 受け入れ条件「変更後の nextval が PG 17 と同じ値」は nextval の着地後に SQL 水準で検証する。期待値の表は `tests/table24_alter_sequence.rs` の冒頭にある。本 Issue では Storage 水準で格納値（`restart_value`・params・状態行の削除）を検証した
 - #1689 と #1690 のどちらかが先にマージされた場合、後の側が rebase で上記を統合する
 
-### 8.4 既知の差
+### 9.4 既知の差
 
 - 同種オプションの重複は構文段で検出するため、未知の名前と重複が同時にあると、PG（リレーション解決が先で `42P01`）と違い `42601` が先に返る
 - `ALTER TABLE <sequence> RENAME TO ...`（PG は許す）は現状の挙動のまま

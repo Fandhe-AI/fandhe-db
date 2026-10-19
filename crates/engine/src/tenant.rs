@@ -445,6 +445,16 @@ pub enum TenantWriteError {
     /// **BREAKING CHANGE**（Issue #1544）: variant を追加した（本 enum は
     /// `#[non_exhaustive]` ではないため網羅的 `match` の下流は追随が必要）。
     SetExpressionEvaluationFailed(SqlSurfaceError),
+    /// `INSERT` の `nextval`／`currval`（`VALUES` 要素・列 `DEFAULT`）の採番・解決が失敗した
+    /// （TABLE-24・Issue #1690）。未定義の SEQUENCE は `42P01`（`Catalog(TableNotFound)`）で別に返し、
+    /// ここには上限到達 `2200H`・`currval` 未定義 `55000`・列型の範囲外 `22003`・対応しない
+    /// 文脈 `0A000`・内部ロックの毒化などを内側の [`SqlSurfaceError`] のまま保持する
+    /// （[`TenantWriteError::CheckEvaluationFailed`] と同じ透過）。値・SEQUENCE 名・テナントは
+    /// 含めない。write トランザクションは commit せず破棄する（行・台帳・状態行とも痕跡ゼロ。
+    /// ただしメモリ上の現在値は戻さず、同じ値を再び払い出さない）。
+    /// **BREAKING CHANGE**（Issue #1690）: variant を追加した（本 enum は `#[non_exhaustive]`
+    /// ではないため網羅的 `match` の下流は追随が必要）。
+    SequenceEvaluationFailed(SqlSurfaceError),
     /// `FOREIGN KEY` 制約（TABLE-17・TASK-205、Issue #907）の参照整合性違反
     /// （`23503`）: 参照元の書き込みで参照先の値の組が同一テナント内に存在しない、
     /// または参照先の削除・更新・TRUNCATE・置換で参照元の行が残る。一意性制約と
@@ -627,6 +637,9 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::SetExpressionEvaluationFailed(inner) => {
                 crate::error_format::ClassifiedError::error_class(inner)
             }
+            TenantWriteError::SequenceEvaluationFailed(inner) => {
+                crate::error_format::ClassifiedError::error_class(inner)
+            }
             TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             TenantWriteError::ReferentialActionLimitExceeded => ErrorClass::PayloadTooLarge,
             TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
@@ -711,6 +724,9 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::SetExpressionEvaluationFailed(inner) => {
                 write!(f, "{}", inner.client_message())
             }
+            TenantWriteError::SequenceEvaluationFailed(inner) => {
+                write!(f, "{}", inner.client_message())
+            }
             TenantWriteError::ForeignKeyViolation => {
                 write!(f, "foreign key constraint violation")
             }
@@ -771,6 +787,9 @@ impl std::fmt::Debug for TenantWriteError {
             }
             TenantWriteError::SetExpressionEvaluationFailed(_) => {
                 f.write_str("SetExpressionEvaluationFailed(<redacted>)")
+            }
+            TenantWriteError::SequenceEvaluationFailed(_) => {
+                f.write_str("SequenceEvaluationFailed(<redacted>)")
             }
             TenantWriteError::ForeignKeyViolation => f.write_str("ForeignKeyViolation"),
             TenantWriteError::ReferentialActionLimitExceeded => {
@@ -1183,13 +1202,30 @@ pub(crate) fn insert_rows_unchecked(
 /// を渡す。内容照合ハッシュは該当列を評価値ではなく DEFAULT の構文形でハッシュする（設計 D1・D2）。
 pub(crate) type VolatileDefaultColumns<'a> = &'a [&'a [VolatileColumn]];
 
-/// `volatile` のいずれかの行が `VALUES` 内の単独時刻関数（[`VolatileColumn::Values`]）を持つか。
+/// `volatile` のいずれかの行が `VALUES` 内の単独時刻関数（[`VolatileColumn::Values`]）または
+/// 単独の `nextval`／`currval`（[`VolatileColumn::Sequence`]。TABLE-24・Issue #1690）を持つか。
 /// 持つ行がある文だけ `*Expr` ドメインでハッシュする。省略列への DEFAULT 適用
-/// （[`VolatileColumn::Default`]）は経路選択に影響させない（Issue #1629 D1）。
+/// （[`VolatileColumn::Default`]・[`VolatileColumn::DefaultSequence`]）は経路選択に影響させない
+/// （Issue #1629 D1）。
 fn any_values_time(volatile: VolatileDefaultColumns<'_>) -> bool {
-    volatile
-        .iter()
-        .any(|row| row.iter().any(|c| matches!(c, VolatileColumn::Values(..))))
+    volatile.iter().any(|row| has_values_expr(row))
+}
+
+/// 1 行分の印に、構文形でハッシュする `VALUES` 要素（時刻関数・`nextval`／`currval`）があるか。
+fn has_values_expr(row: &[VolatileColumn]) -> bool {
+    row.iter()
+        .any(|c| matches!(c, VolatileColumn::Values(..) | VolatileColumn::Sequence(..)))
+}
+
+/// 1 行分の印に、採番が要る列（[`VolatileColumn::Sequence`]・[`VolatileColumn::DefaultSequence`]）
+/// があるか。無い文は採番処理を一切通らない（既存経路のバイト・性能を保つ）。
+fn has_sequence_marks(row: &[VolatileColumn]) -> bool {
+    row.iter().any(|c| {
+        matches!(
+            c,
+            VolatileColumn::Sequence(..) | VolatileColumn::DefaultSequence(..)
+        )
+    })
 }
 
 /// 束縛時の `volatile`（列位置）が、write トランザクション内で再取得した `schema` と整合するか検査する。
@@ -1216,6 +1252,21 @@ fn check_volatile_columns(
                 .columns
                 .get(idx)
                 .is_some_and(|c| !c.nullable && c.default_expr.is_none()),
+            // 採番列は整数型であること（`DefaultSequence` はスキーマ側の DEFAULT も SEQUENCE であること）。
+            VolatileColumn::Sequence(..) => schema.columns.get(idx).is_some_and(|c| {
+                matches!(
+                    c.ty,
+                    crate::catalog::ColumnType::SmallInt
+                        | crate::catalog::ColumnType::Integer
+                        | crate::catalog::ColumnType::BigInt
+                )
+            }),
+            VolatileColumn::DefaultSequence(_) => schema.columns.get(idx).is_some_and(|c| {
+                matches!(
+                    c.default_expr,
+                    Some(crate::catalog::ColumnDefault::Sequence(_))
+                )
+            }),
         };
         let is_vector = schema
             .columns
@@ -1252,7 +1303,14 @@ fn named_value_columns<'a>(
             continue;
         }
         if volatile.iter().any(|c| {
-            matches!(c, VolatileColumn::Default(i) | VolatileColumn::MissingNotNull(i) if *i == idx)
+            matches!(
+                c,
+                VolatileColumn::Default(i)
+                    | VolatileColumn::MissingNotNull(i)
+                    | VolatileColumn::DefaultSequence(i)
+                    | VolatileColumn::Sequence(i, _, _)
+                    if *i == idx
+            )
         }) {
             continue;
         }
@@ -1270,7 +1328,7 @@ fn named_expr_columns<'a>(
     schema: &'a crate::catalog::TableSchema,
     values: &'a [crate::row_codec::Value],
     vector_idx: Option<usize>,
-    volatile: &[VolatileColumn],
+    volatile: &'a [VolatileColumn],
 ) -> Result<Vec<(&'a str, content_hash::HashColumnInput<'a>)>, TenantWriteError> {
     check_volatile_columns(schema, vector_idx, volatile)?;
     let mut out = Vec::new();
@@ -1284,10 +1342,21 @@ fn named_expr_columns<'a>(
             continue;
         }
         match volatile.iter().find(|c| c.index() == idx) {
-            Some(VolatileColumn::Default(_) | VolatileColumn::MissingNotNull(_)) => {}
+            Some(
+                VolatileColumn::Default(_)
+                | VolatileColumn::MissingNotNull(_)
+                | VolatileColumn::DefaultSequence(_),
+            ) => {}
             Some(VolatileColumn::Values(_, t)) => out.push((
                 column.name.as_str(),
                 content_hash::HashColumnInput::ValuesTime(*t),
+            )),
+            Some(VolatileColumn::Sequence(_, func, seq)) => out.push((
+                column.name.as_str(),
+                content_hash::HashColumnInput::ValuesSequence {
+                    func: *func,
+                    name: seq.as_str(),
+                },
             )),
             None => {
                 if let Some(value) = values.get(idx) {
@@ -1324,6 +1393,189 @@ fn reject_missing_not_null(
         }
     }
     Ok(())
+}
+
+/// 台帳照合の後に、SEQUENCE の印（[`VolatileColumn::Sequence`]・[`VolatileColumn::DefaultSequence`]）を
+/// 持つ行の仮値 `Null` を、書き込み txn 内で払い出した値（または `currval`）へ差し替えた行の複製を
+/// 返す（TABLE-24・Issue #1690。印が 1 つも無ければ `None` で何も複製しない）。
+///
+/// 評価順は行は文の順、行の中は `schema.columns` の列順（`VALUES (nextval('s'), currval('s'))` の
+/// `currval` が直前の `nextval` の値を返すため）。名前は書き込み txn 内で解決する（束縛から書き込みまで
+/// の間に挟まった `DROP SEQUENCE` の古い ID へ書かない）。未知の名前はテナントによらず同一の
+/// `42P01`。アロケータとセッション状態は `sql::sequence_scope` のスコープから受け取り、
+/// スコープが無い経路は `Autocommit` の `Storage` のアロケータだけを使う（セッション状態は無く、
+/// `currval` は `0A000`）。明示トランザクションでスコープが無ければ `0A000`（fail-closed）。
+/// 払い出した値は `RETURNING` の投影用にスコープへ記録する。
+fn assign_sequence_values(
+    target: &WriteTarget<'_>,
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    schema: &crate::catalog::TableSchema,
+    row_marks: &[&[VolatileColumn]],
+    row_values: &[&[crate::row_codec::Value]],
+) -> Result<Option<Vec<Vec<crate::row_codec::Value>>>, TenantWriteError> {
+    use crate::catalog::sequence::{sequence_definition_in_txn, AllocError};
+    use crate::sql::allowlist::SequenceFunc;
+    use crate::sql::sequence_scope;
+
+    if !row_marks.iter().any(|m| has_sequence_marks(m)) {
+        return Ok(None);
+    }
+    let sql_err = |e: SqlSurfaceError| TenantWriteError::SequenceEvaluationFailed(e);
+    // 一時表（セッション専用の別 DB）は永続 DB の SEQUENCE カタログを解決できず、カーソルも
+    // 一時 DB へ永続化してしまうため、採番を伴う書き込みは明示的に拒否する（`42P01` の誤報を避ける）。
+    if matches!(target, WriteTarget::Autocommit(storage) if storage.is_temp_scoped()) {
+        return Err(sql_err(SqlSurfaceError::FeatureNotSupported {
+            detail: "nextval is not supported for temporary tables".to_string(),
+        }));
+    }
+    let (allocator, session) = match sequence_scope::current() {
+        Some(c) => (c.allocator, c.session),
+        None => match target {
+            WriteTarget::Autocommit(storage) => {
+                (std::sync::Arc::clone(storage.sequence_allocator()), None)
+            }
+            WriteTarget::InTxn(_) => {
+                return Err(sql_err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "nextval is not supported in this context".to_string(),
+                }))
+            }
+        },
+    };
+
+    let mut out: Vec<Vec<crate::row_codec::Value>> = Vec::new();
+    out.try_reserve_exact(row_values.len()).map_err(|_| {
+        TenantWriteError::Storage(StorageError::Codec(
+            "failed to reserve sequence rows".to_string(),
+        ))
+    })?;
+    for (row_idx, orig) in row_values.iter().enumerate() {
+        let mut values = orig.to_vec();
+        let marks = row_marks.get(row_idx).copied().unwrap_or(&[]);
+        let mut ordered: Vec<&VolatileColumn> = marks
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    VolatileColumn::Sequence(..) | VolatileColumn::DefaultSequence(..)
+                )
+            })
+            .collect();
+        ordered.sort_by_key(|m| m.index());
+        for mark in ordered {
+            let idx = mark.index();
+            let column = schema.columns.get(idx).ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(
+                    "sequence column does not match the table schema".to_string(),
+                ))
+            })?;
+            let (seq_name, func): (&str, SequenceFunc) = match mark {
+                VolatileColumn::Sequence(_, func, name) => (name.as_str(), *func),
+                _ => match &column.default_expr {
+                    Some(crate::catalog::ColumnDefault::Sequence(name)) => {
+                        (name.as_str(), SequenceFunc::Nextval)
+                    }
+                    _ => {
+                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                            "sequence DEFAULT does not match the table schema".to_string(),
+                        )))
+                    }
+                },
+            };
+            let seq_def = sequence_definition_in_txn(write_txn, seq_name)?.ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::TableNotFound(seq_name.to_string()))
+            })?;
+            let (seq_id, params, restart_value) =
+                (seq_def.id, seq_def.params, seq_def.restart_value);
+            let value: i64 = match func {
+                SequenceFunc::Nextval => {
+                    let v = allocator
+                        .next_value_in_txn(write_txn, tenant_id, seq_id, &params, restart_value)
+                        .map_err(|e| match e {
+                            AllocError::LimitReached { ascending } => {
+                                sql_err(SqlSurfaceError::SequenceGeneratorLimitExceeded {
+                                    ascending,
+                                })
+                            }
+                            AllocError::TooManyCursors => {
+                                sql_err(SqlSurfaceError::payload_too_large("too many sequences"))
+                            }
+                            AllocError::Poisoned => sql_err(SqlSurfaceError::Internal {
+                                detail: "sequence allocator unavailable".to_string(),
+                            }),
+                            AllocError::Catalog(c) => TenantWriteError::Catalog(c),
+                        })?;
+                    if let Some(session) = &session {
+                        let mut state = session.lock().map_err(|_| {
+                            sql_err(SqlSurfaceError::Internal {
+                                detail: "sequence session state unavailable".to_string(),
+                            })
+                        })?;
+                        if !state.record_nextval(tenant_id, seq_id, v) {
+                            return Err(sql_err(SqlSurfaceError::payload_too_large(
+                                "too many sequences in session",
+                            )));
+                        }
+                    }
+                    v
+                }
+                SequenceFunc::Currval => {
+                    let Some(session) = &session else {
+                        return Err(sql_err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "currval is not supported in this context".to_string(),
+                        }));
+                    };
+                    let cur = {
+                        let state = session.lock().map_err(|_| {
+                            sql_err(SqlSurfaceError::Internal {
+                                detail: "sequence session state unavailable".to_string(),
+                            })
+                        })?;
+                        state
+                            .currval(tenant_id, seq_id)
+                            .ok_or_else(|| sql_err(SqlSurfaceError::SequenceNotYetDefined))?
+                    };
+                    // ROLLBACK で永続値だけ戻った状態でも、メモリ上の消費済みの現在値を同じ txn へ
+                    // 永続化する（再オープン後の再払い出しを防ぐ。値は巻き戻さない）。
+                    allocator
+                        .persist_current_in_txn(write_txn, tenant_id, seq_id)
+                        .map_err(|e| match e {
+                            AllocError::Catalog(c) => TenantWriteError::Catalog(c),
+                            _ => sql_err(SqlSurfaceError::Internal {
+                                detail: "sequence allocator unavailable".to_string(),
+                            }),
+                        })?;
+                    cur
+                }
+            };
+            // 列型へ収める。範囲外は `22003`（値は消費済みで戻さない。PostgreSQL と同じ）。
+            let range_err = || {
+                sql_err(SqlSurfaceError::numeric_out_of_range(
+                    "sequence value out of range for the column type",
+                ))
+            };
+            let bound = match column.ty {
+                crate::catalog::ColumnType::SmallInt => crate::row_codec::Value::Integer(
+                    i32::from(i16::try_from(value).map_err(|_| range_err())?),
+                ),
+                crate::catalog::ColumnType::Integer => {
+                    crate::row_codec::Value::Integer(i32::try_from(value).map_err(|_| range_err())?)
+                }
+                crate::catalog::ColumnType::BigInt => crate::row_codec::Value::BigInt(value),
+                _ => {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "sequence column is not an integer type".to_string(),
+                    )))
+                }
+            };
+            if let Some(slot) = values.get_mut(idx) {
+                *slot = bound;
+            }
+            sequence_scope::record_assigned(row_idx, idx, value);
+        }
+        out.push(values);
+    }
+    Ok(Some(out))
 }
 
 /// 行ごとの揮発性 DEFAULT 列の指定が行数と整合するか（空は「全行なし」）。
@@ -1462,10 +1714,7 @@ pub(crate) fn insert_typed_row_unchecked(
         // `VALUES` 内の単独時刻関数（Issue #2188）を含む文だけ、構文形を材料にする別ドメイン
         // （`InsertExpr`）を使う。省略列へ適用した DEFAULT（定数・時刻とも）は材料から除外し、
         // DEFAULT の変更を挟んだ再送が一致するようにする（Issue #1629 D1）。
-        let content_hash = if volatile_default_columns
-            .iter()
-            .any(|c| matches!(c, VolatileColumn::Values(..)))
-        {
+        let content_hash = if has_values_expr(volatile_default_columns) {
             let expr_columns =
                 named_expr_columns(&schema, values, vector_idx, volatile_default_columns)?;
             content_hash::for_typed_insert_expr(id, visibility, embedding, &expr_columns)?
@@ -1482,6 +1731,20 @@ pub(crate) fn insert_typed_row_unchecked(
             &content_hash,
         )?;
         reject_missing_not_null(&schema, volatile_default_columns)?;
+        // SEQUENCE の採番は台帳照合の後（再送の `23505` で値を消費しない。TABLE-24 (3)・
+        // Issue #1690）。印が無い文は何もしない。
+        let sequence_rows = assign_sequence_values(
+            &target,
+            write_txn,
+            ctx.tenant_id(),
+            &schema,
+            &[volatile_default_columns],
+            &[values],
+        )?;
+        let values: &[crate::row_codec::Value] = match &sequence_rows {
+            Some(rows) => rows.first().map(Vec::as_slice).unwrap_or(values),
+            None => values,
+        };
         // 行のエンコードは台帳照合と NOT NULL 検査の後に行う（省略された非 nullable 列の仮値
         // `Null` が、再送判定より先に `22000` を起こさないため。Issue #1629）。
         let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
@@ -1668,12 +1931,33 @@ pub(crate) fn insert_typed_rows_unchecked(
             for row_volatile in volatile_default_columns {
                 reject_missing_not_null(&schema, row_volatile)?;
             }
+            // SEQUENCE の採番は台帳照合の後・行の順に行う（TABLE-24・Issue #1690）。
+            let row_marks: Vec<&[VolatileColumn]> = (0..rows.len())
+                .map(|i| volatile_default_columns.get(i).copied().unwrap_or(&[]))
+                .collect();
+            let row_values: Vec<&[crate::row_codec::Value]> =
+                rows.iter().map(|(_, v)| *v).collect();
+            let sequence_rows = assign_sequence_values(
+                &target,
+                write_txn,
+                ctx.tenant_id(),
+                &schema,
+                &row_marks,
+                &row_values,
+            )?;
 
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
                 .open_table(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
-            for (id, values) in rows {
+            for (row_idx, (id, orig_values)) in rows.iter().enumerate() {
+                let values: &[crate::row_codec::Value] = match &sequence_rows {
+                    Some(owned) => owned
+                        .get(row_idx)
+                        .map(Vec::as_slice)
+                        .unwrap_or(*orig_values),
+                    None => orig_values,
+                };
                 let embedding: &[f32] = match vector_idx {
                     Some(idx) => match values.get(idx) {
                         Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
@@ -1903,6 +2187,18 @@ fn upsert_typed_rows_impl(
         return Ok(UpsertOutcome::default());
     }
     check_volatile_len(volatile_default_columns, rows.len())?;
+    // UPSERT は SEQUENCE の印を処理しない（束縛段が `0A000` で拒否済みの多層防御。TABLE-24・
+    // Issue #1690）。仮値 `Null` を黙って書く fail-open を構造的に塞ぐ。
+    if volatile_default_columns
+        .iter()
+        .any(|r| has_sequence_marks(r))
+    {
+        return Err(TenantWriteError::SequenceEvaluationFailed(
+            SqlSurfaceError::FeatureNotSupported {
+                detail: "nextval and currval are not supported in this context".to_string(),
+            },
+        ));
+    }
 
     // バッチ内 id 重複検出（`insert_typed_rows_unchecked` と同じ設計。呼び出し元
     // `sql::parser::bind_upsert_form` が束縛時点で既に `22000` として拒否済みの

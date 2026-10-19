@@ -6234,6 +6234,23 @@ pub enum ColumnDefault {
     Bool(bool),
     /// 時刻値関数の DEFAULT（構文形。評価は INSERT 時のトランザクション開始時刻）。
     CurrentTime(TimeDefault),
+    /// `DEFAULT nextval('<SEQUENCE 名>')`（TABLE-24・Issue #1690）。SEQUENCE 名を構文形のまま
+    /// 保存し（カタログタグ `q`・本体は 16 進化）、INSERT の省略列補完が書き込み txn 内で
+    /// 採番する（`tenant` の INSERT 系書き込み。束縛時には評価しない）。`SMALLINT`／`INTEGER`／
+    /// `BIGINT` 列だけが受理する。`DROP SEQUENCE` は本 variant の参照を依存として数える
+    /// （`catalog::sequence`）。公開 enum への variant 追加は破壊的変更。
+    Sequence(String),
+}
+
+impl ColumnDefault {
+    /// 評価が文ごと（時刻・採番）に決まる DEFAULT か。定数 DEFAULT と違い、読み出し時補完値・
+    /// FK の `SET DEFAULT`・`ADD COLUMN` の既存行補完に使えない（各所の fail-closed 判定が共有する）。
+    pub(crate) fn is_statement_evaluated(&self) -> bool {
+        match self {
+            ColumnDefault::CurrentTime(_) | ColumnDefault::Sequence(_) => true,
+            ColumnDefault::Text(_) | ColumnDefault::Number(_) | ColumnDefault::Bool(_) => false,
+        }
+    }
 }
 
 /// [`ColumnDefault::CurrentTime`] が受理する時刻値関数の構文形（許可リスト。
@@ -6389,6 +6406,13 @@ impl ColumnDefault {
                     | ColumnType::Numeric { .. },
             ) | (ColumnDefault::Bool(_), ColumnType::Boolean)
         ) || matches!(self, ColumnDefault::CurrentTime(t) if t.compatible_with(ty))
+            || matches!(
+                (self, ty),
+                (
+                    ColumnDefault::Sequence(_),
+                    ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt
+                )
+            )
     }
 
     /// カタログテキスト形式（v5）の `default` フィールドへ符号化する。
@@ -6407,6 +6431,10 @@ impl ColumnDefault {
                     ));
                 }
                 ('c', t.canonical_text())
+            }
+            ColumnDefault::Sequence(name) => {
+                validate_identifier(name)?;
+                ('q', name.clone())
             }
             ColumnDefault::Bool(b) => {
                 return Ok(if *b { "t".to_string() } else { "f".to_string() })
@@ -6465,6 +6493,11 @@ impl ColumnDefault {
                 .ok_or_else(|| {
                     CatalogError::Invalid("unknown time column default form".to_string())
                 }),
+            // SEQUENCE 名は識別子規則で検証する（不正な名前は fail-closed。TABLE-24・Issue #1690）。
+            'q' => {
+                validate_identifier(&text)?;
+                Ok(Some(ColumnDefault::Sequence(text)))
+            }
             other => Err(CatalogError::Invalid(format!(
                 "unknown column default tag: {other:?}"
             ))),
@@ -7801,9 +7834,7 @@ fn validate_schema_impl(schema: &TableSchema, require_live: bool) -> Result<()> 
             // 補完値は定数に限る（不変条件 (a)）。時刻 DEFAULT は読み出し時補完が常に
             // 失敗するため、INSERT 既定値と等しいミラー状態（CREATE TABLE の旧来表現）
             // 以外では拒否する。
-            if matches!(fill, ColumnDefault::CurrentTime(_))
-                && column.default_expr.as_ref() != Some(fill)
-            {
+            if fill.is_statement_evaluated() && column.default_expr.as_ref() != Some(fill) {
                 return Err(CatalogError::Invalid(format!(
                     "column {:?} has a fill value that is not a constant",
                     column.name
@@ -8108,7 +8139,12 @@ fn validate_referential_action_declaration(schema: &TableSchema, fk: &ForeignKey
         // 主体の文が無く、評価時刻を再送で再現できないため。SQL-37・Issue #1587、設計 D9）。
         // SQL 表層は `sql::ddl` が先に `0A000` で拒否するため、ここは Rust API・decode の
         // 多層防御（fail-closed）。
-        if uses_set_default && matches!(column.default_expr, Some(ColumnDefault::CurrentTime(_))) {
+        if uses_set_default
+            && column
+                .default_expr
+                .as_ref()
+                .is_some_and(ColumnDefault::is_statement_evaluated)
+        {
             return Err(CatalogError::InvalidForeignKey(format!(
                 "column {name} has a time function DEFAULT and cannot use the SET DEFAULT referential action"
             )));
@@ -10429,7 +10465,9 @@ fn decode_schema_body(
                     // v14 は補完値を別フィールドから読む。時刻 DEFAULT の補完値は
                     // INSERT 既定値と等しいミラー状態以外では拒否する（不変条件 (a)）。
                     let fill = decode_column_default_checked(&column, field)?;
-                    if matches!(fill, Some(ColumnDefault::CurrentTime(_)))
+                    if fill
+                        .as_ref()
+                        .is_some_and(ColumnDefault::is_statement_evaluated)
                         && fill != column.default_expr
                     {
                         return Err(CatalogError::Invalid(format!(
@@ -11147,6 +11185,15 @@ impl Storage {
             None
         };
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        // `DEFAULT nextval('<名前>')` は参照先 SEQUENCE がこの write txn の時点で存在すること
+        // （TABLE-24・Issue #1690。未登録は `TableNotFound`＝`42P01`。名前はクライアント自身の入力）。
+        for column in &schema.columns {
+            if let Some(ColumnDefault::Sequence(seq)) = &column.default_expr {
+                if !sequence::sequence_exists_in_txn(&write_txn, seq)? {
+                    return Err(CatalogError::TableNotFound(seq.clone()));
+                }
+            }
+        }
         {
             // ENUM 列（[`ColumnType::Enum`]）が参照する型は、この write txn の
             // 時点でカタログに登録済みであることを検証する（Issue #890 D2。
@@ -11546,8 +11593,14 @@ impl Storage {
         // 時刻値関数の DEFAULT は既存行の補完値を固定できず、読み出し時補完が常に失敗して
         // テーブルを読めなくするため、Rust API 直接呼び出しでも拒否する（多層防御。SQL 表層は
         // `sql::allowlist` が `0A000` で先に拒否する。SQL-37・Issue #1587、設計 D10）。
-        if matches!(column.default_expr, Some(ColumnDefault::CurrentTime(_)))
-            || matches!(column.fill_value, Some(ColumnDefault::CurrentTime(_)))
+        if column
+            .default_expr
+            .as_ref()
+            .is_some_and(ColumnDefault::is_statement_evaluated)
+            || column
+                .fill_value
+                .as_ref()
+                .is_some_and(ColumnDefault::is_statement_evaluated)
         {
             return Err(CatalogError::Invalid(
                 "time function DEFAULT is not supported in ALTER TABLE ADD COLUMN".to_string(),
@@ -12746,6 +12799,13 @@ impl Storage {
                     "DEFAULT is not supported for a VECTOR column".to_string(),
                 ));
             }
+            // `SET DEFAULT nextval('<名前>')` は参照先 SEQUENCE が同じ write txn で存在すること
+            // （TABLE-24・Issue #1690。`DROP SEQUENCE` との競合を write txn 内の確認で閉じる）。
+            if let Some(ColumnDefault::Sequence(seq)) = &default_expr {
+                if !sequence::sequence_exists_in_txn(write_txn, seq)? {
+                    return Err(CatalogError::TableNotFound(seq.clone()));
+                }
+            }
 
             let mut updated = schema.clone();
             for c in updated.columns.iter_mut() {
@@ -12753,7 +12813,10 @@ impl Storage {
                     c.set_default_expr(default_expr.clone());
                     // 時刻値関数のミラーだった補完値は、`validate_schema` の不変条件 (a) を
                     // 満たすため落とす（上記ドキュメントの根拠参照）。定数の補完値は保持する。
-                    if matches!(c.fill_value, Some(ColumnDefault::CurrentTime(_))) {
+                    if c.fill_value
+                        .as_ref()
+                        .is_some_and(ColumnDefault::is_statement_evaluated)
+                    {
                         c.fill_value = None;
                     }
                     if crate::row_codec::validate_column_default(c).is_err() {
@@ -15652,7 +15715,11 @@ fn catalog_value_references_enum_type_in_table(
                 if fill != v14_default_seen {
                     seen_fill_divergence = true;
                 }
-                if matches!(fill, Some(ColumnDefault::CurrentTime(_))) && fill != v14_default_seen {
+                if fill
+                    .as_ref()
+                    .is_some_and(ColumnDefault::is_statement_evaluated)
+                    && fill != v14_default_seen
+                {
                     return Err(CatalogError::CorruptSchema(format!(
                         "column {name:?} has a fill value that is not a constant"
                     )));
@@ -15949,6 +16016,13 @@ fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> boo
             "integer" | "bigint" | "real" | "double" | "numeric"
         ) | (ColumnDefault::Bool(_), "boolean")
     ) || matches!(default, ColumnDefault::CurrentTime(t) if t.compatible_with_tag(tag))
+        || matches!(
+            (default, tag),
+            (
+                ColumnDefault::Sequence(_),
+                "smallint" | "integer" | "bigint"
+            )
+        )
 }
 
 /// ENUM 型 `type_name` を参照する列を持つテーブル名の一覧を列挙する
