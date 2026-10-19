@@ -492,17 +492,20 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // SEQUENCE の定義表・状態表・ID カウンタだけを書く。表の行スキーマ（`user_rows/{table}`）も
     // 表のスキーマ世代も変えないため、`bump_table_generation_in_txn` を伴わない。Issue #1690 の
     // 採番（`SequenceAllocator`）も状態表だけを書く（コミットは呼び出し側の INSERT の txn）。
-    // 先頭 2 件が本体（`create_sequence`／`drop_sequence`）、残りは同ファイルの `#[cfg(test)]` 内
+    // 先頭 4 件が本体（`create_sequence`／`drop_sequence`／`alter_sequence`／`rename_sequence`）、残りは同ファイルの `#[cfg(test)]` 内
     // （状態行の種まき・採番の永続化確認）で、同じ理由で対象外。
-    ("catalog/sequence.rs", 699),
-    ("catalog/sequence.rs", 720),
-    ("catalog/sequence.rs", 763),
-    ("catalog/sequence.rs", 798),
-    ("catalog/sequence.rs", 853),
-    ("catalog/sequence.rs", 1127),
-    ("catalog/sequence.rs", 1212),
-    ("catalog/sequence.rs", 1480),
-    // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（763・798）も同じ表だけを書く
+    // Issue #1690（nextval／currval）の行追加で行番号が移動したための追随（旧: 699／720／763／798）。
+    ("catalog/sequence.rs", 730),
+    ("catalog/sequence.rs", 754),
+    ("catalog/sequence.rs", 803),
+    ("catalog/sequence.rs", 842),
+    ("catalog/sequence.rs", 897),
+    ("catalog/sequence.rs", 1171),
+    ("catalog/sequence.rs", 1257),
+    ("catalog/sequence.rs", 1297),
+    ("catalog/sequence.rs", 1350),
+    ("catalog/sequence.rs", 1618),
+    // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
 ];
 

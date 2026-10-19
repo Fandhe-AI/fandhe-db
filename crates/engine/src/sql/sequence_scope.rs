@@ -25,9 +25,11 @@ use crate::catalog::sequence::SequenceAllocator;
 /// `nextval` で得た値）。接続単位の値型で、他接続・他テナントへ漏れる経路は構造上存在しない。
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SessionSequenceState {
-    currval: HashMap<u64, i64>,
-    /// 直近に `nextval` が成功した SEQUENCE（`lastval` 用の器。意味の設計は #1691）。
-    last: Option<u64>,
+    /// キーは `(tenant_id, sequence_id)`。同じ `SessionState` を別テナントの `PolicyContext` で
+    /// 使っても、他テナントの `nextval` の結果を `currval` で読めないようにする（テナント境界）。
+    currval: HashMap<(String, u64), i64>,
+    /// 直近に `nextval` が成功した `(tenant_id, sequence_id)`（`lastval` 用の器。意味の設計は #1691）。
+    last: Option<(String, u64)>,
 }
 
 /// セッション内に保持する SEQUENCE の件数上限（DoS 対策。超過は `54000`）。
@@ -35,18 +37,21 @@ pub(crate) const MAX_SESSION_SEQUENCES: usize = crate::catalog::sequence::MAX_SE
 
 impl SessionSequenceState {
     /// `nextval` が成功した値を記録する。件数上限を超える新規 SEQUENCE は `false`（拒否）。
-    pub(crate) fn record_nextval(&mut self, sequence_id: u64, value: i64) -> bool {
-        if !self.currval.contains_key(&sequence_id) && self.currval.len() >= MAX_SESSION_SEQUENCES {
+    pub(crate) fn record_nextval(&mut self, tenant_id: &str, sequence_id: u64, value: i64) -> bool {
+        let key = (tenant_id.to_string(), sequence_id);
+        if !self.currval.contains_key(&key) && self.currval.len() >= MAX_SESSION_SEQUENCES {
             return false;
         }
-        self.currval.insert(sequence_id, value);
-        self.last = Some(sequence_id);
+        self.currval.insert(key.clone(), value);
+        self.last = Some(key);
         true
     }
 
     /// このセッションの `currval`（`nextval` 未呼び出しは `None`）。
-    pub(crate) fn currval(&self, sequence_id: u64) -> Option<i64> {
-        self.currval.get(&sequence_id).copied()
+    pub(crate) fn currval(&self, tenant_id: &str, sequence_id: u64) -> Option<i64> {
+        self.currval
+            .get(&(tenant_id.to_string(), sequence_id))
+            .copied()
     }
 }
 
@@ -85,6 +90,18 @@ impl SequenceScope {
         };
         let prev = CURRENT.with(|c| c.replace(Some(ctx)));
         // 前の文の受け渡し値を持ち越さない。
+        ASSIGNED.with(|a| a.borrow_mut().clear());
+        SequenceScope { prev }
+    }
+
+    /// セッション状態を持たない文脈を張る（公開入口 `execute_insert_returning` を直接呼ぶ経路用。
+    /// 払い出し値の受け渡し（`RETURNING` 用）だけを有効にし、`currval` は `0A000` になる）。
+    pub(crate) fn enter_sessionless(allocator: Arc<SequenceAllocator>) -> Self {
+        let ctx = SequenceContext {
+            allocator,
+            session: None,
+        };
+        let prev = CURRENT.with(|c| c.replace(Some(ctx)));
         ASSIGNED.with(|a| a.borrow_mut().clear());
         SequenceScope { prev }
     }
@@ -139,12 +156,20 @@ mod tests {
     #[test]
     fn session_state_records_and_bounds() {
         let mut s = SessionSequenceState::default();
-        assert_eq!(s.currval(1), None);
-        assert!(s.record_nextval(1, 5));
-        assert_eq!(s.currval(1), Some(5));
-        assert!(s.record_nextval(1, 6));
-        assert_eq!(s.currval(1), Some(6));
-        assert_eq!(s.last, Some(1));
+        assert_eq!(s.currval("t", 1), None);
+        assert!(s.record_nextval("t", 1, 5));
+        assert_eq!(s.currval("t", 1), Some(5));
+        assert!(s.record_nextval("t", 1, 6));
+        assert_eq!(s.currval("t", 1), Some(6));
+        assert_eq!(s.last, Some(("t".to_string(), 1)));
+    }
+
+    #[test]
+    fn currval_is_isolated_per_tenant() {
+        let mut s = SessionSequenceState::default();
+        assert!(s.record_nextval("alice", 1, 5));
+        assert_eq!(s.currval("bob", 1), None);
+        assert_eq!(s.currval("alice", 1), Some(5));
     }
 
     #[test]

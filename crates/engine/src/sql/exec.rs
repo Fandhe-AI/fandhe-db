@@ -5232,6 +5232,21 @@ pub(crate) fn execute_insert_returning_in(
         let _ = crate::sql::sequence_scope::take_assigned();
     }
 
+    // 公開入口を直接呼ぶ経路（`core.rs` の `SequenceScope` が無い）でも払い出し値を捕捉できるよう、
+    // `Autocommit` ではセッション状態なしのスコープを張る（commit 後に値が取れず失敗するのを防ぐ）。
+    // `InTxn` はスコープが無ければ採番が `0A000` で書き込み前に拒否される。
+    let _local_scope = match (&target, has_sequence) {
+        (crate::tenant::WriteTarget::Autocommit(storage), true)
+            if crate::sql::sequence_scope::current().is_none() =>
+        {
+            Some(
+                crate::sql::sequence_scope::SequenceScope::enter_sessionless(
+                    std::sync::Arc::clone(storage.sequence_allocator()),
+                ),
+            )
+        }
+        _ => None,
+    };
     let insert_outcome =
         execute_insert_batch_with_schema_in(target, ctx, bounds, ledger_mode, Some(schema))?;
 

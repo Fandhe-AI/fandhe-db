@@ -1493,7 +1493,7 @@ fn assign_sequence_values(
                                 detail: "sequence session state unavailable".to_string(),
                             })
                         })?;
-                        if !state.record_nextval(seq_id, v) {
+                        if !state.record_nextval(tenant_id, seq_id, v) {
                             return Err(sql_err(SqlSurfaceError::payload_too_large(
                                 "too many sequences in session",
                             )));
@@ -1514,7 +1514,7 @@ fn assign_sequence_values(
                             })
                         })?;
                         state
-                            .currval(seq_id)
+                            .currval(tenant_id, seq_id)
                             .ok_or_else(|| sql_err(SqlSurfaceError::SequenceNotYetDefined))?
                     };
                     // ROLLBACK で永続値だけ戻った状態でも、メモリ上の消費済みの現在値を同じ txn へ
