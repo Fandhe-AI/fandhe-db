@@ -30,6 +30,15 @@
 //! マーカーと全行の正引きエントリがクラッシュ後も生存している）と、既存 code の大文字小文字違いを
 //! 新しい id で再挿入すると再起動後も必ず `23505` で拒否されることを確かめる。
 //!
+//! Issue #1654（INDEX-11）で、部分索引の DML 維持（入場・退場・述語の評価エラーによる拒否が
+//! クラッシュ後も行と一致する不変条件）を検証するため、4 つ目の表 `docs_pidx (n INTEGER, code TEXT)`
+//! ＋部分索引 2 本（`((100 / n)) WHERE n > 0`・`(code) WHERE 100 / (n + 5) > 1`）を追加した。
+//! `write` は `n = (id % 7) - 3`（-3〜3。0 を含み -5 は書かない）で書き、各バッチの直後に先頭行の
+//! `n` の符号を反転する UPDATE を打って入退場を kill の対象経路に乗せる。`verify` は、述語の評価に
+//! 失敗する INSERT／UPDATE（`n = -5`）が再起動後も必ず `22012` で拒否されること（宣言と検査点の生存）、
+//! コミット済みの全行で述語が評価できること（`n = -5` の行が無い）、述語外の `n = 0` の行が永続化
+//! されていること（退場側の受理）を確かめる。
+//!
 //! サブコマンド:
 //! - `write <db_path>`: `docs (code TEXT UNIQUE)` テーブル（無ければ作成）へ、
 //!   `BATCH` 件の行を 1 `INSERT` 文（＝1 write トランザクション。UNIQUE 索引の
@@ -66,9 +75,11 @@ const CRASH_TOOL_TENANT_ID: &str = "crash-tool-unique-index-tenant";
 const BATCH: u64 = 10;
 /// 検証対象の表。`docs` は列制約 `UNIQUE`、`docs_uidx` は `CREATE UNIQUE INDEX` 由来
 /// （Issue #1616・INDEX-9）の一意制約を持つ。
-const TABLES: [&str; 3] = ["docs", "docs_uidx", XIDX_TABLE];
+const TABLES: [&str; 4] = ["docs", "docs_uidx", XIDX_TABLE, PIDX_TABLE];
 /// 式索引（`((100 / n))`・`((lower(code)))`）を持つ表（Issue #1649・INDEX-10）。
 const XIDX_TABLE: &str = "docs_xidx";
+/// 部分索引（`((100 / n)) WHERE n > 0`・`(code) WHERE 100 / (n + 5) > 1`）を持つ表（Issue #1654・INDEX-11）。
+const PIDX_TABLE: &str = "docs_pidx";
 
 /// 再開時に既存行の最大 id を求める `SELECT id FROM docs LIMIT n` の上限件数。
 /// `sql::allowlist` が SELECT の `LIMIT` に課す上限（1..=10000）と同じ値を使う
@@ -164,6 +175,24 @@ fn ensure_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
         core.execute_sql_in_session(ctx, &mut session, sql)
             .map_err(|e| format!("create expression index failed: {e}"))?;
     }
+    match core.execute_sql_in_session(
+        ctx,
+        &mut session,
+        "CREATE TABLE docs_pidx (n INTEGER, code TEXT)",
+    ) {
+        Ok(_) => {}
+        Err(engine::sql::allowlist::SqlSurfaceError::DuplicateTable { .. }) => {}
+        Err(e) => return Err(format!("create table failed: {e}")),
+    }
+    for sql in [
+        // 述語外の `n <= 0`（`n = 0` を含む）の行は式要素 `100 / n` を評価せずに受理される（退場の意味論）。
+        "CREATE INDEX IF NOT EXISTS docs_pidx_div ON docs_pidx ((100 / n)) WHERE n > 0",
+        // 述語自体が `n = -5` で 0 除算になる。`write` は -5 を書かない。
+        "CREATE INDEX IF NOT EXISTS docs_pidx_pred ON docs_pidx (code) WHERE 100 / (n + 5) > 1",
+    ] {
+        core.execute_sql_in_session(ctx, &mut session, sql)
+            .map_err(|e| format!("create partial index failed: {e}"))?;
+    }
     Ok(())
 }
 
@@ -172,6 +201,12 @@ fn ensure_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
 fn row_tuple(table: &str, id: u64) -> String {
     if table == XIDX_TABLE {
         format!("({id}, {}, 'Code-{id}')", id % 7 + 1)
+    } else if table == PIDX_TABLE {
+        // `n = (id % 7) - 3`（-3〜3。0 を含み、述語が失敗する -5 は書かない）。
+        format!(
+            "({id}, {}, 'code-{id}')",
+            i64::try_from(id % 7).unwrap_or(0) - 3
+        )
     } else {
         format!("({id}, 'code-{id}')")
     }
@@ -258,7 +293,7 @@ fn write_inner(path: &str) -> Result<(), String> {
                 }
                 values.push_str(&row_tuple(table, id));
             }
-            let columns = if *table == XIDX_TABLE {
+            let columns = if *table == XIDX_TABLE || *table == PIDX_TABLE {
                 "id, n, code"
             } else {
                 "id, code"
@@ -268,6 +303,16 @@ fn write_inner(path: &str) -> Result<(), String> {
             );
             core.execute_insert_sql(&ctx, &sql)
                 .map_err(|e| format!("insert failed at {table} batch_seq={batch_seq}: {e}"))?;
+            if *table == PIDX_TABLE {
+                // 先頭行の `n` の符号を反転する（-3〜3 の範囲を出ない）。述語・式要素の入退場を
+                // kill の対象経路に乗せる。バッチ通番ごとに一意な操作 ID で、再開時に再実行されない。
+                let flip = format!(
+                    "UPDATE {table} SET n = 0 - n WHERE id = {slot} USING OPERATION_ID 'op-{table}-flip-{batch_seq}'"
+                );
+                let mut session = SessionState::default();
+                core.execute_sql_in_session(&ctx, &mut session, &flip)
+                    .map_err(|e| format!("update failed at {table} batch_seq={batch_seq}: {e}"))?;
+            }
             *slot = slot
                 .checked_add(BATCH)
                 .ok_or_else(|| "row id overflow after insert".to_string())?;
@@ -363,6 +408,10 @@ fn verify_table(core: &EngineCore, ctx: &PolicyContext, table: &str) -> Result<(
 
     if table == XIDX_TABLE {
         verify_expression_index_table(core, ctx, total_rows)?;
+        return Ok((total_rows, total_rows / BATCH));
+    }
+    if table == PIDX_TABLE {
+        verify_partial_index_table(core, ctx, total_rows)?;
         return Ok((total_rows, total_rows / BATCH));
     }
 
@@ -513,6 +562,92 @@ fn verify_expression_index_table(
         .execute_sql(
             ctx,
             &format!("SELECT id FROM {XIDX_TABLE} WHERE id = {probe_id} LIMIT 1"),
+        )
+        .map_err(|e| format!("verify probe scan failed: {e}"))?;
+    if !probe.rows.is_empty() {
+        return Err("rejected probe insert left a row behind".to_string());
+    }
+    Ok(())
+}
+
+/// 部分索引の表の検証（Issue #1654・INDEX-11）。再起動後も部分索引の宣言と DML ゲートが生きており、
+/// コミット済みの全行で述語が評価でき、述語外（退場側）の行が永続化されていることを、公開 API だけで
+/// 確かめる。いずれのプローブも常に拒否される前提のため、成功時は副作用を残さない。
+fn verify_partial_index_table(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    total_rows: u64,
+) -> Result<(), String> {
+    // (a) 述語の評価エラー（`n = -5`）の INSERT は `22012` で拒否され、その id の行が残らない。
+    let probe_id = total_rows;
+    let insert_sql = format!(
+        "INSERT INTO {PIDX_TABLE} (id, n, code) VALUES ({probe_id}, -5, 'probe') \
+         USING OPERATION_ID 'verify-pidx-ins-{probe_id}'"
+    );
+    match core.execute_insert_sql(ctx, &insert_sql) {
+        Err(e) if e.wire_code() == "22012" => {}
+        Err(e) => {
+            return Err(format!(
+                "partial index probe insert failed with an unexpected wire_code {} \
+                 (expected 22012): {e}",
+                e.wire_code()
+            ));
+        }
+        Ok(_) => {
+            return Err(
+                "partial index probe insert was wrongly accepted; the partial index gate \
+                 is missing after crash recovery"
+                    .to_string(),
+            );
+        }
+    }
+    // (b) 既存行を `n = -5` へ更新する UPDATE も `22012` で拒否される。
+    let mut session = SessionState::default();
+    let update_sql = format!(
+        "UPDATE {PIDX_TABLE} SET n = -5 WHERE id = 0 USING OPERATION_ID 'verify-pidx-upd-{total_rows}'"
+    );
+    match core.execute_sql_in_session(ctx, &mut session, &update_sql) {
+        Err(e) if e.wire_code() == "22012" => {}
+        Err(e) => {
+            return Err(format!(
+                "partial index probe update failed with an unexpected wire_code {} \
+                 (expected 22012): {e}",
+                e.wire_code()
+            ));
+        }
+        Ok(_) => {
+            return Err("partial index probe update was wrongly accepted".to_string());
+        }
+    }
+    // (c) 述語を評価できない行（`n = -5`）がコミット済みの中に 1 行も無い。
+    let failing = core
+        .execute_sql(
+            ctx,
+            &format!("SELECT id FROM {PIDX_TABLE} WHERE n = -5 LIMIT {SCAN_LIMIT}"),
+        )
+        .map_err(|e| format!("verify failing-row scan failed: {e}"))?;
+    if !failing.rows.is_empty() {
+        return Err(format!(
+            "{} committed row(s) have n = -5, which the partial index predicate cannot evaluate",
+            failing.rows.len()
+        ));
+    }
+    // (d) 述語外（退場側）の `n = 0` の行が永続化されている（`n = (id % 7) - 3` は id = 3 で 0。
+    //     式要素 `100 / n` は述語 `n > 0` の外なので評価されず、行は受理される）。
+    let outside = core
+        .execute_sql(
+            ctx,
+            &format!("SELECT id FROM {PIDX_TABLE} WHERE n = 0 LIMIT {SCAN_LIMIT}"),
+        )
+        .map_err(|e| format!("verify outside-predicate scan failed: {e}"))?;
+    if outside.rows.is_empty() {
+        return Err("no committed row outside the partial index predicate (n = 0)".to_string());
+    }
+    // (e) 拒否された INSERT の行が残っていない（副作用ゼロ）。
+    let probe = core
+        .execute_sql(
+            ctx,
+            &format!("SELECT id FROM {PIDX_TABLE} WHERE id = {probe_id} LIMIT 1"),
         )
         .map_err(|e| format!("verify probe scan failed: {e}"))?;
     if !probe.rows.is_empty() {

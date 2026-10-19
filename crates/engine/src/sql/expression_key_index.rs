@@ -350,6 +350,19 @@ impl ExpressionKeyIndex {
         decl: &DeclaredExpressionKey,
         running_bytes: usize,
     ) -> Result<Self, ScalarIndexBuildError> {
+        Self::build_for_slots(schema, snapshot, decl, running_bytes, None)
+    }
+
+    /// [`Self::build`] の本体。`slots` が `Some` のときは、そのスロット（昇順・重複なし）だけを評価して
+    /// キーを作る（部分索引〔INDEX-11、Issue #1654〕の式要素を、述語 TRUE の行〔`members`〕だけで作る）。
+    /// `None` は全スロット（従来どおり）。予算検査・確保の扱いは同じ。
+    pub(crate) fn build_for_slots(
+        schema: &TableSchema,
+        snapshot: &SqlArenaSnapshot,
+        decl: &DeclaredExpressionKey,
+        running_bytes: usize,
+        slots: Option<&[u32]>,
+    ) -> Result<Self, ScalarIndexBuildError> {
         // 永続データは untrusted。再解析・再束縛し、保存形へ描き戻して一致することを確認する。
         let expr = crate::sql::allowlist::parse_index_expression_text(&decl.sql)
             .map_err(|_| ScalarIndexBuildError::Unbuildable)?;
@@ -362,7 +375,9 @@ impl ExpressionKeyIndex {
         crate::sql::udf_call::mark_referenced_scalar_columns(&bound.bound, &mut mask);
 
         let arena = snapshot.arena();
-        let row_count = arena.len();
+        let arena_len = arena.len();
+        // 評価・格納の対象件数（`slots` 指定時はその件数）。
+        let row_count = slots.map_or(arena_len, <[u32]>::len);
         let entry_size = match bound.ty {
             ExprType::Text => std::mem::size_of::<(Vec<u8>, u32)>(),
             ExprType::Scalar => std::mem::size_of::<(u64, u32)>(),
@@ -404,8 +419,17 @@ impl ExpressionKeyIndex {
         let mut null_slots: Vec<u32> = Vec::new();
         let mut scratch = Vec::new();
         let ids = arena.ids();
-        for slot in 0..row_count {
-            let slot_u32 = u32::try_from(slot).map_err(|_| ScalarIndexBuildError::SlotOverflow)?;
+        for position in 0..row_count {
+            let slot_u32 = match slots {
+                Some(list) => *list
+                    .get(position)
+                    .ok_or(ScalarIndexBuildError::Unbuildable)?,
+                None => u32::try_from(position).map_err(|_| ScalarIndexBuildError::SlotOverflow)?,
+            };
+            let slot = slot_u32 as usize;
+            if slot >= arena_len {
+                return Err(ScalarIndexBuildError::Unbuildable);
+            }
             let metadata = snapshot
                 .metadata()
                 .get(slot)

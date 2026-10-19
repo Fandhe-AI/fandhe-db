@@ -46,7 +46,7 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 use crate::row_codec::{self, Value as RowCodecValue};
 use crate::sql::allowlist::{
     classify_view_body, parse_view_body, SqlSurfaceError, StructuralOnlyLookup, TableLookup,
-    ViewBodyCheck, ViewBodyKind,
+    ViewBodyCheck, ViewBodyKind, WherePredicate,
 };
 use crate::sql::udf_call::Expr;
 // `RowInput` / `Visibility` は `insert_row_into_table` / `insert_rows_into_table` /
@@ -221,6 +221,22 @@ pub struct IndexDef {
     /// （`sql::ddl::execute_create_index`）だけが書き込みトランザクション内の束縛を通して
     /// 正規化テキストと参照列を確定する（呼び出し元の生テキストを保存しない）。
     pub expressions: Vec<Option<IndexExpressionDef>>,
+    /// 部分索引の述語（`CREATE INDEX ... WHERE <述語>`。INDEX-11、Issue #1654）。`None` は
+    /// 全行を索引化する通常の索引。`Some` の宣言は [`Storage::create_index`]（Rust API）が拒否し、
+    /// SQL 表層（`sql::ddl::execute_create_index`）だけが書き込みトランザクション内の束縛を通して
+    /// 正規化テキストと参照列を確定する（呼び出し元の生テキストを保存しない）。
+    pub predicate: Option<IndexPredicateDef>,
+}
+
+/// 部分索引の述語の永続形（INDEX-11、Issue #1654）。`sql` は
+/// `sql::index_predicate::bind_index_predicate` が描画し、再解析で元の述語に戻ることを確認した
+/// 正規化 SQL テキスト、`referenced_columns` は束縛時に抽出した参照列（重複なし・スキーマ宣言順。
+/// 疑似列 `id` は含めない）。`DROP COLUMN` の連鎖削除・`RENAME COLUMN` の追随・`ALTER COLUMN TYPE`
+/// の拒否の判定に使う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexPredicateDef {
+    pub sql: String,
+    pub referenced_columns: Vec<String>,
 }
 
 /// 式索引の式要素 1 個の永続形（INDEX-10、Issue #1648）。`sql` は
@@ -241,6 +257,11 @@ const INDEX_DEF_EXPRESSION_VERSION: &str = "v4";
 /// 一意の式索引の永続形の版（INDEX-9・INDEX-10、Issue #1651）。`v4` と同じ行構成の末尾に固定行
 /// `unique` を加える。非一意の式索引の `v4` とカタログ上の他の版のバイト列は変えない。
 const INDEX_DEF_EXPRESSION_UNIQUE_VERSION: &str = "v5";
+/// 部分索引の永続形の版（INDEX-11、Issue #1654）。`v4` の行構成の末尾に、述語の正規化 SQL（小文字
+/// 16 進）と述語の参照列 CSV の 2 行を足す。式要素は 0 個でもよい（列だけの部分索引）。非一意に限る
+/// （部分 UNIQUE は後続 Issue）。`v1`〜`v5` のバイト列は変えない（旧バイナリは `v6` を未知の版として
+/// 拒否する。前方互換はない）。
+const INDEX_DEF_PARTIAL_VERSION: &str = "v6";
 
 impl IndexDef {
     /// 照合指定なしの索引宣言を作る（`collations` はすべて `None`・式要素なし）。
@@ -255,7 +276,20 @@ impl IndexDef {
             collations,
             unique: false,
             expressions,
+            predicate: None,
         }
+    }
+
+    /// 部分索引の述語を与える（`sql` は束縛が描画した正規化テキスト。INDEX-11、Issue #1654）。
+    /// [`Storage::create_index`] は述語付きの宣言を拒否する（SQL 表層だけが束縛を通せる）。
+    pub fn with_predicate(mut self, predicate: Option<IndexPredicateDef>) -> Self {
+        self.predicate = predicate;
+        self
+    }
+
+    /// 部分索引（述語付き）か。
+    pub fn has_predicate(&self) -> bool {
+        self.predicate.is_some()
     }
 
     /// 式要素を与える（`expressions` は `columns` と同じ長さ。式の位置の `columns` は空文字列）。
@@ -279,14 +313,21 @@ impl IndexDef {
             .map(|(c, _)| c.as_str())
     }
 
-    /// この索引が依存する列名（素の列と、式が参照する列の和。重複を含み得る）。
+    /// この索引が依存する列名（素の列・式が参照する列・部分索引の述語が参照する列の和。重複を
+    /// 含み得る）。`DROP COLUMN` の連鎖削除はこの集合で判定する（INDEX-11、Issue #1654）。
     pub fn referenced_columns(&self) -> impl Iterator<Item = &str> {
-        self.plain_columns().chain(
-            self.expressions
-                .iter()
-                .flatten()
-                .flat_map(|e| e.referenced_columns.iter().map(String::as_str)),
-        )
+        self.plain_columns()
+            .chain(
+                self.expressions
+                    .iter()
+                    .flatten()
+                    .flat_map(|e| e.referenced_columns.iter().map(String::as_str)),
+            )
+            .chain(
+                self.predicate
+                    .iter()
+                    .flat_map(|p| p.referenced_columns.iter().map(String::as_str)),
+            )
     }
 
     /// 一意索引（`CREATE UNIQUE INDEX`。Issue #1616・INDEX-9）として宣言する。
@@ -321,7 +362,9 @@ impl IndexDef {
 /// 含み得ない）のため、区切り文字として安全に使える。
 fn encode_index_def(def: &IndexDef) -> Result<Vec<u8>> {
     let columns_csv = def.columns.join(",");
-    let text = if def.has_expressions() {
+    let text = if def.has_predicate() || def.has_expressions() {
+        // 部分索引（`v6`。INDEX-11、Issue #1654）も式索引（`v4`／`v5`）と同じ行構成の拡張で、
+        // 版の選択は [`encode_expression_index_def`] が担う。
         encode_expression_index_def(def, &columns_csv)?
     } else if def.unique {
         // 一意索引（Issue #1616・INDEX-9）は `v3`。スカラー宣言かつ照合なしに限る
@@ -411,6 +454,32 @@ fn encode_expression_index_def(def: &IndexDef, columns_csv: &str) -> Result<Stri
         }
     }
     let collation_tokens = vec!["-"; def.columns.len()].join(",");
+    if let Some(p) = &def.predicate {
+        // 部分索引（`v6`）。非一意に限る（部分 UNIQUE は後続 Issue。強制の永続形を持たないまま
+        // 宣言を残すと fail-open になるため保存しない）。
+        if def.unique {
+            return Err(invalid("partial unique index is not supported yet"));
+        }
+        if p.sql.is_empty() || p.sql.len() > MAX_INDEX_EXPRESSION_SQL_LEN {
+            return Err(invalid("index predicate text length is out of range"));
+        }
+        if p.referenced_columns.len() > MAX_COLUMN_COUNT {
+            return Err(invalid("index predicate references too many columns"));
+        }
+        for r in &p.referenced_columns {
+            validate_identifier(r)?;
+        }
+        return Ok(format!(
+            "{INDEX_DEF_PARTIAL_VERSION}\n{}\nscalar\n{}\n{}\n{}\n{}\n{}\n{}",
+            def.table,
+            columns_csv,
+            collation_tokens,
+            expr_tokens.join(","),
+            ref_segments.join(";"),
+            p.sql.bytes().map(hex_encode_byte).collect::<String>(),
+            p.referenced_columns.join(",")
+        ));
+    }
     let (version, unique_tail) = if def.unique {
         (INDEX_DEF_EXPRESSION_UNIQUE_VERSION, "\nunique")
     } else {
@@ -434,8 +503,9 @@ fn decode_expression_index_tail<'a>(
     name: &str,
     columns: &[String],
     unique: bool,
+    partial: bool,
     mut lines: impl Iterator<Item = &'a str>,
-) -> Result<Vec<Option<IndexExpressionDef>>> {
+) -> Result<(Vec<Option<IndexExpressionDef>>, Option<IndexPredicateDef>)> {
     let corrupt =
         || CatalogError::CorruptSchema(format!("invalid expression index record for index {name}"));
     let collations_line = lines.next().ok_or_else(corrupt)?;
@@ -445,6 +515,33 @@ fn decode_expression_index_tail<'a>(
     if unique && lines.next() != Some("unique") {
         return Err(corrupt());
     }
+    // `v6`（部分索引）は述語の正規化 SQL（小文字 16 進）と参照列 CSV の 2 行を持つ。
+    let predicate = if partial {
+        let pred_line = lines.next().ok_or_else(corrupt)?;
+        let pred_refs_line = lines.next().ok_or_else(corrupt)?;
+        if pred_line.is_empty() || pred_line.len() > MAX_INDEX_EXPRESSION_SQL_LEN.saturating_mul(2)
+        {
+            return Err(corrupt());
+        }
+        let bytes = hex_decode(pred_line).map_err(|_| corrupt())?;
+        let sql = String::from_utf8(bytes).map_err(|_| corrupt())?;
+        let mut referenced_columns: Vec<String> = Vec::new();
+        if !pred_refs_line.is_empty() {
+            for r in pred_refs_line.split(',') {
+                if referenced_columns.len() >= MAX_COLUMN_COUNT {
+                    return Err(corrupt());
+                }
+                validate_identifier(r).map_err(|_| corrupt())?;
+                referenced_columns.push(r.to_string());
+            }
+        }
+        Some(IndexPredicateDef {
+            sql,
+            referenced_columns,
+        })
+    } else {
+        None
+    };
     if lines.next().is_some() {
         return Err(CatalogError::CorruptSchema(format!(
             "unexpected trailing data for index {name}"
@@ -496,11 +593,11 @@ fn decode_expression_index_tail<'a>(
             referenced_columns,
         }));
     }
-    if !out.iter().any(Option::is_some) {
-        // 式要素が 1 つも無い `v4` は非正準形（`v1` で書くべき）。
+    // 式要素が 1 つも無い `v4`／`v5` は非正準形（`v1` で書くべき）。`v6`（部分索引）は列だけでもよい。
+    if !partial && !out.iter().any(Option::is_some) {
         return Err(corrupt());
     }
-    Ok(out)
+    Ok((out, predicate))
 }
 
 /// [`encode_index_def`] の逆写像。永続化済みバイト列の破損は fail-closed に
@@ -523,6 +620,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         && version != "v3"
         && version != INDEX_DEF_EXPRESSION_VERSION
         && version != INDEX_DEF_EXPRESSION_UNIQUE_VERSION
+        && version != INDEX_DEF_PARTIAL_VERSION
     {
         return Err(CatalogError::CorruptSchema(format!(
             "unknown index catalog format version for index {name}"
@@ -532,7 +630,8 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     let is_v3 = version == "v3";
     let is_v5 = version == INDEX_DEF_EXPRESSION_UNIQUE_VERSION;
     // 式索引（`v4`: 非一意、`v5`: 一意）。以降の式索引向けの分岐は両版で共通。
-    let is_v4 = version == INDEX_DEF_EXPRESSION_VERSION || is_v5;
+    let is_v6 = version == INDEX_DEF_PARTIAL_VERSION;
+    let is_v4 = version == INDEX_DEF_EXPRESSION_VERSION || is_v5 || is_v6;
     let table = lines
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema(format!("missing table for index {name}")))?
@@ -602,10 +701,10 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
             "duplicate column in index {name}"
         )));
     }
-    let expressions = if is_v4 {
-        decode_expression_index_tail(name, &columns, is_v5, lines)?
+    let (expressions, predicate) = if is_v4 {
+        decode_expression_index_tail(name, &columns, is_v5, is_v6, lines)?
     } else {
-        vec![None; columns.len()]
+        (vec![None; columns.len()], None)
     };
     let collations = match collations_line {
         None => vec![None; columns.len()],
@@ -619,6 +718,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         collations,
         unique: is_v3 || is_v5,
         expressions,
+        predicate,
     })
 }
 
@@ -797,6 +897,66 @@ pub(crate) struct DeclaredIndexTargets {
     /// 対象テーブルの式索引の式要素（宣言順。INDEX-10、Issue #1648）。素の列宣言が無く式宣言
     /// だけのテーブルでも `scalar_columns` は `None`（Auto）のままで、列索引の挙動を変えない。
     pub(crate) expression_keys: Vec<DeclaredExpressionKey>,
+    /// 対象テーブルの部分索引（述語付き。INDEX-11、Issue #1654）。部分索引の列・式要素は
+    /// `scalar_columns`・`expression_keys` のどちらにも**入れない**（含意判定〔#1655〕なしでプランナが
+    /// 使うと、述語外の行が結果から落ちる fail-open になるため。プランナ選択は #1656）。
+    pub(crate) partial_indexes: Vec<DeclaredPartialIndex>,
+}
+
+/// 部分索引の要素 1 個の宣言（INDEX-11、Issue #1654）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PartialElementDecl {
+    /// 素の列要素。
+    Column(String),
+    /// 式要素（保存済みの正規化 SQL テキスト。untrusted として再解析・再束縛する）。
+    Expr(String),
+}
+
+/// 部分索引 1 本の宣言（INDEX-11、Issue #1654）。`sql::index_predicate::CompiledPartialIndexes`（DML ゲート）と
+/// `sql::scalar_index`（派生キーの構築）が入力にする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredPartialIndex {
+    pub(crate) index_name: String,
+    /// 保存済みの述語の正規化 SQL テキスト（untrusted として再解析・再束縛する）。
+    pub(crate) predicate_sql: String,
+    /// 要素の並び（宣言順）。
+    pub(crate) elements: Vec<PartialElementDecl>,
+}
+
+impl DeclaredPartialIndex {
+    /// 式要素を [`DeclaredExpressionKey`]（索引名・要素位置・テキスト）へ変換する。
+    pub(crate) fn expression_keys(&self) -> Vec<DeclaredExpressionKey> {
+        self.elements
+            .iter()
+            .enumerate()
+            .filter_map(|(element, e)| match e {
+                PartialElementDecl::Expr(sql) => Some(DeclaredExpressionKey {
+                    index_name: self.index_name.clone(),
+                    element,
+                    sql: sql.clone(),
+                }),
+                PartialElementDecl::Column(_) => None,
+            })
+            .collect()
+    }
+
+    fn from_def(def: &IndexDef) -> Option<Self> {
+        let p = def.predicate.as_ref()?;
+        let elements = def
+            .columns
+            .iter()
+            .zip(&def.expressions)
+            .map(|(c, e)| match e {
+                Some(e) => PartialElementDecl::Expr(e.sql.clone()),
+                None => PartialElementDecl::Column(c.clone()),
+            })
+            .collect();
+        Some(Self {
+            index_name: def.name.clone(),
+            predicate_sql: p.sql.clone(),
+            elements,
+        })
+    }
 }
 
 /// 式索引の式要素 1 個の宣言（`sql::scalar_index` が式キーを構築する入力。INDEX-10、Issue #1648）。
@@ -848,12 +1008,14 @@ pub(crate) fn declared_index_targets_in_txn(
             return Ok(DeclaredIndexTargets {
                 scalar_columns: None,
                 expression_keys: Vec::new(),
+                partial_indexes: Vec::new(),
             })
         }
         Err(e) => return Err(e.into()),
     };
     let mut scalar_columns: Vec<DeclaredScalarColumn> = Vec::new();
     let mut expression_keys: Vec<DeclaredExpressionKey> = Vec::new();
+    let mut partial_indexes: Vec<DeclaredPartialIndex> = Vec::new();
     for (scanned, entry) in index_table.iter()?.enumerate() {
         if scanned >= MAX_INDEX_COUNT {
             return Err(CatalogError::CorruptSchema(format!(
@@ -862,6 +1024,13 @@ pub(crate) fn declared_index_targets_in_txn(
         }
         let (key, value) = entry?;
         let def = decode_index_def(key.value(), value.value())?;
+        // 部分索引は専用の一覧へ振り分け、列宣言・式キーには混ぜない（INDEX-11、Issue #1654）。
+        if let Some(partial) = DeclaredPartialIndex::from_def(&def) {
+            if def.table == table {
+                partial_indexes.push(partial);
+            }
+            continue;
+        }
         if matches!(def.kind, IndexKind::Scalar) && def.table == table {
             for (element, expr) in def.expressions.iter().enumerate() {
                 if let Some(e) = expr {
@@ -900,6 +1069,7 @@ pub(crate) fn declared_index_targets_in_txn(
             Some(scalar_columns)
         },
         expression_keys,
+        partial_indexes,
     })
 }
 
@@ -925,6 +1095,9 @@ pub(crate) struct DeclaredUniqueExpressionIndex {
 pub(crate) struct TableExpressionDecls {
     pub(crate) keys: Vec<DeclaredExpressionKey>,
     pub(crate) uniques: Vec<DeclaredUniqueExpressionIndex>,
+    /// 部分索引（INDEX-11、Issue #1654。索引名の昇順）。`keys`・`uniques` には混ぜない（部分索引の
+    /// 式要素は述語 TRUE の行でだけ評価し、一意検査の対象にもならない）。
+    pub(crate) partials: Vec<DeclaredPartialIndex>,
 }
 
 /// 索引カタログ表 `index_table` から対象テーブルの式索引の宣言を読む共通実装。write／read txn の
@@ -955,6 +1128,10 @@ where
         }
         let def = decode_index_def(key.value(), bytes)?;
         if !matches!(def.kind, IndexKind::Scalar) || def.table != table {
+            continue;
+        }
+        if let Some(partial) = DeclaredPartialIndex::from_def(&def) {
+            out.partials.push(partial);
             continue;
         }
         let mut unique_elements: Vec<UniqueElementDecl> = Vec::new();
@@ -1053,7 +1230,9 @@ pub(crate) fn explain_index_names_in_txn(
             CatalogError::CorruptSchema(format!("invalid index identifier for index {name}"))
         })?;
         let def = decode_index_def(name, value.value())?;
-        if def.table != table {
+        // 部分索引はプランナ選択（#1656）まで EXPLAIN に名前を出さない（INDEX-11、Issue #1654。
+        // 含意判定なしに「使われた」と見せない）。
+        if def.table != table || def.has_predicate() {
             continue;
         }
         match def.kind {
@@ -1843,7 +2022,12 @@ fn rename_index_def_columns_in_txn(
                 .iter()
                 .flatten()
                 .any(|e| e.referenced_columns.iter().any(|c| c == old));
-            if def.table != table || !(plain_hit || expr_hit) {
+            // 部分索引の述語が参照する列も追随の対象（INDEX-11、Issue #1654）。
+            let pred_hit = def
+                .predicate
+                .as_ref()
+                .is_some_and(|p| p.referenced_columns.iter().any(|c| c == old));
+            if def.table != table || !(plain_hit || expr_hit || pred_hit) {
                 continue;
             }
             for c in &mut def.columns {
@@ -1881,6 +2065,37 @@ fn rename_index_def_columns_in_txn(
                     sql: bound.sql,
                     referenced_columns: bound.referenced_columns,
                 });
+            }
+            // 部分索引の述語（INDEX-11、Issue #1654）。式要素と同じく、改名後のスキーマで再束縛した
+            // 結果の参照列の集合が写像結果と一致しなければ `0A000` で全体を破棄する。
+            if let Some(p) = &def.predicate {
+                if p.referenced_columns.iter().any(|c| c == old) {
+                    let bound = crate::sql::index_predicate::rebind_stored_index_predicate(
+                        &p.sql,
+                        new_schema,
+                        Some((old, new)),
+                    )
+                    .map_err(|_| refuse())?;
+                    let mut expected: Vec<&str> = p
+                        .referenced_columns
+                        .iter()
+                        .map(|c| if c == old { new } else { c.as_str() })
+                        .collect();
+                    let mut actual: Vec<&str> = bound
+                        .referenced_columns
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
+                    expected.sort_unstable();
+                    actual.sort_unstable();
+                    if expected != actual {
+                        return Err(refuse());
+                    }
+                    def.predicate = Some(IndexPredicateDef {
+                        sql: bound.sql,
+                        referenced_columns: bound.referenced_columns,
+                    });
+                }
             }
             if def.unique && def.has_expressions() {
                 unique_expression_touched = true;
@@ -8010,6 +8225,19 @@ fn rebuild_expression_indexes_after_type_change_in_txn(
             let (key, value) = entry.map_err(CatalogError::from)?;
             let name = key.value().to_string();
             let mut def = decode_index_def(&name, value.value())?;
+            // 部分索引（INDEX-11、Issue #1654）の述語・式要素・列要素が参照する列の型変更は、
+            // 述語の再束縛と既存行の再検証が必要になるため本 Issue では `0A000` で拒否する
+            // （放置すると次の書き込みで保存テキストが再束縛できず `CorruptSchema` になる）。
+            if def.table == table_name
+                && def.has_predicate()
+                && def.referenced_columns().any(|c| c == column_name)
+            {
+                return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                    detail:
+                        "altering the type of a column used by a partial index is not supported yet"
+                            .to_string(),
+                }));
+            }
             if def.table != table_name
                 || !def.has_expressions()
                 || !def.referenced_columns().any(|c| c == column_name)
@@ -10729,13 +10957,12 @@ fn reject_constrained_table_for_raw_write(
     table_name: &str,
     schema: &TableSchema,
 ) -> Result<()> {
-    // 式索引の宣言（INDEX-10、Issue #1649）も検査点でしか強制できないため、同じく拒否する。
-    if !table_expression_decls_in_txn(write_txn, table_name)?
-        .keys
-        .is_empty()
-    {
+    // 式索引の宣言（INDEX-10、Issue #1649）・部分索引の述語（INDEX-11、Issue #1654）も検査点でしか
+    // 強制できないため、同じく拒否する。
+    let index_decls = table_expression_decls_in_txn(write_txn, table_name)?;
+    if !index_decls.keys.is_empty() || !index_decls.partials.is_empty() {
         return Err(CatalogError::Invalid(
-            "raw test-only write API does not support tables with expression indexes; use crate::tenant write APIs".to_string(),
+            "raw test-only write API does not support tables with expression or partial indexes; use crate::tenant write APIs".to_string(),
         ));
     }
     if schema.primary_key().is_some()
@@ -13755,12 +13982,19 @@ impl Storage {
                 "expression indexes can only be created through the SQL surface".to_string(),
             ));
         }
-        self.create_index_bound(def, &[]).map_err(|e| match e {
-            CreateIndexError::Catalog(c) => c,
-            CreateIndexError::Sql(_) => {
-                CatalogError::Invalid("index definition rejected".to_string())
-            }
-        })
+        // 述語付き（部分索引。INDEX-11、Issue #1654）も同様に、束縛を通る SQL 表層だけが作れる。
+        if def.has_predicate() {
+            return Err(CatalogError::Invalid(
+                "partial indexes can only be created through the SQL surface".to_string(),
+            ));
+        }
+        self.create_index_bound(def, &[], None)
+            .map_err(|e| match e {
+                CreateIndexError::Catalog(c) => c,
+                CreateIndexError::Sql(_) => {
+                    CatalogError::Invalid("index definition rejected".to_string())
+                }
+            })
     }
 
     /// [`Storage::create_index`] の本体。式要素（`exprs[i] == Some`。その位置の `def.columns[i]` は
@@ -13776,15 +14010,30 @@ impl Storage {
         &self,
         def: &IndexDef,
         exprs: &[Option<Expr>],
+        predicate: Option<&[WherePredicate]>,
     ) -> std::result::Result<(), CreateIndexError> {
         validate_identifier(&def.name)?;
         validate_identifier(&def.table)?;
-        if def.has_expressions() {
-            // 式の永続形は束縛で確定する。入力の生テキストは信用しない。
+        if def.has_expressions() || def.has_predicate() {
+            // 式・述語の永続形は束縛で確定する。入力の生テキストは信用しない。
             return Err(CatalogError::Invalid(
-                "index expressions are bound by the catalog".to_string(),
+                "index expressions and predicates are bound by the catalog".to_string(),
             )
             .into());
+        }
+        // 部分索引（INDEX-11、Issue #1654）の未対応の組み合わせは `0A000`。構文段の最終ゲートの
+        // 多層防御で、強制や照合の永続形が無いまま宣言を残さない（fail-closed）。
+        if predicate.is_some()
+            && (def.unique
+                || !matches!(def.kind, IndexKind::Scalar)
+                || def.collations.iter().any(Option::is_some))
+        {
+            return Err(CreateIndexError::Sql(
+                SqlSurfaceError::FeatureNotSupported {
+                    detail: "partial indexes are not supported for this index definition yet"
+                        .to_string(),
+                },
+            ));
         }
         let has_exprs = exprs.iter().any(Option::is_some);
         if has_exprs && (exprs.len() != def.columns.len() || !matches!(def.kind, IndexKind::Scalar))
@@ -13865,6 +14114,15 @@ impl Storage {
             // matview への索引（TABLE-42 (5)(6)、Issue #1667）は宣言だけを登録し、UNIQUE は
             // 文脈ごとの一意性を強制する。表用の制約・永続一意索引・行走査は通さない。
             if materialized_view_exists_in_txn(&write_txn, &def.table)? {
+                if predicate.is_some() {
+                    // matview への部分索引は対象外（fail-closed。述語を黙って落とさない）。
+                    return Err(CreateIndexError::Sql(
+                        SqlSurfaceError::FeatureNotSupported {
+                            detail: "partial index on a materialized view is not supported"
+                                .to_string(),
+                        },
+                    ));
+                }
                 if has_exprs {
                     // matview への式索引は本 Issue の対象外（fail-closed）。
                     return Err(CreateIndexError::Sql(
@@ -13898,6 +14156,17 @@ impl Storage {
                     });
                 }
             }
+            // 部分索引の述語の束縛（INDEX-11、Issue #1654）。保存するのは束縛が描画した正規化テキストと
+            // 抽出した参照列だけ。式要素の束縛より後に行うため、要素の `42P17` が述語より先に報告される
+            // （構文段と同じ順序）。
+            if let Some(preds) = predicate {
+                let bound = crate::sql::index_predicate::bind_index_predicate(preds, &schema)
+                    .map_err(CreateIndexError::Sql)?;
+                stored.predicate = Some(IndexPredicateDef {
+                    sql: bound.sql,
+                    referenced_columns: bound.referenced_columns,
+                });
+            }
             // 一意の式索引（INDEX-9・INDEX-10、Issue #1651）の前提ゲート: 列要素の型ゲート →
             // 制約名前空間の衝突。式一意索引は UNIQUE 制約へ展開しない（式には列リストが無いため
             // 索引カタログだけが持つ）ので、制約数上限・追加後スキーマの検証は通さない。
@@ -13908,7 +14177,29 @@ impl Storage {
             // できなければ、保存前に拒否する（作れない式索引を残さない）。評価エラーは SQLSTATE を
             // 保った固定文言へ置換し、不可視行の値を応答へ出さない。一意の式索引は続けて同じ行で
             // テナントごとの重複を走査する（`23505`。テナント・値・件数は応答に含めない）。
-            if has_exprs {
+            if let Some(partial) = DeclaredPartialIndex::from_def(&stored) {
+                // 部分索引（INDEX-11、Issue #1654）: 全行で述語が評価でき、述語 TRUE の行で式要素も
+                // 索引化できなければ保存前に拒否する（述語外の行では式要素を評価しない）。
+                let compiled = crate::sql::index_predicate::CompiledPartialIndexes::compile(
+                    &schema,
+                    &[partial],
+                )
+                .map_err(map_index_validation_error)?;
+                if let Some(compiled) = compiled {
+                    let row_table_name = user_rows_table_name(&def.table);
+                    match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+                        Ok(row_table) => {
+                            crate::constraint::validate_existing_rows_for_partial_indexes(
+                                &row_table, &schema, &compiled,
+                            )
+                            .map_err(map_index_validation_error)?;
+                        }
+                        // 行テーブル未作成は行 0 件として扱う。
+                        Err(redb::TableError::TableDoesNotExist(_)) => {}
+                        Err(e) => return Err(CatalogError::from(e).into()),
+                    }
+                }
+            } else if has_exprs {
                 let decls: Vec<DeclaredExpressionKey> = stored
                     .expressions
                     .iter()
@@ -23821,5 +24112,180 @@ mod tests {
             Err(CatalogError::Invalid(_))
         ));
         assert!(storage.list_indexes().expect("list").is_empty());
+    }
+
+    fn partial_def(name: &str, cols: &[&str], sql: &str, refs: &[&str]) -> IndexDef {
+        IndexDef::new(
+            name.to_string(),
+            "docs".to_string(),
+            IndexKind::Scalar,
+            cols.iter().map(|c| c.to_string()).collect(),
+        )
+        .with_predicate(Some(IndexPredicateDef {
+            sql: sql.to_string(),
+            referenced_columns: refs.iter().map(|r| r.to_string()).collect(),
+        }))
+    }
+
+    /// 部分索引（`v6`）は往復でき、区切り文字・改行・引用符を含む述語テキストも壊さない（INDEX-11、
+    /// Issue #1654）。列だけ・式を含む・参照列が空の述語のどれも表せる。
+    #[test]
+    fn partial_index_def_round_trips_through_v6() {
+        let cases = [
+            partial_def("p", &["kind"], "kind = 'a,b;c\n''d'", &["kind"]),
+            partial_def("p", &["a", "b"], "id > 3", &[]),
+            expr_def("p", &["", "body"], &[Some(("lower(a)", &["a"])), None]).with_predicate(Some(
+                IndexPredicateDef {
+                    sql: "a IS NOT NULL".to_string(),
+                    referenced_columns: vec!["a".to_string()],
+                },
+            )),
+        ];
+        for def in cases {
+            let bytes = encode_index_def(&def).expect("encode");
+            assert!(bytes.starts_with(b"v6\n"), "{def:?}");
+            assert_eq!(decode_index_def("p", &bytes).expect("decode"), def);
+        }
+    }
+
+    /// `v1`〜`v5` のバイト列は部分索引の導入で変わらない（旧データの互換）。
+    #[test]
+    fn existing_index_versions_are_byte_stable_with_predicate_field() {
+        let plain = scalar_def("i", "docs", &["a", "b"]);
+        assert_eq!(
+            encode_index_def(&plain).expect("encode"),
+            b"v1\ndocs\nscalar\na,b".to_vec()
+        );
+        let unique = scalar_def("i", "docs", &["a"]).with_unique(true);
+        assert_eq!(
+            encode_index_def(&unique).expect("encode"),
+            b"v3\ndocs\nscalar\na\nunique".to_vec()
+        );
+        let expr = expr_def("e", &[""], &[Some(("lower(a)", &["a"]))]);
+        assert!(encode_index_def(&expr)
+            .expect("encode")
+            .starts_with(b"v4\n"));
+        assert!(decode_index_def("i", b"v1\ndocs\nscalar\na,b")
+            .expect("decode")
+            .predicate
+            .is_none());
+    }
+
+    /// 破損した `v6` は fail-closed の `CorruptSchema`（行の過不足・余剰・hex／UTF-8 の不正・空や超過の
+    /// 述語・参照列の識別子不正・列と式の排他関係の破れ・照合の混入・種別 hnsw・版違い）。
+    #[test]
+    fn corrupt_v6_records_are_rejected() {
+        let good = "v6\ndocs\nscalar\na\n-\n-\n\n6e203e2031\nn";
+        assert!(decode_index_def("p", good.as_bytes()).is_ok(), "{good}");
+        let too_long = format!("v6\ndocs\nscalar\na\n-\n-\n\n{}\n", "61".repeat(4097));
+        for bad in [
+            // 行の不足。
+            "v6\ndocs\nscalar\na\n-\n-\n\n6e203e2031",
+            "v6\ndocs\nscalar\na\n-\n-\n",
+            // 余剰行。
+            "v6\ndocs\nscalar\na\n-\n-\n\n6e203e2031\nn\nextra",
+            // 不正な hex・UTF-8。
+            "v6\ndocs\nscalar\na\n-\n-\n\nzz\nn",
+            "v6\ndocs\nscalar\na\n-\n-\n\nff\nn",
+            // 空の述語。
+            "v6\ndocs\nscalar\na\n-\n-\n\n\nn",
+            // 参照列の識別子不正。
+            "v6\ndocs\nscalar\na\n-\n-\n\n6e203e2031\nn,bad name",
+            "v6\ndocs\nscalar\na\n-\n-\n\n6e203e2031\n,",
+            // 照合の混入。
+            "v6\ndocs\nscalar\na\nund_x_icu\n-\n\n6e203e2031\nn",
+            // 列と式の排他関係の破れ（列名があるのに式トークン）。
+            "v6\ndocs\nscalar\na\n-\n6c6f776572286129\na\n6e203e2031\nn",
+            // 種別 hnsw。
+            "v6\ndocs\nhnsw\na\n-\n-\n\n6e203e2031\nn",
+            too_long.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    decode_index_def("p", bad.as_bytes()),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// 述語付きの宣言は、部分 UNIQUE・hnsw・照合付き・空や超過の述語をエンコード時に拒否する（多層防御）。
+    #[test]
+    fn partial_index_encode_rejects_unsupported_combinations() {
+        let ok = partial_def("p", &["a"], "n > 1", &["n"]);
+        assert!(encode_index_def(&ok).is_ok());
+        assert!(matches!(
+            encode_index_def(&ok.clone().with_unique(true)),
+            Err(CatalogError::Invalid(_))
+        ));
+        let mut hnsw = ok.clone();
+        hnsw.kind = IndexKind::Hnsw;
+        assert!(matches!(
+            encode_index_def(&hnsw),
+            Err(CatalogError::Invalid(_))
+        ));
+        let collated = ok
+            .clone()
+            .with_column_collations(vec![Some(crate::collation::Collation::C)]);
+        assert!(matches!(
+            encode_index_def(&collated),
+            Err(CatalogError::Invalid(_))
+        ));
+        for sql in ["".to_string(), "a".repeat(MAX_INDEX_EXPRESSION_SQL_LEN + 1)] {
+            let bad = partial_def("p", &["a"], &sql, &[]);
+            assert!(matches!(
+                encode_index_def(&bad),
+                Err(CatalogError::Invalid(_))
+            ));
+        }
+    }
+
+    /// 述語の参照列は `referenced_columns()` に含まれる（`DROP COLUMN` の連鎖削除の判定に使う）。
+    #[test]
+    fn predicate_columns_are_part_of_the_dependency_set() {
+        let def = partial_def("p", &["a"], "n > 1 AND m = 'x'", &["n", "m"]);
+        let deps: Vec<&str> = def.referenced_columns().collect();
+        assert_eq!(deps, vec!["a", "n", "m"]);
+    }
+
+    /// 部分索引は列宣言・式キー・EXPLAIN の索引名のどれにも混ざらず、専用の一覧へ振り分けられる
+    /// （プランナ選択〔#1656〕まで結果と EXPLAIN に影響しない。INDEX-11、Issue #1654）。
+    #[test]
+    fn partial_indexes_are_split_from_column_and_expression_declarations() {
+        let (storage, _guard) = index_fixture_storage("index-partial-split");
+        let write_txn = storage.begin_write_txn().expect("txn");
+        {
+            let mut t = write_txn.open_table(INDEX_CATALOG_TABLE).expect("table");
+            let defs = [
+                partial_def("p_col", &["kind"], "kind = 'a'", &["kind"]),
+                expr_def("e_plain", &[""], &[Some(("lower(kind)", &["kind"]))]),
+            ];
+            for d in defs {
+                let bytes = encode_index_def(&d).expect("encode");
+                t.insert(d.name.as_str(), bytes.as_slice()).expect("insert");
+            }
+        }
+        bump_table_generation_in_txn(&write_txn, "docs").expect("bump generation");
+        crate::recovery::commit_boundary::commit(write_txn).expect("commit");
+        let read = storage.db().begin_read().expect("read");
+        let targets = declared_index_targets_in_txn(&read, "docs").expect("targets");
+        assert!(
+            targets.scalar_columns.is_none(),
+            "partial columns are not declared columns"
+        );
+        assert_eq!(targets.expression_keys.len(), 1);
+        assert_eq!(targets.partial_indexes.len(), 1);
+        assert_eq!(targets.partial_indexes[0].index_name, "p_col");
+        assert_eq!(targets.partial_indexes[0].predicate_sql, "kind = 'a'");
+        let decls = table_expression_decls_in_read_txn(&read, "docs").expect("decls");
+        assert_eq!(decls.keys.len(), 1);
+        assert!(decls.uniques.is_empty());
+        assert_eq!(decls.partials.len(), 1);
+        let explain = explain_index_names_in_txn(&read, "docs").expect("explain names");
+        assert!(
+            explain.scalar.is_empty(),
+            "partial index is not named: {explain:?}"
+        );
     }
 }
