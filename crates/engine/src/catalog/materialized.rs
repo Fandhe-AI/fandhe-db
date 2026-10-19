@@ -814,6 +814,49 @@ pub(crate) fn begin_streamed_create_in_txn(
     Ok(())
 }
 
+/// `REFRESH MATERIALIZED VIEW` の第 1 段（TABLE-42・Issue #1665）。呼び出し元の write txn 内で
+/// 定義を読み、全文脈の旧実体（メタと行表）を消去して定義を返す。続けて文脈ごとに
+/// [`write_context_entity_in_txn`] を呼び、最後に [`finish_streamed_refresh_in_txn`] を呼ぶ。
+/// 同じ txn 内の変更なので、commit 前に失敗して txn を破棄すれば旧実体はそのまま残る。
+/// 定義が無ければ `ViewNotFound`（表・ビュー・索引の名前との区別は呼び出し元が行う）。
+pub(crate) fn begin_streamed_refresh_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<MaterializedViewDef> {
+    validate_identifier(name)?;
+    let def = load_def_in_txn(write_txn, name)?
+        .ok_or_else(|| CatalogError::ViewNotFound(name.to_string()))?;
+    delete_all_meta_in_txn(write_txn, name)?;
+    delete_rows_table_in_txn(write_txn, name)?;
+    Ok(def)
+}
+
+/// `REFRESH` の最終段。`populated` を定義へ書き戻し、表単位の世代を同じ txn 内で bump する
+/// （commit は呼び出し元が 1 回だけ行う）。
+pub(crate) fn finish_streamed_refresh_in_txn(
+    write_txn: &redb::WriteTransaction,
+    def: &MaterializedViewDef,
+    populated: bool,
+) -> Result<()> {
+    let mut def = def.clone();
+    def.populated = populated;
+    store_def_in_txn(write_txn, &def)?;
+    bump_table_generation_in_txn(write_txn, &def.name)?;
+    Ok(())
+}
+
+/// `write_context_entity_in_txn` の失敗が「その文脈だけの検証・符号化失敗」（書き込み前に確定し、
+/// txn に何も残さない）かを返す。真なら呼び出し元は他文脈の失敗として隠してよい。偽（ストレージ
+/// エラー等）は部分書き込みが txn に残りうるため、呼び出し元は txn 全体を破棄して返す（fail-closed）。
+pub(crate) fn is_context_local_failure(e: &CatalogError) -> bool {
+    matches!(
+        e,
+        CatalogError::Invalid(_)
+            | CatalogError::ViewLimitExceeded(_)
+            | CatalogError::UniqueConstraintViolation
+    )
+}
+
 /// 1 文脈分の実体を write txn へ書く。評価結果の行値を呼び出し元が即座に解放できるよう、
 /// 文脈ごとに検査（文脈数上限・キー重複・行数上限）と符号化を済ませる。`seen` は書き込み済みの
 /// 文脈キーで、重複検出と文脈数上限の判定に使う。
@@ -846,18 +889,34 @@ pub(crate) fn write_context_entity_in_txn(
         let sets = unique_column_sets_in_txn(write_txn, &def.name, &def.columns)?;
         enforce_unique_rows(&sets, rows)?;
     }
+    // 符号化前提（テナント ID の非空・長さ上限）は行数に関係なく先に検査する。行ループ内だけで
+    // 検査すると行 0 件の文脈で素通りし、行ありの文脈と成否が分かれる（空・非空の parity 崩れ）。
+    if ctx.tenant_id().is_empty() || u8::try_from(ctx.tenant_id().len()).is_err() {
+        return Err(CatalogError::Invalid(
+            "materialized view row does not match its columns".to_string(),
+        ));
+    }
     let schema = TableSchema::new(def.name.clone(), def.columns.clone());
-    let table_name = matview_rows_table_name(&def.name);
-    let rows_def: MatviewRowsDef = TableDefinition::new(&table_name);
-    let mut rows_table = write_txn.open_table(rows_def)?;
-    let mut meta_table = write_txn.open_table(MATVIEW_ENTITY_META_TABLE)?;
-    for (i, values) in rows.iter().enumerate() {
+    // 符号化の失敗（テナント ID 長などの文脈依存の要因）で部分的な行を残さないよう、
+    // 行表へ書く前に全行を符号化する。失敗時は何も書かない（呼び出し元が他文脈の失敗を隠せる）。
+    let mut encoded_rows: Vec<Vec<u8>> = Vec::new();
+    encoded_rows
+        .try_reserve_exact(rows.len())
+        .map_err(|_| CatalogError::Invalid("materialized view allocation failed".to_string()))?;
+    for values in rows {
         let encoded = row_codec::encode_row(&schema, ctx.tenant_id(), Visibility::Private, values)
             .map_err(|_| {
                 CatalogError::Invalid(
                     "materialized view row does not match its columns".to_string(),
                 )
             })?;
+        encoded_rows.push(encoded);
+    }
+    let table_name = matview_rows_table_name(&def.name);
+    let rows_def: MatviewRowsDef = TableDefinition::new(&table_name);
+    let mut rows_table = write_txn.open_table(rows_def)?;
+    let mut meta_table = write_txn.open_table(MATVIEW_ENTITY_META_TABLE)?;
+    for (i, encoded) in encoded_rows.iter().enumerate() {
         rows_table.insert((key.as_bytes(), i as u64), encoded.as_slice())?;
     }
     meta_table.insert(
