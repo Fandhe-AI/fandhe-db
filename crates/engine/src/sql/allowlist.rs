@@ -10917,6 +10917,25 @@ impl<'a> Parser<'a> {
         Ok((name, if_exists, behavior))
     }
 
+    /// `DROP MATERIALIZED VIEW [IF EXISTS] <name>[, <name> ...] [CASCADE | RESTRICT] [;]`
+    /// （TABLE-42 (5)・TABLE-37、Issue #1667）。複数指定の構文は `DROP TABLE` と同じ。
+    /// 戻り値は `(名前の列, IF EXISTS の有無, 動作)`。
+    fn parse_drop_materialized_view(
+        &mut self,
+    ) -> Result<(Vec<String>, bool, DropBehavior), SqlSurfaceError> {
+        self.expect_ident_matching("DROP")?;
+        self.expect_ident_matching("MATERIALIZED")?;
+        self.expect_ident_matching("VIEW")?;
+        let if_exists = self.consume_if_exists();
+        let mut names = vec![self.expect_ident()?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            names.push(self.expect_ident()?);
+        }
+        let behavior = self.parse_optional_drop_behavior();
+        Ok((names, if_exists, behavior))
+    }
+
     /// `WITH <name> AS (<body>)[, <name> AS (<body>)]*`（非再帰 CTE。SQL-29 (b)・
     /// RLS-10 (b)、TASK-213、Issue #928）を切り出し、各定義を
     /// [`super::cte::CteDef`] へ積む。`<body>` は [`parse_view_body`]（`CREATE
@@ -11843,6 +11862,36 @@ impl ValidatedCreateView {
     }
 }
 
+/// `DROP MATERIALIZED VIEW [IF EXISTS] <name>[, <name> ...] [CASCADE | RESTRICT]` の許可形状構造
+/// 検証結果（TABLE-42 (5)・TABLE-37・TABLE-36 (4)、Issue #1667）。[`ValidatedDropTable`] と同じく
+/// カタログ照会を一切行わない（DDL 権限ゲートを名前解決より先に通す契約）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedDropMaterializedView {
+    /// 名前（記述順。重複は実行側で除去する）。
+    pub(crate) names: Vec<String>,
+    /// `IF EXISTS` 句の有無。
+    pub(crate) if_exists: bool,
+    /// `CASCADE`／`RESTRICT` 句。省略時は `Restrict`。
+    pub(crate) behavior: DropBehavior,
+}
+
+impl ValidatedDropMaterializedView {
+    /// 対象 matview 名（記述順）。
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// `IF EXISTS` が指定されたか。
+    pub fn if_exists(&self) -> bool {
+        self.if_exists
+    }
+
+    /// `CASCADE`／`RESTRICT` 句の指定（省略時は `Restrict`）。
+    pub fn behavior(&self) -> DropBehavior {
+        self.behavior
+    }
+}
+
 /// `DROP VIEW <name>` の許可形状構造検証結果（TABLE-18・SQL-23・TASK-205、
 /// Issue #909）。[`ValidatedDropTable`] と同じくカタログ照会を一切行わない。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12555,6 +12604,28 @@ pub(crate) fn validate_drop_type_tokens(
     }
     p.expect_end_of_statement()?;
     Ok(ValidatedDropType { name, if_exists })
+}
+
+/// 先頭 3 トークンが `DROP MATERIALIZED VIEW` か（`core.rs::EngineCore::parse_tokens` の分岐判定。
+/// 汎用 `DROP`（`DROP TABLE` 扱い）より前に分岐するために使う。TABLE-42、Issue #1667）。
+pub(crate) fn is_drop_materialized_view_statement(tokens: &[Token]) -> bool {
+    let ident_at = |i: usize, word: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word));
+    ident_at(0, "DROP") && ident_at(1, "MATERIALIZED")
+}
+
+/// [`ValidatedDropMaterializedView`] の構造検証本体（カタログ照会なし）。`IF EXISTS`・複数指定・
+/// `CASCADE`／`RESTRICT` を受理し、余剰トークン・末尾カンマ・空要素は `42601`。
+pub(crate) fn validate_drop_materialized_view_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedDropMaterializedView, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let (names, if_exists, behavior) = p.parse_drop_materialized_view()?;
+    p.expect_end_of_statement()?;
+    Ok(ValidatedDropMaterializedView {
+        names,
+        if_exists,
+        behavior,
+    })
 }
 
 /// [`ValidatedDropView`] の構造検証本体。

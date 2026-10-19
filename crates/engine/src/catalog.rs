@@ -62,8 +62,8 @@ mod dependency;
 pub(crate) use dependency::{truncate_closure_in_txn, TruncateClosureError};
 
 // matview のカタログと文脈単位の実体ストア（TABLE-42 (2)、Issue #1663）。SQL 表層からの
-// 配線は後続 Issue（#1664〜#1667）が行うため、それまでは crate 内の呼び出し元が
-// テストだけになる（dead_code を許可）。
+// 配線は #1664〜#1667 で進めており、`REFRESH` など未結線の API（#1665・#1666）は当面
+// crate 内の呼び出し元がテストだけになる（dead_code を許可）。
 #[allow(dead_code)]
 pub(crate) mod materialized;
 pub(crate) use materialized::read_materialized_view_in;
@@ -4444,6 +4444,8 @@ pub enum CascadedObject {
     View { name: String },
     /// 連鎖で外した FK 制約（参照元 `table` は残る）。
     ForeignKey { table: String, constraint: String },
+    /// 連鎖削除した matview（TABLE-42 (5)・TABLE-37、Issue #1667）。実体・索引宣言も同時に消える。
+    MaterializedView { name: String },
 }
 
 /// [`Storage::drop_tables`] の結果（TABLE-37 (1)、Issue #1639）。件数以外のテナント固有の
@@ -4465,6 +4467,9 @@ impl CascadedObject {
     fn from_dependent(obj: dependency::DependentObject) -> Result<Self> {
         match obj {
             dependency::DependentObject::View { name } => Ok(Self::View { name }),
+            dependency::DependentObject::MaterializedView { name } => {
+                Ok(Self::MaterializedView { name })
+            }
             dependency::DependentObject::ForeignKey { table, constraint } => {
                 Ok(Self::ForeignKey { table, constraint })
             }
@@ -4569,24 +4574,6 @@ fn drop_targets_with_dependents_in_txn(
     Ok((view_dependent, fk_dependent))
 }
 
-/// CASCADE の閉包に含まれるビューのうち、matview の参照元になっているものがあれば
-/// `DependentViewsExist` で拒否する（Issue #1663 の暫定ガード。CASCADE での matview 削除の
-/// 適用は #1667。指定対象の直接検査だけでは「表 -> ビュー -> matview」「ビュー -> ビュー ->
-/// matview」の連鎖で参照先が欠落するため、適用前に閉包全体を同一 txn 内で走査する。fail-closed）。
-fn reject_cascade_closure_referenced_by_matview_in_txn(
-    write_txn: &redb::WriteTransaction,
-    objects: &[dependency::DependentObject],
-) -> Result<()> {
-    for obj in objects {
-        if let dependency::DependentObject::View { name } = obj {
-            if !materialized::materialized_views_referencing_in_txn(write_txn, name)?.is_empty() {
-                return Err(CatalogError::DependentViewsExist(name.clone()));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// `CASCADE` で列挙された依存オブジェクトを、返された順（依存する側が先）に同じ write txn
 /// 内で削除する（TABLE-37 (3)、Issue #1641）。FK を外した参照元の表は世代を 1 回だけ bump
 /// する（`USING PLAN` の世代照合の失効契約）。呼び出し元（[`Storage::drop_tables`]・
@@ -4602,6 +4589,11 @@ fn apply_cascaded_objects_in_txn(
         let obj = CascadedObject::from_dependent(obj)?;
         match &obj {
             CascadedObject::View { name } => drop_view_in_txn(write_txn, name)?,
+            // 実体・索引宣言・世代の掃除まで同一 txn で行う（Issue #1667）。
+            CascadedObject::MaterializedView { name } => {
+                materialized::drop_materialized_view_in_txn(write_txn, name)?;
+                bump_table_generation_in_txn(write_txn, name)?;
+            }
             CascadedObject::ForeignKey { table, constraint } => {
                 drop_foreign_key_in_txn(write_txn, table, constraint)?;
                 fk_children.insert(table.clone());
@@ -10594,16 +10586,18 @@ impl Storage {
                 cascaded: Vec::new(),
             });
         }
-        // 暫定ガード（Issue #1663）: matview の参照元になっている表は RESTRICT／CASCADE を
-        // 問わず削除しない（CASCADE での matview 削除の適用は #1667。fail-closed）。
-        for name in &existing {
-            if !materialized::materialized_views_referencing_in_txn(write_txn, name)?.is_empty() {
-                return Err(CatalogError::DependentViewsExist((*name).to_string()));
-            }
-        }
         let mut cascaded: Vec<CascadedObject> = Vec::new();
         match behavior {
             DropBehavior::Restrict => {
+                // matview の参照元になっている表は削除しない（TABLE-42 (5)、Issue #1667。
+                // CASCADE では列挙層が依存 matview を連鎖削除する）。
+                for name in &existing {
+                    if !materialized::materialized_views_referencing_in_txn(write_txn, name)?
+                        .is_empty()
+                    {
+                        return Err(CatalogError::DependentViewsExist((*name).to_string()));
+                    }
+                }
                 // Phase 2: 依存（TABLE-15・TABLE-17・TABLE-18、Issue #907・#909）。
                 let (view_dependent, fk_dependent) =
                     drop_targets_with_dependents_in_txn(write_txn, &existing)?;
@@ -10628,7 +10622,6 @@ impl Storage {
                     let first = existing.first().copied().unwrap_or_default();
                     return Err(CatalogError::DependentObjectsStillExist(first.to_string()));
                 }
-                reject_cascade_closure_referenced_by_matview_in_txn(write_txn, &closure.objects)?;
                 cascaded = apply_cascaded_objects_in_txn(write_txn, closure.objects)?;
             }
         }
@@ -11002,9 +10995,9 @@ impl Storage {
                     column_name.to_string(),
                 ));
             }
-            // このテーブルを直接参照する matview があれば、列単位の追随（#1667）が入るまで
+            // このテーブルを直接参照する matview があれば、列単位の追随が入るまで（別 Issue で追跡）
             // 保守的に拒否する（TABLE-42・Issue #1664 の暫定ガード。`REFRESH` が壊れた本文で
-            // 失敗する不整合を作らない。表単位の判定で、matview→ビュー→表の推移依存は #1667）。
+            // 失敗する不整合を作らない。表単位の判定で、matview→ビュー→表の推移依存は未対応で別 Issue で追跡）。
             if !materialized::materialized_views_referencing_in_txn(write_txn, table_name)?
                 .is_empty()
             {
@@ -11106,7 +11099,7 @@ impl Storage {
             }
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        // 直接参照する matview があれば列単位の追随（#1667）が入るまで拒否する（TABLE-42・
+        // 直接参照する matview があれば列単位の追随が入るまで（別 Issue で追跡）拒否する（TABLE-42・
         // Issue #1664 の暫定ガード。表が無ければ空で、従来どおり `TableNotFound` へ進む）。
         if !materialized::materialized_views_referencing_in_txn(&write_txn, table_name)?.is_empty()
         {
@@ -11312,7 +11305,7 @@ impl Storage {
         {
             return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
         }
-        // 暫定ガード（Issue #1663）: matview の参照元の改名は、追随（#1667）が入るまで拒否する。
+        // 暫定ガード（Issue #1663）: matview の参照元の改名は、追随が入るまで拒否する（別 Issue で追跡。Issue #1667 でも対象外）。
         if !materialized::materialized_views_referencing_in_txn(&write_txn, table_name)?.is_empty()
         {
             return Err(CatalogError::DependentViewsExist(table_name.to_string()).into());
@@ -12689,7 +12682,7 @@ impl Storage {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()).into());
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        // 直接参照する matview があれば列単位の追随（#1667）が入るまで拒否する（TABLE-42・
+        // 直接参照する matview があれば列単位の追随が入るまで（別 Issue で追跡）拒否する（TABLE-42・
         // Issue #1664 の暫定ガード。文言はビューの既存拒否と揃える）。
         if !materialized::materialized_views_referencing_in_txn(&write_txn, table_name)?.is_empty()
         {
@@ -13157,13 +13150,15 @@ impl Storage {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
         }
-        // 暫定ガード（Issue #1663）: matview の参照元になっているビューは RESTRICT／CASCADE を
-        // 問わず削除しない（CASCADE での matview 削除の適用は #1667。fail-closed）。
-        if !materialized::materialized_views_referencing_in_txn(&write_txn, name)?.is_empty() {
-            return Err(CatalogError::DependentViewsExist(name.to_string()));
-        }
         let cascaded = match behavior {
             DropBehavior::Restrict => {
+                // matview の参照元になっているビューは削除しない（TABLE-42 (5)、Issue #1667。
+                // CASCADE では列挙層が依存 matview を連鎖削除する）。
+                if !materialized::materialized_views_referencing_in_txn(&write_txn, name)?
+                    .is_empty()
+                {
+                    return Err(CatalogError::DependentViewsExist(name.to_string()));
+                }
                 let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
                 let dependents = views_depending_on_in_txn(&views_table, name)?;
                 if !dependents.is_empty() {
@@ -13182,7 +13177,6 @@ impl Storage {
                 if closure.conservative {
                     return Err(CatalogError::DependentViewsExist(name.to_string()));
                 }
-                reject_cascade_closure_referenced_by_matview_in_txn(&write_txn, &closure.objects)?;
                 let cascaded = apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
                 drop_view_in_txn(&write_txn, name)?;
                 cascaded
@@ -13326,12 +13320,26 @@ impl Storage {
             }
             // 対象がビュー・既存の索引（relation 名前空間を共有するが行を持たない）
             // なら種別不一致（`42809`）。テーブル不在（`42P01`）へ落とさない。
-            // matview への索引は #1667 が解禁するまで種別不一致とする（TABLE-42 (2)）。
-            if views_contains(&def.table)?
-                || index_name_exists_in_txn(&write_txn, &def.table)?
-                || materialized_view_exists_in_txn(&write_txn, &def.table)?
-            {
+            if views_contains(&def.table)? || index_name_exists_in_txn(&write_txn, &def.table)? {
                 return Err(CatalogError::WrongObjectKind(def.table.clone()).into());
+            }
+            // matview への索引（TABLE-42 (5)(6)、Issue #1667）は宣言だけを登録し、UNIQUE は
+            // 文脈ごとの一意性を強制する。表用の制約・永続一意索引・行走査は通さない。
+            if materialized_view_exists_in_txn(&write_txn, &def.table)? {
+                if has_exprs {
+                    // matview への式索引は本 Issue の対象外（fail-closed）。
+                    return Err(CatalogError::Invalid(
+                        "expression index on a materialized view is not supported".to_string(),
+                    )
+                    .into());
+                }
+                let encoded = encode_index_def(def)?;
+                materialized::create_matview_index_in_txn(&write_txn, def, &encoded)?;
+                bump_table_generation_in_txn(&write_txn, &def.table)?;
+                bump_index_catalog_generation_in_txn(&write_txn)?;
+                return crate::recovery::commit_boundary::commit(write_txn)
+                    .map_err(convert_storage_error)
+                    .map_err(CreateIndexError::Catalog);
             }
             let schema = require_table_schema_write(&write_txn, &def.table)?;
             validate_index_columns(def, &schema)?;
@@ -13425,7 +13433,8 @@ impl Storage {
             }
             return Err(CatalogError::IndexNotFound(name.to_string()));
         };
-        if def.unique {
+        // matview の索引宣言（Issue #1667）は表の UNIQUE 制約を持たないので外す制約が無い。
+        if def.unique && !materialized_view_exists_in_txn(&write_txn, &def.table)? {
             drop_unique_index_constraint_in_txn(&write_txn, &def)?;
         }
         bump_table_generation_in_txn(&write_txn, &def.table)?;

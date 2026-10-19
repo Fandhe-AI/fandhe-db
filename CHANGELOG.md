@@ -17,6 +17,14 @@
   `IndexExpressionDef`・`IndexDef::with_expressions` の追加。式を含む宣言のカタログ形式は新版 `v4`
   （`v1`／`v2`／`v3` のバイト列は不変。旧バイナリは `v4` を読めない）。公開の `Storage::create_index` は
   式付きの `IndexDef` を `Invalid` で拒否する（SQL 表層のみが作成できる）。
+- `DROP MATERIALIZED VIEW [IF EXISTS] <名前>[, ...] [CASCADE | RESTRICT]` と matview への索引（Issue #1667・
+  TABLE-42 (5)(6)・TABLE-37）: 従来 `42601` だった `DROP MATERIALIZED VIEW` を受理する（複数指定は単一 txn で原子的、
+  表・ビュー・索引名の指定は `IF EXISTS` でも `42809`、依存する matview は RESTRICT で `2BP01`、CASCADE で依存する
+  側から削除）。表・ビューの `DROP ... CASCADE` は依存 matview を推移的に削除する（従来は #1663 の暫定ガードで
+  `2BP01`）。matview への `CREATE [UNIQUE] INDEX` は従来 `42809` だったが宣言を受理する（スカラーのみ。
+  `USING hnsw` は `0A000`、暗黙の `id` 列は無く `42703`）。UNIQUE 索引は文脈（テナント）ごとに一意性を強制し、
+  重複は `23505`（固定文言）。公開 API は `ParsedSql::DropMaterializedView`・`SqlOutcome::DropMaterializedView`・
+  `CascadedObject::MaterializedView` の追加。
 - `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <名前> [(<別名>, ...)] AS <本文> [WITH [NO] DATA]`（Issue #1664・TABLE-42）:
   従来 `42601` だった構文を受理し、実体化対象の文脈ごとに本文を評価した結果を単一トランザクションで保存する。
   読み取りは読み手の文脈に一致する実体だけを返し、実体が無ければ新分類 `55000`（HTTP 射影は 409）。
@@ -25,7 +33,7 @@
   `SqlOutcome::CreateMaterializedView`・`SqlSurfaceError::MaterializedViewNotPopulated`・
   `ErrorClass::ObjectNotInPrerequisiteState` の追加と、`TableLookup::materialized_view_columns`（既定実装あり）の追加。
   matview が直接参照する表への `DROP COLUMN`（`2BP01`）・`ALTER COLUMN TYPE`／`RENAME COLUMN`（`0A000`）は
-  列単位の追随（#1667）まで拒否する。
+  列単位の追随（別 Issue で追跡）まで拒否する。
 - `TRUNCATE ... [CASCADE | RESTRICT]`（Issue #1644・SQL-48 (2)）: 従来 `42601` だった `CASCADE`／`RESTRICT` を
   受理する（省略時は RESTRICT）。RESTRICT は指定していない表の FK が参照する表の `TRUNCATE` を、参照元の
   行の有無・他テナントの行に関係なくカタログ宣言だけで `0A000` で拒否する（従来は行を消した後の事後検査で

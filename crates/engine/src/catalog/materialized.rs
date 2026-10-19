@@ -13,8 +13,17 @@
 //! 呼び出し元（`catalog.rs` の各 DDL）が [`Storage`] の write txn 内で併記する。
 //!
 //! 呼び出し関係: 本モジュールの API はすべて `pub(crate)`。SQL 表層（`CREATE MATERIALIZED
-//! VIEW`・`REFRESH`・`FROM <matview>` の読み取り配線と `55000` への写像）は後続 Issue
-//! （#1664〜#1667）が担い、本モジュールは Storage 水準の土台だけを提供する。
+//! VIEW`・`REFRESH`・`FROM <matview>` の読み取り配線と `55000` への写像）は `sql::ddl`・
+//! `core.rs` が担い、本モジュールは Storage 水準の土台（定義・実体・索引宣言・DROP）を提供する。
+//!
+//! 索引（TABLE-42 (5)(6)・Issue #1667）: matview への `CREATE [UNIQUE] INDEX` は表と同じ
+//! `INDEX_CATALOG_TABLE` へ `IndexDef { table: <matview 名> }` として宣言し、**物理構造は持たない**
+//! （matview の読み取りは実体全体を外側処理に渡すため、索引の有無で結果は変わらない）。UNIQUE は
+//! **文脈（[`ContextKey`]）ごと**に一意性を強制する（表の一意索引がテナント単位で判定するのと
+//! 同じ規約。NULL は distinct）。強制箇所は `CREATE UNIQUE INDEX` 時の既存実体の走査と、実体の
+//! 書き込みプリミティブ（[`write_entities_in_txn`]・[`write_context_entity_in_txn`]）の 2 つで、
+//! REFRESH が共通プリミティブを通る限り索引との整合（同一 txn・失敗時は旧実体が残る）が保たれる。
+//! 重複時のエラー（`UniqueConstraintViolation`）はテナント・値・件数を含まない固定文言。
 //!
 //! テナント境界（P0）: 実体の読み取りは、渡された `&PolicyContext` から導いたキーに
 //! **完全一致**する実体だけを返す。「全文脈を読む」API は作らない。キーには許可可視性の
@@ -25,9 +34,12 @@
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use super::{
-    bump_table_generation_in_txn, decode_schema_with_resolver, encode_schema, validate_identifier,
-    CatalogError, ColumnDef, ColumnType, Result, Storage, TableSchema, MAX_COLUMN_COUNT,
-    MAX_IDENTIFIER_LEN, MAX_LIST_TABLES, MAX_VIEW_BODY_BYTES,
+    bump_table_generation_in_txn, decode_index_def, decode_schema_with_resolver, encode_schema,
+    is_declarable_scalar_index_type, retain_index_defs_in_txn, validate_identifier,
+    validate_index_columns, CascadedObject, CatalogError, ColumnDef, ColumnType, DropBehavior,
+    IndexDef, IndexKind, Result, Storage, TableSchema, INDEX_CATALOG_TABLE, MAX_COLUMN_COUNT,
+    MAX_IDENTIFIER_LEN, MAX_INDEX_COUNT, MAX_LIST_TABLES, MAX_UNIQUE_CONSTRAINTS,
+    MAX_VIEW_BODY_BYTES,
 };
 use crate::policy::PolicyContext;
 use crate::result_limits::MAX_RESULT_ROWS_HARD_CAP;
@@ -423,6 +435,29 @@ pub(crate) fn materialized_views_referencing_in_txn(
     Ok(out)
 }
 
+/// 全 matview の `(名前, 直接の参照元)` を名前順に 1 回だけ読む（DROP の依存列挙層
+/// `dependency` が使う。読み取り専用で、欠落した表を作らない）。件数は
+/// [`MAX_MATERIALIZED_VIEWS`] で頭打ちにし、超過・decode 失敗は `Err`（fail-closed）。
+pub(crate) fn load_materialized_view_bases_in_txn(
+    write_txn: &redb::WriteTransaction,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let table = match ReadSource::open_table(write_txn, MATERIALIZED_VIEWS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for entry in table.iter()? {
+        if out.len() >= MAX_MATERIALIZED_VIEWS {
+            return Err(corrupt("too many materialized views"));
+        }
+        let (key, value) = entry?;
+        let def = decode_materialized_view_def(key.value(), value.value())?;
+        out.push((def.name, def.base_relations));
+    }
+    Ok(out)
+}
+
 /// 定義 1 件の挿入（write txn 内）。判定順は名前の衝突（`TableAlreadyExists`）→ 参照先の存在
 /// （`TableNotFound`）→ 件数上限（`ViewLimitExceeded`）→ 保存。世代の bump は呼び出し元が行う。
 fn insert_def_in_txn(
@@ -451,6 +486,211 @@ fn insert_def_in_txn(
             "too many materialized views".to_string(),
         ));
     }
+    table.insert(def.name.as_str(), encoded)?;
+    Ok(())
+}
+
+/// matview `name` の UNIQUE 索引宣言の列リストを同一 write txn 内で返す（索引名順）。
+/// 索引カタログ未作成は空（表を作らない）。走査は [`MAX_INDEX_COUNT`] で打ち切り、超過・decode
+/// 失敗は `Err`（fail-closed）。`REFRESH ... CONCURRENTLY`（Issue #1666）の「WHERE を持たない
+/// UNIQUE 索引の有無」判定にも使えるよう `pub(crate)` で公開する。
+pub(crate) fn unique_index_columns_for_matview_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<Vec<Vec<String>>> {
+    let table = match ReadSource::open_table(write_txn, INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for (scanned, entry) in table.iter()?.enumerate() {
+        if scanned >= MAX_INDEX_COUNT {
+            return Err(corrupt("index catalog exceeds its entry limit"));
+        }
+        let (key, value) = entry?;
+        let def = decode_index_def(key.value(), value.value())?;
+        if def.unique && def.table == name {
+            out.push(def.columns);
+        }
+    }
+    Ok(out)
+}
+
+/// UNIQUE 索引宣言の列名を、matview の列位置の組へ解決する。宣言が列に解決できないのは
+/// カタログ破損（`CorruptSchema`）。
+fn unique_column_sets_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+    columns: &[ColumnDef],
+) -> Result<Vec<Vec<usize>>> {
+    unique_index_columns_for_matview_in_txn(write_txn, name)?
+        .iter()
+        .map(|set| {
+            set.iter()
+                .map(|col| {
+                    columns
+                        .iter()
+                        .position(|c| &c.name == col)
+                        .ok_or_else(|| corrupt("unique index references an unknown column"))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// 1 文脈ぶんの行 `rows` が、各 UNIQUE 索引（列位置の組）で重複しないことを検査する。
+/// NULL を含むキーは distinct として数えない（表の一意索引と同じ正準キー）。重複は
+/// `UniqueConstraintViolation`（固定文言で、テナント・値・件数を含めない）。文脈をまたいだ
+/// 比較はしない（呼び出し側が文脈ごとに呼ぶ）。
+fn enforce_unique_rows(sets: &[Vec<usize>], rows: &[Vec<Value>]) -> Result<()> {
+    for set in sets {
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for values in rows {
+            match crate::constraint::unique_key_from_values(set, values) {
+                Ok(Some(key)) => {
+                    if !seen.insert(key) {
+                        return Err(CatalogError::UniqueConstraintViolation);
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    return Err(CatalogError::Invalid(
+                        "materialized view row cannot be used as a unique key".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 既存の全文脈の実体のいずれかが、列位置 `set` の一意性に違反するか（`CREATE UNIQUE INDEX`
+/// 時の走査）。文脈ごとに独立して判定する（行表は文脈キー順に並ぶためキーが変わるたびに集合を
+/// リセットする）。文脈数・文脈ごとの行数は上限で頭打ちにし、超過は `CorruptSchema`。
+fn existing_entities_violate_unique_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+    columns: &[ColumnDef],
+    set: &[usize],
+) -> Result<bool> {
+    let schema = TableSchema::new(name.to_string(), columns.to_vec());
+    let table_name = matview_rows_table_name(name);
+    let rows_def: MatviewRowsDef = TableDefinition::new(&table_name);
+    let rows_table = match ReadSource::open_table(write_txn, rows_def) {
+        Ok(t) => t,
+        // 行表が無い（WITH NO DATA か全文脈が空）なら違反しようがない。
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let mut current: Option<Vec<u8>> = None;
+    let mut contexts = 0usize;
+    let mut in_context = 0usize;
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for entry in rows_table.iter()? {
+        let (k, v) = entry?;
+        let (ctx, _) = k.value();
+        if current.as_deref() != Some(ctx) {
+            contexts += 1;
+            if contexts > MAX_MATVIEW_CONTEXTS {
+                return Err(corrupt("too many materialized view entities"));
+            }
+            current = Some(ctx.to_vec());
+            in_context = 0;
+            seen.clear();
+        }
+        in_context += 1;
+        if in_context > MAX_RESULT_ROWS_HARD_CAP {
+            return Err(corrupt("materialized view entity row count out of range"));
+        }
+        let decoded = row_codec::decode_row(&schema, v.value())
+            .map_err(|_| corrupt("materialized view entity row is corrupt"))?;
+        match crate::constraint::unique_key_from_values(set, &decoded.values) {
+            Ok(Some(key)) => {
+                if !seen.insert(key) {
+                    return Ok(true);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return Err(corrupt("materialized view entity row is corrupt")),
+        }
+    }
+    Ok(false)
+}
+
+/// matview への索引宣言 1 件を登録する（`CREATE [UNIQUE] INDEX ... ON <matview>`。TABLE-42 (5)(6)・
+/// INDEX-7・INDEX-9、Issue #1667）。`Storage::create_index` が、索引名の名前空間衝突を判定し終えた
+/// 後・同一 write txn 内で呼ぶ。commit と世代 bump（表単位・索引カタログ）は呼び出し元が行う。
+///
+/// 判定順（fail-closed。データに依存するのは最後の既存実体走査だけ）: HNSW は対象外
+/// （`IndexKindMismatch`。TABLE-42 (6)）→ 列の存在（matview に暗黙の `id` 列は無い。
+/// `ColumnNotFound`）→ スカラー索引化できる型（`IndexKindMismatch`）→ 照合の可否
+/// （`IndexCollationNotSupported`）→ UNIQUE の列型（`IndexKindMismatch`）→ 件数上限
+/// （`IndexLimitExceeded`）→ UNIQUE なら既存の全文脈の実体の重複走査（`UniqueConstraintViolation`）
+/// → 保存。
+pub(crate) fn create_matview_index_in_txn(
+    write_txn: &redb::WriteTransaction,
+    def: &IndexDef,
+    encoded: &[u8],
+) -> Result<()> {
+    let mv = load_def_in_txn(write_txn, &def.table)?
+        .ok_or_else(|| CatalogError::ViewNotFound(def.table.clone()))?;
+    if matches!(def.kind, IndexKind::Hnsw) {
+        return Err(CatalogError::IndexKindMismatch(
+            "USING hnsw is not supported on materialized views".to_string(),
+        ));
+    }
+    let mut positions = Vec::with_capacity(def.columns.len());
+    for col in &def.columns {
+        let (pos, column) = mv
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| &c.name == col)
+            .ok_or_else(|| CatalogError::ColumnNotFound(col.clone()))?;
+        if !is_declarable_scalar_index_type(&column.ty) {
+            return Err(CatalogError::IndexKindMismatch(format!(
+                "column {col} cannot be declared as a scalar index target"
+            )));
+        }
+        positions.push(pos);
+    }
+    // 照合の可否（照合を持てない型への COLLATE は 42804）。列の存在・型は上で確認済み。
+    validate_index_columns(def, &TableSchema::new(mv.name.clone(), mv.columns.clone()))?;
+    if def.unique {
+        for (col, &pos) in def.columns.iter().zip(&positions) {
+            let allowed = mv
+                .columns
+                .get(pos)
+                .is_some_and(|c| c.ty.is_unique_constraint_allowed());
+            if !allowed {
+                return Err(CatalogError::IndexKindMismatch(format!(
+                    "column {col} cannot be used in a unique index"
+                )));
+            }
+        }
+        if unique_index_columns_for_matview_in_txn(write_txn, &def.table)?.len()
+            >= MAX_UNIQUE_CONSTRAINTS
+        {
+            return Err(CatalogError::IndexLimitExceeded(
+                "too many unique indexes on the materialized view".to_string(),
+            ));
+        }
+    }
+    {
+        let table = write_txn.open_table(INDEX_CATALOG_TABLE)?;
+        if table.len()? >= MAX_INDEX_COUNT as u64 {
+            return Err(CatalogError::IndexLimitExceeded(
+                "too many indexes".to_string(),
+            ));
+        }
+    }
+    if def.unique
+        && existing_entities_violate_unique_in_txn(write_txn, &def.table, &mv.columns, &positions)?
+    {
+        return Err(CatalogError::UniqueConstraintViolation);
+    }
+    let mut table = write_txn.open_table(INDEX_CATALOG_TABLE)?;
     table.insert(def.name.as_str(), encoded)?;
     Ok(())
 }
@@ -497,6 +737,14 @@ fn write_entities_in_txn(
     keys: &[ContextKey],
 ) -> Result<()> {
     let schema = TableSchema::new(name.to_string(), columns.to_vec());
+    // UNIQUE 索引宣言があれば、旧実体を消す前に文脈ごとの一意性を検査する（違反は呼び出し元が
+    // txn ごと破棄するため旧実体が残る。1 行以下の文脈は重複しようがないので索引を読まない）。
+    if entities.iter().any(|(_, rows)| rows.len() >= 2) {
+        let sets = unique_column_sets_in_txn(write_txn, name, columns)?;
+        for (_, rows) in entities {
+            enforce_unique_rows(&sets, rows)?;
+        }
+    }
     delete_all_meta_in_txn(write_txn, name)?;
     delete_rows_table_in_txn(write_txn, name)?;
     let table_name = matview_rows_table_name(name);
@@ -592,6 +840,11 @@ pub(crate) fn write_context_entity_in_txn(
         return Err(CatalogError::ViewLimitExceeded(
             "materialized view result exceeds row limit".to_string(),
         ));
+    }
+    if rows.len() >= 2 {
+        // UNIQUE 索引宣言があれば、この文脈の行だけで一意性を検査する（他文脈とは比較しない）。
+        let sets = unique_column_sets_in_txn(write_txn, &def.name, &def.columns)?;
+        enforce_unique_rows(&sets, rows)?;
     }
     let schema = TableSchema::new(def.name.clone(), def.columns.clone());
     let table_name = matview_rows_table_name(&def.name);
@@ -788,29 +1041,133 @@ impl Storage {
         read_materialized_view_in(&read_txn, name, ctx)
     }
 
-    /// matview の定義・全文脈のメタ・行表を同一 write txn で削除する（行表を残すと同名で
-    /// 作り直したときに旧データが復活する。Issue #179 の教訓）。matview を参照する別の
-    /// matview があれば `DependentViewsExist`。SQL 文・CASCADE は #1667。
+    /// matview 1 件を RESTRICT で削除する（[`Self::drop_materialized_views`] の薄いラッパー。
+    /// 不在は `ViewNotFound`、matview を参照する別の matview があれば `DependentViewsExist`）。
     pub(crate) fn drop_materialized_view(&self, name: &str) -> Result<()> {
-        validate_identifier(name)?;
+        self.drop_materialized_views(&[name.to_string()], false, DropBehavior::Restrict)
+            .map(|_| ())
+    }
+
+    /// `DROP MATERIALIZED VIEW [IF EXISTS] n1[, n2 ...] [CASCADE | RESTRICT]`（TABLE-42 (5)・
+    /// TABLE-37・TABLE-36 (4)、Issue #1667）。全体を 1 つの write txn・1 回の commit で適用し、
+    /// 1 件でも失敗すれば何も削除しない（原子的）。`sql::ddl::execute_drop_materialized_view` が
+    /// DDL 権限ゲートを通過した後に呼ぶ。
+    ///
+    /// 判定順: 識別子検証 → 解決（重複は除去。表・ビュー・索引の名前は `IF EXISTS` でも
+    /// `WrongObjectKind`、不在は `IF EXISTS` なら skip、なければ `ViewNotFound`）→ 依存
+    /// （`Restrict`: 同じ文に並べていない matview が参照元にしていれば `DependentViewsExist`。
+    /// `Cascade`: 列挙層が返した依存 matview を依存する側から先に同じ txn で削除。依存を正確に
+    /// 列挙できない場合は `DependentViewsExist`〔fail-closed〕）→ 削除。全件 skip なら commit せず
+    /// 副作用ゼロ。報告・エラーには共有カタログの名前だけを含め、テナント・行の情報は含めない。
+    pub(crate) fn drop_materialized_views(
+        &self,
+        names: &[String],
+        if_exists: bool,
+        behavior: DropBehavior,
+    ) -> Result<DropMaterializedViewsReport> {
+        let mut targets: Vec<&str> = Vec::new();
+        for name in names {
+            validate_identifier(name)?;
+            if !targets.contains(&name.as_str()) {
+                targets.push(name.as_str());
+            }
+        }
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        if load_def_in_txn(&write_txn, name)?.is_none() {
+        let mut existing: Vec<&str> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        for &name in &targets {
+            if super::materialized_view_exists_in_txn(&write_txn, name)? {
+                existing.push(name);
+            } else if super::table_exists_in_txn(&write_txn, name)?
+                || super::view_exists_in_txn(&write_txn, name)?
+                || super::index_name_exists_in_txn(&write_txn, name)?
+            {
+                return Err(CatalogError::WrongObjectKind(name.to_string()));
+            } else if if_exists {
+                skipped.push(name.to_string());
+            } else {
+                return Err(CatalogError::ViewNotFound(name.to_string()));
+            }
+        }
+        if existing.is_empty() {
+            // 副作用ゼロ。txn は commit せず破棄する。
+            return Ok(DropMaterializedViewsReport {
+                dropped: 0,
+                skipped,
+                cascaded: Vec::new(),
+            });
+        }
+        let mut cascaded: Vec<CascadedObject> = Vec::new();
+        match behavior {
+            DropBehavior::Restrict => {
+                for &name in &existing {
+                    let referencing = materialized_views_referencing_in_txn(&write_txn, name)?;
+                    if referencing.iter().any(|r| !existing.contains(&r.as_str())) {
+                        return Err(CatalogError::DependentViewsExist(name.to_string()));
+                    }
+                }
+            }
+            DropBehavior::Cascade => {
+                let roots: Vec<super::dependency::DropTarget> = existing
+                    .iter()
+                    .map(|n| super::dependency::DropTarget::MaterializedView((*n).to_string()))
+                    .collect();
+                let closure =
+                    super::dependency::enumerate_drop_dependents_in_txn(&write_txn, &roots)?;
+                if closure.conservative {
+                    let first = existing.first().copied().unwrap_or_default();
+                    return Err(CatalogError::DependentViewsExist(first.to_string()));
+                }
+                cascaded = super::apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
+            }
+        }
+        for &name in &existing {
+            drop_materialized_view_in_txn(&write_txn, name)?;
+            bump_table_generation_in_txn(&write_txn, name)?;
+        }
+        let dropped = existing.len();
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(super::convert_storage_error)?;
+        Ok(DropMaterializedViewsReport {
+            dropped,
+            skipped,
+            cascaded,
+        })
+    }
+}
+
+/// [`Storage::drop_materialized_views`] の結果。名前以外のテナント固有の情報は持たない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DropMaterializedViewsReport {
+    /// 実際に削除した matview の数（重複除去後、`CASCADE` で連鎖削除した分は含まない）。
+    pub dropped: usize,
+    /// `IF EXISTS` で不在のため skip した名前（記述順）。
+    pub skipped: Vec<String>,
+    /// `CASCADE` で連鎖削除したオブジェクト（適用順。依存する側が先）。
+    pub cascaded: Vec<CascadedObject>,
+}
+
+/// matview 1 件を同一 write txn 内で削除する: 定義・全文脈のメタ・行表・索引宣言を消す。
+/// 表単位の世代（`bump_table_generation_in_txn`）は呼び出し元が commit と同じ txn で進める。行表を残すと同名で作り直したときに旧データが復活し（Issue #179 の教訓）、索引
+/// 宣言を残すと同名の再作成が古い宣言を引き継ぐため、必ず同じ txn で消す。依存の判定と commit は
+/// 呼び出し元（[`Storage::drop_materialized_views`]・CASCADE の適用側
+/// `apply_cascaded_objects_in_txn`）が行う。定義が無ければ `ViewNotFound`。
+pub(crate) fn drop_materialized_view_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<()> {
+    {
+        let mut table = write_txn.open_table(MATERIALIZED_VIEWS_TABLE)?;
+        if table.remove(name)?.is_none() {
             return Err(CatalogError::ViewNotFound(name.to_string()));
         }
-        if !materialized_views_referencing_in_txn(&write_txn, name)?.is_empty() {
-            return Err(CatalogError::DependentViewsExist(name.to_string()));
-        }
-        {
-            let mut table = write_txn.open_table(MATERIALIZED_VIEWS_TABLE)?;
-            table.remove(name)?;
-        }
-        delete_all_meta_in_txn(&write_txn, name)?;
-        delete_rows_table_in_txn(&write_txn, name)?;
-        bump_table_generation_in_txn(&write_txn, name)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
     }
+    delete_all_meta_in_txn(write_txn, name)?;
+    delete_rows_table_in_txn(write_txn, name)?;
+    retain_index_defs_in_txn(write_txn, |def| def.table != name)?;
+    Ok(())
 }
 
 #[cfg(test)]
