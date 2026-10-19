@@ -3387,6 +3387,85 @@ impl ValidatedViewInsert {
     }
 }
 
+/// 構造検証を通過した、ビューへの `DELETE` 文（TABLE-43・Issue #1672）。[`ValidatedViewInsert`] と
+/// 同じく送られた文の形（ビュー名と公開名）のまま保持し、基表への書き換えは Execute 時に現在の
+/// カタログで行う。`core.rs` の `ParsedSql::ViewDelete` が保持し、`sql::view_dml::rewrite_view_delete`
+/// が基表形の [`DeleteStatement`] へ写す。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedViewDelete {
+    pub(crate) shape: DeleteStatement,
+}
+
+impl ValidatedViewDelete {
+    pub(crate) fn new(shape: DeleteStatement) -> Self {
+        ValidatedViewDelete { shape }
+    }
+
+    /// FROM に指定されたビュー名。
+    pub fn view_name(&self) -> &str {
+        match &self.shape {
+            DeleteStatement::SingleRow(v) => &v.table_name,
+            DeleteStatement::Predicate(v) => &v.table_name,
+        }
+    }
+
+    /// 文末句で搬送された `operation_id`（`USING OPERATION_ID`）。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        match &self.shape {
+            DeleteStatement::SingleRow(v) => v.operation_id.as_ref(),
+            DeleteStatement::Predicate(v) => v.operation_id.as_ref(),
+        }
+    }
+}
+
+/// 構造検証を通過した、ビューへの `UPDATE` 文（TABLE-43・Issue #1672）。[`ValidatedViewDelete`] と
+/// 同じ方針で、`core.rs` の `ParsedSql::ViewUpdate` が保持し、`sql::view_dml::rewrite_view_update`
+/// が基表形の [`ValidatedUpdateForm`] へ写す。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedViewUpdate {
+    pub(crate) shape: ValidatedUpdateForm,
+}
+
+impl ValidatedViewUpdate {
+    pub(crate) fn new(shape: ValidatedUpdateForm) -> Self {
+        ValidatedViewUpdate { shape }
+    }
+
+    /// UPDATE の対象に指定されたビュー名。
+    pub fn view_name(&self) -> &str {
+        match &self.shape {
+            ValidatedUpdateForm::Single(v) => &v.table_name,
+            ValidatedUpdateForm::Predicate(v) => &v.table_name,
+        }
+    }
+
+    /// 文末句で搬送された `operation_id`（`USING OPERATION_ID`）。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        match &self.shape {
+            ValidatedUpdateForm::Single(v) => v.operation_id.as_ref(),
+            ValidatedUpdateForm::Predicate(v) => v.operation_id.as_ref(),
+        }
+    }
+}
+
+/// `id = <literal>` の述語列を、構文解析器（`WHERE` の述語文法）に通して得る（TABLE-43・Issue #1672）。
+/// ビューへの単一行形 `WHERE id = <n>` を、ビューの `WHERE` 述語と AND 合成する述語形へ変換する際、
+/// 利用者が `WHERE <述語> AND id = <n>` と書いたときと同じ AST にするために使う。SQL 文字列は組み
+/// 立てず、検証済みの数値リテラルをトークンとして渡すだけ。
+pub(crate) fn id_equality_predicates(
+    id_literal: &str,
+) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+    let tokens = [
+        Token::Ident("id".to_string()),
+        Token::Punct('='),
+        Token::Number(id_literal.to_string()),
+    ];
+    let mut p = Parser::new(&tokens);
+    let predicates = p.parse_where()?;
+    p.expect_end_of_statement()?;
+    Ok(predicates)
+}
+
 /// 許可形状の構造判定を通過した単一行・`id` 指定形 `DELETE` 文（SQL-18・
 /// TASK-191）。`ValidatedInsert` と同様、本モジュールが保証するのはここまでの
 /// 構造情報のみで、`id` 値の意味論的妥当性（`u64` として解釈可能か）は
@@ -16168,6 +16247,29 @@ pub(crate) fn validate_delete_statement_tokens(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<DeleteStatement, SqlSurfaceError> {
+    let stmt = parse_delete_statement_shape_tokens(tokens, mode)?;
+
+    let table_name = match &stmt {
+        DeleteStatement::SingleRow(v) => &v.table_name,
+        DeleteStatement::Predicate(v) => &v.table_name,
+    };
+    let exists = lookup.table_exists(table_name)?;
+    if !exists {
+        return Err(SqlSurfaceError::undefined_table(table_name.clone()));
+    }
+
+    Ok(stmt)
+}
+
+/// [`validate_delete_statement_tokens`] の前半（構造検証・`PARTITIONED` の `operation_id` 必須化・
+/// `operation_id` 必須化ガードまで。カタログ照会はしない。判定順序は元の関数と同じ）。`core.rs` の
+/// `parse_tokens` が、FROM の名前が表でなかったときにビューへの DELETE として扱う
+/// （`ParsedSql::ViewDelete`。TABLE-43・Issue #1672）ために、構造検証を二重に行わず形だけを取り出す入口。
+/// 返す `table_name` は存在確認前の名前。
+pub(crate) fn parse_delete_statement_shape_tokens(
+    tokens: &[lexer::Token],
+    mode: LedgerMode,
+) -> Result<DeleteStatement, SqlSurfaceError> {
     let shape = parse_delete_statement_shape(tokens)?;
 
     // 分割実行はジョブ識別に operation_id を使うため、構成に関わらず必須（Issue #1704）。
@@ -16175,11 +16277,6 @@ pub(crate) fn validate_delete_statement_tokens(
         crate::recovery::required_op_id::require_partitioned(shape.operation_id.as_ref())?;
     }
     mode.require(shape.operation_id.as_ref())?;
-
-    let exists = lookup.table_exists(&shape.table_name)?;
-    if !exists {
-        return Err(SqlSurfaceError::undefined_table(shape.table_name));
-    }
 
     Ok(match shape.where_clause {
         ParsedDeleteWhere::RowId { id_literal } => DeleteStatement::SingleRow(ValidatedDelete {
@@ -17274,6 +17371,29 @@ pub(crate) fn validate_update_form_tokens(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
+    let form = parse_update_form_shape_tokens(tokens, mode)?;
+
+    let table_name = match &form {
+        ValidatedUpdateForm::Single(v) => &v.table_name,
+        ValidatedUpdateForm::Predicate(v) => &v.table_name,
+    };
+    let exists = lookup.table_exists(table_name)?;
+    if !exists {
+        return Err(SqlSurfaceError::undefined_table(table_name.clone()));
+    }
+
+    Ok(form)
+}
+
+/// [`validate_update_form_tokens`] の前半（構造検証・`PARTITIONED` の `operation_id` 必須化・
+/// `operation_id` 必須化ガードまで。カタログ照会はしない。判定順序は元の関数と同じ）。`core.rs` の
+/// `parse_tokens` が、UPDATE の対象が表でなかったときにビューへの UPDATE として扱う
+/// （`ParsedSql::ViewUpdate`。TABLE-43・Issue #1672）ために、構造検証を二重に行わず形だけを取り出す入口。
+/// 返す `table_name` は存在確認前の名前。
+pub(crate) fn parse_update_form_shape_tokens(
+    tokens: &[lexer::Token],
+    mode: LedgerMode,
+) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     let shape = p.parse_update()?;
     p.expect_end_of_statement()?;
@@ -17283,11 +17403,6 @@ pub(crate) fn validate_update_form_tokens(
         crate::recovery::required_op_id::require_partitioned(shape.operation_id.as_ref())?;
     }
     mode.require(shape.operation_id.as_ref())?;
-
-    let exists = lookup.table_exists(&shape.table_name)?;
-    if !exists {
-        return Err(SqlSurfaceError::undefined_table(shape.table_name));
-    }
 
     Ok(match shape.where_form {
         UpdateWhereForm::Id(id_literal) => ValidatedUpdateForm::Single(ValidatedUpdate {
