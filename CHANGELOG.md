@@ -9,6 +9,18 @@
 
 ### Breaking Changes
 
+- 部分索引の格納と DML 維持（Issue #1654・INDEX-11）: 従来 `0A000` だった `CREATE INDEX ... WHERE <述語>` の
+  決定的な述語を、書き込みトランザクション内で束縛して正規化テキストを永続化する（SQLSTATE が `0A000` から
+  成功、または未知列 `42703`・セッション依存の述語 `42P17`・予約列と `visible()` `42601` 等へ変わる）。
+  述語を満たす行だけが索引化され、`INSERT`／`UPDATE`／UPSERT／`COPY` は述語が TRUE の行でだけ式要素を評価する
+  （NULL・FALSE の行は索引外。述語の評価エラーは文を拒否し、`CREATE INDEX` は既存行を全件検証する）。
+  `UNIQUE`・`USING hnsw`・`COLLATE`・マテリアライズドビューとの組み合わせは引き続き `0A000`。参照列の
+  `DROP COLUMN` は部分索引を連鎖削除し、`RENAME COLUMN` は述語を追随させ、述語・要素が参照する列の
+  `ALTER COLUMN TYPE` は `0A000`。部分索引はプランナ選択（#1656）まで結果・`EXPLAIN` に影響しない。
+  公開 API は `IndexDef.predicate`（pub フィールド追加）・`IndexPredicateDef`・`IndexDef::with_predicate`・
+  `IndexDef::has_predicate` の追加。述語付きの宣言のカタログ形式は新版 `v6`（`v1`〜`v5` のバイト列は不変。旧バイナリは
+  `v6` を読めない）。公開の `Storage::create_index` は述語付きの `IndexDef` を `Invalid` で拒否する
+  （SQL 表層のみが作成できる）。
 - 式索引の UNIQUE と失効管理（Issue #1651・INDEX-9・INDEX-10）: 従来 `0A000` だった
   `CREATE UNIQUE INDEX ... ((<式>))`（列要素との複合を含む）を受理し、式の値の一意性を全書き込み経路で
   `23505` により強制する（NULL は重複しない・テナントごとに独立・不可視行とも衝突）。作成時に既存行へ

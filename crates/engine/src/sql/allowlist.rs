@@ -12498,12 +12498,11 @@ pub(crate) fn validate_create_index_tokens(
     p.expect_end_of_statement()?;
     // 最終ゲート（INDEX-10、Issue #1647）。決定性検査は部分索引の `WHERE` 判定より前に済ませてある。
     reject_unimplemented_expression_keys(&expressions, &collations, hnsw)?;
-    // 部分索引の最終ゲート（INDEX-11、Issue #1653）。述語の格納・DML 維持・部分 UNIQUE の強制は
-    // 後続 Issue（#1654・#1657）。宣言だけ残って効かない索引や強制漏れ（fail-open）を作らない。
+    // 部分索引の最終ゲート（INDEX-11、Issue #1653・#1654）。述語の格納・DML 維持は Issue #1654 で
+    // 実装済みのため、残すのは強制や照合の永続形が無い組み合わせだけ（宣言だけ残って効かない索引や
+    // 強制漏れ〔fail-open〕を作らない）。部分 UNIQUE の強制は #1657。
     if predicate.is_some() {
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "partial indexes are not supported yet".to_string(),
-        });
+        reject_unimplemented_partial_index(unique, hnsw, &collations, &expressions)?;
     }
     Ok(ValidatedCreateIndex {
         name,
@@ -12516,6 +12515,40 @@ pub(crate) fn validate_create_index_tokens(
         unique,
         predicate,
     })
+}
+
+/// 部分索引の最終ゲート（INDEX-11、Issue #1654）。カタログ非参照の構文段で `0A000` に倒す組み合わせ:
+/// `UNIQUE`（部分 UNIQUE の強制は #1657。強制漏れの fail-open を作らない）・`USING hnsw`・`COLLATE`
+/// （`v6` の永続形は照合を持たない。素の列・式のどちらへの指定も）。matview への `WHERE` は対象の種別を
+/// 知る書き込みトランザクション内（`Storage::create_index_bound`）で拒否する。
+fn reject_unimplemented_partial_index(
+    unique: bool,
+    hnsw: bool,
+    collations: &[Option<crate::collation::Collation>],
+    expressions: &[Option<Expr>],
+) -> Result<(), SqlSurfaceError> {
+    let unsupported = |detail: &str| SqlSurfaceError::FeatureNotSupported {
+        detail: detail.to_string(),
+    };
+    if unique {
+        return Err(unsupported("partial unique indexes are not supported yet"));
+    }
+    if hnsw {
+        return Err(unsupported(
+            "partial indexes are not supported for this index kind yet",
+        ));
+    }
+    if collations.iter().any(Option::is_some)
+        || expressions
+            .iter()
+            .flatten()
+            .any(crate::sql::index_expr::expr_contains_collate)
+    {
+        return Err(unsupported(
+            "COLLATE on a partial index is not supported yet",
+        ));
+    }
+    Ok(())
 }
 
 /// 式索引の最終ゲート（INDEX-10、Issue #1647・#1648）。束縛・永続化・キー計算は
@@ -16423,6 +16456,21 @@ pub(crate) fn parse_check_predicate_text(
     // 旧版は時刻キーワード名の列参照を引用なしで保存した。CHECK は値関数を禁止しているため、
     // 保存本文中の未引用の予約語は旧形式の列参照として復元する（書き込み不能化を防ぐ）。
     lexer::requote_legacy_value_function_columns(&mut tokens);
+    let mut p = Parser::new(&tokens);
+    let predicates = p.parse_where()?;
+    p.expect_end_of_statement()?;
+    Ok(predicates)
+}
+
+/// カタログに永続化された部分索引の述語（`sql::index_predicate::bind_index_predicate` が描画した
+/// 正規化テキスト。INDEX-11、Issue #1654）を、`WHERE` 句と同じ文法で再パースする。構文段
+/// （`validate_create_index_tokens`）と同じ既定状態の `parse_where` を使い、第 2 のパーサを作らない。
+/// 保存テキストは untrusted で、末尾に余剰トークンが残る場合は `42601`（往復不能・手書きの破損の
+/// どちらもここで検知する）。CHECK 用の旧形式の再引用（legacy requote）は持ち込まない。
+pub(crate) fn parse_index_predicate_text(
+    sql: &str,
+) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
     let mut p = Parser::new(&tokens);
     let predicates = p.parse_where()?;
     p.expect_end_of_statement()?;

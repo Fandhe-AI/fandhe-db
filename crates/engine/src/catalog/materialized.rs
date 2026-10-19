@@ -510,7 +510,8 @@ pub(crate) fn unique_index_columns_for_matview_in_txn(
         }
         let (key, value) = entry?;
         let def = decode_index_def(key.value(), value.value())?;
-        if def.unique && def.table == name {
+        // 述語付き（部分索引）は強制の対象にしない（fail-closed。INDEX-11、Issue #1654）。
+        if def.unique && def.table == name && !def.has_predicate() {
             out.push(def.columns);
         }
     }
@@ -519,8 +520,9 @@ pub(crate) fn unique_index_columns_for_matview_in_txn(
 
 /// `REFRESH ... CONCURRENTLY` の前提（TABLE-42 (4)・Issue #1666）を満たす UNIQUE 索引が
 /// matview `name` に 1 件以上あるか。全要素が素の列（空名＝式要素でない）の宣言だけを適格とする。
-/// 部分索引の `WHERE` は構文段の最終ゲートで拒否済みで `IndexDef` に述語は無いため、述語や式を持つ宣言が
-/// 将来加わったらここで除外すること（fail-closed）。走査上限・decode 失敗は
+/// 部分索引の `WHERE`（INDEX-11、Issue #1654）は matview 宛てには `create_index_bound` が `0A000` で
+/// 拒否するため、matview の宣言は述語を持たない。述語や式を持つ宣言が将来加わったらここで除外すること
+/// （fail-closed）。走査上限・decode 失敗は
 /// [`unique_index_columns_for_matview_in_txn`] と同じく `Err`。
 pub(crate) fn has_concurrent_refresh_unique_index_in_txn(
     write_txn: &redb::WriteTransaction,

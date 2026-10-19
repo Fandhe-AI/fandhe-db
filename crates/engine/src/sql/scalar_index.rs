@@ -759,6 +759,128 @@ pub(crate) struct ScalarIndex {
     /// 式キーは含まれない（fail-soft。[`Self::attach_expression_keys`]）。消費者は
     /// [`Self::resolve_candidates`] の式述語（Issue #1650）と順序付き走査 API（テスト）。
     expression_keys: Vec<crate::sql::expression_key_index::ExpressionKeyIndex>,
+    /// 部分索引の派生キー（INDEX-11、Issue #1654）。述語 TRUE のスロット集合と、式要素のキー
+    /// （その集合だけで構築）を持つ。作れなかった部分索引は含まれない（fail-soft。
+    /// [`Self::attach_partial_indexes`]）。プランナ選択（#1656）まで消費者はテストだけ。
+    partial_indexes: Vec<PartialIndexEntries>,
+}
+
+/// 部分索引 1 本の派生キー（INDEX-11、Issue #1654）。`members` が「索引に格納された行」（述語が TRUE の
+/// スロット。昇順・重複なし）を表す。索引化はコミット済みの行からテーブル世代ごとに作り直すため、
+/// UPDATE による入場・退場は次の再構築で反映される。素の列要素のキー構造は本 Issue では作らない
+/// （列索引との交差か専用キーかはプランナ選択〔#1656〕の判断）。
+#[derive(Debug)]
+pub(crate) struct PartialIndexEntries {
+    index_name: String,
+    members: Vec<u32>,
+    expression_keys: Vec<crate::sql::expression_key_index::ExpressionKeyIndex>,
+}
+
+impl PartialIndexEntries {
+    /// 保持量の概算バイト数（索引名・`members`・式キー）。
+    fn approx_heap_bytes(&self) -> usize {
+        self.index_name
+            .len()
+            .saturating_add(
+                self.members
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.expression_keys
+                    .iter()
+                    .map(crate::sql::expression_key_index::ExpressionKeyIndex::approx_heap_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+
+    /// 述語 `decl` を `snapshot` の全スロットで評価して構築する。1 行でも述語の評価に失敗する・保存
+    /// テキストが再束縛できない・予算超過・確保失敗のどれでも、構造を丸ごと作らない（途中まで作った
+    /// 構造を残さない）。`running_bytes` は呼び出し元が計上済みの概算バイト量で、確保の**前**に
+    /// 予算を検査する。
+    fn build(
+        schema: &TableSchema,
+        snapshot: &SqlArenaSnapshot,
+        decl: &crate::catalog::DeclaredPartialIndex,
+        running_bytes: usize,
+    ) -> Result<Self, ScalarIndexBuildError> {
+        // 永続データは untrusted。再解析・再束縛し、保存形へ描き戻して一致することを確認する。
+        let predicate = crate::sql::index_predicate::rebind_stored_index_predicate(
+            &decl.predicate_sql,
+            schema,
+            None,
+        )
+        .map_err(|_| ScalarIndexBuildError::Unbuildable)?;
+        if predicate.sql != decl.predicate_sql {
+            return Err(ScalarIndexBuildError::Unbuildable);
+        }
+        let arena = snapshot.arena();
+        let row_count = arena.len();
+        let used = row_count
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(decl.index_name.len());
+        check_scalar_index_budget(running_bytes, used)?;
+        let mut members: Vec<u32> = Vec::new();
+        members
+            .try_reserve_exact(row_count)
+            .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+        let ids = arena.ids();
+        let mut scratch = Vec::new();
+        for slot in 0..row_count {
+            let slot_u32 = u32::try_from(slot).map_err(|_| ScalarIndexBuildError::SlotOverflow)?;
+            let metadata = snapshot
+                .metadata()
+                .get(slot)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let id = ids.get(slot).copied().unwrap_or(0);
+            let embedding: &[f32] = arena.vector(slot).unwrap_or(&[]);
+            match predicate.eval(schema, id, embedding, metadata, &mut scratch) {
+                Ok(true) => members.push(slot_u32),
+                Ok(false) => {}
+                // 述語の評価エラー・行のデコード失敗は、この部分索引を作らない（DML ゲートが
+                // 通常は先に拒否するため、到達は破損・手書き改変の場合に限る）。
+                Err(_) => return Err(ScalarIndexBuildError::Unbuildable),
+            }
+        }
+        let mut expression_keys = Vec::new();
+        let mut running = running_bytes.saturating_add(used);
+        for key_decl in decl.expression_keys() {
+            let key = crate::sql::expression_key_index::ExpressionKeyIndex::build_for_slots(
+                schema,
+                snapshot,
+                &key_decl,
+                running,
+                Some(&members),
+            )?;
+            running = running.saturating_add(key.approx_heap_bytes());
+            expression_keys.push(key);
+        }
+        Ok(Self {
+            index_name: decl.index_name.clone(),
+            members,
+            expression_keys,
+        })
+    }
+}
+
+/// 派生キー（式索引の式キーと部分索引）の宣言一式（INDEX-10・INDEX-11）。構築時に
+/// `ScalarIndex::build_targeted_with_expressions` へ渡す。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DerivedKeyDecls {
+    pub(crate) expression_keys: Vec<crate::catalog::DeclaredExpressionKey>,
+    pub(crate) partials: Vec<crate::catalog::DeclaredPartialIndex>,
+}
+
+impl DerivedKeyDecls {
+    /// 式キーだけの宣言（部分索引なし。テスト向け）。
+    #[cfg(test)]
+    pub(crate) fn expressions_only(keys: Vec<crate::catalog::DeclaredExpressionKey>) -> Self {
+        Self {
+            expression_keys: keys,
+            partials: Vec::new(),
+        }
+    }
 }
 
 /// バイト列順で組み上げた辞書（`values`・CSR の `offsets`/`slots`・`equality`）を、辞書の
@@ -1146,12 +1268,9 @@ pub(crate) fn resolve_scalar_index_target_and_expression_keys_in_txn(
     read_txn: &redb::ReadTransaction,
     table: &str,
     declarations_enabled: bool,
-) -> (
-    Result<ScalarIndexTargetOwned, ()>,
-    Vec<crate::catalog::DeclaredExpressionKey>,
-) {
+) -> (Result<ScalarIndexTargetOwned, ()>, DerivedKeyDecls) {
     if !declarations_enabled {
-        return (Ok(ScalarIndexTargetOwned::Auto), Vec::new());
+        return (Ok(ScalarIndexTargetOwned::Auto), DerivedKeyDecls::default());
     }
     match crate::catalog::declared_index_targets_in_txn(read_txn, table) {
         Ok(targets) => (
@@ -1159,9 +1278,12 @@ pub(crate) fn resolve_scalar_index_target_and_expression_keys_in_txn(
                 Some(cols) => ScalarIndexTargetOwned::Declared(cols),
                 None => ScalarIndexTargetOwned::Auto,
             }),
-            targets.expression_keys,
+            DerivedKeyDecls {
+                expression_keys: targets.expression_keys,
+                partials: targets.partial_indexes,
+            },
         ),
-        Err(_) => (Err(()), Vec::new()),
+        Err(_) => (Err(()), DerivedKeyDecls::default()),
     }
 }
 
@@ -2007,6 +2129,7 @@ impl ScalarIndex {
             // 仮値。この構造体は `build` の外へ `0` のまま漏れ出さない。
             approx_bytes: 0,
             expression_keys: Vec::new(),
+            partial_indexes: Vec::new(),
         };
         let mut computed_bytes = built.compute_approx_heap_bytes();
         if computed_bytes > MAX_SCALAR_INDEX_BYTES && !lane_a_columns.is_empty() {
@@ -2032,11 +2155,75 @@ impl ScalarIndex {
         schema: &TableSchema,
         snapshot: &SqlArenaSnapshot,
         target: ScalarIndexTarget<'_>,
-        expression_keys: &[crate::catalog::DeclaredExpressionKey],
+        derived: &DerivedKeyDecls,
     ) -> Result<Self, ScalarIndexBuildError> {
         let mut index = Self::build_targeted(schema, snapshot, target)?;
-        index.attach_expression_keys(schema, snapshot, expression_keys);
+        index.attach_expression_keys(schema, snapshot, &derived.expression_keys);
+        index.attach_partial_indexes(schema, snapshot, &derived.partials);
         Ok(index)
+    }
+
+    /// 部分索引（INDEX-11、Issue #1654）を 1 本ずつ構築して保持する。作れなかった部分索引は黙って
+    /// 捨てる（fail-soft。途中まで作った構造は残さない）。各部分索引は確保前に残り予算を検査済みで、
+    /// 確定した保持量でも上限を再確認する（超える場合はその部分索引だけ捨てる）。
+    fn attach_partial_indexes(
+        &mut self,
+        schema: &TableSchema,
+        snapshot: &SqlArenaSnapshot,
+        decls: &[crate::catalog::DeclaredPartialIndex],
+    ) {
+        let array_bytes = decls
+            .len()
+            .saturating_mul(std::mem::size_of::<PartialIndexEntries>());
+        if decls.is_empty()
+            || check_scalar_index_budget(self.approx_bytes, array_bytes).is_err()
+            || self.partial_indexes.try_reserve_exact(decls.len()).is_err()
+        {
+            return;
+        }
+        self.approx_bytes = self.approx_bytes.saturating_add(
+            self.partial_indexes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PartialIndexEntries>()),
+        );
+        for decl in decls {
+            if let Ok(entries) =
+                PartialIndexEntries::build(schema, snapshot, decl, self.approx_bytes)
+            {
+                let total = self
+                    .approx_bytes
+                    .saturating_add(entries.approx_heap_bytes());
+                if total > MAX_SCALAR_INDEX_BYTES {
+                    continue;
+                }
+                self.approx_bytes = total;
+                self.partial_indexes.push(entries);
+            }
+        }
+    }
+
+    /// 部分索引 `index_name` の格納行（述語 TRUE のスロット。昇順）。作れていなければ `None`。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn partial_index_members(&self, index_name: &str) -> Option<&[u32]> {
+        self.partial_indexes
+            .iter()
+            .find(|p| p.index_name == index_name)
+            .map(|p| p.members.as_slice())
+    }
+
+    /// 部分索引 `index_name` の `element` 番目の式キー（述語 TRUE の行だけで構築。無ければ `None`）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn partial_expression_key(
+        &self,
+        index_name: &str,
+        element: usize,
+    ) -> Option<&crate::sql::expression_key_index::ExpressionKeyIndex> {
+        self.partial_indexes
+            .iter()
+            .find(|p| p.index_name == index_name)?
+            .expression_keys
+            .iter()
+            .find(|k| k.element() == element)
     }
 
     /// 式キーを 1 個ずつ構築して保持する。作れなかった式キーは黙って捨てる（fail-soft。
@@ -6446,7 +6633,7 @@ mod tests {
             &schema,
             &snapshot,
             ScalarIndexTarget::Auto,
-            std::slice::from_ref(&decl),
+            &DerivedKeyDecls::expressions_only(vec![decl.clone()]),
         )
         .expect("build");
         let got = index
@@ -6502,7 +6689,7 @@ mod tests {
             &schema,
             &snapshot,
             ScalarIndexTarget::Auto,
-            &decls,
+            &DerivedKeyDecls::expressions_only(decls.to_vec()),
         )
         .expect("build");
         for decl in &decls {
@@ -6562,7 +6749,7 @@ mod tests {
             &schema,
             &snapshot,
             ScalarIndexTarget::Auto,
-            &decls,
+            &DerivedKeyDecls::expressions_only(decls.to_vec()),
         )
         .expect("column index build must not fail");
         assert!(index.expression_ordered_slots("i_div", 0).is_none());
@@ -6601,7 +6788,7 @@ mod tests {
             &schema,
             &snapshot,
             ScalarIndexTarget::Auto,
-            &[stale, tampered_syntax, non_canonical],
+            &DerivedKeyDecls::expressions_only(vec![stale, tampered_syntax, non_canonical]),
         )
         .expect("build");
         for name in ["i", "j", "k"] {
@@ -6678,11 +6865,222 @@ mod tests {
             &schema,
             &snapshot,
             ScalarIndexTarget::Auto,
-            std::slice::from_ref(&decl),
+            &DerivedKeyDecls::expressions_only(vec![decl.clone()]),
         )
         .expect("build");
         let got = index.expression_ordered_slots("i", 0).expect("key");
         assert_eq!(got.len(), snapshot.arena().len());
         assert_eq!(got.len(), 2);
+    }
+
+    fn partial_decl(
+        schema: &TableSchema,
+        name: &str,
+        predicate: &str,
+        element_exprs: &[&str],
+    ) -> crate::catalog::DeclaredPartialIndex {
+        let preds =
+            crate::sql::allowlist::parse_index_predicate_text(predicate).expect("parse predicate");
+        let bound =
+            crate::sql::index_predicate::bind_index_predicate(&preds, schema).expect("bind");
+        crate::catalog::DeclaredPartialIndex {
+            index_name: name.to_string(),
+            predicate_sql: bound.sql,
+            elements: element_exprs
+                .iter()
+                .map(|e| {
+                    crate::catalog::PartialElementDecl::Expr(expr_decl(schema, name, 0, e).sql)
+                })
+                .collect(),
+        }
+    }
+
+    /// INDEX-11: 部分索引の `members` は「`WHERE <述語>` の全走査が選ぶスロット集合」（オラクル）と完全に
+    /// 一致する。述語外の行（NULL 含む）では式要素を評価しないため、`10 / n` が 0 除算になる行（n = 0）が
+    /// あっても式キーは作られ、述語 TRUE の行だけを含む。
+    #[test]
+    fn partial_index_members_match_the_where_scan_oracle() {
+        let db_path = unique_db_path("partial-members-oracle");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        let values: [Option<i32>; 8] = [
+            Some(1),
+            Some(-2),
+            None,
+            Some(5),
+            Some(0),
+            Some(3),
+            Some(-4),
+            Some(7),
+        ];
+        for (i, n) in values.iter().enumerate() {
+            insert_typed_basic(
+                &storage,
+                &c,
+                i as u64 + 1,
+                *n,
+                None,
+                Some(1),
+                None,
+                Visibility::Public,
+            );
+        }
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let ids = snapshot.arena().ids().to_vec();
+        for predicate in [
+            "n > 0",
+            "n <> 0",
+            "n > 0 OR n < -3",
+            "NOT n > 0",
+            "n IS NULL",
+            "id > 3 AND n > 0",
+        ] {
+            let decl = partial_decl(&schema, "p", predicate, &["10 / n"]);
+            // `n <> 0`・`n > 0` は n = 0 を含まない。`NOT n > 0` と `n IS NULL`、`n > 0 OR n < -3` も同様に
+            // n = 0 の行では式要素を評価するかどうかが述語次第になるため、述語 TRUE の行だけ評価する。
+            let index = ScalarIndex::build_targeted_with_expressions(
+                &schema,
+                &snapshot,
+                ScalarIndexTarget::Auto,
+                &DerivedKeyDecls {
+                    expression_keys: Vec::new(),
+                    partials: vec![decl.clone()],
+                },
+            )
+            .expect("build");
+            let expected: Vec<u32> = ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| {
+                    let n = usize::try_from(**id - 1)
+                        .ok()
+                        .and_then(|i| values.get(i).copied())
+                        .flatten();
+                    match predicate {
+                        "n > 0" => n.is_some_and(|n| n > 0),
+                        "n <> 0" => n.is_some_and(|n| n != 0),
+                        "n > 0 OR n < -3" => n.is_some_and(|n| n > 0 || !(-3..=0).contains(&n)),
+                        "NOT n > 0" => n.is_some_and(|n| n <= 0),
+                        "n IS NULL" => n.is_none(),
+                        _ => **id > 3 && n.is_some_and(|n| n > 0),
+                    }
+                })
+                .map(|(slot, _)| slot as u32)
+                .collect();
+            // 述語 TRUE の行に n = 0 を含む述語（`NOT n > 0`）では `10 / n` が失敗するため、部分索引の
+            // 構造ごと作られない（途中まで作った構造を残さない）。
+            if predicate == "NOT n > 0" {
+                assert!(index.partial_index_members("p").is_none(), "{predicate}");
+                continue;
+            }
+            let members = index
+                .partial_index_members("p")
+                .unwrap_or_else(|| panic!("{predicate}: members must be built"));
+            assert_eq!(members, expected.as_slice(), "{predicate}");
+            // 式キーはメンバーだけで構築される（述語外の n = 0 の行は含まれない）。
+            let key = index
+                .partial_expression_key("p", 0)
+                .unwrap_or_else(|| panic!("{predicate}: element key must be built"));
+            let keyed = key.ordered_slots().expect("ordered");
+            assert!(keyed.iter().all(|s| expected.contains(s)), "{predicate}");
+            assert_eq!(keyed.len(), expected.len(), "{predicate}");
+        }
+    }
+
+    /// fail-soft: 述語の評価エラー・保存テキストの漂流・予算超過では部分索引の構造を丸ごと作らない
+    /// （途中まで作った構造を残さない）。列索引は残り、起動時 opt-in なし（宣言なし）では何も作らない。
+    #[test]
+    fn partial_index_is_all_or_nothing_and_never_blocks_the_column_index() {
+        let db_path = unique_db_path("partial-members-fail-soft");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        for (id, n) in [(1u64, 2), (2, 0), (3, 4)] {
+            insert_typed_basic(
+                &storage,
+                &c,
+                id,
+                Some(n),
+                None,
+                Some(1),
+                None,
+                Visibility::Public,
+            );
+        }
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        // 述語自体が n = 0 で 0 除算になる。
+        let failing = partial_decl(&schema, "p_fail", "10 / n > 1", &[]);
+        // 漂流した保存テキスト。
+        let drifted = crate::catalog::DeclaredPartialIndex {
+            index_name: "p_drift".to_string(),
+            predicate_sql: "no_such_col > 1".to_string(),
+            elements: vec![],
+        };
+        let ok = partial_decl(&schema, "p_ok", "n > 1", &[]);
+        let index = ScalarIndex::build_targeted_with_expressions(
+            &schema,
+            &snapshot,
+            ScalarIndexTarget::Auto,
+            &DerivedKeyDecls {
+                expression_keys: Vec::new(),
+                partials: vec![failing, drifted, ok],
+            },
+        )
+        .expect("column index build must not fail");
+        assert!(index.partial_index_members("p_fail").is_none());
+        assert!(index.partial_index_members("p_drift").is_none());
+        assert_eq!(index.partial_index_members("p_ok"), Some(&[0u32, 2][..]));
+        assert!(index.typed_column_is_indexed(typed_col(&schema, "dt")));
+        // 宣言なしでは何も作らない。
+        let plain = ScalarIndex::build_targeted_with_expressions(
+            &schema,
+            &snapshot,
+            ScalarIndexTarget::Auto,
+            &DerivedKeyDecls::default(),
+        )
+        .expect("build");
+        assert!(plain.partial_index_members("p_ok").is_none());
+    }
+
+    /// 復旧: ストレージを閉じて開き直した後に再構築した部分索引の `members` が、行（オラクル）と一致する。
+    #[test]
+    fn partial_index_members_are_rebuilt_from_rows_after_reopen() {
+        let db_path = unique_db_path("partial-members-reopen");
+        let _guard = CleanupGuard(db_path.clone());
+        {
+            let storage = Storage::open(&db_path).expect("open storage");
+            create_typed_table(&storage);
+            let c = ctx("tenant-a");
+            for (id, n) in [(1u64, 1), (2, -1), (3, 9)] {
+                insert_typed_basic(
+                    &storage,
+                    &c,
+                    id,
+                    Some(n),
+                    None,
+                    Some(1),
+                    None,
+                    Visibility::Public,
+                );
+            }
+        }
+        let storage = Storage::open(&db_path).expect("reopen storage");
+        let c = ctx("tenant-a");
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let decl = partial_decl(&schema, "p", "n > 0", &[]);
+        let index = ScalarIndex::build_targeted_with_expressions(
+            &schema,
+            &snapshot,
+            ScalarIndexTarget::Auto,
+            &DerivedKeyDecls {
+                expression_keys: Vec::new(),
+                partials: vec![decl],
+            },
+        )
+        .expect("build");
+        assert_eq!(index.partial_index_members("p"), Some(&[0u32, 2][..]));
     }
 }

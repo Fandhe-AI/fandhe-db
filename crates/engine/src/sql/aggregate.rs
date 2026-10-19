@@ -3411,7 +3411,7 @@ fn capture_scalar_index_snapshot(
     table: &str,
     expected_dim: u32,
     target: crate::sql::scalar_index::ScalarIndexTarget<'_>,
-    expression_keys: &[crate::catalog::DeclaredExpressionKey],
+    expression_keys: &crate::sql::scalar_index::DerivedKeyDecls,
 ) -> Option<(
     crate::sql::arena_cache::SqlArenaSnapshot,
     crate::sql::scalar_index::ScalarIndex,
@@ -4509,7 +4509,7 @@ mod tests {
                 "docs",
                 expected_dim,
                 crate::sql::scalar_index::ScalarIndexTarget::Auto,
-                &[],
+                &crate::sql::scalar_index::DerivedKeyDecls::default(),
             )
             .is_none(),
             "a generation containing a nullable-VECTOR NULL row must not be captured"
@@ -4541,7 +4541,7 @@ mod tests {
             "docs",
             expected_dim,
             crate::sql::scalar_index::ScalarIndexTarget::Auto,
-            &[],
+            &crate::sql::scalar_index::DerivedKeyDecls::default(),
         )
         .expect("capture should succeed when no row is NULL");
         assert_eq!(snapshot.arena().len(), 2);
@@ -4591,7 +4591,7 @@ mod tests {
                 "docs",
                 expected_dim,
                 crate::sql::scalar_index::ScalarIndexTarget::Auto,
-                &[],
+                &crate::sql::scalar_index::DerivedKeyDecls::default(),
             )
             .expect("initial capture should succeed");
             arena_cache.insert(&storage, "docs", &ctx, snapshot);

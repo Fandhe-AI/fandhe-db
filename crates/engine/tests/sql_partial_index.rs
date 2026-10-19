@@ -1,4 +1,5 @@
-//! 部分索引の宣言側（述語の parser と決定性検査）の結合テスト（INDEX-11、Issue #1653）。
+//! 部分索引の宣言側（述語の parser と決定性検査）と格納・DML 維持の結合テスト（INDEX-11、
+//! Issue #1653・#1654）。
 //! ポインタ: `docs/spec/04-behavior/indexing.md` INDEX-11、
 //! `docs/spec/04-behavior/error-format.md` ERR-6。
 //!
@@ -7,7 +8,10 @@
 //!
 //! - 非決定な述語は `42P17`、集計は `42803`、ウィンドウは `42P20`、部分クエリ・SRF・組み込み以外の
 //!   関数は `0A000`、`visible()` と構文誤りは `42601`、葉数の上限超過は `54000`
-//! - 決定的な述語も、格納が入る Issue #1654 までは最終ゲートの `0A000`（宣言だけ残らない）
+//! - 決定的な述語は書き込みトランザクション内で束縛して正規化テキストを永続化する（Issue #1654）。
+//!   部分 UNIQUE・hnsw・COLLATE・matview との組み合わせは `0A000`（宣言だけ残らない）
+//! - DML は述語を満たす行だけを索引化する（入場・退場）。述語の評価エラーは文を拒否し、述語外の行では
+//!   式要素を評価しない
 //! - 構文段の判定はカタログを参照しない（権限・対象の有無に依存しない）
 //! - 拒否後にカタログ・世代・クエリ結果が変わらず、拒否文言は固定で何も漏らさない
 
@@ -152,30 +156,17 @@ fn predicate_rejections_are_classified_before_the_catalog() {
             "42601",
         ),
         ("CREATE INDEX i ON docs (lang) WHERE lang = $1", "42601"),
-        // 決定的な述語は格納が入るまで最終ゲートの 0A000。
-        ("CREATE INDEX i ON docs (lang) WHERE lang = 'ja'", "0A000"),
-        (
-            "CREATE INDEX i ON docs (lang) WHERE lower(lang) = 'ja'",
-            "0A000",
-        ),
-        (
-            "CREATE INDEX i ON docs (lang) WHERE body IS NOT NULL AND lang IN ('a', 'b')",
-            "0A000",
-        ),
-        (
-            "CREATE INDEX i ON docs (lang) WHERE lang = 'a' OR NOT (body = 'b')",
-            "0A000",
-        ),
-        (
-            "CREATE INDEX i ON docs (lang) WHERE id BETWEEN 1 AND 5",
-            "0A000",
-        ),
+        // 最終ゲートの未対応の組み合わせ（部分 UNIQUE・hnsw・COLLATE）は 0A000。
         (
             "CREATE UNIQUE INDEX i ON docs (lang) WHERE lang = 'ja'",
             "0A000",
         ),
         (
-            "CREATE INDEX i ON docs ((lower(lang))) WHERE lang = 'ja'",
+            "CREATE INDEX i ON docs USING hnsw (embedding) WHERE lang = 'ja'",
+            "0A000",
+        ),
+        (
+            "CREATE INDEX i ON docs (lang COLLATE \"C\") WHERE lang = 'ja'",
             "0A000",
         ),
         // 判定順: 式要素の判定が述語より先。
@@ -224,7 +215,7 @@ fn rejected_partial_index_leaves_no_declaration() {
     let core = core_at(&path);
     let mut s = allowed_session();
     for sql in [
-        "CREATE INDEX i ON docs (lang) WHERE lang = 'ja'",
+        "CREATE INDEX i ON docs (lang) WHERE no_such_col = 'ja'",
         "CREATE INDEX i ON docs (lang) WHERE body < now()",
         "CREATE UNIQUE INDEX i ON docs (lang) WHERE lang = 'ja'",
     ] {
@@ -268,8 +259,8 @@ fn rejection_messages_are_fixed_and_leak_nothing() {
             "feature not supported: cannot use subquery in index predicate",
         ),
         (
-            "CREATE INDEX i ON docs (lang) WHERE lang = 'secret-alice'",
-            "feature not supported: partial indexes are not supported yet",
+            "CREATE UNIQUE INDEX i ON docs (lang) WHERE lang = 'secret-alice'",
+            "feature not supported: partial unique indexes are not supported yet",
         ),
     ] {
         let err = run(&core, &mut s, sql).expect_err(sql);

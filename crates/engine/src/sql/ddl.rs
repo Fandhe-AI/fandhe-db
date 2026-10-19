@@ -2667,12 +2667,17 @@ pub(crate) fn execute_create_index(
             detail: "expression indexes are not supported for this index kind yet".to_string(),
         });
     }
-    // 防御ゲート（INDEX-11、Issue #1653）: 述語付きは構文段の最終ゲートで拒否済みだが、将来の
-    // 経路変更で届いても、述語を黙って落として列だけの索引を保存しない（fail-closed）。
-    // Issue #1654 が述語の格納を実装する際に撤去する。
-    if validated.predicate().is_some() {
+    // 防御ゲート（INDEX-11、Issue #1653・#1654）: 述語付きの未対応の組み合わせ（部分 UNIQUE・hnsw・
+    // COLLATE）は構文段の最終ゲートで拒否済みだが、将来の経路変更で届いても、述語を黙って落として
+    // 列だけの索引を保存しない（fail-closed）。述語そのものは `create_index_bound` が書き込み txn 内で
+    // 束縛して正規化テキストと参照列を確定する。
+    if validated.predicate().is_some()
+        && (validated.is_unique()
+            || validated.is_hnsw()
+            || validated.column_collations().iter().any(Option::is_some))
+    {
         return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "partial indexes are not supported yet".to_string(),
+            detail: "partial indexes are not supported for this index definition yet".to_string(),
         });
     }
     let kind = if validated.is_hnsw() {
@@ -2694,7 +2699,7 @@ pub(crate) fn execute_create_index(
     // 判定し commit・世代 bump の前に返るため、同名があれば定義を比較せず副作用なしで成功にする。
     // 式要素（INDEX-10、Issue #1648）の束縛エラーは `Sql` としてそのまま透過し、カタログ側の
     // 失敗だけを `map_create_index_error` で写像する。
-    match storage.create_index_bound(&def, validated.expression_keys()) {
+    match storage.create_index_bound(&def, validated.expression_keys(), validated.predicate()) {
         Ok(()) => {}
         Err(CreateIndexError::Catalog(CatalogError::IndexAlreadyExists(_)))
             if validated.if_not_exists() => {}
