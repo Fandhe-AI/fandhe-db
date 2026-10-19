@@ -262,7 +262,7 @@ CACHE は引き続き `0A000` で、内部の値は 1 固定のまま。永続�
 - 受理: INSERT の `VALUES` 要素と列 DEFAULT の単独形 `nextval('<名前>')`・`currval('<名前>')`（`currval` は VALUES のみ）。名前は文字列リテラル（regclass 相当）で、大文字小文字は保持する
 - `0A000`: 修飾名・引用付きの名前（#1717）、SELECT 投影・WHERE・UPDATE SET・ビュー本文などの式位置（書き込み txn を伴う読み取り文の経路が無い。#1691 の `lastval` と合わせて判断する）、UPSERT・COPY・ファイル形 INSERT・分割実行、DEFAULT の `currval`
 - 合成式（`nextval('s') + 1` 等）は単独形にならず従来の定数式経路で拒否される。`nextval`／`currval` は UDF 名として予約する
-- `ALTER SEQUENCE` の commit 後は `SequenceAllocator::evict` で当該 SEQUENCE の現在値を全テナント分捨てる（base 取り込み時に #1689 の結線点へ接続）
+- `ALTER SEQUENCE` の commit 後の `SequenceAllocator::evict`（当該 SEQUENCE の現在値を全テナント分破棄）は `RESTART` を含むときだけ行う。それ以外のオプション変更（INCREMENT・MIN・MAX・CYCLE 等）は現在値を保持する。破棄すると ROLLBACK 済みで消費された値を再払い出ししうるため。破棄は commit 直後に writer permit を保持したまま行う
 
 ## 9. Issue #1689 実装記録（ALTER SEQUENCE）
 
@@ -285,7 +285,7 @@ CACHE は引き続き `0A000` で、内部の値は 1 固定のまま。永続�
 ### 9.3 #1690 への申し送り
 
 - 状態行の値の形式は #1690 が決める。呼び出し元テナントの状態行を読むフック `caller_current_value_in_txn` は、行が存在する間は形式が未確定のため `CorruptSchema` で拒否する。#1690 は状態の decode へ置き換える。置き換えを忘れても ALTER が拒否側に倒れるだけで、黙って検査が飛ぶことはない
-- ALTER の commit 後の結線点 `on_sequence_altered` は空。#1690 のプロセス内アロケータ（D4）は、ここで該当 `sequence_id` のエントリを全テナント分破棄する。RESTART だけでなく INCREMENT・MIN・MAX・CYCLE の変更も次の値に影響する
+- ALTER の commit 後の結線点 `on_sequence_altered` は空。#1690 のプロセス内アロケータ（D4）は、ここで該当 `sequence_id` のエントリを全テナント分破棄する。破棄の対象は RESTART のみで、INCREMENT・MIN・MAX・CYCLE の変更では現在値を保持する（実装は §8.6 を参照）
 - 受け入れ条件「変更後の nextval が PG 17 と同じ値」は nextval の着地後に SQL 水準で検証する。期待値の表は `tests/table24_alter_sequence.rs` の冒頭にある。本 Issue では Storage 水準で格納値（`restart_value`・params・状態行の削除）を検証した
 - #1689 と #1690 のどちらかが先にマージされた場合、後の側が rebase で上記を統合する
 
