@@ -61,6 +61,11 @@ pub enum ScalarPlan {
     IndexInList,
     /// 索引対応述語が 2 件以上（交差が必要）。
     IndexConjunction,
+    /// 通常の分類が [`Self::PlainScan`] のクエリで、`WHERE` が部分索引の述語を含意する
+    /// （INDEX-11、Issue #1656）。部分索引の格納行（Q の上位集合）で候補を絞り、残りの述語は
+    /// 必ず再評価する。`classify_scalar_plan*` は返さず、`sql::exec` と EXPLAIN が
+    /// `sql::index_implication::implied_partial_index_names` の結果から付与する。
+    IndexPartial,
 }
 
 /// [`classify_scalar_plan`] の入力。`sql::exec`・`sql::using_plan::

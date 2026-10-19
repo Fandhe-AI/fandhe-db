@@ -761,14 +761,14 @@ pub(crate) struct ScalarIndex {
     expression_keys: Vec<crate::sql::expression_key_index::ExpressionKeyIndex>,
     /// 部分索引の派生キー（INDEX-11、Issue #1654）。述語 TRUE のスロット集合と、式要素のキー
     /// （その集合だけで構築）を持つ。作れなかった部分索引は含まれない（fail-soft。
-    /// [`Self::attach_partial_indexes`]）。プランナ選択（#1656）まで消費者はテストだけ。
+    /// [`Self::attach_partial_indexes`]）。消費者は [`Self::resolve_partial_candidates`]（プランナ選択、Issue #1656）とテスト。
     partial_indexes: Vec<PartialIndexEntries>,
 }
 
 /// 部分索引 1 本の派生キー（INDEX-11、Issue #1654）。`members` が「索引に格納された行」（述語が TRUE の
 /// スロット。昇順・重複なし）を表す。索引化はコミット済みの行からテーブル世代ごとに作り直すため、
 /// UPDATE による入場・退場は次の再構築で反映される。素の列要素のキー構造は本 Issue では作らない
-/// （列索引との交差か専用キーかはプランナ選択〔#1656〕の判断）。
+/// （#1656 のプランナ選択も `members` だけで絞り、専用キーは作らない）。
 #[derive(Debug)]
 pub(crate) struct PartialIndexEntries {
     index_name: String,
@@ -1241,6 +1241,39 @@ pub(crate) fn resolve_expression_matcher_in_txn(
         return crate::sql::expression_key_index::ExpressionIndexMatcher::empty();
     }
     resolve_expression_matcher_for_table_in_txn(read_txn, table, schema)
+}
+
+/// クエリの `WHERE` が含意する述語を持つ部分索引の名前（昇順・重複なし）を、クエリと同一の
+/// `read_txn` から解決する（INDEX-11、Issue #1656）。`sql::exec` の候補解決の入口。
+///
+/// 空（＝部分索引なし。従来どおりの全走査）を返す場合: `declarations_enabled == false`・部分索引の
+/// 宣言なし・どの述語も含意されない・カタログ読み取り失敗（fail-closed。索引を使わないだけで
+/// クエリは失敗しない）。呼び出し側は通常の分類が `PlainScan` のクエリだけで呼ぶ（カタログ読み取りの
+/// 費用を通常の索引経路に払わせない）。
+pub(crate) fn resolve_implied_partial_indexes_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    schema: &TableSchema,
+    declarations_enabled: bool,
+    query: (
+        &[MetadataFilter],
+        &[crate::sql::udf_call::BoundExpr],
+        &[crate::sql::where_tree::BoundOrGroup],
+    ),
+) -> Vec<String> {
+    if !declarations_enabled {
+        return Vec::new();
+    }
+    match crate::catalog::declared_index_targets_in_txn(read_txn, table) {
+        Ok(targets) => crate::sql::index_implication::implied_partial_index_names(
+            schema,
+            &targets.partial_indexes,
+            query.0,
+            query.1,
+            query.2,
+        ),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// [`resolve_expression_matcher_in_txn`] の構造フィルタ・opt-in 判定を呼び出し元が済ませている版
@@ -2203,12 +2236,62 @@ impl ScalarIndex {
     }
 
     /// 部分索引 `index_name` の格納行（述語 TRUE のスロット。昇順）。作れていなければ `None`。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn partial_index_members(&self, index_name: &str) -> Option<&[u32]> {
         self.partial_indexes
             .iter()
             .find(|p| p.index_name == index_name)
             .map(|p| p.members.as_slice())
+    }
+
+    /// 含意された部分索引 `names` のうち構築済みのものの格納行を昇順で交差し、候補とする
+    /// （INDEX-11、Issue #1656）。含意された索引の `members` はどれも Q に一致する行の上位集合
+    /// なので、交差しても上位集合のままで健全（呼び出し側は残りの述語を必ず再評価する。
+    /// 候補を「一致集合」として信頼してはならない）。未構築（fail-soft で捨てられた）索引は
+    /// 飛ばし、構築済みが 1 本もなければ `FallbackNoIndex`。結果は既存と同じ選択度ゲートに通す。
+    pub(crate) fn resolve_partial_candidates(&self, names: &[String]) -> CandidateResolution {
+        let mut accumulated: Option<Vec<u32>> = None;
+        for name in names {
+            let Some(members) = self.partial_index_members(name) else {
+                continue;
+            };
+            accumulated = Some(match accumulated {
+                None => {
+                    let mut copy: Vec<u32> = Vec::new();
+                    if copy.try_reserve_exact(members.len()).is_err() {
+                        return CandidateResolution::FallbackNoIndex;
+                    }
+                    copy.extend_from_slice(members);
+                    copy
+                }
+                Some(acc) => match intersect_sorted(&acc, members) {
+                    Some(v) => v,
+                    None => return CandidateResolution::FallbackNoIndex,
+                },
+            });
+        }
+        let Some(intersected) = accumulated else {
+            return CandidateResolution::FallbackNoIndex;
+        };
+        if self.exceeds_full_scan_ratio(intersected.len()) {
+            return CandidateResolution::FallbackSelectivity;
+        }
+        CandidateResolution::Use(intersected)
+    }
+
+    /// 候補数 `hits` が選択度切替閾値を超える（全走査が有利）か。判定不能（桁あふれ）は
+    /// 保守的に超過扱い。
+    fn exceeds_full_scan_ratio(&self, hits: usize) -> bool {
+        let hits = hits as u64;
+        let row_count = self.row_count as u64;
+        match hits.checked_mul(DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_DENOMINATOR) {
+            Some(lhs) => {
+                match row_count.checked_mul(DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_NUMERATOR) {
+                    Some(rhs) => lhs > rhs,
+                    None => true,
+                }
+            }
+            None => true,
+        }
     }
 
     /// 部分索引 `index_name` の `element` 番目の式キー（述語 TRUE の行だけで構築。無ければ `None`）。
@@ -7045,6 +7128,76 @@ mod tests {
         )
         .expect("build");
         assert!(plain.partial_index_members("p_ok").is_none());
+    }
+
+    /// 含意された部分索引の候補（Issue #1656）: 構築済みの格納行を昇順で交差し、未構築は飛ばし、
+    /// 構築済みが無ければ `FallbackNoIndex`、交差が選択度ゲートを超えれば `FallbackSelectivity`。
+    #[test]
+    fn resolve_partial_candidates_intersects_built_indexes_only() {
+        let db_path = unique_db_path("partial-candidates");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        for (id, n) in [
+            (1u64, 2),
+            (2, 0),
+            (3, 4),
+            (4, 5),
+            (5, 0),
+            (6, 0),
+            (7, 0),
+            (8, 0),
+        ] {
+            insert_typed_basic(
+                &storage,
+                &c,
+                id,
+                Some(n),
+                None,
+                Some(1),
+                None,
+                Visibility::Public,
+            );
+        }
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let index = ScalarIndex::build_targeted_with_expressions(
+            &schema,
+            &snapshot,
+            ScalarIndexTarget::Auto,
+            &DerivedKeyDecls {
+                expression_keys: Vec::new(),
+                partials: vec![
+                    partial_decl(&schema, "p_a", "n > 1", &[]),
+                    partial_decl(&schema, "p_b", "n > 3", &[]),
+                    // 述語が 0 除算になり構築されない。
+                    partial_decl(&schema, "p_fail", "10 / n > 1", &[]),
+                    partial_decl(&schema, "p_all", "n > -1", &[]),
+                ],
+            },
+        )
+        .expect("build");
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        match index.resolve_partial_candidates(&names(&["p_a", "p_b", "p_fail"])) {
+            CandidateResolution::Use(slots) => assert_eq!(slots, vec![2u32, 3]),
+            _ => panic!("expected the intersection of the built members"),
+        }
+        match index.resolve_partial_candidates(&names(&["p_a"])) {
+            CandidateResolution::Use(slots) => assert_eq!(slots, vec![0u32, 2, 3]),
+            _ => panic!("expected the single index members"),
+        }
+        assert!(matches!(
+            index.resolve_partial_candidates(&names(&["p_fail", "missing"])),
+            CandidateResolution::FallbackNoIndex
+        ));
+        assert!(matches!(
+            index.resolve_partial_candidates(&[]),
+            CandidateResolution::FallbackNoIndex
+        ));
+        assert!(matches!(
+            index.resolve_partial_candidates(&names(&["p_all"])),
+            CandidateResolution::FallbackSelectivity
+        ));
     }
 
     /// 復旧: ストレージを閉じて開き直した後に再構築した部分索引の `members` が、行（オラクル）と一致する。

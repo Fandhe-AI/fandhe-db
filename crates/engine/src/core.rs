@@ -8199,6 +8199,20 @@ impl EngineCore {
                 &post_check_schema,
                 &target,
             );
+        // INDEX-11（Issue #1656）: 通常の分類（式索引の一致後・宣言補正の前）が `PlainScan` のとき、
+        // 実行時（`sql::exec`）と同じ選択関数で部分索引の含意を判定する。含意されれば `index_partial`。
+        let partial_index_names = if self.hnsw_state.is_some()
+            && explain_scalar_plan == crate::sql::scalar_plan::ScalarPlan::PlainScan
+        {
+            explain_shape.implied_partial_indexes(&post_check_txn, table, &post_check_schema)
+        } else {
+            Vec::new()
+        };
+        let scalar_plan_with_reason = if partial_index_names.is_empty() {
+            scalar_plan_with_reason
+        } else {
+            (crate::sql::scalar_plan::ScalarPlan::IndexPartial, None)
+        };
         let (explain_engine, index_names) = self.explain_engine_for(
             &post_check_txn,
             table,
@@ -8220,6 +8234,7 @@ impl EngineCore {
             scalar_plan_with_reason.1,
             scalar_filter_column_names.as_deref(),
             &expression_index_names,
+            &partial_index_names,
         );
         drop(post_check_txn);
         Ok(crate::sql::explain::build_explain_result_with_indexes(
@@ -8305,6 +8320,7 @@ impl EngineCore {
         scalar_fallback: Option<crate::sql::scalar_index::ScalarFallbackReason>,
         scalar_filter_columns: Option<&[&str]>,
         expression_index_names: &[String],
+        partial_index_names: &[String],
     ) -> (
         crate::sql::explain::ExplainEngine,
         crate::sql::explain::ExplainIndexNames,
@@ -8376,8 +8392,14 @@ impl EngineCore {
         // ときは従来どおり名前を出さない。索引カタログの読み取り（列被覆の判定用）が要るのは
         // 列述語があるときだけ。
         let scalar_columns_nonempty = scalar_filter_columns.is_some_and(|cols| !cols.is_empty());
+        // 部分索引（`IndexPartial`。Issue #1656）の名前は呼び出し元が含意判定で確定済み。列被覆の
+        // 判定（`scalar_index_names_with_expressions`）は通さない（部分索引は被覆の候補から除外）。
         let scalar_names_eligible = declarations_enabled
-            && !matches!(scalar_plan, crate::sql::scalar_plan::ScalarPlan::PlainScan)
+            && !matches!(
+                scalar_plan,
+                crate::sql::scalar_plan::ScalarPlan::PlainScan
+                    | crate::sql::scalar_plan::ScalarPlan::IndexPartial
+            )
             && scalar_filter_columns.is_some()
             && (scalar_columns_nonempty || !expression_index_names.is_empty());
         let index_decls = if declarations_enabled
@@ -8404,6 +8426,11 @@ impl EngineCore {
         // （`docs/design/explain-search-engine-exposure.md`「決定 1」節）を
         // 優先し、意図的に静的判定のみを報告する。
         let scalar_names = match scalar_filter_columns {
+            _ if declarations_enabled
+                && scalar_plan == crate::sql::scalar_plan::ScalarPlan::IndexPartial =>
+            {
+                partial_index_names.to_vec()
+            }
             Some(cols) if scalar_names_eligible => scalar_index_names_with_expressions(
                 index_decls.as_ref().map(|decls| decls.scalar.as_slice()),
                 cols,
@@ -8560,6 +8587,32 @@ impl EngineCore {
                 schema,
                 &target,
             );
+        // INDEX-11（Issue #1656）: 通常の分類（宣言補正の前）が `PlainScan` で `WHERE` が部分索引の述語を
+        // 含意するとき、`sql::exec` と同じ選択関数の結果を `index_partial` として表示する。
+        let partial_index_names = if self.hnsw_state.is_some()
+            && scalar_prefilter
+            && bound.has_where_filters()
+            && scalar_plan_before_target == crate::sql::scalar_plan::ScalarPlan::PlainScan
+        {
+            crate::sql::scalar_index::resolve_implied_partial_indexes_in_txn(
+                read_txn,
+                bound.table(),
+                schema,
+                true,
+                (
+                    bound.metadata_filters(),
+                    bound.expr_filters(),
+                    bound.or_filters(),
+                ),
+            )
+        } else {
+            Vec::new()
+        };
+        let (scalar_plan, scalar_fallback) = if partial_index_names.is_empty() {
+            (scalar_plan, scalar_fallback)
+        } else {
+            (crate::sql::scalar_plan::ScalarPlan::IndexPartial, None)
+        };
         let (engine, index_names) = self.explain_engine_for(
             read_txn,
             bound.table(),
@@ -8571,6 +8624,7 @@ impl EngineCore {
             scalar_fallback,
             scalar_filter_column_names.as_deref(),
             &expression_index_names,
+            &partial_index_names,
         );
         crate::sql::explain::build_search_explain_result(bound.mode(), &engine, &index_names)
     }

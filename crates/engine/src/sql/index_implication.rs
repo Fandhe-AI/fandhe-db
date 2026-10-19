@@ -5,9 +5,9 @@
 //!   証明する純関数 [`query_implies_partial_predicate`] を提供する。証明できれば部分索引へ入っている
 //!   行だけを見れば Q の結果が欠けない。証明できないまま索引を使うと述語外の行が結果から落ちる
 //!   （fail-open）ため、判定は常に「含意しない」側へ倒す（偽陽性なし）。
-//! - プランナ（Issue #1656）が部分索引の選択前に呼ぶ想定で、現時点では呼び出し元はテストのみ
-//!   （そのため入口に `dead_code` 許可を付けている。#1656 で外す）。行・カタログ・他テナントの
-//!   データは読まず、束縛済みの述語だけを入力とする。RLS（`visible()`）は判定に関与しない。
+//! - プランナ（Issue #1656）が部分索引の選択前に呼ぶ。選択の入口は [`implied_partial_index_names`]
+//!   （`sql::exec` の候補解決と `core` の EXPLAIN が共有する唯一の選択関数）。行・カタログ・他
+//!   テナントのデータは読まず、束縛済みの述語だけを入力とする。RLS（`visible()`）は判定に関与しない。
 //! - 判定は束縛済み表現（[`MetadataFilter`]・[`BoundExpr`]・[`BoundOrGroup`]）の上で行う。両辺とも
 //!   `sql::parser::bind_where_predicates` を通るため、列添字・型付きリテラル・書き換えが一致し、
 //!   評価器（`BoundOrGroup::matches`）との意味論のずれが生じない。
@@ -525,7 +525,6 @@ fn implies_with_budget(
 /// ことを保守的に判定する。`true` のときだけ部分索引を使える。判定できない形・予算超過・未認識の
 /// P の項はすべて `false`。両辺を同じスキーマ世代で束縛し、プリペアド文は具体値で束縛し直してから
 /// 呼ぶこと（Issue #1656 のプランナが呼ぶ契約）。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn query_implies_partial_predicate(
     query_metadata: &[MetadataFilter],
     query_exprs: &[BoundExpr],
@@ -541,6 +540,51 @@ pub(crate) fn query_implies_partial_predicate(
         schema,
         MAX_IMPLICATION_STEPS,
     )
+}
+
+/// クエリの `WHERE`（Q）が含意する述語を持つ部分索引の名前を、昇順・重複なしで返す（INDEX-11、
+/// Issue #1656）。`sql::exec`（実行時の候補解決）と `core` の EXPLAIN が共有する唯一の選択関数で、
+/// 行数・格納行数などデータに依存しない静的判定のため両者の結果は一致する。
+///
+/// 保存済みの述語テキストは untrusted として再束縛し、往復一致しない宣言・単一分岐でない宣言・
+/// 再束縛に失敗した宣言は含意しない扱い（結果に含めない。fail-closed）。含意される索引の
+/// `members` はどれも Q に一致する行の上位集合になるため、交差しても上位集合のままで健全
+/// （残りの述語は呼び出し側が `on_visible_row` で必ず再評価する）。
+pub(crate) fn implied_partial_index_names(
+    schema: &TableSchema,
+    decls: &[crate::catalog::DeclaredPartialIndex],
+    query_metadata: &[MetadataFilter],
+    query_exprs: &[BoundExpr],
+    query_or_groups: &[BoundOrGroup],
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for decl in decls {
+        let Ok(bound) = crate::sql::index_predicate::rebind_stored_index_predicate(
+            &decl.predicate_sql,
+            schema,
+            None,
+        ) else {
+            continue;
+        };
+        if bound.sql != decl.predicate_sql {
+            continue;
+        }
+        let Some(conj) = bound.conjunction() else {
+            continue;
+        };
+        if query_implies_partial_predicate(
+            query_metadata,
+            query_exprs,
+            query_or_groups,
+            conj,
+            schema,
+        ) {
+            names.push(decl.index_name.clone());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 #[cfg(test)]

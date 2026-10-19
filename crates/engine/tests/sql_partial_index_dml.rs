@@ -10,7 +10,8 @@
 //! - DML は述語を満たす行だけを索引化する。述語外の行では式要素を評価せず（退場・入場）、述語の評価
 //!   エラーは `22012` で文を拒否して副作用を残さない
 //! - `CREATE INDEX` は保存前に既存行（他テナント・不可視行を含む）を検証し、応答は何も漏らさない
-//! - 部分索引はプランナ選択（Issue #1656）まで結果・EXPLAIN に影響しない
+//! - 部分索引は述語を含意しないクエリ・広域取得の結果と EXPLAIN に影響しない（含意するクエリの選択は
+//!   `partial_index_planner.rs`、Issue #1656）
 //! - 列 DDL（`DROP`・`RENAME`・`ALTER TYPE`）と表 DDL（改名・`DROP TABLE`）への追随
 //!
 //! クラッシュ整合は `examples/crash_tool_unique_index.rs`（`make crash-test-unique-index`）が担う。
@@ -448,9 +449,10 @@ fn dml_gate_does_not_touch_other_tenants() {
     insert(&core, &mut s, 1, 4, "op-alice").expect("alice writes are unaffected");
 }
 
-/// 部分索引は #1656 までプランナから見えない。結果集合が索引の有無で変わらず、EXPLAIN に名前が出ない。
+/// 述語を含意しないクエリ（`n >= 0` は `n > 1` を含意しない）では、部分索引の有無で結果集合が変わらず、
+/// EXPLAIN に名前が出ない（含意するクエリの選択と表示は `partial_index_planner.rs`、Issue #1656）。
 #[test]
-fn partial_index_is_invisible_to_the_planner() {
+fn partial_index_is_invisible_to_non_implying_queries() {
     let (_path, _guard, core, mut s) = xt_fixture("partial-index-planner");
     for (id, n) in [(1u64, 1i64), (2, 2), (3, 3), (4, 0)] {
         insert(&core, &mut s, id, n, &format!("op-{id}")).expect("row");

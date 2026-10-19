@@ -23,11 +23,18 @@
   （NULL・FALSE の行は索引外。述語の評価エラーは文を拒否し、`CREATE INDEX` は既存行を全件検証する）。
   `UNIQUE`・`USING hnsw`・`COLLATE`・マテリアライズドビューとの組み合わせは引き続き `0A000`。参照列の
   `DROP COLUMN` は部分索引を連鎖削除し、`RENAME COLUMN` は述語を追随させ、述語・要素が参照する列の
-  `ALTER COLUMN TYPE` は `0A000`。部分索引はプランナ選択（#1656）まで結果・`EXPLAIN` に影響しない。
+  `ALTER COLUMN TYPE` は `0A000`。部分索引のプランナ選択と `EXPLAIN` への表示は #1656（下記）で結線した。
   公開 API は `IndexDef.predicate`（pub フィールド追加）・`IndexPredicateDef`・`IndexDef::with_predicate`・
   `IndexDef::has_predicate` の追加。述語付きの宣言のカタログ形式は新版 `v6`（`v1`〜`v5` のバイト列は不変。旧バイナリは
   `v6` を読めない）。公開の `Storage::create_index` は述語付きの `IndexDef` を `Invalid` で拒否する
   （SQL 表層のみが作成できる）。
+- 部分索引のプランナ選択と EXPLAIN 表示（Issue #1656・INDEX-11・INDEX-7）: 起動時 opt-in 済みのエンジンで、
+  通常の分類が全走査になる検索 SELECT のうち、`WHERE` が部分索引の述語を含意すると保守的に証明できるものは、
+  部分索引の格納行で候補を絞る（残りの述語は必ず再評価する。信頼マスク経路には入れない）。証明できない・
+  未構築・選択度超過・カタログ読み取り失敗はこれまでどおり全走査で、結果と RLS の契約は索引の有無で変わらない。
+  `EXPLAIN` の `scalar_plan:` 行に新しい語彙 `index_partial` を追加し、含意された部分索引の名前を
+  `index=<名前>[,<名前>...]`（昇順）で示す（クライアントから見える出力の語彙が増える）。公開 API は
+  `ScalarPlan::IndexPartial` の追加（`#[non_exhaustive]`）。集計・`GROUP BY`・広域取得は部分索引を使わない。
 - 式索引の UNIQUE と失効管理（Issue #1651・INDEX-9・INDEX-10）: 従来 `0A000` だった
   `CREATE UNIQUE INDEX ... ((<式>))`（列要素との複合を含む）を受理し、式の値の一意性を全書き込み経路で
   `23505` により強制する（NULL は重複しない・テナントごとに独立・不可視行とも衝突）。作成時に既存行へ
