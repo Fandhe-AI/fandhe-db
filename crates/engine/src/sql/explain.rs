@@ -206,7 +206,7 @@ fn normalize_index_names(mut names: Vec<String>) -> Vec<String> {
 /// `post_check_txn` から解決した索引宣言（[`crate::sql::scalar_index::
 /// ScalarIndexTargetOwned`]）と突き合わせて `scalar_plan:` 表示を補正する
 /// （[`crate::sql::scalar_index::scalar_plan_under_target`]）ために使う。
-/// `Copy`（`ExplainShape` 自体が `Copy` の契約を保つため）な固定長ビット集合
+/// `Copy` な固定長ビット集合
 /// （`[u64; FILTER_COLS_WORDS]`。`catalog::MAX_COLUMN_COUNT` 列分）で表現し、無制限 `Vec` 確保を避ける
 /// （`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」）。
 /// 上限は [`crate::declarative_filter::MAX_METADATA_FILTERS`]
@@ -282,7 +282,7 @@ impl FilterColumnSet {
 }
 
 /// 述語が TEXT 系列の辞書をどう使うかの列集合（Issue #2191）。`USING PLAN` の EXPLAIN は
-/// 束縛結果を [`Copy`] の [`ExplainShape`] に畳み、世代照合後のカタログ照会で索引の照合が確定
+/// 束縛結果を [`ExplainShape`] に畳み、世代照合後のカタログ照会で索引の照合が確定
 /// してから照合込みの使用可否を判定するため、ここへ覚えておく。式レーンの `=` 比較は比較の
 /// 照合ごとに別の集合へ入れる（`C`／`POSIX` 系・`und-x-icu`・`ja-x-icu`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,11 +411,22 @@ pub(crate) fn text_predicate_uses(
     TextUseSets::from_filters(filters, exprs).uses()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `EXPLAIN` が `WHERE` の束縛結果から畳む静的な形状（`scalar_plan:` 行・`ann_plan:` 行の入力）。
+///
+/// INDEX-10（Issue #1650）: 束縛時（`pre_check`）は索引カタログを読めないため、式索引の式一致は
+/// 世代照合後に `core.rs::EngineCore::run_explain_plan` が [`Self::resolve_expressions`] で確定する。
+/// そのため式候補の述語（`expr_pending`）を複製して持ち、`Copy` ではない（NoSQL 表層の `bind`
+/// closure が組み立てる値でも SQL と同じ表示になる）。
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ExplainShape {
     filters_empty: bool,
     scalar_plan: ScalarPlan,
+    /// 式索引の式候補（`<式> op <リテラル>` で狭義の形でないもの）。分類で唯一の障害が「式索引との
+    /// 一致が未確定」だったときだけ保持する（空なら式索引は計画に影響しない）。
+    expr_pending: Vec<BoundExpr>,
+    /// `expr_pending` の全件が式索引と一致した場合の `scalar_plan:` の分類。
+    scalar_plan_if_matched: ScalarPlan,
     /// Issue #1066: `metadata_filters` が参照する列インデックス
     /// （[`crate::declarative_filter::MetadataFilter::column_index`]。
     /// 束縛時スキーマの `columns` 添字と同一空間）の集合を、[`Copy`] を保った
@@ -476,12 +487,24 @@ impl ExplainShape {
         expr_filters: &[BoundExpr],
         or_filters: &[crate::sql::where_tree::BoundOrGroup],
     ) -> Self {
-        let scalar_plan = classify_scalar_plan(&ScalarShapeInput {
+        let shape_input = ScalarShapeInput {
             scalar_prefilter: true,
             metadata_filters,
             expr_filters,
             or_filters,
-        });
+        };
+        let scalar_plan = classify_scalar_plan(&shape_input);
+        // 式候補の全件が一致したと仮定した分類（一致判定は世代照合後。`resolve_expressions`）。
+        // 候補が分類を変えうるときだけ（仮定した分類が現行と異なるとき）保留する。
+        let scalar_plan_if_matched = crate::sql::scalar_plan::classify_scalar_plan_with(
+            &shape_input,
+            &|_: &BoundExpr, _| Some(crate::sql::expression_key_index::ExprMatchRef::default()),
+        );
+        let expr_pending = if scalar_plan_if_matched == scalar_plan {
+            Vec::new()
+        } else {
+            crate::sql::scalar_plan::expression_candidate_filters(expr_filters)
+        };
         let mut filter_cols = [0u64; FILTER_COLS_WORDS];
         let mut filter_cols_overflow = false;
         for f in metadata_filters {
@@ -501,6 +524,8 @@ impl ExplainShape {
                 && expr_filters.is_empty()
                 && or_filters.is_empty(),
             scalar_plan,
+            expr_pending,
+            scalar_plan_if_matched,
             filter_cols,
             filter_cols_overflow,
             filter_columns: FilterColumnSet::from_filters(metadata_filters, expr_filters),
@@ -531,9 +556,34 @@ impl ExplainShape {
         self.filter_columns.resolved_column_indices()
     }
 
-    /// `scalar_plan:` 行（Issue #474）が要求する静的判定。
+    /// `scalar_plan:` 行（Issue #474）が要求する静的判定。式索引の一致は含まない（式候補は
+    /// 残余述語として `PlainScan` 側に倒れる）。式索引込みの値は [`Self::resolve_expressions`]。
     pub fn scalar_plan(&self) -> ScalarPlan {
         self.scalar_plan
+    }
+
+    /// 式索引の一致の確定が分類を左右するか（`resolve_expressions` に宣言を渡す必要があるか）。
+    /// 偽ならカタログを読まずに済む（通常のクエリにコストを払わせない）。
+    pub(crate) fn needs_expression_matcher(&self) -> bool {
+        !self.expr_pending.is_empty()
+    }
+
+    /// 式索引の宣言（`matcher`。世代照合後の `post_check_txn` から解決した値）で式候補の一致を確定し、
+    /// `scalar_plan:` の分類と一致した式索引の名前（昇順・重複なし）を返す（INDEX-10、Issue #1650）。
+    /// 実行時（`sql::exec` 等）と同じ一致判定（`ExpressionIndexMatcher::find`）・同じ分類関数の結果と
+    /// 一致する。1 件でも一致しない式候補があれば `(PlainScan, 空)`（残余述語＝全走査）。
+    pub(crate) fn resolve_expressions(
+        &self,
+        matcher: &crate::sql::expression_key_index::ExpressionIndexMatcher,
+    ) -> (ScalarPlan, Vec<String>) {
+        if self.expr_pending.is_empty() {
+            return (self.scalar_plan, Vec::new());
+        }
+        let finder = |e: &BoundExpr, ty| matcher.find(e, ty);
+        match crate::sql::scalar_plan::matched_expression_index_names(&self.expr_pending, &finder) {
+            Some(names) => (self.scalar_plan_if_matched, names),
+            None => (ScalarPlan::PlainScan, Vec::new()),
+        }
     }
 
     /// Issue #1066: `metadata_filters` と式述語の数値列（#1413）が参照した列インデックスの列挙

@@ -12,8 +12,13 @@
 //! - fail-soft かつ「狭めるだけ」: 再束縛の失敗・1 行でも式の評価エラー・非有限の `f64`・予算超過・
 //!   確保失敗のいずれでも、その式キーだけを作らない（部分的な索引は作らない）。既存の列索引や
 //!   クエリの成否・結果には影響しない（多層防御。通常は下記の DML ゲートで起こらない）。
-//!   現時点の消費者はテスト（順序付き走査 API）だけで、プランナ選択・EXPLAIN 表示は後続
-//!   Issue #1650〜#1651 の責務。
+//!   消費者は 2 つ: WHERE の式述語を候補スロットへ写す [`ExpressionKeyIndex::candidates_for_comparison`]
+//!   （Issue #1650。`sql::scalar_index::ScalarIndex::resolve_candidates` が呼ぶ）と、テストの順序付き
+//!   走査 API。ORDER BY の式一致による索引順走査と UNIQUE・失効の追随は後続 Issue の責務。
+//! - プランナ選択（Issue #1650）: [`ExpressionIndexMatcher`] が保存済み宣言を再束縛した式木を持ち、
+//!   WHERE 側の束縛済み式木と構造一致した述語だけを索引対応にする。分類（`sql::scalar_plan`）・
+//!   実行（`sql::exec` 等）・EXPLAIN（`core.rs`）が同じ一致判定 [`ExpressionIndexMatcher::find`] を
+//!   通る単一情報源にする。
 //! - DML 維持（Issue #1649）: 式キー索引はコミット済みの行からテーブル世代ごとに作り直す派生物
 //!   なので、維持の本体は「全行で式が評価でき索引化できる」不変条件の強制になる。
 //!   [`CompiledIndexExpressions`] が `constraint::enforce_row_constraints_in_txn`（全書き込み経路の
@@ -27,8 +32,9 @@ use crate::catalog::{DeclaredExpressionKey, TableSchema};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::arena_cache::SqlArenaSnapshot;
 use crate::sql::scalar_index::ScalarIndexBuildError;
-use crate::sql::udf_call::{ExprType, ExprValue};
+use crate::sql::udf_call::{BinOp, BoundExpr, ExprType, ExprValue};
 use crate::tenant::TenantWriteError;
+use std::ops::Bound;
 
 /// 式の結果値 1 個を索引キーへ分類した結果（構築側と DML ゲートで共有する）。
 #[derive(Debug, PartialEq, Eq)]
@@ -202,6 +208,9 @@ pub(crate) enum ExpressionKeys {
 pub(crate) struct ExpressionKeyIndex {
     index_name: String,
     element: usize,
+    /// 式の結果型（時間型の `DATE`／`TIMESTAMP` 等をリテラルの種類と突き合わせるため、
+    /// `keys` の variant だけでは区別できない型をここで保持する）。
+    ty: ExprType,
     keys: ExpressionKeys,
     /// 式が NULL を返したスロット（昇順）。
     null_slots: Vec<u32>,
@@ -350,6 +359,7 @@ impl ExpressionKeyIndex {
         Ok(Self {
             index_name: decl.index_name.clone(),
             element: decl.element,
+            ty: bound.ty,
             keys,
             null_slots,
         })
@@ -391,7 +401,6 @@ impl ExpressionKeyIndex {
     }
 
     /// `TEXT` 結果の範囲照会（`[lower, upper]`。結果はスロット昇順）。結果型が `TEXT` でなければ `None`。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn range_slots_bytes(
         &self,
         lower: std::ops::Bound<&[u8]>,
@@ -406,7 +415,6 @@ impl ExpressionKeyIndex {
     }
 
     /// `DATE`／`TIMESTAMP`／`TIME`／`TIMESTAMPTZ` 結果の範囲照会。結果型が一致しなければ `None`。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn range_slots_i64(
         &self,
         lower: std::ops::Bound<i64>,
@@ -420,13 +428,11 @@ impl ExpressionKeyIndex {
 
     /// 数値結果の範囲照会（境界は有限の `f64`。`-0.0` は `+0.0` として扱う）。結果型が一致しなければ
     /// `None`。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn range_slots_f64(
         &self,
         lower: std::ops::Bound<f64>,
         upper: std::ops::Bound<f64>,
     ) -> Option<Vec<u32>> {
-        use std::ops::Bound;
         let key = |x: f64| {
             x.is_finite().then(|| {
                 crate::sql::scalar_index::f64_to_sortable_bits(
@@ -446,6 +452,42 @@ impl ExpressionKeyIndex {
                 crate::sql::scalar_index::range_slots(v, map(lower)?, map(upper)?)
             }
             ExpressionKeys::Bytes(_) | ExpressionKeys::I64(_) => None,
+        }
+    }
+
+    /// WHERE の式述語 `<式> <op> <リテラル>`（`op` は `=`／`<`／`<=`／`>`／`>=`）に一致する候補スロット
+    /// （昇順）を返す（INDEX-10、Issue #1650）。リテラルの種類が式の結果型と一致しない・非有限の
+    /// 数値・算術演算子は `None`（呼び出し元は全走査へ縮退する。「一致 0 件」とは別物）。NULL の
+    /// スロットはキーに入っていないため、評価側の `NULL op x` が偽になる規則と一致する。
+    /// 評価器との同値性: TEXT は `Collation::DEFAULT` のバイト列順と byte 等価、数値は `f64` 比較
+    /// （`±0` は同値でキーは正規化済み）、時間型は同種 `i64` の比較。
+    pub(crate) fn candidates_for_comparison(
+        &self,
+        op: BinOp,
+        literal: &ExprKeyLiteral,
+    ) -> Option<Vec<u32>> {
+        match literal {
+            ExprKeyLiteral::Text(s) => {
+                let (lower, upper) = comparison_bounds(op, s.as_bytes())?;
+                if self.ty != ExprType::Text {
+                    return None;
+                }
+                self.range_slots_bytes(lower, upper)
+            }
+            ExprKeyLiteral::Scalar(x) => {
+                if self.ty != ExprType::Scalar || !x.is_finite() {
+                    return None;
+                }
+                let (lower, upper) = comparison_bounds(op, *x)?;
+                self.range_slots_f64(lower, upper)
+            }
+            ExprKeyLiteral::Temporal(ty, v) => {
+                if self.ty != *ty {
+                    return None;
+                }
+                let (lower, upper) = comparison_bounds(op, *v)?;
+                self.range_slots_i64(lower, upper)
+            }
         }
     }
 
@@ -473,6 +515,144 @@ impl ExpressionKeyIndex {
                     .saturating_mul(std::mem::size_of::<u32>()),
             )
             .saturating_add(self.index_name.capacity())
+    }
+}
+
+/// 比較演算子 `op` とキー `k` を `[lower, upper]` の境界対へ写す（`<式> op k`）。算術演算子は `None`。
+fn comparison_bounds<K: Copy>(op: BinOp, k: K) -> Option<(Bound<K>, Bound<K>)> {
+    Some(match op {
+        BinOp::Eq => (Bound::Included(k), Bound::Included(k)),
+        BinOp::Gt => (Bound::Excluded(k), Bound::Unbounded),
+        BinOp::Ge => (Bound::Included(k), Bound::Unbounded),
+        BinOp::Lt => (Bound::Unbounded, Bound::Excluded(k)),
+        BinOp::Le => (Bound::Unbounded, Bound::Included(k)),
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => return None,
+    })
+}
+
+/// WHERE の式述語の右辺リテラル（式の結果型と同じ種類の定数だけを持つ。INDEX-10、Issue #1650）。
+/// `sql::scalar_plan::ExprIndexPredicate::Expression` が保持し、[`ExpressionKeyIndex::
+/// candidates_for_comparison`] が消費する。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ExprKeyLiteral {
+    /// `TEXT` 定数。
+    Text(String),
+    /// 有限の数値定数（非有限は分類側で対象外にする）。
+    Scalar(f64),
+    /// `DATE`／`TIMESTAMP`／`TIME`／`TIMESTAMPTZ` 定数（種類と `i64` 表現）。
+    Temporal(ExprType, i64),
+}
+
+impl ExprKeyLiteral {
+    /// 束縛済みの定数ノードをリテラルへ写す。定数以外・非有限の数値は `None`。
+    pub(crate) fn from_bound(expr: &BoundExpr) -> Option<Self> {
+        Some(match expr {
+            BoundExpr::Text(s) => Self::Text(s.clone()),
+            BoundExpr::Number(x) if x.is_finite() => Self::Scalar(*x),
+            BoundExpr::Date(d) => Self::Temporal(ExprType::Date, i64::from(*d)),
+            BoundExpr::Timestamp(t) => Self::Temporal(ExprType::Timestamp, *t),
+            BoundExpr::Time(t) => Self::Temporal(ExprType::Time, *t),
+            BoundExpr::TimestampTz(t) => Self::Temporal(ExprType::TimestampTz, *t),
+            _ => return None,
+        })
+    }
+
+    /// このリテラルが比較できる式の結果型。
+    pub(crate) fn expr_type(&self) -> ExprType {
+        match self {
+            Self::Text(_) => ExprType::Text,
+            Self::Scalar(_) => ExprType::Scalar,
+            Self::Temporal(ty, _) => *ty,
+        }
+    }
+}
+
+/// 式の一致結果（どの式索引のどの要素か）。名前は EXPLAIN の `index=` 注記にそのまま使う。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ExprMatchRef {
+    pub(crate) index_name: String,
+    pub(crate) element: usize,
+}
+
+/// 一致判定用に再束縛した式要素 1 個分。
+#[derive(Debug)]
+struct MatcherEntry {
+    index_name: String,
+    element: usize,
+    bound: BoundExpr,
+    ty: ExprType,
+}
+
+/// 対象テーブルの式索引の式要素を再束縛して持ち、WHERE の束縛済み式木との構造一致を判定する
+/// （INDEX-10、Issue #1650）。`sql::scalar_index::resolve_expression_matcher_in_txn` が
+/// クエリと同一の `read_txn` から作り、分類（`sql::scalar_plan`）・実行・EXPLAIN が共有する。
+///
+/// 一致の正当性: [`BoundExpr`] はレジストリやセッションを参照せず単独で評価できる純粋な木で、
+/// 索引に入る式は決定性検査（`42P17`）を通過済みのため、木が等しければ評価結果も等しい。
+/// 再束縛・往復一致・識別子検証のいずれかに失敗した宣言は黙って外す（fail-soft。一致しない＝全走査）。
+#[derive(Debug, Default)]
+pub(crate) struct ExpressionIndexMatcher {
+    entries: Vec<MatcherEntry>,
+}
+
+/// 構造一致。`PartialEq` は数値リテラルを `f64 ==` で比べて `-0.0` と `0.0` を同一視するが、
+/// `atan2` 等では符号付きゼロが結果を変えるため、デバッグ表現（`f64` を符号付きで描く）も
+/// 一致することを追加で要求する。
+fn exprs_identical(a: &BoundExpr, b: &BoundExpr) -> bool {
+    a == b && format!("{a:?}") == format!("{b:?}")
+}
+
+impl ExpressionIndexMatcher {
+    /// 何にも一致しないマッチャ（宣言なし・opt-in なし・カタログ読み取り失敗のときの値）。
+    pub(crate) fn empty() -> Self {
+        Self::default()
+    }
+
+    /// 保存済みの式宣言を再解析・再束縛して作る。保存テキストは untrusted で、往復一致しない・
+    /// 識別子として不正な索引名・確保失敗の宣言は外す。`(索引名, 要素位置)` 昇順に並べ、同じ式を
+    /// 持つ索引が複数あっても選択が決定的になるようにする。
+    pub(crate) fn from_decls(schema: &TableSchema, decls: &[DeclaredExpressionKey]) -> Self {
+        let mut entries: Vec<MatcherEntry> = Vec::new();
+        if entries.try_reserve_exact(decls.len()).is_err() {
+            return Self::empty();
+        }
+        for decl in decls {
+            if crate::catalog::validate_identifier(&decl.index_name).is_err() {
+                continue;
+            }
+            let Ok(expr) = crate::sql::allowlist::parse_index_expression_text(&decl.sql) else {
+                continue;
+            };
+            let Ok(bound) = crate::sql::index_expr::bind_index_expression(&expr, schema) else {
+                continue;
+            };
+            if bound.sql != decl.sql {
+                continue;
+            }
+            entries.push(MatcherEntry {
+                index_name: decl.index_name.clone(),
+                element: decl.element,
+                bound: bound.bound,
+                ty: bound.ty,
+            });
+        }
+        entries.sort_by(|a, b| {
+            a.index_name
+                .cmp(&b.index_name)
+                .then(a.element.cmp(&b.element))
+        });
+        Self { entries }
+    }
+
+    /// WHERE 側の式 `expr`（比較の非リテラル側）が結果型 `ty` の式要素と構造一致する最初の宣言。
+    pub(crate) fn find(&self, expr: &BoundExpr, ty: ExprType) -> Option<ExprMatchRef> {
+        self.entries
+            .iter()
+            .find(|e| e.ty == ty && exprs_identical(&e.bound, expr))
+            .map(|e| ExprMatchRef {
+                index_name: e.index_name.clone(),
+                element: e.element,
+            })
     }
 }
 
@@ -530,5 +710,174 @@ mod tests {
             classify_expression_value(ExprType::Scalar, &ExprValue::Text("x".into())),
             Err(ClassifyError::TypeMismatch)
         );
+    }
+}
+/// [`ExpressionIndexMatcher`] と [`ExprKeyLiteral`] の単体テスト（INDEX-10、Issue #1650）。
+#[cfg(test)]
+mod matcher_tests {
+    use super::*;
+    use crate::catalog::{ColumnDef, ColumnType};
+
+    fn schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+                ColumnDef::new("n", ColumnType::Integer, true),
+            ],
+        )
+    }
+
+    /// 式テキストを束縛し、カタログに保存される正規化 SQL と束縛済み式木を得る。
+    fn bind(text: &str) -> crate::sql::index_expr::BoundIndexExpression {
+        let expr = crate::sql::allowlist::parse_index_expression_text(text).expect("parse");
+        crate::sql::index_expr::bind_index_expression(&expr, &schema()).expect("bind")
+    }
+
+    fn decl(name: &str, element: usize, text: &str) -> DeclaredExpressionKey {
+        DeclaredExpressionKey {
+            index_name: name.to_string(),
+            element,
+            sql: bind(text).sql,
+        }
+    }
+
+    #[test]
+    fn find_requires_structural_identity_and_matching_result_type() {
+        let matcher = ExpressionIndexMatcher::from_decls(
+            &schema(),
+            &[decl("i_lower", 0, "lower(lang)"), decl("i_n", 0, "n + 1")],
+        );
+        let lower = bind("lower(lang)").bound;
+        assert_eq!(
+            matcher.find(&lower, ExprType::Text),
+            Some(ExprMatchRef {
+                index_name: "i_lower".to_string(),
+                element: 0
+            })
+        );
+        // 結果型が違うリテラルとは一致しない。
+        assert_eq!(matcher.find(&lower, ExprType::Scalar), None);
+        // 別の関数・別の引数・別の定数は一致しない。
+        assert_eq!(
+            matcher.find(&bind("upper(lang)").bound, ExprType::Text),
+            None
+        );
+        assert_eq!(matcher.find(&bind("n + 2").bound, ExprType::Scalar), None);
+        assert!(matcher
+            .find(&bind("n + 1").bound, ExprType::Scalar)
+            .is_some());
+    }
+
+    #[test]
+    fn signed_zero_literals_are_not_identical() {
+        let matcher = ExpressionIndexMatcher::from_decls(&schema(), &[decl("i_n", 0, "n + 0")]);
+        let positive = bind("n + 0").bound;
+        assert!(matcher.find(&positive, ExprType::Scalar).is_some());
+        // `PartialEq` は `-0.0 == 0.0` だが、符号付きゼロが結果を変えうるため一致させない。
+        let BoundExpr::Binary { op, lhs, .. } = positive else {
+            panic!("expected a binary expression");
+        };
+        let negative = BoundExpr::Binary {
+            op,
+            lhs,
+            rhs: Box::new(BoundExpr::Number(-0.0)),
+        };
+        assert_eq!(matcher.find(&negative, ExprType::Scalar), None);
+    }
+
+    #[test]
+    fn broken_or_stale_declarations_are_dropped_silently() {
+        let mut stale = decl("i_lower", 0, "lower(lang)");
+        stale.sql = "lower(no_such_column)".to_string();
+        let mut invalid_name = decl("i_ok", 0, "n + 1");
+        invalid_name.index_name = "bad name".to_string();
+        let mut garbage = decl("i_garbage", 0, "n + 1");
+        garbage.sql = "((( not sql".to_string();
+        let matcher = ExpressionIndexMatcher::from_decls(
+            &schema(),
+            &[stale, invalid_name, garbage, decl("i_good", 1, "n + 1")],
+        );
+        let found = matcher.find(&bind("n + 1").bound, ExprType::Scalar);
+        assert_eq!(
+            found,
+            Some(ExprMatchRef {
+                index_name: "i_good".to_string(),
+                element: 1
+            })
+        );
+        assert_eq!(
+            matcher.find(&bind("lower(lang)").bound, ExprType::Text),
+            None
+        );
+        assert_eq!(
+            ExpressionIndexMatcher::empty().find(&bind("n + 1").bound, ExprType::Scalar),
+            None
+        );
+    }
+
+    #[test]
+    fn identical_expressions_pick_the_smallest_index_name_deterministically() {
+        let matcher = ExpressionIndexMatcher::from_decls(
+            &schema(),
+            &[decl("i_b", 0, "n + 1"), decl("i_a", 0, "n + 1")],
+        );
+        assert_eq!(
+            matcher
+                .find(&bind("n + 1").bound, ExprType::Scalar)
+                .map(|m| m.index_name),
+            Some("i_a".to_string())
+        );
+    }
+
+    #[test]
+    fn literal_conversion_accepts_only_finite_constants_of_each_kind() {
+        assert_eq!(
+            ExprKeyLiteral::from_bound(&BoundExpr::Text("a".into())),
+            Some(ExprKeyLiteral::Text("a".into()))
+        );
+        assert_eq!(
+            ExprKeyLiteral::from_bound(&BoundExpr::Number(1.5)),
+            Some(ExprKeyLiteral::Scalar(1.5))
+        );
+        assert_eq!(
+            ExprKeyLiteral::from_bound(&BoundExpr::Number(f64::NAN)),
+            None
+        );
+        assert_eq!(
+            ExprKeyLiteral::from_bound(&BoundExpr::Number(f64::INFINITY)),
+            None
+        );
+        assert_eq!(
+            ExprKeyLiteral::from_bound(&BoundExpr::Date(7)),
+            Some(ExprKeyLiteral::Temporal(ExprType::Date, 7))
+        );
+        assert_eq!(
+            ExprKeyLiteral::from_bound(&BoundExpr::Timestamp(9)),
+            Some(ExprKeyLiteral::Temporal(ExprType::Timestamp, 9))
+        );
+        assert_eq!(ExprKeyLiteral::from_bound(&BoundExpr::IdRef), None);
+        assert_eq!(
+            ExprKeyLiteral::Temporal(ExprType::TimestampTz, 1).expr_type(),
+            ExprType::TimestampTz
+        );
+    }
+
+    #[test]
+    fn comparison_bounds_map_each_operator() {
+        assert_eq!(
+            comparison_bounds(BinOp::Eq, 5),
+            Some((Bound::Included(5), Bound::Included(5)))
+        );
+        assert_eq!(
+            comparison_bounds(BinOp::Gt, 5),
+            Some((Bound::Excluded(5), Bound::Unbounded))
+        );
+        assert_eq!(
+            comparison_bounds(BinOp::Le, 5),
+            Some((Bound::Unbounded, Bound::Included(5)))
+        );
+        assert_eq!(comparison_bounds(BinOp::Add, 5), None);
     }
 }

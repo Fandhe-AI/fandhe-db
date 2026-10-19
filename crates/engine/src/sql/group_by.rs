@@ -1486,8 +1486,20 @@ pub(crate) fn execute_grouped_aggregate(
             expr_filters: &bound.expr_filters,
             or_filters: &bound.or_filters,
         };
+        // INDEX-10（Issue #1650）: 式索引の式一致を分類・候補収集の双方へ同じ `finder` で渡す。
+        let expr_matcher = crate::sql::scalar_index::resolve_expression_matcher_in_txn(
+            crate::storage::read_source::require_snapshot(read_txn)?,
+            &bound.table,
+            schema,
+            scalar_access.declarations_enabled,
+            &bound.expr_filters,
+        );
+        let expr_finder = |e: &crate::sql::udf_call::BoundExpr,
+                           ty: crate::sql::udf_call::ExprType| {
+            expr_matcher.find(e, ty)
+        };
         let candidate_walk = !where_less
-            && crate::sql::scalar_plan::classify_scalar_plan(&scalar_shape)
+            && crate::sql::scalar_plan::classify_scalar_plan_with(&scalar_shape, &expr_finder)
                 != crate::sql::scalar_plan::ScalarPlan::PlainScan;
         // codex-review P1 指摘（PR #603）「列挙形を使わない理由」: 列挙形は
         // グループ（値）ごとに全スロットをまとめて処理するため、あるグループの
@@ -1552,8 +1564,9 @@ pub(crate) fn execute_grouped_aggregate(
                         // 混在したまま渡り、`ScalarIndex::candidates_for` が
                         // 内部で振り分ける（Issue #893 production 接続）。
                         if let crate::sql::scalar_index::CandidateResolution::Use(slots) =
-                            match crate::sql::scalar_plan::collect_expr_index_predicates(
+                            match crate::sql::scalar_plan::collect_expr_index_predicates_with(
                                 &bound.expr_filters,
+                                &expr_finder,
                             ) {
                                 Some(expr_preds) => {
                                     index.resolve_candidates(&bound.metadata_filters, &expr_preds)
