@@ -52,7 +52,8 @@ use crate::sql::allowlist::{
     ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
     ValidatedAlterTableRenameColumn, ValidatedAlterTableRenameTable, ValidatedCreateIndex,
     ValidatedCreateTable, ValidatedCreateTempTable, ValidatedCreateType, ValidatedCreateView,
-    ValidatedDropIndex, ValidatedDropTable, ValidatedDropType, ValidatedDropView,
+    ValidatedDropIndex, ValidatedDropMaterializedView, ValidatedDropTable, ValidatedDropType,
+    ValidatedDropView,
 };
 use crate::sql::ddl_column_type::{
     alias_spelling, to_static_column_type_with_array_default, SqlColumnTypeName, StaticColumnType,
@@ -2358,6 +2359,9 @@ pub(crate) fn map_create_matview_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        // 一意索引（Issue #1667）の宣言がある matview の実体書き込みで文脈内に重複があった。
+        // 固定文言で、テナント・値・件数を含めない。
+        CatalogError::UniqueConstraintViolation => SqlSurfaceError::UniqueViolation,
         CatalogError::Invalid(_) => SqlSurfaceError::feature_not_supported(
             "materialized view definition or data cannot be stored",
         ),
@@ -2432,6 +2436,69 @@ pub(crate) fn execute_drop_view(
             cascaded: Vec::new(),
         }),
         Err(e) => Err(map_drop_view_error(e)),
+    }
+}
+
+/// `DROP MATERIALIZED VIEW ...`（TABLE-42 (5)・TABLE-37、Issue #1667）の成功応答。
+/// 連鎖削除の報告には共有カタログのオブジェクト名だけを含み、テナント・行数の情報は持たない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropMaterializedViewOutcome {
+    /// `IF EXISTS` で 1 件も削除しなかったか（全対象が不在）。
+    pub(crate) skipped: bool,
+    /// `CASCADE` で連鎖削除した依存オブジェクト（適用順。依存する側が先）。
+    pub(crate) cascaded: Vec<CascadedObject>,
+}
+
+impl DropMaterializedViewOutcome {
+    /// `IF EXISTS` により全対象が不在で no-op 成功した場合に真。
+    pub fn skipped(&self) -> bool {
+        self.skipped
+    }
+
+    /// `CASCADE` で連鎖削除した依存オブジェクト（`RESTRICT` 時は空）。
+    pub fn cascaded(&self) -> &[CascadedObject] {
+        &self.cascaded
+    }
+}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体。
+/// `Storage::drop_materialized_views` へ委譲する（全体で単一 write txn・単一 commit）。
+pub(crate) fn execute_drop_materialized_view(
+    storage: &Storage,
+    validated: &ValidatedDropMaterializedView,
+) -> Result<DropMaterializedViewOutcome, SqlSurfaceError> {
+    let report = storage
+        .drop_materialized_views(
+            validated.names(),
+            validated.if_exists(),
+            validated.behavior(),
+        )
+        .map_err(map_drop_matview_error)?;
+    Ok(DropMaterializedViewOutcome {
+        skipped: report.dropped == 0,
+        cascaded: report.cascaded,
+    })
+}
+
+/// `Storage::drop_materialized_views` の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （対象不存在 `42P01`、表・ビュー・索引名を指定 `42809`、依存が残存 `2BP01`、書き込みゲート
+/// 待機の超過 `55P03`）。文言に他テナントの情報・内部詳細を含めない。
+pub(crate) fn map_drop_matview_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::ViewNotFound(name) => SqlSurfaceError::UndefinedTable { name },
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::DependentViewsExist(name)
+        | CatalogError::DependentObjectsStillExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
+        CatalogError::Invalid(_) => {
+            SqlSurfaceError::unsupported("malformed relation reference in DROP MATERIALIZED VIEW")
+        }
+        CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "DROP MATERIALIZED VIEW failed".to_string(),
+        },
     }
 }
 
