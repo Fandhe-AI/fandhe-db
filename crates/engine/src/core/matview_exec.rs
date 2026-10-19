@@ -23,8 +23,8 @@
 use super::EngineCore;
 use crate::catalog::materialized::{
     begin_streamed_create_in_txn, begin_streamed_refresh_in_txn, finish_streamed_create_in_txn,
-    finish_streamed_refresh_in_txn, write_context_entity_in_txn, ContextKey, MaterializedViewDef,
-    MAX_MATVIEW_CONTEXTS,
+    finish_streamed_refresh_in_txn, is_context_local_failure, write_context_entity_in_txn,
+    ContextKey, MaterializedViewDef, MAX_MATVIEW_CONTEXTS,
 };
 use crate::catalog::CatalogError;
 use crate::policy::PolicyContext;
@@ -198,9 +198,10 @@ impl EngineCore {
                 // 他文脈の符号化・書き込み失敗（テナント ID 長等で結果の有無により成否が分かれうる）も
                 // 評価失敗と同様に作成者へ返さない。write_context_entity_in_txn は失敗時に行・メタを
                 // 残さないため、その文脈は未実体化（読み取りは 55000）になる。
+                // ストレージエラー等（部分書き込みが残りうる失敗）は隠さず txn ごと破棄して返す。
                 match write_context_entity_in_txn(&write_txn, &def, &ctx, &rows, &mut seen, cap) {
                     Ok(()) => {}
-                    Err(_) if !is_creator => continue,
+                    Err(ref e) if !is_creator && is_context_local_failure(e) => continue,
                     Err(e) => return Err(map_create_matview_error(e)),
                 }
                 drop(rows);
@@ -310,9 +311,10 @@ impl EngineCore {
             };
             // 他文脈の符号化・書き込み失敗も評価失敗と同様に実行者へ返さない（失敗時は行・メタを
             // 残さず、その文脈は未実体化＝読み取りは 55000）。
+            // ストレージエラー等（部分書き込みが残りうる失敗）は隠さず txn ごと破棄して返す。
             match write_context_entity_in_txn(&write_txn, &def, &ctx, &rows, &mut seen, cap) {
                 Ok(()) => {}
-                Err(_) if !is_refresher => continue,
+                Err(ref e) if !is_refresher && is_context_local_failure(e) => continue,
                 Err(e) => return Err(map_refresh_matview_error(e)),
             }
             drop(rows);

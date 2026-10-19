@@ -845,6 +845,18 @@ pub(crate) fn finish_streamed_refresh_in_txn(
     Ok(())
 }
 
+/// `write_context_entity_in_txn` の失敗が「その文脈だけの検証・符号化失敗」（書き込み前に確定し、
+/// txn に何も残さない）かを返す。真なら呼び出し元は他文脈の失敗として隠してよい。偽（ストレージ
+/// エラー等）は部分書き込みが txn に残りうるため、呼び出し元は txn 全体を破棄して返す（fail-closed）。
+pub(crate) fn is_context_local_failure(e: &CatalogError) -> bool {
+    matches!(
+        e,
+        CatalogError::Invalid(_)
+            | CatalogError::ViewLimitExceeded(_)
+            | CatalogError::UniqueConstraintViolation
+    )
+}
+
 /// 1 文脈分の実体を write txn へ書く。評価結果の行値を呼び出し元が即座に解放できるよう、
 /// 文脈ごとに検査（文脈数上限・キー重複・行数上限）と符号化を済ませる。`seen` は書き込み済みの
 /// 文脈キーで、重複検出と文脈数上限の判定に使う。
@@ -876,6 +888,13 @@ pub(crate) fn write_context_entity_in_txn(
         // UNIQUE 索引宣言があれば、この文脈の行だけで一意性を検査する（他文脈とは比較しない）。
         let sets = unique_column_sets_in_txn(write_txn, &def.name, &def.columns)?;
         enforce_unique_rows(&sets, rows)?;
+    }
+    // 符号化前提（テナント ID の非空・長さ上限）は行数に関係なく先に検査する。行ループ内だけで
+    // 検査すると行 0 件の文脈で素通りし、行ありの文脈と成否が分かれる（空・非空の parity 崩れ）。
+    if ctx.tenant_id().is_empty() || u8::try_from(ctx.tenant_id().len()).is_err() {
+        return Err(CatalogError::Invalid(
+            "materialized view row does not match its columns".to_string(),
+        ));
     }
     let schema = TableSchema::new(def.name.clone(), def.columns.clone());
     // 符号化の失敗（テナント ID 長などの文脈依存の要因）で部分的な行を残さないよう、

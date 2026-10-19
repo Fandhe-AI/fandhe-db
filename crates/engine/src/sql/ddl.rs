@@ -2399,6 +2399,7 @@ pub(crate) fn map_refresh_matview_error(e: CatalogError) -> SqlSurfaceError {
         }
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        CatalogError::UniqueConstraintViolation => SqlSurfaceError::UniqueViolation,
         CatalogError::Invalid(_) => SqlSurfaceError::feature_not_supported(
             "materialized view definition or data cannot be stored",
         ),

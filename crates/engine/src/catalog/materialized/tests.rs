@@ -692,6 +692,42 @@ fn streamed_refresh_replaces_all_contexts_on_commit() {
     assert!(s.read_materialized_view("mv", &b).expect("read").is_none());
 }
 
+/// Issue #1665 指摘: 行 0 件の文脈でも符号化前提（テナント ID 長）を検査し、行ありの文脈と同じく
+/// 失敗する（空の実体を populated として保存しない）。失敗時は何も書かず、検証失敗として分類される。
+#[test]
+fn write_context_entity_rejects_oversized_tenant_even_without_rows() {
+    let (_g, _p, s) = open("mv_empty_long_tenant");
+    s.create_materialized_view(&def("mv")).expect("create");
+    let long = ctx(&"t".repeat(256));
+    for rows in [Vec::new(), vec![row("x", 1)]] {
+        let txn = s.begin_write_txn().expect("txn");
+        let d = begin_streamed_refresh_in_txn(&txn, "mv").expect("begin");
+        let mut seen = Vec::new();
+        let err = write_context_entity_in_txn(&txn, &d, &long, &rows, &mut seen, 10)
+            .expect_err("must fail");
+        assert!(is_context_local_failure(&err));
+        assert!(seen.is_empty());
+    }
+}
+
+/// ストレージ起因のエラーは文脈固有の検証失敗として隠さない（部分書き込みを残したまま
+/// commit させない）。
+#[test]
+fn storage_errors_are_not_context_local_failures() {
+    assert!(!is_context_local_failure(&CatalogError::CorruptSchema(
+        "x".to_string()
+    )));
+    assert!(!is_context_local_failure(
+        &CatalogError::TableGenerationCounterOverflow
+    ));
+    assert!(is_context_local_failure(&CatalogError::Invalid(
+        "x".to_string()
+    )));
+    assert!(is_context_local_failure(
+        &CatalogError::UniqueConstraintViolation
+    ));
+}
+
 /// 途中で txn を破棄すれば旧実体がすべて残る（失敗時に旧実体が残る受入基準）。
 #[test]
 fn streamed_refresh_dropped_txn_keeps_old_entities() {
