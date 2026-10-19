@@ -1069,6 +1069,24 @@ fn temp_table_name_colliding_with_a_temp_index_follows_the_persistent_rules() {
 }
 
 #[test]
+fn temp_create_table_if_not_exists_index_collision_wins_over_later_rejections() {
+    let (core, _g) = new_core("t44-dml-ix-early", LedgerMode::CompareOnlyWithoutLedger);
+    let mut s = ddl_session();
+    run_ok(&core, &mut s, "CREATE TEMP TABLE t (a TEXT)");
+    run_ok(&core, &mut s, "CREATE INDEX ix ON t (a)");
+    // 同名索引があれば、FK 拒否（0A000）より前に no-op 成功する（永続表と同順序）。
+    assert!(
+        code(
+            &core,
+            &mut s,
+            "CREATE TEMP TABLE IF NOT EXISTS ix (a TEXT, b TEXT REFERENCES t (a))"
+        )
+        .starts_with("ok:"),
+        "IF NOT EXISTS collision must succeed before FK rejection"
+    );
+}
+
+#[test]
 fn temp_create_index_if_not_exists_keeps_the_existing_index() {
     let (core, _g) = new_core("t44-dml-ix-noop", LedgerMode::CompareOnlyWithoutLedger);
     let mut s = ddl_session();
