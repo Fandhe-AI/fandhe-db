@@ -418,6 +418,16 @@ pub enum TenantWriteError {
     /// 再束縛失敗（漂流）は本 variant ではなく引き続き
     /// [`TenantWriteError::Catalog`]（`CorruptSchema`。`XX000`）が担う。
     CheckEvaluationFailed(SqlSurfaceError),
+    /// 式索引（`CREATE INDEX ... ((<式>))`。INDEX-10、Issue #1649）の式を、書き込もうとした
+    /// 行の値で評価できなかった（0 除算 `22012`・範囲外／非有限 `22003` 等）。式索引は
+    /// 「全行で式が評価でき索引化できる」不変条件の下でだけ派生索引を作り直せるため、
+    /// 評価エラーを握りつぶさず fail-closed に文を拒否する（副作用ゼロ）。
+    /// [`TenantWriteError::CheckEvaluationFailed`] と同じく内側の [`SqlSurfaceError`] を
+    /// そのまま保持して通常の式評価と同じ `wire_code` で返す。評価は書き込んだ自テナントの
+    /// 行だけに対して行い、他テナントの存在オラクルにならない。`Display`／`Debug` は値を含めない。
+    /// **BREAKING CHANGE**（Issue #1649）: variant を追加した（本 enum は `#[non_exhaustive]`
+    /// ではないため網羅的 `match` の下流は追随が必要）。
+    IndexExpressionEvaluationFailed(SqlSurfaceError),
     /// `UPDATE ... SET <col> = <式>` の右辺式の評価・列型への変換が失敗した、または
     /// 式を含む SET の `content_hash` を計算できなかった（Issue #1544・SQL-45 のポインタ。
     /// 0 除算 `22012`・範囲外 `22003`・NOT NULL 列への NULL `23502` 等）。
@@ -592,6 +602,9 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::CheckEvaluationFailed(inner) => {
                 crate::error_format::ClassifiedError::error_class(inner)
             }
+            TenantWriteError::IndexExpressionEvaluationFailed(inner) => {
+                crate::error_format::ClassifiedError::error_class(inner)
+            }
             TenantWriteError::SetExpressionEvaluationFailed(inner) => {
                 crate::error_format::ClassifiedError::error_class(inner)
             }
@@ -669,6 +682,9 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::CheckEvaluationFailed(inner) => {
                 write!(f, "{}", inner.client_message())
             }
+            TenantWriteError::IndexExpressionEvaluationFailed(inner) => {
+                write!(f, "{}", inner.client_message())
+            }
             TenantWriteError::SetExpressionEvaluationFailed(inner) => {
                 write!(f, "{}", inner.client_message())
             }
@@ -725,6 +741,9 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::CheckViolation { .. } => f.write_str("CheckViolation(<redacted>)"),
             TenantWriteError::CheckEvaluationFailed(_) => {
                 f.write_str("CheckEvaluationFailed(<redacted>)")
+            }
+            TenantWriteError::IndexExpressionEvaluationFailed(_) => {
+                f.write_str("IndexExpressionEvaluationFailed(<redacted>)")
             }
             TenantWriteError::SetExpressionEvaluationFailed(_) => {
                 f.write_str("SetExpressionEvaluationFailed(<redacted>)")

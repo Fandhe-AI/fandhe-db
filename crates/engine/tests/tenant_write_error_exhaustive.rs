@@ -49,6 +49,8 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         // オーナー判断（2026-09-28・Issue #1075）: 内側の `SqlSurfaceError` の
         // 分類（通常の式評価と同じ）へ委譲する。`XX000` 固定ではなくなった。
         TenantWriteError::CheckEvaluationFailed(inner) => inner.error_class(),
+        // Issue #1649: 式索引の式の評価エラーも内側の分類へ委譲する。
+        TenantWriteError::IndexExpressionEvaluationFailed(inner) => inner.error_class(),
         // Issue #1544: SET 右辺式の評価エラーも内側の分類へ委譲する。
         TenantWriteError::SetExpressionEvaluationFailed(inner) => inner.error_class(),
         TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
@@ -92,6 +94,9 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
         }),
         TenantWriteError::CheckEvaluationFailed(SqlSurfaceError::Internal {
             detail: "test".to_string(),
+        }),
+        TenantWriteError::IndexExpressionEvaluationFailed(SqlSurfaceError::InvalidInput {
+            detail: "division by zero".to_string(),
         }),
         TenantWriteError::WriteLockTimeout,
         TenantWriteError::ConflictTargetNotVisible,

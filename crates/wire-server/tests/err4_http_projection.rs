@@ -192,6 +192,26 @@ fn new_core_with_check_constraint() -> (Arc<EngineCore>, temp_db::CleanupGuard) 
     (Arc::new(core), guard)
 }
 
+/// 式索引（`CREATE INDEX ... ((100 / qty))`）を持つテーブルのフィクスチャ（Issue #1649）。
+fn new_core_with_expression_index() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("err4-http-projection-expridx");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant ctx");
+    let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(&ctx, &mut session, "CREATE TABLE xidx (qty INTEGER)")
+        .expect("table DDL must succeed");
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        "CREATE INDEX xidx_div ON xidx ((100 / qty))",
+    )
+    .expect("expression index DDL must succeed");
+    (Arc::new(core), guard)
+}
+
 fn spawn(core: Arc<EngineCore>) -> SocketAddr {
     let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
     http_common::spawn_router_listener_with_engine(&users_path, SessionStore::new(), core)
@@ -1294,6 +1314,20 @@ fn err4_check_evaluation_failed_reachable_via_nosql_insert_projects_22012_not_xx
     let addr = spawn(core);
 
     let body = br#"{"op":"insert","table":"checked","rows":[{"id":1,"qty":0}],"operation_id":"err4-check-eval-insert"}"#;
+    let resp = query_as_alice(addr, body);
+    assert_projected(&resp, "22012");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
+}
+
+/// 式索引の式の評価エラー（0 除算）は NoSQL `insert` op からも `XX000`（500）ではなく
+/// `22012`（400）として到達可能であることを固定する（INDEX-10、Issue #1649。
+/// `TenantWriteError::IndexExpressionEvaluationFailed` → `InsertError::Exec` の経路）。
+#[test]
+fn err4_index_expression_evaluation_failed_via_nosql_insert_projects_22012() {
+    let (core, _guard) = new_core_with_expression_index();
+    let addr = spawn(core);
+
+    let body = br#"{"op":"insert","table":"xidx","rows":[{"id":1,"qty":0}],"operation_id":"err4-index-expr-insert"}"#;
     let resp = query_as_alice(addr, body);
     assert_projected(&resp, "22012");
     http_common::assert_message_does_not_echo(&resp, "tenant-a");

@@ -12,6 +12,9 @@
 # Issue #1616（INDEX-9）で、`CREATE UNIQUE INDEX` 由来の一意制約を持つ 2 つ目の表
 # `docs_uidx (code TEXT)` も同じ書き込み・検証の対象に加えた（ツールが両表へ INSERT し、
 # verify が両表へ同じオラクルを適用する。本スクリプトのロジックは変えない）。
+# Issue #1649（INDEX-10）で、式索引（`((100 / n))`・`((lower(code)))`）を持つ 3 つ目の表
+# `docs_xidx (n INTEGER, code TEXT)` を加えた（verify が、再起動後も式の評価失敗が `22012` で拒否
+# され、コミット済みの全行が式を評価できることを確かめる。本スクリプトのロジックは変えない）。
 # Makefile の crash-test-unique-index ターゲット・CI の crash-test-unique-index
 # ジョブから呼ばれる。
 #

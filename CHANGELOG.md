@@ -9,6 +9,11 @@
 
 ### Breaking Changes
 
+- 式索引の DML 維持（Issue #1649・INDEX-10）: 式索引を持つテーブルへの `INSERT`／`UPDATE`／UPSERT／`COPY`
+  （参照アクションによる子表の更新を含む）が、式の評価エラー（0 除算 `22012` 等）・非有限値（`22003`）で
+  失敗する（副作用ゼロ）。NULL を返す行は許容する。`CREATE INDEX ... ((<式>))` は保存前に既存行を全件検証し、
+  失敗行があれば拒否する（応答は固定文言）。公開 API は `TenantWriteError::IndexExpressionEvaluationFailed`
+  の追加（`#[non_exhaustive]` ではないため網羅的 `match` の下流は追随が必要）。
 - 式索引の格納（Issue #1648・INDEX-10）: 従来 `0A000` だった `CREATE INDEX ... ((<式>))`／`(f(col))` のうち
   決定的な式を、書き込みトランザクション内で束縛して永続化する（未知列 `42703`・型不整合は束縛側の
   SQLSTATE・型で決まる非決定性 `42P17`・索引化できない結果型 `0A000`）。`UNIQUE`・`USING hnsw`・式への

@@ -4235,6 +4235,8 @@ pub(crate) fn map_write_error(
         // 変換不要（`tenant::TenantWriteError::CheckEvaluationFailed` のドキュ
         // メント参照）。
         TenantWriteError::CheckEvaluationFailed(inner) => inner,
+        // 式索引の式の評価エラー（INDEX-10、Issue #1649）も内側の `SqlSurfaceError` を透過する。
+        TenantWriteError::IndexExpressionEvaluationFailed(inner) => inner,
         // SET 右辺式の評価エラー（Issue #1544・SQL-45 のポインタ）も内側の
         // `SqlSurfaceError` を透過する（通常の式評価と同じ `wire_code`）。
         TenantWriteError::SetExpressionEvaluationFailed(inner) => inner,
@@ -5444,6 +5446,7 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         // INSERT でも通常の式評価と同じ `SqlSurfaceError` をそのまま透過する
         // （`_` 節の `XX000` へ丸めない）。
         IncrementalError::Write(TenantWriteError::CheckEvaluationFailed(inner)) => inner,
+        IncrementalError::Write(TenantWriteError::IndexExpressionEvaluationFailed(inner)) => inner,
         // `FOREIGN KEY` 制約違反（`23503`。TABLE-17・TASK-205、Issue #907）: ファイル形
         // `INSERT` の置換（`replace_typed_rows_by_text_key`）で旧チャンク行を削除しようと
         // して参照先側の検査に違反した場合、または新規チャンク行の参照元列が参照元側の

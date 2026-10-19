@@ -888,6 +888,54 @@ pub(crate) fn declared_index_targets_in_txn(
     })
 }
 
+/// write txn 内で対象テーブルの式索引の式要素（宣言順）を読む（INDEX-10、Issue #1649）。
+/// DML ゲート（`constraint::enforce_row_constraints_in_txn`）が書き込みの都度呼ぶため、
+/// 対象外テーブルのエントリは保存値の 2 行目（テーブル名）の照合だけで読み飛ばし、フル
+/// デコードしない。カタログ未作成は空の `Ok`。走査件数が [`MAX_INDEX_COUNT`] を超える・
+/// デコードに失敗する場合は `Err`（`CorruptSchema`。呼び出し元は書き込みを拒否する fail-closed）。
+pub(crate) fn expression_index_decls_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+) -> Result<Vec<DeclaredExpressionKey>> {
+    let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out: Vec<DeclaredExpressionKey> = Vec::new();
+    for (scanned, entry) in index_table.iter()?.enumerate() {
+        if scanned >= MAX_INDEX_COUNT {
+            return Err(CatalogError::CorruptSchema(format!(
+                "index catalog exceeds {MAX_INDEX_COUNT} entries"
+            )));
+        }
+        let (key, value) = entry?;
+        let bytes = value.value();
+        // 先頭 2 行（版・テーブル名）だけ見て、別テーブルと確定したものを読み飛ばす。読めない値・
+        // 2 行目が無い値はフルデコードに回し、破損を検出して fail-closed にする。
+        let second_line = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|t| t.split('\n').nth(1));
+        if second_line.is_some_and(|t| t != table) {
+            continue;
+        }
+        let def = decode_index_def(key.value(), bytes)?;
+        if !matches!(def.kind, IndexKind::Scalar) || def.table != table {
+            continue;
+        }
+        for (element, expr) in def.expressions.iter().enumerate() {
+            if let Some(e) = expr {
+                out.push(DeclaredExpressionKey {
+                    index_name: def.name.clone(),
+                    element,
+                    sql: e.sql.clone(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// [`explain_index_names_in_txn`] の出力（Issue #1066・TASK-206・INDEX-7・
 /// SQL-6・SQL-27）。`sql::explain`（`core.rs` 経由）が `EXPLAIN` の
 /// `ann_plan:`／`scalar_plan:` 行へ使用索引名を注記するために読む、対象
@@ -3101,6 +3149,20 @@ fn map_tenant_write_error_to_alter_check(e: crate::tenant::TenantWriteError) -> 
         TenantWriteError::CheckEvaluationFailed(inner) => AlterCheckError::Sql(inner),
         TenantWriteError::Catalog(c) => AlterCheckError::Catalog(c),
         other => AlterCheckError::Catalog(CatalogError::CorruptSchema(other.to_string())),
+    }
+}
+
+/// `CREATE INDEX` の既存行検証（[`crate::constraint::validate_existing_rows_for_index_expressions`]・
+/// `CompiledIndexExpressions::compile`）の失敗を [`CreateIndexError`] へ写像する（Issue #1649）。
+/// 評価エラーは全テナント・全可視性の行が対象のため、SQLSTATE を保った固定文言へ置換して返す
+/// （`redact_row_conversion_error`）。それ以外は `CorruptSchema`（`XX000`。詳細は渡さない）。
+fn map_index_validation_error(e: crate::tenant::TenantWriteError) -> CreateIndexError {
+    match e {
+        crate::tenant::TenantWriteError::IndexExpressionEvaluationFailed(inner) => {
+            CreateIndexError::Sql(crate::sql::alter_using::redact_row_conversion_error(inner))
+        }
+        crate::tenant::TenantWriteError::Catalog(c) => CreateIndexError::Catalog(c),
+        other => CreateIndexError::Catalog(CatalogError::CorruptSchema(other.to_string())),
     }
 }
 
@@ -10226,7 +10288,17 @@ pub(crate) fn require_table_schema_write(
 /// 生 API は `(tenant_id, id)` キーへの追加または同一キーの置換のみを行い既存の `id`
 /// を削除しないため、参照元行が参照先を失う（孤児化する）ことはない。
 #[cfg(test)]
-fn reject_constrained_table_for_raw_write(schema: &TableSchema) -> Result<()> {
+fn reject_constrained_table_for_raw_write(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+) -> Result<()> {
+    // 式索引の宣言（INDEX-10、Issue #1649）も検査点でしか強制できないため、同じく拒否する。
+    if !expression_index_decls_in_txn(write_txn, table_name)?.is_empty() {
+        return Err(CatalogError::Invalid(
+            "raw test-only write API does not support tables with expression indexes; use crate::tenant write APIs".to_string(),
+        ));
+    }
     if schema.primary_key().is_some()
         || !schema.unique_constraints().is_empty()
         || !schema.checks().is_empty()
@@ -13359,6 +13431,41 @@ impl Storage {
                     });
                 }
             }
+            // 既存行の検証（INDEX-10、Issue #1649）: 全テナント・全可視性の行で式が評価でき索引化
+            // できなければ、保存前に拒否する（作れない式索引を残さない）。評価エラーは SQLSTATE を
+            // 保った固定文言へ置換し、不可視行の値を応答へ出さない。
+            if has_exprs {
+                let decls: Vec<DeclaredExpressionKey> = stored
+                    .expressions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(element, e)| {
+                        e.as_ref().map(|e| DeclaredExpressionKey {
+                            index_name: stored.name.clone(),
+                            element,
+                            sql: e.sql.clone(),
+                        })
+                    })
+                    .collect();
+                let compiled = crate::sql::expression_key_index::CompiledIndexExpressions::compile(
+                    &schema, &decls,
+                )
+                .map_err(map_index_validation_error)?;
+                if let Some(compiled) = compiled {
+                    let row_table_name = user_rows_table_name(&def.table);
+                    match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+                        Ok(row_table) => {
+                            crate::constraint::validate_existing_rows_for_index_expressions(
+                                &row_table, &schema, &compiled,
+                            )
+                            .map_err(map_index_validation_error)?;
+                        }
+                        // 行テーブル未作成は行 0 件として扱う。
+                        Err(redb::TableError::TableDoesNotExist(_)) => {}
+                        Err(e) => return Err(CatalogError::from(e).into()),
+                    }
+                }
+            }
             let encoded = encode_index_def(&stored)?;
             // 一意索引（Issue #1616・INDEX-9）: 型ゲート → 制約名前空間 → 件数上限 →
             // 追加後スキーマの検証 → 既存行の重複走査 の順で、スキーマ側の UNIQUE 制約
@@ -13801,7 +13908,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
-            reject_constrained_table_for_raw_write(&schema)?;
+            reject_constrained_table_for_raw_write(&write_txn, table_name, &schema)?;
             schema.validate_row_embedding_dim(row.embedding.len())?;
             let encoded = crate::storage::encode_row(row).map_err(convert_storage_error)?;
             let row_table_name = user_rows_table_name(table_name);
@@ -13847,7 +13954,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
-            reject_constrained_table_for_raw_write(&schema)?;
+            reject_constrained_table_for_raw_write(&write_txn, table_name, &schema)?;
             if rows.is_empty() {
                 // 存在確認以外に何も変更しないため、commit（＝世代を進める）せず
                 // write txn を破棄する（`redb::WriteTransaction` は commit/abort の
@@ -13911,7 +14018,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
-            reject_constrained_table_for_raw_write(&schema)?;
+            reject_constrained_table_for_raw_write(&write_txn, table_name, &schema)?;
             let vector_idx = schema.columns.iter().position(|c| c.ty.is_vector());
             // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま
             // 扱う（読み取り側の dim==0 モデルと整合）。列がある場合の「値が
