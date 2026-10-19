@@ -1680,6 +1680,8 @@ pub enum ParsedSql {
     CreateSequence(crate::sql::allowlist::ValidatedCreateSequence),
     /// `DROP SEQUENCE`（TABLE-24、Issue #1688）。
     DropSequence(crate::sql::allowlist::ValidatedDropSequence),
+    /// `ALTER SEQUENCE`（TABLE-24、Issue #1689）。
+    AlterSequence(crate::sql::allowlist::ValidatedAlterSequence),
 }
 
 /// 読み取り文（[`ParsedSql::Statement`]）と書き込み文（INSERT／UPDATE／DELETE の原子版）が
@@ -1755,7 +1757,8 @@ fn statement_clock_scope(
         | ParsedSql::CreateType(_)
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
-        | ParsedSql::DropSequence(_) => false,
+        | ParsedSql::DropSequence(_)
+        | ParsedSql::AlterSequence(_) => false,
     };
     if !is_read {
         return Ok(None);
@@ -1808,7 +1811,8 @@ fn insert_default_clock_scope(
         | ParsedSql::CreateType(_)
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
-        | ParsedSql::DropSequence(_) => false,
+        | ParsedSql::DropSequence(_)
+        | ParsedSql::AlterSequence(_) => false,
     };
     if !is_insert {
         return Ok(None);
@@ -3545,6 +3549,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -3594,6 +3599,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -3640,6 +3646,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -3693,6 +3700,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -3752,6 +3760,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -4546,6 +4555,11 @@ impl EngineCore {
         // DDL であり `USING OPERATION_ID` を取らないため `LedgerMode`・
         // `TableLookup` のいずれも渡さない（`ValidatedAlterTableAddColumn` の
         // ドキュメント参照。カタログ照会は権限ゲート通過後の実行段が担う）。
+        // Issue #1689: `ALTER SEQUENCE` は「先頭が ALTER なら ALTER TABLE」の汎用分岐より前に束縛する。
+        if crate::sql::allowlist::is_alter_sequence_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_alter_sequence_tokens(&tokens)?;
+            return Ok(ParsedSql::AlterSequence(stmt));
+        }
         let is_alter_table_statement = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("ALTER")
@@ -5507,6 +5521,14 @@ impl EngineCore {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 let outcome = crate::sql::ddl::execute_drop_sequence(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropSequence(outcome))
+            }
+            // TABLE-24・SQL-23（Issue #1689）: DDL 実行権限ゲート → 実行本体。`ctx.tenant_id()` は
+            // RESTART なしの範囲検査で呼び出し元テナントの現在値を読むためだけに渡す。
+            ParsedSql::AlterSequence(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome =
+                    crate::sql::ddl::execute_alter_sequence(&self.storage, ctx.tenant_id(), stmt)?;
+                Ok(crate::sql::SqlOutcome::AlterSequence(outcome))
             }
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
@@ -6707,6 +6729,7 @@ impl EngineCore {
             // Issue #1688: SEQUENCE DDL も結果列を持たない。
             ParsedSql::CreateSequence(_) => Ok(None),
             ParsedSql::DropSequence(_) => Ok(None),
+            ParsedSql::AlterSequence(_) => Ok(None),
             ParsedSql::Delete(DeleteStatement::SingleRow(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
                 match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {

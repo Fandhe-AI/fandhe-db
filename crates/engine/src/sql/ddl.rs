@@ -38,14 +38,16 @@
 //! 別軸の権限であり（テーブル・カタログは全テナント共有）、RLS の判定を
 //! 一切変更しない。
 
+use crate::catalog::sequence::AlterSequenceError;
 use crate::catalog::{
     AlterApply, AlterCheckError, CascadedObject, CatalogError, ColumnDef, ColumnDefault,
     ColumnType, CreateIndexError, IndexDef, IndexKind, TableSchema, MAX_COLUMN_DEFAULT_LEN,
 };
 use crate::schema_limits::SchemaLimits;
+use crate::sql::allowlist::AlterSequenceAction;
 use crate::sql::allowlist::{
-    InsertLiteral, SqlSurfaceError, ValidatedAlterTable, ValidatedAlterTableAddCheck,
-    ValidatedAlterTableAddColumn, ValidatedAlterTableAddUnique,
+    InsertLiteral, SqlSurfaceError, ValidatedAlterSequence, ValidatedAlterTable,
+    ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn, ValidatedAlterTableAddUnique,
     ValidatedAlterTableAlterColumnDropDefault, ValidatedAlterTableAlterColumnDropNotNull,
     ValidatedAlterTableAlterColumnSetDefault, ValidatedAlterTableAlterColumnSetNotNull,
     ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
@@ -2793,6 +2795,10 @@ pub struct CreateSequenceOutcome {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropSequenceOutcome {}
 
+/// `ALTER SEQUENCE`（TABLE-24・SQL-23、Issue #1689）の成功応答（RENAME も同じ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlterSequenceOutcome {}
+
 /// SEQUENCE 定義の意味検証と既定値の補完（bigint 前提。PostgreSQL 17 の公開挙動）。
 /// 昇順の既定は `MINVALUE 1`・`MAXVALUE i64::MAX`・`START = MINVALUE`、降順の既定は
 /// `MINVALUE i64::MIN`・`MAXVALUE -1`・`START = MAXVALUE`。違反は `22023`（固定文言。値を含めない）。
@@ -2857,6 +2863,39 @@ pub(crate) fn execute_drop_sequence(
         .drop_sequence(validated.name())
         .map_err(|e| map_sequence_error(e, "DROP SEQUENCE failed"))?;
     Ok(DropSequenceOutcome {})
+}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体（Issue #1689）。
+/// オプション変更は `Storage::alter_sequence`（範囲違反は `22023`）、`RENAME TO` は
+/// `Storage::rename_sequence` へ委譲する。`tenant_id` は RESTART なしの範囲検査で
+/// 呼び出し元テナントの現在値を読むためだけに使う（他テナントの状態は読まない）。
+pub(crate) fn execute_alter_sequence(
+    storage: &Storage,
+    tenant_id: &str,
+    validated: &ValidatedAlterSequence,
+) -> Result<AlterSequenceOutcome, SqlSurfaceError> {
+    match &validated.action {
+        AlterSequenceAction::Options(alter) => storage
+            .alter_sequence(validated.name(), tenant_id, alter)
+            .map_err(|e| match e {
+                AlterSequenceError::Range(r) => {
+                    SqlSurfaceError::InvalidParameterValue { detail: r.detail() }
+                }
+                AlterSequenceError::Catalog(c) => map_sequence_error(c, "ALTER SEQUENCE failed"),
+            })?,
+        AlterSequenceAction::Rename { new_name } => storage
+            .rename_sequence(validated.name(), new_name)
+            .map_err(|e| match e {
+                // 名前参照の DEFAULT が壊れるため RENAME は拒否する（fail-closed）。
+                CatalogError::DependentObjectsStillExist(_) => {
+                    SqlSurfaceError::feature_not_supported(
+                        "ALTER SEQUENCE RENAME of a sequence used by a column default is not supported",
+                    )
+                }
+                other => map_sequence_error(other, "ALTER SEQUENCE failed"),
+            })?,
+    }
+    Ok(AlterSequenceOutcome {})
 }
 
 /// SEQUENCE DDL の [`CatalogError`] を SQL 表層の契約へ写像する（名前重複 `42P07`・不在 `42P01`・
