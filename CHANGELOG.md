@@ -9,6 +9,14 @@
 
 ### Breaking Changes
 
+- 式索引の格納（Issue #1648・INDEX-10）: 従来 `0A000` だった `CREATE INDEX ... ((<式>))`／`(f(col))` のうち
+  決定的な式を、書き込みトランザクション内で束縛して永続化する（未知列 `42703`・型不整合は束縛側の
+  SQLSTATE・型で決まる非決定性 `42P17`・索引化できない結果型 `0A000`）。`UNIQUE`・`USING hnsw`・式への
+  `COLLATE` との組み合わせは引き続き `0A000`。参照列の `DROP COLUMN` は式索引を連鎖削除し、
+  `RENAME COLUMN`／`ALTER COLUMN TYPE` は `0A000`。公開 API は `IndexDef.expressions`（pub フィールド追加）・
+  `IndexExpressionDef`・`IndexDef::with_expressions` の追加。式を含む宣言のカタログ形式は新版 `v4`
+  （`v1`／`v2`／`v3` のバイト列は不変。旧バイナリは `v4` を読めない）。公開の `Storage::create_index` は
+  式付きの `IndexDef` を `Invalid` で拒否する（SQL 表層のみが作成できる）。
 - `REFRESH MATERIALIZED VIEW [CONCURRENTLY] <名前> [WITH [NO] DATA]`（Issue #1665・TABLE-42）:
   従来 `42601` だった構文を受理し、全文脈の実体を同じスナップショットから単一トランザクションで作り直す。
   失敗時は旧実体が残る。`WITH NO DATA` は実体を破棄して未実体化（`55000`）にする。タグは固定の
