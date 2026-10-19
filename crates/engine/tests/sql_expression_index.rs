@@ -7,11 +7,12 @@
 //! production 経路として使う）。検証する契約（詳細は `docs/design/expression-index.md`）:
 //!
 //! - 非決定式は `42P17`、集計は `42803`、ウィンドウは `42P20`、部分クエリ・SRF・組み込み以外の
-//!   関数は `0A000`。UNIQUE・hnsw・`COLLATE` と式の組み合わせは後続 Issue までの間 `0A000`
+//!   関数は `0A000`。hnsw・`COLLATE` と式の組み合わせは `0A000`（UNIQUE と式の組み合わせは
+//!   `sql_expression_unique_index.rs`〔Issue #1651〕）
 //! - 構文段の判定はカタログを参照しない（権限の有無・対象の有無に依存せず同じ分類。存在オラクルにならない）
 //! - 決定的な式は書き込みトランザクション内で束縛して永続化される（未知列 `42703`・型不整合・
 //!   型による決定性の再判定 `42P17`・索引化できない結果型 `0A000`）。参照列の `DROP COLUMN` は
-//!   連鎖削除、`RENAME COLUMN`／`ALTER COLUMN TYPE` は `0A000` で無変化
+//!   連鎖削除、`RENAME COLUMN` は式テキストの追随、`ALTER COLUMN TYPE` は再束縛（Issue #1651）
 //! - 拒否後にカタログ・世代・クエリ結果が変わらない
 //! - 拒否文言は固定で、列名・値・テナント名を含まない
 //! - 式のノード数・深さには上限がある（`54000`）
@@ -110,8 +111,7 @@ fn expression_rejections_are_classified_before_the_catalog() {
         ("CREATE INDEX i ON docs ((EXISTS (SELECT 1)))", "0A000"),
         ("CREATE INDEX i ON docs ((unnest(lang)))", "0A000"),
         ("CREATE INDEX i ON docs ((no_such_fn(lang)))", "0A000"),
-        // UNIQUE・式への COLLATE は後続 Issue までの間、最終ゲートの 0A000。
-        ("CREATE UNIQUE INDEX i ON docs ((lower(lang)))", "0A000"),
+        // 式への COLLATE は最終ゲートの 0A000（UNIQUE と式の組み合わせは Issue #1651 で受理する）。
         (
             "CREATE INDEX i ON docs ((lower(lang)) COLLATE \"C\")",
             "0A000",
@@ -155,7 +155,7 @@ fn rejected_expression_index_leaves_no_declaration() {
     for sql in [
         "CREATE INDEX i ON docs ((now()))",
         "CREATE INDEX i ON docs ((lower(no_such_column)))",
-        "CREATE UNIQUE INDEX i ON docs ((lower(lang)))",
+        "CREATE UNIQUE INDEX i ON docs ((lower(no_such_column)))",
     ] {
         run(&core, &mut s, sql).expect_err(sql);
         assert_eq!(code_of(&core, &mut s, "DROP INDEX i"), "42704", "{sql}");
@@ -186,10 +186,6 @@ fn rejection_messages_are_fixed_and_leak_nothing() {
         (
             "CREATE INDEX i ON docs ((SELECT lang FROM docs))",
             "feature not supported: cannot use subquery in index expression",
-        ),
-        (
-            "CREATE UNIQUE INDEX i ON docs ((lower(lang)))",
-            "feature not supported: CREATE UNIQUE INDEX does not support expression indexes yet",
         ),
         (
             "CREATE INDEX i ON docs ((CAST(lang AS uuid)))",
@@ -387,8 +383,8 @@ fn type_dependent_determinism_is_rechecked_at_binding() {
     }
 }
 
-/// 参照列の `DROP COLUMN` は式索引を連鎖削除する。`RENAME COLUMN`／`ALTER COLUMN TYPE` は
-/// `0A000` で何も変えない。参照しない列なら成功する。
+/// 参照列の `DROP COLUMN` は式索引を連鎖削除し、`RENAME COLUMN` は式テキストを追随させ、
+/// `ALTER COLUMN TYPE` は式を再束縛して索引を保つ（Issue #1651）。参照しない列は何も変えない。
 #[test]
 fn referenced_column_changes_follow_the_expression_index() {
     let (path, _guard) = open_fixture("expr-index-alter");
@@ -398,19 +394,7 @@ fn referenced_column_changes_follow_the_expression_index() {
     drop(core);
     let before = list(&path);
     let core = core_at(&path);
-    assert_eq!(
-        code_of(&core, &mut s, "ALTER TABLE docs RENAME COLUMN lang TO l2"),
-        "0A000"
-    );
-    assert_eq!(
-        code_of(
-            &core,
-            &mut s,
-            "ALTER TABLE docs ALTER COLUMN lang TYPE varchar(10)"
-        ),
-        "0A000"
-    );
-    // 参照しない列は改名できる。
+    // 参照しない列の改名・型変更は索引を変えない。
     run(
         &core,
         &mut s,
@@ -419,9 +403,32 @@ fn referenced_column_changes_follow_the_expression_index() {
     .expect("rename body");
     drop(core);
     assert_eq!(list(&path), before);
+    // 参照列の改名で式テキストと参照列が新しい名前になる。
+    let core = core_at(&path);
+    run(&core, &mut s, "ALTER TABLE docs RENAME COLUMN lang TO l2").expect("rename lang");
+    drop(core);
+    let renamed = list(&path);
+    assert_eq!(renamed.len(), 1);
+    let expr = renamed[0].expressions[0].as_ref().expect("expression");
+    assert!(
+        expr.sql.contains("l2") && !expr.sql.contains("lang"),
+        "{}",
+        expr.sql
+    );
+    assert_eq!(expr.referenced_columns, vec!["l2".to_string()]);
+    // 参照列の型変更は再束縛して索引を残す。
+    let core = core_at(&path);
+    run(
+        &core,
+        &mut s,
+        "ALTER TABLE docs ALTER COLUMN l2 TYPE varchar(10)",
+    )
+    .expect("alter type");
+    drop(core);
+    assert_eq!(list(&path).len(), 1);
     // 参照列の削除で索引ごと消える。
     let core = core_at(&path);
-    run(&core, &mut s, "ALTER TABLE docs DROP COLUMN lang").expect("drop column");
+    run(&core, &mut s, "ALTER TABLE docs DROP COLUMN l2").expect("drop column");
     drop(core);
     assert!(list(&path).is_empty());
 }

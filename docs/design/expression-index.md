@@ -2,7 +2,7 @@
 
 対象: Issue #1647（親 #1646）。ポインタ: `docs/spec/04-behavior/indexing.md` INDEX-10・INDEX-7
 （spec 本文は転記しない）。#1648（キー計算・エンコード・カタログ永続化）は本書末尾の「Issue #1648」節。
-後続: #1649（DML 維持）→ #1650（プランナ選択。実施済み）→（UNIQUE・失効は #1651）。
+後続: #1649（DML 維持）→ #1650（プランナ選択）→ #1651（UNIQUE・失効管理）。いずれも実施済み。
 
 ## 範囲
 
@@ -83,8 +83,8 @@
   （カタログ形式の新版。式は正規化 SQL テキストで保存し再パースの往復一致を検査）。
   `Storage::create_index` の write txn 内で式を束縛して型依存区分を再判定し、`TimestampTzLiteral`
   （`session_local`）を確定値へ畳み、式から参照列集合を抽出する。
-- **#1651**: `UNIQUE` 式索引の強制、参照列の `DROP COLUMN`（索引削除）・`ALTER TYPE`（再構築）・
-  `RENAME COLUMN` 追随。
+- **#1651**（実施済み。本書末尾の「Issue #1651」節）: `UNIQUE` 式索引の強制、参照列の `DROP COLUMN`（索引削除）・
+  `ALTER TYPE`（再構築）・`RENAME COLUMN` 追随。
 - **#1650**（実施済み。本書末尾の「Issue #1650」節）: 正規化構文での式一致判定（#1648 の正規化テキストを共有）。
 
 ## Issue #1648（格納側: 束縛・永続化・キー計算）
@@ -100,7 +100,7 @@ Issue #1647 の最終ゲートを縮小し、決定的な式の索引を `Storag
 | 組み合わせ | 担当 | 文言 |
 | ---------- | ---- | ---- |
 | `USING hnsw` ＋式 | — | `USING hnsw does not support expression indexes` |
-| `UNIQUE` ＋式 | #1651 | `CREATE UNIQUE INDEX does not support expression indexes yet` |
+| `UNIQUE` ＋式 | #1651（実施済み） | 受理に変更（本書末尾「Issue #1651」節） |
 | 式を含む索引の `COLLATE`（式への指定は要素末尾・式の最上位とも、素の列への指定も。v4 は照合を持たない） | 後続 | `COLLATE on an index expression is not supported yet` |
 
 ### 束縛の判定順（`sql::index_expr::bind_index_expression`。write txn 内）
@@ -165,13 +165,13 @@ must be marked IMMUTABLE`）にする。型を決められない部分式は判�
 | 操作 | 挙動 |
 | ---- | ---- |
 | 参照列の `DROP COLUMN` | 式索引を連鎖削除する（PostgreSQL と同じ。古い宣言を残さない） |
-| 参照列の `RENAME COLUMN` | `0A000`、カタログ・世代は不変（追随は #1651） |
-| 参照列の `ALTER COLUMN TYPE` | `0A000`、カタログ・世代は不変（再構築は #1651） |
+| 参照列の `RENAME COLUMN` | #1651 で式テキストを追随させる（本書末尾「Issue #1651」節。#1648 時点の `0A000` は撤去） |
+| 参照列の `ALTER COLUMN TYPE` | #1651 で式を再束縛して再検証する（同上。#1648 時点の `0A000` は撤去） |
 | 参照しない列の変更、テーブル改名 | 影響なし（式は修飾名を持たない） |
 | `DROP TABLE` | 式索引ごと消える |
 
-`RENAME`／`ALTER TYPE` の拒否は write txn 内で判定する（`AlterCheckError::Sql` で固定文言を返す。
-`CatalogError` の variant は増やさず、`core_api.snapshot` を広げない）。
+（#1648 時点の `RENAME`／`ALTER TYPE` の拒否は、#1651 で追随・再束縛に置き換えた。`CatalogError` の variant は
+増やさず、`core_api.snapshot` を広げない方針は変わらない。）
 
 ### 式キー索引（`sql::expression_key_index`）
 
@@ -196,7 +196,7 @@ must be marked IMMUTABLE`）にする。型を決められない部分式は判�
 | ---- | ---- | ------------ |
 | INSERT／UPDATE 時の式評価エラーで DML を失敗させる・crash 整合 | #1649（実施済み） | 下記「Issue #1649」節。全書き込み経路が commit 前に式を評価し、評価エラーを拒否する |
 | WHERE の式一致・EXPLAIN 表示 | #1650（実施済み） | 下記「Issue #1650」節。ORDER BY の式一致は未対応 |
-| UNIQUE 式索引・`RENAME`／`ALTER TYPE` の追随 | #1651 | 構文段で `0A000`／write txn 内で `0A000` |
+| UNIQUE 式索引・`RENAME`／`ALTER TYPE` の追随 | #1651（実施済み） | 下記「Issue #1651」節 |
 | 式への `COLLATE`（ICU 照合の辞書） | 後続 | `0A000` |
 
 ## Issue #1649（DML 維持・構築時検証）
@@ -297,3 +297,52 @@ must be marked IMMUTABLE`）にする。型を決められない部分式は判�
 - `declared_index_targets_in_txn` には世代キーのキャッシュが無い。式候補を含むクエリは毎回カタログ走査と
   宣言の再束縛を行う（宣言数は `MAX_INDEX_COUNT` が上限で、DDL 権限者しか増やせない）。キャッシュ化は後続候補。
 - ORDER BY の式一致による索引順走査（`ExpressionKeyIndex::ordered_slots` の消費）は本件の対象外。
+
+## Issue #1651（UNIQUE と失効管理）
+
+対象: Issue #1651（親 #1646）。ポインタ: `docs/spec/04-behavior/indexing.md` INDEX-10・INDEX-9
+（spec 本文は転記しない）。#1648〜#1650 で残っていた 3 つの暫定 `0A000`（`CREATE UNIQUE INDEX ... ((式))`・
+参照列の `RENAME COLUMN`・参照列の `ALTER COLUMN TYPE`）を撤去し、式一意性の強制と列変更への追随を実装する。
+
+### 判断
+
+| # | 判断 | 理由 |
+| - | ---- | ---- |
+| D1 | 一意の式索引は `TableSchema::unique_constraints` へ展開しない。索引カタログ（`IndexDef`）だけに持ち、強制は永続一意索引 `user_uniq/{table}` の拡張で行う | 列だけの一意索引は UNIQUE 制約へ展開する方式だが、式には列リストが無い。制約に入れると `ON CONFLICT` の推論・FK の参照先・`information_schema` へ波及する。INDEX-9 の「索引は制約として扱わない」とも整合し、#1649 の D1 が予告した `user_uniq` の拡張に従う |
+| D2 | キーの仕様は `constraint::UniqueKeyPlan`。序数は主キー → UNIQUE 制約 → 一意の式索引（索引名の昇順）の順。要素は素の列または式で、キーは要素ごとの正準成分の連結。1 要素でも NULL ならキーを持たない（NULLS DISTINCT）。混在形 `((lower(a)), b)` も同じ合成で扱う | 列要素は既存の `push_canonical_component`、式要素は `classify_expression_value` の分類を共有し、タグ（`0xE1`〜`0xE3`）は列成分のタグ（0〜14）と重ならない。書き込み検査・バックフィル・読み戻し・作成時の重複走査が `UniqueKeyPlan::row_keys` の 1 関数を通り、判定が 2 系統にならない。列だけのキーのバイト列は従来と同一 |
+| D3 | マーカーのシグネチャへ一意の式索引の仕様（索引名・要素の種別・列名と型タグ、または式の正規化 SQL・結果型・参照列の名前と型の指紋）を追記し、`FORMAT_VERSION` を 2 → 3 に上げる | 作成・削除・式の変更・参照列の改名や型変更のどれでもマーカーが不一致になり、古い正引きエントリを流用せず再構築する（fail-closed）。上げた版は全テナントで初回の書き込み時に 1 回だけ再構築を起こす |
+| D4 | 式索引の宣言の読み込みと式のコンパイルは 1 文につき 1 回。`enforce_row_constraints_in_txn` が索引カタログを 1 回だけ走査し、式の評価段（#1649）と一意検査段へ同じ `CompiledIndexExpressions` を渡す | 式索引の無い表のコストを「索引カタログの 1 回走査」のまま保つ。TRUNCATE・DELETE の後片付けは、`user_uniq` の物理的な存在確認だけで読み飛ばす（PK・UNIQUE が無い表でも式一意索引の永続索引があり得るため、スキーマ側の有無では判定しない） |
+| D5 | カタログ形式に新版 `v5`（`v4` と同じ行構成の末尾に固定行 `unique`）を追加する。`v1`〜`v4` のバイト列は変えない | 旧バイナリは `v5` を未知の版として拒否する（前方互換なし。BREAKING） |
+| D6 | `RENAME COLUMN` は再解析 → AST 上の識別子写像（`map_expr_idents`。1 回の走査で一括適用） → 改名後のスキーマで再束縛 → 写像後の参照列集合の一致確認 → 正規化テキストと参照列を保存。どの段の失敗も `0A000` で txn を破棄する | 文字列置換を使わない。`CHECK` の改名追随と同型で、列の入れ替え（`a→tmp, b→a, tmp→b`）でも連鎖置換が起きない |
+| D7 | `ALTER COLUMN TYPE` は行の書き換え・キー再検証の後、世代 bump の前に、変更列を参照する式索引を新スキーマで再束縛し、全式索引を再コンパイルして全テナント・全可視性の既存行を再検証し、一意の式索引はテナントごとの重複を再走査し、`user_uniq` を失効させる | 新しい値・新しい型で検査する必要がある。メモリ上の式キー索引は世代ごとに作り直す派生物なので、「再構築」は世代 bump で成立する |
+
+### SQLSTATE と挙動
+
+| 操作 | 結果 |
+| ---- | ---- |
+| `CREATE UNIQUE INDEX ... ((式))` | 受理。式・列要素の束縛は #1648 と同じ。素の列要素は一意キー許可型だけ（`id` 等は `0A000`）。制約名前空間との衝突は `42P07` |
+| 作成時に既存行（全テナント・全可視性）へ重複 | `23505`。テナントごとに独立して判定。索引・世代は変わらず、応答にテナント・行・値・件数を含めない |
+| INSERT／UPDATE／UPSERT／COPY／NoSQL の重複 | `23505`（全書き込み経路が `enforce_row_constraints_in_txn` を通る）。不可視行とも衝突し、別テナントとは衝突しない |
+| `DROP INDEX` | 強制が外れる。`user_uniq` を失効させ、再作成ではマーカーを作り直す |
+| 参照列の `DROP COLUMN` | 一意・非一意とも索引を連鎖削除（PostgreSQL と同じ。`CASCADE` 不要）。一意の式索引を消したら `user_uniq` も失効 |
+| 参照列の `RENAME COLUMN` | 式テキスト・参照列・素の列要素を追随。追随できなければ `0A000`（無変化） |
+| 参照列の `ALTER COLUMN TYPE` | 再束縛の失敗はその SQLSTATE（`42883`／`42804`／`42P17`／`0A000`）、既存行の評価エラーはその SQLSTATE（固定文言）、一意の重複は `23505`。いずれも表・索引は無変化 |
+
+### PostgreSQL との差
+
+- 整数の式は `f64` キーになるため、2^53 を超える `BIGINT` の値は同じキーに丸まり、PostgreSQL では一意な値が
+  `23505` になり得る（拒否が増える側の差で、fail-open ではない）。
+- 非有限の数値は `22003` で拒否する（#1649 から継続）。TEXT の一意性はバイト等価（決定的照合と同じ）。
+
+### 検証
+
+- `crates/engine/tests/sql_expression_unique_index.rs`: 全書き込み経路・NULLS DISTINCT・テナント独立・不可視行・
+  複合形・ロールバック・作成時の重複・`IF NOT EXISTS`・名前衝突・再オープン・`DROP`／`RENAME`／`ALTER TYPE`。
+- `make crash-test-unique-index`: `docs_xidx` の一意の式索引について、`verify_unique_index_read_only` の成功と、
+  再起動後の大文字小文字違いの再挿入が `23505` になることを確かめる（新しい CI ジョブは作らない）。
+
+### 対象外
+
+- `ON CONFLICT ((式))` の推論（SQL-49。推論は `unique_constraints` だけを見るので挙動は不変）。
+- 一意の式索引を FK の参照先にすること（列リストが無いため不可。PostgreSQL も同様）。
+- 式要素への `COLLATE`・matview への式索引（従来どおり `0A000`）、ORDER BY の式一致による索引順走査。

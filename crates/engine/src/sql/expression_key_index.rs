@@ -14,7 +14,8 @@
 //!   クエリの成否・結果には影響しない（多層防御。通常は下記の DML ゲートで起こらない）。
 //!   消費者は 2 つ: WHERE の式述語を候補スロットへ写す [`ExpressionKeyIndex::candidates_for_comparison`]
 //!   （Issue #1650。`sql::scalar_index::ScalarIndex::resolve_candidates` が呼ぶ）と、テストの順序付き
-//!   走査 API。ORDER BY の式一致による索引順走査と UNIQUE・失効の追随は後続 Issue の責務。
+//!   走査 API。ORDER BY の式一致による索引順走査は後続 Issue の責務。UNIQUE の強制と列変更への追随は Issue #1651
+//!   （[`CompiledIndexExpressions::push_unique_key_component`] が一意キーの式成分を作る）。
 //! - プランナ選択（Issue #1650）: [`ExpressionIndexMatcher`] が保存済み宣言を再束縛した式木を持ち、
 //!   WHERE 側の束縛済み式木と構造一致した述語だけを索引対応にする。分類（`sql::scalar_plan`）・
 //!   実行（`sql::exec` 等）・EXPLAIN（`core.rs`）が同じ一致判定 [`ExpressionIndexMatcher::find`] を
@@ -152,43 +153,160 @@ impl CompiledIndexExpressions {
         metadata: &[u8],
     ) -> Result<(), TenantWriteError> {
         let mut scratch = Vec::new();
-        for element in &self.elements {
-            let scanned =
-                crate::row_codec::scan_scalar_columns_masked(schema, metadata, Some(&element.mask))
-                    .map_err(|e| {
-                        TenantWriteError::Catalog(crate::catalog::CatalogError::CorruptSchema(
-                            e.to_string(),
-                        ))
-                    })?;
-            let emb: &[f32] = if element.bound.references_embedding {
-                embedding
-            } else {
-                &[]
-            };
-            let value = element
-                .bound
-                .program
-                .eval(id, emb, &scanned, &mut scratch)
-                .map_err(TenantWriteError::IndexExpressionEvaluationFailed)?;
-            match classify_expression_value(element.bound.ty, &value) {
-                Ok(_) => {}
-                Err(ClassifyError::NonFinite) => {
-                    return Err(TenantWriteError::IndexExpressionEvaluationFailed(
-                        SqlSurfaceError::NumericOutOfRange {
-                            detail: "index expression value is out of range".to_string(),
-                        },
-                    ));
-                }
-                Err(ClassifyError::TypeMismatch) => {
-                    return Err(TenantWriteError::IndexExpressionEvaluationFailed(
-                        SqlSurfaceError::Internal {
-                            detail: "index expression result type mismatch".to_string(),
-                        },
-                    ));
-                }
-            }
+        for position in 0..self.elements.len() {
+            self.eval_element(
+                position,
+                schema,
+                id,
+                embedding,
+                metadata,
+                &mut scratch,
+                |_| {},
+            )?;
         }
         Ok(())
+    }
+
+    /// 式要素 `position` を 1 行で評価し、分類した値を `use_key` へ渡す。評価・分類のエラー写像は
+    /// [`Self::enforce`] と共通（2 系統に分けない）。
+    #[allow(clippy::too_many_arguments)]
+    fn eval_element<R>(
+        &self,
+        position: usize,
+        schema: &TableSchema,
+        id: u64,
+        embedding: &[f32],
+        metadata: &[u8],
+        scratch: &mut Vec<crate::sql::expr_program::StackValue>,
+        use_key: impl FnOnce(&ClassifiedKey<'_>) -> R,
+    ) -> Result<R, TenantWriteError> {
+        let element = self.elements.get(position).ok_or_else(drifted)?;
+        let scanned =
+            crate::row_codec::scan_scalar_columns_masked(schema, metadata, Some(&element.mask))
+                .map_err(|e| {
+                    TenantWriteError::Catalog(crate::catalog::CatalogError::CorruptSchema(
+                        e.to_string(),
+                    ))
+                })?;
+        let emb: &[f32] = if element.bound.references_embedding {
+            embedding
+        } else {
+            &[]
+        };
+        let value = element
+            .bound
+            .program
+            .eval(id, emb, &scanned, scratch)
+            .map_err(TenantWriteError::IndexExpressionEvaluationFailed)?;
+        match classify_expression_value(element.bound.ty, &value) {
+            Ok(key) => Ok(use_key(&key)),
+            Err(ClassifyError::NonFinite) => {
+                Err(TenantWriteError::IndexExpressionEvaluationFailed(
+                    SqlSurfaceError::NumericOutOfRange {
+                        detail: "index expression value is out of range".to_string(),
+                    },
+                ))
+            }
+            Err(ClassifyError::TypeMismatch) => Err(
+                TenantWriteError::IndexExpressionEvaluationFailed(SqlSurfaceError::Internal {
+                    detail: "index expression result type mismatch".to_string(),
+                }),
+            ),
+        }
+    }
+
+    /// 式要素 `position` の値を一意キー用の正準成分として `out` へ足す（INDEX-9・INDEX-10、
+    /// Issue #1651）。NULL なら何も足さず `Ok(false)`（NULLS DISTINCT: 呼び出し元はキーを持たない
+    /// 行として扱う）。分類は [`classify_expression_value`] を共有し、成分は列要素の成分
+    /// （`constraint::push_canonical_component`）と衝突しないタグ付き・長さ前置の形にする。
+    pub(crate) fn push_unique_key_component(
+        &self,
+        position: usize,
+        schema: &TableSchema,
+        id: u64,
+        embedding: &[f32],
+        metadata: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<bool, TenantWriteError> {
+        let mut scratch = Vec::new();
+        self.eval_element(
+            position,
+            schema,
+            id,
+            embedding,
+            metadata,
+            &mut scratch,
+            |key| match key {
+                ClassifiedKey::Null => false,
+                ClassifiedKey::Bytes(b) => {
+                    push_expression_component(out, EXPR_KEY_TAG_BYTES, b);
+                    true
+                }
+                ClassifiedKey::F64Sortable(bits) => {
+                    push_expression_component(out, EXPR_KEY_TAG_F64, &bits.to_be_bytes());
+                    true
+                }
+                ClassifiedKey::I64(v) => {
+                    push_expression_component(out, EXPR_KEY_TAG_I64, &v.to_be_bytes());
+                    true
+                }
+            },
+        )
+    }
+
+    /// 式要素 `position` の識別を `out` へ足す（一意キー索引のマーカーのシグネチャ用）。正規化 SQL・
+    /// 結果型・参照列の名前と型の指紋を含めるため、式の変更・参照列の改名・型変更で必ず変わる。
+    pub(crate) fn push_signature(
+        &self,
+        position: usize,
+        schema: &TableSchema,
+        out: &mut Vec<u8>,
+    ) -> Result<(), TenantWriteError> {
+        let element = self.elements.get(position).ok_or_else(drifted)?;
+        push_len_prefixed_u32(out, element.bound.sql.as_bytes());
+        out.push(expr_type_tag(element.bound.ty));
+        for (column, referenced) in schema.columns.iter().zip(&element.mask) {
+            if !*referenced {
+                continue;
+            }
+            push_len_prefixed_u32(out, column.name.as_bytes());
+            let (tag, param) = column.catalog_fields().map_err(TenantWriteError::Catalog)?;
+            push_len_prefixed_u32(out, tag.as_bytes());
+            push_len_prefixed_u32(out, param.as_bytes());
+        }
+        Ok(())
+    }
+}
+
+/// 式成分のタグ（`TEXT` のバイト列）。列要素のタグ（`ColumnType::unique_key_tag` は 0..=14、配列の
+/// 要素タグは別の入れ子）と重ならない値にする。
+pub(crate) const EXPR_KEY_TAG_BYTES: u8 = 0xE1;
+/// 式成分のタグ（数値の全順序 `u64` ビット表現）。
+pub(crate) const EXPR_KEY_TAG_F64: u8 = 0xE2;
+/// 式成分のタグ（`DATE`／`TIMESTAMP`／`TIME`／`TIMESTAMPTZ` の `i64`）。
+pub(crate) const EXPR_KEY_TAG_I64: u8 = 0xE3;
+
+/// `[tag: u8][len: u32 BE][payload]`。長さ前置で成分の境界が曖昧にならない。
+fn push_expression_component(out: &mut Vec<u8>, tag: u8, payload: &[u8]) {
+    out.push(tag);
+    push_len_prefixed_u32(out, payload);
+}
+
+fn push_len_prefixed_u32(out: &mut Vec<u8>, payload: &[u8]) {
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+/// 式の結果型の永続化用タグ（シグネチャ専用。索引化できる型だけが現れる）。
+fn expr_type_tag(ty: ExprType) -> u8 {
+    match ty {
+        ExprType::Text => 1,
+        ExprType::Scalar => 2,
+        ExprType::Date => 3,
+        ExprType::Timestamp => 4,
+        ExprType::Time => 5,
+        ExprType::TimestampTz => 6,
+        _ => 0xFF,
     }
 }
 
@@ -664,6 +782,23 @@ fn reserve_exact_one(v: &mut Vec<u32>) -> Result<(), ScalarIndexBuildError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 式成分のタグは列要素のタグ（`ColumnType::unique_key_tag` の 0..=14）と配列要素のマーク
+    /// （0x80・0x40）に重ならず、互いにも異なる（Issue #1651。複合キーで成分が衝突しない前提）。
+    #[test]
+    fn expression_component_tags_are_disjoint_from_column_tags() {
+        let expr_tags = [EXPR_KEY_TAG_BYTES, EXPR_KEY_TAG_F64, EXPR_KEY_TAG_I64];
+        for (i, a) in expr_tags.iter().enumerate() {
+            assert!(*a > 14, "tag {a:#x} collides with a column key tag");
+            for b in &expr_tags[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // 長さ前置の成分形。
+        let mut out = Vec::new();
+        push_expression_component(&mut out, EXPR_KEY_TAG_BYTES, b"ab");
+        assert_eq!(out, [EXPR_KEY_TAG_BYTES, 0, 0, 0, 2, b'a', b'b']);
+    }
 
     /// 値の分類（INDEX-10、Issue #1649）: NULL は索引に含め、非有限と型不一致は拒否する。
     #[test]

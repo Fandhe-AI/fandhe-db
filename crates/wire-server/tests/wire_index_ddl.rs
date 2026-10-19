@@ -212,7 +212,6 @@ fn wire_index_ddl_error_classification() {
         // 型・組み合わせの拒否（Issue #1648）。束縛側の SQLSTATE がそのまま届く。
         ("CREATE INDEX idx_e ON docs ((lower(nope)))", "42703"),
         ("CREATE INDEX idx_e ON docs ((CAST(body AS uuid)))", "0A000"),
-        ("CREATE UNIQUE INDEX idx_e ON docs ((lower(body)))", "0A000"),
     ] {
         expect_error(&mut stream, sql, code);
     }
@@ -232,12 +231,23 @@ fn wire_index_ddl_error_classification() {
         "CREATE INDEX idx_lower ON docs ((upper(body)))",
         "42P07",
     );
-    // 参照列の改名・型変更は拒否される（無変化）。
-    expect_error(
+    // 一意の式索引は作成でき（Issue #1651）、参照列の改名は式テキストを追随させて成功する。
+    expect_command(
+        &mut stream,
+        "CREATE UNIQUE INDEX idx_ue ON docs ((lower(body)))",
+        "CREATE INDEX",
+    );
+    expect_command(
         &mut stream,
         "ALTER TABLE docs RENAME COLUMN body TO body2",
-        "0A000",
+        "ALTER TABLE",
     );
+    expect_command(
+        &mut stream,
+        "ALTER TABLE docs RENAME COLUMN body2 TO body",
+        "ALTER TABLE",
+    );
+    expect_command(&mut stream, "DROP INDEX idx_ue", "DROP INDEX");
     expect_command(&mut stream, "DROP INDEX idx_lower", "DROP INDEX");
     expect_command(&mut stream, "DROP INDEX idx_body", "DROP INDEX");
     // 削除済みでも `IF EXISTS` は no-op で成功する（Issue #1614）。

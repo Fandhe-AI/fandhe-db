@@ -25,6 +25,11 @@
 //! 拒否されること（＝宣言と検査点がクラッシュ後も生存している）と、`n = 0` の行が 1 行も無いこと
 //! （＝コミット済みの全行が式を評価できる＝派生索引を作り直せる）を確かめる。
 //!
+//! Issue #1651（INDEX-9・INDEX-10）で、同じ表へ一意の式索引 `((lower(code)))` を加えた。`verify` は
+//! 読み取り専用の `verify_unique_index_read_only` が式一意仕様を含めて成功すること（＝永続一意索引の
+//! マーカーと全行の正引きエントリがクラッシュ後も生存している）と、既存 code の大文字小文字違いを
+//! 新しい id で再挿入すると再起動後も必ず `23505` で拒否されることを確かめる。
+//!
 //! サブコマンド:
 //! - `write <db_path>`: `docs (code TEXT UNIQUE)` テーブル（無ければ作成）へ、
 //!   `BATCH` 件の行を 1 `INSERT` 文（＝1 write トランザクション。UNIQUE 索引の
@@ -153,6 +158,8 @@ fn ensure_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
     for sql in [
         "CREATE INDEX IF NOT EXISTS docs_xidx_div ON docs_xidx ((100 / n))",
         "CREATE INDEX IF NOT EXISTS docs_xidx_lower ON docs_xidx ((lower(code)))",
+        // 一意の式索引（Issue #1651・INDEX-9）。`write` の code は行 id ごとに一意なので常に書ける。
+        "CREATE UNIQUE INDEX IF NOT EXISTS docs_xidx_ulower ON docs_xidx ((lower(code)))",
     ] {
         core.execute_sql_in_session(ctx, &mut session, sql)
             .map_err(|e| format!("create expression index failed: {e}"))?;
@@ -415,6 +422,38 @@ fn verify_expression_index_table(
     ctx: &PolicyContext,
     total_rows: u64,
 ) -> Result<(), String> {
+    // (0) 一意の式索引（Issue #1651）の永続一意索引が、再構築に隠蔽されずに生存している。
+    core.verify_unique_index_read_only(ctx, XIDX_TABLE)
+        .map_err(|e| {
+            format!("read-only unique expression index verification failed before probes: {e}")
+        })?;
+    // (0b) 既存 code の大文字小文字違い（式 `lower(code)` が同値）の再挿入は必ず `23505`。
+    for id in 0..total_rows {
+        let probe_id = total_rows
+            .checked_add(id)
+            .and_then(|v| v.checked_add(1))
+            .ok_or_else(|| "probe id overflow during verify".to_string())?;
+        let sql = format!(
+            "INSERT INTO {XIDX_TABLE} (id, n, code) VALUES ({probe_id}, 1, 'CODE-{id}') \
+             USING OPERATION_ID 'verify-xidx-dup-{probe_id}'"
+        );
+        match core.execute_insert_sql(ctx, &sql) {
+            Err(e) if e.wire_code() == "23505" => {}
+            Err(e) => {
+                return Err(format!(
+                    "unique expression probe for id={id} failed with an unexpected wire_code {} \
+                     (expected 23505): {e}",
+                    e.wire_code()
+                ));
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "unique expression probe for id={id} was wrongly accepted; the unique \
+                     expression index lost a forward entry after crash recovery"
+                ));
+            }
+        }
+    }
     // (a) `n = 0` の INSERT は `22012` で拒否され、その id の行が残らない。
     let probe_id = total_rows;
     let insert_sql = format!(
