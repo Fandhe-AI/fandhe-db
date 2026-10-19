@@ -56,6 +56,8 @@ pub(crate) struct RewrittenViewUpdate {
     pub(crate) update: ValidatedUpdateForm,
     /// `RETURNING` の出力列名（ビューの公開名。写像が不要なら `None`）。
     pub(crate) public_names: Option<Vec<String>>,
+    /// `WITH CHECK OPTION` の検査対象の述語（TABLE-43 (2)・Issue #1673。内側が先頭・物理列名）。
+    pub(crate) check_predicates: Vec<Vec<WherePredicate>>,
 }
 
 /// 連鎖を畳み込んだビューの解決結果（`Resolved::View` の所有版）。
@@ -64,6 +66,8 @@ struct ResolvedView {
     view_predicates: Vec<WherePredicate>,
     view_columns: Option<Vec<String>>,
     column_map: Option<Vec<(String, String)>>,
+    /// `WITH CHECK OPTION` の検査対象の述語（内側が先。[`Resolved::View::check_predicates`]）。
+    check_predicates: Vec<Vec<WherePredicate>>,
 }
 
 impl ResolvedView {
@@ -102,11 +106,13 @@ fn resolve_for_write(
             view_predicates,
             view_columns,
             column_map,
+            check_predicates,
         } => Ok(ResolvedView {
             base_table,
             view_predicates,
             view_columns,
             column_map,
+            check_predicates,
         }),
         // 自動更新可能と判定済みなのに `View` 以外になるのは不変条件違反（固定文言。fail-closed）。
         _ => Err(SqlSurfaceError::Internal {
@@ -298,6 +304,7 @@ pub(crate) fn rewrite_view_update(
             Ok(RewrittenViewUpdate {
                 update,
                 public_names,
+                check_predicates: rv.check_predicates.clone(),
             })
         }
         ValidatedUpdateForm::Predicate(v) => {
@@ -317,6 +324,7 @@ pub(crate) fn rewrite_view_update(
                     partitioned: None,
                 }),
                 public_names,
+                check_predicates: rv.check_predicates.clone(),
             })
         }
     }
@@ -351,6 +359,7 @@ mod tests {
 
     fn def(base: &str, body: &str, aliases: &[&str]) -> ViewDef {
         ViewDef {
+            check_option: crate::catalog::ViewCheckOption::None,
             base_relation: base.to_string(),
             body_sql: body.to_string(),
             column_aliases: aliases.iter().map(|a| a.to_string()).collect(),

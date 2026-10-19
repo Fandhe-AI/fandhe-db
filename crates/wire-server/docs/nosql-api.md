@@ -1162,6 +1162,7 @@ Date: <IMF-fixdate>
 | `42P20` | `WINDOWING_ERROR` | 400 | Bad Request | 式索引の式にウィンドウ関数がある（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |
 | `42P21` | `COLLATION_MISMATCH` | 400 | Bad Request | 式の明示的な `COLLATE` 同士の食い違い（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #2190 |
 | `42P22` | `INDETERMINATE_COLLATION` | 400 | Bad Request | 暗黙の照合の衝突を照合が必要な演算が消費した（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #2190 |
+| `44000` | `WITH_CHECK_OPTION_VIOLATION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（ビューへの書き込みは SQL 表層のみ。ビューの `WITH CHECK OPTION`〔TABLE-43〕違反。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
@@ -1182,8 +1183,8 @@ Date: <IMF-fixdate>
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 17 分類（`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
-`42809`・`42703`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`・`55000`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 18 分類（`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
+`42809`・`42703`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`・`55000`・`44000`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
@@ -1213,6 +1214,8 @@ SQL-28・RLS-10）は複数テーブル参照スコープの束縛基盤（`sql:
 `CONSTRAINT <name> PRIMARY KEY` と同じカタログ表現・同じ `wire_code`）。
 `ObjectNotInPrerequisiteState`（`55000`。TABLE-42、Issue #1664）は未実体化の MATERIALIZED VIEW を
 読んだときの分類で、NoSQL 表層は matview を表として解決しない（実要求は表の不在として拒否される）ため到達しない。
+`WithCheckOptionViolation`（`44000`。TABLE-43、Issue #1673）はビュー経由の書き込みが `WITH CHECK OPTION` の
+条件を満たさないときの分類で、NoSQL 表層はビューを表として解決しない（実要求は表の不在として拒否される）ため到達しない。
 `CardinalityViolation`（`21000`。SQL-29、Issue #1404）はスカラーサブクエリの
 2 行以上返却で、NoSQL 表層にサブクエリ構文が無いため到達しない。
 `PartialCompletion`（`VD001`）・`PartitionedDmlCancelled`（`VD002`。SQL-19・

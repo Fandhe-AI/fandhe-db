@@ -152,6 +152,7 @@ fn compose(inner: Resolved, def: &CteDef) -> Result<Resolved, SqlSurfaceError> {
             view_predicates,
             view_columns,
             column_map,
+            ..
         } => {
             // 列別名付きビュー（TABLE-41・Issue #1659）は CTE の本文からは未対応（fail-closed）。
             if column_map.is_some() {
@@ -195,6 +196,8 @@ fn compose(inner: Resolved, def: &CteDef) -> Result<Resolved, SqlSurfaceError> {
         view_predicates: acc_predicates,
         view_columns: next_exposed,
         column_map: None,
+        // CTE 経由の参照は読み取り専用（書き込み検査の対象外）。
+        check_predicates: Vec::new(),
     })
 }
 

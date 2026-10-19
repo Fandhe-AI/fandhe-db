@@ -44,6 +44,7 @@ impl TableLookup for Inner {
     }
     fn view_definition(&self, name: &str) -> Result<Option<ViewDef>, SqlSurfaceError> {
         Ok((name == "v").then(|| ViewDef {
+            check_option: crate::catalog::ViewCheckOption::None,
             base_relation: "t".to_string(),
             body_sql: "SELECT a FROM t".to_string(),
             column_aliases: Vec::new(),

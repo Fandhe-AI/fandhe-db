@@ -4294,6 +4294,7 @@ pub(crate) fn map_write_error(
         // `CHECK` 制約違反（TABLE-16・TASK-204、Issue #906）を `_` 節（`XX000`）へ
         // 丸めると、クライアントが「内部事象」と「宣言済み制約への違反」を
         // 判別できなくなる。制約名のみを含む固定文言（行の値・テナントは含まない）。
+        TenantWriteError::WithCheckOptionViolation => SqlSurfaceError::WithCheckOptionViolation,
         TenantWriteError::CheckViolation { constraint } => {
             SqlSurfaceError::check_violation(constraint)
         }
@@ -5512,6 +5513,9 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         // `CHECK` 制約違反（TABLE-16・TASK-204、Issue #906）もファイル形 INSERT で
         // 行形 INSERT（[`map_write_error`]）と同じ `23514` へ写像する（`_` 節へ
         // 丸めない）。制約名のみを含む固定文言。
+        IncrementalError::Write(TenantWriteError::WithCheckOptionViolation) => {
+            SqlSurfaceError::WithCheckOptionViolation
+        }
         IncrementalError::Write(TenantWriteError::CheckViolation { constraint }) => {
             SqlSurfaceError::check_violation(constraint)
         }
