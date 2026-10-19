@@ -1464,14 +1464,15 @@ fn assign_sequence_values(
                     }
                 },
             };
-            let (seq_id, params) =
-                sequence_definition_in_txn(write_txn, seq_name)?.ok_or_else(|| {
-                    TenantWriteError::Catalog(CatalogError::TableNotFound(seq_name.to_string()))
-                })?;
+            let seq_def = sequence_definition_in_txn(write_txn, seq_name)?.ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::TableNotFound(seq_name.to_string()))
+            })?;
+            let (seq_id, params, restart_value) =
+                (seq_def.id, seq_def.params, seq_def.restart_value);
             let value: i64 = match func {
                 SequenceFunc::Nextval => {
                     let v = allocator
-                        .next_value_in_txn(write_txn, tenant_id, seq_id, &params)
+                        .next_value_in_txn(write_txn, tenant_id, seq_id, &params, restart_value)
                         .map_err(|e| match e {
                             AllocError::LimitReached { ascending } => {
                                 sql_err(SqlSurfaceError::SequenceGeneratorLimitExceeded {

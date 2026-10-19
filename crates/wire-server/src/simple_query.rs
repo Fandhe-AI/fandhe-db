@@ -921,6 +921,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropSequence(_) => OutcomeResponse::Command {
             tag: "DROP SEQUENCE".to_string(),
         },
+        // Issue #1689: RENAME TO も同じタグ。
+        SqlOutcome::AlterSequence(_) => OutcomeResponse::Command {
+            tag: "ALTER SEQUENCE".to_string(),
+        },
     }
 }
 

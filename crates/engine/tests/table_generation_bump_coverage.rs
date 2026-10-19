@@ -494,12 +494,16 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 採番（`SequenceAllocator`）も状態表だけを書く（コミットは呼び出し側の INSERT の txn）。
     // 先頭 2 件が本体（`create_sequence`／`drop_sequence`）、残りは同ファイルの `#[cfg(test)]` 内
     // （状態行の種まき・採番の永続化確認）で、同じ理由で対象外。
-    ("catalog/sequence.rs", 448),
-    ("catalog/sequence.rs", 483),
-    ("catalog/sequence.rs", 535),
-    ("catalog/sequence.rs", 757),
-    ("catalog/sequence.rs", 812),
-    ("catalog/sequence.rs", 863),
+    ("catalog/sequence.rs", 699),
+    ("catalog/sequence.rs", 720),
+    ("catalog/sequence.rs", 763),
+    ("catalog/sequence.rs", 798),
+    ("catalog/sequence.rs", 853),
+    ("catalog/sequence.rs", 1127),
+    ("catalog/sequence.rs", 1212),
+    ("catalog/sequence.rs", 1480),
+    // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（763・798）も同じ表だけを書く
+    // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

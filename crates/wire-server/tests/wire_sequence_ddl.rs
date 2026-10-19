@@ -1,4 +1,4 @@
-//! `CREATE SEQUENCE` / `DROP SEQUENCE`（TABLE-24・SQL-23、Issue #1688）の簡易クエリプロトコル経由
+//! `CREATE SEQUENCE` / `DROP SEQUENCE` / `ALTER SEQUENCE`（TABLE-24・SQL-23、Issue #1688・#1689）の簡易クエリプロトコル経由
 //! （生バイトクライアント）検証（層 A）。
 //!
 //! 意味論そのものは `crates/engine/tests/table24_sequence_ddl.rs` が確定オラクル。本ファイルは
@@ -81,6 +81,8 @@ fn wire_sequence_ddl_without_permission_is_rejected() {
         "CREATE SEQUENCE s1",
         "DROP SEQUENCE s1",
         "DROP SEQUENCE nothere",
+        "ALTER SEQUENCE s1 CYCLE",
+        "ALTER SEQUENCE nothere RENAME TO x",
     ] {
         send_simple_query(&mut stream, sql);
         expect_error_response_with_sqlstate(&mut stream, "42501");
@@ -129,5 +131,49 @@ fn wire_sequence_ddl_lifecycle_and_sqlstates() {
 
     send_simple_query(&mut stream, "CREATE SEQUENCE s2 CACHE 5");
     expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+}
+
+/// ALTER SEQUENCE（Issue #1689）は固定タグ `ALTER SEQUENCE`（RENAME も同じ）を返し、
+/// 範囲違反 `22023`・不在 `42P01`・種別違い `42809`・衝突 `42P07` を wire 越しに返す。
+#[test]
+fn wire_alter_sequence_tag_and_sqlstates() {
+    let (core, _guard) = new_core_with_docs_table();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "CREATE SEQUENCE s1");
+    assert_eq!(read_command_complete(&mut stream), "CREATE SEQUENCE");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "ALTER SEQUENCE s1 INCREMENT BY 5 CYCLE");
+    assert_eq!(read_command_complete(&mut stream), "ALTER SEQUENCE");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "ALTER SEQUENCE s1 RESTART WITH 3");
+    assert_eq!(read_command_complete(&mut stream), "ALTER SEQUENCE");
+    read_ready_for_query(&mut stream);
+
+    for (sql, sqlstate) in [
+        ("ALTER SEQUENCE s1 MINVALUE 5", "22023"),
+        ("ALTER SEQUENCE s1 INCREMENT 0", "22023"),
+        ("ALTER SEQUENCE nothere CYCLE", "42P01"),
+        ("ALTER SEQUENCE docs CYCLE", "42809"),
+        ("ALTER SEQUENCE s1 RENAME TO docs", "42P07"),
+        ("ALTER SEQUENCE s1", "42601"),
+        ("ALTER SEQUENCE s1 CACHE 5", "0A000"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, sqlstate);
+        read_ready_for_query(&mut stream);
+    }
+
+    send_simple_query(&mut stream, "ALTER SEQUENCE s1 RENAME TO s2");
+    assert_eq!(read_command_complete(&mut stream), "ALTER SEQUENCE");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "DROP SEQUENCE s2");
+    assert_eq!(read_command_complete(&mut stream), "DROP SEQUENCE");
     read_ready_for_query(&mut stream);
 }
