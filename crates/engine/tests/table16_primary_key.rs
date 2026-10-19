@@ -2,7 +2,8 @@
 //! 結合テスト。ポインタ: `docs/spec/05-tasks.md` TASK-204・
 //! `docs/spec/04-behavior/table-model.md` TABLE-16・
 //! `docs/spec/04-behavior/rls.md` RLS-10 (c)・
-//! `docs/spec/04-behavior/error-format.md` ERR-6。
+//! `docs/spec/04-behavior/error-format.md` ERR-6・SQL-49 (3)(5)（Issue #1708 の
+//! PK 対象 `DO UPDATE`）。
 //!
 //! `sql_create_table.rs` と同じ流儀（`EngineCore::execute_sql_in_session`・
 //! 実 `Storage` ＋ `CpuScalarProvider`、`unique_db_path`／`CleanupGuard`）で、
@@ -15,6 +16,7 @@ use engine::embedding::HashingEmbedder;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::sql::allowlist::SqlSurfaceError;
 use engine::sql::mode::SessionState;
 use engine::sql::SqlOutcome;
 use engine::storage::Storage;
@@ -959,4 +961,359 @@ fn on_conflict_primary_key_do_update_smoke() {
         .expect("DO UPDATE on PK target");
     assert_eq!(outcome.rows_affected, 1);
     assert_eq!(row_ids(&core, &alice), vec![1]);
+}
+// --- Issue #1708: PK 列指定の DO UPDATE（SQL-49 (3)(5) ポインタ） ------------
+
+/// `DO UPDATE` が arbiter 以外の PK 制約で拒否された場合の分類（行制約由来）。
+fn assert_row_unique_violation(err: &SqlSurfaceError) {
+    assert!(
+        matches!(err, SqlSurfaceError::UniqueViolation),
+        "expected UniqueViolation, got {err:?}"
+    );
+    assert_eq!(err.wire_code(), "23505");
+    assert_eq!(
+        ClassifiedError::error_class(err),
+        ErrorClass::UniqueViolation
+    );
+}
+
+/// 台帳由来（同一 `operation_id` の再送）の分類。行制約由来とは区別される。
+fn assert_ledger_dup(err: &SqlSurfaceError) {
+    assert!(
+        matches!(err, SqlSurfaceError::DuplicateOperationId),
+        "expected DuplicateOperationId, got {err:?}"
+    );
+    assert_eq!(err.wire_code(), "23505");
+    assert_eq!(
+        ClassifiedError::error_class(err),
+        ErrorClass::DuplicateOperationId
+    );
+}
+
+/// `docs (code TEXT PRIMARY KEY, note TEXT)` に `(1,'a')`・`(2,'b')`・`(3,'c')` を投入した core。
+fn seeded_single_pk(label: &str) -> (EngineCore, CleanupGuard) {
+    let (core, path) = new_core(label);
+    let guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (code TEXT PRIMARY KEY, note TEXT)",
+    )
+    .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, code, note) VALUES (1, 'a', 'n1'), (2, 'b', 'n2'), \
+         (3, 'c', 'n3') USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed rows");
+    (core, guard)
+}
+
+fn note_of(core: &EngineCore, who: &PolicyContext, id: u64) -> String {
+    let result = core
+        .execute_sql(who, "SELECT id, note FROM docs LIMIT 100")
+        .expect("scan");
+    let row = result.rows.iter().find(|r| r.id == id).expect("row exists");
+    match &row.cells[1] {
+        engine::sql::exec::Cell::Text(s) => s.clone(),
+        other => panic!("expected Cell::Text, got {other:?}"),
+    }
+}
+
+/// 単一 PK: `EXCLUDED.note` が衝突した既存行へ反映され、`VALUES` 側の `id` の行は作られない。
+#[test]
+fn on_conflict_primary_key_do_update_reflects_excluded_single() {
+    let (core, _g) = seeded_single_pk("pk-du-excluded-single");
+    let alice = ctx("alice");
+    let outcome = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, code, note) VALUES (99, 'a', 'new') ON CONFLICT (code) \
+             DO UPDATE SET note = EXCLUDED.note USING OPERATION_ID 'op-u1'",
+        )
+        .expect("DO UPDATE");
+    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(row_ids(&core, &alice), vec![1, 2, 3]);
+    assert_eq!(note_of(&core, &alice, 1), "new");
+    assert_eq!(note_of(&core, &alice, 2), "n2");
+}
+
+/// 複合 PK: 対象列の書き順（`(a, b)` / `(b, a)`）に依らず既存行だけが更新される。
+#[test]
+fn on_conflict_primary_key_do_update_reflects_excluded_composite_any_order() {
+    for (target, op) in [("(a, b)", "op-ab"), ("(b, a)", "op-ba")] {
+        let (core, path) = new_core(&format!("pk-du-composite{op}"));
+        let _guard = CleanupGuard(path);
+        let alice = ctx("alice");
+        let mut session = granted_session();
+        core.execute_sql_in_session(
+            &alice,
+            &mut session,
+            "CREATE TABLE docs (a TEXT, b TEXT, c TEXT, PRIMARY KEY (a, b))",
+        )
+        .expect("create table");
+        core.execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a, b, c) VALUES (1, 'x', 'y', 'old'), (2, 'x', 'z', 'keep') \
+             USING OPERATION_ID 'op-seed'",
+        )
+        .expect("seed");
+        let sql = format!(
+            "INSERT INTO docs (id, a, b, c) VALUES (50, 'x', 'y', 'new') ON CONFLICT {target} \
+             DO UPDATE SET c = EXCLUDED.c USING OPERATION_ID '{op}'"
+        );
+        let outcome = core.execute_insert_sql(&alice, &sql).expect("DO UPDATE");
+        assert_eq!(outcome.rows_affected, 1, "{target}");
+        assert_eq!(row_ids(&core, &alice), vec![1, 2], "{target}");
+        let result = core
+            .execute_sql(&alice, "SELECT id, c FROM docs LIMIT 100")
+            .expect("scan");
+        let mut cs: Vec<(u64, String)> = result
+            .rows
+            .iter()
+            .map(|r| match &r.cells[1] {
+                engine::sql::exec::Cell::Text(s) => (r.id, s.clone()),
+                other => panic!("expected Cell::Text, got {other:?}"),
+            })
+            .collect();
+        cs.sort();
+        assert_eq!(
+            cs,
+            vec![(1, "new".to_string()), (2, "keep".to_string())],
+            "{target}"
+        );
+    }
+}
+
+/// PK 列を自分自身の値へ SET しても自己衝突にならず成功する。
+#[test]
+fn on_conflict_primary_key_do_update_set_pk_to_same_value_succeeds() {
+    let (core, _g) = seeded_single_pk("pk-du-same-value");
+    let alice = ctx("alice");
+    let outcome = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, code, note) VALUES (99, 'a', 'x') ON CONFLICT (code) \
+             DO UPDATE SET code = EXCLUDED.code, note = EXCLUDED.note USING OPERATION_ID 'op-u'",
+        )
+        .expect("self-assigning PK must succeed");
+    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(
+        id_code_pairs(&core, &alice, "docs"),
+        vec![(1, "a".into()), (2, "b".into()), (3, "c".into())]
+    );
+}
+
+/// PK 列の更新は受理され、旧キーは解放され、新キーが以後の衝突対象になる。
+#[test]
+fn on_conflict_primary_key_do_update_changing_pk_succeeds_and_frees_old_key() {
+    let (core, _g) = seeded_single_pk("pk-du-change-pk");
+    let alice = ctx("alice");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, code, note) VALUES (99, 'a', 'x') ON CONFLICT (code) \
+         DO UPDATE SET code = 'z' USING OPERATION_ID 'op-u'",
+    )
+    .expect("PK change");
+    assert_eq!(
+        id_code_pairs(&core, &alice, "docs"),
+        vec![(1, "z".into()), (2, "b".into()), (3, "c".into())]
+    );
+    // 旧キー 'a' は解放されている。
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, code, note) VALUES (10, 'a', 'fresh') USING OPERATION_ID 'op-a'",
+    )
+    .expect("old key is free");
+    // 新キー 'z' は更新済み行に衝突する。
+    let outcome = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, code, note) VALUES (11, 'z', 'hit') ON CONFLICT (code) \
+             DO NOTHING USING OPERATION_ID 'op-z'",
+        )
+        .expect("DO NOTHING on new key");
+    assert_eq!(outcome.rows_affected, 0);
+}
+
+/// 別行が持つ PK 値へ変更すると、行制約由来の 23505 になり副作用は残らない。
+#[test]
+fn on_conflict_primary_key_do_update_changing_pk_into_existing_value_is_23505() {
+    let (core, _g) = seeded_single_pk("pk-du-collide");
+    let alice = ctx("alice");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, code, note) VALUES (99, 'a', 'x') ON CONFLICT (code) \
+             DO UPDATE SET code = 'b' USING OPERATION_ID 'op-u'",
+        )
+        .expect_err("collision on PK");
+    assert_row_unique_violation(&err);
+    assert_eq!(
+        id_code_pairs(&core, &alice, "docs"),
+        vec![(1, "a".into()), (2, "b".into()), (3, "c".into())]
+    );
+    // 台帳にも残らない（同じ operation_id で別内容を再実行しても台帳重複にならない）。
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, code, note) VALUES (99, 'a', 'x') ON CONFLICT (code) \
+         DO UPDATE SET note = 'ok' USING OPERATION_ID 'op-u'",
+    )
+    .expect("failed statement left no ledger trace");
+}
+
+/// 複合 PK の片方の列の変更が別行と衝突する場合も 23505（行制約由来）。
+#[test]
+fn on_conflict_primary_key_do_update_composite_pk_column_change_collision_is_23505() {
+    let (core, path) = new_core("pk-du-composite-collide");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a TEXT, b TEXT, PRIMARY KEY (a, b))",
+    )
+    .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a, b) VALUES (1, 'x', 'y'), (2, 'x', 'z') \
+         USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a, b) VALUES (9, 'x', 'y') ON CONFLICT (a, b) \
+             DO UPDATE SET b = 'z' USING OPERATION_ID 'op-u'",
+        )
+        .expect_err("composite collision");
+    assert_row_unique_violation(&err);
+    assert_eq!(row_ids(&core, &alice), vec![1, 2]);
+}
+
+/// 2 行が別々の既存行に衝突し、同じ PK 値へ収束する場合は 23505・副作用ゼロ。
+#[test]
+fn on_conflict_primary_key_do_update_rows_converging_on_same_pk_is_23505() {
+    let (core, _g) = seeded_single_pk("pk-du-converge");
+    let alice = ctx("alice");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, code, note) VALUES (91, 'a', 'x'), (92, 'b', 'y') \
+             ON CONFLICT (code) DO UPDATE SET code = 'q' USING OPERATION_ID 'op-u'",
+        )
+        .expect_err("converging PK values");
+    assert_row_unique_violation(&err);
+    assert_eq!(
+        id_code_pairs(&core, &alice, "docs"),
+        vec![(1, "a".into()), (2, "b".into()), (3, "c".into())]
+    );
+}
+
+/// PK 変更後の同一 `operation_id` 再送は台帳由来の 23505 で、行の状態は変わらない。
+/// 事前走査は既に衝突を見つけない状態でも、台帳照合が行分岐より先に行われる。
+#[test]
+fn on_conflict_primary_key_do_update_resend_after_pk_change_is_ledger_duplicate() {
+    let (core, _g) = seeded_single_pk("pk-du-resend");
+    let alice = ctx("alice");
+    let sql = "INSERT INTO docs (id, code, note) VALUES (99, 'a', 'x') ON CONFLICT (code) \
+               DO UPDATE SET code = 'z' USING OPERATION_ID 'op-u'";
+    core.execute_insert_sql(&alice, sql).expect("first");
+    let before = id_code_pairs(&core, &alice, "docs");
+    let err = core.execute_insert_sql(&alice, sql).expect_err("resend");
+    assert_ledger_dup(&err);
+    assert_eq!(id_code_pairs(&core, &alice, "docs"), before);
+}
+
+/// 複合 PK の対象列順を変えた再送も、解決済み PK の宣言順でハッシュされるため台帳重複になる。
+#[test]
+fn on_conflict_primary_key_do_update_resend_with_reordered_composite_target_is_ledger_duplicate() {
+    let (core, path) = new_core("pk-du-resend-reordered");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a TEXT, b TEXT, c TEXT, PRIMARY KEY (a, b))",
+    )
+    .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a, b, c) VALUES (1, 'x', 'y', 'old') USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed");
+    let first = "INSERT INTO docs (id, a, b, c) VALUES (9, 'x', 'y', 'new') ON CONFLICT (a, b) \
+                 DO UPDATE SET c = EXCLUDED.c USING OPERATION_ID 'op-u'";
+    let resend = "INSERT INTO docs (id, a, b, c) VALUES (9, 'x', 'y', 'new') ON CONFLICT (b, a) \
+                  DO UPDATE SET c = EXCLUDED.c USING OPERATION_ID 'op-u'";
+    core.execute_insert_sql(&alice, first).expect("first");
+    let err = core
+        .execute_insert_sql(&alice, resend)
+        .expect_err("reordered resend");
+    assert_ledger_dup(&err);
+}
+
+/// 同じ `operation_id` で SET の内容だけを変えた再送は 22023（内容不一致）で、行は変わらない。
+#[test]
+fn on_conflict_primary_key_do_update_resend_with_different_set_is_content_mismatch() {
+    let (core, _g) = seeded_single_pk("pk-du-resend-mismatch");
+    let alice = ctx("alice");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, code, note) VALUES (99, 'a', 'x') ON CONFLICT (code) \
+         DO UPDATE SET note = 'one' USING OPERATION_ID 'op-u'",
+    )
+    .expect("first");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, code, note) VALUES (99, 'a', 'x') ON CONFLICT (code) \
+             DO UPDATE SET note = 'two' USING OPERATION_ID 'op-u'",
+        )
+        .expect_err("content mismatch");
+    assert_eq!(err.wire_code(), "22023");
+    assert_eq!(note_of(&core, &alice, 1), "one");
+}
+
+/// 不可視な自テナント行への PK 衝突 DO UPDATE は 42501 で拒否され、痕跡を残さない。
+#[test]
+fn on_conflict_primary_key_do_update_on_invisible_conflict_is_42501() {
+    let (core, _g) = seeded_single_pk("pk-du-invisible");
+    let alice = ctx("alice");
+    let public_only =
+        PolicyContext::with_visibilities("alice", [engine::storage::Visibility::Public])
+            .expect("valid tenant");
+    let sql = "INSERT INTO docs (id, code, note) VALUES (99, 'a', 'x') ON CONFLICT (code) \
+               DO UPDATE SET note = 'hit' USING OPERATION_ID 'op-inv'";
+    let err = core
+        .execute_insert_sql(&public_only, sql)
+        .expect_err("invisible conflict target");
+    assert_eq!(err.wire_code(), "42501");
+    assert_eq!(note_of(&core, &alice, 1), "n1");
+    // 台帳に残っていなければ、可視な ctx で同じ operation_id を使える。
+    core.execute_insert_sql(&alice, sql)
+        .expect("no ledger trace after rejection");
+    assert_eq!(note_of(&core, &alice, 1), "hit");
+}
+
+/// 他テナントが同じ PK 値を持っていても衝突せず新規挿入になり、他テナントの行は不変。
+#[test]
+fn on_conflict_primary_key_do_update_other_tenant_same_pk_inserts() {
+    let (core, _g) = seeded_single_pk("pk-du-other-tenant");
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    let outcome = core
+        .execute_insert_sql(
+            &bob,
+            "INSERT INTO docs (id, code, note) VALUES (1, 'a', 'bob') ON CONFLICT (code) \
+             DO UPDATE SET note = EXCLUDED.note USING OPERATION_ID 'op-bob'",
+        )
+        .expect("other tenant inserts");
+    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(note_of(&core, &alice, 1), "n1");
+    assert_eq!(note_of(&core, &bob, 1), "bob");
 }
