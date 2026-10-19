@@ -219,13 +219,25 @@ pub(crate) struct ExprUniqueSpec {
     elements: Vec<ExprUniqueElem>,
 }
 
+/// 部分 UNIQUE 索引（INDEX-11 (4)、Issue #1657）1 本の検査仕様。述語が TRUE の行だけがキーを持ち
+/// （NULL・FALSE の行はキーなし）、キーを持つ行どうしの間でだけ一意性を強制する。要素の NULL は
+/// NULLS DISTINCT（INDEX-9 と同じ）。式要素は `compiled`（この索引専用）の通し番号で引く。
+struct PartialUniqueSpec {
+    index_name: String,
+    predicate: crate::sql::index_predicate::BoundIndexPredicate,
+    elements: Vec<ExprUniqueElem>,
+    compiled: Option<crate::sql::expression_key_index::CompiledIndexExpressions>,
+}
+
 /// 永続一意索引（`user_uniq/{table}`）が強制する全キーの仕様。序数（ordinal）は主キー → UNIQUE 制約
-/// （[`key_specs`] の順）→ 一意の式索引（索引名の昇順）の順に振る。列だけのキーのバイト列は式一意索引の
-/// 有無に関わらず従来と同一（Issue #1651）。
+/// （[`key_specs`] の順）→ 一意の式索引（索引名の昇順）→ 部分 UNIQUE 索引（索引名の昇順）の順に振る。
+/// 列だけのキー・式一意キーのバイト列は部分 UNIQUE 索引の有無に関わらず従来と同一（Issue #1651・#1657）。
 pub(crate) struct UniqueKeyPlan {
     specs: Vec<KeySpec>,
     expr_specs: Vec<ExprUniqueSpec>,
-    /// 列要素（`specs` と式一意索引の素の列）の和集合マスク。
+    /// 部分 UNIQUE 索引（Issue #1657）。序数は `specs`・`expr_specs` の後ろ。
+    partial_specs: Vec<PartialUniqueSpec>,
+    /// 列要素（`specs`・式一意索引・部分 UNIQUE 索引の素の列）の和集合マスク。
     mask: Vec<bool>,
 }
 
@@ -266,15 +278,88 @@ impl UniqueKeyPlan {
                 elements,
             });
         }
-        let total = specs.len().saturating_add(expr_specs.len());
+        // 部分 UNIQUE 索引（Issue #1657）。述語・式要素は保存テキストを再解析・再束縛して使う
+        // （漂流は `CorruptSchema` で拒否）。部分索引の式要素は `decls.keys` に入らないため、索引ごとに
+        // 専用のコンパイル結果を持つ。
+        let mut partial_specs: Vec<PartialUniqueSpec> = Vec::new();
+        for partial in decls.partials.iter().filter(|p| p.unique) {
+            let predicate = crate::sql::index_predicate::compile_stored_predicate(schema, partial)?;
+            let compiled = crate::sql::expression_key_index::CompiledIndexExpressions::compile(
+                schema,
+                &partial.expression_keys(),
+            )?;
+            let mut elements: Vec<ExprUniqueElem> = Vec::with_capacity(partial.elements.len());
+            let mut expr_pos = 0usize;
+            for element in &partial.elements {
+                match element {
+                    crate::catalog::PartialElementDecl::Column(name) => {
+                        let idx = schema
+                            .columns
+                            .iter()
+                            .position(|c| &c.name == name)
+                            .ok_or_else(|| {
+                                internal("partial unique index column not found in live schema")
+                            })?;
+                        if let Some(slot) = mask.get_mut(idx) {
+                            *slot = true;
+                        }
+                        elements.push(ExprUniqueElem::Column(idx));
+                    }
+                    crate::catalog::PartialElementDecl::Expr(_) => {
+                        elements.push(ExprUniqueElem::Expr(expr_pos));
+                        expr_pos = expr_pos.saturating_add(1);
+                    }
+                }
+            }
+            partial_specs.push(PartialUniqueSpec {
+                index_name: partial.index_name.clone(),
+                predicate,
+                elements,
+                compiled,
+            });
+        }
+        let total = specs
+            .len()
+            .saturating_add(expr_specs.len())
+            .saturating_add(partial_specs.len());
         if total > usize::from(u16::MAX) {
             return Err(internal("unique key ordinal exceeds u16 range"));
         }
         Ok(Self {
             specs,
             expr_specs,
+            partial_specs,
             mask,
         })
+    }
+
+    /// 作成中の部分 UNIQUE 索引 1 本だけの仕様（重複走査用。主キー・UNIQUE 制約・他の索引は含めない）。
+    /// `decl.unique` が偽でも、この索引を一意として扱う。
+    pub(crate) fn for_single_partial_unique_index(
+        schema: &TableSchema,
+        decl: &crate::catalog::DeclaredPartialIndex,
+    ) -> Result<Self, TenantWriteError> {
+        let mut forced = decl.clone();
+        forced.unique = true;
+        let decls = crate::catalog::TableExpressionDecls {
+            keys: Vec::new(),
+            uniques: Vec::new(),
+            partials: vec![forced],
+        };
+        let mut plan = Self::build(schema, &decls)?;
+        plan.specs.clear();
+        let mut mask = vec![false; schema.columns.len()];
+        for spec in &plan.partial_specs {
+            for element in &spec.elements {
+                if let ExprUniqueElem::Column(idx) = element {
+                    if let Some(slot) = mask.get_mut(*idx) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        plan.mask = mask;
+        Ok(plan)
     }
 
     /// 作成中の一意の式索引 1 本だけの仕様（重複走査用。主キー・UNIQUE 制約は含めない）。
@@ -309,12 +394,15 @@ impl UniqueKeyPlan {
 
     /// 検査すべきキーが 1 つも無いか。
     pub(crate) fn is_empty(&self) -> bool {
-        self.specs.is_empty() && self.expr_specs.is_empty()
+        self.specs.is_empty() && self.expr_specs.is_empty() && self.partial_specs.is_empty()
     }
 
     /// 序数の個数。
     pub(crate) fn ordinal_count(&self) -> usize {
-        self.specs.len().saturating_add(self.expr_specs.len())
+        self.specs
+            .len()
+            .saturating_add(self.expr_specs.len())
+            .saturating_add(self.partial_specs.len())
     }
 
     /// 列だけのキー仕様（主キー・UNIQUE 制約）。
@@ -345,43 +433,85 @@ impl UniqueKeyPlan {
         for spec in &self.specs {
             out.push(key_bytes(spec, &values).map_err(internal)?);
         }
-        if self.expr_specs.is_empty() {
+        if self.expr_specs.is_empty() && self.partial_specs.is_empty() {
             return Ok(out);
         }
-        let compiled =
-            compiled.ok_or_else(|| internal("unique expression index is not compiled"))?;
         let mut embedding: Vec<f32> = Vec::new();
         let (_dim, metadata) =
             crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
-        for spec in &self.expr_specs {
-            let mut key: Vec<u8> = Vec::new();
-            let mut has_key = true;
-            for element in &spec.elements {
-                match element {
-                    ExprUniqueElem::Column(idx) => {
-                        match values.get(*idx).and_then(|v| v.as_ref()) {
-                            Some(value) => {
-                                push_canonical_component(&mut key, *value).map_err(internal)?;
-                            }
-                            None => {
-                                has_key = false;
-                                break;
-                            }
-                        }
+        if !self.expr_specs.is_empty() {
+            let compiled =
+                compiled.ok_or_else(|| internal("unique expression index is not compiled"))?;
+            for spec in &self.expr_specs {
+                let key = Self::element_key(
+                    &spec.elements,
+                    schema,
+                    Some(compiled),
+                    id,
+                    &values,
+                    &embedding,
+                    metadata,
+                )?;
+                out.push(key);
+            }
+        }
+        // 部分 UNIQUE 索引（Issue #1657）。述語が TRUE でない行はキーを持たない（索引外）。
+        let mut scratch = Vec::new();
+        for spec in &self.partial_specs {
+            let member = spec
+                .predicate
+                .eval(schema, id, &embedding, metadata, &mut scratch)
+                .map_err(crate::sql::index_predicate::map_predicate_eval_error)?;
+            if !member {
+                out.push(None);
+                continue;
+            }
+            let key = Self::element_key(
+                &spec.elements,
+                schema,
+                spec.compiled.as_ref(),
+                id,
+                &values,
+                &embedding,
+                metadata,
+            )?;
+            out.push(key);
+        }
+        Ok(out)
+    }
+
+    /// 要素列（素の列・式）から 1 索引分の正準キーを作る。どれか 1 要素でも NULL なら `None`
+    /// （NULLS DISTINCT）。式一意索引と部分 UNIQUE 索引が共有する（キーの作り方を 2 系統にしない）。
+    fn element_key(
+        elements: &[ExprUniqueElem],
+        schema: &TableSchema,
+        compiled: Option<&crate::sql::expression_key_index::CompiledIndexExpressions>,
+        id: u64,
+        values: &[Option<ScalarRef<'_>>],
+        embedding: &[f32],
+        metadata: &[u8],
+    ) -> Result<Option<Vec<u8>>, TenantWriteError> {
+        let mut key: Vec<u8> = Vec::new();
+        for element in elements {
+            match element {
+                ExprUniqueElem::Column(idx) => match values.get(*idx).and_then(|v| v.as_ref()) {
+                    Some(value) => {
+                        push_canonical_component(&mut key, *value).map_err(internal)?;
                     }
-                    ExprUniqueElem::Expr(pos) => {
-                        if !compiled.push_unique_key_component(
-                            *pos, schema, id, &embedding, metadata, &mut key,
-                        )? {
-                            has_key = false;
-                            break;
-                        }
+                    None => return Ok(None),
+                },
+                ExprUniqueElem::Expr(pos) => {
+                    let compiled =
+                        compiled.ok_or_else(|| internal("unique expression is not compiled"))?;
+                    if !compiled.push_unique_key_component(
+                        *pos, schema, id, embedding, metadata, &mut key,
+                    )? {
+                        return Ok(None);
                     }
                 }
             }
-            out.push(has_key.then_some(key));
         }
-        Ok(out)
+        Ok(Some(key))
     }
 
     /// 永続一意索引のマーカーに載せるシグネチャの式一意索引部分を `out` へ足す。索引名・要素の
@@ -395,26 +525,53 @@ impl UniqueKeyPlan {
     ) -> Result<(), TenantWriteError> {
         out.extend_from_slice(&(self.expr_specs.len() as u32).to_be_bytes());
         for spec in &self.expr_specs {
-            let name = spec.index_name.as_bytes();
-            out.push(u8::try_from(name.len()).unwrap_or(u8::MAX));
-            out.extend_from_slice(name);
-            out.extend_from_slice(&(spec.elements.len() as u32).to_be_bytes());
-            for element in &spec.elements {
-                match element {
-                    ExprUniqueElem::Column(idx) => {
-                        out.push(0);
-                        let column = schema.columns.get(*idx);
-                        out.push(column.map(|c| c.ty.unique_key_tag()).unwrap_or(0));
-                        let col_name = column.map(|c| c.name.as_bytes()).unwrap_or(&[]);
-                        out.push(u8::try_from(col_name.len()).unwrap_or(u8::MAX));
-                        out.extend_from_slice(col_name);
-                    }
-                    ExprUniqueElem::Expr(pos) => {
-                        out.push(1);
-                        let compiled = compiled
-                            .ok_or_else(|| internal("unique expression index is not compiled"))?;
-                        compiled.push_signature(*pos, schema, out)?;
-                    }
+            Self::push_index_signature(&spec.index_name, &spec.elements, schema, compiled, out)?;
+        }
+        // 部分 UNIQUE 索引（Issue #1657）。索引名・述語の正規化 SQL・要素の種別を含めるため、作成・
+        // 削除・述語や式の変更・参照列の改名や型変更でマーカーが不一致になり再構築される。
+        out.extend_from_slice(&(self.partial_specs.len() as u32).to_be_bytes());
+        for spec in &self.partial_specs {
+            Self::push_index_signature(
+                &spec.index_name,
+                &spec.elements,
+                schema,
+                spec.compiled.as_ref(),
+                out,
+            )?;
+            let predicate = spec.predicate.sql.as_bytes();
+            out.extend_from_slice(&(predicate.len() as u32).to_be_bytes());
+            out.extend_from_slice(predicate);
+        }
+        Ok(())
+    }
+
+    /// 式一意索引・部分 UNIQUE 索引 1 本分のシグネチャ（索引名と要素の種別・列名・型タグ／式の署名）。
+    fn push_index_signature(
+        index_name: &str,
+        elements: &[ExprUniqueElem],
+        schema: &TableSchema,
+        compiled: Option<&crate::sql::expression_key_index::CompiledIndexExpressions>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), TenantWriteError> {
+        let name = index_name.as_bytes();
+        out.push(u8::try_from(name.len()).unwrap_or(u8::MAX));
+        out.extend_from_slice(name);
+        out.extend_from_slice(&(elements.len() as u32).to_be_bytes());
+        for element in elements {
+            match element {
+                ExprUniqueElem::Column(idx) => {
+                    out.push(0);
+                    let column = schema.columns.get(*idx);
+                    out.push(column.map(|c| c.ty.unique_key_tag()).unwrap_or(0));
+                    let col_name = column.map(|c| c.name.as_bytes()).unwrap_or(&[]);
+                    out.push(u8::try_from(col_name.len()).unwrap_or(u8::MAX));
+                    out.extend_from_slice(col_name);
+                }
+                ExprUniqueElem::Expr(pos) => {
+                    out.push(1);
+                    let compiled = compiled
+                        .ok_or_else(|| internal("unique expression index is not compiled"))?;
+                    compiled.push_signature(*pos, schema, out)?;
                 }
             }
         }
@@ -1183,6 +1340,55 @@ where
             .map_err(|e| corrupt_check_scan(e.to_string()))?;
         let Some(key) = plan
             .row_keys(schema, Some(compiled), id, buf)?
+            .into_iter()
+            .next()
+            .flatten()
+        else {
+            continue;
+        };
+        if !seen.insert(key) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 部分 UNIQUE 索引（INDEX-11 (4)・INDEX-9、Issue #1657）の作成時（`CREATE UNIQUE INDEX ... WHERE`）が、
+/// 対象テーブルの**全テナント・全可視性**の既存行で、述語 TRUE の行だけを対象にテナントごとに独立して
+/// 一意キーの重複を探す。キーの計算は書き込み時の検査点・バックフィルと同じ [`UniqueKeyPlan::row_keys`]
+/// を通す（判定がずれて作成後の最初の書き込みが `XX000` になる事故を構造的に防ぐ）。物理キー順で同一
+/// テナントの行は連続するため、テナントが変わるたびに集合をリセットする。述語外の行・NULL 要素を含む行は
+/// キーを持たず対象外。評価エラーは [`TenantWriteError::IndexExpressionEvaluationFailed`] で返し、
+/// 呼び出し元が応答用に値を伏せる。
+pub(crate) fn table_has_duplicate_partial_unique_key<T>(
+    row_table: &T,
+    schema: &TableSchema,
+    decl: &crate::catalog::DeclaredPartialIndex,
+) -> Result<bool, TenantWriteError>
+where
+    T: ReadableTable<(&'static str, u64), &'static [u8]>,
+{
+    let plan = UniqueKeyPlan::for_single_partial_unique_index(schema, decl)?;
+    let mut current_tenant: Option<String> = None;
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    for entry in row_table
+        .iter()
+        .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?
+    {
+        let (k, v) = entry.map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
+        let (key_tenant, id) = k.value();
+        if current_tenant.as_deref() != Some(key_tenant) {
+            current_tenant = Some(key_tenant.to_string());
+            seen.clear();
+        }
+        let buf = v.value();
+        // 行ヘッダのテナントと物理キーのテナントの整合（TABLE-12）を確認してから値を読む。
+        let (row_tenant, _visibility, _offset) = crate::storage::decode_row_header(buf)
+            .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        crate::storage::verify_row_key_tenant(key_tenant, row_tenant)
+            .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        let Some(key) = plan
+            .row_keys(schema, None, id, buf)?
             .into_iter()
             .next()
             .flatten()

@@ -593,7 +593,9 @@ impl Walker<'_> {
                 .ok_or_else(|| CatalogError::IndexNotFound(index.to_string()))?;
             decode_index_def(index, guard.value())?
         };
-        if !def.unique {
+        // 部分 UNIQUE 索引（述語付き。Issue #1657）は UNIQUE 制約へ展開しておらず、FK の参照先にも
+        // ならない（述語外の行を参照できてしまうため）。制約の照合より前に依存なしを返す。
+        if !def.unique || def.has_predicate() {
             return Ok(Vec::new());
         }
         // matview の UNIQUE 索引（Issue #1667）は表の制約ではなく、FK の参照先になり得ない。

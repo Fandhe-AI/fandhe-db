@@ -6885,6 +6885,7 @@ mod tests {
             crate::sql::index_predicate::bind_index_predicate(&preds, schema).expect("bind");
         crate::catalog::DeclaredPartialIndex {
             index_name: name.to_string(),
+            unique: false,
             predicate_sql: bound.sql,
             elements: element_exprs
                 .iter()
@@ -7016,6 +7017,7 @@ mod tests {
         // 漂流した保存テキスト。
         let drifted = crate::catalog::DeclaredPartialIndex {
             index_name: "p_drift".to_string(),
+            unique: false,
             predicate_sql: "no_such_col > 1".to_string(),
             elements: vec![],
         };

@@ -78,7 +78,7 @@ DROP INDEX <name>
 | 対象テーブルが存在しない | `42P01` | 404 |
 | 索引列の `COLLATE` の名前が許可リストに無い（構文段。カタログを参照しない。Issue #2191） | `42704` | 400 |
 | 照合を持てない列（`id`・数値・`VECTOR` 等）・`USING hnsw` への `COLLATE`（カタログ段。Issue #2191） | `42804` | 400 |
-| `USING` が `hnsw`・`btree` 以外（`bm25`・`hash`・`gin` 等）／`USING hnsw` の複数列・非 `VECTOR` 列（`id` を含む）／スカラー宣言が `VECTOR` 列・索引化非対応の型／部分 UNIQUE・`USING hnsw`・`COLLATE` を伴う部分索引（`WHERE`。決定的な述語の部分索引は Issue #1654 で受理。非決定は `42P17`・集計 `42803`・ウィンドウ `42P20` は [partial-index.md](partial-index.md)）／リテラルの列指定／式要素と `UNIQUE`・`USING hnsw`・`COLLATE` の組み合わせ／索引化できない式の結果型（Issue #1648） | `0A000` | 501 |
+| `USING` が `hnsw`・`btree` 以外（`bm25`・`hash`・`gin` 等）／`USING hnsw` の複数列・非 `VECTOR` 列（`id` を含む）／スカラー宣言が `VECTOR` 列・索引化非対応の型／`USING hnsw`・`COLLATE` を伴う部分索引（`WHERE`。決定的な述語の部分索引は Issue #1654、部分 UNIQUE は Issue #1657 で受理。非決定は `42P17`・集計 `42803`・ウィンドウ `42P20` は [partial-index.md](partial-index.md)）／リテラルの列指定／式要素と `UNIQUE`・`USING hnsw`・`COLLATE` の組み合わせ／索引化できない式の結果型（Issue #1648） | `0A000` | 501 |
 | 名前の無い `CREATE [UNIQUE] INDEX`／`ASC`・`DESC`／列の重複指定／`DROP` の複数名・`DROP INDEX ... CASCADE`／`(col + 1)` 等の余分なトークン | `42601` | 400 |
 | 列リストの要素数上限（256）超過・索引宣言の総数上限（10,000）超過 | `54000` | 413 |
 | DDL 実行権限なし | `42501` | 403 |

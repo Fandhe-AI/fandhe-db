@@ -9,7 +9,7 @@
 //! - 非決定な述語は `42P17`、集計は `42803`、ウィンドウは `42P20`、部分クエリ・SRF・組み込み以外の
 //!   関数は `0A000`、`visible()` と構文誤りは `42601`、葉数の上限超過は `54000`
 //! - 決定的な述語は書き込みトランザクション内で束縛して正規化テキストを永続化する（Issue #1654）。
-//!   部分 UNIQUE・hnsw・COLLATE・matview との組み合わせは `0A000`（宣言だけ残らない）
+//!   hnsw・COLLATE・matview との組み合わせは `0A000`（宣言だけ残らない）
 //! - DML は述語を満たす行だけを索引化する（入場・退場）。述語の評価エラーは文を拒否し、述語外の行では
 //!   式要素を評価しない
 //! - 構文段の判定はカタログを参照しない（権限・対象の有無に依存しない）
@@ -156,11 +156,8 @@ fn predicate_rejections_are_classified_before_the_catalog() {
             "42601",
         ),
         ("CREATE INDEX i ON docs (lang) WHERE lang = $1", "42601"),
-        // 最終ゲートの未対応の組み合わせ（部分 UNIQUE・hnsw・COLLATE）は 0A000。
-        (
-            "CREATE UNIQUE INDEX i ON docs (lang) WHERE lang = 'ja'",
-            "0A000",
-        ),
+        // 最終ゲートの未対応の組み合わせ（hnsw・COLLATE）は 0A000。部分 UNIQUE は受理される
+        // （Issue #1657。`sql_partial_unique_index.rs` が検証する）。
         (
             "CREATE INDEX i ON docs USING hnsw (embedding) WHERE lang = 'ja'",
             "0A000",
@@ -217,7 +214,7 @@ fn rejected_partial_index_leaves_no_declaration() {
     for sql in [
         "CREATE INDEX i ON docs (lang) WHERE no_such_col = 'ja'",
         "CREATE INDEX i ON docs (lang) WHERE body < now()",
-        "CREATE UNIQUE INDEX i ON docs (lang) WHERE lang = 'ja'",
+        "CREATE INDEX i ON docs USING hnsw (embedding) WHERE lang = 'ja'",
     ] {
         run(&core, &mut s, sql).expect_err(sql);
         assert_eq!(code_of(&core, &mut s, "DROP INDEX i"), "42704", "{sql}");
@@ -259,8 +256,12 @@ fn rejection_messages_are_fixed_and_leak_nothing() {
             "feature not supported: cannot use subquery in index predicate",
         ),
         (
-            "CREATE UNIQUE INDEX i ON docs (lang) WHERE lang = 'secret-alice'",
-            "feature not supported: partial unique indexes are not supported yet",
+            "CREATE INDEX i ON docs USING hnsw (embedding) WHERE lang = 'secret-alice'",
+            "feature not supported: partial indexes are not supported for this index kind yet",
+        ),
+        (
+            "CREATE INDEX i ON docs (lang COLLATE \"C\") WHERE lang = 'secret-alice'",
+            "feature not supported: COLLATE on a partial index is not supported yet",
         ),
     ] {
         let err = run(&core, &mut s, sql).expect_err(sql);
