@@ -50,6 +50,17 @@
 - 追跡事項: 拡張クエリの `USING OPERATION_ID $n` に `NULL` を束縛すると、既定でも bind 段で `23502` になる（リテラルの `NULL` は既定で受理）。任意化との整合は別途扱うため、本 Issue では固定していない
 - 対象外: HTTP の書き込み op の省略時の挙動（#2203）
 
+## Issue #2203 追記
+
+- NoSQL（HTTP）の `insert`／`update`／`delete` が wire 層で行っていた前段拒否（欠落・`null`・空文字を `parse("")` で `23502` にする処理）を撤去した。3 op とも `operation_id` を `Option<OperationId>` として解釈し、欠落・`null`・空文字（完全一致のみ。trim 等はしない）は `None`、それ以外は従来どおり `OperationId::parse`（長さ超過・制御文字は `22000`）を通す（RECOVER-1・NOSQL-6・NOSQL-12 ポインタ）
+- 省略の可否の判定は engine の 7 つの束縛済み入口（insert／update／delete／述語形 update・delete／分割実行 update・delete）の `LedgerMode`（および分割実行の `require_partitioned`）に一本化した。wire 層にモードの getter や独自の分岐は置かない。既定（`Optional`）では台帳に記録しない通常の書き込みとして成功し、`--require-operation-id`（`Ledgered`）では `23502`。判定はスキーマ取得より前にあるため、必須構成で欠落の `23502` が `42P01` より先に返る順序は不変
+- 省略した書き込みの成功応答本文は `operation_id` キーを含まない（`{"inserted":n}`／`{"updated":n}`／`{"deleted":n}`。TASK-240 ポインタ）。指定時は従来どおりキーを echo する。クライアントから見える契約の変更のため BREAKING CHANGE
+- 分割実行（`"mode":"partitioned"`）の update／delete は既定でも欠落を `23502`。`show_partitioned_dml`／`cancel_partitioned_dml` は書き込みではなくジョブの識別子なので、両モードで必須のまま
+- `Idempotency-Key` ヘッダ（HTTP-14 ポインタ・Phase 8・未実装）の前提: 本文の `operation_id` と同じ台帳・同じ意味で扱い、必須構成ではヘッダか本文のどちらかで要件を満たす。ヘッダ自体の実装は本 Issue の対象外
+- 追跡事項（別 Issue）: SQL 表層の `USING OPERATION_ID ''` は既定でも `23502` のままで、NoSQL の空文字＝省略と食い違う。拡張クエリの `USING OPERATION_ID $n` への `NULL` 束縛も既定で `23502`（#1705 の追跡事項）
+- 既定に依存して欠落の `23502` を検証していた既存テスト（`err4_http_projection.rs`・`nosql12_update_delete.rs`・`nosql1_op_vocabulary.rs` と `insert.rs` の単体テスト）は `LedgerMode::Ledgered` を明示して固定した（アサーションは変更していない）
+- テスト: `crates/wire-server/tests/wire_require_operation_id_matrix.rs` の M7（M7a 省略 × 両モード、M7b 台帳に触れないこと、M7c 指定時の再送契約が両モードで同一、M7d 分割実行は両モードで `23502`、M7e show／cancel は両モードで `23502`）と、各 op の `encode_success_body` 単体テスト
+
 ## スコープ外
 
 - コード変更（後続 Issue で実施）

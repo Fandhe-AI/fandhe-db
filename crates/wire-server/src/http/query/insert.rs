@@ -21,9 +21,11 @@
 //! 持たない（`security.md` P0）。可視性は engine 側 [`engine::sql::exec::execute_insert_batch`]
 //! が常に `Private` 固定で書き込む（SQL-10 `execute_insert` と同じ fail-closed 判断）。
 //!
-//! `operation_id` の欠落・`null`・空文字はいずれも `23502`
-//! （[`engine::sql::using_operation_id::OperationId::parse`] が空文字を句の省略と
-//! 同等に扱う契約をそのまま透過する）。同一 `operation_id` への再送は台帳照合
+//! `operation_id` の欠落・`null`・空文字はいずれも「省略」として扱い、wire 層では拒否しない。
+//! 省略の可否は engine の `LedgerMode`（単一の真実源）が判定し、既定（任意）では台帳に
+//! 記録しない通常の書き込みとして成功し（応答本文に `operation_id` キーを含めない）、
+//! `--require-operation-id`（必須）では `23502` になる（Issue #2203・RECOVER-1・NOSQL-6
+//! ポインタ）。 同一 `operation_id` への再送は台帳照合
 //! （TASK-101・RECOVER-10）により内容一致なら `23505`・不一致なら `22023` へ収束する
 //! （`execute_insert_batch`・`insert_typed_rows_unchecked` のドキュメント参照）。
 //! INDEX-4 の 4 上限（バッチ相当の判定を「1 要求の `rows` 行数」に読み替えたもの）は
@@ -34,7 +36,7 @@
 //! Cursor Bugbot 指摘・PR #823）。
 //!
 //! [`execute`] は成功時 [`InsertSuccess`] を返し、[`handle`] が
-//! [`encode_success_body`]（`{"inserted":<n>,"operation_id":"<escaped>"}`。
+//! [`encode_success_body`]（`{"inserted":<n>[,"operation_id":"<escaped>"]}`（`operation_id` は指定時のみ）。
 //! キー順固定・空白なしのコンパクト形）を経由して `gate.rs` の `Op::Insert`
 //! アームへディスパッチ可能な応答バイト列へ写像する（Issue #772・TASK-178。
 //! `scan::handle`／`aggregate::handle` と同一シグネチャ形）。`operation_id` は
@@ -324,7 +326,8 @@ pub struct InsertSuccess {
     /// [`InsertOutcome::rows_affected`]（書き込んだ行数）。
     pub inserted: u64,
     /// 要求で検証済みの `operation_id`。
-    pub operation_id: OperationId,
+    /// 省略時は `None`（応答本文に `operation_id` キーを含めない。Issue #2203）。
+    pub operation_id: Option<OperationId>,
 }
 
 /// [`InsertSuccess`] を成功応答本文（JSON）へ写像する（infallible）。
@@ -340,14 +343,23 @@ pub fn encode_success_body(success: &InsertSuccess) -> String {
     // 固定オーバーヘッド + `operation_id`（≤ 256 バイト。`OperationId::parse`
     // が検証済み）+ u64 の最大桁数の概算のみを事前確保する（`inserted` の
     // 具体的な桁数は `write!` が可変長で埋める）。
-    let mut out = String::with_capacity(success.operation_id.as_str().len() + 64);
+    let mut out = String::with_capacity(
+        success
+            .operation_id
+            .as_ref()
+            .map_or(0, |id| id.as_str().len())
+            + 64,
+    );
     out.push_str("{\"inserted\":");
     // `u64` の `Display` 実装は infallible（`write!` への `String` 追記も
     // アロケーション失敗以外で失敗しない）ため戻り値は捨ててよい。
     let _ = write!(out, "{}", success.inserted);
-    out.push_str(",\"operation_id\":\"");
-    escape_json_string_into(&mut out, success.operation_id.as_str());
-    out.push_str("\"}");
+    if let Some(id) = &success.operation_id {
+        out.push_str(",\"operation_id\":\"");
+        escape_json_string_into(&mut out, id.as_str());
+        out.push('"');
+    }
+    out.push('}');
     out
 }
 
@@ -355,9 +367,9 @@ pub fn encode_success_body(success: &InsertSuccess) -> String {
 /// [`super::schema::ObjectSchema::validate`]（`super::schema::INSERT_SCHEMA` に対する呼び出し）
 /// を通過済みの JSON オブジェクト。
 ///
-/// `operation_id` の欠落・`null`・空文字はいずれも `OperationId::parse` により
-/// `23502` へ収束する（`optional_str` は欠落・`null` の双方を `None` として返す
-/// 契約のため、`None` を空文字と同じ扱いで `OperationId::parse("")` へ通す）。
+/// `operation_id` の欠落・`null`・空文字はいずれも「省略」（`None`）として engine へ
+/// 渡す。省略の可否（既定は受理、`--require-operation-id` では `23502`）は engine の
+/// `LedgerMode` が判定する（Issue #2203）。
 pub fn execute(
     core: &EngineCore,
     principal: &SessionPrincipal,
@@ -370,20 +382,26 @@ pub fn execute(
     let rows = validated
         .required_array("rows")
         .map_err(InsertError::Shape)?;
-    let operation_id_raw = validated
+    // 欠落・`null`・空文字は「省略」として `None` に統一する（完全一致のみ。trim 等の
+    // 正規化はしない）。必須か任意かの判定は engine の `LedgerMode`（単一の真実源）が
+    // 担うため、wire 層では拒否しない（Issue #2203）。
+    let operation_id = match validated
         .optional_str("operation_id")
         .map_err(InsertError::Shape)?
-        .unwrap_or("");
-    let operation_id = OperationId::parse(operation_id_raw).map_err(InsertError::Exec)?;
+        .filter(|raw| !raw.is_empty())
+    {
+        None => None,
+        Some(raw) => Some(OperationId::parse(raw).map_err(InsertError::Exec)?),
+    };
 
     let outcome: InsertOutcome = core
         .execute_bound_insert_in_session(
             principal.policy_context(),
             table,
             rows.len(),
-            Some(&operation_id),
+            operation_id.as_ref(),
             |schema| {
-                bind_rows(rows, table, Some(&operation_id), schema).map_err(|e| match e {
+                bind_rows(rows, table, operation_id.as_ref(), schema).map_err(|e| match e {
                     InsertError::Bind(err) | InsertError::Exec(err) => err,
                     // `bind_rows`（`bind_row` を行ごとに呼ぶ）は列キーの識別子形状検査
                     // （`ident::check_identifier`。NUL・制御文字・63 文字上限等）を
@@ -706,7 +724,7 @@ mod tests {
     fn encode_success_body_is_compact_with_fixed_key_order() {
         let success = InsertSuccess {
             inserted: 2,
-            operation_id: OperationId::parse("op-1").expect("valid operation_id"),
+            operation_id: Some(OperationId::parse("op-1").expect("valid operation_id")),
         };
         assert_eq!(
             encode_success_body(&success),
@@ -715,10 +733,19 @@ mod tests {
     }
 
     #[test]
+    fn encode_success_body_omits_operation_id_key_when_absent() {
+        let success = InsertSuccess {
+            inserted: 2,
+            operation_id: None,
+        };
+        assert_eq!(encode_success_body(&success), r#"{"inserted":2}"#);
+    }
+
+    #[test]
     fn encode_success_body_escapes_quotes_and_backslashes_in_operation_id() {
         let success = InsertSuccess {
             inserted: 1,
-            operation_id: OperationId::parse("a\"b\\c").expect("valid operation_id"),
+            operation_id: Some(OperationId::parse("a\"b\\c").expect("valid operation_id")),
         };
         assert_eq!(
             encode_success_body(&success),
@@ -727,6 +754,12 @@ mod tests {
     }
 
     fn open_core() -> (EngineCore, std::path::PathBuf) {
+        open_core_with_mode(engine::recovery::required_op_id::LedgerMode::Optional)
+    }
+
+    fn open_core_with_mode(
+        mode: engine::recovery::required_op_id::LedgerMode,
+    ) -> (EngineCore, std::path::PathBuf) {
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "wire-insert-{}-{}.redb",
@@ -739,7 +772,7 @@ mod tests {
         let storage = Storage::open(&path).expect("open storage");
         storage.create_table(&schema()).expect("create table");
         (
-            EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+            EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_ledger_mode(mode),
             path,
         )
     }
@@ -792,7 +825,10 @@ mod tests {
             .expect("schema ok");
 
         let success = execute(&core, &principal, &validated).expect("insert ok");
-        assert_eq!(success.operation_id.as_str(), "op-echo");
+        assert_eq!(
+            success.operation_id.as_ref().map(OperationId::as_str),
+            Some("op-echo")
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -819,7 +855,8 @@ mod tests {
 
     #[test]
     fn handle_maps_engine_error_to_error_response() {
-        let (core, path) = open_core();
+        let (core, path) =
+            open_core_with_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
         let principal = principal("tenant-a");
         let body =
             r#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[1,0,0,0],"lang":"ja"}]}"#;
@@ -892,8 +929,9 @@ mod tests {
     }
 
     #[test]
-    fn execute_missing_operation_id_is_23502() {
-        let (core, path) = open_core();
+    fn execute_missing_operation_id_is_23502_when_required() {
+        let (core, path) =
+            open_core_with_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
         let principal = principal("tenant-a");
         let body =
             r#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[1,0,0,0],"lang":"ja"}]}"#;
@@ -908,8 +946,9 @@ mod tests {
     }
 
     #[test]
-    fn execute_null_operation_id_is_23502() {
-        let (core, path) = open_core();
+    fn execute_null_operation_id_is_23502_when_required() {
+        let (core, path) =
+            open_core_with_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
         let principal = principal("tenant-a");
         let body = r#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[1,0,0,0],"lang":"ja"}],"operation_id":null}"#;
         let value = parse_json(body).expect("valid json");
@@ -923,8 +962,9 @@ mod tests {
     }
 
     #[test]
-    fn execute_empty_operation_id_is_23502() {
-        let (core, path) = open_core();
+    fn execute_empty_operation_id_is_23502_when_required() {
+        let (core, path) =
+            open_core_with_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
         let principal = principal("tenant-a");
         let body = r#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[1,0,0,0],"lang":"ja"}],"operation_id":""}"#;
         let value = parse_json(body).expect("valid json");
@@ -935,6 +975,27 @@ mod tests {
         let err = execute(&core, &principal, &validated).expect_err("must reject");
         assert_eq!(err.wire_code(), "23502");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn execute_omitted_operation_id_succeeds_by_default_without_key_in_body() {
+        for tail in ["", r#","operation_id":null"#, r#","operation_id":"""#] {
+            let (core, path) = open_core();
+            let principal = principal("tenant-a");
+            let body = format!(
+                r#"{{"op":"insert","table":"docs","rows":[{{"id":1,"embedding":[1,0,0,0],"lang":"ja"}}]{tail}}}"#
+            );
+            let value = parse_json(&body).expect("valid json");
+            let validated = super::super::schema::INSERT_SCHEMA
+                .validate(&value)
+                .expect("schema ok");
+
+            let success = execute(&core, &principal, &validated).expect("default mode accepts");
+            assert_eq!(success.inserted, 1);
+            assert_eq!(success.operation_id, None);
+            assert_eq!(encode_success_body(&success), r#"{"inserted":1}"#);
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]
