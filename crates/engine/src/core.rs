@@ -1634,6 +1634,9 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `ParsedSql` を
     /// 網羅的にマッチする既存コードはすべて更新済み。
     DropView(crate::sql::allowlist::ValidatedDropView),
+    /// `DROP MATERIALIZED VIEW`（TABLE-42 (5)・TABLE-37、Issue #1667）。構造検証のみで
+    /// カタログを照会しない（`DropView` と同じ設計）。
+    DropMaterializedView(crate::sql::allowlist::ValidatedDropMaterializedView),
     /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <name> [(<alias>, ...)] AS <body>
     /// [WITH [NO] DATA]`（TABLE-42・Issue #1664）。DDL 実行権限ゲートの判定と初回実体化は
     /// `EngineCore::execute_parsed_in_session` の同名腕が担い、構文検証
@@ -1643,6 +1646,14 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #1664）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチする既存コードはすべて更新済み。
     CreateMaterializedView(crate::sql::allowlist::ValidatedCreateMaterializedView),
+    /// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] <name> [WITH [NO] DATA]`（TABLE-42・Issue #1665）。
+    /// DDL 権限ゲートと再実体化は `execute_parsed_in_session` の同名腕が担い、構文検証は
+    /// カタログを照会しない。明示トランザクション内は汎用フォールバックで `0A000`
+    /// （`CreateMaterializedView` と同じ）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1665）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    RefreshMaterializedView(crate::sql::allowlist::ValidatedRefreshMaterializedView),
     /// `CREATE INDEX <name> ON <table> [USING hnsw] (<col>[, ...])`（TASK-206・
     /// INDEX-7・SQL-23、Issue #908）。DDL 実行権限ゲート
     /// （`sql::ddl::require_ddl_permission`）の判定は `EngineCore::
@@ -1719,8 +1730,10 @@ fn statement_clock_scope(
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateView(_)
         | ParsedSql::DropView(_)
+        | ParsedSql::DropMaterializedView(_)
         // TABLE-42・Issue #1664: `CreateView` と同じく本文の時刻関数は束縛段で拒否する（fail-closed）。
         | ParsedSql::CreateMaterializedView(_)
+        | ParsedSql::RefreshMaterializedView(_)
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_)
         | ParsedSql::CreateType(_)
@@ -1767,7 +1780,9 @@ fn insert_default_clock_scope(
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateView(_)
         | ParsedSql::DropView(_)
+        | ParsedSql::DropMaterializedView(_)
         | ParsedSql::CreateMaterializedView(_)
+        | ParsedSql::RefreshMaterializedView(_)
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_)
         | ParsedSql::CreateType(_)
@@ -3461,7 +3476,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::CreateMaterializedView(_)
+                    | crate::sql::SqlOutcome::RefreshMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::DropMaterializedView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
@@ -3506,7 +3523,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::CreateMaterializedView(_)
+                    | crate::sql::SqlOutcome::RefreshMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::DropMaterializedView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
@@ -3548,7 +3567,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::CreateMaterializedView(_)
+                    | crate::sql::SqlOutcome::RefreshMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::DropMaterializedView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
@@ -3597,7 +3618,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::CreateMaterializedView(_)
+                    | crate::sql::SqlOutcome::RefreshMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::DropMaterializedView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
@@ -3652,7 +3675,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::CreateMaterializedView(_)
+                    | crate::sql::SqlOutcome::RefreshMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::DropMaterializedView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
@@ -4299,6 +4324,13 @@ impl EngineCore {
             return Ok(ParsedSql::DropIndex(stmt));
         }
 
+        // TABLE-42 (5)・Issue #1667: `DROP MATERIALIZED VIEW` も汎用 `DROP`（`DROP TABLE` 扱い）より
+        // 前に分岐する。構造検証のみでカタログを照会しない（`DropView` と同じ設計）。
+        if crate::sql::allowlist::is_drop_materialized_view_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_drop_materialized_view_tokens(&tokens)?;
+            return Ok(ParsedSql::DropMaterializedView(stmt));
+        }
+
         let is_drop_view_statement = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DROP")
@@ -4338,6 +4370,11 @@ impl EngineCore {
         if crate::sql::allowlist::is_create_materialized_view_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_materialized_view_tokens(&tokens)?;
             return Ok(ParsedSql::CreateMaterializedView(stmt));
+        }
+        // TABLE-42・Issue #1665: `REFRESH MATERIALIZED VIEW`。構造検証のみでカタログを照会しない。
+        if crate::sql::allowlist::is_refresh_materialized_view_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_refresh_materialized_view_tokens(&tokens)?;
+            return Ok(ParsedSql::RefreshMaterializedView(stmt));
         }
         // `CREATE VIEW` に加え `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）も同じ経路へ
         // 入れる。`CREATE OR REPLACE` の後が `VIEW` 以外（`TABLE`・`INDEX` 等）は従来どおり汎用経路で
@@ -5218,10 +5255,23 @@ impl EngineCore {
                 let outcome = self.execute_create_materialized_view(ctx, session, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateMaterializedView(outcome))
             }
+            // TABLE-42・Issue #1665: 権限ゲートを名前解決より先に置く（`CREATE` と同じ）。
+            ParsedSql::RefreshMaterializedView(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = self.execute_refresh_materialized_view(ctx, session, stmt)?;
+                Ok(crate::sql::SqlOutcome::RefreshMaterializedView(outcome))
+            }
             ParsedSql::DropView(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 let outcome = crate::sql::ddl::execute_drop_view(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropView(outcome))
+            }
+            // TABLE-42 (5)・Issue #1667: `DropView` と同じ判定順序（DDL 権限ゲート → カタログ照会を
+            // 含む実行本体）。権限の無い主体には対象の有無を問わず常に `42501` のみを返す。
+            ParsedSql::DropMaterializedView(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_drop_materialized_view(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::DropMaterializedView(outcome))
             }
             // TASK-206・INDEX-7・SQL-23（Issue #908）: `DropTable`・`CreateView` と
             // 同じ判定順序（DDL 実行権限ゲート → カタログ照会を含む実行本体）。
@@ -6292,7 +6342,10 @@ impl EngineCore {
             ParsedSql::CreateView(_) => Ok(None),
             // TABLE-42・Issue #1664: DDL につき結果列を持たない（Describe は本体を実行しない）。
             ParsedSql::CreateMaterializedView(_) => Ok(None),
+            // TABLE-42・Issue #1665: REFRESH も結果列を持たない。
+            ParsedSql::RefreshMaterializedView(_) => Ok(None),
             ParsedSql::DropView(_) => Ok(None),
+            ParsedSql::DropMaterializedView(_) => Ok(None),
             // TASK-206・INDEX-7（Issue #908）: 索引 DDL も結果列を持たない。
             ParsedSql::CreateIndex(_) => Ok(None),
             ParsedSql::DropIndex(_) => Ok(None),

@@ -880,6 +880,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropView(_) => OutcomeResponse::Command {
             tag: "DROP VIEW".to_string(),
         },
+        // TABLE-42 (5)（Issue #1667）: `DROP MATERIALIZED VIEW` も件数を持たない固定タグ。
+        SqlOutcome::DropMaterializedView(_) => OutcomeResponse::Command {
+            tag: "DROP MATERIALIZED VIEW".to_string(),
+        },
         // TABLE-42（Issue #1664）: `CREATE MATERIALIZED VIEW ... WITH DATA` は pg 互換の
         // `SELECT <n>`。`n` は作成したセッション自身の文脈の実体の行数だけ（他の文脈の件数を
         // 合算すると他テナントの件数が漏れるため、engine は合算値を持たない。実体化対象外なら 0）。
@@ -890,6 +894,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
             } else {
                 "CREATE MATERIALIZED VIEW".to_string()
             },
+        },
+        // TABLE-42（Issue #1665）: REFRESH は件数を持たない固定タグ（他文脈の件数を運べない）。
+        SqlOutcome::RefreshMaterializedView(_) => OutcomeResponse::Command {
+            tag: "REFRESH MATERIALIZED VIEW".to_string(),
         },
         // TASK-206・INDEX-7・SQL-23（Issue #908）: 索引宣言 DDL も件数を持たない
         // pg 互換の固定タグへ整形する（`CREATE VIEW`／`DROP VIEW` と同じ設計）。

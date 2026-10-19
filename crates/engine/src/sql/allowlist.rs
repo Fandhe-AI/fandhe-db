@@ -10957,6 +10957,26 @@ impl<'a> Parser<'a> {
         Ok((name, if_not_exists, aliases, self.remaining()))
     }
 
+    /// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] <name>` の前置部を読む（TABLE-42・Issue #1665）。
+    /// 戻り値は `(名前, CONCURRENTLY の有無, 名前以降の残りトークン)`。残りの
+    /// `WITH [NO] DATA` と `;` の剥離・余剰トークンの拒否は呼び出し元
+    /// （[`validate_refresh_materialized_view_tokens`]）が担う。
+    fn parse_refresh_materialized_view(
+        &mut self,
+    ) -> Result<(String, bool, &[Token]), SqlSurfaceError> {
+        self.expect_ident_matching("REFRESH")?;
+        self.expect_ident_matching("MATERIALIZED")?;
+        self.expect_ident_matching("VIEW")?;
+        let concurrently = if self.peek_ident_matches("CONCURRENTLY") {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        Ok((name, concurrently, self.remaining()))
+    }
+
     /// `DROP VIEW [IF EXISTS] <name> [CASCADE | RESTRICT] [;]`（TABLE-18・SQL-23・TASK-205、
     /// Issue #909。`IF EXISTS` は Issue #1614、`CASCADE`／`RESTRICT` は TABLE-37・Issue #1641）。
     /// 複数ビュー列挙は構造的に受理しない。戻り値は `(ビュー名, IF EXISTS の有無, 動作)`。
@@ -10967,6 +10987,25 @@ impl<'a> Parser<'a> {
         let name = self.expect_ident()?;
         let behavior = self.parse_optional_drop_behavior();
         Ok((name, if_exists, behavior))
+    }
+
+    /// `DROP MATERIALIZED VIEW [IF EXISTS] <name>[, <name> ...] [CASCADE | RESTRICT] [;]`
+    /// （TABLE-42 (5)・TABLE-37、Issue #1667）。複数指定の構文は `DROP TABLE` と同じ。
+    /// 戻り値は `(名前の列, IF EXISTS の有無, 動作)`。
+    fn parse_drop_materialized_view(
+        &mut self,
+    ) -> Result<(Vec<String>, bool, DropBehavior), SqlSurfaceError> {
+        self.expect_ident_matching("DROP")?;
+        self.expect_ident_matching("MATERIALIZED")?;
+        self.expect_ident_matching("VIEW")?;
+        let if_exists = self.consume_if_exists();
+        let mut names = vec![self.expect_ident()?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            names.push(self.expect_ident()?);
+        }
+        let behavior = self.parse_optional_drop_behavior();
+        Ok((names, if_exists, behavior))
     }
 
     /// `WITH <name> AS (<body>)[, <name> AS (<body>)]*`（非再帰 CTE。SQL-29 (b)・
@@ -11895,6 +11934,36 @@ impl ValidatedCreateView {
     }
 }
 
+/// `DROP MATERIALIZED VIEW [IF EXISTS] <name>[, <name> ...] [CASCADE | RESTRICT]` の許可形状構造
+/// 検証結果（TABLE-42 (5)・TABLE-37・TABLE-36 (4)、Issue #1667）。[`ValidatedDropTable`] と同じく
+/// カタログ照会を一切行わない（DDL 権限ゲートを名前解決より先に通す契約）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedDropMaterializedView {
+    /// 名前（記述順。重複は実行側で除去する）。
+    pub(crate) names: Vec<String>,
+    /// `IF EXISTS` 句の有無。
+    pub(crate) if_exists: bool,
+    /// `CASCADE`／`RESTRICT` 句。省略時は `Restrict`。
+    pub(crate) behavior: DropBehavior,
+}
+
+impl ValidatedDropMaterializedView {
+    /// 対象 matview 名（記述順）。
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// `IF EXISTS` が指定されたか。
+    pub fn if_exists(&self) -> bool {
+        self.if_exists
+    }
+
+    /// `CASCADE`／`RESTRICT` 句の指定（省略時は `Restrict`）。
+    pub fn behavior(&self) -> DropBehavior {
+        self.behavior
+    }
+}
+
 /// `DROP VIEW <name>` の許可形状構造検証結果（TABLE-18・SQL-23・TASK-205、
 /// Issue #909）。[`ValidatedDropTable`] と同じくカタログ照会を一切行わない。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12088,6 +12157,60 @@ pub(crate) fn validate_create_materialized_view_tokens(
         column_aliases,
         body_sql,
         base_relations,
+        with_data,
+    })
+}
+
+/// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] <name> [WITH [NO] DATA] [;]` の許可形状構造検証結果
+/// （TABLE-42 (1)(3)(4)・Issue #1665）。カタログを一切照会しない（DDL 権限ゲート・存在確認・種別判定・
+/// 再実体化は実行段 `core/matview_exec.rs` が担う。判定順序は `CreateMaterializedView` と同じ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedRefreshMaterializedView {
+    pub(crate) name: String,
+    /// `CONCURRENTLY` の有無（実行段で暫定 `0A000`。本実装は #1666）。
+    pub(crate) concurrently: bool,
+    /// `WITH DATA`（省略時の既定）なら真、`WITH NO DATA` なら偽。
+    pub(crate) with_data: bool,
+}
+
+impl ValidatedRefreshMaterializedView {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// `CONCURRENTLY` が指定されたか。
+    pub fn concurrently(&self) -> bool {
+        self.concurrently
+    }
+
+    /// 再実体化するか（`WITH DATA`。省略時も真）。偽なら実体を破棄して未実体化にする。
+    pub fn with_data(&self) -> bool {
+        self.with_data
+    }
+}
+
+/// `REFRESH MATERIALIZED VIEW ...` で始まる文か（`core.rs::parse_tokens` の分岐述語。Issue #1665）。
+pub(crate) fn is_refresh_materialized_view_statement(tokens: &[Token]) -> bool {
+    let ident_at = |i: usize, word: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word));
+    ident_at(0, "REFRESH") && ident_at(1, "MATERIALIZED")
+}
+
+/// [`ValidatedRefreshMaterializedView`] の構造検証本体（`core.rs::parse_tokens` から呼ばれる。
+/// Issue #1665）。名前の後ろは `WITH [NO] DATA` と `;` だけを許し、余剰トークンは `42601`。
+pub(crate) fn validate_refresh_materialized_view_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedRefreshMaterializedView, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let (name, concurrently, rest) = p.parse_refresh_materialized_view()?;
+    let (leftover, with_data) = split_matview_data_clause(rest);
+    if !leftover.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "unexpected tokens after REFRESH MATERIALIZED VIEW target",
+        ));
+    }
+    Ok(ValidatedRefreshMaterializedView {
+        name,
+        concurrently,
         with_data,
     })
 }
@@ -12574,6 +12697,28 @@ pub(crate) fn validate_drop_type_tokens(
     }
     p.expect_end_of_statement()?;
     Ok(ValidatedDropType { name, if_exists })
+}
+
+/// 先頭 3 トークンが `DROP MATERIALIZED VIEW` か（`core.rs::EngineCore::parse_tokens` の分岐判定。
+/// 汎用 `DROP`（`DROP TABLE` 扱い）より前に分岐するために使う。TABLE-42、Issue #1667）。
+pub(crate) fn is_drop_materialized_view_statement(tokens: &[Token]) -> bool {
+    let ident_at = |i: usize, word: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word));
+    ident_at(0, "DROP") && ident_at(1, "MATERIALIZED")
+}
+
+/// [`ValidatedDropMaterializedView`] の構造検証本体（カタログ照会なし）。`IF EXISTS`・複数指定・
+/// `CASCADE`／`RESTRICT` を受理し、余剰トークン・末尾カンマ・空要素は `42601`。
+pub(crate) fn validate_drop_materialized_view_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedDropMaterializedView, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let (names, if_exists, behavior) = p.parse_drop_materialized_view()?;
+    p.expect_end_of_statement()?;
+    Ok(ValidatedDropMaterializedView {
+        names,
+        if_exists,
+        behavior,
+    })
 }
 
 /// [`ValidatedDropView`] の構造検証本体。
@@ -25510,6 +25655,43 @@ mod body_expr_policy_tests {
         ] {
             assert!(
                 matches!(check(bad), Err(SqlSurfaceError::UnsupportedSyntax { .. })),
+                "{bad}"
+            );
+        }
+    }
+
+    /// `REFRESH MATERIALIZED VIEW` の構文検証（TABLE-42・Issue #1665）。
+    #[test]
+    fn refresh_materialized_view_structural_checks() {
+        let check = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tok");
+            validate_refresh_materialized_view_tokens(&tokens)
+        };
+        let tokens = crate::sql::lexer::tokenize("REFRESH MATERIALIZED VIEW mv").expect("tok");
+        assert!(is_refresh_materialized_view_statement(&tokens));
+        let plain = check("REFRESH MATERIALIZED VIEW mv").expect("plain");
+        assert!(plain.with_data() && !plain.concurrently());
+        assert_eq!(plain.name(), "mv");
+        assert!(check("refresh materialized view mv with data;")
+            .expect("with data")
+            .with_data());
+        assert!(!check("REFRESH MATERIALIZED VIEW mv WITH NO DATA")
+            .expect("no data")
+            .with_data());
+        let conc = check("REFRESH MATERIALIZED VIEW CONCURRENTLY mv").expect("conc");
+        assert!(conc.concurrently() && conc.with_data());
+        for bad in [
+            "REFRESH VIEW mv",
+            "REFRESH MATERIALIZED VIEW",
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY",
+            "REFRESH MATERIALIZED VIEW mv WITH DATA extra",
+            "REFRESH MATERIALIZED VIEW mv WITH",
+            "REFRESH MATERIALIZED VIEW mv DATA",
+            "REFRESH MATERIALIZED VIEW mv, other",
+        ] {
+            let tokens = crate::sql::lexer::tokenize(bad).expect("tok");
+            assert!(
+                validate_refresh_materialized_view_tokens(&tokens).is_err(),
                 "{bad}"
             );
         }

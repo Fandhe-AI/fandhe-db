@@ -57,6 +57,8 @@ const MAX_DEPENDENCY_WALK: usize = MAX_LIST_TABLES * 2;
 pub(crate) enum DropTarget {
     Table(String),
     View(String),
+    /// matview（TABLE-42 (5)、Issue #1667）。
+    MaterializedView(String),
     // `Index`／`EnumType` は列挙のみ対応済みで、`DROP INDEX／TYPE ... CASCADE` の適用は
     // 未対応（Issue #1641 の対象外）。適用側が結線されるまでは単体テストのみが構築する。
     #[allow(dead_code)]
@@ -160,6 +162,9 @@ pub(crate) enum DependentObject {
     ForeignKey { table: String, constraint: String },
     /// ENUM 型を使う列（表は残り、列が依存する）。
     Column { table: String, column: String },
+    /// matview 全体が依存する（`base_relations` に依存元を含むもの。TABLE-42 (5)、Issue #1667）。
+    /// 削除順の整列で既存の種別の後ろに並ぶよう末尾に置く。
+    MaterializedView { name: String },
 }
 
 /// 辺の端点（向きは [`DependencyClosure::edges`] 参照）。
@@ -225,6 +230,14 @@ pub(crate) fn enumerate_drop_dependents_in_txn(
             .iter()
             .filter_map(|t| match t {
                 DropTarget::View(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect(),
+        matviews: crate::catalog::materialized::load_materialized_view_bases_in_txn(write_txn)?,
+        root_matviews: roots
+            .iter()
+            .filter_map(|t| match t {
+                DropTarget::MaterializedView(n) => Some(n.clone()),
                 _ => None,
             })
             .collect(),
@@ -391,6 +404,11 @@ fn require_root_exists(write_txn: &redb::WriteTransaction, root: &DropTarget) ->
     let (def, name, missing) = match root {
         DropTarget::Table(n) => (CATALOG_TABLE, n, CatalogError::TableNotFound(n.clone())),
         DropTarget::View(n) => (VIEWS_TABLE, n, CatalogError::ViewNotFound(n.clone())),
+        DropTarget::MaterializedView(n) => (
+            crate::catalog::materialized::MATERIALIZED_VIEWS_TABLE,
+            n,
+            CatalogError::ViewNotFound(n.clone()),
+        ),
         DropTarget::Index(n) => (
             INDEX_CATALOG_TABLE,
             n,
@@ -434,6 +452,9 @@ struct Walker<'a> {
     views: Vec<(String, ViewDef)>,
     root_tables: BTreeSet<String>,
     root_views: BTreeSet<String>,
+    /// 全 matview の `(名前, 直接の参照元)`（名前順。walk 中に表ハンドルを保持しないため先読み）。
+    matviews: Vec<(String, Vec<String>)>,
+    root_matviews: BTreeSet<String>,
     conservative: bool,
 }
 
@@ -455,7 +476,18 @@ impl Walker<'_> {
         let mut out = match node {
             DependencyNode::Target(DropTarget::Table(name)) => self.table_children(name)?,
             DependencyNode::Target(DropTarget::View(name))
-            | DependencyNode::Object(DependentObject::View { name }) => self.views_reading(name),
+            | DependencyNode::Object(DependentObject::View { name }) => {
+                let mut out = self.views_reading(name);
+                out.extend(self.matviews_reading(name));
+                out
+            }
+            // 現状ビューは matview を参照できない（作成時に TableNotFound）ため、matview の子は
+            // それを読む matview だけ。ビューを足すと本文を再検証できないビューが無関係な
+            // matview の CASCADE を保守的に拒否してしまう。
+            DependencyNode::Target(DropTarget::MaterializedView(name))
+            | DependencyNode::Object(DependentObject::MaterializedView { name }) => {
+                self.matviews_reading(name)
+            }
             DependencyNode::Target(DropTarget::Index(name)) => self.index_children(name)?,
             DependencyNode::Target(DropTarget::EnumType(name)) => self.enum_children(name)?,
             DependencyNode::Object(DependentObject::Column { table, column }) => {
@@ -498,7 +530,29 @@ impl Walker<'_> {
             .map(|(child, fk)| fk_object(child, fk, self.root_for_table(&child.name)))
             .collect();
         out.extend(self.views_reading(table));
+        out.extend(self.matviews_reading(table));
         Ok(out)
+    }
+
+    /// 根集合の matview なら対応する根（`Child::root` 用）。
+    fn root_for_matview(&self, name: &str) -> Option<DropTarget> {
+        self.root_matviews
+            .contains(name)
+            .then(|| DropTarget::MaterializedView(name.to_string()))
+    }
+
+    /// relation `relation` を直接の参照元とする matview（根集合の matview は `root` 付きで返す）。
+    /// 参照元は定義の `base_relations` から確定するため、ビューと違って `soft` にはならない。
+    fn matviews_reading(&self, relation: &str) -> Vec<Child> {
+        self.matviews
+            .iter()
+            .filter(|(_, bases)| bases.iter().any(|b| b == relation))
+            .map(|(name, _)| Child {
+                obj: DependentObject::MaterializedView { name: name.clone() },
+                soft: false,
+                root: self.root_for_matview(name),
+            })
+            .collect()
     }
 
     /// relation `relation` を読むビュー（根集合のビューは `root` 付きで返す）。
@@ -540,6 +594,13 @@ impl Walker<'_> {
             decode_index_def(index, guard.value())?
         };
         if !def.unique {
+            return Ok(Vec::new());
+        }
+        // matview の UNIQUE 索引（Issue #1667）は表の制約ではなく、FK の参照先になり得ない。
+        if crate::catalog::materialized::load_materialized_view_bases_in_txn(self.write_txn)?
+            .iter()
+            .any(|(name, _)| *name == def.table)
+        {
             return Ok(Vec::new());
         }
         let corrupt = || {

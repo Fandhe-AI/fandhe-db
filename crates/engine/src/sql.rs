@@ -461,12 +461,24 @@ pub enum SqlOutcome {
     /// **BREAKING CHANGE**（Issue #1664）: 本 variant の追加により `SqlOutcome` を網羅的に
     /// マッチする既存コードはすべて更新済み。
     CreateMaterializedView(ddl::CreateMaterializedViewOutcome),
+    /// `REFRESH MATERIALIZED VIEW ...`（TABLE-42・Issue #1665）が成功したことを示す応答
+    /// （[`ddl::RefreshMaterializedViewOutcome`]。件数は運ばない）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1665）: 本 variant の追加により `SqlOutcome` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    RefreshMaterializedView(ddl::RefreshMaterializedViewOutcome),
     /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）がセッション
     /// 経由の実行経路で成功したことを示す応答。
     ///
     /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `SqlOutcome`
     /// を網羅的にマッチする既存コードはすべて更新済み。
     DropView(ddl::DropViewOutcome),
+    /// `DROP MATERIALIZED VIEW [IF EXISTS] <name>[, ...] [CASCADE | RESTRICT]`（TABLE-42 (5)・
+    /// TABLE-37、Issue #1667）がセッション経由の実行経路で成功したことを示す応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #1667）: 本 variant の追加により `SqlOutcome` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    DropMaterializedView(ddl::DropMaterializedViewOutcome),
     /// `CREATE INDEX <name> ON <table> [USING hnsw] (<col>[, ...])`（TASK-206・
     /// INDEX-7・SQL-23、Issue #908）がセッション経由の実行経路で成功したことを
     /// 示す応答（[`ddl::CreateIndexOutcome`] を運ぶ薄いラッパー）。
