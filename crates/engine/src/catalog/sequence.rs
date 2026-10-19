@@ -523,7 +523,36 @@ impl SequenceAllocator {
         Ok(value)
     }
 
-    /// `sequence_id` の現在値を全テナント分メモリから捨てる（`DROP SEQUENCE` の commit 成功後。
+    /// メモリ上の現在値の `last_value` を返す（無ければ `None`。RESTART なしの `ALTER SEQUENCE` の
+    /// 範囲検査用。ROLLBACK 済みで永続値より進んだ値も含む）。
+    fn peek_last_value(
+        &self,
+        tenant: &str,
+        sequence_id: u64,
+    ) -> std::result::Result<Option<i64>, AllocError> {
+        let guard = self.cursors.lock().map_err(|_| AllocError::Poisoned)?;
+        Ok(guard
+            .get(&(tenant.to_string(), sequence_id))
+            .map(|c| c.last_value))
+    }
+
+    /// メモリ上の現在値があれば `write_txn` へ永続化する（`currval` だけを使う書き込みでも、
+    /// ROLLBACK で永続値が戻った状態のまま commit して払い出し済みの値を再払い出ししないため。
+    /// 現在値は巻き戻さず進めない。メモリに無ければ何もしない）。
+    pub(crate) fn persist_current_in_txn(
+        &self,
+        write_txn: &redb::WriteTransaction,
+        tenant: &str,
+        sequence_id: u64,
+    ) -> std::result::Result<(), AllocError> {
+        let guard = self.cursors.lock().map_err(|_| AllocError::Poisoned)?;
+        if let Some(c) = guard.get(&(tenant.to_string(), sequence_id)) {
+            write_state_in_txn(write_txn, tenant, sequence_id, c)?;
+        }
+        Ok(())
+    }
+
+    /// `sequence_id` の現在値を全テナント分メモリから捨てる（`DROP SEQUENCE`・RESTART の commit 成功後。
     /// ロックの毒化は黙って握りつぶさず、次回払い出しで `Poisoned` になる）。
     pub(crate) fn evict(&self, sequence_id: u64) {
         if let Ok(mut guard) = self.cursors.lock() {
@@ -642,27 +671,29 @@ fn load_sequence_bytes_in_txn(write_txn: &redb::WriteTransaction, name: &str) ->
     Err(CatalogError::TableNotFound(name.to_string()))
 }
 
-/// 呼び出し元テナントの現在値を読むフック（RESTART なしの `ALTER SEQUENCE` の範囲検査用）。
-/// 状態行が無ければ `None`（定義の `restart_value` を使う）。状態行の値の形式は #1690 が決めるため、
-/// 行が存在する場合は形式が確定するまで `CorruptSchema` で fail-closed にする（#1690 の結線点）。
-/// 他テナントの状態行は読まない（`22023` の有無から他テナントの採番の進みを観測させない）。
+/// 呼び出し元テナントの現在値を読む（RESTART なしの `ALTER SEQUENCE` の範囲検査用）。
+/// メモリ上の現在値（ROLLBACK 済みで永続値より進んだ値を含む）を優先し、無ければ永続化済みの
+/// 状態行の `last_value`、どちらも無ければ `None`（定義の `restart_value` を使う）。状態行が
+/// 壊れていれば `CorruptSchema` で fail-closed。他テナントの状態は読まない（`22023` の有無から
+/// 他テナントの採番の進みを観測させない）。
 fn caller_current_value_in_txn(
+    allocator: &SequenceAllocator,
     write_txn: &redb::WriteTransaction,
     tenant_id: &str,
     id: u64,
-) -> Result<Option<i64>> {
-    match ReadSource::open_table(write_txn, SEQUENCE_STATE_TABLE) {
-        Ok(t) => {
-            if t.get((tenant_id, id))?.is_some() {
-                return Err(CatalogError::CorruptSchema(
-                    "sequence state format is not yet supported".to_string(),
-                ));
-            }
-            Ok(None)
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
-        Err(e) => Err(e.into()),
+) -> std::result::Result<Option<i64>, AlterSequenceError> {
+    let mem = allocator
+        .peek_last_value(tenant_id, id)
+        .map_err(|e| match e {
+            AllocError::Catalog(c) => AlterSequenceError::Catalog(c),
+            _ => AlterSequenceError::Catalog(CatalogError::CorruptSchema(
+                "sequence allocator unavailable".to_string(),
+            )),
+        })?;
+    if mem.is_some() {
+        return Ok(mem);
     }
+    Ok(read_state_in_txn(write_txn, tenant_id, id)?.map(|c| c.last_value))
 }
 
 impl Storage {
@@ -717,11 +748,14 @@ impl Storage {
             table.remove(sequence_key(name))?;
         }
         delete_sequence_state_in_txn(&write_txn, id)?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
         // commit 成功後にだけメモリ上の現在値を捨てる（内部 ID は再利用しないため、失敗時に
         // 残っても害はなく、成功時に残すと全テナント分が滞留する。設計記録 D3）。
-        self.sequence_allocator().evict(id);
+        let allocator = self.sequence_allocator();
+        crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
+            allocator.evict(id);
+            crate::recovery::commit_boundary::PostCommitResult::Ok
+        })
+        .map_err(super::convert_storage_error)?;
         Ok(())
     }
 
@@ -743,7 +777,7 @@ impl Storage {
         let bytes = load_sequence_bytes_in_txn(&write_txn, name)?;
         let def = decode_sequence_def(&bytes)?;
         let caller_current = if alter.restart.is_none() {
-            caller_current_value_in_txn(&write_txn, tenant_id, def.id)?
+            caller_current_value_in_txn(self.sequence_allocator(), &write_txn, tenant_id, def.id)?
         } else {
             None
         };
@@ -760,9 +794,19 @@ impl Storage {
         if alter.restart.is_some() {
             delete_sequence_state_in_txn(&write_txn, def.id)?;
         }
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        self.sequence_allocator().evict(def.id);
+        // RESTART のときだけメモリ上の現在値を捨てる（それ以外のオプション変更は現在値を保持し、
+        // ROLLBACK 済みの消費済み値の再払い出しを防ぐ）。破棄は commit 直後に writer permit を
+        // 保持したまま行い、commit と破棄の間に別の書き込みが古い現在値で払い出せないようにする。
+        let restart = alter.restart.is_some();
+        let allocator = self.sequence_allocator();
+        let id = def.id;
+        crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
+            if restart {
+                allocator.evict(id);
+            }
+            crate::recovery::commit_boundary::PostCommitResult::Ok
+        })
+        .map_err(super::convert_storage_error)?;
         Ok(())
     }
 
@@ -1162,6 +1206,100 @@ mod tests {
         let txn = s.begin_write_txn().expect("txn");
         assert_eq!(
             alloc
+                .next_value_in_txn(&txn, "t1", id, &p, p.start)
+                .expect("v"),
+            2
+        );
+    }
+
+    #[test]
+    fn alter_without_restart_keeps_unpersisted_current_value() {
+        let (s, _g) = tmp_storage("seq_alter_keep");
+        s.create_sequence("a", &params()).expect("create");
+        let (id, p) = s.sequence_definition("a").unwrap().unwrap();
+        let alloc = s.sequence_allocator();
+        {
+            let txn = s.begin_write_txn().expect("txn");
+            assert_eq!(
+                alloc
+                    .next_value_in_txn(&txn, "t1", id, &p, p.start)
+                    .expect("v"),
+                1
+            );
+            drop(txn); // ROLLBACK 相当。
+        }
+        let a = SequenceAlter {
+            increment: Some(2),
+            ..no_alter()
+        };
+        s.alter_sequence("a", "t1", &a).expect("alter");
+        let (_, p2) = s.sequence_definition("a").unwrap().unwrap();
+        let txn = s.begin_write_txn().expect("txn");
+        // 消費済みの 1 は再払い出しされず、新しい INCREMENT で進む。
+        assert_eq!(
+            alloc
+                .next_value_in_txn(&txn, "t1", id, &p2, p2.start)
+                .expect("v"),
+            3
+        );
+    }
+
+    #[test]
+    fn alter_without_restart_succeeds_after_nextval_persisted_state() {
+        let (s, _g) = tmp_storage("seq_alter_state");
+        s.create_sequence("a", &params()).expect("create");
+        let (id, p) = s.sequence_definition("a").unwrap().unwrap();
+        {
+            let txn = s.begin_write_txn().expect("txn");
+            s.sequence_allocator()
+                .next_value_in_txn(&txn, "t1", id, &p, p.start)
+                .expect("v");
+            crate::recovery::commit_boundary::commit(txn).expect("commit");
+        }
+        let a = SequenceAlter {
+            increment: Some(2),
+            ..no_alter()
+        };
+        s.alter_sequence("a", "t1", &a).expect("alter");
+        // 現在値（1）が新しい範囲の外なら 22023 相当で拒否される。
+        let out_of_range = SequenceAlter {
+            min_value: BoundChange::Set(5),
+            max_value: BoundChange::Set(10),
+            start: Some(5),
+            ..no_alter()
+        };
+        assert!(matches!(
+            s.alter_sequence("a", "t1", &out_of_range),
+            Err(AlterSequenceError::Range(
+                SequenceRangeError::CurrentBelowMin
+            ))
+        ));
+    }
+
+    #[test]
+    fn persist_current_saves_memory_cursor_without_rewinding() {
+        let (s, _g) = tmp_storage("seq_persist_cur");
+        s.create_sequence("a", &params()).expect("create");
+        let (id, p) = s.sequence_definition("a").unwrap().unwrap();
+        let alloc = s.sequence_allocator();
+        {
+            let txn = s.begin_write_txn().expect("txn");
+            alloc
+                .next_value_in_txn(&txn, "t1", id, &p, p.start)
+                .expect("v");
+            drop(txn); // ROLLBACK 相当（永続値は無い）。
+        }
+        {
+            let txn = s.begin_write_txn().expect("txn");
+            alloc
+                .persist_current_in_txn(&txn, "t1", id)
+                .expect("persist");
+            crate::recovery::commit_boundary::commit(txn).expect("commit");
+        }
+        let fresh = SequenceAllocator::default();
+        let txn = s.begin_write_txn().expect("txn");
+        assert_eq!(
+            fresh
                 .next_value_in_txn(&txn, "t1", id, &p, p.start)
                 .expect("v"),
             2

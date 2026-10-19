@@ -1507,14 +1507,27 @@ fn assign_sequence_values(
                             detail: "currval is not supported in this context".to_string(),
                         }));
                     };
-                    let state = session.lock().map_err(|_| {
-                        sql_err(SqlSurfaceError::Internal {
-                            detail: "sequence session state unavailable".to_string(),
-                        })
-                    })?;
-                    state
-                        .currval(seq_id)
-                        .ok_or_else(|| sql_err(SqlSurfaceError::SequenceNotYetDefined))?
+                    let cur = {
+                        let state = session.lock().map_err(|_| {
+                            sql_err(SqlSurfaceError::Internal {
+                                detail: "sequence session state unavailable".to_string(),
+                            })
+                        })?;
+                        state
+                            .currval(seq_id)
+                            .ok_or_else(|| sql_err(SqlSurfaceError::SequenceNotYetDefined))?
+                    };
+                    // ROLLBACK で永続値だけ戻った状態でも、メモリ上の消費済みの現在値を同じ txn へ
+                    // 永続化する（再オープン後の再払い出しを防ぐ。値は巻き戻さない）。
+                    allocator
+                        .persist_current_in_txn(write_txn, tenant_id, seq_id)
+                        .map_err(|e| match e {
+                            AllocError::Catalog(c) => TenantWriteError::Catalog(c),
+                            _ => sql_err(SqlSurfaceError::Internal {
+                                detail: "sequence allocator unavailable".to_string(),
+                            }),
+                        })?;
+                    cur
                 }
             };
             // 列型へ収める。範囲外は `22003`（値は消費済みで戻さない。PostgreSQL と同じ）。
