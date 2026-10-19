@@ -394,10 +394,6 @@ fn structural_rejections_do_not_consult_the_catalog() {
         // 有無に依存しない。UNIQUE・hnsw・式への COLLATE との組み合わせは最終ゲートの 0A000。
         ("CREATE INDEX idx ON docs ((now()))".into(), "42P17"),
         (
-            "CREATE UNIQUE INDEX idx ON docs ((lower(lang)))".into(),
-            "0A000",
-        ),
-        (
             "CREATE INDEX idx ON docs USING hnsw ((lower(lang)))".into(),
             "0A000",
         ),

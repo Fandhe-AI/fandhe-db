@@ -12450,7 +12450,7 @@ pub(crate) fn validate_create_index_tokens(
     }
     p.expect_end_of_statement()?;
     // 最終ゲート（INDEX-10、Issue #1647）。決定性検査は部分索引の `WHERE` 判定より前に済ませてある。
-    reject_unimplemented_expression_keys(&expressions, &collations, hnsw, unique)?;
+    reject_unimplemented_expression_keys(&expressions, &collations, hnsw)?;
     Ok(ValidatedCreateIndex {
         name,
         if_not_exists,
@@ -12468,14 +12468,12 @@ pub(crate) fn validate_create_index_tokens(
 /// 担うため、ここには「強制や追随が未実装の組み合わせ」だけを残し、カタログ非参照の構文段で
 /// `0A000` に倒す（宣言だけ残って効かない索引を作らない。fail-closed）:
 /// - `USING hnsw` かつ式要素
-/// - `UNIQUE` かつ式要素（一意性の強制は後続 Issue #1651）
 /// - 式要素を含む索引の `COLLATE`（式への指定は要素末尾・式の最上位とも、素の列への指定も。
 ///   式キーの辞書はバイト列順のみで、v4 の永続形は照合を持たない）
 fn reject_unimplemented_expression_keys(
     expressions: &[Option<Expr>],
     collations: &[Option<crate::collation::Collation>],
     hnsw: bool,
-    unique: bool,
 ) -> Result<(), SqlSurfaceError> {
     if !expressions.iter().any(Option::is_some) {
         return Ok(());
@@ -12485,11 +12483,7 @@ fn reject_unimplemented_expression_keys(
             detail: "USING hnsw does not support expression indexes".to_string(),
         });
     }
-    if unique {
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "CREATE UNIQUE INDEX does not support expression indexes yet".to_string(),
-        });
-    }
+    // `UNIQUE` かつ式要素（INDEX-9・INDEX-10、Issue #1651）は受理する。強制は永続一意索引が担う。
     // 式要素を含む索引では、素の列要素の `COLLATE` も受理しない（v4 の永続形は照合を持たず、
     // 宣言と永続形が食い違う fail-open になるため。式への照合と合わせて後続対応）。
     let collated = collations.iter().any(Option::is_some)
@@ -17379,6 +17373,9 @@ mod tests {
             "CREATE INDEX i ON t ((lower(a)), b)",
             "CREATE INDEX i ON t ((a::text))",
             "CREATE INDEX i ON t ((date_part('year', ts)))",
+            // 一意の式索引は構文段を通る（INDEX-9・INDEX-10、Issue #1651）。
+            "CREATE UNIQUE INDEX i ON t ((a + 1))",
+            "CREATE UNIQUE INDEX i ON t ((lower(a)), b)",
         ] {
             let ok = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
             assert!(ok.expression_keys().iter().any(Option::is_some), "{sql}");
@@ -17386,7 +17383,7 @@ mod tests {
         for (sql, code) in [
             // 重複列（正規化後）。
             ("CREATE INDEX i ON t ((a), a)", "42601"),
-            // UNIQUE・hnsw・式への COLLATE と式の組み合わせは構文段の最終ゲートで 0A000。
+            // hnsw・式への COLLATE と式の組み合わせは構文段の最終ゲートで 0A000。
             ("CREATE INDEX i ON t (lower(a) COLLATE \"C\")", "0A000"),
             ("CREATE INDEX i ON t ((lower(a) COLLATE \"C\"))", "0A000"),
             // 入れ子の COLLATE（引数・CASE・CAST 内）も 0A000（v4 永続形が照合を持たないため）。
@@ -17396,7 +17393,6 @@ mod tests {
                 "CREATE INDEX i ON t ((CASE WHEN a > 'x' THEN lower(a COLLATE \"C\") END))",
                 "0A000",
             ),
-            ("CREATE UNIQUE INDEX i ON t ((a + 1))", "0A000"),
             ("CREATE INDEX i ON t USING hnsw ((a + 1))", "0A000"),
             // 非決定的な式は 42P17（UNIQUE・入れ子・複数要素でも検出）。
             ("CREATE INDEX i ON t ((now()))", "42P17"),

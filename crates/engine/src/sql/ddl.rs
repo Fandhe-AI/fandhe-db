@@ -2657,11 +2657,12 @@ pub(crate) fn execute_create_index(
     storage: &Storage,
     validated: &ValidatedCreateIndex,
 ) -> Result<CreateIndexOutcome, SqlSurfaceError> {
-    // 防御ゲート（INDEX-10、Issue #1648）: hnsw・一意索引と式要素の組み合わせは構文段の最終
-    // ゲートで拒否済みだが、将来の経路変更で届いても、式を黙って落として列だけで保存しない
-    // （fail-closed）。式要素そのものは `create_index_bound` が書き込み txn 内で束縛する。
+    // 防御ゲート（INDEX-10、Issue #1648）: hnsw と式要素の組み合わせは構文段の最終ゲートで拒否
+    // 済みだが、将来の経路変更で届いても、式を黙って落として列だけで保存しない（fail-closed）。
+    // 式要素そのものは `create_index_bound` が書き込み txn 内で束縛する。一意索引と式要素の組
+    // （Issue #1651）は受理し、`create_index_bound` が強制の前提を同一 txn で整える。
     let has_expressions = validated.expression_keys().iter().any(Option::is_some);
-    if has_expressions && (validated.is_hnsw() || validated.is_unique()) {
+    if has_expressions && validated.is_hnsw() {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "expression indexes are not supported for this index kind yet".to_string(),
         });

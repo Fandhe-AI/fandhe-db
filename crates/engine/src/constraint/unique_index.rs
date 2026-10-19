@@ -39,6 +39,15 @@
 //! 起きない——後片付けは索引の肥大化を防ぐための衛生措置に留まり、判定の
 //! 正しさ自体には関与しない。
 //!
+//! # 一意の式索引（INDEX-9・INDEX-10、Issue #1651）
+//!
+//! `CREATE UNIQUE INDEX ... ((式))` は UNIQUE 制約へ展開せず、索引カタログの宣言を
+//! [`super::UniqueKeyPlan`] が `ordinal`（主キー → UNIQUE 制約 → 式一意索引の順）付きの
+//! キーとして加える。物理レイアウト・遅延検証の不変条件は列だけのキーと同じで、キーの
+//! 計算だけが [`super::UniqueKeyPlan::row_keys`]（式要素は評価結果の分類から作る）に
+//! 置き換わる。マーカーのシグネチャに式の正規化テキスト・参照列の型指紋を含めるため、
+//! 式の変更・参照列の改名や型変更・索引の作成と削除では自動的に再構築される。
+//!
 //! # テナント境界（RLS-9・RLS-10 (c)）
 //!
 //! 索引キーの第 1 要素は常にサーバー側導出テナントであり、照会・範囲走査・
@@ -54,8 +63,9 @@
 //! ダウングレードして書き込む運用はサポートしない（索引と行データの不整合
 //! を検出する機構を持たないため）。
 
-use super::{decode_key_columns, key_bytes, KeySpec, NullPolicy};
+use super::{KeySpec, NullPolicy, UniqueKeyPlan};
 use crate::catalog::{CatalogError, TableSchema};
+use crate::sql::expression_key_index::CompiledIndexExpressions;
 use crate::tenant::TenantWriteError;
 use redb::{ReadableTable, TableHandle};
 use std::collections::{HashMap, HashSet};
@@ -69,7 +79,10 @@ use std::collections::{HashMap, HashSet};
 /// フォーマットのマーカーを取りこぼしなく fail-closed に無効化することを
 /// バイト列の偶然の一致に頼らず保証するため、フォーマット変更のたびに
 /// version も bump する運用とする。
-const FORMAT_VERSION: u32 = 2;
+///
+/// 2 → 3: 一意の式索引（INDEX-9・INDEX-10、Issue #1651）の仕様を [`schema_signature`] へ追記した。
+/// 旧版のマーカーは取りこぼしなく無効化され、各テナントは次回の書き込みで 1 回だけ再構築される。
+const FORMAT_VERSION: u32 = 3;
 
 // [`check_and_update`] が行ストアを読み戻した回数（単体テスト専用の計測
 // フック。Issue #1070 受け入れ条件 1「検査コストがテナントの保有行数に
@@ -159,7 +172,12 @@ fn index_table_exists(
 /// （codex P1 指摘・PR #1123）。列名の長さは [`crate::catalog::validate_identifier`]
 /// が課す上限（63 バイト）以下であることが保証されているため 1 バイトの
 /// 長さプレフィックスで足りる。
-fn schema_signature(schema: &TableSchema, specs: &[KeySpec]) -> Vec<u8> {
+fn schema_signature(
+    schema: &TableSchema,
+    plan: &UniqueKeyPlan,
+    compiled: Option<&CompiledIndexExpressions>,
+) -> Result<Vec<u8>, TenantWriteError> {
+    let specs: &[KeySpec] = plan.column_specs();
     let mut out = Vec::new();
     out.extend_from_slice(&(specs.len() as u32).to_be_bytes());
     for spec in specs {
@@ -180,7 +198,9 @@ fn schema_signature(schema: &TableSchema, specs: &[KeySpec]) -> Vec<u8> {
             out.extend_from_slice(&name_bytes[..usize::from(len)]);
         }
     }
-    out
+    // 一意の式索引（Issue #1651）。式の変更・参照列の改名や型変更でマーカーが不一致になり再構築される。
+    plan.push_expression_signature(schema, compiled, &mut out)?;
+    Ok(out)
 }
 
 /// 正引きサブキー（`[0x01][ordinal: u16 BE][正準キーバイト列]`）を組み立てる。
@@ -325,9 +345,9 @@ pub(super) fn clear_tenant_in_txn(
     schema: &TableSchema,
     tenant_id: &str,
 ) -> Result<(), TenantWriteError> {
-    if schema.primary_key().is_none() && schema.unique_constraints().is_empty() {
-        return Ok(());
-    }
+    // 主キー・UNIQUE 制約が無い表でも、一意の式索引（Issue #1651）の永続索引が物理的に存在し得る。
+    // スキーマ側の有無では判定せず、作成を伴わない存在確認だけで読み飛ばす。
+    let _ = schema;
     let index_table_name = crate::catalog::user_uniq_table_name(table_name);
     if !index_table_exists(write_txn, &index_table_name)? {
         return Ok(());
@@ -361,9 +381,8 @@ pub(super) fn forget_rows_in_txn(
     if ids.is_empty() {
         return Ok(());
     }
-    if schema.primary_key().is_none() && schema.unique_constraints().is_empty() {
-        return Ok(());
-    }
+    // `clear_tenant_in_txn` と同じ理由でスキーマ側の有無では読み飛ばさない（Issue #1651）。
+    let _ = schema;
     let index_table_name = crate::catalog::user_uniq_table_name(table_name);
     if !index_table_exists(write_txn, &index_table_name)? {
         return Ok(());
@@ -414,15 +433,15 @@ pub(super) fn ensure_tenant_index<R>(
     row_table: &R,
     index_table: &mut IndexTable<'_>,
     schema: &TableSchema,
-    specs: &[KeySpec],
-    mask: &[bool],
+    plan: &UniqueKeyPlan,
+    compiled: Option<&CompiledIndexExpressions>,
     tenant_id: &str,
     written_ids: &HashSet<u64>,
 ) -> Result<(), TenantWriteError>
 where
     R: ReadableTable<(&'static str, u64), &'static [u8]>,
 {
-    let signature = schema_signature(schema, specs);
+    let signature = schema_signature(schema, plan, compiled)?;
     let marker_key = (tenant_id, MARKER_SUBKEY.as_slice());
     let up_to_date = match index_table.get(marker_key).map_err(storage_error)? {
         Some(guard) => {
@@ -466,10 +485,10 @@ where
                 // 今回の書き込み対象は `check_and_update` 側で処理する。
                 continue;
             }
-            let values = decode_key_columns(schema, mask, v.value())?;
+            let keys = plan.row_keys(schema, compiled, id, v.value())?;
             let mut forward_subs: Vec<Vec<u8>> = Vec::new();
-            for (ordinal, spec) in specs.iter().enumerate() {
-                let Some(canonical) = key_bytes(spec, &values).map_err(internal)? else {
+            for (ordinal, key) in keys.into_iter().enumerate() {
+                let Some(canonical) = key else {
                     continue;
                 };
                 let ordinal_u16 = u16::try_from(ordinal)
@@ -531,15 +550,15 @@ pub(super) fn verify_tenant_index_read_only<R, I>(
     row_table: &R,
     index_table: &I,
     schema: &TableSchema,
-    specs: &[KeySpec],
-    mask: &[bool],
+    plan: &UniqueKeyPlan,
+    compiled: Option<&CompiledIndexExpressions>,
     tenant_id: &str,
 ) -> Result<(), TenantWriteError>
 where
     R: ReadableTable<(&'static str, u64), &'static [u8]>,
     I: ReadableTable<(&'static str, &'static [u8]), &'static [u8]>,
 {
-    let signature = schema_signature(schema, specs);
+    let signature = schema_signature(schema, plan, compiled)?;
     let marker_key = (tenant_id, MARKER_SUBKEY.as_slice());
     let up_to_date = match index_table.get(marker_key).map_err(storage_error)? {
         Some(guard) => {
@@ -569,9 +588,9 @@ where
             // （`ensure_tenant_index` と同じ判断）。
             break;
         }
-        let values = decode_key_columns(schema, mask, v.value())?;
-        for (ordinal, spec) in specs.iter().enumerate() {
-            let Some(canonical) = key_bytes(spec, &values).map_err(internal)? else {
+        let keys = plan.row_keys(schema, compiled, id, v.value())?;
+        for (ordinal, key) in keys.into_iter().enumerate() {
+            let Some(canonical) = key else {
                 continue;
             };
             let ordinal_u16 = u16::try_from(ordinal)
@@ -598,11 +617,13 @@ where
 /// 行向け）。`indices` に一致する一意キー宣言の正準キー（`(id, 正準キー)` の組）
 /// だけを返す。行本体には一切触れない。索引テーブルが未作成、または該当行の
 /// 逆引きエントリが無い場合は何も返さない（索引を作成・更新しない読み取り専用）。
+#[allow(clippy::too_many_arguments)] // plan と compiled（式一意索引の評価器）を加えて 8 引数。既存の hnsw.rs と同じ方針で許容する。
 pub(super) fn recover_forward_keys_for_rows(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
     schema: &TableSchema,
-    specs: &[KeySpec],
+    plan: &UniqueKeyPlan,
+    compiled: Option<&CompiledIndexExpressions>,
     indices: &[usize],
     tenant_id: &str,
     ids: &[u64],
@@ -611,7 +632,11 @@ pub(super) fn recover_forward_keys_for_rows(
     if !index_table_exists(write_txn, &index_table_name)? {
         return Ok(Vec::new());
     }
-    let Some(ordinal) = specs.iter().position(|s| s.indices == indices) else {
+    let Some(ordinal) = plan
+        .column_specs()
+        .iter()
+        .position(|s| s.indices == indices)
+    else {
         return Ok(Vec::new());
     };
     let ordinal_u16 =
@@ -621,7 +646,7 @@ pub(super) fn recover_forward_keys_for_rows(
         .map_err(table_error)?;
     // 索引が現在のスキーマ・形式のものでなければ、逆引きは旧キーを指しうるため
     // 全行を復元不能として扱う（呼び出し側が一様に fail-closed に倒す）。
-    let signature = schema_signature(schema, specs);
+    let signature = schema_signature(schema, plan, compiled)?;
     let marker_ok = match index_table
         .get((tenant_id, MARKER_SUBKEY.as_slice()))
         .map_err(storage_error)?
@@ -677,10 +702,10 @@ pub(super) fn check_and_update<R>(
     row_table: &R,
     index_table: &mut IndexTable<'_>,
     schema: &TableSchema,
-    specs: &[KeySpec],
+    plan: &UniqueKeyPlan,
+    compiled: Option<&CompiledIndexExpressions>,
     tenant_id: &str,
     written_ids: &HashSet<u64>,
-    mask: &[bool],
 ) -> Result<(), TenantWriteError>
 where
     R: ReadableTable<(&'static str, u64), &'static [u8]>,
@@ -688,7 +713,7 @@ where
     // 1. 今回書き込んだ行同士のキー値衝突を検出しつつ、各行が持つ新しい
     //    正引きエントリ集合を組み立てる（旧実装の段 1 と同じ判定）。
     let mut written_keys: Vec<HashMap<Vec<u8>, u64>> =
-        specs.iter().map(|_| HashMap::new()).collect();
+        (0..plan.ordinal_count()).map(|_| HashMap::new()).collect();
     let mut new_entries: HashMap<u64, Vec<(u16, Vec<u8>)>> = HashMap::new();
     for &id in written_ids {
         count_row_get();
@@ -698,10 +723,10 @@ where
             // （旧実装と同じ扱い）。
             continue;
         };
-        let values = decode_key_columns(schema, mask, guard.value())?;
+        let keys = plan.row_keys(schema, compiled, id, guard.value())?;
         let mut entries: Vec<(u16, Vec<u8>)> = Vec::new();
-        for (ordinal, spec) in specs.iter().enumerate() {
-            let Some(key) = key_bytes(spec, &values).map_err(internal)? else {
+        for (ordinal, key) in keys.into_iter().enumerate() {
+            let Some(key) = key else {
                 continue;
             };
             let ordinal_u16 = u16::try_from(ordinal)
@@ -746,11 +771,10 @@ where
             count_row_get();
             match row_table.get((tenant_id, owner)).map_err(storage_error)? {
                 Some(guard) => {
-                    let owner_values = decode_key_columns(schema, mask, guard.value())?;
-                    let spec = specs
+                    let owner_keys = plan.row_keys(schema, compiled, owner, guard.value())?;
+                    let recomputed = owner_keys
                         .get(usize::from(*ordinal))
                         .ok_or_else(|| internal("unique key ordinal out of range"))?;
-                    let recomputed = key_bytes(spec, &owner_values).map_err(internal)?;
                     if recomputed.as_deref() == Some(key.as_slice()) {
                         return Err(TenantWriteError::UniqueViolation);
                     }
@@ -1029,11 +1053,12 @@ mod tests {
         let schema_unique_on_b =
             schema.with_unique_constraints(vec![UniqueConstraint::new(vec!["b".to_string()])]);
 
-        let (specs_a, _) = super::super::key_specs(&schema_unique_on_a).expect("key specs for a");
-        let (specs_b, _) = super::super::key_specs(&schema_unique_on_b).expect("key specs for b");
+        let no_decls = crate::catalog::TableExpressionDecls::default();
+        let plan_a = UniqueKeyPlan::build(&schema_unique_on_a, &no_decls).expect("plan for a");
+        let plan_b = UniqueKeyPlan::build(&schema_unique_on_b, &no_decls).expect("plan for b");
 
-        let sig_a = schema_signature(&schema_unique_on_a, &specs_a);
-        let sig_b = schema_signature(&schema_unique_on_b, &specs_b);
+        let sig_a = schema_signature(&schema_unique_on_a, &plan_a, None).expect("signature a");
+        let sig_b = schema_signature(&schema_unique_on_b, &plan_b, None).expect("signature b");
         assert_ne!(
             sig_a, sig_b,
             "signatures for UNIQUE(a) and UNIQUE(b) must differ even though \
@@ -1206,8 +1231,9 @@ mod tests {
                 let mut index_table = write_txn
                     .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
                     .expect("open index table");
-                let (specs, _) = super::super::key_specs(&schema).expect("key specs");
-                let signature = schema_signature(&schema, &specs);
+                let no_decls = crate::catalog::TableExpressionDecls::default();
+                let plan = UniqueKeyPlan::build(&schema, &no_decls).expect("plan");
+                let signature = schema_signature(&schema, &plan, None).expect("signature");
                 let mut stale_marker = Vec::with_capacity(4 + signature.len());
                 stale_marker.extend_from_slice(&1u32.to_be_bytes()); // 旧 format_version
                 stale_marker.extend_from_slice(&signature);

@@ -713,6 +713,31 @@ pub(crate) fn bind_index_expression(
         references_embedding,
     })
 }
+
+/// 保存済みの式テキストを `schema` で再束縛する（INDEX-10、Issue #1651）。`RENAME COLUMN` の追随
+/// （`rename` が `Some((旧名, 新名))`。AST 上の識別子写像で、文字列置換は使わない。1 回の走査で全識別子へ
+/// 一括適用されるため列名の入れ替えでも連鎖置換が起きない）と、`ALTER COLUMN TYPE` の再束縛
+/// （`rename` が `None`。新しい型で束縛・決定性・結果型ゲートを再判定する）が共有する唯一の経路。
+/// 保存テキストは untrusted として再解析し、[`bind_index_expression`] が往復一致まで確認する。
+pub(crate) fn rebind_stored_index_expression(
+    stored_sql: &str,
+    schema: &crate::catalog::TableSchema,
+    rename: Option<(&str, &str)>,
+) -> Result<BoundIndexExpression, SqlSurfaceError> {
+    let parsed = crate::sql::allowlist::parse_index_expression_text(stored_sql)?;
+    let expr = match rename {
+        Some((old, new)) => crate::sql::check_constraint::map_expr_idents(&parsed, &|c| {
+            if c == old {
+                new.to_string()
+            } else {
+                c.to_string()
+            }
+        }),
+        None => parsed,
+    };
+    bind_index_expression(&expr, schema)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

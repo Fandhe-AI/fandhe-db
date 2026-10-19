@@ -15,6 +15,9 @@
 # Issue #1649（INDEX-10）で、式索引（`((100 / n))`・`((lower(code)))`）を持つ 3 つ目の表
 # `docs_xidx (n INTEGER, code TEXT)` を加えた（verify が、再起動後も式の評価失敗が `22012` で拒否
 # され、コミット済みの全行が式を評価できることを確かめる。本スクリプトのロジックは変えない）。
+# Issue #1651（INDEX-9・INDEX-10）で、同じ表へ一意の式索引 `((lower(code)))` を加えた（verify が
+# 式一意仕様を含む永続一意索引の生存を読み取り専用で確かめ、大文字小文字違いの再挿入が `23505` で
+# 拒否されることを確かめる。本スクリプトのロジックは変えない）。
 # Makefile の crash-test-unique-index ターゲット・CI の crash-test-unique-index
 # ジョブから呼ばれる。
 #

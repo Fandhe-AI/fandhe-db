@@ -226,8 +226,8 @@ pub struct IndexDef {
 /// 式索引の式要素 1 個の永続形（INDEX-10、Issue #1648）。`sql` は
 /// `sql::index_expr::bind_index_expression` が描画し、再解析で元の式に戻ることを確認した
 /// 正規化 SQL テキスト、`referenced_columns` は束縛時に抽出した参照列（重複なし・スキーマ宣言順）。
-/// 列の改名・削除・型変更が式索引に及ぶ範囲の判定（`DROP COLUMN` の連鎖削除、`RENAME COLUMN`／
-/// `ALTER COLUMN TYPE` の拒否）に使う。
+/// 列の改名・削除・型変更が式索引に及ぶ範囲の判定（`DROP COLUMN` の連鎖削除、`RENAME COLUMN` の
+/// 式テキストの追随、`ALTER COLUMN TYPE` の再束縛。Issue #1651）に使う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexExpressionDef {
     pub sql: String,
@@ -238,6 +238,9 @@ pub struct IndexExpressionDef {
 const MAX_INDEX_EXPRESSION_SQL_LEN: usize = 4096;
 /// 式索引の永続形の版（式要素を 1 つでも含む宣言だけがこの版で保存される）。
 const INDEX_DEF_EXPRESSION_VERSION: &str = "v4";
+/// 一意の式索引の永続形の版（INDEX-9・INDEX-10、Issue #1651）。`v4` と同じ行構成の末尾に固定行
+/// `unique` を加える。非一意の式索引の `v4` とカタログ上の他の版のバイト列は変えない。
+const INDEX_DEF_EXPRESSION_UNIQUE_VERSION: &str = "v5";
 
 impl IndexDef {
     /// 照合指定なしの索引宣言を作る（`collations` はすべて `None`・式要素なし）。
@@ -357,14 +360,13 @@ fn encode_index_def(def: &IndexDef) -> Result<Vec<u8>> {
 /// `v4`／テーブル／`scalar`／列 CSV（式の位置は空トークン）／照合行（全要素 `-`）／式行
 /// （列の位置は `-`、式の位置は正規化 SQL の UTF-8 を小文字 16 進にしたもの）／参照列行
 /// （式ごとに `;` 区切り、各式の中は `,` 区切り）。式テキストは `,`・改行・`'` を含み得るため、
-/// 区切り文字と衝突しない 16 進で格納する。`unique`・`hnsw`・照合付きの式要素は保存しない
-/// （後続 Issue #1651 で拡張。構文段が拒否済みの組み合わせの多層防御）。
+/// 区切り文字と衝突しない 16 進で格納する。一意の式索引（Issue #1651）は版を `v5` にして末尾へ
+/// 固定行 `unique` を足す。`hnsw`・照合付きの式要素は保存しない（構文段が拒否済みの組み合わせの
+/// 多層防御）。
 fn encode_expression_index_def(def: &IndexDef, columns_csv: &str) -> Result<String> {
     let invalid = |msg: &str| CatalogError::Invalid(msg.to_string());
-    if def.unique || !matches!(def.kind, IndexKind::Scalar) {
-        return Err(invalid(
-            "expression index must be a non-unique scalar index",
-        ));
+    if !matches!(def.kind, IndexKind::Scalar) {
+        return Err(invalid("expression index must be a scalar index"));
     }
     if def.expressions.len() != def.columns.len() || def.collations.len() != def.columns.len() {
         return Err(invalid("index expressions must match the column list"));
@@ -409,8 +411,13 @@ fn encode_expression_index_def(def: &IndexDef, columns_csv: &str) -> Result<Stri
         }
     }
     let collation_tokens = vec!["-"; def.columns.len()].join(",");
+    let (version, unique_tail) = if def.unique {
+        (INDEX_DEF_EXPRESSION_UNIQUE_VERSION, "\nunique")
+    } else {
+        (INDEX_DEF_EXPRESSION_VERSION, "")
+    };
     Ok(format!(
-        "{INDEX_DEF_EXPRESSION_VERSION}\n{}\nscalar\n{}\n{}\n{}\n{}",
+        "{version}\n{}\nscalar\n{}\n{}\n{}\n{}{unique_tail}",
         def.table,
         columns_csv,
         collation_tokens,
@@ -426,6 +433,7 @@ fn encode_expression_index_def(def: &IndexDef, columns_csv: &str) -> Result<Stri
 fn decode_expression_index_tail<'a>(
     name: &str,
     columns: &[String],
+    unique: bool,
     mut lines: impl Iterator<Item = &'a str>,
 ) -> Result<Vec<Option<IndexExpressionDef>>> {
     let corrupt =
@@ -433,6 +441,10 @@ fn decode_expression_index_tail<'a>(
     let collations_line = lines.next().ok_or_else(corrupt)?;
     let exprs_line = lines.next().ok_or_else(corrupt)?;
     let refs_line = lines.next().ok_or_else(corrupt)?;
+    // `v5`（一意の式索引）は末尾に固定行 `unique` を持つ。それ以外の値・欠落は破損。
+    if unique && lines.next() != Some("unique") {
+        return Err(corrupt());
+    }
     if lines.next().is_some() {
         return Err(CatalogError::CorruptSchema(format!(
             "unexpected trailing data for index {name}"
@@ -510,6 +522,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         && version != "v2"
         && version != "v3"
         && version != INDEX_DEF_EXPRESSION_VERSION
+        && version != INDEX_DEF_EXPRESSION_UNIQUE_VERSION
     {
         return Err(CatalogError::CorruptSchema(format!(
             "unknown index catalog format version for index {name}"
@@ -517,7 +530,9 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     }
     let is_v2 = version == "v2";
     let is_v3 = version == "v3";
-    let is_v4 = version == INDEX_DEF_EXPRESSION_VERSION;
+    let is_v5 = version == INDEX_DEF_EXPRESSION_UNIQUE_VERSION;
+    // 式索引（`v4`: 非一意、`v5`: 一意）。以降の式索引向けの分岐は両版で共通。
+    let is_v4 = version == INDEX_DEF_EXPRESSION_VERSION || is_v5;
     let table = lines
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema(format!("missing table for index {name}")))?
@@ -588,7 +603,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         )));
     }
     let expressions = if is_v4 {
-        decode_expression_index_tail(name, &columns, lines)?
+        decode_expression_index_tail(name, &columns, is_v5, lines)?
     } else {
         vec![None; columns.len()]
     };
@@ -602,7 +617,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         kind,
         columns,
         collations,
-        unique: is_v3,
+        unique: is_v3 || is_v5,
         expressions,
     })
 }
@@ -888,21 +903,40 @@ pub(crate) fn declared_index_targets_in_txn(
     })
 }
 
-/// write txn 内で対象テーブルの式索引の式要素（宣言順）を読む（INDEX-10、Issue #1649）。
-/// DML ゲート（`constraint::enforce_row_constraints_in_txn`）が書き込みの都度呼ぶため、
-/// 対象外テーブルのエントリは保存値の 2 行目（テーブル名）の照合だけで読み飛ばし、フル
-/// デコードしない。カタログ未作成は空の `Ok`。走査件数が [`MAX_INDEX_COUNT`] を超える・
-/// デコードに失敗する場合は `Err`（`CorruptSchema`。呼び出し元は書き込みを拒否する fail-closed）。
-pub(crate) fn expression_index_decls_in_txn(
-    write_txn: &redb::WriteTransaction,
-    table: &str,
-) -> Result<Vec<DeclaredExpressionKey>> {
-    let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut out: Vec<DeclaredExpressionKey> = Vec::new();
+/// 一意の式索引（INDEX-9・INDEX-10、Issue #1651）の要素 1 個。`Column` は素の列、`Expr` は
+/// [`TableExpressionDecls::keys`] の位置（式要素の宣言順の通し番号）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UniqueElementDecl {
+    Column(String),
+    Expr(usize),
+}
+
+/// 一意の式索引 1 本の宣言（要素の並びは `CREATE UNIQUE INDEX` の宣言順）。UNIQUE 制約へは展開せず、
+/// 索引カタログだけが持つ（式には列リストが無いため）。強制は `constraint::unique_index` が担う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredUniqueExpressionIndex {
+    pub(crate) index_name: String,
+    pub(crate) elements: Vec<UniqueElementDecl>,
+}
+
+/// 対象テーブルの式索引の宣言一式（INDEX-10、Issue #1649・#1651）。`keys` は全式索引の式要素
+/// （索引名の昇順・索引内の要素順）、`uniques` はそのうち一意の索引（索引名の昇順）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TableExpressionDecls {
+    pub(crate) keys: Vec<DeclaredExpressionKey>,
+    pub(crate) uniques: Vec<DeclaredUniqueExpressionIndex>,
+}
+
+/// 索引カタログ表 `index_table` から対象テーブルの式索引の宣言を読む共通実装。write／read txn の
+/// 両方から使う。対象外テーブルのエントリは保存値の 2 行目（テーブル名）の照合だけで読み飛ばし、
+/// フルデコードしない。走査件数が [`MAX_INDEX_COUNT`] を超える・デコードに失敗する場合は `Err`
+/// （`CorruptSchema`。呼び出し元は書き込みを拒否する fail-closed）。redb の走査はキー（索引名）の
+/// 昇順で、順序は決定的。
+fn table_expression_decls_from<T>(index_table: &T, table: &str) -> Result<TableExpressionDecls>
+where
+    T: ReadableTable<&'static str, &'static [u8]>,
+{
+    let mut out = TableExpressionDecls::default();
     for (scanned, entry) in index_table.iter()?.enumerate() {
         if scanned >= MAX_INDEX_COUNT {
             return Err(CatalogError::CorruptSchema(format!(
@@ -923,17 +957,55 @@ pub(crate) fn expression_index_decls_in_txn(
         if !matches!(def.kind, IndexKind::Scalar) || def.table != table {
             continue;
         }
-        for (element, expr) in def.expressions.iter().enumerate() {
+        let mut unique_elements: Vec<UniqueElementDecl> = Vec::new();
+        for (element, (col, expr)) in def.columns.iter().zip(&def.expressions).enumerate() {
             if let Some(e) = expr {
-                out.push(DeclaredExpressionKey {
+                if def.unique {
+                    unique_elements.push(UniqueElementDecl::Expr(out.keys.len()));
+                }
+                out.keys.push(DeclaredExpressionKey {
                     index_name: def.name.clone(),
                     element,
                     sql: e.sql.clone(),
                 });
+            } else if def.unique {
+                unique_elements.push(UniqueElementDecl::Column(col.clone()));
             }
+        }
+        // 式を含まない一意索引は UNIQUE 制約へ展開済みで、ここには載せない。
+        if def.unique && def.has_expressions() {
+            out.uniques.push(DeclaredUniqueExpressionIndex {
+                index_name: def.name.clone(),
+                elements: unique_elements,
+            });
         }
     }
     Ok(out)
+}
+
+/// write txn 内で対象テーブルの式索引の宣言を読む（INDEX-10、Issue #1649・#1651）。DML ゲート
+/// （`constraint::enforce_row_constraints_in_txn`）が書き込みの都度呼ぶ。カタログ未作成は空の `Ok`。
+pub(crate) fn table_expression_decls_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+) -> Result<TableExpressionDecls> {
+    match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => table_expression_decls_from(&t, table),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(TableExpressionDecls::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// [`table_expression_decls_in_txn`] の read txn 版（クラッシュ耐性検証の読み取り専用診断が使う）。
+pub(crate) fn table_expression_decls_in_read_txn(
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+) -> Result<TableExpressionDecls> {
+    match read_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => table_expression_decls_from(&t, table),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(TableExpressionDecls::default()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// [`explain_index_names_in_txn`] の出力（Issue #1066・TASK-206・INDEX-7・
@@ -1210,26 +1282,43 @@ fn unique_index_def_for_table_in_txn(
     Ok(def.unique && def.table == table)
 }
 
-/// [`Storage::create_index`] の一意索引分岐（Issue #1616・INDEX-9）。`def`（`unique == true`）を
-/// 対象テーブルの UNIQUE 制約（索引名と同名）として追加した後のスキーマを返す。同一 write txn
-/// 内で呼ばれ、拒否は commit 前に返る（副作用ゼロ）。判定順（fail-closed。データに依存するのは
-/// 最後の重複走査だけ）: (1) 型ゲート（暗黙の `id`・一意キー許可型外は `IndexKindMismatch`）
-/// (2) 制約名前空間の衝突（UNIQUE・CHECK・FOREIGN KEY・主キー実効名。`ConstraintAlreadyExists`。
-/// `IF NOT EXISTS` でも握りつぶさない） (3) 制約数上限 (4) 追加後スキーマの [`validate_schema`]
-/// （同じ列並びの既存 UNIQUE との重複は `Invalid`） (5) 全テナント・全行の重複走査
-/// （テナントごとに独立。`UniqueConstraintViolation`）。
-fn build_unique_index_schema_in_txn(
+/// `table` に対する一意索引（列だけ・式を含む）の名前を write txn 内で全件返す（Issue #1651）。
+/// 名前未指定の UNIQUE・CHECK・FOREIGN KEY の既定名が索引名と衝突しないよう、使用済み名集合へ
+/// 加える用途。索引カタログ未作成は空。走査上限超過・値の破損は `CorruptSchema` で fail-closed。
+fn unique_index_names_for_table_in_txn(
     write_txn: &redb::WriteTransaction,
-    def: &IndexDef,
-    schema: &TableSchema,
-) -> Result<TableSchema> {
-    // 式要素付きの一意索引は未対応（後続 Issue #1651）。構文段が拒否済みの多層防御。
-    if def.has_expressions() {
-        return Err(CatalogError::IndexKindMismatch(
-            "CREATE UNIQUE INDEX does not support expression indexes yet".to_string(),
-        ));
+    table: &str,
+) -> Result<Vec<String>> {
+    let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut names = Vec::new();
+    for (scanned, entry) in index_table.iter()?.enumerate() {
+        if scanned >= MAX_INDEX_COUNT {
+            return Err(CatalogError::CorruptSchema(format!(
+                "index catalog exceeds {MAX_INDEX_COUNT} entries"
+            )));
+        }
+        let (key, value) = entry?;
+        let def = decode_index_def(key.value(), value.value())?;
+        if def.unique && def.table == table {
+            names.push(def.name);
+        }
     }
-    for col in &def.columns {
+    Ok(names)
+}
+
+/// 一意索引（列だけ・式を含む）の共通の前提ゲート（Issue #1616・#1651）。(1) 素の列要素の型ゲート
+/// （暗黙の `id`・一意キー許可型外は `IndexKindMismatch`） (2) 制約名前空間の衝突（UNIQUE・CHECK・
+/// FOREIGN KEY・主キー実効名。`ConstraintAlreadyExists`。`IF NOT EXISTS` でも握りつぶさない）。
+/// 式要素の位置（`columns[i]` が空文字列）は型ゲートの対象外（式の結果型は束縛が検証済み）。
+fn check_unique_index_gate(def: &IndexDef, schema: &TableSchema) -> Result<()> {
+    for (col, expr) in def.columns.iter().zip(&def.expressions) {
+        if expr.is_some() {
+            continue;
+        }
         let allowed = schema
             .columns
             .iter()
@@ -1249,6 +1338,50 @@ fn build_unique_index_schema_in_txn(
     if collides {
         return Err(CatalogError::ConstraintAlreadyExists(name.to_string()));
     }
+    Ok(())
+}
+
+/// 一意の式索引 `def`（式は束縛済みの正規化テキスト）の要素列。`Expr(k)` の `k` は、この索引の式要素を
+/// 宣言順に数えた通し番号（[`table_expression_decls_from`] が全式要素を通し番号で数えるのと違い、
+/// 1 本の索引だけをコンパイルする作成時・型変更時の再検証向け）。
+fn unique_element_decls(def: &IndexDef) -> Vec<UniqueElementDecl> {
+    let mut position = 0usize;
+    def.columns
+        .iter()
+        .zip(&def.expressions)
+        .map(|(col, e)| match e {
+            Some(_) => {
+                let element = UniqueElementDecl::Expr(position);
+                position = position.saturating_add(1);
+                element
+            }
+            None => UniqueElementDecl::Column(col.clone()),
+        })
+        .collect()
+}
+
+/// [`Storage::create_index`] の一意索引分岐（Issue #1616・INDEX-9）。`def`（`unique == true`）を
+/// 対象テーブルの UNIQUE 制約（索引名と同名）として追加した後のスキーマを返す。同一 write txn
+/// 内で呼ばれ、拒否は commit 前に返る（副作用ゼロ）。判定順（fail-closed。データに依存するのは
+/// 最後の重複走査だけ）: (1) 型ゲート（暗黙の `id`・一意キー許可型外は `IndexKindMismatch`）
+/// (2) 制約名前空間の衝突（UNIQUE・CHECK・FOREIGN KEY・主キー実効名。`ConstraintAlreadyExists`。
+/// `IF NOT EXISTS` でも握りつぶさない） (3) 制約数上限 (4) 追加後スキーマの [`validate_schema`]
+/// （同じ列並びの既存 UNIQUE との重複は `Invalid`） (5) 全テナント・全行の重複走査
+/// （テナントごとに独立。`UniqueConstraintViolation`）。
+fn build_unique_index_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    def: &IndexDef,
+    schema: &TableSchema,
+) -> Result<TableSchema> {
+    // 式要素付きの一意索引は UNIQUE 制約へ展開せず、索引カタログだけが持つ（Issue #1651。
+    // `create_index_bound` が [`check_unique_index_gate`] を通す）。ここへ届くのは内部の呼び出し
+    // 契約違反で、列だけにして黙って作らず拒否する（多層防御）。
+    if def.has_expressions() {
+        return Err(CatalogError::IndexKindMismatch(
+            "expression elements must not be expanded into a unique constraint".to_string(),
+        ));
+    }
+    check_unique_index_gate(def, schema)?;
     if schema.unique_constraints.len() >= MAX_UNIQUE_CONSTRAINTS {
         return Err(CatalogError::ConstraintLimitExceeded(format!(
             "table {} already has {MAX_UNIQUE_CONSTRAINTS} unique constraints",
@@ -1667,29 +1800,50 @@ fn rewrite_views_for_renamed_column_in_txn(
 /// 1 件でも書いたら索引カタログ世代を bump する（`INDEX_CATALOG_GENERATION_TABLE` の
 /// 不変条件）。索引名・種別・照合（列と位置対応）は維持する。
 /// [`retain_index_defs_in_txn`] と同じ [`MAX_INDEX_COUNT`] 打ち切り。
+///
+/// 式要素（INDEX-10、Issue #1651）は改名後のスキーマ `new_schema` で
+/// [`crate::sql::index_expr::rebind_stored_index_expression`]（再解析 → AST 上の識別子写像 → 再束縛・
+/// 往復一致）して正規化テキストと参照列を保存し直す。写像後の参照列の集合が再束縛結果と一致しなければ、
+/// どの段の失敗も `0A000` で全体を破棄する（旧名の参照を残す fail-open を作らない）。戻り値は
+/// 「一意の式索引を書き換えたか」で、呼び出し元が永続一意索引を失効させる判断に使う。
 fn rename_index_def_columns_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
     old: &str,
     new: &str,
-) -> Result<()> {
-    let rewritten = {
+    new_schema: &TableSchema,
+) -> std::result::Result<bool, AlterCheckError> {
+    let refuse = || {
+        AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+            detail: "renaming a column referenced by this index expression is not supported"
+                .to_string(),
+        })
+    };
+    let (rewritten, unique_expression_touched) = {
         let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
             Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-            Err(e) => return Err(e.into()),
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(CatalogError::from(e).into()),
         };
         let mut updates: Vec<(String, Vec<u8>)> = Vec::new();
-        for (scanned, entry) in index_table.iter()?.enumerate() {
+        let mut unique_expression_touched = false;
+        for (scanned, entry) in index_table.iter().map_err(CatalogError::from)?.enumerate() {
             if scanned >= MAX_INDEX_COUNT {
                 return Err(CatalogError::CorruptSchema(format!(
                     "index catalog exceeds {MAX_INDEX_COUNT} entries"
-                )));
+                ))
+                .into());
             }
-            let (key, value) = entry?;
+            let (key, value) = entry.map_err(CatalogError::from)?;
             let name = key.value().to_string();
             let mut def = decode_index_def(&name, value.value())?;
-            if def.table != table || !def.columns.iter().any(|c| c == old) {
+            let plain_hit = def.columns.iter().any(|c| c == old);
+            let expr_hit = def
+                .expressions
+                .iter()
+                .flatten()
+                .any(|e| e.referenced_columns.iter().any(|c| c == old));
+            if def.table != table || !(plain_hit || expr_hit) {
                 continue;
             }
             for c in &mut def.columns {
@@ -1697,17 +1851,53 @@ fn rename_index_def_columns_in_txn(
                     *c = new.to_string();
                 }
             }
+            for slot in &mut def.expressions {
+                let Some(e) = slot else { continue };
+                if !e.referenced_columns.iter().any(|c| c == old) {
+                    continue;
+                }
+                let bound = crate::sql::index_expr::rebind_stored_index_expression(
+                    &e.sql,
+                    new_schema,
+                    Some((old, new)),
+                )
+                .map_err(|_| refuse())?;
+                let mut expected: Vec<&str> = e
+                    .referenced_columns
+                    .iter()
+                    .map(|c| if c == old { new } else { c.as_str() })
+                    .collect();
+                let mut actual: Vec<&str> = bound
+                    .referenced_columns
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                expected.sort_unstable();
+                actual.sort_unstable();
+                if expected != actual {
+                    return Err(refuse());
+                }
+                *slot = Some(IndexExpressionDef {
+                    sql: bound.sql,
+                    referenced_columns: bound.referenced_columns,
+                });
+            }
+            if def.unique && def.has_expressions() {
+                unique_expression_touched = true;
+            }
             updates.push((name, encode_index_def(&def)?));
         }
         for (name, bytes) in &updates {
-            index_table.insert(name.as_str(), bytes.as_slice())?;
+            index_table
+                .insert(name.as_str(), bytes.as_slice())
+                .map_err(CatalogError::from)?;
         }
-        !updates.is_empty()
+        (!updates.is_empty(), unique_expression_touched)
     };
     if rewritten {
         bump_index_catalog_generation_in_txn(write_txn)?;
     }
-    Ok(())
+    Ok(unique_expression_touched)
 }
 
 /// 表改名（[`Storage::alter_table_rename`]、Issue #1624）が同一 write txn から呼ぶ。
@@ -1762,44 +1952,23 @@ fn delete_indexes_referencing_column_in_txn(
     table_name: &str,
     column_name: &str,
 ) -> Result<()> {
+    let mut removed_unique_expression_index = false;
     retain_index_defs_in_txn(write_txn, |def| {
-        def.table != table_name || !def.referenced_columns().any(|c| c == column_name)
-    })
-}
-
-/// `table` の式索引のいずれかが列 `column` を参照しているか（`RENAME COLUMN`／`ALTER COLUMN TYPE`
-/// の拒否判定。INDEX-10、Issue #1648）。式の改名追随・再構築は後続 Issue #1651 のため、参照が
-/// あれば呼び出し元が `0A000` で拒否する（宣言と式テキストが食い違う fail-open を作らない）。
-/// 同一 write txn 内で呼ぶ。走査件数は [`MAX_INDEX_COUNT`] で打ち切る。
-fn expression_index_references_column_in_txn(
-    write_txn: &redb::WriteTransaction,
-    table: &str,
-    column: &str,
-) -> Result<bool> {
-    let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
-    for (scanned, entry) in index_table.iter()?.enumerate() {
-        if scanned >= MAX_INDEX_COUNT {
-            return Err(CatalogError::CorruptSchema(format!(
-                "index catalog exceeds {MAX_INDEX_COUNT} entries"
-            )));
+        let keep = def.table != table_name || !def.referenced_columns().any(|c| c == column_name);
+        if !keep && def.unique && def.has_expressions() {
+            removed_unique_expression_index = true;
         }
-        let (key, value) = entry?;
-        let def = decode_index_def(key.value(), value.value())?;
-        if def.table == table
-            && def
-                .expressions
-                .iter()
-                .flatten()
-                .any(|e| e.referenced_columns.iter().any(|c| c == column))
-        {
-            return Ok(true);
-        }
+        keep
+    })?;
+    // 一意の式索引（Issue #1651）を消したときは、その正引きエントリを持つ永続一意索引も失効させる
+    // （カタログの宣言が消えた時点で強制は外れる。残りのキーは次回の書き込みで再構築される）。
+    // 索引カタログのハンドルを `retain_index_defs_in_txn` が閉じた後に呼ぶ。
+    if removed_unique_expression_index {
+        write_txn
+            .delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))
+            .map_err(CatalogError::from)?;
     }
-    Ok(false)
+    Ok(())
 }
 
 /// 列型変換の一般変換（`AlterPlan::RewriteExpr`。TABLE-40 (4)・Issue #1636・#1637）が、
@@ -2028,6 +2197,29 @@ fn validate_dependents_statically_in_txn(
                 let def = decode_index_def(key.value(), value.value())?;
                 if def.table != table_name || !def.columns.iter().any(|c| c == column_name) {
                     continue;
+                }
+                // 一意索引の素の列要素は作成時の型ゲート（`check_unique_index_gate`）と同じ基準で
+                // 再検証する（Issue #1651）。許可型外へ変えると後続 INSERT が正準キー化で
+                // `XX000` になるため commit 前に `0A000` で拒否する。
+                if def.unique {
+                    let bare_disallowed = def
+                        .columns
+                        .iter()
+                        .zip(&def.expressions)
+                        .filter(|(c, e)| e.is_none() && c.as_str() == column_name)
+                        .any(|_| {
+                            !new_schema
+                                .columns
+                                .iter()
+                                .find(|c| c.name == column_name)
+                                .is_some_and(|c| c.ty.is_unique_constraint_allowed())
+                        });
+                    if bare_disallowed {
+                        return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                            detail: "the new column type cannot be used by an existing index"
+                                .to_string(),
+                        }));
+                    }
                 }
                 match validate_index_columns(&def, new_schema) {
                     Ok(()) => {}
@@ -6030,7 +6222,7 @@ impl ColumnDef {
 
     /// カタログ列行用の型タグと `param`。型由来の `param`（[`ColumnType::catalog_fields`]）に
     /// 照合を合成する（[`encode_collation_param`]）。生存列の encode はすべてここを通す。
-    fn catalog_fields(&self) -> Result<(&'static str, String)> {
+    pub(crate) fn catalog_fields(&self) -> Result<(&'static str, String)> {
         let (tag, base) = self.ty.catalog_fields();
         let param = encode_collation_param(tag, &base, self.collation)?;
         Ok((tag, param))
@@ -7693,6 +7885,139 @@ fn resolve_foreign_key_target(
     Ok(resolved)
 }
 
+/// `ALTER COLUMN TYPE` が同一 write txn から呼ぶ、変更列を参照する式索引の再束縛・再検証
+/// （INDEX-10 (6)、Issue #1651）。`new_schema` は型変更後の最終スキーマ（行は新しい型で書き換え済み）。
+/// 手順: (1) 変更列を参照する式索引の式を新スキーマで再束縛する（束縛・決定性・結果型ゲートの失敗は
+/// その SQLSTATE のまま拒否。正規化テキストや参照列が変われば宣言を書き換えて索引カタログ世代を
+/// bump） (2) テーブルの全式索引を再コンパイルし、全テナント・全可視性の既存行で評価できることを
+/// 再検証する（評価エラーは SQLSTATE を保った固定文言） (3) 一意の式索引はテナントごとの重複を
+/// 再走査する（`23505`） (4) 一意の式索引があれば永続一意索引を失効させる（新しい型で遅延再構築）。
+/// 拒否は commit 前に返るため表・索引は一切変わらない。可視性で絞らない（不可視行の違反を見逃さない）。
+/// 呼び出し元は行ストアのハンドルを保持していない状態で呼ぶこと。
+fn rebuild_expression_indexes_after_type_change_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    new_schema: &TableSchema,
+    column_name: &str,
+) -> std::result::Result<(), AlterCheckError> {
+    let mut updates: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut affected_unique: Vec<String> = Vec::new();
+    let mut any_affected = false;
+    {
+        let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(CatalogError::from(e).into()),
+        };
+        for (scanned, entry) in index_table.iter().map_err(CatalogError::from)?.enumerate() {
+            if scanned >= MAX_INDEX_COUNT {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                ))
+                .into());
+            }
+            let (key, value) = entry.map_err(CatalogError::from)?;
+            let name = key.value().to_string();
+            let mut def = decode_index_def(&name, value.value())?;
+            if def.table != table_name
+                || !def.has_expressions()
+                || !def.referenced_columns().any(|c| c == column_name)
+            {
+                continue;
+            }
+            any_affected = true;
+            let mut changed = false;
+            for slot in &mut def.expressions {
+                let Some(e) = slot else { continue };
+                if !e.referenced_columns.iter().any(|c| c == column_name) {
+                    continue;
+                }
+                let bound = crate::sql::index_expr::rebind_stored_index_expression(
+                    &e.sql, new_schema, None,
+                )
+                .map_err(AlterCheckError::Sql)?;
+                if bound.sql != e.sql || bound.referenced_columns != e.referenced_columns {
+                    *slot = Some(IndexExpressionDef {
+                        sql: bound.sql,
+                        referenced_columns: bound.referenced_columns,
+                    });
+                    changed = true;
+                }
+            }
+            if def.unique {
+                affected_unique.push(name.clone());
+            }
+            if changed {
+                updates.push((name, encode_index_def(&def)?));
+            }
+        }
+    }
+    if !any_affected {
+        return Ok(());
+    }
+    if !updates.is_empty() {
+        {
+            let mut index_table = write_txn
+                .open_table(INDEX_CATALOG_TABLE)
+                .map_err(CatalogError::from)?;
+            for (name, bytes) in &updates {
+                index_table
+                    .insert(name.as_str(), bytes.as_slice())
+                    .map_err(CatalogError::from)?;
+            }
+        }
+        bump_index_catalog_generation_in_txn(write_txn)?;
+    }
+    let to_alter_error = |e: crate::tenant::TenantWriteError| match e {
+        crate::tenant::TenantWriteError::IndexExpressionEvaluationFailed(inner) => {
+            AlterCheckError::Sql(crate::sql::alter_using::redact_row_conversion_error(inner))
+        }
+        crate::tenant::TenantWriteError::Catalog(c) => AlterCheckError::Catalog(c),
+        other => AlterCheckError::Catalog(CatalogError::CorruptSchema(other.to_string())),
+    };
+    let decls = table_expression_decls_in_txn(write_txn, table_name)?;
+    let Some(compiled) = crate::sql::expression_key_index::CompiledIndexExpressions::compile(
+        new_schema,
+        &decls.keys,
+    )
+    .map_err(to_alter_error)?
+    else {
+        return Ok(());
+    };
+    match write_txn.open_table(user_rows_table_def(&user_rows_table_name(table_name))) {
+        Ok(row_table) => {
+            crate::constraint::validate_existing_rows_for_index_expressions(
+                &row_table, new_schema, &compiled,
+            )
+            .map_err(to_alter_error)?;
+            for unique in decls
+                .uniques
+                .iter()
+                .filter(|u| affected_unique.contains(&u.index_name))
+            {
+                if crate::constraint::table_has_duplicate_expression_unique_key(
+                    &row_table,
+                    new_schema,
+                    &compiled,
+                    &unique.elements,
+                )
+                .map_err(to_alter_error)?
+                {
+                    return Err(AlterCheckError::Sql(SqlSurfaceError::unique_violation()));
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(AlterCheckError::Catalog(map_row_table_error(e))),
+    }
+    if !affected_unique.is_empty() {
+        write_txn
+            .delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))
+            .map_err(CatalogError::from)?;
+    }
+    Ok(())
+}
+
 /// 文字列系（Issue #1567）・一般変換（Issue #1637）の列型変換の後に、新スキーマ `new_schema`
 /// （カタログへ書き込み済み・未 commit）で制約を再検証する。`alter_column_type_with` が
 /// `Rewrite(CharFamily)`／`RewriteExpr` の場合にだけ、カタログのハンドルを手放した後・世代 bump の前に呼ぶ。
@@ -7953,7 +8278,17 @@ fn derive_unique_constraint_names(
 /// 内で、`encode_schema`（内部の `validate_schema`）より前に必ず呼ぶこと
 /// （TOCTOU 回避。FK の `parent_columns` 未解決中間表現と同じ流儀）。
 fn assign_unique_constraint_names(schema: TableSchema) -> TableSchema {
+    assign_unique_constraint_names_avoiding(schema, &[])
+}
+
+/// [`assign_unique_constraint_names`] に、既定名の衝突回避対象として `extra_used`
+/// （一意索引名。Issue #1651）を加えた版。索引カタログを持たない経路は空を渡す。
+fn assign_unique_constraint_names_avoiding(
+    schema: TableSchema,
+    extra_used: &[String],
+) -> TableSchema {
     let mut used: Vec<String> = schema.checks.iter().map(|c| c.name.clone()).collect();
+    used.extend(extra_used.iter().cloned());
     // 主キーの明示名（Issue #1364）は同じ名前空間を使うため既定名の衝突回避対象に
     // 加える。導出名 `<table>_pkey` は加えない（v12 以下のバイト列・既定名導出を
     // 変えないため。導出名との衝突は ALTER の実行経路が別途判定する）。
@@ -8019,7 +8354,17 @@ fn derive_foreign_key_constraint_names(
 /// （`used` に確定済みの UNIQUE 名を含めるため。encode_schema ドキュメント
 /// 参照）。
 fn assign_foreign_key_constraint_names(schema: TableSchema) -> TableSchema {
+    assign_foreign_key_constraint_names_avoiding(schema, &[])
+}
+
+/// [`assign_foreign_key_constraint_names`] に、既定名の衝突回避対象として `extra_used`
+/// （一意索引名。Issue #1651）を加えた版。
+fn assign_foreign_key_constraint_names_avoiding(
+    schema: TableSchema,
+    extra_used: &[String],
+) -> TableSchema {
     let mut used: Vec<String> = schema.checks.iter().map(|c| c.name.clone()).collect();
+    used.extend(extra_used.iter().cloned());
     // 主キーの明示名（Issue #1364）。`assign_unique_constraint_names` と同じ理由。
     used.extend(schema.primary_key_name.clone());
     used.extend(
@@ -10294,7 +10639,10 @@ fn reject_constrained_table_for_raw_write(
     schema: &TableSchema,
 ) -> Result<()> {
     // 式索引の宣言（INDEX-10、Issue #1649）も検査点でしか強制できないため、同じく拒否する。
-    if !expression_index_decls_in_txn(write_txn, table_name)?.is_empty() {
+    if !table_expression_decls_in_txn(write_txn, table_name)?
+        .keys
+        .is_empty()
+    {
         return Err(CatalogError::Invalid(
             "raw test-only write API does not support tables with expression indexes; use crate::tenant write APIs".to_string(),
         ));
@@ -11200,14 +11548,6 @@ impl Storage {
         if schema.columns.iter().any(|c| c.name == new_name) {
             return Err(CatalogError::ColumnAlreadyExists(new_name.to_string()).into());
         }
-        // 式索引が参照する列の改名は、式テキストの追随（後続 Issue #1651）が入るまで拒否する
-        // （INDEX-10、Issue #1648）。commit しないため副作用ゼロ。
-        if expression_index_references_column_in_txn(&write_txn, table_name, old_name)? {
-            return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
-                detail: "renaming a column referenced by an expression index is not supported"
-                    .to_string(),
-            }));
-        }
         // ビュー定義の追随（TABLE-38、Issue #1621）。拒否・計画失敗時は何も書かない。
         // CATALOG_TABLE のハンドルは解放済み。`schema` は改名前のもの。
         rewrite_views_for_renamed_column_in_txn(
@@ -11264,13 +11604,16 @@ impl Storage {
             }
             bump_table_generation_in_txn(&write_txn, &child.name)?;
         }
-        rename_index_def_columns_in_txn(&write_txn, table_name, old_name, new_name)?;
+        // 式索引の式テキストも改名後のスキーマで再束縛して追随させる（INDEX-10、Issue #1651）。
+        let unique_expression_touched =
+            rename_index_def_columns_in_txn(&write_txn, table_name, old_name, new_name, &schema)?;
         // 列名を含む派生索引（永続一意索引・キー索引）を同一 txn で失効させる。stale な
         // 索引を後の同名列で「構築済み」と誤認する fail-open を防ぐ（Issue #1402 と同じ）。
-        if old_schema
-            .primary_key
-            .as_ref()
-            .is_some_and(|pk| pk.iter().any(|c| c == old_name))
+        if unique_expression_touched
+            || old_schema
+                .primary_key
+                .as_ref()
+                .is_some_and(|pk| pk.iter().any(|c| c == old_name))
             || old_schema
                 .unique_constraints
                 .iter()
@@ -11564,6 +11907,11 @@ impl Storage {
                 if name_collides_with_primary_key(&schema, table_name, n) {
                     return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
                 }
+                // 一意索引（式索引を含む）との名前衝突（Issue #1651）。索引カタログ側の
+                // 同名と制約が併存すると DROP CONSTRAINT で外せなくなるため双方向で拒否する。
+                if unique_index_def_for_table_in_txn(&write_txn, table_name, n)? {
+                    return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
+                }
             }
             if schema.unique_constraints.len() >= MAX_UNIQUE_CONSTRAINTS {
                 return Err(CatalogError::ConstraintLimitExceeded(format!(
@@ -11577,8 +11925,12 @@ impl Storage {
             };
             let mut constraints = schema.unique_constraints.clone();
             constraints.push(new_constraint);
-            let updated =
-                assign_unique_constraint_names(schema.clone().with_unique_constraints(constraints));
+            // 既定名は一意索引名（式索引を含む）とも衝突させない（Issue #1651）。
+            let index_names = unique_index_names_for_table_in_txn(&write_txn, table_name)?;
+            let updated = assign_unique_constraint_names_avoiding(
+                schema.clone().with_unique_constraints(constraints),
+                &index_names,
+            );
             // 既存行の走査より前に、追加後のスキーマとして検証する。
             validate_schema(&updated)?;
             confirmed_name = updated
@@ -11689,7 +12041,9 @@ impl Storage {
                     .foreign_keys
                     .iter()
                     .any(|f| f.name() == confirmed_name);
-            if name_collides {
+            if name_collides
+                || unique_index_def_for_table_in_txn(&write_txn, table_name, &confirmed_name)?
+            {
                 return Err(CatalogError::ConstraintAlreadyExists(confirmed_name));
             }
 
@@ -12106,6 +12460,12 @@ impl Storage {
                         CatalogError::ConstraintAlreadyExists(n.clone()),
                     ));
                 }
+                // 一意索引（式索引を含む）との名前衝突（Issue #1651）。
+                if unique_index_def_for_table_in_txn(&write_txn, table_name, n)? {
+                    return Err(AlterCheckError::Catalog(
+                        CatalogError::ConstraintAlreadyExists(n.clone()),
+                    ));
+                }
             }
             if schema.checks.len() >= MAX_CHECK_CONSTRAINTS_PER_TABLE {
                 return Err(AlterCheckError::Catalog(
@@ -12131,6 +12491,8 @@ impl Storage {
                     // 導出〔`assign_unique_constraint_names`／
                     // `assign_foreign_key_constraint_names`〕と対称）。
                     used.extend(schema.foreign_keys.iter().map(|f| f.name().to_string()));
+                    // 一意索引名（式索引を含む）とも衝突させない（Issue #1651）。
+                    used.extend(unique_index_names_for_table_in_txn(&write_txn, table_name)?);
                     crate::sql::check_constraint::default_alter_table_check_name(table_name, &used)
                 }
             };
@@ -12245,6 +12607,11 @@ impl Storage {
                 if name_collides_with_primary_key(&schema, table_name, n) {
                     return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
                 }
+                // 一意索引（式索引を含む）との名前衝突（Issue #1651）。索引カタログ側の
+                // 同名と制約が併存すると DROP CONSTRAINT で外せなくなるため双方向で拒否する。
+                if unique_index_def_for_table_in_txn(&write_txn, table_name, n)? {
+                    return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
+                }
             }
             if schema.foreign_keys.len() >= MAX_FOREIGN_KEYS_PER_TABLE {
                 return Err(CatalogError::ConstraintLimitExceeded(format!(
@@ -12288,8 +12655,12 @@ impl Storage {
 
             let mut fks = schema.foreign_keys.clone();
             fks.push(resolved);
-            let updated =
-                assign_foreign_key_constraint_names(schema.clone().with_foreign_keys(fks));
+            // 既定名は一意索引名（式索引を含む）とも衝突させない（Issue #1651）。
+            let index_names = unique_index_names_for_table_in_txn(&write_txn, table_name)?;
+            let updated = assign_foreign_key_constraint_names_avoiding(
+                schema.clone().with_foreign_keys(fks),
+                &index_names,
+            );
             validate_schema(&updated)?;
             let final_fk =
                 updated.foreign_keys.last().cloned().ok_or_else(|| {
@@ -12762,14 +13133,9 @@ impl Storage {
                 detail: "cannot alter type of a column used by a view or rule".to_string(),
             }));
         }
-        // 式索引が参照する列の型変更は、式の再束縛・キー再構築（後続 Issue #1651）が入るまで
-        // 拒否する（INDEX-10、Issue #1648）。commit しないため副作用ゼロ。
-        if expression_index_references_column_in_txn(&write_txn, table_name, column_name)? {
-            return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
-                detail: "cannot alter type of a column used by an expression index".to_string(),
-            }));
-        }
         let mut revalidate_schema: Option<TableSchema> = None;
+        // 型変更後の最終スキーマ。式索引の再束縛・再検証（INDEX-10、Issue #1651）が使う。
+        let mut final_schema: Option<TableSchema> = None;
         // `RewriteExpr` のとき、カタログのハンドルを手放した後で処理するための持ち越し
         // （旧スキーマ・変更列の論理 index・新しい型・新しい照合）。
         let mut expr_rewrite: Option<(
@@ -12932,6 +13298,7 @@ impl Storage {
             table
                 .insert(table_name, encoded.as_slice())
                 .map_err(CatalogError::from)?;
+            final_schema = Some(schema.clone());
             if matches!(
                 plan,
                 AlterPlan::Rewrite(crate::column_rewrite::WideningKind::CharFamily)
@@ -12942,7 +13309,7 @@ impl Storage {
         if let Some((old_schema, logical_index, new_ty, new_collation)) = expr_rewrite {
             // 一般変換は値を変えうるため、新スキーマで PK／UNIQUE の重複・FK の型照合と
             // 参照整合性を下で再検証する（TABLE-40 (3)(4)・Issue #1637）。
-            revalidate_schema = Some(alter_column_type_rewrite_expr_in_txn(
+            let rewritten_schema = alter_column_type_rewrite_expr_in_txn(
                 &write_txn,
                 table_name,
                 column_name,
@@ -12951,7 +13318,9 @@ impl Storage {
                 logical_index,
                 new_ty,
                 new_collation,
-            )?);
+            )?;
+            final_schema = Some(rewritten_schema.clone());
+            revalidate_schema = Some(rewritten_schema);
         }
         // 文字列系・一般変換は値を変えうる（`'ab'` と `'ab '` が `CHAR(3)` で同値になる・rtrim で
         // FK の一致関係が変わる）ため、新スキーマで PK／UNIQUE の重複と FOREIGN KEY の型照合・
@@ -12960,6 +13329,16 @@ impl Storage {
         // txn を破棄するので表（カタログ・行・索引）は一切変わらない。
         if let Some(new_schema) = &revalidate_schema {
             revalidate_keys_after_type_change(&write_txn, table_name, new_schema, column_name)?;
+        }
+        // 変更列を参照する式索引の再束縛・既存行の再検証・一意キーの再走査（INDEX-10、Issue #1651）。
+        // 式キー索引はテーブル世代ごとに作り直す派生物のため、下の世代 bump が「再構築」を成立させる。
+        if let Some(new_schema) = &final_schema {
+            rebuild_expression_indexes_after_type_change_in_txn(
+                &write_txn,
+                table_name,
+                new_schema,
+                column_name,
+            )?;
         }
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
@@ -13317,13 +13696,10 @@ impl Storage {
             .into());
         }
         let has_exprs = exprs.iter().any(Option::is_some);
-        if has_exprs
-            && (exprs.len() != def.columns.len()
-                || !matches!(def.kind, IndexKind::Scalar)
-                || def.unique)
+        if has_exprs && (exprs.len() != def.columns.len() || !matches!(def.kind, IndexKind::Scalar))
         {
             return Err(CatalogError::Invalid(
-                "expression elements must match a non-unique scalar column list".to_string(),
+                "expression elements must match a scalar column list".to_string(),
             )
             .into());
         }
@@ -13431,9 +13807,16 @@ impl Storage {
                     });
                 }
             }
+            // 一意の式索引（INDEX-9・INDEX-10、Issue #1651）の前提ゲート: 列要素の型ゲート →
+            // 制約名前空間の衝突。式一意索引は UNIQUE 制約へ展開しない（式には列リストが無いため
+            // 索引カタログだけが持つ）ので、制約数上限・追加後スキーマの検証は通さない。
+            if def.unique && has_exprs {
+                check_unique_index_gate(&stored, &schema)?;
+            }
             // 既存行の検証（INDEX-10、Issue #1649）: 全テナント・全可視性の行で式が評価でき索引化
             // できなければ、保存前に拒否する（作れない式索引を残さない）。評価エラーは SQLSTATE を
-            // 保った固定文言へ置換し、不可視行の値を応答へ出さない。
+            // 保った固定文言へ置換し、不可視行の値を応答へ出さない。一意の式索引は続けて同じ行で
+            // テナントごとの重複を走査する（`23505`。テナント・値・件数は応答に含めない）。
             if has_exprs {
                 let decls: Vec<DeclaredExpressionKey> = stored
                     .expressions
@@ -13459,6 +13842,16 @@ impl Storage {
                                 &row_table, &schema, &compiled,
                             )
                             .map_err(map_index_validation_error)?;
+                            if def.unique {
+                                let elements = unique_element_decls(&stored);
+                                if crate::constraint::table_has_duplicate_expression_unique_key(
+                                    &row_table, &schema, &compiled, &elements,
+                                )
+                                .map_err(map_index_validation_error)?
+                                {
+                                    return Err(CatalogError::UniqueConstraintViolation.into());
+                                }
+                            }
                         }
                         // 行テーブル未作成は行 0 件として扱う。
                         Err(redb::TableError::TableDoesNotExist(_)) => {}
@@ -13470,7 +13863,7 @@ impl Storage {
             // 一意索引（Issue #1616・INDEX-9）: 型ゲート → 制約名前空間 → 件数上限 →
             // 追加後スキーマの検証 → 既存行の重複走査 の順で、スキーマ側の UNIQUE 制約
             // （強制の唯一の入力）を組み立てる。データに依存するのは最後の走査だけ。
-            let unique_schema = if def.unique {
+            let unique_schema = if def.unique && !has_exprs {
                 Some(build_unique_index_schema_in_txn(&write_txn, def, &schema)?)
             } else {
                 None
@@ -13544,7 +13937,14 @@ impl Storage {
         };
         // matview の索引宣言（Issue #1667）は表の UNIQUE 制約を持たないので外す制約が無い。
         if def.unique && !materialized_view_exists_in_txn(&write_txn, &def.table)? {
-            drop_unique_index_constraint_in_txn(&write_txn, &def)?;
+            if def.has_expressions() {
+                // 一意の式索引（Issue #1651）は UNIQUE 制約へ展開していないので外す制約が無い。
+                // 永続一意索引だけ失効させる（強制はカタログの宣言が無くなった時点で外れ、
+                // 残りのキーは次回の書き込みで再構築される）。
+                write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
+            } else {
+                drop_unique_index_constraint_in_txn(&write_txn, &def)?;
+            }
         }
         bump_table_generation_in_txn(&write_txn, &def.table)?;
         // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。理由は
@@ -23081,6 +23481,57 @@ mod tests {
         );
     }
 
+    /// 一意の式索引（`v5`。Issue #1651）は `v4` と同じ行構成の末尾に固定行 `unique` を持ち、往復する。
+    /// 非一意の `v4` と列だけの一意索引 `v3` のバイト列は変わらない。
+    #[test]
+    fn unique_expression_index_v5_round_trips_and_other_versions_are_unchanged() {
+        let def =
+            expr_def("u", &["", "lang"], &[Some(("lower(a)", &["a"])), None]).with_unique(true);
+        let bytes = encode_index_def(&def).expect("encode");
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        assert!(text.starts_with("v5\ndocs\nscalar\n,lang\n-,-\n"), "{text}");
+        assert!(text.ends_with("\nunique"), "{text}");
+        let decoded = decode_index_def("u", &bytes).expect("decode");
+        assert!(decoded.unique);
+        assert_eq!(decoded, def);
+        // 非一意の式索引は従来どおり `v4`、列だけの一意索引は `v3`。
+        let non_unique = expr_def("e", &[""], &[Some(("lower(a)", &["a"]))]);
+        let v4 = encode_index_def(&non_unique).expect("encode");
+        assert!(v4.starts_with(b"v4\n"));
+        assert!(!decode_index_def("e", &v4).expect("decode").unique);
+        let v3 =
+            encode_index_def(&scalar_def("p", "docs", &["a"]).with_unique(true)).expect("encode");
+        assert_eq!(v3, b"v3\ndocs\nscalar\na\nunique".to_vec());
+    }
+
+    /// 破損・手書きの `v5` は `CorruptSchema` で拒否する（`unique` 行の欠落・不正・余剰）。
+    #[test]
+    fn corrupt_unique_expression_index_v5_is_rejected() {
+        let good = encode_index_def(
+            &expr_def("u", &[""], &[Some(("lower(a)", &["a"]))]).with_unique(true),
+        )
+        .expect("encode");
+        let good = String::from_utf8(good).expect("utf8");
+        assert!(decode_index_def("u", good.as_bytes()).is_ok());
+        for (label, text) in [
+            (
+                "missing unique line",
+                good.strip_suffix("\nunique").expect("suffix").to_string(),
+            ),
+            ("wrong flag", good.replace("\nunique", "\nuniqu")),
+            ("trailing data", format!("{good}\nextra")),
+            ("v4 with unique line", good.replacen("v5", "v4", 1)),
+        ] {
+            assert!(
+                matches!(
+                    decode_index_def("u", text.as_bytes()),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "{label} must be rejected"
+            );
+        }
+    }
+
     /// 破損・手書きの `v4` は `CorruptSchema` で拒否する（fail-closed）。
     #[test]
     fn corrupt_expression_index_v4_is_rejected() {
@@ -23090,7 +23541,7 @@ mod tests {
         assert!(decode_index_def("e", good.as_bytes()).is_ok());
         let hex = good.lines().nth(5).expect("expr line").to_string();
         let cases: Vec<(&str, String)> = vec![
-            ("unknown version", good.replacen("v4", "v5", 1)),
+            ("unknown version", good.replacen("v4", "v9", 1)),
             ("trailing data", format!("{good}\nextra")),
             (
                 "missing refs line",
