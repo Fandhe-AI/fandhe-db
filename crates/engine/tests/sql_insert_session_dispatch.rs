@@ -40,6 +40,7 @@ fn new_core_with_documents_table(path: &std::path::Path) -> EngineCore {
         ))
         .expect("create table");
     EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
 }
 
 /// セッション経由の `INSERT` は `SqlOutcome::Insert` を返し、行が永続化される

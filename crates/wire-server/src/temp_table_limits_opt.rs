@@ -18,7 +18,7 @@ use engine::temp_table_limits::{
 /// 1 セッションが持てる一時表の数の上限を設定する CLI フラグ名。
 pub const MAX_TEMP_TABLES_FLAG: &str = "--max-temp-tables";
 
-/// 1 セッションの一時表の論理総バイト数の上限を設定する CLI フラグ名。
+/// 1 セッションの一時表の総バイト数（確保済みページ総量）の上限を設定する CLI フラグ名。
 pub const MAX_TEMP_BYTES_FLAG: &str = "--max-temp-bytes";
 
 /// 2 つの CLI フラグの生の値（未指定は `None`）。`main.rs` が引数解析で集める。

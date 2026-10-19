@@ -46,7 +46,8 @@ fn new_core() -> (EngineCore, std::path::PathBuf) {
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
     (
-        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+            .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered),
         path,
     )
 }
@@ -743,7 +744,8 @@ fn update_against_row_with_corrupt_stored_metadata_is_rejected_with_xx000() {
     )
     .expect("seed row with corrupt stored metadata");
 
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     let mut session = SessionState::default();
     let err = core
         .execute_sql_in_session(

@@ -140,7 +140,7 @@
 //! （`docs/design/group-by-limits-cli.md`）。
 //!
 //! `--max-temp-tables`／`--max-temp-bytes`（Issue #1683。TABLE-44）: 一時表
-//! （`CREATE TEMP TABLE`）のセッションあたりの件数（`1`〜`64`）・論理総バイト数
+//! （`CREATE TEMP TABLE`）のセッションあたりの件数（`1`〜`64`）・総バイト数（確保済みページ総量）
 //! （`1`〜`67108864`）の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定できる
 //! opt-in 注入点（未指定は現行のハード上限と同値＝挙動不変。メモリの最悪値は
 //! 「最大接続数 × バイト上限」）。超過は `54000`。範囲外・非数値・値欠落・重複指定は
@@ -282,8 +282,9 @@
 //! 値（未知引数として扱われる）はいずれも fail-closed で起動エラー。解決は
 //! `wire_server::require_operation_id_opt::resolve` に一本化し、
 //! `EngineCore::with_ledger_mode` へ 1 回だけ注入する（セッション・SQL からは
-//! 変更できない）。未指定時の扱い（任意モード）は engine 側の #1704 で実装され、
-//! それまでは従来の必須契約のまま（`docs/design/operation-id-optional.md` 参照）。
+//! 変更できない）。未指定時は operation_id 任意（Issue #1704。省略した書き込みは
+//! 台帳に記録しない通常の書き込み。分割実行 DML のみ常に必須。
+//! `docs/design/operation-id-optional.md` 参照）。
 //!
 //! `--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
 //! WIRE-7, WIRE-9 ポインタ）: TLS opt-in の唯一の入口。`--tls-cert`（証明書
@@ -2222,6 +2223,16 @@ fn run_server(args: &[String]) -> ExitCode {
     core = core.with_join_limits(join_limits);
     // Issue #1555: 未指定でも常に呼ぶ（既定は従来の 10,000 と同値で、未注入と挙動が同一）。
     core = core.with_result_limits(result_limits);
+    // Issue #1664（TABLE-42）: MATERIALIZED VIEW の初回実体化の対象文脈は、認証構成（ユーザー
+    // ストア）のテナント集合から導出して 1 回だけ注入する（クライアントの申告値は使わない）。
+    // 導出に失敗したら起動エラーにする（作成者の文脈だけへ黙って縮退する fail-open を作らない）。
+    match store.materialization_contexts() {
+        Ok(contexts) => core = core.with_materialization_contexts(contexts),
+        Err(e) => {
+            engine::log_stderr!("wire-server: failed to derive materialization contexts: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     // Issue #1554: 未指定でも常に呼ぶ（既定は `DEFAULT_WRITE_LOCK_WAIT` で、未注入と
     // 挙動がビット同一）。
     core = core.with_write_lock_wait(write_lock_wait);

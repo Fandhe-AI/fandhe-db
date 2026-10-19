@@ -341,10 +341,21 @@ pub(crate) fn execute_create_temp_table(
     validated: &ValidatedCreateTempTable,
     schema_limits: &SchemaLimits,
     temp_limits: crate::temp_table_limits::TempTableLimits,
+    template: &crate::core::EngineCore,
 ) -> Result<CreateTableOutcome, SqlSurfaceError> {
     let table = &validated.table;
     if table.if_not_exists && session.temp_tables().contains(&table.table_name) {
         return Ok(CreateTableOutcome {});
+    }
+    // 一時索引など一時カタログに載らない同名関係との衝突も、永続の `CREATE TABLE IF NOT EXISTS`
+    // と同じく FK 拒否・スキーマ検証・表数上限より前に no-op 成功にする（無指定なら後段の
+    // `create_table` が `42P07` を返す）。一時領域が未初期化なら一時索引も無いので素通りする。
+    if table.if_not_exists {
+        if let Some(store) = session.temp_rows_arc() {
+            if store.relation_name_exists(&table.table_name)? {
+                return Ok(CreateTableOutcome {});
+            }
+        }
     }
     if let Some(fk) = table.foreign_keys.first() {
         let parent = fk.parent_table();
@@ -376,10 +387,23 @@ pub(crate) fn execute_create_temp_table(
             "too many temporary tables in this session",
         ));
     }
-    session.temp_rows_or_init(tenant_id, temp_limits.max_bytes_per_session())?;
-    session
+    session.temp_rows_or_init(tenant_id, temp_limits.max_bytes_per_session(), template)?;
+    let store = session
+        .temp_rows_arc()
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "temporary storage error".to_string(),
+        })?;
+    // 一時 DB のカタログへ先に実体を作る。以降の DML・索引・制約は一時コアが永続表と同じ
+    // 実行器でこの定義を読む。カタログ登録に失敗した場合は作った実体を戻す（孤児を残さない）。
+    store.create_table(&schema)?;
+    let name = schema.name.clone();
+    if let Err(e) = session
         .temp_tables_mut()
-        .register(schema, validated.on_commit, max_tables)?;
+        .register(schema, validated.on_commit, max_tables)
+    {
+        let _ = store.drop_tables(&[name]);
+        return Err(e);
+    }
     Ok(CreateTableOutcome {})
 }
 
@@ -403,19 +427,19 @@ pub(crate) fn classify_drop_targets(session: &SessionState, names: &[String]) ->
 /// 一時表の `DROP TABLE`（TABLE-44・Issue #1683）。DDL 権限ゲートの対象外で、永続カタログには
 /// 触れない。呼び出し元は [`classify_drop_targets`] が `Some(true)`（全名が一時表）を返した
 /// 場合に限る。一時表には依存物（ビュー・FOREIGN KEY）が無いため `CASCADE`／`RESTRICT` は
-/// 同じ挙動。カタログから外してから行領域を破棄する（失敗しても孤児は掃除できる）。
+/// 同じ挙動。一時 DB から実体を削除してから一時カタログから外す（実体の削除に失敗した場合は
+/// カタログを変えず、固定文言のエラーを返す）。
 pub(crate) fn execute_drop_temp_tables(
     session: &mut SessionState,
     validated: &ValidatedDropTable,
 ) -> Result<DropTableOutcome, SqlSurfaceError> {
-    let mut ids = Vec::new();
+    if let Some(store) = session.temp_rows_arc() {
+        store.drop_tables(&validated.table_names)?;
+    }
     for name in &validated.table_names {
         // 重複指定（`DROP TABLE t, t`）は 1 回として扱う（永続側と同じ）。
-        if let Some(id) = session.temp_tables_mut().remove(name) {
-            ids.push(id);
-        }
+        session.temp_tables_mut().remove(name);
     }
-    session.apply_temp_row_ops(&[], &ids)?;
     Ok(DropTableOutcome {
         skipped: false,
         cascaded: Vec::new(),
@@ -1782,7 +1806,12 @@ fn undefined_table_or_view(storage: &Storage, name: &str) -> SqlSurfaceError {
     let wrong_kind = match storage.view_definition(name) {
         Ok(Some(_)) => true,
         Ok(None) => match storage.index_exists(name) {
-            Ok(found) => found,
+            Ok(true) => true,
+            // matview（TABLE-42・Issue #1664）も表と名前空間を共有する別種のオブジェクト。
+            Ok(false) => match storage.materialized_view_definition(name) {
+                Ok(def) => def.is_some(),
+                Err(e) => return crate::catalog::table_lookup_error(e),
+            },
             Err(e) => return crate::catalog::table_lookup_error(e),
         },
         Err(e) => return crate::catalog::table_lookup_error(e),
@@ -2287,6 +2316,57 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
 /// ないが、`Insert`／`Truncate` と異なり返す値自体がないため設計を揃える）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateViewOutcome {}
+
+/// `CREATE MATERIALIZED VIEW ...`（TABLE-42・Issue #1664）の成功応答。
+///
+/// テナント境界（P0）: 行数は **作成したセッション自身の文脈の実体の行数だけ**を運ぶ。他の文脈
+/// （他テナント・別の可視性集合）の件数を合算すると、DDL 権限を持つ主体に他テナントの件数が
+/// 漏れるため、合算は構造的にできない（フィールドを 1 つの `Option<u64>` に限る）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateMaterializedViewOutcome {
+    /// `IF NOT EXISTS` により同名の relation があって何もしなかったか。
+    pub(crate) skipped: bool,
+    /// `WITH DATA` で初回実体化したか（`WITH NO DATA`・`skipped` では偽）。
+    pub(crate) populated: bool,
+    /// 作成者の文脈の実体の行数（`WITH DATA` で作成者の文脈が実体化対象だったときだけ `Some`）。
+    pub(crate) own_rows: Option<u64>,
+}
+
+impl CreateMaterializedViewOutcome {
+    /// `IF NOT EXISTS` の no-op か。
+    pub fn skipped(&self) -> bool {
+        self.skipped
+    }
+
+    /// 初回実体化を行ったか。
+    pub fn populated(&self) -> bool {
+        self.populated
+    }
+
+    /// 作成者自身の文脈の実体の行数（`SELECT <n>` タグ用）。他文脈の件数は含まない。
+    /// 実体化していない場合・作成者の文脈が実体化対象外の場合は `None`。
+    pub fn own_rows(&self) -> Option<u64> {
+        self.own_rows
+    }
+}
+
+/// `CatalogError` を `CREATE MATERIALIZED VIEW`（TABLE-42・Issue #1664）の SQL 表層の契約へ写像する。
+/// 名前衝突 `42P07`、参照先不存在 `42P01`、件数・行数・本文サイズ上限 `54000`、書き込みゲート待機の
+/// 超過 `55P03`。文言に他テナントの情報・内部詳細を含めない。
+pub(crate) fn map_create_matview_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::TableAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
+        CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
+        CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        CatalogError::Invalid(_) => SqlSurfaceError::feature_not_supported(
+            "materialized view definition or data cannot be stored",
+        ),
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "CREATE MATERIALIZED VIEW failed".to_string(),
+        },
+    }
+}
 
 /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）の成功応答。
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -557,7 +557,7 @@ fn upsert_on_conflict_composite_unique_target_order_independent() {
         .expect("target written in reverse declaration order must still resolve");
     assert_eq!(outcome.rows_affected, 0);
 
-    // `(b)` だけの部分一致は制約全体と一致しないため `42601`。
+    // `(b)` だけの部分一致は制約全体と一致しないため `42P10`。
     let err = core
         .execute_insert_sql(
             &alice,
@@ -565,7 +565,7 @@ fn upsert_on_conflict_composite_unique_target_order_independent() {
              ON CONFLICT (b) DO NOTHING USING OPERATION_ID 'op-partial'",
         )
         .expect_err("partial composite target must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(err.wire_code(), "42P10");
 }
 
 /// NULL を含む UNIQUE 対象キーは NULLS DISTINCT のため衝突しない（新規挿入）。
@@ -658,7 +658,7 @@ fn upsert_on_conflict_unique_column_does_not_conflict_across_tenants() {
     assert_eq!(outcome.rows_affected, 1);
 }
 
-/// 対象がどの UNIQUE 制約とも一致しない場合は `42601`。
+/// 対象がどの UNIQUE 制約とも一致しない場合は `42P10`。
 #[test]
 fn upsert_on_conflict_target_not_matching_any_unique_constraint_is_rejected() {
     let (core, path) = new_core("uniq-on-conflict-no-match");
@@ -679,7 +679,7 @@ fn upsert_on_conflict_target_not_matching_any_unique_constraint_is_rejected() {
              ON CONFLICT (a) DO NOTHING USING OPERATION_ID 'op-no-match'",
         )
         .expect_err("target not matching any UNIQUE constraint must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(err.wire_code(), "42P10");
 }
 
 /// バッチ内の対象キー重複（NULL 以外）は束縛時に `22000` で拒否され、副作用は

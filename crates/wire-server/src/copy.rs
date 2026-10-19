@@ -414,7 +414,7 @@ fn run_copy_from<'e, S: WireStream>(
     stream: &mut S,
     engine: &'e EngineCore,
     ctx: &PolicyContext,
-    conn_session: &SessionState,
+    conn_session: &mut SessionState,
     txn: &mut SessionTransaction<'e>,
     mut session: CopyInSession,
     finish: Finish,
@@ -606,7 +606,7 @@ fn finish_copy_from<'e, S: WireStream>(
     stream: &mut S,
     engine: &'e EngineCore,
     ctx: &PolicyContext,
-    conn_session: &SessionState,
+    conn_session: &mut SessionState,
     txn: &mut SessionTransaction<'e>,
     session: CopyInSession,
     errored: Option<SqlSurfaceError>,
@@ -623,7 +623,9 @@ fn finish_copy_from<'e, S: WireStream>(
 
     let outcome = {
         let _emergency_registration = crate::simple_query::register_emergency_response(stream);
-        engine.commit_copy_in_txn(ctx, txn, batch)
+        // セッション対応版: 一時表向けのバッチの commit と、自動コミットの COPY 後の `ON COMMIT`
+        // 適用（TABLE-44・Issue #1684）に接続の `SessionState` が要る。
+        engine.commit_copy_in_txn_in_session(ctx, conn_session, txn, batch)
     };
 
     match outcome {

@@ -45,7 +45,8 @@ fn open_core(label: &str) -> (EngineCore, CleanupGuard) {
     let guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(engine::kernel::CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(engine::kernel::CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (core, guard)
 }
 
@@ -104,7 +105,8 @@ fn execute_bound_update_in_session_requires_operation_id_before_schema_lookup() 
         let guard = CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
         (
-            EngineCore::from_storage(storage, Box::new(engine::kernel::CpuScalarProvider)),
+            EngineCore::from_storage(storage, Box::new(engine::kernel::CpuScalarProvider))
+                .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered),
             guard,
         )
     };

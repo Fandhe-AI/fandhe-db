@@ -132,6 +132,11 @@ enum TxnOrigin {
 struct ActiveTxn<'e> {
     origin: TxnOrigin,
     write_txn: crate::storage::GatedWriteTxn,
+    /// 一時表（TABLE-44・Issue #1684）の書き込みトランザクション。最初の一時表の文で遅延して開く。
+    /// `ActiveTxn` を取り出して drop する全経路（`rollback`／`fail`／`release_if_expired`／
+    /// 暗黙の abort／`SessionTransaction` の drop）で自動的に abort する。commit は
+    /// [`commit_active`] が永続側の commit 成功後にだけ行う。
+    temp: Option<TempTxn>,
     started_at: Instant,
     /// トランザクション開始時刻（UTC マイクロ秒の壁時計。SQL-37・Issue #1586）。`now()` 系の
     /// 値で、トランザクション内の全文で固定する（`started_at` は壁時計でないため別に持つ）。
@@ -163,6 +168,21 @@ struct ActiveTxn<'e> {
     /// dirty テーブル判定（[`SessionTransaction::dirty_tables`]）が確定済み世代を
     /// 読むための参照。`Active` の間だけ保持する（`begin` が渡す）。
     storage: &'e crate::storage::Storage,
+}
+
+/// 開いている一時側の書き込みトランザクションと、その実体ストア（TABLE-44・Issue #1684）。
+/// フィールドの宣言順が drop 順で、トランザクションをストアより先に破棄する。
+pub(crate) struct TempTxn {
+    txn: crate::storage::GatedWriteTxn,
+    store: std::sync::Arc<crate::sql::temp_rows::TempRowStore>,
+}
+
+impl TempTxn {
+    /// 一時側を確定する。永続側の commit 成功後にだけ呼ぶ。
+    fn commit(self) -> Result<(), SqlSurfaceError> {
+        let Self { txn, store } = self;
+        store.commit(txn)
+    }
 }
 
 enum TxnState<'e> {
@@ -395,6 +415,7 @@ impl<'e> SessionTransaction<'e> {
             TxnState::Active(active) if active.origin == TxnOrigin::Implicit => {
                 let ActiveTxn {
                     write_txn,
+                    temp,
                     started_at,
                     has_writes,
                     session_at_begin,
@@ -411,6 +432,7 @@ impl<'e> SessionTransaction<'e> {
                 commit_active(
                     storage,
                     write_txn,
+                    temp,
                     has_writes,
                     &written_by_tenant,
                     &written_tables,
@@ -484,6 +506,7 @@ impl<'e> SessionTransaction<'e> {
                 self.state = TxnState::Active(Box::new(ActiveTxn {
                     origin,
                     write_txn,
+                    temp: None,
                     started_at: Instant::now(),
                     txn_start_micros,
                     statements: 0,
@@ -535,6 +558,7 @@ impl<'e> SessionTransaction<'e> {
             TxnState::Active(active) => {
                 let ActiveTxn {
                     write_txn,
+                    temp,
                     started_at,
                     has_writes,
                     session_at_begin,
@@ -556,6 +580,7 @@ impl<'e> SessionTransaction<'e> {
                 commit_active(
                     storage,
                     write_txn,
+                    temp,
                     has_writes,
                     &written_by_tenant,
                     &written_tables,
@@ -683,6 +708,33 @@ impl<'e> SessionTransaction<'e> {
                 collect_dirty_tables(active.storage, &active.write_txn, &active.written_tables)
             }
             _ => Ok(HashSet::new()),
+        }
+    }
+
+    /// 一時側の書き込みトランザクションが未開始なら開く（`Active` のときのみ。TABLE-44・
+    /// Issue #1684）。一時表の最初の文（読み取りを含む。自分の書き込みを読めるようにするため）で
+    /// 呼ぶ。一時 DB の単一ライタを既に保持している場合は待たずに `55P03`（再入しない）。
+    pub(crate) fn ensure_temp_txn(
+        &mut self,
+        store: &std::sync::Arc<crate::sql::temp_rows::TempRowStore>,
+    ) -> Result<(), SqlSurfaceError> {
+        let TxnState::Active(active) = &mut self.state else {
+            return Err(internal_error());
+        };
+        if active.temp.is_none() {
+            active.temp = Some(TempTxn {
+                txn: store.begin_write()?,
+                store: std::sync::Arc::clone(store),
+            });
+        }
+        Ok(())
+    }
+
+    /// 開いている一時側の書き込みトランザクション（無ければ `None`）。
+    pub(crate) fn temp_write_txn(&self) -> Option<&crate::storage::GatedWriteTxn> {
+        match &self.state {
+            TxnState::Active(active) => active.temp.as_ref().map(|t| &t.txn),
+            _ => None,
         }
     }
 
@@ -853,9 +905,13 @@ fn internal_error() -> SqlSurfaceError {
 /// `FOREIGN KEY` を検査し（TABLE-17・TASK-205、Issue #1077）、違反すれば abort して
 /// `session` を開始時点へ復元し `23503` を返す。commit 自体の失敗も同様にロールバック
 /// 扱いで `XX000`。成功時は `ON COMMIT` を適用する。呼び出し元は事前に `state` を `Idle` にすること。
+// 引数は `ActiveTxn` を分解して渡す 2 つの呼び出し元（明示・暗黙の commit）専用で、構造体に
+// まとめ直しても取り出し・再構築が増えるだけのため、個別の引数のままにする。
+#[allow(clippy::too_many_arguments)]
 fn commit_active(
     storage: &crate::storage::Storage,
     write_txn: crate::storage::GatedWriteTxn,
+    temp: Option<TempTxn>,
     has_writes: bool,
     written_by_tenant: &std::collections::BTreeSet<(String, String)>,
     written_tables: &HashSet<String>,
@@ -907,10 +963,16 @@ fn commit_active(
         *session = session_at_begin;
         internal_error()
     })?;
-    // commit 成功後にだけ、一時表の `ON COMMIT` 動作を適用する（TABLE-44・Issue #1683。
-    // ROLLBACK・commit 失敗では呼ばない）。永続側は既に commit 済みのため、ここが失敗すると
-    // クライアントには commit 失敗（`XX000`）が返るが実際には commit 済み、という食い違いが
-    // 起こりうる（一時表は in-memory redb で発生確率は極めて低い既知の制約。docs/design/temp-table.md）。
+    // 永続側の commit 成功後にだけ、一時側を確定し、続けて一時表の `ON COMMIT` 動作を適用する
+    // （TABLE-44・Issue #1683・#1684。ROLLBACK・永続側の commit 失敗では `temp` を drop（abort）
+    // するだけで呼ばない）。順序は「永続 commit → 一時 commit → ON COMMIT」で、一時 DB の単一ライタを
+    // `ON COMMIT` が取り直せるよう、一時側を先に確定して書き込みトランザクションを手放す。
+    // 永続側は既に commit 済みのため、一時側の commit・`ON COMMIT` が失敗すると、クライアントには
+    // 失敗（`XX000`）が返るが永続側は commit 済み、という食い違いが起こりうる（2 つの DB の commit は
+    // 原子的でない。一時表は in-memory redb で発生確率は極めて低い既知の制約。docs/design/temp-table.md）。
+    if let Some(temp) = temp {
+        temp.commit()?;
+    }
     session.apply_temp_on_commit()
 }
 

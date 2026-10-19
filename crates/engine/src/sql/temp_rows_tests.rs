@@ -1,27 +1,42 @@
-//! 一時表の行ストア `temp_rows` のテスト（Issue #1682、対象ビヘイビア: TABLE-44）。
+//! 一時表の実体ストア `temp_rows` のテスト（Issue #1682、#1684 で再設計。対象ビヘイビア: TABLE-44）。
 //!
-//! 役割: 行の往復・トランザクション原子性・総バイト数上限（`54000`）・関係の分離・テナント固定・
-//! 切断（drop）での破棄・永続側に触れないこと・キャッシュのゲート・物理上限の backstop を検証する。
+//! 役割: 一時コアでの DML の往復・総バイト数上限（`54000`）・書き込みトランザクションの
+//! 再入拒否（デッドロックしない）・テナント固定・切断（drop）での破棄・永続側に触れないこと・
+//! 物理上限の backstop を検証する。
 
 use std::sync::Arc;
 
 use crate::catalog::{ColumnDef, ColumnType, TableSchema};
-use crate::sql::allowlist::{SqlSurfaceError, TempOnCommit};
+use crate::core::EngineCore;
+use crate::kernel::CpuScalarProvider;
+use crate::policy::PolicyContext;
+use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::mode::SessionState;
-use crate::sql::temp_catalog::{SessionTempCatalog, TempRelationId};
 use crate::sql::temp_rows::{TempRowStore, DEFAULT_MAX_TEMP_BYTES_PER_SESSION};
-use crate::storage::read_source::ReadSource;
-use crate::storage::Storage;
+use crate::storage::{Storage, Visibility};
 use crate::test_util::temp_db::tempdir;
 
 const T: &str = "tenant-a";
 
-fn rel(n: u64) -> TempRelationId {
-    TempRelationId::from_raw(n)
+/// 設定の引き継ぎ元になる永続コア（一時コアはこのコアのストレージを使わない）。
+fn template() -> (EngineCore, crate::test_util::temp_db::TempDir) {
+    let dir = tempdir();
+    let storage = Storage::open(dir.db_path()).expect("open");
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_ledger_mode(
+            crate::recovery::required_op_id::LedgerMode::CompareOnlyWithoutLedger,
+        ),
+        dir,
+    )
 }
 
-fn store(max: u64) -> TempRowStore {
-    TempRowStore::new(T, max).expect("store")
+fn ctx(tenant: &str) -> PolicyContext {
+    PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant")
+}
+
+fn store(max: u64, tpl: &EngineCore) -> TempRowStore {
+    TempRowStore::new(T, max, tpl).expect("store")
 }
 
 fn code(e: &SqlSurfaceError) -> &'static str {
@@ -32,142 +47,86 @@ fn schema(name: &str) -> TableSchema {
     TableSchema::new(name, vec![ColumnDef::new("x", ColumnType::Text, true)])
 }
 
-/// 1 行あたりの論理コスト（tenant 長 + 8 + 値長）。
-fn cost(len: usize) -> u64 {
-    (T.len() + 8 + len) as u64
+fn insert(core: &EngineCore, table: &str, id: u64, body: &str) -> Result<(), String> {
+    let mut s = SessionState::default();
+    core.execute_sql_in_session(
+        &ctx(T),
+        &mut s,
+        &format!("INSERT INTO {table} (id, x) VALUES ({id}, '{body}')"),
+    )
+    .map(|_| ())
+    .map_err(|e| e.wire_code().to_string())
 }
 
 #[test]
-fn table_44_row_roundtrip() {
-    let s = store(DEFAULT_MAX_TEMP_BYTES_PER_SESSION);
-    let w = s.begin_write().unwrap();
-    assert!(w.insert_row(rel(1), T, 1, b"aa").unwrap());
-    assert!(w.insert_row(rel(1), T, 2, b"bb").unwrap());
-    assert!(!w.insert_row(rel(1), T, 1, b"zz").unwrap(), "duplicate id");
-    assert_eq!(w.get_row(rel(1), T, 1).unwrap(), Some(b"aa".to_vec()));
-    w.put_row(rel(1), T, 2, b"BBB").unwrap();
-    assert!(w.delete_row(rel(1), T, 1).unwrap());
-    assert!(!w.delete_row(rel(1), T, 1).unwrap());
-    w.commit().unwrap();
+fn table_44_store_runs_dml_on_its_own_storage() {
+    let (tpl, _dir) = template();
+    let s = store(DEFAULT_MAX_TEMP_BYTES_PER_SESSION, &tpl);
+    s.create_table(&schema("a")).unwrap();
+    let core = s.core().unwrap();
+    insert(core, "a", 1, "aa").unwrap();
+    assert_eq!(insert(core, "a", 1, "zz"), Err("23505".to_string()));
+    s.truncate_tables(&["a".to_string()]).unwrap();
+    insert(core, "a", 1, "again").unwrap();
+    s.drop_tables(&["a".to_string()]).unwrap();
+    // 実体ごと消えたので、同名の表は存在しない。
+    assert_eq!(insert(core, "a", 1, "x"), Err("42P01".to_string()));
+    // 永続コア（テンプレート）にはこの表が無い。
+    assert_eq!(insert(&tpl, "a", 1, "x"), Err("42P01".to_string()));
+}
 
-    let r = s.begin_read().unwrap();
-    assert_eq!(r.get_row(rel(1), T, 1).unwrap(), None);
+#[test]
+fn table_44_budget_is_enforced_with_54000_and_released_by_delete() {
+    let (tpl, _dir) = template();
+    let s = store(DEFAULT_MAX_TEMP_BYTES_PER_SESSION, &tpl);
+    s.create_table(&schema("a")).unwrap();
+    insert(s.core().unwrap(), "a", 1, &"x".repeat(2000)).unwrap();
+    let used = s.used_bytes().unwrap();
+    assert!(used > 0);
+
+    // 現在の使用量より小さい上限のストアでは、文の後・commit の前の判定が 54000 になる。
+    // DDL（CREATE TEMP TABLE）も上限を迂回できない。超過なら作った表は戻る。
+    let small = store(1, &tpl);
+    let err = small
+        .create_table(&schema("a"))
+        .expect_err("DDL over budget");
+    assert_eq!(code(&err), "54000");
     assert_eq!(
-        r.scan_relation(rel(1), T).unwrap(),
-        vec![(2, b"BBB".to_vec())]
+        insert(small.core().unwrap(), "a", 1, "x"),
+        Err("42P01".to_string())
     );
-    assert!(r.scan_relation(rel(9), T).unwrap().is_empty());
-    assert_eq!(s.used_bytes().unwrap(), cost(3));
+
+    let ample = store(used.saturating_mul(4), &tpl);
+    ample.create_table(&schema("a")).unwrap();
+    let w = ample.begin_write().unwrap();
+    ample.enforce_budget(&w).expect("within budget");
 }
 
 #[test]
-fn table_44_abort_restores_rows_and_accounting() {
-    let s = store(DEFAULT_MAX_TEMP_BYTES_PER_SESSION);
-    let w = s.begin_write().unwrap();
-    w.insert_row(rel(1), T, 1, b"keep").unwrap();
-    w.commit().unwrap();
-    let before = s.used_bytes().unwrap();
-
-    let w = s.begin_write().unwrap();
-    w.insert_row(rel(1), T, 2, b"drop-me").unwrap();
-    w.abort().unwrap();
-    assert_eq!(s.used_bytes().unwrap(), before);
-    let r = s.begin_read().unwrap();
-    assert_eq!(r.scan_relation(rel(1), T).unwrap().len(), 1);
-}
-
-#[test]
-fn table_44_limit_is_enforced_with_54000() {
-    let max = cost(10) * 2;
-    let s = store(max);
-    let w = s.begin_write().unwrap();
-    w.insert_row(rel(1), T, 1, &[0u8; 10]).unwrap();
-    w.insert_row(rel(1), T, 2, &[0u8; 10]).unwrap();
-    let err = w.insert_row(rel(1), T, 3, &[0u8; 1]).expect_err("over");
-    assert_eq!(code(&err), "54000");
-    assert!(w.get_row(rel(1), T, 3).unwrap().is_none());
-    // 置換で 1 バイト増えても超過。
-    let err = w.put_row(rel(1), T, 1, &[0u8; 11]).expect_err("over");
-    assert_eq!(code(&err), "54000");
-    w.commit().unwrap();
-    assert_eq!(s.used_bytes().unwrap(), max);
-
-    // 削除・truncate で空きができれば再び入る。
-    let w = s.begin_write().unwrap();
-    assert!(w.delete_row(rel(1), T, 1).unwrap());
-    w.insert_row(rel(1), T, 3, &[0u8; 10]).unwrap();
-    w.truncate_relation(rel(1)).unwrap();
-    w.insert_row(rel(1), T, 4, &[0u8; 10]).unwrap();
-    w.commit().unwrap();
-    assert_eq!(s.used_bytes().unwrap(), cost(10));
-}
-
-#[test]
-fn table_44_oversized_value_is_rejected_before_allocation() {
-    let s = store(u64::MAX);
-    let w = s.begin_write().unwrap();
-    let big = vec![0u8; 4 * 1024 * 1024 + 4096 + 1];
-    let err = w.insert_row(rel(1), T, 1, &big).expect_err("too big");
-    assert_eq!(code(&err), "54000");
-}
-
-#[test]
-fn table_44_relations_are_isolated_and_orphans_are_swept() {
-    let s = store(DEFAULT_MAX_TEMP_BYTES_PER_SESSION);
-    let mut cat = SessionTempCatalog::default();
-    let a = cat
-        .register(schema("a"), TempOnCommit::PreserveRows, 8)
-        .expect("register a");
-    let b = cat
-        .register(schema("b"), TempOnCommit::PreserveRows, 8)
-        .expect("register b");
-    let w = s.begin_write().unwrap();
-    w.insert_row(a, T, 1, b"a1").unwrap();
-    w.insert_row(b, T, 1, b"b1").unwrap();
-    assert_eq!(w.get_row(a, T, 1).unwrap(), Some(b"a1".to_vec()));
-    assert_eq!(w.get_row(b, T, 1).unwrap(), Some(b"b1".to_vec()));
-
-    // DROP 相当: 同名を新しい id で作り直しても古い行は見えない。
-    let removed = cat.remove("a").expect("removed");
-    w.drop_relation(removed).unwrap();
-    let a2 = cat
-        .register(schema("a"), TempOnCommit::PreserveRows, 8)
-        .expect("re-register");
-    assert_ne!(a2, removed);
-    assert!(w.get_row(a2, T, 1).unwrap().is_none());
-
-    // カタログから消えた b の行領域は retain_relations が掃除する。
-    cat.remove("b");
-    w.retain_relations(&cat).unwrap();
-    assert!(w.get_row(b, T, 1).unwrap().is_none());
-    w.commit().unwrap();
-    assert_eq!(s.used_bytes().unwrap(), 0);
+fn table_44_second_begin_write_on_the_same_thread_errors_instead_of_blocking() {
+    let (tpl, _dir) = template();
+    let s = store(DEFAULT_MAX_TEMP_BYTES_PER_SESSION, &tpl);
+    let first = s.begin_write().unwrap();
+    let err = s.begin_write().err().expect("re-entrant begin_write");
+    assert_eq!(code(&err), "55P03");
+    drop(first);
+    // 手放した後は再び取れる。
+    s.begin_write().expect("after release");
 }
 
 #[test]
 fn table_44_tenant_is_pinned_and_errors_do_not_leak() {
-    let s = store(DEFAULT_MAX_TEMP_BYTES_PER_SESSION);
-    let w = s.begin_write().unwrap();
+    let (tpl, _dir) = template();
+    let s = store(DEFAULT_MAX_TEMP_BYTES_PER_SESSION, &tpl);
     let other = "tenant-secret-b";
-    for err in [
-        w.insert_row(rel(1), other, 1, b"x")
-            .map(|_| ())
-            .unwrap_err(),
-        w.put_row(rel(1), other, 1, b"x").unwrap_err(),
-        w.delete_row(rel(1), other, 1).map(|_| ()).unwrap_err(),
-        w.get_row(rel(1), other, 1).map(|_| ()).unwrap_err(),
-    ] {
-        assert_eq!(code(&err), "XX000");
-        assert!(!format!("{err:?}{err}").contains(other));
-    }
-    w.commit().unwrap();
-    let r = s.begin_read().unwrap();
-    assert!(r.get_row(rel(1), other, 1).is_err());
-    assert!(r.scan_relation(rel(1), other).is_err());
+    let err = s.check_tenant(other).expect_err("other tenant");
+    assert_eq!(code(&err), "XX000");
+    assert!(!format!("{err:?}{err}").contains(other));
+    s.check_tenant(T).expect("owner");
 
     let mut session = SessionState::default();
-    session.temp_rows_or_init(T, 1024).expect("init");
-    assert!(session.temp_rows_or_init(other, 1024).is_err());
+    session.temp_rows_or_init(T, 1024, &tpl).expect("init");
+    assert!(session.temp_rows_or_init(other, 1024, &tpl).is_err());
 }
 
 /// テスト専用: `SessionState` が保持する `Arc` の弱参照を取る。
@@ -177,17 +136,15 @@ fn weak_of(s: &SessionState) -> std::sync::Weak<TempRowStore> {
 
 #[test]
 fn table_44_store_is_dropped_with_session_and_clones() {
+    let (tpl, _dir) = template();
     let mut session = SessionState::default();
-    assert!(session.temp_rows().is_none());
+    assert!(session.temp_rows_arc_for_test().is_none());
     // 遅延生成: clone しても生成されない。
-    assert!(session.clone().temp_rows().is_none());
+    assert!(session.clone().temp_rows_arc_for_test().is_none());
 
-    session.temp_rows_or_init(T, 1024 * 1024).expect("init");
-    {
-        let w = session.temp_rows().unwrap().begin_write().unwrap();
-        w.insert_row(rel(1), T, 1, b"row").unwrap();
-        w.commit().unwrap();
-    }
+    session
+        .temp_rows_or_init(T, 1024 * 1024, &tpl)
+        .expect("init");
     let rollback_copy = session.clone();
     let weak = weak_of(&session);
     drop(session);
@@ -209,10 +166,14 @@ fn table_44_persistent_db_and_data_dir_are_untouched() {
         for i in 0..3 {
             let storage = Storage::open(&db).expect("open");
             if with_temp && i == 2 {
-                let s = store(1024 * 1024);
-                let w = s.begin_write().unwrap();
-                w.insert_row(rel(1), T, 1, b"temp-only").unwrap();
-                w.commit().unwrap();
+                let tpl_dir = tempdir();
+                let tpl = EngineCore::from_storage(
+                    Storage::open(tpl_dir.db_path()).expect("open tpl"),
+                    Box::new(CpuScalarProvider),
+                );
+                let s = store(1024 * 1024, &tpl);
+                s.create_table(&schema("a")).unwrap();
+                insert(s.core().unwrap(), "a", 1, "temp-only").unwrap();
             }
             drop(storage);
         }
@@ -227,49 +188,46 @@ fn table_44_persistent_db_and_data_dir_are_untouched() {
 }
 
 #[test]
-fn table_44_read_txn_never_exposes_a_cache_snapshot() {
-    let s = store(1024);
-    let r = s.begin_read().unwrap();
-    assert!(ReadSource::snapshot(&r).is_none());
-}
-
-#[test]
 fn table_44_physical_backstop_fails_closed() {
+    let (tpl, _dir) = template();
     // 初期確保（約 1 MiB）の直後に数 MiB の物理上限を置き、論理上限は十分に大きくする。
-    let s = TempRowStore::with_limits(T, u64::MAX, 3 * 1024 * 1024).expect("store");
-    let chunk = vec![7u8; 64 * 1024];
+    let s = TempRowStore::with_limits(T, u64::MAX, 3 * 1024 * 1024, &tpl).expect("store");
+    s.create_table(&schema("a")).unwrap();
+    let chunk = "y".repeat(8 * 1024);
     let mut failed = false;
-    {
-        let w = s.begin_write().unwrap();
-        for i in 0..256u64 {
-            if w.insert_row(rel(1), T, i, &chunk).is_err() {
+    for i in 0..1024u64 {
+        match s.core() {
+            Ok(core) => {
+                if insert(core, "a", i, &chunk).is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            Err(_) => {
                 failed = true;
                 break;
             }
         }
-        failed |= w.commit().is_err();
     }
     assert!(failed, "physical growth must be refused");
     // 以後の操作はすべて fail-closed。
+    let err = s.core().err().expect("exhausted store");
+    assert_eq!(code(&err), "54000");
     assert!(s.begin_write().is_err());
-    assert!(s.begin_read().is_err());
 }
 
 #[test]
-fn table_44_memory_stays_bounded_by_churn() {
-    let s = store(DEFAULT_MAX_TEMP_BYTES_PER_SESSION);
-    let chunk = vec![1u8; 32 * 1024];
-    for _ in 0..20 {
-        let w = s.begin_write().unwrap();
-        for i in 0..32u64 {
-            w.put_row(rel(1), T, i, &chunk).unwrap();
-        }
-        w.commit().unwrap();
-    }
-    // 論理 1 MiB を 20 回書き換えても、解放ページが再利用されて物理長は数倍に収まる。
-    assert!(
-        s.physical_len() < 16 * 1024 * 1024,
-        "len={}",
-        s.physical_len()
-    );
+fn table_44_apply_on_commit_truncates_and_drops_in_one_txn() {
+    let (tpl, _dir) = template();
+    let s = store(DEFAULT_MAX_TEMP_BYTES_PER_SESSION, &tpl);
+    s.create_table(&schema("a")).unwrap();
+    s.create_table(&schema("b")).unwrap();
+    let core = s.core().unwrap();
+    insert(core, "a", 1, "aa").unwrap();
+    insert(core, "b", 1, "bb").unwrap();
+    s.apply_on_commit(&["a".to_string()], &["b".to_string()])
+        .unwrap();
+    // a は行だけ消え（同じ id を再挿入できる）、b は実体ごと消える。
+    insert(core, "a", 1, "again").unwrap();
+    assert_eq!(insert(core, "b", 1, "x"), Err("42P01".to_string()));
 }
