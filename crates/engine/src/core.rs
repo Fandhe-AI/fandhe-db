@@ -3784,12 +3784,43 @@ impl EngineCore {
         &self,
         e: crate::sql::allowlist::SqlSurfaceError,
     ) -> crate::sql::allowlist::SqlSurfaceError {
+        self.reclassify_write_to_view_error_for(None, e)
+    }
+
+    /// [`Self::reclassify_write_to_view_error`] の文種別つき版（TABLE-43 (3)・Issue #1670）。
+    /// `op` が `Some`（`INSERT`／`UPDATE`／`DELETE`）で対象がビューのとき、自動更新可能性を
+    /// `sql::view_updatable` で判定し、自動更新不可なら `55000`
+    /// （`ViewNotAutoUpdatable`）で拒否する。自動更新可能なビューは基表への書き換えが入る
+    /// まで（Issue #1671／#1672）従来どおり `42809`（fail-closed）。`op` が `None`
+    /// （`TRUNCATE`・`EXPLAIN` 系）は常に従来の `42809`。判定自体の失敗（破損 `XX000`・深さ超過
+    /// `54000` 等）はそのまま返し、「ビューではない」側へは倒さない。
+    fn reclassify_write_to_view_error_for(
+        &self,
+        op: Option<crate::sql::allowlist::ViewWriteOp>,
+        e: crate::sql::allowlist::SqlSurfaceError,
+    ) -> crate::sql::allowlist::SqlSurfaceError {
         if let crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name } = &e {
             // 索引名（TASK-206・INDEX-7、Issue #908）もビューと同じくテーブルと
             // relation 名前空間を共有する行を持たないオブジェクトのため、書き込み
             // 系 DML の対象にされた場合は `42809` へ揃える。
             let wrong_kind = match self.storage.view_definition(name) {
-                Ok(Some(_)) => true,
+                Ok(Some(_)) => {
+                    if let Some(op) = op {
+                        match crate::sql::view_updatable::view_updatability(&self.storage, name) {
+                            Ok(crate::sql::view_updatable::ViewUpdatability::NotAutoUpdatable(
+                                reason,
+                            )) => {
+                                return crate::sql::allowlist::SqlSurfaceError::ViewNotAutoUpdatable {
+                                    op,
+                                    reason,
+                                };
+                            }
+                            Ok(crate::sql::view_updatable::ViewUpdatability::AutoUpdatable) => {}
+                            Err(judge_err) => return judge_err,
+                        }
+                    }
+                    true
+                }
                 Ok(None) => match self.storage.index_exists(name) {
                     Ok(true) => true,
                     // matview（TABLE-42・Issue #1664）も行を直接書けないオブジェクト。表・ビュー・
@@ -4154,7 +4185,12 @@ impl EngineCore {
                 ledger_mode,
                 self.dml_limits.max_insert_rows_per_statement,
             )
-            .map_err(|e| self.reclassify_write_to_view_error(e))?;
+            .map_err(|e| {
+                self.reclassify_write_to_view_error_for(
+                    Some(crate::sql::allowlist::ViewWriteOp::Insert),
+                    e,
+                )
+            })?;
             return Ok(ParsedSql::Insert(stmt));
         }
 
@@ -4182,7 +4218,12 @@ impl EngineCore {
                 &storage_lookup,
                 ledger_mode,
             )
-            .map_err(|e| self.reclassify_write_to_view_error(e))?;
+            .map_err(|e| {
+                self.reclassify_write_to_view_error_for(
+                    Some(crate::sql::allowlist::ViewWriteOp::Delete),
+                    e,
+                )
+            })?;
             if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
                 self.check_partitioned_chunk(v.partitioned())?;
             }
@@ -4199,7 +4240,12 @@ impl EngineCore {
                 &storage_lookup,
                 ledger_mode,
             )
-            .map_err(|e| self.reclassify_write_to_view_error(e))?;
+            .map_err(|e| {
+                self.reclassify_write_to_view_error_for(
+                    Some(crate::sql::allowlist::ViewWriteOp::Update),
+                    e,
+                )
+            })?;
             if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
                 self.check_partitioned_chunk(v.partitioned())?;
             }

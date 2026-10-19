@@ -500,6 +500,44 @@ fn truncate_for_error(s: &str) -> String {
     }
 }
 
+/// ビューへの書き込み文の種別（TABLE-43・Issue #1670）。自動更新可能でないビューへの書き込みを
+/// `55000` で拒否するときの固定文言の選択にだけ使う（`core.rs` の書き込み経路が渡す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewWriteOp {
+    /// `INSERT`（`ON CONFLICT`・UPSERT を含む）。
+    Insert,
+    /// `UPDATE`。
+    Update,
+    /// `DELETE`。
+    Delete,
+}
+
+/// ビューが自動更新可能でない理由（TABLE-43・Issue #1670）。`sql::view_updatable` の判定結果で、
+/// wire 文言には出さない（固定文言のみ）。テストと将来の診断用に区別して保持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewNotUpdatableReason {
+    /// `SELECT DISTINCT`。
+    Distinct,
+    /// `GROUP BY`。
+    GroupBy,
+    /// `HAVING`。
+    Having,
+    /// `UNION`／`INTERSECT`／`EXCEPT`。
+    SetOperation,
+    /// `WITH`（CTE）。
+    With,
+    /// `LIMIT`／`OFFSET`。
+    LimitOffset,
+    /// 集計関数（`COUNT` 等）。
+    Aggregate,
+    /// ウィンドウ関数（`OVER`）。
+    Window,
+    /// 単一の表・ビューではない（`JOIN`）。
+    NotSingleRelation,
+    /// 下位の relation（ビュー連鎖の内側・matview）が自動更新可能でない。
+    UnderlyingNotUpdatable,
+}
+
 /// SQL 表層のエラー型。ERR-2 参照（docs/spec/04-behavior/error-format.md）。
 /// engine 全体の共通エラー型統合は他タスクの管轄のため、本モジュールローカルの
 /// 型として定義する。
@@ -640,6 +678,14 @@ pub enum SqlSurfaceError {
     /// 未実体化の MATERIALIZED VIEW を読んだ（`55000`。TABLE-42・Issue #1664）。
     /// 文言は固定で、名前・件数・他文脈の情報を含めない。
     MaterializedViewNotPopulated,
+    /// 自動更新可能でないビューへの `INSERT`／`UPDATE`／`DELETE`（`55000`。TABLE-43 (3)・
+    /// Issue #1670）。文言は文種別ごとの固定文言で、ビュー名・理由・本文を含めない。
+    ViewNotAutoUpdatable {
+        /// 拒否した書き込み文の種別。
+        op: ViewWriteOp,
+        /// 自動更新不可と判定した理由（wire へは出さない）。
+        reason: ViewNotUpdatableReason,
+    },
     /// 明示トランザクション（SQL-31・TASK-221）内で構文としては受理されるものの、
     /// 本実装がトランザクション文脈での実行に未対応な文（複数行/ファイル形/
     /// `ON CONFLICT` の `INSERT`・`UPDATE`・`DELETE`・`UPSERT`・COPY・既に書き込んだ
@@ -1197,7 +1243,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::NoActiveSqlTransaction => ErrorClass::NoActiveSqlTransaction,
             SqlSurfaceError::InFailedSqlTransaction => ErrorClass::InFailedSqlTransaction,
             SqlSurfaceError::LockNotAvailable => ErrorClass::LockNotAvailable,
-            SqlSurfaceError::MaterializedViewNotPopulated => {
+            SqlSurfaceError::MaterializedViewNotPopulated
+            | SqlSurfaceError::ViewNotAutoUpdatable { .. } => {
                 ErrorClass::ObjectNotInPrerequisiteState
             }
             SqlSurfaceError::TransactionFeatureNotSupported { .. } => {
@@ -1352,6 +1399,11 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::MaterializedViewNotPopulated => {
                 write!(f, "materialized view has not been populated")
             }
+            SqlSurfaceError::ViewNotAutoUpdatable { op, .. } => match op {
+                ViewWriteOp::Insert => write!(f, "cannot insert into view"),
+                ViewWriteOp::Update => write!(f, "cannot update view"),
+                ViewWriteOp::Delete => write!(f, "cannot delete from view"),
+            },
             SqlSurfaceError::TransactionFeatureNotSupported { detail } => {
                 write!(f, "not supported inside an explicit transaction: {detail}")
             }
