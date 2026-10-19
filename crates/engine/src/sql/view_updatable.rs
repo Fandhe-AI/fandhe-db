@@ -14,8 +14,8 @@
 //! （評価後射影形）が自動更新不可に対応する。不可の理由は格納本文のトークン列から分類し、
 //! 複数当てはまる場合の優先順位は固定する（決定性のため）。
 //!
-//! fail-closed: 連鎖の解決失敗（破損 `XX000`・深さ超過 `54000`・参照先未定義 `42P01`）は
-//! 握りつぶさずそのまま返し、「更新可能」にも「ビューではない」にも倒さない。
+//! fail-closed: 連鎖の解決失敗（破損 `XX000`・深さ超過 `54000`・参照先未定義のうち名前自体が非ビューのもの `42P01`）は
+//! 握りつぶさずそのまま返し（実在ビューの内側欠落は `55000` へ再分類）、「更新可能」にも「ビューではない」にも倒さない。
 
 use super::allowlist::{SqlSurfaceError, TableLookup, ViewNotUpdatableReason};
 use super::lexer::{Keyword, Token};
@@ -43,7 +43,25 @@ pub(crate) fn view_updatability(
     lookup: &impl TableLookup,
     name: &str,
 ) -> Result<ViewUpdatability, SqlSurfaceError> {
-    match resolve_from(lookup, name)? {
+    let resolved = match resolve_from(lookup, name) {
+        Ok(r) => r,
+        // 名前自体がビューとして実在するのに連鎖の内側（基表の欠落・ビュー経由の matview 基底）
+        // が解決できない場合、`42P01` のまま返すと実在ビューが欠落テーブル扱いになる。
+        // 書き込みは基表へ書き換えられないため自動更新不可（`55000`）へ再分類する（fail-closed）。
+        // 名前自体がビューでない場合は従来どおり `42P01` を伝播する。
+        Err(SqlSurfaceError::UndefinedTable { name: missing }) => {
+            return match lookup.view_definition(name)? {
+                Some(def) => {
+                    let reason = reason_from_body(&def.body_sql)
+                        .unwrap_or(ViewNotUpdatableReason::UnderlyingNotUpdatable);
+                    Ok(ViewUpdatability::NotAutoUpdatable(reason))
+                }
+                None => Err(SqlSurfaceError::UndefinedTable { name: missing }),
+            };
+        }
+        Err(e) => return Err(e),
+    };
+    match resolved {
         Resolved::View { .. } => Ok(ViewUpdatability::AutoUpdatable),
         Resolved::Buffered { .. } => {
             // 最も外側のビュー定義が無い（= matview を直接指した）場合は下位が更新不可。
@@ -303,6 +321,21 @@ mod tests {
             view_updatability(&lookup, "nope"),
             Err(SqlSurfaceError::UndefinedTable { .. })
         ));
+    }
+
+    /// 実在ビューの内側の基表が欠落している場合は `42P01` ではなく自動更新不可（`55000` 相当）。
+    #[test]
+    fn existing_view_with_missing_base_is_not_auto_updatable() {
+        let lookup = MapLookup(vec![
+            ("v_missing", def("gone", "SELECT * FROM gone")),
+            ("v_outer", def("v_missing", "SELECT * FROM v_missing")),
+        ]);
+        for name in ["v_missing", "v_outer"] {
+            assert!(matches!(
+                view_updatability(&lookup, name),
+                Ok(ViewUpdatability::NotAutoUpdatable(_))
+            ));
+        }
     }
 
     /// LIMIT のない JOIN 本文は理由分類のみ単体で確認する（実カタログでは LIMIT 必須で到達しない）。
