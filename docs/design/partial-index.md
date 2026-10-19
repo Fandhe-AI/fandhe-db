@@ -141,3 +141,25 @@ spec 本文は転記しない。実装は `sql::index_predicate`（束縛・評�
 含意判定 #1655・プランナ選択と EXPLAIN #1656・部分 UNIQUE の強制 #1657・素の列要素のキー構造・部分索引への
 `COLLATE`／matview／`USING hnsw`・述語が参照する列の `ALTER COLUMN TYPE` の再束縛。`ON CONFLICT (...) WHERE` は
 SQL-49 ポインタのとおり `42601` のまま。
+
+## Issue #1655（述語の含意判定）
+
+INDEX-11 ポインタ。`sql::index_implication::query_implies_partial_predicate` は「クエリの `WHERE`（Q）が TRUE の
+行は索引述語（P）も TRUE」を保守的に証明する純関数で、プランナへは未結線（#1656 が呼ぶ）。SQL 表層・SQLSTATE・
+EXPLAIN・結果は変えない。公開 API の追加なし（`pub(crate)`）。
+
+| 項目 | 判断 |
+| ---- | ---- |
+| 判定の層 | 束縛済み表現（`MetadataFilter`・`BoundExpr`・`BoundOrGroup`）。両辺が同じ `bind_where_predicates` を通るため列添字・型付きリテラル・書き換えが一致し、評価器との意味論のずれが無い |
+| 既定値 | P の未認識の項は「含意しない」。Q の未認識の項と Q の `OR` 群は無視（条件を落とすと Q は弱くなるだけ）。P の `OR`・`NOT`・`LIKE`・式は Q に構造的に同一の項があるときだけ含意 |
+| 認識する原子 | 等価・範囲・`IN`・`BETWEEN`・`IS [NOT] NULL`（`CHAR(n)` 列を除く）、整数列と有限の数値定数の比較（逆向き可）、疑似列 `id` の比較。Q の原子は列ごとに下限・上限・等価集合・所属集合・NULL 状態へ畳み、P の各項を照合する |
+| 推論に使わない | 整数性（`n > 4` は `n >= 5` を含意しない）、浮動小数列、`CHAR(n)`、TEXT の範囲比較、照合依存の比較。結果は常に正しい（索引を使わないだけ） |
+| NULL | 等価・範囲・所属は非 NULL を含意する（P の `IS NOT NULL` を満たす）。P の `IS NULL` は Q の `IS NULL` でのみ満たす |
+| 値の比較 | 評価器と同じ比較（`NUMERIC` は `numeric::cmp_exact`。`1.0` と `1.00` は同値）。種別違い・比較不能は含意しない |
+| 作業予算 | 比較 1 回を 1 単位として上限（既定 2^18）を設け、超過は `false`（未信頼入力による CPU 増幅の防止） |
+| 検証 | 値グリッド上のオラクルテスト（含意と判定した組は、実評価器で Q が TRUE の行すべてで P も TRUE）と明示の正例・負例 |
+
+申し送り（Issue #1656）: 両辺を同じスキーマ世代で束縛する（索引側は `rebind_stored_index_predicate` の結果の
+`BoundIndexPredicate::conjunction`）。プリペアド文は具体値で束縛した後に毎回判定し、describe 用ダミー値での判定や
+判定結果の使い回しをしない。`false` のときは従来の経路へ。浮動小数・`CHAR(n)`・TEXT 範囲・`OR`/`NOT` の推論拡張は、
+オラクルテストを伴う別 Issue で扱う。
