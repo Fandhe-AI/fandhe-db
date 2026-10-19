@@ -456,3 +456,31 @@ fn wire_create_or_replace_view_compatibility() {
     expect_error_response_with_sqlstate(&mut stream, "42809");
     read_ready_for_query(&mut stream);
 }
+
+/// 依存ビューを持つビューの `CREATE OR REPLACE VIEW`（TABLE-41 (3)・Issue #1661）が wire 越しに
+/// 通る。互換な置換は `CREATE VIEW`、依存ビューの列追加ゲートに当たる置換は SQLSTATE `0A000`
+/// の `ErrorResponse`（意味論の確定オラクルは `crates/engine/tests/table41_view_or_replace.rs`）。
+#[test]
+fn wire_create_or_replace_view_with_dependent_views() {
+    let (core, _guard) = new_core_with_docs_table();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    for sql in [
+        "CREATE VIEW v1 AS SELECT lang FROM docs",
+        "CREATE VIEW v2 AS SELECT * FROM v1 UNION ALL SELECT lang FROM docs",
+        "CREATE OR REPLACE VIEW v1 AS SELECT lang FROM docs WHERE lang = 'ja'",
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), "CREATE VIEW", "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    send_simple_query(
+        &mut stream,
+        "CREATE OR REPLACE VIEW v1 AS SELECT lang, id FROM docs",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+}

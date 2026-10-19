@@ -489,7 +489,7 @@ TABLE-41 (2) のポインタ（TABLE-18 の RLS 契約は変えない）。兄�
   到達ありとみなす（fail-closed）
 - ビューは行ストア・世代を持たないため `bump_table_generation_in_txn` は呼ばない
 
-### 暫定制限（Issue #1661 で解除）
+### 暫定制限（Issue #1661 で解除済み。以下は #1660 時点の記録）
 
 - 置換対象に依存するビューがある場合は `0A000` で拒否し、状態を変えない（依存ビューの再検証と
   途中失敗時の復旧は #1661）
@@ -497,3 +497,55 @@ TABLE-41 (2) のポインタ（TABLE-18 の RLS 契約は変えない）。兄�
   限られる（#1661 で txn 内検査化を検討）
 - 公開型の変更: `CatalogError::{ViewDefinitionChanged, ViewReferenceCycle}`・
   `SqlSurfaceError::InvalidViewReplacement`・`ValidatedCreateView::or_replace` を追加（破壊的変更）
+
+## Issue #1661 追記: `OR REPLACE` 時の依存ビュー再検証と原子的置換
+
+TABLE-41 (2)(3) のポインタ（TABLE-18 の RLS 契約は変えない）。#1660 の「暫定制限」（依存ビューがあれば
+`0A000`）を解除した。
+
+### 原子性
+
+- 置換は単一 write txn。新定義を未 commit のまま insert し、同じ txn で依存ビュー（推移閉包）を
+  再検証してから commit する（redb は同一 txn 内の自身の書き込みを読める）。再検証が失敗すれば txn は
+  commit されず破棄され、旧定義がバイト列ごと残る。クラッシュ時は redb の commit 原子性に依存し、追加の
+  復旧機構は持たない（`table41_view_or_replace_crash_atomicity.rs` が SIGKILL で確認）
+- 閉包は `dependent_views_closure_in_txn`（全定義を `MAX_VIEWS` 上限付きで 1 回走査し、
+  `view_def_dependence_on` の逆辺を再帰なしの BFS で辿る。本文を読めないビューは依存ありとみなして拒否）
+
+### 再検証の 2 段（`revalidate_dependent_views_in_txn`）
+
+1. 作成時と同じ `validate_new_view_body_in_txn`（参照先の存在・評価後射影形／別名付きビューへの到達時の
+   再検証・ネスト深さ `54000`）
+2. 参照時と同じ `sql::view::resolve_from`（単純形の連鎖の列スコープ・別名の公開名重複）
+
+形・列の破綻は `0A000`（`CatalogError::DependentViewsExist`。公開 enum は変えず、文言は固定英文で
+置換対象名以外を含めない）。深さ超過は `54000`。カタログ破損・ストレージエラーはそのまま伝播する。
+
+### `SELECT *` と列追加ゲート
+
+- ビューの `*` は参照時に動的展開されるため、`v2 AS SELECT * FROM v1` は v1 に末尾列を足すと v2 の
+  出力も末尾が増える（既存列の名前・型・順序は不変のため受理）
+- ただし集合演算の枝・部分クエリ・CTE の中で `*` が置換対象へ届くと、列数が変わって参照時に壊れる。
+  この壊れ方は上の 2 段では検出できないため、新定義が列を追加する置換（`appends_columns`。
+  `EngineCore` が互換検査通過後に算出して渡す）では、閉包内に本文の `SELECT` が 2 個以上のビュー、または
+  列別名付きの評価後射影形ビューがあれば保守的に `0A000` で拒否する
+- 公開 API `Storage::create_or_replace_view` は互換性検査を行わないため、fail-closed として常に
+  `appends_columns = true` で扱う
+- 既知の過剰拒否: 明示列だけの集合演算でも、列追加の置換は拒否される
+
+### 判定順序の追加分
+
+… 互換性 `42P16` → txn 内の CAS・指紋照合 → 新本文の検証 → 未 commit の insert → 依存ビューの再検証
+（`54000`／`0A000`）→ 列追加ゲート（`0A000`）→ commit。
+
+### TOCTOU
+
+互換性検査（Describe）は core に残す。検査が読んだ relation は #1660 の CAS と指紋が txn 内で照合済みで、
+依存ビュー側は本 Issue で txn 内検査になる。検査後に作られた依存ビューも commit 時の閉包に入るため、
+新たな窓は生じない。
+
+### 対象外
+
+- 新状態に対して依存ビューを Describe する完全な再検証（列追加ゲートの過剰拒否の解消）
+- 照合順序の比較、静的な型を持たない列、ALTER VIEW、TABLE-42／43
+- prepared statement の列メタデータ（`*` 依存ビューの列増加）
