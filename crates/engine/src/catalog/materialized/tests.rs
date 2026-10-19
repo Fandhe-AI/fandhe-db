@@ -1,7 +1,8 @@
-//! TABLE-42 (2) のポインタ。matview の定義 codec・文脈単位の実体ストア・名前空間・暫定ガードを
-//! Storage 水準で検証する（SQL 表層の配線は後続 Issue #1664〜#1667）。
+//! TABLE-42 (2)(5)(6) のポインタ。matview の定義 codec・文脈単位の実体ストア・名前空間・
+//! 依存ガード・索引宣言・DROP を Storage 水準で検証する（SQL 表層の配線は `sql::ddl`・`core.rs`、
+//! Issue #1664〜#1667）。
 use super::*;
-use crate::catalog::{ArrayType, DropBehavior, EnumTypeDef, IndexDef, IndexKind};
+use crate::catalog::{ArrayType, CascadedObject, DropBehavior, EnumTypeDef, IndexDef, IndexKind};
 use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
 use redb::TableHandle;
 
@@ -402,9 +403,11 @@ fn namespace_is_shared_with_tables_views_and_indexes() {
         IndexKind::Scalar,
         vec!["label".to_string()],
     );
+    // matview への索引は宣言できる（TABLE-42 (5)、Issue #1667）。
+    s.create_index(&idx).expect("index on matview");
     assert!(matches!(
         s.create_index(&idx),
-        Err(CatalogError::WrongObjectKind(_))
+        Err(CatalogError::IndexAlreadyExists(_))
     ));
     let idx2 = IndexDef::new(
         "mv".to_string(),
@@ -419,31 +422,28 @@ fn namespace_is_shared_with_tables_views_and_indexes() {
 }
 
 #[test]
-fn referenced_relations_cannot_be_dropped_or_renamed() {
+fn referenced_relations_restrict_blocks_drop_and_cascade_removes_dependents() {
     let (_g, _p, s) = open("mv-guard");
     s.create_materialized_view(&def("mv")).expect("create");
-    for behavior in [DropBehavior::Restrict, DropBehavior::Cascade] {
-        assert!(matches!(
-            s.drop_tables(&["base".to_string()], false, behavior),
-            Err(CatalogError::DependentViewsExist(_))
-        ));
-    }
+    // RESTRICT は参照元の表の削除を拒否する。改名は追随が入るまで拒否のまま。
+    assert!(matches!(
+        s.drop_tables(&["base".to_string()], false, DropBehavior::Restrict),
+        Err(CatalogError::DependentViewsExist(_))
+    ));
     assert!(s.alter_table_rename("base", "renamed").is_err());
     assert!(s.relation_name_exists("base").expect("e"));
-    // ビューを参照元にした場合もビューの DROP を拒否する。
+    // ビューを参照元にした場合もビューの RESTRICT 削除を拒否する。
     s.create_view("v", "base", "SELECT embedding FROM base")
         .expect("view");
     let mut on_view = def("mv_v");
     on_view.base_relations = vec!["v".to_string()];
     s.create_materialized_view(&on_view)
         .expect("create on view");
-    for behavior in [DropBehavior::Restrict, DropBehavior::Cascade] {
-        assert!(matches!(
-            s.drop_view_with_behavior("v", behavior),
-            Err(CatalogError::DependentViewsExist(_))
-        ));
-    }
-    // matview を参照する matview がある間は DROP できない。
+    assert!(matches!(
+        s.drop_view_with_behavior("v", DropBehavior::Restrict),
+        Err(CatalogError::DependentViewsExist(_))
+    ));
+    // matview を参照する matview がある間は RESTRICT で DROP できない。
     let mut on_mv = def("mv_mv");
     on_mv.base_relations = vec!["mv".to_string()];
     s.create_materialized_view(&on_mv)
@@ -452,13 +452,46 @@ fn referenced_relations_cannot_be_dropped_or_renamed() {
         s.drop_materialized_view("mv"),
         Err(CatalogError::DependentViewsExist(_))
     ));
+    // 拒否は副作用なし。
+    for name in ["base", "v", "mv", "mv_v", "mv_mv"] {
+        assert!(s.relation_name_exists(name).expect("exists"), "{name}");
+    }
+
+    // CASCADE: ビューの削除は、それを読む matview を連鎖削除する。
+    let cascaded = s
+        .drop_view_with_behavior("v", DropBehavior::Cascade)
+        .expect("drop view cascade");
+    assert_eq!(
+        cascaded,
+        vec![CascadedObject::MaterializedView {
+            name: "mv_v".to_string()
+        }]
+    );
+    assert!(!s.relation_name_exists("v").expect("v"));
+    assert!(!s.relation_name_exists("mv_v").expect("mv_v"));
+    // CASCADE: 表の削除は、直接・推移の matview（依存する側が先）を連鎖削除する。
+    let report = s
+        .drop_tables(&["base".to_string()], false, DropBehavior::Cascade)
+        .expect("drop table cascade");
+    assert_eq!(
+        report.cascaded,
+        vec![
+            CascadedObject::MaterializedView {
+                name: "mv_mv".to_string()
+            },
+            CascadedObject::MaterializedView {
+                name: "mv".to_string()
+            },
+        ]
+    );
+    for name in ["base", "mv", "mv_mv"] {
+        assert!(!s.relation_name_exists(name).expect("gone"), "{name}");
+    }
 }
 
 #[test]
-fn cascade_closure_views_referenced_by_matview_are_rejected() {
+fn cascade_closure_drops_matviews_through_view_chains() {
     // 表 base -> ビュー v1 -> ビュー v2 -> matview mv_v2。
-    // 指定対象（base／v1）は matview の直接の参照元ではないが、CASCADE の閉包に含まれる
-    // v2 を削除すると mv_v2 の参照先が欠落するため、削除前に fail-closed で拒否する。
     let (_g, _p, s) = open("mv-cascade-closure");
     s.create_view("v1", "base", "SELECT embedding FROM base")
         .expect("v1");
@@ -468,22 +501,33 @@ fn cascade_closure_views_referenced_by_matview_are_rejected() {
     on_v2.base_relations = vec!["v2".to_string()];
     s.create_materialized_view(&on_v2).expect("create matview");
 
-    // 表 -> ビュー -> matview 経路（DROP TABLE CASCADE）。
-    assert!(matches!(
-        s.drop_tables(&["base".to_string()], false, DropBehavior::Cascade),
-        Err(CatalogError::DependentViewsExist(_))
-    ));
-    // ビュー -> ビュー -> matview 経路（DROP VIEW CASCADE）。
-    assert!(matches!(
-        s.drop_view_with_behavior("v1", DropBehavior::Cascade),
-        Err(CatalogError::DependentViewsExist(_))
-    ));
-    // 拒否は副作用なし: 表・ビュー・matview がすべて残る。
-    assert!(s.relation_name_exists("base").expect("base"));
-    assert!(s.relation_name_exists("v1").expect("v1"));
-    assert!(s.relation_name_exists("v2").expect("v2"));
+    // RESTRICT は閉包ではなく直接の依存で拒否する（表 -> v1、ビュー v1 -> v2）。副作用なし。
+    assert!(s
+        .drop_tables(&["base".to_string()], false, DropBehavior::Restrict)
+        .is_err());
+    assert!(s
+        .drop_view_with_behavior("v1", DropBehavior::Restrict)
+        .is_err());
     assert!(s.relation_name_exists("mv_v2").expect("mv"));
+
+    // ビュー -> ビュー -> matview 経路（DROP VIEW CASCADE）。matview はそれを読むビューより先に消える。
+    let cascaded = s
+        .drop_view_with_behavior("v1", DropBehavior::Cascade)
+        .expect("cascade view");
+    let pos = |o: &CascadedObject| cascaded.iter().position(|c| c == o).expect("present");
+    assert!(
+        pos(&CascadedObject::MaterializedView {
+            name: "mv_v2".to_string()
+        }) < pos(&CascadedObject::View {
+            name: "v2".to_string()
+        })
+    );
+    assert!(s.relation_name_exists("base").expect("base"));
+    for name in ["v1", "v2", "mv_v2"] {
+        assert!(!s.relation_name_exists(name).expect("gone"), "{name}");
+    }
 }
+
 /// 定義と全文脈の実体を 1 つの write txn で作る（TABLE-42 (2)(3)・Issue #1664）。commit 前に
 /// 失敗（行数超過・文脈キー重複・列に合わない行・名前衝突）すれば何も残らない。
 fn create_with_entities(
@@ -700,4 +744,226 @@ fn streamed_refresh_unpopulate_and_missing_definition() {
         begin_streamed_refresh_in_txn(&txn, "nope"),
         Err(CatalogError::ViewNotFound(_))
     ));
+}
+
+fn scalar_index(name: &str, table: &str, cols: &[&str]) -> IndexDef {
+    IndexDef::new(
+        name.to_string(),
+        table.to_string(),
+        IndexKind::Scalar,
+        cols.iter().map(|c| c.to_string()).collect(),
+    )
+}
+
+fn names(v: &[&str]) -> Vec<String> {
+    v.iter().map(|n| n.to_string()).collect()
+}
+
+#[test]
+fn matview_index_declaration_rules() {
+    let (_g, _p, s) = open("mv-index-rules");
+    s.create_materialized_view(&def("mv")).expect("create");
+    let gen_before = s.table_generation("mv").expect("gen");
+    s.create_index(&scalar_index("ix", "mv", &["label", "n"]))
+        .expect("scalar index");
+    assert!(s.table_generation("mv").expect("gen") > gen_before);
+    // 名前衝突（索引・表・matview）は IndexAlreadyExists。
+    for taken in ["ix", "base", "mv"] {
+        assert!(matches!(
+            s.create_index(&scalar_index(taken, "mv", &["label"])),
+            Err(CatalogError::IndexAlreadyExists(_))
+        ));
+    }
+    // matview に暗黙の id 列は無い。
+    assert!(matches!(
+        s.create_index(&scalar_index("ix_id", "mv", &["id"])),
+        Err(CatalogError::ColumnNotFound(_))
+    ));
+    assert!(matches!(
+        s.create_index(&scalar_index("ix_nope", "mv", &["nope"])),
+        Err(CatalogError::ColumnNotFound(_))
+    ));
+    // HNSW は対象外（TABLE-42 (6)）。
+    let hnsw = IndexDef::new(
+        "ix_h".to_string(),
+        "mv".to_string(),
+        IndexKind::Hnsw,
+        vec!["label".to_string()],
+    );
+    assert!(matches!(
+        s.create_index(&hnsw),
+        Err(CatalogError::IndexKindMismatch(_))
+    ));
+    // 照合を持てない型への COLLATE。
+    let collated = scalar_index("ix_c", "mv", &["n"])
+        .with_column_collations(vec![Some(crate::collation::Collation::C)]);
+    assert!(matches!(
+        s.create_index(&collated),
+        Err(CatalogError::IndexCollationNotSupported(_))
+    ));
+    let listed: Vec<String> = s
+        .list_indexes()
+        .expect("list")
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert_eq!(listed, vec!["ix".to_string()]);
+    // 索引は DROP INDEX で外せる。
+    s.drop_index("ix").expect("drop index");
+    assert!(s.list_indexes().expect("list").is_empty());
+}
+
+#[test]
+fn unique_index_is_enforced_per_context() {
+    let (_g, _p, s) = open("mv-index-unique");
+    s.create_materialized_view(&def("mv")).expect("create");
+    // 文脈 a は label 重複なし、文脈 b は a と同じキーを 1 件ずつ持つ（文脈内では一意）。
+    s.replace_materialized_view_entities(
+        "mv",
+        &[
+            (ctx("a"), vec![row("k", 1), row("j", 2)]),
+            (ctx("b"), vec![row("k", 3)]),
+        ],
+        10,
+    )
+    .expect("replace");
+    let unique = scalar_index("ux", "mv", &["label"]).with_unique(true);
+    s.create_index(&unique)
+        .expect("文脈をまたぐ同値は重複ではない");
+    // NULL は distinct。
+    let nulls = vec![
+        vec![Value::Null, Value::Integer(1)],
+        vec![Value::Null, Value::Integer(2)],
+    ];
+    s.replace_materialized_view_entities("mv", &[(ctx("a"), nulls)], 10)
+        .expect("NULL は重複しない");
+    // 書き込みプリミティブは文脈内の重複を拒否し、旧実体を残す。
+    let err = s
+        .replace_materialized_view_entities(
+            "mv",
+            &[(ctx("a"), vec![row("dup", 1), row("dup", 2)])],
+            10,
+        )
+        .expect_err("duplicate");
+    assert!(matches!(err, CatalogError::UniqueConstraintViolation));
+    assert_eq!(
+        s.read_materialized_view("mv", &ctx("a"))
+            .unwrap()
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+    // 逐次書き込みプリミティブも同じ。
+    let write_txn = s.begin_write_txn().expect("txn");
+    let mut seen = Vec::new();
+    let d = def("mv");
+    let res = write_context_entity_in_txn(
+        &write_txn,
+        &d,
+        &ctx("z"),
+        &[row("x", 1), row("x", 2)],
+        &mut seen,
+        10,
+    );
+    assert!(matches!(res, Err(CatalogError::UniqueConstraintViolation)));
+    drop(write_txn);
+
+    // 既存実体に重複があれば UNIQUE 索引の作成は拒否され、宣言は残らない。
+    s.drop_index("ux").expect("drop");
+    s.replace_materialized_view_entities(
+        "mv",
+        &[
+            (ctx("a"), vec![row("k", 1), row("k", 2)]),
+            (ctx("b"), vec![row("q", 3)]),
+        ],
+        10,
+    )
+    .expect("replace");
+    let err = s
+        .create_index(&scalar_index("ux2", "mv", &["label"]).with_unique(true))
+        .expect_err("duplicate in context a");
+    assert!(matches!(err, CatalogError::UniqueConstraintViolation));
+    assert!(s.list_indexes().expect("list").is_empty());
+}
+
+#[test]
+fn drop_materialized_views_resolution_atomicity_and_cleanup() {
+    let (_g, path, s) = open("mv-drop-many");
+    s.create_materialized_view(&def("mv1")).expect("mv1");
+    s.create_materialized_view(&def("mv2")).expect("mv2");
+    s.replace_materialized_view_entities("mv1", &[(ctx("a"), vec![row("a1", 1)])], 10)
+        .expect("fill");
+    s.create_index(&scalar_index("ux", "mv1", &["label"]).with_unique(true))
+        .expect("index");
+    s.create_view("v", "base", "SELECT embedding FROM base")
+        .expect("view");
+
+    // 1 件でも失敗すれば何も消えない（不在・種別違い）。
+    assert!(matches!(
+        s.drop_materialized_views(&names(&["mv1", "ghost"]), false, DropBehavior::Restrict),
+        Err(CatalogError::ViewNotFound(_))
+    ));
+    for bad in ["base", "v", "ux"] {
+        for if_exists in [false, true] {
+            assert!(matches!(
+                s.drop_materialized_views(&names(&["mv1", bad]), if_exists, DropBehavior::Restrict),
+                Err(CatalogError::WrongObjectKind(_))
+            ));
+        }
+    }
+    assert!(s.relation_name_exists("mv1").expect("mv1"));
+    // IF EXISTS は不在だけを skip し、全件 skip は副作用なし。
+    let gen = s.table_generation("mv2").expect("gen");
+    let report = s
+        .drop_materialized_views(&names(&["ghost"]), true, DropBehavior::Restrict)
+        .expect("skip");
+    assert_eq!((report.dropped, report.skipped.len()), (0, 1));
+    assert_eq!(s.table_generation("mv2").expect("gen"), gen);
+    // 重複指定は除去され、複数を 1 回で消せる。
+    let report = s
+        .drop_materialized_views(
+            &names(&["mv1", "ghost", "mv2", "mv1"]),
+            true,
+            DropBehavior::Restrict,
+        )
+        .expect("drop many");
+    assert_eq!(report.dropped, 2);
+    assert_eq!(report.skipped, vec!["ghost".to_string()]);
+    assert!(s.list_indexes().expect("list").is_empty());
+    assert!(s.materialized_view_definition("mv1").unwrap().is_none());
+    assert!(!table_names(&s)
+        .iter()
+        .any(|t| t.contains("matview_rows/mv1")));
+    // 同名で作り直すと実体も索引宣言も引き継がない。
+    s.create_materialized_view(&def("mv1")).expect("recreate");
+    assert!(s
+        .read_materialized_view("mv1", &ctx("a"))
+        .unwrap()
+        .is_none());
+    s.create_index(&scalar_index("ux", "mv1", &["label"]).with_unique(true))
+        .expect("索引名を再利用できる");
+    drop(s);
+    // 再オープン後も削除状態が保たれる。
+    let s = Storage::open(&path).expect("reopen");
+    assert!(s.materialized_view_definition("mv2").unwrap().is_none());
+}
+
+#[test]
+fn drop_materialized_views_restrict_ignores_dependents_in_the_same_statement() {
+    let (_g, _p, s) = open("mv-drop-same-stmt");
+    s.create_materialized_view(&def("mv")).expect("mv");
+    let mut on_mv = def("mv_mv");
+    on_mv.base_relations = vec!["mv".to_string()];
+    s.create_materialized_view(&on_mv).expect("mv_mv");
+    assert!(matches!(
+        s.drop_materialized_views(&names(&["mv"]), false, DropBehavior::Restrict),
+        Err(CatalogError::DependentViewsExist(_))
+    ));
+    // 並べた名前どうしの依存は依存に数えない。
+    let report = s
+        .drop_materialized_views(&names(&["mv", "mv_mv"]), false, DropBehavior::Restrict)
+        .expect("both");
+    assert_eq!(report.dropped, 2);
+    assert!(report.cascaded.is_empty());
 }

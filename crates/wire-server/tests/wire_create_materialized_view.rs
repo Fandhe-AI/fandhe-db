@@ -309,3 +309,55 @@ fn wire_refresh_with_no_data_then_read_is_55000() {
     let (bob_ids, _) = read_ids(&mut bob, "SELECT id FROM mv LIMIT 10");
     assert_eq!(bob_ids, vec!["3".to_string()]);
 }
+
+/// matview への索引と `DROP MATERIALIZED VIEW`（TABLE-42 (5)・Issue #1667）の CommandComplete タグ・
+/// 権限ゲート・他テナント不可視。意味論は `crates/engine/tests/table42_matview_index_drop.rs`
+/// が確定オラクル。
+#[test]
+fn wire_index_and_drop_tags_permission_gate_and_other_tenants_see_the_drop() {
+    let (addr, _guard) = spawn("wire-mv-index-drop");
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    insert(&mut alice, 1, "ja");
+    insert(&mut bob, 2, "en");
+
+    send_simple_query(
+        &mut alice,
+        "CREATE MATERIALIZED VIEW mv AS SELECT id, lang FROM docs",
+    );
+    assert_eq!(read_command_complete(&mut alice), "SELECT 1");
+    read_ready_for_query(&mut alice);
+
+    // 索引の作成タグ。DDL 権限の無い bob は存在の有無によらず 42501。
+    send_simple_query(&mut alice, "CREATE UNIQUE INDEX ux_id ON mv (id)");
+    assert_eq!(read_command_complete(&mut alice), "CREATE INDEX");
+    read_ready_for_query(&mut alice);
+    for sql in [
+        "CREATE INDEX ix_b ON mv (lang)",
+        "DROP MATERIALIZED VIEW mv",
+        "DROP MATERIALIZED VIEW ghost",
+    ] {
+        send_simple_query(&mut bob, sql);
+        expect_error_response_with_sqlstate(&mut bob, "42501");
+        read_ready_for_query(&mut bob);
+    }
+    // 索引があっても bob は自分の文脈の行だけを読む。
+    let (bob_ids, _) = read_ids(&mut bob, "SELECT id FROM mv LIMIT 100");
+    assert_eq!(bob_ids, vec!["2".to_string()]);
+
+    // DROP のタグ。依存する表の RESTRICT 削除は 2BP01。
+    send_simple_query(&mut alice, "DROP TABLE docs");
+    expect_error_response_with_sqlstate(&mut alice, "2BP01");
+    read_ready_for_query(&mut alice);
+    send_simple_query(&mut alice, "DROP MATERIALIZED VIEW mv");
+    assert_eq!(read_command_complete(&mut alice), "DROP MATERIALIZED VIEW");
+    read_ready_for_query(&mut alice);
+    // 作成していない bob の接続でも、削除後は 42P01（55000 ではない）。
+    send_simple_query(&mut bob, "SELECT id FROM mv LIMIT 10");
+    expect_error_response_with_sqlstate(&mut bob, "42P01");
+    read_ready_for_query(&mut bob);
+    // IF EXISTS の no-op も固定タグ。
+    send_simple_query(&mut alice, "DROP MATERIALIZED VIEW IF EXISTS mv");
+    assert_eq!(read_command_complete(&mut alice), "DROP MATERIALIZED VIEW");
+    read_ready_for_query(&mut alice);
+}
