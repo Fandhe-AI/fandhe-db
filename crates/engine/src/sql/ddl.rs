@@ -2368,6 +2368,43 @@ pub(crate) fn map_create_matview_error(e: CatalogError) -> SqlSurfaceError {
     }
 }
 
+/// `REFRESH MATERIALIZED VIEW ...`（TABLE-42・Issue #1665）の成功応答。
+///
+/// テナント境界（P0）: 件数を運ばない（pg の固定タグ `REFRESH MATERIALIZED VIEW` に件数は無く、
+/// 他文脈の件数を DDL 権限を持つ主体へ返せない構造にする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshMaterializedViewOutcome {
+    /// `WITH DATA` で再実体化したか（`WITH NO DATA` では偽）。
+    pub(crate) populated: bool,
+}
+
+impl RefreshMaterializedViewOutcome {
+    /// 再実体化を行ったか（`WITH NO DATA` なら偽）。
+    pub fn populated(&self) -> bool {
+        self.populated
+    }
+}
+
+/// `CatalogError` を `REFRESH MATERIALIZED VIEW`（TABLE-42・Issue #1665）の SQL 表層の契約へ写像する。
+/// 不存在 `42P01`、種別違い `42809`、行数上限 `54000`、書き込みゲート待機の超過 `55P03`。
+/// 文言に他テナントの情報・内部詳細を含めない。
+pub(crate) fn map_refresh_matview_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::ViewNotFound(name) | CatalogError::TableNotFound(name) => {
+            SqlSurfaceError::UndefinedTable { name }
+        }
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        CatalogError::Invalid(_) => SqlSurfaceError::feature_not_supported(
+            "materialized view definition or data cannot be stored",
+        ),
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "REFRESH MATERIALIZED VIEW failed".to_string(),
+        },
+    }
+}
+
 /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）の成功応答。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropViewOutcome {

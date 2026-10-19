@@ -891,6 +891,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
                 "CREATE MATERIALIZED VIEW".to_string()
             },
         },
+        // TABLE-42（Issue #1665）: REFRESH は件数を持たない固定タグ（他文脈の件数を運べない）。
+        SqlOutcome::RefreshMaterializedView(_) => OutcomeResponse::Command {
+            tag: "REFRESH MATERIALIZED VIEW".to_string(),
+        },
         // TASK-206・INDEX-7・SQL-23（Issue #908）: 索引宣言 DDL も件数を持たない
         // pg 互換の固定タグへ整形する（`CREATE VIEW`／`DROP VIEW` と同じ設計）。
         SqlOutcome::CreateIndex(_) => OutcomeResponse::Command {

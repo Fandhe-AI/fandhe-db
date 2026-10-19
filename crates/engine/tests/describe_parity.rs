@@ -74,6 +74,7 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::AlterTable(_)
         | SqlOutcome::CreateView(_)
         | SqlOutcome::CreateMaterializedView(_)
+        | SqlOutcome::RefreshMaterializedView(_)
         | SqlOutcome::DropView(_)
         | SqlOutcome::CreateIndex(_)
         | SqlOutcome::DropIndex(_)

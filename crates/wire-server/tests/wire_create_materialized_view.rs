@@ -241,3 +241,71 @@ fn wire_extended_query_reads_a_materialized_view() {
     assert_eq!(data_rows, 1);
     assert_eq!(tag, "SELECT 1");
 }
+
+/// REFRESH（Issue #1665）: タグは件数を持たない固定の `REFRESH MATERIALIZED VIEW`。REFRESH 後は
+/// 作成者でない別テナントの接続でも、更新後の自分の文脈の実体を読める。
+#[test]
+fn wire_refresh_tag_and_other_tenants_read_refreshed_rows() {
+    let (addr, _guard) = spawn("wire-mv-refresh");
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    insert(&mut alice, 1, "ja");
+    insert(&mut bob, 3, "ja");
+    send_simple_query(
+        &mut alice,
+        "CREATE MATERIALIZED VIEW mv AS SELECT id FROM docs",
+    );
+    assert_eq!(read_command_complete(&mut alice), "SELECT 1");
+    read_ready_for_query(&mut alice);
+
+    insert(&mut bob, 4, "en");
+    // REFRESH 前の bob は旧実体（1 行）。
+    let (bob_ids, _) = read_ids(&mut bob, "SELECT id FROM mv LIMIT 100");
+    assert_eq!(bob_ids, vec!["3".to_string()]);
+
+    // DDL 権限の無い bob は 42501。
+    send_simple_query(&mut bob, "REFRESH MATERIALIZED VIEW mv");
+    expect_error_response_with_sqlstate(&mut bob, "42501");
+    read_ready_for_query(&mut bob);
+
+    send_simple_query(&mut alice, "REFRESH MATERIALIZED VIEW mv");
+    assert_eq!(
+        read_command_complete(&mut alice),
+        "REFRESH MATERIALIZED VIEW"
+    );
+    read_ready_for_query(&mut alice);
+
+    let (bob_ids, _) = read_ids(&mut bob, "SELECT id FROM mv LIMIT 100");
+    assert_eq!(bob_ids, vec!["3".to_string(), "4".to_string()]);
+}
+
+/// `WITH NO DATA` の REFRESH 後は全テナントの読み取りが `55000`、続く REFRESH で再び読める。
+#[test]
+fn wire_refresh_with_no_data_then_read_is_55000() {
+    let (addr, _guard) = spawn("wire-mv-refresh-nodata");
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    insert(&mut bob, 3, "ja");
+    send_simple_query(
+        &mut alice,
+        "CREATE MATERIALIZED VIEW mv AS SELECT id FROM docs",
+    );
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(&mut alice, "REFRESH MATERIALIZED VIEW mv WITH NO DATA");
+    assert_eq!(
+        read_command_complete(&mut alice),
+        "REFRESH MATERIALIZED VIEW"
+    );
+    read_ready_for_query(&mut alice);
+    send_simple_query(&mut bob, "SELECT id FROM mv LIMIT 10");
+    expect_error_response_with_sqlstate(&mut bob, "55000");
+    read_ready_for_query(&mut bob);
+
+    send_simple_query(&mut alice, "REFRESH MATERIALIZED VIEW mv");
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+    let (bob_ids, _) = read_ids(&mut bob, "SELECT id FROM mv LIMIT 10");
+    assert_eq!(bob_ids, vec!["3".to_string()]);
+}

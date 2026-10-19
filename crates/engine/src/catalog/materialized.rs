@@ -566,6 +566,37 @@ pub(crate) fn begin_streamed_create_in_txn(
     Ok(())
 }
 
+/// `REFRESH MATERIALIZED VIEW` の第 1 段（TABLE-42・Issue #1665）。呼び出し元の write txn 内で
+/// 定義を読み、全文脈の旧実体（メタと行表）を消去して定義を返す。続けて文脈ごとに
+/// [`write_context_entity_in_txn`] を呼び、最後に [`finish_streamed_refresh_in_txn`] を呼ぶ。
+/// 同じ txn 内の変更なので、commit 前に失敗して txn を破棄すれば旧実体はそのまま残る。
+/// 定義が無ければ `ViewNotFound`（表・ビュー・索引の名前との区別は呼び出し元が行う）。
+pub(crate) fn begin_streamed_refresh_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<MaterializedViewDef> {
+    validate_identifier(name)?;
+    let def = load_def_in_txn(write_txn, name)?
+        .ok_or_else(|| CatalogError::ViewNotFound(name.to_string()))?;
+    delete_all_meta_in_txn(write_txn, name)?;
+    delete_rows_table_in_txn(write_txn, name)?;
+    Ok(def)
+}
+
+/// `REFRESH` の最終段。`populated` を定義へ書き戻し、表単位の世代を同じ txn 内で bump する
+/// （commit は呼び出し元が 1 回だけ行う）。
+pub(crate) fn finish_streamed_refresh_in_txn(
+    write_txn: &redb::WriteTransaction,
+    def: &MaterializedViewDef,
+    populated: bool,
+) -> Result<()> {
+    let mut def = def.clone();
+    def.populated = populated;
+    store_def_in_txn(write_txn, &def)?;
+    bump_table_generation_in_txn(write_txn, &def.name)?;
+    Ok(())
+}
+
 /// 1 文脈分の実体を write txn へ書く。評価結果の行値を呼び出し元が即座に解放できるよう、
 /// 文脈ごとに検査（文脈数上限・キー重複・行数上限）と符号化を済ませる。`seen` は書き込み済みの
 /// 文脈キーで、重複検出と文脈数上限の判定に使う。

@@ -9,6 +9,12 @@
 
 ### Breaking Changes
 
+- `REFRESH MATERIALIZED VIEW [CONCURRENTLY] <名前> [WITH [NO] DATA]`（Issue #1665・TABLE-42）:
+  従来 `42601` だった構文を受理し、全文脈の実体を同じスナップショットから単一トランザクションで作り直す。
+  失敗時は旧実体が残る。`WITH NO DATA` は実体を破棄して未実体化（`55000`）にする。タグは固定の
+  `REFRESH MATERIALIZED VIEW`。`CONCURRENTLY` は暫定で `0A000`（#1666 で本実装）。公開 API は
+  `ParsedSql::RefreshMaterializedView`・`SqlOutcome::RefreshMaterializedView`・
+  `ddl::RefreshMaterializedViewOutcome` を追加する。
 - `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <名前> [(<別名>, ...)] AS <本文> [WITH [NO] DATA]`（Issue #1664・TABLE-42）:
   従来 `42601` だった構文を受理し、実体化対象の文脈ごとに本文を評価した結果を単一トランザクションで保存する。
   読み取りは読み手の文脈に一致する実体だけを返し、実体が無ければ新分類 `55000`（HTTP 射影は 409）。
