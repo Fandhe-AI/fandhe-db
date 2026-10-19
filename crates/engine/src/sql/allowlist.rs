@@ -678,6 +678,9 @@ pub enum SqlSurfaceError {
     /// 未実体化の MATERIALIZED VIEW を読んだ（`55000`。TABLE-42・Issue #1664）。
     /// 文言は固定で、名前・件数・他文脈の情報を含めない。
     MaterializedViewNotPopulated,
+    /// `REFRESH MATERIALIZED VIEW CONCURRENTLY` の前提（WHERE を持たない列の UNIQUE 索引）を
+    /// 満たさない（`55000`。TABLE-42 (4)・Issue #1666）。文言は固定で、名前・索引・件数を含めない。
+    MaterializedViewNotRefreshableConcurrently,
     /// 自動更新可能でないビューへの `INSERT`／`UPDATE`／`DELETE`（`55000`。TABLE-43 (3)・
     /// Issue #1670）。文言は文種別ごとの固定文言で、ビュー名・理由・本文を含めない。
     ViewNotAutoUpdatable {
@@ -1244,6 +1247,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InFailedSqlTransaction => ErrorClass::InFailedSqlTransaction,
             SqlSurfaceError::LockNotAvailable => ErrorClass::LockNotAvailable,
             SqlSurfaceError::MaterializedViewNotPopulated
+            | SqlSurfaceError::MaterializedViewNotRefreshableConcurrently
             | SqlSurfaceError::ViewNotAutoUpdatable { .. } => {
                 ErrorClass::ObjectNotInPrerequisiteState
             }
@@ -1398,6 +1402,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::MaterializedViewNotPopulated => {
                 write!(f, "materialized view has not been populated")
+            }
+            SqlSurfaceError::MaterializedViewNotRefreshableConcurrently => {
+                write!(f, "cannot refresh materialized view concurrently")
             }
             SqlSurfaceError::ViewNotAutoUpdatable { op, .. } => match op {
                 ViewWriteOp::Insert => write!(f, "cannot insert into view"),
@@ -12167,7 +12174,7 @@ pub(crate) fn validate_create_materialized_view_tokens(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedRefreshMaterializedView {
     pub(crate) name: String,
-    /// `CONCURRENTLY` の有無（実行段で暫定 `0A000`。本実装は #1666）。
+    /// `CONCURRENTLY` の有無（実行段で未実体化 `0A000`／適格な UNIQUE 索引なし `55000` を検査。Issue #1666）。
     pub(crate) concurrently: bool,
     /// `WITH DATA`（省略時の既定）なら真、`WITH NO DATA` なら偽。
     pub(crate) with_data: bool,
@@ -12206,6 +12213,12 @@ pub(crate) fn validate_refresh_materialized_view_tokens(
     if !leftover.is_empty() {
         return Err(SqlSurfaceError::unsupported(
             "unexpected tokens after REFRESH MATERIALIZED VIEW target",
+        ));
+    }
+    // PostgreSQL と同じく CONCURRENTLY と WITH NO DATA の併用は構文エラー（Issue #1666）。
+    if concurrently && !with_data {
+        return Err(SqlSurfaceError::unsupported(
+            "CONCURRENTLY and WITH NO DATA options cannot be used together",
         ));
     }
     Ok(ValidatedRefreshMaterializedView {
@@ -25684,6 +25697,7 @@ mod body_expr_policy_tests {
             "REFRESH VIEW mv",
             "REFRESH MATERIALIZED VIEW",
             "REFRESH MATERIALIZED VIEW CONCURRENTLY",
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY mv WITH NO DATA",
             "REFRESH MATERIALIZED VIEW mv WITH DATA extra",
             "REFRESH MATERIALIZED VIEW mv WITH",
             "REFRESH MATERIALIZED VIEW mv DATA",

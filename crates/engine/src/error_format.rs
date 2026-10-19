@@ -241,6 +241,7 @@ define_error_classes! {
     /// 自動更新可能でないビューへの `INSERT`／`UPDATE`／`DELETE` も同じ分類を共有する
     /// （TABLE-43 (3)・Issue #1670。固定文言のみでビュー名・理由は含めない）。
     /// [`crate::sql::allowlist::SqlSurfaceError::MaterializedViewNotPopulated`]・
+    /// [`crate::sql::allowlist::SqlSurfaceError::MaterializedViewNotRefreshableConcurrently`]・
     /// [`crate::sql::allowlist::SqlSurfaceError::ViewNotAutoUpdatable`] の写像。
     ObjectNotInPrerequisiteState => ("55000", "OBJECT_NOT_IN_PREREQUISITE_STATE"),
     /// `CREATE TABLE` が指定したテーブル名が既に存在する（`42P07`）。TABLE-4・

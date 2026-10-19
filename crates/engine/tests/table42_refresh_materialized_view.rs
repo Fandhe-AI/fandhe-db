@@ -10,7 +10,8 @@
 //! 3. 他の文脈の失敗は実行者へ返さず、その文脈は `55000`（fail-closed）になる
 //! 4. `WITH NO DATA` は未実体化（`55000`）にし、以後の REFRESH で再実体化できる
 //! 5. 権限ゲートが先（`42501`）、明示トランザクション内は `0A000`、種別違いは `42809`
-//! 6. `CONCURRENTLY` は暫定で `0A000`（本実装は #1666）、構文違反は `42601`、再オープン後も新実体
+//! 6. `CONCURRENTLY` は TABLE-42 (4) の前提検査（未実体化 `0A000`／適格な UNIQUE 索引なし `55000`）を
+//!    通れば非 CONCURRENTLY と同結果（Issue #1666）、構文違反は `42601`、再オープン後も新実体
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -434,36 +435,154 @@ fn refresh_on_wrong_object_kinds() {
     }
 }
 
-/// CONCURRENTLY は暫定で 0A000（本実装は #1666）。実体の状態は変わらない。
+/// CONCURRENTLY の前提（TABLE-42 (4)・Issue #1666）: 適格な UNIQUE 索引が無ければ 55000 で、旧実体は残る。
 #[test]
-fn concurrently_is_feature_not_supported_for_now() {
-    let (core, _g) = open_core("t42r-conc");
+fn concurrently_without_unique_index_is_55000_and_keeps_old_entity() {
+    let (core, _g) = open_core("t42r-conc-noidx");
     create_ok(
         &core,
         "CREATE MATERIALIZED VIEW mv AS SELECT body FROM docs",
     );
+    let q = "SELECT body FROM mv LIMIT 100";
+    exec_ok(&core, "alice", &insert_sql("alice", 100, "a-new"));
+    for round in 0..2 {
+        assert_eq!(
+            refresh_code(&core, "alice", "REFRESH MATERIALIZED VIEW CONCURRENTLY mv"),
+            "55000"
+        );
+        assert_eq!(bodies(&core, "alice", q).len(), 5);
+        assert!(!has(&core, "alice", q, "a-new"));
+        // 非 UNIQUE 索引だけでは前提を満たさない。
+        if round == 0 {
+            exec_ok(&core, "alice", "CREATE INDEX mv_body_idx ON mv (body)");
+        }
+    }
+}
+
+/// 未実体化は索引の有無より先に 0A000。読み取りは 55000 のまま。
+#[test]
+fn concurrently_on_unpopulated_is_0a000() {
+    let (core, _g) = open_core("t42r-conc-unpop");
     create_ok(
         &core,
         "CREATE MATERIALIZED VIEW mv0 AS SELECT body FROM docs WITH NO DATA",
     );
-    assert_eq!(
-        refresh_code(&core, "alice", "REFRESH MATERIALIZED VIEW CONCURRENTLY mv"),
-        "0A000"
-    );
-    assert_eq!(
-        refresh_code(&core, "alice", "REFRESH MATERIALIZED VIEW CONCURRENTLY mv0"),
-        "0A000"
-    );
-    assert_eq!(
-        bodies(&core, "alice", "SELECT body FROM mv LIMIT 100").len(),
-        5
-    );
+    let sql = "REFRESH MATERIALIZED VIEW CONCURRENTLY mv0";
+    assert_eq!(refresh_code(&core, "alice", sql), "0A000");
+    exec_ok(&core, "alice", "CREATE UNIQUE INDEX mv0_body ON mv0 (body)");
+    assert_eq!(refresh_code(&core, "alice", sql), "0A000");
     assert_eq!(
         err_code(&core, "alice", "SELECT body FROM mv0 LIMIT 5"),
         "55000"
     );
 }
 
+/// 前提を満たせば非 CONCURRENTLY と同じ結果になる。
+#[test]
+fn concurrently_with_unique_index_refreshes_like_plain() {
+    let (core, _g) = open_core("t42r-conc-ok");
+    create_ok(
+        &core,
+        "CREATE MATERIALIZED VIEW mv AS SELECT body FROM docs",
+    );
+    exec_ok(&core, "alice", "CREATE UNIQUE INDEX mv_body ON mv (body)");
+    exec_ok(&core, "alice", &insert_sql("alice", 100, "a-new"));
+    exec_ok(&core, "bob", &insert_sql("bob", 101, "b-new"));
+    let q = "SELECT body FROM mv LIMIT 100";
+    assert!(refresh_ok(
+        &core,
+        "alice",
+        "REFRESH MATERIALIZED VIEW CONCURRENTLY mv"
+    ));
+    assert_matches_direct(&core, q, "SELECT body FROM docs LIMIT 100");
+    assert!(has(&core, "alice", q, "a-new"));
+    assert!(has(&core, "bob", q, "b-new"));
+    assert!(!has(&core, "alice", q, "b-new"));
+    assert!(refresh_ok(
+        &core,
+        "alice",
+        "REFRESH MATERIALIZED VIEW CONCURRENTLY mv WITH DATA"
+    ));
+}
+
+/// 実行者の文脈に重複があれば 23505 で旧実体が残る（UNIQUE の強制は非 CONCURRENTLY と同一）。
+#[test]
+fn concurrently_duplicate_in_refresher_context_is_23505_and_keeps_old_entity() {
+    let (core, _g) = open_core("t42r-conc-dup");
+    create_ok(
+        &core,
+        "CREATE MATERIALIZED VIEW mv AS SELECT body FROM docs",
+    );
+    exec_ok(&core, "alice", "CREATE UNIQUE INDEX mv_body ON mv (body)");
+    exec_ok(&core, "alice", &insert_sql("alice", 100, "a1"));
+    assert_eq!(
+        refresh_code(&core, "alice", "REFRESH MATERIALIZED VIEW CONCURRENTLY mv"),
+        "23505"
+    );
+    assert_eq!(
+        bodies(&core, "alice", "SELECT body FROM mv LIMIT 100").len(),
+        5
+    );
+}
+
+/// 他文脈だけの重複は実行者へ返さず、その文脈は未実体化（55000）になる。
+#[test]
+fn concurrently_duplicate_only_in_other_context_is_hidden() {
+    let (core, _g) = open_core("t42r-conc-dup-other");
+    create_ok(
+        &core,
+        "CREATE MATERIALIZED VIEW mv AS SELECT body FROM docs",
+    );
+    exec_ok(&core, "alice", "CREATE UNIQUE INDEX mv_body ON mv (body)");
+    exec_ok(&core, "carol", &insert_sql("carol", 100, "c1"));
+    let q = "SELECT body FROM mv LIMIT 100";
+    assert!(refresh_ok(
+        &core,
+        "alice",
+        "REFRESH MATERIALIZED VIEW CONCURRENTLY mv"
+    ));
+    assert_eq!(err_code(&core, "carol", q), "55000");
+    assert_eq!(bodies(&core, "alice", q).len(), 5);
+}
+
+/// 種別違い・不在・権限ゲートは CONCURRENTLY でも前提検査より前に効く。
+#[test]
+fn concurrently_keeps_earlier_gates() {
+    let (core, _g) = open_core("t42r-conc-gates");
+    create_ok(&core, "CREATE VIEW v AS SELECT body FROM docs");
+    create_ok(
+        &core,
+        "CREATE MATERIALIZED VIEW mv AS SELECT body FROM docs",
+    );
+    assert_eq!(
+        refresh_code(
+            &core,
+            "alice",
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY nope"
+        ),
+        "42P01"
+    );
+    for name in ["docs", "v"] {
+        assert_eq!(
+            refresh_code(
+                &core,
+                "alice",
+                &format!("REFRESH MATERIALIZED VIEW CONCURRENTLY {name}")
+            ),
+            "42809",
+            "{name}"
+        );
+    }
+    let mut session = SessionState::default();
+    let e = ddl(
+        &core,
+        "alice",
+        &mut session,
+        "REFRESH MATERIALIZED VIEW CONCURRENTLY mv",
+    )
+    .expect_err("denied");
+    assert_eq!(e.wire_code(), "42501");
+}
 #[test]
 fn syntax_errors_are_42601() {
     let (core, _g) = open_core("t42r-syntax");
@@ -472,6 +591,7 @@ fn syntax_errors_are_42601() {
         "REFRESH MATERIALIZED VIEW",
         "REFRESH MATERIALIZED VIEW mv WITH DATA extra",
         "REFRESH MATERIALIZED VIEW mv WITH",
+        "REFRESH MATERIALIZED VIEW CONCURRENTLY mv WITH NO DATA",
     ] {
         assert_eq!(refresh_code(&core, "alice", sql), "42601", "{sql}");
     }
