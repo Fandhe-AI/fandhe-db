@@ -386,11 +386,13 @@ fn check_catalog(storage: &Storage) -> Result<(), String> {
     let indexes = storage
         .list_indexes()
         .map_err(|e| format!("list indexes failed: {e}"))?;
-    if indexes
-        .iter()
-        .any(|i| is_temp_artifact(&i.name) || is_temp_artifact(&i.table))
-    {
-        return Err("persistent catalog has a temp index".to_string());
+    // 永続 `docs` は索引なしで宣言している（`ensure_persistent_docs`）ため、索引は 1 件でも残骸。
+    // 一時 `docs` の UNIQUE 索引のように名前が scratch_tmp 系でないものも検出する。
+    if !indexes.is_empty() {
+        return Err(format!(
+            "persistent catalog is not exactly [docs] with no indexes: index_count={}",
+            indexes.len()
+        ));
     }
     Ok(())
 }
