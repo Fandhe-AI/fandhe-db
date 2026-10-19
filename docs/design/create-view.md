@@ -8,7 +8,8 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 本リポ側の実装判断・設計記録のみを扱う。
 
 `MATERIALIZED VIEW`（TABLE-42）は本ファイル末尾の「Issue #1668 追記」にまとめる。以降の節は
-非マテリアライズドビューの記録である。
+非マテリアライズドビューの記録である。更新可能ビュー（TABLE-43。関連ポインタ SQL-49・
+RLS-10 (b)・ERR-6 の `55000`）は末尾の「Issue #1675 追記」にまとめる。
 
 ## 概要
 
@@ -31,7 +32,7 @@ DROP VIEW <name>
   （`Projection::Items`）・UDF 呼び出し述語（`WherePredicate::PredicateCall`／
   `Expression`）・`EXPLAIN`・`CREATE OR REPLACE` の `VIEW` 以外への適用・`IF NOT EXISTS`・`TEMP`／
   `MATERIALIZED`（`CREATE VIEW` の中では受理しない。`CREATE MATERIALIZED VIEW` は別の文として
-  Issue #1664 で受理済み。「Issue #1668 追記」参照）・`WITH CHECK OPTION`・末尾の余剰トークンは
+  Issue #1664 で受理済み。「Issue #1668 追記」参照）・`WITH CHECK OPTION`（#1673 で対応予定）・末尾の余剰トークンは
   いずれも構造的に受理しない（`42601`）。使える単純述語は
   `Equality`／`Prefix`／`BoolEquality`／`BoolColumn`／`Compare`（列 対
   リテラル）のみ。
@@ -345,12 +346,19 @@ view_read_applies_referencing_session_rls_not_creator_visibility` で
 - `DROP VIEW`: 名前がテーブルなら `42809`、存在しなければ `42P01` →
   依存するビューがあれば `2BP01` → 削除。
 - `DROP TABLE <ビュー名>`: `42809`。参照しているビューがあれば `2BP01`。
-- **ビューへの書き込み**（`INSERT`／UPSERT／`UPDATE`／`DELETE`／`TRUNCATE`）は
-  `42809`。`EngineCore::parse_tokens` の書き込み分岐（`validate_insert_tokens`
-  等）が `UndefinedTable` を返し、かつその名前がビューとして存在する場合に
-  限り `WrongObjectType` へ読み替える（`EngineCore::
-  reclassify_write_to_view_error`。1 か所のみ）。副作用（台帳・世代・行）が
-  一切発生しないことをテストで固定した。
+- **ビューへの書き込み**（`INSERT`／UPSERT／`UPDATE`／`DELETE`／`TRUNCATE`）は、
+  Issue #1670〜#1672 で次の 3 分岐に改訂した（TABLE-43。詳細は末尾の
+  「Issue #1675 追記」）。
+  - 自動更新可能なビューへの `INSERT`（UPSERT・`RETURNING` を含む）／`UPDATE`／`DELETE`
+    は基表への同じ文に書き換えて実行する（`INSERT` は #1671、`UPDATE`／`DELETE` は #1672）。
+  - 自動更新不可のビューへの `INSERT`／`UPDATE`／`DELETE` は `55000`（#1670。
+    `SqlSurfaceError::ViewNotAutoUpdatable`、文種別ごとの固定文言）。
+  - `TRUNCATE`・`EXPLAIN` 系・matview・索引名、および Parse 後の並行 DDL でビューが
+    現れた競合は、従来どおり `42809`。`EngineCore::parse_tokens` の書き込み分岐が
+    `UndefinedTable` を返し、かつその名前がビューとして存在する場合に限り
+    `WrongObjectType` へ読み替える（`EngineCore::reclassify_write_to_view_error_for`）。
+  - `55000` と `42809` の拒否経路では、副作用（台帳・世代・行）が一切発生しない
+    ことをテストで固定した。
 
 ## 情報漏えいの抑止
 
@@ -380,7 +388,8 @@ body のリテラル値・破損理由の詳細をクライアントへ運ばな
   RLS 境界には影響しない——書き換え後の述語は基底テーブルへ委譲される既存の
   束縛・実行経路でそのまま評価されるため、この検査はビューが宣言した列
   スコープ契約のためのものであり安全性の境界ではない。
-- 更新可能ビュー。
+- ~~更新可能ビュー。~~ Issue #1670〜#1672 で対応済み（末尾「Issue #1675 追記」）。残りの
+  `WITH CHECK OPTION` は #1673、RLS・台帳・crash の総合テストは #1674 で扱う。
 - `MATERIALIZED VIEW`（TABLE-42）は Issue #1663〜#1667 で実装済み。設計は「Issue #1668 追記」、
   未対応事項も同節の「対象外」に集約した。
 - NoSQL 表層の `scan`／`aggregate` op でビューを対象にすると従来どおり
@@ -553,7 +562,7 @@ TABLE-41 (2)(3) のポインタ（TABLE-18 の RLS 契約は変えない）。#1
 ### 対象外
 
 - 新状態に対して依存ビューを Describe する完全な再検証（列追加ゲートの過剰拒否の解消）
-- 照合順序の比較、静的な型を持たない列、ALTER VIEW、TABLE-42（#1663〜#1667 で実装済み。「Issue #1668 追記」参照）／43
+- 照合順序の比較、静的な型を持たない列、ALTER VIEW、TABLE-42（#1663〜#1667 で実装済み。「Issue #1668 追記」参照）／43（#1670〜#1672 で一部実装済み。「Issue #1675 追記」参照。`WITH CHECK OPTION` は #1673）
 - prepared statement の列メタデータ（`*` 依存ビューの列増加）
 
 ## Issue #1668 追記: MATERIALIZED VIEW（TABLE-42）
@@ -693,3 +702,91 @@ Issue #1665（`REFRESH`）・#1666（`REFRESH ... CONCURRENTLY`）・#1667（索
 - DROP CASCADE のクラッシュ原子性テスト。
 - 式索引の取り込み時に、適格判定 `has_concurrent_refresh_unique_index_in_txn` から式を含む宣言を
   除く追随。
+
+## Issue #1675 追記: 更新可能ビュー（TABLE-43）
+
+親 #1669。実装は #1670（判定規則）・#1671（`INSERT`）・#1672（`UPDATE`／`DELETE`）。関連ポインタは
+SQL-49・RLS-10 (b)・ERR-6 の `55000`。本節は設計判断の記録でコードは変更しない。Issue ごとの
+経緯は [implementation-status.md](implementation-status.md) を参照。`WITH CHECK OPTION`（#1673）と
+RLS・台帳・crash の総合テスト（#1674）は未実装で、本節では後続としてのみ扱う。
+
+### 自動更新可能性の判定（#1670）
+
+- `sql::view_updatable::view_updatability` は第 2 の分類器を作らず、読み取り経路と同じ
+  `sql::view::resolve_from` の結果に乗る。`Resolved::View`（連鎖の全段が単純形）なら更新可能、
+  `Resolved::Buffered`（評価後射影形）なら不可。
+- 不可の理由（`ViewNotUpdatableReason`）は DISTINCT・GROUP BY・HAVING・集合演算・WITH・
+  LIMIT／OFFSET・集計・ウィンドウ・単一の表ではない・下位が不可、を固定の優先順位で決定的に
+  分類する。wire 文言には出さない（ビュー名・理由を含めない固定文言）。
+- fail-closed: 判定の失敗（破損 `XX000`・深さ超過 `54000`）を「ビューではない」「更新可能」の
+  どちらにも倒さず伝播する。
+
+### `INSERT` の書き換え（#1671）
+
+- Parse は構造検証と判定だけを行い（`ParsedSql::ViewInsert`）、書き換え（`sql::view_insert`）は
+  Execute／Describe 時に現在のカタログで行う。Parse と Execute の間の `CREATE OR REPLACE VIEW`／
+  `DROP VIEW` を取り込むため。
+- 公開名に対して列スコープ検査を先に行い（非公開列は `42703`）、その後で物理名へ写す。写す対象は
+  列リスト・`ON CONFLICT` の対象列・`DO UPDATE SET` の左辺・`EXCLUDED.<col>`・`RETURNING`。
+- 別名で疑似列 `id` へ写る公開名は `0A000`。ビューに現れない基表の列は基表の `DEFAULT`
+  （無ければ NULL）。`RETURNING` の列名と Describe はビューの公開名で返す。
+- ビューの `WHERE` 述語は `INSERT` に適用しない（検査は #1673）。
+- 書き換え後は既存の基表 `INSERT` 経路を通るため、制約・上限・テナント所有・台帳は基表の単位で働く。
+
+### `UPDATE`／`DELETE` の書き換え（#1672）
+
+- `sql::view_dml`（写像器と `RETURNING` の書き換えは `sql::view_insert` と共用）。
+- 述語はビュー連鎖の述語（内側の段が先）、利用者の述語の順に AND で合成する。読み取り経路と
+  同じ順序で、ビューの外の行は更新も削除もされない。
+- 単一行形 `WHERE id = <n>`: ビューが `id` を公開しなければ `42703`、利用者列を公開名 `id` で
+  公開していれば `0A000`、ビュー述語が空なら単一行形のまま基表へ、空でなければ述語形へ変換する。
+- `PARTITIONED` 修飾は `0A000`。分割実行はチャンクごとに commit するため、指紋照合と再試行の
+  意味が定まらないことが理由。
+- 影響行数の上限（`--max-dml-affected-rows`）・RLS・`RETURNING` は基表への書き込みと同じに働く。
+  Parse 時のパラメータ型推論は、公開列から基表の列型を引く。
+
+### 並行 DDL と TOCTOU（#1671・#1672 共通）
+
+- 書き換えの前に `Storage::view_write_fingerprint` で「ビュー連鎖の定義と終端の基表スキーマ」の
+  指紋を取る（`CREATE OR REPLACE VIEW` と同じ `replace_fingerprint`）。`sql::view_write_scope` 経由で
+  書き込み txn の冒頭にその指紋を照合する。
+- 不一致なら書き込み前に中断し、`EngineCore::run_view_write` が上限つき（8 回）で再試行する。
+  上限到達は `55P03`。
+
+### 台帳と冪等再送
+
+- 台帳のキーは基表名のまま。内容ハッシュには、ビュー経由のときだけ `content_hash::for_view_write` で
+  ビュー名のドメインを被せる。
+- 同じ `operation_id` をビュー経由で再送すると `23505`、同じ値を基表へ直接送ると `22023`。
+  ビュー経由でない既存のハッシュは変わらない。
+
+### RLS-10 (b) の不変条件と判定順序
+
+- 書き換えは名前の写像と述語の AND 追加だけで、可視性を緩めない。書き込み対象行の所有テナントは
+  書き込みセッションの `PolicyContext` が決め、ビュー作成者の可視性は引き継がない。
+- 順序: 構文 → 更新可能性（不可なら `55000`）→ 解決 → `PARTITIONED` の拒否 → 公開名での列スコープ検査
+  （`42703`）→ 物理名への写像（`id` 写像は `0A000`）→ 指紋照合と基表 DML 経路。
+
+### PostgreSQL との差異
+
+- ビュー経由の `PARTITIONED` は `0A000`。
+- 並行 DDL との競合が上限を超えると `55P03` になりうる。
+- `WITH CHECK OPTION` は未対応（#1673）で、宣言は `42601`。
+- `TRUNCATE <view>` は `42809`。
+- 非セッション API（`execute_insert_sql`／`execute_update_sql`／`execute_delete_sql`）と
+  NoSQL 表層からのビューへの書き込みは `42P01`。
+
+### テスト
+
+- engine: `tests/table43_view_updatability.rs`・`table43_view_insert.rs`・`table43_view_update_delete.rs`
+- wire-server: `tests/wire_view_insert.rs`・`wire_view_update_delete.rs`
+- 単体: `sql::view_updatable`・`sql::view_insert`・`sql::view_dml`・`sql::view_write_scope`、
+  `catalog` の `view_write_fingerprint_tracks_chain_definitions`
+
+### 対象外（後続）
+
+- `WITH CHECK OPTION`（#1673）。
+- RLS・台帳・crash 耐性の総合テスト（#1674）。
+- ビュー経由の `PARTITIONED` 分割実行 DML。
+- 非セッション API と NoSQL 表層からのビューへの書き込み。
+- `TRUNCATE` のビュー対応（`42809` を維持する）。
