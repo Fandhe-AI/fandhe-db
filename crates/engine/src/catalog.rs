@@ -986,7 +986,7 @@ pub(crate) fn explain_index_names_in_txn(
         }
         match def.kind {
             IndexKind::Hnsw => decls.hnsw.push(def.name),
-            // 式要素は #1650（プランナ選択・EXPLAIN 表示）まで出さない。
+            // 式要素は列被覆名に含めない（式索引名は #1650 の式一致で EXPLAIN 側が合流させる）。
             IndexKind::Scalar => {
                 let plain: Vec<String> = def.plain_columns().map(str::to_string).collect();
                 if !plain.is_empty() {

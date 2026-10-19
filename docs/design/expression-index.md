@@ -2,7 +2,7 @@
 
 対象: Issue #1647（親 #1646）。ポインタ: `docs/spec/04-behavior/indexing.md` INDEX-10・INDEX-7
 （spec 本文は転記しない）。#1648（キー計算・エンコード・カタログ永続化）は本書末尾の「Issue #1648」節。
-後続: #1649（DML 維持）→（プランナ選択は #1650）→（UNIQUE・失効は #1651）。
+後続: #1649（DML 維持）→ #1650（プランナ選択。実施済み）→（UNIQUE・失効は #1651）。
 
 ## 範囲
 
@@ -85,7 +85,7 @@
   （`session_local`）を確定値へ畳み、式から参照列集合を抽出する。
 - **#1651**: `UNIQUE` 式索引の強制、参照列の `DROP COLUMN`（索引削除）・`ALTER TYPE`（再構築）・
   `RENAME COLUMN` 追随。
-- **#1650**: 正規化構文での式一致判定（#1648 の正規化テキストを共有）。
+- **#1650**（実施済み。本書末尾の「Issue #1650」節）: 正規化構文での式一致判定（#1648 の正規化テキストを共有）。
 
 ## Issue #1648（格納側: 束縛・永続化・キー計算）
 
@@ -195,7 +195,7 @@ must be marked IMMUTABLE`）にする。型を決められない部分式は判�
 | 事項 | 担当 | 本件での挙動 |
 | ---- | ---- | ------------ |
 | INSERT／UPDATE 時の式評価エラーで DML を失敗させる・crash 整合 | #1649（実施済み） | 下記「Issue #1649」節。全書き込み経路が commit 前に式を評価し、評価エラーを拒否する |
-| WHERE／ORDER BY の式一致・EXPLAIN 表示 | #1650 | 式キーは構築するがどこからも消費しない（クエリ結果・計画は不変） |
+| WHERE の式一致・EXPLAIN 表示 | #1650（実施済み） | 下記「Issue #1650」節。ORDER BY の式一致は未対応 |
 | UNIQUE 式索引・`RENAME`／`ALTER TYPE` の追随 | #1651 | 構文段で `0A000`／write txn 内で `0A000` |
 | 式への `COLLATE`（ICU 照合の辞書） | 後続 | `0A000` |
 
@@ -254,3 +254,46 @@ must be marked IMMUTABLE`）にする。型を決められない部分式は判�
 
 - 分割実行 DML（`partitioned-dml.md`）での評価エラーは、既存の CHECK エラーと同じチャンク原子性の契約に従う。
 - 本件より前の #1648 ビルドで作った式索引の既存失敗行は遡って検証しない（構築側の fail-soft で無害化される）。
+
+## Issue #1650（プランナ選択・EXPLAIN 表示）
+
+対象: Issue #1650（親 #1646）。ポインタ: `docs/spec/04-behavior/indexing.md` INDEX-10・INDEX-7
+（spec 本文は転記しない）。#1648 が構築した式キー索引を、WHERE の式述語の選択と EXPLAIN の索引名注記で
+消費する。
+
+### 判断
+
+| # | 判断 | 理由 |
+| - | ---- | ---- |
+| D1 | 宣言を分類へ渡す。式述語は、宣言済みの式索引と構造一致したものだけを索引対応にする。公開の `classify_scalar_plan`・`ScalarShapeInput` は変えず、`pub(crate)` の `classify_scalar_plan_with` が一致判定関数（`finder`）を受ける | 宣言を見ずに形だけで分類する案は、式索引が無い表・opt-in なしでも `scalar_plan_kind != PlainScan` になり、索引の構築・統計加算が走って「opt-in なしの挙動を変えない」契約を破る。宣言を渡せば、宣言なし・不一致・opt-in なしの分類は従来とビット単位で同じ（`PlainScan`） |
+| D2 | 一致判定は束縛済み式木（`BoundExpr`）の構造一致。保存済みの式テキストを再解析・再束縛（往復一致つき）した木と、WHERE の比較の非リテラル側を比べる。数値リテラルは `-0.0` と `0.0` を区別する（`PartialEq` に加えてデバッグ表現の一致を要求） | `BoundExpr` はレジストリやセッションを参照せず単独で評価できる純粋な木で、索引に入る式は決定性検査を通過済みなので、木が等しければ評価結果も等しい。関数名の大小文字や余分な括弧の差は束縛後に消える。`BoundStatement` に束縛前の WHERE を持ち回る改修は採らない |
+| D3 | 対応する形は `<式> op <リテラル>`（`op` は `=`／`<`／`<=`／`>`／`>=`。左右逆は演算子を反転）。リテラルは式の結果型と同じ種類の定数だけ（TEXT・有限の数値・DATE／TIMESTAMP／TIME／TIMESTAMPTZ）。`BETWEEN` は 2 本の比較に脱糖されて交差になる | TEXT は `Collation::DEFAULT` のバイト列順と byte 等価、数値は `f64` 比較（`±0` は同値でキーは正規化済み）、時間型は同種 `i64` の比較で、評価器と同値。種類が違えば単位が違うので一致させない |
+| D4 | 候補集合は「厳密一致」か `FallbackNoIndex` のどちらか。式述語の収集口は `collect_expr_index_predicates_with` の 1 つだけで、`filter_map` 形で述語を落とさない | `mask_trusted_defer`・`count_star_only`・`observe_group_count_only` は候補を WHERE の厳密一致集合とみなして再評価を省く。#1649 の不変条件（式索引があるなら全行で式が評価できる）と、式キーは 1 行でも評価に失敗すれば作らない構築規則により、再評価を省いても全走査と結果が変わらない |
+| D5 | EXPLAIN の語彙は増やさない。1 件だけの式述語は、TEXT 結果の `=` なら `index_equality`、それ以外は `index_typed_range`、2 件以上は `index_conjunction`。式索引名は `index=<名前>` の注記で出す（INDEX-7 と同じ規則） | 数値列のレーン（#1359）が語彙を増やさなかった前例に合わせる。`ScalarPlan::IndexExpression` の新設は代替案として残す |
+| D6 | opt-in なし（`declarations_enabled == false`）では式述語は常に全走査。式キーの構築も opt-in 時だけ（#1648）で、EXPLAIN の索引名も opt-in 時だけ | #1648 から持ち越された論点への回答 |
+
+### 一致しない形（対象外。残余述語＝全走査のまま）
+
+- `TextCompare`（ICU 照合の比較。順序がバイト列順のキーと合わない）、`IS NULL`、`IN`、`LIKE`、`<>`、OR 群。
+  式に対する `BETWEEN`・`IN`・`IS NULL` は現状の構文段が受理しない形もある。
+- 式同士の比較、リテラルの種類が式の結果型と食い違う比較（`DATE` 式と `TIMESTAMP` リテラル等。束縛器が
+  昇格ノードで包むため一致しない）。
+- 宣言した式と構文が異なる式（`lower(x)` に対する `upper(x)`、`n + 1` に対する `n + 2`）。
+
+### 構成
+
+- `sql::expression_key_index::ExpressionIndexMatcher`: 宣言を再束縛した式木の集合。`find(expr, ty)` が分類・実行・
+  EXPLAIN の共通の一致判定。再束縛・往復一致・識別子検証に失敗した宣言は黙って外す（fail-soft）。
+- `sql::scalar_index::resolve_expression_matcher_in_txn`: クエリと同一の `read_txn` から解決する唯一の入口。
+  opt-in なし・式候補なし（構造フィルタ）・カタログ読み取り失敗は空のマッチャ。
+- 実行時: `sql::exec`・`sql::aggregate`・`sql::group_by` が、分類と候補収集の双方へ同じ `finder` を渡す。
+- EXPLAIN: 検索・集計は束縛済みの WHERE から直接、`USING PLAN` は `ExplainShape` が保留した式候補を、世代照合を
+  通過した `post_check_txn` の宣言で `resolve_expressions` が確定する。式索引名は列被覆名と合流させる
+  （列述語がある場合は全列が被覆されているときだけ）。名前は `ExplainIndexNames::new` の識別子検証を通る。
+- `ExplainShape` は式候補を保持するため `Copy`・`Eq` ではなくなった（BREAKING。`from_filters` のシグネチャは不変）。
+
+### 既知のコストと後続
+
+- `declared_index_targets_in_txn` には世代キーのキャッシュが無い。式候補を含むクエリは毎回カタログ走査と
+  宣言の再束縛を行う（宣言数は `MAX_INDEX_COUNT` が上限で、DDL 権限者しか増やせない）。キャッシュ化は後続候補。
+- ORDER BY の式一致による索引順走査（`ExpressionKeyIndex::ordered_slots` の消費）は本件の対象外。

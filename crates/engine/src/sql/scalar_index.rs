@@ -756,8 +756,8 @@ pub(crate) struct ScalarIndex {
     /// にする。
     approx_bytes: usize,
     /// 式索引の式キー（INDEX-10、Issue #1648。`schema.columns` とは独立した並び）。作れなかった
-    /// 式キーは含まれない（fail-soft。[`Self::attach_expression_keys`]）。現時点の消費者は
-    /// 順序付き走査 API（テスト）だけで、プランナ選択は後続 Issue #1650 の責務。
+    /// 式キーは含まれない（fail-soft。[`Self::attach_expression_keys`]）。消費者は
+    /// [`Self::resolve_candidates`] の式述語（Issue #1650）と順序付き走査 API（テスト）。
     expression_keys: Vec<crate::sql::expression_key_index::ExpressionKeyIndex>,
 }
 
@@ -1097,6 +1097,43 @@ pub(crate) fn resolve_scalar_index_target_in_txn(
             None => ScalarIndexTargetOwned::Auto,
         }),
         Err(_) => Err(()),
+    }
+}
+
+/// 対象テーブルの式索引の式要素を再束縛した一致用マッチャを、クエリと同一の `read_txn` から
+/// 解決する（INDEX-10、Issue #1650）。`sql::exec`・`sql::aggregate`・`sql::group_by` の実行時分類と
+/// `core.rs` の EXPLAIN が共有する唯一の入口。
+///
+/// 空のマッチャ（＝従来どおりの全走査）を返す場合: `declarations_enabled == false`（起動時 opt-in
+/// なし。式キーも作られない）・`expr_filters` に式索引の候補（[`crate::sql::scalar_plan::
+/// has_expression_candidate`]）が無い（通常のクエリがカタログ読み取りの費用を払わない構造フィルタ）・
+/// カタログ読み取り失敗（fail-closed。索引を使わないだけでクエリは失敗しない）。
+pub(crate) fn resolve_expression_matcher_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    schema: &TableSchema,
+    declarations_enabled: bool,
+    expr_filters: &[crate::sql::udf_call::BoundExpr],
+) -> crate::sql::expression_key_index::ExpressionIndexMatcher {
+    if !declarations_enabled || !crate::sql::scalar_plan::has_expression_candidate(expr_filters) {
+        return crate::sql::expression_key_index::ExpressionIndexMatcher::empty();
+    }
+    resolve_expression_matcher_for_table_in_txn(read_txn, table, schema)
+}
+
+/// [`resolve_expression_matcher_in_txn`] の構造フィルタ・opt-in 判定を呼び出し元が済ませている版
+/// （`ExplainShape` が保持する保留述語から要否を決める EXPLAIN 用）。
+pub(crate) fn resolve_expression_matcher_for_table_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    schema: &TableSchema,
+) -> crate::sql::expression_key_index::ExpressionIndexMatcher {
+    match crate::catalog::declared_index_targets_in_txn(read_txn, table) {
+        Ok(targets) => crate::sql::expression_key_index::ExpressionIndexMatcher::from_decls(
+            schema,
+            &targets.expression_keys,
+        ),
+        Err(_) => crate::sql::expression_key_index::ExpressionIndexMatcher::empty(),
     }
 }
 
@@ -2046,7 +2083,6 @@ impl ScalarIndex {
     }
 
     /// `index_name` の `element` 番目の式キー（作れていなければ `None`）。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn expression_key(
         &self,
         index_name: &str,
@@ -2618,6 +2654,13 @@ impl ScalarIndex {
                     ))
                 )
             }
+            // 式キーが作れていない（再束縛失敗・評価エラー・予算超過で fail-soft に捨てた）なら
+            // 値に依存せず全走査へ縮退する（INDEX-10、Issue #1650）。
+            crate::sql::scalar_plan::ExprIndexPredicate::Expression {
+                index_name,
+                element,
+                ..
+            } => self.expression_key(index_name, *element).is_some(),
         }
     }
 
@@ -2731,6 +2774,16 @@ impl ScalarIndex {
                     op,
                     literal,
                 } => self.numeric_column_candidates(*column_index, *op, *literal),
+                // 式索引の式述語（INDEX-10、Issue #1650）。候補は式キーの厳密な一致集合で、
+                // 作れない場合は `None`（＝`FallbackNoIndex`）にする。
+                crate::sql::scalar_plan::ExprIndexPredicate::Expression {
+                    index_name,
+                    element,
+                    op,
+                    literal,
+                } => self
+                    .expression_key(index_name, *element)
+                    .and_then(|key| key.candidates_for_comparison(*op, literal)),
             };
             let Some(slots) = slots else {
                 return CandidateResolution::FallbackNoIndex;

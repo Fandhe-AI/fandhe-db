@@ -26,7 +26,8 @@
 //! を増やさないため、この判定には現れない（残余述語にはならない）。
 
 use crate::declarative_filter::MetadataFilter;
-use crate::sql::udf_call::{BinOp, BoundExpr};
+use crate::sql::expression_key_index::{ExprKeyLiteral, ExprMatchRef};
+use crate::sql::udf_call::{BinOp, BoundExpr, ExprType};
 use crate::sql::where_tree::BoundOrGroup;
 
 /// [`classify_scalar_plan`] の分類結果。閉じた語彙（`sql::explain` の
@@ -126,8 +127,8 @@ fn flip_comparison(op: BinOp) -> BinOp {
 /// 異なる述語集合を見ると候補が上位集合になり条件外の行を返す（fail-open）ため、
 /// 両者が必ずこの型を介して同じ集合を見る（旧 `id_predicate_from_expr` の
 /// `filter_map` は述語を黙って落とせたので、公開面を
-/// [`collect_expr_index_predicates`] に限定して型で塞ぐ）。
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// [`collect_expr_index_predicates_with`] に限定して型で塞ぐ）。
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ExprIndexPredicate {
     /// `id <op> <数値リテラル>`。
     Id(IdPredicate),
@@ -139,14 +140,78 @@ pub(crate) enum ExprIndexPredicate {
         op: BinOp,
         literal: f64,
     },
+    /// `<式索引の式> <op> <リテラル>`（INDEX-10、Issue #1650）。式は宣言済みの式索引の要素と
+    /// 構造一致したもの（[`crate::sql::expression_key_index::ExpressionIndexMatcher::find`]）。
+    /// 索引名と要素位置を持つので、候補解決（`ScalarIndex::resolve_candidates`）はマッチャを
+    /// 必要としない。左右入替は `op` を反転して式が左辺に来る形へ揃える。
+    Expression {
+        index_name: String,
+        element: usize,
+        op: BinOp,
+        literal: ExprKeyLiteral,
+    },
+}
+
+/// 式索引の式を探す関数（比較の非リテラル側の式と、リテラルから決まる結果型を受ける）。
+/// 実行時と EXPLAIN は `ExpressionIndexMatcher::find` を、宣言を読めない箇所は常に `None` の
+/// [`no_expression_match`] を渡す。
+pub(crate) type ExprFinder<'a> = &'a dyn Fn(&BoundExpr, ExprType) -> Option<ExprMatchRef>;
+
+/// 式索引を一切使わない finder（従来どおりの分類）。
+pub(crate) fn no_expression_match(_: &BoundExpr, _: ExprType) -> Option<ExprMatchRef> {
+    None
 }
 
 /// `expr` が「`id` または数値列と数値リテラルの単純比較」（狭義の索引対応
 /// 述語）である場合に限り [`ExprIndexPredicate`] を返す。それ以外（算術式・
 /// `Builtin`・`WasmCall`・`VectorRef` を含む式・ネストした比較等）はすべて
 /// `None`（索引非対応。呼び出し元はこれを「残余述語あり」＝
-/// [`ScalarPlan::PlainScan`] の根拠として扱う）。
+/// [`ScalarPlan::PlainScan`] の根拠として扱う）。式索引の対応は
+/// [`expr_index_predicate_from_expr_with`] を通す。
 fn expr_index_predicate_from_expr(expr: &BoundExpr) -> Option<ExprIndexPredicate> {
+    expr_index_predicate_from_expr_with(expr, &no_expression_match)
+}
+
+/// [`expr_index_predicate_from_expr`] に、式索引との構造一致（INDEX-10、Issue #1650）を加えた版。
+/// 狭義の形（`id`・数値列）を先に判定し、どれにも当たらない比較だけを `finder` に渡す。
+/// 比較は `<式> op <リテラル>` で、式側がリテラルでなく `finder` が宣言と一致を返したものだけが
+/// [`ExprIndexPredicate::Expression`] になる（`TextCompare`・`IS NULL`・`IN`・`LIKE`・`<>`・
+/// 式同士の比較・リテラルの種類が式の型と食い違う比較は一致せず、残余述語＝全走査になる）。
+fn expr_index_predicate_from_expr_with(
+    expr: &BoundExpr,
+    finder: ExprFinder<'_>,
+) -> Option<ExprIndexPredicate> {
+    if let Some(narrow) = narrow_index_predicate(expr) {
+        return Some(narrow);
+    }
+    let BoundExpr::Binary { op, lhs, rhs } = expr else {
+        return None;
+    };
+    if !matches!(
+        op,
+        BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq
+    ) {
+        return None;
+    }
+    let (target, op, literal) = match (
+        ExprKeyLiteral::from_bound(lhs),
+        ExprKeyLiteral::from_bound(rhs),
+    ) {
+        (None, Some(literal)) => (lhs.as_ref(), *op, literal),
+        (Some(literal), None) => (rhs.as_ref(), flip_comparison(*op), literal),
+        _ => return None,
+    };
+    let matched = finder(target, literal.expr_type())?;
+    Some(ExprIndexPredicate::Expression {
+        index_name: matched.index_name,
+        element: matched.element,
+        op,
+        literal,
+    })
+}
+
+/// 狭義の索引対応述語（`id`・数値列と数値リテラルの比較。Issue #1359）。
+fn narrow_index_predicate(expr: &BoundExpr) -> Option<ExprIndexPredicate> {
     let BoundExpr::Binary { op, lhs, rhs } = expr else {
         return None;
     };
@@ -187,6 +252,18 @@ fn expr_index_predicate_from_expr(expr: &BoundExpr) -> Option<ExprIndexPredicate
     }
 }
 
+/// 式索引の式候補（狭義の形でなく、`<式> op <リテラル>` の形をした比較）を 1 件でも含むか。
+/// 宣言（カタログ）を読む前の構造フィルタで、候補が無いクエリはカタログ読み取りの費用を払わない。
+pub(crate) fn has_expression_candidate(exprs: &[BoundExpr]) -> bool {
+    let assume_match = |_: &BoundExpr, _: ExprType| Some(ExprMatchRef::default());
+    exprs.iter().any(|e| {
+        matches!(
+            expr_index_predicate_from_expr_with(e, &assume_match),
+            Some(ExprIndexPredicate::Expression { .. })
+        )
+    })
+}
+
 /// `exprs` のうち数値列述語（[`ExprIndexPredicate::NumericColumn`]）が参照する
 /// 列添字（`schema.columns` 添字）を列挙する（Issue #1359）。`EXPLAIN` の静的
 /// 判定（`sql::scalar_index::scalar_plan_under_target`）が、索引宣言
@@ -203,19 +280,57 @@ pub(crate) fn numeric_predicate_columns(exprs: &[BoundExpr]) -> impl Iterator<It
 }
 
 /// `exprs`（`bound.expr_filters`）の**全件**が索引対応述語なら全件を返し、
-/// 1 件でも非対応なら `None`（Issue #1359）。`classify_scalar_plan` が
-/// `PlainScan` 以外を返した入力では常に `Some` になる。呼び出し元は `None` を
+/// 1 件でも非対応なら `None`（Issue #1359）。`classify_scalar_plan_with` が
+/// `PlainScan` 以外を返した入力（同じ `finder`）では常に `Some` になる。呼び出し元は `None` を
 /// 「索引経路を使わない」（fail-closed）として扱う。一部だけを落とす
-/// `filter_map` 形を作らせないための唯一の収集口。
-pub(crate) fn collect_expr_index_predicates(
+/// `filter_map` 形を作らせないための唯一の収集口。式索引の一致は `finder` で与える（Issue #1650）。
+pub(crate) fn collect_expr_index_predicates_with(
     exprs: &[BoundExpr],
+    finder: ExprFinder<'_>,
 ) -> Option<Vec<ExprIndexPredicate>> {
     let mut out: Vec<ExprIndexPredicate> = Vec::new();
     out.try_reserve_exact(exprs.len()).ok()?;
     for expr in exprs {
-        out.push(expr_index_predicate_from_expr(expr)?);
+        out.push(expr_index_predicate_from_expr_with(expr, finder)?);
     }
     Some(out)
+}
+
+/// `exprs` の式述語が一致した式索引の名前（昇順・重複なし）。EXPLAIN の `index=` 注記用。
+/// 1 件でも索引対応でない式述語があれば `None`（その計画は `PlainScan` で名前を出さない）。
+/// 式索引に一致する述語が無ければ `Some(空)`。
+pub(crate) fn matched_expression_index_names(
+    exprs: &[BoundExpr],
+    finder: ExprFinder<'_>,
+) -> Option<Vec<String>> {
+    let preds = collect_expr_index_predicates_with(exprs, finder)?;
+    let mut names: Vec<String> = preds
+        .into_iter()
+        .filter_map(|p| match p {
+            ExprIndexPredicate::Expression { index_name, .. } => Some(index_name),
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    Some(names)
+}
+
+/// 式索引の式候補（[`has_expression_candidate`] が真になる述語）だけを複製して返す。`ExplainShape` が
+/// 束縛時には宣言を読めない（`pre_check` は索引カタログを見ない）ため、世代照合後に一致を判定する
+/// ために保留しておく入力。
+pub(crate) fn expression_candidate_filters(exprs: &[BoundExpr]) -> Vec<BoundExpr> {
+    let assume_match = |_: &BoundExpr, _: ExprType| Some(ExprMatchRef::default());
+    exprs
+        .iter()
+        .filter(|e| {
+            matches!(
+                expr_index_predicate_from_expr_with(e, &assume_match),
+                Some(ExprIndexPredicate::Expression { .. })
+            )
+        })
+        .cloned()
+        .collect()
 }
 
 /// [`ScalarShapeInput`] から [`ScalarPlan`] を決定する（純粋関数・副作用なし）。
@@ -223,6 +338,16 @@ pub(crate) fn collect_expr_index_predicates(
 /// この関数だけを単一情報源として使う（モジュールドキュメント参照）。TASK-186・
 /// NOSQL-10 の前提として Issue #730 で公開 API へ昇格した。
 pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
+    classify_scalar_plan_with(input, &no_expression_match)
+}
+
+/// [`classify_scalar_plan`] に式索引の一致（INDEX-10、Issue #1650）を加えた版。`finder` が一致を返した
+/// 式述語は索引対応述語として数える（実行時と EXPLAIN が同じ `finder` を渡す単一情報源）。
+/// `finder` が常に `None` なら [`classify_scalar_plan`] とビット単位で同じ結果になる。
+pub(crate) fn classify_scalar_plan_with(
+    input: &ScalarShapeInput<'_>,
+    finder: ExprFinder<'_>,
+) -> ScalarPlan {
     if !input.scalar_prefilter {
         return ScalarPlan::PlainScan;
     }
@@ -290,15 +415,26 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
         return ScalarPlan::PlainScan;
     }
     let mut expr_predicate_count = 0usize;
-    let mut single_expr_is_id = false;
+    let mut single_expr_plan = ScalarPlan::IndexTypedRange;
     for expr in input.expr_filters {
-        let Some(pred) = expr_index_predicate_from_expr(expr) else {
+        let Some(pred) = expr_index_predicate_from_expr_with(expr, finder) else {
             // 索引非対応の残余述語（評価時にエラーになりうる式を含む）が
             // 1 つでもあれば、索引経路を使わず宣言順の逐次評価
             // （既存 fail-closed 契約）へ全面的に委ねる。
             return ScalarPlan::PlainScan;
         };
-        single_expr_is_id = matches!(pred, ExprIndexPredicate::Id(_));
+        single_expr_plan = match &pred {
+            ExprIndexPredicate::Id(_) => ScalarPlan::IndexIdRange,
+            // `TEXT` 結果の等価比較は `TEXT` 列の等価と同じ区分（INDEX-7 の語彙を増やさない）。
+            ExprIndexPredicate::Expression {
+                op: BinOp::Eq,
+                literal: ExprKeyLiteral::Text(_),
+                ..
+            } => ScalarPlan::IndexEquality,
+            ExprIndexPredicate::NumericColumn { .. } | ExprIndexPredicate::Expression { .. } => {
+                ScalarPlan::IndexTypedRange
+            }
+        };
         expr_predicate_count += 1;
     }
     let total = input.metadata_filters.len() + expr_predicate_count;
@@ -308,12 +444,8 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
     // ここに到達する時点で `total == 1`（`total == 0` は上の空判定で除外済み）。
     if expr_predicate_count == 1 {
         // 数値列の単純比較は `DATE`／`NUMERIC` 等と同じ「型付き範囲」区分へ
-        // 載せ、`EXPLAIN` の語彙を増やさない（Issue #1359）。
-        if single_expr_is_id {
-            ScalarPlan::IndexIdRange
-        } else {
-            ScalarPlan::IndexTypedRange
-        }
+        // 載せ、`EXPLAIN` の語彙を増やさない（Issue #1359。式索引の述語も同じ。Issue #1650）。
+        single_expr_plan
     } else {
         match input.metadata_filters[0].op() {
             crate::declarative_filter::FilterOp::Equals(_) => ScalarPlan::IndexEquality,
@@ -1172,7 +1304,10 @@ mod tests {
     #[test]
     fn collect_expr_index_predicates_is_all_or_nothing() {
         let ok = [numeric_cmp(BinOp::Ge, true, 1.0), id_gt(2.0)];
-        assert_eq!(collect_expr_index_predicates(&ok).map(|v| v.len()), Some(2));
+        assert_eq!(
+            collect_expr_index_predicates_with(&ok, &no_expression_match).map(|v| v.len()),
+            Some(2)
+        );
         let arith = BoundExpr::Binary {
             op: BinOp::Gt,
             lhs: Box::new(BoundExpr::Binary {
@@ -1183,7 +1318,7 @@ mod tests {
             rhs: Box::new(BoundExpr::Number(5.0)),
         };
         let mixed = [numeric_cmp(BinOp::Ge, true, 1.0), arith];
-        assert!(collect_expr_index_predicates(&mixed).is_none());
+        assert!(collect_expr_index_predicates_with(&mixed, &no_expression_match).is_none());
     }
 
     /// Issue #1359: 単独の数値列比較は `IndexTypedRange`、2 本以上は
@@ -1361,5 +1496,184 @@ mod tests {
             Bound::Unbounded => true,
         };
         lower_ok && upper_ok
+    }
+}
+
+/// 式索引の式一致（INDEX-10、Issue #1650）を分類へ加える `classify_scalar_plan_with` の単体テスト。
+/// 束縛器を介さず `BoundExpr` を直接組み立て、`finder` の応答だけで分類が決まることを固定する。
+#[cfg(test)]
+mod expression_match_tests {
+    use super::*;
+
+    fn n_plus_one() -> BoundExpr {
+        BoundExpr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(BoundExpr::ColumnRef { index: 3 }),
+            rhs: Box::new(BoundExpr::Number(1.0)),
+        }
+    }
+
+    fn cmp(op: BinOp, lhs: BoundExpr, rhs: BoundExpr) -> BoundExpr {
+        BoundExpr::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    fn classify(exprs: &[BoundExpr], finder: ExprFinder<'_>) -> ScalarPlan {
+        classify_scalar_plan_with(
+            &ScalarShapeInput {
+                scalar_prefilter: true,
+                metadata_filters: &[],
+                expr_filters: exprs,
+                or_filters: &[],
+            },
+            finder,
+        )
+    }
+
+    /// `n + 1` を宣言済みの `Scalar` 式として返す finder。
+    fn finder_for_n_plus_one(e: &BoundExpr, ty: ExprType) -> Option<ExprMatchRef> {
+        (ty == ExprType::Scalar && *e == n_plus_one()).then(|| ExprMatchRef {
+            index_name: "i_n".to_string(),
+            element: 0,
+        })
+    }
+
+    #[test]
+    fn without_a_match_expression_comparison_is_a_residual_plain_scan() {
+        let exprs = [cmp(BinOp::Gt, n_plus_one(), BoundExpr::Number(5.0))];
+        assert_eq!(
+            classify(&exprs, &no_expression_match),
+            ScalarPlan::PlainScan
+        );
+        // 従来の公開関数とも一致する（宣言を読めない箇所は従来どおり）。
+        assert_eq!(
+            classify_scalar_plan(&ScalarShapeInput {
+                scalar_prefilter: true,
+                metadata_filters: &[],
+                expr_filters: &exprs,
+                or_filters: &[],
+            }),
+            ScalarPlan::PlainScan
+        );
+    }
+
+    #[test]
+    fn matching_expression_becomes_an_index_predicate_in_either_operand_order() {
+        let lhs = [cmp(BinOp::Gt, n_plus_one(), BoundExpr::Number(5.0))];
+        let rhs = [cmp(BinOp::Lt, BoundExpr::Number(5.0), n_plus_one())];
+        assert_eq!(
+            classify(&lhs, &finder_for_n_plus_one),
+            ScalarPlan::IndexTypedRange
+        );
+        assert_eq!(
+            classify(&rhs, &finder_for_n_plus_one),
+            ScalarPlan::IndexTypedRange
+        );
+        // 左右入れ替えは演算子を反転して式を左辺へ揃える（`5 < e` は `e > 5`）。
+        let collected = collect_expr_index_predicates_with(&rhs, &finder_for_n_plus_one)
+            .expect("all predicates indexable");
+        assert_eq!(
+            collected,
+            vec![ExprIndexPredicate::Expression {
+                index_name: "i_n".to_string(),
+                element: 0,
+                op: BinOp::Gt,
+                literal: ExprKeyLiteral::Scalar(5.0),
+            }]
+        );
+    }
+
+    #[test]
+    fn text_equality_uses_the_equality_token_and_other_ops_the_range_token() {
+        let text_expr = BoundExpr::TextColumnRef { index: 2 };
+        let always = |_: &BoundExpr, ty: ExprType| {
+            (ty == ExprType::Text).then(|| ExprMatchRef {
+                index_name: "i_t".to_string(),
+                element: 0,
+            })
+        };
+        let eq = [cmp(
+            BinOp::Eq,
+            text_expr.clone(),
+            BoundExpr::Text("a".into()),
+        )];
+        let gt = [cmp(BinOp::Gt, text_expr, BoundExpr::Text("a".into()))];
+        assert_eq!(classify(&eq, &always), ScalarPlan::IndexEquality);
+        assert_eq!(classify(&gt, &always), ScalarPlan::IndexTypedRange);
+    }
+
+    #[test]
+    fn literal_kind_must_agree_with_the_expression_type() {
+        // finder は結果型 `Scalar` の式にだけ一致する。TEXT リテラルとの比較は一致しない。
+        let exprs = [cmp(BinOp::Eq, n_plus_one(), BoundExpr::Text("5".into()))];
+        assert_eq!(
+            classify(&exprs, &finder_for_n_plus_one),
+            ScalarPlan::PlainScan
+        );
+    }
+
+    #[test]
+    fn one_unmatched_predicate_keeps_the_whole_where_a_plain_scan() {
+        let exprs = [
+            cmp(BinOp::Gt, n_plus_one(), BoundExpr::Number(5.0)),
+            cmp(
+                BinOp::Gt,
+                BoundExpr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(BoundExpr::ColumnRef { index: 3 }),
+                    rhs: Box::new(BoundExpr::Number(2.0)),
+                },
+                BoundExpr::Number(5.0),
+            ),
+        ];
+        assert_eq!(
+            classify(&exprs, &finder_for_n_plus_one),
+            ScalarPlan::PlainScan
+        );
+        assert!(collect_expr_index_predicates_with(&exprs, &finder_for_n_plus_one).is_none());
+        assert!(matched_expression_index_names(&exprs, &finder_for_n_plus_one).is_none());
+    }
+
+    #[test]
+    fn two_matched_predicates_are_a_conjunction_with_deduplicated_names() {
+        let exprs = [
+            cmp(BinOp::Gt, n_plus_one(), BoundExpr::Number(1.0)),
+            cmp(BinOp::Le, n_plus_one(), BoundExpr::Number(9.0)),
+        ];
+        assert_eq!(
+            classify(&exprs, &finder_for_n_plus_one),
+            ScalarPlan::IndexConjunction
+        );
+        assert_eq!(
+            matched_expression_index_names(&exprs, &finder_for_n_plus_one),
+            Some(vec!["i_n".to_string()])
+        );
+    }
+
+    #[test]
+    fn candidate_filter_ignores_narrow_forms_and_non_comparisons() {
+        let narrow = cmp(
+            BinOp::Gt,
+            BoundExpr::ColumnRef { index: 3 },
+            BoundExpr::Number(1.0),
+        );
+        let id = cmp(BinOp::Gt, BoundExpr::IdRef, BoundExpr::Number(1.0));
+        let both_literal = cmp(BinOp::Eq, BoundExpr::Number(1.0), BoundExpr::Number(1.0));
+        let arithmetic = cmp(BinOp::Add, n_plus_one(), BoundExpr::Number(1.0));
+        assert!(!has_expression_candidate(&[
+            narrow,
+            id,
+            both_literal,
+            arithmetic
+        ]));
+        let candidate = cmp(BinOp::Eq, n_plus_one(), BoundExpr::Number(1.0));
+        assert!(has_expression_candidate(std::slice::from_ref(&candidate)));
+        assert_eq!(
+            expression_candidate_filters(std::slice::from_ref(&candidate)),
+            vec![candidate]
+        );
     }
 }

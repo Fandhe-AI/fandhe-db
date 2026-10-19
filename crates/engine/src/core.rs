@@ -2227,6 +2227,32 @@ fn scalar_index_names_for_columns(
     chosen
 }
 
+/// `scalar_plan:` の `index=` 注記へ出すスカラー索引名（INDEX-10、Issue #1650）。列述語の被覆名
+/// （[`scalar_index_names_for_columns`]）に、WHERE の式述語が一致した式索引名を合流させる。
+///
+/// - 列述語が無い（`column_names` が空）: 式索引名だけ。
+/// - 列述語がある: 全列が宣言で被覆されている場合に限り、被覆名と式索引名の和集合。被覆されない
+///   列が 1 つでもある・宣言を読めていない（`scalar_decls == None`）なら空（実行時は全走査へ縮退
+///   するため索引使用を主張しない）。昇順・重複排除は呼び出し元 `ExplainIndexNames::new` に委ねる。
+fn scalar_index_names_with_expressions(
+    scalar_decls: Option<&[(String, Vec<String>)]>,
+    column_names: &[&str],
+    expression_names: &[String],
+) -> Vec<String> {
+    if column_names.is_empty() {
+        return expression_names.to_vec();
+    }
+    let Some(decls) = scalar_decls else {
+        return Vec::new();
+    };
+    let mut names = scalar_index_names_for_columns(decls, column_names);
+    if names.is_empty() {
+        return Vec::new();
+    }
+    names.extend(expression_names.iter().cloned());
+    names
+}
+
 impl EngineCore {
     /// 指定パスの `redb` データベースを開き、既定の検索エンジン
     /// （[`crate::search_engine::default_engine`]）を注入した `EngineCore` を構築する。
@@ -7786,6 +7812,25 @@ impl EngineCore {
             self.hnsw_state.is_some(),
         );
 
+        // INDEX-10（Issue #1650）: 式索引の式一致を、世代照合を通過した `post_check_txn`（`bind` 時と
+        // 同じ世代のカタログ）から確定する。式候補が無いクエリはカタログを読まない。opt-in なし
+        // （`declarations_enabled == false`）は空のマッチャで、実行時と同じく式候補は全走査になる。
+        let (explain_scalar_plan, expression_index_names) =
+            if explain_shape.needs_expression_matcher() {
+                let matcher = if self.hnsw_state.is_some() {
+                    crate::sql::scalar_index::resolve_expression_matcher_for_table_in_txn(
+                        &post_check_txn,
+                        table,
+                        &post_check_schema,
+                    )
+                } else {
+                    crate::sql::expression_key_index::ExpressionIndexMatcher::empty()
+                };
+                explain_shape.resolve_expressions(&matcher)
+            } else {
+                (explain_shape.scalar_plan(), Vec::new())
+            };
+
         // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する（多層防御。
         // `Statement::Select` アームの `USING PLAN` 経路と同じ理由）。
         dictionary_required_columns(&post_check_schema)
@@ -7831,7 +7876,7 @@ impl EngineCore {
         // Issue #2191: 照合込みの使用可否と縮退理由（実行時の `candidates_for` と同じ判定関数）。
         let scalar_plan_with_reason =
             crate::sql::scalar_index::scalar_plan_under_target_with_reason(
-                explain_shape.scalar_plan(),
+                explain_scalar_plan,
                 explain_shape.metadata_filter_columns(),
                 &explain_shape.text_uses(),
                 &post_check_schema,
@@ -7857,6 +7902,7 @@ impl EngineCore {
             scalar_plan_with_reason.0,
             scalar_plan_with_reason.1,
             scalar_filter_column_names.as_deref(),
+            &expression_index_names,
         );
         drop(post_check_txn);
         Ok(crate::sql::explain::build_explain_result_with_indexes(
@@ -7941,6 +7987,7 @@ impl EngineCore {
         scalar_plan: crate::sql::scalar_plan::ScalarPlan,
         scalar_fallback: Option<crate::sql::scalar_index::ScalarFallbackReason>,
         scalar_filter_columns: Option<&[&str]>,
+        expression_index_names: &[String],
     ) -> (
         crate::sql::explain::ExplainEngine,
         crate::sql::explain::ExplainIndexNames,
@@ -8006,10 +8053,19 @@ impl EngineCore {
         // 未キャッシュな走査が `EXPLAIN` の呼び出しごとに発生してしまう。
         // 両条件のいずれかが真の場合に限りカタログを読む（走査自体は
         // キャッシュしないが、不要な呼び出しでは行わない）。
+        //
+        // INDEX-10（Issue #1650）: 式索引の名前は呼び出し元が一致判定で確定済みなので、式述語だけの
+        // WHERE（列述語なし）でも名前を出せる。列名を確定できない（`scalar_filter_columns == None`）
+        // ときは従来どおり名前を出さない。索引カタログの読み取り（列被覆の判定用）が要るのは
+        // 列述語があるときだけ。
+        let scalar_columns_nonempty = scalar_filter_columns.is_some_and(|cols| !cols.is_empty());
         let scalar_names_eligible = declarations_enabled
             && !matches!(scalar_plan, crate::sql::scalar_plan::ScalarPlan::PlainScan)
-            && scalar_filter_columns.is_some_and(|cols| !cols.is_empty());
-        let index_decls = if declarations_enabled && (ann_names_eligible || scalar_names_eligible) {
+            && scalar_filter_columns.is_some()
+            && (scalar_columns_nonempty || !expression_index_names.is_empty());
+        let index_decls = if declarations_enabled
+            && (ann_names_eligible || (scalar_names_eligible && scalar_columns_nonempty))
+        {
             // Issue #1066: `Err`（走査上限超過・デコード失敗）は「名前を
             // 出さない」へ fail-closed に倒す（`EXPLAIN` 自体は失敗させ
             // ない。トークン〔`hnsw_enabled`〕は上記判定のまま変えない）。
@@ -8030,10 +8086,12 @@ impl EngineCore {
         // テーブル内容・行数に依存する実行時縮退を観測しない既存契約
         // （`docs/design/explain-search-engine-exposure.md`「決定 1」節）を
         // 優先し、意図的に静的判定のみを報告する。
-        let scalar_names = match (&index_decls, scalar_filter_columns) {
-            (Some(decls), Some(cols)) if scalar_names_eligible => {
-                scalar_index_names_for_columns(&decls.scalar, cols)
-            }
+        let scalar_names = match scalar_filter_columns {
+            Some(cols) if scalar_names_eligible => scalar_index_names_with_expressions(
+                index_decls.as_ref().map(|decls| decls.scalar.as_slice()),
+                cols,
+                expression_index_names,
+            ),
             _ => Vec::new(),
         };
 
@@ -8115,14 +8173,37 @@ impl EngineCore {
         let scalar_prefilter =
             crate::sql::plan::ExecutionPlan::from_evaluation_order(bound.evaluation_order())
                 .scalar_prefilter;
-        let scalar_plan_before_target = crate::sql::scalar_plan::classify_scalar_plan(
+        // INDEX-10（Issue #1650）: 実行時（`sql::exec`）と同じ式索引の一致判定を同一の `read_txn` から
+        // 解決して分類へ加える（式候補が無い・opt-in なしのクエリは空のマッチャ＝従来どおり）。
+        let expr_matcher = if scalar_prefilter {
+            crate::sql::scalar_index::resolve_expression_matcher_in_txn(
+                read_txn,
+                bound.table(),
+                schema,
+                self.hnsw_state.is_some(),
+                bound.expr_filters(),
+            )
+        } else {
+            crate::sql::expression_key_index::ExpressionIndexMatcher::empty()
+        };
+        let expr_finder = |e: &crate::sql::udf_call::BoundExpr,
+                           ty: crate::sql::udf_call::ExprType| {
+            expr_matcher.find(e, ty)
+        };
+        let scalar_plan_before_target = crate::sql::scalar_plan::classify_scalar_plan_with(
             &crate::sql::scalar_plan::ScalarShapeInput {
                 scalar_prefilter,
                 metadata_filters: bound.metadata_filters(),
                 expr_filters: bound.expr_filters(),
                 or_filters: bound.or_filters(),
             },
+            &expr_finder,
         );
+        let expression_index_names = crate::sql::scalar_plan::matched_expression_index_names(
+            bound.expr_filters(),
+            &expr_finder,
+        )
+        .unwrap_or_default();
         // Issue #1066: `metadata_filters` が参照する列を同一 `schema` で
         // 列名へ写像する（添字は `MetadataFilter::column_index` のドキュメント
         // どおり `schema.columns` と同一空間）。写像に失敗する列があれば
@@ -8172,6 +8253,7 @@ impl EngineCore {
             scalar_plan,
             scalar_fallback,
             scalar_filter_column_names.as_deref(),
+            &expression_index_names,
         );
         crate::sql::explain::build_search_explain_result(bound.mode(), &engine, &index_names)
     }
@@ -8242,8 +8324,20 @@ impl EngineCore {
             &schema.name,
             self.hnsw_state.is_some(),
         );
+        // INDEX-10（Issue #1650）: 実行時と同じ式索引の一致判定を同一の `read_txn` から解決する。
+        let expr_matcher = crate::sql::scalar_index::resolve_expression_matcher_in_txn(
+            read_txn,
+            &schema.name,
+            schema,
+            self.hnsw_state.is_some(),
+            bound.expr_filters(),
+        );
+        let expr_finder = |e: &crate::sql::udf_call::BoundExpr,
+                           ty: crate::sql::udf_call::ExprType| {
+            expr_matcher.find(e, ty)
+        };
         let (scalar_plan, scalar_fallback, access_path) =
-            crate::sql::aggregate::classify_aggregate_access(schema, bound, &target);
+            crate::sql::aggregate::classify_aggregate_access(schema, bound, &target, &expr_finder);
         // Issue #1066: `access_path`（上記 `target` 補正後の値）が
         // `ScalarIndexCandidates` のときに限り、`metadata_filters` の列が
         // すべて対象テーブルのスカラー宣言で被覆されているかを確認して索引名を
@@ -8255,6 +8349,11 @@ impl EngineCore {
             crate::sql::explain::AccessPath::ScalarIndexCandidates
         ) && self.hnsw_state.is_some()
         {
+            let expression_names = crate::sql::scalar_plan::matched_expression_index_names(
+                bound.expr_filters(),
+                &expr_finder,
+            )
+            .unwrap_or_default();
             match scalar_filter_column_names_with_numeric(
                 schema,
                 bound.metadata_filters(),
@@ -8264,12 +8363,20 @@ impl EngineCore {
                     match self.read_explain_index_names_in_txn(read_txn, bound.table()) {
                         Ok(decls) => crate::sql::explain::ExplainIndexNames::new(
                             Vec::new(),
-                            scalar_index_names_for_columns(&decls.scalar, &cols),
+                            scalar_index_names_with_expressions(
+                                Some(decls.scalar.as_slice()),
+                                &cols,
+                                &expression_names,
+                            ),
                         ),
                         Err(_) => crate::sql::explain::ExplainIndexNames::default(),
                     }
                 }
-                _ => crate::sql::explain::ExplainIndexNames::default(),
+                // 列述語が無く式述語だけ: 索引カタログを読まず、一致済みの式索引名だけを出す。
+                Some(_) => {
+                    crate::sql::explain::ExplainIndexNames::new(Vec::new(), expression_names)
+                }
+                None => crate::sql::explain::ExplainIndexNames::default(),
             }
         } else {
             crate::sql::explain::ExplainIndexNames::default()
