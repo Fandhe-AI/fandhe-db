@@ -316,7 +316,7 @@ pub struct BoundInsert {
 
 /// 内容照合ハッシュが評価値をそのまま使わない列（DEFAULT 適用列は除外、`VALUES` 内の時刻関数列は
 /// 構文形。SQL-37・Issue #1587・#1629・#2188）。`tenant` の INSERT 系書き込みと `sql::exec` が共有する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VolatileColumn {
     /// 省略列へ `DEFAULT`（定数・時刻とも）を適用した列（`schema.columns` 上の位置）。
     /// 内容照合ハッシュの材料から除外する（Issue #1629。旧ハッシュ種別 `2` は退役・再利用禁止）。
@@ -329,6 +329,16 @@ pub enum VolatileColumn {
     /// NOT NULL 列の DROP DEFAULT を挟んだ同一文の再送を `23505` にするため）。
     /// 行形 INSERT（単一行・複数行 VALUES）の束縛だけが生成し、他の束縛経路は即時 `23502` のまま。
     MissingNotNull(usize),
+    /// `VALUES` の要素が単独の `nextval('<名前>')`／`currval('<名前>')` だった列（位置・関数・名前。
+    /// TABLE-24・Issue #1690）。`values` の該当位置は `Null` の仮値で、`tenant` の INSERT 系書き込みが
+    /// 台帳照合の後（再送では採番しないため）に書き込み txn 内で採番・解決して差し込む。
+    /// 内容照合ハッシュは構文形（`HashColumnInput::ValuesSequence`）を使う。
+    Sequence(usize, crate::sql::allowlist::SequenceFunc, String),
+    /// 省略列へ `DEFAULT nextval('<名前>')`（[`crate::catalog::ColumnDefault::Sequence`]）を適用する
+    /// 列（位置。TABLE-24・Issue #1690）。名前は書き込み txn 内で再取得したスキーマの DEFAULT から
+    /// 読む。仮値・採番の扱いは [`VolatileColumn::Sequence`] と同じで、ハッシュ材料からは
+    /// [`VolatileColumn::Default`] と同様に除外する（Issue #1629 D1）。
+    DefaultSequence(usize),
 }
 
 impl VolatileColumn {
@@ -337,7 +347,9 @@ impl VolatileColumn {
         match self {
             VolatileColumn::Default(i)
             | VolatileColumn::Values(i, _)
-            | VolatileColumn::MissingNotNull(i) => *i,
+            | VolatileColumn::MissingNotNull(i)
+            | VolatileColumn::Sequence(i, _, _)
+            | VolatileColumn::DefaultSequence(i) => *i,
         }
     }
 }
@@ -350,6 +362,16 @@ pub(crate) fn reject_current_time_literal(name: &str) -> SqlSurfaceError {
     SqlSurfaceError::invalid_input(format!(
         "column {name:?} does not accept a time function in this position"
     ))
+}
+
+/// `InsertLiteral::SequenceCall`（`VALUES` 要素の単独 `nextval`／`currval`。TABLE-24・Issue #1690）を
+/// 受理しない束縛経路（UPDATE のリテラル・UPSERT・ファイル形 INSERT・COPY・NoSQL・数値／整数列の
+/// 共通束縛ヘルパー）の共通拒否（`0A000`。fail-closed。採番は `bind_insert_row` が運ぶ印を
+/// `tenant` の INSERT 書き込みが処理する経路に限る）。値・SEQUENCE 名を含めない固定文言。
+pub(crate) fn reject_sequence_call_literal() -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: "nextval and currval are not supported in this context".to_string(),
+    }
 }
 
 /// 定数式が TIMESTAMPTZ に評価された値（UTC マイクロ秒）を、代入先の列型へ束縛する
@@ -445,6 +467,7 @@ pub(crate) fn bind_numeric_literal(
         InsertLiteral::CurrentTime(_) | InsertLiteral::TimestampTz(_) => {
             return Err(reject_current_time_literal(name))
         }
+        InsertLiteral::SequenceCall { .. } => return Err(reject_sequence_call_literal()),
         // 呼び出し元（`bind_insert`／`bind_set_assignments`／
         // `bind_upsert_assignments`）はいずれも `InsertLiteral::Null` を
         // 本関数へ渡すより前に nullable 判定込みで独自に処理するため実際には
@@ -592,6 +615,7 @@ pub(crate) fn bind_integer_literal(
         InsertLiteral::CurrentTime(_) | InsertLiteral::TimestampTz(_) => {
             return Err(reject_current_time_literal(name))
         }
+        InsertLiteral::SequenceCall { .. } => return Err(reject_sequence_call_literal()),
         InsertLiteral::Bool(_) | InsertLiteral::Null | InsertLiteral::Vector(_) => {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "column {name:?} expects an integer literal, got a non-integer literal"
@@ -3120,6 +3144,12 @@ pub(crate) fn fill_omitted_columns(
             continue;
         }
         match &column.default_expr {
+            Some(ColumnDefault::Sequence(_)) => {
+                // 採番は書き込み txn 内（台帳照合の後）で行う。仮値 `Null` を置いて印だけ運ぶ
+                // （TABLE-24・Issue #1690）。この印を処理しない経路は `tenant` 側で `0A000`、
+                // COPY などは束縛直後に印を検出して拒否する。
+                volatile.push(VolatileColumn::DefaultSequence(idx));
+            }
             Some(ColumnDefault::CurrentTime(time)) => {
                 // 評価時刻の無い文脈は `0A000`（fail-closed。ファイル INSERT・FK の
                 // SET DEFAULT 等は `bind_column_default` 側で常に拒否される）。
@@ -3189,6 +3219,14 @@ pub(crate) fn bind_column_default(
     // 常に `0A000`（既定が拒否の fail-closed。INSERT の省略列補完は `fill_omitted_columns`
     // が評価する。ファイル INSERT・FK の SET DEFAULT 等の新経路が追加されても拒否が抜けない。
     // SQL-37・Issue #1587、設計 D9）。
+    if matches!(default, ColumnDefault::Sequence(_)) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!(
+                "column {:?} sequence DEFAULT is not supported in this context",
+                column.name
+            ),
+        });
+    }
     if matches!(default, ColumnDefault::CurrentTime(_)) {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: format!(
@@ -3322,6 +3360,7 @@ fn bind_insert_row(
         | InsertLiteral::Null
         | InsertLiteral::CurrentTime(_)
         | InsertLiteral::TimestampTz(_)
+        | InsertLiteral::SequenceCall { .. }
         | InsertLiteral::Vector(_) => {
             return Err(SqlSurfaceError::invalid_input(
                 "id pseudo-column value must be a number",
@@ -3375,10 +3414,31 @@ fn bind_insert_row(
             volatile_values.push(VolatileColumn::Values(col_idx, *time));
             continue;
         }
+        if let InsertLiteral::SequenceCall { func, name: seq } = literal {
+            // `nextval`／`currval` の単独形（TABLE-24・Issue #1690）。ここでは列型だけを検査し、
+            // 仮値 `Null` と印を運ぶ（採番・解決は書き込み txn 内の台帳照合の後。`tenant`）。
+            if !matches!(
+                column.ty,
+                ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt
+            ) {
+                return Err(SqlSurfaceError::datatype_mismatch(format!(
+                    "column {name:?} type does not match the sequence function"
+                )));
+            }
+            if let Some(flag) = provided.get_mut(col_idx) {
+                *flag = true;
+            }
+            volatile_values.push(VolatileColumn::Sequence(col_idx, *func, seq.clone()));
+            continue;
+        }
         let value = match (&column.ty, literal) {
             // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。
             (_, InsertLiteral::CurrentTime(_)) => {
                 return Err(reject_current_time_literal(name));
+            }
+            // `nextval`／`currval` の単独形も上で処理済み（到達しない）。fail-closed で拒否する。
+            (_, InsertLiteral::SequenceCall { .. }) => {
+                return Err(reject_sequence_call_literal());
             }
             // 定数式の TIMESTAMPTZ 結果は代入先の列型で変換する（Issue #1576）。
             (ty, InsertLiteral::TimestampTz(micros)) => bind_tstz_literal(name, ty, *micros)?,
@@ -3865,6 +3925,9 @@ fn bind_set_assignments(
             // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。
             (_, InsertLiteral::CurrentTime(_) | InsertLiteral::TimestampTz(_)) => {
                 return Err(reject_current_time_literal(name));
+            }
+            (_, InsertLiteral::SequenceCall { .. }) => {
+                return Err(reject_sequence_call_literal());
             }
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
@@ -4918,6 +4981,18 @@ fn bind_upsert_form(
             false,
         )?);
     }
+    // UPSERT は `nextval`／`currval`（VALUES・列 DEFAULT）を採番しない（TABLE-24・Issue #1690。
+    // 衝突時の欠番・`DO UPDATE` との意味が未設計のため fail-closed で拒否する）。
+    if rows.iter().any(|r| {
+        r.volatile_default_columns.iter().any(|c| {
+            matches!(
+                c,
+                VolatileColumn::Sequence(..) | VolatileColumn::DefaultSequence(..)
+            )
+        })
+    }) {
+        return Err(reject_sequence_call_literal());
+    }
 
     let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     seen_ids
@@ -5085,6 +5160,9 @@ fn bind_upsert_assignments(
             // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。
             (_, InsertLiteral::CurrentTime(_) | InsertLiteral::TimestampTz(_)) => {
                 return Err(reject_current_time_literal(name));
+            }
+            (_, InsertLiteral::SequenceCall { .. }) => {
+                return Err(reject_sequence_call_literal());
             }
                     (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
@@ -5319,6 +5397,9 @@ fn bind_file_insert(
             // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。
             (_, InsertLiteral::CurrentTime(_) | InsertLiteral::TimestampTz(_)) => {
                 return Err(reject_current_time_literal(name));
+            }
+            (_, InsertLiteral::SequenceCall { .. }) => {
+                return Err(reject_sequence_call_literal());
             }
             (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::String(s)) => {
                 bind_text_literal(&column.ty, s)?

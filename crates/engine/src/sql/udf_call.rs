@@ -2084,6 +2084,10 @@ fn is_reserved_function_name(name: &str) -> bool {
             | "ANY"
             | "SOME"
             | "ALL"
+            // `nextval`／`currval`（TABLE-24・Issue #1690）は INSERT の VALUES・列 DEFAULT の
+            // 構文形としてだけ解釈される。同名の UDF を許すと呼び出せない定義が登録できてしまう。
+            | "NEXTVAL"
+            | "CURRVAL"
     ) || is_builtin_function_name(name)
         || crate::sql::allowlist::is_aggregate_function_name(name)
 }
@@ -5824,6 +5828,14 @@ fn bind_call(
         ));
     }
     let lower_name = name.to_ascii_lowercase();
+    // `nextval`／`currval` は INSERT の VALUES 要素・列 DEFAULT の単独形でだけ使える
+    // （TABLE-24・Issue #1690）。SELECT 投影・WHERE・UPDATE SET・ビュー本文などの式位置は
+    // 書き込み txn を伴う評価経路が無いため、`42883` へ落とさず `0A000` で拒否する（固定文言）。
+    if lower_name == "nextval" || lower_name == "currval" {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "nextval and currval are not supported in this context".to_string(),
+        });
+    }
     if crate::sql::json_fn::is_json_fn_name(&lower_name) {
         return crate::sql::json_fn::bind_json_fn(&lower_name, args, env, node_budget);
     }

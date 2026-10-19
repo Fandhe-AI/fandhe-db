@@ -68,6 +68,9 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // TABLE-42・Issue #1664: 未実体化の MATERIALIZED VIEW の読み取り。対象の状態と
         // 矛盾する操作として 409（NoSQL 表層からは matview へ到達できないが網羅 match のため定義）。
         ErrorClass::ObjectNotInPrerequisiteState => 409,
+        // TABLE-24・Issue #1690: SEQUENCE の上限・下限到達（`2200H`）は入力（採番の累積）起因の
+        // 拒否として 400（`NumericOutOfRange` と同類）。
+        ErrorClass::SequenceGeneratorLimitExceeded => 400,
         // TABLE-43 (2)・Issue #1673: ビューの `WITH CHECK OPTION` 違反（`44000`）。書き込む行の値が
         // ビューの条件と矛盾する入力起因の拒否として 400（NoSQL 表層からはビューへ書けないため到達しない
         // が、網羅 match のため定義）。
@@ -194,7 +197,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 72] = [
+    const EXPECTED: [(ErrorClass, u16); 73] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -225,6 +228,7 @@ mod tests {
         (ErrorClass::InvalidTextRepresentation, 400),
         (ErrorClass::LockNotAvailable, 503),
         (ErrorClass::ObjectNotInPrerequisiteState, 409),
+        (ErrorClass::SequenceGeneratorLimitExceeded, 400),
         (ErrorClass::WithCheckOptionViolation, 400),
         (ErrorClass::InvalidTransactionState, 400),
         (ErrorClass::ActiveSqlTransaction, 400),
