@@ -16,7 +16,7 @@ use crate::policy::PolicyContext;
 use crate::sql::allowlist::{SqlSurfaceError, TableLookup, TempOnCommit};
 use crate::sql::mode::SessionState;
 use crate::sql::temp_catalog::{
-    tokens_reference_temp, ResolvedRelation, SessionRelationLookup, SessionTempCatalog,
+    tokens_reference_temp, SessionRelationLookup, SessionTempCatalog,
     DEFAULT_MAX_TEMP_TABLES_PER_SESSION,
 };
 use crate::storage::{Storage, Visibility};
@@ -123,14 +123,8 @@ fn table_44_resolution_prefers_temp() {
     let mut cat = SessionTempCatalog::default();
     cat.register(schema("t", &["x"]), TempOnCommit::PreserveRows, 4)
         .expect("register");
-    assert!(matches!(
-        cat.resolve_unqualified("t"),
-        ResolvedRelation::Temp(_)
-    ));
-    assert!(matches!(
-        cat.resolve_unqualified("other"),
-        ResolvedRelation::Persistent("other")
-    ));
+    assert!(cat.get("t").is_some());
+    assert!(cat.get("other").is_none());
 }
 
 // ---- ラッパー ----
@@ -252,40 +246,36 @@ fn session_with_temp_t() -> SessionState {
     s
 }
 
+/// 実体（一時 DB のテーブル）も作った一時表 `t(a TEXT)` を持つセッション。
+fn session_with_real_temp_t(core: &EngineCore) -> SessionState {
+    let mut s = SessionState::default();
+    run(core, &mut s, "tenant-a", "CREATE TEMP TABLE t (a TEXT)").expect("create temp t");
+    s
+}
+
 #[test]
 fn table_44_temp_name_never_touches_the_persistent_table() {
     let path = unique_db_path("temp-catalog-hide");
     let _g = CleanupGuard(path.clone());
     let core = open_core(&path);
     setup_persistent(&core);
-    let mut a = session_with_temp_t();
+    let mut a = session_with_real_temp_t(&core);
 
-    for sql in [
-        "SELECT * FROM t LIMIT 10",
-        "DELETE FROM t WHERE id = 1",
-        "TRUNCATE t",
-        "TRUNCATE u, T",
-        "CREATE INDEX i ON t (a)",
-        "INSERT INTO t (id, embedding, a) VALUES (2, '[0.1,0.2]', 'q') USING OPERATION_ID 'op-2'",
+    // 一時表 `t` への文は一時表だけに作用する（永続表 `t` の 1 行は読めず、消えない）。
+    for (sql, expected) in [
+        ("SELECT * FROM t LIMIT 10", Ok(0)),
+        ("DELETE FROM t WHERE id = 1", Ok(0)),
+        ("TRUNCATE t", Ok(0)),
+        ("CREATE INDEX i ON t (a)", Ok(0)),
+        ("INSERT INTO t (id, a) VALUES (2, 'q')", Ok(0)),
+        ("SELECT * FROM t LIMIT 10", Ok(1)),
+        // 一時表と永続表を 1 文で混ぜる文は拒否する（fail-closed）。
+        ("TRUNCATE u, t", Err("0A000".to_string())),
     ] {
-        assert_eq!(
-            run(&core, &mut a, "tenant-a", sql),
-            Err("0A000".to_string()),
-            "{sql}"
-        );
+        assert_eq!(run(&core, &mut a, "tenant-a", sql), expected, "{sql}");
     }
 
-    // `DROP TABLE t` は一時表の `t` だけを消す（TABLE-44・Issue #1683）。永続表は無傷で、
-    // 削除後は名前が永続表へ解決される。
-    assert_eq!(run(&core, &mut a, "tenant-a", "DROP TABLE t"), Ok(0));
-    assert!(a.temp_tables().is_empty());
-    assert_eq!(
-        run(&core, &mut a, "tenant-a", "SELECT * FROM t LIMIT 10"),
-        Ok(1)
-    );
-    let mut a = session_with_temp_t();
-
-    // 同じテナントの別セッション・別テナントは永続表を従来どおり読める。
+    // 同じテナントの別セッション・別テナントは永続表を従来どおり読める（行は無傷）。
     let mut b = SessionState::default();
     assert_eq!(
         run(&core, &mut b, "tenant-a", "SELECT * FROM t LIMIT 10"),
@@ -297,7 +287,17 @@ fn table_44_temp_name_never_touches_the_persistent_table() {
         Ok(0)
     );
 
-    // 無関係の永続表は A でも従来どおり使える。
+    // `DROP TABLE t` は一時表の `t` だけを消す（TABLE-44・Issue #1683）。永続表は無傷で、
+    // 削除後は名前が永続表へ解決される。
+    assert_eq!(run(&core, &mut a, "tenant-a", "DROP TABLE t"), Ok(0));
+    assert!(a.temp_tables().is_empty());
+    assert_eq!(
+        run(&core, &mut a, "tenant-a", "SELECT * FROM t LIMIT 10"),
+        Ok(1)
+    );
+
+    // 無関係の永続表は一時表を持つセッションでも従来どおり使える。
+    let mut a = session_with_real_temp_t(&core);
     assert_eq!(
         run(&core, &mut a, "tenant-a", "SELECT * FROM u LIMIT 10"),
         Ok(0)
@@ -327,8 +327,9 @@ fn table_44_transaction_control_is_never_blocked_and_rollback_restores_catalog()
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&c, &mut a, &mut txn, "BEGIN")
         .expect("begin");
+    // 振り分け対象外の文種（ALTER）で一時表の名前が現れる文は拒否され、Failed に遷移する。
     let err = core
-        .execute_sql_in_txn(&c, &mut a, &mut txn, "SELECT * FROM t LIMIT 1")
+        .execute_sql_in_txn(&c, &mut a, &mut txn, "ALTER TABLE t ADD COLUMN z TEXT")
         .expect_err("temp ref");
     assert_eq!(err.wire_code(), "0A000");
     let err = core
@@ -399,28 +400,31 @@ fn table_44_quoted_null_temp_name_never_touches_the_persistent_table() {
     .expect("persistent quoted NULL table");
     let mut a = SessionState::default();
     a.allow_ddl();
-    a.temp_tables_mut()
-        .register(
-            schema("NULL", &["x"]),
-            TempOnCommit::PreserveRows,
-            DEFAULT_MAX_TEMP_TABLES_PER_SESSION,
-        )
-        .expect("register temp");
-    for sql in [
-        "ALTER TABLE \"NULL\" ADD COLUMN b TEXT",
-        "CREATE INDEX i ON \"NULL\" (a)",
-        "TRUNCATE \"NULL\"",
-    ] {
-        assert_eq!(
-            run(&core, &mut a, "tenant-a", sql),
-            Err("0A000".to_string()),
-            "{sql}"
-        );
+    run(
+        &core,
+        &mut a,
+        "tenant-a",
+        "CREATE TEMP TABLE \"NULL\" (a TEXT)",
+    )
+    .expect("temp quoted NULL table");
+    // 振り分け対象外の文種は拒否する。一時表向けの文は一時表だけに作用する。
+    assert_eq!(
+        run(
+            &core,
+            &mut a,
+            "tenant-a",
+            "ALTER TABLE \"NULL\" ADD COLUMN b TEXT"
+        ),
+        Err("0A000".to_string())
+    );
+    for sql in ["CREATE INDEX i ON \"NULL\" (a)", "TRUNCATE \"NULL\""] {
+        assert_eq!(run(&core, &mut a, "tenant-a", sql), Ok(0), "{sql}");
     }
-    let err = core
-        .begin_copy(&ctx("tenant-a"), &a, "COPY \"NULL\" FROM STDIN")
-        .expect_err("copy gate");
-    assert_eq!(err.wire_code(), "0A000");
+    // COPY も一時表だけを対象にする（一時 DB に無い表を指す文は拒否される）。
+    let plan = core
+        .begin_copy(&ctx("tenant-a"), &a, "COPY \"NULL\" (id, a) FROM STDIN")
+        .expect("copy plan on the temp table");
+    assert!(matches!(plan, crate::core::CopyPlan::From(_)));
     // `DROP TABLE "NULL"` は一時表だけを消し、永続表は無傷（TABLE-44・Issue #1683）。
     assert_eq!(run(&core, &mut a, "tenant-a", "DROP TABLE \"NULL\""), Ok(0));
     assert!(a.temp_tables().is_empty());

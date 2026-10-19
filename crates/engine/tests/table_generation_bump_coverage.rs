@@ -76,8 +76,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （旧: 652／683）。
     // Issue #1179（`storage::read_source` モジュール宣言の追加）で行番号が移動したための追随（旧: 804／835）。
     // Issue #1128（`begin_partitioned_chunk_txn` の追加）で行番号が移動したための追随（旧: 820／851）。
-    ("storage.rs", 930),
-    ("storage.rs", 961),
+    // TABLE-44・Issue #1684（`Storage::from_db`・`open_with_backend` の追加）で行番号が移動した
+    // ための追随（旧: 930／961）。
+    ("storage.rs", 950),
+    ("storage.rs", 981),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 201),
     ("txn.rs", 372),
@@ -208,7 +210,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+101 行。旧: 11169）。（main 取り込み後の再追随）
     // Issue #1664（MATERIALIZED VIEW の列 DDL ガード・TableLookup 追加）で catalog.rs の 5 エントリを +28 行追随（旧: 12373／12454／12563／12635／13017）。
-    ("catalog.rs", 12401),
+    ("catalog.rs", 12419),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -275,7 +277,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+101 行。旧: 11250）。
-    ("catalog.rs", 12482),
+    ("catalog.rs", 12500),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -335,7 +337,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+131 行。旧: 11389）。
-    ("catalog.rs", 12591),
+    ("catalog.rs", 12609),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -403,10 +405,16 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+131 行。旧: 11422）。
     // Issue #1644（TRUNCATE CASCADE／RESTRICT）で catalog.rs 全エントリ +1・tenant.rs 506→516 に追随。
     // Issue #1663（MATERIALIZED VIEW のカタログ追加）の base 取り込みで追随（旧: 13013）。
-    ("catalog.rs", 12663),
+    ("catalog.rs", 12681),
     // `Storage::create_or_replace_view_checked`（TABLE-41 (2)、Issue #1660。`create_or_replace_view` の本体）: `create_view` と同じく
     // `[VIEWS_TABLE]` のみを書く（上書き）。ビューは行ストア・世代を持たないためバンプ対象がない。
-    ("catalog.rs", 13045),
+    ("catalog.rs", 13063),
+    // `Storage::drop_tables`（Issue #1684 で本体を `drop_tables_in_txn` へ切り出した）: 世代 bump は
+    // 同一 write txn で先に呼ばれる `drop_tables_in_txn` 内（削除する各表と FK を外した参照元表）で
+    // 行われ、本呼び出しはその結果（`dropped > 0`）を単一 commit で確定させるだけ。`bump` が
+    // 直前 60 行の外（別関数）へ移ったための許可。
+    ("catalog.rs", 10038),
+    // 上記 `drop_tables_in_txn` 切り出し（+18 行）に伴い、以降の catalog.rs エントリ（12419／12500／12609／12681／13063）を追随（旧: 12401／12482／12591／12663／13045）。
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_
@@ -426,7 +434,15 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 抽出し、Issue #1179 で COMMIT 時の遅延 FK 検査対象を dirty テーブル（世代の変化
     // から検出）へ拡張したことでさらに移動（旧: 330）。書き込み内容・commit の意味は不変。
     // Issue #1553（明示トランザクションの最大時間・最大文数の CLI 設定化）の行追加でさらに移動（旧: 793）。
-    ("sql/transaction.rs", 899),
+    // TABLE-44・Issue #1684（一時表の DML）: `commit_active` に一時側の確定・`ON COMMIT` 適用が加わり
+    // 行が移動したための追随（旧: 899）。書き込み内容・commit の意味は不変。
+    ("sql/transaction.rs", 955),
+    // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
+    // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
+    // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が
+    // 開いているトランザクションに積んだ変更だけで、本箇所自体は新たな `user_rows/{table}` 書き込みを
+    // 行わない。一時 DB の世代は一時コア専用のキャッシュ（永続コアと共有しない）だけが読む。
+    ("sql/temp_rows.rs", 264),
     // Issue #1129（分割実行 DML の取り消し）: 取り消し済み記録への縮小（`partitioned_job::
     // cancel_in_txn`）はジョブ表（`PARTITIONED_JOB_TABLE`・索引表）だけを書き、
     // `CATALOG_TABLE`／`user_rows/{table}` のいずれにも触れない（commit 済みチャンクの行は

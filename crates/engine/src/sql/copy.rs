@@ -737,6 +737,10 @@ pub struct CopyInSession {
     /// 確定した値を保持し、[`Self::feed`]／[`Self::finish`] で TZ 無しの `TIMESTAMPTZ` 入力の解釈に使う。
     // `Box`: `CopyPlan::From` の `clippy::large_enum_variant` を避けるため（schema と同じ理由）。
     time_zone: Box<crate::datetime::SessionTimeZone>,
+    /// 一時表（TABLE-44・Issue #1684）を対象にする COPY か。`Some` のとき commit は一時コアが
+    /// 一時 DB へ行う（`EngineCore::commit_copy_in_txn_in_session`）。永続の入口
+    /// （`commit_copy_in`／`commit_copy_in_txn`）は一時表向けのバッチを `0A000` で拒否する。
+    temp: Option<crate::sql::temp_rows::TempCopyTarget>,
 }
 
 impl CopyInSession {
@@ -805,7 +809,15 @@ impl CopyInSession {
             clock,
             clock_used: false,
             time_zone: Box::new(time_zone),
+            temp: None,
         })
+    }
+
+    /// 一時表向けの COPY として印を付ける（`EngineCore::begin_copy` の一時表の経路が呼ぶ）。
+    #[must_use]
+    pub(crate) fn with_temp(mut self, target: crate::sql::temp_rows::TempCopyTarget) -> Self {
+        self.temp = Some(target);
+        self
     }
 
     /// FROM 対象テーブル名（wire-server の CopyInResponse 送出前の分岐でも
@@ -915,6 +927,7 @@ impl CopyInSession {
             bounds: self.bounds,
             schema: *self.schema,
             evaluated_at: self.clock_used.then_some(self.clock.txn_start_micros),
+            temp: self.temp,
         })
     }
 }
@@ -929,6 +942,8 @@ pub struct CopyInBatch {
     pub(crate) schema: TableSchema,
     /// 時刻 DEFAULT を評価した場合の台帳 v3 評価時刻（トランザクション開始時刻。Issue #2188）。
     pub(crate) evaluated_at: Option<i64>,
+    /// 一時表向けのバッチなら対象ストアと準備時の一時カタログ世代（`CopyInSession::with_temp`）。
+    pub(crate) temp: Option<crate::sql::temp_rows::TempCopyTarget>,
 }
 
 impl CopyInBatch {

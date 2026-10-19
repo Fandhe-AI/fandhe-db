@@ -366,10 +366,13 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 
 `--max-temp-tables <N>`（既定 64・範囲 `1`〜`64`）・`--max-temp-bytes <N>`（既定 67,108,864・範囲
 `1`〜`67,108,864`）（Issue #1683・TABLE-44）は、一時表（`CREATE TEMP TABLE`）の 1 セッション（接続）あたりの
-件数と論理総バイト数の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は
+件数と総バイト数（確保済みページ総量）の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は
 既定のハード上限と同じ値で、挙動は変わりません。メモリの最悪値は「最大接続数 × バイト上限」です）。
 超過時の SQLSTATE は `54000` です。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で
 起動エラーです。上限を引き上げることはできません（詳細: [docs/design/temp-table.md](docs/design/temp-table.md)）。
+一時表には永続表と同じ `INSERT`／`UPDATE`／`DELETE`／`TRUNCATE`／`SELECT`／`COPY`・制約・索引（`CREATE [UNIQUE] INDEX`）
+が使えます（Issue #1684）。書き込みは `operation_id` 台帳の対象外（`USING OPERATION_ID` は `0A000`）で、
+一時表と永続表を 1 文で参照する文・`ALTER TABLE`・カーソル・`VECTOR` 列は `0A000` です。
 
 `--max-jsonpath-steps <N>`（既定 4,000,000・範囲 `1`〜`4,000,000`）・`--max-jsonpath-depth <N>`（既定 1,024・
 範囲 `1`〜`1,024`）（Issue #2184・TABLE-25）は、jsonpath 評価器の評価ステップ数と再帰深さの上限を、

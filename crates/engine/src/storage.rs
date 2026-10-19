@@ -736,7 +736,12 @@ impl Storage {
         durability: WriteDurability,
     ) -> Result<Self> {
         let db = redb::Database::create(path)?;
-        Ok(Self {
+        Ok(Self::from_db(db, durability))
+    }
+
+    /// 開いた `redb::Database` から `Storage` を組み立てる共通本体。
+    fn from_db(db: redb::Database, durability: WriteDurability) -> Self {
+        Self {
             db,
             durability,
             #[cfg(test)]
@@ -746,7 +751,22 @@ impl Storage {
             write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             #[cfg(feature = "test-sync-points")]
             sync_hook: std::sync::Mutex::new(None),
-        })
+        }
+    }
+
+    /// 任意の `redb` backend 上に `Storage` を作る（TABLE-44・Issue #1684。セッション単位の
+    /// 一時表専用のインメモリ DB が `sql::temp_rows` から呼ぶ）。永続 DB のファイルには一切
+    /// 触れず、writer gate・台帳・世代表はこのインスタンス専用になる（永続 DB と共有しない）。
+    /// `cache_size` は redb のページキャッシュ上限（インメモリでは backend との二重持ちになるため
+    /// 呼び出し元が小さく指定する）。durability は既定の `Immediate` のまま。
+    pub(crate) fn open_with_backend<B: redb::StorageBackend>(
+        backend: B,
+        cache_size: usize,
+    ) -> Result<Self> {
+        let db = redb::Builder::new()
+            .set_cache_size(cache_size)
+            .create_with_backend(backend)?;
+        Ok(Self::from_db(db, WriteDurability::default()))
     }
 
     /// 同期点コールバックを設定・解除する（テスト専用。feature `test-sync-points` 限定、
