@@ -2667,6 +2667,14 @@ pub(crate) fn execute_create_index(
             detail: "expression indexes are not supported for this index kind yet".to_string(),
         });
     }
+    // 防御ゲート（INDEX-11、Issue #1653）: 述語付きは構文段の最終ゲートで拒否済みだが、将来の
+    // 経路変更で届いても、述語を黙って落として列だけの索引を保存しない（fail-closed）。
+    // Issue #1654 が述語の格納を実装する際に撤去する。
+    if validated.predicate().is_some() {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "partial indexes are not supported yet".to_string(),
+        });
+    }
     let kind = if validated.is_hnsw() {
         IndexKind::Hnsw
     } else {
@@ -3263,6 +3271,7 @@ mod tests {
             expressions: vec![None],
             collations: vec![None],
             unique: false,
+            predicate: None,
         };
         execute_create_index(&storage, &index).expect("create index");
         let snapshot = |storage: &Storage| {

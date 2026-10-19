@@ -12282,9 +12282,17 @@ pub struct ValidatedCreateIndex {
     /// `CREATE UNIQUE INDEX` か（Issue #1616・INDEX-9）。UNIQUE 制約への展開は
     /// `catalog::Storage::create_index` が担う。
     pub(crate) unique: bool,
+    /// 部分索引の述語（INDEX-11、Issue #1653）。最終ゲートが拒否するため現状は常に `None`
+    /// （#1654 が格納を実装するまで）。
+    pub(crate) predicate: Option<Vec<WherePredicate>>,
 }
 
 impl ValidatedCreateIndex {
+    /// 部分索引の述語（`None` は全行対象）。
+    pub fn predicate(&self) -> Option<&[WherePredicate]> {
+        self.predicate.as_deref()
+    }
+
     /// `CREATE UNIQUE INDEX` か。真のとき実行段は `IndexDef::with_unique(true)` で渡す。
     pub fn is_unique(&self) -> bool {
         self.unique
@@ -12466,18 +12474,37 @@ pub(crate) fn validate_create_index_tokens(
     // 式要素の決定性（`42P17`／組み込み以外の関数は `0A000`。INDEX-10、Issue #1647）。判定順は
     // 要素の構文・集計/ウィンドウ/部分クエリ → 上の構造検査 → 決定性 → `WHERE` → 最終ゲート。
     for expr in expressions.iter().flatten() {
-        crate::sql::index_expr::check_index_expression_determinism(expr)?;
+        crate::sql::index_expr::check_index_expression_determinism(
+            expr,
+            crate::sql::index_expr::IndexExprSite::Key,
+        )?;
     }
-    // 部分索引（PostgreSQL 拡張構文）の `WHERE` 句は許可形状外の「機能」として
-    // `0A000`（`expect_end_of_statement` の汎用検査に落とすと `42601` になる）。
-    if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "partial indexes (WHERE clause) are not supported".to_string(),
-        });
-    }
+    // 部分索引の述語（INDEX-11、Issue #1653）。判定順は 述語の先読み（集計・ウィンドウ・部分
+    // クエリ・SRF を PostgreSQL と同じ SQLSTATE へ）→ 解析 → 決定性 → 文末 → 最終ゲート。
+    // 汎用の `parse_where` は既定状態（部分クエリ・CHECK 文脈なし）で使い、第 2 のパーサを作らない。
+    let predicate = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
+        p.advance();
+        let rest = p.tokens.get(p.pos..).unwrap_or(&[]);
+        crate::sql::index_expr::precheck_index_tokens(
+            rest,
+            crate::sql::index_expr::IndexExprSite::Predicate,
+        )?;
+        let preds = p.parse_where()?;
+        crate::sql::index_expr::check_index_predicate_determinism(&preds)?;
+        Some(preds)
+    } else {
+        None
+    };
     p.expect_end_of_statement()?;
     // 最終ゲート（INDEX-10、Issue #1647）。決定性検査は部分索引の `WHERE` 判定より前に済ませてある。
     reject_unimplemented_expression_keys(&expressions, &collations, hnsw)?;
+    // 部分索引の最終ゲート（INDEX-11、Issue #1653）。述語の格納・DML 維持・部分 UNIQUE の強制は
+    // 後続 Issue（#1654・#1657）。宣言だけ残って効かない索引や強制漏れ（fail-open）を作らない。
+    if predicate.is_some() {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "partial indexes are not supported yet".to_string(),
+        });
+    }
     Ok(ValidatedCreateIndex {
         name,
         if_not_exists,
@@ -12487,6 +12514,7 @@ pub(crate) fn validate_create_index_tokens(
         expressions,
         collations,
         unique,
+        predicate,
     })
 }
 
@@ -12551,7 +12579,7 @@ type IndexColumnElement = (String, Option<Expr>, Option<crate::collation::Collat
 /// 3. 括弧式 `(<式>)` + 任意の `COLLATE`。閉じ括弧で式がちょうど終わらない形
 ///    （`(a) + 1`）は `42601`。式が単なる列参照なら通常の列要素へ正規化する。
 ///
-/// 式の解析前に要素のトークン区間を先読み検査し（`sql::index_expr::precheck_element_tokens`）、
+/// 式の解析前に要素のトークン区間を先読み検査し（`sql::index_expr::precheck_index_tokens`）、
 /// 集計・ウィンドウ・部分クエリ・SRF を PostgreSQL と同じ SQLSTATE で拒否する。式は
 /// ノード予算（`MAX_EXPR_NODES`）と深さ上限の内側でのみ解析する。リテラル・空括弧等は
 /// 従来どおり `0A000`。
@@ -12569,7 +12597,10 @@ fn parse_index_column(p: &mut Parser<'_>) -> Result<IndexColumnElement, SqlSurfa
     if is_call || is_paren {
         let end = crate::sql::index_expr::element_end(&p.tokens, p.pos);
         let element = p.tokens.get(p.pos..end).unwrap_or(&[]);
-        crate::sql::index_expr::precheck_element_tokens(element)?;
+        crate::sql::index_expr::precheck_index_tokens(
+            element,
+            crate::sql::index_expr::IndexExprSite::Key,
+        )?;
     }
     let expr = if is_call {
         p.parse_bounded_primary_expr()?

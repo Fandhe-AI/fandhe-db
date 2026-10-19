@@ -202,6 +202,12 @@ fn wire_index_ddl_error_classification() {
         "CREATE INDEX idx_p ON docs (body) WHERE body = 'x'",
         "0A000",
     );
+    // 部分索引の述語の拒否（INDEX-11、Issue #1653）。非決定は 42P17 で、エラー後もセッションは継続する。
+    expect_error(
+        &mut stream,
+        "CREATE INDEX idx_p ON docs (body) WHERE id < now()",
+        "42P17",
+    );
     // 式索引の式の拒否（INDEX-10、Issue #1647）。ErrorResponse の SQLSTATE として観測でき、
     // エラー後もセッションは継続する。
     for (sql, code) in [
