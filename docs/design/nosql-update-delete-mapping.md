@@ -104,7 +104,7 @@ PR #1038〔Issue #896 レビュー指摘〕以降の実装に合わせた記述�
 - `execute_bound_update_in_session<F>(ctx, table, operation_id, bind: F)`:
   `execute_bound_insert_in_session` と同型の binder closure 方式。判定順序
   （fail-closed。契約の一部）:
-  1. `operation_id` 必須化ガード（`23502`。スキーマ取得より前）
+  1. `operation_id` 判定（`LedgerMode` 依存。必須構成と分割実行の欠落は `23502`。スキーマ取得より前）
   2. `read_txn_with_schema(table)` でスキーマ取得（テーブル不存在は
      `42P01`）
   3. `bind(&schema)` で `BoundUpdate` を得る（`read_txn` が開いている間に
@@ -139,9 +139,9 @@ PR #1038〔Issue #896 レビュー指摘〕以降の実装に合わせた記述�
 `mode`＋`where` は `42601`／`22000`。`chunk` のみは `42601`） → [`update` のみ] `set` 非空＋各キー `check_identifier`（`42601`）
 → JSON→`InsertLiteral` 写像（`22000`） → `where.id` は
 `JsonNumber::as_exact_u64` のみ受理し、非受理時は variant で分岐する
-（`dml_target.rs::DmlTargetError`）→ `operation_id`（`optional_str` の
-`None` を `""` に読み替え `OperationId::parse` → `23502`） → engine 入口
-（`23502` 再ガード → `42P01` → bind `42601`/`22000` → 実行
+（`dml_target.rs::DmlTargetError`）→ `operation_id`（欠落・`null`・空文字を `None` に正規化し、
+`Some` のみ `OperationId::parse`。Issue #2203） → engine 入口
+（`LedgerMode` 依存の `23502` 判定 → `42P01` → bind `42601`/`22000` → 実行
 `23505`/`22023`/`XX000`）。
 
 **`where.id` 非受理時の分岐は SQL 表層の字句解析・束縛とパリティを取る**

@@ -221,7 +221,8 @@ impl ClassifiedError for JobOpError {
 }
 
 /// `table`・`operation_id` を取り出して検証する（`update` op と同じ規則。
-/// `operation_id` の欠落・`null`・空文字は `23502`）。
+/// `operation_id` の欠落・`null`・空文字は `23502`）。ジョブの照会・取り消しは書き込みでは
+/// ないため、`--require-operation-id` の有無によらず operation_id は常に必須（Issue #2203）。
 fn parse_job_ref<'a>(validated: &Validated<'a>) -> Result<(&'a str, OperationId), JobOpError> {
     let table = validated.required_str("table")?;
     ident::check_identifier(table)?;

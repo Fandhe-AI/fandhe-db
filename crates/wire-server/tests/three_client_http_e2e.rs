@@ -266,6 +266,9 @@ fn spawn_server_with_args(
         db_path,
         "--bind",
         "127.0.0.1:0",
+        // 本ハーネスは SQL・NoSQL 両表層の `operation_id` 必須化（欠落 → `23502`）を
+        // パリティ検証するため、既定（任意。Issue #1704・#2203）ではなく必須構成で起動する。
+        "--require-operation-id",
     ];
     if surface_nosql {
         args.push("--surface");
