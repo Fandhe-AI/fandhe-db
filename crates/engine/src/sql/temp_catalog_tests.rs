@@ -13,10 +13,10 @@ use crate::catalog::{ColumnDef, ColumnType, TableSchema, ViewDef};
 use crate::core::EngineCore;
 use crate::kernel::CpuScalarProvider;
 use crate::policy::PolicyContext;
-use crate::sql::allowlist::{SqlSurfaceError, TableLookup};
+use crate::sql::allowlist::{SqlSurfaceError, TableLookup, TempOnCommit};
 use crate::sql::mode::SessionState;
 use crate::sql::temp_catalog::{
-    tokens_reference_temp, ResolvedRelation, SessionRelationLookup, SessionTempCatalog,
+    tokens_reference_temp, SessionRelationLookup, SessionTempCatalog,
     DEFAULT_MAX_TEMP_TABLES_PER_SESSION,
 };
 use crate::storage::{Storage, Visibility};
@@ -63,15 +63,21 @@ impl TableLookup for Inner {
 fn table_44_register_get_remove_and_duplicate() {
     let mut cat = SessionTempCatalog::default();
     assert!(cat.is_empty());
-    let id = cat.register(schema("t", &["x"]), 4).expect("register");
+    let id = cat
+        .register(schema("t", &["x"]), TempOnCommit::PreserveRows, 4)
+        .expect("register");
     assert!(cat.contains("t"));
     assert_eq!(cat.get("t").map(|e| e.id), Some(id));
-    let dup = cat.register(schema("t", &["x"]), 4).expect_err("dup");
+    let dup = cat
+        .register(schema("t", &["x"]), TempOnCommit::PreserveRows, 4)
+        .expect_err("dup");
     assert_eq!(code(&dup), "42P07");
-    assert!(cat.remove("t"));
-    assert!(!cat.remove("t"));
+    assert_eq!(cat.remove("t"), Some(id));
+    assert_eq!(cat.remove("t"), None);
     // 取り除いた後は再登録でき、識別子は別物になる。
-    let id2 = cat.register(schema("t", &["x"]), 4).expect("re-register");
+    let id2 = cat
+        .register(schema("t", &["x"]), TempOnCommit::PreserveRows, 4)
+        .expect("re-register");
     assert_ne!(id, id2);
 }
 
@@ -79,10 +85,11 @@ fn table_44_register_get_remove_and_duplicate() {
 fn table_44_limit_is_enforced_before_allocation() {
     let mut cat = SessionTempCatalog::default();
     for n in ["a", "b"] {
-        cat.register(schema(n, &["x"]), 2).expect("within limit");
+        cat.register(schema(n, &["x"]), TempOnCommit::PreserveRows, 2)
+            .expect("within limit");
     }
     let err = cat
-        .register(schema("c", &["x"]), 2)
+        .register(schema("c", &["x"]), TempOnCommit::PreserveRows, 2)
         .expect_err("over limit");
     assert_eq!(code(&err), "54000");
     assert_eq!(cat.len(), 2);
@@ -92,7 +99,11 @@ fn table_44_limit_is_enforced_before_allocation() {
 fn table_44_invalid_identifier_is_rejected() {
     let mut cat = SessionTempCatalog::default();
     for bad in ["", "1abc", "a b", "a-b"] {
-        assert!(cat.register(schema(bad, &["x"]), 4).is_err(), "{bad:?}");
+        assert!(
+            cat.register(schema(bad, &["x"]), TempOnCommit::PreserveRows, 4)
+                .is_err(),
+            "{bad:?}"
+        );
     }
     assert!(cat.is_empty());
 }
@@ -101,7 +112,8 @@ fn table_44_invalid_identifier_is_rejected() {
 fn table_44_names_are_deterministic() {
     let mut cat = SessionTempCatalog::default();
     for n in ["zeta", "alpha", "mid"] {
-        cat.register(schema(n, &["x"]), 8).expect("register");
+        cat.register(schema(n, &["x"]), TempOnCommit::PreserveRows, 8)
+            .expect("register");
     }
     assert_eq!(cat.names().collect::<Vec<_>>(), ["alpha", "mid", "zeta"]);
 }
@@ -109,15 +121,10 @@ fn table_44_names_are_deterministic() {
 #[test]
 fn table_44_resolution_prefers_temp() {
     let mut cat = SessionTempCatalog::default();
-    cat.register(schema("t", &["x"]), 4).expect("register");
-    assert!(matches!(
-        cat.resolve_unqualified("t"),
-        ResolvedRelation::Temp(_)
-    ));
-    assert!(matches!(
-        cat.resolve_unqualified("other"),
-        ResolvedRelation::Persistent("other")
-    ));
+    cat.register(schema("t", &["x"]), TempOnCommit::PreserveRows, 4)
+        .expect("register");
+    assert!(cat.get("t").is_some());
+    assert!(cat.get("other").is_none());
 }
 
 // ---- ラッパー ----
@@ -125,8 +132,10 @@ fn table_44_resolution_prefers_temp() {
 #[test]
 fn table_44_wrapper_hides_persistent_table_and_view() {
     let mut cat = SessionTempCatalog::default();
-    cat.register(schema("t", &["x", "y"]), 4).expect("t");
-    cat.register(schema("v", &["z"]), 4).expect("v");
+    cat.register(schema("t", &["x", "y"]), TempOnCommit::PreserveRows, 4)
+        .expect("t");
+    cat.register(schema("v", &["z"]), TempOnCommit::PreserveRows, 4)
+        .expect("v");
     let hit = Cell::new(false);
     let w = SessionRelationLookup::new(&Inner, &cat, &hit);
 
@@ -158,7 +167,8 @@ fn table_44_wrapper_passes_through_unmatched_names_and_empty_catalog() {
         );
         assert!(!hit.get());
     }
-    cat.register(schema("u", &["x"]), 4).expect("u");
+    cat.register(schema("u", &["x"]), TempOnCommit::PreserveRows, 4)
+        .expect("u");
     let w = SessionRelationLookup::new(&Inner, &cat, &hit);
     assert!(w.table_exists("t").expect("exists"));
     assert!(w.view_definition("v").expect("view").is_some());
@@ -170,7 +180,8 @@ fn table_44_token_scan_is_case_insensitive_and_empty_safe() {
     let toks = crate::sql::lexer::tokenize_marked("DROP TABLE Tmp1").expect("lex");
     let mut cat = SessionTempCatalog::default();
     assert!(!tokens_reference_temp(&toks, &cat));
-    cat.register(schema("tmp1", &["x"]), 4).expect("register");
+    cat.register(schema("tmp1", &["x"]), TempOnCommit::PreserveRows, 4)
+        .expect("register");
     assert!(tokens_reference_temp(&toks, &cat));
     let other = crate::sql::lexer::tokenize_marked("DROP TABLE zzz").expect("lex");
     assert!(!tokens_reference_temp(&other, &cat));
@@ -179,7 +190,8 @@ fn table_44_token_scan_is_case_insensitive_and_empty_safe() {
 #[test]
 fn table_44_token_scan_matches_quoted_null_relation_name() {
     let mut cat = SessionTempCatalog::default();
-    cat.register(schema("null", &["x"]), 4).expect("register");
+    cat.register(schema("null", &["x"]), TempOnCommit::PreserveRows, 4)
+        .expect("register");
     let toks = crate::sql::lexer::tokenize_marked("DROP TABLE \"NULL\"").expect("lex");
     assert!(tokens_reference_temp(&toks, &cat));
 }
@@ -225,8 +237,19 @@ fn session_with_temp_t() -> SessionState {
     let mut s = SessionState::default();
     s.allow_ddl();
     s.temp_tables_mut()
-        .register(schema("t", &["x"]), DEFAULT_MAX_TEMP_TABLES_PER_SESSION)
+        .register(
+            schema("t", &["x"]),
+            TempOnCommit::PreserveRows,
+            DEFAULT_MAX_TEMP_TABLES_PER_SESSION,
+        )
         .expect("register temp t");
+    s
+}
+
+/// 実体（一時 DB のテーブル）も作った一時表 `t(a TEXT)` を持つセッション。
+fn session_with_real_temp_t(core: &EngineCore) -> SessionState {
+    let mut s = SessionState::default();
+    run(core, &mut s, "tenant-a", "CREATE TEMP TABLE t (a TEXT)").expect("create temp t");
     s
 }
 
@@ -236,25 +259,23 @@ fn table_44_temp_name_never_touches_the_persistent_table() {
     let _g = CleanupGuard(path.clone());
     let core = open_core(&path);
     setup_persistent(&core);
-    let mut a = session_with_temp_t();
+    let mut a = session_with_real_temp_t(&core);
 
-    for sql in [
-        "SELECT * FROM t LIMIT 10",
-        "DELETE FROM t WHERE id = 1",
-        "DROP TABLE t",
-        "TRUNCATE t",
-        "TRUNCATE u, T",
-        "CREATE INDEX i ON t (a)",
-        "INSERT INTO t (id, embedding, a) VALUES (2, '[0.1,0.2]', 'q') USING OPERATION_ID 'op-2'",
+    // 一時表 `t` への文は一時表だけに作用する（永続表 `t` の 1 行は読めず、消えない）。
+    for (sql, expected) in [
+        ("SELECT * FROM t LIMIT 10", Ok(0)),
+        ("DELETE FROM t WHERE id = 1", Ok(0)),
+        ("TRUNCATE t", Ok(0)),
+        ("CREATE INDEX i ON t (a)", Ok(0)),
+        ("INSERT INTO t (id, a) VALUES (2, 'q')", Ok(0)),
+        ("SELECT * FROM t LIMIT 10", Ok(1)),
+        // 一時表と永続表を 1 文で混ぜる文は拒否する（fail-closed）。
+        ("TRUNCATE u, t", Err("0A000".to_string())),
     ] {
-        assert_eq!(
-            run(&core, &mut a, "tenant-a", sql),
-            Err("0A000".to_string()),
-            "{sql}"
-        );
+        assert_eq!(run(&core, &mut a, "tenant-a", sql), expected, "{sql}");
     }
 
-    // 同じテナントの別セッション・別テナントは永続表を従来どおり読める。
+    // 同じテナントの別セッション・別テナントは永続表を従来どおり読める（行は無傷）。
     let mut b = SessionState::default();
     assert_eq!(
         run(&core, &mut b, "tenant-a", "SELECT * FROM t LIMIT 10"),
@@ -266,7 +287,17 @@ fn table_44_temp_name_never_touches_the_persistent_table() {
         Ok(0)
     );
 
-    // 無関係の永続表は A でも従来どおり使える。
+    // `DROP TABLE t` は一時表の `t` だけを消す（TABLE-44・Issue #1683）。永続表は無傷で、
+    // 削除後は名前が永続表へ解決される。
+    assert_eq!(run(&core, &mut a, "tenant-a", "DROP TABLE t"), Ok(0));
+    assert!(a.temp_tables().is_empty());
+    assert_eq!(
+        run(&core, &mut a, "tenant-a", "SELECT * FROM t LIMIT 10"),
+        Ok(1)
+    );
+
+    // 無関係の永続表は一時表を持つセッションでも従来どおり使える。
+    let mut a = session_with_real_temp_t(&core);
     assert_eq!(
         run(&core, &mut a, "tenant-a", "SELECT * FROM u LIMIT 10"),
         Ok(0)
@@ -296,8 +327,9 @@ fn table_44_transaction_control_is_never_blocked_and_rollback_restores_catalog()
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&c, &mut a, &mut txn, "BEGIN")
         .expect("begin");
+    // 振り分け対象外の文種（ALTER）で一時表の名前が現れる文は拒否され、Failed に遷移する。
     let err = core
-        .execute_sql_in_txn(&c, &mut a, &mut txn, "SELECT * FROM t LIMIT 1")
+        .execute_sql_in_txn(&c, &mut a, &mut txn, "ALTER TABLE t ADD COLUMN z TEXT")
         .expect_err("temp ref");
     assert_eq!(err.wire_code(), "0A000");
     let err = core
@@ -314,7 +346,7 @@ fn table_44_transaction_control_is_never_blocked_and_rollback_restores_catalog()
     core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
         .expect("begin");
     s.temp_tables_mut()
-        .register(schema("late", &["x"]), 4)
+        .register(schema("late", &["x"]), TempOnCommit::PreserveRows, 4)
         .expect("register");
     core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
         .expect("rollback");
@@ -368,23 +400,40 @@ fn table_44_quoted_null_temp_name_never_touches_the_persistent_table() {
     .expect("persistent quoted NULL table");
     let mut a = SessionState::default();
     a.allow_ddl();
-    a.temp_tables_mut()
-        .register(schema("null", &["x"]), DEFAULT_MAX_TEMP_TABLES_PER_SESSION)
-        .expect("register temp");
-    for sql in [
-        "DROP TABLE \"NULL\"",
-        "ALTER TABLE \"NULL\" ADD COLUMN b TEXT",
-        "CREATE INDEX i ON \"NULL\" (a)",
-        "TRUNCATE \"NULL\"",
-    ] {
-        assert_eq!(
-            run(&core, &mut a, "tenant-a", sql),
-            Err("0A000".to_string()),
-            "{sql}"
-        );
+    run(
+        &core,
+        &mut a,
+        "tenant-a",
+        "CREATE TEMP TABLE \"NULL\" (a TEXT)",
+    )
+    .expect("temp quoted NULL table");
+    // 振り分け対象外の文種は拒否する。一時表向けの文は一時表だけに作用する。
+    assert_eq!(
+        run(
+            &core,
+            &mut a,
+            "tenant-a",
+            "ALTER TABLE \"NULL\" ADD COLUMN b TEXT"
+        ),
+        Err("0A000".to_string())
+    );
+    for sql in ["CREATE INDEX i ON \"NULL\" (a)", "TRUNCATE \"NULL\""] {
+        assert_eq!(run(&core, &mut a, "tenant-a", sql), Ok(0), "{sql}");
     }
-    let err = core
-        .begin_copy(&ctx("tenant-a"), &a, "COPY \"NULL\" FROM STDIN")
-        .expect_err("copy gate");
-    assert_eq!(err.wire_code(), "0A000");
+    // COPY も一時表だけを対象にする（一時 DB に無い表を指す文は拒否される）。
+    let plan = core
+        .begin_copy(&ctx("tenant-a"), &a, "COPY \"NULL\" (id, a) FROM STDIN")
+        .expect("copy plan on the temp table");
+    assert!(matches!(plan, crate::core::CopyPlan::From(_)));
+    // `DROP TABLE "NULL"` は一時表だけを消し、永続表は無傷（TABLE-44・Issue #1683）。
+    assert_eq!(run(&core, &mut a, "tenant-a", "DROP TABLE \"NULL\""), Ok(0));
+    assert!(a.temp_tables().is_empty());
+    let mut other = SessionState::default();
+    assert!(run(
+        &core,
+        &mut other,
+        "tenant-a",
+        "SELECT * FROM \"NULL\" LIMIT 1"
+    )
+    .is_ok());
 }

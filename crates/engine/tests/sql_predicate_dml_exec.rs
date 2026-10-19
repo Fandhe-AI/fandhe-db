@@ -45,7 +45,8 @@ fn new_core_with_table() -> (EngineCore, std::path::PathBuf) {
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema(TABLE)).expect("create table");
     (
-        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+            .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered),
         path,
     )
 }
@@ -61,7 +62,9 @@ fn new_core_with_table_and_dml_limits(
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema(TABLE)).expect("create table");
     (
-        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_dml_limits(limits),
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+            .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
+            .with_dml_limits(limits),
         path,
     )
 }
@@ -952,7 +955,8 @@ fn new_core_with_bulk_seeded_table(
     tenant::insert_rows(&storage, table, ctx, &rows, &op_id).expect("bulk seed rows");
 
     (
-        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+            .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered),
         path,
     )
 }

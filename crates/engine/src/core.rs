@@ -63,6 +63,13 @@ use crate::search_engine;
 use crate::storage::{Row, Storage, StorageError};
 use redb::ReadableDatabase;
 
+// 一時表（TABLE-44・Issue #1684）の振り分けと実行。永続コアの私的な項目に触れるため子モジュールに
+// 置く（`core.rs` の肥大化を避ける目的も兼ねる）。
+mod temp_route;
+pub use temp_route::SessionRoutedSql;
+
+mod matview_exec;
+
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
 /// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は
 /// `OFFSET`・集合演算の枝行数・サブクエリ内側行数など他の内部上限として固定のまま残す。
@@ -1180,6 +1187,9 @@ pub struct EngineCore {
     /// [`Self::with_group_by_limits`] のみ（起動時 1 回）。集計の実行段
     /// （単一表・集合演算枝・サブクエリ内側・ビュー外側・JOIN）にだけ効く。
     group_by_limits: crate::group_by_limits::GroupByLimits,
+    /// 一時表のセッションあたりの件数・総バイト数の上限（TABLE-44・Issue #1683）。差し替えは
+    /// [`Self::with_temp_table_limits`] のみ（起動時 1 回）。`CREATE TEMP TABLE` の実行段にだけ効く。
+    temp_table_limits: crate::temp_table_limits::TempTableLimits,
     /// jsonpath 評価のステップ数・再帰深さの上限（Issue #2184・TABLE-25 ポインタ）。
     /// 差し替えは [`Self::with_jsonpath_limits`] のみ（起動時 1 回）。SQL 表層の `jsonb_path_*`
     /// （Issue #2185）は、文実行入口が張る `JsonPathLimitsScope` 経由で束縛時にこの値を焼き込む。
@@ -1195,6 +1205,11 @@ pub struct EngineCore {
     /// のみ（起動時 1 回）。文の `LIMIT`・`FETCH n`・集合演算／JOIN 文の `LIMIT` の
     /// 範囲判定にだけ効き、`OFFSET`・枝行数・サブクエリ内側行数の上限とは連動しない。
     result_limits: crate::result_limits::ResultLimits,
+    /// MATERIALIZED VIEW の初回実体化の対象文脈（TABLE-42・Issue #1664）。`None` は未設定で、
+    /// 作成したセッションの文脈だけを実体化する（安全側。それ以外の文脈からの読み取りは `55000`）。
+    /// 差し替えは [`Self::with_materialization_contexts`] のみ（起動時 1 回）。クライアントの
+    /// 申告値は使わず、認証構成から導出した文脈だけを注入する。
+    materialization_contexts: Option<std::sync::Arc<Vec<PolicyContext>>>,
     /// 述語形 UPDATE／DELETE の分割実行（Issue #1128・ADR `docs/design/partitioned-dml.md`
     /// §15.2）のチャンク幅・走査予算・writer 保持時間。差し替えは
     /// [`Self::with_partitioned_dml_limits`] のみ（起動時に 1 回）。
@@ -1540,6 +1555,18 @@ pub enum ParsedSql {
     /// 更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードがあれば
     /// 追随が必要。
     CreateTable(crate::sql::allowlist::ValidatedCreateTable),
+    /// `CREATE [GLOBAL|LOCAL] {TEMP|TEMPORARY} TABLE ... [ON COMMIT ...]`
+    /// （TABLE-44・Issue #1683）。永続表の [`CreateTable`](Self::CreateTable) とは別 variant
+    /// にして、確認漏れが「一時表の定義が全テナント共有の永続表になる」fail-open にならないよう、
+    /// 網羅 `match` をコンパイル時に強制する。DDL 実行権限ゲートの対象外（セッション内で閉じる）。
+    /// 実行は `EngineCore::execute_parsed_in_session` の本 variant の分岐が担う。
+    CreateTempTable(crate::sql::allowlist::ValidatedCreateTempTable),
+    /// 一時表だけを参照する文を、セッション専用の一時コアで実行する形（TABLE-44・Issue #1684）。
+    /// `INSERT`／`UPDATE`／`DELETE`／`TRUNCATE`／読み取り系／索引 DDL を包む。永続コアの実行器へ
+    /// 渡すと同名の永続表へ作用してしまうため、永続側の [`ParsedSql`] とは別 variant にして、
+    /// 網羅 `match` の確認漏れをコンパイル時に検出する（`CreateTempTable` と同じ理由）。
+    /// 一時カタログの世代を持ち、一時表の作成・削除・索引 DDL の後に実行すると `0A000` で拒否する。
+    SessionRouted(Box<SessionRoutedSql>),
     /// `DECLARE`/`FETCH`/`CLOSE`（カーソル。WIRE-15・TASK-218）。トランザクション
     /// 文脈を持たない [`EngineCore::execute_parsed_in_session`] はこの variant を
     /// `DECLARE` なら `25P01`（`NoActiveSqlTransaction`）、`FETCH`／`CLOSE` なら
@@ -1607,6 +1634,15 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `ParsedSql` を
     /// 網羅的にマッチする既存コードはすべて更新済み。
     DropView(crate::sql::allowlist::ValidatedDropView),
+    /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <name> [(<alias>, ...)] AS <body>
+    /// [WITH [NO] DATA]`（TABLE-42・Issue #1664）。DDL 実行権限ゲートの判定と初回実体化は
+    /// `EngineCore::execute_parsed_in_session` の同名腕が担い、構文検証
+    /// （`validate_create_materialized_view_tokens`）はカタログを一切照会しない（`CreateView` と
+    /// 同じ設計）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1664）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    CreateMaterializedView(crate::sql::allowlist::ValidatedCreateMaterializedView),
     /// `CREATE INDEX <name> ON <table> [USING hnsw] (<col>[, ...])`（TASK-206・
     /// INDEX-7・SQL-23、Issue #908）。DDL 実行権限ゲート
     /// （`sql::ddl::require_ddl_permission`）の判定は `EngineCore::
@@ -1638,6 +1674,19 @@ fn show_time_zone_columns() -> Vec<crate::sql::exec::ColumnMeta> {
     }]
 }
 
+impl ParsedSql {
+    /// セッションの一時カタログに対する振り分けの包み（[`ParsedSql::SessionRouted`]）を外した、
+    /// 文そのものの構文形を返す。包まれていなければ自分自身。wire-server が、実行した文の種類
+    /// （書き込みか・カーソルの `FETCH` か等）を判定するために使う。包みを外した形を永続コアの
+    /// 実行入口へ渡してはならない（一時表の文は一時コアでしか実行できない）。
+    pub fn peel_session_route(&self) -> &ParsedSql {
+        match self {
+            ParsedSql::SessionRouted(routed) => routed.inner(),
+            other => other,
+        }
+    }
+}
+
 /// セッション TimeZone を現在の文の束縛区間へ張る（`execute_parsed_in_session` 等の
 /// セッション入口が呼ぶ。TZ を持たない `TIMESTAMPTZ` リテラルの解釈とDDL既定値の正規化が
 /// 読む。TABLE-33・Issue #1575）。
@@ -1652,6 +1701,10 @@ fn statement_clock_scope(
     txn_start_micros: Option<i64>,
 ) -> Result<Option<crate::sql::time_fn::ClockScope>, crate::sql::allowlist::SqlSurfaceError> {
     let is_read = match parsed {
+        // 一時表の文は、中身の文種で判定する（時刻の確定は永続側と同じ規則）。
+        ParsedSql::SessionRouted(routed) => {
+            return statement_clock_scope(routed.inner(), txn_start_micros)
+        }
         ParsedSql::Statement(_)
         | ParsedSql::Insert(_)
         | ParsedSql::Delete(_)
@@ -1660,11 +1713,14 @@ fn statement_clock_scope(
         | ParsedSql::Transaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
+        | ParsedSql::CreateTempTable(_)
         | ParsedSql::Cursor(_)
         | ParsedSql::Partitioned(_)
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateView(_)
         | ParsedSql::DropView(_)
+        // TABLE-42・Issue #1664: `CreateView` と同じく本文の時刻関数は束縛段で拒否する（fail-closed）。
+        | ParsedSql::CreateMaterializedView(_)
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_)
         | ParsedSql::CreateType(_)
@@ -1694,6 +1750,9 @@ fn insert_default_clock_scope(
 ) -> Result<Option<crate::sql::time_fn::DefaultClockScope>, crate::sql::allowlist::SqlSurfaceError>
 {
     let is_insert = match parsed {
+        ParsedSql::SessionRouted(routed) => {
+            return insert_default_clock_scope(routed.inner(), txn_start_micros)
+        }
         ParsedSql::Insert(_) => true,
         ParsedSql::Statement(_)
         | ParsedSql::Truncate(_)
@@ -1702,11 +1761,13 @@ fn insert_default_clock_scope(
         | ParsedSql::Transaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
+        | ParsedSql::CreateTempTable(_)
         | ParsedSql::Cursor(_)
         | ParsedSql::Partitioned(_)
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateView(_)
         | ParsedSql::DropView(_)
+        | ParsedSql::CreateMaterializedView(_)
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_)
         | ParsedSql::CreateType(_)
@@ -1849,6 +1910,10 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         ParsedSql::Update(crate::sql::allowlist::ValidatedUpdateForm::Predicate(v)) => {
             v.operation_id().map(|id| id.as_str())
         }
+        // 永続側の文を包んだ形は中身の `operation_id` を使う（一時表の文は `operation_id` を持たない）。
+        ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
+            parsed_operation_id(routed.inner())
+        }
         _ => None,
     }
 }
@@ -1865,6 +1930,9 @@ fn is_partitioned_write(parsed: &ParsedSql) -> bool {
             v.partitioned().is_some()
         }
         ParsedSql::Partitioned(control) => control.writes(),
+        ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
+            is_partitioned_write(routed.inner())
+        }
         _ => false,
     }
 }
@@ -1887,6 +1955,10 @@ pub struct PreparedSql {
     tokens: Vec<crate::sql::lexer::Token>,
     param_count: u16,
     dummy_parsed: ParsedSql,
+    /// 一時表（TABLE-44・Issue #1684）の経路。セッションを持たない Parse は常に `Plain`。
+    /// セッション対応の Parse が一時表だけを参照する文を一時コアで構造検証したときは `Temp`
+    /// （`dummy_parsed` も一時コア向けの形で包む。`core/temp_route.rs`）。
+    route: temp_route::PreparedRoute,
     /// `dummy_parsed` の `ORDER BY` ベクトルリテラル（`Distance` 形。
     /// [`crate::sql::allowlist::OrderByForm::Distance`]）が、元の SQL テキストの
     /// `$n`（[`crate::sql::params::order_by_distance_literal_is_param`]）に由来する
@@ -2293,10 +2365,12 @@ impl EngineCore {
             schema_limits: crate::schema_limits::SchemaLimits::default(),
             scan_limits: crate::scan_limits::ScanLimits::default(),
             group_by_limits: crate::group_by_limits::GroupByLimits::default(),
+            temp_table_limits: crate::temp_table_limits::TempTableLimits::default(),
             jsonpath_limits: crate::jsonpath_limits::JsonPathLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             join_limits: crate::join_limits::JoinSizeLimits::default(),
             result_limits: crate::result_limits::ResultLimits::default(),
+            materialization_contexts: None,
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
@@ -2565,6 +2639,23 @@ impl EngineCore {
         self.group_by_limits
     }
 
+    /// 一時表の件数・総バイト数上限（[`crate::temp_table_limits::TempTableLimits`]）を
+    /// 差し替えたビルダーを返す（TABLE-44・Issue #1683）。`wire-server` の起動時 CLI フラグ
+    /// （`--max-temp-tables`・`--max-temp-bytes`）からのみ呼ぶ。未呼び出しならハード上限と
+    /// 同値の既定（現行挙動）。
+    pub fn with_temp_table_limits(
+        mut self,
+        limits: crate::temp_table_limits::TempTableLimits,
+    ) -> Self {
+        self.temp_table_limits = limits;
+        self
+    }
+
+    /// 現在の一時表上限（TABLE-44・Issue #1683）。
+    pub fn temp_table_limits(&self) -> crate::temp_table_limits::TempTableLimits {
+        self.temp_table_limits
+    }
+
     /// jsonpath 評価のステップ数・再帰深さ上限（[`crate::jsonpath_limits::JsonPathLimits`]）を
     /// 差し替えたビルダーを返す（Issue #2184）。`wire-server` の起動時 CLI フラグ
     /// （`--max-jsonpath-steps`・`--max-jsonpath-depth`）からのみ呼ぶ。未呼び出しなら
@@ -2646,6 +2737,28 @@ impl EngineCore {
     /// （現行挙動）。
     pub fn with_result_limits(mut self, limits: crate::result_limits::ResultLimits) -> Self {
         self.result_limits = limits;
+        self
+    }
+
+    /// MATERIALIZED VIEW の初回実体化の対象文脈を差し替えたビルダーを返す（TABLE-42・Issue #1664）。
+    /// `wire-server` が起動時に認証構成（UserStore）のテナント集合から導出した文脈を 1 回だけ
+    /// 注入する。文脈は [`crate::catalog::materialized::ContextKey`] で重複を除き、決定的な順序に
+    /// 並べる。未呼び出し（Rust API の埋め込み・テスト）なら作成セッションの文脈だけを実体化する。
+    pub fn with_materialization_contexts(mut self, contexts: Vec<PolicyContext>) -> Self {
+        let mut keyed: Vec<(crate::catalog::materialized::ContextKey, PolicyContext)> = contexts
+            .into_iter()
+            .map(|c| {
+                (
+                    crate::catalog::materialized::ContextKey::from_context(&c),
+                    c,
+                )
+            })
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        keyed.dedup_by(|a, b| a.0 == b.0);
+        self.materialization_contexts = Some(std::sync::Arc::new(
+            keyed.into_iter().map(|(_, c)| c).collect(),
+        ));
         self
     }
 
@@ -3347,6 +3460,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::CreateMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
@@ -3391,6 +3505,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::CreateMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
@@ -3432,6 +3547,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::CreateMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
@@ -3480,6 +3596,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::CreateMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
@@ -3507,6 +3624,13 @@ impl EngineCore {
             // 経路を通るため、同じくセッションを要する実行本体へ委譲する。
             // SQL-43（Issue #1531）: `FROM` なし定数式 SELECT もセッション UDF
             // レジストリを参照しうるため、同じくセッション付き実行本体へ委譲する。
+            // TABLE-42・Issue #1664: matview の葉は `BufferedView` の本文としてのみ現れ、
+            // 単独の文としては生成されない（防御的に fail-closed）。
+            crate::sql::allowlist::Statement::MaterializedView(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "unexpected materialized view statement".to_string(),
+                })
+            }
             stmt @ (crate::sql::allowlist::Statement::Join(_)
             | crate::sql::allowlist::Statement::BufferedView(_)
             | crate::sql::allowlist::Statement::ConstSelect(_)) => {
@@ -3527,6 +3651,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::CreateMaterializedView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
@@ -3666,7 +3791,14 @@ impl EngineCore {
             let wrong_kind = match self.storage.view_definition(name) {
                 Ok(Some(_)) => true,
                 Ok(None) => match self.storage.index_exists(name) {
-                    Ok(found) => found,
+                    Ok(true) => true,
+                    // matview（TABLE-42・Issue #1664）も行を直接書けないオブジェクト。表・ビュー・
+                    // 索引と名前空間を共有するため、書き込み対象にされたら `42809` へ揃える。
+                    // 照会の失敗は「存在しない」と同一視せず、同じ写像で `XX000` にする。
+                    Ok(false) => match self.storage.materialized_view_definition(name) {
+                        Ok(def) => def.is_some(),
+                        Err(lookup_err) => return crate::catalog::table_lookup_error(lookup_err),
+                    },
                     Err(lookup_err) => return crate::catalog::table_lookup_error(lookup_err),
                 },
                 Err(lookup_err) => return crate::catalog::table_lookup_error(lookup_err),
@@ -3675,6 +3807,28 @@ impl EngineCore {
                 return crate::sql::allowlist::SqlSurfaceError::WrongObjectType {
                     name: name.clone(),
                 };
+            }
+        }
+        e
+    }
+
+    /// `COPY FROM` の対象が matview のとき `42809` へ読み替える（TABLE-42・Issue #1664。行を直接書けない
+    /// オブジェクトへの書き込みは、`UndefinedTable` ではなく種別違いで報告する）。ビュー・索引の読み替えは
+    /// 従来どおりこの経路では行わない（既存挙動を変えない）。照会の失敗は「存在しない」と同一視せず
+    /// `table_lookup_error` で写す（fail-closed）。
+    fn reclassify_matview_write_error(
+        &self,
+        e: crate::sql::allowlist::SqlSurfaceError,
+    ) -> crate::sql::allowlist::SqlSurfaceError {
+        if let crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name } = &e {
+            match self.storage.materialized_view_definition(name) {
+                Ok(Some(_)) => {
+                    return crate::sql::allowlist::SqlSurfaceError::WrongObjectType {
+                        name: name.clone(),
+                    }
+                }
+                Ok(None) => {}
+                Err(lookup_err) => return crate::catalog::table_lookup_error(lookup_err),
             }
         }
         e
@@ -3740,19 +3894,20 @@ impl EngineCore {
         }
     }
 
-    /// セッション一時カタログ対応の構文検証（TABLE-44・Issue #1681。暫定ゲート。#1684 で置換）。
+    /// セッション一時カタログ対応の構文検証（TABLE-44・Issue #1681。一時表への振り分けは Issue #1684）。
     ///
-    /// 一時カタログが空なら [`Self::parse_tokens`] と同一。空でなければ、(i) トークン列が
-    /// 一時表の名前と ASCII 大小無視で一致する識別子を含む、または (ii) 一時カタログ優先の
-    /// lookup が parse 中に一時表を引いた、のいずれでも `0A000` で拒否する。一時表の行ストア・
-    /// 実行器が無い間に通すと、同名の**永続表**へ作用してしまう（fail-open）ため。(i) は
-    /// カタログを引かない文（DROP・ALTER・CREATE INDEX 等）も覆う。トランザクション制御文は
-    /// 関係名を持たないため走査しない。
+    /// 一時カタログが空なら [`Self::parse_tokens`] と同一。空でなければ、トランザクション制御文と
+    /// `CREATE [TEMP] TABLE`／`DROP TABLE`（関係を読み書きせず、実行段が自セッションの一時カタログで
+    /// 名前を解決する）を除き、トークン列に一時表の名前と ASCII 大小無視で一致する識別子が無ければ
+    /// 通常の parse、あれば [`Self::route_temp_statement`]（一時コアへの振り分け。混在・対象外の
+    /// 文種は `0A000`）に回す。トークン走査は保守的（一致しすぎても拒否側＝fail-closed）で、
+    /// カタログを引かない文（`ALTER`・ビュー・カーソル等）や永続ビュー本文の再検証も覆う。
     fn parse_tokens_gated(
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
-        temp: &crate::sql::temp_catalog::SessionTempCatalog,
+        session: &crate::sql::mode::SessionState,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        let temp = session.temp_tables();
         if temp.is_empty() {
             return self.parse_tokens(tokens);
         }
@@ -3763,54 +3918,71 @@ impl EngineCore {
                     || name.eq_ignore_ascii_case("COMMIT")
                     || name.eq_ignore_ascii_case("ROLLBACK")
         );
-        if !txn_control_head && crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
-            return Err(crate::sql::temp_catalog::temp_table_unsupported());
+        // TABLE-44・Issue #1683: 次の 3 種は一時表の行を読み書きしないためトークン走査を飛ばす。
+        // `CREATE [TEMP] TABLE` は列定義だけで（FOREIGN KEY の参照先が一時表の名前なら実行段が
+        // `42P16`／`0A000`）、`DROP TABLE` は実行段が自セッションの一時カタログで名前を解決する。
+        let is_drop_table = matches!(tokens.first(), Some(crate::sql::lexer::Token::Ident(a)) if a.eq_ignore_ascii_case("DROP"))
+            && matches!(tokens.get(1), Some(crate::sql::lexer::Token::Ident(b)) if b.eq_ignore_ascii_case("TABLE"));
+        let scan_exempt = is_drop_table
+            || crate::sql::allowlist::is_create_table_statement(&tokens)
+            || crate::sql::allowlist::is_create_temp_table_statement(&tokens);
+        if txn_control_head || scan_exempt {
+            let hits = crate::sql::temp_catalog::RelationHits::default();
+            let parsed = self.parse_tokens_in(tokens, temp, &hits, self.ledger_mode)?;
+            if hits.temp_hit() {
+                return Err(crate::sql::temp_catalog::temp_table_unsupported());
+            }
+            return Ok(parsed);
         }
-        let hit = std::cell::Cell::new(false);
-        let parsed = self.parse_tokens_in(tokens, temp, &hit)?;
-        if hit.get() {
-            return Err(crate::sql::temp_catalog::temp_table_unsupported());
+        // `DROP INDEX <名前>` は索引名しか持たず、一時表の名前がトークンに現れない。一時表の索引かどうかは
+        // 一時 DB のカタログで決まる（一時表の索引は永続側の DDL 権限ゲートの対象外）。
+        if crate::sql::allowlist::is_drop_index_statement(&tokens) {
+            return self.route_drop_index(tokens, session);
         }
-        Ok(parsed)
+        if !crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
+            return self.parse_tokens(tokens);
+        }
+        self.route_temp_statement(tokens, session)
     }
 
-    /// 粗いゲート（暫定。TABLE-44・Issue #1681）。既に parse 済みの [`ParsedSql`] を受ける入口
-    /// （拡張クエリの Parse はセッションを持たず、名前が一時表かを判定できない）では、
-    /// 一時カタログが空でないセッションの文を（トランザクション制御以外）一律 `0A000` で
-    /// 拒否する。一時カタログが空なら何もしない。細かいゲートを済ませた SQL テキスト入口は
-    /// 本ゲートを持たない内部版（`*_inner`）を呼ぶ。#1684 でセッションを受ける Parse を導入して解除する。
+    /// 粗いゲート（TABLE-44・Issue #1681。#1684 で振り分け済みの文の世代検査を足した）。既に parse
+    /// 済みの [`ParsedSql`] を受ける入口（`execute_parsed_*`・`describe_*`）では、セッションを持たない
+    /// parse で作られた文（名前が一時表かを判定できていない）を、一時カタログが空でないセッションで
+    /// （トランザクション制御・`CREATE [TEMP] TABLE`・`DROP TABLE` 以外）一律 `0A000` で拒否する。
+    /// セッション対応の parse／Bind が振り分けた文（[`ParsedSql::SessionRouted`]）は、一時カタログの
+    /// 世代が振り分け時から変わっていなければ通す。一時カタログが空なら何もしない。細かい振り分けを
+    /// 済ませた SQL テキスト入口は本ゲートを持たない内部版（`*_inner`）を呼ぶ。
     ///
     /// | 入口 | ゲート |
     /// | ---- | ------ |
-    /// | `execute_sql_in_session`・`execute_sql_in_txn` | 細かい（`parse_tokens_gated`） |
-    /// | `begin_copy`・`begin_copy_in_txn` | 細かい（トークン走査 `copy_temp_gate`） |
-    /// | `execute_parsed_in_session`・`execute_parsed_in_txn`・`describe_*` | 粗い |
+    /// | `execute_sql_in_session`・`execute_sql_in_txn` | 細かい（`parse_tokens_gated` の振り分け） |
+    /// | `begin_copy`・`begin_copy_in_txn` | 細かい（`begin_copy_temp` の振り分け） |
+    /// | `execute_parsed_in_session`・`execute_parsed_in_txn`・`describe_*` | 粗い（世代検査つき） |
     fn coarse_temp_gate(
         session: &crate::sql::mode::SessionState,
         parsed: &ParsedSql,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-        if session.temp_tables().is_empty() || matches!(parsed, ParsedSql::Transaction(_)) {
+        // 振り分け済みの文（一時表向け・永続側）は、一時カタログの世代・参照する一時表が振り分け時から
+        // 変わっていなければ通す。変わっていれば陳腐化として `0A000`（TABLE-44・Issue #1684）。
+        if let ParsedSql::SessionRouted(routed) = parsed {
+            return routed.require_current(session);
+        }
+        // TABLE-44・Issue #1683: トランザクション制御に加え、一時表の行を読み書きしない
+        // `CREATE [TEMP] TABLE`・`DROP TABLE` を通す（実行段がセッションの一時カタログで
+        // 名前を解決する）。これらを通さないと、一時表を作った直後のセッションが拡張クエリで
+        // 一時表の `DROP` も永続表の DDL も実行できなくなる。
+        if session.temp_tables().is_empty()
+            || matches!(
+                parsed,
+                ParsedSql::Transaction(_)
+                    | ParsedSql::CreateTable(_)
+                    | ParsedSql::CreateTempTable(_)
+                    | ParsedSql::DropTable(_)
+            )
+        {
             return Ok(());
         }
         Err(crate::sql::temp_catalog::temp_table_unsupported())
-    }
-
-    /// `COPY` 入口の細かいゲート（SQL テキストのトークン走査。字句解析に失敗する入力は
-    /// 通常の検証へ任せる）。
-    fn copy_temp_gate(
-        session: &crate::sql::mode::SessionState,
-        sql: &str,
-    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-        let temp = session.temp_tables();
-        if temp.is_empty() {
-            return Ok(());
-        }
-        if let Ok(tokens) = crate::sql::lexer::tokenize_marked(sql) {
-            if crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
-                return Err(crate::sql::temp_catalog::temp_table_unsupported());
-            }
-        }
-        Ok(())
     }
 
     /// [`Self::execute_parsed_in_session_inner`] の公開入口。一時カタログが空でないセッションでは
@@ -3859,23 +4031,31 @@ impl EngineCore {
         // セッションを持たない入口（`parse_sql`・拡張クエリの Parse 等）は空の一時カタログで
         // 解決する（挙動は一時カタログ導入前と同一。TABLE-44・Issue #1681）。
         let temp = crate::sql::temp_catalog::SessionTempCatalog::default();
-        let hit = std::cell::Cell::new(false);
-        self.parse_tokens_in(tokens, &temp, &hit)
+        let hits = crate::sql::temp_catalog::RelationHits::default();
+        self.parse_tokens_in(tokens, &temp, &hits, self.ledger_mode)
     }
 
     /// [`Self::parse_tokens`] のセッション一時カタログ対応版（TABLE-44・Issue #1681）。
     /// カタログを引く検証器へ、一時カタログ優先の
     /// [`crate::sql::temp_catalog::SessionRelationLookup`] を渡す。一時表に当たると
-    /// `hit` が立つ（呼び出し元の暫定ゲートが `0A000` で拒否する）。`temp` が空なら
-    /// 永続カタログ（`Storage`）だけを引き、`parse_tokens` と完全に同一に振る舞う。
+    /// `hits` の一時側が、永続の関係（表・ビュー）に当たると永続側が立つ（呼び出し元の振り分け
+    /// [`Self::route_temp_statement`] が使う）。`temp` が空なら永続カタログ（`Storage`）だけを引き、
+    /// `parse_tokens` と完全に同一に振る舞う。`ledger_mode` は書き込み文の `operation_id` 必須化の
+    /// 判定に使う台帳モードで、通常は `self.ledger_mode`。一時表への書き込みの分類 parse だけが
+    /// 緩めたモードを渡す。
     fn parse_tokens_in(
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
         temp: &crate::sql::temp_catalog::SessionTempCatalog,
-        hit: &std::cell::Cell<bool>,
+        hits: &crate::sql::temp_catalog::RelationHits,
+        ledger_mode: LedgerMode,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
-        let storage_lookup =
-            crate::sql::temp_catalog::SessionRelationLookup::new(&self.storage, temp, hit);
+        let storage_lookup = crate::sql::temp_catalog::SessionRelationLookup::new(
+            &self.storage,
+            temp,
+            hits.temp_cell(),
+        )
+        .with_persistent_hit(hits.persistent_cell());
         // 引用付き `NULL`（`Token::QuotedNull`）を値位置で区別する必要があるのは
         // INSERT／UPDATE／CREATE／ALTER（`WITH` 先頭の DML 含む）の許可リスト検証だけ
         // （Issue #1524）。それ以外の文種は従来どおり `Ident` として扱う（識別子位置の
@@ -3962,12 +4142,16 @@ impl EngineCore {
         );
         if is_insert_statement {
             let insert_inner = InsertSchemaLookup::new(&self.storage);
-            let lookup =
-                crate::sql::temp_catalog::SessionRelationLookup::new(&insert_inner, temp, hit);
+            let lookup = crate::sql::temp_catalog::SessionRelationLookup::new(
+                &insert_inner,
+                temp,
+                hits.temp_cell(),
+            )
+            .with_persistent_hit(hits.persistent_cell());
             let stmt = crate::sql::allowlist::validate_insert_tokens_with_limit(
                 &tokens,
                 &lookup,
-                self.ledger_mode,
+                ledger_mode,
                 self.dml_limits.max_insert_rows_per_statement,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
@@ -3982,7 +4166,7 @@ impl EngineCore {
             let stmt = crate::sql::allowlist::validate_truncate_tokens(
                 &tokens,
                 &storage_lookup,
-                self.ledger_mode,
+                ledger_mode,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return Ok(ParsedSql::Truncate(stmt));
@@ -3996,7 +4180,7 @@ impl EngineCore {
             let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
                 &tokens,
                 &storage_lookup,
-                self.ledger_mode,
+                ledger_mode,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
             if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
@@ -4013,7 +4197,7 @@ impl EngineCore {
             let stmt = crate::sql::allowlist::validate_update_form_tokens(
                 &tokens,
                 &storage_lookup,
-                self.ledger_mode,
+                ledger_mode,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
             if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
@@ -4102,6 +4286,13 @@ impl EngineCore {
                 Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case(word)
             )
         };
+        // TABLE-42・Issue #1664: `CREATE MATERIALIZED VIEW` は `CREATE VIEW` の判定より前に分岐する。
+        // 構造検証のみでカタログを照会しない（`CreateView` と同じ設計）。`CREATE OR REPLACE
+        // MATERIALIZED` は下の `CREATE VIEW` 経路が `OR REPLACE` の後の `VIEW` を要求して `42601`。
+        if crate::sql::allowlist::is_create_materialized_view_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_materialized_view_tokens(&tokens)?;
+            return Ok(ParsedSql::CreateMaterializedView(stmt));
+        }
         // `CREATE VIEW` に加え `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）も同じ経路へ
         // 入れる。`CREATE OR REPLACE` の後が `VIEW` 以外（`TABLE`・`INDEX` 等）は従来どおり汎用経路で
         // `42601` になる。
@@ -4139,6 +4330,12 @@ impl EngineCore {
         if crate::sql::allowlist::is_create_table_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_table_tokens(&tokens)?;
             return Ok(ParsedSql::CreateTable(stmt));
+        }
+        // TABLE-44・Issue #1683: `CREATE [GLOBAL|LOCAL] TEMP|TEMPORARY TABLE` は永続表の
+        // `CreateTable` とは別 variant へ束縛する（カタログ照会なしの構造検証のみ）。
+        if crate::sql::allowlist::is_create_temp_table_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_temp_table_tokens(&tokens)?;
+            return Ok(ParsedSql::CreateTempTable(stmt));
         }
 
         // TASK-202（SQL-23。Issue #900）: `ALTER TABLE ... ADD COLUMN ...` は
@@ -4360,6 +4557,7 @@ impl EngineCore {
                 .map(|i| declared.get(i).copied().flatten())
                 .collect(),
             session_tz_dependent,
+            route: temp_route::PreparedRoute::Plain,
         })
     }
 
@@ -4673,7 +4871,7 @@ impl EngineCore {
         // `bind_aggregate_with_dummy_flags`／`bind_projection_for_describe`／
         // `bind_scan_with_dummy_flags` の
         // いずれが呼ばれても同じ配列を共有する）。
-        Self::coarse_temp_gate(session, &prepared.dummy_parsed)?;
+        Self::check_prepared_for_session(session, prepared)?;
         self.describe_parsed_in_session_impl(
             session,
             &prepared.dummy_parsed,
@@ -4690,6 +4888,30 @@ impl EngineCore {
     /// 従来インライン実行していた本体をそのまま移設したもので、実行順序・
     /// エラー契約は不変。
     fn execute_parsed_in_session_inner(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        parsed: &ParsedSql,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 永続側の文を包んだ形（世代の検査は公開入口の粗いゲートが済ませている）は中身を実行する。
+        if let ParsedSql::SessionRouted(routed) = parsed {
+            if routed.is_persistent() {
+                return self.execute_parsed_in_session_inner(ctx, session, routed.inner());
+            }
+        }
+        let outcome = self.execute_parsed_statement(ctx, session, parsed)?;
+        // 自動コミットの文が成功した直後に、一時表の `ON COMMIT` 動作を適用する
+        // （TABLE-44・Issue #1683。失敗した文では適用しない。明示・暗黙トランザクションの
+        // COMMIT は `sql::transaction::commit_active` が適用する）。
+        if !matches!(parsed, ParsedSql::Transaction(_)) {
+            session.apply_temp_on_commit()?;
+        }
+        Ok(outcome)
+    }
+
+    /// [`Self::execute_parsed_in_session_inner`] の本体（文の種類ごとの実行。`ON COMMIT` の
+    /// 適用は呼び出し元が行う）。
+    fn execute_parsed_statement(
         &self,
         ctx: &PolicyContext,
         session: &mut crate::sql::mode::SessionState,
@@ -4826,6 +5048,14 @@ impl EngineCore {
             ParsedSql::Partitioned(control) => {
                 self.execute_partitioned_control(ctx, session, control)
             }
+            // TABLE-44・Issue #1684: 一時表だけを参照する文は一時コアで実行する
+            // （`core/temp_route.rs`）。永続コアの実行器へは渡さない。
+            ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
+                self.execute_parsed_statement(ctx, session, routed.inner())
+            }
+            ParsedSql::SessionRouted(routed) => {
+                self.execute_temp_routed_autocommit(ctx, session, routed)
+            }
             // SQL-23・TASK-203（Issue #902）: DDL 実行権限ゲート
             // （`sql::ddl::require_ddl_permission`）を、カタログ照会（対象
             // テーブルの存在確認）を含む `execute_drop_table` より必ず先に
@@ -4833,6 +5063,24 @@ impl EngineCore {
             // 参照）。`ctx`（テナント境界）は `Storage::drop_table` が取らない
             // ため未使用のまま——`DROP TABLE` はテナントスコープの操作ではない。
             ParsedSql::DropTable(stmt) => {
+                // TABLE-44・Issue #1683: 名前がすべて自セッションの一時表なら、DDL 権限ゲートの
+                // 対象外で一時表を削除する。一時表と永続表の混在は、2 つのストアにまたがる原子的な
+                // 削除ができないため `0A000`（fail-closed）。判定は自セッションの一時カタログだけ
+                // で決まり、永続表の存否は観測できない。
+                match crate::sql::ddl::classify_drop_targets(session, &stmt.table_names) {
+                    Some(true) => {
+                        let outcome = crate::sql::ddl::execute_drop_temp_tables(session, stmt)?;
+                        return Ok(crate::sql::SqlOutcome::DropTable(outcome));
+                    }
+                    Some(false) => {}
+                    None => {
+                        return Err(
+                            crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                                "DROP TABLE cannot mix temporary and permanent tables",
+                            ),
+                        );
+                    }
+                }
                 crate::sql::ddl::require_ddl_permission(session)?;
                 let outcome = crate::sql::ddl::execute_drop_table(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropTable(outcome))
@@ -4844,10 +5092,48 @@ impl EngineCore {
             // ため未使用のまま——`CREATE TABLE` はテナントスコープの操作ではない。
             ParsedSql::CreateTable(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
+                // TABLE-44・Issue #1683: 永続表の FOREIGN KEY がこのセッションの一時表の名前に
+                // 解決される場合は `42P16`（永続表は一時表を参照できない）。同名の永続表を
+                // 黙って参照する fail-open を避ける。
+                // `IF NOT EXISTS` で同名の関係が既にあるときは、`execute_create_table` が定義の
+                // 意味検証より前に no-op 成功を返す契約のため、この検査も行わない（権限確認後の
+                // 既存名判定を FK 検証より先に維持する）。実際に新規作成する場合だけ拒否する。
+                let existing_noop = stmt.if_not_exists
+                    && self
+                        .storage
+                        .relation_name_exists(&stmt.table_name)
+                        .map_err(|_| crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "internal error".to_string(),
+                        })?;
+                if !existing_noop
+                    && stmt
+                        .foreign_keys
+                        .iter()
+                        .any(|fk| session.temp_tables().contains(fk.parent_table()))
+                {
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::invalid_table_definition(
+                            stmt.table_name.clone(),
+                        ),
+                    );
+                }
                 let outcome = crate::sql::ddl::execute_create_table(
                     &self.storage,
                     stmt,
                     &self.schema_limits,
+                )?;
+                Ok(crate::sql::SqlOutcome::CreateTable(outcome))
+            }
+            // TABLE-44・Issue #1683: 一時表の作成は DDL 実行権限ゲートの対象外（セッション内で
+            // 閉じる）。永続カタログには触れず、セッションの一時カタログへ登録する。
+            ParsedSql::CreateTempTable(stmt) => {
+                let outcome = crate::sql::ddl::execute_create_temp_table(
+                    session,
+                    ctx.tenant_id(),
+                    stmt,
+                    &self.schema_limits,
+                    self.temp_table_limits,
+                    self,
                 )?;
                 Ok(crate::sql::SqlOutcome::CreateTable(outcome))
             }
@@ -4877,6 +5163,14 @@ impl EngineCore {
                     crate::sql::ddl::execute_create_view(&self.storage, stmt)?
                 };
                 Ok(crate::sql::SqlOutcome::CreateView(outcome))
+            }
+            // TABLE-42・Issue #1664: DDL 権限ゲートを名前解決・カタログ照会より先に置く
+            // （権限の無い主体へ relation の有無・列構成を返さない）。以降は write txn 内で
+            // 列の確定・本文の評価・定義と実体の原子的な作成を行う。
+            ParsedSql::CreateMaterializedView(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = self.execute_create_materialized_view(ctx, session, stmt)?;
+                Ok(crate::sql::SqlOutcome::CreateMaterializedView(outcome))
             }
             ParsedSql::DropView(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
@@ -4980,7 +5274,7 @@ impl EngineCore {
         // TimeZone を parse 区間へも張る（ゾーン無し `TIMESTAMPTZ` リテラル・`AT LOCAL`。Issue #1576）。
         let parsed = {
             let _session_tz_scope = session_time_zone_scope(session);
-            self.parse_tokens_gated(tokens, session.temp_tables())?
+            self.parse_tokens_gated(tokens, session)?
         };
         // 一時カタログに対する細かいゲートは上の parse で通過済みのため、粗いゲートを持たない
         // 内部版を呼ぶ（TABLE-44・Issue #1681）。
@@ -5022,7 +5316,7 @@ impl EngineCore {
             // `parse_sql` と同じ字句解析 → 構文検証に、一時カタログの細かいゲートを足したもの。
             let parsed = (|| {
                 let tokens = crate::sql::lexer::tokenize_marked(sql)?;
-                self.parse_tokens_gated(tokens, session.temp_tables())
+                self.parse_tokens_gated(tokens, session)
             })();
             match parsed {
                 Ok(parsed) => parsed,
@@ -5062,6 +5356,12 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::transaction::{TransactionStatus, TxnControl};
 
+        // 永続側の文を包んだ形（世代の検査は公開入口の粗いゲートが済ませている）は中身を実行する。
+        if let ParsedSql::SessionRouted(routed) = parsed {
+            if routed.is_persistent() {
+                return self.execute_parsed_in_txn_inner(ctx, session, txn, routed.inner());
+            }
+        }
         if let ParsedSql::Transaction(ctrl) = parsed {
             return match ctrl {
                 TxnControl::Begin => {
@@ -5287,6 +5587,14 @@ impl EngineCore {
                 self.execute_partitioned_control(ctx, session, control)
             }
             ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
+            // TABLE-44・Issue #1684: 一時表の文は、一時側の書き込みトランザクション（最初の一時表の
+            // 文で開く）の上で一時コアが実行する。永続側の write txn・dirty 判定には触れない。
+            ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
+                self.execute_in_active_txn(ctx, session, txn, routed.inner())
+            }
+            ParsedSql::SessionRouted(routed) => {
+                self.execute_temp_routed_in_txn(ctx, session, txn, routed)
+            }
             // COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
@@ -5543,6 +5851,7 @@ impl EngineCore {
             | Statement::SetTimeZone { .. }
             | Statement::ShowTimeZone
             | Statement::CreateFunction { .. }
+            | Statement::MaterializedView(_)
             | Statement::ConstSelect(_) => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "unexpected statement in transactional read path".to_string(),
             }),
@@ -5592,7 +5901,20 @@ impl EngineCore {
         parsed: &ParsedSql,
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
-        if let ParsedSql::Cursor(stmt) = parsed {
+        // 永続側の文を包んだ形（拡張クエリの Bind が一時カタログが空でないセッションで作る）の中身が
+        // カーソル文なら、包みを外した文として扱う（世代の検査は先に済ませる）。
+        let cursor = match parsed {
+            ParsedSql::Cursor(stmt) => Some(stmt),
+            ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
+                routed.require_current(session)?;
+                match routed.inner() {
+                    ParsedSql::Cursor(stmt) => Some(stmt),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(stmt) = cursor {
             return match stmt {
                 crate::sql::cursor::CursorStatement::Declare { .. }
                 | crate::sql::cursor::CursorStatement::Close { .. } => Ok(None),
@@ -5872,6 +6194,24 @@ impl EngineCore {
         let _session_tz_scope = session_time_zone_scope(session);
 
         match parsed {
+            // TABLE-44・Issue #1684: 一時表の文は一時コアが結果列を導出する。
+            ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
+                routed.require_current(session)?;
+                self.describe_parsed_in_session_impl(
+                    session,
+                    routed.inner(),
+                    skip_vector_literal_validation,
+                    dummy_equality_flags,
+                    limits,
+                )
+            }
+            ParsedSql::SessionRouted(routed) => self.describe_temp_routed(
+                session,
+                routed,
+                skip_vector_literal_validation,
+                dummy_equality_flags,
+                limits,
+            ),
             ParsedSql::Insert(stmt) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&stmt.table_name)?;
                 match crate::sql::parser::bind_returning(stmt.returning.as_ref(), &schema)? {
@@ -5890,7 +6230,7 @@ impl EngineCore {
             // `CREATE TABLE`（Issue #899）も同じく `CommandComplete` のみを返す
             // DDL のため結果列を持たない。DDL 実行権限判定・カタログへの反映は
             // 一切行わない（Describe は本体を実行しない契約）。
-            ParsedSql::CreateTable(_) => Ok(None),
+            ParsedSql::CreateTable(_) | ParsedSql::CreateTempTable(_) => Ok(None),
             // `ALTER TABLE ADD COLUMN`（TASK-202・SQL-23。Issue #900）も
             // `CommandComplete` のみを返す DDL のため結果列を持たない。DDL 実行
             // 権限判定・カタログへの反映は一切行わない（Describe は本体を実行
@@ -5899,6 +6239,8 @@ impl EngineCore {
             // TABLE-18・SQL-23・TASK-205（Issue #909）: DDL につき結果列を持たない
             // （`DropTable` と同じ扱い）。
             ParsedSql::CreateView(_) => Ok(None),
+            // TABLE-42・Issue #1664: DDL につき結果列を持たない（Describe は本体を実行しない）。
+            ParsedSql::CreateMaterializedView(_) => Ok(None),
             ParsedSql::DropView(_) => Ok(None),
             // TASK-206・INDEX-7（Issue #908）: 索引 DDL も結果列を持たない。
             ParsedSql::CreateIndex(_) => Ok(None),
@@ -6027,6 +6369,11 @@ impl EngineCore {
                     limits,
                 )?;
                 Ok(Some(columns))
+            }
+            // TABLE-42・Issue #1664: matview の葉。列は参照時に束縛した定義の列で、実体の有無は
+            // Describe では判定しない（本体を実行しない契約）。
+            ParsedSql::Statement(Statement::MaterializedView(v)) => {
+                Ok(Some(crate::sql::matview::describe_columns(v)))
             }
             // Issue #1192（TABLE-18）: 評価後射影形ビュー。本文の結果列を
             // （本文は実行せずに）導出し、外側の射影だけを適用する。
@@ -6497,6 +6844,13 @@ impl EngineCore {
                 let result = crate::sql::const_select::run(&validated, session.udfs())?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
+            // TABLE-42・Issue #1664: matview の葉は `BufferedView` の本文としてのみ現れ、単独の
+            // 文としては生成されない（防御的に fail-closed）。
+            crate::sql::allowlist::Statement::MaterializedView(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "unexpected materialized view statement".to_string(),
+                })
+            }
         }
     }
 
@@ -6697,6 +7051,13 @@ impl EngineCore {
                         detail: "internal error".to_string(),
                     }),
                 }
+            }
+            // TABLE-42・Issue #1664: matview の葉。読み手の `ctx`（RLS 暗黙適用と同じ文脈）に
+            // 完全一致する文脈の実体だけを、同一の `read_txn`（単一スナップショット）から読む。
+            // 外側の WHERE・ORDER BY・射影・LIMIT は呼び出し元の `BufferedView` 腕が適用する。
+            crate::sql::allowlist::Statement::MaterializedView(validated) => {
+                let result = crate::sql::matview::execute_read(read_txn, ctx, &validated)?;
+                Ok(crate::sql::SqlOutcome::Query(result))
             }
             _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "internal error".to_string(),
@@ -8304,8 +8665,16 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
-        Self::copy_temp_gate(session, sql)?;
-        let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)?;
+        if let Some(plan) = self.begin_copy_temp(
+            ctx,
+            session,
+            None::<&mut crate::sql::transaction::SessionTransaction<'_>>,
+            sql,
+        )? {
+            return Ok(plan);
+        }
+        let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)
+            .map_err(|e| self.reclassify_matview_write_error(e))?;
         self.begin_copy_validated(ctx, session, stmt, None)
     }
 
@@ -8319,7 +8688,9 @@ impl EngineCore {
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         match stmt {
             crate::sql::allowlist::CopyStatement::From(v) => {
-                let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
+                let (_read_txn, schema) = self
+                    .read_txn_with_schema(&v.table_name)
+                    .map_err(|e| self.reclassify_matview_write_error(e))?;
                 // SQL-37・Issue #1587: COPY の行ごとの束縛は複数の wire メッセージにまたがるため、
                 // 列 `DEFAULT now()` 系の評価時刻（文の開始時刻・明示トランザクションでは
                 // トランザクション開始時刻）をここで確定してセッションへ持たせる。
@@ -8393,8 +8764,11 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
-        Self::copy_temp_gate(session, sql)?;
-        let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)?;
+        if let Some(plan) = self.begin_copy_temp(ctx, session, Some(&mut *txn), sql)? {
+            return Ok(plan);
+        }
+        let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)
+            .map_err(|e| self.reclassify_matview_write_error(e))?;
         if let crate::sql::allowlist::CopyStatement::To(v) = &stmt {
             // 通常の読み取り文と同じ文実行前チェック（文数・持続時間の上限。
             // 超過時は `Failed` へ遷移して拒否する）。`COPY FROM` は
@@ -8438,6 +8812,11 @@ impl EngineCore {
         ctx: &PolicyContext,
         batch: crate::sql::copy::CopyInBatch,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 一時表向けのバッチはセッションを要する `commit_copy_in_txn_in_session` だけが扱う
+        // （`ON COMMIT` の適用に `SessionState` が要る。永続 DB へ書く経路には絶対に載せない）。
+        if batch.temp.is_some() {
+            return Err(crate::sql::temp_catalog::temp_table_unsupported());
+        }
         self.commit_copy_in_with_target(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
             ctx,
@@ -8461,6 +8840,9 @@ impl EngineCore {
         batch: crate::sql::copy::CopyInBatch,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::transaction::TransactionStatus;
+        if batch.temp.is_some() {
+            return Err(crate::sql::temp_catalog::temp_table_unsupported());
+        }
         match txn.status() {
             TransactionStatus::Idle => self.commit_copy_in(ctx, batch),
             TransactionStatus::Failed => Err(txn.take_failed_error()),
@@ -8506,6 +8888,8 @@ impl EngineCore {
             bounds,
             schema: bound_schema,
             evaluated_at,
+            // 一時表向けの印は呼び出し元（`commit_copy_in*` の各入口）が振り分け済み。ここでは使わない。
+            temp: _,
         } = batch;
         // COPY の束縛は wire メッセージをまたいで完了済みのため、台帳 v3 の評価時刻を
         // 書き込み区間へ明示的に渡す（Issue #2188。None は v2 の権威値）。
@@ -8800,8 +9184,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
-        self.ledger_mode
-            .resolve(operation_id)
+        // 分割実行は構成に関わらず operation_id 必須（Issue #1704・RECOVER-1）。
+        crate::recovery::required_op_id::require_partitioned(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
         let clause = crate::sql::partitioned::PartitionedClause { chunk_rows };
         let limits =
@@ -8848,8 +9232,8 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
-        self.ledger_mode
-            .resolve(operation_id)
+        // 分割実行は構成に関わらず operation_id 必須（Issue #1704・RECOVER-1）。
+        crate::recovery::required_op_id::require_partitioned(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
         let clause = crate::sql::partitioned::PartitionedClause { chunk_rows };
         let limits =
@@ -9582,7 +9966,7 @@ impl EngineCore {
     ///
     /// `sql::allowlist::validate_insert`（構造検証。文末専用句
     /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
-    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// が `LedgerMode::Ledgered`（`--require-operation-id`）である限りこの段階で `23502` として拒否され、
     /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
     /// RECOVER-1）→ `Storage::get_table_schema`（スキーマ取得）→
     /// `sql::parser::bind_insert`（意味論検証・束縛）→ `sql::exec::execute_insert`
@@ -9842,7 +10226,7 @@ impl EngineCore {
     ///
     /// `sql::allowlist::validate_truncate`（構造検証。文末専用句
     /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
-    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// が `LedgerMode::Ledgered`（`--require-operation-id`）である限りこの段階で `23502` として拒否され、
     /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
     /// RECOVER-1）→ [`Self::execute_truncate_form`]（実行本体）の順に呼ぶ。
     pub fn execute_truncate_sql(
@@ -9873,7 +10257,7 @@ impl EngineCore {
     ///
     /// `sql::allowlist::validate_delete`（構造検証。文末専用句
     /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
-    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// が `LedgerMode::Ledgered`（`--require-operation-id`）である限りこの段階で `23502` として拒否され、
     /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
     /// RECOVER-1）→ [`Self::execute_delete_form`]（実行本体）の順に呼ぶ。
     pub fn execute_delete_sql(
@@ -10039,6 +10423,9 @@ impl EngineCore {
         schema: &crate::catalog::TableSchema,
         limits: &crate::sql::parser::PartitionedDmlLimits,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 多層防御: 外部で組み立てた文でも構成に関わらず operation_id 必須（Issue #1704）。
+        crate::recovery::required_op_id::require_partitioned(stmt.operation_id())
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
         // 時刻値関数を含む文は、ジョブ開始時に確定・永続化した固定時刻で全チャンクを束縛する
         // （再開時も同じ値。SQL-37・RECOVER-11・Issue #1587、設計 D6）。束縛 → ハッシュ計算の
         // 失敗順序は従来どおり。
@@ -10079,6 +10466,9 @@ impl EngineCore {
         schema: &crate::catalog::TableSchema,
         limits: &crate::sql::parser::PartitionedDmlLimits,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 多層防御: 外部で組み立てた文でも構成に関わらず operation_id 必須（Issue #1704）。
+        crate::recovery::required_op_id::require_partitioned(stmt.operation_id())
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
         let assignment_refs: Vec<(&str, &crate::sql::allowlist::SetValue)> = stmt
             .assignments()
             .iter()
@@ -10411,7 +10801,7 @@ impl EngineCore {
     ///
     /// `sql::allowlist::validate_update`（構造検証。文末専用句
     /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
-    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// が `LedgerMode::Ledgered`（`--require-operation-id`）である限りこの段階で `23502` として拒否され、
     /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
     /// RECOVER-1）→ [`Self::execute_update_form`]（束縛・実行本体）の順に呼ぶ。
     ///

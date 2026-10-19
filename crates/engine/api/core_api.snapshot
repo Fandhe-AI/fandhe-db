@@ -47,6 +47,7 @@ pub mod search_engine;
 pub mod sparse;
 pub mod sql;
 pub mod storage;
+pub mod temp_table_limits;
 pub mod tenant;
 pub mod test_sync;
 pub mod tiering;
@@ -220,6 +221,10 @@ impl PolicyContext {
     #[inline]
     pub(crate) fn allows_public(&self) -> bool {
         self.allowed.public
+    }
+    #[inline]
+    pub(crate) fn allows_private(&self) -> bool {
+        self.allowed.private
     }
 }
 

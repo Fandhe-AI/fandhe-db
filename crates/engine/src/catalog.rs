@@ -61,6 +61,13 @@ use crate::storage::{RowInput, Visibility};
 mod dependency;
 pub(crate) use dependency::{truncate_closure_in_txn, TruncateClosureError};
 
+// matview のカタログと文脈単位の実体ストア（TABLE-42 (2)、Issue #1663）。SQL 表層からの
+// 配線は後続 Issue（#1664〜#1667）が行うため、それまでは crate 内の呼び出し元が
+// テストだけになる（dead_code を許可）。
+#[allow(dead_code)]
+pub(crate) mod materialized;
+pub(crate) use materialized::read_materialized_view_in;
+
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
 /// エンコードしたバイト列。`ROWS_TABLE`（`storage.rs`）とは別テーブルとし、
 /// カタログの読み書き（TABLE-4/TABLE-5）が行データに触れないようにする。
@@ -1039,6 +1046,37 @@ fn foreign_keys_relying_on_unique_columns_in_txn(
 /// （宣言 0 件）の場合は `false`。
 fn index_name_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
     match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => Ok(t.get(name)?.is_some()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `name` が [`CATALOG_TABLE`] に表として登録済みかを write txn 内で判定する
+/// （relation 名前空間の衝突・存在確認用。表が未作成なら `false` で、表を作らない）。
+fn table_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
+    match write_txn.open_table(CATALOG_TABLE) {
+        Ok(t) => Ok(t.get(name)?.is_some()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `name` が [`VIEWS_TABLE`] にビューとして登録済みかを write txn 内で判定する。
+fn view_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
+    match write_txn.open_table(VIEWS_TABLE) {
+        Ok(t) => Ok(t.get(name)?.is_some()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `name` が [`materialized::MATERIALIZED_VIEWS_TABLE`] に matview として登録済みかを
+/// write txn 内で判定する（TABLE-42 (2)、Issue #1663）。表・ビュー・索引と名前空間を共有する
+/// ため、`index_name_exists_in_txn` を呼ぶ DDL の衝突・種別判定には必ず併記する。
+/// 表が未作成なら `false` で、表を作らない。
+fn materialized_view_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
+    match write_txn.open_table(materialized::MATERIALIZED_VIEWS_TABLE) {
         Ok(t) => Ok(t.get(name)?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
         Err(e) => Err(e.into()),
@@ -4196,6 +4234,24 @@ fn drop_targets_with_dependents_in_txn(
         }
     }
     Ok((view_dependent, fk_dependent))
+}
+
+/// CASCADE の閉包に含まれるビューのうち、matview の参照元になっているものがあれば
+/// `DependentViewsExist` で拒否する（Issue #1663 の暫定ガード。CASCADE での matview 削除の
+/// 適用は #1667。指定対象の直接検査だけでは「表 -> ビュー -> matview」「ビュー -> ビュー ->
+/// matview」の連鎖で参照先が欠落するため、適用前に閉包全体を同一 txn 内で走査する。fail-closed）。
+fn reject_cascade_closure_referenced_by_matview_in_txn(
+    write_txn: &redb::WriteTransaction,
+    objects: &[dependency::DependentObject],
+) -> Result<()> {
+    for obj in objects {
+        if let dependency::DependentObject::View { name } = obj {
+            if !materialized::materialized_views_referencing_in_txn(write_txn, name)?.is_empty() {
+                return Err(CatalogError::DependentViewsExist(name.clone()));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `CASCADE` で列挙された依存オブジェクトを、返された順（依存する側が先）に同じ write txn
@@ -9882,6 +9938,10 @@ impl Storage {
             if index_name_exists_in_txn(&write_txn, schema.name.as_str())? {
                 return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
             }
+            // matview とも名前空間を共有する（TABLE-42 (2)、Issue #1663）。
+            if materialized_view_exists_in_txn(&write_txn, schema.name.as_str())? {
+                return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
+            }
         }
         // `FOREIGN KEY` の参照先解決は `CATALOG_TABLE` を別途開く（参照先スキーマの
         // decode）ため、上のブロックでハンドルを解放してから行う（redb の
@@ -9969,6 +10029,26 @@ impl Storage {
         if_exists: bool,
         behavior: DropBehavior,
     ) -> Result<DropTablesReport> {
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let report = self.drop_tables_in_txn(&write_txn, table_names, if_exists, behavior)?;
+        if report.dropped == 0 {
+            // 副作用ゼロ（世代も不変）。txn は commit せず破棄する。
+            return Ok(report);
+        }
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(report)
+    }
+
+    /// [`Self::drop_tables`] の write txn 内本体（begin・commit を含まない）。呼び出し側が commit
+    /// するか、`Err`／`dropped == 0` なら破棄する。一時 DB の `ON COMMIT` 処理が行の全削除と
+    /// 表の削除を単一 txn で原子的に適用するために切り出した（Issue #1684）。
+    pub(crate) fn drop_tables_in_txn(
+        &self,
+        write_txn: &redb::WriteTransaction,
+        table_names: &[String],
+        if_exists: bool,
+        behavior: DropBehavior,
+    ) -> Result<DropTablesReport> {
         let mut targets: Vec<&str> = Vec::new();
         for name in table_names {
             validate_identifier(name)?;
@@ -9976,7 +10056,6 @@ impl Storage {
                 targets.push(name.as_str());
             }
         }
-        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         // Phase 1: 解決。
         let mut existing: Vec<&str> = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
@@ -9992,7 +10071,11 @@ impl Storage {
             }
             // 索引名を指定された場合もビューと同じく種別不一致（`42809`。TASK-206・INDEX-7、
             // Issue #908）。
-            if index_name_exists_in_txn(&write_txn, name)? {
+            if index_name_exists_in_txn(write_txn, name)? {
+                return Err(CatalogError::WrongObjectKind(name.to_string()));
+            }
+            // matview を指定された場合も種別不一致（TABLE-42 (5)、Issue #1663）。
+            if materialized_view_exists_in_txn(write_txn, name)? {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
             let found = match write_txn.open_table(CATALOG_TABLE) {
@@ -10016,12 +10099,19 @@ impl Storage {
                 cascaded: Vec::new(),
             });
         }
+        // 暫定ガード（Issue #1663）: matview の参照元になっている表は RESTRICT／CASCADE を
+        // 問わず削除しない（CASCADE での matview 削除の適用は #1667。fail-closed）。
+        for name in &existing {
+            if !materialized::materialized_views_referencing_in_txn(write_txn, name)?.is_empty() {
+                return Err(CatalogError::DependentViewsExist((*name).to_string()));
+            }
+        }
         let mut cascaded: Vec<CascadedObject> = Vec::new();
         match behavior {
             DropBehavior::Restrict => {
                 // Phase 2: 依存（TABLE-15・TABLE-17・TABLE-18、Issue #907・#909）。
                 let (view_dependent, fk_dependent) =
-                    drop_targets_with_dependents_in_txn(&write_txn, &existing)?;
+                    drop_targets_with_dependents_in_txn(write_txn, &existing)?;
                 if let Some(name) = existing.iter().find(|n| view_dependent.contains(**n)) {
                     return Err(CatalogError::DependentViewsExist((*name).to_string()));
                 }
@@ -10037,13 +10127,14 @@ impl Storage {
                     .iter()
                     .map(|n| dependency::DropTarget::Table((*n).to_string()))
                     .collect();
-                let closure = dependency::enumerate_drop_dependents_in_txn(&write_txn, &roots)?;
+                let closure = dependency::enumerate_drop_dependents_in_txn(write_txn, &roots)?;
                 if closure.conservative {
                     // 依存を正確に検証できないまま不可逆な連鎖削除をしない（fail-closed）。
                     let first = existing.first().copied().unwrap_or_default();
                     return Err(CatalogError::DependentObjectsStillExist(first.to_string()));
                 }
-                cascaded = apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
+                reject_cascade_closure_referenced_by_matview_in_txn(write_txn, &closure.objects)?;
+                cascaded = apply_cascaded_objects_in_txn(write_txn, closure.objects)?;
             }
         }
         // Phase 3: 削除。
@@ -10061,21 +10152,20 @@ impl Storage {
             // 新テーブルの行と突き合わされる。
             write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(name)))?;
             // 台帳・分割実行ジョブ表（Issue #226・#1127）は同名再作成での引き継ぎ防止。
-            crate::recovery::ledger::delete_table_in_txn(&write_txn, name)
+            crate::recovery::ledger::delete_table_in_txn(write_txn, name)
                 .map_err(convert_storage_error)?;
-            crate::recovery::partitioned_job::delete_table_in_txn(&write_txn, name)
+            crate::recovery::partitioned_job::delete_table_in_txn(write_txn, name)
                 .map_err(convert_storage_error)?;
             // 永続キー索引（Issue #1071）。残置すると参照整合性検査が fail-open になりうる。
-            crate::key_index::drop_indexes_for_table_in_txn(&write_txn, name)?;
-            bump_table_generation_in_txn(&write_txn, name)?;
+            crate::key_index::drop_indexes_for_table_in_txn(write_txn, name)?;
+            bump_table_generation_in_txn(write_txn, name)?;
         }
         // 索引宣言（TASK-206・INDEX-7、Issue #908）は 1 回にまとめる（カタログ世代の bump も 1 回）。
-        retain_index_defs_in_txn(&write_txn, |def| !existing.contains(&def.table.as_str()))?;
+        retain_index_defs_in_txn(write_txn, |def| !existing.contains(&def.table.as_str()))?;
         // TABLE-15・Issue #1363: 全削除済み・commit 前の同期点（feature 限定。既定ビルドでは消える）。
         #[cfg(feature = "test-sync-points")]
         self.sync_point(crate::test_sync::SyncPoint::DropTableBeforeCommit);
         let dropped = existing.len();
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(DropTablesReport {
             dropped,
             skipped,
@@ -10417,6 +10507,16 @@ impl Storage {
                     column_name.to_string(),
                 ));
             }
+            // このテーブルを直接参照する matview があれば、列単位の追随（#1667）が入るまで
+            // 保守的に拒否する（TABLE-42・Issue #1664 の暫定ガード。`REFRESH` が壊れた本文で
+            // 失敗する不整合を作らない。表単位の判定で、matview→ビュー→表の推移依存は #1667）。
+            if !materialized::materialized_views_referencing_in_txn(write_txn, table_name)?
+                .is_empty()
+            {
+                return Err(CatalogError::DependentObjectsStillExist(
+                    column_name.to_string(),
+                ));
+            }
             // このテーブルを直接参照するビュー（TABLE-18・SQL-23、Issue #909）の
             // 投影・述語が削除対象列を参照していれば拒否する（`2BP01`。ビューを
             // 黙って壊す暗黙 cascade を作らない）。同一 write txn 内で判定する
@@ -10511,6 +10611,15 @@ impl Storage {
             }
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        // 直接参照する matview があれば列単位の追随（#1667）が入るまで拒否する（TABLE-42・
+        // Issue #1664 の暫定ガード。表が無ければ空で、従来どおり `TableNotFound` へ進む）。
+        if !materialized::materialized_views_referencing_in_txn(&write_txn, table_name)?.is_empty()
+        {
+            return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail: "renaming a column of a table used by a materialized view is not supported"
+                    .to_string(),
+            }));
+        }
         let mut schema = {
             let table = write_txn
                 .open_table(CATALOG_TABLE)
@@ -10695,8 +10804,15 @@ impl Storage {
             Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(e) => return Err(CatalogError::from(e).into()),
         }
-        if index_name_exists_in_txn(&write_txn, new_table_name)? {
+        if index_name_exists_in_txn(&write_txn, new_table_name)?
+            || materialized_view_exists_in_txn(&write_txn, new_table_name)?
+        {
             return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
+        }
+        // 暫定ガード（Issue #1663）: matview の参照元の改名は、追随（#1667）が入るまで拒否する。
+        if !materialized::materialized_views_referencing_in_txn(&write_txn, table_name)?.is_empty()
+        {
+            return Err(CatalogError::DependentViewsExist(table_name.to_string()).into());
         }
         rewrite_views_for_renamed_table_in_txn(&write_txn, table_name, new_table_name)?;
 
@@ -11592,7 +11708,9 @@ impl Storage {
                     Err(redb::TableError::TableDoesNotExist(_)) => {}
                     Err(e) => return Err(CatalogError::from(e)),
                 }
-                if index_name_exists_in_txn(&write_txn, parent_table_name.as_str())? {
+                if index_name_exists_in_txn(&write_txn, parent_table_name.as_str())?
+                    || materialized_view_exists_in_txn(&write_txn, parent_table_name.as_str())?
+                {
                     return Err(CatalogError::WrongObjectKind(parent_table_name.clone()));
                 }
                 owned_parent = require_table_schema_write(&write_txn, &parent_table_name)?;
@@ -12068,6 +12186,14 @@ impl Storage {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()).into());
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        // 直接参照する matview があれば列単位の追随（#1667）が入るまで拒否する（TABLE-42・
+        // Issue #1664 の暫定ガード。文言はビューの既存拒否と揃える）。
+        if !materialized::materialized_views_referencing_in_txn(&write_txn, table_name)?.is_empty()
+        {
+            return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail: "cannot alter type of a column used by a view or rule".to_string(),
+            }));
+        }
         let mut revalidate_schema: Option<TableSchema> = None;
         // `RewriteExpr` のとき、カタログのハンドルを手放した後で処理するための持ち越し
         // （旧スキーマ・変更列の論理 index・新しい型・新しい照合）。
@@ -12459,7 +12585,9 @@ impl Storage {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
             // 索引名とも名前空間を共有する（TASK-206・INDEX-7、Issue #908）。
-            if index_name_exists_in_txn(&write_txn, name)? {
+            if index_name_exists_in_txn(&write_txn, name)?
+                || materialized_view_exists_in_txn(&write_txn, name)?
+            {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
             validate_new_view_body_in_txn(
@@ -12513,9 +12641,16 @@ impl Storage {
             }
             // 索引名を指定された場合も種別不一致（`42809`。TASK-206・INDEX-7、
             // Issue #908）。
-            if index_name_exists_in_txn(&write_txn, name)? {
+            if index_name_exists_in_txn(&write_txn, name)?
+                || materialized_view_exists_in_txn(&write_txn, name)?
+            {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
+        }
+        // 暫定ガード（Issue #1663）: matview の参照元になっているビューは RESTRICT／CASCADE を
+        // 問わず削除しない（CASCADE での matview 削除の適用は #1667。fail-closed）。
+        if !materialized::materialized_views_referencing_in_txn(&write_txn, name)?.is_empty() {
+            return Err(CatalogError::DependentViewsExist(name.to_string()));
         }
         let cascaded = match behavior {
             DropBehavior::Restrict => {
@@ -12537,6 +12672,7 @@ impl Storage {
                 if closure.conservative {
                     return Err(CatalogError::DependentViewsExist(name.to_string()));
                 }
+                reject_cascade_closure_referenced_by_matview_in_txn(&write_txn, &closure.objects)?;
                 let cascaded = apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
                 drop_view_in_txn(&write_txn, name)?;
                 cascaded
@@ -12617,12 +12753,17 @@ impl Storage {
             if table_contains(&def.name)?
                 || views_contains(&def.name)?
                 || index_name_exists_in_txn(&write_txn, &def.name)?
+                || materialized_view_exists_in_txn(&write_txn, &def.name)?
             {
                 return Err(CatalogError::IndexAlreadyExists(def.name.clone()));
             }
             // 対象がビュー・既存の索引（relation 名前空間を共有するが行を持たない）
             // なら種別不一致（`42809`）。テーブル不在（`42P01`）へ落とさない。
-            if views_contains(&def.table)? || index_name_exists_in_txn(&write_txn, &def.table)? {
+            // matview への索引は #1667 が解禁するまで種別不一致とする（TABLE-42 (2)）。
+            if views_contains(&def.table)?
+                || index_name_exists_in_txn(&write_txn, &def.table)?
+                || materialized_view_exists_in_txn(&write_txn, &def.table)?
+            {
                 return Err(CatalogError::WrongObjectKind(def.table.clone()));
             }
             let schema = require_table_schema_write(&write_txn, &def.table)?;
@@ -12695,6 +12836,9 @@ impl Storage {
                     Err(e) => return Err(e.into()),
                 }
             }
+            if materialized_view_exists_in_txn(&write_txn, name)? {
+                return Err(CatalogError::WrongObjectKind(name.to_string()));
+            }
             return Err(CatalogError::IndexNotFound(name.to_string()));
         };
         if def.unique {
@@ -12746,6 +12890,16 @@ impl Storage {
             Err(e) => return Err(e.into()),
         }
         match read_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => {
+                if t.get(name)?.is_some() {
+                    return Ok(true);
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        // matview も同じ名前空間（TABLE-42 (2)、Issue #1663）。
+        match read_txn.open_table(materialized::MATERIALIZED_VIEWS_TABLE) {
             Ok(t) => Ok(t.get(name)?.is_some()),
             Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
             Err(e) => Err(e.into()),
@@ -12847,7 +13001,11 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
-            if catalog_table.get(name)?.is_some() || index_name_exists_in_txn(&write_txn, name)? {
+            // matview とも名前空間を共有する（TABLE-42 (2)、Issue #1663）。
+            if catalog_table.get(name)?.is_some()
+                || index_name_exists_in_txn(&write_txn, name)?
+                || materialized_view_exists_in_txn(&write_txn, name)?
+            {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
             let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
@@ -13345,6 +13503,20 @@ impl TableLookup for Storage {
         match self.get_table_schema(name) {
             Ok(schema) => Ok(Some(lookup_star_columns_of(&schema))),
             Err(CatalogError::TableNotFound(_)) => Ok(None),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
+    /// matview の列定義（TABLE-42・Issue #1664）。[`Storage::materialized_view_definition`] へ
+    /// 委譲し、破損・I/O 失敗は [`table_lookup_error`] で写す（`None` と同一視しない）。
+    fn materialized_view_columns(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Vec<ColumnDef>>, SqlSurfaceError> {
+        match self.materialized_view_definition(name) {
+            Ok(def) => Ok(def.map(|d| d.columns)),
+            // 識別子として不正な名前は matview ではない（表の照会と同じく存在しない扱い）。
+            Err(CatalogError::Invalid(_)) => Ok(None),
             Err(other) => Err(table_lookup_error(other)),
         }
     }
@@ -14157,7 +14329,9 @@ fn resolve_foreign_keys_in_txn(
                 Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(e) => return Err(CatalogError::from(e)),
             }
-            if index_name_exists_in_txn(write_txn, fk.parent_table.as_str())? {
+            if index_name_exists_in_txn(write_txn, fk.parent_table.as_str())?
+                || materialized_view_exists_in_txn(write_txn, fk.parent_table.as_str())?
+            {
                 return Err(CatalogError::WrongObjectKind(fk.parent_table.clone()));
             }
             owned_parent = require_table_schema_write(write_txn, &fk.parent_table)?;
@@ -14337,6 +14511,16 @@ pub(crate) fn changed_table_generations_in_write_txn(
         }
     }
     Ok(changed)
+}
+
+/// 一時表の定義を一時カタログへ登録する前に正規化・検証する（TABLE-44・Issue #1683）。
+/// 永続表の [`Storage::create_table`] が write txn の前に行う UNIQUE 制約名の確定と
+/// スキーマ検証だけを切り出したもので、永続カタログには一切触れない。呼び出し元は
+/// `sql::ddl::execute_create_temp_table`。
+pub(crate) fn prepare_temp_table_schema(schema: &TableSchema) -> Result<TableSchema> {
+    let schema = assign_unique_constraint_names(schema.clone());
+    validate_schema(&schema)?;
+    Ok(schema)
 }
 
 #[cfg(test)]

@@ -37,7 +37,8 @@ fn new_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             ],
         ))
         .expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (Arc::new(core), guard)
 }
 
@@ -57,7 +58,8 @@ fn new_core_with_nullable_note_table() -> (Arc<EngineCore>, temp_db::CleanupGuar
             ],
         ))
         .expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (Arc::new(core), guard)
 }
 
@@ -91,7 +93,8 @@ fn new_core_with_extended_types_table() -> (Arc<EngineCore>, temp_db::CleanupGua
             ],
         ))
         .expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (Arc::new(core), guard)
 }
 
@@ -1112,10 +1115,10 @@ fn wire17_copy_real_exponent_output_round_trips_through_copy_from_stdin() {
             ],
         ))
         .expect("create table");
-    let core = Arc::new(EngineCore::from_storage(
-        storage,
-        Box::new(CpuScalarProvider),
-    ));
+    let core = Arc::new(
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+            .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered),
+    );
     let mut stream = spawn_with_alice(core);
 
     // 1e6 以上・1e-5 未満・通常値の 3 行を COPY FROM（指数表記入力を含む）で投入する。

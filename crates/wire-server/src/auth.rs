@@ -396,6 +396,29 @@ impl UserStore {
         self.users.is_empty()
     }
 
+    /// 認証構成に載っているテナント ID の集合（重複なし・昇順）。
+    pub(crate) fn tenant_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.users.values().map(|r| r.tenant_id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// MATERIALIZED VIEW の初回実体化の対象文脈（TABLE-42・Issue #1664）。認証構成のテナントごとに、
+    /// 認証成功後のセッションが実際に持つ `PolicyContext`（[`session_policy_context`] と同一の
+    /// 導出点）を返す。可視性集合まで一致させるのは、engine が実体を許可可視性まで含む文脈キーの
+    /// 完全一致で読み出すため（導出がずれると、そのテナントの読み取りが `55000` になる）。
+    /// クライアントの申告値は使わない。起動時に 1 回だけ呼び、失敗（ロード時検証で弾かれているはず
+    /// の不正なテナント ID）は呼び出し元が起動エラーにする（fail-closed。作成者のみへ縮退させない）。
+    pub fn materialization_contexts(
+        &self,
+    ) -> Result<Vec<engine::policy::PolicyContext>, engine::policy::PolicyError> {
+        self.tenant_ids()
+            .iter()
+            .map(|tenant_id| session_policy_context(tenant_id))
+            .collect()
+    }
+
     /// DDL 実行権限を持つ username 集合を設定する opt-in（`--ddl-allowed-users`
     /// からのみ呼ばれる。Issue #902・SQL-23・TASK-203）。`--search-engine` 等の
     /// 他の起動時 opt-in と同じく、起動後に変更できない構成値として一度だけ

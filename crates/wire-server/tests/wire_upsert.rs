@@ -41,7 +41,8 @@ fn new_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             ],
         ))
         .expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (Arc::new(core), guard)
 }
 
@@ -279,7 +280,8 @@ fn new_core_with_unique_column_table() -> (Arc<EngineCore>, temp_db::CleanupGuar
     storage
         .alter_table_add_unique_constraint("docs", &["a"])
         .expect("add UNIQUE(a) constraint");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (Arc::new(core), guard)
 }
 

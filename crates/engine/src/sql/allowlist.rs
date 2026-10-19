@@ -637,6 +637,9 @@ pub enum SqlSurfaceError {
     /// 取得（[`crate::storage::Storage::begin_write_txn`]）がロック待ちの上限を
     /// 超過した（`55P03`）。
     LockNotAvailable,
+    /// 未実体化の MATERIALIZED VIEW を読んだ（`55000`。TABLE-42・Issue #1664）。
+    /// 文言は固定で、名前・件数・他文脈の情報を含めない。
+    MaterializedViewNotPopulated,
     /// 明示トランザクション（SQL-31・TASK-221）内で構文としては受理されるものの、
     /// 本実装がトランザクション文脈での実行に未対応な文（複数行/ファイル形/
     /// `ON CONFLICT` の `INSERT`・`UPDATE`・`DELETE`・`UPSERT`・COPY・既に書き込んだ
@@ -699,6 +702,10 @@ pub enum SqlSurfaceError {
     /// `CREATE TABLE` の列リストに同名の列が複数回宣言された（TABLE-6、
     /// Issue #899）。ERR-6: `42701`。
     DuplicateColumn { name: String },
+    /// `ON CONFLICT (<列>)` の衝突対象が、どの PRIMARY KEY・UNIQUE 制約の構成列集合とも
+    /// 一致しない（`42P10`。SQL-49・ERR-6、Issue #1707。`id` と他列の混在・未知列を含む）。
+    /// 束縛段（`sql::parser::resolve_conflict_target`）が返す。固定文言で列名・値を含めない。
+    InvalidColumnReference,
     /// DDL 文（`CREATE TABLE`・`DROP TABLE` 等。SQL-23、TASK-202・TASK-203、
     /// Issue #899・#902）を、DDL 実行権限（[`crate::sql::mode::SessionState::
     /// ddl_allowed`]）を持たないセッションが実行しようとした（ERR-2 拡張:
@@ -1190,6 +1197,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::NoActiveSqlTransaction => ErrorClass::NoActiveSqlTransaction,
             SqlSurfaceError::InFailedSqlTransaction => ErrorClass::InFailedSqlTransaction,
             SqlSurfaceError::LockNotAvailable => ErrorClass::LockNotAvailable,
+            SqlSurfaceError::MaterializedViewNotPopulated => {
+                ErrorClass::ObjectNotInPrerequisiteState
+            }
             SqlSurfaceError::TransactionFeatureNotSupported { .. } => {
                 ErrorClass::FeatureNotSupported
             }
@@ -1205,6 +1215,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PartitionedDmlInTransaction => ErrorClass::ActiveSqlTransaction,
             SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
+            SqlSurfaceError::InvalidColumnReference => ErrorClass::InvalidColumnReference,
             SqlSurfaceError::InsufficientPrivilege | SqlSurfaceError::ConflictTargetNotVisible => {
                 ErrorClass::ForbiddenTenantMismatch
             }
@@ -1338,6 +1349,9 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::LockNotAvailable => {
                 write!(f, "write lock not available: timed out waiting for writer")
             }
+            SqlSurfaceError::MaterializedViewNotPopulated => {
+                write!(f, "materialized view has not been populated")
+            }
             SqlSurfaceError::TransactionFeatureNotSupported { detail } => {
                 write!(f, "not supported inside an explicit transaction: {detail}")
             }
@@ -1398,6 +1412,11 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::DuplicateColumn { name } => {
                 write!(f, "duplicate column name: {name}")
             }
+            // 列名・値を含めない固定文言（PostgreSQL の公開メッセージと同形）。
+            SqlSurfaceError::InvalidColumnReference => write!(
+                f,
+                "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+            ),
             // テーブル名・ユーザー名を含めない固定文言（security.md P0。
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
@@ -1563,6 +1582,18 @@ pub trait TableLookup {
     /// 破損したカタログの循環でも再帰が無限にならないようにする。
     fn buffered_depth(&self) -> usize {
         0
+    }
+
+    /// `name` が MATERIALIZED VIEW（TABLE-42・Issue #1664）なら、その列定義を返す。matview でなければ
+    /// `Ok(None)`。既定実装は常に `Ok(None)`（matview を持たない既存の実装・モックは無変更で動く）。
+    /// [`crate::sql::view::resolve_from`] が、表にもビューにも該当しない名前に限って照会する。
+    /// カタログ照会自体の失敗・破損は `Err`（fail-closed。matview が無いとは扱わない）。
+    fn materialized_view_columns(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<crate::catalog::ColumnDef>>, SqlSurfaceError> {
+        let _ = name;
+        Ok(None)
     }
 }
 
@@ -2107,6 +2138,29 @@ pub enum Statement {
     /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的
     /// `match` はアームの追加が必要（`BufferedView` 追加時と同じ運用）。
     ConstSelect(ValidatedConstSelect),
+    /// MATERIALIZED VIEW（TABLE-42・Issue #1664）の葉の読み取り。`sql::view::resolve_from` が
+    /// matview 名を [`super::view::Resolved::Buffered`] の本文として返し、外側の WHERE・ORDER BY・
+    /// 射影・集計・LIMIT は評価後射影形ビューと同じ [`Statement::BufferedView`] の外側処理に乗る。
+    /// 実行は読み手の `PolicyContext` に完全一致する文脈の実体だけを読む（`sql::matview`）。
+    ///
+    /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的 `match` はアームの
+    /// 追加が必要（`ConstSelect` 追加時と同じ運用）。
+    MaterializedView(ValidatedMaterializedViewRead),
+}
+
+/// matview の葉の読み取り（[`Statement::MaterializedView`]）。定義の列は参照時に束縛した値で、
+/// 実行時に実体の列と突き合わせる（並行 DDL で食い違えば行を返さず拒否）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedMaterializedViewRead {
+    pub(crate) name: String,
+    pub(crate) columns: Vec<crate::catalog::ColumnDef>,
+}
+
+impl ValidatedMaterializedViewRead {
+    /// 参照された matview 名。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// `FROM` なし定数式 SELECT の項目数上限（SQL-43）。1 文あたりの束縛・評価コストを
@@ -3194,8 +3248,8 @@ pub enum OnConflictAction {
 
 /// `ON CONFLICT (<col>[, <col>]*) DO NOTHING | DO UPDATE SET ...`（SQL-20・
 /// TABLE-16、Issue #1074）。対象列リストは構文段階（本モジュール）では列名の
-/// 宣言順の並びとしてのみ受理し、スキーマ照合（`id` 疑似列か、UNIQUE 制約の
-/// 構成列集合と一致するか）は `sql::parser::bind_upsert_form` の責務とする
+/// 宣言順の並びとしてのみ受理し、スキーマ照合（`id` 疑似列か、UNIQUE 制約または
+/// PRIMARY KEY の構成列集合と一致するか。SQL-49、Issue #1707）は `sql::parser::bind_upsert_form` の責務とする
 /// （`ValidatedStatement` の一般契約と同じ「構造検証はここまで」の分担）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnConflictClause {
@@ -3228,7 +3282,7 @@ pub struct ValidatedInsert {
     pub rows: Vec<Vec<InsertLiteral>>,
     /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-10）。句の欠落・明示
     /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。`validate_insert` は
-    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション開始前に
+    /// `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を書き込みトランザクション開始前に
     /// `23502` で拒否するため、この構成では常に `Some` になる。
     /// `LedgerMode::CompareOnlyWithoutLedger` では `None` を許す。
     pub operation_id: Option<OperationId>,
@@ -3267,7 +3321,7 @@ pub struct ValidatedDelete {
     pub id_literal: String,
     /// 文末専用句で搬送された、検証済みの `operation_id`。句の欠落・明示
     /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。`validate_delete` は
-    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
+    /// `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を書き込みトランザクション
     /// 開始前に `23502` で拒否するため、この構成では常に `Some`。
     pub operation_id: Option<OperationId>,
     /// `RETURNING` 句（Issue #873・SQL-21）。単一行・`id` 完全一致形は実行結線
@@ -3299,7 +3353,7 @@ pub struct ValidatedPredicateDelete {
     pub(crate) where_predicates: Vec<WherePredicate>,
     /// 文末専用句で搬送された、検証済みの `operation_id`。句の欠落・明示
     /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。[`validate_delete_statement`]
-    /// は `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
+    /// は `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を書き込みトランザクション
     /// 開始前に `23502` で拒否するため、この構成では常に `Some`。
     pub(crate) operation_id: Option<OperationId>,
     /// `RETURNING` 句（Issue #1182・SQL-21）。削除前の値を返す
@@ -3428,6 +3482,30 @@ pub struct ValidatedCreateTable {
     /// BREAKING CHANGE: 公開フィールドの追加（構造体リテラルで生成する外部コードは
     /// 追随が必要）。
     pub primary_key_name: Option<String>,
+}
+
+/// `ON COMMIT` 句の動作（TABLE-44・Issue #1683）。一時表にだけ指定できる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TempOnCommit {
+    /// 行も表も保持する（既定）。
+    #[default]
+    PreserveRows,
+    /// 各 commit（自動コミットの文を含む）で行を消す。表は残る。
+    DeleteRows,
+    /// 作成したトランザクションの commit で表を消す。
+    Drop,
+}
+
+/// 構造検証済みの `CREATE TEMP TABLE`（TABLE-44・Issue #1683）。永続表の
+/// [`ValidatedCreateTable`] とは別の型にして、`ParsedSql::CreateTempTable` を別 variant で
+/// 運ぶ。`temp` フラグを `ValidatedCreateTable` に足すと、永続表の分岐の確認漏れが
+/// 「一時表のつもりの定義が全テナント共有の永続表になる」fail-open を招くため。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedCreateTempTable {
+    /// 列定義・制約（永続表と同じ構造検証を通過済み）。
+    pub table: ValidatedCreateTable,
+    /// `ON COMMIT` の動作（省略時は [`TempOnCommit::PreserveRows`]）。
+    pub on_commit: TempOnCommit,
 }
 
 /// [`Parser::parse_create_table`] が列リスト全体の構文判定を終えた後に呼ぶ、
@@ -3655,7 +3733,7 @@ pub struct ValidatedTruncate {
     pub table_names: Vec<String>,
     /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-22）。句の欠落・明示
     /// `NULL` はいずれも `None`（`ValidatedInsert::operation_id` と同じ契約）。
-    /// `validate_truncate` は `LedgerMode::Ledgered`（既定）では `None` を
+    /// `validate_truncate` は `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を
     /// 書き込みトランザクション開始前に `23502` で拒否するため、この構成では
     /// 常に `Some` になる。
     pub operation_id: Option<OperationId>,
@@ -3979,7 +4057,7 @@ pub struct ValidatedUpdate {
     pub id_literal: String,
     /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-17）。句の欠落・明示
     /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。`validate_update` は
-    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション開始前に
+    /// `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を書き込みトランザクション開始前に
     /// `23502` で拒否するため、この構成では常に `Some` になる。
     /// `LedgerMode::CompareOnlyWithoutLedger` では `None` を許す。
     pub operation_id: Option<OperationId>,
@@ -8610,8 +8688,10 @@ impl<'a> Parser<'a> {
     /// 対象列リストは `id` に限らず任意の識別子の列（TABLE-16、Issue #1074）を
     /// 構文段階で受理する。列数上限（[`crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS`]）
     /// 超過・列名の重複はここで `42601` として拒否するが、対象列が実在する
-    /// スキーマ列か・`id` 単独か・宣言済み UNIQUE 制約の構成列集合と一致するかの
-    /// 意味論的検証は本モジュールの管轄外（`sql::parser::bind_upsert_form`）。
+    /// スキーマ列か・`id` 単独か・宣言済み UNIQUE 制約／PRIMARY KEY の構成列集合と
+    /// 一致するかの意味論的検証は本モジュールの管轄外（`sql::parser::bind_upsert_form`。
+    /// 一致なしは `42P10`、SQL-49・Issue #1707）。式・部分索引の推論形
+    /// （`((<式>))`・`(<列>) WHERE ...`）は本関数で `42601` のまま拒否する。
     /// `ON CONFLICT ON CONSTRAINT ...`・空の対象リスト（`ON CONFLICT ()`）は
     /// 未対応のまま `42601`（対象外・申し送り: Issue #1074 §8）。
     fn parse_on_conflict_clause(&mut self) -> Result<Option<OnConflictClause>, SqlSurfaceError> {
@@ -9445,11 +9525,95 @@ impl<'a> Parser<'a> {
     fn parse_create_table(&mut self) -> Result<ValidatedCreateTable, SqlSurfaceError> {
         self.expect_contextual_keyword("CREATE")?;
         self.expect_contextual_keyword("TABLE")?;
+        let (if_not_exists, table_name) = self.parse_create_table_name()?;
+        self.parse_create_table_body(if_not_exists, table_name)
+    }
+
+    /// `[IF NOT EXISTS] <名前>` を読み、識別子形式を検証する（`CREATE TABLE` と
+    /// `CREATE TEMP TABLE` で共通。TABLE-44・Issue #1683）。
+    fn parse_create_table_name(&mut self) -> Result<(bool, String), SqlSurfaceError> {
         let if_not_exists = self.parse_optional_if_not_exists();
         let table_name = self.expect_ident()?;
         crate::catalog::validate_identifier(&table_name)
             .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
+        Ok((if_not_exists, table_name))
+    }
 
+    /// `CREATE [GLOBAL|LOCAL] {TEMP|TEMPORARY} TABLE [IF NOT EXISTS] <名前> (...)
+    /// [ON COMMIT {PRESERVE ROWS|DELETE ROWS|DROP}]`（TABLE-44・Issue #1683）。
+    /// 列定義・制約の本体は [`Self::parse_create_table_body`] を永続表と共有する
+    /// （第 2 の列定義パーサーを作らない）。構造段で判定できる未対応の形
+    /// （`CREATE TEMP TABLE ... AS`・`VECTOR` 列・ENUM 列）は `0A000` で拒否する。
+    /// カタログは参照しない。
+    fn parse_create_temp_table(&mut self) -> Result<ValidatedCreateTempTable, SqlSurfaceError> {
+        self.expect_contextual_keyword("CREATE")?;
+        if self.peek_ident_matches("GLOBAL") || self.peek_ident_matches("LOCAL") {
+            // `GLOBAL` は `LOCAL` と同義（PG 互換。非推奨警告は出さない）。
+            self.advance();
+        }
+        if self.peek_ident_matches("TEMP") || self.peek_ident_matches("TEMPORARY") {
+            self.advance();
+        } else {
+            return Err(SqlSurfaceError::unsupported("expected keyword TEMPORARY"));
+        }
+        self.expect_contextual_keyword("TABLE")?;
+        let (if_not_exists, table_name) = self.parse_create_table_name()?;
+        if self.peek_ident_matches("AS") {
+            // `CREATE TEMP TABLE ... AS`（SQL-52）は未確定のため `0A000`。
+            return Err(SqlSurfaceError::feature_not_supported(
+                "CREATE TEMPORARY TABLE ... AS is not supported",
+            ));
+        }
+        let table = self.parse_create_table_body(if_not_exists, table_name)?;
+        let on_commit = self.parse_optional_on_commit()?;
+        for column in &table.columns {
+            let unsupported = match &column.ty {
+                crate::catalog::ColumnType::Vector(_) | crate::catalog::ColumnType::Enum(_) => true,
+                crate::catalog::ColumnType::Array(a) => a.enum_def().is_some(),
+                _ => false,
+            };
+            if unsupported {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "VECTOR and ENUM columns are not supported in temporary tables",
+                ));
+            }
+        }
+        Ok(ValidatedCreateTempTable { table, on_commit })
+    }
+
+    /// 省略可能な `ON COMMIT {PRESERVE ROWS|DELETE ROWS|DROP}` 句。省略時は
+    /// `PRESERVE ROWS`（PG の既定）。綴り違い・重複は `42601`。
+    fn parse_optional_on_commit(&mut self) -> Result<TempOnCommit, SqlSurfaceError> {
+        if !self.peek_ident_matches("ON") {
+            return Ok(TempOnCommit::PreserveRows);
+        }
+        self.advance();
+        self.expect_contextual_keyword("COMMIT")?;
+        if self.peek_ident_matches("DROP") {
+            self.advance();
+            return Ok(TempOnCommit::Drop);
+        }
+        let on_commit = if self.peek_ident_matches("PRESERVE") {
+            TempOnCommit::PreserveRows
+        } else if self.peek_ident_matches("DELETE") {
+            TempOnCommit::DeleteRows
+        } else {
+            return Err(SqlSurfaceError::unsupported(
+                "expected PRESERVE ROWS, DELETE ROWS or DROP after ON COMMIT",
+            ));
+        };
+        self.advance();
+        self.expect_contextual_keyword("ROWS")?;
+        Ok(on_commit)
+    }
+
+    /// `CREATE TABLE` の `(` 以降（列定義・表制約）の構文検証。表名は
+    /// [`Self::parse_create_table_name`] が読み済み。
+    fn parse_create_table_body(
+        &mut self,
+        if_not_exists: bool,
+        table_name: String,
+    ) -> Result<ValidatedCreateTable, SqlSurfaceError> {
         self.expect_punct('(')?;
         let mut columns: Vec<ColumnDef> = Vec::new();
         let mut alias_type_names: Vec<String> = Vec::new();
@@ -10683,6 +10847,19 @@ impl<'a> Parser<'a> {
             }));
         }
         let name = self.expect_ident()?;
+        let aliases = self.parse_optional_view_column_aliases()?;
+        self.expect_ident_matching("AS")?;
+        // 本文の構造検証（単純形／評価後射影形の判定。Issue #1192）は呼び出し元
+        // （[`validate_create_view_tokens`]）が [`classify_view_body`] で行う。
+        // 本文が末尾まで消費し尽くされたことの検証も同関数群が担うため、この
+        // Parser 側で追加のトークンを消費する必要はない。
+        Ok((name, aliases, self.remaining(), or_replace))
+    }
+
+    /// ビュー名の直後に置かれる任意の列別名リスト `(a, b, ...)`（TABLE-41 (1)・Issue #1659、
+    /// matview は TABLE-42・Issue #1664 が共用）を読む。件数上限（`54000`）・リスト内の重複
+    /// （`42701`）を構文段で検査し、リストが無ければ空を返す。出力列数との突合は実行段が担う。
+    fn parse_optional_view_column_aliases(&mut self) -> Result<Vec<String>, SqlSurfaceError> {
         let mut aliases: Vec<String> = Vec::new();
         if matches!(self.peek(), Some(Token::Punct('('))) {
             self.advance();
@@ -10708,12 +10885,24 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        Ok(aliases)
+    }
+
+    /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <name> [(<alias>, ...)] AS <本文...>`
+    /// （TABLE-42・Issue #1664）の前置部を読む。戻り値は `(名前, IF NOT EXISTS の有無,
+    /// 列別名, `AS` 以降の残りトークン)`。`OR REPLACE`・`TEMP`・`WITH (...)` 等の保存
+    /// パラメータ・`TABLESPACE`・`USING` は `AS` の前に現れるため、ここで `42601` になる。
+    /// 末尾の `WITH [NO] DATA` の剥離と本文の構造検証は呼び出し元
+    /// （[`validate_create_materialized_view_tokens`]）が担う。
+    fn parse_create_materialized_view(&mut self) -> Result<MatviewHead<'_>, SqlSurfaceError> {
+        self.expect_ident_matching("CREATE")?;
+        self.expect_ident_matching("MATERIALIZED")?;
+        self.expect_ident_matching("VIEW")?;
+        let if_not_exists = self.parse_optional_if_not_exists();
+        let name = self.expect_ident()?;
+        let aliases = self.parse_optional_view_column_aliases()?;
         self.expect_ident_matching("AS")?;
-        // 本文の構造検証（単純形／評価後射影形の判定。Issue #1192）は呼び出し元
-        // （[`validate_create_view_tokens`]）が [`classify_view_body`] で行う。
-        // 本文が末尾まで消費し尽くされたことの検証も同関数群が担うため、この
-        // Parser 側で追加のトークンを消費する必要はない。
-        Ok((name, aliases, self.remaining(), or_replace))
+        Ok((name, if_not_exists, aliases, self.remaining()))
     }
 
     /// `DROP VIEW [IF EXISTS] <name> [CASCADE | RESTRICT] [;]`（TABLE-18・SQL-23・TASK-205、
@@ -11688,9 +11877,32 @@ pub(crate) fn validate_create_view_tokens(
 ) -> Result<ValidatedCreateView, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     let (name, column_aliases, body_tokens, or_replace) = p.parse_create_view()?;
-    // 判定順序（構文 `42601` → 本文サイズ `54000`）を保つため、本文の構造検証は
-    // カタログを照会しない [`StructuralOnlyLookup`] で行う。
-    let (base_relation, body_sql) = match classify_view_body(
+    let (relations, body_sql) = validate_view_body_for_storage(body_tokens, &column_aliases)?;
+    let base_relation = relations
+        .into_iter()
+        .next()
+        .ok_or_else(|| SqlSurfaceError::unsupported("view body has no source relation"))?;
+    Ok(ValidatedCreateView {
+        name,
+        base_relation,
+        body_sql,
+        column_aliases,
+        or_replace,
+    })
+}
+
+/// `CREATE MATERIALIZED VIEW` の前置部の解析結果（名前・`IF NOT EXISTS`・列別名・`AS` 以降）。
+type MatviewHead<'a> = (String, bool, Vec<String>, &'a [Token]);
+
+/// ビュー本文（`CREATE VIEW`・`CREATE MATERIALIZED VIEW` 共通。TABLE-18・TABLE-42）の構造検証と
+/// 永続化形の生成。戻り値は `(本文が読む relation の一覧〔先頭が主クエリの最初の FROM〕, 正規化
+/// 描画した本文 SQL)`。判定順序（構文 `42601` → 本文サイズ `54000`）を保つため、構造検証は
+/// カタログを照会しない [`StructuralOnlyLookup`] で行う。
+fn validate_view_body_for_storage(
+    body_tokens: &[Token],
+    column_aliases: &[String],
+) -> Result<(Vec<String>, String), SqlSurfaceError> {
+    let (relations, body_sql) = match classify_view_body(
         body_tokens,
         &StructuralOnlyLookup,
         ViewBodyCheck::Structural,
@@ -11706,13 +11918,9 @@ pub(crate) fn validate_create_view_tokens(
                 }
             }
             let sql = render_stored_simple_view_body(&body)?;
-            (body.table_name, sql)
+            (vec![body.table_name], sql)
         }
         ViewBodyKind::Buffered { relations, .. } => {
-            let base = relations
-                .into_iter()
-                .next()
-                .ok_or_else(|| SqlSurfaceError::unsupported("view body has no source relation"))?;
             // 検証済みトークン列そのものを正規化描画して永続化する
             // （AST からの再描画による丸め・形状取りこぼしを避ける）。
             let stripped = strip_trailing_semicolons(body_tokens);
@@ -11724,7 +11932,7 @@ pub(crate) fn validate_create_view_tokens(
             if super::lexer::stored_body_needs_bool_literal_marker(stripped) {
                 sql.insert_str(0, super::lexer::STORED_BODY_BOOL_LITERAL_MARKER);
             }
-            (base, sql)
+            (relations, sql)
         }
     };
     if body_sql.len() > crate::catalog::MAX_VIEW_BODY_BYTES {
@@ -11732,12 +11940,103 @@ pub(crate) fn validate_create_view_tokens(
             "view body exceeds the allowed size",
         ));
     }
-    Ok(ValidatedCreateView {
+    Ok((relations, body_sql))
+}
+
+/// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <name> [(<alias>, ...)] AS <SELECT 本文>
+/// [WITH [NO] DATA] [;]` の許可形状構造検証結果（TABLE-42・Issue #1664）。カタログ照会は
+/// 一切行わない（DDL 権限ゲート・名前衝突・参照先の存在・列型の確定・実体化は実行段
+/// `core.rs` が担う。判定順序は `CreateView` と同じ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedCreateMaterializedView {
+    pub(crate) name: String,
+    /// `IF NOT EXISTS` 句の有無。真なら同名の relation があるとき副作用ゼロで成功する。
+    pub(crate) if_not_exists: bool,
+    /// 列別名リスト（空なら別名なし。件数上限・重複は構文段で検査済み）。
+    pub(crate) column_aliases: Vec<String>,
+    /// 正規化描画した本文 SQL（永続化される値そのもの。`CREATE VIEW` と同一規則）。
+    pub(crate) body_sql: String,
+    /// 本文が直接読む relation（重複なし・名前順。`MaterializedViewDef::base_relations`）。
+    pub(crate) base_relations: Vec<String>,
+    /// `WITH DATA`（省略時の既定）なら真、`WITH NO DATA` なら偽。
+    pub(crate) with_data: bool,
+}
+
+impl ValidatedCreateMaterializedView {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// `IF NOT EXISTS` が指定されたか。
+    pub fn if_not_exists(&self) -> bool {
+        self.if_not_exists
+    }
+
+    /// 列別名リスト（空なら指定なし）。
+    pub fn column_aliases(&self) -> &[String] {
+        &self.column_aliases
+    }
+
+    pub fn body_sql(&self) -> &str {
+        &self.body_sql
+    }
+
+    /// 本文が直接読む relation（重複なし・名前順）。
+    pub fn base_relations(&self) -> &[String] {
+        &self.base_relations
+    }
+
+    /// 初回実体化を行うか（`WITH DATA`。省略時も真）。
+    pub fn with_data(&self) -> bool {
+        self.with_data
+    }
+}
+
+/// `CREATE MATERIALIZED VIEW ...` で始まる文か（`core.rs::parse_tokens` が `CREATE VIEW` の
+/// 判定より前に分岐するための述語。TABLE-42・Issue #1664）。
+pub(crate) fn is_create_materialized_view_statement(tokens: &[Token]) -> bool {
+    let ident_at = |i: usize, word: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word));
+    ident_at(0, "CREATE") && ident_at(1, "MATERIALIZED")
+}
+
+/// 末尾の `WITH [NO] DATA` を剥がし、残りの本文トークン列と `WITH DATA` の有無を返す
+/// （末尾の `;` は先に取り除く）。`WITH` を伴わない `DATA`／`NO DATA` は剥がさない
+/// （本文側が `42601` で拒否する）。
+fn split_matview_data_clause(tokens: &[Token]) -> (&[Token], bool) {
+    let body = strip_trailing_semicolons(tokens);
+    let ident_is = |t: Option<&Token>, word: &str| matches!(t, Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word));
+    let len = body.len();
+    if len >= 2 && ident_is(body.get(len - 1), "DATA") {
+        if ident_is(body.get(len - 2), "WITH") {
+            return (body.get(..len - 2).unwrap_or(body), true);
+        }
+        if len >= 3 && ident_is(body.get(len - 2), "NO") && ident_is(body.get(len - 3), "WITH") {
+            return (body.get(..len - 3).unwrap_or(body), false);
+        }
+    }
+    (body, true)
+}
+
+/// [`ValidatedCreateMaterializedView`] の構造検証本体（`core.rs::parse_tokens` から呼ばれる。
+/// TABLE-42・Issue #1664）。本文は `CREATE VIEW` と同じ許可形状（単純形・評価後射影形）で、
+/// ベクトル順位付け（`<=>`・`HYBRID`・`USING PLAN`）は本文検証が `42601` で拒否する。
+pub(crate) fn validate_create_materialized_view_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedCreateMaterializedView, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let (name, if_not_exists, column_aliases, rest) = p.parse_create_materialized_view()?;
+    let (body_tokens, with_data) = split_matview_data_clause(rest);
+    let (mut base_relations, body_sql) =
+        validate_view_body_for_storage(body_tokens, &column_aliases)?;
+    base_relations.sort();
+    base_relations.dedup();
+    Ok(ValidatedCreateMaterializedView {
         name,
-        base_relation,
-        body_sql,
+        if_not_exists,
         column_aliases,
-        or_replace,
+        body_sql,
+        base_relations,
+        with_data,
     })
 }
 
@@ -15122,7 +15421,9 @@ fn validate_sql_tokens_impl(
                 // JOIN（`Statement::Join`）も返さない（JOIN の検出・分岐は
                 // `looks_like_join` が `validate_select_statement` を呼ぶより前に
                 // 完結させる設計）。網羅性のためのみここに列挙する防御的経路。
-                | Statement::Join(_) => {
+                | Statement::Join(_)
+                // TABLE-42・Issue #1664: matview の葉は `BufferedView` の本文としてのみ現れる。
+                | Statement::MaterializedView(_) => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "validate_select_statement returned a non-SELECT statement"
                             .to_string(),
@@ -15396,6 +15697,10 @@ pub fn validate_statement(
         Statement::ConstSelect(_) => Err(SqlSurfaceError::unsupported(
             "FROM-less SELECT is not a search query statement (use a session-aware entry point)",
         )),
+        // TABLE-42・Issue #1664: matview の葉は単独の文としては現れない（防御的経路）。
+        Statement::MaterializedView(_) => Err(SqlSurfaceError::unsupported(
+            "materialized view read is not a search query statement (use a session-aware entry point)",
+        )),
     }
 }
 
@@ -15537,6 +15842,10 @@ pub(crate) fn validate_delete_statement_tokens(
 ) -> Result<DeleteStatement, SqlSurfaceError> {
     let shape = parse_delete_statement_shape(tokens)?;
 
+    // 分割実行はジョブ識別に operation_id を使うため、構成に関わらず必須（Issue #1704）。
+    if shape.partitioned.is_some() {
+        crate::recovery::required_op_id::require_partitioned(shape.operation_id.as_ref())?;
+    }
     mode.require(shape.operation_id.as_ref())?;
 
     let exists = lookup.table_exists(&shape.table_name)?;
@@ -15753,6 +16062,41 @@ pub fn validate_create_table_tokens(
 ) -> Result<ValidatedCreateTable, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     let validated = p.parse_create_table()?;
+    // `ON COMMIT` は一時表にしか使えない（TABLE-44・Issue #1683。PG と同じ `42P16`）。
+    if p.peek_ident_matches("ON") && p.peek_ident_matches_at(1, "COMMIT") {
+        return Err(SqlSurfaceError::invalid_table_definition(
+            validated.table_name,
+        ));
+    }
+    p.expect_end_of_statement()?;
+    Ok(validated)
+}
+
+/// 先頭が `CREATE [GLOBAL|LOCAL] {TEMP|TEMPORARY} TABLE` かを判定する（TABLE-44・
+/// Issue #1683）。`core.rs::EngineCore::parse_tokens_in` が `is_create_table_statement`
+/// より先にこれで分岐する（一時表の定義を永続表の `CreateTable` として束縛しない）。
+/// `CREATE TEMP VIEW` 等は一致しない（従来どおりの拒否経路へ流れる）。
+pub(crate) fn is_create_temp_table_statement(tokens: &[Token]) -> bool {
+    let ident_at = |i: usize, word: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word));
+    if !ident_at(0, "CREATE") {
+        return false;
+    }
+    let mut i = 1;
+    if ident_at(i, "GLOBAL") || ident_at(i, "LOCAL") {
+        i += 1;
+    }
+    (ident_at(i, "TEMP") || ident_at(i, "TEMPORARY")) && ident_at(i + 1, "TABLE")
+}
+
+/// [`is_create_temp_table_statement`] が真のトークン列から `CREATE TEMP TABLE` の
+/// 許可形状を構造検証する（TABLE-44・Issue #1683）。カタログ照会はしない。
+/// 実行（セッションの一時カタログへの登録）は `EngineCore::execute_parsed_in_session`
+/// の `ParsedSql::CreateTempTable` 分岐が担う。
+pub(crate) fn validate_create_temp_table_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedCreateTempTable, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let validated = p.parse_create_temp_table()?;
     p.expect_end_of_statement()?;
     Ok(validated)
 }
@@ -16111,7 +16455,7 @@ pub struct ValidatedCopyFrom {
     pub format: CopyFormat,
     /// 文末専用句で搬送された、検証済みの `operation_id`。句の欠落・明示
     /// `NULL` はいずれも `None`（`ValidatedInsert::operation_id` と同じ契約。
-    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
+    /// `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を書き込みトランザクション
     /// 開始前に `23502` で拒否するため、この構成では常に `Some`）。
     pub operation_id: Option<OperationId>,
 }
@@ -16577,6 +16921,10 @@ pub(crate) fn validate_update_form_tokens(
     let shape = p.parse_update()?;
     p.expect_end_of_statement()?;
 
+    // 分割実行はジョブ識別に operation_id を使うため、構成に関わらず必須（Issue #1704）。
+    if shape.partitioned.is_some() {
+        crate::recovery::required_op_id::require_partitioned(shape.operation_id.as_ref())?;
+    }
     mode.require(shape.operation_id.as_ref())?;
 
     let exists = lookup.table_exists(&shape.table_name)?;
@@ -19912,7 +20260,7 @@ mod tests {
         // 構文段階（本モジュール）では `id` に限らず任意の列名を対象列として
         // 受理する（TABLE-16、Issue #1074）。宣言済み UNIQUE 制約の構成列
         // 集合と一致するかの意味論的検証は `sql::parser::bind_upsert_form` の
-        // 責務であり、`lang` に UNIQUE 制約が無いスキーマでは最終的に `42601`
+        // 責務であり、`lang` に UNIQUE 制約が無いスキーマでは最終的に `42P10`
         // になることを `sql::parser` の結合テストで固定する
         // （`rejects_upsert_target_not_matching_any_unique_constraint` 参照）。
         let lookup = catalog_with(&["documents"]);
@@ -23549,6 +23897,114 @@ mod tests {
         }
     }
 
+    fn parse_temp_ok(sql: &str) -> ValidatedCreateTempTable {
+        let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        assert!(is_create_temp_table_statement(&tokens), "{sql}");
+        validate_create_temp_table_tokens(&tokens)
+            .unwrap_or_else(|e| panic!("expected ok, got {e:?} for {sql}"))
+    }
+
+    fn parse_temp_err(sql: &str) -> SqlSurfaceError {
+        let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        match validate_create_temp_table_tokens(&tokens) {
+            Ok(v) => panic!("expected error, got ok: {v:?}"),
+            Err(e) => e,
+        }
+    }
+
+    /// `CREATE TEMP TABLE` の先頭部の全組み合わせと `ON COMMIT` 句（TABLE-44・Issue #1683）。
+    #[test]
+    fn create_temp_table_prefix_and_on_commit_forms() {
+        for prefix in [
+            "CREATE TEMP TABLE",
+            "create temporary table",
+            "CREATE LOCAL TEMP TABLE",
+            "CREATE LOCAL TEMPORARY TABLE",
+            "CREATE GLOBAL TEMP TABLE",
+            "CREATE GLOBAL TEMPORARY TABLE",
+        ] {
+            let v = parse_temp_ok(&format!("{prefix} t (a TEXT)"));
+            assert_eq!(v.table.table_name, "t", "{prefix}");
+            assert_eq!(v.on_commit, TempOnCommit::PreserveRows, "{prefix}");
+            assert!(!v.table.if_not_exists);
+        }
+        assert!(
+            parse_temp_ok("CREATE TEMP TABLE IF NOT EXISTS t (a TEXT)")
+                .table
+                .if_not_exists
+        );
+        for (clause, expected) in [
+            ("ON COMMIT PRESERVE ROWS", TempOnCommit::PreserveRows),
+            ("on commit delete rows", TempOnCommit::DeleteRows),
+            ("ON COMMIT DROP", TempOnCommit::Drop),
+            ("ON COMMIT DROP;", TempOnCommit::Drop),
+        ] {
+            let v = parse_temp_ok(&format!("CREATE TEMP TABLE t (a TEXT) {clause}"));
+            assert_eq!(v.on_commit, expected, "{clause}");
+        }
+        // 制約付きの列定義は永続表と同じ本体パーサーを通る。
+        let v = parse_temp_ok(
+            "CREATE TEMP TABLE t (a TEXT PRIMARY KEY, b INTEGER UNIQUE) ON COMMIT DELETE ROWS",
+        );
+        assert_eq!(v.table.primary_key, Some(vec!["a".to_string()]));
+        assert_eq!(v.table.unique_constraints.len(), 1);
+    }
+
+    /// 綴り違い・重複・欠落した `ON COMMIT` は `42601`。
+    #[test]
+    fn create_temp_table_on_commit_syntax_errors() {
+        for sql in [
+            "CREATE TEMP TABLE t (a TEXT) ON COMMIT",
+            "CREATE TEMP TABLE t (a TEXT) ON COMMIT PRESERVE",
+            "CREATE TEMP TABLE t (a TEXT) ON COMMIT DELETE",
+            "CREATE TEMP TABLE t (a TEXT) ON COMMIT KEEP ROWS",
+            "CREATE TEMP TABLE t (a TEXT) ON COMMIT DROP ON COMMIT DROP",
+            "CREATE TEMP TABLE t (a TEXT) ON ROLLBACK DROP",
+            "CREATE TEMP TABLE t (a TEXT) ON COMMIT DROP extra",
+            "CREATE TEMP TABLE t (a TEXT) extra",
+        ] {
+            assert_eq!(parse_temp_err(sql).wire_code(), "42601", "{sql}");
+        }
+    }
+
+    /// 構造段で判定できる未対応の形は `0A000`（fail-closed）。
+    #[test]
+    fn create_temp_table_unsupported_forms_are_feature_not_supported() {
+        for sql in [
+            "CREATE TEMP TABLE t AS SELECT 1",
+            "CREATE TEMP TABLE t (e VECTOR(3))",
+            "CREATE TEMP TABLE t (a TEXT, e VECTOR(3))",
+            "CREATE TEMP TABLE t (c mood)",
+            "CREATE TEMP TABLE t (c mood[2])",
+        ] {
+            assert_eq!(parse_temp_err(sql).wire_code(), "0A000", "{sql}");
+        }
+    }
+
+    /// `CREATE TEMP VIEW` 等は一時表の経路に入らない。素の `CREATE TABLE ... ON COMMIT` は `42P16`。
+    #[test]
+    fn create_temp_table_detection_and_plain_table_on_commit() {
+        for sql in [
+            "CREATE TEMP VIEW v AS SELECT 1",
+            "CREATE TABLE t (a TEXT)",
+            "CREATE GLOBAL TABLE t (a TEXT)",
+            "CREATE TEMP t (a TEXT)",
+            "CREATE UNIQUE INDEX i ON t (a)",
+        ] {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            assert!(!is_create_temp_table_statement(&tokens), "{sql}");
+        }
+        assert_eq!(
+            parse_create_table_err("CREATE TABLE t (a TEXT) ON COMMIT DROP").wire_code(),
+            "42P16"
+        );
+        // `ON COMMIT` を伴わない末尾トークンは従来どおり `42601`。
+        assert_eq!(
+            parse_create_table_err("CREATE TABLE t (a TEXT) ON ROLLBACK").wire_code(),
+            "42601"
+        );
+    }
+
     fn parse_create_table_err(sql: &str) -> SqlSurfaceError {
         let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
         match validate_create_table_tokens(&tokens) {
@@ -25005,6 +25461,74 @@ mod body_expr_policy_tests {
                 "{bad}"
             );
         }
+    }
+
+    /// `CREATE MATERIALIZED VIEW` の構文検証（TABLE-42・Issue #1664）。`WITH [NO] DATA`・`;`・
+    /// `IF NOT EXISTS`・列別名・大文字小文字の組み合わせを受理し、`OR REPLACE`・`TEMP`・保存パラメータ・
+    /// `WITH` を伴わない `DATA`／`NO DATA`・ベクトル順位付けの本文は `42601`。
+    #[test]
+    fn create_materialized_view_structural_checks() {
+        let check = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tok");
+            // `OR REPLACE`／`TEMP` 付きは分岐述語に当たらず、汎用経路か本検証が `42601` にする。
+            if !sql.contains("OR REPLACE") && !sql.contains("TEMP") {
+                assert!(is_create_materialized_view_statement(&tokens), "{sql}");
+            }
+            validate_create_materialized_view_tokens(&tokens)
+        };
+        let plain = check("CREATE MATERIALIZED VIEW mv AS SELECT a FROM docs").expect("plain");
+        assert!(plain.with_data() && !plain.if_not_exists());
+        assert_eq!(plain.name(), "mv");
+        assert_eq!(plain.base_relations(), ["docs".to_string()]);
+        assert!(plain.column_aliases().is_empty());
+        assert!(
+            !check("create materialized view mv as select a from docs with no data;")
+                .expect("no data")
+                .with_data()
+        );
+        assert!(
+            check("CREATE MATERIALIZED VIEW mv AS SELECT a FROM docs WITH DATA;;")
+                .expect("with data")
+                .with_data()
+        );
+        let full = check(
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS mv (x) AS SELECT a FROM docs WITH NO DATA",
+        )
+        .expect("full");
+        assert!(full.if_not_exists() && !full.with_data());
+        assert_eq!(full.column_aliases(), ["x".to_string()]);
+        // 評価後射影形の本文（集計）も受理し、参照先を重複なく名前順で運ぶ。
+        let agg = check("CREATE MATERIALIZED VIEW mv AS SELECT count(*) AS n FROM docs")
+            .expect("aggregate");
+        assert_eq!(agg.base_relations(), ["docs".to_string()]);
+        // 本文の末尾が識別子 `data` でも `WITH` が無ければ剥がさない。
+        assert!(check("CREATE MATERIALIZED VIEW mv AS SELECT a FROM data")
+            .expect("table named data")
+            .with_data());
+        for bad in [
+            "CREATE OR REPLACE MATERIALIZED VIEW mv AS SELECT a FROM docs",
+            "CREATE TEMP MATERIALIZED VIEW mv AS SELECT a FROM docs",
+            "CREATE MATERIALIZED VIEW mv WITH (fillfactor = 70) AS SELECT a FROM docs",
+            "CREATE MATERIALIZED VIEW mv TABLESPACE ts AS SELECT a FROM docs",
+            "CREATE MATERIALIZED VIEW mv USING heap AS SELECT a FROM docs",
+            "CREATE MATERIALIZED VIEW mv AS SELECT a FROM docs DATA",
+            "CREATE MATERIALIZED VIEW mv AS SELECT a FROM docs NO DATA",
+            "CREATE MATERIALIZED VIEW mv AS SELECT a FROM docs WITH",
+            "CREATE MATERIALIZED VIEW mv AS",
+            "CREATE MATERIALIZED VIEW mv AS WITH DATA",
+            "CREATE MATERIALIZED VIEW mv (a,) AS SELECT a FROM docs",
+            "CREATE MATERIALIZED VIEW mv (a, b, c) AS SELECT x, y FROM docs",
+            "CREATE MATERIALIZED VIEW mv AS SELECT a FROM docs ORDER BY embedding <=> '[1,0]' LIMIT 3",
+        ] {
+            assert_eq!(check(bad).expect_err(bad).wire_code(), "42601", "{bad}");
+        }
+        // 別名の重複は構文段で `42701`。
+        assert_eq!(
+            check("CREATE MATERIALIZED VIEW mv (a, a) AS SELECT x, y FROM docs")
+                .expect_err("dup alias")
+                .wire_code(),
+            "42701"
+        );
     }
 
     /// `CREATE VIEW v (a, b) AS ...` の列別名リストの構造検証（TABLE-41 (1)・Issue #1659）。

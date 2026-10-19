@@ -65,6 +65,9 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // 待ちタイムアウト。NoSQL 表層からは `insert`／`update`／`delete` op が
         // 待たされて到達しうる（一時的なサーバー側の輻輳として 503 に射影する）。
         ErrorClass::LockNotAvailable => 503,
+        // TABLE-42・Issue #1664: 未実体化の MATERIALIZED VIEW の読み取り。対象の状態と
+        // 矛盾する操作として 409（NoSQL 表層からは matview へ到達できないが網羅 match のため定義）。
+        ErrorClass::ObjectNotInPrerequisiteState => 409,
         ErrorClass::ProtocolViolation
         | ErrorClass::UnsupportedSqlSyntax
         | ErrorClass::InvalidInput
@@ -114,6 +117,8 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // `DuplicateColumn`（`42701`。Issue #899）は `CREATE TABLE` の列リスト
         // 自体が不正という構文的な分類のため、他の 42xxx 系と同じ 400 とする。
         | ErrorClass::DuplicateColumn
+        // Issue #1707・SQL-49・ERR-6: ON CONFLICT 対象の不一致（`42P10`）も入力起因で 400。
+        | ErrorClass::InvalidColumnReference
         // Issue #1195・TABLE-22・ERR-6: 制約名重複（`42710`）。ERR-4 の「ERR-6 新設行は
         // 400」規則に従い、`DuplicateColumn` と同じ DDL 宣言不正の分類として 400
         // とする（`42P07` の 409 とはあえて揃えない）。NoSQL の `alter_table` は
@@ -185,7 +190,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 69] = [
+    const EXPECTED: [(ErrorClass, u16); 71] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -215,12 +220,14 @@ mod tests {
         (ErrorClass::IntervalFieldOverflow, 400),
         (ErrorClass::InvalidTextRepresentation, 400),
         (ErrorClass::LockNotAvailable, 503),
+        (ErrorClass::ObjectNotInPrerequisiteState, 409),
         (ErrorClass::InvalidTransactionState, 400),
         (ErrorClass::ActiveSqlTransaction, 400),
         (ErrorClass::NoActiveSqlTransaction, 400),
         (ErrorClass::InFailedSqlTransaction, 400),
         (ErrorClass::DuplicateTable, 409),
         (ErrorClass::DuplicateColumn, 400),
+        (ErrorClass::InvalidColumnReference, 400),
         (ErrorClass::InvalidCursorName, 404),
         (ErrorClass::DependentObjectsStillExist, 400),
         (ErrorClass::WrongObjectType, 400),

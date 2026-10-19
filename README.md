@@ -82,11 +82,13 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--hnsw-sparse-visited-max <N>] \
   [--hnsw-scope all|declared] \
   [--durability immediate|none] \
+  [--require-operation-id] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--batch-max-files <1-1000000>] \
   [--max-table-columns <1-256>] [--max-array-elements <1-1024>] [--max-enum-labels <1-256>] \
   [--max-scanned-rows <1-1000000>] \
   [--max-group-by-columns <1-8>] [--max-groups <1-10000>] \
+  [--max-temp-tables <1-64>] [--max-temp-bytes <1-67108864>] \
   [--max-jsonpath-steps <1-4000000>] [--max-jsonpath-depth <1-1024>] \
   [--max-subquery-depth <1-4>] [--max-subquery-executions <1-16>] \
   [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] \
@@ -262,6 +264,16 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 `WARNING` 行を 1 行出します（`immediate`・未指定では出力されません）。
 `EXPLAIN` への durability 設定の露出は対象外です。
 
+`--require-operation-id`（Issue #1703）は値を取らないスイッチで、指定すると
+書き込み文の `USING OPERATION_ID` 省略を `23502` で拒否します（現行の必須
+契約）。プロセス起動時にのみ指定でき、セッション・SQL からは変更できません。
+重複指定・`=` 連結形・後続の値は fail-closed で起動エラーとなり、指定時に
+限り起動ログへ英語の 1 行を出します。未指定時（既定）は省略を受理し、省略した
+書き込みは台帳に記録しない通常の書き込みとして実行します（再送の検出はしません。
+指定した場合の記録・重複拒否・内容照合は不変）。冪等な再送保護が必要な運用では
+本スイッチで必須化してください。分割実行 DML（`PARTITIONED`）は既定でも省略を
+`23502` で拒否します（Issue #1704）。
+
 `--max-dml-affected-rows`・`--max-insert-rows`（Issue #997。オーナー判断の
 改訂・2026-09-27）は、それぞれ述語形 `UPDATE`／`DELETE`（`WHERE` 句付き）の
 1 文あたり影響行数上限・複数行 `VALUES` の 1 文あたり行数上限を、プロセス
@@ -351,6 +363,16 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 パーティション上限はハード上限のままです。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で
 起動エラーです。上限を引き上げることはできません
 （詳細: [docs/design/group-by-limits-cli.md](docs/design/group-by-limits-cli.md)）。
+
+`--max-temp-tables <N>`（既定 64・範囲 `1`〜`64`）・`--max-temp-bytes <N>`（既定 67,108,864・範囲
+`1`〜`67,108,864`）（Issue #1683・TABLE-44）は、一時表（`CREATE TEMP TABLE`）の 1 セッション（接続）あたりの
+件数と総バイト数（確保済みページ総量）の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は
+既定のハード上限と同じ値で、挙動は変わりません。メモリの最悪値は「最大接続数 × バイト上限」です）。
+超過時の SQLSTATE は `54000` です。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で
+起動エラーです。上限を引き上げることはできません（詳細: [docs/design/temp-table.md](docs/design/temp-table.md)）。
+一時表には永続表と同じ `INSERT`／`UPDATE`／`DELETE`／`TRUNCATE`／`SELECT`／`COPY`・制約・索引（`CREATE [UNIQUE] INDEX`）
+が使えます（Issue #1684）。書き込みは `operation_id` 台帳の対象外（`USING OPERATION_ID` は `0A000`）で、
+一時表と永続表を 1 文で参照する文・`ALTER TABLE`・カーソル・`VECTOR` 列は `0A000` です。
 
 `--max-jsonpath-steps <N>`（既定 4,000,000・範囲 `1`〜`4,000,000`）・`--max-jsonpath-depth <N>`（既定 1,024・
 範囲 `1`〜`1,024`）（Issue #2184・TABLE-25）は、jsonpath 評価器の評価ステップ数と再帰深さの上限を、

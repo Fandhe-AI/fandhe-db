@@ -298,7 +298,7 @@ pub enum TenantWriteError {
     /// 行の破壊を遮断しつつ、所有テナントの存在情報を漏らさない）。
     IdConflict,
     /// `operation_id` の省略（句の欠落・明示 `NULL` を含む）。台帳あり構成
-    /// （`recovery::required_op_id::LedgerMode::Ledgered`、既定）では書き込み系操作に
+    /// （`recovery::required_op_id::LedgerMode::Ledgered`、`--require-operation-id`）では書き込み系操作に
     /// `operation_id` の指定を必須とする（TASK-92・対象ビヘイビア: RECOVER-1）。
     /// `crate::core::EngineCore::{insert_row, update_row, delete_row}` が
     /// `crate::tenant::*_unchecked` へ委譲する**前**に `self.ledger_mode` でガードを
@@ -1705,7 +1705,8 @@ pub(crate) enum UpsertTarget<'a> {
     /// `(ctx.tenant_id(), id)` の物理キー所有で行い、書き込み対象は所有 ∩ 可視
     /// （Issue #1254）。
     RowId,
-    /// `ON CONFLICT (<UNIQUE 制約の構成列>)`（Issue #1074）。`indices` は
+    /// `ON CONFLICT (<UNIQUE 制約または PRIMARY KEY の構成列>)`（Issue #1074・#1707。
+    /// PRIMARY KEY 対象でも同じ経路を使う）。`indices` は
     /// `schema.columns` に対する論理インデックス（解決した制約の宣言順。
     /// `sql::parser::BoundConflictTarget::Unique` と同じ規約）。衝突判定は
     /// `docs/design/sql-upsert.md`「衝突判定スコープ」節参照——テナントが

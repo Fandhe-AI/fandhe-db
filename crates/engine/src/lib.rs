@@ -277,6 +277,7 @@ pub mod sparse;
 pub(crate) mod sq8;
 pub mod sql;
 pub mod storage;
+pub mod temp_table_limits;
 pub mod tenant;
 // 注意: `test_sync` は feature `test-sync-points` 限定（既定ビルドには存在しない）。
 // core_api.snapshot は `pub mod` 行のみをテキスト抽出し cfg 属性を含めないため、

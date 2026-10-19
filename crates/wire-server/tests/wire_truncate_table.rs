@@ -42,10 +42,10 @@ fn new_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
         ))
         .expect("create table");
     (
-        Arc::new(EngineCore::from_storage(
-            storage,
-            Box::new(CpuScalarProvider),
-        )),
+        Arc::new(
+            EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+                .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered),
+        ),
         guard,
     )
 }
@@ -117,10 +117,10 @@ fn wire_truncate_multi_table_without_table_keyword_returns_bare_tag() {
             ))
             .expect("create table");
     }
-    let core = Arc::new(EngineCore::from_storage(
-        storage,
-        Box::new(CpuScalarProvider),
-    ));
+    let core = Arc::new(
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+            .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered),
+    );
     seed_private_rows(&core, "tenant-a", 1..4);
     let addr = spawn_server_with_engine(&users_file(), core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");

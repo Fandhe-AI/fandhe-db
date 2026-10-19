@@ -139,6 +139,15 @@
 //! `EngineCore::with_group_by_limits` へ 1 回だけ注入する
 //! （`docs/design/group-by-limits-cli.md`）。
 //!
+//! `--max-temp-tables`／`--max-temp-bytes`（Issue #1683。TABLE-44）: 一時表
+//! （`CREATE TEMP TABLE`）のセッションあたりの件数（`1`〜`64`）・総バイト数（確保済みページ総量）
+//! （`1`〜`67108864`）の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定できる
+//! opt-in 注入点（未指定は現行のハード上限と同値＝挙動不変。メモリの最悪値は
+//! 「最大接続数 × バイト上限」）。超過は `54000`。範囲外・非数値・値欠落・重複指定は
+//! いずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::temp_table_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_temp_table_limits` へ 1 回だけ注入する。
+//!
 //! `--max-jsonpath-steps`／`--max-jsonpath-depth`（Issue #2184。TABLE-25）: jsonpath 評価器の
 //! ステップ数（`1`〜`4000000`）・再帰深さ（`1`〜`1024`）の上限を、プロセス全体に対して
 //! 起動時に**下げる方向だけ**設定できる opt-in 注入点（未指定は評価器のハード上限と同値）。
@@ -266,6 +275,16 @@
 //! `wire_server::hnsw_scope_opt::parse` に一本化し、
 //! `EngineCore::with_hnsw_scope` へ 1 回だけ注入する（`docs/design/
 //! index-declaration-effects.md` 参照）。
+//!
+//! `--require-operation-id`（Issue #1703・親 #1701・RECOVER-1 ポインタ）: 値を
+//! 取らないスイッチ。指定すると書き込み文の `USING OPERATION_ID` 省略を `23502`
+//! で拒否する従来の必須契約で起動する。2 回目以降の重複指定・`=` 連結形・後続の
+//! 値（未知引数として扱われる）はいずれも fail-closed で起動エラー。解決は
+//! `wire_server::require_operation_id_opt::resolve` に一本化し、
+//! `EngineCore::with_ledger_mode` へ 1 回だけ注入する（セッション・SQL からは
+//! 変更できない）。未指定時は operation_id 任意（Issue #1704。省略した書き込みは
+//! 台帳に記録しない通常の書き込み。分割実行 DML のみ常に必須。
+//! `docs/design/operation-id-optional.md` 参照）。
 //!
 //! `--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
 //! WIRE-7, WIRE-9 ポインタ）: TLS opt-in の唯一の入口。`--tls-cert`（証明書
@@ -400,6 +419,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut sparse_visited_max_raw: Option<String> = None;
     let mut durability_raw: Option<String> = None;
     let mut hnsw_scope_raw: Option<String> = None;
+    let mut require_operation_id = false;
     let mut max_dml_affected_rows_raw: Option<String> = None;
     let mut max_insert_rows_raw: Option<String> = None;
     let mut batch_max_files_raw: Option<String> = None;
@@ -409,6 +429,8 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_scanned_rows_raw: Option<String> = None;
     let mut max_group_by_columns_raw: Option<String> = None;
     let mut max_groups_raw: Option<String> = None;
+    let mut max_temp_tables_raw: Option<String> = None;
+    let mut max_temp_bytes_raw: Option<String> = None;
     let mut max_jsonpath_steps_raw: Option<String> = None;
     let mut max_jsonpath_depth_raw: Option<String> = None;
     let mut max_subquery_depth_raw: Option<String> = None;
@@ -619,6 +641,19 @@ fn run_server(args: &[String]) -> ExitCode {
                 durability_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::require_operation_id_opt::FLAG => {
+                // Issue #1703: 値なしスイッチ。起動後に変更できない構成値のため、
+                // 他フラグと同じ理由で 2 回目以降の指定を fail-closed に拒否する。
+                if require_operation_id {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::require_operation_id_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                require_operation_id = true;
+                i += 1;
+            }
             wire_server::hnsw_scope_opt::FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!(
@@ -820,6 +855,46 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_groups_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::temp_table_limits_opt::MAX_TEMP_TABLES_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::temp_table_limits_opt::MAX_TEMP_TABLES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1683: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_temp_tables_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::temp_table_limits_opt::MAX_TEMP_TABLES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_temp_tables_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::temp_table_limits_opt::MAX_TEMP_BYTES_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::temp_table_limits_opt::MAX_TEMP_BYTES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1683: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_temp_bytes_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::temp_table_limits_opt::MAX_TEMP_BYTES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_temp_bytes_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::jsonpath_limits_opt::MAX_JSONPATH_STEPS_FLAG => {
@@ -1607,6 +1682,22 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1683: 一時表のセッションあたり件数・総バイト数上限を bind・ユーザーストア読込より
+    // 前に解決する（fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
+    // `TempTableLimits::default()`＝ハード上限＝現行挙動。
+    let temp_table_limits = match wire_server::temp_table_limits_opt::resolve(
+        wire_server::temp_table_limits_opt::TempTableLimitsRawFlags {
+            max_temp_tables: max_temp_tables_raw.as_deref(),
+            max_temp_bytes: max_temp_bytes_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid temp table limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #2184: jsonpath 評価のステップ数・再帰深さ上限を bind・ユーザーストア読込より
     // 前に解決する（fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
     // `JsonPathLimits::default()`＝ハード上限。
@@ -2119,6 +2210,9 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #1550: 未指定でも常に呼ぶ（`group_by_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_group_by_limits(group_by_limits);
+    // Issue #1683: 未指定でも常に呼ぶ（`temp_table_limits` は既定まで解決済み。既定は
+    // ハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_temp_table_limits(temp_table_limits);
     // Issue #2184: 未指定でも常に呼ぶ（`jsonpath_limits` は既定まで解決済み。既定は
     // ハード上限と同値）。SQL 表層からの利用は Issue #2185 以降。
     core = core.with_jsonpath_limits(jsonpath_limits);
@@ -2129,6 +2223,16 @@ fn run_server(args: &[String]) -> ExitCode {
     core = core.with_join_limits(join_limits);
     // Issue #1555: 未指定でも常に呼ぶ（既定は従来の 10,000 と同値で、未注入と挙動が同一）。
     core = core.with_result_limits(result_limits);
+    // Issue #1664（TABLE-42）: MATERIALIZED VIEW の初回実体化の対象文脈は、認証構成（ユーザー
+    // ストア）のテナント集合から導出して 1 回だけ注入する（クライアントの申告値は使わない）。
+    // 導出に失敗したら起動エラーにする（作成者の文脈だけへ黙って縮退する fail-open を作らない）。
+    match store.materialization_contexts() {
+        Ok(contexts) => core = core.with_materialization_contexts(contexts),
+        Err(e) => {
+            engine::log_stderr!("wire-server: failed to derive materialization contexts: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     // Issue #1554: 未指定でも常に呼ぶ（既定は `DEFAULT_WRITE_LOCK_WAIT` で、未注入と
     // 挙動がビット同一）。
     core = core.with_write_lock_wait(write_lock_wait);
@@ -2143,6 +2247,12 @@ fn run_server(args: &[String]) -> ExitCode {
     // `with_hnsw_scope` を呼ばない構築とビット同一）。HNSW opt-in なしの構築
     // では engine 側で参照されない。
     core = core.with_hnsw_scope(hnsw_scope);
+    // Issue #1703: 未指定でも常に呼ぶ（未指定は `LedgerMode::default()` で、
+    // 呼ばない構築とビット同一）。SQL・NoSQL 両表層が同一の `Arc<EngineCore>` を
+    // 共有するため両方に効く（HTTP 側の任意化の意味付けは #2203）。
+    core = core.with_ledger_mode(wire_server::require_operation_id_opt::resolve(
+        require_operation_id,
+    ));
     let core = Arc::new(core);
 
     // `guarded.bind()` は検証済みの数値アドレスへ直接 bind し、`bind_addr`
@@ -2166,6 +2276,15 @@ fn run_server(args: &[String]) -> ExitCode {
     if let Some(kind) = fault_kind {
         wire_server::fault_injection::arm(kind);
         engine::log_stderr!("wire-server: fault injection armed: post-commit-panic (test only)");
+    }
+
+    // Issue #1703: フラグ指定時に限り必須契約で起動した旨を 1 行出す（未指定時は
+    // 何も出さず既存 stderr をビット同一に保つ。`listening on` より前・bind 成功後）。
+    if require_operation_id {
+        engine::log_stderr!(
+            "wire-server: {}",
+            wire_server::require_operation_id_opt::STARTUP_NOTICE
+        );
     }
 
     // Issue #850: 非既定 durability（`WriteDurability::None`）を選んだ場合に

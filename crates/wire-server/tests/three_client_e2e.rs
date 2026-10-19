@@ -2241,7 +2241,13 @@ fn psql_copy_round_trips_text_and_csv_and_respects_rls() {
     )
     .expect("write csv");
 
-    let server = spawn_wire_server(&users_path, &db_path, &[]);
+    // 既定は operation_id 任意（Issue #1704）。後段の「operation_id 無しの FROM は 23502」
+    // を検証するため `--require-operation-id` で必須化して起動する。
+    let server = spawn_wire_server(
+        &users_path,
+        &db_path,
+        &["--require-operation-id".to_string()],
+    );
     let port = server.port;
 
     // 3 行ずつ（既定上限 64 行・0 行拒否を避ける）。

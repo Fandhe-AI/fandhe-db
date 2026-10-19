@@ -76,7 +76,8 @@ fn new_core_with_docs() -> (EngineCore, CleanupGuard) {
         )
         .expect("insert row");
     }
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (core, guard)
 }
 
@@ -108,7 +109,8 @@ fn new_core_with_one_private_row() -> (EngineCore, CleanupGuard) {
             .expect("valid operation_id"),
     )
     .expect("insert row");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (core, guard)
 }
 

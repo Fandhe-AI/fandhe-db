@@ -198,6 +198,15 @@ impl PolicyContext {
     pub(crate) fn allows_public(&self) -> bool {
         self.allowed.public
     }
+
+    /// このコンテキストが `Private` ラベルを許可するか（Issue #1663）。matview の実体を
+    /// 文脈ごとに分ける `catalog::materialized::ContextKey` が、許可可視性の集合を
+    /// キーへ含めるために読む。[`Self::allows_public`] と同じく判定パスは増やさず、
+    /// 既存の `allowed.private` を読み取り専用で公開するのみ。
+    #[inline]
+    pub(crate) fn allows_private(&self) -> bool {
+        self.allowed.private
+    }
 }
 
 #[cfg(test)]

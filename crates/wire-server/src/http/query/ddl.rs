@@ -874,6 +874,15 @@ fn run_ddl(
     principal: &SessionPrincipal,
     parsed: ParsedSql,
 ) -> Result<(), DdlError> {
+    // TABLE-44・Issue #1683: NoSQL 表層からは一時表を作らない。HTTP は要求ごとに使い捨ての
+    // `SessionState` を作るため、通っても一時表は要求の終了で消えるだけだが、一時表の行ストアの
+    // 確保（要求ごと）を避ける多層防御として、SQL 実行器へ渡す前に拒否する。このモジュールの
+    // 写像は `CREATE TEMP TABLE` のトークン列を組み立てないため、通常は到達しない。
+    if matches!(parsed, ParsedSql::CreateTempTable(_)) {
+        return Err(DdlError::FeatureNotSupported(
+            "temporary tables are not available on this surface",
+        ));
+    }
     let mut session = SessionState::default();
     if principal.ddl_allowed() {
         session.allow_ddl();
@@ -1860,5 +1869,54 @@ mod tests {
         let value = obj(&format!(r#"{{"kind":"check","predicate":[{leaves}]}}"#));
         let err = build_constraint_tokens(&value).expect_err("over limit");
         assert!(matches!(err, DdlError::Engine(_)), "{err:?}");
+    }
+
+    /// TABLE-44・Issue #1683: `CREATE TEMP TABLE` を表す `ParsedSql` が DDL の実行入口へ
+    /// 届いても、SQL 実行器へ渡す前に拒否する（NoSQL 表層からは一時表を作らない）。
+    #[test]
+    fn run_ddl_rejects_create_temp_table() {
+        use engine::kernel::CpuScalarProvider;
+        use engine::policy::PolicyContext;
+        use engine::storage::Storage;
+
+        let path = std::env::temp_dir().join(format!(
+            "wire-ddl-temp-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let parsed = core
+            .parse_sql("CREATE TEMP TABLE t (a TEXT)")
+            .expect("parse temp table");
+        assert!(matches!(parsed, ParsedSql::CreateTempTable(_)));
+
+        use crate::http::headers::{parse_headers, HeaderParse};
+        use crate::http::session::middleware;
+        use crate::http::session::store::SessionStore;
+        let sessions = SessionStore::new();
+        let now = std::time::Instant::now();
+        let token = sessions
+            .issue(PolicyContext::new("tenant-a").expect("valid ctx"), now)
+            .expect("issue");
+        let raw = format!(
+            "Authorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
+            token.encoded()
+        );
+        let leaked: &'static [u8] = Box::leak(raw.into_bytes().into_boxed_slice());
+        let headers = match parse_headers(leaked).expect("header parse") {
+            HeaderParse::Complete { headers, .. } => headers,
+            other => panic!("expected Complete, got {other:?}"),
+        };
+        let principal =
+            middleware::authenticate(&sessions, &headers, move || now).expect("authenticate");
+
+        let err = run_ddl(&core, &principal, parsed).expect_err("must be rejected");
+        assert!(matches!(err, DdlError::FeatureNotSupported(_)), "{err:?}");
+        drop(core);
+        let _ = std::fs::remove_file(&path);
     }
 }
