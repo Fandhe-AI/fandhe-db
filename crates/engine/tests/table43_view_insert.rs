@@ -496,7 +496,8 @@ fn execute_uses_the_definition_current_at_execute_time() {
     assert_eq!(ids(&core, "alice", "notes"), vec![80]);
 }
 
-/// 自動更新不可のビューは `55000`、単純形ビューへの UPDATE／DELETE は `42809` のまま。
+/// 自動更新不可のビューは `55000`。単純形ビューへの UPDATE／DELETE は基表へ書き換わる
+/// （Issue #1672。契約は `table43_view_update_delete.rs`）。
 #[test]
 fn non_updatable_and_other_writes_keep_their_codes() {
     let (core, _g) = open_core("t43i-other");
@@ -510,23 +511,17 @@ fn non_updatable_and_other_writes_keep_their_codes() {
         ),
         "55000"
     );
-    assert_eq!(
-        code(
-            &core,
-            "alice",
-            "UPDATE sv SET body = 'y' WHERE id = 1 USING OPERATION_ID 'op-o-2'"
-        ),
-        "42809"
+    ok(
+        &core,
+        "alice",
+        "UPDATE sv SET body = 'y' WHERE id = 1 USING OPERATION_ID 'op-o-2'",
     );
-    assert_eq!(
-        code(
-            &core,
-            "alice",
-            "DELETE FROM sv WHERE id = 1 USING OPERATION_ID 'op-o-3'"
-        ),
-        "42809"
+    ok(
+        &core,
+        "alice",
+        "DELETE FROM sv WHERE id = 1 USING OPERATION_ID 'op-o-3'",
     );
-    assert_eq!(ids(&core, "alice", "docs"), vec![1, 2, 3]);
+    assert_eq!(ids(&core, "alice", "docs"), vec![2, 3]);
 }
 
 /// `--max-insert-rows` の上限はビュー経由でも効く（`54000`）。

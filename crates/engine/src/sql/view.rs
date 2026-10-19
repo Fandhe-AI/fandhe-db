@@ -678,7 +678,7 @@ fn check_predicate_columns_within(
 /// `SqlSurfaceError::InvalidInput` で拒否する（[`check_columns_within_view`] の
 /// 式項目・式述語向け実装）。`Expr::Number` は列参照を持たず、`Expr::Call`・
 /// `Expr::Binary` は子孫を再帰的に辿る。
-fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurfaceError> {
+pub(crate) fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurfaceError> {
     match expr {
         Expr::Number(_) | Expr::String(_) => Ok(()),
         Expr::Ident(name) => {

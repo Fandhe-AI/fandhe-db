@@ -5,7 +5,8 @@
 //! `table18_view.rs` と同じ流儀（実 `Storage`＋`EngineCore::execute_sql_in_session`）。
 //! 検証する契約: (1) 自動更新不可（評価後射影形）ビューへの `INSERT`／`UPDATE`／`DELETE` は
 //! 文種別ごとの固定文言の `55000` で、行・台帳に副作用が無い (2) 自動更新可能な単純形ビューは
-//! `INSERT` は基表へ書き換わる（Issue #1671。`table43_view_insert.rs`）、`UPDATE`／`DELETE` は書き換え（Issue #1672）まで従来どおり `42809` (3) `TRUNCATE`・matview・
+//! `INSERT`／`UPDATE`／`DELETE` は基表へ書き換わる（Issue #1671・#1672。`table43_view_insert.rs`・
+//! `table43_view_update_delete.rs`） (3) `TRUNCATE`・matview・
 //! 索引名への書き込みは `42809` のまま (4) 応答は閲覧テナントに依存しない。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -182,24 +183,40 @@ fn chain_over_buffered_view_is_not_updatable() {
     assert_not_updatable(&e, "cannot delete from view");
 }
 
-/// 自動更新可能な単純形ビューへの `UPDATE`／`DELETE` は、書き換え実装（Issue #1672）までは
-/// 従来どおり `42809`。`INSERT` は Issue #1671 で基表へ書き換わる（`table43_view_insert.rs`）。
+/// 自動更新可能な単純形ビューへの `UPDATE`／`DELETE` は基表へ書き換わる（Issue #1672。詳細な契約は
+/// `table43_view_update_delete.rs`）。`INSERT` は Issue #1671（`table43_view_insert.rs`）。
 #[test]
-fn simple_view_update_delete_stay_42809_until_rewrite_lands() {
+fn simple_view_update_delete_are_rewritten_to_the_base_table() {
     let (core, _g) = open_core("t43-simple");
     ddl(
         &core,
         "CREATE VIEW sv AS SELECT * FROM docs WHERE lang = 'ja'",
     );
     let before = ids(&core, "alice");
-    for sql in [
+    run(
+        &core,
+        "alice",
         "UPDATE sv SET body = 'y' WHERE id = 1 USING OPERATION_ID 'op-t43-s2'",
-        "DELETE FROM sv WHERE id = 1 USING OPERATION_ID 'op-t43-s3'",
-    ] {
-        let e = run(&core, "alice", sql).expect_err(sql);
-        assert_eq!(e.wire_code(), "42809", "{sql}");
+    )
+    .expect("update through view");
+    match run(&core, "alice", "SELECT body FROM docs WHERE id = 1 LIMIT 1").expect("select") {
+        engine::sql::SqlOutcome::Query(q) => match &q.rows[0].cells[0] {
+            engine::sql::exec::Cell::Text(t) => assert_eq!(t, "y"),
+            other => panic!("expected text, got {other:?}"),
+        },
+        other => panic!("expected Query, got {other:?}"),
     }
-    assert_eq!(before, ids(&core, "alice"));
+    run(
+        &core,
+        "alice",
+        "DELETE FROM sv WHERE id = 1 USING OPERATION_ID 'op-t43-s3'",
+    )
+    .expect("delete through view");
+    let after = ids(&core, "alice");
+    assert_eq!(
+        after,
+        before.into_iter().filter(|id| *id != 1).collect::<Vec<_>>()
+    );
 }
 
 /// `TRUNCATE`（ビューを含む）は従来どおり `42809`。
