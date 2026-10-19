@@ -832,3 +832,71 @@ fn alter_type_of_bare_unique_element_to_disallowed_type_is_rejected() {
     );
     insert_ab(&core, &mut s, "alice", 1, "x", "y").expect("table is unchanged");
 }
+
+/// 名前未指定の UNIQUE・CHECK・FOREIGN KEY の自動生成名が式一意索引名と衝突しない
+/// （Issue #1651）。衝突すると `DROP CONSTRAINT` が実在する制約を 42704 で拒否してしまう。
+#[test]
+fn auto_generated_constraint_names_avoid_unique_expression_index_names() {
+    let (core, path, mut s) = setup("xuidx-auto-name-avoid");
+    let _g = CleanupGuard(path.clone());
+    exec(
+        &core,
+        &mut s,
+        "owner",
+        "CREATE TABLE parents (k TEXT PRIMARY KEY)",
+    )
+    .expect("parents");
+    for name in ["docs_b_key", "docs_check", "docs_b_fkey"] {
+        exec(
+            &core,
+            &mut s,
+            "owner",
+            &format!("CREATE UNIQUE INDEX {name} ON docs ((lower(a)))"),
+        )
+        .expect("create expression unique index");
+    }
+    exec(&core, &mut s, "owner", "ALTER TABLE docs ADD UNIQUE (b)").expect("add unique");
+    exec(
+        &core,
+        &mut s,
+        "owner",
+        "ALTER TABLE docs ADD CHECK (b = 'x')",
+    )
+    .expect("add check");
+    exec(
+        &core,
+        &mut s,
+        "owner",
+        "ALTER TABLE docs ADD FOREIGN KEY (b) REFERENCES parents (k)",
+    )
+    .expect("add fk");
+    drop(core);
+    let storage = Storage::open(&path).expect("reopen");
+    let schema = storage.get_table_schema("docs").expect("schema");
+    drop(storage);
+    let core = core_at(&path);
+    let index_names = ["docs_b_key", "docs_check", "docs_b_fkey"];
+    let uq = schema.unique_constraints()[0].name().to_string();
+    let fk = schema.foreign_keys()[0].name().to_string();
+    assert!(!index_names.contains(&uq.as_str()), "unique name {uq}");
+    assert!(!index_names.contains(&fk.as_str()), "fk name {fk}");
+    // 実在する制約は DROP CONSTRAINT で外せ、索引名は制約として扱われない。
+    for target in [uq.as_str(), fk.as_str(), "docs_check_2"] {
+        exec(
+            &core,
+            &mut s,
+            "owner",
+            &format!("ALTER TABLE docs DROP CONSTRAINT {target}"),
+        )
+        .expect(target);
+    }
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "owner",
+            "ALTER TABLE docs DROP CONSTRAINT docs_b_key"
+        ),
+        "42704"
+    );
+}

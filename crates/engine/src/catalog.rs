@@ -1282,6 +1282,34 @@ fn unique_index_def_for_table_in_txn(
     Ok(def.unique && def.table == table)
 }
 
+/// `table` に対する一意索引（列だけ・式を含む）の名前を write txn 内で全件返す（Issue #1651）。
+/// 名前未指定の UNIQUE・CHECK・FOREIGN KEY の既定名が索引名と衝突しないよう、使用済み名集合へ
+/// 加える用途。索引カタログ未作成は空。走査上限超過・値の破損は `CorruptSchema` で fail-closed。
+fn unique_index_names_for_table_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+) -> Result<Vec<String>> {
+    let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut names = Vec::new();
+    for (scanned, entry) in index_table.iter()?.enumerate() {
+        if scanned >= MAX_INDEX_COUNT {
+            return Err(CatalogError::CorruptSchema(format!(
+                "index catalog exceeds {MAX_INDEX_COUNT} entries"
+            )));
+        }
+        let (key, value) = entry?;
+        let def = decode_index_def(key.value(), value.value())?;
+        if def.unique && def.table == table {
+            names.push(def.name);
+        }
+    }
+    Ok(names)
+}
+
 /// 一意索引（列だけ・式を含む）の共通の前提ゲート（Issue #1616・#1651）。(1) 素の列要素の型ゲート
 /// （暗黙の `id`・一意キー許可型外は `IndexKindMismatch`） (2) 制約名前空間の衝突（UNIQUE・CHECK・
 /// FOREIGN KEY・主キー実効名。`ConstraintAlreadyExists`。`IF NOT EXISTS` でも握りつぶさない）。
@@ -8250,7 +8278,17 @@ fn derive_unique_constraint_names(
 /// 内で、`encode_schema`（内部の `validate_schema`）より前に必ず呼ぶこと
 /// （TOCTOU 回避。FK の `parent_columns` 未解決中間表現と同じ流儀）。
 fn assign_unique_constraint_names(schema: TableSchema) -> TableSchema {
+    assign_unique_constraint_names_avoiding(schema, &[])
+}
+
+/// [`assign_unique_constraint_names`] に、既定名の衝突回避対象として `extra_used`
+/// （一意索引名。Issue #1651）を加えた版。索引カタログを持たない経路は空を渡す。
+fn assign_unique_constraint_names_avoiding(
+    schema: TableSchema,
+    extra_used: &[String],
+) -> TableSchema {
     let mut used: Vec<String> = schema.checks.iter().map(|c| c.name.clone()).collect();
+    used.extend(extra_used.iter().cloned());
     // 主キーの明示名（Issue #1364）は同じ名前空間を使うため既定名の衝突回避対象に
     // 加える。導出名 `<table>_pkey` は加えない（v12 以下のバイト列・既定名導出を
     // 変えないため。導出名との衝突は ALTER の実行経路が別途判定する）。
@@ -8316,7 +8354,17 @@ fn derive_foreign_key_constraint_names(
 /// （`used` に確定済みの UNIQUE 名を含めるため。encode_schema ドキュメント
 /// 参照）。
 fn assign_foreign_key_constraint_names(schema: TableSchema) -> TableSchema {
+    assign_foreign_key_constraint_names_avoiding(schema, &[])
+}
+
+/// [`assign_foreign_key_constraint_names`] に、既定名の衝突回避対象として `extra_used`
+/// （一意索引名。Issue #1651）を加えた版。
+fn assign_foreign_key_constraint_names_avoiding(
+    schema: TableSchema,
+    extra_used: &[String],
+) -> TableSchema {
     let mut used: Vec<String> = schema.checks.iter().map(|c| c.name.clone()).collect();
+    used.extend(extra_used.iter().cloned());
     // 主キーの明示名（Issue #1364）。`assign_unique_constraint_names` と同じ理由。
     used.extend(schema.primary_key_name.clone());
     used.extend(
@@ -11877,8 +11925,12 @@ impl Storage {
             };
             let mut constraints = schema.unique_constraints.clone();
             constraints.push(new_constraint);
-            let updated =
-                assign_unique_constraint_names(schema.clone().with_unique_constraints(constraints));
+            // 既定名は一意索引名（式索引を含む）とも衝突させない（Issue #1651）。
+            let index_names = unique_index_names_for_table_in_txn(&write_txn, table_name)?;
+            let updated = assign_unique_constraint_names_avoiding(
+                schema.clone().with_unique_constraints(constraints),
+                &index_names,
+            );
             // 既存行の走査より前に、追加後のスキーマとして検証する。
             validate_schema(&updated)?;
             confirmed_name = updated
@@ -12439,6 +12491,8 @@ impl Storage {
                     // 導出〔`assign_unique_constraint_names`／
                     // `assign_foreign_key_constraint_names`〕と対称）。
                     used.extend(schema.foreign_keys.iter().map(|f| f.name().to_string()));
+                    // 一意索引名（式索引を含む）とも衝突させない（Issue #1651）。
+                    used.extend(unique_index_names_for_table_in_txn(&write_txn, table_name)?);
                     crate::sql::check_constraint::default_alter_table_check_name(table_name, &used)
                 }
             };
@@ -12601,8 +12655,12 @@ impl Storage {
 
             let mut fks = schema.foreign_keys.clone();
             fks.push(resolved);
-            let updated =
-                assign_foreign_key_constraint_names(schema.clone().with_foreign_keys(fks));
+            // 既定名は一意索引名（式索引を含む）とも衝突させない（Issue #1651）。
+            let index_names = unique_index_names_for_table_in_txn(&write_txn, table_name)?;
+            let updated = assign_foreign_key_constraint_names_avoiding(
+                schema.clone().with_foreign_keys(fks),
+                &index_names,
+            );
             validate_schema(&updated)?;
             let final_fk =
                 updated.foreign_keys.last().cloned().ok_or_else(|| {
