@@ -354,6 +354,7 @@ fn decl(name: &str, predicate: &str) -> crate::catalog::DeclaredPartialIndex {
         index_name: name.to_string(),
         predicate_sql: bound.sql.clone(),
         elements: vec![crate::catalog::PartialElementDecl::Column("n".to_string())],
+        unique: false,
     }
 }
 
@@ -393,6 +394,7 @@ fn index11_selection_skips_unbindable_or_drifted_declarations() {
         index_name: "p_missing".to_string(),
         predicate_sql: "nope = 1".to_string(),
         elements: Vec::new(),
+        unique: false,
     };
     let ok = decl("p_ok", "n > 3");
     assert_eq!(
