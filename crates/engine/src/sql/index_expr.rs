@@ -4,7 +4,7 @@
 //! - `sql::allowlist::validate_create_index_tokens` が列リストの式要素を解析する際に呼ぶ、
 //!   カタログ非参照・権限非依存の検査を持つ。表・列の存在や列の型には一切依存しない
 //!   （存在オラクルにならず、権限の無い主体にも同じ結果を返す）。
-//! - `precheck_element_tokens`: 式の構文解析より前に行うトークン先読み検査。汎用の式パーサは
+//! - `precheck_index_tokens`: 式の構文解析より前に行うトークン先読み検査。汎用の式パーサは
 //!   `count(*)`・`OVER (...)`・`(SELECT ...)` を `42601` で落とすため、PostgreSQL と同じ
 //!   SQLSTATE（`42803`・`42P20`・`0A000`）にはここで分類する。
 //! - `check_index_expression_determinism`: 解析済みの式木に対する決定性（IMMUTABLE 相当）検査。
@@ -16,9 +16,14 @@
 //!   永続化されないため、永続する索引がセッション外で消える関数に依存すると維持できず
 //!   fail-open になる。
 //!
+//! - `check_index_predicate_determinism`: 部分索引の述語（INDEX-11、Issue #1653）の決定性検査。
+//!   先読み・式の検査は [`IndexExprSite::Predicate`] で文言だけ切り替えて共有する。
+//!
 //! 判定表と PostgreSQL との差は `docs/design/expression-index.md` を参照。
 
-use crate::sql::allowlist::{is_aggregate_function_name, SqlSurfaceError, WindowFunc};
+use crate::sql::allowlist::{
+    is_aggregate_function_name, SqlSurfaceError, WherePredicate, WindowFunc,
+};
 use crate::sql::lexer::{Keyword, Token};
 use crate::sql::udf_call::{
     is_builtin_function_name, is_current_time_function_name, ArraySubscript, Expr,
@@ -36,6 +41,55 @@ const MSG_SRF: &str = "set-returning functions are not allowed in index expressi
 const MSG_NOT_IMMUTABLE: &str = "functions in index expression must be marked IMMUTABLE";
 /// 組み込み以外の関数の拒否文言。
 const MSG_UDF: &str = "user-defined functions in index expressions are not supported";
+
+/// 検査の文脈。式索引のキー式（INDEX-10）と部分索引の述語（INDEX-11、Issue #1653）で、同じ
+/// 検査を共有しつつ PostgreSQL 17 の公開文言だけを切り替える（SQLSTATE は共通）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexExprSite {
+    /// 式索引のキー式（`((<式>))`・`f(...)`）。
+    Key,
+    /// 部分索引の `WHERE` 述語。
+    Predicate,
+}
+
+impl IndexExprSite {
+    fn subquery(self) -> &'static str {
+        match self {
+            Self::Key => MSG_SUBQUERY,
+            Self::Predicate => "cannot use subquery in index predicate",
+        }
+    }
+    fn aggregate(self) -> &'static str {
+        match self {
+            Self::Key => MSG_AGGREGATE,
+            Self::Predicate => "aggregate functions are not allowed in index predicates",
+        }
+    }
+    fn window(self) -> &'static str {
+        match self {
+            Self::Key => MSG_WINDOW,
+            Self::Predicate => "window functions are not allowed in index predicates",
+        }
+    }
+    fn srf(self) -> &'static str {
+        match self {
+            Self::Key => MSG_SRF,
+            Self::Predicate => "set-returning functions are not allowed in index predicates",
+        }
+    }
+    fn not_immutable(self) -> &'static str {
+        match self {
+            Self::Key => MSG_NOT_IMMUTABLE,
+            Self::Predicate => "functions in index predicate must be marked IMMUTABLE",
+        }
+    }
+    fn udf(self) -> &'static str {
+        match self {
+            Self::Key => MSG_UDF,
+            Self::Predicate => "user-defined functions in index predicates are not supported",
+        }
+    }
+}
 
 /// 式要素 1 個のトークン区間の終端（`start` から最初の深さ 0 の `,` または対応の無い `)` の
 /// 位置。見つからなければ `tokens.len()`）を返す。深さカウンタによる線形走査で再帰しない。
@@ -83,7 +137,10 @@ fn is_set_returning_name(lower: &str) -> bool {
 /// （`EXISTS (SELECT`・`IN (SELECT`・`ARRAY(SELECT` を含む）。`<名前> ( ... )` の直後が `OVER` なら
 /// 集計／ウィンドウ関数は `42P20`、それ以外の名前への `OVER` は `42601`（fail-closed）。
 /// `OVER` の無い集計は `42803`、`OVER` の無い順位関数は `42601`。
-pub(crate) fn precheck_element_tokens(tokens: &[Token]) -> Result<(), SqlSurfaceError> {
+pub(crate) fn precheck_index_tokens(
+    tokens: &[Token],
+    site: IndexExprSite,
+) -> Result<(), SqlSurfaceError> {
     // `(` ごとの対応する `)` の位置を 1 回の走査で求める（呼び出しごとの再走査による
     // 二乗時間を避ける）。対応の無い `(` は `None`。
     let mut close: Vec<Option<usize>> = vec![None; tokens.len()];
@@ -110,7 +167,7 @@ pub(crate) fn precheck_element_tokens(tokens: &[Token]) -> Result<(), SqlSurface
                 ) =>
             {
                 return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: MSG_SUBQUERY.to_string(),
+                    detail: site.subquery().to_string(),
                 });
             }
             Token::Ident(name)
@@ -129,7 +186,9 @@ pub(crate) fn precheck_element_tokens(tokens: &[Token]) -> Result<(), SqlSurface
                 let is_window = WindowFunc::from_name(name).is_some();
                 if has_over {
                     if is_agg || is_window {
-                        return Err(SqlSurfaceError::WindowingError { detail: MSG_WINDOW });
+                        return Err(SqlSurfaceError::WindowingError {
+                            detail: site.window(),
+                        });
                     }
                     return Err(SqlSurfaceError::unsupported(
                         "OVER is not allowed for a non-window function",
@@ -137,7 +196,7 @@ pub(crate) fn precheck_element_tokens(tokens: &[Token]) -> Result<(), SqlSurface
                 }
                 if is_agg {
                     return Err(SqlSurfaceError::GroupingError {
-                        detail: MSG_AGGREGATE,
+                        detail: site.aggregate(),
                     });
                 }
                 if is_window {
@@ -147,7 +206,7 @@ pub(crate) fn precheck_element_tokens(tokens: &[Token]) -> Result<(), SqlSurface
                 }
                 if is_set_returning_name(&name.to_ascii_lowercase()) {
                     return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: MSG_SRF.to_string(),
+                        detail: site.srf().to_string(),
                     });
                 }
             }
@@ -190,9 +249,17 @@ fn is_known_non_immutable_name(lower: &str) -> bool {
         || crate::sql::udf_call::ValueFunctionKind::from_keyword(lower).is_some()
 }
 
+/// 式キー文脈（[`IndexExprSite::Key`]）の非決定的な式の拒否（束縛段の再判定が使う）。
 fn not_immutable() -> SqlSurfaceError {
     SqlSurfaceError::InvalidObjectDefinition {
         detail: MSG_NOT_IMMUTABLE,
+    }
+}
+
+/// 文脈に応じた非決定的な式の拒否（`42P17`。文言は固定で、列名・値を載せない）。
+fn not_immutable_at(site: IndexExprSite) -> SqlSurfaceError {
+    SqlSurfaceError::InvalidObjectDefinition {
+        detail: site.not_immutable(),
     }
 }
 
@@ -204,7 +271,10 @@ fn not_immutable() -> SqlSurfaceError {
 /// （時刻型の `CAST`・`date_part`・`date_trunc`・2 引数の `timezone`・`TIMESTAMPTZ` リテラル・
 /// `COLLATE`・SQL/JSON 問い合わせ）は本段では通して子だけ再帰する。型依存の再判定は束縛段
 /// （Issue #1648）の責務。
-pub(crate) fn check_index_expression_determinism(expr: &Expr) -> Result<(), SqlSurfaceError> {
+pub(crate) fn check_index_expression_determinism(
+    expr: &Expr,
+    site: IndexExprSite,
+) -> Result<(), SqlSurfaceError> {
     match expr {
         Expr::Number(_)
         | Expr::String(_)
@@ -216,63 +286,110 @@ pub(crate) fn check_index_expression_determinism(expr: &Expr) -> Result<(), SqlS
         | Expr::TimestampTzLiteral { .. }
         | Expr::IntervalLiteral(_) => Ok(()),
         // `CURRENT_TIMESTAMP` 等（括弧なしの SQL 値関数）は常に非 IMMUTABLE。
-        Expr::ValueFunction { .. } => Err(not_immutable()),
+        Expr::ValueFunction { .. } => Err(not_immutable_at(site)),
         Expr::Call { name, args } => {
             let lower = name.to_ascii_lowercase();
             // 1 引数の `timezone(<式>)`（`AT LOCAL`）はセッション TimeZone に依存する。
             if is_known_non_immutable_name(&lower) || (lower == "timezone" && args.len() == 1) {
-                return Err(not_immutable());
+                return Err(not_immutable_at(site));
             }
             if !is_builtin_function_name(name) {
                 return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: MSG_UDF.to_string(),
+                    detail: site.udf().to_string(),
                 });
             }
-            args.iter().try_for_each(check_index_expression_determinism)
+            args.iter()
+                .try_for_each(|e| check_index_expression_determinism(e, site))
         }
         Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
-            check_index_expression_determinism(lhs)?;
-            check_index_expression_determinism(rhs)
+            check_index_expression_determinism(lhs, site)?;
+            check_index_expression_determinism(rhs, site)
         }
         Expr::Case { whens, else_result } => {
             for (cond, result) in whens {
-                check_index_expression_determinism(cond)?;
-                check_index_expression_determinism(result)?;
+                check_index_expression_determinism(cond, site)?;
+                check_index_expression_determinism(result, site)?;
             }
             else_result
                 .as_deref()
-                .map_or(Ok(()), check_index_expression_determinism)
+                .map_or(Ok(()), |e| check_index_expression_determinism(e, site))
         }
         Expr::Coalesce(items) | Expr::ArrayConstructor(items) => items
             .iter()
-            .try_for_each(check_index_expression_determinism),
+            .try_for_each(|e| check_index_expression_determinism(e, site)),
         Expr::NullIf(a, b) => {
-            check_index_expression_determinism(a)?;
-            check_index_expression_determinism(b)
+            check_index_expression_determinism(a, site)?;
+            check_index_expression_determinism(b, site)
         }
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
-            check_index_expression_determinism(expr)
+            check_index_expression_determinism(expr, site)
         }
         Expr::SqlJsonQuery(q) => q
             .children()
             .into_iter()
-            .try_for_each(check_index_expression_determinism),
+            .try_for_each(|e| check_index_expression_determinism(e, site)),
         Expr::Subscript { base, subscript } => {
-            check_index_expression_determinism(base)?;
+            check_index_expression_determinism(base, site)?;
             match subscript {
-                ArraySubscript::Index(i) => check_index_expression_determinism(i),
+                ArraySubscript::Index(i) => check_index_expression_determinism(i, site),
                 ArraySubscript::Slice { lo, hi } => {
                     for bound in [lo, hi].into_iter().flatten() {
-                        check_index_expression_determinism(bound)?;
+                        check_index_expression_determinism(bound, site)?;
                     }
                     Ok(())
                 }
             }
         }
         Expr::Quantified { lhs, rhs, .. } => {
-            check_index_expression_determinism(lhs)?;
-            check_index_expression_determinism(rhs)
+            check_index_expression_determinism(lhs, site)?;
+            check_index_expression_determinism(rhs, site)
         }
+    }
+}
+
+/// 部分索引の述語（`WherePredicate` の木）の決定性を検査する（INDEX-11、Issue #1653）。
+/// `WherePredicate` の全 variant を `_ =>` 無しで網羅する（variant 追加時のコンパイルエラーで
+/// 検査漏れに気づく。fail-closed）。列とリテラルだけの葉は決定的。式述語は
+/// [`check_index_expression_determinism`] へ委譲する。`validate_create_index_tokens` から呼ばれ、
+/// カタログ・型には依存しない（型依存の再判定は束縛段〔Issue #1654〕の責務）。
+pub(crate) fn check_index_predicate_determinism(
+    preds: &[WherePredicate],
+) -> Result<(), SqlSurfaceError> {
+    preds.iter().try_for_each(check_one_predicate)
+}
+
+fn check_one_predicate(pred: &WherePredicate) -> Result<(), SqlSurfaceError> {
+    let site = IndexExprSite::Predicate;
+    match pred {
+        WherePredicate::Equality { .. }
+        | WherePredicate::Prefix { .. }
+        | WherePredicate::BoolEquality { .. }
+        | WherePredicate::BoolColumn { .. }
+        | WherePredicate::Compare { .. }
+        | WherePredicate::InList { .. }
+        | WherePredicate::Between { .. }
+        | WherePredicate::IsNull { .. } => Ok(()),
+        WherePredicate::Expression(expr) => check_index_expression_determinism(expr, site),
+        WherePredicate::Not(inner) => check_one_predicate(inner),
+        WherePredicate::Or(branches) => branches
+            .iter()
+            .try_for_each(|branch| check_index_predicate_determinism(branch)),
+        // RLS 述語呼び出しはセッション主体に依存する。永続する索引へ埋め込ませない（P0）。
+        WherePredicate::PredicateCall { .. } => Err(SqlSurfaceError::unsupported(
+            "visible() is not allowed in an index predicate",
+        )),
+        // 構文段（`subquery_ctx = None`）では生成されないが、fail-closed の防御として拒否する。
+        WherePredicate::InSubquery { .. }
+        | WherePredicate::Exists { .. }
+        | WherePredicate::ScalarSubqueryCompare { .. } => {
+            Err(SqlSurfaceError::FeatureNotSupported {
+                detail: site.subquery().to_string(),
+            })
+        }
+        // パーサが生成しない内部専用の葉。到達しないが、防御的に拒否する。
+        WherePredicate::IdCompare { .. } => Err(SqlSurfaceError::unsupported(
+            "unsupported predicate in an index predicate",
+        )),
     }
 }
 
@@ -749,7 +866,7 @@ mod tests {
 
     fn pre_code(sql: &str) -> Option<&'static str> {
         use crate::error_format::ClassifiedError;
-        precheck_element_tokens(&toks(sql))
+        precheck_index_tokens(&toks(sql), IndexExprSite::Key)
             .err()
             .map(|e| e.error_class().wire_code())
     }

@@ -30,11 +30,11 @@
 ## 判定順（全て構文段・カタログ非参照）
 
 1. 字句
-2. 要素ごとの先読み検査（`sql::index_expr::precheck_element_tokens`。トークン区間を左端優先で線形走査）
+2. 要素ごとの先読み検査（`sql::index_expr::precheck_index_tokens`。トークン区間を左端優先で線形走査）
 3. 要素の構文解析（`42601`／`54000`）
 4. 文全体の構造検査（重複列・`USING hnsw` の列数・`UNIQUE` との併用・要素数上限）
 5. 式要素の決定性（`sql::index_expr::check_index_expression_determinism`）
-6. 部分索引 `WHERE`（`0A000`）・文末
+6. 部分索引の述語（[partial-index.md](partial-index.md) 参照）・文末
 7. 最終ゲート（`reject_unimplemented_expression_keys`。#1648 以降は `USING hnsw`／`UNIQUE`／`COLLATE` と式の
    組み合わせだけ `0A000`。それ以外は実行段の束縛へ渡す）
 

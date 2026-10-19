@@ -94,6 +94,11 @@
   `((col))` は通常の列索引として作成できる。公開 API は `SqlSurfaceError`（`InvalidObjectDefinition`・
   `GroupingError`・`WindowingError`）・`ErrorClass`（同名 3 分類）への variant 追加と
   `ValidatedCreateIndex::expression_keys` の追加。
+- 部分索引の述語 parser と決定性検査（Issue #1653・INDEX-11）: `CREATE INDEX ... WHERE <述語>` の述語を
+  解析し、非決定を `42P17`、集計を `42803`、ウィンドウを `42P20`、部分クエリ・SRF・組み込み以外の
+  関数を `0A000`、`visible()` と構文誤りを `42601` で拒否する（従来は `WHERE` を一律 `0A000`）。
+  決定的な述語も後続 Issue（#1654）までは `0A000`（部分索引は作成できない）。公開 API は
+  `ValidatedCreateIndex::predicate` の追加。
 - `DROP TABLE a, b`（Issue #1639・TABLE-37 (1)）: 従来 `42601` だった複数テーブル指定を受理する。
   文全体を 1 つの write txn で原子的に実行し（不在・種類違い・依存のどれか 1 つでもあれば何も削除しない）、
   同じ文に並べた名前どうしの依存は数えない。`CASCADE`／`RESTRICT` は従来どおり `42601`。公開 API は
