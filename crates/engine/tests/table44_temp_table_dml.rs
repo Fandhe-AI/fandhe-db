@@ -709,7 +709,8 @@ fn temp_indexes_and_unique_indexes_work() {
     );
 }
 /// 一時表への式索引（INDEX-10、Issue #1648）は永続表と同じ経路（束縛・永続化）で作成でき、
-/// 同じ分類で拒否される。DML は式索引に影響されず成功する（一時表への `ALTER` は未対応）。
+/// 同じ分類で拒否される。式が評価できる DML は成功し、評価エラーになる DML は永続表と同じ
+/// SQLSTATE で拒否される（Issue #1649）。一時表への `ALTER` は未対応。
 #[test]
 fn temp_expression_indexes_share_the_persistent_path() {
     let (core, _g) = new_core("t44-dml-expr-index", LedgerMode::CompareOnlyWithoutLedger);
@@ -737,7 +738,7 @@ fn temp_expression_indexes_share_the_persistent_path() {
         code(&core, &mut s, "CREATE INDEX bad ON t ((now()))"),
         "42P17"
     );
-    // DML は式索引の有無に影響されない。
+    // 式が評価できる DML は式索引の有無に影響されない。
     run_ok(
         &core,
         &mut s,
@@ -747,6 +748,25 @@ fn temp_expression_indexes_share_the_persistent_path() {
         rows(&core, &mut s, "SELECT id FROM t WHERE qty = 5 LIMIT 10").len(),
         2
     );
+    // 評価エラーになる DML は永続表と同じ SQLSTATE で拒否される（Issue #1649）。
+    run_ok(&core, &mut s, "CREATE INDEX by_div ON t ((100 / qty))");
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "INSERT INTO t (id, name, qty) VALUES (4, 'D', 0)"
+        ),
+        "22012"
+    );
+    assert_eq!(
+        code(&core, &mut s, "UPDATE t SET qty = 0 WHERE id = 1"),
+        "22012"
+    );
+    assert_eq!(
+        rows(&core, &mut s, "SELECT id FROM t WHERE qty = 5 LIMIT 10").len(),
+        2
+    );
+    run_ok(&core, &mut s, "DROP INDEX by_div");
     run_ok(&core, &mut s, "DROP INDEX by_lower");
 }
 

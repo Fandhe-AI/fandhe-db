@@ -18,6 +18,13 @@
 //! docs_uidx_code ON docs_uidx (code)` を追加した。2 表は独立に id を採番・再開し、`verify` は
 //! 両表へ同じオラクルを適用する（`docs` は列制約 `UNIQUE`、`docs_uidx` は索引宣言由来）。
 //!
+//! Issue #1649（INDEX-10）で、式索引の DML 維持（コミット済みの全行で式が評価できる不変条件）を
+//! 検証するため、3 つ目の表 `docs_xidx (n INTEGER, code TEXT)` ＋ 式索引 `((100 / n))`・
+//! `((lower(code)))` を追加した。`write` は `n = (id % 7) + 1`（0 にならない）で書き、`verify` は
+//! 行 id 連続性・BATCH 整合に加え、式の評価に失敗する INSERT／UPDATE が再起動後も必ず `22012` で
+//! 拒否されること（＝宣言と検査点がクラッシュ後も生存している）と、`n = 0` の行が 1 行も無いこと
+//! （＝コミット済みの全行が式を評価できる＝派生索引を作り直せる）を確かめる。
+//!
 //! サブコマンド:
 //! - `write <db_path>`: `docs (code TEXT UNIQUE)` テーブル（無ければ作成）へ、
 //!   `BATCH` 件の行を 1 `INSERT` 文（＝1 write トランザクション。UNIQUE 索引の
@@ -54,7 +61,9 @@ const CRASH_TOOL_TENANT_ID: &str = "crash-tool-unique-index-tenant";
 const BATCH: u64 = 10;
 /// 検証対象の表。`docs` は列制約 `UNIQUE`、`docs_uidx` は `CREATE UNIQUE INDEX` 由来
 /// （Issue #1616・INDEX-9）の一意制約を持つ。
-const TABLES: [&str; 2] = ["docs", "docs_uidx"];
+const TABLES: [&str; 3] = ["docs", "docs_uidx", XIDX_TABLE];
+/// 式索引（`((100 / n))`・`((lower(code)))`）を持つ表（Issue #1649・INDEX-10）。
+const XIDX_TABLE: &str = "docs_xidx";
 
 /// 再開時に既存行の最大 id を求める `SELECT id FROM docs LIMIT n` の上限件数。
 /// `sql::allowlist` が SELECT の `LIMIT` に課す上限（1..=10000）と同じ値を使う
@@ -132,7 +141,33 @@ fn ensure_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
         "CREATE UNIQUE INDEX IF NOT EXISTS docs_uidx_code ON docs_uidx (code)",
     )
     .map_err(|e| format!("create unique index failed: {e}"))?;
+    match core.execute_sql_in_session(
+        ctx,
+        &mut session,
+        "CREATE TABLE docs_xidx (n INTEGER, code TEXT)",
+    ) {
+        Ok(_) => {}
+        Err(engine::sql::allowlist::SqlSurfaceError::DuplicateTable { .. }) => {}
+        Err(e) => return Err(format!("create table failed: {e}")),
+    }
+    for sql in [
+        "CREATE INDEX IF NOT EXISTS docs_xidx_div ON docs_xidx ((100 / n))",
+        "CREATE INDEX IF NOT EXISTS docs_xidx_lower ON docs_xidx ((lower(code)))",
+    ] {
+        core.execute_sql_in_session(ctx, &mut session, sql)
+            .map_err(|e| format!("create expression index failed: {e}"))?;
+    }
     Ok(())
+}
+
+/// `write` が `table` の行 `id` に使う `VALUES` の 1 タプル。式索引の表は `n` を `1..=7` にする
+/// （0 除算にならない）。
+fn row_tuple(table: &str, id: u64) -> String {
+    if table == XIDX_TABLE {
+        format!("({id}, {}, 'Code-{id}')", id % 7 + 1)
+    } else {
+        format!("({id}, 'code-{id}')")
+    }
 }
 
 /// スキャン結果の件数が [`SCAN_LIMIT`] に達していないことを確認する。達して
@@ -214,10 +249,15 @@ fn write_inner(path: &str) -> Result<(), String> {
                 if offset > 0 {
                     values.push(',');
                 }
-                values.push_str(&format!("({id}, 'code-{id}')"));
+                values.push_str(&row_tuple(table, id));
             }
+            let columns = if *table == XIDX_TABLE {
+                "id, n, code"
+            } else {
+                "id, code"
+            };
             let sql = format!(
-                "INSERT INTO {table} (id, code) VALUES {values} USING OPERATION_ID 'op-{table}-{batch_seq}'"
+                "INSERT INTO {table} ({columns}) VALUES {values} USING OPERATION_ID 'op-{table}-{batch_seq}'"
             );
             core.execute_insert_sql(&ctx, &sql)
                 .map_err(|e| format!("insert failed at {table} batch_seq={batch_seq}: {e}"))?;
@@ -314,6 +354,11 @@ fn verify_table(core: &EngineCore, ctx: &PolicyContext, table: &str) -> Result<(
         ));
     }
 
+    if table == XIDX_TABLE {
+        verify_expression_index_table(core, ctx, total_rows)?;
+        return Ok((total_rows, total_rows / BATCH));
+    }
+
     // 永続一意索引の不変条件そのものを検証する（本ツール固有のオラクル）:
     // 生存する各行の `code` 値は正引きエントリを持たなければならない
     // （`docs/design/unique-index.md`「正しさの不変条件」）。
@@ -360,4 +405,79 @@ fn verify_table(core: &EngineCore, ctx: &PolicyContext, table: &str) -> Result<(
 
     let total_batches = total_rows / BATCH;
     Ok((total_rows, total_batches))
+}
+
+/// 式索引の表の検証（Issue #1649・INDEX-10）。再起動後も式索引の宣言と DML ゲートが生きており、
+/// コミット済みの全行が式を評価できることを、公開 API だけで確かめる。いずれのプローブも常に
+/// 拒否される前提のため、成功時は副作用を残さない（`write` が再開する id 採番と衝突しない）。
+fn verify_expression_index_table(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    total_rows: u64,
+) -> Result<(), String> {
+    // (a) `n = 0` の INSERT は `22012` で拒否され、その id の行が残らない。
+    let probe_id = total_rows;
+    let insert_sql = format!(
+        "INSERT INTO {XIDX_TABLE} (id, n, code) VALUES ({probe_id}, 0, 'probe') \
+         USING OPERATION_ID 'verify-xidx-ins-{probe_id}'"
+    );
+    match core.execute_insert_sql(ctx, &insert_sql) {
+        Err(e) if e.wire_code() == "22012" => {}
+        Err(e) => {
+            return Err(format!(
+                "expression probe insert failed with an unexpected wire_code {} \
+                 (expected 22012): {e}",
+                e.wire_code()
+            ));
+        }
+        Ok(_) => {
+            return Err(
+                "expression probe insert was wrongly accepted; the expression index gate \
+                 is missing after crash recovery"
+                    .to_string(),
+            );
+        }
+    }
+    // (b) 既存行を `n = 0` へ更新する UPDATE も `22012` で拒否される。
+    let mut session = SessionState::default();
+    let update_sql = format!(
+        "UPDATE {XIDX_TABLE} SET n = 0 WHERE id = 0 USING OPERATION_ID 'verify-xidx-upd-{total_rows}'"
+    );
+    match core.execute_sql_in_session(ctx, &mut session, &update_sql) {
+        Err(e) if e.wire_code() == "22012" => {}
+        Err(e) => {
+            return Err(format!(
+                "expression probe update failed with an unexpected wire_code {} \
+                 (expected 22012): {e}",
+                e.wire_code()
+            ));
+        }
+        Ok(_) => {
+            return Err("expression probe update was wrongly accepted".to_string());
+        }
+    }
+    // (c) 失敗値の行がコミット済みの中に 1 行も無い（派生索引を作り直せる）。
+    let zero = core
+        .execute_sql(
+            ctx,
+            &format!("SELECT id FROM {XIDX_TABLE} WHERE n = 0 LIMIT {SCAN_LIMIT}"),
+        )
+        .map_err(|e| format!("verify zero scan failed: {e}"))?;
+    if !zero.rows.is_empty() {
+        return Err(format!(
+            "{} committed row(s) have n = 0, which the expression index cannot evaluate",
+            zero.rows.len()
+        ));
+    }
+    // (d) 拒否された INSERT の行が残っていない（副作用ゼロ）。
+    let probe = core
+        .execute_sql(
+            ctx,
+            &format!("SELECT id FROM {XIDX_TABLE} WHERE id = {probe_id} LIMIT 1"),
+        )
+        .map_err(|e| format!("verify probe scan failed: {e}"))?;
+    if !probe.rows.is_empty() {
+        return Err("rejected probe insert left a row behind".to_string());
+    }
+    Ok(())
 }

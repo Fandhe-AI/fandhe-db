@@ -194,7 +194,63 @@ must be marked IMMUTABLE`）にする。型を決められない部分式は判�
 
 | 事項 | 担当 | 本件での挙動 |
 | ---- | ---- | ------------ |
-| INSERT／UPDATE 時の式評価エラーで DML を失敗させる・crash 整合 | #1649 | DML は従来どおり成功する。構築時に評価エラーがあれば、その式キーは作らない |
+| INSERT／UPDATE 時の式評価エラーで DML を失敗させる・crash 整合 | #1649（実施済み） | 下記「Issue #1649」節。全書き込み経路が commit 前に式を評価し、評価エラーを拒否する |
 | WHERE／ORDER BY の式一致・EXPLAIN 表示 | #1650 | 式キーは構築するがどこからも消費しない（クエリ結果・計画は不変） |
 | UNIQUE 式索引・`RENAME`／`ALTER TYPE` の追随 | #1651 | 構文段で `0A000`／write txn 内で `0A000` |
 | 式への `COLLATE`（ICU 照合の辞書） | 後続 | `0A000` |
+
+## Issue #1649（DML 維持・構築時検証）
+
+ポインタ: INDEX-10（`docs/spec/04-behavior/indexing.md`）。式の評価エラーで文を拒否する・NULL も
+索引に含める・書き込みと同じトランザクションで維持する・クラッシュ後も行と一致する、の 4 点を満たす。
+
+### 判断
+
+| # | 判断 | 理由 |
+| - | ---- | ---- |
+| D1 | 永続の式索引表は作らない。式キー索引は従来どおりコミット済みの行からテーブル世代ごとに作り直す派生物のままにする | 読み手は #1650 が消費するメモリ上の `ScalarIndex` だけで、一意性は #1651 が `user_uniq` の拡張で扱える。第 2 の複製が無いので、クラッシュ後に行と食い違う状態が構造的に存在しない。DML は既に全経路で同じ write txn 内に世代を bump している |
+| D1' | 守る不変条件は「式索引が存在するなら、テーブルの全行で式が評価エラーなく索引化できる値（NULL を含む）を返す」 | 旧キーは再構築で消え、新キーは不変条件の強制によって必ず再構築に入る。#1648 の fail-soft（`Unbuildable`）は多層防御として残す |
+| D2 | DML ゲートは単一検査点 `constraint::enforce_row_constraints_in_txn` に式評価段を足す（呼び出し元の変更なし） | 検査順は 索引同期 → CHECK → **式評価** → UNIQUE → FK。参照アクションで書き換えた子表・COPY・一時表も同じ関数を通る |
+| D3 | `CREATE INDEX` は保存前に既存行を全件評価する（全テナント・全可視性） | 失敗行を抱えた索引が恒久的に作れない状態で残るのを防ぐ。`ALTER TABLE ... ADD CHECK` と同じ設計判断 |
+| D4 | `TenantWriteError::IndexExpressionEvaluationFailed(SqlSurfaceError)` を追加する | `CheckEvaluationFailed` の意味は CHECK に限られる。内側の `wire_code` を透過し、`Display`／`Debug` は値を含めない |
+| D5 | crash-test は既存の `crash_tool_unique_index` に 3 つ目の表 `docs_xidx` を足して行い、新しい CI ジョブは作らない | required check の登録というリポジトリ設定の変更を要さない |
+
+### 判定と SQLSTATE
+
+| 事象 | 結果 |
+| ---- | ---- |
+| 式が NULL を返す | 可（索引に含める） |
+| 式の評価エラー（0 除算 `22012` 等） | 内側の SQLSTATE を透過して文を拒否 |
+| 数値が非有限（キーを表せない） | `22003` で拒否 |
+| 静的な結果型と値の型の不一致 | `XX000` |
+| 保存済みの式が再解析・再束縛・往復一致に失敗（漂流） | `XX000`（`CorruptSchema`。詳細は渡さない） |
+
+- 起動時 opt-in（`declarations_enabled`）に**依存せず**、カタログに宣言があれば常に発火する。
+- 値の分類は `sql::expression_key_index::classify_expression_value` を構築側と共有する。
+- 式索引を持たない表のコストは索引カタログを 1 回走査するだけ（対象外エントリはテーブル名の照合だけで読み飛ばす）。
+- 拒否は commit 前に返すため、行・台帳・世代のいずれにも痕跡を残さない。
+
+### テナント境界
+
+- DML ゲートはサーバー側で導出したテナントの物理キーで `written_ids` だけを読み戻して評価する。
+  他テナントの行に触れず、存在オラクルにならない。
+- `CREATE INDEX` の全件検証は運用者権限の DDL（`42501` ゲートの後）に限る。評価エラーは SQLSTATE を保った
+  固定文言へ置換し、テナント・行 id・値を応答へ出さない。
+
+### PostgreSQL との差
+
+- PostgreSQL の `float8` は Infinity を索引化できるが、本実装はキーのエンコードが非有限を表せないため
+  `22003` で拒否する。
+
+### 検証
+
+- 層 A: `crates/engine/tests/sql_expression_index.rs`（INSERT・複数行・UPSERT・UPDATE・DELETE・TRUNCATE・
+  `CREATE INDEX` の既存行検証・明示トランザクション）、`table44_temp_table_dml.rs`（一時表）、
+  `crates/wire-server/tests/err4_http_projection.rs`（NoSQL insert の `22012` 射影）。
+- crash: `make crash-test-unique-index` が `docs_xidx` で、再起動後も式の評価失敗が `22012` で拒否され、
+  コミット済みの全行が式を評価できることを確かめる。
+
+### 対象外
+
+- 分割実行 DML（`partitioned-dml.md`）での評価エラーは、既存の CHECK エラーと同じチャンク原子性の契約に従う。
+- 本件より前の #1648 ビルドで作った式索引の既存失敗行は遡って検証しない（構築側の fail-soft で無害化される）。

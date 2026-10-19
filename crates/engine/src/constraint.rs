@@ -233,7 +233,8 @@ impl FkCheckMode {
 
 /// `tenant.rs` の各書き込み関数が書き込み後・commit 前に呼ぶ唯一の入口
 /// （TABLE-16・TASK-204）。永続キー索引（`key_index.rs`、Issue #1071）の同期 →
-/// `CHECK` 制約（Issue #906）→ 一意性制約（主キー・UNIQUE）→ `FOREIGN KEY` の
+/// `CHECK` 制約（Issue #906）→ 式索引の式評価（INDEX-10、Issue #1649。
+/// [`enforce_index_expressions_in_txn`]）→ 一意性制約（主キー・UNIQUE）→ `FOREIGN KEY` の
 /// 参照元側（TABLE-17・TASK-205、Issue #907。書いた行が参照する値の組が
 /// 参照先に存在するか）の順に検査する。`written_ids` の契約は
 /// [`enforce_unique_keys_in_txn`] と同じ。いずれの制約も宣言しないテーブルは
@@ -261,6 +262,7 @@ pub(crate) fn enforce_row_constraints_in_txn(
     let delta =
         crate::key_index::sync_rows_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
     enforce_check_constraints_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
+    enforce_index_expressions_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
     enforce_unique_keys_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
     enforce_foreign_keys_in_txn(
         write_txn,
@@ -312,6 +314,94 @@ fn enforce_check_constraints_in_txn(
         let (_dim, metadata) =
             crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
         compiled.enforce(schema, id, &embedding, metadata)?;
+    }
+    Ok(())
+}
+
+/// 式索引（INDEX-10、Issue #1649）の式を `written_ids` の各行で評価し、「式索引があるなら全行で
+/// 式が評価でき索引化できる」不変条件を維持する検査。式キー索引はコミット済みの行から世代ごとに
+/// 作り直す派生物のため、この不変条件こそが「INSERT／UPDATE の新キーが次回の再構築に必ず入る」
+/// ことの保証になる。DELETE／TRUNCATE・UPDATE の旧値は再構築で自然に消える。
+///
+/// 評価エラーは [`TenantWriteError::IndexExpressionEvaluationFailed`]（内側の SQLSTATE を透過）、
+/// 非有限値は `22003`、型不一致は `XX000`、保存式の漂流は `Catalog(CorruptSchema)` で拒否し、
+/// 呼び出し元は `write_txn` を commit しない（副作用ゼロ）。`declarations_enabled`（起動時 opt-in）
+/// には依存せず、カタログに宣言があれば常に発火する。物理キーはサーバー側導出の `tenant_id` で
+/// 名前空間化済みで、書き込んだ自テナントの行だけを読むため他テナントの存在オラクルにならない
+/// （RLS-9・TABLE-12）。読み戻せない id は [`enforce_check_constraints_in_txn`] と同じく対象外。
+fn enforce_index_expressions_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    written_ids: &[u64],
+) -> Result<(), TenantWriteError> {
+    if written_ids.is_empty() {
+        return Ok(());
+    }
+    let decls = crate::catalog::expression_index_decls_in_txn(write_txn, table_name)?;
+    let Some(compiled) =
+        crate::sql::expression_key_index::CompiledIndexExpressions::compile(schema, &decls)?
+    else {
+        return Ok(());
+    };
+    let row_table_name = crate::catalog::user_rows_table_name(table_name);
+    let row_table = write_txn
+        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .map_err(crate::catalog::map_row_table_error)?;
+    let mut embedding: Vec<f32> = Vec::new();
+    for &id in written_ids {
+        let Some(guard) = row_table
+            .get((tenant_id, id))
+            .map_err(crate::catalog::CatalogError::from)?
+        else {
+            continue;
+        };
+        let buf = guard.value();
+        let (_dim, metadata) =
+            crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
+        compiled.enforce(schema, id, &embedding, metadata)?;
+    }
+    Ok(())
+}
+
+/// `CREATE INDEX ... ((<式>))`（INDEX-10、Issue #1649）が索引宣言を保存する前に、対象テーブルの
+/// **既存行全件**（全テナント・可視性を問わない）で `compiled` が評価でき索引化できることを検証する。
+/// 可視性で絞ると不可視行の失敗を見逃し、恒久的に作れない式索引が残る。DDL は運用者権限
+/// （`42501` ゲートの後）の共有カタログ操作で、[`validate_existing_rows_for_check`] と同じ設計判断。
+///
+/// 評価エラー（[`TenantWriteError::IndexExpressionEvaluationFailed`]）は透過し、それ以外
+/// （デコード失敗・ヘッダのテナント不整合・漂流）は `Catalog(CorruptSchema)`（`XX000`）へ揃える。
+/// 呼び出し元は write トランザクションを commit せず破棄するため、拒否は痕跡を残さない。
+pub(crate) fn validate_existing_rows_for_index_expressions<T>(
+    row_table: &T,
+    schema: &TableSchema,
+    compiled: &crate::sql::expression_key_index::CompiledIndexExpressions,
+) -> Result<(), TenantWriteError>
+where
+    T: ReadableTable<(&'static str, u64), &'static [u8]>,
+{
+    let mut embedding: Vec<f32> = Vec::new();
+    for entry in row_table
+        .iter()
+        .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?
+    {
+        let (k, v) = entry.map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
+        let (key_tenant, id) = k.value();
+        let buf = v.value();
+        let (row_tenant, _visibility, _offset) = crate::storage::decode_row_header(buf)
+            .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        crate::storage::verify_row_key_tenant(key_tenant, row_tenant)
+            .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        let (_dim, metadata) =
+            crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)
+                .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        compiled
+            .enforce(schema, id, &embedding, metadata)
+            .map_err(|e| match e {
+                TenantWriteError::IndexExpressionEvaluationFailed(_) => e,
+                other => corrupt_check_scan(other.to_string()),
+            })?;
     }
     Ok(())
 }

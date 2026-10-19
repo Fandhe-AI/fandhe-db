@@ -437,3 +437,248 @@ fn drop_table_removes_expression_indexes() {
     drop(core);
     assert!(list(&path).is_empty());
 }
+// ---------------------------------------------------------------------------
+// DML 維持（Issue #1649）。式索引があるテーブルでは、全書き込み経路が commit 前に式を評価し、
+// 評価エラーを同じ SQLSTATE で拒否する（副作用ゼロ）。クラッシュ整合は
+// `examples/crash_tool_unique_index.rs`（`make crash-test-unique-index`）が担う。
+// ---------------------------------------------------------------------------
+
+fn ctx_of(tenant: &str) -> PolicyContext {
+    PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant")
+}
+
+/// `xt (n INTEGER, code TEXT)` に `((100 / n))` の式索引を張ったフィクスチャ。
+fn dml_fixture(label: &str) -> (std::path::PathBuf, CleanupGuard, EngineCore, SessionState) {
+    let path = unique_db_path(label);
+    let guard = CleanupGuard(path.clone());
+    let core = core_at(&path);
+    let mut session = allowed_session();
+    run(
+        &core,
+        &mut session,
+        "CREATE TABLE xt (n INTEGER, code TEXT)",
+    )
+    .expect("create table");
+    run(&core, &mut session, "CREATE INDEX xt_div ON xt ((100 / n))").expect("create index");
+    (path, guard, core, session)
+}
+
+fn count_of(core: &EngineCore, session: &mut SessionState, sql: &str) -> usize {
+    match run(core, session, sql).expect("select") {
+        SqlOutcome::Query(q) => q.rows.len(),
+        other => panic!("unexpected outcome {other:?}"),
+    }
+}
+
+/// INSERT（単一行・複数行・UPSERT）の評価エラーは `22012` で拒否され、行を残さない。
+#[test]
+fn insert_with_failing_expression_is_rejected_without_side_effects() {
+    let (_path, _guard, core, mut session) = dml_fixture("expr-index-dml-insert");
+    run(
+        &core,
+        &mut session,
+        "INSERT INTO xt (id, n, code) VALUES (1, 5, 'a') USING OPERATION_ID 'op-ok'",
+    )
+    .expect("valid row");
+    assert_eq!(
+        code_of(
+            &core,
+            &mut session,
+            "INSERT INTO xt (id, n, code) VALUES (2, 0, 'b') USING OPERATION_ID 'op-single'"
+        ),
+        "22012"
+    );
+    // 複数行の 1 行でも失敗すれば全体を拒否する。
+    assert_eq!(
+        code_of(
+            &core,
+            &mut session,
+            "INSERT INTO xt (id, n, code) VALUES (3, 2, 'c'), (4, 0, 'd') USING OPERATION_ID 'op-multi'"
+        ),
+        "22012"
+    );
+    // UPSERT の更新側も同じ検査点を通る。
+    assert_eq!(
+        code_of(
+            &core,
+            &mut session,
+            "INSERT INTO xt (id, n, code) VALUES (1, 0, 'a') ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n USING OPERATION_ID 'op-upsert'"
+        ),
+        "22012"
+    );
+    assert_eq!(
+        count_of(&core, &mut session, "SELECT id FROM xt LIMIT 100"),
+        1
+    );
+    assert_eq!(
+        count_of(
+            &core,
+            &mut session,
+            "SELECT id FROM xt WHERE n = 5 LIMIT 100"
+        ),
+        1,
+        "the original row keeps its value"
+    );
+}
+
+/// UPDATE（id 指定・述語形・SET 式）が参照列を失敗値にすると `22012` で拒否され、旧値が残る。
+/// 参照列以外の UPDATE は成功する。NULL を返す式は索引に含まれ DML は通る。
+#[test]
+fn update_with_failing_expression_is_rejected_and_keeps_old_value() {
+    let (_path, _guard, core, mut session) = dml_fixture("expr-index-dml-update");
+    for (id, n) in [(1, 5), (2, 4)] {
+        run(
+            &core,
+            &mut session,
+            &format!(
+                "INSERT INTO xt (id, n, code) VALUES ({id}, {n}, 'a') USING OPERATION_ID 'op-i{id}'"
+            ),
+        )
+        .expect("valid row");
+    }
+    for (i, sql) in [
+        "UPDATE xt SET n = 0 WHERE id = 1",
+        "UPDATE xt SET n = 0 WHERE code = 'a'",
+        "UPDATE xt SET n = n - 4 WHERE id = 2",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert_eq!(
+            code_of(
+                &core,
+                &mut session,
+                &format!("{sql} USING OPERATION_ID 'op-u{i}'")
+            ),
+            "22012",
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        count_of(
+            &core,
+            &mut session,
+            "SELECT id FROM xt WHERE n = 5 LIMIT 100"
+        ),
+        1
+    );
+    // 参照列以外の更新と、NULL を返す式（`100 / NULL`）は通る。
+    run(
+        &core,
+        &mut session,
+        "UPDATE xt SET code = 'z' WHERE id = 1 USING OPERATION_ID 'op-ok1'",
+    )
+    .expect("non-referenced column update");
+    run(
+        &core,
+        &mut session,
+        "UPDATE xt SET n = NULL WHERE id = 1 USING OPERATION_ID 'op-null'",
+    )
+    .expect("NULL expression result is indexable");
+    run(
+        &core,
+        &mut session,
+        "INSERT INTO xt (id, code) VALUES (9, 'nn') USING OPERATION_ID 'op-null-ins'",
+    )
+    .expect("NULL column insert");
+}
+
+/// DELETE・TRUNCATE は式を評価せずに成功する。
+#[test]
+fn delete_and_truncate_do_not_evaluate_the_expression() {
+    let (_path, _guard, core, mut session) = dml_fixture("expr-index-dml-delete");
+    run(
+        &core,
+        &mut session,
+        "INSERT INTO xt (id, n, code) VALUES (1, 5, 'a'), (2, 4, 'b') USING OPERATION_ID 'op-i'",
+    )
+    .expect("rows");
+    run(
+        &core,
+        &mut session,
+        "DELETE FROM xt WHERE id = 1 USING OPERATION_ID 'op-d'",
+    )
+    .expect("delete");
+    assert_eq!(
+        count_of(&core, &mut session, "SELECT id FROM xt LIMIT 100"),
+        1
+    );
+    run(
+        &core,
+        &mut session,
+        "TRUNCATE TABLE xt USING OPERATION_ID 'op-t'",
+    )
+    .expect("truncate");
+    assert_eq!(
+        count_of(&core, &mut session, "SELECT id FROM xt LIMIT 100"),
+        0
+    );
+}
+
+/// `CREATE INDEX` は保存前に既存行（他テナントの行を含む）を検証する。失敗行があれば `22012` で
+/// 拒否し索引を作らない。応答はテナント名を含まない。
+#[test]
+fn create_index_validates_existing_rows_across_tenants() {
+    let path = unique_db_path("expr-index-dml-create");
+    let _guard = CleanupGuard(path.clone());
+    let core = core_at(&path);
+    let mut session = allowed_session();
+    run(
+        &core,
+        &mut session,
+        "CREATE TABLE xt (n INTEGER, code TEXT)",
+    )
+    .expect("create table");
+    core.execute_sql_in_session(
+        &ctx_of("bob-secret"),
+        &mut allowed_session(),
+        "INSERT INTO xt (id, n, code) VALUES (1, 0, 'x') USING OPERATION_ID 'op-bob'",
+    )
+    .expect("bob row");
+    let err = run(&core, &mut session, "CREATE INDEX xt_div ON xt ((100 / n))")
+        .expect_err("existing failing row must reject the index");
+    assert_eq!(err.wire_code(), "22012");
+    assert!(
+        !err.to_string().contains("bob-secret"),
+        "must not echo the tenant: {err}"
+    );
+    assert_eq!(
+        code_of(&core, &mut session, "DROP INDEX xt_div"),
+        "42704",
+        "no declaration remains"
+    );
+    // 失敗行を消せば同名で作れる。
+    core.execute_sql_in_session(
+        &ctx_of("bob-secret"),
+        &mut allowed_session(),
+        "DELETE FROM xt WHERE id = 1 USING OPERATION_ID 'op-bob-del'",
+    )
+    .expect("delete");
+    run(&core, &mut session, "CREATE INDEX xt_div ON xt ((100 / n))").expect("now valid");
+}
+
+/// 明示トランザクション内の評価エラーは文を失敗させ、ROLLBACK 後に痕跡が残らない。
+#[test]
+fn failing_expression_inside_explicit_transaction_leaves_no_trace() {
+    let (_path, _guard, core, mut session) = dml_fixture("expr-index-dml-txn");
+    let caller = ctx();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "INSERT INTO xt (id, n, code) VALUES (1, 0, 'a') USING OPERATION_ID 'op-tx'",
+        )
+        .expect_err("failing expression");
+    assert_eq!(err.wire_code(), "22012");
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(
+        count_of(&core, &mut session, "SELECT id FROM xt LIMIT 100"),
+        0
+    );
+}
