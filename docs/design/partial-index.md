@@ -3,7 +3,7 @@
 対象: Issue #1653（親 #1652）。ポインタ: `docs/spec/04-behavior/indexing.md` INDEX-11・INDEX-10、
 `docs/spec/04-behavior/error-format.md` ERR-6（spec 本文は転記しない）。
 兄弟: #1654（格納・DML 維持）、#1655（述語の含意判定）、#1656（プランナ選択・EXPLAIN）、
-部分 UNIQUE は #1657。式索引の宣言側（[expression-index.md](expression-index.md)）と同じ形で、
+部分 UNIQUE は #1657（実装済み。「Issue #1657」節）。式索引の宣言側（[expression-index.md](expression-index.md)）と同じ形で、
 述語は解析・分類までを行い、決定的と判定した述語も最終ゲートで `0A000` にした（Issue #1654 で格納・DML
 維持を実装し、最終ゲートは未対応の組み合わせだけに縮小した。「Issue #1654」節を参照）。
 
@@ -42,7 +42,7 @@
 | SRF | `0A000` | `set-returning functions are not allowed in index predicates` |
 | 組み込み以外の関数 | `0A000` | `user-defined functions in index predicates are not supported` |
 | `visible()`・構文誤り・文末の余剰 | `42601` | 既存の構文エラー文言 |
-| 決定的な述語（#1654 まで。#1654 で縮小） | `0A000` | `partial indexes are not supported yet`（#1654 で撤去。現在の `0A000` は `partial unique indexes are not supported yet`・`partial indexes are not supported for this index kind yet`・`COLLATE on a partial index is not supported yet`・`partial index on a materialized view is not supported`） |
+| 決定的な述語（#1654 まで。#1654 で縮小） | `0A000` | `partial indexes are not supported yet`（#1654 で撤去。現在の `0A000` は `partial indexes are not supported for this index kind yet`・`COLLATE on a partial index is not supported yet`・`partial index on a materialized view is not supported`） |
 
 決定性の基準は式索引（INDEX-10）と同じ表を共有する（`sql::index_expr::IndexExprSite` が文言だけ切り替える）。
 型に依存する判定（時刻型の `CAST`・`TIMESTAMPTZ` 列とリテラルの比較等）は構文段では通し、束縛段（#1654）で
@@ -85,9 +85,9 @@ spec 本文は転記しない。実装は `sql::index_predicate`（束縛・評�
 | D4 | 述語は WHERE と同じ束縛（`bind_where_predicates`）・評価（`BoundOrGroup::matches`）を使い、第 2 の評価器を作らない。CHECK 用の束縛は使わない | 索引に入る行の集合と「`WHERE <述語>` が選ぶ行の集合」の一致が #1655・#1656 の前提 |
 | D5 | セッションに依存する述語は束縛段で `42P17`（固定文言）: 式葉の `check_bound_index_expression_determinism`・`TIMESTAMPTZ` 列と文字列リテラルの宣言的比較・日時の特殊値。`'now'` 等は束縛が `22007` で受理しない | 保存テキストは書き込みのたびに再束縛するため、セッション TZ・評価時刻で結果が変わる述語は決定的でない |
 | D6 | 予約列（`tenant_id`・`visibility`）・`visible()` を参照する述語は `42601`。疑似列 `id` は許可する | 共有カタログの永続宣言へテナント識別や可視性を埋め込ませない |
-| D7 | カタログ形式に新版 `v6` を追加する（`v1`〜`v5` のバイト列は不変。旧バイナリは `v6` を読めない）。非一意に限る | 部分 UNIQUE の強制は #1657 |
+| D7 | カタログ形式に新版 `v6` を追加する（`v1`〜`v5` のバイト列は不変。旧バイナリは `v6` を読めない）。非一意に限る | 部分 UNIQUE の強制は #1657 で `v7` として追加した（「Issue #1657」節） |
 | D8 | 派生構造 `PartialIndexEntries`（述語 TRUE のスロット `members` と、式要素の式キーを `members` だけで構築したもの）を `ScalarIndex` が持つ。起動時 opt-in 有効時のみ構築し、fail-soft（再束縛失敗・述語の評価エラー・予算超過・確保失敗のどれでも丸ごと作らない）。素の列要素のキー構造は作らない | #1648 の式キーの前例。消費者は #1656 まではテストだけ |
-| D9 | `0A000` のまま残す組み合わせ: `UNIQUE`＋`WHERE`・`USING hnsw`＋`WHERE`・`COLLATE`＋`WHERE`・matview への `WHERE`。最終ゲートと防御ゲートは「撤去」ではなく「縮小」した | 強制や照合の永続形が無いまま宣言を残すと fail-open になる |
+| D9 | `0A000` のまま残す組み合わせ（`UNIQUE`＋`WHERE` は #1657 で受理に変更）: `USING hnsw`＋`WHERE`・`COLLATE`＋`WHERE`・matview への `WHERE`。最終ゲートと防御ゲートは「撤去」ではなく「縮小」した | 強制や照合の永続形が無いまま宣言を残すと fail-open になる |
 | D10 | 列 DDL: `DROP COLUMN` は `referenced_columns()` が述語の参照列を含むため連鎖削除。`RENAME COLUMN` は保存テキストを再解析し AST 上の識別子を写像して再束縛し、参照列集合の一致を確認してから保存（失敗は `0A000`・txn 破棄）。述語・要素が参照する列への `ALTER COLUMN TYPE` は `0A000`（無変化） | 放置すると次の書き込みで保存テキストが再束縛できず `CorruptSchema` になる |
 
 ### `v6` の行構成（`\n` 区切り）
@@ -113,7 +113,7 @@ spec 本文は転記しない。実装は `sql::index_predicate`（束縛・評�
 | セッション依存の述語 | `42P17` |
 | 予約列・`visible()` | `42601` |
 | 述語の評価エラー（DML・作成時の既存行） | 評価エラー自身（0 除算 `22012` 等）。作成時は固定文言 |
-| 部分 UNIQUE・hnsw・COLLATE・matview・述語列の `ALTER TYPE` | `0A000` |
+| hnsw・COLLATE・matview・述語列の `ALTER TYPE`（部分 UNIQUE は #1657 で受理） | `0A000` |
 | 述語テキスト 4096 バイト超 | `54000` |
 
 ### テナント境界
@@ -138,7 +138,7 @@ spec 本文は転記しない。実装は `sql::index_predicate`（束縛・評�
 
 ### 対象外（後続）
 
-含意判定 #1655・プランナ選択と EXPLAIN #1656・部分 UNIQUE の強制 #1657・素の列要素のキー構造・部分索引への
+含意判定 #1655・プランナ選択と EXPLAIN #1656・部分 UNIQUE の強制 #1657（実装済み）・素の列要素のキー構造・部分索引への
 `COLLATE`／matview／`USING hnsw`・述語が参照する列の `ALTER COLUMN TYPE` の再束縛。`ON CONFLICT (...) WHERE` は
 SQL-49 ポインタのとおり `42601` のまま。
 
@@ -163,3 +163,61 @@ EXPLAIN・結果は変えない。公開 API の追加なし（`pub(crate)`）�
 `BoundIndexPredicate::conjunction`）。プリペアド文は具体値で束縛した後に毎回判定し、describe 用ダミー値での判定や
 判定結果の使い回しをしない。`false` のときは従来の経路へ。浮動小数・`CHAR(n)`・TEXT 範囲・`OR`/`NOT` の推論拡張は、
 オラクルテストを伴う別 Issue で扱う。
+
+## Issue #1657（部分 UNIQUE 索引）
+
+INDEX-11 (4)・INDEX-9 ポインタ。`CREATE UNIQUE INDEX ... WHERE <述語>` を受理し、述語が TRUE の行どうしの間
+でだけ一意性を強制する（テナントごと・NULLS DISTINCT・`23505`）。述語外（NULL・FALSE）の行どうし、および
+述語外と述語内の行の間の重複は許可する。作成時の既存行の重複検査も述語 TRUE の行だけが対象。
+
+### 判断
+
+| # | 判断 | 理由 |
+| - | ---- | ---- |
+| E1 | 永続形は新版 `v7`（`v6` の行構成のうち、参照列行と述語行の間に固定行 `unique` を挟む）。`v1`〜`v6` のバイト列は不変。旧バイナリは `v7` を読めない | `v4`→`v5` の前例と同じ。`unique` 行の欠落・別値・行順違い・`v6` への混入は `CorruptSchema` |
+| E2 | 部分 UNIQUE は UNIQUE 制約へ展開せず、索引カタログだけが持つ（式一意索引と同じ） | 展開すると述語外の行まで強制される。`ON CONFLICT` の推論対象・FK の参照先にもさせない |
+| E3 | 強制は既存の永続一意索引（`user_uniq/{table}`）に序数を足して行う。序数は 主キー → UNIQUE 制約 → 式一意索引 → 部分一意索引（各索引名の昇順） | 既存キーの序数・バイト列を変えない |
+| E4 | `UniqueKeyPlan::row_keys` は、部分一意索引の序数について述語が TRUE でなければキーなし（NULL を含む行と同じ概念）を返す | 登録・衝突検査・逆引きの後片付けに新しい概念が要らない。UPDATE の入場は新キーの衝突検査、退場は stale 判定で処理される |
+| E5 | 部分一意索引の述語・式要素は `UniqueKeyPlan::build` 内で保存テキストを再解析・再束縛して自前でコンパイルする（`sql::index_predicate::compile_stored_predicate` を DML ゲートと共有）。漂流は `CorruptSchema` | 部分索引の式要素は全行評価の対象外（`decls.keys` に入らない）ため。第 2 の束縛経路を作らない |
+| E6 | `unique_index::FORMAT_VERSION` を 3 から 4 へ上げ、`schema_signature` に索引名・述語の正規化 SQL・要素の署名を足す | bump しないと既存テナントのマーカーが構築済みと誤認され、新序数が未バックフィルのまま強制漏れ（fail-open）になる。代償は各テナント・表で初回書き込み時に 1 回だけの再構築 |
+| E7 | 作成時は「既存行の述語・式要素の検証 → 述語 TRUE の行だけのテナントごとの重複走査」の順。重複は `23505`（固定文言） | 述語の評価エラーが重複より先に報告される（DML の検査順と一致）。キーは `row_keys` の 1 経路だけで計算する |
+| E8 | 前提ゲートは式一意索引と同じ `check_unique_index_gate`（素の列の型ゲート・制約名前空間の衝突） | INDEX-9 と同じ規則 |
+| E9 | `DeclaredPartialIndex` に `unique` を追加。`partials` には一意・非一意の両方を入れ続ける | DML ゲートと派生キーは一意性に関係なく必要 |
+| E10 | `DROP INDEX`・`DROP COLUMN`・`RENAME COLUMN` は制約を介さず `user_uniq` を失効させる分岐へ。`catalog::dependency` の `index_children` は述語付き一意索引を FK の参照先にしない | 対応する UNIQUE 制約が無いため（無いと `CorruptSchema`） |
+
+### `v7` の行構成（`\n` 区切り）
+
+`v7` / テーブル / `scalar` / 列 CSV / 照合行（全 `-`）/ 式行 / 参照列行 / `unique` / 述語 hex / 述語の参照列 CSV。
+
+### SQLSTATE
+
+| 区分 | SQLSTATE |
+| ---- | -------- |
+| 述語内の重複（DML・作成時の既存行） | `23505`（固定文言。値・テナント・行 id・件数を含まない） |
+| 述語・式要素の評価エラー | 評価エラー自身（作成時は重複より先に報告） |
+| 素の列の型ゲート・制約名の衝突 | 式一意索引と同じ |
+| `ON CONFLICT (列)` が部分一意索引しか無い列を指す | `42P10`（推論対象外） |
+| `ON CONFLICT (...) WHERE` | `42601`（SQL-49 ポインタ。従来どおり） |
+| hnsw・COLLATE・matview・述語列の `ALTER TYPE` | `0A000`（従来どおり） |
+
+### テナント境界
+
+- 永続一意索引のキーの第 1 要素は常にサーバー側導出のテナント。DML の検査は自テナント行だけを読み戻す。
+- 作成時の走査は DDL 権限ゲート（`42501`）の後の運用者操作で、テナントが変わるたびに集合をリセットする
+  （他テナントの同値を重複としない）。応答は固定文言で、他テナントの存在を示さない。
+
+### PostgreSQL との差
+
+部分 UNIQUE 索引は `ON CONFLICT (列) WHERE <述語>` の推論対象にならない（対象外のまま `42601`）。述語なしの
+`ON CONFLICT (列)` が部分一意索引を仲裁に使わない点は PostgreSQL と同じ。
+
+### 検証
+
+`crates/engine/tests/sql_partial_unique_index.rs`（述語内外の重複・入退場・NULL・作成時検査・評価エラーの順序・
+式要素・テナント・再オープン・列 DDL・`ON CONFLICT`）、`catalog` 単体テスト（`v7` の往復と破損）、
+`wire_index_ddl.rs`（wire 経由の `23505`）、クラッシュ整合は `make crash-test-unique-index`（`docs_pidx` 表）。
+
+### 対象外（後続）
+
+プランナ選択と EXPLAIN（#1656）・述語参照列の `ALTER COLUMN TYPE` の再束縛・`USING hnsw`／`COLLATE`／matview との
+組み合わせ。
