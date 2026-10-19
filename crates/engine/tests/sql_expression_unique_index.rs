@@ -787,3 +787,48 @@ fn alter_type_evaluation_error_is_rejected_with_the_sqlstate() {
     assert_eq!(err.wire_code(), "22012", "{err}");
     insert_n(&core, &mut s, "alice", 2, 4).expect("table is unchanged");
 }
+
+#[test]
+fn constraint_additions_collide_with_unique_index_name() {
+    let (core, path, mut s) = setup("xuidx-name-collision");
+    let _g = CleanupGuard(path);
+    exec(
+        &core,
+        &mut s,
+        "owner",
+        "CREATE UNIQUE INDEX u ON docs ((lower(a)))",
+    )
+    .expect("create");
+    for (sql, expected) in [
+        ("ALTER TABLE docs ADD CONSTRAINT u UNIQUE (b)", "42P07"),
+        (
+            "ALTER TABLE docs ADD CONSTRAINT u CHECK (b <> 'x')",
+            "42710",
+        ),
+    ] {
+        assert_eq!(code(&core, &mut s, "owner", sql), expected, "{sql}");
+    }
+}
+
+#[test]
+fn alter_type_of_bare_unique_element_to_disallowed_type_is_rejected() {
+    let (core, path, mut s) = setup("xuidx-alter-bare-type");
+    let _g = CleanupGuard(path);
+    exec(
+        &core,
+        &mut s,
+        "owner",
+        "CREATE UNIQUE INDEX u ON docs ((lower(a)), b)",
+    )
+    .expect("create");
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "owner",
+            "ALTER TABLE docs ALTER COLUMN b TYPE time USING NULL"
+        ),
+        "0A000"
+    );
+    insert_ab(&core, &mut s, "alice", 1, "x", "y").expect("table is unchanged");
+}

@@ -2170,6 +2170,29 @@ fn validate_dependents_statically_in_txn(
                 if def.table != table_name || !def.columns.iter().any(|c| c == column_name) {
                     continue;
                 }
+                // 一意索引の素の列要素は作成時の型ゲート（`check_unique_index_gate`）と同じ基準で
+                // 再検証する（Issue #1651）。許可型外へ変えると後続 INSERT が正準キー化で
+                // `XX000` になるため commit 前に `0A000` で拒否する。
+                if def.unique {
+                    let bare_disallowed = def
+                        .columns
+                        .iter()
+                        .zip(&def.expressions)
+                        .filter(|(c, e)| e.is_none() && c.as_str() == column_name)
+                        .any(|_| {
+                            !new_schema
+                                .columns
+                                .iter()
+                                .find(|c| c.name == column_name)
+                                .is_some_and(|c| c.ty.is_unique_constraint_allowed())
+                        });
+                    if bare_disallowed {
+                        return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                            detail: "the new column type cannot be used by an existing index"
+                                .to_string(),
+                        }));
+                    }
+                }
                 match validate_index_columns(&def, new_schema) {
                     Ok(()) => {}
                     Err(CatalogError::IndexKindMismatch(_)) => {
@@ -11836,6 +11859,11 @@ impl Storage {
                 if name_collides_with_primary_key(&schema, table_name, n) {
                     return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
                 }
+                // 一意索引（式索引を含む）との名前衝突（Issue #1651）。索引カタログ側の
+                // 同名と制約が併存すると DROP CONSTRAINT で外せなくなるため双方向で拒否する。
+                if unique_index_def_for_table_in_txn(&write_txn, table_name, n)? {
+                    return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
+                }
             }
             if schema.unique_constraints.len() >= MAX_UNIQUE_CONSTRAINTS {
                 return Err(CatalogError::ConstraintLimitExceeded(format!(
@@ -11961,7 +11989,9 @@ impl Storage {
                     .foreign_keys
                     .iter()
                     .any(|f| f.name() == confirmed_name);
-            if name_collides {
+            if name_collides
+                || unique_index_def_for_table_in_txn(&write_txn, table_name, &confirmed_name)?
+            {
                 return Err(CatalogError::ConstraintAlreadyExists(confirmed_name));
             }
 
@@ -12378,6 +12408,12 @@ impl Storage {
                         CatalogError::ConstraintAlreadyExists(n.clone()),
                     ));
                 }
+                // 一意索引（式索引を含む）との名前衝突（Issue #1651）。
+                if unique_index_def_for_table_in_txn(&write_txn, table_name, n)? {
+                    return Err(AlterCheckError::Catalog(
+                        CatalogError::ConstraintAlreadyExists(n.clone()),
+                    ));
+                }
             }
             if schema.checks.len() >= MAX_CHECK_CONSTRAINTS_PER_TABLE {
                 return Err(AlterCheckError::Catalog(
@@ -12515,6 +12551,11 @@ impl Storage {
                 }
                 // 主キーの導出擬似名との衝突（Issue #1196）。
                 if name_collides_with_primary_key(&schema, table_name, n) {
+                    return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
+                }
+                // 一意索引（式索引を含む）との名前衝突（Issue #1651）。索引カタログ側の
+                // 同名と制約が併存すると DROP CONSTRAINT で外せなくなるため双方向で拒否する。
+                if unique_index_def_for_table_in_txn(&write_txn, table_name, n)? {
                     return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
                 }
             }
