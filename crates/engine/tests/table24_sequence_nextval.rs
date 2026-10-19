@@ -102,6 +102,55 @@ fn column_n(core: &EngineCore, tenant: &str) -> Vec<i64> {
     rows.into_iter().map(|(_, n)| n).collect()
 }
 
+/// 採番の印の列は仮値 `Null` で運ばれるが、INSERT バイト量上限（INDEX-4）には固定幅で計上される
+/// （codex-review P1）。BIGINT 列だけの複数行 VALUES が上限超過で `54000` に拒否され、
+/// 採番（値の消費）も行の書き込みも起きない。
+#[test]
+fn nextval_columns_count_toward_insert_byte_limit() {
+    let path = unique_db_path("table24-nextval-byte-limit");
+    let _guard = CleanupGuard(path.clone());
+    let core = open_core(&path).with_batch_limits(engine::batch_limits::BatchLimits {
+        max_batch_total_bytes: 16,
+        ..engine::batch_limits::BatchLimits::default()
+    });
+    let mut s = ddl_session();
+    ok(&core, "sys", &mut s, "CREATE SEQUENCE s");
+    ok(&core, "sys", &mut s, "CREATE TABLE t (n BIGINT)");
+    ok(
+        &core,
+        "sys",
+        &mut s,
+        "CREATE TABLE d (k BIGINT DEFAULT nextval('s'), tag TEXT)",
+    );
+
+    // 3 行 x 8 バイト = 24 バイトが上限 16 を超える。
+    assert_eq!(
+        code(
+            &core,
+            "sys",
+            &mut s,
+            "INSERT INTO t (id, n) VALUES (1, nextval('s')), (2, nextval('s')), (3, nextval('s')) \
+             USING OPERATION_ID 'op-big'"
+        ),
+        "54000"
+    );
+    // DEFAULT nextval の省略列も計上される（3 行 x (8 + 4) バイト）。
+    assert_eq!(
+        code(
+            &core,
+            "sys",
+            &mut s,
+            "INSERT INTO d (id, tag) VALUES (1, 'a'), (2, 'b'), (3, 'c') \
+             USING OPERATION_ID 'op-dflt'"
+        ),
+        "54000"
+    );
+    assert!(column_n(&core, "sys").is_empty());
+    // 上限内（1 行 8 バイト）なら成功し、拒否された文は値を消費していない。
+    ok(&core, "sys", &mut s, &insert_next(1, "op-small"));
+    assert_eq!(column_n(&core, "sys"), vec![1]);
+}
+
 fn insert_next(id: u64, op: &str) -> String {
     format!("INSERT INTO t (id, n) VALUES ({id}, nextval('s')) USING OPERATION_ID '{op}'")
 }

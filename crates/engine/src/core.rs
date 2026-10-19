@@ -10133,6 +10133,25 @@ impl EngineCore {
                     )
                 })?;
             }
+            // 採番の印（`nextval`／`currval`・`DEFAULT nextval`）の列は仮値 `Null`（0 バイト計上）で
+            // 運ばれるが、書き込み時は整数 1 値が入る。採番せずに固定幅の上限（BIGINT 相当の 8 バイト。
+            // SMALLINT／INTEGER 列でも上限側へ倒す fail-closed）を計上し、INDEX-4 の行別・バッチ合計
+            // バイト上限を迂回できないようにする（Issue #1690・codex-review P1）。
+            for volatile in &bound.volatile_default_columns {
+                if matches!(
+                    volatile,
+                    crate::sql::parser::VolatileColumn::Sequence(..)
+                        | crate::sql::parser::VolatileColumn::DefaultSequence(_)
+                ) {
+                    row_bytes = row_bytes
+                        .checked_add(std::mem::size_of::<i64>())
+                        .ok_or_else(|| {
+                            crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                                "INSERT batch row byte size overflow",
+                            )
+                        })?;
+                }
+            }
             shapes.push((0, row_bytes));
         }
         crate::batch_limits::validate_batch_shape(&shapes, &self.batch_limits).map_err(|e| {
