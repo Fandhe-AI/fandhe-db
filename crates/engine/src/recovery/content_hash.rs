@@ -147,6 +147,9 @@ enum OpTag {
     /// 既定値のため従来の [`OpTag::Truncate`]／[`OpTag::TruncateMulti`] を使い、CASCADE だけを
     /// 別ドメインに分離する。[`for_truncate_tables_cascade`] 参照。
     TruncateCascade = 18,
+    /// ビュー経由の書き込み（TABLE-43・Issue #1671）用。基表への直接の書き込みと別ドメインに
+    /// 分離するため、内側の内容ハッシュへビュー名を被せる。[`for_view_write`] 参照。
+    ViewWrite = 19,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -1115,6 +1118,18 @@ pub(crate) fn for_update_encoded(id: u64, encoded_row: &[u8]) -> Result<ContentH
 pub(crate) fn for_update(id: u64, row: &RowInput<'_>) -> Result<ContentHash, StorageError> {
     let encoded = encode_row(row)?;
     for_update_encoded(id, &encoded)
+}
+
+/// ビュー経由の書き込み（`INSERT INTO <view>`。TABLE-43・Issue #1671）の内容ハッシュ。基表形の
+/// 内容ハッシュ `inner` へビュー名を新しいドメインとして被せる。同じ `operation_id` と同じ値でも、
+/// ビュー経由の文と基表への直接の文は別ハッシュになり（再送の取り違えは `22023`）、ビュー経由の
+/// 同一再送は同一ハッシュになる（`23505`）。`recovery::ledger::record_in_txn_accepting` だけが呼ぶ。
+pub(crate) fn for_view_write(view_name: &str, inner: &ContentHash) -> ContentHash {
+    let mut b = HashInputBuilder::new(OpTag::ViewWrite);
+    b.push_u64(view_name.len() as u64);
+    b.push_raw(view_name.as_bytes());
+    b.push_raw(inner.as_bytes());
+    b.finish()
 }
 
 /// `delete_row_unchecked` 用（TASK-101 対象経路 5）。入力: `id` のみ（削除要求は
@@ -2506,6 +2521,27 @@ fn dml_binop_tag(op: crate::sql::udf_call::BinOp) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ビュー経由の書き込みのハッシュ（TABLE-43・Issue #1671）は決定的で、基表への直接の文・
+    /// 別のビュー・別の内容と衝突しない。
+    #[test]
+    fn view_write_hash_is_deterministic_and_domain_separated() {
+        let inner = ContentHash::for_test(b"row");
+        let other = ContentHash::for_test(b"row2");
+        let a = for_view_write("v", &inner);
+        assert_eq!(a, for_view_write("v", &inner));
+        assert_ne!(a, inner, "must differ from the direct write's hash");
+        assert_ne!(
+            a,
+            for_view_write("w", &inner),
+            "view name is part of the domain"
+        );
+        assert_ne!(
+            a,
+            for_view_write("v", &other),
+            "inner content is part of the hash"
+        );
+    }
 
     /// 揮発性 DEFAULT 形（`*Expr`）のハッシュは構文形で決まり、評価値に依存しない
     /// （SQL-37・Issue #1587、設計 D1・D2・D3）。`now()` と `CURRENT_TIMESTAMP` は別内容、

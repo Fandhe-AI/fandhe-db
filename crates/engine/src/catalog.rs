@@ -4947,6 +4947,23 @@ fn replace_fingerprint(
     Ok(out)
 }
 
+/// [`Storage::view_write_fingerprint`] と同じ指紋を、書き込み txn 内の最新カタログから再計算する
+/// （`tenant::WriteTarget::with_txn` が `sql::view_write_scope` 経由で呼び、書き換え時点の指紋と
+/// 照合する。TABLE-43・Issue #1671）。テーブルのハンドルは関数内で閉じ、呼び出し元の以降の
+/// `open_table` と衝突させない。
+pub(crate) fn view_write_fingerprint_in_txn(
+    write_txn: &redb::WriteTransaction,
+    view_name: &str,
+) -> Result<Vec<u8>> {
+    let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+    let views_table = write_txn.open_table(VIEWS_TABLE)?;
+    replace_fingerprint(
+        vec![view_name.to_string()],
+        &|n| Ok(catalog_table.get(n)?.map(|g| g.value().to_vec())),
+        &|n| Ok(views_table.get(n)?.map(|g| g.value().to_vec())),
+    )
+}
+
 /// 置換前後の本文（旧定義があれば旧本文も）が読む relation 群（指紋探索の起点）。
 fn replace_fingerprint_starts(
     name: &str,
@@ -14213,6 +14230,36 @@ impl Storage {
         )
     }
 
+    /// ビューへの書き込み（`INSERT INTO <view>`。TABLE-43・Issue #1671）の書き換え時点で、ビュー連鎖の
+    /// 各定義と終端の基表スキーマの指紋をスナップショット読み取りで返す。書き込み txn 内で
+    /// [`view_write_fingerprint_in_txn`] が同じ指紋を再計算して照合し、書き換え後に定義が変わった
+    /// ときは書き込まずに中断する（Parse／Execute の分離と並行 DDL に対する TOCTOU 回避）。
+    /// 指紋の材料は `CREATE OR REPLACE VIEW` と同じ [`replace_fingerprint`]（第 2 実装を作らない）。
+    pub(crate) fn view_write_fingerprint(&self, view_name: &str) -> Result<Vec<u8>> {
+        let read_txn = self.db().begin_read()?;
+        let catalog_table = match read_txn.open_table(CATALOG_TABLE) {
+            Ok(t) => Some(t),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let views_table = match read_txn.open_table(VIEWS_TABLE) {
+            Ok(t) => Some(t),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        replace_fingerprint(
+            vec![view_name.to_string()],
+            &|n| match &catalog_table {
+                Some(t) => Ok(t.get(n)?.map(|g| g.value().to_vec())),
+                None => Ok(None),
+            },
+            &|n| match &views_table {
+                Some(t) => Ok(t.get(n)?.map(|g| g.value().to_vec())),
+                None => Ok(None),
+            },
+        )
+    }
+
     /// 新本文 `body_sql` がビュー `name` 自身へ（ビュー連鎖を介して）到達するか
     /// （`CREATE OR REPLACE VIEW` の自己参照・循環検査。Issue #1660）。互換性検査より前に
     /// 判定して `42P17` を優先させるための読み取り版で、置換時の write txn 内の検査とは別に
@@ -15680,6 +15727,57 @@ mod tests {
             assert!(!column_default_compatible_with_tag(&default, bad_tag));
             assert!(!default.compatible_with(&ColumnType::Text));
         }
+    }
+
+    /// ビュー書き込みの指紋（TABLE-43・Issue #1671）: 読み取り版と同一 write txn 版が同じ指紋を返し、
+    /// ビュー定義の置換・基表スキーマの変更で変わる。書き込み txn 内の照合は不一致で
+    /// `ViewDefinitionChanged` を返し、スコープの `mismatched` を立てる。
+    #[test]
+    fn view_write_fingerprint_tracks_chain_definitions() {
+        let path = unique_db_path("catalog-view-write-fingerprint");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "base",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("lang", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create base");
+        storage
+            .create_view("v", "base", "SELECT * FROM base")
+            .expect("create view");
+
+        let read_fp = storage
+            .view_write_fingerprint("v")
+            .expect("read fingerprint");
+        let txn = storage.begin_write_txn().expect("begin write");
+        let txn_fp = view_write_fingerprint_in_txn(&txn, "v").expect("txn fingerprint");
+        assert_eq!(read_fp, txn_fp);
+
+        // 一致するスコープでは照合を通り、不一致のスコープでは `ViewDefinitionChanged`。
+        {
+            let scope = crate::sql::view_write_scope::ViewWriteScope::enter("v", read_fp.clone());
+            crate::sql::view_write_scope::verify_in_txn(&txn).expect("same fingerprint");
+            assert!(!scope.mismatched());
+        }
+        {
+            let scope = crate::sql::view_write_scope::ViewWriteScope::enter("v", vec![0]);
+            let err =
+                crate::sql::view_write_scope::verify_in_txn(&txn).expect_err("stale fingerprint");
+            assert!(matches!(err, CatalogError::ViewDefinitionChanged(_)));
+            assert!(scope.mismatched());
+        }
+        drop(txn);
+
+        // 連鎖の定義が変わる（ビューの削除）と指紋が変わる。
+        storage.drop_view("v").expect("drop view");
+        let after = storage
+            .view_write_fingerprint("v")
+            .expect("fingerprint after drop");
+        assert_ne!(read_fp, after);
     }
 
     /// 精度範囲外の時刻 DEFAULT は永続化前に拒否され、何も作られない（fail-closed）。

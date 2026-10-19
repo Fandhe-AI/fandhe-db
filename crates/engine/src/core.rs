@@ -1518,6 +1518,10 @@ pub enum ParsedSql {
     /// `INSERT`（単一行・複数行 `VALUES`・`ON CONFLICT`・`RETURNING` を含む。
     /// SQL-10・SQL-16・SQL-20・SQL-21）。
     Insert(crate::sql::allowlist::ValidatedInsert),
+    /// 自動更新可能なビューへの `INSERT`（TABLE-43・Issue #1671）。送られた文の形のまま保持し、
+    /// 基表への書き換えは Execute／Describe 時に現在のカタログで行う（Parse と Execute の間の
+    /// `CREATE OR REPLACE VIEW`／`DROP VIEW` を取り込む）。自動更新不可のビューは Parse で `55000`。
+    ViewInsert(crate::sql::allowlist::ValidatedViewInsert),
     /// `TRUNCATE TABLE ... USING OPERATION_ID '<id>'`（SQL-22）。
     Truncate(crate::sql::allowlist::ValidatedTruncate),
     /// `DELETE`（単一行・`id` 完全一致形／述語形。SQL-18・SQL-19）。
@@ -1718,6 +1722,7 @@ fn statement_clock_scope(
         }
         ParsedSql::Statement(_)
         | ParsedSql::Insert(_)
+        | ParsedSql::ViewInsert(_)
         | ParsedSql::Delete(_)
         | ParsedSql::Update(_) => true,
         ParsedSql::Truncate(_)
@@ -1766,7 +1771,7 @@ fn insert_default_clock_scope(
         ParsedSql::SessionRouted(routed) => {
             return insert_default_clock_scope(routed.inner(), txn_start_micros)
         }
-        ParsedSql::Insert(_) => true,
+        ParsedSql::Insert(_) | ParsedSql::ViewInsert(_) => true,
         ParsedSql::Statement(_)
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
@@ -1912,6 +1917,7 @@ fn table_schemas_in(
 fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
     match parsed {
         ParsedSql::Insert(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
+        ParsedSql::ViewInsert(stmt) => stmt.operation_id().map(|id| id.as_str()),
         ParsedSql::Truncate(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
         ParsedSql::Delete(crate::sql::allowlist::DeleteStatement::SingleRow(v)) => {
             v.operation_id.as_ref().map(|id| id.as_str())
@@ -3841,8 +3847,9 @@ impl EngineCore {
     /// [`Self::reclassify_write_to_view_error`] の文種別つき版（TABLE-43 (3)・Issue #1670）。
     /// `op` が `Some`（`INSERT`／`UPDATE`／`DELETE`）で対象がビューのとき、自動更新可能性を
     /// `sql::view_updatable` で判定し、自動更新不可なら `55000`
-    /// （`ViewNotAutoUpdatable`）で拒否する。自動更新可能なビューは基表への書き換えが入る
-    /// まで（Issue #1671／#1672）従来どおり `42809`（fail-closed）。`op` が `None`
+    /// （`ViewNotAutoUpdatable`）で拒否する。自動更新可能なビューは、INSERT なら
+    /// `parse_tokens` が先に `ParsedSql::ViewInsert` として受理する（Issue #1671）ため本関数には来ない。
+    /// UPDATE／DELETE は基表への書き換えが入る（Issue #1672）まで従来どおり `42809`（fail-closed）。`op` が `None`
     /// （`TRUNCATE`・`EXPLAIN` 系）は常に従来の `42809`。判定自体の失敗（破損 `XX000`・深さ超過
     /// `54000` 等）はそのまま返し、「ビューではない」側へは倒さない。
     fn reclassify_write_to_view_error_for(
@@ -4230,19 +4237,29 @@ impl EngineCore {
                 hits.temp_cell(),
             )
             .with_persistent_hit(hits.persistent_cell());
-            let stmt = crate::sql::allowlist::validate_insert_tokens_with_limit(
+            // 構造検証 → 存在確認の順序は `validate_insert_tokens_with_limit` と同じ。INTO の名前が
+            // 表でなくビューなら、自動更新可能なものに限りビューへの INSERT として受理する
+            // （TABLE-43・Issue #1671。書き換えは Execute 時）。
+            let stmt = crate::sql::allowlist::parse_insert_shape_tokens_with_limit(
                 &tokens,
-                &lookup,
                 ledger_mode,
                 self.dml_limits.max_insert_rows_per_statement,
-            )
-            .map_err(|e| {
-                self.reclassify_write_to_view_error_for(
-                    Some(crate::sql::allowlist::ViewWriteOp::Insert),
-                    e,
-                )
-            })?;
-            return Ok(ParsedSql::Insert(stmt));
+            )?;
+            if crate::sql::allowlist::TableLookup::table_exists(&lookup, &stmt.table_name)? {
+                return Ok(ParsedSql::Insert(stmt));
+            }
+            if matches!(self.storage.view_definition(&stmt.table_name), Ok(Some(_))) {
+                let view_stmt = crate::sql::allowlist::ValidatedViewInsert::new(stmt);
+                // 自動更新不可は `55000`、判定・解決の失敗はそのまま返す（fail-closed）。
+                crate::sql::view_insert::check_view_insert(&self.storage, &view_stmt)?;
+                return Ok(ParsedSql::ViewInsert(view_stmt));
+            }
+            // 表でもビューでもない名前は従来どおり（索引・matview は `42809`、その他は `42P01`）。
+            // 照会の失敗は再照会する `reclassify_write_to_view_error_for` が `XX000` へ写す。
+            return Err(self.reclassify_write_to_view_error_for(
+                Some(crate::sql::allowlist::ViewWriteOp::Insert),
+                crate::sql::allowlist::SqlSurfaceError::undefined_table(stmt.table_name),
+            ));
         }
 
         let is_truncate_statement = matches!(
@@ -5067,6 +5084,13 @@ impl EngineCore {
                 )?;
                 Ok(crate::sql::SqlOutcome::Insert(outcome))
             }
+            ParsedSql::ViewInsert(stmt) => self
+                .execute_view_insert(
+                    || crate::tenant::WriteTarget::Autocommit(&self.storage),
+                    ctx,
+                    stmt,
+                )
+                .map(|(outcome, _base_table)| outcome),
             ParsedSql::Truncate(stmt) => {
                 let outcome = self.execute_truncate_form(ctx, stmt)?;
                 Ok(crate::sql::SqlOutcome::Truncate(outcome))
@@ -5591,6 +5615,20 @@ impl EngineCore {
                     )
                 };
                 txn.mark_written(ctx.tenant_id(), &stmt.table_name);
+                Ok(outcome)
+            }
+            // ビューへの INSERT（TABLE-43・Issue #1671）。基表形へ書き換えて同じフォーム関数へ
+            // `InTxn` を渡す。台帳・`mark_written` は基表の単位（ビュー名ではない）。
+            ParsedSql::ViewInsert(stmt) => {
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let (outcome, base_table) = self.execute_view_insert(
+                    || crate::tenant::WriteTarget::InTxn(write_txn),
+                    ctx,
+                    stmt,
+                )?;
+                txn.mark_written(ctx.tenant_id(), &base_table);
                 Ok(outcome)
             }
             ParsedSql::Delete(stmt) => {
@@ -6346,6 +6384,27 @@ impl EngineCore {
                         &projection,
                         &schema,
                     )?)),
+                    None => Ok(None),
+                }
+            }
+            // ビューへの INSERT（TABLE-43・Issue #1671）: 現在のカタログで書き換え、`RETURNING` の
+            // 列メタは基表の型で導き、列名だけビューの公開名へ上書きする。
+            ParsedSql::ViewInsert(stmt) => {
+                let rewritten = crate::sql::view_insert::rewrite_view_insert(&self.storage, stmt)?;
+                let (_read_txn, schema) =
+                    self.read_txn_with_schema(&rewritten.insert.table_name)?;
+                match crate::sql::parser::bind_returning(
+                    rewritten.insert.returning.as_ref(),
+                    &schema,
+                )? {
+                    Some(projection) => {
+                        let mut columns = crate::sql::returning::column_meta(&projection, &schema)?;
+                        crate::sql::view_insert::apply_public_names(
+                            &mut columns,
+                            rewritten.public_names.as_deref(),
+                        );
+                        Ok(Some(columns))
+                    }
                     None => Ok(None),
                 }
             }
@@ -10224,6 +10283,60 @@ impl EngineCore {
             &stmt,
             &lookup,
         )
+    }
+
+    /// ビューへの `INSERT`（TABLE-43・Issue #1671）の実行本体。autocommit 腕・明示トランザクション腕
+    /// から呼ばれる。現在のカタログでビューを基表形の INSERT へ書き換え
+    /// （[`crate::sql::view_insert::rewrite_view_insert`]）、既存の基表 INSERT 経路
+    /// （[`Self::execute_insert_form`]／[`Self::execute_insert_returning_form`]）へ流す。制約・
+    /// `--max-insert-rows`・INDEX-4 上限・テナント所有・台帳は基表への書き込みと同じ。
+    ///
+    /// 書き換え後に並行 DDL でビュー連鎖・基表スキーマが変わる TOCTOU は、書き換えの**前に**取った
+    /// 指紋（[`Storage::view_write_fingerprint`]）を [`crate::sql::view_write_scope`] 経由で書き込み
+    /// txn の冒頭に照合して検出する（不一致は書き込み前に中断。`CREATE OR REPLACE VIEW` と同じ型の
+    /// 上限つき再試行。上限到達は `55P03`）。明示トランザクションでも照合は書き込み前に失敗するため、
+    /// 共有 write txn は汚れず再試行できる。`make_target` は試行ごとに書き込み先を作る。
+    /// 戻り値の第 2 要素は書き換え後の基表名（`mark_written` 用）。
+    fn execute_view_insert<'t>(
+        &self,
+        make_target: impl Fn() -> crate::tenant::WriteTarget<'t>,
+        ctx: &PolicyContext,
+        stmt: &crate::sql::allowlist::ValidatedViewInsert,
+    ) -> Result<(crate::sql::SqlOutcome, String), crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
+        // 並行 DDL による再試行の上限（`CREATE OR REPLACE VIEW` の再試行と同じ小さな固定値の考え方）。
+        const MAX_ATTEMPTS: usize = 8;
+        for _ in 0..MAX_ATTEMPTS {
+            // 指紋を先に取る: 書き換えが指紋より新しい状態を読んでも照合が不一致になるだけで
+            // （再試行）、古い状態で書き込まれることはない。
+            let fingerprint = self
+                .storage
+                .view_write_fingerprint(stmt.view_name())
+                .map_err(crate::catalog::table_lookup_error)?;
+            let rewritten = crate::sql::view_insert::rewrite_view_insert(&self.storage, stmt)?;
+            let base_table = rewritten.insert.table_name.clone();
+            let scope =
+                crate::sql::view_write_scope::ViewWriteScope::enter(stmt.view_name(), fingerprint);
+            let lookup = InsertSchemaLookup::new(&self.storage);
+            let result = if rewritten.insert.returning.is_some() {
+                self.execute_insert_returning_form(make_target(), ctx, &rewritten.insert, &lookup)
+                    .map(|mut outcome| {
+                        crate::sql::view_insert::apply_public_names(
+                            &mut outcome.result.columns,
+                            rewritten.public_names.as_deref(),
+                        );
+                        crate::sql::SqlOutcome::Returning(outcome)
+                    })
+            } else {
+                self.execute_insert_form(make_target(), ctx, &rewritten.insert, &lookup)
+                    .map(crate::sql::SqlOutcome::Insert)
+            };
+            if scope.mismatched() {
+                continue;
+            }
+            return result.map(|outcome| (outcome, base_table));
+        }
+        Err(SqlSurfaceError::LockNotAvailable)
     }
 
     /// [`Self::execute_insert_sql`]・[`Self::execute_sql_in_session`] の

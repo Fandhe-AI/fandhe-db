@@ -4288,6 +4288,11 @@ pub(crate) fn map_write_error(
         // ロック競合とサーバー内部エラーを判別できなくなる。`catalog::table_lookup_error`・
         // `tenant::ClassifiedError` と同じ写像先（codex-review 指摘）。
         TenantWriteError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        // ビュー経由の INSERT（TABLE-43・Issue #1671）で、書き換え後にビュー連鎖・基表スキーマが変わった
+        // （通常は core の再試行が吸収する。上限到達時は `CREATE OR REPLACE VIEW` と同じ `55P03`）。
+        TenantWriteError::Catalog(CatalogError::ViewDefinitionChanged(_)) => {
+            SqlSurfaceError::LockNotAvailable
+        }
         // `RETURNING` 句（Issue #873・SQL-21）の捕捉行投影が容量上限超過で失敗した
         // （[`execute_delete_returning`] の `project` コールバック。commit **前**に
         // 検出し `write_txn` を abort させる設計のため、この写像に到達する時点で

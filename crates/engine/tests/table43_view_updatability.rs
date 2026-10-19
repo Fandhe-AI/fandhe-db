@@ -5,7 +5,7 @@
 //! `table18_view.rs` と同じ流儀（実 `Storage`＋`EngineCore::execute_sql_in_session`）。
 //! 検証する契約: (1) 自動更新不可（評価後射影形）ビューへの `INSERT`／`UPDATE`／`DELETE` は
 //! 文種別ごとの固定文言の `55000` で、行・台帳に副作用が無い (2) 自動更新可能な単純形ビューは
-//! 基表への書き換えが入る（Issue #1671／#1672）まで従来どおり `42809` (3) `TRUNCATE`・matview・
+//! `INSERT` は基表へ書き換わる（Issue #1671。`table43_view_insert.rs`）、`UPDATE`／`DELETE` は書き換え（Issue #1672）まで従来どおり `42809` (3) `TRUNCATE`・matview・
 //! 索引名への書き込みは `42809` のまま (4) 応答は閲覧テナントに依存しない。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -182,9 +182,10 @@ fn chain_over_buffered_view_is_not_updatable() {
     assert_not_updatable(&e, "cannot delete from view");
 }
 
-/// 自動更新可能な単純形ビューは、書き換え実装（Issue #1671／#1672）までは従来どおり `42809`。
+/// 自動更新可能な単純形ビューへの `UPDATE`／`DELETE` は、書き換え実装（Issue #1672）までは
+/// 従来どおり `42809`。`INSERT` は Issue #1671 で基表へ書き換わる（`table43_view_insert.rs`）。
 #[test]
-fn simple_view_writes_stay_42809_until_rewrite_lands() {
+fn simple_view_update_delete_stay_42809_until_rewrite_lands() {
     let (core, _g) = open_core("t43-simple");
     ddl(
         &core,
@@ -192,7 +193,6 @@ fn simple_view_writes_stay_42809_until_rewrite_lands() {
     );
     let before = ids(&core, "alice");
     for sql in [
-        "INSERT INTO sv (id, embedding, lang, body) VALUES (200, '[1,1]', 'ja', 'x') USING OPERATION_ID 'op-t43-s1'",
         "UPDATE sv SET body = 'y' WHERE id = 1 USING OPERATION_ID 'op-t43-s2'",
         "DELETE FROM sv WHERE id = 1 USING OPERATION_ID 'op-t43-s3'",
     ] {
