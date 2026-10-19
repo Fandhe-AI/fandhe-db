@@ -276,6 +276,53 @@ pub(crate) fn check_index_expression_determinism(expr: &Expr) -> Result<(), SqlS
     }
 }
 
+/// 式木のどこかに `COLLATE` を含むかを再帰的に判定する（式索引は照合を永続形に持たないため、
+/// 最上位だけでなく入れ子の `lower(col COLLATE "C")` も fail-closed で拒否する根拠）。
+/// `Expr` の全 variant を網羅する（variant 追加時にコンパイルエラーで漏れに気づく）。
+pub(crate) fn expr_contains_collate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Collate { .. } => true,
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Ident(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
+        | Expr::IntervalLiteral(_)
+        | Expr::ValueFunction { .. } => false,
+        Expr::Call { args, .. } => args.iter().any(expr_contains_collate),
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::Quantified { lhs, rhs, .. } => {
+            expr_contains_collate(lhs) || expr_contains_collate(rhs)
+        }
+        Expr::Case { whens, else_result } => {
+            whens
+                .iter()
+                .any(|(c, r)| expr_contains_collate(c) || expr_contains_collate(r))
+                || else_result.as_deref().is_some_and(expr_contains_collate)
+        }
+        Expr::Coalesce(items) | Expr::ArrayConstructor(items) => {
+            items.iter().any(expr_contains_collate)
+        }
+        Expr::NullIf(a, b) => expr_contains_collate(a) || expr_contains_collate(b),
+        Expr::Cast { expr, .. } => expr_contains_collate(expr),
+        Expr::SqlJsonQuery(q) => q.children().into_iter().any(expr_contains_collate),
+        Expr::Subscript { base, subscript } => {
+            expr_contains_collate(base)
+                || match subscript {
+                    ArraySubscript::Index(i) => expr_contains_collate(i),
+                    ArraySubscript::Slice { lo, hi } => [lo, hi]
+                        .into_iter()
+                        .flatten()
+                        .any(|b| expr_contains_collate(b)),
+                }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 束縛段（Issue #1648）: 型を知る側（`catalog::Storage::create_index` の書き込みトランザクションと
 // `sql::scalar_index` の式キー構築）が呼ぶ。
@@ -567,7 +614,7 @@ fn check_index_result_type(ty: crate::sql::udf_call::ExprType) -> Result<(), Sql
 }
 
 /// 式要素 1 個を `schema` に対して束縛する（INDEX-10、Issue #1648）。判定順:
-/// 1. 最上位の `COLLATE` は `0A000`
+/// 1. 式木内の `COLLATE`（入れ子含む）は `0A000`
 /// 2. 定義時セッション TZ でゾーン無し `TIMESTAMPTZ` リテラルを確定値へ畳む
 /// 3. 束縛（未知列 `42703`・型不整合 `42883`／`42804` 等は束縛側のエラーをそのまま透過）
 /// 4. 型に依存する決定性の再判定（`42P17`）
@@ -581,7 +628,7 @@ pub(crate) fn bind_index_expression(
     expr: &Expr,
     schema: &crate::catalog::TableSchema,
 ) -> Result<BoundIndexExpression, SqlSurfaceError> {
-    if matches!(expr, Expr::Collate { .. }) {
+    if expr_contains_collate(expr) {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: MSG_COLLATE.to_string(),
         });

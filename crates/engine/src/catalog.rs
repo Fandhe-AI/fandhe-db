@@ -13328,10 +13328,12 @@ impl Storage {
             if materialized_view_exists_in_txn(&write_txn, &def.table)? {
                 if has_exprs {
                     // matview への式索引は本 Issue の対象外（fail-closed）。
-                    return Err(CatalogError::Invalid(
-                        "expression index on a materialized view is not supported".to_string(),
-                    )
-                    .into());
+                    return Err(CreateIndexError::Sql(
+                        SqlSurfaceError::FeatureNotSupported {
+                            detail: "expression index on a materialized view is not supported"
+                                .to_string(),
+                        },
+                    ));
                 }
                 let encoded = encode_index_def(def)?;
                 materialized::create_matview_index_in_txn(&write_txn, def, &encoded)?;

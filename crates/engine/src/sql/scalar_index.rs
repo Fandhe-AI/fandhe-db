@@ -2011,6 +2011,21 @@ impl ScalarIndex {
         snapshot: &SqlArenaSnapshot,
         decls: &[crate::catalog::DeclaredExpressionKey],
     ) {
+        // 保持配列そのもの（容量 × 要素サイズ）を先に確保前検査し、`try_reserve_exact` で
+        // 確保する（以降の `push` は再確保しない。確保失敗は式キーを 1 個も作らず縮退）。
+        let array_bytes = decls.len().saturating_mul(std::mem::size_of::<
+            crate::sql::expression_key_index::ExpressionKeyIndex,
+        >());
+        if check_scalar_index_budget(self.approx_bytes, array_bytes).is_err()
+            || self.expression_keys.try_reserve_exact(decls.len()).is_err()
+        {
+            return;
+        }
+        self.approx_bytes =
+            self.approx_bytes
+                .saturating_add(self.expression_keys.capacity().saturating_mul(
+                    std::mem::size_of::<crate::sql::expression_key_index::ExpressionKeyIndex>(),
+                ));
         for decl in decls {
             if let Ok(key) = crate::sql::expression_key_index::ExpressionKeyIndex::build(
                 schema,

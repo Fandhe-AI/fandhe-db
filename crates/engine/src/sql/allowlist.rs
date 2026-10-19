@@ -12431,7 +12431,7 @@ fn reject_unimplemented_expression_keys(
         || expressions
             .iter()
             .flatten()
-            .any(|e| matches!(e, Expr::Collate { .. }));
+            .any(crate::sql::index_expr::expr_contains_collate);
     if collated {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: crate::sql::index_expr::MSG_COLLATE.to_string(),
@@ -17324,6 +17324,13 @@ mod tests {
             // UNIQUE・hnsw・式への COLLATE と式の組み合わせは構文段の最終ゲートで 0A000。
             ("CREATE INDEX i ON t (lower(a) COLLATE \"C\")", "0A000"),
             ("CREATE INDEX i ON t ((lower(a) COLLATE \"C\"))", "0A000"),
+            // 入れ子の COLLATE（引数・CASE・CAST 内）も 0A000（v4 永続形が照合を持たないため）。
+            ("CREATE INDEX i ON t (lower(a COLLATE \"C\"))", "0A000"),
+            ("CREATE INDEX i ON t ((a COLLATE \"C\" || 'x'))", "0A000"),
+            (
+                "CREATE INDEX i ON t ((CASE WHEN a > 'x' THEN lower(a COLLATE \"C\") END))",
+                "0A000",
+            ),
             ("CREATE UNIQUE INDEX i ON t ((a + 1))", "0A000"),
             ("CREATE INDEX i ON t USING hnsw ((a + 1))", "0A000"),
             // 非決定的な式は 42P17（UNIQUE・入れ子・複数要素でも検出）。
