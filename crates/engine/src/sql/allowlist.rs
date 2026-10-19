@@ -839,6 +839,9 @@ pub enum SqlSurfaceError {
     /// [`crate::tenant::TenantWriteError::CheckViolation`] の写像。制約名のみを
     /// 保持する（行の値・id・テナントは含めない。security.md P0）。
     CheckViolation { constraint: String },
+    /// ビューの `WITH CHECK OPTION` 違反（`44000`。TABLE-43 (2)・Issue #1673）。
+    /// [`crate::tenant::TenantWriteError::WithCheckOptionViolation`] の写像。固定文言。
+    WithCheckOptionViolation,
     /// `FOREIGN KEY` 制約（TABLE-17・TASK-205、Issue #907）の参照整合性違反
     /// （[`crate::tenant::TenantWriteError::ForeignKeyViolation`] の写像。ERR-6:
     /// `23503`）。値・行 id・テナント・参照先テーブル名、および参照先が「不在」か
@@ -1293,6 +1296,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::UndefinedColumn { .. }
             | SqlSurfaceError::ColumnReferenceWithoutFrom => ErrorClass::UndefinedColumn,
             SqlSurfaceError::CheckViolation { .. } => ErrorClass::CheckViolation,
+            SqlSurfaceError::WithCheckOptionViolation => ErrorClass::WithCheckOptionViolation,
             SqlSurfaceError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             SqlSurfaceError::InvalidForeignKey { .. } => ErrorClass::InvalidForeignKey,
             SqlSurfaceError::DatatypeMismatch { .. } => ErrorClass::DatatypeMismatch,
@@ -1556,6 +1560,9 @@ impl std::fmt::Display for SqlSurfaceError {
             // security.md P0。`TenantWriteError::CheckViolation` と同じ文言）。
             SqlSurfaceError::CheckViolation { constraint } => {
                 write!(f, "new row violates check constraint {constraint:?}")
+            }
+            SqlSurfaceError::WithCheckOptionViolation => {
+                write!(f, "new row violates check option for view")
             }
             // 固定文言（`TenantWriteError::ForeignKeyViolation` と同じ。値・参照先の
             // 有無の理由を含めない。RLS-9・RLS-10 (c)）。
@@ -11110,7 +11117,7 @@ impl<'a> Parser<'a> {
     /// TASK-205、Issue #909。列別名リストは TABLE-41 (1)・Issue #1659）。`CREATE OR REPLACE VIEW`
     /// （TABLE-41 (2)・Issue #1660）は受理し、`or_replace` で返す。`CREATE OR REPLACE` の後が `VIEW`
     /// 以外・`TEMP`／`MATERIALIZED` は構造的に受理しない。
-    /// 戻り値は `(ビュー名, 列別名, 本文, OR REPLACE の有無)`。
+    /// 戻り値は `(ビュー名, 列別名, 本文〔末尾の `WITH CHECK OPTION` を含みうる〕, OR REPLACE の有無)`。
     ///
     /// 列別名リストの構造検証（カタログは照会しない）: 空 `()`・末尾カンマ・識別子でない
     /// 要素は `42601`、件数が [`crate::catalog::MAX_COLUMN_COUNT`] 超は `54000`（長さ検査の
@@ -12148,9 +12155,18 @@ pub struct ValidatedCreateView {
     /// `CREATE OR REPLACE VIEW` か（TABLE-41 (2)・Issue #1660）。真のとき実行段が既存定義との
     /// 互換性検査を行ったうえで定義を置き換える。
     pub(crate) or_replace: bool,
+    /// `WITH [CASCADED | LOCAL] CHECK OPTION`（TABLE-43 (2)・Issue #1673）。宣言なしは `None`。
+    /// 修飾子の省略は `Cascaded`。更新可能性の検査（宣言先が自動更新できない形なら `0A000`）は
+    /// 構造段（評価後射影形本文。[`validate_create_view_tokens`]）と実行段（`core`）が担う。
+    pub(crate) check_option: crate::catalog::ViewCheckOption,
 }
 
 impl ValidatedCreateView {
+    /// 宣言された `WITH CHECK OPTION`（宣言なしは [`crate::catalog::ViewCheckOption::None`]）。
+    pub fn check_option(&self) -> crate::catalog::ViewCheckOption {
+        self.check_option
+    }
+
     /// `CREATE OR REPLACE VIEW` か。
     pub fn or_replace(&self) -> bool {
         self.or_replace
@@ -12237,8 +12253,16 @@ pub(crate) fn validate_create_view_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedCreateView, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
-    let (name, column_aliases, body_tokens, or_replace) = p.parse_create_view()?;
-    let (relations, body_sql) = validate_view_body_for_storage(body_tokens, &column_aliases)?;
+    let (name, column_aliases, rest_tokens, or_replace) = p.parse_create_view()?;
+    // 末尾の `WITH [CASCADED | LOCAL] CHECK OPTION`（Issue #1673）を本文から剥がす。
+    let (body_tokens, check_option) = split_view_check_option(rest_tokens);
+    let (relations, body_sql, buffered) =
+        validate_view_body_for_storage(body_tokens, &column_aliases)?;
+    // 評価後射影形（LIMIT・集計・JOIN 等）の本文は自動更新できないため、CHECK OPTION は宣言できない
+    // （構文段の拒否の後に判定する。カタログは照会しない）。
+    if buffered && check_option != crate::catalog::ViewCheckOption::None {
+        return Err(not_auto_updatable_check_option());
+    }
     let base_relation = relations
         .into_iter()
         .next()
@@ -12249,7 +12273,49 @@ pub(crate) fn validate_create_view_tokens(
         body_sql,
         column_aliases,
         or_replace,
+        check_option,
     })
+}
+
+/// 自動更新できないビューへの `WITH CHECK OPTION` 宣言の拒否（`0A000`。固定文言）。構造段
+/// （評価後射影形本文）と実行段（`core` の `CreateView` 腕。基底ビューが更新不可）が共有する。
+pub(crate) fn not_auto_updatable_check_option() -> SqlSurfaceError {
+    SqlSurfaceError::feature_not_supported(
+        "WITH CHECK OPTION is supported only on automatically updatable views",
+    )
+}
+
+/// `CREATE VIEW` の本文トークン列の末尾から `WITH [CASCADED | LOCAL] CHECK OPTION`
+/// （TABLE-43 (2)・Issue #1673）を剥がし、残りと宣言を返す（末尾の `;` は先に取り除く）。末尾から
+/// 照合するため、先頭の CTE の `WITH` と取り違えない。`WITH` を伴わない `CHECK OPTION`・`CHECK` だけ・
+/// 未知の修飾子は剥がさず、本文の構造検証が `42601` で拒否する。
+fn split_view_check_option(tokens: &[Token]) -> (&[Token], crate::catalog::ViewCheckOption) {
+    use crate::catalog::ViewCheckOption;
+    let body = strip_trailing_semicolons(tokens);
+    let ident_is = |t: Option<&Token>, word: &str| matches!(t, Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word));
+    let len = body.len();
+    let none = (body, ViewCheckOption::None);
+    if len < 3 || !ident_is(body.get(len - 1), "OPTION") || !ident_is(body.get(len - 2), "CHECK") {
+        return none;
+    }
+    if ident_is(body.get(len - 3), "WITH") {
+        return (
+            body.get(..len - 3).unwrap_or(body),
+            ViewCheckOption::Cascaded,
+        );
+    }
+    if len >= 4 && ident_is(body.get(len - 4), "WITH") {
+        if ident_is(body.get(len - 3), "LOCAL") {
+            return (body.get(..len - 4).unwrap_or(body), ViewCheckOption::Local);
+        }
+        if ident_is(body.get(len - 3), "CASCADED") {
+            return (
+                body.get(..len - 4).unwrap_or(body),
+                ViewCheckOption::Cascaded,
+            );
+        }
+    }
+    none
 }
 
 /// `CREATE MATERIALIZED VIEW` の前置部の解析結果（名前・`IF NOT EXISTS`・列別名・`AS` 以降）。
@@ -12262,8 +12328,8 @@ type MatviewHead<'a> = (String, bool, Vec<String>, &'a [Token]);
 fn validate_view_body_for_storage(
     body_tokens: &[Token],
     column_aliases: &[String],
-) -> Result<(Vec<String>, String), SqlSurfaceError> {
-    let (relations, body_sql) = match classify_view_body(
+) -> Result<(Vec<String>, String, bool), SqlSurfaceError> {
+    let (relations, body_sql, buffered) = match classify_view_body(
         body_tokens,
         &StructuralOnlyLookup,
         ViewBodyCheck::Structural,
@@ -12279,7 +12345,7 @@ fn validate_view_body_for_storage(
                 }
             }
             let sql = render_stored_simple_view_body(&body)?;
-            (vec![body.table_name], sql)
+            (vec![body.table_name], sql, false)
         }
         ViewBodyKind::Buffered { relations, .. } => {
             // 検証済みトークン列そのものを正規化描画して永続化する
@@ -12293,7 +12359,7 @@ fn validate_view_body_for_storage(
             if super::lexer::stored_body_needs_bool_literal_marker(stripped) {
                 sql.insert_str(0, super::lexer::STORED_BODY_BOOL_LITERAL_MARKER);
             }
-            (relations, sql)
+            (relations, sql, true)
         }
     };
     if body_sql.len() > crate::catalog::MAX_VIEW_BODY_BYTES {
@@ -12301,7 +12367,7 @@ fn validate_view_body_for_storage(
             "view body exceeds the allowed size",
         ));
     }
-    Ok((relations, body_sql))
+    Ok((relations, body_sql, buffered))
 }
 
 /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] <name> [(<alias>, ...)] AS <SELECT 本文>
@@ -12387,7 +12453,7 @@ pub(crate) fn validate_create_materialized_view_tokens(
     let mut p = Parser::new(tokens);
     let (name, if_not_exists, column_aliases, rest) = p.parse_create_materialized_view()?;
     let (body_tokens, with_data) = split_matview_data_clause(rest);
-    let (mut base_relations, body_sql) =
+    let (mut base_relations, body_sql, _buffered) =
         validate_view_body_for_storage(body_tokens, &column_aliases)?;
     base_relations.sort();
     base_relations.dedup();
@@ -14671,6 +14737,7 @@ fn parse_set_branch(
             view_predicates,
             view_columns,
             column_map,
+            ..
         } => {
             // 列別名付きビュー（TABLE-41・Issue #1659）は集合演算の枝では未対応（fail-closed）。
             if column_map.is_some() {
@@ -15832,6 +15899,7 @@ fn build_scan_from_resolved(
             view_predicates,
             view_columns,
             column_map,
+            ..
         } => {
             super::view::check_columns_within_view(
                 view_columns.as_deref(),
@@ -15928,6 +15996,7 @@ fn build_aggregate_from_resolved(
             view_predicates,
             view_columns,
             column_map,
+            ..
         } => {
             super::view::check_aggregate_columns_within_view(
                 view_columns.as_deref(),
@@ -26085,6 +26154,7 @@ mod tests {
             ) -> Result<Option<crate::catalog::ViewDef>, SqlSurfaceError> {
                 if name == "docs_view" {
                     Ok(Some(crate::catalog::ViewDef {
+                        check_option: crate::catalog::ViewCheckOption::None,
                         base_relation: "documents".to_string(),
                         body_sql: "SELECT id FROM documents".to_string(),
                         column_aliases: Vec::new(),
@@ -26572,6 +26642,43 @@ mod body_expr_policy_tests {
         let tokens = crate::sql::lexer::tokenize("SELECT * FROM docs").expect("tok");
         let mut body = parse_view_body(&tokens).expect("parse");
         assert!(!rename_column_in_view_body(&mut body, "note", "memo").expect("noop"));
+    }
+
+    /// `WITH [CASCADED | LOCAL] CHECK OPTION`（TABLE-43 (2)・Issue #1673）の構文: 末尾の宣言だけを
+    /// 剥がし（CTE 先頭の `WITH` と取り違えない）、省略した修飾子は CASCADED。誤った形は `42601`。
+    /// 評価後射影形本文への宣言は構造段で `0A000`。
+    #[test]
+    fn create_view_check_option_structural_checks() {
+        use crate::catalog::ViewCheckOption;
+        let check = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tok");
+            validate_create_view_tokens(&tokens)
+        };
+        let option = |tail: &str| {
+            check(&format!("CREATE VIEW v AS SELECT * FROM docs {tail}"))
+                .expect(tail)
+                .check_option()
+        };
+        assert_eq!(option(""), ViewCheckOption::None);
+        assert_eq!(option("WITH CHECK OPTION"), ViewCheckOption::Cascaded);
+        assert_eq!(
+            option("with cascaded check option ;"),
+            ViewCheckOption::Cascaded
+        );
+        assert_eq!(option("WITH LOCAL CHECK OPTION"), ViewCheckOption::Local);
+        for bad in [
+            "WITH FOO CHECK OPTION",
+            "WITH CHECK",
+            "CHECK OPTION",
+            "WITH CHECK OPTION x",
+            "WITH LOCAL CASCADED CHECK OPTION",
+        ] {
+            let err = check(&format!("CREATE VIEW v AS SELECT * FROM docs {bad}")).expect_err(bad);
+            assert_eq!(err.wire_code(), "42601", "{bad}");
+        }
+        let err = check("CREATE VIEW v AS SELECT * FROM docs LIMIT 3 WITH CHECK OPTION")
+            .expect_err("buffered body");
+        assert_eq!(err.wire_code(), "0A000");
     }
 
     /// `CREATE OR REPLACE VIEW` の構文（TABLE-41 (2)・Issue #1660）: 大文字小文字を問わず受理し、

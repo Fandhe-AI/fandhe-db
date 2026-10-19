@@ -1126,6 +1126,7 @@ mod tests {
         let (storage, _g) = open("dep-t8");
         storage.create_table(&parent_table("t")).expect("t");
         let encoded = encode_view_def(&ViewDef {
+            check_option: crate::catalog::ViewCheckOption::None,
             base_relation: "other".to_string(),
             body_sql: "SELECT a FROM other".to_string(),
             column_aliases: Vec::new(),
@@ -1158,6 +1159,7 @@ mod tests {
         storage.create_table(&parent_table("t")).expect("t");
         let inject = |name: &str, base: &str, body: &str| {
             let encoded = encode_view_def(&ViewDef {
+                check_option: crate::catalog::ViewCheckOption::None,
                 base_relation: base.to_string(),
                 body_sql: body.to_string(),
                 column_aliases: Vec::new(),
@@ -1191,6 +1193,7 @@ mod tests {
         storage.create_table(&parent_table("t")).expect("t");
         let inject = |name: &str, base: &str, body: &str| {
             let encoded = encode_view_def(&ViewDef {
+                check_option: crate::catalog::ViewCheckOption::None,
                 base_relation: base.to_string(),
                 body_sql: body.to_string(),
                 column_aliases: Vec::new(),

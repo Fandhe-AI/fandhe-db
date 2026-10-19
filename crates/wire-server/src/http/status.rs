@@ -71,6 +71,10 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // TABLE-24・Issue #1690: SEQUENCE の上限・下限到達（`2200H`）は入力（採番の累積）起因の
         // 拒否として 400（`NumericOutOfRange` と同類）。
         ErrorClass::SequenceGeneratorLimitExceeded => 400,
+        // TABLE-43 (2)・Issue #1673: ビューの `WITH CHECK OPTION` 違反（`44000`）。書き込む行の値が
+        // ビューの条件と矛盾する入力起因の拒否として 400（NoSQL 表層からはビューへ書けないため到達しない
+        // が、網羅 match のため定義）。
+        ErrorClass::WithCheckOptionViolation => 400,
         ErrorClass::ProtocolViolation
         | ErrorClass::UnsupportedSqlSyntax
         | ErrorClass::InvalidInput
@@ -225,6 +229,7 @@ mod tests {
         (ErrorClass::LockNotAvailable, 503),
         (ErrorClass::ObjectNotInPrerequisiteState, 409),
         (ErrorClass::SequenceGeneratorLimitExceeded, 400),
+        (ErrorClass::WithCheckOptionViolation, 400),
         (ErrorClass::InvalidTransactionState, 400),
         (ErrorClass::ActiveSqlTransaction, 400),
         (ErrorClass::NoActiveSqlTransaction, 400),

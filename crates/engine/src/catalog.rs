@@ -1977,6 +1977,7 @@ fn rewrite_views_for_renamed_column_in_txn(
             base_relation: def.base_relation.clone(),
             body_sql,
             column_aliases: def.column_aliases.clone(),
+            check_option: def.check_option,
         })?;
         planned.push((name.clone(), encoded));
     }
@@ -4426,6 +4427,23 @@ pub struct ViewDef {
     /// 出力列に先頭から順に名前を付ける。空なら別名なし（本文から導いた名前のまま）。
     /// 件数は [`MAX_COLUMN_COUNT`]、各別名は識別子の長さ上限以下に限る。
     pub column_aliases: Vec<String>,
+    /// `WITH [CASCADED | LOCAL] CHECK OPTION`（TABLE-43 (2)・Issue #1673）。書き込み後の行が
+    /// ビューの条件を満たすことを `sql::view_check` が検査する。宣言なしは [`ViewCheckOption::None`]。
+    pub check_option: ViewCheckOption,
+}
+
+/// ビューの `WITH CHECK OPTION` の宣言（TABLE-43 (2)・Issue #1673）。`CREATE VIEW` の構文
+/// （`sql::allowlist`）が決め、[`ViewDef::check_option`] として永続化し、書き込み時に
+/// `sql::view::resolve_from` が入れ子の検査対象を導くときに読む。修飾子の省略は `Cascaded`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewCheckOption {
+    /// 宣言なし。
+    #[default]
+    None,
+    /// `WITH LOCAL CHECK OPTION`: このビュー自身の条件だけを検査する。
+    Local,
+    /// `WITH [CASCADED] CHECK OPTION`: このビューと、下位のビューすべての条件を検査する。
+    Cascaded,
 }
 
 /// 列別名リストの符号化後の最大バイト数（件数 4 + 各別名の長さ 4 + 識別子上限）。
@@ -4441,7 +4459,10 @@ const MAX_VIEW_ALIAS_BYTES: usize = 4 + MAX_COLUMN_COUNT * (4 + MAX_IDENTIFIER_L
 fn encode_view_def(def: &ViewDef) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     // バージョン（別名なしは従来の v1 と同一バイト列を保つ）。
-    out.push(if def.column_aliases.is_empty() {
+    // CHECK OPTION あり（Issue #1673）は v3（別名 0 件を許し、末尾に 1 バイト）。
+    out.push(if def.check_option != ViewCheckOption::None {
+        3u8
+    } else if def.column_aliases.is_empty() {
         1u8
     } else {
         2u8
@@ -4453,7 +4474,7 @@ fn encode_view_def(def: &ViewDef) -> Result<Vec<u8>> {
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(part.as_bytes());
     }
-    if !def.column_aliases.is_empty() {
+    if !def.column_aliases.is_empty() || def.check_option != ViewCheckOption::None {
         if def.column_aliases.len() > MAX_COLUMN_COUNT {
             return Err(CatalogError::Invalid(
                 "too many view column aliases".to_string(),
@@ -4474,9 +4495,14 @@ fn encode_view_def(def: &ViewDef) -> Result<Vec<u8>> {
             out.extend_from_slice(alias.as_bytes());
         }
     }
+    match def.check_option {
+        ViewCheckOption::None => {}
+        ViewCheckOption::Local => out.push(1u8),
+        ViewCheckOption::Cascaded => out.push(2u8),
+    }
     if out.len()
         > MAX_VIEW_BODY_BYTES
-            .saturating_add(64)
+            .saturating_add(65)
             .saturating_add(MAX_VIEW_ALIAS_BYTES)
     {
         return Err(CatalogError::ViewLimitExceeded(
@@ -4501,7 +4527,7 @@ fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
     let version = *bytes
         .first()
         .ok_or_else(|| CatalogError::Invalid("view definition value is empty".to_string()))?;
-    if version != 1 && version != 2 {
+    if version != 1 && version != 2 && version != 3 {
         return Err(CatalogError::Invalid(format!(
             "unknown view definition format version: {version}"
         )));
@@ -4538,7 +4564,7 @@ fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
         offset = end;
     }
     let mut column_aliases: Vec<String> = Vec::new();
-    if version == 2 {
+    if version == 2 || version == 3 {
         let count_bytes: [u8; 4] = bytes
             .get(offset..offset + 4)
             .ok_or_else(|| CatalogError::Invalid("view definition value truncated".to_string()))?
@@ -4547,7 +4573,8 @@ fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
         offset += 4;
         let count = u32::from_le_bytes(count_bytes) as usize;
         // 件数は確保の前に上限検査する（破損値による過大確保の防止）。
-        if count == 0 || count > MAX_COLUMN_COUNT {
+        // v2 は別名 1 件以上。v3 は CHECK OPTION のみのビューのため 0 件を許す。
+        if (count == 0 && version == 2) || count > MAX_COLUMN_COUNT {
             return Err(CatalogError::Invalid(
                 "view column alias count out of range".to_string(),
             ));
@@ -4583,6 +4610,19 @@ fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
             offset = end;
         }
     }
+    let mut check_option = ViewCheckOption::None;
+    if version == 3 {
+        check_option = match bytes.get(offset) {
+            Some(1) => ViewCheckOption::Local,
+            Some(2) => ViewCheckOption::Cascaded,
+            _ => {
+                return Err(CatalogError::Invalid(
+                    "view check option byte is invalid".to_string(),
+                ))
+            }
+        };
+        offset += 1;
+    }
     if offset != bytes.len() {
         return Err(CatalogError::Invalid(
             "view definition value has trailing bytes".to_string(),
@@ -4599,6 +4639,7 @@ fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
         base_relation,
         body_sql,
         column_aliases,
+        check_option,
     })
 }
 
@@ -13908,6 +13949,26 @@ impl Storage {
         body_sql: &str,
         column_aliases: &[String],
     ) -> Result<()> {
+        self.create_view_with_check_option(
+            name,
+            base_relation,
+            body_sql,
+            column_aliases,
+            ViewCheckOption::None,
+        )
+    }
+
+    /// [`Self::create_view_with_column_aliases`] に `WITH CHECK OPTION`（TABLE-43 (2)・Issue #1673）
+    /// を加えた版。SQL 表層（`sql::ddl::execute_create_view`）が宣言を [`ViewDef::check_option`] として
+    /// 永続化するために呼ぶ。更新可能性の判定は列・連鎖を導出できる SQL 表層（`core`）が作成前に行う。
+    pub fn create_view_with_check_option(
+        &self,
+        name: &str,
+        base_relation: &str,
+        body_sql: &str,
+        column_aliases: &[String],
+        check_option: ViewCheckOption,
+    ) -> Result<()> {
         validate_identifier(name)?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
             return Err(CatalogError::ViewLimitExceeded(
@@ -13933,6 +13994,7 @@ impl Storage {
             base_relation: base_relation.to_string(),
             body_sql: body_sql.to_string(),
             column_aliases: column_aliases.to_vec(),
+            check_option,
         })?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
@@ -14555,6 +14617,7 @@ impl Storage {
             // 互換性検査を経ない公開 API では列追加の有無が分からないため、fail-closed で
             // 「追加あり」として依存ビューの保守的ゲートを適用する。
             true,
+            ViewCheckOption::None,
         )
     }
 
@@ -14562,7 +14625,7 @@ impl Storage {
     /// 同一 write txn 内の指紋と一致するときだけ置換する [`Self::create_or_replace_view`] の本体。
     /// 不一致は `Err(ViewDefinitionChanged)`（互換性検査の前提になった参照先テーブル・ビューが
     /// 検査後に変わった。呼び出し元が検査からやり直す）。`None` は指紋照合を省く。
-    #[allow(clippy::too_many_arguments)] // CAS・指紋・列追加フラグを SQL 表層から受けるため 8 引数。
+    #[allow(clippy::too_many_arguments)] // CAS・指紋・列追加フラグ・CHECK OPTION を SQL 表層から受けるため 9 引数。
     pub(crate) fn create_or_replace_view_checked(
         &self,
         name: &str,
@@ -14572,6 +14635,7 @@ impl Storage {
         expected_old: Option<&ViewDef>,
         expected_fingerprint: Option<&[u8]>,
         appends_columns: bool,
+        check_option: ViewCheckOption,
     ) -> Result<()> {
         validate_identifier(name)?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
@@ -14598,6 +14662,7 @@ impl Storage {
             base_relation: base_relation.to_string(),
             body_sql: body_sql.to_string(),
             column_aliases: column_aliases.to_vec(),
+            check_option,
         })?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
@@ -16420,6 +16485,7 @@ mod tests {
             defs.insert(
                 name.to_string(),
                 ViewDef {
+                    check_option: crate::catalog::ViewCheckOption::None,
                     base_relation: base.to_string(),
                     body_sql: format!("SELECT * FROM {base}"),
                     column_aliases: Vec::new(),
@@ -20700,6 +20766,7 @@ mod tests {
             {
                 let mut views = write_txn.open_table(VIEWS_TABLE).expect("views");
                 let bad = encode_view_def(&ViewDef {
+                    check_option: crate::catalog::ViewCheckOption::None,
                     base_relation: "docs".to_string(),
                     body_sql: "NOT A VIEW BODY".to_string(),
                     column_aliases: Vec::new(),
@@ -21425,6 +21492,7 @@ mod tests {
     #[test]
     fn view_def_codec_keeps_v1_bytes_and_round_trips_v2_aliases() {
         let plain = ViewDef {
+            check_option: crate::catalog::ViewCheckOption::None,
             base_relation: "docs".to_string(),
             body_sql: "SELECT a FROM docs".to_string(),
             column_aliases: Vec::new(),
@@ -21452,6 +21520,7 @@ mod tests {
     #[test]
     fn view_def_v2_rejects_corrupt_alias_sections() {
         let aliased = ViewDef {
+            check_option: crate::catalog::ViewCheckOption::None,
             base_relation: "docs".to_string(),
             body_sql: "SELECT a FROM docs".to_string(),
             column_aliases: vec!["x".to_string()],
@@ -21488,6 +21557,54 @@ mod tests {
         let last = bad_utf8.len() - 1;
         bad_utf8[last] = 0xFF;
         corrupt(&bad_utf8);
+    }
+
+    /// `WITH CHECK OPTION`（Issue #1673）: 宣言なしは従来の v1／v2 のバイト列のまま、宣言ありは v3 で
+    /// 往復し、v3 の破損（option バイトの 0・未知値・欠落・余剰）は `CorruptSchema` で拒否する。
+    #[test]
+    fn view_def_v3_check_option_round_trips_and_rejects_corruption() {
+        use crate::catalog::ViewCheckOption;
+        let def = |aliases: &[&str], check_option| ViewDef {
+            check_option,
+            base_relation: "docs".to_string(),
+            body_sql: "SELECT a FROM docs".to_string(),
+            column_aliases: aliases.iter().map(|a| a.to_string()).collect(),
+        };
+        // 宣言なしは v1／v2 のまま（バイト列を変えない）。
+        assert_eq!(
+            encode_view_def(&def(&[], ViewCheckOption::None)).expect("v1")[0],
+            1
+        );
+        assert_eq!(
+            encode_view_def(&def(&["x"], ViewCheckOption::None)).expect("v2")[0],
+            2
+        );
+        // 宣言ありは v3。別名の有無・修飾子の別で往復する。
+        for aliases in [&[][..], &["x", "y"][..]] {
+            for opt in [ViewCheckOption::Local, ViewCheckOption::Cascaded] {
+                let d = def(aliases, opt);
+                let bytes = encode_view_def(&d).expect("v3");
+                assert_eq!(bytes[0], 3);
+                assert_eq!(decode_view_def(&bytes).expect("decode"), d);
+            }
+        }
+        let good = encode_view_def(&def(&[], ViewCheckOption::Local)).expect("v3");
+        let corrupt = |bytes: &[u8]| {
+            assert!(
+                matches!(decode_view_def(bytes), Err(CatalogError::CorruptSchema(_))),
+                "must be CorruptSchema: {bytes:?}"
+            );
+        };
+        let last = good.len() - 1;
+        for bad in [0u8, 3, 0xFF] {
+            let mut b = good.clone();
+            b[last] = bad;
+            corrupt(&b);
+        }
+        corrupt(&good[..last]);
+        let mut trailing = good.clone();
+        trailing.push(0);
+        corrupt(&trailing);
     }
 
     /// 公開 API からの直接呼び出しでも、別名の件数・識別子・重複を保存前に検査する。
@@ -21540,6 +21657,7 @@ mod tests {
         let db = redb::Database::create(&path).expect("create db");
         let remaining = vec!["a".to_string()];
         let def = ViewDef {
+            check_option: crate::catalog::ViewCheckOption::None,
             base_relation: "docs".to_string(),
             body_sql: "SELECT a FROM docs".to_string(),
             column_aliases: Vec::new(),

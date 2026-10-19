@@ -46,6 +46,7 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::TruncateReferencedByForeignKey { .. } => ErrorClass::FeatureNotSupported,
         TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
         TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
+        TenantWriteError::WithCheckOptionViolation => ErrorClass::WithCheckOptionViolation,
         // オーナー判断（2026-09-28・Issue #1075）: 内側の `SqlSurfaceError` の
         // 分類（通常の式評価と同じ）へ委譲する。`XX000` 固定ではなくなった。
         TenantWriteError::CheckEvaluationFailed(inner) => inner.error_class(),
@@ -86,6 +87,7 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
         TenantWriteError::UniqueViolation,
         TenantWriteError::ForeignKeyViolation,
         TenantWriteError::ReferentialActionLimitExceeded,
+        TenantWriteError::WithCheckOptionViolation,
         TenantWriteError::CheckViolation {
             constraint: "test_check".to_string(),
         },

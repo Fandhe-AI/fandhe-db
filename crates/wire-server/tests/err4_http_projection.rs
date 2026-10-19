@@ -330,6 +330,8 @@ const EXPECTED_STATUS: [(&str, u16); 69] = [
     ("55000", 409),
     // `SequenceGeneratorLimitExceeded`（`2200H`。TABLE-24・Issue #1690）。
     ("2200H", 400),
+    // `WithCheckOptionViolation`（`44000`。TABLE-43 (2)、Issue #1673）: ビューの CHECK OPTION 違反。400。
+    ("44000", 400),
     ("25000", 400),
     ("25001", 400),
     ("25P01", 400),
@@ -500,7 +502,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 72);
+const _: () = assert!(ErrorClass::ALL.len() == 73);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。

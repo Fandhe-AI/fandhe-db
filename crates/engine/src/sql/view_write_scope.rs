@@ -15,18 +15,27 @@
 //!   ([`current_view_name`])。ビュー経由の文と基表への直接の文を同じ `operation_id` で取り違えた
 //!   再送を内容不一致（`22023`）として検出する。台帳のキーは基表名のまま。
 //!
+//! - `constraint::enforce_row_constraints_in_txn`: `WITH CHECK OPTION`（TABLE-43 (2)・Issue #1673）の
+//!   検査対象の述語を [`current_view_checks`] で読み、書いた行で評価する（`sql::view_check`）。述語は
+//!   書き込み先の基表名とともに搬送し、FK の参照アクションの連鎖など別表への書き込みには適用しない。
+//!
 //! スコープの外では何も変わらない（既存の基表書き込みと台帳ハッシュはビット同一）。
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::catalog::CatalogError;
+use crate::sql::allowlist::WherePredicate;
 
 /// 現在の書き込み区間が張るビュー書き込みの情報。
 struct Active {
     view_name: String,
     fingerprint: Vec<u8>,
     mismatch: Rc<Cell<bool>>,
+    /// 書き込み先の基表名（`WITH CHECK OPTION` の検査をこの表への書き込みにだけ適用するため）。
+    base_table: String,
+    /// `WITH CHECK OPTION` の検査対象の述語（内側のビューが先頭。DELETE では空）。
+    check_predicates: Rc<Vec<Vec<WherePredicate>>>,
 }
 
 thread_local! {
@@ -42,12 +51,26 @@ pub(crate) struct ViewWriteScope {
 impl ViewWriteScope {
     /// `view_name` 経由の書き込み区間に入る。`fingerprint` は書き換えに使ったカタログの指紋
     /// （[`crate::catalog::Storage::view_write_fingerprint`]）。
+    #[cfg(test)]
     pub(crate) fn enter(view_name: &str, fingerprint: Vec<u8>) -> Self {
+        Self::enter_with_checks(view_name, fingerprint, "", Vec::new())
+    }
+
+    /// [`Self::enter`] に、書き込み先の基表名と `WITH CHECK OPTION` の検査対象の述語を加えた版
+    /// （INSERT・UPDATE のみ検査を載せる。DELETE は空を渡す）。
+    pub(crate) fn enter_with_checks(
+        view_name: &str,
+        fingerprint: Vec<u8>,
+        base_table: &str,
+        check_predicates: Vec<Vec<WherePredicate>>,
+    ) -> Self {
         let mismatch = Rc::new(Cell::new(false));
         let active = Active {
             view_name: view_name.to_string(),
             fingerprint,
             mismatch: Rc::clone(&mismatch),
+            base_table: base_table.to_string(),
+            check_predicates: Rc::new(check_predicates),
         };
         let prev = CURRENT.with(|c| c.replace(Some(active)));
         ViewWriteScope { prev, mismatch }
@@ -69,6 +92,18 @@ impl Drop for ViewWriteScope {
 /// 現スレッドがビュー経由の書き込み区間にいるとき、そのビュー名。
 pub(crate) fn current_view_name() -> Option<String> {
     CURRENT.with(|c| c.borrow().as_ref().map(|a| a.view_name.clone()))
+}
+
+/// 現スレッドがビュー経由の書き込み区間にいて、書き込み先が `table_name`（基表）のとき、
+/// `WITH CHECK OPTION` の検査対象の述語を返す（検査対象が無ければ `None`）。表名が一致しない
+/// 書き込み（FK の参照アクションの連鎖等）には適用しない。
+pub(crate) fn current_view_checks(table_name: &str) -> Option<Rc<Vec<Vec<WherePredicate>>>> {
+    CURRENT.with(|c| {
+        c.borrow().as_ref().and_then(|a| {
+            (a.base_table == table_name && !a.check_predicates.is_empty())
+                .then(|| Rc::clone(&a.check_predicates))
+        })
+    })
 }
 
 /// 書き込み txn の冒頭の指紋照合。スコープ外なら何もしない。不一致は印を立てて

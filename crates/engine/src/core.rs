@@ -5484,6 +5484,35 @@ impl EngineCore {
                 // TABLE-41 (1)・Issue #1659: 列別名リストと本文の出力列数の突合は、カタログを
                 // 照会するため DDL 権限ゲートの後に行う（権限の無い主体へ列構成を返さない）。
                 self.check_create_view_column_aliases(session, stmt)?;
+                // TABLE-43 (2)・Issue #1673: `WITH CHECK OPTION` の宣言先が自動更新できる形か・検査
+                // できる述語かを、カタログ書き込みの前に判定する（宣言なしは何もしない）。
+                // 新定義による循環（`42P17`）は、新定義を重ねて連鎖を辿る宣言検査より先に判定する
+                // （CHECK OPTION の有無でエラー契約が割れて `XX000` になるのを防ぐ）。
+                if stmt.or_replace()
+                    && self
+                        .storage
+                        .view_definition(stmt.name())
+                        .map_err(crate::sql::ddl::map_replace_view_error)?
+                        .is_some()
+                    && self
+                        .storage
+                        .view_body_reaches_self(stmt.name(), stmt.body_sql())
+                        .map_err(crate::sql::ddl::map_replace_view_error)?
+                {
+                    return Err(crate::sql::ddl::map_replace_view_error(
+                        crate::catalog::CatalogError::ViewReferenceCycle(stmt.name().to_string()),
+                    ));
+                }
+                crate::sql::view_check::check_declaration(
+                    &self.storage,
+                    stmt.name(),
+                    crate::catalog::ViewDef {
+                        base_relation: stmt.base_relation().to_string(),
+                        body_sql: stmt.body_sql().to_string(),
+                        column_aliases: stmt.column_aliases().to_vec(),
+                        check_option: stmt.check_option(),
+                    },
+                )?;
                 // TABLE-41 (2)・Issue #1660: `OR REPLACE` は互換性検査付きの置換経路へ。
                 let outcome = if stmt.or_replace() {
                     self.create_or_replace_view_in_session(session, stmt)?
@@ -10691,6 +10720,7 @@ impl EngineCore {
             &crate::catalog::ViewWriteSnapshot<'_>,
         ) -> Result<P, crate::sql::allowlist::SqlSurfaceError>,
         base_table_of: impl Fn(&P) -> String,
+        checks_of: impl Fn(&P) -> Vec<Vec<crate::sql::allowlist::WherePredicate>>,
         mut execute: impl FnMut(
             P,
         ) -> Result<
@@ -10713,8 +10743,15 @@ impl EngineCore {
             // スナップショット内の解決エラーはその時点の状態に対する正当なエラー。
             let (fingerprint, prepared) = snapshot?;
             let base_table = base_table_of(&prepared);
-            let scope =
-                crate::sql::view_write_scope::ViewWriteScope::enter(view_name, fingerprint.clone());
+            // `WITH CHECK OPTION`（TABLE-43 (2)・Issue #1673）の検査対象の述語は、INSERT・UPDATE の
+            // 書き換え結果だけが持つ（DELETE は空）。検査点が書き込み txn 内で評価する。
+            let check_predicates = checks_of(&prepared);
+            let scope = crate::sql::view_write_scope::ViewWriteScope::enter_with_checks(
+                view_name,
+                fingerprint.clone(),
+                &base_table,
+                check_predicates,
+            );
             let result = execute(prepared);
             if scope.mismatched() {
                 continue;
@@ -10762,6 +10799,7 @@ impl EngineCore {
                 Ok((rewritten, schema))
             },
             |(rewritten, _)| rewritten.insert.table_name.clone(),
+            |(rewritten, _)| rewritten.check_predicates.clone(),
             |(rewritten, schema)| {
                 let lookup = InsertSchemaLookup::with_schema(
                     &self.storage,
@@ -10811,6 +10849,8 @@ impl EngineCore {
                 DeleteStatement::SingleRow(v) => v.table_name.clone(),
                 DeleteStatement::Predicate(v) => v.table_name().to_string(),
             },
+            // DELETE は `WITH CHECK OPTION` の検査対象外（削除後の行は存在しない）。
+            |_| Vec::new(),
             |rewritten| {
                 let names = rewritten.public_names.as_deref();
                 let returning = |mut outcome: crate::sql::exec::ReturningOutcome| {
@@ -10853,6 +10893,7 @@ impl EngineCore {
                 ValidatedUpdateForm::Single(v) => v.table_name.clone(),
                 ValidatedUpdateForm::Predicate(v) => v.table_name().to_string(),
             },
+            |rewritten| rewritten.check_predicates.clone(),
             |rewritten| {
                 let has_returning = match &rewritten.update {
                     ValidatedUpdateForm::Single(v) => v.returning.is_some(),
