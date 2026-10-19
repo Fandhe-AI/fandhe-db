@@ -178,7 +178,7 @@ fn rewrite_on_conflict(
 /// `RETURNING` をビューの公開列で解決して物理名の投影へ写す。戻り値の第 2 要素は出力列名
 /// （公開名。写像が不要なら `None`）。`RETURNING *` は、ビューが列を絞り込む・改名するときだけ
 /// 公開列リストへ展開する（それ以外は基表の `*` と同じ列になるため `All` のまま）。
-fn rewrite_returning(
+pub(crate) fn rewrite_returning(
     mapper: &Mapper<'_>,
     returning: Option<&Projection>,
 ) -> Result<(Option<Projection>, Option<Vec<String>>), SqlSurfaceError> {
@@ -230,22 +230,22 @@ pub(crate) fn apply_public_names(columns: &mut [ColumnMeta], public_names: Optio
 }
 
 /// ビューの公開名 → 基表の物理名の写像（`Resolved::View` の `view_columns`／`column_map` の借用）。
-struct Mapper<'a> {
+pub(crate) struct Mapper<'a> {
     /// ビューが公開する列集合。`None` は連鎖のどの段も列を絞り込んでいない（基表の全列）。
-    columns: Option<&'a [String]>,
+    pub(crate) columns: Option<&'a [String]>,
     /// 列別名の対応。`None` は公開名＝物理名。
-    map: Option<&'a [(String, String)]>,
+    pub(crate) map: Option<&'a [(String, String)]>,
 }
 
 impl Mapper<'_> {
     /// 公開名と物理名が常に一致し、列集合も絞られていない（基表の束縛段が列検査を担う）。
-    fn is_identity(&self) -> bool {
+    pub(crate) fn is_identity(&self) -> bool {
         self.columns.is_none() && self.map.is_none()
     }
 
     /// 公開名 `public` の物理名。公開されていない列は `42703`、別名で疑似列 `id` へ写る公開名は
     /// `0A000`（行 identity を利用者列として書く取り違えを防ぐ。fail-closed）。
-    fn physical(&self, public: &str) -> Result<String, SqlSurfaceError> {
+    pub(crate) fn physical(&self, public: &str) -> Result<String, SqlSurfaceError> {
         if let Some(columns) = self.columns {
             if !columns.iter().any(|c| c == public) {
                 return Err(SqlSurfaceError::undefined_column(public));

@@ -106,6 +106,16 @@ pub(crate) fn rewrite_where(
         .collect()
 }
 
+/// ビューへの `UPDATE` の `SET` 右辺の式を物理名へ書き換える（TABLE-43・Issue #1672）。列スコープ
+/// 検査（`sql::view::expr_columns_within`）は呼び出し元が公開名に対して先に済ませている。別名で
+/// 疑似列 `id` へ写る公開名を含む式は意味を取り違えないよう `0A000`（fail-closed）。
+pub(crate) fn rewrite_set_value(map: &ColumnMap<'_>, expr: &Expr) -> Result<Expr, SqlSurfaceError> {
+    let mut idents = HashSet::new();
+    super::parser::collect_expr_idents(expr, &mut idents);
+    map.reject_aliased_id_refs(&idents)?;
+    Ok(map_expr_idents(expr, &|c| map.physical(c)))
+}
+
 /// 書き換え後の投影が持つ明示別名（`SelectItem::Expr` の `alias`）の集合。外側クエリの
 /// `ORDER BY` はこの名前を出力別名として解決する（`sql::parser::resolve_scan_order_aliases`）。
 fn explicit_aliases(projection: &Projection) -> HashSet<&str> {

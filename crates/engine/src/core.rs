@@ -1522,6 +1522,11 @@ pub enum ParsedSql {
     /// 基表への書き換えは Execute／Describe 時に現在のカタログで行う（Parse と Execute の間の
     /// `CREATE OR REPLACE VIEW`／`DROP VIEW` を取り込む）。自動更新不可のビューは Parse で `55000`。
     ViewInsert(crate::sql::allowlist::ValidatedViewInsert),
+    /// 自動更新可能なビューへの `DELETE`（TABLE-43・Issue #1672）。[`ParsedSql::ViewInsert`] と同じく
+    /// 送られた文の形のまま保持し、基表への書き換えは Execute／Describe 時に現在のカタログで行う。
+    ViewDelete(crate::sql::allowlist::ValidatedViewDelete),
+    /// 自動更新可能なビューへの `UPDATE`（TABLE-43・Issue #1672）。[`ParsedSql::ViewDelete`] と同じ扱い。
+    ViewUpdate(crate::sql::allowlist::ValidatedViewUpdate),
     /// `TRUNCATE TABLE ... USING OPERATION_ID '<id>'`（SQL-22）。
     Truncate(crate::sql::allowlist::ValidatedTruncate),
     /// `DELETE`（単一行・`id` 完全一致形／述語形。SQL-18・SQL-19）。
@@ -1727,6 +1732,8 @@ fn statement_clock_scope(
         ParsedSql::Statement(_)
         | ParsedSql::Insert(_)
         | ParsedSql::ViewInsert(_)
+        | ParsedSql::ViewDelete(_)
+        | ParsedSql::ViewUpdate(_)
         | ParsedSql::Delete(_)
         | ParsedSql::Update(_) => true,
         ParsedSql::Truncate(_)
@@ -1782,6 +1789,8 @@ fn insert_default_clock_scope(
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
         | ParsedSql::Update(_)
+        | ParsedSql::ViewDelete(_)
+        | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
@@ -1926,6 +1935,8 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
     match parsed {
         ParsedSql::Insert(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
         ParsedSql::ViewInsert(stmt) => stmt.operation_id().map(|id| id.as_str()),
+        ParsedSql::ViewDelete(stmt) => stmt.operation_id().map(|id| id.as_str()),
+        ParsedSql::ViewUpdate(stmt) => stmt.operation_id().map(|id| id.as_str()),
         ParsedSql::Truncate(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
         ParsedSql::Delete(crate::sql::allowlist::DeleteStatement::SingleRow(v)) => {
             v.operation_id.as_ref().map(|id| id.as_str())
@@ -3874,10 +3885,10 @@ impl EngineCore {
     /// [`Self::reclassify_write_to_view_error`] の文種別つき版（TABLE-43 (3)・Issue #1670）。
     /// `op` が `Some`（`INSERT`／`UPDATE`／`DELETE`）で対象がビューのとき、自動更新可能性を
     /// `sql::view_updatable` で判定し、自動更新不可なら `55000`
-    /// （`ViewNotAutoUpdatable`）で拒否する。自動更新可能なビューは、INSERT なら
-    /// `parse_tokens` が先に `ParsedSql::ViewInsert` として受理する（Issue #1671）ため本関数には来ない。
-    /// UPDATE／DELETE は基表への書き換えが入る（Issue #1672）まで従来どおり `42809`（fail-closed）。`op` が `None`
-    /// （`TRUNCATE`・`EXPLAIN` 系）は常に従来の `42809`。判定自体の失敗（破損 `XX000`・深さ超過
+    /// （`ViewNotAutoUpdatable`）で拒否する。自動更新可能なビューへの INSERT／UPDATE／DELETE は
+    /// `parse_tokens` が先に `ParsedSql::ViewInsert`／`ViewUpdate`／`ViewDelete` として受理する
+    /// （Issue #1671・#1672）ため通常は本関数には来ない（並行 DDL でビューが現れた競合時だけ
+    /// 従来どおり `42809`〔fail-closed〕）。`op` が `None`（`TRUNCATE`・`EXPLAIN` 系）は常に従来の `42809`。判定自体の失敗（破損 `XX000`・深さ超過
     /// `54000` 等）はそのまま返し、「ビューではない」側へは倒さない。
     fn reclassify_write_to_view_error_for(
         &self,
@@ -4312,21 +4323,35 @@ impl EngineCore {
             Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DELETE")
         );
         if is_delete_statement {
-            let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
-                &tokens,
-                &storage_lookup,
-                ledger_mode,
-            )
-            .map_err(|e| {
-                self.reclassify_write_to_view_error_for(
-                    Some(crate::sql::allowlist::ViewWriteOp::Delete),
-                    e,
-                )
-            })?;
-            if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
-                self.check_partitioned_chunk(v.partitioned())?;
+            // 構造検証 → 存在確認の順序は `validate_delete_statement_tokens` と同じ。FROM の名前が表で
+            // なくビューなら、自動更新可能なものに限りビューへの DELETE として受理する（TABLE-43・
+            // Issue #1672。書き換えは Execute 時）。
+            let stmt =
+                crate::sql::allowlist::parse_delete_statement_shape_tokens(&tokens, ledger_mode)?;
+            let table_name = match &stmt {
+                crate::sql::allowlist::DeleteStatement::SingleRow(v) => v.table_name.clone(),
+                crate::sql::allowlist::DeleteStatement::Predicate(v) => v.table_name().to_string(),
+            };
+            if crate::sql::allowlist::TableLookup::table_exists(&storage_lookup, &table_name)? {
+                if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
+                    self.check_partitioned_chunk(v.partitioned())?;
+                }
+                return Ok(ParsedSql::Delete(stmt));
             }
-            return Ok(ParsedSql::Delete(stmt));
+            if matches!(self.storage.view_definition(&table_name), Ok(Some(_))) {
+                let view_stmt = crate::sql::allowlist::ValidatedViewDelete::new(stmt);
+                // 自動更新不可は `55000`、判定・解決の失敗はそのまま返す（fail-closed）。
+                self.storage
+                    .with_view_write_snapshot(view_stmt.view_name(), |snap, _| {
+                        crate::sql::view_dml::check_view_delete(snap, &view_stmt)
+                    })
+                    .map_err(crate::catalog::table_lookup_error)??;
+                return Ok(ParsedSql::ViewDelete(view_stmt));
+            }
+            return Err(self.reclassify_write_to_view_error_for(
+                Some(crate::sql::allowlist::ViewWriteOp::Delete),
+                crate::sql::allowlist::SqlSurfaceError::undefined_table(table_name),
+            ));
         }
 
         let is_update_statement = matches!(
@@ -4334,21 +4359,33 @@ impl EngineCore {
             Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("UPDATE")
         );
         if is_update_statement {
-            let stmt = crate::sql::allowlist::validate_update_form_tokens(
-                &tokens,
-                &storage_lookup,
-                ledger_mode,
-            )
-            .map_err(|e| {
-                self.reclassify_write_to_view_error_for(
-                    Some(crate::sql::allowlist::ViewWriteOp::Update),
-                    e,
-                )
-            })?;
-            if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
-                self.check_partitioned_chunk(v.partitioned())?;
+            // 構造検証 → 存在確認の順序は `validate_update_form_tokens` と同じ（TABLE-43・Issue #1672）。
+            let stmt = crate::sql::allowlist::parse_update_form_shape_tokens(&tokens, ledger_mode)?;
+            let table_name = match &stmt {
+                crate::sql::allowlist::ValidatedUpdateForm::Single(v) => v.table_name.clone(),
+                crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) => {
+                    v.table_name().to_string()
+                }
+            };
+            if crate::sql::allowlist::TableLookup::table_exists(&storage_lookup, &table_name)? {
+                if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
+                    self.check_partitioned_chunk(v.partitioned())?;
+                }
+                return Ok(ParsedSql::Update(stmt));
             }
-            return Ok(ParsedSql::Update(stmt));
+            if matches!(self.storage.view_definition(&table_name), Ok(Some(_))) {
+                let view_stmt = crate::sql::allowlist::ValidatedViewUpdate::new(stmt);
+                self.storage
+                    .with_view_write_snapshot(view_stmt.view_name(), |snap, _| {
+                        crate::sql::view_dml::check_view_update(snap, &view_stmt)
+                    })
+                    .map_err(crate::catalog::table_lookup_error)??;
+                return Ok(ParsedSql::ViewUpdate(view_stmt));
+            }
+            return Err(self.reclassify_write_to_view_error_for(
+                Some(crate::sql::allowlist::ViewWriteOp::Update),
+                crate::sql::allowlist::SqlSurfaceError::undefined_table(table_name),
+            ));
         }
 
         let is_declare_statement = matches!(
@@ -4776,20 +4813,25 @@ impl EngineCore {
         // `INSERT INTO <表> ( <列> {, <列>} ) VALUES`（構文は `Parser::parse_insert` が
         // 保証する形。ここでは型の引き当てだけに使い、崩れていれば未解決として扱う）。
         let insert_target: Option<(String, Vec<String>)> = insert_target_from_tokens(tokens);
-        let is_insert = matches!(
+        // INSERT／UPDATE／DELETE（対象がビューのときの公開列→基表の列の型引き。TABLE-43・
+        // Issue #1671・#1672）。
+        let is_write = matches!(
             tokens.first(),
-            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("INSERT")
+            Some(Token::Ident(w))
+                if w.eq_ignore_ascii_case("INSERT")
+                    || w.eq_ignore_ascii_case("UPDATE")
+                    || w.eq_ignore_ascii_case("DELETE")
         );
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
             let id_type = || Some(PreparedParamType::Column(ColumnMeta::Id));
             let (schema, column) = match self.storage.get_table_schema(table) {
                 Ok(_) if column == "id" => return id_type(),
                 Ok(schema) => (schema, column.to_string()),
-                // 表でなければ、INSERT に限りビューの公開列を基表の列へ解決して型を引く
-                // （TABLE-43・Issue #1671）。公開名 `id` でも物理列へ解決してから疑似列かを
+                // 表でなければ、書き込み文に限りビューの公開列を基表の列へ解決して型を引く
+                // （TABLE-43・Issue #1671・#1672）。公開名 `id` でも物理列へ解決してから疑似列かを
                 // 判定する（TEXT 列を `id` として公開するビューで `$n` を整数と誤推論しない）。
                 // 解決できなければ、`id` は従来どおり疑似列、他は未解決（`Text`）。
-                Err(_) if is_insert => {
+                Err(_) if is_write => {
                     let resolved = self
                         .storage
                         .with_view_write_snapshot(table, |snap, _| {
@@ -5160,6 +5202,23 @@ impl EngineCore {
                 .execute_view_insert(
                     || crate::tenant::WriteTarget::Autocommit(&self.storage),
                     ctx,
+                    stmt,
+                )
+                .map(|(outcome, _base_table)| outcome),
+            // ビューへの DELETE／UPDATE（TABLE-43・Issue #1672）。基表形へ書き換えて既存の基表 DML 経路へ流す。
+            ParsedSql::ViewDelete(stmt) => self
+                .execute_view_delete(
+                    || crate::tenant::WriteTarget::Autocommit(&self.storage),
+                    ctx,
+                    session,
+                    stmt,
+                )
+                .map(|(outcome, _base_table)| outcome),
+            ParsedSql::ViewUpdate(stmt) => self
+                .execute_view_update(
+                    || crate::tenant::WriteTarget::Autocommit(&self.storage),
+                    ctx,
+                    session,
                     stmt,
                 )
                 .map(|(outcome, _base_table)| outcome),
@@ -5710,6 +5769,34 @@ impl EngineCore {
                 let (outcome, base_table) = self.execute_view_insert(
                     || crate::tenant::WriteTarget::InTxn(write_txn),
                     ctx,
+                    stmt,
+                )?;
+                txn.mark_written(ctx.tenant_id(), &base_table);
+                Ok(outcome)
+            }
+            // ビューへの DELETE／UPDATE（TABLE-43・Issue #1672）。INSERT と同じく台帳・`mark_written` は
+            // 基表の単位（ビュー名ではない）。
+            ParsedSql::ViewDelete(stmt) => {
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let (outcome, base_table) = self.execute_view_delete(
+                    || crate::tenant::WriteTarget::InTxn(write_txn),
+                    ctx,
+                    session,
+                    stmt,
+                )?;
+                txn.mark_written(ctx.tenant_id(), &base_table);
+                Ok(outcome)
+            }
+            ParsedSql::ViewUpdate(stmt) => {
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let (outcome, base_table) = self.execute_view_update(
+                    || crate::tenant::WriteTarget::InTxn(write_txn),
+                    ctx,
+                    session,
                     stmt,
                 )?;
                 txn.mark_written(ctx.tenant_id(), &base_table);
@@ -6495,6 +6582,76 @@ impl EngineCore {
                     rewritten.insert.returning.as_ref(),
                     &schema,
                 )? {
+                    Some(projection) => {
+                        let mut columns = crate::sql::returning::column_meta(&projection, &schema)?;
+                        crate::sql::view_insert::apply_public_names(
+                            &mut columns,
+                            rewritten.public_names.as_deref(),
+                        );
+                        Ok(Some(columns))
+                    }
+                    None => Ok(None),
+                }
+            }
+            // ビューへの DELETE／UPDATE（TABLE-43・Issue #1672）: 現在のカタログで書き換え、`RETURNING` の
+            // 列メタは基表の型で導き、列名だけビューの公開名へ上書きする（INSERT と同じ）。
+            ParsedSql::ViewDelete(stmt) => {
+                let (rewritten, schema) = self
+                    .storage
+                    .with_view_write_snapshot(stmt.view_name(), |snap, _| {
+                        let rewritten = crate::sql::view_dml::rewrite_view_delete(snap, stmt)?;
+                        let table = match &rewritten.delete {
+                            DeleteStatement::SingleRow(v) => v.table_name.as_str(),
+                            DeleteStatement::Predicate(v) => v.table_name(),
+                        };
+                        let schema = snap.table_schema(table).map_err(|e| match e {
+                            CatalogError::TableNotFound(name) => {
+                                crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                            }
+                            other => crate::catalog::table_lookup_error(other),
+                        })?;
+                        Ok::<_, crate::sql::allowlist::SqlSurfaceError>((rewritten, schema))
+                    })
+                    .map_err(crate::catalog::table_lookup_error)??;
+                let returning = match &rewritten.delete {
+                    DeleteStatement::SingleRow(v) => v.returning.as_ref(),
+                    DeleteStatement::Predicate(v) => v.returning(),
+                };
+                match crate::sql::parser::bind_returning(returning, &schema)? {
+                    Some(projection) => {
+                        let mut columns = crate::sql::returning::column_meta(&projection, &schema)?;
+                        crate::sql::view_insert::apply_public_names(
+                            &mut columns,
+                            rewritten.public_names.as_deref(),
+                        );
+                        Ok(Some(columns))
+                    }
+                    None => Ok(None),
+                }
+            }
+            ParsedSql::ViewUpdate(stmt) => {
+                let (rewritten, schema) = self
+                    .storage
+                    .with_view_write_snapshot(stmt.view_name(), |snap, _| {
+                        let rewritten = crate::sql::view_dml::rewrite_view_update(snap, stmt)?;
+                        let table = match &rewritten.update {
+                            ValidatedUpdateForm::Single(v) => v.table_name.as_str(),
+                            ValidatedUpdateForm::Predicate(v) => v.table_name(),
+                        };
+                        let schema = snap.table_schema(table).map_err(|e| match e {
+                            CatalogError::TableNotFound(name) => {
+                                crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                            }
+                            other => crate::catalog::table_lookup_error(other),
+                        })?;
+                        Ok::<_, crate::sql::allowlist::SqlSurfaceError>((rewritten, schema))
+                    })
+                    .map_err(crate::catalog::table_lookup_error)??;
+                let returning = match &rewritten.update {
+                    ValidatedUpdateForm::Single(v) => v.returning.as_ref(),
+                    ValidatedUpdateForm::Predicate(v) => v.returning(),
+                };
+                match crate::sql::parser::bind_returning(returning, &schema)? {
                     Some(projection) => {
                         let mut columns = crate::sql::returning::column_meta(&projection, &schema)?;
                         crate::sql::view_insert::apply_public_names(
@@ -10386,23 +10543,31 @@ impl EngineCore {
         )
     }
 
-    /// ビューへの `INSERT`（TABLE-43・Issue #1671）の実行本体。autocommit 腕・明示トランザクション腕
-    /// から呼ばれる。現在のカタログでビューを基表形の INSERT へ書き換え
-    /// （[`crate::sql::view_insert::rewrite_view_insert`]）、既存の基表 INSERT 経路
-    /// （[`Self::execute_insert_form`]／[`Self::execute_insert_returning_form`]）へ流す。制約・
-    /// `--max-insert-rows`・INDEX-4 上限・テナント所有・台帳は基表への書き込みと同じ。
+    /// ビューへの書き込み（`INSERT`／`UPDATE`／`DELETE`。TABLE-43・Issue #1671・#1672）が共有する
+    /// 「スナップショット取得 → 書き換え → 指紋スコープ → 実行 → 再試行」の枠。autocommit 腕・
+    /// 明示トランザクション腕の実行本体（[`Self::execute_view_insert`]・[`Self::execute_view_update`]・
+    /// [`Self::execute_view_delete`]）から呼ばれる。
     ///
-    /// 書き換え後に並行 DDL でビュー連鎖・基表スキーマが変わる TOCTOU は、書き換えの**前に**取った
+    /// `prepare` は同一 read スナップショット上で現在のカタログによりビューを基表形へ書き換える
+    /// （書き換え結果 `P` を返す）。`execute` は書き換え結果を既存の基表 DML 経路（`execute_*_form`）へ
+    /// 流す。書き換え後に並行 DDL でビュー連鎖・基表スキーマが変わる TOCTOU は、書き換えの**前に**取った
     /// 指紋（[`Storage::view_write_fingerprint`]）を [`crate::sql::view_write_scope`] 経由で書き込み
     /// txn の冒頭に照合して検出する（不一致は書き込み前に中断。`CREATE OR REPLACE VIEW` と同じ型の
     /// 上限つき再試行。上限到達は `55P03`）。明示トランザクションでも照合は書き込み前に失敗するため、
-    /// 共有 write txn は汚れず再試行できる。`make_target` は試行ごとに書き込み先を作る。
-    /// 戻り値の第 2 要素は書き換え後の基表名（`mark_written` 用）。
-    fn execute_view_insert<'t>(
+    /// 共有 write txn は汚れず再試行できる。戻り値の第 2 要素は書き換え後の基表名（`mark_written` 用）。
+    fn run_view_write<P>(
         &self,
-        make_target: impl Fn() -> crate::tenant::WriteTarget<'t>,
-        ctx: &PolicyContext,
-        stmt: &crate::sql::allowlist::ValidatedViewInsert,
+        view_name: &str,
+        prepare: impl Fn(
+            &crate::catalog::ViewWriteSnapshot<'_>,
+        ) -> Result<P, crate::sql::allowlist::SqlSurfaceError>,
+        base_table_of: impl Fn(&P) -> String,
+        mut execute: impl FnMut(
+            P,
+        ) -> Result<
+            crate::sql::SqlOutcome,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
     ) -> Result<(crate::sql::SqlOutcome, String), crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::SqlSurfaceError;
         // 並行 DDL による再試行の上限（`CREATE OR REPLACE VIEW` の再試行と同じ小さな固定値の考え方）。
@@ -10412,40 +10577,16 @@ impl EngineCore {
             // ビューが A→B→A と置換されたとき指紋は一致するのに別の表へ書く状態を作れる）。
             let snapshot = self
                 .storage
-                .with_view_write_snapshot(stmt.view_name(), |snap, fingerprint| {
-                    let rewritten = crate::sql::view_insert::rewrite_view_insert(snap, stmt)?;
-                    let schema = snap
-                        .table_schema(&rewritten.insert.table_name)
-                        .map_err(|e| match e {
-                            CatalogError::TableNotFound(name) => {
-                                SqlSurfaceError::UndefinedTable { name }
-                            }
-                            other => crate::catalog::table_lookup_error(other),
-                        })?;
-                    Ok::<_, SqlSurfaceError>((fingerprint, rewritten, schema))
+                .with_view_write_snapshot(view_name, |snap, fingerprint| {
+                    prepare(snap).map(|prepared| (fingerprint, prepared))
                 })
                 .map_err(crate::catalog::table_lookup_error)?;
             // スナップショット内の解決エラーはその時点の状態に対する正当なエラー。
-            let (fingerprint, rewritten, schema) = snapshot?;
-            let base_table = rewritten.insert.table_name.clone();
-            let scope = crate::sql::view_write_scope::ViewWriteScope::enter(
-                stmt.view_name(),
-                fingerprint.clone(),
-            );
-            let lookup = InsertSchemaLookup::with_schema(&self.storage, &base_table, schema);
-            let result = if rewritten.insert.returning.is_some() {
-                self.execute_insert_returning_form(make_target(), ctx, &rewritten.insert, &lookup)
-                    .map(|mut outcome| {
-                        crate::sql::view_insert::apply_public_names(
-                            &mut outcome.result.columns,
-                            rewritten.public_names.as_deref(),
-                        );
-                        crate::sql::SqlOutcome::Returning(outcome)
-                    })
-            } else {
-                self.execute_insert_form(make_target(), ctx, &rewritten.insert, &lookup)
-                    .map(crate::sql::SqlOutcome::Insert)
-            };
+            let (fingerprint, prepared) = snapshot?;
+            let base_table = base_table_of(&prepared);
+            let scope =
+                crate::sql::view_write_scope::ViewWriteScope::enter(view_name, fingerprint.clone());
+            let result = execute(prepared);
             if scope.mismatched() {
                 continue;
             }
@@ -10453,7 +10594,7 @@ impl EngineCore {
             // 並行 DDL が入っていたなら失敗はスナップショット由来の陳腐化なので再試行する。
             // 指紋の再取得に失敗したときは元のエラーを返す（fail-closed）。
             if result.is_err() {
-                if let Ok(current) = self.storage.view_write_fingerprint(stmt.view_name()) {
+                if let Ok(current) = self.storage.view_write_fingerprint(view_name) {
                     if current != fingerprint {
                         continue;
                     }
@@ -10462,6 +10603,157 @@ impl EngineCore {
             return result.map(|outcome| (outcome, base_table));
         }
         Err(SqlSurfaceError::LockNotAvailable)
+    }
+
+    /// ビューへの `INSERT`（TABLE-43・Issue #1671）の実行本体。autocommit 腕・明示トランザクション腕
+    /// から呼ばれる。現在のカタログでビューを基表形の INSERT へ書き換え
+    /// （[`crate::sql::view_insert::rewrite_view_insert`]）、既存の基表 INSERT 経路
+    /// （[`Self::execute_insert_form`]／[`Self::execute_insert_returning_form`]）へ流す。制約・
+    /// `--max-insert-rows`・INDEX-4 上限・テナント所有・台帳は基表への書き込みと同じ。
+    /// 再試行・指紋照合は [`Self::run_view_write`]。`make_target` は試行ごとに書き込み先を作る。
+    fn execute_view_insert<'t>(
+        &self,
+        make_target: impl Fn() -> crate::tenant::WriteTarget<'t>,
+        ctx: &PolicyContext,
+        stmt: &crate::sql::allowlist::ValidatedViewInsert,
+    ) -> Result<(crate::sql::SqlOutcome, String), crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
+        self.run_view_write(
+            stmt.view_name(),
+            |snap| {
+                let rewritten = crate::sql::view_insert::rewrite_view_insert(snap, stmt)?;
+                let schema =
+                    snap.table_schema(&rewritten.insert.table_name)
+                        .map_err(|e| match e {
+                            CatalogError::TableNotFound(name) => {
+                                SqlSurfaceError::UndefinedTable { name }
+                            }
+                            other => crate::catalog::table_lookup_error(other),
+                        })?;
+                Ok((rewritten, schema))
+            },
+            |(rewritten, _)| rewritten.insert.table_name.clone(),
+            |(rewritten, schema)| {
+                let lookup = InsertSchemaLookup::with_schema(
+                    &self.storage,
+                    &rewritten.insert.table_name,
+                    schema,
+                );
+                if rewritten.insert.returning.is_some() {
+                    self.execute_insert_returning_form(
+                        make_target(),
+                        ctx,
+                        &rewritten.insert,
+                        &lookup,
+                    )
+                    .map(|mut outcome| {
+                        crate::sql::view_insert::apply_public_names(
+                            &mut outcome.result.columns,
+                            rewritten.public_names.as_deref(),
+                        );
+                        crate::sql::SqlOutcome::Returning(outcome)
+                    })
+                } else {
+                    self.execute_insert_form(make_target(), ctx, &rewritten.insert, &lookup)
+                        .map(crate::sql::SqlOutcome::Insert)
+                }
+            },
+        )
+    }
+
+    /// ビューへの `DELETE`（TABLE-43・Issue #1672）の実行本体。現在のカタログでビューを基表形の
+    /// DELETE（ビューの述語と利用者の述語を AND 合成）へ書き換え
+    /// （[`crate::sql::view_dml::rewrite_view_delete`]）、既存の基表 DELETE 経路
+    /// （[`Self::execute_delete_form`]・[`Self::execute_predicate_delete_form`] とその
+    /// `RETURNING` 版）へ流す。影響行数の上限（`--max-dml-affected-rows`）・RLS・台帳は基表への
+    /// 書き込みと同じ。`PARTITIONED` は書き換えの段で拒否済み（`0A000`）。
+    fn execute_view_delete<'t>(
+        &self,
+        make_target: impl Fn() -> crate::tenant::WriteTarget<'t>,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedViewDelete,
+    ) -> Result<(crate::sql::SqlOutcome, String), crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::DeleteStatement;
+        self.run_view_write(
+            stmt.view_name(),
+            |snap| crate::sql::view_dml::rewrite_view_delete(snap, stmt),
+            |rewritten| match &rewritten.delete {
+                DeleteStatement::SingleRow(v) => v.table_name.clone(),
+                DeleteStatement::Predicate(v) => v.table_name().to_string(),
+            },
+            |rewritten| {
+                let names = rewritten.public_names.as_deref();
+                let returning = |mut outcome: crate::sql::exec::ReturningOutcome| {
+                    crate::sql::view_insert::apply_public_names(&mut outcome.result.columns, names);
+                    crate::sql::SqlOutcome::Returning(outcome)
+                };
+                match &rewritten.delete {
+                    DeleteStatement::SingleRow(v) if v.returning.is_some() => self
+                        .execute_delete_returning_form(make_target(), ctx, v)
+                        .map(returning),
+                    DeleteStatement::SingleRow(v) => self
+                        .execute_delete_form(make_target(), ctx, v)
+                        .map(crate::sql::SqlOutcome::Delete),
+                    DeleteStatement::Predicate(v) if v.returning().is_some() => self
+                        .execute_predicate_delete_returning_form(make_target(), ctx, session, v)
+                        .map(returning),
+                    DeleteStatement::Predicate(v) => self
+                        .execute_predicate_delete_form(make_target(), ctx, session, v)
+                        .map(crate::sql::SqlOutcome::Delete),
+                }
+            },
+        )
+    }
+
+    /// ビューへの `UPDATE`（TABLE-43・Issue #1672）の実行本体。[`Self::execute_view_delete`] と同じ
+    /// 構成で、基表形の UPDATE を [`Self::execute_predicate_update_form`]／
+    /// [`Self::execute_update_returning_form`] へ流す。
+    fn execute_view_update<'t>(
+        &self,
+        make_target: impl Fn() -> crate::tenant::WriteTarget<'t>,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedViewUpdate,
+    ) -> Result<(crate::sql::SqlOutcome, String), crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::ValidatedUpdateForm;
+        self.run_view_write(
+            stmt.view_name(),
+            |snap| crate::sql::view_dml::rewrite_view_update(snap, stmt),
+            |rewritten| match &rewritten.update {
+                ValidatedUpdateForm::Single(v) => v.table_name.clone(),
+                ValidatedUpdateForm::Predicate(v) => v.table_name().to_string(),
+            },
+            |rewritten| {
+                let has_returning = match &rewritten.update {
+                    ValidatedUpdateForm::Single(v) => v.returning.is_some(),
+                    ValidatedUpdateForm::Predicate(v) => v.returning().is_some(),
+                };
+                if has_returning {
+                    self.execute_update_returning_form(
+                        make_target(),
+                        ctx,
+                        session,
+                        &rewritten.update,
+                    )
+                    .map(|mut outcome| {
+                        crate::sql::view_insert::apply_public_names(
+                            &mut outcome.result.columns,
+                            rewritten.public_names.as_deref(),
+                        );
+                        crate::sql::SqlOutcome::Returning(outcome)
+                    })
+                } else {
+                    self.execute_predicate_update_form(
+                        make_target(),
+                        ctx,
+                        session,
+                        &rewritten.update,
+                    )
+                    .map(crate::sql::SqlOutcome::Update)
+                }
+            },
+        )
     }
 
     /// [`Self::execute_insert_sql`]・[`Self::execute_sql_in_session`] の
