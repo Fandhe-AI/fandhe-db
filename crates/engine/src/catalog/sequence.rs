@@ -552,6 +552,57 @@ impl SequenceAllocator {
         Ok(())
     }
 
+    /// `setval` の現在値を `write_txn` へ書く（TABLE-24・Issue #1691。設計記録 D4）。保持件数の上限は
+    /// 書き込みの前に検査する（超過は [`AllocError::TooManyCursors`]）。`apply_now` が真なら
+    /// 同じ呼び出しでメモリ上の現在値も更新する（明示・暗黙トランザクション用。ROLLBACK しても
+    /// メモリは戻らず、後続の `nextval` が `setval` の値から続く。PostgreSQL の `setval` が
+    /// 非トランザクション的なのと同じ）。偽のときは更新せず、呼び出し元が commit 成功後に
+    /// [`Self::apply_set_value`] を呼ぶ（autocommit 用。commit 前に更新すると、commit 失敗でメモリが
+    /// 永続値より後ろへ下がり、払い出し済みの値を再び払い出しうる）。
+    pub(crate) fn set_value_in_txn(
+        &self,
+        write_txn: &redb::WriteTransaction,
+        tenant: &str,
+        sequence_id: u64,
+        cursor_value: (i64, bool),
+        apply_now: bool,
+    ) -> std::result::Result<(), AllocError> {
+        let cursor = SeqCursor {
+            last_value: cursor_value.0,
+            is_called: cursor_value.1,
+        };
+        let mut guard = self.cursors.lock().map_err(|_| AllocError::Poisoned)?;
+        let key = (tenant.to_string(), sequence_id);
+        if !guard.contains_key(&key) && guard.len() >= MAX_CURSORS {
+            return Err(AllocError::TooManyCursors);
+        }
+        write_state_in_txn(write_txn, tenant, sequence_id, &cursor)?;
+        if apply_now {
+            guard.insert(key, cursor);
+        }
+        Ok(())
+    }
+
+    /// commit 成功後に `setval` の値をメモリ上の現在値へ反映する（[`Self::set_value_in_txn`] を
+    /// `apply_now = false` で呼んだ autocommit 経路用。writer permit を保持したまま呼ぶ）。
+    /// ロックの毒化は黙って握りつぶさず、次回の払い出しが `Poisoned`（`XX000`）で失敗する。
+    pub(crate) fn apply_set_value(
+        &self,
+        tenant: &str,
+        sequence_id: u64,
+        cursor_value: (i64, bool),
+    ) {
+        if let Ok(mut guard) = self.cursors.lock() {
+            guard.insert(
+                (tenant.to_string(), sequence_id),
+                SeqCursor {
+                    last_value: cursor_value.0,
+                    is_called: cursor_value.1,
+                },
+            );
+        }
+    }
+
     /// `sequence_id` の現在値を全テナント分メモリから捨てる（`DROP SEQUENCE`・RESTART の commit 成功後。
     /// ロックの毒化は黙って握りつぶさず、次回払い出しで `Poisoned` になる）。
     pub(crate) fn evict(&self, sequence_id: u64) {
@@ -694,6 +745,89 @@ fn caller_current_value_in_txn(
         return Ok(mem);
     }
     Ok(read_state_in_txn(write_txn, tenant_id, id)?.map(|c| c.last_value))
+}
+
+/// `setval` の失敗（`sql::sequence_fn` が SQL 表層のエラーへ写像する）。
+#[derive(Debug)]
+pub(crate) enum SetvalError {
+    /// 値が `[min_value, max_value]` の外（`22003`）。
+    OutOfRange,
+    /// セッションの `currval` 状態の保持件数が上限に達した（`54000`）。
+    SessionFull,
+    /// アロケータのエラー（保持件数上限・ロック毒化・永続化層）。
+    Alloc(AllocError),
+    /// カタログのエラー（不在 `42P01`・他種別 `42809`・破損）。
+    Catalog(CatalogError),
+}
+
+impl From<CatalogError> for SetvalError {
+    fn from(e: CatalogError) -> Self {
+        SetvalError::Catalog(e)
+    }
+}
+
+impl From<AllocError> for SetvalError {
+    fn from(e: AllocError) -> Self {
+        SetvalError::Alloc(e)
+    }
+}
+
+/// `setval` の入力（名前・値・`is_called`）。
+pub(crate) struct SetvalArgs<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) value: i64,
+    pub(crate) is_called: bool,
+}
+
+/// `setval(name, value, is_called)` の本体（TABLE-24・Issue #1691）。同一 `write_txn` 内で名前の
+/// 解決（他種別 `WrongObjectKind`・不在 `TableNotFound`。存在情報はテナント非依存）→ 範囲検査
+/// （`min_value <= value <= max_value`）→ `admit`（セッション状態の受け入れ可否。偽なら
+/// [`SetvalError::SessionFull`]）→ 呼び出し元テナントの状態行の書き込み、を行い内部 ID を返す。
+/// 作用するのは `(tenant_id, sequence_id)` の 1 行だけで、他テナントの採番には影響しない
+/// （TABLE-24 (2)）。`apply_now` の意味は [`SequenceAllocator::set_value_in_txn`] を参照。
+pub(crate) fn setval_in_txn(
+    allocator: &SequenceAllocator,
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    args: &SetvalArgs<'_>,
+    admit: impl FnOnce(u64) -> bool,
+    apply_now: bool,
+) -> std::result::Result<u64, SetvalError> {
+    validate_identifier(args.name)?;
+    let bytes = load_sequence_bytes_in_txn(write_txn, args.name)?;
+    let def = decode_sequence_def(&bytes)?;
+    if args.value < def.params.min_value || args.value > def.params.max_value {
+        return Err(SetvalError::OutOfRange);
+    }
+    if !admit(def.id) {
+        return Err(SetvalError::SessionFull);
+    }
+    allocator.set_value_in_txn(
+        write_txn,
+        tenant_id,
+        def.id,
+        (args.value, args.is_called),
+        apply_now,
+    )?;
+    Ok(def.id)
+}
+
+/// 内部 ID `id` の SEQUENCE が定義として存在するか（`lastval` の存在確認用。TABLE-24・Issue #1691）。
+/// 名前ではなく ID で引くため、RENAME 後も真で、DROP 後に同名で作り直しても偽になる。走査は
+/// [`MAX_SEQUENCES`] 件で打ち切り、定義 blob の復号失敗は `CorruptSchema`（fail-closed）。
+pub(crate) fn sequence_id_exists_in<R: ReadSource>(src: &R, id: u64) -> Result<bool> {
+    let table = match src.open_table(SEQUENCES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in table.iter()?.take(MAX_SEQUENCES) {
+        let (_, v) = entry?;
+        if decode_sequence_def(v.value())?.id == id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl Storage {
@@ -840,6 +974,38 @@ impl Storage {
             table.insert(sequence_key(new), bytes.as_slice())?;
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
+    }
+
+    /// `setval` を autocommit で実行する（TABLE-24・Issue #1691。設計記録 D4）。自前の書き込み txn で
+    /// [`setval_in_txn`] を行い、commit 成功後に writer permit を保持したままメモリ上の現在値を
+    /// 反映する（commit 失敗時はメモリを変えない）。operation_id 台帳は開かない（冪等で、台帳には
+    /// 採番値を保存しない。D1）。`sql::sequence_fn` から呼ばれ、内部 ID を返す。
+    pub(crate) fn set_sequence_value(
+        &self,
+        tenant_id: &str,
+        args: &SetvalArgs<'_>,
+        admit: impl FnOnce(u64) -> bool,
+    ) -> std::result::Result<u64, SetvalError> {
+        validate_identifier(args.name)?;
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::convert_storage_error)?;
+        let allocator = self.sequence_allocator();
+        let id = setval_in_txn(allocator, &write_txn, tenant_id, args, admit, false)?;
+        let cursor = (args.value, args.is_called);
+        crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
+            allocator.apply_set_value(tenant_id, id, cursor);
+            crate::recovery::commit_boundary::PostCommitResult::Ok
+        })
+        .map_err(super::convert_storage_error)?;
+        Ok(id)
+    }
+
+    /// 内部 ID `id` の SEQUENCE が存在するかをスナップショット読み取りで返す（autocommit の
+    /// `lastval` 用。[`sequence_id_exists_in`]）。
+    pub(crate) fn sequence_id_exists(&self, id: u64) -> Result<bool> {
+        let read_txn = self.db().begin_read()?;
+        sequence_id_exists_in(&read_txn, id)
     }
 
     /// 定義をスナップショット読み取りで取得する（`(id, params)`。無ければ `None`）。
@@ -1622,5 +1788,164 @@ mod tests {
         eprintln!("sequence drop scan (10000 tenants x 2 sequences): {elapsed:?}");
         assert!(!state_exists(&s, "tenant0", ida));
         assert!(state_exists(&s, "tenant9999", idb));
+    }
+}
+/// `setval`／`lastval` のカタログ層（TABLE-24・Issue #1691）。
+#[cfg(test)]
+mod setval_tests {
+    use super::*;
+
+    fn tmp_storage(label: &str) -> (Storage, crate::test_util::temp_db::CleanupGuard) {
+        let path = crate::test_util::temp_db::unique_db_path(label);
+        let guard = crate::test_util::temp_db::CleanupGuard(path.clone());
+        (Storage::open(&path).expect("open storage"), guard)
+    }
+
+    fn params() -> SequenceParams {
+        SequenceParams {
+            increment: 1,
+            min_value: 1,
+            max_value: 100,
+            start: 1,
+            cycle: false,
+        }
+    }
+
+    fn args(name: &str, value: i64, is_called: bool) -> SetvalArgs<'_> {
+        SetvalArgs {
+            name,
+            value,
+            is_called,
+        }
+    }
+
+    /// 次の払い出し値（永続化まで行う）。
+    fn next(s: &Storage, tenant: &str, id: u64, p: &SequenceParams) -> i64 {
+        let txn = s.begin_write_txn().expect("txn");
+        let v = s
+            .sequence_allocator()
+            .next_value_in_txn(&txn, tenant, id, p, p.start)
+            .expect("next");
+        crate::recovery::commit_boundary::commit(txn).expect("commit");
+        v
+    }
+
+    #[test]
+    fn set_sequence_value_then_next_follows_is_called() {
+        let (s, _g) = tmp_storage("setval_basic");
+        s.create_sequence("a", &params()).expect("create");
+        let (id, p) = s.sequence_definition("a").unwrap().unwrap();
+        let got = s
+            .set_sequence_value("t1", &args("a", 10, true), |_| true)
+            .expect("setval");
+        assert_eq!(got, id);
+        assert_eq!(next(&s, "t1", id, &p), 11);
+        s.set_sequence_value("t1", &args("a", 50, false), |_| true)
+            .expect("setval");
+        assert_eq!(next(&s, "t1", id, &p), 50);
+        // 他テナントは影響を受けない。
+        assert_eq!(next(&s, "t2", id, &p), 1);
+    }
+
+    #[test]
+    fn set_sequence_value_checks_range_and_names() {
+        let (s, _g) = tmp_storage("setval_range");
+        s.create_sequence("a", &params()).expect("create");
+        for v in [0, 101, i64::MIN, i64::MAX] {
+            assert!(matches!(
+                s.set_sequence_value("t1", &args("a", v, true), |_| true),
+                Err(SetvalError::OutOfRange)
+            ));
+        }
+        for v in [1, 100] {
+            s.set_sequence_value("t1", &args("a", v, true), |_| true)
+                .expect("bounds are inclusive");
+        }
+        assert!(matches!(
+            s.set_sequence_value("t1", &args("nope", 1, true), |_| true),
+            Err(SetvalError::Catalog(CatalogError::TableNotFound(_)))
+        ));
+        assert!(matches!(
+            s.set_sequence_value("t1", &args("a", 1, true), |_| false),
+            Err(SetvalError::SessionFull)
+        ));
+    }
+
+    #[test]
+    fn autocommit_setval_is_persisted_and_survives_a_fresh_allocator() {
+        let (s, _g) = tmp_storage("setval_persist");
+        s.create_sequence("a", &params()).expect("create");
+        let (id, p) = s.sequence_definition("a").unwrap().unwrap();
+        s.set_sequence_value("t1", &args("a", 20, true), |_| true)
+            .expect("setval");
+        let fresh = SequenceAllocator::default();
+        let txn = s.begin_write_txn().expect("txn");
+        assert_eq!(
+            fresh
+                .next_value_in_txn(&txn, "t1", id, &p, p.start)
+                .expect("v"),
+            21
+        );
+    }
+
+    #[test]
+    fn txn_setval_applies_memory_immediately_and_rollback_keeps_it() {
+        let (s, _g) = tmp_storage("setval_txn");
+        s.create_sequence("a", &params()).expect("create");
+        let (id, p) = s.sequence_definition("a").unwrap().unwrap();
+        let txn = s.begin_write_txn().expect("txn");
+        setval_in_txn(
+            s.sequence_allocator(),
+            &txn,
+            "t1",
+            &args("a", 30, true),
+            |_| true,
+            true,
+        )
+        .expect("setval");
+        assert_eq!(
+            s.sequence_allocator()
+                .next_value_in_txn(&txn, "t1", id, &p, p.start)
+                .expect("v"),
+            31
+        );
+        drop(txn); // ROLLBACK 相当
+                   // メモリ上の現在値は戻らない（欠番。再払い出しをしない）。
+        assert_eq!(next(&s, "t1", id, &p), 32);
+    }
+
+    #[test]
+    fn deferred_apply_does_not_touch_memory_before_commit() {
+        let (s, _g) = tmp_storage("setval_deferred");
+        s.create_sequence("a", &params()).expect("create");
+        let (id, p) = s.sequence_definition("a").unwrap().unwrap();
+        assert_eq!(next(&s, "t1", id, &p), 1);
+        let txn = s.begin_write_txn().expect("txn");
+        setval_in_txn(
+            s.sequence_allocator(),
+            &txn,
+            "t1",
+            &args("a", 50, true),
+            |_| true,
+            false,
+        )
+        .expect("setval");
+        drop(txn); // commit しない
+        assert_eq!(next(&s, "t1", id, &p), 2);
+    }
+
+    #[test]
+    fn sequence_id_exists_tracks_drop_rename_and_recreate() {
+        let (s, _g) = tmp_storage("setval_exists");
+        assert!(!s.sequence_id_exists(1).expect("empty"));
+        s.create_sequence("a", &params()).expect("create");
+        let (id, _) = s.sequence_definition("a").unwrap().unwrap();
+        assert!(s.sequence_id_exists(id).expect("exists"));
+        s.rename_sequence("a", "b").expect("rename");
+        assert!(s.sequence_id_exists(id).expect("renamed"));
+        s.drop_sequence("b").expect("drop");
+        assert!(!s.sequence_id_exists(id).expect("dropped"));
+        s.create_sequence("b", &params()).expect("recreate");
+        assert!(!s.sequence_id_exists(id).expect("new id"));
     }
 }

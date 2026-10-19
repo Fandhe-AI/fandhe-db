@@ -1682,6 +1682,13 @@ pub enum ParsedSql {
     DropSequence(crate::sql::allowlist::ValidatedDropSequence),
     /// `ALTER SEQUENCE`（TABLE-24、Issue #1689）。
     AlterSequence(crate::sql::allowlist::ValidatedAlterSequence),
+    /// `SELECT setval('<名>', <n>[, <is_called>])`／`SELECT lastval()` の単独形（TABLE-24・
+    /// ERR-6、Issue #1691）。書き込み txn を伴うため、ストレージに触れない `ConstSelect`（#1531）
+    /// には乗せない。結果は 1 行 1 列の `bigint`（`SqlOutcome::Query`）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1691）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    SequenceFunction(crate::sql::allowlist::ValidatedSequenceFunction),
 }
 
 /// 読み取り文（[`ParsedSql::Statement`]）と書き込み文（INSERT／UPDATE／DELETE の原子版）が
@@ -1758,7 +1765,8 @@ fn statement_clock_scope(
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
-        | ParsedSql::AlterSequence(_) => false,
+        | ParsedSql::AlterSequence(_)
+        | ParsedSql::SequenceFunction(_) => false,
     };
     if !is_read {
         return Ok(None);
@@ -1810,7 +1818,8 @@ fn insert_sequence_scope(
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
-        | ParsedSql::AlterSequence(_) => false,
+        | ParsedSql::AlterSequence(_)
+        | ParsedSql::SequenceFunction(_) => false,
     };
     is_insert.then(|| {
         crate::sql::sequence_scope::SequenceScope::enter(
@@ -1860,7 +1869,8 @@ fn insert_default_clock_scope(
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
-        | ParsedSql::AlterSequence(_) => false,
+        | ParsedSql::AlterSequence(_)
+        | ParsedSql::SequenceFunction(_) => false,
     };
     if !is_insert {
         return Ok(None);
@@ -4285,6 +4295,14 @@ impl EngineCore {
             return Ok(ParsedSql::Transaction(ctrl));
         }
 
+        // TABLE-24・Issue #1691: `SELECT setval(...)`／`SELECT lastval()` は専用の検証器で受理するか
+        // 拒否する。`ConstSelect` の一般経路へ流すと書き込みを伴う関数が式として評価されうるため、
+        // 先頭がこの形なら必ずここで結論を出す（fail-closed）。
+        if crate::sql::allowlist::is_sequence_function_select(&tokens) {
+            let stmt = crate::sql::allowlist::validate_sequence_function_tokens(&tokens)?;
+            return Ok(ParsedSql::SequenceFunction(stmt));
+        }
+
         // TABLE-33・Issue #1575: `SHOW timezone`／`SHOW TIME ZONE` は分割実行 DML の `SHOW` より
         // 先に厳密一致で取り出す（それ以外の `SHOW` の挙動は変えない）。
         if crate::sql::allowlist::is_show_time_zone(&tokens) {
@@ -4728,6 +4746,19 @@ impl EngineCore {
             return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                 "bind parameters are not supported in CREATE VIEW / DROP VIEW / CREATE TYPE / DROP TYPE",
             ));
+        }
+        // TABLE-24・Issue #1691: `setval`／`lastval` は実値を要する構文形のため `$n` を一律 `0A000` で
+        // 拒否する（ダミー置換より前に判定する。位置検査の `42601` より優先）。
+        if crate::sql::allowlist::is_sequence_function_select(&tokens)
+            && tokens
+                .iter()
+                .any(|t| matches!(t, crate::sql::lexer::Token::Param(_)))
+        {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "bind parameters are not supported in setval / lastval",
+                ),
+            );
         }
         let param_count = crate::sql::params::validate_param_positions(&tokens)?;
         // Issue #927・SQL-29 (a)・TASK-213（拡張クエリプロトコルの注意点）:
@@ -5597,6 +5628,17 @@ impl EngineCore {
                     crate::sql::ddl::execute_alter_sequence(&self.storage, ctx.tenant_id(), stmt)?;
                 Ok(crate::sql::SqlOutcome::AlterSequence(outcome))
             }
+            // TABLE-24・Issue #1691: `setval`／`lastval`。DDL 権限ゲートはかけない（作用範囲が呼び出し元
+            // テナントに閉じるため。設計記録 §10）。
+            ParsedSql::SequenceFunction(stmt) => {
+                let result = crate::sql::sequence_fn::execute_autocommit(
+                    &self.storage,
+                    session,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
             }
@@ -6028,6 +6070,25 @@ impl EngineCore {
             }
             ParsedSql::SessionRouted(routed) => {
                 self.execute_temp_routed_in_txn(ctx, session, txn, routed)
+            }
+            // TABLE-24・Issue #1691: 共有 write txn へ状態行を書く（commit は COMMIT 時）。表を書かないため
+            // `mark_written` の相手がなく、`has_writes` だけを立てる（立てないと COMMIT が write txn を
+            // 破棄して setval の永続化が落ちる）。`lastval` は読み取りのみで印を付けない。
+            ParsedSql::SequenceFunction(stmt) => {
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let (result, wrote) = crate::sql::sequence_fn::execute_in_txn(
+                    &self.storage,
+                    write_txn,
+                    session,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                if wrote {
+                    txn.mark_sequence_written();
+                }
+                Ok(crate::sql::SqlOutcome::Query(result))
             }
             // COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
@@ -6799,6 +6860,8 @@ impl EngineCore {
             ParsedSql::CreateSequence(_) => Ok(None),
             ParsedSql::DropSequence(_) => Ok(None),
             ParsedSql::AlterSequence(_) => Ok(None),
+            // Issue #1691: 結果列（1 列・bigint）だけを返し、`setval` の書き込みは実行しない。
+            ParsedSql::SequenceFunction(stmt) => Ok(Some(crate::sql::sequence_fn::columns(stmt))),
             ParsedSql::Delete(DeleteStatement::SingleRow(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
                 match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {

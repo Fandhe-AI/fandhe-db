@@ -662,6 +662,15 @@ impl<'e> SessionTransaction<'e> {
         Ok(())
     }
 
+    /// 表を書かない永続状態の書き込み（`setval` の採番状態行。TABLE-24・Issue #1691）を記録する。
+    /// `has_writes` だけを立てる（立てないと COMMIT が書き込み txn を破棄して永続化が落ちる）。
+    /// `written_tables`・`written_by_tenant` には偽の名前を入れない（遅延 FK 検査の対象は増えない）。
+    pub(crate) fn mark_sequence_written(&mut self) {
+        if let TxnState::Active(active) = &mut self.state {
+            active.has_writes = true;
+        }
+    }
+
     /// 対象テーブルへの書き込みを記録する（読み取りの `written_tables` 判定用に
     /// 加え、`tenant_id` を伴う `written_by_tenant` へも記録する。TABLE-17・
     /// TASK-205、Issue #1077。COMMIT 時の遅延 `FOREIGN KEY` 検査の走査範囲は

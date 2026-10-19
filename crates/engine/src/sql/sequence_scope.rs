@@ -28,7 +28,8 @@ pub(crate) struct SessionSequenceState {
     /// キーは `(tenant_id, sequence_id)`。同じ `SessionState` を別テナントの `PolicyContext` で
     /// 使っても、他テナントの `nextval` の結果を `currval` で読めないようにする（テナント境界）。
     currval: HashMap<(String, u64), i64>,
-    /// 直近に `nextval` が成功した `(tenant_id, sequence_id)`（`lastval` 用の器。意味の設計は #1691）。
+    /// 直近に `nextval` が成功した `(tenant_id, sequence_id)`（`lastval` の対象。TABLE-24・Issue #1691。
+    /// `setval` は変えない）。
     last: Option<(String, u64)>,
 }
 
@@ -52,6 +53,47 @@ impl SessionSequenceState {
         self.currval
             .get(&(tenant_id.to_string(), sequence_id))
             .copied()
+    }
+
+    /// 新しい SEQUENCE をこの状態へ記録できるか（件数上限の事前検査。`setval` が commit の前に
+    /// 呼び、commit 後の記録が上限で失敗して「永続化済みなのにエラー」にならないようにする）。
+    pub(crate) fn can_record(&self, tenant_id: &str, sequence_id: u64) -> bool {
+        self.currval.len() < MAX_SESSION_SEQUENCES
+            || self
+                .currval
+                .contains_key(&(tenant_id.to_string(), sequence_id))
+    }
+
+    /// `setval(..., true)` の値を `currval` へ記録する（TABLE-24・Issue #1691）。PostgreSQL の
+    /// `setval` と同じく `lastval` の対象（`last`）は変えない。件数上限を超える新規 SEQUENCE は
+    /// `false`（拒否）。`is_called = false` の `setval` は呼び出し元が本関数を呼ばない。
+    pub(crate) fn record_setval(&mut self, tenant_id: &str, sequence_id: u64, value: i64) -> bool {
+        let key = (tenant_id.to_string(), sequence_id);
+        if !self.currval.contains_key(&key) && self.currval.len() >= MAX_SESSION_SEQUENCES {
+            return false;
+        }
+        self.currval.insert(key, value);
+        true
+    }
+
+    /// `lastval` の対象 `(sequence_id, 値)`。呼び出し元テナントのものだけを返し、`nextval` 未呼び出し・
+    /// 他テナントが最後に使った場合は `None`（`55000`。テナント境界）。
+    pub(crate) fn lastval(&self, tenant_id: &str) -> Option<(u64, i64)> {
+        let (t, id) = self.last.as_ref()?;
+        if t != tenant_id {
+            return None;
+        }
+        let value = self.currval.get(&(t.clone(), *id)).copied()?;
+        Some((*id, value))
+    }
+
+    /// 消えた SEQUENCE（DROP 済み）のエントリを捨てる（`lastval` が存在確認に失敗したとき。設計記録 D6）。
+    pub(crate) fn forget(&mut self, tenant_id: &str, sequence_id: u64) {
+        let key = (tenant_id.to_string(), sequence_id);
+        self.currval.remove(&key);
+        if self.last.as_ref() == Some(&key) {
+            self.last = None;
+        }
     }
 }
 
@@ -178,6 +220,42 @@ mod tests {
         assert!(s.record_nextval("alice", 1, 5));
         assert_eq!(s.currval("bob", 1), None);
         assert_eq!(s.currval("alice", 1), Some(5));
+    }
+
+    #[test]
+    fn setval_updates_currval_but_not_last() {
+        let mut s = SessionSequenceState::default();
+        assert!(s.record_setval("t", 1, 50));
+        assert_eq!(s.currval("t", 1), Some(50));
+        assert_eq!(s.lastval("t"), None);
+        assert!(s.record_nextval("t", 2, 7));
+        assert!(s.record_setval("t", 2, 50));
+        assert_eq!(s.lastval("t"), Some((2, 50)));
+        assert!(s.record_setval("t", 1, 60));
+        assert_eq!(s.lastval("t"), Some((2, 50)));
+    }
+
+    #[test]
+    fn lastval_is_isolated_per_tenant_and_forget_clears_it() {
+        let mut s = SessionSequenceState::default();
+        assert!(s.record_nextval("alice", 1, 5));
+        assert_eq!(s.lastval("bob"), None);
+        assert_eq!(s.lastval("alice"), Some((1, 5)));
+        s.forget("alice", 1);
+        assert_eq!(s.lastval("alice"), None);
+        assert_eq!(s.currval("alice", 1), None);
+    }
+
+    #[test]
+    fn can_record_allows_existing_key_at_the_cap() {
+        let mut s = SessionSequenceState::default();
+        assert!(s.can_record("t", 1));
+        for id in 0..MAX_SESSION_SEQUENCES as u64 {
+            assert!(s.record_setval("t", id, 1));
+        }
+        assert!(!s.can_record("t", u64::MAX));
+        assert!(!s.record_setval("t", u64::MAX, 1));
+        assert!(s.can_record("t", 0));
     }
 
     #[test]
