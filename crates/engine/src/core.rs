@@ -1676,6 +1676,10 @@ pub enum ParsedSql {
     CreateType(crate::sql::allowlist::ValidatedCreateType),
     /// `DROP TYPE <name>`（TABLE-14・SQL-23・TASK-198、Issue #1194）。
     DropType(crate::sql::allowlist::ValidatedDropType),
+    /// `CREATE SEQUENCE`（TABLE-24、Issue #1688）。
+    CreateSequence(crate::sql::allowlist::ValidatedCreateSequence),
+    /// `DROP SEQUENCE`（TABLE-24、Issue #1688）。
+    DropSequence(crate::sql::allowlist::ValidatedDropSequence),
 }
 
 /// 読み取り文（[`ParsedSql::Statement`]）と書き込み文（INSERT／UPDATE／DELETE の原子版）が
@@ -1749,7 +1753,9 @@ fn statement_clock_scope(
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_)
         | ParsedSql::CreateType(_)
-        | ParsedSql::DropType(_) => false,
+        | ParsedSql::DropType(_)
+        | ParsedSql::CreateSequence(_)
+        | ParsedSql::DropSequence(_) => false,
     };
     if !is_read {
         return Ok(None);
@@ -1800,7 +1806,9 @@ fn insert_default_clock_scope(
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_)
         | ParsedSql::CreateType(_)
-        | ParsedSql::DropType(_) => false,
+        | ParsedSql::DropType(_)
+        | ParsedSql::CreateSequence(_)
+        | ParsedSql::DropSequence(_) => false,
     };
     if !is_insert {
         return Ok(None);
@@ -3535,6 +3543,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
                     | crate::sql::SqlOutcome::DropType(_)
+                    | crate::sql::SqlOutcome::CreateSequence(_)
+                    | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -3582,6 +3592,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
                     | crate::sql::SqlOutcome::DropType(_)
+                    | crate::sql::SqlOutcome::CreateSequence(_)
+                    | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -3626,6 +3638,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
                     | crate::sql::SqlOutcome::DropType(_)
+                    | crate::sql::SqlOutcome::CreateSequence(_)
+                    | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -3677,6 +3691,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
                     | crate::sql::SqlOutcome::DropType(_)
+                    | crate::sql::SqlOutcome::CreateSequence(_)
+                    | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -3734,6 +3750,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::CreateType(_)
                     | crate::sql::SqlOutcome::DropType(_)
+                    | crate::sql::SqlOutcome::CreateSequence(_)
+                    | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -4408,6 +4426,11 @@ impl EngineCore {
         // `validate_drop_index_tokens` はカタログ照会を一切行わない
         // （`DropTable`・`DropView` と同じ設計）。
         // Issue #1194: `DROP TYPE` も汎用 `DROP`（`DROP TABLE` 扱い）より前に分岐する。
+        // Issue #1688: `DROP SEQUENCE` も汎用 `DROP` より前に分岐する（カタログ照会なし）。
+        if crate::sql::allowlist::is_drop_sequence_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_drop_sequence_tokens(&tokens)?;
+            return Ok(ParsedSql::DropSequence(stmt));
+        }
         if crate::sql::allowlist::is_drop_type_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_type_tokens(&tokens)?;
             return Ok(ParsedSql::DropType(stmt));
@@ -4490,6 +4513,11 @@ impl EngineCore {
         // `sql::allowlist::validate_sql_tokens` 内の `CREATE FUNCTION` 分岐へ
         // 渡さない。
         // Issue #1194: `CREATE TYPE` も `CREATE FUNCTION` 分岐へ渡さない。
+        // Issue #1688: `CREATE [TEMP|UNLOGGED] SEQUENCE` も `CREATE TABLE`／`FUNCTION` 分岐へ渡さない。
+        if crate::sql::allowlist::is_create_sequence_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_sequence_tokens(&tokens)?;
+            return Ok(ParsedSql::CreateSequence(stmt));
+        }
         if crate::sql::allowlist::is_create_type_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_type_tokens(&tokens)?;
             return Ok(ParsedSql::CreateType(stmt));
@@ -5455,6 +5483,18 @@ impl EngineCore {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 let outcome = crate::sql::ddl::execute_drop_type(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropType(outcome))
+            }
+            // TABLE-24・SQL-23（Issue #1688）: 他の DDL と同じ判定順序（DDL 実行権限ゲート →
+            // 実行本体）。SEQUENCE の定義は全テナント共有カタログで `ctx` は取らない。
+            ParsedSql::CreateSequence(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_create_sequence(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::CreateSequence(outcome))
+            }
+            ParsedSql::DropSequence(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_drop_sequence(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::DropSequence(outcome))
             }
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
@@ -6652,6 +6692,9 @@ impl EngineCore {
             // Issue #1194: 型 DDL も結果列を持たない。
             ParsedSql::CreateType(_) => Ok(None),
             ParsedSql::DropType(_) => Ok(None),
+            // Issue #1688: SEQUENCE DDL も結果列を持たない。
+            ParsedSql::CreateSequence(_) => Ok(None),
+            ParsedSql::DropSequence(_) => Ok(None),
             ParsedSql::Delete(DeleteStatement::SingleRow(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
                 match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {

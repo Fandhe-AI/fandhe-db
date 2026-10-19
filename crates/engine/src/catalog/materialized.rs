@@ -469,6 +469,7 @@ fn insert_def_in_txn(
         || super::view_exists_in_txn(write_txn, &def.name)?
         || super::index_name_exists_in_txn(write_txn, &def.name)?
         || super::materialized_view_exists_in_txn(write_txn, &def.name)?
+        || super::sequence::sequence_exists_in_txn(write_txn, &def.name)?
     {
         return Err(CatalogError::TableAlreadyExists(def.name.clone()));
     }
@@ -1176,6 +1177,7 @@ impl Storage {
             } else if super::table_exists_in_txn(&write_txn, name)?
                 || super::view_exists_in_txn(&write_txn, name)?
                 || super::index_name_exists_in_txn(&write_txn, name)?
+                || super::sequence::sequence_exists_in_txn(&write_txn, name)?
             {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             } else if if_exists {

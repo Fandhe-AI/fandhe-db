@@ -914,6 +914,13 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropType(_) => OutcomeResponse::Command {
             tag: "DROP TYPE".to_string(),
         },
+        // TABLE-24・SQL-23（Issue #1688）: SEQUENCE DDL も件数を持たない固定タグ。
+        SqlOutcome::CreateSequence(_) => OutcomeResponse::Command {
+            tag: "CREATE SEQUENCE".to_string(),
+        },
+        SqlOutcome::DropSequence(_) => OutcomeResponse::Command {
+            tag: "DROP SEQUENCE".to_string(),
+        },
     }
 }
 

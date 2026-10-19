@@ -12905,6 +12905,266 @@ pub(crate) fn validate_drop_type_tokens(
     Ok(ValidatedDropType { name, if_exists })
 }
 
+/// `CREATE SEQUENCE <name> [option ...]` の許可形状構造検証結果（TABLE-24・SQL-23、Issue #1688）。
+/// 数値は i64 へ解釈済みで、既定値の補完と範囲の意味検証（`22023`）は `sql::ddl` が担う。
+/// カタログ照会は一切行わない（重複・種別は Storage 側の判定に一本化する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedCreateSequence {
+    pub(crate) name: String,
+    pub(crate) start: Option<i64>,
+    pub(crate) increment: Option<i64>,
+    pub(crate) min_value: Option<i64>,
+    pub(crate) max_value: Option<i64>,
+    pub(crate) cycle: Option<bool>,
+    /// `NO MINVALUE` が指定されたか（既定値と同義。同種オプションの重複判定にだけ使う）。
+    pub(crate) no_min_value: bool,
+    /// `NO MAXVALUE` が指定されたか（同上）。
+    pub(crate) no_max_value: bool,
+}
+
+impl ValidatedCreateSequence {
+    /// SEQUENCE 名（大文字小文字は原文のまま保持する）。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// `DROP SEQUENCE <name> [RESTRICT]` の許可形状構造検証結果（TABLE-24・SQL-23、Issue #1688）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedDropSequence {
+    pub(crate) name: String,
+}
+
+impl ValidatedDropSequence {
+    /// 削除対象の SEQUENCE 名。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// 先頭が `CREATE [TEMP|TEMPORARY|UNLOGGED] SEQUENCE` か（`core.rs::EngineCore::parse_tokens` の
+/// 分岐判定）。`TEMP`／`UNLOGGED` 付きもここで捕まえ、検証本体で `0A000` にする
+/// （`CREATE TABLE`／`FUNCTION` 系の分岐へ流さない）。
+pub(crate) fn is_create_sequence_statement(tokens: &[Token]) -> bool {
+    let ident_at = |i: usize, w: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(w));
+    ident_at(0, "CREATE")
+        && (ident_at(1, "SEQUENCE")
+            || ((ident_at(1, "TEMP") || ident_at(1, "TEMPORARY") || ident_at(1, "UNLOGGED"))
+                && ident_at(2, "SEQUENCE")))
+}
+
+/// 先頭 2 トークンが `DROP SEQUENCE` か（汎用 `DROP`〔`DROP TABLE` 扱い〕より前に分岐するために使う）。
+pub(crate) fn is_drop_sequence_statement(tokens: &[Token]) -> bool {
+    matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("DROP"))
+        && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("SEQUENCE"))
+}
+
+impl Parser<'_> {
+    /// SEQUENCE オプションの符号付き整数リテラル（`[+-]? digits`）を i64 として読む。
+    /// 小数・指数・文字列・`$n` は `42601`、i64 の範囲外は `22003`。符号込みで i128 に解釈してから
+    /// 変換するため `i64::MIN` を正しく扱える。
+    fn expect_signed_i64(&mut self) -> Result<i64, SqlSurfaceError> {
+        let negative = match self.peek() {
+            Some(Token::Punct('-')) => {
+                self.advance();
+                true
+            }
+            Some(Token::Punct('+')) => {
+                self.advance();
+                false
+            }
+            _ => false,
+        };
+        let digits = self.expect_number()?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(SqlSurfaceError::unsupported(
+                "sequence option requires an integer literal",
+            ));
+        }
+        let magnitude: i128 = digits
+            .parse()
+            .map_err(|_| SqlSurfaceError::numeric_out_of_range("sequence option out of range"))?;
+        let value = if negative { -magnitude } else { magnitude };
+        i64::try_from(value)
+            .map_err(|_| SqlSurfaceError::numeric_out_of_range("sequence option out of range"))
+    }
+
+    /// 次のトークンが識別子ならその大文字化を返す（消費しない）。
+    fn peek_upper_ident(&self) -> Option<String> {
+        match self.peek() {
+            Some(Token::Ident(w)) => Some(w.to_ascii_uppercase()),
+            _ => None,
+        }
+    }
+}
+
+/// [`ValidatedCreateSequence`] の構造検証本体（TABLE-24、Issue #1688）。受理するのは
+/// `START [WITH]`・`INCREMENT [BY]`・`MINVALUE`／`NO MINVALUE`・`MAXVALUE`／`NO MAXVALUE`・
+/// `CYCLE`／`NO CYCLE` の任意順。同じ種類の重複指定は `42601`。
+/// 未対応の句（`IF NOT EXISTS`・`AS`・`CACHE`・`OWNED BY`・`TEMP`／`UNLOGGED`・修飾名など）は
+/// 黙って無視せず `0A000` で拒否する（fail-closed。設計記録 D8）。
+pub(crate) fn validate_create_sequence_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedCreateSequence, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("CREATE")?;
+    if p.peek_ident_matches("TEMP")
+        || p.peek_ident_matches("TEMPORARY")
+        || p.peek_ident_matches("UNLOGGED")
+    {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "CREATE SEQUENCE with TEMP or UNLOGGED is not supported",
+        ));
+    }
+    p.expect_ident_matching("SEQUENCE")?;
+    if p.parse_optional_if_not_exists() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "CREATE SEQUENCE ... IF NOT EXISTS is not supported",
+        ));
+    }
+    if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "schema-qualified sequence names are not supported",
+        ));
+    }
+    let name = p.expect_ident()?;
+    crate::catalog::validate_identifier(&name)
+        .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name in CREATE SEQUENCE"))?;
+    let mut out = ValidatedCreateSequence {
+        name,
+        start: None,
+        increment: None,
+        min_value: None,
+        max_value: None,
+        cycle: None,
+        no_min_value: false,
+        no_max_value: false,
+    };
+    let dup = || SqlSurfaceError::unsupported("conflicting or redundant sequence options");
+    while !matches!(p.peek(), None | Some(Token::Punct(';'))) {
+        let Some(word) = p.peek_upper_ident() else {
+            return Err(SqlSurfaceError::unsupported(
+                "unexpected token in CREATE SEQUENCE",
+            ));
+        };
+        p.advance();
+        match word.as_str() {
+            "START" => {
+                if p.peek_ident_matches("WITH") {
+                    p.advance();
+                }
+                if out.start.is_some() {
+                    return Err(dup());
+                }
+                out.start = Some(p.expect_signed_i64()?);
+            }
+            "INCREMENT" => {
+                // `BY` は字句解析で予約語（`Keyword::By`）になっている。
+                if matches!(p.peek(), Some(Token::Keyword(Keyword::By))) {
+                    p.advance();
+                }
+                if out.increment.is_some() {
+                    return Err(dup());
+                }
+                out.increment = Some(p.expect_signed_i64()?);
+            }
+            "MINVALUE" => {
+                if out.min_value.is_some() || out.no_min_value {
+                    return Err(dup());
+                }
+                out.min_value = Some(p.expect_signed_i64()?);
+            }
+            "MAXVALUE" => {
+                if out.max_value.is_some() || out.no_max_value {
+                    return Err(dup());
+                }
+                out.max_value = Some(p.expect_signed_i64()?);
+            }
+            "CYCLE" => {
+                if out.cycle.is_some() {
+                    return Err(dup());
+                }
+                out.cycle = Some(true);
+            }
+            "NO" => {
+                let next = p.peek_upper_ident();
+                p.advance();
+                match next.as_deref() {
+                    Some("MINVALUE") => {
+                        if out.min_value.is_some() || out.no_min_value {
+                            return Err(dup());
+                        }
+                        out.no_min_value = true;
+                    }
+                    Some("MAXVALUE") => {
+                        if out.max_value.is_some() || out.no_max_value {
+                            return Err(dup());
+                        }
+                        out.no_max_value = true;
+                    }
+                    Some("CYCLE") => {
+                        if out.cycle.is_some() {
+                            return Err(dup());
+                        }
+                        out.cycle = Some(false);
+                    }
+                    _ => {
+                        return Err(SqlSurfaceError::unsupported(
+                            "unexpected token after NO in CREATE SEQUENCE",
+                        ))
+                    }
+                }
+            }
+            "AS" | "CACHE" | "OWNED" | "RESTART" | "SEQUENCE" | "IF" => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "unsupported CREATE SEQUENCE option",
+                ));
+            }
+            _ => {
+                return Err(SqlSurfaceError::unsupported(
+                    "unexpected token in CREATE SEQUENCE",
+                ))
+            }
+        }
+    }
+    p.expect_end_of_statement()?;
+    Ok(out)
+}
+
+/// [`ValidatedDropSequence`] の構造検証本体（TABLE-24、Issue #1688）。`RESTRICT`（既定と同義）は
+/// 受理し、`IF EXISTS`・`CASCADE`・複数名・修飾名は `0A000`（fail-closed。設計記録 D8）。
+pub(crate) fn validate_drop_sequence_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedDropSequence, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("DROP")?;
+    p.expect_ident_matching("SEQUENCE")?;
+    if p.consume_if_exists() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "DROP SEQUENCE ... IF EXISTS is not supported",
+        ));
+    }
+    if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "schema-qualified sequence names are not supported",
+        ));
+    }
+    let name = p.expect_ident()?;
+    crate::catalog::validate_identifier(&name)
+        .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name in DROP SEQUENCE"))?;
+    if p.parse_optional_drop_behavior() == DropBehavior::Cascade {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "DROP SEQUENCE ... CASCADE is not supported",
+        ));
+    }
+    if matches!(p.peek(), Some(Token::Punct(','))) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "DROP SEQUENCE with multiple names is not supported",
+        ));
+    }
+    p.expect_end_of_statement()?;
+    Ok(ValidatedDropSequence { name })
+}
 /// 先頭 3 トークンが `DROP MATERIALIZED VIEW` か（`core.rs::EngineCore::parse_tokens` の分岐判定。
 /// 汎用 `DROP`（`DROP TABLE` 扱い）より前に分岐するために使う。TABLE-42、Issue #1667）。
 pub(crate) fn is_drop_materialized_view_statement(tokens: &[Token]) -> bool {

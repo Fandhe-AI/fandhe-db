@@ -66,6 +66,9 @@ pub(crate) use dependency::{truncate_closure_in_txn, TruncateClosureError};
 // crate 内の呼び出し元がテストだけになる（dead_code を許可）。
 #[allow(dead_code)]
 pub(crate) mod materialized;
+// SEQUENCE のカタログ（TABLE-24・Issue #1688）。relation 名前空間を表・ビュー・索引・matview と
+// 共有するため、`index_name_exists_in_txn` を呼ぶ DDL は `sequence::sequence_exists_in_txn` も併記する。
+pub(crate) mod sequence;
 pub(crate) use materialized::read_materialized_view_in;
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
@@ -11179,6 +11182,10 @@ impl Storage {
             if materialized_view_exists_in_txn(&write_txn, schema.name.as_str())? {
                 return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
             }
+            // SEQUENCE とも名前空間を共有する（TABLE-24・Issue #1688）。
+            if sequence::sequence_exists_in_txn(&write_txn, schema.name.as_str())? {
+                return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
+            }
         }
         // `FOREIGN KEY` の参照先解決は `CATALOG_TABLE` を別途開く（参照先スキーマの
         // decode）ため、上のブロックでハンドルを解放してから行う（redb の
@@ -11313,6 +11320,10 @@ impl Storage {
             }
             // matview を指定された場合も種別不一致（TABLE-42 (5)、Issue #1663）。
             if materialized_view_exists_in_txn(write_txn, name)? {
+                return Err(CatalogError::WrongObjectKind(name.to_string()));
+            }
+            // SEQUENCE を指定された場合も種別不一致（TABLE-24・Issue #1688）。
+            if sequence::sequence_exists_in_txn(write_txn, name)? {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
             let found = match write_txn.open_table(CATALOG_TABLE) {
@@ -12047,6 +12058,7 @@ impl Storage {
         }
         if index_name_exists_in_txn(&write_txn, new_table_name)?
             || materialized_view_exists_in_txn(&write_txn, new_table_name)?
+            || sequence::sequence_exists_in_txn(&write_txn, new_table_name)?
         {
             return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
         }
@@ -12975,6 +12987,7 @@ impl Storage {
                 }
                 if index_name_exists_in_txn(&write_txn, parent_table_name.as_str())?
                     || materialized_view_exists_in_txn(&write_txn, parent_table_name.as_str())?
+                    || sequence::sequence_exists_in_txn(&write_txn, parent_table_name.as_str())?
                 {
                     return Err(CatalogError::WrongObjectKind(parent_table_name.clone()));
                 }
@@ -13871,6 +13884,7 @@ impl Storage {
             // 索引名とも名前空間を共有する（TASK-206・INDEX-7、Issue #908）。
             if index_name_exists_in_txn(&write_txn, name)?
                 || materialized_view_exists_in_txn(&write_txn, name)?
+                || sequence::sequence_exists_in_txn(&write_txn, name)?
             {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
@@ -13927,6 +13941,7 @@ impl Storage {
             // Issue #908）。
             if index_name_exists_in_txn(&write_txn, name)?
                 || materialized_view_exists_in_txn(&write_txn, name)?
+                || sequence::sequence_exists_in_txn(&write_txn, name)?
             {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
@@ -14115,12 +14130,16 @@ impl Storage {
                 || views_contains(&def.name)?
                 || index_name_exists_in_txn(&write_txn, &def.name)?
                 || materialized_view_exists_in_txn(&write_txn, &def.name)?
+                || sequence::sequence_exists_in_txn(&write_txn, &def.name)?
             {
                 return Err(CatalogError::IndexAlreadyExists(def.name.clone()).into());
             }
             // 対象がビュー・既存の索引（relation 名前空間を共有するが行を持たない）
             // なら種別不一致（`42809`）。テーブル不在（`42P01`）へ落とさない。
-            if views_contains(&def.table)? || index_name_exists_in_txn(&write_txn, &def.table)? {
+            if views_contains(&def.table)?
+                || index_name_exists_in_txn(&write_txn, &def.table)?
+                || sequence::sequence_exists_in_txn(&write_txn, &def.table)?
+            {
                 return Err(CatalogError::WrongObjectKind(def.table.clone()).into());
             }
             // matview への索引（TABLE-42 (5)(6)、Issue #1667）は宣言だけを登録し、UNIQUE は
@@ -14338,7 +14357,9 @@ impl Storage {
                     Err(e) => return Err(e.into()),
                 }
             }
-            if materialized_view_exists_in_txn(&write_txn, name)? {
+            if materialized_view_exists_in_txn(&write_txn, name)?
+                || sequence::sequence_exists_in_txn(&write_txn, name)?
+            {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
             return Err(CatalogError::IndexNotFound(name.to_string()));
@@ -14522,6 +14543,7 @@ impl Storage {
             if catalog_table.get(name)?.is_some()
                 || index_name_exists_in_txn(&write_txn, name)?
                 || materialized_view_exists_in_txn(&write_txn, name)?
+                || sequence::sequence_exists_in_txn(&write_txn, name)?
             {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
@@ -15924,6 +15946,7 @@ fn resolve_foreign_keys_in_txn(
             }
             if index_name_exists_in_txn(write_txn, fk.parent_table.as_str())?
                 || materialized_view_exists_in_txn(write_txn, fk.parent_table.as_str())?
+                || sequence::sequence_exists_in_txn(write_txn, fk.parent_table.as_str())?
             {
                 return Err(CatalogError::WrongObjectKind(fk.parent_table.clone()));
             }
