@@ -521,6 +521,11 @@ pub(crate) fn check_bound_index_expression_determinism(
             if !two_arg_timezone && args.iter().any(|a| ty_of(a) == Some(ExprType::TimestampTz)) {
                 return Err(not_immutable());
             }
+            // 3 引数 `date_trunc(<単位>, <値>, <ゾーン>)` は、束縛が非 TIMESTAMPTZ の値へ
+            // セッション TZ 依存の暗黙変換を挿入するため、引数の型によらず拒否する。
+            if name.eq_ignore_ascii_case("date_trunc") && args.len() == 3 {
+                return Err(not_immutable());
+            }
             args.iter().try_for_each(rec)
         }
         Expr::Binary { op, lhs, rhs } => {
@@ -532,7 +537,7 @@ pub(crate) fn check_bound_index_expression_determinism(
             let mixed_naive = (tz(lt) && naive(rt)) || (naive(lt) && tz(rt));
             let tz_interval_arith = matches!(op, BinOp::Add | BinOp::Sub)
                 && ((tz(lt) && interval(rt)) || (interval(lt) && tz(rt)));
-            if mixed_naive || tz_interval_arith {
+            if mixed_naive || tz_interval_arith || tz_vs_string_literal(lhs, rhs, lt, rt) {
                 return Err(not_immutable());
             }
             rec(lhs)?;
@@ -549,8 +554,19 @@ pub(crate) fn check_bound_index_expression_determinism(
             }
             else_result.as_deref().map_or(Ok(()), rec)
         }
-        Expr::Coalesce(items) | Expr::ArrayConstructor(items) => items.iter().try_for_each(rec),
+        Expr::Coalesce(items) | Expr::ArrayConstructor(items) => {
+            let has_tz = items
+                .iter()
+                .any(|e| ty_of(e) == Some(ExprType::TimestampTz));
+            if has_tz && items.iter().any(|e| matches!(e, Expr::String(_))) {
+                return Err(not_immutable());
+            }
+            items.iter().try_for_each(rec)
+        }
         Expr::NullIf(a, b) => {
+            if tz_vs_string_literal(a, b, ty_of(a), ty_of(b)) {
+                return Err(not_immutable());
+            }
             rec(a)?;
             rec(b)
         }
@@ -582,10 +598,27 @@ pub(crate) fn check_bound_index_expression_determinism(
             }
         }
         Expr::Quantified { lhs, rhs, .. } => {
+            if tz_vs_string_literal(lhs, rhs, ty_of(lhs), ty_of(rhs)) {
+                return Err(not_immutable());
+            }
             rec(lhs)?;
             rec(rhs)
         }
     }
+}
+
+/// 一方が `TIMESTAMPTZ` 型、他方が型なし文字列リテラルか。束縛は文字列リテラルを
+/// セッション TZ で `TIMESTAMPTZ` へ暗黙変換する（`bind_unknown_literal_against`）ため、
+/// 索引キーが再構築するセッションに依存する（INDEX-10 の `42P17` 対象）。
+fn tz_vs_string_literal(
+    lhs: &Expr,
+    rhs: &Expr,
+    lt: Option<crate::sql::udf_call::ExprType>,
+    rt: Option<crate::sql::udf_call::ExprType>,
+) -> bool {
+    use crate::sql::udf_call::ExprType;
+    let tz = |t: Option<ExprType>| t == Some(ExprType::TimestampTz);
+    (tz(lt) && matches!(rhs, Expr::String(_))) || (tz(rt) && matches!(lhs, Expr::String(_)))
 }
 
 /// 結果型が索引キーにできるか（`Text`／`Scalar`／`Date`／`Timestamp`／`Time`／`TimestampTz`）。
@@ -804,6 +837,9 @@ mod tests {
             "at_tz + INTERVAL '1 day'",
             "at_tz - at",
             "COALESCE(at_tz, TIMESTAMPTZ '2020-01-01 00:00:00+00')",
+            "CASE WHEN at_tz > '2024-01-01 00:00:00' THEN 1 ELSE 0 END",
+            "CASE WHEN '2024-01-01 00:00:00' < at_tz THEN 1 ELSE 0 END",
+            "date_trunc('day', at, 'UTC')",
         ] {
             // 最後の例は列そのものの型が同じで通る。除外して個別に確認する。
             if not_immutable.starts_with("COALESCE") {
