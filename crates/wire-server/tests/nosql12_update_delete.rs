@@ -64,7 +64,10 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let guard = temp_db::CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    // 欠落 operation_id の `23502` を検証する本テスト群のため台帳必須モードを明示する
+    // （既定は省略を受理する。Issue #2203・既定側は wire_require_operation_id_matrix が担う）。
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (Arc::new(core), guard)
 }
 
