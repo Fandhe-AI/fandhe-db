@@ -23,7 +23,7 @@
 
 use super::allowlist::{
     OnConflictAction, OnConflictClause, Projection, SqlSurfaceError, TableLookup, UpsertValue,
-    ValidatedInsert, ValidatedViewInsert, ViewWriteOp,
+    ValidatedInsert, ValidatedViewInsert, ViewWriteOp, WherePredicate,
 };
 use super::exec::ColumnMeta;
 use super::view::{resolve_from, Resolved};
@@ -37,6 +37,10 @@ pub(crate) struct RewrittenViewInsert {
     /// `RETURNING` の出力列名（ビューの公開名。`returning` の各項目と同じ並び）。基表の列名と
     /// 同じ（ビューが何も改名・絞り込みしない）ときは `None`。
     pub(crate) public_names: Option<Vec<String>>,
+    /// `WITH CHECK OPTION` の検査対象の述語（TABLE-43 (2)・Issue #1673。内側のビューが先頭。
+    /// 基表の物理列名）。`core::run_view_write` が書き込み区間のスコープへ張り、検査点
+    /// （`constraint::enforce_row_constraints_in_txn`）が書いた行で評価する。
+    pub(crate) check_predicates: Vec<Vec<WherePredicate>>,
 }
 
 /// Parse 時の検証（自動更新可能か・解決できるか・書き込む列が公開されているか）。結果は捨てる。
@@ -64,20 +68,22 @@ pub(crate) fn rewrite_view_insert(
             });
         }
     }
-    let (base_table, view_columns, column_map) = match resolve_from(lookup, &shape.table_name)? {
-        Resolved::View {
-            base_table,
-            view_columns,
-            column_map,
-            ..
-        } => (base_table, view_columns, column_map),
-        // 自動更新可能と判定済みなのに `View` 以外になるのは不変条件違反（固定文言。fail-closed）。
-        _ => {
-            return Err(SqlSurfaceError::Internal {
-                detail: "invalid view definition".to_string(),
-            })
-        }
-    };
+    let (base_table, view_columns, column_map, check_predicates) =
+        match resolve_from(lookup, &shape.table_name)? {
+            Resolved::View {
+                base_table,
+                view_columns,
+                column_map,
+                check_predicates,
+                ..
+            } => (base_table, view_columns, column_map, check_predicates),
+            // 自動更新可能と判定済みなのに `View` 以外になるのは不変条件違反（固定文言。fail-closed）。
+            _ => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "invalid view definition".to_string(),
+                })
+            }
+        };
     let mapper = Mapper {
         columns: view_columns.as_deref(),
         map: column_map.as_deref(),
@@ -115,6 +121,7 @@ pub(crate) fn rewrite_view_insert(
             on_conflict,
         },
         public_names,
+        check_predicates,
     })
 }
 
@@ -294,6 +301,7 @@ mod tests {
 
     fn def(base: &str, body: &str, aliases: &[&str]) -> ViewDef {
         ViewDef {
+            check_option: crate::catalog::ViewCheckOption::None,
             base_relation: base.to_string(),
             body_sql: body.to_string(),
             column_aliases: aliases.iter().map(|a| a.to_string()).collect(),

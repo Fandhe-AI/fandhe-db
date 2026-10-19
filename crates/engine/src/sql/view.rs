@@ -21,7 +21,7 @@ use super::allowlist::{
     Projection, ScalarOrderKey, ScanOrderKey, SelectItem, SqlSurfaceError, Statement, TableLookup,
     ViewBodyCheck, ViewBodyKind, WherePredicate, WindowSelectItem,
 };
-use crate::catalog::{ViewDef, MAX_VIEW_NESTING_DEPTH};
+use crate::catalog::{ViewCheckOption, ViewDef, MAX_VIEW_NESTING_DEPTH};
 use crate::sql::udf_call::Expr;
 
 /// FROM に指定された名前の解決結果。
@@ -45,6 +45,11 @@ pub(crate) enum Resolved {
         /// 公開名に対して先に行ってから `sql::view_alias` で物理名へ書き換えるか、書き換えに
         /// 未対応の形を `0A000` で拒否する（fail-closed）。
         column_map: Option<Vec<(String, String)>>,
+        /// `WITH CHECK OPTION`（TABLE-43 (2)・Issue #1673）の検査対象になる段の述語。内側のビューが
+        /// 先頭で、各段は基底表の物理列名で書かれている（`view_predicates` と同じ規則）。どの段も
+        /// 検査対象でなければ空。入れ子の規則は [`checked_layer_flags`]。書き込みの検査点
+        /// （`sql::view_check`）だけが読み、読み取り経路は使わない。
+        check_predicates: Vec<Vec<WherePredicate>>,
     },
     /// 評価後射影形ビュー（Issue #1192。`LIMIT`・`ORDER BY`・集計・JOIN を含む
     /// 本文）。インライン展開できない（外側の `WHERE` を合成すると `LIMIT`／集計の
@@ -85,7 +90,7 @@ pub(crate) fn resolve_from(
     // 行わない——内側の露出列が確定するまでは外側の参照が妥当かどうか
     // 判断できないため、確定は第 2 パスへ分離する）。
     let mut current = name.to_string();
-    let mut chain: Vec<(String, super::allowlist::ParsedViewBody, Vec<String>)> = Vec::new();
+    let mut chain: Vec<ChainLayer> = Vec::new();
     let mut depth: u32 = 0;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -101,6 +106,7 @@ pub(crate) fn resolve_from(
                 base_relation,
                 body_sql,
                 column_aliases,
+                check_option,
             }) => {
                 let parsed = match reparse_stored_body(&body_sql) {
                     Ok(parsed) => parsed,
@@ -120,7 +126,7 @@ pub(crate) fn resolve_from(
                                 column_aliases,
                             );
                         }
-                        for (layer_name, layer, layer_aliases) in chain.into_iter().rev() {
+                        for (layer_name, layer, layer_aliases, _) in chain.into_iter().rev() {
                             stmt = super::allowlist::buffered_layer_statement(
                                 &layer_name,
                                 stmt,
@@ -146,7 +152,7 @@ pub(crate) fn resolve_from(
                         "view nesting depth exceeds limit",
                     ));
                 }
-                chain.push((current.clone(), parsed, column_aliases));
+                chain.push((current.clone(), parsed, column_aliases, check_option));
                 current = base_relation;
             }
             None => {
@@ -193,7 +199,11 @@ pub(crate) fn resolve_from(
     // まだ現れていない間は `None`（公開名＝物理名）。
     let mut column_map: Option<Vec<(String, String)>> = None;
     let mut acc_predicates: Vec<WherePredicate> = Vec::new();
-    for (_, mut view, aliases) in chain.into_iter().rev() {
+    // `WITH CHECK OPTION` の検査対象（TABLE-43 (2)・Issue #1673）。`chain` は外側が先頭なので、
+    // 反転して内側から処理する前に各段の要否を外側から決めておく。
+    let checked = checked_layer_flags(chain.iter().map(|(_, _, _, opt)| *opt));
+    let mut check_predicates: Vec<Vec<WherePredicate>> = Vec::new();
+    for (layer_index, (_, mut view, aliases, _)) in chain.into_iter().enumerate().rev() {
         // ビュー本文（`ParsedViewBody`）は構文上 `ORDER BY` を持たない
         // （[`parse_view_body`] のドキュメント参照）ため、連鎖の各段の検査には
         // 空スライスを渡す（クエリ自身の ORDER BY 検査は呼び出し元
@@ -260,6 +270,10 @@ pub(crate) fn resolve_from(
             exposed = Some(next.iter().map(|(p, _)| p.clone()).collect());
             column_map = Some(next);
         }
+        // 検査対象の段の述語（`WHERE` が無い段は常に真のため積まない）。
+        if checked.get(layer_index).copied().unwrap_or(false) && !layer_predicates.is_empty() {
+            check_predicates.push(layer_predicates.clone());
+        }
         // 内側（より深い）のビューの述語を先頭に置く（§設計「述語合成」）。
         // ここでは内側から外側へ順に処理しているため、単純な追記でよい。
         acc_predicates.extend(layer_predicates);
@@ -270,7 +284,32 @@ pub(crate) fn resolve_from(
         view_predicates: acc_predicates,
         view_columns: exposed,
         column_map,
+        check_predicates,
     })
+}
+
+/// 連鎖の 1 段（外側から内側の順に積む）: ビュー名・再パース済みの本文・列別名・`CHECK OPTION` 宣言。
+type ChainLayer = (
+    String,
+    super::allowlist::ParsedViewBody,
+    Vec<String>,
+    ViewCheckOption,
+);
+
+/// 連鎖を外側（文が直接指すビュー）から内側へたどり、各段の述語を検査対象にするかを返す
+/// （TABLE-43 (2)・Issue #1673。PostgreSQL の rewriter と同じ規則）。`cascaded` を偽から始め、
+/// 段の述語は「その段自身が宣言している」か「`cascaded` が真」のとき検査対象になる。判定の後で、
+/// その段が `CASCADED` を宣言していれば以降の内側の段すべてに及ぶ。入力は外側が先頭の宣言列。
+pub(crate) fn checked_layer_flags(options: impl Iterator<Item = ViewCheckOption>) -> Vec<bool> {
+    let mut cascaded = false;
+    let mut out = Vec::new();
+    for opt in options {
+        out.push(opt != ViewCheckOption::None || cascaded);
+        if opt == ViewCheckOption::Cascaded {
+            cascaded = true;
+        }
+    }
+    out
 }
 
 /// `CREATE VIEW` 本文の出力列の導出結果（[`body_output`]）。
@@ -820,6 +859,22 @@ mod tests {
     use super::super::lexer;
     use super::*;
 
+    /// `WITH CHECK OPTION` の検査対象の入れ子規則（TABLE-43 (2)・Issue #1673）。外側が先頭。
+    #[test]
+    fn checked_layer_flags_follow_local_and_cascaded_rules() {
+        use ViewCheckOption::{Cascaded, Local, None as No};
+        let flags = |opts: &[ViewCheckOption]| checked_layer_flags(opts.iter().copied());
+        assert_eq!(flags(&[No, No, No]), vec![false, false, false]);
+        // 外側が無宣言でも、内側が自分で宣言していればその段は検査する。
+        assert_eq!(flags(&[No, No, Local]), vec![false, false, true]);
+        // LOCAL は下位へ及ばない。
+        assert_eq!(flags(&[Local, No, No]), vec![true, false, false]);
+        // CASCADED は以降の内側すべてへ及ぶ（無宣言の段を貫く）。
+        assert_eq!(flags(&[Cascaded, No, Local]), vec![true, true, true]);
+        assert_eq!(flags(&[No, Cascaded, No]), vec![false, true, true]);
+        assert_eq!(flags(&[Local, Cascaded, No]), vec![true, true, true]);
+    }
+
     /// SQL-24（TASK-208 ポインタ）・A01（`.claude/rules/security.md`）回帰:
     /// `NOT hidden_col = 'x'` のように `WHERE` 述語が `Not` で列参照を包んでも、
     /// 列スコープ検査（`check_columns_within_view`）が再帰して内側の列を検出し、
@@ -861,6 +916,7 @@ mod tests {
 
     fn def(base: &str, body: &str) -> ViewDef {
         ViewDef {
+            check_option: crate::catalog::ViewCheckOption::None,
             base_relation: base.to_string(),
             body_sql: body.to_string(),
             column_aliases: Vec::new(),

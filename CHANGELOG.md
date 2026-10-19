@@ -9,6 +9,15 @@
 
 ### Breaking Changes
 
+- ビューの `WITH CHECK OPTION`（Issue #1673・TABLE-43 (2)）: `CREATE [OR REPLACE] VIEW ... WITH [CASCADED | LOCAL]
+  CHECK OPTION` を受理して永続化し（従来は `42601`）、ビュー経由の `INSERT`／`UPDATE`（UPSERT を含む。`DELETE` は
+  検査しない）が書いた行を検査対象の述語（NULL も違反）で検査して、違反を `44000`（固定文言。ビュー名・行の値を
+  含めない）で文ごと拒否する。入れ子は PostgreSQL と同じ規則（LOCAL は自身の段、CASCADED は下位すべて、
+  下位が自分で宣言していればその段も検査）。自動更新できないビューへの宣言は `0A000`。公開 API は
+  `ViewDef.check_option`（pub フィールド追加）・`ViewCheckOption`・`Storage::create_view_with_check_option` の追加と、
+  `TenantWriteError::WithCheckOptionViolation`・`SqlSurfaceError::WithCheckOptionViolation`・
+  `ErrorClass::WithCheckOptionViolation`（`44000`・HTTP 400）の追加。宣言ありのビュー定義のカタログ形式は新版
+  v3（宣言なしの v1／v2 のバイト列は不変。旧バイナリは v3 を読めない）。
 - 部分 UNIQUE 索引（Issue #1657・INDEX-11 (4)）: 従来 `0A000` だった `CREATE UNIQUE INDEX ... WHERE <述語>` を受理し、
   述語が TRUE の行どうしの間でだけ一意性を `23505` で強制する（述語外の行どうし・述語外と述語内の重複は許可。
   テナントごと・NULLS DISTINCT）。作成時の既存行検査も述語 TRUE の行だけが対象。UNIQUE 制約へは展開しないため

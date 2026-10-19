@@ -405,6 +405,11 @@ pub enum TenantWriteError {
     /// **後**・テーブル世代 bump／commit の**前**に返す（`write_txn` は commit
     /// されないため、行・台帳とも痕跡が残らない）。
     CheckViolation { constraint: String },
+    /// ビューの `WITH CHECK OPTION`（TABLE-43 (2)・Issue #1673）が検査対象とする述語を、ビュー経由で
+    /// 書き込んだ行が満たさない（述語が NULL の場合も違反）。`CHECK` 制約と同じ単一の検査点
+    /// （`constraint::enforce_row_constraints_in_txn`）が UNIQUE の後・`FOREIGN KEY` の前に返し、
+    /// `write_txn` は commit されない（副作用ゼロ）。ビュー名・行の値・id・テナントは含めない固定文言。
+    WithCheckOptionViolation,
     /// `CHECK` 制約の述語評価自体が失敗した（0 除算・`BIGINT` の精度超過等、
     /// 値依存で発生しうる）。違反（[`TenantWriteError::CheckViolation`]）には
     /// 丸めず fail-closed に書き込みを拒否する。PostgreSQL と同様、CHECK 評価中の
@@ -608,6 +613,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             }
             TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
             TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
+            TenantWriteError::WithCheckOptionViolation => ErrorClass::WithCheckOptionViolation,
             // 内側の `SqlSurfaceError`（`sql::allowlist`）が既に
             // `ClassifiedError::error_class()` を実装済みのため、そこへ委譲する
             // （通常の式評価と同じ分類。ERR-2 の SSOT を経由するため、CHECK 専用の
@@ -688,6 +694,10 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::CheckViolation { constraint } => {
                 write!(f, "new row violates check constraint {constraint:?}")
             }
+            // 固定文言（ビュー名・行の値を含めない。TABLE-43・Issue #1673）。
+            TenantWriteError::WithCheckOptionViolation => {
+                write!(f, "new row violates check option for view")
+            }
             // 内側の `SqlSurfaceError::client_message()`（`Internal` は固定文言
             // へ既に丸め済み）をそのまま転送する。通常の式評価が返す文言と
             // 揃えるための委譲であり、`TenantWriteError` 側で新たな文言を
@@ -752,6 +762,7 @@ impl std::fmt::Debug for TenantWriteError {
             }
             TenantWriteError::UniqueViolation => f.write_str("UniqueViolation"),
             TenantWriteError::CheckViolation { .. } => f.write_str("CheckViolation(<redacted>)"),
+            TenantWriteError::WithCheckOptionViolation => f.write_str("WithCheckOptionViolation"),
             TenantWriteError::CheckEvaluationFailed(_) => {
                 f.write_str("CheckEvaluationFailed(<redacted>)")
             }

@@ -189,6 +189,7 @@ mod tests {
 
     fn def(base: &str, body: &str) -> ViewDef {
         ViewDef {
+            check_option: crate::catalog::ViewCheckOption::None,
             base_relation: base.to_string(),
             body_sql: body.to_string(),
             column_aliases: Vec::new(),

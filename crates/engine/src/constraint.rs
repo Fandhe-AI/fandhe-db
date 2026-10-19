@@ -634,6 +634,30 @@ pub(crate) fn enforce_row_constraints_in_txn(
     written_ids: &[u64],
     fk_mode: FkCheckMode,
 ) -> Result<crate::key_index::KeyIndexDelta, TenantWriteError> {
+    enforce_row_constraints_impl(
+        write_txn,
+        table_name,
+        schema,
+        tenant_id,
+        written_ids,
+        fk_mode,
+        true,
+    )
+}
+
+/// [`enforce_row_constraints_in_txn`] の本体。`view_checks` が偽のときはビューの
+/// `WITH CHECK OPTION`（TABLE-43 (2)・Issue #1673）の段を飛ばす。`FOREIGN KEY` の参照アクションが
+/// 連鎖して書いた子表の検査（[`propagate_referential_actions`] からの呼び出し）は、ユーザーが
+/// ビュー越しに書いた行ではないため偽にする（ビューの検査対象は文が直接書いた基表の行だけ）。
+fn enforce_row_constraints_impl(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    written_ids: &[u64],
+    fk_mode: FkCheckMode,
+    view_checks: bool,
+) -> Result<crate::key_index::KeyIndexDelta, TenantWriteError> {
     let delta =
         crate::key_index::sync_rows_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
     enforce_check_constraints_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
@@ -674,6 +698,17 @@ pub(crate) fn enforce_row_constraints_in_txn(
             &decls,
             compiled.as_ref(),
         )?;
+        // ビューの `WITH CHECK OPTION`（TABLE-43 (2)・Issue #1673）。一意索引の後・FK の前
+        // （PostgreSQL の検査順に合わせる）。
+        if view_checks {
+            enforce_view_check_option_in_txn(
+                write_txn,
+                table_name,
+                schema,
+                tenant_id,
+                written_ids,
+            )?;
+        }
     }
     enforce_foreign_keys_in_txn(
         write_txn,
@@ -684,6 +719,51 @@ pub(crate) fn enforce_row_constraints_in_txn(
         fk_mode,
     )?;
     Ok(delta)
+}
+
+/// ビューの `WITH CHECK OPTION`（TABLE-43 (2)・Issue #1673）の検査。書き込み区間のスコープ
+/// （`sql::view_write_scope`）が持つ検査対象の述語を、書いた行（`written_ids`。UPSERT の DO NOTHING で
+/// 衝突した行は含まれない）を同一 write txn で読み戻して評価する。スコープが無い・書き込み先の表が
+/// スコープの基表と異なる・検査対象が無いときは何もしない。述語が TRUE でない行（NULL を含む）は
+/// [`TenantWriteError::WithCheckOptionViolation`]、評価エラーは SQLSTATE を保って透過する。物理キーは
+/// サーバー側導出の `tenant_id` で名前空間化済みで、自テナントの行だけを読む（RLS-9・TABLE-12）。
+/// 読み戻せない id は対象外（[`enforce_check_constraints_in_txn`] と同じ）。
+fn enforce_view_check_option_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    written_ids: &[u64],
+) -> Result<(), TenantWriteError> {
+    if written_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(layers) = crate::sql::view_write_scope::current_view_checks(table_name) else {
+        return Ok(());
+    };
+    let Some(compiled) = crate::sql::view_check::CompiledViewChecks::compile(schema, &layers)
+        .map_err(TenantWriteError::CheckEvaluationFailed)?
+    else {
+        return Ok(());
+    };
+    let row_table_name = crate::catalog::user_rows_table_name(table_name);
+    let row_table = write_txn
+        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .map_err(crate::catalog::map_row_table_error)?;
+    let mut embedding: Vec<f32> = Vec::new();
+    for &id in written_ids {
+        let Some(guard) = row_table
+            .get((tenant_id, id))
+            .map_err(crate::catalog::CatalogError::from)?
+        else {
+            continue;
+        };
+        let buf = guard.value();
+        let (_dim, metadata) =
+            crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
+        compiled.enforce(schema, id, &embedding, metadata)?;
+    }
+    Ok(())
 }
 
 /// `CHECK` 制約（TABLE-16・TASK-204、Issue #906）の検査。`written_ids` の各行を
@@ -3618,13 +3698,14 @@ fn propagate_referential_actions(
     // 蓄積した検証をここでまとめて行う（同じ子テーブルへ複数 FK が action を
     // 適用していても、全アクション適用後の最終値を 1 回だけ検査する）。
     for (child_table, (child_schema, child_ids)) in pending_validation {
-        enforce_row_constraints_in_txn(
+        enforce_row_constraints_impl(
             write_txn,
             &child_table,
             &child_schema,
             tenant_id,
             &child_ids,
             fk_mode,
+            false,
         )?;
     }
 

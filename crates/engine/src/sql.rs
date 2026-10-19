@@ -235,6 +235,7 @@ pub mod udf_call;
 pub(crate) mod view;
 pub(crate) mod view_alias;
 pub(crate) mod view_buffered;
+pub(crate) mod view_check;
 pub(crate) mod view_dml;
 pub(crate) mod view_insert;
 pub(crate) mod view_replace;

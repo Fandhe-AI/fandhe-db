@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 71;
+    count = 72;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -297,6 +297,11 @@ define_error_classes! {
     /// [`crate::tenant::TenantWriteError::CheckViolation`]・
     /// [`crate::sql::allowlist::SqlSurfaceError::CheckViolation`] の写像。
     CheckViolation => ("23514", "CHECK_VIOLATION"),
+    /// ビューの `WITH CHECK OPTION`（TABLE-43 (2)・Issue #1673）が宣言する条件を、ビュー経由で
+    /// 書き込んだ行が満たさない（`44000`）。
+    /// [`crate::tenant::TenantWriteError::WithCheckOptionViolation`]・
+    /// [`crate::sql::allowlist::SqlSurfaceError::WithCheckOptionViolation`] の写像。
+    WithCheckOptionViolation => ("44000", "WITH_CHECK_OPTION_VIOLATION"),
     /// `FOREIGN KEY` 制約（TABLE-17・TASK-205、Issue #907）の参照整合性違反
     /// （`23503`）: 参照元の書き込みで参照先の値の組が同一テナント内に存在しない、
     /// または参照先の削除・更新で参照元の行が残る。
