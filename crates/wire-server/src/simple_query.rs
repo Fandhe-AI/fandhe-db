@@ -880,6 +880,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropView(_) => OutcomeResponse::Command {
             tag: "DROP VIEW".to_string(),
         },
+        // TABLE-42 (5)（Issue #1667）: `DROP MATERIALIZED VIEW` も件数を持たない固定タグ。
+        SqlOutcome::DropMaterializedView(_) => OutcomeResponse::Command {
+            tag: "DROP MATERIALIZED VIEW".to_string(),
+        },
         // TABLE-42（Issue #1664）: `CREATE MATERIALIZED VIEW ... WITH DATA` は pg 互換の
         // `SELECT <n>`。`n` は作成したセッション自身の文脈の実体の行数だけ（他の文脈の件数を
         // 合算すると他テナントの件数が漏れるため、engine は合算値を持たない。実体化対象外なら 0）。
