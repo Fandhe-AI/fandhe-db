@@ -1454,6 +1454,36 @@ pub(crate) fn execute_statement_with_cache(
         &expr_finder,
     );
 
+    // INDEX-11（Issue #1656）: 通常の分類が `PlainScan` のクエリに限り、`WHERE`（Q）が部分索引の述語（P）を
+    // 含意する索引の名前をクエリと同一の `read_txn` から解決する。式索引を含む通常の索引経路には
+    // 触れず（カタログ読み取りは全走査になるクエリだけが払う）、解決できない・含意しない・opt-in
+    // なしはいずれも空（全走査）。
+    //
+    // 健全性の不変条件: Q ⇒ P のとき部分索引の格納行は Q に一致する行の**上位集合**にすぎない
+    // （残りの述語は未評価）。そのため部分索引の候補は必ず `on_visible_row` を再適用する経路へ流し、
+    // 索引信頼マスク（`mask_trusted_defer`。完全被覆が前提）には決して入れない。
+    let partial_names: Vec<String> = match (scalar_cache.as_ref(), read_txn.snapshot()) {
+        (Some(scalar_access), Some(snapshot_txn))
+            if scalar_access.declarations_enabled
+                && plan.scalar_prefilter
+                && bound.has_where_filters()
+                && scalar_plan_kind == crate::sql::scalar_plan::ScalarPlan::PlainScan =>
+        {
+            crate::sql::scalar_index::resolve_implied_partial_indexes_in_txn(
+                snapshot_txn,
+                &bound.table,
+                schema,
+                scalar_access.declarations_enabled,
+                (
+                    &bound.metadata_filters,
+                    &bound.expr_filters,
+                    &bound.or_filters,
+                ),
+            )
+        }
+        _ => Vec::new(),
+    };
+
     let rls_hook = ImplicitRlsHook::new(ctx);
     // 借用元を関数スコープ末尾まで生かすための保持先（`arena` はこのいずれかを
     // 指す `&VectorArena` になる。ミス／フォールバック経路は `owned_arena` へ、
@@ -1609,7 +1639,11 @@ pub(crate) fn execute_statement_with_cache(
                     scalar_snapshot_for_index = Some(std::sync::Arc::clone(&snapshot));
 
                     let mut index_candidate_slots: Option<Vec<u32>> = None;
-                    if scalar_plan_kind != crate::sql::scalar_plan::ScalarPlan::PlainScan {
+                    // 候補が「一致集合」（通常の索引で完全被覆）か、部分索引由来の上位集合か。
+                    let mut candidates_exact = true;
+                    if scalar_plan_kind != crate::sql::scalar_plan::ScalarPlan::PlainScan
+                        || !partial_names.is_empty()
+                    {
                         if let Some(scalar_access) = scalar_cache.as_ref() {
                             let looked_up = scalar_access.cache.lookup(
                                 scalar_access.storage,
@@ -1638,12 +1672,21 @@ pub(crate) fn execute_statement_with_cache(
                                     // 渡り、`ScalarIndex::candidates_for` が
                                     // 内部で振り分ける（Issue #893 production
                                     // 接続）。
-                                    match match crate::sql::scalar_plan::collect_expr_index_predicates_with(&bound.expr_filters, &expr_finder) {
-                                        Some(expr_preds) => index.resolve_candidates(&bound.metadata_filters, &expr_preds),
-                                        // 分類が `PlainScan` 以外なら到達しないが、式述語を 1 件でも落とすと
-                                        // 候補が上位集合になり fail-open になるため、非対応は全走査へ倒す。
-                                        None => crate::sql::scalar_index::CandidateResolution::FallbackNoIndex,
-                                    } {
+                                    let resolution = if scalar_plan_kind
+                                        == crate::sql::scalar_plan::ScalarPlan::PlainScan
+                                    {
+                                        // 部分索引（Issue #1656）。候補は上位集合のため再評価が必須。
+                                        candidates_exact = false;
+                                        index.resolve_partial_candidates(&partial_names)
+                                    } else {
+                                        match crate::sql::scalar_plan::collect_expr_index_predicates_with(&bound.expr_filters, &expr_finder) {
+                                            Some(expr_preds) => index.resolve_candidates(&bound.metadata_filters, &expr_preds),
+                                            // 分類が `PlainScan` 以外なら到達しないが、式述語を 1 件でも落とすと
+                                            // 候補が上位集合になり fail-open になるため、非対応は全走査へ倒す。
+                                            None => crate::sql::scalar_index::CandidateResolution::FallbackNoIndex,
+                                        }
+                                    };
+                                    match resolution {
                                         crate::sql::scalar_index::CandidateResolution::Use(
                                             slots,
                                         ) => {
@@ -1701,7 +1744,9 @@ pub(crate) fn execute_statement_with_cache(
                             // 崩れた場合は下の従来経路（`filter_cached_rls_rows_
                             // subset` による候補行への `on_visible_row` 再適用）へ
                             // 落ちるだけで、クエリの正しさ・テナント境界は不変。
-                            let kept = if !hnsw_subset_eligible {
+                            // 部分索引由来の候補（`candidates_exact == false`）は上位集合なので、
+                            // 信頼マスクではなく `on_visible_row` 再適用経路を必ず通す（Issue #1656）。
+                            let kept = if !hnsw_subset_eligible && candidates_exact {
                                 if let Some(scalar_access) = scalar_cache.as_ref() {
                                     scalar_access.cache.record_index_trusted_mask_scan();
                                 }
@@ -1880,7 +1925,9 @@ pub(crate) fn execute_statement_with_cache(
     if let (Some(scalar_access), Some(snapshot_for_scalar)) =
         (scalar_cache.as_ref(), scalar_snapshot_for_index.as_ref())
     {
-        if scalar_plan_kind != crate::sql::scalar_plan::ScalarPlan::PlainScan {
+        if scalar_plan_kind != crate::sql::scalar_plan::ScalarPlan::PlainScan
+            || !partial_names.is_empty()
+        {
             // Issue #474: 上記の候補削減分岐が同じクエリ中に既に `lookup` を
             // 呼んでいれば（`scalar_index_lookup_hit`）その結果を再利用し、
             // `lookup` の重複呼び出しによる `hits`/`misses` 統計の二重計上を

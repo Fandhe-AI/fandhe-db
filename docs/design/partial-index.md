@@ -81,12 +81,12 @@ spec 本文は転記しない。実装は `sql::index_predicate`（束縛・評�
 | - | ---- | ---- |
 | D1 | 永続の部分索引表は作らない。派生キーは式キー索引と同じく、コミット済みの行からテーブル世代ごとに作り直す | 第 2 の複製が無いので、クラッシュ後に行と食い違う状態が構造的に生じない。DML は全経路で同じ write txn 内に世代を bump する |
 | D2 | 守る不変条件は「部分索引があれば、全行で述語が評価でき、述語が TRUE の行では式要素も評価・索引化できる」。述語が NULL・FALSE の行は索引外で、式要素は評価しない | `((100 / n)) WHERE n <> 0` の `n = 0` 行を過剰に拒否しない。述語の評価エラーは文を拒否する |
-| D3 | 部分索引の宣言は列宣言（`scalar_columns`）・式キー（`expression_keys`）・一意宣言のどれにも入れず、専用の一覧（`partial_indexes`／`partials`）へ振り分ける。EXPLAIN にも名前を出さない | 含意判定（#1655）なしでプランナが使うと述語外の行が結果から落ちる（fail-open）。プランナ選択は #1656 |
+| D3 | 部分索引の宣言は列宣言（`scalar_columns`）・式キー（`expression_keys`）・一意宣言のどれにも入れず、専用の一覧（`partial_indexes`／`partials`）へ振り分ける。EXPLAIN の列被覆の名前にも入れない（#1656 で `index_partial` として別経路に結線） | 含意判定（#1655）なしでプランナが使うと述語外の行が結果から落ちる（fail-open）。プランナ選択は #1656 |
 | D4 | 述語は WHERE と同じ束縛（`bind_where_predicates`）・評価（`BoundOrGroup::matches`）を使い、第 2 の評価器を作らない。CHECK 用の束縛は使わない | 索引に入る行の集合と「`WHERE <述語>` が選ぶ行の集合」の一致が #1655・#1656 の前提 |
 | D5 | セッションに依存する述語は束縛段で `42P17`（固定文言）: 式葉の `check_bound_index_expression_determinism`・`TIMESTAMPTZ` 列と文字列リテラルの宣言的比較・日時の特殊値。`'now'` 等は束縛が `22007` で受理しない | 保存テキストは書き込みのたびに再束縛するため、セッション TZ・評価時刻で結果が変わる述語は決定的でない |
 | D6 | 予約列（`tenant_id`・`visibility`）・`visible()` を参照する述語は `42601`。疑似列 `id` は許可する | 共有カタログの永続宣言へテナント識別や可視性を埋め込ませない |
 | D7 | カタログ形式に新版 `v6` を追加する（`v1`〜`v5` のバイト列は不変。旧バイナリは `v6` を読めない）。非一意に限る | 部分 UNIQUE の強制は #1657 |
-| D8 | 派生構造 `PartialIndexEntries`（述語 TRUE のスロット `members` と、式要素の式キーを `members` だけで構築したもの）を `ScalarIndex` が持つ。起動時 opt-in 有効時のみ構築し、fail-soft（再束縛失敗・述語の評価エラー・予算超過・確保失敗のどれでも丸ごと作らない）。素の列要素のキー構造は作らない | #1648 の式キーの前例。消費者は #1656 まではテストだけ |
+| D8 | 派生構造 `PartialIndexEntries`（述語 TRUE のスロット `members` と、式要素の式キーを `members` だけで構築したもの）を `ScalarIndex` が持つ。起動時 opt-in 有効時のみ構築し、fail-soft（再束縛失敗・述語の評価エラー・予算超過・確保失敗のどれでも丸ごと作らない）。素の列要素のキー構造は作らない | #1648 の式キーの前例。消費者は #1656 の `resolve_partial_candidates` とテスト |
 | D9 | `0A000` のまま残す組み合わせ: `UNIQUE`＋`WHERE`・`USING hnsw`＋`WHERE`・`COLLATE`＋`WHERE`・matview への `WHERE`。最終ゲートと防御ゲートは「撤去」ではなく「縮小」した | 強制や照合の永続形が無いまま宣言を残すと fail-open になる |
 | D10 | 列 DDL: `DROP COLUMN` は `referenced_columns()` が述語の参照列を含むため連鎖削除。`RENAME COLUMN` は保存テキストを再解析し AST 上の識別子を写像して再束縛し、参照列集合の一致を確認してから保存（失敗は `0A000`・txn 破棄）。述語・要素が参照する列への `ALTER COLUMN TYPE` は `0A000`（無変化） | 放置すると次の書き込みで保存テキストが再束縛できず `CorruptSchema` になる |
 
@@ -122,7 +122,7 @@ spec 本文は転記しない。実装は `sql::index_predicate`（束縛・評�
   存在オラクルにならない。
 - `CREATE INDEX` の全件検証は DDL 権限ゲート（`42501`）の後の運用者権限の操作で、不可視行の失敗も検出する。
   評価エラーは固定文言に置換し、テナント・行 id・値・件数を応答へ出さない。
-- 派生キーの構築元は RLS 適用済みのスナップショットだけ。部分索引は #1656 までプランナに結線しない。
+- 派生キーの構築元は RLS 適用済みのスナップショットだけ。部分索引のプランナへの結線は #1656（下記）。
 
 ### PostgreSQL との差
 
@@ -145,7 +145,7 @@ SQL-49 ポインタのとおり `42601` のまま。
 ## Issue #1655（述語の含意判定）
 
 INDEX-11 ポインタ。`sql::index_implication::query_implies_partial_predicate` は「クエリの `WHERE`（Q）が TRUE の
-行は索引述語（P）も TRUE」を保守的に証明する純関数で、プランナへは未結線（#1656 が呼ぶ）。SQL 表層・SQLSTATE・
+行は索引述語（P）も TRUE」を保守的に証明する純関数で、プランナへの結線は #1656（`implied_partial_index_names` が呼ぶ）。SQL 表層・SQLSTATE・
 EXPLAIN・結果は変えない。公開 API の追加なし（`pub(crate)`）。
 
 | 項目 | 判断 |
@@ -163,3 +163,31 @@ EXPLAIN・結果は変えない。公開 API の追加なし（`pub(crate)`）�
 `BoundIndexPredicate::conjunction`）。プリペアド文は具体値で束縛した後に毎回判定し、describe 用ダミー値での判定や
 判定結果の使い回しをしない。`false` のときは従来の経路へ。浮動小数・`CHAR(n)`・TEXT 範囲・`OR`/`NOT` の推論拡張は、
 オラクルテストを伴う別 Issue で扱う。
+
+## Issue #1656（プランナ選択と EXPLAIN）
+
+INDEX-11 (3)・INDEX-7 ポインタ。含意判定（#1655）と格納（#1654）を検索 SELECT の読み取り経路へ結線する。
+SQLSTATE は変えない。公開 API は `ScalarPlan::IndexPartial` の追加（`#[non_exhaustive]`）。クライアントから見える
+EXPLAIN の語彙として `index_partial` が増えるため CHANGELOG の Breaking Changes に載せる。
+
+| # | 判断 | 理由 |
+| - | ---- | ---- |
+| P1 | Q が P を含意するとき、部分索引の格納行は Q に一致する行の**上位集合**にすぎない。候補は必ず `on_visible_row` を再適用する経路（`filter_cached_rls_rows_subset`／`build_from_cached_rls_rows_subset`）へ流し、索引信頼マスク（`mask_trusted_defer`）には入れない | 信頼マスクの前提は「WHERE が索引で完全に被覆される」こと。部分索引は満たさず、入れると述語外の行が混ざる（fail-open） |
+| P2 | 参加条件: opt-in 済み・`scalar_prefilter`・WHERE あり・**通常の分類が `PlainScan`**（式索引の一致を含む。宣言による補正の前の値）。判定に使う量は exec と EXPLAIN で揃える | 宣言補正後の値で判定すると exec と EXPLAIN が食い違う。通常の索引経路には触れず、カタログを読むのは全走査になるクエリだけ |
+| P3 | 選択関数は `index_implication::implied_partial_index_names` の 1 本だけ。宣言ごとに再束縛・往復一致・単一分岐を確認し、含意される全索引の名前を昇順・重複なしで返す。失敗はすべて「含意しない」 | EXPLAIN は静的な判定でなければならずデータ（行数・格納行数）に依存できない |
+| P4 | 実行時の候補は、含意された索引のうち構築済みの格納行を昇順で交差して作る（未構築は飛ばす。1 本もなければ `FallbackNoIndex`）。既存と同じ選択度ゲートを通す | 交差しても上位集合のまま健全。EXPLAIN は実行時の縮退を観測しない既存の契約を維持 |
+| P5 | EXPLAIN は `scalar_plan: index_partial index=<名前>[,<名前>...]`（縮退理由なし）。`ScalarPlan::IndexPartial` は分類関数からは返さず、exec と EXPLAIN が付与する | `plain_scan` に `index=` を付けない既存規則と、部分索引を使うのに `plain_scan` と出す誤りの回避 |
+| P6 | 部分索引の名前は列被覆の判定を通さず選択関数の結果をそのまま使う。`explain_index_names_in_txn` が部分索引を列被覆から除外する動作（#1654 D3）は維持する | 列被覆に含めると含意しないクエリにも名前が出る |
+| P7 | 集計・`GROUP BY`・広域取得（`sql::scan`）は変更しない | 集計の信頼経路は完全被覆が前提で P1 と衝突する |
+| P8 | 素の列要素の専用キー・部分索引の式キーでの絞り込み・通常の索引候補との組み合わせはしない | 範囲を最小にする。性能改善の後続候補で、正しさには影響しない |
+| P9 | 判定はクエリの実行ごとに具体値で束縛した Q に対して行い、結果は使い回さない。カタログを読めなければ空（全走査）に倒す | プリペアド文をダミー値で判定しない（#1655 からの申し送り）。fail-closed |
+
+テナント境界: 候補は RLS 適用済みスナップショットのスロットの部分集合（同一性ガード通過分）で、`on_visible_row`
+を必ず再適用するため述語外の行・不可視行は混入しない。EXPLAIN が出すのは検証済み識別子の索引名だけで、件数・値・
+テナント情報は出さない。既知のコスト: 通常の分類が `PlainScan` のクエリは、opt-in 時に宣言の読み取りと再束縛を
+行う（全走査になるクエリだけ。世代キーのキャッシュは #1650 と同じく後続候補）。
+
+検証: `tests/partial_index_planner.rs`（含意する形の結果が全走査オラクルと一致・索引経路の発火と信頼マスク
+不使用・含意しない形・opt-in なし・テナント境界・UPDATE による入退場・集計・`USING PLAN` の EXPLAIN）と
+`index_implication`・`scalar_index`・`explain` の単体テスト。対象外: 集計・広域取得での使用、通常の索引候補との
+組み合わせ、部分索引の式キーでの絞り込み、世代キーのキャッシュ、部分 UNIQUE（#1657）、含意判定の拡張。

@@ -346,3 +346,57 @@ fn index11_bound_index_predicate_exposes_its_conjunction() {
         &schema(),
     ));
 }
+
+fn decl(name: &str, predicate: &str) -> crate::catalog::DeclaredPartialIndex {
+    let preds = crate::sql::allowlist::parse_index_predicate_text(predicate).expect("parse");
+    let bound = crate::sql::index_predicate::bind_index_predicate(&preds, &schema()).expect("bind");
+    crate::catalog::DeclaredPartialIndex {
+        index_name: name.to_string(),
+        predicate_sql: bound.sql.clone(),
+        elements: vec![crate::catalog::PartialElementDecl::Column("n".to_string())],
+    }
+}
+
+fn names_for(q: &str, decls: &[crate::catalog::DeclaredPartialIndex]) -> Vec<String> {
+    let qc = bind(q);
+    implied_partial_index_names(
+        &schema(),
+        decls,
+        &qc.metadata_filters,
+        &qc.expr_filters,
+        &qc.or_groups,
+    )
+}
+
+/// 含意される索引だけが昇順・重複なしで返る（Issue #1656 の選択関数）。
+#[test]
+fn index11_selection_returns_implied_names_sorted_and_deduped() {
+    let decls = vec![
+        decl("p_z", "n > 3"),
+        decl("p_a", "n >= 0"),
+        decl("p_no", "n > 100"),
+        decl("p_z", "n > 3"),
+    ];
+    assert_eq!(names_for("n = 5", &decls), vec!["p_a", "p_z"]);
+    assert!(names_for("n = 1000000000000", &[]).is_empty());
+    assert_eq!(names_for("code = 'a'", &decls), Vec::<String>::new());
+}
+
+/// 再束縛できない・往復一致しない宣言は含意しない扱いで除外される（fail-closed）。
+#[test]
+fn index11_selection_skips_unbindable_or_drifted_declarations() {
+    let mut broken = decl("p_broken", "n > 3");
+    broken.predicate_sql = "n >".to_string();
+    let mut drifted = decl("p_drift", "n > 3");
+    drifted.predicate_sql = "(n > 3)".to_string();
+    let missing_col = crate::catalog::DeclaredPartialIndex {
+        index_name: "p_missing".to_string(),
+        predicate_sql: "nope = 1".to_string(),
+        elements: Vec::new(),
+    };
+    let ok = decl("p_ok", "n > 3");
+    assert_eq!(
+        names_for("n = 5", &[broken, drifted, missing_col, ok]),
+        vec!["p_ok"]
+    );
+}

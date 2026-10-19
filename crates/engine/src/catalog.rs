@@ -899,7 +899,7 @@ pub(crate) struct DeclaredIndexTargets {
     pub(crate) expression_keys: Vec<DeclaredExpressionKey>,
     /// 対象テーブルの部分索引（述語付き。INDEX-11、Issue #1654）。部分索引の列・式要素は
     /// `scalar_columns`・`expression_keys` のどちらにも**入れない**（含意判定〔#1655〕なしでプランナが
-    /// 使うと、述語外の行が結果から落ちる fail-open になるため。プランナ選択は #1656）。
+    /// 使うと、述語外の行が結果から落ちる fail-open になるため。プランナ選択は #1656 の `sql::index_implication::implied_partial_index_names` が含意判定を通して行う）。
     pub(crate) partial_indexes: Vec<DeclaredPartialIndex>,
 }
 
@@ -1230,8 +1230,8 @@ pub(crate) fn explain_index_names_in_txn(
             CatalogError::CorruptSchema(format!("invalid index identifier for index {name}"))
         })?;
         let def = decode_index_def(name, value.value())?;
-        // 部分索引はプランナ選択（#1656）まで EXPLAIN に名前を出さない（INDEX-11、Issue #1654。
-        // 含意判定なしに「使われた」と見せない）。
+        // 部分索引は列被覆の候補から除外する（INDEX-11、Issue #1654・#1656。含意しないクエリに名前を
+        // 出さないため。名前は含意判定を通ったときだけ `core.rs` の EXPLAIN が `index_partial` で出す）。
         if def.table != table || def.has_predicate() {
             continue;
         }
@@ -24250,7 +24250,7 @@ mod tests {
     }
 
     /// 部分索引は列宣言・式キー・EXPLAIN の索引名のどれにも混ざらず、専用の一覧へ振り分けられる
-    /// （プランナ選択〔#1656〕まで結果と EXPLAIN に影響しない。INDEX-11、Issue #1654）。
+    /// （EXPLAIN の列被覆の名前には混ざらない。プランナ選択は #1656 が含意判定を通して行う。INDEX-11、Issue #1654）。
     #[test]
     fn partial_indexes_are_split_from_column_and_expression_declarations() {
         let (storage, _guard) = index_fixture_storage("index-partial-split");

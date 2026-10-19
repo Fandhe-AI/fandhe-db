@@ -53,8 +53,7 @@ pub(crate) struct BoundIndexPredicate {
 impl BoundIndexPredicate {
     /// 述語の唯一の AND 連言（含意判定 `sql::index_implication` の入力）。分岐が 1 個でなければ
     /// `None`（呼び出し側は含意しない扱いにする。束縛は常に単一分岐で作るため防御的な戻り値）。
-    /// プランナ（Issue #1656）が結線するまで呼び出し元はテストのみ。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// プランナ選択（`sql::index_implication::implied_partial_index_names`、Issue #1656）が呼ぶ。
     pub(crate) fn conjunction(&self) -> Option<&BoundConjunction> {
         match self.group.branches.as_slice() {
             [only] => Some(only),

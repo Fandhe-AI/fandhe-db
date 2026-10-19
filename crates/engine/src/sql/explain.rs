@@ -455,6 +455,17 @@ pub struct ExplainShape {
     filter_columns: FilterColumnSet,
     /// Issue #2191: TEXT 系列の辞書の使い方（照合込みの使用可否と縮退理由の入力）。
     text_uses: TextUseSets,
+    /// 部分索引の含意判定（INDEX-11、Issue #1656）の入力となる `WHERE` の束縛結果の複製。
+    /// `WHERE` が空なら持たない（部分索引は `WHERE` のあるクエリだけが対象）。
+    partial_query: Option<PartialQueryInput>,
+}
+
+/// 部分索引の含意判定に渡す `WHERE` の束縛結果（Issue #1656。`ExplainShape` 専用の複製）。
+#[derive(Debug, Clone, PartialEq)]
+struct PartialQueryInput {
+    metadata_filters: Vec<MetadataFilter>,
+    expr_filters: Vec<BoundExpr>,
+    or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
 }
 
 /// [`ExplainShape::filter_cols`] の語数。[`crate::catalog::MAX_COLUMN_COUNT`] から
@@ -530,6 +541,40 @@ impl ExplainShape {
             filter_cols_overflow,
             filter_columns: FilterColumnSet::from_filters(metadata_filters, expr_filters),
             text_uses: TextUseSets::from_filters(metadata_filters, expr_filters),
+            partial_query: if metadata_filters.is_empty()
+                && expr_filters.is_empty()
+                && or_filters.is_empty()
+            {
+                None
+            } else {
+                Some(PartialQueryInput {
+                    metadata_filters: metadata_filters.to_vec(),
+                    expr_filters: expr_filters.to_vec(),
+                    or_filters: or_filters.to_vec(),
+                })
+            },
+        }
+    }
+
+    /// `WHERE` を含意する述語を持つ部分索引の名前（昇順・重複なし。INDEX-11、Issue #1656）。
+    /// 実行時と同じ解決（`scalar_index::resolve_implied_partial_indexes_in_txn`）を通す。
+    /// `core.rs::EngineCore::run_explain_plan` が、opt-in 済みで通常の分類が `PlainScan` のときだけ、
+    /// 世代照合を通過した `post_check_txn` を渡して呼ぶ。`WHERE` が空・カタログ読み取り失敗は空。
+    pub(crate) fn implied_partial_indexes(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table: &str,
+        schema: &crate::catalog::TableSchema,
+    ) -> Vec<String> {
+        match self.partial_query.as_ref() {
+            Some(q) => crate::sql::scalar_index::resolve_implied_partial_indexes_in_txn(
+                read_txn,
+                table,
+                schema,
+                true,
+                (&q.metadata_filters, &q.expr_filters, &q.or_filters),
+            ),
+            None => Vec::new(),
         }
     }
 
@@ -659,6 +704,7 @@ fn scalar_plan_token(plan: ScalarPlan) -> &'static str {
         ScalarPlan::IndexTypedRange => "index_typed_range",
         ScalarPlan::IndexInList => "index_in_list",
         ScalarPlan::IndexConjunction => "index_conjunction",
+        ScalarPlan::IndexPartial => "index_partial",
     }
 }
 
@@ -1250,6 +1296,23 @@ mod tests {
         assert_eq!(
             cell_text(&result, last - 1),
             "ann_plan: hnsw_full_visible index=idx_vec"
+        );
+    }
+
+    /// 部分索引の選択（Issue #1656）は `scalar_plan: index_partial index=<名前>` で表示される。
+    #[test]
+    fn index_partial_plan_renders_the_partial_index_names() {
+        assert_eq!(scalar_plan_token(ScalarPlan::IndexPartial), "index_partial");
+        let names = ExplainIndexNames::new(vec![], vec!["p_b".to_string(), "p_a".to_string()]);
+        let result = build_relational_explain_result(
+            ScalarPlan::IndexPartial,
+            None,
+            AccessPath::FullScan,
+            &names,
+        );
+        assert_eq!(
+            cell_text(&result, 0),
+            "scalar_plan: index_partial index=p_a,p_b"
         );
     }
 
