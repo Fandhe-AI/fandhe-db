@@ -214,3 +214,33 @@ Issue #1711 より前の定義は全テナント共有の `public` に属する�
 - 未知の名前の `42P01` はテナントによらず同一の応答で、文言にテナント情報を含めない
 
 **既知の残課題**: 他テナントのスキーマに属する SEQUENCE を名前で解決できないことの完全な実現は、#1711（tenant 所有のスキーマ）と #1717（SEQUENCE の修飾名）に属する。`sequence_key` が差し替え点。
+
+## 8. Issue #1689 実装記録（ALTER SEQUENCE）
+
+### 8.1 構文と検査順
+
+- 受理: `RESTART [[WITH] n]`・`START [WITH]`・`INCREMENT [BY]`・`MINVALUE`／`NO MINVALUE`・`MAXVALUE`／`NO MAXVALUE`・`CYCLE`／`NO CYCLE` の任意順（1 個以上）と、単独の `RENAME TO <新名>`。タグは `ALTER SEQUENCE`（RENAME も同じ）
+- `42601`: オプションなし・同種の重複・`RENAME TO` と他オプションの併用・小数・未知のトークン。`22003`: i64 の範囲外
+- `0A000`: `IF EXISTS`・`AS`・`CACHE`・`OWNED BY`・`SET SCHEMA`・`OWNER TO`・`SET LOGGED`／`UNLOGGED`・修飾名。明示トランザクション内の ALTER も `0A000`（既存の末尾の拒否に乗る）
+- `22023` の検査順（PostgreSQL 17 の `init_params` と同じ）: `INCREMENT` ≠ 0 → MIN／MAX の決定（`NO MINVALUE`／`NO MAXVALUE` は変更後の INCREMENT の符号から既定値を再導出。未指定は現行値を維持）→ MIN < MAX → START ∈ [MIN, MAX]（START を指定しなくても現行値を常に検査）→ RESTART 値（値なしは START）または現在値 ∈ [MIN, MAX]。文言は値を含まない固定文言
+- 判定の順序: 構文 → DDL 権限（`42501`。対象の有無を問わない）→ 名前の解決（`42P01`／`42809`）→ RENAME 先の衝突（`42P07`。同名も）→ 範囲（`22023`）
+
+### 8.2 決定
+
+- **定義 blob v2**: v1 の末尾に `restart_value`（i64）を足す。意味は「状態行を持たないテナントの last_value（`is_called = false`）」。CREATE 時は START、RESTART で更新する。v1 は `restart_value = start` として読み、書き込みは常に v2。`restart_value` が範囲外の blob は `CorruptSchema`
+- **RESTART は全テナントへ作用する**: 定義の `restart_value` の更新と、全テナント分の状態行の削除を同一 txn で行う（DROP と同じ `retain` の走査削除）。#1711 より前は定義が全テナント共有で、呼び出し元だけをリセットすると他テナントに新しい範囲の外の現在値が残りうるため。結果が他テナントの状態に依存しない（TABLE-24 (2) のポインタ）。ただし spec が作用範囲を明示していないため自動運転下で安全側に決めた判断で、人間の確認が要る
+- **範囲検査の現在値は「呼び出し元テナント＋定義の `restart_value`」に限る**: 他テナントの状態行を検査すると、他テナントの採番の進みが `22023` の有無から観測できる。新しい範囲の外に残った他テナントの現在値は、#1690 の nextval が PG の算術どおりに `2200H`（CYCLE なら折り返し）で処理する
+- **RENAME は定義のキーだけを付け替える**: 内部 ID・状態行は不変（D3）。依存 DEFAULT があれば `0A000`（現状は常に偽。#1690 の `ColumnDefault` の variant が名前で SEQUENCE を保持する場合の fail-closed。`sequence_id` で保持すれば外せる）
+- `CatalogError` は公開型なので variant を足さず、`catalog::sequence` の `AlterSequenceError`（範囲違反とカタログ系）で区別する
+
+### 8.3 #1690 への申し送り
+
+- 状態行の値の形式は #1690 が決める。呼び出し元テナントの状態行を読むフック `caller_current_value_in_txn` は、行が存在する間は形式が未確定のため `CorruptSchema` で拒否する。#1690 は状態の decode へ置き換える。置き換えを忘れても ALTER が拒否側に倒れるだけで、黙って検査が飛ぶことはない
+- ALTER の commit 後の結線点 `on_sequence_altered` は空。#1690 のプロセス内アロケータ（D4）は、ここで該当 `sequence_id` のエントリを全テナント分破棄する。RESTART だけでなく INCREMENT・MIN・MAX・CYCLE の変更も次の値に影響する
+- 受け入れ条件「変更後の nextval が PG 17 と同じ値」は nextval の着地後に SQL 水準で検証する。期待値の表は `tests/table24_alter_sequence.rs` の冒頭にある。本 Issue では Storage 水準で格納値（`restart_value`・params・状態行の削除）を検証した
+- #1689 と #1690 のどちらかが先にマージされた場合、後の側が rebase で上記を統合する
+
+### 8.4 既知の差
+
+- 同種オプションの重複は構文段で検出するため、未知の名前と重複が同時にあると、PG（リレーション解決が先で `42P01`）と違い `42601` が先に返る
+- `ALTER TABLE <sequence> RENAME TO ...`（PG は許す）は現状の挙動のまま
