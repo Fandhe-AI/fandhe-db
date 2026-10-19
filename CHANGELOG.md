@@ -17,6 +17,13 @@
   `IndexExpressionDef`・`IndexDef::with_expressions` の追加。式を含む宣言のカタログ形式は新版 `v4`
   （`v1`／`v2`／`v3` のバイト列は不変。旧バイナリは `v4` を読めない）。公開の `Storage::create_index` は
   式付きの `IndexDef` を `Invalid` で拒否する（SQL 表層のみが作成できる）。
+- `REFRESH MATERIALIZED VIEW [CONCURRENTLY] <名前> [WITH [NO] DATA]`（Issue #1665・TABLE-42）:
+  従来 `42601` だった構文を受理し、全文脈の実体を同じスナップショットから単一トランザクションで作り直す。
+  失敗時は旧実体が残る。`WITH NO DATA` は実体を破棄して未実体化（`55000`）にする。タグは固定の
+  `REFRESH MATERIALIZED VIEW`。`CONCURRENTLY` は暫定で `0A000`（#1666 で本実装）。公開 API は
+  `ParsedSql::RefreshMaterializedView`・`SqlOutcome::RefreshMaterializedView`・
+  `ddl::RefreshMaterializedViewOutcome` を追加する。
+
 - `DROP MATERIALIZED VIEW [IF EXISTS] <名前>[, ...] [CASCADE | RESTRICT]` と matview への索引（Issue #1667・
   TABLE-42 (5)(6)・TABLE-37）: 従来 `42601` だった `DROP MATERIALIZED VIEW` を受理する（複数指定は単一 txn で原子的、
   表・ビュー・索引名の指定は `IF EXISTS` でも `42809`、依存する matview は RESTRICT で `2BP01`、CASCADE で依存する
