@@ -3144,11 +3144,13 @@ pub(crate) fn ensure_scalar_index_snapshot(
     // `read_txn` から解決する。カタログ読み取り失敗は「宣言なし→自動」へは
     // 倒さず即座に構築不能（plain scan フォールバック）とする
     // （`resolve_scalar_index_target_in_txn` ドキュメント参照）。
-    let target = match crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
-        read_txn,
-        table,
-        scalar_access.declarations_enabled,
-    ) {
+    let (resolved_target, expression_keys) =
+        crate::sql::scalar_index::resolve_scalar_index_target_and_expression_keys_in_txn(
+            read_txn,
+            table,
+            scalar_access.declarations_enabled,
+        );
+    let target = match resolved_target {
         Ok(t) => t,
         Err(()) => {
             scalar_access.cache.record_build_failure();
@@ -3175,10 +3177,11 @@ pub(crate) fn ensure_scalar_index_snapshot(
         {
             return None;
         }
-        return match crate::sql::scalar_index::ScalarIndex::build_targeted(
+        return match crate::sql::scalar_index::ScalarIndex::build_targeted_with_expressions(
             schema,
             &snapshot,
             target.as_target(),
+            &expression_keys,
         ) {
             Ok(index) => scalar_access
                 .cache
@@ -3214,6 +3217,7 @@ pub(crate) fn ensure_scalar_index_snapshot(
         table,
         expected_dim,
         target.as_target(),
+        &expression_keys,
     ) {
         Some(pair) => pair,
         None => {
@@ -3384,6 +3388,7 @@ fn capture_scalar_index_snapshot(
     table: &str,
     expected_dim: u32,
     target: crate::sql::scalar_index::ScalarIndexTarget<'_>,
+    expression_keys: &[crate::catalog::DeclaredExpressionKey],
 ) -> Option<(
     crate::sql::arena_cache::SqlArenaSnapshot,
     crate::sql::scalar_index::ScalarIndex,
@@ -3461,8 +3466,13 @@ fn capture_scalar_index_snapshot(
     let generation = crate::catalog::table_generation_in_txn(read_txn, table).ok()?;
     let snapshot =
         crate::sql::arena_cache::SqlArenaSnapshot::new(arena, metadata, ctx.clone(), generation);
-    let index =
-        crate::sql::scalar_index::ScalarIndex::build_targeted(schema, &snapshot, target).ok()?;
+    let index = crate::sql::scalar_index::ScalarIndex::build_targeted_with_expressions(
+        schema,
+        &snapshot,
+        target,
+        expression_keys,
+    )
+    .ok()?;
     Some((snapshot, index))
 }
 
@@ -4475,7 +4485,8 @@ mod tests {
                 &schema,
                 "docs",
                 expected_dim,
-                crate::sql::scalar_index::ScalarIndexTarget::Auto
+                crate::sql::scalar_index::ScalarIndexTarget::Auto,
+                &[],
             )
             .is_none(),
             "a generation containing a nullable-VECTOR NULL row must not be captured"
@@ -4507,6 +4518,7 @@ mod tests {
             "docs",
             expected_dim,
             crate::sql::scalar_index::ScalarIndexTarget::Auto,
+            &[],
         )
         .expect("capture should succeed when no row is NULL");
         assert_eq!(snapshot.arena().len(), 2);
@@ -4556,6 +4568,7 @@ mod tests {
                 "docs",
                 expected_dim,
                 crate::sql::scalar_index::ScalarIndexTarget::Auto,
+                &[],
             )
             .expect("initial capture should succeed");
             arena_cache.insert(&storage, "docs", &ctx, snapshot);

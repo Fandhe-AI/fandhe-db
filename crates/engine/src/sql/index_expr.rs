@@ -9,8 +9,9 @@
 //!   SQLSTATE（`42803`・`42P20`・`0A000`）にはここで分類する。
 //! - `check_index_expression_determinism`: 解析済みの式木に対する決定性（IMMUTABLE 相当）検査。
 //!   構文だけで確実に非決定的と言えるものを `42P17` にする。引数の型に依存して決まるもの
-//!   （時刻型を含む `CAST`・`date_part` 等）は本段では通し、型を知る束縛段（後続 Issue #1648 が
-//!   `Storage::create_index` の書き込みトランザクション内で行う）で再判定する。
+//!   （時刻型を含む `CAST`・`date_part` 等）は本段では通し、型を知る束縛段
+//!   （[`bind_index_expression`]。Issue #1648 が `Storage::create_index` の書き込みトランザクション内で
+//!   呼ぶ）で再判定する。
 //! - 組み込み以外の関数（セッション UDF・未知名）は `0A000`。`UdfRegistry` はセッション単位で
 //!   永続化されないため、永続する索引がセッション外で消える関数に依存すると維持できず
 //!   fail-open になる。
@@ -275,6 +276,443 @@ pub(crate) fn check_index_expression_determinism(expr: &Expr) -> Result<(), SqlS
     }
 }
 
+/// 式木のどこかに `COLLATE` を含むかを再帰的に判定する（式索引は照合を永続形に持たないため、
+/// 最上位だけでなく入れ子の `lower(col COLLATE "C")` も fail-closed で拒否する根拠）。
+/// `Expr` の全 variant を網羅する（variant 追加時にコンパイルエラーで漏れに気づく）。
+pub(crate) fn expr_contains_collate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Collate { .. } => true,
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Ident(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
+        | Expr::IntervalLiteral(_)
+        | Expr::ValueFunction { .. } => false,
+        Expr::Call { args, .. } => args.iter().any(expr_contains_collate),
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::Quantified { lhs, rhs, .. } => {
+            expr_contains_collate(lhs) || expr_contains_collate(rhs)
+        }
+        Expr::Case { whens, else_result } => {
+            whens
+                .iter()
+                .any(|(c, r)| expr_contains_collate(c) || expr_contains_collate(r))
+                || else_result.as_deref().is_some_and(expr_contains_collate)
+        }
+        Expr::Coalesce(items) | Expr::ArrayConstructor(items) => {
+            items.iter().any(expr_contains_collate)
+        }
+        Expr::NullIf(a, b) => expr_contains_collate(a) || expr_contains_collate(b),
+        Expr::Cast { expr, .. } => expr_contains_collate(expr),
+        Expr::SqlJsonQuery(q) => q.children().into_iter().any(expr_contains_collate),
+        Expr::Subscript { base, subscript } => {
+            expr_contains_collate(base)
+                || match subscript {
+                    ArraySubscript::Index(i) => expr_contains_collate(i),
+                    ArraySubscript::Slice { lo, hi } => [lo, hi]
+                        .into_iter()
+                        .flatten()
+                        .any(|b| expr_contains_collate(b)),
+                }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 束縛段（Issue #1648）: 型を知る側（`catalog::Storage::create_index` の書き込みトランザクションと
+// `sql::scalar_index` の式キー構築）が呼ぶ。
+// ---------------------------------------------------------------------------
+
+/// 索引化できない結果型の拒否文言（固定。列名・値を含めない）。
+const MSG_RESULT_TYPE: &str = "index expression result type is not supported yet";
+/// 正規化テキストへ往復できない式の拒否文言（fail-closed。壊れた式を永続化しない）。
+const MSG_NOT_STORABLE: &str = "index expression cannot be stored in normalized form";
+/// セッション TZ での畳み込み失敗の拒否文言（固定。値を含めない）。
+const MSG_TZ_FOLD: &str =
+    "timestamp with time zone literal is out of range or does not exist in the session time zone";
+/// 式への `COLLATE` の拒否文言（式キーの辞書はバイト列順のみ。後続対応）。
+pub(crate) const MSG_COLLATE: &str = "COLLATE on an index expression is not supported yet";
+
+/// 式要素 1 個を束縛した結果（[`bind_index_expression`] の戻り値）。
+///
+/// 呼び出し元は 2 つ: `catalog::Storage::create_index` の書き込みトランザクション（保存用の
+/// 正規化テキストと参照列を得る）と `sql::scalar_index` の式キー構築（評価プログラムを得る）。
+#[derive(Debug)]
+pub(crate) struct BoundIndexExpression {
+    /// 束縛済み式（参照列の走査マスク計算に使う）。
+    pub(crate) bound: crate::sql::udf_call::BoundExpr,
+    /// 結果型（索引化可能な型だけがここまで届く）。
+    pub(crate) ty: crate::sql::udf_call::ExprType,
+    /// コンパイル済みの評価プログラム。
+    pub(crate) program: crate::sql::expr_program::ExprProgram,
+    /// 往復一致を確認済みの正規化 SQL テキスト（カタログへ保存する値）。
+    pub(crate) sql: String,
+    /// 参照するスキーマ列名（重複なし・スキーマ宣言順）。
+    pub(crate) referenced_columns: Vec<String>,
+    /// VECTOR 列（埋め込み）を参照するか。
+    pub(crate) references_embedding: bool,
+}
+
+/// ゾーン無し `TIMESTAMPTZ` リテラル（`session_local`）を、定義時のセッション TZ で UTC の確定値へ
+/// 畳んだ複製を返す。`check_constraint::render_expr` が描く `+00` 形と一致させ、描画→再解析の
+/// 往復一致と、セッション TZ に依存しない永続化を両立する。`Expr` の全 variant を網羅する
+/// （`_ =>` 無し）。CHECK 側の同名処理は `Cast` 等の内側を再帰しないため流用しない。
+pub(crate) fn fold_session_local_literals(expr: &Expr) -> Result<Expr, SqlSurfaceError> {
+    let rec = |e: &Expr| fold_session_local_literals(e);
+    Ok(match expr {
+        Expr::TimestampTzLiteral {
+            micros,
+            session_local,
+        } => {
+            if *session_local {
+                // 変換できない（DST の欠落時刻・範囲外）場合は fail-closed で拒否する。元の
+                // micros を UTC として残すと、誤った時刻が永続化される。
+                let utc = crate::datetime::with_current_session_time_zone(|tz| {
+                    tz.timestamp_to_timestamptz(*micros)
+                })
+                .ok_or_else(|| SqlSurfaceError::DatetimeFieldOverflow {
+                    detail: MSG_TZ_FOLD.to_string(),
+                })?;
+                Expr::TimestampTzLiteral {
+                    micros: utc,
+                    session_local: false,
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Ident(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::IntervalLiteral(_)
+        | Expr::ValueFunction { .. } => expr.clone(),
+        Expr::Call { name, args } => Expr::Call {
+            name: name.clone(),
+            args: args.iter().map(rec).collect::<Result<_, _>>()?,
+        },
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op: *op,
+            lhs: Box::new(rec(lhs)?),
+            rhs: Box::new(rec(rhs)?),
+        },
+        Expr::Case { whens, else_result } => Expr::Case {
+            whens: whens
+                .iter()
+                .map(|(c, r)| Ok((rec(c)?, rec(r)?)))
+                .collect::<Result<_, SqlSurfaceError>>()?,
+            else_result: match else_result.as_deref() {
+                Some(e) => Some(Box::new(rec(e)?)),
+                None => None,
+            },
+        },
+        Expr::JsonAccess { op, lhs, rhs } => Expr::JsonAccess {
+            op: *op,
+            lhs: Box::new(rec(lhs)?),
+            rhs: Box::new(rec(rhs)?),
+        },
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
+            match expr.try_map_array_children(&mut |e| rec(e)) {
+                Some(r) => r?,
+                None => expr.clone(),
+            }
+        }
+        Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(rec).collect::<Result<_, _>>()?),
+        Expr::NullIf(a, b) => Expr::NullIf(Box::new(rec(a)?), Box::new(rec(b)?)),
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(rec(expr)?),
+            collation: *collation,
+        },
+        Expr::SqlJsonQuery(q) => Expr::SqlJsonQuery(Box::new(q.try_map_children(&mut |e| rec(e))?)),
+        Expr::Cast { expr, ty } => Expr::Cast {
+            expr: Box::new(rec(expr)?),
+            ty: ty.clone(),
+        },
+    })
+}
+
+/// 部分式 `sub` の静的な結果型。束縛できない（文脈依存の型なし `NULL` 等）場合は `None`。
+fn static_type_of(
+    sub: &Expr,
+    schema: &crate::catalog::TableSchema,
+) -> Option<crate::sql::udf_call::ExprType> {
+    let udfs = crate::sql::udf_call::UdfRegistry::default();
+    let mut budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    crate::sql::udf_call::bind_order_expr(sub, schema, &udfs, &mut budget)
+        .ok()
+        .map(|(_, ty)| ty)
+}
+
+/// 時刻・間隔型（文字列との相互変換が `DateStyle`／`IntervalStyle` に依存する型）か。
+fn is_datetime_type(ty: crate::sql::udf_call::ExprType) -> bool {
+    use crate::sql::udf_call::ExprType;
+    matches!(
+        ty,
+        ExprType::Date
+            | ExprType::Time
+            | ExprType::Timestamp
+            | ExprType::TimestampTz
+            | ExprType::Interval
+    )
+}
+
+/// `CastType` が文字列系（`text`／`varchar`／`bpchar`）か。
+fn cast_is_text_family(ty: &crate::sql::cast::CastType) -> bool {
+    use crate::sql::cast::CastType;
+    matches!(
+        ty,
+        CastType::Text | CastType::Varchar(_) | CastType::Bpchar(_)
+    )
+}
+
+/// `CastType` が時刻・間隔型か。
+fn cast_is_datetime(ty: &crate::sql::cast::CastType) -> bool {
+    use crate::sql::cast::CastType;
+    matches!(
+        ty,
+        CastType::Date
+            | CastType::Time
+            | CastType::Timestamp
+            | CastType::TimestampTz
+            | CastType::Interval
+    )
+}
+
+/// 束縛後（型が確定した後）の決定性再判定（INDEX-10）。構文段の
+/// [`check_index_expression_determinism`] が通した「型に依存して決まる」区分のうち、PostgreSQL 17 で
+/// IMMUTABLE でないオーバーロードに束縛されるものを `42P17` にする。判定表:
+///
+/// - `TIMESTAMPTZ` 型の引数を取る関数呼び出し（`date_part`・`date_trunc`・`extract` 等。
+///   `timezone(<zone>, <値>)` の 2 引数形だけは IMMUTABLE のため除く）
+/// - `TIMESTAMPTZ` と `TIMESTAMP`／`DATE` の演算、`TIMESTAMPTZ ± INTERVAL`
+/// - `CAST`: 変換元または変換先が `TIMESTAMPTZ`（もう一方が `TIMESTAMPTZ` 以外）、
+///   時刻・間隔型と文字列系の相互変換（`DateStyle`／`IntervalStyle` 依存）
+///
+/// 型を決められない部分式はこの判定に寄与しない（式全体は束縛に成功している）。
+/// `Expr` の全 variant を網羅する（`_ =>` 無し。fail-closed）。
+pub(crate) fn check_bound_index_expression_determinism(
+    expr: &Expr,
+    schema: &crate::catalog::TableSchema,
+) -> Result<(), SqlSurfaceError> {
+    use crate::sql::udf_call::{BinOp, ExprType};
+    let rec = |e: &Expr| check_bound_index_expression_determinism(e, schema);
+    let ty_of = |e: &Expr| static_type_of(e, schema);
+    match expr {
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Ident(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
+        | Expr::IntervalLiteral(_)
+        | Expr::ValueFunction { .. } => Ok(()),
+        Expr::Call { name, args } => {
+            let two_arg_timezone = name.eq_ignore_ascii_case("timezone") && args.len() == 2;
+            if !two_arg_timezone && args.iter().any(|a| ty_of(a) == Some(ExprType::TimestampTz)) {
+                return Err(not_immutable());
+            }
+            // 2 引数 `timezone(<zone>, <値>)` は、値が型なし文字列リテラル（セッション TZ で
+            // `TIMESTAMPTZ` として解釈）または `DATE`（セッション TZ の 0 時へ変換）のとき、束縛が
+            // セッション TZ 依存の暗黙変換を挿入し、再構築するセッションでキーが変わるため拒否する。
+            if two_arg_timezone {
+                if let Some(value) = args.get(1) {
+                    if matches!(value, Expr::String(_)) || ty_of(value) == Some(ExprType::Date) {
+                        return Err(not_immutable());
+                    }
+                }
+            }
+            // 3 引数 `date_trunc(<単位>, <値>, <ゾーン>)` は、束縛が非 TIMESTAMPTZ の値へ
+            // セッション TZ 依存の暗黙変換を挿入するため、引数の型によらず拒否する。
+            if name.eq_ignore_ascii_case("date_trunc") && args.len() == 3 {
+                return Err(not_immutable());
+            }
+            args.iter().try_for_each(rec)
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let (lt, rt) = (ty_of(lhs), ty_of(rhs));
+            let tz = |t: Option<ExprType>| t == Some(ExprType::TimestampTz);
+            let naive =
+                |t: Option<ExprType>| matches!(t, Some(ExprType::Timestamp | ExprType::Date));
+            let interval = |t: Option<ExprType>| t == Some(ExprType::Interval);
+            let mixed_naive = (tz(lt) && naive(rt)) || (naive(lt) && tz(rt));
+            let tz_interval_arith = matches!(op, BinOp::Add | BinOp::Sub)
+                && ((tz(lt) && interval(rt)) || (interval(lt) && tz(rt)));
+            if mixed_naive || tz_interval_arith || tz_vs_string_literal(lhs, rhs, lt, rt) {
+                return Err(not_immutable());
+            }
+            rec(lhs)?;
+            rec(rhs)
+        }
+        Expr::JsonAccess { lhs, rhs, .. } => {
+            rec(lhs)?;
+            rec(rhs)
+        }
+        Expr::Case { whens, else_result } => {
+            for (cond, result) in whens {
+                rec(cond)?;
+                rec(result)?;
+            }
+            else_result.as_deref().map_or(Ok(()), rec)
+        }
+        Expr::Coalesce(items) | Expr::ArrayConstructor(items) => {
+            let has_tz = items
+                .iter()
+                .any(|e| ty_of(e) == Some(ExprType::TimestampTz));
+            if has_tz && items.iter().any(|e| matches!(e, Expr::String(_))) {
+                return Err(not_immutable());
+            }
+            items.iter().try_for_each(rec)
+        }
+        Expr::NullIf(a, b) => {
+            if tz_vs_string_literal(a, b, ty_of(a), ty_of(b)) {
+                return Err(not_immutable());
+            }
+            rec(a)?;
+            rec(b)
+        }
+        Expr::Collate { expr, .. } => rec(expr),
+        Expr::Cast { expr: inner, ty } => {
+            let src = ty_of(inner);
+            let src_tz = src == Some(ExprType::TimestampTz);
+            let dst_tz = matches!(ty, crate::sql::cast::CastType::TimestampTz);
+            // 文字列リテラル等も含め、`TIMESTAMPTZ` への変換は評価時のセッション TZ に依存する。
+            let tz_conversion = (src_tz && !dst_tz) || (dst_tz && !src_tz);
+            let text_datetime = (cast_is_text_family(ty) && src.is_some_and(is_datetime_type))
+                || (cast_is_datetime(ty) && src == Some(ExprType::Text));
+            if tz_conversion || text_datetime {
+                return Err(not_immutable());
+            }
+            rec(inner)
+        }
+        Expr::SqlJsonQuery(q) => q.children().into_iter().try_for_each(rec),
+        Expr::Subscript { base, subscript } => {
+            rec(base)?;
+            match subscript {
+                ArraySubscript::Index(i) => rec(i),
+                ArraySubscript::Slice { lo, hi } => {
+                    for bound in [lo, hi].into_iter().flatten() {
+                        rec(bound)?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+        Expr::Quantified { lhs, rhs, .. } => {
+            if tz_vs_string_literal(lhs, rhs, ty_of(lhs), ty_of(rhs)) {
+                return Err(not_immutable());
+            }
+            rec(lhs)?;
+            rec(rhs)
+        }
+    }
+}
+
+/// 一方が `TIMESTAMPTZ` 型、他方が型なし文字列リテラルか。束縛は文字列リテラルを
+/// セッション TZ で `TIMESTAMPTZ` へ暗黙変換する（`bind_unknown_literal_against`）ため、
+/// 索引キーが再構築するセッションに依存する（INDEX-10 の `42P17` 対象）。
+fn tz_vs_string_literal(
+    lhs: &Expr,
+    rhs: &Expr,
+    lt: Option<crate::sql::udf_call::ExprType>,
+    rt: Option<crate::sql::udf_call::ExprType>,
+) -> bool {
+    use crate::sql::udf_call::ExprType;
+    let tz = |t: Option<ExprType>| t == Some(ExprType::TimestampTz);
+    (tz(lt) && matches!(rhs, Expr::String(_))) || (tz(rt) && matches!(lhs, Expr::String(_)))
+}
+
+/// 結果型が索引キーにできるか（`Text`／`Scalar`／`Date`／`Timestamp`／`Time`／`TimestampTz`）。
+/// それ以外は固定文言の `0A000`（`ExprType` の全 variant を網羅する）。
+fn check_index_result_type(ty: crate::sql::udf_call::ExprType) -> Result<(), SqlSurfaceError> {
+    use crate::sql::udf_call::ExprType;
+    match ty {
+        ExprType::Text
+        | ExprType::Scalar
+        | ExprType::Date
+        | ExprType::Timestamp
+        | ExprType::Time
+        | ExprType::TimestampTz => Ok(()),
+        ExprType::Vector
+        | ExprType::Bool
+        | ExprType::Interval
+        | ExprType::Json
+        | ExprType::JsonText
+        | ExprType::Numeric
+        | ExprType::Uuid
+        | ExprType::Bytea
+        | ExprType::Array => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: MSG_RESULT_TYPE.to_string(),
+        }),
+    }
+}
+
+/// 式要素 1 個を `schema` に対して束縛する（INDEX-10、Issue #1648）。判定順:
+/// 1. 式木内の `COLLATE`（入れ子含む）は `0A000`
+/// 2. 定義時セッション TZ でゾーン無し `TIMESTAMPTZ` リテラルを確定値へ畳む
+/// 3. 束縛（未知列 `42703`・型不整合 `42883`／`42804` 等は束縛側のエラーをそのまま透過）
+/// 4. 型に依存する決定性の再判定（`42P17`）
+/// 5. 結果型ゲート（`0A000`）
+/// 6. 正規化テキストへ描画し、再解析して元の式と一致することを確認（不一致は `0A000`）
+/// 7. 参照列の抽出
+///
+/// 保存するのは 6 の正規化テキストだけで、呼び出し元の生入力を連結しない。UDF レジストリは
+/// 空（構文段が組み込み以外の関数を拒否済みで、セッション外で消える関数に依存しない）。
+pub(crate) fn bind_index_expression(
+    expr: &Expr,
+    schema: &crate::catalog::TableSchema,
+) -> Result<BoundIndexExpression, SqlSurfaceError> {
+    if expr_contains_collate(expr) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: MSG_COLLATE.to_string(),
+        });
+    }
+    let folded = fold_session_local_literals(expr)?;
+    let udfs = crate::sql::udf_call::UdfRegistry::default();
+    let mut budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    let (bound, ty) = crate::sql::udf_call::bind_order_expr(&folded, schema, &udfs, &mut budget)?;
+    check_bound_index_expression_determinism(&folded, schema)?;
+    check_index_result_type(ty)?;
+    let sql = crate::sql::check_constraint::render_expr(&folded);
+    let not_storable = || SqlSurfaceError::FeatureNotSupported {
+        detail: MSG_NOT_STORABLE.to_string(),
+    };
+    let reparsed =
+        crate::sql::allowlist::parse_index_expression_text(&sql).map_err(|_| not_storable())?;
+    if reparsed != folded {
+        return Err(not_storable());
+    }
+    let references_embedding = crate::sql::udf_call::references_embedding(&bound);
+    let mut mask = vec![false; schema.columns.len()];
+    crate::sql::udf_call::mark_referenced_scalar_columns(&bound, &mut mask);
+    // VECTOR 列の参照は走査マスクに現れない（埋め込みは別経路で渡す）ため、参照した場合は
+    // VECTOR 列を依存列に含める（`DROP COLUMN` の連鎖削除・`RENAME`／`ALTER TYPE` の拒否の判定漏れを防ぐ）。
+    let referenced_columns: Vec<String> = schema
+        .columns
+        .iter()
+        .zip(&mask)
+        .filter(|(c, used)| **used || (references_embedding && c.ty.is_vector()))
+        .map(|(c, _)| c.name.clone())
+        .collect();
+    let program = crate::sql::expr_program::ExprProgram::compile(&bound);
+    Ok(BoundIndexExpression {
+        bound,
+        ty,
+        program,
+        sql,
+        referenced_columns,
+        references_embedding,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +767,160 @@ mod tests {
         // 閉じ括弧が無ければ終端は末尾。
         let t = toks("lower(a");
         assert_eq!(element_end(&t, 0), t.len());
+    }
+    // --- 束縛段（Issue #1648） -------------------------------------------------------
+
+    fn bind_schema() -> crate::catalog::TableSchema {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+                ColumnDef::new("body", ColumnType::Text, true),
+                ColumnDef::new("n", ColumnType::Integer, true),
+                ColumnDef::new("at", ColumnType::Timestamp, true),
+                ColumnDef::new("at_tz", ColumnType::TimestampTz, true),
+                ColumnDef::new("flag", ColumnType::Boolean, true),
+            ],
+        )
+    }
+
+    fn bind_sql(sql: &str) -> Result<BoundIndexExpression, SqlSurfaceError> {
+        let expr = crate::sql::allowlist::parse_index_expression_text(sql)?;
+        bind_index_expression(&expr, &bind_schema())
+    }
+
+    fn bind_code(sql: &str) -> &'static str {
+        use crate::error_format::ClassifiedError;
+        bind_sql(sql)
+            .map(|_| "ok")
+            .unwrap_or_else(|e| e.error_class().wire_code())
+    }
+
+    /// 描画した正規化テキストは再解析すると同じ木に戻り、再束縛しても同じテキストになる。
+    #[test]
+    fn bound_expression_text_round_trips() {
+        for sql in [
+            "lower(lang)",
+            "COALESCE(lower(lang), upper(body), 'it''s')",
+            "(n + 1) * 2",
+            "CASE WHEN n > 1 THEN lower(lang) ELSE upper(lang) END",
+            "NULLIF(lang, 'x')",
+            "CAST(n AS text)",
+            "length(lang) - 3",
+            "substr(body, 1, 3)",
+            "'multi\nline'",
+        ] {
+            let bound = bind_sql(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let again = bind_sql(&bound.sql).unwrap_or_else(|e| panic!("{}: {e}", bound.sql));
+            assert_eq!(bound.sql, again.sql, "{sql}");
+        }
+        // 参照列は重複なし・スキーマ宣言順。
+        let bound = bind_sql("COALESCE(lower(body), lower(lang), lower(body))").expect("bind");
+        assert_eq!(bound.referenced_columns, vec!["lang", "body"]);
+        assert!(!bound.references_embedding);
+    }
+
+    /// 結果型ゲート: 索引化できる型は通し、それ以外は固定文言の `0A000`。
+    #[test]
+    fn result_type_gate_is_closed() {
+        for ok in ["lower(lang)", "n + 1", "at", "at_tz", "DATE '2020-01-01'"] {
+            assert_eq!(bind_code(ok), "ok", "{ok}");
+        }
+        for unsupported in ["CAST(n AS numeric)", "CAST(lang AS uuid)"] {
+            assert_eq!(bind_code(unsupported), "0A000", "{unsupported}");
+        }
+        // 束縛エラーは透過する。
+        assert_eq!(bind_code("lower(nope)"), "42703");
+    }
+
+    /// 型によって決まる決定性の判定表（PostgreSQL 17 の IMMUTABLE でないオーバーロード）。
+    #[test]
+    fn type_dependent_determinism_table() {
+        for not_immutable in [
+            "date_part('hour', at_tz)",
+            "CAST(at_tz AS date)",
+            "CAST(at AS timestamptz)",
+            "CAST(at AS text)",
+            "CAST(lang AS timestamp)",
+            "at_tz + INTERVAL '1 day'",
+            "at_tz - at",
+            "COALESCE(at_tz, TIMESTAMPTZ '2020-01-01 00:00:00+00')",
+            "CASE WHEN at_tz > '2024-01-01 00:00:00' THEN 1 ELSE 0 END",
+            "CASE WHEN '2024-01-01 00:00:00' < at_tz THEN 1 ELSE 0 END",
+            "date_trunc('day', at, 'UTC')",
+            "timezone('UTC', '2024-01-01 00:00:00')",
+            "timezone('UTC', DATE '2024-01-01')",
+        ] {
+            // 最後の例は列そのものの型が同じで通る。除外して個別に確認する。
+            if not_immutable.starts_with("COALESCE") {
+                assert_eq!(bind_code(not_immutable), "ok", "{not_immutable}");
+                continue;
+            }
+            assert_eq!(bind_code(not_immutable), "42P17", "{not_immutable}");
+        }
+        for immutable in [
+            "date_part('hour', at)",
+            "at + INTERVAL '1 day'",
+            "timezone('UTC', at_tz)",
+            "CAST(n AS text)",
+        ] {
+            assert_eq!(bind_code(immutable), "ok", "{immutable}");
+        }
+    }
+
+    /// ゾーン無し `TIMESTAMPTZ` リテラルは、定義時のセッション TZ で UTC の確定値へ畳まれて保存される。
+    /// 保存形は TZ に依存せず、再束縛しても同じテキストに戻る。
+    #[test]
+    fn session_local_timestamptz_literal_is_folded_at_definition() {
+        let sql = "COALESCE(at_tz, TIMESTAMPTZ '2024-01-01 09:00:00')";
+        let utc = bind_sql(sql).expect("utc").sql;
+        let tokyo = {
+            let tz = crate::datetime::SessionTimeZone::parse_setting("Asia/Tokyo").expect("tz");
+            let _scope = crate::datetime::SessionTimeZoneScope::enter(tz);
+            bind_sql(sql).expect("tokyo").sql
+        };
+        // 09:00 JST は 00:00 UTC。保存形は明示 offset の UTC 定数。
+        assert_ne!(utc, tokyo);
+        assert!(tokyo.contains("2024-01-01 00:00:00+00"), "{tokyo}");
+        assert!(utc.contains("2024-01-01 09:00:00+00"), "{utc}");
+        // 畳んだ後の保存形は、どの TZ で再束縛しても変わらない。
+        let tz = crate::datetime::SessionTimeZone::parse_setting("America/New_York").expect("tz");
+        let _scope = crate::datetime::SessionTimeZoneScope::enter(tz);
+        assert_eq!(bind_sql(&tokyo).expect("rebind").sql, tokyo);
+    }
+
+    /// DST の欠落時刻は変換器が決定的に解決した UTC 値で保存される（元の micros を UTC として
+    /// 流用しない）。
+    #[test]
+    fn session_local_timestamptz_literal_in_dst_gap_is_resolved_not_passed_through() {
+        let tz = crate::datetime::SessionTimeZone::parse_setting("America/New_York").expect("tz");
+        let _scope = crate::datetime::SessionTimeZoneScope::enter(tz);
+        let sql = bind_sql("COALESCE(at_tz, TIMESTAMPTZ '2024-03-10 02:30:00')")
+            .expect("bind")
+            .sql;
+        assert!(sql.contains("2024-03-10 07:30:00+00"), "{sql}");
+    }
+
+    /// 変換結果が範囲外になる `TIMESTAMPTZ` リテラルも拒否する。
+    #[test]
+    fn session_local_timestamptz_literal_out_of_range_fold_is_rejected() {
+        let expr = Expr::TimestampTzLiteral {
+            micros: i64::MAX,
+            session_local: true,
+        };
+        assert!(fold_session_local_literals(&expr).is_err());
+    }
+
+    /// 式の最上位の `COLLATE` は束縛段でも `0A000`（構文段の最終ゲートの多層防御）。
+    #[test]
+    fn top_level_collate_is_rejected_at_binding() {
+        let expr = crate::sql::allowlist::parse_index_expression_text("lang COLLATE \"C\"")
+            .expect("parse");
+        assert!(matches!(
+            bind_index_expression(&expr, &bind_schema()),
+            Err(SqlSurfaceError::FeatureNotSupported { .. })
+        ));
     }
 }

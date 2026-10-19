@@ -211,7 +211,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+101 行。旧: 11169）。（main 取り込み後の再追随）
     // Issue #1664（MATERIALIZED VIEW の列 DDL ガード・TableLookup 追加）で catalog.rs の 5 エントリを +28 行追随（旧: 12373／12454／12563／12635／13017）。
     // Issue #1661（OR REPLACE の依存ビュー再検証）＋ main 取り込みで catalog.rs の全エントリを再計算（drop_tables 10204／create_enum_type 12585／drop_enum_type 12666／create_view 12775／drop_view 12847／create_or_replace 13243）。
-    ("catalog.rs", 12578),
+    // Issue #1648（式索引の永続形 v4・`create_index_bound`・列依存ヘルパー。`catalog.rs` に行が追加）で一括追随（旧: 10204／12585／12666／12775／12847／13243）。
+    ("catalog.rs", 12922),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -278,7 +279,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+101 行。旧: 11250）。
-    ("catalog.rs", 12659),
+    ("catalog.rs", 13003),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -338,7 +339,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+131 行。旧: 11389）。
-    ("catalog.rs", 12768),
+    ("catalog.rs", 13112),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -406,16 +407,15 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+131 行。旧: 11422）。
     // Issue #1644（TRUNCATE CASCADE／RESTRICT）で catalog.rs 全エントリ +1・tenant.rs 506→516 に追随。
     // Issue #1663（MATERIALIZED VIEW のカタログ追加）の base 取り込みで追随（旧: 13013）。
-    ("catalog.rs", 12841),
+    ("catalog.rs", 13185),
     // `Storage::create_or_replace_view_checked`（TABLE-41 (2)、Issue #1660。`create_or_replace_view` の本体）: `create_view` と同じく
     // `[VIEWS_TABLE]` のみを書く（上書き）。ビューは行ストア・世代を持たないためバンプ対象がない。
-    ("catalog.rs", 13243),
+    ("catalog.rs", 13672),
     // `Storage::drop_tables`（Issue #1684 で本体を `drop_tables_in_txn` へ切り出した）: 世代 bump は
     // 同一 write txn で先に呼ばれる `drop_tables_in_txn` 内（削除する各表と FK を外した参照元表）で
     // 行われ、本呼び出しはその結果（`dropped > 0`）を単一 commit で確定させるだけ。`bump` が
     // 直前 60 行の外（別関数）へ移ったための許可。
-    // Issue #1667（matview の暫定ガード撤去による行移動）で追随（旧: 10204）。同 Issue で 12585/12666/12775/12847 も追随済み。
-    ("catalog.rs", 10196),
+    ("catalog.rs", 10525),
     // 上記 `drop_tables_in_txn` 切り出し（+18 行）に伴い、以降の catalog.rs エントリ（12419／12500／12609／12681／13063）を追随（旧: 12401／12482／12591／12663／13045）。
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`

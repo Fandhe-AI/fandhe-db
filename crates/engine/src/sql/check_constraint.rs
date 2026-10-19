@@ -141,7 +141,7 @@ fn render_expression_predicate(expr: &Expr) -> String {
 /// 元の木構造に依存しない一意な往復（`parse(render(x)) == x`）を保証する
 /// （括弧を省略すると演算子優先順位により異なる木が同一テキストへレンダリング
 /// され得るため）。
-fn render_expr(expr: &Expr) -> String {
+pub(crate) fn render_expr(expr: &Expr) -> String {
     match expr {
         Expr::Number(s) => s.clone(),
         // Issue #919・SQL-26: 文字列リテラルは SQL の標準的な引用符エスケープ
@@ -492,7 +492,7 @@ fn render_sql_json_query(q: &udf_call::SqlJsonQueryExpr) -> String {
     out
 }
 
-fn escape_literal(s: &str) -> String {
+pub(crate) fn escape_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 

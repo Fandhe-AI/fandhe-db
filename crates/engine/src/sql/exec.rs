@@ -1881,16 +1881,19 @@ pub(crate) fn execute_statement_with_cache(
                 // 断念する（`resolve_scalar_index_target_in_txn` ドキュメント
                 // 参照。構築断念はこの派生キャッシュの fail-soft 契約の範囲内で、
                 // クエリ自体は plain scan へ縮退するだけで失敗しない）。
-                match crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
-                    crate::storage::read_source::require_snapshot(read_txn)?,
-                    &bound.table,
-                    scalar_access.declarations_enabled,
-                ) {
+                let (resolved_target, expression_keys) =
+                    crate::sql::scalar_index::resolve_scalar_index_target_and_expression_keys_in_txn(
+                        crate::storage::read_source::require_snapshot(read_txn)?,
+                        &bound.table,
+                        scalar_access.declarations_enabled,
+                    );
+                match resolved_target {
                     Ok(target) => {
-                        match crate::sql::scalar_index::ScalarIndex::build_targeted(
+                        match crate::sql::scalar_index::ScalarIndex::build_targeted_with_expressions(
                             schema,
                             snapshot_for_scalar,
                             target.as_target(),
+                            &expression_keys,
                         ) {
                             Ok(index) => {
                                 let _ = scalar_access.cache.insert(
