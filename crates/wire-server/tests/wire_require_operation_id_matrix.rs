@@ -9,11 +9,12 @@
 //! - M4: wire 越しの `SET`／`RESET` ではモードが変わらない（両方向）
 //! - M5: StartupMessage の追加パラメータ（`options`・素のキー）ではモードが変わらない
 //! - M6: HTTP のクエリ文字列ではモードが変わらない
+//! - M7: HTTP（NoSQL）書き込み op の省略・指定・分割実行・show／cancel（Issue #2203）
 //!
 //! モードは CLI の解決関数（`require_operation_id_opt::resolve`）から決め、「フラグ → モード →
 //! 挙動」を 1 本でつなぐ。バイナリ起動の代表経路は `wire_require_operation_id_cli.rs`（R4/R5）、
 //! engine 層の行列は engine の `tests/recovery_ledger_mode_matrix.rs`。HTTP の書き込み op
-//! 省略時の挙動は #2203 で変わるため、ここでは固定しない。
+//! 省略時の挙動は M7 で固定する（#2203）。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -439,6 +440,265 @@ fn m6_http_query_string_does_not_switch_mode() {
             q_err(&mut s, sql, "23502");
         } else {
             q_ok(&mut s, sql);
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// M7: HTTP（NoSQL）書き込み op（Issue #2203）
+// ---------------------------------------------------------------------------
+
+use engine::recovery::ledger::LastOperationLookup;
+use engine::recovery::required_op_id::OperationId;
+use http_common::{AfterWrite, HttpResponse};
+
+/// operation_id の「省略」表現 3 種（欠落・`null`・空文字）。
+const HTTP_OMITTED: [&str; 3] = ["", r#","operation_id":null"#, r#","operation_id":"""#];
+
+struct HttpClient {
+    addr: SocketAddr,
+    token: String,
+}
+
+fn http_client(f: &Fixture) -> HttpClient {
+    let addr = http_common::spawn_router_listener_with_engine(
+        &f._users,
+        wire_server::http::session::store::SessionStore::new(),
+        Arc::clone(&f.core),
+    );
+    let body = br#"{"user":"alice","password":"pw-alice"}"#;
+    let request = http_common::build_request(
+        "/v1/session",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", &body.len().to_string()),
+        ],
+        body,
+    );
+    let resp = http_common::parse_single_response(&http_common::send_raw(
+        addr,
+        &request,
+        AfterWrite::HalfClose,
+    ));
+    assert_eq!(resp.status, 200, "login must succeed: {resp:?}");
+    let text = String::from_utf8_lossy(&resp.body).into_owned();
+    let marker = "\"token\":\"";
+    let start = text.find(marker).expect("token field") + marker.len();
+    let end = start + text[start..].find('"').expect("token end");
+    HttpClient {
+        addr,
+        token: text[start..end].to_string(),
+    }
+}
+
+fn post(c: &HttpClient, body: &str) -> HttpResponse {
+    let request = http_common::build_request(
+        "/v1/query",
+        &[
+            ("Authorization", &format!("Bearer {}", c.token)),
+            ("Content-Type", "application/json"),
+            ("Content-Length", &body.len().to_string()),
+        ],
+        body.as_bytes(),
+    );
+    http_common::parse_single_response(&http_common::send_raw(
+        c.addr,
+        &request,
+        AfterWrite::HalfClose,
+    ))
+}
+
+fn body_text(resp: &HttpResponse) -> String {
+    String::from_utf8_lossy(&resp.body).into_owned()
+}
+
+fn row(id: u32, lang: &str) -> String {
+    format!(r#"{{"id":{id},"embedding":[1,0],"lang":"{lang}"}}"#)
+}
+
+/// 指定付き operation_id（`seed-<先頭 id>`）で行を投入する（両モードで成功する）。
+fn seed_rows(c: &HttpClient, ids: &[u32]) {
+    let rows: Vec<String> = ids.iter().map(|i| row(*i, "ja")).collect();
+    let resp = post(
+        c,
+        &format!(
+            r#"{{"op":"insert","table":"docs","rows":[{}],"operation_id":"seed-{}"}}"#,
+            rows.join(","),
+            ids[0]
+        ),
+    );
+    assert_eq!(resp.status, 200, "seed must succeed: {resp:?}");
+}
+
+/// 省略した書き込み 1 件を送り、モード別の期待（既定＝成功・応答に `operation_id` キー無し／
+/// 必須＝`23502` で副作用なし）を検証する。副作用の有無は行数で判定する。
+fn assert_omitted_write(
+    f: &Fixture,
+    c: &HttpClient,
+    require: bool,
+    body: &str,
+    expected_ok_body: &str,
+    rows_after_ok: usize,
+) {
+    let before = count_rows(f);
+    let resp = post(c, body);
+    if require {
+        assert_eq!(resp.status, 400, "{body}: {resp:?}");
+        assert_eq!(http_common::wire_code_of(&resp), "23502", "{body}");
+        assert_eq!(count_rows(f), before, "{body}: must not change rows");
+    } else {
+        assert_eq!(resp.status, 200, "{body}: {resp:?}");
+        assert_eq!(body_text(&resp), expected_ok_body, "{body}");
+        assert!(!body_text(&resp).contains("operation_id"), "{body}");
+        assert_eq!(count_rows(f), rows_after_ok, "{body}");
+    }
+}
+
+const FILTER_JA: &str = r#""filter":[{"column":"lang","op":"eq","value":"ja"}]"#;
+
+#[test]
+fn m7a_http_write_ops_omitted_operation_id_follows_flag() {
+    for require in FLAGS {
+        let f = fixture("wire-mx-m7a", require);
+        let c = http_client(&f);
+        seed_rows(&c, &[1, 2, 3]);
+        for (n, tail) in HTTP_OMITTED.into_iter().enumerate() {
+            // insert: 既定では行が 1 件増える（後始末は指定付き delete）。
+            let body = format!(
+                r#"{{"op":"insert","table":"docs","rows":[{}]{tail}}}"#,
+                row(100, "en")
+            );
+            assert_omitted_write(&f, &c, require, &body, r#"{"inserted":1}"#, 4);
+            if !require {
+                // 後始末は指定付き delete（operation_id は反復ごとに別値にする）。
+                let del = format!(
+                    r#"{{"op":"delete","table":"docs","where":{{"id":100}},"operation_id":"cleanup-{n}"}}"#
+                );
+                assert_eq!(post(&c, &del).status, 200);
+            }
+        }
+        // update（where 形・filter 形）: 行数は不変。
+        for tail in HTTP_OMITTED {
+            let body = format!(
+                r#"{{"op":"update","table":"docs","set":{{"lang":"ja"}},"where":{{"id":1}}{tail}}}"#
+            );
+            assert_omitted_write(&f, &c, require, &body, r#"{"updated":1}"#, 3);
+            let body = format!(
+                r#"{{"op":"update","table":"docs","set":{{"lang":"ja"}},{FILTER_JA}{tail}}}"#
+            );
+            assert_omitted_write(&f, &c, require, &body, r#"{"updated":3}"#, 3);
+        }
+        // delete（where 形）。
+        for tail in HTTP_OMITTED {
+            let body = format!(r#"{{"op":"delete","table":"docs","where":{{"id":1}}{tail}}}"#);
+            assert_omitted_write(&f, &c, require, &body, r#"{"deleted":1}"#, 2);
+            if !require {
+                let ins = format!(
+                    r#"{{"op":"insert","table":"docs","rows":[{}]{tail}}}"#,
+                    row(1, "ja")
+                );
+                assert_eq!(post(&c, &ins).status, 200);
+            }
+        }
+        // delete（filter 形）。
+        for tail in HTTP_OMITTED {
+            let body = format!(r#"{{"op":"delete","table":"docs",{FILTER_JA}{tail}}}"#);
+            assert_omitted_write(&f, &c, require, &body, r#"{"deleted":3}"#, 0);
+            if !require {
+                let rows: Vec<String> = [1, 2, 3].iter().map(|i| row(*i, "ja")).collect();
+                let ins = format!(
+                    r#"{{"op":"insert","table":"docs","rows":[{}]{tail}}}"#,
+                    rows.join(",")
+                );
+                assert_eq!(post(&c, &ins).status, 200);
+            }
+        }
+    }
+}
+
+#[test]
+fn m7b_http_omitted_write_does_not_touch_ledger_by_default() {
+    let f = fixture("wire-mx-m7b", false);
+    let c = http_client(&f);
+    seed_rows(&c, &[1]);
+    let ctx = engine::policy::PolicyContext::new("tenant-a").expect("tenant");
+    let expect_last = |label: &str| {
+        assert_eq!(
+            f.core.last_operation_id(&ctx, "docs").expect("last"),
+            LastOperationLookup::Committed(OperationId::parse("seed-1").expect("op")),
+            "{label}"
+        );
+    };
+    expect_last("after seed");
+    // 同一内容の省略書き込みは何度でも成功する（台帳照合が働かず 23505 にならない）。
+    let upd = r#"{"op":"update","table":"docs","set":{"lang":"fr"},"where":{"id":1}}"#;
+    for _ in 0..2 {
+        assert_eq!(post(&c, upd).status, 200);
+        expect_last("after omitted update");
+    }
+}
+
+#[test]
+fn m7c_http_specified_operation_id_resend_contract_is_identical_in_both_modes() {
+    for require in FLAGS {
+        let f = fixture("wire-mx-m7c", require);
+        let c = http_client(&f);
+        let ins = format!(
+            r#"{{"op":"insert","table":"docs","rows":[{}],"operation_id":"op-1"}}"#,
+            row(1, "ja")
+        );
+        let first = post(&c, &ins);
+        assert_eq!(first.status, 200, "{first:?}");
+        assert_eq!(body_text(&first), r#"{"inserted":1,"operation_id":"op-1"}"#);
+        // 同一内容の再送 -> 23505、内容不一致 -> 22023。
+        let same = post(&c, &ins);
+        assert_eq!(http_common::wire_code_of(&same), "23505", "{same:?}");
+        let diff = post(
+            &c,
+            &format!(
+                r#"{{"op":"insert","table":"docs","rows":[{}],"operation_id":"op-1"}}"#,
+                row(2, "en")
+            ),
+        );
+        assert_eq!(http_common::wire_code_of(&diff), "22023", "{diff:?}");
+    }
+}
+
+#[test]
+fn m7d_http_partitioned_ops_require_operation_id_in_both_modes() {
+    for require in FLAGS {
+        let f = fixture("wire-mx-m7d", require);
+        let c = http_client(&f);
+        seed_rows(&c, &[1, 2]);
+        for tail in HTTP_OMITTED {
+            for body in [
+                format!(
+                    r#"{{"op":"update","table":"docs","set":{{"lang":"x"}},{FILTER_JA},"mode":"partitioned"{tail}}}"#
+                ),
+                format!(
+                    r#"{{"op":"delete","table":"docs",{FILTER_JA},"mode":"partitioned"{tail}}}"#
+                ),
+            ] {
+                let resp = post(&c, &body);
+                assert_eq!(resp.status, 400, "{body}: {resp:?}");
+                assert_eq!(http_common::wire_code_of(&resp), "23502", "{body}");
+                assert_eq!(count_rows(&f), 2, "{body}: must not change rows");
+            }
+        }
+    }
+}
+
+#[test]
+fn m7e_http_show_and_cancel_partitioned_dml_require_operation_id_in_both_modes() {
+    for require in FLAGS {
+        let f = fixture("wire-mx-m7e", require);
+        let c = http_client(&f);
+        for op in ["show_partitioned_dml", "cancel_partitioned_dml"] {
+            for tail in HTTP_OMITTED {
+                let body = format!(r#"{{"op":"{op}","table":"docs"{tail}}}"#);
+                let resp = post(&c, &body);
+                assert_eq!(resp.status, 400, "{body}: {resp:?}");
+                assert_eq!(http_common::wire_code_of(&resp), "23502", "{body}");
+            }
         }
     }
 }

@@ -48,9 +48,11 @@
 //! 経路を塞ぐ）。`set` が空オブジェクトの場合も `42601`（SQL 文法は SET 項目
 //! ≥ 1 を要求する）。
 //!
-//! `operation_id` の欠落・`null`・空文字はいずれも `23502`
-//! （`engine::sql::using_operation_id::OperationId::parse` の契約をそのまま
-//! 透過する）。同一 `operation_id` への再送は台帳照合（TASK-101・
+//! `operation_id` の欠落・`null`・空文字はいずれも「省略」として扱い、wire 層では拒否しない。
+//! 省略の可否は engine の `LedgerMode`（単一の真実源）が判定し、既定（任意）では台帳に
+//! 記録しない通常の書き込みとして成功し（応答本文に `operation_id` キーを含めない）、
+//! `--require-operation-id`（必須）では `23502` になる（Issue #2203・RECOVER-1・NOSQL-6
+//! ポインタ）。 同一 `operation_id` への再送は台帳照合（TASK-101・
 //! RECOVER-10）により内容一致なら `23505`・不一致なら `22023` へ収束する
 //! （SQL 表層と同じ台帳キー空間 `(tenant, table, operation_id)` を共有する。
 //! `crates/engine/tests/sql_update_delete_session_public_api.rs` で固定）。
@@ -66,7 +68,7 @@
 //! で固定）。
 //!
 //! [`execute`] は成功時 [`UpdateSuccess`] を返し、[`handle`] が
-//! [`encode_success_body`]（`{"updated":<n>,"operation_id":"<escaped>"}`。
+//! [`encode_success_body`]（`{"updated":<n>[,"operation_id":"<escaped>"]}`（`operation_id` は指定時のみ）。
 //! キー順固定・空白なし）を経由して `gate.rs` の `Op::Update` アームへ
 //! ディスパッチ可能な応答バイト列へ写像する（`insert::encode_success_body`
 //! と同型）。他テナント所有 id・未存在 id はいずれも `updated:0`・`200`
@@ -223,19 +225,29 @@ fn map_set_assignments(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateSuccess {
     pub updated: u64,
-    pub operation_id: OperationId,
+    /// 省略時は `None`（応答本文に `operation_id` キーを含めない。Issue #2203）。
+    pub operation_id: Option<OperationId>,
 }
 
 /// [`UpdateSuccess`] を成功応答本文（JSON）へ写像する（infallible）。
-/// 出力形 `{"updated":<n>,"operation_id":"<escaped>"}`（`insert::
+/// 出力形 `{"updated":<n>[,"operation_id":"<escaped>"]}`（`operation_id` は指定時のみ。`insert::
 /// encode_success_body` と同型のキー順固定・空白なし規約）。
 pub fn encode_success_body(success: &UpdateSuccess) -> String {
-    let mut out = String::with_capacity(success.operation_id.as_str().len() + 64);
+    let mut out = String::with_capacity(
+        success
+            .operation_id
+            .as_ref()
+            .map_or(0, |id| id.as_str().len())
+            + 64,
+    );
     out.push_str("{\"updated\":");
     let _ = write!(out, "{}", success.updated);
-    out.push_str(",\"operation_id\":\"");
-    escape_json_string_into(&mut out, success.operation_id.as_str());
-    out.push_str("\"}");
+    if let Some(id) = &success.operation_id {
+        out.push_str(",\"operation_id\":\"");
+        escape_json_string_into(&mut out, id.as_str());
+        out.push('"');
+    }
+    out.push('}');
     out
 }
 
@@ -292,17 +304,23 @@ pub fn execute(
         ident::check_identifier(key)?;
     }
 
-    let operation_id_raw = validated
+    // 欠落・`null`・空文字は「省略」として `None` に統一する（完全一致のみ。trim 等の
+    // 正規化はしない）。必須か任意かの判定は engine の `LedgerMode`（単一の真実源）が
+    // 担うため、wire 層では拒否しない（Issue #2203）。
+    let operation_id = match validated
         .optional_str("operation_id")
         .map_err(UpdateError::Shape)?
-        .unwrap_or("");
-    let operation_id = OperationId::parse(operation_id_raw)?;
+        .filter(|raw| !raw.is_empty())
+    {
+        None => None,
+        Some(raw) => Some(OperationId::parse(raw)?),
+    };
 
     let outcome: UpdateOutcome = match target {
         TargetForm::RowId(id) => core.execute_bound_update_in_session(
             principal.policy_context(),
             table,
-            Some(&operation_id),
+            operation_id.as_ref(),
             |schema| {
                 // NoSQL 表層の SET 値は常に平易なリテラル（式は SQL 表層のみ。
                 // Issue #1544 で `ValidatedUpdate::assignments` が `SetValue` になったため包む）。
@@ -314,7 +332,7 @@ pub fn execute(
                     table_name: table.to_string(),
                     assignments,
                     id_literal: id.to_string(),
-                    operation_id: Some(operation_id.clone()),
+                    operation_id: operation_id.clone(),
                     // NoSQL 表層 `op: update` は `RETURNING` を公開しない
                     // （Issue #876 のスコープ外。SQL 表層の `RETURNING`
                     // 実行結線は Issue #873・SQL-21 が別途担当し、
@@ -346,14 +364,14 @@ pub fn execute(
                 Some(m) => core.execute_bound_partitioned_update_in_session(
                     principal.policy_context(),
                     table,
-                    Some(&operation_id),
+                    operation_id.as_ref(),
                     m.chunk_rows,
                     bind,
                 )?,
                 None => core.execute_bound_predicate_update_in_session(
                     principal.policy_context(),
                     table,
-                    Some(&operation_id),
+                    operation_id.as_ref(),
                     bind,
                 )?,
             }
@@ -796,5 +814,26 @@ mod tests {
         let success = execute(&core, &principal, &validated).expect("update ok");
         assert_eq!(success.updated, 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_success_body_omits_operation_id_key_when_absent() {
+        let success = UpdateSuccess {
+            updated: 3,
+            operation_id: None,
+        };
+        assert_eq!(encode_success_body(&success), r#"{"updated":3}"#);
+    }
+
+    #[test]
+    fn encode_success_body_keeps_operation_id_key_when_present() {
+        let success = UpdateSuccess {
+            updated: 3,
+            operation_id: Some(OperationId::parse("op-1").expect("valid operation_id")),
+        };
+        assert_eq!(
+            encode_success_body(&success),
+            r#"{"updated":3,"operation_id":"op-1"}"#
+        );
     }
 }

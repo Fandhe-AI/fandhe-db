@@ -37,7 +37,7 @@
   `execute_bound_aggregate_in_session`（Issue #728）と同型の binder closure
   方式のセッション対応エントリ。判定順序は以下のとおり（fail-closed。順序が
   契約）:
-  1. `operation_id` 必須化ガード（`23502`。スキーマ取得より前）
+  1. `operation_id` 判定（`LedgerMode` 依存。必須構成の欠落は `23502`。スキーマ取得より前）
   2. 空バッチ拒否（`22000`）
   3. INDEX-4 ①（件数上限。「バッチあたり最大ファイル数」を「1 要求あたり
      最大行数」に読み替え。カタログ参照・束縛より前・`54000`）
@@ -62,9 +62,10 @@
   `fract() == 0.0` 等で事後判定すると `2^53` 境界直上の整数が丸めで
   別の `id` へ書き込まれ得た）。
 - `execute`: `table`／`rows`／`operation_id` を取り出し、`operation_id` は
-  欠落・`null`・空文字のいずれも `OperationId::parse("")` に正規化して
-  `23502` へ収束させたうえで `EngineCore::execute_bound_insert_in_session`
-  へ委譲する。第 2 の実行器は作らない。
+  欠落・`null`・空文字のいずれも `None`（省略）に正規化し（Issue #2203。
+  従来は `parse("")` で `23502` へ前段拒否していた）、可否の判定は engine の
+  `LedgerMode` に一任して `EngineCore::execute_bound_insert_in_session`
+  へ委譲する（既定は受理、`--require-operation-id` では `23502`）。第 2 の実行器は作らない。
 - テナントは `SessionPrincipal::policy_context()` のみから導出し、JSON・
   ヘッダからテナント相当の値を読む経路をシグネチャ上持たない。可視性は
   engine 側が常に `Private` 固定で書き込む（`execute_insert` と同じ判断）。

@@ -165,7 +165,10 @@ fn new_core_two_tenant_docs() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     )
     .expect("insert tenant-a private trap row");
 
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    // 欠落 operation_id の `23502` を検証するため台帳必須モードを明示する
+    // （既定は省略を受理する。Issue #2203・既定側は wire_require_operation_id_matrix が担う）。
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
     (Arc::new(core), guard)
 }
 

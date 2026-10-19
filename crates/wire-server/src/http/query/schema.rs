@@ -24,12 +24,12 @@
 //!   語彙〔`"asc"`／`"desc"` 以外の拒否〕は [`super::scan`]（Issue #946・
 //!   NOSQL-15）が担う）
 //!
-//! `insert` op の `operation_id` 欠落／`null`／空文字 → `23502`・`rows[*]` の
+//! `insert` op の `operation_id` 欠落／`null`／空文字の可否は構成依存（既定は省略として受理・`--require-operation-id` と分割実行は `23502`。Issue #2203）・`rows[*]` の
 //! 列検証・engine への束縛・実行は [`super::insert`]（Issue #771・NOSQL-6）が担う。
 //!
 //! `update`／`delete` op（Issue #875・NOSQL-12）の `set` 禁止列（`id`／
 //! `tenant_id`／`visibility`）検査・`where`／`filter` の排他判定・列名解決・
-//! `operation_id` 欠落／`null`／空文字 → `23502`・engine への束縛・実行は
+//! `operation_id` 欠落／`null`／空文字の可否は構成依存（既定は省略として受理・`--require-operation-id` と分割実行は `23502`。Issue #2203）・engine への束縛・実行は
 //! [`super::update`]・[`super::delete`]・[`super::dml_target`]（Issue
 //! #876・TASK-186・NOSQL-6・NOSQL-12）が担う。本モジュールでは
 //! `UPDATE_SCHEMA`（`set` を任意キーのオブジェクトとして型のみ検査する
@@ -810,7 +810,7 @@ pub static AGGREGATE_SCHEMA: ObjectSchema = ObjectSchema {
 };
 
 /// `insert` op のトップレベルスキーマ（NOSQL-6 ポインタ）。`operation_id` の
-/// 欠落／`null`／空文字 → `23502`、`rows[*]` の列検証は [`super::insert`]
+/// 欠落／`null`／空文字の可否は構成依存（既定は省略として受理・`--require-operation-id` と分割実行は `23502`。Issue #2203）、`rows[*]` の列検証は [`super::insert`]
 /// （Issue #771）が担う（本ヘルパーでは `operation_id` を Required にせず、`rows`
 /// は任意列名を持つため `Array(Any)` として型のみ検査する）。
 pub static INSERT_SCHEMA: ObjectSchema = ObjectSchema {
