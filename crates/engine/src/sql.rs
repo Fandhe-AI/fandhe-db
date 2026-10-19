@@ -191,6 +191,7 @@ pub(crate) mod distinct;
 pub mod exec;
 pub mod explain;
 pub(crate) mod expr_program;
+pub(crate) mod expression_key_index;
 pub mod generation_key;
 pub mod group_by;
 pub(crate) mod hnsw_cache;

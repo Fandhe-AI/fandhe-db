@@ -12054,11 +12054,12 @@ pub struct ValidatedCreateIndex {
     /// `USING hnsw` 指定の有無（`btree` は省略時と同じ `false`。`hnsw`・`btree` 以外の
     /// `USING` 値は構造検証段で `0A000` 拒否済み。Issue #1617）。
     pub(crate) hnsw: bool,
-    /// 列名。式要素の位置は空文字列（`expressions` が `Some` の位置。式要素は構文段の最終ゲートが
-    /// 拒否するため、現状は実行段に到達しない。Issue #1647）。
+    /// 列名。式要素の位置は空文字列（`expressions` が `Some` の位置。Issue #1647・#1648）。
     pub(crate) columns: Vec<String>,
-    /// `columns` と同じ長さの式要素（`None` は列。INDEX-10、Issue #1647）。後続 Issue #1648 が
-    /// 束縛・永続化する入口で、それまでは常に全要素 `None` の状態でしか構築されない。
+    /// `columns` と同じ長さの式要素（`None` は列。INDEX-10、Issue #1647）。実行段
+    /// （`sql::ddl::execute_create_index`）が `IndexDef` へ渡し、`Storage::create_index` が
+    /// 書き込みトランザクション内で束縛・永続化する（Issue #1648）。UNIQUE／hnsw／COLLATE と
+    /// 組み合わさった宣言は構文段の最終ゲートが拒否済み。
     pub(crate) expressions: Vec<Option<Expr>>,
     /// `columns` と同じ長さの列ごとの `COLLATE`（`None` は照合指定なし。Issue #2191・
     /// TABLE-28）。名前の解決は固定の許可リストとの完全一致だけで、カタログを参照しない。
@@ -12095,9 +12096,7 @@ impl ValidatedCreateIndex {
         &self.columns
     }
 
-    /// `columns` と同じ長さの式要素（`None` は列。INDEX-10、Issue #1647）。式要素を含む宣言は
-    /// 構文段の最終ゲート（`reject_unimplemented_expression_keys`）が拒否するため、現状の
-    /// 実行段が受け取る値は全要素 `None`。
+    /// `columns` と同じ長さの式要素（`None` は列。INDEX-10、Issue #1647・#1648）。
     pub fn expression_keys(&self) -> &[Option<Expr>] {
         &self.expressions
     }
@@ -12152,8 +12151,8 @@ pub(crate) fn is_drop_index_statement(tokens: &[Token]) -> bool {
 /// - `USING hnsw` なのに列が複数 → `0A000`。
 /// - 列リストの要素: 式（`((<式>))`・関数呼び出し形 `(f(col))`）は先読み検査で集計 `42803`・
 ///   ウィンドウ `42P20`・部分クエリ／SRF `0A000`、決定性検査で非決定式 `42P17`・組み込み以外の
-///   関数 `0A000`、通過した式も後続 Issue（#1648〜）までは最終ゲートで `0A000`
-///   （INDEX-10、Issue #1647）。リテラルは `0A000`。
+///   関数 `0A000`。通過した式は最終ゲートで `UNIQUE`／hnsw／`COLLATE` との組み合わせだけ
+///   `0A000`、それ以外は実行段の束縛へ渡す（INDEX-10、Issue #1647・#1648）。リテラルは `0A000`。
 /// - 部分索引の `WHERE` 句 → `0A000`。
 /// - 列リストに重複する列名 → `42601`。列数上限超過 → `54000`。
 ///
@@ -12263,7 +12262,7 @@ pub(crate) fn validate_create_index_tokens(
     }
     p.expect_end_of_statement()?;
     // 最終ゲート（INDEX-10、Issue #1647）。決定性検査は部分索引の `WHERE` 判定より前に済ませてある。
-    reject_unimplemented_expression_keys(&expressions, hnsw)?;
+    reject_unimplemented_expression_keys(&expressions, &collations, hnsw, unique)?;
     Ok(ValidatedCreateIndex {
         name,
         if_not_exists,
@@ -12276,13 +12275,19 @@ pub(crate) fn validate_create_index_tokens(
     })
 }
 
-/// 式索引の最終ゲート（INDEX-10、Issue #1647）。決定性検査を通った式も、キー計算・DML 維持・
-/// プランナ選択（後続 Issue #1648〜#1651）が無い間は宣言だけ残すと効かない索引（`UNIQUE` なら
-/// 一意性の強制漏れ）になるため、カタログ非参照の構文段で `0A000` に倒す。Issue #1648 は
-/// この呼び出しを外し、`Storage::create_index` の書き込みトランザクション内で束縛と永続化を行う。
+/// 式索引の最終ゲート（INDEX-10、Issue #1647・#1648）。束縛・永続化・キー計算は
+/// `Storage::create_index` の書き込みトランザクション内（`sql::index_expr::bind_index_expression`）が
+/// 担うため、ここには「強制や追随が未実装の組み合わせ」だけを残し、カタログ非参照の構文段で
+/// `0A000` に倒す（宣言だけ残って効かない索引を作らない。fail-closed）:
+/// - `USING hnsw` かつ式要素
+/// - `UNIQUE` かつ式要素（一意性の強制は後続 Issue #1651）
+/// - 式要素を含む索引の `COLLATE`（式への指定は要素末尾・式の最上位とも、素の列への指定も。
+///   式キーの辞書はバイト列順のみで、v4 の永続形は照合を持たない）
 fn reject_unimplemented_expression_keys(
     expressions: &[Option<Expr>],
+    collations: &[Option<crate::collation::Collation>],
     hnsw: bool,
+    unique: bool,
 ) -> Result<(), SqlSurfaceError> {
     if !expressions.iter().any(Option::is_some) {
         return Ok(());
@@ -12292,9 +12297,37 @@ fn reject_unimplemented_expression_keys(
             detail: "USING hnsw does not support expression indexes".to_string(),
         });
     }
-    Err(SqlSurfaceError::FeatureNotSupported {
-        detail: "expression indexes are not supported yet".to_string(),
-    })
+    if unique {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "CREATE UNIQUE INDEX does not support expression indexes yet".to_string(),
+        });
+    }
+    // 式要素を含む索引では、素の列要素の `COLLATE` も受理しない（v4 の永続形は照合を持たず、
+    // 宣言と永続形が食い違う fail-open になるため。式への照合と合わせて後続対応）。
+    let collated = collations.iter().any(Option::is_some)
+        || expressions
+            .iter()
+            .flatten()
+            .any(|e| matches!(e, Expr::Collate { .. }));
+    if collated {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: crate::sql::index_expr::MSG_COLLATE.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// 保存済みの式索引の要素テキスト（`sql::index_expr::bind_index_expression` が描画した正規化 SQL）を
+/// 再解析する唯一の経路（作成時の往復一致検証と、構築時の再束縛が共有する。第 2 のパーサーを
+/// 作らない）。構文段と同じ文法（`parse_bounded_value_expr`）・同じノード予算で解析し、末尾に
+/// 余剰トークンがあれば `42601`。永続データは untrusted として扱う（手書きの破損データも
+/// ここで拒否される）。
+pub(crate) fn parse_index_expression_text(sql: &str) -> Result<Expr, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    let mut p = Parser::new(&tokens);
+    let expr = p.parse_bounded_value_expr()?;
+    p.expect_end_of_statement()?;
+    Ok(expr)
 }
 
 /// [`parse_index_column`] の戻り値（列名・式要素・照合）。式要素の位置の列名は空文字列。
@@ -17128,16 +17161,24 @@ mod tests {
             ok.column_collations(),
             [Some(crate::collation::Collation::C)]
         );
+        // 決定的な式・型依存の式は構文段を通り、実行段（`Storage::create_index` の書き込み
+        // トランザクション）が束縛する（Issue #1648）。
+        for sql in [
+            "CREATE INDEX i ON t (lower(a))",
+            "CREATE INDEX i ON t ((a + 1))",
+            "CREATE INDEX i ON t ((lower(a)), b)",
+            "CREATE INDEX i ON t ((a::text))",
+            "CREATE INDEX i ON t ((date_part('year', ts)))",
+        ] {
+            let ok = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert!(ok.expression_keys().iter().any(Option::is_some), "{sql}");
+        }
         for (sql, code) in [
             // 重複列（正規化後）。
             ("CREATE INDEX i ON t ((a), a)", "42601"),
-            // 決定的な式・型依存の式は構文段の最終ゲートで 0A000。
-            ("CREATE INDEX i ON t (lower(a))", "0A000"),
-            ("CREATE INDEX i ON t ((a + 1))", "0A000"),
-            ("CREATE INDEX i ON t ((lower(a)), b)", "0A000"),
-            ("CREATE INDEX i ON t ((a::text))", "0A000"),
-            ("CREATE INDEX i ON t ((date_part('year', ts)))", "0A000"),
+            // UNIQUE・hnsw・式への COLLATE と式の組み合わせは構文段の最終ゲートで 0A000。
             ("CREATE INDEX i ON t (lower(a) COLLATE \"C\")", "0A000"),
+            ("CREATE INDEX i ON t ((lower(a) COLLATE \"C\"))", "0A000"),
             ("CREATE UNIQUE INDEX i ON t ((a + 1))", "0A000"),
             ("CREATE INDEX i ON t USING hnsw ((a + 1))", "0A000"),
             // 非決定的な式は 42P17（UNIQUE・入れ子・複数要素でも検出）。

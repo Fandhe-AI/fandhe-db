@@ -135,6 +135,10 @@ pub(crate) enum ScalarIndexBuildError {
     AllocationFailed,
     /// 構築結果の概算バイト量が [`MAX_SCALAR_INDEX_BYTES`] を超えた。
     TooLarge,
+    /// 式索引の式キー（Issue #1648）を作れない（保存済みの式の再解析・再束縛の失敗、1 行でも
+    /// 式の評価エラー、非有限の `f64`、結果型の不一致）。その式キーだけを作らず、他の索引や
+    /// クエリの成否には影響させない。
+    Unbuildable,
 }
 
 impl std::fmt::Display for ScalarIndexBuildError {
@@ -147,6 +151,7 @@ impl std::fmt::Display for ScalarIndexBuildError {
                 f,
                 "scalar index approx size exceeds limit {MAX_SCALAR_INDEX_BYTES}"
             ),
+            Self::Unbuildable => write!(f, "expression key index cannot be built"),
         }
     }
 }
@@ -189,7 +194,7 @@ fn approx_string_entry_bytes(s: &str) -> usize {
 /// 含むスナップショットに対して判定前に上限超過分のメモリを確保してしまう）。
 /// `running` は呼び出し元が管理する累計カウンタで、本関数が返す `Ok` を受けて
 /// 呼び出し元が `additional` 分だけ加算する契約とする。
-fn check_scalar_index_budget(
+pub(super) fn check_scalar_index_budget(
     running: usize,
     additional: usize,
 ) -> Result<(), ScalarIndexBuildError> {
@@ -397,7 +402,7 @@ enum OrderedColumnIndex {
 /// 符号ビットだけを立てる（標準的な「浮動小数点を符号なし整数の全順序へ写像
 /// する」変換）。`NaN`・無限大は呼び出し元が事前に拒否する契約（`is_finite`
 /// を満たさない値を渡すと結果は未定義の順序になり得るが panic はしない）。
-fn f64_to_sortable_bits(v: f64) -> u64 {
+pub(super) fn f64_to_sortable_bits(v: f64) -> u64 {
     let bits = v.to_bits();
     if bits & (1u64 << 63) != 0 {
         !bits
@@ -410,7 +415,7 @@ fn f64_to_sortable_bits(v: f64) -> u64 {
 /// [`f64_to_sortable_bits`] は両者を別キーにするため、索引キーとリテラル
 /// 境界の双方でこれを通して評価と一致させる（保存時の不変条件にも依存しない
 /// 防御。Issue #1359）。
-fn normalize_zero(v: f64) -> f64 {
+pub(super) fn normalize_zero(v: f64) -> f64 {
     if v == 0.0 {
         0.0
     } else {
@@ -446,7 +451,7 @@ pub(crate) enum TypedKey {
 /// 範囲に一致する候補スロットを求める（[`ScalarIndex::candidates_id_range`]
 /// と同じ二分探索による区間複製。区間内はキー昇順だがスロット昇順とは限らない
 /// ため、返す前に `sort_unstable` でスロット昇順へ揃える）。
-fn range_slots<K: Ord + Copy>(
+pub(super) fn range_slots<K: Ord + Copy>(
     pairs: &[(K, u32)],
     lower: std::ops::Bound<K>,
     upper: std::ops::Bound<K>,
@@ -475,7 +480,7 @@ fn range_slots<K: Ord + Copy>(
 /// [`range_slots`] の `BYTEA`（可変長バイト列キー）版（Issue #1257）。キーが
 /// `Copy` でないため境界を参照で受ける。後続値の導出は行わず、`Excluded`
 /// で `FilterOp::eval` の `cmp` と厳密に同値な区間を得る。
-fn range_slots_bytes(
+pub(super) fn range_slots_bytes(
     pairs: &[(Vec<u8>, u32)],
     lower: std::ops::Bound<&[u8]>,
     upper: std::ops::Bound<&[u8]>,
@@ -750,6 +755,10 @@ pub(crate) struct ScalarIndex {
     /// [`Self::approx_heap_bytes`] はこのフィールドを返すだけの O(1) アクセサ
     /// にする。
     approx_bytes: usize,
+    /// 式索引の式キー（INDEX-10、Issue #1648。`schema.columns` とは独立した並び）。作れなかった
+    /// 式キーは含まれない（fail-soft。[`Self::attach_expression_keys`]）。現時点の消費者は
+    /// 順序付き走査 API（テスト）だけで、プランナ選択は後続 Issue #1650 の責務。
+    expression_keys: Vec<crate::sql::expression_key_index::ExpressionKeyIndex>,
 }
 
 /// バイト列順で組み上げた辞書（`values`・CSR の `offsets`/`slots`・`equality`）を、辞書の
@@ -1088,6 +1097,34 @@ pub(crate) fn resolve_scalar_index_target_in_txn(
             None => ScalarIndexTargetOwned::Auto,
         }),
         Err(_) => Err(()),
+    }
+}
+
+/// [`resolve_scalar_index_target_in_txn`] と同じ解決に加えて、対象テーブルの式索引の式要素
+/// （INDEX-10、Issue #1648）を返す。起動時 opt-in なし（`declarations_enabled == false`）は常に
+/// 空、カタログ読み取り失敗も空（式キーは候補を狭めるだけの派生物で、作れなくてもクエリの
+/// 成否と結果は変わらない。列ターゲット側の `Err(())` が構築断念の合図を別に担う）。
+/// 呼び出し元は `sql::exec`／`sql::aggregate` の索引構築直前。
+pub(crate) fn resolve_scalar_index_target_and_expression_keys_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    declarations_enabled: bool,
+) -> (
+    Result<ScalarIndexTargetOwned, ()>,
+    Vec<crate::catalog::DeclaredExpressionKey>,
+) {
+    if !declarations_enabled {
+        return (Ok(ScalarIndexTargetOwned::Auto), Vec::new());
+    }
+    match crate::catalog::declared_index_targets_in_txn(read_txn, table) {
+        Ok(targets) => (
+            Ok(match targets.scalar_columns {
+                Some(cols) => ScalarIndexTargetOwned::Declared(cols),
+                None => ScalarIndexTargetOwned::Auto,
+            }),
+            targets.expression_keys,
+        ),
+        Err(_) => (Err(()), Vec::new()),
     }
 }
 
@@ -1932,6 +1969,7 @@ impl ScalarIndex {
             // 直後に `compute_approx_heap_bytes` の結果で確定させるまでの
             // 仮値。この構造体は `build` の外へ `0` のまま漏れ出さない。
             approx_bytes: 0,
+            expression_keys: Vec::new(),
         };
         let mut computed_bytes = built.compute_approx_heap_bytes();
         if computed_bytes > MAX_SCALAR_INDEX_BYTES && !lane_a_columns.is_empty() {
@@ -1949,6 +1987,69 @@ impl ScalarIndex {
         }
         built.approx_bytes = computed_bytes;
         Ok(built)
+    }
+
+    /// [`Self::build_targeted`] に加えて、式索引の式キー（INDEX-10、Issue #1648）を構築する。
+    /// 式キーの失敗（再束縛・評価エラー・予算超過等）は列索引の構築結果に影響しない。
+    pub(crate) fn build_targeted_with_expressions(
+        schema: &TableSchema,
+        snapshot: &SqlArenaSnapshot,
+        target: ScalarIndexTarget<'_>,
+        expression_keys: &[crate::catalog::DeclaredExpressionKey],
+    ) -> Result<Self, ScalarIndexBuildError> {
+        let mut index = Self::build_targeted(schema, snapshot, target)?;
+        index.attach_expression_keys(schema, snapshot, expression_keys);
+        Ok(index)
+    }
+
+    /// 式キーを 1 個ずつ構築して保持する。作れなかった式キーは黙って捨てる（fail-soft。
+    /// 部分的な索引は作らない）。構築分の概算バイト量を `approx_bytes` へ加算する
+    /// （各式キーは確保前に残り予算を検査済みのため、合計が上限を超えない）。
+    fn attach_expression_keys(
+        &mut self,
+        schema: &TableSchema,
+        snapshot: &SqlArenaSnapshot,
+        decls: &[crate::catalog::DeclaredExpressionKey],
+    ) {
+        for decl in decls {
+            if let Ok(key) = crate::sql::expression_key_index::ExpressionKeyIndex::build(
+                schema,
+                snapshot,
+                decl,
+                self.approx_bytes,
+            ) {
+                self.approx_bytes = self.approx_bytes.saturating_add(key.approx_heap_bytes());
+                self.expression_keys.push(key);
+            }
+        }
+    }
+
+    /// `index_name` の `element` 番目の式キー（作れていなければ `None`）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn expression_key(
+        &self,
+        index_name: &str,
+        element: usize,
+    ) -> Option<&crate::sql::expression_key_index::ExpressionKeyIndex> {
+        self.expression_keys
+            .iter()
+            .find(|k| k.index_name() == index_name && k.element() == element)
+    }
+
+    /// 式の結果順（キー昇順・同値はスロット昇順・NULL は末尾）のスロット列。式キーが無ければ `None`。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn expression_ordered_slots(
+        &self,
+        index_name: &str,
+        element: usize,
+    ) -> Option<Vec<u32>> {
+        self.expression_key(index_name, element)?.ordered_slots()
+    }
+
+    /// 式が NULL を返したスロット（昇順）。式キーが無ければ `None`。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn expression_null_slots(&self, index_name: &str, element: usize) -> Option<&[u32]> {
+        Some(self.expression_key(index_name, element)?.null_slots())
     }
 
     /// 等価述語向け直引き（列が `TEXT` でない・未知の列は `None`。値が辞書に
@@ -6144,5 +6245,340 @@ mod tests {
         assert!(lt_empty.is_empty());
         let gt_7 = range_slots_bytes(&pairs, Bound::Excluded(&[7]), Bound::Unbounded).unwrap();
         assert_eq!(gt_7, vec![1, 2]);
+    }
+    // --- 式索引の式キー（INDEX-10、Issue #1648） ---------------------------------------
+
+    /// 式キーの宣言（保存形の正規化テキストは束縛が描画したものを使う）。
+    fn expr_decl(
+        schema: &TableSchema,
+        index_name: &str,
+        element: usize,
+        expr_sql: &str,
+    ) -> crate::catalog::DeclaredExpressionKey {
+        let expr =
+            crate::sql::allowlist::parse_index_expression_text(expr_sql).expect("parse expression");
+        let bound =
+            crate::sql::index_expr::bind_index_expression(&expr, schema).expect("bind expression");
+        crate::catalog::DeclaredExpressionKey {
+            index_name: index_name.to_string(),
+            element,
+            sql: bound.sql,
+        }
+    }
+
+    /// オラクルのキー（式を行ごとに評価した結果）。
+    #[derive(Debug, Clone, PartialEq)]
+    enum OracleKey {
+        Bytes(Vec<u8>),
+        Float(f64),
+        Int(i64),
+    }
+
+    /// 全スロットで式を直接評価し、`(キー昇順・同値はスロット昇順・NULL 末尾)` に整列したスロット列を返す。
+    fn oracle_ordered_slots(
+        schema: &TableSchema,
+        snapshot: &crate::sql::arena_cache::SqlArenaSnapshot,
+        expr_sql: &str,
+    ) -> Vec<u32> {
+        let expr =
+            crate::sql::allowlist::parse_index_expression_text(expr_sql).expect("parse expression");
+        let bound =
+            crate::sql::index_expr::bind_index_expression(&expr, schema).expect("bind expression");
+        let mut rows: Vec<(Option<OracleKey>, u32)> = Vec::new();
+        let mut scratch = Vec::new();
+        for slot in 0..snapshot.arena().len() {
+            let meta = snapshot
+                .metadata()
+                .get(slot)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let scanned = scan_scalar_columns(schema, meta).expect("decode");
+            let id = snapshot.arena().ids()[slot];
+            let v = bound
+                .program
+                .eval(id, &[], &scanned, &mut scratch)
+                .expect("eval");
+            let key = match v {
+                crate::sql::udf_call::ExprValue::Null => None,
+                crate::sql::udf_call::ExprValue::Text(s) => {
+                    Some(OracleKey::Bytes(s.as_bytes().to_vec()))
+                }
+                crate::sql::udf_call::ExprValue::Scalar(x) => Some(OracleKey::Float(x)),
+                crate::sql::udf_call::ExprValue::Date(d) => Some(OracleKey::Int(i64::from(d))),
+                crate::sql::udf_call::ExprValue::Timestamp(t)
+                | crate::sql::udf_call::ExprValue::Time(t)
+                | crate::sql::udf_call::ExprValue::TimestampTz(t) => Some(OracleKey::Int(t)),
+                other => panic!("unexpected value {other:?}"),
+            };
+            rows.push((key, slot as u32));
+        }
+        rows.sort_by(|(ka, sa), (kb, sb)| {
+            use std::cmp::Ordering;
+            let ord = match (ka, kb) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(OracleKey::Bytes(a)), Some(OracleKey::Bytes(b))) => a.cmp(b),
+                (Some(OracleKey::Float(a)), Some(OracleKey::Float(b))) => {
+                    a.partial_cmp(b).expect("finite")
+                }
+                (Some(OracleKey::Int(a)), Some(OracleKey::Int(b))) => a.cmp(b),
+                _ => panic!("mixed key types"),
+            };
+            ord.then(sa.cmp(sb))
+        });
+        rows.into_iter().map(|(_, s)| s).collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_typed_basic(
+        storage: &Storage,
+        c: &PolicyContext,
+        id: u64,
+        n: Option<i32>,
+        d: Option<f64>,
+        dt: Option<i32>,
+        ts: Option<i64>,
+        visibility: Visibility,
+    ) {
+        insert_typed(
+            storage, c, id, n, None, None, d, dt, ts, None, None, None, visibility,
+        );
+    }
+
+    /// TEXT 結果の式キーは、行ごとの評価結果をバイト列順に整列したオラクルと一致し、NULL は末尾に回る。
+    #[test]
+    fn expression_key_text_matches_row_evaluation_oracle() {
+        let db_path = unique_db_path("expr-key-text");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        let kinds = [
+            Some("Beta"),
+            Some("alpha"),
+            None,
+            Some("ALPHA"),
+            Some(""),
+            Some("beta"),
+            Some("ÄPFEL"),
+        ];
+        for (i, k) in kinds.iter().enumerate() {
+            insert(&storage, &c, i as u64 + 1, *k, None, Visibility::Public);
+        }
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let decl = expr_decl(&schema, "i_lower", 0, "lower(kind)");
+        let index = ScalarIndex::build_targeted_with_expressions(
+            &schema,
+            &snapshot,
+            ScalarIndexTarget::Auto,
+            std::slice::from_ref(&decl),
+        )
+        .expect("build");
+        let got = index
+            .expression_ordered_slots("i_lower", 0)
+            .expect("expression key");
+        assert_eq!(got, oracle_ordered_slots(&schema, &snapshot, &decl.sql));
+        // NULL（kind が NULL の行）は末尾。
+        assert_eq!(index.expression_null_slots("i_lower", 0), Some(&[2u32][..]));
+        assert_eq!(got.last().copied(), Some(2));
+        // 他の索引名・要素位置は存在しない。
+        assert!(index.expression_ordered_slots("i_lower", 1).is_none());
+        assert!(index.expression_ordered_slots("nope", 0).is_none());
+    }
+
+    /// 数値（f64）結果: 負・小数・ゼロ（`-0.0` を含む）・重複と NULL を含めてオラクルと一致する。
+    /// date／timestamp 結果も同様。
+    #[test]
+    fn expression_key_numeric_and_datetime_match_row_evaluation_oracle() {
+        let db_path = unique_db_path("expr-key-typed");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(Option<f64>, Option<i32>, Option<i32>, Option<i64>)> = vec![
+            (Some(1.5), Some(10), Some(100), Some(1_000_000)),
+            (Some(-2.25), Some(-5), Some(-3), Some(-86_400_000_000)),
+            (Some(0.0), Some(0), Some(0), Some(0)),
+            (Some(-0.0), Some(7), None, None),
+            (None, None, Some(100), Some(1_000_000)),
+            (Some(1.5), Some(10), Some(-3), Some(5)),
+            (Some(1e10), Some(-1), Some(40_000), Some(3_000_000_000)),
+        ];
+        for (i, (d, n, dt, ts)) in rows.iter().enumerate() {
+            insert_typed_basic(
+                &storage,
+                &c,
+                i as u64 + 1,
+                *n,
+                *d,
+                *dt,
+                *ts,
+                Visibility::Public,
+            );
+        }
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let decls = [
+            expr_decl(&schema, "i_num", 0, "d * 2"),
+            expr_decl(&schema, "i_date", 0, "dt + 1"),
+            expr_decl(&schema, "i_ts", 0, "ts + INTERVAL '1 day'"),
+        ];
+        let index = ScalarIndex::build_targeted_with_expressions(
+            &schema,
+            &snapshot,
+            ScalarIndexTarget::Auto,
+            &decls,
+        )
+        .expect("build");
+        for decl in &decls {
+            let got = index
+                .expression_ordered_slots(&decl.index_name, 0)
+                .unwrap_or_else(|| panic!("expression key {}", decl.index_name));
+            assert_eq!(
+                got,
+                oracle_ordered_slots(&schema, &snapshot, &decl.sql),
+                "{}",
+                decl.index_name
+            );
+        }
+        // 範囲照会: 数値 `d * 2` が [0, 3] に入るスロット（-0.0 は 0.0 と同値）。
+        let key = index.expression_key("i_num", 0).expect("key");
+        let got = key
+            .range_slots_f64(Bound::Included(0.0), Bound::Included(3.0))
+            .expect("range");
+        assert_eq!(got, vec![0, 2, 3, 5]);
+        // 型の違う範囲照会は None。
+        assert!(key
+            .range_slots_i64(Bound::Unbounded, Bound::Unbounded)
+            .is_none());
+        assert!(key
+            .range_slots_bytes(Bound::Unbounded, Bound::Unbounded)
+            .is_none());
+    }
+
+    /// 1 行でも式の評価に失敗（または非有限）なら、その式キーだけを作らない。同じ構築で
+    /// 列索引は残り、他の式キーも作られる。
+    #[test]
+    fn expression_key_is_skipped_when_any_row_fails_but_column_index_survives() {
+        let db_path = unique_db_path("expr-key-fail-soft");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        for (id, n) in [(1u64, 2), (2, 0), (3, 4)] {
+            insert_typed_basic(
+                &storage,
+                &c,
+                id,
+                Some(n),
+                None,
+                Some(1),
+                None,
+                Visibility::Public,
+            );
+        }
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        // `10 / n` は n = 0 の行で 0 除算になる。`dt + 1` は全行で成功する。
+        let decls = [
+            expr_decl(&schema, "i_div", 0, "10 / n"),
+            expr_decl(&schema, "i_ok", 0, "dt + 1"),
+        ];
+        let index = ScalarIndex::build_targeted_with_expressions(
+            &schema,
+            &snapshot,
+            ScalarIndexTarget::Auto,
+            &decls,
+        )
+        .expect("column index build must not fail");
+        assert!(index.expression_ordered_slots("i_div", 0).is_none());
+        assert!(index.expression_ordered_slots("i_ok", 0).is_some());
+        assert!(index.typed_column_is_indexed(typed_col(&schema, "dt")));
+    }
+
+    /// 保存済みの式が現在のスキーマで束縛できない（列が消えた等）場合も、その式キーだけを作らない。
+    /// 往復で同じテキストに戻らない改ざんテキストも使わない。
+    #[test]
+    fn expression_key_rejects_stale_or_tampered_declarations() {
+        let db_path = unique_db_path("expr-key-stale");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        insert(&storage, &c, 1, Some("a"), None, Visibility::Public);
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let stale = crate::catalog::DeclaredExpressionKey {
+            index_name: "i".to_string(),
+            element: 0,
+            sql: "lower(no_such_col)".to_string(),
+        };
+        let tampered_syntax = crate::catalog::DeclaredExpressionKey {
+            index_name: "j".to_string(),
+            element: 0,
+            sql: "lower(kind) )".to_string(),
+        };
+        // 解析できて束縛もできるが、正規化形ではないテキスト（余分な括弧）。
+        let non_canonical = crate::catalog::DeclaredExpressionKey {
+            index_name: "k".to_string(),
+            element: 0,
+            sql: "((lower(kind)))".to_string(),
+        };
+        let index = ScalarIndex::build_targeted_with_expressions(
+            &schema,
+            &snapshot,
+            ScalarIndexTarget::Auto,
+            &[stale, tampered_syntax, non_canonical],
+        )
+        .expect("build");
+        for name in ["i", "j", "k"] {
+            assert!(index.expression_ordered_slots(name, 0).is_none(), "{name}");
+        }
+    }
+
+    /// 予算を使い切った状態では式キーを作らず（`TooLarge`）、確保前に検査される。
+    #[test]
+    fn expression_key_respects_the_byte_budget() {
+        let db_path = unique_db_path("expr-key-budget");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        insert(&storage, &c, 1, Some("a"), None, Visibility::Public);
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let decl = expr_decl(&schema, "i", 0, "lower(kind)");
+        let err = crate::sql::expression_key_index::ExpressionKeyIndex::build(
+            &schema,
+            &snapshot,
+            &decl,
+            MAX_SCALAR_INDEX_BYTES,
+        )
+        .expect_err("budget exhausted");
+        assert!(matches!(err, ScalarIndexBuildError::TooLarge));
+    }
+
+    /// 式キーは RLS 適用済みスナップショットからだけ構築される（他テナントの行を含まない）。
+    #[test]
+    fn expression_key_is_built_from_visible_rows_only() {
+        let db_path = unique_db_path("expr-key-rls");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_table(&storage);
+        let a = ctx("tenant-a");
+        let b = ctx("tenant-b");
+        insert(&storage, &a, 1, Some("x"), None, Visibility::Public);
+        insert(&storage, &a, 2, Some("y"), None, Visibility::Public);
+        insert(&storage, &b, 3, Some("z"), None, Visibility::Private);
+        let (snapshot, schema) = snapshot_from(&storage, &a);
+        let decl = expr_decl(&schema, "i", 0, "upper(kind)");
+        let index = ScalarIndex::build_targeted_with_expressions(
+            &schema,
+            &snapshot,
+            ScalarIndexTarget::Auto,
+            std::slice::from_ref(&decl),
+        )
+        .expect("build");
+        let got = index.expression_ordered_slots("i", 0).expect("key");
+        assert_eq!(got.len(), snapshot.arena().len());
+        assert_eq!(got.len(), 2);
     }
 }

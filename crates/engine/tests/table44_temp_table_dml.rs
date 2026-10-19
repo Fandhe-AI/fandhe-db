@@ -708,6 +708,47 @@ fn temp_indexes_and_unique_indexes_work() {
         "42501"
     );
 }
+/// 一時表への式索引（INDEX-10、Issue #1648）は永続表と同じ経路（束縛・永続化）で作成でき、
+/// 同じ分類で拒否される。DML は式索引に影響されず成功する（一時表への `ALTER` は未対応）。
+#[test]
+fn temp_expression_indexes_share_the_persistent_path() {
+    let (core, _g) = new_core("t44-dml-expr-index", LedgerMode::CompareOnlyWithoutLedger);
+    let mut s = SessionState::default();
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE t (name TEXT, qty INTEGER)",
+    );
+    run_ok(
+        &core,
+        &mut s,
+        "INSERT INTO t (id, name, qty) VALUES (1, 'A', 5), (2, 'b', 5)",
+    );
+    run_ok(&core, &mut s, "CREATE INDEX by_lower ON t ((lower(name)))");
+    assert_eq!(
+        code(&core, &mut s, "CREATE INDEX by_lower ON t ((lower(name)))"),
+        "42P07"
+    );
+    assert_eq!(
+        code(&core, &mut s, "CREATE INDEX bad ON t ((lower(nope)))"),
+        "42703"
+    );
+    assert_eq!(
+        code(&core, &mut s, "CREATE INDEX bad ON t ((now()))"),
+        "42P17"
+    );
+    // DML は式索引の有無に影響されない。
+    run_ok(
+        &core,
+        &mut s,
+        "INSERT INTO t (id, name, qty) VALUES (3, 'C', 7)",
+    );
+    assert_eq!(
+        rows(&core, &mut s, "SELECT id FROM t WHERE qty = 5 LIMIT 10").len(),
+        2
+    );
+    run_ok(&core, &mut s, "DROP INDEX by_lower");
+}
 
 // ---- COPY ---------------------------------------------------------------------------------------
 

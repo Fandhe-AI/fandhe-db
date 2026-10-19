@@ -40,7 +40,7 @@
 
 use crate::catalog::{
     AlterApply, AlterCheckError, CascadedObject, CatalogError, ColumnDef, ColumnDefault,
-    ColumnType, IndexDef, IndexKind, TableSchema, MAX_COLUMN_DEFAULT_LEN,
+    ColumnType, CreateIndexError, IndexDef, IndexKind, TableSchema, MAX_COLUMN_DEFAULT_LEN,
 };
 use crate::schema_limits::SchemaLimits;
 use crate::sql::allowlist::{
@@ -2552,11 +2552,13 @@ pub(crate) fn execute_create_index(
     storage: &Storage,
     validated: &ValidatedCreateIndex,
 ) -> Result<CreateIndexOutcome, SqlSurfaceError> {
-    // 防御ゲート（INDEX-10、Issue #1647）: 式要素は構文段の最終ゲートで拒否済みだが、将来の
-    // 経路変更で式を含む宣言が届いても、式を黙って落として列だけで保存しない（fail-closed）。
-    if validated.expression_keys().iter().any(Option::is_some) {
+    // 防御ゲート（INDEX-10、Issue #1648）: hnsw・一意索引と式要素の組み合わせは構文段の最終
+    // ゲートで拒否済みだが、将来の経路変更で届いても、式を黙って落として列だけで保存しない
+    // （fail-closed）。式要素そのものは `create_index_bound` が書き込み txn 内で束縛する。
+    let has_expressions = validated.expression_keys().iter().any(Option::is_some);
+    if has_expressions && (validated.is_hnsw() || validated.is_unique()) {
         return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "expression indexes are not supported yet".to_string(),
+            detail: "expression indexes are not supported for this index kind yet".to_string(),
         });
     }
     let kind = if validated.is_hnsw() {
@@ -2576,9 +2578,14 @@ pub(crate) fn execute_create_index(
     .with_unique(validated.is_unique());
     // `IF NOT EXISTS`（TABLE-36、Issue #1613）。`create_index` の write txn は名前衝突を最初に
     // 判定し commit・世代 bump の前に返るため、同名があれば定義を比較せず副作用なしで成功にする。
-    match storage.create_index(&def) {
-        Err(CatalogError::IndexAlreadyExists(_)) if validated.if_not_exists() => {}
-        result => result.map_err(map_create_index_error)?,
+    // 式要素（INDEX-10、Issue #1648）の束縛エラーは `Sql` としてそのまま透過し、カタログ側の
+    // 失敗だけを `map_create_index_error` で写像する。
+    match storage.create_index_bound(&def, validated.expression_keys()) {
+        Ok(()) => {}
+        Err(CreateIndexError::Catalog(CatalogError::IndexAlreadyExists(_)))
+            if validated.if_not_exists() => {}
+        Err(CreateIndexError::Catalog(e)) => return Err(map_create_index_error(e)),
+        Err(CreateIndexError::Sql(e)) => return Err(e),
     }
     Ok(CreateIndexOutcome {})
 }

@@ -215,12 +215,35 @@ pub struct IndexDef {
     /// 登録し、[`Storage::drop_index`] が同一 txn で取り除く。強制は制約側が担い、本フラグは
     /// 「この UNIQUE 制約は索引由来で `DROP CONSTRAINT` の対象外」の判定にだけ使う。
     pub unique: bool,
+    /// `columns` と同じ長さの式要素（`CREATE INDEX ... ((<式>))`。INDEX-10、Issue #1648）。
+    /// `None` は通常の列要素、`Some` は式要素で、その位置の `columns` は空文字列。スカラー宣言
+    /// のみが持つ。[`Storage::create_index`] は式付きの宣言を拒否し、SQL 表層
+    /// （`sql::ddl::execute_create_index`）だけが書き込みトランザクション内の束縛を通して
+    /// 正規化テキストと参照列を確定する（呼び出し元の生テキストを保存しない）。
+    pub expressions: Vec<Option<IndexExpressionDef>>,
 }
 
+/// 式索引の式要素 1 個の永続形（INDEX-10、Issue #1648）。`sql` は
+/// `sql::index_expr::bind_index_expression` が描画し、再解析で元の式に戻ることを確認した
+/// 正規化 SQL テキスト、`referenced_columns` は束縛時に抽出した参照列（重複なし・スキーマ宣言順）。
+/// 列の改名・削除・型変更が式索引に及ぶ範囲の判定（`DROP COLUMN` の連鎖削除、`RENAME COLUMN`／
+/// `ALTER COLUMN TYPE` の拒否）に使う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexExpressionDef {
+    pub sql: String,
+    pub referenced_columns: Vec<String>,
+}
+
+/// 式要素 1 個の正規化 SQL テキストの長さ上限（バイト。`MAX_CHECK_PREDICATE_SQL_LEN` と同値）。
+const MAX_INDEX_EXPRESSION_SQL_LEN: usize = 4096;
+/// 式索引の永続形の版（式要素を 1 つでも含む宣言だけがこの版で保存される）。
+const INDEX_DEF_EXPRESSION_VERSION: &str = "v4";
+
 impl IndexDef {
-    /// 照合指定なしの索引宣言を作る（`collations` はすべて `None`）。
+    /// 照合指定なしの索引宣言を作る（`collations` はすべて `None`・式要素なし）。
     pub fn new(name: String, table: String, kind: IndexKind, columns: Vec<String>) -> Self {
         let collations = vec![None; columns.len()];
+        let expressions = vec![None; columns.len()];
         Self {
             name,
             table,
@@ -228,7 +251,39 @@ impl IndexDef {
             columns,
             collations,
             unique: false,
+            expressions,
         }
+    }
+
+    /// 式要素を与える（`expressions` は `columns` と同じ長さ。式の位置の `columns` は空文字列）。
+    /// 長さの不一致は [`Storage::create_index`] が `Invalid` で拒否する。
+    pub fn with_expressions(mut self, expressions: Vec<Option<IndexExpressionDef>>) -> Self {
+        self.expressions = expressions;
+        self
+    }
+
+    /// 式要素を含むか。
+    pub fn has_expressions(&self) -> bool {
+        self.expressions.iter().any(Option::is_some)
+    }
+
+    /// 式でない位置の列名（宣言順）。
+    pub fn plain_columns(&self) -> impl Iterator<Item = &str> {
+        self.columns
+            .iter()
+            .zip(&self.expressions)
+            .filter(|(_, e)| e.is_none())
+            .map(|(c, _)| c.as_str())
+    }
+
+    /// この索引が依存する列名（素の列と、式が参照する列の和。重複を含み得る）。
+    pub fn referenced_columns(&self) -> impl Iterator<Item = &str> {
+        self.plain_columns().chain(
+            self.expressions
+                .iter()
+                .flatten()
+                .flat_map(|e| e.referenced_columns.iter().map(String::as_str)),
+        )
     }
 
     /// 一意索引（`CREATE UNIQUE INDEX`。Issue #1616・INDEX-9）として宣言する。
@@ -256,11 +311,16 @@ impl IndexDef {
 /// （Issue #2191。旧バイナリは `v2` を未知の版として拒否する。前方互換はない）。
 /// 一意索引（Issue #1616・INDEX-9）は 5 行目に固定フラグ `unique` を持つ `v3`
 /// （スカラー・照合なしのみ。`v1`／`v2` のバイト列は不変）。
+/// 式要素を 1 つでも含む宣言（INDEX-10、Issue #1648）は `v4`（[`encode_expression_index_def`]）。
+/// 式を含まない宣言の `v1`／`v2`／`v3` のバイト列は一切変えない（旧バイナリは `v4` を未知の版
+/// として拒否する。前方互換はない）。
 /// 列名・テーブル名は [`validate_identifier`] を通過済みの前提（`,`・改行のいずれも
 /// 含み得ない）のため、区切り文字として安全に使える。
 fn encode_index_def(def: &IndexDef) -> Result<Vec<u8>> {
     let columns_csv = def.columns.join(",");
-    let text = if def.unique {
+    let text = if def.has_expressions() {
+        encode_expression_index_def(def, &columns_csv)?
+    } else if def.unique {
         // 一意索引（Issue #1616・INDEX-9）は `v3`。スカラー宣言かつ照合なしに限る
         // （`create_index` が事前に保証する。破れていれば保存せず拒否する）。
         if !matches!(def.kind, IndexKind::Scalar) || def.collations.iter().any(Option::is_some) {
@@ -293,6 +353,144 @@ fn encode_index_def(def: &IndexDef) -> Result<Vec<u8>> {
     Ok(text.into_bytes())
 }
 
+/// 式索引（`v4`）のエンコード（INDEX-10、Issue #1648）。行構成:
+/// `v4`／テーブル／`scalar`／列 CSV（式の位置は空トークン）／照合行（全要素 `-`）／式行
+/// （列の位置は `-`、式の位置は正規化 SQL の UTF-8 を小文字 16 進にしたもの）／参照列行
+/// （式ごとに `;` 区切り、各式の中は `,` 区切り）。式テキストは `,`・改行・`'` を含み得るため、
+/// 区切り文字と衝突しない 16 進で格納する。`unique`・`hnsw`・照合付きの式要素は保存しない
+/// （後続 Issue #1651 で拡張。構文段が拒否済みの組み合わせの多層防御）。
+fn encode_expression_index_def(def: &IndexDef, columns_csv: &str) -> Result<String> {
+    let invalid = |msg: &str| CatalogError::Invalid(msg.to_string());
+    if def.unique || !matches!(def.kind, IndexKind::Scalar) {
+        return Err(invalid(
+            "expression index must be a non-unique scalar index",
+        ));
+    }
+    if def.expressions.len() != def.columns.len() || def.collations.len() != def.columns.len() {
+        return Err(invalid("index expressions must match the column list"));
+    }
+    let mut expr_tokens: Vec<String> = Vec::with_capacity(def.columns.len());
+    let mut ref_segments: Vec<String> = Vec::with_capacity(def.columns.len());
+    for ((col, expr), collation) in def
+        .columns
+        .iter()
+        .zip(&def.expressions)
+        .zip(&def.collations)
+    {
+        match expr {
+            None => {
+                if col.is_empty() {
+                    return Err(invalid(
+                        "index element is neither a column nor an expression",
+                    ));
+                }
+                // v4 は照合を持たない。素の列の照合を黙って落として保存しない（fail-closed）。
+                if collation.is_some() {
+                    return Err(invalid(
+                        "expression index does not support collations on column elements",
+                    ));
+                }
+                expr_tokens.push("-".to_string());
+                ref_segments.push(String::new());
+            }
+            Some(e) => {
+                if !col.is_empty() || collation.is_some() {
+                    return Err(invalid("index expression element must not name a column"));
+                }
+                if e.sql.is_empty() || e.sql.len() > MAX_INDEX_EXPRESSION_SQL_LEN {
+                    return Err(invalid("index expression text length is out of range"));
+                }
+                for r in &e.referenced_columns {
+                    validate_identifier(r)?;
+                }
+                expr_tokens.push(e.sql.bytes().map(hex_encode_byte).collect::<String>());
+                ref_segments.push(e.referenced_columns.join(","));
+            }
+        }
+    }
+    let collation_tokens = vec!["-"; def.columns.len()].join(",");
+    Ok(format!(
+        "{INDEX_DEF_EXPRESSION_VERSION}\n{}\nscalar\n{}\n{}\n{}\n{}",
+        def.table,
+        columns_csv,
+        collation_tokens,
+        expr_tokens.join(","),
+        ref_segments.join(";")
+    ))
+}
+
+/// 式索引（`v4`）の 5 行目以降を復元する（[`decode_index_def`] の分岐）。破損（列と式の排他関係の
+/// 破れ・照合の混入・hex／UTF-8 の不正・長さ超過・参照列の識別子不正・式要素ゼロの非正準形）は
+/// すべて [`CatalogError::CorruptSchema`] で fail-closed に拒否する。構文の再解析はここでは
+/// 行わない（ホットパスの負荷を避ける。再解析と束縛は作成時と式キー構築時に行う）。
+fn decode_expression_index_tail<'a>(
+    name: &str,
+    columns: &[String],
+    mut lines: impl Iterator<Item = &'a str>,
+) -> Result<Vec<Option<IndexExpressionDef>>> {
+    let corrupt =
+        || CatalogError::CorruptSchema(format!("invalid expression index record for index {name}"));
+    let collations_line = lines.next().ok_or_else(corrupt)?;
+    let exprs_line = lines.next().ok_or_else(corrupt)?;
+    let refs_line = lines.next().ok_or_else(corrupt)?;
+    if lines.next().is_some() {
+        return Err(CatalogError::CorruptSchema(format!(
+            "unexpected trailing data for index {name}"
+        )));
+    }
+    let n = columns.len();
+    if collations_line.split(',').count() != n
+        || collations_line.split(',').any(|t| t != "-")
+        || exprs_line.split(',').count() != n
+        || refs_line.split(';').count() != n
+    {
+        return Err(corrupt());
+    }
+    let mut out: Vec<Option<IndexExpressionDef>> = Vec::with_capacity(n);
+    for ((col, token), refs) in columns
+        .iter()
+        .zip(exprs_line.split(','))
+        .zip(refs_line.split(';'))
+    {
+        if token == "-" {
+            // 列要素: 列名があり、参照列は空。
+            if col.is_empty() || !refs.is_empty() {
+                return Err(corrupt());
+            }
+            out.push(None);
+            continue;
+        }
+        // 式要素: 列名は空、式テキストは上限内の妥当な UTF-8。
+        if !col.is_empty()
+            || token.is_empty()
+            || token.len() > MAX_INDEX_EXPRESSION_SQL_LEN.saturating_mul(2)
+        {
+            return Err(corrupt());
+        }
+        let bytes = hex_decode(token).map_err(|_| corrupt())?;
+        let sql = String::from_utf8(bytes).map_err(|_| corrupt())?;
+        let mut referenced_columns: Vec<String> = Vec::new();
+        if !refs.is_empty() {
+            for r in refs.split(',') {
+                if referenced_columns.len() >= MAX_COLUMN_COUNT {
+                    return Err(corrupt());
+                }
+                validate_identifier(r).map_err(|_| corrupt())?;
+                referenced_columns.push(r.to_string());
+            }
+        }
+        out.push(Some(IndexExpressionDef {
+            sql,
+            referenced_columns,
+        }));
+    }
+    if !out.iter().any(Option::is_some) {
+        // 式要素が 1 つも無い `v4` は非正準形（`v1` で書くべき）。
+        return Err(corrupt());
+    }
+    Ok(out)
+}
+
 /// [`encode_index_def`] の逆写像。永続化済みバイト列の破損は fail-closed に
 /// [`CatalogError::CorruptSchema`] として拒否する（`decode_schema` と同じ方針）。
 fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
@@ -308,13 +506,18 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     let version = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema(format!("missing format version for index {name}"))
     })?;
-    if version != "v1" && version != "v2" && version != "v3" {
+    if version != "v1"
+        && version != "v2"
+        && version != "v3"
+        && version != INDEX_DEF_EXPRESSION_VERSION
+    {
         return Err(CatalogError::CorruptSchema(format!(
             "unknown index catalog format version for index {name}"
         )));
     }
     let is_v2 = version == "v2";
     let is_v3 = version == "v3";
+    let is_v4 = version == INDEX_DEF_EXPRESSION_VERSION;
     let table = lines
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema(format!("missing table for index {name}")))?
@@ -352,9 +555,14 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
             )));
         }
     }
-    if lines.next().is_some() {
+    if !is_v4 && lines.next().is_some() {
         return Err(CatalogError::CorruptSchema(format!(
             "unexpected trailing data for index {name}"
+        )));
+    }
+    if is_v4 && !matches!(kind, IndexKind::Scalar) {
+        return Err(CatalogError::CorruptSchema(format!(
+            "invalid expression index record for index {name}"
         )));
     }
     let mut columns: Vec<String> = Vec::new();
@@ -364,9 +572,12 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
                 "index column count exceeds limit for index {name}"
             )));
         }
-        validate_identifier(c).map_err(|_| {
-            CatalogError::CorruptSchema(format!("invalid column identifier for index {name}"))
-        })?;
+        // 式索引（`v4`）の式の位置は空トークン（排他関係は `decode_expression_index_tail` が検査）。
+        if !(is_v4 && c.is_empty()) {
+            validate_identifier(c).map_err(|_| {
+                CatalogError::CorruptSchema(format!("invalid column identifier for index {name}"))
+            })?;
+        }
         columns.push(c.to_string());
     }
     // [`Storage::create_index`] は列の重複を永続化しないため、重複を含む値は
@@ -376,6 +587,11 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
             "duplicate column in index {name}"
         )));
     }
+    let expressions = if is_v4 {
+        decode_expression_index_tail(name, &columns, lines)?
+    } else {
+        vec![None; columns.len()]
+    };
     let collations = match collations_line {
         None => vec![None; columns.len()],
         Some(line) => decode_index_collations(name, line, columns.len(), &kind)?,
@@ -387,6 +603,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         columns,
         collations,
         unique: is_v3,
+        expressions,
     })
 }
 
@@ -428,9 +645,10 @@ fn decode_index_collations(
 /// [`MAX_COLUMN_COUNT`] 以下に制限済み）。
 fn first_duplicate_column(columns: &[String]) -> Option<&str> {
     let mut seen = std::collections::HashSet::new();
+    // 空文字列は式要素の位置（INDEX-10、Issue #1648）。重複判定の対象外。
     columns
         .iter()
-        .find(|c| !seen.insert(c.as_str()))
+        .find(|c| !c.is_empty() && !seen.insert(c.as_str()))
         .map(|c| c.as_str())
 }
 
@@ -446,7 +664,7 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
     // 宣言の列にだけ付けられる。`id`（暗黙の行キー）・数値・`VECTOR` 等の型・`USING hnsw` は
     // 種別・列型の検査より前に `IndexCollationNotSupported`（`42804`）で拒否する。
     for (col, collation) in def.columns.iter().zip(def.collations.iter()) {
-        if collation.is_none() {
+        if collation.is_none() || col.is_empty() {
             continue;
         }
         if matches!(def.kind, IndexKind::Hnsw) {
@@ -499,7 +717,8 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
             }
         }
         IndexKind::Scalar => {
-            for col in &def.columns {
+            // 式要素の位置（空文字列）は束縛段（`create_index_bound`）が検査する。
+            for col in def.columns.iter().filter(|c| !c.is_empty()) {
                 if col == "id" {
                     continue;
                 }
@@ -560,6 +779,20 @@ pub(crate) struct DeclaredIndexTargets {
     /// 対象テーブルのスカラー宣言列（複数宣言の和集合・重複排除）。宣言が
     /// 1 件も無ければ `None`（呼び出し元は `Auto` 〔現行の全列自動〕へ倒す）。
     pub(crate) scalar_columns: Option<Vec<DeclaredScalarColumn>>,
+    /// 対象テーブルの式索引の式要素（宣言順。INDEX-10、Issue #1648）。素の列宣言が無く式宣言
+    /// だけのテーブルでも `scalar_columns` は `None`（Auto）のままで、列索引の挙動を変えない。
+    pub(crate) expression_keys: Vec<DeclaredExpressionKey>,
+}
+
+/// 式索引の式要素 1 個の宣言（`sql::scalar_index` が式キーを構築する入力。INDEX-10、Issue #1648）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredExpressionKey {
+    /// 所属する索引名。
+    pub(crate) index_name: String,
+    /// 索引内の要素位置（0 始まり）。
+    pub(crate) element: usize,
+    /// 保存済みの正規化 SQL テキスト（untrusted として再解析・再束縛する）。
+    pub(crate) sql: String,
 }
 
 /// スカラー宣言された列 1 つ分の宣言一覧（Issue #2191）。同じ列を覆う宣言が複数ある場合、
@@ -599,11 +832,13 @@ pub(crate) fn declared_index_targets_in_txn(
         Err(redb::TableError::TableDoesNotExist(_)) => {
             return Ok(DeclaredIndexTargets {
                 scalar_columns: None,
+                expression_keys: Vec::new(),
             })
         }
         Err(e) => return Err(e.into()),
     };
     let mut scalar_columns: Vec<DeclaredScalarColumn> = Vec::new();
+    let mut expression_keys: Vec<DeclaredExpressionKey> = Vec::new();
     for (scanned, entry) in index_table.iter()?.enumerate() {
         if scanned >= MAX_INDEX_COUNT {
             return Err(CatalogError::CorruptSchema(format!(
@@ -613,7 +848,25 @@ pub(crate) fn declared_index_targets_in_txn(
         let (key, value) = entry?;
         let def = decode_index_def(key.value(), value.value())?;
         if matches!(def.kind, IndexKind::Scalar) && def.table == table {
-            for (col, collation) in def.columns.into_iter().zip(def.collations) {
+            for (element, expr) in def.expressions.iter().enumerate() {
+                if let Some(e) = expr {
+                    expression_keys.push(DeclaredExpressionKey {
+                        index_name: def.name.clone(),
+                        element,
+                        sql: e.sql.clone(),
+                    });
+                }
+            }
+            for ((col, collation), expr) in def
+                .columns
+                .into_iter()
+                .zip(def.collations)
+                .zip(&def.expressions)
+            {
+                // 式要素の位置（空文字列）は列宣言に含めない。
+                if expr.is_some() {
+                    continue;
+                }
                 let decl = (def.name.clone(), collation);
                 match scalar_columns.iter_mut().find(|c| c.name == col) {
                     Some(existing) => existing.decls.push(decl),
@@ -631,6 +884,7 @@ pub(crate) fn declared_index_targets_in_txn(
         } else {
             Some(scalar_columns)
         },
+        expression_keys,
     })
 }
 
@@ -684,7 +938,13 @@ pub(crate) fn explain_index_names_in_txn(
         }
         match def.kind {
             IndexKind::Hnsw => decls.hnsw.push(def.name),
-            IndexKind::Scalar => decls.scalar.push((def.name, def.columns)),
+            // 式要素は #1650（プランナ選択・EXPLAIN 表示）まで出さない。
+            IndexKind::Scalar => {
+                let plain: Vec<String> = def.plain_columns().map(str::to_string).collect();
+                if !plain.is_empty() {
+                    decls.scalar.push((def.name, plain));
+                }
+            }
         }
     }
     Ok(decls)
@@ -915,6 +1175,12 @@ fn build_unique_index_schema_in_txn(
     def: &IndexDef,
     schema: &TableSchema,
 ) -> Result<TableSchema> {
+    // 式要素付きの一意索引は未対応（後続 Issue #1651）。構文段が拒否済みの多層防御。
+    if def.has_expressions() {
+        return Err(CatalogError::IndexKindMismatch(
+            "CREATE UNIQUE INDEX does not support expression indexes yet".to_string(),
+        ));
+    }
     for col in &def.columns {
         let allowed = schema
             .columns
@@ -1449,8 +1715,43 @@ fn delete_indexes_referencing_column_in_txn(
     column_name: &str,
 ) -> Result<()> {
     retain_index_defs_in_txn(write_txn, |def| {
-        def.table != table_name || !def.columns.iter().any(|c| c == column_name)
+        def.table != table_name || !def.referenced_columns().any(|c| c == column_name)
     })
+}
+
+/// `table` の式索引のいずれかが列 `column` を参照しているか（`RENAME COLUMN`／`ALTER COLUMN TYPE`
+/// の拒否判定。INDEX-10、Issue #1648）。式の改名追随・再構築は後続 Issue #1651 のため、参照が
+/// あれば呼び出し元が `0A000` で拒否する（宣言と式テキストが食い違う fail-open を作らない）。
+/// 同一 write txn 内で呼ぶ。走査件数は [`MAX_INDEX_COUNT`] で打ち切る。
+fn expression_index_references_column_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
+    let index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    for (scanned, entry) in index_table.iter()?.enumerate() {
+        if scanned >= MAX_INDEX_COUNT {
+            return Err(CatalogError::CorruptSchema(format!(
+                "index catalog exceeds {MAX_INDEX_COUNT} entries"
+            )));
+        }
+        let (key, value) = entry?;
+        let def = decode_index_def(key.value(), value.value())?;
+        if def.table == table
+            && def
+                .expressions
+                .iter()
+                .flatten()
+                .any(|e| e.referenced_columns.iter().any(|c| c == column))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// 列型変換の一般変換（`AlterPlan::RewriteExpr`。TABLE-40 (4)・Issue #1636・#1637）が、
@@ -2693,6 +2994,34 @@ pub(crate) enum AlterCheckError {
 impl From<CatalogError> for AlterCheckError {
     fn from(e: CatalogError) -> Self {
         AlterCheckError::Catalog(e)
+    }
+}
+
+/// [`Storage::create_index_bound`]（INDEX-10、Issue #1648）専用の crate 内部合成エラー型。
+/// 式要素の束縛で発生する `SqlSurfaceError`（`42703`／`42804`／`42883`／`42P17`／`0A000`）を
+/// `CatalogError` へ混ぜ込むと catalog → sql の型依存・公開 API（`core_api.snapshot`）を不要に
+/// 拡大するため、[`AlterCheckError`] と同じ方針で分離する。`sql::ddl::execute_create_index` が
+/// 唯一の呼び出し元で、`Sql` はそのまま透過し、`Catalog` は `map_create_index_error` へ渡す。
+#[derive(Debug)]
+pub(crate) enum CreateIndexError {
+    Catalog(CatalogError),
+    Sql(SqlSurfaceError),
+}
+
+impl From<CatalogError> for CreateIndexError {
+    fn from(e: CatalogError) -> Self {
+        CreateIndexError::Catalog(e)
+    }
+}
+
+/// `redb` の各操作が返すエラー型を `?` で直接 [`CreateIndexError::Catalog`] へ橋渡しする
+/// （[`CatalogError`] の同種の `From` と同じ方針）。
+impl<E> From<E> for CreateIndexError
+where
+    E: Into<redb::Error>,
+{
+    fn from(e: E) -> Self {
+        CreateIndexError::Catalog(CatalogError::Backend(e.into()))
     }
 }
 
@@ -10806,6 +11135,14 @@ impl Storage {
         if schema.columns.iter().any(|c| c.name == new_name) {
             return Err(CatalogError::ColumnAlreadyExists(new_name.to_string()).into());
         }
+        // 式索引が参照する列の改名は、式テキストの追随（後続 Issue #1651）が入るまで拒否する
+        // （INDEX-10、Issue #1648）。commit しないため副作用ゼロ。
+        if expression_index_references_column_in_txn(&write_txn, table_name, old_name)? {
+            return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail: "renaming a column referenced by an expression index is not supported"
+                    .to_string(),
+            }));
+        }
         // ビュー定義の追随（TABLE-38、Issue #1621）。拒否・計画失敗時は何も書かない。
         // CATALOG_TABLE のハンドルは解放済み。`schema` は改名前のもの。
         rewrite_views_for_renamed_column_in_txn(
@@ -12360,6 +12697,13 @@ impl Storage {
                 detail: "cannot alter type of a column used by a view or rule".to_string(),
             }));
         }
+        // 式索引が参照する列の型変更は、式の再束縛・キー再構築（後続 Issue #1651）が入るまで
+        // 拒否する（INDEX-10、Issue #1648）。commit しないため副作用ゼロ。
+        if expression_index_references_column_in_txn(&write_txn, table_name, column_name)? {
+            return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail: "cannot alter type of a column used by an expression index".to_string(),
+            }));
+        }
         let mut revalidate_schema: Option<TableSchema> = None;
         // `RewriteExpr` のとき、カタログのハンドルを手放した後で処理するための持ち越し
         // （旧スキーマ・変更列の論理 index・新しい型・新しい照合）。
@@ -12868,25 +13212,85 @@ impl Storage {
     /// 宣言変更前のキャッシュが残り続ける経路を作らない（宣言列をキャッシュの
     /// 構築対象へ反映する結線自体は本メソッドの管轄外）。
     pub fn create_index(&self, def: &IndexDef) -> Result<()> {
+        // 式要素付きの宣言は束縛を通す SQL 表層（[`Storage::create_index_bound`]）だけが作れる。
+        // 呼び出し元の生テキストをそのまま保存せず、式を黙って落として列だけで保存もしない。
+        if def.has_expressions() {
+            return Err(CatalogError::Invalid(
+                "expression indexes can only be created through the SQL surface".to_string(),
+            ));
+        }
+        self.create_index_bound(def, &[]).map_err(|e| match e {
+            CreateIndexError::Catalog(c) => c,
+            CreateIndexError::Sql(_) => {
+                CatalogError::Invalid("index definition rejected".to_string())
+            }
+        })
+    }
+
+    /// [`Storage::create_index`] の本体。式要素（`exprs[i] == Some`。その位置の `def.columns[i]` は
+    /// 空文字列、`def.expressions` は全要素 `None`）を同一 write txn 内で束縛し、正規化テキストと
+    /// 参照列を確定してから保存する（INDEX-10、Issue #1648）。`sql::ddl::execute_create_index` が
+    /// 唯一の呼び出し元。束縛エラー（`42703`／`42804`／`42883`／`42P17`／`0A000`）は
+    /// [`CreateIndexError::Sql`] としてそのまま透過し、commit 前に返る（副作用ゼロ）。
+    ///
+    /// 判定順（同一 write txn 内）: 名前衝突 → 対象の種別 → テーブル存在 → 素の列の整合
+    /// （[`validate_index_columns`]）→ 式ごとの束縛（未知列・型・決定性・結果型・往復一致）→
+    /// 一意索引の展開 → 件数上限 → 保存 → 世代 bump。
+    pub(crate) fn create_index_bound(
+        &self,
+        def: &IndexDef,
+        exprs: &[Option<Expr>],
+    ) -> std::result::Result<(), CreateIndexError> {
         validate_identifier(&def.name)?;
         validate_identifier(&def.table)?;
+        if def.has_expressions() {
+            // 式の永続形は束縛で確定する。入力の生テキストは信用しない。
+            return Err(CatalogError::Invalid(
+                "index expressions are bound by the catalog".to_string(),
+            )
+            .into());
+        }
+        let has_exprs = exprs.iter().any(Option::is_some);
+        if has_exprs
+            && (exprs.len() != def.columns.len()
+                || !matches!(def.kind, IndexKind::Scalar)
+                || def.unique)
+        {
+            return Err(CatalogError::Invalid(
+                "expression elements must match a non-unique scalar column list".to_string(),
+            )
+            .into());
+        }
+        let is_expr = |i: usize| exprs.get(i).is_some_and(Option::is_some);
         if def.columns.is_empty() {
             return Err(CatalogError::Invalid(
                 "index must reference at least one column".to_string(),
-            ));
+            )
+            .into());
         }
         if def.columns.len() > MAX_COLUMN_COUNT {
             return Err(CatalogError::Invalid(format!(
                 "index column count {} exceeds limit {MAX_COLUMN_COUNT}",
                 def.columns.len()
-            )));
+            ))
+            .into());
         }
         if def.collations.len() != def.columns.len() {
             return Err(CatalogError::Invalid(
                 "index collations must match the column list".to_string(),
-            ));
+            )
+            .into());
         }
-        for c in &def.columns {
+        for (i, c) in def.columns.iter().enumerate() {
+            if is_expr(i) {
+                if !c.is_empty() {
+                    return Err(CatalogError::Invalid(
+                        "expression element must not name a column".to_string(),
+                    )
+                    .into());
+                }
+                continue;
+            }
             validate_identifier(c)?;
         }
         // 同一列の重複指定は SQL 表層の構文検証（`validate_create_index_tokens`）と
@@ -12895,11 +13299,8 @@ impl Storage {
         // （[`decode_index_def`] は重複を破損として拒否するため、ここで通すと
         // 以後そのカタログ値を読めなくなる）。
         if let Some(dup) = first_duplicate_column(&def.columns) {
-            return Err(CatalogError::Invalid(format!(
-                "duplicate index column: {dup}"
-            )));
+            return Err(CatalogError::Invalid(format!("duplicate index column: {dup}")).into());
         }
-        let encoded = encode_index_def(def)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let views_contains = |name: &str| -> Result<bool> {
@@ -12921,7 +13322,7 @@ impl Storage {
                 || index_name_exists_in_txn(&write_txn, &def.name)?
                 || materialized_view_exists_in_txn(&write_txn, &def.name)?
             {
-                return Err(CatalogError::IndexAlreadyExists(def.name.clone()));
+                return Err(CatalogError::IndexAlreadyExists(def.name.clone()).into());
             }
             // 対象がビュー・既存の索引（relation 名前空間を共有するが行を持たない）
             // なら種別不一致（`42809`）。テーブル不在（`42P01`）へ落とさない。
@@ -12930,10 +13331,25 @@ impl Storage {
                 || index_name_exists_in_txn(&write_txn, &def.table)?
                 || materialized_view_exists_in_txn(&write_txn, &def.table)?
             {
-                return Err(CatalogError::WrongObjectKind(def.table.clone()));
+                return Err(CatalogError::WrongObjectKind(def.table.clone()).into());
             }
             let schema = require_table_schema_write(&write_txn, &def.table)?;
             validate_index_columns(def, &schema)?;
+            // 式要素の束縛（INDEX-10、Issue #1648）。保存するのは束縛が描画した正規化テキストと
+            // 抽出した参照列だけ。
+            let mut stored = def.clone();
+            for (i, expr) in exprs.iter().enumerate() {
+                let Some(expr) = expr else { continue };
+                let bound = crate::sql::index_expr::bind_index_expression(expr, &schema)
+                    .map_err(CreateIndexError::Sql)?;
+                if let Some(slot) = stored.expressions.get_mut(i) {
+                    *slot = Some(IndexExpressionDef {
+                        sql: bound.sql,
+                        referenced_columns: bound.referenced_columns,
+                    });
+                }
+            }
+            let encoded = encode_index_def(&stored)?;
             // 一意索引（Issue #1616・INDEX-9）: 型ゲート → 制約名前空間 → 件数上限 →
             // 追加後スキーマの検証 → 既存行の重複走査 の順で、スキーマ側の UNIQUE 制約
             // （強制の唯一の入力）を組み立てる。データに依存するのは最後の走査だけ。
@@ -12944,9 +13360,9 @@ impl Storage {
             };
             let mut index_table = write_txn.open_table(INDEX_CATALOG_TABLE)?;
             if index_table.len()? >= MAX_INDEX_COUNT as u64 {
-                return Err(CatalogError::IndexLimitExceeded(
-                    "too many indexes".to_string(),
-                ));
+                return Err(
+                    CatalogError::IndexLimitExceeded("too many indexes".to_string()).into(),
+                );
             }
             index_table.insert(def.name.as_str(), encoded.as_slice())?;
             if let Some(updated) = &unique_schema {
@@ -12964,7 +13380,9 @@ impl Storage {
         // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。
         // `IndexCatalogGateCache` が古い HNSW 宣言判定を再利用しないようにする）。
         bump_index_catalog_generation_in_txn(&write_txn)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(convert_storage_error)
+            .map_err(CreateIndexError::Catalog)
     }
 
     /// 索引宣言を削除する（`DROP INDEX`。TASK-206・INDEX-7、Issue #908）。名前が
@@ -22485,5 +22903,144 @@ mod tests {
             }
             AlterCheckError::Catalog(c) => panic!("unexpected catalog error: {c:?}"),
         }
+    }
+    // --- 式索引の永続形 v4（INDEX-10、Issue #1648） --------------------------------------
+
+    fn expr_def(name: &str, cols: &[&str], exprs: &[Option<(&str, &[&str])>]) -> IndexDef {
+        IndexDef::new(
+            name.to_string(),
+            "docs".to_string(),
+            IndexKind::Scalar,
+            cols.iter().map(|c| c.to_string()).collect(),
+        )
+        .with_expressions(
+            exprs
+                .iter()
+                .map(|e| {
+                    e.map(|(sql, refs)| IndexExpressionDef {
+                        sql: sql.to_string(),
+                        referenced_columns: refs.iter().map(|r| r.to_string()).collect(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// `v4` は往復でき、区切り文字・改行・引用符を含む式テキストも壊さない。式を含まない宣言の
+    /// `v1`／`v2`／`v3` のバイト列は変わらない。
+    #[test]
+    fn expression_index_v4_round_trips_and_legacy_bytes_are_unchanged() {
+        let def = expr_def(
+            "e",
+            &["", "lang", ""],
+            &[
+                Some(("COALESCE(lower(a), 'x,y\n''z')", &["a"])),
+                None,
+                Some(("(1 + 2)", &[])),
+            ],
+        );
+        let bytes = encode_index_def(&def).expect("encode");
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        assert!(
+            text.starts_with("v4\ndocs\nscalar\n,lang,\n-,-,-\n"),
+            "{text}"
+        );
+        assert!(!text.contains('\''), "式テキストは 16 進で格納する: {text}");
+        assert_eq!(text.lines().count(), 7);
+        assert_eq!(decode_index_def("e", &bytes).expect("decode"), def);
+        // 式を含まない宣言は従来どおり。
+        let plain = scalar_def("p", "docs", &["a", "b"]);
+        assert_eq!(
+            encode_index_def(&plain).expect("encode"),
+            b"v1\ndocs\nscalar\na,b".to_vec()
+        );
+        // 参照列の補助メソッド。
+        assert!(def.has_expressions());
+        assert_eq!(def.plain_columns().collect::<Vec<_>>(), vec!["lang"]);
+        assert_eq!(
+            def.referenced_columns().collect::<Vec<_>>(),
+            vec!["lang", "a"]
+        );
+    }
+
+    /// 破損・手書きの `v4` は `CorruptSchema` で拒否する（fail-closed）。
+    #[test]
+    fn corrupt_expression_index_v4_is_rejected() {
+        let good =
+            encode_index_def(&expr_def("e", &[""], &[Some(("lower(a)", &["a"]))])).expect("encode");
+        let good = String::from_utf8(good).expect("utf8");
+        assert!(decode_index_def("e", good.as_bytes()).is_ok());
+        let hex = good.lines().nth(5).expect("expr line").to_string();
+        let cases: Vec<(&str, String)> = vec![
+            ("unknown version", good.replacen("v4", "v5", 1)),
+            ("trailing data", format!("{good}\nextra")),
+            (
+                "missing refs line",
+                good.rsplit_once('\n').expect("nl").0.to_string(),
+            ),
+            ("odd hex", good.replace(&hex, &hex[..hex.len() - 1])),
+            ("non hex", good.replace(&hex, &"zz".repeat(hex.len() / 2))),
+            // 0xff 0xff は UTF-8 として不正。
+            ("invalid utf8", good.replace(&hex, "ffff")),
+            ("collation present", good.replace("\n-\n", "\nc\n")),
+            ("bad ref identifier", good.replace("\na", "\n1a")),
+            ("expression line says column", good.replace(&hex, "-")),
+            (
+                "column and expression both",
+                good.replace("scalar\n\n", "scalar\nx\n"),
+            ),
+            ("hnsw kind", good.replace("scalar", "hnsw")),
+            (
+                "too long",
+                good.replace(&hex, &"61".repeat(MAX_INDEX_EXPRESSION_SQL_LEN + 1)),
+            ),
+            ("empty expression", good.replace(&hex, "")),
+        ];
+        for (label, text) in cases {
+            assert!(
+                matches!(
+                    decode_index_def("e", text.as_bytes()),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "{label}: {text:?}"
+            );
+        }
+        // 式要素が 1 つも無い v4 は非正準形。
+        let no_expr = "v4\ndocs\nscalar\na\n-\n-\n";
+        assert!(matches!(
+            decode_index_def("e", no_expr.as_bytes()),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+        // 素の列の位置に実トークンを持つ v4 は、照合を黙って落とさず破損として拒否する。
+        let plain_collation = "v4\ndocs\nscalar\n,body\n-,c\n6c6f776572286129,-\na;";
+        assert!(matches!(
+            decode_index_def("e", plain_collation.as_bytes()),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+        let plain_ok = "v4\ndocs\nscalar\n,body\n-,-\n6c6f776572286129,-\na;";
+        assert!(decode_index_def("e", plain_ok.as_bytes()).is_ok());
+    }
+
+    /// 素の列に照合を持つ式索引は、v4 が照合を持てないためエンコード時に拒否する（fail-closed）。
+    #[test]
+    fn expression_index_encode_rejects_collation_on_column_elements() {
+        let def = expr_def("e", &["", "body"], &[Some(("lower(a)", &["a"])), None])
+            .with_column_collations(vec![None, Some(crate::collation::Collation::C)]);
+        assert!(matches!(
+            encode_index_def(&def),
+            Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// 公開 `create_index` は式付きの宣言を拒否する（式を黙って落として保存しない）。
+    #[test]
+    fn public_create_index_rejects_expression_elements() {
+        let (storage, _guard) = index_fixture_storage("index-expr-public-api");
+        let def = expr_def("e", &[""], &[Some(("lower(kind)", &["kind"]))]);
+        assert!(matches!(
+            storage.create_index(&def),
+            Err(CatalogError::Invalid(_))
+        ));
+        assert!(storage.list_indexes().expect("list").is_empty());
     }
 }
