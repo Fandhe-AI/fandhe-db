@@ -182,3 +182,40 @@ fn extended_protocol_execute_uses_the_current_view_definition() {
     assert_eq!(read_command_complete(&mut stream), "SELECT 0");
     read_ready_for_query(&mut stream);
 }
+
+/// 公開名 `id` が基表の TEXT 列を指すビュー: `$1` の型推論と Bind は疑似列 `id`（整数）ではなく
+/// 物理列 `title` の型に従い、文字列の Bind が整数構文エラーにならず成功する。
+#[test]
+fn extended_protocol_public_id_alias_to_text_column_binds_as_text() {
+    let (core, _guard) = new_core();
+    ddl(&core, "CREATE VIEW idv (id) AS SELECT title FROM notes");
+    let mut stream = connect(Arc::clone(&core));
+
+    let sql = "INSERT INTO idv (id) VALUES ($1) USING OPERATION_ID 'wire-view-insert-3'";
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("s1", sql, 0));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'1', "expected ParseComplete");
+
+    // Bind: 全パラメータ text 形式・1 個の値 'hello'・結果形式なし。
+    let mut bind = Vec::new();
+    bind.extend_from_slice(b"p1\0s1\0");
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&1i16.to_be_bytes());
+    bind.extend_from_slice(&5i32.to_be_bytes());
+    bind.extend_from_slice(b"hello");
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    send_length_prefixed_message(&mut stream, b'B', &bind);
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(
+        kind, b'2',
+        "expected BindComplete (text bind must not be an integer error)"
+    );
+
+    // この定義では基表の `id` を公開する列が無いため Execute は書き換えで拒否される（fail-closed）。
+    // 本テストの対象は型推論なので、整数構文エラー（22P02）ではないことだけを確認する。
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 0));
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b'E', "expected ErrorResponse");
+    let text = String::from_utf8_lossy(&body);
+    assert!(!text.contains("22P02"), "integer parse error: {text}");
+}

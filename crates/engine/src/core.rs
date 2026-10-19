@@ -4753,24 +4753,37 @@ impl EngineCore {
             Some(Token::Ident(w)) if w.eq_ignore_ascii_case("INSERT")
         );
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
-            if column == "id" {
-                return Some(PreparedParamType::Column(ColumnMeta::Id));
-            }
+            let id_type = || Some(PreparedParamType::Column(ColumnMeta::Id));
             let (schema, column) = match self.storage.get_table_schema(table) {
+                Ok(_) if column == "id" => return id_type(),
                 Ok(schema) => (schema, column.to_string()),
                 // 表でなければ、INSERT に限りビューの公開列を基表の列へ解決して型を引く
-                // （TABLE-43・Issue #1671）。解決できなければ従来どおり未解決（`Text`）。
-                Err(_) if is_insert => self
-                    .storage
-                    .with_view_write_snapshot(table, |snap, _| {
-                        let (base, physical) =
-                            crate::sql::view_insert::resolve_insert_column(snap, table, column)?;
-                        snap.table_schema(&base).ok().map(|s| (s, physical))
-                    })
-                    .ok()
-                    .flatten()?,
+                // （TABLE-43・Issue #1671）。公開名 `id` でも物理列へ解決してから疑似列かを
+                // 判定する（TEXT 列を `id` として公開するビューで `$n` を整数と誤推論しない）。
+                // 解決できなければ、`id` は従来どおり疑似列、他は未解決（`Text`）。
+                Err(_) if is_insert => {
+                    let resolved = self
+                        .storage
+                        .with_view_write_snapshot(table, |snap, _| {
+                            let (base, physical) = crate::sql::view_insert::resolve_insert_column(
+                                snap, table, column,
+                            )?;
+                            snap.table_schema(&base).ok().map(|s| (s, physical))
+                        })
+                        .ok()
+                        .flatten();
+                    match resolved {
+                        Some(r) => r,
+                        None if column == "id" => return id_type(),
+                        None => return None,
+                    }
+                }
+                Err(_) if column == "id" => return id_type(),
                 Err(_) => return None,
             };
+            if column == "id" {
+                return id_type();
+            }
             let def = schema.columns.iter().find(|c| c.name == column)?;
             Some(PreparedParamType::Column(ColumnMeta::Scalar {
                 name: def.name.clone(),
