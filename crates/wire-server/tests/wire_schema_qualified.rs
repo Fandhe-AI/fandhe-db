@@ -72,7 +72,10 @@ fn wire_simple_query_public_qualified_names() {
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
     assert_eq!(
-        simple_ok(&mut stream, "CREATE TABLE public.t (name TEXT)"),
+        simple_ok(
+            &mut stream,
+            "CREATE TABLE public.t (id BIGINT PRIMARY KEY, name TEXT)"
+        ),
         "CREATE TABLE"
     );
     assert_eq!(
@@ -112,7 +115,10 @@ fn wire_extended_query_public_qualified_names() {
     let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
     let addr = spawn_server(store, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
-    simple_ok(&mut stream, "CREATE TABLE t (name TEXT)");
+    simple_ok(
+        &mut stream,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
     simple_ok(&mut stream, "INSERT INTO t (id, name) VALUES (1, 'a')");
 
     let sql = "SELECT id, name FROM public.t LIMIT 10";
