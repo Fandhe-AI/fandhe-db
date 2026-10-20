@@ -187,6 +187,13 @@ pub(crate) fn convert_column_default_for_alter(
             Err(fail())
         };
     }
+    // IDENTITY 列の型変更は暗黙 SEQUENCE の型も変える必要があるが未対応（fail-closed。
+    // TABLE-24・Issue #1695）。
+    if let ColumnDefault::Identity { .. } = default {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "ALTER COLUMN TYPE on an identity column is not supported",
+        ));
+    }
     // `DEFAULT nextval`（TABLE-24・Issue #1690）は構文形のまま、新しい型が整数 3 型のときだけ保持する。
     if let ColumnDefault::Sequence(_) = default {
         return if matches!(
@@ -357,6 +364,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::DuplicateSchema { .. }
         | E::InvalidSchemaName { .. }
         | E::ReservedName { .. }
+        | E::GeneratedAlways { .. }
         | E::MaterializedViewNotRefreshableConcurrently
         | E::ViewNotAutoUpdatable { .. }
         | E::PartitionedDmlInTransaction

@@ -77,6 +77,8 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         ErrorClass::DuplicateSchema => 409,
         ErrorClass::InvalidSchemaName => 404,
         ErrorClass::ReservedName => 400,
+        // TABLE-24・Issue #1695: GENERATED ALWAYS 列への明示値（`428C9`）は入力起因の拒否として 400。
+        ErrorClass::GeneratedAlways => 400,
         // TABLE-43 (2)・Issue #1673: ビューの `WITH CHECK OPTION` 違反（`44000`）。書き込む行の値が
         // ビューの条件と矛盾する入力起因の拒否として 400（NoSQL 表層からはビューへ書けないため到達しない
         // が、網羅 match のため定義）。
@@ -203,7 +205,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 76] = [
+    const EXPECTED: [(ErrorClass, u16); 77] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -238,6 +240,7 @@ mod tests {
         (ErrorClass::DuplicateSchema, 409),
         (ErrorClass::InvalidSchemaName, 404),
         (ErrorClass::ReservedName, 400),
+        (ErrorClass::GeneratedAlways, 400),
         (ErrorClass::WithCheckOptionViolation, 400),
         (ErrorClass::InvalidTransactionState, 400),
         (ErrorClass::ActiveSqlTransaction, 400),

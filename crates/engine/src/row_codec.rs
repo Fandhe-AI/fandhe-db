@@ -4918,7 +4918,11 @@ pub(crate) fn validate_default(
         }
         // SEQUENCE DEFAULT（TABLE-24・Issue #1690）も評価せず列型との適合だけを検査する
         // （採番は INSERT の書き込み txn 内。整数 3 型のみ）。
-        (crate::catalog::ColumnDefault::Sequence(_), ty) => {
+        (
+            crate::catalog::ColumnDefault::Sequence(_)
+            | crate::catalog::ColumnDefault::Identity { .. },
+            ty,
+        ) => {
             if matches!(
                 ty,
                 ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt
@@ -5110,7 +5114,9 @@ pub(crate) fn default_scalar<'a>(
         // 読み出し時補完へは到達しない。設計 D9・D10）。
         (ColumnDefault::CurrentTime(_), _) => Err(DefaultBindError::Incompatible),
         // SEQUENCE DEFAULT も固定値の補完には使えない（同上。TABLE-24・Issue #1690）。
-        (ColumnDefault::Sequence(_), _) => Err(DefaultBindError::Incompatible),
+        (ColumnDefault::Sequence(_) | ColumnDefault::Identity { .. }, _) => {
+            Err(DefaultBindError::Incompatible)
+        }
         _ => Err(DefaultBindError::Incompatible),
     }
 }
