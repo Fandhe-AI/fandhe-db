@@ -72,6 +72,10 @@ pub(crate) mod rowid_alloc;
 #[cfg(test)]
 mod rowid_gate_tests;
 pub(crate) mod sequence;
+// SCHEMA（テナント内側の名前空間）のカタログ（TABLE-27・Issue #1713。設計記録:
+// `docs/design/schema-tenant-namespace.md`）。`public` は仮想 SCHEMA で行を持たない。
+#[allow(dead_code)]
+pub(crate) mod namespace;
 pub(crate) use materialized::read_materialized_view_in;
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
@@ -3207,6 +3211,17 @@ pub enum CatalogError {
     /// TABLE-18・SQL-23・TASK-205、Issue #909。ERR-6: `54000`）。`detail` は
     /// 固定文言のみ（テナント・行内容を含まない）。
     ViewLimitExceeded(String),
+    /// `CREATE SCHEMA` 相当 API で、同一テナントに同名の SCHEMA が既にある（上書きしない。
+    /// TABLE-27・Issue #1713。`42P06`）。中身は呼び出し元が指定した名前のみ。
+    SchemaAlreadyExists(String),
+    /// `DROP SCHEMA` 相当 API で、呼び出し元テナントに対象の SCHEMA が無い（TABLE-27・
+    /// Issue #1713。`3F000`）。他テナントにしか無い名前も同じ variant になる。
+    SchemaNotFound(String),
+    /// 予約名（`pg_` 接頭辞）の SCHEMA 名（TABLE-27・Issue #1713。`42939`）。
+    ReservedSchemaName(String),
+    /// 組み込み SCHEMA（`public`・`pg_catalog`・`information_schema`）の削除（TABLE-27・
+    /// Issue #1713。`42501`）。
+    BuiltinSchema(String),
     /// 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有により、書き込み
     /// トランザクションの取得がロック待ちの上限を超過した（`storage::StorageError`
     /// から写像。[`convert_storage_error`] 参照）。
@@ -3343,6 +3358,12 @@ impl fmt::Display for CatalogError {
             CatalogError::ViewLimitExceeded(detail) => {
                 write!(f, "view limit exceeded: {detail}")
             }
+            CatalogError::SchemaAlreadyExists(name) => write!(f, "schema already exists: {name}"),
+            CatalogError::SchemaNotFound(name) => write!(f, "schema not found: {name}"),
+            CatalogError::ReservedSchemaName(name) => {
+                write!(f, "reserved schema name: {name}")
+            }
+            CatalogError::BuiltinSchema(name) => write!(f, "built-in schema: {name}"),
             CatalogError::WriteLockTimeout => {
                 write!(f, "write lock not available: timed out waiting for writer")
             }
@@ -3426,6 +3447,10 @@ impl std::error::Error for CatalogError {
             | CatalogError::ViewDefinitionChanged(_)
             | CatalogError::ViewReferenceCycle(_)
             | CatalogError::ViewLimitExceeded(_)
+            | CatalogError::SchemaAlreadyExists(_)
+            | CatalogError::SchemaNotFound(_)
+            | CatalogError::ReservedSchemaName(_)
+            | CatalogError::BuiltinSchema(_)
             | CatalogError::ColumnNotFound(_)
             | CatalogError::ProtectedColumn(_)
             | CatalogError::IncompatibleTypeChange { .. }
@@ -15480,6 +15505,10 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
             | CatalogError::ViewDefinitionChanged(_)
             | CatalogError::ViewReferenceCycle(_)
         | CatalogError::ViewLimitExceeded(_)
+        | CatalogError::SchemaAlreadyExists(_)
+        | CatalogError::SchemaNotFound(_)
+        | CatalogError::ReservedSchemaName(_)
+        | CatalogError::BuiltinSchema(_)
         | CatalogError::ColumnNotFound(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }

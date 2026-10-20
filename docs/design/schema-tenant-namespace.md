@@ -239,3 +239,35 @@ README の公開済み要点を超えて具体化しない。公開境界を広�
 - システムカタログ（`pg_namespace` 等）・psql の `\dn`（#1718 で対象外が宣言済み）
 - ロール・所有者（SQL-39）、SCHEMA 単位の GRANT（#2234）、利用者定義ポリシーの実装（RLS-13）
 - テーブル単位の物理分離（TABLE-9 のポインタ。SCHEMA はテナント境界に使わない）
+
+## 6. Issue #1713 実装記録
+
+TABLE-27・TABLE-36 のポインタ。`CREATE SCHEMA`／`DROP SCHEMA` と SCHEMA カタログを engine に入れた。
+
+- **移行処理なし**: `public` は仮想 SCHEMA で `schemas` 表に行を持たない。既存のカタログキー・
+  `user_rows/{name}`・台帳キーは書き換えず、格納形式の版も上げない。`schemas`・`schema_id_counter` は
+  最初の `CREATE SCHEMA` まで作らない（遅延作成。存在判定は読み取り専用オープン）。既存データの
+  バイト列が変わらないことは `catalog::namespace` の単体テスト（全表の件数と主要カタログの
+  key/value の前後比較）で固定した
+- **格納**: `catalog/namespace.rs`。`schemas` のキーは `(tenant_id, schema_name)`、値は固定 10 バイト
+  （版 1・内部 ID `u64` LE・所有者予約領域 1 バイト〔SQL-39 まで常に 0〕）。未知の版・長さ不一致・
+  予約領域の非零・id=0 は `CorruptSchema`（fail-closed）。ID カウンタは単調で再利用しない
+- **受理範囲**: `CREATE SCHEMA [IF NOT EXISTS] <名>`、`DROP SCHEMA [IF EXISTS] <名> [RESTRICT]`。
+  `AUTHORIZATION`・schema_element・`CASCADE`・複数名は `0A000`、修飾名・不正な識別子・余分な
+  トークンは `42601`。明示トランザクション内は既存の DDL 方針どおり `0A000`
+- **判定順序**: CREATE は 構文 → DDL 権限 → 予約名（`IF NOT EXISTS` より先）→ 組み込み名・同名の
+  既存 → 件数上限 → ID 払い出しと保存。DROP は 構文 → DDL 権限 → 組み込み名 → 存在
+  （`(tenant_id, name)` の 1 回 get）→ 空判定 → 削除。予約名（`pg_` 接頭辞）と組み込み名
+  （`public`・`pg_catalog`・`information_schema`）は ASCII の大文字小文字を無視して判定する
+  （lexer が畳み込みをしないため、拒否側に倒す）
+- **エラー分類**: `42P06`（DuplicateSchema）・`3F000`（InvalidSchemaName）・`42939`（ReservedName）を
+  `ErrorClass` に追加した（`count` 73 → 76）。組み込み SCHEMA の DROP は既存の `42501`、中身ありは
+  既存の `2BP01`。文言は利用者が書いた名前だけを含み、内部 ID・依存オブジェクト名・他テナントの
+  情報を含めない
+- **`RelationKey`**: 内部キー（`name`／`#<id>.<name>`）の組み立てと解析を `namespace.rs` に集約した。
+  本 Issue で使うのは DROP の空判定の接頭辞だけ。既存の decode 側 `validate_identifier` 呼び出し点の
+  置き換えは、`#<id>.` キーを書く経路を入れる #1714／#1717 で行う（書き込み経路が無い段階で受理
+  範囲を広げると fail-closed が弱まるため）
+- **対象外**: 修飾名の解決（#1714）、`search_path`（#1715）、`ALTER SCHEMA`（#1716）、tenant SCHEMA
+  へのオブジェクト作成と `CASCADE`（#1717）、システムカタログ（#1718）、横断テスト（#1719）、
+  SCHEMA 単位の GRANT（#2234）。`DROP SCHEMA` の複数名指定は本 Issue では `0A000`

@@ -83,6 +83,8 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::DropType(_)
         | SqlOutcome::CreateSequence(_)
         | SqlOutcome::DropSequence(_)
+        | SqlOutcome::CreateSchema(_)
+        | SqlOutcome::DropSchema(_)
         | SqlOutcome::AlterSequence(_)
         | SqlOutcome::Begin
         | SqlOutcome::Commit

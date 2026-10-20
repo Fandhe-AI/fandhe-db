@@ -71,6 +71,12 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // TABLE-24・Issue #1690: SEQUENCE の上限・下限到達（`2200H`）は入力（採番の累積）起因の
         // 拒否として 400（`NumericOutOfRange` と同類）。
         ErrorClass::SequenceGeneratorLimitExceeded => 400,
+        // TABLE-27・Issue #1713: SCHEMA 名の重複は `DuplicateTable` と同じ 409、呼び出し元テナントに
+        // 無い SCHEMA は 404、予約名の指定は入力起因の 400（NoSQL 表層からは SCHEMA DDL へ到達
+        // できないが、網羅 match のため定義）。
+        ErrorClass::DuplicateSchema => 409,
+        ErrorClass::InvalidSchemaName => 404,
+        ErrorClass::ReservedName => 400,
         // TABLE-43 (2)・Issue #1673: ビューの `WITH CHECK OPTION` 違反（`44000`）。書き込む行の値が
         // ビューの条件と矛盾する入力起因の拒否として 400（NoSQL 表層からはビューへ書けないため到達しない
         // が、網羅 match のため定義）。
@@ -197,7 +203,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 73] = [
+    const EXPECTED: [(ErrorClass, u16); 76] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -229,6 +235,9 @@ mod tests {
         (ErrorClass::LockNotAvailable, 503),
         (ErrorClass::ObjectNotInPrerequisiteState, 409),
         (ErrorClass::SequenceGeneratorLimitExceeded, 400),
+        (ErrorClass::DuplicateSchema, 409),
+        (ErrorClass::InvalidSchemaName, 404),
+        (ErrorClass::ReservedName, 400),
         (ErrorClass::WithCheckOptionViolation, 400),
         (ErrorClass::InvalidTransactionState, 400),
         (ErrorClass::ActiveSqlTransaction, 400),
