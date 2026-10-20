@@ -380,8 +380,43 @@ impl Storage {
         Ok(DropSchemaResult::Dropped)
     }
 
-    /// `(tenant_id, name)` の SCHEMA の内部 ID（後続の名前解決用。読み取り専用）。
-    #[allow(dead_code)]
+    /// `tenant_id` の SCHEMA `old` を `new` へ改名する（TABLE-27 のポインタ、Issue #1716）。
+    /// オブジェクトは内部 ID 経由で格納されるため、`schemas` 表の 1 行の付け替え（内部 ID は不変）
+    /// だけで中のオブジェクトが追随する。判定順は識別子 → 旧名が組み込み名（`BuiltinSchema`）→
+    /// 旧名の存在（`(tenant_id, old)` の 1 回 get。他テナントの同名は不在と同じ `SchemaNotFound`）→
+    /// 新名が組み込み名・既存（`SchemaAlreadyExists`。同名への改名を含む）→ 新名が予約名
+    /// （`ReservedSchemaName`）→ 付け替えを 1 回の commit で行う。
+    /// `sql::ddl::execute_alter_schema` から呼ばれる（権限ゲート通過後）。
+    pub(crate) fn rename_schema(&self, tenant_id: &str, old: &str, new: &str) -> Result<()> {
+        validate_tenant_id(tenant_id)?;
+        validate_identifier(old)?;
+        validate_identifier(new)?;
+        if is_builtin_schema_name(old) {
+            return Err(CatalogError::BuiltinSchema(old.to_string()));
+        }
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::convert_storage_error)?;
+        let Some(id) = schema_id_in_txn(&*write_txn, tenant_id, old)? else {
+            return Err(CatalogError::SchemaNotFound(old.to_string()));
+        };
+        if is_builtin_schema_name(new) || schema_id_in_txn(&*write_txn, tenant_id, new)?.is_some() {
+            return Err(CatalogError::SchemaAlreadyExists(new.to_string()));
+        }
+        if is_reserved_schema_name(new) {
+            return Err(CatalogError::ReservedSchemaName(new.to_string()));
+        }
+        {
+            let mut table = write_txn.open_table(SCHEMAS_TABLE)?;
+            table.remove((tenant_id, old))?;
+            table.insert((tenant_id, new), encode_schema_def(id).as_slice())?;
+        }
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(super::convert_storage_error)?;
+        Ok(())
+    }
+
+    /// `(tenant_id, name)` の SCHEMA の内部 ID（`ALTER TABLE SET SCHEMA` の移動先解決用。読み取り専用）。
     pub(crate) fn schema_id(&self, tenant_id: &str, name: &str) -> Result<Option<u64>> {
         let rt = self.db().begin_read()?;
         schema_id_in_txn(&rt, tenant_id, name)
@@ -581,6 +616,71 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn rename_keeps_internal_id_and_objects_follow() {
+        let (s, _g) = tmp_storage("ns-rename");
+        s.create_schema("alice", "a", false).expect("a");
+        s.create_schema("bob", "a", false).expect("bob a");
+        let id = s.schema_id("alice", "a").expect("id").expect("some");
+        let bob_id = s.schema_id("bob", "a").expect("id").expect("some");
+        // 中身（表）を内部 ID キーで直接置き、改名後も DROP が依存で拒否されること。
+        {
+            let w = s.begin_write_txn().expect("w");
+            {
+                let mut t = w.open_table(CATALOG_TABLE).expect("t");
+                t.insert(format!("#{id}.x").as_str(), [0u8].as_slice())
+                    .expect("ins");
+            }
+            crate::recovery::commit_boundary::commit(w).expect("commit");
+        }
+        s.rename_schema("alice", "a", "b").expect("rename");
+        assert_eq!(s.schema_id("alice", "b").expect("id"), Some(id));
+        assert_eq!(s.schema_id("alice", "a").expect("id"), None);
+        assert_eq!(s.schema_id("bob", "a").expect("id"), Some(bob_id));
+        assert!(matches!(
+            s.drop_schema("alice", "b", false),
+            Err(CatalogError::DependentObjectsStillExist(_))
+        ));
+    }
+
+    #[test]
+    fn rename_rejections_leave_catalog_unchanged() {
+        let (s, _g) = tmp_storage("ns-rename-rej");
+        // SCHEMA 未使用の DB では表を作らない。
+        assert!(matches!(
+            s.rename_schema("alice", "a", "b"),
+            Err(CatalogError::SchemaNotFound(_))
+        ));
+        s.create_schema("alice", "a", false).expect("a");
+        s.create_schema("alice", "c", false).expect("c");
+        s.create_schema("bob", "only_bob", false).expect("bob");
+        let id = s.schema_id("alice", "a").expect("id");
+        for old in ["public", "PUBLIC", "pg_catalog", "information_schema"] {
+            assert!(matches!(
+                s.rename_schema("alice", old, "z"),
+                Err(CatalogError::BuiltinSchema(_))
+            ));
+        }
+        assert!(matches!(
+            s.rename_schema("alice", "only_bob", "z"),
+            Err(CatalogError::SchemaNotFound(_))
+        ));
+        for new in ["c", "a", "public", "information_schema"] {
+            assert!(matches!(
+                s.rename_schema("alice", "a", new),
+                Err(CatalogError::SchemaAlreadyExists(_))
+            ));
+        }
+        for new in ["pg_x", "PG_X"] {
+            assert!(matches!(
+                s.rename_schema("alice", "a", new),
+                Err(CatalogError::ReservedSchemaName(_))
+            ));
+        }
+        assert_eq!(s.schema_id("alice", "a").expect("id"), id);
+        assert!(s.schema_id("alice", "z").expect("id").is_none());
     }
 
     #[test]
