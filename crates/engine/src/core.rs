@@ -9880,6 +9880,49 @@ impl EngineCore {
         crate::sql::exec::execute_delete(&self.storage, ctx, bound, self.ledger_mode)
     }
 
+    /// [`Self::execute_bound_delete_in_session`] の束縛時スキーマ検査付き版（Issue #2199）。
+    /// `check` が受け取るスキーマは実行（write トランザクション内の再照合）と同一世代で、
+    /// `check` が `Err` ならば書き込まずにそのまま返す。write 側は束縛時スキーマと現スキーマの
+    /// 不一致を fail-closed で拒否するため、検査後に並行 DDL で表が差し替わっても素通りしない。
+    /// `wire-server::http::query::delete` の単一行形が、採番方式の表を `id` 直指定で
+    /// 触らせないために使う。`operation_id` 必須化ガードはスキーマ取得より前に判定する。
+    pub fn execute_bound_delete_checked_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        bound: &crate::sql::parser::BoundDelete,
+        check: F,
+    ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<(), crate::sql::allowlist::SqlSurfaceError>,
+    {
+        let ledger_write = self
+            .ledger_mode
+            .resolve(bound.operation_id.as_ref())
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+        let (read_txn, schema) = self.read_txn_with_schema(&bound.table)?;
+        check(&schema)?;
+        drop(read_txn);
+        match crate::tenant::delete_row_ledgered_capturing_unchecked(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            &bound.table,
+            ctx,
+            bound.id,
+            ledger_write,
+            Some(&schema),
+            None,
+        ) {
+            Ok((crate::tenant::DeleteRowOutcome::Deleted, _)) => {
+                Ok(crate::sql::exec::DeleteOutcome { rows_affected: 1 })
+            }
+            Ok((crate::tenant::DeleteRowOutcome::NotFound, _)) => {
+                Ok(crate::sql::exec::DeleteOutcome { rows_affected: 0 })
+            }
+            Err(e) => Err(crate::sql::exec::map_write_error(e, "delete")),
+        }
+    }
+
     /// NoSQL 表層 `update` op の `filter`（述語形。TASK-186・NOSQL-12、
     /// Issue #1062・対象ビヘイビア NOSQL-6・NOSQL-12・SQL-19・RECOVER-1／10／11）
     /// を SQL 表層 `UPDATE ... WHERE <述語> USING OPERATION_ID`（SQL-19・

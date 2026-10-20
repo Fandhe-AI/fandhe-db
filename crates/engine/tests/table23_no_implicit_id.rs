@@ -1181,3 +1181,56 @@ fn using_plan_works_on_allocated_table() {
         other => panic!("expected Explain, got {other:?}"),
     }
 }
+
+/// 単一行 DELETE の束縛時スキーマ検査（Issue #2199）。`check` が `Err` を返せば、採番方式の表の
+/// 内部 rowid を `id` として指定されても行を消さずに拒否する（fail-closed）。
+#[test]
+fn checked_single_row_delete_rejects_before_touching_an_allocated_table() {
+    use engine::sql::allowlist::SqlSurfaceError;
+    use engine::sql::parser::BoundDelete;
+
+    let (core, _g) = new_core("t23-noid-checked-delete");
+    let alice = ctx("alice");
+    run(&core, &alice, "CREATE TABLE notes (title TEXT)");
+    run(&core, &alice, "INSERT INTO notes (title) VALUES ('a')");
+    let count = |core: &EngineCore| {
+        query(core, &alice, "SELECT * FROM notes LIMIT 10")
+            .rows
+            .len()
+    };
+    assert_eq!(count(&core), 1);
+
+    let reject = |schema: &TableSchema| {
+        if schema.uses_allocated_row_identity() {
+            Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "row identity mode is not supported yet".to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    };
+    // 採番方式の表では、どの `id`（総当たり含む）でも検査で止まり行は残る。
+    for id in 0..4u64 {
+        let bound = BoundDelete {
+            table: "notes".to_string(),
+            id,
+            operation_id: None,
+        };
+        let err = core
+            .execute_bound_delete_checked_in_session(&alice, &bound, reject)
+            .expect_err("allocated table is rejected");
+        assert_eq!(err.wire_code(), "0A000");
+    }
+    assert_eq!(count(&core), 1);
+
+    // 検査を通す場合は実行器へ到達する（存在しない表は 42P01）。
+    let missing = BoundDelete {
+        table: "nope".to_string(),
+        id: 1,
+        operation_id: None,
+    };
+    let err = core
+        .execute_bound_delete_checked_in_session(&alice, &missing, reject)
+        .expect_err("undefined table");
+    assert_eq!(err.wire_code(), "42P01");
+}
