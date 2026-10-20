@@ -184,8 +184,8 @@ fn rewrite_id_form(
     if rv.view_predicates.is_empty() && !base_allocated {
         return Ok(BaseIdForm::Single(id_literal.to_string()));
     }
-    let mut merged = rv.view_predicates.clone();
-    merged.extend(id_equality_predicates(id_literal)?);
+    // 生成した述語は公開名 `id` で組まれているため、述語形 DML と同じ公開名→物理名の解決経路を通す。
+    let merged = merge_predicates(rv, &id_equality_predicates(id_literal)?)?;
     Ok(BaseIdForm::Predicates(merged))
 }
 

@@ -1111,6 +1111,40 @@ fn view_aliasing_an_ordinary_id_column_works() {
     assert_eq!(texts(&all, 0), vec!["x", "y", "z"]);
 }
 
+/// 利用者列を公開名 `id` で公開するビューへの単一行形 `WHERE id = <n>` は、公開名を物理名へ解決した
+/// 述語になる（基表の同名列 `id` と取り違えない。基表に `id` が無くても動く）。
+#[test]
+fn single_row_form_on_view_resolves_public_id_to_physical_column() {
+    let (core, _g) = new_core("t23-noid-view-id-map");
+    let alice = ctx("alice");
+    run(&core, &alice, "CREATE TABLE t (id INTEGER, k INTEGER)");
+    run(&core, &alice, "INSERT INTO t (id, k) VALUES (1, 2), (2, 1)");
+    run(
+        &core,
+        &alice,
+        "CREATE VIEW v (id, original_id) AS SELECT k, id FROM t",
+    );
+    // 公開名 id = 1 は物理列 k = 1 の行（基表の id = 2）。
+    run(&core, &alice, "UPDATE v SET original_id = 9 WHERE id = 1");
+    let only_k1 = query(&core, &alice, "SELECT id FROM t WHERE k = 1 LIMIT 10");
+    assert!(format!("{:?}", only_k1.rows[0].cells).contains('9'));
+    let untouched = query(&core, &alice, "SELECT id FROM t WHERE k = 2 LIMIT 10");
+    assert!(format!("{:?}", untouched.rows[0].cells).contains('1'));
+    run(&core, &alice, "DELETE FROM v WHERE id = 1");
+    let left = query(&core, &alice, "SELECT k FROM t LIMIT 10");
+    assert_eq!(left.rows.len(), 1);
+    assert!(format!("{:?}", left.rows[0].cells).contains('2'));
+
+    // 基表に `id` 列が無くても、公開名 id は物理列へ写る。
+    run(&core, &alice, "CREATE TABLE t2 (k INTEGER)");
+    run(&core, &alice, "INSERT INTO t2 (k) VALUES (1), (2)");
+    run(&core, &alice, "CREATE VIEW v2 (id) AS SELECT k FROM t2");
+    run(&core, &alice, "DELETE FROM v2 WHERE id = 1");
+    let left2 = query(&core, &alice, "SELECT k FROM t2 LIMIT 10");
+    assert_eq!(left2.rows.len(), 1);
+    assert!(format!("{:?}", left2.rows[0].cells).contains('2'));
+}
+
 /// 採番方式の表でも `USING PLAN` の辞書構築（内部走査）が通る（公開の行 API は拒否のまま）。
 #[test]
 fn using_plan_works_on_allocated_table() {
