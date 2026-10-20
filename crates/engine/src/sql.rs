@@ -528,6 +528,18 @@ pub enum SqlOutcome {
     /// **BREAKING CHANGE**（Issue #1688）: 本 variant の追加により `SqlOutcome`
     /// を網羅的にマッチする既存コードはすべて更新済み。
     DropSequence(ddl::DropSequenceOutcome),
+    /// `CREATE SCHEMA [IF NOT EXISTS] <name>`（TABLE-27、Issue #1713）がセッション経由の実行経路で
+    /// 成功したことを示す応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #1713）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コードはすべて更新済み。
+    CreateSchema(ddl::CreateSchemaOutcome),
+    /// `DROP SCHEMA [IF EXISTS] <name> [RESTRICT]`（TABLE-27、Issue #1713）がセッション経由の
+    /// 実行経路で成功したことを示す応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #1713）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コードはすべて更新済み。
+    DropSchema(ddl::DropSchemaOutcome),
     /// `ALTER SEQUENCE <name> ...`（`RENAME TO` を含む。TABLE-24・SQL-23、Issue #1689）が
     /// セッション経由の実行経路で成功したことを示す応答。
     ///

@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 73;
+    count = 76;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -248,6 +248,17 @@ define_error_classes! {
     /// 値・SEQUENCE 名・テナントは含めない固定文言。
     /// [`crate::sql::allowlist::SqlSurfaceError::SequenceGeneratorLimitExceeded`] の写像。
     SequenceGeneratorLimitExceeded => ("2200H", "SEQUENCE_GENERATOR_LIMIT_EXCEEDED"),
+    /// `CREATE SCHEMA` の名前が、同一テナント内の既存 SCHEMA または組み込み SCHEMA と衝突した
+    /// （`42P06`。TABLE-27・ERR-6、Issue #1713）。名前は利用者が書いたものだけを含める。
+    /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateSchema`] の写像。
+    DuplicateSchema => ("42P06", "DUPLICATE_SCHEMA"),
+    /// `DROP SCHEMA` の対象が、呼び出し元テナントに存在しない（`3F000`。TABLE-27・ERR-6、
+    /// Issue #1713）。他テナントにしか無い名前も同じ経路・同じ文言で返す（存在を秘匿する）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidSchemaName`] の写像。
+    InvalidSchemaName => ("3F000", "INVALID_SCHEMA_NAME"),
+    /// 予約名（`pg_` 接頭辞）の SCHEMA 作成を拒否した（`42939`。TABLE-27・ERR-6、Issue #1713）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::ReservedName`] の写像。
+    ReservedName => ("42939", "RESERVED_NAME"),
     /// `CREATE TABLE` が指定したテーブル名が既に存在する（`42P07`）。TABLE-4・
     /// TASK-85（Issue #899）が追加。上書きしない設計（既存スキーマは変更されない）。
     /// `CREATE VIEW`（TABLE-18・SQL-23・TASK-205、Issue #909）が既存のテーブル
