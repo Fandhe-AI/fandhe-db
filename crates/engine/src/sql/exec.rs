@@ -4413,6 +4413,11 @@ pub(crate) fn map_write_error(
         TenantWriteError::ReferentialActionLimitExceeded => {
             SqlSurfaceError::payload_too_large("referential action limit exceeded")
         }
+        // GIN 相当索引（INDEX-8、Issue #2207）の抽出上限超過。`_` 節（`XX000`）へ丸めず `54000` の
+        // 固定文言で返す（テナント・値・件数を含めない）。
+        TenantWriteError::GinIndexEntryLimitExceeded => {
+            SqlSurfaceError::payload_too_large("gin index entry limit exceeded")
+        }
         // 同じく commit 前 abort の内部事象版（型不整合等。untrusted 入力起因では
         // ないため `XX000`。`_` 節と同じ分類だが意図を明示する）。
         TenantWriteError::ReturningProjectionFailed(_) => SqlSurfaceError::Internal {
@@ -5713,6 +5718,9 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         // 丸めない。
         IncrementalError::Write(TenantWriteError::ReferentialActionLimitExceeded) => {
             SqlSurfaceError::payload_too_large("referential action limit exceeded")
+        }
+        IncrementalError::Write(TenantWriteError::GinIndexEntryLimitExceeded) => {
+            SqlSurfaceError::payload_too_large("gin index entry limit exceeded")
         }
         // ファイル形 INSERT の置換前走査が総走査行数上限（`--max-scanned-rows`。
         // Issue #1549）を超えた場合。述語形 DML と同じ固定文言の `54000` へ写像する

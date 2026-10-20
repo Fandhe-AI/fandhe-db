@@ -254,3 +254,87 @@ INDEX-8 ポインタ（関連: INDEX-7・TABLE-36・TABLE-37・ERR-6）。D2（�
 
 未知の演算子クラスの `42704`、`COLLATE` 付きの `0A000`、一時表での受理、SCHEMA 修飾下の物理名
 （索引名の内部キーが変わる PR とのマージ順で追随が要る）。
+
+## 8. Issue #2207 実装記録（キー抽出と DML 維持）
+
+INDEX-8 ポインタ（関連: INDEX-7・TABLE-12・TABLE-16・RLS-9・RLS-10・ERR-6）。D3・D4・D5／D6（格納側の抽出）・D7・D8 を
+実装した。読み取り側（プランナ接続・recheck・EXPLAIN）は #2208、crash テストと越境マトリクスは #2209 の担当で、本 Issue は
+索引を読まない（診断 API を除く）。実装は `crates/engine/src/gin_index.rs`・`gin_index/extract.rs`。
+
+### 8.1 物理形式（永続形式。`FORMAT_VERSION = 1`）
+
+テーブル `user_gin/{索引名}`、キー `(tenant_id, subkey)`、値 `&[u8]`。
+
+| 名前空間 | subkey | 値 |
+| -------- | ------ | -- |
+| マーカー | `[0x00]` | `[format_version: u32 BE][signature]` |
+| ポスティング | `[0x01][entry_len: u16 BE][entry][rowid: u64 BE]` | 空 |
+| 逆引き | `[0x02][rowid: u64 BE]` | `[count: u32 BE]` と `count` 個の `[len: u16 BE][entry]` |
+
+- D3 の `[0x01][entry][rowid]` に**エントリ長の接頭辞を足した**。接頭辞が無いとキー `"a"` の範囲走査にキー `"ab"` の
+  ポスティングが混ざる（プレフィックス自由でない）ため、#2208 の範囲走査が正しく動くよう形式に入れた。末尾の rowid は昇順で、
+  k-way マージ交差に使える。
+- `signature` は `[演算子クラス: u8][列名長: u8][列名][列型タグ: u8]`。D3 に従い列名を含めるため、`RENAME COLUMN` の後は
+  マーカーが不一致になり、各テナントの次の書き込みで遅延再構築される（読み取り側は再構築までは全走査へ倒れるので結果は変わらない）。
+- エントリ形式やハッシュを変えるときは `FORMAT_VERSION` を上げる（旧版のマーカーは取りこぼしなく無効化される）。
+
+### 8.2 抽出規則
+
+- `jsonb_ops`: キー `[0x01][UTF-8 キー]`、値 `[0x02][型タグ][payload]`。数値の payload は `json::scalar_equality_key`
+  （`@>` の等価判定と同じ値としての正規化。`1`・`1.0`・`10e-1` が同一、`-0` は `0`）。オブジェクトのキー（全階層）と配列の文字列要素を
+  キー、スカラー（全階層。配列の文字列要素を除く）を値とし、最上位の文字列スカラーだけキーと値の両方を出す（D5）。
+- `jsonb_path_ops`: 葉スカラーごとに `[0x03][FNV-1a 64 のハッシュ]`。入力はルートからのキー経路（各キーは長さ接頭辞付き）・
+  値の型タグ・値の長さ付き payload。配列は経路に段を足さない（透過。`jsonb_contains` の「配列 ⊇ スカラー」規則と整合）。
+  ハッシュは自作で依存を足さない（公開ベクタをユニットテストで固定）。空の容器はエントリを出さない（D6）。
+- 1 値の中の重複は除いてから数える。jsonb が NULL の行はエントリ 0 件で、逆引きも書かない。
+
+### 8.3 上限と `54000`（D7）
+
+- 既定上限は 1 値あたり 65,535 エントリ（重複除去後）・`jsonb_ops` の 1 エントリ 4,096 バイト。超過した時点で抽出を打ち切る。
+  書き込みは `TenantWriteError::GinIndexEntryLimitExceeded`（`54000`。固定文言でテナント・値・件数・索引名を含めない。commit しない）、
+  `CREATE INDEX` は `54000`（宣言も索引も残らない）。PG は長いキーをハッシュ化して受理するが、本実装は fail-closed 側で拒否する。
+- **CLI フラグ（`--max-gin-keys-per-value`・`--max-gin-key-bytes`）は本 Issue では入れない。** jsonpath 上限の thread-local
+  スコープ（`JsonPathLimitsScope`）は `execute_sql_in_txn`・`describe_*` にしか張られず、NoSQL・COPY・直接 API・一時コアの
+  書き込みは通らない。このため起動時の値が経路によって効いたり効かなかったりする。CLI は値を下げる方向にしか使えないので、
+  入れなくても安全性は落ちない。運搬方式（`Storage` のフィールドか、tenant 書き込み関数の明示引数か）は後続 Issue で決める。
+  抽出器と `CREATE INDEX` の走査は `GinLimits`（`Default` が既定値）を受け取るため、差し込み口は用意済み。
+
+### 8.4 初回構築と維持（D8）
+
+- `CREATE INDEX ... USING gin` は同じ write txn で全テナント・全可視性の行を 1 回だけストリーミング走査し、行ごとの抽出・上限検証・
+  ポスティング書き込みを行い、テナントごとにマーカーを書く。**ADR §3 D8 の推奨（上限検証のみ同期、構築は遅延）から変更して構築も同期にした**
+  （検証で抽出は済んでおり書き込みを足すだけで済む・書き込みの無いテナントでもすぐ索引を使える・テストが決定的になる）。
+  INDEX-7 の「行数非依存」との差（`CREATE INDEX` が行数に依存する）はこの変更でも変わらない。
+- 書き込みは `constraint::enforce_row_constraints_impl` が `enforce_unique_keys_with_decls` の後・ビューの `WITH CHECK OPTION` の前に
+  維持する（PG の検査順と同じ）。FK の参照アクションが子行を書き換える経路も同じ入口を通る。マーカーが無効なテナント
+  （新規・TRUNCATE 後・`RENAME COLUMN` 後・形式版更新後）は書き込み時に自テナントの行だけを再構築する。
+- 逆引きとの差分（旧 − 新を削除、新 − 旧を挿入）だけを書く。読み戻せない id は削除扱いで後片付けする。
+- 後片付け（衛生措置）: 削除系 3 経路（`delete_row_impl`・`apply_predicate_delete_in_txn`・`replace_typed_rows_by_text_key`）・
+  FK `ON DELETE CASCADE`。TRUNCATE は自テナントの範囲を空にしてマーカーを書き直す（空の索引として完全な状態）。
+  物理テーブルが無いときは作らない（`list_tables` で確かめる）。
+- 生書き込みのテスト専用 API は GIN 付きの表を拒否する（検査点を通らず D4 に反するため）。
+- DDL: `DROP INDEX`・`DROP TABLE [CASCADE]`・`DROP COLUMN` は #2206 の掃除経路で物理テーブルを消す。`RENAME TABLE`・
+  `SET SCHEMA` は物理名が索引名由来でシグネチャに表名を含めないため移動不要。他の列の追加・削除・型変更は rowid と jsonb の値を
+  変えないので索引は有効のまま。
+
+### 8.5 診断 API
+
+`EngineCore::verify_gin_index_read_only(ctx, index_name) -> GinIndexAudit { marker_valid, missing, stale }` は自テナントの
+範囲だけを読み取り専用で全行抽出と突き合わせる（再構築も書き込みもしない）。受け入れ条件は「どの DML の後でも
+`marker_valid && missing == 0`、後片付けのある経路では `stale == 0`」。#2209 の crash オラクルもこの API を使える。
+
+### 8.6 要確認（自動運転下の判断で、人間の確認が要る事項）
+
+- 既定上限（65,535 エントリ・4,096 バイト）。
+- 初回構築を同期にしたこと（D8 の推奨からの変更）。
+- シグネチャに列名を含めたことで、`RENAME COLUMN` の後に遅延再構築になること。
+- 長いキーをハッシュせず拒否すること（PG との差）。
+- SCHEMA 修飾下の物理名: 索引名の内部キーが変わる PR とのマージ順で追随が要る（物理名は `delete_gin_index_table_in_txn` と
+  同じ出どころから作ること）。
+
+### 8.7 #2208 への申し送り
+
+- 問い合わせ側の抽出は `gin_index::extract`（`pub(crate)`）を使い、書き込みと同じ規則・同じ数値正規化にする。
+- ポスティングの範囲走査は `[0x01][entry_len][entry]` を接頭辞にする。マーカー判定は `gin_index::marker_matches` 相当
+  （形式版とシグネチャの完全一致）を読み取り専用で行い、不一致のテナントは行範囲の全走査へ倒す。
+- 候補は行を読み戻して可視性・TABLE-12 整合・元の述語の再評価（recheck）を通す（stale・ハッシュ衝突はここで除かれる）。

@@ -10732,6 +10732,33 @@ impl EngineCore {
         crate::constraint::verify_unique_index_read_only(read_txn, table, &schema, ctx.tenant_id())
     }
 
+    /// GIN 相当索引 `index_name`（INDEX-8、Issue #2207）の自テナントの索引内容を、**書き込みを一切行わずに**
+    /// 全行走査の抽出結果と突き合わせて検証する診断 API。マーカーの一致・欠落ポスティング数（不変条件違反）・
+    /// stale 数（衛生指標）を返す。再構築・遅延バックフィルは行わない（欠落を静かに直さず検出するため）。
+    /// 索引が無い・GIN 索引でない場合は `Err`。他テナントの範囲は読まない。
+    pub fn verify_gin_index_read_only(
+        &self,
+        ctx: &PolicyContext,
+        index_name: &str,
+    ) -> Result<crate::catalog::GinIndexAudit, crate::tenant::TenantWriteError> {
+        let snapshot = self.storage.begin_read()?;
+        let read_txn = snapshot.raw_txn();
+        let Some((table, decl)) = crate::catalog::gin_decl_in_read_txn(read_txn, index_name)?
+        else {
+            return Err(crate::tenant::TenantWriteError::Catalog(
+                crate::catalog::CatalogError::IndexNotFound(index_name.to_string()),
+            ));
+        };
+        let schema = crate::catalog::get_table_schema_in_txn(read_txn, &table)?;
+        crate::constraint::verify_gin_index_read_only(
+            read_txn,
+            &table,
+            &schema,
+            ctx.tenant_id(),
+            &decl,
+        )
+    }
+
     /// `table` に `op_id` が台帳記録済みかを照会する（TASK-93、対象ビヘイビア:
     /// RECOVER-2）。`crate::tenant::operation_recorded` への薄い委譲のみ。
     ///
