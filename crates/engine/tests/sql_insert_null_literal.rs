@@ -39,7 +39,7 @@ fn setup(label: &str) -> (EngineCore, std::path::PathBuf, SessionState) {
     core.execute_sql_in_session(
         &ctx(),
         &mut session,
-        "CREATE TABLE docs (embedding VECTOR(4), note TEXT, req TEXT NOT NULL, \
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(4), note TEXT, req TEXT NOT NULL, \
          u TEXT UNIQUE, d TEXT DEFAULT 'x')",
     )
     .expect("create table");
@@ -121,7 +121,7 @@ fn explicit_null_into_declared_primary_key_column_is_23502() {
     core.execute_sql_in_session(
         &ctx(),
         &mut session,
-        "CREATE TABLE docs (embedding VECTOR(4), k TEXT PRIMARY KEY)",
+        "CREATE TABLE docs (id BIGINT NOT NULL UNIQUE, embedding VECTOR(4), k TEXT PRIMARY KEY)",
     )
     .expect("create pk table");
     let err = core

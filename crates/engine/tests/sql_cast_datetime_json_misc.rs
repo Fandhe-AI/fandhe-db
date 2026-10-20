@@ -55,7 +55,7 @@ fn select_as(core: &EngineCore, tenant: &str, sql: &str) -> Result<QueryResult, 
     core.execute_sql(&ctx(tenant), &sql)
 }
 
-const CREATE: &str = "CREATE TABLE c (embedding VECTOR(2) NOT NULL, s2 SMALLINT, i4 INTEGER, \
+const CREATE: &str = "CREATE TABLE c (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, s2 SMALLINT, i4 INTEGER, \
     i8 BIGINT, r REAL, d DOUBLE PRECISION, n NUMERIC(10,3), b BOOLEAN, dt DATE, tm TIME, \
     ts TIMESTAMP, tz TIMESTAMPTZ, iv INTERVAL, js JSON, jb JSONB, uu UUID, bt BYTEA, \
     ai INTEGER[], at TEXT[], tx TEXT, jn JSONB)";
@@ -1166,7 +1166,7 @@ fn enum_element_arrays_can_only_be_rendered_as_text() {
     ok(
         &core,
         "alice",
-        "CREATE TABLE e (embedding VECTOR(2) NOT NULL, m mood[])",
+        "CREATE TABLE e (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, m mood[])",
     );
     ok(
         &core,

@@ -89,7 +89,7 @@ fn wire_create_table_succeeds_for_ddl_principal() {
 
     send_simple_query(
         &mut stream,
-        "CREATE TABLE docs (embedding VECTOR(3), body TEXT)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(3), body TEXT)",
     );
     let tag = read_command_complete(&mut stream);
     assert_eq!(tag, "CREATE TABLE");
@@ -104,11 +104,17 @@ fn wire_create_table_duplicate_name_is_rejected() {
     let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
     let mut stream = connect_as(addr, "alice", "pw-alice");
 
-    send_simple_query(&mut stream, "CREATE TABLE docs (body TEXT)");
+    send_simple_query(
+        &mut stream,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, body TEXT)",
+    );
     assert_eq!(read_command_complete(&mut stream), "CREATE TABLE");
     read_ready_for_query(&mut stream);
 
-    send_simple_query(&mut stream, "CREATE TABLE docs (a TEXT, b TEXT)");
+    send_simple_query(
+        &mut stream,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, a TEXT, b TEXT)",
+    );
     expect_error_response_with_sqlstate(&mut stream, "42P07");
     read_ready_for_query(&mut stream);
 }
@@ -125,7 +131,10 @@ fn wire_create_table_rejects_non_principal_user() {
     let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
     let mut stream = connect_as(addr, "bob", "pw-bob");
 
-    send_simple_query(&mut stream, "CREATE TABLE docs (body TEXT)");
+    send_simple_query(
+        &mut stream,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, body TEXT)",
+    );
     expect_error_response_with_sqlstate(&mut stream, "42501");
     read_ready_for_query(&mut stream);
 }
@@ -139,7 +148,10 @@ fn wire_create_table_rejects_everyone_when_ddl_allowed_users_unset() {
     let addr = spawn_with_ddl_allowed_users(&users_path, core, &[]);
     let mut stream = connect_as(addr, "alice", "pw-alice");
 
-    send_simple_query(&mut stream, "CREATE TABLE docs (body TEXT)");
+    send_simple_query(
+        &mut stream,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, body TEXT)",
+    );
     expect_error_response_with_sqlstate(&mut stream, "42501");
     read_ready_for_query(&mut stream);
 }
@@ -161,7 +173,10 @@ fn wire_create_table_rejects_non_principal_user_even_for_malformed_syntax() {
     let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
     let mut stream = connect_as(addr, "bob", "pw-bob");
 
-    send_simple_query(&mut stream, "CREATE TABLE docs ((()) not a schema");
+    send_simple_query(
+        &mut stream,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, (()) not a schema",
+    );
     expect_error_response_with_sqlstate(&mut stream, "42601");
     read_ready_for_query(&mut stream);
 }
@@ -178,7 +193,7 @@ fn wire_create_table_then_insert_and_select_same_session() {
 
     send_simple_query(
         &mut stream,
-        "CREATE TABLE docs (embedding VECTOR(2), body TEXT)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(2), body TEXT)",
     );
     assert_eq!(read_command_complete(&mut stream), "CREATE TABLE");
     read_ready_for_query(&mut stream);
@@ -194,4 +209,36 @@ fn wire_create_table_then_insert_and_select_same_session() {
     let _cols = read_row_description(&mut stream);
     let row = read_data_row(&mut stream);
     assert_eq!(row, vec![Some("hello".to_string())]);
+}
+
+/// 暗黙の `id` を持たない新しい表（TABLE-23・Issue #2199）: PG と同じく `SELECT *` の
+/// RowDescription は宣言した列だけを返し、`id` を省いた INSERT が通る。宣言の無い `id` は `42703`。
+#[test]
+fn wire_select_star_on_a_table_without_id_lists_declared_columns_only() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    send_simple_query(&mut stream, "CREATE TABLE notes (title TEXT, n INTEGER)");
+    assert_eq!(read_command_complete(&mut stream), "CREATE TABLE");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO notes (title, n) VALUES ('a', 1) USING OPERATION_ID 'wire-noid-1'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT * FROM notes LIMIT 10");
+    assert_eq!(read_row_description(&mut stream), vec!["title", "n"]);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row.len(), 2);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT id FROM notes LIMIT 10");
+    expect_error_response_with_sqlstate(&mut stream, "42703");
+    read_ready_for_query(&mut stream);
 }

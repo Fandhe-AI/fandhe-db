@@ -31,6 +31,12 @@ use engine::storage::{Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 fn new_core(label: &str) -> (EngineCore, std::path::PathBuf) {
@@ -56,7 +62,7 @@ fn granted_session() -> SessionState {
 fn select_count(core: &EngineCore, alice: &PolicyContext, sql: &str) -> usize {
     let mut session = SessionState::default();
     match core
-        .execute_sql_in_session(alice, &mut session, sql)
+        .execute_sql_in_session_legacy(alice, &mut session, sql)
         .expect("SELECT should succeed")
     {
         SqlOutcome::Query(result) => result.rows.len(),
@@ -73,7 +79,7 @@ fn create_table_with_column_level_check_persists_and_survives_reopen() {
     let alice = ctx("alice");
     let mut session = granted_session();
 
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'))",
@@ -114,7 +120,7 @@ fn check_with_negative_literal_survives_reopen() {
     let alice = ctx("alice");
     let mut session = granted_session();
 
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (n INTEGER, CHECK (n > -1), CHECK (n - -1 > 0))",
@@ -146,7 +152,7 @@ fn create_table_rejects_check_referencing_unknown_column() {
     let mut session = granted_session();
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (body TEXT, CHECK (missing = 'x'))",
@@ -163,7 +169,7 @@ fn create_table_rejects_check_calling_visible() {
     let mut session = granted_session();
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (body TEXT, CHECK (visible()))",
@@ -190,7 +196,7 @@ fn create_table_rejects_not_group_and_numeric_in_between_in_check() {
         "n BETWEEN 1 AND 3",
     ] {
         let err = core
-            .execute_sql_in_session(
+            .execute_sql_in_session_legacy(
                 &alice,
                 &mut session,
                 &format!("CREATE TABLE docs (kind TEXT, n INTEGER, CHECK ({cond}))"),
@@ -208,7 +214,7 @@ fn insert_violating_check_is_rejected_with_no_side_effects() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (kind TEXT CONSTRAINT kind_ck CHECK (kind = 'a'))",
@@ -258,7 +264,7 @@ fn insert_satisfying_check_succeeds() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'))",
@@ -283,7 +289,7 @@ fn insert_violating_like_general_form_check_is_rejected_with_23514() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (path TEXT CONSTRAINT path_ck CHECK (path LIKE '%.rs'))",
@@ -313,7 +319,7 @@ fn insert_null_column_is_treated_as_unknown_not_violation() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'), body TEXT)",
@@ -336,7 +342,7 @@ fn multi_row_insert_rejects_whole_batch_when_any_row_violates() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'))",
@@ -367,7 +373,7 @@ fn upsert_do_update_violating_check_is_rejected() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'))",
@@ -406,7 +412,7 @@ fn upsert_do_nothing_does_not_evaluate_check() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'))",
@@ -435,7 +441,7 @@ fn upsert_new_insert_branch_violating_check_is_rejected() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'))",
@@ -465,7 +471,7 @@ fn single_row_update_violating_check_is_rejected_with_no_side_effects() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'))",
@@ -478,7 +484,7 @@ fn single_row_update_violating_check_is_rejected_with_no_side_effects() {
     .expect("seed row");
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut SessionState::default(),
             "UPDATE docs SET kind = 'b' WHERE id = 1 USING OPERATION_ID 'op-upd'",
@@ -504,7 +510,7 @@ fn predicate_update_rejects_whole_statement_when_any_matched_row_violates() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (kind TEXT, status TEXT CHECK (status = 'ok'))",
@@ -520,7 +526,7 @@ fn predicate_update_rejects_whole_statement_when_any_matched_row_violates() {
     // `kind = 'x'` は 2 行に一致し、`status` を `'bad'` にする SET はいずれの
     // 一致行も違反させる。
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut SessionState::default(),
             "UPDATE docs SET status = 'bad' WHERE kind = 'x' USING OPERATION_ID 'op-upd'",
@@ -547,7 +553,7 @@ fn drop_column_referenced_by_check_is_rejected() {
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'), body TEXT)",
@@ -592,7 +598,7 @@ fn new_file_core_with_check(label: &str, check_sql: &str) -> (EngineCore, std::p
         });
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         &format!("CREATE TABLE docs (embedding VECTOR(16), path TEXT {check_sql}, body TEXT)"),
@@ -683,7 +689,7 @@ fn explicit_transaction_insert_violating_check_is_rejected() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut ddl = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut ddl,
         "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'))",
@@ -743,7 +749,7 @@ fn copy_from_stdin_violating_check_rejects_whole_batch() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut ddl = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut ddl,
         "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'))",
@@ -783,7 +789,7 @@ fn raw_row_input_api_is_checked() {
         let storage = Storage::open(&path).expect("open storage");
         let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
         let mut ddl = granted_session();
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &ctx("alice"),
             &mut ddl,
             "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'))",
@@ -827,7 +833,7 @@ fn check_is_evaluated_before_unique() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut ddl = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut ddl,
         "CREATE TABLE docs (kind TEXT UNIQUE CHECK (kind LIKE 'a%'))",
@@ -868,12 +874,12 @@ fn create_table_rejects_ambiguous_constraint_column_without_creating_table() {
         "CREATE TABLE docs (check TEXT, body TEXT)",
     ] {
         let err = core
-            .execute_sql_in_session(&alice, &mut ddl, sql)
+            .execute_sql_in_session_legacy(&alice, &mut ddl, sql)
             .expect_err("ambiguous definition must be rejected");
         assert_eq!(err.wire_code(), "42601", "{sql}");
     }
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut SessionState::default(),
             "SELECT id FROM docs LIMIT 1",
@@ -898,7 +904,7 @@ fn drop_column_rejected_by_check_keeps_index_declarations() {
         "CREATE INDEX docs_kind_idx ON docs (kind)",
         "CREATE INDEX docs_body_idx ON docs (body)",
     ] {
-        core.execute_sql_in_session(&alice, &mut session, sql)
+        core.execute_sql_in_session_legacy(&alice, &mut session, sql)
             .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     }
     drop(core);
@@ -954,7 +960,7 @@ fn create_table_with_integer_column_check_persists_and_survives_reopen() {
     let alice = ctx("alice");
     let mut session = granted_session();
 
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (qty INTEGER CONSTRAINT qty_ck CHECK (qty > 0))",
@@ -999,7 +1005,7 @@ fn multi_row_insert_rejects_batch_with_numeric_check_violation() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (qty INTEGER CHECK (qty > 0))",
@@ -1029,7 +1035,7 @@ fn insert_with_null_numeric_column_passes_check() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (qty INTEGER CHECK (qty > 0))",
@@ -1052,7 +1058,7 @@ fn single_row_update_violating_numeric_check_is_rejected() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (qty INTEGER CHECK (qty > 0))",
@@ -1065,7 +1071,7 @@ fn single_row_update_violating_numeric_check_is_rejected() {
     .expect("seed row");
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut SessionState::default(),
             "UPDATE docs SET qty = -1 WHERE id = 1 USING OPERATION_ID 'op-upd'",
@@ -1093,7 +1099,7 @@ fn insert_triggering_division_by_zero_in_check_returns_same_sqlstate_as_normal_e
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (qty INTEGER CHECK (100 / qty > 1))",
@@ -1123,7 +1129,7 @@ fn update_triggering_division_by_zero_in_check_returns_same_sqlstate_as_normal_e
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (qty INTEGER CHECK (100 / qty > 1))",
@@ -1136,7 +1142,7 @@ fn update_triggering_division_by_zero_in_check_returns_same_sqlstate_as_normal_e
     .expect("seed row");
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut SessionState::default(),
             "UPDATE docs SET qty = 0 WHERE id = 1 USING OPERATION_ID 'op-upd'",
@@ -1161,7 +1167,7 @@ fn upsert_do_update_triggering_division_by_zero_in_check_returns_same_sqlstate_a
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (qty INTEGER CHECK (100 / qty > 1))",
@@ -1198,7 +1204,7 @@ fn drop_column_referenced_by_numeric_check_is_rejected() {
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (qty INTEGER CHECK (qty > 0), body TEXT)",
@@ -1229,7 +1235,7 @@ fn widen_numeric_precision_on_check_referenced_integer_column_is_incompatible() 
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (qty INTEGER CHECK (qty > 0))",
@@ -1255,7 +1261,7 @@ fn multi_column_integer_bigint_table_check_enforces_and_records_both_columns() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (qty INTEGER CHECK (qty > 0), lim BIGINT, CONSTRAINT c CHECK (qty <= lim))",
@@ -1292,10 +1298,10 @@ fn select_where_numeric_column_expression_is_accepted() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (qty INTEGER)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (qty INTEGER)")
         .expect("create table");
 
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut SessionState::default(),
         "SELECT id FROM docs WHERE qty > 0 LIMIT 100",

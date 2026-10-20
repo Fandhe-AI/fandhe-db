@@ -97,7 +97,7 @@ fn widening_check_column_is_accepted_and_check_still_enforced() {
     ok(
         &core,
         &alice,
-        "CREATE TABLE t (qty INTEGER CONSTRAINT qty_pos CHECK (qty > 0), note TEXT)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INTEGER CONSTRAINT qty_pos CHECK (qty > 0), note TEXT)",
     );
     ok(
         &core,
@@ -151,7 +151,7 @@ fn expression_evaluation_error_code_is_unchanged_by_widening() {
     ok(
         &core,
         &o,
-        "CREATE TABLE t (qty INTEGER CHECK (10 / (qty - 5) > 0))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INTEGER CHECK (10 / (qty - 5) > 0))",
     );
     ok(
         &core,
@@ -175,7 +175,7 @@ fn table_check_over_multiple_columns_survives_widening() {
     ok(
         &core,
         &o,
-        "CREATE TABLE t (a INTEGER, b BIGINT, CONSTRAINT ab CHECK (a < b))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a INTEGER, b BIGINT, CONSTRAINT ab CHECK (a < b))",
     );
     ok(
         &core,
@@ -204,7 +204,11 @@ fn real_to_double_keeps_check_outcome() {
     let (core, path) = new_core("ackc-real");
     let _g = CleanupGuard(path);
     let o = ctx("owner");
-    ok(&core, &o, "CREATE TABLE t (note TEXT)");
+    ok(
+        &core,
+        &o,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, note TEXT)",
+    );
     ok(&core, &o, "ALTER TABLE t ADD COLUMN r REAL");
     ok(
         &core,
@@ -245,7 +249,7 @@ fn non_widening_on_check_column_is_42804_and_changes_nothing() {
     ok(
         &core,
         &o,
-        "CREATE TABLE t (a INTEGER CHECK (a > 0), b BIGINT CHECK (b > 0))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a INTEGER CHECK (a > 0), b BIGINT CHECK (b > 0))",
     );
     ok(
         &core,
@@ -303,7 +307,7 @@ fn widening_persists_and_works_with_primary_key() {
     ok(
         &core,
         &o,
-        "CREATE TABLE t (code INTEGER PRIMARY KEY CHECK (code > 0))",
+        "CREATE TABLE t (id BIGINT NOT NULL UNIQUE, code INTEGER PRIMARY KEY CHECK (code > 0))",
     );
     ok(
         &core,

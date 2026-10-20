@@ -24,6 +24,12 @@ use engine::storage::{Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 const DIM: u32 = 128;
@@ -733,7 +739,7 @@ fn new_core_with_unique_table(path: &std::path::Path, table_sql: &str) -> Engine
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = engine::sql::mode::SessionState::default();
     session.allow_ddl();
-    core.execute_sql_in_session(&ctx, &mut session, table_sql)
+    core.execute_sql_in_session_legacy(&ctx, &mut session, table_sql)
         .expect("create table with UNIQUE constraint should succeed");
     core
 }

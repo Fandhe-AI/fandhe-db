@@ -464,7 +464,7 @@ fn dml_fixture(label: &str) -> (std::path::PathBuf, CleanupGuard, EngineCore, Se
     run(
         &core,
         &mut session,
-        "CREATE TABLE xt (n INTEGER, code TEXT)",
+        "CREATE TABLE xt (id BIGINT PRIMARY KEY, n INTEGER, code TEXT)",
     )
     .expect("create table");
     run(&core, &mut session, "CREATE INDEX xt_div ON xt ((100 / n))").expect("create index");
@@ -634,7 +634,7 @@ fn create_index_validates_existing_rows_across_tenants() {
     run(
         &core,
         &mut session,
-        "CREATE TABLE xt (n INTEGER, code TEXT)",
+        "CREATE TABLE xt (id BIGINT PRIMARY KEY, n INTEGER, code TEXT)",
     )
     .expect("create table");
     core.execute_sql_in_session(

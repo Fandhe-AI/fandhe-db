@@ -43,6 +43,12 @@
 
 #[path = "common/mod.rs"]
 mod common;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// NoSQL 表層は従来方式の表だけを扱うため、このテストの `CREATE TABLE` は従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../../engine/src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 #[path = "http_common/mod.rs"]
 mod http_common;
 use http_common::temp_db;
@@ -164,7 +170,7 @@ fn new_core_with_foreign_key() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
         "CREATE TABLE fk_parent (embedding VECTOR(2))",
         "CREATE TABLE fk_child (embedding VECTOR(2), parent_id BIGINT REFERENCES fk_parent)",
     ] {
-        core.execute_sql_in_session(&ctx, &mut session, ddl)
+        core.execute_sql_in_session_legacy(&ctx, &mut session, ddl)
             .expect("fk fixture DDL must succeed");
     }
     (Arc::new(core), guard)
@@ -186,7 +192,7 @@ fn new_core_with_check_constraint() -> (Arc<EngineCore>, temp_db::CleanupGuard) 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant ctx");
     let mut session = engine::sql::mode::SessionState::default();
     session.allow_ddl();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &ctx,
         &mut session,
         "CREATE TABLE checked (qty INTEGER CHECK (100 / qty > 1))",
@@ -204,9 +210,9 @@ fn new_core_with_expression_index() -> (Arc<EngineCore>, temp_db::CleanupGuard) 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant ctx");
     let mut session = engine::sql::mode::SessionState::default();
     session.allow_ddl();
-    core.execute_sql_in_session(&ctx, &mut session, "CREATE TABLE xidx (qty INTEGER)")
+    core.execute_sql_in_session_legacy(&ctx, &mut session, "CREATE TABLE xidx (qty INTEGER)")
         .expect("table DDL must succeed");
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &ctx,
         &mut session,
         "CREATE INDEX xidx_div ON xidx ((100 / qty))",

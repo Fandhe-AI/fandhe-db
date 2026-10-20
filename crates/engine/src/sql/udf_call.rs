@@ -4042,7 +4042,7 @@ pub(super) fn bind_expr_any(
                     ))),
                 };
             }
-            if name == "id" {
+            if name == "id" && schema.has_pseudo_id() {
                 return Ok((BoundExpr::IdRef, ExprType::Scalar));
             }
             Err(SqlSurfaceError::undefined_column(name))

@@ -88,7 +88,7 @@ fn setup(label: &str) -> (EngineCore, std::path::PathBuf, SessionState) {
     ok(
         &core,
         &mut session,
-        "CREATE TABLE docs (a TEXT NOT NULL, b TEXT)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, a TEXT NOT NULL, b TEXT)",
     );
     (core, path, session)
 }
@@ -161,12 +161,12 @@ fn rejects_primary_key_columns() {
     ok(
         &core,
         &mut session,
-        "CREATE TABLE pk1 (k TEXT PRIMARY KEY, v TEXT)",
+        "CREATE TABLE pk1 (id BIGINT NOT NULL UNIQUE, k TEXT PRIMARY KEY, v TEXT)",
     );
     ok(
         &core,
         &mut session,
-        "CREATE TABLE pk2 (x TEXT, y TEXT, PRIMARY KEY (x, y))",
+        "CREATE TABLE pk2 (id BIGINT NOT NULL UNIQUE, x TEXT, y TEXT, PRIMARY KEY (x, y))",
     );
     for (sql, col) in [
         ("ALTER TABLE pk1 ALTER COLUMN k DROP NOT NULL", "k"),
@@ -190,7 +190,11 @@ fn rejects_primary_key_columns() {
 fn succeeds_after_primary_key_dropped() {
     let (core, path, mut session) = setup("drop-nn-after-pk");
     let _guard = CleanupGuard(path.clone());
-    ok(&core, &mut session, "CREATE TABLE pk1 (k TEXT PRIMARY KEY)");
+    ok(
+        &core,
+        &mut session,
+        "CREATE TABLE pk1 (id BIGINT NOT NULL UNIQUE, k TEXT PRIMARY KEY)",
+    );
     ok(
         &core,
         &mut session,
@@ -235,7 +239,11 @@ fn existence_and_reserved_column_errors() {
 fn rejects_vector_column() {
     let (core, path, mut session) = setup("drop-nn-vector");
     let _guard = CleanupGuard(path.clone());
-    ok(&core, &mut session, "CREATE TABLE vt (embedding VECTOR(3))");
+    ok(
+        &core,
+        &mut session,
+        "CREATE TABLE vt (id BIGINT PRIMARY KEY, embedding VECTOR(3))",
+    );
     assert_eq!(
         code(
             &core,
@@ -272,12 +280,12 @@ fn foreign_key_interaction() {
     ok(
         &core,
         &mut session,
-        "CREATE TABLE p (k TEXT NOT NULL UNIQUE)",
+        "CREATE TABLE p (id BIGINT PRIMARY KEY, k TEXT NOT NULL UNIQUE)",
     );
     ok(
         &core,
         &mut session,
-        "CREATE TABLE c (pk TEXT NOT NULL REFERENCES p (k) ON UPDATE CASCADE)",
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, pk TEXT NOT NULL REFERENCES p (k) ON UPDATE CASCADE)",
     );
     assert_eq!(
         code(
@@ -291,12 +299,12 @@ fn foreign_key_interaction() {
     ok(
         &core,
         &mut session,
-        "CREATE TABLE p2 (k TEXT NOT NULL UNIQUE)",
+        "CREATE TABLE p2 (id BIGINT PRIMARY KEY, k TEXT NOT NULL UNIQUE)",
     );
     ok(
         &core,
         &mut session,
-        "CREATE TABLE c2 (pk TEXT REFERENCES p2 (k) ON UPDATE CASCADE)",
+        "CREATE TABLE c2 (id BIGINT PRIMARY KEY, pk TEXT REFERENCES p2 (k) ON UPDATE CASCADE)",
     );
     ok(
         &core,
@@ -304,11 +312,15 @@ fn foreign_key_interaction() {
         "ALTER TABLE p2 ALTER COLUMN k DROP NOT NULL",
     );
 
-    ok(&core, &mut session, "CREATE TABLE p3 (k TEXT UNIQUE)");
     ok(
         &core,
         &mut session,
-        "CREATE TABLE c3 (r TEXT NOT NULL, FOREIGN KEY (r) REFERENCES p3 (k))",
+        "CREATE TABLE p3 (id BIGINT PRIMARY KEY, k TEXT UNIQUE)",
+    );
+    ok(
+        &core,
+        &mut session,
+        "CREATE TABLE c3 (id BIGINT PRIMARY KEY, r TEXT NOT NULL, FOREIGN KEY (r) REFERENCES p3 (k))",
     );
     ok(
         &core,

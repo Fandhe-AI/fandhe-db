@@ -435,8 +435,8 @@ fn write_contexts_accept_time_functions_and_keep_rejecting_unsupported_forms() {
     .expect("delete with now() in txn");
     // CHECK・VIEW 本文は 42601（SQL-37・TABLE-16・TABLE-18）。
     for sql in [
-        "CREATE TABLE t3 (embedding VECTOR(2), n TIMESTAMP, CHECK (n < now()))",
-        "CREATE TABLE t4 (embedding VECTOR(2), n TIMESTAMP, CHECK (n < CURRENT_TIMESTAMP))",
+        "CREATE TABLE t3 (id BIGINT PRIMARY KEY, embedding VECTOR(2), n TIMESTAMP, CHECK (n < now()))",
+        "CREATE TABLE t4 (id BIGINT PRIMARY KEY, embedding VECTOR(2), n TIMESTAMP, CHECK (n < CURRENT_TIMESTAMP))",
         "CREATE VIEW v1 AS SELECT id, now() FROM events LIMIT 10",
     ] {
         assert_eq!(ddl_code(&core, sql), "42601", "{sql}");
@@ -452,7 +452,7 @@ fn quoted_keyword_identifiers_stay_column_references() {
     core.execute_sql_in_session(
         &ctx,
         &mut session,
-        "CREATE TABLE q (embedding VECTOR(2), \"current_date\" TEXT)",
+        "CREATE TABLE q (id BIGINT PRIMARY KEY, embedding VECTOR(2), \"current_date\" TEXT)",
     )
     .expect("create table with a quoted keyword column");
     core.execute_sql_in_session(

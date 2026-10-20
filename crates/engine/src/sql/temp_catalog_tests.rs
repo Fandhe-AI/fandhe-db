@@ -226,8 +226,8 @@ fn setup_persistent(core: &EngineCore) {
     let mut s = SessionState::default();
     s.allow_ddl();
     for sql in [
-        "CREATE TABLE t (embedding VECTOR(2), a TEXT)",
-        "CREATE TABLE u (embedding VECTOR(2), a TEXT)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, embedding VECTOR(2), a TEXT)",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, embedding VECTOR(2), a TEXT)",
         "INSERT INTO t (id, embedding, a) VALUES (1, '[0.1,0.2]', 'p') USING OPERATION_ID 'op-1'",
     ] {
         run(core, &mut s, "tenant-a", sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -250,7 +250,13 @@ fn session_with_temp_t() -> SessionState {
 /// 実体（一時 DB のテーブル）も作った一時表 `t(a TEXT)` を持つセッション。
 fn session_with_real_temp_t(core: &EngineCore) -> SessionState {
     let mut s = SessionState::default();
-    run(core, &mut s, "tenant-a", "CREATE TEMP TABLE t (a TEXT)").expect("create temp t");
+    run(
+        core,
+        &mut s,
+        "tenant-a",
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, a TEXT)",
+    )
+    .expect("create temp t");
     s
 }
 
@@ -423,7 +429,7 @@ fn table_44_quoted_null_temp_name_never_touches_the_persistent_table() {
     }
     // COPY も一時表だけを対象にする（一時 DB に無い表を指す文は拒否される）。
     let plan = core
-        .begin_copy(&ctx("tenant-a"), &a, "COPY \"NULL\" (id, a) FROM STDIN")
+        .begin_copy(&ctx("tenant-a"), &a, "COPY \"NULL\" (a) FROM STDIN")
         .expect("copy plan on the temp table");
     assert!(matches!(plan, crate::core::CopyPlan::From(_)));
     // `DROP TABLE "NULL"` は一時表だけを消し、永続表は無傷（TABLE-44・Issue #1683）。

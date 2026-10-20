@@ -21,6 +21,12 @@ use engine::storage::{Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 fn open_core(path: &std::path::Path) -> EngineCore {
@@ -43,7 +49,7 @@ fn ddl_session() -> SessionState {
 /// `d` は `CURRENT_DATE`。
 fn create_events(core: &EngineCore) {
     let mut session = ddl_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &ctx_for("tenant-a"),
         &mut session,
         "CREATE TABLE events (embedding VECTOR(2), lang TEXT, \
@@ -55,7 +61,7 @@ fn create_events(core: &EngineCore) {
 
 fn exec(core: &EngineCore, tenant: &str, sql: &str) -> Result<SqlOutcome, String> {
     let mut session = SessionState::default();
-    core.execute_sql_in_session(&ctx_for(tenant), &mut session, sql)
+    core.execute_sql_in_session_legacy(&ctx_for(tenant), &mut session, sql)
         .map_err(|e| e.wire_code().to_string())
 }
 
@@ -109,7 +115,7 @@ fn unsupported_or_mismatched_time_defaults_are_rejected() {
     let core = open_core(&path);
     let mut session = ddl_session();
     let mut ddl = |sql: &str| -> String {
-        core.execute_sql_in_session(&ctx_for("tenant-a"), &mut session, sql)
+        core.execute_sql_in_session_legacy(&ctx_for("tenant-a"), &mut session, sql)
             .expect_err(sql)
             .wire_code()
             .to_string()
@@ -167,7 +173,7 @@ fn add_column_and_set_default_fk_with_time_default_are_rejected() {
     let mut session = ddl_session();
     let ctx = ctx_for("tenant-a");
     let mut ddl = |sql: &str| -> Result<(), String> {
-        core.execute_sql_in_session(&ctx, &mut session, sql)
+        core.execute_sql_in_session_legacy(&ctx, &mut session, sql)
             .map(|_| ())
             .map_err(|e| e.wire_code().to_string())
     };
@@ -424,7 +430,7 @@ fn copy_from_applies_defaults_with_one_time_and_deduplicates_resends() {
 
 fn create_docs(core: &EngineCore) {
     let mut session = ddl_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &ctx_for("tenant-a"),
         &mut session,
         "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE, at TIMESTAMP)",
@@ -575,7 +581,7 @@ fn file_insert_with_omitted_time_default_column_is_rejected_without_side_effects
     let _g = CleanupGuard(path.clone());
     let core = open_core(&path);
     let mut session = ddl_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &ctx_for("tenant-a"),
         &mut session,
         "CREATE TABLE notes (embedding VECTOR(2), path TEXT, body TEXT, \
@@ -610,7 +616,7 @@ fn partitioned_delete_where_time_is_fixed_at_job_start_across_resume() {
         "CREATE TABLE evs (embedding VECTOR(2), n BIGINT, at TIMESTAMP DEFAULT now())",
         "CREATE TABLE kids (embedding VECTOR(2), parent_id BIGINT REFERENCES evs)",
     ] {
-        core.execute_sql_in_session(&ctx_for("tenant-a"), &mut session, ddl)
+        core.execute_sql_in_session_legacy(&ctx_for("tenant-a"), &mut session, ddl)
             .expect(ddl);
     }
     exec(

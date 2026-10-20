@@ -85,12 +85,12 @@ fn named_unique_table_and_column_forms_are_enforced_and_droppable_by_name() {
     for (label, ddl, default_name) in [
         (
             "create-named-unique-table",
-            "CREATE TABLE docs (a TEXT, CONSTRAINT u_docs UNIQUE (a))",
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, a TEXT, CONSTRAINT u_docs UNIQUE (a))",
             "docs_a_key",
         ),
         (
             "create-named-unique-column",
-            "CREATE TABLE docs (a TEXT CONSTRAINT u_docs UNIQUE)",
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, a TEXT CONSTRAINT u_docs UNIQUE)",
             "docs_a_key",
         ),
     ] {
@@ -137,11 +137,15 @@ fn named_unique_table_and_column_forms_are_enforced_and_droppable_by_name() {
 fn named_column_references_is_enforced_and_droppable_by_name() {
     let (core, path, mut session) = setup("create-named-fk-column");
     let _guard = CleanupGuard(path);
-    run(&core, &mut session, "CREATE TABLE p (k TEXT UNIQUE)");
     run(
         &core,
         &mut session,
-        "CREATE TABLE c (v TEXT CONSTRAINT fk_c REFERENCES p (k))",
+        "CREATE TABLE p (id BIGINT PRIMARY KEY, k TEXT UNIQUE)",
+    );
+    run(
+        &core,
+        &mut session,
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, v TEXT CONSTRAINT fk_c REFERENCES p (k))",
     );
     assert_eq!(
         code(insert(
@@ -191,11 +195,15 @@ fn named_column_references_is_enforced_and_droppable_by_name() {
 fn named_unique_and_column_references_survive_reopen() {
     let (core, path, mut session) = setup("create-named-unique-fk-reopen");
     let _guard = CleanupGuard(path.clone());
-    run(&core, &mut session, "CREATE TABLE p (k TEXT UNIQUE)");
     run(
         &core,
         &mut session,
-        "CREATE TABLE c (v TEXT CONSTRAINT fk_c REFERENCES p (k), \
+        "CREATE TABLE p (id BIGINT PRIMARY KEY, k TEXT UNIQUE)",
+    );
+    run(
+        &core,
+        &mut session,
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, v TEXT CONSTRAINT fk_c REFERENCES p (k), \
          w TEXT CONSTRAINT u_c UNIQUE)",
     );
     drop(session);
@@ -233,42 +241,50 @@ fn named_unique_and_column_references_survive_reopen() {
 fn duplicate_names_return_42p07_or_42710_without_side_effects() {
     let (core, path, mut session) = setup("create-named-dup");
     let _guard = CleanupGuard(path);
-    run(&core, &mut session, "CREATE TABLE p (k TEXT UNIQUE)");
+    run(
+        &core,
+        &mut session,
+        "CREATE TABLE p (id BIGINT PRIMARY KEY, k TEXT UNIQUE)",
+    );
     for (sql, expected) in [
         (
-            "CREATE TABLE t (a TEXT, b TEXT, CONSTRAINT x UNIQUE (a), CONSTRAINT x UNIQUE (b))",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT, b TEXT, CONSTRAINT x UNIQUE (a), CONSTRAINT x UNIQUE (b))",
             "42P07",
         ),
         (
-            "CREATE TABLE t (a TEXT CONSTRAINT x UNIQUE, b TEXT CONSTRAINT x UNIQUE)",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT CONSTRAINT x UNIQUE, b TEXT CONSTRAINT x UNIQUE)",
             "42P07",
         ),
         (
-            "CREATE TABLE t (a TEXT, CONSTRAINT x UNIQUE (a), CONSTRAINT x CHECK (a = 'v'))",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT, CONSTRAINT x UNIQUE (a), CONSTRAINT x CHECK (a = 'v'))",
             "42P07",
         ),
         (
-            "CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT, CONSTRAINT t_pkey UNIQUE (b))",
+            "CREATE TABLE t (id BIGINT NOT NULL UNIQUE, a TEXT PRIMARY KEY, b TEXT, CONSTRAINT t_pkey UNIQUE (b))",
             "42P07",
         ),
         (
-            "CREATE TABLE t (a TEXT CONSTRAINT x UNIQUE, b TEXT CONSTRAINT x REFERENCES p (k))",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT CONSTRAINT x UNIQUE, b TEXT CONSTRAINT x REFERENCES p (k))",
             "42710",
         ),
         (
-            "CREATE TABLE t (a TEXT CONSTRAINT x REFERENCES p (k), b TEXT, \
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT CONSTRAINT x REFERENCES p (k), b TEXT, \
              CONSTRAINT x FOREIGN KEY (b) REFERENCES p (k))",
             "42710",
         ),
         (
-            "CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT CONSTRAINT t_pkey REFERENCES p (k))",
+            "CREATE TABLE t (id BIGINT NOT NULL UNIQUE, a TEXT PRIMARY KEY, b TEXT CONSTRAINT t_pkey REFERENCES p (k))",
             "42710",
         ),
     ] {
         assert_eq!(fail(&core, &mut session, sql), expected, "{sql}");
     }
     // どれも副作用を残さない。
-    run(&core, &mut session, "CREATE TABLE t (a TEXT)");
+    run(
+        &core,
+        &mut session,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT)",
+    );
 }
 
 /// 既定名は明示した UNIQUE 名を避ける。
@@ -279,7 +295,7 @@ fn default_unique_name_avoids_explicit_names() {
     run(
         &core,
         &mut session,
-        "CREATE TABLE t (a TEXT UNIQUE, b TEXT, CONSTRAINT t_a_key UNIQUE (b))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT UNIQUE, b TEXT, CONSTRAINT t_a_key UNIQUE (b))",
     );
     run(&core, &mut session, "ALTER TABLE t DROP CONSTRAINT t_a_key");
 }
@@ -294,7 +310,7 @@ fn explicit_unique_name_colliding_with_default_check_name_is_42601() {
         fail(
             &core,
             &mut session,
-            "CREATE TABLE t (a INT CHECK (a > 0), CONSTRAINT t_a_check UNIQUE (a))"
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a INT CHECK (a > 0), CONSTRAINT t_a_check UNIQUE (a))"
         ),
         "42601"
     );
@@ -308,12 +324,12 @@ fn dropping_named_unique_referenced_by_foreign_key_is_2bp01() {
     run(
         &core,
         &mut session,
-        "CREATE TABLE p (k TEXT, CONSTRAINT u_p UNIQUE (k))",
+        "CREATE TABLE p (id BIGINT PRIMARY KEY, k TEXT, CONSTRAINT u_p UNIQUE (k))",
     );
     run(
         &core,
         &mut session,
-        "CREATE TABLE c (v TEXT CONSTRAINT fk_c REFERENCES p (k))",
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, v TEXT CONSTRAINT fk_c REFERENCES p (k))",
     );
     assert_eq!(
         fail(&core, &mut session, "ALTER TABLE p DROP CONSTRAINT u_p"),
@@ -327,10 +343,10 @@ fn structural_rejections_are_42601() {
     let (core, path, mut session) = setup("create-named-unique-structural");
     let _guard = CleanupGuard(path);
     for sql in [
-        "CREATE TABLE t (a TEXT, CONSTRAINT text UNIQUE (a))",
-        "CREATE TABLE t (a TEXT, CONSTRAINT u UNIQUE (missing))",
-        "CREATE TABLE t (a TEXT UNIQUE CONSTRAINT u UNIQUE)",
-        "CREATE TABLE t (a TEXT CONSTRAINT u NOT NULL)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT, CONSTRAINT text UNIQUE (a))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT, CONSTRAINT u UNIQUE (missing))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT UNIQUE CONSTRAINT u UNIQUE)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT CONSTRAINT u NOT NULL)",
     ] {
         assert_eq!(fail(&core, &mut session, sql), "42601", "{sql}");
     }

@@ -86,9 +86,11 @@ def create_table_sql(dim: int) -> str:
     """投入先の `CREATE TABLE`。`dim` は int 以外を拒否する（SQL へ数値のみ埋め込む）。"""
     if isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0:
         raise ValueError(f"dim must be a positive int (got {dim!r})")
+    # SQL の `CREATE TABLE` は暗黙の `id` を持たない（TABLE-23・Issue #2199）ため、COPY の先頭列 `id` は
+    # 宣言した通常の列として持つ（PRIMARY KEY にしない。投入計測へ一意索引の維持コストを足さない）。
     return (
         f"CREATE TABLE {TABLE} "
-        f"(embedding VECTOR({dim}), lang TEXT, topic TEXT, body TEXT)"
+        f"(id BIGINT, embedding VECTOR({dim}), lang TEXT, topic TEXT, body TEXT)"
     )
 
 

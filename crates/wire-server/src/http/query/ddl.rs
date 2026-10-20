@@ -9,7 +9,7 @@
 //! ## 設計（第 2 の DDL 実行器・第 2 の権限判定を作らない）
 //!
 //! JSON の各フィールドを `engine::sql::lexer::Token` へ直接写像し、
-//! `engine::sql::allowlist::{validate_create_table_tokens,
+//! `engine::sql::allowlist::{validate_create_table_tokens_with_implicit_id,
 //! validate_alter_table_tokens, validate_drop_table_tokens}`（crate 外部公開。
 //! Issue #910 で pub 化）へそのまま渡す。これは `EngineCore::
 //! parse_sql_prepared`／`bind_prepared`（拡張クエリプロトコルの `$n` を実値の
@@ -117,8 +117,8 @@ use engine::core::{EngineCore, ParsedSql};
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::sql::allowlist::{
-    validate_alter_table_tokens, validate_create_table_tokens, validate_drop_table_tokens,
-    SqlSurfaceError,
+    validate_alter_table_tokens, validate_create_table_tokens_with_implicit_id,
+    validate_drop_table_tokens, SqlSurfaceError,
 };
 use engine::sql::lexer::{tokenize, Keyword, Token};
 use engine::sql::mode::SessionState;
@@ -603,7 +603,7 @@ pub fn execute_create_table(
     }
     tokens.push(Token::Punct(')'));
 
-    let stmt = validate_create_table_tokens(&tokens)?;
+    let stmt = validate_create_table_tokens_with_implicit_id(&tokens)?;
     run_ddl(core, principal, ParsedSql::CreateTable(stmt))
 }
 
@@ -1270,7 +1270,7 @@ mod tests {
     ) -> Result<engine::sql::allowlist::ValidatedCreateTable, DdlError> {
         let tokens =
             tokenize(&format!("CREATE TABLE docs ({decl})")).expect("fixture SQL must tokenize");
-        Ok(validate_create_table_tokens(&tokens)?)
+        Ok(validate_create_table_tokens_with_implicit_id(&tokens)?)
     }
 
     fn nosql_create_validated(
@@ -1284,7 +1284,7 @@ mod tests {
         ];
         tokens.extend(build_column_tokens(&obj(column_json))?);
         tokens.push(Token::Punct(')'));
-        Ok(validate_create_table_tokens(&tokens)?)
+        Ok(validate_create_table_tokens_with_implicit_id(&tokens)?)
     }
 
     /// (SQL 列宣言, NoSQL 列 JSON) の行列。create_table／add_column 双方で使う。
@@ -1619,7 +1619,7 @@ mod tests {
             ];
             full_tokens.extend(nosql_tokens);
             full_tokens.push(Token::Punct(')'));
-            let nosql_validated = validate_create_table_tokens(&full_tokens)
+            let nosql_validated = validate_create_table_tokens_with_implicit_id(&full_tokens)
                 .expect("nosql-derived tokens must validate");
 
             let sql_text = format!(
@@ -1627,7 +1627,7 @@ mod tests {
                  REFERENCES parents (id) ON DELETE {sql_action} ON UPDATE {sql_action})"
             );
             let sql_tokens = tokenize(&sql_text).expect("sql fixture must tokenize");
-            let sql_validated = validate_create_table_tokens(&sql_tokens)
+            let sql_validated = validate_create_table_tokens_with_implicit_id(&sql_tokens)
                 .expect("sql-derived tokens must validate");
 
             assert_eq!(
@@ -1652,8 +1652,8 @@ mod tests {
         ];
         full_tokens.extend(omitted_tokens);
         full_tokens.push(Token::Punct(')'));
-        let omitted_validated =
-            validate_create_table_tokens(&full_tokens).expect("omitted tokens must validate");
+        let omitted_validated = validate_create_table_tokens_with_implicit_id(&full_tokens)
+            .expect("omitted tokens must validate");
 
         let explicit_no_action = obj(r#"{"kind":"foreign_key","columns":["parent_id"],
                 "references":{"table":"parents","columns":["id"],
@@ -1671,8 +1671,8 @@ mod tests {
         ];
         full_tokens.extend(explicit_tokens);
         full_tokens.push(Token::Punct(')'));
-        let explicit_validated =
-            validate_create_table_tokens(&full_tokens).expect("explicit tokens must validate");
+        let explicit_validated = validate_create_table_tokens_with_implicit_id(&full_tokens)
+            .expect("explicit tokens must validate");
 
         assert_eq!(omitted_validated, explicit_validated);
     }
@@ -1690,12 +1690,13 @@ mod tests {
                 {"column":"qty","op":"gt","value":0},
                 {"column":"kind","op":"prefix","value":"a%_\\"}]}"#);
         let tokens = build_check_case(&value);
-        let nosql = validate_create_table_tokens(&check_table_tokens(tokens)).expect("nosql");
+        let nosql = validate_create_table_tokens_with_implicit_id(&check_table_tokens(tokens))
+            .expect("nosql");
         let sql_tokens = tokenize(
             "CREATE TABLE t (qty INTEGER, kind TEXT, CONSTRAINT c1 CHECK (qty > 0 AND kind LIKE 'a\\%\\_\\\\%'))",
         )
         .expect("lex");
-        let sql = validate_create_table_tokens(&sql_tokens).expect("sql");
+        let sql = validate_create_table_tokens_with_implicit_id(&sql_tokens).expect("sql");
         assert_eq!(nosql, sql);
     }
 
@@ -1714,12 +1715,13 @@ mod tests {
             ),
         ] {
             let tokens = build_constraint_tokens(&obj(json)).expect("named pk must map");
-            let nosql = validate_create_table_tokens(&check_table_tokens(tokens)).expect("nosql");
+            let nosql = validate_create_table_tokens_with_implicit_id(&check_table_tokens(tokens))
+                .expect("nosql");
             let sql_tokens = tokenize(&format!(
                 "CREATE TABLE t (qty INTEGER, kind TEXT, CONSTRAINT pk_t PRIMARY KEY ({sql_cols}))"
             ))
             .expect("lex");
-            let sql = validate_create_table_tokens(&sql_tokens).expect("sql");
+            let sql = validate_create_table_tokens_with_implicit_id(&sql_tokens).expect("sql");
             assert_eq!(nosql, sql);
             assert_eq!(nosql.primary_key_name.as_deref(), Some("pk_t"));
         }
@@ -1766,8 +1768,8 @@ mod tests {
                 t.extend(build_constraint_tokens(&obj(item)).expect("map"));
             }
             t.push(Token::Punct(')'));
-            let nosql = validate_create_table_tokens(&t);
-            let sql = validate_create_table_tokens(
+            let nosql = validate_create_table_tokens_with_implicit_id(&t);
+            let sql = validate_create_table_tokens_with_implicit_id(
                 &tokenize(&format!(
                     "CREATE TABLE t (qty INTEGER, kind TEXT, {sql_constraints})"
                 ))
@@ -1788,8 +1790,8 @@ mod tests {
         let mut t = tokenize("CREATE TABLE t (id INTEGER,").expect("lex");
         t.extend(id_tokens);
         t.push(Token::Punct(')'));
-        let nosql = validate_create_table_tokens(&t).expect_err("named (id)");
-        let sql = validate_create_table_tokens(
+        let nosql = validate_create_table_tokens_with_implicit_id(&t).expect_err("named (id)");
+        let sql = validate_create_table_tokens_with_implicit_id(
             &tokenize("CREATE TABLE t (id INTEGER, CONSTRAINT a PRIMARY KEY (id))").expect("lex"),
         )
         .expect_err("sql named (id)");
@@ -1807,13 +1809,15 @@ mod tests {
                 {"column":"qty","op":"lte","value":9},
                 {"column":"qty","op":"ge","value":1},
                 {"column":"kind","op":"eq","value":"x"}]}"#);
-        let nosql = validate_create_table_tokens(&check_table_tokens(build_check_case(&value)))
-            .expect("nosql");
+        let nosql = validate_create_table_tokens_with_implicit_id(&check_table_tokens(
+            build_check_case(&value),
+        ))
+        .expect("nosql");
         let sql_tokens = tokenize(
             "CREATE TABLE t (qty INTEGER, kind TEXT, CHECK (qty <= 9 AND qty >= 1 AND kind = 'x'))",
         )
         .expect("lex");
-        let sql = validate_create_table_tokens(&sql_tokens).expect("sql");
+        let sql = validate_create_table_tokens_with_implicit_id(&sql_tokens).expect("sql");
         assert_eq!(nosql, sql);
     }
 

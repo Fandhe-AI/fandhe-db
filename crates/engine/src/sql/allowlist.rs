@@ -1707,6 +1707,15 @@ pub trait TableLookup {
         }))
     }
 
+    /// `name` が採番方式（暗黙の `id` を持たない。TABLE-23・Issue #2199）の表かを返す。単一行形
+    /// `WHERE id = <n>` を物理キーの直接指定として扱うか、通常の述語として扱うかの判定（ビュー経由の
+    /// 書き込みの書き換え・`core.rs` の文解析）に使う。既定実装は従来方式（`false`）。表でない・存在しない
+    /// 名前は `false`。
+    fn table_is_allocated(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        let _ = name;
+        Ok(false)
+    }
+
     /// 評価後射影形ビューの本文を参照時に再検証する入れ子の深さ（Issue #1411。
     /// 既定は 0）。評価後射影形ビューの連鎖（`sql::view::resolve_from` が本文を再検証する
     /// たびに +1 するラッパーが上書きする）を `MAX_VIEW_NESTING_DEPTH` で打ち切り、
@@ -3581,6 +3590,36 @@ pub(crate) fn id_equality_predicates(
     Ok(predicates)
 }
 
+impl ValidatedDelete {
+    /// 単一行形 `WHERE id = <n>` を、利用者が述語形で書いたときと同じ AST へ戻す
+    /// （TABLE-23・Issue #2199）。採番方式の表（`id` を予約しない表）では `id` は通常の列であり、
+    /// 物理キーへの直接アクセスではなく述語形 DML（`WHERE id = <n>`）として扱う。呼び出し元は
+    /// `core.rs` の文解析（対象表が採番方式と判明したとき）。
+    pub(crate) fn into_predicate_form(self) -> Result<ValidatedPredicateDelete, SqlSurfaceError> {
+        Ok(ValidatedPredicateDelete {
+            where_predicates: id_equality_predicates(&self.id_literal)?,
+            table_name: self.table_name,
+            operation_id: self.operation_id,
+            returning: self.returning,
+            partitioned: None,
+        })
+    }
+}
+
+impl ValidatedUpdate {
+    /// [`ValidatedDelete::into_predicate_form`] の `UPDATE` 版。
+    pub(crate) fn into_predicate_form(self) -> Result<ValidatedPredicateUpdate, SqlSurfaceError> {
+        Ok(ValidatedPredicateUpdate {
+            where_predicates: id_equality_predicates(&self.id_literal)?,
+            table_name: self.table_name,
+            assignments: self.assignments,
+            operation_id: self.operation_id,
+            returning: self.returning,
+            partitioned: None,
+        })
+    }
+}
+
 /// 許可形状の構造判定を通過した単一行・`id` 指定形 `DELETE` 文（SQL-18・
 /// TASK-191）。`ValidatedInsert` と同様、本モジュールが保証するのはここまでの
 /// 構造情報のみで、`id` 値の意味論的妥当性（`u64` として解釈可能か）は
@@ -3775,6 +3814,11 @@ pub struct ValidatedCreateTable {
     ///
     /// BREAKING CHANGE: 公開フィールドの追加（構造体リテラルで生成する外部コードは追随が必要）。
     pub identity_columns: Vec<IdentityColumn>,
+    /// 従来方式（暗黙の `id` 疑似列を持つ）の表として作るかどうか（TABLE-23・Issue #2199）。
+    /// 既定の SQL 表層（[`validate_create_table_tokens`]）は `false` で、暗黙の `id` を持たない採番方式の
+    /// 表を作る。NoSQL 表層の `create_table` だけが [`validate_create_table_tokens_with_implicit_id`] 経由で
+    /// `true` を得る（NoSQL の行アドレスが `id` 前提のため。後続 Issue #2201 が外す）。
+    pub legacy_row_identity: bool,
 }
 
 /// IDENTITY 列の宣言 1 件（[`ValidatedCreateTable::identity_columns`]。TABLE-24・Issue #1695）。
@@ -3997,9 +4041,10 @@ fn check_create_table_constraint_namespace(
 /// `PRIMARY KEY` 宣言の最終判定・正規化（TABLE-16・TASK-204、Issue #903）。
 ///
 /// - `None`（未宣言）はそのまま `Ok(None)`。
-/// - `id` 単独宣言（`PRIMARY KEY (id)`）は暗黙主キーの明示宣言として `Ok(None)`
-///   （何も永続化しない。`docs/design/sql-primary-key.md` 参照）。
-/// - `id` と他列の混在は曖昧さを避けるため `42601` で拒否する。
+/// - `id` は暗黙の主キーではなく通常の列名として扱う（TABLE-23・Issue #2199。新しく作る表は
+///   暗黙の `id` を持たない）。宣言されていない `id` は他の未宣言列と同じ `42601` になる。
+///   `legacy_implicit_id`（NoSQL 表層の表作成）のときだけ従来どおり、`id` 単独宣言（`PRIMARY KEY (id)`）を
+///   暗黙主キーの明示宣言として `Ok(None)`（何も永続化しない）、`id` と他列の混在を `42601` にする。
 /// - それ以外の各列名は `columns`（生存列のみ。表制約は宣言順に関わらず任意
 ///   位置の列を参照できる）に存在しなければならず、存在すれば
 ///   `nullable = false` へ書き換える（列制約・表制約いずれの宣言経路でも
@@ -4011,6 +4056,7 @@ fn check_create_table_constraint_namespace(
 fn finalize_primary_key(
     primary_key: Option<Vec<String>>,
     columns: &mut [ColumnDef],
+    legacy_implicit_id: bool,
 ) -> Result<Option<Vec<String>>, SqlSurfaceError> {
     let Some(pk_cols) = primary_key else {
         return Ok(None);
@@ -4020,8 +4066,10 @@ fn finalize_primary_key(
             "PRIMARY KEY must declare at least one column",
         ));
     }
+    // 従来方式（NoSQL 表層の表作成）: `id` 単独宣言は暗黙主キーの明示宣言として `Ok(None)`、
+    // `id` と他列の混在は `42601`。
     let contains_id = pk_cols.iter().any(|name| name.eq_ignore_ascii_case("id"));
-    if contains_id {
+    if legacy_implicit_id && contains_id {
         if pk_cols.len() > 1 {
             return Err(SqlSurfaceError::unsupported(
                 "PRIMARY KEY must not combine the implicit id column with other columns",
@@ -4542,6 +4590,9 @@ struct Parser<'a> {
     /// `Some` の間だけ [`Self::parse_call_expr`] が集計関数名を受理し、内部名の
     /// `Expr::Ident` に置き換えて返す。`None`（既定）では従来どおり `42601`
     /// （WHERE・CHECK・UDF 本体・集計引数内の入れ子集計など）。
+    /// `CREATE TABLE` で暗黙の `id` 疑似列を保つ従来方式の検証（`id` 列名の予約・`PRIMARY KEY (id)` の
+    /// 暗黙主キー正規化）を行うか（TABLE-23・Issue #2199。NoSQL 表層の表作成専用）。
+    legacy_implicit_id: bool,
     agg_calls: Option<Vec<AggregateItem>>,
     /// SELECT リストで既に確定した項目が占める集計項目枠数（[`AggregateSelectItem::slot_count`]
     /// の合計）。式中の集計呼び出しを溜める前に [`MAX_AGGREGATE_ITEMS`] を検査するための基点。
@@ -4607,7 +4658,15 @@ impl<'a> Parser<'a> {
             allow_aggregate_expr_items: false,
             agg_calls: None,
             agg_slots_used: 0,
+            legacy_implicit_id: false,
         }
+    }
+
+    /// `CREATE TABLE` を従来方式（暗黙の `id` 疑似列を持つ）として検証する（TABLE-23・Issue #2199。
+    /// [`validate_create_table_tokens_with_implicit_id`] のみが呼ぶ）。
+    fn with_legacy_implicit_id(mut self) -> Self {
+        self.legacy_implicit_id = true;
+        self
     }
 
     /// 複数行 `VALUES` の行数上限を CLI 設定値へ差し替える（Issue #997）。
@@ -9179,11 +9238,18 @@ impl<'a> Parser<'a> {
         let operation_id = self.parse_operation_id_clause()?;
         // `PARTITIONED [CHUNK n]`（Issue #1129）は `USING OPERATION_ID` 句の直後。
         let partitioned = self.parse_partitioned_clause()?;
+        // `id = <n>` 形は表の行識別方式で意味が変わる（従来方式は物理キーの単一行指定、採番方式は
+        // 通常列の述語）。構文段では決められないため、`PARTITIONED` 付きは述語形へ変換して保持し、
+        // 単一行形の拒否は表を引ける呼び出し側が [`reject_partitioned_single_row_form`] で行う
+        // （Issue #2199）。
+        let where_clause = match where_clause {
+            ParsedDeleteWhere::RowId { id_literal } if partitioned.is_some() => {
+                ParsedDeleteWhere::Predicates(id_equality_predicates(&id_literal)?)
+            }
+            other => other,
+        };
         if partitioned.is_some() {
-            reject_partitioned_combination(
-                matches!(where_clause, ParsedDeleteWhere::RowId { .. }),
-                returning.is_some(),
-            )?;
+            reject_partitioned_combination(returning.is_some())?;
         }
 
         Ok(ParsedDeleteShape {
@@ -9267,11 +9333,15 @@ impl<'a> Parser<'a> {
         let operation_id = self.parse_operation_id_clause()?;
         // `PARTITIONED [CHUNK n]`（Issue #1129）は `USING OPERATION_ID` 句の直後。
         let partitioned = self.parse_partitioned_clause()?;
+        // DELETE と同じく、`PARTITIONED` 付きの `id = <n>` 形は述語形へ変換して保持する（Issue #2199）。
+        let where_form = match where_form {
+            UpdateWhereForm::Id(id_literal) if partitioned.is_some() => {
+                UpdateWhereForm::Predicates(id_equality_predicates(&id_literal)?)
+            }
+            other => other,
+        };
         if partitioned.is_some() {
-            reject_partitioned_combination(
-                matches!(where_form, UpdateWhereForm::Id(_)),
-                returning.is_some(),
-            )?;
+            reject_partitioned_combination(returning.is_some())?;
         }
 
         Ok(ParsedUpdateShape {
@@ -10249,9 +10319,10 @@ impl<'a> Parser<'a> {
             ));
         }
 
-        // 名前付きの `PRIMARY KEY (id)` は暗黙主キー（`None` へ正規化され何も
-        // 永続化されない）と両立せず、名前が黙って捨てられるため `42601`（fail-closed）。
-        if primary_key_name.is_some()
+        // 従来方式の検証（NoSQL 表層の表作成）: 名前付きの `PRIMARY KEY (id)` は暗黙主キー（`None` へ
+        // 正規化され何も永続化されない）と両立せず、名前が黙って捨てられるため `42601`（fail-closed）。
+        if self.legacy_implicit_id
+            && primary_key_name.is_some()
             && matches!(&primary_key, Some(cols) if cols.len() == 1
                 && cols.iter().any(|c| c.eq_ignore_ascii_case("id")))
         {
@@ -10259,7 +10330,7 @@ impl<'a> Parser<'a> {
                 "a named PRIMARY KEY must not declare only the implicit id column",
             ));
         }
-        let primary_key = finalize_primary_key(primary_key, &mut columns)?;
+        let primary_key = finalize_primary_key(primary_key, &mut columns, self.legacy_implicit_id)?;
         let unique_explicit: Vec<bool> = unique_constraints
             .iter()
             .map(|(n, _)| n.is_some())
@@ -10298,6 +10369,7 @@ impl<'a> Parser<'a> {
             primary_key_name,
             serial_columns,
             identity_columns,
+            legacy_row_identity: self.legacy_implicit_id,
         })
     }
 
@@ -10426,7 +10498,9 @@ impl<'a> Parser<'a> {
         // 拒否する。列リスト要素の先頭に現れる `CHECK (`／`CONSTRAINT` を常に
         // 制約宣言として解釈できるようにし、列定義との曖昧さを構造的に排除する
         // （[`Self::peek_check_clause_start`] 参照。PostgreSQL でも両語は予約語）。
-        if name.eq_ignore_ascii_case("id")
+        // `id` は予約しない（TABLE-23・Issue #2199。新しく作る表は暗黙の `id` を持たず、宣言した
+        // `id` は通常の列になる）。`tenant_id`・`visibility` は RLS 内部列のため引き続き予約。
+        if (self.legacy_implicit_id && name.eq_ignore_ascii_case("id"))
             || name.eq_ignore_ascii_case("tenant_id")
             || name.eq_ignore_ascii_case("visibility")
             || name.eq_ignore_ascii_case("check")
@@ -16479,6 +16553,7 @@ fn build_scan_from_resolved(
             view_predicates,
             view_columns,
             column_map,
+            base_allocated,
             ..
         } => {
             super::view::check_columns_within_view(
@@ -16502,7 +16577,7 @@ fn build_scan_from_resolved(
                              aliases are not supported",
                         ));
                     }
-                    let map = super::view_alias::ColumnMap::new(map);
+                    let map = super::view_alias::ColumnMap::new(map, !base_allocated);
                     let projection = super::view_alias::rewrite_projection(&map, projection)?;
                     let where_predicates =
                         super::view_alias::rewrite_where(&map, where_predicates)?;
@@ -16576,6 +16651,7 @@ fn build_aggregate_from_resolved(
             view_predicates,
             view_columns,
             column_map,
+            base_allocated,
             ..
         } => {
             super::view::check_aggregate_columns_within_view(
@@ -16587,7 +16663,7 @@ fn build_aggregate_from_resolved(
             // 列別名付きビュー（TABLE-41・Issue #1659）: 公開名に対する検査の後で物理名へ書き換える。
             let (items, where_predicates, group_by) = match &column_map {
                 Some(map) => super::view_alias::rewrite_aggregate(
-                    &super::view_alias::ColumnMap::new(map),
+                    &super::view_alias::ColumnMap::new(map, !base_allocated),
                     items,
                     where_predicates,
                     group_by,
@@ -17488,6 +17564,14 @@ pub(crate) fn validate_delete_statement_tokens(
     if !exists {
         return Err(SqlSurfaceError::undefined_table(table_name.clone()));
     }
+    if let DeleteStatement::Predicate(v) = &stmt {
+        reject_partitioned_single_row_form(
+            lookup,
+            &v.table_name,
+            v.partitioned(),
+            &v.where_predicates,
+        )?;
+    }
 
     Ok(stmt)
 }
@@ -17528,20 +17612,42 @@ pub(crate) fn parse_delete_statement_shape_tokens(
     })
 }
 
-/// `PARTITIONED` 修飾と併用できない形（単一行・`id` 指定形・`RETURNING`）を `42601` で
-/// 拒否する（Issue #1129）。固定文言で、入力断片を含めない。
-fn reject_partitioned_combination(
-    single_row_form: bool,
-    has_returning: bool,
-) -> Result<(), SqlSurfaceError> {
-    if single_row_form {
-        return Err(SqlSurfaceError::unsupported(
-            "PARTITIONED requires a predicate-form WHERE (single-row id form is not allowed)",
-        ));
-    }
+/// `PARTITIONED` 修飾と併用できない `RETURNING` を `42601` で拒否する（Issue #1129）。
+/// 固定文言で、入力断片を含めない。単一行・`id` 指定形の拒否は表の行識別方式に依存するため
+/// [`reject_partitioned_single_row_form`] が担う。
+fn reject_partitioned_combination(has_returning: bool) -> Result<(), SqlSurfaceError> {
     if has_returning {
         return Err(SqlSurfaceError::unsupported(
             "PARTITIONED cannot be combined with RETURNING",
+        ));
+    }
+    Ok(())
+}
+
+/// 従来方式（`id` が疑似列）の表への `PARTITIONED` 付き単一行・`id` 指定形（`WHERE id = <n>`）を
+/// `42601` で拒否する（Issue #1129・#2199）。構文段は `PARTITIONED` 付きの `id = <n>` を述語形へ
+/// 変換して保持するため、表を引ける呼び出し側（`core.rs` の DELETE／UPDATE 解析と
+/// `validate_delete_statement_tokens`・`validate_update_form_tokens`）が行識別方式を確認してから呼ぶ。
+/// 採番方式の表では `id` は通常列で複数行に一致しうるため拒否しない。固定文言で入力断片を含めない。
+pub(crate) fn reject_partitioned_single_row_form(
+    lookup: &impl TableLookup,
+    table_name: &str,
+    partitioned: Option<&crate::sql::partitioned::PartitionedClause>,
+    predicates: &[WherePredicate],
+) -> Result<(), SqlSurfaceError> {
+    if partitioned.is_none() {
+        return Ok(());
+    }
+    // `id = <数値リテラル>` の 1 述語（構文段が `peek_single_row_*_id` で単一行形と見なす形と同じ）。
+    let single_id_form = matches!(
+        predicates,
+        [WherePredicate::Expression(Expr::Binary { op: BinOp::Eq, lhs, rhs })]
+            if matches!(&**lhs, Expr::Ident(c) if c == "id") && matches!(&**rhs, Expr::Number(_))
+    );
+    // 判定不能（照会失敗）は従来方式として扱い、拒否側へ倒す（fail-closed）。
+    if single_id_form && !lookup.table_is_allocated(table_name).unwrap_or(false) {
+        return Err(SqlSurfaceError::unsupported(
+            "PARTITIONED requires a predicate-form WHERE (single-row id form is not allowed)",
         ));
     }
     Ok(())
@@ -17733,6 +17839,25 @@ pub fn validate_create_table_tokens(
     let mut p = Parser::new(tokens);
     let validated = p.parse_create_table()?;
     // `ON COMMIT` は一時表にしか使えない（TABLE-44・Issue #1683。PG と同じ `42P16`）。
+    if p.peek_ident_matches("ON") && p.peek_ident_matches_at(1, "COMMIT") {
+        return Err(SqlSurfaceError::invalid_table_definition(
+            validated.table_name,
+        ));
+    }
+    p.expect_end_of_statement()?;
+    Ok(validated)
+}
+
+/// [`validate_create_table_tokens`] の従来方式版（暗黙の `id` 疑似列を持つ表を作る検証。TABLE-23・
+/// Issue #2199）。`id` 列名は予約のまま、`PRIMARY KEY (id)` は暗黙主キーの明示宣言として扱い、結果の
+/// [`ValidatedCreateTable::legacy_row_identity`] が真になる（実行段が従来方式の表を作る）。NoSQL 表層
+/// （`wire-server` の `http/query/ddl.rs`）の `create_table` 専用: NoSQL の行アドレスは `id` 前提で、
+/// 採番方式の表への対応は後続 Issue（#2201）が担う。SQL 表層は [`validate_create_table_tokens`] を使う。
+pub fn validate_create_table_tokens_with_implicit_id(
+    tokens: &[Token],
+) -> Result<ValidatedCreateTable, SqlSurfaceError> {
+    let mut p = Parser::new(tokens).with_legacy_implicit_id();
+    let validated = p.parse_create_table()?;
     if p.peek_ident_matches("ON") && p.peek_ident_matches_at(1, "COMMIT") {
         return Err(SqlSurfaceError::invalid_table_definition(
             validated.table_name,
@@ -18281,11 +18406,8 @@ fn validate_copy_from_tokens(
             )));
         }
     }
-    if !columns.iter().any(|c| c == "id") {
-        return Err(SqlSurfaceError::invalid_input(
-            "COPY column list must include the id pseudo-column",
-        ));
-    }
+    // 疑似列 `id` の要否は表の行識別方式で決まる（採番方式の表は不要。TABLE-23・Issue #2199）ため、
+    // 列リストへの `id` 必須検査は束縛段（`sql::copy`）が表のスキーマを見て行う。
 
     Ok(CopyStatement::From(ValidatedCopyFrom {
         table_name,
@@ -18612,6 +18734,14 @@ pub(crate) fn validate_update_form_tokens(
     let exists = lookup.table_exists(table_name)?;
     if !exists {
         return Err(SqlSurfaceError::undefined_table(table_name.clone()));
+    }
+    if let ValidatedUpdateForm::Predicate(v) = &form {
+        reject_partitioned_single_row_form(
+            lookup,
+            &v.table_name,
+            v.partitioned(),
+            &v.where_predicates,
+        )?;
     }
 
     Ok(form)
@@ -25722,6 +25852,45 @@ mod tests {
         validate_create_table_tokens(&tokens).unwrap_or_else(|e| panic!("expected ok, got {e:?}"))
     }
 
+    /// 従来方式（暗黙の `id` 疑似列を持つ表。NoSQL 表層の表作成）の検証（TABLE-23・Issue #2199）。
+    fn parse_create_table_ok_legacy(sql: &str) -> ValidatedCreateTable {
+        let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        validate_create_table_tokens_with_implicit_id(&tokens)
+            .unwrap_or_else(|e| panic!("expected ok, got {e:?}"))
+    }
+
+    /// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たず、`id` を通常の列名として宣言でき、
+    /// `PRIMARY KEY (id)` は宣言した列を指す（TABLE-23・Issue #2199）。`tenant_id`・`visibility` は
+    /// 引き続き予約名。従来方式の検証（NoSQL 表層の表作成）だけが `id` を予約し、暗黙主キーとして扱う。
+    #[test]
+    fn create_table_treats_id_as_an_ordinary_column_name() {
+        let v = parse_create_table_ok("CREATE TABLE t (id TEXT PRIMARY KEY, a TEXT)");
+        assert_eq!(v.primary_key, Some(vec!["id".to_string()]));
+        assert!(!v.legacy_row_identity);
+        let v = parse_create_table_ok("CREATE TABLE t (a TEXT, id BIGINT, PRIMARY KEY (id, a))");
+        assert_eq!(v.primary_key, Some(vec!["id".to_string(), "a".to_string()]));
+        // 宣言の無い `id` は他の未宣言列と同じ（暗黙の主キー列は無い）。
+        assert_eq!(
+            parse_create_table_err("CREATE TABLE t (a TEXT, PRIMARY KEY (id))").wire_code(),
+            "42601"
+        );
+        for reserved in ["tenant_id", "visibility", "check", "constraint"] {
+            let sql = format!("CREATE TABLE t ({reserved} TEXT)");
+            assert_eq!(parse_create_table_err(&sql).wire_code(), "42601", "{sql}");
+        }
+        // 従来方式の検証は従来どおり。
+        let tokens = crate::sql::lexer::tokenize("CREATE TABLE t (id TEXT)").expect("tokenize");
+        assert_eq!(
+            validate_create_table_tokens_with_implicit_id(&tokens)
+                .expect_err("id is reserved for the legacy shape")
+                .wire_code(),
+            "42601"
+        );
+        let v = parse_create_table_ok_legacy("CREATE TABLE t (a TEXT, PRIMARY KEY (id))");
+        assert_eq!(v.primary_key, None);
+        assert!(v.legacy_row_identity);
+    }
+
     /// IDENTITY 列は整数型・`NOT NULL`・`DEFAULT` なしへ展開され、`identity_columns` に宣言順で
     /// 種別と SEQUENCE オプションつきで載る（TABLE-24・Issue #1695）。
     #[test]
@@ -26041,7 +26210,6 @@ mod tests {
     #[test]
     fn create_table_named_primary_key_rejections_are_42601() {
         for sql in [
-            "CREATE TABLE t (a TEXT, CONSTRAINT x PRIMARY KEY (id))",
             "CREATE TABLE t (a TEXT, CONSTRAINT text PRIMARY KEY (a))",
             "CREATE TABLE t (a TEXT CONSTRAINT text PRIMARY KEY)",
             "CREATE TABLE t (a TEXT, CONSTRAINT x PRIMARY KEY (a), CONSTRAINT x CHECK (a = 'v'))",
@@ -26049,6 +26217,16 @@ mod tests {
         ] {
             assert_eq!(parse_create_table_err(sql).wire_code(), "42601", "{sql}");
         }
+        // 従来方式の検証では、名前付きの `PRIMARY KEY (id)` は暗黙主キーと両立せず `42601`。
+        let tokens =
+            crate::sql::lexer::tokenize("CREATE TABLE t (a TEXT, CONSTRAINT x PRIMARY KEY (id))")
+                .expect("tokenize");
+        assert_eq!(
+            validate_create_table_tokens_with_implicit_id(&tokens)
+                .expect_err("named implicit pk")
+                .wire_code(),
+            "42601"
+        );
         // 主キーと FOREIGN KEY の明示名重複は 42710（Issue #1428）。
         assert_eq!(
             parse_create_table_err(
@@ -26057,8 +26235,9 @@ mod tests {
             .wire_code(),
             "42710"
         );
-        // 無名の `PRIMARY KEY (id)` は従来どおり受理して `None` に正規化する。
-        let v = parse_create_table_ok("CREATE TABLE t (a TEXT, PRIMARY KEY (id))");
+        // 無名の `PRIMARY KEY (id)` は従来方式の検証（NoSQL 表層の表作成）では受理して `None` に
+        // 正規化する。
+        let v = parse_create_table_ok_legacy("CREATE TABLE t (a TEXT, PRIMARY KEY (id))");
         assert_eq!(v.primary_key, None);
     }
 
@@ -26106,7 +26285,7 @@ mod tests {
             assert_eq!(parse_create_table_err(sql).wire_code(), expected, "{sql}");
         }
         // `PRIMARY KEY (id)` は主キーを持たないため導出名は存在せず受理する。
-        parse_create_table_ok(
+        parse_create_table_ok_legacy(
             "CREATE TABLE t (a TEXT, PRIMARY KEY (id), CONSTRAINT t_pkey UNIQUE (a))",
         );
     }

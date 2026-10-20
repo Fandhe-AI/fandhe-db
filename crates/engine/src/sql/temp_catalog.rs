@@ -293,6 +293,17 @@ impl<L: TableLookup + ?Sized> TableLookup for SessionRelationLookup<'_, L> {
         Ok(columns)
     }
 
+    fn table_is_allocated(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        if let Some(entry) = self.temp_entry(name) {
+            return Ok(entry.schema.is_allocated());
+        }
+        let allocated = self.inner.table_is_allocated(name)?;
+        if allocated {
+            self.note_persistent();
+        }
+        Ok(allocated)
+    }
+
     fn buffered_depth(&self) -> usize {
         self.inner.buffered_depth()
     }

@@ -31,6 +31,12 @@ use engine::storage::{Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 const TENANT_A: &str = "tenant-a";
@@ -71,11 +77,14 @@ fn outcome(r: Result<impl std::fmt::Debug, SqlSurfaceError>, include_ok_body: bo
 }
 
 fn run(core: &EngineCore, tenant: &str, s: &mut SessionState, sql: &str) -> String {
-    outcome(core.execute_sql_in_session(&ctx(tenant), s, sql), true)
+    outcome(
+        core.execute_sql_in_session_legacy(&ctx(tenant), s, sql),
+        true,
+    )
 }
 
 fn run_ok(core: &EngineCore, tenant: &str, s: &mut SessionState, sql: &str) -> SqlOutcome {
-    core.execute_sql_in_session(&ctx(tenant), s, sql)
+    core.execute_sql_in_session_legacy(&ctx(tenant), s, sql)
         .unwrap_or_else(|e| panic!("{sql}: {} {e:?}", e.wire_code()))
 }
 
@@ -108,7 +117,7 @@ fn setup_secret_temp_table(core: &EngineCore, a: &mut SessionState) {
         core,
         TENANT_A,
         a,
-        "CREATE TEMP TABLE secret_t (code TEXT UNIQUE, n INTEGER)",
+        "CREATE TEMP TABLE secret_t (id BIGINT PRIMARY KEY, code TEXT UNIQUE, n INTEGER)",
     );
     run_ok(core, TENANT_A, a, "CREATE INDEX secret_idx ON secret_t (n)");
     run_ok(
@@ -195,7 +204,12 @@ fn same_temp_name_in_two_sessions_and_tenants_is_independent() {
     let mut b = SessionState::default();
     let mut c = SessionState::default();
     for (tenant, s) in [(TENANT_A, &mut a), (TENANT_A, &mut b), (TENANT_B, &mut c)] {
-        run_ok(&core, tenant, s, "CREATE TEMP TABLE shared_name (v TEXT)");
+        run_ok(
+            &core,
+            tenant,
+            s,
+            "CREATE TEMP TABLE shared_name (id BIGINT PRIMARY KEY, v TEXT)",
+        );
     }
     run_ok(
         &core,
@@ -237,6 +251,11 @@ fn same_temp_name_in_two_sessions_and_tenants_is_independent() {
 
 const INVARIANCE_COLUMNS: &str =
     "(name TEXT NOT NULL, qty INTEGER DEFAULT 7 CHECK (qty >= 0), code TEXT UNIQUE)";
+
+/// 一時表側の列定義。一時表は採番方式で暗黙の `id` を持たないため、`id` を宣言した列にする
+/// （永続表側は従来方式で疑似列 `id` を持つ。TABLE-23・Issue #2199）。
+const INVARIANCE_TEMP_COLUMNS: &str =
+    "(id BIGINT PRIMARY KEY, name TEXT NOT NULL, qty INTEGER DEFAULT 7 CHECK (qty >= 0), code TEXT UNIQUE)";
 
 /// 一時表 `t` に対して流す台本。永続表 `t` の他テナント行の有無で結果が変わらないことを比べる。
 const INVARIANCE_SCRIPT: &[&str] = &[
@@ -293,16 +312,16 @@ fn run_invariance_script(label: &str, other_rows: usize, public_only: bool) -> V
     };
     let mut s = SessionState::default();
     let mut out = vec![outcome(
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &ctx_a,
             &mut s,
-            &format!("CREATE TEMP TABLE t {INVARIANCE_COLUMNS}"),
+            &format!("CREATE TEMP TABLE t {INVARIANCE_TEMP_COLUMNS}"),
         ),
         true,
     )];
     for sql in INVARIANCE_SCRIPT {
         out.push(outcome(
-            core.execute_sql_in_session(&ctx_a, &mut s, sql),
+            core.execute_sql_in_session_legacy(&ctx_a, &mut s, sql),
             true,
         ));
     }
@@ -387,7 +406,7 @@ fn temp_tables_never_reach_the_persistent_catalog_or_file() {
             &core,
             TENANT_A,
             &mut a,
-            "CREATE TEMP TABLE scratch (v TEXT) ON COMMIT DELETE ROWS",
+            "CREATE TEMP TABLE scratch (id BIGINT PRIMARY KEY, v TEXT) ON COMMIT DELETE ROWS",
         );
 
         let mut t: SessionTransaction<'_> = core.new_session_transaction();
@@ -447,7 +466,7 @@ fn temp_tables_never_reach_the_persistent_catalog_or_file() {
         &core,
         TENANT_A,
         &mut s,
-        "CREATE TEMP TABLE secret_t (code TEXT UNIQUE, n INTEGER)",
+        "CREATE TEMP TABLE secret_t (id BIGINT PRIMARY KEY, code TEXT UNIQUE, n INTEGER)",
     );
     assert!(query_rows(&core, TENANT_A, &mut s, "SELECT id FROM secret_t LIMIT 10").is_empty());
 }

@@ -300,12 +300,12 @@ fn wire_drop_table_multiple_names_atomic_and_permission() {
     let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
     expect_command(
         &mut alice,
-        "CREATE TABLE multi_a (name TEXT)",
+        "CREATE TABLE multi_a (id BIGINT PRIMARY KEY, name TEXT)",
         "CREATE TABLE",
     );
     expect_command(
         &mut alice,
-        "CREATE TABLE multi_b (name TEXT)",
+        "CREATE TABLE multi_b (id BIGINT PRIMARY KEY, name TEXT)",
         "CREATE TABLE",
     );
     expect_error(&mut alice, "DROP TABLE multi_a, ghost", "42P01");
@@ -326,10 +326,14 @@ fn wire_drop_cascade_and_restrict() {
     let (core, _guard) = new_core_with_docs();
     let addr = spawn_with_ddl_allowed_users(&users(), core, &["alice"]);
     let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
-    expect_command(&mut alice, "CREATE TABLE cp (name TEXT)", "CREATE TABLE");
     expect_command(
         &mut alice,
-        "CREATE TABLE cc (pid BIGINT REFERENCES cp, note TEXT)",
+        "CREATE TABLE cp (id BIGINT PRIMARY KEY, name TEXT UNIQUE)",
+        "CREATE TABLE",
+    );
+    expect_command(
+        &mut alice,
+        "CREATE TABLE cc (id BIGINT PRIMARY KEY, pname TEXT REFERENCES cp (name), note TEXT)",
         "CREATE TABLE",
     );
     expect_command(
@@ -356,7 +360,11 @@ fn wire_create_unique_index_enforces_and_drops() {
     let (core, _guard) = new_core_with_docs();
     let addr = spawn_with_ddl_allowed_users(&users(), core, &["alice"]);
     let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
-    expect_command(&mut alice, "CREATE TABLE notes (code TEXT)", "CREATE TABLE");
+    expect_command(
+        &mut alice,
+        "CREATE TABLE notes (id BIGINT PRIMARY KEY, code TEXT)",
+        "CREATE TABLE",
+    );
     expect_command(
         &mut alice,
         "INSERT INTO notes (id, code) VALUES (1, 'x'), (2, 'x') USING OPERATION_ID 'u-1'",
@@ -407,7 +415,7 @@ fn wire_create_partial_index_maintains_on_dml() {
     let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
     expect_command(
         &mut alice,
-        "CREATE TABLE nums (n INTEGER, code TEXT)",
+        "CREATE TABLE nums (id BIGINT PRIMARY KEY, n INTEGER, code TEXT)",
         "CREATE TABLE",
     );
     expect_command(
@@ -451,7 +459,7 @@ fn wire_partial_unique_index_enforces_inside_the_predicate_only() {
     let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
     expect_command(
         &mut alice,
-        "CREATE TABLE pu (n INTEGER, code TEXT)",
+        "CREATE TABLE pu (id BIGINT PRIMARY KEY, n INTEGER, code TEXT)",
         "CREATE TABLE",
     );
     expect_command(

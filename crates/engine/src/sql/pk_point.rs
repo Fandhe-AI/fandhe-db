@@ -438,7 +438,7 @@ mod tests {
                 &core,
                 "t1",
                 &mut s,
-                "CREATE TABLE pk (code INTEGER PRIMARY KEY)",
+                "CREATE TABLE pk (id BIGINT NOT NULL UNIQUE, code INTEGER PRIMARY KEY)",
             );
             for i in 1..=rows {
                 run(
@@ -470,7 +470,7 @@ mod tests {
             &core,
             "alice",
             &mut s,
-            "CREATE TABLE t (code TEXT NOT NULL)",
+            "CREATE TABLE t (id BIGINT NOT NULL UNIQUE, code TEXT NOT NULL)",
         );
         run(
             &core,
@@ -552,7 +552,7 @@ mod tests {
             &core,
             "alice",
             &mut s,
-            "CREATE TABLE pk (code TEXT PRIMARY KEY)",
+            "CREATE TABLE pk (id BIGINT NOT NULL UNIQUE, code TEXT PRIMARY KEY)",
         );
         for (tenant, id) in [("alice", 1), ("bob", 2), ("carol", 3)] {
             run(
@@ -575,7 +575,16 @@ mod tests {
         let crate::sql::SqlOutcome::Query(r) = out else {
             panic!("expected Query");
         };
-        assert_eq!(r.rows.iter().map(|x| x.id).collect::<Vec<_>>(), vec![2]);
+        // 宣言した `id` 列の値で確かめる（行の物理 rowid は応答の意味を持たない。Issue #2199）。
+        let ids: Vec<i64> = r
+            .rows
+            .iter()
+            .map(|x| match x.cells.first() {
+                Some(crate::sql::exec::Cell::SignedInteger(v)) => *v,
+                other => panic!("unexpected id cell {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![2]);
         assert_eq!(counts(), (1, 0));
     }
 }

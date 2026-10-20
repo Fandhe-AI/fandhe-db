@@ -118,7 +118,7 @@ fn child_workload(db: &Path, log: &Path) {
     ok(
         &core,
         &alice,
-        "CREATE TABLE docs (code TEXT, kind TEXT, embedding VECTOR(2) NOT NULL)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, code TEXT, kind TEXT, embedding VECTOR(2) NOT NULL)",
     );
     ok(&core, &alice, &insert_sql());
     ok(&core, &alice, &replace_sql(0).replace(" OR REPLACE", ""));

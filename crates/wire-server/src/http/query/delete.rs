@@ -205,7 +205,11 @@ pub fn execute(
                 id,
                 operation_id: operation_id.clone(),
             };
-            core.execute_bound_delete_in_session(principal.policy_context(), &bound)?
+            core.execute_bound_delete_checked_in_session(
+                principal.policy_context(),
+                &bound,
+                super::gate::reject_allocated_schema,
+            )?
         }
         // 述語形（`filter`。TASK-186・NOSQL-12、Issue #1062）: `WHERE` 述語列は
         // `filter::bind_filter_where_predicates`（SQL 表層の述語形 `DELETE` が
@@ -215,6 +219,7 @@ pub fn execute(
         // 作らない。
         TargetForm::Predicate(items) => {
             let bind = |schema: &engine::catalog::TableSchema| {
+                super::gate::reject_allocated_schema(schema)?;
                 filter::bind_filter_where_predicates(items, schema)
                     .map_err(filter::FilterError::into_sql_surface_error)
             };

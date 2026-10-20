@@ -182,6 +182,10 @@ impl TableLookup for NewViewLookup<'_> {
         TableLookup::table_star_columns(self.inner, name)
     }
 
+    fn table_is_allocated(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        TableLookup::table_is_allocated(self.inner, name)
+    }
+
     fn materialized_view_columns(
         &self,
         name: &str,

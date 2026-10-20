@@ -1904,6 +1904,13 @@ fn insert_default_clock_scope(
     )))
 }
 
+/// `name` が採番方式（暗黙の `id` を持たない）の表かを返す（TABLE-23・Issue #2199）。単一行形
+/// `WHERE id = <n>` を述語形へ戻すかの判定にだけ使う。引けない場合は従来方式（`false`）として扱う:
+/// 採番方式の表を従来方式と誤判定しても、id 指定の書き込みゲート（`0A000`）が fail-closed に拒否する。
+fn allocated_table(lookup: &impl crate::sql::allowlist::TableLookup, name: &str) -> bool {
+    crate::sql::allowlist::TableLookup::table_is_allocated(lookup, name).unwrap_or(false)
+}
+
 /// `read_txn`（確定済みスナップショットまたは明示トランザクションの書き込み
 /// トランザクション。[`crate::storage::read_source::ReadSource`]）から `table_name` の
 /// スキーマを取得する（[`EngineCore::read_txn_with_schema`] とエラー分類を共有する
@@ -2771,6 +2778,18 @@ impl EngineCore {
         self
     }
 
+    /// `table` が採番方式（暗黙の `id` を持たない。TABLE-23・Issue #2199）の表かを返す。NoSQL 表層が
+    /// 行の単一アドレスに `id` を前提とするため、該当する表への要求を実行前に `0A000` で拒否する判定に
+    /// 使う（後続 Issue #2201 が NoSQL 側の対応を入れるまでの fail-closed な安全弁）。表が無い・スキーマを
+    /// 読めない場合は `false`（通常の実行経路が未定義表・内部エラーとして分類する。存在の有無を
+    /// この判定の応答に出さない）。
+    pub fn table_uses_allocated_row_identity(&self, table: &str) -> bool {
+        self.storage
+            .get_table_schema(table)
+            .map(|schema| schema.is_allocated())
+            .unwrap_or(false)
+    }
+
     /// 現在の総走査行数上限（Issue #1549）。
     pub fn scan_limits(&self) -> crate::scan_limits::ScanLimits {
         self.scan_limits
@@ -3100,7 +3119,7 @@ impl EngineCore {
             let (path_idx, body_idx) = dictionary_required_columns(&schema)
                 .map_err(|msg| CoreError::from(CatalogError::Invalid(msg)))?;
 
-            let rows = crate::tenant::visible_rows_with_scan_limit(
+            let rows = crate::tenant::visible_rows_any_identity(
                 &self.storage,
                 table,
                 ctx,
@@ -4441,7 +4460,23 @@ impl EngineCore {
                 crate::sql::allowlist::DeleteStatement::Predicate(v) => v.table_name().to_string(),
             };
             if crate::sql::allowlist::TableLookup::table_exists(&storage_lookup, &table_name)? {
+                // 採番方式の表（TABLE-23・Issue #2199）では `WHERE id = <n>` は物理キーの直接指定ではなく
+                // 通常の述語（`id` は宣言した列）なので、述語形 DML へ戻す。
+                let stmt = match stmt {
+                    crate::sql::allowlist::DeleteStatement::SingleRow(v)
+                        if allocated_table(&storage_lookup, &table_name) =>
+                    {
+                        crate::sql::allowlist::DeleteStatement::Predicate(v.into_predicate_form()?)
+                    }
+                    other => other,
+                };
                 if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
+                    crate::sql::allowlist::reject_partitioned_single_row_form(
+                        &storage_lookup,
+                        &table_name,
+                        v.partitioned(),
+                        v.where_predicates(),
+                    )?;
                     self.check_partitioned_chunk(v.partitioned())?;
                 }
                 return Ok(ParsedSql::Delete(stmt));
@@ -4476,7 +4511,24 @@ impl EngineCore {
                 }
             };
             if crate::sql::allowlist::TableLookup::table_exists(&storage_lookup, &table_name)? {
+                // 採番方式の表では単一行形 `WHERE id = <n>` を述語形へ戻す（DELETE と同じ。Issue #2199）。
+                let stmt = match stmt {
+                    crate::sql::allowlist::ValidatedUpdateForm::Single(v)
+                        if allocated_table(&storage_lookup, &table_name) =>
+                    {
+                        crate::sql::allowlist::ValidatedUpdateForm::Predicate(
+                            v.into_predicate_form()?,
+                        )
+                    }
+                    other => other,
+                };
                 if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
+                    crate::sql::allowlist::reject_partitioned_single_row_form(
+                        &storage_lookup,
+                        &table_name,
+                        v.partitioned(),
+                        v.where_predicates(),
+                    )?;
                     self.check_partitioned_chunk(v.partitioned())?;
                 }
                 return Ok(ParsedSql::Update(stmt));
@@ -4949,25 +5001,16 @@ impl EngineCore {
         // `INSERT INTO <表> ( <列> {, <列>} ) VALUES`（構文は `Parser::parse_insert` が
         // 保証する形。ここでは型の引き当てだけに使い、崩れていれば未解決として扱う）。
         let insert_target: Option<(String, Vec<String>)> = insert_target_from_tokens(tokens);
-        // INSERT／UPDATE／DELETE（対象がビューのときの公開列→基表の列の型引き。TABLE-43・
-        // Issue #1671・#1672）。
-        let is_write = matches!(
-            tokens.first(),
-            Some(Token::Ident(w))
-                if w.eq_ignore_ascii_case("INSERT")
-                    || w.eq_ignore_ascii_case("UPDATE")
-                    || w.eq_ignore_ascii_case("DELETE")
-        );
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
             let id_type = || Some(PreparedParamType::Column(ColumnMeta::Id));
             let (schema, column) = match self.storage.get_table_schema(table) {
-                Ok(_) if column == "id" => return id_type(),
+                Ok(schema) if column == "id" && schema.has_pseudo_id() => return id_type(),
                 Ok(schema) => (schema, column.to_string()),
-                // 表でなければ、書き込み文に限りビューの公開列を基表の列へ解決して型を引く
-                // （TABLE-43・Issue #1671・#1672）。公開名 `id` でも物理列へ解決してから疑似列かを
+                // 表でなければ、ビューの公開列を基表の列へ解決して型を引く（書き込み文・読み取り文とも。
+                // TABLE-43・Issue #1671・#1672・#2199）。公開名 `id` でも物理列へ解決してから疑似列かを
                 // 判定する（TEXT 列を `id` として公開するビューで `$n` を整数と誤推論しない）。
                 // 解決できなければ、`id` は従来どおり疑似列、他は未解決（`Text`）。
-                Err(_) if is_write => {
+                Err(_) => {
                     let resolved = self
                         .storage
                         .with_view_write_snapshot(table, |snap, _| {
@@ -4984,10 +5027,8 @@ impl EngineCore {
                         None => return None,
                     }
                 }
-                Err(_) if column == "id" => return id_type(),
-                Err(_) => return None,
             };
-            if column == "id" {
+            if column == "id" && schema.has_pseudo_id() {
                 return id_type();
             }
             let def = schema.columns.iter().find(|c| c.name == column)?;
@@ -9837,6 +9878,49 @@ impl EngineCore {
         bound: &crate::sql::parser::BoundDelete,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         crate::sql::exec::execute_delete(&self.storage, ctx, bound, self.ledger_mode)
+    }
+
+    /// [`Self::execute_bound_delete_in_session`] の束縛時スキーマ検査付き版（Issue #2199）。
+    /// `check` が受け取るスキーマは実行（write トランザクション内の再照合）と同一世代で、
+    /// `check` が `Err` ならば書き込まずにそのまま返す。write 側は束縛時スキーマと現スキーマの
+    /// 不一致を fail-closed で拒否するため、検査後に並行 DDL で表が差し替わっても素通りしない。
+    /// `wire-server::http::query::delete` の単一行形が、採番方式の表を `id` 直指定で
+    /// 触らせないために使う。`operation_id` 必須化ガードはスキーマ取得より前に判定する。
+    pub fn execute_bound_delete_checked_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        bound: &crate::sql::parser::BoundDelete,
+        check: F,
+    ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<(), crate::sql::allowlist::SqlSurfaceError>,
+    {
+        let ledger_write = self
+            .ledger_mode
+            .resolve(bound.operation_id.as_ref())
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+        let (read_txn, schema) = self.read_txn_with_schema(&bound.table)?;
+        check(&schema)?;
+        drop(read_txn);
+        match crate::tenant::delete_row_ledgered_capturing_unchecked(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            &bound.table,
+            ctx,
+            bound.id,
+            ledger_write,
+            Some(&schema),
+            None,
+        ) {
+            Ok((crate::tenant::DeleteRowOutcome::Deleted, _)) => {
+                Ok(crate::sql::exec::DeleteOutcome { rows_affected: 1 })
+            }
+            Ok((crate::tenant::DeleteRowOutcome::NotFound, _)) => {
+                Ok(crate::sql::exec::DeleteOutcome { rows_affected: 0 })
+            }
+            Err(e) => Err(crate::sql::exec::map_write_error(e, "delete")),
+        }
     }
 
     /// NoSQL 表層 `update` op の `filter`（述語形。TASK-186・NOSQL-12、

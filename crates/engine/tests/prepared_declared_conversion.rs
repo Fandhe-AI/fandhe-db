@@ -28,7 +28,7 @@ fn setup(label: &str) -> (EngineCore, CleanupGuard) {
     core.execute_sql_in_session(
         &ctx,
         &mut session,
-        "CREATE TABLE m (sm SMALLINT, n INTEGER, b BIGINT, r REAL, d DOUBLE PRECISION, \
+        "CREATE TABLE m (id BIGINT PRIMARY KEY, sm SMALLINT, n INTEGER, b BIGINT, r REAL, d DOUBLE PRECISION, \
          nu NUMERIC(10,2), flag BOOLEAN, t TEXT, vc VARCHAR(20), ch CHAR(5), dt DATE, \
          tm TIME, ts TIMESTAMP, tz TIMESTAMPTZ, iv INTERVAL, js JSON, jb JSONB, u UUID, \
          bt BYTEA, v VECTOR(3), arr INTEGER[])",

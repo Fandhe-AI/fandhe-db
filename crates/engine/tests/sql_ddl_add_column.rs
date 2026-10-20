@@ -1809,7 +1809,7 @@ fn create_table_bytea_default_is_accepted_and_applied_on_omission() {
     core.execute_sql_in_session(
         &owner,
         &mut s,
-        "CREATE TABLE bt (embedding VECTOR(2), b BYTEA DEFAULT '\\x01')",
+        "CREATE TABLE bt (id BIGINT PRIMARY KEY, embedding VECTOR(2), b BYTEA DEFAULT '\\x01')",
     )
     .expect("CREATE TABLE with BYTEA DEFAULT");
     core.execute_sql_in_session(
@@ -1830,7 +1830,7 @@ fn create_table_bytea_default_is_accepted_and_applied_on_omission() {
         .execute_sql_in_session(
             &owner,
             &mut s,
-            "CREATE TABLE bt2 (embedding VECTOR(2), b BYTEA DEFAULT 'ab')",
+            "CREATE TABLE bt2 (id BIGINT PRIMARY KEY, embedding VECTOR(2), b BYTEA DEFAULT 'ab')",
         )
         .expect_err("malformed hex");
     assert_eq!(err.wire_code(), "22P02");
@@ -2056,7 +2056,7 @@ fn create_table_array_default_is_accepted_and_applied_on_omission() {
     core.execute_sql_in_session(
         &owner,
         &mut s,
-        "CREATE TABLE at (embedding VECTOR(2), m mood[] DEFAULT '{happy}', n INTEGER[] DEFAULT '{1,2}')",
+        "CREATE TABLE at (id BIGINT PRIMARY KEY, embedding VECTOR(2), m mood[] DEFAULT '{happy}', n INTEGER[] DEFAULT '{1,2}')",
     )
     .expect("CREATE TABLE with array DEFAULT");
     core.execute_sql_in_session(
@@ -2083,11 +2083,11 @@ fn create_table_array_default_is_accepted_and_applied_on_omission() {
     );
     for (sql, code) in [
         (
-            "CREATE TABLE at2 (embedding VECTOR(2), m mood[] DEFAULT '{angry}')",
+            "CREATE TABLE at2 (id BIGINT PRIMARY KEY, embedding VECTOR(2), m mood[] DEFAULT '{angry}')",
             "22P02",
         ),
         (
-            "CREATE TABLE at3 (embedding VECTOR(2), n INTEGER[] DEFAULT 1)",
+            "CREATE TABLE at3 (id BIGINT PRIMARY KEY, embedding VECTOR(2), n INTEGER[] DEFAULT 1)",
             "42601",
         ),
     ] {

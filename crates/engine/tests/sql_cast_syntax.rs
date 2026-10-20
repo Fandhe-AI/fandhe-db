@@ -21,6 +21,12 @@ use engine::storage::{Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 fn ctx(tenant: &str) -> PolicyContext {
@@ -31,7 +37,7 @@ fn ctx(tenant: &str) -> PolicyContext {
 fn run(core: &EngineCore, tenant: &str, sql: &str) -> Result<SqlOutcome, SqlSurfaceError> {
     let mut s = SessionState::default();
     s.allow_ddl();
-    core.execute_sql_in_session(&ctx(tenant), &mut s, sql)
+    core.execute_sql_in_session_legacy(&ctx(tenant), &mut s, sql)
 }
 
 fn ok(core: &EngineCore, tenant: &str, sql: &str) {
@@ -571,7 +577,7 @@ fn cast_in_function_body_is_validated_and_bound_at_call() {
     let mut session = SessionState::default();
     session.allow_ddl();
     let c = ctx("alice");
-    let mut exec = |sql: &str| core.execute_sql_in_session(&c, &mut session, sql);
+    let mut exec = |sql: &str| core.execute_sql_in_session_legacy(&c, &mut session, sql);
     exec("CREATE FUNCTION f(x) AS CAST(x AS text)").expect("define text cast");
     exec("CREATE FUNCTION g(x) AS CAST(x AS integer)").expect("define integer cast");
     exec("CREATE FUNCTION h(x) AS CAST(x AS date)").expect("define date cast");

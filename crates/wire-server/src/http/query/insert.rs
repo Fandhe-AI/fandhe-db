@@ -401,6 +401,7 @@ pub fn execute(
             rows.len(),
             operation_id.as_ref(),
             |schema| {
+                super::gate::reject_allocated_schema(schema)?;
                 bind_rows(rows, table, operation_id.as_ref(), schema).map_err(|e| match e {
                     InsertError::Bind(err) | InsertError::Exec(err) => err,
                     // `bind_rows`（`bind_row` を行ごとに呼ぶ）は列キーの識別子形状検査

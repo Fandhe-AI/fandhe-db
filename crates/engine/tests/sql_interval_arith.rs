@@ -277,7 +277,7 @@ fn seed(core: &EngineCore, s: &mut SessionState) {
     ok(
         core,
         s,
-        "CREATE TABLE ev (ts TIMESTAMP, d DATE, v INTERVAL, tz TIMESTAMPTZ, n INTEGER)",
+        "CREATE TABLE ev (id BIGINT PRIMARY KEY, ts TIMESTAMP, d DATE, v INTERVAL, tz TIMESTAMPTZ, n INTEGER)",
     );
     for (id, ts, d, v, n) in [
         (1, "2024-01-31 10:00:00", "2024-01-31", "'1 mon'", 2),
@@ -556,7 +556,11 @@ fn literal_errors_and_unsupported_forms_fail_closed() {
         "42601"
     );
     // 列名 `interval` は引き続き使える。
-    ok(&core, &mut s, "CREATE TABLE named (interval INTEGER)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE named (id BIGINT PRIMARY KEY, interval INTEGER)",
+    );
     ok(
         &core,
         &mut s,
@@ -599,7 +603,7 @@ fn check_constraint_with_interval_roundtrips_and_rejects_session_tz() {
     ok(
         &core,
         &mut s,
-        "CREATE TABLE c (ts TIMESTAMP, tz TIMESTAMPTZ, \
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, ts TIMESTAMP, tz TIMESTAMPTZ, \
          CHECK (ts + INTERVAL '1 day' > ts))",
     );
     ok(
@@ -621,7 +625,7 @@ fn check_constraint_with_interval_roundtrips_and_rejects_session_tz() {
         code(
             &core,
             &mut s,
-            "CREATE TABLE c2 (tz TIMESTAMPTZ, CHECK (tz + INTERVAL '1 day' > tz))"
+            "CREATE TABLE c2 (id BIGINT PRIMARY KEY, tz TIMESTAMPTZ, CHECK (tz + INTERVAL '1 day' > tz))"
         ),
         "0A000"
     );

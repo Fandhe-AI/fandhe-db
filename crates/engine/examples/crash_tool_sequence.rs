@@ -41,6 +41,13 @@ use engine::storage::{Storage, Visibility};
 
 /// write/verify で固定して使うテナント識別子（単一テナントのクラッシュ耐性検証が目的。
 /// `crash_tool_unique_index.rs` と同方針）。
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// この crash ツールは行 id を行の識別に使う従来方式の契約を検証するため、`CREATE TABLE` を従来方式の
+// 表作成へ振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
+
 const CRASH_TOOL_TENANT_ID: &str = "crash-tool-sequence-tenant";
 /// 検証対象の表。
 const TABLE: &str = "seq_rows";
@@ -126,7 +133,7 @@ fn ensure_schema(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
         format!("CREATE SEQUENCE {SEQ2}"),
         format!("CREATE TABLE {TABLE} (n BIGINT DEFAULT nextval('{SEQ}'), via TEXT)"),
     ] {
-        match core.execute_sql_in_session(ctx, &mut session, &sql) {
+        match core.execute_sql_in_session_legacy(ctx, &mut session, &sql) {
             Ok(_) => {}
             Err(e) if is_already_exists(&e) => {}
             Err(e) => return Err(format!("ddl failed ({sql}): {e}")),
@@ -200,7 +207,7 @@ fn execute_row(core: &EngineCore, ctx: &PolicyContext, id: u64) -> Result<i64, S
         value.ok_or_else(|| "txn insert produced no value".to_string())
     } else {
         let out = core
-            .execute_sql_in_session(ctx, &mut session, &sql)
+            .execute_sql_in_session_legacy(ctx, &mut session, &sql)
             .map_err(|e| format!("insert failed at id={id}: {e}"))?;
         returned_value(out)
     }
@@ -356,7 +363,7 @@ fn finish_inner(path: &str) -> Result<(u64, i64), String> {
 
     // (i) 同じ op・同じ内容の再送は台帳が拒否する（再実行も採番もしない）。
     let mut session = SessionState::default();
-    match core.execute_sql_in_session(&ctx, &mut session, &insert_sql(last_id)) {
+    match core.execute_sql_in_session_legacy(&ctx, &mut session, &insert_sql(last_id)) {
         Err(SqlSurfaceError::DuplicateOperationId) => {}
         Err(e) => {
             return Err(format!(
@@ -378,7 +385,7 @@ fn finish_inner(path: &str) -> Result<(u64, i64), String> {
         "INSERT INTO {TABLE} (id, n, via) VALUES ({last_id}, nextval('{SEQ2}'), 'values') \
          RETURNING n USING OPERATION_ID 'seq-{last_id}'"
     );
-    match core.execute_sql_in_session(&ctx, &mut session, &mismatch) {
+    match core.execute_sql_in_session_legacy(&ctx, &mut session, &mismatch) {
         Err(SqlSurfaceError::OperationIdContentMismatch) => {}
         Err(e) => {
             return Err(format!(
@@ -416,7 +423,7 @@ fn finish_inner(path: &str) -> Result<(u64, i64), String> {
     // （再起動直後のプロセスなので、メモリ上の先行払い出しは無い）。
     let new_id = last_id.checked_add(1).ok_or("row id overflow")?;
     let out = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &ctx,
             &mut session,
             &format!(
@@ -475,7 +482,7 @@ fn self_check_inner(path: &str) -> Result<(), String> {
     ensure_schema(&core, &ctx)?;
     let mut session = SessionState::default();
     for (id, n) in [(1u64, 5i64), (2, 5)] {
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &ctx,
             &mut session,
             &format!(

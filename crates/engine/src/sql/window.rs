@@ -1822,7 +1822,9 @@ fn build_result(
         // 行集合が食い違った場合に静かに誤った行へウィンドウ値を付けてしまわない
         // よう `id` の一致も確認する（他テナントの可視 `Public` 行と衝突しうる
         // `id` 自体を対応付けキーにはしない。P1 レビュー指摘対応）。
-        if mat_row.id != base_row.id {
+        // 採番方式の表（TABLE-23）は基底走査の `id` が `0` にマスク済みで生 rowid と比較できない
+        // ため、この `id` 突合は従来方式の表に限る（`base_row.id` はマスク後、`mat_row.id` は生値）。
+        if !schema.is_allocated() && mat_row.id != base_row.id {
             return Err(window_bug(
                 "window scan row correlation id mismatch between materialize and base scan",
             ));

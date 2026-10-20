@@ -50,7 +50,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     core.execute_sql_in_session(
         &sys,
         &mut session,
-        "CREATE TABLE orders (code TEXT PRIMARY KEY, sku TEXT UNIQUE)",
+        "CREATE TABLE orders (id BIGINT NOT NULL UNIQUE, code TEXT PRIMARY KEY, sku TEXT UNIQUE)",
     )
     .expect("create table");
     (Arc::new(core), guard)
@@ -206,7 +206,7 @@ fn new_core_with_notes() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     core.execute_sql_in_session(
         &sys,
         &mut session,
-        "CREATE TABLE notes (code TEXT, sku TEXT)",
+        "CREATE TABLE notes (id BIGINT PRIMARY KEY, code TEXT, sku TEXT)",
     )
     .expect("create notes");
     (core, guard)

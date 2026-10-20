@@ -75,7 +75,8 @@ fn err(core: &EngineCore, c: &PolicyContext, sql: &str) -> String {
     }
 }
 
-const CREATE_DOCS: &str = "CREATE TABLE docs (code TEXT UNIQUE, embedding VECTOR(2) NOT NULL)";
+const CREATE_DOCS: &str =
+    "CREATE TABLE docs (id BIGINT PRIMARY KEY, code TEXT UNIQUE, embedding VECTOR(2) NOT NULL)";
 
 /// `ids` の行を 1 文（1 txn）で投入する SQL。`code` は `<prefix><id>`。
 fn insert_sql(prefix: &str, first: u64, count: u64, op: &str) -> String {

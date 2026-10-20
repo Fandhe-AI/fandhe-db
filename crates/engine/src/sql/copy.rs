@@ -516,22 +516,28 @@ fn bind_copy_record(
     schema: &TableSchema,
     clock: crate::sql::time_fn::StatementClock,
 ) -> Result<BoundInsert, SqlSurfaceError> {
-    let id_pos = columns.iter().position(|c| c == "id").ok_or_else(|| {
-        SqlSurfaceError::invalid_input("COPY column list must include the id pseudo-column")
-    })?;
-    let id_field = fields
-        .get(id_pos)
-        .and_then(|f| f.as_ref())
-        .ok_or_else(|| SqlSurfaceError::invalid_input("id pseudo-column value must not be NULL"))?;
-    let id: u64 = id_field
-        .parse()
-        .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed id value: {id_field}")))?;
+    // 疑似列 `id` を持つのは従来方式の表だけ（TABLE-23・Issue #2199）。採番方式の表では行の識別子は
+    // 書き込み段が払い出し、`BoundInsert.id` は使われない固定値 0。
+    let has_pseudo_id = schema.has_pseudo_id();
+    let id: u64 = if has_pseudo_id {
+        let id_pos = columns.iter().position(|c| c == "id").ok_or_else(|| {
+            SqlSurfaceError::invalid_input("COPY column list must include the id pseudo-column")
+        })?;
+        let id_field = fields.get(id_pos).and_then(|f| f.as_ref()).ok_or_else(|| {
+            SqlSurfaceError::invalid_input("id pseudo-column value must not be NULL")
+        })?;
+        id_field.parse().map_err(|_| {
+            SqlSurfaceError::invalid_input(format!("malformed id value: {id_field}"))
+        })?
+    } else {
+        0
+    };
 
     let mut bound_values: Vec<Value> = vec![Value::Null; schema.columns.len()];
     let mut provided = vec![false; schema.columns.len()];
 
     for (name, field) in columns.iter().zip(fields.iter()) {
-        if name == "id" {
+        if has_pseudo_id && name == "id" {
             continue;
         }
         let col_idx = schema
@@ -769,8 +775,14 @@ impl CopyInSession {
         columns: &[String],
         schema: &TableSchema,
     ) -> Result<(), SqlSurfaceError> {
+        // 従来方式の表は疑似列 `id` が必須（採番方式の表は `id` を要求しない。Issue #2199）。
+        if schema.has_pseudo_id() && !columns.iter().any(|c| c == "id") {
+            return Err(SqlSurfaceError::invalid_input(
+                "COPY column list must include the id pseudo-column",
+            ));
+        }
         for name in columns {
-            if name == "id" {
+            if schema.has_pseudo_id() && name == "id" {
                 continue;
             }
             if !schema.columns.iter().any(|c| &c.name == name) {

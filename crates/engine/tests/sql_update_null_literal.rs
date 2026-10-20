@@ -78,7 +78,7 @@ fn setup(label: &str) -> (EngineCore, CleanupGuard) {
     let (core, g) = new_core(label);
     ddl(
         &core,
-        "CREATE TABLE docs (lang TEXT, req TEXT NOT NULL DEFAULT 'r', u TEXT UNIQUE)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, lang TEXT, req TEXT NOT NULL DEFAULT 'r', u TEXT UNIQUE)",
     );
     for (id, tenant) in [(1, "alice"), (2, "alice"), (3, "alice"), (4, "bob")] {
         ok(
@@ -171,7 +171,10 @@ fn set_null_on_not_null_column_is_23502_and_leaves_all_rows() {
 #[test]
 fn set_null_on_primary_key_column_is_23502() {
     let (core, _g) = new_core("upd-null-pk");
-    ddl(&core, "CREATE TABLE pk (k TEXT PRIMARY KEY, v TEXT)");
+    ddl(
+        &core,
+        "CREATE TABLE pk (id BIGINT NOT NULL UNIQUE, k TEXT PRIMARY KEY, v TEXT)",
+    );
     ok(
         &core,
         "alice",
@@ -285,7 +288,10 @@ fn scalar_index_hit_drops_row_updated_to_null() {
 #[test]
 fn vector_column_null_keeps_current_codes() {
     let (core, _g) = new_core("upd-null-vector");
-    ddl(&core, "CREATE TABLE v (embedding VECTOR(2), note TEXT)");
+    ddl(
+        &core,
+        "CREATE TABLE v (id BIGINT PRIMARY KEY, embedding VECTOR(2), note TEXT)",
+    );
     ok(
         &core,
         "alice",

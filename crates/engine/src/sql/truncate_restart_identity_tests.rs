@@ -63,7 +63,11 @@ fn fixture(label: &str, seq_ddl: &str) -> (std::path::PathBuf, CleanupGuard, Eng
     let guard = CleanupGuard(path.clone());
     let core = open_core(&path);
     ok(&core, "sys", seq_ddl);
-    ok(&core, "sys", "CREATE TABLE t (n BIGINT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)",
+    );
     core.storage_for_test()
         .set_sequence_owner("s", owner("t"))
         .expect("set owner");
@@ -87,8 +91,9 @@ fn column_n(core: &EngineCore, tenant: &str) -> Vec<i64> {
         .rows
         .iter()
         .map(|row| {
+            // 宣言した `id BIGINT` 列（TABLE-23・Issue #2199 以降の表は暗黙の `id` を持たない）。
             let id = match row.cells[0] {
-                Cell::Integer(v) => v,
+                Cell::SignedInteger(v) => u64::try_from(v).expect("non-negative id"),
                 ref o => panic!("id cell {o:?}"),
             };
             let n = match row.cells[1] {
@@ -176,7 +181,11 @@ fn restart_identity_ignores_unowned_sequences() {
     let _g = CleanupGuard(path.clone());
     let core = open_core(&path);
     ok(&core, "sys", "CREATE SEQUENCE s");
-    ok(&core, "sys", "CREATE TABLE t (n BIGINT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)",
+    );
     insert_next(&core, "alice", 1, "a1");
     insert_next(&core, "alice", 2, "a2");
     truncate(&core, "alice", "RESTART IDENTITY", "r1");
@@ -192,11 +201,15 @@ fn restart_identity_follows_cascade_closure_and_rejection_keeps_state() {
     let _g = CleanupGuard(path.clone());
     let core = open_core(&path);
     ok(&core, "sys", "CREATE SEQUENCE s");
-    ok(&core, "sys", "CREATE TABLE p (id_ BIGINT PRIMARY KEY)");
     ok(
         &core,
         "sys",
-        "CREATE TABLE t (n BIGINT, ref_ BIGINT REFERENCES p (id_))",
+        "CREATE TABLE p (id BIGINT NOT NULL UNIQUE, id_ BIGINT PRIMARY KEY)",
+    );
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT, ref_ BIGINT REFERENCES p (id_))",
     );
     core.storage_for_test()
         .set_sequence_owner("s", owner("t"))
@@ -318,7 +331,11 @@ fn restart_identity_in_transaction_without_owned_sequence_succeeds() {
     let path = unique_db_path("trunc-restart-txn-noseq");
     let _g = CleanupGuard(path.clone());
     let core = open_core(&path);
-    ok(&core, "sys", "CREATE TABLE t (n BIGINT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)",
+    );
     ok(
         &core,
         "alice",

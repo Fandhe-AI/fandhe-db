@@ -68,15 +68,22 @@ pub(crate) fn rewrite_view_insert(
             });
         }
     }
-    let (base_table, view_columns, column_map, check_predicates) =
+    let (base_table, view_columns, column_map, check_predicates, base_allocated) =
         match resolve_from(lookup, &shape.table_name)? {
             Resolved::View {
                 base_table,
                 view_columns,
                 column_map,
                 check_predicates,
+                base_allocated,
                 ..
-            } => (base_table, view_columns, column_map, check_predicates),
+            } => (
+                base_table,
+                view_columns,
+                column_map,
+                check_predicates,
+                base_allocated,
+            ),
             // 自動更新可能と判定済みなのに `View` 以外になるのは不変条件違反（固定文言。fail-closed）。
             _ => {
                 return Err(SqlSurfaceError::Internal {
@@ -87,6 +94,7 @@ pub(crate) fn rewrite_view_insert(
     let mapper = Mapper {
         columns: view_columns.as_deref(),
         map: column_map.as_deref(),
+        base_allocated,
     };
 
     // 列リスト。写像後に物理列が重複したら、公開名を示して拒否する（物理名は出さない）。
@@ -142,11 +150,13 @@ pub(crate) fn resolve_insert_column(
             base_table,
             view_columns,
             column_map,
+            base_allocated,
             ..
         } => {
             let mapper = Mapper {
                 columns: view_columns.as_deref(),
                 map: column_map.as_deref(),
+                base_allocated,
             };
             let physical = mapper.physical(public).ok()?;
             Some((base_table, physical))
@@ -242,6 +252,8 @@ pub(crate) struct Mapper<'a> {
     pub(crate) columns: Option<&'a [String]>,
     /// 列別名の対応。`None` は公開名＝物理名。
     pub(crate) map: Option<&'a [(String, String)]>,
+    /// 基表が採番方式（疑似列 `id` を持たない。Issue #2199）か。真のとき `id` へ写る別名も通常列。
+    pub(crate) base_allocated: bool,
 }
 
 impl Mapper<'_> {
@@ -266,7 +278,7 @@ impl Mapper<'_> {
                 .unwrap_or_else(|| public.to_string()),
             None => public.to_string(),
         };
-        if physical == "id" && public != "id" {
+        if !self.base_allocated && physical == "id" && public != "id" {
             return Err(SqlSurfaceError::feature_not_supported(
                 "writing to a view column aliased to the row id is not supported",
             ));

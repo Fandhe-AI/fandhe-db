@@ -270,7 +270,7 @@ impl<'a> BindingScope<'a> {
                 column_type: Some(schema.columns[index].ty.clone()),
             });
         }
-        if name == "id" {
+        if name == "id" && schema.has_pseudo_id() {
             return Some(ResolvedColumn {
                 relation: position,
                 slot: ColumnSlot::Id,

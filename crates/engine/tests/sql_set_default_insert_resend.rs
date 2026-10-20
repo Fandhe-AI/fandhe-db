@@ -67,7 +67,7 @@ fn setup(label: &str) -> (EngineCore, std::path::PathBuf) {
     let core = open_core(&path);
     ok(
         &core,
-        "CREATE TABLE docs (a TEXT, c TEXT DEFAULT 'old', t TIMESTAMP DEFAULT now())",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, a TEXT, c TEXT DEFAULT 'old', t TIMESTAMP DEFAULT now())",
     );
     (core, path)
 }
@@ -233,7 +233,7 @@ fn resend_after_default_change_on_not_null_column_is_duplicate() {
     let core = open_core(&path);
     ok(
         &core,
-        "CREATE TABLE nn (a TEXT, c TEXT NOT NULL DEFAULT 'old')",
+        "CREATE TABLE nn (id BIGINT PRIMARY KEY, a TEXT, c TEXT NOT NULL DEFAULT 'old')",
     );
     let single = "INSERT INTO nn (id, a) VALUES (1, 'x') USING OPERATION_ID 'nn-s'";
     let multi = "INSERT INTO nn (id, a) VALUES (11, 'x'), (12, 'y') USING OPERATION_ID 'nn-m'";

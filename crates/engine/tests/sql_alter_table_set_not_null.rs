@@ -60,7 +60,11 @@ fn setup(label: &str) -> (EngineCore, std::path::PathBuf, SessionState) {
     let storage = Storage::open(&path).expect("open storage");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let mut session = ddl_session();
-    ok(&core, &mut session, "CREATE TABLE docs (a TEXT, b TEXT)");
+    ok(
+        &core,
+        &mut session,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, a TEXT, b TEXT)",
+    );
     (core, path, session)
 }
 
@@ -144,7 +148,7 @@ fn empty_table_and_already_not_null_succeed() {
     ok(
         &core,
         &mut session,
-        "CREATE TABLE keyed (code TEXT PRIMARY KEY, v VECTOR(3))",
+        "CREATE TABLE keyed (id BIGINT NOT NULL UNIQUE, code TEXT PRIMARY KEY, v VECTOR(3))",
     );
     ok(
         &core,
@@ -260,21 +264,25 @@ fn permission_and_explicit_transaction_gates() {
 fn foreign_key_interaction() {
     let (core, path, mut session) = setup("set-nn-fk");
     let _guard = CleanupGuard(path);
-    ok(&core, &mut session, "CREATE TABLE parent (k TEXT UNIQUE)");
     ok(
         &core,
         &mut session,
-        "CREATE TABLE c1 (r TEXT, FOREIGN KEY (r) REFERENCES parent (k) ON DELETE SET NULL)",
+        "CREATE TABLE parent (id BIGINT PRIMARY KEY, k TEXT UNIQUE)",
     );
     ok(
         &core,
         &mut session,
-        "CREATE TABLE c2 (r TEXT, FOREIGN KEY (r) REFERENCES parent (k) ON UPDATE CASCADE)",
+        "CREATE TABLE c1 (id BIGINT PRIMARY KEY, r TEXT, FOREIGN KEY (r) REFERENCES parent (k) ON DELETE SET NULL)",
     );
     ok(
         &core,
         &mut session,
-        "CREATE TABLE c3 (r TEXT, FOREIGN KEY (r) REFERENCES parent (k))",
+        "CREATE TABLE c2 (id BIGINT PRIMARY KEY, r TEXT, FOREIGN KEY (r) REFERENCES parent (k) ON UPDATE CASCADE)",
+    );
+    ok(
+        &core,
+        &mut session,
+        "CREATE TABLE c3 (id BIGINT PRIMARY KEY, r TEXT, FOREIGN KEY (r) REFERENCES parent (k))",
     );
     assert_eq!(
         code(

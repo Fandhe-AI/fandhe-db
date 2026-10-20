@@ -103,7 +103,11 @@ fn one(core: &EngineCore, s: &mut SessionState, sql: &str) -> String {
 }
 
 fn seed(core: &EngineCore, s: &mut SessionState) {
-    ok(core, s, "CREATE TABLE iv (v INTERVAL, ts TIMESTAMP)");
+    ok(
+        core,
+        s,
+        "CREATE TABLE iv (id BIGINT PRIMARY KEY, v INTERVAL, ts TIMESTAMP)",
+    );
     for (id, v) in [
         (1, "'1 year 2 mons 3 days 04:05:06.789'"),
         (2, "'-1 day -25:30:00'"),
@@ -428,7 +432,7 @@ fn error_messages_do_not_echo_values_and_tenants_are_isolated() {
         "bob",
         &core,
         &mut bob,
-        "CREATE TABLE iv (v INTERVAL, ts TIMESTAMP)",
+        "CREATE TABLE iv (id BIGINT PRIMARY KEY, v INTERVAL, ts TIMESTAMP)",
     )
     .ok();
     let r = run_as(
@@ -454,7 +458,7 @@ fn check_constraint_with_interval_part_roundtrips() {
     ok(
         &core,
         &mut s,
-        "CREATE TABLE c (v INTERVAL, CHECK (date_part('day', v) >= 0))",
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, v INTERVAL, CHECK (date_part('day', v) >= 0))",
     );
     ok(
         &core,
