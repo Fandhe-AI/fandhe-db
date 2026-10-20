@@ -186,3 +186,14 @@ ADR §3 の D1・D2・D3 と、§4「表のライフサイクル」の項、D8 �
 - 永続化: 検索系の構造はいずれもメモリ上のみで、オンディスク形式・カタログ版の変更はない。
 - 回帰ガード: `tests/table23_search_rowid.rs`（同点を含む kNN の `id` 昇順）。`cargo test --workspace` は全件通過（12414 件）。
 - 未検証: Recall 層 B の再計測（閾値は非公開環境変数が必要なためオーナーが `recall.yml` で再計測）・GPU 実機の同一性。
+
+## 9. Issue #2196 実装記録（第 4 段: 台帳・content_hash・分割実行カーソル）
+
+挙動不変の型レベル移行。契約本文は spec のポインタ（TABLE-23・RECOVER-10〜12・SQL-32）を正とし、ここには書かない。
+
+- 分割実行 DML のカーソルを `RowId` へ移した（`recovery/partitioned_job.rs`・`tenant/partitioned_dml.rs`）。永続のジョブ記録（v1／v2）は不変で、`RowId::{to,from}_job_cursor_raw`・`RowId::MIN`／`MAX` を入出口とした。§7 の棚卸し表「分割実行 DML のカーソル」の後続結果はこれ。
+- `content_hash`: 行識別の材料は要求由来の `id`（主キー）値であり、物理 rowid を含めない契約をモジュール doc に明文化した。シグネチャ・バイト列は不変（golden を追加。変更前の実装から採取した値のまま固定）。
+- `ledger.rs`: 台帳は行識別子を保持しないことを明記した（コード変更なし）。
+- 互換テスト: `recovery/table23_ledger_compat_tests.rs` が台帳 v1／v2／v3 とジョブ記録 v1 の旧バイト列を注入し、再オープン後の再送判定が従来どおりであることを固定する。
+- 残した境界: 適用段（`apply_predicate_*_in_txn`）への `legacy_id()` 変換と `DmlCandidate.id`。`UpsertHashTarget::RowId` は `ON CONFLICT (id)` を指す印で物理 rowid ではない（名前の整理は #2197／#2199）。採番方式の表のゲートは開けていない。
+- 未検証: ローカルで未実行の CI ジョブは PR に記載する。

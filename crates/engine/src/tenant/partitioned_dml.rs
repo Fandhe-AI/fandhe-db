@@ -27,7 +27,7 @@
 //!
 //! # 不変条件
 //!
-//! - 走査はテナントの閉区間 `(tenant, 0)..=(tenant, u64::MAX)` に限り、キーのテナントが
+//! - 走査はテナントの閉区間 `(tenant, RowId::MIN)..=(tenant, RowId::MAX)`（物理 rowid の閉区間）に限り、キーのテナントが
 //!   変わったら打ち切る（他テナント領域のキー・値は読まない。RLS-9・RLS-10）。
 //! - 走査行数は自テナントの行だけで数える（他テナントの行数が応答に表れない）。
 //! - 1 チャンクの走査予算はハード上限以下で、ジョブ全体には課さない（`--max-scanned-rows` と非連動）。
@@ -50,6 +50,7 @@ use crate::recovery::partitioned_job::{
     self, chunk_range, ChunkCommitOutcome, JobKey, JobRecord, PartitionedJobError, ResendDecision,
 };
 use crate::sql::parser::PartitionedDmlLimits;
+use crate::storage::rowid::{split_row_key, RowId};
 
 /// 分割実行の正常終了。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,8 +195,8 @@ impl Hooks<'static> {
 
 /// チャンク間で持ち回るメモリ上の状態。commit が成功した後にだけ更新する。
 struct JobState {
-    /// 最後に走査した id（下端排他）。`None` は先頭から。
-    cursor: Option<u64>,
+    /// 最後に走査した物理 rowid（下端排他）。`None` は先頭から（TABLE-23 (5)）。
+    cursor: Option<RowId>,
     /// commit 済みの累計処理件数。
     processed: u64,
     /// ジョブ表に `Running` 記録があるか。
@@ -523,6 +524,11 @@ fn chunk_loop<E>(
             }
         }
 
+        // 適用段（原子経路と共有。#2194 の担当範囲）は未移行で `id` 列値の `u64` 列を受ける。
+        // 従来方式の表（採番方式の表は DML ゲートで到達不能）では rowid の生値＝`id` 列値なので
+        // `legacy_id()` で変換する。#2197 でこの境界を主キー値／rowid の解決へ差し替える。
+        // 長さはチャンク幅以下で有界（走査段が候補をチャンク幅で締める）。
+        let candidate_ids: Vec<u64> = candidates.iter().map(|r| r.legacy_id()).collect();
         // 適用（原子経路と共有する適用段）。保持時間を超えたら残りを次チャンクへ回す。
         let mut stop_by_hold =
             || clock().saturating_duration_since(start) >= limits.max_writer_hold;
@@ -533,7 +539,7 @@ fn chunk_loop<E>(
                 table,
                 ctx,
                 &schema,
-                &candidates,
+                &candidate_ids,
                 fk_mode,
                 None,
                 Some(&mut stop_by_hold),
@@ -546,7 +552,7 @@ fn chunk_loop<E>(
                 table,
                 ctx,
                 &schema,
-                &candidates,
+                &candidate_ids,
                 assignments,
                 set_exprs,
                 fk_mode,
@@ -556,7 +562,7 @@ fn chunk_loop<E>(
         }
         .map_err(from_predicate_err)?;
 
-        // 打ち切った場合のカーソルは「最後に適用した候補の id」（それ以降の行は次の
+        // 打ち切った場合のカーソルは「最後に適用した候補の rowid」（それ以降の行は次の
         // チャンクで再走査・再評価される）。
         let new_cursor = if applied < candidates.len() {
             exhausted = false;
@@ -644,24 +650,24 @@ fn chunk_loop<E>(
 
 /// 1 チャンクの走査結果。
 struct ScanResult {
-    /// 述語に一致した id（昇順。長さは高々チャンク幅）。
-    candidates: Vec<u64>,
-    /// このチャンクで最後に走査した id（1 行も走査しなければ `None`）。
-    last_scanned: Option<u64>,
+    /// 述語に一致した行の物理 rowid（昇順。長さは高々チャンク幅）。
+    candidates: Vec<RowId>,
+    /// このチャンクで最後に走査した物理 rowid（1 行も走査しなければ `None`）。
+    last_scanned: Option<RowId>,
     /// 範囲を走査し尽くしたか。
     exhausted: bool,
 }
 
-/// カーソルの次からテナント所有かつ可視の範囲を走査し、述語に一致した id を集める。
+/// カーソルの次からテナント所有かつ可視の範囲を走査し、述語に一致した行の rowid を集める。
 /// 適用行数がチャンク幅・走査行数が走査予算・writer 保持時間が上限に達したら締める
-/// （判定は 1 行以上走査した後）。メモリは候補 id（チャンク幅以下）と 1 行分の作業領域
+/// （判定は 1 行以上走査した後）。メモリは候補 rowid（チャンク幅以下）と 1 行分の作業領域
 /// だけで、対象行数に比例しない。
 #[allow(clippy::too_many_arguments)]
 fn scan_chunk<E>(
     write_txn: &redb::WriteTransaction,
     table: &str,
     ctx: &PolicyContext,
-    cursor: Option<u64>,
+    cursor: Option<RowId>,
     needs_embedding: bool,
     width: usize,
     scan_budget: usize,
@@ -672,7 +678,7 @@ fn scan_chunk<E>(
 ) -> Result<ScanResult, PartitionedStopCause<E>> {
     let tenant = ctx.tenant_id();
     let Some(range) = chunk_range(tenant, cursor) else {
-        // `u64::MAX` まで走査済み（記録としては取り得ないが、取った場合も走査し尽くし）。
+        // `RowId::MAX` まで走査済み（記録としては取り得ないが、取った場合も走査し尽くし）。
         return Ok(ScanResult {
             candidates: Vec::new(),
             last_scanned: None,
@@ -683,10 +689,10 @@ fn scan_chunk<E>(
     let row_table = write_txn
         .open_table(user_rows_table_def(&row_table_name))
         .map_err(|e| w(map_row_table_error(e)))?;
-    let mut candidates: Vec<u64> = Vec::with_capacity(width.min(4096));
+    let mut candidates: Vec<RowId> = Vec::with_capacity(width.min(4096));
     let mut embedding_scratch: Vec<f32> = Vec::new();
     let mut scanned: usize = 0;
-    let mut last_scanned: Option<u64> = None;
+    let mut last_scanned: Option<RowId> = None;
     let mut exhausted = true;
 
     for entry in row_table
@@ -694,13 +700,13 @@ fn scan_chunk<E>(
         .map_err(|e| w(CatalogError::from(e)))?
     {
         let (k, v) = entry.map_err(|e| w(CatalogError::from(e)))?;
-        let (key_tenant, id) = k.value();
+        let (key_tenant, rowid) = split_row_key(k.value());
         if key_tenant != tenant {
             // 閉区間により理論上到達しない多層防御（他テナント領域は読まない）。
             break;
         }
         scanned = scanned.saturating_add(1);
-        last_scanned = Some(id);
+        last_scanned = Some(rowid);
 
         let hit: bool = 'row: {
             let buf = v.value();
@@ -723,7 +729,8 @@ fn scan_chunk<E>(
                 &[]
             };
             predicate(&DmlCandidate {
-                id,
+                // 従来方式の表の `id` 列値（採番方式の表はゲートで到達不能。#2197 で差し替え）。
+                id: rowid.legacy_id(),
                 dim,
                 embedding,
                 metadata,
@@ -731,15 +738,15 @@ fn scan_chunk<E>(
             .map_err(PartitionedStopCause::Predicate)?
         };
         if hit {
-            candidates.push(id);
+            candidates.push(rowid);
         }
 
         let close = candidates.len() >= width
             || scanned >= scan_budget
             || clock().saturating_duration_since(start) >= max_hold;
         if close {
-            // 最後の id まで走査した場合のみ、その先に行は存在しない。
-            exhausted = id == u64::MAX;
+            // 最大 rowid まで走査した場合のみ、その先に行は存在しない。
+            exhausted = rowid == RowId::MAX;
             break;
         }
     }

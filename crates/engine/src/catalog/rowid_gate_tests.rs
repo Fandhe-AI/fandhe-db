@@ -303,3 +303,56 @@ fn table23_allocated_table_search_entrances_are_rejected() {
     let text = format!("{err} {err:?}");
     assert!(!text.contains(TENANT) && !text.contains("docs"), "{text}");
 }
+
+/// Issue #2196: 分割実行 DML（カーソルを rowid 型へ移した後）も、採番方式の表では実行器へ
+/// 入る前に `0A000` の固定文言で拒否され、ジョブ記録・台帳エントリが一切作られない
+/// （fail-closed。TABLE-23・RECOVER-11・RECOVER-12 のポインタ）。拒否文面にテナント名・
+/// 表名・数字（rowid 候補）を含めない。
+#[test]
+fn table23_allocated_table_partitioned_dml_is_rejected_without_side_effects() {
+    use crate::recovery::ledger::OP_LEDGER_TABLE;
+    use crate::recovery::partitioned_job::{PARTITIONED_JOB_ACTIVE_TABLE, PARTITIONED_JOB_TABLE};
+    let (storage, _g) = allocated_table("rowid-gate-partitioned");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    for sql in [
+        "UPDATE docs SET kind = 'y' WHERE id > 0 USING OPERATION_ID 'pp-a' PARTITIONED CHUNK 2",
+        "DELETE FROM docs WHERE id > 0 USING OPERATION_ID 'pp-b' PARTITIONED CHUNK 2",
+    ] {
+        let err = run_ddl(&core, sql).expect_err(sql);
+        assert!(err.starts_with("0A000|"), "{sql}: {err}");
+        assert!(
+            err.contains("row identity mode is not supported yet"),
+            "{sql}: {err}"
+        );
+        assert!(
+            !err.contains(TENANT) && !err.contains("docs"),
+            "{sql}: {err}"
+        );
+    }
+    // 拒否は台帳・ジョブ記録より前: いずれの表にもエントリが作られていない。
+    let storage = core.storage_for_test();
+    let read = storage.db().begin_read().expect("read");
+    for (name, count) in [
+        (
+            "ledger",
+            read.open_table(OP_LEDGER_TABLE)
+                .map(|t| t.len().expect("len")),
+        ),
+        (
+            "job",
+            read.open_table(PARTITIONED_JOB_TABLE)
+                .map(|t| t.len().expect("len")),
+        ),
+        (
+            "active",
+            read.open_table(PARTITIONED_JOB_ACTIVE_TABLE)
+                .map(|t| t.len().expect("len")),
+        ),
+    ] {
+        match count {
+            Ok(n) => assert_eq!(n, 0, "{name} must stay empty"),
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => panic!("open {name}: {e}"),
+        }
+    }
+}

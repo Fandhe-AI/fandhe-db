@@ -632,6 +632,10 @@ Issue #871（述語つき UPDATE/DELETE の実行結線）は自動運転モー�
   申し送り。本 ADR は predicate 形 `UPDATE`／`DELETE` の `WHERE` から
   WASM UDF への `Call` を拒否する提案〔4.4.1 節〕のみを示す）
 
+## Issue #2196 追記（行識別の rowid／主キー基準）
+
+述語形（`for_*_where*`）のハッシュ入力は行識別子を持たない構文形のため、行ストアの物理キーの rowid 化（TABLE-23）の影響を受けず、バイト列は不変。単一行形の行識別材料の扱いは [operation-id-ledger.md](operation-id-ledger.md) の同名追記節を参照。
+
 ## 参照
 
 - `docs/spec/04-behavior/recovery.md`（RECOVER-2・RECOVER-3・RECOVER-7・

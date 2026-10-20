@@ -47,6 +47,10 @@ Issue #81（TASK-93）は、TASK-92（RECOVER-1）が必須化した `operation_
 - `crates/engine/tests/recovery_ledger.rs`（結合テスト。原子性・テーブル単位・
   テナント単位・永続性・`CompareOnlyWithoutLedger`・keep-first の検証）
 
+## Issue #2196 追記（行識別の rowid／主キー基準）
+
+親 #1710（TABLE-23 (4)・RECOVER-2・RECOVER-10 のポインタ）。台帳のキー・値（v1／v2／v3）は行識別子を保持せず、フォーマットは変更しない。内容照合ハッシュの行識別材料は**要求由来の `id`（主キー）値**で、行ストアの物理 rowid を含めない（サーバー採番値を混ぜると同一要求の再送が別ハッシュになるため）。出力バイト列は移行前後で不変で、`content_hash` の golden テスト（`id_based_hash_layouts_are_golden_across_rowid_migration` ほか）と、旧形式エントリの再送判定（`23505`／`22023`）を再オープン後に確認する `recovery/table23_ledger_compat_tests.rs` で固定した。
+
 ## 参照
 
 - `docs/spec/05-tasks.md`（TASK-92・TASK-93・TASK-94・TASK-98・TASK-101）

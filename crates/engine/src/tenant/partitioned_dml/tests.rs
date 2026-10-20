@@ -338,10 +338,10 @@ fn zero_change_chunk_does_not_create_record_until_a_row_changes() {
     assert!(matches!(
         seen.get(2),
         Some(Some(JobRecord::Running {
-            cursor: 9,
+            cursor,
             processed: 1,
             ..
-        }))
+        })) if *cursor == RowId::from_legacy_id(9)
     ));
     assert_eq!(rows_of(&storage, "t-a").len(), 8);
 }
@@ -371,19 +371,19 @@ fn zero_change_chunk_with_record_updates_cursor_only() {
     assert!(matches!(
         seen.first(),
         Some(Some(JobRecord::Running {
-            cursor: 3,
+            cursor,
             processed: 1,
             ..
-        }))
+        })) if *cursor == RowId::from_legacy_id(3)
     ));
     // 第 2 チャンク（id 4..6）は変更 0 件。記録のカーソルだけが進み、件数は据え置き。
     assert!(matches!(
         seen.get(1),
         Some(Some(JobRecord::Running {
-            cursor: 6,
+            cursor,
             processed: 1,
             ..
-        }))
+        })) if *cursor == RowId::from_legacy_id(6)
     ));
 }
 
@@ -462,10 +462,10 @@ fn hold_limit_cuts_apply_stage_and_cursor_is_last_applied_id() {
     assert!(matches!(
         seen.first(),
         Some(Some(JobRecord::Running {
-            cursor: 1,
+            cursor,
             processed: 1,
             ..
-        }))
+        })) if *cursor == RowId::from_legacy_id(1)
     ));
     assert!(rows_of(&storage, "t-a").is_empty());
 }

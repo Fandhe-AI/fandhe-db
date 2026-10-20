@@ -149,7 +149,8 @@ fn job_record(storage: &Storage, tenant: &str, op: &str) -> Option<JobRecord> {
 
 fn cursor_of(storage: &Storage, tenant: &str, op: &str) -> u64 {
     match job_record(storage, tenant, op) {
-        Some(JobRecord::Running { cursor, .. }) => cursor,
+        // 従来方式の表では rowid の生値＝`id` 列値（テストの期待値は id 列値で書く）。
+        Some(JobRecord::Running { cursor, .. }) => cursor.legacy_id(),
         other => panic!("expected Running record, got {other:?}"),
     }
 }

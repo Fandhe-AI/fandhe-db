@@ -21,6 +21,12 @@
 //! （本モジュールは「既存エントリを上書きしない（keep-first）」ことを引き続き
 //! 恒久契約として担保する）。
 //!
+//! 行識別子との関係（Issue #2196。ポインタ: TABLE-23 (4)・RECOVER-2）: 台帳のキー・値
+//! （v1／v2／v3）は行識別子（rowid・`id` 列値）を一切保持しない。行識別の互換は内容照合
+//! ハッシュの材料側（[`crate::recovery::content_hash`] の「行識別の材料」節）で担保し、
+//! 行ストアの物理キーを rowid へ分離しても台帳の値フォーマット・キー構成は変えない
+//! （旧エントリの読み取り互換は `recovery::table23_ledger_compat_tests` で固定）。
+//!
 //! TASK-98（対象ビヘイビア: RECOVER-7）で [`LAST_OP_TABLE`] を追加した（ポインタ:
 //! `docs/spec/05-tasks.md` TASK-98・`docs/spec/04-behavior/recovery.md` RECOVER-7。
 //! 契約の詳細は spec 参照）。
