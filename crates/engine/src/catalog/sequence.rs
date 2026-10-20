@@ -32,8 +32,8 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 use crate::storage::read_source::ReadSource;
 
 use super::{
-    get_table_schema_in_txn, list_tables_in_txn, validate_identifier, CatalogError, ColumnDefault,
-    Result, Storage, TableSchema, MAX_LIST_TABLES,
+    get_table_schema_in_txn, get_table_schema_in_txn_impl, list_tables_in_txn, validate_identifier,
+    CatalogError, ColumnDefault, Result, Storage, TableSchema, MAX_LIST_TABLES,
 };
 
 /// SEQUENCE 定義の専用カタログ表。キーは `(schema, name)`。#1711 より前の schema は
@@ -696,6 +696,12 @@ impl SequenceAllocator {
         }
     }
 
+    /// 保持しているカーソル件数（テストで evict の漏れを検出するための観測口）。
+    #[cfg(test)]
+    pub(crate) fn cursor_count(&self) -> usize {
+        self.cursors.lock().map_or(0, |g| g.len())
+    }
+
     /// `sequence_id` の現在値を全テナント分メモリから捨てる（`DROP SEQUENCE`・RESTART の commit 成功後。
     /// ロックの毒化は黙って握りつぶさず、次回払い出しで `Poisoned` になる）。
     pub(crate) fn evict(&self, sequence_id: u64) {
@@ -768,7 +774,9 @@ fn column_default_references_sequence(default: &ColumnDefault, name: &str) -> bo
 /// [`MAX_LIST_TABLES`] で打ち切られる（`list_tables_in_txn` の上限）。
 fn sequence_has_dependents_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
     for table_name in list_tables_in_txn(write_txn)? {
-        let schema = get_table_schema_in_txn(write_txn, &table_name)?;
+        // 依存走査はカタログ情報だけを見る。複数アクション `ALTER TABLE` の中間状態（DROP COLUMN
+        // 直後で生存列 0 本）の表も読めるよう `require_live = false` で復号する（Issue #1694）。
+        let schema = get_table_schema_in_txn_impl(write_txn, &table_name, false)?;
         if schema.columns.iter().any(|c| {
             c.default_expr
                 .as_ref()

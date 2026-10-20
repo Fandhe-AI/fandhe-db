@@ -11786,15 +11786,26 @@ impl Storage {
     pub(crate) fn alter_table_in_single_txn<T>(
         &self,
         table_name: &str,
-        f: impl FnOnce(&redb::WriteTransaction) -> std::result::Result<(T, bool), AlterCheckError>,
+        f: impl FnOnce(
+            &redb::WriteTransaction,
+        ) -> std::result::Result<(T, bool, Vec<u64>), AlterCheckError>,
     ) -> std::result::Result<T, AlterCheckError> {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        let (out, changed) = f(&write_txn)?;
+        // 第 3 要素は DROP COLUMN が道連れに削除した所有 SEQUENCE の内部 ID。commit 成功後に
+        // メモリ上の現在値を捨てる（`MAX_CURSORS` 枯渇防止。commit 失敗時は何も変えない）。
+        let (out, changed, dropped_sequence_ids) = f(&write_txn)?;
         if !changed {
             return Ok(out);
         }
         bump_table_generation_in_txn(&write_txn, table_name)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        let allocator = self.sequence_allocator();
+        crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
+            for id in &dropped_sequence_ids {
+                allocator.evict(*id);
+            }
+            crate::recovery::commit_boundary::PostCommitResult::Ok
+        })
+        .map_err(convert_storage_error)?;
         Ok(out)
     }
 
@@ -11973,9 +11984,19 @@ impl Storage {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()));
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        Self::alter_table_drop_column_in_txn(&write_txn, table_name, column_name, false)?;
+        let dropped_sequence_ids =
+            Self::alter_table_drop_column_in_txn(&write_txn, table_name, column_name, false)?;
         bump_table_generation_in_txn(&write_txn, table_name)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        // 所有 SEQUENCE のメモリ上の現在値は commit 成功後に捨てる（`drop_tables` と同じ）。
+        let allocator = self.sequence_allocator();
+        crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
+            for id in &dropped_sequence_ids {
+                allocator.evict(*id);
+            }
+            crate::recovery::commit_boundary::PostCommitResult::Ok
+        })
+        .map(|_| ())
+        .map_err(convert_storage_error)
     }
 
     /// 複数アクション `ALTER TABLE` の最後に呼ぶ検証。txn 内の現在のスキーマに生存列が 1 本以上
@@ -12009,7 +12030,7 @@ impl Storage {
         table_name: &str,
         column_name: &str,
         defer_live_check: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<u64>> {
         {
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             let existing: Vec<u8> = {
@@ -12140,12 +12161,11 @@ impl Storage {
         delete_indexes_referencing_column_in_txn(write_txn, table_name, column_name)?;
         // 列が所有する SEQUENCE（SERIAL 列等。TABLE-24・Issue #1694）も同じ txn で削除する（PostgreSQL
         // と同じ。所有者が宙に浮く状態を作らない）。他の列の `DEFAULT nextval` が参照していれば
-        // `DependentObjectsStillExist`。メモリ上の現在値は破棄しない（内部 ID は再利用しないため
-        // 別 SEQUENCE の値には化けず、残るのはプロセス内の有界なメモリのみ。再起動で消える）。
+        // `DependentObjectsStillExist`。削除した内部 ID は呼び出し側へ返し、commit 成功後に
+        // メモリ上の現在値を `SequenceAllocator::evict` で捨てさせる（カーソル枯渇の防止）。
         sequence::drop_owned_sequences_in_txn(write_txn, |owner| {
             owner.table == table_name && owner.column == column_name
-        })?;
-        Ok(())
+        })
     }
 
     /// 既存テーブルの列名を変更する（`ALTER TABLE ... RENAME [COLUMN] <old> TO <new>`。

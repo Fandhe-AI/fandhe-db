@@ -992,6 +992,7 @@ pub(crate) fn execute_alter_table_multiple(
             let mut results: Vec<Option<AlterTableAction>> = vec![None; stmt.actions.len()];
             let mut changed = false;
             let mut live_checked = false;
+            let mut dropped_sequence_ids: Vec<u64> = Vec::new();
             for &i in &order {
                 let Some(action) = stmt.actions.get(i) else {
                     continue;
@@ -1003,8 +1004,14 @@ pub(crate) fn execute_alter_table_multiple(
                         .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
                     live_checked = true;
                 }
-                let (done, apply) =
-                    apply_alter_action_in_txn(storage, txn, &stmt.table_name, action, limits)?;
+                let (done, apply) = apply_alter_action_in_txn(
+                    storage,
+                    txn,
+                    &stmt.table_name,
+                    action,
+                    limits,
+                    &mut dropped_sequence_ids,
+                )?;
                 changed |= apply == AlterApply::Applied;
                 if let Some(slot) = results.get_mut(i) {
                     *slot = Some(done);
@@ -1015,7 +1022,7 @@ pub(crate) fn execute_alter_table_multiple(
             // 0 本のままなら単一 DROP と同じ 42601 で txn ごと破棄）。
             Storage::ensure_table_has_live_column_in_txn(txn, &stmt.table_name)
                 .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
-            Ok((results, changed))
+            Ok((results, changed, dropped_sequence_ids))
         })
         .map_err(|e| match e {
             AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
@@ -1074,6 +1081,7 @@ fn apply_alter_action_in_txn(
     table_name: &str,
     action: &ValidatedAlterTable,
     limits: &SchemaLimits,
+    dropped_sequence_ids: &mut Vec<u64>,
 ) -> Result<(AlterTableAction, AlterApply), AlterCheckError> {
     use crate::catalog::{get_table_schema_in_txn, get_table_schema_in_txn_impl};
     match action {
@@ -1107,8 +1115,11 @@ fn apply_alter_action_in_txn(
             let map = map_drop_alter_column_error;
             Storage::validate_alter_column_target(table_name, &stmt.column_name)
                 .map_err(|e| alter_in_txn_error(e, map))?;
-            Storage::alter_table_drop_column_in_txn(txn, table_name, &stmt.column_name, true)
-                .map_err(|e| alter_in_txn_error(e, map))?;
+            let ids =
+                Storage::alter_table_drop_column_in_txn(txn, table_name, &stmt.column_name, true)
+                    .map_err(|e| alter_in_txn_error(e, map))?;
+            // commit 成功後に呼び出し元（`alter_table_in_single_txn`）が evict する。
+            dropped_sequence_ids.extend(ids);
             Ok((
                 AlterTableAction::DropColumn {
                     column_name: stmt.column_name.clone(),

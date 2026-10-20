@@ -406,6 +406,48 @@ fn drop_column_drops_owned_sequence() {
     assert_eq!(code(&core, "sys", "DROP SEQUENCE t_n_seq"), "42P01");
 }
 
+/// 複数アクションで SERIAL 列を落とし別の列を足せる（DROP 直後は生存列 0 本の中間状態。
+/// 依存走査がその中間状態を読めること）。所有 SEQUENCE は消え、カーソルも残らない。
+#[test]
+fn multi_action_drop_serial_column_and_add_column() {
+    let (_p, _g, core) = fixture("serial-multi-drop");
+    ok(&core, "sys", "CREATE TABLE t (n SERIAL)");
+    ok(
+        &core,
+        "sys",
+        "ALTER TABLE t DROP COLUMN n, ADD COLUMN v TEXT",
+    );
+    assert_eq!(code(&core, "sys", "DROP SEQUENCE t_n_seq"), "42P01");
+}
+
+/// 単独・複数アクションの DROP COLUMN は、所有 SEQUENCE のメモリ上のカーソルも commit 後に捨てる。
+#[test]
+fn drop_column_evicts_sequence_cursors() {
+    let (_p, _g, core) = fixture("serial-evict");
+    for (i, ddl) in [
+        "ALTER TABLE t DROP COLUMN n",
+        "ALTER TABLE t DROP COLUMN n, ADD COLUMN w TEXT",
+    ]
+    .iter()
+    .enumerate()
+    {
+        ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
+        ok(
+            &core,
+            "alice",
+            &format!("INSERT INTO t (id, v) VALUES (1, 'x') USING OPERATION_ID 'e{i}'"),
+        );
+        let before = core.storage_for_test().sequence_allocator().cursor_count();
+        assert!(before >= 1, "cursor must exist after nextval");
+        ok(&core, "sys", ddl);
+        assert_eq!(
+            core.storage_for_test().sequence_allocator().cursor_count(),
+            0
+        );
+        ok(&core, "sys", "DROP TABLE t");
+    }
+}
+
 /// `IF NOT EXISTS` で表が既にあれば暗黙 SEQUENCE も作らない。
 #[test]
 fn if_not_exists_existing_table_creates_no_sequence() {
