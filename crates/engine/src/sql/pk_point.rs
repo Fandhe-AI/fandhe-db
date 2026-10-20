@@ -50,6 +50,7 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::parser::BoundScan;
 use crate::sql::udf_call::{BinOp, BoundExpr};
 use crate::storage::read_source::ReadSource;
+use crate::storage::rowid::row_key;
 use redb::ReadableTable;
 use std::ops::Bound;
 
@@ -254,14 +255,6 @@ fn count_range_fallback() {
 #[inline(always)]
 fn count_range_fallback() {}
 
-/// 正引きが指す locator から行テーブルの物理キーを作る。現状の locator は行 `id`（u64）そのもの。
-/// 索引の行参照が rowid へ移る場合（`docs/design/rowid-primary-key-separation.md`）は、解釈を
-/// この 1 か所で直す。
-#[inline]
-fn row_key_for_locator(tenant: &str, locator: u64) -> (&str, u64) {
-    (tenant, locator)
-}
-
 /// 点検索の候補行を、テナントの昇順・各テナント内は物理キーの昇順で `visit` へ渡す。
 ///
 /// `visit(key_tenant, id, buf)` は候補 1 行ごとに呼ばれ、`true` を返すと探査を打ち切る（`LIMIT` 到達）。
@@ -361,13 +354,15 @@ where
                 return Ok(false);
             };
             let guard = rows
-                .get(row_key_for_locator(tenant, locator))
+                .get(row_key(tenant, locator))
                 .map_err(storage_failure)?;
             // 行が無い正引きは stale（削除済み）。何も出さない。
             let Some(guard) = guard else {
                 return Ok(false);
             };
-            return visit(tenant, locator, guard.value());
+            // `visit` は下流（可視性・述語の再評価と検索経路）が未移行のため、従来方式の `id` で受ける
+            // （rowid → `id` の出口。#2195 以降が rowid 受けへ移す。Issue #2194）。
+            return visit(tenant, locator.legacy_id(), guard.value());
         }
     }
     // 縮退: このテナントだけを範囲走査する。
