@@ -337,4 +337,69 @@ mod tests {
             .expect("utf8")
             .contains("rowmode:"));
     }
+
+    /// 旧バイナリ（物理キーを rowid へ切り替える前のコミット）が書いたデータディレクトリの
+    /// フィクスチャ（Issue #2202。生成手順は `tests/table23_legacy_fixture_migration.rs`）を開く前に
+    /// 直接読み、カタログ値の版が v2〜v14 の幅を持つこと（非空虚ゲート）を確かめる。開いた後は全表が
+    /// 移行済みで、スキーマ本体（移行の印を除く）が移行前と同値であること。
+    #[test]
+    fn pre_rowid_fixture_catalog_versions_and_schemas_survive_migration() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/table23_legacy_pre_rowid.redb"
+        );
+        let path = unique_db_path("legacy-id-fixture-unit");
+        let _g = CleanupGuard(path.clone());
+        std::fs::copy(fixture, &path).expect("copy fixture");
+        // 開く前の生のカタログ値（版プレフィックス）と、移行前のスキーマ（版を問わない復号）。
+        // 同一ファイルを二重に開けないため、読み終えたら redb のハンドルを手放してから `Storage` で開く。
+        let mut versions = std::collections::BTreeSet::new();
+        let mut before: Vec<(String, TableSchema)> = Vec::new();
+        {
+            let db = redb::Database::open(&path).expect("open raw");
+            let read = db.begin_read().expect("read");
+            let table = read.open_table(CATALOG_TABLE).expect("catalog");
+            for entry in table.iter().expect("iter") {
+                let (k, v) = entry.expect("entry");
+                let bytes = v.value().to_vec();
+                let head = bytes.split(|b| *b == b'\n').next().unwrap_or(&[]).to_vec();
+                versions.insert(String::from_utf8(head).expect("utf8 version"));
+                let name = k.value().to_string();
+                let mut resolve = |n: &str| get_enum_type_in_read_txn(&read, n);
+                let old = decode_schema_with_resolver(&name, &bytes, &mut resolve)
+                    .expect("decode old value");
+                before.push((name, old));
+            }
+        }
+        // 旧バイナリの表はいずれも従来方式（v15 の印を持たない）。
+        assert!(!versions.contains("v15"), "{versions:?}");
+        for needed in [
+            "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+        ] {
+            assert!(
+                versions.contains(needed),
+                "{needed} missing in {versions:?}"
+            );
+        }
+        eprintln!("fixture catalog versions: {versions:?}");
+        assert!(
+            before.len() >= 15,
+            "fixture has too few tables: {}",
+            before.len()
+        );
+        let s = Storage::open(&path).expect("open migrates");
+        for (name, old) in &before {
+            let migrated = s.get_table_schema(name).expect("schema after migration");
+            assert_eq!(
+                migrated.row_identity(),
+                RowIdentity::MigratedId,
+                "{name} must be migrated"
+            );
+            // 移行前の値を印だけ差し替えて符号化した結果が、移行後の値と一致する（本体は不変）。
+            assert_eq!(old.row_identity(), RowIdentity::LegacyId, "{name}");
+            let expected = encode_schema(&old.clone().with_row_identity(RowIdentity::MigratedId))
+                .expect("encode expected");
+            assert_eq!(raw_catalog_value(&s, name), expected, "{name}");
+        }
+    }
 }
