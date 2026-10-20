@@ -284,3 +284,47 @@ fn table23_id_reference_foreign_key_to_allocated_parent_is_rejected() {
     assert!(is_row_identity_unsupported(&err), "{err:?}");
     assert_redacted(&err.to_string());
 }
+
+/// 採番方式かつベクトル列を持つ表（検索入口のゲート確認用）。
+fn allocated_vector_table(label: &str) -> (Storage, crate::test_util::temp_db::CleanupGuard) {
+    let path = crate::test_util::temp_db::unique_db_path(label);
+    let guard = crate::test_util::temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open");
+    storage
+        .create_table(
+            &TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            )
+            .with_row_identity(RowIdentity::Allocated),
+        )
+        .expect("create allocated vector table");
+    (storage, guard)
+}
+
+/// Issue #2195: 検索系の行参照を rowid 化した後も、採番方式の表は kNN SQL・EXPLAIN 付き kNN・
+/// Rust API の検索のいずれでも拒否され、rowid が `SearchHit.id` として露出しない
+/// （TABLE-23 の非露出・RLS-9）。拒否文面にテナント名・表名を含めない。
+#[test]
+fn table23_allocated_table_search_entrances_are_rejected() {
+    use crate::core::VectorCore;
+    let (storage, _g) = allocated_vector_table("rowid-gate-search");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut session = SessionState::default();
+    for sql in [
+        "SELECT id FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 3",
+        "EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 3",
+    ] {
+        let err = core
+            .execute_sql_in_session(&ctx(), &mut session, sql)
+            .expect_err(sql);
+        assert_eq!(err.wire_code(), "0A000", "{sql}");
+        let text = format!("{err} {err:?}");
+        assert!(!text.contains(TENANT) && !text.contains("docs"), "{text}");
+    }
+    let err = core
+        .search(&ctx(), "docs", &[0.0, 0.0], 3)
+        .expect_err("rust api search is gated");
+    let text = format!("{err} {err:?}");
+    assert!(!text.contains(TENANT) && !text.contains("docs"), "{text}");
+}
