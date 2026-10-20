@@ -996,7 +996,10 @@ pub(crate) fn set_sequence_owner_in_txn(
         validate_identifier(&o.table)?;
         validate_identifier(&o.column)?;
         let schema = get_table_schema_in_txn(write_txn, &o.table)?;
-        if !schema.columns.iter().any(|c| c.name == o.column) {
+        // 移行済み表（MigratedId）の `id` は列を持たない疑似列なので、所有者としてだけ許す（#1698）。
+        let pseudo_id =
+            o.column == "id" && schema.row_identity() == crate::catalog::RowIdentity::MigratedId;
+        if !pseudo_id && !schema.columns.iter().any(|c| c.name == o.column) {
             return Err(CatalogError::Invalid(
                 "sequence owner column does not exist".to_string(),
             ));

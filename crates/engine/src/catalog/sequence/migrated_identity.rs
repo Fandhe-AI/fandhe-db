@@ -7,6 +7,10 @@
 //! 初期状態・原子性・再実行条件の具体は spec のポインタ（TABLE-24 (1)〜(4)・RECOVER-1・
 //! RECOVER-10〜12）に従い、本ファイルのコードで実現する（契約の文言は転記しない）。
 //!
+//! 保存方法: 実際に移行した表（`RowIdentity::MigratedId`）の `id` は列を持たない疑似列なので、
+//! スキーマは書き換えず所有者 `(table, id)` の SEQUENCE だけで結び付ける（割り当て済みの判定も
+//! 所有者で行う）。宣言した `id` 列を持つ表（`Allocated`）は従来どおり列の DEFAULT も Identity にする。
+//!
 //! 呼び出し元: #2200 の移行 txn（結線は #2200 の範囲。本ファイルは SQL・NoSQL・公開 API のいずれにも
 //! 結線せず、外から見える挙動を変えない）。呼び出し先: 親モジュールの SEQUENCE 作成・命名・所有者
 //! 設定・状態行の書き込みと、`catalog.rs` のスキーマ保存。
@@ -26,16 +30,16 @@ use redb::ReadableTable;
 
 use crate::catalog::{
     get_table_schema_in_txn_impl, map_row_table_error, user_rows_table_def, user_rows_table_name,
-    validate_identifier, CatalogError, ColumnDefault, ColumnType, IdentityKind, Result, Storage,
-    TableSchema,
+    validate_identifier, CatalogError, ColumnDefault, ColumnType, IdentityKind, Result,
+    RowIdentity, Storage, TableSchema,
 };
 use crate::row_codec::{scan_scalar_columns, ScalarRef};
 use crate::storage::read_source::ReadSource;
 
 use super::{
     choose_implicit_sequence_name_in_txn, create_sequence_in_txn, decode_sequence_def_with_owner,
-    load_sequence_bytes_in_txn, set_sequence_owner_in_txn, write_state_in_txn, SeqCursor,
-    SequenceOwner, SequenceParams, MAX_CURSORS,
+    load_sequence_bytes_in_txn, owned_sequence_entries_in_txn, set_sequence_owner_in_txn,
+    write_state_in_txn, SeqCursor, SequenceOwner, SequenceParams, MAX_CURSORS,
 };
 
 /// 移行する `id` 列の名前（ADR D2。PK 列名は移行後も `id`）。
@@ -65,12 +69,36 @@ fn invalid(msg: &str) -> CatalogError {
     CatalogError::Invalid(msg.to_string())
 }
 
+/// 疑似列 `id` の移行済み表（[`RowIdentity::MigratedId`]）の前提検証。所有者 `(table, id)` の
+/// SEQUENCE が 1 件あれば割り当て済み（`Some`）、無ければ `None`、複数あれば不整合で拒否する。
+fn check_pseudo_id_preconditions(
+    write_txn: &redb::WriteTransaction,
+    schema: &TableSchema,
+) -> Result<Option<String>> {
+    let found = owned_sequence_entries_in_txn(write_txn, &|o| {
+        o.table == schema.name && o.column == ID_COLUMN
+    })?;
+    match found.as_slice() {
+        [] => Ok(None),
+        [(name, _, _)] => Ok(Some(name.clone())),
+        _ => Err(invalid("migrated id sequence is inconsistent")),
+    }
+}
+
 /// 表の `id` 列への割り当て前提を検証する（書き込みより前に行い、拒否時の副作用をゼロにする）。
 /// 割り当て済みなら `Some(SEQUENCE 名)`、未割り当てで前提を満たすなら `None`。
 fn check_preconditions(
     write_txn: &redb::WriteTransaction,
     schema: &TableSchema,
 ) -> Result<Option<String>> {
+    match schema.row_identity() {
+        // 移行済み（疑似列 `id`）: 列も DEFAULT も持たないため、割り当て済みかは
+        // 所有者 `(table, id)` の SEQUENCE の有無で判定する（保存方法は所有者だけ）。
+        RowIdentity::MigratedId => return check_pseudo_id_preconditions(write_txn, schema),
+        // 未移行の従来方式は #2200 の移行より前なので対象外。
+        RowIdentity::LegacyId => return Err(invalid("migrated id table is required")),
+        RowIdentity::Allocated => {}
+    }
     let column = schema
         .columns
         .iter()
@@ -226,16 +254,20 @@ pub(crate) fn assign_migrated_id_identity_in_txn(
     let name = choose_implicit_sequence_name_in_txn(write_txn, table, ID_COLUMN, &[])?;
     let sequence_id = create_sequence_in_txn(write_txn, &name, &migrated_sequence_params())?;
 
-    let mut updated = schema.clone();
-    for c in updated.columns.iter_mut() {
-        if c.name == ID_COLUMN {
-            c.set_default_expr(Some(ColumnDefault::Identity {
-                sequence: name.clone(),
-                kind: IdentityKind::ByDefault,
-            }));
+    // 疑似列 `id`（MigratedId）は列を持たないのでスキーマは書き換えず、所有者だけで結び付ける。
+    // 宣言した `id` 列（Allocated）は DEFAULT を Identity へ更新する。
+    if !schema.has_pseudo_id() {
+        let mut updated = schema.clone();
+        for c in updated.columns.iter_mut() {
+            if c.name == ID_COLUMN {
+                c.set_default_expr(Some(ColumnDefault::Identity {
+                    sequence: name.clone(),
+                    kind: IdentityKind::ByDefault,
+                }));
+            }
         }
+        crate::catalog::write_schema_in_txn(write_txn, &updated)?;
     }
-    crate::catalog::write_schema_in_txn(write_txn, &updated)?;
     // 列の実在を確かめるため、スキーマ更新の後に所有者を設定する。
     set_sequence_owner_in_txn(
         write_txn,

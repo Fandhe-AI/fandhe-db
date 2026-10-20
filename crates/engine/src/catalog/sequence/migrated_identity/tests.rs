@@ -402,3 +402,74 @@ fn temp_scoped_storage_is_rejected() {
     ));
     assert!(definition_bytes(&s).is_empty());
 }
+
+/// #2200 の移行を実際に通した表（疑似列 `id`・列なし）を作り、各テナントへ物理キーで行を書く。
+fn migrated_real(
+    label: &str,
+    tables: &[(&str, Option<&str>)],
+) -> (Storage, crate::test_util::temp_db::CleanupGuard) {
+    let (s, g) = tmp(label);
+    for (name, pk) in tables {
+        let schema = match pk {
+            Some(pk) => {
+                TableSchema::new(*name, vec![ColumnDef::new(*pk, ColumnType::BigInt, false)])
+                    .with_primary_key(vec![(*pk).to_string()])
+            }
+            None => TableSchema::new(*name, vec![ColumnDef::new("k", ColumnType::BigInt, true)]),
+        };
+        s.create_table(&schema).expect("create");
+        let txn = s.begin_write_txn().expect("txn");
+        {
+            let rows = user_rows_table_name(name);
+            let mut t = txn.open_table(user_rows_table_def(&rows)).expect("open");
+            for (tenant, id) in [("tenant-a", 3u64), ("tenant-a", 10), ("tenant-b", 5)] {
+                t.insert((tenant, id), [0u8].as_slice()).expect("insert");
+            }
+        }
+        txn.commit_raw_for_test().expect("commit");
+    }
+    let n = crate::catalog::legacy_id_migration::migrate_legacy_ids(&s).expect("migrate");
+    assert_eq!(n, tables.len());
+    (s, g)
+}
+
+#[test]
+fn real_migrated_tables_get_owner_only_identity_for_both_roles() {
+    let (s, _g) = migrated_real("mig-id-real", &[("plain", None), ("keyed", Some("code"))]);
+    for table in ["plain", "keyed"] {
+        let schema = s.get_table_schema(table).expect("schema");
+        assert_eq!(schema.row_identity(), RowIdentity::MigratedId);
+        let out = s.assign_migrated_id_identity(table).expect("assign");
+        let seq = format!("{table}_id_seq");
+        assert_eq!(
+            out,
+            MigratedIdIdentityOutcome::Assigned {
+                sequence: seq.clone()
+            }
+        );
+        // 列は増えず、所有者 `(table, id)` だけで結び付く。
+        let after = s.get_table_schema(table).expect("schema");
+        assert_eq!(after.columns.len(), 1);
+        assert_eq!(
+            s.sequence_owner(&seq).expect("owner"),
+            Some(SequenceOwner {
+                table: table.to_string(),
+                column: "id".to_string()
+            })
+        );
+        assert_eq!(next(&s, &seq, "tenant-a").expect("next"), 11);
+        assert_eq!(next(&s, &seq, "tenant-b").expect("next"), 6);
+        assert_eq!(next(&s, &seq, "tenant-c").expect("next"), 1);
+        // 再実行は何も書かず収束する。
+        let before = (definition_bytes(&s), state_rows(&s));
+        assert_eq!(
+            s.assign_migrated_id_identity(table).expect("rerun"),
+            MigratedIdIdentityOutcome::AlreadyAssigned { sequence: seq }
+        );
+        assert_eq!((definition_bytes(&s), state_rows(&s)), before);
+    }
+    // DROP TABLE で所有 SEQUENCE も消える。
+    s.drop_table("plain").expect("drop");
+    s.drop_table("keyed").expect("drop");
+    assert!(definition_bytes(&s).is_empty());
+}
