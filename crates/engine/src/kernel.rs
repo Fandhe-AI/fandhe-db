@@ -16,6 +16,8 @@
 
 use std::fmt;
 
+use crate::search_order;
+
 /// **候補**検索結果 1 件（候補識別子とスコア）。[`SearchProvider`] の戻り値型。
 ///
 /// `id` は行 `id` とは限らない「呼び出し元が定義した候補識別子」で、[`SearchInput::ids`]
@@ -383,10 +385,13 @@ impl PartialOrd for MinHeapItem {
 }
 impl Ord for MinHeapItem {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0
-            .score
-            .total_cmp(&other.0.score)
-            .then(other.0.id.cmp(&self.0.id))
+        // 最小ヒープ用に「より劣る側が小さい」順序へ揃える（同点順序は D9 の順序キー経由）。
+        search_order::cmp_score_desc_then_tie(
+            other.0.score,
+            search_order::tie_key_for_response_id(other.0.id),
+            self.0.score,
+            search_order::tie_key_for_response_id(self.0.id),
+        )
     }
 }
 
@@ -459,7 +464,14 @@ impl TopKSelector {
             .into_iter()
             .map(|std::cmp::Reverse(item)| item.0)
             .collect();
-        out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+        out.sort_by(|a, b| {
+            search_order::cmp_score_desc_then_tie(
+                a.score,
+                search_order::tie_key_for_response_id(a.id),
+                b.score,
+                search_order::tie_key_for_response_id(b.id),
+            )
+        });
         out
     }
 }

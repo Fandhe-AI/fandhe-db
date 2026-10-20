@@ -283,7 +283,9 @@ impl IndexedBase {
             // が、untrusted 添字アクセス禁止の方針（coding-rust.md）に従い `[]` を
             // 使わず `unwrap_or` で防御的に扱う。
             let tenant = arena.tenant_id(slot).unwrap_or("").to_string();
-            let id = arena.ids().get(slot).copied().unwrap_or(0);
+            // ノード → 行の写像は rowid の生値で持つ（`RowKey` は非公開・メモリ上のみ。
+            // Issue #2195）。範囲外は従来どおり 0 に倒す。
+            let id = arena.row_id(slot).map_or(0, |r| r.raw_for_arena());
             let key = (tenant, id);
             let node = slot as u32; // arena.len() <= MAX_ARENA_ROWS <= u32::MAX 前提
             key_to_node.insert(key.clone(), node);
@@ -513,9 +515,10 @@ impl Overlay {
         let arena_len = slots.len();
         for (ordinal, actual_slot) in slots.enumerate() {
             let tenant = arena.tenant_id(actual_slot).unwrap_or("");
-            let Some(&id) = arena.ids().get(actual_slot) else {
+            let Some(rowid) = arena.row_id(actual_slot) else {
                 continue;
             };
+            let id = rowid.raw_for_arena();
             let key: RowKey = (tenant.to_string(), id);
             let Some(&node) = base.key_to_node.get(&key) else {
                 // 新規行（索引構築時点では存在しなかった）。
@@ -2275,7 +2278,7 @@ fn finish_indexed_search(
             return full_scan_with_arena(provider, arena, query, k);
         };
         let arena_tenant = arena.tenant_id(slot_usize);
-        let arena_id = arena.ids().get(slot_usize).copied();
+        let arena_id = arena.row_id(slot_usize).map(|r| r.raw_for_arena());
         if arena_tenant != Some(node_key.0.as_str()) || arena_id != Some(node_key.1) {
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
             fell_back.set(true);

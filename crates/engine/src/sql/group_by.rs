@@ -52,6 +52,7 @@ use crate::sql::parser::{
 };
 use crate::sql::udf_call::{self, BinOp, ExprValue};
 use crate::storage;
+use crate::storage::rowid::hit_id_for_response;
 use redb::ReadableTable;
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
@@ -783,10 +784,13 @@ fn observe_group_slots(
     for &slot in slots {
         let slot_idx = usize::try_from(slot)
             .map_err(|_| accumulator_bug("candidate slot does not fit in usize"))?;
-        let &id = arena
-            .ids()
-            .get(slot_idx)
-            .ok_or_else(|| accumulator_bug("candidate slot out of bounds (ids)"))?;
+        // 集計 `id` 値は rowid → 応答境界（従来方式の表の `id` 列値）を明示的に通す
+        // （Issue #2195・ADR D8）。
+        let id = hit_id_for_response(
+            arena
+                .row_id(slot_idx)
+                .ok_or_else(|| accumulator_bug("candidate slot out of bounds (ids)"))?,
+        );
         let metadata = snapshot
             .metadata()
             .get(slot_idx)
@@ -913,10 +917,13 @@ fn observe_candidate_slots_grouped_inner(
     'candidates: for &slot in slots {
         let slot_idx = usize::try_from(slot)
             .map_err(|_| accumulator_bug("candidate slot does not fit in usize"))?;
-        let &id = arena
-            .ids()
-            .get(slot_idx)
-            .ok_or_else(|| accumulator_bug("candidate slot out of bounds (ids)"))?;
+        // 集計 `id` 値は rowid → 応答境界（従来方式の表の `id` 列値）を明示的に通す
+        // （Issue #2195・ADR D8）。
+        let id = hit_id_for_response(
+            arena
+                .row_id(slot_idx)
+                .ok_or_else(|| accumulator_bug("candidate slot out of bounds (ids)"))?,
+        );
         let metadata = snapshot
             .metadata()
             .get(slot_idx)

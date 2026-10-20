@@ -919,7 +919,9 @@ pub(crate) fn resolve_batch_slot<S: BatchRowSource>(
 ) -> Option<(&str, u64, Visibility)> {
     let idx = usize::try_from(slot).ok()?;
     let tenant = source.tenant_ids().get(idx)?.as_str();
-    let id = *source.ids().get(idx)?;
+    let id = crate::storage::rowid::hit_id_for_response(
+        crate::storage::rowid::RowId::from_arena_raw(*source.ids().get(idx)?),
+    );
     let visibility = *source.visibilities().get(idx)?;
     Some((tenant, id, visibility))
 }

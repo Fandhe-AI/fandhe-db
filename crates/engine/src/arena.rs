@@ -36,6 +36,7 @@
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::catalog::{self, CatalogError};
+use crate::storage::rowid::RowId;
 use crate::storage::{Storage, StorageError, Visibility};
 
 /// アリーナが保持してよい行数の上限（アロケーション前の事前検証に使う。
@@ -361,9 +362,15 @@ impl GrowableArenaBuffers {
     /// 1 行分を 4 本のバッファへ追加する。呼び出し元が直前に
     /// [`Self::ensure_capacity`] を呼び、十分な capacity を確保済みであること
     /// （＝ここでの追加が再確保を発生させないこと）が前提。
-    fn push_row(&mut self, id: u64, embedding: &[f32], tenant_id: String, visibility: Visibility) {
+    fn push_row(
+        &mut self,
+        rowid: RowId,
+        embedding: &[f32],
+        tenant_id: String,
+        visibility: Visibility,
+    ) {
         self.vectors.extend_from_slice(embedding);
-        self.ids.push(id);
+        self.ids.push(rowid.raw_for_arena());
         self.tenant_ids.push(tenant_id);
         self.visibilities.push(visibility);
     }
@@ -410,7 +417,12 @@ where
         .ok_or(ArenaError::CapacityExceeded)?;
     check_capacity(*visible_row_count, expected_dim, max_rows, max_bytes)?;
     buffers.ensure_capacity(*visible_row_count, dim, expected_dim, max_rows, max_bytes)?;
-    buffers.push_row(id, embedding, tenant_id.to_string(), visibility);
+    buffers.push_row(
+        RowId::from_arena_raw(id),
+        embedding,
+        tenant_id.to_string(),
+        visibility,
+    );
     Ok(())
 }
 
@@ -560,8 +572,12 @@ impl SqlArenaCaptureBuilder {
             self.failed = true;
             return;
         }
-        self.buffers
-            .push_row(id, embedding, owned_tenant_id, visibility);
+        self.buffers.push_row(
+            RowId::from_arena_raw(id),
+            embedding,
+            owned_tenant_id,
+            visibility,
+        );
         self.metadata.push(owned_metadata);
         self.row_count = next_count;
         self.metadata_bytes = next_metadata_bytes;
@@ -1378,8 +1394,22 @@ impl VectorArena {
     }
 
     /// 行 ID の一覧（構築時のスキャン順＝行 ID 昇順）。
+    ///
+    /// 互換ビュー: 値は物理 rowid の生値で、従来方式の表では `id` 列値と恒等。crate 内の
+    /// 新規コードは [`Self::row_id`]／[`Self::row_ids`] を使うこと（Issue #2195。撤去は
+    /// 採番方式のゲートを外す #2197 の担当。ADR D8 参照）。
     pub fn ids(&self) -> &[u64] {
         &self.ids
+    }
+
+    /// `slot` 番目の行の物理 rowid を返す。範囲外は `None`（呼び出し側は fail-closed に扱う）。
+    pub(crate) fn row_id(&self, slot: usize) -> Option<RowId> {
+        self.ids.get(slot).copied().map(RowId::from_arena_raw)
+    }
+
+    /// 全スロットの物理 rowid を構築順に列挙する。
+    pub(crate) fn row_ids(&self) -> impl ExactSizeIterator<Item = RowId> + '_ {
+        self.ids.iter().copied().map(RowId::from_arena_raw)
     }
 
     /// row-major の連続ベクトルバッファ全体（長さ = `len() * dim()`）。
@@ -2810,7 +2840,7 @@ mod tests {
             // `build_filtered_with_limits` のループと同じ形）に依存するため、テストでも
             // 同じ順序（ensure_capacity → push_row）を守る。
             buffers.push_row(
-                target_row_count as u64,
+                RowId::from_arena_raw(target_row_count as u64),
                 &vec![0.0f32; dim_usize],
                 "tenant-a".to_string(),
                 Visibility::Public,
