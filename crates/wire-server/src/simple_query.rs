@@ -932,6 +932,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropSchema(_) => OutcomeResponse::Command {
             tag: "DROP SCHEMA".to_string(),
         },
+        // Issue #1716: `ALTER SCHEMA ... RENAME TO`。
+        SqlOutcome::AlterSchema(_) => OutcomeResponse::Command {
+            tag: "ALTER SCHEMA".to_string(),
+        },
         // Issue #1689: RENAME TO も同じタグ。
         SqlOutcome::AlterSequence(_) => OutcomeResponse::Command {
             tag: "ALTER SEQUENCE".to_string(),

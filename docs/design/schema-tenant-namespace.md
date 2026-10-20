@@ -355,3 +355,29 @@ TABLE-27 (3) のポインタ。セッション変数 `search_path` を engine �
   優先順（#1717）、`pg_temp.x` の結線、`current_schema()`（#1718）、StartupMessage の `search_path`・
   `ParameterStatus` 通知、`set_config('search_path', ..)`・`ALTER ROLE .. SET search_path`、NoSQL 表層
   （ステートレスで既定の path）
+
+## 9. Issue #1716 実装記録
+
+親 #1711・TABLE-27 のポインタ。`ALTER SCHEMA ... RENAME TO` と `ALTER TABLE ... SET SCHEMA` を追加した。
+
+- **ALTER SCHEMA RENAME TO**: `schemas` 表の 1 行を付け替えるだけで、内部 ID は不変（D2）。中の
+  オブジェクト（表・索引・SEQUENCE・VIEW 等）は内部 ID のキーで格納されているため追随する
+  （単体テストで内部 ID の保持と中身を持つ SCHEMA の DROP 拒否を確認済み）。判定順は、旧名が
+  組み込み名（`42501`）→ 旧名の不在・他テナントの同名（`3F000`、同一応答）→ 新名が組み込み名・
+  既存・同名（`42P06`）→ 新名が予約名（`42939`）。`OWNER TO` は `0A000`（D10）。
+  1 回の write txn・1 回の commit で行う
+- **ALTER TABLE SET SCHEMA**: 判定順は、DDL 権限ゲート → 表の存在（`42P01`／`42809`）→ 移動先の
+  解決（`public` は ASCII の大小を無視。`pg_temp`・`pg_catalog`・`information_schema` は `0A000`。
+  それ以外は `(tenant, name)` の 1 回 get で、不在と他テナントの SCHEMA は同一の `3F000`）→
+  テナント境界（`public` の表をテナントの SCHEMA へ移す経路は `42501`。D7）→ `public` から
+  `public` は何も書かない成功。複数アクションとの併用は `42601`。一時表は従来どおり `0A000`
+- **スコープの制約（#1717 への申し送り）**: テナント SCHEMA に表を置く経路（`#<id>.` キーの書き込みと
+  decode 側の受理）が未実装のため、移動元は常に `public` の表になる。次は #1717 の取り込み後に
+  実装・検証する: テナント SCHEMA 間の実移動（表・索引・制約・`OWNED BY` SEQUENCE のキー付け替え、
+  移動先の名前衝突 `42P07`、ビューは移さない）、テナント SCHEMA から `public` への移動（`42501`）、
+  実移動後の索引と行の保持の検証
+- **既知の制限**: `ALTER TABLE t SET SCHEMA <一時表と同名の名前>` は一時表のトークン走査に当たり
+  `0A000` になる（拒否側に倒れるだけで境界は緩まない）
+- **対象外**: `ALTER SEQUENCE／VIEW／INDEX／MATERIALIZED VIEW／TYPE ... SET SCHEMA`（#1717。
+  `ALTER SEQUENCE ... SET SCHEMA` は従来の `0A000` を維持）、`ALTER TABLE IF EXISTS`（TABLE-36）、
+  `ALTER SCHEMA ... OWNER TO`（SQL-39）

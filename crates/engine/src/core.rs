@@ -1688,6 +1688,8 @@ pub enum ParsedSql {
     CreateSchema(crate::sql::allowlist::ValidatedCreateSchema),
     /// `DROP SCHEMA [IF EXISTS] <name> [RESTRICT]`（TABLE-27、Issue #1713）。
     DropSchema(crate::sql::allowlist::ValidatedDropSchema),
+    /// `ALTER SCHEMA <name> RENAME TO <new>`（TABLE-27、Issue #1716）。**BREAKING CHANGE**: variant 追加。
+    AlterSchema(crate::sql::allowlist::ValidatedAlterSchema),
     /// `ALTER SEQUENCE`（TABLE-24、Issue #1689）。
     AlterSequence(crate::sql::allowlist::ValidatedAlterSequence),
     /// `SELECT setval('<名>', <n>[, <is_called>])`／`SELECT lastval()` の単独形（TABLE-24・
@@ -1784,6 +1786,7 @@ fn statement_clock_scope(
         | ParsedSql::DropSequence(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
+        | ParsedSql::AlterSchema(_)
         | ParsedSql::AlterSequence(_)
         | ParsedSql::SequenceFunction(_) => false,
     };
@@ -1839,6 +1842,7 @@ fn insert_sequence_scope(
         | ParsedSql::DropSequence(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
+        | ParsedSql::AlterSchema(_)
         | ParsedSql::AlterSequence(_)
         | ParsedSql::SequenceFunction(_) => false,
     };
@@ -1892,6 +1896,7 @@ fn insert_default_clock_scope(
         | ParsedSql::DropSequence(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
+        | ParsedSql::AlterSchema(_)
         | ParsedSql::AlterSequence(_)
         | ParsedSql::SequenceFunction(_) => false,
     };
@@ -3691,6 +3696,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
+                    | crate::sql::SqlOutcome::AlterSchema(_)
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
@@ -3744,6 +3750,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
+                    | crate::sql::SqlOutcome::AlterSchema(_)
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
@@ -3794,6 +3801,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
+                    | crate::sql::SqlOutcome::AlterSchema(_)
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
@@ -3851,6 +3859,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
+                    | crate::sql::SqlOutcome::AlterSchema(_)
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
@@ -3914,6 +3923,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
+                    | crate::sql::SqlOutcome::AlterSchema(_)
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
@@ -4285,7 +4295,8 @@ impl EngineCore {
             || crate::sql::allowlist::is_create_temp_table_statement(&tokens)
             // SCHEMA 名は関係名と別の名前空間で一時表を読み書きしないため走査対象外（TABLE-27・Issue #1713）。
             || crate::sql::allowlist::is_create_schema_statement(&tokens)
-            || crate::sql::allowlist::is_drop_schema_statement(&tokens);
+            || crate::sql::allowlist::is_drop_schema_statement(&tokens)
+            || crate::sql::allowlist::is_alter_schema_statement(&tokens);
         if txn_control_head || scan_exempt {
             let hits = crate::sql::temp_catalog::RelationHits::default();
             let parsed = self.parse_tokens_in(tokens, temp, &hits, self.ledger_mode)?;
@@ -4355,6 +4366,7 @@ impl EngineCore {
                     | ParsedSql::DropTable(_)
                     | ParsedSql::CreateSchema(_)
                     | ParsedSql::DropSchema(_)
+                    | ParsedSql::AlterSchema(_)
             )
         {
             return Ok(());
@@ -4735,6 +4747,11 @@ impl EngineCore {
         if crate::sql::allowlist::is_drop_schema_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_schema_tokens(&tokens)?;
             return Ok(ParsedSql::DropSchema(stmt));
+        }
+        // Issue #1716: `ALTER SCHEMA` も汎用 `ALTER`（`ALTER TABLE` 扱い）より前に分岐する。
+        if crate::sql::allowlist::is_alter_schema_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_alter_schema_tokens(&tokens)?;
+            return Ok(ParsedSql::AlterSchema(stmt));
         }
         if crate::sql::allowlist::is_drop_sequence_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_sequence_tokens(&tokens)?;
@@ -5755,8 +5772,12 @@ impl EngineCore {
             // 境界）は `Storage::alter_table_add_column` が取らないため未使用。
             ParsedSql::AlterTable(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
-                let outcome =
-                    crate::sql::ddl::execute_alter_table(&self.storage, stmt, &self.schema_limits)?;
+                let outcome = crate::sql::ddl::execute_alter_table(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                    &self.schema_limits,
+                )?;
                 Ok(crate::sql::SqlOutcome::AlterTable(outcome))
             }
             // TABLE-18・SQL-23・TASK-205（Issue #909）: `DropTable` と同じ判定
@@ -5889,6 +5910,13 @@ impl EngineCore {
                 let outcome =
                     crate::sql::ddl::execute_drop_schema(&self.storage, ctx.tenant_id(), stmt)?;
                 Ok(crate::sql::SqlOutcome::DropSchema(outcome))
+            }
+            // TABLE-27（Issue #1716）: DDL 実行権限ゲート → 実行本体（`ALTER SCHEMA ... RENAME TO`）。
+            ParsedSql::AlterSchema(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome =
+                    crate::sql::ddl::execute_alter_schema(&self.storage, ctx.tenant_id(), stmt)?;
+                Ok(crate::sql::SqlOutcome::AlterSchema(outcome))
             }
             // TABLE-24・SQL-23（Issue #1689）: DDL 実行権限ゲート → 実行本体。`ctx.tenant_id()` は
             // RESTART なしの範囲検査で呼び出し元テナントの現在値を読むためだけに渡す。
@@ -7137,6 +7165,7 @@ impl EngineCore {
             ParsedSql::DropSequence(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),
             ParsedSql::DropSchema(_) => Ok(None),
+            ParsedSql::AlterSchema(_) => Ok(None),
             ParsedSql::AlterSequence(_) => Ok(None),
             // Issue #1691: 結果列（1 列・bigint）だけを返し、`setval` の書き込みは実行しない。
             ParsedSql::SequenceFunction(stmt) => Ok(Some(crate::sql::sequence_fn::columns(stmt))),
