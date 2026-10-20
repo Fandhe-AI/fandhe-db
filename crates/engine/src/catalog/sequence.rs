@@ -776,6 +776,20 @@ fn column_default_references_sequence(default: &ColumnDefault, name: &str) -> bo
 /// SEQUENCE `name` を DEFAULT に使う列が 1 つでもあるか（2BP01 判定）。表数は
 /// [`MAX_LIST_TABLES`] で打ち切られる（`list_tables_in_txn` の上限）。
 fn sequence_has_dependents_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
+    // 移行済み表（MigratedId）の疑似列 `id` は列 DEFAULT を持たず所有者だけで結ばれるため、
+    // 所有者がその疑似列を指す SEQUENCE も依存ありとして扱う（単独 DROP・RENAME を拒否。#1698）。
+    let owned = owned_sequence_entries_in_txn(write_txn, &|o| o.column == "id")?;
+    for (seq_name, _, owner) in owned {
+        if seq_name != name {
+            continue;
+        }
+        if super::table_exists_in_txn(write_txn, &owner.table)? {
+            let schema = get_table_schema_in_txn_impl(write_txn, &owner.table, false)?;
+            if schema.row_identity() == crate::catalog::RowIdentity::MigratedId {
+                return Ok(true);
+            }
+        }
+    }
     for table_name in list_tables_in_txn(write_txn)? {
         // 依存走査はカタログ情報だけを見る。複数アクション `ALTER TABLE` の中間状態（DROP COLUMN
         // 直後で生存列 0 本）の表も読めるよう `require_live = false` で復号する（Issue #1694）。

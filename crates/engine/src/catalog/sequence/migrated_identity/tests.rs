@@ -473,3 +473,25 @@ fn real_migrated_tables_get_owner_only_identity_for_both_roles() {
     s.drop_table("keyed").expect("drop");
     assert!(definition_bytes(&s).is_empty());
 }
+
+/// 疑似列 `id` 所有（列 DEFAULT なし）の SEQUENCE は単独 DROP・RENAME を拒否され、
+/// 定義も状態行も失われない。DROP TABLE 経由の削除は従来どおり許可される。
+#[test]
+fn owner_only_sequence_rejects_standalone_drop_and_rename() {
+    let (s, _g) = migrated_real("mig-id-owner-only", &[("plain", None)]);
+    s.assign_migrated_id_identity("plain").expect("assign");
+    assert_eq!(next(&s, "plain_id_seq", "tenant-a").expect("next"), 11);
+    let before = (definition_bytes(&s), state_rows(&s));
+    assert!(matches!(
+        s.drop_sequence("plain_id_seq"),
+        Err(CatalogError::DependentObjectsStillExist(_))
+    ));
+    assert!(matches!(
+        s.rename_sequence("plain_id_seq", "other_seq"),
+        Err(CatalogError::DependentObjectsStillExist(_))
+    ));
+    assert_eq!((definition_bytes(&s), state_rows(&s)), before);
+    s.drop_table("plain").expect("drop table");
+    assert!(definition_bytes(&s).is_empty());
+    assert!(state_rows(&s).is_empty());
+}
