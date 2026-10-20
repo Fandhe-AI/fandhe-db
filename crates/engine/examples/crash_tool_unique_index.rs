@@ -46,6 +46,16 @@
 //! 述語内の既存 code を新しい id・`n > 0` で再挿入すると再起動後も必ず `23505` で拒否されることを確かめる
 //! （述語外の重複を受理する側のプローブは行を残してしまうため、結合テストが担当する）。
 //!
+//! Issue #2202（TABLE-23）で、採番方式の表（SQL `CREATE TABLE` が作る暗黙の `id` を持たない表。
+//! rowid を内部の採番器で払い出し、PRIMARY KEY の一意索引を同一 write トランザクションで更新する）を
+//! kill の対象経路へ加えた。`docs_pk (grp TEXT, k BIGINT, code TEXT UNIQUE, n BIGINT, PRIMARY KEY (grp, k))`
+//! （複合 PK＋UNIQUE。各バッチ先頭行への `ON CONFLICT (grp, k) DO UPDATE` を含む）と、PK なしの
+//! `docs_nopk (seq BIGINT, code TEXT)`。`verify` は `k`／`seq` の 0 起点連続性・BATCH 整合（rowid の
+//! 再払い出しによる行の上書き・消失の検出を兼ねる）、PK／UNIQUE の重複再挿入が必ず `23505` になること、
+//! 点検索と全走査の一致、読み取り専用の一意索引検証を確かめる。あわせて、従来方式で作った表
+//! （`docs`・`docs_uidx`。反復ごとの再 open で `MigratedId` へ移行済み）の `id` 契約（`WHERE id = n` の
+//! 点検索・既存 `id` の再挿入が `23505`・開き直しを繰り返しても件数が不変）を検査する。
+//!
 //! サブコマンド:
 //! - `write <db_path>`: `docs (code TEXT UNIQUE)` テーブル（無ければ作成）へ、
 //!   `BATCH` 件の行を 1 `INSERT` 文（＝1 write トランザクション。UNIQUE 索引の
@@ -70,6 +80,7 @@ use std::io::Write as _;
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
 use engine::storage::{Storage, Visibility};
 
@@ -94,6 +105,13 @@ const TABLES: [&str; 4] = ["docs", "docs_uidx", XIDX_TABLE, PIDX_TABLE];
 const XIDX_TABLE: &str = "docs_xidx";
 /// 部分索引（`((100 / n)) WHERE n > 0`・`(code) WHERE 100 / (n + 5) > 1`）を持つ表（Issue #1654・INDEX-11）。
 const PIDX_TABLE: &str = "docs_pidx";
+
+/// 採番方式の表（TABLE-23・Issue #2202）。複合 PRIMARY KEY `(grp, k)` と UNIQUE `code` を持つ。
+const PK_TABLE: &str = "docs_pk";
+/// 採番方式の PK なしの表（TABLE-23・Issue #2202）。`seq` を単調増加で書く。
+const NOPK_TABLE: &str = "docs_nopk";
+/// `PK_TABLE` の `grp` 列の固定値。
+const PK_GROUP: &str = "g";
 
 /// 再開時に既存行の最大 id を求める `SELECT id FROM docs LIMIT n` の上限件数。
 /// `sql::allowlist` が SELECT の `LIMIT` に課す上限（1..=10000）と同じ値を使う
@@ -206,6 +224,17 @@ fn ensure_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
         Err(engine::sql::allowlist::SqlSurfaceError::DuplicateTable { .. }) => {}
         Err(e) => return Err(format!("create table failed: {e}")),
     }
+    // 採番方式の表（`LegacyExec` を使わない素の `CREATE TABLE`）。
+    for sql in [
+        "CREATE TABLE docs_pk (grp TEXT, k BIGINT, code TEXT UNIQUE, n BIGINT, PRIMARY KEY (grp, k))",
+        "CREATE TABLE docs_nopk (seq BIGINT, code TEXT)",
+    ] {
+        match core.execute_sql_in_session(ctx, &mut session, sql) {
+            Ok(_) => {}
+            Err(engine::sql::allowlist::SqlSurfaceError::DuplicateTable { .. }) => {}
+            Err(e) => return Err(format!("create allocated table failed: {e}")),
+        }
+    }
     for sql in [
         // 述語外の `n <= 0`（`n = 0` を含む）の行は式要素 `100 / n` を評価せずに受理される（退場の意味論）。
         "CREATE INDEX IF NOT EXISTS docs_pidx_div ON docs_pidx ((100 / n)) WHERE n > 0",
@@ -268,6 +297,107 @@ fn find_next_row_id(core: &EngineCore, ctx: &PolicyContext, table: &str) -> Resu
     }
 }
 
+/// 採番方式の表の整数列 `col` の全値を昇順で返す（`LIMIT` で切り捨てられたら資源制限として拒否する）。
+fn read_int_column(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    table: &str,
+    col: &str,
+) -> Result<Vec<i64>, String> {
+    let result = core
+        .execute_sql(
+            ctx,
+            &format!("SELECT {col} FROM {table} ORDER BY {col} LIMIT {SCAN_LIMIT}"),
+        )
+        .map_err(|e| format!("scan of {table}.{col} failed: {e}"))?;
+    check_scan_not_truncated(result.rows.len())?;
+    result
+        .rows
+        .iter()
+        .map(|row| match row.cells.first() {
+            Some(Cell::SignedInteger(v)) => Ok(*v),
+            other => Err(format!("unexpected cell in {table}.{col}: {other:?}")),
+        })
+        .collect()
+}
+
+/// 採番方式の表の次に書く連番（`col` の最大値 + 1。空なら 0）。
+fn find_next_seq(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    table: &str,
+    col: &str,
+) -> Result<u64, String> {
+    let values = read_int_column(core, ctx, table, col)?;
+    match values.last() {
+        Some(max) => u64::try_from(*max)
+            .ok()
+            .and_then(|v| v.checked_add(1))
+            .ok_or_else(|| format!("invalid {table}.{col} while resuming")),
+        None => Ok(0),
+    }
+}
+
+/// 採番方式の 2 表へ 1 バッチずつ書く。`docs_pk` は `BATCH` 行の INSERT の後に、先頭行への
+/// `ON CONFLICT (grp, k) DO UPDATE`（別 txn）を打ち、UPSERT を kill の対象経路に乗せる。
+fn write_allocated_batch(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    pk_next: &mut u64,
+    nopk_next: &mut u64,
+) -> Result<(), String> {
+    let mut session = SessionState::default();
+    let pk_seq = *pk_next / BATCH;
+    let mut values = String::new();
+    for offset in 0..BATCH {
+        let k = pk_next
+            .checked_add(offset)
+            .ok_or_else(|| "pk overflow while writing".to_string())?;
+        if offset > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("('{PK_GROUP}', {k}, 'pcode-{k}', 0)"));
+    }
+    let sql = format!(
+        "INSERT INTO {PK_TABLE} (grp, k, code, n) VALUES {values} \
+         USING OPERATION_ID 'op-{PK_TABLE}-{pk_seq}'"
+    );
+    core.execute_sql_in_session(ctx, &mut session, &sql)
+        .map_err(|e| format!("insert failed at {PK_TABLE} batch_seq={pk_seq}: {e}"))?;
+    let first = *pk_next;
+    let upsert = format!(
+        "INSERT INTO {PK_TABLE} (grp, k, code, n) VALUES ('{PK_GROUP}', {first}, 'pcode-{first}', 0) \
+         ON CONFLICT (grp, k) DO UPDATE SET n = 1 USING OPERATION_ID 'op-{PK_TABLE}-up-{pk_seq}'"
+    );
+    core.execute_sql_in_session(ctx, &mut session, &upsert)
+        .map_err(|e| format!("upsert failed at {PK_TABLE} batch_seq={pk_seq}: {e}"))?;
+    *pk_next = pk_next
+        .checked_add(BATCH)
+        .ok_or_else(|| "pk overflow after insert".to_string())?;
+
+    let nopk_seq = *nopk_next / BATCH;
+    let mut values = String::new();
+    for offset in 0..BATCH {
+        let seq = nopk_next
+            .checked_add(offset)
+            .ok_or_else(|| "seq overflow while writing".to_string())?;
+        if offset > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({seq}, 'nopk-{seq}')"));
+    }
+    let sql = format!(
+        "INSERT INTO {NOPK_TABLE} (seq, code) VALUES {values} \
+         USING OPERATION_ID 'op-{NOPK_TABLE}-{nopk_seq}'"
+    );
+    core.execute_sql_in_session(ctx, &mut session, &sql)
+        .map_err(|e| format!("insert failed at {NOPK_TABLE} batch_seq={nopk_seq}: {e}"))?;
+    *nopk_next = nopk_next
+        .checked_add(BATCH)
+        .ok_or_else(|| "seq overflow after insert".to_string())?;
+    Ok(())
+}
+
 fn run_write(path: &str) -> i32 {
     match write_inner(path) {
         Ok(()) => 0,
@@ -292,6 +422,18 @@ fn write_inner(path: &str) -> Result<(), String> {
                 "resumed row id {slot} of {table} is not a multiple of BATCH ({BATCH}); \
                  a previous run must have left a partial batch, which the atomic \
                  per-statement commit contract should make impossible"
+            ));
+        }
+    }
+
+    // 採番方式の 2 表も独立に再開する（バッチ単位でしか進まない）。
+    let mut pk_next = find_next_seq(&core, &ctx, PK_TABLE, "k")?;
+    let mut nopk_next = find_next_seq(&core, &ctx, NOPK_TABLE, "seq")?;
+    for (next, table) in [(pk_next, PK_TABLE), (nopk_next, NOPK_TABLE)] {
+        if !next.is_multiple_of(BATCH) {
+            return Err(format!(
+                "resumed sequence {next} of {table} is not a multiple of BATCH ({BATCH}); \
+                 the atomic per-statement commit contract should make a partial batch impossible"
             ));
         }
     }
@@ -345,6 +487,8 @@ fn write_inner(path: &str) -> Result<(), String> {
             }
         }
 
+        write_allocated_batch(&core, &ctx, &mut pk_next, &mut nopk_next)?;
+
         // 進捗行はスクリプト側が「書き込みが実際に進み始めた」ことを検知する同期点
         // なので、バッファリングで遅延しないよう毎回明示的に flush する
         // （`crash_tool_cross_table.rs` と同方針）。
@@ -392,7 +536,184 @@ fn verify_inner(path: &str) -> Result<(u64, u64), String> {
             summary = totals;
         }
     }
+    verify_pk_table(&core, &ctx)?;
+    verify_nopk_table(&core, &ctx)?;
+    let counts = verify_migrated_id_contract(&core, &ctx)?;
+    // 開き直しを繰り返しても件数が変わらない（移行は 2 回目以降は何もしない）。同一 DB を二重に開けない
+    // ため、先に開いている `core` を手放してから確かめる。
+    drop(core);
+    verify_reopen_stable(path, &ctx, &counts)?;
     Ok(summary)
+}
+
+/// 0 起点で欠落・重複なく連続しているか（rowid の再払い出しで行が上書き・消失した場合も検出する）。
+fn check_contiguous(values: &[i64], what: &str) -> Result<u64, String> {
+    for (expected, actual) in values.iter().enumerate() {
+        if *actual != expected as i64 {
+            return Err(format!(
+                "{what}: gap, duplicate or disorder: expected={expected} actual={actual}"
+            ));
+        }
+    }
+    let total = values.len() as u64;
+    if total == 0 {
+        return Err(format!("{what}: no rows found"));
+    }
+    if !total.is_multiple_of(BATCH) {
+        return Err(format!(
+            "{what}: row count {total} is not a multiple of BATCH ({BATCH}), partial batch suspected"
+        ));
+    }
+    Ok(total)
+}
+
+/// 採番方式の PK 表の検証（Issue #2202・TABLE-23）。プローブは常に拒否される前提で、成功時は
+/// 副作用を残さない（`write` の再開採番と衝突しない）。
+fn verify_pk_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
+    let ks = read_int_column(core, ctx, PK_TABLE, "k").map_err(|e| format!("{PK_TABLE}: {e}"))?;
+    let total = check_contiguous(&ks, PK_TABLE)?;
+    // 先頭行以外の `n` は 0、先頭行（UPSERT 済みなら）は 0 か 1。
+    let result = core
+        .execute_sql(
+            ctx,
+            &format!("SELECT k, n FROM {PK_TABLE} ORDER BY k LIMIT {SCAN_LIMIT}"),
+        )
+        .map_err(|e| format!("{PK_TABLE}: scan failed: {e}"))?;
+    for row in &result.rows {
+        let (k, n) = match row.cells.as_slice() {
+            [Cell::SignedInteger(k), Cell::SignedInteger(n)] => (*k, *n),
+            other => return Err(format!("{PK_TABLE}: unexpected cells {other:?}")),
+        };
+        let is_batch_head = k % BATCH as i64 == 0;
+        if !(n == 0 || (n == 1 && is_batch_head)) {
+            return Err(format!("{PK_TABLE}: unexpected n={n} at k={k}"));
+        }
+    }
+    // 読み取り専用の一意索引検証（PK と UNIQUE の永続索引がクラッシュ後も生存している）。
+    core.verify_unique_index_read_only(ctx, PK_TABLE)
+        .map_err(|e| format!("{PK_TABLE}: read-only unique index verification failed: {e}"))?;
+    let mut session = SessionState::default();
+    let expect_23505 = |core: &EngineCore, session: &mut SessionState, sql: String, what: &str| {
+        match core.execute_sql_in_session(ctx, session, &sql) {
+            Err(e) if e.wire_code() == "23505" => Ok(()),
+            Err(e) => Err(format!(
+                "{PK_TABLE}: {what} failed with an unexpected wire_code {} (expected 23505): {e}",
+                e.wire_code()
+            )),
+            Ok(_) => Err(format!(
+                "{PK_TABLE}: {what} was wrongly accepted; a unique index entry is missing after crash recovery"
+            )),
+        }
+    };
+    for k in 0..total {
+        // 既存 PK の再挿入（`code` は未使用値）は PK 違反。
+        expect_23505(
+            core,
+            &mut session,
+            format!(
+                "INSERT INTO {PK_TABLE} (grp, k, code, n) VALUES ('{PK_GROUP}', {k}, 'probe-{k}', 0) \
+                 USING OPERATION_ID 'verify-pk-dup-{k}'"
+            ),
+            "duplicate primary key probe",
+        )?;
+        // 既存 `code` の再挿入（PK は未使用値）は UNIQUE 違反。
+        let fresh = total + k;
+        expect_23505(
+            core,
+            &mut session,
+            format!(
+                "INSERT INTO {PK_TABLE} (grp, k, code, n) VALUES ('{PK_GROUP}', {fresh}, 'pcode-{k}', 0) \
+                 USING OPERATION_ID 'verify-pk-code-{fresh}'"
+            ),
+            "duplicate unique code probe",
+        )?;
+    }
+    // 点検索と全走査の一致（先頭・中央・末尾と、存在しないキー）。
+    for k in [0, total / 2, total - 1, total] {
+        let point = core
+            .execute_sql(
+                ctx,
+                &format!(
+                    "SELECT k FROM {PK_TABLE} WHERE grp = '{PK_GROUP}' AND k = {k} ORDER BY k LIMIT 10"
+                ),
+            )
+            .map_err(|e| format!("{PK_TABLE}: point lookup failed: {e}"))?;
+        let expected = usize::from(k < total);
+        if point.rows.len() != expected {
+            return Err(format!(
+                "{PK_TABLE}: point lookup of k={k} returned {} rows (expected {expected})",
+                point.rows.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 採番方式の PK なしの表の検証（Issue #2202・TABLE-23）。`seq` の連続性と BATCH 整合。
+fn verify_nopk_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
+    let seqs =
+        read_int_column(core, ctx, NOPK_TABLE, "seq").map_err(|e| format!("{NOPK_TABLE}: {e}"))?;
+    check_contiguous(&seqs, NOPK_TABLE)?;
+    Ok(())
+}
+
+/// 従来方式の表（`docs`・`docs_uidx`。再 open ごとに `MigratedId` へ移行済み）の `id` 契約
+/// （Issue #2202・TABLE-23）。点検索・既存 `id` の再挿入の拒否・開き直しを繰り返しても不変なこと。
+fn verify_migrated_id_contract(core: &EngineCore, ctx: &PolicyContext) -> Result<Vec<u64>, String> {
+    let mut counts = Vec::new();
+    for table in ["docs", "docs_uidx"] {
+        let ids = core
+            .execute_sql(ctx, &format!("SELECT id FROM {table} LIMIT {SCAN_LIMIT}"))
+            .map_err(|e| format!("{table}: id scan failed: {e}"))?;
+        check_scan_not_truncated(ids.rows.len())?;
+        let total = ids.rows.len() as u64;
+        counts.push(total);
+        for id in [0, total / 2, total.saturating_sub(1)] {
+            let point = core
+                .execute_sql(
+                    ctx,
+                    &format!("SELECT id FROM {table} WHERE id = {id} ORDER BY id LIMIT 10"),
+                )
+                .map_err(|e| format!("{table}: id point lookup failed: {e}"))?;
+            if point.rows.len() != 1 {
+                return Err(format!(
+                    "{table}: id point lookup of id={id} returned {} rows (expected 1)",
+                    point.rows.len()
+                ));
+            }
+        }
+        // 既存 `id` の再挿入（`code` は未使用値）は `id` 重複の `23505`。
+        let probe = format!(
+            "INSERT INTO {table} (id, code) VALUES (0, 'migrated-id-probe') \
+             USING OPERATION_ID 'verify-mig-id-{table}-{total}'"
+        );
+        match core.execute_insert_sql(ctx, &probe) {
+            Err(e) if e.wire_code() == "23505" => {}
+            other => {
+                return Err(format!(
+                    "{table}: duplicate id probe must fail with 23505, got {other:?}"
+                ));
+            }
+        }
+    }
+    Ok(counts)
+}
+
+/// 開き直した DB の `docs`・`docs_uidx` の行数が `expected` から変わらないこと。
+fn verify_reopen_stable(path: &str, ctx: &PolicyContext, expected: &[u64]) -> Result<(), String> {
+    let reopened = open_core(path)?;
+    for (table, expected) in ["docs", "docs_uidx"].iter().zip(expected) {
+        let ids = reopened
+            .execute_sql(ctx, &format!("SELECT id FROM {table} LIMIT {SCAN_LIMIT}"))
+            .map_err(|e| format!("{table}: id scan after reopen failed: {e}"))?;
+        if ids.rows.len() as u64 != *expected {
+            return Err(format!(
+                "{table}: row count changed across reopen: {expected} -> {}",
+                ids.rows.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 1 表分の検証本体（行 id の連続性・BATCH 整合・読み取り専用の索引検証・重複プローブ）。
