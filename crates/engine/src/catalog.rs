@@ -197,6 +197,11 @@ pub(crate) fn index_catalog_generation_in_txn(read_txn: &redb::ReadTransaction) 
 pub enum IndexKind {
     Scalar,
     Hnsw,
+    /// JSONB 列の包含・存在検索向け GIN 相当索引の宣言（Issue #2206・INDEX-8。格納形式と
+    /// 演算子クラスの設計は `docs/design/gin-jsonb-index.md` D2・D12）。演算子クラスを種別に
+    /// 持たせ、「演算子クラスの無い Gin」を型で作れなくする。本 Issue の範囲は宣言の受理と
+    /// カタログ永続化まで（ポスティングの生成・維持は後続 Issue）。
+    Gin(GinOpClass),
 }
 
 impl IndexKind {
@@ -204,6 +209,48 @@ impl IndexKind {
         match self {
             IndexKind::Scalar => "scalar",
             IndexKind::Hnsw => "hnsw",
+            IndexKind::Gin(_) => "gin",
+        }
+    }
+}
+
+/// GIN 相当索引の演算子クラス（Issue #2206・INDEX-8）。`jsonb_ops` が省略時の既定。
+/// 構文段（`sql::allowlist`）が固定の許可リストとの完全一致だけで解決し、カタログの永続形には
+/// [`GinOpClass::as_str`] のトークンだけを保存する（未検証の文字列を連結しない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GinOpClass {
+    /// キーと値の双方を索引化する既定の演算子クラス。
+    JsonbOps,
+    /// 値へ至るパスだけを索引化する演算子クラス。
+    JsonbPathOps,
+}
+
+impl GinOpClass {
+    /// カタログ永続形・診断に使う演算子クラス名（PostgreSQL と同じ綴り）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GinOpClass::JsonbOps => "jsonb_ops",
+            GinOpClass::JsonbPathOps => "jsonb_path_ops",
+        }
+    }
+
+    /// 演算子クラス名（大文字小文字を区別しない）から解決する。未知の名前は `None`。
+    pub fn from_name(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("jsonb_ops") {
+            Some(GinOpClass::JsonbOps)
+        } else if name.eq_ignore_ascii_case("jsonb_path_ops") {
+            Some(GinOpClass::JsonbPathOps)
+        } else {
+            None
+        }
+    }
+
+    /// 永続形のトークン（正準な小文字）から復元する。大文字などの非正準形は `None`（fail-closed）。
+    fn from_catalog_token(token: &str) -> Option<Self> {
+        match token {
+            "jsonb_ops" => Some(GinOpClass::JsonbOps),
+            "jsonb_path_ops" => Some(GinOpClass::JsonbPathOps),
+            _ => None,
         }
     }
 }
@@ -277,6 +324,10 @@ const INDEX_DEF_PARTIAL_VERSION: &str = "v6";
 /// の間に固定行 `unique` を挟む（`…参照列行 / unique / 述語 hex / 述語の参照列 CSV`）。`v1`〜`v6`
 /// のバイト列は変えない（旧バイナリは `v7` を未知の版として拒否する。前方互換はない）。
 const INDEX_DEF_PARTIAL_UNIQUE_VERSION: &str = "v7";
+/// GIN 相当索引の永続形の版（Issue #2206・INDEX-8）。行構成は
+/// `v8／テーブル／gin／列（ちょうど 1 個）／演算子クラス`。`v1`〜`v7` のバイト列は変えない
+/// （旧バイナリは `v8` を未知の版として拒否する。前方互換はない）。
+const INDEX_DEF_GIN_VERSION: &str = "v8";
 
 impl IndexDef {
     /// 照合指定なしの索引宣言を作る（`collations` はすべて `None`・式要素なし）。
@@ -377,7 +428,27 @@ impl IndexDef {
 /// 含み得ない）のため、区切り文字として安全に使える。
 fn encode_index_def(def: &IndexDef) -> Result<Vec<u8>> {
     let columns_csv = def.columns.join(",");
-    let text = if def.has_predicate() || def.has_expressions() {
+    let text = if let IndexKind::Gin(opclass) = def.kind {
+        // GIN 宣言（`v8`）。単一の素の列に限り、一意・照合・式・述語は持てない（構文段・
+        // 束縛段が拒否済みの組み合わせの多層防御。破れていれば保存せず拒否する）。
+        if def.unique
+            || def.has_predicate()
+            || def.has_expressions()
+            || def.collations.iter().any(Option::is_some)
+            || def.columns.len() != 1
+            || def.columns.iter().any(String::is_empty)
+        {
+            return Err(CatalogError::Invalid(
+                "gin index must be a single plain column without options".to_string(),
+            ));
+        }
+        format!(
+            "{INDEX_DEF_GIN_VERSION}\n{}\ngin\n{}\n{}",
+            def.table,
+            columns_csv,
+            opclass.as_str()
+        )
+    } else if def.has_predicate() || def.has_expressions() {
         // 部分索引（`v6`。INDEX-11、Issue #1654）も式索引（`v4`／`v5`）と同じ行構成の拡張で、
         // 版の選択は [`encode_expression_index_def`] が担う。
         encode_expression_index_def(def, &columns_csv)?
@@ -639,11 +710,13 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         && version != INDEX_DEF_EXPRESSION_UNIQUE_VERSION
         && version != INDEX_DEF_PARTIAL_VERSION
         && version != INDEX_DEF_PARTIAL_UNIQUE_VERSION
+        && version != INDEX_DEF_GIN_VERSION
     {
         return Err(CatalogError::CorruptSchema(format!(
             "unknown index catalog format version for index {name}"
         )));
     }
+    let is_v8 = version == INDEX_DEF_GIN_VERSION;
     let is_v2 = version == "v2";
     let is_v3 = version == "v3";
     let is_v5 = version == INDEX_DEF_EXPRESSION_UNIQUE_VERSION;
@@ -664,12 +737,19 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     let kind = match kind_tag {
         "scalar" => IndexKind::Scalar,
         "hnsw" => IndexKind::Hnsw,
+        // `gin` は `v8` だけが持てる。演算子クラスは下の `v8` 分岐が復元する（仮置き）。
+        "gin" if is_v8 => IndexKind::Gin(GinOpClass::JsonbOps),
         _ => {
             return Err(CatalogError::CorruptSchema(format!(
                 "unknown index kind for index {name}"
             )))
         }
     };
+    if is_v8 && !matches!(kind, IndexKind::Gin(_)) {
+        return Err(CatalogError::CorruptSchema(format!(
+            "invalid gin index record for index {name}"
+        )));
+    }
     let columns_csv = lines
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema(format!("missing columns for index {name}")))?;
@@ -680,6 +760,22 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     } else {
         None
     };
+    let mut kind = kind;
+    if is_v8 {
+        // `v8` は GIN 専用: 列はちょうど 1 個の素の列、5 行目は演算子クラス、以降の行は無い。
+        let opclass = lines
+            .next()
+            .and_then(GinOpClass::from_catalog_token)
+            .ok_or_else(|| {
+                CatalogError::CorruptSchema(format!("invalid gin operator class for index {name}"))
+            })?;
+        if columns_csv.is_empty() || columns_csv.contains(',') {
+            return Err(CatalogError::CorruptSchema(format!(
+                "gin index must have exactly one column for index {name}"
+            )));
+        }
+        kind = IndexKind::Gin(opclass);
+    }
     if is_v3 {
         // `v3` は一意索引専用: 種別は scalar、5 行目は固定フラグ `unique`（それ以外は破損）。
         if !matches!(kind, IndexKind::Scalar) || lines.next() != Some("unique") {
@@ -806,6 +902,11 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
                 "USING hnsw does not support COLLATE".to_string(),
             ));
         }
+        if matches!(def.kind, IndexKind::Gin(_)) {
+            return Err(CatalogError::IndexCollationNotSupported(
+                "USING gin does not support COLLATE".to_string(),
+            ));
+        }
         match schema.columns.iter().find(|c| &c.name == col) {
             Some(column) if crate::collation::is_collatable(&column.ty) => {}
             Some(_) => {
@@ -847,6 +948,32 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
             if !column.ty.is_vector() {
                 return Err(CatalogError::IndexKindMismatch(format!(
                     "USING hnsw requires a VECTOR column, column {col} is not VECTOR"
+                )));
+            }
+        }
+        IndexKind::Gin(_) => {
+            // GIN は単一の素の JSONB 列だけが対象（Issue #2206・INDEX-8）。`JSON` は含めない。
+            let col = match def.columns.as_slice() {
+                [only] if !only.is_empty() => only,
+                _ => {
+                    return Err(CatalogError::IndexKindMismatch(
+                        "USING gin requires exactly one column".to_string(),
+                    ))
+                }
+            };
+            if col == "id" && schema.has_pseudo_id() {
+                return Err(CatalogError::IndexKindMismatch(
+                    "USING gin requires a JSONB column, column id is not JSONB".to_string(),
+                ));
+            }
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| &c.name == col)
+                .ok_or_else(|| CatalogError::ColumnNotFound(col.clone()))?;
+            if !matches!(column.ty, ColumnType::Jsonb) {
+                return Err(CatalogError::IndexKindMismatch(format!(
+                    "USING gin requires a JSONB column, column {col} is not JSONB"
                 )));
             }
         }
@@ -1262,6 +1389,8 @@ pub(crate) fn explain_index_names_in_txn(
         }
         match def.kind {
             IndexKind::Hnsw => decls.hnsw.push(def.name),
+            // GIN の EXPLAIN 表示は後続 Issue（プランナ接続）の担当。列被覆名には出さない。
+            IndexKind::Gin(_) => {}
             // 式要素は列被覆名に含めない（式索引名は #1650 の式一致で EXPLAIN 側が合流させる）。
             IndexKind::Scalar => {
                 let plain: Vec<String> = def.plain_columns().map(str::to_string).collect();
@@ -1755,6 +1884,7 @@ fn retain_index_defs_in_txn(
             Err(e) => return Err(e.into()),
         };
         let mut to_remove = Vec::new();
+        let mut removed_gin: Vec<IndexDef> = Vec::new();
         for (scanned, entry) in index_table.iter()?.enumerate() {
             if scanned >= MAX_INDEX_COUNT {
                 return Err(CatalogError::CorruptSchema(format!(
@@ -1766,10 +1896,18 @@ fn retain_index_defs_in_txn(
             let def = decode_index_def(&name, value.value())?;
             if !keep(&def) {
                 to_remove.push(name);
+                if matches!(def.kind, IndexKind::Gin(_)) {
+                    removed_gin.push(def);
+                }
             }
         }
         for name in &to_remove {
             index_table.remove(name.as_str())?;
+        }
+        // GIN の物理テーブルは索引カタログのハンドルを閉じてから消す（Issue #2206）。
+        drop(index_table);
+        for def in &removed_gin {
+            delete_gin_index_table_in_txn(write_txn, def)?;
         }
         !to_remove.is_empty()
     };
@@ -11231,6 +11369,35 @@ pub(crate) fn user_uniq_table_def(index_table_name: &str) -> UniqueIndexTableDef
     TableDefinition::new(index_table_name)
 }
 
+/// GIN 相当索引（Issue #2206・INDEX-8。`docs/design/gin-jsonb-index.md` D2）の物理テーブル名を
+/// 組み立てる。索引名単位で `user_gin/{index_name}`。`validate_identifier` を通った索引名は `/` を
+/// 含まないため、他の固定テーブル・行テーブル・一意索引テーブルと衝突しない（呼び出し元が事前に
+/// 検証する契約は [`user_uniq_table_name`] と同じ）。本 Issue はテーブルを作らず、`DROP INDEX`・
+/// `DROP TABLE`・`DROP COLUMN` での掃除だけを担う（作成とポスティングの維持は後続 Issue）。
+pub(crate) fn user_gin_table_name(index_name: &str) -> String {
+    format!("user_gin/{index_name}")
+}
+
+/// GIN 索引テーブルの物理キー型。第 1 要素はサーバー側導出テナント、第 2 要素は名前空間化済み
+/// サブキー（D3）。[`UniqueIndexTableDef`] と同じ形。
+pub(crate) type GinIndexTableDef<'a> =
+    TableDefinition<'a, (&'static str, &'static [u8]), &'static [u8]>;
+
+/// GIN 索引テーブル定義を組み立てる（[`GinIndexTableDef`] の唯一の生成点）。
+pub(crate) fn user_gin_table_def(gin_table_name: &str) -> GinIndexTableDef<'_> {
+    TableDefinition::new(gin_table_name)
+}
+
+/// 宣言が GIN のときだけ、その物理テーブルを同一 write txn で削除する（無ければ no-op）。
+/// `Storage::drop_index`・[`retain_index_defs_in_txn`]（`DROP TABLE`・`DROP COLUMN`・matview 削除）
+/// の唯一の掃除経路。
+fn delete_gin_index_table_in_txn(write_txn: &redb::WriteTransaction, def: &IndexDef) -> Result<()> {
+    if matches!(def.kind, IndexKind::Gin(_)) {
+        write_txn.delete_table(user_gin_table_def(&user_gin_table_name(&def.name)))?;
+    }
+    Ok(())
+}
+
 /// 行テーブル `open_table` のエラー写像（[`UserRowsTableDef`] 専用）。
 ///
 /// 旧フォーマット（物理キーが `id` のみ）の DB を開くと `redb` は
@@ -14744,6 +14911,20 @@ impl Storage {
                 },
             ));
         }
+        // GIN 宣言（Issue #2206・INDEX-8）の未対応の組み合わせ（一意・述語・式・照合）は `0A000`。
+        // 構文段の最終ゲートの多層防御で、効かない宣言を残さない（fail-closed）。
+        if matches!(def.kind, IndexKind::Gin(_))
+            && (def.unique
+                || predicate.is_some()
+                || exprs.iter().any(Option::is_some)
+                || def.collations.iter().any(Option::is_some))
+        {
+            return Err(CreateIndexError::Sql(
+                SqlSurfaceError::FeatureNotSupported {
+                    detail: "USING gin does not support this index definition".to_string(),
+                },
+            ));
+        }
         let has_exprs = exprs.iter().any(Option::is_some);
         if has_exprs && (exprs.len() != def.columns.len() || !matches!(def.kind, IndexKind::Scalar))
         {
@@ -15046,6 +15227,7 @@ impl Storage {
             }
             return Err(CatalogError::IndexNotFound(name.to_string()));
         };
+        delete_gin_index_table_in_txn(&write_txn, &def)?;
         // matview の索引宣言（Issue #1667）は表の UNIQUE 制約を持たないので外す制約が無い。
         if def.unique && !materialized_view_exists_in_txn(&write_txn, &def.table)? {
             if def.has_expressions() || def.has_predicate() {
@@ -25347,5 +25529,168 @@ mod tests {
             explain.scalar.is_empty(),
             "partial index is not named: {explain:?}"
         );
+    }
+
+    // --- GIN 相当索引の宣言（Issue #2206・INDEX-8） -----------------------------------
+
+    fn gin_def(name: &str, col: &str, opclass: GinOpClass) -> IndexDef {
+        IndexDef::new(
+            name.to_string(),
+            "docs".to_string(),
+            IndexKind::Gin(opclass),
+            vec![col.to_string()],
+        )
+    }
+
+    /// `v8` の往復（2 つの演算子クラス）と、バイト列の固定形（`v1`〜`v7` と衝突しない）。
+    #[test]
+    fn gin_index_def_round_trips_as_v8() {
+        for opclass in [GinOpClass::JsonbOps, GinOpClass::JsonbPathOps] {
+            let def = gin_def("g", "doc", opclass);
+            let bytes = encode_index_def(&def).expect("encode");
+            assert_eq!(
+                std::str::from_utf8(&bytes).expect("utf8"),
+                format!("v8\ndocs\ngin\ndoc\n{}", opclass.as_str())
+            );
+            assert_eq!(decode_index_def("g", &bytes).expect("decode"), def);
+        }
+    }
+
+    /// 破損した `v8` と、`gin` を持てない旧版は `CorruptSchema` で fail-closed に拒否する。
+    #[test]
+    fn gin_index_def_rejects_corruption() {
+        for corrupt in [
+            &b"v8\ndocs\nscalar\ndoc\njsonb_ops"[..],
+            b"v8\ndocs\nhnsw\ndoc\njsonb_ops",
+            b"v8\ndocs\ngin\n\njsonb_ops",
+            b"v8\ndocs\ngin\na,b\njsonb_ops",
+            b"v8\ndocs\ngin\ndoc",
+            b"v8\ndocs\ngin\ndoc\narray_ops",
+            b"v8\ndocs\ngin\ndoc\nJSONB_OPS",
+            b"v8\ndocs\ngin\ndoc\njsonb_ops\nextra",
+            b"v8\n1docs\ngin\ndoc\njsonb_ops",
+            b"v1\ndocs\ngin\ndoc",
+            b"v2\ndocs\ngin\ndoc\n-",
+            b"v3\ndocs\ngin\ndoc\nunique",
+        ] {
+            assert!(
+                matches!(
+                    decode_index_def("g", corrupt),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "corrupt value must be rejected: {corrupt:?}"
+            );
+        }
+    }
+
+    /// 保存前の多層防御: GIN は単一の素の列で、一意・照合・式・述語を持てない。
+    #[test]
+    fn gin_index_def_encode_rejects_unsupported_combinations() {
+        let ok = gin_def("g", "doc", GinOpClass::JsonbOps);
+        assert!(encode_index_def(&ok).is_ok());
+        let mut multi = ok.clone();
+        multi.columns.push("other".to_string());
+        multi.collations.push(None);
+        multi.expressions.push(None);
+        let mut uniq = ok.clone();
+        uniq.unique = true;
+        let mut collated = ok.clone();
+        collated.collations = vec![Some(crate::collation::Collation::C)];
+        let mut predicate = ok.clone();
+        predicate.predicate = Some(IndexPredicateDef {
+            sql: "a = 1".to_string(),
+            referenced_columns: vec!["a".to_string()],
+        });
+        for bad in [multi, uniq, collated, predicate] {
+            assert!(matches!(
+                encode_index_def(&bad),
+                Err(CatalogError::Invalid(_))
+            ));
+        }
+    }
+
+    /// 対象列の検査: JSONB だけが受理され、JSON・TEXT・VECTOR・疑似列 `id`・不在列は拒否する。
+    #[test]
+    fn gin_index_requires_a_jsonb_column() {
+        let path = unique_db_path("index-gin-columns");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("doc", ColumnType::Jsonb, true),
+                    ColumnDef::new("raw", ColumnType::Json, true),
+                    ColumnDef::new("body", ColumnType::Text, true),
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ],
+            ))
+            .expect("create docs");
+        for col in ["raw", "body", "embedding", "id"] {
+            assert!(
+                matches!(
+                    storage.create_index(&gin_def("g", col, GinOpClass::JsonbOps)),
+                    Err(CatalogError::IndexKindMismatch(_))
+                ),
+                "{col}"
+            );
+        }
+        assert!(matches!(
+            storage.create_index(&gin_def("g", "missing", GinOpClass::JsonbOps)),
+            Err(CatalogError::ColumnNotFound(_))
+        ));
+        storage
+            .create_index(&gin_def("g_ok", "doc", GinOpClass::JsonbPathOps))
+            .expect("jsonb column is accepted");
+        let defs = storage.list_indexes().expect("list");
+        assert_eq!(
+            defs.iter().map(|d| d.kind).collect::<Vec<_>>(),
+            vec![IndexKind::Gin(GinOpClass::JsonbPathOps)]
+        );
+    }
+
+    /// GIN の物理テーブル（`user_gin/{索引名}`）は `DROP INDEX`・`DROP TABLE` で消える
+    /// （作成は後続 Issue。ここでは先に置いたテーブルが掃除経路で消えることを固定する）。
+    #[test]
+    fn gin_physical_table_is_removed_by_drop_index_and_drop_table() {
+        let path = unique_db_path("index-gin-cleanup");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("doc", ColumnType::Jsonb, true)],
+            ))
+            .expect("create docs");
+        let physical_exists = |name: &str| -> bool {
+            let read_txn = storage.db().begin_read().expect("read txn");
+            let exists = read_txn
+                .open_table(user_gin_table_def(&user_gin_table_name(name)))
+                .is_ok();
+            exists
+        };
+        let seed = |name: &str| {
+            let write_txn = storage.db().begin_write().expect("txn");
+            write_txn
+                .open_table(user_gin_table_def(&user_gin_table_name(name)))
+                .expect("open physical");
+            // テスト内の物理テーブル用意だけの commit（世代の bump 対象外）。
+            write_txn.commit().expect("commit");
+        };
+        storage
+            .create_index(&gin_def("g1", "doc", GinOpClass::JsonbOps))
+            .expect("create g1");
+        storage
+            .create_index(&gin_def("g2", "doc", GinOpClass::JsonbPathOps))
+            .expect("create g2");
+        seed("g1");
+        seed("g2");
+        assert!(physical_exists("g1") && physical_exists("g2"));
+        storage.drop_index("g1").expect("drop g1");
+        assert!(!physical_exists("g1"), "DROP INDEX removes the table");
+        assert!(physical_exists("g2"));
+        storage.drop_table("docs").expect("drop table");
+        assert!(!physical_exists("g2"), "DROP TABLE removes the table");
+        assert!(storage.list_indexes().expect("list").is_empty());
     }
 }
