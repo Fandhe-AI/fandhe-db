@@ -581,3 +581,45 @@ fn gate_respects_cte_scope_syntax_named_tables_and_temp_indexes() {
     ok(&core, &mut s, "DROP INDEX tmp_v");
     assert_eq!(code(&core, &mut s, "DROP INDEX tmp_v"), "42P01");
 }
+
+/// 引用付き `NULL` 名の表も参照ゲートの対象（`DROP TABLE "null"` が `42P01`。永続表は残る）。
+#[test]
+fn quoted_null_named_table_is_gated() {
+    let (core, _g) = new_core("sp-quoted-null");
+    let mut s = ddl_session();
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE \"null\" (id BIGINT PRIMARY KEY)",
+    );
+    ok(&core, &mut s, "SET search_path = nosuch");
+    assert_eq!(code(&core, &mut s, "DROP TABLE \"null\""), "42P01");
+    ok(&core, &mut s, "RESET search_path");
+    ok(&core, &mut s, "DROP TABLE \"null\"");
+}
+
+/// 構文語と同名の別名（`AS truncate`）が表参照リストを開かず、`public.` 修飾の表だけの文は通る。
+#[test]
+fn syntax_word_alias_does_not_trigger_the_gate() {
+    let (core, _g, mut s) = with_table("sp-alias");
+    ok(&core, &mut s, "SET search_path = nosuch");
+    ok(
+        &core,
+        &mut s,
+        "SELECT 1 AS truncate, id FROM public.t LIMIT 5",
+    );
+}
+
+/// 一時表と同名の search_path 要素でも `SET search_path` は一時表参照扱い（`0A000`）にならない。
+#[test]
+fn set_search_path_ignores_same_named_temp_table() {
+    let (core, _g) = new_core("sp-temp-name");
+    let mut s = ddl_session();
+    ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE tmpx (id BIGINT PRIMARY KEY)",
+    );
+    ok(&core, &mut s, "SET search_path = tmpx, public");
+    assert_eq!(show(&core, &mut s), "tmpx, public");
+}

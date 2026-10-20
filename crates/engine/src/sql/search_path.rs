@@ -231,7 +231,7 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
     }
     let next_is_name = matches!(
         tokens.get(idx.saturating_add(1)),
-        Some(Token::Ident(_) | Token::QualifiedIdent { .. })
+        Some(t) if crate::sql::relation_name::is_ident_like(t)
     );
     let Some(w) = word(idx) else {
         return false;
@@ -264,7 +264,10 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
         if pos.create_name || skip.contains(&pos.index) {
             continue;
         }
-        let Some(Token::Ident(name)) = tokens.get(pos.index) else {
+        let Some(name) = tokens
+            .get(pos.index)
+            .and_then(crate::sql::relation_name::unqualified_ident_name)
+        else {
             continue;
         };
         // 構文語（`IF`・`ONLY`・`LATERAL` 等）は構文位置で判定する。CTE 名はその参照位置から実際に
@@ -292,7 +295,7 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
             continue;
         }
         out.push(GateRef {
-            name: name.clone(),
+            name: name.to_string(),
             is_index: false,
         });
     }
@@ -328,9 +331,12 @@ fn object_ddl_names(tokens: &[Token]) -> Vec<GateRef> {
         i += 2;
     }
     let mut out = Vec::new();
-    while let Some(Token::Ident(name)) = tokens.get(i) {
+    while let Some(name) = tokens
+        .get(i)
+        .and_then(crate::sql::relation_name::unqualified_ident_name)
+    {
         out.push(GateRef {
-            name: name.clone(),
+            name: name.to_string(),
             is_index,
         });
         if matches!(tokens.get(i + 1), Some(Token::Punct(','))) {
@@ -568,6 +574,31 @@ mod tests {
             names("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2"),
             vec!["t"]
         );
+    }
+
+    fn marked_names(sql: &str) -> Vec<String> {
+        let toks = crate::sql::lexer::tokenize_marked(sql).expect("lex");
+        unqualified_relation_refs(&toks, &[])
+            .into_iter()
+            .map(|r| r.name)
+            .collect()
+    }
+
+    #[test]
+    fn quoted_identifier_tokens_are_gated() {
+        assert_eq!(marked_names("DROP TABLE \"null\""), vec!["null"]);
+        assert_eq!(marked_names("SELECT * FROM \"true\""), vec!["true"]);
+        assert_eq!(marked_names("DROP VIEW \"null\""), vec!["null"]);
+    }
+
+    #[test]
+    fn syntax_word_alias_does_not_open_a_relation_list() {
+        assert_eq!(
+            names("SELECT 1 AS truncate, id FROM public.t LIMIT 5"),
+            Vec::<String>::new()
+        );
+        assert_eq!(names("SELECT 1 AS truncate, id FROM a, b"), vec!["a", "b"]);
+        assert_eq!(names("TRUNCATE a, b"), vec!["a", "b"]);
     }
 
     #[test]

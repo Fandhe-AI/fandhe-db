@@ -46,6 +46,26 @@ fn ident_is(tok: Option<&Token>, word: &str) -> bool {
     matches!(tok, Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word))
 }
 
+/// 識別子として表名になりうるトークンか（修飾あり・なし・二重引用符付きの `NULL`／`true`／`false` 等。
+/// 引用付きは構文解析が識別子位置で `Ident` へ戻して受理するため、参照ゲートも同じ範囲を見る）。
+pub(crate) fn is_ident_like(tok: &Token) -> bool {
+    matches!(
+        tok,
+        Token::QualifiedIdent { .. }
+            | Token::Ident(_)
+            | Token::QuotedNull(_)
+            | Token::QuotedBoolWord(_)
+    )
+}
+
+/// 未修飾の識別子トークン（`Ident`・引用付き）の名前。`QualifiedIdent` は `None`。
+pub(crate) fn unqualified_ident_name(tok: &Token) -> Option<&str> {
+    match tok {
+        Token::Ident(s) | Token::QuotedNull(s) | Token::QuotedBoolWord(s) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
 /// テーブル参照位置にあるトークン 1 件（[`relation_positions`] の戻り値の要素）。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RelPos {
@@ -124,31 +144,34 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
             Token::Ident(w) => {
                 if w.eq_ignore_ascii_case("UPDATE") || w.eq_ignore_ascii_case("DELETE") {
                     next.from_ok = true;
-                } else if w.eq_ignore_ascii_case("TRUNCATE")
+                } else if (w.eq_ignore_ascii_case("TRUNCATE") && i == 0)
                     || (w.eq_ignore_ascii_case("TABLE") && ddl_head && i < 4)
                 {
+                    // `TRUNCATE` は文頭のときだけ表参照リストを開く（`SELECT 1 AS truncate, id`
+                    // の別名を構文語と取り違えない）。
                     next.list = true;
-                } else if [
-                    "GROUP",
-                    "HAVING",
-                    "UNION",
-                    "INTERSECT",
-                    "EXCEPT",
-                    "WINDOW",
-                    "OFFSET",
-                    "FETCH",
-                    "RETURNING",
-                    "CONFLICT",
-                ]
-                .iter()
-                .any(|k| w.eq_ignore_ascii_case(k))
+                } else if !ident_is(prev, "AS")
+                    && [
+                        "GROUP",
+                        "HAVING",
+                        "UNION",
+                        "INTERSECT",
+                        "EXCEPT",
+                        "WINDOW",
+                        "OFFSET",
+                        "FETCH",
+                        "RETURNING",
+                        "CONFLICT",
+                    ]
+                    .iter()
+                    .any(|k| w.eq_ignore_ascii_case(k))
                 {
                     next.list = false;
                 }
             }
             _ => {}
         }
-        if matches!(cur, Token::QualifiedIdent { .. } | Token::Ident(_)) {
+        if is_ident_like(cur) {
             relation_pos = match prev {
                 Some(Token::Keyword(Keyword::From)) => from_rel,
                 Some(Token::Ident(w)) => {
@@ -186,7 +209,7 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
         }
         match cur {
             Token::QualifiedIdent { .. } if !relation_pos => out.residual_column_qualifier = true,
-            Token::QualifiedIdent { .. } | Token::Ident(_) if relation_pos => {
+            t if relation_pos && is_ident_like(t) => {
                 out.positions.push(RelPos {
                     index: i,
                     create_name: is_create_name,
