@@ -218,6 +218,7 @@ pub fn execute(
         let session = SessionState::default();
         let result =
             core.explain_bound_search_in_session(ctx, &session, table, |schema, udfs| {
+                super::gate::reject_allocated_schema(schema)?;
                 bind_vector_statement(validated, schema, udfs, &core.result_limits())
             })?;
         return Ok(result);
@@ -253,6 +254,7 @@ pub fn execute(
         question.unwrap_or(""),
         mode_literal,
         |schema, udfs| -> Result<ExplainShape, ExplainError> {
+            super::gate::reject_allocated_schema(schema)?;
             // テーブル解決後に初めて `plan` 欠落を判定する（codex-review P1
             // 指摘対応・PR #828。`super::search::execute` が `vector`／`plan`
             // 両方欠落の判定を `bind_search` 自身のテーブル解決後へ委ねるのと

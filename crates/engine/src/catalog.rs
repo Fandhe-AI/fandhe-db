@@ -7602,6 +7602,12 @@ impl TableSchema {
         matches!(self.row_identity, RowIdentity::Allocated)
     }
 
+    /// [`Self::is_allocated`] の公開版。wire-server の NoSQL 表層が、各 op の束縛・実行で使う
+    /// スキーマ（同一スナップショット）に対して行識別方式の拒否判定を行うために使う（Issue #2199）。
+    pub fn uses_allocated_row_identity(&self) -> bool {
+        self.is_allocated()
+    }
+
     /// 行識別方式が従来方式以外の表への操作を fail-closed に拒否する共通ゲート
     /// （索引・検索・台帳が rowid 未対応の間の安全弁。後続 sub-issue #2194〜#2197 が外す）。
     pub(crate) fn require_legacy_row_identity(&self) -> Result<()> {

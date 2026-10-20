@@ -81,6 +81,22 @@ pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
 /// `catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE` と同じ。表名・テナント名・値を含めない）。
 const ROW_IDENTITY_UNSUPPORTED_MESSAGE: &str = "row identity mode is not supported yet";
 
+/// 採番方式の表なら固定文言の `0A000` で拒否する（TABLE-23・Issue #2199）。各 op の束縛 closure が
+/// 受け取るスキーマ（実行と同一のスナップショット）に対して呼ぶ。入口の事前判定（[`handle`]）は
+/// 別スナップショットのため、並行 DDL による表の差し替えはこの判定が塞ぐ。応答に表名・値を含めない。
+pub(super) fn reject_allocated_schema(
+    schema: &engine::catalog::TableSchema,
+) -> Result<(), engine::sql::allowlist::SqlSurfaceError> {
+    if schema.uses_allocated_row_identity() {
+        return Err(
+            engine::sql::allowlist::SqlSurfaceError::FeatureNotSupported {
+                detail: ROW_IDENTITY_UNSUPPORTED_MESSAGE.to_string(),
+            },
+        );
+    }
+    Ok(())
+}
+
 /// 検証を通過したが実行結線が未接続の要求に返す暫定応答の文言。
 /// `scan`・`aggregate`・`insert`・`search`（`explain: true` の `search` を
 /// 含む）・`update`・`delete`（`where` 形・`filter` 形の両方。Issue #876・

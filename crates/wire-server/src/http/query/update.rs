@@ -322,6 +322,7 @@ pub fn execute(
             table,
             operation_id.as_ref(),
             |schema| {
+                super::gate::reject_allocated_schema(schema)?;
                 // NoSQL 表層の SET 値は常に平易なリテラル（式は SQL 表層のみ。
                 // Issue #1544 で `ValidatedUpdate::assignments` が `SetValue` になったため包む）。
                 let assignments = map_set_assignments_for_engine(set, schema)?
@@ -353,6 +354,7 @@ pub fn execute(
         // 第 2 の実行器は作らない。
         TargetForm::Predicate(items) => {
             let bind = |schema: &TableSchema| {
+                super::gate::reject_allocated_schema(schema)?;
                 let assignments = map_set_assignments_for_engine(set, schema)?;
                 let predicates = filter::bind_filter_where_predicates(items, schema)
                     .map_err(filter::FilterError::into_sql_surface_error)?;

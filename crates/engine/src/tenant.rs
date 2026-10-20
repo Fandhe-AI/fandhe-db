@@ -1677,12 +1677,11 @@ pub fn insert_typed_row(
 ) -> Result<(), TenantWriteError> {
     let ledger_write = LedgerMode::Ledgered.resolve(Some(operation_id))?;
     // 利用者が行 id を指定する Rust API は、rowid を自前で払い出す採番方式の表（TABLE-23・
-    // Issue #2199）では意味を持たないため、書き込み前に固定文言の `0A000` で拒否する（SQL 表層は
-    // [`insert_typed_row_unchecked`] を直接呼び、採番方式の表も扱う）。表が無ければ下の書き込みが分類する。
-    if let Ok(schema) = storage.get_table_schema(table) {
-        schema.require_legacy_row_identity()?;
-    }
-    insert_typed_row_unchecked(
+    // Issue #2199）では意味を持たないため、固定文言の `0A000` で拒否する。判定は書き込みと同じ
+    // write txn 内で取得したスキーマに対して行う（別 txn で判定すると並行 DROP・再作成との
+    // TOCTOU でゲートを素通りするため）。SQL 表層は [`insert_typed_row_unchecked`] を直接呼ぶ。
+    insert_typed_row_impl(
+        true,
         WriteTarget::Autocommit(storage),
         table,
         ctx,
@@ -1732,9 +1731,43 @@ pub(crate) fn insert_typed_row_unchecked(
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: &[VolatileColumn],
 ) -> Result<(), TenantWriteError> {
+    insert_typed_row_impl(
+        false,
+        target,
+        table,
+        ctx,
+        id,
+        visibility,
+        values,
+        ledger_write,
+        expected_schema,
+        volatile_default_columns,
+    )
+}
+
+/// [`insert_typed_row_unchecked`] の本体。`require_legacy` が真なら write txn 内で取得した
+/// スキーマが採番方式のとき `0A000` で拒否する（[`insert_typed_row`] 用）。
+#[allow(clippy::too_many_arguments)]
+fn insert_typed_row_impl(
+    require_legacy: bool,
+    target: WriteTarget<'_>,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    visibility: crate::storage::Visibility,
+    values: &[crate::row_codec::Value],
+    ledger_write: LedgerWrite<'_>,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    volatile_default_columns: &[VolatileColumn],
+) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
     target.with_txn(|write_txn| {
         let schema = require_table_schema_write_any_identity(write_txn, table)?;
+        if require_legacy {
+            schema
+                .require_legacy_row_identity()
+                .map_err(TenantWriteError::Catalog)?;
+        }
         if let Some(expected) = expected_schema {
             if expected != &schema {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(

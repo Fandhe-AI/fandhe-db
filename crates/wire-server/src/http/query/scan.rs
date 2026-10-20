@@ -403,6 +403,7 @@ pub fn execute(
     let session = SessionState::default();
     let result =
         core.execute_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {
+            super::gate::reject_allocated_schema(schema)?;
             prepared.bind(schema, udfs)
         })?;
     Ok(result)
@@ -421,6 +422,7 @@ pub fn explain(
     let session = SessionState::default();
     let result =
         core.explain_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {
+            super::gate::reject_allocated_schema(schema)?;
             prepared.bind(schema, udfs)
         })?;
     Ok(result)

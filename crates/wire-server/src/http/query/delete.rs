@@ -215,6 +215,7 @@ pub fn execute(
         // 作らない。
         TargetForm::Predicate(items) => {
             let bind = |schema: &engine::catalog::TableSchema| {
+                super::gate::reject_allocated_schema(schema)?;
                 filter::bind_filter_where_predicates(items, schema)
                     .map_err(filter::FilterError::into_sql_surface_error)
             };
