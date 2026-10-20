@@ -520,6 +520,26 @@ fn failed_create_table_leaves_no_orphan_sequence() {
     ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
 }
 
+/// SERIAL 列の暗黙 DEFAULT は `SET DEFAULT` の参照アクションの対象にできず、
+/// `INTEGER DEFAULT nextval(...)` と同じ `0A000` になる（ON DELETE・ON UPDATE 双方）。
+#[test]
+fn serial_column_rejects_set_default_referential_action() {
+    let (_p, _g, core) = fixture("serial-set-default");
+    ok(&core, "sys", "CREATE TABLE p (k INTEGER PRIMARY KEY)");
+    for action in ["ON DELETE SET DEFAULT", "ON UPDATE SET DEFAULT"] {
+        assert_eq!(
+            code(
+                &core,
+                "sys",
+                &format!("CREATE TABLE c (n SERIAL REFERENCES p(k) {action})")
+            ),
+            "0A000",
+            "{action}"
+        );
+    }
+    assert_eq!(code(&core, "sys", "DROP SEQUENCE c_n_seq"), "42P01");
+}
+
 /// 再オープン後も定義・所有者・採番の続きが保たれる。
 #[test]
 fn serial_state_survives_reopen() {

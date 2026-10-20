@@ -408,7 +408,7 @@ ROLLBACK した値の再出現はオラクルにしない。`write` は数行ご
 | 名前 | PostgreSQL の `ChooseRelationName` 相当。`<table>_<col>_seq` を 63 バイトへ切り詰め、relation 名前空間（表・ビュー・索引・matview・SEQUENCE）と、同じ文で先に決めた名前を避けて `seq1`・`seq2` と数字を足す。試行は `MAX_SEQUENCES + 1` 回で打ち切り `54000`。書き込み txn の中で決める（`catalog::sequence::choose_implicit_sequence_name_in_txn`。#1698 の `<table>_id_seq` も再利用できる。要確認） |
 | 原子性 | SEQUENCE の挿入・表の作成・所有者の設定・世代の bump を 1 つの write txn で行う（`Storage::create_table_with_implicit_sequences`）。表名の衝突・`IF NOT EXISTS`・後段の失敗では txn を破棄し、孤児 SEQUENCE を残さない。SERIAL 列の無い表は従来の `create_table` のままでバイト列も不変 |
 | DROP TABLE | 所有 SEQUENCE の定義と全テナントの状態行を同じ txn で削除し、メモリ上の現在値は commit 成功後に捨てる。削除対象外の表の `DEFAULT nextval` が参照していれば、RESTRICT・CASCADE とも `2BP01`（DEFAULT は連鎖削除しない。要確認） |
-| 所有者の追従 | `RENAME TO` は所有者の表名、`RENAME COLUMN` は列名を同じ txn で書き換える。`DROP COLUMN` は所有 SEQUENCE も削除する（現在値のメモリは捨てない。内部 ID は再利用しないので別 SEQUENCE の値には化けず、残るのは有界なメモリのみ） |
+| 所有者の追従 | `RENAME TO` は所有者の表名、`RENAME COLUMN` は列名を同じ txn で書き換える。`DROP COLUMN` は所有 SEQUENCE も同じ txn で削除し、メモリ上の現在値（カーソル）は commit 成功後に `SequenceAllocator::evict` で捨てる（単一アクション・複数アクションの ALTER とも。ROLLBACK 時は捨てない） |
 | 列制約の併記 | `NOT NULL`・`PRIMARY KEY`・`UNIQUE`・`CHECK`・`REFERENCES` は受理。`DEFAULT`（`DEFAULT NULL`・時刻 DEFAULT を含む）は `42601`。明示値は受理（BY DEFAULT 相当）、明示 NULL は `23502` |
 | 予約語 | SERIAL 系 6 語を列型キーワードに加える。`CONSTRAINT serial CHECK` の制約名と、NoSQL の `enum_type: "serial"` は拒否される。列定義では同名の ENUM があっても SERIAL として扱う（PostgreSQL と同じ。既知の差・影響。要確認） |
 | 台帳・ハッシュ | 変更しない。省略列に適用した DEFAULT は内容照合ハッシュの材料から外れる（D2）。golden は不変 |

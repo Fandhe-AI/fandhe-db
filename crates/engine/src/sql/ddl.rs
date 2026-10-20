@@ -164,6 +164,10 @@ pub(crate) fn build_table_schema(
         }
     }
     reject_time_default_set_default(&columns, &validated.foreign_keys)?;
+    // SERIAL 列の暗黙 `DEFAULT nextval` は展開が後段（カタログ側）で付くため、上の検査では
+    // 見えない。`INTEGER DEFAULT nextval(...)` と同じく `SET DEFAULT` の対象にできず `0A000`
+    // で拒否する（ON DELETE／ON UPDATE 双方。Issue #1694）。
+    reject_serial_set_default(&validated.serial_columns, &validated.foreign_keys)?;
     let mut schema = TableSchema::new(validated.table_name.clone(), columns);
     // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`validated.primary_key` は
     // `sql::allowlist::finalize_primary_key` が `id` 単独宣言を `None` へ既に
@@ -2017,6 +2021,28 @@ fn reject_time_default_set_default(
         if has_time_default {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: "SET DEFAULT referential action on a column with a time function DEFAULT is not supported".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// SERIAL 列を `ON DELETE／UPDATE SET DEFAULT` の対象にする FK 宣言を `0A000` で拒否する
+/// （暗黙 `DEFAULT nextval` は連鎖更新で評価できないため。時刻 DEFAULT と同じ契約）。
+fn reject_serial_set_default(
+    serial_columns: &[crate::sql::allowlist::SerialColumn],
+    foreign_keys: &[crate::catalog::ForeignKeyDef],
+) -> Result<(), SqlSurfaceError> {
+    for fk in foreign_keys {
+        if fk.uses_set_default()
+            && fk
+                .columns()
+                .iter()
+                .any(|name| serial_columns.iter().any(|s| &s.column == name))
+        {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "SET DEFAULT referential action on a SERIAL column is not supported"
+                    .to_string(),
             });
         }
     }
