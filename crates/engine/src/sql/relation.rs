@@ -64,8 +64,13 @@ impl TableRef {
 
     /// 修飾列参照（`<qualifier>.<col>`）が照合する公開名。別名があれば別名、
     /// 無ければテーブル名そのもの。
+    ///
+    /// SCHEMA 配下の表（内部キー `#<id>.<name>`。TABLE-27・Issue #1717）は、別名が無ければ
+    /// 名前部 `<name>` が公開名になる（PG と同じく `SELECT t.id FROM s.t` を受理する）。
     pub fn exposed_name(&self) -> &str {
-        self.alias.as_deref().unwrap_or(&self.table)
+        self.alias
+            .as_deref()
+            .unwrap_or_else(|| crate::catalog::namespace::relation_name_part(&self.table))
     }
 
     /// 修飾子 `qualifier` がこの参照の公開名（[`Self::exposed_name`]）と一致するか。

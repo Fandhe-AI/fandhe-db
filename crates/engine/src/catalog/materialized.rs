@@ -963,6 +963,9 @@ pub(crate) fn read_materialized_view_in<R: ReadSource>(
     name: &str,
     ctx: &PolicyContext,
 ) -> Result<Option<MaterializedViewEntity>> {
+    if name.starts_with('#') {
+        return Ok(None);
+    }
     validate_identifier(name)?;
     let def = {
         let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
@@ -1051,6 +1054,9 @@ impl Storage {
         &self,
         name: &str,
     ) -> Result<Option<MaterializedViewDef>> {
+        if name.starts_with('#') {
+            return Ok(None);
+        }
         validate_identifier(name)?;
         let read_txn = self.db().begin_read()?;
         let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
@@ -1070,6 +1076,10 @@ impl Storage {
         read_txn: &redb::ReadTransaction,
         name: &str,
     ) -> Result<Option<MaterializedViewDef>> {
+        if name.starts_with('#') {
+            // matview は public にしか置けない（内部キーの名前は存在しない。Issue #1717）。
+            return Ok(None);
+        }
         validate_identifier(name)?;
         let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
             Ok(t) => t,

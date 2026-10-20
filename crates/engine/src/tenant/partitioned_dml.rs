@@ -338,7 +338,7 @@ fn chunk_loop<E>(
     hooks: &mut Hooks<'_>,
     state: &mut JobState,
 ) -> Result<PartitionedDmlOutcome, PartitionedStopCause<E>> {
-    validate_identifier(table).map_err(w)?;
+    validate_relation_key(table).map_err(w)?;
     // 台帳を持たない構成は、テーブルにもジョブ表にも触れる前に拒否する（fail-closed）。
     let Some(op_id) = ledger_write.op_id() else {
         return Err(PartitionedStopCause::LedgerRequired);

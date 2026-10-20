@@ -232,6 +232,7 @@ pub mod returning;
 pub(crate) mod scalar_index;
 pub(crate) mod scalar_plan;
 pub mod scan;
+pub(crate) mod schema_dependency;
 pub(crate) mod sequence_fn;
 pub(crate) mod sequence_scope;
 pub(crate) mod set_op;

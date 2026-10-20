@@ -1489,8 +1489,12 @@ pub(crate) fn execute_alter_table_rename_table(
     stmt: &ValidatedAlterTableRenameTable,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     ensure_table_exists(storage, &stmt.table_name)?;
+    // 改名先は同じ SCHEMA に置く（`s.t RENAME TO t2` は `s.t2`。新しい名前は修飾できない。
+    // TABLE-27・Issue #1717）。
+    let new_key = crate::catalog::namespace::sibling_key(&stmt.table_name, &stmt.new_table_name)
+        .map_err(crate::catalog::table_lookup_error)?;
     storage
-        .alter_table_rename(&stmt.table_name, &stmt.new_table_name)
+        .alter_table_rename(&stmt.table_name, &new_key)
         .map_err(|e| match e {
             AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
                 undefined_table_or_view(storage, &stmt.table_name)
@@ -2970,8 +2974,12 @@ pub(crate) fn execute_create_index(
     } else {
         IndexKind::Scalar
     };
+    // 索引は対象表と同じ SCHEMA に置く（`CREATE INDEX i ON s.t` の索引は `s` の `i`。PG と同じく
+    // 索引名は修飾できない。TABLE-27・Issue #1717）。
+    let index_key = crate::catalog::namespace::sibling_key(validated.table(), validated.name())
+        .map_err(map_create_index_error)?;
     let def = IndexDef::new(
-        validated.name().to_string(),
+        index_key,
         validated.table().to_string(),
         kind,
         validated.columns().to_vec(),
@@ -3167,7 +3175,12 @@ pub(crate) fn execute_alter_sequence(
                 AlterSequenceError::Catalog(c) => map_sequence_error(c, "ALTER SEQUENCE failed"),
             })?,
         AlterSequenceAction::Rename { new_name } => storage
-            .rename_sequence(validated.name(), new_name)
+            .rename_sequence(
+                validated.name(),
+                // 改名先は同じ SCHEMA に置く（TABLE-27・Issue #1717）。
+                &crate::catalog::namespace::sibling_key(validated.name(), new_name)
+                    .map_err(|e| map_sequence_error(e, "ALTER SEQUENCE failed"))?,
+            )
             .map_err(|e| match e {
                 // 名前参照の DEFAULT が壊れるため RENAME は拒否する（fail-closed）。
                 CatalogError::DependentObjectsStillExist(_) => {
@@ -3232,9 +3245,12 @@ pub(crate) fn execute_drop_schema(
     tenant_id: &str,
     validated: &ValidatedDropSchema,
 ) -> Result<DropSchemaOutcome, SqlSurfaceError> {
-    storage
-        .drop_schema(tenant_id, validated.name(), validated.if_exists)
-        .map_err(|e| map_schema_error(e, "DROP SCHEMA failed"))?;
+    if validated.cascade {
+        storage.drop_schema_cascade(tenant_id, validated.name(), validated.if_exists)
+    } else {
+        storage.drop_schema(tenant_id, validated.name(), validated.if_exists)
+    }
+    .map_err(|e| map_schema_error(e, "DROP SCHEMA failed"))?;
     Ok(DropSchemaOutcome {})
 }
 

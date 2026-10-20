@@ -37,7 +37,7 @@ use crate::storage::rowid::{row_key, RowId};
 
 use crate::catalog::{
     map_row_table_error, require_table_schema_write, require_table_schema_write_any_identity,
-    user_rows_table_def, user_rows_table_name, validate_identifier, CatalogError,
+    user_rows_table_def, user_rows_table_name, validate_relation_key, CatalogError,
 };
 use crate::kernel::SearchHit;
 use crate::policy::PolicyContext;
@@ -1003,7 +1003,7 @@ pub(crate) fn insert_row_unchecked(
     row: &RowInput<'_>,
     ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     // ストレージへ触れる前に、クライアント自己申告の `tenant_id` を ctx と照合する
     // （security.md P0「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。
     if !ctx.is_owner(row.tenant_id) {
@@ -1122,7 +1122,7 @@ pub(crate) fn insert_rows_unchecked(
     rows: &[(u64, RowInput<'_>)],
     ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     // ストレージへ触れる前に、クライアント自己申告の `tenant_id` を全件検査する
     // （security.md P0。[`insert_row`] と同じ単一照合パス `PolicyContext::is_owner`）。
     if rows.iter().any(|(_, row)| !ctx.is_owner(row.tenant_id)) {
@@ -1760,7 +1760,7 @@ fn insert_typed_row_impl(
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: &[VolatileColumn],
 ) -> Result<(), TenantWriteError> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     target.with_txn(|write_txn| {
         let schema = require_table_schema_write_any_identity(write_txn, table)?;
         if require_legacy {
@@ -1971,7 +1971,7 @@ pub(crate) fn insert_typed_rows_unchecked(
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: VolatileDefaultColumns<'_>,
 ) -> Result<(), TenantWriteError> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     if rows.is_empty() {
         return Ok(());
     }
@@ -2361,7 +2361,7 @@ fn upsert_typed_rows_impl(
     volatile_default_columns: VolatileDefaultColumns<'_>,
     mut project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<UpsertOutcome, TenantWriteError> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     if rows.is_empty() {
         return Ok(UpsertOutcome::default());
     }
@@ -3064,7 +3064,7 @@ pub(crate) fn update_row_unchecked(
     row: &RowInput<'_>,
     ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     if !ctx.is_owner(row.tenant_id) {
         return Err(TenantWriteError::Forbidden);
     }
@@ -3953,7 +3953,7 @@ pub(crate) fn update_row_columns_capturing_unchecked(
     expected_schema: Option<&crate::catalog::TableSchema>,
     mut project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<usize, TenantWriteError> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     target.with_txn(|write_txn| {
         let rows_affected: usize;
         let mut captured_row: Option<CapturedRow> = None;
@@ -4534,7 +4534,7 @@ fn delete_row_impl(
     scope: DeleteScope,
     mut capture: Option<DeleteCapture<'_>>,
 ) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     target.with_txn(|write_txn| {
         let mut captured_row: Option<CapturedRow> = None;
         // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。削除された行が
@@ -5128,7 +5128,7 @@ fn delete_rows_where_impl<E>(
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
-    validate_identifier(table).map_err(dml_write_err)?;
+    validate_relation_key(table).map_err(dml_write_err)?;
     target.with_txn(|write_txn| {
         let (candidate_ids, schema) = {
             let schema =
@@ -5315,7 +5315,7 @@ fn update_rows_where_impl<E>(
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
-    validate_identifier(table).map_err(dml_write_err)?;
+    validate_relation_key(table).map_err(dml_write_err)?;
     target.with_txn(|write_txn| {
         let (candidate_ids, schema) = {
             let schema =
@@ -5704,7 +5704,7 @@ pub(crate) fn truncate_tables_unchecked(
         );
     }
     for table in tables {
-        validate_identifier(table)?;
+        validate_relation_key(table)?;
     }
     // 全表を **単一** の write トランザクションで処理する（SQL-48 (4)。表ごとに commit する
     // ループは Autocommit で N 回 commit され原子性を失うため禁止）。途中の `?` は
@@ -5937,7 +5937,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
     } = req;
     // 置換前走査の上限も `ScanLimits` で飽和させる（`usize::MAX` による迂回防止）。
     let max_scanned_rows = crate::scan_limits::ScanLimits::new(max_scanned_rows).max_scanned_rows();
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     target.with_txn(|write_txn| {
         // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。クロージャ内で
         // 可変参照として捕捉し、削除した旧チャンク行の削除前の値を積む（下記の
@@ -6305,7 +6305,7 @@ pub(crate) fn operation_recorded(
     ctx: &PolicyContext,
     op_id: &OperationId,
 ) -> Result<bool, TenantWriteError> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     let read_txn = storage.db().begin_read().map_err(CatalogError::from)?;
     ledger::contains_in_read_txn(&read_txn, ctx.tenant_id(), table, op_id)
         .map_err(TenantWriteError::LedgerCorrupted)
@@ -6327,7 +6327,7 @@ pub(crate) fn last_operation(
     table: &str,
     ctx: &PolicyContext,
 ) -> Result<ledger::LastOperationRaw, TenantWriteError> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     let read_txn = storage.db().begin_read().map_err(CatalogError::from)?;
     ledger::last_operation_in_read_txn(&read_txn, ctx.tenant_id(), table)
         .map_err(TenantWriteError::LedgerCorrupted)
