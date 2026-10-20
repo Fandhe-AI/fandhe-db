@@ -380,3 +380,5 @@ Track A の段別内訳（`docs/design/filtered-distance-stage-profile.md`
   `improved` 判定にはオーナーの専有環境再実測が必要。
 - **hybrid・HNSW `Subset` 形状**（#654 の対象外区間。「対象外」節参照）は
   本 Issue でも計測していない。
+
+> Issue #2194 注記: 本書の索引の行参照は `SqlArenaSnapshot` のスロットで、Issue #2194 では変更していない（`id_index` を含め #2195 が扱う）。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。

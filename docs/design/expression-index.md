@@ -346,3 +346,5 @@ must be marked IMMUTABLE`）にする。型を決められない部分式は判�
 - `ON CONFLICT ((式))` の推論（SQL-49。推論は `unique_constraints` だけを見るので挙動は不変）。
 - 一意の式索引を FK の参照先にすること（列リストが無いため不可。PostgreSQL も同様）。
 - 式要素への `COLLATE`・matview への式索引（従来どおり `0A000`）、ORDER BY の式一致による索引順走査。
+
+> Issue #2194 注記: 本書の索引の行参照は `SqlArenaSnapshot` のスロットで、Issue #2194 では変更していない（`id_index` を含め #2195 が扱う）。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。

@@ -20,7 +20,7 @@
 //! - `0x01`（正引き。[`forward_subkey`]）: `[0x01][ordinal: u16 BE][正準キー
 //!   バイト列]`。`ordinal` は [`super::key_specs`] が返す一意キーの宣言順
 //!   インデックス（主キーが `Some` なら常に 0、UNIQUE 制約は 1 番から）。
-//!   値は当該キー値を保持する行の `id`（u64 BE）。
+//!   値は当該キー値を保持する行の rowid（u64 BE。従来方式の表では `id` と同一バイト列。Issue #2194）。
 //! - `0x02`（逆引き。[`reverse_subkey`]）: `[0x02][id: u64 BE]`。値はその行が
 //!   現在所有する正引きサブキー列（[`encode_reverse`]）で、行のキー値が
 //!   変わった・行が削除された際に、古い正引きエントリを漏れなく後片付け
@@ -84,6 +84,7 @@
 use super::{KeySpec, NullPolicy, UniqueKeyPlan};
 use crate::catalog::{CatalogError, TableSchema};
 use crate::sql::expression_key_index::CompiledIndexExpressions;
+use crate::storage::rowid::{row_key, split_row_key, RowId};
 use crate::tenant::TenantWriteError;
 use redb::{ReadableTable, TableHandle};
 use std::collections::{HashMap, HashSet};
@@ -245,21 +246,21 @@ fn forward_subkey(ordinal: u16, canonical_key: &[u8]) -> Vec<u8> {
 }
 
 /// 逆引きサブキー（`[0x02][id: u64 BE]`）を組み立てる。
-fn reverse_subkey(id: u64) -> Vec<u8> {
+fn reverse_subkey(id: RowId) -> Vec<u8> {
     let mut out = Vec::with_capacity(9);
     out.push(REVERSE_TAG);
-    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&id.to_index_raw().to_be_bytes());
     out
 }
 
 /// 正引きエントリの値（行 id、u64 BE 固定 8 バイト）をデコードする。破損値
 /// （長さ不足）は fail-closed に内部エラーとして拒否する（untrusted な
 /// wire 入力経路ではないが、ディスク破損を黙って無視しない。coding-rust.md）。
-fn decode_row_id(buf: &[u8]) -> Result<u64, TenantWriteError> {
+fn decode_row_id(buf: &[u8]) -> Result<RowId, TenantWriteError> {
     let arr: [u8; 8] = buf
         .try_into()
         .map_err(|_| internal("unique index forward entry value has unexpected length"))?;
-    Ok(u64::from_be_bytes(arr))
+    Ok(RowId::from_index_raw(u64::from_be_bytes(arr)))
 }
 
 /// 逆引きエントリの値（`[count: u16 BE]` + `count` 個の `[len: u32 BE][正引き
@@ -408,7 +409,7 @@ pub(super) fn forget_rows_in_txn(
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
-    ids: &[u64],
+    ids: &[RowId],
 ) -> Result<(), TenantWriteError> {
     if ids.is_empty() {
         return Ok(());
@@ -468,7 +469,7 @@ pub(super) fn ensure_tenant_index<R>(
     plan: &UniqueKeyPlan,
     compiled: Option<&CompiledIndexExpressions>,
     tenant_id: &str,
-    written_ids: &HashSet<u64>,
+    written_ids: &HashSet<RowId>,
 ) -> Result<(), TenantWriteError>
 where
     R: ReadableTable<(&'static str, u64), &'static [u8]>,
@@ -496,15 +497,15 @@ where
     // `clear_tenant_chunk` で丸ごと消した索引テーブル」への点照会で行う——
     // 既に挿入済みの正引きキーだけがヒットしうるため、`HashMap` での全件
     // 保持と同じ判定結果になる。
-    let start = std::ops::Bound::Included((tenant_id, 0u64));
-    let end = std::ops::Bound::Included((tenant_id, u64::MAX));
+    let start = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(0)));
+    let end = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(u64::MAX)));
     {
         let iter = row_table
             .range::<(&str, u64)>((start, end))
             .map_err(storage_error)?;
         for entry in iter {
             let (k, v) = entry.map_err(storage_error)?;
-            let (key_tenant, id) = k.value();
+            let (key_tenant, id) = split_row_key(k.value());
             if key_tenant != tenant_id {
                 break;
             }
@@ -512,7 +513,7 @@ where
                 // 今回の書き込み対象は `check_and_update` 側で処理する。
                 continue;
             }
-            let keys = plan.row_keys(schema, compiled, id, v.value())?;
+            let keys = plan.row_keys(schema, compiled, id.legacy_id(), v.value())?;
             let mut forward_subs: Vec<Vec<u8>> = Vec::new();
             for (ordinal, key) in keys.into_iter().enumerate() {
                 let Some(canonical) = key else {
@@ -536,7 +537,10 @@ where
                     }
                 }
                 index_table
-                    .insert((tenant_id, sub.as_slice()), id.to_be_bytes().as_slice())
+                    .insert(
+                        (tenant_id, sub.as_slice()),
+                        id.to_index_raw().to_be_bytes().as_slice(),
+                    )
                     .map_err(storage_error)?;
                 forward_subs.push(sub);
             }
@@ -597,20 +601,20 @@ where
         ));
     }
 
-    let start = std::ops::Bound::Included((tenant_id, 0u64));
-    let end = std::ops::Bound::Included((tenant_id, u64::MAX));
+    let start = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(0)));
+    let end = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(u64::MAX)));
     let iter = row_table
         .range::<(&str, u64)>((start, end))
         .map_err(storage_error)?;
     for entry in iter {
         let (k, v) = entry.map_err(storage_error)?;
-        let (key_tenant, id) = k.value();
+        let (key_tenant, id) = split_row_key(k.value());
         if key_tenant != tenant_id {
             // 閉区間の構築上到達しないはずだが defense-in-depth で維持する
             // （`ensure_tenant_index` と同じ判断）。
             break;
         }
-        let keys = plan.row_keys(schema, compiled, id, v.value())?;
+        let keys = plan.row_keys(schema, compiled, id.legacy_id(), v.value())?;
         for (ordinal, key) in keys.into_iter().enumerate() {
             let Some(canonical) = key else {
                 continue;
@@ -674,7 +678,7 @@ pub(super) fn lookup_forward_read_only<I>(
     tenant_id: &str,
     ordinal: u16,
     canonical_key: &[u8],
-) -> Result<Option<u64>, TenantWriteError>
+) -> Result<Option<RowId>, TenantWriteError>
 where
     I: ReadableTable<(&'static str, &'static [u8]), &'static [u8]>,
 {
@@ -701,8 +705,8 @@ pub(super) fn recover_forward_keys_for_rows(
     compiled: Option<&CompiledIndexExpressions>,
     indices: &[usize],
     tenant_id: &str,
-    ids: &[u64],
-) -> Result<Vec<(u64, Vec<u8>)>, TenantWriteError> {
+    ids: &[RowId],
+) -> Result<Vec<(RowId, Vec<u8>)>, TenantWriteError> {
     let index_table_name = crate::catalog::user_uniq_table_name(table_name);
     if !index_table_exists(write_txn, &index_table_name)? {
         return Ok(Vec::new());
@@ -775,25 +779,28 @@ pub(super) fn check_and_update<R>(
     plan: &UniqueKeyPlan,
     compiled: Option<&CompiledIndexExpressions>,
     tenant_id: &str,
-    written_ids: &HashSet<u64>,
+    written_ids: &HashSet<RowId>,
 ) -> Result<(), TenantWriteError>
 where
     R: ReadableTable<(&'static str, u64), &'static [u8]>,
 {
     // 1. 今回書き込んだ行同士のキー値衝突を検出しつつ、各行が持つ新しい
     //    正引きエントリ集合を組み立てる（旧実装の段 1 と同じ判定）。
-    let mut written_keys: Vec<HashMap<Vec<u8>, u64>> =
+    let mut written_keys: Vec<HashMap<Vec<u8>, RowId>> =
         (0..plan.ordinal_count()).map(|_| HashMap::new()).collect();
-    let mut new_entries: HashMap<u64, Vec<(u16, Vec<u8>)>> = HashMap::new();
+    let mut new_entries: HashMap<RowId, Vec<(u16, Vec<u8>)>> = HashMap::new();
     for &id in written_ids {
         count_row_get();
-        let Some(guard) = row_table.get((tenant_id, id)).map_err(storage_error)? else {
+        let Some(guard) = row_table
+            .get(row_key(tenant_id, id))
+            .map_err(storage_error)?
+        else {
             // 呼び出し元は必ず同一 txn 内で先に書き込み済みのはずだが、内部
             // 不変条件の欠落があっても判定対象から除外するに留める
             // （旧実装と同じ扱い）。
             continue;
         };
-        let keys = plan.row_keys(schema, compiled, id, guard.value())?;
+        let keys = plan.row_keys(schema, compiled, id.legacy_id(), guard.value())?;
         let mut entries: Vec<(u16, Vec<u8>)> = Vec::new();
         for (ordinal, key) in keys.into_iter().enumerate() {
             let Some(key) = key else {
@@ -839,9 +846,13 @@ where
                 continue;
             }
             count_row_get();
-            match row_table.get((tenant_id, owner)).map_err(storage_error)? {
+            match row_table
+                .get(row_key(tenant_id, owner))
+                .map_err(storage_error)?
+            {
                 Some(guard) => {
-                    let owner_keys = plan.row_keys(schema, compiled, owner, guard.value())?;
+                    let owner_keys =
+                        plan.row_keys(schema, compiled, owner.legacy_id(), guard.value())?;
                     let recomputed = owner_keys
                         .get(usize::from(*ordinal))
                         .ok_or_else(|| internal("unique key ordinal out of range"))?;
@@ -895,7 +906,10 @@ where
 
         for sub in &new_forward_subs {
             index_table
-                .insert((tenant_id, sub.as_slice()), id.to_be_bytes().as_slice())
+                .insert(
+                    (tenant_id, sub.as_slice()),
+                    id.to_index_raw().to_be_bytes().as_slice(),
+                )
                 .map_err(storage_error)?;
         }
         if new_forward_subs.is_empty() {
@@ -925,9 +939,26 @@ mod tests {
         assert_eq!(&sub[1..3], &7u16.to_be_bytes());
         assert_eq!(&sub[3..], key.as_slice());
 
-        let rsub = reverse_subkey(42);
+        let rsub = reverse_subkey(RowId::from_legacy_id(42));
         assert_eq!(rsub[0], REVERSE_TAG);
         assert_eq!(&rsub[1..], &42u64.to_be_bytes());
+    }
+
+    /// 永続バイト列は rowid 化の前後で不変（`FORMAT_VERSION` を据え置く根拠。Issue #2194）:
+    /// 逆引きサブキーは `[0x02][u64 BE]`、正引き値は u64 BE の 8 バイト。
+    #[test]
+    fn persisted_row_reference_bytes_are_unchanged_golden() {
+        assert_eq!(FORMAT_VERSION, 4);
+        assert_eq!(
+            reverse_subkey(RowId::from_legacy_id(0x0102_0304_0506_0708)),
+            vec![REVERSE_TAG, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        let decoded = decode_row_id(&[0, 0, 0, 0, 0, 0, 0x03, 0xE8]).expect("decode");
+        assert_eq!(decoded, RowId::from_allocated(1000));
+        assert_eq!(
+            decoded.to_index_raw().to_be_bytes(),
+            [0, 0, 0, 0, 0, 0, 0x03, 0xE8]
+        );
     }
 
     #[test]
@@ -1087,7 +1118,7 @@ mod tests {
         let index_table = write_txn
             .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
             .expect("open index table");
-        let rev_sub = reverse_subkey(1);
+        let rev_sub = reverse_subkey(RowId::from_legacy_id(1));
         let leftover = index_table
             .get(("tenant-a", rev_sub.as_slice()))
             .expect("index table get")
@@ -1239,7 +1270,7 @@ mod tests {
             "docs",
             &schema_unique_on_b,
             "tenant-a",
-            &[2],
+            &[RowId::from_legacy_id(2)],
         )
         .expect_err(
             "row 2's value in column b duplicates row 1's column-b value; this must be \

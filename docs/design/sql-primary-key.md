@@ -188,3 +188,5 @@ COLUMN`（Rust API。TABLE-19）は主キー構成列の削除を
 - PK 構成列すべてへのリテラル等価を持つ広域取得は、永続一意索引の点検索で実行し、EXPLAIN に
   `index_primary_key`／`primary_key_lookup` を出す。設計は
   [primary-key-point-lookup.md](primary-key-point-lookup.md)。
+
+> Issue #2194 注記: 索引・FK の行参照は rowid 型で扱う（従来方式の表ではバイト列は `id` と同一）。本書の「行の `id`」「物理キー `(tenant_id, id)`」は rowid に読み替える。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。

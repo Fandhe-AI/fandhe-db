@@ -512,3 +512,5 @@ spec 側への申し送り（ポインタのみ）: `IN`／`BETWEEN` 構文の�
 ## 追記（Issue #2191・TABLE-28）: 照合込みの辞書
 
 `TextColumnIndex.values` は「バイト列昇順」から「索引の照合順」になった（バイト列順の照合では従来と同一）。ICU 列も索引化され、等価・`IN` は辞書の直引きで解決する。前方一致は辞書がバイト列順のときだけ使い、`column_groups`（GROUP BY の列挙形）もバイト列順の辞書だけが列挙する。使用可否の規則と `EXPLAIN` の理由表示は [collation-aware-index.md](collation-aware-index.md)。
+
+> Issue #2194 注記: 本書の索引の行参照は `SqlArenaSnapshot` のスロットで、Issue #2194 では変更していない（`id_index` を含め #2195 が扱う）。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。

@@ -114,3 +114,5 @@ Issue #1364 で `ErrorClass::InvalidTableDefinition`・`SqlSurfaceError::Invalid
 スキーマから導く。`ADD PRIMARY KEY` の直後は永続一意索引が無効化されているため、実行時はテナント単位で
 範囲走査へ縮退し（結果は全走査と同一）、そのテナントの次の書き込みで索引が再構築されて索引経路へ移る。
 主キーの `DROP CONSTRAINT` の後は PK が無いので全走査になる。`tests/sql_scan_pk_point.rs` が固定する。
+
+> Issue #2194 注記: 索引・FK の行参照は rowid 型で扱う（従来方式の表ではバイト列は `id` と同一）。本書の「行の `id`」「物理キー `(tenant_id, id)`」は rowid に読み替える。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。

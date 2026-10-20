@@ -271,3 +271,5 @@ Issue #1067（UNIQUE の ADD 時全テナント検証）と同じ判断で、上
   除く）で通ることを確認済み
 - `crates/wire-server/tests/err4_http_projection.rs`: 新しい `ErrorClass` が
   無いため無変更で通過（HTTP 射影の整合確認を兼ねる）
+
+> Issue #2194 注記: 索引・FK の行参照は rowid 型で扱う（従来方式の表ではバイト列は `id` と同一）。本書の「行の `id`」「物理キー `(tenant_id, id)`」は rowid に読み替える。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。

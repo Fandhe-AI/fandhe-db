@@ -455,3 +455,5 @@ nosql13_ddl.rs`・`crates/wire-server/tests/err4_http_projection.rs` の
   `on_delete`／`on_update` の宣言自体は解消済み）
 - `UPDATE ... SET col = NULL` 経由の `MATCH FULL` 検証（SQL 表層の `NULL` リテラルは
   Issue #1524 で受理済み。この経路での `MATCH FULL` テストは未追加）
+
+> Issue #2194 注記: 索引・FK の行参照は rowid 型で扱う（従来方式の表ではバイト列は `id` と同一）。本書の「行の `id`」「物理キー `(tenant_id, id)`」は rowid に読み替える。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。
