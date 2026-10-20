@@ -1359,7 +1359,7 @@ fn is_json_container(v: &JsonValue) -> bool {
 
 /// スカラーの等価キー。数値は表記（`1`／`1.0`／`10e-1`）に依らず値で等しくなる
 /// （[`canonical_equality_text`] と同じ正規化。構造的な `==` は使わない）。
-fn scalar_equality_key(v: &JsonValue) -> Result<String, JsonColumnError> {
+pub(crate) fn scalar_equality_key(v: &JsonValue) -> Result<String, JsonColumnError> {
     let mut out = String::new();
     write_equality_canonical(v, &mut out)?;
     Ok(out)

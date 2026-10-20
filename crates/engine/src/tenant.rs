@@ -498,6 +498,11 @@ pub enum TenantWriteError {
     /// は上限値のみを含む固定文言（テナント・値・テーブル名は含めない。
     /// RLS-9・security.md P0）。
     ReferentialActionLimitExceeded,
+    /// GIN 相当索引（INDEX-8、Issue #2207）の 1 値あたりの抽出キー数または 1 キーのバイト長が
+    /// 上限を超えた。`54000`（`PayloadTooLarge`）へ写像し、`write_txn` は commit しない
+    /// （行・台帳・索引とも痕跡ゼロ）。`Display`／`Debug` は固定文言（テナント・値・件数・
+    /// 索引名を含めない。RLS-9・security.md P0）。
+    GinIndexEntryLimitExceeded,
     /// 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有により、書き込み
     /// トランザクションの取得（[`Storage::begin_write_txn`]）がロック待ちの上限を
     /// 超過した（`55P03`）。`Storage(StorageError::WriteLockTimeout)` へ一般化せず
@@ -699,6 +704,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             }
             TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             TenantWriteError::ReferentialActionLimitExceeded => ErrorClass::PayloadTooLarge,
+            TenantWriteError::GinIndexEntryLimitExceeded => ErrorClass::PayloadTooLarge,
             TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
         }
     }
@@ -787,6 +793,9 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::ForeignKeyViolation => {
                 write!(f, "foreign key constraint violation")
             }
+            TenantWriteError::GinIndexEntryLimitExceeded => {
+                f.write_str("gin index entry limit exceeded")
+            }
             TenantWriteError::ReferentialActionLimitExceeded => {
                 write!(
                     f,
@@ -849,6 +858,9 @@ impl std::fmt::Debug for TenantWriteError {
                 f.write_str("SequenceEvaluationFailed(<redacted>)")
             }
             TenantWriteError::ForeignKeyViolation => f.write_str("ForeignKeyViolation"),
+            TenantWriteError::GinIndexEntryLimitExceeded => {
+                f.write_str("GinIndexEntryLimitExceeded")
+            }
             TenantWriteError::ReferentialActionLimitExceeded => {
                 f.write_str("ReferentialActionLimitExceeded")
             }
@@ -4684,6 +4696,13 @@ fn delete_row_impl(
                 ctx.tenant_id(),
                 &[RowId::from_legacy_id(id)],
             )?;
+            // GIN 相当索引（INDEX-8、Issue #2207）のポスティングの後片付け（衛生措置）。
+            crate::constraint::forget_gin_index_rows_in_txn(
+                write_txn,
+                table,
+                ctx.tenant_id(),
+                &[RowId::from_legacy_id(id)],
+            )?;
         }
         // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の
         // 参照先側の検査。行を実際に削除した場合のみ行う——対象行が不存在・他テナント
@@ -5496,6 +5515,14 @@ fn apply_predicate_delete_in_txn<E>(
             &candidate_rowids,
         )
         .map_err(dml_write_err)?;
+        // GIN 相当索引（INDEX-8、Issue #2207）のポスティングの後片付け（衛生措置）。
+        crate::constraint::forget_gin_index_rows_in_txn(
+            write_txn,
+            table,
+            ctx.tenant_id(),
+            &candidate_rowids,
+        )
+        .map_err(dml_write_err)?;
     }
 
     // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の
@@ -5796,6 +5823,11 @@ pub(crate) fn truncate_tables_unchecked(
                     // 永続一意索引（TABLE-16・TASK-204、Issue #1070）のテナント範囲をクリアする
                     // （他テナントの索引エントリには触れない）。
                     crate::constraint::clear_unique_index_for_tenant_in_txn(
+                        write_txn, table, schema, tenant,
+                    )?;
+                    // GIN 相当索引（INDEX-8、Issue #2207）の自テナント範囲を空にし、空の索引として
+                    // 完全な状態（マーカー有効）にする。
+                    crate::constraint::clear_gin_index_for_tenant_in_txn(
                         write_txn, table, schema, tenant,
                     )?;
                     crate::key_index::clear_tenant_in_txn(write_txn, table, tenant)?;
@@ -6164,6 +6196,13 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 write_txn,
                 table,
                 &schema,
+                tenant,
+                &to_remove_rowids,
+            )?;
+            // GIN 相当索引（INDEX-8、Issue #2207）のポスティングの後片付け（衛生措置）。
+            crate::constraint::forget_gin_index_rows_in_txn(
+                write_txn,
+                table,
                 tenant,
                 &to_remove_rowids,
             )?;

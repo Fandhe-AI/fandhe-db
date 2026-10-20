@@ -9,6 +9,14 @@
 
 ### Breaking Changes
 
+- GIN 相当索引のキー抽出と DML 維持（Issue #2207・INDEX-8）: `CREATE INDEX ... USING gin` の宣言が物理テーブル
+  `user_gin/{索引名}` のポスティングを持つようになり、INSERT・UPSERT・UPDATE・DELETE・COPY・TRUNCATE・分割実行 DML・
+  FK 参照アクションと同じ write txn で維持する（`CREATE INDEX` は既存行から同期構築）。1 値あたり 65,535 エントリ・
+  `jsonb_ops` の 1 エントリ 4,096 バイトを超える jsonb の書き込み・`CREATE INDEX` は `54000`（副作用なし）。
+  結果集合は宣言の有無で変わらない（読み取り側の利用は #2208）。公開 API は `TenantWriteError::GinIndexEntryLimitExceeded`・
+  `EngineCore::verify_gin_index_read_only`・`GinIndexAudit` の追加。
+  BREAKING CHANGE: `TenantWriteError` に variant を追加したため外部の網羅的な `match` は更新が要る。GIN 索引付きの表への
+  書き込みが上限超過で `54000` になりうる。
 - GIN 相当索引の宣言（Issue #2206・INDEX-8）: `CREATE INDEX ... USING gin (<JSONB 列> [jsonb_ops | jsonb_path_ops])` を
   受理してカタログへ永続化する（従来は `0A000`）。JSONB 以外の列・複数列・式・`UNIQUE`・`WHERE`・`COLLATE` は `0A000`、
   未知の演算子クラスは `42704`。宣言の受理までで、索引の生成・利用は後続（宣言は結果集合に影響しない）。

@@ -58,6 +58,8 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::SequenceEvaluationFailed(inner) => inner.error_class(),
         TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
         TenantWriteError::ReferentialActionLimitExceeded => ErrorClass::PayloadTooLarge,
+        // Issue #2207（INDEX-8）: GIN 相当索引の抽出上限超過は `54000`。
+        TenantWriteError::GinIndexEntryLimitExceeded => ErrorClass::PayloadTooLarge,
         TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
     }
 }
@@ -87,6 +89,7 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
         TenantWriteError::UniqueViolation,
         TenantWriteError::ForeignKeyViolation,
         TenantWriteError::ReferentialActionLimitExceeded,
+        TenantWriteError::GinIndexEntryLimitExceeded,
         TenantWriteError::WithCheckOptionViolation,
         TenantWriteError::CheckViolation {
             constraint: "test_check".to_string(),
