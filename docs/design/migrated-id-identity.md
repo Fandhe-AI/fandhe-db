@@ -47,7 +47,7 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
 | `id` の明示が必須（INSERT・COPY・NoSQL insert） | `sql/parser.rs`・`sql/copy.rs`・`http/query/insert.rs` |
 | `ColumnDefault::Sequence(名前)` がある。省略列の採番は書き込み txn 内で、台帳照合の後に行う | sequence ADR §8.1・§8.5 |
 | SEQUENCE の定義は全テナント共有の `public`、状態は `(tenant_id, sequence_id)` | sequence ADR §7.1・§7.5 |
-| 定義 blob の `owned_by` は「なし」で固定 | `catalog/sequence.rs` |
+| 定義 blob v3 が所有者（表・列）を持つ（#1645）。DROP TABLE・RENAME への追従は #1694 | `catalog/sequence.rs` |
 | `AS`・`CACHE`・`OWNED BY`・IDENTITY・UPSERT・COPY・ファイル形 INSERT の `DEFAULT nextval` は `0A000` | sequence ADR D8・§8.5・§8.6 |
 | 台帳のハッシュは typed insert の先頭が `push_u64(id)` | `recovery/content_hash.rs`・[nosql-insert-mapping.md](nosql-insert-mapping.md) |
 | 省略列へ適用した DEFAULT はハッシュの材料から除外する | [not-null-default.md](not-null-default.md)・sequence ADR D2 |
@@ -83,6 +83,11 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
   RECOVER-1・RECOVER-10〜12）。公開境界の拡張にはオーナー承認が要るため、承認記録が得られるまで
   具体の契約は本書へ転記しない
 - 具体の方式は #1698 の実装時にオーナー承認済みの範囲で確定する
+- 実装の所在: `catalog/sequence/migrated_identity.rs`。テナントごとの状態行は既存の最大 `id` から始め、
+  `i64::MAX` を超える従来の u64 の `id` は `i64::MAX` へ飽和させて次の採番を `2200H` で止める
+  （衝突させない側へ倒す。範囲外の値そのものの扱いは #2200 の値域の判断に従う）。
+  最大 `id` の算出は、物理キーが `id` の表（飛ばし読み）と、`id` を列に持つ表（一度きりの走査）の
+  2 経路を持つ。移行後にどちらが該当するかは #2200 が確定する（引き継ぎ事項）
 
 ### D4. IDENTITY 相当の表現（#1698 で確定。自動運転下の判断で、人間の確認が要る）
 
@@ -95,6 +100,10 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
 - #1695（`GENERATED … AS IDENTITY`）と表現を共有する。#1695 は `ColumnDefault::Identity` を採用して着地した
   （[sequence-namespace-and-ledger.md](sequence-namespace-and-ledger.md) §13）。#1698 はこの表現へ合わせ、
   本案の独自表現は採らない
+- 確定（#1698）: `ColumnDefault::Identity { sequence, kind: ByDefault }` を採用する。列と SEQUENCE は名前で
+  結び付き、`ALTER SEQUENCE … RENAME` は sequence ADR §9.2 のとおり `0A000` のまま受け入れる。
+  部品は `assign_migrated_id_identity_in_txn`（#2200 の移行 txn が表ごとに呼ぶ。begin・commit を含まず、
+  再実行は何も書かずに収束する）。#2200 が着地するまで SQL・NoSQL・公開 API には結線しない
 - 保留案: 新しい列属性 `identity`（BY DEFAULT／ALWAYS と sequence_id）。ALWAYS や `OVERRIDING` を
   扱う #1695 の判断に委ねる
 
@@ -104,7 +113,8 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
   同じ txn で削除する
 - SEQUENCE だけを DROP すると依存の `2BP01`
 - `ALTER TABLE … RENAME TO` では SEQUENCE の名前を変えない
-- `TRUNCATE … RESTART IDENTITY`（SQL-48 ポインタ）と `ALTER COLUMN … DROP IDENTITY` は、
+- `TRUNCATE … RESTART IDENTITY`（SQL-48 ポインタ）は #1645 で受理済みで、所有者が付いた SEQUENCE が対象になる
+  （そのテナントの全行が消えた後に START へ戻るため衝突しない）。`ALTER COLUMN … DROP IDENTITY` は、
   受理する Issue が決まるまで `0A000`
 - ALTER SEQUENCE の RESTART は全テナントへ作用する（sequence ADR §9.2）。所有された SEQUENCE への
   RESTART は既存の `id` と衝突して `23505` を招く。DDL 権限ゲートの下にあり、データ破壊ではなく

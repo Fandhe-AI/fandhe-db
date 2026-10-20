@@ -29,6 +29,8 @@
 
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
+mod migrated_identity;
+
 use crate::storage::read_source::ReadSource;
 
 use super::{
