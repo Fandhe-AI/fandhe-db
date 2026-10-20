@@ -236,7 +236,10 @@ pub(crate) fn schema_id_in_txn<R: ReadSource>(
 /// Bind 済みの内部キーが削除済み ID を指したまま作成できてしまうため。作成と同じ txn で検査して
 /// TOCTOU を塞ぐ）。`public` の裸の名前は常に生存扱い。不在は `TableNotFound`（fail-closed。
 /// 他テナントの SCHEMA か否かを区別しない）。SCHEMA ID は再利用されないため、全テナントの定義を
-/// 走査して ID の一致を見る（DDL のみ・件数は上限付き。真偽以外は何も返さない）。
+/// 走査して ID の一致を見る（DDL のみの経路。relation キーはテナントを持たないため行を直接引けず、
+/// 件数上限も設けない。真偽以外は何も返さない）。他テナントの行が壊れていても無関係な作成を
+/// 阻害しないよう、復号できない行は読み飛ばす（対象 SCHEMA 自身の行が壊れていれば一致せず
+/// `TableNotFound` になるため fail-closed は保たれる）。
 pub(crate) fn ensure_key_schema_alive_in_txn<R: ReadSource>(src: &R, key: &str) -> Result<()> {
     let RelationKey::InSchema { schema_id, .. } = RelationKey::parse(key)? else {
         return Ok(());
@@ -250,7 +253,7 @@ pub(crate) fn ensure_key_schema_alive_in_txn<R: ReadSource>(src: &R, key: &str) 
     };
     for entry in table.iter()? {
         let (_, v) = entry?;
-        if decode_schema_def(v.value())? == schema_id {
+        if decode_schema_def(v.value()).is_ok_and(|id| id == schema_id) {
             return Ok(());
         }
     }

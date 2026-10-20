@@ -374,7 +374,7 @@ fn decode_owner_trailer(trailer: &[u8]) -> Result<SequenceOwner> {
     let corrupt = || CatalogError::CorruptSchema("corrupt sequence definition".to_string());
     let mut rest = trailer;
     let mut names: Vec<String> = Vec::with_capacity(2);
-    for _ in 0..2 {
+    for is_relation in [true, false] {
         let len_raw: [u8; 2] = rest
             .get(..2)
             .and_then(|s| s.try_into().ok())
@@ -382,7 +382,13 @@ fn decode_owner_trailer(trailer: &[u8]) -> Result<SequenceOwner> {
         let len = usize::from(u16::from_le_bytes(len_raw));
         let name_bytes = rest.get(2..2 + len).ok_or_else(corrupt)?;
         let name = std::str::from_utf8(name_bytes).map_err(|_| corrupt())?;
-        validate_relation_key(name).map_err(|_| corrupt())?;
+        // 書き込み側は表名に relation key（修飾名を含む）、列名に厳格な識別子検証を課すため、
+        // 復号側も同じ検証で揃える（列名に relation key 形式が入った blob は破損扱い）。
+        if is_relation {
+            validate_relation_key(name).map_err(|_| corrupt())?;
+        } else {
+            validate_identifier(name).map_err(|_| corrupt())?;
+        }
         names.push(name.to_string());
         rest = rest.get(2 + len..).ok_or_else(corrupt)?;
     }
@@ -1522,6 +1528,25 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
+    /// 所有者部の列名は厳格な識別子検証を通す（relation key 形式の列名は破損扱い）。
+    #[test]
+    fn owner_trailer_rejects_relation_key_column() {
+        let enc = |table: &str, column: &str| {
+            let mut v = Vec::new();
+            for n in [table, column] {
+                v.extend_from_slice(&(n.len() as u16).to_le_bytes());
+                v.extend_from_slice(n.as_bytes());
+            }
+            v
+        };
+        let ok = decode_owner_trailer(&enc("#1.t", "c")).expect("valid owner");
+        assert_eq!((ok.table.as_str(), ok.column.as_str()), ("#1.t", "c"));
+        assert!(matches!(
+            decode_owner_trailer(&enc("t", "#1.c")),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
     /// 暗黙 SEQUENCE の名前の切り詰め（PostgreSQL の `makeObjectName` 相当。Issue #1694）。
     #[test]
     fn make_object_name_fits_identifier_limit() {
