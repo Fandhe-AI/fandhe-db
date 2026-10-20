@@ -5846,11 +5846,9 @@ impl EngineCore {
                         .map_err(|_| crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "internal error".to_string(),
                         })?;
-                // ADR D7（TABLE-27・Issue #1717）: public の表は SCHEMA 配下のオブジェクトへ依存しない。
-                // 既存名への `IF NOT EXISTS` は意味検査をしない no-op 契約のため、実作成時だけ検査する。
-                if !existing_noop {
-                    crate::sql::schema_dependency::check_create_table(stmt)?;
-                }
+                // ADR D7（TABLE-27・Issue #1717）の検査は `execute_create_table` 内で、既存名 no-op の
+                // 判定を通過して実作成へ進む経路すべてに対して行う（ここで省略判定を持つと、判定後に
+                // 他セッションが同名を DROP した競合で未検査の定義が作られる）。
                 if !existing_noop
                     && stmt
                         .foreign_keys

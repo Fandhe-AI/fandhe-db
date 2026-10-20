@@ -258,6 +258,10 @@ pub(crate) fn execute_create_table(
     {
         return Ok(CreateTableOutcome {});
     }
+    // ADR D7（TABLE-27・Issue #1717）: public の表は SCHEMA 配下のオブジェクトへ依存しない。
+    // 検査は定義だけで決まる（カタログ非依存）ため、上の既存名 no-op を抜けた時点で必ず通す。
+    // 呼び出し元の事前存在判定が競合で古くなっても、実作成へ進む定義は常に検査済みになる。
+    crate::sql::schema_dependency::check_create_table(validated)?;
     let schema = build_table_schema(Some(storage), validated, limits)?;
     // 早期判定〔上〕と書き込みの間に他セッションが同名を作った場合の TOCTOU 対策。名前衝突は
     // commit・世代 bump の前に返るため、no-op は副作用を残さない。
@@ -3476,6 +3480,29 @@ fn map_drop_type_error(e: CatalogError) -> SqlSurfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR D7（TABLE-27・Issue #1717）の回帰: 呼び出し元が「既存名」と判断して事前検査を省いた後に
+    /// 名前が消えた競合を模す（対象名が存在しない状態で `IF NOT EXISTS` を直接実行する）。
+    /// SCHEMA 配下のオブジェクトへ依存する public 表は、実作成へ進む前に必ず拒否される。
+    #[test]
+    fn create_if_not_exists_still_enforces_schema_dependency_when_name_vanished() {
+        let path = crate::test_util::temp_db::unique_db_path("ddl-ine-d7-race");
+        let _guard = crate::test_util::temp_db::CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let tokens = crate::sql::lexer::tokenize(
+            "CREATE TABLE IF NOT EXISTS c (id BIGINT PRIMARY KEY, n BIGINT)",
+        )
+        .expect("tokenize");
+        let mut validated =
+            crate::sql::allowlist::validate_create_table_tokens(&tokens).expect("validate");
+        // 名前解決器が作る SCHEMA 配下の内部キー（`#<id>.<name>`）への `DEFAULT nextval` 依存を与える。
+        let col = validated.columns.last_mut().expect("column");
+        col.default_expr = Some(crate::catalog::ColumnDefault::Sequence("#1.sq".to_string()));
+        let err = execute_create_table(&storage, &validated, &SchemaLimits::default())
+            .expect_err("D7 must reject");
+        assert_eq!(err.wire_code(), "42501");
+        assert!(!storage.relation_name_exists("c").expect("exists"));
+    }
 
     /// `IF EXISTS` の対象不在 no-op は全体世代・テーブル単位世代・索引カタログ世代を
     /// 進めない（Issue #1614・TABLE-36 ポインタ）。対照として実在する索引の DROP は
