@@ -545,6 +545,11 @@ pub enum SqlOutcome {
     /// **BREAKING CHANGE**（Issue #1713）: 本 variant の追加により `SqlOutcome`
     /// を網羅的にマッチする既存コードはすべて更新済み。
     DropSchema(ddl::DropSchemaOutcome),
+    /// `ALTER SCHEMA <name> RENAME TO <new>`（TABLE-27、Issue #1716）の成功応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #1716）: 本 variant の追加により `SqlOutcome` を網羅的に
+    /// マッチするコードは追随が必要。
+    AlterSchema(ddl::AlterSchemaOutcome),
     /// `ALTER SEQUENCE <name> ...`（`RENAME TO` を含む。TABLE-24・SQL-23、Issue #1689）が
     /// セッション経由の実行経路で成功したことを示す応答。
     ///

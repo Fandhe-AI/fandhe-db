@@ -510,7 +510,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // の variant・`mod namespace` 宣言）に伴い同ファイルの他の行番号を追随させた。
     ("catalog/namespace.rs", 340),
     ("catalog/namespace.rs", 378),
-    ("catalog/namespace.rs", 652),
+    // Issue #1716: `rename_schema`（414）も `schemas` の 1 行付け替えだけで、行ストア・世代を変えない。
+    // 636・752 は同ファイルの `#[cfg(test)]` 内（カタログ表への種まき）で同じ理由で対象外。
+    ("catalog/namespace.rs", 414),
+    ("catalog/namespace.rs", 636),
+    ("catalog/namespace.rs", 752),
     // Issue #1645（所有 SEQUENCE の定義 blob 版 3・`commit_and_finish` 経路の追加）と base 取り込みで行が移動したため
     // 全件を現行行へ追随（commit 対象は SEQUENCE 定義・状態表のみで同じ理由により対象外）。
     // Issue #1694（SERIAL の暗黙 SEQUENCE・所有 SEQUENCE の削除と追従）の追加で行番号が移動したための追随

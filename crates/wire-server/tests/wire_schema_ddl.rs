@@ -123,6 +123,44 @@ fn wire_schema_ddl_lifecycle_and_sqlstates() {
     read_ready_for_query(&mut stream);
 }
 
+/// `ALTER SCHEMA ... RENAME TO` と `ALTER TABLE ... SET SCHEMA`（Issue #1716）の CommandComplete タグと
+/// SQLSTATE（権限なしは対象の有無によらず `42501`）。
+#[test]
+fn wire_alter_schema_and_set_schema_tags_and_sqlstates() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    for (sql, tag) in [
+        ("CREATE SCHEMA a", "CREATE SCHEMA"),
+        (
+            "CREATE TABLE items (id BIGINT PRIMARY KEY, qty INTEGER)",
+            "CREATE TABLE",
+        ),
+        ("ALTER SCHEMA a RENAME TO b", "ALTER SCHEMA"),
+        ("ALTER TABLE items SET SCHEMA public", "ALTER TABLE"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    for (sql, sqlstate) in [
+        ("ALTER SCHEMA public RENAME TO z", "42501"),
+        ("ALTER SCHEMA ghost RENAME TO z", "3F000"),
+        ("ALTER SCHEMA b RENAME TO pg_x", "42939"),
+        ("ALTER SCHEMA b OWNER TO bob", "0A000"),
+        ("ALTER TABLE items SET SCHEMA b", "42501"),
+        ("ALTER TABLE items SET SCHEMA ghost", "3F000"),
+        ("ALTER TABLE items SET SCHEMA pg_catalog", "0A000"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, sqlstate);
+        read_ready_for_query(&mut stream);
+    }
+}
+
 /// 2 テナントの接続で同名が独立し、他テナントにしか無い名前の DROP は存在しない名前と
 /// 同じ SQLSTATE・同じ文言になる（存在の秘匿）。
 #[test]
