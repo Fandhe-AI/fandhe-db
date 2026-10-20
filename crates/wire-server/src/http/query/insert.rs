@@ -184,20 +184,27 @@ fn bind_row(
     // `NegInt`（負の整数）・`Float`（小数点／指数部を含むリテラル。整数値に
     // 丸められる小数——例: `1.0`——を含む）はいずれも `id` として拒否する
     // （`id` は非負整数のみが妥当なため。文字列形の `id` も受理しない）。
-    let id: u64 = match map.get("id") {
-        Some(JsonValue::Number(n)) => match n.as_exact_u64() {
-            Some(id) => id,
-            None => {
+    let allocated = schema.uses_allocated_row_identity();
+    let id: Option<u64> = if allocated {
+        // 採番方式の表（TABLE-23・NOSQL-23。Issue #2201）は疑似列 `id` を持たず、行 id は engine が
+        // 払い出す。`id` キーは宣言した通常の列としてだけ扱う（要求も注入もしない）。
+        None
+    } else {
+        Some(match map.get("id") {
+            Some(JsonValue::Number(n)) => match n.as_exact_u64() {
+                Some(id) => id,
+                None => {
+                    return Err(InsertError::Bind(invalid_input_error(
+                        "INSERT row id must be a non-negative integer JSON number",
+                    )))
+                }
+            },
+            _ => {
                 return Err(InsertError::Bind(invalid_input_error(
                     "INSERT row id must be a non-negative integer JSON number",
                 )))
             }
-        },
-        _ => {
-            return Err(InsertError::Bind(invalid_input_error(
-                "INSERT row id must be a non-negative integer JSON number",
-            )))
-        }
+        })
     };
 
     // `columns`／`literals` は宣言順に対応する 2 本の Vec として組み立て、
@@ -207,13 +214,16 @@ fn bind_row(
     // `bind_insert` 側の単一情報源に委譲する（NOSQL-17。Issue #896）。
     let mut columns: Vec<String> = Vec::with_capacity(map.len());
     let mut literals: Vec<engine::sql::allowlist::InsertLiteral> = Vec::with_capacity(map.len());
-    columns.push("id".to_string());
-    literals.push(engine::sql::allowlist::InsertLiteral::Number(
-        id.to_string(),
-    ));
+    if let Some(id) = id {
+        columns.push("id".to_string());
+        literals.push(engine::sql::allowlist::InsertLiteral::Number(
+            id.to_string(),
+        ));
+    }
 
     for (key, raw) in map.iter() {
-        if key == "id" {
+        // 疑似列 `id` は上で処理済み。採番方式の表の `id` は通常の列として下の写像へ進む。
+        if id.is_some() && key == "id" {
             continue;
         }
         // untrusted な列名が engine 側のエラー文言へそのまま埋め込まれて
@@ -401,7 +411,6 @@ pub fn execute(
             rows.len(),
             operation_id.as_ref(),
             |schema| {
-                super::gate::reject_allocated_schema(schema)?;
                 bind_rows(rows, table, operation_id.as_ref(), schema).map_err(|e| match e {
                     InsertError::Bind(err) | InsertError::Exec(err) => err,
                     // `bind_rows`（`bind_row` を行ごとに呼ぶ）は列キーの識別子形状検査

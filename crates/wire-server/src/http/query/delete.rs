@@ -65,7 +65,7 @@ use crate::http::error_body::escape_json_string_into;
 use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
 
-use super::dml_target::{bind_target_form, DmlTargetError, TargetForm};
+use super::dml_target::{self, bind_target_form, DmlTargetError, TargetForm};
 use super::filter;
 use super::ident::{self, InvalidIdentifier};
 use super::partitioned::{self, PartitionedRequestError};
@@ -199,7 +199,15 @@ pub fn execute(
     };
 
     let outcome: DeleteOutcome = match target {
-        TargetForm::RowId(id) => {
+        // 単一行アドレス（`where`。Issue #2201）: 疑似列 `id` を持つ表で `{"id"}` のみなら従来の
+        // 単一行形、それ以外（採番方式の表・PRIMARY KEY 形）は PK の等価述語で述語形へ流す。
+        // 経路は事前判定で選び、束縛時スナップショットと食い違えば（並行 DDL）束縛 closure が
+        // fail-closed で拒否する。
+        TargetForm::RowAddress(address)
+            if dml_target::is_id_address(address)
+                && !core.table_uses_allocated_row_identity(table) =>
+        {
+            let id = dml_target::row_id_from_address(address)?;
             let bound = BoundDelete {
                 table: table.to_string(),
                 id,
@@ -211,6 +219,12 @@ pub fn execute(
                 super::gate::reject_allocated_schema,
             )?
         }
+        TargetForm::RowAddress(address) => core.execute_bound_predicate_delete_in_session(
+            principal.policy_context(),
+            table,
+            operation_id.as_ref(),
+            |schema| dml_target::bind_primary_key_predicates(address, schema),
+        )?,
         // 述語形（`filter`。TASK-186・NOSQL-12、Issue #1062）: `WHERE` 述語列は
         // `filter::bind_filter_where_predicates`（SQL 表層の述語形 `DELETE` が
         // 使うのと同一の `WherePredicate` を生成する）で得る。実行本体
@@ -219,7 +233,6 @@ pub fn execute(
         // 作らない。
         TargetForm::Predicate(items) => {
             let bind = |schema: &engine::catalog::TableSchema| {
-                super::gate::reject_allocated_schema(schema)?;
                 filter::bind_filter_where_predicates(items, schema)
                     .map_err(filter::FilterError::into_sql_surface_error)
             };

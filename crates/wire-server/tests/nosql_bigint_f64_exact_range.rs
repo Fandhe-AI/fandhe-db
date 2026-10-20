@@ -172,11 +172,11 @@ fn nosql_insert_full_i64_into_unchecked_bigint_still_succeeds() {
     }
 }
 
-/// 暗黙の `id` を持たない表（SQL 表層で新しく作る表。TABLE-23・Issue #2199）は NoSQL 表層の行アドレス
-/// （`id`）が通用しないため、行を読み書きする op は実行前に固定文言の `0A000`（501）で拒否される
-/// （後続 Issue #2201 が NoSQL 側の対応を入れるまでの fail-closed。応答に表名・値を含めない）。
+/// 暗黙の `id` を持たない表（SQL 表層で新しく作る表。TABLE-23・NOSQL-23）への `scan`／`insert` は
+/// PRIMARY KEY 基準で動く（Issue #2201）。`aggregate`／`search` は未対応のため実行前に固定文言の
+/// `0A000`（501）で拒否される（fail-closed。応答に表名・値を含めない）。
 #[test]
-fn nosql_row_ops_on_a_table_without_implicit_id_are_rejected_with_0a000() {
+fn nosql_row_ops_on_a_table_without_implicit_id() {
     let path = temp_db::unique_db_path("nosql-no-implicit-id");
     let _guard = temp_db::CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -191,9 +191,15 @@ fn nosql_row_ops_on_a_table_without_implicit_id_are_rejected_with_0a000() {
         .expect("create table");
     let (addr, token) = spawn(Arc::new(core));
     for body in [
-        r#"{"op":"insert","table":"secret_notes","rows":[{"id":1,"b":1}],"operation_id":"na-1"}"#,
+        r#"{"op":"insert","table":"secret_notes","rows":[{"b":1}],"operation_id":"na-1"}"#,
         r#"{"op":"scan","table":"secret_notes","limit":10}"#,
+    ] {
+        let resp = post_query(addr, &token, body);
+        assert_eq!(resp.status, 200, "{body}: {resp:?}");
+    }
+    for body in [
         r#"{"op":"aggregate","table":"secret_notes","aggregates":[{"fn":"sum","column":"b"}]}"#,
+        r#"{"op":"search","table":"secret_notes","limit":1,"vector":[1,0,0]}"#,
     ] {
         let resp = post_query(addr, &token, body);
         assert_eq!(resp.status, 501, "{body}: {resp:?}");
