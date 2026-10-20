@@ -602,6 +602,27 @@ mod tests {
     }
 
     #[test]
+    fn syntax_word_named_column_does_not_open_a_relation() {
+        assert_eq!(
+            names("SELECT \"update\" AS x FROM public.t LIMIT 5"),
+            Vec::<String>::new()
+        );
+        assert_eq!(names("SELECT \"join\" AS x, \"only\" y FROM a"), vec!["a"]);
+    }
+
+    #[test]
+    fn quoted_cte_names_are_excluded() {
+        assert_eq!(
+            marked_names("WITH \"null\" AS (SELECT 1) SELECT * FROM \"null\""),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            marked_names("WITH \"true\" AS (SELECT 1) SELECT * FROM \"true\", u"),
+            vec!["u"]
+        );
+    }
+
+    #[test]
     fn index_ddl_names_are_marked_as_index() {
         let toks = tokenize("DROP INDEX i").expect("lex");
         let refs = unqualified_relation_refs(&toks, &[]);

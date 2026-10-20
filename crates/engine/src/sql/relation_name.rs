@@ -40,6 +40,9 @@ struct Level {
     from_ok: bool,
     /// カンマの直後が表参照になるリスト（`FROM a, b`・`TRUNCATE a, b`）の中。
     list: bool,
+    /// `SELECT` の射影リスト内（`SELECT` 後〜この段の `FROM` 前）。射影の識別子（列 `"update"` と
+    /// その別名 `AS x` 等）は構文語に見えても表参照を導かない。
+    in_proj: bool,
 }
 
 fn ident_is(tok: Option<&Token>, word: &str) -> bool {
@@ -139,7 +142,11 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                 }
                 continue;
             }
-            Token::Keyword(Keyword::Select) => next.from_ok = true,
+            Token::Keyword(Keyword::Select) => {
+                next.from_ok = true;
+                next.in_proj = true;
+            }
+            Token::Keyword(Keyword::From) if !ident_is(prev, "DISTINCT") => next.in_proj = false,
             Token::Keyword(Keyword::Where | Keyword::Order | Keyword::Limit) => next.list = false,
             Token::Ident(w) => {
                 if w.eq_ignore_ascii_case("UPDATE") || w.eq_ignore_ascii_case("DELETE") {
@@ -171,7 +178,7 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
             }
             _ => {}
         }
-        if is_ident_like(cur) {
+        if is_ident_like(cur) && !level.in_proj {
             relation_pos = match prev {
                 Some(Token::Keyword(Keyword::From)) => from_rel,
                 Some(Token::Ident(w)) => {
@@ -395,7 +402,7 @@ pub(crate) fn collect_cte_scopes(tokens: &[Token]) -> Vec<CteScope> {
         if ident_is(tokens.get(j), "RECURSIVE") {
             j += 1;
         }
-        while let Some(Token::Ident(name)) = tokens.get(j) {
+        while let Some(name) = tokens.get(j).and_then(unqualified_ident_name) {
             j += 1;
             if matches!(tokens.get(j), Some(Token::Punct('('))) {
                 match skip_group(tokens, j) {
@@ -421,7 +428,7 @@ pub(crate) fn collect_cte_scopes(tokens: &[Token]) -> Vec<CteScope> {
             };
             j = after;
             out.push(CteScope {
-                name: name.clone(),
+                name: name.to_string(),
                 visible_from: after,
                 visible_to: scope_end,
             });
