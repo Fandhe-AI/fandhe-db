@@ -334,6 +334,59 @@ pub(crate) fn tokens_reference_temp(tokens: &[Token], catalog: &SessionTempCatal
     })
 }
 
+/// `public.<一時表の名前>` を含む文を拒否する（TABLE-27・Issue #1714）。`public.` で修飾した名前は
+/// 永続側の関係を指すが、解決後は未修飾名と同一になり一時表（検索順で優先）に当たってしまう。
+/// `DROP TABLE public.t` が一時表を落とす等の取り違えを避けるため、解決より前に固定の `0A000`
+/// （[`temp_table_unsupported`]）で拒否する（fail-closed）。一時カタログが空なら常に `Ok`。
+pub(crate) fn reject_public_qualified_temp(
+    tokens: &[Token],
+    catalog: &SessionTempCatalog,
+) -> Result<(), SqlSurfaceError> {
+    if catalog.is_empty() {
+        return Ok(());
+    }
+    // 列修飾（`public.name` を別名 `public` の列参照として使う等）を誤って拒否しないよう、
+    // 名前解決と同じ表参照位置の判定（`rewrite_relation_names`）で `public.<表名>` と確認できた
+    // ものだけを照合する。解決エラーは後続の parse が同じ入力で返すため、ここでは拒否しない。
+    let has_public = tokens.iter().any(|t| {
+        matches!(t, Token::QualifiedIdent { qualifier, .. } if qualifier.eq_ignore_ascii_case("public"))
+    });
+    if !has_public {
+        return Ok(());
+    }
+    let mut resolved = tokens.to_vec();
+    let Ok(public_names) = crate::sql::relation_name::rewrite_relation_names(&mut resolved, None)
+    else {
+        return Ok(());
+    };
+    let hit = public_names
+        .iter()
+        .any(|p| catalog.names().any(|n| n.eq_ignore_ascii_case(p)));
+    if hit {
+        return Err(temp_table_unsupported());
+    }
+    Ok(())
+}
+
+/// Parse 時に `public.` 修飾を解決済みの表名（[`crate::sql::relation_name::rewrite_relation_names`]
+/// の戻り値）が、現在の一時表と衝突するなら固定の `0A000` で拒否する。準備済み文は Parse 後に
+/// 同名の一時表が作られうるため、Bind・Describe の段で再検査する（fail-closed）。
+pub(crate) fn reject_public_names_temp(
+    public_names: &[String],
+    catalog: &SessionTempCatalog,
+) -> Result<(), SqlSurfaceError> {
+    if public_names.is_empty() || catalog.is_empty() {
+        return Ok(());
+    }
+    let hit = public_names
+        .iter()
+        .any(|p| catalog.names().any(|n| n.eq_ignore_ascii_case(p)));
+    if hit {
+        return Err(temp_table_unsupported());
+    }
+    Ok(())
+}
+
 /// 一時表を扱えない文（混在・対象外の文種）に返す固定の拒否（`0A000`）。永続側の表の存否を
 /// 含まない固定文言で、存在オラクルにならない。
 pub(crate) fn temp_table_unsupported() -> SqlSurfaceError {

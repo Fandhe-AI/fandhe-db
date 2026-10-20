@@ -1001,6 +1001,15 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `sql::relation_name`（TABLE-27・Issue #1714）が、存在しない（または他テナントの）
+    /// SCHEMA で修飾された表参照を `3F000` で拒否するために使う。SCHEMA 名は untrusted な
+    /// 字句解析結果のため切り詰める。
+    pub(crate) fn invalid_schema_name(name: impl Into<String>) -> Self {
+        SqlSurfaceError::InvalidSchemaName {
+            name: truncate_for_error(&name.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::ddl` の `ALTER TABLE ... ADD PRIMARY KEY` の重複宣言
     /// （Issue #1364）が `catalog::CatalogError::MultiplePrimaryKeys` を写像する
     /// ほか、`CREATE TABLE` の構文段（Issue #1412）が主キー重複宣言に使う。テーブル名は untrusted な字句解析結果のため切り詰める。
@@ -4486,6 +4495,12 @@ pub struct ValidatedDropTable {
     /// `CASCADE`／`RESTRICT` 句（TABLE-37 (2)(3)、Issue #1641）。省略時は `Restrict`。
     /// **BREAKING CHANGE**: pub フィールドの追加（構造体リテラルで生成する側は指定が必要）。
     pub behavior: DropBehavior,
+    /// Parse 時に `public.` 修飾を外した表名（TABLE-27・Issue #1714）。セッション付き実行の
+    /// 粗いゲートが、同名の一時表との衝突（`public.t` が一時表 `t` を落とす取り違え）を
+    /// 拒否するために使う。修飾が無ければ空。構文検証（`validate_drop_table_tokens`）は常に空で
+    /// 返し、`EngineCore::parse_tokens_in` が名前解決の結果を設定する。
+    /// **BREAKING CHANGE**: pub フィールドの追加（構造体リテラルで生成する側は指定が必要）。
+    pub public_qualified: Vec<String>,
 }
 
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
@@ -16477,7 +16492,7 @@ fn parse_create_function(tokens: &[Token]) -> Result<(String, Vec<String>, Expr)
 /// 3. `SELECT` の場合のみ、FROM 単一テーブルのカタログ存在確認
 ///    （不存在は [`SqlSurfaceError::UndefinedTable`]）
 pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = super::relation_name::tokenize_resolved(sql, false)?;
     validate_sql_tokens(&tokens, lookup)
 }
 
@@ -16492,7 +16507,7 @@ pub(crate) fn validate_sql_with_subquery_ctx(
     lookup: &impl TableLookup,
     limits: crate::nesting_limits::NestingLimits,
 ) -> Result<Statement, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = super::relation_name::tokenize_resolved(sql, false)?;
     validate_sql_tokens_with_subquery_ctx_limits(&tokens, lookup, 0, limits)
 }
 
@@ -17481,7 +17496,7 @@ pub fn validate_delete(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedDelete, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = super::relation_name::tokenize_resolved(sql, false)?;
     validate_delete_tokens(&tokens, lookup, mode)
 }
 
@@ -17542,7 +17557,7 @@ pub fn validate_delete_statement(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<DeleteStatement, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = super::relation_name::tokenize_resolved(sql, false)?;
     validate_delete_statement_tokens(&tokens, lookup, mode)
 }
 
@@ -17708,7 +17723,7 @@ pub fn validate_insert_with_limit(
     mode: LedgerMode,
     max_insert_rows: Option<std::num::NonZeroUsize>,
 ) -> Result<ValidatedInsert, SqlSurfaceError> {
-    let tokens = lexer::tokenize_marked(sql)?;
+    let tokens = super::relation_name::tokenize_resolved(sql, true)?;
     validate_insert_tokens_with_limit(&tokens, lookup, mode, max_insert_rows)
 }
 
@@ -17935,7 +17950,7 @@ pub fn validate_truncate(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedTruncate, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = super::relation_name::tokenize_resolved(sql, false)?;
     validate_truncate_tokens(&tokens, lookup, mode)
 }
 
@@ -18017,7 +18032,7 @@ fn reject_reserved_rename_column_name(column_name: &str) -> Result<(), SqlSurfac
 /// `VECTOR` 列の `0A000` 拒否を含む）は権限ゲート通過後の実行段
 /// （`sql::ddl::execute_alter_table_add_column`）が担う。
 pub fn validate_alter_table(sql: &str) -> Result<ValidatedAlterTable, SqlSurfaceError> {
-    let tokens = lexer::tokenize_marked(sql)?;
+    let tokens = super::relation_name::tokenize_resolved(sql, true)?;
     validate_alter_table_tokens(&tokens)
 }
 
@@ -18215,8 +18230,12 @@ fn into_validated_alter_table(
 /// カタログへ一切問い合わせない。存在確認は `sql::ddl::execute_drop_table` が
 /// 書き込みトランザクション内で行う。
 pub fn validate_drop_table(sql: &str) -> Result<ValidatedDropTable, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
-    validate_drop_table_tokens(&tokens)
+    let mut tokens = lexer::tokenize(sql)?;
+    let public_names = super::relation_name::rewrite_relation_names(&mut tokens, None)?;
+    let mut stmt = validate_drop_table_tokens(&tokens)?;
+    // `public.` 修飾の情報を捨てない（実行時に一時表との衝突検査を通すため。Issue #1714）。
+    stmt.public_qualified = public_names;
+    Ok(stmt)
 }
 
 /// [`validate_drop_table`] の本体。`core.rs::EngineCore::parse_tokens` が既に
@@ -18236,6 +18255,7 @@ pub fn validate_drop_table_tokens(
         table_names,
         if_exists,
         behavior,
+        public_qualified: Vec::new(),
     })
 }
 
@@ -18467,7 +18487,7 @@ pub fn validate_copy(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<CopyStatement, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = super::relation_name::tokenize_resolved(sql, false)?;
     validate_copy_tokens(&tokens, lookup, mode)
 }
 
@@ -18634,7 +18654,7 @@ pub fn validate_update(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedUpdate, SqlSurfaceError> {
-    let tokens = lexer::tokenize_marked(sql)?;
+    let tokens = super::relation_name::tokenize_resolved(sql, true)?;
     validate_update_tokens(&tokens, lookup, mode)
 }
 
@@ -18713,7 +18733,7 @@ pub fn validate_update_form(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
-    let tokens = lexer::tokenize_marked(sql)?;
+    let tokens = super::relation_name::tokenize_resolved(sql, true)?;
     validate_update_form_tokens(&tokens, lookup, mode)
 }
 

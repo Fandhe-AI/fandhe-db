@@ -91,6 +91,10 @@ pub struct SessionRoutedSql {
     /// 参照する一時表の識別子（同名の再作成との区別。`Temp` 経路のみ）。
     relations: Vec<TempRelationId>,
     route: Route,
+    /// 振り分け時に一時カタログが未変更（世代 0）だったか。`public.` 修飾つきの準備済み文が、
+    /// 一時表を持たないセッションでも世代の検査を受けるための印（世代 0 は通常「未設定」の
+    /// 予約値で拒否されるが、この印がある文だけは世代 0 の一致を現行とみなす）。
+    fresh: bool,
 }
 
 impl SessionRoutedSql {
@@ -104,6 +108,7 @@ impl SessionRoutedSql {
             epoch: catalog.epoch(),
             relations,
             route: Route::Temp,
+            fresh: false,
         }
     }
 
@@ -114,6 +119,17 @@ impl SessionRoutedSql {
             epoch: catalog.epoch(),
             relations: Vec::new(),
             route: Route::Persistent,
+            fresh: false,
+        }
+    }
+
+    /// `public.` 修飾の表名を持つ準備済み文を、世代つきの永続側の文として包む（TABLE-27・
+    /// Issue #1714）。Bind 後〜Execute 前に同名の一時表が作られると、`DROP TABLE` 等の免除文は
+    /// 粗いゲートを素通りして一時表へ作用しうるため、世代の変化を実行時に拒否させる。
+    pub(crate) fn persistent_guarded(inner: ParsedSql, catalog: &SessionTempCatalog) -> Self {
+        Self {
+            fresh: catalog.epoch() == 0 && catalog.is_empty(),
+            ..Self::persistent(inner, catalog)
         }
     }
 
@@ -129,7 +145,7 @@ impl SessionRoutedSql {
 
     /// 現在のセッションの一時カタログで、この文の前提（世代・参照する一時表）がまだ有効か。
     fn is_current(&self, catalog: &SessionTempCatalog) -> bool {
-        self.epoch != 0
+        (self.epoch != 0 || self.fresh)
             && self.epoch == catalog.epoch()
             && self.relations.iter().all(|id| {
                 catalog
@@ -329,6 +345,7 @@ impl EngineCore {
         let Ok(tokens) = crate::sql::lexer::tokenize_marked(sql) else {
             return Ok(None);
         };
+        crate::sql::temp_catalog::reject_public_qualified_temp(&tokens, temp)?;
         if !crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
             return Ok(None);
         }
@@ -516,6 +533,12 @@ impl EngineCore {
             PreparedRoute::Temp(_) => Self::coarse_temp_gate(session, &prepared.dummy_parsed),
             PreparedRoute::Plain => {
                 let temp = session.temp_tables();
+                // 免除文（`DROP TABLE` 等）でも、Parse 後に作られた同名の一時表へ `public.` 修飾の
+                // 表名が化けないよう先に拒否する（TABLE-27・Issue #1714）。
+                crate::sql::temp_catalog::reject_public_names_temp(
+                    &prepared.public_qualified,
+                    temp,
+                )?;
                 if temp.is_empty() || is_session_exempt(&prepared.dummy_parsed) {
                     return Ok(());
                 }
@@ -542,6 +565,8 @@ impl EngineCore {
             return self.parse_sql_prepared_with_declared(sql, declared);
         }
         let tokens = crate::sql::lexer::tokenize_with_params(sql)?;
+        // `public.<一時表の名前>` は解決より前に拒否する（TABLE-27・Issue #1714）。
+        crate::sql::temp_catalog::reject_public_qualified_temp(&tokens, temp)?;
         // トランザクション制御・`CREATE [TEMP] TABLE`・`DROP TABLE` は実行段が一時カタログで名前を解決する。
         let txn_control_head = matches!(
             tokens.first(),
@@ -653,9 +678,14 @@ impl EngineCore {
                     epoch: prepared_routed.epoch,
                     relations: prepared_routed.relations.clone(),
                     route: Route::Temp,
+                    fresh: false,
                 })))
             }
             PreparedRoute::Plain => {
+                crate::sql::temp_catalog::reject_public_names_temp(
+                    &prepared.public_qualified,
+                    temp,
+                )?;
                 let parsed = self.bind_prepared(prepared, values)?;
                 // `DROP INDEX <名前>` は一時表の名前トークンが現れない。準備後に同名の一時索引が
                 // 作られていれば、通常の Parse（`route_drop_index`）なら一時索引に当たるため、
@@ -673,7 +703,14 @@ impl EngineCore {
                     }
                 }
                 if temp.is_empty() || is_session_exempt(&parsed) {
-                    return Ok(parsed);
+                    if prepared.public_qualified.is_empty() {
+                        return Ok(parsed);
+                    }
+                    // `public.` 修飾つきの文は、実行までに同名の一時表が作られても一時表へ
+                    // 化けないよう世代を持たせる（Execute の粗いゲートが検査する）。
+                    return Ok(ParsedSql::SessionRouted(Box::new(
+                        SessionRoutedSql::persistent_guarded(parsed, temp),
+                    )));
                 }
                 if crate::sql::temp_catalog::tokens_reference_temp(&prepared.tokens, temp) {
                     return Err(crate::sql::temp_catalog::temp_statement_stale());

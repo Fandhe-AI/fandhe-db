@@ -271,3 +271,36 @@ TABLE-27・TABLE-36 のポインタ。`CREATE SCHEMA`／`DROP SCHEMA` と SCHEMA
 - **対象外**: 修飾名の解決（#1714）、`search_path`（#1715）、`ALTER SCHEMA`（#1716）、tenant SCHEMA
   へのオブジェクト作成と `CASCADE`（#1717）、システムカタログ（#1718）、横断テスト（#1719）、
   SCHEMA 単位の GRANT（#2234）。`DROP SCHEMA` の複数名指定は本 Issue では `0A000`
+
+## 7. Issue #1714 実装記録
+
+TABLE-27 のポインタ。`schema.table` のテーブル参照を解決する層を engine に入れた（本文は ADR D2・D4 に従う）。
+
+- **方式**: パーサ（`sql::allowlist::Parser`）は変えず、字句解析の直後・構文解析の前に
+  `sql::relation_name::rewrite_relation_names` が**テーブル参照の位置**の `QualifiedIdent` を解決して
+  `Ident(<名前>)` へ置き換える。置き換え後は未修飾の文とトークン列が同一になるため、暗黙 RLS・
+  DDL 権限ゲート・一時表の振り分け・ビュー本文の保存（解決後の名前で保存）が修飾の有無で変わらない。
+  既存テストは 1 行も変更していない
+- **対象位置**: `FROM`（表参照の `FROM` のみ。`IS DISTINCT FROM`・`EXTRACT(.. FROM x)` を除く）・
+  `FROM a, b` のカンマ・`JOIN`・`INSERT INTO`・`UPDATE`・`TRUNCATE`（複数表）・`TABLE`
+  （`CREATE`／`ALTER`／`DROP`・`IF [NOT] EXISTS`）・`ONLY`・`REFERENCES`・`CREATE INDEX .. ON`・
+  `COPY`。ビュー・SEQUENCE・索引名・`RENAME TO` などオブジェクト名の位置は従来どおり（#1717）
+- **解決規則**: `public`（大小無視）は裸の名前（`CREATE TEMP TABLE public.t` は `42P16`）。
+  `pg_catalog`／`information_schema`／`pg_temp` は `0A000`。それ以外はテナント不明の入口で `3F000`、
+  ctx を持つ入口（`execute_sql*`・`begin_copy*`）は `3F000` を受けて `(tenant, schema)` の 1 回の get で
+  精密化する（無ければ `3F000`・他テナントの SCHEMA も同じ応答、あれば参照系 `42P01`・作成系 `0A000`）。
+  `42P01` の文言は利用者が書いた `s.t` だけを含む。通常の文は精密化の追加コストを払わない
+- **判定順序の変化**: 解決エラーは構文解析より先に返る（置き換え用の名前で解析を続けると別の
+  オブジェクトに誤解決しうるため）。ただし選択リストなどに列修飾（`x.id`）が残る文は、従来の
+  `42601`（SQL-44 の既存契約）を保つため解決エラーを保留して書き換えない
+- **一時表**: `public.<一時表の名前>` は永続側を指すが、解決後は未修飾名と同じになり一時表に当たる。
+  取り違え（例: `DROP TABLE public.t` が一時表を落とす）を避けるため、解決より前に `0A000` で
+  拒否する（`temp_catalog::reject_public_qualified_temp`）。`pg_temp.x` は全経路で `0A000` のまま
+  （永続の `x` に落ちない）。`pg_temp` の結線は未実施
+- **拡張クエリ**: Parse／Bind の経路は ctx を持たないため、テナント SCHEMA の存在判定ができず
+  `3F000` のままになる（`42P01` にならない。fail-closed）。ctx を渡すシグネチャ変更は #1717 で
+  再検討する
+- **#1717 への申し送り**: `#<id>.` キーの書き込み、decode 側 `validate_identifier` の
+  `RelationKey::parse` への置き換え、テナント SCHEMA 解決が成功しうるようになった後の実行時の再検証
+- **対象外**: `search_path`（#1715）、オブジェクト名の修飾、NoSQL 表層の `table`、
+  `SHOW/CANCEL PARTITIONED DML .. ON <table>`、引用付き修飾名・3 部名（従来の `42601`）
