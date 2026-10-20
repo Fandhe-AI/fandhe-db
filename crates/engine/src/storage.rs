@@ -31,6 +31,7 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 #[cfg(test)]
 mod power_loss_model;
 pub(crate) mod read_source;
+pub(crate) mod rowid;
 pub(crate) mod writer_gate;
 
 /// 行ストアの物理キー型（対象ビヘイビア: TABLE-12。ポインタ:
@@ -967,7 +968,10 @@ impl Storage {
             let mut table = write_txn
                 .open_table(ROWS_TABLE)
                 .map_err(map_rows_table_error)?;
-            table.insert((row.tenant_id, id), encoded.as_slice())?;
+            table.insert(
+                rowid::row_key(row.tenant_id, rowid::RowId::from_legacy_id(id)),
+                encoded.as_slice(),
+            )?;
         }
         // commit 成功境界（TASK-96・RECOVER-5）の choke point 経由でコミットする
         // （`crate::recovery::commit_boundary` 参照。commit 成功後の応答一意性を
@@ -998,7 +1002,10 @@ impl Storage {
             for (id, row) in rows {
                 scratch.clear();
                 encode_row_into(&mut scratch, row)?;
-                table.insert((row.tenant_id, *id), scratch.as_slice())?;
+                table.insert(
+                    rowid::row_key(row.tenant_id, rowid::RowId::from_legacy_id(*id)),
+                    scratch.as_slice(),
+                )?;
             }
         }
         // commit 成功境界（TASK-96・RECOVER-5）の choke point 経由でコミットする
@@ -1027,10 +1034,11 @@ impl Storage {
             Err(redb::TableError::TableDoesNotExist(_)) => return Err(StorageError::NotFound(id)),
             Err(e) => return Err(map_rows_table_error(e)),
         };
+        let rowid = rowid::RowId::from_legacy_id(id);
         let guard = table
-            .get((tenant_id, id))?
+            .get(rowid::row_key(tenant_id, rowid))?
             .ok_or(StorageError::NotFound(id))?;
-        decode_row_for_key(tenant_id, id, guard.value())
+        decode_row_for_key(tenant_id, rowid, guard.value())
     }
 
     /// 全行をスナップショット読み取りで走査する（対象ビヘイビア: PERSIST-4・TABLE-12）。
@@ -1055,11 +1063,11 @@ impl Storage {
         let mut bytes_used: usize = 0;
         for entry in table.iter()? {
             let (k, v) = entry?;
-            let (tenant_id, id) = k.value();
+            let (tenant_id, rowid) = rowid::split_row_key(k.value());
             let raw = v.value();
             check_scan_limits(out.len(), bytes_used, raw.len())?;
             bytes_used = bytes_used.saturating_add(raw.len());
-            out.push(decode_row_for_key(tenant_id, id, raw)?);
+            out.push(decode_row_for_key(tenant_id, rowid, raw)?);
         }
         Ok(out)
     }
@@ -1116,14 +1124,15 @@ impl Storage {
                 break;
             }
             let (k, v) = entry?;
-            let (tenant_id, id) = k.value();
+            let (tenant_id, rowid) = rowid::split_row_key(k.value());
             let raw = v.value();
             if !out.is_empty() && bytes_used.saturating_add(raw.len()) > MAX_SCAN_PAGE_BYTES {
                 capped = true;
                 break;
             }
-            out.push(decode_row_for_key(tenant_id, id, raw)?);
-            last_key = Some((tenant_id.to_string(), id));
+            out.push(decode_row_for_key(tenant_id, rowid, raw)?);
+            // カーソルは従来方式の表の `id` 列値（rowid と恒等）で返す。
+            last_key = Some((tenant_id.to_string(), rowid.legacy_id()));
             bytes_used = bytes_used.saturating_add(raw.len());
         }
 
@@ -1759,7 +1768,9 @@ pub(crate) fn verify_row_key_tenant(key_tenant: &str, header_tenant: &str) -> Re
 ///
 /// `pub(crate)`: `txn.rs`（TASK-88）の読み取りスナップショットハンドルが、`Storage::get`
 /// と同一のデコード・fail-closed 契約で行を読み出すために再利用する。
-pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
+pub(crate) fn decode_row(rowid: rowid::RowId, buf: &[u8]) -> Result<Row> {
+    // 従来方式の表では行値に `id` を持たず、物理キーの rowid から復元する。
+    let id = rowid.legacy_id();
     #[cfg(test)]
     decode_probe::record_embedding_decode();
     let (tenant_id, visibility, mut offset) = decode_row_header(buf)?;
@@ -1850,8 +1861,8 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
 /// [`StorageError::Codec`] で拒否する（テナント境界の異常検知であり、
 /// `IncompatibleRowKeyFormat` のような DB 全体のフォーマット不整合とは性質が異なる
 /// ため既存 variant を再利用する）。
-pub(crate) fn decode_row_for_key(key_tenant: &str, id: u64, raw: &[u8]) -> Result<Row> {
-    let row = decode_row(id, raw)?;
+pub(crate) fn decode_row_for_key(key_tenant: &str, rowid: rowid::RowId, raw: &[u8]) -> Result<Row> {
+    let row = decode_row(rowid, raw)?;
     verify_row_key_tenant(key_tenant, &row.tenant_id)?;
     Ok(row)
 }
@@ -1915,7 +1926,7 @@ mod tests {
         let embedding = vec![0.5_f32, -1.0, 2.25];
         let metadata = b"opaque".to_vec();
         let buf = sample_row_with_rls("tenant-a", Visibility::Private, &embedding, &metadata);
-        let row = decode_row(7, &buf).unwrap();
+        let row = decode_row(rowid::RowId::from_legacy_id(7), &buf).unwrap();
         assert_eq!(row.id, 7);
         assert_eq!(row.tenant_id, "tenant-a");
         assert_eq!(row.visibility, Visibility::Private);
@@ -1926,7 +1937,7 @@ mod tests {
     #[test]
     fn row_roundtrips_with_empty_embedding_and_metadata() {
         let buf = sample_row(&[], &[]);
-        let row = decode_row(1, &buf).unwrap();
+        let row = decode_row(rowid::RowId::from_legacy_id(1), &buf).unwrap();
         assert!(row.embedding.is_empty());
         assert!(row.metadata.is_empty());
     }
@@ -1940,7 +1951,8 @@ mod tests {
         v1_buf.push(1u8); // ROW_FORMAT_VERSION（旧 v1）
         v1_buf.extend_from_slice(&0u32.to_le_bytes()); // dim=0
         v1_buf.extend_from_slice(&0u32.to_le_bytes()); // metadata_len=0
-        let err = decode_row(1, &v1_buf).expect_err("v1 row must be rejected");
+        let err = decode_row(rowid::RowId::from_legacy_id(1), &v1_buf)
+            .expect_err("v1 row must be rejected");
         assert!(matches!(err, StorageError::Codec(_)));
     }
 
@@ -1950,7 +1962,8 @@ mod tests {
         // レイアウト: [version][tenant_len(2)][tenant bytes]["tenant-a" は 8 バイト][visibility]
         let visibility_offset = 1 + 2 + "tenant-a".len();
         buf[visibility_offset] = 0xFF;
-        let err = decode_row(1, &buf).expect_err("unknown visibility byte must be rejected");
+        let err = decode_row(rowid::RowId::from_legacy_id(1), &buf)
+            .expect_err("unknown visibility byte must be rejected");
         assert!(matches!(err, StorageError::Codec(_)));
     }
 
@@ -1983,7 +1996,8 @@ mod tests {
         // "tenant-a" の先頭バイトを不正な UTF-8 継続バイトへ書き換える。
         let tenant_start = 1 + 2;
         buf[tenant_start] = 0xFF;
-        let err = decode_row(1, &buf).expect_err("non-UTF-8 tenant_id must be rejected");
+        let err = decode_row(rowid::RowId::from_legacy_id(1), &buf)
+            .expect_err("non-UTF-8 tenant_id must be rejected");
         assert!(matches!(err, StorageError::Codec(_)));
     }
 
@@ -1992,7 +2006,8 @@ mod tests {
         let mut buf = sample_row(&[1.0], b"m");
         let oversized = MAX_TENANT_ID_LEN + 1;
         buf[1..3].copy_from_slice(&oversized.to_le_bytes());
-        let err = decode_row(1, &buf).expect_err("oversized tenant_len must be rejected");
+        let err = decode_row(rowid::RowId::from_legacy_id(1), &buf)
+            .expect_err("oversized tenant_len must be rejected");
         assert!(matches!(err, StorageError::Codec(_)));
     }
 
@@ -2007,7 +2022,8 @@ mod tests {
         buf.push(Visibility::Public.to_byte());
         buf.extend_from_slice(&0u32.to_le_bytes()); // dim = 0
         buf.extend_from_slice(&0u32.to_le_bytes()); // metadata_len = 0
-        let err = decode_row(1, &buf).expect_err("zero-length tenant_id must be rejected");
+        let err = decode_row(rowid::RowId::from_legacy_id(1), &buf)
+            .expect_err("zero-length tenant_id must be rejected");
         assert!(matches!(err, StorageError::Codec(_)));
     }
 
@@ -2016,7 +2032,7 @@ mod tests {
         let buf = sample_row(&[1.0, 2.0], b"meta");
         for cut in 1..buf.len() {
             assert!(
-                decode_row(1, &buf[..cut]).is_err(),
+                decode_row(rowid::RowId::from_legacy_id(1), &buf[..cut]).is_err(),
                 "truncated buffer of length {cut} should not decode successfully"
             );
         }
@@ -2026,14 +2042,14 @@ mod tests {
     fn decode_row_rejects_unknown_version() {
         let mut buf = sample_row(&[1.0], b"m");
         buf[0] = 0xFF;
-        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row(rowid::RowId::from_legacy_id(1), &buf).is_err());
     }
 
     #[test]
     fn decode_row_rejects_trailing_garbage() {
         let mut buf = sample_row(&[1.0], b"m");
         buf.push(0);
-        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row(rowid::RowId::from_legacy_id(1), &buf).is_err());
     }
 
     #[test]
@@ -2045,7 +2061,7 @@ mod tests {
         // レイアウト: [version(1)][tenant_len(2)]["tenant-a"(8)][visibility(1)][dim(4)]。
         let dim_offset = 1 + 2 + "tenant-a".len() + 1;
         buf[dim_offset..dim_offset + 4].copy_from_slice(&oversized.to_le_bytes());
-        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row(rowid::RowId::from_legacy_id(1), &buf).is_err());
     }
 
     #[test]
@@ -2180,7 +2196,7 @@ mod tests {
         assert_eq!(&embedding_bytes[0..4], &[0x00, 0x00, 0x80, 0x3F]);
 
         // decode_row で往復一致（NaN はビットパターン比較）。
-        let decoded = decode_row(1, &buf).unwrap();
+        let decoded = decode_row(rowid::RowId::from_legacy_id(1), &buf).unwrap();
         assert_eq!(decoded.embedding.len(), embedding.len());
         for (a, b) in decoded.embedding.iter().zip(embedding.iter()) {
             assert_eq!(a.to_bits(), b.to_bits());
@@ -2225,7 +2241,7 @@ mod tests {
             let buf = sample_row_with_rls(tenant_id, visibility, &[1.0, 2.0], b"meta");
             let (header_tenant, header_visibility) =
                 decode_row_tenant_and_visibility(&buf).unwrap();
-            let row = decode_row(1, &buf).unwrap();
+            let row = decode_row(rowid::RowId::from_legacy_id(1), &buf).unwrap();
             assert_eq!(header_tenant, row.tenant_id);
             assert_eq!(header_visibility, row.visibility);
         }
@@ -2293,7 +2309,7 @@ mod tests {
         ];
         for buf in corrupt_cases {
             let header_result = decode_row_tenant_and_visibility(&buf);
-            let full_result = decode_row(1, &buf);
+            let full_result = decode_row(rowid::RowId::from_legacy_id(1), &buf);
             assert!(header_result.is_err(), "header decode should fail-closed");
             assert!(full_result.is_err(), "full decode should fail-closed");
         }
@@ -2309,7 +2325,7 @@ mod tests {
         let metadata = b"scalar-columns";
         let buf = sample_row(&embedding, metadata);
 
-        let full = decode_row(1, &buf).expect("full decode");
+        let full = decode_row(rowid::RowId::from_legacy_id(1), &buf).expect("full decode");
 
         let mut scratch: Vec<f32> = Vec::new();
         let (dim, borrowed_metadata) =
@@ -2462,7 +2478,7 @@ mod tests {
         buf[dim_offset..dim_offset + 4].copy_from_slice(&oversized.to_le_bytes());
 
         let mut scratch: Vec<f32> = Vec::new();
-        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row(rowid::RowId::from_legacy_id(1), &buf).is_err());
         assert!(decode_row_embedding_and_metadata_into(&buf, &mut scratch).is_err());
     }
 
@@ -2478,7 +2494,7 @@ mod tests {
         buf[metadata_len_offset..metadata_len_offset + 4].copy_from_slice(&oversized.to_le_bytes());
 
         let mut scratch: Vec<f32> = Vec::new();
-        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row(rowid::RowId::from_legacy_id(1), &buf).is_err());
         assert!(decode_row_embedding_and_metadata_into(&buf, &mut scratch).is_err());
     }
 
@@ -2488,7 +2504,7 @@ mod tests {
         buf.push(0);
 
         let mut scratch: Vec<f32> = Vec::new();
-        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row(rowid::RowId::from_legacy_id(1), &buf).is_err());
         assert!(decode_row_embedding_and_metadata_into(&buf, &mut scratch).is_err());
     }
 
@@ -2501,7 +2517,7 @@ mod tests {
         let truncated = &buf[..dim_offset + 4 + 4]; // dim フィールド + embedding 4 バイトのみ
 
         let mut scratch: Vec<f32> = Vec::new();
-        assert!(decode_row(1, truncated).is_err());
+        assert!(decode_row(rowid::RowId::from_legacy_id(1), truncated).is_err());
         assert!(decode_row_embedding_and_metadata_into(truncated, &mut scratch).is_err());
     }
 
@@ -2513,7 +2529,7 @@ mod tests {
         let metadata = b"scalar-payload".to_vec();
         let buf = sample_row(&embedding, &metadata);
 
-        let full = decode_row(1, &buf).expect("full decode");
+        let full = decode_row(rowid::RowId::from_legacy_id(1), &buf).expect("full decode");
         let (dim, borrowed_metadata) =
             decode_row_dim_and_metadata_borrowed(&buf).expect("dim+metadata decode");
         assert_eq!(dim as usize, full.embedding.len());
@@ -2540,7 +2556,7 @@ mod tests {
         let oversized = MAX_METADATA_LEN + 1;
         buf[metadata_len_offset..metadata_len_offset + 4].copy_from_slice(&oversized.to_le_bytes());
 
-        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row(rowid::RowId::from_legacy_id(1), &buf).is_err());
         assert!(decode_row_dim_and_metadata_borrowed(&buf).is_err());
     }
 
@@ -2561,7 +2577,7 @@ mod tests {
         // `verify_row_key_tenant`（部分デコード経路が再利用する切り出し済み検査）
         // が同じ入力に対して同じ結論（拒否）に達することを確認する。
         let buf = sample_row(&[1.0], b"m");
-        assert!(decode_row_for_key("tenant-b", 1, &buf).is_err());
+        assert!(decode_row_for_key("tenant-b", rowid::RowId::from_legacy_id(1), &buf).is_err());
         assert!(verify_row_key_tenant("tenant-b", "tenant-a").is_err());
     }
 

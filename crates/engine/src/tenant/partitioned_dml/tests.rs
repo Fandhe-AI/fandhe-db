@@ -77,7 +77,9 @@ fn rows_of(storage: &Storage, tenant: &str) -> Vec<(u64, String)> {
     {
         let (k, v) = entry.expect("entry");
         let (_, id) = k.value();
-        let row = crate::storage::decode_row(id, v.value()).expect("decode");
+        let row =
+            crate::storage::decode_row(crate::storage::rowid::RowId::from_legacy_id(id), v.value())
+                .expect("decode");
         let values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata).expect("cols");
         let tag = match values.first() {
             Some(Value::Text(s)) => s.clone(),

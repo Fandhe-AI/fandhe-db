@@ -132,10 +132,13 @@ impl ReadSnapshot {
             Err(redb::TableError::TableDoesNotExist(_)) => return Err(StorageError::NotFound(id)),
             Err(e) => return Err(map_rows_table_error(e)),
         };
+        // 旧 `rows` 表は Rust API 専用でカタログ外のため、恒久的に従来方式
+        // （rowid = 呼び出し元の `id`。ADR D8）。
+        let rowid = crate::storage::rowid::RowId::from_legacy_id(id);
         let guard = table
-            .get((tenant_id, id))?
+            .get(crate::storage::rowid::row_key(tenant_id, rowid))?
             .ok_or(StorageError::NotFound(id))?;
-        decode_row_for_key(tenant_id, id, guard.value())
+        decode_row_for_key(tenant_id, rowid, guard.value())
     }
 
     /// 内部 `redb::ReadTransaction` への `pub(crate)` アクセサ（[`Storage::db`] と
@@ -188,7 +191,13 @@ impl WriteTxn {
             .txn
             .open_table(ROWS_TABLE)
             .map_err(map_rows_table_error)?;
-        table.insert((row.tenant_id, id), encoded.as_slice())?;
+        table.insert(
+            crate::storage::rowid::row_key(
+                row.tenant_id,
+                crate::storage::rowid::RowId::from_legacy_id(id),
+            ),
+            encoded.as_slice(),
+        )?;
         Ok(())
     }
 
@@ -290,7 +299,13 @@ impl BatchWriteTxn {
             .txn
             .open_table(ROWS_TABLE)
             .map_err(map_rows_table_error)?;
-        let previous = table.insert((row.tenant_id, id), encoded.as_slice())?;
+        let previous = table.insert(
+            crate::storage::rowid::row_key(
+                row.tenant_id,
+                crate::storage::rowid::RowId::from_legacy_id(id),
+            ),
+            encoded.as_slice(),
+        )?;
         if previous.is_none() {
             // 呼び出し元にはトランザクション内で扱える行数の上限（TASK-90 の想定用途
             // ではバッチ 1 本あたり高々数千件）を課しており u64 を溢れさせることは
