@@ -389,6 +389,29 @@ fn finish_inner(path: &str) -> Result<(u64, i64), String> {
         Ok(_) => return Err("mismatch probe was wrongly accepted".to_string()),
     }
 
+    // (ii-b) 内容不一致の文が参照した SEQUENCE も消費されていない（SEQ2 は finish でしか使わず、
+    // 内容照合前に払い出していれば初期値 1 を飛ばす）。新しい op で払い出して 1 を確認する。
+    let probe2_id = last_id.checked_add(1).ok_or("row id overflow")?;
+    let probe2_sql = format!(
+        "INSERT INTO {TABLE} (id, n, via) VALUES ({probe2_id}, nextval('{SEQ2}'), 'probe2') \
+         RETURNING n USING OPERATION_ID 'seq-probe2-{probe2_id}'"
+    );
+    let mut txn = core.new_session_transaction();
+    let mut v2 = None;
+    for stmt in ["BEGIN", probe2_sql.as_str(), "ROLLBACK"] {
+        let out = core
+            .execute_sql_in_txn(&ctx, &mut session, &mut txn, stmt)
+            .map_err(|e| format!("seq2 probe failed ({stmt}): {e}"))?;
+        if stmt == probe2_sql {
+            v2 = Some(returned_value(out)?);
+        }
+    }
+    if v2 != Some(1) {
+        return Err(format!(
+            "{SEQ2} first value is {v2:?}, expected 1 (a mismatch-rejected statement consumed a value)"
+        ));
+    }
+
     // (iii) 新しい id で VALUES 形を書く。(i)(ii) が値を消費していなければ、値はちょうど max + 1
     // （再起動直後のプロセスなので、メモリ上の先行払い出しは無い）。
     let new_id = last_id.checked_add(1).ok_or("row id overflow")?;

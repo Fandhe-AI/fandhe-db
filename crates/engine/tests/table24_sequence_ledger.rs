@@ -320,6 +320,19 @@ fn different_content_under_the_same_op_is_22023_and_consumes_nothing() {
     }
     assert_eq!(column_n(&core, "alice", "t"), vec![1]);
     assert_eq!(probe_next(&core, "alice", 2, "op2"), 2);
+    // 拒否された文が参照した s2 も消費されていない（初期値 1 のまま）。
+    let out = ok(
+        &core,
+        "alice",
+        &mut s,
+        "INSERT INTO t (id, n) VALUES (3, nextval('s2')) RETURNING n USING OPERATION_ID 'op3'",
+    );
+    match out {
+        SqlOutcome::Returning(o) => {
+            assert!(matches!(o.result.rows[0].cells[0], Cell::SignedInteger(1)))
+        }
+        other => panic!("expected Returning, got {other:?}"),
+    }
 }
 
 #[test]
