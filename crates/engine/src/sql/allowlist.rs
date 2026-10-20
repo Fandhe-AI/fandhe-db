@@ -12973,7 +12973,8 @@ pub(crate) fn validate_refresh_materialized_view_tokens(
     })
 }
 
-/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> [USING btree｜hnsw] (<col> [COLLATE <name>][, ...])` の許可形状構造
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> [USING btree｜hnsw｜gin] (<col> [COLLATE <name>][, ...])`
+/// （`gin` のみ列の直後に演算子クラス `jsonb_ops｜jsonb_path_ops` を任意で書ける）の許可形状構造
 /// 検証結果（TASK-206・INDEX-7・SQL-23、Issue #908）。[`ValidatedDropTable`] と
 /// 同じくカタログ照会を一切行わない（列の存在・型整合・名前衝突・対象の種別は
 /// `sql::ddl::execute_create_index` → `catalog::Storage::create_index` が単一の
@@ -12984,9 +12985,9 @@ pub struct ValidatedCreateIndex {
     /// `IF NOT EXISTS` 句の有無（TABLE-36、Issue #1613。名前付きのみ）。
     pub(crate) if_not_exists: bool,
     pub(crate) table: String,
-    /// `USING hnsw` 指定の有無（`btree` は省略時と同じ `false`。`hnsw`・`btree` 以外の
-    /// `USING` 値は構造検証段で `0A000` 拒否済み。Issue #1617）。
-    pub(crate) hnsw: bool,
+    /// `USING` の方式（省略・`btree` は [`IndexMethod::Btree`]。`hnsw`・`gin`・`btree` 以外の
+    /// `USING` 値は構造検証段で `0A000` 拒否済み。Issue #1617・#2206）。
+    pub(crate) method: IndexMethod,
     /// 列名。式要素の位置は空文字列（`expressions` が `Some` の位置。Issue #1647・#1648）。
     pub(crate) columns: Vec<String>,
     /// `columns` と同じ長さの式要素（`None` は列。INDEX-10、Issue #1647）。実行段
@@ -13030,7 +13031,20 @@ impl ValidatedCreateIndex {
     }
 
     pub fn is_hnsw(&self) -> bool {
-        self.hnsw
+        matches!(self.method, IndexMethod::Hnsw)
+    }
+
+    /// `USING` の方式。
+    pub fn method(&self) -> IndexMethod {
+        self.method
+    }
+
+    /// `USING gin` の演算子クラス（`gin` 以外は `None`。省略時は `jsonb_ops`。Issue #2206）。
+    pub fn gin_opclass(&self) -> Option<crate::catalog::GinOpClass> {
+        match self.method {
+            IndexMethod::Gin(opclass) => Some(opclass),
+            _ => None,
+        }
     }
 
     pub fn columns(&self) -> &[String] {
@@ -13046,6 +13060,18 @@ impl ValidatedCreateIndex {
     pub fn column_collations(&self) -> &[Option<crate::collation::Collation>] {
         &self.collations
     }
+}
+
+/// `CREATE INDEX ... USING <method>` の方式（構文段の分類。Issue #2206）。実行段
+/// （`sql::ddl::execute_create_index`）が `catalog::IndexKind` へ対応づける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMethod {
+    /// 省略時・`USING btree`（スカラー宣言）。
+    Btree,
+    /// `USING hnsw`。
+    Hnsw,
+    /// `USING gin`（JSONB 向け。演算子クラスは省略時 `jsonb_ops`。INDEX-8）。
+    Gin(crate::catalog::GinOpClass),
 }
 
 /// `DROP INDEX <name>` の許可形状構造検証結果（TASK-206・INDEX-7・SQL-23、
@@ -13087,8 +13113,11 @@ pub(crate) fn is_drop_index_statement(tokens: &[Token]) -> bool {
 /// [`ValidatedCreateIndex`] の構造検証本体（TASK-206・INDEX-7、Issue #908）。
 /// カタログを参照しない範囲の判定はここで完結させる（fail-closed。権限の無い
 /// 呼び出し元へ存在情報を漏らさないよう、カタログ照会を要する検査は一切行わない）:
-/// - `USING <ident>` が `hnsw`・`btree` 以外 → `0A000`（`FeatureNotSupported`）。
+/// - `USING <ident>` が `hnsw`・`gin`・`btree` 以外 → `0A000`（`FeatureNotSupported`）。
 ///   `USING btree` は省略時と同一のスカラー宣言（INDEX-9、Issue #1617）。
+/// - `USING gin`（Issue #2206・INDEX-8）: 列の直後の演算子クラスは `jsonb_ops`（省略時）・
+///   `jsonb_path_ops` の完全一致（大文字小文字不問）で、未知の名前は `42704`。列が複数・式要素・
+///   `UNIQUE`・`WHERE`・`COLLATE` は `0A000`。列の JSONB 型の検査はカタログ段が担う。
 /// - `USING hnsw` なのに列が複数 → `0A000`。
 /// - 列リストの要素: 式（`((<式>))`・関数呼び出し形 `(f(col))`）は先読み検査で集計 `42803`・
 ///   ウィンドウ `42P20`・部分クエリ／SRF `0A000`、決定性検査で非決定式 `42P17`・組み込み以外の
@@ -13127,23 +13156,29 @@ pub(crate) fn validate_create_index_tokens(
     let name = p.expect_ident()?;
     p.expect_ident_matching("ON")?;
     let table = p.expect_ident()?;
-    let hnsw = if p.peek_ident_matches("USING") {
+    let method = if p.peek_ident_matches("USING") {
         p.advance();
         let method = p.expect_ident()?;
         if method.eq_ignore_ascii_case("hnsw") {
-            true
+            IndexMethod::Hnsw
+        } else if method.eq_ignore_ascii_case("gin") {
+            // 演算子クラスは列リスト解析後に確定する（既定は `jsonb_ops`）。
+            IndexMethod::Gin(crate::catalog::GinOpClass::JsonbOps)
         } else if method.eq_ignore_ascii_case("btree") {
             // PG の既定方式の明示。`USING` 省略時と同一のスカラー宣言として扱う
             // （カタログ表現は変えない。INDEX-9、Issue #1617）。
-            false
+            IndexMethod::Btree
         } else {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: truncate_for_error(&format!("index method {method} is not supported")),
             });
         }
     } else {
-        false
+        IndexMethod::Btree
     };
+    let hnsw = matches!(method, IndexMethod::Hnsw);
+    let is_gin = matches!(method, IndexMethod::Gin(_));
+    let mut method = method;
     p.expect_punct('(')?;
     let mut columns = Vec::new();
     let mut expressions: Vec<Option<Expr>> = Vec::new();
@@ -13153,6 +13188,23 @@ pub(crate) fn validate_create_index_tokens(
             return Err(SqlSurfaceError::payload_too_large("too many index columns"));
         }
         let (column, expression, collation) = parse_index_column(&mut p)?;
+        // `USING gin` の演算子クラス（Issue #2206）。素の列要素の直後に識別子が続く形だけを
+        // 演算子クラスとして読む。`COLLATE` の後ろの演算子クラスは PG にも無い語順のため、
+        // 読まずに列リストの文法エラー（`42601`）へ落とす。
+        if is_gin
+            && expression.is_none()
+            && collation.is_none()
+            && matches!(p.peek(), Some(Token::Ident(_)))
+        {
+            let opclass_name = p.expect_ident()?;
+            let opclass =
+                crate::catalog::GinOpClass::from_name(&opclass_name).ok_or_else(|| {
+                    SqlSurfaceError::UndefinedObject {
+                        name: truncate_for_error(&opclass_name),
+                    }
+                })?;
+            method = IndexMethod::Gin(opclass);
+        }
         columns.push(column);
         expressions.push(expression);
         collations.push(collation);
@@ -13166,6 +13218,11 @@ pub(crate) fn validate_create_index_tokens(
     if hnsw && columns.len() != 1 {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "USING hnsw requires exactly one column".to_string(),
+        });
+    }
+    if is_gin && columns.len() != 1 {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "USING gin requires exactly one column".to_string(),
         });
     }
     let mut seen = std::collections::HashSet::new();
@@ -13187,6 +13244,17 @@ pub(crate) fn validate_create_index_tokens(
     if unique && collations.iter().any(Option::is_some) {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "CREATE UNIQUE INDEX does not support COLLATE".to_string(),
+        });
+    }
+    if unique && is_gin {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "CREATE UNIQUE INDEX does not support USING gin".to_string(),
+        });
+    }
+    // GIN の列要素への `COLLATE` は PG では `42804` だが、本実装は設計 D12 に従い `0A000`。
+    if is_gin && collations.iter().any(Option::is_some) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "USING gin does not support COLLATE".to_string(),
         });
     }
     // 式要素の決定性（`42P17`／組み込み以外の関数は `0A000`。INDEX-10、Issue #1647）。判定順は
@@ -13215,18 +13283,18 @@ pub(crate) fn validate_create_index_tokens(
     };
     p.expect_end_of_statement()?;
     // 最終ゲート（INDEX-10、Issue #1647）。決定性検査は部分索引の `WHERE` 判定より前に済ませてある。
-    reject_unimplemented_expression_keys(&expressions, &collations, hnsw)?;
+    reject_unimplemented_expression_keys(&expressions, &collations, method)?;
     // 部分索引の最終ゲート（INDEX-11、Issue #1653・#1654）。述語の格納・DML 維持は Issue #1654、
     // 部分 UNIQUE の強制は Issue #1657 で実装済みのため、残すのは照合や hnsw の永続形が無い組み合わせ
     // だけ（宣言だけ残って効かない索引を作らない）。
     if predicate.is_some() {
-        reject_unimplemented_partial_index(hnsw, &collations, &expressions)?;
+        reject_unimplemented_partial_index(method, &collations, &expressions)?;
     }
     Ok(ValidatedCreateIndex {
         name,
         if_not_exists,
         table,
-        hnsw,
+        method,
         columns,
         expressions,
         collations,
@@ -13240,14 +13308,14 @@ pub(crate) fn validate_create_index_tokens(
 /// 部分 UNIQUE は Issue #1657 で受理に変わった（強制は `constraint::UniqueKeyPlan`）。matview への
 /// `WHERE` は対象の種別を知る書き込みトランザクション内（`Storage::create_index_bound`）で拒否する。
 fn reject_unimplemented_partial_index(
-    hnsw: bool,
+    method: IndexMethod,
     collations: &[Option<crate::collation::Collation>],
     expressions: &[Option<Expr>],
 ) -> Result<(), SqlSurfaceError> {
     let unsupported = |detail: &str| SqlSurfaceError::FeatureNotSupported {
         detail: detail.to_string(),
     };
-    if hnsw {
+    if !matches!(method, IndexMethod::Btree) {
         return Err(unsupported(
             "partial indexes are not supported for this index kind yet",
         ));
@@ -13275,15 +13343,24 @@ fn reject_unimplemented_partial_index(
 fn reject_unimplemented_expression_keys(
     expressions: &[Option<Expr>],
     collations: &[Option<crate::collation::Collation>],
-    hnsw: bool,
+    method: IndexMethod,
 ) -> Result<(), SqlSurfaceError> {
     if !expressions.iter().any(Option::is_some) {
         return Ok(());
     }
-    if hnsw {
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "USING hnsw does not support expression indexes".to_string(),
-        });
+    match method {
+        IndexMethod::Hnsw => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "USING hnsw does not support expression indexes".to_string(),
+            });
+        }
+        // GIN は素の JSONB 列だけが対象（Issue #2206）。
+        IndexMethod::Gin(_) => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "USING gin does not support expression indexes".to_string(),
+            });
+        }
+        IndexMethod::Btree => {}
     }
     // `UNIQUE` かつ式要素（INDEX-9・INDEX-10、Issue #1651）は受理する。強制は永続一意索引が担う。
     // 式要素を含む索引では、素の列要素の `COLLATE` も受理しない（v4 の永続形は照合を持たず、
@@ -19039,6 +19116,63 @@ mod tests {
         }
     }
 
+    /// `USING gin` の構文段（Issue #2206・INDEX-8）: 演算子クラスの解決（省略時 `jsonb_ops`・
+    /// 大文字小文字不問）と、未知の演算子クラス `42704`・未対応の組み合わせ `0A000`・
+    /// 非 gin 方式の演算子クラス風識別子 `42601`。
+    #[test]
+    fn create_index_using_gin_accepts_opclasses_and_rejects_unsupported_forms() {
+        use super::*;
+        use crate::catalog::GinOpClass;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            validate_create_index_tokens(&tokens)
+        };
+        for (sql, expected) in [
+            ("CREATE INDEX i ON t USING gin (d)", GinOpClass::JsonbOps),
+            (
+                "CREATE INDEX i ON t USING GIN (d jsonb_ops)",
+                GinOpClass::JsonbOps,
+            ),
+            (
+                "CREATE INDEX i ON t USING gin (d JSONB_PATH_OPS)",
+                GinOpClass::JsonbPathOps,
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS i ON t USING gin (\"d\" jsonb_path_ops)",
+                GinOpClass::JsonbPathOps,
+            ),
+        ] {
+            let v = parse(sql).expect(sql);
+            assert_eq!(v.gin_opclass(), Some(expected), "{sql}");
+            assert_eq!(v.columns(), ["d".to_string()], "{sql}");
+        }
+        for (sql, code) in [
+            ("CREATE INDEX i ON t USING gin (d array_ops)", "42704"),
+            ("CREATE INDEX i ON t USING gin (d foo)", "42704"),
+            ("CREATE INDEX i ON t USING gin (a, b)", "0A000"),
+            ("CREATE INDEX i ON t USING gin (a jsonb_ops, b)", "0A000"),
+            ("CREATE INDEX i ON t USING gin ((a || b))", "0A000"),
+            ("CREATE INDEX i ON t USING gin (lower(a))", "0A000"),
+            ("CREATE UNIQUE INDEX i ON t USING gin (a)", "0A000"),
+            ("CREATE INDEX i ON t USING gin (a) WHERE b = 1", "0A000"),
+            ("CREATE INDEX i ON t USING gin (a COLLATE \"C\")", "0A000"),
+            (
+                "CREATE INDEX i ON t USING gin (a jsonb_ops COLLATE \"C\")",
+                "42601",
+            ),
+            (
+                "CREATE INDEX i ON t USING gin (a jsonb_ops jsonb_ops)",
+                "42601",
+            ),
+            ("CREATE INDEX i ON t USING btree (a jsonb_ops)", "42601"),
+            ("CREATE INDEX i ON t USING hnsw (a jsonb_ops)", "42601"),
+            ("CREATE INDEX i ON t (a jsonb_ops)", "42601"),
+        ] {
+            let err = parse(sql).expect_err(sql);
+            assert_eq!(err.wire_code(), code, "{sql}");
+        }
+    }
+
     /// `USING btree` は省略形と同一の宣言で、`hnsw`・`btree` 以外の手法は `0A000`
     /// （INDEX-9、Issue #1617）。
     #[test]
@@ -19058,7 +19192,7 @@ mod tests {
         );
         let ine = parse("CREATE INDEX IF NOT EXISTS i ON t USING btree (a)").expect("ine");
         assert!(ine.if_not_exists());
-        for m in ["bm25", "hash", "gin", "gist"] {
+        for m in ["bm25", "hash", "gist"] {
             assert!(
                 matches!(
                     parse(&format!("CREATE INDEX i ON t USING {m} (a)")),

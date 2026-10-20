@@ -9,6 +9,12 @@
 
 ### Breaking Changes
 
+- GIN 相当索引の宣言（Issue #2206・INDEX-8）: `CREATE INDEX ... USING gin (<JSONB 列> [jsonb_ops | jsonb_path_ops])` を
+  受理してカタログへ永続化する（従来は `0A000`）。JSONB 以外の列・複数列・式・`UNIQUE`・`WHERE`・`COLLATE` は `0A000`、
+  未知の演算子クラスは `42704`。宣言の受理までで、索引の生成・利用は後続（宣言は結果集合に影響しない）。
+  公開 API は `IndexKind::Gin(GinOpClass)` と `GinOpClass` の追加。索引カタログの形式は新版 `v8`（`v1`〜`v7` は不変）。
+  BREAKING CHANGE: `IndexKind` に variant を追加したため外部の網羅的な `match` は更新が要る。`v8` を含むデータディレクトリは
+  旧バイナリでは読めない（未知の版として拒否する）。
 - NoSQL の単一行アドレスと insert・scan を PRIMARY KEY 基準へ移行（Issue #2201・TABLE-23・NOSQL-23）: SQL の `CREATE TABLE` で作った表（採番方式）に対して NoSQL の `scan`（`explain` を含む）・`insert`（`id` 不要）・`update`／`delete`（`where` に PRIMARY KEY の列を指定、複合可。PK なし表の単一行形は `42601`・述語形 `filter` は使える）が使える。疑似列 `id` を持つ表の `where: {"id": n}` は互換のまま。NoSQL の `aggregate`／`search` は採番方式の表に対して引き続き `0A000`。`update`／`delete` の `where` の型検査は表のスキーマ解決後（未知キーは従来どおり `42601`）。既存の要求は同じ応答を返すため、既存クライアントへの破壊的変更ではない。
 - 既存表の `id` の移行（Issue #2200・TABLE-23）: 既存データディレクトリを開く時点で、従来方式の永続表のカタログを
   移行済みの印（v15 の `rowmode:migrated`。`RowIdentity::MigratedId`）へ一方向に書き換える（表ごとに原子的・再 open で収束。

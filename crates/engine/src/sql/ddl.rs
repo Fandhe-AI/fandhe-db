@@ -3020,7 +3020,12 @@ pub(crate) fn execute_create_index(
     // 式要素そのものは `create_index_bound` が書き込み txn 内で束縛する。一意索引と式要素の組
     // （Issue #1651）は受理し、`create_index_bound` が強制の前提を同一 txn で整える。
     let has_expressions = validated.expression_keys().iter().any(Option::is_some);
-    if has_expressions && validated.is_hnsw() {
+    if has_expressions
+        && !matches!(
+            validated.method(),
+            crate::sql::allowlist::IndexMethod::Btree
+        )
+    {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "expression indexes are not supported for this index kind yet".to_string(),
         });
@@ -3030,16 +3035,27 @@ pub(crate) fn execute_create_index(
     // 列だけの索引を保存しない（fail-closed）。述語そのものは `create_index_bound` が書き込み txn 内で
     // 束縛して正規化テキストと参照列を確定する。
     if validated.predicate().is_some()
-        && (validated.is_hnsw() || validated.column_collations().iter().any(Option::is_some))
+        && (!matches!(
+            validated.method(),
+            crate::sql::allowlist::IndexMethod::Btree
+        ) || validated.column_collations().iter().any(Option::is_some))
     {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "partial indexes are not supported for this index definition yet".to_string(),
         });
     }
-    let kind = if validated.is_hnsw() {
-        IndexKind::Hnsw
-    } else {
-        IndexKind::Scalar
+    // 防御ゲート（Issue #2206・INDEX-8）: GIN と一意・照合の組み合わせは構文段で拒否済み。
+    if validated.gin_opclass().is_some()
+        && (validated.is_unique() || validated.column_collations().iter().any(Option::is_some))
+    {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "USING gin does not support this index definition".to_string(),
+        });
+    }
+    let kind = match validated.method() {
+        crate::sql::allowlist::IndexMethod::Hnsw => IndexKind::Hnsw,
+        crate::sql::allowlist::IndexMethod::Gin(opclass) => IndexKind::Gin(opclass),
+        crate::sql::allowlist::IndexMethod::Btree => IndexKind::Scalar,
     };
     // 索引は対象表と同じ SCHEMA に置く（`CREATE INDEX i ON s.t` の索引は `s` の `i`。PG と同じく
     // 索引名は修飾できない。TABLE-27・Issue #1717）。
@@ -3858,7 +3874,7 @@ mod tests {
             name: "i".to_string(),
             if_not_exists: true,
             table: "docs".to_string(),
-            hnsw: false,
+            method: crate::sql::allowlist::IndexMethod::Btree,
             columns: vec!["body".to_string()],
             expressions: vec![None],
             collations: vec![None],

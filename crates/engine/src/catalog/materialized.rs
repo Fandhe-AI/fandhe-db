@@ -657,6 +657,12 @@ pub(crate) fn create_matview_index_in_txn(
             "USING hnsw is not supported on materialized views".to_string(),
         ));
     }
+    // GIN 相当索引（Issue #2206・INDEX-8）も matview へは宣言しない（HNSW と同じ扱い）。
+    if matches!(def.kind, IndexKind::Gin(_)) {
+        return Err(CatalogError::IndexKindMismatch(
+            "USING gin is not supported on materialized views".to_string(),
+        ));
+    }
     let mut positions = Vec::with_capacity(def.columns.len());
     for col in &def.columns {
         let (pos, column) = mv
