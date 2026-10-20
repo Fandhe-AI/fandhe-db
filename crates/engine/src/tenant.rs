@@ -204,6 +204,27 @@ pub fn visible_rows_with_scan_limit(
     ctx: &PolicyContext,
     scan_limits: crate::scan_limits::ScanLimits,
 ) -> Result<Vec<Row>, TenantError> {
+    visible_rows_impl(storage, table, ctx, scan_limits, false)
+}
+
+/// [`visible_rows_with_scan_limit`] と同一契約で採番方式の表も走査する crate 内部専用版
+/// （Issue #2199。`core.rs` の `USING PLAN` 辞書構築用。公開 API のゲートは維持する）。
+pub(crate) fn visible_rows_any_identity(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    scan_limits: crate::scan_limits::ScanLimits,
+) -> Result<Vec<Row>, TenantError> {
+    visible_rows_impl(storage, table, ctx, scan_limits, true)
+}
+
+fn visible_rows_impl(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    scan_limits: crate::scan_limits::ScanLimits,
+    allow_allocated: bool,
+) -> Result<Vec<Row>, TenantError> {
     let max_scanned_rows = scan_limits.max_scanned_rows();
     let mut out = Vec::new();
     // カーソルは行ストアの物理キーと同じ `(tenant_id, id)` 形（TABLE-12）。`id` 単独では
@@ -212,7 +233,11 @@ pub fn visible_rows_with_scan_limit(
     let mut scanned: usize = 0;
     loop {
         let cursor = after.as_ref().map(|(t, id)| (t.as_str(), *id));
-        let (page, next) = storage.scan_table_page(table, cursor, PAGE_LIMIT)?;
+        let (page, next) = if allow_allocated {
+            storage.scan_table_page_any_identity(table, cursor, PAGE_LIMIT)?
+        } else {
+            storage.scan_table_page(table, cursor, PAGE_LIMIT)?
+        };
         if page.is_empty() && next.is_none() {
             break;
         }

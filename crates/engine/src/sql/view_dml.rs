@@ -68,6 +68,8 @@ struct ResolvedView {
     column_map: Option<Vec<(String, String)>>,
     /// `WITH CHECK OPTION` の検査対象の述語（内側が先。[`Resolved::View::check_predicates`]）。
     check_predicates: Vec<Vec<WherePredicate>>,
+    /// 基表が採番方式（疑似列 `id` を持たない。Issue #2199）か。
+    base_allocated: bool,
 }
 
 impl ResolvedView {
@@ -75,15 +77,17 @@ impl ResolvedView {
         Mapper {
             columns: self.view_columns.as_deref(),
             map: self.column_map.as_deref(),
+            base_allocated: self.base_allocated,
         }
     }
 
     /// 利用者列を公開名 `id` で公開しているか（疑似列 `id` と取り違えないための判定）。
     fn exposes_user_column_as_id(&self) -> bool {
-        self.column_map.as_deref().is_some_and(|m| {
-            m.iter()
-                .any(|(public, phys)| public == "id" && phys != "id")
-        })
+        !self.base_allocated
+            && self.column_map.as_deref().is_some_and(|m| {
+                m.iter()
+                    .any(|(public, phys)| public == "id" && phys != "id")
+            })
     }
 }
 
@@ -107,12 +111,14 @@ fn resolve_for_write(
             view_columns,
             column_map,
             check_predicates,
+            base_allocated,
         } => Ok(ResolvedView {
             base_table,
             view_predicates,
             view_columns,
             column_map,
             check_predicates,
+            base_allocated,
         }),
         // 自動更新可能と判定済みなのに `View` 以外になるのは不変条件違反（固定文言。fail-closed）。
         _ => Err(SqlSurfaceError::Internal {
@@ -138,7 +144,10 @@ fn merge_predicates(
         &[],
     )?;
     let user = match rv.column_map.as_deref() {
-        Some(map) => rewrite_where(&ColumnMap::new(map), predicates.to_vec())?,
+        Some(map) => rewrite_where(
+            &ColumnMap::new(map, !rv.base_allocated),
+            predicates.to_vec(),
+        )?,
         None => predicates.to_vec(),
     };
     let mut merged = rv.view_predicates.clone();
@@ -268,7 +277,10 @@ fn rewrite_assignments(
                     expr_columns_within(columns, expr)?;
                 }
                 match rv.column_map.as_deref() {
-                    Some(map) => SetValue::Expr(rewrite_set_value(&ColumnMap::new(map), expr)?),
+                    Some(map) => SetValue::Expr(rewrite_set_value(
+                        &ColumnMap::new(map, !rv.base_allocated),
+                        expr,
+                    )?),
                     None => SetValue::Expr(expr.clone()),
                 }
             }

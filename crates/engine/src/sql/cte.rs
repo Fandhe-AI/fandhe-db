@@ -198,6 +198,8 @@ fn compose(inner: Resolved, def: &CteDef) -> Result<Resolved, SqlSurfaceError> {
         column_map: None,
         // CTE 経由の参照は読み取り専用（書き込み検査の対象外）。
         check_predicates: Vec::new(),
+        // CTE 経由は `column_map` を持たない（別名の書き換えが走らない）ため参照されない。
+        base_allocated: false,
     })
 }
 

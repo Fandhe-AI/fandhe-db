@@ -16553,6 +16553,7 @@ fn build_scan_from_resolved(
             view_predicates,
             view_columns,
             column_map,
+            base_allocated,
             ..
         } => {
             super::view::check_columns_within_view(
@@ -16576,7 +16577,7 @@ fn build_scan_from_resolved(
                              aliases are not supported",
                         ));
                     }
-                    let map = super::view_alias::ColumnMap::new(map);
+                    let map = super::view_alias::ColumnMap::new(map, !base_allocated);
                     let projection = super::view_alias::rewrite_projection(&map, projection)?;
                     let where_predicates =
                         super::view_alias::rewrite_where(&map, where_predicates)?;
@@ -16650,6 +16651,7 @@ fn build_aggregate_from_resolved(
             view_predicates,
             view_columns,
             column_map,
+            base_allocated,
             ..
         } => {
             super::view::check_aggregate_columns_within_view(
@@ -16661,7 +16663,7 @@ fn build_aggregate_from_resolved(
             // 列別名付きビュー（TABLE-41・Issue #1659）: 公開名に対する検査の後で物理名へ書き換える。
             let (items, where_predicates, group_by) = match &column_map {
                 Some(map) => super::view_alias::rewrite_aggregate(
-                    &super::view_alias::ColumnMap::new(map),
+                    &super::view_alias::ColumnMap::new(map, !base_allocated),
                     items,
                     where_predicates,
                     group_by,

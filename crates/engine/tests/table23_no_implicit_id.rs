@@ -1086,3 +1086,64 @@ fn prepared_select_on_a_view_resolves_the_declared_id_column() {
         other => panic!("expected the declared TEXT id column, got {other:?}"),
     }
 }
+
+/// 通常列 `id` を別名で公開するビューの SELECT・INSERT は疑似列扱いで拒否されない
+/// （基表が採番方式のとき `id` は通常の利用者列。Issue #2199）。
+#[test]
+fn view_aliasing_an_ordinary_id_column_works() {
+    let (core, _g) = new_core("t23-noid-view-alias");
+    let alice = ctx("alice");
+    run(&core, &alice, "CREATE TABLE t (id TEXT)");
+    run(&core, &alice, "INSERT INTO t (id) VALUES ('x'), ('y')");
+    run(
+        &core,
+        &alice,
+        "CREATE VIEW v (external_id) AS SELECT id FROM t",
+    );
+    let q = query(
+        &core,
+        &alice,
+        "SELECT external_id FROM v WHERE external_id = 'x' LIMIT 10",
+    );
+    assert_eq!(texts(&q, 0), vec!["x"]);
+    run(&core, &alice, "INSERT INTO v (external_id) VALUES ('z')");
+    let all = query(&core, &alice, "SELECT id FROM t LIMIT 10");
+    assert_eq!(texts(&all, 0), vec!["x", "y", "z"]);
+}
+
+/// 採番方式の表でも `USING PLAN` の辞書構築（内部走査）が通る（公開の行 API は拒否のまま）。
+#[test]
+fn using_plan_works_on_allocated_table() {
+    use engine::query_planner::{LlmClient, PlanError};
+    struct Stub;
+    impl LlmClient for Stub {
+        fn complete(&self, _prompt: &str) -> Result<String, PlanError> {
+            Ok(r#"{"search_terms": ["alpha"], "path_hint": null, "kind_hint": null}"#.to_string())
+        }
+    }
+    let path = unique_db_path("t23-noid-using-plan");
+    let _g = CleanupGuard(path.clone());
+    let core = EngineCore::open(&path)
+        .expect("open core")
+        .with_query_planner(Box::new(Stub));
+    let alice = ctx("alice");
+    run(
+        &core,
+        &alice,
+        "CREATE TABLE docs (path TEXT NOT NULL, body TEXT NOT NULL, embedding VECTOR(2))",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO docs (path, body, embedding) VALUES ('a.md', 'alpha content', '[1.0,0.0]')",
+    );
+    // EXPLAIN は辞書構築・展開までを実行する（埋め込み器を要さない）。
+    match run(
+        &core,
+        &alice,
+        "EXPLAIN SELECT path FROM docs USING PLAN('find alpha') LIMIT 5",
+    ) {
+        SqlOutcome::Explain(_) => {}
+        other => panic!("expected Explain, got {other:?}"),
+    }
+}

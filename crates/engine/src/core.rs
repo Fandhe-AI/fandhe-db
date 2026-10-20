@@ -3119,7 +3119,7 @@ impl EngineCore {
             let (path_idx, body_idx) = dictionary_required_columns(&schema)
                 .map_err(|msg| CoreError::from(CatalogError::Invalid(msg)))?;
 
-            let rows = crate::tenant::visible_rows_with_scan_limit(
+            let rows = crate::tenant::visible_rows_any_identity(
                 &self.storage,
                 table,
                 ctx,

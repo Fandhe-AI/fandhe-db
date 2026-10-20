@@ -50,6 +50,10 @@ pub(crate) enum Resolved {
         /// 検査対象でなければ空。入れ子の規則は [`checked_layer_flags`]。書き込みの検査点
         /// （`sql::view_check`）だけが読み、読み取り経路は使わない。
         check_predicates: Vec<Vec<WherePredicate>>,
+        /// 基底表が採番方式（疑似列 `id` を持たない。TABLE-23・Issue #2199）か。列別名の書き換えが
+        /// 「`id` へ写る公開名」を疑似列として拒否するのは、基底表が疑似列 `id` を持つとき
+        /// （この値が偽のとき）だけ。採番方式の表の `id` は通常の利用者列。
+        base_allocated: bool,
     },
     /// 評価後射影形ビュー（Issue #1192。`LIMIT`・`ORDER BY`・集計・JOIN を含む
     /// 本文）。インライン展開できない（外側の `WHERE` を合成すると `LIMIT`／集計の
@@ -195,6 +199,7 @@ pub(crate) fn resolve_from(
     // 参照した場合（`CREATE VIEW` 自体はカタログ照会を行わないため作成時
     // には検出されない）も、連鎖のどの段であれ参照時に一様に拒否できる。
     let mut exposed: Option<Vec<String>> = None;
+    let base_allocated = lookup.table_is_allocated(&base_table)?;
     // 列別名の段（TABLE-41・Issue #1659）を含むときの「公開名 → 物理名」対応。別名の段が
     // まだ現れていない間は `None`（公開名＝物理名）。
     let mut column_map: Option<Vec<(String, String)>> = None;
@@ -218,7 +223,7 @@ pub(crate) fn resolve_from(
         // 対応（親の `column_map`）で物理名へ書き換えてから合成する（TABLE-41・Issue #1659）。
         let layer_predicates = match &column_map {
             Some(map) => super::view_alias::rewrite_where(
-                &super::view_alias::ColumnMap::new(map),
+                &super::view_alias::ColumnMap::new(map, !base_allocated),
                 std::mem::take(&mut view.where_predicates),
             )?,
             None => std::mem::take(&mut view.where_predicates),
@@ -285,6 +290,7 @@ pub(crate) fn resolve_from(
         view_columns: exposed,
         column_map,
         check_predicates,
+        base_allocated,
     })
 }
 

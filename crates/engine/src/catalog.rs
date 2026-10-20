@@ -5511,6 +5511,7 @@ fn validate_new_view_body_in_txn(
         if let crate::sql::view::Resolved::View {
             view_columns,
             column_map: Some(map),
+            base_allocated,
             ..
         } = crate::sql::view::resolve_from(&lookup, base_relation).map_err(|_| invalid())?
         {
@@ -5522,7 +5523,7 @@ fn validate_new_view_body_in_txn(
             )
             .map_err(|_| invalid())?;
             crate::sql::view_alias::rewrite_where(
-                &crate::sql::view_alias::ColumnMap::new(&map),
+                &crate::sql::view_alias::ColumnMap::new(&map, !base_allocated),
                 parsed.where_predicates,
             )
             .map_err(|_| invalid())?;
@@ -11353,6 +11354,22 @@ fn require_legacy_row_identity_read(
     read_txn: &impl crate::storage::read_source::ReadSource,
     table_name: &str,
 ) -> Result<()> {
+    require_row_identity_read(read_txn, table_name, false)
+}
+
+/// 表の存在だけを確認する（行識別方式は問わない。[`Storage::scan_table_page_any_identity`] 用）。
+fn require_table_defined_read(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    table_name: &str,
+) -> Result<()> {
+    require_row_identity_read(read_txn, table_name, true)
+}
+
+fn require_row_identity_read(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    table_name: &str,
+    allow_allocated: bool,
+) -> Result<()> {
     let catalog_table = match read_txn.open_table(CATALOG_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => {
@@ -11368,7 +11385,9 @@ fn require_legacy_row_identity_read(
         .iter()
         .position(|b| *b == b'\n')
         .unwrap_or(value.len());
-    if value.get(..first_line_len) == Some(CATALOG_FORMAT_VERSION_V15.as_bytes()) {
+    if !allow_allocated
+        && value.get(..first_line_len) == Some(CATALOG_FORMAT_VERSION_V15.as_bytes())
+    {
         return Err(row_identity_unsupported_error());
     }
     Ok(())
@@ -15625,11 +15644,39 @@ impl Storage {
         after: Option<(&str, u64)>,
         limit: u32,
     ) -> Result<RowPage> {
+        self.scan_table_page_impl(table_name, after, limit, false)
+    }
+
+    /// [`Self::scan_table_page`] と同一の走査契約で、採番方式（[`RowIdentity::Allocated`]）の表も
+    /// 走査できる crate 内部専用の経路（Issue #2199）。SQL 表層の `USING PLAN` 辞書構築
+    /// （`core.rs` の辞書スナップショット）が、行 id を利用者へ見せずに本文列だけを読むために使う。
+    /// 公開の行 API（[`Self::scan_table_page`]）は採番方式の拒否ゲートを維持する。
+    pub(crate) fn scan_table_page_any_identity(
+        &self,
+        table_name: &str,
+        after: Option<(&str, u64)>,
+        limit: u32,
+    ) -> Result<RowPage> {
+        self.scan_table_page_impl(table_name, after, limit, true)
+    }
+
+    fn scan_table_page_impl(
+        &self,
+        table_name: &str,
+        after: Option<(&str, u64)>,
+        limit: u32,
+        allow_allocated: bool,
+    ) -> Result<RowPage> {
         validate_identifier(table_name)?;
         let limit = limit.min(crate::storage::MAX_SCAN_PAGE_LIMIT) as usize;
 
         let read_txn = self.db().begin_read()?;
-        require_legacy_row_identity_read(&read_txn, table_name)?;
+        if allow_allocated {
+            // 存在確認のみ（採番方式の拒否はしない）。
+            require_table_defined_read(&read_txn, table_name)?;
+        } else {
+            require_legacy_row_identity_read(&read_txn, table_name)?;
+        }
         // `limit == 0` の早期 return は存在確認より後に置く（レビュー指摘対応: 先に
         // 判定すると、存在しないテーブルへの limit=0 走査が空ページで成功してしまい、
         // 「テーブル不存在は fail-closed に `Err`」という契約を迂回できてしまう）。
