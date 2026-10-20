@@ -216,7 +216,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1648（式索引の永続形 v4・`create_index_bound`・列依存ヘルパー。`catalog.rs` に行が追加）で一括追随（旧: 10204／12585／12666／12775／12847／13243）。
     // Issue #1651（式索引の UNIQUE・列変更への追随。`catalog.rs` に行が追加）で一括追随（旧: 10597／12994／13075／13184／13257／13779）。
     // Issue #1651（式索引の UNIQUE・失効管理。`catalog.rs` に行が追加）で一括追随（旧: 13274／13355／13464／13537／14080／10874）。
-    ("catalog.rs", 14135),
+    ("catalog.rs", 14241),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -283,7 +283,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+101 行。旧: 11250）。
-    ("catalog.rs", 14216),
+    ("catalog.rs", 14322),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -343,7 +343,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+131 行。旧: 11389）。
-    ("catalog.rs", 14347),
+    ("catalog.rs", 14453),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -412,15 +412,15 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1644（TRUNCATE CASCADE／RESTRICT）で catalog.rs 全エントリ +1・tenant.rs 506→516 に追随。
     // Issue #1663（MATERIALIZED VIEW のカタログ追加）の base 取り込みで追随（旧: 13013）。
     // Issue #1671（ビュー INSERT 書き換えで `catalog.rs` に行が追加）で全エントリを追随。
-    ("catalog.rs", 14421),
+    ("catalog.rs", 14527),
     // `Storage::create_or_replace_view_checked`（TABLE-41 (2)、Issue #1660。`create_or_replace_view` の本体）: `create_view` と同じく
     // `[VIEWS_TABLE]` のみを書く（上書き）。ビューは行ストア・世代を持たないためバンプ対象がない。
-    ("catalog.rs", 15053),
+    ("catalog.rs", 15159),
     // `Storage::drop_tables`（Issue #1684 で本体を `drop_tables_in_txn` へ切り出した）: 世代 bump は
     // 同一 write txn で先に呼ばれる `drop_tables_in_txn` 内（削除する各表と FK を外した参照元表）で
     // 行われ、本呼び出しはその結果（`dropped > 0`）を単一 commit で確定させるだけ。`bump` が
     // 直前 60 行の外（別関数）へ移ったための許可。
-    ("catalog.rs", 11563),
+    ("catalog.rs", 11630),
     // 上記 `drop_tables_in_txn` 切り出し（+18 行）に伴い、以降の catalog.rs エントリ（12419／12500／12609／12681／13063）を追随（旧: 12401／12482／12591／12663／13045）。
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
@@ -513,20 +513,21 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 全件を現行行へ追随（commit 対象は SEQUENCE 定義・状態表のみで同じ理由により対象外）。
     // Issue #1694（SERIAL の暗黙 SEQUENCE・所有 SEQUENCE の削除と追従）の追加で行番号が移動したための追随
     // （`create_table_with_implicit_sequences` の commit は直前で表の世代を bump するため対象外）。
-    ("catalog/sequence.rs", 1242),
-    ("catalog/sequence.rs", 1255),
-    ("catalog/sequence.rs", 1303),
-    ("catalog/sequence.rs", 1352),
-    ("catalog/sequence.rs", 1391),
-    ("catalog/sequence.rs", 1411),
-    ("catalog/sequence.rs", 1513),
-    ("catalog/sequence.rs", 1787),
-    ("catalog/sequence.rs", 1877),
-    ("catalog/sequence.rs", 1917),
-    ("catalog/sequence.rs", 1970),
-    ("catalog/sequence.rs", 2238),
-    ("catalog/sequence.rs", 2283),
-    ("catalog/sequence.rs", 2550),
+    // Issue #1695（IDENTITY 列の暗黙 SEQUENCE 宣言 `ImplicitSequence` の追加）で行番号が移動したための追随。
+    ("catalog/sequence.rs", 1256),
+    ("catalog/sequence.rs", 1269),
+    ("catalog/sequence.rs", 1317),
+    ("catalog/sequence.rs", 1366),
+    ("catalog/sequence.rs", 1405),
+    ("catalog/sequence.rs", 1425),
+    ("catalog/sequence.rs", 1527),
+    ("catalog/sequence.rs", 1801),
+    ("catalog/sequence.rs", 1891),
+    ("catalog/sequence.rs", 1931),
+    ("catalog/sequence.rs", 1984),
+    ("catalog/sequence.rs", 2252),
+    ("catalog/sequence.rs", 2297),
+    ("catalog/sequence.rs", 2564),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
 ];

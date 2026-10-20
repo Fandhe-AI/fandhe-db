@@ -3144,7 +3144,7 @@ pub(crate) fn fill_omitted_columns(
             continue;
         }
         match &column.default_expr {
-            Some(ColumnDefault::Sequence(_)) => {
+            Some(ColumnDefault::Sequence(_) | ColumnDefault::Identity { .. }) => {
                 // 採番は書き込み txn 内（台帳照合の後）で行う。仮値 `Null` を置いて印だけ運ぶ
                 // （TABLE-24・Issue #1690）。この印を処理しない経路は `tenant` 側で `0A000`、
                 // COPY などは束縛直後に印を検出して拒否する。
@@ -3219,7 +3219,7 @@ pub(crate) fn bind_column_default(
     // 常に `0A000`（既定が拒否の fail-closed。INSERT の省略列補完は `fill_omitted_columns`
     // が評価する。ファイル INSERT・FK の SET DEFAULT 等の新経路が追加されても拒否が抜けない。
     // SQL-37・Issue #1587、設計 D9）。
-    if matches!(default, ColumnDefault::Sequence(_)) {
+    if default.sequence_name().is_some() {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: format!(
                 "column {:?} sequence DEFAULT is not supported in this context",
@@ -3322,6 +3322,26 @@ pub(crate) fn bind_column_default(
     }
 }
 
+/// `GENERATED ALWAYS AS IDENTITY` 列への利用者指定の値（明示値・明示 `NULL`・UPDATE の SET）を
+/// `428C9` で拒否する（TABLE-24・ERR-6、Issue #1695）。INSERT・ファイル形 INSERT・UPSERT の挿入側・
+/// `bind_set_assignments`（UPDATE。述語形を含む）・`DO UPDATE SET` が束縛の最初に呼ぶ（型の束縛より
+/// 前に判定するため、型不正な値も 22P02 より先に 428C9 になる。PostgreSQL と同じ順序）。判定は
+/// スキーマだけで決まり、テナントの状態・SEQUENCE カタログを引かない（存在オラクルにならない）。
+/// COPY は PostgreSQL と同じく IDENTITY 列へ入力値をそのまま書くため呼ばない。
+fn reject_generated_always_value(column: &ColumnDef) -> Result<(), SqlSurfaceError> {
+    if column
+        .default_expr
+        .as_ref()
+        .and_then(ColumnDefault::identity_kind)
+        == Some(crate::catalog::IdentityKind::Always)
+    {
+        return Err(SqlSurfaceError::GeneratedAlways {
+            column: column.name.clone(),
+        });
+    }
+    Ok(())
+}
+
 fn bind_insert_row(
     table_name: &str,
     columns: &[String],
@@ -3391,6 +3411,7 @@ fn bind_insert_row(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
+        reject_generated_always_value(column)?;
         if let InsertLiteral::CurrentTime(time) = literal {
             // 時刻関数の単独形（SQL-37・Issue #2188）。列型と構文形の適合を確認してから、
             // 現スレッドの時刻スコープ（`core.rs` の INSERT 入口が開く）で評価する。
@@ -3911,6 +3932,7 @@ fn bind_set_assignments(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
+        reject_generated_always_value(column)?;
         let literal = match set_value {
             crate::sql::allowlist::SetValue::Literal(literal) => literal,
             crate::sql::allowlist::SetValue::Expr(expr) => {
@@ -5131,6 +5153,7 @@ fn bind_upsert_assignments(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
+        reject_generated_always_value(column)?;
 
         let bound_value = match value {
             UpsertValue::Excluded(src) => {
@@ -5393,6 +5416,7 @@ fn bind_file_insert(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
+        reject_generated_always_value(column)?;
         let value = match (&column.ty, literal) {
             // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。
             (_, InsertLiteral::CurrentTime(_) | InsertLiteral::TimestampTz(_)) => {

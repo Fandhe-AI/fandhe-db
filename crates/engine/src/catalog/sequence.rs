@@ -767,6 +767,7 @@ fn column_default_references_sequence(default: &ColumnDefault, name: &str) -> bo
         | ColumnDefault::Bool(_)
         | ColumnDefault::CurrentTime(_) => false,
         ColumnDefault::Sequence(seq) => seq == name,
+        ColumnDefault::Identity { sequence, .. } => sequence == name,
     }
 }
 
@@ -1044,30 +1045,37 @@ pub(crate) fn create_sequence_in_txn(
     Ok(id)
 }
 
+/// 暗黙 SEQUENCE を持つ列 1 件の宣言（SERIAL 系・IDENTITY 列。TABLE-24・Issue #1694／#1695）。
+/// `CREATE TABLE` の列宣言順に並べて渡し、`<table>_<col>_seq` の衝突番号（`seq1`…）が列順に
+/// 決まるようにする。`sql::ddl::execute_create_table` が組み立てる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImplicitSequence {
+    /// 所有する列名（`schema.columns` に存在する）。
+    pub(crate) column: String,
+    /// 作成する SEQUENCE の定義（検証済みの値）。
+    pub(crate) params: SequenceParams,
+    /// `Some` なら IDENTITY 列（種別）、`None` なら SERIAL 系（`DEFAULT nextval`）。
+    pub(crate) identity: Option<super::IdentityKind>,
+}
+
 /// [`Storage::create_table_with_implicit_sequences`] の write txn 内本体（begin・commit を含まない）。
 /// 表の世代 bump は呼び出し側が commit 直前に行う。`Err` の場合は呼び出し側が txn を破棄する（途中まで作った
 /// SEQUENCE も残らない）。
 pub(crate) fn create_table_with_implicit_sequences_in_txn(
     write_txn: &redb::WriteTransaction,
     schema: &TableSchema,
-    serials: &[(String, i64)],
+    serials: &[ImplicitSequence],
 ) -> Result<Vec<String>> {
     if relation_name_taken_in_txn(write_txn, &schema.name)? {
         return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
     }
     let mut named_schema = schema.clone();
     let mut created: Vec<String> = Vec::with_capacity(serials.len());
-    for (column, max_value) in serials {
+    for implicit in serials {
+        let column = &implicit.column;
         let seq_name =
             choose_implicit_sequence_name_in_txn(write_txn, &schema.name, column, &created)?;
-        let params = SequenceParams {
-            increment: 1,
-            min_value: 1,
-            max_value: *max_value,
-            start: 1,
-            cycle: false,
-        };
-        create_sequence_in_txn(write_txn, &seq_name, &params)?;
+        create_sequence_in_txn(write_txn, &seq_name, &implicit.params)?;
         let col = named_schema
             .columns
             .iter_mut()
@@ -1075,19 +1083,25 @@ pub(crate) fn create_table_with_implicit_sequences_in_txn(
             .ok_or_else(|| {
                 CatalogError::Invalid("serial column does not exist in the table".to_string())
             })?;
-        col.default_expr = Some(ColumnDefault::Sequence(seq_name.clone()));
+        col.default_expr = Some(match implicit.identity {
+            Some(kind) => ColumnDefault::Identity {
+                sequence: seq_name.clone(),
+                kind,
+            },
+            None => ColumnDefault::Sequence(seq_name.clone()),
+        });
         created.push(seq_name);
     }
     // 既定値を付けた後のスキーマを、`create_table` と同じ前処理・txn 内本体へ通す。
     let (named_schema, pre_encoded) = Storage::prepare_create_table(&named_schema)?;
     Storage::create_table_in_txn(write_txn, &named_schema, pre_encoded)?;
-    for ((column, _), seq_name) in serials.iter().zip(&created) {
+    for (implicit, seq_name) in serials.iter().zip(&created) {
         set_sequence_owner_in_txn(
             write_txn,
             seq_name,
             Some(SequenceOwner {
                 table: schema.name.clone(),
-                column: column.clone(),
+                column: implicit.column.clone(),
             }),
         )?;
     }
@@ -1256,7 +1270,7 @@ impl Storage {
     }
 
     /// 表と暗黙 SEQUENCE を単一 write txn で作る（`CREATE TABLE ... (n SERIAL)`。TABLE-24・
-    /// Issue #1694）。`serials` の各 `(列名, 上限値)` について、PostgreSQL の `ChooseRelationName`
+    /// Issue #1694）。`serials` の各宣言（SERIAL 系・IDENTITY）について、PostgreSQL の `ChooseRelationName`
     /// 相当で `<table>_<col>_seq` を決め、SEQUENCE の挿入 → 列の `DEFAULT nextval` 付与 → 表の作成 →
     /// 所有者（`OWNED BY <table>.<col>`）設定を行い、1 回の commit で確定する。途中のどの段階で
     /// 失敗しても txn ごと破棄するため、孤児 SEQUENCE も半端な表も残らない（`IF NOT EXISTS` で表が既に
@@ -1267,7 +1281,7 @@ impl Storage {
     pub(crate) fn create_table_with_implicit_sequences(
         &self,
         schema: &TableSchema,
-        serials: &[(String, i64)],
+        serials: &[ImplicitSequence],
     ) -> Result<Vec<String>> {
         let write_txn = self
             .begin_write_txn()

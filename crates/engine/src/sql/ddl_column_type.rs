@@ -239,6 +239,18 @@ impl SerialKind {
     }
 }
 
+/// IDENTITY 列に使える列型の SEQUENCE 境界 `(下限, 上限)`（TABLE-24・Issue #1695）。
+/// `SMALLINT`／`INTEGER`／`BIGINT` 以外は `None`（`22023`）。暗黙 SEQUENCE の既定値と利用者
+/// オプションの範囲検査（`sql::ddl::resolve_identity_sequence_params`）が使う。
+pub(crate) fn identity_type_bounds(ty: &ColumnType) -> Option<(i64, i64)> {
+    match ty {
+        ColumnType::SmallInt => Some((i64::from(i16::MIN), i64::from(i16::MAX))),
+        ColumnType::Integer => Some((i64::from(i32::MIN), i64::from(i32::MAX))),
+        ColumnType::BigInt => Some((i64::MIN, i64::MAX)),
+        _ => None,
+    }
+}
+
 /// 型名の許可リスト構文木。`ALTER TABLE ADD COLUMN`（将来 `CREATE TABLE` とも
 /// 共有する前提。`docs/design/sql-alter-table-add-column.md` 参照）が受理する
 /// 型名の閉じた集合＋ ENUM 型名候補。

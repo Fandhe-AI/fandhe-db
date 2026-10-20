@@ -135,7 +135,7 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
 ### D8. 受理範囲と fail-closed
 
 - 最初に受理するのは #1688 の START／INCREMENT／MINVALUE／MAXVALUE／CYCLE
-- CACHE・SQL の OWNED BY・AS・IDENTITY・
+- CACHE・SQL の OWNED BY・AS・（IDENTITY は #1695 で着地。§13）・
   `DROP SEQUENCE ... CASCADE`（TABLE-37）・`IF [NOT] EXISTS`（TABLE-36）・TEMP SEQUENCE は、
   受理する sub-issue が明記されるまで `0A000`／`42601` で fail-closed とする
 - DDL は既存の `--ddl-allowed-users` のゲートに従い、既定拒否を維持する
@@ -163,7 +163,7 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
 
 - SCHEMA の実装（#1711）
 - 一時表と TEMP SEQUENCE
-- IDENTITY（TABLE-23 (8)・TABLE-24 の後続。SERIAL は #1694 で着地）
+- IDENTITY（TABLE-23 (8)・TABLE-24 の後続。SERIAL は #1694、IDENTITY は #1695 で着地。§13）
 - 変更ログとレプリカ（RECOVER-14／15）
 - NoSQL の returning（NOSQL-22）
 
@@ -423,7 +423,45 @@ RENAME の追従と `RESTART IDENTITY`・依存 DEFAULT の `2BP01`・原子性�
 
 ### 12.3 対象外・申し送り
 
-- IDENTITY（`GENERATED ... AS IDENTITY`・428C9）は #1695。`id` 列の SERIAL・IDENTITY 化は #2197・#1696
+- IDENTITY（`GENERATED ... AS IDENTITY`・428C9）は #1695 で着地した（§13）。`id` 列の SERIAL・IDENTITY 化は #2197・#1696
 - SQL の `OWNED BY` 句、`ADD COLUMN ... SERIAL`（既存行への採番補完）、`AS smallint/integer` の型タグ
 - 修飾名・SCHEMA の追随は #1711・#1717。`pg_get_serial_sequence` と information_schema 相当の表示
 - NoSQL DDL の `serial` 型、DROP TABLE の CASCADE で依存 DEFAULT を連鎖削除すること
+
+## 13. Issue #1695 実装記録（GENERATED ALWAYS／BY DEFAULT AS IDENTITY）
+
+`CREATE TABLE` の列制約 `GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY [(<SEQUENCE オプション>)]` を、整数型・
+`NOT NULL`・列が所有する暗黙 SEQUENCE・`ColumnDefault::Identity` へ展開する（TABLE-24 のポインタ。拒否の分類は
+ERR-6 の `428C9`）。以下は自動運転下の判断で、人間の確認が要る点に「要確認」と付ける。
+
+### 13.1 決定
+
+| 項目 | 決定 |
+| ---- | ---- |
+| 表現 | `ColumnDefault::Identity { sequence, kind: IdentityKind }` を新設し、カタログの `default` フィールドにタグ `a`（ALWAYS）・`b`（BY DEFAULT）を足す（本体は SEQUENCE 名の 16 進。decode 時に識別子検証。未知タグは従来どおり fail-closed）。表のカタログ版は上げない。束縛段がスキーマだけで ALWAYS を判定でき、SEQUENCE カタログを引かない。「採番する DEFAULT か」の判定は `ColumnDefault::sequence_name()` に集約した。#1698 は本表現を再利用する（要確認） |
+| 暗黙 SEQUENCE | 型は列型（`SMALLINT`／`INTEGER`／`BIGINT`）から決める。既定は昇順が MINVALUE 1・MAXVALUE 型上限・START = MINVALUE、降順が MINVALUE 型下限・MAXVALUE -1・START = MAXVALUE、NO CYCLE。利用者指定が列型の範囲外なら `22023`（固定文言）。名前・所有者・原子性は SERIAL（§12）と同じで、SERIAL と IDENTITY は列の宣言順の 1 本のリスト（`ImplicitSequence`）で渡し、`seq1` の衝突番号が列順に決まる |
+| 428C9 | ALWAYS 列への明示値・明示 NULL（INSERT・複数行 VALUES・ファイル形・UPSERT の挿入側。NoSQL の insert も同じ束縛を通る）と、UPDATE の SET（リテラル・式・述語形）・`DO UPDATE SET` を拒否する。判定は型の束縛より前（型不正な値も 22P02 より先に 428C9）で、スキーマだけで決まりテナントの状態に依存しない。txn・台帳の前なので SEQUENCE を進めない。BY DEFAULT は明示値を受け付け、明示 NULL は `23502` |
+| COPY（要確認） | PostgreSQL の COPY FROM は IDENTITY 列（ALWAYS を含む）へ入力値をそのまま書く（`OVERRIDING SYSTEM VALUE` 相当）ため、428C9 を出さない。IDENTITY 列を省略した COPY は既存の「COPY は `DEFAULT nextval` を採番しない」に従い `0A000` のまま |
+| 構文段の組み合わせ | IDENTITY と `DEFAULT`（`DEFAULT NULL` を含む。順不同）の併記・IDENTITY 句の二重指定・SERIAL 型との併用は `42601`、整数 3 型以外（配列・ENUM 候補を含む）は `22023`。IDENTITY は暗黙に `NOT NULL`。オプションの `AS`／`CACHE`／`OWNED BY`／`SEQUENCE NAME`／`RESTART` と生成列 `GENERATED ALWAYS AS (<式>) STORED` は `0A000`。オプション列の解析は `CREATE SEQUENCE` と共有ヘルパー（`parse_sequence_option_list`）にした |
+| 未対応形（fail-closed） | `INSERT ... OVERRIDING {SYSTEM\|USER} VALUE`・`ALTER TABLE ... ADD COLUMN ... IDENTITY`・`ALTER COLUMN ... ADD／SET GENERATED`／`DROP IDENTITY`／`RESTART`／`SET <SEQUENCE オプション>`・IDENTITY 列の `ALTER COLUMN TYPE`（暗黙 SEQUENCE の型変更が要るため。要確認）・一時表・FK の `ON DELETE／UPDATE SET DEFAULT` の対象列は `0A000`。IDENTITY 列の `SET DEFAULT`／`DROP DEFAULT`／`DROP NOT NULL` は `42601`（PostgreSQL と同じ分類。要確認） |
+| 依存 | `DROP SEQUENCE`（`2BP01`）・`DROP TABLE`／`DROP COLUMN` の連動削除・RENAME の追従・`TRUNCATE ... RESTART IDENTITY` は SERIAL と同じ経路で IDENTITY 列にも効く（`column_default_references_sequence` の網羅 match に腕を足した） |
+| 台帳・ハッシュ | 変更しない。省略列に適用した DEFAULT は内容照合ハッシュの材料から外れる（D2）。golden は不変 |
+| `id` 列 | `id` は予約列名のまま。`id` への IDENTITY は従来どおり `42601`（#1696／#1698） |
+
+### 13.2 テスト
+
+`crates/engine/src/sql/identity_column_tests.rs`（展開・再オープン・オプションと列型の範囲・ALWAYS／BY DEFAULT の拒否と受理・
+SEQUENCE を進めないこと・UPDATE・`OVERRIDING`・DDL の組み合わせ規則・ALTER の拒否・ライフサイクル・台帳の再送・DDL 権限・COPY・ビュー経由の書き込み）、
+`allowlist`／`catalog` の単体テスト、`crates/wire-server/tests/wire_identity_column.rs`（`428C9` の SQLSTATE と BY DEFAULT の採番）、
+`err4_http_projection.rs`（`428C9` → 400）。
+
+### 13.3 対象外・申し送り
+
+- `OVERRIDING SYSTEM／USER VALUE` の実装（内容照合ハッシュへの反映設計が要る）
+- ALTER TABLE の ADD／SET GENERATED・DROP IDENTITY・RESTART・オプション変更・`ADD COLUMN ... IDENTITY`
+- IDENTITY 列の `ALTER COLUMN TYPE`（SEQUENCE の型変更）
+- `INSERT ... VALUES (DEFAULT)` キーワードと INSERT … SELECT（本リポに未実装の機能のため該当なし）
+- UPSERT・COPY・ファイル形 INSERT での省略 IDENTITY 列の採番（既存の `0A000` を継承）。UPSERT は省略列の採番拒否が
+  `DO UPDATE SET` の束縛より先に働くため、`DO UPDATE SET` 側の 428C9 は多層防御で、SQL からは到達しない
+- SEQUENCE 定義 blob の `AS smallint/integer` 型タグ（bigint 固定のまま。列型の範囲は作成時に検査する）
+- information_schema・`pg_get_serial_sequence`・`attidentity` 相当の表示
