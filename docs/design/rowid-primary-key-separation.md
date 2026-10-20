@@ -258,3 +258,35 @@ SQL-17・SQL-18・SQL-20・SQL-32）。契約の詳細は spec を正とし、�
 - **対象外**: 既存表の `id` の通常列への移行（#2200）・移行後の採番（#1696）・NoSQL の単一行アドレスと scan（#2201）・Rust API の
   行 API／検索 API の採番方式対応（#2197 の残り）・PK の値による同点順序・採番方式の表を基表とするビューの単一行形
   （`id` を宣言した基表は述語形へ戻る）・`INSERT` の列リスト省略形。
+
+## 12. Issue #2200 実装記録（既存表の移行済みの印と一方向移行）
+
+- **ポインタ**: TABLE-23（関連: TABLE-12・TABLE-16・RECOVER-10〜12・RLS-9・RLS-10・WIRE-13）。D10 が #2200 に割り当てた
+  既存 DB の移行と運用文書化を実装した。
+- **方式**: 移行は**カタログだけの変更**で、行・物理キー・索引・台帳は書き換えない。従来方式の表は `id` を行の値に持たず
+  キーから復元するため、行の値を書き換えずに `id` を通常列へ移すと既存行がデコードできなくなる。そこで移行後も `id` は
+  rowid の別名のまま（不変条件 rowid == `id`）とし、DML・検索・NoSQL・Rust API は従来方式と同じ経路を通す。このため
+  `WHERE id = n`・`ON CONFLICT (id)` などの既存クエリの結果は構造上変わらない。
+- **永続する印**: 行識別方式の第 3 の変種 `RowIdentity::MigratedId` を追加し、カタログ v15 の既存の `rowmode:` 行へ
+  `rowmode:migrated` として書く（新しい版は作らない。`FK_BEARING_FORMAT_VERSIONS`・未知 mode の `CorruptSchema` はそのまま）。
+  `has_pseudo_id`・`require_legacy_row_identity` は移行済みも従来方式として扱い、`is_allocated` は偽のまま。`rowmode:legacy`
+  は従来どおり不正値。行 API・走査の読み取りゲート（v15 の先頭行判定）は `rowmode:migrated` を通す。
+- **`id` の役割**: `TableSchema::migrated_id_role()` が宣言 PRIMARY KEY の有無から導出する（なし → `PrimaryKey`、`id` 以外の
+  PK あり → `Unique`）。カタログに別の行は持たない。後続 #1698 以降の IDENTITY 化がこの印で対象を判定する。
+- **ドライバ**: `catalog/legacy_id_migration.rs`。`Storage::open_with_durability` の末尾（一時表用の `open_with_backend` は
+  対象外）で、読み取り txn が従来方式の候補（デコードできる表のみ）を辞書順に集め、候補が無ければ write txn を開かない。
+  候補ごとに 1 つの write txn で、スキーマを再取得して従来方式のままかを再確認し、v15 で書き直して commit する。途中で
+  クラッシュしても各表は移行済みか未移行のどちらかで、次回の open が残りを移す。壊れたカタログ項目は移行せず残し
+  （アクセス時は従来どおり `CorruptSchema`）、redb の I/O エラーは open を失敗させる。エラー文面は固定文言。
+- **作成経路は据え置き**: NoSQL・Rust API の `create_table` は従来方式のまま作り、次に開いたときに移行される（従来方式の
+  カタログのバイト列 golden と #2201 前の契約を保つため）。
+- **値域・型**: `id` の値域は u64、wire の型 OID は 1700 のまま（`BIGINT` へ狭めると OID と `i64::MAX` 超の既存 `id` の
+  扱いが変わるため行わない）。
+- **互換性**: 旧バイナリは `rowmode:migrated` を `CorruptSchema` で拒否する（fail-closed の一方向移行）。戻す場合は
+  移行前のバックアップを使う（README「既存データディレクトリの `id` 移行とバックアップ」）。
+- **テスト**: `catalog/legacy_id_migration.rs` の単体テスト（収束・冪等・故障注入〔commit 後の中断／未 commit の破棄〕・
+  壊れた項目・採番方式の据え置き・ALTER 後の印の維持・v15 往復）、`tests/table23_legacy_id_migration.rs`（開き直し前後の
+  クエリ結果・エラーコード・テナント境界の一致）。
+- **対象外**: 移行後の `id` の採番（#1696・#1698〜#1700）・移行した表での rowid 採番器の使用・`UPDATE ... SET id`／ALTER の
+  `id` 操作（従来どおり `42601`）・NoSQL の単一行アドレスと scan（#2201）・crash-test スクリプトへの移行シナリオ追加と
+  旧形式フィクスチャの網羅（#2202）・採番方式の親への `id` 参照 FK（移行の対象外のため未起票の後続 Issue で追跡）。
