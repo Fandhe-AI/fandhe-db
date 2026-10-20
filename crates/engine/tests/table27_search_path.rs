@@ -116,6 +116,16 @@ fn default_value_and_set_show_reset_roundtrip() {
 }
 
 #[test]
+fn set_search_path_values_are_not_scanned_as_relations() {
+    let (core, _g) = new_core("sp-set-values");
+    let mut s = ddl_session();
+    ok(&core, &mut s, "SET search_path = nosuch");
+    // 設定値の `truncate` を TRUNCATE 文と誤解釈せず、`public` を表参照として拒否しない。
+    ok(&core, &mut s, "SET search_path TO truncate, public");
+    assert_eq!(show(&core, &mut s), "truncate, public");
+}
+
+#[test]
 fn invalid_values_fail_closed_without_changing_the_value() {
     let (core, _g) = new_core("sp-invalid");
     let mut s = ddl_session();

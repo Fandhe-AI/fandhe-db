@@ -370,6 +370,14 @@ pub(crate) fn check_unqualified_refs(
     if is_ddl_head(tokens) && !session.ddl_allowed() {
         return Ok(());
     }
+    // `SET`／`RESET`／`SHOW` は関係を参照しない。設定値（例 `truncate`）を文種と誤解釈して
+    // 関係名として走査すると、同じ設定が現在の path 次第で拒否されるため走査対象から除く。
+    if matches!(
+        tokens.first(),
+        Some(Token::Ident(w)) if ["SET", "RESET", "SHOW"].iter().any(|k| w.eq_ignore_ascii_case(k))
+    ) {
+        return Ok(());
+    }
     let temp = session.temp_tables();
     for r in unqualified_relation_refs(tokens, skip) {
         // 索引名は一時表名の集合ではなく一時 DB の索引カタログで照会する（一時表の索引に対する
