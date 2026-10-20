@@ -315,3 +315,16 @@ id = n`〕ではなく `filter` 相当・SQL 表層は `WHERE <述語>`）は、
   RLS-9 応答バイト同一性・`filter` のみの `0A000`・`explain: true` 拒否）
 - `crates/wire-server/tests/nosql9_op_allowlist.rs`・`nosql1_op_vocabulary.rs`:
   既存の placeholder 前提テストを実行到達テストへ更新
+
+## Issue #2201: `where` の行アドレスを PRIMARY KEY 基準へ拡張
+
+TABLE-23・NOSQL-23 のポインタ。`where` は任意キーのオブジェクトとして受け、解決規則は次のとおり
+（実装は `crates/wire-server/src/http/query/dml_target.rs`、決定の経緯は
+[rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §13）。
+
+- スキーマ非依存の検査（空・キー数上限・列名の識別子形状）は表の解決より先に行い、すべて `42601`。
+- 疑似列 `id` を持つ表で `{"id"}` のみ → 従来の単一行形（小数 `22000`・負数 `42601`）。
+- それ以外で PRIMARY KEY の列集合と完全一致 → PK 宣言順の等価述語（`filter` の `eq` と同じ束縛器）で述語形へ。
+  SQL 表層の述語形と同じ `WherePredicate` になるため `content_hash`・台帳キー空間が一致する。
+- PK なし表・キーの過不足・未知列・`null` 値 → 固定文言の `42601`（engine の書き込みへ到達しない）。
+- 事前判定と束縛時スナップショットの食い違い（並行 DDL）は fail-closed で拒否する。

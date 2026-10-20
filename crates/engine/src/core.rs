@@ -2795,8 +2795,8 @@ impl EngineCore {
     }
 
     /// `table` が採番方式（暗黙の `id` を持たない。TABLE-23・Issue #2199）の表かを返す。NoSQL 表層が
-    /// 行の単一アドレスに `id` を前提とするため、該当する表への要求を実行前に `0A000` で拒否する判定に
-    /// 使う（後続 Issue #2201 が NoSQL 側の対応を入れるまでの fail-closed な安全弁）。表が無い・スキーマを
+    /// 該当する表への `aggregate`／`search` を実行前に `0A000` で拒否する判定と、`update`／`delete` の
+    /// 経路選択（疑似列 `id` の単一行形か PRIMARY KEY の述語形か。Issue #2201）に使う。表が無い・スキーマを
     /// 読めない場合は `false`（通常の実行経路が未定義表・内部エラーとして分類する。存在の有無を
     /// この判定の応答に出さない）。
     pub fn table_uses_allocated_row_identity(&self, table: &str) -> bool {
