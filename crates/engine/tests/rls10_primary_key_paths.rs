@@ -863,6 +863,132 @@ fn t7_autocommit_and_explicit_txn_agree() {
     assert_eq!(compared, 3 * 2 * shapes().len());
 }
 
+/// 事後状態ダンプから表 `table` の行（`table:[...]` の 1 行）を取り出す。
+fn state_line<'a>(state: &'a str, table: &str) -> &'a str {
+    let head = format!("{table}:");
+    state
+        .lines()
+        .find(|l| l.starts_with(&head))
+        .unwrap_or_else(|| panic!("table {table} not in state"))
+}
+
+/// 事後状態の検査（事後状態, 閲覧テナント名）→ 違反内容。
+type StateCheck = fn(&str, &str) -> Vec<String>;
+
+/// T8 書き込み後の自テナント状態の独立オラクル: baseline との相互比較に頼らず、形状ごとに期待する
+/// セル値・行の増減を固定する（採番方式 FK の CASCADE／SET NULL が両経路で未実行でも通過する
+/// ことを防ぐ）。Private 込みモードを対象に、全閲覧側・両実行経路・baseline／flooded で検査する。
+#[test]
+fn t8_own_state_after_write_meets_independent_oracle() {
+    let checks: Vec<(&str, StateCheck)> = vec![
+        // ON DELETE CASCADE の子は消え、SET NULL の子は残って参照キーだけが NULL になる。
+        ("fk_cascade_and_set_null_own_children_only", |st, v| {
+            let mut bad = Vec::new();
+            let p = state_line(st, "parents");
+            if p.contains(&format!("tok-{v}-p2")) || !p.contains(&format!("tok-{v}-p1")) {
+                bad.push(format!("parents: {p}"));
+            }
+            let c = state_line(st, "children_c");
+            if c != "children_c:[]" {
+                bad.push(format!("children_c must be empty (CASCADE): {c}"));
+            }
+            let s = state_line(st, "children_s");
+            if !s.contains(&format!("tok-{v}-cs")) || s.contains("p2") || !s.contains("Null") {
+                bad.push(format!("children_s must keep the row with NULL key: {s}"));
+            }
+            let k = state_line(st, "children");
+            if !k.contains(&format!("tok-{v}-c1")) {
+                bad.push(format!("children must be untouched: {k}"));
+            }
+            bad
+        }),
+        // 参照されている親の削除は拒否され、親も子も残る。
+        ("fk_delete_referenced_parent", |st, v| {
+            let mut bad = Vec::new();
+            let p = state_line(st, "parents");
+            if !p.contains(&format!("tok-{v}-p1")) || !p.contains(&format!("tok-{v}-p2")) {
+                bad.push(format!("parents must be intact: {p}"));
+            }
+            let k = state_line(st, "children");
+            if !k.contains(&format!("tok-{v}-c1")) {
+                bad.push(format!("children must be intact: {k}"));
+            }
+            bad
+        }),
+        // 点削除で k1 だけが消える。
+        ("delete_pk_point_own", |st, v| {
+            let l = state_line(st, "pk_text");
+            if l.contains(&format!("tok-{v}-k1")) || !l.contains(&format!("tok-{v}-k2")) {
+                vec![format!("pk_text: {l}")]
+            } else {
+                vec![]
+            }
+        }),
+        ("delete_nopk_pred_own", |st, v| {
+            let l = state_line(st, "nopk");
+            if l.contains(&format!("tok-{v}-n1")) || !l.contains(&format!("tok-{v}-n2")) {
+                vec![format!("nopk: {l}")]
+            } else {
+                vec![]
+            }
+        }),
+        // UPSERT の更新は n だけを変え、body は据え置く。
+        ("upsert_pk_update_own", |st, v| {
+            let l = state_line(st, "pk_text");
+            if !l.contains("50") || !l.contains(&format!("tok-{v}-k1")) || l.contains("new") {
+                vec![format!("pk_text: {l}")]
+            } else {
+                vec![]
+            }
+        }),
+        // 他テナントが持つ値への PK 値変更は、自テナント内の衝突ではないため受理される。
+        ("update_pk_value_to_other_held", |st, v| {
+            let l = state_line(st, "pk_text");
+            if !l.contains("only-other") || !l.contains(&format!("tok-{v}-k1")) {
+                vec![format!("pk_text: {l}")]
+            } else {
+                vec![]
+            }
+        }),
+        // 自テナント内の衝突は拒否され、状態は変わらない。
+        ("update_pk_value_to_own_existing", |st, v| {
+            let l = state_line(st, "pk_text");
+            if !l.contains(&format!("tok-{v}-k1")) || !l.contains(&format!("tok-{v}-k2")) {
+                vec![format!("pk_text: {l}")]
+            } else {
+                vec![]
+            }
+        }),
+        // 他テナントだけが持つキーへの INSERT は自テナントの新規行になる。
+        ("insert_pk_other_held_is_accepted", |st, _v| {
+            let l = state_line(st, "pk_text");
+            if l.contains("only-other") && l.contains("mine") {
+                vec![]
+            } else {
+                vec![format!("pk_text: {l}")]
+            }
+        }),
+    ];
+    let mut checked = 0;
+    for (name, check) in &checks {
+        let runs: Vec<&Run> = report()
+            .iter()
+            .filter(|r| r.shape == *name && r.allow_private)
+            .collect();
+        assert_eq!(runs.len(), 3 * 2, "shape {name}");
+        for r in runs {
+            for (kind, st) in [
+                ("baseline", &r.base_own_after),
+                ("flooded", &r.flood_own_after),
+            ] {
+                let bad = check(st, r.viewer);
+                assert!(bad.is_empty(), "{} ({kind}): {bad:?}", label(r));
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, checks.len() * 3 * 2 * 2);
+}
 /// 移行済みの表と採番方式の表の両方で、宣言キーを参照する FK が他テナントの親を見つけない。
 /// （採番方式の子表が、移行済みの表の宣言 PK を参照する形も含む。）
 #[test]
