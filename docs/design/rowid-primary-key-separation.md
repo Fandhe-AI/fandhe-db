@@ -173,3 +173,16 @@ ADR §3 の D1・D2・D3 と、§4「表のライフサイクル」の項、D8 �
 
 未移行モジュール（`constraint.rs`・`key_index.rs`・`column_rewrite.rs`・`sql/*`・`arena.rs`・`rls.rs`・`recovery/ledger.rs`
 等）は `user_rows` のキーの `u64` を従来どおり直接扱う。これらは担当 sub-issue（#2194〜#2196）が `RowId` へ移す。
+
+## 8. Issue #2195 実装記録（第 2 段: 検索系の行参照）
+
+挙動不変の型レベル移行。契約本文は spec のポインタ（TABLE-23・SEARCH-1・SQL-4）を正とし、ここには書かない。
+
+- 境界関数: `storage::rowid::hit_id_for_response(RowId) -> u64`。検索結果・集計の応答 `id` へ rowid を詰める**唯一の地点**。現状は `legacy_id()` へ委譲し、#2197 が主キー列値を返す実装へ差し替える。
+- 同点順序（D9）: 新設 `search_order`（crate 内部）に `TieKey`・`tie_key_for`・`cmp_score_desc_then_tie` を置いた。kernel の Top-k ヒープと結果整列がこれを経由する。従来方式の表では順序キー＝rowid の生値で、移行前と順序は完全に一致する。他モジュール（HNSW・GPU バッチ・疎索引・hybrid／RRF・rerank・parallel_search）の同点比較の集約は未着手（後続）。
+- arena: 格納は `Vec<u64>` のまま（方針 A）。`push_row` は `RowId` を受け、`row_id(slot)`／`row_ids()`（crate 内部）を追加した。公開 `ids()` は互換ビューとして残す（撤去は #2197。`scalar_index.rs`・`expression_key_index.rs`〔#2194〕と wire-server の bench が使うため）。方針 B（`Vec<RowId>` 化）は同時に壊れる範囲が広いため採らない。
+- 結果 → 行解決: `core.rs`（`resolve_slot_hits`）・`batch_search.rs`・`sql/exec.rs`（投影・WHERE 式評価）・`sql/hnsw_cache.rs`（ノード写像）・`sql/aggregate.rs`／`sql/group_by.rs` の `id` 取得は `arena.row_id(slot)` を通す。
+- ゲート: 採番方式の表は kNN SQL・EXPLAIN 付き kNN・Rust API の `search` が拒否されることを `catalog/rowid_gate_tests.rs` で固定した。
+- 永続化: 検索系の構造はいずれもメモリ上のみで、オンディスク形式・カタログ版の変更はない。
+- 回帰ガード: `tests/table23_search_rowid.rs`（同点を含む kNN の `id` 昇順）。`cargo test --workspace` は全件通過（12414 件）。
+- 未検証: Recall 層 B の再計測（閾値は非公開環境変数が必要なためオーナーが `recall.yml` で再計測）・GPU 実機の同一性。

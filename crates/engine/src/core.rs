@@ -60,6 +60,7 @@ use crate::policy::{PolicyContext, PolicyError};
 use crate::recovery::required_op_id::{LedgerMode, OperationId};
 use crate::rls::{ImplicitRlsHook, PrefilterSnapshot, RlsError};
 use crate::search_engine;
+use crate::storage::rowid::hit_id_for_response;
 use crate::storage::{Row, Storage, StorageError};
 use redb::ReadableDatabase;
 
@@ -220,7 +221,7 @@ pub(crate) fn provider_result_is_valid(
 /// ヒットの行解決の双方が曖昧にならない（`sql/exec.rs` も同じ方式）。
 /// 確保はフォールブル（`try_reserve_exact`）で行う（coding-rust.md「無制限確保禁止」）。
 pub(crate) fn slot_ids_for(arena: &VectorArena) -> Result<Vec<u64>, ArenaError> {
-    let len = arena.ids().len();
+    let len = arena.row_ids().len();
     let mut slot_ids: Vec<u64> = Vec::new();
     slot_ids
         .try_reserve_exact(len)
@@ -249,7 +250,8 @@ pub(crate) fn resolve_slot_hits(
     for hit in candidates {
         let slot = usize::try_from(hit.id).ok()?;
         let tenant = arena.tenant_id(slot)?;
-        let id = *arena.ids().get(slot)?;
+        // 応答 `id` は rowid → 境界関数 1 箇所を通す（Issue #2195・ADR D8）。
+        let id = hit_id_for_response(arena.row_id(slot)?);
         out.push(SearchHit::new(tenant, id, hit.score));
     }
     Some(out)

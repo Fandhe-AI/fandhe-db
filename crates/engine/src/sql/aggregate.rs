@@ -53,6 +53,7 @@ use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::StackValue;
 use crate::sql::parser::{AggregateInput, BoundAggregate};
 use crate::sql::udf_call::{self, BoundExpr, ExprValue};
+use crate::storage::rowid::hit_id_for_response;
 use crate::storage::{self, StorageError};
 use redb::ReadableTable;
 
@@ -3293,10 +3294,13 @@ pub(crate) fn observe_candidate_slots(
     'candidates: for &slot in slots {
         let slot_idx = usize::try_from(slot)
             .map_err(|_| accumulator_bug("candidate slot does not fit in usize"))?;
-        let &id = arena
-            .ids()
-            .get(slot_idx)
-            .ok_or_else(|| accumulator_bug("candidate slot out of bounds (ids)"))?;
+        // 集計 `id` 値は rowid → 応答境界（従来方式の表の `id` 列値）を明示的に通す
+        // （Issue #2195・ADR D8）。
+        let id = hit_id_for_response(
+            arena
+                .row_id(slot_idx)
+                .ok_or_else(|| accumulator_bug("candidate slot out of bounds (ids)"))?,
+        );
         let metadata = snapshot
             .metadata()
             .get(slot_idx)
