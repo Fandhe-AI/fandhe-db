@@ -13,7 +13,7 @@
 //! `operation_id` を取り出し、[`map_set_assignments`]（純関数・engine 非依存。
 //! JSON `set` を `engine::sql::allowlist::InsertLiteral` 列へ写像する）と
 //! [`super::dml_target::bind_target_form`]（`where`／`filter` の排他判定。
-//! 単一行形は [`super::dml_target::TargetForm::RowId`]、述語形は
+//! 単一行形は [`super::dml_target::TargetForm::RowAddress`]、述語形は
 //! [`super::dml_target::TargetForm::Predicate`]）で束縛したうえで、
 //! [`execute`] が単一行形は
 //! `engine::core::EngineCore::execute_bound_update_in_session`
@@ -94,7 +94,7 @@ use crate::http::error_body::escape_json_string_into;
 use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
 
-use super::dml_target::{bind_target_form, DmlTargetError, TargetForm};
+use super::dml_target::{self, bind_target_form, DmlTargetError, TargetForm};
 use super::filter;
 use super::ident::{self, InvalidIdentifier};
 use super::partitioned::{self, PartitionedRequestError};
@@ -317,33 +317,56 @@ pub fn execute(
     };
 
     let outcome: UpdateOutcome = match target {
-        TargetForm::RowId(id) => core.execute_bound_update_in_session(
-            principal.policy_context(),
-            table,
-            operation_id.as_ref(),
-            |schema| {
-                super::gate::reject_allocated_schema(schema)?;
-                // NoSQL 表層の SET 値は常に平易なリテラル（式は SQL 表層のみ。
-                // Issue #1544 で `ValidatedUpdate::assignments` が `SetValue` になったため包む）。
-                let assignments = map_set_assignments_for_engine(set, schema)?
-                    .into_iter()
-                    .map(|(name, literal)| (name, SetValue::Literal(literal)))
-                    .collect();
-                let stmt = ValidatedUpdate {
-                    table_name: table.to_string(),
-                    assignments,
-                    id_literal: id.to_string(),
-                    operation_id: operation_id.clone(),
-                    // NoSQL 表層 `op: update` は `RETURNING` を公開しない
-                    // （Issue #876 のスコープ外。SQL 表層の `RETURNING`
-                    // 実行結線は Issue #873・SQL-21 が別途担当し、
-                    // `ValidatedUpdate::returning` を `Some` にする経路は
-                    // ここには無い）。
-                    returning: None,
-                };
-                bind_update(&stmt, schema)
-            },
-        )?,
+        // 単一行アドレス（`where`。Issue #2201）: 疑似列 `id` を持つ表で `{"id"}` のみなら従来の
+        // 単一行形、それ以外（採番方式の表・PRIMARY KEY 形）は PK の等価述語で述語形へ流す。
+        // 経路は事前判定（`table_uses_allocated_row_identity`）で選び、束縛時スナップショットと
+        // 食い違えば（並行 DDL）各経路の束縛 closure が fail-closed で拒否する。
+        TargetForm::RowAddress(address)
+            if dml_target::is_id_address(address)
+                && !core.table_uses_allocated_row_identity(table) =>
+        {
+            let id = dml_target::row_id_from_address(address)?;
+            core.execute_bound_update_in_session(
+                principal.policy_context(),
+                table,
+                operation_id.as_ref(),
+                |schema| {
+                    super::gate::reject_allocated_schema(schema)?;
+                    // NoSQL 表層の SET 値は常に平易なリテラル（式は SQL 表層のみ。
+                    // Issue #1544 で `ValidatedUpdate::assignments` が `SetValue` になったため包む）。
+                    let assignments = map_set_assignments_for_engine(set, schema)?
+                        .into_iter()
+                        .map(|(name, literal)| (name, SetValue::Literal(literal)))
+                        .collect();
+                    let stmt = ValidatedUpdate {
+                        table_name: table.to_string(),
+                        assignments,
+                        id_literal: id.to_string(),
+                        operation_id: operation_id.clone(),
+                        // NoSQL 表層 `op: update` は `RETURNING` を公開しない
+                        // （Issue #876 のスコープ外。SQL 表層の `RETURNING`
+                        // 実行結線は Issue #873・SQL-21 が別途担当し、
+                        // `ValidatedUpdate::returning` を `Some` にする経路は
+                        // ここには無い）。
+                        returning: None,
+                    };
+                    bind_update(&stmt, schema)
+                },
+            )?
+        }
+        TargetForm::RowAddress(address) => {
+            let bind = |schema: &TableSchema| {
+                let predicates = dml_target::bind_primary_key_predicates(address, schema)?;
+                let assignments = map_set_assignments_for_engine(set, schema)?;
+                Ok((assignments, predicates))
+            };
+            core.execute_bound_predicate_update_in_session(
+                principal.policy_context(),
+                table,
+                operation_id.as_ref(),
+                bind,
+            )?
+        }
         // 述語形（`filter`。TASK-186・NOSQL-12、Issue #1062）: SET 束縛は
         // 単一行形と同一（`map_set_assignments_for_engine`）を共有し、
         // `WHERE` 述語列は `filter::bind_filter_where_predicates`
@@ -354,7 +377,6 @@ pub fn execute(
         // 第 2 の実行器は作らない。
         TargetForm::Predicate(items) => {
             let bind = |schema: &TableSchema| {
-                super::gate::reject_allocated_schema(schema)?;
                 let assignments = map_set_assignments_for_engine(set, schema)?;
                 let predicates = filter::bind_filter_where_predicates(items, schema)
                     .map_err(filter::FilterError::into_sql_surface_error)?;
