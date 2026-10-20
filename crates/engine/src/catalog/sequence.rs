@@ -31,6 +31,11 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 
 mod migrated_identity;
 
+// #2200 の移行 txn（`catalog::legacy_id_migration`）が呼ぶ入口を親モジュールへ公開する。
+// 結線までは未使用のため unused_imports を許容する。
+#[allow(unused_imports)]
+pub(crate) use migrated_identity::{assign_migrated_id_identity_in_txn, MigratedIdIdentityOutcome};
+
 use crate::storage::read_source::ReadSource;
 
 use super::{
