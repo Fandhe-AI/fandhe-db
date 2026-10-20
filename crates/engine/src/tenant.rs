@@ -1032,7 +1032,7 @@ pub(crate) fn insert_row_unchecked(
             table,
             &schema,
             ctx.tenant_id(),
-            &[id],
+            &[RowId::from_legacy_id(id)],
             target.fk_check_mode(),
         )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
@@ -1214,7 +1214,10 @@ pub(crate) fn insert_rows_unchecked(
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
         // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
         // ドキュメント参照）。
-        let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<RowId> = rows
+            .iter()
+            .map(|(id, _)| RowId::from_legacy_id(*id))
+            .collect();
         crate::constraint::enforce_row_constraints_in_txn(
             write_txn,
             table,
@@ -1803,7 +1806,7 @@ pub(crate) fn insert_typed_row_unchecked(
             table,
             &schema,
             ctx.tenant_id(),
-            &[id],
+            &[RowId::from_legacy_id(id)],
             target.fk_check_mode(),
         )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
@@ -2018,7 +2021,10 @@ pub(crate) fn insert_typed_rows_unchecked(
         // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
         // ドキュメント参照）。
         {
-            let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+            let ids: Vec<RowId> = rows
+                .iter()
+                .map(|(id, _)| RowId::from_legacy_id(*id))
+                .collect();
             let schema_for_pk = require_table_schema_write(write_txn, table)?;
             crate::constraint::enforce_row_constraints_in_txn(
                 write_txn,
@@ -2461,7 +2467,7 @@ fn upsert_typed_rows_impl(
             // 作る（`docs/design/sql-upsert.md`「衝突判定スコープ」節。可視性を
             // 問わない全行が母集合。`row_table` はまだ本文で 1 行も書き込んでいない
             // ためこの時点のスキャンが「この文の書き込みより前」の状態と一致する）。
-            let unique_existing: Option<std::collections::HashMap<Vec<u8>, u64>> = match target {
+            let unique_existing: Option<std::collections::HashMap<Vec<u8>, RowId>> = match target {
                 UpsertTarget::RowId => None,
                 UpsertTarget::Unique(indices) => {
                     let (mut existing, corrupt_ids) =
@@ -2505,7 +2511,12 @@ fn upsert_typed_rows_impl(
                                 TenantWriteError::Catalog(CatalogError::Invalid(m.to_string()))
                             })?
                             .and_then(|key| {
-                                unique_existing.as_ref().and_then(|m| m.get(&key).copied())
+                                // 衝突先の行参照は rowid。行の読み書き API が未移行の間は、
+                                // 従来方式の `id` へ出口で変換する（#2197 が rowid 受けへ移す）。
+                                unique_existing
+                                    .as_ref()
+                                    .and_then(|m| m.get(&key).copied())
+                                    .map(RowId::legacy_id)
                             })
                     }
                 };
@@ -2613,7 +2624,8 @@ fn upsert_typed_rows_impl(
                             if schema.primary_key().is_some()
                                 || !schema.unique_constraints().is_empty()
                             {
-                                pre_images.record(write_id, merged_values.clone());
+                                pre_images
+                                    .record(RowId::from_legacy_id(write_id), merged_values.clone());
                             }
                             let mut embedding_value: Vec<f32> = existing.embedding.clone();
 
@@ -2772,12 +2784,16 @@ fn upsert_typed_rows_impl(
             // 切って再オープンする）。
             if !written_ids.is_empty() {
                 drop(row_table);
+                let written_rowids: Vec<RowId> = written_ids
+                    .iter()
+                    .map(|&id| RowId::from_legacy_id(id))
+                    .collect();
                 let delta = crate::constraint::enforce_row_constraints_in_txn(
                     write_txn,
                     table,
                     &schema,
                     ctx.tenant_id(),
-                    &written_ids,
+                    &written_rowids,
                     write_target.fk_check_mode(),
                 )?;
                 // `DO UPDATE` で既存行を更新した場合、このテーブルを参照先とする
@@ -2935,7 +2951,7 @@ pub(crate) fn update_row_unchecked(
                                     &schema,
                                     &existing.metadata,
                                 ) {
-                                    pre_images.record(id, old_values);
+                                    pre_images.record(RowId::from_legacy_id(id), old_values);
                                 }
                             }
                         }
@@ -2963,7 +2979,7 @@ pub(crate) fn update_row_unchecked(
                 table,
                 &schema_for_pk,
                 ctx.tenant_id(),
-                &[id],
+                &[RowId::from_legacy_id(id)],
                 target.fk_check_mode(),
             )?;
             // 全列置換は参照先キー（主キー・UNIQUE 構成列）を変え得るため、このテーブルを
@@ -4020,7 +4036,7 @@ pub(crate) fn update_row_columns_capturing_unchecked(
                         if let Ok(old_values) =
                             crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
                         {
-                            pre_images.record(id, old_values);
+                            pre_images.record(RowId::from_legacy_id(id), old_values);
                         }
                     }
                     let (embedding, metadata) =
@@ -4064,7 +4080,7 @@ pub(crate) fn update_row_columns_capturing_unchecked(
                     table,
                     &schema,
                     ctx.tenant_id(),
-                    &[id],
+                    &[RowId::from_legacy_id(id)],
                     target.fk_check_mode(),
                 )?;
                 // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・
@@ -4455,7 +4471,7 @@ fn delete_row_impl(
                             }
                         }
                         if needs_fk_removed_pre_image {
-                            removed_pre_images.record(id, values.clone());
+                            removed_pre_images.record(RowId::from_legacy_id(id), values.clone());
                         }
                         if capture.is_some() {
                             captured_row = Some(CapturedRow {
@@ -4490,7 +4506,7 @@ fn delete_row_impl(
                 table,
                 &schema,
                 ctx.tenant_id(),
-                std::slice::from_ref(&id),
+                &[RowId::from_legacy_id(id)],
             )?;
         }
         // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の
@@ -4503,7 +4519,9 @@ fn delete_row_impl(
                 table,
                 &schema,
                 ctx.tenant_id(),
-                crate::constraint::ReferencedRowsChange::Removed { ids: &[id] },
+                crate::constraint::ReferencedRowsChange::Removed {
+                    ids: &[RowId::from_legacy_id(id)],
+                },
                 needs_fk_removed_pre_image.then_some(&removed_pre_images),
                 target.fk_check_mode(),
             )?;
@@ -5262,7 +5280,7 @@ fn apply_predicate_delete_in_txn<E>(
                     let values = captured_values_from_parts(schema, row.embedding, &row.metadata)
                         .map_err(dml_write_err)?;
                     if needs_fk_removed_pre_image {
-                        removed_pre_images.record(*id, values.clone());
+                        removed_pre_images.record(RowId::from_legacy_id(*id), values.clone());
                     }
                     // `RETURNING`（Issue #1182）: 削除前の値。`remove` 済みだが
                     // `write_txn` 未 commit のため、`Err` は abort で行ごと巻き戻る。
@@ -5283,6 +5301,11 @@ fn apply_predicate_delete_in_txn<E>(
 
     // 以降の制約・索引・FK 処理は実際に適用した id に限る。
     let candidate_ids = candidate_ids.get(..applied).unwrap_or(candidate_ids);
+    // 以降の制約・索引・FK 処理は rowid で受ける（従来方式の表では `id` と同値。Issue #2194）。
+    let candidate_rowids: Vec<RowId> = candidate_ids
+        .iter()
+        .map(|&id| RowId::from_legacy_id(id))
+        .collect();
 
     // 永続一意索引（TABLE-16・TASK-204、Issue #1070）の後片付け。
     // `row_table`（`mut`）の可変ハンドルは上のブロック終端で既に解放済み。
@@ -5292,7 +5315,7 @@ fn apply_predicate_delete_in_txn<E>(
             table,
             schema,
             ctx.tenant_id(),
-            candidate_ids,
+            &candidate_rowids,
         )
         .map_err(dml_write_err)?;
     }
@@ -5306,7 +5329,9 @@ fn apply_predicate_delete_in_txn<E>(
             table,
             schema,
             ctx.tenant_id(),
-            crate::constraint::ReferencedRowsChange::Removed { ids: candidate_ids },
+            crate::constraint::ReferencedRowsChange::Removed {
+                ids: &candidate_rowids,
+            },
             needs_fk_removed_pre_image.then_some(&removed_pre_images),
             fk_mode,
         )
@@ -5379,7 +5404,7 @@ fn apply_predicate_update_in_txn<E>(
                 if let Ok(old_values) =
                     crate::row_codec::decode_scalar_columns(schema, &existing.metadata)
                 {
-                    pre_images.record(*id, old_values);
+                    pre_images.record(RowId::from_legacy_id(*id), old_values);
                 }
             }
 
@@ -5420,6 +5445,11 @@ fn apply_predicate_update_in_txn<E>(
 
     // 以降の制約・索引・FK 処理は実際に適用した id に限る。
     let candidate_ids = candidate_ids.get(..applied).unwrap_or(candidate_ids);
+    // 以降の制約・索引・FK 処理は rowid で受ける（従来方式の表では `id` と同値。Issue #2194）。
+    let candidate_rowids: Vec<RowId> = candidate_ids
+        .iter()
+        .map(|&id| RowId::from_legacy_id(id))
+        .collect();
 
     // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査。
     // 一致行が 0 件（何も書き込んでいない）場合は呼ばない（`constraint.rs`
@@ -5430,7 +5460,7 @@ fn apply_predicate_update_in_txn<E>(
             table,
             schema,
             ctx.tenant_id(),
-            candidate_ids,
+            &candidate_rowids,
             fk_mode,
         )
         .map_err(dml_write_err)?;
@@ -5744,7 +5774,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
         // `ReplaceOutcome`（公開 API）に id 一覧を持たせずに済ませるため、クロージャの
         // 外側でこの `Vec` を用意し、クロージャ内から書き込む（Issue #1071: 参照先側
         // FK 検査〔`ReferencedRowsChange::Removed`〕が索引の同期に必要とする）。
-        let mut removed_ids: Vec<u64> = Vec::new();
+        let mut removed_ids: Vec<RowId> = Vec::new();
         let outcome: Result<ReplaceOutcome, TenantWriteError> = (|| {
             let schema = require_table_schema_write(write_txn, table)?;
             let vector_idx = schema
@@ -5919,6 +5949,10 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 || crate::catalog::referencing_foreign_keys_in_txn(write_txn, table)?
                     .iter()
                     .any(|(_, fk)| fk.references_parent_id());
+            let to_remove_rowids: Vec<RowId> = to_remove
+                .iter()
+                .map(|&id| RowId::from_legacy_id(id))
+                .collect();
             for id in &to_remove {
                 let removed_guard = row_table
                     .remove(&(tenant, *id))
@@ -5939,7 +5973,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
                                         "removed row decode failed: {e}"
                                     ))
                                 })?;
-                        removed_pre_images.record(*id, values);
+                        removed_pre_images.record(RowId::from_legacy_id(*id), values);
                     }
                 }
             }
@@ -5949,7 +5983,11 @@ pub(crate) fn replace_typed_rows_by_text_key(
             // 新行の挿入に使うため開いたままだが、索引テーブルは別名のため
             // `TableAlreadyOpen` にならない）。
             crate::constraint::forget_unique_index_rows_in_txn(
-                write_txn, table, &schema, tenant, &to_remove,
+                write_txn,
+                table,
+                &schema,
+                tenant,
+                &to_remove_rowids,
             )?;
 
             // clear 再利用の 1 面スクラッチ（Issue #398）: 行ごとの `encode_row`
@@ -6009,7 +6047,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 })?;
             }
 
-            removed_ids = to_remove.clone();
+            removed_ids = to_remove_rowids.clone();
             Ok(ReplaceOutcome {
                 removed,
                 inserted,
@@ -6033,8 +6071,9 @@ pub(crate) fn replace_typed_rows_by_text_key(
         // 行をそのまま読める）。
         if outcome.inserted > 0 {
             if let Some(first_id) = outcome.first_id {
-                let ids: Vec<u64> = (0..outcome.inserted as u64)
+                let ids: Vec<RowId> = (0..outcome.inserted as u64)
                     .filter_map(|offset| first_id.checked_add(offset))
+                    .map(RowId::from_legacy_id)
                     .collect();
                 let schema_for_pk = require_table_schema_write(write_txn, table)?;
                 crate::constraint::enforce_row_constraints_in_txn(

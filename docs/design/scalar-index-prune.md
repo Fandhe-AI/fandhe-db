@@ -527,3 +527,5 @@ TEXT／BYTEA と同じ既知の乖離で結果の正しさには影響しない�
 ## Issue #1580: INTERVAL 列の二次索引
 
 `INTERVAL` 列は正規化比較キー（`datetime::interval_cmp_key`。1 か月 = 30 日、1 日 = 24 時間を i128 で換算）を `OrderedColumnIndex::Interval(Vec<(i128, u32)>)` へ構築する（レーン B）。`OrderedColumnIndex::I128` は NUMERIC 専用（列 scale を持つ）のため流用せず、`(I128, Numeric)` の照会腕が INTERVAL 列から到達しないようにした。`2^53` 縮退は i128 キーには不要で、番兵（`±infinity`）だけを防御的に「索引対象外」へ縮退する。照会は `TypedLiteral::Interval`（束縛時にキー化済み）を `Included`／`Excluded` の境界へ写す。評価側（`FilterOp::eval`）も同じキーで比べるため、索引経路・信頼マスク・全走査の結果が一致する。`CREATE INDEX` の宣言対象にも含める。`InTyped` は他の型付き列と同じく索引未対応（全走査）。
+
+> Issue #2194 注記: 本書の索引の行参照は `SqlArenaSnapshot` のスロットで、Issue #2194 では変更していない（`id_index` を含め #2195 が扱う）。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。

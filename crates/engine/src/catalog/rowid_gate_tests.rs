@@ -260,6 +260,31 @@ fn table23_only_v15_carries_rowmode_and_is_caught_by_read_gate() {
     assert!(bytes.starts_with(b"v15\n"));
 }
 
+/// 採番方式の親を `id` で参照する FK は、DDL 段で `0A000` の固定文言により拒否される
+/// （`id` の値から親行を引く解決が従来方式の表でしか成立しないため。Issue #2194・TABLE-23）。
+/// 列参照 FK（親の主キー・UNIQUE を参照）は本ゲートの対象外で、このテストでは扱わない。
+#[test]
+fn table23_id_reference_foreign_key_to_allocated_parent_is_rejected() {
+    use crate::catalog::{ForeignKeyDef, ReferentialAction};
+    let (storage, _guard) = allocated_table("table23-fk-id-ref-allocated");
+    let child = TableSchema::new(
+        "kids",
+        vec![ColumnDef::new("pid", ColumnType::BigInt, true)],
+    )
+    .with_foreign_keys(vec![ForeignKeyDef::new(
+        vec!["pid".to_string()],
+        "docs".to_string(),
+        Vec::new(),
+        ReferentialAction::NoAction,
+        ReferentialAction::NoAction,
+    )]);
+    let err = storage
+        .create_table(&child)
+        .expect_err("id reference to an allocated parent must be rejected");
+    assert!(is_row_identity_unsupported(&err), "{err:?}");
+    assert_redacted(&err.to_string());
+}
+
 /// 採番方式かつベクトル列を持つ表（検索入口のゲート確認用）。
 fn allocated_vector_table(label: &str) -> (Storage, crate::test_util::temp_db::CleanupGuard) {
     let path = crate::test_util::temp_db::unique_db_path(label);

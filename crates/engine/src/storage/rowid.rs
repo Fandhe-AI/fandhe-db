@@ -57,6 +57,22 @@ impl RowId {
     }
 }
 
+impl RowId {
+    /// 索引（永続一意索引・FK 用キー索引）へ行参照として永続化する生値を得る。
+    ///
+    /// 不変条件: 索引の行参照のバイト列は、行ストア物理キーの `u64` 要素と同一
+    /// （従来方式の表では利用者 `id` とも一致する）。永続フォーマットを変えないため、
+    /// 索引コードは `legacy_id` / `raw_for_state` を経由せず本入口を使う（Issue #2194）。
+    pub(crate) const fn to_index_raw(self) -> u64 {
+        self.0
+    }
+
+    /// 索引に永続化された行参照の生値から rowid を復元する（[`RowId::to_index_raw`] の逆）。
+    pub(crate) const fn from_index_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 /// 検索結果（公開型 `SearchHit.id` 等）へ詰める応答 `id` を rowid から得る**唯一の境界**
 /// （Issue #2195。ビヘイビア: TABLE-23・SEARCH-1。設計記録: ADR D8）。
 ///
@@ -115,6 +131,13 @@ mod tests {
         assert_eq!(t, "t");
         assert_eq!(back, r);
         assert_eq!(back.legacy_id(), 42);
+    }
+
+    #[test]
+    fn index_raw_matches_row_key_element() {
+        let r = RowId::from_allocated(1234);
+        assert_eq!(r.to_index_raw(), row_key("t", r).1);
+        assert_eq!(RowId::from_index_raw(row_key("t", r).1), r);
     }
 
     #[test]

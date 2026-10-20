@@ -96,6 +96,7 @@ use crate::catalog::{
     CatalogError, ColumnType, ForeignKeyDef, ForeignKeyMatch, ReferentialAction, TableSchema,
 };
 use crate::row_codec::ScalarRef;
+use crate::storage::rowid::{row_key, split_row_key, RowId};
 use crate::tenant::TenantWriteError;
 use redb::ReadableTable;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -631,7 +632,7 @@ pub(crate) fn enforce_row_constraints_in_txn(
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
-    written_ids: &[u64],
+    written_ids: &[RowId],
     fk_mode: FkCheckMode,
 ) -> Result<crate::key_index::KeyIndexDelta, TenantWriteError> {
     enforce_row_constraints_impl(
@@ -654,7 +655,7 @@ fn enforce_row_constraints_impl(
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
-    written_ids: &[u64],
+    written_ids: &[RowId],
     fk_mode: FkCheckMode,
     view_checks: bool,
 ) -> Result<crate::key_index::KeyIndexDelta, TenantWriteError> {
@@ -733,7 +734,7 @@ fn enforce_view_check_option_in_txn(
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
-    written_ids: &[u64],
+    written_ids: &[RowId],
 ) -> Result<(), TenantWriteError> {
     if written_ids.is_empty() {
         return Ok(());
@@ -753,7 +754,7 @@ fn enforce_view_check_option_in_txn(
     let mut embedding: Vec<f32> = Vec::new();
     for &id in written_ids {
         let Some(guard) = row_table
-            .get((tenant_id, id))
+            .get(row_key(tenant_id, id))
             .map_err(crate::catalog::CatalogError::from)?
         else {
             continue;
@@ -761,7 +762,7 @@ fn enforce_view_check_option_in_txn(
         let buf = guard.value();
         let (_dim, metadata) =
             crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
-        compiled.enforce(schema, id, &embedding, metadata)?;
+        compiled.enforce(schema, id.legacy_id(), &embedding, metadata)?;
     }
     Ok(())
 }
@@ -781,7 +782,7 @@ fn enforce_check_constraints_in_txn(
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
-    written_ids: &[u64],
+    written_ids: &[RowId],
 ) -> Result<(), TenantWriteError> {
     if written_ids.is_empty() {
         return Ok(());
@@ -796,7 +797,7 @@ fn enforce_check_constraints_in_txn(
     let mut embedding: Vec<f32> = Vec::new();
     for &id in written_ids {
         let Some(guard) = row_table
-            .get((tenant_id, id))
+            .get(row_key(tenant_id, id))
             .map_err(crate::catalog::CatalogError::from)?
         else {
             continue;
@@ -804,7 +805,7 @@ fn enforce_check_constraints_in_txn(
         let buf = guard.value();
         let (_dim, metadata) =
             crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
-        compiled.enforce(schema, id, &embedding, metadata)?;
+        compiled.enforce(schema, id.legacy_id(), &embedding, metadata)?;
     }
     Ok(())
 }
@@ -825,7 +826,7 @@ fn enforce_index_expressions_in_txn(
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
-    written_ids: &[u64],
+    written_ids: &[RowId],
     compiled: Option<&crate::sql::expression_key_index::CompiledIndexExpressions>,
 ) -> Result<(), TenantWriteError> {
     if written_ids.is_empty() {
@@ -841,7 +842,7 @@ fn enforce_index_expressions_in_txn(
     let mut embedding: Vec<f32> = Vec::new();
     for &id in written_ids {
         let Some(guard) = row_table
-            .get((tenant_id, id))
+            .get(row_key(tenant_id, id))
             .map_err(crate::catalog::CatalogError::from)?
         else {
             continue;
@@ -849,7 +850,7 @@ fn enforce_index_expressions_in_txn(
         let buf = guard.value();
         let (_dim, metadata) =
             crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
-        compiled.enforce(schema, id, &embedding, metadata)?;
+        compiled.enforce(schema, id.legacy_id(), &embedding, metadata)?;
     }
     Ok(())
 }
@@ -871,7 +872,7 @@ fn enforce_partial_indexes_in_txn(
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
-    written_ids: &[u64],
+    written_ids: &[RowId],
     compiled: Option<&crate::sql::index_predicate::CompiledPartialIndexes>,
 ) -> Result<(), TenantWriteError> {
     if written_ids.is_empty() {
@@ -887,7 +888,7 @@ fn enforce_partial_indexes_in_txn(
     let mut embedding: Vec<f32> = Vec::new();
     for &id in written_ids {
         let Some(guard) = row_table
-            .get((tenant_id, id))
+            .get(row_key(tenant_id, id))
             .map_err(crate::catalog::CatalogError::from)?
         else {
             continue;
@@ -895,7 +896,7 @@ fn enforce_partial_indexes_in_txn(
         let buf = guard.value();
         let (_dim, metadata) =
             crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
-        compiled.enforce(schema, id, &embedding, metadata)?;
+        compiled.enforce(schema, id.legacy_id(), &embedding, metadata)?;
     }
     Ok(())
 }
@@ -1000,7 +1001,7 @@ pub(crate) fn enforce_unique_keys_with_decls(
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
-    written_ids: &[u64],
+    written_ids: &[RowId],
     decls: &crate::catalog::TableExpressionDecls,
     compiled: Option<&crate::sql::expression_key_index::CompiledIndexExpressions>,
 ) -> Result<(), TenantWriteError> {
@@ -1023,7 +1024,7 @@ pub(crate) fn enforce_unique_keys_with_decls(
         .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
         .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
 
-    let written_id_set: HashSet<u64> = written_ids.iter().copied().collect();
+    let written_id_set: HashSet<RowId> = written_ids.iter().copied().collect();
     unique_index::ensure_tenant_index(
         &row_table,
         &mut index_table,
@@ -1052,7 +1053,7 @@ pub(crate) fn enforce_unique_keys_in_txn(
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
-    written_ids: &[u64],
+    written_ids: &[RowId],
 ) -> Result<(), TenantWriteError> {
     let decls = crate::catalog::table_expression_decls_in_txn(write_txn, table_name)?;
     let compiled =
@@ -1080,7 +1081,7 @@ pub(crate) fn forget_unique_index_rows_in_txn(
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
-    ids: &[u64],
+    ids: &[RowId],
 ) -> Result<(), TenantWriteError> {
     unique_index::forget_rows_in_txn(write_txn, table_name, schema, tenant_id, ids)
 }
@@ -1132,7 +1133,7 @@ impl PkIndexProbe {
         index_table: &I,
         tenant_id: &str,
         canonical_key: &[u8],
-    ) -> Result<Option<u64>, TenantWriteError>
+    ) -> Result<Option<RowId>, TenantWriteError>
     where
         I: ReadableTable<(&'static str, &'static [u8]), &'static [u8]>,
     {
@@ -1236,18 +1237,18 @@ where
     }
 
     let tenant_id = ctx.tenant_id();
-    let mut existing: HashMap<Vec<u8>, u64> = HashMap::new();
+    let mut existing: HashMap<Vec<u8>, RowId> = HashMap::new();
     // キーを復元できなかった不可視行の id（[`recover_unique_keys_of_corrupt_rows`] が
     // 永続索引から補完する）。
-    let mut corrupt_invisible: Vec<u64> = Vec::new();
-    let range_start = std::ops::Bound::Included((tenant_id, 0u64));
-    let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
+    let mut corrupt_invisible: Vec<RowId> = Vec::new();
+    let range_start = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(0)));
+    let range_end = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(u64::MAX)));
     for entry in row_table
         .range::<(&str, u64)>((range_start, range_end))
         .map_err(crate::catalog::CatalogError::from)?
     {
         let (k, v) = entry.map_err(crate::catalog::CatalogError::from)?;
-        let (key_tenant, id) = k.value();
+        let (key_tenant, id) = split_row_key(k.value());
         if key_tenant != tenant_id {
             // 閉区間により理論上到達しないが、defense-in-depth として維持する
             // （`enforce_unique_keys_in_txn` と同じ判断）。
@@ -1301,7 +1302,7 @@ where
 
 /// [`scan_tenant_rows_by_unique_key`] の戻り値（対象キー → 既存行 id の対応表と、
 /// キーを復元できなかった不可視行の id 一覧）。
-pub(crate) type UniqueKeyScan = (HashMap<Vec<u8>, u64>, Vec<u64>);
+pub(crate) type UniqueKeyScan = (HashMap<Vec<u8>, RowId>, Vec<RowId>);
 
 /// 事前走査でキーを復元できなかった不可視行（`corrupt_ids`）の一意キーを永続
 /// 索引の逆引きから補完し、`existing`（キー → 既存行 id）へ加える（Issue #1254・
@@ -1316,8 +1317,8 @@ pub(crate) fn recover_unique_keys_of_corrupt_rows(
     schema: &TableSchema,
     tenant_id: &str,
     indices: &[usize],
-    corrupt_ids: &[u64],
-    existing: &mut HashMap<Vec<u8>, u64>,
+    corrupt_ids: &[RowId],
+    existing: &mut HashMap<Vec<u8>, RowId>,
 ) -> Result<(), TenantWriteError> {
     if corrupt_ids.is_empty() {
         return Ok(());
@@ -1326,7 +1327,7 @@ pub(crate) fn recover_unique_keys_of_corrupt_rows(
     let compiled =
         crate::sql::expression_key_index::CompiledIndexExpressions::compile(schema, &decls.keys)?;
     let plan = UniqueKeyPlan::build(schema, &decls)?;
-    let mut recovered: HashSet<u64> = HashSet::new();
+    let mut recovered: HashSet<RowId> = HashSet::new();
     for (id, key) in unique_index::recover_forward_keys_for_rows(
         write_txn,
         table_name,
@@ -2460,7 +2461,7 @@ fn verify_required_parent_keys(
                 };
             for id in ids {
                 if row_table
-                    .get((tenant_id, id))
+                    .get(parent_row_key_by_id_value(parent_schema, tenant_id, id)?)
                     .map_err(CatalogError::from)?
                     .is_none()
                 {
@@ -2615,7 +2616,7 @@ fn enforce_foreign_keys_in_txn(
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
-    written_ids: &[u64],
+    written_ids: &[RowId],
     fk_mode: FkCheckMode,
 ) -> Result<(), TenantWriteError> {
     if schema.foreign_keys().is_empty() || written_ids.is_empty() {
@@ -2638,9 +2639,12 @@ fn enforce_foreign_keys_in_txn(
         let row_table = write_txn
             .open_table(crate::catalog::user_rows_table_def(&row_table_name))
             .map_err(crate::catalog::map_row_table_error)?;
-        let written: BTreeSet<u64> = written_ids.iter().copied().collect();
+        let written: BTreeSet<RowId> = written_ids.iter().copied().collect();
         for id in written {
-            let Some(guard) = row_table.get((tenant_id, id)).map_err(CatalogError::from)? else {
+            let Some(guard) = row_table
+                .get(row_key(tenant_id, id))
+                .map_err(CatalogError::from)?
+            else {
                 // 同一文内で後から削除された等、存在しない行は制約に違反し得ない
                 // （`enforce_unique_keys_in_txn` と同じ扱い）。
                 continue;
@@ -2677,7 +2681,7 @@ pub(crate) enum ReferencedRowsChange<'a> {
     /// 失われ得る。呼び出し元はまだこの id 集合を索引へ同期していない前提
     /// （本関数が内部で [`crate::key_index::sync_rows_in_txn`] を呼ぶ）。参照
     /// アクション（Issue #1076）を発火させる（[`Self::Truncated`] とは異なる）。
-    Removed { ids: &'a [u64] },
+    Removed { ids: &'a [RowId] },
     /// 既存行の指定列（論理インデックス）のみの更新（`UPDATE ... SET`・UPSERT の
     /// `DO UPDATE SET`）。`id` は予約列で `SET` できないため失われない。`delta` は
     /// 呼び出し元が同じ id 集合に対して直前に呼んだ `enforce_row_constraints_in_txn`
@@ -2721,7 +2725,7 @@ pub(crate) const MAX_REFERENTIAL_ACTION_ROWS: u32 = 10_000;
 /// 引き続き行われる）。
 #[derive(Default)]
 pub(crate) struct UpdatedKeyPreImages {
-    old_values: HashMap<u64, Vec<crate::row_codec::Value>>,
+    old_values: HashMap<RowId, Vec<crate::row_codec::Value>>,
 }
 
 impl UpdatedKeyPreImages {
@@ -2740,7 +2744,7 @@ impl UpdatedKeyPreImages {
     /// 後勝ちで上書きすると本来の旧キーを失い、対象の子行を取り違える（見失う・
     /// 別のキーへ連鎖する）。最初の記録が唯一の真の文実行前スナップショットで
     /// あるため、以降の呼び出しは無視する。
-    pub(crate) fn record(&mut self, id: u64, values: Vec<crate::row_codec::Value>) {
+    pub(crate) fn record(&mut self, id: RowId, values: Vec<crate::row_codec::Value>) {
         self.old_values.entry(id).or_insert(values);
     }
 }
@@ -2839,8 +2843,8 @@ fn scan_child_fk_rows_for_keys(
     tenant_id: &str,
     wanted_keys: Option<&HashSet<ChildKey>>,
     remaining_budget: u32,
-) -> Result<HashMap<ChildKey, Vec<u64>>, TenantWriteError> {
-    let mut out: HashMap<ChildKey, Vec<u64>> = HashMap::new();
+) -> Result<HashMap<ChildKey, Vec<RowId>>, TenantWriteError> {
+    let mut out: HashMap<ChildKey, Vec<RowId>> = HashMap::new();
     if wanted_keys.is_some_and(|w| w.is_empty()) {
         return Ok(out);
     }
@@ -2869,14 +2873,14 @@ fn scan_child_fk_rows_for_keys(
         }
     };
     let mut matched: u32 = 0;
-    let range_start = std::ops::Bound::Included((tenant_id, 0u64));
-    let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
+    let range_start = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(0)));
+    let range_end = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(u64::MAX)));
     for entry in row_table
         .range::<(&str, u64)>((range_start, range_end))
         .map_err(CatalogError::from)?
     {
         let (k, v) = entry.map_err(CatalogError::from)?;
-        let (key_tenant, id) = k.value();
+        let (key_tenant, id) = split_row_key(k.value());
         if key_tenant != tenant_id {
             break;
         }
@@ -2922,8 +2926,8 @@ fn snapshot_child_rows_before_pass2(
     write_txn: &redb::WriteTransaction,
     child_schema: &TableSchema,
     tenant_id: &str,
-    ids: impl Iterator<Item = u64>,
-) -> Result<HashMap<u64, Vec<crate::row_codec::Value>>, TenantWriteError> {
+    ids: impl Iterator<Item = RowId>,
+) -> Result<HashMap<RowId, Vec<crate::row_codec::Value>>, TenantWriteError> {
     let mut out = HashMap::new();
     let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
     let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
@@ -2937,15 +2941,14 @@ fn snapshot_child_rows_before_pass2(
         }
     };
     for id in ids {
-        let Some(guard) = row_table.get((tenant_id, id)).map_err(CatalogError::from)? else {
+        let Some(guard) = row_table
+            .get(row_key(tenant_id, id))
+            .map_err(CatalogError::from)?
+        else {
             continue;
         };
-        let existing = crate::storage::decode_row_for_key(
-            tenant_id,
-            crate::storage::rowid::RowId::from_legacy_id(id),
-            guard.value(),
-        )
-        .map_err(TenantWriteError::Storage)?;
+        let existing = crate::storage::decode_row_for_key(tenant_id, id, guard.value())
+            .map_err(TenantWriteError::Storage)?;
         // `guard`（`row_table` の不変借用）は `existing` がデータを複製済みの
         // ため、明示的な drop は不要（このスコープ内で `row_table` への可変
         // 借用を行わないため、借用チェッカ上も問題ない）。
@@ -3341,8 +3344,10 @@ pub(crate) fn enforce_referencing_rows_in_txn(
             };
             let child_col_ty = single_referencing_column_type(child_schema, &child_columns)?;
             let mut lost_ids: BTreeSet<Vec<u8>> = BTreeSet::new();
-            for &id in ids {
-                if let Some(bytes) = crate::key_index::parent_id_key_bytes(child_col_ty, id)? {
+            for &rowid in ids {
+                let id_value = referenced_id_value_of_removed_row(schema, rowid)?;
+                if let Some(bytes) = crate::key_index::parent_id_key_bytes(child_col_ty, id_value)?
+                {
                     lost_ids.insert(bytes);
                 }
             }
@@ -3546,7 +3551,7 @@ pub(crate) fn enforce_deferred_foreign_keys_in_txn(
 /// 連鎖の対象子行 1 件分: `(子行 id, ON UPDATE CASCADE の新しい参照先キー値。
 /// それ以外のアクションでは `None`)`。[`collect_action_targets`] の戻り値・
 /// [`apply_referential_action`] の入力で共有する（Issue #1076）。
-type ActionTargets = Vec<(u64, Option<Vec<crate::row_codec::Value>>)>;
+type ActionTargets = Vec<(RowId, Option<Vec<crate::row_codec::Value>>)>;
 
 /// `propagate_referential_actions` の Pass 1（対象特定）が FK 1 個分について
 /// 確定した情報: `(子スキーマ, FK 宣言, アクション, 対象子行, Pass 1 時点の
@@ -3558,7 +3563,7 @@ type PendingReferentialAction<'a> = (
     &'a ForeignKeyDef,
     ReferentialAction,
     ActionTargets,
-    HashMap<u64, Vec<crate::row_codec::Value>>,
+    HashMap<RowId, Vec<crate::row_codec::Value>>,
 );
 
 /// `table_name`（スキーマ `schema`）に加えた変更 `change` を起点に、参照アクション
@@ -3707,7 +3712,7 @@ fn propagate_referential_actions(
     // 蓄積し、このテーブルを参照する全 FK のアクション適用が終わってから
     // まとめて 1 回ずつ検証する（子孫段への再帰も同様に、全 FK 適用後へ
     // 遅延する）。
-    let mut pending_validation: HashMap<String, (TableSchema, Vec<u64>)> = HashMap::new();
+    let mut pending_validation: HashMap<String, (TableSchema, Vec<RowId>)> = HashMap::new();
     let mut pending_recursions: Vec<(
         TableSchema,
         PropagatedChange,
@@ -3736,7 +3741,7 @@ fn propagate_referential_actions(
             // 側）は行が既に無いため対象外。実際の検証はこのテーブルを参照する
             // 全 FK のループを終えた後、子テーブルごとに 1 回だけ行う（上記
             // `pending_validation` ドキュメント参照）。
-            let child_ids: Vec<u64> = affected.iter().map(|(id, _)| *id).collect();
+            let child_ids: Vec<RowId> = affected.iter().map(|(id, _)| *id).collect();
             pending_validation
                 .entry(child_schema.name.clone())
                 .and_modify(|(_, ids)| ids.extend(child_ids.iter().copied()))
@@ -3883,7 +3888,10 @@ fn collect_action_targets(
                 let mut seen_keys: HashSet<ChildKey> = HashSet::new();
                 for (removed_id, old_values) in &pre.old_values {
                     let old_key = if fk.references_parent_id() {
-                        Some(ChildKey::Id(*removed_id))
+                        Some(ChildKey::Id(referenced_id_value_of_removed_row(
+                            parent_schema,
+                            *removed_id,
+                        )?))
                     } else {
                         build_owned_key(old_values, &parent_indices, fk)?
                     };
@@ -3894,9 +3902,13 @@ fn collect_action_targets(
                         continue;
                     }
                     let exists = match &old_key {
-                        ChildKey::Id(id) => {
-                            parent_row_exists(write_txn, parent_table, tenant_id, *id)?
-                        }
+                        ChildKey::Id(id) => resolve_parent_by_id_value(
+                            write_txn,
+                            parent_table,
+                            parent_schema,
+                            tenant_id,
+                            *id,
+                        )?,
                         ChildKey::Bytes(bytes) => present_keys
                             .as_ref()
                             .is_some_and(|present| present.contains(bytes)),
@@ -3990,7 +4002,13 @@ fn collect_action_targets(
             let mut out = Vec::new();
             for (key, ids) in child_rows {
                 let exists = match &key {
-                    ChildKey::Id(id) => parent_row_exists(write_txn, parent_table, tenant_id, *id)?,
+                    ChildKey::Id(id) => resolve_parent_by_id_value(
+                        write_txn,
+                        parent_table,
+                        parent_schema,
+                        tenant_id,
+                        *id,
+                    )?,
                     // 子の型のキーを親の型へ読み替えて照合する（親の列に収まらない
                     // 値は親に存在しない）。
                     ChildKey::Bytes(bytes) => match recoder.child_to_parent(bytes.clone())? {
@@ -4115,19 +4133,44 @@ fn collect_action_targets(
     }
 }
 
+/// 親テーブルの `id` 列（従来方式の暗黙主キー）の値 `id_value` から親行の物理キーを解決する
+/// （`id` 参照 FK が参照先を引く 2 つの集約点の一方。Issue #2194・TABLE-23）。
+///
+/// 従来方式（`LegacyId`）の表は rowid と `id` が 1:1 のため、値から rowid への写像は恒等で、
+/// 物理キーの点照会が主キー値による解決そのものになる。採番方式（`Allocated`）の表は主キー索引から
+/// 引く実装が未整備のため、固定文言で fail-closed に拒否する（ゲートで到達しない想定だが、
+/// 後続作業の一覧として明示する）。呼び出し元は本 module の `id` 参照 FK の検査・連鎖処理。
+fn parent_row_key_by_id_value<'a>(
+    parent_schema: &TableSchema,
+    tenant_id: &'a str,
+    id_value: u64,
+) -> Result<(&'a str, u64), TenantWriteError> {
+    parent_schema.require_legacy_row_identity()?;
+    Ok(row_key(tenant_id, RowId::from_legacy_id(id_value)))
+}
+
+/// 削除された親行の rowid から、その行が持っていた `id` 列の値（`id` 参照 FK の子が保持する値）を
+/// 得る（`id` 参照 FK の集約点の他方。Issue #2194）。採番方式の表は fail-closed。
+fn referenced_id_value_of_removed_row(
+    parent_schema: &TableSchema,
+    rowid: RowId,
+) -> Result<u64, TenantWriteError> {
+    parent_schema.require_legacy_row_identity()?;
+    Ok(rowid.legacy_id())
+}
+
 /// 親テーブル `parent_table` の `id` 疑似列参照の存在確認（`id` 参照 FK 用）。
-fn parent_row_exists(
+fn resolve_parent_by_id_value(
     write_txn: &redb::WriteTransaction,
     parent_table: &str,
+    parent_schema: &TableSchema,
     tenant_id: &str,
-    id: u64,
+    id_value: u64,
 ) -> Result<bool, TenantWriteError> {
+    let key = parent_row_key_by_id_value(parent_schema, tenant_id, id_value)?;
     let row_table_name = crate::catalog::user_rows_table_name(parent_table);
     match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
-        Ok(t) => Ok(t
-            .get((tenant_id, id))
-            .map_err(CatalogError::from)?
-            .is_some()),
+        Ok(t) => Ok(t.get(key).map_err(CatalogError::from)?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
         Err(e) => Err(TenantWriteError::from(crate::catalog::map_row_table_error(
             e,
@@ -4205,7 +4248,7 @@ fn read_parent_row_values(
     parent_table: &str,
     parent_schema: &TableSchema,
     tenant_id: &str,
-    id: u64,
+    id: RowId,
 ) -> Result<Option<Vec<crate::row_codec::Value>>, TenantWriteError> {
     let row_table_name = crate::catalog::user_rows_table_name(parent_table);
     let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
@@ -4218,7 +4261,10 @@ fn read_parent_row_values(
             )))
         }
     };
-    let Some(guard) = row_table.get((tenant_id, id)).map_err(CatalogError::from)? else {
+    let Some(guard) = row_table
+        .get(row_key(tenant_id, id))
+        .map_err(CatalogError::from)?
+    else {
         return Ok(None);
     };
     let (_dim, metadata) = crate::storage::decode_row_dim_and_metadata_borrowed(guard.value())?;
@@ -4278,7 +4324,7 @@ fn apply_referential_action(
     fk: &ForeignKeyDef,
     action: ReferentialAction,
     affected: &ActionTargets,
-    original_snapshot: &HashMap<u64, Vec<crate::row_codec::Value>>,
+    original_snapshot: &HashMap<RowId, Vec<crate::row_codec::Value>>,
     tenant_id: &str,
     is_delete: bool,
 ) -> Result<(PropagatedChange, Option<UpdatedKeyPreImages>), TenantWriteError> {
@@ -4293,14 +4339,14 @@ fn apply_referential_action(
         // ——`tenant.rs` の `remove` 呼び出し元が積む `removed_pre_images` と
         // 同じ契約をこの CASCADE 経由の削除にも適用する）。
         let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
-        let mut deleted_ids: Vec<u64> = Vec::new();
+        let mut deleted_ids: Vec<RowId> = Vec::new();
         let mut pre_images = UpdatedKeyPreImages::new();
         {
             let mut row_table = write_txn
                 .open_table(crate::catalog::user_rows_table_def(&row_table_name))
                 .map_err(crate::catalog::map_row_table_error)?;
             for (id, _) in affected {
-                let key = (tenant_id, *id);
+                let key = row_key(tenant_id, *id);
                 if row_table.get(&key).map_err(CatalogError::from)?.is_none() {
                     // 同一トランザクション内で既に削除された等（多段連鎖の交差）。
                     continue;
@@ -4370,17 +4416,13 @@ fn apply_referential_action(
             .open_table(crate::catalog::user_rows_table_def(&row_table_name))
             .map_err(crate::catalog::map_row_table_error)?;
         for (id, new_key_values) in affected {
-            let key = (tenant_id, *id);
+            let key = row_key(tenant_id, *id);
             let Some(guard) = row_table.get(&key).map_err(CatalogError::from)? else {
                 // 同一トランザクション内で既に削除された等（多段連鎖の交差）。
                 continue;
             };
-            let existing = crate::storage::decode_row_for_key(
-                tenant_id,
-                crate::storage::rowid::RowId::from_legacy_id(*id),
-                guard.value(),
-            )
-            .map_err(TenantWriteError::Storage)?;
+            let existing = crate::storage::decode_row_for_key(tenant_id, *id, guard.value())
+                .map_err(TenantWriteError::Storage)?;
             // `guard`（`row_table` の不変借用）を、直後の可変借用（`insert`）と
             // 衝突しないよう明示的に drop する（`existing` は既にデータを
             // 複製済みのため、以降 `guard`／借用元バッファへは触れない）。
@@ -4541,8 +4583,18 @@ mod tests {
         );
         storage.create_table(&schema).expect("create table");
         let write_txn = storage.begin_write_txn().expect("begin write");
-        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[1, 2, 3])
-            .expect("no primary key must be a no-op");
+        enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema,
+            "tenant-a",
+            &[
+                RowId::from_legacy_id(1),
+                RowId::from_legacy_id(2),
+                RowId::from_legacy_id(3),
+            ],
+        )
+        .expect("no primary key must be a no-op");
         write_txn.abort().expect("abort");
     }
 
@@ -4585,10 +4637,133 @@ mod tests {
                     .expect("insert row");
             }
         }
-        let err = enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[1, 2])
-            .expect_err("duplicate primary key within the same batch must be rejected");
+        let err = enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema,
+            "tenant-a",
+            &[RowId::from_legacy_id(1), RowId::from_legacy_id(2)],
+        )
+        .expect_err("duplicate primary key within the same batch must be rejected");
         assert!(matches!(err, TenantWriteError::UniqueViolation));
         write_txn.abort().expect("abort");
+    }
+
+    /// 行テーブルへ生の行を `rowid` キーで書く（宣言 PK 値と rowid をずらす索引層の単体試験用。
+    /// 公開 API・ゲートは通さず、索引層だけを直接呼ぶ。Issue #2194）。
+    fn put_raw_row_at(
+        write_txn: &redb::WriteTransaction,
+        schema: &TableSchema,
+        rowid: u64,
+        code: &str,
+    ) {
+        let mut table = write_txn
+            .open_table(crate::catalog::user_rows_table_def(
+                &crate::catalog::user_rows_table_name("docs"),
+            ))
+            .expect("open row table");
+        let metadata =
+            crate::row_codec::encode_scalar_columns(schema, &[Value::Text(code.to_string())])
+                .expect("encode scalar columns");
+        let row = crate::storage::RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[],
+            metadata: &metadata,
+        };
+        let encoded = crate::storage::encode_row(&row).expect("encode row");
+        table
+            .insert(
+                row_key("tenant-a", RowId::from_allocated(rowid)),
+                encoded.as_slice(),
+            )
+            .expect("insert row");
+    }
+
+    /// 索引層は行参照を rowid で扱い、キー値（PK 値）とは独立に動く（rowid が 1000 以降で値と
+    /// ずれても、一意性違反の検出・stale 正引きの上書き・逆引きの後片付けが成立する。TABLE-23）。
+    #[test]
+    fn unique_index_works_when_rowid_differs_from_key_value() {
+        let (storage, _guard) = tmp_storage("constraint-rowid-ne-value");
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new(
+                "code",
+                crate::catalog::ColumnType::Text,
+                false,
+            )],
+        )
+        .with_primary_key(vec!["code".to_string()]);
+        storage.create_table(&schema).expect("create table");
+        let r1000 = RowId::from_allocated(1000);
+        let r1001 = RowId::from_allocated(1001);
+        let r2000 = RowId::from_allocated(2000);
+
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        put_raw_row_at(&write_txn, &schema, 1000, "a");
+        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[r1000])
+            .expect("first row is unique");
+        // 別 rowid が同じキー値を持つと違反。
+        put_raw_row_at(&write_txn, &schema, 1001, "a");
+        let err = enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[r1001])
+            .expect_err("same key under another rowid must conflict");
+        assert!(matches!(err, TenantWriteError::UniqueViolation));
+        write_txn.abort().expect("abort");
+
+        // 行削除 + 後片付け後は、同じキー値を別 rowid が取得できる。
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        put_raw_row_at(&write_txn, &schema, 1000, "a");
+        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[r1000])
+            .expect("first row is unique");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("docs"),
+                ))
+                .expect("open row table");
+            table
+                .remove(row_key("tenant-a", r1000))
+                .expect("remove row");
+        }
+        forget_unique_index_rows_in_txn(&write_txn, "docs", &schema, "tenant-a", &[r1000])
+            .expect("forget");
+        put_raw_row_at(&write_txn, &schema, 2000, "a");
+        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[r2000])
+            .expect("key is free after the owner row was removed");
+        write_txn.abort().expect("abort");
+    }
+
+    /// `id` 参照 FK の参照先解決は、採番方式の親を固定文言で fail-closed に拒否する（Issue #2194）。
+    #[test]
+    fn id_reference_resolution_rejects_allocated_parent() {
+        let parent = TableSchema::new(
+            "parent",
+            vec![ColumnDef::new("k", crate::catalog::ColumnType::Text, false)],
+        )
+        .with_row_identity(crate::catalog::RowIdentity::Allocated);
+        let err = parent_row_key_by_id_value(&parent, "tenant-a", 1).expect_err("must reject");
+        assert!(matches!(
+            err,
+            TenantWriteError::Catalog(ref e) if crate::catalog::is_row_identity_unsupported(e)
+        ));
+        let err = referenced_id_value_of_removed_row(&parent, RowId::from_allocated(7))
+            .expect_err("must reject");
+        assert!(matches!(
+            err,
+            TenantWriteError::Catalog(ref e) if crate::catalog::is_row_identity_unsupported(e)
+        ));
+        let legacy = TableSchema::new(
+            "parent",
+            vec![ColumnDef::new("k", crate::catalog::ColumnType::Text, false)],
+        );
+        assert_eq!(
+            parent_row_key_by_id_value(&legacy, "t", 5).expect("legacy"),
+            ("t", 5)
+        );
+        assert_eq!(
+            referenced_id_value_of_removed_row(&legacy, RowId::from_legacy_id(9)).expect("legacy"),
+            9
+        );
     }
 
     #[test]
@@ -4639,8 +4814,14 @@ mod tests {
                 .insert(("tenant-a", 2u64), encoded.as_slice())
                 .expect("insert row");
         }
-        let err = enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[2])
-            .expect_err("conflict against an existing tenant row must be rejected");
+        let err = enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema,
+            "tenant-a",
+            &[RowId::from_legacy_id(2)],
+        )
+        .expect_err("conflict against an existing tenant row must be rejected");
         assert!(matches!(err, TenantWriteError::UniqueViolation));
         write_txn.abort().expect("abort");
     }
@@ -4713,8 +4894,14 @@ mod tests {
         let write_txn = storage.begin_write_txn().expect("begin write");
         let schema_reloaded =
             crate::catalog::require_table_schema_write(&write_txn, "docs").expect("schema");
-        enforce_unique_keys_in_txn(&write_txn, "docs", &schema_reloaded, "tenant-a", &[1])
-            .expect("self-update with unchanged primary key must not conflict");
+        enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema_reloaded,
+            "tenant-a",
+            &[RowId::from_legacy_id(1)],
+        )
+        .expect("self-update with unchanged primary key must not conflict");
         write_txn.abort().expect("abort");
     }
 
@@ -4777,8 +4964,14 @@ mod tests {
                 &[Value::Text("same".to_string()), Value::Null],
             );
         }
-        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[1, 2])
-            .expect("rows with a NULL component must not conflict");
+        enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema,
+            "tenant-a",
+            &[RowId::from_legacy_id(1), RowId::from_legacy_id(2)],
+        )
+        .expect("rows with a NULL component must not conflict");
         write_txn.abort().expect("abort");
     }
 
@@ -4801,11 +4994,23 @@ mod tests {
         );
         put_raw_row(&write_txn, &schema, "tenant-a", 2, &xy);
         // tenant-b の同値・tenant-a の部分一致とは衝突しない。
-        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[2])
-            .expect("partial match and other tenants' values must not conflict");
+        enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema,
+            "tenant-a",
+            &[RowId::from_legacy_id(2)],
+        )
+        .expect("partial match and other tenants' values must not conflict");
         put_raw_row(&write_txn, &schema, "tenant-a", 3, &xy);
-        let err = enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[3])
-            .expect_err("full match within the tenant must conflict");
+        let err = enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema,
+            "tenant-a",
+            &[RowId::from_legacy_id(3)],
+        )
+        .expect_err("full match within the tenant must conflict");
         assert!(matches!(err, TenantWriteError::UniqueViolation));
         write_txn.abort().expect("abort");
     }
@@ -4942,8 +5147,14 @@ mod tests {
             ]
         };
         put_raw_row(&write_txn, &schema, "tenant-a", 1, &row(r#"{"a":1,"b":2}"#));
-        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[1])
-            .expect("first row must succeed");
+        enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema,
+            "tenant-a",
+            &[RowId::from_legacy_id(1)],
+        )
+        .expect("first row must succeed");
         // キー順・空白だけが異なるが値として等価な JSON テキスト。
         put_raw_row(
             &write_txn,
@@ -4952,8 +5163,14 @@ mod tests {
             2,
             &row(r#"{ "b": 2, "a": 1 }"#),
         );
-        let err = enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[2])
-            .expect_err("value-equal JSON must conflict despite differing text");
+        let err = enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema,
+            "tenant-a",
+            &[RowId::from_legacy_id(2)],
+        )
+        .expect_err("value-equal JSON must conflict despite differing text");
         assert!(matches!(err, TenantWriteError::UniqueViolation));
         write_txn.abort().expect("abort");
     }
@@ -4976,16 +5193,34 @@ mod tests {
             ]
         };
         put_raw_row(&write_txn, &schema, "tenant-a", 1, &row(&["a", "b"]));
-        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[1])
-            .expect("first row must succeed");
+        enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema,
+            "tenant-a",
+            &[RowId::from_legacy_id(1)],
+        )
+        .expect("first row must succeed");
         // 要素順が異なる配列は衝突しない。
         put_raw_row(&write_txn, &schema, "tenant-a", 2, &row(&["b", "a"]));
-        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[2])
-            .expect("different element order must not conflict");
+        enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema,
+            "tenant-a",
+            &[RowId::from_legacy_id(2)],
+        )
+        .expect("different element order must not conflict");
         // 完全一致は衝突する。
         put_raw_row(&write_txn, &schema, "tenant-a", 3, &row(&["a", "b"]));
-        let err = enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[3])
-            .expect_err("identical array must conflict");
+        let err = enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema,
+            "tenant-a",
+            &[RowId::from_legacy_id(3)],
+        )
+        .expect_err("identical array must conflict");
         assert!(matches!(err, TenantWriteError::UniqueViolation));
         write_txn.abort().expect("abort");
     }
@@ -5160,7 +5395,10 @@ mod tests {
         );
 
         let mut pre_images = UpdatedKeyPreImages::new();
-        pre_images.record(5, vec![Value::Text("removed".to_string())]);
+        pre_images.record(
+            RowId::from_legacy_id(5),
+            vec![Value::Text("removed".to_string())],
+        );
 
         let limited = collect_action_targets(
             &write_txn,
@@ -5175,7 +5413,7 @@ mod tests {
             MAX_REFERENTIAL_ACTION_ROWS,
         )
         .expect("limited scan must succeed");
-        let limited_ids: HashSet<u64> = limited.into_iter().map(|(id, _)| id).collect();
+        let limited_ids: HashSet<u64> = limited.into_iter().map(|(id, _)| id.legacy_id()).collect();
         assert_eq!(
             limited_ids,
             HashSet::from([101]),
@@ -5199,7 +5437,8 @@ mod tests {
             MAX_REFERENTIAL_ACTION_ROWS,
         )
         .expect("fallback scan must succeed");
-        let fallback_ids: HashSet<u64> = fallback.into_iter().map(|(id, _)| id).collect();
+        let fallback_ids: HashSet<u64> =
+            fallback.into_iter().map(|(id, _)| id.legacy_id()).collect();
         assert_eq!(
             fallback_ids,
             HashSet::from([100, 101]),
@@ -5321,14 +5560,19 @@ mod tests {
             table.remove(("tenant-a", 1u64)).expect("remove parent row");
         }
         let mut pre_images = UpdatedKeyPreImages::new();
-        pre_images.record(1, vec![Value::Text("p1".to_string())]);
+        pre_images.record(
+            RowId::from_legacy_id(1),
+            vec![Value::Text("p1".to_string())],
+        );
 
         enforce_referencing_rows_in_txn(
             &write_txn,
             "parents",
             &parent_schema,
             "tenant-a",
-            ReferencedRowsChange::Removed { ids: &[1] },
+            ReferencedRowsChange::Removed {
+                ids: &[RowId::from_legacy_id(1)],
+            },
             Some(&pre_images),
             FkCheckMode::ImmediateOnly,
         )
@@ -5458,7 +5702,9 @@ mod tests {
         let mut matched_ids: Vec<u64> = ok
             .get(&ChildKey::Id(5))
             .expect("key 5 must be present")
-            .clone();
+            .iter()
+            .map(|id| id.legacy_id())
+            .collect();
         matched_ids.sort_unstable();
         assert_eq!(matched_ids, vec![10, 11, 12]);
         assert_eq!(
@@ -5481,11 +5727,17 @@ mod tests {
     #[test]
     fn updated_key_pre_images_record_keeps_the_first_value_for_the_same_id() {
         let mut pre_images = UpdatedKeyPreImages::new();
-        pre_images.record(1, vec![Value::Text("original".to_string())]);
+        pre_images.record(
+            RowId::from_legacy_id(1),
+            vec![Value::Text("original".to_string())],
+        );
         // 2 回目の呼び出し（中間状態を模す）は無視される。
-        pre_images.record(1, vec![Value::Text("intermediate".to_string())]);
+        pre_images.record(
+            RowId::from_legacy_id(1),
+            vec![Value::Text("intermediate".to_string())],
+        );
         assert_eq!(
-            pre_images.old_values.get(&1),
+            pre_images.old_values.get(&RowId::from_legacy_id(1)),
             Some(&vec![Value::Text("original".to_string())]),
             "2 回目以降の record は最初の値を上書きしてはならない"
         );
