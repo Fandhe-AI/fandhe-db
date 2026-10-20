@@ -719,6 +719,14 @@ pub enum SqlSurfaceError {
     /// 衝突した場合も同じ分類を共有する（ビューはテーブルと名前空間を共有する）。
     /// ERR-6: `42P07`。
     DuplicateTable { name: String },
+    /// `CREATE SCHEMA`（TABLE-27・ERR-6、Issue #1713）が、同一テナント内の既存 SCHEMA または
+    /// 組み込み SCHEMA と衝突した。`42P06`。名前は利用者自身が書いたものだけを含める。
+    DuplicateSchema { name: String },
+    /// `DROP SCHEMA`（TABLE-27・ERR-6、Issue #1713）の対象が呼び出し元テナントに存在しない。
+    /// `3F000`。他テナントにしか無い名前も同じ経路・同じ文言（存在を秘匿する）。
+    InvalidSchemaName { name: String },
+    /// 予約名（`pg_` 接頭辞）の SCHEMA 名の指定（TABLE-27・ERR-6、Issue #1713）。`42939`。
+    ReservedName { name: String },
     /// `ALTER TABLE ... ADD [CONSTRAINT <name>] {CHECK|FOREIGN KEY}` の明示名が
     /// 同一テーブルの既存制約名と衝突した（TABLE-22、Issue #1195）。
     /// ERR-6: `42710`。UNIQUE の名前衝突は `DuplicateTable`（`42P07`）のまま。
@@ -1274,6 +1282,9 @@ impl ClassifiedError for SqlSurfaceError {
             }
             SqlSurfaceError::FeatureNotSupported { .. } => ErrorClass::FeatureNotSupported,
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
+            SqlSurfaceError::DuplicateSchema { .. } => ErrorClass::DuplicateSchema,
+            SqlSurfaceError::InvalidSchemaName { .. } => ErrorClass::InvalidSchemaName,
+            SqlSurfaceError::ReservedName { .. } => ErrorClass::ReservedName,
             SqlSurfaceError::DuplicateObject { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::DuplicateType { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::InvalidTableDefinition { .. }
@@ -1455,6 +1466,16 @@ impl std::fmt::Display for SqlSurfaceError {
             // 双方の名前衝突を共有する分類のため "relation" と汎称する。
             SqlSurfaceError::DuplicateTable { name } => {
                 write!(f, "relation already exists: {name}")
+            }
+            // 名前は利用者自身が書いた識別子のみ（内部 ID・他テナントの情報は含めない。Issue #1713）。
+            SqlSurfaceError::DuplicateSchema { name } => {
+                write!(f, "schema already exists: {name}")
+            }
+            SqlSurfaceError::InvalidSchemaName { name } => {
+                write!(f, "schema does not exist: {name}")
+            }
+            SqlSurfaceError::ReservedName { name } => {
+                write!(f, "unacceptable schema name: {name}")
             }
             // 制約名はクライアント自身が指定した識別子。テーブル名・テナントは含めない。
             SqlSurfaceError::DuplicateObject { name } => {
@@ -13104,6 +13125,117 @@ pub(crate) fn validate_drop_type_tokens(
     }
     p.expect_end_of_statement()?;
     Ok(ValidatedDropType { name, if_exists })
+}
+
+/// `CREATE SCHEMA [IF NOT EXISTS] <name>` の許可形状構造検証結果（TABLE-27・TABLE-36 のポインタ、
+/// Issue #1713）。カタログ照会は一切行わない（予約名・重複の判定は `sql::ddl` と Storage 側）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedCreateSchema {
+    pub(crate) name: String,
+    pub(crate) if_not_exists: bool,
+}
+
+impl ValidatedCreateSchema {
+    /// SCHEMA 名（大文字小文字は原文のまま保持する）。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// `DROP SCHEMA [IF EXISTS] <name> [RESTRICT]` の許可形状構造検証結果（TABLE-27・TABLE-36 の
+/// ポインタ、Issue #1713）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedDropSchema {
+    pub(crate) name: String,
+    pub(crate) if_exists: bool,
+}
+
+impl ValidatedDropSchema {
+    /// 削除対象の SCHEMA 名。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// 先頭 2 トークンが `CREATE SCHEMA` か（`core.rs::EngineCore::parse_tokens` の分岐判定）。
+pub(crate) fn is_create_schema_statement(tokens: &[Token]) -> bool {
+    let ident_at = |i: usize, w: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(w));
+    ident_at(0, "CREATE") && ident_at(1, "SCHEMA")
+}
+
+/// 先頭 2 トークンが `DROP SCHEMA` か（汎用 `DROP`〔`DROP TABLE` 扱い〕より前に分岐するために使う）。
+pub(crate) fn is_drop_schema_statement(tokens: &[Token]) -> bool {
+    let ident_at = |i: usize, w: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(w));
+    ident_at(0, "DROP") && ident_at(1, "SCHEMA")
+}
+
+/// [`ValidatedCreateSchema`] の構造検証本体（TABLE-27、Issue #1713）。`AUTHORIZATION`（名前の有無を
+/// 問わない）と schema_element（`CREATE SCHEMA s CREATE TABLE ...`）は、ロール（SQL-39）が入るまで
+/// 黙って無視せず `0A000` で拒否する（fail-closed。設計記録 D10）。修飾名・不正な識別子・余分な
+/// トークンは `42601`。
+pub(crate) fn validate_create_schema_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedCreateSchema, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("CREATE")?;
+    p.expect_ident_matching("SCHEMA")?;
+    let if_not_exists = p.parse_optional_if_not_exists();
+    let authorization = || {
+        SqlSurfaceError::feature_not_supported(
+            "CREATE SCHEMA with AUTHORIZATION or schema elements is not supported",
+        )
+    };
+    if p.peek_ident_matches("AUTHORIZATION") {
+        return Err(authorization());
+    }
+    if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
+        return Err(SqlSurfaceError::unsupported(
+            "schema name must not be qualified in CREATE SCHEMA",
+        ));
+    }
+    let name = p.expect_ident()?;
+    crate::catalog::validate_identifier(&name)
+        .map_err(|_| SqlSurfaceError::unsupported("invalid schema name in CREATE SCHEMA"))?;
+    if p.peek_ident_matches("AUTHORIZATION") || p.peek_ident_matches("CREATE") {
+        return Err(authorization());
+    }
+    p.expect_end_of_statement()?;
+    Ok(ValidatedCreateSchema {
+        name,
+        if_not_exists,
+    })
+}
+
+/// [`ValidatedDropSchema`] の構造検証本体（TABLE-27・TABLE-36 のポインタ、Issue #1713）。
+/// `RESTRICT`（既定と同義）は受理し、`CASCADE`（#1717）と複数名は `0A000`。修飾名・不正な
+/// 識別子・余分なトークンは `42601`。
+pub(crate) fn validate_drop_schema_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedDropSchema, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("DROP")?;
+    p.expect_ident_matching("SCHEMA")?;
+    let if_exists = p.consume_if_exists();
+    if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
+        return Err(SqlSurfaceError::unsupported(
+            "schema name must not be qualified in DROP SCHEMA",
+        ));
+    }
+    let name = p.expect_ident()?;
+    crate::catalog::validate_identifier(&name)
+        .map_err(|_| SqlSurfaceError::unsupported("invalid schema name in DROP SCHEMA"))?;
+    if p.parse_optional_drop_behavior() == DropBehavior::Cascade {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "DROP SCHEMA ... CASCADE is not supported",
+        ));
+    }
+    if matches!(p.peek(), Some(Token::Punct(','))) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "DROP SCHEMA with multiple names is not supported",
+        ));
+    }
+    p.expect_end_of_statement()?;
+    Ok(ValidatedDropSchema { name, if_exists })
 }
 
 /// `CREATE SEQUENCE <name> [option ...]` の許可形状構造検証結果（TABLE-24・SQL-23、Issue #1688）。

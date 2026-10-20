@@ -354,6 +354,9 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::SequenceNotYetDefined
         | E::LastvalNotYetDefined
         | E::SequenceGeneratorLimitExceeded { .. }
+        | E::DuplicateSchema { .. }
+        | E::InvalidSchemaName { .. }
+        | E::ReservedName { .. }
         | E::MaterializedViewNotRefreshableConcurrently
         | E::ViewNotAutoUpdatable { .. }
         | E::PartitionedDmlInTransaction

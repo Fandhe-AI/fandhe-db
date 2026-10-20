@@ -53,9 +53,10 @@ use crate::sql::allowlist::{
     ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
     ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
     ValidatedAlterTableRenameColumn, ValidatedAlterTableRenameTable, ValidatedCreateIndex,
-    ValidatedCreateSequence, ValidatedCreateTable, ValidatedCreateTempTable, ValidatedCreateType,
-    ValidatedCreateView, ValidatedDropIndex, ValidatedDropMaterializedView, ValidatedDropSequence,
-    ValidatedDropTable, ValidatedDropType, ValidatedDropView,
+    ValidatedCreateSchema, ValidatedCreateSequence, ValidatedCreateTable, ValidatedCreateTempTable,
+    ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex, ValidatedDropMaterializedView,
+    ValidatedDropSchema, ValidatedDropSequence, ValidatedDropTable, ValidatedDropType,
+    ValidatedDropView,
 };
 use crate::sql::ddl_column_type::{
     alias_spelling, to_static_column_type_with_array_default, SqlColumnTypeName, StaticColumnType,
@@ -288,6 +289,10 @@ pub(crate) fn execute_create_table(
         | CatalogError::ViewDefinitionChanged(_)
         | CatalogError::ViewReferenceCycle(_)
         | CatalogError::ViewLimitExceeded(_)
+        | CatalogError::SchemaAlreadyExists(_)
+        | CatalogError::SchemaNotFound(_)
+        | CatalogError::ReservedSchemaName(_)
+        | CatalogError::BuiltinSchema(_)
         // `TooManyColumns` は `ALTER TABLE ADD COLUMN`（Issue #900・
         // `Storage::alter_table_add_column`）専用の変種で、`Storage::create_table`
         // からは返らない（列数上限は `validate_create_table_tokens` が構造検証
@@ -1305,6 +1310,10 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::ViewDefinitionChanged(_)
         | CatalogError::ViewReferenceCycle(_)
         | CatalogError::ViewLimitExceeded(_)
+        | CatalogError::SchemaAlreadyExists(_)
+        | CatalogError::SchemaNotFound(_)
+        | CatalogError::ReservedSchemaName(_)
+        | CatalogError::BuiltinSchema(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
         | CatalogError::TooManyColumns { .. }
@@ -1777,6 +1786,10 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::ViewDefinitionChanged(_)
         | CatalogError::ViewReferenceCycle(_)
         | CatalogError::ViewLimitExceeded(_)
+        | CatalogError::SchemaAlreadyExists(_)
+        | CatalogError::SchemaNotFound(_)
+        | CatalogError::ReservedSchemaName(_)
+        | CatalogError::BuiltinSchema(_)
         | CatalogError::TooManyColumns { .. }
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
@@ -2316,6 +2329,10 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::ViewDefinitionChanged(_)
         | CatalogError::ViewReferenceCycle(_)
         | CatalogError::ViewLimitExceeded(_)
+        | CatalogError::SchemaAlreadyExists(_)
+        | CatalogError::SchemaNotFound(_)
+        | CatalogError::ReservedSchemaName(_)
+        | CatalogError::BuiltinSchema(_)
         // `UniqueConstraintViolation` は `Storage::alter_table_add_unique_constraint`
         // 専用（TABLE-16・TASK-204、Issue #905）で、`alter_table_add_column` からは
         // 返らない（到達不能）。
@@ -2947,6 +2964,65 @@ pub(crate) fn map_sequence_error(e: CatalogError, internal_detail: &str) -> SqlS
         CatalogError::ViewLimitExceeded(_) => {
             SqlSurfaceError::payload_too_large("too many sequences")
         }
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: internal_detail.to_string(),
+        },
+    }
+}
+
+/// `CREATE SCHEMA`（TABLE-27、Issue #1713）の成功応答（`IF NOT EXISTS` の no-op も同じ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateSchemaOutcome {}
+
+/// `DROP SCHEMA`（TABLE-27、Issue #1713）の成功応答（`IF EXISTS` の no-op も同じ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropSchemaOutcome {}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体（Issue #1713）。
+/// 予約名・重複・件数上限の判定は `Storage::create_schema`（単一 write txn）に一本化する。
+/// SCHEMA はテナント単位のため、`tenant_id`（呼び出し元の `PolicyContext`）を必ず渡す。
+pub(crate) fn execute_create_schema(
+    storage: &Storage,
+    tenant_id: &str,
+    validated: &ValidatedCreateSchema,
+) -> Result<CreateSchemaOutcome, SqlSurfaceError> {
+    storage
+        .create_schema(tenant_id, validated.name(), validated.if_not_exists)
+        .map_err(|e| map_schema_error(e, "CREATE SCHEMA failed"))?;
+    Ok(CreateSchemaOutcome {})
+}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体（Issue #1713）。
+/// 組み込み SCHEMA の拒否・存在判定・空判定は `Storage::drop_schema` に一本化する。
+pub(crate) fn execute_drop_schema(
+    storage: &Storage,
+    tenant_id: &str,
+    validated: &ValidatedDropSchema,
+) -> Result<DropSchemaOutcome, SqlSurfaceError> {
+    storage
+        .drop_schema(tenant_id, validated.name(), validated.if_exists)
+        .map_err(|e| map_schema_error(e, "DROP SCHEMA failed"))?;
+    Ok(DropSchemaOutcome {})
+}
+
+/// SCHEMA DDL の [`CatalogError`] を SQL 表層の契約へ写像する（重複 `42P06`・不在 `3F000`・
+/// 予約名 `42939`・組み込み SCHEMA の削除 `42501`・中身あり `2BP01`・上限超過 `54000`・
+/// ロック timeout `55P03`）。文言には利用者が書いた名前だけを含め、内部 ID・他テナントの
+/// 情報・依存オブジェクト名は含めない（security.md P0）。
+pub(crate) fn map_schema_error(e: CatalogError, internal_detail: &str) -> SqlSurfaceError {
+    match e {
+        CatalogError::SchemaAlreadyExists(name) => SqlSurfaceError::DuplicateSchema { name },
+        CatalogError::SchemaNotFound(name) => SqlSurfaceError::InvalidSchemaName { name },
+        CatalogError::ReservedSchemaName(name) => SqlSurfaceError::ReservedName { name },
+        CatalogError::BuiltinSchema(_) => SqlSurfaceError::InsufficientPrivilege,
+        CatalogError::DependentObjectsStillExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
+        CatalogError::ViewLimitExceeded(_) => {
+            SqlSurfaceError::payload_too_large("too many schemas")
+        }
+        CatalogError::Invalid(_) => SqlSurfaceError::unsupported("invalid schema name"),
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
         _ => SqlSurfaceError::Internal {
             detail: internal_detail.to_string(),

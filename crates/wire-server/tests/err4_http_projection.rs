@@ -302,7 +302,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 70] = [
+const EXPECTED_STATUS: [(&str, u16); 73] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -330,6 +330,10 @@ const EXPECTED_STATUS: [(&str, u16); 70] = [
     ("55000", 409),
     // `SequenceGeneratorLimitExceeded`（`2200H`。TABLE-24・Issue #1690）。
     ("2200H", 400),
+    // `DuplicateSchema`／`InvalidSchemaName`／`ReservedName`（TABLE-27・Issue #1713）。
+    ("42P06", 409),
+    ("3F000", 404),
+    ("42939", 400),
     // `WithCheckOptionViolation`（`44000`。TABLE-43 (2)、Issue #1673）: ビューの CHECK OPTION 違反。400。
     ("44000", 400),
     ("25000", 400),
@@ -502,7 +506,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 73);
+const _: () = assert!(ErrorClass::ALL.len() == 76);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。

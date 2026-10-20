@@ -921,6 +921,13 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropSequence(_) => OutcomeResponse::Command {
             tag: "DROP SEQUENCE".to_string(),
         },
+        // TABLE-27（Issue #1713）: SCHEMA DDL も件数を持たない固定タグ。
+        SqlOutcome::CreateSchema(_) => OutcomeResponse::Command {
+            tag: "CREATE SCHEMA".to_string(),
+        },
+        SqlOutcome::DropSchema(_) => OutcomeResponse::Command {
+            tag: "DROP SCHEMA".to_string(),
+        },
         // Issue #1689: RENAME TO も同じタグ。
         SqlOutcome::AlterSequence(_) => OutcomeResponse::Command {
             tag: "ALTER SEQUENCE".to_string(),
