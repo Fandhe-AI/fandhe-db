@@ -3287,8 +3287,12 @@ impl EngineCore {
                 if visible > crate::tenant::MAX_VISIBLE_ROWS {
                     return Err(invalid("too many rows to build dictionary snapshot"));
                 }
-                let row = crate::storage::decode_row_for_key(key_tenant, id, raw)
-                    .map_err(|_| invalid(DECODE_FAILED))?;
+                let row = crate::storage::decode_row_for_key(
+                    key_tenant,
+                    crate::storage::rowid::RowId::from_legacy_id(id),
+                    raw,
+                )
+                .map_err(|_| invalid(DECODE_FAILED))?;
                 let values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
                     .map_err(|_| invalid(DECODE_FAILED))?;
                 let (

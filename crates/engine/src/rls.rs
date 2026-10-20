@@ -804,7 +804,9 @@ impl<'s> SearchTimeFilter<'s> {
             // ここに到達するのは呼び出し元 `ctx` から可視な行のみ。次元不一致はこの行
             // 自身の id を含めて fail-closed に伝播してよい（呼び出し元が既に到達できる
             // 情報。`PrefilterIndex::build` と同じ契約。上記型ドキュメント参照）。
-            let mut row = crate::storage::decode_row(id, buf).map_err(ArenaError::from)?;
+            let mut row =
+                crate::storage::decode_row(crate::storage::rowid::RowId::from_legacy_id(id), buf)
+                    .map_err(ArenaError::from)?;
             let found_dim =
                 u32::try_from(row.embedding.len()).map_err(|_| ArenaError::DimMismatch {
                     id,
