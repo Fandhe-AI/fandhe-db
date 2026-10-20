@@ -4224,6 +4224,15 @@ impl EngineCore {
         // `CREATE [TEMP] TABLE`・`DROP TABLE` を通す（実行段がセッションの一時カタログで
         // 名前を解決する）。これらを通さないと、一時表を作った直後のセッションが拡張クエリで
         // 一時表の `DROP` も永続表の DDL も実行できなくなる。
+        // `public.` 修飾つきの `DROP TABLE` は、同名の一時表があれば一時表へ化けるため拒否する
+        // （`parse_sql` 経由で修飾情報を持つ文が、後から一時表を持つセッションで実行される経路。
+        // TABLE-27・Issue #1714。`execute_parsed_in_session`・`execute_parsed_in_txn` 共通）。
+        if let ParsedSql::DropTable(stmt) = parsed {
+            crate::sql::temp_catalog::reject_public_names_temp(
+                &stmt.public_qualified,
+                session.temp_tables(),
+            )?;
+        }
         if session.temp_tables().is_empty()
             || matches!(
                 parsed,
@@ -4309,7 +4318,7 @@ impl EngineCore {
         // 以降の検証はすべて未修飾名として扱うため、修飾の有無で経路・エラー契約が変わらない。
         // 冪等（解決済みのトークン列には何もしない）で、テナント不明の解決は ctx を持つ入口が
         // [`Self::refine_relation_error`] で精密化する。
-        crate::sql::relation_name::rewrite_relation_names(&mut tokens, None)?;
+        let public_names = crate::sql::relation_name::rewrite_relation_names(&mut tokens, None)?;
         let storage_lookup = crate::sql::temp_catalog::SessionRelationLookup::new(
             &self.storage,
             temp,
@@ -4616,7 +4625,9 @@ impl EngineCore {
             // （DDL 実行権限ゲートを存在確認より前に通す契約。`ValidatedDropTable`
             // ドキュメント参照）。権限判定・実行本体は
             // `execute_parsed_in_session` の `DropTable` 分岐が担う。
-            let stmt = crate::sql::allowlist::validate_drop_table_tokens(&tokens)?;
+            let mut stmt = crate::sql::allowlist::validate_drop_table_tokens(&tokens)?;
+            // `public.` 修飾の情報を保持し、セッション付き実行の粗いゲートが一時表との衝突を拒否する。
+            stmt.public_qualified = public_names;
             return Ok(ParsedSql::DropTable(stmt));
         }
 

@@ -3350,6 +3350,7 @@ mod tests {
             table_names: vec!["ghost".into()],
             if_exists: true,
             behavior: crate::catalog::DropBehavior::Restrict,
+            public_qualified: Vec::new(),
         };
         assert!(execute_drop_table(&storage, &t).expect("table").skipped());
         let v = ValidatedDropView {

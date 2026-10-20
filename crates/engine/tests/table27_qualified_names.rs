@@ -475,3 +475,50 @@ fn public_alias_column_reference_is_not_a_temp_collision() {
     );
     assert!(!r.contains("0A000"), "{r}");
 }
+
+#[test]
+fn parse_sql_public_qualified_drop_is_rejected_for_session_with_same_name_temp_table() {
+    let (core, _g) = new_core("t27-qualified-parse-sql");
+    let mut s = ddl_session();
+    ok(&core, &mut s, &format!("CREATE TABLE t {COLUMNS}"));
+    // セッション非依存の parse_sql（`public.` 修飾は Parse 時に外れる）。
+    let parsed = core.parse_sql("DROP TABLE public.t").expect("parse");
+    ok(&core, &mut s, &format!("CREATE TEMP TABLE t {COLUMNS}"));
+    let e = core
+        .execute_parsed_in_session(&ctx(TENANT), &mut s, &parsed)
+        .map(|_| ())
+        .expect_err("execute must reject");
+    assert_eq!(e.wire_code(), "0A000");
+    // 一時表も永続表も残る。
+    assert_eq!(count(&core, &mut s, "t"), "Integer(0)");
+    ok(&core, &mut s, "DROP TABLE t");
+    assert_eq!(count(&core, &mut s, "public.t"), "Integer(0)");
+}
+
+#[test]
+fn create_temp_table_allows_public_qualified_reference_side() {
+    let (core, _g) = new_core("t27-qualified-temp-reference-side");
+    let mut s = ddl_session();
+    ok(&core, &mut s, "CREATE TABLE u (k INTEGER PRIMARY KEY)");
+    // 作成対象の `public.` は 42P16、参照側の `public.u` は修飾子の検査で拒否されない。
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "CREATE TEMP TABLE public.x (a INTEGER REFERENCES public.u (k))"
+        ),
+        "42P16"
+    );
+    // 未修飾の参照側と修飾した参照側で同じ結果（修飾子だけで拒否が変わらない）。
+    let plain = err(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE x (a INTEGER REFERENCES u (k))",
+    );
+    let qualified = err(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE x (a INTEGER REFERENCES public.u (k))",
+    );
+    assert_eq!(plain, qualified);
+}

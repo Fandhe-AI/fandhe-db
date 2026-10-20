@@ -4447,6 +4447,12 @@ pub struct ValidatedDropTable {
     /// `CASCADE`／`RESTRICT` 句（TABLE-37 (2)(3)、Issue #1641）。省略時は `Restrict`。
     /// **BREAKING CHANGE**: pub フィールドの追加（構造体リテラルで生成する側は指定が必要）。
     pub behavior: DropBehavior,
+    /// Parse 時に `public.` 修飾を外した表名（TABLE-27・Issue #1714）。セッション付き実行の
+    /// 粗いゲートが、同名の一時表との衝突（`public.t` が一時表 `t` を落とす取り違え）を
+    /// 拒否するために使う。修飾が無ければ空。構文検証（`validate_drop_table_tokens`）は常に空で
+    /// 返し、`EngineCore::parse_tokens_in` が名前解決の結果を設定する。
+    /// **BREAKING CHANGE**: pub フィールドの追加（構造体リテラルで生成する側は指定が必要）。
+    pub public_qualified: Vec<String>,
 }
 
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
@@ -18120,6 +18126,7 @@ pub fn validate_drop_table_tokens(
         table_names,
         if_exists,
         behavior,
+        public_qualified: Vec::new(),
     })
 }
 

@@ -188,7 +188,8 @@ pub(crate) fn rewrite_relation_names(
             &qualifier,
             &name,
             is_create_name,
-            create_temp_table,
+            // 一時表の作成対象名だけが対象（`REFERENCES public.u` 等の参照側は許可する）。
+            create_temp_table && is_create_name,
             schema_exists,
         ) {
             Ok(()) => {
