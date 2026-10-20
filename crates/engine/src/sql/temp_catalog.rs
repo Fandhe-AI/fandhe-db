@@ -334,13 +334,23 @@ pub(crate) fn reject_public_qualified_temp(
     if catalog.is_empty() {
         return Ok(());
     }
-    let hit = tokens.iter().any(|t| match t {
-        Token::QualifiedIdent { qualifier, name } => {
-            qualifier.eq_ignore_ascii_case("public")
-                && catalog.names().any(|n| n.eq_ignore_ascii_case(name))
-        }
-        _ => false,
+    // 列修飾（`public.name` を別名 `public` の列参照として使う等）を誤って拒否しないよう、
+    // 名前解決と同じ表参照位置の判定（`rewrite_relation_names`）で `public.<表名>` と確認できた
+    // ものだけを照合する。解決エラーは後続の parse が同じ入力で返すため、ここでは拒否しない。
+    let has_public = tokens.iter().any(|t| {
+        matches!(t, Token::QualifiedIdent { qualifier, .. } if qualifier.eq_ignore_ascii_case("public"))
     });
+    if !has_public {
+        return Ok(());
+    }
+    let mut resolved = tokens.to_vec();
+    let Ok(public_names) = crate::sql::relation_name::rewrite_relation_names(&mut resolved, None)
+    else {
+        return Ok(());
+    };
+    let hit = public_names
+        .iter()
+        .any(|p| catalog.names().any(|n| n.eq_ignore_ascii_case(p)));
     if hit {
         return Err(temp_table_unsupported());
     }

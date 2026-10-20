@@ -420,3 +420,58 @@ fn prepared_public_qualified_name_rejected_after_same_name_temp_table_created() 
     // 一時表は残る。
     assert_eq!(count(&core, &mut s, "t"), "Integer(0)");
 }
+
+#[test]
+fn bound_public_qualified_drop_is_rejected_when_temp_table_created_before_execute() {
+    let (core, _g) = new_core("t27-qualified-temp-bound");
+    let mut s = ddl_session();
+    ok(&core, &mut s, &format!("CREATE TABLE t {COLUMNS}"));
+    let prepared = core
+        .parse_sql_prepared_with_declared_in_session(&s, "DROP TABLE public.t", &[])
+        .expect("prepare");
+    // 一時表が無い状態で Bind 済み（ポータル相当）にしてから、同名の一時表を作る。
+    let bound = core
+        .bind_prepared_in_session(&s, &prepared, &[])
+        .expect("bind");
+    ok(&core, &mut s, &format!("CREATE TEMP TABLE t {COLUMNS}"));
+    let e = core
+        .execute_parsed_in_session(&ctx(TENANT), &mut s, &bound)
+        .map(|_| ())
+        .expect_err("execute must reject");
+    assert_eq!(e.wire_code(), "0A000");
+    // 一時表も永続表も残る。
+    assert_eq!(count(&core, &mut s, "t"), "Integer(0)");
+    ok(&core, &mut s, "DROP TABLE t");
+    assert_eq!(count(&core, &mut s, "public.t"), "Integer(0)");
+}
+
+#[test]
+fn table_identifier_in_select_list_does_not_start_relation_list() {
+    let (core, _g) = new_core("t27-qualified-table-ident");
+    let mut s = ddl_session();
+    ok(&core, &mut s, &format!("CREATE TABLE t {COLUMNS}"));
+    // 選択リストの `t.id`・`public.id` は列修飾のまま扱われ、表参照として解決されない
+    // （スキーマ `t`／`public` の解決エラーにならない）。
+    for sql in [
+        "SELECT table, t.id FROM t LIMIT 10",
+        "SELECT table, public.id FROM t LIMIT 10",
+    ] {
+        let r = run(&core, &mut s, sql);
+        assert!(!r.contains("3F000"), "{sql}: {r}");
+    }
+}
+
+#[test]
+fn public_alias_column_reference_is_not_a_temp_collision() {
+    let (core, _g) = new_core("t27-qualified-public-alias");
+    let mut s = ddl_session();
+    ok(&core, &mut s, &format!("CREATE TABLE base {COLUMNS}"));
+    ok(&core, &mut s, &format!("CREATE TEMP TABLE name {COLUMNS}"));
+    // `public` を別名にした列参照は、一時表 `name` との衝突として拒否されない。
+    let r = run(
+        &core,
+        &mut s,
+        "SELECT public.name FROM base AS public LIMIT 1",
+    );
+    assert!(!r.contains("0A000"), "{r}");
+}

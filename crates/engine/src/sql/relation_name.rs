@@ -64,6 +64,11 @@ pub(crate) fn rewrite_relation_names(
     // `CREATE [GLOBAL|LOCAL] {TEMP|TEMPORARY} TABLE`（一時表 DDL として受理される全形）。
     let create_temp_table = crate::sql::allowlist::is_create_temp_table_statement(tokens);
     let table_head = head.iter().any(|t| ident_is(Some(t), "TABLE"));
+    // `TABLE` が表参照を導くのは DDL 文の先頭付近だけ（`SELECT table, t.id` の識別子 `table` と
+    // 区別する）。
+    let ddl_head = ["CREATE", "DROP", "ALTER", "TRUNCATE", "LOCK", "COMMENT"]
+        .iter()
+        .any(|k| ident_is(tokens.first(), k));
     let mut index_on_pending = head_create && head.iter().any(|t| ident_is(Some(t), "INDEX"));
 
     let mut levels: Vec<Level> = vec![Level::default()];
@@ -110,7 +115,9 @@ pub(crate) fn rewrite_relation_names(
             Token::Ident(w) => {
                 if w.eq_ignore_ascii_case("UPDATE") || w.eq_ignore_ascii_case("DELETE") {
                     next.from_ok = true;
-                } else if w.eq_ignore_ascii_case("TRUNCATE") || w.eq_ignore_ascii_case("TABLE") {
+                } else if w.eq_ignore_ascii_case("TRUNCATE")
+                    || (w.eq_ignore_ascii_case("TABLE") && ddl_head && i < 4)
+                {
                     next.list = true;
                 } else if [
                     "GROUP",
@@ -137,7 +144,7 @@ pub(crate) fn rewrite_relation_names(
                         let is = |k: &str| w.eq_ignore_ascii_case(k);
                         if is("TABLE") {
                             is_create_name = create_table;
-                            true
+                            ddl_head && i <= 4
                         } else if is("EXISTS") {
                             let ok =
                                 table_head && (ident_is(prev2, "IF") || ident_is(prev2, "NOT"));
@@ -301,6 +308,7 @@ mod tests {
             "SELECT * FROM a JOIN b ON a.id = b.id",
         );
         same("SELECT * FROM a, public.b", "SELECT * FROM a, b");
+        same("DROP TABLE public.a, public.b", "DROP TABLE a, b");
         same(
             "INSERT INTO public.t (a) VALUES (1)",
             "INSERT INTO t (a) VALUES (1)",
@@ -336,6 +344,8 @@ mod tests {
             "SELECT a.id FROM a JOIN b ON a.id = b.id, c",
             "SELECT EXTRACT(YEAR FROM t.ts) FROM t",
             "SELECT a FROM t WHERE a IS DISTINCT FROM b.x",
+            "SELECT table, t.id FROM t LIMIT 10",
+            "SELECT table, public.id FROM t",
         ] {
             assert_eq!(
                 rewrite(sql).expect(sql),

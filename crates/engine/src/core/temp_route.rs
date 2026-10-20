@@ -91,6 +91,10 @@ pub struct SessionRoutedSql {
     /// 参照する一時表の識別子（同名の再作成との区別。`Temp` 経路のみ）。
     relations: Vec<TempRelationId>,
     route: Route,
+    /// 振り分け時に一時カタログが未変更（世代 0）だったか。`public.` 修飾つきの準備済み文が、
+    /// 一時表を持たないセッションでも世代の検査を受けるための印（世代 0 は通常「未設定」の
+    /// 予約値で拒否されるが、この印がある文だけは世代 0 の一致を現行とみなす）。
+    fresh: bool,
 }
 
 impl SessionRoutedSql {
@@ -104,6 +108,7 @@ impl SessionRoutedSql {
             epoch: catalog.epoch(),
             relations,
             route: Route::Temp,
+            fresh: false,
         }
     }
 
@@ -114,6 +119,17 @@ impl SessionRoutedSql {
             epoch: catalog.epoch(),
             relations: Vec::new(),
             route: Route::Persistent,
+            fresh: false,
+        }
+    }
+
+    /// `public.` 修飾の表名を持つ準備済み文を、世代つきの永続側の文として包む（TABLE-27・
+    /// Issue #1714）。Bind 後〜Execute 前に同名の一時表が作られると、`DROP TABLE` 等の免除文は
+    /// 粗いゲートを素通りして一時表へ作用しうるため、世代の変化を実行時に拒否させる。
+    pub(crate) fn persistent_guarded(inner: ParsedSql, catalog: &SessionTempCatalog) -> Self {
+        Self {
+            fresh: catalog.epoch() == 0 && catalog.is_empty(),
+            ..Self::persistent(inner, catalog)
         }
     }
 
@@ -129,7 +145,7 @@ impl SessionRoutedSql {
 
     /// 現在のセッションの一時カタログで、この文の前提（世代・参照する一時表）がまだ有効か。
     fn is_current(&self, catalog: &SessionTempCatalog) -> bool {
-        self.epoch != 0
+        (self.epoch != 0 || self.fresh)
             && self.epoch == catalog.epoch()
             && self.relations.iter().all(|id| {
                 catalog
@@ -662,6 +678,7 @@ impl EngineCore {
                     epoch: prepared_routed.epoch,
                     relations: prepared_routed.relations.clone(),
                     route: Route::Temp,
+                    fresh: false,
                 })))
             }
             PreparedRoute::Plain => {
@@ -686,7 +703,14 @@ impl EngineCore {
                     }
                 }
                 if temp.is_empty() || is_session_exempt(&parsed) {
-                    return Ok(parsed);
+                    if prepared.public_qualified.is_empty() {
+                        return Ok(parsed);
+                    }
+                    // `public.` 修飾つきの文は、実行までに同名の一時表が作られても一時表へ
+                    // 化けないよう世代を持たせる（Execute の粗いゲートが検査する）。
+                    return Ok(ParsedSql::SessionRouted(Box::new(
+                        SessionRoutedSql::persistent_guarded(parsed, temp),
+                    )));
                 }
                 if crate::sql::temp_catalog::tokens_reference_temp(&prepared.tokens, temp) {
                     return Err(crate::sql::temp_catalog::temp_statement_stale());
