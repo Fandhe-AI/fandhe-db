@@ -370,6 +370,7 @@ impl TempRowStore {
                 crate::tenant::WriteTarget::InTxn(&txn),
                 delete_rows,
                 crate::catalog::DropBehavior::Restrict,
+                false,
                 &ctx,
                 crate::recovery::ledger::LedgerWrite::Disabled,
             )
@@ -398,6 +399,7 @@ impl TempRowStore {
             crate::tenant::WriteTarget::Autocommit(self.storage()?),
             names,
             crate::catalog::DropBehavior::Restrict,
+            false,
             &ctx,
             crate::recovery::ledger::LedgerWrite::Disabled,
         )

@@ -183,6 +183,8 @@ pub(crate) mod temp_rows;
 #[cfg(test)]
 mod temp_rows_tests;
 #[cfg(test)]
+mod truncate_restart_identity_tests;
+#[cfg(test)]
 mod write_time_ledger_tests;
 // `SELECT DISTINCT`・`COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）が共有する
 // 正準キー化・予算管理。`allowlist`（構文の脱糖先）と `aggregate`／`group_by`
@@ -216,6 +218,7 @@ pub(crate) mod param_infer;
 pub mod params;
 pub mod parser;
 pub mod partitioned;
+pub(crate) mod pk_point;
 pub mod plan;
 pub(crate) mod qualified_column;
 pub mod relation;

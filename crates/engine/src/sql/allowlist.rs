@@ -3972,10 +3972,16 @@ fn finalize_primary_key(
 ///
 /// 受理する形は `TRUNCATE [TABLE] [ONLY] <table> [*] [, [ONLY] <table> [*] ...]
 /// [CASCADE | RESTRICT] USING OPERATION_ID '<id>' [;]`（SQL-48 (1)(2)(4)、Issue #1643・
-/// #1644。継承が無いため `ONLY`／`*` は意味を変えない no-op）。`RESTART IDENTITY` 等の
-/// 拡張句は許可リスト外（後続 Issue の範囲。`42601`）。
+/// #1644。継承が無いため `ONLY`／`*` は意味を変えない no-op）。識別句
+/// `RESTART IDENTITY`／`CONTINUE IDENTITY` は表リストと `CASCADE`／`RESTRICT` の間に
+/// 置ける（SQL-48 (3)、Issue #1645）。それ以外の拡張句は許可リスト外（`42601`）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedTruncate {
+    /// `RESTART IDENTITY` が指定されたか（SQL-48 (3)、Issue #1645）。既定は
+    /// `CONTINUE IDENTITY`（`false`）で、明示の `CONTINUE IDENTITY` も `false`。真のとき、
+    /// 対象表が所有する SEQUENCE の自テナントの採番状態を開始値へ戻す
+    /// （判定・適用は `tenant::truncate_tables_unchecked`）。
+    pub restart_identity: bool,
     /// 参照元表の扱い（SQL-48 (2)、Issue #1644）。省略時は `Restrict`。RESTRICT は指定表を
     /// 指定外の表の FK が参照していればカタログ宣言だけで `0A000` で拒否し、CASCADE は
     /// 参照元の表を推移的に対象へ加える（判定・適用は `tenant::truncate_tables_unchecked`）。
@@ -9354,11 +9360,12 @@ impl<'a> Parser<'a> {
     }
 
     /// `TRUNCATE [TABLE] [ONLY] <table> [*] [, [ONLY] <table> [*] ...]
-    /// [CASCADE | RESTRICT] USING OPERATION_ID '<id>' [;]` を受理する（SQL-22、TASK-193。
+    /// [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]
+    /// USING OPERATION_ID '<id>' [;]` を受理する（SQL-22、TASK-193。
     /// TABLE 省略・複数テーブル・`ONLY`／`*` は SQL-48 (1)(4)、Issue #1643。
-    /// `CASCADE`／`RESTRICT` は SQL-48 (2)、Issue #1644）。`RESTART IDENTITY` 等の
-    /// 拡張句は構造的に受理しない（`expect_end_of_statement` が余剰トークンとして
-    /// `42601` で拒否する。識別句は後続 Issue がこの behavior の手前に差し込む）。
+    /// `CASCADE`／`RESTRICT` は SQL-48 (2)、Issue #1644。識別句は SQL-48 (3)、
+    /// Issue #1645）。それ以外の拡張句や順序違い・重複は構造的に受理しない
+    /// （`expect_end_of_statement` が余剰トークンとして `42601` で拒否する）。
     ///
     /// `TABLE`／`ONLY` は予約語ではないため、直後が `,`・`*`・`USING OPERATION_ID`
     /// の場合は同名の表名として扱い（[`Self::peek_truncate_keyword`]）、従来の
@@ -9390,6 +9397,20 @@ impl<'a> Parser<'a> {
 
         // 表名は先に `expect_ident` で読み切るため、`cascade` という名前の表は
         // 従来どおり表名として扱われ、ここで読むのは表リスト直後の句だけになる。
+        // 識別句は 2 トークン先読み（`RESTART`／`CONTINUE` の直後が `IDENTITY`）で判定する。
+        let restart_identity = if self.peek_ident_matches("RESTART")
+            && self.peek_ident_matches_at(1, "IDENTITY")
+        {
+            self.advance();
+            self.advance();
+            true
+        } else if self.peek_ident_matches("CONTINUE") && self.peek_ident_matches_at(1, "IDENTITY") {
+            self.advance();
+            self.advance();
+            false
+        } else {
+            false
+        };
         let behavior = self.parse_optional_drop_behavior();
 
         // 文末専用句の構造パースのみをここで行う（`parse_insert` と同じ設計。
@@ -9400,6 +9421,7 @@ impl<'a> Parser<'a> {
 
         Ok(ParsedTruncateShape {
             table_names,
+            restart_identity,
             behavior,
             operation_id,
         })
@@ -13879,6 +13901,7 @@ pub(crate) fn validate_drop_view_tokens(
 /// （SQL-22、TASK-193）。
 struct ParsedTruncateShape {
     table_names: Vec<String>,
+    restart_identity: bool,
     behavior: DropBehavior,
     operation_id: Option<OperationId>,
 }
@@ -17539,6 +17562,7 @@ pub(crate) fn validate_truncate_tokens(
     }
 
     Ok(ValidatedTruncate {
+        restart_identity: shape.restart_identity,
         behavior: shape.behavior,
         table_names: shape.table_names,
         operation_id: shape.operation_id,
@@ -23034,7 +23058,10 @@ mod tests {
     fn rejects_truncate_with_qualified_star_or_extension_clauses() {
         for sql in [
             "TRUNCATE a.* USING OPERATION_ID 'op-0001'",
-            "TRUNCATE a RESTART IDENTITY USING OPERATION_ID 'op-0001'",
+            "TRUNCATE a CASCADE RESTART IDENTITY USING OPERATION_ID 'op-0001'",
+            "TRUNCATE a RESTART IDENTITY RESTART IDENTITY USING OPERATION_ID 'op-0001'",
+            "TRUNCATE a RESTART USING OPERATION_ID 'op-0001'",
+            "TRUNCATE a USING OPERATION_ID 'op-0001' RESTART IDENTITY",
             "TRUNCATE a CASCADE RESTRICT USING OPERATION_ID 'op-0001'",
             "TRUNCATE a CASCADE, b USING OPERATION_ID 'op-0001'",
             "TRUNCATE a USING OPERATION_ID 'op-0001' CASCADE",
@@ -23042,6 +23069,54 @@ mod tests {
             let err = truncate_names(sql, &["a", "b"]).expect_err(sql);
             assert_eq!(err.wire_code(), "42601", "{sql}");
         }
+    }
+
+    /// SQL-48 (3): 識別句は表リスト直後・CASCADE／RESTRICT の手前に置け、既定は CONTINUE。
+    #[test]
+    fn accepts_truncate_identity_clause() {
+        let lookup = catalog_with(&["a", "b"]);
+        let op = "USING OPERATION_ID 'op-0001'";
+        for (sql, restart, behavior) in [
+            (format!("TRUNCATE a {op}"), false, DropBehavior::Restrict),
+            (
+                format!("TRUNCATE a restart identity {op}"),
+                true,
+                DropBehavior::Restrict,
+            ),
+            (
+                format!("TRUNCATE a CONTINUE IDENTITY {op}"),
+                false,
+                DropBehavior::Restrict,
+            ),
+            (
+                format!("TRUNCATE a, b RESTART IDENTITY CASCADE {op}"),
+                true,
+                DropBehavior::Cascade,
+            ),
+            (
+                format!("TRUNCATE a CONTINUE IDENTITY RESTRICT {op}"),
+                false,
+                DropBehavior::Restrict,
+            ),
+        ] {
+            let v = validate_truncate(&sql, &lookup, LedgerMode::Ledgered).expect(&sql);
+            assert_eq!(v.restart_identity, restart, "{sql}");
+            assert_eq!(v.behavior, behavior, "{sql}");
+        }
+    }
+
+    /// `restart` という名前の表は従来どおり表名として扱われる。
+    #[test]
+    fn truncate_restart_named_table_is_still_a_table_name() {
+        let lookup = catalog_with(&["restart"]);
+        let v = validate_truncate(
+            "TRUNCATE restart USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("table named restart");
+        assert_eq!(v.table_names, vec!["restart".to_string()]);
+        assert!(!v.restart_identity);
     }
 
     fn truncate_behavior(sql: &str, tables: &[&'static str]) -> (DropBehavior, Vec<String>) {

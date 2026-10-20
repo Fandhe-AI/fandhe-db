@@ -64,6 +64,15 @@
 //! （`(tenant, ..)` の範囲）に閉じる。他テナントの索引エントリ・行データには
 //! 一切触れない。
 //!
+//! # 読み取り側の消費者（Issue #2198）
+//!
+//! 上記の「テナント境界」は**書き込み側の判定**（一意性の検査・索引の更新）の規則で、変えない。これとは別に、
+//! 宣言 PRIMARY KEY の点検索（`sql::pk_point`。広域取得）が、候補を絞るためだけに他テナントを含む索引
+//! パーティション（マーカーと正引き）を**読み取り専用**で参照する（[`marker_valid_read_only`]・
+//! [`lookup_forward_read_only`]）。読み取り側は再構築も書き込みもせず、マーカーが無効なテナントは行テーブルの
+//! 範囲走査へ縮退する。候補行は全走査と同じ `is_visible`・TABLE-12 整合・`WHERE` の再評価を通るため、
+//! 他テナントの `Private` 行は結果に現れず、stale な正引きも除かれる（可視性の判定はここでは行わない）。
+//!
 //! # 後方互換
 //!
 //! 索引テーブルが存在しない既存 DB では、各テナントの当該テーブルへの
@@ -214,6 +223,16 @@ fn schema_signature(
     // 一意の式索引（Issue #1651）。式の変更・参照列の改名や型変更でマーカーが不一致になり再構築される。
     plan.push_expression_signature(schema, compiled, &mut out)?;
     Ok(out)
+}
+
+/// マーカーの値 `value`（`[format_version: u32 BE][signature]`）が、現在の
+/// フォーマットバージョンと宣言シグネチャ `signature` に一致するか。書き込み側の
+/// 再構築判定（[`ensure_tenant_index`]）・読み取り専用検証・逆引き復元・読み取り側の
+/// 候補探査（[`marker_valid_read_only`]）が同じ判定を共有する（判定を 2 系統にしない）。
+fn marker_matches(value: &[u8], signature: &[u8]) -> bool {
+    value.len() == 4 + signature.len()
+        && value.get(0..4) == Some(FORMAT_VERSION.to_be_bytes().as_slice())
+        && value.get(4..) == Some(signature)
 }
 
 /// 正引きサブキー（`[0x01][ordinal: u16 BE][正準キーバイト列]`）を組み立てる。
@@ -457,12 +476,7 @@ where
     let signature = schema_signature(schema, plan, compiled)?;
     let marker_key = (tenant_id, MARKER_SUBKEY.as_slice());
     let up_to_date = match index_table.get(marker_key).map_err(storage_error)? {
-        Some(guard) => {
-            let v = guard.value();
-            v.len() == 4 + signature.len()
-                && v.get(0..4) == Some(FORMAT_VERSION.to_be_bytes().as_slice())
-                && v.get(4..) == Some(signature.as_slice())
-        }
+        Some(guard) => marker_matches(guard.value(), &signature),
         None => false,
     };
     if up_to_date {
@@ -574,12 +588,7 @@ where
     let signature = schema_signature(schema, plan, compiled)?;
     let marker_key = (tenant_id, MARKER_SUBKEY.as_slice());
     let up_to_date = match index_table.get(marker_key).map_err(storage_error)? {
-        Some(guard) => {
-            let v = guard.value();
-            v.len() == 4 + signature.len()
-                && v.get(0..4) == Some(FORMAT_VERSION.to_be_bytes().as_slice())
-                && v.get(4..) == Some(signature.as_slice())
-        }
+        Some(guard) => marker_matches(guard.value(), &signature),
         None => false,
     };
     if !up_to_date {
@@ -624,6 +633,59 @@ where
     Ok(())
 }
 
+/// 読み取り側（`sql::pk_point` の候補探査）がマーカー照合に使うシグネチャを組み立てる
+/// （[`schema_signature`] の `pub(super)` 入口。書き込み側と同じバイト列を返す）。
+pub(super) fn signature_for_read(
+    schema: &TableSchema,
+    plan: &UniqueKeyPlan,
+    compiled: Option<&CompiledIndexExpressions>,
+) -> Result<Vec<u8>, TenantWriteError> {
+    schema_signature(schema, plan, compiled)
+}
+
+/// テナント `tenant_id` の索引が現在の宣言（`signature`）で完全に構築済みか、**読み取り専用**で
+/// 判定する。マーカー不在・不一致は `Ok(false)`（呼び出し側は範囲走査へ縮退する。書き込み側の
+/// 遅延再構築〔[`ensure_tenant_index`]〕は読み取りでは行わない）。他テナントの索引エントリには触れない。
+pub(super) fn marker_valid_read_only<I>(
+    index_table: &I,
+    tenant_id: &str,
+    signature: &[u8],
+) -> Result<bool, TenantWriteError>
+where
+    I: ReadableTable<(&'static str, &'static [u8]), &'static [u8]>,
+{
+    Ok(
+        match index_table
+            .get((tenant_id, MARKER_SUBKEY.as_slice()))
+            .map_err(storage_error)?
+        {
+            Some(guard) => marker_matches(guard.value(), signature),
+            None => false,
+        },
+    )
+}
+
+/// 正引き `(tenant_id, [0x01][ordinal][canonical])` を**読み取り専用**で点照会し、行の locator
+/// （現状は行 `id`）を返す。stale な正引き（削除済み・キーが変わった行を指す）も返りうるため、
+/// 呼び出し側は行を読み戻して述語を再評価する契約（モジュールドキュメント「正しさの不変条件」）。
+/// 値が壊れている場合は固定文言の内部エラー（値・id・テナントを含めない）。
+pub(super) fn lookup_forward_read_only<I>(
+    index_table: &I,
+    tenant_id: &str,
+    ordinal: u16,
+    canonical_key: &[u8],
+) -> Result<Option<u64>, TenantWriteError>
+where
+    I: ReadableTable<(&'static str, &'static [u8]), &'static [u8]>,
+{
+    let sub = forward_subkey(ordinal, canonical_key);
+    index_table
+        .get((tenant_id, sub.as_slice()))
+        .map_err(storage_error)?
+        .map(|guard| decode_row_id(guard.value()))
+        .transpose()
+}
+
 /// キー列が復元できない（破損した）不可視行の一意キーを、永続索引の逆引き
 /// エントリから復元する（Issue #1254・RLS-10・RLS-11。`tenant::upsert_typed_rows_impl`
 /// の UNIQUE 対象事前走査が [`super::scan_tenant_rows_by_unique_key`] で除外した
@@ -664,12 +726,7 @@ pub(super) fn recover_forward_keys_for_rows(
         .get((tenant_id, MARKER_SUBKEY.as_slice()))
         .map_err(storage_error)?
     {
-        Some(guard) => {
-            let v = guard.value();
-            v.len() == 4 + signature.len()
-                && v.get(0..4) == Some(FORMAT_VERSION.to_be_bytes().as_slice())
-                && v.get(4..) == Some(signature.as_slice())
-        }
+        Some(guard) => marker_matches(guard.value(), &signature),
         None => false,
     };
     if !marker_ok {

@@ -16485,6 +16485,21 @@ pub(crate) fn prepare_temp_table_schema(schema: &TableSchema) -> Result<TableSch
     Ok(schema)
 }
 
+/// [`table_expression_decls_in_txn`] の読み取り入力源版（Issue #2198）。確定済みスナップショットでも
+/// 明示トランザクションの書き込み txn でも同じ判定で宣言を読む（`ReadSource::open_table` は書き込み txn
+/// でも存在しないカタログを作成しない）。`sql::pk_point` が、永続一意索引のマーカー照合に使うシグネチャを
+/// 書き込み側と同じ宣言から組み立てるために呼ぶ。カタログ未作成は空の `Ok`。
+pub(crate) fn table_expression_decls_in_source<R: crate::storage::read_source::ReadSource>(
+    source: &R,
+    table: &str,
+) -> Result<TableExpressionDecls> {
+    match source.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => table_expression_decls_from(&t, table),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(TableExpressionDecls::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

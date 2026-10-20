@@ -66,6 +66,10 @@ pub enum ScalarPlan {
     /// 必ず再評価する。`classify_scalar_plan*` は返さず、`sql::exec` と EXPLAIN が
     /// `sql::index_implication::implied_partial_index_names` の結果から付与する。
     IndexPartial,
+    /// 宣言 PRIMARY KEY の全構成列へのリテラル等価を、永続一意索引（`user_uniq/{table}`）の点検索で
+    /// 解決する広域取得（Issue #2198・TABLE-23）。`classify_scalar_plan*` は返さず、`sql::pk_point::
+    /// classify_pk_point`（`sql::scan` の実行経路選択と同じ静的分類）が `EXPLAIN` へ付与する。
+    IndexPrimaryKey,
 }
 
 /// [`classify_scalar_plan`] の入力。`sql::exec`・`sql::using_plan::

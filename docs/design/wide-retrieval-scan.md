@@ -159,3 +159,10 @@ spec 側ビヘイビア ID の確定を待つと本 PR（#562）の統合が長�
 実装既定値として先行公開し、本 PR をマージした。その後 spec 側で SQL-15・
 TASK-170 が新設・main へマージされたため（fandhe-db-spec#12）、本 ADR・関連
 コード内ポインタ・コミット/PR 参照を確定済みの ID へ差し替えた。
+
+## 追記（Issue #2198）: PK 点検索の経路
+
+順序なしの経路（`ORDER BY` もウィンドウも無い）で、宣言 PRIMARY KEY の全構成列がリテラル等価なら、
+全行走査の代わりに永続一意索引の点検索で候補を絞る（`sql::pk_point`）。候補も全走査と同じ
+`with_visible_row` を通るので、行・順序・OFFSET の数え方は全走査と同一。それ以外は従来の全行走査。
+詳細は [primary-key-point-lookup.md](primary-key-point-lookup.md)。

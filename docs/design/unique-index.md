@@ -132,3 +132,12 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 - FOREIGN KEY 参照先側の照会の同索引への統合。
 - SQL `ALTER TABLE ... ADD UNIQUE` / `DROP CONSTRAINT` を導入する際は、索引の
   無効化・`ordinal` の再採番を併せて設計する必要がある。
+
+## Issue #2198: 読み取り側の消費者
+
+書き込み側の判定（一意性の検査・索引の更新）は自テナントのパーティションだけを見る。D5 のこの規則は
+変えない。これとは別に、宣言 PRIMARY KEY の点検索（`sql::pk_point`。広域取得）が、候補を絞るためだけに
+索引パーティションを**読み取り専用**で参照する。マーカーが有効なテナントは正引きを点照会し、無効な
+テナントは範囲走査へ縮退する（再構築は書き込み側だけが行う）。候補行は全走査と同じ可視性判定
+（`is_visible`・TABLE-12 整合・`WHERE` の再評価）を通るため、他テナントの `Private` 行は結果に現れず、
+stale な正引き（D4）も除かれる。詳細は [primary-key-point-lookup.md](primary-key-point-lookup.md)。

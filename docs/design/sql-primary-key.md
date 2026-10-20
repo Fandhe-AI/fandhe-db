@@ -177,3 +177,14 @@ COLUMN`（Rust API。TABLE-19）は主キー構成列の削除を
   これら 3 API 自身が主キー（UNIQUE・CHECK・FOREIGN KEY も同様）を宣言した
   テーブルへの書き込みを fail-closed に拒否するガードを追加したため、検査点を
   経由しなくてもテストがこれらの制約に違反する状態を作ることはできない。
+
+## Issue #2198: PK 列の NOT NULL と点検索
+
+- PK 構成列は宣言の仕方（列制約・表制約・`ALTER TABLE ADD PRIMARY KEY`）によらず暗黙に NOT NULL
+  で、NULL の INSERT は `23502`、重複は `23505`、他テナントの同値は違反にならない
+  （`tests/sql_scan_pk_point.rs`・`tests/table16_primary_key.rs`）。
+- PK 列型の許可範囲（`ColumnType::is_primary_key_allowed`）は広げていない。理由と拡張の前提は
+  [primary-key-point-lookup.md](primary-key-point-lookup.md) の「対象外・申し送り」。
+- PK 構成列すべてへのリテラル等価を持つ広域取得は、永続一意索引の点検索で実行し、EXPLAIN に
+  `index_primary_key`／`primary_key_lookup` を出す。設計は
+  [primary-key-point-lookup.md](primary-key-point-lookup.md)。

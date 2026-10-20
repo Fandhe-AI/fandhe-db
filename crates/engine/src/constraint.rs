@@ -1085,6 +1085,61 @@ pub(crate) fn forget_unique_index_rows_in_txn(
     unique_index::forget_rows_in_txn(write_txn, table_name, schema, tenant_id, ids)
 }
 
+/// 宣言 PRIMARY KEY の永続一意索引を**読み取り側**から参照する窓口（Issue #2198。`sql::pk_point` の
+/// テナントごとの候補探査が使う）。書き込み側の判定（自テナントのパーティションだけを見る。
+/// [`unique_index`] モジュールドキュメント「テナント境界」）は変えず、読み取り側は候補を絞るためだけに
+/// 索引パーティションを読み取り専用で参照する（候補は必ず `with_visible_row` で可視性・TABLE-12 整合・
+/// `WHERE` を再評価される）。主キーは常に序数 0（[`key_specs`]）。
+pub(crate) struct PkIndexProbe {
+    signature: Vec<u8>,
+}
+
+impl PkIndexProbe {
+    /// `schema` の現在の宣言（主キー・UNIQUE 制約・式／部分 UNIQUE 索引）から、書き込み側と同じ
+    /// マーカーのシグネチャを組み立てる。宣言の読み取りや式の再束縛に失敗した場合（カタログ破損）は
+    /// 呼び出し側が fail-closed に拒否する。
+    pub(crate) fn for_read<R: crate::storage::read_source::ReadSource>(
+        source: &R,
+        table_name: &str,
+        schema: &TableSchema,
+    ) -> Result<Self, TenantWriteError> {
+        let decls = crate::catalog::table_expression_decls_in_source(source, table_name)?;
+        let plan = UniqueKeyPlan::build(schema, &decls)?;
+        let compiled = crate::sql::expression_key_index::CompiledIndexExpressions::compile(
+            schema,
+            &decls.keys,
+        )?;
+        let signature = unique_index::signature_for_read(schema, &plan, compiled.as_ref())?;
+        Ok(Self { signature })
+    }
+
+    /// テナント `tenant_id` の索引が現在の宣言で構築済みか（読み取り専用。不在・不一致は `false`）。
+    pub(crate) fn marker_valid<I>(
+        &self,
+        index_table: &I,
+        tenant_id: &str,
+    ) -> Result<bool, TenantWriteError>
+    where
+        I: ReadableTable<(&'static str, &'static [u8]), &'static [u8]>,
+    {
+        unique_index::marker_valid_read_only(index_table, tenant_id, &self.signature)
+    }
+
+    /// 主キーの正準キーから行 locator を点照会する（stale な値も返りうる。呼び出し側が行を読み戻して
+    /// 述語を再評価する）。
+    pub(crate) fn lookup_primary_key<I>(
+        &self,
+        index_table: &I,
+        tenant_id: &str,
+        canonical_key: &[u8],
+    ) -> Result<Option<u64>, TenantWriteError>
+    where
+        I: ReadableTable<(&'static str, &'static [u8]), &'static [u8]>,
+    {
+        unique_index::lookup_forward_read_only(index_table, tenant_id, 0, canonical_key)
+    }
+}
+
 /// クラッシュ耐性検証ツール（`examples/crash_tool_unique_index.rs`）専用の
 /// 読み取り専用診断 API（[`EngineCore::verify_unique_index_read_only`] から
 /// 呼ばれる。Issue #1070・PR #1123 レビュー対応）。テナントの永続一意索引が
