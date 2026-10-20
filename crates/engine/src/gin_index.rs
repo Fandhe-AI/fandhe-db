@@ -10,6 +10,9 @@
 //! - TRUNCATE: `tenant.rs::truncate_tables_unchecked` → [`clear_tenant_in_txn`]
 //! - `CREATE INDEX` の初回構築: `catalog.rs::create_index_bound` → [`build_all_tenants_in_txn`]
 //! - 診断: `EngineCore::verify_gin_index_read_only` → [`audit_tenant_read_only`]
+//! - 読み取り（Issue #2208）: `sql::gin_scan`（広域取得 `sql::scan` の候補探査）→ [`GinIndexProbe`]・
+//!   [`posting_range_bounds`]・[`decode_posting_rowid`]。**読み取り専用**で、索引・マーカーを一切書き換えない
+//!   （マーカーが無効なテナントは呼び出し側が行範囲の走査へ縮退する）。
 //!
 //! 抽出規則と上限は [`extract`]、設計判断は `docs/design/gin-jsonb-index.md`（D3〜D8・§8）を参照。
 //!
@@ -438,6 +441,75 @@ where
     Ok(true)
 }
 
+/// 読み取り側（`sql::gin_scan`）の窓口。宣言と実スキーマから書き込み側と**同じ**シグネチャを組み立て、
+/// テナントのマーカーを読み取り専用で照合する（形式版とシグネチャの完全一致。D9）。書き込み側の
+/// [`signature`]・[`marker_matches`] を共有するため、読み取り側が独自のマーカー規則を持たない。
+pub(crate) struct GinIndexProbe {
+    signature: Vec<u8>,
+}
+
+impl GinIndexProbe {
+    /// 宣言 `decl` を `schema` の実列へ解決してシグネチャを作る。列が無い・jsonb でない場合は内部矛盾
+    /// （通常は起きない）で、呼び出し側は固定文言の内部エラーとして fail-closed に拒否する。
+    pub(crate) fn for_read(
+        schema: &TableSchema,
+        decl: &DeclaredGinIndex,
+    ) -> Result<Self, TenantWriteError> {
+        let target = resolve_target(schema, decl)?;
+        Ok(Self {
+            signature: signature(&target)?,
+        })
+    }
+
+    /// テナント `tenant` の索引が現在の宣言で構築済みか。マーカー不在・不一致は `false`
+    /// （遅延再構築前の状態。呼び出し側は行範囲の走査へ縮退する）。
+    pub(crate) fn marker_valid<I>(
+        &self,
+        index: &I,
+        tenant: &str,
+    ) -> Result<bool, redb::StorageError>
+    where
+        I: ReadableTable<(&'static str, &'static [u8]), &'static [u8]>,
+    {
+        Ok(match index.get((tenant, MARKER_SUBKEY.as_slice()))? {
+            Some(guard) => marker_matches(guard.value(), &self.signature),
+            None => false,
+        })
+    }
+}
+
+/// エントリ `entry` のポスティング範囲 `[0x01][len: u16 BE][entry][rowid 0..=MAX]` の下端・上端
+/// （閉区間のサブキー）。エントリ長が `u16` に収まらなければ `None`（索引不可。抽出側の上限で
+/// 通常は起きない）。長さ接頭辞により、`a` の範囲に `ab` のポスティングは入らない。
+pub(crate) fn posting_range_bounds(entry: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let len = u16::try_from(entry.len()).ok()?;
+    let mut prefix = Vec::with_capacity(3 + entry.len() + 8);
+    prefix.push(POSTING_TAG);
+    prefix.extend_from_slice(&len.to_be_bytes());
+    prefix.extend_from_slice(entry);
+    let mut lo = prefix.clone();
+    lo.extend_from_slice(&0u64.to_be_bytes());
+    let mut hi = prefix;
+    hi.extend_from_slice(&u64::MAX.to_be_bytes());
+    Some((lo, hi))
+}
+
+/// ポスティングのサブキーから rowid を復号する。サブキーが `entry` の範囲の形（長さ・接頭辞）に
+/// 完全一致しない場合は `None`（破損。呼び出し側は固定文言の内部エラーで fail-closed にする）。
+pub(crate) fn decode_posting_rowid(subkey: &[u8], entry: &[u8]) -> Option<RowId> {
+    let len = u16::try_from(entry.len()).ok()?;
+    let prefix_len = 3usize.checked_add(entry.len())?;
+    if subkey.len() != prefix_len.checked_add(8)?
+        || subkey.first() != Some(&POSTING_TAG)
+        || subkey.get(1..3) != Some(len.to_be_bytes().as_slice())
+        || subkey.get(3..prefix_len) != Some(entry)
+    {
+        return None;
+    }
+    let raw: [u8; 8] = subkey.get(prefix_len..)?.try_into().ok()?;
+    Some(RowId::from_index_raw(u64::from_be_bytes(raw)))
+}
+
 /// 書き込んだ行 `written_ids`（同一テナント）のエントリを、宣言済みの全 GIN 索引へ反映する
 /// （`constraint::enforce_row_constraints_in_txn` から呼ばれる維持の唯一の入口）。マーカーが無効な
 /// テナントは先に自テナントの既存行から再構築する。読み戻せない id は削除扱いで後片付けする。
@@ -755,5 +827,37 @@ mod tests {
         let mut other_version = value.clone();
         other_version[3] ^= 1;
         assert!(!marker_matches(&other_version, &sig));
+    }
+
+    #[test]
+    fn posting_range_is_prefix_free_and_rowid_round_trips() {
+        let a = vec![0x01, b'a'];
+        let ab = vec![0x01, b'a', b'b'];
+        let (lo, hi) = posting_range_bounds(&a).unwrap();
+        let in_range = |sub: &[u8]| lo.as_slice() <= sub && sub <= hi.as_slice();
+        let id = RowId::from_index_raw(7);
+        assert!(in_range(&posting_subkey(&a, id).unwrap()));
+        assert!(!in_range(&posting_subkey(&ab, id).unwrap()));
+        assert!(in_range(
+            &posting_subkey(&a, RowId::from_index_raw(u64::MAX)).unwrap()
+        ));
+        assert_eq!(
+            decode_posting_rowid(&posting_subkey(&a, id).unwrap(), &a),
+            Some(id)
+        );
+        // 別エントリの形・切り詰め・余剰・別タグは拒否する。
+        assert_eq!(
+            decode_posting_rowid(&posting_subkey(&ab, id).unwrap(), &a),
+            None
+        );
+        let good = posting_subkey(&a, id).unwrap();
+        assert_eq!(decode_posting_rowid(&good[..good.len() - 1], &a), None);
+        let mut extra = good.clone();
+        extra.push(0);
+        assert_eq!(decode_posting_rowid(&extra, &a), None);
+        let mut other_tag = good.clone();
+        other_tag[0] = REVERSE_TAG;
+        assert_eq!(decode_posting_rowid(&other_tag, &a), None);
+        assert_eq!(decode_posting_rowid(&[], &a), None);
     }
 }

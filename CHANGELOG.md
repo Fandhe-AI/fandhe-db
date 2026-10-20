@@ -9,6 +9,12 @@
 
 ### Breaking Changes
 
+- GIN 相当索引の読み取り（Issue #2208・INDEX-8）: 広域取得で jsonb 列への `@>`・`?`・`?|`・`?&`（`jsonb_ops`）と
+  `@>`・`@?`・`@@`（`jsonb_path_ops`）が GIN 相当索引のポスティングで候補を絞るようになった（候補は全走査と同じ可視性判定と
+  WHERE 全体の再評価を通るため、結果の行・順序・`LIMIT`／`OFFSET` の数え方は不変）。`EXPLAIN` はこの形のときだけ
+  `scalar_plan: index_gin index=<索引名>`・`access_path: gin_index_candidates` を出す（従来は `plain_scan`／`full_scan`）。
+  PK 点検索が成り立つ文は従来どおり PK が優先。`ORDER BY`・ウィンドウ・OR・NOT・空集合の問い合わせ・許可形でない jsonpath は不変。
+  公開 API は `ScalarPlan::IndexGin` の追加（`#[non_exhaustive]`）。詳細は [gin-jsonb-index.md](docs/design/gin-jsonb-index.md) の §9。
 - GIN 相当索引のキー抽出と DML 維持（Issue #2207・INDEX-8）: `CREATE INDEX ... USING gin` の宣言が物理テーブル
   `user_gin/{索引名}` のポスティングを持つようになり、INSERT・UPSERT・UPDATE・DELETE・COPY・TRUNCATE・分割実行 DML・
   FK 参照アクションと同じ write txn で維持する（`CREATE INDEX` は既存行から同期構築）。1 値あたり 65,535 エントリ・

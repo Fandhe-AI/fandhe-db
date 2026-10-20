@@ -338,3 +338,59 @@ INDEX-8 ポインタ（関連: INDEX-7・TABLE-12・TABLE-16・RLS-9・RLS-10・
 - ポスティングの範囲走査は `[0x01][entry_len][entry]` を接頭辞にする。マーカー判定は `gin_index::marker_matches` 相当
   （形式版とシグネチャの完全一致）を読み取り専用で行い、不一致のテナントは行範囲の全走査へ倒す。
 - 候補は行を読み戻して可視性・TABLE-12 整合・元の述語の再評価（recheck）を通す（stale・ハッシュ衝突はここで除かれる）。
+
+## 9. Issue #2208 実装記録（読み取り側と EXPLAIN）
+
+ビヘイビア: INDEX-8（関連: INDEX-7・TABLE-12・RLS-9・RLS-10・SQL-6・SQL-27）。D5・D6 の問い合わせ側、D9、EXPLAIN を担当する。
+実装は `sql::gin_scan`（静的分類と候補探査。`sql::pk_point` と同じ型）、`gin_index::extract` の `query_*`（問い合わせ側の抽出）、
+`gin_index::GinIndexProbe`（読み取り専用のマーカー照合）、`sql::scan` の dispatch、`core.rs::scan_explain_result`。
+
+### 9.1 適用範囲と選択規則
+
+- 対象は順序なしの広域取得（`ORDER BY`・ウィンドウ無し）。経路の優先順位は PK 点検索 → GIN → 全走査で、実行と EXPLAIN が
+  同じ分類関数（`classify_gin_scan`）を呼ぶ。
+- 索引候補にするのは `expr_filters`（トップレベルの AND 連言）で**最初に条件を満たした 1 述語**だけ。`or_filters`・`NOT` の内側・
+  複数述語や複数索引の交差は対象外。
+- `@>` は `jsonb_path_ops` を先に、次に `jsonb_ops`（どちらの中でも索引名の昇順）。`?`・`?|`・`?&` は `jsonb_ops` のみ、
+  `@?`・`@@` は `jsonb_path_ops` のみ。`<@`・左辺がリテラルの `@>`・右辺がリテラルでない形は全走査。
+- `@?`・`@@` は演算子形のみ（`vars` なし・`silent` 定数 true・SQL/JSON 句なし）で、lax モードの次の許可形だけ索引化する。
+  `@@` は `$.a.b == <リテラル>`（左右どちらでも可）。`@?` は `$.a.b ? (@.c.d == <リテラル>)`（フィルタは末尾の 1 個。`@` 単独も可）。
+  リテラルは文字列・真偽・数値（`null` と符号付き数値は対象外）。ワイルドカード・添字・`.**`・メソッド・変数・算術・
+  `!=`／範囲比較・`&&`／`||`・`exists`・`starts with` は全走査。関数形（`jsonb_path_exists(...)`）も全走査。
+
+### 9.2 問い合わせキーと縮退
+
+- `jsonb_ops` の `@>` は右辺に格納側と同じ抽出を適用する（ただし右辺が最上位の文字列スカラーのときはキー用タグのみ。D5）。
+  `?` 系はキー用タグ（`?|` は和、それ以外は積）。`jsonb_path_ops` の `@>` は格納側と同じ経路抽出（配列透過）、
+  `@?`／`@@` は経路と値から葉エントリ 1 件を作る。葉ハッシュと経路符号化は格納側と**同じ関数**を共有する。
+- 次の場合は全走査へ倒す（fail-soft。エラーにしない）: キー集合が空（`@> '{}'`・`?& '{}'`・NULL のみのキー）、抽出が上限を超えた、
+  キー数が `MAX_GIN_QUERY_KEYS`（64）を超えた、形を判断できない。
+- マーカーが無効（不在・形式版またはシグネチャの不一致）なテナントは、そのテナントの行範囲を走査する。結果は同じ。
+- 積は leapfrog 交差（先頭が遠いときは範囲を開き直して飛ぶ）、和は `BinaryHeap` による k-way マージ（重複 rowid は 1 回）。
+  メモリは O(キー数)。出力はテナント昇順 → rowid 昇順で全走査の物理順と一致し、`LIMIT`／`OFFSET` の数え方も同じ。
+
+### 9.3 EXPLAIN
+
+`scalar_plan: index_gin index=<索引名>`（`ScalarPlan::IndexGin`）と `access_path: gin_index_candidates`
+（`AccessPath::GinIndexCandidates`）。索引名は INDEX-7 と同じ `index=<name>` 接尾辞。EXPLAIN は静的判定だけで `user_gin/*` を開かず、
+縮退・候補数・テナントの有無を出さない。索引カタログは GIN になりうる形の述語がある文でだけ読む。
+
+### 9.4 PostgreSQL 17 との差
+
+- `jsonb_ops` では `@?`・`@@` を索引化しない（PostgreSQL は対応）。複数述語の交差（bitmap AND/OR 相当）はしない。
+  関数形の `jsonb_path_*` は PostgreSQL も索引化しないため同じ。
+- 候補にならない行で述語の評価がエラーになる場合（包含判定のステップ上限等）、全走査と索引経路で表面化のしかたが異なりうる
+  （PK 点検索と `LIMIT` の早期打ち切りに同じ前例がある）。正常系の結果集合には影響しない。
+
+### 9.5 要確認（自動運転下の判断で、人間の確認が要る事項）
+
+- EXPLAIN の新語彙（`index_gin`・`gin_index_candidates`）。語彙数は SQL-27 の確定時に spec 側とすり合わせる。
+- 問い合わせキー数の上限値（64）。
+- `@>` で `jsonb_path_ops` を優先する選択規則。
+- jsonpath の許可形から `null` リテラルと符号付き数値・`$` 単独を外したこと。
+- SCHEMA 修飾の PR とのマージ順で、物理名（`user_gin_table_name`）と表示名の追随が要ること。
+
+### 9.6 対象外
+
+集計・`GROUP BY`・`ORDER BY` 付き scan・ウィンドウ・検索 SELECT（ハイブリッド）・UPDATE／DELETE の WHERE への適用、
+複数索引の交差、`jsonb_ops` での `@?`／`@@`、許可形より広い jsonpath、CLI の上限フラグ、crash テストと越境マトリクス（#2209）。
