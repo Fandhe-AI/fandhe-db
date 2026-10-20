@@ -25,7 +25,8 @@ mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
 const TENANT: &str = "alice";
-const COLUMNS: &str = "(name TEXT NOT NULL, qty INTEGER DEFAULT 7, code TEXT UNIQUE)";
+const COLUMNS: &str =
+    "(id BIGINT PRIMARY KEY, name TEXT NOT NULL, qty INTEGER DEFAULT 7, code TEXT UNIQUE)";
 
 fn ctx(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
@@ -81,9 +82,9 @@ fn count(core: &EngineCore, s: &mut SessionState, table: &str) -> String {
 
 /// `{Q}` を修飾子（空文字または `public.`）へ置換して実行する、修飾の有無で結果が一致するべき台本。
 const SCRIPT: &[&str] = &[
-    "CREATE TABLE {Q}t (name TEXT NOT NULL, qty INTEGER DEFAULT 7, code TEXT UNIQUE)",
-    "CREATE TABLE IF NOT EXISTS {Q}t (name TEXT NOT NULL)",
-    "CREATE TABLE {Q}p (name TEXT)",
+    "CREATE TABLE {Q}t (id BIGINT PRIMARY KEY, name TEXT NOT NULL, qty INTEGER DEFAULT 7, code TEXT UNIQUE)",
+    "CREATE TABLE IF NOT EXISTS {Q}t (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
+    "CREATE TABLE {Q}p (id BIGINT PRIMARY KEY, name TEXT)",
     "INSERT INTO {Q}t (id, name, qty, code) VALUES (1, 'a', 10, 'c1')",
     "INSERT INTO {Q}t (id, name, qty, code) VALUES (2, 'b', 20, 'c2'), (3, 'c', 30, 'c3')",
     "INSERT INTO {Q}t (id, name, qty, code) VALUES (9, 'x', 1, 'c1')",
@@ -103,7 +104,7 @@ const SCRIPT: &[&str] = &[
     "UPDATE {Q}t SET qty = 51 WHERE id = 5 RETURNING id, qty",
     "DELETE FROM {Q}t WHERE id = 5 RETURNING id, name",
     "CREATE INDEX t_qty ON {Q}t (qty)",
-    "CREATE TABLE {Q}c (pid BIGINT REFERENCES {Q}p (id))",
+    "CREATE TABLE {Q}c (id BIGINT PRIMARY KEY, pid BIGINT REFERENCES {Q}p (id))",
     "INSERT INTO {Q}c (id, pid) VALUES (1, 1)",
     "INSERT INTO {Q}c (id, pid) VALUES (2, 99)",
     "ALTER TABLE {Q}t ADD COLUMN extra TEXT",
