@@ -188,8 +188,12 @@ pub(crate) fn rewrite_rows_with_conversion_in_txn(
                 None => return Err(corrupt("row vanished during column rewrite")),
             };
             // 行キーとヘッダのテナントの整合もここで検証される（不整合は破損として固定文言）。
-            let row = decode_row_for_key(tenant, *id, &raw)
-                .map_err(|_| corrupt("failed to decode row during column rewrite"))?;
+            let row = decode_row_for_key(
+                tenant,
+                crate::storage::rowid::RowId::from_legacy_id(*id),
+                &raw,
+            )
+            .map_err(|_| corrupt("failed to decode row during column rewrite"))?;
             let mut values = decode_scalar_columns(old_schema, &row.metadata)
                 .map_err(|_| corrupt("failed to decode row payload during column rewrite"))?;
             let converted = {
@@ -284,8 +288,12 @@ fn scan_rows_in_txn(
                 Some(g) => g.value().to_vec(),
                 None => return Err(corrupt("row vanished during column rewrite")),
             };
-            let row = decode_row_for_key(tenant, *id, &raw)
-                .map_err(|_| corrupt("failed to decode row during column rewrite"))?;
+            let row = decode_row_for_key(
+                tenant,
+                crate::storage::rowid::RowId::from_legacy_id(*id),
+                &raw,
+            )
+            .map_err(|_| corrupt("failed to decode row during column rewrite"))?;
             let mut values = decode_scalar_columns(old_schema, &row.metadata)
                 .map_err(|_| corrupt("failed to decode row payload during column rewrite"))?;
             let slot = values

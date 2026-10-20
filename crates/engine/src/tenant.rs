@@ -33,9 +33,11 @@
 
 use redb::{ReadableDatabase, ReadableTable};
 
+use crate::storage::rowid::{row_key, RowId};
+
 use crate::catalog::{
-    map_row_table_error, require_table_schema_write, user_rows_table_def, user_rows_table_name,
-    validate_identifier, CatalogError,
+    map_row_table_error, require_table_schema_write, require_table_schema_write_any_identity,
+    user_rows_table_def, user_rows_table_name, validate_identifier, CatalogError,
 };
 use crate::kernel::SearchHit;
 use crate::policy::PolicyContext;
@@ -636,6 +638,10 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::IdConflict => ErrorClass::UniqueViolation,
             TenantWriteError::DuplicateOperationId => ErrorClass::DuplicateOperationId,
             TenantWriteError::MissingOperationId => ErrorClass::MissingOperationId,
+            // 行識別方式が未対応の表（TABLE-23・Issue #2193）は固定文言で `0A000` に写像する。
+            TenantWriteError::Catalog(e) if crate::catalog::is_row_identity_unsupported(e) => {
+                ErrorClass::FeatureNotSupported
+            }
             TenantWriteError::Catalog(_)
             | TenantWriteError::Storage(_)
             | TenantWriteError::LedgerCorrupted(_) => ErrorClass::InternalError,
@@ -1012,7 +1018,7 @@ pub(crate) fn insert_row_unchecked(
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
         // 物理キーはサーバー側導出テナントで名前空間化する（TABLE-12・RLS-9）。
-        let key = (ctx.tenant_id(), id);
+        let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
         // `CHECK` 制約（Issue #906）と `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905）の
         // テナント内一意性制約（いずれも TABLE-16・TASK-204）は、
@@ -1196,7 +1202,7 @@ pub(crate) fn insert_rows_unchecked(
             .map_err(map_row_table_error)?;
         for ((id, row), range) in rows.iter().zip(ranges.iter()) {
             schema.validate_row_embedding_dim(row.embedding.len())?;
-            let key = (ctx.tenant_id(), *id);
+            let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(*id));
             let encoded = arena.get(range.clone()).ok_or_else(|| {
                 TenantWriteError::Storage(StorageError::Codec(
                     "batch encode arena range out of bounds".to_string(),
@@ -1785,7 +1791,7 @@ pub(crate) fn insert_typed_row_unchecked(
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
-        let key = (ctx.tenant_id(), id);
+        let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
         let encoded = encode_row(&row)?;
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
         drop(row_table);
@@ -2003,7 +2009,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                     embedding,
                     metadata: &metadata,
                 };
-                let key = (ctx.tenant_id(), *id);
+                let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(*id));
                 let encoded = encode_row(&row)?;
                 insert_unique_row(&mut row_table, key, encoded.as_slice())?;
             }
@@ -2514,7 +2520,7 @@ fn upsert_typed_rows_impl(
                 // `insert` と衝突しないようこのブロック内に閉じ込める。
                 let conflict_state: ConflictState = match conflict_id {
                     Some(cid) => match row_table
-                        .get(&(ctx.tenant_id(), cid))
+                        .get(&row_key(ctx.tenant_id(), RowId::from_legacy_id(cid)))
                         .map_err(CatalogError::from)?
                     {
                         Some(guard) => {
@@ -2531,7 +2537,7 @@ fn upsert_typed_rows_impl(
                                         UpsertAction::DoUpdate(_) => ConflictState::Visible(Some(
                                             crate::storage::decode_row_for_key(
                                                 ctx.tenant_id(),
-                                                cid,
+                                                RowId::from_legacy_id(cid),
                                                 raw,
                                             )
                                             .map_err(TenantWriteError::Storage)?,
@@ -2567,7 +2573,7 @@ fn upsert_typed_rows_impl(
                             )));
                         }
                     };
-                    let key = (ctx.tenant_id(), write_id);
+                    let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(write_id));
                     match action {
                         UpsertAction::DoNothing => {
                             // 変更なし（新規挿入もしない）。
@@ -2716,7 +2722,7 @@ fn upsert_typed_rows_impl(
                     // 拒否する——PostgreSQL の「arbiter でない制約の違反は吸収しない」
                     // 挙動と同じ）。既存 `insert_typed_rows_unchecked` と同じ組み立て
                     // （Issue #995: `VECTOR` 列なしスキーマは embedding 空）。
-                    let key = (ctx.tenant_id(), *id);
+                    let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(*id));
                     let embedding: &[f32] = match vector_idx {
                         Some(idx) => match values.get(idx) {
                             Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
@@ -2902,7 +2908,7 @@ pub(crate) fn update_row_unchecked(
             // キーと食い違う場合も fail-closed 側に倒れる）。
             // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用（`insert`）と
             // 衝突しないようにする。
-            let key = (ctx.tenant_id(), id);
+            let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
             let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
                 Some(guard) => {
                     let (existing_tenant, _existing_visibility) =
@@ -2922,7 +2928,7 @@ pub(crate) fn update_row_unchecked(
                         {
                             if let Ok(existing) = crate::storage::decode_row_for_key(
                                 ctx.tenant_id(),
-                                id,
+                                RowId::from_legacy_id(id),
                                 guard.value(),
                             ) {
                                 if let Ok(old_values) = crate::row_codec::decode_scalar_columns(
@@ -3925,7 +3931,7 @@ pub(crate) fn update_row_columns_capturing_unchecked(
                 .map_err(map_row_table_error)?;
             // `AccessGuard` の借用はこのブロック内に閉じ込め、後続の可変借用
             // （`insert`）と衝突しないようにする（`update_row_unchecked` と同じ設計）。
-            let key = (ctx.tenant_id(), id);
+            let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
             // ヘッダのみを検証してから可視性を判定する（codex-review P0 再々指摘・
             // PR #989・`crates/engine/src/tenant.rs:1696`）: フル本体デコード
             // （`decode_row_for_key`。embedding・metadata を含む）を `is_visible`
@@ -3956,7 +3962,7 @@ pub(crate) fn update_row_columns_capturing_unchecked(
                             // 伝播しても、不存在の id との応答差にはならない。
                             Some(crate::storage::decode_row_for_key(
                                 ctx.tenant_id(),
-                                id,
+                                RowId::from_legacy_id(id),
                                 raw,
                             )?)
                         }
@@ -4394,7 +4400,7 @@ fn delete_row_impl(
                 .open_table(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             // `update_row` と同じく `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御。
-            let key = (ctx.tenant_id(), id);
+            let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
             let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
                 Some(guard) => {
                     let (existing_tenant, existing_visibility) =
@@ -4423,11 +4429,13 @@ fn delete_row_impl(
                         // 共用すると `map_insert_write_error` が `22000`（クライアント
                         // 入力不正）へ丸めてしまうため、専用 variant
                         // `CapturedRowDecodeFailed` で `XX000` に固定する）。
-                        let row = crate::storage::decode_row(id, guard.value()).map_err(|e| {
-                            TenantWriteError::CapturedRowDecodeFailed(format!(
-                                "captured row decode failed: {e}"
-                            ))
-                        })?;
+                        let row =
+                            crate::storage::decode_row(RowId::from_legacy_id(id), guard.value())
+                                .map_err(|e| {
+                                    TenantWriteError::CapturedRowDecodeFailed(format!(
+                                        "captured row decode failed: {e}"
+                                    ))
+                                })?;
                         let mut values =
                             crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
                                 .map_err(|e| {
@@ -5239,17 +5247,18 @@ fn apply_predicate_delete_in_txn<E>(
                 break;
             }
             applied += 1;
-            let key = (ctx.tenant_id(), *id);
+            let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(*id));
             let removed_guard = row_table
                 .remove(&key)
                 .map_err(|e| dml_write_err(CatalogError::from(e)))?;
             if needs_fk_removed_pre_image || project.is_some() {
                 if let Some(guard) = removed_guard {
-                    let row = crate::storage::decode_row(*id, guard.value()).map_err(|e| {
-                        dml_write_err(TenantWriteError::CapturedRowDecodeFailed(format!(
-                            "removed row decode failed: {e}"
-                        )))
-                    })?;
+                    let row = crate::storage::decode_row(RowId::from_legacy_id(*id), guard.value())
+                        .map_err(|e| {
+                            dml_write_err(TenantWriteError::CapturedRowDecodeFailed(format!(
+                                "removed row decode failed: {e}"
+                            )))
+                        })?;
                     let values = captured_values_from_parts(schema, row.embedding, &row.metadata)
                         .map_err(dml_write_err)?;
                     if needs_fk_removed_pre_image {
@@ -5338,15 +5347,17 @@ fn apply_predicate_update_in_txn<E>(
                 break;
             }
             applied += 1;
-            let key = (ctx.tenant_id(), *id);
+            let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(*id));
             let existing = match row_table
                 .get(&key)
                 .map_err(|e| dml_write_err(CatalogError::from(e)))?
             {
-                Some(guard) => {
-                    crate::storage::decode_row_for_key(ctx.tenant_id(), *id, guard.value())
-                        .map_err(dml_write_err)?
-                }
+                Some(guard) => crate::storage::decode_row_for_key(
+                    ctx.tenant_id(),
+                    RowId::from_legacy_id(*id),
+                    guard.value(),
+                )
+                .map_err(dml_write_err)?,
                 None => {
                     // 列挙後・適用前の並行削除（同一トランザクション内で候補行は
                     // 列挙時に読み取り済みのため、redb の単一ライター制約下では
@@ -5532,7 +5543,7 @@ pub(crate) fn truncate_tables_unchecked(
                 // 全表のスキーマを確定する（並行 DDL で不在になっていれば `42P01` で全体 abort）。
                 let mut schemas = Vec::with_capacity(all_tables.len());
                 for table in all_tables {
-                    schemas.push(require_table_schema_write(write_txn, table)?);
+                    schemas.push(require_table_schema_write_any_identity(write_txn, table)?);
                 }
 
                 // 台帳ハッシュ: CASCADE は利用者が書いた表の正規化集合（別ドメイン）。RESTRICT は
@@ -5914,11 +5925,13 @@ pub(crate) fn replace_typed_rows_by_text_key(
                     .map_err(CatalogError::from)?;
                 if needs_fk_removed_pre_image {
                     if let Some(guard) = removed_guard {
-                        let row = crate::storage::decode_row(*id, guard.value()).map_err(|e| {
-                            TenantWriteError::CapturedRowDecodeFailed(format!(
-                                "removed row decode failed: {e}"
-                            ))
-                        })?;
+                        let row =
+                            crate::storage::decode_row(RowId::from_legacy_id(*id), guard.value())
+                                .map_err(|e| {
+                                TenantWriteError::CapturedRowDecodeFailed(format!(
+                                    "removed row decode failed: {e}"
+                                ))
+                            })?;
                         let values =
                             crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
                                 .map_err(|e| {
@@ -5974,7 +5987,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
                     metadata: &metadata,
                 };
                 let id = next_id;
-                let key = (ctx.tenant_id(), id);
+                let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
                 // 上の採番規則により既存行との衝突は起こらないはずだが、`insert_row` と
                 // 同じ防御（TOCTOU 対策の単一 write トランザクション内チェック）を残す。
                 if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
@@ -7566,7 +7579,8 @@ mod tests {
             // 適用前の生バイトを読み、参照オラクルで期待値を計算してから
             // 実装を実行し、書き込まれた生バイトと突き合わせる。
             let before = raw_row_bytes(&storage, "docs", "tenant-a", id);
-            let existing = crate::storage::decode_row(id, &before).expect("decode seeded row");
+            let existing = crate::storage::decode_row(RowId::from_legacy_id(id), &before)
+                .expect("decode seeded row");
             let (expected_embedding, expected_metadata) = legacy_predicate_update_reencode(
                 &schema,
                 &existing.metadata,
@@ -8320,7 +8334,7 @@ mod tests {
                 assert_eq!(header_visibility, Visibility::Private);
                 // 一方でフル本体デコードは失敗する（末尾切り詰めにより
                 // `metadata` フィールドが宣言長に届かない）。
-                assert!(crate::storage::decode_row(1, corrupted).is_err());
+                assert!(crate::storage::decode_row(RowId::from_legacy_id(1), corrupted).is_err());
                 row_table
                     .insert(key, corrupted)
                     .expect("overwrite with corrupted body");
@@ -9269,7 +9283,7 @@ mod tests {
                 .value()
                 .to_vec();
             let corrupted = &existing[..existing.len() - 4];
-            assert!(crate::storage::decode_row(id, corrupted).is_err());
+            assert!(crate::storage::decode_row(RowId::from_legacy_id(id), corrupted).is_err());
             t.insert(key, corrupted).expect("overwrite");
         }
         crate::catalog::bump_table_generation_in_txn(&write_txn, "docs").expect("bump generation");

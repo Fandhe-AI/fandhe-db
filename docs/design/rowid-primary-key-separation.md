@@ -145,3 +145,31 @@ sub-issue #2200 が spec に従って確定し、運用文書化する。
 
 未決・確認事項は各 sub-issue が spec に従って確定する。管理者の承認が得られた時点で、承認済みの
 範囲を spec 側の「公開境界」記録と合わせて本書へ反映する。
+
+## 7. Issue #2193 実装記録（第 1 段: 物理キーの型と採番器）
+
+ADR §3 の D1・D2・D3 と、§4「表のライフサイクル」の項、D8 の一時表・旧 `rows` 表の項を挙動不変で実装した。
+契約の詳細は公開境界の注記のとおり本書に記載せず、spec のポインタ（TABLE-23。関連: TABLE-12・TABLE-16・RLS-9・RLS-10）を正とする。
+
+- **`RowId`（`storage::rowid`）**: 行ストアの物理キーの要素を `pub(crate)` の newtype として区別する。`Display` を実装しない。
+  物理キーの組み立て・分解は `row_key`／`split_row_key` に集約した（`storage.rs`・`txn.rs`・`tenant.rs`）。
+- **行識別方式（`catalog::RowIdentity`）**: カタログ属性。永続化形式・互換性の詳細は記載しない（ポインタ: TABLE-23）。
+- **採番器（`catalog::rowid_alloc`）**: 実装は `crates/engine/src/catalog/rowid_alloc.rs`。契約の詳細は記載しない（ポインタ: TABLE-23）。
+- **ゲート**: 採番方式の表は、後続 sub-issue の対応が揃うまで DML・読み取りを固定文言（値を含まない）で拒否する。
+- **非露出の回帰テスト**: `tests/table23_rowid_storage.rs`、`catalog/rowid_gate_tests.rs`。
+
+### 公開 API 棚卸し（§5 の #2193 成果物）
+
+| API | 本 PR での扱い | 後続担当 |
+| --- | --- | --- |
+| `tenant::insert_row`／`insert_rows`／`insert_typed_row`／`update_row`／`delete_row` の `id` | 従来方式の `id` 列値として不変（内部で `RowId` へ変換） | #2197 |
+| `Storage::put`／`put_batch`／`get`、`txn::WriteTxn::put`（旧 `rows` 表） | 恒久的に従来方式（rowid = 呼び出し元 `id`。Rust API 専用でカタログ外） | なし |
+| `storage::Row.id`・`catalog::StorageRow` | `id` 列値（従来方式で rowid と恒等）。core API スナップショット不変 | #2197 |
+| `Storage::get_row_from_table`・`scan_table_page`・`RowCursor (String, u64)` | 従来方式のみ受理。採番方式の表は拒否（カーソルに rowid を出さない） | #2197（不透明カーソル化の要否） |
+| `StorageError::NotFound(u64)`・`CatalogError::RowNotFound(u64)` の文面 | 従来方式では利用者 `id`。採番方式の表へは到達しない（ゲート） | #2197 |
+| `SearchHit` 等の検索結果 id | 不変 | #2195 |
+| NoSQL `where.id`・SQL `WHERE id = n`・`ON CONFLICT (id)` | 不変 | #2197／#2199 |
+| 分割実行 DML のカーソル | 不変 | #2196 |
+
+未移行モジュール（`constraint.rs`・`key_index.rs`・`column_rewrite.rs`・`sql/*`・`arena.rs`・`rls.rs`・`recovery/ledger.rs`
+等）は `user_rows` のキーの `u64` を従来どおり直接扱う。これらは担当 sub-issue（#2194〜#2196）が `RowId` へ移す。

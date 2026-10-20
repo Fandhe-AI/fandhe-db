@@ -118,3 +118,9 @@ SQL-19（述語形 UPDATE/DELETE）が定める 1 文あたり影響行数上限
 適用しない（全行削除が目的の操作のため）。`retain_in` は候補 id を `Vec` へ
 materialize しないため、`MAX_SCANNED_ROWS`／`MAX_VISIBLE_ROWS` のような DoS 上限も
 構造的に不要である。
+
+## Issue #2193 追記（rowid 関連状態の扱い）
+
+`TRUNCATE` の rowid 関連状態の扱いは spec のポインタ（TABLE-23）を正とし、本書には記載しない。
+実装は `tenant::truncate_tables_unchecked` が `require_table_schema_write_any_identity` を通す
+（[rowid-primary-key-separation.md](rowid-primary-key-separation.md)）。

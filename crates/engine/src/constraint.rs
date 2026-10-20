@@ -2885,8 +2885,12 @@ fn snapshot_child_rows_before_pass2(
         let Some(guard) = row_table.get((tenant_id, id)).map_err(CatalogError::from)? else {
             continue;
         };
-        let existing = crate::storage::decode_row_for_key(tenant_id, id, guard.value())
-            .map_err(TenantWriteError::Storage)?;
+        let existing = crate::storage::decode_row_for_key(
+            tenant_id,
+            crate::storage::rowid::RowId::from_legacy_id(id),
+            guard.value(),
+        )
+        .map_err(TenantWriteError::Storage)?;
         // `guard`（`row_table` の不変借用）は `existing` がデータを複製済みの
         // ため、明示的な drop は不要（このスコープ内で `row_table` への可変
         // 借用を行わないため、借用チェッカ上も問題ない）。
@@ -4316,8 +4320,12 @@ fn apply_referential_action(
                 // 同一トランザクション内で既に削除された等（多段連鎖の交差）。
                 continue;
             };
-            let existing = crate::storage::decode_row_for_key(tenant_id, *id, guard.value())
-                .map_err(TenantWriteError::Storage)?;
+            let existing = crate::storage::decode_row_for_key(
+                tenant_id,
+                crate::storage::rowid::RowId::from_legacy_id(*id),
+                guard.value(),
+            )
+            .map_err(TenantWriteError::Storage)?;
             // `guard`（`row_table` の不変借用）を、直後の可変借用（`insert`）と
             // 衝突しないよう明示的に drop する（`existing` は既にデータを
             // 複製済みのため、以降 `guard`／借用元バッファへは触れない）。

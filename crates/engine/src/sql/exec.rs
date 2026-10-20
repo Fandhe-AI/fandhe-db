@@ -4398,6 +4398,12 @@ pub(crate) fn map_write_error(
         // 行データとは無関係のサーバー内部事象であり、クライアントの行を「不正」と
         // 誤認させると誤った再試行を誘発する（Cursor Bugbot 指摘・PR #226）。下の
         // `_` 節（`XX000`）へ委ねる。
+        // 行識別方式が未対応の表（TABLE-23・Issue #2193）は固定文言の `0A000`。入力不正ではない。
+        TenantWriteError::Catalog(e) if crate::catalog::is_row_identity_unsupported(&e) => {
+            SqlSurfaceError::FeatureNotSupported {
+                detail: crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE.to_string(),
+            }
+        }
         TenantWriteError::Catalog(CatalogError::Invalid(_))
         | TenantWriteError::Storage(StorageError::Codec(_)) => {
             SqlSurfaceError::invalid_input(format!("{op} rejected: invalid row"))
@@ -5597,6 +5603,13 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         },
         IncrementalError::Write(TenantWriteError::Catalog(CatalogError::TableNotFound(name))) => {
             SqlSurfaceError::UndefinedTable { name }
+        }
+        IncrementalError::Write(TenantWriteError::Catalog(e))
+            if crate::catalog::is_row_identity_unsupported(&e) =>
+        {
+            SqlSurfaceError::FeatureNotSupported {
+                detail: crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE.to_string(),
+            }
         }
         IncrementalError::Write(TenantWriteError::Catalog(CatalogError::Invalid(_))) => {
             SqlSurfaceError::invalid_input("insert rejected: invalid row")
