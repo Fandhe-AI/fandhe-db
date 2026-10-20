@@ -9,6 +9,11 @@
 
 ### Breaking Changes
 
+- 既存表の `id` の移行（Issue #2200・TABLE-23）: 既存データディレクトリを開く時点で、従来方式の永続表のカタログを
+  移行済みの印（v15 の `rowmode:migrated`。`RowIdentity::MigratedId`）へ一方向に書き換える（表ごとに原子的・再 open で収束。
+  行・キー・索引・台帳は書き換えず、既存クエリの結果と wire の型 OID は不変）。壊れたカタログ項目は移行せず残す。
+  運用手順（バックアップ）は README を参照。
+  BREAKING CHANGE: 移行後のデータディレクトリは旧バイナリでは開けない（`rowmode:migrated` を不正値として拒否する）。
 - 暗黙の `id` の廃止（Issue #2199・TABLE-23）: SQL 表層の `CREATE TABLE`・`CREATE TEMP TABLE` で新しく作る表は暗黙の
   `id` 疑似列を持たない（PG と同じ表定義）。`id` は予約名ではなくなり、`id` を通常の列として宣言でき（`tenant_id`・
   `visibility`・`check`・`constraint` は引き続き予約）、PRIMARY KEY を持たない表・`id` 列を持たない表を作れる。
