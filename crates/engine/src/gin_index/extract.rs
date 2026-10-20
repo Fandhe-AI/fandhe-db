@@ -2,7 +2,8 @@
 //!
 //! 親モジュール [`super`]（`gin_index.rs`）の書き込み経路（`constraint::enforce_row_constraints_in_txn`
 //! 経由の DML 維持・`CREATE INDEX` の初回構築）が、jsonb 値 1 件から演算子クラスごとの索引エントリ
-//! 集合を得るために呼ぶ純粋関数群。Issue #2208 の読み取り側も問い合わせ側の抽出に同じ規則を使う前提で、
+//! 集合を得るために呼ぶ純粋関数群。Issue #2208 の読み取り側（`sql::gin_scan`）も問い合わせ側の抽出に
+//! 同じ規則（`query_*` 関数群。葉ハッシュ・経路符号化・値の正規化は格納側と共有）を使うため、
 //! 抽出規則（`docs/design/gin-jsonb-index.md` D5・D6）を本ファイルに一本化する。
 //!
 //! # エントリ形式（永続形式の一部。変更時は [`super::FORMAT_VERSION`] を上げる）
@@ -200,8 +201,7 @@ fn walk_path(
         JsonValue::Object(map) => {
             for (k, val) in map {
                 let mark = path.len();
-                path.extend_from_slice(&(k.len() as u64).to_be_bytes());
-                path.extend_from_slice(k.as_bytes());
+                push_path_segment(path, k);
                 walk_path(val, path, out)?;
                 path.truncate(mark);
             }
@@ -213,20 +213,105 @@ fn walk_path(
             }
         }
         scalar => {
-            let (tag, payload) = scalar_parts(scalar)?;
-            let mut h = Fnv1a64::new();
-            h.write(path);
-            h.write(&[tag]);
-            h.write(&(payload.len() as u64).to_be_bytes());
-            h.write(&payload);
-            let mut e = Vec::with_capacity(9);
-            e.push(PATH_HASH_TAG);
-            e.extend_from_slice(&h.finish().to_be_bytes());
+            let e = path_leaf_entry(path, scalar)?;
             // ハッシュ長は固定のため、バイト長上限は適用しない。
             out.push(e, false)?;
         }
     }
     Ok(())
+}
+
+/// `jsonb_path_ops` の経路キー 1 段（`[len: u64 BE][UTF-8 キー]`）を `path` へ足す。格納側
+/// （[`walk_path`]）と問い合わせ側（[`query_path_leaf_entry`]）が同じ符号化を共有する
+/// （第 2 の実装を作らない。偽陰性の根拠）。
+fn push_path_segment(path: &mut Vec<u8>, key: &str) {
+    path.extend_from_slice(&(key.len() as u64).to_be_bytes());
+    path.extend_from_slice(key.as_bytes());
+}
+
+/// `jsonb_path_ops` の葉エントリ `[0x03][FNV-1a 64 BE]` を、経路 `path` とスカラー `scalar` から作る。
+/// 格納側と問い合わせ側の共有関数（永続形式の一部。変更時は [`super::FORMAT_VERSION`] を上げる）。
+fn path_leaf_entry(path: &[u8], scalar: &JsonValue) -> Result<Vec<u8>, GinExtractError> {
+    let (tag, payload) = scalar_parts(scalar)?;
+    let mut h = Fnv1a64::new();
+    h.write(path);
+    h.write(&[tag]);
+    h.write(&(payload.len() as u64).to_be_bytes());
+    h.write(&payload);
+    let mut e = Vec::with_capacity(9);
+    e.push(PATH_HASH_TAG);
+    e.extend_from_slice(&h.finish().to_be_bytes());
+    Ok(e)
+}
+
+/// 問い合わせ側が 1 回の探査で同時に開くポスティング範囲の上限。超える問い合わせは索引不可として
+/// 全走査へ倒す（数万本の範囲反復器を同時に開く DoS を避ける。`sql::gin_scan` が呼ぶ）。
+/// 自動運転下の判断で、人間の確認が要る（`docs/design/gin-jsonb-index.md` §9）。
+pub(crate) const MAX_GIN_QUERY_KEYS: usize = 64;
+
+/// 問い合わせキー集合を確定する共通の出口。空・上限超過は `None`（索引不可。全走査へ倒す）。
+fn finish_query(set: BTreeSet<Vec<u8>>) -> Option<Vec<Vec<u8>>> {
+    if set.is_empty() || set.len() > MAX_GIN_QUERY_KEYS {
+        return None;
+    }
+    Some(set.into_iter().collect())
+}
+
+/// `col @> query` の問い合わせエントリ（積。すべてのエントリが必要）。`jsonb_contains(S, Q)` が真なら
+/// 返り値は `extract_entries(S)` の部分集合になる（D5・D6）。`jsonb_ops` では、右辺が最上位の文字列
+/// スカラーのときだけキー用タグのみを返す（`'["bar"]' @> '"bar"'` は格納側にキー用タグしか無い）。
+/// 空の容器・上限超過・抽出不能は `None`（索引不可。「索引から全行」を返す経路を作らない）。
+pub(crate) fn query_contains_entries(
+    opclass: GinOpClass,
+    query: &JsonValue,
+    limits: &GinLimits,
+) -> Option<Vec<Vec<u8>>> {
+    let mut out = Collector {
+        set: BTreeSet::new(),
+        limits: *limits,
+    };
+    let result = match opclass {
+        GinOpClass::JsonbOps => match query {
+            JsonValue::String(s) => key_entry(s, &mut out),
+            other => walk_ops(other, false, &mut out),
+        },
+        GinOpClass::JsonbPathOps => {
+            let mut path: Vec<u8> = Vec::new();
+            walk_path(query, &mut path, &mut out)
+        }
+    };
+    result.ok()?;
+    finish_query(out.set)
+}
+
+/// `col ? key`／`?|`／`?&` の問い合わせエントリ（キー用タグ `[0x01][key]`。`jsonb_ops` 専用）。
+/// `keys` は NULL 要素を除いた後のキー列。空・上限超過・キー長超過は `None`（索引不可）。
+pub(crate) fn query_key_entries<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    limits: &GinLimits,
+) -> Option<Vec<Vec<u8>>> {
+    let mut out = Collector {
+        set: BTreeSet::new(),
+        limits: *limits,
+    };
+    for key in keys {
+        key_entry(key, &mut out).ok()?;
+    }
+    finish_query(out.set)
+}
+
+/// `jsonb_path_ops` の jsonpath 許可形（`@@`・`@?`）用の葉エントリ 1 件。`members` はルートからの
+/// メンバー名の列（配列は透過なので添字・ワイルドカードは受け付けない）、`scalar` は比較リテラル
+/// （容器は不可）。格納側と同じ [`push_path_segment`]・[`path_leaf_entry`] を通す。
+pub(crate) fn query_path_leaf_entry<'a>(
+    members: impl IntoIterator<Item = &'a str>,
+    scalar: &JsonValue,
+) -> Option<Vec<u8>> {
+    let mut path: Vec<u8> = Vec::new();
+    for m in members {
+        push_path_segment(&mut path, m);
+    }
+    path_leaf_entry(&path, scalar).ok()
 }
 
 /// FNV-1a 64 ビット。永続形式の一部（`jsonb_path_ops` のエントリ）なので、アルゴリズムを変える場合は
@@ -399,5 +484,213 @@ mod tests {
             extract_entries_from_text(GinOpClass::JsonbOps, "{", &GinLimits::default()),
             Err(GinExtractError::Invalid)
         );
+    }
+    // ---- 問い合わせ側の抽出（Issue #2208）: 偽陰性なしの性質テスト ----
+
+    const DOCS: &[&str] = &[
+        r#"{}"#,
+        r#"[]"#,
+        r#"{"a":1}"#,
+        r#"{"a":1.0}"#,
+        r#"{"a":10e-1,"b":"x"}"#,
+        r#"{"a":-0}"#,
+        r#"{"a":0}"#,
+        r#"{"a":"bar"}"#,
+        r#"{"a":["bar","baz"]}"#,
+        r#"{"a":{"b":{"c":true}}}"#,
+        r#"{"a":[{"b":1},{"b":2,"c":null}]}"#,
+        r#"{"a":[[1,2],[3]]}"#,
+        r#"["foo","bar"]"#,
+        r#"["foo",1,null,true,{"k":"v"}]"#,
+        r#"[1,2,[1,3]]"#,
+        r#"[[1,3]]"#,
+        r#""bar""#,
+        r#""foo""#,
+        r#"1"#,
+        r#"1.0"#,
+        r#"true"#,
+        r#"null"#,
+        r#"{"tags":["a","b"],"meta":{"k":"v","n":[1,2,3]}}"#,
+        r#"{"k":"v","k2":"v2","k3":{"x":[{"y":"z"}]}}"#,
+        r#"[{"a":1,"b":2}]"#,
+        r#"{"a":[]}"#,
+        r#"{"a":{}}"#,
+        r#"{"":""}"#,
+        r#"{"a":"1"}"#,
+        r#"{"ab":1}"#,
+    ];
+
+    const QUERIES: &[&str] = &[
+        r#"{}"#,
+        r#"[]"#,
+        r#"{"a":1}"#,
+        r#"{"a":1.0}"#,
+        r#"{"a":10e-1}"#,
+        r#"{"a":0}"#,
+        r#"{"a":-0}"#,
+        r#"{"a":"bar"}"#,
+        r#"{"a":["bar"]}"#,
+        r#"{"a":{"b":{}}}"#,
+        r#"{"a":{"b":{"c":true}}}"#,
+        r#"{"a":[{"b":1}]}"#,
+        r#"{"a":[[1]]}"#,
+        r#"{"a":[]}"#,
+        r#"["bar"]"#,
+        r#"["foo",1]"#,
+        r#"[[1,3]]"#,
+        r#"[1,3]"#,
+        r#"[{"a":1}]"#,
+        r#"[{"k":"v"}]"#,
+        r#""bar""#,
+        r#""foo""#,
+        r#"1"#,
+        r#"1.0"#,
+        r#"true"#,
+        r#"null"#,
+        r#"{"tags":["a"]}"#,
+        r#"{"meta":{"n":[2]}}"#,
+        r#"{"k":"v"}"#,
+        r#"{"":""}"#,
+        r#"{"a":"1"}"#,
+    ];
+
+    fn parsed(text: &str) -> JsonValue {
+        crate::json::parse_json(text).unwrap()
+    }
+
+    #[test]
+    fn contains_query_entries_are_subset_of_stored_entries_whenever_contained() {
+        let limits = GinLimits::default();
+        for opclass in [GinOpClass::JsonbOps, GinOpClass::JsonbPathOps] {
+            let mut matched = 0usize;
+            for s in DOCS {
+                let stored = extract_entries_from_text(opclass, s, &limits).unwrap();
+                for q in QUERIES {
+                    if !crate::json::jsonb_contains(s, q).unwrap() {
+                        continue;
+                    }
+                    matched += 1;
+                    let Some(keys) = query_contains_entries(opclass, &parsed(q), &limits) else {
+                        continue;
+                    };
+                    for key in &keys {
+                        assert!(
+                            stored.contains(key),
+                            "false negative: opclass={opclass:?} stored={s} query={q}"
+                        );
+                    }
+                }
+            }
+            assert!(matched > 40, "corpus must exercise containment: {matched}");
+        }
+    }
+
+    #[test]
+    fn exists_query_entries_are_subset_of_jsonb_ops_entries_whenever_key_exists() {
+        let limits = GinLimits::default();
+        let keys = ["a", "b", "foo", "bar", "k", "tags", "x", "", "1", "v", "ab"];
+        for s in DOCS {
+            let stored = extract_entries_from_text(GinOpClass::JsonbOps, s, &limits).unwrap();
+            for key in keys {
+                if crate::json::jsonb_exists(s, key).unwrap() {
+                    let q = query_key_entries([key], &limits).unwrap();
+                    assert!(q.iter().all(|e| stored.contains(e)), "{s} ? {key}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn top_level_string_query_uses_key_tag_only() {
+        let limits = GinLimits::default();
+        let q = query_contains_entries(GinOpClass::JsonbOps, &parsed(r#""bar""#), &limits).unwrap();
+        assert_eq!(q, vec![k("bar")]);
+        // 格納側の `["bar"]` はキー用タグしか持たないため、値用タグを要求してはならない。
+        let stored = ops(r#"["bar"]"#);
+        assert!(q.iter().all(|e| stored.contains(e)));
+    }
+
+    #[test]
+    fn query_returns_none_for_empty_and_oversized_sets() {
+        let limits = GinLimits::default();
+        for opclass in [GinOpClass::JsonbOps, GinOpClass::JsonbPathOps] {
+            assert!(query_contains_entries(opclass, &parsed("{}"), &limits).is_none());
+            assert!(query_contains_entries(opclass, &parsed("[]"), &limits).is_none());
+        }
+        // 空の容器だけを持つ値は `jsonb_path_ops` では葉が無い（`jsonb_ops` はキー `a` が残る）。
+        assert!(
+            query_contains_entries(GinOpClass::JsonbPathOps, &parsed(r#"{"a":[]}"#), &limits)
+                .is_none()
+        );
+        assert!(query_key_entries(std::iter::empty::<&str>(), &limits).is_none());
+        let many: Vec<String> = (0..=MAX_GIN_QUERY_KEYS).map(|i| format!("k{i}")).collect();
+        assert!(query_key_entries(many.iter().map(String::as_str), &limits).is_none());
+        let ok: Vec<String> = (0..MAX_GIN_QUERY_KEYS).map(|i| format!("k{i}")).collect();
+        assert!(query_key_entries(ok.iter().map(String::as_str), &limits).is_some());
+        let big = format!(
+            "[{}]",
+            (0..=MAX_GIN_QUERY_KEYS)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(query_contains_entries(GinOpClass::JsonbPathOps, &parsed(&big), &limits).is_none());
+        // 長すぎるキーは索引不可（fail-soft）。
+        let long = "k".repeat(MAX_GIN_KEY_BYTES + 1);
+        assert!(query_key_entries([long.as_str()], &limits).is_none());
+    }
+
+    #[test]
+    fn path_leaf_query_matches_stored_leaf_entries() {
+        let stored = path_ops(r#"{"a":{"b":"x"},"c":[1,2]}"#);
+        let e = query_path_leaf_entry(["a", "b"], &JsonValue::String("x".to_string())).unwrap();
+        assert!(stored.contains(&e));
+        let e = query_path_leaf_entry(["c"], &parsed("2.0")).unwrap();
+        assert!(stored.contains(&e));
+        let e = query_path_leaf_entry(["a", "b"], &JsonValue::String("y".to_string())).unwrap();
+        assert!(!stored.contains(&e));
+        // 容器は葉になれない。
+        assert!(query_path_leaf_entry(["a"], &parsed("[1]")).is_none());
+    }
+
+    #[test]
+    fn number_equality_by_comparison_implies_same_equality_key() {
+        use crate::json::cmp_json_numbers;
+        let nums = [
+            "0",
+            "-0",
+            "0.0",
+            "1",
+            "1.0",
+            "10e-1",
+            "1E0",
+            "0.1e1",
+            "100",
+            "1e2",
+            "1.00e2",
+            "-1",
+            "-1.0",
+            "123456789012345678901234567890",
+            "1.23456789012345678901234567890e29",
+            "1e400",
+            "1.0e400",
+            "0.5",
+            "5e-1",
+            "-0.0e5",
+        ];
+        for a in nums {
+            for b in nums {
+                let (JsonValue::Number(x), JsonValue::Number(y)) = (parsed(a), parsed(b)) else {
+                    panic!("not numbers");
+                };
+                if cmp_json_numbers(&x, &y) == Some(std::cmp::Ordering::Equal) {
+                    assert_eq!(
+                        scalar_equality_key(&JsonValue::Number(x)).unwrap(),
+                        scalar_equality_key(&JsonValue::Number(y)).unwrap(),
+                        "{a} vs {b}"
+                    );
+                }
+            }
+        }
     }
 }

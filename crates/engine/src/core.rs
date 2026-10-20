@@ -9134,7 +9134,7 @@ impl EngineCore {
         validated: &crate::sql::allowlist::ValidatedScan,
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
         let bound = crate::sql::parser::bind_scan_with_dummy_flags(
             validated,
             &schema,
@@ -9142,46 +9142,75 @@ impl EngineCore {
             &[],
             &self.result_limits,
         )?;
+        let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
         Ok(crate::sql::SqlOutcome::Explain(Self::scan_explain_result(
-            &schema, &bound,
+            &schema, &bound, &gins,
         )))
     }
 
+    /// 広域取得（scan）の `EXPLAIN` が GIN 相当索引の分類に使う宣言を読む（INDEX-8、Issue #2208）。
+    /// 索引カタログは GIN の対象になりうる形の述語がある文でだけ読む
+    /// （[`crate::sql::gin_scan::may_use_gin`]。それ以外の文でカタログ読み取りを増やさない）。
+    /// 実行側（`sql::scan`）と同じ判定を共有するため、2 行は実経路と矛盾しない。
+    fn gin_decls_for_explain(
+        read_txn: &redb::ReadTransaction,
+        bound: &crate::sql::parser::BoundScan,
+    ) -> Result<Vec<crate::catalog::DeclaredGinIndex>, crate::sql::allowlist::SqlSurfaceError> {
+        if !crate::sql::gin_scan::may_use_gin(bound) {
+            return Ok(Vec::new());
+        }
+        crate::catalog::table_expression_decls_in_source(read_txn, bound.table())
+            .map(|decls| decls.gins)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "gin index declaration lookup failed".to_string(),
+            })
+    }
+
     /// 広域取得（scan）の `QUERY PLAN` 応答を組み立てる（Issue #948・
-    /// NOSQL-16・SQL-27・TASK-186）。`sql::scan` はランキング段・索引・
-    /// キャッシュのいずれも消費しない（`sql::scan` モジュールドキュメント
-    /// 参照）ため、値は常に固定（`scalar_plan: plain_scan`／
-    /// `access_path: full_scan`）。[`Self::run_relational_explain_scan`]
-    /// （SQL `EXPLAIN SELECT ... LIMIT n` テキスト経由）と
-    /// [`Self::explain_bound_scan_in_session`]（NoSQL 表層の `scan` op の
-    /// `explain: true`）の両方が共有する。
+    /// NOSQL-16・SQL-27・TASK-186）。`sql::scan` は既定では
+    /// `scalar_plan: plain_scan`／`access_path: full_scan` の全行走査で、次の 2 経路だけが静的分類で
+    /// 候補を絞る（実行側 `sql::scan` と同じ分類関数を呼ぶので、2 行は実経路と矛盾しない。D5「矛盾出力の
+    /// 防止」）。優先順位は PK 点検索 → GIN → 全走査。実行時の縮退（テナントごとのマーカー欠落による
+    /// 行範囲走査）は実行時の事実であり、ここには露出しない（可視カーディナリティ・テナントの存在情報に
+    /// 繋がる値を出さない）。
+    ///
+    /// - 宣言 PRIMARY KEY の全構成列へのリテラル等価（Issue #2198・TABLE-23）:
+    ///   `index_primary_key`／`primary_key_lookup`。
+    /// - jsonb 列への包含・キー存在・jsonpath 演算子と GIN 相当索引（Issue #2208・INDEX-8）:
+    ///   `index_gin index=<索引名>`／`gin_index_candidates`。
+    ///
+    /// [`Self::run_relational_explain_scan`]（SQL `EXPLAIN SELECT ... LIMIT n` テキスト経由）と
+    /// [`Self::explain_bound_scan_in_session`]（NoSQL 表層の `scan` op の `explain: true`）の両方が
+    /// 共有する。`gins` は [`Self::gin_decls_for_explain`] が読んだ対象表の GIN 宣言。
     fn scan_explain_result(
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundScan,
+        gins: &[crate::catalog::DeclaredGinIndex],
     ) -> crate::sql::exec::QueryResult {
-        // 宣言 PRIMARY KEY の全構成列へのリテラル等価は永続一意索引の点検索で実行される
-        // （Issue #2198・TABLE-23）。実行側（`sql::scan`）と同じ静的分類
-        // （`sql::pk_point::classify_pk_point`）を呼ぶので、2 行は実経路と矛盾しない。テナントごとの
-        // マーカー欠落による範囲走査への縮退は実行時の縮退であり、ここには露出しない（可視カーディナリティ・
-        // テナントの存在情報に繋がる値を出さない）。
-        let (scalar_plan, access_path) =
+        use crate::sql::explain::{AccessPath, ExplainIndexNames};
+        use crate::sql::scalar_plan::ScalarPlan;
+        let gin_plan = crate::sql::gin_scan::classify_gin_scan(schema, bound, gins);
+        let (scalar_plan, access_path, names) =
             if crate::sql::pk_point::classify_pk_point(schema, bound).is_point() {
                 (
-                    crate::sql::scalar_plan::ScalarPlan::IndexPrimaryKey,
-                    crate::sql::explain::AccessPath::PrimaryKeyLookup,
+                    ScalarPlan::IndexPrimaryKey,
+                    AccessPath::PrimaryKeyLookup,
+                    ExplainIndexNames::default(),
+                )
+            } else if let Some(index_name) = gin_plan.index_name() {
+                (
+                    ScalarPlan::IndexGin,
+                    AccessPath::GinIndexCandidates,
+                    ExplainIndexNames::new(Vec::new(), vec![index_name.to_string()]),
                 )
             } else {
                 (
-                    crate::sql::scalar_plan::ScalarPlan::PlainScan,
-                    crate::sql::explain::AccessPath::FullScan,
+                    ScalarPlan::PlainScan,
+                    AccessPath::FullScan,
+                    ExplainIndexNames::default(),
                 )
             };
-        crate::sql::explain::build_relational_explain_result(
-            scalar_plan,
-            None,
-            access_path,
-            &crate::sql::explain::ExplainIndexNames::default(),
-        )
+        crate::sql::explain::build_relational_explain_result(scalar_plan, None, access_path, &names)
     }
 
     /// 束縛済み `USING PLAN` 検索計画の EXPLAIN（TASK-186・NOSQL-10。
@@ -9363,7 +9392,7 @@ impl EngineCore {
     /// [`Self::execute_bound_scan_in_session`] と同型の設計・処理順序
     /// （`docs/design/bound-plan-session-entry.md` 参照）で、実行本体
     /// （[`Self::run_scan_plan`]）を呼ばず [`Self::scan_explain_result`]
-    /// （固定値。SQL `EXPLAIN` 経路と共有）だけを呼ぶ。`ctx` を残す理由・
+    /// （静的分類だけ。SQL `EXPLAIN` 経路と共有）を呼ぶ。`ctx` を残す理由・
     /// テナント判定への不使用は [`Self::explain_bound_search_in_session`]
     /// と同じ。
     pub fn explain_bound_scan_in_session<F>(
@@ -9380,7 +9409,7 @@ impl EngineCore {
         )
             -> Result<crate::sql::parser::BoundScan, crate::sql::allowlist::SqlSurfaceError>,
     {
-        let (_read_txn, schema) = self.read_txn_with_schema(table)?;
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
             return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
@@ -9388,7 +9417,8 @@ impl EngineCore {
             ));
         }
         self.check_bound_limit(bound.limit())?;
-        Ok(Self::scan_explain_result(&schema, &bound))
+        let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
+        Ok(Self::scan_explain_result(&schema, &bound, &gins))
     }
 
     /// 束縛済み集計計画（[`crate::sql::parser::BoundAggregate`]。`GROUP BY`
