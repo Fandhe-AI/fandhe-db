@@ -16,6 +16,7 @@
   公開 API は `Statement::SetSearchPath`・`ShowSearchPath`、`SqlOutcome::SetSearchPath`、`Token::QuotedDollarUser`、
   `SqlSurfaceError::NoSchemaSelected`、`ValidatedCreateTable.public_qualified`（pub フィールド追加）、`sql::search_path` の追加。
   BREAKING CHANGE: `Statement`・`SqlOutcome`・`Token`・`SqlSurfaceError` を網羅的に `match` するコードは variant の追従が必要。
+- NoSQL の単一行アドレスと insert・scan を PRIMARY KEY 基準へ移行（Issue #2201・TABLE-23・NOSQL-23）: SQL の `CREATE TABLE` で作った表（採番方式）に対して NoSQL の `scan`（`explain` を含む）・`insert`（`id` 不要）・`update`／`delete`（`where` に PRIMARY KEY の列を指定、複合可。PK なし表の単一行形は `42601`・述語形 `filter` は使える）が使える。疑似列 `id` を持つ表の `where: {"id": n}` は互換のまま。NoSQL の `aggregate`／`search` は採番方式の表に対して引き続き `0A000`。`update`／`delete` の `where` の型検査は表のスキーマ解決後（未知キーは従来どおり `42601`）。既存の要求は同じ応答を返すため、既存クライアントへの破壊的変更ではない。
 - 既存表の `id` の移行（Issue #2200・TABLE-23）: 既存データディレクトリを開く時点で、従来方式の永続表のカタログを
   移行済みの印（v15 の `rowmode:migrated`。`RowIdentity::MigratedId`）へ一方向に書き換える（表ごとに原子的・再 open で収束。
   行・キー・索引・台帳は書き換えず、既存クエリの結果と wire の型 OID は不変）。壊れたカタログ項目は移行せず残す。

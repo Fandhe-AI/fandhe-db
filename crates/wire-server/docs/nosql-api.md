@@ -5,7 +5,7 @@
 （`search`／`scan`／`aggregate`／`insert`／`update`／`delete`／`create_table`／
 `alter_table`／`drop_table`／`show_partitioned_dml`／`cancel_partitioned_dml`）の JSON
 スキーマを利用者向けに整理する。
-`update`／`delete` は `where`（単一行・`id` 完全一致形）・`filter`（述語形）の
+`update`／`delete` は `where`（単一行・PRIMARY KEY 列〔複合可〕または従来方式の表の `id`）・`filter`（述語形）の
 いずれも束縛・実行結線済み（後述の各節参照）。`create_table`／`alter_table`／
 `drop_table`（DDL 3 op）は
 `--ddl-allowed-users` に列挙したユーザーのみ実行できる（後述の各節参照）。
@@ -382,7 +382,7 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
 | --- | --- | --- | --- |
 | `op` | ○ | string | `"insert"` |
 | `table` | ○ | string | |
-| `rows` | ○ | object[] | 各行は `id`（非負整数）＋スキーマ列名をキーとする値 |
+| `rows` | ○ | object[] | 各行はスキーマ列名をキーとする値。疑似列 `id` を持つ表（従来方式・NoSQL `create_table` で作った表）は `id`（非負整数）が必須。SQL の `CREATE TABLE` で作った表（暗黙の `id` を持たない採番方式。TABLE-23・NOSQL-23。Issue #2201）は `id` を要求せず、宣言した `id` 列は通常の列として扱い、宣言のない `id` キーは `22000`。PRIMARY KEY 列の省略は `23502`（`DEFAULT` があれば適用）、PK 重複は `23505`。行の識別子（rowid）は応答に出ない |
 | `operation_id` | △ | string | 既定では省略可（欠落・`null`・空文字は台帳に記録しない通常の書き込み。成功応答に `operation_id` キーなし）。`--require-operation-id` の構成では欠落・`null`・空文字はいずれも `23502` |
 
 要求例:
@@ -471,7 +471,7 @@ SQL の `WHERE` 句省略とのパリティ）。
 | `op` | ○ | string | `"update"` |
 | `table` | ○ | string | |
 | `set` | ○ | object（任意キー・非空） | 列名をキーに持つ部分更新。`id`／`tenant_id`／`visibility` は `42601`。`TEXT` 列は JSON 文字列、`VECTOR` 列は数値配列（**文字列形のベクトルリテラルは受理しない**）のみ受理。他の列型は `insert` と同じ JSON 表現（Issue #896・NOSQL-17。上記参照）。`null` は列型を問わず nullable 判定込みで `bind_update` へ委譲する（非 nullable 列への `null` は `22000`）。型不一致・未知列・次元不一致は `22000`（新型の型不一致は `42601`） |
-| `where` | △ | `{"id": number}` | 単一行・`id` 完全一致形。小数は `22000`、負数は `42601`（SQL 表層の字句解析・束縛とのパリティ。詳細は design doc 参照）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
+| `where` | △ | object | 単一行アドレス（Issue #2201・TABLE-23・NOSQL-23）。キー集合が表の PRIMARY KEY の列集合と完全一致（複合可。値は `filter` の `eq` と同じ型規則）、または疑似列 `id` を持つ表で `{"id": number}`（小数は `22000`、負数は `42601`。SQL 表層とのパリティ）。PK なし表・キーの過不足・未知列・`null` 値・空オブジェクトは `42601`（副作用なし。述語形 `filter` は使える）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `UPDATE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
 | `operation_id` | △ | string | 既定では省略可（成功応答に `operation_id` キーなし）。`--require-operation-id` の構成では欠落・`null`・空文字は `23502`（分割実行は構成によらず `23502`）。同一値への再送は台帳照合により内容一致 `23505`（`DUPLICATE_OPERATION_ID`）・不一致 `22023`（SQL 表層と共有） |
 | `mode` | | string | 分割実行の修飾（Issue #1130・NOSQL-12）。受理値は `"partitioned"` のみで、それ以外の文字列・非文字列は `42601`（黙って原子実行へ切り替えない）。`filter`（述語形）とだけ組み合わせられ、`where` との併用は `42601`。詳細は[分割実行](#分割実行-dml)参照 |
@@ -524,7 +524,7 @@ execute_delete`）・同一の台帳キー空間を共有する。`filter`（述
 | --- | --- | --- | --- |
 | `op` | ○ | string | `"delete"` |
 | `table` | ○ | string | |
-| `where` | △ | `{"id": number}` | 単一行・`id` 完全一致形。小数は `22000`、負数は `42601`（SQL 表層とのパリティ）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
+| `where` | △ | object | 単一行アドレス（Issue #2201・TABLE-23・NOSQL-23）。キー集合が表の PRIMARY KEY の列集合と完全一致（複合可。値は `filter` の `eq` と同じ型規則）、または疑似列 `id` を持つ表で `{"id": number}`（小数は `22000`、負数は `42601`。SQL 表層とのパリティ）。PK なし表・キーの過不足・未知列・`null` 値・空オブジェクトは `42601`（副作用なし。述語形 `filter` は使える）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `DELETE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
 | `operation_id` | △ | string | 既定では省略可（成功応答に `operation_id` キーなし）。`--require-operation-id` の構成では欠落・`null`・空文字は `23502`（分割実行は構成によらず `23502`）。同一値への再送は台帳照合により `23505`（`DUPLICATE_OPERATION_ID`。内容一致。`DELETE` は行の有無に関わらず同一内容） |
 | `mode` | | string | 分割実行の修飾（Issue #1130・NOSQL-12）。受理値は `"partitioned"` のみで、それ以外の文字列・非文字列は `42601`（黙って原子実行へ切り替えない）。`filter`（述語形）とだけ組み合わせられ、`where` との併用は `42601`。詳細は[分割実行](#分割実行-dml)参照 |
@@ -989,8 +989,10 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 | `EXPLAIN SELECT COUNT(*) FROM docs` | `aggregate` + `"explain":true`（Issue #948） |
 | `INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID 'op-1'` | `insert` + `operation_id` |
 | `UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-1'` | `update` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
+| `UPDATE t SET v = 'x' WHERE a = 'k' AND b = 1 USING OPERATION_ID 'op-1'`（複合 PRIMARY KEY `(a, b)`） | `update` + `where: {"a": "k", "b": 1}` + `operation_id`（PK の等価述語。同一実行器・同一台帳キー空間。Issue #2201） |
 | `UPDATE docs SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `update` + `filter` + `operation_id`（結線済み。同一実行器・同一台帳キー空間。Issue #1062） |
 | `DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'op-1'` | `delete` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
+| `DELETE FROM t WHERE a = 'k' AND b = 1 USING OPERATION_ID 'op-1'`（複合 PRIMARY KEY `(a, b)`） | `delete` + `where: {"a": "k", "b": 1}` + `operation_id`（Issue #2201） |
 | `DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `delete` + `filter` + `operation_id`（結線済み。同一実行器・同一台帳キー空間。Issue #1062） |
 | `CREATE TABLE docs (embedding VECTOR(3), lang TEXT)` | `create_table` + `columns`（Issue #910。同一実行器） |
 | `CREATE TABLE posts (tags TEXT[8], price NUMERIC(10,2), mood mood)` | `create_table` + `columns`（`type:"array"`＋`element_type`／`max_len`、`numeric`、`enum`。Issue #1409。同一実行器・同一カタログ表現） |
