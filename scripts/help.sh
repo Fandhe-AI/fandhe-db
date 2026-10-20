@@ -78,6 +78,9 @@ cat <<'EOF'
   crash-test-temp-table
       一時表の異常終了後残骸・crash 耐性回帰テスト
       $ scripts/crash_test_temp_table.sh
+  crash-test-view-write
+      ビュー書き込みの crash 耐性・台帳再送の回帰テスト
+      $ scripts/crash_test_view_write.sh
   tmp-leak-check
       テスト一時領域の残置検出ゲート
       $ scripts/check_tmp_leak.sh
@@ -133,6 +136,7 @@ cat <<'EOF'
       $ scripts/crash_test_unique_index.sh
       $ scripts/crash_test_partitioned_dml.sh
       $ scripts/crash_test_temp_table.sh
+      $ scripts/crash_test_view_write.sh
       $ scripts/check_tmp_leak.sh
       $ scripts/core_api_check.sh
       $ scripts/sort_determinism_check.sh
