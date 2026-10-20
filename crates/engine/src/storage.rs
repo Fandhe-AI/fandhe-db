@@ -744,7 +744,11 @@ impl Storage {
         durability: WriteDurability,
     ) -> Result<Self> {
         let db = redb::Database::create(path)?;
-        Ok(Self::from_db(db, durability))
+        let storage = Self::from_db(db, durability);
+        // 旧形式の表の `id` を移行済みの印へ一方向に移す（TABLE-23・Issue #2200）。
+        // 一時表用の `open_with_backend` は対象外（永続 DB のカタログだけを移す）。
+        crate::catalog::legacy_id_migration::migrate_legacy_ids(&storage)?;
+        Ok(storage)
     }
 
     /// 開いた `redb::Database` から `Storage` を組み立てる共通本体。
