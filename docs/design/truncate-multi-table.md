@@ -108,9 +108,10 @@
 - 所有関係は SEQUENCE の定義 blob に格納する。所有者ありだけ版 3（版 2 の固定部 + 表名・列名を u16 LE 長さ付きで
   連結）で書き、所有者なしは従来の版 2 のバイト列のまま。旧バイナリは版 3 を `CorruptSchema` で拒否する。
   `ALTER SEQUENCE` は所有者を引き継ぐ。
-- 所有者を設定する入口は `Storage::set_sequence_owner`（`pub(crate)`）のみ。`OWNED BY` 構文・SERIAL／IDENTITY の
-  結線・DROP TABLE／DROP COLUMN／RENAME での追従は #1694 の範囲のため、**それまで SQL から所有者を作れず、
-  `RESTART IDENTITY` は受理されるが採番には作用しない**（所有 SEQUENCE が無い表では PostgreSQL も no-op）。
+- 所有者を設定する入口は `set_sequence_owner_in_txn`（`pub(crate)`）。SERIAL の結線と DROP TABLE／DROP COLUMN／
+  RENAME での追従は Issue #1694 で着地した（[sequence-namespace-and-ledger.md](sequence-namespace-and-ledger.md) §12）。
+  `OWNED BY` 構文・IDENTITY の結線は未着地のため、SERIAL 以外の表では `RESTART IDENTITY` は受理されるが採番には
+  作用しない（所有 SEQUENCE が無い表では PostgreSQL も no-op）。
 
 ### 実行
 

@@ -33,7 +33,7 @@ use crate::storage::read_source::ReadSource;
 
 use super::{
     get_table_schema_in_txn, list_tables_in_txn, validate_identifier, CatalogError, ColumnDefault,
-    Result, Storage, MAX_LIST_TABLES,
+    Result, Storage, TableSchema, MAX_LIST_TABLES,
 };
 
 /// SEQUENCE 定義の専用カタログ表。キーは `(schema, name)`。#1711 より前の schema は
@@ -973,7 +973,6 @@ pub(crate) fn reset_sequence_state_in_txn(
 /// SEQUENCE `name` の所有者（表・列）を設定または解除する（Issue #1645）。表・列の実在を同一
 /// write txn で確認する（表不在 `TableNotFound`・列不在 `Invalid`・SEQUENCE 不在／他種別は
 /// `load_sequence_bytes_in_txn` の契約）。`OWNED BY`／SERIAL／IDENTITY の結線（#1694）が呼ぶ入口。
-#[cfg_attr(not(test), allow(dead_code))] // #1694 が結線するまでテストからのみ呼ばれる。
 pub(crate) fn set_sequence_owner_in_txn(
     write_txn: &redb::WriteTransaction,
     name: &str,
@@ -1000,9 +999,229 @@ pub(crate) fn set_sequence_owner_in_txn(
     Ok(())
 }
 
+/// relation 名前空間（表・ビュー・索引・matview・SEQUENCE）で `name` が使用済みか。
+/// `CREATE SEQUENCE`・暗黙 SEQUENCE の名前決定が共有する。
+fn relation_name_taken_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
+    Ok(super::table_exists_in_txn(write_txn, name)?
+        || super::view_exists_in_txn(write_txn, name)?
+        || super::index_name_exists_in_txn(write_txn, name)?
+        || super::materialized_view_exists_in_txn(write_txn, name)?
+        || sequence_exists_in_txn(write_txn, name)?)
+}
+
+/// SEQUENCE を作る write txn 内本体（名前衝突 `TableAlreadyExists` → 件数上限 `ViewLimitExceeded`
+/// → 保存。begin・commit を含まない）。[`Storage::create_sequence`] と、表の作成と同じ txn に載せる
+/// [`create_table_with_implicit_sequences_in_txn`] が共有する。内部 ID を払い出し返す。
+pub(crate) fn create_sequence_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+    params: &SequenceParams,
+) -> Result<u64> {
+    validate_identifier(name)?;
+    params.validate()?;
+    if relation_name_taken_in_txn(write_txn, name)? {
+        return Err(CatalogError::TableAlreadyExists(name.to_string()));
+    }
+    let id = allocate_sequence_id_in_txn(write_txn)?;
+    let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
+    if table.len()? >= MAX_SEQUENCES as u64 {
+        return Err(CatalogError::ViewLimitExceeded(
+            "too many sequences".to_string(),
+        ));
+    }
+    table.insert(
+        sequence_key(name),
+        encode_sequence_def(id, params, params.start, None).as_slice(),
+    )?;
+    Ok(id)
+}
+
+/// [`Storage::create_table_with_implicit_sequences`] の write txn 内本体（begin・commit を含まない）。
+/// 表の世代 bump は呼び出し側が commit 直前に行う。`Err` の場合は呼び出し側が txn を破棄する（途中まで作った
+/// SEQUENCE も残らない）。
+pub(crate) fn create_table_with_implicit_sequences_in_txn(
+    write_txn: &redb::WriteTransaction,
+    schema: &TableSchema,
+    serials: &[(String, i64)],
+) -> Result<Vec<String>> {
+    if relation_name_taken_in_txn(write_txn, &schema.name)? {
+        return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
+    }
+    let mut named_schema = schema.clone();
+    let mut created: Vec<String> = Vec::with_capacity(serials.len());
+    for (column, max_value) in serials {
+        let seq_name =
+            choose_implicit_sequence_name_in_txn(write_txn, &schema.name, column, &created)?;
+        let params = SequenceParams {
+            increment: 1,
+            min_value: 1,
+            max_value: *max_value,
+            start: 1,
+            cycle: false,
+        };
+        create_sequence_in_txn(write_txn, &seq_name, &params)?;
+        let col = named_schema
+            .columns
+            .iter_mut()
+            .find(|c| &c.name == column)
+            .ok_or_else(|| {
+                CatalogError::Invalid("serial column does not exist in the table".to_string())
+            })?;
+        col.default_expr = Some(ColumnDefault::Sequence(seq_name.clone()));
+        created.push(seq_name);
+    }
+    // 既定値を付けた後のスキーマを、`create_table` と同じ前処理・txn 内本体へ通す。
+    let (named_schema, pre_encoded) = Storage::prepare_create_table(&named_schema)?;
+    Storage::create_table_in_txn(write_txn, &named_schema, pre_encoded)?;
+    for ((column, _), seq_name) in serials.iter().zip(&created) {
+        set_sequence_owner_in_txn(
+            write_txn,
+            seq_name,
+            Some(SequenceOwner {
+                table: schema.name.clone(),
+                column: column.clone(),
+            }),
+        )?;
+    }
+    Ok(created)
+}
+
+/// PostgreSQL の `makeObjectName` 相当。`<name1>_<name2>_<label>` を識別子長上限に収め、
+/// 収まらない場合は長い方の名前から 1 文字ずつ削る（同じ長さなら `name2` を削る）。識別子は
+/// ASCII（`validate_identifier` 済み）の前提で、境界で切れない不正入力は切らずにそのまま返し、
+/// 呼び出し側の `validate_identifier` に拒否させる。
+fn make_object_name(name1: &str, name2: &str, label: &str) -> String {
+    let overhead = label.len().saturating_add(2);
+    let avail = super::MAX_IDENTIFIER_LEN.saturating_sub(overhead);
+    let (mut l1, mut l2) = (name1.len(), name2.len());
+    while l1.saturating_add(l2) > avail && (l1 > 0 || l2 > 0) {
+        if l1 > l2 {
+            l1 -= 1;
+        } else {
+            l2 -= 1;
+        }
+    }
+    match (name1.get(..l1), name2.get(..l2)) {
+        (Some(a), Some(b)) => format!("{a}_{b}_{label}"),
+        _ => format!("{name1}_{name2}_{label}"),
+    }
+}
+
+/// 暗黙 SEQUENCE（SERIAL 列・IDENTITY 列の裏）の名前を決める（TABLE-24・Issue #1694）。
+/// PostgreSQL の `ChooseRelationName` と同じく `<table>_<column>_seq`、使用済みなら
+/// `<table>_<column>_seq1`、`..._seq2` と数字を足す。`reserved` は同じ文で先に決めた名前
+/// （txn にはまだ見えない）、`table` は作成中の表名（カタログには未登録）で、いずれも使用済みとして扱う。
+/// 試行は [`MAX_SEQUENCES`]` + 1` 回で打ち切り、尽きたら `ViewLimitExceeded`（無制限ループの防止）。
+/// 結果は必ず `validate_identifier` に通す。write txn 内で呼ぶこと（衝突判定と作成の間に別の
+/// 作成が割り込まない）。#1698 の `<table>_id_seq` も本関数の規則に揃える。
+pub(crate) fn choose_implicit_sequence_name_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    column: &str,
+    reserved: &[String],
+) -> Result<String> {
+    validate_identifier(table)?;
+    validate_identifier(column)?;
+    for pass in 0..=MAX_SEQUENCES {
+        let label = if pass == 0 {
+            "seq".to_string()
+        } else {
+            format!("seq{pass}")
+        };
+        let candidate = make_object_name(table, column, &label);
+        if candidate == table
+            || reserved.iter().any(|r| r == &candidate)
+            || relation_name_taken_in_txn(write_txn, &candidate)?
+        {
+            continue;
+        }
+        validate_identifier(&candidate)?;
+        return Ok(candidate);
+    }
+    Err(CatalogError::ViewLimitExceeded(
+        "too many sequences".to_string(),
+    ))
+}
+
+/// 所有者が `matches` を満たす SEQUENCE を同じ write txn で削除する（定義と全テナント分の状態行）。
+/// `DROP TABLE`・`ALTER TABLE DROP COLUMN` が所有 SEQUENCE を道連れにするための入口（Issue #1694）。
+/// 削除対象の SEQUENCE を `DEFAULT nextval` で参照する列が（呼び出し側が先に消した表・列を除いて）
+/// 残っていれば `DependentObjectsStillExist`（`2BP01`。DEFAULT の連鎖削除はしない）。走査は
+/// [`MAX_SEQUENCES`] 件で打ち切り、定義の復号失敗は `CorruptSchema`。返り値の内部 ID は、commit 成功後に
+/// メモリ上の現在値を [`SequenceAllocator::evict`] で捨てるために呼び出し側へ返す（内部 ID は
+/// 再利用しないので、捨て損ねても別 SEQUENCE の値には化けない）。
+pub(crate) fn drop_owned_sequences_in_txn(
+    write_txn: &redb::WriteTransaction,
+    matches: impl Fn(&SequenceOwner) -> bool,
+) -> Result<Vec<u64>> {
+    let targets = owned_sequence_entries_in_txn(write_txn, &matches)?;
+    let mut ids = Vec::with_capacity(targets.len());
+    for (name, def, _) in &targets {
+        if sequence_has_dependents_in_txn(write_txn, name)? {
+            return Err(CatalogError::DependentObjectsStillExist(name.clone()));
+        }
+        ids.push(def.id);
+    }
+    for (name, def, _) in &targets {
+        {
+            let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
+            table.remove(sequence_key(name))?;
+        }
+        delete_sequence_state_in_txn(write_txn, def.id)?;
+    }
+    Ok(ids)
+}
+
+/// 所有者が `matches` を満たす SEQUENCE の `(名前, 定義, 所有者)` を列挙する
+/// （[`MAX_SEQUENCES`] 件で打ち切り。読み取りハンドルは返す前に解放する）。
+fn owned_sequence_entries_in_txn(
+    write_txn: &redb::WriteTransaction,
+    matches: &impl Fn(&SequenceOwner) -> bool,
+) -> Result<Vec<(String, SequenceDef, SequenceOwner)>> {
+    let table = match ReadSource::open_table(write_txn, SEQUENCES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for entry in table.iter()?.take(MAX_SEQUENCES) {
+        let (k, v) = entry?;
+        let (def, owner) = decode_sequence_def_with_owner(v.value())?;
+        if let Some(owner) = owner {
+            if matches(&owner) {
+                out.push((k.value().1.to_string(), def, owner));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 所有者が `rewrite` で書き換わる SEQUENCE の所有者を同じ write txn で付け替える
+/// （`ALTER TABLE RENAME TO`・`RENAME COLUMN` が所有者を追従させる入口。Issue #1694）。
+/// `rewrite` が `None` を返した SEQUENCE は変更しない。古い所有者（存在しない表・列）を
+/// 残さないためのもので、定義の他の値（内部 ID・パラメータ・`restart_value`）は変えない。
+pub(crate) fn rewrite_sequence_owners_in_txn(
+    write_txn: &redb::WriteTransaction,
+    rewrite: impl Fn(&SequenceOwner) -> Option<SequenceOwner>,
+) -> Result<()> {
+    let targets = owned_sequence_entries_in_txn(write_txn, &|o| rewrite(o).is_some())?;
+    for (name, def, owner) in targets {
+        let Some(new_owner) = rewrite(&owner) else {
+            continue;
+        };
+        let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
+        table.insert(
+            sequence_key(&name),
+            encode_sequence_def(def.id, &def.params, def.restart_value, Some(&new_owner))
+                .as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
 impl Storage {
     /// [`set_sequence_owner_in_txn`] を単独の write txn で実行する。
-    #[cfg_attr(not(test), allow(dead_code))] // #1694 が結線するまでテストからのみ呼ばれる。
+    #[cfg_attr(not(test), allow(dead_code))] // 結線は `*_in_txn` 経由。単独版は SQL の `OWNED BY` が入るまでテストのみ。
     pub(crate) fn set_sequence_owner(
         &self,
         name: &str,
@@ -1024,28 +1243,32 @@ impl Storage {
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        if super::table_exists_in_txn(&write_txn, name)?
-            || super::view_exists_in_txn(&write_txn, name)?
-            || super::index_name_exists_in_txn(&write_txn, name)?
-            || super::materialized_view_exists_in_txn(&write_txn, name)?
-            || sequence_exists_in_txn(&write_txn, name)?
-        {
-            return Err(CatalogError::TableAlreadyExists(name.to_string()));
-        }
-        let id = allocate_sequence_id_in_txn(&write_txn)?;
-        {
-            let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
-            if table.len()? >= MAX_SEQUENCES as u64 {
-                return Err(CatalogError::ViewLimitExceeded(
-                    "too many sequences".to_string(),
-                ));
-            }
-            table.insert(
-                sequence_key(name),
-                encode_sequence_def(id, params, params.start, None).as_slice(),
-            )?;
-        }
+        create_sequence_in_txn(&write_txn, name, params)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
+    }
+
+    /// 表と暗黙 SEQUENCE を単一 write txn で作る（`CREATE TABLE ... (n SERIAL)`。TABLE-24・
+    /// Issue #1694）。`serials` の各 `(列名, 上限値)` について、PostgreSQL の `ChooseRelationName`
+    /// 相当で `<table>_<col>_seq` を決め、SEQUENCE の挿入 → 列の `DEFAULT nextval` 付与 → 表の作成 →
+    /// 所有者（`OWNED BY <table>.<col>`）設定を行い、1 回の commit で確定する。途中のどの段階で
+    /// 失敗しても txn ごと破棄するため、孤児 SEQUENCE も半端な表も残らない（`IF NOT EXISTS` で表が既に
+    /// あった場合も同じ）。`sql::ddl::execute_create_table` から呼ばれる（権限ゲート通過後）。
+    ///
+    /// 判定順は表名の衝突（`TableAlreadyExists`）→ 名前の決定・件数上限（`ViewLimitExceeded`）→
+    /// 既存の `create_table` と同じ検証。返り値は作成した SEQUENCE 名（`serials` と同順）。
+    pub(crate) fn create_table_with_implicit_sequences(
+        &self,
+        schema: &TableSchema,
+        serials: &[(String, i64)],
+    ) -> Result<Vec<String>> {
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::convert_storage_error)?;
+        let created = create_table_with_implicit_sequences_in_txn(&write_txn, schema, serials)?;
+        super::bump_table_generation_in_txn(&write_txn, &schema.name)?;
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(super::convert_storage_error)?;
+        Ok(created)
     }
 
     /// SEQUENCE を削除する。名前が他種別なら `WrongObjectKind`、無ければ `TableNotFound`。
@@ -1200,6 +1423,22 @@ impl Storage {
             .map(|d| (d.id, d.params)))
     }
 
+    /// 定義の所有者を取得する（テスト専用。SERIAL 展開・RENAME 追従・DROP の検証に使う）。
+    #[cfg(test)]
+    pub(crate) fn sequence_owner(&self, name: &str) -> Result<Option<SequenceOwner>> {
+        validate_identifier(name)?;
+        let read_txn = self.db().begin_read()?;
+        let table = match read_txn.open_table(SEQUENCES_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        match table.get(sequence_key(name))? {
+            Some(g) => Ok(decode_sequence_def_with_owner(g.value())?.1),
+            None => Ok(None),
+        }
+    }
+
     /// 定義を `restart_value` 込みで取得する（スナップショット読み取り。無ければ `None`）。
     #[cfg_attr(not(test), allow(dead_code))] // #1690 が使う。
     pub(crate) fn sequence_definition_full(&self, name: &str) -> Result<Option<SequenceDef>> {
@@ -1219,6 +1458,25 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
+    /// 暗黙 SEQUENCE の名前の切り詰め（PostgreSQL の `makeObjectName` 相当。Issue #1694）。
+    #[test]
+    fn make_object_name_fits_identifier_limit() {
+        assert_eq!(make_object_name("t", "n", "seq"), "t_n_seq");
+        assert_eq!(make_object_name("t", "n", "seq12"), "t_n_seq12");
+        // 長い方から 1 文字ずつ削る（同じ長さなら列側を削る）。
+        let long = make_object_name(&"a".repeat(63), &"b".repeat(63), "seq");
+        assert!(long.len() <= 63, "{long}");
+        assert!(long.ends_with("_seq"));
+        validate_identifier(&long).expect("valid identifier");
+        let t = make_object_name(&"t".repeat(40), "n", "seq1");
+        assert_eq!(t.len(), 40 + 1 + 1 + 1 + 4);
+        let clipped = make_object_name(&"t".repeat(60), "n", "seq1");
+        assert!(
+            clipped.len() <= 63 && clipped.ends_with("_n_seq1"),
+            "{clipped}"
+        );
+    }
+
     use super::*;
 
     fn tmp_storage(label: &str) -> (Storage, crate::test_util::temp_db::CleanupGuard) {

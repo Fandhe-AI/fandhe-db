@@ -173,6 +173,8 @@ pub mod declarative_predicate;
 pub(crate) mod describe;
 pub(crate) mod interval_arith;
 pub(crate) mod matview;
+#[cfg(test)]
+mod serial_expansion_tests;
 pub(crate) mod set_expr;
 pub(crate) mod temp_catalog;
 #[cfg(test)]
@@ -278,7 +280,7 @@ pub mod using_operation_id;
 /// （`ScalarIndexCacheStats`・`AnnPlan` 等と同方針）。`SqlOutcome::AlterTable` の
 /// 中身（`AlterTableOutcome`）は公開モジュール [`ddl`] から直接参照できる
 /// （`CreateTableOutcome`／`DropTableOutcome` と同じ扱い）。
-pub use ddl_column_type::SqlColumnTypeName;
+pub use ddl_column_type::{SerialKind, SqlColumnTypeName};
 pub(crate) mod using_plan;
 
 /// `EngineCore::visible_bitmap_cache_stats`（`pub`）の戻り値型を外部から

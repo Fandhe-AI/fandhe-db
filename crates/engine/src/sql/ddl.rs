@@ -243,7 +243,22 @@ pub(crate) fn execute_create_table(
     let schema = build_table_schema(Some(storage), validated, limits)?;
     // 早期判定〔上〕と書き込みの間に他セッションが同名を作った場合の TOCTOU 対策。名前衝突は
     // commit・世代 bump の前に返るため、no-op は副作用を残さない。
-    match storage.create_table(&schema) {
+    // SERIAL 系の列（TABLE-24・Issue #1694）があれば、暗黙 SEQUENCE の作成・所有者設定・
+    // `DEFAULT nextval` の付与を表の作成と同じ write txn で行う（部分的な成功を残さない）。
+    // SERIAL 列の無い表は従来の `create_table` のままで、挙動・カタログのバイト列は変わらない。
+    let serials: Vec<(String, i64)> = validated
+        .serial_columns
+        .iter()
+        .map(|s| (s.column.clone(), s.kind.max_value()))
+        .collect();
+    let created = if serials.is_empty() {
+        storage.create_table(&schema)
+    } else {
+        storage
+            .create_table_with_implicit_sequences(&schema, &serials)
+            .map(|_| ())
+    };
+    match created {
         Err(CatalogError::TableAlreadyExists(_)) if validated.if_not_exists => {
             return Ok(CreateTableOutcome {});
         }
@@ -251,6 +266,10 @@ pub(crate) fn execute_create_table(
     }
     .map_err(|e| match e {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::duplicate_table(name),
+        // 暗黙 SEQUENCE の件数上限（名前の決定の打ち切りを含む）。`CREATE SEQUENCE` と同じ `54000`。
+        CatalogError::ViewLimitExceeded(_) => {
+            SqlSurfaceError::payload_too_large("too many sequences")
+        }
         // `FOREIGN KEY` の参照先（TABLE-17・TASK-205、Issue #907）。`create_table` が
         // `TableNotFound` を返すのは参照先テーブルの不在のみ（作成対象自身の重複は
         // 上の `TableAlreadyExists` が先に判定する）。参照先名がビュー・索引名なら
@@ -288,7 +307,6 @@ pub(crate) fn execute_create_table(
         | CatalogError::DependentViewsExist(_)
         | CatalogError::ViewDefinitionChanged(_)
         | CatalogError::ViewReferenceCycle(_)
-        | CatalogError::ViewLimitExceeded(_)
         | CatalogError::SchemaAlreadyExists(_)
         | CatalogError::SchemaNotFound(_)
         | CatalogError::ReservedSchemaName(_)
@@ -376,6 +394,14 @@ pub(crate) fn execute_create_temp_table(
                 SqlSurfaceError::invalid_table_definition(table.table_name.clone())
             },
         );
+    }
+    // SERIAL 系は暗黙 SEQUENCE を永続カタログへ作る必要があるが、一時表は永続 DB を参照できない
+    // （下の `DEFAULT nextval` と同じ理由。TABLE-24・Issue #1694）。`42P01`／`42704` へ化けさせず
+    // 構文検証済みの宣言の時点で `0A000` にする。
+    if !table.serial_columns.is_empty() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "serial columns are not supported for temporary tables",
+        ));
     }
     let schema = build_table_schema(None, table, schema_limits)?;
     // 一時表は永続 DB の SEQUENCE カタログを参照できないため、`DEFAULT nextval(...)` は
@@ -3279,6 +3305,7 @@ mod tests {
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
+            serial_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3471,6 +3498,7 @@ mod tests {
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
+            serial_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new(
@@ -3500,6 +3528,7 @@ mod tests {
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
+            serial_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3548,6 +3577,7 @@ mod tests {
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
+            serial_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3575,6 +3605,7 @@ mod tests {
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
+            serial_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new("a", crate::catalog::ColumnType::Vector(4), false),

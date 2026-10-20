@@ -11333,29 +11333,53 @@ impl Storage {
     /// 自己参照は参照先を作成中のスキーマ自身として解決する。参照先を持たない
     /// スキーマの挙動・カタログバイト列は従来と同一。
     pub fn create_table(&self, schema: &TableSchema) -> Result<()> {
+        let (schema, pre_encoded) = Self::prepare_create_table(schema)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Self::create_table_in_txn(&write_txn, &schema, pre_encoded)?;
+        bump_table_generation_in_txn(&write_txn, &schema.name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// [`Self::create_table`] の txn 前処理（UNIQUE 制約名の確定・スキーマ検証。write txn を開く前に
+    /// fail-closed に拒否できる判定だけ）。暗黙 SEQUENCE 付きの作成
+    /// （[`Self::create_table_with_implicit_sequences`]）も同じ処理を通す。FK を持たないスキーマは
+    /// エンコード済みバイト列も返す（FK ありは参照先解決後に txn 内でエンコードするため `None`）。
+    fn prepare_create_table(schema: &TableSchema) -> Result<(TableSchema, Option<Vec<u8>>)> {
         // UNIQUE 制約の名前を確定する（設計 D2・Issue #1067）。`CREATE TABLE` の
         // 構文段（`sql::allowlist`）は常に名前未確定（空名）の `UniqueConstraint`
         // を組み立てるため、`validate_schema`（`encode_schema` 内）が空名を
         // 拒否する前にここで確定する（TOCTOU 回避。FK の `parent_columns`
         // 未解決中間表現と同じ流儀）。
-        let schema = &assign_unique_constraint_names(schema.clone());
+        let schema = assign_unique_constraint_names(schema.clone());
         // スキーマ検証は `encode_schema` 内の `validate_schema` に集約する（write txn を
         // 開く前に fail-closed に拒否される。ここで別途 `validate_schema` を呼ぶ必要はない）。
         // `FOREIGN KEY` を持つスキーマは参照先列の解決を write txn 内で行うため、
         // ここでは参照先を要さない不変条件のみを先に検証し、エンコードは解決後に行う。
         let pre_encoded = if schema.foreign_keys.is_empty() {
-            Some(encode_schema(schema)?)
+            Some(encode_schema(&schema)?)
         } else {
             validate_schema(&schema.clone().with_foreign_keys(Vec::new()))?;
-            validate_foreign_keys(schema, true)?;
+            validate_foreign_keys(&schema, true)?;
             None
         };
-        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Ok((schema, pre_encoded))
+    }
+
+    /// [`Self::create_table`] の write txn 内本体（begin・commit を含まない）。`schema` は
+    /// [`Self::prepare_create_table`] 済み。同名の関係の衝突・参照先解決・ENUM 再検証・保存を行う。
+    /// 表の世代 bump は呼び出し側が commit 直前に行う（`commit_boundary::commit` の悉皆検査が呼び出し側の
+    /// 関数内で bump を確認するため）。`Err` の場合は呼び出し側が txn を破棄する。暗黙 SEQUENCE 付きの作成が、
+    /// SEQUENCE の挿入・所有者設定と同じ txn に表の作成を載せるために切り出した（Issue #1694）。
+    fn create_table_in_txn(
+        write_txn: &redb::WriteTransaction,
+        schema: &TableSchema,
+        pre_encoded: Option<Vec<u8>>,
+    ) -> Result<()> {
         // `DEFAULT nextval('<名前>')` は参照先 SEQUENCE がこの write txn の時点で存在すること
         // （TABLE-24・Issue #1690。未登録は `TableNotFound`＝`42P01`。名前はクライアント自身の入力）。
         for column in &schema.columns {
             if let Some(ColumnDefault::Sequence(seq)) = &column.default_expr {
-                if !sequence::sequence_exists_in_txn(&write_txn, seq)? {
+                if !sequence::sequence_exists_in_txn(write_txn, seq)? {
                     return Err(CatalogError::TableNotFound(seq.clone()));
                 }
             }
@@ -11376,7 +11400,7 @@ impl Storage {
                 // 同じ。Issue #1374）。
                 if let ColumnType::Array(array_ty) = &column.ty {
                     if let Some(def) = array_ty.enum_def() {
-                        let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
+                        let registered = get_enum_type_in_write_txn(write_txn, def.name())?;
                         if column.default_expr.is_some() || column.fill_value.is_some() {
                             let mut checked = column.clone();
                             checked.ty = ColumnType::Array(
@@ -11396,7 +11420,7 @@ impl Storage {
                     }
                 }
                 if let ColumnType::Enum(def) = &column.ty {
-                    let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
+                    let registered = get_enum_type_in_write_txn(write_txn, def.name())?;
                     if column.default_expr.is_some() || column.fill_value.is_some() {
                         let mut checked = column.clone();
                         checked.ty = ColumnType::Enum(registered);
@@ -11429,15 +11453,15 @@ impl Storage {
             }
             // 索引名とも名前空間を共有する（TASK-206・INDEX-7、Issue #908）。
             // 既存の索引宣言と同名のテーブルは同じ `TableAlreadyExists` で拒否する。
-            if index_name_exists_in_txn(&write_txn, schema.name.as_str())? {
+            if index_name_exists_in_txn(write_txn, schema.name.as_str())? {
                 return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
             }
             // matview とも名前空間を共有する（TABLE-42 (2)、Issue #1663）。
-            if materialized_view_exists_in_txn(&write_txn, schema.name.as_str())? {
+            if materialized_view_exists_in_txn(write_txn, schema.name.as_str())? {
                 return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
             }
             // SEQUENCE とも名前空間を共有する（TABLE-24・Issue #1688）。
-            if sequence::sequence_exists_in_txn(&write_txn, schema.name.as_str())? {
+            if sequence::sequence_exists_in_txn(write_txn, schema.name.as_str())? {
                 return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
             }
         }
@@ -11446,14 +11470,13 @@ impl Storage {
         // `TableAlreadyOpen` 回避）。
         let encoded = match pre_encoded {
             Some(encoded) => encoded,
-            None => encode_schema(&resolve_foreign_keys_in_txn(&write_txn, schema)?)?,
+            None => encode_schema(&resolve_foreign_keys_in_txn(write_txn, schema)?)?,
         };
         {
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             table.insert(schema.name.as_str(), encoded.as_slice())?;
         }
-        bump_table_generation_in_txn(&write_txn, &schema.name)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        Ok(())
     }
 
     /// テーブル定義（`CATALOG_TABLE` エントリ）と、対応する行ストア
@@ -11528,18 +11551,31 @@ impl Storage {
         behavior: DropBehavior,
     ) -> Result<DropTablesReport> {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        let report = self.drop_tables_in_txn(&write_txn, table_names, if_exists, behavior)?;
+        let (report, dropped_sequence_ids) =
+            self.drop_tables_collecting_sequences(&write_txn, table_names, if_exists, behavior)?;
         if report.dropped == 0 {
             // 副作用ゼロ（世代も不変）。txn は commit せず破棄する。
             return Ok(report);
         }
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        // 所有 SEQUENCE（SERIAL 等。TABLE-24・Issue #1694）のメモリ上の現在値は、commit 成功後に
+        // writer permit を保持したまま捨てる（`drop_sequence` と同じ。commit 失敗時は何も変えない）。
+        let allocator = self.sequence_allocator();
+        crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
+            for id in &dropped_sequence_ids {
+                allocator.evict(*id);
+            }
+            crate::recovery::commit_boundary::PostCommitResult::Ok
+        })
+        .map_err(convert_storage_error)?;
         Ok(report)
     }
 
     /// [`Self::drop_tables`] の write txn 内本体（begin・commit を含まない）。呼び出し側が commit
     /// するか、`Err`／`dropped == 0` なら破棄する。一時 DB の `ON COMMIT` 処理が行の全削除と
     /// 表の削除を単一 txn で原子的に適用するために切り出した（Issue #1684）。
+    ///
+    /// 削除した表が所有する SEQUENCE のメモリ上の現在値の破棄は行わない（一時 DB には SEQUENCE
+    /// 表が無く、所有 SEQUENCE は常に空。永続側は [`Self::drop_tables`] が破棄する）。
     pub(crate) fn drop_tables_in_txn(
         &self,
         write_txn: &redb::WriteTransaction,
@@ -11547,6 +11583,19 @@ impl Storage {
         if_exists: bool,
         behavior: DropBehavior,
     ) -> Result<DropTablesReport> {
+        self.drop_tables_collecting_sequences(write_txn, table_names, if_exists, behavior)
+            .map(|(report, _)| report)
+    }
+
+    /// [`Self::drop_tables_in_txn`] の実体。削除した表が所有していた SEQUENCE の内部 ID も返す
+    /// （commit 成功後に [`sequence::SequenceAllocator::evict`] するため。Issue #1694）。
+    fn drop_tables_collecting_sequences(
+        &self,
+        write_txn: &redb::WriteTransaction,
+        table_names: &[String],
+        if_exists: bool,
+        behavior: DropBehavior,
+    ) -> Result<(DropTablesReport, Vec<u64>)> {
         let mut targets: Vec<&str> = Vec::new();
         for name in table_names {
             validate_identifier(name)?;
@@ -11595,11 +11644,14 @@ impl Storage {
         }
         if existing.is_empty() {
             // 副作用ゼロ（世代も不変）。txn は commit せず破棄する。
-            return Ok(DropTablesReport {
-                dropped: 0,
-                skipped,
-                cascaded: Vec::new(),
-            });
+            return Ok((
+                DropTablesReport {
+                    dropped: 0,
+                    skipped,
+                    cascaded: Vec::new(),
+                },
+                Vec::new(),
+            ));
         }
         let mut cascaded: Vec<CascadedObject> = Vec::new();
         match behavior {
@@ -11667,15 +11719,24 @@ impl Storage {
         }
         // 索引宣言（TASK-206・INDEX-7、Issue #908）は 1 回にまとめる（カタログ世代の bump も 1 回）。
         retain_index_defs_in_txn(write_txn, |def| !existing.contains(&def.table.as_str()))?;
+        // 削除した表が所有する SEQUENCE（SERIAL 等）を同じ txn で道連れにする（TABLE-24・
+        // Issue #1694）。表の行は上で消えているため、削除対象外の表の DEFAULT が参照している場合
+        // だけ `DependentObjectsStillExist`（`2BP01`。RESTRICT・CASCADE とも。DEFAULT は連鎖削除しない）。
+        let dropped_sequence_ids = sequence::drop_owned_sequences_in_txn(write_txn, |owner| {
+            existing.contains(&owner.table.as_str())
+        })?;
         // TABLE-15・Issue #1363: 全削除済み・commit 前の同期点（feature 限定。既定ビルドでは消える）。
         #[cfg(feature = "test-sync-points")]
         self.sync_point(crate::test_sync::SyncPoint::DropTableBeforeCommit);
         let dropped = existing.len();
-        Ok(DropTablesReport {
-            dropped,
-            skipped,
-            cascaded,
-        })
+        Ok((
+            DropTablesReport {
+                dropped,
+                skipped,
+                cascaded,
+            },
+            dropped_sequence_ids,
+        ))
     }
 
     /// 既存テーブルへ列を末尾追記する（TABLE-5）。既存行のバイト列には一切触れない
@@ -12077,6 +12138,13 @@ impl Storage {
         // 削除した列を含む索引宣言（TASK-206・INDEX-7、Issue #908）も同一 txn で
         // 削除する（[`delete_indexes_referencing_column_in_txn`] 参照）。
         delete_indexes_referencing_column_in_txn(write_txn, table_name, column_name)?;
+        // 列が所有する SEQUENCE（SERIAL 列等。TABLE-24・Issue #1694）も同じ txn で削除する（PostgreSQL
+        // と同じ。所有者が宙に浮く状態を作らない）。他の列の `DEFAULT nextval` が参照していれば
+        // `DependentObjectsStillExist`。メモリ上の現在値は破棄しない（内部 ID は再利用しないため
+        // 別 SEQUENCE の値には化けず、残るのはプロセス内の有界なメモリのみ。再起動で消える）。
+        sequence::drop_owned_sequences_in_txn(write_txn, |owner| {
+            owner.table == table_name && owner.column == column_name
+        })?;
         Ok(())
     }
 
@@ -12239,6 +12307,15 @@ impl Storage {
                 .insert(table_name, encoded.as_slice())
                 .map_err(CatalogError::from)?;
         }
+        // 列が所有する SEQUENCE の所有者（列名）を追従させる（TABLE-24・Issue #1694）。
+        sequence::rewrite_sequence_owners_in_txn(&write_txn, |owner| {
+            (owner.table == table_name && owner.column == old_name).then(|| {
+                sequence::SequenceOwner {
+                    table: owner.table.clone(),
+                    column: new_name.to_string(),
+                }
+            })
+        })?;
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(())
@@ -12433,6 +12510,14 @@ impl Storage {
             new_table_name,
         )
         .map_err(convert_storage_error)?;
+        // 表が所有する SEQUENCE の所有者（表名）を追従させる（TABLE-24・Issue #1694）。SEQUENCE 自体の
+        // 名前・`DEFAULT nextval` の参照名は変えない（PostgreSQL と同じ）。
+        sequence::rewrite_sequence_owners_in_txn(&write_txn, |owner| {
+            (owner.table == table_name).then(|| sequence::SequenceOwner {
+                table: new_table_name.to_string(),
+                column: owner.column.clone(),
+            })
+        })?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(())
     }
