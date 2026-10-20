@@ -266,6 +266,28 @@ jobs:
         run: make crash-test-temp-table
 
   # --------------------------------------------------
+  # crash-test-view-write（更新可能ビュー書き込みの crash 耐性・台帳再送検査。
+  # Issue #1674・対象ビヘイビア TABLE-43・PERSIST-1）
+  # --------------------------------------------------
+  # ビュー経由の INSERT・UPDATE・DELETE・明示トランザクションを発行するプロセスを SIGKILL し、
+  # 台帳の適用済み接頭辞と表の内容（モデル再生との一致）・再送時の拒否コードを検証する
+  # （scripts/crash_test_view_write.sh。負の対照 self-check を含む）。
+  # 既存の crash-test 系と同じ理由で独立ジョブとし、actions/checkout は SHA 固定で参照する。
+  # private submodule（docs/spec）は取得しない。
+  crash-test-view-write:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run crash-test-view-write
+        run: make crash-test-view-write
+
+  # --------------------------------------------------
   # crash-test-sequence（採番状態・operation_id 台帳の crash 耐性検査。
   # Issue #1692・対象ビヘイビア TABLE-24 (3)(4)・RECOVER-10・RECOVER-11）
   # --------------------------------------------------

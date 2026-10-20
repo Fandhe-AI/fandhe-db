@@ -707,8 +707,8 @@ Issue #1665（`REFRESH`）・#1666（`REFRESH ... CONCURRENTLY`）・#1667（索
 
 親 #1669。実装は #1670（判定規則）・#1671（`INSERT`）・#1672（`UPDATE`／`DELETE`）。関連ポインタは
 SQL-49・RLS-10 (b)・ERR-6 の `55000`。本節は設計判断の記録でコードは変更しない。Issue ごとの
-経緯は [implementation-status.md](implementation-status.md) を参照。`WITH CHECK OPTION`（#1673）と
-RLS・台帳・crash の総合テスト（#1674）は未実装で、本節では後続としてのみ扱う。
+経緯は [implementation-status.md](implementation-status.md) を参照。`WITH CHECK OPTION`（#1673）は
+実装済みで、RLS・台帳・crash の総合テスト（#1674）は「テスト」節にまとめた。
 
 ### 自動更新可能性の判定（#1670）
 
@@ -759,6 +759,9 @@ RLS・台帳・crash の総合テスト（#1674）は未実装で、本節では
   ビュー名のドメインを被せる。
 - 同じ `operation_id` をビュー経由で再送すると `23505`、同じ値を基表へ直接送ると `22023`。
   ビュー経由でない既存のハッシュは変わらない。
+- 台帳エントリはビュー経由の行と同じトランザクションで永続する。再オープン後と SIGKILL 後も
+  再送の判定（`23505`／`22023`）が変わらず、失敗した文・ROLLBACK した文は台帳に残らないことを
+  #1674 のテストと crash 検査で固定した。
 
 ### RLS-10 (b) の不変条件と判定順序
 
@@ -771,7 +774,7 @@ RLS・台帳・crash の総合テスト（#1674）は未実装で、本節では
 
 - ビュー経由の `PARTITIONED` は `0A000`。
 - 並行 DDL との競合が上限を超えると `55P03` になりうる。
-- `WITH CHECK OPTION` は未対応（#1673）で、宣言は `42601`。
+- `WITH CHECK OPTION`（`LOCAL`／`CASCADED`）は #1673 で対応済み（違反は `44000`）。
 - `TRUNCATE <view>` は `42809`。
 - 非セッション API（`execute_insert_sql`／`execute_update_sql`／`execute_delete_sql`）と
   NoSQL 表層からのビューへの書き込みは `42P01`。
@@ -780,13 +783,20 @@ RLS・台帳・crash の総合テスト（#1674）は未実装で、本節では
 
 - engine: `tests/table43_view_updatability.rs`・`table43_view_insert.rs`・`table43_view_update_delete.rs`
 - wire-server: `tests/wire_view_insert.rs`・`wire_view_update_delete.rs`
+- RLS・台帳・crash の総合（#1674）:
+  - engine: `tests/table43_view_write_rls_ledger.rs`（単一行形・RETURNING・UPSERT の衝突先・可視性・
+    CHECK OPTION 違反応答の同一性・再オープン後の再送・失敗文と ROLLBACK の台帳・`LedgerMode`・
+    テナント間の `operation_id`。基表の挙動を推測しない箇所は基表直送との差分オラクル）
+  - wire-server: `tests/wire_view_write_tenant.rs`（2 ユーザー・2 テナントの `CommandComplete`・
+    ErrorResponse のバイト同一性・再送・NoSQL 表層からの拒否が存在しない表名と同じ応答）
+  - crash: `examples/crash_tool_view_write.rs`・`scripts/crash_test_view_write.sh`・
+    `make crash-test-view-write`（ci.yml の独立ジョブ。台帳の適用済み接頭辞とモデル再生した行集合の
+    一致、明示トランザクションの原子性、テナント B の不変、再起動時の再送。負の対照 `self-check` 付き）
 - 単体: `sql::view_updatable`・`sql::view_insert`・`sql::view_dml`・`sql::view_write_scope`、
   `catalog` の `view_write_fingerprint_tracks_chain_definitions`
 
 ### 対象外（後続）
 
-- `WITH CHECK OPTION`（#1673）。
-- RLS・台帳・crash 耐性の総合テスト（#1674）。
 - ビュー経由の `PARTITIONED` 分割実行 DML。
 - 非セッション API と NoSQL 表層からのビューへの書き込み。
 - `TRUNCATE` のビュー対応（`42809` を維持する）。
