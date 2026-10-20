@@ -596,7 +596,7 @@ fn alter_type_gate_and_order_by_over_buffered_alias() {
     ddl(
         &core,
         &mut session,
-        "CREATE TABLE nums (n BIGINT, m BIGINT)",
+        "CREATE TABLE nums (id BIGINT PRIMARY KEY, n BIGINT, m BIGINT)",
     )
     .expect("create nums");
     create_ok(&core, "CREATE VIEW vn_star (x, y, z) AS SELECT * FROM nums");

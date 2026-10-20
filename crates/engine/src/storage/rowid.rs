@@ -45,13 +45,12 @@ impl RowId {
     }
 
     /// 採番器（`catalog::rowid_alloc`）が払い出した値から rowid を作る。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn from_allocated(raw: u64) -> Self {
         Self(raw)
     }
 
-    /// 採番器の状態保存用に生値を取り出す（`catalog::rowid_alloc` 専用）。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 採番器の状態保存・払い出し区間の展開用に生値を取り出す（`catalog::rowid_alloc` と
+    /// `tenant::allocate_rowids` 専用。利用者へは出さない）。
     pub(crate) const fn raw_for_state(self) -> u64 {
         self.0
     }
@@ -76,9 +75,11 @@ impl RowId {
 /// 検索結果（公開型 `SearchHit.id` 等）へ詰める応答 `id` を rowid から得る**唯一の境界**
 /// （Issue #2195。ビヘイビア: TABLE-23・SEARCH-1。設計記録: ADR D8）。
 ///
-/// 現状は従来方式（`RowIdentity::LegacyId`）の表でしか到達しない（採番方式の表は
-/// 読み取りゲートで拒否される）ため、`id` 列値＝rowid の生値を返す。採番方式のゲートを
-/// 外す後続 sub-issue（#2197）は、本関数を「主キー列値を返す」実装へ差し替える。
+/// 応答 `id` を返す Rust API の検索（`SearchHit.id`）は従来方式（`RowIdentity::LegacyId`）の表でしか
+/// 到達しない（採番方式の表は検索入口 `VectorArena::build*` が拒否する。Issue #2199。SQL 表層は
+/// 投影した列だけで結果を作り、rowid を応答へ出さない）ため、`id` 列値＝rowid の生値を返す。
+/// 採番方式の表へ行 API・検索 API を開く後続 sub-issue（#2197）は、本関数を「主キー列値を返す」実装へ
+/// 差し替える。
 /// 検索経路が rowid を応答へ直接詰める箇所をここ 1 箇所に集約する。
 pub(crate) const fn hit_id_for_response(rowid: RowId) -> u64 {
     rowid.legacy_id()

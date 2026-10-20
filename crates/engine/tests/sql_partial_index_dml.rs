@@ -109,7 +109,7 @@ fn xt_fixture(label: &str) -> (std::path::PathBuf, CleanupGuard, EngineCore, Ses
     run(
         &core,
         &mut session,
-        "CREATE TABLE xt (n INTEGER, code TEXT)",
+        "CREATE TABLE xt (id BIGINT PRIMARY KEY, n INTEGER, code TEXT)",
     )
     .expect("create table");
     (path, guard, core, session)
@@ -223,7 +223,7 @@ fn session_dependent_predicates_are_rejected_at_binding() {
     run(
         &core,
         &mut s,
-        "CREATE TABLE ev (at_tz TIMESTAMPTZ, at TIMESTAMP, label TEXT)",
+        "CREATE TABLE ev (id BIGINT PRIMARY KEY, at_tz TIMESTAMPTZ, at TIMESTAMP, label TEXT)",
     )
     .expect("create table");
     for sql in [
@@ -609,7 +609,12 @@ fn temp_table_partial_index_gates_dml_like_a_persistent_table() {
     // 一時表の DML は台帳を使わない（`USING OPERATION_ID` は受け付けない）。
     let core = core_at(&path).with_ledger_mode(LedgerMode::CompareOnlyWithoutLedger);
     let mut s = allowed_session();
-    run(&core, &mut s, "CREATE TEMP TABLE tt (n INTEGER, code TEXT)").expect("create temp table");
+    run(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE tt (id BIGINT PRIMARY KEY, n INTEGER, code TEXT)",
+    )
+    .expect("create temp table");
     run(
         &core,
         &mut s,

@@ -200,7 +200,8 @@ fn push_dedup(v: &mut Vec<String>, name: &str) {
     }
 }
 
-/// 1 辺の走査投影。`All` は疑似列 `id`（位置 0）＋スキーマ列順（位置 `1 + index`）
+/// 1 辺の走査投影。`All` は疑似列 `id`（位置 0。従来方式の表のみ）＋スキーマ列順（位置 `1 + index`、
+/// 採番方式の表は `index`）
 /// という [`crate::sql::parser::bind_projection`] の `Projection::All` 展開規則と
 /// 一致させる（第 2 の展開規則を作らない）。`Columns` は要求された順に追記する
 /// （位置は追記後も変わらない）。
@@ -222,8 +223,12 @@ impl SideProjection {
                 .columns
                 .iter()
                 .position(|c| c.name == name)
-                .map(|i| i + 1)
-                .or(if name == "id" { Some(0) } else { None }),
+                .map(|i| i + usize::from(schema.has_pseudo_id()))
+                .or(if name == "id" && schema.has_pseudo_id() {
+                    Some(0)
+                } else {
+                    None
+                }),
             SideProjection::Columns(v) => v.iter().position(|s| s == name),
         }
     }
@@ -834,15 +839,20 @@ fn build_plain_shape(
                     .ok_or_else(|| SqlSurfaceError::Internal {
                         detail: "JOIN relation index out of range".to_string(),
                     })?;
-                output.push(OutputColumn {
-                    rel,
-                    pos: 0,
-                    meta: ColumnMeta::Id,
-                });
+                // 疑似列 `id`（位置 0）は従来方式の表だけが持つ。採番方式の表（TABLE-23・Issue #2199）は
+                // 宣言した列だけを展開し、位置は 0 始まり（`Projection::All` の展開規則と一致させる）。
+                let id_offset = usize::from(schema.has_pseudo_id());
+                if schema.has_pseudo_id() {
+                    output.push(OutputColumn {
+                        rel,
+                        pos: 0,
+                        meta: ColumnMeta::Id,
+                    });
+                }
                 for (idx, col) in schema.columns.iter().enumerate() {
                     output.push(OutputColumn {
                         rel,
-                        pos: idx + 1,
+                        pos: idx + id_offset,
                         meta: ColumnMeta::Scalar {
                             name: col.name.clone(),
                             ty: col.ty.clone(),

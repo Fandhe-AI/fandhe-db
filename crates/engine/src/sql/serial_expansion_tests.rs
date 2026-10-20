@@ -78,8 +78,9 @@ fn column_n(core: &EngineCore, tenant: &str) -> Vec<i64> {
         .rows
         .iter()
         .map(|row| {
+            // 宣言した `id BIGINT` 列（TABLE-23・Issue #2199 以降の表は暗黙の `id` を持たない）。
             let id = match row.cells[0] {
-                Cell::Integer(v) => v,
+                Cell::SignedInteger(v) => u64::try_from(v).expect("non-negative id"),
                 ref o => panic!("id cell {o:?}"),
             };
             let n = match row.cells[1] {
@@ -104,7 +105,11 @@ fn owner(table: &str, column: &str) -> Option<SequenceOwner> {
 #[test]
 fn serial_expands_and_numbers_per_tenant_from_one() {
     let (_p, _g, core) = fixture("serial-basic");
-    ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
+    );
 
     let storage = core.storage_for_test();
     let schema = storage.get_table_schema("t").expect("schema");
@@ -147,7 +152,7 @@ fn serial_spellings_map_to_base_types_and_limits() {
     ok(
         &core,
         "sys",
-        "CREATE TABLE t (a SERIAL, b serial4, c BIGSERIAL, d Serial8, e SMALLSERIAL, f serial2, v TEXT)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a SERIAL, b serial4, c BIGSERIAL, d Serial8, e SMALLSERIAL, f serial2, v TEXT)",
     );
     let schema = core
         .storage_for_test()
@@ -184,7 +189,11 @@ fn serial_spellings_map_to_base_types_and_limits() {
 #[test]
 fn smallserial_exhaustion_is_sequence_limit_error() {
     let (_p, _g, core) = fixture("serial-small-limit");
-    ok(&core, "sys", "CREATE TABLE t (n SMALLSERIAL, v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SMALLSERIAL, v TEXT)",
+    );
     ok(&core, "alice", "SELECT setval('t_n_seq', 32766)");
     insert_t(&core, "alice", 1, "a1");
     assert_eq!(column_n(&core, "alice"), vec![32767]);
@@ -205,7 +214,7 @@ fn serial_accepts_explicit_values_and_rejects_null() {
     ok(
         &core,
         "sys",
-        "CREATE TABLE t (n SERIAL NOT NULL UNIQUE, v TEXT)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL NOT NULL UNIQUE, v TEXT)",
     );
     ok(
         &core,
@@ -225,7 +234,7 @@ fn serial_accepts_explicit_values_and_rejects_null() {
     ok(
         &core,
         "sys",
-        "CREATE TABLE p (k BIGSERIAL PRIMARY KEY, v TEXT)",
+        "CREATE TABLE p (id BIGINT NOT NULL UNIQUE, k BIGSERIAL PRIMARY KEY, v TEXT)",
     );
 }
 
@@ -233,10 +242,18 @@ fn serial_accepts_explicit_values_and_rejects_null() {
 #[test]
 fn implicit_sequence_behaves_as_owned_sequence() {
     let (_p, _g, core) = fixture("serial-visible");
-    ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
+    );
     assert_eq!(code(&core, "sys", "CREATE SEQUENCE t_n_seq"), "42P07");
     assert_eq!(
-        code(&core, "sys", "CREATE TABLE t_n_seq (a BIGINT)"),
+        code(
+            &core,
+            "sys",
+            "CREATE TABLE t_n_seq (id BIGINT PRIMARY KEY, a BIGINT)"
+        ),
         "42P07"
     );
     assert_eq!(code(&core, "sys", "DROP SEQUENCE t_n_seq"), "2BP01");
@@ -250,8 +267,16 @@ fn implicit_sequence_behaves_as_owned_sequence() {
 fn name_collision_appends_numeric_suffix() {
     let (_p, _g, core) = fixture("serial-name-collision");
     ok(&core, "sys", "CREATE SEQUENCE t_n_seq");
-    ok(&core, "sys", "CREATE TABLE t_n_seq1 (a BIGINT)");
-    ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t_n_seq1 (id BIGINT PRIMARY KEY, a BIGINT)",
+    );
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
+    );
     let schema = core
         .storage_for_test()
         .get_table_schema("t")
@@ -317,14 +342,22 @@ fn long_names_are_truncated_and_same_statement_collisions_are_resolved() {
 #[test]
 fn drop_table_drops_owned_sequence_and_state() {
     let (_p, _g, core) = fixture("serial-drop-table");
-    ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
+    );
     insert_t(&core, "alice", 1, "a1");
     insert_t(&core, "alice", 2, "a2");
     ok(&core, "sys", "DROP TABLE t");
     assert_eq!(code(&core, "sys", "DROP SEQUENCE t_n_seq"), "42P01");
     ok(&core, "sys", "CREATE SEQUENCE t_n_seq");
     ok(&core, "sys", "DROP SEQUENCE t_n_seq");
-    ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
+    );
     insert_t(&core, "alice", 1, "a3");
     assert_eq!(column_n(&core, "alice"), vec![1]);
 }
@@ -334,11 +367,15 @@ fn drop_table_drops_owned_sequence_and_state() {
 #[test]
 fn drop_table_with_dependent_default_is_refused() {
     let (_p, _g, core) = fixture("serial-drop-dependent");
-    ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
     ok(
         &core,
         "sys",
-        "CREATE TABLE u (m BIGINT DEFAULT nextval('t_n_seq'), w TEXT)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
+    );
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, m BIGINT DEFAULT nextval('t_n_seq'), w TEXT)",
     );
     assert_eq!(code(&core, "sys", "DROP TABLE t"), "2BP01");
     assert_eq!(code(&core, "sys", "DROP TABLE t CASCADE"), "2BP01");
@@ -360,7 +397,11 @@ fn drop_table_with_dependent_default_is_refused() {
 #[test]
 fn rename_table_and_column_keep_ownership() {
     let (_p, _g, core) = fixture("serial-rename");
-    ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
+    );
     insert_t(&core, "alice", 1, "a1");
     insert_t(&core, "alice", 2, "a2");
     ok(&core, "sys", "ALTER TABLE t RENAME COLUMN n TO k");
@@ -401,7 +442,11 @@ fn rename_table_and_column_keep_ownership() {
 #[test]
 fn drop_column_drops_owned_sequence() {
     let (_p, _g, core) = fixture("serial-drop-column");
-    ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
+    );
     ok(&core, "sys", "ALTER TABLE t DROP COLUMN n");
     assert_eq!(code(&core, "sys", "DROP SEQUENCE t_n_seq"), "42P01");
 }
@@ -411,7 +456,11 @@ fn drop_column_drops_owned_sequence() {
 #[test]
 fn multi_action_drop_serial_column_and_add_column() {
     let (_p, _g, core) = fixture("serial-multi-drop");
-    ok(&core, "sys", "CREATE TABLE t (n SERIAL)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL)",
+    );
     ok(
         &core,
         "sys",
@@ -437,7 +486,7 @@ fn multi_action_drop_checks_dependents_after_all_actions() {
         ok(
             &core,
             "sys",
-            "CREATE TABLE t (n SERIAL, m BIGINT DEFAULT nextval('t_n_seq'), v TEXT)",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, m BIGINT DEFAULT nextval('t_n_seq'), v TEXT)",
         );
         ok(&core, "sys", alter);
         assert_eq!(
@@ -451,7 +500,7 @@ fn multi_action_drop_checks_dependents_after_all_actions() {
     ok(
         &core,
         "sys",
-        "CREATE TABLE t (n SERIAL, m BIGINT DEFAULT nextval('t_n_seq'), v TEXT)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, m BIGINT DEFAULT nextval('t_n_seq'), v TEXT)",
     );
     assert_eq!(
         code(&core, "sys", "ALTER TABLE t DROP COLUMN n, DROP COLUMN v"),
@@ -472,7 +521,11 @@ fn drop_column_evicts_sequence_cursors() {
     .iter()
     .enumerate()
     {
-        ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
+        ok(
+            &core,
+            "sys",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
+        );
         ok(
             &core,
             "alice",
@@ -493,14 +546,25 @@ fn drop_column_evicts_sequence_cursors() {
 #[test]
 fn if_not_exists_existing_table_creates_no_sequence() {
     let (_p, _g, core) = fixture("serial-if-not-exists");
-    ok(&core, "sys", "CREATE TABLE t (v TEXT)");
     ok(
         &core,
         "sys",
-        "CREATE TABLE IF NOT EXISTS t (n SERIAL, v TEXT)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TEXT)",
+    );
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE IF NOT EXISTS t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
     );
     assert_eq!(code(&core, "sys", "DROP SEQUENCE t_n_seq"), "42P01");
-    assert_eq!(code(&core, "sys", "CREATE TABLE t (n SERIAL)"), "42P07");
+    assert_eq!(
+        code(
+            &core,
+            "sys",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL)"
+        ),
+        "42P07"
+    );
     assert_eq!(code(&core, "sys", "DROP SEQUENCE t_n_seq"), "42P01");
 }
 
@@ -512,12 +576,16 @@ fn failed_create_table_leaves_no_orphan_sequence() {
         code(
             &core,
             "sys",
-            "CREATE TABLE t (n SERIAL, r BIGINT REFERENCES nowhere)"
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, r BIGINT REFERENCES nowhere)"
         ),
         "42P01"
     );
     assert_eq!(code(&core, "sys", "DROP SEQUENCE t_n_seq"), "42P01");
-    ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
+    );
 }
 
 /// SERIAL 列の暗黙 DEFAULT は `SET DEFAULT` の参照アクションの対象にできず、
@@ -525,13 +593,19 @@ fn failed_create_table_leaves_no_orphan_sequence() {
 #[test]
 fn serial_column_rejects_set_default_referential_action() {
     let (_p, _g, core) = fixture("serial-set-default");
-    ok(&core, "sys", "CREATE TABLE p (k INTEGER PRIMARY KEY)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE p (id BIGINT NOT NULL UNIQUE, k INTEGER PRIMARY KEY)",
+    );
     for action in ["ON DELETE SET DEFAULT", "ON UPDATE SET DEFAULT"] {
         assert_eq!(
             code(
                 &core,
                 "sys",
-                &format!("CREATE TABLE c (n SERIAL REFERENCES p(k) {action})")
+                &format!(
+                    "CREATE TABLE c (id BIGINT PRIMARY KEY, n SERIAL REFERENCES p(k) {action})"
+                )
             ),
             "0A000",
             "{action}"
@@ -544,7 +618,11 @@ fn serial_column_rejects_set_default_referential_action() {
 #[test]
 fn serial_state_survives_reopen() {
     let (path, _g, core) = fixture("serial-reopen");
-    ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
+    );
     insert_t(&core, "alice", 1, "a1");
     insert_t(&core, "alice", 2, "a2");
     drop(core);
@@ -563,7 +641,11 @@ fn serial_state_survives_reopen() {
 #[test]
 fn ledger_replay_does_not_consume_serial_value() {
     let (_p, _g, core) = fixture("serial-ledger");
-    ok(&core, "sys", "CREATE TABLE t (n SERIAL, v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL, v TEXT)",
+    );
     insert_t(&core, "alice", 1, "a1");
     assert_eq!(
         code(
@@ -582,20 +664,43 @@ fn ledger_replay_does_not_consume_serial_value() {
 fn unsupported_forms_are_rejected_without_side_effects() {
     let (_p, _g, core) = fixture("serial-reject");
     for (sql, expected) in [
-        ("CREATE TABLE r (n SERIAL DEFAULT 1)", "42601"),
-        ("CREATE TABLE r (n SERIAL DEFAULT NULL)", "42601"),
-        ("CREATE TABLE r (n SERIAL DEFAULT now())", "42601"),
-        ("CREATE TABLE r (n SERIAL[])", "0A000"),
-        ("CREATE TABLE r (n SERIAL[3])", "0A000"),
-        ("CREATE TEMP TABLE r (n SERIAL)", "0A000"),
-        ("CREATE TABLE r (id SERIAL)", "42601"),
+        (
+            "CREATE TABLE r (id BIGINT PRIMARY KEY, n SERIAL DEFAULT 1)",
+            "42601",
+        ),
+        (
+            "CREATE TABLE r (id BIGINT PRIMARY KEY, n SERIAL DEFAULT NULL)",
+            "42601",
+        ),
+        (
+            "CREATE TABLE r (id BIGINT PRIMARY KEY, n SERIAL DEFAULT now())",
+            "42601",
+        ),
+        (
+            "CREATE TABLE r (id BIGINT PRIMARY KEY, n SERIAL[])",
+            "0A000",
+        ),
+        (
+            "CREATE TABLE r (id BIGINT PRIMARY KEY, n SERIAL[3])",
+            "0A000",
+        ),
+        (
+            "CREATE TEMP TABLE r (id BIGINT PRIMARY KEY, n SERIAL)",
+            "0A000",
+        ),
+        // 内部列名は SERIAL 列にも使えない（`id` は予約しない。TABLE-23・Issue #2199）。
+        ("CREATE TABLE r (tenant_id SERIAL)", "42601"),
     ] {
         assert_eq!(code(&core, "sys", sql), expected, "{sql}");
     }
     assert_eq!(code(&core, "sys", "DROP SEQUENCE r_n_seq"), "42P01");
     assert_eq!(code(&core, "sys", "DROP TABLE r"), "42P01");
 
-    ok(&core, "sys", "CREATE TABLE t (v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TEXT)",
+    );
     for (sql, expected) in [
         ("ALTER TABLE t ADD COLUMN m SERIAL", "0A000"),
         ("ALTER TABLE t ADD COLUMN m BIGSERIAL", "0A000"),
@@ -612,7 +717,11 @@ fn serial_requires_ddl_permission() {
     let (_p, _g, core) = fixture("serial-no-ddl");
     let mut session = SessionState::default();
     let e = core
-        .execute_sql_in_session(&ctx("alice"), &mut session, "CREATE TABLE t (n SERIAL)")
+        .execute_sql_in_session(
+            &ctx("alice"),
+            &mut session,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, n SERIAL)",
+        )
         .expect_err("must fail");
     assert_eq!(e.wire_code(), "42501");
     assert_eq!(code(&core, "sys", "DROP SEQUENCE t_n_seq"), "42P01");
@@ -622,7 +731,11 @@ fn serial_requires_ddl_permission() {
 #[test]
 fn serial_is_not_a_type_outside_column_definitions() {
     let (_p, _g, core) = fixture("serial-cast");
-    ok(&core, "sys", "CREATE TABLE t (v TEXT)");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TEXT)",
+    );
     let e = core
         .execute_sql(&ctx("alice"), "SELECT CAST(v AS serial) FROM t LIMIT 1")
         .expect_err("must fail");

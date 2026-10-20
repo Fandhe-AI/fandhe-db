@@ -38,6 +38,13 @@ use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
 use engine::storage::{Storage, Visibility};
 
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// この crash ツールは行 id を行の識別に使う従来方式の契約を検証するため、`CREATE TABLE` を従来方式の
+// 表作成へ振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
+
 const TENANT_A: &str = "crash-tool-view-tenant-a";
 const TENANT_B: &str = "crash-tool-view-tenant-b";
 /// 1 バッチあたりの操作数（INSERT・UPDATE・DELETE・明示トランザクションの 2 文）。
@@ -108,7 +115,7 @@ fn exec(core: &EngineCore, tenant: &str, ddl: bool, sql: &str) -> Result<(), Str
     if ddl {
         s.allow_ddl();
     }
-    core.execute_sql_in_session(&ctx(tenant)?, &mut s, sql)
+    core.execute_sql_in_session_legacy(&ctx(tenant)?, &mut s, sql)
         .map(|_| ())
         .map_err(|e| format!("{} failed ({})", sql_head(sql), e.wire_code()))
 }
@@ -116,7 +123,7 @@ fn exec(core: &EngineCore, tenant: &str, ddl: bool, sql: &str) -> Result<(), Str
 /// `sql` が `want` の `wire_code` で拒否されることを確かめる（成功・別コードは Err）。
 fn expect_code(core: &EngineCore, tenant: &str, sql: &str, want: &str) -> Result<(), String> {
     let mut s = SessionState::default();
-    match core.execute_sql_in_session(&ctx(tenant)?, &mut s, sql) {
+    match core.execute_sql_in_session_legacy(&ctx(tenant)?, &mut s, sql) {
         Err(e) if e.wire_code() == want => Ok(()),
         Err(e) => Err(format!(
             "{} gave {} (want {want})",

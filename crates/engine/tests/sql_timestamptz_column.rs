@@ -119,7 +119,7 @@ fn timestamptz_and_with_time_zone_are_persisted_as_the_same_type() {
     let (path, _g, core) = open("tz-persist");
     ok(
         &core,
-        "CREATE TABLE t (a TIMESTAMPTZ, b timestamp WITH TIME ZONE, c TIMESTAMP, d INTEGER)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a TIMESTAMPTZ, b timestamp WITH TIME ZONE, c TIMESTAMP, d INTEGER)",
     );
     ok(&core, "ALTER TABLE t ADD COLUMN e TIMESTAMPTZ");
     ok(
@@ -139,7 +139,10 @@ fn timestamptz_and_with_time_zone_are_persisted_as_the_same_type() {
 #[test]
 fn offset_notations_normalize_to_the_same_utc_value() {
     let (_p, _g, core) = open("tz-normalize");
-    ok(&core, "CREATE TABLE t (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     let literals = [
         "'2026-01-01 12:00:00+09'",
         "'2026-01-01 03:00:00Z'",
@@ -171,7 +174,10 @@ fn offset_notations_normalize_to_the_same_utc_value() {
 #[test]
 fn boundary_values_roundtrip_and_one_microsecond_outside_is_rejected() {
     let (_p, _g, core) = open("tz-bounds");
-    ok(&core, "CREATE TABLE t (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     insert(&core, 1, "'0001-01-01 00:00:00+00'", "b1").expect("min");
     insert(&core, 2, "'9999-12-31 23:59:59.999999+00'", "b2").expect("max");
     let got = micros(&core, "SELECT id, v FROM t LIMIT 5");
@@ -203,7 +209,10 @@ fn boundary_values_roundtrip_and_one_microsecond_outside_is_rejected() {
 #[test]
 fn insert_classifies_format_range_and_zone_errors() {
     let (_p, _g, core) = open("tz-errors");
-    ok(&core, "CREATE TABLE t (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     let cases = [
         // 範囲外は 22008。
         ("'2026-02-30 00:00:00Z'", "22008"),
@@ -245,7 +254,10 @@ fn insert_classifies_format_range_and_zone_errors() {
 #[test]
 fn update_set_and_upsert_bind_and_reject_without_side_effects() {
     let (_p, _g, core) = open("tz-update");
-    ok(&core, "CREATE TABLE t (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     insert(&core, 1, "'2026-01-01 00:00:00Z'", "i1").expect("insert");
     let before = micros(&core, "SELECT id, v FROM t LIMIT 5");
     for (sql, want) in [
@@ -292,24 +304,27 @@ fn column_default_is_validated_and_applied() {
     assert_eq!(
         code(
             &core,
-            "CREATE TABLE a (v TIMESTAMPTZ DEFAULT '2026-13-01 00:00:00Z')"
+            "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMPTZ DEFAULT '2026-13-01 00:00:00Z')"
         ),
         "22008"
     );
     assert_eq!(
-        code(&core, "CREATE TABLE a (v TIMESTAMPTZ DEFAULT 'zz')"),
+        code(
+            &core,
+            "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMPTZ DEFAULT 'zz')"
+        ),
         "22007"
     );
     assert_eq!(
         code(
             &core,
-            "CREATE TABLE a (v TIMESTAMPTZ DEFAULT '2026-01-01 00:00:00 Nowhere/Land')"
+            "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMPTZ DEFAULT '2026-01-01 00:00:00 Nowhere/Land')"
         ),
         "22023"
     );
     ok(
         &core,
-        "CREATE TABLE t (v TIMESTAMPTZ DEFAULT '2026-01-01 12:00:00+09', w INTEGER)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ DEFAULT '2026-01-01 12:00:00+09', w INTEGER)",
     );
     ok(
         &core,
@@ -340,7 +355,10 @@ fn column_default_is_validated_and_applied() {
 #[test]
 fn returning_projects_the_utc_value() {
     let (_p, _g, core) = open("tz-returning");
-    ok(&core, "CREATE TABLE t (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     let outcome = exec(
         &core,
         "INSERT INTO t (id, v) VALUES (1, '2026-01-01 12:00:00.25+09') RETURNING v USING OPERATION_ID 'r1'",
@@ -358,7 +376,10 @@ fn returning_projects_the_utc_value() {
 #[test]
 fn copy_from_binds_timestamptz_fields() {
     let (_p, _g, core) = open("tz-copy");
-    ok(&core, "CREATE TABLE t (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     let run = |data: &[u8], op: &str| {
         let policy = ctx();
         let session = SessionState::default();
@@ -411,7 +432,10 @@ fn copy_from_binds_timestamptz_fields() {
 #[test]
 fn values_and_catalog_survive_reopen() {
     let (path, guard, core) = open("tz-reopen");
-    ok(&core, "CREATE TABLE t (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     insert(&core, 1, "'9999-12-31 23:59:59.999999Z'", "p1").expect("insert");
     insert(&core, 2, "'0001-01-01 09:00:00+09'", "p2").expect("insert");
     drop(core);
@@ -434,7 +458,10 @@ fn values_and_catalog_survive_reopen() {
 #[test]
 fn other_tenants_cannot_see_timestamptz_rows() {
     let (_p, _g, core) = open("tz-tenant");
-    ok(&core, "CREATE TABLE t (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     insert(&core, 1, "'2031-05-06 07:08:09+09'", "t1").expect("insert");
     let other = core
         .execute_sql(&ctx_for("bob"), "SELECT id, v FROM t LIMIT 5")
@@ -456,14 +483,17 @@ fn other_tenants_cannot_see_timestamptz_rows() {
 #[test]
 fn features_not_yet_enabled_are_rejected_fail_closed() {
     let (_p, _g, core) = open("tz-failclosed");
-    ok(&core, "CREATE TABLE t (v TIMESTAMPTZ, n INTEGER)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ, n INTEGER)",
+    );
     insert(&core, 1, "'2026-01-01 03:00:00Z'", "f1").expect("insert");
     for sql in [
         "SELECT SUM(v) FROM t",
         "SELECT AVG(v) FROM t",
         "SELECT v + 1 FROM t LIMIT 5",
-        "CREATE TABLE a (v TIMESTAMPTZ PRIMARY KEY)",
-        "CREATE TABLE a (v TIMESTAMPTZ UNIQUE)",
+        "CREATE TABLE a (id BIGINT NOT NULL UNIQUE, v TIMESTAMPTZ PRIMARY KEY)",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMPTZ UNIQUE)",
         // TIMESTAMPTZ→TIMESTAMP は TABLE-40 の一般変換（Issue #1636）で受理される。
         // INTEGER→TIMESTAMPTZ は代入変換が無く拒否のまま。
         "ALTER TABLE t ALTER COLUMN n TYPE TIMESTAMPTZ",
@@ -484,14 +514,17 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
 fn unsupported_timestamptz_type_spellings_are_rejected() {
     let (_p, _g, core) = open("tz-spellings");
     for sql in [
-        "CREATE TABLE a (v TIMESTAMPTZ(3))",
-        "CREATE TABLE a (v TIMESTAMPTZ[])",
-        "CREATE TABLE a (v TIMESTAMPTZ[3])",
-        "CREATE TABLE a (v TIMESTAMP WITH TIME ZONE[])",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMPTZ(3))",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMPTZ[])",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMPTZ[3])",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMP WITH TIME ZONE[])",
     ] {
         assert_eq!(code(&core, sql), "0A000", "{sql}");
     }
-    ok(&core, "CREATE TABLE b (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        "CREATE TABLE b (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     assert_eq!(
         code(&core, "ALTER TABLE b ADD COLUMN w TIMESTAMPTZ(6)"),
         "0A000"

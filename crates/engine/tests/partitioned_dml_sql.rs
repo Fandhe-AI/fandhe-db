@@ -106,7 +106,10 @@ fn show(core: &EngineCore, tenant: &str, table: &str, id: &str) -> Vec<(String, 
 
 fn setup(label: &str, rows: &[(u64, i64, &str)]) -> (EngineCore, CleanupGuard) {
     let (core, g) = new_core(label);
-    ddl(&core, "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE)");
+    ddl(
+        &core,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, n BIGINT, u TEXT UNIQUE)",
+    );
     seed(&core, "alice", rows);
     (core, g)
 }
@@ -284,7 +287,10 @@ fn affected_rows_limit_is_54000_before_commit_and_vd001_after() {
             max_affected_rows: std::num::NonZeroUsize::new(3),
             ..DmlLimits::default()
         });
-    ddl(&core, "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE)");
+    ddl(
+        &core,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, n BIGINT, u TEXT UNIQUE)",
+    );
     seed(&core, "alice", &five_rows());
     // 2 チャンク目（累計 4 件 > 3）で超過: 1 チャンク目は commit 済みなので VD001（原因 54000）。
     let e = err(
@@ -525,7 +531,10 @@ fn interrupted_record_limit_blocks_new_jobs_but_not_resumes() {
             interrupted_record_limit: std::num::NonZeroU64::MIN,
             ..PartitionedDmlLimits::default()
         });
-    ddl(&core, "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE)");
+    ddl(
+        &core,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, n BIGINT, u TEXT UNIQUE)",
+    );
     seed(&core, "alice", &[(1, 10, "a"), (2, 20, "b")]);
     assert_eq!(
         make_interrupted(&core, "alice", "int-a").wire_code(),
@@ -691,7 +700,10 @@ fn chunk_above_server_width_is_rejected_and_smaller_is_accepted() {
             chunk_rows: std::num::NonZeroUsize::new(3).expect("non-zero"),
             ..PartitionedDmlLimits::default()
         });
-    ddl(&core, "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE)");
+    ddl(
+        &core,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, n BIGINT, u TEXT UNIQUE)",
+    );
     seed(&core, "alice", &five_rows());
     assert_eq!(
         code(
@@ -719,7 +731,10 @@ fn partitioned_dml_requires_the_operation_ledger() {
     let storage = Storage::open(&path).expect("open storage");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
         .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::CompareOnlyWithoutLedger);
-    ddl(&core, "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE)");
+    ddl(
+        &core,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, n BIGINT, u TEXT UNIQUE)",
+    );
     seed_without_ledger(&core);
     assert_eq!(
         code(
@@ -758,7 +773,10 @@ fn interrupted_job_is_reported_interrupted_after_reopen_and_resumes() {
     let _g = CleanupGuard(path.clone());
     {
         let core = reopen(&path);
-        ddl(&core, "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE)");
+        ddl(
+            &core,
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, n BIGINT, u TEXT UNIQUE)",
+        );
         seed(&core, "alice", &[(1, 10, "a"), (2, 20, "b")]);
         assert_eq!(
             make_interrupted(&core, "alice", "op-re").wire_code(),
@@ -804,7 +822,10 @@ fn interrupted_job_can_be_cancelled_after_reopen() {
     let _g = CleanupGuard(path.clone());
     {
         let core = reopen(&path);
-        ddl(&core, "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE)");
+        ddl(
+            &core,
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, n BIGINT, u TEXT UNIQUE)",
+        );
         seed(&core, "alice", &[(1, 10, "a"), (2, 20, "b")]);
         assert_eq!(
             make_interrupted(&core, "alice", "op-rc").wire_code(),

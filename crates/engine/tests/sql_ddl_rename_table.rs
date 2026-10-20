@@ -238,7 +238,7 @@ fn old_name_recreated_is_empty_and_round_trip_keeps_rows() {
     run(
         &core,
         &mut session,
-        "CREATE TABLE docs (embedding VECTOR(2) NOT NULL, note TEXT)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, note TEXT)",
     )
     .expect("recreate");
     assert!(notes(&core, "alice", "docs").expect("fresh").is_empty());
@@ -284,7 +284,12 @@ fn rename_error_codes() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
-    run(&core, &mut session, "CREATE TABLE other (note TEXT)").expect("other");
+    run(
+        &core,
+        &mut session,
+        "CREATE TABLE other (id BIGINT PRIMARY KEY, note TEXT)",
+    )
+    .expect("other");
     run(
         &core,
         &mut session,
@@ -364,7 +369,7 @@ fn rename_with_buffered_view_is_refused_without_changes() {
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
     for ddl in [
-        "CREATE TABLE view_t (note TEXT)",
+        "CREATE TABLE view_t (id BIGINT PRIMARY KEY, note TEXT)",
         "CREATE VIEW v_view_t AS SELECT note FROM view_t ORDER BY note LIMIT 5",
     ] {
         run(&core, &mut session, ddl).unwrap_or_else(|e| panic!("{ddl}: {e:?}"));
@@ -426,7 +431,11 @@ fn rename_unrelated_views_untouched() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
-    exec(&core, &mut session, "CREATE TABLE other (note TEXT)");
+    exec(
+        &core,
+        &mut session,
+        "CREATE TABLE other (id BIGINT PRIMARY KEY, note TEXT)",
+    );
     exec(
         &core,
         &mut session,
@@ -510,7 +519,11 @@ fn last_operation_id_follows_rename() {
         LastOperationLookup::NotFound
     );
     // 旧名で再作成した表は旧記録を引き継がない（同じ operation_id の INSERT が成功する）。
-    exec(&core, &mut session, "CREATE TABLE docs (note TEXT)");
+    exec(
+        &core,
+        &mut session,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, note TEXT)",
+    );
     exec(
         &core,
         &mut session,
@@ -529,12 +542,12 @@ fn rename_parent_table_keeps_foreign_key_actions() {
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
     for ddl in [
-        "CREATE TABLE par (code TEXT PRIMARY KEY, note TEXT)",
-        "CREATE TABLE kid_c (p TEXT, note TEXT, \
+        "CREATE TABLE par (id BIGINT NOT NULL UNIQUE, code TEXT PRIMARY KEY, note TEXT)",
+        "CREATE TABLE kid_c (id BIGINT PRIMARY KEY, p TEXT, note TEXT, \
          FOREIGN KEY (p) REFERENCES par (code) ON DELETE CASCADE)",
-        "CREATE TABLE kid_n (p TEXT, note TEXT, \
+        "CREATE TABLE kid_n (id BIGINT PRIMARY KEY, p TEXT, note TEXT, \
          FOREIGN KEY (p) REFERENCES par (code) ON DELETE SET NULL)",
-        "CREATE TABLE kid_r (p TEXT, note TEXT, FOREIGN KEY (p) REFERENCES par (code))",
+        "CREATE TABLE kid_r (id BIGINT PRIMARY KEY, p TEXT, note TEXT, FOREIGN KEY (p) REFERENCES par (code))",
         "INSERT INTO par (id, code, note) VALUES (1, 'a', 'pa')",
         "INSERT INTO par (id, code, note) VALUES (2, 'b', 'pb')",
         "INSERT INTO kid_c (id, p, note) VALUES (1, 'a', 'c1')",
@@ -583,8 +596,8 @@ fn rename_keeps_constraints_and_their_names() {
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
     for ddl in [
-        "CREATE TABLE par (code TEXT PRIMARY KEY, note TEXT)",
-        "CREATE TABLE tree (code TEXT PRIMARY KEY, up TEXT, n INTEGER, note TEXT, \
+        "CREATE TABLE par (id BIGINT NOT NULL UNIQUE, code TEXT PRIMARY KEY, note TEXT)",
+        "CREATE TABLE tree (id BIGINT NOT NULL UNIQUE, code TEXT PRIMARY KEY, up TEXT, n INTEGER, note TEXT, \
          UNIQUE (up, n), CHECK (n > 0), \
          FOREIGN KEY (up) REFERENCES tree (code), \
          FOREIGN KEY (note) REFERENCES par (code))",
@@ -648,7 +661,7 @@ fn rename_moves_index_declarations_and_keeps_index_names() {
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
     for ddl in [
-        "CREATE TABLE idx_t (code TEXT, note TEXT)",
+        "CREATE TABLE idx_t (id BIGINT PRIMARY KEY, code TEXT, note TEXT)",
         "CREATE INDEX idx_t_note ON idx_t (note)",
         "CREATE UNIQUE INDEX idx_t_code ON idx_t (code)",
         "INSERT INTO idx_t (id, code, note) VALUES (1, 'a', 'n')",

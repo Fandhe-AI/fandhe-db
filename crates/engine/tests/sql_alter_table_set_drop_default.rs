@@ -61,7 +61,11 @@ fn setup(label: &str) -> (EngineCore, std::path::PathBuf, SessionState) {
     let storage = Storage::open(&path).expect("open storage");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let mut session = ddl_session();
-    ok(&core, &mut session, "CREATE TABLE docs (a TEXT, n INTEGER)");
+    ok(
+        &core,
+        &mut session,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, a TEXT, n INTEGER)",
+    );
     (core, path, session)
 }
 
@@ -193,7 +197,7 @@ fn null_and_drop_semantics() {
     ok(
         &core,
         &mut session,
-        "CREATE TABLE strict (k TEXT NOT NULL DEFAULT 'd', v TEXT)",
+        "CREATE TABLE strict (id BIGINT PRIMARY KEY, k TEXT NOT NULL DEFAULT 'd', v TEXT)",
     );
     ok(
         &core,
@@ -248,7 +252,7 @@ fn value_validation_codes() {
     ok(
         &core,
         &mut session,
-        "CREATE TABLE v (vc VARCHAR(3), si SMALLINT, bb BYTEA, emb VECTOR(3))",
+        "CREATE TABLE v (id BIGINT PRIMARY KEY, vc VARCHAR(3), si SMALLINT, bb BYTEA, emb VECTOR(3))",
     );
     for (sql, c) in [
         ("ALTER TABLE v ALTER COLUMN vc SET DEFAULT 'abcd'", "22001"),
@@ -355,11 +359,15 @@ fn existence_permission_and_transaction_gates() {
 fn foreign_key_set_default_interaction() {
     let (core, path, mut session) = setup("set-default-fk");
     let _guard = CleanupGuard(path);
-    ok(&core, &mut session, "CREATE TABLE parent (k TEXT UNIQUE)");
     ok(
         &core,
         &mut session,
-        "CREATE TABLE child (r TEXT NOT NULL DEFAULT 'x', \
+        "CREATE TABLE parent (id BIGINT PRIMARY KEY, k TEXT UNIQUE)",
+    );
+    ok(
+        &core,
+        &mut session,
+        "CREATE TABLE child (id BIGINT PRIMARY KEY, r TEXT NOT NULL DEFAULT 'x', \
          FOREIGN KEY (r) REFERENCES parent (k) ON DELETE SET DEFAULT)",
     );
     assert_eq!(
@@ -386,12 +394,12 @@ fn foreign_key_set_default_interaction() {
     ok(
         &core,
         &mut session,
-        "CREATE TABLE parent2 (ts TIMESTAMP UNIQUE)",
+        "CREATE TABLE parent2 (id BIGINT PRIMARY KEY, ts TIMESTAMP UNIQUE)",
     );
     ok(
         &core,
         &mut session,
-        "CREATE TABLE child2 (at TIMESTAMP NOT NULL DEFAULT '2020-01-01 00:00:00', \
+        "CREATE TABLE child2 (id BIGINT PRIMARY KEY, at TIMESTAMP NOT NULL DEFAULT '2020-01-01 00:00:00', \
          FOREIGN KEY (at) REFERENCES parent2 (ts) ON DELETE SET DEFAULT)",
     );
     assert_eq!(
@@ -413,7 +421,7 @@ fn time_function_defaults() {
     ok(
         &core,
         &mut session,
-        "CREATE TABLE ev (at TIMESTAMP DEFAULT now(), note TEXT)",
+        "CREATE TABLE ev (id BIGINT PRIMARY KEY, at TIMESTAMP DEFAULT now(), note TEXT)",
     );
     ok(
         &core,

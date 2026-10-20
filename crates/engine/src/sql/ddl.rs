@@ -172,7 +172,17 @@ pub(crate) fn build_table_schema(
         &validated.identity_columns,
         &validated.foreign_keys,
     )?;
-    let mut schema = TableSchema::new(validated.table_name.clone(), columns);
+    // 行識別方式は CHECK 制約の束縛（疑似列 `id` を参照できるか）より前に確定させる。SQL 表層で新しく作る表は
+    // 暗黙の `id` を持たない採番方式（TABLE-23・Issue #2199。PG と同じ表定義）。永続表
+    // （[`execute_create_table`]）と一時表（[`execute_create_temp_table`]）が共有するため、行識別方式の
+    // 決定点はここ 1 か所。NoSQL 表層の表作成（`legacy_row_identity`）・Rust API の表作成・既存表は従来方式。
+    let row_identity = if validated.legacy_row_identity {
+        crate::catalog::RowIdentity::LegacyId
+    } else {
+        crate::catalog::RowIdentity::Allocated
+    };
+    let mut schema =
+        TableSchema::new(validated.table_name.clone(), columns).with_row_identity(row_identity);
     // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`validated.primary_key` は
     // `sql::allowlist::finalize_primary_key` が `id` 単独宣言を `None` へ既に
     // 正規化済みのため、ここでは素通しするだけでよい。
@@ -281,6 +291,13 @@ pub(crate) fn execute_create_table(
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::InvalidForeignKey(detail) => SqlSurfaceError::invalid_foreign_key(detail),
+        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // （TABLE-23・Issue #2199。入力不正ではない）。
+        CatalogError::Invalid(detail)
+            if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
+        {
+            SqlSurfaceError::FeatureNotSupported { detail }
+        }
         CatalogError::Invalid(detail) => {
             SqlSurfaceError::unsupported(format!("invalid table schema: {detail}"))
         }
@@ -427,6 +444,13 @@ pub(crate) fn execute_create_temp_table(
         ));
     }
     let schema = crate::catalog::prepare_temp_table_schema(&schema).map_err(|e| match e {
+        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // （TABLE-23・Issue #2199。入力不正ではない）。
+        CatalogError::Invalid(detail)
+            if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
+        {
+            SqlSurfaceError::FeatureNotSupported { detail }
+        }
         CatalogError::Invalid(detail) => {
             SqlSurfaceError::unsupported(format!("invalid table schema: {detail}"))
         }
@@ -1349,6 +1373,13 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::NotNullConstraintViolation(column) => {
             SqlSurfaceError::not_null_violation(column)
         }
+        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // （TABLE-23・Issue #2199。入力不正ではない）。
+        CatalogError::Invalid(detail)
+            if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
+        {
+            SqlSurfaceError::FeatureNotSupported { detail }
+        }
         CatalogError::Invalid(detail) => SqlSurfaceError::UnsupportedSyntax { detail },
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
         // ゲートの待機上限を超えた。他の DDL・書き込み入口と同じく `55P03`。
@@ -1822,6 +1853,13 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
         CatalogError::ProtectedColumn(name) => {
             SqlSurfaceError::unsupported(format!("column {name:?} cannot be dropped or altered"))
+        }
+        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // （TABLE-23・Issue #2199。入力不正ではない）。
+        CatalogError::Invalid(detail)
+            if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
+        {
+            SqlSurfaceError::FeatureNotSupported { detail }
         }
         CatalogError::Invalid(detail) => SqlSurfaceError::UnsupportedSyntax { detail },
         CatalogError::DependentObjectsStillExist(name) => {
@@ -2486,6 +2524,13 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         // と同じく `54000` へ写像する。
         CatalogError::TooManyColumns { count } => {
             SqlSurfaceError::payload_too_large(format!("too many columns: {count}"))
+        }
+        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // （TABLE-23・Issue #2199。入力不正ではない）。
+        CatalogError::Invalid(detail)
+            if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
+        {
+            SqlSurfaceError::FeatureNotSupported { detail }
         }
         CatalogError::Invalid(detail) => SqlSurfaceError::UnsupportedSyntax { detail },
         CatalogError::TypeNotFound(name) => SqlSurfaceError::UndefinedType { name },
@@ -3468,6 +3513,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            legacy_row_identity: false,
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3662,6 +3708,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            legacy_row_identity: false,
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new(
@@ -3693,6 +3740,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            legacy_row_identity: false,
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3743,6 +3791,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            legacy_row_identity: false,
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3772,6 +3821,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            legacy_row_identity: false,
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new("a", crate::catalog::ColumnType::Vector(4), false),

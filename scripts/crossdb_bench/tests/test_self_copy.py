@@ -91,7 +91,7 @@ class StatementTests(unittest.TestCase):
     def test_create_table_sql(self) -> None:
         self.assertEqual(
             self_copy.create_table_sql(128),
-            "CREATE TABLE docs_bulk (embedding VECTOR(128), lang TEXT, topic TEXT, body TEXT)",
+            "CREATE TABLE docs_bulk (id BIGINT, embedding VECTOR(128), lang TEXT, topic TEXT, body TEXT)",
         )
         for bad in (0, -1, "128", True):
             with self.assertRaises(ValueError):

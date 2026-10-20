@@ -77,8 +77,14 @@ fn column_type(path: &std::path::Path, table: &str, col: &str) -> ColumnType {
 
 /// 同じ内容の TEXT 表 `tt` と VARCHAR 表 `vt` を作る。
 fn setup_pair(core: &EngineCore) {
-    ok(core, "CREATE TABLE tt (k TEXT, v TEXT)");
-    ok(core, "CREATE TABLE vt (k VARCHAR, v CHARACTER VARYING)");
+    ok(
+        core,
+        "CREATE TABLE tt (id BIGINT PRIMARY KEY, k TEXT, v TEXT)",
+    );
+    ok(
+        core,
+        "CREATE TABLE vt (id BIGINT PRIMARY KEY, k VARCHAR, v CHARACTER VARYING)",
+    );
     for (i, (k, v)) in [
         ("apple", "Red"),
         ("apricot", "orange"),
@@ -104,7 +110,7 @@ fn unbounded_varchar_is_persisted_as_a_distinct_type() {
     let (path, _g, core) = open("vc-persist");
     ok(
         &core,
-        "CREATE TABLE t (a VARCHAR, b character varying, c TEXT)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a VARCHAR, b character varying, c TEXT)",
     );
     ok(&core, "ALTER TABLE t ADD COLUMN d VARCHAR");
     drop(core);
@@ -117,11 +123,11 @@ fn unbounded_varchar_is_persisted_as_a_distinct_type() {
 #[test]
 fn array_forms_stay_unsupported() {
     let (_p, _g, core) = open("vc-reject");
-    ok(&core, "CREATE TABLE t (a INT)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, a INT)");
     for sql in [
-        "CREATE TABLE u (a VARCHAR(10)[])",
-        "CREATE TABLE u (a VARCHAR[])",
-        "CREATE TABLE u (a CHARACTER VARYING[2])",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, a VARCHAR(10)[])",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, a VARCHAR[])",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, a CHARACTER VARYING[2])",
         "ALTER TABLE t ADD COLUMN b VARCHAR[]",
         "ALTER TABLE t ALTER COLUMN a TYPE VARCHAR[]",
     ] {
@@ -176,7 +182,7 @@ fn indexes_and_key_constraints_work_like_text() {
     let (_p, _g, core) = open("vc-keys");
     ok(
         &core,
-        "CREATE TABLE t (k VARCHAR PRIMARY KEY, u VARCHAR, UNIQUE (u))",
+        "CREATE TABLE t (id BIGINT NOT NULL UNIQUE, k VARCHAR PRIMARY KEY, u VARCHAR, UNIQUE (u))",
     );
     ok(&core, "CREATE INDEX idx_u ON t (u)");
     ok(
@@ -214,15 +220,21 @@ fn indexes_and_key_constraints_work_like_text() {
 #[test]
 fn text_and_varchar_foreign_keys_reference_each_other() {
     let (_p, _g, core) = open("vc-fk");
-    ok(&core, "CREATE TABLE tp (k TEXT PRIMARY KEY)");
-    ok(&core, "CREATE TABLE vp (k VARCHAR PRIMARY KEY)");
     ok(
         &core,
-        "CREATE TABLE vc (r VARCHAR, FOREIGN KEY (r) REFERENCES tp (k))",
+        "CREATE TABLE tp (id BIGINT NOT NULL UNIQUE, k TEXT PRIMARY KEY)",
     );
     ok(
         &core,
-        "CREATE TABLE tc (r TEXT, FOREIGN KEY (r) REFERENCES vp (k))",
+        "CREATE TABLE vp (id BIGINT NOT NULL UNIQUE, k VARCHAR PRIMARY KEY)",
+    );
+    ok(
+        &core,
+        "CREATE TABLE vc (id BIGINT PRIMARY KEY, r VARCHAR, FOREIGN KEY (r) REFERENCES tp (k))",
+    );
+    ok(
+        &core,
+        "CREATE TABLE tc (id BIGINT PRIMARY KEY, r TEXT, FOREIGN KEY (r) REFERENCES vp (k))",
     );
     ok(
         &core,
@@ -295,7 +307,7 @@ fn alter_column_type_converts_between_text_and_varchar() {
     let (path, _g, core) = open("vc-alter");
     ok(
         &core,
-        "CREATE TABLE t (k TEXT PRIMARY KEY, u TEXT, UNIQUE (u), w TEXT)",
+        "CREATE TABLE t (id BIGINT NOT NULL UNIQUE, k TEXT PRIMARY KEY, u TEXT, UNIQUE (u), w TEXT)",
     );
     ok(
         &core,
@@ -348,7 +360,7 @@ fn alter_column_type_on_check_dependent_column_stays_rejected() {
     let (_p, _g, core) = open("vc-alter-check");
     ok(
         &core,
-        "CREATE TABLE t (c TEXT CONSTRAINT c_ne CHECK (c = 'ok'))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, c TEXT CONSTRAINT c_ne CHECK (c = 'ok'))",
     );
     assert!(exec(&core, "ALTER TABLE t ALTER COLUMN c TYPE VARCHAR").is_err());
 }

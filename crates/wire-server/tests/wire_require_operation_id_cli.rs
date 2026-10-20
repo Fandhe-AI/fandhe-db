@@ -153,7 +153,10 @@ fn flag_rejects_insert_without_operation_id_with_23502() {
         common::wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
     let mut stream = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
 
-    common::send_simple_query(&mut stream, "CREATE TABLE docs (embedding VECTOR(3))");
+    common::send_simple_query(
+        &mut stream,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(3))",
+    );
     let _ = common::read_command_complete(&mut stream);
     common::read_ready_for_query(&mut stream);
 
@@ -192,7 +195,10 @@ fn default_accepts_insert_without_operation_id() {
         common::wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
     let mut stream = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
 
-    common::send_simple_query(&mut stream, "CREATE TABLE docs (embedding VECTOR(3))");
+    common::send_simple_query(
+        &mut stream,
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(3))",
+    );
     let _ = common::read_command_complete(&mut stream);
     common::read_ready_for_query(&mut stream);
 

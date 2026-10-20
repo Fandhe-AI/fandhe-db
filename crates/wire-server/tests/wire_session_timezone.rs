@@ -47,8 +47,12 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
         ],
     )
     .expect("tenant");
-    core.execute_sql_in_session(&ctx, &mut s, "CREATE TABLE t (v TIMESTAMPTZ)")
-        .expect("create table");
+    core.execute_sql_in_session(
+        &ctx,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    )
+    .expect("create table");
     (core, guard)
 }
 

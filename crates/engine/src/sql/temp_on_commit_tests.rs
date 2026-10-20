@@ -93,10 +93,15 @@ fn table_44_delete_rows_clears_rows_after_a_successful_autocommit_statement() {
     exec(
         &core,
         &mut s,
-        "CREATE TEMP TABLE d (a TEXT) ON COMMIT DELETE ROWS",
+        "CREATE TEMP TABLE d (id BIGINT PRIMARY KEY, a TEXT) ON COMMIT DELETE ROWS",
     )
     .unwrap();
-    exec(&core, &mut s, "CREATE TEMP TABLE p (a TEXT)").unwrap();
+    exec(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE p (id BIGINT PRIMARY KEY, a TEXT)",
+    )
+    .unwrap();
 
     // 自動コミットの INSERT 自体が commit なので、DELETE ROWS の表は同じ文の終わりで空になる。
     put(&core, &mut s, "d", 1);
@@ -106,13 +111,21 @@ fn table_44_delete_rows_clears_rows_after_a_successful_autocommit_statement() {
     // 失敗した文（重複 `42P07`）では適用されない: DELETE ROWS の表へは明示トランザクションで
     // 行を置く必要があるため、ここでは PRESERVE ROWS の行が失敗した文の後も残ることを確かめる。
     assert_eq!(
-        exec(&core, &mut s, "CREATE TEMP TABLE p (a TEXT)"),
+        exec(
+            &core,
+            &mut s,
+            "CREATE TEMP TABLE p (id BIGINT PRIMARY KEY, a TEXT)"
+        ),
         Err("42P07".to_string())
     );
     assert_eq!(rows(&core, &mut s, "p"), 1);
     assert!(s.temp_tables().contains("d"));
     assert_eq!(
-        exec(&core, &mut s, "CREATE TEMP TABLE d (a TEXT)"),
+        exec(
+            &core,
+            &mut s,
+            "CREATE TEMP TABLE d (id BIGINT PRIMARY KEY, a TEXT)"
+        ),
         Err("42P07".to_string())
     );
 }
@@ -126,7 +139,7 @@ fn table_44_explicit_commit_applies_and_rollback_does_not() {
     exec(
         &core,
         &mut s,
-        "CREATE TEMP TABLE d (a TEXT) ON COMMIT DELETE ROWS",
+        "CREATE TEMP TABLE d (id BIGINT PRIMARY KEY, a TEXT) ON COMMIT DELETE ROWS",
     )
     .unwrap();
     let mut txn = core.new_session_transaction();
@@ -153,12 +166,27 @@ fn table_44_drop_removes_the_table_and_its_storage() {
     let core = open_core(&path);
     let mut s = new_session();
     // 自動コミットの CREATE は同じ文の終わりで消える（PG の自動コミット時と同じ）。
-    exec(&core, &mut s, "CREATE TEMP TABLE x (a TEXT) ON COMMIT DROP").unwrap();
+    exec(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE x (id BIGINT PRIMARY KEY, a TEXT) ON COMMIT DROP",
+    )
+    .unwrap();
     assert!(!s.temp_tables().contains("x"));
-    exec(&core, &mut s, "CREATE TEMP TABLE x (a TEXT) ON COMMIT DROP").unwrap();
+    exec(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE x (id BIGINT PRIMARY KEY, a TEXT) ON COMMIT DROP",
+    )
+    .unwrap();
 
     // 手で登録した DROP の表は、行を置いた後の commit で表も実体も無くなる。
-    exec(&core, &mut s, "CREATE TEMP TABLE keep (a TEXT)").unwrap();
+    exec(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE keep (id BIGINT PRIMARY KEY, a TEXT)",
+    )
+    .unwrap();
     put(&core, &mut s, "keep", 1);
     let store = s.temp_rows_arc_for_test().expect("store");
     let base = store.used_bytes().expect("used");
@@ -171,7 +199,12 @@ fn table_44_drop_removes_the_table_and_its_storage() {
     assert!(s.temp_tables().contains("keep"));
     assert_eq!(rows(&core, &mut s, "keep"), 1);
     // 実体も消えているので、同名を作り直せる。
-    exec(&core, &mut s, "CREATE TEMP TABLE y (a TEXT)").unwrap();
+    exec(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE y (id BIGINT PRIMARY KEY, a TEXT)",
+    )
+    .unwrap();
     assert!(store.used_bytes().expect("used") >= base);
 }
 
@@ -195,7 +228,12 @@ fn table_44_hook_is_a_noop_without_targets() {
     // 一時表が無いセッションは一時 DB も作らない。
     s.apply_temp_on_commit().expect("empty");
     assert!(s.temp_rows_arc_for_test().is_none());
-    exec(&core, &mut s, "CREATE TEMP TABLE p (a TEXT)").unwrap();
+    exec(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE p (id BIGINT PRIMARY KEY, a TEXT)",
+    )
+    .unwrap();
     put(&core, &mut s, "p", 1);
     s.apply_temp_on_commit().expect("preserve only");
     assert_eq!(rows(&core, &mut s, "p"), 1);

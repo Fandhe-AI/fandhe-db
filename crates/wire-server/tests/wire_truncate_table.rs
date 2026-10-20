@@ -10,6 +10,12 @@
 
 #[path = "common/mod.rs"]
 mod common;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// NoSQL 表層は従来方式の表だけを扱うため、このテストの `CREATE TABLE` は従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../../engine/src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 
 #[path = "../../engine/src/test_util/temp_db.rs"]
 mod temp_db;
@@ -242,7 +248,7 @@ fn wire_truncate_restrict_rejects_and_cascade_empties_referencing_table() {
         "CREATE TABLE p (name TEXT)",
         "CREATE TABLE kids (parent_id BIGINT REFERENCES p)",
     ] {
-        core.execute_sql_in_session(&sys, &mut ddl_session, sql)
+        core.execute_sql_in_session_legacy(&sys, &mut ddl_session, sql)
             .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
     }
     let addr = spawn_server_with_engine(&users_file(), core);

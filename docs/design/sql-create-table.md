@@ -45,10 +45,13 @@ CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]
 - `TEXT`・`INTEGER`・`BIGINT` 列は PostgreSQL に倣い `nullable = true`。
 - `VECTOR` 列は 0 本または 1 本（catalog の既存 `validate_schema` 規則。2 本以上の
   宣言は `catalog::CatalogError::Invalid` → `42601`）。
-- 予約列名 `id`／`tenant_id`／`visibility`（ASCII 大文字小文字を無視して照合）は
-  列宣言として拒否する（`42601`）。`sql::parser` がこれら 3 語を疑似列・RLS 内部列
-  として扱う契約と整合させ、SQL 表層の DDL でこれらを隠蔽する列を作らせないため
-  （fail-closed）。Rust API（`Storage::create_table`）の挙動は変更しない。
+- 予約列名 `tenant_id`／`visibility`（ASCII 大文字小文字を無視して照合）は
+  列宣言として拒否する（`42601`）。RLS 内部列を隠蔽する列を作らせないため（fail-closed）。
+  Rust API（`Storage::create_table`）の挙動は変更しない。
+- `id` は予約しない（Issue #2199・TABLE-23）。SQL 表層で新しく作る表は暗黙の `id` を持たず、宣言した
+  `id` は通常の列（PG と同じ）。従来方式の検証（NoSQL 表層の `create_table`。
+  `validate_create_table_tokens_with_implicit_id`）だけが `id` を予約し、`PRIMARY KEY (id)` を暗黙主キーとして扱う。
+  詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §11。
 - `check`／`constraint` も予約列名として拒否する（`42601`。Issue #906）。列リスト
   要素先頭の `CHECK (`／`CONSTRAINT` を列定義と曖昧さなく制約宣言として解釈する
   ため（`docs/design/sql-check-constraint.md`「曖昧さの排除」参照）。

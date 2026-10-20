@@ -672,7 +672,7 @@ fn partitioned_dml_over_the_wire_reports_completion_and_vd001() {
         core.execute_sql_in_session(
             &sys,
             &mut session,
-            "CREATE TABLE udocs (n BIGINT, u TEXT UNIQUE)",
+            "CREATE TABLE udocs (id BIGINT PRIMARY KEY, n BIGINT, u TEXT UNIQUE)",
         )
         .expect("create table");
         let alice =

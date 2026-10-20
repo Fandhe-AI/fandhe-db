@@ -813,7 +813,7 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
                 )));
             }
             // `id` は存在するが照合を持てない。それ以外の不在は列不在（`42703`）。
-            None if col == "id" => {
+            None if col == "id" && schema.has_pseudo_id() => {
                 return Err(CatalogError::IndexCollationNotSupported(
                     "column id does not support COLLATE in an index".to_string(),
                 ));
@@ -831,7 +831,7 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
                     ))
                 }
             };
-            if col == "id" {
+            if col == "id" && schema.has_pseudo_id() {
                 // `id` は暗黙の行キーで常に「存在する列」だが `VECTOR` 型ではないため、
                 // 列不在（`ColumnNotFound`）ではなく種別・列型の不整合へ倒す。
                 return Err(CatalogError::IndexKindMismatch(
@@ -852,7 +852,9 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
         IndexKind::Scalar => {
             // 式要素の位置（空文字列）は束縛段（`create_index_bound`）が検査する。
             for col in def.columns.iter().filter(|c| !c.is_empty()) {
-                if col == "id" {
+                // 疑似列 `id` を持つのは従来方式の表だけ（採番方式の表の `id` は宣言した通常の列。
+                // TABLE-23・Issue #2199）。
+                if col == "id" && schema.has_pseudo_id() {
                     continue;
                 }
                 let column = schema
@@ -1631,7 +1633,7 @@ fn drop_unique_index_constraint_in_txn(
             def.name
         ))
     };
-    let schema = match require_table_schema_write(write_txn, &def.table) {
+    let schema = match require_table_schema_write_any_identity(write_txn, &def.table) {
         Ok(s) => s,
         Err(CatalogError::TableNotFound(_)) => return Err(corrupt()),
         Err(e) => return Err(e),
@@ -4842,24 +4844,24 @@ impl TableLookup for TxnViewLookup<'_, '_> {
         &self,
         name: &str,
     ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
-        Ok(self.txn_schema(name)?.map(|schema| {
-            let mut columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-            if !columns.iter().any(|c| c == "id") {
-                columns.push("id".to_string());
-            }
-            columns
-        }))
+        Ok(self
+            .txn_schema(name)?
+            .map(|schema| lookup_columns_of(&schema)))
     }
 
     fn table_star_columns(
         &self,
         name: &str,
     ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
-        Ok(self.txn_schema(name)?.map(|schema| {
-            let mut columns = vec!["id".to_string()];
-            columns.extend(schema.columns.iter().map(|c| c.name.clone()));
-            columns
-        }))
+        Ok(self
+            .txn_schema(name)?
+            .map(|schema| lookup_star_columns_of(&schema)))
+    }
+
+    fn table_is_allocated(&self, name: &str) -> std::result::Result<bool, SqlSurfaceError> {
+        Ok(self
+            .txn_schema(name)?
+            .is_some_and(|schema| schema.is_allocated()))
     }
 }
 
@@ -4929,6 +4931,14 @@ impl TableLookup for ViewWriteSnapshot<'_> {
         match self.table_schema(name) {
             Ok(schema) => Ok(Some(lookup_columns_of(&schema))),
             Err(CatalogError::TableNotFound(_)) => Ok(None),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
+    fn table_is_allocated(&self, name: &str) -> std::result::Result<bool, SqlSurfaceError> {
+        match self.table_schema(name) {
+            Ok(schema) => Ok(schema.is_allocated()),
+            Err(CatalogError::TableNotFound(_)) => Ok(false),
             Err(other) => Err(table_lookup_error(other)),
         }
     }
@@ -5265,7 +5275,7 @@ fn drop_foreign_key_in_txn(
     constraint: &str,
 ) -> Result<()> {
     {
-        let schema = require_table_schema_write(write_txn, child_table)?;
+        let schema = require_table_schema_write_any_identity(write_txn, child_table)?;
         let fk_index = schema
             .foreign_keys
             .iter()
@@ -7204,16 +7214,18 @@ pub struct TableSchema {
 /// 表ごとの行識別方式（TABLE-23・Issue #2193。ADR D3）。カタログ属性として
 /// [`TableSchema`] が保持し、行ストアの物理キー（`storage::rowid::RowId`）の意味を決める。
 ///
-/// 本 Issue の時点では、SQL・NoSQL・Rust API の `create_table` は常に `LegacyId` で表を作る。
-/// `Allocated` の本番作成経路は後続 sub-issue（#2197・#2200）が担い、本 Issue では
-/// 属性の永続化・採番器・未対応経路の fail-closed 拒否までを用意する。
+/// 表の作成経路ごとの方式（Issue #2199 以降）: SQL 表層の `CREATE TABLE`・`CREATE TEMP TABLE` は
+/// `Allocated`（暗黙の `id` を持たない。PG と同じ表定義）、NoSQL 表層の `create_table`・Rust API の
+/// `create_table` と既存の全表は `LegacyId`。NoSQL・Rust API の行 API（`id` で行を指す）は
+/// `Allocated` の表を固定文言の `0A000` で拒否する（rowid を `id` として見せない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum RowIdentity {
     /// 従来方式（既定）。
     #[default]
     LegacyId,
-    /// 採番方式（契約は spec のポインタ TABLE-23 を正とする）。後続対応が揃うまで全 DML・読み取りを
-    /// `0A000` 相当の固定文言で拒否する（[`ROW_IDENTITY_UNSUPPORTED_MESSAGE`]）。
+    /// 採番方式（契約は spec のポインタ TABLE-23 を正とする）。暗黙の `id` を持たず、行の物理キー（rowid）は
+    /// 書き込み段が同じ write txn で払い出す。SQL 表層だけが読み書きでき、行の識別子を `id` として返す
+    /// Rust API・NoSQL 表層は `0A000` 相当の固定文言で拒否する（[`ROW_IDENTITY_UNSUPPORTED_MESSAGE`]）。
     Allocated,
 }
 
@@ -7574,12 +7586,40 @@ impl TableSchema {
         self.row_identity
     }
 
+    /// 疑似列 `id`（行ストアの物理キーを利用者へ見せる従来の予約列）を持つ表かを返す
+    /// （TABLE-23・Issue #2199）。従来方式（[`RowIdentity::LegacyId`]）の表だけが持ち、
+    /// 採番方式（[`RowIdentity::Allocated`]）の表では `id` は予約されず、宣言した場合だけ通常の列として
+    /// 存在する。SQL 表層の `id` 解決・`SELECT *` の展開・`INSERT` の `id` 必須検査はすべてこの判定に従う。
+    pub(crate) fn has_pseudo_id(&self) -> bool {
+        matches!(self.row_identity, RowIdentity::LegacyId)
+    }
+
+    /// 採番方式（`id` を予約しない）の表かを返す。NoSQL 表層・Rust API など rowid を
+    /// 利用者へ見せる経路が fail-closed に拒否する判定に使う（公開 API は
+    /// [`Storage::table_uses_allocated_row_identity`]）。
+    pub(crate) fn is_allocated(&self) -> bool {
+        matches!(self.row_identity, RowIdentity::Allocated)
+    }
+
     /// 行識別方式が従来方式以外の表への操作を fail-closed に拒否する共通ゲート
     /// （索引・検索・台帳が rowid 未対応の間の安全弁。後続 sub-issue #2194〜#2197 が外す）。
     pub(crate) fn require_legacy_row_identity(&self) -> Result<()> {
         match self.row_identity {
             RowIdentity::LegacyId => Ok(()),
             RowIdentity::Allocated => Err(row_identity_unsupported_error()),
+        }
+    }
+
+    /// 採番方式の表への UPSERT で、衝突対象が行キー指定（`ON CONFLICT (id)` の疑似列解決）なら
+    /// fail-closed に拒否する（TABLE-23・Issue #2199。束縛段が採番方式の表では `RowId` 対象を
+    /// 作らないため通常は到達しない多層防御）。
+    pub(crate) fn require_legacy_row_identity_unless_unique_target(
+        &self,
+        target: &crate::tenant::UpsertTarget<'_>,
+    ) -> Result<()> {
+        match target {
+            crate::tenant::UpsertTarget::Unique(_) => Ok(()),
+            crate::tenant::UpsertTarget::RowId => self.require_legacy_row_identity(),
         }
     }
 
@@ -8338,7 +8378,15 @@ fn resolve_foreign_key_target(
     let parent_columns: Vec<String> = if fk.parent_columns.is_empty() {
         match parent.primary_key() {
             Some(pk) => pk.to_vec(),
-            None => vec![FOREIGN_KEY_PARENT_ID_COLUMN.to_string()],
+            // 参照先列の省略で主キーが無い場合、従来方式の表は `id` 疑似列を参照する。採番方式の表
+            // （暗黙の `id` を持たない。TABLE-23・Issue #2199）には疑似列が無いため PG と同じ `42830`。
+            None if parent.has_pseudo_id() => vec![FOREIGN_KEY_PARENT_ID_COLUMN.to_string()],
+            None => {
+                return Err(CatalogError::InvalidForeignKey(format!(
+                    "there is no primary key for referenced table {}",
+                    parent.name
+                )))
+            }
         }
     } else {
         fk.parent_columns.clone()
@@ -8376,7 +8424,9 @@ fn resolve_foreign_key_target(
             }
         }
         // `id` は常に非 NULL・ON UPDATE は A7 で発火しないため (c) の nullable 検査は不要。
-        // 採番方式の親への `id` 参照は DDL 段で拒否（実行時は constraint 側が対。Issue #2194）。
+        // 採番方式の親（`id` を宣言した列として持つ場合を含む）への `id` 参照は DDL 段で拒否する。永続化する
+        // 参照先列名 `id` は物理キーの `id` を指す宣言と区別できず、宣言した列への FK の対応は
+        // 後続 Issue（#2200）が担う（実行時は constraint 側が対。Issue #2194・#2199）。
         parent.require_legacy_row_identity()?;
         return Ok(resolved);
     }
@@ -8663,7 +8713,7 @@ fn revalidate_keys_after_type_change(
         let parent = if fk.parent_table == table_name {
             new_schema.clone()
         } else {
-            require_table_schema_write(write_txn, &fk.parent_table)?
+            require_table_schema_write_any_identity(write_txn, &fk.parent_table)?
         };
         if fk.references_parent_id() {
             // `id` 疑似列参照は参照元列が整数型であることだけを宣言時と同じ基準で照合し
@@ -11216,16 +11266,19 @@ pub(crate) fn require_table_schema_write(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
 ) -> Result<TableSchema> {
-    // 行識別方式が従来方式以外の表への書き込みは、索引・検索・台帳が rowid 未対応の間
-    // 共通点（`tenant.rs` の全書き込みがここを通る）で fail-closed に拒否する
-    // （TABLE-23・Issue #2193。後続 #2194〜#2197 が外す）。
+    // 利用者が行 id を指定する書き込み（Rust API・NoSQL 表層・raw 書き込み）は、採番方式の表では
+    // rowid を利用者へ見せる経路になるため、共通点（`tenant.rs` の id 指定書き込み）で fail-closed
+    // に拒否する（TABLE-23・Issue #2193・#2199）。SQL 表層の書き込みは
+    // [`require_table_schema_write_sql`] を使い、採番方式の表も扱う。
     let schema = require_table_schema_write_any_identity(write_txn, table_name)?;
     schema.require_legacy_row_identity()?;
     Ok(schema)
 }
 
-/// [`require_table_schema_write`] から行識別方式のゲートを除いた版。行を識別子に依存せず
-/// 消すだけの `TRUNCATE` など、方式に関わらず通すべき経路専用（TABLE-23・Issue #2193）。
+/// [`require_table_schema_write`] から行識別方式のゲートを除いた版。方式に関わらず通すべき経路用:
+/// 行を識別子に依存せず消す `TRUNCATE`（Issue #2193）、採番方式の表も書く SQL 表層の型付き挿入・
+/// UPSERT・述語形 DML・分割実行 DML（Issue #2199）、スキーマを読むだけのカタログ・制約の内部処理。
+/// 利用者が行 id を指定する Rust API・NoSQL・raw 書き込みは [`require_table_schema_write`]（ゲートあり）。
 pub(crate) fn require_table_schema_write_any_identity(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
@@ -12705,7 +12758,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let confirmed_name;
         {
-            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
             let new_columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
 
             // 明示名の衝突は既定名導出より前に判定する（同名の UNIQUE・CHECK・
@@ -12846,7 +12899,7 @@ impl Storage {
             .unwrap_or_else(|| primary_key_constraint_name(table_name));
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
-            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
             if schema.primary_key().is_some() {
                 return Err(CatalogError::MultiplePrimaryKeys(table_name.to_string()));
             }
@@ -12950,7 +13003,7 @@ impl Storage {
         column_name: &str,
     ) -> Result<AlterApply> {
         {
-            let schema = require_table_schema_write(write_txn, table_name)?;
+            let schema = require_table_schema_write_any_identity(write_txn, table_name)?;
             let column = schema
                 .columns
                 .iter()
@@ -12980,15 +13033,17 @@ impl Storage {
                 if !fk.columns.iter().any(|c| c == column_name) || fk.parent_table == table_name {
                     continue;
                 }
-                let parent = match require_table_schema_write(write_txn, &fk.parent_table) {
-                    Ok(p) => p,
-                    Err(CatalogError::TableNotFound(_)) | Err(CatalogError::WrongObjectKind(_)) => {
-                        return Err(CatalogError::CorruptSchema(
-                            "foreign key parent is missing".to_string(),
-                        ));
-                    }
-                    Err(e) => return Err(e),
-                };
+                let parent =
+                    match require_table_schema_write_any_identity(write_txn, &fk.parent_table) {
+                        Ok(p) => p,
+                        Err(CatalogError::TableNotFound(_))
+                        | Err(CatalogError::WrongObjectKind(_)) => {
+                            return Err(CatalogError::CorruptSchema(
+                                "foreign key parent is missing".to_string(),
+                            ));
+                        }
+                        Err(e) => return Err(e),
+                    };
                 resolve_foreign_key_target(&updated, fk, &parent)?;
             }
 
@@ -13054,7 +13109,7 @@ impl Storage {
         column_name: &str,
     ) -> Result<AlterApply> {
         let updated = {
-            let schema = require_table_schema_write(write_txn, table_name)?;
+            let schema = require_table_schema_write_any_identity(write_txn, table_name)?;
             let column = schema
                 .columns
                 .iter()
@@ -13172,7 +13227,7 @@ impl Storage {
         default_expr: Option<ColumnDefault>,
     ) -> Result<AlterApply> {
         {
-            let schema = require_table_schema_write(write_txn, table_name)?;
+            let schema = require_table_schema_write_any_identity(write_txn, table_name)?;
             let column = schema
                 .columns
                 .iter()
@@ -13291,7 +13346,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let confirmed_name;
         {
-            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
 
             // 明示名の衝突は意味論検証・件数上限より前に判定する（UNIQUE の
             // `alter_table_add_named_unique_constraint` と同じ順序）。
@@ -13449,7 +13504,7 @@ impl Storage {
         let confirmed_name;
         let parent_table_name;
         {
-            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
 
             if let Some(n) = name {
                 let collides = schema.unique_constraints.iter().any(|u| u.name() == n)
@@ -13504,7 +13559,8 @@ impl Storage {
                 {
                     return Err(CatalogError::WrongObjectKind(parent_table_name.clone()));
                 }
-                owned_parent = require_table_schema_write(&write_txn, &parent_table_name)?;
+                owned_parent =
+                    require_table_schema_write_any_identity(&write_txn, &parent_table_name)?;
                 &owned_parent
             };
             let resolved = resolve_foreign_key_target(&schema, &fk_declared, parent)?;
@@ -13604,7 +13660,7 @@ impl Storage {
         let mut dropped_fk_parent_table: Option<String> = None;
         let mut dropped_primary_key = false;
         {
-            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
             let unique_index = schema
                 .unique_constraints
                 .iter()
@@ -14717,7 +14773,7 @@ impl Storage {
                     .map_err(convert_storage_error)
                     .map_err(CreateIndexError::Catalog);
             }
-            let schema = require_table_schema_write(&write_txn, &def.table)?;
+            let schema = require_table_schema_write_any_identity(&write_txn, &def.table)?;
             validate_index_columns(def, &schema)?;
             // 式要素の束縛（INDEX-10、Issue #1648）。保存するのは束縛が描画した正規化テキストと
             // 抽出した参照列だけ。
@@ -15359,7 +15415,7 @@ impl Storage {
         validate_identifier(table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
-            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
             reject_constrained_table_for_raw_write(&write_txn, table_name, &schema)?;
             schema.validate_row_embedding_dim(row.embedding.len())?;
             let encoded = crate::storage::encode_row(row).map_err(convert_storage_error)?;
@@ -15405,7 +15461,7 @@ impl Storage {
         validate_identifier(table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
-            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
             reject_constrained_table_for_raw_write(&write_txn, table_name, &schema)?;
             if rows.is_empty() {
                 // 存在確認以外に何も変更しないため、commit（＝世代を進める）せず
@@ -15469,7 +15525,7 @@ impl Storage {
         validate_identifier(table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
-            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
             reject_constrained_table_for_raw_write(&write_txn, table_name, &schema)?;
             let vector_idx = schema.columns.iter().position(|c| c.ty.is_vector());
             // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま
@@ -15669,6 +15725,14 @@ impl TableLookup for Storage {
         }
     }
 
+    fn table_is_allocated(&self, name: &str) -> std::result::Result<bool, SqlSurfaceError> {
+        match self.get_table_schema(name) {
+            Ok(schema) => Ok(schema.is_allocated()),
+            Err(CatalogError::TableNotFound(_)) => Ok(false),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
     /// `SELECT *` の実際の列並び（疑似列 `id` が先頭、続けて宣言済みの実カラム。実カラム `id` を
     /// 宣言していれば `id` が 2 回現れる）。`sql::parser::bind_projection` の `Projection::All` と一致させる。
     fn table_star_columns(
@@ -15703,7 +15767,7 @@ impl TableLookup for Storage {
 /// `sql::parser::bind_projection` との整合を 1 か所で保つ。
 pub(crate) fn lookup_columns_of(schema: &TableSchema) -> Vec<String> {
     let mut columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-    if !columns.iter().any(|c| c == "id") {
+    if schema.has_pseudo_id() && !columns.iter().any(|c| c == "id") {
         columns.push("id".to_string());
     }
     columns
@@ -15712,7 +15776,11 @@ pub(crate) fn lookup_columns_of(schema: &TableSchema) -> Vec<String> {
 /// [`TableLookup::table_star_columns`] の列名組み立て（疑似列 `id` が先頭、続けて
 /// 宣言済みの実カラム）。[`lookup_columns_of`] と同じ理由で共有する。
 pub(crate) fn lookup_star_columns_of(schema: &TableSchema) -> Vec<String> {
-    let mut columns = vec!["id".to_string()];
+    let mut columns = if schema.has_pseudo_id() {
+        vec!["id".to_string()]
+    } else {
+        Vec::new()
+    };
     columns.extend(schema.columns.iter().map(|c| c.name.clone()));
     columns
 }
@@ -15806,14 +15874,10 @@ pub(crate) fn get_table_schema_in_txn(
     read_txn: &impl crate::storage::read_source::ReadSource,
     table_name: &str,
 ) -> Result<TableSchema> {
-    // 読み取り・検索の relation 解決点。行識別方式が従来方式以外の表は、索引・検索・台帳が
-    // rowid 未対応の間 fail-closed に拒否する（TABLE-23・Issue #2193。後続 #2194〜#2197 が外す）。
-    // `DROP`／`RENAME`／`TRUNCATE` と SQL の存在確認（`TableLookup`）は表の実在確認だけで行を
-    // 読まないため、ゲートを持たない [`Storage::get_table_schema`]・
-    // [`get_table_schema_in_txn_impl`] を使う。
-    let schema = get_table_schema_in_txn_impl(read_txn, table_name, true)?;
-    schema.require_legacy_row_identity()?;
-    Ok(schema)
+    // 読み取り・検索の relation 解決点。採番方式の表（TABLE-23・Issue #2199）も SQL 表層が読む
+    // ため、ここは行識別方式で拒否しない。rowid を応答 `id` として見せる Rust API 側は、それぞれの
+    // 入口（`get_row_from_table`／`scan_table_page` など）がゲートを持つ。
+    get_table_schema_in_txn_impl(read_txn, table_name, true)
 }
 
 /// [`get_table_schema_in_txn`] の本体（行識別方式のゲートなし）。`require_live = false` は
@@ -16547,7 +16611,7 @@ fn resolve_foreign_keys_in_txn(
             {
                 return Err(CatalogError::WrongObjectKind(fk.parent_table.clone()));
             }
-            owned_parent = require_table_schema_write(write_txn, &fk.parent_table)?;
+            owned_parent = require_table_schema_write_any_identity(write_txn, &fk.parent_table)?;
             &owned_parent
         };
         resolved.push(resolve_foreign_key_target(schema, fk, parent)?);
@@ -16680,7 +16744,7 @@ pub(crate) fn required_key_index_names_in_txn(
     // ため除外しない（`constraint::enforce_referencing_rows_in_txn` の
     // `fk.references_parent_id()` 分岐が `none_referenced_in_txn` 経由で
     // 同じ索引を照会する）。
-    let own_schema = require_table_schema_write(write_txn, table)?;
+    let own_schema = require_table_schema_write_any_identity(write_txn, table)?;
     names.extend(
         own_schema
             .foreign_keys

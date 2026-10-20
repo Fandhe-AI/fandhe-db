@@ -366,7 +366,9 @@ fn reject_correlated(
     outer_scopes: &[&TableSchema],
 ) -> Result<(), SqlSurfaceError> {
     for name in referenced {
-        if name == "id" || inner_schema.columns.iter().any(|c| &c.name == name) {
+        if (name == "id" && inner_schema.has_pseudo_id())
+            || inner_schema.columns.iter().any(|c| &c.name == name)
+        {
             continue;
         }
         if outer_scopes
@@ -574,7 +576,9 @@ fn inner_scan_prechecks(
         // から拒否する問題を避ける。`resolve_in_subquery` 等の実行後チェックは
         // 想定外の構成を取りこぼさないための多層防御として残す）。
         let projected_len = match &validated.projection {
-            Projection::All => 1 + inner_schema.columns.len(),
+            Projection::All => {
+                usize::from(inner_schema.has_pseudo_id()) + inner_schema.columns.len()
+            }
             Projection::Columns(names) => names.len(),
             Projection::Items(items) => items.len(),
         };
@@ -1108,7 +1112,7 @@ fn validate_in_target_column<'a>(
     outer_schema: &'a TableSchema,
 ) -> Result<(Option<&'a ColumnType>, SubqueryValueFamily), SqlSurfaceError> {
     let Some(column_def) = outer_schema.columns.iter().find(|c| c.name == column) else {
-        if column == "id" {
+        if column == "id" && outer_schema.has_pseudo_id() {
             return Ok((None, SubqueryValueFamily::Integer));
         }
         return Err(SqlSurfaceError::undefined_column(column));
@@ -1820,7 +1824,7 @@ fn scalar_target_column<'a>(
                 ))
             })?,
         )),
-        None if column == "id" => Ok((None, SubqueryValueFamily::Integer)),
+        None if column == "id" && owner.has_pseudo_id() => Ok((None, SubqueryValueFamily::Integer)),
         None => Err(SqlSurfaceError::undefined_column(column)),
     }
 }

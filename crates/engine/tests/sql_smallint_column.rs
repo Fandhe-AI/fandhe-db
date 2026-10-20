@@ -77,7 +77,10 @@ fn column_type(path: &std::path::Path, table: &str, col: &str) -> ColumnType {
 #[test]
 fn smallint_and_int2_are_persisted_as_the_same_type() {
     let (path, _g, core) = open("si-persist");
-    ok(&core, "CREATE TABLE t (a SMALLINT, b int2, c INTEGER)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a SMALLINT, b int2, c INTEGER)",
+    );
     ok(&core, "ALTER TABLE t ADD COLUMN d SMALLINT");
     ok(&core, "ALTER TABLE t ADD COLUMN e SMALLINT DEFAULT 7");
     drop(core);
@@ -92,14 +95,23 @@ fn smallint_and_int2_are_persisted_as_the_same_type() {
 fn column_default_is_range_checked() {
     let (_p, _g, core) = open("si-default");
     assert_eq!(
-        code(&core, "CREATE TABLE t (a SMALLINT DEFAULT 32768)"),
+        code(
+            &core,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a SMALLINT DEFAULT 32768)"
+        ),
         "22003"
     );
     assert_eq!(
-        code(&core, "CREATE TABLE t (a SMALLINT DEFAULT -32769)"),
+        code(
+            &core,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a SMALLINT DEFAULT -32769)"
+        ),
         "22003"
     );
-    ok(&core, "CREATE TABLE t (a SMALLINT DEFAULT -32768)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a SMALLINT DEFAULT -32768)",
+    );
     assert_eq!(
         code(&core, "ALTER TABLE t ADD COLUMN b SMALLINT DEFAULT 99999"),
         "22003"
@@ -109,7 +121,7 @@ fn column_default_is_range_checked() {
 #[test]
 fn insert_accepts_boundaries_and_rejects_out_of_range() {
     let (_p, _g, core) = open("si-insert");
-    ok(&core, "CREATE TABLE t (n SMALLINT)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, n SMALLINT)");
     for (i, v) in ["-32768", "32767", "0", "NULL"].iter().enumerate() {
         ok(
             &core,
@@ -161,7 +173,7 @@ fn insert_accepts_boundaries_and_rejects_out_of_range() {
 #[test]
 fn update_set_literal_is_range_checked_without_side_effects() {
     let (_p, _g, core) = open("si-update");
-    ok(&core, "CREATE TABLE t (n SMALLINT)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, n SMALLINT)");
     ok(
         &core,
         "INSERT INTO t (id, n) VALUES (1, 5) USING OPERATION_ID 'i1'",
@@ -184,7 +196,7 @@ fn update_set_literal_is_range_checked_without_side_effects() {
 #[test]
 fn upsert_is_range_checked_on_both_sides() {
     let (_p, _g, core) = open("si-upsert");
-    ok(&core, "CREATE TABLE t (n SMALLINT)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, n SMALLINT)");
     ok(
         &core,
         "INSERT INTO t (id, n) VALUES (1, 5) USING OPERATION_ID 'i1'",
@@ -212,14 +224,20 @@ fn upsert_is_range_checked_on_both_sides() {
 #[test]
 fn features_not_yet_enabled_are_rejected_fail_closed() {
     let (_p, _g, core) = open("si-failclosed");
-    ok(&core, "CREATE TABLE t (n SMALLINT, m INTEGER)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SMALLINT, m INTEGER)",
+    );
     ok(
         &core,
         "INSERT INTO t (id, n, m) VALUES (1, 5, 5) USING OPERATION_ID 'i1'",
     );
     for (sql, want) in [
-        ("CREATE TABLE a (n SMALLINT[])", "0A000"),
-        ("CREATE TABLE a (n INT2[3])", "0A000"),
+        (
+            "CREATE TABLE a (id BIGINT PRIMARY KEY, n SMALLINT[])",
+            "0A000",
+        ),
+        ("CREATE TABLE a (id BIGINT PRIMARY KEY, n INT2[3])", "0A000"),
     ] {
         assert_eq!(code(&core, sql), want, "{sql}");
     }
@@ -229,9 +247,18 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
 #[test]
 fn primary_key_unique_and_alter_type_are_enabled() {
     let (_p, _g, core) = open("si-enabled");
-    ok(&core, "CREATE TABLE p (n SMALLINT PRIMARY KEY)");
-    ok(&core, "CREATE TABLE u (n SMALLINT UNIQUE)");
-    ok(&core, "CREATE TABLE t (n SMALLINT, m INTEGER)");
+    ok(
+        &core,
+        "CREATE TABLE p (id BIGINT NOT NULL UNIQUE, n SMALLINT PRIMARY KEY)",
+    );
+    ok(
+        &core,
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, n SMALLINT UNIQUE)",
+    );
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SMALLINT, m INTEGER)",
+    );
     ok(&core, "ALTER TABLE t ALTER COLUMN n TYPE INTEGER");
 }
 

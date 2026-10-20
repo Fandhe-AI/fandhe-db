@@ -393,7 +393,7 @@ fn chunk_loop<E>(
         // 保持時間は permit を得てから数える（待機時間を保持時間に含めない）。
         let start = clock();
 
-        let schema = require_table_schema_write(&write_txn, table).map_err(w)?;
+        let schema = require_table_schema_write_any_identity(&write_txn, table).map_err(w)?;
         if let Some(expected) = expected_schema {
             if expected != &schema {
                 return Err(w(CatalogError::Invalid(
@@ -524,9 +524,9 @@ fn chunk_loop<E>(
             }
         }
 
-        // 適用段（原子経路と共有。#2194 の担当範囲）は未移行で `id` 列値の `u64` 列を受ける。
-        // 従来方式の表（採番方式の表は DML ゲートで到達不能）では rowid の生値＝`id` 列値なので
-        // `legacy_id()` で変換する。#2197 でこの境界を主キー値／rowid の解決へ差し替える。
+        // 適用段（原子経路と共有）は物理キー要素の `u64` 列を受ける。従来方式の表では rowid の生値＝
+        // `id` 列値、採番方式の表（TABLE-23・Issue #2199）では払い出した rowid の生値で、どちらも
+        // `legacy_id()` が行ストアの物理キー要素を返す（利用者へは出さない）。
         // 長さはチャンク幅以下で有界（走査段が候補をチャンク幅で締める）。
         let candidate_ids: Vec<u64> = candidates.iter().map(|r| r.legacy_id()).collect();
         // 適用（原子経路と共有する適用段）。保持時間を超えたら残りを次チャンクへ回す。

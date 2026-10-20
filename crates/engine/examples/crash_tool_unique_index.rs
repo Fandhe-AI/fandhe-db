@@ -75,6 +75,13 @@ use engine::storage::{Storage, Visibility};
 
 /// write/verify で固定して使うテナント識別子（単一テナントのクラッシュ耐性検証が
 /// 目的で、RLS ポリシー評価そのものは対象外。`crash_tool_cross_table.rs` と同方針）。
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// この crash ツールは行 id を行の識別に使う従来方式の契約を検証するため、`CREATE TABLE` を従来方式の
+// 表作成へ振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
+
 const CRASH_TOOL_TENANT_ID: &str = "crash-tool-unique-index-tenant";
 
 /// 1 `INSERT` 文（＝1 write トランザクション）で書き込む行数。行総数はこの値の
@@ -148,23 +155,31 @@ fn tenant_ctx() -> Result<PolicyContext, String> {
 fn ensure_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
     let mut session = SessionState::default();
     session.allow_ddl();
-    match core.execute_sql_in_session(ctx, &mut session, "CREATE TABLE docs (code TEXT UNIQUE)") {
+    match core.execute_sql_in_session_legacy(
+        ctx,
+        &mut session,
+        "CREATE TABLE docs (code TEXT UNIQUE)",
+    ) {
         Ok(_) => {}
         Err(engine::sql::allowlist::SqlSurfaceError::DuplicateTable { .. }) => {}
         Err(e) => return Err(format!("create table failed: {e}")),
     }
-    match core.execute_sql_in_session(ctx, &mut session, "CREATE TABLE docs_uidx (code TEXT)") {
+    match core.execute_sql_in_session_legacy(
+        ctx,
+        &mut session,
+        "CREATE TABLE docs_uidx (code TEXT)",
+    ) {
         Ok(_) => {}
         Err(engine::sql::allowlist::SqlSurfaceError::DuplicateTable { .. }) => {}
         Err(e) => return Err(format!("create table failed: {e}")),
     }
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         ctx,
         &mut session,
         "CREATE UNIQUE INDEX IF NOT EXISTS docs_uidx_code ON docs_uidx (code)",
     )
     .map_err(|e| format!("create unique index failed: {e}"))?;
-    match core.execute_sql_in_session(
+    match core.execute_sql_in_session_legacy(
         ctx,
         &mut session,
         "CREATE TABLE docs_xidx (n INTEGER, code TEXT)",
@@ -179,10 +194,10 @@ fn ensure_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
         // 一意の式索引（Issue #1651・INDEX-9）。`write` の code は行 id ごとに一意なので常に書ける。
         "CREATE UNIQUE INDEX IF NOT EXISTS docs_xidx_ulower ON docs_xidx ((lower(code)))",
     ] {
-        core.execute_sql_in_session(ctx, &mut session, sql)
+        core.execute_sql_in_session_legacy(ctx, &mut session, sql)
             .map_err(|e| format!("create expression index failed: {e}"))?;
     }
-    match core.execute_sql_in_session(
+    match core.execute_sql_in_session_legacy(
         ctx,
         &mut session,
         "CREATE TABLE docs_pidx (n INTEGER, code TEXT)",
@@ -199,7 +214,7 @@ fn ensure_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String> {
         // 部分 UNIQUE 索引（Issue #1657）。`code` は恒久的に一意なので `write` は違反しない。
         "CREATE UNIQUE INDEX IF NOT EXISTS docs_pidx_code_u ON docs_pidx (code) WHERE n > 0",
     ] {
-        core.execute_sql_in_session(ctx, &mut session, sql)
+        core.execute_sql_in_session_legacy(ctx, &mut session, sql)
             .map_err(|e| format!("create partial index failed: {e}"))?;
     }
     Ok(())
@@ -319,7 +334,7 @@ fn write_inner(path: &str) -> Result<(), String> {
                     "UPDATE {table} SET n = 0 - n WHERE id = {slot} USING OPERATION_ID 'op-{table}-flip-{batch_seq}'"
                 );
                 let mut session = SessionState::default();
-                core.execute_sql_in_session(&ctx, &mut session, &flip)
+                core.execute_sql_in_session_legacy(&ctx, &mut session, &flip)
                     .map_err(|e| format!("update failed at {table} batch_seq={batch_seq}: {e}"))?;
             }
             *slot = slot
@@ -540,7 +555,7 @@ fn verify_expression_index_table(
     let update_sql = format!(
         "UPDATE {XIDX_TABLE} SET n = 0 WHERE id = 0 USING OPERATION_ID 'verify-xidx-upd-{total_rows}'"
     );
-    match core.execute_sql_in_session(ctx, &mut session, &update_sql) {
+    match core.execute_sql_in_session_legacy(ctx, &mut session, &update_sql) {
         Err(e) if e.wire_code() == "22012" => {}
         Err(e) => {
             return Err(format!(
@@ -656,7 +671,7 @@ fn verify_partial_index_table(
     let update_sql = format!(
         "UPDATE {PIDX_TABLE} SET n = -5 WHERE id = 0 USING OPERATION_ID 'verify-pidx-upd-{total_rows}'"
     );
-    match core.execute_sql_in_session(ctx, &mut session, &update_sql) {
+    match core.execute_sql_in_session_legacy(ctx, &mut session, &update_sql) {
         Err(e) if e.wire_code() == "22012" => {}
         Err(e) => {
             return Err(format!(

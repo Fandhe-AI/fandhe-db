@@ -130,7 +130,12 @@ fn fixture(label: &str) -> (std::path::PathBuf, CleanupGuard, EngineCore, Sessio
     let core = open_core(&path);
     let mut s = ddl_session();
     ok(&core, "sys", &mut s, "CREATE SEQUENCE s");
-    ok(&core, "sys", &mut s, "CREATE TABLE t (n BIGINT)");
+    ok(
+        &core,
+        "sys",
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)",
+    );
     (path, guard, core, s)
 }
 
@@ -552,7 +557,12 @@ fn explain_and_cursor_forms_do_not_execute_setval() {
 #[test]
 fn works_in_a_session_that_has_temp_tables() {
     let (_p, _g, core, mut s) = fixture("setval-temp");
-    ok(&core, "alice", &mut s, "CREATE TEMP TABLE tmp (a BIGINT)");
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE TEMP TABLE tmp (id BIGINT PRIMARY KEY, a BIGINT)",
+    );
     assert_eq!(sv(&core, "alice", &mut s, "SELECT setval('s', 10)"), 10);
     assert_eq!(nv(&core, "alice", &mut s, "s"), 11);
     assert_eq!(sv(&core, "alice", &mut s, "SELECT lastval()"), 11);

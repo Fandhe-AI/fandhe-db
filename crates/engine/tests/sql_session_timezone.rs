@@ -236,7 +236,11 @@ fn describe_reports_show_columns_and_set_no_data() {
 fn naive_input_follows_the_session_zone_and_stored_value_is_fixed() {
     let (_g, core) = open("sz-interpret");
     let mut s = session();
-    ok(&core, &mut s, "CREATE TABLE t (v TIMESTAMPTZ, n INTEGER)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ, n INTEGER)",
+    );
     insert(&core, &mut s, 1, "2026-01-01 09:00:00");
     ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
     insert(&core, &mut s, 2, "2026-01-01 09:00:00");
@@ -283,7 +287,11 @@ fn naive_input_follows_the_session_zone_and_stored_value_is_fixed() {
 fn update_and_upsert_follow_the_session_zone() {
     let (_g, core) = open("sz-update");
     let mut s = session();
-    ok(&core, &mut s, "CREATE TABLE t (v TIMESTAMPTZ, n INTEGER)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ, n INTEGER)",
+    );
     insert(&core, &mut s, 1, "2026-01-01 00:00:00Z");
     ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
     ok(
@@ -311,7 +319,11 @@ fn update_and_upsert_follow_the_session_zone() {
 fn copy_from_uses_the_zone_at_copy_start() {
     let (_g, core) = open("sz-copy");
     let mut s = session();
-    ok(&core, &mut s, "CREATE TABLE t (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
     let policy = ctx_for("alice");
     let plan = core
@@ -386,7 +398,11 @@ fn sessions_and_tenants_are_independent() {
     let (_g, core) = open("sz-isolation");
     let mut a = session();
     let mut b = session();
-    ok(&core, &mut a, "CREATE TABLE t (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        &mut a,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     ok(&core, &mut a, "SET TIME ZONE 'Asia/Tokyo'");
     assert_eq!(show(&core, &mut b), "UTC");
     // 別テナントの同名セッション値も独立。
@@ -410,7 +426,7 @@ fn column_default_is_interpreted_at_ddl_time() {
     ok(
         &core,
         &mut s,
-        "CREATE TABLE t (v TIMESTAMPTZ DEFAULT '2026-01-01 00:00:00', n INTEGER)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ DEFAULT '2026-01-01 00:00:00', n INTEGER)",
     );
     ok(
         &core,
@@ -440,7 +456,7 @@ fn column_default_is_interpreted_at_ddl_time() {
         code(
             &core,
             &mut s,
-            "CREATE TABLE u (v TIMESTAMPTZ DEFAULT 'nope')"
+            "CREATE TABLE u (id BIGINT PRIMARY KEY, v TIMESTAMPTZ DEFAULT 'nope')"
         ),
         "22007"
     );
@@ -450,7 +466,11 @@ fn column_default_is_interpreted_at_ddl_time() {
 fn partitioned_resend_with_another_zone_does_not_rewrite() {
     let (_g, core) = open("sz-partitioned");
     let mut s = session();
-    ok(&core, &mut s, "CREATE TABLE t (v TIMESTAMPTZ, n INTEGER)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ, n INTEGER)",
+    );
     for i in 1..=3 {
         ok(
             &core,

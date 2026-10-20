@@ -1904,6 +1904,13 @@ fn insert_default_clock_scope(
     )))
 }
 
+/// `name` が採番方式（暗黙の `id` を持たない）の表かを返す（TABLE-23・Issue #2199）。単一行形
+/// `WHERE id = <n>` を述語形へ戻すかの判定にだけ使う。引けない場合は従来方式（`false`）として扱う:
+/// 採番方式の表を従来方式と誤判定しても、id 指定の書き込みゲート（`0A000`）が fail-closed に拒否する。
+fn allocated_table(lookup: &impl crate::sql::allowlist::TableLookup, name: &str) -> bool {
+    crate::sql::allowlist::TableLookup::table_is_allocated(lookup, name).unwrap_or(false)
+}
+
 /// `read_txn`（確定済みスナップショットまたは明示トランザクションの書き込み
 /// トランザクション。[`crate::storage::read_source::ReadSource`]）から `table_name` の
 /// スキーマを取得する（[`EngineCore::read_txn_with_schema`] とエラー分類を共有する
@@ -2769,6 +2776,18 @@ impl EngineCore {
     pub fn with_scan_limits(mut self, limits: crate::scan_limits::ScanLimits) -> Self {
         self.scan_limits = limits;
         self
+    }
+
+    /// `table` が採番方式（暗黙の `id` を持たない。TABLE-23・Issue #2199）の表かを返す。NoSQL 表層が
+    /// 行の単一アドレスに `id` を前提とするため、該当する表への要求を実行前に `0A000` で拒否する判定に
+    /// 使う（後続 Issue #2201 が NoSQL 側の対応を入れるまでの fail-closed な安全弁）。表が無い・スキーマを
+    /// 読めない場合は `false`（通常の実行経路が未定義表・内部エラーとして分類する。存在の有無を
+    /// この判定の応答に出さない）。
+    pub fn table_uses_allocated_row_identity(&self, table: &str) -> bool {
+        self.storage
+            .get_table_schema(table)
+            .map(|schema| schema.is_allocated())
+            .unwrap_or(false)
     }
 
     /// 現在の総走査行数上限（Issue #1549）。
@@ -4441,6 +4460,16 @@ impl EngineCore {
                 crate::sql::allowlist::DeleteStatement::Predicate(v) => v.table_name().to_string(),
             };
             if crate::sql::allowlist::TableLookup::table_exists(&storage_lookup, &table_name)? {
+                // 採番方式の表（TABLE-23・Issue #2199）では `WHERE id = <n>` は物理キーの直接指定ではなく
+                // 通常の述語（`id` は宣言した列）なので、述語形 DML へ戻す。
+                let stmt = match stmt {
+                    crate::sql::allowlist::DeleteStatement::SingleRow(v)
+                        if allocated_table(&storage_lookup, &table_name) =>
+                    {
+                        crate::sql::allowlist::DeleteStatement::Predicate(v.into_predicate_form()?)
+                    }
+                    other => other,
+                };
                 if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
                     self.check_partitioned_chunk(v.partitioned())?;
                 }
@@ -4476,6 +4505,17 @@ impl EngineCore {
                 }
             };
             if crate::sql::allowlist::TableLookup::table_exists(&storage_lookup, &table_name)? {
+                // 採番方式の表では単一行形 `WHERE id = <n>` を述語形へ戻す（DELETE と同じ。Issue #2199）。
+                let stmt = match stmt {
+                    crate::sql::allowlist::ValidatedUpdateForm::Single(v)
+                        if allocated_table(&storage_lookup, &table_name) =>
+                    {
+                        crate::sql::allowlist::ValidatedUpdateForm::Predicate(
+                            v.into_predicate_form()?,
+                        )
+                    }
+                    other => other,
+                };
                 if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
                     self.check_partitioned_chunk(v.partitioned())?;
                 }
@@ -4961,7 +5001,7 @@ impl EngineCore {
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
             let id_type = || Some(PreparedParamType::Column(ColumnMeta::Id));
             let (schema, column) = match self.storage.get_table_schema(table) {
-                Ok(_) if column == "id" => return id_type(),
+                Ok(schema) if column == "id" && schema.has_pseudo_id() => return id_type(),
                 Ok(schema) => (schema, column.to_string()),
                 // 表でなければ、書き込み文に限りビューの公開列を基表の列へ解決して型を引く
                 // （TABLE-43・Issue #1671・#1672）。公開名 `id` でも物理列へ解決してから疑似列かを
@@ -4987,7 +5027,7 @@ impl EngineCore {
                 Err(_) if column == "id" => return id_type(),
                 Err(_) => return None,
             };
-            if column == "id" {
+            if column == "id" && schema.has_pseudo_id() {
                 return id_type();
             }
             let def = schema.columns.iter().find(|c| c.name == column)?;

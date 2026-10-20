@@ -32,7 +32,7 @@ fn new_core(limits: SchemaLimits, tag: &str) -> (Arc<EngineCore>, temp_db::Clean
     new_core_with_ddl(
         limits,
         tag,
-        "CREATE TABLE g (embedding VECTOR(2) NOT NULL, \
+        "CREATE TABLE g (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, \
          a_text TEXT[4], a_bool BOOLEAN[4], a_int INTEGER[4], a_big BIGINT[4], \
          a_real REAL[4], a_dbl DOUBLE PRECISION[4], a_date DATE[4], a_ts TIMESTAMP[4], \
          a_uuid UUID[4], a_num NUMERIC(5,2)[4], a_bytea BYTEA[4], a_json JSON[4], \
@@ -323,7 +323,8 @@ fn array_binary_result_format_is_0a000_and_connection_survives() {
 /// 既定値では 6 要素を受理する。
 #[test]
 fn configured_array_limit_applies_to_multi_dimensional_columns() {
-    let ddl = "CREATE TABLE lim (embedding VECTOR(2) NOT NULL, m INTEGER[][])";
+    let ddl =
+        "CREATE TABLE lim (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, m INTEGER[][])";
     let (core, _g) = new_core_with_ddl(
         SchemaLimits::new(256, 4, 256),
         "wire-array-limit-small",

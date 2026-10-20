@@ -23,6 +23,12 @@ use engine::storage::{Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 fn new_core(label: &str) -> (EngineCore, CleanupGuard) {
@@ -47,7 +53,7 @@ fn granted() -> SessionState {
 
 fn run_as(core: &EngineCore, tenant: &str, sql: &str) -> Result<SqlOutcome, SqlSurfaceError> {
     let mut s = granted();
-    core.execute_sql_in_session(&ctx(tenant), &mut s, sql)
+    core.execute_sql_in_session_legacy(&ctx(tenant), &mut s, sql)
 }
 
 fn ok(core: &EngineCore, sql: &str) -> SqlOutcome {
@@ -298,7 +304,7 @@ fn permission_and_transaction_gates_apply_to_cascade() {
         "DROP VIEW v1 CASCADE",
     ] {
         let err = core
-            .execute_sql_in_session(&ctx("alice"), &mut denied, sql)
+            .execute_sql_in_session_legacy(&ctx("alice"), &mut denied, sql)
             .expect_err("denied");
         assert_eq!(err.wire_code(), "42501", "{sql}");
     }

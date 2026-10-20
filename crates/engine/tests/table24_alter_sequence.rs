@@ -211,7 +211,11 @@ fn name_resolution_and_kinds() {
     ok(&core, &mut s, "CREATE SEQUENCE seq_a");
     ok(&core, &mut s, "CREATE SEQUENCE seq_b");
     ok(&core, &mut s, "CREATE VIEW v1 AS SELECT embedding FROM t");
-    ok(&core, &mut s, "CREATE TABLE u (lang TEXT)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, lang TEXT)",
+    );
     ok(&core, &mut s, "CREATE INDEX idx1 ON u (lang)");
     ok(
         &core,

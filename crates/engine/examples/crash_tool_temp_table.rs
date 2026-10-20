@@ -39,6 +39,13 @@ use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 use redb::ReadableDatabase;
 
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// この crash ツールは行 id を行の識別に使う従来方式の契約を検証するため、`CREATE TABLE` を従来方式の
+// 表作成へ振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
+
 const TENANT_A: &str = "crash-tool-temp-tenant-a";
 const TENANT_B: &str = "crash-tool-temp-tenant-b";
 /// 1 `INSERT` 文（＝1 write トランザクション）で書き込む永続行数。
@@ -93,7 +100,7 @@ fn open_core(path: &str) -> Result<EngineCore, String> {
 fn ensure_persistent_docs(core: &EngineCore) -> Result<(), String> {
     let mut session = SessionState::default();
     session.allow_ddl();
-    match core.execute_sql_in_session(
+    match core.execute_sql_in_session_legacy(
         &ctx(TENANT_A)?,
         &mut session,
         "CREATE TABLE docs (code TEXT)",
@@ -105,7 +112,7 @@ fn ensure_persistent_docs(core: &EngineCore) -> Result<(), String> {
 }
 
 fn exec(core: &EngineCore, tenant: &str, s: &mut SessionState, sql: &str) -> Result<(), String> {
-    core.execute_sql_in_session(&ctx(tenant)?, s, sql)
+    core.execute_sql_in_session_legacy(&ctx(tenant)?, s, sql)
         .map(|_| ())
         .map_err(|e| format!("{} failed ({}): {e}", sql_head(sql), e.wire_code()))
 }
@@ -175,13 +182,13 @@ fn write_inner(path: &str) -> Result<(), String> {
         &core,
         TENANT_A,
         &mut t1,
-        "CREATE TEMP TABLE docs (code TEXT UNIQUE)",
+        "CREATE TEMP TABLE docs (id BIGINT PRIMARY KEY, code TEXT UNIQUE)",
     )?;
     exec(
         &core,
         TENANT_A,
         &mut t1,
-        "CREATE TEMP TABLE scratch_tmp (code TEXT, n INTEGER)",
+        "CREATE TEMP TABLE scratch_tmp (id BIGINT PRIMARY KEY, code TEXT, n INTEGER)",
     )?;
     exec(
         &core,
@@ -193,13 +200,13 @@ fn write_inner(path: &str) -> Result<(), String> {
         &core,
         TENANT_B,
         &mut t2,
-        "CREATE TEMP TABLE scratch_tmp (code TEXT, n INTEGER)",
+        "CREATE TEMP TABLE scratch_tmp (id BIGINT PRIMARY KEY, code TEXT, n INTEGER)",
     )?;
     exec(
         &core,
         TENANT_A,
         &mut t3,
-        "CREATE TEMP TABLE scratch_tmp (code TEXT, n INTEGER) ON COMMIT DELETE ROWS",
+        "CREATE TEMP TABLE scratch_tmp (id BIGINT PRIMARY KEY, code TEXT, n INTEGER) ON COMMIT DELETE ROWS",
     )?;
     let ctx_a = ctx(TENANT_A)?;
     let mut txn = core.new_session_transaction();
@@ -326,7 +333,7 @@ fn verify_inner(path: &str) -> Result<u64, String> {
 
         for tenant in [TENANT_A, TENANT_B] {
             let mut fresh = SessionState::default();
-            match core.execute_sql_in_session(
+            match core.execute_sql_in_session_legacy(
                 &ctx(tenant)?,
                 &mut fresh,
                 "SELECT code FROM scratch_tmp LIMIT 1",
@@ -346,10 +353,10 @@ fn verify_inner(path: &str) -> Result<u64, String> {
             &core,
             TENANT_A,
             &mut fresh,
-            "CREATE TEMP TABLE scratch_tmp (code TEXT, n INTEGER)",
+            "CREATE TEMP TABLE scratch_tmp (id BIGINT PRIMARY KEY, code TEXT, n INTEGER)",
         )?;
         match core
-            .execute_sql_in_session(
+            .execute_sql_in_session_legacy(
                 &ctx(TENANT_A)?,
                 &mut fresh,
                 "SELECT COUNT(*) FROM scratch_tmp",

@@ -800,3 +800,6 @@ SQL-49・RLS-10 (b)・ERR-6 の `55000`。本節は設計判断の記録でコ�
 - ビュー経由の `PARTITIONED` 分割実行 DML。
 - 非セッション API と NoSQL 表層からのビューへの書き込み。
 - `TRUNCATE` のビュー対応（`42809` を維持する）。
+
+> Issue #2199 注記: 基表が採番方式の表（暗黙の `id` を持たない）のときの単一行形 `WHERE id = <n>` は、基表の通常の列への述語形へ
+> 書き換える（宣言の無い `id` は `42703`）。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §11。

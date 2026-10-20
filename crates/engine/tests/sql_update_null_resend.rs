@@ -52,7 +52,7 @@ fn seed(core: &EngineCore) {
     core.execute_sql_in_session(
         &ctx("sys"),
         &mut session,
-        "CREATE TABLE docs (lang TEXT, n BIGINT)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, lang TEXT, n BIGINT)",
     )
     .expect("create table");
     for id in 1..=3 {

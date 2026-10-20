@@ -23,6 +23,12 @@ use engine::storage::Storage;
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 fn new_core(label: &str) -> (EngineCore, std::path::PathBuf) {
@@ -61,7 +67,7 @@ fn create_table_accepts_single_column_primary_key_via_column_constraint() {
     let mut session = granted_session();
 
     let outcome = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY)",
@@ -84,7 +90,7 @@ fn create_table_accepts_composite_primary_key_via_table_constraint() {
     let mut session = granted_session();
 
     let outcome = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (embedding VECTOR(4), tenant_code TEXT, region TEXT, PRIMARY KEY (tenant_code, region))",
@@ -100,7 +106,7 @@ fn create_table_accepts_id_only_primary_key_as_a_no_op() {
     let alice = ctx("alice");
     let mut session = granted_session();
 
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (embedding VECTOR(4), body TEXT, PRIMARY KEY (id))",
@@ -160,7 +166,7 @@ fn create_table_rejects_multiple_primary_key_declarations() {
         "CREATE TABLE docs (a TEXT PRIMARY KEY, b TEXT, PRIMARY KEY (b))",
     ] {
         let err = core
-            .execute_sql_in_session(&alice, &mut session, sql)
+            .execute_sql_in_session_legacy(&alice, &mut session, sql)
             .expect_err("duplicate PRIMARY KEY declarations must be rejected");
         assert_eq!(err.wire_code(), "42P16", "{sql}");
         assert_eq!(
@@ -170,7 +176,7 @@ fn create_table_rejects_multiple_primary_key_declarations() {
     }
 
     // 副作用ゼロ: テーブルは作られておらず、正しい定義で作成できる。
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (a TEXT PRIMARY KEY, b TEXT)",
@@ -186,7 +192,7 @@ fn create_table_rejects_empty_primary_key_column_list() {
     let mut session = granted_session();
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (a TEXT, PRIMARY KEY ())",
@@ -203,7 +209,7 @@ fn create_table_rejects_primary_key_referencing_unknown_column() {
     let mut session = granted_session();
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (a TEXT, PRIMARY KEY (missing))",
@@ -220,7 +226,7 @@ fn create_table_rejects_vector_column_as_primary_key() {
     let mut session = granted_session();
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (embedding VECTOR(4) PRIMARY KEY)",
@@ -237,7 +243,7 @@ fn create_table_rejects_id_mixed_with_other_columns_in_primary_key() {
     let mut session = granted_session();
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (code TEXT, PRIMARY KEY (id, code))",
@@ -254,7 +260,7 @@ fn create_table_rejects_duplicate_column_name_within_primary_key() {
     let mut session = granted_session();
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (code TEXT, PRIMARY KEY (code, code))",
@@ -271,7 +277,7 @@ fn insert_rejects_duplicate_primary_key_value_within_the_same_tenant() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY)",
@@ -307,7 +313,7 @@ fn insert_rejects_duplicate_composite_primary_key_value() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (embedding VECTOR(4), a TEXT, b TEXT, PRIMARY KEY (a, b))",
@@ -343,7 +349,7 @@ fn update_rejects_change_that_would_create_a_duplicate_primary_key_value() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY)",
@@ -386,7 +392,7 @@ fn different_tenants_may_share_the_same_primary_key_value() {
     let alice = ctx("alice");
     let bob = ctx("bob");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY)",
@@ -414,7 +420,7 @@ fn upsert_do_nothing_row_is_excluded_from_primary_key_check_and_does_not_block_n
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY)",
@@ -446,7 +452,7 @@ fn upsert_do_nothing_row_value_still_participates_in_primary_key_check_via_exist
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY)",
@@ -479,7 +485,7 @@ fn upsert_do_update_rows_that_would_collide_are_rejected() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY)",
@@ -547,7 +553,7 @@ fn predicate_update_matching_multiple_rows_without_touching_primary_key_succeeds
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY, tag TEXT)",
@@ -575,7 +581,7 @@ fn predicate_update_matching_multiple_rows_without_touching_primary_key_succeeds
     // （`execute_update_sql` は単一行・`id` 等価形のみ。SQL-19 参照）。
     let mut dml_session = SessionState::default();
     let outcome = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut dml_session,
             "UPDATE docs SET tag = 'z' WHERE tag = 'x' USING OPERATION_ID 'op-update-benign'",
@@ -593,7 +599,7 @@ fn predicate_update_matching_multiple_rows_that_would_collide_on_primary_key_is_
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY, tag TEXT)",
@@ -614,7 +620,7 @@ fn predicate_update_matching_multiple_rows_that_would_collide_on_primary_key_is_
     // 一括更新しようとするため、更新後の行同士が一意性制約に違反する。
     let mut dml_session = SessionState::default();
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut dml_session,
             "UPDATE docs SET code = 'dup' WHERE tag = 'x' USING OPERATION_ID 'op-update-collide'",
@@ -647,7 +653,7 @@ fn file_insert_rejects_primary_key_collision_across_generated_chunk_rows() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         &format!(
@@ -706,7 +712,7 @@ fn on_conflict_primary_key_single_column_do_nothing() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (code TEXT PRIMARY KEY, note TEXT)",
@@ -747,7 +753,7 @@ fn on_conflict_primary_key_composite_is_order_independent() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (a TEXT, b TEXT, PRIMARY KEY (a, b))",
@@ -781,7 +787,7 @@ fn on_conflict_target_without_matching_constraint_is_42p10() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (a TEXT, b TEXT, c TEXT, PRIMARY KEY (a, b))",
@@ -809,7 +815,7 @@ fn on_conflict_expression_and_partial_index_inference_stay_42601() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (code TEXT PRIMARY KEY)",
@@ -842,7 +848,7 @@ fn on_conflict_primary_key_respects_tenant_boundary() {
         PolicyContext::with_visibilities("alice", [engine::storage::Visibility::Public])
             .expect("valid tenant");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (code TEXT PRIMARY KEY)",
@@ -880,7 +886,7 @@ fn on_conflict_primary_key_null_value_is_not_null_violation() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (code TEXT PRIMARY KEY)",
@@ -903,7 +909,7 @@ fn on_conflict_resolves_primary_key_and_unique_independently() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (code TEXT PRIMARY KEY, a TEXT UNIQUE)",
@@ -941,7 +947,7 @@ fn on_conflict_primary_key_do_update_smoke() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (code TEXT PRIMARY KEY, note TEXT)",
@@ -996,7 +1002,7 @@ fn seeded_single_pk(label: &str) -> (EngineCore, CleanupGuard) {
     let guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (code TEXT PRIMARY KEY, note TEXT)",
@@ -1048,7 +1054,7 @@ fn on_conflict_primary_key_do_update_reflects_excluded_composite_any_order() {
         let _guard = CleanupGuard(path);
         let alice = ctx("alice");
         let mut session = granted_session();
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (a TEXT, b TEXT, c TEXT, PRIMARY KEY (a, b))",
@@ -1171,7 +1177,7 @@ fn on_conflict_primary_key_do_update_composite_pk_column_change_collision_is_235
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (a TEXT, b TEXT, PRIMARY KEY (a, b))",
@@ -1235,7 +1241,7 @@ fn on_conflict_primary_key_do_update_resend_with_reordered_composite_target_is_l
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (a TEXT, b TEXT, c TEXT, PRIMARY KEY (a, b))",

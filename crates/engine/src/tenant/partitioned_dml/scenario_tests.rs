@@ -55,16 +55,20 @@ fn new_core(label: &str, lim: PartitionedDmlLimits) -> (EngineCore, CleanupGuard
     let path = unique_db_path(label);
     let guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
+    // このシナリオは行ストアの物理キー（従来方式の表では `id` 列値）に沿った分割実行の挙動（カーソル・
+    // 並行書き込み）を検証するため、表は Rust API（常に従来方式）で作る。SQL の `CREATE TABLE` は暗黙の
+    // `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+    storage
+        .create_table(&crate::catalog::TableSchema::new(
+            TABLE,
+            vec![
+                crate::catalog::ColumnDef::new("tag", crate::catalog::ColumnType::Text, true),
+                crate::catalog::ColumnDef::new("n", crate::catalog::ColumnType::BigInt, true),
+            ],
+        ))
+        .expect("create table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
         .with_partitioned_dml_limits(lim);
-    let mut session = SessionState::default();
-    session.allow_ddl();
-    core.execute_sql_in_session(
-        &ctx("sys"),
-        &mut session,
-        "CREATE TABLE docs (tag TEXT, n BIGINT)",
-    )
-    .expect("create table");
     (core, guard)
 }
 

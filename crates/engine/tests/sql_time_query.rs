@@ -736,7 +736,7 @@ fn check_constraint_roundtrips_time_literals_across_reopen() {
     exec(
         &core,
         &mut session,
-        "CREATE TABLE c (embedding VECTOR(2), v TIME, CHECK (v >= TIME '01:00:00.5'), CHECK (v <= TIME '24:00:00'))",
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, embedding VECTOR(2), v TIME, CHECK (v >= TIME '01:00:00.5'), CHECK (v <= TIME '24:00:00'))",
     )
     .expect("CHECK with TIME literal");
     let insert = |core: &EngineCore, session: &mut SessionState, id: u64, v: &str, op: &str| {

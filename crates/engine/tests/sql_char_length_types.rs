@@ -107,7 +107,7 @@ fn length_and_kind_are_restored_after_reopen() {
     let (path, _g, core) = open("cl-persist");
     ok(
         &core,
-        "CREATE TABLE t (a VARCHAR(10), b CHARACTER VARYING(3), c CHAR(5), d CHARACTER(1), \
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a VARCHAR(10), b CHARACTER VARYING(3), c CHAR(5), d CHARACTER(1), \
          e VARCHAR, f TEXT)",
     );
     ok(&core, "ALTER TABLE t ADD COLUMN x VARCHAR(4)");
@@ -129,33 +129,33 @@ fn length_and_kind_are_restored_after_reopen() {
 fn invalid_lengths_are_rejected_fail_closed_without_side_effects() {
     let (path, _g, core) = open("cl-reject");
     for sql in [
-        "CREATE TABLE t (a VARCHAR(0))",
-        "CREATE TABLE t (a CHAR(0))",
-        "CREATE TABLE t (a CHARACTER VARYING(0))",
-        "CREATE TABLE t (a VARCHAR(10485761))",
-        "CREATE TABLE t (a CHAR(4294967296))",
-        "CREATE TABLE t (a VARCHAR(99999999999999999999))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a VARCHAR(0))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHAR(0))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHARACTER VARYING(0))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a VARCHAR(10485761))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHAR(4294967296))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a VARCHAR(99999999999999999999))",
     ] {
         assert_eq!(code(&core, sql), "22023", "{sql}");
     }
     for sql in [
-        "CREATE TABLE t (a VARCHAR())",
-        "CREATE TABLE t (a VARCHAR(01))",
-        "CREATE TABLE t (a CHAR(1.5))",
-        "CREATE TABLE t (a CHAR(-1))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a VARCHAR())",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a VARCHAR(01))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHAR(1.5))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHAR(-1))",
         "CREATE TABLE t (a VARCHAR(3)",
     ] {
         assert_eq!(code(&core, sql), "42601", "{sql}");
     }
     for sql in [
-        "CREATE TABLE t (a CHAR)",
-        "CREATE TABLE t (a CHARACTER)",
-        "CREATE TABLE t (a VARCHAR(3)[])",
-        "CREATE TABLE t (a CHAR(3)[])",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHAR)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHARACTER)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a VARCHAR(3)[])",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHAR(3)[])",
     ] {
         assert_eq!(code(&core, sql), "0A000", "{sql}");
     }
-    ok(&core, "CREATE TABLE base (a INT)");
+    ok(&core, "CREATE TABLE base (id BIGINT PRIMARY KEY, a INT)");
     assert_eq!(
         code(&core, "ALTER TABLE base ADD COLUMN b VARCHAR(0)"),
         "22023"
@@ -185,7 +185,7 @@ fn maximum_length_is_accepted() {
     let (path, _g, core) = open("cl-max");
     ok(
         &core,
-        "CREATE TABLE t (a VARCHAR(10485760), b CHAR(10485760))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a VARCHAR(10485760), b CHAR(10485760))",
     );
     drop(core);
     assert_eq!(
@@ -200,7 +200,10 @@ fn maximum_length_is_accepted() {
 #[test]
 fn over_length_writes_are_rejected_and_not_persisted() {
     let (_p, _g, core) = open("cl-overflow");
-    ok(&core, "CREATE TABLE t (v VARCHAR(3))");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(3))",
+    );
     ok(
         &core,
         "INSERT INTO t (id, v) VALUES (1, 'abc') USING OPERATION_ID 'o1'",
@@ -239,7 +242,10 @@ fn over_length_writes_are_rejected_and_not_persisted() {
 #[test]
 fn over_length_update_set_is_rejected_even_with_zero_matching_rows() {
     let (_p, _g, core) = open("cl-update-zero");
-    ok(&core, "CREATE TABLE t (v VARCHAR(3))");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(3))",
+    );
     ok(
         &core,
         "INSERT INTO t (id, v) VALUES (1, 'abc') USING OPERATION_ID 'o1'",
@@ -268,7 +274,7 @@ fn bounded_varchar_behaves_like_text_for_predicates_and_keys() {
     let (_p, _g, core) = open("cl-varchar-text");
     ok(
         &core,
-        "CREATE TABLE t (k VARCHAR(8) PRIMARY KEY, v VARCHAR(4))",
+        "CREATE TABLE t (id BIGINT NOT NULL UNIQUE, k VARCHAR(8) PRIMARY KEY, v VARCHAR(4))",
     );
     ok(
         &core,
@@ -300,7 +306,7 @@ fn char_varying_is_accepted_as_varchar_and_bare_char_stays_rejected() {
     let (path, _g, core) = open("cl-char-varying");
     ok(
         &core,
-        "CREATE TABLE t (a CHAR VARYING(6), b char varying, c CHAR(2))",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHAR VARYING(6), b char varying, c CHAR(2))",
     );
     drop(core);
     assert_eq!(column_type(&path, "t", "a"), ColumnType::Varchar(Some(6)));
@@ -308,7 +314,10 @@ fn char_varying_is_accepted_as_varchar_and_bare_char_stays_rejected() {
     assert_eq!(column_type(&path, "t", "c"), ColumnType::Bpchar(2));
 
     let (_p2, _g2, core) = open("cl-char-bare");
-    assert_eq!(code(&core, "CREATE TABLE u (a CHAR)"), "0A000");
+    assert_eq!(
+        code(&core, "CREATE TABLE u (id BIGINT PRIMARY KEY, a CHAR)"),
+        "0A000"
+    );
 }
 
 /// `CHAR(n)` の書き込みは n 文字へ半角空白で詰めて保存され、SELECT は詰めた値を返す
@@ -316,7 +325,10 @@ fn char_varying_is_accepted_as_varchar_and_bare_char_stays_rejected() {
 #[test]
 fn char_values_are_blank_padded_on_write() {
     let (_p, _g, core) = open("cl-bpchar-pad");
-    ok(&core, "CREATE TABLE t (c CHAR(3), n INT)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, c CHAR(3), n INT)",
+    );
     ok(
         &core,
         "INSERT INTO t (id, c, n) VALUES (1, 'a', 1) USING OPERATION_ID 'o1'",
@@ -393,7 +405,10 @@ fn char_comparison_ignores_trailing_spaces_with_and_without_index() {
         } else {
             "cl-bpchar-cmp"
         });
-        ok(&core, "CREATE TABLE t (c CHAR(3), n INT)");
+        ok(
+            &core,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, c CHAR(3), n INT)",
+        );
         if indexed {
             ok(&core, "CREATE INDEX t_c ON t (c)");
         }
@@ -486,7 +501,10 @@ fn char_comparison_ignores_trailing_spaces_with_and_without_index() {
 #[test]
 fn char_in_expressions_behaves_as_trimmed_text() {
     let (_p, _g, core) = open("cl-bpchar-expr");
-    ok(&core, "CREATE TABLE t (c CHAR(5), v TEXT)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, c CHAR(5), v TEXT)",
+    );
     ok(
         &core,
         "INSERT INTO t (id, c, v) VALUES (1, 'ab', 'ab') USING OPERATION_ID 'o1'",
@@ -516,7 +534,7 @@ fn char_in_expressions_behaves_as_trimmed_text() {
 #[test]
 fn char_group_by_distinct_and_order_by_use_rtrim_semantics() {
     let (_p, _g, core) = open("cl-bpchar-group");
-    ok(&core, "CREATE TABLE t (c CHAR(3))");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, c CHAR(3))");
     for (i, v) in ["a", "a ", "a  ", "b", "a\t"].iter().enumerate() {
         ok(
             &core,
@@ -564,7 +582,10 @@ fn char_group_by_distinct_and_order_by_use_rtrim_semantics() {
 #[test]
 fn char_unsupported_forms_stay_fail_closed() {
     let (_p, _g, core) = open("cl-bpchar-closed");
-    ok(&core, "CREATE TABLE t (c CHAR(3), n INT)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, c CHAR(3), n INT)",
+    );
     ok(
         &core,
         "INSERT INTO t (id, c, n) VALUES (1, 'ab', 1) USING OPERATION_ID 'o1'",
@@ -585,7 +606,10 @@ fn char_unsupported_forms_stay_fail_closed() {
 #[test]
 fn char_default_is_padded() {
     let (_p, _g, core) = open("cl-bpchar-default");
-    ok(&core, "CREATE TABLE t (n INT, c CHAR(3) DEFAULT 'a')");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n INT, c CHAR(3) DEFAULT 'a')",
+    );
     ok(
         &core,
         "INSERT INTO t (id, n) VALUES (1, 1) USING OPERATION_ID 'o1'",
@@ -600,7 +624,10 @@ fn char_default_is_padded() {
         vec![Some("x ".to_string())]
     );
     assert_eq!(
-        code(&core, "CREATE TABLE u (c CHAR(3) DEFAULT 'abcd')"),
+        code(
+            &core,
+            "CREATE TABLE u (id BIGINT PRIMARY KEY, c CHAR(3) DEFAULT 'abcd')"
+        ),
         "22001"
     );
 }
@@ -609,7 +636,10 @@ fn char_default_is_padded() {
 #[test]
 fn char_padding_beyond_engine_text_limit_is_rejected() {
     let (_p, _g, core) = open("cl-bpchar-limit");
-    ok(&core, "CREATE TABLE t (c CHAR(10485760))");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, c CHAR(10485760))",
+    );
     assert_eq!(
         code(
             &core,
@@ -627,7 +657,7 @@ fn alter_column_type_char_family_matrix() {
     let (path, _g, core) = open("cl-alter");
     ok(
         &core,
-        "CREATE TABLE t (a TEXT, b VARCHAR(5), c CHAR(5), d VARCHAR(3), e VARCHAR)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT, b VARCHAR(5), c CHAR(5), d VARCHAR(3), e VARCHAR)",
     );
     ok(
         &core,
@@ -693,7 +723,10 @@ fn alter_column_type_char_family_matrix() {
 #[test]
 fn alter_column_type_shrink_with_excess_rows_is_rejected_atomically() {
     let (path, _g, core) = open("cl-alter-shrink");
-    ok(&core, "CREATE TABLE t (a TEXT, b VARCHAR(10), c CHAR(5))");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT, b VARCHAR(10), c CHAR(5))",
+    );
     ok(
         &core,
         "INSERT INTO t (id, a, b, c) VALUES (1, 'ab', 'ab', 'ab') USING OPERATION_ID 'o1'",
@@ -729,7 +762,7 @@ fn alter_column_type_shrink_with_excess_rows_is_rejected_atomically() {
         vec![Some("ab   ".to_string()), Some("abc  ".to_string())]
     );
     // 超過が空白だけなら切り詰めて受理する。
-    ok(&core, "CREATE TABLE s (a TEXT)");
+    ok(&core, "CREATE TABLE s (id BIGINT PRIMARY KEY, a TEXT)");
     ok(
         &core,
         "INSERT INTO s (id, a) VALUES (1, 'ab     ') USING OPERATION_ID 'o3'",
@@ -745,7 +778,10 @@ fn alter_column_type_shrink_with_excess_rows_is_rejected_atomically() {
 #[test]
 fn alter_column_type_converts_column_default() {
     let (_p, _g, core) = open("cl-alter-default");
-    ok(&core, "CREATE TABLE t (n INT, c TEXT DEFAULT 'a')");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n INT, c TEXT DEFAULT 'a')",
+    );
     ok(
         &core,
         "INSERT INTO t (id, n) VALUES (1, 1) USING OPERATION_ID 'o1'",
@@ -775,7 +811,10 @@ fn alter_column_type_converts_column_default() {
         texts(&core, "SELECT c FROM t WHERE id = 1 LIMIT 10"),
         vec![Some("a".to_string())]
     );
-    ok(&core, "CREATE TABLE u (c TEXT DEFAULT 'abcd')");
+    ok(
+        &core,
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, c TEXT DEFAULT 'abcd')",
+    );
     assert_eq!(
         code(&core, "ALTER TABLE u ALTER COLUMN c TYPE VARCHAR(3)"),
         "22001"
@@ -787,7 +826,10 @@ fn alter_column_type_converts_column_default() {
 #[test]
 fn alter_column_type_rechecks_unique_after_conversion() {
     let (path, _g, core) = open("cl-alter-uniq");
-    ok(&core, "CREATE TABLE t (u TEXT UNIQUE)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, u TEXT UNIQUE)",
+    );
     ok(
         &core,
         "INSERT INTO t (id, u) VALUES (1, 'ab') USING OPERATION_ID 'o1'",
@@ -805,7 +847,10 @@ fn alter_column_type_rechecks_unique_after_conversion() {
         vec![Some("ab".to_string()), Some("ab ".to_string())]
     );
     // テナントをまたぐ同値は重複ではない。
-    ok(&core, "CREATE TABLE t2 (u TEXT UNIQUE)");
+    ok(
+        &core,
+        "CREATE TABLE t2 (id BIGINT PRIMARY KEY, u TEXT UNIQUE)",
+    );
     ok(
         &core,
         "INSERT INTO t2 (id, u) VALUES (1, 'ab') USING OPERATION_ID 'o3'",
@@ -826,7 +871,10 @@ fn alter_column_type_rechecks_unique_after_conversion() {
 #[test]
 fn char_primary_key_and_unique_use_padded_identity() {
     let (_p, _g, core) = open("cl-bpchar-key");
-    ok(&core, "CREATE TABLE p (c CHAR(3) PRIMARY KEY)");
+    ok(
+        &core,
+        "CREATE TABLE p (id BIGINT NOT NULL UNIQUE, c CHAR(3) PRIMARY KEY)",
+    );
     ok(
         &core,
         "INSERT INTO p (id, c) VALUES (1, 'a') USING OPERATION_ID 'o1'",
@@ -844,7 +892,10 @@ fn char_primary_key_and_unique_use_padded_identity() {
     );
     assert_eq!(select_count(&core, "SELECT id FROM p LIMIT 10"), 2);
 
-    ok(&core, "CREATE TABLE u (c CHAR(3) UNIQUE, n INT)");
+    ok(
+        &core,
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, c CHAR(3) UNIQUE, n INT)",
+    );
     ok(
         &core,
         "INSERT INTO u (id, c, n) VALUES (1, 'a', 1) USING OPERATION_ID 'o5'",
@@ -873,7 +924,7 @@ fn char_primary_key_and_unique_use_padded_identity() {
         "INSERT INTO u (id, n) VALUES (4, 4) USING OPERATION_ID 'o8'",
     );
     // 末尾空白だけ違う値を持つ TEXT 列への ADD UNIQUE は成立するが、CHAR 列では重複になる。
-    ok(&core, "CREATE TABLE w (c CHAR(3))");
+    ok(&core, "CREATE TABLE w (id BIGINT PRIMARY KEY, c CHAR(3))");
     ok(
         &core,
         "INSERT INTO w (id, c) VALUES (1, 'a') USING OPERATION_ID 'o9'",
@@ -890,8 +941,14 @@ fn char_primary_key_and_unique_use_padded_identity() {
 #[test]
 fn char_foreign_key_type_matrix_and_integrity() {
     let (path, _g, core) = open("cl-bpchar-fk");
-    ok(&core, "CREATE TABLE p (code CHAR(5) PRIMARY KEY)");
-    ok(&core, "CREATE TABLE c (ref CHAR(3) REFERENCES p (code))");
+    ok(
+        &core,
+        "CREATE TABLE p (id BIGINT NOT NULL UNIQUE, code CHAR(5) PRIMARY KEY)",
+    );
+    ok(
+        &core,
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, ref CHAR(3) REFERENCES p (code))",
+    );
     ok(
         &core,
         "INSERT INTO p (id, code) VALUES (1, 'ab') USING OPERATION_ID 'o1'",
@@ -916,8 +973,14 @@ fn char_foreign_key_type_matrix_and_integrity() {
         "23503"
     );
     // TEXT の親: 末尾空白付きの親値は CHAR の子に一致しない。
-    ok(&core, "CREATE TABLE tp (code TEXT PRIMARY KEY)");
-    ok(&core, "CREATE TABLE tc (ref CHAR(3) REFERENCES tp (code))");
+    ok(
+        &core,
+        "CREATE TABLE tp (id BIGINT NOT NULL UNIQUE, code TEXT PRIMARY KEY)",
+    );
+    ok(
+        &core,
+        "CREATE TABLE tc (id BIGINT PRIMARY KEY, ref CHAR(3) REFERENCES tp (code))",
+    );
     ok(
         &core,
         "INSERT INTO tp (id, code) VALUES (1, 'ab') USING OPERATION_ID 'o6'",
@@ -950,7 +1013,10 @@ fn char_foreign_key_type_matrix_and_integrity() {
     );
     // TEXT の参照元で CHAR の参照先は宣言時に拒否する。
     assert_eq!(
-        code(&core, "CREATE TABLE bad (ref TEXT REFERENCES p (code))"),
+        code(
+            &core,
+            "CREATE TABLE bad (id BIGINT PRIMARY KEY, ref TEXT REFERENCES p (code))"
+        ),
         "42830"
     );
     drop(core);
@@ -961,10 +1027,13 @@ fn char_foreign_key_type_matrix_and_integrity() {
 #[test]
 fn char_foreign_key_cascade_repads_child_values() {
     let (_p, _g, core) = open("cl-bpchar-fk-cascade");
-    ok(&core, "CREATE TABLE p (code CHAR(5) PRIMARY KEY)");
     ok(
         &core,
-        "CREATE TABLE c (ref CHAR(3) REFERENCES p (code) ON DELETE CASCADE ON UPDATE CASCADE)",
+        "CREATE TABLE p (id BIGINT NOT NULL UNIQUE, code CHAR(5) PRIMARY KEY)",
+    );
+    ok(
+        &core,
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, ref CHAR(3) REFERENCES p (code) ON DELETE CASCADE ON UPDATE CASCADE)",
     );
     ok(
         &core,
@@ -1003,8 +1072,14 @@ fn char_foreign_key_cascade_repads_child_values() {
 #[test]
 fn alter_column_type_rechecks_foreign_keys() {
     let (path, _g, core) = open("cl-alter-fk");
-    ok(&core, "CREATE TABLE p (code TEXT PRIMARY KEY)");
-    ok(&core, "CREATE TABLE c (ref TEXT REFERENCES p (code))");
+    ok(
+        &core,
+        "CREATE TABLE p (id BIGINT NOT NULL UNIQUE, code TEXT PRIMARY KEY)",
+    );
+    ok(
+        &core,
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, ref TEXT REFERENCES p (code))",
+    );
     ok(
         &core,
         "INSERT INTO p (id, code) VALUES (1, 'ab ') USING OPERATION_ID 'o1'",
@@ -1039,7 +1114,10 @@ fn alter_column_type_rechecks_foreign_keys() {
         &core,
         "INSERT INTO p (id, code) VALUES (2, 'cd') USING OPERATION_ID 'o3'",
     );
-    ok(&core, "CREATE TABLE c2 (ref TEXT REFERENCES p (code))");
+    ok(
+        &core,
+        "CREATE TABLE c2 (id BIGINT PRIMARY KEY, ref TEXT REFERENCES p (code))",
+    );
     ok(
         &core,
         "INSERT INTO c2 (id, ref) VALUES (1, 'cd') USING OPERATION_ID 'o4'",
@@ -1055,7 +1133,10 @@ fn alter_column_type_rechecks_foreign_keys() {
 #[test]
 fn alter_column_type_errors_do_not_leak_values() {
     let (_p, _g, core) = open("cl-alter-leak");
-    ok(&core, "CREATE TABLE t (a TEXT UNIQUE)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a TEXT UNIQUE)",
+    );
     ok(
         &core,
         "INSERT INTO t (id, a) VALUES (1, 'secret-value') USING OPERATION_ID 'o1'",
@@ -1078,9 +1159,15 @@ fn alter_column_type_errors_do_not_leak_values() {
 #[test]
 fn varchar_default_longer_than_length_is_rejected() {
     let (path, _g, core) = open("cl-default");
-    ok(&core, "CREATE TABLE ok_t (v VARCHAR(3) DEFAULT 'abc')");
+    ok(
+        &core,
+        "CREATE TABLE ok_t (id BIGINT PRIMARY KEY, v VARCHAR(3) DEFAULT 'abc')",
+    );
     assert_eq!(
-        code(&core, "CREATE TABLE bad_t (v VARCHAR(3) DEFAULT 'abcd')"),
+        code(
+            &core,
+            "CREATE TABLE bad_t (id BIGINT PRIMARY KEY, v VARCHAR(3) DEFAULT 'abcd')"
+        ),
         "22001"
     );
     drop(core);
@@ -1093,8 +1180,16 @@ fn varchar_default_longer_than_length_is_rejected() {
 #[test]
 fn errors_do_not_leak_tenant_information() {
     let (_p, _g, core) = open("cl-tenant");
-    ok(&core, "CREATE TABLE secret_t (v VARCHAR(3))");
-    let e = exec_as("bob", &core, "CREATE TABLE u (a VARCHAR(0))").expect_err("must fail");
+    ok(
+        &core,
+        "CREATE TABLE secret_t (id BIGINT PRIMARY KEY, v VARCHAR(3))",
+    );
+    let e = exec_as(
+        "bob",
+        &core,
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, a VARCHAR(0))",
+    )
+    .expect_err("must fail");
     assert_eq!(e.wire_code(), "22023");
     let msg = e.to_string();
     assert!(
@@ -1115,7 +1210,10 @@ fn count_where(core: &EngineCore, table: &str, v: &str) -> usize {
 #[test]
 fn trailing_spaces_beyond_length_are_truncated() {
     let (_p, _g, core) = open("cl-trim");
-    ok(&core, "CREATE TABLE t (v VARCHAR(3))");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(3))",
+    );
     ok(
         &core,
         "INSERT INTO t (id, v) VALUES (1, 'abc   ') USING OPERATION_ID 'o1'",
@@ -1154,7 +1252,10 @@ fn trailing_spaces_beyond_length_are_truncated() {
 #[test]
 fn runtime_evaluated_assignments_are_rejected_with_22001() {
     let (_p, _g, core) = open("cl-runtime");
-    ok(&core, "CREATE TABLE t (v VARCHAR(3), w TEXT)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(3), w TEXT)",
+    );
     ok(
         &core,
         "INSERT INTO t (id, v, w) VALUES (1, 'abc', 'longtext') USING OPERATION_ID 'o1'",
@@ -1198,7 +1299,10 @@ fn runtime_evaluated_assignments_are_rejected_with_22001() {
 #[test]
 fn copy_from_over_length_is_rejected_atomically() {
     let (_p, _g, core) = open("cl-copy");
-    ok(&core, "CREATE TABLE t (v VARCHAR(3))");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(3))",
+    );
     let run = |sql: &str, payload: &[u8]| {
         let policy = ctx_of("alice");
         let session = SessionState::default();
@@ -1231,10 +1335,13 @@ fn copy_from_over_length_is_rejected_atomically() {
 fn defaults_are_checked_at_definition_time() {
     let (path, _g, core) = open("cl-default22001");
     assert_eq!(
-        code(&core, "CREATE TABLE a (v VARCHAR(3) DEFAULT 'abcd')"),
+        code(
+            &core,
+            "CREATE TABLE a (id BIGINT PRIMARY KEY, v VARCHAR(3) DEFAULT 'abcd')"
+        ),
         "22001"
     );
-    ok(&core, "CREATE TABLE t (id2 INT)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, id2 INT)");
     assert_eq!(
         code(
             &core,
@@ -1244,7 +1351,7 @@ fn defaults_are_checked_at_definition_time() {
     );
     ok(
         &core,
-        "CREATE TABLE b (n INT, v VARCHAR(3) DEFAULT 'ab   ')",
+        "CREATE TABLE b (id BIGINT PRIMARY KEY, n INT, v VARCHAR(3) DEFAULT 'ab   ')",
     );
     ok(
         &core,
@@ -1259,7 +1366,10 @@ fn defaults_are_checked_at_definition_time() {
 #[test]
 fn over_length_in_explicit_transaction_leaves_no_side_effect() {
     let (_p, _g, core) = open("cl-txn");
-    ok(&core, "CREATE TABLE t (v VARCHAR(3))");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(3))",
+    );
     let mut session = SessionState::default();
     let mut txn = core.new_session_transaction();
     let ctx = ctx_of("alice");
@@ -1282,7 +1392,10 @@ fn over_length_in_explicit_transaction_leaves_no_side_effect() {
 #[test]
 fn truncation_message_does_not_reflect_values() {
     let (_p, _g, core) = open("cl-msg");
-    ok(&core, "CREATE TABLE t (v VARCHAR(3))");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(3))",
+    );
     let e = exec_as(
         "alice",
         &core,
@@ -1300,7 +1413,7 @@ fn truncation_message_does_not_reflect_values() {
 #[test]
 fn char_column_accepts_set_expression_and_pads() {
     let (_p, _g, core) = open("cl-set-expr");
-    ok(&core, "CREATE TABLE t (c CHAR(3))");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, c CHAR(3))");
     ok(
         &core,
         "INSERT INTO t (id, c) VALUES (1, 'AB') USING OPERATION_ID 'o1'",

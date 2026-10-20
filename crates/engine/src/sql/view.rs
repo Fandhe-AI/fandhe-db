@@ -475,6 +475,10 @@ impl TableLookup for BufferedBodyLookup<'_> {
         self.inner.table_star_columns(name)
     }
 
+    fn table_is_allocated(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        self.inner.table_is_allocated(name)
+    }
+
     fn buffered_depth(&self) -> usize {
         self.depth
     }

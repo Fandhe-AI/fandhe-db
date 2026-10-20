@@ -77,6 +77,10 @@ use crate::http::{body, response};
 
 pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
 
+/// 採番方式の表（暗黙の `id` を持たない表）への NoSQL 要求を拒否するときの固定文言（engine 側の
+/// `catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE` と同じ。表名・テナント名・値を含めない）。
+const ROW_IDENTITY_UNSUPPORTED_MESSAGE: &str = "row identity mode is not supported yet";
+
 /// 検証を通過したが実行結線が未接続の要求に返す暫定応答の文言。
 /// `scan`・`aggregate`・`insert`・`search`（`explain: true` の `search` を
 /// 含む）・`update`・`delete`（`where` 形・`filter` 形の両方。Issue #876・
@@ -132,6 +136,26 @@ pub fn handle(
     // #768・#772・#764・#876）。各アームは対応するモジュールへの 1 行委譲に
     // 留める。全 6 op が実行結線済みのため `(_, _)` は `engine` 未接続時
     // （`Router::new` 経由）にのみ到達する。
+    // 採番方式の表（暗黙の `id` を持たない表。TABLE-23・Issue #2199）は NoSQL 表層の行アドレス
+    // （`id`）が通用しないため、行を読み書きする op は実行前に固定文言の `0A000` で拒否する
+    // （後続 Issue #2201 が NoSQL 側の対応を入れるまでの fail-closed。応答に表名・値を含めない）。
+    if let Some(engine) = engine {
+        if matches!(
+            op,
+            Op::Scan | Op::Aggregate | Op::Insert | Op::Search | Op::Update | Op::Delete
+        ) {
+            if let Ok(table) = validated.required_str("table") {
+                if engine.table_uses_allocated_row_identity(table) {
+                    return response::encode_error(
+                        ErrorClass::FeatureNotSupported,
+                        ROW_IDENTITY_UNSUPPORTED_MESSAGE,
+                        now_wall,
+                    );
+                }
+            }
+        }
+    }
+
     match (op, engine) {
         // `explain: true` は各 op の通常実行より必ず先に判定する
         // （`search` は Issue #765・TASK-186・NOSQL-10、`scan`／`aggregate` は

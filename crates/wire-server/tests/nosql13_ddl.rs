@@ -13,6 +13,12 @@
 
 #[path = "common/mod.rs"]
 mod common;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// NoSQL 表層は従来方式の表だけを扱うため、このテストの `CREATE TABLE` は従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../../engine/src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 #[path = "http_common/mod.rs"]
 mod http_common;
 
@@ -328,7 +334,7 @@ fn sql_and_nosql_create_table_produce_identical_results_for_referential_actions(
         "CREATE TABLE children_sql (parent_code INTEGER REFERENCES parents_sql (code) \
          ON DELETE CASCADE ON UPDATE SET NULL, tag TEXT)",
     ] {
-        core.execute_sql_in_session(&ctx, &mut sql_session, ddl)
+        core.execute_sql_in_session_legacy(&ctx, &mut sql_session, ddl)
             .expect("sql fixture DDL must succeed");
     }
 
@@ -1031,10 +1037,10 @@ fn create_table_named_primary_key_is_enforced_and_droppable_by_name() {
     let (ctx, mut sql) = sql_ddl_session();
     // 導出名ではなく明示名がカタログに入っている。
     let err = core
-        .execute_sql_in_session(&ctx, &mut sql, "ALTER TABLE t DROP CONSTRAINT t_pkey")
+        .execute_sql_in_session_legacy(&ctx, &mut sql, "ALTER TABLE t DROP CONSTRAINT t_pkey")
         .expect_err("derived name must not exist");
     assert_eq!(err.wire_code(), "42704");
-    core.execute_sql_in_session(&ctx, &mut sql, "ALTER TABLE t DROP CONSTRAINT pk_t")
+    core.execute_sql_in_session_legacy(&ctx, &mut sql, "ALTER TABLE t DROP CONSTRAINT pk_t")
         .expect("drop by explicit name");
     assert_eq!(query(&session, ins(3).as_bytes()).status, 200);
 }
@@ -1047,7 +1053,7 @@ fn create_table_named_primary_key_equal_to_derived_name_behaves_as_unnamed() {
         "constraints":[{"kind":"primary_key","name":"t_pkey","columns":["a"]}]}"#;
     assert_eq!(query(&session, body).status, 200);
     let (ctx, mut sql) = sql_ddl_session();
-    core.execute_sql_in_session(&ctx, &mut sql, "ALTER TABLE t DROP CONSTRAINT t_pkey")
+    core.execute_sql_in_session_legacy(&ctx, &mut sql, "ALTER TABLE t DROP CONSTRAINT t_pkey")
         .expect("derived name is droppable");
 }
 
@@ -1106,7 +1112,7 @@ fn create_table_named_primary_key_wire_codes_match_sql_surface() {
         if !sql_constraint.is_empty() {
             let (ctx, mut sql) = sql_ddl_session();
             let err = core
-                .execute_sql_in_session(
+                .execute_sql_in_session_legacy(
                     &ctx,
                     &mut sql,
                     &format!("CREATE TABLE t (x INTEGER, y INTEGER, {sql_constraint})"),
@@ -1586,7 +1592,7 @@ fn sql_and_nosql_add_column_not_null_default_produce_identical_results() {
     ];
 
     for (decl, json) in &cases {
-        let sql = core.execute_sql_in_session(
+        let sql = core.execute_sql_in_session_legacy(
             &ctx,
             &mut sql_session,
             &format!("ALTER TABLE docs_sql ADD COLUMN {decl}"),
@@ -1802,7 +1808,7 @@ fn column_types_of(
     use engine::sql::SqlOutcome;
     let sql = format!("SELECT {} FROM {table} LIMIT 1", columns.join(", "));
     let outcome = core
-        .execute_sql_in_session(&parity_ctx(), session, &sql)
+        .execute_sql_in_session_legacy(&parity_ctx(), session, &sql)
         .unwrap_or_else(|e| panic!("select on {table} must succeed: {e:?}"));
     let SqlOutcome::Query(result) = outcome else {
         panic!("expected SqlOutcome::Query for {sql:?}");
@@ -1825,7 +1831,7 @@ fn parity_core_with_enum() -> (
     let (core, guard) = new_core();
     let mut sql_session = engine::sql::mode::SessionState::default();
     sql_session.allow_ddl();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &parity_ctx(),
         &mut sql_session,
         "CREATE TYPE mood AS ENUM ('happy', 'sad')",
@@ -1841,7 +1847,7 @@ fn nosql_and_sql_create_table_produce_identical_column_types() {
         .iter()
         .map(|(n, t, _)| format!("{n} {t}"))
         .collect();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &parity_ctx(),
         &mut sql_session,
         &format!("CREATE TABLE t_sql ({})", sql_cols.join(", ")),
@@ -1871,7 +1877,7 @@ fn nosql_and_sql_create_table_produce_identical_column_types() {
 fn nosql_and_sql_add_column_produce_identical_column_types() {
     let (core, _guard, mut sql_session) = parity_core_with_enum();
     for t in ["b_sql", "b_nosql"] {
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &parity_ctx(),
             &mut sql_session,
             &format!("CREATE TABLE {t} (base TEXT)"),
@@ -1880,7 +1886,7 @@ fn nosql_and_sql_add_column_produce_identical_column_types() {
     }
     let session = ddl_session(Arc::clone(&core));
     for (name, sql_ty, json) in TYPE_PARITY_COLUMNS {
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &parity_ctx(),
             &mut sql_session,
             &format!("ALTER TABLE b_sql ADD COLUMN {name} {sql_ty}"),
@@ -1901,7 +1907,7 @@ fn nosql_and_sql_add_column_produce_identical_column_types() {
 #[test]
 fn create_table_array_max_len_is_enforced_on_insert_like_sql() {
     let (core, _guard, mut sql_session) = parity_core_with_enum();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &parity_ctx(),
         &mut sql_session,
         "CREATE TABLE lim_sql (tags TEXT[2])",
@@ -1963,7 +1969,7 @@ fn create_table_new_types_error_classification_matches_sql() {
     ];
     for (i, (sql_decl, json)) in cases.iter().enumerate() {
         let sql_err = core
-            .execute_sql_in_session(
+            .execute_sql_in_session_legacy(
                 &parity_ctx(),
                 &mut sql_session,
                 &format!("CREATE TABLE e_sql_{i} ({sql_decl})"),
@@ -2016,7 +2022,10 @@ fn temp_table_from_pg_wire_is_invisible_to_nosql_surface() {
     let users_path = common::write_user_store_file(&[("alice", TENANT_A, "pw-alice")]);
     let wire_addr = common::spawn_server_with_engine(&users_path, core.clone());
     let mut pg = common::authenticate_to_ready_for_query(wire_addr, "alice", "pw-alice");
-    common::send_simple_query(&mut pg, "CREATE TEMP TABLE nosql_tmp (v TEXT)");
+    common::send_simple_query(
+        &mut pg,
+        "CREATE TEMP TABLE nosql_tmp (id BIGINT PRIMARY KEY, v TEXT)",
+    );
     assert_eq!(common::read_command_complete(&mut pg), "CREATE TABLE");
     common::read_ready_for_query(&mut pg);
     common::send_simple_query(

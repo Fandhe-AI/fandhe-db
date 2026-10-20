@@ -332,7 +332,7 @@ fn sql41_quoted_bool_words_remain_usable_identifiers() {
     core.execute_sql_in_session(
         &ctx,
         &mut ddl,
-        "CREATE TABLE qdocs (embedding VECTOR(2) NOT NULL, \"true\" BOOLEAN, \"false\" BOOLEAN)",
+        "CREATE TABLE qdocs (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, \"true\" BOOLEAN, \"false\" BOOLEAN)",
     )
     .expect("quoted bool-word column names are valid DDL identifiers");
     run(
@@ -386,8 +386,8 @@ fn sql41_join_where_quoted_bool_words_remain_column_refs() {
     let mut ddl = SessionState::default();
     ddl.allow_ddl();
     for sql in [
-        "CREATE TABLE ja (embedding VECTOR(2) NOT NULL, \"true\" BOOLEAN, \"false\" BOOLEAN)",
-        "CREATE TABLE jb (embedding VECTOR(2) NOT NULL)",
+        "CREATE TABLE ja (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, \"true\" BOOLEAN, \"false\" BOOLEAN)",
+        "CREATE TABLE jb (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL)",
     ] {
         core.execute_sql_in_session(&ctx, &mut ddl, sql)
             .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"));
@@ -422,7 +422,7 @@ fn sql41_parenthesized_quoted_bool_word_value_expr_remains_column_ref() {
     core.execute_sql_in_session(
         &ctx,
         &mut ddl,
-        "CREATE TABLE ndocs (embedding VECTOR(2) NOT NULL, \"true\" INTEGER)",
+        "CREATE TABLE ndocs (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, \"true\" INTEGER)",
     )
     .expect("create table");
     for (id, v) in [(1, 5), (2, 0)] {
@@ -456,7 +456,7 @@ fn sql41_view_roundtrip_keeps_quoted_bool_word_column_predicate() {
     let mut ddl = SessionState::default();
     ddl.allow_ddl();
     for sql in [
-        "CREATE TABLE vdocs (embedding VECTOR(2) NOT NULL, \"true\" BOOLEAN)",
+        "CREATE TABLE vdocs (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, \"true\" BOOLEAN)",
         "CREATE VIEW vv AS SELECT id FROM vdocs WHERE \"true\"",
     ] {
         core.execute_sql_in_session(&ctx, &mut ddl, sql)

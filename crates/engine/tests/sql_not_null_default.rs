@@ -58,7 +58,7 @@ fn create_table_accepts_not_null_and_default_on_text_column() {
         .execute_sql_in_session(
             &alice,
             &mut session,
-            "CREATE TABLE docs (embedding VECTOR(4), lang TEXT NOT NULL DEFAULT 'ja')",
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(4), lang TEXT NOT NULL DEFAULT 'ja')",
         )
         .expect("CREATE TABLE with NOT NULL DEFAULT must succeed");
     assert!(matches!(outcome, SqlOutcome::CreateTable(_)));
@@ -75,7 +75,7 @@ fn create_table_accepts_default_before_not_null() {
     core.execute_sql_in_session(
         &alice,
         &mut session,
-        "CREATE TABLE docs (embedding VECTOR(4), lang TEXT DEFAULT 'ja' NOT NULL)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(4), lang TEXT DEFAULT 'ja' NOT NULL)",
     )
     .expect("CREATE TABLE with DEFAULT before NOT NULL must succeed");
 }
@@ -97,7 +97,7 @@ fn create_table_accepts_default_and_primary_key_on_the_same_column() {
         core.execute_sql_in_session(
             &alice,
             &mut session,
-            "CREATE TABLE docs (embedding VECTOR(4), code TEXT DEFAULT 'draft' PRIMARY KEY)",
+            "CREATE TABLE docs (id BIGINT NOT NULL UNIQUE, embedding VECTOR(4), code TEXT DEFAULT 'draft' PRIMARY KEY)",
         )
         .expect("CREATE TABLE with DEFAULT and PRIMARY KEY on the same column must succeed");
     }
@@ -140,7 +140,7 @@ fn insert_omitting_default_column_applies_the_declared_default_value() {
     core.execute_sql_in_session(
         &alice,
         &mut session,
-        "CREATE TABLE docs (embedding VECTOR(4), lang TEXT NOT NULL DEFAULT 'ja')",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(4), lang TEXT NOT NULL DEFAULT 'ja')",
     )
     .expect("create table");
 
@@ -201,7 +201,7 @@ fn copy_with_explicit_null_marker_does_not_apply_default_and_is_rejected_for_non
     core.execute_sql_in_session(
         &alice,
         &mut session,
-        "CREATE TABLE docs (embedding VECTOR(4), lang TEXT NOT NULL DEFAULT 'ja')",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(4), lang TEXT NOT NULL DEFAULT 'ja')",
     )
     .expect("create table");
 
@@ -302,7 +302,7 @@ fn default_type_mismatch_on_text_column_is_rejected() {
         .execute_sql_in_session(
             &alice,
             &mut session,
-            "CREATE TABLE docs (embedding VECTOR(4), lang TEXT DEFAULT 42)",
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(4), lang TEXT DEFAULT 42)",
         )
         .expect_err("DEFAULT literal type mismatch must be rejected");
     assert_eq!(err.wire_code(), "42601");
@@ -319,7 +319,7 @@ fn default_on_vector_column_is_rejected() {
         .execute_sql_in_session(
             &alice,
             &mut session,
-            "CREATE TABLE docs (embedding VECTOR(4) DEFAULT '[0.1,0.2,0.3,0.4]', lang TEXT)",
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(4) DEFAULT '[0.1,0.2,0.3,0.4]', lang TEXT)",
         )
         .expect_err("DEFAULT on a VECTOR column must be rejected");
     assert_eq!(err.wire_code(), "42601");
@@ -336,7 +336,7 @@ fn default_null_literal_is_accepted_as_no_default() {
     core.execute_sql_in_session(
         &alice,
         &mut session,
-        "CREATE TABLE docs (embedding VECTOR(4), lang TEXT DEFAULT NULL, \
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(4), lang TEXT DEFAULT NULL, \
          req TEXT NOT NULL DEFAULT NULL)",
     )
     .expect("DEFAULT NULL must be accepted");
@@ -373,7 +373,7 @@ fn default_null_literal_is_accepted_as_no_default() {
     core.execute_sql_in_session(
         &alice,
         &mut session,
-        "CREATE TABLE docs2 (embedding VECTOR(4) DEFAULT NULL)",
+        "CREATE TABLE docs2 (id BIGINT PRIMARY KEY, embedding VECTOR(4) DEFAULT NULL)",
     )
     .expect("VECTOR DEFAULT NULL is accepted as no default");
 }
@@ -389,7 +389,7 @@ fn duplicate_not_null_constraint_is_rejected() {
         .execute_sql_in_session(
             &alice,
             &mut session,
-            "CREATE TABLE docs (embedding VECTOR(4), lang TEXT NOT NULL NOT NULL)",
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(4), lang TEXT NOT NULL NOT NULL)",
         )
         .expect_err("duplicate NOT NULL must be rejected");
     assert_eq!(err.wire_code(), "42601");
@@ -406,7 +406,7 @@ fn duplicate_default_constraint_is_rejected() {
         .execute_sql_in_session(
             &alice,
             &mut session,
-            "CREATE TABLE docs (embedding VECTOR(4), lang TEXT DEFAULT 'ja' DEFAULT 'en')",
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(4), lang TEXT DEFAULT 'ja' DEFAULT 'en')",
         )
         .expect_err("duplicate DEFAULT must be rejected");
     assert_eq!(err.wire_code(), "42601");
@@ -421,7 +421,7 @@ fn default_literal_exceeding_length_limit_is_rejected() {
 
     // `MAX_COLUMN_DEFAULT_LEN`（1024 バイト）を超える文字列リテラル。
     let too_long: String = "a".repeat(engine::catalog::MAX_COLUMN_DEFAULT_LEN + 1);
-    let sql = format!("CREATE TABLE docs (embedding VECTOR(4), lang TEXT DEFAULT '{too_long}')");
+    let sql = format!("CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(4), lang TEXT DEFAULT '{too_long}')");
     let err = core
         .execute_sql_in_session(&alice, &mut session, &sql)
         .expect_err("DEFAULT literal exceeding the length limit must be rejected");

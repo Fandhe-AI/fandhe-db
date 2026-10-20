@@ -2590,7 +2590,7 @@ fn parent_schema_for(
     if fk.parent_table() == child_table {
         return Ok(None);
     }
-    crate::catalog::require_table_schema_write(write_txn, fk.parent_table())
+    crate::catalog::require_table_schema_write_any_identity(write_txn, fk.parent_table())
         .map(Some)
         .map_err(|e| match e {
             CatalogError::TableNotFound(_) => {
@@ -3512,7 +3512,7 @@ pub(crate) fn enforce_deferred_foreign_keys_in_txn(
     tenant_id: &str,
     table: &str,
 ) -> Result<(), TenantWriteError> {
-    let schema = crate::catalog::require_table_schema_write(write_txn, table)?;
+    let schema = crate::catalog::require_table_schema_write_any_identity(write_txn, table)?;
 
     // `table` を子とする宣言（このスキーマの `foreign_keys()`）。
     for fk in schema.foreign_keys() {

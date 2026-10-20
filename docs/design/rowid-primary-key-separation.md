@@ -222,3 +222,39 @@ spec のポインタ（TABLE-23・TABLE-16。関連: RLS-9・RLS-10）を正と�
 - 互換テスト: `recovery/table23_ledger_compat_tests.rs` が台帳 v1／v2／v3 とジョブ記録 v1 の旧バイト列を注入し、再オープン後の再送判定が従来どおりであることを固定する。
 - 残した境界: 適用段（`apply_predicate_*_in_txn`）への `legacy_id()` 変換と `DmlCandidate.id`。`UpsertHashTarget::RowId` は `ON CONFLICT (id)` を指す印で物理 rowid ではない（名前の整理は #2197／#2199）。採番方式の表のゲートは開けていない。
 - 未検証: ローカルで未実行の CI ジョブは PR に記載する。
+
+## 11. Issue #2199 実装記録（第 5 段: `id` の予約解除と PK なし表）
+
+SQL 表層で新しく作る表から暗黙の `id` をなくした（ポインタ: TABLE-23。関連: TABLE-12・TABLE-16・RLS-9・RLS-10・
+SQL-17・SQL-18・SQL-20・SQL-32）。契約の詳細は spec を正とし、ここには実装判断だけを記す。
+
+- **新しい表の方式**: SQL の `CREATE TABLE`・`CREATE TEMP TABLE` は採番方式（`RowIdentity::Allocated`）の表を作る
+  （`sql/ddl.rs` の `build_table_schema` 1 か所）。NoSQL 表層の `create_table`（`validate_create_table_tokens_with_implicit_id`
+  経由。従来方式の検証・実行）・Rust API の `create_table`・既存の全表は従来方式のまま。`TableSchema::has_pseudo_id()` が
+  「疑似列 `id` を持つ表か」の判定で、SQL 表層の `id` 解決・`SELECT *`・`INSERT` の `id` 必須検査・`SET`・`ON CONFLICT (id)` は
+  すべてこの判定に従う。従来方式の表の挙動は変えない。
+- **採番方式の表の書き込み**: `INSERT`（単一行・複数行・`ON CONFLICT`・`RETURNING`）・`COPY FROM` は、台帳照合・SEQUENCE 採番の後、
+  行ストアを開く前に `rowid_alloc::allocate_in_txn` で行数分をまとめて払い出す（`tenant::allocate_rowids`）。`BoundInsert.id` は
+  使われない固定値 0 で、内容照合ハッシュの材料は固定値 0（バッチは行の位置）。rowid は再送前に分からないため、再送判定は
+  決定的に保たれる。単一行形 `WHERE id = <n>` の `UPDATE`／`DELETE` は、対象が採番方式の表と分かった時点で述語形へ戻す
+  （`core.rs` の文解析・ビュー書き込みの書き換え）。述語形 DML・分割実行 DML は物理キーの `u64` で動くため変更なし。
+- **読み取り**: `get_table_schema_in_txn`（SQL の relation 解決点）のゲートを外し、`SELECT *` は宣言した列だけを返す。宣言の無い
+  `id`・`ctid` などは未定義列（`42703`）。kNN の結果は投影した列だけで作り、rowid を応答・エラーに出さない。同点順序は
+  従来どおり rowid の昇順（`search_order`）。
+- **ゲートを残した経路（`0A000` の固定文言）**: 利用者が行 id を指定する Rust API（`insert_typed_row`・`insert_row`・
+  `update_row`・`delete_row`・`get_row_from_table`・`scan_table_page`・`VectorArena::build*` を使う `search`／`batch_search`）、
+  NoSQL 表層の行 op（`wire-server/http/query/gate.rs` が実行前に拒否。後続 #2201）、ファイル形 INSERT（`path`／`body`
+  は採番方式の表では通常の列で、行形 INSERT として束縛する）、採番方式の親への `id` 参照 FK（親が宣言した `id` 列を
+  参照する場合を含む。永続化する参照先列名が物理キーの `id` 参照と区別できないため。#2200 が扱う）。主キーを持たない
+  採番方式の親への列省略 FK は PG と同じ `42830`。
+- **ALTER**: 採番方式の表でも `ALTER TABLE` の `id` 列そのもの（ADD／DROP／RENAME／TYPE／`ADD PRIMARY KEY (id)`）は構文段で
+  従来どおり拒否する（対象外）。`CREATE TABLE` で宣言した `id` は通常の列。
+- **DDL のゲート**: カタログ・制約・ALTER の内部処理は `require_table_schema_write_any_identity`（方式を問わない）を使い、
+  id 指定の書き込み API だけが `require_table_schema_write`（ゲートあり）を使う。
+- **テスト**: `tests/table23_no_implicit_id.rs`（PK なし表・`id` 列宣言・`SELECT *`・RETURNING・UPSERT・COPY・ビュー・マテビュー・
+  FK・カーソル・テナント境界・従来方式の不変）、`catalog/rowid_gate_tests.rs`、wire-server の `wire_create_table.rs`
+  （RowDescription）・`nosql_bigint_f64_exact_range.rs`（NoSQL の拒否）。疑似列 `id`・FK の `id` 参照・物理キー順序の契約を
+  検証する既存の結合テストは、`src/test_util/legacy_table.rs`（従来方式の表作成）で表を作る形へ移した。
+- **対象外**: 既存表の `id` の通常列への移行（#2200）・移行後の採番（#1696）・NoSQL の単一行アドレスと scan（#2201）・Rust API の
+  行 API／検索 API の採番方式対応（#2197 の残り）・PK の値による同点順序・採番方式の表を基表とするビューの単一行形
+  （`id` を宣言した基表は述語形へ戻る）・`INSERT` の列リスト省略形。

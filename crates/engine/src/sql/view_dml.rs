@@ -154,7 +154,11 @@ enum BaseIdForm {
     Predicates(Vec<WherePredicate>),
 }
 
-fn rewrite_id_form(rv: &ResolvedView, id_literal: &str) -> Result<BaseIdForm, SqlSurfaceError> {
+fn rewrite_id_form(
+    lookup: &impl TableLookup,
+    rv: &ResolvedView,
+    id_literal: &str,
+) -> Result<BaseIdForm, SqlSurfaceError> {
     if let Some(columns) = rv.view_columns.as_deref() {
         if !columns.iter().any(|c| c == "id") {
             return Err(SqlSurfaceError::undefined_column("id"));
@@ -165,7 +169,10 @@ fn rewrite_id_form(rv: &ResolvedView, id_literal: &str) -> Result<BaseIdForm, Sq
             "WHERE id = <n> on a view that exposes a user column as id is not supported",
         ));
     }
-    if rv.view_predicates.is_empty() {
+    // 基表が採番方式（暗黙の `id` を持たない。TABLE-23・Issue #2199）なら、`id` は基表の通常の列なので
+    // 物理キーの直接指定（単一行形）ではなく述語形へ戻す。宣言の無い `id` は述語の束縛が未定義列にする。
+    let base_allocated = lookup.table_is_allocated(&rv.base_table)?;
+    if rv.view_predicates.is_empty() && !base_allocated {
         return Ok(BaseIdForm::Single(id_literal.to_string()));
     }
     let mut merged = rv.view_predicates.clone();
@@ -199,7 +206,7 @@ pub(crate) fn rewrite_view_delete(
     match &stmt.shape {
         DeleteStatement::SingleRow(v) => {
             let (returning, public_names) = rewrite_returning(&mapper, v.returning.as_ref())?;
-            let delete = match rewrite_id_form(&rv, &v.id_literal)? {
+            let delete = match rewrite_id_form(lookup, &rv, &v.id_literal)? {
                 BaseIdForm::Single(id_literal) => DeleteStatement::SingleRow(ValidatedDelete {
                     table_name: rv.base_table.clone(),
                     id_literal,
@@ -282,7 +289,7 @@ pub(crate) fn rewrite_view_update(
         ValidatedUpdateForm::Single(v) => {
             let assignments = rewrite_assignments(&rv, &v.assignments)?;
             let (returning, public_names) = rewrite_returning(&mapper, v.returning.as_ref())?;
-            let update = match rewrite_id_form(&rv, &v.id_literal)? {
+            let update = match rewrite_id_form(lookup, &rv, &v.id_literal)? {
                 BaseIdForm::Single(id_literal) => ValidatedUpdateForm::Single(ValidatedUpdate {
                     table_name: rv.base_table.clone(),
                     assignments,

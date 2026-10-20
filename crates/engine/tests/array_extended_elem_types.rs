@@ -65,7 +65,7 @@ fn ids(core: &EngineCore, tenant: &str, table: &str, predicate: &str) -> Vec<u64
     v
 }
 
-const CREATE_ALL: &str = "CREATE TABLE ext (embedding VECTOR(2) NOT NULL, \
+const CREATE_ALL: &str = "CREATE TABLE ext (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, \
     nums NUMERIC(5,2)[4], blobs BYTEA[4], js JSON[4], jb JSONB[4], moods mood[4])";
 
 fn setup(label: &str) -> (std::path::PathBuf, CleanupGuard) {
@@ -235,7 +235,7 @@ fn unique_constraint_on_new_array_types_rejects_value_equal_duplicates() {
     ok(&core, "CREATE TYPE mood AS ENUM ('happy', 'sad')");
     ok(
         &core,
-        "CREATE TABLE u (embedding VECTOR(2) NOT NULL, \
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, \
          js JSON[4] UNIQUE, nums NUMERIC(5,2)[4] UNIQUE, moods mood[4] UNIQUE, b BYTEA[4] UNIQUE)",
     );
     let insert = |id: u64, column: &str, literal: &str| {
@@ -289,7 +289,7 @@ fn drop_type_sees_enum_array_dependency_and_alter_type_extends_vocabulary() {
         // `mood[]` 列だけが依存として残る（スカラー ENUM 列は無い）。
         ok(
             &core,
-            "CREATE TABLE e (embedding VECTOR(2) NOT NULL, moods mood[4])",
+            "CREATE TABLE e (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, moods mood[4])",
         );
         assert_eq!(code(&core, "DROP TYPE mood"), "2BP01");
         assert_eq!(
@@ -331,7 +331,10 @@ fn add_column_accepts_new_element_types_and_alter_column_type_widens_array_eleme
     let _g = CleanupGuard(path.clone());
     let core = core_at(&path);
     ok(&core, "CREATE TYPE mood AS ENUM ('happy')");
-    ok(&core, "CREATE TABLE a (embedding VECTOR(2) NOT NULL)");
+    ok(
+        &core,
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL)",
+    );
     for sql in [
         "ALTER TABLE a ADD COLUMN n NUMERIC(5,2)[]",
         "ALTER TABLE a ADD COLUMN b BYTEA[3]",
@@ -376,8 +379,8 @@ fn ddl_permission_gate_precedes_enum_array_type_resolution() {
     let mut denied = SessionState::default();
     // 型が存在しても存在しなくても同じ 42501（存在オラクルにならない）。
     for sql in [
-        "CREATE TABLE p (m mood[])",
-        "CREATE TABLE p (m no_such_type[])",
+        "CREATE TABLE p (id BIGINT PRIMARY KEY, m mood[])",
+        "CREATE TABLE p (id BIGINT PRIMARY KEY, m no_such_type[])",
     ] {
         let err = core
             .execute_sql_in_session(&ctx("alice"), &mut denied, sql)
@@ -385,7 +388,13 @@ fn ddl_permission_gate_precedes_enum_array_type_resolution() {
         assert_eq!(err.wire_code(), "42501", "{sql}");
     }
     // 権限があっても未登録の ENUM 要素型は 42704。
-    assert_eq!(code(&core, "CREATE TABLE p (m no_such_type[])"), "42704");
+    assert_eq!(
+        code(
+            &core,
+            "CREATE TABLE p (id BIGINT PRIMARY KEY, m no_such_type[])"
+        ),
+        "42704"
+    );
 }
 
 /// 集合演算（`UNION`）の行キーも値等価の正準ペイロードを使う（Issue #1357 D4）。
@@ -398,11 +407,11 @@ fn union_dedups_by_value_equality_for_json_and_numeric_arrays() {
     let core = core_at(&path);
     ok(
         &core,
-        "CREATE TABLE s1 (embedding VECTOR(2) NOT NULL, js JSON[2], nums NUMERIC(5,2)[2])",
+        "CREATE TABLE s1 (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, js JSON[2], nums NUMERIC(5,2)[2])",
     );
     ok(
         &core,
-        "CREATE TABLE s2 (embedding VECTOR(2) NOT NULL, js JSON[2], nums NUMERIC(5,2)[2])",
+        "CREATE TABLE s2 (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, js JSON[2], nums NUMERIC(5,2)[2])",
     );
     ok(
         &core,

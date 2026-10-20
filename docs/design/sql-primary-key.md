@@ -190,3 +190,7 @@ COLUMN`（Rust API。TABLE-19）は主キー構成列の削除を
   [primary-key-point-lookup.md](primary-key-point-lookup.md)。
 
 > Issue #2194 注記: 索引・FK の行参照は rowid 型で扱う（従来方式の表ではバイト列は `id` と同一）。本書の「行の `id`」「物理キー `(tenant_id, id)`」は rowid に読み替える。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。
+
+**Issue #2199 注記**: SQL 表層で新しく作る表は暗黙の `id` を持たず、`PRIMARY KEY (id)` は宣言した `id` 列を指す通常の PK になる
+（宣言が無ければ未知列の `42601`）。本書の「`id` 単独宣言は暗黙主キーの明示」は従来方式の検証（NoSQL 表層の表作成）と
+既存の表にだけ当てはまる。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §11。

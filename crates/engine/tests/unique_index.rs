@@ -23,6 +23,12 @@ use redb::{Database, ReadableDatabase, TableHandle};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 fn new_core(label: &str) -> (EngineCore, std::path::PathBuf) {
@@ -88,7 +94,7 @@ fn deleted_row_key_can_be_reused_by_a_later_committed_insert() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     core.execute_insert_sql(
@@ -97,7 +103,7 @@ fn deleted_row_key_can_be_reused_by_a_later_committed_insert() {
     )
     .expect("first insert");
 
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'op-del'",
@@ -128,7 +134,7 @@ fn truncated_table_keys_can_be_reused_by_a_later_committed_insert() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     core.execute_insert_sql(
@@ -137,7 +143,7 @@ fn truncated_table_keys_can_be_reused_by_a_later_committed_insert() {
     )
     .expect("first insert");
 
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "TRUNCATE TABLE docs USING OPERATION_ID 'op-trunc'",
@@ -161,7 +167,7 @@ fn truncate_does_not_affect_another_tenants_unique_keys() {
     let alice = ctx("alice");
     let bob = ctx("bob");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     core.execute_insert_sql(
@@ -175,7 +181,7 @@ fn truncate_does_not_affect_another_tenants_unique_keys() {
     )
     .expect("alice insert");
 
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "TRUNCATE TABLE docs USING OPERATION_ID 'op-trunc'",
@@ -202,7 +208,7 @@ fn drop_table_and_recreate_does_not_leak_the_old_unique_index() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
     core.execute_insert_sql(
         &alice,
@@ -210,9 +216,9 @@ fn drop_table_and_recreate_does_not_leak_the_old_unique_index() {
     )
     .expect("insert");
 
-    core.execute_sql_in_session(&alice, &mut session, "DROP TABLE docs")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "DROP TABLE docs")
         .expect("drop table");
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("recreate table");
 
     // 旧テーブルで使っていた値は、新しいテーブルでは初回の値として問題なく
@@ -235,7 +241,7 @@ fn add_unique_constraint_invalidates_index_and_lazily_rebuilds_on_next_write() {
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT)")
         .expect("create table");
     core.execute_insert_sql(
         &alice,
@@ -283,7 +289,7 @@ fn on_conflict_do_update_targeting_a_unique_column_keeps_the_index_consistent() 
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     core.execute_insert_sql(
@@ -333,7 +339,7 @@ fn key_freed_by_updating_it_to_null_can_be_reused_by_a_later_committed_insert() 
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     core.execute_insert_sql(
@@ -396,12 +402,12 @@ fn truncate_on_a_tenant_whose_index_was_never_built_does_not_create_the_index_ta
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     // alice はこのテーブルへ一度も書き込んでいないため、
     // `ensure_tenant_index` による索引の遅延バックフィルは一度も走っていない。
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "TRUNCATE TABLE docs USING OPERATION_ID 'op-truncate'",
@@ -428,7 +434,7 @@ fn delete_on_a_tenant_whose_index_was_never_built_does_not_create_the_index_tabl
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT)")
         .expect("create table without a UNIQUE constraint yet");
     core.execute_insert_sql(
         &alice,

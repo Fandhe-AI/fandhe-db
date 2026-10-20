@@ -30,6 +30,12 @@ use engine::storage::{Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 /// 台帳由来の重複（commit 済み再送）の固定文言。pg wire の `M` フィールドにそのまま載る。
@@ -53,7 +59,7 @@ fn new_core(label: &str, columns: &str) -> (EngineCore, std::path::PathBuf) {
     let mut session = SessionState::default();
     session.allow_ddl();
     let sys = ctx("sys");
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &sys,
         &mut session,
         &format!("CREATE TABLE orders ({columns})"),
@@ -180,7 +186,7 @@ fn colliding_values_with_fresh_operation_id_are_row_constraint_violations() {
         let (core, path) = new_core(&format!("recover12-control-{label}"), columns);
         let _guard = CleanupGuard(path);
         let alice = ctx("alice");
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &alice,
             &mut SessionState::default(),
             &ins(1, "c1", "s1", "seed-1"),
@@ -254,7 +260,7 @@ fn row_constraint_conflict_on_resend_is_not_a_commit_proof() {
             // COMMIT せずに drop（接続断）。
         }
         // 別経路が、別 id・同じ制約列の値を確定させる。
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &alice,
             &mut SessionState::default(),
             &ins(6, "e", "se", "other-6"),
@@ -268,7 +274,7 @@ fn row_constraint_conflict_on_resend_is_not_a_commit_proof() {
         rollback_to_idle(&core, &alice, &mut txn);
 
         // 衝突を解消してから同内容で再送すると成功する。
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &alice,
             &mut SessionState::default(),
             "DELETE FROM orders WHERE id = 6 USING OPERATION_ID 'del-6'",
@@ -445,7 +451,7 @@ fn zero_row_delete_resend_does_not_delete_row_inserted_later() {
         );
         commit(&core, &alice, &mut txn);
 
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &alice,
             &mut SessionState::default(),
             &ins_target(7, "zd-ins"),
@@ -470,8 +476,12 @@ fn zero_row_delete_resend_is_tenant_scoped() {
         let _guard = CleanupGuard(path);
         let alice = ctx("tenant-a");
         let bob = ctx("tenant-b");
-        core.execute_sql_in_session(&bob, &mut SessionState::default(), &ins_target(7, "b-ins"))
-            .expect("bob seed");
+        core.execute_sql_in_session_legacy(
+            &bob,
+            &mut SessionState::default(),
+            &ins_target(7, "b-ins"),
+        )
+        .expect("bob seed");
 
         let mut txn = begin(&core, &alice);
         assert_zero_row_delete(
