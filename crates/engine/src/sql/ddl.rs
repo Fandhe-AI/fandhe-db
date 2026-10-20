@@ -46,17 +46,17 @@ use crate::catalog::{
 use crate::schema_limits::SchemaLimits;
 use crate::sql::allowlist::AlterSequenceAction;
 use crate::sql::allowlist::{
-    InsertLiteral, SqlSurfaceError, ValidatedAlterSequence, ValidatedAlterTable,
-    ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn, ValidatedAlterTableAddUnique,
-    ValidatedAlterTableAlterColumnDropDefault, ValidatedAlterTableAlterColumnDropNotNull,
-    ValidatedAlterTableAlterColumnSetDefault, ValidatedAlterTableAlterColumnSetNotNull,
-    ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
-    ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
-    ValidatedAlterTableRenameColumn, ValidatedAlterTableRenameTable, ValidatedCreateIndex,
-    ValidatedCreateSchema, ValidatedCreateSequence, ValidatedCreateTable, ValidatedCreateTempTable,
-    ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex, ValidatedDropMaterializedView,
-    ValidatedDropSchema, ValidatedDropSequence, ValidatedDropTable, ValidatedDropType,
-    ValidatedDropView,
+    InsertLiteral, SqlSurfaceError, ValidatedAlterSchema, ValidatedAlterSequence,
+    ValidatedAlterTable, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
+    ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnDropDefault,
+    ValidatedAlterTableAlterColumnDropNotNull, ValidatedAlterTableAlterColumnSetDefault,
+    ValidatedAlterTableAlterColumnSetNotNull, ValidatedAlterTableAlterColumnType,
+    ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
+    ValidatedAlterTableRenameColumn, ValidatedAlterTableRenameTable, ValidatedAlterTableSetSchema,
+    ValidatedCreateIndex, ValidatedCreateSchema, ValidatedCreateSequence, ValidatedCreateTable,
+    ValidatedCreateTempTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
+    ValidatedDropMaterializedView, ValidatedDropSchema, ValidatedDropSequence, ValidatedDropTable,
+    ValidatedDropType, ValidatedDropView,
 };
 use crate::sql::ddl_column_type::{
     alias_spelling, to_static_column_type_with_array_default, SqlColumnTypeName, StaticColumnType,
@@ -689,6 +689,9 @@ pub enum AlterTableAction {
     /// `RENAME TO <new>`（表の改名。TABLE-38 のポインタ、Issue #1623）。
     /// **BREAKING CHANGE**: variant 追加。
     RenameTable { new_table_name: String },
+    /// `SET SCHEMA <schema>`（表の SCHEMA 移動。TABLE-27 のポインタ、Issue #1716）。移動先の
+    /// 名前は利用者が書いた原文のまま。**BREAKING CHANGE**: variant 追加。
+    SetSchema { schema_name: String },
 }
 
 /// `ALTER TABLE <table> ADD COLUMN <column> <type>` の実行本体（Issue #900）。
@@ -949,6 +952,7 @@ pub(crate) fn execute_alter_table_add_check(
 /// 管轄、ディスパッチはここと `core.rs` の管轄という既存の責務分担を維持する）。
 pub(crate) fn execute_alter_table(
     storage: &Storage,
+    tenant_id: &str,
     validated: &crate::sql::allowlist::ValidatedAlterTable,
     limits: &SchemaLimits,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
@@ -997,6 +1001,9 @@ pub(crate) fn execute_alter_table(
         }
         crate::sql::allowlist::ValidatedAlterTable::RenameTable(stmt) => {
             execute_alter_table_rename_table(storage, stmt)
+        }
+        crate::sql::allowlist::ValidatedAlterTable::SetSchema(stmt) => {
+            execute_alter_table_set_schema(storage, tenant_id, stmt)
         }
     }
 }
@@ -1266,7 +1273,8 @@ fn apply_alter_action_in_txn(
         | ValidatedAlterTable::AddPrimaryKey(_)
         | ValidatedAlterTable::AlterColumnType(_)
         | ValidatedAlterTable::RenameColumn(_)
-        | ValidatedAlterTable::RenameTable(_) => {
+        | ValidatedAlterTable::RenameTable(_)
+        | ValidatedAlterTable::SetSchema(_) => {
             Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
                 detail: "multiple ALTER TABLE actions including this action are not supported"
                     .to_string(),
@@ -1509,6 +1517,56 @@ pub(crate) fn execute_alter_table_rename_table(
         table_name: stmt.table_name.clone(),
         action: AlterTableAction::RenameTable {
             new_table_name: stmt.new_table_name.clone(),
+        },
+    })
+}
+
+/// `ALTER TABLE <table> SET SCHEMA <schema>` の実行本体（TABLE-27 のポインタ、Issue #1716。
+/// 設計記録 D7）。呼び出し元（`core.rs`）は [`require_ddl_permission`] を必ず先に通している前提。
+///
+/// 判定順序（決定的）: 表の存在確認（`42P01`／`42809`）→ 移動先の解決（`public` は ASCII の大小を
+/// 無視。`pg_temp`・`pg_catalog`・`information_schema` は `0A000`。それ以外は
+/// `(tenant_id, name)` の 1 回 get で、無い名前〔他テナントの SCHEMA を含む〕は同一の `3F000`）→
+/// テナント境界（共有の `public` の表をテナントの SCHEMA へ移す経路は `42501`。fail-closed）→
+/// `public` から `public` は何も書かない成功（no-op）。
+///
+/// 現状はテナント SCHEMA に表を置く経路（#1717）が無く、移動元は常に `public` のため、
+/// テナント SCHEMA 間の実移動は未実装（到達不能な分岐を作らない）。
+pub(crate) fn execute_alter_table_set_schema(
+    storage: &Storage,
+    tenant_id: &str,
+    stmt: &ValidatedAlterTableSetSchema,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    let target = stmt.schema_name.as_str();
+    let to_public = if target.eq_ignore_ascii_case("public") {
+        true
+    } else if target.eq_ignore_ascii_case("pg_temp")
+        || target.eq_ignore_ascii_case("pg_catalog")
+        || target.eq_ignore_ascii_case("information_schema")
+    {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "ALTER TABLE SET SCHEMA to a system schema is not supported",
+        ));
+    } else {
+        match storage.schema_id(tenant_id, target) {
+            Ok(Some(_)) => false,
+            Ok(None) => {
+                return Err(SqlSurfaceError::InvalidSchemaName {
+                    name: target.to_string(),
+                })
+            }
+            Err(e) => return Err(map_schema_error(e, "ALTER TABLE SET SCHEMA failed")),
+        }
+    };
+    if !to_public {
+        // 共有の `public` の表の行をテナントの SCHEMA 側へ移さない（設計記録 D7）。
+        return Err(SqlSurfaceError::InsufficientPrivilege);
+    }
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::SetSchema {
+            schema_name: stmt.schema_name.clone(),
         },
     })
 }
@@ -3238,6 +3296,23 @@ pub(crate) fn execute_create_schema(
     Ok(CreateSchemaOutcome {})
 }
 
+/// `ALTER SCHEMA ... RENAME TO`（TABLE-27、Issue #1716）の成功応答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlterSchemaOutcome {}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体（Issue #1716）。
+/// 組み込み名・存在・重複・予約名の判定は `Storage::rename_schema`（単一 write txn）に一本化する。
+pub(crate) fn execute_alter_schema(
+    storage: &Storage,
+    tenant_id: &str,
+    validated: &ValidatedAlterSchema,
+) -> Result<AlterSchemaOutcome, SqlSurfaceError> {
+    storage
+        .rename_schema(tenant_id, validated.name(), validated.new_name())
+        .map_err(|e| map_schema_error(e, "ALTER SCHEMA failed"))?;
+    Ok(AlterSchemaOutcome {})
+}
+
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体（Issue #1713）。
 /// 組み込み SCHEMA の拒否・存在判定・空判定は `Storage::drop_schema` に一本化する。
 pub(crate) fn execute_drop_schema(
@@ -3898,7 +3973,7 @@ mod tests {
         let limits = SchemaLimits::default();
         let run = |sql: &str| {
             let v = validate_alter_table(sql).expect("valid shape");
-            execute_alter_table(&storage, &v, &limits)
+            execute_alter_table(&storage, "t", &v, &limits)
         };
         let generation = || storage.table_generation("docs").expect("generation");
         let schema = || storage.get_table_schema("docs").expect("schema");

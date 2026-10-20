@@ -68,6 +68,7 @@ pub(crate) use dependency::{truncate_closure_in_txn, TruncateClosureError};
 pub(crate) mod materialized;
 // SEQUENCE のカタログ（TABLE-24・Issue #1688）。relation 名前空間を表・ビュー・索引・matview と
 // 共有するため、`index_name_exists_in_txn` を呼ぶ DDL は `sequence::sequence_exists_in_txn` も併記する。
+pub(crate) mod legacy_id_migration;
 pub(crate) mod rowid_alloc;
 #[cfg(test)]
 mod rowid_gate_tests;
@@ -7238,6 +7239,23 @@ pub(crate) enum RowIdentity {
     /// 書き込み段が同じ write txn で払い出す。SQL 表層だけが読み書きでき、行の識別子を `id` として返す
     /// Rust API・NoSQL 表層は `0A000` 相当の固定文言で拒否する（[`ROW_IDENTITY_UNSUPPORTED_MESSAGE`]）。
     Allocated,
+    /// 移行済みの従来方式（TABLE-23・Issue #2200。ADR `docs/design/rowid-primary-key-separation.md` §12）。
+    /// 旧形式の表を開く時点でカタログだけを書き換えて付ける、永続する移行済みの印（`rowmode:migrated`）。
+    /// 行・キー・索引・台帳は書き換えず、`id` は rowid の別名のまま（rowid == `id`）なので、DML・検索・
+    /// NoSQL・Rust API は従来方式（[`RowIdentity::LegacyId`]）と同じ経路を通る。移行後の `id` の
+    /// IDENTITY 化は後続 Issue（#1698 以降）がこの印を見て判定する。
+    MigratedId,
+}
+
+/// 移行済みの表（[`RowIdentity::MigratedId`]）で `id` が担う役割（TABLE-23・Issue #2200）。
+/// カタログに別行は持たず [`TableSchema::migrated_id_role`] が宣言 PRIMARY KEY の有無から導出する。
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MigratedIdRole {
+    /// 宣言 PRIMARY KEY を持たない表。`id` が暗黙の主キー。
+    PrimaryKey,
+    /// `id` 以外の宣言 PRIMARY KEY を持つ表。`id` は UNIQUE 相当として残る。
+    Unique,
 }
 
 /// 行識別方式が未対応の表（[`RowIdentity::Allocated`]）への操作を拒否するときの固定文言。
@@ -7592,7 +7610,6 @@ impl TableSchema {
     }
 
     /// 行識別方式（TABLE-23・Issue #2193）。既存の全表は [`RowIdentity::LegacyId`]。
-    #[cfg(test)]
     pub(crate) fn row_identity(&self) -> RowIdentity {
         self.row_identity
     }
@@ -7602,7 +7619,30 @@ impl TableSchema {
     /// 採番方式（[`RowIdentity::Allocated`]）の表では `id` は予約されず、宣言した場合だけ通常の列として
     /// 存在する。SQL 表層の `id` 解決・`SELECT *` の展開・`INSERT` の `id` 必須検査はすべてこの判定に従う。
     pub(crate) fn has_pseudo_id(&self) -> bool {
-        matches!(self.row_identity, RowIdentity::LegacyId)
+        matches!(
+            self.row_identity,
+            RowIdentity::LegacyId | RowIdentity::MigratedId
+        )
+    }
+
+    /// 開く時点の移行（Issue #2200）で移行済みの印が付いた表かを返す（現状はテストからのみ参照）。
+    #[cfg(test)]
+    pub(crate) fn is_migrated_id(&self) -> bool {
+        matches!(self.row_identity, RowIdentity::MigratedId)
+    }
+
+    /// 移行済みの表で `id` が担う役割を導出する（TABLE-23・Issue #2200）。従来方式・採番方式は `None`。
+    /// 後続 #1698 が IDENTITY を割り当てる対象の判定に使う前提で、現状はテストからのみ参照する。
+    #[cfg(test)]
+    pub(crate) fn migrated_id_role(&self) -> Option<MigratedIdRole> {
+        if !self.is_migrated_id() {
+            return None;
+        }
+        Some(if self.primary_key.is_none() {
+            MigratedIdRole::PrimaryKey
+        } else {
+            MigratedIdRole::Unique
+        })
     }
 
     /// 採番方式（`id` を予約しない）の表かを返す。NoSQL 表層・Rust API など rowid を
@@ -7622,7 +7662,7 @@ impl TableSchema {
     /// （索引・検索・台帳が rowid 未対応の間の安全弁。後続 sub-issue #2194〜#2197 が外す）。
     pub(crate) fn require_legacy_row_identity(&self) -> Result<()> {
         match self.row_identity {
-            RowIdentity::LegacyId => Ok(()),
+            RowIdentity::LegacyId | RowIdentity::MigratedId => Ok(()),
             RowIdentity::Allocated => Err(row_identity_unsupported_error()),
         }
     }
@@ -8455,7 +8495,7 @@ fn resolve_foreign_key_target(
         // `id` は常に非 NULL・ON UPDATE は A7 で発火しないため (c) の nullable 検査は不要。
         // 採番方式の親（`id` を宣言した列として持つ場合を含む）への `id` 参照は DDL 段で拒否する。永続化する
         // 参照先列名 `id` は物理キーの `id` を指す宣言と区別できず、宣言した列への FK の対応は
-        // 後続 Issue（#2200）が担う（実行時は constraint 側が対。Issue #2194・#2199）。
+        // 後続 Issue（未起票。#2197 配下で追跡。#2200 の移行は従来方式の表だけが対象）が担う（実行時は constraint 側が対。Issue #2194・#2199）。
         parent.require_legacy_row_identity()?;
         return Ok(resolved);
     }
@@ -10042,8 +10082,14 @@ fn encode_schema_impl(schema: &TableSchema, require_live: bool) -> Result<Vec<u8
             out.push_str("pkname:\n");
         }
         if has_row_identity {
-            // v15 の `rowmode:` 行（TABLE-23）。現状の非従来方式は採番方式のみ。
-            out.push_str("rowmode:allocated\n");
+            // v15 の `rowmode:` 行（TABLE-23）。非従来方式は採番方式と移行済みの 2 種。
+            let mode = match schema.row_identity {
+                RowIdentity::Allocated => "allocated",
+                RowIdentity::MigratedId => "migrated",
+                // `has_row_identity` が偽のため到達しない。到達しても従来方式の印は書かない。
+                RowIdentity::LegacyId => "allocated",
+            };
+            out.push_str(&format!("rowmode:{mode}\n"));
         }
         for slot in schema.physical_slots() {
             match slot {
@@ -10977,7 +11023,7 @@ type ParsedUniqueConstraints = Vec<(Option<String>, Vec<String>)>;
 
 /// カタログ v15 の `rowmode:<mode>` 行（`pkname:` 行の直後。TABLE-23・Issue #2193）を
 /// 読み取る共有パーサー。[`decode_schema_body`] と軽量パーサーが共有する。v15 は従来方式
-/// 以外の表だけが書く版のため、受理する `<mode>` は `allocated` のみ。行の欠落・接頭辞違い・
+/// 以外の表だけが書く版のため、受理する `<mode>` は `allocated`・`migrated` のみ。行の欠落・接頭辞違い・
 /// 未知の値（`legacy` を含む）はすべて拒否する（黙って従来方式へ丸めない）。
 fn parse_row_mode_line<'a>(
     lines: &mut impl Iterator<Item = &'a str>,
@@ -10987,6 +11033,7 @@ fn parse_row_mode_line<'a>(
         .ok_or_else(|| "catalog value truncated: missing rowmode line".to_string())?;
     match line.strip_prefix("rowmode:") {
         Some("allocated") => Ok(RowIdentity::Allocated),
+        Some("migrated") => Ok(RowIdentity::MigratedId),
         _ => Err("malformed rowmode line".to_string()),
     }
 }
@@ -11396,6 +11443,13 @@ fn require_table_defined_read(
     require_row_identity_read(read_txn, table_name, true)
 }
 
+/// v15 のカタログ値が移行済み（`rowmode:migrated`。Issue #2200）かを、全体を decode せず判定する。
+/// v15 の行構成は「版・`cols:`・`pk:`・`pkname:`・`rowmode:`」の順で、`rowmode:` は 5 行目。
+/// 移行済みの表は従来方式と同じく行 API・走査を通すため、読み取りゲートの拒否対象から外す。
+fn v15_row_mode_is_migrated(value: &[u8]) -> bool {
+    value.split(|b| *b == b'\n').nth(4) == Some(b"rowmode:migrated".as_slice())
+}
+
 fn require_row_identity_read(
     read_txn: &impl crate::storage::read_source::ReadSource,
     table_name: &str,
@@ -11418,6 +11472,7 @@ fn require_row_identity_read(
         .unwrap_or(value.len());
     if !allow_allocated
         && value.get(..first_line_len) == Some(CATALOG_FORMAT_VERSION_V15.as_bytes())
+        && !v15_row_mode_is_migrated(value)
     {
         return Err(row_identity_unsupported_error());
     }

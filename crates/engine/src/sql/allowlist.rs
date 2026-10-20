@@ -4347,6 +4347,17 @@ pub struct ValidatedAlterTableRenameTable {
     pub new_table_name: String,
 }
 
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> SET SCHEMA <schema>` 文（TABLE-27 のポインタ、
+/// Issue #1716）。移動先名の識別子検証は構造検証段で `42601` に落とし済み（大小は原文のまま保持）。
+/// 表・移動先 SCHEMA の存在確認とテナント境界の判定は DDL 権限ゲート通過後の実行段
+/// （`sql::ddl::execute_alter_table_set_schema`）が担う（存在オラクル化を防ぐ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableSetSchema {
+    pub table_name: String,
+    /// 移動先の SCHEMA 名。
+    pub schema_name: String,
+}
+
 /// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> TYPE
 /// <型名>` 文（TABLE-19・SQL-23、Issue #1167）。型名の意味づけ（ENUM 型名の
 /// 存在確認・`ColumnType` への変換）と互換性判定は実行段
@@ -4464,6 +4475,8 @@ pub enum ValidatedAlterTable {
     RenameColumn(ValidatedAlterTableRenameColumn),
     /// 表の改名（Issue #1623）。**BREAKING CHANGE**: variant 追加。
     RenameTable(ValidatedAlterTableRenameTable),
+    /// 表の SCHEMA 移動（TABLE-27 のポインタ、Issue #1716）。**BREAKING CHANGE**: variant 追加。
+    SetSchema(ValidatedAlterTableSetSchema),
 }
 
 /// `UPDATE ... SET <col> = <右辺>` の右辺 1 個ぶんの構文表現（Issue #1544・SQL-45 の
@@ -10023,6 +10036,21 @@ impl<'a> Parser<'a> {
         // `RENAME CONSTRAINT` は未対応のため `42601`。
         // 予約列名は改名元・改名先とも構造検証段で拒否する（カタログを見ない判定のため
         // 権限ゲートより前に置いても存在オラクルにならない）。
+        // `SET SCHEMA <schema>`（TABLE-27 のポインタ、Issue #1716）。移動先は裸の識別子のみ
+        // （修飾名は `.` が残り呼び出し元の `expect_end_of_statement` が `42601`）。カタログは
+        // 見ない（存在・境界の判定は権限ゲート通過後の実行段）。
+        if self.peek_contextual_keyword("SET") && self.peek_ident_matches_at(1, "SCHEMA") {
+            self.advance();
+            self.advance();
+            let schema_name = self.expect_ident()?;
+            crate::catalog::validate_identifier(&schema_name).map_err(|_| {
+                SqlSurfaceError::unsupported("invalid schema name in ALTER TABLE SET SCHEMA")
+            })?;
+            return Ok(ParsedAlterTableShape::SetSchema {
+                table_name,
+                schema_name,
+            });
+        }
         if self.peek_contextual_keyword("RENAME") {
             self.advance();
             if self.peek_contextual_keyword("TO") {
@@ -13547,6 +13575,68 @@ impl ValidatedDropSchema {
     }
 }
 
+/// `ALTER SCHEMA <name> RENAME TO <new>` の許可形状構造検証結果（TABLE-27 のポインタ、Issue #1716）。
+/// カタログ照会は一切行わない（存在・重複・予約名の判定は `Storage::rename_schema`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedAlterSchema {
+    pub(crate) name: String,
+    pub(crate) new_name: String,
+}
+
+impl ValidatedAlterSchema {
+    /// 改名元の SCHEMA 名。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 改名先の SCHEMA 名。
+    pub fn new_name(&self) -> &str {
+        &self.new_name
+    }
+}
+
+/// 先頭 2 トークンが `ALTER SCHEMA` か（汎用 `ALTER`〔`ALTER TABLE` 扱い〕より前に分岐するために使う）。
+pub(crate) fn is_alter_schema_statement(tokens: &[Token]) -> bool {
+    let ident_at = |i: usize, w: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(w));
+    ident_at(0, "ALTER") && ident_at(1, "SCHEMA")
+}
+
+/// [`ValidatedAlterSchema`] の構造検証本体（TABLE-27 のポインタ、Issue #1716）。`RENAME TO` だけを
+/// 受理し、`OWNER TO` は SQL-39（ロール）導入まで `0A000`。修飾名・不正な識別子・他の句・
+/// 余分なトークンは `42601`。
+pub(crate) fn validate_alter_schema_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedAlterSchema, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("ALTER")?;
+    p.expect_ident_matching("SCHEMA")?;
+    if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
+        return Err(SqlSurfaceError::unsupported(
+            "schema name must not be qualified in ALTER SCHEMA",
+        ));
+    }
+    let name = p.expect_ident()?;
+    crate::catalog::validate_identifier(&name)
+        .map_err(|_| SqlSurfaceError::unsupported("invalid schema name in ALTER SCHEMA"))?;
+    if p.peek_ident_matches("OWNER") {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "ALTER SCHEMA ... OWNER TO is not supported",
+        ));
+    }
+    p.expect_ident_matching("RENAME")?;
+    p.expect_ident_matching("TO")?;
+    if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
+        return Err(SqlSurfaceError::unsupported(
+            "schema name must not be qualified in ALTER SCHEMA",
+        ));
+    }
+    let new_name = p.expect_ident()?;
+    crate::catalog::validate_identifier(&new_name)
+        .map_err(|_| SqlSurfaceError::unsupported("invalid schema name in ALTER SCHEMA"))?;
+    p.expect_end_of_statement()?;
+    Ok(ValidatedAlterSchema { name, new_name })
+}
+
 /// 先頭 2 トークンが `CREATE SCHEMA` か（`core.rs::EngineCore::parse_tokens` の分岐判定）。
 pub(crate) fn is_create_schema_statement(tokens: &[Token]) -> bool {
     let ident_at = |i: usize, w: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(w));
@@ -14438,6 +14528,10 @@ enum ParsedAlterTableShape {
     RenameTable {
         table_name: String,
         new_table_name: String,
+    },
+    SetSchema {
+        table_name: String,
+        schema_name: String,
     },
 }
 
@@ -18151,6 +18245,11 @@ fn into_validated_alter_table(
                             "RENAME cannot be combined with other ALTER TABLE actions",
                         ));
                     }
+                    ParsedAlterTableShape::SetSchema { .. } => {
+                        return Err(SqlSurfaceError::unsupported(
+                            "SET SCHEMA cannot be combined with other ALTER TABLE actions",
+                        ));
+                    }
                     ParsedAlterTableShape::AddUnique { .. }
                     | ParsedAlterTableShape::AddCheck { .. }
                     | ParsedAlterTableShape::DropConstraint { .. }
@@ -18277,6 +18376,13 @@ fn into_validated_alter_table(
         } => ValidatedAlterTable::RenameTable(ValidatedAlterTableRenameTable {
             table_name,
             new_table_name,
+        }),
+        ParsedAlterTableShape::SetSchema {
+            table_name,
+            schema_name,
+        } => ValidatedAlterTable::SetSchema(ValidatedAlterTableSetSchema {
+            table_name,
+            schema_name,
         }),
         ParsedAlterTableShape::AlterColumnType {
             table_name,
@@ -27912,6 +28018,60 @@ mod body_expr_policy_tests {
             "ALTER TABLE docs RENAME CONSTRAINT a TO b",
         ] {
             let err = validate_alter_table(bad).expect_err(bad);
+            assert_eq!(err.wire_code(), "42601", "{bad}");
+        }
+    }
+
+    /// `SET SCHEMA` は表の SCHEMA 移動として受理し（Issue #1716）、不正な形は構文段で `42601`。
+    #[test]
+    fn alter_table_set_schema_parses_and_rejects_bad_forms() {
+        match validate_alter_table("ALTER TABLE docs SET SCHEMA Archive;").expect("set schema") {
+            ValidatedAlterTable::SetSchema(stmt) => {
+                assert_eq!(stmt.table_name, "docs");
+                assert_eq!(stmt.schema_name, "Archive");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        for bad in [
+            "ALTER TABLE docs SET SCHEMA",
+            "ALTER TABLE docs SET SCHEMA a.b",
+            "ALTER TABLE docs SET SCHEMA 1x",
+            "ALTER TABLE docs SET SCHEMA a extra",
+            "ALTER TABLE docs SET SCHEMA a, ADD COLUMN z TEXT",
+            "ALTER TABLE docs ADD COLUMN z TEXT, SET SCHEMA a",
+        ] {
+            let err = validate_alter_table(bad).expect_err(bad);
+            assert_eq!(err.wire_code(), "42601", "{bad}");
+        }
+    }
+
+    /// `ALTER SCHEMA ... RENAME TO` の構文（Issue #1716）。`OWNER TO` は `0A000`、他は `42601`。
+    #[test]
+    fn alter_schema_rename_parses_and_rejects_bad_forms() {
+        let tokens = |sql: &str| super::super::relation_name::tokenize_resolved(sql, true);
+        let ok = validate_alter_schema_tokens(&tokens("ALTER SCHEMA a RENAME TO b;").expect("lex"))
+            .expect("rename");
+        assert_eq!((ok.name(), ok.new_name()), ("a", "b"));
+        assert!(is_alter_schema_statement(
+            &tokens("alter schema a rename to b").expect("lex")
+        ));
+        assert!(!is_alter_schema_statement(
+            &tokens("ALTER TABLE a RENAME TO b").expect("lex")
+        ));
+        let owner =
+            validate_alter_schema_tokens(&tokens("ALTER SCHEMA a OWNER TO r").expect("lex"))
+                .expect_err("owner");
+        assert_eq!(owner.wire_code(), "0A000");
+        for bad in [
+            "ALTER SCHEMA",
+            "ALTER SCHEMA a",
+            "ALTER SCHEMA a RENAME TO",
+            "ALTER SCHEMA a.b RENAME TO c",
+            "ALTER SCHEMA a RENAME TO b.c",
+            "ALTER SCHEMA a RENAME TO b extra",
+            "ALTER SCHEMA a SET x",
+        ] {
+            let err = validate_alter_schema_tokens(&tokens(bad).expect("lex")).expect_err(bad);
             assert_eq!(err.wire_code(), "42601", "{bad}");
         }
     }
