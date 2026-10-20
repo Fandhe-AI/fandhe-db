@@ -354,6 +354,12 @@ fn knn_over_table_without_id_returns_declared_columns_only() {
     );
     assert_eq!(column_names(&hits), vec!["title"]);
     assert_eq!(hits.rows.len(), 2);
+    // kNN 経路でも内部 rowid を応答 `id` へ出さない（通常走査・RETURNING と同じ契約）。
+    assert!(
+        hits.rows.iter().all(|r| r.id == 0),
+        "kNN rows must not expose the internal rowid: {:?}",
+        hits.rows.iter().map(|r| r.id).collect::<Vec<_>>()
+    );
     let star = query(
         &core,
         &alice,

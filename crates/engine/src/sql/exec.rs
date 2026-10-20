@@ -3634,7 +3634,13 @@ fn project_rows(
                 }
             }
         }
-        rows.push(ResultRow { id, score, cells });
+        // 採番方式の表（TABLE-23・Issue #2199）は kNN 経路でも内部 rowid を応答へ出さない
+        // （通常走査・RETURNING と同じ契約）。再取得・式評価には上で確定した生の `id` を使う。
+        rows.push(ResultRow {
+            id: crate::sql::scan::response_row_id(schema, id),
+            score,
+            cells,
+        });
     }
     Ok(rows)
 }
