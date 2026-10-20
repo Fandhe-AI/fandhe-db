@@ -82,12 +82,8 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
   （`docs/spec/04-behavior/data-model.md` TABLE-24 (1)〜(4)・`docs/spec/04-behavior/recovery.md`
   RECOVER-1・RECOVER-10〜12）。公開境界の拡張にはオーナー承認が要るため、承認記録が得られるまで
   具体の契約は本書へ転記しない
-- 具体の方式は #1698 の実装時にオーナー承認済みの範囲で確定する
-- 実装の所在: `catalog/sequence/migrated_identity.rs`。テナントごとの状態行は既存の最大 `id` から始め、
-  `i64::MAX` を超える従来の u64 の `id` は `i64::MAX` へ飽和させて次の採番を `2200H` で止める
-  （衝突させない側へ倒す。範囲外の値そのものの扱いは #2200 の値域の判断に従う）。
-  最大 `id` の算出は、物理キーが `id` の表（飛ばし読み）と、`id` を列に持つ表（一度きりの走査）の
-  2 経路を持つ。移行後にどちらが該当するかは #2200 が確定する（引き継ぎ事項）
+- 実装の所在: `catalog/sequence/migrated_identity.rs`。具体の方式・値域の扱いは上記ポインタ先と
+  #2200 の判断に従い、本書には転記しない
 
 ### D4. IDENTITY 相当の表現（#1698 で確定。自動運転下の判断で、人間の確認が要る）
 
@@ -102,8 +98,7 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
   本案の独自表現は採らない
 - 確定（#1698）: `ColumnDefault::Identity { sequence, kind: ByDefault }` を採用する。列と SEQUENCE は名前で
   結び付き、`ALTER SEQUENCE … RENAME` は sequence ADR §9.2 のとおり `0A000` のまま受け入れる。
-  部品は `assign_migrated_id_identity_in_txn`（#2200 の移行 txn が表ごとに呼ぶ。begin・commit を含まず、
-  再実行は何も書かずに収束する）。#2200 が着地するまで SQL・NoSQL・公開 API には結線しない
+  部品は `assign_migrated_id_identity_in_txn`（#2200 の移行 txn が表ごとに呼ぶ）。#2200 が着地するまで SQL・NoSQL・公開 API には結線しない
 - 保留案: 新しい列属性 `identity`（BY DEFAULT／ALWAYS と sequence_id）。ALWAYS や `OVERRIDING` を
   扱う #1695 の判断に委ねる
 
