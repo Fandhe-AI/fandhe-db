@@ -1199,6 +1199,17 @@ spec 側の issue→ビヘイビア ID 対応表（`docs/spec/04-behavior/record
 `dry_run: false` で再実行する。ローカル確認は
 `GH_TOKEN=$(gh auth token) python3 scripts/sync_issue_behavior_ids.py --map <JSON> --repo Fandhe-AI/fandhe-db --dry-run`。
 
+## 既存データディレクトリの `id` 移行とバックアップ
+
+新しいバイナリで既存のデータディレクトリを最初に開いた時点で、従来方式の表（予約の疑似列 `id` を持つ表）が
+`id` を通常の PRIMARY KEY 列として扱う形へ**一方向に移行**されます（Issue #2200。設計記録は
+[`docs/design/rowid-primary-key-separation.md`](docs/design/rowid-primary-key-separation.md) の §12）。
+移行はカタログの書き換えだけで、行・索引・台帳は変更しません。既存のクエリ（`WHERE id = n`・`ON CONFLICT (id)` など）の結果は変わりません。
+
+- **バックアップ（移行前に必須）**: アップグレード前にサーバーを停止し、redb の単一ファイル（データディレクトリ内の DB ファイル）をコピーして保管してください
+- **戻せません**: 移行済みのファイルは旧バイナリでは開けません（fail-closed）。戻す場合はバックアップから復元してください
+- **中断しても安全**: 移行は表ごとに原子的で、途中で停止しても次回の起動で残りが移行されます。移行済みの表だけのファイルを開く場合は何も書き込みません
+
 ## 旧名からの移行
 
 本プロジェクトは 2026-10-08 に vector-db から fandhe-db へ改名しました（経緯と新旧対応は [`docs/design/rename-to-fandhe-db.md`](docs/design/rename-to-fandhe-db.md)）。

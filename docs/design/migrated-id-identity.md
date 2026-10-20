@@ -61,7 +61,8 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
 - #2200 で移行した既存表の `id` 列だけに適用する。新規作成の表・一時表・matview には適用しない
 - 新規表は #1693 の範囲で、主キー列を省略して DEFAULT が無ければ従来どおり `23502`
   （TABLE-23 (6) ポインタ）
-- 移行済みかどうかは、#2200 がカタログに残す移行済みの印で判定する
+- 移行済みかどうかは、#2200 がカタログに残す移行済みの印で判定する。印の実体は
+  `RowIdentity::MigratedId`（カタログ v15 の `rowmode:migrated`。[rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §12）
 
 ### D2. SEQUENCE の割り当て（#1698 で確定）
 
