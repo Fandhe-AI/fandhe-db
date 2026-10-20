@@ -9,6 +9,12 @@
 
 ### Breaking Changes
 
+- GIN 相当索引の宣言（Issue #2206・INDEX-8）: `CREATE INDEX ... USING gin (<JSONB 列> [jsonb_ops | jsonb_path_ops])` を
+  受理してカタログへ永続化する（従来は `0A000`）。JSONB 以外の列・複数列・式・`UNIQUE`・`WHERE`・`COLLATE` は `0A000`、
+  未知の演算子クラスは `42704`。宣言の受理までで、索引の生成・利用は後続（宣言は結果集合に影響しない）。
+  公開 API は `IndexKind::Gin(GinOpClass)` と `GinOpClass` の追加。索引カタログの形式は新版 `v8`（`v1`〜`v7` は不変）。
+  BREAKING CHANGE: `IndexKind` に variant を追加したため外部の網羅的な `match` は更新が要る。`v8` を含むデータディレクトリは
+  旧バイナリでは読めない（未知の版として拒否する）。
 - 既存表の `id` の移行（Issue #2200・TABLE-23）: 既存データディレクトリを開く時点で、従来方式の永続表のカタログを
   移行済みの印（v15 の `rowmode:migrated`。`RowIdentity::MigratedId`）へ一方向に書き換える（表ごとに原子的・再 open で収束。
   行・キー・索引・台帳は書き換えず、既存クエリの結果と wire の型 OID は不変）。壊れたカタログ項目は移行せず残す。

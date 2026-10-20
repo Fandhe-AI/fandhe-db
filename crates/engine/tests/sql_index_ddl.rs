@@ -384,7 +384,10 @@ fn structural_rejections_do_not_consult_the_catalog() {
     let too_many_sql = format!("CREATE INDEX idx ON docs ({})", too_many.join(", "));
     let cases: Vec<(String, &str)> = vec![
         ("CREATE INDEX idx ON docs USING hash (lang)".into(), "0A000"),
-        ("CREATE INDEX idx ON docs USING gin (lang)".into(), "0A000"),
+        (
+            "CREATE INDEX idx ON docs USING gin (lang, body)".into(),
+            "0A000",
+        ),
         ("CREATE INDEX idx ON docs USING bm25 (body)".into(), "0A000"),
         (
             "CREATE INDEX idx ON docs USING hnsw (embedding) WHERE lang = 'ja'".into(),
