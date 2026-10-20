@@ -643,13 +643,16 @@ fn views_in_schema_bind_early_and_public_views_cannot_depend_on_schema() {
         &mut s,
         "INSERT INTO t (id, name, qty) VALUES (9, 'pub', 99)",
     );
-    // SCHEMA 配下のビューは SCHEMA 配下の表を指す（裸の `t` を書いても、作成時に解決した表）。
+    // SCHEMA 配下のビューは SCHEMA 配下の表を指す。public の表を読むビューは D7 で `42501`。
     ok(
         &core,
         &mut s,
         "CREATE VIEW s.v AS SELECT id, name FROM s.t WHERE name = 'b'",
     );
-    ok(&core, &mut s, "CREATE VIEW s.w AS SELECT id, name FROM t");
+    assert_eq!(
+        code(&core, &mut s, "CREATE VIEW s.w AS SELECT id, name FROM t"),
+        "42501"
+    );
     assert_eq!(
         query_rows(
             &core,
@@ -657,14 +660,6 @@ fn views_in_schema_bind_early_and_public_views_cannot_depend_on_schema() {
             "SELECT id, name FROM s.v ORDER BY id LIMIT 10"
         ),
         ["[SignedInteger(2), Text(\"b\")]"]
-    );
-    assert_eq!(
-        query_rows(
-            &core,
-            &mut s,
-            "SELECT id, name FROM s.w ORDER BY id LIMIT 10"
-        ),
-        ["[SignedInteger(9), Text(\"pub\")]"]
     );
     // 自動更新可能なビューへの書き込み。
     ok(&core, &mut s, "INSERT INTO s.v (id, name) VALUES (3, 'c')");
@@ -686,7 +681,7 @@ fn views_in_schema_bind_early_and_public_views_cannot_depend_on_schema() {
     );
     // 依存する表は RESTRICT で削除できない。
     assert_eq!(code(&core, &mut s, "DROP TABLE s.t"), "2BP01");
-    // D7: public のビューは SCHEMA 配下を読めない（逆向きは許可される）。
+    // D7: public のビューは SCHEMA 配下を読めない（逆向きも拒否される）。
     assert_eq!(
         code(&core, &mut s, "CREATE VIEW pv AS SELECT id, name FROM s.t"),
         "42501"
@@ -701,7 +696,6 @@ fn views_in_schema_bind_early_and_public_views_cannot_depend_on_schema() {
     );
     // 名前が SCHEMA 配下の `DROP VIEW`。
     ok(&core, &mut s, "DROP VIEW s.v");
-    ok(&core, &mut s, "DROP VIEW s.w");
     assert_eq!(code(&core, &mut s, "DROP VIEW s.v"), "42P01");
     ok(&core, &mut s, "DROP VIEW IF EXISTS s.v");
     // MATERIALIZED VIEW の SCHEMA 配置は未対応（fail-closed）。
@@ -723,7 +717,7 @@ fn views_in_schema_bind_early_and_public_views_cannot_depend_on_schema() {
     );
 }
 
-/// D7: public の表は SCHEMA 配下の表・SEQUENCE へ依存できない（外部キー・DEFAULT nextval）。逆向きは成功する。
+/// D7: public と SCHEMA 配下の間の依存は両方向とも拒否される（外部キー・DEFAULT nextval・ビュー）。
 #[test]
 fn public_tables_cannot_depend_on_schema_objects() {
     let (core, _g) = new_core("t27-objects-d7");
@@ -751,18 +745,39 @@ fn public_tables_cannot_depend_on_schema_objects() {
             "{msg}"
         );
     }
-    // 逆向き（SCHEMA 配下から public）は許可。
-    ok(
-        &core,
-        &mut s,
+    // 逆向き（SCHEMA 配下から public）も拒否する（public 側 DROP の依存判定が全テナントを走査し、
+    // 他テナントの非公開の依存が存在情報になるため。固定文言で名前・内部 ID を含めない）。
+    for sql in [
         "CREATE TABLE s.c (id BIGINT PRIMARY KEY, pc TEXT REFERENCES p (code))",
-    );
+        "CREATE TABLE s.d (id BIGINT PRIMARY KEY, n BIGINT DEFAULT nextval('q'))",
+        "CREATE VIEW s.pv AS SELECT id FROM p",
+        "CREATE VIEW s.pj AS SELECT x.id FROM s.p AS x INNER JOIN p AS y ON x.id = y.id LIMIT 5",
+    ] {
+        let (c, msg) = err(&core, &mut s, sql);
+        assert_eq!(c, "42501", "{sql}");
+        assert!(!msg.contains('#'), "{msg}");
+    }
     ok(
         &core,
         &mut s,
-        "CREATE TABLE s.d (id BIGINT PRIMARY KEY, n BIGINT DEFAULT nextval('q'))",
+        "CREATE TABLE s.c0 (id BIGINT PRIMARY KEY, n BIGINT)",
     );
-    ok(&core, &mut s, "CREATE VIEW s.pv AS SELECT id FROM p");
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "ALTER TABLE s.c0 ALTER COLUMN n SET DEFAULT nextval('q')"
+        ),
+        "42501"
+    );
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "ALTER TABLE s.c0 ADD FOREIGN KEY (id) REFERENCES p (id)"
+        ),
+        "42501"
+    );
     // 同じ SCHEMA 内の参照も許可。
     ok(
         &core,
@@ -845,6 +860,41 @@ fn other_tenants_schema_objects_are_unreachable_for_every_kind() {
     );
     assert_eq!(count_as(&core, "bob", &mut bob, "a.t"), "Integer(0)");
     assert_eq!(count(&core, &mut alice, "a.t"), "Integer(1)");
+}
+
+/// D7: 他テナントの SCHEMA 配下から public への依存は作れないため、public 側の `DROP` の結果
+/// （RESTRICT・CASCADE とも）が他テナントの非公開オブジェクトの有無で変わらない（存在情報を漏らさない）。
+#[test]
+fn schema_to_public_dependency_cannot_leak_into_public_drop() {
+    let (core, _g) = new_core("t27-objects-drop-oracle");
+    let mut alice = ddl_session();
+    let mut bob = ddl_session();
+    ok_as(&core, "alice", &mut alice, "CREATE SCHEMA a");
+    ok_as(
+        &core,
+        "alice",
+        &mut alice,
+        "CREATE TABLE p (id BIGINT PRIMARY KEY, code TEXT UNIQUE)",
+    );
+    ok_as(
+        &core,
+        "alice",
+        &mut alice,
+        "CREATE TABLE p2 (id BIGINT PRIMARY KEY)",
+    );
+    for sql in [
+        "CREATE TABLE a.c (id BIGINT PRIMARY KEY, pc TEXT REFERENCES p (code))",
+        "CREATE VIEW a.v AS SELECT id FROM p",
+    ] {
+        assert_eq!(
+            run_as(&core, "alice", &mut alice, sql),
+            "ERR 42501",
+            "{sql}"
+        );
+    }
+    // 依存が作られていないので、bob の public 側 DROP は alice の SCHEMA の有無と無関係に成功する。
+    ok_as(&core, "bob", &mut bob, "DROP TABLE p");
+    ok_as(&core, "bob", &mut bob, "DROP TABLE p2 CASCADE");
 }
 
 fn ok_as(core: &EngineCore, tenant: &str, s: &mut SessionState, sql: &str) -> SqlOutcome {

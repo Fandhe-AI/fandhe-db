@@ -162,9 +162,11 @@ README の公開済み要点を超えて具体化しない。公開境界を広�
   `public` の表の FK・索引、`OWNED BY`、`DEFAULT nextval` から、テナントの SCHEMA の
   オブジェクトへの参照。共有オブジェクトを経由すると、他テナントのセッションが名前解決（D4）を
   通らずにテナント内のオブジェクトへ到達できてしまうため
-- 逆向き（テナントの SCHEMA から `public` への参照）は許可する。`public` の行には暗黙 RLS が
-  常に掛かる
-- 受理範囲は #1717 で確定する。それまでは拒否側に倒す
+- 逆向き（テナントの SCHEMA から `public` への参照）も、public 側の DDL（`DROP` の依存判定・
+  `CASCADE`）がテナント境界に対応するまでは拒否する（#1717 のレビューで確定）。`public` の `DROP` の
+  依存判定は全テナントを走査するため、許すと他テナントの非公開の依存の有無で結果（成功／`2BP01`）が
+  分かれて存在情報が漏れ、`CASCADE` では他テナントの定義まで消える。対応後に再検討する
+- 受理範囲は #1717 で確定した（同じ所属内の参照だけを許可する）
 
 ### D8. DROP SCHEMA と CASCADE の決定的順序（#1713・#1717）
 
@@ -343,11 +345,13 @@ TABLE-27 のポインタ。テナントの SCHEMA 配下に表・ビュー・索
 - **ビュー本文（D5）**: 作成時に解決した内部キーで保存する（早期束縛）。SCHEMA の削除・再作成で内部 ID は
   再利用されないため、古い本文は `42P01` になる。格納形式の版は上げない。内部キーを含む本文を持つ DB を
   旧バイナリで開くと decode の検証で `CorruptSchema`（fail-closed）になる
-- **D7（`42501`）**: public の表（FK の参照先・`DEFAULT nextval`。`ALTER` の追加 FK・`ADD COLUMN`・
-  `SET DEFAULT` を含む）・public のビュー・materialized view が SCHEMA 配下を参照する定義は
-  `SchemaDependencyForbidden`（固定文言）で拒否する（`sql::schema_dependency`。DDL 権限ゲートの直後・
-  カタログ書き込みの前）。逆向き・同一 SCHEMA 内は許可。`OWNED BY` は構文上テナント表を指せない
-  （3 部名）ため、SCHEMA 配下の SEQUENCE が public の表を所有する向きだけが成立する（許可の向き）
+- **D7（`42501`）**: public と SCHEMA 配下の間をまたぐ依存は両方向とも `SchemaDependencyForbidden`
+  （固定文言）で拒否する（`sql::schema_dependency`。DDL 権限ゲートの直後・カタログ書き込みの前）。
+  対象は表の FK の参照先・`DEFAULT nextval`（`ALTER` の追加 FK・`SET DEFAULT` を含む）とビュー・
+  materialized view の本文の参照先。ビューの SCHEMA 配下 → public は、DROP の依存判定と同じ導出
+  （`catalog::view_body_relations`）で調べる。同一 SCHEMA 内は許可。SCHEMA 配下 → public を拒否する理由は、
+  public 側の `DROP` の依存判定が全テナントを走査し、他テナントの非公開の依存の有無が成否に表れるため。
+  `OWNED BY` は構文上テナント表を指せない（3 部名）ため対象外
 - **UDF**: セッション単位の登録（永続化しない）は変えず、登録キー・呼び出しキーを内部キーにした。
   SCHEMA の削除後は解決できず、作り直した SCHEMA は別の内部 ID のため古い登録に当たらない。
   `public.f`・組み込み SCHEMA の修飾は解決しない（組み込み関数へ化けない）
@@ -377,11 +381,9 @@ TABLE-27 のポインタ。テナントの SCHEMA 配下に表・ビュー・索
   `ALTER VIEW`（未実装）、UDF の永続化
 - **既知の制限**: 単独の `SELECT nextval('s.q')` は public の `SELECT nextval('q')` と同じく未対応だが、
   SQLSTATE は `42703`（public は `0A000`）になる（どちらも拒否。内部キーは文言に出ない）。
-  解決（Parse）から書き込みまでの間に別セッションが同じ SCHEMA を削除すると、削除済みの
-  内部 ID へ作成が成功しうる（到達できない孤児になる。内部 ID は再利用しないため他テナント・新しい
-  SCHEMA からは見えない）。書き込み txn 内での SCHEMA 存在確認（内部 ID 逆引きの索引）は未実装。
-  public の表・ビューへの `DROP ... CASCADE`／RESTRICT は、別テナントの SCHEMA 配下の依存（SCHEMA →
-  public の許可された向き）の有無に影響される（共有カタログの DDL は元々全テナントに影響する操作）
+  解決（Parse）から書き込みまでの間に別セッションが同じ SCHEMA を削除する競合は、表・ビュー・索引・
+  SEQUENCE の作成 txn 内で `ensure_key_schema_alive_in_txn` が SCHEMA の存在を確認して拒否する
+  （削除済みの内部 ID へ作成できない）。UDF はセッション単位の登録で永続化しないため対象外。
 
 ## 9. Issue #1716 実装記録
 

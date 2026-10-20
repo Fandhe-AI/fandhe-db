@@ -4768,6 +4768,13 @@ fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
     })
 }
 
+/// ビュー本文が読む relation 名（DROP の依存判定 `view_def_dependence_on` と同じ導出）。
+/// `sql::schema_dependency` が SCHEMA 配下のビューの参照先を調べるために使う（TABLE-27・Issue #1717）。
+/// 本文を検証できない場合は `Err`（呼び出し側は fail-closed で拒否する）。
+pub(crate) fn view_body_relations(body_sql: &str) -> Result<Vec<String>> {
+    Ok(view_body_shape(body_sql)?.relations)
+}
+
 /// ビュー定義の DDL 依存ゲート用の形状（Issue #1659）。列別名を持つビューは、列名の追随
 /// （RENAME COLUMN）・依存列の検査（DROP COLUMN／ALTER TYPE）を単純形の導出列では
 /// 精密に行えないため、評価後射影形と同じ保守側（`buffered = true`）に分類する
