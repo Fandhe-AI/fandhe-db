@@ -3568,7 +3568,9 @@ impl EngineCore {
             sql,
             &self.storage,
             self.nesting_limits,
-        )? {
+        )
+        .map_err(|e| self.refine_relation_error(ctx, sql, e))?
+        {
             crate::sql::allowlist::Statement::SetSearchMode { .. } => {
                 Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                     "SET search_mode requires a session-aware entry point",
@@ -3977,6 +3979,26 @@ impl EngineCore {
         self.reclassify_write_to_view_error_for(None, e)
     }
 
+    /// テナント不明の `schema.table` 解決が返した `3F000` を、呼び出し元テナントの SCHEMA 照会で
+    /// `3F000`／`42P01`／`0A000` に精密化する（TABLE-27・Issue #1714、ADR D4）。SCHEMA の照会は
+    /// `(ctx.tenant_id, schema)` の get 1 回だけで、他テナントの SCHEMA と存在しない名前は同じ
+    /// `3F000` になる（存在オラクルにしない）。`3F000` 以外のエラーは素通しで、通常の文は
+    /// 追加コストを払わない。
+    fn refine_relation_error(
+        &self,
+        ctx: &PolicyContext,
+        sql: &str,
+        e: crate::sql::allowlist::SqlSurfaceError,
+    ) -> crate::sql::allowlist::SqlSurfaceError {
+        let probe = |schema: &str| {
+            self.storage
+                .schema_id(ctx.tenant_id(), schema)
+                .map(|id| id.is_some())
+                .map_err(crate::catalog::table_lookup_error)
+        };
+        crate::sql::relation_name::refine_schema_error(sql, &probe, e)
+    }
+
     /// [`Self::reclassify_write_to_view_error`] の文種別つき版（TABLE-43 (3)・Issue #1670）。
     /// `op` が `Some`（`INSERT`／`UPDATE`／`DELETE`）で対象がビューのとき、自動更新可能性を
     /// `sql::view_updatable` で判定し、自動更新不可なら `55000`
@@ -4133,6 +4155,9 @@ impl EngineCore {
         if temp.is_empty() {
             return self.parse_tokens(tokens);
         }
+        // `public.<一時表の名前>` は永続側の関係を指すため、裸の名前へ解決すると一時表に化ける。
+        // 解決より前に拒否する（TABLE-27・Issue #1714。fail-closed）。
+        crate::sql::temp_catalog::reject_public_qualified_temp(&tokens, temp)?;
         let txn_control_head = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name))
@@ -4272,11 +4297,16 @@ impl EngineCore {
     /// 緩めたモードを渡す。
     fn parse_tokens_in(
         &self,
-        tokens: Vec<crate::sql::lexer::Token>,
+        mut tokens: Vec<crate::sql::lexer::Token>,
         temp: &crate::sql::temp_catalog::SessionTempCatalog,
         hits: &crate::sql::temp_catalog::RelationHits,
         ledger_mode: LedgerMode,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        // `schema.table` のテーブル参照を解決して未修飾の名前へ置き換える（TABLE-27・Issue #1714）。
+        // 以降の検証はすべて未修飾名として扱うため、修飾の有無で経路・エラー契約が変わらない。
+        // 冪等（解決済みのトークン列には何もしない）で、テナント不明の解決は ctx を持つ入口が
+        // [`Self::refine_relation_error`] で精密化する。
+        crate::sql::relation_name::rewrite_relation_names(&mut tokens, None)?;
         let storage_lookup = crate::sql::temp_catalog::SessionRelationLookup::new(
             &self.storage,
             temp,
@@ -4763,7 +4793,10 @@ impl EngineCore {
         sql: &str,
         declared: &[Option<crate::sql::params::DeclaredParamType>],
     ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
-        let tokens = crate::sql::lexer::tokenize_with_params(sql)?;
+        let mut tokens = crate::sql::lexer::tokenize_with_params(sql)?;
+        // `schema.table` のテーブル参照を解決して未修飾の名前へ置き換える（TABLE-27・Issue #1714）。
+        // 位置推論・型推論・Bind の再 parse が同じ（解決済みの）トークン列を見るよう、最初に行う。
+        crate::sql::relation_name::rewrite_relation_names(&mut tokens, None)?;
         // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW`
         // は DDL であり、`sql::params` が受理する `$n` の許可位置一覧
         // （WHERE 等号右辺・VALUES 節等）はいずれも DML 向けの規範形のため、
@@ -5764,7 +5797,8 @@ impl EngineCore {
         // TimeZone を parse 区間へも張る（ゾーン無し `TIMESTAMPTZ` リテラル・`AT LOCAL`。Issue #1576）。
         let parsed = {
             let _session_tz_scope = session_time_zone_scope(session);
-            self.parse_tokens_gated(tokens, session)?
+            self.parse_tokens_gated(tokens, session)
+                .map_err(|e| self.refine_relation_error(ctx, sql, e))?
         };
         // 一時カタログに対する細かいゲートは上の parse で通過済みのため、粗いゲートを持たない
         // 内部版を呼ぶ（TABLE-44・Issue #1681）。
@@ -5807,6 +5841,7 @@ impl EngineCore {
             let parsed = (|| {
                 let tokens = crate::sql::lexer::tokenize_marked(sql)?;
                 self.parse_tokens_gated(tokens, session)
+                    .map_err(|e| self.refine_relation_error(ctx, sql, e))
             })();
             match parsed {
                 Ok(parsed) => parsed,
@@ -9505,7 +9540,8 @@ impl EngineCore {
             return Ok(plan);
         }
         let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)
-            .map_err(|e| self.reclassify_matview_write_error(e))?;
+            .map_err(|e| self.reclassify_matview_write_error(e))
+            .map_err(|e| self.refine_relation_error(ctx, sql, e))?;
         self.begin_copy_validated(ctx, session, stmt, None)
     }
 
@@ -9599,7 +9635,8 @@ impl EngineCore {
             return Ok(plan);
         }
         let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)
-            .map_err(|e| self.reclassify_matview_write_error(e))?;
+            .map_err(|e| self.reclassify_matview_write_error(e))
+            .map_err(|e| self.refine_relation_error(ctx, sql, e))?;
         if let crate::sql::allowlist::CopyStatement::To(v) = &stmt {
             // 通常の読み取り文と同じ文実行前チェック（文数・持続時間の上限。
             // 超過時は `Failed` へ遷移して拒否する）。`COPY FROM` は

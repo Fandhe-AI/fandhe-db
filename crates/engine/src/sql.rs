@@ -224,6 +224,7 @@ pub(crate) mod pk_point;
 pub mod plan;
 pub(crate) mod qualified_column;
 pub mod relation;
+pub(crate) mod relation_name;
 pub mod relation_snapshot;
 pub mod returning;
 pub(crate) mod scalar_index;

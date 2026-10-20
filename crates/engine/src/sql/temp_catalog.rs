@@ -323,6 +323,30 @@ pub(crate) fn tokens_reference_temp(tokens: &[Token], catalog: &SessionTempCatal
     })
 }
 
+/// `public.<一時表の名前>` を含む文を拒否する（TABLE-27・Issue #1714）。`public.` で修飾した名前は
+/// 永続側の関係を指すが、解決後は未修飾名と同一になり一時表（検索順で優先）に当たってしまう。
+/// `DROP TABLE public.t` が一時表を落とす等の取り違えを避けるため、解決より前に固定の `0A000`
+/// （[`temp_table_unsupported`]）で拒否する（fail-closed）。一時カタログが空なら常に `Ok`。
+pub(crate) fn reject_public_qualified_temp(
+    tokens: &[Token],
+    catalog: &SessionTempCatalog,
+) -> Result<(), SqlSurfaceError> {
+    if catalog.is_empty() {
+        return Ok(());
+    }
+    let hit = tokens.iter().any(|t| match t {
+        Token::QualifiedIdent { qualifier, name } => {
+            qualifier.eq_ignore_ascii_case("public")
+                && catalog.names().any(|n| n.eq_ignore_ascii_case(name))
+        }
+        _ => false,
+    });
+    if hit {
+        return Err(temp_table_unsupported());
+    }
+    Ok(())
+}
+
 /// 一時表を扱えない文（混在・対象外の文種）に返す固定の拒否（`0A000`）。永続側の表の存否を
 /// 含まない固定文言で、存在オラクルにならない。
 pub(crate) fn temp_table_unsupported() -> SqlSurfaceError {

@@ -329,6 +329,7 @@ impl EngineCore {
         let Ok(tokens) = crate::sql::lexer::tokenize_marked(sql) else {
             return Ok(None);
         };
+        crate::sql::temp_catalog::reject_public_qualified_temp(&tokens, temp)?;
         if !crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
             return Ok(None);
         }
@@ -542,6 +543,8 @@ impl EngineCore {
             return self.parse_sql_prepared_with_declared(sql, declared);
         }
         let tokens = crate::sql::lexer::tokenize_with_params(sql)?;
+        // `public.<一時表の名前>` は解決より前に拒否する（TABLE-27・Issue #1714）。
+        crate::sql::temp_catalog::reject_public_qualified_temp(&tokens, temp)?;
         // トランザクション制御・`CREATE [TEMP] TABLE`・`DROP TABLE` は実行段が一時カタログで名前を解決する。
         let txn_control_head = matches!(
             tokens.first(),
