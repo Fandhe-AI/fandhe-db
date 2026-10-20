@@ -4145,7 +4145,10 @@ impl EngineCore {
             && matches!(tokens.get(1), Some(crate::sql::lexer::Token::Ident(b)) if b.eq_ignore_ascii_case("TABLE"));
         let scan_exempt = is_drop_table
             || crate::sql::allowlist::is_create_table_statement(&tokens)
-            || crate::sql::allowlist::is_create_temp_table_statement(&tokens);
+            || crate::sql::allowlist::is_create_temp_table_statement(&tokens)
+            // SCHEMA 名は関係名と別の名前空間で一時表を読み書きしないため走査対象外（TABLE-27・Issue #1713）。
+            || crate::sql::allowlist::is_create_schema_statement(&tokens)
+            || crate::sql::allowlist::is_drop_schema_statement(&tokens);
         if txn_control_head || scan_exempt {
             let hits = crate::sql::temp_catalog::RelationHits::default();
             let parsed = self.parse_tokens_in(tokens, temp, &hits, self.ledger_mode)?;
@@ -4198,6 +4201,8 @@ impl EngineCore {
                     | ParsedSql::CreateTable(_)
                     | ParsedSql::CreateTempTable(_)
                     | ParsedSql::DropTable(_)
+                    | ParsedSql::CreateSchema(_)
+                    | ParsedSql::DropSchema(_)
             )
         {
             return Ok(());

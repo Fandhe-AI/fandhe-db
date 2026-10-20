@@ -290,3 +290,30 @@ fn schema_names_do_not_collide_with_relations_and_existing_behavior_is_unchanged
     ok_as(&core, "alice", &mut s, "DROP TABLE s");
     ok_as(&core, "alice", &mut s, "DROP SCHEMA s");
 }
+
+/// 一時表を持つセッションでも `CREATE SCHEMA`／`DROP SCHEMA` が通る（Issue #1713 の Bugbot 指摘）。
+/// SCHEMA 名は関係名と別の名前空間のため、一時表名（`create`／`schema`／`drop` や SCHEMA 名と同名）と
+/// トークンが一致しても 0A000 にならない。simple query（トークン走査）と extended
+/// （`execute_parsed_in_session` の粗いゲート）の両経路を覆う。
+#[test]
+fn schema_ddl_is_not_blocked_by_session_temp_tables() {
+    let (_path, _guard, core) = open_fixture("schema-with-temp");
+    let mut session = allowed_session();
+    for tmp in ["create", "schema", "drop", "s1"] {
+        ok_as(
+            &core,
+            "tenant-a",
+            &mut session,
+            &format!("CREATE TEMP TABLE {tmp} (a INTEGER)"),
+        );
+    }
+    ok_as(&core, "tenant-a", &mut session, "CREATE SCHEMA s1");
+    ok_as(&core, "tenant-a", &mut session, "DROP SCHEMA s1");
+
+    let parsed = core.parse_sql("CREATE SCHEMA s2").expect("parse");
+    core.execute_parsed_in_session(&ctx("tenant-a"), &mut session, &parsed)
+        .expect("extended CREATE SCHEMA must pass the coarse temp gate");
+    let parsed = core.parse_sql("DROP SCHEMA s2").expect("parse");
+    core.execute_parsed_in_session(&ctx("tenant-a"), &mut session, &parsed)
+        .expect("extended DROP SCHEMA must pass the coarse temp gate");
+}
