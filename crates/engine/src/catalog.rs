@@ -2602,6 +2602,11 @@ fn alter_column_type_rewrite_expr_in_txn(
     }
     invalidate_user_uniq_if_key_column_in_txn(write_txn, table_name, &schema, column_name)?;
     crate::key_index::drop_indexes_containing_column_in_txn(write_txn, table_name, column_name)?;
+    // GIN 相当索引（INDEX-8、Issue #2207・`docs/design/gin-jsonb-index.md` D4・D7・D8）。行を直接
+    // 書き換えるこの経路は `constraint::enforce_row_constraints_in_txn` を通らないため、変更列を対象と
+    // する GIN 索引を同一 write txn で新しい値から再構築する（完全性と抽出上限の契約を保つ）。
+    // 上限超過は `54000`（commit 前に返るため副作用ゼロ）。
+    rebuild_gin_indexes_on_column_in_txn(write_txn, table_name, &schema, column_name)?;
     if schema_check_references_column(old_schema, column_name) {
         revalidate_checks_after_type_change_in_txn(
             write_txn,
@@ -2619,6 +2624,35 @@ fn alter_column_type_rewrite_expr_in_txn(
         .insert(table_name, encoded.as_slice())
         .map_err(CatalogError::from)?;
     Ok(schema)
+}
+
+/// 変更列 `column_name` を対象とする GIN 相当索引を、新スキーマ `schema` の行から同一 write txn で
+/// 再構築する（`alter_column_type_rewrite_expr_in_txn` が行の書き換え後に呼ぶ。INDEX-8、Issue #2207）。
+/// 抽出上限超過は `54000` の固定文言（全テナントの行が対象のためテナント・値は含めない）。
+fn rebuild_gin_indexes_on_column_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    column_name: &str,
+) -> std::result::Result<(), AlterCheckError> {
+    let decls = table_expression_decls_in_txn(write_txn, table_name)?;
+    for decl in decls.gins.iter().filter(|d| d.column == column_name) {
+        crate::gin_index::build_all_tenants_in_txn(
+            write_txn,
+            table_name,
+            schema,
+            decl,
+            &crate::gin_index::GinLimits::default(),
+        )
+        .map_err(|e| match e {
+            crate::tenant::TenantWriteError::GinIndexEntryLimitExceeded => AlterCheckError::Sql(
+                SqlSurfaceError::payload_too_large("gin index entry limit exceeded"),
+            ),
+            crate::tenant::TenantWriteError::Catalog(c) => AlterCheckError::Catalog(c),
+            other => AlterCheckError::Catalog(CatalogError::CorruptSchema(other.to_string())),
+        })?;
+    }
+    Ok(())
 }
 
 /// 一般変換（`RewriteExpr`）の静的検証（行を読まない。TABLE-40 (3)・Issue #1637）。新しい型が

@@ -733,3 +733,61 @@ fn view_dml_and_set_schema_keep_the_index_consistent() {
     run_ok(&core, &mut s, "alice", "ALTER TABLE docs SET SCHEMA public");
     assert_clean(&core, &["alice", "bob"], true);
 }
+
+/// `ALTER COLUMN ... TYPE JSONB USING <式>` は行を直接書き換えるが、GIN 索引は同一 txn で新しい値から
+/// 再構築される（欠落 0）。再構築で抽出上限を超える行があれば `54000` で、行も索引も変わらない。
+#[test]
+fn alter_column_type_using_rebuilds_gin_index_and_enforces_limits() {
+    let (path, _guard) = open_fixture("gin-dml-alter-using");
+    let core = core_at(&path);
+    let mut s = allowed_session();
+    create_indexes(&core, &mut s);
+    let big_key = "k".repeat(4_097);
+    for (tenant, id, doc, raw) in [
+        ("alice", 1, r#"{"a":1}"#, r#"{"zz":2,"tags":["m"]}"#),
+        ("bob", 11, r#"{"b":1}"#, r#"[1,2]"#),
+    ] {
+        run_ok(
+            &core,
+            &mut s,
+            tenant,
+            &format!(
+                "INSERT INTO docs (id, doc, raw, body, embedding) VALUES ({id}, '{doc}', '{raw}', 'b', '[1,0]')"
+            ),
+        );
+    }
+    assert_clean(&core, &["alice", "bob"], true);
+
+    // 上限超過: bob の行（他テナント）の変換結果が超過しても拒否され、副作用はゼロ。
+    run_ok(
+        &core,
+        &mut s,
+        "bob",
+        &format!("UPDATE docs SET raw = '{{\"{big_key}\":1}}' WHERE id = 11"),
+    );
+    let e = err(
+        &core,
+        &mut s,
+        "alice",
+        "ALTER TABLE docs ALTER COLUMN doc TYPE JSONB USING raw::jsonb",
+    );
+    assert_eq!(e.wire_code(), "54000");
+    let msg = e.to_string();
+    assert!(!msg.contains("bob") && !msg.contains("kkkk"), "{msg}");
+    assert_clean(&core, &["alice", "bob"], true);
+
+    // 超過行を直せば通り、索引は新しい値と一致する。
+    run_ok(
+        &core,
+        &mut s,
+        "bob",
+        "UPDATE docs SET raw = '[1,2]' WHERE id = 11",
+    );
+    run_ok(
+        &core,
+        &mut s,
+        "alice",
+        "ALTER TABLE docs ALTER COLUMN doc TYPE JSONB USING raw::jsonb",
+    );
+    assert_clean(&core, &["alice", "bob"], true);
+}
