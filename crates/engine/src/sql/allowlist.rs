@@ -18105,8 +18105,12 @@ fn into_validated_alter_table(
 /// カタログへ一切問い合わせない。存在確認は `sql::ddl::execute_drop_table` が
 /// 書き込みトランザクション内で行う。
 pub fn validate_drop_table(sql: &str) -> Result<ValidatedDropTable, SqlSurfaceError> {
-    let tokens = super::relation_name::tokenize_resolved(sql, false)?;
-    validate_drop_table_tokens(&tokens)
+    let mut tokens = lexer::tokenize(sql)?;
+    let public_names = super::relation_name::rewrite_relation_names(&mut tokens, None)?;
+    let mut stmt = validate_drop_table_tokens(&tokens)?;
+    // `public.` 修飾の情報を捨てない（実行時に一時表との衝突検査を通すため。Issue #1714）。
+    stmt.public_qualified = public_names;
+    Ok(stmt)
 }
 
 /// [`validate_drop_table`] の本体。`core.rs::EngineCore::parse_tokens` が既に

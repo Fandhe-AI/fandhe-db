@@ -2108,6 +2108,14 @@ pub struct PreparedSql {
     public_qualified: Vec<String>,
 }
 
+/// 解決済みトークンから再 parse した `DROP TABLE` に、Parse 時に外した `public.` 修飾の
+/// 表名を戻す（TABLE-27・Issue #1714）。実行時の粗いゲートが同名の一時表との衝突を拒否する。
+fn attach_public_qualified(parsed: &mut ParsedSql, public_qualified: &[String]) {
+    if let ParsedSql::DropTable(stmt) = parsed {
+        stmt.public_qualified = public_qualified.to_vec();
+    }
+}
+
 impl PreparedSql {
     /// `$n` ごとの宣言型（`param_count()` と同じ長さ。宣言なしは `None`）。
     pub fn declared_param_types(&self) -> &[Option<crate::sql::params::DeclaredParamType>] {
@@ -4918,7 +4926,11 @@ impl EngineCore {
                 .collect();
             let _guard = crate::sql::const_expr::defer_param_value_errors(positions);
             crate::datetime::reset_session_time_zone_read();
-            self.parse_tokens(dummy_tokens)?
+            let mut parsed = self.parse_tokens(dummy_tokens)?;
+            // 解決済みトークンの再 parse は `public.` 修飾の情報を持たない。`$n` を含まない文の
+            // 実行は `dummy_parsed` を複製するため、ここで保持して実行時の衝突検査を通す。
+            attach_public_qualified(&mut parsed, &public_qualified);
+            parsed
         };
         // Issue #2437・WIRE-24 (1)(5): 宣言型と文脈の型の変換可否は、構造検証 parse の成功後に
         // 判定する（構文 `42601`・名前解決 `42P01`／`42703` が型エラーより先に返る）。
@@ -5261,7 +5273,9 @@ impl EngineCore {
             .collect();
         let substituted =
             crate::sql::params::substitute_values_typed(&prepared.tokens, &decoded, &kinds)?;
-        self.parse_tokens(substituted)
+        let mut parsed = self.parse_tokens(substituted)?;
+        attach_public_qualified(&mut parsed, &prepared.public_qualified);
+        Ok(parsed)
     }
 
     /// Describe(statement)（拡張クエリプロトコルの 'D' 種別 S。Issue #935・

@@ -71,6 +71,7 @@ pub(crate) fn rewrite_relation_names(
         .any(|k| ident_is(tokens.first(), k));
     let mut index_on_pending = head_create && head.iter().any(|t| ident_is(Some(t), "INDEX"));
 
+    let cte_names = collect_cte_names(tokens);
     let mut levels: Vec<Level> = vec![Level::default()];
     let mut public_names: Vec<String> = Vec::new();
     let mut deferred: Option<SqlSurfaceError> = None;
@@ -193,6 +194,13 @@ pub(crate) fn rewrite_relation_names(
             schema_exists,
         ) {
             Ok(()) => {
+                // 同名の CTE があると、置換後の裸の名前が CTE に解決され永続表を指さなくなる。
+                // `public.` が永続側を指す契約を守れないため拒否する（fail-closed）。
+                if cte_names.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "public-qualified relation conflicts with a CTE name",
+                    ));
+                }
                 public_names.push(name.clone());
                 if let Some(slot) = tokens.get_mut(i) {
                     *slot = Token::Ident(name);
@@ -211,6 +219,49 @@ pub(crate) fn rewrite_relation_names(
         Some(e) => Err(e),
         None => Ok(public_names),
     }
+}
+
+/// 文中の CTE 名（`name AS (` ／ `name (cols) AS (` ／ `AS [NOT] MATERIALIZED (` の形）を
+/// 保守的に集める。`WITH` を含まない文では空。一致しすぎても拒否側に倒れるだけ（fail-closed）。
+fn collect_cte_names(tokens: &[Token]) -> Vec<String> {
+    let mut out = Vec::new();
+    if !tokens.iter().any(|t| ident_is(Some(t), "WITH")) {
+        return out;
+    }
+    for (i, t) in tokens.iter().enumerate() {
+        if !ident_is(Some(t), "AS") {
+            continue;
+        }
+        let Some(mut j) = i.checked_sub(1) else {
+            continue;
+        };
+        if matches!(tokens.get(j), Some(Token::Punct(')'))) {
+            // 列名リスト `name (a, b) AS (`: 対応する `(` まで戻る。
+            let mut depth = 0usize;
+            let mut found = None;
+            for k in (0..=j).rev() {
+                match tokens.get(k) {
+                    Some(Token::Punct(')')) => depth += 1,
+                    Some(Token::Punct('(')) => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            found = Some(k);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match found.and_then(|k| k.checked_sub(1)) {
+                Some(k) => j = k,
+                None => continue,
+            }
+        }
+        if let Some(Token::Ident(n)) = tokens.get(j) {
+            out.push(n.clone());
+        }
+    }
+    out
 }
 
 /// `qualifier.name` 1 件の解決。成功は「`public` で裸の名前へ置き換えてよい」を意味する。
@@ -392,6 +443,22 @@ mod tests {
             let e = rewrite_relation_names(&mut t, Some(&probe)).expect_err(sql);
             assert_eq!(e.wire_code(), code, "{sql}");
         }
+    }
+
+    #[test]
+    fn public_relation_with_same_name_cte_is_rejected() {
+        for sql in [
+            "WITH t AS (SELECT id FROM u) SELECT id FROM public.t LIMIT 10",
+            "WITH t(id) AS (SELECT id FROM u) SELECT id FROM public.t",
+            "WITH x AS (SELECT 1), T AS MATERIALIZED (SELECT 2) SELECT * FROM public.t",
+        ] {
+            assert_eq!(rewrite(sql).expect_err(sql).wire_code(), "0A000", "{sql}");
+        }
+        // 別名の CTE とは衝突しない。
+        same(
+            "WITH c AS (SELECT id FROM public.t) SELECT id FROM c",
+            "WITH c AS (SELECT id FROM t) SELECT id FROM c",
+        );
     }
 
     #[test]

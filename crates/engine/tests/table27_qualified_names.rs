@@ -522,3 +522,40 @@ fn create_temp_table_allows_public_qualified_reference_side() {
     );
     assert_eq!(plain, qualified);
 }
+
+#[test]
+fn unparameterized_public_drop_via_dummy_parsed_is_rejected_after_temp_table_created() {
+    let (core, _g) = new_core("t27-qualified-temp-dummy");
+    let mut s = ddl_session();
+    ok(&core, &mut s, &format!("CREATE TABLE t {COLUMNS}"));
+    // wire-server の `parsed_if_unparameterized` 経路（Bind を経ず複製して実行）を再現する。
+    let prepared = core
+        .parse_sql_prepared_with_declared_in_session(&s, "DROP TABLE public.t", &[])
+        .expect("prepare");
+    let parsed = prepared
+        .parsed_if_unparameterized()
+        .expect("unparameterized")
+        .clone();
+    ok(&core, &mut s, &format!("CREATE TEMP TABLE t {COLUMNS}"));
+    let e = core
+        .execute_parsed_in_session(&ctx(TENANT), &mut s, &parsed)
+        .map(|_| ())
+        .expect_err("execute must reject");
+    assert_eq!(e.wire_code(), "0A000");
+    assert_eq!(count(&core, &mut s, "t"), "Integer(0)");
+}
+
+#[test]
+fn public_qualified_relation_is_not_shadowed_by_same_name_cte() {
+    let (core, _g) = new_core("t27-qualified-cte");
+    let mut s = ddl_session();
+    ok(&core, &mut s, &format!("CREATE TABLE u {COLUMNS}"));
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "WITH t AS (SELECT name FROM u) SELECT name FROM public.t LIMIT 10"
+        ),
+        "0A000"
+    );
+}
