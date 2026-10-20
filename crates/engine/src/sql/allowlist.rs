@@ -9238,11 +9238,18 @@ impl<'a> Parser<'a> {
         let operation_id = self.parse_operation_id_clause()?;
         // `PARTITIONED [CHUNK n]`（Issue #1129）は `USING OPERATION_ID` 句の直後。
         let partitioned = self.parse_partitioned_clause()?;
+        // `id = <n>` 形は表の行識別方式で意味が変わる（従来方式は物理キーの単一行指定、採番方式は
+        // 通常列の述語）。構文段では決められないため、`PARTITIONED` 付きは述語形へ変換して保持し、
+        // 単一行形の拒否は表を引ける呼び出し側が [`reject_partitioned_single_row_form`] で行う
+        // （Issue #2199）。
+        let where_clause = match where_clause {
+            ParsedDeleteWhere::RowId { id_literal } if partitioned.is_some() => {
+                ParsedDeleteWhere::Predicates(id_equality_predicates(&id_literal)?)
+            }
+            other => other,
+        };
         if partitioned.is_some() {
-            reject_partitioned_combination(
-                matches!(where_clause, ParsedDeleteWhere::RowId { .. }),
-                returning.is_some(),
-            )?;
+            reject_partitioned_combination(returning.is_some())?;
         }
 
         Ok(ParsedDeleteShape {
@@ -9326,11 +9333,15 @@ impl<'a> Parser<'a> {
         let operation_id = self.parse_operation_id_clause()?;
         // `PARTITIONED [CHUNK n]`（Issue #1129）は `USING OPERATION_ID` 句の直後。
         let partitioned = self.parse_partitioned_clause()?;
+        // DELETE と同じく、`PARTITIONED` 付きの `id = <n>` 形は述語形へ変換して保持する（Issue #2199）。
+        let where_form = match where_form {
+            UpdateWhereForm::Id(id_literal) if partitioned.is_some() => {
+                UpdateWhereForm::Predicates(id_equality_predicates(&id_literal)?)
+            }
+            other => other,
+        };
         if partitioned.is_some() {
-            reject_partitioned_combination(
-                matches!(where_form, UpdateWhereForm::Id(_)),
-                returning.is_some(),
-            )?;
+            reject_partitioned_combination(returning.is_some())?;
         }
 
         Ok(ParsedUpdateShape {
@@ -17551,6 +17562,14 @@ pub(crate) fn validate_delete_statement_tokens(
     if !exists {
         return Err(SqlSurfaceError::undefined_table(table_name.clone()));
     }
+    if let DeleteStatement::Predicate(v) = &stmt {
+        reject_partitioned_single_row_form(
+            lookup,
+            &v.table_name,
+            v.partitioned(),
+            &v.where_predicates,
+        )?;
+    }
 
     Ok(stmt)
 }
@@ -17591,20 +17610,42 @@ pub(crate) fn parse_delete_statement_shape_tokens(
     })
 }
 
-/// `PARTITIONED` 修飾と併用できない形（単一行・`id` 指定形・`RETURNING`）を `42601` で
-/// 拒否する（Issue #1129）。固定文言で、入力断片を含めない。
-fn reject_partitioned_combination(
-    single_row_form: bool,
-    has_returning: bool,
-) -> Result<(), SqlSurfaceError> {
-    if single_row_form {
-        return Err(SqlSurfaceError::unsupported(
-            "PARTITIONED requires a predicate-form WHERE (single-row id form is not allowed)",
-        ));
-    }
+/// `PARTITIONED` 修飾と併用できない `RETURNING` を `42601` で拒否する（Issue #1129）。
+/// 固定文言で、入力断片を含めない。単一行・`id` 指定形の拒否は表の行識別方式に依存するため
+/// [`reject_partitioned_single_row_form`] が担う。
+fn reject_partitioned_combination(has_returning: bool) -> Result<(), SqlSurfaceError> {
     if has_returning {
         return Err(SqlSurfaceError::unsupported(
             "PARTITIONED cannot be combined with RETURNING",
+        ));
+    }
+    Ok(())
+}
+
+/// 従来方式（`id` が疑似列）の表への `PARTITIONED` 付き単一行・`id` 指定形（`WHERE id = <n>`）を
+/// `42601` で拒否する（Issue #1129・#2199）。構文段は `PARTITIONED` 付きの `id = <n>` を述語形へ
+/// 変換して保持するため、表を引ける呼び出し側（`core.rs` の DELETE／UPDATE 解析と
+/// `validate_delete_statement_tokens`・`validate_update_form_tokens`）が行識別方式を確認してから呼ぶ。
+/// 採番方式の表では `id` は通常列で複数行に一致しうるため拒否しない。固定文言で入力断片を含めない。
+pub(crate) fn reject_partitioned_single_row_form(
+    lookup: &impl TableLookup,
+    table_name: &str,
+    partitioned: Option<&crate::sql::partitioned::PartitionedClause>,
+    predicates: &[WherePredicate],
+) -> Result<(), SqlSurfaceError> {
+    if partitioned.is_none() {
+        return Ok(());
+    }
+    // `id = <数値リテラル>` の 1 述語（構文段が `peek_single_row_*_id` で単一行形と見なす形と同じ）。
+    let single_id_form = matches!(
+        predicates,
+        [WherePredicate::Expression(Expr::Binary { op: BinOp::Eq, lhs, rhs })]
+            if matches!(&**lhs, Expr::Ident(c) if c == "id") && matches!(&**rhs, Expr::Number(_))
+    );
+    // 判定不能（照会失敗）は従来方式として扱い、拒否側へ倒す（fail-closed）。
+    if single_id_form && !lookup.table_is_allocated(table_name).unwrap_or(false) {
+        return Err(SqlSurfaceError::unsupported(
+            "PARTITIONED requires a predicate-form WHERE (single-row id form is not allowed)",
         ));
     }
     Ok(())
@@ -18691,6 +18732,14 @@ pub(crate) fn validate_update_form_tokens(
     let exists = lookup.table_exists(table_name)?;
     if !exists {
         return Err(SqlSurfaceError::undefined_table(table_name.clone()));
+    }
+    if let ValidatedUpdateForm::Predicate(v) = &form {
+        reject_partitioned_single_row_form(
+            lookup,
+            &v.table_name,
+            v.partitioned(),
+            &v.where_predicates,
+        )?;
     }
 
     Ok(form)

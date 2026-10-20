@@ -20,6 +20,16 @@ use engine::storage::{Storage, Visibility};
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+/// 結果行の先頭セル（`SELECT id ...` の宣言済み `id` 列）を `u64` で返す。採番方式の表は
+/// `ResultRow::id` に内部 rowid を載せない（TABLE-23）ため、利用者向けの値はセルから読む。
+fn row_id(r: &engine::sql::exec::ResultRow) -> u64 {
+    match r.cells.first() {
+        Some(engine::sql::exec::Cell::SignedInteger(n)) => u64::try_from(*n).expect("id >= 0"),
+        Some(engine::sql::exec::Cell::Integer(n)) => *n,
+        other => panic!("unexpected id cell: {other:?}"),
+    }
+}
+
 fn ctx_of(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
         .expect("valid tenant")
@@ -97,7 +107,7 @@ fn ids(core: &EngineCore, sql: &str) -> Vec<u64> {
         .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"))
         .rows
         .iter()
-        .map(|r| r.id)
+        .map(row_id)
         .collect()
 }
 

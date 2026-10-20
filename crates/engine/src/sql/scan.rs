@@ -80,6 +80,16 @@ const MAX_SCAN_RESULT_BYTES: usize = crate::arena::MAX_ARENA_TOTAL_BYTES;
 
 /// 型不整合・実装バグの検出用（untrusted 入力起因ではないため `wire_code` は
 /// `XX000`。[`crate::sql::aggregate::accumulator_bug`] と同方針）。
+/// 結果行の `id` に詰める値を返す。採番方式の表（TABLE-23・Issue #2199）は内部 rowid を応答へ
+/// 出さないため `0` に置換する（実行に必要な物理キーは別変数で保持する）。従来方式はそのまま。
+pub(crate) fn response_row_id(schema: &crate::catalog::TableSchema, id: u64) -> u64 {
+    if schema.is_allocated() {
+        0
+    } else {
+        id
+    }
+}
+
 fn scan_bug(detail: &str) -> SqlSurfaceError {
     SqlSurfaceError::Internal {
         detail: format!("scan tier/projection mismatch: {detail}"),
@@ -1232,7 +1242,7 @@ pub(crate) fn execute_scan_with_budget(
                         max_result_bytes,
                     )?;
                     Ok(Some(ResultRow {
-                        id,
+                        id: response_row_id(schema, id),
                         score: 0.0,
                         cells,
                     }))
@@ -1336,7 +1346,7 @@ pub(crate) fn execute_scan_with_budget(
                         max_result_bytes,
                     )?;
                     Ok(Some(ResultRow {
-                        id,
+                        id: response_row_id(schema, id),
                         score: 0.0,
                         cells,
                     }))
@@ -1704,7 +1714,7 @@ pub(crate) fn execute_scan_with_budget(
                         max_result_bytes,
                     )?;
                     Ok(ResultRow {
-                        id: winner.id,
+                        id: response_row_id(schema, winner.id),
                         score: 0.0,
                         cells,
                     })

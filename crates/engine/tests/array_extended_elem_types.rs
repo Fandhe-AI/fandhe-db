@@ -59,7 +59,11 @@ fn ids(core: &EngineCore, tenant: &str, table: &str, predicate: &str) -> Vec<u64
         .unwrap_or_else(|e| panic!("{sql} failed: {e:?}"))
         .rows
         .iter()
-        .map(|r| r.id)
+        .map(|r| match r.cells.first() {
+            Some(engine::sql::exec::Cell::SignedInteger(n)) => u64::try_from(*n).expect("id >= 0"),
+            Some(engine::sql::exec::Cell::Integer(n)) => *n,
+            other => panic!("unexpected id cell: {other:?}"),
+        })
         .collect();
     v.sort_unstable();
     v

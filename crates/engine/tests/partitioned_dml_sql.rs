@@ -621,15 +621,8 @@ fn syntax_rejections() {
         // どの拒否も副作用を残さない。
         assert_eq!(count(&core, "alice"), 5, "{sql}");
     };
-    // 単一行形・RETURNING・INSERT・TRUNCATE との併用は 42601。
-    reject(
-        "DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'a' PARTITIONED",
-        "42601",
-    );
-    reject(
-        "UPDATE docs SET n = 1 WHERE id = 1 USING OPERATION_ID 'a' PARTITIONED",
-        "42601",
-    );
+    // RETURNING・INSERT・TRUNCATE との併用は 42601。宣言した通常列 `id` への `id = <n>` は述語形として
+    // 受理される（疑似列 `id` の表での単一行形の拒否は `table23_no_implicit_id.rs` が検証する）。
     reject(
         "DELETE FROM docs WHERE n > 0 RETURNING id USING OPERATION_ID 'a' PARTITIONED",
         "42601",

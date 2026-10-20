@@ -1822,7 +1822,7 @@ fn build_result(
         // 行集合が食い違った場合に静かに誤った行へウィンドウ値を付けてしまわない
         // よう `id` の一致も確認する（他テナントの可視 `Public` 行と衝突しうる
         // `id` 自体を対応付けキーにはしない。P1 レビュー指摘対応）。
-        if mat_row.id != base_row.id {
+        if crate::sql::scan::response_row_id(schema, mat_row.id) != base_row.id {
             return Err(window_bug(
                 "window scan row correlation id mismatch between materialize and base scan",
             ));

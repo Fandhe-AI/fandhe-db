@@ -978,3 +978,105 @@ fn constraints_cannot_reference_an_undeclared_id() {
         .rows
         .is_empty());
 }
+/// 採番方式の表の SELECT は、結果行の `id` に内部 rowid を載せない（TABLE-23 のポインタ）。
+/// 順序なし・ORDER BY 付きの両経路で、全行の `id` が一定（0）であることを確かめる。
+#[test]
+fn query_result_row_ids_do_not_expose_the_internal_rowid() {
+    let (core, _g) = new_core("t23-noid-rowid-hidden");
+    let alice = ctx("alice");
+    run(&core, &alice, "CREATE TABLE notes (title TEXT, n INTEGER)");
+    run(
+        &core,
+        &alice,
+        "INSERT INTO notes (title, n) VALUES ('a', 1), ('b', 2), ('c', 3)",
+    );
+    for sql in [
+        "SELECT title FROM notes LIMIT 10",
+        "SELECT title FROM notes ORDER BY n LIMIT 10",
+    ] {
+        let q = query(&core, &alice, sql);
+        assert_eq!(q.rows.len(), 3, "{sql}");
+        assert!(q.rows.iter().all(|r| r.id == 0), "{sql}: rowid exposed");
+    }
+}
+
+/// 通常列 `id` を宣言した表への `id = <n> ... PARTITIONED` は、単一行形ではなく述語形として
+/// 受理される（通常列 `id` は重複でき複数行に一致する）。
+#[test]
+fn partitioned_dml_accepts_id_equality_on_a_declared_id_column() {
+    let (core, _g) = new_core("t23-noid-partitioned-id");
+    let alice = ctx("alice");
+    run(&core, &alice, "CREATE TABLE t (id BIGINT, n INTEGER)");
+    run(
+        &core,
+        &alice,
+        "INSERT INTO t (id, n) VALUES (1, 0), (1, 0), (2, 0)",
+    );
+    run(
+        &core,
+        &alice,
+        "UPDATE t SET n = 2 WHERE id = 1 USING OPERATION_ID 'pu-id' PARTITIONED CHUNK 1",
+    );
+    run(
+        &core,
+        &alice,
+        "DELETE FROM t WHERE id = 1 USING OPERATION_ID 'pd-id' PARTITIONED CHUNK 1",
+    );
+    assert_eq!(
+        query(&core, &alice, "SELECT n FROM t LIMIT 10").rows.len(),
+        1
+    );
+}
+
+/// 従来方式の表（疑似列 `id`）では、`PARTITIONED` 付きの単一行・`id` 指定形は従来どおり `42601`。
+#[test]
+fn partitioned_single_row_id_form_is_still_rejected_on_legacy_tables() {
+    let (core, g) = new_core("t23-legacy-partitioned-id");
+    drop(core);
+    let storage = Storage::open(&g.0).expect("reopen");
+    storage
+        .create_table(&TableSchema::new(
+            "legacy",
+            vec![ColumnDef::new("n", ColumnType::BigInt, true)],
+        ))
+        .expect("create legacy table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let alice = ctx("alice");
+    assert_eq!(
+        code_of(
+            &core,
+            &alice,
+            "UPDATE legacy SET n = 2 WHERE id = 1 USING OPERATION_ID 'lp1' PARTITIONED"
+        ),
+        "42601"
+    );
+    assert_eq!(
+        code_of(
+            &core,
+            &alice,
+            "DELETE FROM legacy WHERE id = 1 USING OPERATION_ID 'lp2' PARTITIONED"
+        ),
+        "42601"
+    );
+}
+
+/// 採番表上のビューが任意型の `id` を公開しても、SELECT の `$n` は物理列の型で公告される
+/// （疑似列 `id` の整数と誤推論しない）。
+#[test]
+fn prepared_select_on_a_view_resolves_the_declared_id_column() {
+    use engine::sql::params::PreparedParamType;
+    let (core, _g) = new_core("t23-noid-prepared-view");
+    let alice = ctx("alice");
+    run(&core, &alice, "CREATE TABLE users (id TEXT, n INTEGER)");
+    run(&core, &alice, "CREATE VIEW v AS SELECT * FROM users");
+    let p = core
+        .parse_sql_prepared("SELECT n FROM v WHERE id = $1 LIMIT 10")
+        .expect("prepare");
+    match p.param_types().first() {
+        Some(PreparedParamType::Column(ColumnMeta::Scalar { name, ty })) => {
+            assert_eq!(name, "id");
+            assert_eq!(*ty, ColumnType::Text);
+        }
+        other => panic!("expected the declared TEXT id column, got {other:?}"),
+    }
+}

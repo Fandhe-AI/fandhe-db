@@ -18,6 +18,16 @@ use temp_db::{unique_db_path, CleanupGuard};
 
 const TABLE: &str = "docs";
 
+/// 結果行の先頭セル（`SELECT id ...` の宣言済み `id` 列）を `u64` で返す。採番方式の表は
+/// `ResultRow::id` に内部 rowid を載せない（TABLE-23）ため、利用者向けの値はセルから読む。
+fn row_id(r: &engine::sql::exec::ResultRow) -> u64 {
+    match r.cells.first() {
+        Some(engine::sql::exec::Cell::SignedInteger(n)) => u64::try_from(*n).expect("id >= 0"),
+        Some(engine::sql::exec::Cell::Integer(n)) => *n,
+        other => panic!("unexpected id cell: {other:?}"),
+    }
+}
+
 fn schema() -> TableSchema {
     TableSchema::new(
         TABLE,
@@ -63,7 +73,7 @@ fn select_ids_where(core: &EngineCore, ctx: &PolicyContext, predicate: &str) -> 
             &format!("SELECT id FROM {TABLE} WHERE {predicate} LIMIT 100"),
         )
         .unwrap_or_else(|e| panic!("scan with predicate={predicate:?} should succeed: {e:?}"));
-    let mut ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    let mut ids: Vec<u64> = result.rows.iter().map(row_id).collect();
     ids.sort_unstable();
     ids
 }
@@ -77,7 +87,7 @@ fn distance_ids_where(core: &EngineCore, ctx: &PolicyContext, predicate: &str) -
             ),
         )
         .unwrap_or_else(|e| panic!("distance search with predicate={predicate:?} should succeed: {e:?}"));
-    let mut ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    let mut ids: Vec<u64> = result.rows.iter().map(row_id).collect();
     ids.sort_unstable();
     ids
 }
@@ -349,12 +359,12 @@ fn sql41_quoted_bool_words_remain_usable_identifiers() {
             .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"))
             .rows
             .iter()
-            .map(|r| r.id)
+            .map(row_id)
             .collect();
         v.sort_unstable();
         v
     };
-    assert_eq!(ids("SELECT \"true\" FROM qdocs LIMIT 10"), vec![1, 2]);
+    assert_eq!(ids("SELECT id, \"true\" FROM qdocs LIMIT 10"), vec![1, 2]);
     assert_eq!(ids("SELECT id FROM qdocs WHERE \"true\" LIMIT 10"), vec![1]);
     assert_eq!(
         ids("SELECT id FROM qdocs WHERE \"false\" LIMIT 10"),
@@ -440,7 +450,7 @@ fn sql41_parenthesized_quoted_bool_word_value_expr_remains_column_ref() {
     let result = core
         .execute_sql(&ctx, sql)
         .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"));
-    let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    let ids: Vec<u64> = result.rows.iter().map(row_id).collect();
     assert_eq!(ids, vec![1]);
 }
 
@@ -476,7 +486,7 @@ fn sql41_view_roundtrip_keeps_quoted_bool_word_column_predicate() {
     let result = core
         .execute_sql(&ctx, "SELECT id FROM vv LIMIT 10")
         .expect("view select");
-    let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    let ids: Vec<u64> = result.rows.iter().map(row_id).collect();
     assert_eq!(ids, vec![1]);
 }
 
@@ -516,7 +526,7 @@ fn sql41_legacy_stored_view_body_keeps_bare_true_as_column_predicate() {
     let result = core
         .execute_sql(&ctx, "SELECT id FROM vv LIMIT 10")
         .expect("view select");
-    let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    let ids: Vec<u64> = result.rows.iter().map(row_id).collect();
     assert_eq!(ids, vec![1]);
 }
 
@@ -554,7 +564,7 @@ fn ids_of(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> Vec<u64> {
     let result = core
         .execute_sql(ctx, sql)
         .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"));
-    let mut ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    let mut ids: Vec<u64> = result.rows.iter().map(row_id).collect();
     ids.sort_unstable();
     ids
 }

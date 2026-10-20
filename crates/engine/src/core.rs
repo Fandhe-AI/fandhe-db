@@ -4471,6 +4471,12 @@ impl EngineCore {
                     other => other,
                 };
                 if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
+                    crate::sql::allowlist::reject_partitioned_single_row_form(
+                        &storage_lookup,
+                        &table_name,
+                        v.partitioned(),
+                        v.where_predicates(),
+                    )?;
                     self.check_partitioned_chunk(v.partitioned())?;
                 }
                 return Ok(ParsedSql::Delete(stmt));
@@ -4517,6 +4523,12 @@ impl EngineCore {
                     other => other,
                 };
                 if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
+                    crate::sql::allowlist::reject_partitioned_single_row_form(
+                        &storage_lookup,
+                        &table_name,
+                        v.partitioned(),
+                        v.where_predicates(),
+                    )?;
                     self.check_partitioned_chunk(v.partitioned())?;
                 }
                 return Ok(ParsedSql::Update(stmt));
@@ -4989,25 +5001,16 @@ impl EngineCore {
         // `INSERT INTO <表> ( <列> {, <列>} ) VALUES`（構文は `Parser::parse_insert` が
         // 保証する形。ここでは型の引き当てだけに使い、崩れていれば未解決として扱う）。
         let insert_target: Option<(String, Vec<String>)> = insert_target_from_tokens(tokens);
-        // INSERT／UPDATE／DELETE（対象がビューのときの公開列→基表の列の型引き。TABLE-43・
-        // Issue #1671・#1672）。
-        let is_write = matches!(
-            tokens.first(),
-            Some(Token::Ident(w))
-                if w.eq_ignore_ascii_case("INSERT")
-                    || w.eq_ignore_ascii_case("UPDATE")
-                    || w.eq_ignore_ascii_case("DELETE")
-        );
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
             let id_type = || Some(PreparedParamType::Column(ColumnMeta::Id));
             let (schema, column) = match self.storage.get_table_schema(table) {
                 Ok(schema) if column == "id" && schema.has_pseudo_id() => return id_type(),
                 Ok(schema) => (schema, column.to_string()),
-                // 表でなければ、書き込み文に限りビューの公開列を基表の列へ解決して型を引く
-                // （TABLE-43・Issue #1671・#1672）。公開名 `id` でも物理列へ解決してから疑似列かを
+                // 表でなければ、ビューの公開列を基表の列へ解決して型を引く（書き込み文・読み取り文とも。
+                // TABLE-43・Issue #1671・#1672・#2199）。公開名 `id` でも物理列へ解決してから疑似列かを
                 // 判定する（TEXT 列を `id` として公開するビューで `$n` を整数と誤推論しない）。
                 // 解決できなければ、`id` は従来どおり疑似列、他は未解決（`Text`）。
-                Err(_) if is_write => {
+                Err(_) => {
                     let resolved = self
                         .storage
                         .with_view_write_snapshot(table, |snap, _| {
@@ -5024,8 +5027,6 @@ impl EngineCore {
                         None => return None,
                     }
                 }
-                Err(_) if column == "id" => return id_type(),
-                Err(_) => return None,
             };
             if column == "id" && schema.has_pseudo_id() {
                 return id_type();

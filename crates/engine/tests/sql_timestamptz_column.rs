@@ -23,6 +23,16 @@ use engine::storage::{Storage, Visibility};
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+/// 結果行の先頭セル（`SELECT id ...` の宣言済み `id` 列）を `u64` で返す。採番方式の表は
+/// `ResultRow::id` に内部 rowid を載せない（TABLE-23）ため、利用者向けの値はセルから読む。
+fn row_id(r: &engine::sql::exec::ResultRow) -> u64 {
+    match r.cells.first() {
+        Some(engine::sql::exec::Cell::SignedInteger(n)) => u64::try_from(*n).expect("id >= 0"),
+        Some(engine::sql::exec::Cell::Integer(n)) => *n,
+        other => panic!("unexpected id cell: {other:?}"),
+    }
+}
+
 fn ctx_for(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
         .expect("valid tenant")
@@ -76,7 +86,7 @@ fn micros(core: &EngineCore, sql: &str) -> Vec<(u64, Option<i64>)> {
                 Some(Cell::Null) => None,
                 other => panic!("unexpected cell {other:?}"),
             };
-            (r.id, v)
+            (row_id(r), v)
         })
         .collect()
 }
@@ -505,7 +515,7 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
     let is_null = core
         .execute_sql(&ctx(), "SELECT id FROM t WHERE v IS NULL LIMIT 5")
         .expect("is null");
-    assert_eq!(is_null.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [2]);
+    assert_eq!(is_null.rows.iter().map(row_id).collect::<Vec<_>>(), [2]);
     assert_eq!(micros(&core, "SELECT id, v FROM t LIMIT 5").len(), 2);
 }
 
