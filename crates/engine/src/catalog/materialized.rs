@@ -965,7 +965,8 @@ pub(crate) fn read_materialized_view_in<R: ReadSource>(
     ctx: &PolicyContext,
 ) -> Result<Option<MaterializedViewEntity>> {
     if name.starts_with('#') {
-        return Ok(None);
+        // 内部キーは利用者が直接指せない。定義が無い扱い（`Ok(None)` は「未 populate」の意味）。
+        return Err(CatalogError::ViewNotFound(name.to_string()));
     }
     validate_identifier(name)?;
     let def = {

@@ -1492,3 +1492,60 @@ fn temp_table_cannot_be_created_in_an_existing_schema() {
     );
     assert_eq!(schema, public);
 }
+
+/// COPY 完了処理（`commit_copy_in`）のエラーにも内部キー（`#<id>.t`）が出ない（ADR D2）。
+/// COPY 開始後に表が削除された場合でも、利用者向けの名前だけを返す。
+#[test]
+fn copy_commit_errors_hide_internal_keys() {
+    let (core, _g) = new_core("t27-objects-copy-commit");
+    let mut s = ddl_session();
+    ok(&core, &mut s, "CREATE SCHEMA a");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE a.t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    let plan = core
+        .begin_copy(&ctx(TENANT), &s, "COPY a.t (id, name) FROM STDIN")
+        .expect("copy from");
+    let engine::core::CopyPlan::From(mut session) = plan else {
+        panic!("expected CopyPlan::From");
+    };
+    session.feed(b"1\tx\n").expect("feed");
+    ok(&core, &mut s, "DROP TABLE a.t");
+    let batch = session.finish().expect("finish");
+    let e = core
+        .commit_copy_in(&ctx(TENANT), batch)
+        .expect_err("table was dropped");
+    assert!(!e.to_string().contains('#'), "{e}");
+}
+
+/// 既存表への `CREATE TABLE IF NOT EXISTS` は意味検査（SCHEMA 依存検査）より前に no-op 成功する。
+#[test]
+fn create_if_not_exists_on_existing_table_is_noop_before_dependency_check() {
+    let (core, _g) = new_core("t27-objects-ine");
+    let mut s = ddl_session();
+    ok(&core, &mut s, "CREATE SCHEMA s");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE s.p (id BIGINT PRIMARY KEY, code TEXT UNIQUE)",
+    );
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, pc TEXT)",
+    );
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE IF NOT EXISTS c (id BIGINT PRIMARY KEY, pc TEXT REFERENCES s.p (code))",
+    );
+    // 実際に作成する場合は従来どおり拒否する。
+    let c = code(
+        &core,
+        &mut s,
+        "CREATE TABLE IF NOT EXISTS c9 (id BIGINT PRIMARY KEY, pc TEXT REFERENCES s.p (code))",
+    );
+    assert_eq!(c, "42501");
+}

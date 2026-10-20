@@ -5833,8 +5833,6 @@ impl EngineCore {
             // ため未使用のまま——`CREATE TABLE` はテナントスコープの操作ではない。
             ParsedSql::CreateTable(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
-                // ADR D7（TABLE-27・Issue #1717）: public の表は SCHEMA 配下のオブジェクトへ依存しない。
-                crate::sql::schema_dependency::check_create_table(stmt)?;
                 // TABLE-44・Issue #1683: 永続表の FOREIGN KEY がこのセッションの一時表の名前に
                 // 解決される場合は `42P16`（永続表は一時表を参照できない）。同名の永続表を
                 // 黙って参照する fail-open を避ける。
@@ -5848,6 +5846,11 @@ impl EngineCore {
                         .map_err(|_| crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "internal error".to_string(),
                         })?;
+                // ADR D7（TABLE-27・Issue #1717）: public の表は SCHEMA 配下のオブジェクトへ依存しない。
+                // 既存名への `IF NOT EXISTS` は意味検査をしない no-op 契約のため、実作成時だけ検査する。
+                if !existing_noop {
+                    crate::sql::schema_dependency::check_create_table(stmt)?;
+                }
                 if !existing_noop
                     && stmt
                         .foreign_keys
@@ -10113,11 +10116,14 @@ impl EngineCore {
         if batch.temp.is_some() {
             return Err(crate::sql::temp_catalog::temp_table_unsupported());
         }
+        // 出口で SCHEMA 配下の relation の内部キー（`#<id>.<name>`）を表示名へ戻す
+        // （COPY 開始後に別接続が表を削除した場合の `UndefinedTable` 等。ADR D2・Issue #1717）。
         self.commit_copy_in_with_target(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
             ctx,
             batch,
         )
+        .map_err(|e| self.scrub_error(ctx, e))
     }
 
     /// [`Self::commit_copy_in`] の明示トランザクション対応版（Issue #1179）。
@@ -10130,6 +10136,17 @@ impl EngineCore {
     ///   失敗時はトランザクションを `Failed` へ遷移させる（commit は `COMMIT` 文のみ）。
     /// - `Failed`: 実行せず `25P02` 相当のエラーを返す。
     pub fn commit_copy_in_txn<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        batch: crate::sql::copy::CopyInBatch,
+    ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.commit_copy_in_txn_unscrubbed(ctx, txn, batch)
+            .map_err(|e| self.scrub_error(ctx, e))
+    }
+
+    /// [`Self::commit_copy_in_txn`] の本体。出口の内部キー表示変換（`scrub_error`）だけが公開入口と異なる。
+    fn commit_copy_in_txn_unscrubbed<'e>(
         &'e self,
         ctx: &PolicyContext,
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
