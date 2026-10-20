@@ -49,3 +49,9 @@ Issue #1623（親 #1622、TABLE-38 のポインタ）。仕様本文は転記せ
 - **再送の判定**: 表名を内容ハッシュに含まない操作（INSERT・UPSERT・id 指定の UPDATE/DELETE・単表の TRUNCATE）は、新名での同内容の再送が重複（`23505`）、内容違いが `22023`。表名を含む操作（述語つき UPDATE/DELETE・分割実行・複数表の TRUNCATE）は新名での再送がハッシュ不一致で `22023`（fail-closed。二重適用は起きない）。旧名への文は `42P01`。`EngineCore::last_operation_id` は新名で改名前の最後の `operation_id` を返し、旧名では `NotFound`。
 - **中断ジョブ**: 移送後は新名で `SHOW／CANCEL PARTITIONED DML` が働く。再開はハッシュ不一致で `22023`。
 - **既知の制約**: 表名を含むハッシュの改名後の同一文再送を `23505` にすることは対象外（旧名を legacy ハッシュとして受理する案）。宣言的 UDF はセッション保持で永続化しないため追随対象なし。
+
+## Issue #2193 追記（rowid 採番状態の移送）
+
+`Storage::alter_table_rename` は、台帳・分割実行ジョブの移送と並べて `catalog::rowid_alloc::rename_table_in_txn` を呼び、
+新名側の孤児の採番状態を掃除してから旧名の採番状態を新名へ移す（同一 txn。TABLE-23）。再利用しない採番を改名で
+巻き戻さないための措置で、状態表が未作成なら何もしない。

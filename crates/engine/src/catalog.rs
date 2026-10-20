@@ -68,6 +68,9 @@ pub(crate) use dependency::{truncate_closure_in_txn, TruncateClosureError};
 pub(crate) mod materialized;
 // SEQUENCE のカタログ（TABLE-24・Issue #1688）。relation 名前空間を表・ビュー・索引・matview と
 // 共有するため、`index_name_exists_in_txn` を呼ぶ DDL は `sequence::sequence_exists_in_txn` も併記する。
+pub(crate) mod rowid_alloc;
+#[cfg(test)]
+mod rowid_gate_tests;
 pub(crate) mod sequence;
 pub(crate) use materialized::read_materialized_view_in;
 
@@ -2799,13 +2802,23 @@ const CATALOG_FORMAT_VERSION_V13: &str = "v13";
 /// 拒否する（前方互換は持たない）。
 const CATALOG_FORMAT_VERSION_V14: &str = "v14";
 
+/// カタログ v15（TABLE-23・Issue #2193）。v14 の上位集合（列行 7 フィールド・`pkname:`
+/// 行を常に持つ。ただし補完値の食い違い 0 件を許す）で、`pkname:` 行の直後に行識別方式
+/// を表す `rowmode:<mode>` 行を 1 行持つ。**行識別方式が従来方式（[`RowIdentity::LegacyId`]）
+/// 以外のスキーマだけ**がこの版で書かれ、従来方式のスキーマは従来の版（v2〜v14）の
+/// バイト列のまま（正規形の一意性。既存 DB は無変換で開ける）。`<mode>` は現状
+/// `allocated` のみで、未知の値・`legacy`（従来方式は v15 に現れない）・行の欠落は
+/// `CorruptSchema`（fail-closed。黙って従来方式へ丸めない）。v15 を知らない旧バイナリは
+/// 「未知のフォーマットバージョン」として fail-closed に拒否する。
+const CATALOG_FORMAT_VERSION_V15: &str = "v15";
+
 /// `FOREIGN KEY` を持ちうるカタログフォーマット版の一覧（TABLE-17・TASK-205・
 /// TABLE-22・TASK-233、Issue #907・#1069）。[`referencing_foreign_keys_in_txn`]
 /// が候補行の絞り込みに使う唯一の情報源。**P0**: 新しい FK 保持版を追加する際は
 /// 必ずここへ追記すること——見落とすと参照先側の書き込み検査
 /// （`constraint::enforce_referencing_rows_in_txn`）と `DROP TABLE` の依存検査
 /// （`2BP01`）の双方が fail-open になる（advisor 指摘・codex-review 指摘）。
-const FK_BEARING_FORMAT_VERSIONS: [&str; 7] = [
+const FK_BEARING_FORMAT_VERSIONS: [&str; 8] = [
     CATALOG_FORMAT_VERSION_V8,
     CATALOG_FORMAT_VERSION_V9,
     CATALOG_FORMAT_VERSION_V10,
@@ -2813,6 +2826,7 @@ const FK_BEARING_FORMAT_VERSIONS: [&str; 7] = [
     CATALOG_FORMAT_VERSION_V12,
     CATALOG_FORMAT_VERSION_V13,
     CATALOG_FORMAT_VERSION_V14,
+    CATALOG_FORMAT_VERSION_V15,
 ];
 
 /// 1 テーブルが持てる `CHECK` 制約数の上限（TABLE-16・TASK-204、Issue #906。
@@ -7093,6 +7107,43 @@ pub struct TableSchema {
     /// キャッシュ（Issue #1373・#1374）。非公開で、`TableSchema` の等価性・`Debug`
     /// には影響しない。詳細は [`MaterializedDefaultCache`]。
     bytea_defaults: MaterializedDefaultCache,
+    /// 行ストアの物理キー（rowid）と利用者の `id` 列の関係（TABLE-23・Issue #2193。
+    /// 設計記録: `docs/design/rowid-primary-key-separation.md` D3）。既定は
+    /// [`RowIdentity::LegacyId`]（既存の全表・本 Issue 時点で作成される全表）。
+    /// 従来方式以外のスキーマはカタログ v15 で永続化される。
+    row_identity: RowIdentity,
+}
+
+/// 表ごとの行識別方式（TABLE-23・Issue #2193。ADR D3）。カタログ属性として
+/// [`TableSchema`] が保持し、行ストアの物理キー（`storage::rowid::RowId`）の意味を決める。
+///
+/// 本 Issue の時点では、SQL・NoSQL・Rust API の `create_table` は常に `LegacyId` で表を作る。
+/// `Allocated` の本番作成経路は後続 sub-issue（#2197・#2200）が担い、本 Issue では
+/// 属性の永続化・採番器・未対応経路の fail-closed 拒否までを用意する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RowIdentity {
+    /// 従来方式。物理キーの `u64` が利用者の `id` 列値そのもの（rowid と `id` が恒等）。
+    #[default]
+    LegacyId,
+    /// 採番方式。物理キーの `u64` は表単位・テナント単位の採番器が払い出す非公開の rowid で、
+    /// `id` は通常の格納列として扱う。索引・検索・台帳が未対応のため現状は全 DML・読み取りを
+    /// `0A000` 相当の固定文言で拒否する（[`ROW_IDENTITY_UNSUPPORTED_MESSAGE`]）。
+    Allocated,
+}
+
+/// 行識別方式が未対応の表（[`RowIdentity::Allocated`]）への操作を拒否するときの固定文言。
+/// rowid・テナント名・表名を含めない（情報漏えい防止。security.md）。
+pub(crate) const ROW_IDENTITY_UNSUPPORTED_MESSAGE: &str = "row identity mode is not supported yet";
+
+/// [`ROW_IDENTITY_UNSUPPORTED_MESSAGE`] を載せた拒否エラー（[`CatalogError::Invalid`]）を作る。
+/// `error_format`／`tenant` の分類側が [`is_row_identity_unsupported`] で `0A000` へ写像する。
+pub(crate) fn row_identity_unsupported_error() -> CatalogError {
+    CatalogError::Invalid(ROW_IDENTITY_UNSUPPORTED_MESSAGE.to_string())
+}
+
+/// `e` が [`row_identity_unsupported_error`] 由来かを返す（`wire_code` 分類用）。
+pub(crate) fn is_row_identity_unsupported(e: &CatalogError) -> bool {
+    matches!(e, CatalogError::Invalid(m) if m == ROW_IDENTITY_UNSUPPORTED_MESSAGE)
 }
 
 /// [`MaterializedDefaultCache`] の実体化済みの値。
@@ -7267,6 +7318,7 @@ impl TableSchema {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             bytea_defaults: MaterializedDefaultCache::default(),
+            row_identity: RowIdentity::LegacyId,
         }
     }
 
@@ -7291,6 +7343,7 @@ impl TableSchema {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             bytea_defaults: MaterializedDefaultCache::default(),
+            row_identity: RowIdentity::LegacyId,
         }
     }
 
@@ -7428,6 +7481,26 @@ impl TableSchema {
     /// 行わない（[`encode_schema`] 内の [`validate_schema`] が別途通す）。
     /// [`Storage::alter_table_add_named_primary_key`]・[`decode_schema_body`]
     /// （v13 の復元）が使う。
+    pub(crate) fn with_row_identity(mut self, row_identity: RowIdentity) -> Self {
+        self.row_identity = row_identity;
+        self
+    }
+
+    /// 行識別方式（TABLE-23・Issue #2193）。既存の全表は [`RowIdentity::LegacyId`]。
+    #[cfg(test)]
+    pub(crate) fn row_identity(&self) -> RowIdentity {
+        self.row_identity
+    }
+
+    /// 行識別方式が従来方式以外の表への操作を fail-closed に拒否する共通ゲート
+    /// （索引・検索・台帳が rowid 未対応の間の安全弁。後続 sub-issue #2194〜#2197 が外す）。
+    pub(crate) fn require_legacy_row_identity(&self) -> Result<()> {
+        match self.row_identity {
+            RowIdentity::LegacyId => Ok(()),
+            RowIdentity::Allocated => Err(row_identity_unsupported_error()),
+        }
+    }
+
     pub(crate) fn with_primary_key_name(mut self, name: Option<String>) -> Self {
         let derived = primary_key_constraint_name(&self.name);
         self.primary_key_name = name.filter(|n| *n != derived);
@@ -9693,6 +9766,9 @@ fn encode_schema_impl(schema: &TableSchema, require_live: bool) -> Result<Vec<u8
         .columns
         .iter()
         .any(|c| c.fill_value != c.default_expr);
+    // v15 選択条件（TABLE-23・Issue #2193）: 行識別方式が従来方式以外（最優先）。
+    let has_row_identity = schema.row_identity != RowIdentity::LegacyId;
+    let v14_shape = has_fill_divergence || has_row_identity;
     let has_unique = !schema.unique_constraints.is_empty();
     let has_check = !schema.checks.is_empty();
     let has_fk = !schema.foreign_keys.is_empty();
@@ -9762,7 +9838,7 @@ fn encode_schema_impl(schema: &TableSchema, require_live: bool) -> Result<Vec<u8
         .primary_key_name
         .as_deref()
         .filter(|n| *n != primary_key_constraint_name(&schema.name));
-    if has_fill_divergence || has_named_fk || pk_name_explicit.is_some() {
+    if v14_shape || has_named_fk || pk_name_explicit.is_some() {
         // カタログ v12（設計 F4。TABLE-22・TASK-233、Issue #1069）: v11 の
         // 上位集合で、`uniq:`／`checks:` セクションは 0 件を許し（この枝へ来る
         // 判断材料は FK の実名のみで UNIQUE・CHECK の有無とは独立なため）、
@@ -9771,7 +9847,9 @@ fn encode_schema_impl(schema: &TableSchema, require_live: bool) -> Result<Vec<u8
         // v13（Issue #1364）は v12 と同じ本体に `pk:` 行の直後の `pkname:` 行を
         // 足しただけの上位集合で、同じ出力経路を共有する（UNIQUE・FK の名前は
         // 常に明示形で書く）。
-        out.push_str(if has_fill_divergence {
+        out.push_str(if has_row_identity {
+            CATALOG_FORMAT_VERSION_V15
+        } else if has_fill_divergence {
             CATALOG_FORMAT_VERSION_V14
         } else if pk_name_explicit.is_some() {
             CATALOG_FORMAT_VERSION_V13
@@ -9788,16 +9866,20 @@ fn encode_schema_impl(schema: &TableSchema, require_live: bool) -> Result<Vec<u8
         out.push_str(&format!("pk:{pk_field}\n"));
         if let Some(pk_name) = pk_name_explicit {
             out.push_str(&format!("pkname:{pk_name}\n"));
-        } else if has_fill_divergence {
-            // v14 は `pkname:` 行を常に書く（空＝明示名なし。`pkname` という列名の列行と
+        } else if v14_shape {
+            // v14／v15 は `pkname:` 行を常に書く（空＝明示名なし。`pkname` という列名の列行と
             // 区別できなくなるため任意行にしない）。
             out.push_str("pkname:\n");
+        }
+        if has_row_identity {
+            // v15 の `rowmode:` 行（TABLE-23）。現状の非従来方式は採番方式のみ。
+            out.push_str("rowmode:allocated\n");
         }
         for slot in schema.physical_slots() {
             match slot {
                 PhysicalSlot::Live(_, column) => {
                     let (type_name, param_field) = column.catalog_fields()?;
-                    if has_fill_divergence {
+                    if v14_shape {
                         out.push_str(&encode_column_line_v14(
                             &column.name,
                             type_name,
@@ -9820,7 +9902,7 @@ fn encode_schema_impl(schema: &TableSchema, require_live: bool) -> Result<Vec<u8
                 }
                 PhysicalSlot::Dropped(dropped) => {
                     let (type_name, param_field) = dropped.ty().catalog_fields();
-                    if has_fill_divergence {
+                    if v14_shape {
                         out.push_str(&encode_column_line_v14(
                             dropped.name(),
                             type_name,
@@ -10233,6 +10315,7 @@ fn decode_schema_body(
         V12,
         V13,
         V14,
+        V15,
     }
     let format_version = match version_line {
         CATALOG_FORMAT_VERSION_LINE => FormatVersion::V2,
@@ -10248,6 +10331,7 @@ fn decode_schema_body(
         CATALOG_FORMAT_VERSION_V12 => FormatVersion::V12,
         CATALOG_FORMAT_VERSION_V13 => FormatVersion::V13,
         CATALOG_FORMAT_VERSION_V14 => FormatVersion::V14,
+        CATALOG_FORMAT_VERSION_V15 => FormatVersion::V15,
         other => {
             return Err(CatalogError::Invalid(format!(
                 "unknown catalog format version: {other:?}"
@@ -10275,6 +10359,7 @@ fn decode_schema_body(
             | FormatVersion::V12
             | FormatVersion::V13
             | FormatVersion::V14
+            | FormatVersion::V15
     );
     // `pk:` 行を持つのは v4〜v13（v4 は非空必須、v5〜v12 は空を「主キー
     // なし」として許容する）。
@@ -10291,6 +10376,7 @@ fn decode_schema_body(
             | FormatVersion::V12
             | FormatVersion::V13
             | FormatVersion::V14
+            | FormatVersion::V15
     );
 
     let cols_line = lines.next().ok_or_else(|| {
@@ -10351,18 +10437,26 @@ fn decode_schema_body(
     };
     // v13 専用: `pk:` 行の直後の `pkname:` 行（Issue #1364）。
     // v14（Issue #1627）は `pkname:` を常に持ち、空本体を許す。
-    let primary_key_name: Option<String> =
-        if matches!(format_version, FormatVersion::V13 | FormatVersion::V14) {
-            parse_primary_key_name_line(
-                &mut lines,
-                primary_key.as_deref(),
-                Some(table_name),
-                format_version == FormatVersion::V14,
-            )
-            .map_err(CatalogError::Invalid)?
-        } else {
-            None
-        };
+    let primary_key_name: Option<String> = if matches!(
+        format_version,
+        FormatVersion::V13 | FormatVersion::V14 | FormatVersion::V15
+    ) {
+        parse_primary_key_name_line(
+            &mut lines,
+            primary_key.as_deref(),
+            Some(table_name),
+            matches!(format_version, FormatVersion::V14 | FormatVersion::V15),
+        )
+        .map_err(CatalogError::Invalid)?
+    } else {
+        None
+    };
+    // v15 専用: `pkname:` 行の直後の `rowmode:` 行（TABLE-23・Issue #2193）。
+    let row_identity = if format_version == FormatVersion::V15 {
+        parse_row_mode_line(&mut lines).map_err(CatalogError::Invalid)?
+    } else {
+        RowIdentity::LegacyId
+    };
 
     // 残り行を、宣言スロット数（slot_count。上で MAX_COLUMN_COUNT 以下と検証済み）を
     // 超えない範囲でのみ構築する。旧実装の `lines.collect()` は残り行数が
@@ -10418,7 +10512,7 @@ fn decode_schema_body(
             };
         // v14（Issue #1627）は 7 番目に読み出し時補完値 `fill` を必須で持つ。
         let fill_field =
-            if format_version == FormatVersion::V14 {
+            if matches!(format_version, FormatVersion::V14 | FormatVersion::V15) {
                 Some(fields.next().ok_or_else(|| {
                     CatalogError::Invalid(format!("malformed column line: {line:?}"))
                 })?)
@@ -10589,7 +10683,7 @@ fn decode_schema_body(
             .collect(),
         // v12（設計 F4・Issue #1069）は名前付き FK の有無のみで選ばれる形式で
         // あり UNIQUE の有無とは独立なため、0 件を許容する（`allow_empty = true`）。
-        FormatVersion::V12 | FormatVersion::V13 | FormatVersion::V14 => {
+        FormatVersion::V12 | FormatVersion::V13 | FormatVersion::V14 | FormatVersion::V15 => {
             parse_unique_section(&mut lines, true, true)
                 .map_err(CatalogError::Invalid)?
                 .into_iter()
@@ -10609,7 +10703,8 @@ fn decode_schema_body(
         | FormatVersion::V11
         | FormatVersion::V12
         | FormatVersion::V13
-        | FormatVersion::V14 => {
+        | FormatVersion::V14
+        | FormatVersion::V15 => {
             parse_check_section(&mut lines, format_version != FormatVersion::V7)
                 .map_err(CatalogError::Invalid)?
         }
@@ -10639,7 +10734,7 @@ fn decode_schema_body(
         FormatVersion::V12 => {
             parse_foreign_key_section_v12(&mut lines, false).map_err(CatalogError::Invalid)?
         }
-        FormatVersion::V13 | FormatVersion::V14 => {
+        FormatVersion::V13 | FormatVersion::V14 | FormatVersion::V15 => {
             parse_foreign_key_section_v12(&mut lines, true).map_err(CatalogError::Invalid)?
         }
         _ => Vec::new(),
@@ -10667,7 +10762,8 @@ fn decode_schema_body(
     )
     .with_checks(checks)
     .with_foreign_keys(foreign_keys)
-    .with_primary_key_name(primary_key_name);
+    .with_primary_key_name(primary_key_name)
+    .with_row_identity(row_identity);
     // v6〜v9（名前の無い UNIQUE 制約）は decode 時に既定名を導出する
     // （設計 D2・Issue #1067）。v10／v11 はすでに実名を持つため素通しする
     // （`assign_unique_constraint_names` は空名の制約にのみ作用するため
@@ -10679,6 +10775,7 @@ fn decode_schema_body(
             | FormatVersion::V12
             | FormatVersion::V13
             | FormatVersion::V14
+            | FormatVersion::V15
     ) {
         schema
     } else {
@@ -10690,7 +10787,7 @@ fn decode_schema_body(
     // 呼んでも安全だが、意図を明示するため分岐する）。
     let schema = if matches!(
         format_version,
-        FormatVersion::V12 | FormatVersion::V13 | FormatVersion::V14
+        FormatVersion::V12 | FormatVersion::V13 | FormatVersion::V14 | FormatVersion::V15
     ) {
         schema
     } else {
@@ -10713,6 +10810,22 @@ type ParsedUniqueConstraints = Vec<(Option<String>, Vec<String>)>;
 /// [`catalog_value_references_enum_type`] の両方が使い、fail-closed 判定を
 /// 1 か所に揃える（[`parse_unique_section`] と同じ理由）。
 ///
+/// カタログ v15 の `rowmode:<mode>` 行（`pkname:` 行の直後。TABLE-23・Issue #2193）を
+/// 読み取る共有パーサー。[`decode_schema_body`] と軽量パーサーが共有する。v15 は従来方式
+/// 以外の表だけが書く版のため、受理する `<mode>` は `allocated` のみ。行の欠落・接頭辞違い・
+/// 未知の値（`legacy` を含む）はすべて拒否する（黙って従来方式へ丸めない）。
+fn parse_row_mode_line<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+) -> std::result::Result<RowIdentity, String> {
+    let line = lines
+        .next()
+        .ok_or_else(|| "catalog value truncated: missing rowmode line".to_string())?;
+    match line.strip_prefix("rowmode:") {
+        Some("allocated") => Ok(RowIdentity::Allocated),
+        _ => Err("malformed rowmode line".to_string()),
+    }
+}
+
 /// v14（Issue #1627）は `allow_empty = true` で空の本体を `None`（明示名なし）として受ける。
 ///
 /// 検証項目: 行の存在・`pkname:` 接頭辞・識別子として妥当（長さ上限を含む）・
@@ -11015,6 +11128,20 @@ pub(crate) fn require_table_schema_write(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
 ) -> Result<TableSchema> {
+    // 行識別方式が従来方式以外の表への書き込みは、索引・検索・台帳が rowid 未対応の間
+    // 共通点（`tenant.rs` の全書き込みがここを通る）で fail-closed に拒否する
+    // （TABLE-23・Issue #2193。後続 #2194〜#2197 が外す）。
+    let schema = require_table_schema_write_any_identity(write_txn, table_name)?;
+    schema.require_legacy_row_identity()?;
+    Ok(schema)
+}
+
+/// [`require_table_schema_write`] から行識別方式のゲートを除いた版。行を識別子に依存せず
+/// 消すだけの `TRUNCATE` など、方式に関わらず通すべき経路専用（TABLE-23・Issue #2193）。
+pub(crate) fn require_table_schema_write_any_identity(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+) -> Result<TableSchema> {
     let catalog_table = match write_txn.open_table(CATALOG_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => {
@@ -11073,9 +11200,15 @@ fn reject_constrained_table_for_raw_write(
 
 /// read トランザクション内でカタログテーブルに `table_name` が定義済みかを確認する
 /// （TASK-146）。`get_row_from_table` / `scan_table_page` の共通前段処理。スキーマ本体は
-/// 呼び出し元が使わないため取得・デコードしない（[`require_table_schema_write`] と異なり
-/// 存在確認のみ）。判定方針は同様に fail-closed。
-fn require_table_exists_read(
+/// decode しない（[`require_table_schema_write`] と異なり存在確認のみ）。判定方針は同様に
+/// fail-closed。
+///
+/// 加えて、行識別方式が従来方式以外の表（カタログ v15。`CATALOG_FORMAT_VERSION_V15` は
+/// 従来方式以外の表だけが書く版）を `0A000` 相当の
+/// 固定文言で拒否する（TABLE-23・Issue #2193）。スキーマ全体を decode しないため、
+/// 行取得・ページ走査のホットパスへ追加コストを載せない。呼び出し元は
+/// [`Storage::get_row_from_table`]・[`Storage::scan_table_page`]。
+fn require_legacy_row_identity_read(
     read_txn: &impl crate::storage::read_source::ReadSource,
     table_name: &str,
 ) -> Result<()> {
@@ -11086,8 +11219,16 @@ fn require_table_exists_read(
         }
         Err(e) => return Err(e.into()),
     };
-    if catalog_table.get(table_name)?.is_none() {
-        return Err(CatalogError::TableNotFound(table_name.to_string()));
+    let guard = catalog_table
+        .get(table_name)?
+        .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
+    let value = guard.value();
+    let first_line_len = value
+        .iter()
+        .position(|b| *b == b'\n')
+        .unwrap_or(value.len());
+    if value.get(..first_line_len) == Some(CATALOG_FORMAT_VERSION_V15.as_bytes()) {
+        return Err(row_identity_unsupported_error());
     }
     Ok(())
 }
@@ -11493,6 +11634,8 @@ impl Storage {
                 .map_err(convert_storage_error)?;
             crate::recovery::partitioned_job::delete_table_in_txn(write_txn, name)
                 .map_err(convert_storage_error)?;
+            // rowid 採番状態（TABLE-23・Issue #2193）。残置すると同名再作成が旧状態を引き継ぐ。
+            rowid_alloc::delete_table_in_txn(write_txn, name)?;
             // 永続キー索引（Issue #1071）。残置すると参照整合性検査が fail-open になりうる。
             crate::key_index::drop_indexes_for_table_in_txn(write_txn, name)?;
             bump_table_generation_in_txn(write_txn, name)?;
@@ -12257,6 +12400,8 @@ impl Storage {
             .map_err(convert_storage_error)?;
         crate::recovery::ledger::rename_table_in_txn(&write_txn, table_name, new_table_name)
             .map_err(convert_storage_error)?;
+        // rowid 採番状態（TABLE-23・Issue #2193）も旧名から新名へ移す（再利用しないため）。
+        rowid_alloc::rename_table_in_txn(&write_txn, table_name, new_table_name)?;
         crate::recovery::partitioned_job::rename_table_in_txn(
             &write_txn,
             table_name,
@@ -14875,9 +15020,13 @@ impl Storage {
 
     /// テーブル定義を読み出す（スナップショット読み取り）。存在しない場合は
     /// `Err(CatalogError::TableNotFound)`。
+    ///
+    /// 行識別方式のゲートは掛けない（TABLE-23・Issue #2193。`DROP`／`RENAME`／`TRUNCATE` と
+    /// SQL の存在確認が採番方式の表でも通るため）。行を読む経路のゲートは
+    /// [`get_table_schema_in_txn`] と書き込みの `require_table_schema_write` が担う。
     pub fn get_table_schema(&self, table_name: &str) -> Result<TableSchema> {
         let read_txn = self.db().begin_read()?;
-        get_table_schema_in_txn(&read_txn, table_name)
+        get_table_schema_in_txn_impl(&read_txn, table_name, true)
     }
 
     /// テーブル単位の世代（[`table_generation_in_txn`]）を新規 read トランザクション
@@ -15104,7 +15253,7 @@ impl Storage {
     ) -> Result<StorageRow> {
         validate_identifier(table_name)?;
         let read_txn = self.db().begin_read()?;
-        require_table_exists_read(&read_txn, table_name)?;
+        require_legacy_row_identity_read(&read_txn, table_name)?;
         let row_table_name = user_rows_table_name(table_name);
         let row_table = match read_txn.open_table(user_rows_table_def(&row_table_name)) {
             Ok(t) => t,
@@ -15117,7 +15266,11 @@ impl Storage {
         let guard = row_table
             .get(&(tenant_id, id))?
             .ok_or(CatalogError::RowNotFound(id))?;
-        crate::storage::decode_row(id, guard.value()).map_err(convert_storage_error)
+        crate::storage::decode_row(
+            crate::storage::rowid::RowId::from_legacy_id(id),
+            guard.value(),
+        )
+        .map_err(convert_storage_error)
     }
 
     /// テーブルスコープで物理キー昇順（`(tenant_id, id)`。TABLE-12）に最大 `limit` 件を
@@ -15144,7 +15297,7 @@ impl Storage {
         let limit = limit.min(crate::storage::MAX_SCAN_PAGE_LIMIT) as usize;
 
         let read_txn = self.db().begin_read()?;
-        require_table_exists_read(&read_txn, table_name)?;
+        require_legacy_row_identity_read(&read_txn, table_name)?;
         // `limit == 0` の早期 return は存在確認より後に置く（レビュー指摘対応: 先に
         // 判定すると、存在しないテーブルへの limit=0 走査が空ページで成功してしまい、
         // 「テーブル不存在は fail-closed に `Err`」という契約を迂回できてしまう）。
@@ -15183,7 +15336,10 @@ impl Storage {
                 capped = true;
                 break;
             }
-            out.push(crate::storage::decode_row(id, raw).map_err(convert_storage_error)?);
+            out.push(
+                crate::storage::decode_row(crate::storage::rowid::RowId::from_legacy_id(id), raw)
+                    .map_err(convert_storage_error)?,
+            );
             last_key = Some((tenant_id.to_string(), id));
             bytes_used = bytes_used.saturating_add(raw.len());
         }
@@ -15296,6 +15452,10 @@ pub(crate) fn lookup_star_columns_of(schema: &TableSchema) -> Vec<String> {
 /// （呼び出し元が `Ok(false)`／`UndefinedTable` へ個別に振り分ける）。
 pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
     match e {
+        // 行識別方式が未対応の表（TABLE-23・Issue #2193）は固定文言の `0A000` に分類する。
+        CatalogError::Invalid(detail) if detail == ROW_IDENTITY_UNSUPPORTED_MESSAGE => {
+            SqlSurfaceError::FeatureNotSupported { detail }
+        }
         CatalogError::Invalid(detail) => {
             SqlSurfaceError::unsupported(format!("malformed table reference: {detail}"))
         }
@@ -15366,11 +15526,19 @@ pub(crate) fn get_table_schema_in_txn(
     read_txn: &impl crate::storage::read_source::ReadSource,
     table_name: &str,
 ) -> Result<TableSchema> {
-    get_table_schema_in_txn_impl(read_txn, table_name, true)
+    // 読み取り・検索の relation 解決点。行識別方式が従来方式以外の表は、索引・検索・台帳が
+    // rowid 未対応の間 fail-closed に拒否する（TABLE-23・Issue #2193。後続 #2194〜#2197 が外す）。
+    // `DROP`／`RENAME`／`TRUNCATE` と SQL の存在確認（`TableLookup`）は表の実在確認だけで行を
+    // 読まないため、ゲートを持たない [`Storage::get_table_schema`]・
+    // [`get_table_schema_in_txn_impl`] を使う。
+    let schema = get_table_schema_in_txn_impl(read_txn, table_name, true)?;
+    schema.require_legacy_row_identity()?;
+    Ok(schema)
 }
 
-/// [`get_table_schema_in_txn`] の本体。`require_live = false` は複数アクション `ALTER TABLE` の
-/// 中間状態（`DROP COLUMN` 直後で生存列 0 本）を読む経路専用（Issue #1633）。
+/// [`get_table_schema_in_txn`] の本体（行識別方式のゲートなし）。`require_live = false` は
+/// 複数アクション `ALTER TABLE` の中間状態（`DROP COLUMN` 直後で生存列 0 本）を読む経路専用
+/// （Issue #1633）。
 pub(crate) fn get_table_schema_in_txn_impl(
     read_txn: &impl crate::storage::read_source::ReadSource,
     table_name: &str,
@@ -15508,6 +15676,9 @@ fn catalog_value_references_enum_type_in_table(
         // v14（Issue #1627）は v13 の上位集合で、`pkname:` 行を常に持ち、列行が
         // 7 番目に `fill` を持つ（下記で `decode_schema_body` と同じ契約を検証する）。
         CATALOG_FORMAT_VERSION_V14 => (true, true),
+        // v15（TABLE-23・Issue #2193）は v14 の上位集合で、`pkname:` 行の直後に
+        // `rowmode:` 行を持つ（補完値の食い違い 0 件を許す）。
+        CATALOG_FORMAT_VERSION_V15 => (true, true),
         other => {
             return Err(CatalogError::CorruptSchema(format!(
                 "unknown catalog format version: {other:?}"
@@ -15525,6 +15696,9 @@ fn catalog_value_references_enum_type_in_table(
     let is_v12 = version_line == CATALOG_FORMAT_VERSION_V12;
     let is_v13 = version_line == CATALOG_FORMAT_VERSION_V13;
     let is_v14 = version_line == CATALOG_FORMAT_VERSION_V14;
+    let is_v15 = version_line == CATALOG_FORMAT_VERSION_V15;
+    // v14 と同じ列行・`pkname:` 行の形（v15 は v14 の上位集合）。
+    let v14_shape = is_v14 || is_v15;
     let has_pk_line = is_v4
         || is_v5
         || is_v6
@@ -15535,7 +15709,8 @@ fn catalog_value_references_enum_type_in_table(
         || is_v11
         || is_v12
         || is_v13
-        || is_v14;
+        || is_v14
+        || is_v15;
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema("catalog value truncated: missing cols line".to_string())
@@ -15601,12 +15776,15 @@ fn catalog_value_references_enum_type_in_table(
     };
     // v13 の `pkname:` 行（Issue #1364）。名前空間の衝突検査は列・制約セクションを
     // 読み終えてから行う。
-    let pk_name: Option<String> = if is_v13 || is_v14 {
-        parse_primary_key_name_line(&mut lines, pk_cols.as_deref(), table_name, is_v14)
+    let pk_name: Option<String> = if is_v13 || v14_shape {
+        parse_primary_key_name_line(&mut lines, pk_cols.as_deref(), table_name, v14_shape)
             .map_err(CatalogError::CorruptSchema)?
     } else {
         None
     };
+    if is_v15 {
+        parse_row_mode_line(&mut lines).map_err(CatalogError::CorruptSchema)?;
+    }
 
     let mut found = false;
     // v5 の「DEFAULT 0 件のカタログを拒否する」不変条件（`decode_schema_body`
@@ -15698,7 +15876,7 @@ fn catalog_value_references_enum_type_in_table(
         // fail-closed 契約: 墓標は `-` 固定、生存列は既存デコーダで検証し型タグと整合し、
         // 時刻 DEFAULT は INSERT 既定値と等しいミラー状態以外では拒否する。
         // 補完値が INSERT 既定値と食い違う列が 0 件の v14 も拒否する（正規形の一意性）。
-        if is_v14 {
+        if v14_shape {
             let fill_field = fields.next().ok_or_else(|| {
                 CatalogError::CorruptSchema(format!("malformed column line: {line:?}"))
             })?;
@@ -15777,7 +15955,7 @@ fn catalog_value_references_enum_type_in_table(
         // カタログが本関数だけ「依存なし」に丸められ、ENUM 依存判定の
         // fail-closed 判定が `validate_schema` 側と食い違う）。
         parse_unique_section(&mut lines, false, true).map_err(CatalogError::CorruptSchema)?
-    } else if is_v12 || is_v13 || is_v14 {
+    } else if is_v12 || is_v13 || v14_shape {
         // v12（設計 F4・Issue #1069）は名前付き FK の有無のみで選ばれる形式で
         // あり UNIQUE の有無とは独立なため、0 件を許容する（`allow_empty = true`）。
         // v13（Issue #1364）も主キーの明示名のみで選ばれるため同様。
@@ -15791,10 +15969,10 @@ fn catalog_value_references_enum_type_in_table(
     // られるため、`decode_schema_body` と同じ共有パーサーで構造を検証し、
     // 参照列の実在・制約名の一意性も下で検証する。
     let checks: Vec<CheckConstraint> =
-        if is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13 || is_v14 {
+        if is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13 || v14_shape {
             parse_check_section(
                 &mut lines,
-                is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13 || is_v14,
+                is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13 || v14_shape,
             )
             .map_err(CatalogError::CorruptSchema)?
         } else {
@@ -15819,7 +15997,7 @@ fn catalog_value_references_enum_type_in_table(
         parse_foreign_key_section(&mut lines, false, true).map_err(CatalogError::CorruptSchema)?
     } else if is_v12 {
         parse_foreign_key_section_v12(&mut lines, false).map_err(CatalogError::CorruptSchema)?
-    } else if is_v13 || is_v14 {
+    } else if is_v13 || v14_shape {
         parse_foreign_key_section_v12(&mut lines, true).map_err(CatalogError::CorruptSchema)?
     } else {
         Vec::new()
@@ -24095,7 +24273,90 @@ mod tests {
     #[test]
     fn v14_is_registered_as_foreign_key_bearing_version() {
         assert!(FK_BEARING_FORMAT_VERSIONS.contains(&CATALOG_FORMAT_VERSION_V14));
-        assert_eq!(FK_BEARING_FORMAT_VERSIONS.len(), 7);
+        assert!(FK_BEARING_FORMAT_VERSIONS.contains(&CATALOG_FORMAT_VERSION_V15));
+        assert_eq!(FK_BEARING_FORMAT_VERSIONS.len(), 8);
+    }
+
+    fn allocated_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("m", ColumnType::Text, true),
+                ColumnDef::new("n", ColumnType::Text, false)
+                    .with_default(ColumnDefault::Text("d".to_string())),
+            ],
+        )
+        .with_row_identity(RowIdentity::Allocated)
+    }
+
+    /// TABLE-23: 従来方式のスキーマはカタログのバイト列が従来のまま（`rowmode:` を書かない）。
+    #[test]
+    fn legacy_row_identity_keeps_catalog_bytes_unchanged() {
+        let schema = TableSchema::new("docs", vec![ColumnDef::new("m", ColumnType::Text, true)]);
+        let explicit = schema.clone().with_row_identity(RowIdentity::LegacyId);
+        let bytes = encode_schema(&schema).expect("encode");
+        assert_eq!(bytes, encode_schema(&explicit).expect("encode"));
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(!text.contains("rowmode:"), "{text}");
+        assert!(!text.starts_with("v15"), "{text}");
+        assert_eq!(schema.row_identity(), RowIdentity::LegacyId);
+    }
+
+    /// TABLE-23: 採番方式は v15 で往復し、軽量パーサーも受理する。
+    #[test]
+    fn v15_roundtrips_allocated_row_identity() {
+        let schema = allocated_schema();
+        let bytes = encode_schema(&schema).expect("encode");
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        assert!(text.starts_with("v15\n"), "{text}");
+        assert!(text.contains("\nrowmode:allocated\n"), "{text}");
+        let decoded = decode_schema_any_identity(&bytes);
+        assert_eq!(decoded.row_identity(), RowIdentity::Allocated);
+        assert_eq!(decoded, schema);
+        assert_eq!(encode_schema(&decoded).expect("re-encode"), bytes);
+        assert!(
+            !catalog_value_references_enum_type_in_table(&bytes, "mood", Some("docs"))
+                .expect("valid v15")
+        );
+    }
+
+    fn decode_schema_any_identity(bytes: &[u8]) -> TableSchema {
+        decode_schema("docs", bytes).expect("decode")
+    }
+
+    /// TABLE-23: 未知のモード・従来方式の明示・行の欠落・重複・旧版での出現は fail-closed。
+    #[test]
+    fn v15_rejects_malformed_or_misplaced_rowmode() {
+        let bytes = encode_schema(&allocated_schema()).expect("encode");
+        let text = String::from_utf8(bytes).expect("utf8");
+        let unknown = text.replace("rowmode:allocated", "rowmode:weird");
+        let legacy = text.replace("rowmode:allocated", "rowmode:legacy");
+        let missing = text.replace("rowmode:allocated\n", "");
+        let duplicated = text.replace(
+            "rowmode:allocated\n",
+            "rowmode:allocated\nrowmode:allocated\n",
+        );
+        let old_version = text.replacen("v15", "v14", 1);
+        for bad in [unknown, legacy, missing, duplicated, old_version] {
+            assert!(
+                matches!(
+                    decode_schema("docs", bad.as_bytes()),
+                    Err(CatalogError::Invalid(_)) | Err(CatalogError::CorruptSchema(_))
+                ),
+                "decode must reject: {bad:?}"
+            );
+            assert!(
+                matches!(
+                    catalog_value_references_enum_type_in_table(
+                        bad.as_bytes(),
+                        "mood",
+                        Some("docs")
+                    ),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "lightweight parser must reject: {bad:?}"
+            );
+        }
     }
 
     /// 軽量パーサーも v14 を扱い、`decode_schema_body` と同じ不変条件を敷く。

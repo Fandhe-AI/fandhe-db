@@ -253,3 +253,11 @@ drop_table_without_permission_is_rejected_with_42501_regardless_of_table_existen
   ところまで）、NoSQL `drop_table` の CASCADE（TABLE-37 (6)）。
 - **破壊的変更**: `ValidatedDropTable.behavior` の追加、`DropTablesReport.cascaded` の追加、
   `Drop{Table,View}Outcome` から `Copy` を外した、`Storage::drop_tables` の引数追加。
+
+## Issue #2193 追記（rowid 採番状態の削除）
+
+行ストアの物理キーを非公開の rowid として扱う変更（TABLE-23。[rowid-primary-key-separation.md](rowid-primary-key-separation.md)）
+で、表ごとの rowid 採番状態（`rowid_state`。キーは `(table, tenant)`）を導入した。`DROP TABLE` は
+`Storage::drop_tables` の Phase 3 で台帳・分割実行ジョブと並べて `catalog::rowid_alloc::delete_table_in_txn` を
+呼び、全テナント分の採番状態を同一 txn で削除する。同名で作り直した表が古い状態を引き継ぐ fail-open を防ぐ。
+状態表が未作成なら何もしない（表を作らない）。

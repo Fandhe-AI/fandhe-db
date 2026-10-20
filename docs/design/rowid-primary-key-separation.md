@@ -145,3 +145,43 @@ sub-issue #2200 が spec に従って確定し、運用文書化する。
 
 未決・確認事項は各 sub-issue が spec に従って確定する。管理者の承認が得られた時点で、承認済みの
 範囲を spec 側の「公開境界」記録と合わせて本書へ反映する。
+
+## 7. Issue #2193 実装記録（第 1 段: 物理キーの型と採番器）
+
+ADR §3 の D1・D2・D3 と、§4「表のライフサイクル」の項、D8 の一時表・旧 `rows` 表の項を挙動不変で実装した。
+契約の詳細は spec のポインタ（TABLE-23。関連: TABLE-12・TABLE-16・RLS-9・RLS-10）を正とし、本節は本リポの実装判断のみを記す。
+
+- **`RowId`（`storage::rowid`）**: 行ストアの redb キー `(tenant_id, u64)` の `u64` を `pub(crate)` の newtype として区別する。
+  キーの形式・表名・バイト列は不変で、既存の全表（従来方式）では rowid と `id` 列値が恒等（既存 DB は変換なしで開ける）。
+  `Display` を実装せず、`RowId::legacy_id()` の呼び出し箇所が後続 sub-issue の作業一覧になる。物理キーの組み立て・分解は
+  `row_key`／`split_row_key` に集約した（`storage.rs`・`txn.rs`・`tenant.rs`）。
+- **行識別方式（`catalog::RowIdentity`）**: `LegacyId`（既定）／`Allocated`。従来方式以外のスキーマだけカタログ新版 `v15`
+  （v14 の上位集合 + `rowmode:allocated` 行）で書く。従来方式のカタログバイト列は不変。未知値・欠落・重複・旧版での出現は
+  `CorruptSchema`（fail-closed）。本番の作成経路（SQL・NoSQL・Rust API の `create_table`）はすべて `LegacyId` で、採番方式の
+  表を作る経路は #2197／#2200 が担う。
+- **採番器（`catalog::rowid_alloc`）**: 状態表 `rowid_state` はキー `(table, tenant)`・値は最後に払い出した rowid。行の挿入と
+  同一 write txn で書くため、コミット済みの行の rowid は状態行で必ず覆われる（クラッシュ後に重複しない）。状態行が無い表の
+  初期値は行ストアの当該テナント範囲の最大キー。加算は `checked_add`、枯渇は固定文言で拒否。DROP で削除、RENAME で移送、
+  TRUNCATE は触れない。本番の払い出し呼び出し元は #2197。
+- **ゲート**: 採番方式の表は、索引・検索・台帳が rowid 未対応の間、全 DML・読み取りを固定文言（値を含まない）で拒否する
+  （書き込みは `require_table_schema_write`、読み取りは `get_table_schema_in_txn`、行取得 API は `get_row_from_table`／
+  `scan_table_page`）。`TenantWriteError`・SQL 表層は `0A000` へ写像する。`Storage::get_table_schema`（SQL の存在確認が使う）はゲートを
+  持たず、`DROP TABLE`・`RENAME TO`・`TRUNCATE` は SQL 経由でも通る（`catalog/rowid_gate_tests.rs`）。
+- **非露出の回帰テスト**: `tests/table23_rowid_storage.rs`（`ctid`／`rowid` が列不在 `42703`、EXPLAIN・応答に出ない、再オープン後の
+  `id` 不変）、`catalog/rowid_gate_tests.rs`（ゲート・ライフサイクル）。
+
+### 公開 API 棚卸し（§5 の #2193 成果物）
+
+| API | 本 PR での扱い | 後続担当 |
+| --- | --- | --- |
+| `tenant::insert_row`／`insert_rows`／`insert_typed_row`／`update_row`／`delete_row` の `id` | 従来方式の `id` 列値として不変（内部で `RowId` へ変換） | #2197 |
+| `Storage::put`／`put_batch`／`get`、`txn::WriteTxn::put`（旧 `rows` 表） | 恒久的に従来方式（rowid = 呼び出し元 `id`。Rust API 専用でカタログ外） | なし |
+| `storage::Row.id`・`catalog::StorageRow` | `id` 列値（従来方式で rowid と恒等）。core API スナップショット不変 | #2197 |
+| `Storage::get_row_from_table`・`scan_table_page`・`RowCursor (String, u64)` | 従来方式のみ受理。採番方式の表は拒否（カーソルに rowid を出さない） | #2197（不透明カーソル化の要否） |
+| `StorageError::NotFound(u64)`・`CatalogError::RowNotFound(u64)` の文面 | 従来方式では利用者 `id`。採番方式の表へは到達しない（ゲート） | #2197 |
+| `SearchHit` 等の検索結果 id | 不変 | #2195 |
+| NoSQL `where.id`・SQL `WHERE id = n`・`ON CONFLICT (id)` | 不変 | #2197／#2199 |
+| 分割実行 DML のカーソル | 不変 | #2196 |
+
+未移行モジュール（`constraint.rs`・`key_index.rs`・`column_rewrite.rs`・`sql/*`・`arena.rs`・`rls.rs`・`recovery/ledger.rs`
+等）は `user_rows` のキーの `u64` を従来どおり直接扱う。これらは担当 sub-issue（#2194〜#2196）が `RowId` へ移す。
