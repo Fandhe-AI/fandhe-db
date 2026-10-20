@@ -7475,12 +7475,8 @@ impl TableSchema {
         self
     }
 
-    /// 主キー制約の明示名（Issue #1364）を設定したコピーを返すビルダー。
-    /// 導出名 `<table>_pkey` と同じ名前は `None` へ正規化する（無名と同じ
-    /// バイト列・同じ意味に保ち、正規形を一意にする）。バリデーションは
-    /// 行わない（[`encode_schema`] 内の [`validate_schema`] が別途通す）。
-    /// [`Storage::alter_table_add_named_primary_key`]・[`decode_schema_body`]
-    /// （v13 の復元）が使う。
+    /// 行識別方式（TABLE-23・Issue #2193）を設定したコピーを返すビルダー。バリデーションは行わない。
+    /// 表作成経路と [`decode_schema_body`]（v15 の復元）が使う。
     pub(crate) fn with_row_identity(mut self, row_identity: RowIdentity) -> Self {
         self.row_identity = row_identity;
         self
@@ -7501,6 +7497,12 @@ impl TableSchema {
         }
     }
 
+    /// 主キー制約の明示名（Issue #1364）を設定したコピーを返すビルダー。
+    /// 導出名 `<table>_pkey` と同じ名前は `None` へ正規化する（無名と同じ
+    /// バイト列・同じ意味に保ち、正規形を一意にする）。バリデーションは
+    /// 行わない（[`encode_schema`] 内の [`validate_schema`] が別途通す）。
+    /// [`Storage::alter_table_add_named_primary_key`]・[`decode_schema_body`]
+    /// （v13 の復元）が使う。
     pub(crate) fn with_primary_key_name(mut self, name: Option<String>) -> Self {
         let derived = primary_key_constraint_name(&self.name);
         self.primary_key_name = name.filter(|n| *n != derived);
@@ -10805,11 +10807,6 @@ fn decode_schema_body(
 /// 書かないための共有エイリアス（clippy `type_complexity` 対応）。
 type ParsedUniqueConstraints = Vec<(Option<String>, Vec<String>)>;
 
-/// カタログ v13 の `pkname:<name>` 行（`pk:` 行の直後。Issue #1364）を構造検証
-/// しつつ読み取る共有パーサー。[`decode_schema_body`] と軽量パーサー
-/// [`catalog_value_references_enum_type`] の両方が使い、fail-closed 判定を
-/// 1 か所に揃える（[`parse_unique_section`] と同じ理由）。
-///
 /// カタログ v15 の `rowmode:<mode>` 行（`pkname:` 行の直後。TABLE-23・Issue #2193）を
 /// 読み取る共有パーサー。[`decode_schema_body`] と軽量パーサーが共有する。v15 は従来方式
 /// 以外の表だけが書く版のため、受理する `<mode>` は `allocated` のみ。行の欠落・接頭辞違い・
@@ -10826,6 +10823,11 @@ fn parse_row_mode_line<'a>(
     }
 }
 
+/// カタログ v13 の `pkname:<name>` 行（`pk:` 行の直後。Issue #1364）を構造検証
+/// しつつ読み取る共有パーサー。[`decode_schema_body`] と軽量パーサー
+/// [`catalog_value_references_enum_type`] の両方が使い、fail-closed 判定を
+/// 1 か所に揃える（[`parse_unique_section`] と同じ理由）。
+///
 /// v14（Issue #1627）は `allow_empty = true` で空の本体を `None`（明示名なし）として受ける。
 ///
 /// 検証項目: 行の存在・`pkname:` 接頭辞・識別子として妥当（長さ上限を含む）・
