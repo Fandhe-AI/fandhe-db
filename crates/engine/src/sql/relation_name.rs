@@ -201,6 +201,11 @@ pub(crate) fn rewrite_relation_names(
                         "public-qualified relation conflicts with a CTE name",
                     ));
                 }
+                if collides_with_syntax_word(&name) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "qualified relation name collides with a syntax word",
+                    ));
+                }
                 public_names.push(name.clone());
                 if let Some(slot) = tokens.get_mut(i) {
                     *slot = Token::Ident(name);
@@ -221,47 +226,159 @@ pub(crate) fn rewrite_relation_names(
     }
 }
 
-/// 文中の CTE 名（`name AS (` ／ `name (cols) AS (` ／ `AS [NOT] MATERIALIZED (` の形）を
-/// 保守的に集める。`WITH` を含まない文では空。一致しすぎても拒否側に倒れるだけ（fail-closed）。
+/// 文中の CTE 定義名を集める。`WITH [RECURSIVE] name [(cols)] AS [[NOT] MATERIALIZED] (..)
+/// [, name ..]*` の構造に沿って定義名だけを拾う（表別名・列別名・`CAST(.. AS ..)` の `AS` は
+/// 対象外）。`WITH` を含まない文では空。構造が想定外の `WITH` はそこで打ち切る（その文は後段の
+/// パーサーが拒否する）。
 fn collect_cte_names(tokens: &[Token]) -> Vec<String> {
     let mut out = Vec::new();
-    if !tokens.iter().any(|t| ident_is(Some(t), "WITH")) {
-        return out;
-    }
-    for (i, t) in tokens.iter().enumerate() {
-        if !ident_is(Some(t), "AS") {
+    for (start, t) in tokens.iter().enumerate() {
+        if !ident_is(Some(t), "WITH") {
             continue;
         }
-        let Some(mut j) = i.checked_sub(1) else {
-            continue;
-        };
-        if matches!(tokens.get(j), Some(Token::Punct(')'))) {
-            // 列名リスト `name (a, b) AS (`: 対応する `(` まで戻る。
-            let mut depth = 0usize;
-            let mut found = None;
-            for k in (0..=j).rev() {
-                match tokens.get(k) {
-                    Some(Token::Punct(')')) => depth += 1,
-                    Some(Token::Punct('(')) => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            found = Some(k);
-                            break;
-                        }
-                    }
-                    _ => {}
+        let mut j = start + 1;
+        if ident_is(tokens.get(j), "RECURSIVE") {
+            j += 1;
+        }
+        while let Some(Token::Ident(name)) = tokens.get(j) {
+            j += 1;
+            if matches!(tokens.get(j), Some(Token::Punct('('))) {
+                // 列名リスト `(a, b)` を対応する `)` の直後まで読み飛ばす。
+                match skip_group(tokens, j) {
+                    Some(next) => j = next,
+                    None => break,
                 }
             }
-            match found.and_then(|k| k.checked_sub(1)) {
-                Some(k) => j = k,
-                None => continue,
+            if !ident_is(tokens.get(j), "AS") {
+                break;
             }
-        }
-        if let Some(Token::Ident(n)) = tokens.get(j) {
-            out.push(n.clone());
+            j += 1;
+            if ident_is(tokens.get(j), "NOT") {
+                j += 1;
+            }
+            if ident_is(tokens.get(j), "MATERIALIZED") {
+                j += 1;
+            }
+            if !matches!(tokens.get(j), Some(Token::Punct('('))) {
+                break;
+            }
+            out.push(name.clone());
+            match skip_group(tokens, j) {
+                Some(next) => j = next,
+                None => break,
+            }
+            if matches!(tokens.get(j), Some(Token::Punct(','))) {
+                j += 1;
+            } else {
+                break;
+            }
         }
     }
     out
+}
+
+/// `tokens[open]` の `(` に対応する `)` の次の添字を返す（対応が無ければ `None`）。
+fn skip_group(tokens: &[Token], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for k in open..tokens.len() {
+        match tokens.get(k) {
+            Some(Token::Punct('(')) => depth += 1,
+            Some(Token::Punct(')')) => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return k.checked_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 解決後の名前を裸の `Token::Ident` に置き換えると、後段の構文解析が構文語として
+/// 再解釈しうるか（`DROP TABLE public.if EXISTS x` の `if` 等）。予約語トークンになる語、
+/// または文脈依存の構文語に一致する名前は置き換えず拒否する（fail-closed）。
+fn collides_with_syntax_word(name: &str) -> bool {
+    const SYNTAX_WORDS: &[&str] = &[
+        "IF",
+        "NOT",
+        "EXISTS",
+        "ONLY",
+        "TABLE",
+        "TEMP",
+        "TEMPORARY",
+        "GLOBAL",
+        "LOCAL",
+        "UNLOGGED",
+        "VIEW",
+        "INDEX",
+        "UNIQUE",
+        "CONCURRENTLY",
+        "RECURSIVE",
+        "LATERAL",
+        "NATURAL",
+        "INNER",
+        "LEFT",
+        "RIGHT",
+        "FULL",
+        "CROSS",
+        "OUTER",
+        "JOIN",
+        "ON",
+        "USING",
+        "SET",
+        "VALUES",
+        "DEFAULT",
+        "AS",
+        "CASCADE",
+        "RESTRICT",
+        "RESTART",
+        "CONTINUE",
+        "IDENTITY",
+        "INTO",
+        "REFERENCES",
+        "WITH",
+        "MATERIALIZED",
+        "DISTINCT",
+        "OR",
+        "REPLACE",
+        "IN",
+        "IS",
+        "NULL",
+        "LIKE",
+        "BETWEEN",
+        "FOR",
+        "SHARE",
+        "MODE",
+        "NOWAIT",
+        "DELETE",
+        "UPDATE",
+        "INSERT",
+        "TRUNCATE",
+        "DROP",
+        "ALTER",
+        "CREATE",
+        "COPY",
+        "COMMENT",
+        "LOCK",
+        "GROUP",
+        "HAVING",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "WINDOW",
+        "OFFSET",
+        "FETCH",
+        "RETURNING",
+        "CONFLICT",
+    ];
+    if SYNTAX_WORDS.iter().any(|w| name.eq_ignore_ascii_case(w)) {
+        return true;
+    }
+    !matches!(
+        crate::sql::lexer::tokenize(name).as_deref(),
+        Ok([Token::Ident(n)]) if n == name
+    )
 }
 
 /// `qualifier.name` 1 件の解決。成功は「`public` で裸の名前へ置き換えてよい」を意味する。
@@ -459,6 +576,49 @@ mod tests {
             "WITH c AS (SELECT id FROM public.t) SELECT id FROM c",
             "WITH c AS (SELECT id FROM t) SELECT id FROM c",
         );
+    }
+
+    #[test]
+    fn qualified_name_colliding_with_syntax_word_is_rejected() {
+        for sql in [
+            "DROP TABLE public.if EXISTS victim",
+            "DROP TABLE public.IF EXISTS victim",
+            "CREATE TABLE public.if NOT EXISTS victim (id TEXT)",
+            "CREATE TABLE public.if not EXISTS victim (id TEXT)",
+            "TRUNCATE public.only victim",
+            "TRUNCATE public.table victim",
+            "TRUNCATE TABLE public.only victim",
+            "SELECT * FROM public.from",
+        ] {
+            assert_eq!(rewrite(sql).expect_err(sql).wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn cte_collection_ignores_aliases_and_casts() {
+        assert_eq!(
+            collect_cte_names(
+                &tokenize(
+                    "WITH c AS (SELECT id FROM t AS x LIMIT 10) SELECT id FROM public.t LIMIT 10"
+                )
+                .expect("lex")
+            ),
+            vec!["c".to_string()]
+        );
+        assert_eq!(
+            collect_cte_names(&tokenize("WITH a(x, y) AS (SELECT CAST(q AS TEXT) FROM u), b AS NOT MATERIALIZED (SELECT 1) SELECT 1").expect("lex")),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        for sql in [
+            "WITH c AS (SELECT id FROM t AS x LIMIT 10) SELECT id FROM public.t LIMIT 10",
+            "WITH c AS (SELECT CAST(id AS TEXT) FROM u) SELECT id FROM public.id",
+            "WITH c AS (SELECT id FROM u AS t) SELECT id FROM public.t",
+        ] {
+            assert!(rewrite(sql).is_ok(), "{sql}");
+        }
+        let e = rewrite("WITH RECURSIVE x AS (SELECT 1), t AS (SELECT 2) SELECT * FROM public.t")
+            .expect_err("cte");
+        assert_eq!(e.wire_code(), "0A000");
     }
 
     #[test]
