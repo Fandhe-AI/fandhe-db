@@ -2805,6 +2805,62 @@ mod tests {
         );
     }
 
+    /// golden 固定（Issue #1692・TABLE-24 (3)・RECOVER-10・RECOVER-11）: `nextval`／`currval` の
+    /// 構文形（種別 1。[`HashColumnInput::ValuesSequence`]）を含む INSERT／バッチ INSERT／UPSERT の
+    /// ハッシュがバイト単位で不変であることを固定する。永続化済みの台帳エントリとの再送互換
+    /// （設計 D2）のため、定数は採取時の値のまま更新しない。ハッシュは採番結果を材料に含めず、
+    /// 構文形（関数名と SEQUENCE 名）だけで決まる。
+    #[test]
+    fn typed_insert_layouts_with_sequence_calls_are_golden() {
+        use crate::sql::allowlist::SequenceFunc;
+        fn to_hex(bytes: &[u8; 32]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let embedding = [1.0_f32, 0.0, 0.0];
+        let lang = Value::Text("ja".to_string());
+        let cols: [(&str, HashColumnInput<'_>); 3] = [
+            ("lang", HashColumnInput::Value(&lang)),
+            (
+                "n",
+                HashColumnInput::ValuesSequence {
+                    func: SequenceFunc::Nextval,
+                    name: "s",
+                },
+            ),
+            (
+                "m",
+                HashColumnInput::ValuesSequence {
+                    func: SequenceFunc::Currval,
+                    name: "s",
+                },
+            ),
+        ];
+        let single = for_typed_insert_expr(5, Visibility::Private, &embedding, &cols).unwrap();
+        assert_eq!(
+            to_hex(single.as_bytes()),
+            "9fc425a9b9d25d49bbba8f9bdbb4ae1569c6b88dc6e6236d75fa619350701a7e"
+        );
+        let rows: [TypedInsertExprBatchRow<'_>; 2] = [
+            (1, Visibility::Private, &embedding, &cols),
+            (2, Visibility::Private, &embedding, &cols),
+        ];
+        let batch = for_typed_insert_batch_expr(&rows).unwrap();
+        assert_eq!(
+            to_hex(batch.as_bytes()),
+            "f30f6b55e9f9a4a37ab6720e3ab8c708aa22a0c3ac33f43ad5d8fee05315295a"
+        );
+        let upsert = for_typed_upsert_expr(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .unwrap();
+        assert_eq!(
+            to_hex(upsert.as_bytes()),
+            "0ed2e58eb0daa7626499b47e6757b31e90b739ce80dd565a8d69e4f93cb7a10c"
+        );
+    }
+
     // 操作種別が違えば同じフィールド列でも異なるハッシュになる（連結曖昧性排除の
     // ピン留め）。
     #[test]

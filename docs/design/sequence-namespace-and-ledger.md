@@ -98,8 +98,9 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
     RECOVER 系ポインタ）
 - **保証範囲**: クラッシュ後の採番値に関する契約は TABLE-24 (4) と RECOVER 系ポインタを参照する
   （本書では再掲しない）。後続実装は spec の契約のみを前提とする
-- **補強 txn の要否（未確定）**: ROLLBACK 後に高水位だけを書く短い write txn を補強として発行するかは
-  #1692 で確定する（要追確認）。この未確定部分は spec の契約とは分けて扱う
+- **補強 txn の要否**: ROLLBACK 後に高水位だけを書く短い write txn を補強として発行するかは、
+  #1692 で「採用しない」と確定した（[§11.2](#112-補強-txn-の不採用)。自動運転下の判断で、人間の確認が要る）。
+  この部分は spec の契約とは分けて扱う
 - **`SELECT nextval(...)`** も write txn を必要とする文として扱い、autocommit で高水位を永続化する
 - **`CACHE` の意味**: セッションごとの事前確保（PostgreSQL と同じ。セッション終了で残りは欠番）を推奨する。
   テナント×SEQUENCE 共有アロケータの永続化刻み幅とする案もある。二方式では、複数セッションが交互に
@@ -238,7 +239,7 @@ Issue #1711 より前の定義は全テナント共有の `public` に属する�
 - ROLLBACK は永続値だけを戻し、メモリ上の現在値は戻さない。同じプロセスでは同じ値を再び払い出さない（欠番は許容。TABLE-24 (1)）。明示トランザクションは単一ライタを保持するので、commit 済みの行に入った値は必ず同じ txn が永続化した現在値で覆われる（TABLE-24 (4)）
 - `DROP SEQUENCE` は commit 成功後に全テナント分のメモリ上の現在値を捨てる
 - 保持件数（アロケータ・セッション）は上限つきで、超過は `54000`。ロックの毒化は `XX000`
-- ROLLBACK 後にクラッシュした場合の再払い出しを補強 txn で防ぐ設計と、クラッシュ注入による検証は #1692 に残す
+- ROLLBACK 後にクラッシュした場合の再払い出しを補強 txn で防ぐ設計は #1692 で不採用と確定し（[§11.2](#112-補強-txn-の不採用)）、クラッシュ注入による検証は #1692 で追加した（[§11.4](#114-crash-試験のオラクル)）
 
 ### 8.3 CACHE の扱い（D4 が #1690 に割り当てた判断）
 
@@ -320,7 +321,71 @@ CACHE は引き続き `0A000` で、内部の値は 1 固定のまま。永続�
 ### 10.3 対象外・申し送り
 
 - SELECT 位置の `nextval`／`currval`（#1690 からの申し送り）: 本 Issue では拡張していない。`SequenceFnKind` に `Nextval`／`Currval` を足せば小差分で対応できる。追記先（既存 Issue か新規起票か）はユーザー確認が要る
-- ROLLBACK の後にクラッシュした場合の `setval` の消失（PostgreSQL は即時に永続化する）。#1692 の補強 txn と同じ系統として扱う
+- ROLLBACK の後にクラッシュした場合の `setval` の消失（PostgreSQL は即時に永続化する）。補強 txn と同じ系統として扱い、#1692 で不採用と確定した（[§11.2](#112-補強-txn-の不採用)）
 - `INSERT VALUES (lastval())`・`setval` の `$n`・`NULL` 引数（PostgreSQL は strict で `NULL` を返す）・キャスト付き引数は `0A000`／`42601`
 - 修飾名（#1717）、CACHE（後続）
 - テスト: `tests/table24_sequence_setval.rs`（冒頭に PG 17 の期待値表）・`catalog::sequence::setval_tests`・`sql::allowlist::sequence_function_tests`・`sql::sequence_scope::tests`・`wire_sequence_setval.rs`
+
+## 11. Issue #1692 実装記録（採番値の operation_id 台帳）
+
+対応ビヘイビア（ポインタのみ）: TABLE-24 (3)(4)・RECOVER-1・RECOVER-10・RECOVER-11・RECOVER-12。
+
+### 11.1 着地済み範囲の確認
+
+台帳との統合の中核は #1690・#1691 で満たしており、本 Issue はコードのロジックを変えず、回帰テストと crash 試験で固定した。
+
+- 内容照合ハッシュは採番前の構文形（`HashColumnInput::ValuesSequence`、種別 1）で計算する。省略列へ適用した `DEFAULT nextval` は材料から除外する（D2）。台帳の値のレイアウトは不変（D1。新しい OpTag も版もない）
+- 採番状態は commit と同じ write txn で永続化する（`SequenceAllocator::next_value_in_txn`）。commit 済みの行に入った値は、必ず同じ txn の状態行で覆われる
+- 同じ op の再送は、台帳が `23505`（`DuplicateOperationId`）で拒否し、再実行も追加の採番もしない。再送は同じ値を再現しない（Issue タイトルの「同じ値を返す」は、受け入れ条件と TABLE-24 の改訂注記に従い「採番は 1 回だけ」で満たす）
+
+### 11.2 補強 txn の不採用
+
+ROLLBACK・文の失敗・接続断の後に、払い出し済みの採番状態だけを書く短い write txn（補強 txn）は**採用しない**。自動運転下の判断で、人間の確認が要る。
+
+- 根拠 1: TABLE-24 (4) が求める「commit と同じ txn での永続化」は既に満たしている。補強 txn は D4 が「要追確認」とした任意の強化で、本 Issue の受け入れ条件に含まれない
+- 根拠 2: txn が終わる経路は多い（`rollback`・`fail`・`release_if_expired`・暗黙 abort・`Drop`〔接続断〕・COMMIT 失敗・autocommit の文失敗）。ここへ書き込みを足すと、`Drop` 内の I/O や writer gate の再取得待ちが生じ、SEQUENCE を使わないセッションにも影響する（スコープ外の挙動変更）
+- 残る事象は 1 つだけ: rolled back した txn・失敗した文で払い出した値（`RETURNING`・`currval` で観測しうる）は、直後にクラッシュすると再起動後に再払い出しされうる。commit 済みの行どうしの二重採番は起きない。§10.3 の `setval`（ROLLBACK 後のクラッシュで消失）も同じ系統
+
+採用する場合の設計案（別 Issue で実装する。起票はユーザー承認後）:
+
+- フック点: `core.rs` の `TxnControl::Rollback` 腕と、autocommit INSERT が採番後に失敗した経路
+- 対象集合: セッションの `currval` マップ（`SessionState::sequences_handle()`。テナント込みのキー）。DROP・RESTART 済みの ID は `evict` でメモリから消えているため書かれない。書く前に `sequence_id_exists_in` でも確認する
+- 処理: `Storage::set_sequence_value` と同じ `begin_write_txn` → `SequenceAllocator::persist_current_in_txn` → `commit_boundary::commit_and_finish`。値を巻き戻さない冪等な書き込み
+- 残課題: 接続断（`Drop` 内で I/O しない）、writer gate の待機、sessionless 経路（NoSQL の `DEFAULT nextval`）で対象集合をどう取るか
+
+### 11.3 テスト行列
+
+`crates/engine/tests/table24_sequence_ledger.rs`（採番と台帳の相互作用に限る）:
+
+| 観点 | 内容 |
+| ---- | ---- |
+| 再送の拒否 | VALUES・`DEFAULT`・複数行・`RETURNING` の各形で `DuplicateOperationId`（行制約由来の `IdConflict` と variant で区別）。行数・次の値は不変で、`RETURNING` の再送は値を返さない |
+| 再起動 | 書き込み → 再オープン → 再送が拒否され、系列が続きの値で進む |
+| 明示 txn | autocommit 済みの op を `BEGIN` 内で再送すると `23505` で txn は `Failed`。`COMMIT` 済みの op を autocommit で再送しても `23505`。同じ txn 内の同一 op は `InvalidTransactionState`（`23505` ではない） |
+| 内容不一致 | SEQUENCE 名・`nextval` → `currval`・払い出し値のリテラル化・省略列の明示化は `22023`。値を消費しない |
+| DEFAULT 変更後 | 省略列の DEFAULT は材料外なので、変更後の再送は不一致にならず `23505`（D2） |
+| 省略・必須モード | 既定では台帳に記録せず、id まで同一の再送は `IdConflict` で欠番になる。必須モードは `23502` で値を消費しない |
+| NoSQL 経路 | `bind_insert` ＋ `execute_bound_insert_in_session` で、`DEFAULT nextval` の再送は `23505`、省略は新しい値 |
+| テナント境界 | 同じ op 文字列でも他テナントと衝突せず、再送が他テナントの系列を動かさない |
+
+### 11.4 crash 試験のオラクル
+
+`crates/engine/examples/crash_tool_sequence.rs` と `scripts/crash_test_sequence.sh`（`make crash-test-sequence`、CI の独立ジョブ `crash-test-sequence`）。`write` を SIGKILL し、再オープン後の `verify` で次を検査する。
+
+- 行 id が 1 起点で連続し、全行の採番値が NULL でなく 1 以上
+- **採番値が行 id の順に狭義単調増加**する（二重採番と、再起動後に commit 済みの値以下を払い出すことの両方を検出する）
+- kill 前に確認済みの行数・採番値を下回らない
+- セットの最後に `finish`: 最後の commit の再送が `DuplicateOperationId`、SEQUENCE 名を変えた同 op の文が `OperationIdContentMismatch`、続く新しい 1 行の値がちょうど `max + 1`（拒否された文が値を消費していない）
+- 負の対照 `self-check`: 重複・逆順・欠落・NULL の列と、DB へ書いた重複値をオラクルが拒否する
+
+ROLLBACK した値の再出現はオラクルにしない。`write` は数行ごとに `BEGIN` → `INSERT … nextval` → `ROLLBACK` を挟んでメモリ上の値を永続値より先行させるが、rolled back の払い出しは永続化の約束外（§11.2）で、再起動後の再払い出しは仕様どおりの事象であり失敗にしない。
+
+### 11.5 golden の追加
+
+`recovery::content_hash::tests::typed_insert_layouts_with_sequence_calls_are_golden` が、`nextval`／`currval` の構文形を含む単一行・バッチ・UPSERT のハッシュを hex で固定する。永続化済みの台帳エントリとの再送互換（D2）のため、定数は採取時の値のまま更新しない。既存の `typed_insert_and_upsert_layouts_without_volatile_defaults_are_golden` は不変。
+
+### 11.6 対象外・申し送り
+
+- 接続断（`Drop`）後のクラッシュでの再払い出し、§10.3 の `setval` の消失（§11.2）
+- NoSQL 表層の `returning`（NOSQL-22）、CACHE の受理、変更ログ・レプリカ（RECOVER-14・RECOVER-15）
+- 新しいジョブ `crash-test-sequence` の必須チェック登録はオーナー作業（実装側は ruleset を変更しない）
