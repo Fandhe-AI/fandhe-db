@@ -25,6 +25,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 static OP: AtomicU64 = AtomicU64::new(0);
@@ -59,7 +65,7 @@ fn exec(
     tenant: &str,
     sql: &str,
 ) -> Result<SqlOutcome, SqlSurfaceError> {
-    core.execute_sql_in_session(&ctx(tenant), session, sql)
+    core.execute_sql_in_session_legacy(&ctx(tenant), session, sql)
 }
 
 fn code(core: &EngineCore, session: &mut SessionState, tenant: &str, sql: &str) -> &'static str {
@@ -219,7 +225,7 @@ fn private_rows_collide_with_other_visibility_of_the_same_tenant() {
         PolicyContext::with_visibilities("alice", [Visibility::Private]).expect("valid tenant");
     let public_only =
         PolicyContext::with_visibilities("alice", [Visibility::Public]).expect("valid tenant");
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &private_only,
         &mut s,
         &format!(
@@ -230,7 +236,7 @@ fn private_rows_collide_with_other_visibility_of_the_same_tenant() {
     .expect("private row");
     // 不可視（Private）行とも衝突する（可視性で判定を狭めない）。
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &public_only,
             &mut s,
             &format!(

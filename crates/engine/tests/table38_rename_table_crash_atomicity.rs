@@ -109,7 +109,7 @@ fn child_workload(db: &Path, log: &Path) {
     ok(
         &core,
         &alice,
-        "CREATE TABLE docs (code TEXT, embedding VECTOR(2) NOT NULL)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, code TEXT, embedding VECTOR(2) NOT NULL)",
     );
     ok(&core, &alice, &insert_sql("docs", 1, ALICE_ROWS, "seed-a"));
     ok(
@@ -242,7 +242,7 @@ fn assert_rename_state(db: &Path, lines: &[String]) {
     ok(
         &core,
         &alice,
-        &format!("CREATE TABLE {missing} (code TEXT, embedding VECTOR(2) NOT NULL)"),
+        &format!("CREATE TABLE {missing} (id BIGINT PRIMARY KEY, code TEXT, embedding VECTOR(2) NOT NULL)"),
     );
     assert_eq!(count(&core, &alice, missing).expect("fresh"), 0, "{msg}");
     assert_eq!(count(&core, &bob, missing).expect("fresh bob"), 0, "{msg}");

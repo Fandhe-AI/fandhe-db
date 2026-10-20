@@ -460,7 +460,10 @@ fn catalog_level_classification_matches_err6() {
         ("CREATE INDEX idx_lang ON docs (body)", "42P07"),
         ("CREATE INDEX docs ON docs (body)", "42P07"),
         ("CREATE INDEX ja_docs ON docs (body)", "42P07"),
-        ("CREATE TABLE idx_lang (embedding VECTOR(2))", "42P07"),
+        (
+            "CREATE TABLE idx_lang (id BIGINT PRIMARY KEY, embedding VECTOR(2))",
+            "42P07",
+        ),
         ("CREATE VIEW idx_lang AS SELECT id FROM docs", "42P07"),
         // 対象の種別・存在。
         ("CREATE INDEX idx_v ON ja_docs (id)", "42809"),
@@ -648,7 +651,7 @@ fn drop_table_clears_index_declarations() {
     run(
         &core,
         &mut s,
-        "CREATE TABLE docs (embedding VECTOR(2), lang TEXT)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(2), lang TEXT)",
     )
     .expect("recreate table");
     run(&core, &mut s, "CREATE INDEX idx_lang ON docs (lang)")

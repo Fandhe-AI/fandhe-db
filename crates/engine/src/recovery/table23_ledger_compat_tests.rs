@@ -8,6 +8,7 @@
 //! テナントは 2 つ使い、他テナントの同一 `operation_id`・同一 id が判定に影響しないこと
 //! （RLS-9）も確認する。呼び出し元は `recovery.rs` の `#[cfg(test)]` 宣言のみ。
 
+use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::core::EngineCore;
 use crate::kernel::CpuScalarProvider;
 use crate::policy::PolicyContext;
@@ -47,15 +48,21 @@ fn exec_ok(core: &EngineCore, tenant: &str, sql: &str) {
 fn setup(label: &str) -> (std::path::PathBuf, CleanupGuard) {
     let path = unique_db_path(label);
     let guard = CleanupGuard(path.clone());
-    let core = open_core(&path);
-    let mut session = SessionState::default();
-    session.allow_ddl();
-    core.execute_sql_in_session(
-        &ctx("sys"),
-        &mut session,
-        "CREATE TABLE docs (tag TEXT, n BIGINT)",
-    )
-    .expect("create table");
+    // 旧バイナリが書いた台帳・ジョブ記録は従来方式（`id` 列値＝rowid の生値）の表に対するものなので、
+    // 表は Rust API（常に従来方式）で作る。SQL の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を
+    // 作るため使えない（TABLE-23・Issue #2199）。
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("tag", ColumnType::Text, true),
+                    ColumnDef::new("n", ColumnType::BigInt, true),
+                ],
+            ))
+            .expect("create table");
+    }
     (path, guard)
 }
 

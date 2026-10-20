@@ -21,6 +21,12 @@ use engine::storage::Storage;
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 fn new_core(label: &str) -> (EngineCore, std::path::PathBuf) {
@@ -58,7 +64,7 @@ fn create_table_accepts_column_level_and_table_level_unique() {
     let alice = ctx("alice");
     let mut session = granted_session();
 
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (a TEXT UNIQUE, b TEXT, c TEXT, UNIQUE (b, c))",
@@ -74,7 +80,7 @@ fn create_table_rejects_unique_on_undeclared_column() {
     let mut session = granted_session();
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (a TEXT, UNIQUE (z))",
@@ -91,7 +97,7 @@ fn create_table_rejects_unique_on_vector_column() {
     let mut session = granted_session();
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (embedding VECTOR(4) UNIQUE)",
@@ -108,7 +114,7 @@ fn insert_rejects_duplicate_single_column_and_allows_distinct_values() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     core.execute_insert_sql(
@@ -138,7 +144,7 @@ fn insert_allows_multiple_null_rows_for_unique_column() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     core.execute_insert_sql(
@@ -159,7 +165,7 @@ fn insert_composite_unique_requires_all_columns_to_match() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (b TEXT, c TEXT, UNIQUE (b, c))",
@@ -193,7 +199,7 @@ fn insert_uniqueness_is_scoped_per_tenant() {
     let alice = ctx("alice");
     let bob = ctx("bob");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     core.execute_insert_sql(
@@ -221,7 +227,7 @@ fn insert_uniqueness_includes_private_rows_not_just_visible_ones() {
         PolicyContext::with_visibilities("alice", [engine::storage::Visibility::Private])
             .expect("valid tenant");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice_all,
         &mut session,
         "CREATE TABLE docs (a TEXT UNIQUE)",
@@ -250,7 +256,7 @@ fn multi_row_insert_batch_rejects_internal_duplicate_with_no_partial_effect() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     let err = core
@@ -279,7 +285,7 @@ fn ledger_duplicate_operation_id_takes_priority_over_unique_violation() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     core.execute_insert_sql(
@@ -336,7 +342,7 @@ fn update_rejects_conflicting_value_but_allows_self_assignment() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
     core.execute_insert_sql(
         &alice,
@@ -371,7 +377,7 @@ fn upsert_do_update_rejects_conflicting_value() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
     core.execute_insert_sql(
         &alice,
@@ -415,7 +421,7 @@ fn multi_row_upsert_rejects_internal_duplicate_among_new_insert_branches() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
     // id=1・id=2 はいずれもテーブルに存在しない（新規挿入分岐）。同じ値 'z' を
     // 持つため、既存行との比較では衝突しないがバッチ内候補同士では衝突する。
@@ -446,7 +452,7 @@ fn upsert_on_conflict_unique_column_do_nothing() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (a TEXT UNIQUE, b TEXT)",
@@ -492,7 +498,7 @@ fn upsert_on_conflict_unique_column_do_update_updates_existing_row() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (a TEXT UNIQUE, b TEXT)",
@@ -536,7 +542,7 @@ fn upsert_on_conflict_composite_unique_target_order_independent() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (b TEXT, c TEXT, UNIQUE (b, c))",
@@ -575,7 +581,7 @@ fn upsert_on_conflict_unique_column_null_never_conflicts() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
     core.execute_insert_sql(
         &alice,
@@ -605,13 +611,13 @@ fn upsert_on_conflict_unique_column_conflicts_with_invisible_own_row() {
         PolicyContext::with_visibilities("alice", [engine::storage::Visibility::Public])
             .expect("valid tenant");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice_full,
         &mut session,
         "CREATE TABLE docs (a TEXT UNIQUE)",
     )
     .expect("create table");
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice_full,
         &mut SessionState::default(),
         "INSERT INTO docs (id, a) VALUES (1, 'x') USING OPERATION_ID 'op-private'",
@@ -640,7 +646,7 @@ fn upsert_on_conflict_unique_column_does_not_conflict_across_tenants() {
     let alice = ctx("alice");
     let bob = ctx("bob");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
     core.execute_insert_sql(
         &alice,
@@ -665,7 +671,7 @@ fn upsert_on_conflict_target_not_matching_any_unique_constraint_is_rejected() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (a TEXT, b TEXT UNIQUE)",
@@ -690,7 +696,7 @@ fn upsert_on_conflict_unique_column_rejects_duplicate_target_key_within_batch() 
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     let err = core
@@ -717,7 +723,7 @@ fn upsert_on_conflict_unique_column_new_insert_branch_id_conflict() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
     core.execute_insert_sql(
         &alice,
@@ -744,7 +750,7 @@ fn alter_table_add_unique_constraint_rejects_existing_duplicates_with_no_side_ef
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT)")
         .expect("create table");
     core.execute_insert_sql(
         &alice,
@@ -779,7 +785,7 @@ fn alter_table_add_unique_constraint_succeeds_when_no_duplicates_and_is_enforced
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT)")
         .expect("create table");
     core.execute_insert_sql(
         &alice,
@@ -811,7 +817,7 @@ fn alter_table_drop_column_rejects_when_column_is_used_by_a_unique_constraint() 
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (a TEXT UNIQUE, b TEXT)",
@@ -840,7 +846,7 @@ fn primary_key_and_unique_constraints_are_enforced_independently() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (code TEXT PRIMARY KEY, a TEXT UNIQUE)",
@@ -898,7 +904,7 @@ fn explicit_transaction_detects_duplicate_against_uncommitted_row_in_same_transa
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut ddl_session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut ddl_session,
         "CREATE TABLE docs (a TEXT UNIQUE)",
@@ -948,7 +954,7 @@ fn explicit_transaction_commits_distinct_values_and_sees_uncommitted_truncate() 
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut ddl_session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut ddl_session,
         "CREATE TABLE docs (a TEXT UNIQUE)",
@@ -1021,7 +1027,7 @@ fn unique_violation_response_does_not_depend_on_other_tenants_rows() {
     let alice = ctx("alice");
     let bob = ctx("bob");
     let mut session = granted_session();
-    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
         .expect("create table");
 
     // bob だけが 'secret' を保持している状態で、alice の書き込みは成功する。
@@ -1062,7 +1068,7 @@ fn add_column_preserves_existing_unique_constraint_and_column_resolution() {
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (a TEXT, b TEXT UNIQUE)",
@@ -1082,10 +1088,10 @@ fn add_column_preserves_existing_unique_constraint_and_column_resolution() {
         .expect("drop a non-constrained column");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
 
-    core.execute_sql_in_session(&alice, &mut session, "ALTER TABLE docs ADD COLUMN c TEXT")
+    core.execute_sql_in_session_legacy(&alice, &mut session, "ALTER TABLE docs ADD COLUMN c TEXT")
         .expect("add column");
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "ALTER TABLE docs ADD COLUMN d TEXT UNIQUE",

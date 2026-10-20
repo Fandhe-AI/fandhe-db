@@ -55,7 +55,7 @@ fn partitioned_delete_coexists_with_normal_writes_and_searches() {
         core.execute_sql_in_session(
             &ctx("sys"),
             &mut session,
-            "CREATE TABLE docs (tag TEXT, n BIGINT)",
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, tag TEXT, n BIGINT)",
         )
         .expect("create table");
     }

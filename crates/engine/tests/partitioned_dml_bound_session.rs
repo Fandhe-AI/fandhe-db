@@ -66,7 +66,7 @@ fn setup(label: &str, rows: &[(u64, i64, &str)]) -> (EngineCore, CleanupGuard) {
     core.execute_sql_in_session(
         &ctx("sys"),
         &mut session,
-        "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, n BIGINT, u TEXT UNIQUE)",
     )
     .expect("create table");
     seed(&core, "alice", rows);
@@ -460,7 +460,7 @@ fn bound_partitioned_dml_requires_the_operation_ledger() {
     core.execute_sql_in_session(
         &ctx("sys"),
         &mut session,
-        "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, n BIGINT, u TEXT UNIQUE)",
     )
     .expect("create table");
     ok(

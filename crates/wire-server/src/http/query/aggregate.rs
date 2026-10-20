@@ -554,7 +554,10 @@ pub fn execute(
         principal.policy_context(),
         &session,
         table,
-        |schema, udfs| bind(validated, schema, udfs).map_err(to_sql_surface_error),
+        |schema, udfs| {
+            super::gate::reject_allocated_schema(schema)?;
+            bind(validated, schema, udfs).map_err(to_sql_surface_error)
+        },
     )?;
     Ok(result)
 }
@@ -579,7 +582,10 @@ pub fn explain(
         principal.policy_context(),
         &session,
         table,
-        |schema, udfs| bind(validated, schema, udfs).map_err(to_sql_surface_error),
+        |schema, udfs| {
+            super::gate::reject_allocated_schema(schema)?;
+            bind(validated, schema, udfs).map_err(to_sql_surface_error)
+        },
     )?;
     Ok(result)
 }

@@ -47,7 +47,6 @@ fn state_table_exists(write_txn: &redb::WriteTransaction) -> Result<bool> {
 /// 戻り値は払い出した閉区間（`n == 0` は `Invalid`）。呼び出し元は行ストア
 /// （`user_rows/{table}`）のテーブルハンドルを開く**前**に呼ぶこと（同一 txn で二重オープンに
 /// なる）。枯渇は固定文言の `Invalid` で fail-closed に拒否する。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn allocate_in_txn(
     write_txn: &redb::WriteTransaction,
     tenant: &str,

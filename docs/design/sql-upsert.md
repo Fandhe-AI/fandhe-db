@@ -312,3 +312,7 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
   いずれも PostgreSQL と異なる挙動を固めないため回帰テストでは固定しない。
 - **対象外**: バッチ内の対象キー重複の `21000` 化、`ON CONFLICT ON CONSTRAINT`、対象省略の
   `DO NOTHING`、`DO UPDATE ... WHERE`、SET 右辺の式、NoSQL 表層の `upsert`。
+
+> Issue #2199 注記: 採番方式の表（SQL 表層で新しく作る表）には行キー指定の `ON CONFLICT (id)` が無く、`id` は宣言した通常の列として
+> PRIMARY KEY／UNIQUE 制約との照合（`Unique` 対象）で解決する。新規挿入行の rowid は書き込み段が払い出す。詳細は
+> [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §11。

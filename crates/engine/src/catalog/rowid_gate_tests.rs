@@ -1,10 +1,11 @@
 //! 行識別方式が採番方式（`RowIdentity::Allocated`）の表に対するゲートとライフサイクルの
-//! 単体テスト（TABLE-23・Issue #2193）。
+//! 単体テスト（TABLE-23・Issue #2193・#2199）。
 //!
-//! 採番方式の表を作る手段は crate 内部（`TableSchema::with_row_identity`）に限られるため、
+//! 採番方式の表を Rust API で作る手段は crate 内部（`TableSchema::with_row_identity`）に限られるため、
 //! 結合テスト（`tests/table23_rowid_storage.rs`）ではなく本モジュールに置く。確認すること:
-//! 全 DML・読み取りが `0A000` の固定文言で拒否されること（索引・検索・台帳が rowid 未対応の
-//! 間の fail-closed）、拒否文面に rowid・テナント名・表名を含めないこと、`DROP TABLE`・
+//! 利用者が行 id を指定する Rust API（行の取得・走査・id 指定の書き込み・検索）が `0A000` の固定文言で
+//! 拒否されること（rowid を `id` として見せない fail-closed）、拒否文面に rowid・テナント名・表名を含めない
+//! こと、SQL 表層の読み書き（暗黙の `id` を持たない表として扱う）が通ること、`DROP TABLE`・
 //! `ALTER TABLE ... RENAME TO`・`TRUNCATE` が採番状態を含めて通ること。
 
 use crate::catalog::rowid_alloc::{allocate_in_txn, ROWID_STATE_TABLE};
@@ -60,16 +61,16 @@ fn seed_state(storage: &Storage, tenant: &str) {
 }
 
 #[test]
-fn table23_allocated_table_schema_read_is_rejected_with_fixed_message() {
+fn table23_allocated_table_schema_read_is_allowed_for_sql_relation_resolution() {
     let (storage, _g) = allocated_table("rowid-gate-schema");
-    // 実在確認の `Storage::get_table_schema` は通り、行を読む relation 解決点は拒否する。
+    // SQL 表層の relation 解決点（行を読む前のスキーマ取得）は採番方式の表も通す（Issue #2199）。
     storage
         .get_table_schema("docs")
         .expect("existence check passes");
     let read_txn = storage.db().begin_read().expect("read");
-    let err = crate::catalog::get_table_schema_in_txn(&read_txn, "docs").expect_err("gated");
-    assert!(is_row_identity_unsupported(&err), "{err:?}");
-    assert_redacted(&err.to_string());
+    let schema = crate::catalog::get_table_schema_in_txn(&read_txn, "docs").expect("resolved");
+    assert!(schema.is_allocated());
+    assert!(!schema.has_pseudo_id());
 }
 
 #[test]
@@ -199,27 +200,30 @@ fn table23_sql_truncate_works_on_allocated_table() {
 }
 
 #[test]
-fn table23_sql_reads_and_writes_are_rejected_as_0a000() {
-    let (storage, _g) = allocated_table("rowid-gate-sql-0a000");
+fn table23_sql_reads_and_writes_treat_the_table_as_having_no_implicit_id() {
+    let (storage, _g) = allocated_table("rowid-gate-sql");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    // 通常の文は通る（暗黙の `id` を持たない表）。
+    for sql in [
+        "INSERT INTO docs (kind) VALUES ('x') USING OPERATION_ID 'op-a'",
+        "SELECT COUNT(*) FROM docs",
+        "SELECT kind FROM docs LIMIT 5",
+        "UPDATE docs SET kind = 'y' WHERE kind = 'x' USING OPERATION_ID 'op-b'",
+        "DELETE FROM docs WHERE kind = 'y' USING OPERATION_ID 'op-c'",
+    ] {
+        run_ddl(&core, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // 宣言の無い `id` は未定義列（`42703`）。拒否文面にテナント名・表名を含めない。
     for sql in [
         "SELECT id FROM docs ORDER BY id LIMIT 5",
-        "SELECT COUNT(*) FROM docs",
         "EXPLAIN SELECT id FROM docs ORDER BY id LIMIT 5",
-        "INSERT INTO docs (id, kind) VALUES (1, 'x') USING OPERATION_ID 'op-a'",
-        "UPDATE docs SET kind = 'y' WHERE id = 1 USING OPERATION_ID 'op-b'",
-        "DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'op-c'",
+        "INSERT INTO docs (id, kind) VALUES (1, 'x') USING OPERATION_ID 'op-d'",
+        "UPDATE docs SET kind = 'y' WHERE id = 1 USING OPERATION_ID 'op-e'",
+        "DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'op-f'",
     ] {
         let err = run_ddl(&core, sql).expect_err(sql);
-        assert!(err.starts_with("0A000|"), "{sql}: {err}");
-        assert!(
-            err.contains("row identity mode is not supported yet"),
-            "{sql}"
-        );
-        assert!(
-            !err.contains(TENANT) && !err.contains("docs"),
-            "{sql}: {err}"
-        );
+        assert!(err.starts_with("42703|"), "{sql}: {err}");
+        assert!(!err.contains(TENANT), "{sql}: {err}");
     }
 }
 
@@ -261,25 +265,52 @@ fn table23_only_v15_carries_rowmode_and_is_caught_by_read_gate() {
 }
 
 /// 採番方式の親を `id` で参照する FK は、DDL 段で `0A000` の固定文言により拒否される
-/// （`id` の値から親行を引く解決が従来方式の表でしか成立しないため。Issue #2194・TABLE-23）。
-/// 列参照 FK（親の主キー・UNIQUE を参照）は本ゲートの対象外で、このテストでは扱わない。
+/// （`id` の値から親行を引く解決が従来方式の表でしか成立しないため。親が宣言した `id` 列を持つ場合も、
+/// 永続化する参照先列名が物理キーの `id` 参照と区別できないため未対応。Issue #2194・#2199・TABLE-23）。
+/// 主キーを持たない採番方式の親への列省略 FK は PG と同じ `42830`（`InvalidForeignKey`）。
+/// 列参照 FK（`id` 以外の主キー・UNIQUE を参照）は本ゲートの対象外で、このテストでは扱わない。
 #[test]
 fn table23_id_reference_foreign_key_to_allocated_parent_is_rejected() {
-    use crate::catalog::{ForeignKeyDef, ReferentialAction};
+    use crate::catalog::{CatalogError, ForeignKeyDef, ReferentialAction};
     let (storage, _guard) = allocated_table("table23-fk-id-ref-allocated");
-    let child = TableSchema::new(
-        "kids",
-        vec![ColumnDef::new("pid", ColumnType::BigInt, true)],
-    )
-    .with_foreign_keys(vec![ForeignKeyDef::new(
-        vec!["pid".to_string()],
-        "docs".to_string(),
-        Vec::new(),
-        ReferentialAction::NoAction,
-        ReferentialAction::NoAction,
-    )]);
+    let child = |parent_columns: Vec<String>| {
+        TableSchema::new(
+            "kids",
+            vec![ColumnDef::new("pid", ColumnType::BigInt, true)],
+        )
+        .with_foreign_keys(vec![ForeignKeyDef::new(
+            vec!["pid".to_string()],
+            "docs".to_string(),
+            parent_columns,
+            ReferentialAction::NoAction,
+            ReferentialAction::NoAction,
+        )])
+    };
+    // 主キーの無い採番方式の親: 列省略は参照先を決められない。
     let err = storage
-        .create_table(&child)
+        .create_table(&child(Vec::new()))
+        .expect_err("omitted columns need a primary key on the allocated parent");
+    assert!(matches!(err, CatalogError::InvalidForeignKey(_)), "{err:?}");
+    assert_redacted(&err.to_string());
+    // 宣言した `id` 列（主キー）を持つ採番方式の親への `id` 参照は未対応の固定文言。
+    let path = crate::test_util::temp_db::unique_db_path("table23-fk-id-column-allocated");
+    let _guard2 = crate::test_util::temp_db::CleanupGuard(path.clone());
+    let storage2 = Storage::open(&path).expect("open");
+    storage2
+        .create_table(
+            &TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("id", ColumnType::BigInt, false),
+                    ColumnDef::new("kind", ColumnType::Text, false),
+                ],
+            )
+            .with_primary_key(vec!["id".to_string()])
+            .with_row_identity(RowIdentity::Allocated),
+        )
+        .expect("create allocated parent with a declared id column");
+    let err = storage2
+        .create_table(&child(vec!["id".to_string()]))
         .expect_err("id reference to an allocated parent must be rejected");
     assert!(is_row_identity_unsupported(&err), "{err:?}");
     assert_redacted(&err.to_string());
@@ -302,82 +333,49 @@ fn allocated_vector_table(label: &str) -> (Storage, crate::test_util::temp_db::C
     (storage, guard)
 }
 
-/// Issue #2195: 検索系の行参照を rowid 化した後も、採番方式の表は kNN SQL・EXPLAIN 付き kNN・
-/// Rust API の検索のいずれでも拒否され、rowid が `SearchHit.id` として露出しない
-/// （TABLE-23 の非露出・RLS-9）。拒否文面にテナント名・表名を含めない。
+/// 検索入口: SQL の kNN は採番方式の表も扱い（応答は投影した列だけで rowid を含まない）、Rust API の検索は
+/// rowid を `SearchHit.id` として露出させないため `0A000` の固定文言で拒否される（TABLE-23 の非露出・
+/// RLS-9）。拒否文面にテナント名・表名を含めない。
 #[test]
-fn table23_allocated_table_search_entrances_are_rejected() {
+fn table23_allocated_table_search_entrances_follow_the_exposure_contract() {
     use crate::core::VectorCore;
     let (storage, _g) = allocated_vector_table("rowid-gate-search");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let mut session = SessionState::default();
     for sql in [
-        "SELECT id FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 3",
-        "EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 3",
+        "SELECT embedding FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 3",
+        "EXPLAIN SELECT embedding FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 3",
     ] {
-        let err = core
-            .execute_sql_in_session(&ctx(), &mut session, sql)
-            .expect_err(sql);
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
-        let text = format!("{err} {err:?}");
-        assert!(!text.contains(TENANT) && !text.contains("docs"), "{text}");
+        core.execute_sql_in_session(&ctx(), &mut session, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
     let err = core
         .search(&ctx(), "docs", &[0.0, 0.0], 3)
         .expect_err("rust api search is gated");
     let text = format!("{err} {err:?}");
+    assert!(
+        text.contains("row identity mode is not supported yet"),
+        "{text}"
+    );
     assert!(!text.contains(TENANT) && !text.contains("docs"), "{text}");
 }
 
-/// Issue #2196: 分割実行 DML（カーソルを rowid 型へ移した後）も、採番方式の表では実行器へ
-/// 入る前に `0A000` の固定文言で拒否され、ジョブ記録・台帳エントリが一切作られない
-/// （fail-closed。TABLE-23・RECOVER-11・RECOVER-12 のポインタ）。拒否文面にテナント名・
-/// 表名・数字（rowid 候補）を含めない。
+/// 分割実行 DML は採番方式の表でも通る（Issue #2199。カーソルは rowid 型で、応答・エラーに rowid が出ない）。
 #[test]
-fn table23_allocated_table_partitioned_dml_is_rejected_without_side_effects() {
-    use crate::recovery::ledger::OP_LEDGER_TABLE;
-    use crate::recovery::partitioned_job::{PARTITIONED_JOB_ACTIVE_TABLE, PARTITIONED_JOB_TABLE};
+fn table23_allocated_table_partitioned_dml_runs() {
     let (storage, _g) = allocated_table("rowid-gate-partitioned");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
-    for sql in [
-        "UPDATE docs SET kind = 'y' WHERE id > 0 USING OPERATION_ID 'pp-a' PARTITIONED CHUNK 2",
-        "DELETE FROM docs WHERE id > 0 USING OPERATION_ID 'pp-b' PARTITIONED CHUNK 2",
-    ] {
-        let err = run_ddl(&core, sql).expect_err(sql);
-        assert!(err.starts_with("0A000|"), "{sql}: {err}");
-        assert!(
-            err.contains("row identity mode is not supported yet"),
-            "{sql}: {err}"
-        );
-        assert!(
-            !err.contains(TENANT) && !err.contains("docs"),
-            "{sql}: {err}"
-        );
+    for i in 0..5 {
+        run_ddl(
+            &core,
+            &format!("INSERT INTO docs (kind) VALUES ('k{i}') USING OPERATION_ID 'ins-{i}'"),
+        )
+        .expect("insert");
     }
-    // 拒否は台帳・ジョブ記録より前: いずれの表にもエントリが作られていない。
-    let storage = core.storage_for_test();
-    let read = storage.db().begin_read().expect("read");
-    for (name, count) in [
-        (
-            "ledger",
-            read.open_table(OP_LEDGER_TABLE)
-                .map(|t| t.len().expect("len")),
-        ),
-        (
-            "job",
-            read.open_table(PARTITIONED_JOB_TABLE)
-                .map(|t| t.len().expect("len")),
-        ),
-        (
-            "active",
-            read.open_table(PARTITIONED_JOB_ACTIVE_TABLE)
-                .map(|t| t.len().expect("len")),
-        ),
+    for sql in [
+        "UPDATE docs SET kind = 'y' WHERE kind = 'k1' USING OPERATION_ID 'pp-a' PARTITIONED CHUNK 2",
+        "DELETE FROM docs WHERE kind = 'y' USING OPERATION_ID 'pp-b' PARTITIONED CHUNK 2",
     ] {
-        match count {
-            Ok(n) => assert_eq!(n, 0, "{name} must stay empty"),
-            Err(redb::TableError::TableDoesNotExist(_)) => {}
-            Err(e) => panic!("open {name}: {e}"),
-        }
+        run_ddl(&core, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }

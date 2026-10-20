@@ -37,7 +37,7 @@ fn ok(core: &EngineCore, tenant: &str, sql: &str) {
     run(core, tenant, sql).unwrap_or_else(|e| panic!("{sql} failed: {e:?}"));
 }
 
-const CREATE: &str = "CREATE TABLE c (embedding VECTOR(2) NOT NULL, s2 SMALLINT, i4 INTEGER, \
+const CREATE: &str = "CREATE TABLE c (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, s2 SMALLINT, i4 INTEGER, \
     i8 BIGINT, r REAL, d DOUBLE PRECISION, t TEXT, v VARCHAR(10), ch CHAR(3), dt DATE, \
     tm TIME, ts TIMESTAMP, tz TIMESTAMPTZ, iv INTERVAL, j JSON, jb JSONB)";
 
@@ -273,12 +273,12 @@ fn typecast_is_rejected_where_cast_is_rejected() {
              USING OPERATION_ID 'k1'",
         ),
         (
-            "CREATE TABLE df (embedding VECTOR(2) NOT NULL, a INTEGER DEFAULT 1::integer)",
-            "CREATE TABLE df (embedding VECTOR(2) NOT NULL, a INTEGER DEFAULT CAST(1 AS integer))",
+            "CREATE TABLE df (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, a INTEGER DEFAULT 1::integer)",
+            "CREATE TABLE df (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, a INTEGER DEFAULT CAST(1 AS integer))",
         ),
         (
-            "CREATE TABLE ck (embedding VECTOR(2) NOT NULL, a INTEGER, CHECK (a::integer > 0))",
-            "CREATE TABLE ck (embedding VECTOR(2) NOT NULL, a INTEGER, \
+            "CREATE TABLE ck (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, a INTEGER, CHECK (a::integer > 0))",
+            "CREATE TABLE ck (id BIGINT PRIMARY KEY, embedding VECTOR(2) NOT NULL, a INTEGER, \
              CHECK (CAST(a AS integer) > 0))",
         ),
         (

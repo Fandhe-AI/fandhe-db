@@ -618,7 +618,7 @@ fn open_core_at_unique(path: &std::path::Path) -> EngineCore {
     core.execute_sql_in_session(
         &ctx("tenant-a"),
         &mut session,
-        "CREATE TABLE u (a TEXT COLLATE \"und-x-icu\" UNIQUE)",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, a TEXT COLLATE \"und-x-icu\" UNIQUE)",
     )
     .expect("create unique table");
     core

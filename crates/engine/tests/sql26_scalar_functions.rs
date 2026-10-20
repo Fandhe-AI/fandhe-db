@@ -324,7 +324,7 @@ fn check_constraint_using_length_enforces_at_write_time_and_treats_null_as_satis
     core.execute_sql_in_session(
         &ctx,
         &mut session,
-        "CREATE TABLE docs (label TEXT CHECK (length(label) > 0))",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, label TEXT CHECK (length(label) > 0))",
     )
     .expect("CREATE TABLE with length(...) CHECK should succeed");
 
@@ -377,7 +377,7 @@ fn check_constraint_using_position_round_trips_through_storage_reopen() {
         core.execute_sql_in_session(
             &ctx,
             &mut session,
-            "CREATE TABLE docs (label TEXT CHECK (POSITION('a' IN label) > 0))",
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, label TEXT CHECK (POSITION('a' IN label) > 0))",
         )
         .expect("CREATE TABLE with POSITION(...) CHECK should succeed");
 

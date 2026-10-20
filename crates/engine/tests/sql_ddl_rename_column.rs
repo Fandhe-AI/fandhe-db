@@ -274,9 +274,9 @@ fn permission_denial_is_identical_regardless_of_existence() {
 /// `tree`: 自己参照 FK、`docs`: scalar 索引）。
 fn setup_constrained(core: &EngineCore, session: &mut SessionState) {
     for sql in [
-        "CREATE TABLE parents (code TEXT PRIMARY KEY, u TEXT UNIQUE, c INTEGER, free TEXT, CHECK (c > 0))",
-        "CREATE TABLE children (pcode TEXT, y TEXT, FOREIGN KEY (pcode) REFERENCES parents (code))",
-        "CREATE TABLE tree (nid TEXT PRIMARY KEY, up TEXT, FOREIGN KEY (up) REFERENCES tree (nid))",
+        "CREATE TABLE parents (id BIGINT NOT NULL UNIQUE, code TEXT PRIMARY KEY, u TEXT UNIQUE, c INTEGER, free TEXT, CHECK (c > 0))",
+        "CREATE TABLE children (id BIGINT PRIMARY KEY, pcode TEXT, y TEXT, FOREIGN KEY (pcode) REFERENCES parents (code))",
+        "CREATE TABLE tree (id BIGINT NOT NULL UNIQUE, nid TEXT PRIMARY KEY, up TEXT, FOREIGN KEY (up) REFERENCES tree (nid))",
         "CREATE INDEX idx_note ON docs (note)",
     ] {
         run(core, session, sql).expect(sql);
@@ -614,7 +614,7 @@ fn unrelated_table_view_with_same_column_name_is_untouched() {
     run(
         &core,
         &mut session,
-        "CREATE TABLE other (embedding VECTOR(2), note TEXT)",
+        "CREATE TABLE other (id BIGINT PRIMARY KEY, embedding VECTOR(2), note TEXT)",
     )
     .expect("other table");
     run(

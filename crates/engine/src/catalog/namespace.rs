@@ -741,7 +741,7 @@ mod tests {
             Box::new(CpuScalarProvider),
         );
         for sql in [
-            "CREATE TABLE t (embedding VECTOR(2), n BIGINT)",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, embedding VECTOR(2), n BIGINT)",
             "CREATE VIEW v1 AS SELECT n FROM t",
             "CREATE INDEX idx1 ON t (n)",
             "CREATE SEQUENCE seq1",

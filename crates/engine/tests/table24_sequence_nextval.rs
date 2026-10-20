@@ -27,6 +27,12 @@ use engine::storage::{Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 fn ctx(tenant: &str) -> PolicyContext {
@@ -64,7 +70,7 @@ fn run(
     session: &mut SessionState,
     sql: &str,
 ) -> Result<SqlOutcome, SqlSurfaceError> {
-    core.execute_sql_in_session(&ctx(tenant), session, sql)
+    core.execute_sql_in_session_legacy(&ctx(tenant), session, sql)
 }
 
 fn ok(core: &EngineCore, tenant: &str, session: &mut SessionState, sql: &str) -> SqlOutcome {
@@ -386,14 +392,14 @@ fn rollback_does_not_return_values_but_currval_survives() {
     }
     assert!(column_n(&core, "alice").is_empty());
     // currval は ROLLBACK 後も保持される（PostgreSQL と同じ）。
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &c,
         &mut session,
         "INSERT INTO t (id, n) VALUES (5, currval('s')) USING OPERATION_ID 'op5'",
     )
     .expect("currval after rollback");
     // 値 1 は戻らず欠番になる（次の払い出しは 2）。
-    core.execute_sql_in_session(&c, &mut session, &insert_next(2, "op2"))
+    core.execute_sql_in_session_legacy(&c, &mut session, &insert_next(2, "op2"))
         .expect("autocommit insert");
     assert_eq!(column_n(&core, "alice"), vec![2, 1]);
 }
@@ -643,11 +649,16 @@ fn temp_table_with_nextval_is_rejected_explicitly() {
             &core,
             "sys",
             &mut s,
-            "CREATE TEMP TABLE tt_def (n BIGINT DEFAULT nextval('s'))"
+            "CREATE TEMP TABLE tt_def (id BIGINT PRIMARY KEY, n BIGINT DEFAULT nextval('s'))"
         ),
         "0A000"
     );
-    ok(&core, "sys", &mut s, "CREATE TEMP TABLE tt (n BIGINT)");
+    ok(
+        &core,
+        "sys",
+        &mut s,
+        "CREATE TEMP TABLE tt (id BIGINT PRIMARY KEY, n BIGINT)",
+    );
     assert_eq!(
         code(
             &core,

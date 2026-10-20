@@ -17,6 +17,12 @@ use engine::storage::{Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 fn ctx(tenant: &str) -> PolicyContext {
@@ -42,7 +48,7 @@ fn open(label: &str) -> (std::path::PathBuf, CleanupGuard, EngineCore) {
 }
 
 fn run(core: &EngineCore, s: &mut SessionState, sql: &str) -> Result<SqlOutcome, SqlSurfaceError> {
-    core.execute_sql_in_session(&ctx("alice"), s, sql)
+    core.execute_sql_in_session_legacy(&ctx("alice"), s, sql)
 }
 
 fn code(core: &EngineCore, s: &mut SessionState, sql: &str) -> &'static str {

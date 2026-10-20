@@ -1679,7 +1679,11 @@ pub fn bind_projection(
     match projection {
         Projection::All => {
             let mut cols = Vec::with_capacity(schema.columns.len() + 1);
-            cols.push(ProjectedColumn::Id);
+            // 疑似列 `id` を先頭に置くのは従来方式の表だけ。採番方式の表（TABLE-23・Issue #2199）の
+            // `SELECT *` は宣言した列だけを返す（PG と同じ）。
+            if schema.has_pseudo_id() {
+                cols.push(ProjectedColumn::Id);
+            }
             for (index, column) in schema.columns.iter().enumerate() {
                 cols.push(ProjectedColumn::Column {
                     index,
@@ -1752,7 +1756,7 @@ fn resolve_projected_column(
             name: output_name.to_string(),
         });
     }
-    if name == "id" {
+    if name == "id" && schema.has_pseudo_id() {
         return Ok(if output_name == name {
             ProjectedColumn::Id
         } else {
@@ -2113,7 +2117,8 @@ fn numeric_column_string_leaf_as_predicates(
     // 疑似列 `id`（スキーマに実カラム `id` が無い場合のみ。実カラム優先は
     // `udf_call::bind_expr_in`・投影束縛と同じ。Issue #1431・SQL-24）は wire 型が
     // `numeric` で、束縛段が `IdRef` として数値リテラル形と同じ文法で解釈する。
-    let is_pseudo_id = column == "id" && !schema.columns.iter().any(|c| c.name == "id");
+    let is_pseudo_id =
+        column == "id" && schema.has_pseudo_id() && !schema.columns.iter().any(|c| c.name == "id");
     if !is_numeric && !is_pseudo_id {
         return Ok(None);
     }
@@ -3365,27 +3370,35 @@ fn bind_insert_row(
         }
     }
 
-    let id_pos = columns.iter().position(|c| c == "id").ok_or_else(|| {
-        SqlSurfaceError::invalid_input("INSERT column list must include the id pseudo-column")
-    })?;
-    let id_literal = values
-        .get(id_pos)
-        .ok_or_else(|| SqlSurfaceError::invalid_input("missing value for id pseudo-column"))?;
-    let id: u64 = match id_literal {
-        InsertLiteral::Number(n) => n
-            .parse()
-            .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed id value: {n}")))?,
-        InsertLiteral::String(_)
-        | InsertLiteral::Bool(_)
-        | InsertLiteral::Null
-        | InsertLiteral::CurrentTime(_)
-        | InsertLiteral::TimestampTz(_)
-        | InsertLiteral::SequenceCall { .. }
-        | InsertLiteral::Vector(_) => {
-            return Err(SqlSurfaceError::invalid_input(
-                "id pseudo-column value must be a number",
-            ))
+    // 疑似列 `id` を持つのは従来方式の表だけ（TABLE-23・Issue #2199）。採番方式の表は暗黙の `id` を
+    // 持たず、行の識別子は書き込み段（`tenant`）が同じ write txn 内で払い出す。`BoundInsert.id` は
+    // その表では使われない固定値 0（内容照合ハッシュの材料にも固定値 0 を使い、再送判定を決定的にする）。
+    let has_pseudo_id = schema.has_pseudo_id();
+    let id: u64 = if has_pseudo_id {
+        let id_pos = columns.iter().position(|c| c == "id").ok_or_else(|| {
+            SqlSurfaceError::invalid_input("INSERT column list must include the id pseudo-column")
+        })?;
+        let id_literal = values
+            .get(id_pos)
+            .ok_or_else(|| SqlSurfaceError::invalid_input("missing value for id pseudo-column"))?;
+        match id_literal {
+            InsertLiteral::Number(n) => n
+                .parse()
+                .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed id value: {n}")))?,
+            InsertLiteral::String(_)
+            | InsertLiteral::Bool(_)
+            | InsertLiteral::Null
+            | InsertLiteral::CurrentTime(_)
+            | InsertLiteral::TimestampTz(_)
+            | InsertLiteral::SequenceCall { .. }
+            | InsertLiteral::Vector(_) => {
+                return Err(SqlSurfaceError::invalid_input(
+                    "id pseudo-column value must be a number",
+                ))
+            }
         }
+    } else {
+        0
     };
 
     let mut bound_values: Vec<crate::row_codec::Value> =
@@ -3395,7 +3408,7 @@ fn bind_insert_row(
     let mut volatile_values: Vec<VolatileColumn> = Vec::new();
 
     for (name, literal) in columns.iter().zip(values.iter()) {
-        if name == "id" {
+        if has_pseudo_id && name == "id" {
             // 疑似列 `id` は行キーとして上で処理済みであり、スキーマ実列とは
             // 照合しない（既存の SELECT 側 `bind` と同様、実カラム名 `id` を
             // 持つスキーマではその実列を本 INSERT 形から指定する手段がない。
@@ -3913,7 +3926,8 @@ fn bind_set_assignments(
     let mut bound_exprs: Vec<(usize, crate::sql::set_expr::BoundSetExpr)> = Vec::new();
 
     for (name, set_value) in assignments {
-        if name == "id" || name == "tenant_id" || name == "visibility" {
+        // 疑似列 `id` は従来方式の表だけ（採番方式の表の `id` は通常の列。TABLE-23・Issue #2199）。
+        if (name == "id" && schema.has_pseudo_id()) || name == "tenant_id" || name == "visibility" {
             return Err(SqlSurfaceError::unsupported(format!(
                 "column {name:?} cannot be targeted by SET"
             )));
@@ -4845,7 +4859,8 @@ pub fn bind_insert_form(
     stmt: &ValidatedInsert,
     schema: &TableSchema,
 ) -> Result<BoundInsertForm, SqlSurfaceError> {
-    let has_id = stmt.columns.iter().any(|c| c == "id");
+    // ファイル形の判別に使う `id` は疑似列 `id` のみ（採番方式の表の宣言した `id` 列は通常の列）。
+    let has_id = schema.has_pseudo_id() && stmt.columns.iter().any(|c| c == "id");
     let has_vector_column = stmt.columns.iter().any(|c| {
         schema
             .columns
@@ -4854,7 +4869,11 @@ pub fn bind_insert_form(
     });
     let has_path = stmt.columns.iter().any(|c| c == "path");
     let has_body = stmt.columns.iter().any(|c| c == "body");
-    let is_file_form_shape = !has_id && !has_vector_column && has_path && has_body;
+    // ファイル形は疑似列 `id` を持つ従来方式の表だけが対象（TABLE-23・Issue #2199）。採番方式の表の
+    // `path`／`body` 列は通常の列で、行形の INSERT として束縛する（ファイル形の行 id 導出は従来方式の
+    // 行 id 前提のため、採番方式の表では未対応）。
+    let is_file_form_shape =
+        schema.has_pseudo_id() && !has_id && !has_vector_column && has_path && has_body;
 
     // `ON CONFLICT ...`（SQL-20・TASK-193、Issue #872）は判別規則より前に分岐
     // する（ファイル形との併用は明示的に `42601` で拒否し、行形との併用は
@@ -4925,11 +4944,15 @@ fn resolve_conflict_target(
     target: &[String],
     schema: &TableSchema,
 ) -> Result<BoundConflictTarget, SqlSurfaceError> {
-    if matches!(target, [only] if only == "id") {
-        return Ok(BoundConflictTarget::RowId);
-    }
-    if target.iter().any(|c| c == "id") {
-        return Err(SqlSurfaceError::InvalidColumnReference);
+    // `(id)` の行キー解決は疑似列 `id` を持つ従来方式の表だけ。採番方式の表の `id` は通常の列で、
+    // PRIMARY KEY／UNIQUE 制約との照合（下）で解決する（TABLE-23・Issue #2199）。
+    if schema.has_pseudo_id() {
+        if matches!(target, [only] if only == "id") {
+            return Ok(BoundConflictTarget::RowId);
+        }
+        if target.iter().any(|c| c == "id") {
+            return Err(SqlSurfaceError::InvalidColumnReference);
+        }
     }
     let target_set: std::collections::BTreeSet<&str> =
         target.iter().map(std::string::String::as_str).collect();
@@ -5020,7 +5043,9 @@ fn bind_upsert_form(
     seen_ids
         .try_reserve(rows.len())
         .map_err(|_| SqlSurfaceError::payload_too_large("failed to reserve UPSERT id set"))?;
-    for row in &rows {
+    // 採番方式の表には利用者指定の行 id が無い（`BoundInsert.id` は固定値）ため、行 id の重複検出は
+    // 従来方式の表だけ。同一文内の対象キー重複は下の `Unique` 検査が拒否する（Issue #2199）。
+    for row in rows.iter().filter(|_| schema.has_pseudo_id()) {
         if !seen_ids.insert(row.id) {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "duplicate id {} within the same UPSERT statement",
@@ -5134,7 +5159,7 @@ fn bind_upsert_assignments(
     let mut bound: Vec<(usize, BoundUpsertValue)> = Vec::with_capacity(assignments.len());
 
     for (name, value) in assignments {
-        if name == "id" || name == "tenant_id" || name == "visibility" {
+        if (name == "id" && schema.has_pseudo_id()) || name == "tenant_id" || name == "visibility" {
             return Err(SqlSurfaceError::unsupported(format!(
                 "column {name:?} cannot be targeted by SET"
             )));
@@ -5157,7 +5182,10 @@ fn bind_upsert_assignments(
 
         let bound_value = match value {
             UpsertValue::Excluded(src) => {
-                if src == "id" || src == "tenant_id" || src == "visibility" {
+                if (src == "id" && schema.has_pseudo_id())
+                    || src == "tenant_id"
+                    || src == "visibility"
+                {
                     return Err(SqlSurfaceError::unsupported(format!(
                         "column {src:?} cannot be referenced by EXCLUDED"
                     )));
@@ -6554,7 +6582,7 @@ fn resolve_aggregate_input(
                     ))),
                 };
             }
-            if name == "id" {
+            if name == "id" && schema.has_pseudo_id() {
                 return match func {
                     AggregateFunc::Count => Ok(AggregateInput::AllVisible),
                     _ => Ok(AggregateInput::IdU64),
@@ -6715,7 +6743,7 @@ fn resolve_count_distinct_input(
                     ColumnType::Uuid => Ok(AggregateInput::UuidColumn(index)),
                 };
             }
-            if name == "id" {
+            if name == "id" && schema.has_pseudo_id() {
                 return Ok(AggregateInput::IdU64);
             }
             Err(SqlSurfaceError::undefined_column(name))
@@ -7231,7 +7259,7 @@ fn bind_scalar_order_by(
             });
             continue;
         }
-        if key.column == "id" {
+        if key.column == "id" && schema.has_pseudo_id() {
             bound.push(BoundOrderKey {
                 target: BoundOrderTarget::Id,
                 kind: OrderKind::Id,
@@ -7785,7 +7813,7 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
         };
         return Ok(WindowKeyRef::Column { index, kind });
     }
-    if name == "id" {
+    if name == "id" && schema.has_pseudo_id() {
         return Ok(WindowKeyRef::Id);
     }
     Err(SqlSurfaceError::undefined_column(name))
@@ -8068,7 +8096,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         // 実在列・疑似列 `id` が同名なら列参照として解釈する。
         for key in stmt.order_by() {
             if window_aliases.contains(key.column.as_str())
-                && key.column != "id"
+                && !(key.column == "id" && schema.has_pseudo_id())
                 && !schema.columns.iter().any(|c| c.name == key.column)
             {
                 return Err(SqlSurfaceError::unsupported(
@@ -8195,7 +8223,7 @@ fn resolve_group_by_key(
             collation,
         });
     }
-    if column == "id" {
+    if column == "id" && schema.has_pseudo_id() {
         return Ok(BoundOrderKey {
             target: BoundOrderTarget::Id,
             kind: OrderKind::Id,

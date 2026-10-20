@@ -827,6 +827,11 @@ impl VectorArena {
         G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
     {
         let read_txn = storage.db().begin_read().map_err(StorageError::from)?;
+        // `Storage` を受ける入口は Rust API の検索（`SearchHit.id` に行の識別子を載せる）用で、
+        // 採番方式の表（暗黙の `id` を持たない表。TABLE-23・Issue #2199）は rowid を `id` として
+        // 露出させないため固定文言の `0A000` で拒否する。SQL 表層は `_in_txn` 版を使い、
+        // 採番方式の表も投影だけから結果行を作る（rowid は応答に出ない）。
+        catalog::get_table_schema_in_txn(&read_txn, table_name)?.require_legacy_row_identity()?;
         Self::build_filtered_with_rows_and_limits_in_txn(
             &read_txn,
             table_name,

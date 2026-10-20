@@ -9,6 +9,17 @@
 
 ### Breaking Changes
 
+- 暗黙の `id` の廃止（Issue #2199・TABLE-23）: SQL 表層の `CREATE TABLE`・`CREATE TEMP TABLE` で新しく作る表は暗黙の
+  `id` 疑似列を持たない（PG と同じ表定義）。`id` は予約名ではなくなり、`id` を通常の列として宣言でき（`tenant_id`・
+  `visibility`・`check`・`constraint` は引き続き予約）、PRIMARY KEY を持たない表・`id` 列を持たない表を作れる。
+  `INSERT` は `id` を要求せず、`SELECT *`・`RETURNING *` は宣言した列だけを返し、宣言の無い `id` は未定義列（`42703`）になる。
+  `INSERT`（`ON CONFLICT`・`COPY` を含む）の行識別子は書き込み段が払い出す（応答・エラーに出ない）。`WHERE id = <n>` は
+  新しい表では通常の述語。NoSQL 表層の `create_table`・Rust API の `create_table`・既存の全表は従来方式のまま
+  （疑似列 `id` の挙動は不変）。新しい表に対する NoSQL の行 op・Rust API の行 API／検索 API は固定文言の `0A000` で拒否する
+  （後続 Issue で対応）。新しい表の親を `id` 列で参照する FK は `0A000`、主キーの無い親への列省略 FK は `42830`。
+  公開 API は `validate_create_table_tokens_with_implicit_id`・`ValidatedCreateTable.legacy_row_identity`（pub フィールド追加）・
+  `TableLookup::table_is_allocated`（既定実装つきのメソッド追加）・`EngineCore::table_uses_allocated_row_identity` の追加。
+  BREAKING CHANGE: SQL の `CREATE TABLE` で作った表の `INSERT ... (id, ...)` は `id` を宣言していなければ `42703` になる。
 - 宣言 PRIMARY KEY の点検索（Issue #2198・TABLE-23）: 広域取得で PK の全構成列がリテラル等価のとき、永続一意索引の
   点検索で実行する。`EXPLAIN` はこの形のときだけ `scalar_plan: index_primary_key`・`access_path: primary_key_lookup`
   を出す（従来は `plain_scan`／`full_scan` 固定。PK 未宣言の表・部分等価・範囲比較・`ORDER BY` 付きは不変）。

@@ -10,6 +10,12 @@
 
 #[path = "common/mod.rs"]
 mod common;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// NoSQL 表層は従来方式の表だけを扱うため、このテストの `CREATE TABLE` は従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../../engine/src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 #[path = "http_common/mod.rs"]
 mod http_common;
 
@@ -38,7 +44,7 @@ fn ctx(tenant: &str) -> PolicyContext {
 }
 
 fn exec(core: &EngineCore, tenant: &str, sql: &str) -> SqlOutcome {
-    core.execute_sql_in_session(&ctx(tenant), &mut SessionState::default(), sql)
+    core.execute_sql_in_session_legacy(&ctx(tenant), &mut SessionState::default(), sql)
         .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"))
 }
 
@@ -54,7 +60,7 @@ fn new_core(rows: usize) -> (Arc<EngineCore>, temp_db::CleanupGuard) {
         });
     let mut session = SessionState::default();
     session.allow_ddl();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &ctx("sys"),
         &mut session,
         "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE)",

@@ -61,7 +61,12 @@ fn check_insert_rejects_beyond_exact_range_with_22003_and_no_side_effect() {
     let (core, path) = new_core("bigint-f64-check-insert");
     let _g = CleanupGuard(path);
     let a = ctx("alice");
-    run(&core, &a, "CREATE TABLE t (b BIGINT CHECK (b = b))").expect("ddl");
+    run(
+        &core,
+        &a,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, b BIGINT CHECK (b = b))",
+    )
+    .expect("ddl");
     for (i, v) in OK_VALUES.iter().enumerate() {
         run(&core, &a, &insert(i as u64 + 1, *v, &format!("ok-{i}"))).expect("exact range ok");
     }
@@ -80,7 +85,12 @@ fn check_update_rejects_beyond_exact_range_with_22003() {
     let (core, path) = new_core("bigint-f64-check-update");
     let _g = CleanupGuard(path);
     let a = ctx("alice");
-    run(&core, &a, "CREATE TABLE t (b BIGINT CHECK (b = b))").expect("ddl");
+    run(
+        &core,
+        &a,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, b BIGINT CHECK (b = b))",
+    )
+    .expect("ddl");
     run(&core, &a, &insert(1, 1, "seed")).expect("seed");
     for (i, v) in OK_VALUES.iter().enumerate() {
         run(
@@ -107,7 +117,12 @@ fn add_column_default_binds_full_i64_but_later_check_evaluation_is_22003() {
     for v in OK_VALUES.iter().chain(BAD_VALUES.iter()) {
         let (core, path) = new_core("bigint-f64-add-default");
         let _g = CleanupGuard(path);
-        run(&core, &a, "CREATE TABLE t (b BIGINT)").expect("ddl");
+        run(
+            &core,
+            &a,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, b BIGINT)",
+        )
+        .expect("ddl");
         run(&core, &a, &insert(1, 1, "seed")).expect("seed");
         // DEFAULT の束縛自体は i64 全域を受理する（挙動不変）。
         run(
@@ -130,7 +145,12 @@ fn where_expression_over_stored_bigint_is_22003_beyond_exact_range_only() {
     let (core, path) = new_core("bigint-f64-where-col");
     let _g = CleanupGuard(path);
     let a = ctx("alice");
-    run(&core, &a, "CREATE TABLE t (b BIGINT)").expect("ddl");
+    run(
+        &core,
+        &a,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, b BIGINT)",
+    )
+    .expect("ddl");
     // CHECK も式も無い列は i64 全域を受理する（回帰防止）。
     for (i, v) in OK_VALUES.iter().enumerate() {
         run(&core, &a, &insert(i as u64 + 1, *v, &format!("ok-{i}"))).expect("insert");
@@ -160,7 +180,12 @@ fn where_integer_literal_beyond_exact_range_is_22003() {
     let (core, path) = new_core("bigint-f64-where-lit");
     let _g = CleanupGuard(path);
     let a = ctx("alice");
-    run(&core, &a, "CREATE TABLE t (b BIGINT)").expect("ddl");
+    run(
+        &core,
+        &a,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, b BIGINT)",
+    )
+    .expect("ddl");
     run(&core, &a, &insert(1, 1, "seed")).expect("seed");
     assert_eq!(
         count(
@@ -189,7 +214,12 @@ fn other_tenant_value_beyond_exact_range_does_not_fail_own_evaluation() {
     let _g = CleanupGuard(path);
     let a = ctx("alice");
     let b = ctx("bob");
-    run(&core, &a, "CREATE TABLE t (b BIGINT)").expect("ddl");
+    run(
+        &core,
+        &a,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, b BIGINT)",
+    )
+    .expect("ddl");
     run(&core, &a, &insert(1, 1, "a-1")).expect("alice row");
     run(&core, &b, &insert(2, EXACT + 1, "b-1")).expect("bob row");
     // bob の値は alice の式評価に到達しない（存在オラクルにならない）。

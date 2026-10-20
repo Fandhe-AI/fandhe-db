@@ -42,7 +42,7 @@ fn setup(core: &EngineCore) {
     core.execute_sql_in_session(
         &ctx("tenant-a"),
         &mut session,
-        "CREATE TABLE ev (embedding VECTOR(2), n TIMESTAMP, s TIMESTAMP, c TIMESTAMP, \
+        "CREATE TABLE ev (id BIGINT PRIMARY KEY, embedding VECTOR(2), n TIMESTAMP, s TIMESTAMP, c TIMESTAMP, \
          d TIMESTAMP DEFAULT now(), lt TIME)",
     )
     .expect("create table");
@@ -291,7 +291,7 @@ fn new_time_defaults_evaluate_per_statement_and_per_row() {
     core.execute_sql_in_session(
         &ctx("tenant-a"),
         &mut session,
-        "CREATE TABLE ev (embedding VECTOR(2), n TIMESTAMP, \
+        "CREATE TABLE ev (id BIGINT PRIMARY KEY, embedding VECTOR(2), n TIMESTAMP, \
          ds TIMESTAMP DEFAULT statement_timestamp(), dc TIMESTAMP DEFAULT clock_timestamp(), \
          dl TIME DEFAULT LOCALTIME(3))",
     )

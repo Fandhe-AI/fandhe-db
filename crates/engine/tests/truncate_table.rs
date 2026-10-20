@@ -25,6 +25,12 @@ use std::num::NonZeroUsize;
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 const TABLE: &str = "documents";
@@ -148,7 +154,7 @@ fn truncate_removes_only_own_tenant_rows_public_and_private() {
 
     let mut session = SessionState::default();
     let outcome = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             &format!("TRUNCATE TABLE {TABLE} USING OPERATION_ID 'op-truncate-alice'"),
@@ -181,7 +187,7 @@ fn truncate_response_is_identical_regardless_of_other_tenant_row_count() {
 
         let mut session = SessionState::default();
         let outcome = core
-            .execute_sql_in_session(
+            .execute_sql_in_session_legacy(
                 &alice,
                 &mut session,
                 &format!("TRUNCATE TABLE {TABLE} USING OPERATION_ID 'op-oracle'"),
@@ -204,7 +210,7 @@ fn truncate_response_is_identical_regardless_of_other_tenant_row_count() {
 
         let mut session = SessionState::default();
         let outcome = core
-            .execute_sql_in_session(
+            .execute_sql_in_session_legacy(
                 &alice,
                 &mut session,
                 &format!("TRUNCATE TABLE {TABLE} USING OPERATION_ID 'op-oracle'"),
@@ -228,14 +234,14 @@ fn truncate_missing_operation_id_is_rejected_with_23502_before_any_write() {
 
     let mut session = SessionState::default();
     let err = core
-        .execute_sql_in_session(&alice, &mut session, &format!("TRUNCATE TABLE {TABLE}"))
+        .execute_sql_in_session_legacy(&alice, &mut session, &format!("TRUNCATE TABLE {TABLE}"))
         .expect_err("missing operation_id must be rejected");
     assert_eq!(err.wire_code(), "23502");
     // 拒否されたので行は残ったまま。
     assert_eq!(count_star(&core, &alice, TABLE), 1);
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             &format!("TRUNCATE TABLE {TABLE} USING OPERATION_ID NULL"),
@@ -256,12 +262,12 @@ fn truncate_resending_same_operation_id_is_rejected_with_23505() {
 
     let mut session = SessionState::default();
     let sql = format!("TRUNCATE TABLE {TABLE} USING OPERATION_ID 'op-resend'");
-    core.execute_sql_in_session(&alice, &mut session, &sql)
+    core.execute_sql_in_session_legacy(&alice, &mut session, &sql)
         .expect("first TRUNCATE should succeed");
     assert_eq!(count_star(&core, &alice, TABLE), 0);
 
     let err = core
-        .execute_sql_in_session(&alice, &mut session, &sql)
+        .execute_sql_in_session_legacy(&alice, &mut session, &sql)
         .expect_err("resend with the same operation_id must be rejected as duplicate commit");
     assert_eq!(err.wire_code(), "23505");
 }
@@ -280,12 +286,12 @@ fn truncate_on_empty_table_still_records_the_ledger_entry() {
     let mut session = SessionState::default();
     let sql = format!("TRUNCATE TABLE {TABLE} USING OPERATION_ID 'op-empty'");
     let outcome = core
-        .execute_sql_in_session(&alice, &mut session, &sql)
+        .execute_sql_in_session_legacy(&alice, &mut session, &sql)
         .expect("TRUNCATE of an already-empty table must succeed");
     assert!(matches!(outcome, SqlOutcome::Truncate(_)));
 
     let err = core
-        .execute_sql_in_session(&alice, &mut session, &sql)
+        .execute_sql_in_session_legacy(&alice, &mut session, &sql)
         .expect_err("resend against the same operation_id must still be a duplicate");
     assert_eq!(
         err.wire_code(),
@@ -306,7 +312,7 @@ fn truncate_keeps_table_definition_and_does_not_affect_other_tables() {
     insert_row(&core, &alice, OTHER_TABLE, 100, Visibility::Public, 100);
 
     let mut session = SessionState::default();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         &format!("TRUNCATE TABLE {TABLE} USING OPERATION_ID 'op-ddl-contrast'"),
@@ -318,7 +324,7 @@ fn truncate_keeps_table_definition_and_does_not_affect_other_tables() {
 
     // テーブル定義は残っているため、TRUNCATE 後も同一テーブルへ INSERT できる
     // （`drop_table` ならテーブル不存在で `42P01` になる）。
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         &format!(
@@ -348,7 +354,7 @@ fn truncate_invalidates_arena_and_visible_bitmap_caches() {
     assert_eq!(count_star(&core, &alice, TABLE), 2);
 
     let mut session = SessionState::default();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         &format!("TRUNCATE TABLE {TABLE} USING OPERATION_ID 'op-cache-invalidate'"),
@@ -373,7 +379,7 @@ fn explain_truncate_is_rejected_as_unsupported_syntax() {
     let mut session = SessionState::default();
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             &format!("EXPLAIN TRUNCATE TABLE {TABLE} USING OPERATION_ID 'op-explain-truncate'"),
@@ -398,7 +404,7 @@ fn truncate_multiple_tables_removes_own_rows_in_all_tables_only() {
 
     let mut session = SessionState::default();
     let outcome = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             &format!("TRUNCATE ONLY {TABLE} *, {OTHER_TABLE} USING OPERATION_ID 'op-multi'"),
@@ -419,7 +425,7 @@ fn truncate_duplicate_table_names_collapse_to_one() {
     let alice = ctx_for("alice", true);
     insert_row(&core, &alice, TABLE, 1, Visibility::Private, 1);
     let mut session = SessionState::default();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         &format!("TRUNCATE {TABLE}, {TABLE} USING OPERATION_ID 'op-dup-names'"),
@@ -439,7 +445,7 @@ fn truncate_multi_with_undefined_second_table_is_atomic() {
     let mut session = SessionState::default();
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             &format!("TRUNCATE {TABLE}, ghost USING OPERATION_ID 'op-atomic'"),
@@ -448,7 +454,7 @@ fn truncate_multi_with_undefined_second_table_is_atomic() {
     assert_eq!(err.wire_code(), "42P01");
     assert_eq!(count_star(&core, &alice, TABLE), 1, "first table untouched");
 
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         &format!("TRUNCATE {TABLE} USING OPERATION_ID 'op-atomic'"),
@@ -465,7 +471,7 @@ fn truncate_multi_resend_uses_normalized_table_set_for_ledger_check() {
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice", true);
     let mut session = SessionState::default();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         &format!("TRUNCATE {TABLE}, {OTHER_TABLE} USING OPERATION_ID 'op-set'"),
@@ -479,13 +485,13 @@ fn truncate_multi_resend_uses_normalized_table_set_for_ledger_check() {
         format!("TRUNCATE {OTHER_TABLE}, {TABLE} USING OPERATION_ID 'op-set'"),
     ] {
         let err = core
-            .execute_sql_in_session(&alice, &mut session, &sql)
+            .execute_sql_in_session_legacy(&alice, &mut session, &sql)
             .expect_err("same table set resend must be a duplicate");
         assert_eq!(err.wire_code(), "23505", "{sql}");
     }
     // 単一表の文は集合が異なるため内容不一致。
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             &format!("TRUNCATE {TABLE} USING OPERATION_ID 'op-set'"),
@@ -504,14 +510,14 @@ fn truncate_single_and_deduplicated_forms_share_ledger_content() {
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice", true);
     let mut session = SessionState::default();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         &format!("TRUNCATE TABLE {TABLE} USING OPERATION_ID 'op-single-form'"),
     )
     .expect("first");
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             &format!("TRUNCATE {TABLE}, {TABLE} USING OPERATION_ID 'op-single-form'"),
@@ -535,7 +541,7 @@ fn truncate_malformed_extension_clauses_remain_rejected() {
         "RESTART",
     ] {
         let err = core
-            .execute_sql_in_session(
+            .execute_sql_in_session_legacy(
                 &alice,
                 &mut session,
                 &format!("TRUNCATE {TABLE} {clause} USING OPERATION_ID 'op-ext'"),
@@ -563,7 +569,7 @@ fn truncate_identity_clauses_are_accepted_and_delete_rows() {
         let alice = ctx_for("alice", true);
         let mut session = SessionState::default();
         insert_row(&core, &alice, TABLE, 1, Visibility::Public, i as u64);
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &alice,
             &mut session,
             &format!("TRUNCATE {TABLE}, {OTHER_TABLE} {clause} USING OPERATION_ID 'op-id-{i}'"),
@@ -582,7 +588,7 @@ fn truncate_undefined_table_is_rejected_with_42p01() {
     let mut session = SessionState::default();
 
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "TRUNCATE TABLE ghost USING OPERATION_ID 'op-undefined-table'",
@@ -620,14 +626,14 @@ fn execute_truncate_sql_direct_entry_point_matches_session_dispatch_contract() {
 fn sql_ok(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> SqlOutcome {
     let mut session = SessionState::default();
     session.allow_ddl();
-    core.execute_sql_in_session(ctx, &mut session, sql)
+    core.execute_sql_in_session_legacy(ctx, &mut session, sql)
         .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"))
 }
 
 fn sql_err_code(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> String {
     let mut session = SessionState::default();
     session.allow_ddl();
-    core.execute_sql_in_session(ctx, &mut session, sql)
+    core.execute_sql_in_session_legacy(ctx, &mut session, sql)
         .map(|o| panic!("{sql} must fail, got {o:?}"))
         .unwrap_err()
         .wire_code()
@@ -1104,7 +1110,7 @@ fn truncate_restrict_rejects_by_catalog_declaration_regardless_of_rows() {
     ] {
         let mut session = SessionState::default();
         let err = core
-            .execute_sql_in_session(&alice, &mut session, sql)
+            .execute_sql_in_session_legacy(&alice, &mut session, sql)
             .expect_err("restrict must reject");
         assert_eq!(err.wire_code(), "0A000", "{sql}");
         messages.push(err.to_string());
@@ -1124,7 +1130,7 @@ fn truncate_restrict_rejects_by_catalog_declaration_regardless_of_rows() {
     );
     let mut session = SessionState::default();
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "TRUNCATE parents USING OPERATION_ID 'op-r-3'",
@@ -1334,23 +1340,23 @@ fn restart_identity_leaves_unowned_sequence_untouched() {
         "CREATE SEQUENCE s",
         "CREATE TABLE seqt (n BIGINT DEFAULT nextval('s'))",
     ] {
-        core.execute_sql_in_session(&alice, &mut ddl, sql)
+        core.execute_sql_in_session_legacy(&alice, &mut ddl, sql)
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
     let mut session = SessionState::default();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "INSERT INTO seqt (id) VALUES (1), (2), (3) USING OPERATION_ID 'seq-ins-1'",
     )
     .expect("insert");
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "TRUNCATE seqt RESTART IDENTITY USING OPERATION_ID 'seq-trunc-1'",
     )
     .expect("restart identity");
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "INSERT INTO seqt (id) VALUES (1) USING OPERATION_ID 'seq-ins-2'",
@@ -1372,7 +1378,7 @@ fn truncate_identity_replay_and_mismatch_codes() {
     let alice = ctx_for("alice", true);
     let mut session = SessionState::default();
     let mut run = |sql: &str| {
-        core.execute_sql_in_session(&alice, &mut session, sql)
+        core.execute_sql_in_session_legacy(&alice, &mut session, sql)
             .map_err(|e| e.wire_code())
     };
     run(&format!(
@@ -1409,14 +1415,14 @@ fn tables_named_restart_and_continue_still_truncate() {
     let mut ddl = SessionState::default();
     ddl.allow_ddl();
     for name in ["restart", "continue"] {
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &alice,
             &mut ddl,
             &format!("CREATE TABLE {name} (embedding VECTOR(2))"),
         )
         .unwrap_or_else(|e| panic!("create {name}: {e}"));
         let mut session = SessionState::default();
-        core.execute_sql_in_session(
+        core.execute_sql_in_session_legacy(
             &alice,
             &mut session,
             &format!("TRUNCATE {name} USING OPERATION_ID 'op-{name}'"),

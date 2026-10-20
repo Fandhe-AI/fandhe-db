@@ -126,7 +126,11 @@ fn relation_namespace_collisions_both_directions() {
     let mut s = allowed_session();
     ok(&core, &mut s, "CREATE SEQUENCE seq_a");
     ok(&core, &mut s, "CREATE VIEW v1 AS SELECT embedding FROM t");
-    ok(&core, &mut s, "CREATE TABLE u (lang TEXT)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, lang TEXT)",
+    );
     ok(&core, &mut s, "CREATE INDEX idx1 ON u (lang)");
 
     // SEQUENCE 作成が既存の表・ビュー・索引・SEQUENCE と衝突する。
@@ -138,7 +142,14 @@ fn relation_namespace_collisions_both_directions() {
         );
     }
     // 既存 SEQUENCE の名前で表・ビュー・索引・改名を作ると衝突する。
-    assert_eq!(code(&core, &mut s, "CREATE TABLE seq_a (x TEXT)"), "42P07");
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "CREATE TABLE seq_a (id BIGINT PRIMARY KEY, x TEXT)"
+        ),
+        "42P07"
+    );
     assert_eq!(
         code(
             &core,

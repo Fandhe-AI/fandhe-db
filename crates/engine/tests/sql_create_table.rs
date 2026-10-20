@@ -22,6 +22,12 @@ use engine::storage::Storage;
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// このテストは疑似列 `id`・従来方式の契約を検証するため、`CREATE TABLE` を従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 use temp_db::{unique_db_path, CleanupGuard};
 
 fn new_core(label: &str) -> (EngineCore, std::path::PathBuf) {
@@ -63,7 +69,7 @@ fn create_table_succeeds_with_vector_and_text_columns() {
     let mut session = granted_session();
 
     let outcome = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (embedding VECTOR(4), body TEXT)",
@@ -108,7 +114,7 @@ fn create_table_accepts_lowercase_keywords_and_trailing_semicolon() {
     let mut session = granted_session();
 
     let outcome = core
-        .execute_sql_in_session(&alice, &mut session, "create table t (body text);")
+        .execute_sql_in_session_legacy(&alice, &mut session, "create table t (body text);")
         .expect("lowercase CREATE TABLE should succeed");
     assert!(matches!(outcome, SqlOutcome::CreateTable(_)));
 }
@@ -119,7 +125,7 @@ fn create_table_persists_across_reopen() {
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (embedding VECTOR(3))",
@@ -144,7 +150,7 @@ fn create_table_is_immediately_usable_by_other_session() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut ddl_session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut ddl_session,
         "CREATE TABLE docs (embedding VECTOR(2), body TEXT)",
@@ -152,7 +158,7 @@ fn create_table_is_immediately_usable_by_other_session() {
     .expect("CREATE TABLE should succeed");
 
     let mut other_session = SessionState::default();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut other_session,
         "INSERT INTO docs (id, embedding, body) VALUES (1, '[0.1,0.2]', 'hello') USING OPERATION_ID 'op-1'",
@@ -175,7 +181,7 @@ fn create_table_rejects_duplicate_name_without_overwriting() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE docs (embedding VECTOR(2), a TEXT)",
@@ -183,7 +189,7 @@ fn create_table_rejects_duplicate_name_without_overwriting() {
     .expect("first CREATE TABLE should succeed");
 
     let err = core
-        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (b TEXT, c TEXT)")
+        .execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (b TEXT, c TEXT)")
         .expect_err("duplicate CREATE TABLE must be rejected");
     assert_eq!(err.wire_code(), "42P07");
 
@@ -206,7 +212,7 @@ fn create_table_rejects_unauthorized_session_for_valid_syntax() {
     let mut session = SessionState::default();
 
     let err = core
-        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT)")
+        .execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT)")
         .expect_err("unauthorized session must be denied");
     assert_eq!(err.wire_code(), "42501");
 
@@ -214,7 +220,7 @@ fn create_table_rejects_unauthorized_session_for_valid_syntax() {
     // 改めて `CREATE TABLE` すると `42P07`（既存名との衝突）ではなく成功する。
     let mut granted = granted_session();
     let outcome = core
-        .execute_sql_in_session(&alice, &mut granted, "CREATE TABLE docs (a TEXT)")
+        .execute_sql_in_session_legacy(&alice, &mut granted, "CREATE TABLE docs (a TEXT)")
         .expect("table must not have been created by the unauthorized attempt");
     assert!(matches!(outcome, SqlOutcome::CreateTable(_)));
 }
@@ -236,7 +242,7 @@ fn create_table_rejects_unauthorized_session_for_garbage_syntax() {
     let mut session = SessionState::default();
 
     let err = core
-        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs ((()) not a schema")
+        .execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs ((()) not a schema")
         .expect_err("unauthorized session must be denied even for malformed syntax");
     assert_eq!(
         err.wire_code(),
@@ -252,12 +258,12 @@ fn create_table_rejects_unauthorized_session_for_existing_table_name() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut granted = granted_session();
-    core.execute_sql_in_session(&alice, &mut granted, "CREATE TABLE docs (a TEXT)")
+    core.execute_sql_in_session_legacy(&alice, &mut granted, "CREATE TABLE docs (a TEXT)")
         .expect("first CREATE TABLE should succeed");
 
     let mut unauthorized = SessionState::default();
     let err = core
-        .execute_sql_in_session(&alice, &mut unauthorized, "CREATE TABLE docs (b TEXT)")
+        .execute_sql_in_session_legacy(&alice, &mut unauthorized, "CREATE TABLE docs (b TEXT)")
         .expect_err("unauthorized session must be denied");
     // 既存名と衝突する場合でも `42P07` ではなく `42501`（既存名の有無を漏らさない）。
     assert_eq!(err.wire_code(), "42501");
@@ -272,7 +278,7 @@ fn create_table_rejects_empty_column_list() {
     let alice = ctx("alice");
     let mut session = granted_session();
     let err = core
-        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs ()")
+        .execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs ()")
         .expect_err("empty column list must be rejected");
     assert_eq!(err.wire_code(), "42601");
 }
@@ -284,7 +290,7 @@ fn create_table_rejects_trailing_comma() {
     let alice = ctx("alice");
     let mut session = granted_session();
     let err = core
-        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT,)")
+        .execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT,)")
         .expect_err("trailing comma must be rejected");
     assert_eq!(err.wire_code(), "42601");
 }
@@ -298,11 +304,11 @@ fn create_table_rejects_unknown_type() {
     let err = core
         // スカラー型・配列・ENUM は受理する（Issue #1348）ため、未知の型名の代表として
         // 未登録の識別子を使う（ENUM 型名候補として実行段で存在確認され `42704`。Issue #2306）。
-        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a no_such_type)")
+        .execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a no_such_type)")
         .expect_err("unknown type must be rejected");
     assert_eq!(err.wire_code(), "42704");
     let err = core
-        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a no_such_type[])")
+        .execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a no_such_type[])")
         .expect_err("unknown array element type must be rejected");
     assert_eq!(err.wire_code(), "42704");
 }
@@ -314,7 +320,7 @@ fn create_table_rejects_two_vector_columns() {
     let alice = ctx("alice");
     let mut session = granted_session();
     let err = core
-        .execute_sql_in_session(
+        .execute_sql_in_session_legacy(
             &alice,
             &mut session,
             "CREATE TABLE docs (a VECTOR(2), b VECTOR(2))",
@@ -338,7 +344,7 @@ fn create_table_rejects_vector_dimension_zero_and_overflow() {
         "CREATE TABLE t5 (a VECTOR(1.5))",
     ] {
         let err = core
-            .execute_sql_in_session(&alice, &mut session, sql)
+            .execute_sql_in_session_legacy(&alice, &mut session, sql)
             .unwrap_err_or_else(sql);
         assert_eq!(err.wire_code(), "42601", "sql={sql}");
     }
@@ -360,7 +366,7 @@ fn create_table_accepts_vector_dimension_upper_bound() {
     let alice = ctx("alice");
     let mut session = granted_session();
     let outcome = core
-        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE t (a VECTOR(65536))")
+        .execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE t (a VECTOR(65536))")
         .expect("VECTOR(65536) must be accepted (upper bound)");
     assert!(matches!(outcome, SqlOutcome::CreateTable(_)));
 }
@@ -375,7 +381,7 @@ fn create_table_rejects_too_many_columns() {
     let cols: Vec<String> = (0..257).map(|i| format!("c{i} TEXT")).collect();
     let sql = format!("CREATE TABLE docs ({})", cols.join(", "));
     let err = core
-        .execute_sql_in_session(&alice, &mut session, &sql)
+        .execute_sql_in_session_legacy(&alice, &mut session, &sql)
         .expect_err("257 columns must be rejected");
     assert_eq!(err.wire_code(), "54000");
 }
@@ -387,7 +393,7 @@ fn create_table_rejects_duplicate_column_name_in_same_statement() {
     let alice = ctx("alice");
     let mut session = granted_session();
     let err = core
-        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT, a TEXT)")
+        .execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (a TEXT, a TEXT)")
         .expect_err("duplicate column name must be rejected");
     assert_eq!(err.wire_code(), "42701");
 }
@@ -406,7 +412,7 @@ fn create_table_rejects_reserved_column_names() {
         "CREATE TABLE t4 (visibility TEXT)",
     ] {
         let err = core
-            .execute_sql_in_session(&alice, &mut session, sql)
+            .execute_sql_in_session_legacy(&alice, &mut session, sql)
             .unwrap_err_or_else(sql);
         assert_eq!(err.wire_code(), "42601", "sql={sql}");
     }
@@ -422,13 +428,13 @@ fn create_table_rejects_oversized_identifier() {
     let long_name = "a".repeat(64);
     let sql = format!("CREATE TABLE {long_name} (a TEXT)");
     let err = core
-        .execute_sql_in_session(&alice, &mut session, &sql)
+        .execute_sql_in_session_legacy(&alice, &mut session, &sql)
         .expect_err("64-byte identifier must be rejected");
     assert_eq!(err.wire_code(), "42601");
 
     let ok_name = "a".repeat(63);
     let sql = format!("CREATE TABLE {ok_name} (a TEXT)");
-    core.execute_sql_in_session(&alice, &mut session, &sql)
+    core.execute_sql_in_session_legacy(&alice, &mut session, &sql)
         .expect("63-byte identifier must be accepted");
 }
 
@@ -441,7 +447,7 @@ fn create_function_still_works() {
     let alice = ctx("alice");
     let mut session = SessionState::default();
     let outcome = core
-        .execute_sql_in_session(&alice, &mut session, "CREATE FUNCTION double(x) AS x + x")
+        .execute_sql_in_session_legacy(&alice, &mut session, "CREATE FUNCTION double(x) AS x + x")
         .expect("CREATE FUNCTION must still work without DDL privilege");
     assert!(matches!(outcome, SqlOutcome::CreateFunction { .. }));
 }
@@ -453,7 +459,7 @@ fn explain_create_table_is_rejected() {
     let alice = ctx("alice");
     let mut session = granted_session();
     let err = core
-        .execute_sql_in_session(&alice, &mut session, "EXPLAIN CREATE TABLE docs (a TEXT)")
+        .execute_sql_in_session_legacy(&alice, &mut session, "EXPLAIN CREATE TABLE docs (a TEXT)")
         .expect_err("EXPLAIN CREATE TABLE must be rejected");
     assert_eq!(err.wire_code(), "42601");
 }
@@ -479,26 +485,26 @@ fn create_table_dimensions_are_independent_across_tables() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE small (embedding VECTOR(2))",
     )
     .expect("small table create");
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "CREATE TABLE big (embedding VECTOR(4))",
     )
     .expect("big table create");
 
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "INSERT INTO small (id, embedding) VALUES (1, '[1,0]') USING OPERATION_ID 'op-small'",
     )
     .expect("insert into small");
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &alice,
         &mut session,
         "INSERT INTO big (id, embedding) VALUES (1, '[1,0,0,0]') USING OPERATION_ID 'op-big'",

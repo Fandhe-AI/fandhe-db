@@ -85,7 +85,7 @@ fn rows(core: &EngineCore, s: &mut SessionState, sql: &str) -> Vec<Vec<String>> 
 }
 
 const COLUMNS: &str =
-    "(name TEXT NOT NULL, qty INTEGER DEFAULT 7 CHECK (qty >= 0), code TEXT UNIQUE)";
+    "(id BIGINT PRIMARY KEY, name TEXT NOT NULL, qty INTEGER DEFAULT 7 CHECK (qty >= 0), code TEXT UNIQUE)";
 
 /// `{T}` を表名に置換する。
 fn sub(sql: &str, table: &str) -> String {
@@ -164,7 +164,14 @@ fn names(core: &EngineCore, s: &mut SessionState, table: &str) -> Vec<String> {
         &format!("SELECT id, name FROM {table} ORDER BY id LIMIT 100"),
     )
     .into_iter()
-    .map(|r| format!("{}:{}", r[0], r[2]))
+    // 宣言した `id` 列の値（`SignedInteger(n)`）と `name`。行の物理 rowid（`r[0]`）は意味を持たない
+    // （TRUNCATE 後も採番は続く。TABLE-23・Issue #2199）。
+    .map(|r| {
+        let id = r[1]
+            .trim_start_matches("SignedInteger(")
+            .trim_end_matches(')');
+        format!("{id}:{}", r[2])
+    })
     .collect()
 }
 
@@ -263,7 +270,11 @@ fn temp_statements_never_touch_a_same_named_persistent_table() {
 fn another_session_or_tenant_never_sees_a_temp_table() {
     let (core, _g) = new_core("t44-dml-isolation", LedgerMode::CompareOnlyWithoutLedger);
     let mut a = SessionState::default();
-    run_ok(&core, &mut a, "CREATE TEMP TABLE only_a (name TEXT)");
+    run_ok(
+        &core,
+        &mut a,
+        "CREATE TEMP TABLE only_a (id BIGINT PRIMARY KEY, name TEXT)",
+    );
     run_ok(
         &core,
         &mut a,
@@ -297,7 +308,11 @@ fn views_and_mixed_statements_are_rejected_not_misrouted() {
     let (core, _g) = new_core("t44-dml-views", LedgerMode::CompareOnlyWithoutLedger);
     let mut s = ddl_session();
     run_ok(&core, &mut s, &format!("CREATE TABLE t {COLUMNS}"));
-    run_ok(&core, &mut s, "CREATE TABLE p2 (note TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TABLE p2 (id BIGINT PRIMARY KEY, note TEXT)",
+    );
     run_ok(
         &core,
         &mut s,
@@ -355,8 +370,16 @@ fn views_and_mixed_statements_are_rejected_not_misrouted() {
         1
     );
     // 一時表どうしの JOIN・集計は使える。
-    run_ok(&core, &mut s, "CREATE TEMP TABLE a (k INTEGER)");
-    run_ok(&core, &mut s, "CREATE TEMP TABLE b (k INTEGER, label TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE a (id BIGINT PRIMARY KEY, k INTEGER)",
+    );
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE b (id BIGINT PRIMARY KEY, k INTEGER, label TEXT)",
+    );
     run_ok(&core, &mut s, "INSERT INTO a (id, k) VALUES (1, 7), (2, 8)");
     run_ok(
         &core,
@@ -378,8 +401,16 @@ fn temp_writes_ignore_the_operation_id_ledger() {
     // 台帳あり・id 必須の構成（`--require-operation-id` 相当）でも、一時表への書き込みは id を要求しない。
     let (core, _g) = new_core("t44-dml-ledger", LedgerMode::Ledgered);
     let mut s = ddl_session();
-    run_ok(&core, &mut s, "CREATE TABLE perm (name TEXT)");
-    run_ok(&core, &mut s, "CREATE TEMP TABLE tmp (name TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TABLE perm (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE tmp (id BIGINT PRIMARY KEY, name TEXT)",
+    );
     assert_eq!(
         code(&core, &mut s, "INSERT INTO perm (id, name) VALUES (1, 'x')"),
         "23502",
@@ -444,8 +475,16 @@ fn tx_count<'e>(
 fn explicit_transactions_apply_commit_and_rollback_to_temp_tables() {
     let (core, _g) = new_core("t44-dml-txn", LedgerMode::CompareOnlyWithoutLedger);
     let mut s = ddl_session();
-    run_ok(&core, &mut s, "CREATE TABLE perm (name TEXT)");
-    run_ok(&core, &mut s, "CREATE TEMP TABLE tmp (name TEXT NOT NULL)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TABLE perm (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE tmp (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
+    );
     let mut t = core.new_session_transaction();
 
     // ROLLBACK: 自分の書き込みは同じブロックから見え、巻き戻すと永続・一時の両方が消える。
@@ -555,9 +594,13 @@ fn on_commit_delete_rows_and_drop_apply_through_sql() {
     run_ok(
         &core,
         &mut s,
-        "CREATE TEMP TABLE d (name TEXT) ON COMMIT DELETE ROWS",
+        "CREATE TEMP TABLE d (id BIGINT PRIMARY KEY, name TEXT) ON COMMIT DELETE ROWS",
     );
-    run_ok(&core, &mut s, "CREATE TEMP TABLE p (name TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE p (id BIGINT PRIMARY KEY, name TEXT)",
+    );
     // 自動コミットの文の終わりで DELETE ROWS の表は空になる。
     run_ok(&core, &mut s, "INSERT INTO d (id, name) VALUES (1, 'x')");
     run_ok(&core, &mut s, "INSERT INTO p (id, name) VALUES (1, 'x')");
@@ -581,7 +624,7 @@ fn on_commit_delete_rows_and_drop_apply_through_sql() {
     run_ok(
         &core,
         &mut s,
-        "CREATE TEMP TABLE x (name TEXT) ON COMMIT DROP",
+        "CREATE TEMP TABLE x (id BIGINT PRIMARY KEY, name TEXT) ON COMMIT DROP",
     );
     assert_eq!(code(&core, &mut s, "SELECT id FROM x LIMIT 1"), "42P01");
 }
@@ -596,7 +639,11 @@ fn temp_byte_limit_yields_54000_and_keeps_earlier_rows() {
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
         .with_temp_table_limits(TempTableLimits::new(4, 256 * 1024));
     let mut s = SessionState::default();
-    run_ok(&core, &mut s, "CREATE TEMP TABLE big (body TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE big (id BIGINT PRIMARY KEY, body TEXT)",
+    );
     let body = "z".repeat(4000);
     let mut ok = 0u64;
     let mut failure = None;
@@ -655,7 +702,7 @@ fn temp_indexes_and_unique_indexes_work() {
     run_ok(
         &core,
         &mut s,
-        "CREATE TEMP TABLE t (name TEXT, qty INTEGER)",
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, name TEXT, qty INTEGER)",
     );
     run_ok(
         &core,
@@ -718,7 +765,7 @@ fn temp_expression_indexes_share_the_persistent_path() {
     run_ok(
         &core,
         &mut s,
-        "CREATE TEMP TABLE t (name TEXT, qty INTEGER)",
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, name TEXT, qty INTEGER)",
     );
     run_ok(
         &core,
@@ -811,17 +858,25 @@ fn copy_out<'e>(
 fn copy_from_and_to_work_on_temp_tables_without_touching_a_same_named_persistent_table() {
     let (core, _g) = new_core("t44-dml-copy", LedgerMode::Ledgered);
     let mut s = ddl_session();
-    run_ok(&core, &mut s, "CREATE TABLE t (name TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
     run_ok(
         &core,
         &mut s,
         "INSERT INTO t (id, name) VALUES (1, 'perm') USING OPERATION_ID 'perm-1'",
     );
-    run_ok(&core, &mut s, "CREATE TEMP TABLE t (name TEXT)");
     run_ok(
         &core,
         &mut s,
-        "CREATE TEMP TABLE d (name TEXT) ON COMMIT DELETE ROWS",
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE d (id BIGINT PRIMARY KEY, name TEXT) ON COMMIT DELETE ROWS",
     );
     let mut t = core.new_session_transaction();
 
@@ -948,7 +1003,11 @@ fn copy_from_and_to_work_on_temp_tables_without_touching_a_same_named_persistent
 fn copy_batch_from_a_temp_table_never_commits_through_the_persistent_entry_points() {
     let (core, _g) = new_core("t44-dml-copy-entry", LedgerMode::CompareOnlyWithoutLedger);
     let mut s = SessionState::default();
-    run_ok(&core, &mut s, "CREATE TEMP TABLE t (name TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
     let plan = core
         .begin_copy(&ctx(TENANT), &s, "COPY t (id, name) FROM STDIN")
         .expect("plan");
@@ -972,8 +1031,16 @@ fn prepared_statements_are_revalidated_against_the_temp_catalog() {
     let (core, _g) = new_core("t44-dml-prepared", LedgerMode::CompareOnlyWithoutLedger);
     let c = ctx(TENANT);
     let mut s = ddl_session();
-    run_ok(&core, &mut s, "CREATE TABLE t (name TEXT)");
-    run_ok(&core, &mut s, "CREATE TABLE other (name TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TABLE other (id BIGINT PRIMARY KEY, name TEXT)",
+    );
     run_ok(&core, &mut s, "INSERT INTO t (id, name) VALUES (1, 'perm')");
 
     // 一時表を作る前に準備した永続側の文。
@@ -987,7 +1054,11 @@ fn prepared_statements_are_revalidated_against_the_temp_catalog() {
         .parse_sql("SELECT id, name FROM t LIMIT 5")
         .expect("plain parse");
 
-    run_ok(&core, &mut s, "CREATE TEMP TABLE t (name TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
     run_ok(&core, &mut s, "INSERT INTO t (id, name) VALUES (7, 'temp')");
 
     // 同名の一時表ができた後は、一時表の名前を含む準備済み文は陳腐化として拒否される
@@ -1034,7 +1105,11 @@ fn prepared_statements_are_revalidated_against_the_temp_catalog() {
         other => panic!("expected the temp row, got {other:?}"),
     }
     run_ok(&core, &mut s, "DROP TABLE t");
-    run_ok(&core, &mut s, "CREATE TEMP TABLE t (name TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
     for result in [
         core.execute_parsed_in_session(&c, &mut s, &temp_bound)
             .map(|_| ()),
@@ -1058,7 +1133,11 @@ fn prepared_statements_are_revalidated_against_the_temp_catalog() {
 fn cursors_over_temp_tables_are_rejected() {
     let (core, _g) = new_core("t44-dml-cursor", LedgerMode::CompareOnlyWithoutLedger);
     let mut s = SessionState::default();
-    run_ok(&core, &mut s, "CREATE TEMP TABLE t (name TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
     let mut t = core.new_session_transaction();
     tx(&core, &mut s, &mut t, "BEGIN").unwrap();
     assert_eq!(
@@ -1086,7 +1165,11 @@ fn temp_ddl_cannot_exceed_the_byte_limit() {
         .with_temp_table_limits(TempTableLimits::new(4, 1));
     let mut s = SessionState::default();
     let err = core
-        .execute_sql_in_session(&ctx(TENANT), &mut s, "CREATE TEMP TABLE big (body TEXT)")
+        .execute_sql_in_session(
+            &ctx(TENANT),
+            &mut s,
+            "CREATE TEMP TABLE big (id BIGINT PRIMARY KEY, body TEXT)",
+        )
         .expect_err("DDL over the byte limit");
     assert_eq!(err.wire_code(), "54000");
     // 確定されていない（同名の表は存在しない）。
@@ -1100,12 +1183,20 @@ fn temp_ddl_cannot_exceed_the_byte_limit() {
 fn prepared_drop_index_does_not_hit_a_later_temp_index_of_the_same_name() {
     let (core, _g) = new_core("t44-dml-prep-drop-ix", LedgerMode::CompareOnlyWithoutLedger);
     let mut s = ddl_session();
-    run_ok(&core, &mut s, "CREATE TABLE p (name TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TABLE p (id BIGINT PRIMARY KEY, name TEXT)",
+    );
     run_ok(&core, &mut s, "CREATE INDEX ix ON p (name)");
     let prepared = core
         .parse_sql_prepared_with_declared_in_session(&s, "DROP INDEX ix", &[])
         .expect("prepare");
-    run_ok(&core, &mut s, "CREATE TEMP TABLE tmp (name TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE tmp (id BIGINT PRIMARY KEY, name TEXT)",
+    );
     run_ok(&core, &mut s, "CREATE INDEX ix ON tmp (name)");
     let err = core
         .bind_prepared_in_session(&s, &prepared, &[])
@@ -1117,14 +1208,27 @@ fn prepared_drop_index_does_not_hit_a_later_temp_index_of_the_same_name() {
 fn temp_table_name_colliding_with_a_temp_index_follows_the_persistent_rules() {
     let (core, _g) = new_core("t44-dml-ix-name", LedgerMode::CompareOnlyWithoutLedger);
     let mut s = ddl_session();
-    run_ok(&core, &mut s, "CREATE TEMP TABLE t (a TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, a TEXT)",
+    );
     run_ok(&core, &mut s, "CREATE INDEX ix ON t (a)");
     assert_eq!(
-        code(&core, &mut s, "CREATE TEMP TABLE ix (a TEXT)"),
+        code(
+            &core,
+            &mut s,
+            "CREATE TEMP TABLE ix (id BIGINT PRIMARY KEY, a TEXT)"
+        ),
         "42P07"
     );
     assert!(
-        code(&core, &mut s, "CREATE TEMP TABLE IF NOT EXISTS ix (a TEXT)").starts_with("ok:"),
+        code(
+            &core,
+            &mut s,
+            "CREATE TEMP TABLE IF NOT EXISTS ix (id BIGINT PRIMARY KEY, a TEXT)"
+        )
+        .starts_with("ok:"),
         "IF NOT EXISTS must be a no-op success"
     );
 }
@@ -1133,14 +1237,18 @@ fn temp_table_name_colliding_with_a_temp_index_follows_the_persistent_rules() {
 fn temp_create_table_if_not_exists_index_collision_wins_over_later_rejections() {
     let (core, _g) = new_core("t44-dml-ix-early", LedgerMode::CompareOnlyWithoutLedger);
     let mut s = ddl_session();
-    run_ok(&core, &mut s, "CREATE TEMP TABLE t (a TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, a TEXT)",
+    );
     run_ok(&core, &mut s, "CREATE INDEX ix ON t (a)");
     // 同名索引があれば、FK 拒否（0A000）より前に no-op 成功する（永続表と同順序）。
     assert!(
         code(
             &core,
             &mut s,
-            "CREATE TEMP TABLE IF NOT EXISTS ix (a TEXT, b TEXT REFERENCES t (a))"
+            "CREATE TEMP TABLE IF NOT EXISTS ix (id BIGINT PRIMARY KEY, a TEXT, b TEXT REFERENCES t (a))"
         )
         .starts_with("ok:"),
         "IF NOT EXISTS collision must succeed before FK rejection"
@@ -1151,7 +1259,11 @@ fn temp_create_table_if_not_exists_index_collision_wins_over_later_rejections() 
 fn temp_create_index_if_not_exists_keeps_the_existing_index() {
     let (core, _g) = new_core("t44-dml-ix-noop", LedgerMode::CompareOnlyWithoutLedger);
     let mut s = ddl_session();
-    run_ok(&core, &mut s, "CREATE TEMP TABLE t (a TEXT)");
+    run_ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, a TEXT)",
+    );
     run_ok(&core, &mut s, "CREATE INDEX ix ON t (a)");
     assert!(code(&core, &mut s, "CREATE INDEX IF NOT EXISTS ix ON t (a)").starts_with("ok:"));
     // 既存索引が残っている（DROP INDEX が成功し、再度の DROP は 42704）。

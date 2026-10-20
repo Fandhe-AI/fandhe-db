@@ -630,12 +630,11 @@ pub fn execute(
             question,
             mode_literal,
             limit_raw,
-            |schema, udfs| match bind_search_with_limits(
-                validated,
-                schema,
-                udfs,
-                &engine.result_limits(),
-            )
+            |schema, udfs| match {
+                // 採番方式の表は拒否する（実行と同一スナップショットのスキーマで判定。Issue #2199）。
+                super::gate::reject_allocated_schema(schema)?;
+                bind_search_with_limits(validated, schema, udfs, &engine.result_limits())
+            }
             .map_err(to_sql_surface_error)?
             {
                 BoundSearch::Plan(plan) => {
@@ -660,6 +659,7 @@ pub fn execute(
     } else {
         let result =
             engine.execute_bound_search_in_session(ctx, &session, table, |schema, udfs| {
+                super::gate::reject_allocated_schema(schema)?;
                 bind_vector_statement(validated, schema, udfs, &engine.result_limits())
             })?;
         Ok(result)

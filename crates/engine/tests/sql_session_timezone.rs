@@ -22,6 +22,16 @@ use engine::storage::{Storage, Visibility};
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+/// 結果行の先頭セル（`SELECT id ...` の宣言済み `id` 列）を `u64` で返す。採番方式の表は
+/// `ResultRow::id` に内部 rowid を載せない（TABLE-23）ため、利用者向けの値はセルから読む。
+fn row_id(r: &engine::sql::exec::ResultRow) -> u64 {
+    match r.cells.first() {
+        Some(engine::sql::exec::Cell::SignedInteger(n)) => u64::try_from(*n).expect("id >= 0"),
+        Some(engine::sql::exec::Cell::Integer(n)) => *n,
+        other => panic!("unexpected id cell: {other:?}"),
+    }
+}
+
 fn ctx_for(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
         .expect("valid tenant")
@@ -80,7 +90,7 @@ fn stored(core: &EngineCore, id: u64) -> Option<i64> {
         .expect("select");
     r.rows
         .iter()
-        .find(|row| row.id == id)
+        .find(|row| row_id(row) == id)
         .and_then(|row| match row.cells.get(1) {
             Some(Cell::TimestampTz(m)) => Some(*m),
             _ => None,
@@ -236,7 +246,11 @@ fn describe_reports_show_columns_and_set_no_data() {
 fn naive_input_follows_the_session_zone_and_stored_value_is_fixed() {
     let (_g, core) = open("sz-interpret");
     let mut s = session();
-    ok(&core, &mut s, "CREATE TABLE t (v TIMESTAMPTZ, n INTEGER)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ, n INTEGER)",
+    );
     insert(&core, &mut s, 1, "2026-01-01 09:00:00");
     ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
     insert(&core, &mut s, 2, "2026-01-01 09:00:00");
@@ -283,7 +297,11 @@ fn naive_input_follows_the_session_zone_and_stored_value_is_fixed() {
 fn update_and_upsert_follow_the_session_zone() {
     let (_g, core) = open("sz-update");
     let mut s = session();
-    ok(&core, &mut s, "CREATE TABLE t (v TIMESTAMPTZ, n INTEGER)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ, n INTEGER)",
+    );
     insert(&core, &mut s, 1, "2026-01-01 00:00:00Z");
     ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
     ok(
@@ -311,7 +329,11 @@ fn update_and_upsert_follow_the_session_zone() {
 fn copy_from_uses_the_zone_at_copy_start() {
     let (_g, core) = open("sz-copy");
     let mut s = session();
-    ok(&core, &mut s, "CREATE TABLE t (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
     let policy = ctx_for("alice");
     let plan = core
@@ -386,7 +408,11 @@ fn sessions_and_tenants_are_independent() {
     let (_g, core) = open("sz-isolation");
     let mut a = session();
     let mut b = session();
-    ok(&core, &mut a, "CREATE TABLE t (v TIMESTAMPTZ)");
+    ok(
+        &core,
+        &mut a,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ)",
+    );
     ok(&core, &mut a, "SET TIME ZONE 'Asia/Tokyo'");
     assert_eq!(show(&core, &mut b), "UTC");
     // 別テナントの同名セッション値も独立。
@@ -410,7 +436,7 @@ fn column_default_is_interpreted_at_ddl_time() {
     ok(
         &core,
         &mut s,
-        "CREATE TABLE t (v TIMESTAMPTZ DEFAULT '2026-01-01 00:00:00', n INTEGER)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ DEFAULT '2026-01-01 00:00:00', n INTEGER)",
     );
     ok(
         &core,
@@ -440,7 +466,7 @@ fn column_default_is_interpreted_at_ddl_time() {
         code(
             &core,
             &mut s,
-            "CREATE TABLE u (v TIMESTAMPTZ DEFAULT 'nope')"
+            "CREATE TABLE u (id BIGINT PRIMARY KEY, v TIMESTAMPTZ DEFAULT 'nope')"
         ),
         "22007"
     );
@@ -450,7 +476,11 @@ fn column_default_is_interpreted_at_ddl_time() {
 fn partitioned_resend_with_another_zone_does_not_rewrite() {
     let (_g, core) = open("sz-partitioned");
     let mut s = session();
-    ok(&core, &mut s, "CREATE TABLE t (v TIMESTAMPTZ, n INTEGER)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ, n INTEGER)",
+    );
     for i in 1..=3 {
         ok(
             &core,

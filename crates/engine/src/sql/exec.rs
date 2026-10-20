@@ -3634,7 +3634,13 @@ fn project_rows(
                 }
             }
         }
-        rows.push(ResultRow { id, score, cells });
+        // 採番方式の表（TABLE-23・Issue #2199）は kNN 経路でも内部 rowid を応答へ出さない
+        // （通常走査・RETURNING と同じ契約）。再取得・式評価には上で確定した生の `id` を使う。
+        rows.push(ResultRow {
+            id: crate::sql::scan::response_row_id(schema, id),
+            score,
+            cells,
+        });
     }
     Ok(rows)
 }
@@ -3952,6 +3958,15 @@ pub(crate) fn execute_delete_in(
     }
 }
 
+/// 採番方式の表（TABLE-23・Issue #2199）では内部 rowid を応答 `id` へ出さないため `0` に置換する
+/// （従来方式の表はそのまま返す）。RETURNING の行投影に使う。
+fn mask_returning_row_id(schema: &crate::catalog::TableSchema, mut row: ResultRow) -> ResultRow {
+    if schema.is_allocated() {
+        row.id = 0;
+    }
+    row
+}
+
 /// `RETURNING` 付き DML 全経路（単一行 `DELETE`／`UPDATE`・述語形 `DELETE`／
 /// `UPDATE`・UPSERT。Issue #873・#1182）が共有する投影コールバックの生成器。
 /// `tenant.rs` の各 `*_capturing_*` 関数が write トランザクション内・commit 前に
@@ -3970,6 +3985,7 @@ pub(crate) fn execute_delete_in(
 fn returning_collector<'a>(
     ctx: &'a PolicyContext,
     returning: &'a [crate::sql::parser::ProjectedColumn],
+    mask_row_id: bool,
     budget: &'a mut usize,
     rows: &'a mut Vec<ResultRow>,
 ) -> impl FnMut(&crate::tenant::CapturedRow) -> Result<(), crate::tenant::TenantWriteError> + 'a {
@@ -3986,7 +4002,11 @@ fn returning_collector<'a>(
             return Ok(());
         }
         match crate::sql::returning::project_row(row.id, &row.values, returning, budget) {
-            Ok(result_row) => {
+            Ok(mut result_row) => {
+                // 採番方式の表は内部 rowid を応答へ出さない（TABLE-23・Issue #2199）。
+                if mask_row_id {
+                    result_row.id = 0;
+                }
                 rows.try_reserve(1).map_err(|e| {
                     crate::tenant::TenantWriteError::ReturningProjectionFailed(format!(
                         "failed to reserve RETURNING row buffer: {e}"
@@ -4076,7 +4096,13 @@ pub(crate) fn execute_delete_returning_in(
     // 結果は共有コレクタ（[`returning_collector`]）が `rows` へ積む。
     let mut rows: Vec<ResultRow> = Vec::new();
     let mut budget = 0usize;
-    let mut project = returning_collector(ctx, returning, &mut budget, &mut rows);
+    let mut project = returning_collector(
+        ctx,
+        returning,
+        schema.is_allocated(),
+        &mut budget,
+        &mut rows,
+    );
 
     let (outcome, _captured) = crate::tenant::delete_row_ledgered_capturing_unchecked(
         target,
@@ -4232,7 +4258,13 @@ pub(crate) fn execute_update_returning_in(
 
     let mut rows: Vec<ResultRow> = Vec::new();
     let mut budget = 0usize;
-    let mut project = returning_collector(ctx, returning, &mut budget, &mut rows);
+    let mut project = returning_collector(
+        ctx,
+        returning,
+        schema.is_allocated(),
+        &mut budget,
+        &mut rows,
+    );
     let rows_affected = crate::tenant::update_row_columns_capturing_unchecked(
         target,
         &bound.table,
@@ -4504,7 +4536,13 @@ pub(crate) fn execute_predicate_delete_returning(
     let columns = crate::sql::returning::column_meta(returning, schema)?;
     let mut rows: Vec<ResultRow> = Vec::new();
     let mut budget = 0usize;
-    let mut project = returning_collector(ctx, returning, &mut budget, &mut rows);
+    let mut project = returning_collector(
+        ctx,
+        returning,
+        schema.is_allocated(),
+        &mut budget,
+        &mut rows,
+    );
     let rows_affected = execute_predicate_delete_inner(
         target,
         ctx,
@@ -4750,7 +4788,13 @@ pub(crate) fn execute_predicate_update_returning(
     let columns = crate::sql::returning::column_meta(returning, schema)?;
     let mut rows: Vec<ResultRow> = Vec::new();
     let mut budget = 0usize;
-    let mut project = returning_collector(ctx, returning, &mut budget, &mut rows);
+    let mut project = returning_collector(
+        ctx,
+        returning,
+        schema.is_allocated(),
+        &mut budget,
+        &mut rows,
+    );
     let rows_affected = execute_predicate_update_inner(
         target,
         ctx,
@@ -5225,19 +5269,20 @@ pub(crate) fn execute_insert_returning_in(
     for bound in bounds {
         if has_sequence {
             let probe = sequence_patched_values(bound, schema, |_| Some(0))?;
-            rows.push(crate::sql::returning::project_row(
-                bound.id,
-                &probe,
-                returning,
-                &mut budget,
-            )?);
+            rows.push(mask_returning_row_id(
+                schema,
+                crate::sql::returning::project_row(bound.id, &probe, returning, &mut budget)?,
+            ));
         } else {
-            rows.push(crate::sql::returning::project_row(
-                bound.id,
-                &bound.values,
-                returning,
-                &mut budget,
-            )?);
+            rows.push(mask_returning_row_id(
+                schema,
+                crate::sql::returning::project_row(
+                    bound.id,
+                    &bound.values,
+                    returning,
+                    &mut budget,
+                )?,
+            ));
         }
     }
     if has_sequence {
@@ -5279,12 +5324,10 @@ pub(crate) fn execute_insert_returning_in(
             let values = sequence_patched_values(bound, schema, |col| {
                 assigned.get(&(row_idx, col)).copied()
             })?;
-            rows.push(crate::sql::returning::project_row(
-                bound.id,
-                &values,
-                returning,
-                &mut budget,
-            )?);
+            rows.push(mask_returning_row_id(
+                schema,
+                crate::sql::returning::project_row(bound.id, &values, returning, &mut budget)?,
+            ));
         }
     }
 
@@ -5400,7 +5443,13 @@ pub(crate) fn execute_upsert_returning_in(
     let columns = crate::sql::returning::column_meta(returning, bound_schema)?;
     let mut rows: Vec<ResultRow> = Vec::new();
     let mut budget = 0usize;
-    let mut project = returning_collector(ctx, returning, &mut budget, &mut rows);
+    let mut project = returning_collector(
+        ctx,
+        returning,
+        bound_schema.is_allocated(),
+        &mut budget,
+        &mut rows,
+    );
     let rows_affected = execute_upsert_inner(
         target,
         ctx,
@@ -6147,7 +6196,7 @@ mod tests {
             let mut budget = 0usize;
             let mut rows = Vec::new();
             let result =
-                returning_collector(ctx, &projection, &mut budget, &mut rows)(&row(origin));
+                returning_collector(ctx, &projection, false, &mut budget, &mut rows)(&row(origin));
             (result, rows)
         }
 

@@ -30,7 +30,7 @@ fn setup(label: &str) -> (EngineCore, std::path::PathBuf, SessionState) {
     core.execute_sql_in_session(
         &ctx(),
         &mut session,
-        "CREATE TABLE docs (embedding VECTOR(4), n INTEGER, t TEXT, \
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, embedding VECTOR(4), n INTEGER, t TEXT, \
          d INTEGER DEFAULT 1+1, s TEXT DEFAULT upper('ab'))",
     )
     .expect("create table with constant-expression defaults");
@@ -132,7 +132,7 @@ fn column_references_and_boundaries_are_rejected() {
         .execute_sql_in_session(
             &ctx(),
             &mut session,
-            "CREATE TABLE bad (embedding VECTOR(4), n INTEGER DEFAULT n + 1)",
+            "CREATE TABLE bad (id BIGINT PRIMARY KEY, embedding VECTOR(4), n INTEGER DEFAULT n + 1)",
         )
         .unwrap_err();
     assert_eq!(err.wire_code(), "42703");
@@ -141,7 +141,7 @@ fn column_references_and_boundaries_are_rejected() {
             &ctx(),
             &mut session,
             // 単独の `now()` は時刻 DEFAULT（Issue #1587）として受理されるが、定数式の中の時刻関数は拒否する。
-            "CREATE TABLE bad2 (embedding VECTOR(4), n TIMESTAMP DEFAULT now() + 1)",
+            "CREATE TABLE bad2 (id BIGINT PRIMARY KEY, embedding VECTOR(4), n TIMESTAMP DEFAULT now() + 1)",
         )
         .unwrap_err();
     assert_eq!(err.wire_code(), "42601");

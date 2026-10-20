@@ -25,6 +25,16 @@ use engine::storage::{Storage, Visibility};
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+/// 結果行の先頭セル（`SELECT id ...` の宣言済み `id` 列）を `u64` で返す。採番方式の表は
+/// `ResultRow::id` に内部 rowid を載せない（TABLE-23）ため、利用者向けの値はセルから読む。
+fn row_id(r: &engine::sql::exec::ResultRow) -> u64 {
+    match r.cells.first() {
+        Some(engine::sql::exec::Cell::SignedInteger(n)) => u64::try_from(*n).expect("id >= 0"),
+        Some(engine::sql::exec::Cell::Integer(n)) => *n,
+        other => panic!("unexpected id cell: {other:?}"),
+    }
+}
+
 fn ctx_for(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
         .expect("valid tenant")
@@ -78,7 +88,7 @@ fn values(core: &EngineCore, sql: &str) -> Vec<(u64, Option<Interval>)> {
                 Some(Cell::Null) => None,
                 other => panic!("unexpected cell {other:?}"),
             };
-            (r.id, v)
+            (row_id(r), v)
         })
         .collect()
 }
@@ -115,7 +125,10 @@ fn find(rows: &[(u64, Option<Interval>)], id: u64) -> Option<Interval> {
 #[test]
 fn interval_type_is_persisted_in_the_catalog() {
     let (path, _g, core) = open("iv-persist");
-    ok(&core, "CREATE TABLE t (a INTERVAL, b interval, c INTEGER)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a INTERVAL, b interval, c INTEGER)",
+    );
     ok(&core, "ALTER TABLE t ADD COLUMN d INTERVAL");
     ok(
         &core,
@@ -133,7 +146,7 @@ fn interval_type_is_persisted_in_the_catalog() {
 #[test]
 fn representative_formats_roundtrip_through_storage_and_output() {
     let (_p, _g, core) = open("iv-roundtrip");
-    ok(&core, "CREATE TABLE t (v INTERVAL)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, v INTERVAL)");
     let cases = [
         ("'1 day 2 hours'", "1 day 02:00:00"),
         ("'@ 1 day ago'", "-1 days"),
@@ -162,7 +175,7 @@ fn representative_formats_roundtrip_through_storage_and_output() {
 #[test]
 fn insert_classifies_format_overflow_range_and_infinity_errors() {
     let (_p, _g, core) = open("iv-errors");
-    ok(&core, "CREATE TABLE t (v INTERVAL)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, v INTERVAL)");
     let cases = [
         // 書式違反は 22007。
         ("'abc'", "22007"),
@@ -201,7 +214,7 @@ fn insert_classifies_format_overflow_range_and_infinity_errors() {
 #[test]
 fn update_set_and_upsert_bind_and_reject_without_side_effects() {
     let (_p, _g, core) = open("iv-update");
-    ok(&core, "CREATE TABLE t (v INTERVAL)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, v INTERVAL)");
     insert(&core, 1, "'1 day'", "i1").expect("insert");
     let before = values(&core, "SELECT id, v FROM t LIMIT 5");
     for (sql, want) in [
@@ -245,23 +258,29 @@ fn update_set_and_upsert_bind_and_reject_without_side_effects() {
 fn column_default_is_validated_and_applied() {
     let (_p, _g, core) = open("iv-default");
     assert_eq!(
-        code(&core, "CREATE TABLE a (v INTERVAL DEFAULT 'zz')"),
+        code(
+            &core,
+            "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL DEFAULT 'zz')"
+        ),
         "22007"
     );
     assert_eq!(
         code(
             &core,
-            "CREATE TABLE a (v INTERVAL DEFAULT '2147483648 days')"
+            "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL DEFAULT '2147483648 days')"
         ),
         "22015"
     );
     assert_eq!(
-        code(&core, "CREATE TABLE a (v INTERVAL DEFAULT 'infinity')"),
+        code(
+            &core,
+            "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL DEFAULT 'infinity')"
+        ),
         "0A000"
     );
     ok(
         &core,
-        "CREATE TABLE t (v INTERVAL DEFAULT '1 day 02:00:00', w INTEGER)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v INTERVAL DEFAULT '1 day 02:00:00', w INTEGER)",
     );
     ok(
         &core,
@@ -281,7 +300,7 @@ fn column_default_is_validated_and_applied() {
 #[test]
 fn returning_projects_the_postgres_style_value() {
     let (_p, _g, core) = open("iv-returning");
-    ok(&core, "CREATE TABLE t (v INTERVAL)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, v INTERVAL)");
     let outcome = exec(
         &core,
         "INSERT INTO t (id, v) VALUES (1, '1 year 2 months') RETURNING v USING OPERATION_ID 'r1'",
@@ -299,7 +318,7 @@ fn returning_projects_the_postgres_style_value() {
 #[test]
 fn copy_from_binds_interval_fields() {
     let (_p, _g, core) = open("iv-copy");
-    ok(&core, "CREATE TABLE t (v INTERVAL)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, v INTERVAL)");
     let run = |data: &[u8], op: &str| {
         let policy = ctx();
         let session = SessionState::default();
@@ -341,7 +360,7 @@ fn copy_from_binds_interval_fields() {
 #[test]
 fn values_and_catalog_survive_reopen() {
     let (path, guard, core) = open("iv-reopen");
-    ok(&core, "CREATE TABLE t (v INTERVAL)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, v INTERVAL)");
     insert(&core, 1, "'-178956970 years -8 mons'", "p1").expect("insert");
     insert(&core, 2, "'2562047788:00:54.775807'", "p2").expect("insert");
     drop(core);
@@ -358,7 +377,7 @@ fn values_and_catalog_survive_reopen() {
 #[test]
 fn other_tenants_cannot_see_interval_rows() {
     let (_p, _g, core) = open("iv-tenant");
-    ok(&core, "CREATE TABLE t (v INTERVAL)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, v INTERVAL)");
     insert(&core, 1, "'31 days 7 hours'", "t1").expect("insert");
     let other = core
         .execute_sql(&ctx_for("bob"), "SELECT id, v FROM t LIMIT 5")
@@ -381,7 +400,10 @@ fn other_tenants_cannot_see_interval_rows() {
 #[test]
 fn features_not_yet_enabled_are_rejected_fail_closed() {
     let (_p, _g, core) = open("iv-failclosed");
-    ok(&core, "CREATE TABLE t (v INTERVAL, n INTEGER)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v INTERVAL, n INTEGER)",
+    );
     insert(&core, 1, "'1 day'", "f1").expect("insert");
     for sql in [
         "SELECT id FROM t WHERE v IS NOT DISTINCT FROM '1 day' LIMIT 5",
@@ -391,8 +413,8 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
         "SELECT v FROM t UNION SELECT v FROM t",
         "SELECT v FROM t UNION ALL SELECT v FROM t",
         "SELECT INTERVAL '1 day' FROM t LIMIT 5",
-        "CREATE TABLE a (v INTERVAL PRIMARY KEY)",
-        "CREATE TABLE a (v INTERVAL UNIQUE)",
+        "CREATE TABLE a (id BIGINT NOT NULL UNIQUE, v INTERVAL PRIMARY KEY)",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL UNIQUE)",
         // INTERVAL→TEXT は TABLE-40 の一般変換（Issue #1636）で受理される。
         // INTEGER→INTERVAL は代入変換が無く拒否のまま。
         "ALTER TABLE t ALTER COLUMN n TYPE INTERVAL",
@@ -404,7 +426,7 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
     let is_null = core
         .execute_sql(&ctx(), "SELECT id FROM t WHERE v IS NULL LIMIT 5")
         .expect("is null");
-    assert_eq!(is_null.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [2]);
+    assert_eq!(is_null.rows.iter().map(row_id).collect::<Vec<_>>(), [2]);
     assert_eq!(values(&core, "SELECT id, v FROM t LIMIT 5").len(), 2);
 }
 
@@ -413,15 +435,15 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
 fn unsupported_interval_type_spellings_are_rejected() {
     let (_p, _g, core) = open("iv-spellings");
     for sql in [
-        "CREATE TABLE a (v INTERVAL(3))",
-        "CREATE TABLE a (v INTERVAL YEAR)",
-        "CREATE TABLE a (v INTERVAL DAY TO SECOND)",
-        "CREATE TABLE a (v INTERVAL[])",
-        "CREATE TABLE a (v INTERVAL[3])",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL(3))",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL YEAR)",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL DAY TO SECOND)",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL[])",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL[3])",
     ] {
         assert_eq!(code(&core, sql), "0A000", "{sql}");
     }
-    ok(&core, "CREATE TABLE b (v INTERVAL)");
+    ok(&core, "CREATE TABLE b (id BIGINT PRIMARY KEY, v INTERVAL)");
     assert_eq!(
         code(&core, "ALTER TABLE b ADD COLUMN w INTERVAL(6)"),
         "0A000"

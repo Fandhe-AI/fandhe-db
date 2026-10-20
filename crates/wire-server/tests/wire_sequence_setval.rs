@@ -38,7 +38,7 @@ fn setup() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     for sql in [
         "CREATE SEQUENCE s",
         "CREATE SEQUENCE capped MAXVALUE 10",
-        "CREATE TABLE t (n BIGINT)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)",
     ] {
         core.execute_sql_in_session(&ctx, &mut session, sql)
             .unwrap_or_else(|e| panic!("{sql}: {e}"));

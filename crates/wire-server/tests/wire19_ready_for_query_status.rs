@@ -15,6 +15,12 @@
 
 #[path = "common/mod.rs"]
 mod common;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// NoSQL 表層は従来方式の表だけを扱うため、このテストの `CREATE TABLE` は従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../../engine/src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 
 #[path = "../../engine/src/test_util/temp_db.rs"]
 mod temp_db;
@@ -666,7 +672,7 @@ fn deferred_foreign_key_violation_at_commit_returns_to_idle() {
         "CREATE TABLE p (name TEXT)",
         "CREATE TABLE c (parent_id BIGINT REFERENCES p DEFERRABLE INITIALLY DEFERRED)",
     ] {
-        core.execute_sql_in_session(&sys, &mut ddl_session, sql)
+        core.execute_sql_in_session_legacy(&sys, &mut ddl_session, sql)
             .expect("ddl succeeds");
     }
     let mut stream = spawn_alice(core);

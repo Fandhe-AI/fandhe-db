@@ -204,6 +204,27 @@ pub fn visible_rows_with_scan_limit(
     ctx: &PolicyContext,
     scan_limits: crate::scan_limits::ScanLimits,
 ) -> Result<Vec<Row>, TenantError> {
+    visible_rows_impl(storage, table, ctx, scan_limits, false)
+}
+
+/// [`visible_rows_with_scan_limit`] と同一契約で採番方式の表も走査する crate 内部専用版
+/// （Issue #2199。`core.rs` の `USING PLAN` 辞書構築用。公開 API のゲートは維持する）。
+pub(crate) fn visible_rows_any_identity(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    scan_limits: crate::scan_limits::ScanLimits,
+) -> Result<Vec<Row>, TenantError> {
+    visible_rows_impl(storage, table, ctx, scan_limits, true)
+}
+
+fn visible_rows_impl(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    scan_limits: crate::scan_limits::ScanLimits,
+    allow_allocated: bool,
+) -> Result<Vec<Row>, TenantError> {
     let max_scanned_rows = scan_limits.max_scanned_rows();
     let mut out = Vec::new();
     // カーソルは行ストアの物理キーと同じ `(tenant_id, id)` 形（TABLE-12）。`id` 単独では
@@ -212,7 +233,11 @@ pub fn visible_rows_with_scan_limit(
     let mut scanned: usize = 0;
     loop {
         let cursor = after.as_ref().map(|(t, id)| (t.as_str(), *id));
-        let (page, next) = storage.scan_table_page(table, cursor, PAGE_LIMIT)?;
+        let (page, next) = if allow_allocated {
+            storage.scan_table_page_any_identity(table, cursor, PAGE_LIMIT)?
+        } else {
+            storage.scan_table_page(table, cursor, PAGE_LIMIT)?
+        };
         if page.is_empty() && next.is_none() {
             break;
         }
@@ -1651,7 +1676,12 @@ pub fn insert_typed_row(
     operation_id: &OperationId,
 ) -> Result<(), TenantWriteError> {
     let ledger_write = LedgerMode::Ledgered.resolve(Some(operation_id))?;
-    insert_typed_row_unchecked(
+    // 利用者が行 id を指定する Rust API は、rowid を自前で払い出す採番方式の表（TABLE-23・
+    // Issue #2199）では意味を持たないため、固定文言の `0A000` で拒否する。判定は書き込みと同じ
+    // write txn 内で取得したスキーマに対して行う（別 txn で判定すると並行 DROP・再作成との
+    // TOCTOU でゲートを素通りするため）。SQL 表層は [`insert_typed_row_unchecked`] を直接呼ぶ。
+    insert_typed_row_impl(
+        true,
         WriteTarget::Autocommit(storage),
         table,
         ctx,
@@ -1701,9 +1731,43 @@ pub(crate) fn insert_typed_row_unchecked(
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: &[VolatileColumn],
 ) -> Result<(), TenantWriteError> {
+    insert_typed_row_impl(
+        false,
+        target,
+        table,
+        ctx,
+        id,
+        visibility,
+        values,
+        ledger_write,
+        expected_schema,
+        volatile_default_columns,
+    )
+}
+
+/// [`insert_typed_row_unchecked`] の本体。`require_legacy` が真なら write txn 内で取得した
+/// スキーマが採番方式のとき `0A000` で拒否する（[`insert_typed_row`] 用）。
+#[allow(clippy::too_many_arguments)]
+fn insert_typed_row_impl(
+    require_legacy: bool,
+    target: WriteTarget<'_>,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    visibility: crate::storage::Visibility,
+    values: &[crate::row_codec::Value],
+    ledger_write: LedgerWrite<'_>,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    volatile_default_columns: &[VolatileColumn],
+) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
     target.with_txn(|write_txn| {
-        let schema = require_table_schema_write(write_txn, table)?;
+        let schema = require_table_schema_write_any_identity(write_txn, table)?;
+        if require_legacy {
+            schema
+                .require_legacy_row_identity()
+                .map_err(TenantWriteError::Catalog)?;
+        }
         if let Some(expected) = expected_schema {
             if expected != &schema {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
@@ -1711,6 +1775,10 @@ pub(crate) fn insert_typed_row_unchecked(
                 )));
             }
         }
+        // 採番方式の表（TABLE-23・Issue #2199）は呼び出し元の `id` を使わず、内容照合ハッシュの
+        // 材料には固定値 0 を使う（rowid は再送前に分からないため。再送判定を決定的に保つ）。
+        let allocated = schema.is_allocated();
+        let hash_id = if allocated { 0 } else { id };
         let vector_idx = schema
             .columns
             .iter()
@@ -1754,11 +1822,11 @@ pub(crate) fn insert_typed_row_unchecked(
         let content_hash = if has_values_expr(volatile_default_columns) {
             let expr_columns =
                 named_expr_columns(&schema, values, vector_idx, volatile_default_columns)?;
-            content_hash::for_typed_insert_expr(id, visibility, embedding, &expr_columns)?
+            content_hash::for_typed_insert_expr(hash_id, visibility, embedding, &expr_columns)?
         } else {
             let named_columns =
                 named_value_columns(&schema, values, vector_idx, volatile_default_columns)?;
-            content_hash::for_typed_insert(id, visibility, embedding, &named_columns)?
+            content_hash::for_typed_insert(hash_id, visibility, embedding, &named_columns)?
         };
         ledger::record_in_txn(
             write_txn,
@@ -1792,11 +1860,25 @@ pub(crate) fn insert_typed_row_unchecked(
             embedding,
             metadata: &metadata,
         };
+        // 採番方式の表の rowid は台帳照合・SEQUENCE 採番の後、行ストアを開く前に払い出す
+        // （`rowid_alloc::allocate_in_txn` の呼び出し規約）。
+        let row_id = if allocated {
+            allocate_rowids(write_txn, ctx.tenant_id(), table, 1)?
+                .first()
+                .copied()
+                .ok_or_else(|| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(
+                        "row id allocation returned no id".to_string(),
+                    ))
+                })?
+        } else {
+            RowId::from_legacy_id(id)
+        };
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
-        let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
+        let key = row_key(ctx.tenant_id(), row_id);
         let encoded = encode_row(&row)?;
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
         drop(row_table);
@@ -1808,12 +1890,50 @@ pub(crate) fn insert_typed_row_unchecked(
             table,
             &schema,
             ctx.tenant_id(),
-            &[RowId::from_legacy_id(id)],
+            &[row_id],
             target.fk_check_mode(),
         )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok(((), TxnEffect::Wrote))
     })
+}
+
+/// 採番方式の表（TABLE-23・Issue #2199）へ書く `n` 行分の rowid を、同じ write txn 内で払い出す
+/// （`catalog::rowid_alloc::allocate_in_txn` の薄い写像）。呼び出し元は行ストア
+/// （`user_rows/{table}`）のハンドルを開く**前**に呼ぶこと。`n` は呼び出し元がバッチ上限で検証済みの
+/// 行数で、確保はフォールブル（`try_reserve_exact`）にする。枯渇・不正は固定文言の
+/// `CatalogError::Invalid`（`22000`）で fail-closed に拒否する。
+pub(crate) fn allocate_rowids(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    table: &str,
+    n: usize,
+) -> Result<Vec<RowId>, TenantWriteError> {
+    let count = u64::try_from(n).map_err(|_| {
+        TenantWriteError::Catalog(CatalogError::Invalid(
+            "row id allocation count out of range".to_string(),
+        ))
+    })?;
+    let range = crate::catalog::rowid_alloc::allocate_in_txn(write_txn, tenant, table, count)?;
+    let first = range.start().raw_for_state();
+    let last = range.end().raw_for_state();
+    let mut out: Vec<RowId> = Vec::new();
+    out.try_reserve_exact(n).map_err(|_| {
+        TenantWriteError::Storage(StorageError::Codec(
+            "failed to reserve row id batch".to_string(),
+        ))
+    })?;
+    let mut raw = first;
+    loop {
+        out.push(RowId::from_allocated(raw));
+        if raw == last {
+            break;
+        }
+        raw = raw.checked_add(1).ok_or_else(|| {
+            TenantWriteError::Catalog(CatalogError::Invalid("row id space exhausted".to_string()))
+        })?;
+    }
+    Ok(out)
 }
 
 /// [`insert_typed_row_unchecked`] の複数行版（Issue #771・TASK-178・NOSQL-6）。
@@ -1857,28 +1977,33 @@ pub(crate) fn insert_typed_rows_unchecked(
     }
     check_volatile_len(volatile_default_columns, rows.len())?;
 
-    // バッチ内 id 重複検出（`insert_rows_unchecked` と同じ設計。確保はフォール
-    // ブルにする。coding-rust.md）。
-    let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    seen_ids.try_reserve(rows.len()).map_err(|_| {
-        TenantWriteError::Storage(StorageError::Codec(
-            "failed to reserve batch id set".to_string(),
-        ))
-    })?;
-    for (id, _) in rows {
-        if !seen_ids.insert(*id) {
-            return Err(TenantWriteError::IdConflict);
-        }
-    }
-
     target.with_txn(|write_txn| {
-        {
-            let schema = require_table_schema_write(write_txn, table)?;
+        let row_ids: Vec<RowId> = {
+            let schema = require_table_schema_write_any_identity(write_txn, table)?;
             if let Some(expected) = expected_schema {
                 if expected != &schema {
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                         "table schema changed after the insert values were bound".to_string(),
                     )));
+                }
+            }
+            // 採番方式の表（TABLE-23・Issue #2199）には利用者指定の行 id が無く、呼び出し元の `id` は
+            // 固定の仮値。重複検出は従来方式の表だけが対象で、ハッシュ材料には行の位置を使う
+            // （rowid は再送前に分からないため、再送判定を決定的に保つ）。
+            let allocated = schema.is_allocated();
+            if !allocated {
+                // バッチ内 id 重複検出（`insert_rows_unchecked` と同じ設計。確保はフォールブルに
+                // する。coding-rust.md）。行ストアへ触れる前・台帳へ書く前に検出する。
+                let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                seen_ids.try_reserve(rows.len()).map_err(|_| {
+                    TenantWriteError::Storage(StorageError::Codec(
+                        "failed to reserve batch id set".to_string(),
+                    ))
+                })?;
+                for (id, _) in rows {
+                    if !seen_ids.insert(*id) {
+                        return Err(TenantWriteError::IdConflict);
+                    }
                 }
             }
             // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま扱う
@@ -1916,6 +2041,7 @@ pub(crate) fn insert_typed_rows_unchecked(
             );
             let mut expr_rows: Vec<ExprHashRow<'_>> = Vec::new();
             for (row_idx, (id, values)) in rows.iter().enumerate() {
+                let hash_id = if allocated { row_idx as u64 } else { *id };
                 let embedding: &[f32] = match vector_idx {
                     Some(idx) => match values.get(idx) {
                         Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
@@ -1935,7 +2061,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                         .unwrap_or(&[]);
                     let expr_columns =
                         named_expr_columns(&schema, values, vector_idx, row_volatile)?;
-                    expr_rows.push((*id, visibility, embedding, expr_columns));
+                    expr_rows.push((hash_id, visibility, embedding, expr_columns));
                     continue;
                 }
                 let row_volatile: &[VolatileColumn] = volatile_default_columns
@@ -1943,7 +2069,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                     .copied()
                     .unwrap_or(&[]);
                 let named_columns = named_value_columns(&schema, values, vector_idx, row_volatile)?;
-                hash_rows.push((*id, visibility, embedding, named_columns));
+                hash_rows.push((hash_id, visibility, embedding, named_columns));
             }
             let content_hash = if use_expr {
                 let expr_input: Vec<content_hash::TypedInsertExprBatchRow<'_>> = expr_rows
@@ -1983,11 +2109,20 @@ pub(crate) fn insert_typed_rows_unchecked(
                 &row_values,
             )?;
 
+            // 採番方式の表の rowid は台帳照合・SEQUENCE 採番の後、行ストアを開く前に行の数だけ
+            // まとめて払い出す（Issue #2199。従来方式の表は呼び出し元の `id` をそのまま使う）。
+            let row_ids: Vec<RowId> = if allocated {
+                allocate_rowids(write_txn, ctx.tenant_id(), table, rows.len())?
+            } else {
+                rows.iter()
+                    .map(|(id, _)| RowId::from_legacy_id(*id))
+                    .collect()
+            };
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
                 .open_table(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
-            for (row_idx, (id, orig_values)) in rows.iter().enumerate() {
+            for (row_idx, (_, orig_values)) in rows.iter().enumerate() {
                 let values: &[crate::row_codec::Value] = match &sequence_rows {
                     Some(owned) => owned
                         .get(row_idx)
@@ -2014,20 +2149,24 @@ pub(crate) fn insert_typed_rows_unchecked(
                     embedding,
                     metadata: &metadata,
                 };
-                let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(*id));
+                let row_id = row_ids.get(row_idx).copied().ok_or_else(|| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(
+                        "row id allocation count mismatch".to_string(),
+                    ))
+                })?;
+                let key = row_key(ctx.tenant_id(), row_id);
                 let encoded = encode_row(&row)?;
                 insert_unique_row(&mut row_table, key, encoded.as_slice())?;
             }
-        }
+            drop(row_table);
+            row_ids
+        };
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
         // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
         // ドキュメント参照）。
         {
-            let ids: Vec<RowId> = rows
-                .iter()
-                .map(|(id, _)| RowId::from_legacy_id(*id))
-                .collect();
-            let schema_for_pk = require_table_schema_write(write_txn, table)?;
+            let ids: Vec<RowId> = row_ids;
+            let schema_for_pk = require_table_schema_write_any_identity(write_txn, table)?;
             crate::constraint::enforce_row_constraints_in_txn(
                 write_txn,
                 table,
@@ -2246,18 +2385,6 @@ fn upsert_typed_rows_impl(
     // `id` は対象が `Unique`（Issue #1074）の場合も衝突判定には使わないが、
     // 新規挿入分岐で使う一意な行識別子であることに変わりはないため、対象に
     // 関わらず検出する。
-    let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    seen_ids.try_reserve(rows.len()).map_err(|_| {
-        TenantWriteError::Storage(StorageError::Codec(
-            "failed to reserve upsert batch id set".to_string(),
-        ))
-    })?;
-    for (id, _) in rows {
-        if !seen_ids.insert(*id) {
-            return Err(TenantWriteError::IdConflict);
-        }
-    }
-
     // バッチ内の対象キー重複検出（Issue #1074。UNIQUE 対象のみ）。呼び出し元
     // `sql::parser::bind_upsert_form` が束縛時点で既に `22000` として拒否済みの
     // ため通常は到達しないが、`(id)` 対象の `seen_ids` と同じ理由で本関数単体
@@ -2290,12 +2417,36 @@ fn upsert_typed_rows_impl(
         let mut inserted: u64 = 0;
         let mut updated: u64 = 0;
         {
-            let schema = require_table_schema_write(write_txn, table)?;
+            let schema = require_table_schema_write_any_identity(write_txn, table)?;
             if let Some(expected) = expected_schema {
                 if expected != &schema {
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                         "table schema changed after the insert values were bound".to_string(),
                     )));
+                }
+            }
+            // 採番方式の表（TABLE-23・Issue #2199）: 利用者指定の行 id が無いため行 id の重複検出は
+            // 従来方式の表だけが対象で、衝突対象は `(id)` の行キー指定ではなく PRIMARY KEY／UNIQUE
+            // 制約（`Unique`）に限る（行キー指定は fail-closed に拒否）。ハッシュ材料には行の位置を使う。
+            let allocated = schema.is_allocated();
+            if allocated {
+                schema.require_legacy_row_identity_unless_unique_target(target)?;
+            } else {
+                // バッチ内 id 重複検出（`insert_typed_rows_unchecked` と同じ設計。確保はフォール
+                // ブルにする）。呼び出し元 `sql::parser::bind_upsert_form` が束縛時点で既に `22000` として
+                // 拒否済みのため通常は到達しないが、本関数単体でも fail-closed を保つ。`VALUES` の
+                // `id` は対象が `Unique`（Issue #1074）の場合も衝突判定には使わないが、新規挿入分岐で
+                // 使う一意な行識別子であることに変わりはないため、対象に関わらず検出する。
+                let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                seen_ids.try_reserve(rows.len()).map_err(|_| {
+                    TenantWriteError::Storage(StorageError::Codec(
+                        "failed to reserve upsert batch id set".to_string(),
+                    ))
+                })?;
+                for (id, _) in rows {
+                    if !seen_ids.insert(*id) {
+                        return Err(TenantWriteError::IdConflict);
+                    }
                 }
             }
             // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま扱う
@@ -2331,6 +2482,7 @@ fn upsert_typed_rows_impl(
             );
             let mut expr_rows: Vec<ExprHashRow<'_>> = Vec::new();
             for (row_idx, (id, values)) in rows.iter().enumerate() {
+                let hash_id = if allocated { row_idx as u64 } else { *id };
                 let embedding: &[f32] = match vector_idx {
                     Some(idx) => match values.get(idx) {
                         Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
@@ -2351,7 +2503,7 @@ fn upsert_typed_rows_impl(
                     reject_missing_not_null(&schema, row_volatile)?;
                     let expr_columns =
                         named_expr_columns(&schema, values, vector_idx, row_volatile)?;
-                    expr_rows.push((*id, insert_visibility, embedding, expr_columns));
+                    expr_rows.push((hash_id, insert_visibility, embedding, expr_columns));
                     continue;
                 }
                 let row_volatile: &[VolatileColumn] = volatile_default_columns
@@ -2360,7 +2512,7 @@ fn upsert_typed_rows_impl(
                     .unwrap_or(&[]);
                 reject_missing_not_null(&schema, row_volatile)?;
                 let named_columns = named_value_columns(&schema, values, vector_idx, row_volatile)?;
-                hash_rows.push((*id, insert_visibility, embedding, named_columns));
+                hash_rows.push((hash_id, insert_visibility, embedding, named_columns));
             }
             let hash_input: Vec<content_hash::TypedInsertBatchRow<'_>> = hash_rows
                 .iter()
@@ -2459,6 +2611,19 @@ fn upsert_typed_rows_impl(
                 &content_hash_value,
             )?;
 
+            // 採番方式の表の新規挿入行に使う rowid は、台帳照合の後・行ストアを開く前に行の数だけ
+            // まとめて払い出す（衝突して使わなかった分は欠番になる。Issue #2199）。従来方式の表は
+            // `VALUES` 自身の `id` を使う。
+            let new_row_ids: Option<Vec<RowId>> = if allocated {
+                Some(allocate_rowids(
+                    write_txn,
+                    ctx.tenant_id(),
+                    table,
+                    rows.len(),
+                )?)
+            } else {
+                None
+            };
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
                 .open_table(user_rows_table_def(&row_table_name))
@@ -2500,7 +2665,16 @@ fn upsert_typed_rows_impl(
             // `DO UPDATE` で実際に既存行を書き換えた場合のみ、書き換え前の全列値を
             // 積む（新規挿入行は「更新」ではないため対象外）。
             let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
-            for (id, values) in rows {
+            for (row_idx, (id, values)) in rows.iter().enumerate() {
+                // 新規挿入分岐が使う行 id（採番方式の表は払い出し済みの rowid）。
+                let insert_id: u64 = match &new_row_ids {
+                    Some(ids) => ids.get(row_idx).map(|r| r.legacy_id()).ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "row id allocation count mismatch".to_string(),
+                        ))
+                    })?,
+                    None => *id,
+                };
                 // 衝突判定の対象行 id を対象ごとに決定する（Issue #1074）。`(id)`
                 // 対象は常に VALUES 自身の `id` で判定する（既存挙動、無変更）。
                 // UNIQUE 対象は上記の事前走査で一致した既存行の `id` を使う（対象
@@ -2736,7 +2910,7 @@ fn upsert_typed_rows_impl(
                     // 拒否する——PostgreSQL の「arbiter でない制約の違反は吸収しない」
                     // 挙動と同じ）。既存 `insert_typed_rows_unchecked` と同じ組み立て
                     // （Issue #995: `VECTOR` 列なしスキーマは embedding 空）。
-                    let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(*id));
+                    let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(insert_id));
                     let embedding: &[f32] = match vector_idx {
                         Some(idx) => match values.get(idx) {
                             Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
@@ -2763,7 +2937,7 @@ fn upsert_typed_rows_impl(
                         let values =
                             captured_values_from_parts(&schema, embedding.to_vec(), &metadata)?;
                         project(&CapturedRow {
-                            id: *id,
+                            id: insert_id,
                             tenant_id: ctx.tenant_id().to_string(),
                             visibility: insert_visibility,
                             origin: CapturedRowOrigin::Inserted,
@@ -2775,7 +2949,7 @@ fn upsert_typed_rows_impl(
                             "upsert inserted row counter overflow".to_string(),
                         ))
                     })?;
-                    written_ids.push(*id);
+                    written_ids.push(insert_id);
                 }
             }
             // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約
@@ -4957,7 +5131,8 @@ fn delete_rows_where_impl<E>(
     validate_identifier(table).map_err(dml_write_err)?;
     target.with_txn(|write_txn| {
         let (candidate_ids, schema) = {
-            let schema = require_table_schema_write(write_txn, table).map_err(dml_write_err)?;
+            let schema =
+                require_table_schema_write_any_identity(write_txn, table).map_err(dml_write_err)?;
             if let Some(expected) = expected_schema {
                 if expected != &schema {
                     return Err(dml_write_err(CatalogError::Invalid(
@@ -5143,7 +5318,8 @@ fn update_rows_where_impl<E>(
     validate_identifier(table).map_err(dml_write_err)?;
     target.with_txn(|write_txn| {
         let (candidate_ids, schema) = {
-            let schema = require_table_schema_write(write_txn, table).map_err(dml_write_err)?;
+            let schema =
+                require_table_schema_write_any_identity(write_txn, table).map_err(dml_write_err)?;
             if let Some(expected) = expected_schema {
                 if expected != &schema {
                     return Err(dml_write_err(CatalogError::Invalid(

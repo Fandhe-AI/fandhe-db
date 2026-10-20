@@ -25,17 +25,21 @@ use super::check_constraint::{map_expr_idents, map_predicate_columns};
 use super::udf_call::Expr;
 
 /// 公開名 → 物理名の対応（`Resolved::View::column_map` の借用ビュー）。
-pub(crate) struct ColumnMap<'a>(&'a [(String, String)]);
+pub(crate) struct ColumnMap<'a> {
+    map: &'a [(String, String)],
+    /// 基底表が疑似列 `id` を持つか（従来方式の表。採番方式の表では `id` は通常列）。
+    pseudo_id: bool,
+}
 
 impl<'a> ColumnMap<'a> {
-    pub(crate) fn new(map: &'a [(String, String)]) -> Self {
-        ColumnMap(map)
+    pub(crate) fn new(map: &'a [(String, String)], pseudo_id: bool) -> Self {
+        ColumnMap { map, pseudo_id }
     }
 
     /// 公開名に対応する物理名（対応が無ければ同名のまま返す。呼び出し元が公開列の範囲検査を
     /// 済ませているため、無い場合は未知の列であり後段の束縛が拒否する）。
     fn physical(&self, public: &str) -> String {
-        self.0
+        self.map
             .iter()
             .find(|(p, _)| p == public)
             .map(|(_, phys)| phys.clone())
@@ -43,15 +47,18 @@ impl<'a> ColumnMap<'a> {
     }
 
     fn contains(&self, public: &str) -> bool {
-        self.0.iter().any(|(p, _)| p == public)
+        self.map.iter().any(|(p, _)| p == public)
     }
 
     /// 疑似列 `id` へ別名で写る公開名が `idents` に含まれていれば `0A000`。疑似列 `id` は
     /// 述語・並べ替え・集計で扱いが異なる（`IdCompare` 等）ため、外側の投影以外での参照は
     /// 意味を取り違えないよう未対応にする（fail-closed）。
     fn reject_aliased_id_refs(&self, idents: &HashSet<String>) -> Result<(), SqlSurfaceError> {
+        if !self.pseudo_id {
+            return Ok(());
+        }
         let hit = self
-            .0
+            .map
             .iter()
             .any(|(public, phys)| phys == "id" && public != "id" && idents.contains(public));
         if hit {
@@ -63,9 +70,11 @@ impl<'a> ColumnMap<'a> {
     /// 利用者列を公開名 `id` で公開しているか。このとき疑似列 `id`（行 identity）と公開名 `id`
     /// （別名元の利用者列）は別物になる。
     fn exposes_user_column_as_id(&self) -> bool {
-        self.0
-            .iter()
-            .any(|(public, phys)| public == "id" && phys != "id")
+        self.pseudo_id
+            && self
+                .map
+                .iter()
+                .any(|(public, phys)| public == "id" && phys != "id")
     }
 }
 
@@ -256,7 +265,7 @@ pub(crate) fn rewrite_projection(
 ) -> Result<Projection, SqlSurfaceError> {
     match projection {
         Projection::All => Ok(finish_items(
-            map.0.iter().map(|(p, _)| column_item(map, p)).collect(),
+            map.map.iter().map(|(p, _)| column_item(map, p)).collect(),
         )),
         Projection::Columns(cols) => {
             let mut items = Vec::with_capacity(cols.len());
@@ -399,7 +408,7 @@ mod tests {
     #[test]
     fn id_compare_is_rejected_when_user_column_is_exposed_as_id() {
         let pairs = vec![("id".to_string(), "lang".to_string())];
-        let map = ColumnMap::new(&pairs);
+        let map = ColumnMap::new(&pairs, true);
         for preds in [
             vec![id_compare()],
             vec![WherePredicate::Not(Box::new(id_compare()))],
@@ -413,7 +422,7 @@ mod tests {
     #[test]
     fn id_compare_passes_when_id_is_not_user_column() {
         let pairs = vec![("a".to_string(), "lang".to_string())];
-        let map = ColumnMap::new(&pairs);
+        let map = ColumnMap::new(&pairs, true);
         assert!(rewrite_where(&map, vec![id_compare()]).is_ok());
     }
 }

@@ -50,7 +50,7 @@ fn setup() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let (core, guard) = new_core();
     ddl(&core, "CREATE SEQUENCE s");
     ddl(&core, "CREATE SEQUENCE capped MAXVALUE 2");
-    ddl(&core, "CREATE TABLE t (n BIGINT)");
+    ddl(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)");
     (core, guard)
 }
 

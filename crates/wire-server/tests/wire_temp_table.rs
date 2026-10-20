@@ -71,18 +71,24 @@ fn simple_query_creates_and_drops_temp_tables_without_ddl_permission() {
     let addr = spawn_server_with_engine(&users_path, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
-    send_simple_query(&mut stream, "CREATE TEMP TABLE t (a TEXT)");
+    send_simple_query(
+        &mut stream,
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, a TEXT)",
+    );
     assert_eq!(read_command_complete(&mut stream), "CREATE TABLE");
     read_ready_for_query(&mut stream);
 
-    send_simple_query(&mut stream, "CREATE TEMP TABLE t (a TEXT)");
+    send_simple_query(
+        &mut stream,
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, a TEXT)",
+    );
     expect_error_response_with_sqlstate(&mut stream, "42P07");
     read_ready_for_query(&mut stream);
 
     // 一時表を持つ接続でも、2 個目の CREATE TEMP と一時表の DROP が通る。
     send_simple_query(
         &mut stream,
-        "CREATE GLOBAL TEMPORARY TABLE u (a TEXT) ON COMMIT PRESERVE ROWS",
+        "CREATE GLOBAL TEMPORARY TABLE u (id BIGINT PRIMARY KEY, a TEXT) ON COMMIT PRESERVE ROWS",
     );
     assert_eq!(read_command_complete(&mut stream), "CREATE TABLE");
     read_ready_for_query(&mut stream);
@@ -95,13 +101,19 @@ fn simple_query_creates_and_drops_temp_tables_without_ddl_permission() {
     send_simple_query(&mut stream, "DROP TABLE t");
     expect_error_response_with_sqlstate(&mut stream, "42501");
     read_ready_for_query(&mut stream);
-    send_simple_query(&mut stream, "CREATE TABLE p (a TEXT)");
+    send_simple_query(
+        &mut stream,
+        "CREATE TABLE p (id BIGINT PRIMARY KEY, a TEXT)",
+    );
     expect_error_response_with_sqlstate(&mut stream, "42501");
     read_ready_for_query(&mut stream);
 
     // ON COMMIT DROP は自動コミットの文の終わりで消えるため、再作成できる。
     for _ in 0..2 {
-        send_simple_query(&mut stream, "CREATE TEMP TABLE d (a TEXT) ON COMMIT DROP");
+        send_simple_query(
+            &mut stream,
+            "CREATE TEMP TABLE d (id BIGINT PRIMARY KEY, a TEXT) ON COMMIT DROP",
+        );
         assert_eq!(read_command_complete(&mut stream), "CREATE TABLE");
         read_ready_for_query(&mut stream);
     }
@@ -117,18 +129,26 @@ fn extended_query_creates_and_drops_temp_tables() {
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
     assert_eq!(
-        extended_command(&mut stream, "s1", "CREATE TEMP TABLE t (a TEXT)"),
+        extended_command(
+            &mut stream,
+            "s1",
+            "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, a TEXT)"
+        ),
         "CREATE TABLE"
     );
     assert_eq!(
-        extended_command(&mut stream, "s2", "CREATE TEMP TABLE u (a TEXT)"),
+        extended_command(
+            &mut stream,
+            "s2",
+            "CREATE TEMP TABLE u (id BIGINT PRIMARY KEY, a TEXT)"
+        ),
         "CREATE TABLE"
     );
     assert_eq!(
         extended_command(
             &mut stream,
             "s3",
-            "CREATE TEMPORARY TABLE d (a TEXT) ON COMMIT DROP"
+            "CREATE TEMPORARY TABLE d (id BIGINT PRIMARY KEY, a TEXT) ON COMMIT DROP"
         ),
         "CREATE TABLE"
     );
@@ -137,7 +157,7 @@ fn extended_query_creates_and_drops_temp_tables() {
         extended_command(
             &mut stream,
             "s4",
-            "CREATE TEMPORARY TABLE d (a TEXT) ON COMMIT DROP"
+            "CREATE TEMPORARY TABLE d (id BIGINT PRIMARY KEY, a TEXT) ON COMMIT DROP"
         ),
         "CREATE TABLE"
     );
@@ -146,7 +166,11 @@ fn extended_query_creates_and_drops_temp_tables() {
         "DROP TABLE"
     );
     assert_eq!(
-        extended_command(&mut stream, "s6", "CREATE TEMP TABLE t (a TEXT)"),
+        extended_command(
+            &mut stream,
+            "s6",
+            "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, a TEXT)"
+        ),
         "CREATE TABLE"
     );
 }
@@ -160,7 +184,10 @@ fn temp_tables_are_private_to_a_connection() {
     let addr = spawn_server_with_engine(&users_path, core);
 
     let mut a = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
-    send_simple_query(&mut a, "CREATE TEMP TABLE only_a (x TEXT)");
+    send_simple_query(
+        &mut a,
+        "CREATE TEMP TABLE only_a (id BIGINT PRIMARY KEY, x TEXT)",
+    );
     assert_eq!(read_command_complete(&mut a), "CREATE TABLE");
     read_ready_for_query(&mut a);
 
@@ -168,7 +195,10 @@ fn temp_tables_are_private_to_a_connection() {
     send_simple_query(&mut b, "DROP TABLE only_a");
     expect_error_response_with_sqlstate(&mut b, "42501");
     read_ready_for_query(&mut b);
-    send_simple_query(&mut b, "CREATE TEMP TABLE only_a (x TEXT)");
+    send_simple_query(
+        &mut b,
+        "CREATE TEMP TABLE only_a (id BIGINT PRIMARY KEY, x TEXT)",
+    );
     assert_eq!(read_command_complete(&mut b), "CREATE TABLE");
     read_ready_for_query(&mut b);
 
@@ -342,7 +372,10 @@ fn simple_query_dml_and_select_on_temp_tables() {
     let mut s = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
     assert_eq!(
-        simple_ok(&mut s, "CREATE TEMP TABLE t (a TEXT NOT NULL)"),
+        simple_ok(
+            &mut s,
+            "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, a TEXT NOT NULL)"
+        ),
         "CREATE TABLE"
     );
     // `--require-operation-id` 構成（台帳あり・id 必須）でも operation_id は要らない。
@@ -414,7 +447,10 @@ fn extended_query_dml_and_select_on_temp_tables() {
     let mut s = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
     assert_eq!(
-        simple_ok(&mut s, "CREATE TEMP TABLE t (a TEXT NOT NULL)"),
+        simple_ok(
+            &mut s,
+            "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, a TEXT NOT NULL)"
+        ),
         "CREATE TABLE"
     );
     assert_eq!(
@@ -523,7 +559,10 @@ fn extended_query_dml_and_select_on_temp_tables() {
     );
     assert_eq!(simple_ok(&mut s, "DROP TABLE t"), "DROP TABLE");
     assert_eq!(
-        simple_ok(&mut s, "CREATE TEMP TABLE t (a TEXT NOT NULL)"),
+        simple_ok(
+            &mut s,
+            "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, a TEXT NOT NULL)"
+        ),
         "CREATE TABLE"
     );
     assert_eq!(
@@ -548,11 +587,17 @@ fn copy_from_and_to_work_on_temp_tables() {
     let mut s = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
     assert_eq!(
-        simple_ok(&mut s, "CREATE TEMP TABLE t (a TEXT)"),
+        simple_ok(
+            &mut s,
+            "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, a TEXT)"
+        ),
         "CREATE TABLE"
     );
     assert_eq!(
-        simple_ok(&mut s, "CREATE TEMP TABLE d (a TEXT) ON COMMIT DELETE ROWS"),
+        simple_ok(
+            &mut s,
+            "CREATE TEMP TABLE d (id BIGINT PRIMARY KEY, a TEXT) ON COMMIT DELETE ROWS"
+        ),
         "CREATE TABLE"
     );
 
@@ -672,7 +717,10 @@ fn temp_tables_are_invisible_to_another_tenant_over_wire() {
 
     let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
     assert_eq!(
-        simple_ok(&mut alice, "CREATE TEMP TABLE secret_t (v TEXT)"),
+        simple_ok(
+            &mut alice,
+            "CREATE TEMP TABLE secret_t (id BIGINT PRIMARY KEY, v TEXT)"
+        ),
         "CREATE TABLE"
     );
     assert_eq!(
@@ -695,7 +743,10 @@ fn temp_tables_are_invisible_to_another_tenant_over_wire() {
 
     // bob も同名の一時表を作れ、互いに独立している。
     assert_eq!(
-        simple_ok(&mut bob2, "CREATE TEMP TABLE secret_t (v TEXT)"),
+        simple_ok(
+            &mut bob2,
+            "CREATE TEMP TABLE secret_t (id BIGINT PRIMARY KEY, v TEXT)"
+        ),
         "CREATE TABLE"
     );
     assert_eq!(
@@ -727,7 +778,10 @@ fn abnormal_disconnect_mid_transaction_discards_temp_table() {
 
     let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
     assert_eq!(
-        simple_ok(&mut alice, "CREATE TEMP TABLE secret_t (v TEXT)"),
+        simple_ok(
+            &mut alice,
+            "CREATE TEMP TABLE secret_t (id BIGINT PRIMARY KEY, v TEXT)"
+        ),
         "CREATE TABLE"
     );
     assert_eq!(simple_ok(&mut alice, "BEGIN"), "BEGIN");
@@ -784,7 +838,10 @@ fn abnormal_disconnect_mid_transaction_discards_temp_table() {
     assert!(!alice_view.contains(CANARY));
     // 同名を作り直すと空の表になる（行が復活しない）。
     assert_eq!(
-        simple_ok(&mut alice2, "CREATE TEMP TABLE secret_t (v TEXT)"),
+        simple_ok(
+            &mut alice2,
+            "CREATE TEMP TABLE secret_t (id BIGINT PRIMARY KEY, v TEXT)"
+        ),
         "CREATE TABLE"
     );
     assert!(

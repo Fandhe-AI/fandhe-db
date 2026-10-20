@@ -158,7 +158,7 @@ fn open_big_with_foreign_row(
 #[test]
 fn narrowing_without_using_converts_all_rows_and_persists() {
     let (path, _g, core) = open("rw-narrow");
-    ok(&core, "CREATE TABLE t (n BIGINT)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)");
     for (i, v) in [-2_147_483_648_i64, -1, 0, 2_147_483_647]
         .iter()
         .enumerate()
@@ -261,7 +261,7 @@ fn success_rewrites_rows_of_every_tenant_and_visibility() {
 #[test]
 fn varchar_conversion_trims_excess_trailing_spaces() {
     let (_path, _g, core) = open("rw-trailing-spaces");
-    ok(&core, "CREATE TABLE t (s TEXT)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, s TEXT)");
     insert(&core, "t", 1, "s", "'abc   '");
     ok(
         &core,
@@ -280,7 +280,7 @@ fn varchar_conversion_trims_excess_trailing_spaces() {
 #[test]
 fn text_to_integer_requires_using_and_rejects_malformed_values() {
     let (_path, _g, core) = open("rw-text-int");
-    ok(&core, "CREATE TABLE t (note TEXT)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, note TEXT)");
     insert(&core, "t", 1, "note", "'10'");
     insert(&core, "t", 2, "note", "'20'");
     assert_eq!(
@@ -318,7 +318,7 @@ fn using_expression_references_other_columns() {
     let (_path, _g, core) = open("rw-using-expr");
     ok(
         &core,
-        "CREATE TABLE t (qty INTEGER, label TEXT, req INTEGER NOT NULL)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INTEGER, label TEXT, req INTEGER NOT NULL)",
     );
     insert(&core, "t", 1, "qty, label, req", "3, 'a', 1");
     insert(&core, "t", 2, "qty, label, req", "4, 'b', 2");
@@ -362,7 +362,10 @@ fn using_expression_references_other_columns() {
 #[test]
 fn assignment_semantics_for_length_and_precision() {
     let (_path, _g, core) = open("rw-assign");
-    ok(&core, "CREATE TABLE t (s TEXT, d NUMERIC(8,3))");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, s TEXT, d NUMERIC(8,3))",
+    );
     insert(&core, "t", 1, "s, d", "'abcdef', 1.235");
     let err = fail(
         &core,
@@ -389,7 +392,10 @@ fn assignment_semantics_for_length_and_precision() {
 #[test]
 fn datetime_conversions_succeed() {
     let (_path, _g, core) = open("rw-datetime");
-    ok(&core, "CREATE TABLE t (d DATE, ts TIMESTAMP)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, d DATE, ts TIMESTAMP)",
+    );
     insert(
         &core,
         "t",
@@ -413,9 +419,12 @@ fn dependent_columns_are_rebuilt_and_only_view_columns_are_rejected() {
     let (_path, _g, core) = open("rw-dependents");
     ok(
         &core,
-        "CREATE TABLE p (k BIGINT PRIMARY KEY, u BIGINT UNIQUE, c BIGINT CHECK (c > 0), d BIGINT DEFAULT 5, ix BIGINT, vw BIGINT, n BIGINT)",
+        "CREATE TABLE p (id BIGINT NOT NULL UNIQUE, k BIGINT PRIMARY KEY, u BIGINT UNIQUE, c BIGINT CHECK (c > 0), d BIGINT DEFAULT 5, ix BIGINT, vw BIGINT, n BIGINT)",
     );
-    ok(&core, "CREATE TABLE ch (r BIGINT REFERENCES p (k))");
+    ok(
+        &core,
+        "CREATE TABLE ch (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p (k))",
+    );
     ok(&core, "CREATE INDEX p_ix ON p (ix)");
     ok(&core, "CREATE VIEW pv AS SELECT vw FROM p");
     for col in ["k", "u", "c", "d", "ix", "n"] {
@@ -438,7 +447,7 @@ fn dependent_columns_are_rebuilt_and_only_view_columns_are_rejected() {
 #[test]
 fn select_star_view_blocks_general_conversion() {
     let (_path, _g, core) = open("rw-star-view");
-    ok(&core, "CREATE TABLE t (n BIGINT)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)");
     ok(&core, "CREATE VIEW v AS SELECT * FROM t");
     let err = fail(&core, "ALTER TABLE t ALTER COLUMN n TYPE INTEGER");
     assert_eq!(err.wire_code(), "0A000", "{err}");
@@ -449,7 +458,10 @@ fn select_star_view_blocks_general_conversion() {
 #[test]
 fn using_target_column_is_treated_as_omitted() {
     let (_path, _g, core) = open("rw-identity");
-    ok(&core, "CREATE TABLE t (amount NUMERIC(5,2))");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, amount NUMERIC(5,2))",
+    );
     insert(&core, "t", 1, "amount", "1.50");
     ok(
         &core,
@@ -474,7 +486,10 @@ fn using_target_column_is_treated_as_omitted() {
 fn timestamp_to_timestamptz_uses_session_time_zone() {
     let (_path, _g, core) = open("rw-tz");
     for (table, zone) in [("utc", "UTC"), ("tokyo", "Asia/Tokyo")] {
-        ok(&core, &format!("CREATE TABLE {table} (ts TIMESTAMP)"));
+        ok(
+            &core,
+            &format!("CREATE TABLE {table} (id BIGINT PRIMARY KEY, ts TIMESTAMP)"),
+        );
         insert(&core, table, 1, "ts", "TIMESTAMP '2024-03-01 12:00:00'");
         let mut s = SessionState::default();
         s.allow_ddl();
@@ -498,7 +513,7 @@ fn unchanged_rejections() {
     let (_path, _g, core) = open("rw-rejections");
     ok(
         &core,
-        "CREATE TABLE t (embedding VECTOR(2), qty INTEGER, note TEXT)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, embedding VECTOR(2), qty INTEGER, note TEXT)",
     );
     ok(&core, "CREATE TYPE mood AS ENUM ('a', 'b')");
     assert_eq!(
@@ -536,11 +551,11 @@ fn unchanged_rejections() {
 #[test]
 fn array_to_text_assignment_is_accepted() {
     let (_path, _g, core) = open("rw-array-to-text");
-    ok(&core, "CREATE TABLE t (a INTEGER[])");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, a INTEGER[])");
     ok(&core, "ALTER TABLE t ALTER COLUMN a TYPE TEXT");
     assert_eq!(column_type(&core, "t", "a"), ColumnType::Text);
 
-    ok(&core, "CREATE TABLE u (a INTEGER[])");
+    ok(&core, "CREATE TABLE u (id BIGINT PRIMARY KEY, a INTEGER[])");
     insert(&core, "u", 1, "a", "ARRAY[1, 2]");
     ok(&core, "ALTER TABLE u ALTER COLUMN a TYPE VARCHAR(20)");
     assert_eq!(firsts(&core, "SELECT a FROM u LIMIT 5").len(), 1);
@@ -551,7 +566,10 @@ fn array_to_text_assignment_is_accepted() {
 #[test]
 fn default_exceeding_catalog_limit_after_conversion_is_rejected_with_42804() {
     let (_path, _g, core) = open("rw-default-too-long");
-    ok(&core, "CREATE TABLE t (k BIGINT, c BIGINT DEFAULT 1)");
+    ok(
+        &core,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT, c BIGINT DEFAULT 1)",
+    );
     let err = fail(&core, "ALTER TABLE t ALTER COLUMN c TYPE CHAR(1025)");
     assert_eq!(err.wire_code(), "42804", "{err}");
     assert_eq!(column_type(&core, "t", "c"), ColumnType::BigInt);
@@ -562,7 +580,7 @@ fn default_exceeding_catalog_limit_after_conversion_is_rejected_with_42804() {
 #[test]
 fn fill_only_exceeding_catalog_limit_after_conversion_is_discarded() {
     let (_path, _g, core) = open("rw-fill-too-long");
-    ok(&core, "CREATE TABLE t (k BIGINT)");
+    ok(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT)");
     ok(&core, "ALTER TABLE t ADD COLUMN c BIGINT DEFAULT 1");
     ok(&core, "ALTER TABLE t ALTER COLUMN c DROP DEFAULT");
     ok(&core, "ALTER TABLE t ALTER COLUMN c TYPE CHAR(1025)");

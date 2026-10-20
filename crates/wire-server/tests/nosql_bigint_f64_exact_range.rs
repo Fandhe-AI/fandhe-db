@@ -10,6 +10,12 @@
 
 #[path = "common/mod.rs"]
 mod common;
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// NoSQL 表層は従来方式の表だけを扱うため、このテストの `CREATE TABLE` は従来方式の表作成へ
+// 振り向ける（`LegacyExec`）。
+#[path = "../../engine/src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
 #[path = "http_common/mod.rs"]
 mod http_common;
 
@@ -46,7 +52,7 @@ fn new_core_with_table(checked: bool) -> (Arc<EngineCore>, temp_db::CleanupGuard
     } else {
         "CREATE TABLE t (b BIGINT)"
     };
-    core.execute_sql_in_session(&ctx, &mut session, ddl)
+    core.execute_sql_in_session_legacy(&ctx, &mut session, ddl)
         .expect("create table");
     (Arc::new(core), guard)
 }
@@ -163,5 +169,43 @@ fn nosql_insert_full_i64_into_unchecked_bigint_still_succeeds() {
         );
         let resp = post_query(addr, &token, &body);
         assert_eq!(resp.status, 200, "v={v}: {resp:?}");
+    }
+}
+
+/// 暗黙の `id` を持たない表（SQL 表層で新しく作る表。TABLE-23・Issue #2199）は NoSQL 表層の行アドレス
+/// （`id`）が通用しないため、行を読み書きする op は実行前に固定文言の `0A000`（501）で拒否される
+/// （後続 Issue #2201 が NoSQL 側の対応を入れるまでの fail-closed。応答に表名・値を含めない）。
+#[test]
+fn nosql_row_ops_on_a_table_without_implicit_id_are_rejected_with_0a000() {
+    let path = temp_db::unique_db_path("nosql-no-implicit-id");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    // 通常の `execute_sql_in_session` は採番方式の表を作る（`_legacy` ではない）。
+    core.execute_sql_in_session(&ctx, &mut session, "CREATE TABLE secret_notes (b BIGINT)")
+        .expect("create table");
+    let (addr, token) = spawn(Arc::new(core));
+    for body in [
+        r#"{"op":"insert","table":"secret_notes","rows":[{"id":1,"b":1}],"operation_id":"na-1"}"#,
+        r#"{"op":"scan","table":"secret_notes","limit":10}"#,
+        r#"{"op":"aggregate","table":"secret_notes","aggregates":[{"fn":"sum","column":"b"}]}"#,
+    ] {
+        let resp = post_query(addr, &token, body);
+        assert_eq!(resp.status, 501, "{body}: {resp:?}");
+        assert_eq!(http_common::wire_code_of(&resp), "0A000", "{body}");
+        let text = String::from_utf8_lossy(&resp.body).into_owned();
+        assert!(
+            text.contains("row identity mode is not supported yet"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("secret_notes") && !text.contains("tenant-a"),
+            "{text}"
+        );
     }
 }

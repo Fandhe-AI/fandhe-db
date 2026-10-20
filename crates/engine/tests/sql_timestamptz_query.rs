@@ -183,7 +183,11 @@ fn at_time_zone_both_directions_and_dst() {
         "2026-01-01 09:00:00"
     );
     // NULL の zone は NULL（strict）。
-    ok(&core, &mut s, "CREATE TABLE z (name TEXT, t TIMESTAMP)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE z (id BIGINT PRIMARY KEY, name TEXT, t TIMESTAMP)",
+    );
     ok(&core, &mut s, "INSERT INTO z (id, name, t) VALUES (1, 'Asia/Tokyo', '2026-01-01 00:00:00') USING OPERATION_ID 'z1'");
     ok(
         &core,
@@ -237,7 +241,7 @@ fn setup_events(core: &EngineCore, s: &mut SessionState) {
     ok(
         core,
         s,
-        "CREATE TABLE ev (at TIMESTAMPTZ, ts TIMESTAMP, d DATE, n INTEGER)",
+        "CREATE TABLE ev (id BIGINT PRIMARY KEY, at TIMESTAMPTZ, ts TIMESTAMP, d DATE, n INTEGER)",
     );
     // 時点（UTC）: 1=2026-01-01 00:00Z, 2=2026-03-08 07:30Z（NY の gap 後）, 3=2026-06-15 12:00Z,
     // 4=2026-11-01 06:30Z（NY の fold 後）, 5=NULL。
@@ -528,7 +532,11 @@ fn extract_and_date_trunc_use_the_session_zone() {
 fn grouping_distinct_set_ops_and_subquery() {
     let (_g, core) = open("tzq-group");
     let mut s = session();
-    ok(&core, &mut s, "CREATE TABLE g (at TIMESTAMPTZ, k INTEGER)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE g (id BIGINT PRIMARY KEY, at TIMESTAMPTZ, k INTEGER)",
+    );
     // 同一時点を別 offset で入れる（UTC 2026-01-01 00:00 が 2 行、別時点が 1 行）。
     for (id, at, k) in [
         (1, "2026-01-01 09:00:00+09", 1),
@@ -609,7 +617,7 @@ fn secondary_index_matches_full_scan() {
     ok(
         &core,
         &mut s,
-        "CREATE TABLE ix (at TIMESTAMPTZ, ts TIMESTAMP)",
+        "CREATE TABLE ix (id BIGINT PRIMARY KEY, at TIMESTAMPTZ, ts TIMESTAMP)",
     );
     for i in 0..40u64 {
         let (month, day) = (1 + i % 12, 1 + i % 27);
@@ -709,7 +717,7 @@ fn explain_shows_index_use_and_mixed_comparison_fallback() {
     ok(
         &core,
         &mut s,
-        "CREATE TABLE ex (embedding VECTOR(2), at TIMESTAMPTZ, ts TIMESTAMP)",
+        "CREATE TABLE ex (id BIGINT PRIMARY KEY, embedding VECTOR(2), at TIMESTAMPTZ, ts TIMESTAMP)",
     );
     for i in 0..8u64 {
         ok(
@@ -758,7 +766,7 @@ fn assignment_conversions_follow_the_session_zone() {
     ok(
         &core,
         &mut s,
-        "CREATE TABLE a (at TIMESTAMPTZ, ts TIMESTAMP, d DATE)",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, at TIMESTAMPTZ, ts TIMESTAMP, d DATE)",
     );
     ok(&core, &mut s, "SET TIME ZONE 'America/New_York'");
     // INSERT: TIMESTAMP リテラル（gap を含む）→ TIMESTAMPTZ 列。
@@ -852,13 +860,13 @@ fn range_errors_check_constraints_and_tenant_boundary() {
     ok(
         &core,
         &mut s,
-        "CREATE TABLE c (at TIMESTAMPTZ, ts TIMESTAMP)",
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, at TIMESTAMPTZ, ts TIMESTAMP)",
     );
     assert_eq!(
         code(
             &core,
             &mut s,
-            "CREATE TABLE c2 (at TIMESTAMPTZ, ts TIMESTAMP, CHECK (at > ts))"
+            "CREATE TABLE c2 (id BIGINT PRIMARY KEY, at TIMESTAMPTZ, ts TIMESTAMP, CHECK (at > ts))"
         ),
         "0A000"
     );
@@ -905,11 +913,20 @@ fn range_errors_check_constraints_and_tenant_boundary() {
 fn closed_features_stay_fail_closed() {
     let (_g, core) = open("tzq-closed");
     let mut s = session();
-    ok(&core, &mut s, "CREATE TABLE t (at TIMESTAMPTZ, n INTEGER)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, at TIMESTAMPTZ, n INTEGER)",
+    );
     assert_eq!(code(&core, &mut s, "SELECT SUM(at) FROM t"), "42883");
     assert_eq!(code(&core, &mut s, "SELECT at + 1 FROM t LIMIT 5"), "42804");
     // PK／UNIQUE は担当 Issue 未定のまま拒否される（拒否コードは #1574 から不変）。
-    assert!(run(&core, &mut s, "CREATE TABLE u (at TIMESTAMPTZ PRIMARY KEY)").is_err());
+    assert!(run(
+        &core,
+        &mut s,
+        "CREATE TABLE u (id BIGINT NOT NULL UNIQUE, at TIMESTAMPTZ PRIMARY KEY)"
+    )
+    .is_err());
     // INTERVAL の zone は未実装のため構文段で拒否される。
     assert!(run(
         &core,
@@ -947,7 +964,11 @@ fn window_and_partitioned_update() {
     assert_eq!(code(&core, &mut s, sql), "22023");
     // TIMESTAMPTZ 列を持たないテーブルでも、TIMESTAMPTZ の式（ゾーン無しのリテラル）を含む再送は
     // セッション TZ が違えば内容不一致になる。
-    ok(&core, &mut s, "CREATE TABLE tp (ts TIMESTAMP, n INTEGER)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE tp (id BIGINT PRIMARY KEY, ts TIMESTAMP, n INTEGER)",
+    );
     for i in 1..=3 {
         ok(
             &core,
@@ -1035,7 +1056,11 @@ fn boolean_combinations_nulls_and_case() {
 fn const_fold_uses_session_zone_and_check_rejects_zone_less_forms() {
     let (_g, core) = open("tzq-review");
     let mut s = session();
-    ok(&core, &mut s, "CREATE TABLE r (at TIMESTAMPTZ)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE r (id BIGINT PRIMARY KEY, at TIMESTAMPTZ)",
+    );
     ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
     ok(
         &core,
@@ -1073,20 +1098,20 @@ fn const_fold_uses_session_zone_and_check_rejects_zone_less_forms() {
         code(
             &core,
             &mut s,
-            "CREATE TABLE ck1 (at TIMESTAMPTZ, CHECK (at > '2026-01-01 00:00:00'))"
+            "CREATE TABLE ck1 (id BIGINT PRIMARY KEY, at TIMESTAMPTZ, CHECK (at > '2026-01-01 00:00:00'))"
         ),
         "0A000"
     );
     ok(
         &core,
         &mut s,
-        "CREATE TABLE ck2 (at TIMESTAMPTZ, CHECK (at > '2026-01-01 00:00:00+00'))",
+        "CREATE TABLE ck2 (id BIGINT PRIMARY KEY, at TIMESTAMPTZ, CHECK (at > '2026-01-01 00:00:00+00'))",
     );
     assert_eq!(
         code(
             &core,
             &mut s,
-            "CREATE TABLE ck3 (ts TIMESTAMP, \
+            "CREATE TABLE ck3 (id BIGINT PRIMARY KEY, ts TIMESTAMP, \
              CHECK (date_trunc('day', ts, 'UTC') = TIMESTAMPTZ '2026-01-01 00:00:00+00'))"
         ),
         "0A000"
@@ -1102,7 +1127,7 @@ fn const_tstz_assignment_targets_and_null_arguments() {
     ok(
         &core,
         &mut s,
-        "CREATE TABLE ra (ts TIMESTAMP, d DATE, z TIMESTAMPTZ)",
+        "CREATE TABLE ra (id BIGINT PRIMARY KEY, ts TIMESTAMP, d DATE, z TIMESTAMPTZ)",
     );
     ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
     ok(
@@ -1117,7 +1142,11 @@ fn const_tstz_assignment_targets_and_null_arguments() {
     assert_eq!(r[0][1], "2026-01-02");
     assert_eq!(r[0][2], "2026-01-01 20:00:00+00");
     // TEXT 列などへの代入は拒否のまま。
-    ok(&core, &mut s, "CREATE TABLE rb (t TEXT)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE rb (id BIGINT PRIMARY KEY, t TEXT)",
+    );
     assert_eq!(
         code(
             &core,
@@ -1131,7 +1160,7 @@ fn const_tstz_assignment_targets_and_null_arguments() {
     ok(
         &core,
         &mut s,
-        "CREATE TABLE rn (t TIMESTAMP, z TIMESTAMPTZ)",
+        "CREATE TABLE rn (id BIGINT PRIMARY KEY, t TIMESTAMP, z TIMESTAMPTZ)",
     );
     for (i, (col, expr)) in [
         ("t", "timezone('UTC', NULL)"),
@@ -1158,7 +1187,11 @@ fn const_tstz_assignment_targets_and_null_arguments() {
         assert_eq!(r, ["NULL", "NULL"]);
     }
     // 述語付き分割実行: ゾーン付きリテラルでも TIMESTAMP 列との比較は TZ 依存のため、別 TZ での再送は不一致。
-    ok(&core, &mut s, "CREATE TABLE rp (ts TIMESTAMP, n INTEGER)");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE rp (id BIGINT PRIMARY KEY, ts TIMESTAMP, n INTEGER)",
+    );
     for i in 1..=3 {
         ok(
             &core,
@@ -1182,7 +1215,7 @@ fn at_time_zone_after_lone_literal_in_value_positions() {
     ok(
         &core,
         &mut s,
-        "CREATE TABLE v (at TIMESTAMPTZ, ts TIMESTAMP)",
+        "CREATE TABLE v (id BIGINT PRIMARY KEY, at TIMESTAMPTZ, ts TIMESTAMP)",
     );
     ok(
         &core,
@@ -1217,7 +1250,7 @@ fn default_accepts_timestamptz_const_expr() {
     ok(
         &core,
         &mut s,
-        "CREATE TABLE d (z TIMESTAMPTZ DEFAULT TIMESTAMPTZ '2026-01-01 09:00:00+09', \
+        "CREATE TABLE d (id BIGINT PRIMARY KEY, z TIMESTAMPTZ DEFAULT TIMESTAMPTZ '2026-01-01 09:00:00+09', \
          t TIMESTAMP DEFAULT '2026-01-01 09:00:00+09' AT TIME ZONE 'UTC')",
     );
     ok(

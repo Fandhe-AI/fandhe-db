@@ -35,7 +35,7 @@ fn new_core(label: &str, mode: Option<LedgerMode>) -> (EngineCore, CleanupGuard)
     core.execute_sql_in_session(
         &ctx("sys"),
         &mut session,
-        "CREATE TABLE docs (n BIGINT, u TEXT)",
+        "CREATE TABLE docs (id BIGINT PRIMARY KEY, n BIGINT, u TEXT)",
     )
     .expect("create table");
     (core, CleanupGuard(path))

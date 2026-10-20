@@ -42,9 +42,9 @@ use redb::ReadableTable;
 use super::{
     decode_index_def, decode_view_def, dependent_tables_in_txn, exposed_columns_of_view,
     foreign_keys_relying_on_unique_columns_in_txn, referencing_foreign_keys_in_txn,
-    require_table_schema_write, view_body_shape, view_def_dependence_on, CatalogError, ColumnType,
-    ForeignKeyDef, IndexDef, Result, TableSchema, ViewDef, ViewDependence, ViewExposure,
-    CATALOG_TABLE, ENUM_TYPES_TABLE, INDEX_CATALOG_TABLE, MAX_LIST_TABLES, MAX_VIEWS,
+    require_table_schema_write_any_identity, view_body_shape, view_def_dependence_on, CatalogError,
+    ColumnType, ForeignKeyDef, IndexDef, Result, TableSchema, ViewDef, ViewDependence,
+    ViewExposure, CATALOG_TABLE, ENUM_TYPES_TABLE, INDEX_CATALOG_TABLE, MAX_LIST_TABLES, MAX_VIEWS,
     MAX_VIEW_CHAIN_WALK, VIEWS_TABLE,
 };
 
@@ -611,7 +611,7 @@ impl Walker<'_> {
                 def.name
             ))
         };
-        let schema = match require_table_schema_write(self.write_txn, &def.table) {
+        let schema = match require_table_schema_write_any_identity(self.write_txn, &def.table) {
             Ok(s) => s,
             Err(CatalogError::TableNotFound(_)) => return Err(corrupt()),
             Err(e) => return Err(e),
@@ -638,7 +638,7 @@ impl Walker<'_> {
         let mut out = Vec::new();
         for table in dependent_tables_in_txn(self.write_txn, type_name)? {
             let root = self.root_for_table(&table);
-            let schema = require_table_schema_write(self.write_txn, &table)?;
+            let schema = require_table_schema_write_any_identity(self.write_txn, &table)?;
             for column in &schema.columns {
                 let uses = match &column.ty {
                     ColumnType::Enum(def) => def.name() == type_name,
@@ -671,7 +671,7 @@ impl Walker<'_> {
             .filter(|(_, fk)| fk.parent_columns().iter().any(|c| c == column))
             .map(|(child, fk)| fk_object(child, fk, self.root_for_table(&child.name)))
             .collect();
-        let schema = require_table_schema_write(self.write_txn, table)?;
+        let schema = require_table_schema_write_any_identity(self.write_txn, table)?;
         out.extend(self.views_affected_by_column(&schema, column)?);
         Ok(out)
     }

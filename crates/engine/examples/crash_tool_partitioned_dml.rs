@@ -61,6 +61,13 @@ use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 
 /// ジョブを実行するテナント。
+// SQL 表層の `CREATE TABLE` は暗黙の `id` を持たない採番方式の表を作る（TABLE-23・Issue #2199）。
+// この crash ツールは行 id を行の識別に使う従来方式の契約を検証するため、`CREATE TABLE` を従来方式の
+// 表作成へ振り向ける（`LegacyExec`）。
+#[path = "../src/test_util/legacy_table.rs"]
+mod legacy_table;
+use legacy_table::LegacyExec as _;
+
 const TENANT_A: &str = "crash-pdml-tenant-a";
 /// 境界確認用テナント（ジョブを実行しない。行・ジョブ記録・台帳が不変であることを見る）。
 const TENANT_B: &str = "crash-pdml-tenant-b";
@@ -276,7 +283,7 @@ fn ctx(tenant: &str) -> Result<PolicyContext, String> {
 
 fn sql(core: &EngineCore, tenant: &str, stmt: &str) -> Result<SqlOutcome, String> {
     let mut session = SessionState::default();
-    core.execute_sql_in_session(&ctx(tenant)?, &mut session, stmt)
+    core.execute_sql_in_session_legacy(&ctx(tenant)?, &mut session, stmt)
         .map_err(|e| format!("{}:{e}", e.wire_code()))
 }
 
@@ -316,7 +323,7 @@ fn init(path: &str) -> Result<(), String> {
     let core = open_core(path)?;
     let mut session = SessionState::default();
     session.allow_ddl();
-    core.execute_sql_in_session(
+    core.execute_sql_in_session_legacy(
         &ctx("crash-pdml-sys")?,
         &mut session,
         "CREATE TABLE docs (tag TEXT, n BIGINT, at TIMESTAMP)",

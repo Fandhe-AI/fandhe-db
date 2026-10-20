@@ -68,6 +68,8 @@ struct ResolvedView {
     column_map: Option<Vec<(String, String)>>,
     /// `WITH CHECK OPTION` の検査対象の述語（内側が先。[`Resolved::View::check_predicates`]）。
     check_predicates: Vec<Vec<WherePredicate>>,
+    /// 基表が採番方式（疑似列 `id` を持たない。Issue #2199）か。
+    base_allocated: bool,
 }
 
 impl ResolvedView {
@@ -75,15 +77,17 @@ impl ResolvedView {
         Mapper {
             columns: self.view_columns.as_deref(),
             map: self.column_map.as_deref(),
+            base_allocated: self.base_allocated,
         }
     }
 
     /// 利用者列を公開名 `id` で公開しているか（疑似列 `id` と取り違えないための判定）。
     fn exposes_user_column_as_id(&self) -> bool {
-        self.column_map.as_deref().is_some_and(|m| {
-            m.iter()
-                .any(|(public, phys)| public == "id" && phys != "id")
-        })
+        !self.base_allocated
+            && self.column_map.as_deref().is_some_and(|m| {
+                m.iter()
+                    .any(|(public, phys)| public == "id" && phys != "id")
+            })
     }
 }
 
@@ -107,12 +111,14 @@ fn resolve_for_write(
             view_columns,
             column_map,
             check_predicates,
+            base_allocated,
         } => Ok(ResolvedView {
             base_table,
             view_predicates,
             view_columns,
             column_map,
             check_predicates,
+            base_allocated,
         }),
         // 自動更新可能と判定済みなのに `View` 以外になるのは不変条件違反（固定文言。fail-closed）。
         _ => Err(SqlSurfaceError::Internal {
@@ -138,7 +144,10 @@ fn merge_predicates(
         &[],
     )?;
     let user = match rv.column_map.as_deref() {
-        Some(map) => rewrite_where(&ColumnMap::new(map), predicates.to_vec())?,
+        Some(map) => rewrite_where(
+            &ColumnMap::new(map, !rv.base_allocated),
+            predicates.to_vec(),
+        )?,
         None => predicates.to_vec(),
     };
     let mut merged = rv.view_predicates.clone();
@@ -154,7 +163,11 @@ enum BaseIdForm {
     Predicates(Vec<WherePredicate>),
 }
 
-fn rewrite_id_form(rv: &ResolvedView, id_literal: &str) -> Result<BaseIdForm, SqlSurfaceError> {
+fn rewrite_id_form(
+    lookup: &impl TableLookup,
+    rv: &ResolvedView,
+    id_literal: &str,
+) -> Result<BaseIdForm, SqlSurfaceError> {
     if let Some(columns) = rv.view_columns.as_deref() {
         if !columns.iter().any(|c| c == "id") {
             return Err(SqlSurfaceError::undefined_column("id"));
@@ -165,11 +178,14 @@ fn rewrite_id_form(rv: &ResolvedView, id_literal: &str) -> Result<BaseIdForm, Sq
             "WHERE id = <n> on a view that exposes a user column as id is not supported",
         ));
     }
-    if rv.view_predicates.is_empty() {
+    // 基表が採番方式（暗黙の `id` を持たない。TABLE-23・Issue #2199）なら、`id` は基表の通常の列なので
+    // 物理キーの直接指定（単一行形）ではなく述語形へ戻す。宣言の無い `id` は述語の束縛が未定義列にする。
+    let base_allocated = lookup.table_is_allocated(&rv.base_table)?;
+    if rv.view_predicates.is_empty() && !base_allocated {
         return Ok(BaseIdForm::Single(id_literal.to_string()));
     }
-    let mut merged = rv.view_predicates.clone();
-    merged.extend(id_equality_predicates(id_literal)?);
+    // 生成した述語は公開名 `id` で組まれているため、述語形 DML と同じ公開名→物理名の解決経路を通す。
+    let merged = merge_predicates(rv, &id_equality_predicates(id_literal)?)?;
     Ok(BaseIdForm::Predicates(merged))
 }
 
@@ -199,7 +215,7 @@ pub(crate) fn rewrite_view_delete(
     match &stmt.shape {
         DeleteStatement::SingleRow(v) => {
             let (returning, public_names) = rewrite_returning(&mapper, v.returning.as_ref())?;
-            let delete = match rewrite_id_form(&rv, &v.id_literal)? {
+            let delete = match rewrite_id_form(lookup, &rv, &v.id_literal)? {
                 BaseIdForm::Single(id_literal) => DeleteStatement::SingleRow(ValidatedDelete {
                     table_name: rv.base_table.clone(),
                     id_literal,
@@ -261,7 +277,10 @@ fn rewrite_assignments(
                     expr_columns_within(columns, expr)?;
                 }
                 match rv.column_map.as_deref() {
-                    Some(map) => SetValue::Expr(rewrite_set_value(&ColumnMap::new(map), expr)?),
+                    Some(map) => SetValue::Expr(rewrite_set_value(
+                        &ColumnMap::new(map, !rv.base_allocated),
+                        expr,
+                    )?),
                     None => SetValue::Expr(expr.clone()),
                 }
             }
@@ -282,7 +301,7 @@ pub(crate) fn rewrite_view_update(
         ValidatedUpdateForm::Single(v) => {
             let assignments = rewrite_assignments(&rv, &v.assignments)?;
             let (returning, public_names) = rewrite_returning(&mapper, v.returning.as_ref())?;
-            let update = match rewrite_id_form(&rv, &v.id_literal)? {
+            let update = match rewrite_id_form(lookup, &rv, &v.id_literal)? {
                 BaseIdForm::Single(id_literal) => ValidatedUpdateForm::Single(ValidatedUpdate {
                     table_name: rv.base_table.clone(),
                     assignments,
