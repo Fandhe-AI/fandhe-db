@@ -9,6 +9,13 @@
 
 ### Breaking Changes
 
+- `search_path` の追加（Issue #1715・TABLE-27）: セッション変数 `search_path`（既定 `"$user", public`）の `SET`／`RESET`／`SHOW`
+  を受理する。実効 path に `public` が含まれないセッションでは、一時表以外の未修飾のテーブル参照が `42P01`、作成系 DDL の
+  作成先が `public` 以外になる文が `3F000`／`0A000` になる（既定の path の挙動は不変）。`"$user"` は handshake の username から
+  展開し、自分の username と同名の SCHEMA を持つテナントの未修飾 `CREATE TABLE` は `0A000`（テナント SCHEMA への作成は後続 Issue）。
+  公開 API は `Statement::SetSearchPath`・`ShowSearchPath`、`SqlOutcome::SetSearchPath`、`Token::QuotedDollarUser`、
+  `SqlSurfaceError::NoSchemaSelected`、`ValidatedCreateTable.public_qualified`（pub フィールド追加）、`sql::search_path` の追加。
+  BREAKING CHANGE: `Statement`・`SqlOutcome`・`Token`・`SqlSurfaceError` を網羅的に `match` するコードは variant の追従が必要。
 - 暗黙の `id` の廃止（Issue #2199・TABLE-23）: SQL 表層の `CREATE TABLE`・`CREATE TEMP TABLE` で新しく作る表は暗黙の
   `id` 疑似列を持たない（PG と同じ表定義）。`id` は予約名ではなくなり、`id` を通常の列として宣言でき（`tenant_id`・
   `visibility`・`check`・`constraint` は引き続き予約）、PRIMARY KEY を持たない表・`id` 列を持たない表を作れる。

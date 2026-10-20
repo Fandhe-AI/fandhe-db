@@ -1459,7 +1459,11 @@ pub(crate) fn handle_parse<S: WireStream>(
 /// 従来の経路のまま。
 fn needs_session_revalidation(session: &SessionState, parsed: &ParsedSql) -> bool {
     !matches!(parsed.peel_session_route(), ParsedSql::Cursor(_))
-        && (session.has_temp_tables() || matches!(parsed, ParsedSql::SessionRouted(_)))
+        && (session.has_temp_tables()
+            // TABLE-27・Issue #1715: `public` が見えない `search_path` では、Parse 時の解決結果を
+            // そのまま使わず、現在の path に照らして検証し直す。
+            || session.search_path_hides_public()
+            || matches!(parsed, ParsedSql::SessionRouted(_)))
 }
 
 fn handle_parse_body(
@@ -1953,16 +1957,20 @@ fn handle_bind_body(
             // 一時表（TABLE-44・Issue #1684）を持つセッション、または一時表の経路で準備した文は、
             // Bind のたびにセッション対応の経路で検証し直す（一時カタログが Parse 時から変わって
             // いれば陳腐化として `0A000`）。一時表を持たないセッションは従来どおり `parsed` を使う。
-            let parsed =
-                if session.has_temp_tables() || matches!(parsed, ParsedSql::SessionRouted(_)) {
-                    let _session_tz_scope =
-                        engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
-                    engine
-                        .bind_prepared_in_session(session, prepared, &[])
-                        .map_err(HandlerError::Sql)?
-                } else {
-                    parsed.clone()
-                };
+            // TABLE-27・Issue #1715: `public` が見えない `search_path` のセッションも同じく Bind の
+            // たびに検証し直す（Parse 後に `SET search_path` された文を古い解決結果で実行しない）。
+            let parsed = if session.has_temp_tables()
+                || session.search_path_hides_public()
+                || matches!(parsed, ParsedSql::SessionRouted(_))
+            {
+                let _session_tz_scope =
+                    engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
+                engine
+                    .bind_prepared_in_session(session, prepared, &[])
+                    .map_err(HandlerError::Sql)?
+            } else {
+                parsed.clone()
+            };
             // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替える
             // （`handle_describe_body` と同じ理由。`FETCH` の portal 列メタは
             // Bind 時点で開いているカーソルの列を反映する）。

@@ -3515,6 +3515,7 @@ mod tests {
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
             legacy_row_identity: false,
+            public_qualified: false,
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3710,6 +3711,7 @@ mod tests {
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
             legacy_row_identity: false,
+            public_qualified: false,
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new(
@@ -3742,6 +3744,7 @@ mod tests {
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
             legacy_row_identity: false,
+            public_qualified: false,
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3793,6 +3796,7 @@ mod tests {
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
             legacy_row_identity: false,
+            public_qualified: false,
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3823,6 +3827,7 @@ mod tests {
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
             legacy_row_identity: false,
+            public_qualified: false,
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new("a", crate::catalog::ColumnType::Vector(4), false),

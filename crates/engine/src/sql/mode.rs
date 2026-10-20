@@ -230,9 +230,76 @@ pub struct SessionState {
     /// 漏れる経路は構造上存在しない。`Arc` 共有なので、BEGIN 時のコピーを ROLLBACK／abort で
     /// 戻しても値は消えない（PostgreSQL の `currval` と同じ。`sql/transaction.rs` 参照）。
     sequences: crate::sql::sequence_scope::SharedSessionSequences,
+    /// セッションの `search_path`（TABLE-27・Issue #1715）。既定は `"$user", public`。接続単位の値型
+    /// であるため他接続へ漏れず、ROLLBACK／abort の `SessionState` 巻き戻しに乗って取り消される
+    /// （ADR D5）。変更は検証成功後の [`Self::set_search_path`] だけで行う。
+    search_path: std::sync::Arc<crate::sql::search_path::SearchPath>,
+    /// `search_path` の変更ごとに進むプロセス全体で単調な世代（0 は未設定の予約値）。準備済み文・
+    /// 解析済み文が、path が変わった後の実行で陳腐化していないかの照合に使う
+    /// （[`crate::core::SessionRoutedSql`]）。値が等しければ path も等しい。
+    search_path_epoch: u64,
+    /// `"$user"` の展開に使う、接続した主体の username。認証層（wire-server の handshake）が認証成功後に
+    /// 1 回だけ設定する契約で、SQL 文から変える経路は持たない（`allow_ddl` と同じ。ADR D6）。
+    session_user: Option<std::sync::Arc<str>>,
 }
 
+/// `search_path` の世代の採番元。0 は採番されない。
+static NEXT_SEARCH_PATH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl SessionState {
+    /// セッションの現在の `search_path`（TABLE-27・Issue #1715）。
+    pub fn search_path(&self) -> &crate::sql::search_path::SearchPath {
+        self.search_path.as_ref()
+    }
+
+    /// 検証済みの `search_path` を現在値にして世代を進める。呼び出し元（`core.rs` の `SetSearchPath`
+    /// 実行腕）が検証成功後にのみ呼ぶ（失敗した `SET` はセッションを変えない）。世代の採番が尽きた
+    /// 場合は `Internal`（fail-closed。到達しない想定）。
+    pub(crate) fn set_search_path(
+        &mut self,
+        path: crate::sql::search_path::SearchPath,
+    ) -> Result<(), SqlSurfaceError> {
+        let epoch = NEXT_SEARCH_PATH_EPOCH
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| v.checked_add(1),
+            )
+            .map_err(|_| SqlSurfaceError::Internal {
+                detail: "search_path epoch space exhausted".to_string(),
+            })?;
+        self.search_path = std::sync::Arc::new(path);
+        self.search_path_epoch = epoch;
+        Ok(())
+    }
+
+    /// `RESET search_path`／`SET search_path TO DEFAULT` の実体。既定値へ戻す。
+    pub(crate) fn reset_search_path(&mut self) -> Result<(), SqlSurfaceError> {
+        self.set_search_path(crate::sql::search_path::SearchPath::default())
+    }
+
+    /// `search_path` の現在の世代（変更ごとに進む。未変更は 0）。
+    pub(crate) fn search_path_epoch(&self) -> u64 {
+        self.search_path_epoch
+    }
+
+    /// 実効 `search_path` に `public` が含まれないか。真のセッションだけが未修飾名の参照ゲート・
+    /// 作成先判定・準備済み文の再検証の対象になる（既定の path は常に偽で、追加コストを払わない）。
+    pub fn search_path_hides_public(&self) -> bool {
+        self.search_path.hides_public(self.session_user.as_deref())
+    }
+
+    /// `"$user"` の展開に使う username（未設定なら `None`）。
+    pub(crate) fn session_user(&self) -> Option<&str> {
+        self.session_user.as_deref()
+    }
+
+    /// 接続した主体の username を設定する。wire-server の handshake が認証成功後に 1 回だけ呼ぶ契約
+    /// （SQL 文経由の経路は持たない。`allow_ddl` と同じ。TABLE-27・Issue #1715・ADR D6）。
+    pub fn set_session_user(&mut self, username: &str) {
+        self.session_user = Some(std::sync::Arc::from(username));
+    }
+
     /// セッションの現在の TimeZone。
     pub fn time_zone(&self) -> &crate::datetime::SessionTimeZone {
         &self.time_zone
@@ -583,6 +650,36 @@ mod tests {
         let resolved = resolve_mode(None, Some(SearchMode::Precision));
         assert_eq!(resolved.mode, SearchMode::Precision);
         assert_eq!(resolved.source, ModeSource::SessionVariable);
+    }
+
+    /// TABLE-27・Issue #1715: `search_path` の既定値・変更・世代・巻き戻し（clone）・`$user` の扱い。
+    #[test]
+    fn search_path_defaults_epoch_and_clone_independence() {
+        use crate::sql::search_path::{SearchPath, SearchPathElem};
+        let mut a = SessionState::default();
+        assert_eq!(a.search_path().display(), "\"$user\", public");
+        assert_eq!(a.search_path_epoch(), 0);
+        assert!(!a.search_path_hides_public());
+        let snapshot = a.clone();
+        let only_x = SearchPath::new(vec![SearchPathElem::from_ident("x").unwrap()]).unwrap();
+        a.set_search_path(only_x).unwrap();
+        assert!(a.search_path_hides_public());
+        let epoch_after_set = a.search_path_epoch();
+        assert_ne!(epoch_after_set, 0);
+        // 巻き戻し用 clone は独立で、世代も戻る（ROLLBACK で path が戻る契約）。
+        assert!(!snapshot.search_path_hides_public());
+        assert_eq!(snapshot.search_path_epoch(), 0);
+        a.reset_search_path().unwrap();
+        assert!(!a.search_path_hides_public());
+        assert!(a.search_path_epoch() > epoch_after_set);
+        // `$user` は username が `public` のときだけ public を見せる。
+        let only_user = SearchPath::new(vec![SearchPathElem::User]).unwrap();
+        a.set_search_path(only_user).unwrap();
+        assert!(a.search_path_hides_public());
+        a.set_session_user("alice");
+        assert!(a.search_path_hides_public());
+        a.set_session_user("PUBLIC");
+        assert!(!a.search_path_hides_public());
     }
 
     #[test]

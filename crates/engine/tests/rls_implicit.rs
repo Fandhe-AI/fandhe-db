@@ -404,6 +404,8 @@ fn rls6_disallowed_sql_forms_rejected() {
         .expect_err("should be rejected");
     assert_eq!(err.wire_code(), "42703");
 
+    // セッションを持たない入口（`execute_sql`）では `SET search_path` も一律 `42601` のまま
+    // （TABLE-27・Issue #1715。セッション対応の入口の契約は下の D11 のテストが固定する）。
     for sql in [
         "SET search_path = tenant_b",
         "SELECT set_config('fandhe_db.tenant', 'tenant-b', false)",
@@ -411,6 +413,49 @@ fn rls6_disallowed_sql_forms_rejected() {
     ] {
         let err = core.execute_sql(&ctx, sql).expect_err("should be rejected");
         assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+    }
+}
+
+/// TABLE-27・Issue #1715（ADR D11）: `search_path` はセッション対応の入口では設定できるが、
+/// 暗黙 RLS は path に関係なく常に掛かり、テナント境界を越える経路にはならない。
+#[test]
+fn rls_d11_search_path_cannot_widen_the_tenant_boundary() {
+    let path = unique_db_path("rls-d11-search-path");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let truths = seed_multi_tenant_corpus(&storage);
+    let core = new_core(storage);
+    let q = query_vec();
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let allowed = allowed_set(&truths, "tenant-a", false);
+    let sql = format!("SELECT * FROM docs ORDER BY embedding <=> '{q}' LIMIT 10");
+    let qualified = format!("SELECT * FROM public.docs ORDER BY embedding <=> '{q}' LIMIT 10");
+
+    let mut session = engine::sql::mode::SessionState::default();
+    core.execute_sql_in_session(&ctx, &mut session, "SET search_path = tenant_b")
+        .expect("SET search_path is accepted by session-aware entry points");
+    // `public` が見えない path では未修飾の `docs` は解決されない。
+    let err = core
+        .execute_sql_in_session(&ctx, &mut session, &sql)
+        .expect_err("docs is not on the path");
+    assert_eq!(err.wire_code(), "42P01");
+
+    for (path_sql, query) in [
+        ("SET search_path = tenant_b, public", &sql),
+        ("SET search_path = tenant_b", &qualified),
+    ] {
+        core.execute_sql_in_session(&ctx, &mut session, path_sql)
+            .expect("set path");
+        let outcome = core
+            .execute_sql_in_session(&ctx, &mut session, query)
+            .expect("query should succeed");
+        let engine::sql::SqlOutcome::Query(result) = outcome else {
+            panic!("expected Query");
+        };
+        // 他テナントの SCHEMA 名を path に置いても、可視行は呼び出し元テナントのオラクルに収まる。
+        for id in result_ids(&result) {
+            assert!(allowed.contains(&id), "id={id} not in oracle allowed set");
+        }
     }
 }
 

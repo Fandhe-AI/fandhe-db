@@ -95,6 +95,11 @@ pub struct SessionRoutedSql {
     /// 一時表を持たないセッションでも世代の検査を受けるための印（世代 0 は通常「未設定」の
     /// 予約値で拒否されるが、この印がある文だけは世代 0 の一致を現行とみなす）。
     fresh: bool,
+    /// 包んだ時点で `public` が見えない `search_path` だったときの世代（TABLE-27・Issue #1715）。
+    /// `public` が見えないセッションで実行するとき、永続側の文はこの世代が現在の `search_path` の
+    /// 世代と一致していなければ陳腐化として拒否する（準備・Bind の後に `SET search_path` された文が、
+    /// 古い解決結果のまま実行されない。PostgreSQL なら再計画する場面）。
+    path_epoch: Option<u64>,
 }
 
 impl SessionRoutedSql {
@@ -109,6 +114,7 @@ impl SessionRoutedSql {
             relations,
             route: Route::Temp,
             fresh: false,
+            path_epoch: None,
         }
     }
 
@@ -120,7 +126,17 @@ impl SessionRoutedSql {
             relations: Vec::new(),
             route: Route::Persistent,
             fresh: false,
+            path_epoch: None,
         }
+    }
+
+    /// `public` が見えない `search_path` のセッションで、現在の `search_path` の世代を刻む
+    /// （TABLE-27・Issue #1715）。既定の path のセッションでは何もしない。
+    pub(crate) fn stamped_with_path(mut self, session: &SessionState) -> Self {
+        if session.search_path_hides_public() {
+            self.path_epoch = Some(session.search_path_epoch());
+        }
+        self
     }
 
     /// `public.` 修飾の表名を持つ準備済み文を、世代つきの永続側の文として包む（TABLE-27・
@@ -156,12 +172,49 @@ impl SessionRoutedSql {
 
     /// 前提が有効でなければ `0A000`（陳腐化。固定文言で永続側の存否を含まない）。
     pub(crate) fn require_current(&self, session: &SessionState) -> Result<(), SqlSurfaceError> {
-        if self.is_current(session.temp_tables()) {
-            Ok(())
-        } else {
-            Err(crate::sql::temp_catalog::temp_statement_stale())
+        if !self.is_current(session.temp_tables()) {
+            return Err(crate::sql::temp_catalog::temp_statement_stale());
         }
+        // 永続側の文は、`public` が見えない `search_path` のもとで解決した世代と一致するときだけ通す
+        // （一時表の経路の文は一時表だけを参照し path に依らない）。
+        if self.route == Route::Persistent
+            && session.search_path_hides_public()
+            && !is_search_path_exempt(&self.inner)
+            && self.path_epoch != Some(session.search_path_epoch())
+        {
+            return Err(search_path_stale());
+        }
+        Ok(())
     }
+}
+
+/// `search_path` の変更後に陳腐化した文に返す固定の拒否（`0A000`。TABLE-27・Issue #1715）。
+/// 名前を判定していないため `42P01` にはせず、再 Parse／Bind での再検証を促す。
+pub(crate) fn search_path_stale() -> SqlSurfaceError {
+    SqlSurfaceError::feature_not_supported("statement must be re-prepared after search_path change")
+}
+
+/// 関係名を引かないため `search_path` の世代検査を免除する文か（トランザクション制御・セッション変数・
+/// 一時表の作成・SCHEMA の作成削除・定数式・カーソルの `FETCH`／`CLOSE`・UDF 定義）。
+pub(crate) fn is_search_path_exempt(parsed: &ParsedSql) -> bool {
+    use crate::sql::cursor::CursorStatement;
+    matches!(
+        parsed,
+        ParsedSql::Transaction(_)
+            | ParsedSql::CreateTempTable(_)
+            | ParsedSql::CreateSchema(_)
+            | ParsedSql::DropSchema(_)
+            | ParsedSql::Cursor(CursorStatement::Fetch { .. } | CursorStatement::Close { .. })
+            | ParsedSql::Statement(
+                Statement::SetSearchMode { .. }
+                    | Statement::SetTimeZone { .. }
+                    | Statement::ShowTimeZone
+                    | Statement::SetSearchPath { .. }
+                    | Statement::ShowSearchPath
+                    | Statement::CreateFunction { .. }
+                    | Statement::ConstSelect(_)
+            )
+    )
 }
 
 /// 一時コアで実行できる文種か（`operation_id` を持たず、分割実行でもない）。
@@ -533,6 +586,13 @@ impl EngineCore {
             PreparedRoute::Temp(_) => Self::coarse_temp_gate(session, &prepared.dummy_parsed),
             PreparedRoute::Plain => {
                 let temp = session.temp_tables();
+                // `public` が見えない `search_path` では、一時表以外の未修飾名を `42P01` にする
+                // （TABLE-27・Issue #1715。既定の path では何もしない）。
+                crate::sql::search_path::check_unqualified_refs(
+                    session,
+                    &prepared.tokens,
+                    &prepared.qualified_positions,
+                )?;
                 // 免除文（`DROP TABLE` 等）でも、Parse 後に作られた同名の一時表へ `public.` 修飾の
                 // 表名が化けないよう先に拒否する（TABLE-27・Issue #1714）。
                 crate::sql::temp_catalog::reject_public_names_temp(
@@ -555,6 +615,29 @@ impl EngineCore {
     /// 名前を含む文は一時コアで構造検証し（一時表だけを参照する DML・読み取り・索引 DDL のみ。
     /// 混在・対象外の文種は `0A000`）、結果を一時表の経路として印付けする。
     pub fn parse_sql_prepared_with_declared_in_session(
+        &self,
+        session: &SessionState,
+        sql: &str,
+        declared: &[Option<crate::sql::params::DeclaredParamType>],
+    ) -> Result<super::PreparedSql, SqlSurfaceError> {
+        let result = self.parse_sql_prepared_in_session_inner(session, sql, declared);
+        // TABLE-27・Issue #1715: `public` が見えない `search_path` のセッションは、一時表以外の未修飾の
+        // テーブル参照を `42P01` にする。判定順は構文エラー `42601` → 参照ゲート → その他の検証エラー。
+        // 既定の path のセッションは何も足さない。
+        if !session.search_path_hides_public() {
+            return result;
+        }
+        if matches!(&result, Err(e) if e.wire_code() == "42601") {
+            return result;
+        }
+        if let Ok(tokens) = crate::sql::lexer::tokenize_with_params(sql) {
+            crate::sql::search_path::check_unqualified_refs(session, &tokens, &[])?;
+        }
+        result
+    }
+
+    /// [`Self::parse_sql_prepared_with_declared_in_session`] の一時カタログ対応の本体。
+    fn parse_sql_prepared_in_session_inner(
         &self,
         session: &SessionState,
         sql: &str,
@@ -679,12 +762,20 @@ impl EngineCore {
                     relations: prepared_routed.relations.clone(),
                     route: Route::Temp,
                     fresh: false,
+                    path_epoch: None,
                 })))
             }
             PreparedRoute::Plain => {
                 crate::sql::temp_catalog::reject_public_names_temp(
                     &prepared.public_qualified,
                     temp,
+                )?;
+                // `public` が見えない `search_path` では、Parse 後に変わった path でも一時表以外の
+                // 未修飾名を `42P01` にする（TABLE-27・Issue #1715。既定の path では何もしない）。
+                crate::sql::search_path::check_unqualified_refs(
+                    session,
+                    &prepared.tokens,
+                    &prepared.qualified_positions,
                 )?;
                 let parsed = self.bind_prepared(prepared, values)?;
                 // `DROP INDEX <名前>` は一時表の名前トークンが現れない。準備後に同名の一時索引が
@@ -703,20 +794,23 @@ impl EngineCore {
                     }
                 }
                 if temp.is_empty() || is_session_exempt(&parsed) {
-                    if prepared.public_qualified.is_empty() {
+                    if prepared.public_qualified.is_empty() && !session.search_path_hides_public() {
                         return Ok(parsed);
                     }
                     // `public.` 修飾つきの文は、実行までに同名の一時表が作られても一時表へ
-                    // 化けないよう世代を持たせる（Execute の粗いゲートが検査する）。
+                    // 化けないよう世代を持たせる（Execute の粗いゲートが検査する）。`public` が
+                    // 見えない `search_path` では、path の世代も刻む（Bind 後の `SET search_path` で
+                    // 陳腐化した文を実行しない。TABLE-27・Issue #1715）。
                     return Ok(ParsedSql::SessionRouted(Box::new(
-                        SessionRoutedSql::persistent_guarded(parsed, temp),
+                        SessionRoutedSql::persistent_guarded(parsed, temp)
+                            .stamped_with_path(session),
                     )));
                 }
                 if crate::sql::temp_catalog::tokens_reference_temp(&prepared.tokens, temp) {
                     return Err(crate::sql::temp_catalog::temp_statement_stale());
                 }
                 Ok(ParsedSql::SessionRouted(Box::new(
-                    SessionRoutedSql::persistent(parsed, temp),
+                    SessionRoutedSql::persistent(parsed, temp).stamped_with_path(session),
                 )))
             }
         }

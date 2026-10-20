@@ -46,23 +46,31 @@ fn ident_is(tok: Option<&Token>, word: &str) -> bool {
     matches!(tok, Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word))
 }
 
-/// `tokens` のテーブル参照位置にある `schema.name` を解決して `Token::Ident(name)` へ置き換える。
-/// 戻り値は `public.` で修飾されていた表名（一時表との衝突検査用）。修飾が無ければ何もしない。
-pub(crate) fn rewrite_relation_names(
-    tokens: &mut [Token],
-    schema_exists: Option<SchemaExists<'_>>,
-) -> Result<Vec<String>, SqlSurfaceError> {
-    if !tokens
-        .iter()
-        .any(|t| matches!(t, Token::QualifiedIdent { .. }))
-    {
-        return Ok(Vec::new());
-    }
-    let head = tokens.get(..4).unwrap_or(&*tokens);
+/// テーブル参照位置にあるトークン 1 件（[`relation_positions`] の戻り値の要素）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RelPos {
+    /// `tokens` 内の添字。
+    pub index: usize,
+    /// `CREATE TABLE <名前>` の作成対象名の位置か。
+    pub create_name: bool,
+}
+
+/// [`relation_positions`] の結果。
+pub(crate) struct RelationWalk {
+    /// テーブル参照位置にある `Token::Ident`／`Token::QualifiedIdent`（出現順）。
+    pub positions: Vec<RelPos>,
+    /// テーブル参照位置ではない `Token::QualifiedIdent`（列修飾 `x.id` 等）が残っているか。
+    pub residual_column_qualifier: bool,
+}
+
+/// `tokens` を走査して、テーブル参照位置にある識別子（修飾あり・なし）の添字を集める。位置判定は
+/// 修飾名の解決（[`rewrite_relation_names`]）と `search_path` の未修飾名ゲート
+/// （`sql::search_path`。TABLE-27・Issue #1715）が共有する唯一の実装で、トークン列は書き換えない。
+/// 未修飾の `Token::Ident` には構文語・表関数名などの偽陽性があり得るため、呼び出し側が除外する。
+pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
+    let head = tokens.get(..4).unwrap_or(tokens);
     let head_create = ident_is(tokens.first(), "CREATE");
     let create_table = head_create && head.iter().any(|t| ident_is(Some(t), "TABLE"));
-    // `CREATE [GLOBAL|LOCAL] {TEMP|TEMPORARY} TABLE`（一時表 DDL として受理される全形）。
-    let create_temp_table = crate::sql::allowlist::is_create_temp_table_statement(tokens);
     let table_head = head.iter().any(|t| ident_is(Some(t), "TABLE"));
     // `TABLE` が表参照を導くのは DDL 文の先頭付近だけ（`SELECT table, t.id` の識別子 `table` と
     // 区別する）。
@@ -71,11 +79,11 @@ pub(crate) fn rewrite_relation_names(
         .any(|k| ident_is(tokens.first(), k));
     let mut index_on_pending = head_create && head.iter().any(|t| ident_is(Some(t), "INDEX"));
 
-    let cte_names = collect_cte_names(tokens);
     let mut levels: Vec<Level> = vec![Level::default()];
-    let mut public_names: Vec<String> = Vec::new();
-    let mut deferred: Option<SqlSurfaceError> = None;
-    let mut residual_column_qualifier = false;
+    let mut out = RelationWalk {
+        positions: Vec::new(),
+        residual_column_qualifier: false,
+    };
 
     for i in 0..tokens.len() {
         let prev = i.checked_sub(1).and_then(|p| tokens.get(p));
@@ -138,37 +146,36 @@ pub(crate) fn rewrite_relation_names(
                     next.list = false;
                 }
             }
-            Token::QualifiedIdent { .. } => {
-                relation_pos = match prev {
-                    Some(Token::Keyword(Keyword::From)) => from_rel,
-                    Some(Token::Ident(w)) => {
-                        let is = |k: &str| w.eq_ignore_ascii_case(k);
-                        if is("TABLE") {
-                            is_create_name = create_table;
-                            ddl_head && i <= 4
-                        } else if is("EXISTS") {
-                            let ok =
-                                table_head && (ident_is(prev2, "IF") || ident_is(prev2, "NOT"));
-                            is_create_name = ok && create_table;
-                            ok
-                        } else if is("COPY") {
-                            i == 1
-                        } else if is("ON") {
-                            index_on_pending
-                        } else {
-                            is("JOIN")
-                                || is("INTO")
-                                || is("TRUNCATE")
-                                || is("UPDATE")
-                                || is("ONLY")
-                                || is("REFERENCES")
-                        }
-                    }
-                    Some(Token::Punct(',')) => level.list,
-                    _ => false,
-                };
-            }
             _ => {}
+        }
+        if matches!(cur, Token::QualifiedIdent { .. } | Token::Ident(_)) {
+            relation_pos = match prev {
+                Some(Token::Keyword(Keyword::From)) => from_rel,
+                Some(Token::Ident(w)) => {
+                    let is = |k: &str| w.eq_ignore_ascii_case(k);
+                    if is("TABLE") {
+                        is_create_name = create_table;
+                        ddl_head && i <= 4
+                    } else if is("EXISTS") {
+                        let ok = table_head && (ident_is(prev2, "IF") || ident_is(prev2, "NOT"));
+                        is_create_name = ok && create_table;
+                        ok
+                    } else if is("COPY") {
+                        i == 1
+                    } else if is("ON") {
+                        index_on_pending
+                    } else {
+                        is("JOIN")
+                            || is("INTO")
+                            || is("TRUNCATE")
+                            || is("UPDATE")
+                            || is("ONLY")
+                            || is("REFERENCES")
+                    }
+                }
+                Some(Token::Punct(',')) => level.list,
+                _ => false,
+            };
         }
         // 索引 DDL の最初の `ON` だけが表参照を導く（JOIN の `ON <条件>` と区別する）。
         if ident_is(prev, "ON") {
@@ -177,20 +184,74 @@ pub(crate) fn rewrite_relation_names(
         if let Some(l) = levels.last_mut() {
             *l = next;
         }
-        let Token::QualifiedIdent { qualifier, name } = cur else {
+        match cur {
+            Token::QualifiedIdent { .. } if !relation_pos => out.residual_column_qualifier = true,
+            Token::QualifiedIdent { .. } | Token::Ident(_) if relation_pos => {
+                out.positions.push(RelPos {
+                    index: i,
+                    create_name: is_create_name,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// [`rewrite_relation_names_full`] の結果。
+pub(crate) struct RewriteInfo {
+    /// `public.` で修飾されていた表名（一時表との衝突検査用）。
+    pub names: Vec<String>,
+    /// `public.` 修飾を外したトークンの添字（準備済み文が未修飾名ゲートから除外するため。
+    /// 置換は 1 対 1 なので位置は保たれる。TABLE-27・Issue #1715）。
+    pub positions: Vec<usize>,
+    /// `CREATE TABLE` の作成対象名が `public.` で明示修飾されていたか。
+    pub create_public: bool,
+}
+
+/// `tokens` のテーブル参照位置にある `schema.name` を解決して `Token::Ident(name)` へ置き換える。
+/// 戻り値は `public.` で修飾されていた表名（一時表との衝突検査用）。修飾が無ければ何もしない。
+pub(crate) fn rewrite_relation_names(
+    tokens: &mut [Token],
+    schema_exists: Option<SchemaExists<'_>>,
+) -> Result<Vec<String>, SqlSurfaceError> {
+    Ok(rewrite_relation_names_full(tokens, schema_exists)?.names)
+}
+
+/// [`rewrite_relation_names`] の位置情報つき版。
+pub(crate) fn rewrite_relation_names_full(
+    tokens: &mut [Token],
+    schema_exists: Option<SchemaExists<'_>>,
+) -> Result<RewriteInfo, SqlSurfaceError> {
+    let mut info = RewriteInfo {
+        names: Vec::new(),
+        positions: Vec::new(),
+        create_public: false,
+    };
+    if !tokens
+        .iter()
+        .any(|t| matches!(t, Token::QualifiedIdent { .. }))
+    {
+        return Ok(info);
+    }
+    // 一時表 DDL として受理される全形（`CREATE [GLOBAL|LOCAL] {TEMP|TEMPORARY} TABLE`）。
+    let create_temp_table = crate::sql::allowlist::is_create_temp_table_statement(tokens);
+    let cte_names = collect_cte_names(tokens);
+    let walk = relation_positions(tokens);
+    let mut deferred: Option<SqlSurfaceError> = None;
+
+    for pos in &walk.positions {
+        let i = pos.index;
+        let Some(Token::QualifiedIdent { qualifier, name }) = tokens.get(i) else {
             continue;
         };
-        if !relation_pos {
-            residual_column_qualifier = true;
-            continue;
-        }
         let (qualifier, name) = (qualifier.clone(), name.clone());
         match resolve(
             &qualifier,
             &name,
-            is_create_name,
+            pos.create_name,
             // 一時表の作成対象名だけが対象（`REFERENCES public.u` 等の参照側は許可する）。
-            create_temp_table && is_create_name,
+            create_temp_table && pos.create_name,
             schema_exists,
         ) {
             Ok(()) => {
@@ -206,7 +267,9 @@ pub(crate) fn rewrite_relation_names(
                         "qualified relation name collides with a syntax word",
                     ));
                 }
-                public_names.push(name.clone());
+                info.names.push(name.clone());
+                info.positions.push(i);
+                info.create_public |= pos.create_name;
                 if let Some(slot) = tokens.get_mut(i) {
                     *slot = Token::Ident(name);
                 }
@@ -220,9 +283,9 @@ pub(crate) fn rewrite_relation_names(
     }
     match deferred {
         // 列修飾が残る文は従来の `42601`（パーサー判定）を保つため、保留した解決エラーは返さない。
-        Some(_) if residual_column_qualifier => Ok(public_names),
+        Some(_) if walk.residual_column_qualifier => Ok(info),
         Some(e) => Err(e),
-        None => Ok(public_names),
+        None => Ok(info),
     }
 }
 
@@ -230,7 +293,7 @@ pub(crate) fn rewrite_relation_names(
 /// [, name ..]*` の構造に沿って定義名だけを拾う（表別名・列別名・`CAST(.. AS ..)` の `AS` は
 /// 対象外）。`WITH` を含まない文では空。構造が想定外の `WITH` はそこで打ち切る（その文は後段の
 /// パーサーが拒否する）。
-fn collect_cte_names(tokens: &[Token]) -> Vec<String> {
+pub(crate) fn collect_cte_names(tokens: &[Token]) -> Vec<String> {
     let mut out = Vec::new();
     for (start, t) in tokens.iter().enumerate() {
         if !ident_is(Some(t), "WITH") {
@@ -298,7 +361,7 @@ fn skip_group(tokens: &[Token], open: usize) -> Option<usize> {
 /// 解決後の名前を裸の `Token::Ident` に置き換えると、後段の構文解析が構文語として
 /// 再解釈しうるか（`DROP TABLE public.if EXISTS x` の `if` 等）。予約語トークンになる語、
 /// または文脈依存の構文語に一致する名前は置き換えず拒否する（fail-closed）。
-fn collides_with_syntax_word(name: &str) -> bool {
+pub(crate) fn collides_with_syntax_word(name: &str) -> bool {
     const SYNTAX_WORDS: &[&str] = &[
         "IF",
         "NOT",

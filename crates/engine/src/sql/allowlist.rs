@@ -733,6 +733,10 @@ pub enum SqlSurfaceError {
     /// `DROP SCHEMA`（TABLE-27・ERR-6、Issue #1713）の対象が呼び出し元テナントに存在しない。
     /// `3F000`。他テナントにしか無い名前も同じ経路・同じ文言（存在を秘匿する）。
     InvalidSchemaName { name: String },
+    /// `search_path` に作成先として使える SCHEMA が 1 つも無い状態での作成系 DDL（TABLE-27・
+    /// Issue #1715）。`3F000`。固定文言で、`search_path` の要素・他テナントの SCHEMA の有無を
+    /// 反射しない。
+    NoSchemaSelected,
     /// 予約名（`pg_` 接頭辞）の SCHEMA 名の指定（TABLE-27・ERR-6、Issue #1713）。`42939`。
     ReservedName { name: String },
     /// `GENERATED ALWAYS AS IDENTITY` 列への明示値の書き込み（INSERT／UPDATE。TABLE-24・ERR-6、
@@ -1303,7 +1307,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::FeatureNotSupported { .. } => ErrorClass::FeatureNotSupported,
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateSchema { .. } => ErrorClass::DuplicateSchema,
-            SqlSurfaceError::InvalidSchemaName { .. } => ErrorClass::InvalidSchemaName,
+            SqlSurfaceError::InvalidSchemaName { .. } | SqlSurfaceError::NoSchemaSelected => {
+                ErrorClass::InvalidSchemaName
+            }
             SqlSurfaceError::ReservedName { .. } => ErrorClass::ReservedName,
             SqlSurfaceError::GeneratedAlways { .. } => ErrorClass::GeneratedAlways,
             SqlSurfaceError::DuplicateObject { .. } => ErrorClass::DuplicateObject,
@@ -1494,6 +1500,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::InvalidSchemaName { name } => {
                 write!(f, "schema does not exist: {name}")
+            }
+            SqlSurfaceError::NoSchemaSelected => {
+                f.write_str("no schema has been selected to create in")
             }
             SqlSurfaceError::ReservedName { name } => {
                 write!(f, "unacceptable schema name: {name}")
@@ -2216,6 +2225,18 @@ pub enum Statement {
     /// `SHOW timezone`／`SHOW TIME ZONE`／`SHOW "TimeZone"`（TABLE-33・Issue #1575）。
     /// 列名 `TimeZone` の text 1 行を返す（`core.rs` の実行腕）。
     ShowTimeZone,
+    /// `SET [SESSION] search_path {TO|=} ...`／`RESET search_path`（TABLE-27・Issue #1715）。
+    /// 値の検証（要素数・要素長・`pg_temp` の順序）は `core.rs` の実行腕が
+    /// [`crate::sql::search_path::SearchPath::new`] で行う（本モジュールは構造の受理までを担う）。
+    /// `reset` は `RESET search_path` 由来か（応答タグの出し分け用。`value` は常に `Default`）。
+    /// **#1715 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    SetSearchPath {
+        value: crate::sql::search_path::SearchPathSetting,
+        reset: bool,
+    },
+    /// `SHOW search_path`（TABLE-27・Issue #1715）。列名 `search_path` の text 1 行を返す。
+    /// **#1715 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    ShowSearchPath,
     /// `CREATE FUNCTION <name>(<param>[, <param>...]) AS <expr>`（TASK-79・SQL-9）。
     /// カタログ照会を必要としない（セッションのみに影響するため FROM テーブルの
     /// 存在確認は行わない）。パラメータ名重複・登録済み名との衝突・列参照の禁止
@@ -3828,6 +3849,12 @@ pub struct ValidatedCreateTable {
     /// 表を作る。NoSQL 表層の `create_table` だけが [`validate_create_table_tokens_with_implicit_id`] 経由で
     /// `true` を得る（NoSQL の行アドレスが `id` 前提のため。後続 Issue #2201 が外す）。
     pub legacy_row_identity: bool,
+    /// 作成対象名が `public.` で明示修飾されていたか（TABLE-27・Issue #1715）。真なら実行段は
+    /// `search_path` による作成先の判定を行わず `public` へ作る。構文段は常に `false` で、
+    /// `core::EngineCore` が名前解決（`sql::relation_name`）の結果から設定する。
+    ///
+    /// BREAKING CHANGE: 公開フィールドの追加（構造体リテラルで生成する外部コードは追随が必要）。
+    pub public_qualified: bool,
 }
 
 /// IDENTITY 列の宣言 1 件（[`ValidatedCreateTable::identity_columns`]。TABLE-24・Issue #1695）。
@@ -10385,6 +10412,7 @@ impl<'a> Parser<'a> {
             serial_columns,
             identity_columns,
             legacy_row_identity: self.legacy_implicit_id,
+            public_qualified: false,
         })
     }
 
@@ -16355,6 +16383,82 @@ pub(crate) fn is_show_time_zone(tokens: &[Token]) -> bool {
     ok && p.expect_end_of_statement().is_ok()
 }
 
+/// 文が `SHOW search_path`（末尾 `;` 可。TABLE-27・Issue #1715）か。他の `SHOW` は従来どおり別経路が
+/// 解析するため厳密一致のみ真にする。
+pub(crate) fn is_show_search_path(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SHOW").is_ok()
+        && p.expect_ident_matching("search_path").is_ok()
+        && p.expect_end_of_statement().is_ok()
+}
+
+/// 文が `SET [SESSION] search_path ...` の頭（`SET LOCAL` は含めない。TimeZone 系と同じく別途 `0A000`）か。
+fn is_set_search_path_head(tokens: &[Token]) -> bool {
+    let name_at = |i: usize| matches!(tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("search_path"));
+    let session_at_1 =
+        matches!(tokens.get(1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("SESSION"));
+    name_at(1) || (session_at_1 && name_at(2))
+}
+
+/// `SET [SESSION] search_path {TO|=} {DEFAULT | <要素>[, <要素>]*}`（TABLE-27・Issue #1715）。要素は
+/// 識別子・`"$user"`・文字列リテラル（中身が識別子形か `$user` のときだけ）。要素の上限は確保前に検査する。
+fn parse_set_search_path(
+    tokens: &[Token],
+) -> Result<crate::sql::search_path::SearchPathSetting, SqlSurfaceError> {
+    use crate::sql::search_path::{SearchPathElem, SearchPathSetting, MAX_SEARCH_PATH_ELEMENTS};
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SET")?;
+    if p.peek_ident_matches("SESSION") {
+        p.advance();
+    }
+    p.expect_ident_matching("search_path")?;
+    if p.peek_ident_matches("TO") {
+        p.advance();
+    } else {
+        p.expect_punct('=')?;
+    }
+    if p.peek_ident_matches("DEFAULT") {
+        p.advance();
+        p.expect_end_of_statement()?;
+        return Ok(SearchPathSetting::Default);
+    }
+    let mut elems: Vec<SearchPathElem> = Vec::new();
+    loop {
+        if elems.len() >= MAX_SEARCH_PATH_ELEMENTS {
+            return Err(SqlSurfaceError::InvalidParameterValue {
+                detail: crate::sql::search_path::INVALID_SEARCH_PATH_DETAIL,
+            });
+        }
+        let elem = match p.advance() {
+            Some(Token::Ident(w)) => SearchPathElem::from_ident(w)?,
+            Some(Token::QuotedDollarUser) => SearchPathElem::User,
+            Some(Token::StringLiteral(s)) => SearchPathElem::from_literal(s)?,
+            other => {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "expected schema name in search_path, got {other:?}"
+                )));
+            }
+        };
+        elems.push(elem);
+        if matches!(p.peek(), Some(Token::Punct(','))) {
+            p.advance();
+        } else {
+            break;
+        }
+    }
+    p.expect_end_of_statement()?;
+    Ok(SearchPathSetting::List(elems))
+}
+
+/// 文が `RESET search_path`（末尾 `;` 可。TABLE-27・Issue #1715）か。他の `RESET`（`RESET ALL`・
+/// 他の変数）は従来どおり許可リスト外（`42601`）。
+fn is_reset_search_path(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("RESET").is_ok()
+        && p.expect_ident_matching("search_path").is_ok()
+        && p.expect_end_of_statement().is_ok()
+}
+
 /// `SET` 文の 2 語目が TimeZone 系（`TIME`・`TIMEZONE`・`SESSION`・`LOCAL`）か（#1575）。
 /// 真のとき [`parse_set_time_zone`] が解析し、偽のとき従来の [`parse_set_search_mode`]
 /// （挙動・エラー文言を変えない）へ進む。
@@ -17065,6 +17169,19 @@ fn validate_sql_tokens_impl(
                 }
             }
         }
+        // TABLE-27・Issue #1715: `SET [SESSION] search_path` は TimeZone 系の振り分けより先に判定する
+        // （`SET SESSION` の 2 語目が TimeZone 系の頭として扱われるため）。他の `SET` の挙動は不変。
+        _ if is_set_statement && is_set_search_path_head(tokens) => {
+            let value = parse_set_search_path(tokens)?;
+            Ok(Statement::SetSearchPath {
+                value,
+                reset: false,
+            })
+        }
+        _ if is_reset_search_path(tokens) => Ok(Statement::SetSearchPath {
+            value: crate::sql::search_path::SearchPathSetting::Default,
+            reset: true,
+        }),
         _ if is_set_statement && is_set_time_zone_head(tokens) => {
             let value = parse_set_time_zone(tokens)?;
             Ok(Statement::SetTimeZone { value })
@@ -17138,6 +17255,8 @@ fn validate_sql_tokens_impl(
                 Statement::SetSearchMode { .. }
                 | Statement::SetTimeZone { .. }
                 | Statement::ShowTimeZone
+                | Statement::SetSearchPath { .. }
+                | Statement::ShowSearchPath
                 | Statement::CreateFunction { .. }
                 | Statement::Explain(_)
                 // Issue #929（SQL-29 (c)）: `validate_select_statement` は集合演算
@@ -17377,12 +17496,12 @@ pub fn validate_statement(
 ) -> Result<ValidatedStatement, SqlSurfaceError> {
     match validate_sql(sql, lookup)? {
         Statement::Select(stmt) => Ok(stmt),
-        Statement::SetSearchMode { .. } | Statement::SetTimeZone { .. } => {
-            Err(SqlSurfaceError::unsupported(
-                "SET is not a query statement (use a session-aware entry point)",
-            ))
-        }
-        Statement::ShowTimeZone => Err(SqlSurfaceError::unsupported(
+        Statement::SetSearchMode { .. }
+        | Statement::SetTimeZone { .. }
+        | Statement::SetSearchPath { .. } => Err(SqlSurfaceError::unsupported(
+            "SET is not a query statement (use a session-aware entry point)",
+        )),
+        Statement::ShowTimeZone | Statement::ShowSearchPath => Err(SqlSurfaceError::unsupported(
             "SHOW is not a query statement (use a session-aware entry point)",
         )),
         Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(

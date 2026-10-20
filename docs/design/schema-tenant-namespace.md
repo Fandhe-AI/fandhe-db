@@ -304,3 +304,54 @@ TABLE-27 のポインタ。`schema.table` のテーブル参照を解決する�
   `RelationKey::parse` への置き換え、テナント SCHEMA 解決が成功しうるようになった後の実行時の再検証
 - **対象外**: `search_path`（#1715）、オブジェクト名の修飾、NoSQL 表層の `table`、
   `SHOW/CANCEL PARTITIONED DML .. ON <table>`、引用付き修飾名・3 部名（従来の `42601`）
+
+## 8. Issue #1715 実装記録
+
+TABLE-27 (3) のポインタ。セッション変数 `search_path` を engine に入れた（本文は ADR D5・D6・D11 に従う）。
+
+- **値と構文**: 既定は `"$user", public`。`SET [SESSION] search_path {TO|=} <要素>[, ..]`・`= DEFAULT`・
+  `RESET search_path`・`SHOW search_path` を受理する（`SET LOCAL` は TimeZone と同じ `0A000`。他の `RESET`・
+  変数は従来どおり `42601`）。要素は識別子・`"$user"`・文字列リテラル（中身が識別子形か `$user` のとき
+  だけ）。要素数 64・要素長 63 バイトの上限を確保前に検査し、超過・不正な文字列は固定文言の `22023`。
+  `public`・`pg_catalog`・`information_schema`・`pg_temp` は ASCII 大小無視で照合して小文字へ正規化する。
+  `pg_temp` を `public` より後ろに置く指定は `0A000`（一時表は常に先頭で探すため、黙って無視しない）。
+  SCHEMA の存在は SET 時に検査せず、他テナントの名前・存在しない名前も保持する
+- **`"$user"` の字句化**: 引用識別子の中身が `$` を含むと従来は拒否される。ちょうど `"$user"` だけを専用
+  トークン（`Token::QuotedDollarUser`）にし、受理するのは `SET search_path` の値の位置だけ（他は `42601`）
+- **`$user` の展開**: handshake が認証成功後に確定した username を `SessionState::set_session_user` で 1 回
+  だけ設定する。SQL から変える経路は持たない（D6）。未設定のセッション（Rust API・NoSQL 表層）は飛ばす
+- **セッション状態**: `SessionState` に `search_path`・単調な世代（`search_path_epoch`）・`session_user` を
+  追加した。ROLLBACK／abort は `SessionState` ごと巻き戻るため `SET search_path` も取り消される（D5）。
+  `TxnState::Failed` の巻き戻し用セッションは `Box` にした（型サイズ差の clippy 対応）
+- **未修飾名の解決（参照ゲート）**: テナント SCHEMA の中にはまだオブジェクトを作れない（#1717）ため、
+  解決結果は「実効 path に `public` が含まれるか」だけで決まる。含まれる（既定の）セッションは追加コストなしで
+  従来と同一。含まれないセッションは、テーブル参照位置（#1714 と共有する `relation_positions`）の未修飾名が
+  一時表以外なら `42P01`（文言は利用者が書いた名前だけ。カタログを引かないので存在オラクルにならない）。
+  CTE 名・構文語・表関数・`public.` 修飾・定数式は対象外。`DROP`／`ALTER`／`REFRESH` の
+  VIEW・MATERIALIZED VIEW・SEQUENCE・INDEX・TYPE の対象名も参照として扱う（共有 `public` の取り違えを防ぐ）。
+  判定順は 構文 `42601` → DDL 権限の無い DDL 先頭は飛ばす（`42501` を維持）→ 参照ゲート → その他の検証
+- **作成先**: 永続オブジェクトを作る各実行腕（`CREATE TABLE`・`VIEW`・`MATERIALIZED VIEW`・`SEQUENCE`・`TYPE`）が
+  DDL 権限ゲートの直後・既存名の判定より前に path の先頭から作成先を判定する。`public` は従来どおり、
+  自テナントの既存 SCHEMA・`pg_catalog`・`information_schema`・`pg_temp` は `0A000`、どれも無ければ
+  `3F000`（固定文言 `no schema has been selected to create in`）。`public.` で明示修飾した `CREATE TABLE`
+  （`ValidatedCreateTable.public_qualified`）・一時表・UDF は判定しない。既定の path のまま自分の username と
+  同名の SCHEMA を作ったテナントは、未修飾の `CREATE TABLE` が `0A000` になる（PG と同じく `$user` が優先。
+  #1717 まで）
+- **拡張クエリ**: Parse・Bind・Describe・`COPY` も同じゲートを通す。Parse 後に `SET search_path` された文は
+  Bind（wire は path が隠れているセッションで cached の `$n` なし文も `bind_prepared_in_session` で
+  検証し直す）で `42P01` になる。Bind 後・Execute 前に path が変わった文と、`parse_sql` で作った
+  未検証の文は、`public` が隠れている間 `0A000`（`SessionRoutedSql` の path 世代。セッション変数・
+  トランザクション制御・一時表の作成・定数式・カーソルの `FETCH`／`CLOSE` は免除）
+- **暗黙 RLS**: path に関係なく常に掛かる（D3）。`SET search_path` は境界を越える経路にならない
+  （`rls_implicit.rs` に D11 のテストを追加。セッションの無い入口の `SET search_path` は従来どおり `42601`）
+- **意図的な PostgreSQL との差**: 長すぎる要素名は切り詰めず `22023`／文字列リテラル要素は識別子形か
+  `$user` だけ（カンマ分割しない）／`DROP`・`ALTER` の `IF EXISTS` も `public` が隠れていれば no-op に
+  せず `42P01`／`pg_temp` を `public` より後ろに置くと `0A000`／`quote_identifier` の予約語判定は lexer の
+  予約語に限る
+- **公開 API の破壊的変更**: `Statement::SetSearchPath`・`ShowSearchPath`、`SqlOutcome::SetSearchPath`、
+  `Token::QuotedDollarUser`、`SqlSurfaceError::NoSchemaSelected`、`ValidatedCreateTable.public_qualified`
+- **対象外**: テナント SCHEMA 内のオブジェクトの解決と作成・要素ごとの読み取り probe（#1717）、
+  `nextval('s')` など文字列引数のオブジェクト名・UDF・ENUM 型の参照解決・組み込み関数の `pg_catalog` の
+  優先順（#1717）、`pg_temp.x` の結線、`current_schema()`（#1718）、StartupMessage の `search_path`・
+  `ParameterStatus` 通知、`set_config('search_path', ..)`・`ALTER ROLE .. SET search_path`、NoSQL 表層
+  （ステートレスで既定の path）

@@ -1622,6 +1622,9 @@ fn run_authenticated_session<S: WireStream>(
     if store.is_ddl_allowed(&username) {
         session.allow_ddl();
     }
+    // TABLE-27・Issue #1715: `search_path` の `"$user"` は、認証成功後に確定した username から
+    // 展開する（接続ごとに 1 回だけ設定し、SQL 文から変える経路は持たない。ADR D6）。
+    session.set_session_user(&username);
     // 接続単位の Parse 済みステートメント・portal 保持（Issue #933・#934・
     // TASK-71・WIRE-11）。`session` と同じく接続終了で破棄し、接続間・
     // テナント間で共有しない（`extended_query` モジュールドキュメント参照）。

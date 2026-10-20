@@ -26,7 +26,8 @@
 //! 実体ストアと切断時の破棄は `temp_rows`（#1682）、`CREATE TEMP TABLE` と
 //! `ON COMMIT`（`SessionState::apply_temp_on_commit`）・一時表の `DROP` は #1683、
 //! 一時表への DML・索引・制約は #1684、テナント境界・crash 耐性の検査は #1685。
-//! 修飾名（`pg_temp.<名前>`）はスキーマ・`search_path`（TABLE-27）の実装へ申し送る。
+//! 修飾名（`pg_temp.<名前>`）の結線は別 Issue へ申し送る（`search_path`〔TABLE-27・Issue #1715〕は実装済みで、
+//! 一時表は path に関わらず先頭で解決する）。
 
 use std::cell::Cell;
 use std::collections::BTreeMap;

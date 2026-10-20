@@ -50,6 +50,11 @@ pub enum Token {
     /// 〔NAMEDATALEN-1〕）だけを専用トークンにする。受理するのは `COLLATE` 直後の照合名の位置だけで、
     /// 他の位置では既存の不一致腕により `42601` になる（識別子として使えない）。
     QuotedCollationName(String),
+    /// 二重引用符付きのちょうど `"$user"`（TABLE-27・Issue #1715）。`search_path` の特殊要素 `$user`
+    /// を表す。引用識別子は `$` を含められない（[`is_plain_identifier`]）ため専用トークンにし、
+    /// 受理するのは `SET search_path` の値の位置だけ。他の位置では既存の不一致腕により `42601`
+    /// になる（識別子として使えない。fail-closed）。
+    QuotedDollarUser,
     StringLiteral(String),
     Number(String),
     /// `(` `)` `,` `*` `=` `;` `+` `-` `/` `>` `<` `[` `]` `%` `#`（`%`・単独 `#` は
@@ -210,6 +215,7 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
                 out.push_str(s);
                 out.push('"');
             }
+            Token::QuotedDollarUser => out.push_str("\"$user\""),
             Token::StringLiteral(s) => {
                 out.push('\'');
                 out.push_str(&s.replace('\'', "''"));
@@ -695,6 +701,11 @@ fn tokenize_impl(
                     message: "zero-length quoted identifier".to_string(),
                     byte_offset: offset,
                 });
+            }
+            if content == "$user" {
+                tokens.push(Token::QuotedDollarUser);
+                advance_to(&mut chars, end);
+                continue;
             }
             if is_hyphenated_collation_name(content) {
                 tokens.push(Token::QuotedCollationName(content.to_string()));
@@ -2216,6 +2227,35 @@ mod quoted_bool_word_tests {
             &tokenize("SELECT id FROM t WHERE flag = true").expect("tokenize")
         ));
     }
+    /// TABLE-27・Issue #1715: 二重引用符付きのちょうど `"$user"` だけが専用トークンになる。
+    /// 他の `$` を含む引用識別子は従来どおり拒否し、パラメータ走査・引用の終端判定と干渉しない。
+    #[test]
+    fn quoted_dollar_user_token_is_exact_and_isolated() {
+        assert_eq!(
+            tokenize("SET search_path TO \"$user\", public").expect("tokenize"),
+            vec![
+                Token::Ident("SET".to_string()),
+                Token::Ident("search_path".to_string()),
+                Token::Ident("TO".to_string()),
+                Token::QuotedDollarUser,
+                Token::Punct(','),
+                Token::Ident("public".to_string()),
+            ]
+        );
+        for bad in ["\"$User\"", "\"$user1\"", "\"a$user\"", "\"$\"", "\"$1\""] {
+            assert!(tokenize(bad).is_err(), "{bad}");
+        }
+        // `$n` のプレースホルダ走査は引用内の `$` に反応しない。
+        let toks = tokenize_with_params("SELECT \"$user\" FROM t WHERE a = $1").expect("tokenize");
+        assert!(toks.contains(&Token::QuotedDollarUser));
+        assert!(toks.iter().any(|t| matches!(t, Token::Param(1))));
+        // 往復表示。
+        assert_eq!(
+            render_tokens(&[Token::QuotedDollarUser]).as_deref(),
+            Some("\"$user\"")
+        );
+    }
+
     /// TABLE-28・Issue #2190: ハイフンを含む二重引用符付きの照合名候補だけが専用トークンになる。
     /// 文字種（先頭は英字、以降は英数字・`_`・`-`）と長さ（63 バイト以下）を字句段で制限する。
     #[test]
