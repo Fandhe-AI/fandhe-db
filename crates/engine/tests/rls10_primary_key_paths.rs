@@ -290,6 +290,25 @@ enum Obs {
     Err { code: &'static str, message: String },
 }
 
+/// Debug 文字列から `ResultRow` の内部 id（割り当てられた rowid）を除く。flood 側では他テナントの
+/// INSERT が間に入り採番が baseline とずれるため、SQL セル値だけを比較対象にする（RLS 判定を採番差で
+/// 誤らせない）。`ResultRow { id: N, ` を `ResultRow { ` へ正規化する。
+fn strip_row_ids(dbg: &str) -> String {
+    const HEAD: &str = "ResultRow { id: ";
+    let mut out = String::with_capacity(dbg.len());
+    let mut rest = dbg;
+    while let Some(pos) = rest.find(HEAD) {
+        out.push_str(&rest[..pos]);
+        out.push_str("ResultRow { ");
+        let after = &rest[pos + HEAD.len()..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        let tail = &after[digits..];
+        rest = tail.strip_prefix(", ").unwrap_or(tail);
+    }
+    out.push_str(rest);
+    out
+}
+
 fn observe(r: Result<SqlOutcome, engine::sql::allowlist::SqlSurfaceError>) -> Obs {
     match r {
         Ok(o) => {
@@ -302,7 +321,7 @@ fn observe(r: Result<SqlOutcome, engine::sql::allowlist::SqlSurfaceError>) -> Ob
                 _ => None,
             };
             Obs::Ok {
-                debug: format!("{o:?}"),
+                debug: strip_row_ids(&format!("{o:?}")),
                 count,
             }
         }
@@ -355,7 +374,7 @@ fn tenant_state(core: &EngineCore, tenant: &str, exclude: Option<&str>) -> Strin
                 let rows: Vec<String> = q
                     .rows
                     .iter()
-                    .map(|r| format!("{r:?}"))
+                    .map(|r| format!("{:?}", r.cells))
                     .filter(|r| exclude.is_none_or(|x| !r.contains(&format!("tok-{x}-"))))
                     .collect();
                 out.push_str(&format!("{table}:{rows:?}\n"));

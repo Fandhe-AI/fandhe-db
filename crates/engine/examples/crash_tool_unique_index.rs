@@ -338,6 +338,25 @@ fn find_next_seq(
     }
 }
 
+/// `docs_pk` のバッチ先頭行 `first` へ `ON CONFLICT (grp, k) DO UPDATE SET n = 1`（INSERT とは別 txn）を
+/// 打つ。同一 `seq` では同一 OPERATION_ID のため再実行しても結果は変わらない。
+fn upsert_batch_head(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    session: &mut SessionState,
+    first: u64,
+    seq: u64,
+    op_tag: &str,
+) -> Result<(), String> {
+    let upsert = format!(
+        "INSERT INTO {PK_TABLE} (grp, k, code, n) VALUES ('{PK_GROUP}', {first}, 'pcode-{first}', 0) \
+         ON CONFLICT (grp, k) DO UPDATE SET n = 1 USING OPERATION_ID 'op-{PK_TABLE}-{op_tag}-{seq}'"
+    );
+    core.execute_sql_in_session(ctx, session, &upsert)
+        .map_err(|e| format!("upsert failed at {PK_TABLE} batch_seq={seq}: {e}"))?;
+    Ok(())
+}
+
 /// 採番方式の 2 表へ 1 バッチずつ書く。`docs_pk` は `BATCH` 行の INSERT の後に、先頭行への
 /// `ON CONFLICT (grp, k) DO UPDATE`（別 txn）を打ち、UPSERT を kill の対象経路に乗せる。
 fn write_allocated_batch(
@@ -348,6 +367,24 @@ fn write_allocated_batch(
 ) -> Result<(), String> {
     let mut session = SessionState::default();
     let pk_seq = *pk_next / BATCH;
+    // 前回の write が kill で INSERT と UPSERT の間に落ちた場合に備え、直前バッチの先頭行が `n = 0` の
+    // ままなら UPSERT をやり直す（OPERATION_ID は同一内容の再記録を拒否するため別タグ `upr`）。
+    // これにより最終バッチ以外の先頭行は必ず `n = 1` になり、verify が UPSERT 更新の消失を検出できる。
+    if let Some(prev_first) = pk_next.checked_sub(BATCH) {
+        let probe = core
+            .execute_sql(
+                ctx,
+                &format!("SELECT n FROM {PK_TABLE} WHERE grp = '{PK_GROUP}' AND k = {prev_first} ORDER BY k LIMIT 1"),
+            )
+            .map_err(|e| format!("{PK_TABLE}: head probe failed: {e}"))?;
+        let pending = matches!(
+            probe.rows.first().map(|r| r.cells.as_slice()),
+            Some([Cell::SignedInteger(0)])
+        );
+        if pending {
+            upsert_batch_head(core, ctx, &mut session, prev_first, pk_seq - 1, "upr")?;
+        }
+    }
     let mut values = String::new();
     for offset in 0..BATCH {
         let k = pk_next
@@ -364,13 +401,7 @@ fn write_allocated_batch(
     );
     core.execute_sql_in_session(ctx, &mut session, &sql)
         .map_err(|e| format!("insert failed at {PK_TABLE} batch_seq={pk_seq}: {e}"))?;
-    let first = *pk_next;
-    let upsert = format!(
-        "INSERT INTO {PK_TABLE} (grp, k, code, n) VALUES ('{PK_GROUP}', {first}, 'pcode-{first}', 0) \
-         ON CONFLICT (grp, k) DO UPDATE SET n = 1 USING OPERATION_ID 'op-{PK_TABLE}-up-{pk_seq}'"
-    );
-    core.execute_sql_in_session(ctx, &mut session, &upsert)
-        .map_err(|e| format!("upsert failed at {PK_TABLE} batch_seq={pk_seq}: {e}"))?;
+    upsert_batch_head(core, ctx, &mut session, *pk_next, pk_seq, "up")?;
     *pk_next = pk_next
         .checked_add(BATCH)
         .ok_or_else(|| "pk overflow after insert".to_string())?;
@@ -585,7 +616,15 @@ fn verify_pk_table(core: &EngineCore, ctx: &PolicyContext) -> Result<(), String>
             other => return Err(format!("{PK_TABLE}: unexpected cells {other:?}")),
         };
         let is_batch_head = k % BATCH as i64 == 0;
-        if !(n == 0 || (n == 1 && is_batch_head)) {
+        // 最終バッチの先頭行だけは INSERT の直後（UPSERT 前）で kill され得るため 0 も許す。それ以前の
+        // バッチ先頭行は次バッチ着手前（または再開時の再実行）に UPSERT 済みなので `n = 1` を要求する。
+        let is_last_batch = k >= total as i64 - BATCH as i64;
+        let ok = if is_batch_head && !is_last_batch {
+            n == 1
+        } else {
+            n == 0 || (n == 1 && is_batch_head)
+        };
+        if !ok {
             return Err(format!("{PK_TABLE}: unexpected n={n} at k={k}"));
         }
     }
