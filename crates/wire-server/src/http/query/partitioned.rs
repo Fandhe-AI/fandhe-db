@@ -143,7 +143,7 @@ pub fn check_target_form(
     target: &TargetForm<'_>,
 ) -> Result<(), PartitionedRequestError> {
     match (modifier, target) {
-        (Some(_), TargetForm::RowId(_)) => Err(PartitionedRequestError::WhereNotAllowed),
+        (Some(_), TargetForm::RowAddress(_)) => Err(PartitionedRequestError::WhereNotAllowed),
         _ => Ok(()),
     }
 }
@@ -288,6 +288,7 @@ pub fn handle_cancel(
 mod tests {
     use super::*;
     use engine::json::{parse_json, JsonValue};
+    use std::collections::BTreeMap;
 
     fn validated_update(extra: &str) -> Validated<'static> {
         let json = format!(
@@ -354,8 +355,8 @@ mod tests {
     #[test]
     fn modifier_with_row_id_target_is_rejected() {
         let m = Some(PartitionedModifier { chunk_rows: None });
-        assert!(check_target_form(m, &TargetForm::RowId(1)).is_err());
-        assert!(check_target_form(None, &TargetForm::RowId(1)).is_ok());
+        assert!(check_target_form(m, &TargetForm::RowAddress(&BTreeMap::new())).is_err());
+        assert!(check_target_form(None, &TargetForm::RowAddress(&BTreeMap::new())).is_ok());
         assert!(check_target_form(m, &TargetForm::Predicate(&[])).is_ok());
     }
 }

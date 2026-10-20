@@ -3886,7 +3886,8 @@ pub struct ValidatedCreateTable {
     /// 従来方式（暗黙の `id` 疑似列を持つ）の表として作るかどうか（TABLE-23・Issue #2199）。
     /// 既定の SQL 表層（[`validate_create_table_tokens`]）は `false` で、暗黙の `id` を持たない採番方式の
     /// 表を作る。NoSQL 表層の `create_table` だけが [`validate_create_table_tokens_with_implicit_id`] 経由で
-    /// `true` を得る（NoSQL の行アドレスが `id` 前提のため。後続 Issue #2201 が外す）。
+    /// `true` を得る（作成経路は据え置き。NoSQL の行アドレスは Issue #2201 で PRIMARY KEY 基準にも対応したが、
+    /// NoSQL `create_table` の作成方式の切り替えは破壊的変更のため別途判断する）。
     pub legacy_row_identity: bool,
 }
 
@@ -18032,8 +18033,9 @@ pub fn validate_create_table_tokens(
 /// [`validate_create_table_tokens`] の従来方式版（暗黙の `id` 疑似列を持つ表を作る検証。TABLE-23・
 /// Issue #2199）。`id` 列名は予約のまま、`PRIMARY KEY (id)` は暗黙主キーの明示宣言として扱い、結果の
 /// [`ValidatedCreateTable::legacy_row_identity`] が真になる（実行段が従来方式の表を作る）。NoSQL 表層
-/// （`wire-server` の `http/query/ddl.rs`）の `create_table` 専用: NoSQL の行アドレスは `id` 前提で、
-/// 採番方式の表への対応は後続 Issue（#2201）が担う。SQL 表層は [`validate_create_table_tokens`] を使う。
+/// （`wire-server` の `http/query/ddl.rs`）の `create_table` 専用: 作成方式（従来方式）は据え置き。
+/// NoSQL の行 op の採番方式の表への対応は Issue #2201 で入ったが、`create_table` の作成方式の切り替えは
+/// 後続の判断事項。SQL 表層は [`validate_create_table_tokens`] を使う。
 pub fn validate_create_table_tokens_with_implicit_id(
     tokens: &[Token],
 ) -> Result<ValidatedCreateTable, SqlSurfaceError> {

@@ -81,7 +81,8 @@ pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
 /// `catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE` と同じ。表名・テナント名・値を含めない）。
 const ROW_IDENTITY_UNSUPPORTED_MESSAGE: &str = "row identity mode is not supported yet";
 
-/// 採番方式の表なら固定文言の `0A000` で拒否する（TABLE-23・Issue #2199）。各 op の束縛 closure が
+/// 採番方式の表なら固定文言の `0A000` で拒否する（TABLE-23・Issue #2199）。`aggregate`／`search`
+/// の束縛 closure と、`update`／`delete` の従来の単一行 `id` 形の経路が
 /// 受け取るスキーマ（実行と同一のスナップショット）に対して呼ぶ。入口の事前判定（[`handle`]）は
 /// 別スナップショットのため、並行 DDL による表の差し替えはこの判定が塞ぐ。応答に表名・値を含めない。
 pub(super) fn reject_allocated_schema(
@@ -152,14 +153,11 @@ pub fn handle(
     // #768・#772・#764・#876）。各アームは対応するモジュールへの 1 行委譲に
     // 留める。全 6 op が実行結線済みのため `(_, _)` は `engine` 未接続時
     // （`Router::new` 経由）にのみ到達する。
-    // 採番方式の表（暗黙の `id` を持たない表。TABLE-23・Issue #2199）は NoSQL 表層の行アドレス
-    // （`id`）が通用しないため、行を読み書きする op は実行前に固定文言の `0A000` で拒否する
-    // （後続 Issue #2201 が NoSQL 側の対応を入れるまでの fail-closed。応答に表名・値を含めない）。
+    // 採番方式の表（暗黙の `id` を持たない表。TABLE-23・NOSQL-23）への `scan`／`insert`／
+    // `update`／`delete` は PRIMARY KEY 基準の行アドレスで動く（Issue #2201）。`aggregate`／`search`
+    // は未対応のため、実行前に固定文言の `0A000` で拒否する（fail-closed。応答に表名・値を含めない）。
     if let Some(engine) = engine {
-        if matches!(
-            op,
-            Op::Scan | Op::Aggregate | Op::Insert | Op::Search | Op::Update | Op::Delete
-        ) {
+        if matches!(op, Op::Aggregate | Op::Search) {
             if let Ok(table) = validated.required_str("table") {
                 if engine.table_uses_allocated_row_identity(table) {
                     return response::encode_error(
@@ -610,12 +608,13 @@ mod tests {
     }
 
     #[test]
-    fn nested_where_unknown_key_rejects_with_42601() {
+    fn where_with_extra_keys_passes_schema_and_is_resolved_against_the_table() {
+        // `where` のキー集合は表の PRIMARY KEY と照合するまで確定しない（Issue #2201。
+        // 不一致の拒否は `dml_target` と結合テストが担う）。engine 未接続のため暫定応答に落ちる。
         let body = br#"{"op":"delete","table":"docs","where":{"id":1,"extra":1}}"#;
         let response = run(body, &[]);
         let text = String::from_utf8(response).expect("utf-8 response");
-        assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
-        assert!(text.contains("42601"), "got: {text}");
+        assert!(text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
     }
 
     #[test]

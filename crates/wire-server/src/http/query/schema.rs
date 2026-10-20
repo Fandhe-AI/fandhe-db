@@ -843,21 +843,6 @@ pub static INSERT_SCHEMA: ObjectSchema = ObjectSchema {
     ],
 };
 
-/// `where` フィールドのサブスキーマ（`update`／`delete` op。単一行・`id`
-/// 指定形。Issue #875・NOSQL-12）。`where`／`filter` の排他・双方欠落の
-/// 意味検証はここでは行わず（両方 `Optional`）、後続 Issue（#876）の
-/// バインダが担う（`search` op の `vector`／`plan` 排他判定を #763 の
-/// バインダへ置いた前例と同じ設計）。
-pub static WHERE_ID_SCHEMA: ObjectSchema = ObjectSchema {
-    name: "where",
-    fields: &[FieldSpec {
-        key: "id",
-        presence: Presence::Required,
-        ty: FieldType::Number,
-        nullable: false,
-    }],
-};
-
 /// `update` op のトップレベルスキーマ（NOSQL-12 ポインタ。Issue #875）。
 /// `set` の禁止列（`id`／`tenant_id`／`visibility`）検査・列名解決・
 /// `where`／`filter` の排他判定・`operation_id` 欠落／`null`／空文字 →
@@ -887,7 +872,7 @@ pub static UPDATE_SCHEMA: ObjectSchema = ObjectSchema {
         FieldSpec {
             key: "where",
             presence: Presence::Optional,
-            ty: FieldType::Object(&WHERE_ID_SCHEMA),
+            ty: FieldType::AnyObject,
             nullable: false,
         },
         FieldSpec {
@@ -942,7 +927,7 @@ pub static DELETE_SCHEMA: ObjectSchema = ObjectSchema {
         FieldSpec {
             key: "where",
             presence: Presence::Optional,
-            ty: FieldType::Object(&WHERE_ID_SCHEMA),
+            ty: FieldType::AnyObject,
             nullable: false,
         },
         FieldSpec {
@@ -1093,7 +1078,7 @@ pub static DDL_REFERENCES_SCHEMA: ObjectSchema = ObjectSchema {
 /// `check`）・`columns` の必須性は [`super::ddl`] の意味検証が判定する
 /// （`check` は `columns` を要求しないため、本スキーマでは `columns` を
 /// `Optional` として宣言し、`kind` ごとの必須性は呼び出し元が
-/// `Validated::required_array` で判定する。`WHERE_ID_SCHEMA` と同じ
+/// `Validated::required_array` で判定する。`where` と同じ
 /// 「スキーマは型のみ、意味は呼び出し元」設計）。
 pub static DDL_CONSTRAINT_SCHEMA: ObjectSchema = ObjectSchema {
     name: "ddl_constraint",
@@ -1655,12 +1640,7 @@ mod tests {
     }
 
     #[test]
-    fn where_id_type_mismatch_is_rejected() {
-        let v = obj(r#"{"op":"delete","table":"docs","where":{"id":"1"}}"#);
-        assert_eq!(
-            DELETE_SCHEMA.validate(&v).unwrap_err(),
-            SchemaError::TypeMismatch { key: "id" }
-        );
+    fn where_must_be_an_object() {
         let v2 = obj(r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":"x"}"#);
         assert_eq!(
             UPDATE_SCHEMA.validate(&v2).unwrap_err(),
@@ -1669,12 +1649,13 @@ mod tests {
     }
 
     #[test]
-    fn nested_where_rejects_unknown_key() {
-        let v = obj(r#"{"op":"delete","table":"docs","where":{"id":1,"extra":1}}"#);
-        assert_eq!(
-            DELETE_SCHEMA.validate(&v).unwrap_err(),
-            SchemaError::UnknownKey
-        );
+    fn where_accepts_arbitrary_keys_for_row_address() {
+        // 行アドレスのキー集合（PRIMARY KEY 列。複合可）の検証は表のスキーマが要るため
+        // `dml_target` が担う（TABLE-23・NOSQL-23。Issue #2201）。
+        let v = obj(r#"{"op":"delete","table":"docs","where":{"a":"x","b":1}}"#);
+        assert!(DELETE_SCHEMA.validate(&v).is_ok());
+        let u = obj(r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":"1"}}"#);
+        assert!(UPDATE_SCHEMA.validate(&u).is_ok());
     }
 
     #[test]

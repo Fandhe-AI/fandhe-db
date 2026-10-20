@@ -7243,8 +7243,8 @@ pub(crate) enum RowIdentity {
     #[default]
     LegacyId,
     /// 採番方式（契約は spec のポインタ TABLE-23 を正とする）。暗黙の `id` を持たず、行の物理キー（rowid）は
-    /// 書き込み段が同じ write txn で払い出す。SQL 表層だけが読み書きでき、行の識別子を `id` として返す
-    /// Rust API・NoSQL 表層は `0A000` 相当の固定文言で拒否する（[`ROW_IDENTITY_UNSUPPORTED_MESSAGE`]）。
+    /// 書き込み段が同じ write txn で払い出す。SQL 表層と NoSQL の scan/insert/update/delete（PK 基準。#2201）が読み書きでき、
+    /// `id` を返す Rust API と NoSQL の aggregate/search は `0A000` 相当の固定文言で拒否する（[`ROW_IDENTITY_UNSUPPORTED_MESSAGE`]）。
     Allocated,
     /// 移行済みの従来方式（TABLE-23・Issue #2200。ADR `docs/design/rowid-primary-key-separation.md` §12）。
     /// 旧形式の表を開く時点でカタログだけを書き換えて付ける、永続する移行済みの印（`rowmode:migrated`）。
