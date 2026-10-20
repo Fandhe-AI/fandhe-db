@@ -351,6 +351,12 @@ impl EngineCore {
         ))))
     }
 
+    /// このコア（一時コア）に同名の索引があるか。`search_path` の参照ゲート
+    /// （`sql::search_path`）が一時表の索引名を判定するために呼ぶ。照会失敗は `false`（fail-closed）。
+    pub(crate) fn has_index_named(&self, name: &str) -> bool {
+        self.storage.index_exists(name).unwrap_or(false)
+    }
+
     /// `DROP INDEX` の振り分け。名前が一時 DB の索引なら一時コアで実行し（PostgreSQL が `pg_temp` を
     /// 先に探すのと同じく、同名の永続の索引より優先する）、そうでなければ従来の永続の経路
     /// （DDL 権限ゲートあり）へ回す。

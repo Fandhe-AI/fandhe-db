@@ -544,3 +544,30 @@ fn search_path_never_widens_the_tenant_boundary() {
         other => panic!("expected Query, got {other:?}"),
     }
 }
+
+#[test]
+fn gate_respects_cte_scope_syntax_named_tables_and_temp_indexes() {
+    let (core, _g, mut s) = with_table("sp-gate-review");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE \"temp\" (id BIGINT PRIMARY KEY)",
+    );
+    ok(&core, &mut s, "SET search_path = nosuch");
+    // 非再帰 CTE の本文中の自己参照は同名の永続表を読むためゲートの対象。
+    for sql in [
+        "WITH t AS (SELECT id FROM t) SELECT id FROM t LIMIT 5",
+        "SELECT id FROM temp LIMIT 5",
+    ] {
+        assert_eq!(code(&core, &mut s, sql), "42P01", "{sql}");
+    }
+    // 一時表の索引に対する DROP INDEX は一時側で解決される。
+    ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE tmp (id BIGINT PRIMARY KEY, v INT)",
+    );
+    ok(&core, &mut s, "CREATE INDEX tmp_v ON tmp (v)");
+    ok(&core, &mut s, "DROP INDEX tmp_v");
+    assert_eq!(code(&core, &mut s, "DROP INDEX tmp_v"), "42P01");
+}

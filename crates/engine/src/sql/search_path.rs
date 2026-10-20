@@ -202,11 +202,63 @@ fn quote_identifier(name: &str) -> String {
     }
 }
 
+/// ゲート対象の未修飾名 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateRef {
+    name: String,
+    /// `DROP INDEX`／`ALTER INDEX` の対象名か（一時表の索引は一時 DB の索引カタログで照会する）。
+    is_index: bool,
+}
+
+/// 添字 `idx` の識別子が、表名ではなく構文語として置かれているか。名前の一致だけでは判定せず、
+/// 構文位置（直後のトークン・直前の句）で区別する。`"temp"` のように構文語と同名の実テーブルは
+/// 参照として残す（fail-closed。除外は構文語だと確定できる形だけ）。
+fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
+    let word = |i: usize| match tokens.get(i) {
+        Some(Token::Ident(w)) => Some(w.as_str()),
+        _ => None,
+    };
+    let is =
+        |i: Option<usize>, k: &str| i.and_then(word).is_some_and(|w| w.eq_ignore_ascii_case(k));
+    let prev = idx.checked_sub(1);
+    // `FOR UPDATE <NOWAIT|OF|SKIP>`・`DO UPDATE SET`・`ON UPDATE <CASCADE|SET|NO ..>` は句の続き。
+    if is(prev, "UPDATE")
+        && (is(idx.checked_sub(2), "FOR")
+            || is(idx.checked_sub(2), "DO")
+            || is(idx.checked_sub(2), "ON"))
+    {
+        return true;
+    }
+    let next_is_name = matches!(
+        tokens.get(idx.saturating_add(1)),
+        Some(Token::Ident(_) | Token::QualifiedIdent { .. })
+    );
+    let Some(w) = word(idx) else {
+        return false;
+    };
+    if w.eq_ignore_ascii_case("IF") {
+        return is(Some(idx.saturating_add(1)), "EXISTS") || is(Some(idx.saturating_add(1)), "NOT");
+    }
+    if w.eq_ignore_ascii_case("ONLY") {
+        return next_is_name;
+    }
+    if w.eq_ignore_ascii_case("TABLE") {
+        return is(prev, "TRUNCATE") && (next_is_name);
+    }
+    if w.eq_ignore_ascii_case("LATERAL") {
+        let after = tokens.get(idx.saturating_add(1));
+        return matches!(after, Some(Token::Punct('(')))
+            || (next_is_name
+                && matches!(tokens.get(idx.saturating_add(2)), Some(Token::Punct('('))));
+    }
+    false
+}
+
 /// 未修飾のテーブル参照の名前集め（参照ゲートの入力）。`skip` はゲート対象外のトークン添字
 /// （準備済み文で `public.` 修飾を外した位置）。トークン列は書き換えない。
-fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<String> {
+fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
     let walk = crate::sql::relation_name::relation_positions(tokens);
-    let ctes = crate::sql::relation_name::collect_cte_names(tokens);
+    let ctes = crate::sql::relation_name::collect_cte_scopes(tokens);
     let mut out = Vec::new();
     for pos in walk.positions {
         if pos.create_name || skip.contains(&pos.index) {
@@ -215,9 +267,12 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<String> {
         let Some(Token::Ident(name)) = tokens.get(pos.index) else {
             continue;
         };
-        // 構文語（`IF`・`ONLY`・`LATERAL` 等）・CTE 名は表参照ではない。
-        if crate::sql::relation_name::collides_with_syntax_word(name)
-            || ctes.iter().any(|c| c.eq_ignore_ascii_case(name))
+        // 構文語（`IF`・`ONLY`・`LATERAL` 等）は構文位置で判定する。CTE 名はその参照位置から実際に
+        // 可視なものだけを除外する（非再帰 CTE は自身の本文から見えない。`sql::cte` の契約）。
+        if is_syntax_keyword_here(tokens, pos.index)
+            || ctes
+                .iter()
+                .any(|c| c.covers(pos.index) && c.name.eq_ignore_ascii_case(name))
         {
             continue;
         }
@@ -236,7 +291,10 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<String> {
         {
             continue;
         }
-        out.push(name.clone());
+        out.push(GateRef {
+            name: name.clone(),
+            is_index: false,
+        });
     }
     out.extend(object_ddl_names(tokens));
     out
@@ -245,7 +303,7 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<String> {
 /// `DROP`／`ALTER`／`REFRESH` の `[MATERIALIZED] VIEW`・`SEQUENCE`・`INDEX`・`TYPE` の対象名。
 /// `public` が見えないセッションが共有 `public` のビューなどを取り違えて落とさないよう、
 /// 参照として扱う（fail-closed。`IF EXISTS` でも拒否する。ADR §8 の意図的な差）。
-fn object_ddl_names(tokens: &[Token]) -> Vec<String> {
+fn object_ddl_names(tokens: &[Token]) -> Vec<GateRef> {
     let word = |i: usize| match tokens.get(i) {
         Some(Token::Ident(w)) => Some(w.as_str()),
         _ => None,
@@ -261,6 +319,7 @@ fn object_ddl_names(tokens: &[Token]) -> Vec<String> {
     if !(is(i, "VIEW") || is(i, "SEQUENCE") || is(i, "INDEX") || is(i, "TYPE")) {
         return Vec::new();
     }
+    let is_index = is(i, "INDEX");
     i += 1;
     if is(i, "CONCURRENTLY") {
         i += 1;
@@ -270,7 +329,10 @@ fn object_ddl_names(tokens: &[Token]) -> Vec<String> {
     }
     let mut out = Vec::new();
     while let Some(Token::Ident(name)) = tokens.get(i) {
-        out.push(name.clone());
+        out.push(GateRef {
+            name: name.clone(),
+            is_index,
+        });
         if matches!(tokens.get(i + 1), Some(Token::Punct(','))) {
             i += 2;
         } else {
@@ -309,13 +371,28 @@ pub(crate) fn check_unqualified_refs(
         return Ok(());
     }
     let temp = session.temp_tables();
-    for name in unqualified_relation_refs(tokens, skip) {
-        if temp.contains(&name) {
+    for r in unqualified_relation_refs(tokens, skip) {
+        // 索引名は一時表名の集合ではなく一時 DB の索引カタログで照会する（一時表の索引に対する
+        // `DROP INDEX` を `42P01` で先に拒否しない）。照会に失敗したら存在しない側（fail-closed）。
+        let temp_hit = if r.is_index {
+            temp_index_exists(session, &r.name)
+        } else {
+            temp.contains(&r.name)
+        };
+        if temp_hit {
             continue;
         }
-        return Err(SqlSurfaceError::undefined_table(name));
+        return Err(SqlSurfaceError::undefined_table(r.name));
     }
     Ok(())
+}
+
+/// セッションの一時 DB に同名の索引があるか（未生成・照会失敗は `false`）。
+fn temp_index_exists(session: &SessionState, name: &str) -> bool {
+    session
+        .temp_rows_arc()
+        .and_then(|store| store.core().ok().map(|c| c.has_index_named(name)))
+        .unwrap_or(false)
 }
 
 /// 作成系 DDL の作成先（現時点では `public` だけ）。
@@ -372,6 +449,9 @@ mod tests {
 
     fn names(sql: &str) -> Vec<String> {
         unqualified_relation_refs(&tokenize(sql).expect("lex"), &[])
+            .into_iter()
+            .map(|r| r.name)
+            .collect()
     }
 
     #[test]
@@ -446,5 +526,54 @@ mod tests {
         assert_eq!(names("CREATE TABLE u (id INT)"), Vec::<String>::new());
         assert_eq!(names("DROP VIEW IF EXISTS v"), vec!["v"]);
         assert_eq!(names("REFRESH MATERIALIZED VIEW m"), vec!["m"]);
+    }
+
+    #[test]
+    fn cte_name_hides_only_where_visible() {
+        // 非再帰 CTE は自身の本文から見えない（同名の実リレーションを読む）。
+        assert_eq!(
+            names("WITH t AS (SELECT id FROM t) SELECT id FROM t"),
+            vec!["t"]
+        );
+        // 先行する CTE は後続の本文から見える。後続は先行の本文から見えない。
+        assert_eq!(
+            names("WITH a AS (SELECT 1 FROM b), b AS (SELECT 1 FROM a) SELECT * FROM b"),
+            vec!["b"]
+        );
+        // CTE の外側（サブクエリの WITH の外）では見えない。
+        assert_eq!(
+            names("SELECT * FROM (WITH c AS (SELECT 1 FROM x) SELECT * FROM c) s, c"),
+            vec!["x", "c"]
+        );
+    }
+
+    #[test]
+    fn syntax_word_named_tables_are_gated_but_keywords_are_not() {
+        assert_eq!(names("SELECT * FROM temp"), vec!["temp"]);
+        assert_eq!(names("SELECT * FROM \"values\""), vec!["values"]);
+        assert_eq!(names("INSERT INTO if (a) VALUES (1)"), vec!["if"]);
+        assert_eq!(names("DROP TABLE IF EXISTS t"), vec!["t"]);
+        assert_eq!(names("DELETE FROM ONLY t"), vec!["t"]);
+        assert_eq!(names("TRUNCATE TABLE ONLY t"), vec!["t"]);
+        assert_eq!(names("SELECT * FROM a, LATERAL f(a.x)"), vec!["a"]);
+        assert_eq!(
+            names("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2"),
+            vec!["t"]
+        );
+    }
+
+    #[test]
+    fn index_ddl_names_are_marked_as_index() {
+        let toks = tokenize("DROP INDEX i").expect("lex");
+        let refs = unqualified_relation_refs(&toks, &[]);
+        assert_eq!(
+            refs,
+            vec![GateRef {
+                name: "i".to_string(),
+                is_index: true
+            }]
+        );
+        let toks = tokenize("DROP VIEW v").expect("lex");
+        assert!(!unqualified_relation_refs(&toks, &[])[0].is_index);
     }
 }

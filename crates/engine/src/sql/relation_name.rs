@@ -340,6 +340,96 @@ pub(crate) fn collect_cte_names(tokens: &[Token]) -> Vec<String> {
     out
 }
 
+/// CTE 1 件の可視範囲（[`collect_cte_scopes`] の要素）。
+#[derive(Debug, Clone)]
+pub(crate) struct CteScope {
+    /// CTE 名（利用者が書いたとおり）。
+    pub name: String,
+    /// 可視範囲の開始添字（自身の本文の `)` の直後。自身の本文と先行する CTE の本文は含まない）。
+    pub visible_from: usize,
+    /// 可視範囲の終了添字（排他。`WITH` を含む括弧の `)`、無ければ末尾）。
+    pub visible_to: usize,
+}
+
+impl CteScope {
+    /// 添字 `index` の位置から、この CTE の名前が見えるか。
+    pub(crate) fn covers(&self, index: usize) -> bool {
+        self.visible_from <= index && index < self.visible_to
+    }
+}
+
+/// [`collect_cte_names`] と同じ構造で CTE 定義を拾い、各 CTE の可視範囲を返す。非再帰 CTE は自身の
+/// 本文からは見えず（同名の実リレーションへ解決される。`sql::cte` の契約）、後続の CTE の本文と主
+/// クエリから見える。`search_path` の参照ゲートが「参照位置ごとに実際に可視な CTE だけ」を除外するために使う。
+pub(crate) fn collect_cte_scopes(tokens: &[Token]) -> Vec<CteScope> {
+    let mut out = Vec::new();
+    for (start, t) in tokens.iter().enumerate() {
+        if !ident_is(Some(t), "WITH") {
+            continue;
+        }
+        let scope_end = enclosing_scope_end(tokens, start);
+        let mut j = start + 1;
+        if ident_is(tokens.get(j), "RECURSIVE") {
+            j += 1;
+        }
+        while let Some(Token::Ident(name)) = tokens.get(j) {
+            j += 1;
+            if matches!(tokens.get(j), Some(Token::Punct('('))) {
+                match skip_group(tokens, j) {
+                    Some(next) => j = next,
+                    None => break,
+                }
+            }
+            if !ident_is(tokens.get(j), "AS") {
+                break;
+            }
+            j += 1;
+            if ident_is(tokens.get(j), "NOT") {
+                j += 1;
+            }
+            if ident_is(tokens.get(j), "MATERIALIZED") {
+                j += 1;
+            }
+            if !matches!(tokens.get(j), Some(Token::Punct('('))) {
+                break;
+            }
+            let Some(after) = skip_group(tokens, j) else {
+                break;
+            };
+            j = after;
+            out.push(CteScope {
+                name: name.clone(),
+                visible_from: after,
+                visible_to: scope_end,
+            });
+            if matches!(tokens.get(j), Some(Token::Punct(','))) {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// `tokens[start]` を含む括弧の閉じ `)` の添字（無ければ末尾）。
+fn enclosing_scope_end(tokens: &[Token], start: usize) -> usize {
+    let mut depth = 0usize;
+    for k in start..tokens.len() {
+        match tokens.get(k) {
+            Some(Token::Punct('(')) => depth += 1,
+            Some(Token::Punct(')')) => {
+                if depth == 0 {
+                    return k;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    tokens.len()
+}
+
 /// `tokens[open]` の `(` に対応する `)` の次の添字を返す（対応が無ければ `None`）。
 fn skip_group(tokens: &[Token], open: usize) -> Option<usize> {
     let mut depth = 0usize;
