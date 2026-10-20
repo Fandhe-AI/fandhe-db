@@ -118,9 +118,8 @@ SQL-19（述語形 UPDATE/DELETE）が定める 1 文あたり影響行数上限
 materialize しないため、`MAX_SCANNED_ROWS`／`MAX_VISIBLE_ROWS` のような DoS 上限も
 構造的に不要である。
 
-## Issue #2193 追記（rowid 採番状態は戻さない）
+## Issue #2193 追記（rowid 関連状態の扱い）
 
-`TRUNCATE` は行だけを削除し、rowid 採番状態（`rowid_state`）には触れない。払い出した rowid を再利用しない
-ためで、TRUNCATE 後の次の払い出しは続きの値から始まる（TABLE-23。
-[rowid-primary-key-separation.md](rowid-primary-key-separation.md)）。`tenant::truncate_tables_unchecked` は
-行識別方式が従来方式以外の表も通す（`require_table_schema_write_any_identity`。行を識別子に依存せず消すため）。
+`TRUNCATE` の rowid 関連状態の扱いは spec のポインタ（TABLE-23）を正とし、本書には記載しない。
+実装は `tenant::truncate_tables_unchecked` が `require_table_schema_write_any_identity` を通す
+（[rowid-primary-key-separation.md](rowid-primary-key-separation.md)）。

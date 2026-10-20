@@ -50,8 +50,7 @@ Issue #1623（親 #1622、TABLE-38 のポインタ）。仕様本文は転記せ
 - **中断ジョブ**: 移送後は新名で `SHOW／CANCEL PARTITIONED DML` が働く。再開はハッシュ不一致で `22023`。
 - **既知の制約**: 表名を含むハッシュの改名後の同一文再送を `23505` にすることは対象外（旧名を legacy ハッシュとして受理する案）。宣言的 UDF はセッション保持で永続化しないため追随対象なし。
 
-## Issue #2193 追記（rowid 採番状態の移送）
+## Issue #2193 追記（rowid 関連状態の移送）
 
-`Storage::alter_table_rename` は、台帳・分割実行ジョブの移送と並べて `catalog::rowid_alloc::rename_table_in_txn` を呼び、
-新名側の孤児の採番状態を掃除してから旧名の採番状態を新名へ移す（同一 txn。TABLE-23）。再利用しない採番を改名で
-巻き戻さないための措置で、状態表が未作成なら何もしない。
+`Storage::alter_table_rename` は、台帳・分割実行ジョブの移送と並べて `catalog::rowid_alloc::rename_table_in_txn` を
+同一 txn で呼ぶ（ポインタ: TABLE-23）。契約の詳細は spec を正とし、本書には記載しない。

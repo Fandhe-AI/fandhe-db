@@ -7109,8 +7109,7 @@ pub struct TableSchema {
     bytea_defaults: MaterializedDefaultCache,
     /// 行ストアの物理キー（rowid）と利用者の `id` 列の関係（TABLE-23・Issue #2193。
     /// 設計記録: `docs/design/rowid-primary-key-separation.md` D3）。既定は
-    /// [`RowIdentity::LegacyId`]（既存の全表・本 Issue 時点で作成される全表）。
-    /// 従来方式以外のスキーマはカタログ v15 で永続化される。
+    /// [`RowIdentity::LegacyId`]。永続化の詳細は spec のポインタ（TABLE-23）を正とする。
     row_identity: RowIdentity,
 }
 
@@ -7122,11 +7121,10 @@ pub struct TableSchema {
 /// 属性の永続化・採番器・未対応経路の fail-closed 拒否までを用意する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum RowIdentity {
-    /// 従来方式。物理キーの `u64` が利用者の `id` 列値そのもの（rowid と `id` が恒等）。
+    /// 従来方式（既定）。
     #[default]
     LegacyId,
-    /// 採番方式。物理キーの `u64` は表単位・テナント単位の採番器が払い出す非公開の rowid で、
-    /// `id` は通常の格納列として扱う。索引・検索・台帳が未対応のため現状は全 DML・読み取りを
+    /// 採番方式（契約は spec のポインタ TABLE-23 を正とする）。後続対応が揃うまで全 DML・読み取りを
     /// `0A000` 相当の固定文言で拒否する（[`ROW_IDENTITY_UNSUPPORTED_MESSAGE`]）。
     Allocated,
 }

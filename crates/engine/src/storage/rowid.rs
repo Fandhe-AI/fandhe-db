@@ -2,13 +2,11 @@
 //! （Issue #2193。ビヘイビア: TABLE-23。関連: TABLE-12。設計記録:
 //! `docs/design/rowid-primary-key-separation.md`）。
 //!
-//! 責務境界: 行ストア（`rows` 表・`user_rows/{table}` 表）の redb キー
-//! `(tenant_id, u64)` の `u64` を「物理 rowid」として型で区別する。キーの形式・
-//! バイト列は従来から不変で、既存の表（従来方式 = `RowIdentity::LegacyId`）では
-//! rowid と利用者の `id` 列値が恒等である。呼び出し文脈は `storage.rs`（`Storage::put` 等）・
+//! 責務境界: 行ストア（`rows` 表・`user_rows/{table}` 表）の物理キーの `u64` 要素を
+//! 「物理 rowid」として型で区別する。契約の詳細は spec のポインタ（TABLE-23）を正とし、
+//! 本コメントには記載しない。呼び出し文脈は `storage.rs`（`Storage::put` 等）・
 //! `txn.rs`・`recovery/commit_boundary.rs`・`catalog.rs`・`tenant.rs` の行ストア操作で、
-//! `id: u64` を受け取る公開 API は入口で [`RowId::from_legacy_id`] を通して以降を
-//! rowid で扱う。
+//! `id: u64` を受け取る公開 API は入口で [`RowId::from_legacy_id`] を通す。
 //!
 //! 非露出の契約: [`RowId`] は `Display` を実装しない。rowid の値を SQL 応答・EXPLAIN・
 //! エラー文面・ログへ出さないための型レベルの防壁であり、`format!` へ直接渡せない
