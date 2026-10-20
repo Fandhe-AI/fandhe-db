@@ -134,7 +134,18 @@ impl SearchPath {
     /// 要素の並びを検証して値にする。要素数の上限超過は `22023`。`pg_temp` を `public` より後ろに
     /// 置く指定は `0A000`（一時表は常に先頭で探すため、`public` を優先する指定を黙って無視しない。
     /// fail-closed）。他テナントの SCHEMA 名・存在しない名前も受理して保持する（ADR D5）。
+    #[cfg(test)]
     pub(crate) fn new(elems: Vec<SearchPathElem>) -> Result<Self, SqlSurfaceError> {
+        Self::new_for_user(elems, None)
+    }
+
+    /// [`Self::new`] に `session_user` を加えた版。`$user` は `session_user` が ASCII 大小無視で
+    /// `public` のとき `public` として展開し、`pg_temp` との順序検査に含める（`"$user", pg_temp` が
+    /// `public, pg_temp` に化ける指定を拒否する）。
+    pub(crate) fn new_for_user(
+        elems: Vec<SearchPathElem>,
+        session_user: Option<&str>,
+    ) -> Result<Self, SqlSurfaceError> {
         if elems.is_empty() || elems.len() > MAX_SEARCH_PATH_ELEMENTS {
             return Err(invalid_value());
         }
@@ -142,6 +153,11 @@ impl SearchPath {
         for e in &elems {
             match e {
                 SearchPathElem::Name(n) if n == PUBLIC => seen_public = true,
+                SearchPathElem::User
+                    if session_user.is_some_and(|u| u.eq_ignore_ascii_case(PUBLIC)) =>
+                {
+                    seen_public = true
+                }
                 SearchPathElem::Name(n) if n == "pg_temp" && seen_public => {
                     return Err(SqlSurfaceError::feature_not_supported(
                         "pg_temp after public in search_path is not supported",
@@ -508,6 +524,15 @@ mod tests {
         let public = SearchPathElem::from_ident("public").unwrap();
         assert!(SearchPath::new(vec![temp.clone(), public.clone()]).is_ok());
         assert!(SearchPath::new(vec![public, temp]).is_err());
+    }
+
+    #[test]
+    fn pg_temp_after_expanded_user_public_is_rejected() {
+        let temp = SearchPathElem::from_ident("pg_temp").unwrap();
+        let elems = vec![SearchPathElem::User, temp];
+        assert!(SearchPath::new_for_user(elems.clone(), Some("public")).is_err());
+        assert!(SearchPath::new_for_user(elems.clone(), Some("alice")).is_ok());
+        assert!(SearchPath::new_for_user(elems, None).is_ok());
     }
 
     #[test]

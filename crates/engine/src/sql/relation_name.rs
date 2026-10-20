@@ -178,7 +178,46 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
             }
             _ => {}
         }
-        if is_ident_like(cur) && !level.in_proj {
+        // 直前の識別子（`"update"` 等の引用付き列名は構文語と同じ `Ident` になる）が式の位置にある
+        // ときは、表参照を導く語ではなく式の一部なので表参照位置にしない。
+        let prev3 = i.checked_sub(3).and_then(|p| tokens.get(p));
+        let expr_ctx = match prev2 {
+            Some(Token::Keyword(
+                Keyword::Where
+                | Keyword::And
+                | Keyword::Select
+                | Keyword::Order
+                | Keyword::By
+                | Keyword::Limit,
+            )) => true,
+            Some(Token::Punct(c)) => match c {
+                '(' => {
+                    !(ident_is(prev, "UPDATE")
+                        && (ident_is(prev3, "AS") || ident_is(prev3, "MATERIALIZED")))
+                }
+                ',' | '=' | '+' | '-' | '/' | '>' | '<' | '%' | '*' | '#' | '[' | ':' => true,
+                _ => false,
+            },
+            Some(Token::Le | Token::Ge | Token::Concat | Token::TypeCast | Token::DistanceOp) => {
+                true
+            }
+            // `IF NOT EXISTS t`・`COMMENT ON TABLE t` の `NOT`／`ON` は表参照の文脈。
+            Some(Token::Ident(w))
+                if (w.eq_ignore_ascii_case("NOT") && ident_is(prev, "EXISTS"))
+                    || (w.eq_ignore_ascii_case("ON") && ident_is(prev, "TABLE")) =>
+            {
+                false
+            }
+            Some(Token::Ident(w)) => [
+                "AND", "OR", "NOT", "ON", "HAVING", "WHEN", "THEN", "ELSE", "IS", "IN", "LIKE",
+                "BETWEEN", "CASE", "BY",
+            ]
+            .iter()
+            .any(|k| w.eq_ignore_ascii_case(k)),
+            _ => false,
+        };
+        let prev_is_word = matches!(prev, Some(Token::Ident(_)));
+        if is_ident_like(cur) && !level.in_proj && !(prev_is_word && expr_ctx) {
             relation_pos = match prev {
                 Some(Token::Keyword(Keyword::From)) => from_rel,
                 Some(Token::Ident(w)) => {
@@ -649,6 +688,17 @@ mod tests {
             tokenize(plain).expect("lex"),
             "{qualified}"
         );
+    }
+
+    #[test]
+    fn quoted_keyword_column_in_expression_is_not_a_relation_position() {
+        let t = tokenize("SELECT id FROM public.t WHERE \"update\" IS NULL LIMIT 5").expect("lex");
+        let walk = relation_positions(&t);
+        assert_eq!(walk.positions.len(), 1);
+        assert!(matches!(
+            t.get(walk.positions[0].index),
+            Some(Token::QualifiedIdent { .. })
+        ));
     }
 
     #[test]

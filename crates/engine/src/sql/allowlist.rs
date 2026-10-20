@@ -16525,7 +16525,9 @@ fn parse_set_search_path(
             });
         }
         let elem = match p.advance() {
-            Some(Token::Ident(w)) => SearchPathElem::from_ident(w)?,
+            Some(Token::Ident(w)) | Some(Token::QuotedBoolWord(w)) | Some(Token::QuotedNull(w)) => {
+                SearchPathElem::from_ident(w)?
+            }
             Some(Token::QuotedDollarUser) => SearchPathElem::User,
             Some(Token::StringLiteral(s)) => SearchPathElem::from_literal(s)?,
             other => {
@@ -19036,6 +19038,14 @@ pub(crate) fn parse_update_form_shape_tokens(
 
 #[cfg(test)]
 mod tests {
+    /// TABLE-27・Issue #1715: 引用付き `true`／`false` も `search_path` の識別子要素として受理する。
+    #[test]
+    fn set_search_path_accepts_quoted_bool_word_elements() {
+        use super::*;
+        let toks = crate::sql::lexer::tokenize("SET search_path TO \"true\", public").expect("lex");
+        assert!(parse_set_search_path(&toks).is_ok());
+    }
+
     /// TABLE-40・Issue #1635: `ALTER COLUMN TYPE` の `SET DATA TYPE`・`USING` の構文。
     #[test]
     fn alter_column_type_parses_set_data_type_and_using() {

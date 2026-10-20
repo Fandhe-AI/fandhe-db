@@ -7469,7 +7469,10 @@ impl EngineCore {
                         session.reset_search_path()?
                     }
                     crate::sql::search_path::SearchPathSetting::List(elems) => {
-                        let path = crate::sql::search_path::SearchPath::new(elems)?;
+                        let path = crate::sql::search_path::SearchPath::new_for_user(
+                            elems,
+                            session.session_user(),
+                        )?;
                         session.set_search_path(path)?;
                     }
                 }
