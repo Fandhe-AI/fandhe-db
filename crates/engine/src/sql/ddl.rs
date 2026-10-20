@@ -1559,6 +1559,15 @@ pub(crate) fn execute_alter_table_set_schema(
             Err(e) => return Err(map_schema_error(e, "ALTER TABLE SET SCHEMA failed")),
         }
     };
+    if to_public {
+        // SCHEMA 配下の表を共有の `public` へ戻す経路は未実装。何も変えずに成功させず拒否する。
+        if matches!(
+            crate::catalog::namespace::RelationKey::parse(&stmt.table_name),
+            Ok(crate::catalog::namespace::RelationKey::InSchema { .. })
+        ) {
+            return Err(SqlSurfaceError::InsufficientPrivilege);
+        }
+    }
     if !to_public {
         // 共有の `public` の表の行をテナントの SCHEMA 側へ移さない（設計記録 D7）。
         return Err(SqlSurfaceError::InsufficientPrivilege);

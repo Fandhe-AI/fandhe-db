@@ -1054,6 +1054,7 @@ pub(crate) fn create_sequence_in_txn(
 ) -> Result<u64> {
     validate_relation_key(name)?;
     params.validate()?;
+    super::namespace::ensure_key_schema_alive_in_txn(write_txn, name)?;
     if relation_name_taken_in_txn(write_txn, name)? {
         return Err(CatalogError::TableAlreadyExists(name.to_string()));
     }

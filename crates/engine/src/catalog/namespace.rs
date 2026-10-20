@@ -231,6 +231,32 @@ pub(crate) fn schema_id_in_txn<R: ReadSource>(
     }
 }
 
+/// relation キー `key` が SCHEMA 配下形（`#<id>.<name>`）なら、その SCHEMA が write txn の時点で
+/// 生存していることを確認する（Issue #1717。拡張クエリで Parse 後に `DROP SCHEMA` されると、
+/// Bind 済みの内部キーが削除済み ID を指したまま作成できてしまうため。作成と同じ txn で検査して
+/// TOCTOU を塞ぐ）。`public` の裸の名前は常に生存扱い。不在は `TableNotFound`（fail-closed。
+/// 他テナントの SCHEMA か否かを区別しない）。SCHEMA ID は再利用されないため、全テナントの定義を
+/// 走査して ID の一致を見る（DDL のみ・件数は上限付き。真偽以外は何も返さない）。
+pub(crate) fn ensure_key_schema_alive_in_txn<R: ReadSource>(src: &R, key: &str) -> Result<()> {
+    let RelationKey::InSchema { schema_id, .. } = RelationKey::parse(key)? else {
+        return Ok(());
+    };
+    let table = match src.open_table(SCHEMAS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(CatalogError::TableNotFound(key.to_string()))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    for entry in table.iter()? {
+        let (_, v) = entry?;
+        if decode_schema_def(v.value())? == schema_id {
+            return Ok(());
+        }
+    }
+    Err(CatalogError::TableNotFound(key.to_string()))
+}
+
 /// `tenant_id` の SCHEMA 数を [`limit`] + 1 件で打ち切って数える。
 fn count_schemas_capped<R: ReadSource>(src: &R, tenant_id: &str, limit: usize) -> Result<usize> {
     let table = match src.open_table(SCHEMAS_TABLE) {
@@ -1007,6 +1033,38 @@ mod tests {
             );
             assert!(s.schema_id("alice", "s2").expect("id").is_some());
         }
+    }
+
+    /// 削除済み SCHEMA の ID を指す内部キーでは、表・SEQUENCE のいずれも作成できない
+    /// （Parse 後に `DROP SCHEMA` されても同一 txn の生存検査で拒否する。Issue #1717）。
+    #[test]
+    fn creating_objects_under_a_dropped_schema_is_rejected() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        let (s, _g) = tmp_storage("ns-dropped");
+        s.create_schema("alice", "a", false).expect("schema");
+        let id = s.schema_id("alice", "a").expect("id").expect("exists");
+        s.drop_schema("alice", "a", false).expect("drop");
+        let key = RelationKey::InSchema {
+            schema_id: id,
+            name: "t".to_string(),
+        }
+        .encode();
+        let cols = vec![ColumnDef::new("name", ColumnType::Text, true)];
+        assert!(matches!(
+            s.create_table(&TableSchema::new(key.clone(), cols)),
+            Err(CatalogError::TableNotFound(_))
+        ));
+        let params = crate::catalog::sequence::SequenceParams {
+            increment: 1,
+            min_value: 1,
+            max_value: 100,
+            start: 1,
+            cycle: false,
+        };
+        assert!(matches!(
+            s.create_sequence(&key, &params),
+            Err(CatalogError::TableNotFound(_))
+        ));
     }
 
     /// 一覧 API（`list_tables`・`list_indexes`）は public の名前だけを返し、SCHEMA 配下の内部キー・内部 ID を

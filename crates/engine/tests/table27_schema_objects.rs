@@ -1360,3 +1360,31 @@ fn raw_table_names_never_reach_schema_tables() {
         assert!(core.delete_row(&ctx(TENANT), table, 1, None).is_err());
     }
 }
+
+/// 別名なしの UDF 呼び出しの既定列名は公開名（内部キー `#<id>.f` を出さない）。SCHEMA 配下の表を
+/// `public` へ戻す `SET SCHEMA` は何も変えず成功せず 42501 で拒否する（Issue #1717）。
+#[test]
+fn default_udf_column_name_is_public_and_set_schema_to_public_is_rejected() {
+    let (core, _g) = new_core("t27-objects-udf-name");
+    let mut s = ddl_session();
+    ok(&core, &mut s, "CREATE SCHEMA s");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE s.t (id BIGINT PRIMARY KEY, n INTEGER)",
+    );
+    ok(&core, &mut s, "INSERT INTO s.t (id, n) VALUES (1, 5)");
+    ok(&core, &mut s, "CREATE FUNCTION s.f(x) AS x");
+    match ok(&core, &mut s, "SELECT s.f(n) FROM s.t LIMIT 1") {
+        SqlOutcome::Query(r) => {
+            let dbg = format!("{:?}", r.columns);
+            assert!(!dbg.contains('#'), "{dbg}");
+            assert!(dbg.contains("\"f\""), "{dbg}");
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+    assert_eq!(
+        code(&core, &mut s, "ALTER TABLE s.t SET SCHEMA public"),
+        "42501"
+    );
+}

@@ -805,6 +805,7 @@ pub(crate) fn create_materialized_view_in_txn(
         None => Vec::new(),
     };
     let encoded = encode_materialized_view_def(&def)?;
+    super::namespace::ensure_key_schema_alive_in_txn(write_txn, &def.name)?;
     insert_def_in_txn(write_txn, &def, &encoded)?;
     if let Some(e) = entities {
         write_entities_in_txn(write_txn, &def.name, &def.columns, e, &keys)?;

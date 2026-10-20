@@ -11596,6 +11596,7 @@ impl Storage {
         schema: &TableSchema,
         pre_encoded: Option<Vec<u8>>,
     ) -> Result<()> {
+        namespace::ensure_key_schema_alive_in_txn(write_txn, schema.name.as_str())?;
         // `DEFAULT nextval('<名前>')` は参照先 SEQUENCE がこの write txn の時点で存在すること
         // （TABLE-24・Issue #1690。未登録は `TableNotFound`＝`42P01`。名前はクライアント自身の入力）。
         for column in &schema.columns {
@@ -14386,6 +14387,7 @@ impl Storage {
         }
         let encoded = encode_enum_type_def(name, &labels)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
         {
             let mut table = write_txn.open_table(ENUM_TYPES_TABLE)?;
             if table.get(name)?.is_some() {
@@ -14579,6 +14581,7 @@ impl Storage {
             check_option,
         })?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
         {
             let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             if catalog_table.get(name)?.is_some() {
@@ -14818,6 +14821,7 @@ impl Storage {
             return Err(CatalogError::Invalid(format!("duplicate index column: {dup}")).into());
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        namespace::ensure_key_schema_alive_in_txn(&*write_txn, &def.name)?;
         {
             let views_contains = |name: &str| -> Result<bool> {
                 match write_txn.open_table(VIEWS_TABLE) {
@@ -15252,6 +15256,7 @@ impl Storage {
             check_option,
         })?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
         {
             let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             // matview とも名前空間を共有する（TABLE-42 (2)、Issue #1663）。
