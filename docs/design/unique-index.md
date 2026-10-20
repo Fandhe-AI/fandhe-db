@@ -141,3 +141,5 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 テナントは範囲走査へ縮退する（再構築は書き込み側だけが行う）。候補行は全走査と同じ可視性判定
 （`is_visible`・TABLE-12 整合・`WHERE` の再評価）を通るため、他テナントの `Private` 行は結果に現れず、
 stale な正引き（D4）も除かれる。詳細は [primary-key-point-lookup.md](primary-key-point-lookup.md)。
+
+> Issue #2194 注記: 索引・FK の行参照は rowid 型で扱う（従来方式の表ではバイト列は `id` と同一）。本書の「行の `id`」「物理キー `(tenant_id, id)`」は rowid に読み替える。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。

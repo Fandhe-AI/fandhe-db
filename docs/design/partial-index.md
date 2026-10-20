@@ -249,3 +249,5 @@ INDEX-11 (4)・INDEX-9 ポインタ。`CREATE UNIQUE INDEX ... WHERE <述語>` �
 
 プランナ選択と EXPLAIN（#1656）・述語参照列の `ALTER COLUMN TYPE` の再束縛・`USING hnsw`／`COLLATE`／matview との
 組み合わせ。
+
+> Issue #2194 注記: 本書の索引の行参照は `SqlArenaSnapshot` のスロットで、Issue #2194 では変更していない（`id_index` を含め #2195 が扱う）。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。

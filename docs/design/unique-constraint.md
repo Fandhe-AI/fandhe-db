@@ -299,3 +299,5 @@ O(JSON サイズ) の係数が乗る（既知の制約として記録するの�
 - `crates/engine/src/sql/allowlist.rs` 単体テスト: `UNIQUE` 構文の受理・拒否形、
   上限ちょうどの列＋表制約（先頭・中間・末尾）の受理、表制約の前・後ろ・間に
   超過列がある場合の `54000`、制約数・制約あたり列数の上限
+
+> Issue #2194 注記: 索引・FK の行参照は rowid 型で扱う（従来方式の表ではバイト列は `id` と同一）。本書の「行の `id`」「物理キー `(tenant_id, id)`」は rowid に読み替える。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。

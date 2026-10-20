@@ -236,3 +236,5 @@ fail-closed。FOREIGN KEY・CHECK の削除は既存行を変更しないため�
 導出擬似名 `<table>_pkey` を追加した。実名を持つ制約を先に探すため既存の挙動は変わらない。
 従来 `42704` だった「主キーの擬似名を指定した DROP」は、主キー宣言済みなら成功する。
 詳細は `docs/design/alter-table-primary-key.md`。
+
+> Issue #2194 注記: 索引・FK の行参照は rowid 型で扱う（従来方式の表ではバイト列は `id` と同一）。本書の「行の `id`」「物理キー `(tenant_id, id)`」は rowid に読み替える。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。

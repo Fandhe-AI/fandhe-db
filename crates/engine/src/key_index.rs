@@ -7,6 +7,9 @@
 //!
 //! # 索引の形
 //!
+//! 行への参照はすべて rowid（[`RowId`]）で持つ。永続化するバイト列は行ストア物理キーの `u64`
+//! 要素と同一で、従来方式の表では利用者 `id` とも一致する（Issue #2194。TABLE-23）。
+//!
 //! 索引は `(テーブル, 索引名)` で識別し、索引名は `k:{col1},{col2},...}` 形式
 //! （構成列名を宣言順にカンマ区切り。列名自体は `validate_identifier` 済みの
 //! `[A-Za-z0-9_]` のみのため区切り文字と衝突しない）。同じテーブル・同じ列集合を
@@ -14,9 +17,9 @@
 //! 一致する場合）。
 //!
 //! 各索引は 2 つの redb テーブルを持つ:
-//! - 順引き `key_index/{table}/{name}`: `(tenant, key_bytes, row_id) -> ()`。
+//! - 順引き `key_index/{table}/{name}`: `(tenant, key_bytes, rowid) -> ()`。
 //!   「このテナントにこのキー値を持つ行が存在するか」を前方一致 range で判定する。
-//! - 逆引き `key_index_rev/{table}/{name}`: `(tenant, row_id) -> key_bytes`。
+//! - 逆引き `key_index_rev/{table}/{name}`: `(tenant, rowid) -> key_bytes`。
 //!   同期時に行の直前のキー値（pre-image）を求め、順引き側の旧エントリを
 //!   O(1) で特定するために使う。
 //!
@@ -39,7 +42,7 @@
 //! 共有する。`FOREIGN KEY` が `id` 疑似列を参照する場合も、子列（`INTEGER`／
 //! `BIGINT`）の値をそのまま同じ正準エンコードで索引化する——参照先の `id` は
 //! 常に子列と同じ数値としてしか比較され得ないため、`id` 専用の別エンコードは
-//! 不要（[`parent_id_key_bytes`] が `u64` の物理 id を子列の型へ変換してから
+//! 不要（[`parent_id_key_bytes`] が参照先 `id` 列の値（`u64`）を子列の型へ変換してから
 //! [`crate::constraint::push_canonical_component`] へ渡す）。
 //!
 //! # テナント境界（RLS-9・RLS-10 (c)）
@@ -72,6 +75,7 @@ use crate::catalog::{CatalogError, TableSchema};
 use crate::constraint::{
     decode_key_columns, key_bytes, push_canonical_component, KeySpec, NullPolicy,
 };
+use crate::storage::rowid::{row_key, split_row_key, RowId};
 use crate::tenant::TenantWriteError;
 use redb::{ReadableTable, TableDefinition};
 use std::collections::{BTreeMap, BTreeSet};
@@ -175,22 +179,23 @@ fn mask_for_spec(schema: &TableSchema, spec: &KeySpec) -> Vec<bool> {
     mask
 }
 
-/// 参照元列（`INTEGER`／`BIGINT`）の物理 `id`（`u64`）値を、その列の正準エンコード
-/// （[`push_canonical_component`]）へ変換する。`id` が列の値域に収まらない場合は
+/// 参照先の `id` 列（従来方式の暗黙主キー）の**値**（`u64`）を、参照元列の正準エンコード
+/// （[`push_canonical_component`]）へ変換する。物理キー（rowid）ではなくキー値を扱う
+/// 関数である（Issue #2194）。`parent_id_value` が列の値域に収まらない場合は
 /// `Ok(None)`（その列にその値を持つ子行は構造的に存在し得ないため、索引照会上は
 /// 「一致し得ない」として扱ってよい——値域外の値を書き込んだ行は存在しない）。
 pub(crate) fn parent_id_key_bytes(
     column_ty: &crate::catalog::ColumnType,
-    id: u64,
+    parent_id_value: u64,
 ) -> Result<Option<Vec<u8>>, TenantWriteError> {
     use crate::catalog::ColumnType;
     use crate::row_codec::ScalarRef;
     let scalar = match column_ty {
-        ColumnType::SmallInt => i16::try_from(id)
+        ColumnType::SmallInt => i16::try_from(parent_id_value)
             .ok()
             .map(|v| ScalarRef::Integer(i32::from(v))),
-        ColumnType::Integer => i32::try_from(id).ok().map(ScalarRef::Integer),
-        ColumnType::BigInt => i64::try_from(id).ok().map(ScalarRef::BigInt),
+        ColumnType::Integer => i32::try_from(parent_id_value).ok().map(ScalarRef::Integer),
+        ColumnType::BigInt => i64::try_from(parent_id_value).ok().map(ScalarRef::BigInt),
         // `validate_foreign_keys` が `id` 参照の子列を整数型（SMALLINT／INTEGER／BIGINT）に
         // 限定するため到達しない内部矛盾。
         _ => {
@@ -371,7 +376,7 @@ pub(crate) fn sync_rows_in_txn(
     table: &str,
     schema: &TableSchema,
     tenant_id: &str,
-    ids: &[u64],
+    ids: &[RowId],
 ) -> Result<KeyIndexDelta, TenantWriteError> {
     let mut delta = KeyIndexDelta::default();
     if ids.is_empty() || !table_may_need_index(schema) {
@@ -409,13 +414,18 @@ pub(crate) fn sync_rows_in_txn(
         let mut fwd = open_fwd_readable(write_txn, &fwd_name)?;
         let mut rev = open_rev_writable(write_txn, &rev_name)?;
 
-        for &id in ids {
+        for &rowid in ids {
+            // 索引の行参照は rowid の生値で永続化する（バイト列は従来の `id` と同一。Issue #2194）。
+            let id = rowid.to_index_raw();
             let old_key: Option<Vec<u8>> = rev
                 .get((tenant_id, id))
                 .map_err(CatalogError::from)?
                 .map(|g| g.value().to_vec());
             let new_key: Option<Vec<u8>> = match &row_table {
-                Some(rt) => match rt.get((tenant_id, id)).map_err(CatalogError::from)? {
+                Some(rt) => match rt
+                    .get(row_key(tenant_id, rowid))
+                    .map_err(CatalogError::from)?
+                {
                     Some(guard) => {
                         let values = decode_key_columns(schema, &mask, guard.value())?;
                         key_bytes(&spec, &values).map_err(internal)?
@@ -489,7 +499,7 @@ pub(crate) fn clear_tenant_in_txn(
     for name in &names {
         delta.registered.insert(name.clone());
         let rev_name = rev_table_name(table, name);
-        let mut ids_and_keys: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut ids_and_keys: Vec<(u64, Vec<u8>)> = Vec::new(); // 索引表の行参照の生値（`RowId::to_index_raw`）
         {
             // 登録済み索引の逆引きテーブルが無いのは破損状態であり、`continue`
             // で黙って読み飛ばすと以後の順引き消去もスキップされ、削除される
@@ -725,14 +735,16 @@ pub(crate) fn ensure_index_in_txn(
         Ok(row_table) => {
             let mut fwd = open_kv_table(write_txn, fwd_table_def(&fwd_name))?;
             let mut rev = open_kv_table(write_txn, rev_table_def(&rev_name))?;
-            let start = std::ops::Bound::Included((tenant_id, 0u64));
-            let end = std::ops::Bound::Included((tenant_id, u64::MAX));
+            let start = std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(0)));
+            let end =
+                std::ops::Bound::Included(row_key(tenant_id, RowId::from_index_raw(u64::MAX)));
             let mut iter = row_table
                 .range::<(&str, u64)>((start, end))
                 .map_err(CatalogError::from)?;
             for entry in &mut iter {
                 let (k, v) = entry.map_err(CatalogError::from)?;
-                let (key_tenant, id) = k.value();
+                let (key_tenant, rowid) = split_row_key(k.value());
+                let id = rowid.to_index_raw();
                 if key_tenant != tenant_id {
                     break;
                 }
@@ -1694,7 +1706,9 @@ mod tests {
             "nodes",
             &schema,
             "tenant-a",
-            crate::constraint::ReferencedRowsChange::Removed { ids: &[0u64] },
+            crate::constraint::ReferencedRowsChange::Removed {
+                ids: &[RowId::from_legacy_id(0)],
+            },
             None,
             crate::constraint::FkCheckMode::All,
         );
@@ -1790,7 +1804,7 @@ mod tests {
             "nodes",
             &schema,
             "tenant-a",
-            &[2u64],
+            &[RowId::from_legacy_id(2)],
             crate::constraint::FkCheckMode::All,
         )
         .expect("C's own FK check (parent_code=NULL) must pass");
@@ -1799,7 +1813,9 @@ mod tests {
             "nodes",
             &schema,
             "tenant-a",
-            crate::constraint::ReferencedRowsChange::Removed { ids: &[0u64] },
+            crate::constraint::ReferencedRowsChange::Removed {
+                ids: &[RowId::from_legacy_id(0)],
+            },
             None,
             crate::constraint::FkCheckMode::All,
         );

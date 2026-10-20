@@ -173,3 +173,28 @@ ADR §3 の D1・D2・D3 と、§4「表のライフサイクル」の項、D8 �
 
 未移行モジュール（`constraint.rs`・`key_index.rs`・`column_rewrite.rs`・`sql/*`・`arena.rs`・`rls.rs`・`recovery/ledger.rs`
 等）は `user_rows` のキーの `u64` を従来どおり直接扱う。これらは担当 sub-issue（#2194〜#2196）が `RowId` へ移す。
+
+## 8. Issue #2194 実装記録（第 2 段: 索引・FK の行参照）
+
+ADR §3 の D8「永続一意索引・FK 用 `key_index`」の項を挙動不変で実装した。契約の詳細は本書に記載せず、
+spec のポインタ（TABLE-23・TABLE-16。関連: RLS-9・RLS-10）を正とする。
+
+- **型の境界だけを変えた**: 索引が持つ「行への参照」を `RowId` で扱う。対象は `constraint/unique_index.rs`（正引き値・逆引き
+  サブキー・バックフィル・stale 判定）、`key_index.rs`（`sync_rows_in_txn`・`clear_tenant_in_txn`・バックフィル）、
+  `constraint.rs` の入口（検査・後片付け・参照アクションの対象行）、`sql/pk_point.rs` の locator。行テーブルのキーは
+  `row_key`／`split_row_key` を通して読む。
+- **永続バイト列は変えない**: 索引へ書く行参照の `u64` は `RowId::to_index_raw`／`from_index_raw` を通り、従来方式の表では
+  従来の `id` と同一のバイト列になる。このため `unique_index::FORMAT_VERSION`・カタログの版は据え置き、再オープンで
+  マーカーは無効にならず再構築も起きない（バイト列の golden テストと再オープンの結合テストで固定）。
+- **FK の `id` 参照の解決を 2 か所に集約した**（`constraint.rs`）: 参照先の `id` 値から親行の物理キーを得る
+  `parent_row_key_by_id_value` と、削除された親行の rowid から失われた `id` 値を得る `referenced_id_value_of_removed_row`。
+  採番方式の親は固定文言（`0A000`）で拒否する。DDL 段（`resolve_foreign_key_target`）でも同じ拒否を行う。
+- **ゲートは維持した**: 採番方式の表の DML は開放しない（外すのは #2195〜#2197 が揃った後）。
+- **検査順序・テナント境界は不変**: `enforce_row_constraints_impl` と `enforce_referencing_rows_in_txn` の順序、および
+  `(tenant, ..)` の範囲は変えていない（RLS-9・RLS-10）。`23503`／`23505` の SQLSTATE・文面も変わらない。
+- **スカラー二次索引・式索引・部分索引は変更なし**: これらはメモリ上の派生索引で、行の参照に `SqlArenaSnapshot` のスロットを使い、
+  行ストアの物理キーに触れない。`id_index`（利用者の `id` 列値の順序索引）はアリーナの ids の意味づけとあわせて #2195 が扱う。
+- **残した境界**: 検索経路への出口（`visit` コールバックの `id`）、行の読み書き API の `id`、`UniqueKeyPlan::row_keys` の
+  `id` 引数は従来方式の `id` のまま（`RowId::legacy_id` の呼び出し箇所が後続の作業一覧）。
+- **テスト**: `tests/table23_index_rowid_reference.rs`、`constraint.rs`・`constraint/unique_index.rs`・`catalog/rowid_gate_tests.rs`
+  の単体テスト（rowid とキー値が食い違うケース・採番方式の親の拒否を含む）。

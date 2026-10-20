@@ -8287,9 +8287,9 @@ fn resolve_foreign_key_target(
                 )));
             }
         }
-        // `id` 疑似列（物理キー）は常に非 NULL のため、`ON UPDATE CASCADE` の
-        // 参照先 nullable 検査（(c)）は不要（`id` 自体は更新されず、A7 により
-        // ON UPDATE アクションはそもそも発火しない）。
+        // `id` は常に非 NULL・ON UPDATE は A7 で発火しないため (c) の nullable 検査は不要。
+        // 採番方式の親への `id` 参照は DDL 段で拒否（実行時は constraint 側が対。Issue #2194）。
+        parent.require_legacy_row_identity()?;
         return Ok(resolved);
     }
     let same_set = |key: &[String]| -> bool {
