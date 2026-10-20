@@ -150,6 +150,11 @@ enum OpTag {
     /// ビュー経由の書き込み（TABLE-43・Issue #1671）用。基表への直接の書き込みと別ドメインに
     /// 分離するため、内側の内容ハッシュへビュー名を被せる。[`for_view_write`] 参照。
     ViewWrite = 19,
+    /// `TRUNCATE ... RESTART IDENTITY`（SQL-48 (3)、Issue #1645）用。CONTINUE IDENTITY
+    /// （省略・明示とも）は既存の [`OpTag::Truncate`]／[`OpTag::TruncateMulti`]／
+    /// [`OpTag::TruncateCascade`] を使い、RESTART だけを別ドメインに分離する。
+    /// [`for_truncate_tables_restart_identity`] 参照。
+    TruncateRestartIdentity = 20,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -1323,6 +1328,26 @@ pub(crate) fn for_truncate_tables_cascade(tables: &[&str]) -> Result<ContentHash
     sorted.sort_unstable();
     sorted.dedup();
     let mut b = HashInputBuilder::new(OpTag::TruncateCascade);
+    b.push_u64(u64::try_from(sorted.len()).unwrap_or(u64::MAX));
+    for t in sorted {
+        b.push_bytes(t.as_bytes())?;
+    }
+    Ok(b.finish())
+}
+
+/// `TRUNCATE ... RESTART IDENTITY`（SQL-48 (3)、Issue #1645）用。入力は behavior バイト
+/// （0 = RESTRICT、1 = CASCADE）と**利用者が文に書いた表の正規化集合**（整列・重複除去・
+/// 件数と各名の長さプレフィクス）。CONTINUE IDENTITY とは別ドメインのため、取り違えた
+/// 再送は `22023` になる。呼び出し元は `tenant::truncate_tables_unchecked`。
+pub(crate) fn for_truncate_tables_restart_identity(
+    tables: &[&str],
+    cascade: bool,
+) -> Result<ContentHash, StorageError> {
+    let mut sorted: Vec<&str> = tables.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut b = HashInputBuilder::new(OpTag::TruncateRestartIdentity);
+    b.push_u8(u8::from(cascade));
     b.push_u64(u64::try_from(sorted.len()).unwrap_or(u64::MAX));
     for t in sorted {
         b.push_bytes(t.as_bytes())?;
@@ -3041,6 +3066,29 @@ mod tests {
             for_truncate_tables(&["a"]).expect("hash"),
             for_truncate(),
             "multi-form domain must be separate from the single form"
+        );
+    }
+
+    #[test]
+    fn for_truncate_tables_restart_identity_is_separate_and_order_insensitive() {
+        let ab = for_truncate_tables_restart_identity(&["a", "b"], false).expect("hash");
+        assert_eq!(
+            ab,
+            for_truncate_tables_restart_identity(&["b", "a", "a"], false).expect("hash")
+        );
+        assert_ne!(
+            ab,
+            for_truncate_tables_restart_identity(&["a", "b"], true).expect("hash")
+        );
+        assert_ne!(
+            ab,
+            for_truncate_tables_restart_identity(&["a", "c"], false).expect("hash")
+        );
+        assert_ne!(ab, for_truncate_tables(&["a", "b"]).expect("hash"));
+        assert_ne!(ab, for_truncate_tables_cascade(&["a", "b"]).expect("hash"));
+        assert_ne!(
+            for_truncate_tables_restart_identity(&["a"], false).expect("hash"),
+            for_truncate()
         );
     }
 

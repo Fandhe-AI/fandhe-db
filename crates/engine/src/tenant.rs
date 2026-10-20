@@ -531,6 +531,20 @@ impl<'a> WriteTarget<'a> {
         &self,
         f: impl FnOnce(&redb::WriteTransaction) -> Result<(T, TxnEffect), Er>,
     ) -> Result<T, Er> {
+        self.with_txn_post_commit(f, |_, _| {})
+    }
+
+    /// [`Self::with_txn`] に commit 成功後フックを足した版（`TRUNCATE ... RESTART IDENTITY` が
+    /// メモリ上の SEQUENCE 現在値を捨てるために使う。Issue #1645）。`Autocommit` で `f` が
+    /// [`TxnEffect::Wrote`] を返して commit が成功した場合だけ、writer permit を保持したまま
+    /// `post_commit(storage, &value)` を呼ぶ（permit を手放した後だと別のライタが古い現在値で払い出し、
+    /// commit 前だと commit 失敗でメモリが永続値より後ろへ下がるため、いずれも重複採番になる）。
+    /// `NoOp`・`InTxn`・失敗時は呼ばない（`InTxn` の commit／abort は `COMMIT`／`ROLLBACK` が担う）。
+    fn with_txn_post_commit<T, Er: From<TenantWriteError>>(
+        &self,
+        f: impl FnOnce(&redb::WriteTransaction) -> Result<(T, TxnEffect), Er>,
+        post_commit: impl FnOnce(&Storage, &T),
+    ) -> Result<T, Er> {
         match self {
             WriteTarget::Autocommit(storage) => {
                 let write_txn = storage
@@ -541,12 +555,24 @@ impl<'a> WriteTarget<'a> {
                 verify_view_write_scope(&write_txn).map_err(Er::from)?;
                 let (value, effect) = f(&write_txn)?;
                 match effect {
-                    TxnEffect::Wrote => crate::recovery::commit_boundary::commit(write_txn)
-                        .map_err(|e| Er::from(TenantWriteError::from(e)))?,
+                    TxnEffect::Wrote => {
+                        let (value, _) = crate::recovery::commit_boundary::commit_and_finish(
+                            write_txn,
+                            value,
+                            |v| {
+                                post_commit(storage, v);
+                                crate::recovery::commit_boundary::PostCommitResult::Ok
+                            },
+                        )
+                        .map_err(|e| Er::from(TenantWriteError::from(e)))?;
+                        Ok(value)
+                    }
                     // 何も書いていないため drop（abort）で閉じ、世代を進めない。
-                    TxnEffect::NoOp => drop(write_txn),
+                    TxnEffect::NoOp => {
+                        drop(write_txn);
+                        Ok(value)
+                    }
                 }
-                Ok(value)
             }
             WriteTarget::InTxn(write_txn) => {
                 // 照合は書き込み前に失敗するため、共有 `write_txn` は汚れない（再試行しても安全）。
@@ -5433,12 +5459,22 @@ fn apply_predicate_update_in_txn<E>(
 /// （参照アクションは発火しない）。台帳は明示表の正規化集合のハッシュを、連鎖した表を含む
 /// 最終集合の全表へ同じ `operation_id` で記録する。パス 2 の事後 FK 検査は多層防御として残す。
 ///
+/// `restart_identity`（SQL-48 (3)、Issue #1645）: 真のとき、**連鎖後の最終集合**の表が所有する
+/// SEQUENCE（`catalog::sequence::SequenceOwner`。`DEFAULT nextval('s')` で参照されるだけの
+/// SEQUENCE は含めない）の**自テナントの**採番状態を、FK・台帳の検査を通過した後に START・
+/// `is_called = false` へ書き戻す（他テナントの状態行・メモリ上の現在値には触れない）。Autocommit は
+/// commit 成功後に writer permit を保持したまま `(tenant, seq_id)` のメモリ上の現在値を捨てる。
+/// 明示・暗黙トランザクション（`InTxn`）はメモリ上の現在値が ROLLBACK で戻らないため、所有 SEQUENCE が
+/// 1 つでもあれば行を消す前に `0A000` で拒否する（fail-closed。所有 SEQUENCE が無ければ従来どおり成功）。
+/// 一時表の DB には SEQUENCE の定義表が無く、列挙結果が空になるため何もしない。
+///
 /// 権限検査（#1968）を結線する際は、**連鎖後の最終集合**に対して検査する必要がある
 /// （名前を書いていない表まで削除するため）。
 pub(crate) fn truncate_tables_unchecked(
     target: WriteTarget<'_>,
     tables: &[String],
     behavior: crate::catalog::DropBehavior,
+    restart_identity: bool,
     ctx: &PolicyContext,
     ledger_write: LedgerWrite<'_>,
 ) -> Result<Vec<String>, TenantWriteError> {
@@ -5454,84 +5490,133 @@ pub(crate) fn truncate_tables_unchecked(
     // 全表を **単一** の write トランザクションで処理する（SQL-48 (4)。表ごとに commit する
     // ループは Autocommit で N 回 commit され原子性を失うため禁止）。途中の `?` は
     // トランザクションの drop（abort）で全表の副作用を破棄する。
-    target.with_txn(|write_txn| {
-        let tenant = ctx.tenant_id();
-        // パス 0: 対象集合の確定。RESTRICT の判定・CASCADE の連鎖はカタログの FK 宣言だけで
-        // 行い（行ストアは読まない）、行を消す前に済ませる（拒否時は何も書かれない）。
-        let closure = crate::catalog::truncate_closure_in_txn(write_txn, tables, behavior)
-            .map_err(|e| match e {
-                crate::catalog::TruncateClosureError::Referenced {
-                    table,
-                    referencing_table,
-                } => TenantWriteError::TruncateReferencedByForeignKey {
-                    table,
-                    referencing_table,
+    target
+        .with_txn_post_commit(
+            |write_txn| {
+                let tenant = ctx.tenant_id();
+                // パス 0: 対象集合の確定。RESTRICT の判定・CASCADE の連鎖はカタログの FK 宣言だけで
+                // 行い（行ストアは読まない）、行を消す前に済ませる（拒否時は何も書かれない）。
+                let closure = crate::catalog::truncate_closure_in_txn(write_txn, tables, behavior)
+                    .map_err(|e| match e {
+                        crate::catalog::TruncateClosureError::Referenced {
+                            table,
+                            referencing_table,
+                        } => TenantWriteError::TruncateReferencedByForeignKey {
+                            table,
+                            referencing_table,
+                        },
+                        crate::catalog::TruncateClosureError::Catalog(c) => {
+                            TenantWriteError::from(c)
+                        }
+                    })?;
+                let all_tables: &[String] = &closure.tables;
+
+                // RESTART IDENTITY の対象（連鎖後の最終集合が所有する SEQUENCE）を行を消す前に確定する。
+                // 全テナント共有のカタログ宣言だけで決まるため、InTxn の拒否は存在オラクルにならない。
+                let owned_sequences = if restart_identity {
+                    crate::catalog::sequence::owned_sequences_for_tables_in_txn(
+                        write_txn, all_tables,
+                    )?
+                } else {
+                    Vec::new()
+                };
+                if matches!(target, WriteTarget::InTxn(_)) && !owned_sequences.is_empty() {
+                    return Err(TenantWriteError::SequenceEvaluationFailed(
+                SqlSurfaceError::FeatureNotSupported {
+                    detail: "TRUNCATE ... RESTART IDENTITY is not supported in a transaction block"
+                        .to_string(),
                 },
-                crate::catalog::TruncateClosureError::Catalog(c) => TenantWriteError::from(c),
-            })?;
-        let all_tables: &[String] = &closure.tables;
+            ));
+                }
 
-        // 全表のスキーマを確定する（並行 DDL で不在になっていれば `42P01` で全体 abort）。
-        let mut schemas = Vec::with_capacity(all_tables.len());
-        for table in all_tables {
-            schemas.push(require_table_schema_write(write_txn, table)?);
-        }
+                // 全表のスキーマを確定する（並行 DDL で不在になっていれば `42P01` で全体 abort）。
+                let mut schemas = Vec::with_capacity(all_tables.len());
+                for table in all_tables {
+                    schemas.push(require_table_schema_write(write_txn, table)?);
+                }
 
-        // 台帳ハッシュ: CASCADE は利用者が書いた表の正規化集合（別ドメイン）。RESTRICT は
-        // 1 表なら既存エントリ互換の `for_truncate()`（バイト列不変）、2 表以上なら正規化した
-        // 表集合のハッシュ（`TRUNCATE a, b` と `b, a` は同一、`a` と `a, b` は内容不一致）。
-        // 台帳キーは表ごとに `(tenant, table, operation_id)`。連鎖した表にも同じ値を記録する。
-        let content_hash = if behavior == crate::catalog::DropBehavior::Cascade {
-            let names: Vec<&str> = tables.iter().map(String::as_str).collect();
-            content_hash::for_truncate_tables_cascade(&names).map_err(TenantWriteError::from)?
-        } else if tables.len() == 1 {
-            content_hash::for_truncate()
-        } else {
-            let names: Vec<&str> = tables.iter().map(String::as_str).collect();
-            content_hash::for_truncate_tables(&names).map_err(TenantWriteError::from)?
-        };
+                // 台帳ハッシュ: CASCADE は利用者が書いた表の正規化集合（別ドメイン）。RESTRICT は
+                // 1 表なら既存エントリ互換の `for_truncate()`（バイト列不変）、2 表以上なら正規化した
+                // 表集合のハッシュ（`TRUNCATE a, b` と `b, a` は同一、`a` と `a, b` は内容不一致）。
+                // 台帳キーは表ごとに `(tenant, table, operation_id)`。連鎖した表にも同じ値を記録する。
+                let content_hash = if restart_identity {
+                    // RESTART IDENTITY は別ドメイン（behavior バイト + 正規化した表集合）。
+                    let names: Vec<&str> = tables.iter().map(String::as_str).collect();
+                    content_hash::for_truncate_tables_restart_identity(
+                        &names,
+                        behavior == crate::catalog::DropBehavior::Cascade,
+                    )
+                    .map_err(TenantWriteError::from)?
+                } else if behavior == crate::catalog::DropBehavior::Cascade {
+                    let names: Vec<&str> = tables.iter().map(String::as_str).collect();
+                    content_hash::for_truncate_tables_cascade(&names)
+                        .map_err(TenantWriteError::from)?
+                } else if tables.len() == 1 {
+                    content_hash::for_truncate()
+                } else {
+                    let names: Vec<&str> = tables.iter().map(String::as_str).collect();
+                    content_hash::for_truncate_tables(&names).map_err(TenantWriteError::from)?
+                };
 
-        // パス 1: 台帳記録 → 行削除 → 一意索引・キー索引のテナント範囲クリアを全表で先に行う。
-        // 親子を同じ文で指定した場合に、パス 2 の FK 判定が「同じ文で消える子の行」を
-        // 見て誤って `23503` にしないため（子のキー索引も先に空になる）。
-        for (table, schema) in all_tables.iter().zip(&schemas) {
-            ledger::record_in_txn(write_txn, tenant, table, ledger_write, &content_hash)?;
+                // パス 1: 台帳記録 → 行削除 → 一意索引・キー索引のテナント範囲クリアを全表で先に行う。
+                // 親子を同じ文で指定した場合に、パス 2 の FK 判定が「同じ文で消える子の行」を
+                // 見て誤って `23503` にしないため（子のキー索引も先に空になる）。
+                for (table, schema) in all_tables.iter().zip(&schemas) {
+                    ledger::record_in_txn(write_txn, tenant, table, ledger_write, &content_hash)?;
 
-            let row_table_name = user_rows_table_name(table);
-            let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
-                .map_err(map_row_table_error)?;
-            let start = std::ops::Bound::Included((tenant, 0u64));
-            let end = std::ops::Bound::Included((tenant, u64::MAX));
-            row_table
-                .retain_in((start, end), |_, _| false)
-                .map_err(CatalogError::from)?;
-            drop(row_table);
-            // 永続一意索引（TABLE-16・TASK-204、Issue #1070）のテナント範囲をクリアする
-            // （他テナントの索引エントリには触れない）。
-            crate::constraint::clear_unique_index_for_tenant_in_txn(
-                write_txn, table, schema, tenant,
-            )?;
-            crate::key_index::clear_tenant_in_txn(write_txn, table, tenant)?;
-        }
+                    let row_table_name = user_rows_table_name(table);
+                    let mut row_table = write_txn
+                        .open_table(user_rows_table_def(&row_table_name))
+                        .map_err(map_row_table_error)?;
+                    let start = std::ops::Bound::Included((tenant, 0u64));
+                    let end = std::ops::Bound::Included((tenant, u64::MAX));
+                    row_table
+                        .retain_in((start, end), |_, _| false)
+                        .map_err(CatalogError::from)?;
+                    drop(row_table);
+                    // 永続一意索引（TABLE-16・TASK-204、Issue #1070）のテナント範囲をクリアする
+                    // （他テナントの索引エントリには触れない）。
+                    crate::constraint::clear_unique_index_for_tenant_in_txn(
+                        write_txn, table, schema, tenant,
+                    )?;
+                    crate::key_index::clear_tenant_in_txn(write_txn, table, tenant)?;
+                }
 
-        // パス 2: 参照先側の `FOREIGN KEY` 検査（TABLE-17・TASK-205、Issue #907）と世代 bump。
-        // 自テナントの参照元行が（同じ文の対象外の表に）残れば `23503`。他テナントの行は
-        // 走査も削除もしない。`Truncated` は参照アクション（Issue #1076）を発火させない。
-        for (table, schema) in all_tables.iter().zip(&schemas) {
-            crate::constraint::enforce_referencing_rows_in_txn(
-                write_txn,
-                table,
-                schema,
-                tenant,
-                crate::constraint::ReferencedRowsChange::Truncated,
-                None,
-                target.fk_check_mode(),
-            )?;
-            crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
-        }
-        Ok((closure.cascaded, TxnEffect::Wrote))
-    })
+                // パス 2: 参照先側の `FOREIGN KEY` 検査（TABLE-17・TASK-205、Issue #907）と世代 bump。
+                // 自テナントの参照元行が（同じ文の対象外の表に）残れば `23503`。他テナントの行は
+                // 走査も削除もしない。`Truncated` は参照アクション（Issue #1076）を発火させない。
+                for (table, schema) in all_tables.iter().zip(&schemas) {
+                    crate::constraint::enforce_referencing_rows_in_txn(
+                        write_txn,
+                        table,
+                        schema,
+                        tenant,
+                        crate::constraint::ReferencedRowsChange::Truncated,
+                        None,
+                        target.fk_check_mode(),
+                    )?;
+                    crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+                }
+
+                // FK・台帳・一意性の検査を通過した後にだけ、自テナントの採番状態を START へ戻す。
+                let mut reset_ids = Vec::with_capacity(owned_sequences.len());
+                for def in &owned_sequences {
+                    crate::catalog::sequence::reset_sequence_state_in_txn(write_txn, tenant, def)?;
+                    reset_ids.push(def.id);
+                }
+                Ok(((closure.cascaded, reset_ids), TxnEffect::Wrote))
+            },
+            |storage, (_, reset_ids)| {
+                // commit 成功後・writer permit 保持中に、リセットした `(tenant, seq_id)` の
+                // メモリ上の現在値だけを捨てる（次の払い出しは書き込んだ状態行から種を作る）。
+                for id in reset_ids {
+                    storage
+                        .sequence_allocator()
+                        .evict_tenant(ctx.tenant_id(), *id);
+                }
+            },
+        )
+        .map(|(cascaded, _)| cascaded)
 }
 
 /// [`replace_typed_rows_by_text_key`] の成功応答。

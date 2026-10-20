@@ -520,15 +520,20 @@ fn truncate_single_and_deduplicated_forms_share_ledger_content() {
     assert_eq!(err.wire_code(), "23505");
 }
 
-/// 拡張句のうち `RESTART IDENTITY` は後続 Issue の範囲で、引き続き `42601`
-/// （`CASCADE`／`RESTRICT` は Issue #1644 で受理する）。
+/// 拡張句の組み合わせ違反は `42601`（`CASCADE RESTRICT` の重複・順序違い・`IDENTITY` 欠落）。
+/// `RESTART IDENTITY`／`CONTINUE IDENTITY` 単体は Issue #1645 で受理する（SQL-48 (3)）。
 #[test]
-fn truncate_extension_clauses_remain_rejected() {
+fn truncate_malformed_extension_clauses_remain_rejected() {
     let (core, path) = new_core_with_tables();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice", true);
     let mut session = SessionState::default();
-    for clause in ["RESTART IDENTITY", "CASCADE RESTRICT"] {
+    for clause in [
+        "CASCADE RESTRICT",
+        "CASCADE RESTART IDENTITY",
+        "RESTART IDENTITY RESTART IDENTITY",
+        "RESTART",
+    ] {
         let err = core
             .execute_sql_in_session(
                 &alice,
@@ -539,6 +544,35 @@ fn truncate_extension_clauses_remain_rejected() {
         assert_eq!(err.wire_code(), "42601", "{clause}");
     }
 }
+
+/// `RESTART IDENTITY`／`CONTINUE IDENTITY`（CASCADE／RESTRICT との組み合わせ・複数表を含む）が
+/// 受理され、行が消える（SQL-48 (3)、Issue #1645）。
+#[test]
+fn truncate_identity_clauses_are_accepted_and_delete_rows() {
+    for (i, clause) in [
+        "RESTART IDENTITY",
+        "CONTINUE IDENTITY",
+        "RESTART IDENTITY CASCADE",
+        "CONTINUE IDENTITY RESTRICT",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (core, path) = new_core_with_tables();
+        let _guard = CleanupGuard(path);
+        let alice = ctx_for("alice", true);
+        let mut session = SessionState::default();
+        insert_row(&core, &alice, TABLE, 1, Visibility::Public, i as u64);
+        core.execute_sql_in_session(
+            &alice,
+            &mut session,
+            &format!("TRUNCATE {TABLE}, {OTHER_TABLE} {clause} USING OPERATION_ID 'op-id-{i}'"),
+        )
+        .unwrap_or_else(|e| panic!("{clause} must be accepted: {e}"));
+        assert_eq!(count_star(&core, &alice, TABLE), 0, "{clause}");
+    }
+}
+
 /// 存在しないテーブルへの TRUNCATE は `42P01`（`UndefinedTable`）。
 #[test]
 fn truncate_undefined_table_is_rejected_with_42p01() {
@@ -1285,4 +1319,128 @@ fn truncate_cascade_is_durable_after_reopen() {
         ),
         "23505"
     );
+}
+
+/// 所有していない SEQUENCE（`DEFAULT nextval` から参照されるだけ）は `RESTART IDENTITY` でも
+/// 戻らない。戻すと同じ SEQUENCE を使う別の表で値が重複する（SQL-48 (3)、TABLE-24。Issue #1645）。
+#[test]
+fn restart_identity_leaves_unowned_sequence_untouched() {
+    let (core, path) = new_core_with_tables();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    for sql in [
+        "CREATE SEQUENCE s",
+        "CREATE TABLE seqt (n BIGINT DEFAULT nextval('s'))",
+    ] {
+        core.execute_sql_in_session(&alice, &mut ddl, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "INSERT INTO seqt (id) VALUES (1), (2), (3) USING OPERATION_ID 'seq-ins-1'",
+    )
+    .expect("insert");
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "TRUNCATE seqt RESTART IDENTITY USING OPERATION_ID 'seq-trunc-1'",
+    )
+    .expect("restart identity");
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "INSERT INTO seqt (id) VALUES (1) USING OPERATION_ID 'seq-ins-2'",
+    )
+    .expect("insert after truncate");
+    let r = core
+        .execute_sql(&alice, "SELECT n FROM seqt LIMIT 10")
+        .expect("select");
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].cells[0], Cell::SignedInteger(4));
+}
+
+/// `RESTART IDENTITY` は `CONTINUE IDENTITY`（省略形）と別の内容ハッシュ。同じ `operation_id` の
+/// 再送は `23505`、種別を取り違えた再送は `22023`。明示 `CONTINUE IDENTITY` は省略形と同一。
+#[test]
+fn truncate_identity_replay_and_mismatch_codes() {
+    let (core, path) = new_core_with_tables();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    let mut run = |sql: &str| {
+        core.execute_sql_in_session(&alice, &mut session, sql)
+            .map_err(|e| e.wire_code())
+    };
+    run(&format!(
+        "TRUNCATE {TABLE} RESTART IDENTITY USING OPERATION_ID 'id-1'"
+    ))
+    .expect("first");
+    assert_eq!(
+        run(&format!(
+            "TRUNCATE {TABLE} RESTART IDENTITY USING OPERATION_ID 'id-1'"
+        ))
+        .unwrap_err(),
+        "23505"
+    );
+    assert_eq!(
+        run(&format!("TRUNCATE {TABLE} USING OPERATION_ID 'id-1'")).unwrap_err(),
+        "22023"
+    );
+    run(&format!("TRUNCATE {TABLE} USING OPERATION_ID 'id-2'")).expect("default form");
+    assert_eq!(
+        run(&format!(
+            "TRUNCATE {TABLE} CONTINUE IDENTITY USING OPERATION_ID 'id-2'"
+        ))
+        .unwrap_err(),
+        "23505"
+    );
+}
+
+/// 名前が `restart`／`continue` の表は従来どおり表名として扱われる。
+#[test]
+fn tables_named_restart_and_continue_still_truncate() {
+    let (core, path) = new_core_with_tables();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    for name in ["restart", "continue"] {
+        core.execute_sql_in_session(
+            &alice,
+            &mut ddl,
+            &format!("CREATE TABLE {name} (embedding VECTOR(2))"),
+        )
+        .unwrap_or_else(|e| panic!("create {name}: {e}"));
+        let mut session = SessionState::default();
+        core.execute_sql_in_session(
+            &alice,
+            &mut session,
+            &format!("TRUNCATE {name} USING OPERATION_ID 'op-{name}'"),
+        )
+        .unwrap_or_else(|e| panic!("truncate {name}: {e}"));
+    }
+}
+
+/// 所有 SEQUENCE が無い表なら、明示トランザクション内の `RESTART IDENTITY` も成功する。
+#[test]
+fn restart_identity_in_transaction_without_owned_sequence_succeeds() {
+    let (core, path) = new_core_with_tables();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    insert_row(&core, &alice, TABLE, 1, Visibility::Public, 0);
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    for sql in [
+        "BEGIN".to_string(),
+        format!("TRUNCATE {TABLE} RESTART IDENTITY USING OPERATION_ID 'op-txn-ri'"),
+        "COMMIT".to_string(),
+    ] {
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, &sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
 }

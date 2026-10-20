@@ -15,8 +15,9 @@ TRUNCATE TABLE <table> USING OPERATION_ID '<id>'
 
 - `INSERT`（TASK-80・SQL-10）と同じ「文末専用句 `USING OPERATION_ID '<id>'`」規範を
   踏襲する。省略・明示 `NULL` はいずれも `LedgerMode::Ledgered`（既定）で `23502`。
-- 複数テーブル指定・`CASCADE`／`RESTART IDENTITY` 等の PostgreSQL 拡張句は構造的に
-  受理しない（許可リスト外・`42601`）。
+- 当初は複数テーブル指定・`CASCADE`／`RESTART IDENTITY` 等の PostgreSQL 拡張句を受理しなかったが、
+  現在は Issue #1643・#1644・#1645 で順に受理している（[truncate-multi-table.md](truncate-multi-table.md)）。
+  それ以外の拡張句は許可リスト外（`42601`）。
 - `EXPLAIN TRUNCATE ...` は許可形状に存在しないため、先頭トークンが `EXPLAIN` の
   場合は既存の `EXPLAIN` 分岐（次トークンが `SELECT` であることを要求）へ流れて
   自然に `42601` になる（`INSERT` と同じ経路）。

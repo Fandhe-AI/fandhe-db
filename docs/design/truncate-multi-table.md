@@ -4,7 +4,7 @@
 - 関連ビヘイビア: SQL-22（TASK-193）・TABLE-17・RECOVER-1/2/10/11・SQL-31
 - 関連コード: `sql::allowlist`（`parse_truncate`・`ValidatedTruncate`）・`tenant::truncate_tables_unchecked`・
   `recovery::content_hash::for_truncate_tables`
-- 範囲外: `RESTART IDENTITY`（#1645。従来どおり `42601`）。`CASCADE`／`RESTRICT` は Issue #1644 で追加（末尾の追記節）
+- 範囲外: `RESTART IDENTITY`（Issue #1645 で追加。末尾の追記節）。`CASCADE`／`RESTRICT` は Issue #1644 で追加（末尾の追記節）
 
 ## 受理する形
 
@@ -84,3 +84,57 @@
   `Copy` は外した
 - 明示トランザクションでは `core.rs` が明示した表と連鎖した表の両方に `mark_written` を呼ぶ
 - 権限検査（#1968）を結線する際は、連鎖後の最終集合に対して行う必要がある
+
+## Issue #1645 追記: RESTART IDENTITY／CONTINUE IDENTITY
+
+- 対象ビヘイビア: SQL-48 (3)・TABLE-24（ポインタ: `docs/spec/04-behavior/sql-surface.md`・`data-model.md`）。
+  関連: RECOVER-10・RECOVER-11・SQL-31
+
+### 構文
+
+`TRUNCATE [TABLE] [ONLY] <表> [, ...] [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT] USING OPERATION_ID '<id>'`
+
+- 識別句は表リストと `CASCADE`／`RESTRICT` の間に置く。`RESTART`／`CONTINUE` の直後が `IDENTITY` のときだけ
+  句として読む 2 トークン先読みで、`restart` という名前の表は従来どおり表名として扱われる。
+- 省略と明示の `CONTINUE IDENTITY` は同じ意味（採番を戻さない）で、内容ハッシュも同一。
+- 重複・順序違い・`IDENTITY` 欠落・`USING OPERATION_ID` の後ろは `42601`。
+- 公開 API は `ValidatedTruncate::restart_identity` の追加（破壊的変更）。
+
+### 「所有」の定義
+
+- 戻す対象は、対象表（CASCADE では連鎖後の最終集合）が**所有する** SEQUENCE の自テナントの採番だけ。
+  `DEFAULT nextval('s')` から参照されるだけの SEQUENCE は戻さない（戻すと同じ SEQUENCE を使う別の表で
+  値が重複する。PostgreSQL と同じ）。
+- 所有関係は SEQUENCE の定義 blob に格納する。所有者ありだけ版 3（版 2 の固定部 + 表名・列名を u16 LE 長さ付きで
+  連結）で書き、所有者なしは従来の版 2 のバイト列のまま。旧バイナリは版 3 を `CorruptSchema` で拒否する。
+  `ALTER SEQUENCE` は所有者を引き継ぐ。
+- 所有者を設定する入口は `Storage::set_sequence_owner`（`pub(crate)`）のみ。`OWNED BY` 構文・SERIAL／IDENTITY の
+  結線・DROP TABLE／DROP COLUMN／RENAME での追従は #1694 の範囲のため、**それまで SQL から所有者を作れず、
+  `RESTART IDENTITY` は受理されるが採番には作用しない**（所有 SEQUENCE が無い表では PostgreSQL も no-op）。
+
+### 実行
+
+- パス 0（行を消す前）で所有 SEQUENCE を列挙する。カタログ宣言だけで決まり、テナントの採番状態には依存しない。
+- 戻す値は `params.start`・`is_called = false`。状態行を削除せず明示的に書く（削除すると次の払い出しが
+  `ALTER SEQUENCE ... RESTART WITH` でずれうる `restart_value` にフォールバックするため。PostgreSQL の
+  `ResetSequence` も START に戻す）。書き込みは FK 検査・世代 bump・台帳を通過した後で、`(自テナント, seq_id)` の
+  行だけを対象にする（他テナントの行には触れない）。
+- Autocommit は commit 成功後に writer permit を保持したまま `(tenant, seq_id)` のメモリ上の現在値だけを捨てる
+  （`WriteTarget::with_txn_post_commit`・`SequenceAllocator::evict_tenant`）。commit 前に巻き戻すと commit 失敗で
+  メモリが永続値より後ろへ下がり、permit 解放後に巻き戻すと他のライタと競合する。いずれも重複採番になる。
+- 一時表の DB には SEQUENCE の定義表が無く、列挙結果が空になるため何もしない。
+
+### 明示・暗黙トランザクション内（fail-closed）
+
+- 対象の閉包に所有 SEQUENCE が 1 つでもあれば、行を消す前に `0A000` で拒否する（`ALTER SEQUENCE` と同じ方針）。
+  所有 SEQUENCE が無ければ従来どおり成功する。判定は全テナント共有のカタログだけで行い、存在オラクルにならない。
+- 理由: アロケータのメモリ上の現在値は ROLLBACK で戻らない設計のため、トランザクション内で正しく戻すには
+  `ActiveTxn` への保留リセットの保持、同じ txn 内の `nextval` が状態行から種を作る経路、保留キーでの
+  `persist_current_in_txn` の抑止、`commit_active` の `commit_and_finish` 化が要る。所有者を SQL から作れるのが
+  #1694 以降のため、完全対応はフォローアップとする。
+
+### 台帳
+
+- `RESTART IDENTITY` は `OpTag::TruncateRestartIdentity = 20`（behavior バイト + 利用者が書いた表の正規化集合）。
+  CONTINUE（省略・明示）は既存の 3 領域のままでバイト列を変えない。取り違えた再送は `22023`、同じ文の再送は
+  `23505` で、`23505` のときは採番を戻さない。

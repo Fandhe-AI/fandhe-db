@@ -106,6 +106,12 @@
   対象へ加え、同じトランザクションで自テナントの行を削除する（参照アクションは発火しない）。公開 API は
   `ValidatedTruncate::behavior` の追加、`TruncateOutcome` の `Copy` 削除と `cascaded()` の追加、
   `TenantWriteError::TruncateReferencedByForeignKey` の追加。
+- `TRUNCATE ... RESTART IDENTITY`／`CONTINUE IDENTITY`（Issue #1645・SQL-48 (3)）: 従来 `42601` だった識別句を
+  受理する（省略時は CONTINUE）。RESTART は対象表が所有する SEQUENCE の自テナントの採番を開始値へ戻す。
+  所有関係は SEQUENCE 定義 blob の版 3 に格納する（所有者なしは従来の版 2 のまま。旧バイナリは版 3 を
+  `CorruptSchema` で拒否する）。SQL から所有者を作る `OWNED BY`／SERIAL は後続 Issue（#1694）のため、それまで
+  RESTART は採番に作用しない。明示トランザクション内は所有 SEQUENCE があれば `0A000`。公開 API は
+  `ValidatedTruncate::restart_identity` の追加。
 - `CREATE VIEW v (a, b) AS ...`（Issue #1659・TABLE-41 (1)）: 従来 `42601` だった列別名リストを受理する。
   別名は出力列に先頭から名前を付け、短いリストの残りは導出名のまま。出力列より長いリストは `42601`、
   リスト内または最終名の重複は `42701`。別名付きビューが読む表への `RENAME COLUMN` は `0A000`、
