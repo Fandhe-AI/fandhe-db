@@ -321,3 +321,11 @@ PLAN-11・TASK-186（NOSQL-6・NOSQL-10・NOSQL-16）
 ## 追記（Issue #2191・TABLE-28）: 縮退理由の露出
 
 `scalar_plan:` 行の末尾に、照合の不一致で全走査へ縮退したときだけ `reason=collation_mismatch` を追記する。`index=` 注記と同じ「既存トークンの末尾への追記のみ」の規則で、行の追加・順序変更はしない。語彙は固定で、値・件数・他テナントの存在情報を含まない。実行時の `ScalarIndex::candidates_for` と静的判定が同じ関数（`text_index_supports`）を通るため、D5 の矛盾出力は生じない。新しい接尾辞を spec 側の語彙（SQL-27 等）へ加えるかは、spec リポ側でオーナーが判断する事項。
+
+## 追記（Issue #2198・TABLE-23）: PK 点検索の語彙
+
+広域取得（`sql::scan`）で宣言 PRIMARY KEY の全構成列がリテラル等価のとき、`scalar_plan: index_primary_key`
+と `access_path: primary_key_lookup` を出す（新しい語彙。`ScalarPlan::IndexPrimaryKey`・
+`AccessPath::PrimaryKeyLookup`）。実行側と同じ静的分類（`sql::pk_point::classify_pk_point`）を呼ぶので 2 行は
+矛盾しない。テナント単位のマーカー欠落による範囲走査への縮退は露出せず、索引名の注記も付けない。
+語彙数の変更は SQL-27 の確定時に spec 側とすり合わせる事項。

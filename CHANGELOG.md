@@ -9,6 +9,10 @@
 
 ### Breaking Changes
 
+- 宣言 PRIMARY KEY の点検索（Issue #2198・TABLE-23）: 広域取得で PK の全構成列がリテラル等価のとき、永続一意索引の
+  点検索で実行する。`EXPLAIN` はこの形のときだけ `scalar_plan: index_primary_key`・`access_path: primary_key_lookup`
+  を出す（従来は `plain_scan`／`full_scan` 固定。PK 未宣言の表・部分等価・範囲比較・`ORDER BY` 付きは不変）。
+  公開 API は `ScalarPlan::IndexPrimaryKey` の追加（`#[non_exhaustive]`）。結果は全走査と一致する。
 - ビューの `WITH CHECK OPTION`（Issue #1673・TABLE-43 (2)）: `CREATE [OR REPLACE] VIEW ... WITH [CASCADED | LOCAL]
   CHECK OPTION` を受理して永続化し（従来は `42601`）、ビュー経由の `INSERT`／`UPDATE`（UPSERT を含む。`DELETE` は
   検査しない）が書いた行を検査対象の述語（NULL も違反）で検査して、違反を `44000`（固定文言。ビュー名・行の値を

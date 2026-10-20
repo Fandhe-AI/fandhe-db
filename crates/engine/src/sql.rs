@@ -216,6 +216,7 @@ pub(crate) mod param_infer;
 pub mod params;
 pub mod parser;
 pub mod partitioned;
+pub(crate) mod pk_point;
 pub mod plan;
 pub(crate) mod qualified_column;
 pub mod relation;

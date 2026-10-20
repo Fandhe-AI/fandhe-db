@@ -8944,14 +8944,16 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-        let _bound = crate::sql::parser::bind_scan_with_dummy_flags(
+        let bound = crate::sql::parser::bind_scan_with_dummy_flags(
             validated,
             &schema,
             session.udfs(),
             &[],
             &self.result_limits,
         )?;
-        Ok(crate::sql::SqlOutcome::Explain(Self::scan_explain_result()))
+        Ok(crate::sql::SqlOutcome::Explain(Self::scan_explain_result(
+            &schema, &bound,
+        )))
     }
 
     /// 広域取得（scan）の `QUERY PLAN` 応答を組み立てる（Issue #948・
@@ -8962,11 +8964,31 @@ impl EngineCore {
     /// （SQL `EXPLAIN SELECT ... LIMIT n` テキスト経由）と
     /// [`Self::explain_bound_scan_in_session`]（NoSQL 表層の `scan` op の
     /// `explain: true`）の両方が共有する。
-    fn scan_explain_result() -> crate::sql::exec::QueryResult {
+    fn scan_explain_result(
+        schema: &crate::catalog::TableSchema,
+        bound: &crate::sql::parser::BoundScan,
+    ) -> crate::sql::exec::QueryResult {
+        // 宣言 PRIMARY KEY の全構成列へのリテラル等価は永続一意索引の点検索で実行される
+        // （Issue #2198・TABLE-23）。実行側（`sql::scan`）と同じ静的分類
+        // （`sql::pk_point::classify_pk_point`）を呼ぶので、2 行は実経路と矛盾しない。テナントごとの
+        // マーカー欠落による範囲走査への縮退は実行時の縮退であり、ここには露出しない（可視カーディナリティ・
+        // テナントの存在情報に繋がる値を出さない）。
+        let (scalar_plan, access_path) =
+            if crate::sql::pk_point::classify_pk_point(schema, bound).is_point() {
+                (
+                    crate::sql::scalar_plan::ScalarPlan::IndexPrimaryKey,
+                    crate::sql::explain::AccessPath::PrimaryKeyLookup,
+                )
+            } else {
+                (
+                    crate::sql::scalar_plan::ScalarPlan::PlainScan,
+                    crate::sql::explain::AccessPath::FullScan,
+                )
+            };
         crate::sql::explain::build_relational_explain_result(
-            crate::sql::scalar_plan::ScalarPlan::PlainScan,
+            scalar_plan,
             None,
-            crate::sql::explain::AccessPath::FullScan,
+            access_path,
             &crate::sql::explain::ExplainIndexNames::default(),
         )
     }
@@ -9175,7 +9197,7 @@ impl EngineCore {
             ));
         }
         self.check_bound_limit(bound.limit())?;
-        Ok(Self::scan_explain_result())
+        Ok(Self::scan_explain_result(&schema, &bound))
     }
 
     /// 束縛済み集計計画（[`crate::sql::parser::BoundAggregate`]。`GROUP BY`

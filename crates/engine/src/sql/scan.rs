@@ -39,6 +39,10 @@
 //! （デコード前のヘッダ判定 → TABLE-12 → 必要範囲のみのデコード → `WHERE` → 可視性の
 //! 再適用）は順序なし経路と同一（[`with_visible_row`] に共通化）。
 //!
+//! **PK 点検索**（Issue #2198。`docs/design/primary-key-point-lookup.md`）: 順序なしの経路で宣言
+//! PRIMARY KEY の全構成列がリテラル等価なら、全行走査の代わりに永続一意索引の点検索で候補を絞る
+//! （[`crate::sql::pk_point`]）。候補も全走査と同じ [`with_visible_row`] を通るため、出力は全走査と同一。
+//!
 //! `OFFSET`（Issue #916・SQL-25 (b)・TASK-209。詳細は
 //! `docs/design/sql-offset-paging.md`）は「可視かつ `WHERE` 一致」の行のみを対象に
 //! 読み飛ばす。RLS 判定・`WHERE` 評価が確定した後でのみ計数するため、不可視行は
@@ -1241,20 +1245,46 @@ pub(crate) fn execute_scan_with_budget(
         // 契約の実装側。テナントを跨いだ物理走査順のどこで打ち切っても、
         // 不可視行は一切カウントされないため他テナントの存在・件数の情報を
         // 漏らさない）。
-        for entry in table.iter().map_err(storage_internal)? {
-            if rows.len() >= bound.limit {
-                break;
+        // 1 候補行の処理（全走査・PK 点検索の候補探査が共有する）。戻り値 `true` は
+        // `LIMIT` 件に達したため打ち切る合図。
+        let mut consume =
+            |key_tenant: &str, id: u64, buf: &[u8]| -> Result<bool, SqlSurfaceError> {
+                if rows.len() >= bound.limit {
+                    return Ok(true);
+                }
+                // `build_visible_row` が `Some(None)` を返すのは「可視かつ WHERE を
+                // 満たすが OFFSET でスキップされる行」（投影・予算計上済みでない）。
+                if let Some(Some(row)) = build_visible_row(key_tenant, id, buf)? {
+                    rows.try_reserve(1).map_err(|e| SqlSurfaceError::Internal {
+                        detail: format!("failed to reserve scan result rows: {e}"),
+                    })?;
+                    rows.push(row);
+                }
+                Ok(rows.len() >= bound.limit)
+            };
+        // Issue #2198: 宣言 PRIMARY KEY の全構成列がリテラル等価なら、全行走査の代わりに
+        // 永続一意索引の点検索で候補を絞る（`sql::pk_point`。候補も全走査と同じ
+        // `with_visible_row` を通るため出力は全走査と同一）。それ以外は従来の全行走査。
+        match crate::sql::pk_point::classify_pk_point(schema, bound) {
+            crate::sql::pk_point::PkPointPlan::Point { canonical_key } => {
+                crate::sql::pk_point::for_each_candidate(
+                    read_txn,
+                    &table,
+                    ctx,
+                    schema,
+                    &bound.table,
+                    &canonical_key,
+                    &mut consume,
+                )?;
             }
-            let (k, v) = entry.map_err(storage_internal)?;
-            let (key_tenant, id) = k.value();
-            let buf = v.value();
-            // `build_visible_row` が `Some(None)` を返すのは「可視かつ WHERE を
-            // 満たすが OFFSET でスキップされる行」（投影・予算計上済みでない）。
-            if let Some(Some(row)) = build_visible_row(key_tenant, id, buf)? {
-                rows.try_reserve(1).map_err(|e| SqlSurfaceError::Internal {
-                    detail: format!("failed to reserve scan result rows: {e}"),
-                })?;
-                rows.push(row);
+            crate::sql::pk_point::PkPointPlan::NotApplicable => {
+                for entry in table.iter().map_err(storage_internal)? {
+                    let (k, v) = entry.map_err(storage_internal)?;
+                    let (key_tenant, id) = k.value();
+                    if consume(key_tenant, id, v.value())? {
+                        break;
+                    }
+                }
             }
         }
     } else if leading_key_is_id(bound) && !ctx.allows_public() {
