@@ -1144,9 +1144,19 @@ pub(crate) fn verify_gin_index_read_only(
     decl: &crate::catalog::DeclaredGinIndex,
 ) -> Result<crate::catalog::GinIndexAudit, TenantWriteError> {
     let row_table_name = crate::catalog::user_rows_table_name(table_name);
-    let row_table = read_txn
-        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
-        .map_err(crate::catalog::map_row_table_error)?;
+    let row_table = match read_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
+    {
+        Ok(t) => t,
+        // 行テーブル未作成は行 0 件として扱う（CREATE INDEX の構築と同じ扱い。物理 GIN テーブルも作られない）。
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Ok(crate::catalog::GinIndexAudit {
+                marker_valid: false,
+                missing: 0,
+                stale: 0,
+            })
+        }
+        Err(e) => return Err(crate::catalog::map_row_table_error(e).into()),
+    };
     let gin_table_name = crate::catalog::user_gin_table_name(&decl.index_name);
     let limits = crate::gin_index::GinLimits::default();
     match read_txn.open_table(crate::catalog::user_gin_table_def(&gin_table_name)) {

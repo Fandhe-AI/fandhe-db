@@ -188,6 +188,27 @@ fn create_index_builds_from_existing_rows_for_all_tenants() {
     assert_eq!((a.missing, a.stale), (0, 0));
 }
 
+/// 行が 1 件も無い作成直後の表（行テーブル未作成）でも診断 API は失敗せず、マーカー無効・欠落 0・stale 0 を返す。
+#[test]
+fn verify_on_empty_table_without_row_table_reports_zero() {
+    let (path, _guard) = open_fixture("gin-dml-empty-verify");
+    let core = core_at(&path);
+    let mut s = allowed_session();
+    create_indexes(&core, &mut s);
+    for index in INDEXES {
+        let a = audit(&core, "alice", index);
+        assert_eq!(
+            a,
+            GinIndexAudit {
+                marker_valid: false,
+                missing: 0,
+                stale: 0
+            },
+            "{index}"
+        );
+    }
+}
+
 /// INSERT・UPDATE・DELETE（単一行・述語形）の各経路で索引が全行抽出と一致し、他テナントは不変。
 #[test]
 fn dml_paths_keep_the_index_equal_to_a_full_extraction() {
