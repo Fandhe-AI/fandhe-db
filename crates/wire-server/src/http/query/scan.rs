@@ -40,7 +40,7 @@
 //! 第 2 の並べ替え実装は持たない。
 //!
 //! 応答は `score` を一切含まない: `Projection::All`（`columns` 省略時）は
-//! `schema.columns` の実列と疑似列 `id` のみを列挙し（`bind_projection` の
+//! `schema.columns` の実列と（疑似列 `id` を持つ表では）疑似列 `id` のみを列挙し（`bind_projection` の
 //! 既存契約）、`hybrid`／スカラー `ORDER BY`（`sort` 指定時を含む）を経由
 //! しない広域取得には合成スコア列が構造上存在しない。
 //!
@@ -403,7 +403,6 @@ pub fn execute(
     let session = SessionState::default();
     let result =
         core.execute_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {
-            super::gate::reject_allocated_schema(schema)?;
             prepared.bind(schema, udfs)
         })?;
     Ok(result)
@@ -422,7 +421,6 @@ pub fn explain(
     let session = SessionState::default();
     let result =
         core.explain_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {
-            super::gate::reject_allocated_schema(schema)?;
             prepared.bind(schema, udfs)
         })?;
     Ok(result)

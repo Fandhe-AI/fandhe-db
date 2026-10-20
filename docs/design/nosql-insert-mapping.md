@@ -174,3 +174,11 @@ SQL-16 結線前（Issue #771〜#773 時点）の状態を指すものであり�
 - SQL 表層固有の受入基準（行順保持・ファイル形との非併用〔`42601`〕・
   1 文あたり行数上限・単一行の既存挙動不変・台帳キー空間の共有）は
   `docs/design/sql-multi-row-insert.md` を参照。
+
+## Issue #2201: 採番方式の表への `insert`
+
+TABLE-23・NOSQL-23 のポインタ。疑似列 `id` を持つ表（従来方式・移行済み）は従来どおり各行の `id`（非負整数）が必須。
+採番方式の表（SQL の `CREATE TABLE` で作った表）は `id` を要求も注入もせず、宣言した `id` 列は通常の列として
+写像し、宣言のない `id` キーは未知列（`22000`）とする。PK 列の省略は engine の `DEFAULT`／NOT NULL 規則に任せる
+（`23502`）。行の識別子は engine が払い出し、応答には出さない（実装: `crates/wire-server/src/http/query/insert.rs`
+の `bind_row`）。
