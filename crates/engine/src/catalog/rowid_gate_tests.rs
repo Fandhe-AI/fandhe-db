@@ -157,6 +157,7 @@ fn table23_truncate_is_allowed_and_keeps_allocator_state() {
         crate::tenant::WriteTarget::Autocommit(&storage),
         &["docs".to_string()],
         DropBehavior::Restrict,
+        false,
         &ctx(),
         ledger,
     )

@@ -135,10 +135,13 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
 ### D8. 受理範囲と fail-closed
 
 - 最初に受理するのは #1688 の START／INCREMENT／MINVALUE／MAXVALUE／CYCLE
-- CACHE・OWNED BY・AS・SERIAL・IDENTITY・`TRUNCATE ... RESTART IDENTITY`（SQL-48）・
+- CACHE・OWNED BY・AS・SERIAL・IDENTITY・
   `DROP SEQUENCE ... CASCADE`（TABLE-37）・`IF [NOT] EXISTS`（TABLE-36）・TEMP SEQUENCE は、
   受理する sub-issue が明記されるまで `0A000`／`42601` で fail-closed とする
 - DDL は既存の `--ddl-allowed-users` のゲートに従い、既定拒否を維持する
+- `TRUNCATE ... RESTART IDENTITY`（SQL-48 (3)）は Issue #1645 で受理した。所有者を定義 blob（版 3）に格納でき、
+  戻す対象は所有 SEQUENCE の自テナントの採番だけ。`OWNED BY`／SERIAL の結線は #1694 で、それまで SQL から
+  所有者は作れない。詳細は [truncate-multi-table.md](truncate-multi-table.md) の「Issue #1645 追記」
 
 ### D9. 変更ログとレプリカ
 

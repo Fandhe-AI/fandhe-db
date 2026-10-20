@@ -488,7 +488,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2328 等の base 取り込みと Issue #1544 の追加で行が移動したための追随（旧: 493）。
     // Issue #1671（ビュー書き込みの定義照合 `verify_view_write_scope` 追加。+3 行）で追随（旧: 526）。
     // Issue #1690（`TenantWriteError::SequenceEvaluationFailed` の追加。+10 行）で追随（旧: 529）。
-    ("tenant.rs", 546),
+    // Issue #1645（`with_txn_post_commit` の導入。commit 成功後フックのため `commit_and_finish` 呼び出しへ変更、
+    // `with_txn` はその薄いラッパーになった。choke point である点は不変）で追随（旧: 546）。
+    ("tenant.rs", 561),
     // Issue #1688（SEQUENCE のカタログ）: `catalog/sequence.rs` の `create_sequence`／`drop_sequence` は
     // SEQUENCE の定義表・状態表・ID カウンタだけを書く。表の行スキーマ（`user_rows/{table}`）も
     // 表のスキーマ世代も変えないため、`bump_table_generation_in_txn` を伴わない。Issue #1690 の
@@ -499,18 +501,22 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1691（setval）: `set_sequence_value`（996）も状態表だけを書くため同じ理由で対象外。行追加に伴い
     // 他の行番号が移動したため追随（旧: 730／754／803／842／897／1171／1257／1297／1350／1618）。末尾の 2 件
     // （1784・1829）は同ファイルの `#[cfg(test)]` 内（旧 1618 の移動分と setval の単体テストの補助関数）。
-    ("catalog/sequence.rs", 864),
-    ("catalog/sequence.rs", 888),
-    ("catalog/sequence.rs", 937),
-    ("catalog/sequence.rs", 976),
-    ("catalog/sequence.rs", 996),
-    ("catalog/sequence.rs", 1063),
-    ("catalog/sequence.rs", 1337),
-    ("catalog/sequence.rs", 1423),
-    ("catalog/sequence.rs", 1463),
-    ("catalog/sequence.rs", 1516),
-    ("catalog/sequence.rs", 1784),
-    ("catalog/sequence.rs", 1829),
+    // Issue #1645（所有 SEQUENCE の定義 blob 版 3・`commit_and_finish` 経路の追加）と base 取り込みで行が移動したため
+    // 全件を現行行へ追随（commit 対象は SEQUENCE 定義・状態表のみで同じ理由により対象外）。
+    ("catalog/sequence.rs", 1015),
+    ("catalog/sequence.rs", 1048),
+    ("catalog/sequence.rs", 1072),
+    ("catalog/sequence.rs", 1121),
+    ("catalog/sequence.rs", 1160),
+    ("catalog/sequence.rs", 1180),
+    ("catalog/sequence.rs", 1247),
+    ("catalog/sequence.rs", 1521),
+    ("catalog/sequence.rs", 1611),
+    ("catalog/sequence.rs", 1651),
+    ("catalog/sequence.rs", 1704),
+    ("catalog/sequence.rs", 1972),
+    ("catalog/sequence.rs", 2017),
+    ("catalog/sequence.rs", 2284),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
 ];

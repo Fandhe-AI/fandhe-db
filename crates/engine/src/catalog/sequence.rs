@@ -56,8 +56,13 @@ const SEQUENCE_ID_COUNTER_KEY: &str = "next_id";
 /// #1711（SCHEMA）より前の SEQUENCE が属する schema 名。
 const DEFAULT_SEQUENCE_SCHEMA: &str = "public";
 
-/// 定義 blob の版（現行の書き込み版。版 1 は読み取りのみ受理する）。
+/// 定義 blob の版（所有者なしの書き込み版。版 1 は読み取りのみ受理する）。
 const SEQUENCE_DEF_VERSION: u8 = 2;
+
+/// 所有者あり（`owned_by` バイト = 1）の定義 blob の版（Issue #1645）。版 2 の固定部の後ろに
+/// 所有する表名・列名を u16 LE 長さ付きで連結する。所有者なしは版 2 のまま書き、既存 blob の
+/// バイト列と旧バイナリとの互換を変えない（旧バイナリは版 3 を `CorruptSchema` で拒否する）。
+const SEQUENCE_DEF_VERSION_OWNED: u8 = 3;
 
 /// 旧版（`restart_value` を持たない）の版番号。decode は `restart_value = start` として読む。
 const SEQUENCE_DEF_VERSION_V1: u8 = 1;
@@ -123,6 +128,16 @@ pub(crate) struct SequenceDef {
     /// 状態行を持たないテナントの初期 last_value（`is_called = false`）。CREATE 時は `start`、
     /// `ALTER SEQUENCE ... RESTART` で更新される（Issue #1689）。
     pub(crate) restart_value: i64,
+}
+
+/// SEQUENCE を所有する表の列（`OWNED BY <table>.<column>`／SERIAL・IDENTITY 列。Issue #1645）。
+/// `TRUNCATE ... RESTART IDENTITY` が「どの SEQUENCE を戻すか」を決めるカタログ宣言で、
+/// 全テナント共有（テナントごとの状態ではない）。`DEFAULT nextval('s')` で参照されるだけの
+/// SEQUENCE は所有ではない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SequenceOwner {
+    pub(crate) table: String,
+    pub(crate) column: String,
 }
 
 /// `MINVALUE`／`MAXVALUE` の変更指定（`ALTER SEQUENCE`）。
@@ -292,34 +307,91 @@ fn sequence_key(name: &str) -> (&str, &str) {
     (DEFAULT_SEQUENCE_SCHEMA, name)
 }
 
-/// 定義 blob を符号化する（固定長・版バイト先頭。常に版 2 で書く）。`restart_value` は
-/// 状態行を持たないテナントの初期 last_value（`is_called = false`）。
-fn encode_sequence_def(id: u64, p: &SequenceParams, restart_value: i64) -> Vec<u8> {
+/// 定義 blob を符号化する（版バイト先頭）。所有者なしは固定長の版 2、あり（Issue #1645）は
+/// 版 3（版 2 の固定部 + u16 LE 長さ付きの表名・列名）。`restart_value` は状態行を持たない
+/// テナントの初期 last_value（`is_called = false`）。
+fn encode_sequence_def(
+    id: u64,
+    p: &SequenceParams,
+    restart_value: i64,
+    owner: Option<&SequenceOwner>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(SEQUENCE_DEF_LEN);
-    out.push(SEQUENCE_DEF_VERSION);
+    out.push(if owner.is_some() {
+        SEQUENCE_DEF_VERSION_OWNED
+    } else {
+        SEQUENCE_DEF_VERSION
+    });
     out.extend_from_slice(&id.to_le_bytes());
     out.push(TYPE_TAG_BIGINT);
     for v in [p.increment, p.min_value, p.max_value, p.start, 1_i64] {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out.push(u8::from(p.cycle));
-    out.push(0); // owned_by: なし
+    out.push(u8::from(owner.is_some())); // owned_by
     out.extend_from_slice(&restart_value.to_le_bytes());
+    if let Some(o) = owner {
+        for name in [&o.table, &o.column] {
+            // 識別子は `validate_identifier` 済み（長さは u16 に収まる）。収まらない値は
+            // 書き込み側で弾かれている前提のため、飽和させて decode 側の検証に任せる。
+            let len = u16::try_from(name.len()).unwrap_or(u16::MAX);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+    }
     out
 }
 
-/// 定義 blob を復号する（版 1・版 2 を受理。版 1 は `restart_value = start`）。未知の版・タグ・
-/// 長さ不一致・不変条件違反は `CorruptSchema`（fail-closed。detail は固定文言で格納バイト列の
-/// 断片を含めない）。
+/// 版 3 の所有者部（固定部の後ろ）を復号する。長さ不一致・余剰バイト・不正な識別子は
+/// `CorruptSchema`（fail-closed）。
+fn decode_owner_trailer(trailer: &[u8]) -> Result<SequenceOwner> {
+    let corrupt = || CatalogError::CorruptSchema("corrupt sequence definition".to_string());
+    let mut rest = trailer;
+    let mut names: Vec<String> = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let len_raw: [u8; 2] = rest
+            .get(..2)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(corrupt)?;
+        let len = usize::from(u16::from_le_bytes(len_raw));
+        let name_bytes = rest.get(2..2 + len).ok_or_else(corrupt)?;
+        let name = std::str::from_utf8(name_bytes).map_err(|_| corrupt())?;
+        validate_identifier(name).map_err(|_| corrupt())?;
+        names.push(name.to_string());
+        rest = rest.get(2 + len..).ok_or_else(corrupt)?;
+    }
+    if !rest.is_empty() {
+        return Err(corrupt());
+    }
+    let column = names.pop().ok_or_else(corrupt)?;
+    let table = names.pop().ok_or_else(corrupt)?;
+    Ok(SequenceOwner { table, column })
+}
+
+/// 定義 blob を復号する（所有者は読み捨てる）。[`decode_sequence_def_with_owner`] 参照。
 fn decode_sequence_def(bytes: &[u8]) -> Result<SequenceDef> {
+    decode_sequence_def_with_owner(bytes).map(|(def, _)| def)
+}
+
+/// 定義 blob を所有者込みで復号する（版 1・2・3 を受理。版 1 は `restart_value = start`、
+/// 版 1・2 の所有者は常に `None`）。未知の版・タグ・長さ不一致・不変条件違反は
+/// `CorruptSchema`（fail-closed。detail は固定文言で格納バイト列の断片を含めない）。
+fn decode_sequence_def_with_owner(bytes: &[u8]) -> Result<(SequenceDef, Option<SequenceOwner>)> {
     let corrupt = || CatalogError::CorruptSchema("corrupt sequence definition".to_string());
     let version = bytes.first().copied();
+    // 版 3 は固定部（版 2 と同じ長さ）の後ろに所有者部が続く可変長。
+    let owned = version == Some(SEQUENCE_DEF_VERSION_OWNED);
     let expected_len = match version {
         Some(SEQUENCE_DEF_VERSION) => SEQUENCE_DEF_LEN,
         Some(SEQUENCE_DEF_VERSION_V1) => SEQUENCE_DEF_LEN_V1,
+        Some(SEQUENCE_DEF_VERSION_OWNED) => SEQUENCE_DEF_LEN,
         _ => return Err(corrupt()),
     };
-    if bytes.len() != expected_len {
+    if owned {
+        if bytes.len() <= expected_len {
+            return Err(corrupt());
+        }
+    } else if bytes.len() != expected_len {
         return Err(corrupt());
     }
     let read_i64 = |off: usize| -> Result<i64> {
@@ -348,12 +420,13 @@ fn decode_sequence_def(bytes: &[u8]) -> Result<SequenceDef> {
             _ => return Err(corrupt()),
         },
     };
-    // cache は 1 固定、owned_by はなし固定（現時点では他の値を書かない）。
-    if read_i64(42)? != 1 || bytes.get(CYCLE_OFFSET + 1) != Some(&0) {
+    // cache は 1 固定。owned_by バイトは版 3 なら 1、版 1・2 なら 0 でなければならない。
+    let expected_owned_byte = u8::from(owned);
+    if read_i64(42)? != 1 || bytes.get(CYCLE_OFFSET + 1) != Some(&expected_owned_byte) {
         return Err(corrupt());
     }
     params.validate().map_err(|_| corrupt())?;
-    let restart_value = if version == Some(SEQUENCE_DEF_VERSION) {
+    let restart_value = if version != Some(SEQUENCE_DEF_VERSION_V1) {
         read_i64(RESTART_OFFSET)?
     } else {
         params.start
@@ -361,11 +434,21 @@ fn decode_sequence_def(bytes: &[u8]) -> Result<SequenceDef> {
     if restart_value < params.min_value || restart_value > params.max_value {
         return Err(corrupt());
     }
-    Ok(SequenceDef {
-        id,
-        params,
-        restart_value,
-    })
+    let owner = if owned {
+        Some(decode_owner_trailer(
+            bytes.get(SEQUENCE_DEF_LEN..).ok_or_else(corrupt)?,
+        )?)
+    } else {
+        None
+    };
+    Ok((
+        SequenceDef {
+            id,
+            params,
+            restart_value,
+        },
+        owner,
+    ))
 }
 
 /// cycle バイトの位置（`10 + 8 * 5` = cache の直後。owned_by はその次の 1 バイト）。
@@ -603,6 +686,16 @@ impl SequenceAllocator {
         }
     }
 
+    /// `(tenant, sequence_id)` の 1 キーだけメモリ上の現在値を捨てる（`TRUNCATE ... RESTART IDENTITY`
+    /// の commit 成功後に writer permit を保持したまま呼ぶ。Issue #1645）。次の払い出しは同じ txn で
+    /// 書いた状態行 `{start, is_called = false}` から種を作る。他テナントのキーには触れない。
+    /// ロックの毒化は黙って握りつぶさず、次回の払い出しが `Poisoned`（`XX000`）で失敗する。
+    pub(crate) fn evict_tenant(&self, tenant: &str, sequence_id: u64) {
+        if let Ok(mut guard) = self.cursors.lock() {
+            guard.remove(&(tenant.to_string(), sequence_id));
+        }
+    }
+
     /// `sequence_id` の現在値を全テナント分メモリから捨てる（`DROP SEQUENCE`・RESTART の commit 成功後。
     /// ロックの毒化は黙って握りつぶさず、次回払い出しで `Poisoned` になる）。
     pub(crate) fn evict(&self, sequence_id: u64) {
@@ -830,7 +923,98 @@ pub(crate) fn sequence_id_exists_in<R: ReadSource>(src: &R, id: u64) -> Result<b
     Ok(false)
 }
 
+/// `tables` のいずれかが所有する SEQUENCE の定義を内部 ID 昇順で返す（`TRUNCATE ... RESTART
+/// IDENTITY` の対象列挙。SQL-48 (3)、Issue #1645）。`DEFAULT nextval('s')` で参照されるだけの
+/// SEQUENCE は含めない。全テナント共有のカタログ宣言だけで決まり、テナントの採番状態には依存
+/// しない。表が未作成なら空（表を作らない）。走査は [`MAX_SEQUENCES`] 件で打ち切り、定義 blob の
+/// 復号失敗は `CorruptSchema`（スキップせず全体を fail-closed にする）。
+pub(crate) fn owned_sequences_for_tables_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tables: &[String],
+) -> Result<Vec<SequenceDef>> {
+    let table = match ReadSource::open_table(write_txn, SEQUENCES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for entry in table.iter()?.take(MAX_SEQUENCES) {
+        let (_, v) = entry?;
+        let (def, owner) = decode_sequence_def_with_owner(v.value())?;
+        if owner.is_some_and(|o| tables.contains(&o.table)) {
+            out.push(def);
+        }
+    }
+    out.sort_by_key(|d| d.id);
+    Ok(out)
+}
+
+/// `(tenant, def.id)` の状態行を `{last_value: START, is_called: false}` で書く（`TRUNCATE ...
+/// RESTART IDENTITY` の本体。Issue #1645）。`restart_value`（`ALTER SEQUENCE ... RESTART WITH`
+/// でずれうる）ではなく START へ戻す（PostgreSQL の `ResetSequence` と同じ）。状態行を削除せず
+/// 明示的に書くのは、行が無いと次の払い出しが `restart_value` にフォールバックするため。他テナントの
+/// 行には触れない（TABLE-24 (2)）。メモリ上の現在値の破棄は呼び出し元が commit 後に行う。
+pub(crate) fn reset_sequence_state_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    def: &SequenceDef,
+) -> Result<()> {
+    write_state_in_txn(
+        write_txn,
+        tenant,
+        def.id,
+        &SeqCursor {
+            last_value: def.params.start,
+            is_called: false,
+        },
+    )
+}
+
+/// SEQUENCE `name` の所有者（表・列）を設定または解除する（Issue #1645）。表・列の実在を同一
+/// write txn で確認する（表不在 `TableNotFound`・列不在 `Invalid`・SEQUENCE 不在／他種別は
+/// `load_sequence_bytes_in_txn` の契約）。`OWNED BY`／SERIAL／IDENTITY の結線（#1694）が呼ぶ入口。
+#[cfg_attr(not(test), allow(dead_code))] // #1694 が結線するまでテストからのみ呼ばれる。
+pub(crate) fn set_sequence_owner_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+    owner: Option<SequenceOwner>,
+) -> Result<()> {
+    validate_identifier(name)?;
+    let bytes = load_sequence_bytes_in_txn(write_txn, name)?;
+    let def = decode_sequence_def(&bytes)?;
+    if let Some(o) = &owner {
+        validate_identifier(&o.table)?;
+        validate_identifier(&o.column)?;
+        let schema = get_table_schema_in_txn(write_txn, &o.table)?;
+        if !schema.columns.iter().any(|c| c.name == o.column) {
+            return Err(CatalogError::Invalid(
+                "sequence owner column does not exist".to_string(),
+            ));
+        }
+    }
+    let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
+    table.insert(
+        sequence_key(name),
+        encode_sequence_def(def.id, &def.params, def.restart_value, owner.as_ref()).as_slice(),
+    )?;
+    Ok(())
+}
+
 impl Storage {
+    /// [`set_sequence_owner_in_txn`] を単独の write txn で実行する。
+    #[cfg_attr(not(test), allow(dead_code))] // #1694 が結線するまでテストからのみ呼ばれる。
+    pub(crate) fn set_sequence_owner(
+        &self,
+        name: &str,
+        owner: Option<SequenceOwner>,
+    ) -> Result<()> {
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::convert_storage_error)?;
+        set_sequence_owner_in_txn(&write_txn, name, owner)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
+    }
+
     /// SEQUENCE を作成する。判定順は同一 write txn 内で名前の衝突（`TableAlreadyExists`。
     /// 表・ビュー・索引・matview・SEQUENCE）→ 件数上限（`ViewLimitExceeded`）→ 保存。
     /// `sql::ddl::execute_create_sequence` から呼ばれる（権限ゲート通過後）。
@@ -858,7 +1042,7 @@ impl Storage {
             }
             table.insert(
                 sequence_key(name),
-                encode_sequence_def(id, params, params.start).as_slice(),
+                encode_sequence_def(id, params, params.start, None).as_slice(),
             )?;
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
@@ -909,7 +1093,7 @@ impl Storage {
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
         let bytes = load_sequence_bytes_in_txn(&write_txn, name)?;
-        let def = decode_sequence_def(&bytes)?;
+        let (def, owner) = decode_sequence_def_with_owner(&bytes)?;
         let caller_current = if alter.restart.is_none() {
             caller_current_value_in_txn(self.sequence_allocator(), &write_txn, tenant_id, def.id)?
         } else {
@@ -922,7 +1106,7 @@ impl Storage {
             let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
             table.insert(
                 sequence_key(name),
-                encode_sequence_def(def.id, &params, restart_value).as_slice(),
+                encode_sequence_def(def.id, &params, restart_value, owner.as_ref()).as_slice(),
             )?;
         }
         if alter.restart.is_some() {
@@ -1080,7 +1264,7 @@ mod tests {
             start: 10,
             cycle: true,
         };
-        let d = decode_sequence_def(&encode_sequence_def(7, &p, 10)).expect("decode");
+        let d = decode_sequence_def(&encode_sequence_def(7, &p, 10, None)).expect("decode");
         assert_eq!(
             d,
             SequenceDef {
@@ -1098,7 +1282,7 @@ mod tests {
             min_value: 1,
             ..params()
         };
-        let mut v1 = encode_sequence_def(3, &p, 5);
+        let mut v1 = encode_sequence_def(3, &p, 5, None);
         v1[0] = SEQUENCE_DEF_VERSION_V1;
         v1.truncate(SEQUENCE_DEF_LEN_V1);
         let d = decode_sequence_def(&v1).expect("v1 decode");
@@ -1107,7 +1291,7 @@ mod tests {
 
     #[test]
     fn v2_restart_value_out_of_range_is_corrupt() {
-        let good = encode_sequence_def(1, &params(), 1);
+        let good = encode_sequence_def(1, &params(), 1, None);
         let mut bad = good.clone();
         bad[RESTART_OFFSET..RESTART_OFFSET + 8].copy_from_slice(&0_i64.to_le_bytes());
         assert!(matches!(
@@ -1123,7 +1307,7 @@ mod tests {
 
     #[test]
     fn blob_corruption_is_rejected() {
-        let good = encode_sequence_def(1, &params(), 1);
+        let good = encode_sequence_def(1, &params(), 1, None);
         let mut bad_version = good.clone();
         bad_version[0] = 9;
         let mut bad_type = good.clone();
@@ -1395,8 +1579,12 @@ mod tests {
             drop(txn); // ROLLBACK 相当。
         }
         let a = SequenceAlter {
+            restart: None,
+            start: None,
             increment: Some(2),
-            ..no_alter()
+            min_value: BoundChange::Keep,
+            max_value: BoundChange::Keep,
+            cycle: None,
         };
         s.alter_sequence("a", "t1", &a).expect("alter");
         let (_, p2) = s.sequence_definition("a").unwrap().unwrap();
@@ -1947,5 +2135,158 @@ mod setval_tests {
         assert!(!s.sequence_id_exists(id).expect("dropped"));
         s.create_sequence("b", &params()).expect("recreate");
         assert!(!s.sequence_id_exists(id).expect("new id"));
+    }
+
+    // --- Issue #1645: 所有者・RESTART IDENTITY 用の土台 ---
+
+    fn owner(table: &str, column: &str) -> SequenceOwner {
+        SequenceOwner {
+            table: table.to_string(),
+            column: column.to_string(),
+        }
+    }
+
+    fn make_table(s: &Storage, name: &str) {
+        s.create_table(&crate::catalog::TableSchema::new(
+            name,
+            vec![crate::catalog::ColumnDef::new(
+                "n",
+                crate::catalog::ColumnType::BigInt,
+                false,
+            )],
+        ))
+        .expect("create table");
+    }
+
+    #[test]
+    fn owned_blob_v3_roundtrip_and_unowned_stays_v2() {
+        let o = owner("tbl", "n");
+        let blob = encode_sequence_def(5, &params(), 1, Some(&o));
+        assert_eq!(blob[0], SEQUENCE_DEF_VERSION_OWNED);
+        let (d, got) = decode_sequence_def_with_owner(&blob).expect("decode");
+        assert_eq!((d.id, d.restart_value), (5, 1));
+        assert_eq!(got, Some(o));
+        let unowned = encode_sequence_def(5, &params(), 1, None);
+        assert_eq!(unowned[0], SEQUENCE_DEF_VERSION);
+        assert_eq!(unowned.len(), SEQUENCE_DEF_LEN);
+        assert_eq!(decode_sequence_def_with_owner(&unowned).unwrap().1, None);
+    }
+
+    #[test]
+    fn owned_blob_corruption_is_rejected() {
+        let good = encode_sequence_def(1, &params(), 1, Some(&owner("tbl", "n")));
+        let mut trailing = good.clone();
+        trailing.push(0);
+        let mut bad_len = good.clone();
+        bad_len[SEQUENCE_DEF_LEN] = 200;
+        let mut bad_name = good.clone();
+        bad_name[SEQUENCE_DEF_LEN + 2] = b'"';
+        let mut owned_byte_zero = good.clone();
+        owned_byte_zero[CYCLE_OFFSET + 1] = 0;
+        for b in [
+            trailing,
+            bad_len,
+            bad_name,
+            owned_byte_zero,
+            good[..SEQUENCE_DEF_LEN].to_vec(),
+            good[..good.len() - 1].to_vec(),
+        ] {
+            assert!(matches!(
+                decode_sequence_def_with_owner(&b),
+                Err(CatalogError::CorruptSchema(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn set_owner_validates_table_and_column_and_survives_alter() {
+        let (s, _g) = tmp_storage("seq_owner");
+        s.create_sequence("a", &params()).expect("create");
+        assert!(matches!(
+            s.set_sequence_owner("a", Some(owner("nope", "n"))),
+            Err(CatalogError::TableNotFound(_))
+        ));
+        make_table(&s, "tbl");
+        assert!(matches!(
+            s.set_sequence_owner("a", Some(owner("tbl", "zzz"))),
+            Err(CatalogError::Invalid(_))
+        ));
+        s.set_sequence_owner("a", Some(owner("tbl", "n")))
+            .expect("set");
+        // ALTER SEQUENCE は所有者を引き継ぐ。
+        let alter = SequenceAlter {
+            restart: None,
+            start: None,
+            increment: Some(2),
+            min_value: BoundChange::Keep,
+            max_value: BoundChange::Keep,
+            cycle: None,
+        };
+        s.alter_sequence("a", "t1", &alter).expect("alter");
+        let txn = s.begin_write_txn().expect("txn");
+        let got = owned_sequences_for_tables_in_txn(&txn, &["tbl".to_string()]).expect("list");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].params.increment, 2);
+        drop(txn);
+        // 解除すると列挙されない。
+        s.set_sequence_owner("a", None).expect("unset");
+        let txn = s.begin_write_txn().expect("txn");
+        assert!(
+            owned_sequences_for_tables_in_txn(&txn, &["tbl".to_string()])
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn owned_sequences_are_filtered_by_table_and_ordered_by_id() {
+        let (s, _g) = tmp_storage("seq_owned_list");
+        make_table(&s, "t1");
+        make_table(&s, "t2");
+        for n in ["a", "b", "c"] {
+            s.create_sequence(n, &params()).expect("create");
+        }
+        s.set_sequence_owner("c", Some(owner("t1", "n"))).unwrap();
+        s.set_sequence_owner("a", Some(owner("t1", "n"))).unwrap();
+        s.set_sequence_owner("b", Some(owner("t2", "n"))).unwrap();
+        let ids = |tables: &[&str]| -> Vec<u64> {
+            let txn = s.begin_write_txn().expect("txn");
+            let t: Vec<String> = tables.iter().map(|x| x.to_string()).collect();
+            owned_sequences_for_tables_in_txn(&txn, &t)
+                .expect("list")
+                .iter()
+                .map(|d| d.id)
+                .collect()
+        };
+        let id = |n: &str| s.sequence_definition(n).unwrap().unwrap().0;
+        assert_eq!(ids(&["t1"]), vec![id("a"), id("c")]);
+        assert_eq!(ids(&["t2"]), vec![id("b")]);
+        assert_eq!(ids(&["t1", "t2"]).len(), 3);
+        assert!(ids(&["other"]).is_empty());
+    }
+
+    #[test]
+    fn reset_writes_only_callers_row_with_start() {
+        let (s, _g) = tmp_storage("seq_reset");
+        let p = SequenceParams {
+            start: 50,
+            min_value: 1,
+            ..params()
+        };
+        s.create_sequence("a", &p).expect("create");
+        let def = s.sequence_definition_full("a").unwrap().unwrap();
+        assert_eq!(next(&s, "t1", def.id, &def.params), 50);
+        assert_eq!(next(&s, "t1", def.id, &def.params), 51);
+        assert_eq!(next(&s, "t2", def.id, &def.params), 50);
+        assert_eq!(next(&s, "t2", def.id, &def.params), 51);
+        let txn = s.begin_write_txn().expect("txn");
+        reset_sequence_state_in_txn(&txn, "t1", &def).expect("reset");
+        crate::recovery::commit_boundary::commit_and_finish(txn, (), |()| {
+            s.sequence_allocator().evict_tenant("t1", def.id);
+            crate::recovery::commit_boundary::PostCommitResult::Ok
+        })
+        .expect("commit");
+        assert_eq!(next(&s, "t1", def.id, &def.params), 50);
+        assert_eq!(next(&s, "t2", def.id, &def.params), 52);
     }
 }

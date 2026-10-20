@@ -3865,6 +3865,7 @@ pub(crate) fn execute_truncate_in(
         target,
         &validated.table_names,
         validated.behavior,
+        validated.restart_identity,
         ctx,
         ledger_write,
     )
