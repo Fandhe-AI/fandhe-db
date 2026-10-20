@@ -36,6 +36,37 @@ fn forbid<'a>(owner: &str, mut deps: impl Iterator<Item = &'a str>) -> Result<()
     Ok(())
 }
 
+/// ENUM 型（配列要素を含む）を使う列型か。ENUM 型は全テナント共有のカタログ（public 相当）にだけ
+/// 存在するため、SCHEMA 配下の表がこれを使うと SEQUENCE や FK と同じ「SCHEMA → public」依存になる。
+fn column_type_uses_enum(ty: &crate::catalog::ColumnType) -> bool {
+    match ty {
+        crate::catalog::ColumnType::Enum(_) => true,
+        crate::catalog::ColumnType::Array(a) => a.enum_def().is_some(),
+        _ => false,
+    }
+}
+
+/// [`column_type_uses_enum`] の型名（構文木）版。`ALTER TABLE` の `ADD COLUMN`・型変更が使う。
+fn type_name_uses_enum(ty: &crate::sql::ddl_column_type::SqlColumnTypeName) -> bool {
+    use crate::sql::ddl_column_type::SqlColumnTypeName as T;
+    match ty {
+        T::Enum(_) => true,
+        T::Array { elem, .. } => type_name_uses_enum(elem),
+        T::Alias { target, .. } => type_name_uses_enum(target),
+        _ => false,
+    }
+}
+
+/// SCHEMA 配下の表（`owner`）が ENUM 型を使うことを拒否する。型の存在確認を伴わず（存在オラクルに
+/// しない）、型名の形だけで判定する。DROP TYPE の依存判定が全テナントを走査するため、他テナントの
+/// 非公開の依存の有無が `DROP TYPE` の結果（成功／`2BP01`）で漏れるのを防ぐ（ADR D7）。
+fn forbid_enum(owner: &str, uses_enum: bool) -> Result<(), SqlSurfaceError> {
+    if uses_enum && is_schema_key(owner) {
+        return Err(SqlSurfaceError::SchemaDependencyForbidden);
+    }
+    Ok(())
+}
+
 /// `DEFAULT nextval('<名前>')` が参照する SEQUENCE 名（それ以外のリテラルは `None`）。
 fn sequence_of_literal(literal: Option<&InsertLiteral>) -> Option<&str> {
     match literal {
@@ -52,18 +83,28 @@ pub(crate) fn check_create_table(stmt: &ValidatedCreateTable) -> Result<(), SqlS
         Some(ColumnDefault::Sequence(name)) => Some(name.as_str()),
         _ => None,
     });
-    forbid(&stmt.table_name, fk_parents.chain(sequences))
+    forbid(&stmt.table_name, fk_parents.chain(sequences))?;
+    forbid_enum(
+        &stmt.table_name,
+        stmt.columns.iter().any(|c| column_type_uses_enum(&c.ty)),
+    )
 }
 
 /// `ALTER TABLE`: 追加する外部キーの参照先・`ADD COLUMN`／`SET DEFAULT` の `DEFAULT nextval` が
-/// 表と同じ所属であること。複数アクションは各アクションを検査する。
+/// 表と同じ所属であること。SCHEMA 配下の表への ENUM 型列の追加・型変更も拒否する。複数アクションは各アクションを検査する。
 pub(crate) fn check_alter_table(stmt: &ValidatedAlterTable) -> Result<(), SqlSurfaceError> {
     match stmt {
         ValidatedAlterTable::Multiple(m) => m.actions.iter().try_for_each(check_alter_table),
-        ValidatedAlterTable::AddColumn(a) => forbid(
-            &a.table_name,
-            sequence_of_literal(a.default.as_ref()).into_iter(),
-        ),
+        ValidatedAlterTable::AddColumn(a) => {
+            forbid(
+                &a.table_name,
+                sequence_of_literal(a.default.as_ref()).into_iter(),
+            )?;
+            forbid_enum(&a.table_name, type_name_uses_enum(&a.column_type))
+        }
+        ValidatedAlterTable::AlterColumnType(a) => {
+            forbid_enum(&a.table_name, type_name_uses_enum(&a.column_type))
+        }
         ValidatedAlterTable::AddForeignKey(a) => {
             forbid(&a.table_name, std::iter::once(a.foreign_key.parent_table()))
         }

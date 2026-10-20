@@ -562,6 +562,11 @@ fn resolve(
             "relations in this schema are not supported",
         ));
     }
+    if create_temp {
+        // 一時表は `public` 相当（一時ではない SCHEMA）に置けない。SCHEMA の存否で結果を
+        // 変えないよう、照会の前に固定のエラーで拒否する（`public.t` と同じ経路）。
+        return Err(SqlSurfaceError::invalid_table_definition(name));
+    }
     // `(tenant, schema)` の 1 回の照会。他テナントにしか無い SCHEMA と存在しない SCHEMA は
     // 同じ `3F000`（存在オラクルにしない）。
     let schema_id = match resolver {

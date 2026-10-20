@@ -1438,3 +1438,57 @@ fn default_udf_column_name_is_public_and_set_schema_to_public_is_rejected() {
         "42501"
     );
 }
+
+/// D7: SCHEMA 配下の表は public の ENUM 型（配列を含む）を使えない（`42501`）。使えると、他テナントの
+/// `DROP TYPE` が alice の表の有無で成功／`2BP01` に分かれ存在情報が漏れる。public の表は従来どおり使える。
+#[test]
+fn schema_tables_cannot_depend_on_public_enum_types() {
+    let (core, _g) = new_core("t27-objects-enum-dep");
+    let mut alice = ddl_session();
+    let mut bob = ddl_session();
+    for sql in [
+        "CREATE SCHEMA s",
+        "CREATE TYPE mood AS ENUM ('a', 'b')",
+        "CREATE TABLE s.base (id BIGINT PRIMARY KEY, n TEXT)",
+    ] {
+        ok_as(&core, "alice", &mut alice, sql);
+    }
+    for sql in [
+        "CREATE TABLE s.t (m mood)",
+        "CREATE TABLE s.t2 (m mood[])",
+        "ALTER TABLE s.base ADD COLUMN m mood",
+        "ALTER TABLE s.base ADD COLUMN ms mood[]",
+        "ALTER TABLE s.base ALTER COLUMN n TYPE mood",
+    ] {
+        assert_eq!(
+            run_as(&core, "alice", &mut alice, sql),
+            "ERR 42501",
+            "{sql}"
+        );
+    }
+    // public の表は従来どおり ENUM を使える。
+    ok_as(&core, "alice", &mut alice, "CREATE TABLE pt (m mood)");
+    ok_as(&core, "alice", &mut alice, "DROP TABLE pt");
+    // 依存が作られていないので、他テナントの DROP TYPE の結果は alice の SCHEMA 表の有無と無関係。
+    ok_as(&core, "bob", &mut bob, "DROP TYPE mood");
+}
+
+/// 一時表は SCHEMA 修飾で作れない。存在する SCHEMA でも `public.t` と同じ拒否になる
+/// （内部キーへ書き換わって後段の識別子エラーにならない）。
+#[test]
+fn temp_table_cannot_be_created_in_an_existing_schema() {
+    let (core, _g) = new_core("t27-objects-temp-schema");
+    let mut s = ddl_session();
+    ok(&core, &mut s, "CREATE SCHEMA s");
+    let public = code(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE public.t (id BIGINT PRIMARY KEY)",
+    );
+    let schema = code(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE s.t (id BIGINT PRIMARY KEY)",
+    );
+    assert_eq!(schema, public);
+}
