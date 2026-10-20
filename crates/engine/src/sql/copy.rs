@@ -621,6 +621,16 @@ fn bind_copy_record(
         Some(clock),
         false,
     )?;
+    // `DEFAULT nextval` の列は COPY では採番しない（TABLE-24・Issue #1690。fail-closed）。
+    if volatile_default_columns.iter().any(|c| {
+        matches!(
+            c,
+            crate::sql::parser::VolatileColumn::DefaultSequence(_)
+                | crate::sql::parser::VolatileColumn::Sequence(..)
+        )
+    }) {
+        return Err(crate::sql::parser::reject_sequence_call_literal());
+    }
 
     Ok(BoundInsert {
         table: table_name.to_string(),

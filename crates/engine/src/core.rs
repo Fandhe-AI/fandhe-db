@@ -1682,6 +1682,13 @@ pub enum ParsedSql {
     DropSequence(crate::sql::allowlist::ValidatedDropSequence),
     /// `ALTER SEQUENCE`（TABLE-24、Issue #1689）。
     AlterSequence(crate::sql::allowlist::ValidatedAlterSequence),
+    /// `SELECT setval('<名>', <n>[, <is_called>])`／`SELECT lastval()` の単独形（TABLE-24・
+    /// ERR-6、Issue #1691）。書き込み txn を伴うため、ストレージに触れない `ConstSelect`（#1531）
+    /// には乗せない。結果は 1 行 1 列の `bigint`（`SqlOutcome::Query`）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1691）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    SequenceFunction(crate::sql::allowlist::ValidatedSequenceFunction),
 }
 
 /// 読み取り文（[`ParsedSql::Statement`]）と書き込み文（INSERT／UPDATE／DELETE の原子版）が
@@ -1758,7 +1765,8 @@ fn statement_clock_scope(
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
-        | ParsedSql::AlterSequence(_) => false,
+        | ParsedSql::AlterSequence(_)
+        | ParsedSql::SequenceFunction(_) => false,
     };
     if !is_read {
         return Ok(None);
@@ -1770,6 +1778,55 @@ fn statement_clock_scope(
             stmt_start_micros,
         },
     )))
+}
+
+/// INSERT 文だけが SEQUENCE の採番文脈（アロケータとセッションの `currval` 状態）を持つ
+/// スコープを開く（TABLE-24・Issue #1690。許可リスト型の fail-closed）。`tenant` の INSERT 書き込みが
+/// 台帳照合の後に読む（`sql::sequence_scope`）。autocommit・明示トランザクションの両入口が呼ぶ。
+/// `ParsedSql` を網羅 `match` にして variant 追加時の判定漏れをコンパイルエラーで検出する。
+fn insert_sequence_scope(
+    storage: &Storage,
+    session: &crate::sql::mode::SessionState,
+    parsed: &ParsedSql,
+) -> Option<crate::sql::sequence_scope::SequenceScope> {
+    let is_insert = match parsed {
+        ParsedSql::SessionRouted(routed) => {
+            return insert_sequence_scope(storage, session, routed.inner())
+        }
+        ParsedSql::Insert(_) | ParsedSql::ViewInsert(_) => true,
+        ParsedSql::Statement(_)
+        | ParsedSql::Truncate(_)
+        | ParsedSql::Delete(_)
+        | ParsedSql::Update(_)
+        | ParsedSql::ViewDelete(_)
+        | ParsedSql::ViewUpdate(_)
+        | ParsedSql::Transaction(_)
+        | ParsedSql::DropTable(_)
+        | ParsedSql::CreateTable(_)
+        | ParsedSql::CreateTempTable(_)
+        | ParsedSql::Cursor(_)
+        | ParsedSql::Partitioned(_)
+        | ParsedSql::AlterTable(_)
+        | ParsedSql::CreateView(_)
+        | ParsedSql::DropView(_)
+        | ParsedSql::DropMaterializedView(_)
+        | ParsedSql::CreateMaterializedView(_)
+        | ParsedSql::RefreshMaterializedView(_)
+        | ParsedSql::CreateIndex(_)
+        | ParsedSql::DropIndex(_)
+        | ParsedSql::CreateType(_)
+        | ParsedSql::DropType(_)
+        | ParsedSql::CreateSequence(_)
+        | ParsedSql::DropSequence(_)
+        | ParsedSql::AlterSequence(_)
+        | ParsedSql::SequenceFunction(_) => false,
+    };
+    is_insert.then(|| {
+        crate::sql::sequence_scope::SequenceScope::enter(
+            std::sync::Arc::clone(storage.sequence_allocator()),
+            session.sequences_handle(),
+        )
+    })
 }
 
 /// INSERT 文だけが列 `DEFAULT now()` 系の評価時刻を持つ束縛スコープを開く（SQL-37・
@@ -1812,7 +1869,8 @@ fn insert_default_clock_scope(
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
-        | ParsedSql::AlterSequence(_) => false,
+        | ParsedSql::AlterSequence(_)
+        | ParsedSql::SequenceFunction(_) => false,
     };
     if !is_insert {
         return Ok(None);
@@ -4237,6 +4295,14 @@ impl EngineCore {
             return Ok(ParsedSql::Transaction(ctrl));
         }
 
+        // TABLE-24・Issue #1691: `SELECT setval(...)`／`SELECT lastval()` は専用の検証器で受理するか
+        // 拒否する。`ConstSelect` の一般経路へ流すと書き込みを伴う関数が式として評価されうるため、
+        // 先頭がこの形なら必ずここで結論を出す（fail-closed）。
+        if crate::sql::allowlist::is_sequence_function_select(&tokens) {
+            let stmt = crate::sql::allowlist::validate_sequence_function_tokens(&tokens)?;
+            return Ok(ParsedSql::SequenceFunction(stmt));
+        }
+
         // TABLE-33・Issue #1575: `SHOW timezone`／`SHOW TIME ZONE` は分割実行 DML の `SHOW` より
         // 先に厳密一致で取り出す（それ以外の `SHOW` の挙動は変えない）。
         if crate::sql::allowlist::is_show_time_zone(&tokens) {
@@ -4680,6 +4746,19 @@ impl EngineCore {
             return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                 "bind parameters are not supported in CREATE VIEW / DROP VIEW / CREATE TYPE / DROP TYPE",
             ));
+        }
+        // TABLE-24・Issue #1691: `setval`／`lastval` は実値を要する構文形のため `$n` を一律 `0A000` で
+        // 拒否する（ダミー置換より前に判定する。位置検査の `42601` より優先）。
+        if crate::sql::allowlist::is_sequence_function_select(&tokens)
+            && tokens
+                .iter()
+                .any(|t| matches!(t, crate::sql::lexer::Token::Param(_)))
+        {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "bind parameters are not supported in setval / lastval",
+                ),
+            );
         }
         let param_count = crate::sql::params::validate_param_positions(&tokens)?;
         // Issue #927・SQL-29 (a)・TASK-213（拡張クエリプロトコルの注意点）:
@@ -5183,6 +5262,8 @@ impl EngineCore {
         let _session_tz_scope = session_time_zone_scope(session);
         // SQL-37・Issue #1587: INSERT の列 `DEFAULT now()` 系の評価時刻（autocommit は文の開始時刻）。
         let _default_clock_scope = insert_default_clock_scope(parsed, None)?;
+        // TABLE-24・Issue #1690: INSERT の `nextval`／`currval`（VALUES・列 DEFAULT）の採番文脈。
+        let _sequence_scope = insert_sequence_scope(&self.storage, session, parsed);
         match parsed {
             ParsedSql::Insert(stmt) => {
                 // Issue #933: Parse 時点のスキーマキャッシュ（`InsertSchemaLookup`）
@@ -5547,6 +5628,17 @@ impl EngineCore {
                     crate::sql::ddl::execute_alter_sequence(&self.storage, ctx.tenant_id(), stmt)?;
                 Ok(crate::sql::SqlOutcome::AlterSequence(outcome))
             }
+            // TABLE-24・Issue #1691: `setval`／`lastval`。DDL 権限ゲートはかけない（作用範囲が呼び出し元
+            // テナントに閉じるため。設計記録 §10）。
+            ParsedSql::SequenceFunction(stmt) => {
+                let result = crate::sql::sequence_fn::execute_autocommit(
+                    &self.storage,
+                    session,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
             }
@@ -5781,6 +5873,8 @@ impl EngineCore {
                     })?,
             ),
         )?;
+        // TABLE-24・Issue #1690: INSERT の `nextval`／`currval`（VALUES・列 DEFAULT）の採番文脈。
+        let _sequence_scope = insert_sequence_scope(&self.storage, session, parsed);
 
         // 注意（Issue #1182・#1272）: 明示トランザクション内の `RETURNING` は `INSERT`
         // （単一行・複数行）・`DELETE`・`UPDATE`（単一行・述語形）・UPSERT に対応する
@@ -5976,6 +6070,25 @@ impl EngineCore {
             }
             ParsedSql::SessionRouted(routed) => {
                 self.execute_temp_routed_in_txn(ctx, session, txn, routed)
+            }
+            // TABLE-24・Issue #1691: 共有 write txn へ状態行を書く（commit は COMMIT 時）。表を書かないため
+            // `mark_written` の相手がなく、`has_writes` だけを立てる（立てないと COMMIT が write txn を
+            // 破棄して setval の永続化が落ちる）。`lastval` は読み取りのみで印を付けない。
+            ParsedSql::SequenceFunction(stmt) => {
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let (result, wrote) = crate::sql::sequence_fn::execute_in_txn(
+                    &self.storage,
+                    write_txn,
+                    session,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                if wrote {
+                    txn.mark_sequence_written();
+                }
+                Ok(crate::sql::SqlOutcome::Query(result))
             }
             // COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
@@ -6747,6 +6860,8 @@ impl EngineCore {
             ParsedSql::CreateSequence(_) => Ok(None),
             ParsedSql::DropSequence(_) => Ok(None),
             ParsedSql::AlterSequence(_) => Ok(None),
+            // Issue #1691: 結果列（1 列・bigint）だけを返し、`setval` の書き込みは実行しない。
+            ParsedSql::SequenceFunction(stmt) => Ok(Some(crate::sql::sequence_fn::columns(stmt))),
             ParsedSql::Delete(DeleteStatement::SingleRow(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
                 match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {
@@ -10080,6 +10195,25 @@ impl EngineCore {
                         "INSERT batch row byte size overflow",
                     )
                 })?;
+            }
+            // 採番の印（`nextval`／`currval`・`DEFAULT nextval`）の列は仮値 `Null`（0 バイト計上）で
+            // 運ばれるが、書き込み時は整数 1 値が入る。採番せずに固定幅の上限（BIGINT 相当の 8 バイト。
+            // SMALLINT／INTEGER 列でも上限側へ倒す fail-closed）を計上し、INDEX-4 の行別・バッチ合計
+            // バイト上限を迂回できないようにする（Issue #1690・codex-review P1）。
+            for volatile in &bound.volatile_default_columns {
+                if matches!(
+                    volatile,
+                    crate::sql::parser::VolatileColumn::Sequence(..)
+                        | crate::sql::parser::VolatileColumn::DefaultSequence(_)
+                ) {
+                    row_bytes = row_bytes
+                        .checked_add(std::mem::size_of::<i64>())
+                        .ok_or_else(|| {
+                            crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                                "INSERT batch row byte size overflow",
+                            )
+                        })?;
+                }
             }
             shapes.push((0, row_bytes));
         }

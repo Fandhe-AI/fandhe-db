@@ -78,8 +78,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1128（`begin_partitioned_chunk_txn` の追加）で行番号が移動したための追随（旧: 820／851）。
     // TABLE-44・Issue #1684（`Storage::from_db`・`open_with_backend` の追加）で行番号が移動した
     // ための追随（旧: 930／961）。
-    ("storage.rs", 950),
-    ("storage.rs", 981),
+    // Issue #1690（`Storage::sequence_allocator` の追加）で行番号が移動したための追随（旧: 950／981）。
+    // PR #2566 レビュー対応（一時 DB 判定 `Storage::is_temp_scoped` の追加。+12 行）で追随（旧: 963／994）。
+    ("storage.rs", 975),
+    ("storage.rs", 1006),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 201),
     ("txn.rs", 372),
@@ -214,7 +216,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1648（式索引の永続形 v4・`create_index_bound`・列依存ヘルパー。`catalog.rs` に行が追加）で一括追随（旧: 10204／12585／12666／12775／12847／13243）。
     // Issue #1651（式索引の UNIQUE・列変更への追随。`catalog.rs` に行が追加）で一括追随（旧: 10597／12994／13075／13184／13257／13779）。
     // Issue #1651（式索引の UNIQUE・失効管理。`catalog.rs` に行が追加）で一括追随（旧: 13274／13355／13464／13537／14080／10874）。
-    ("catalog.rs", 13757),
+    ("catalog.rs", 13820),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -281,7 +283,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+101 行。旧: 11250）。
-    ("catalog.rs", 13838),
+    ("catalog.rs", 13901),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -341,7 +343,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+131 行。旧: 11389）。
-    ("catalog.rs", 13969),
+    ("catalog.rs", 14032),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -410,15 +412,15 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1644（TRUNCATE CASCADE／RESTRICT）で catalog.rs 全エントリ +1・tenant.rs 506→516 に追随。
     // Issue #1663（MATERIALIZED VIEW のカタログ追加）の base 取り込みで追随（旧: 13013）。
     // Issue #1671（ビュー INSERT 書き換えで `catalog.rs` に行が追加）で全エントリを追随。
-    ("catalog.rs", 14043),
+    ("catalog.rs", 14106),
     // `Storage::create_or_replace_view_checked`（TABLE-41 (2)、Issue #1660。`create_or_replace_view` の本体）: `create_view` と同じく
     // `[VIEWS_TABLE]` のみを書く（上書き）。ビューは行ストア・世代を持たないためバンプ対象がない。
-    ("catalog.rs", 14675),
+    ("catalog.rs", 14738),
     // `Storage::drop_tables`（Issue #1684 で本体を `drop_tables_in_txn` へ切り出した）: 世代 bump は
     // 同一 write txn で先に呼ばれる `drop_tables_in_txn` 内（削除する各表と FK を外した参照元表）で
     // 行われ、本呼び出しはその結果（`dropped > 0`）を単一 commit で確定させるだけ。`bump` が
     // 直前 60 行の外（別関数）へ移ったための許可。
-    ("catalog.rs", 11323),
+    ("catalog.rs", 11370),
     // 上記 `drop_tables_in_txn` 切り出し（+18 行）に伴い、以降の catalog.rs エントリ（12419／12500／12609／12681／13063）を追随（旧: 12401／12482／12591／12663／13045）。
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
@@ -441,7 +443,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1553（明示トランザクションの最大時間・最大文数の CLI 設定化）の行追加でさらに移動（旧: 793）。
     // TABLE-44・Issue #1684（一時表の DML）: `commit_active` に一時側の確定・`ON COMMIT` 適用が加わり
     // 行が移動したための追随（旧: 899）。書き込み内容・commit の意味は不変。
-    ("sql/transaction.rs", 955),
+    ("sql/transaction.rs", 964),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が
@@ -485,19 +487,32 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `TxnEffect::Wrote` を返す構造になった（回帰ではなく構造変更への追随。旧: 453・466）。
     // Issue #2328 等の base 取り込みと Issue #1544 の追加で行が移動したための追随（旧: 493）。
     // Issue #1671（ビュー書き込みの定義照合 `verify_view_write_scope` 追加。+3 行）で追随（旧: 526）。
-    ("tenant.rs", 534),
+    // Issue #1690（`TenantWriteError::SequenceEvaluationFailed` の追加。+10 行）で追随（旧: 529）。
+    ("tenant.rs", 544),
     // Issue #1688（SEQUENCE のカタログ）: `catalog/sequence.rs` の `create_sequence`／`drop_sequence` は
     // SEQUENCE の定義表・状態表・ID カウンタだけを書く。表の行スキーマ（`user_rows/{table}`）も
-    // 表のスキーマ世代も変えないため、`bump_table_generation_in_txn` を伴わない。末尾 2 件は
-    // 同ファイルの `#[cfg(test)]` 内（状態行の種まき）で、同じ理由で対象外。
-    // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence` も同じ表だけを書く
+    // 表のスキーマ世代も変えないため、`bump_table_generation_in_txn` を伴わない。Issue #1690 の
+    // 採番（`SequenceAllocator`）も状態表だけを書く（コミットは呼び出し側の INSERT の txn）。
+    // 先頭 4 件が本体（`create_sequence`／`drop_sequence`／`alter_sequence`／`rename_sequence`）、残りは同ファイルの `#[cfg(test)]` 内
+    // （状態行の種まき・採番の永続化確認）で、同じ理由で対象外。
+    // Issue #1690（nextval／currval）の行追加で行番号が移動したための追随（旧: 699／720／763／798）。
+    // Issue #1691（setval）: `set_sequence_value`（996）も状態表だけを書くため同じ理由で対象外。行追加に伴い
+    // 他の行番号が移動したため追随（旧: 730／754／803／842／897／1171／1257／1297／1350／1618）。末尾の 2 件
+    // （1784・1829）は同ファイルの `#[cfg(test)]` 内（旧 1618 の移動分と setval の単体テストの補助関数）。
+    ("catalog/sequence.rs", 864),
+    ("catalog/sequence.rs", 888),
+    ("catalog/sequence.rs", 937),
+    ("catalog/sequence.rs", 976),
+    ("catalog/sequence.rs", 996),
+    ("catalog/sequence.rs", 1063),
+    ("catalog/sequence.rs", 1337),
+    ("catalog/sequence.rs", 1423),
+    ("catalog/sequence.rs", 1463),
+    ("catalog/sequence.rs", 1516),
+    ("catalog/sequence.rs", 1784),
+    ("catalog/sequence.rs", 1829),
+    // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
-    ("catalog/sequence.rs", 507),
-    ("catalog/sequence.rs", 528),
-    ("catalog/sequence.rs", 566),
-    ("catalog/sequence.rs", 601),
-    ("catalog/sequence.rs", 656),
-    ("catalog/sequence.rs", 1051),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
