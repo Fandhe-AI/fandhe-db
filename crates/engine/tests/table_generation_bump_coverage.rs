@@ -522,20 +522,21 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （`create_table_with_implicit_sequences` の commit は直前で表の世代を bump するため対象外）。
     // Issue #1695（IDENTITY 列の暗黙 SEQUENCE 宣言 `ImplicitSequence` の追加）で行番号が移動したための追随。
     // Issue #1698（`mod migrated_identity;` の追加。+2 行）で追随（旧: 1256〜）。
-    ("catalog/sequence.rs", 1275),
-    ("catalog/sequence.rs", 1288),
-    ("catalog/sequence.rs", 1336),
-    ("catalog/sequence.rs", 1385),
-    ("catalog/sequence.rs", 1424),
-    ("catalog/sequence.rs", 1444),
-    ("catalog/sequence.rs", 1546),
-    ("catalog/sequence.rs", 1820),
-    ("catalog/sequence.rs", 1910),
-    ("catalog/sequence.rs", 1950),
-    ("catalog/sequence.rs", 2003),
-    ("catalog/sequence.rs", 2271),
-    ("catalog/sequence.rs", 2316),
-    ("catalog/sequence.rs", 2583),
+    // Issue #1698（`sequence_has_dependents_in_txn` の移行表依存判定の追加。+5 行）で追随（旧: 1275〜）。
+    ("catalog/sequence.rs", 1280),
+    ("catalog/sequence.rs", 1293),
+    ("catalog/sequence.rs", 1341),
+    ("catalog/sequence.rs", 1390),
+    ("catalog/sequence.rs", 1429),
+    ("catalog/sequence.rs", 1449),
+    ("catalog/sequence.rs", 1551),
+    ("catalog/sequence.rs", 1825),
+    ("catalog/sequence.rs", 1915),
+    ("catalog/sequence.rs", 1955),
+    ("catalog/sequence.rs", 2008),
+    ("catalog/sequence.rs", 2276),
+    ("catalog/sequence.rs", 2321),
+    ("catalog/sequence.rs", 2588),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
 ];
