@@ -420,6 +420,47 @@ fn multi_action_drop_serial_column_and_add_column() {
     assert_eq!(code(&core, "sys", "DROP SEQUENCE t_n_seq"), "42P01");
 }
 
+/// 複数アクションで、所有 SEQUENCE を参照する別列の DROP COLUMN と同じ文に書けば、記述順によらず
+/// 依存は残らず通る。DROP DEFAULT を併用しても通り、依存が残る場合は 2BP01 で何も適用しない。
+#[test]
+fn multi_action_drop_checks_dependents_after_all_actions() {
+    for (i, alter) in [
+        "ALTER TABLE t DROP COLUMN n, DROP COLUMN m",
+        "ALTER TABLE t DROP COLUMN m, DROP COLUMN n",
+        "ALTER TABLE t DROP COLUMN n, ALTER COLUMN m DROP DEFAULT",
+        "ALTER TABLE t ALTER COLUMN m DROP DEFAULT, DROP COLUMN n",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (_p, _g, core) = fixture(&format!("serial-multi-dep-{i}"));
+        ok(
+            &core,
+            "sys",
+            "CREATE TABLE t (n SERIAL, m BIGINT DEFAULT nextval('t_n_seq'), v TEXT)",
+        );
+        ok(&core, "sys", alter);
+        assert_eq!(
+            code(&core, "sys", "DROP SEQUENCE t_n_seq"),
+            "42P01",
+            "{alter}"
+        );
+    }
+    // 依存が残る場合は拒否され、何も適用されない。
+    let (_p, _g, core) = fixture("serial-multi-dep-kept");
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE t (n SERIAL, m BIGINT DEFAULT nextval('t_n_seq'), v TEXT)",
+    );
+    assert_eq!(
+        code(&core, "sys", "ALTER TABLE t DROP COLUMN n, DROP COLUMN v"),
+        "2BP01"
+    );
+    insert_t(&core, "alice", 1, "a1");
+    assert_eq!(column_n(&core, "alice"), vec![1]);
+}
+
 /// 単独・複数アクションの DROP COLUMN は、所有 SEQUENCE のメモリ上のカーソルも commit 後に捨てる。
 #[test]
 fn drop_column_evicts_sequence_cursors() {

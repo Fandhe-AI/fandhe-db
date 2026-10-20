@@ -11999,6 +11999,23 @@ impl Storage {
         .map_err(convert_storage_error)
     }
 
+    /// 複数アクション `ALTER TABLE` で削除した列（`columns`）が所有する SEQUENCE を、全アクション適用後の
+    /// スキーマに対して依存検査したうえで同じ txn で削除する（Issue #1694。`DROP COLUMN` 直後に検査すると、
+    /// 同じ文で除去される `DEFAULT nextval` 依存まで `2BP01` になり記述順で結果が変わるため）。
+    /// 返す内部 ID は commit 成功後に `SequenceAllocator::evict` するための値。
+    pub(crate) fn drop_owned_sequences_of_columns_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        columns: &[String],
+    ) -> Result<Vec<u64>> {
+        if columns.is_empty() {
+            return Ok(Vec::new());
+        }
+        sequence::drop_owned_sequences_in_txn(write_txn, |owner| {
+            owner.table == table_name && columns.contains(&owner.column)
+        })
+    }
+
     /// 複数アクション `ALTER TABLE` の最後に呼ぶ検証。txn 内の現在のスキーマに生存列が 1 本以上
     /// あることを確かめ、0 本なら `Invalid`（SQL 表層で `42601`）で拒否する（Issue #1633。
     /// `defer_live_check` で保留した中間検証の本検証。fail-closed）。
@@ -12030,6 +12047,26 @@ impl Storage {
         table_name: &str,
         column_name: &str,
         defer_live_check: bool,
+    ) -> Result<Vec<u64>> {
+        Self::alter_table_drop_column_core_in_txn(
+            write_txn,
+            table_name,
+            column_name,
+            defer_live_check,
+            true,
+        )
+    }
+
+    /// [`Self::alter_table_drop_column_in_txn`] の実体。`drop_owned_sequences = false` は複数アクション
+    /// 経路専用で、所有 SEQUENCE の削除と依存検査を行わない（空の ID 列を返す）。同じ文の後続アクション
+    /// （別列の `DROP COLUMN`・`DROP DEFAULT` 等）が依存を除去しうるため、呼び出し側が全アクション適用後に
+    /// [`Self::drop_owned_sequences_of_columns_in_txn`] で一括して検査・削除する（Issue #1694）。
+    pub(crate) fn alter_table_drop_column_core_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        column_name: &str,
+        defer_live_check: bool,
+        drop_owned_sequences: bool,
     ) -> Result<Vec<u64>> {
         {
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
@@ -12159,6 +12196,9 @@ impl Storage {
         // 削除した列を含む索引宣言（TASK-206・INDEX-7、Issue #908）も同一 txn で
         // 削除する（[`delete_indexes_referencing_column_in_txn`] 参照）。
         delete_indexes_referencing_column_in_txn(write_txn, table_name, column_name)?;
+        if !drop_owned_sequences {
+            return Ok(Vec::new());
+        }
         // 列が所有する SEQUENCE（SERIAL 列等。TABLE-24・Issue #1694）も同じ txn で削除する（PostgreSQL
         // と同じ。所有者が宙に浮く状態を作らない）。他の列の `DEFAULT nextval` が参照していれば
         // `DependentObjectsStillExist`。削除した内部 ID は呼び出し側へ返し、commit 成功後に
