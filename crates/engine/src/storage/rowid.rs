@@ -94,6 +94,30 @@ pub(crate) fn split_row_key(key: (&str, u64)) -> (&str, RowId) {
     (key.0, RowId(key.1))
 }
 
+/// 分割実行 DML のカーソル（Issue #2196・TABLE-23 (5)）用の入出口と範囲端。
+///
+/// 呼び出し元は `recovery::partitioned_job`（ジョブ記録の符号化・走査範囲）と
+/// `tenant::partitioned_dml`（実行器）のみ。ジョブ記録の永続バイト列は「行ストア物理キーの
+/// `u64` 要素と同一の値」を 8 バイト LE で持つ形式で、本入出口はその値を変えない
+/// （旧バイナリが書いた記録がそのまま読める）。
+impl RowId {
+    /// 物理キー範囲の下端（最小の rowid）。
+    pub(crate) const MIN: Self = Self(0);
+
+    /// 物理キー範囲の上端（最大の rowid）。分割実行では「走査し尽くした」印として使う。
+    pub(crate) const MAX: Self = Self(u64::MAX);
+
+    /// ジョブ記録から読んだ生値をカーソルの rowid へ戻す（`partitioned_job` の decode 専用）。
+    pub(crate) const fn from_job_cursor_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// カーソルの rowid をジョブ記録へ書く生値へ変える（`partitioned_job` の encode 専用）。
+    pub(crate) const fn to_job_cursor_raw(self) -> u64 {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +154,14 @@ mod tests {
         let b = RowId::from_legacy_id(u64::MAX);
         assert!(a < b);
         assert!(row_key("t", a) < row_key("t", b));
+    }
+
+    #[test]
+    fn job_cursor_raw_roundtrip_and_range_ends() {
+        let r = RowId::from_job_cursor_raw(0x0102_0304_0506_0708);
+        assert_eq!(r.to_job_cursor_raw(), 0x0102_0304_0506_0708);
+        assert_eq!(row_key("t", RowId::MAX), ("t", u64::MAX));
+        assert_eq!(row_key("t", RowId::MIN), ("t", 0));
+        assert!(RowId::MIN < r && r < RowId::MAX);
     }
 }

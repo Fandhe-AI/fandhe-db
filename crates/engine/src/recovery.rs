@@ -51,3 +51,5 @@ pub mod panic_hook;
 pub(crate) mod partitioned_job;
 pub mod required_op_id;
 pub mod stderr_log;
+#[cfg(test)]
+mod table23_ledger_compat_tests;

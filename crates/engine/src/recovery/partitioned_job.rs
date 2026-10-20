@@ -40,6 +40,9 @@
 //! 4. 行変更・カーソル・件数・台帳・完了記録への縮小は呼び出し元の同一 write txn で
 //!    行い、commit は呼び出し元の 1 回（原子性・二重適用／取りこぼしの排除）。
 //! 5. 永続値のデコードは fail-closed（未知のバージョン・状態・長さは拒否）。
+//! 6. カーソルは行ストアの物理 rowid（[`RowId`]。Issue #2196・TABLE-23 (5)）。永続形式は
+//!    rowid の生値 8 バイト LE で従来の `id` 値と同一バイト（旧記録がそのまま読める。
+//!    golden: `persisted_job_record_bytes_are_golden`）。応答・エラー・EXPLAIN・SHOW には出さない。
 //!
 //! 2 つのテーブル名は `op_ledger` と同じくユーザーテーブルの一覧には現れない。
 
@@ -54,6 +57,7 @@ use crate::policy::PolicyContext;
 use crate::recovery::content_hash::ContentHash;
 use crate::recovery::ledger::LedgerRecordError;
 use crate::recovery::required_op_id::OperationId;
+use crate::storage::rowid::{row_key, RowId};
 use crate::storage::StorageError;
 
 /// ジョブ表（Issue #1127・A1）。キーは `(tenant_id, table_name, operation_id)`、
@@ -193,8 +197,10 @@ pub(crate) enum JobRecord {
     /// カーソルを持つ記録（実行中または中断。区別は [`derive_status`]）。
     Running {
         hash: [u8; 32],
-        /// 最後に走査した id（下端排他で次チャンクを走査する。`u64::MAX` は取らない）。
-        cursor: u64,
+        /// 最後に走査した物理 rowid（下端排他で次チャンクを走査する。[`RowId::MAX`] は取らない。
+        /// 永続形式は rowid の生値 8 バイト LE で従来から不変。応答・エラー・EXPLAIN・SHOW には
+        /// 出さない。TABLE-23・SQL-32 のポインタ）。
+        cursor: RowId,
         /// commit 済みの処理済み（変更）件数。
         processed: u64,
         /// 時刻値関数を含む文のジョブ開始時に確定した固定時刻（UTC マイクロ秒。設計 D6）。
@@ -237,7 +243,7 @@ fn encode_record(record: &JobRecord) -> Vec<u8> {
         } => {
             buf.push(STATE_RUNNING);
             buf.extend_from_slice(hash);
-            buf.extend_from_slice(&cursor.to_le_bytes());
+            buf.extend_from_slice(&cursor.to_job_cursor_raw().to_le_bytes());
             buf.extend_from_slice(&processed.to_le_bytes());
             if let Some(t) = fixed_time {
                 buf.extend_from_slice(&t.to_le_bytes());
@@ -258,7 +264,7 @@ fn encode_record(record: &JobRecord) -> Vec<u8> {
 }
 
 /// 値のデコード。空値・未知のバージョン／状態・長さ不一致・`Running` の
-/// `cursor == u64::MAX`（その範囲は走査し尽くしており `Running` のまま残らない）を
+/// `cursor == RowId::MAX`（その範囲は走査し尽くしており `Running` のまま残らない）を
 /// すべて拒否する（fail-closed。添字アクセス・`unwrap` は使わない）。
 fn decode_record(value: &[u8]) -> Result<JobRecord, PartitionedJobError> {
     let bad = || PartitionedJobError::corrupt("partitioned job record is malformed");
@@ -286,8 +292,8 @@ fn decode_record(value: &[u8]) -> Result<JobRecord, PartitionedJobError> {
             } else {
                 return Err(bad());
             };
-            let cursor = u64::from_le_bytes(*cursor);
-            if cursor == u64::MAX {
+            let cursor = RowId::from_job_cursor_raw(u64::from_le_bytes(*cursor));
+            if cursor == RowId::MAX {
                 return Err(bad());
             }
             Ok(JobRecord::Running {
@@ -315,29 +321,30 @@ fn decode_record(value: &[u8]) -> Result<JobRecord, PartitionedJobError> {
     }
 }
 
-/// [`chunk_range`] の戻り値（行ストアの `(tenant, id)` キー範囲）。
+/// [`chunk_range`] の戻り値（行ストアの物理キー `(tenant, rowid の生値)` の範囲。
+/// キーの組み立ては [`row_key`] を通す）。
 pub(crate) type ChunkRange<'a> = (Bound<(&'a str, u64)>, Bound<(&'a str, u64)>);
 
-/// 次チャンクの走査範囲（行ストアの `(tenant, id)` キー用。A3）。
+/// 次チャンクの走査範囲（行ストアの物理キー `(tenant, rowid)` 用。A3）。
 ///
-/// 下端は `cursor` を**排他**にし、`cursor + 1` の加算はしない（`u64::MAX` の id を
+/// 下端は `cursor` を**排他**にし、`cursor + 1` の加算はしない（最大 rowid の行を
 /// 取りこぼさず、加算あふれも起こさない）。`cursor == None` は先頭から。
-/// `Some(u64::MAX)` は走査済みで `None`（範囲なし）を返す。上端は常に
-/// `(tenant, u64::MAX)` の閉区間でテナント境界の内側に収まる。
-pub(crate) fn chunk_range(tenant: &str, cursor: Option<u64>) -> Option<ChunkRange<'_>> {
+/// `Some(RowId::MAX)` は走査済みで `None`（範囲なし）を返す。上端は常に
+/// `(tenant, RowId::MAX)` の閉区間でテナント境界の内側に収まる。
+pub(crate) fn chunk_range(tenant: &str, cursor: Option<RowId>) -> Option<ChunkRange<'_>> {
     let lower = match cursor {
-        None => Bound::Included((tenant, 0)),
-        Some(u64::MAX) => return None,
-        Some(c) => Bound::Excluded((tenant, c)),
+        None => Bound::Included(row_key(tenant, RowId::MIN)),
+        Some(RowId::MAX) => return None,
+        Some(c) => Bound::Excluded(row_key(tenant, c)),
     };
-    Some((lower, Bound::Included((tenant, u64::MAX))))
+    Some((lower, Bound::Included(row_key(tenant, RowId::MAX))))
 }
 
 /// 照会用の見かけの状態（[`derive_status`] が導出する。永続化しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JobStatus {
     Running { processed: u64 },
-    Interrupted { processed: u64, cursor: u64 },
+    Interrupted { processed: u64, cursor: RowId },
     Cancelled { committed: u64 },
     Completed { total: u64 },
 }
@@ -381,7 +388,7 @@ pub(crate) enum ResendDecision {
     /// `Running`（中断）でハッシュ一致。カーソルから再開する。`fixed_time` は記録済みの
     /// 固定時刻（時刻値関数を含まない文は `None`。設計 D6）。
     Resume {
-        cursor: u64,
+        cursor: RowId,
         processed: u64,
         fixed_time: Option<i64>,
     },
@@ -543,7 +550,7 @@ pub(crate) enum ChunkCommitOutcome {
 
 /// チャンクの行変更と**同じ write txn** の中で、カーソルと処理済み件数を記録する
 /// （A2・A8）。commit は呼び出し元（#1128）が 1 回だけ行う。`last_scanned` はこの
-/// チャンクで最後に走査した id（`u64::MAX` は走査し尽くした最後のチャンクなので
+/// チャンクで最後に走査した物理 rowid（[`RowId::MAX`] は走査し尽くした最後のチャンクなので
 /// [`complete_in_txn`] を使う）。
 ///
 /// - 記録なしで `rows_changed == 0`: 何も書かない（ジョブ記録は最初に行を変更した
@@ -560,11 +567,11 @@ pub(crate) fn record_chunk_progress_in_txn(
     key: &JobKey<'_>,
     hash: &ContentHash,
     rows_changed: u64,
-    last_scanned: u64,
+    last_scanned: RowId,
     interrupted_limit: u64,
     fixed_time: Option<i64>,
 ) -> Result<ChunkCommitOutcome, PartitionedJobError> {
-    if last_scanned == u64::MAX {
+    if last_scanned == RowId::MAX {
         // この範囲は走査し尽くしており、`Running` には縮約できない。
         return Err(PartitionedJobError::StateConflict);
     }
@@ -1049,6 +1056,12 @@ mod tests {
         OperationId::parse(id).expect("valid operation_id")
     }
 
+    fn rid(n: u64) -> RowId {
+        RowId::from_legacy_id(n)
+    }
+
+    const CURSOR: RowId = RowId::from_job_cursor_raw(0x0102_0304_0506_0708);
+
     fn hash(seed: &str) -> ContentHash {
         ContentHash::for_test(seed.as_bytes())
     }
@@ -1112,7 +1125,7 @@ mod tests {
         for r in [
             JobRecord::Running {
                 hash: h,
-                cursor: 42,
+                cursor: rid(42),
                 processed: 9,
                 fixed_time: None,
             },
@@ -1133,7 +1146,7 @@ mod tests {
         let h = [7u8; 32];
         let with_time = JobRecord::Running {
             hash: h,
-            cursor: 42,
+            cursor: rid(42),
             processed: 9,
             fixed_time: Some(-5),
         };
@@ -1144,7 +1157,7 @@ mod tests {
 
         let without = JobRecord::Running {
             hash: h,
-            cursor: 42,
+            cursor: rid(42),
             processed: 9,
             fixed_time: None,
         };
@@ -1160,7 +1173,7 @@ mod tests {
         let h = [1u8; 32];
         let good = encode_record(&JobRecord::Running {
             hash: h,
-            cursor: 1,
+            cursor: rid(1),
             processed: 1,
             fixed_time: Some(7),
         });
@@ -1173,7 +1186,7 @@ mod tests {
         // v1 `Running` に余剰バイト（固定時刻相当）が付いた値は拒否する。
         let mut v1_extra = encode_record(&JobRecord::Running {
             hash: h,
-            cursor: 1,
+            cursor: rid(1),
             processed: 1,
             fixed_time: None,
         });
@@ -1199,20 +1212,20 @@ mod tests {
         let h = hash("h");
         let timed = JobRecord::Running {
             hash: *h.as_bytes(),
-            cursor: 5,
+            cursor: rid(5),
             processed: 2,
             fixed_time: Some(123),
         };
         let untimed = JobRecord::Running {
             hash: *h.as_bytes(),
-            cursor: 5,
+            cursor: rid(5),
             processed: 2,
             fixed_time: None,
         };
         assert_eq!(
             classify_resend(Some(&timed), &h, false, true),
             ResendDecision::Resume {
-                cursor: 5,
+                cursor: rid(5),
                 processed: 2,
                 fixed_time: Some(123)
             }
@@ -1225,7 +1238,7 @@ mod tests {
         assert_eq!(
             classify_resend(Some(&untimed), &h, false, false),
             ResendDecision::Resume {
-                cursor: 5,
+                cursor: rid(5),
                 processed: 2,
                 fixed_time: None
             }
@@ -1236,7 +1249,7 @@ mod tests {
     fn decode_rejects_unknown_version_state_and_length() {
         let good = encode_record(&JobRecord::Running {
             hash: [1; 32],
-            cursor: 1,
+            cursor: rid(1),
             processed: 1,
             fixed_time: None,
         });
@@ -1262,22 +1275,75 @@ mod tests {
         assert!(decode_record(&max_cursor).is_err());
     }
 
+    /// golden 固定（Issue #2196・TABLE-23 (5)・RECOVER-12 のポインタ）: カーソルを物理 rowid 型へ
+    /// 移した前後で、ジョブ記録の永続バイト列（v1／v2／Cancelled／Completed）が不変である
+    /// ことを固定する。期待値は移行前のレイアウト（`[ver][state][hash 32][u64 LE …]`）を
+    /// 手で組み立てたもので、更新しない。旧バイナリが書いた記録がそのまま読めることの根拠。
+    #[test]
+    fn persisted_job_record_bytes_are_golden() {
+        let h = [7u8; 32];
+        let cur = 0x0102_0304_0506_0708_u64;
+        let mut v1 = vec![1u8, 1];
+        v1.extend_from_slice(&h);
+        v1.extend_from_slice(&cur.to_le_bytes());
+        v1.extend_from_slice(&9u64.to_le_bytes());
+        let r1 = JobRecord::Running {
+            hash: h,
+            cursor: CURSOR,
+            processed: 9,
+            fixed_time: None,
+        };
+        assert_eq!(encode_record(&r1), v1);
+        assert_eq!(decode_record(&v1).expect("decode"), r1);
+
+        let mut v2 = vec![2u8, 1];
+        v2.extend_from_slice(&h);
+        v2.extend_from_slice(&cur.to_le_bytes());
+        v2.extend_from_slice(&9u64.to_le_bytes());
+        v2.extend_from_slice(&(-5i64).to_le_bytes());
+        let r2 = JobRecord::Running {
+            hash: h,
+            cursor: CURSOR,
+            processed: 9,
+            fixed_time: Some(-5),
+        };
+        assert_eq!(encode_record(&r2), v2);
+        assert_eq!(decode_record(&v2).expect("decode"), r2);
+
+        let mut cancelled = vec![1u8, 2];
+        cancelled.extend_from_slice(&h);
+        cancelled.extend_from_slice(&3u64.to_le_bytes());
+        let r3 = JobRecord::Cancelled {
+            hash: h,
+            committed: 3,
+        };
+        assert_eq!(encode_record(&r3), cancelled);
+        assert_eq!(decode_record(&cancelled).expect("decode"), r3);
+
+        let mut completed = vec![1u8, 3];
+        completed.extend_from_slice(&h);
+        completed.extend_from_slice(&11u64.to_le_bytes());
+        let r4 = JobRecord::Completed { hash: h, total: 11 };
+        assert_eq!(encode_record(&r4), completed);
+        assert_eq!(decode_record(&completed).expect("decode"), r4);
+    }
+
     // --- カーソル範囲 -------------------------------------------------------
 
     #[test]
     fn chunk_range_excludes_cursor_and_never_adds() {
-        let (lo, hi) = chunk_range("t", Some(5)).expect("range");
+        let (lo, hi) = chunk_range("t", Some(rid(5))).expect("range");
         assert_eq!(lo, Bound::Excluded(("t", 5)));
         assert_eq!(hi, Bound::Included(("t", u64::MAX)));
         let (lo, _) = chunk_range("t", None).expect("range");
         assert_eq!(lo, Bound::Included(("t", 0)));
-        let (lo, _) = chunk_range("t", Some(u64::MAX - 1)).expect("range");
+        let (lo, _) = chunk_range("t", Some(rid(u64::MAX - 1))).expect("range");
         assert_eq!(lo, Bound::Excluded(("t", u64::MAX - 1)));
     }
 
     #[test]
     fn chunk_range_at_u64_max_is_exhausted() {
-        assert!(chunk_range("t", Some(u64::MAX)).is_none());
+        assert!(chunk_range("t", Some(RowId::MAX)).is_none());
     }
 
     #[test]
@@ -1293,7 +1359,7 @@ mod tests {
         wt.commit().expect("commit");
         let rt = db.begin_read().expect("r");
         let t = rt.open_table(ROWS).expect("open");
-        let ids = |cursor: Option<u64>| -> Vec<u64> {
+        let ids = |cursor: Option<RowId>| -> Vec<u64> {
             match chunk_range("a", cursor) {
                 None => vec![],
                 Some(r) => t
@@ -1304,8 +1370,8 @@ mod tests {
             }
         };
         assert_eq!(ids(None), vec![1, u64::MAX]);
-        assert_eq!(ids(Some(1)), vec![u64::MAX]);
-        assert_eq!(ids(Some(u64::MAX)), Vec::<u64>::new());
+        assert_eq!(ids(Some(rid(1))), vec![u64::MAX]);
+        assert_eq!(ids(Some(RowId::MAX)), Vec::<u64>::new());
     }
 
     // --- 原子性・カーソル ---------------------------------------------------
@@ -1321,7 +1387,8 @@ mod tests {
                 let mut t = wt.open_table(ROWS).expect("open");
                 t.insert(("t1", 1u64), b"x".as_slice()).expect("ins");
             }
-            let out = record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 10, None).expect("p");
+            let out =
+                record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(1), 10, None).expect("p");
             assert_eq!(out, ChunkCommitOutcome::Created);
             // commit せず drop。
         }
@@ -1334,16 +1401,16 @@ mod tests {
             let mut t = wt.open_table(ROWS).expect("open");
             t.insert(("t1", 1u64), b"x".as_slice()).expect("ins");
         }
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 10, None).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(1), 10, None).expect("p");
         wt.commit().expect("commit");
         assert_eq!(rows_count(&db), 1);
         assert!(matches!(
             read_job(&db, &k),
             Some(JobRecord::Running {
-                cursor: 1,
+                cursor,
                 processed: 1,
                 ..
-            })
+            }) if cursor == rid(1)
         ));
     }
 
@@ -1354,29 +1421,30 @@ mod tests {
         let k = key("t1", "docs", &id);
         for (changed, last) in [(3u64, 10u64), (0, 20), (4, 30)] {
             let wt = db.begin_write().expect("w");
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), changed, last, 10, None).expect("p");
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), changed, rid(last), 10, None)
+                .expect("p");
             wt.commit().expect("c");
         }
         assert!(matches!(
             read_job(&db, &k),
             Some(JobRecord::Running {
-                cursor: 30,
+                cursor,
                 processed: 7,
                 ..
-            })
+            }) if cursor == rid(30)
         ));
         // カーソルが前進しない・ハッシュ不一致は fail-closed。
         let wt = db.begin_write().expect("w");
         assert!(matches!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 30, 10, None,),
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(30), 10, None,),
             Err(PartitionedJobError::StateConflict)
         ));
         assert!(matches!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("other"), 1, 40, 10, None,),
+            record_chunk_progress_in_txn(&wt, &k, &hash("other"), 1, rid(40), 10, None,),
             Err(PartitionedJobError::StateConflict)
         ));
         assert!(matches!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, u64::MAX, 10, None,),
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(u64::MAX), 10, None,),
             Err(PartitionedJobError::StateConflict)
         ));
     }
@@ -1388,24 +1456,24 @@ mod tests {
         let k = key("t1", "docs", &id);
         let wt = db.begin_write().expect("w");
         assert_eq!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 0, 5, 10, None,).expect("p"),
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 0, rid(5), 10, None,).expect("p"),
             ChunkCommitOutcome::NoRecord
         );
         wt.commit().expect("c");
         assert!(read_job(&db, &k).is_none());
         let wt = db.begin_write().expect("w");
         assert_eq!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 2, 9, 10, None,).expect("p"),
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 2, rid(9), 10, None,).expect("p"),
             ChunkCommitOutcome::Created
         );
         wt.commit().expect("c");
         assert!(matches!(
             read_job(&db, &k),
             Some(JobRecord::Running {
-                cursor: 9,
+                cursor,
                 processed: 2,
                 ..
-            })
+            }) if cursor == rid(9)
         ));
     }
 
@@ -1418,7 +1486,7 @@ mod tests {
         let k = key("t1", "docs", &id);
         let h = hash("h");
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &h, 3, 10, 10, None).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &h, 3, rid(10), 10, None).expect("p");
         wt.commit().expect("c");
         assert_eq!(active_count(&db), 1);
 
@@ -1461,7 +1529,7 @@ mod tests {
         let id = op("op-1");
         let k = key("t1", "docs", &id);
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 3, 10, None).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(3), 10, None).expect("p");
         wt.commit().expect("c");
         // 通常 DML 相当が先に同じ operation_id を台帳へ記録していた状況を作る。
         // （Running を通常 DML が拒否する不変条件の外側にある破損状態の再現。）
@@ -1496,7 +1564,7 @@ mod tests {
         let id = op("op-1");
         let k = key("t1", "docs", &id);
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 4, 8, 10, None).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 4, rid(8), 10, None).expect("p");
         wt.commit().expect("c");
         let wt = db.begin_write().expect("w");
         assert_eq!(
@@ -1523,8 +1591,16 @@ mod tests {
         let ids: Vec<OperationId> = (0..3).map(|i| op(&format!("op-{i}"))).collect();
         for id in ids.iter().take(2) {
             let wt = db.begin_write().expect("w");
-            record_chunk_progress_in_txn(&wt, &key("t1", "docs", id), &hash("h"), 1, 1, 2, None)
-                .expect("p");
+            record_chunk_progress_in_txn(
+                &wt,
+                &key("t1", "docs", id),
+                &hash("h"),
+                1,
+                rid(1),
+                2,
+                None,
+            )
+            .expect("p");
             wt.commit().expect("c");
         }
         let wt = db.begin_write().expect("w");
@@ -1538,7 +1614,7 @@ mod tests {
                 &key("t1", "docs", &ids[2]),
                 &hash("h"),
                 1,
-                9,
+                rid(9),
                 2,
                 None,
             ),
@@ -1549,10 +1625,26 @@ mod tests {
         assert!(read_job(&db, &key("t1", "docs", &ids[2])).is_none());
         // 別テーブル・別テナントは数えない。
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &key("t1", "other", &ids[2]), &hash("h"), 1, 1, 2, None)
-            .expect("other table is independent");
-        record_chunk_progress_in_txn(&wt, &key("t2", "docs", &ids[2]), &hash("h"), 1, 1, 2, None)
-            .expect("other tenant is independent");
+        record_chunk_progress_in_txn(
+            &wt,
+            &key("t1", "other", &ids[2]),
+            &hash("h"),
+            1,
+            rid(1),
+            2,
+            None,
+        )
+        .expect("other table is independent");
+        record_chunk_progress_in_txn(
+            &wt,
+            &key("t2", "docs", &ids[2]),
+            &hash("h"),
+            1,
+            rid(1),
+            2,
+            None,
+        )
+        .expect("other tenant is independent");
     }
 
     #[test]
@@ -1561,8 +1653,16 @@ mod tests {
         let ids: Vec<OperationId> = (0..5).map(|i| op(&format!("op-{i}"))).collect();
         for id in &ids {
             let wt = db.begin_write().expect("w");
-            record_chunk_progress_in_txn(&wt, &key("t1", "docs", id), &hash("h"), 1, 1, 100, None)
-                .expect("p");
+            record_chunk_progress_in_txn(
+                &wt,
+                &key("t1", "docs", id),
+                &hash("h"),
+                1,
+                rid(1),
+                100,
+                None,
+            )
+            .expect("p");
             wt.commit().expect("c");
         }
         let wt = db.begin_write().expect("w");
@@ -1593,7 +1693,7 @@ mod tests {
         drop(wt);
         // 索引値が不明なバージョン。
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100, None).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(1), 100, None).expect("p");
         {
             let mut a = wt.open_table(PARTITIONED_JOB_ACTIVE_TABLE).expect("a");
             a.insert(k.tuple(), [9u8].as_slice()).expect("i");
@@ -1605,7 +1705,7 @@ mod tests {
         drop(wt);
         // 索引が指す記録が Running 以外。
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100, None).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(1), 100, None).expect("p");
         write_record(
             &wt,
             &k,
@@ -1627,7 +1727,7 @@ mod tests {
         let id = op("op-1");
         let k = key("t1", "docs", &id);
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100, None).expect("p");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(1), 100, None).expect("p");
         wt.commit().expect("c");
         let wt = db.begin_write().expect("w");
         {
@@ -1635,7 +1735,7 @@ mod tests {
             a.remove(k.tuple()).expect("rm");
         }
         assert!(matches!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 5, 100, None,),
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(5), 100, None,),
             Err(PartitionedJobError::Corrupted(_))
         ));
     }
@@ -1648,7 +1748,8 @@ mod tests {
         let id = op("op-1");
         let k = key("t1", "docs", &id);
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100, Some(1_000)).expect("create");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(1), 100, Some(1_000))
+            .expect("create");
         wt.commit().expect("c");
         assert!(matches!(
             read_job(&db, &k),
@@ -1660,21 +1761,22 @@ mod tests {
         for bad in [Some(2_000), None] {
             let wt = db.begin_write().expect("w");
             assert!(matches!(
-                record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 5, 100, bad),
+                record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(5), 100, bad),
                 Err(PartitionedJobError::StateConflict)
             ));
         }
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 5, 100, Some(1_000)).expect("update");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(5), 100, Some(1_000))
+            .expect("update");
         wt.commit().expect("c");
         assert!(matches!(
             read_job(&db, &k),
             Some(JobRecord::Running {
-                cursor: 5,
+                cursor,
                 processed: 2,
                 fixed_time: Some(1_000),
                 ..
-            })
+            }) if cursor == rid(5)
         ));
     }
 
@@ -1689,7 +1791,7 @@ mod tests {
         wt.commit().expect("c");
         let wt = db.begin_write().expect("w");
         assert!(matches!(
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100, None,),
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(1), 100, None,),
             Err(PartitionedJobError::LedgerConflict(_))
         ));
         assert!(lookup_in_write_txn(&wt, &k).expect("l").is_none());
@@ -1702,7 +1804,7 @@ mod tests {
         let k = key("t1", "docs", &id);
         for cancel in [false, true] {
             let wt = db.begin_write().expect("w");
-            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100, None).expect("p");
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, rid(1), 100, None).expect("p");
             {
                 let mut a = wt.open_table(PARTITIONED_JOB_ACTIVE_TABLE).expect("a");
                 a.insert(k.tuple(), [9u8].as_slice()).expect("i");
@@ -1723,7 +1825,7 @@ mod tests {
         let id = op("op-1");
         let wt = db.begin_write().expect("w");
         for (t, tb) in [("t1", "docs"), ("t1", "other"), ("t2", "docs")] {
-            record_chunk_progress_in_txn(&wt, &key(t, tb, &id), &hash("h"), 1, 1, 100, None)
+            record_chunk_progress_in_txn(&wt, &key(t, tb, &id), &hash("h"), 1, rid(1), 100, None)
                 .expect("p");
         }
         assert_eq!(
@@ -1745,8 +1847,16 @@ mod tests {
         let (db, _g) = open_db("pj-tenant");
         let id = op("op-1");
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &key("t1", "docs", &id), &hash("h"), 1, 1, 100, None)
-            .expect("p");
+        record_chunk_progress_in_txn(
+            &wt,
+            &key("t1", "docs", &id),
+            &hash("h"),
+            1,
+            rid(1),
+            100,
+            None,
+        )
+        .expect("p");
         wt.commit().expect("c");
         assert!(read_job(&db, &key("t1", "docs", &id)).is_some());
         assert_eq!(read_job(&db, &key("t2", "docs", &id)), None);
@@ -1816,7 +1926,7 @@ mod tests {
         let other = hash("o");
         let running = JobRecord::Running {
             hash: *h.as_bytes(),
-            cursor: 5,
+            cursor: rid(5),
             processed: 2,
             fixed_time: None,
         };
@@ -1839,7 +1949,7 @@ mod tests {
         assert_eq!(
             classify_resend(Some(&running), &h, false, false,),
             ResendDecision::Resume {
-                cursor: 5,
+                cursor: rid(5),
                 processed: 2,
                 fixed_time: None,
             }
@@ -1870,7 +1980,7 @@ mod tests {
     fn derive_status_uses_registry_for_running_records() {
         let running = JobRecord::Running {
             hash: [0; 32],
-            cursor: 5,
+            cursor: rid(5),
             processed: 2,
             fixed_time: None,
         };
@@ -1882,7 +1992,7 @@ mod tests {
             derive_status(Some(&running), false),
             Some(JobStatus::Interrupted {
                 processed: 2,
-                cursor: 5
+                cursor: rid(5)
             })
         );
         assert_eq!(
@@ -1900,8 +2010,16 @@ mod tests {
         {
             let db = redb::Database::create(&path).expect("create");
             let wt = db.begin_write().expect("w");
-            record_chunk_progress_in_txn(&wt, &key("t1", "docs", &id), &hash("h"), 2, 6, 10, None)
-                .expect("p");
+            record_chunk_progress_in_txn(
+                &wt,
+                &key("t1", "docs", &id),
+                &hash("h"),
+                2,
+                rid(6),
+                10,
+                None,
+            )
+            .expect("p");
             wt.commit().expect("c");
         }
         let db = redb::Database::create(&path).expect("reopen");
@@ -1912,7 +2030,7 @@ mod tests {
             derive_status(Some(&rec), registry.is_registered(&k)),
             Some(JobStatus::Interrupted {
                 processed: 2,
-                cursor: 6
+                cursor: rid(6)
             })
         );
         // 自動では何も書かれない（記録は Running のまま）。
@@ -1976,7 +2094,7 @@ mod tests {
         let id = op("op-1");
         let wt = db.begin_write().expect("w");
         for (t, tb) in [("t1", "docs"), ("t2", "docs"), ("t1", "keep")] {
-            record_chunk_progress_in_txn(&wt, &key(t, tb, &id), &hash("h"), 1, 1, 100, None)
+            record_chunk_progress_in_txn(&wt, &key(t, tb, &id), &hash("h"), 1, rid(1), 100, None)
                 .expect("p");
         }
         wt.commit().expect("c");
@@ -2006,8 +2124,16 @@ mod tests {
 
     fn seed_running(db: &redb::Database, id: &OperationId) {
         let wt = db.begin_write().expect("w");
-        record_chunk_progress_in_txn(&wt, &key("t1", "docs", id), &hash("job"), 1, 1, 10, None)
-            .expect("p");
+        record_chunk_progress_in_txn(
+            &wt,
+            &key("t1", "docs", id),
+            &hash("job"),
+            1,
+            rid(1),
+            10,
+            None,
+        )
+        .expect("p");
         wt.commit().expect("c");
     }
 
@@ -2108,7 +2234,7 @@ mod tests {
         let id = op("op-1");
         let wt = db.begin_write().expect("w");
         for (t, tb) in [("t1", "docs"), ("t2", "docs"), ("t1", "keep")] {
-            record_chunk_progress_in_txn(&wt, &key(t, tb, &id), &hash("h"), 1, 1, 100, None)
+            record_chunk_progress_in_txn(&wt, &key(t, tb, &id), &hash("h"), 1, rid(1), 100, None)
                 .expect("p");
         }
         wt.commit().expect("c");

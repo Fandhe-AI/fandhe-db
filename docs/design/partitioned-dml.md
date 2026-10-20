@@ -557,6 +557,16 @@ Accepted と、15 節の提案値のオーナー確認後」。後者は 2026-10
 | 同時実行数の上限超過のコード | `55P03`（`LOCK_NOT_AVAILABLE`） | 時間をおけば解消する一時的な拒否で、writer 待機上限と同じ「再試行できる」扱いがふさわしい。`54000`（`PAYLOAD_TOO_LARGE`）は要求自体の大きさの超過に使っており意味が合わない。全体上限による拒否が示す情報も、writer 待機の `55P03` と同じ程度にとどまる |
 | 中断記録数の上限超過のコード | `54000`（`PAYLOAD_TOO_LARGE`） | 時間をおいても解消しない上限超過で、副作用ゼロで拒否する既存の `54000` の扱いと同じ。自テナント・自テーブルの判定だけで、他テナントの状態は応答に影響しない |
 
+## Issue #2196 追記（カーソルの物理 rowid 化）
+
+親 #1710（TABLE-23 (5)・SQL-32・RECOVER-11・RECOVER-12 のポインタ）の段階移行の一環。上の §4.1・§8.1・§13 の `(tenant, id)` 表記は本文を書き換えず、**行ストアの物理キー `(tenant, rowid)` と読み替える**（従来方式の表では rowid の生値＝旧 `id` 値）。
+
+- カーソル（`JobRecord::Running.cursor`・`JobStatus::Interrupted.cursor`・`ResendDecision::Resume.cursor`・`chunk_range`・実行器の走査状態）を `storage::rowid::RowId` 型にした。走査範囲は `(tenant, RowId::MIN)..=(tenant, RowId::MAX)` の閉区間で、下端排他・加算なしの契約は不変。
+- 永続形式は不変（ジョブ記録 v1／v2。カーソルは rowid の生値 8 バイト LE）。旧バイナリが書いた記録がそのまま読める。固定テスト: `persisted_job_record_bytes_are_golden`（`partitioned_job.rs`）・`table23_legacy_partitioned_job_record_resumes_after_cursor`（`recovery/table23_ledger_compat_tests.rs`）。
+- カーソルは応答・エラー・EXPLAIN・SHOW に出さない（`RowId` は `Display` 非実装）。
+- 適用段（`apply_predicate_*_in_txn`）はまだ `id` 列値の `u64` を受けるため、実行器が候補の rowid を `legacy_id()` で変換して渡す境界を 1 箇所に残した（後続 #2197 で差し替え）。述語へ渡す `DmlCandidate.id` も同様。
+- 採番方式の表の分割実行 UPDATE／DELETE は従来どおり `0A000` で拒否され、台帳・ジョブ記録は作られない（`table23_allocated_table_partitioned_dml_is_rejected_without_side_effects`）。
+
 ## スコープ外・申し送り
 
 - `crates/` 配下のコード変更・実装（#1127〜#1131 の担当）

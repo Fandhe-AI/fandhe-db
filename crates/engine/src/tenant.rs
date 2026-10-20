@@ -9780,7 +9780,16 @@ mod tests {
         {
             let txn = storage.begin_write_txn().expect("txn");
             let key = JobKey::for_context(&ctx, "docs", &running);
-            record_chunk_progress_in_txn(&txn, &key, &job_hash, 1, 1, 10, None).expect("running");
+            record_chunk_progress_in_txn(
+                &txn,
+                &key,
+                &job_hash,
+                1,
+                crate::storage::rowid::RowId::from_legacy_id(1),
+                10,
+                None,
+            )
+            .expect("running");
             txn.commit_raw_for_test().expect("commit");
         }
         assert_rejected(&running);
@@ -9824,7 +9833,7 @@ mod tests {
                 &key,
                 &content_hash::ContentHash::for_test(b"job"),
                 1,
-                1,
+                crate::storage::rowid::RowId::from_legacy_id(1),
                 10,
                 None,
             )

@@ -21,6 +21,18 @@
 //! クライアント要求が再送された場合は常に同一ハッシュへ決定的に写像される
 //! （再送検知の前提条件）。
 //!
+//! ## 行識別の材料（Issue #2196。ポインタ: TABLE-23・RECOVER-10）
+//!
+//! `id: u64` を取る `for_*`（`for_insert_encoded`・`for_insert_batch_encoded`・
+//! `for_typed_insert*`・`for_typed_upsert*`・`for_update_encoded`・`for_update_columns*`・
+//! `for_delete`）の `id` は**要求由来の行識別値（従来方式では `id` 列＝主キー値）**であり、
+//! 行ストアの物理 rowid（[`crate::storage::rowid::RowId`]）は決して材料にしない。サーバー側の
+//! 採番値を混ぜると同一要求の再送で別ハッシュになり `23505` が `22023` に化けるため、上の
+//! 「DB 状態由来の値を含めない」の帰結である。シグネチャが `u64` のままなのは意図的で
+//! （`RowId` は `u64` へ暗黙変換できない）、出力バイト列は移行前後で不変
+//! （golden: `id_based_hash_layouts_are_golden_across_rowid_migration` ほか）。
+//! 述語形（`for_*_where*`）は行識別子を持たない構文形のため影響を受けない。
+//!
 //! 連結曖昧性（例: `"ab"+"c"` と `"a"+"bc"` が同一バイト列になる事故）を構造的に
 //! 排除するため、[`HashInputBuilder`] はすべての可変長フィールドへ長さプレフィクス
 //! （4 バイト LE）を付けてから連結する。先頭にドメイン分離タグ（固定文字列）＋
@@ -833,6 +845,8 @@ pub(crate) enum UpsertHashAction<'a> {
 }
 
 /// [`for_typed_upsert`] の衝突対象（SQL-20・TABLE-16、Issue #1074）。
+/// 注意（Issue #2196）: `RowId` は `ON CONFLICT (id)`（利用者の `id` 列＝主キー）を指す印であり、
+/// 行ストアの物理 rowid（[`crate::storage::rowid::RowId`]）ではない。名前の整理は後続（#2197）。
 /// `sql::parser::BoundConflictTarget` に対応する最小表現。`RowId` は本 Issue
 /// 導入前と完全に同じレイアウトを出力する（golden テストで固定）。
 pub(crate) enum UpsertHashTarget<'a> {
@@ -3804,6 +3818,45 @@ mod tests {
         assert_eq!(
             to_hex(for_update_columns(3, &vec_cols).expect("hash").as_bytes()),
             "f7b2ee1f790be8849a79364620b1da02a77a81fb331760966ba579f9deca62ab"
+        );
+    }
+
+    /// golden 固定（Issue #2196・TABLE-23 (4)・RECOVER-10・RECOVER-11・RECOVER-12 のポインタ）:
+    /// 行識別の材料が「要求由来の `id`（主キー）値」であり、物理 rowid への移行の前後で
+    /// 単一行形・バッチ形のバイト列が不変であることを固定する（永続化済み台帳エントリとの
+    /// 再送互換）。定数は rowid 移行前の実装から採取した値のまま更新しない。
+    #[test]
+    fn id_based_hash_layouts_are_golden_across_rowid_migration() {
+        fn to_hex(bytes: &[u8; 32]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let enc: &[u8] = &[1, 2, 3, 4];
+        assert_eq!(
+            to_hex(for_insert_encoded(5, enc).expect("hash").as_bytes()),
+            "6db1afe08d6601df06f61a0c70bb2797317bca45ec18380e68dac31969afaa6e"
+        );
+        let rows: [(u64, &[u8]); 2] = [(1, enc), (u64::MAX, &[9, 8])];
+        assert_eq!(
+            to_hex(for_insert_batch_encoded(&rows).expect("hash").as_bytes()),
+            "06298c98cbaba2f1da2a53c311bcf3e4628f132bcbba16c6cb5b6ba7d8b0799f"
+        );
+        assert_eq!(
+            to_hex(for_update_encoded(5, enc).expect("hash").as_bytes()),
+            "677130d479683d0c81180efa8d027f4ab771834a5414bb67eecda9c32c7ddb68"
+        );
+        assert_eq!(
+            to_hex(for_delete(5).as_bytes()),
+            "8ae1246d12a76c815d2a22f8d77173ad260526e1c730731bc680c0c0880cc7be"
+        );
+        let x = Value::Text("x".to_string());
+        let cols: [(&str, UpdateColumnHashItem<'_>); 1] = [("a", UpdateColumnHashItem::Value(&x))];
+        assert_eq!(
+            to_hex(
+                for_update_columns_with_exprs(7, &cols)
+                    .expect("hash")
+                    .as_bytes()
+            ),
+            "3430c25e760c5c1c5fc94538d0efaf312fba2773ac0052cadde806468e73853d"
         );
     }
 
