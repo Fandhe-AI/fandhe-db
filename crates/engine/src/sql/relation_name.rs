@@ -61,8 +61,8 @@ pub(crate) fn rewrite_relation_names(
     let head = tokens.get(..4).unwrap_or(&*tokens);
     let head_create = ident_is(tokens.first(), "CREATE");
     let create_table = head_create && head.iter().any(|t| ident_is(Some(t), "TABLE"));
-    let create_temp_table =
-        create_table && (ident_is(tokens.get(1), "TEMP") || ident_is(tokens.get(1), "TEMPORARY"));
+    // `CREATE [GLOBAL|LOCAL] {TEMP|TEMPORARY} TABLE`（一時表 DDL として受理される全形）。
+    let create_temp_table = crate::sql::allowlist::is_create_temp_table_statement(tokens);
     let table_head = head.iter().any(|t| ident_is(Some(t), "TABLE"));
     let mut index_on_pending = head_create && head.iter().any(|t| ident_is(Some(t), "INDEX"));
 

@@ -517,6 +517,12 @@ impl EngineCore {
             PreparedRoute::Temp(_) => Self::coarse_temp_gate(session, &prepared.dummy_parsed),
             PreparedRoute::Plain => {
                 let temp = session.temp_tables();
+                // 免除文（`DROP TABLE` 等）でも、Parse 後に作られた同名の一時表へ `public.` 修飾の
+                // 表名が化けないよう先に拒否する（TABLE-27・Issue #1714）。
+                crate::sql::temp_catalog::reject_public_names_temp(
+                    &prepared.public_qualified,
+                    temp,
+                )?;
                 if temp.is_empty() || is_session_exempt(&prepared.dummy_parsed) {
                     return Ok(());
                 }
@@ -659,6 +665,10 @@ impl EngineCore {
                 })))
             }
             PreparedRoute::Plain => {
+                crate::sql::temp_catalog::reject_public_names_temp(
+                    &prepared.public_qualified,
+                    temp,
+                )?;
                 let parsed = self.bind_prepared(prepared, values)?;
                 // `DROP INDEX <名前>` は一時表の名前トークンが現れない。準備後に同名の一時索引が
                 // 作られていれば、通常の Parse（`route_drop_index`）なら一時索引に当たるため、

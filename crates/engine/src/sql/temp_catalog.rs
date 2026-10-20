@@ -347,6 +347,25 @@ pub(crate) fn reject_public_qualified_temp(
     Ok(())
 }
 
+/// Parse 時に `public.` 修飾を解決済みの表名（[`crate::sql::relation_name::rewrite_relation_names`]
+/// の戻り値）が、現在の一時表と衝突するなら固定の `0A000` で拒否する。準備済み文は Parse 後に
+/// 同名の一時表が作られうるため、Bind・Describe の段で再検査する（fail-closed）。
+pub(crate) fn reject_public_names_temp(
+    public_names: &[String],
+    catalog: &SessionTempCatalog,
+) -> Result<(), SqlSurfaceError> {
+    if public_names.is_empty() || catalog.is_empty() {
+        return Ok(());
+    }
+    let hit = public_names
+        .iter()
+        .any(|p| catalog.names().any(|n| n.eq_ignore_ascii_case(p)));
+    if hit {
+        return Err(temp_table_unsupported());
+    }
+    Ok(())
+}
+
 /// 一時表を扱えない文（混在・対象外の文種）に返す固定の拒否（`0A000`）。永続側の表の存否を
 /// 含まない固定文言で、存在オラクルにならない。
 pub(crate) fn temp_table_unsupported() -> SqlSurfaceError {

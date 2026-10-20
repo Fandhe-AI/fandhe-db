@@ -2103,6 +2103,9 @@ pub struct PreparedSql {
     /// リテラル・`AT LOCAL` の定数畳み込み。Issue #1576）。`true` の文は `dummy_parsed` を
     /// 実行へ再利用せず、Bind ごとにセッション TimeZone の下で再 parse する。
     session_tz_dependent: bool,
+    /// Parse 時に `public.` 修飾を外した表名（TABLE-27・Issue #1714）。Parse 後に同名の一時表が
+    /// 作られると未修飾名が一時表へ解決されるため、Bind・Describe の段で一時カタログと再照合する。
+    public_qualified: Vec<String>,
 }
 
 impl PreparedSql {
@@ -4796,7 +4799,8 @@ impl EngineCore {
         let mut tokens = crate::sql::lexer::tokenize_with_params(sql)?;
         // `schema.table` のテーブル参照を解決して未修飾の名前へ置き換える（TABLE-27・Issue #1714）。
         // 位置推論・型推論・Bind の再 parse が同じ（解決済みの）トークン列を見るよう、最初に行う。
-        crate::sql::relation_name::rewrite_relation_names(&mut tokens, None)?;
+        let public_qualified =
+            crate::sql::relation_name::rewrite_relation_names(&mut tokens, None)?;
         // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW`
         // は DDL であり、`sql::params` が受理する `$n` の許可位置一覧
         // （WHERE 等号右辺・VALUES 節等）はいずれも DML 向けの規範形のため、
@@ -4930,6 +4934,7 @@ impl EngineCore {
                 .map(|i| declared.get(i).copied().flatten())
                 .collect(),
             session_tz_dependent,
+            public_qualified,
             route: temp_route::PreparedRoute::Plain,
         })
     }

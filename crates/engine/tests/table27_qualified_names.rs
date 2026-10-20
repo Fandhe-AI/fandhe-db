@@ -369,6 +369,22 @@ fn create_temp_table_in_public_is_42p16_and_pg_temp_is_not_wired() {
         ),
         "42P16"
     );
+    for kw in [
+        "GLOBAL TEMP",
+        "LOCAL TEMP",
+        "GLOBAL TEMPORARY",
+        "LOCAL TEMPORARY",
+    ] {
+        assert_eq!(
+            code(
+                &core,
+                &mut s,
+                &format!("CREATE {kw} TABLE public.t {COLUMNS}")
+            ),
+            "42P16",
+            "{kw}"
+        );
+    }
     ok(&core, &mut s, &format!("CREATE TABLE x {COLUMNS}"));
     ok(&core, &mut s, &format!("CREATE TEMP TABLE y {COLUMNS}"));
     // `pg_temp.x` は永続の `x` に落ちない。
@@ -380,4 +396,27 @@ fn create_temp_table_in_public_is_42p16_and_pg_temp_is_not_wired() {
         code(&core, &mut s, "SELECT id FROM pg_temp.y LIMIT 1"),
         "0A000"
     );
+}
+
+#[test]
+fn prepared_public_qualified_name_rejected_after_same_name_temp_table_created() {
+    let (core, _g) = new_core("t27-qualified-temp-prepared");
+    let mut s = ddl_session();
+    ok(&core, &mut s, &format!("CREATE TABLE t {COLUMNS}"));
+    // 一時表が無い状態で Parse する（`public.` 修飾は Parse 時に外れる）。
+    let prepared = core
+        .parse_sql_prepared_with_declared_in_session(&s, "DROP TABLE public.t", &[])
+        .expect("prepare");
+    ok(&core, &mut s, &format!("CREATE TEMP TABLE t {COLUMNS}"));
+    let e = core
+        .describe_prepared_in_session(&s, &prepared)
+        .map(|_| ())
+        .expect_err("describe must reject");
+    assert_eq!(e.wire_code(), "0A000");
+    let e = core
+        .bind_prepared_in_session(&s, &prepared, &[])
+        .expect_err("bind must reject");
+    assert_eq!(e.wire_code(), "0A000");
+    // 一時表は残る。
+    assert_eq!(count(&core, &mut s, "t"), "Integer(0)");
 }
