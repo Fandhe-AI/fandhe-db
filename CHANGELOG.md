@@ -110,6 +110,13 @@
   対象へ加え、同じトランザクションで自テナントの行を削除する（参照アクションは発火しない）。公開 API は
   `ValidatedTruncate::behavior` の追加、`TruncateOutcome` の `Copy` 削除と `cascaded()` の追加、
   `TenantWriteError::TruncateReferencedByForeignKey` の追加。
+- `SERIAL` 系型（Issue #1694・TABLE-24）: `CREATE TABLE` の `SERIAL`／`BIGSERIAL`／`SMALLSERIAL`（別名 `SERIAL4`・
+  `SERIAL8`・`SERIAL2`）を受理する（従来は ENUM 型名候補として `42704`）。基底の整数型・`NOT NULL`・暗黙 SEQUENCE
+  （`<table>_<col>_seq`・列が所有・MAXVALUE は列型の上限）・`DEFAULT nextval` へ展開し、表と同じ write txn で作る。
+  DROP TABLE・DROP COLUMN は所有 SEQUENCE も削除し、RENAME は所有者を追従させる。`DEFAULT` 併記は `42601`、
+  `ADD COLUMN`・一時表・配列は `0A000`、列定義の外の型名は `42704`。SERIAL 系の 6 語は列型キーワードとなり、
+  制約名・NoSQL の `enum_type` として使えなくなる。公開 API は `ValidatedCreateTable::serial_columns`（pub フィールド追加）・
+  `SerialColumn`・`SqlColumnTypeName::Serial`・`SerialKind` の追加。
 - `TRUNCATE ... RESTART IDENTITY`／`CONTINUE IDENTITY`（Issue #1645・SQL-48 (3)）: 従来 `42601` だった識別句を
   受理する（省略時は CONTINUE）。RESTART は対象表が所有する SEQUENCE の自テナントの採番を開始値へ戻す。
   所有関係は SEQUENCE 定義 blob の版 3 に格納する（所有者なしは従来の版 2 のまま。旧バイナリは版 3 を

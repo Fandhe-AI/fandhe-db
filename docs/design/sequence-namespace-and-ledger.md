@@ -135,13 +135,13 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
 ### D8. 受理範囲と fail-closed
 
 - 最初に受理するのは #1688 の START／INCREMENT／MINVALUE／MAXVALUE／CYCLE
-- CACHE・OWNED BY・AS・SERIAL・IDENTITY・
+- CACHE・SQL の OWNED BY・AS・IDENTITY・
   `DROP SEQUENCE ... CASCADE`（TABLE-37）・`IF [NOT] EXISTS`（TABLE-36）・TEMP SEQUENCE は、
   受理する sub-issue が明記されるまで `0A000`／`42601` で fail-closed とする
 - DDL は既存の `--ddl-allowed-users` のゲートに従い、既定拒否を維持する
 - `TRUNCATE ... RESTART IDENTITY`（SQL-48 (3)）は Issue #1645 で受理した。所有者を定義 blob（版 3）に格納でき、
-  戻す対象は所有 SEQUENCE の自テナントの採番だけ。`OWNED BY`／SERIAL の結線は #1694 で、それまで SQL から
-  所有者は作れない。詳細は [truncate-multi-table.md](truncate-multi-table.md) の「Issue #1645 追記」
+  戻す対象は所有 SEQUENCE の自テナントの採番だけ。SERIAL の結線は #1694 で着地した（§12）。SQL の `OWNED BY` は
+  引き続き `0A000`。詳細は [truncate-multi-table.md](truncate-multi-table.md) の「Issue #1645 追記」
 
 ### D9. 変更ログとレプリカ
 
@@ -163,7 +163,7 @@ SEQUENCE と `nextval`／`currval`／`setval`／`lastval`（親 #1686）の実�
 
 - SCHEMA の実装（#1711）
 - 一時表と TEMP SEQUENCE
-- SERIAL／IDENTITY（TABLE-23 (8)・TABLE-24 の後続）
+- IDENTITY（TABLE-23 (8)・TABLE-24 の後続。SERIAL は #1694 で着地）
 - 変更ログとレプリカ（RECOVER-14／15）
 - NoSQL の returning（NOSQL-22）
 
@@ -392,3 +392,38 @@ ROLLBACK した値の再出現はオラクルにしない。`write` は数行ご
 - 接続断（`Drop`）後のクラッシュでの再払い出し、§10.3 の `setval` の消失（§11.2）
 - NoSQL 表層の `returning`（NOSQL-22）、CACHE の受理、変更ログ・レプリカ（RECOVER-14・RECOVER-15）
 - 新しいジョブ `crash-test-sequence` の必須チェック登録はオーナー作業（実装側は ruleset を変更しない）
+
+## 12. Issue #1694 実装記録（SERIAL 系型の展開）
+
+`CREATE TABLE` の `SERIAL`／`BIGSERIAL`／`SMALLSERIAL`（別名 `SERIAL4`・`SERIAL8`・`SERIAL2`）を、基底の整数型・
+`NOT NULL`・暗黙 SEQUENCE・`DEFAULT nextval('<seq>')` へ展開する（TABLE-24 のポインタ）。以下は自動運転下の判断で、
+人間の確認が要る点に「要確認」と付ける。
+
+### 12.1 決定
+
+| 項目 | 決定 |
+| ---- | ---- |
+| 型名解決 | `TYPE_NAME_TABLE` に 6 行を足し、構文木は `SqlColumnTypeName::Serial(SerialKind)`。列定義だけが展開し、`to_static_column_type`・CAST・`ALTER COLUMN TYPE` は `42704`、`ADD COLUMN` と `SERIAL[]` は `0A000`、一時表は `0A000`（暗黙 SEQUENCE を永続カタログへ作れないため） |
+| 暗黙 SEQUENCE の値 | INCREMENT 1・MINVALUE 1・START 1・NO CYCLE。MAXVALUE は列型の上限（`i16`／`i32`／`i64`）なので、枯渇は列に入らない値の `22003` ではなく `2200H` になる。定義 blob の型タグは bigint 固定で、`AS` は未対応のまま（既知の差。要確認） |
+| 名前 | PostgreSQL の `ChooseRelationName` 相当。`<table>_<col>_seq` を 63 バイトへ切り詰め、relation 名前空間（表・ビュー・索引・matview・SEQUENCE）と、同じ文で先に決めた名前を避けて `seq1`・`seq2` と数字を足す。試行は `MAX_SEQUENCES + 1` 回で打ち切り `54000`。書き込み txn の中で決める（`catalog::sequence::choose_implicit_sequence_name_in_txn`。#1698 の `<table>_id_seq` も再利用できる。要確認） |
+| 原子性 | SEQUENCE の挿入・表の作成・所有者の設定・世代の bump を 1 つの write txn で行う（`Storage::create_table_with_implicit_sequences`）。表名の衝突・`IF NOT EXISTS`・後段の失敗では txn を破棄し、孤児 SEQUENCE を残さない。SERIAL 列の無い表は従来の `create_table` のままでバイト列も不変 |
+| DROP TABLE | 所有 SEQUENCE の定義と全テナントの状態行を同じ txn で削除し、メモリ上の現在値は commit 成功後に捨てる。削除対象外の表の `DEFAULT nextval` が参照していれば、RESTRICT・CASCADE とも `2BP01`（DEFAULT は連鎖削除しない。要確認） |
+| 所有者の追従 | `RENAME TO` は所有者の表名、`RENAME COLUMN` は列名を同じ txn で書き換える。`DROP COLUMN` は所有 SEQUENCE も同じ txn で削除し、メモリ上の現在値（カーソル）は commit 成功後に `SequenceAllocator::evict` で捨てる（単一アクション・複数アクションの ALTER とも。ROLLBACK 時は捨てない） |
+| 列制約の併記 | `NOT NULL`・`PRIMARY KEY`・`UNIQUE`・`CHECK`・`REFERENCES` は受理。`DEFAULT`（`DEFAULT NULL`・時刻 DEFAULT を含む）は `42601`。明示値は受理（BY DEFAULT 相当）、明示 NULL は `23502` |
+| 予約語 | SERIAL 系 6 語を列型キーワードに加える。`CONSTRAINT serial CHECK` の制約名と、NoSQL の `enum_type: "serial"` は拒否される。列定義では同名の ENUM があっても SERIAL として扱う（PostgreSQL と同じ。既知の差・影響。要確認） |
+| 台帳・ハッシュ | 変更しない。省略列に適用した DEFAULT は内容照合ハッシュの材料から外れる（D2）。golden は不変 |
+| 表示との整合 | 本リポに SHOW・information_schema 相当の表層は無い。カタログ API（`get_table_schema` の列型・`nullable`・`default_expr`、定義の所有者・パラメータ）を表示の正として検証する |
+| `id` 列 | `id` は予約列名のまま。`id SERIAL` は従来どおり `42601` |
+
+### 12.2 テスト
+
+`crates/engine/src/sql/serial_expansion_tests.rs`（展開・テナント別採番・名前の衝突と切り詰め・DROP TABLE／DROP COLUMN・
+RENAME の追従と `RESTART IDENTITY`・依存 DEFAULT の `2BP01`・原子性・再オープン・台帳の再送・拒否形・DDL 権限）、
+`ddl_column_type`／`allowlist`／`catalog::sequence` の単体テスト。
+
+### 12.3 対象外・申し送り
+
+- IDENTITY（`GENERATED ... AS IDENTITY`・428C9）は #1695。`id` 列の SERIAL・IDENTITY 化は #2197・#1696
+- SQL の `OWNED BY` 句、`ADD COLUMN ... SERIAL`（既存行への採番補完）、`AS smallint/integer` の型タグ
+- 修飾名・SCHEMA の追随は #1711・#1717。`pg_get_serial_sequence` と information_schema 相当の表示
+- NoSQL DDL の `serial` 型、DROP TABLE の CASCADE で依存 DEFAULT を連鎖削除すること

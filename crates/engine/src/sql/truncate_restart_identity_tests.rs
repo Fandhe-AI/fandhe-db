@@ -1,6 +1,6 @@
 //! `TRUNCATE ... RESTART IDENTITY`／`CONTINUE IDENTITY`（SQL-48 (3)・TABLE-24、Issue #1645）の
-//! crate 内結合テスト。所有者（`SequenceOwner`）を SQL から作る経路は後続 Issue（#1694）のため、
-//! `Storage::set_sequence_owner` で所有関係を直接作って `EngineCore` の production 経路
+//! crate 内結合テスト。所有者（`SequenceOwner`）を SQL から作る経路は SERIAL（#1694）のみのため、
+//! 素の SEQUENCE の所有関係は `Storage::set_sequence_owner` で直接作って `EngineCore` の production 経路
 //! （`execute_sql_in_session`／`execute_sql_in_txn`）を検証する。
 //!
 //! 検証する契約:

@@ -287,6 +287,12 @@ impl CastType {
             SqlColumnTypeName::Enum(name) => {
                 return Err(SqlSurfaceError::UndefinedType { name: name.clone() })
             }
+            // SERIAL 系は列宣言の短縮記法で型ではない（PostgreSQL と同じく `42704`。Issue #1694）。
+            SqlColumnTypeName::Serial(kind) => {
+                return Err(SqlSurfaceError::UndefinedType {
+                    name: kind.canonical().to_string(),
+                })
+            }
             SqlColumnTypeName::Array { elem, .. } => {
                 CastType::Array(Box::new(CastType::from_sql_type_name(elem)?))
             }

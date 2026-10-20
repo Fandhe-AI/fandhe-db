@@ -81,6 +81,14 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "VARCHAR",
     "CHAR",
     "CHARACTER",
+    // SERIAL 系の列宣言（TABLE-24・Issue #1694）。`CONSTRAINT serial CHECK` の制約名と、NoSQL の
+    // `enum_type: "serial"` を拒否する（後者を通すと NoSQL が作る列定義が SERIAL 展開に化ける）。
+    "SERIAL",
+    "SERIAL4",
+    "BIGSERIAL",
+    "SERIAL8",
+    "SMALLSERIAL",
+    "SERIAL2",
 ];
 
 /// `raw` が `CREATE TABLE` の列型キーワードかを判定する（Issue #1529・TABLE-29）。
@@ -3234,6 +3242,9 @@ struct ColumnConstraints {
     /// 列制約 `COLLATE <name>`（TABLE-28。Issue #1609）。名前は構文段で許可リストに
     /// 解決済み。列型への適用可否（文字列系のみ）は実行段（`sql::ddl`）が判定する。
     collation: Option<crate::collation::Collation>,
+    /// `DEFAULT` 句を 1 つでも書いたか（`DEFAULT NULL`・時刻 DEFAULT を含む。`default` が `None`
+    /// になる `DEFAULT NULL` と区別するため）。SERIAL 列への `DEFAULT` 併記の拒否に使う（Issue #1694）。
+    default_declared: bool,
 }
 
 /// `CREATE TABLE` の列 1 個ぶんの構文解析結果（[`Parser::parse_create_table_column`]
@@ -3259,6 +3270,9 @@ struct ParsedCreateTableColumn {
     alias_type_name: Option<String>,
     /// 配列型で要素数 `[N]` が省略された（`<型>[]`）場合 true（Issue #1548）。
     array_len_defaulted: bool,
+    /// SERIAL 系の列宣言だった場合の種別（TABLE-24・Issue #1694）。`column` は基底型・`NOT NULL`
+    /// へ展開済みで、`DEFAULT nextval` は暗黙 SEQUENCE の名前が決まる書き込み txn 内で付く。
+    serial: Option<crate::sql::ddl_column_type::SerialKind>,
 }
 
 /// `REFERENCES` 句（列制約・表制約の双方で共有。TABLE-17・TASK-205、
@@ -3734,6 +3748,21 @@ pub struct ValidatedCreateTable {
     /// BREAKING CHANGE: 公開フィールドの追加（構造体リテラルで生成する外部コードは
     /// 追随が必要）。
     pub primary_key_name: Option<String>,
+    /// SERIAL 系の列宣言（宣言順。TABLE-24・Issue #1694）。該当列は `columns` で基底の整数型・
+    /// `NOT NULL`・`DEFAULT` なしへ展開済みで、実行段（`sql::ddl::execute_create_table`）が
+    /// 暗黙 SEQUENCE の作成・所有者設定・`DEFAULT nextval` の付与を表の作成と同じ write txn で行う。
+    ///
+    /// BREAKING CHANGE: 公開フィールドの追加（構造体リテラルで生成する外部コードは追随が必要）。
+    pub serial_columns: Vec<SerialColumn>,
+}
+
+/// SERIAL 系の列宣言 1 件（[`ValidatedCreateTable::serial_columns`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerialColumn {
+    /// 列名（`ValidatedCreateTable::columns` に存在する）。
+    pub column: String,
+    /// 宣言の種別（基底の整数幅と暗黙 SEQUENCE の `MAXVALUE`）。
+    pub kind: crate::sql::ddl_column_type::SerialKind,
 }
 
 /// `ON COMMIT` 句の動作（TABLE-44・Issue #1683）。一時表にだけ指定できる。
@@ -9512,6 +9541,16 @@ impl<'a> Parser<'a> {
                     &self.tokens,
                     &mut self.pos,
                 )?;
+                // SERIAL 系は既存行への採番補完（行ごとの nextval）が要るため未対応（fail-closed。
+                // `DEFAULT nextval` の ADD COLUMN と同じ `0A000`。TABLE-24・Issue #1694）。
+                if matches!(
+                    column_type,
+                    crate::sql::ddl_column_type::SqlColumnTypeName::Serial(_)
+                ) {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "serial is not supported in ALTER TABLE ADD COLUMN".to_string(),
+                    });
+                }
                 // 列制約（Issue #1169）。`UNIQUE` は追加列では受け付けない（`ALTER
                 // TABLE ADD UNIQUE` 形を使う）。`PRIMARY KEY`／`REFERENCES`／`CHECK`
                 // は後続の `expect_end_of_statement` が `42601` で拒否する。
@@ -9917,6 +9956,7 @@ impl<'a> Parser<'a> {
         let mut columns: Vec<ColumnDef> = Vec::new();
         let mut alias_type_names: Vec<String> = Vec::new();
         let mut array_len_defaulted: Vec<String> = Vec::new();
+        let mut serial_columns: Vec<SerialColumn> = Vec::new();
         // `PRIMARY KEY` 宣言（列制約・表制約のいずれか一方のみ。TABLE-16・
         // TASK-204、Issue #903）。列名の存在検証・`id` 混在検査・nullable の
         // 強制は列リスト全体の構文判定を終えた後（このループを抜けた後）に
@@ -10092,6 +10132,12 @@ impl<'a> Parser<'a> {
                     foreign_keys.push(fk);
                 }
                 alias_type_names.extend(parsed.alias_type_name);
+                if let Some(kind) = parsed.serial {
+                    serial_columns.push(SerialColumn {
+                        column: parsed.column.name.clone(),
+                        kind,
+                    });
+                }
                 if parsed.array_len_defaulted {
                     array_len_defaulted.push(parsed.column.name.clone());
                 }
@@ -10172,6 +10218,7 @@ impl<'a> Parser<'a> {
             checks,
             foreign_keys,
             primary_key_name,
+            serial_columns,
         })
     }
 
@@ -10326,7 +10373,16 @@ impl<'a> Parser<'a> {
             type_name,
             crate::sql::ddl_column_type::SqlColumnTypeName::Array { max_len: None, .. }
         );
-        let static_ty = crate::sql::ddl_column_type::to_static_column_type(&type_name)?;
+        // SERIAL 系（TABLE-24・Issue #1694）は基底の整数型へ展開する。`DEFAULT nextval` は暗黙
+        // SEQUENCE の名前を書き込み txn 内で決めてから付けるため、ここでは基底型・`NOT NULL` のみ。
+        let serial = match &type_name {
+            crate::sql::ddl_column_type::SqlColumnTypeName::Serial(kind) => Some(*kind),
+            _ => None,
+        };
+        let static_ty = match serial {
+            Some(kind) => StaticColumnType::Resolved(kind.column_type()),
+            None => crate::sql::ddl_column_type::to_static_column_type(&type_name)?,
+        };
         let ty = match static_ty {
             StaticColumnType::Resolved(t) => t,
             StaticColumnType::EnumCandidate(enum_name) => {
@@ -10352,6 +10408,13 @@ impl<'a> Parser<'a> {
             }
         };
         let constraints = self.parse_column_constraints()?;
+        // SERIAL 列の `DEFAULT` 併記は PostgreSQL の "multiple default values specified" 相当で
+        // `42601`（`DEFAULT NULL`・時刻 DEFAULT も同じ。fail-closed）。
+        if serial.is_some() && constraints.default_declared {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "multiple default values specified for column {name:?}"
+            )));
+        }
         let unique = constraints.unique;
         let unique_name = constraints.unique_name.clone();
         let column = if let ColumnType::Vector(_) = ty {
@@ -10384,7 +10447,8 @@ impl<'a> Parser<'a> {
                 // 時刻 DEFAULT は評価せず列型との適合だけを検査する（SQL-37・Issue #1587）。
                 (None, Some(t)) => Some(crate::sql::ddl::time_column_default(&name, &ty, t)?),
             };
-            let mut column = ColumnDef::new(name, ty, !constraints.not_null);
+            // SERIAL 列は常に `NOT NULL`（`NOT NULL` の明示は冗長だが受理する）。
+            let mut column = ColumnDef::new(name, ty, !constraints.not_null && serial.is_none());
             if let Some(default) = default {
                 column = column.with_default(default);
             }
@@ -10467,6 +10531,7 @@ impl<'a> Parser<'a> {
             references_name,
             alias_type_name,
             array_len_defaulted,
+            serial,
         })
     }
 
@@ -10908,6 +10973,7 @@ impl<'a> Parser<'a> {
             unique,
             unique_name,
             collation,
+            default_declared: seen_default,
         })
     }
 
@@ -18763,7 +18829,7 @@ mod tests {
             assert!(is_column_type_keyword(kw), "{kw}");
             assert!(is_column_type_keyword(&kw.to_ascii_lowercase()), "{kw}");
         }
-        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 31);
+        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 37);
         for ok in ["Int4", "iNt8", "float4", "FLOAT8", "int", "int2", "varchar"] {
             assert!(is_column_type_keyword(ok), "{ok}");
         }
@@ -25445,6 +25511,55 @@ mod tests {
     fn parse_create_table_ok(sql: &str) -> ValidatedCreateTable {
         let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
         validate_create_table_tokens(&tokens).unwrap_or_else(|e| panic!("expected ok, got {e:?}"))
+    }
+
+    /// SERIAL 系の列は基底型・`NOT NULL`・`DEFAULT` なしへ展開され、`serial_columns` に宣言順で載る
+    /// （TABLE-24・Issue #1694）。`DEFAULT` の併記は `DEFAULT NULL` を含めて `42601`。
+    #[test]
+    fn create_table_serial_columns_expand_to_base_types() {
+        use crate::sql::ddl_column_type::SerialKind;
+        let v = parse_create_table_ok(
+            "CREATE TABLE t (a SERIAL, b TEXT, c bigserial NOT NULL, d SMALLSERIAL PRIMARY KEY)",
+        );
+        let by_name = |n: &str| v.columns.iter().find(|c| c.name == n).expect("column");
+        assert_eq!(by_name("a").ty, ColumnType::Integer);
+        assert_eq!(by_name("c").ty, ColumnType::BigInt);
+        assert_eq!(by_name("d").ty, ColumnType::SmallInt);
+        for n in ["a", "c", "d"] {
+            assert!(!by_name(n).nullable, "{n}");
+            assert!(by_name(n).default_expr.is_none(), "{n}");
+        }
+        assert!(by_name("b").nullable);
+        assert_eq!(
+            v.serial_columns,
+            vec![
+                SerialColumn {
+                    column: "a".to_string(),
+                    kind: SerialKind::Int
+                },
+                SerialColumn {
+                    column: "c".to_string(),
+                    kind: SerialKind::Big
+                },
+                SerialColumn {
+                    column: "d".to_string(),
+                    kind: SerialKind::Small
+                },
+            ]
+        );
+        assert!(parse_create_table_ok("CREATE TABLE t (a TEXT)")
+            .serial_columns
+            .is_empty());
+        for sql in [
+            "CREATE TABLE t (a SERIAL DEFAULT 1)",
+            "CREATE TABLE t (a SERIAL DEFAULT NULL)",
+            "CREATE TABLE t (a SERIAL DEFAULT now())",
+            "CREATE TABLE t (a SERIAL NOT NULL DEFAULT nextval('s'))",
+        ] {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            let err = validate_create_table_tokens(&tokens).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     /// `IF NOT EXISTS` 句の解析（TABLE-36、Issue #1613）。

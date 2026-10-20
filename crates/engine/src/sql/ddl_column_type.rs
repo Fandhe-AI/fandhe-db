@@ -98,6 +98,15 @@ pub(crate) fn to_static_column_type_with_array_default(
             return to_static_column_type_with_array_default(target, default_max_len)
         }
         SqlColumnTypeName::Enum(name) => return Ok(StaticColumnType::EnumCandidate(name.clone())),
+        // SERIAL 系は `CREATE TABLE` の列定義だけが受理する擬似型（TABLE-24・Issue #1694）。
+        // 列定義側（`sql::allowlist::Parser::parse_create_table_column`）は本関数を呼ぶ前に
+        // 基底型へ展開するため、ここへ来るのは列定義の外（`ALTER COLUMN TYPE` 等）だけで、
+        // PostgreSQL と同じく型が存在しないものとして `42704` にする（fail-closed）。
+        SqlColumnTypeName::Serial(kind) => {
+            return Err(SqlSurfaceError::UndefinedType {
+                name: kind.canonical().to_string(),
+            })
+        }
         SqlColumnTypeName::Array {
             elem,
             max_len,
@@ -188,6 +197,48 @@ fn array_size_error(e: crate::catalog::CatalogError) -> SqlSurfaceError {
     SqlSurfaceError::unsupported(format!("invalid array type: {e}"))
 }
 
+/// SERIAL 系列宣言の種別（基底の整数幅。TABLE-24・Issue #1694）。`sql::allowlist` が
+/// `CREATE TABLE` の列定義で展開し、`catalog` の暗黙 SEQUENCE 作成が上限値を決めるのに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialKind {
+    /// `SMALLSERIAL`／`SERIAL2`（基底 `SMALLINT`）。
+    Small,
+    /// `SERIAL`／`SERIAL4`（基底 `INTEGER`）。
+    Int,
+    /// `BIGSERIAL`／`SERIAL8`（基底 `BIGINT`）。
+    Big,
+}
+
+impl SerialKind {
+    /// 展開後の列型。
+    pub fn column_type(self) -> ColumnType {
+        match self {
+            SerialKind::Small => ColumnType::SmallInt,
+            SerialKind::Int => ColumnType::Integer,
+            SerialKind::Big => ColumnType::BigInt,
+        }
+    }
+
+    /// 暗黙 SEQUENCE の `MAXVALUE`（列型の上限。枯渇を列に入らない値の `22003` ではなく
+    /// SEQUENCE の `2200H` で報告するため）。
+    pub fn max_value(self) -> i64 {
+        match self {
+            SerialKind::Small => i64::from(i16::MAX),
+            SerialKind::Int => i64::from(i32::MAX),
+            SerialKind::Big => i64::MAX,
+        }
+    }
+
+    /// エラー文言に使う正規名（綴りの別名に依らず固定。利用者入力を反射しない）。
+    pub fn canonical(self) -> &'static str {
+        match self {
+            SerialKind::Small => "smallserial",
+            SerialKind::Int => "serial",
+            SerialKind::Big => "bigserial",
+        }
+    }
+}
+
 /// 型名の許可リスト構文木。`ALTER TABLE ADD COLUMN`（将来 `CREATE TABLE` とも
 /// 共有する前提。`docs/design/sql-alter-table-add-column.md` 参照）が受理する
 /// 型名の閉じた集合＋ ENUM 型名候補。
@@ -253,6 +304,11 @@ pub enum SqlColumnTypeName {
         name: String,
         target: Box<SqlColumnTypeName>,
     },
+    /// `SERIAL`／`BIGSERIAL`／`SMALLSERIAL`（別名 `SERIAL4`・`SERIAL8`・`SERIAL2`。TABLE-24・
+    /// Issue #1694）。型ではなく列宣言の短縮記法で、`CREATE TABLE` の列定義だけが基底の整数型・
+    /// `NOT NULL`・暗黙 SEQUENCE への `DEFAULT nextval` へ展開する。他の位置は
+    /// [`to_static_column_type`]・CAST が `42704`、`ADD COLUMN` が `0A000`、配列は `0A000`。
+    Serial(SerialKind),
     /// 上記いずれの予約型名にも一致しなかった識別子。ENUM 型名の候補として
     /// 実行段が `Storage::get_enum_type` で存在確認・語彙解決する。
     Enum(String),
@@ -275,6 +331,14 @@ pub(crate) fn parse_column_type_name(
     pos: &mut usize,
 ) -> Result<SqlColumnTypeName, SqlSurfaceError> {
     let base = parse_base_type_name(tokens, pos)?;
+    // `SERIAL[]` は PostgreSQL でも未実装（"array of serial is not implemented"）。
+    if matches!(base, SqlColumnTypeName::Serial(_))
+        && matches!(tokens.get(*pos), Some(Token::Punct('[')))
+    {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "array of serial is not supported".to_string(),
+        });
+    }
     // 配列サフィックス `[]`／`[N]` の連続（Issue #1605）。`[]` の連続数が次元数で、
     // 上限 `MAX_ARRAY_DIMS` 超過は `54000`。`[N]`（要素総数の上限）は全体で高々 1 個
     // （PostgreSQL はサイズを無視するが、本実装は書き込み上限として使うため 2 個目以降は
@@ -336,6 +400,8 @@ pub(crate) fn alias_spelling(ty: &SqlColumnTypeName) -> Option<&str> {
 /// コンパイラが追従漏れを検出する。
 #[derive(Debug, Clone, Copy)]
 enum TypeNameKind {
+    /// SERIAL 系の列宣言（Issue #1694）。展開は列定義側が行う。
+    Serial(SerialKind),
     /// 綴りを保持せず写す（`INT` を含む。構文木は従来どおり plain）。
     Direct(fn() -> SqlColumnTypeName),
     /// 綴りを保持する別名（実行段が同名 ENUM との衝突検出に使う。Issue #1528）。
@@ -427,6 +493,12 @@ const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
         "SMALLINT",
         TypeNameKind::Direct(|| SqlColumnTypeName::SmallInt),
     ),
+    ("SERIAL", TypeNameKind::Serial(SerialKind::Int)),
+    ("SERIAL4", TypeNameKind::Serial(SerialKind::Int)),
+    ("BIGSERIAL", TypeNameKind::Serial(SerialKind::Big)),
+    ("SERIAL8", TypeNameKind::Serial(SerialKind::Big)),
+    ("SMALLSERIAL", TypeNameKind::Serial(SerialKind::Small)),
+    ("SERIAL2", TypeNameKind::Serial(SerialKind::Small)),
     ("VARCHAR", TypeNameKind::Varchar),
     ("CHAR", TypeNameKind::Char),
     ("CHARACTER", TypeNameKind::Character),
@@ -524,6 +596,7 @@ fn parse_base_type_name(
         return Ok(SqlColumnTypeName::Enum(name));
     };
     match kind {
+        TypeNameKind::Serial(kind) => Ok(SqlColumnTypeName::Serial(*kind)),
         TypeNameKind::Direct(make) => Ok(make()),
         TypeNameKind::Alias(make) => Ok(alias_type(name, make())),
         TypeNameKind::DoublePrecision => {
@@ -1164,6 +1237,33 @@ mod tests {
         assert!(parse_type("TEXT[0]").is_ok());
         let (ty, _) = parse_type("mood[]").expect("valid");
         assert!(matches!(ty, SqlColumnTypeName::Array { .. }));
+    }
+
+    /// SERIAL 系（TABLE-24・Issue #1694）: 6 綴り（大小無視）を種別へ写し、配列は `0A000`、
+    /// 型としての写像（`to_static_column_type`）は `42704`。
+    #[test]
+    fn serial_spellings_parse_and_are_not_static_types() {
+        for (raw, kind) in [
+            ("SERIAL", SerialKind::Int),
+            ("serial4", SerialKind::Int),
+            ("BigSerial", SerialKind::Big),
+            ("SERIAL8", SerialKind::Big),
+            ("smallserial", SerialKind::Small),
+            ("Serial2", SerialKind::Small),
+        ] {
+            let (ty, consumed) = parse_type(raw).expect(raw);
+            assert_eq!(ty, SqlColumnTypeName::Serial(kind), "{raw}");
+            assert_eq!(consumed, 1);
+            let e = to_static_column_type(&ty).expect_err(raw);
+            assert_eq!(e.wire_code(), "42704", "{raw}");
+        }
+        for raw in ["SERIAL[]", "BIGSERIAL[3]", "smallserial[][]"] {
+            let e = parse_type(raw).expect_err(raw);
+            assert_eq!(e.wire_code(), "0A000", "{raw}");
+        }
+        assert_eq!(SerialKind::Small.max_value(), i64::from(i16::MAX));
+        assert_eq!(SerialKind::Int.max_value(), i64::from(i32::MAX));
+        assert_eq!(SerialKind::Big.max_value(), i64::MAX);
     }
 
     /// 多次元宣言（Issue #1605・TABLE-35 (2)）: `[]` の連続数が次元数、`[N]` は全体で高々 1 個、

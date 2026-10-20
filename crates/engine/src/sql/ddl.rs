@@ -164,6 +164,10 @@ pub(crate) fn build_table_schema(
         }
     }
     reject_time_default_set_default(&columns, &validated.foreign_keys)?;
+    // SERIAL 列の暗黙 `DEFAULT nextval` は展開が後段（カタログ側）で付くため、上の検査では
+    // 見えない。`INTEGER DEFAULT nextval(...)` と同じく `SET DEFAULT` の対象にできず `0A000`
+    // で拒否する（ON DELETE／ON UPDATE 双方。Issue #1694）。
+    reject_serial_set_default(&validated.serial_columns, &validated.foreign_keys)?;
     let mut schema = TableSchema::new(validated.table_name.clone(), columns);
     // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`validated.primary_key` は
     // `sql::allowlist::finalize_primary_key` が `id` 単独宣言を `None` へ既に
@@ -243,7 +247,22 @@ pub(crate) fn execute_create_table(
     let schema = build_table_schema(Some(storage), validated, limits)?;
     // 早期判定〔上〕と書き込みの間に他セッションが同名を作った場合の TOCTOU 対策。名前衝突は
     // commit・世代 bump の前に返るため、no-op は副作用を残さない。
-    match storage.create_table(&schema) {
+    // SERIAL 系の列（TABLE-24・Issue #1694）があれば、暗黙 SEQUENCE の作成・所有者設定・
+    // `DEFAULT nextval` の付与を表の作成と同じ write txn で行う（部分的な成功を残さない）。
+    // SERIAL 列の無い表は従来の `create_table` のままで、挙動・カタログのバイト列は変わらない。
+    let serials: Vec<(String, i64)> = validated
+        .serial_columns
+        .iter()
+        .map(|s| (s.column.clone(), s.kind.max_value()))
+        .collect();
+    let created = if serials.is_empty() {
+        storage.create_table(&schema)
+    } else {
+        storage
+            .create_table_with_implicit_sequences(&schema, &serials)
+            .map(|_| ())
+    };
+    match created {
         Err(CatalogError::TableAlreadyExists(_)) if validated.if_not_exists => {
             return Ok(CreateTableOutcome {});
         }
@@ -251,6 +270,10 @@ pub(crate) fn execute_create_table(
     }
     .map_err(|e| match e {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::duplicate_table(name),
+        // 暗黙 SEQUENCE の件数上限（名前の決定の打ち切りを含む）。`CREATE SEQUENCE` と同じ `54000`。
+        CatalogError::ViewLimitExceeded(_) => {
+            SqlSurfaceError::payload_too_large("too many sequences")
+        }
         // `FOREIGN KEY` の参照先（TABLE-17・TASK-205、Issue #907）。`create_table` が
         // `TableNotFound` を返すのは参照先テーブルの不在のみ（作成対象自身の重複は
         // 上の `TableAlreadyExists` が先に判定する）。参照先名がビュー・索引名なら
@@ -288,7 +311,6 @@ pub(crate) fn execute_create_table(
         | CatalogError::DependentViewsExist(_)
         | CatalogError::ViewDefinitionChanged(_)
         | CatalogError::ViewReferenceCycle(_)
-        | CatalogError::ViewLimitExceeded(_)
         | CatalogError::SchemaAlreadyExists(_)
         | CatalogError::SchemaNotFound(_)
         | CatalogError::ReservedSchemaName(_)
@@ -376,6 +398,14 @@ pub(crate) fn execute_create_temp_table(
                 SqlSurfaceError::invalid_table_definition(table.table_name.clone())
             },
         );
+    }
+    // SERIAL 系は暗黙 SEQUENCE を永続カタログへ作る必要があるが、一時表は永続 DB を参照できない
+    // （下の `DEFAULT nextval` と同じ理由。TABLE-24・Issue #1694）。`42P01`／`42704` へ化けさせず
+    // 構文検証済みの宣言の時点で `0A000` にする。
+    if !table.serial_columns.is_empty() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "serial columns are not supported for temporary tables",
+        ));
     }
     let schema = build_table_schema(None, table, schema_limits)?;
     // 一時表は永続 DB の SEQUENCE カタログを参照できないため、`DEFAULT nextval(...)` は
@@ -966,6 +996,8 @@ pub(crate) fn execute_alter_table_multiple(
             let mut results: Vec<Option<AlterTableAction>> = vec![None; stmt.actions.len()];
             let mut changed = false;
             let mut live_checked = false;
+            // DROP COLUMN した列名。所有 SEQUENCE の削除・依存検査は全アクション適用後に行う。
+            let mut dropped_columns: Vec<String> = Vec::new();
             for &i in &order {
                 let Some(action) = stmt.actions.get(i) else {
                     continue;
@@ -977,8 +1009,14 @@ pub(crate) fn execute_alter_table_multiple(
                         .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
                     live_checked = true;
                 }
-                let (done, apply) =
-                    apply_alter_action_in_txn(storage, txn, &stmt.table_name, action, limits)?;
+                let (done, apply) = apply_alter_action_in_txn(
+                    storage,
+                    txn,
+                    &stmt.table_name,
+                    action,
+                    limits,
+                    &mut dropped_columns,
+                )?;
                 changed |= apply == AlterApply::Applied;
                 if let Some(slot) = results.get_mut(i) {
                     *slot = Some(done);
@@ -989,7 +1027,15 @@ pub(crate) fn execute_alter_table_multiple(
             // 0 本のままなら単一 DROP と同じ 42601 で txn ごと破棄）。
             Storage::ensure_table_has_live_column_in_txn(txn, &stmt.table_name)
                 .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
-            Ok((results, changed))
+            // 全アクション適用後のスキーマで、削除列が所有する SEQUENCE の依存検査・削除を行う
+            // （同じ文で DEFAULT を外した／参照列を落とした場合は依存なしとして通す）。
+            let dropped_sequence_ids = Storage::drop_owned_sequences_of_columns_in_txn(
+                txn,
+                &stmt.table_name,
+                &dropped_columns,
+            )
+            .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
+            Ok((results, changed, dropped_sequence_ids))
         })
         .map_err(|e| match e {
             AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
@@ -1048,6 +1094,7 @@ fn apply_alter_action_in_txn(
     table_name: &str,
     action: &ValidatedAlterTable,
     limits: &SchemaLimits,
+    dropped_columns: &mut Vec<String>,
 ) -> Result<(AlterTableAction, AlterApply), AlterCheckError> {
     use crate::catalog::{get_table_schema_in_txn, get_table_schema_in_txn_impl};
     match action {
@@ -1081,8 +1128,16 @@ fn apply_alter_action_in_txn(
             let map = map_drop_alter_column_error;
             Storage::validate_alter_column_target(table_name, &stmt.column_name)
                 .map_err(|e| alter_in_txn_error(e, map))?;
-            Storage::alter_table_drop_column_in_txn(txn, table_name, &stmt.column_name, true)
-                .map_err(|e| alter_in_txn_error(e, map))?;
+            // 所有 SEQUENCE は削除せず、列名だけ記録する（全アクション適用後に呼び出し元が一括処理）。
+            Storage::alter_table_drop_column_core_in_txn(
+                txn,
+                table_name,
+                &stmt.column_name,
+                true,
+                false,
+            )
+            .map_err(|e| alter_in_txn_error(e, map))?;
+            dropped_columns.push(stmt.column_name.clone());
             Ok((
                 AlterTableAction::DropColumn {
                     column_name: stmt.column_name.clone(),
@@ -1966,6 +2021,28 @@ fn reject_time_default_set_default(
         if has_time_default {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: "SET DEFAULT referential action on a column with a time function DEFAULT is not supported".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// SERIAL 列を `ON DELETE／UPDATE SET DEFAULT` の対象にする FK 宣言を `0A000` で拒否する
+/// （暗黙 `DEFAULT nextval` は連鎖更新で評価できないため。時刻 DEFAULT と同じ契約）。
+fn reject_serial_set_default(
+    serial_columns: &[crate::sql::allowlist::SerialColumn],
+    foreign_keys: &[crate::catalog::ForeignKeyDef],
+) -> Result<(), SqlSurfaceError> {
+    for fk in foreign_keys {
+        if fk.uses_set_default()
+            && fk
+                .columns()
+                .iter()
+                .any(|name| serial_columns.iter().any(|s| &s.column == name))
+        {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "SET DEFAULT referential action on a SERIAL column is not supported"
+                    .to_string(),
             });
         }
     }
@@ -3279,6 +3356,7 @@ mod tests {
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
+            serial_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3471,6 +3549,7 @@ mod tests {
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
+            serial_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new(
@@ -3500,6 +3579,7 @@ mod tests {
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
+            serial_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3548,6 +3628,7 @@ mod tests {
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
+            serial_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3575,6 +3656,7 @@ mod tests {
             primary_key_name: None,
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
+            serial_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new("a", crate::catalog::ColumnType::Vector(4), false),
