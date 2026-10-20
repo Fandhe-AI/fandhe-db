@@ -110,6 +110,15 @@
   対象へ加え、同じトランザクションで自テナントの行を削除する（参照アクションは発火しない）。公開 API は
   `ValidatedTruncate::behavior` の追加、`TruncateOutcome` の `Copy` 削除と `cascaded()` の追加、
   `TenantWriteError::TruncateReferencedByForeignKey` の追加。
+- IDENTITY 列（Issue #1695・TABLE-24）: `CREATE TABLE` の列制約 `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY
+  [(<SEQUENCE オプション>)]` を受理する（従来は `42601`）。整数型・`NOT NULL`・列が所有する暗黙 SEQUENCE（型は列型で
+  決まり、範囲外のオプションは `22023`）・`DEFAULT` の IDENTITY 表現へ展開し、表と同じ write txn で作る。`ALWAYS` 列への
+  明示値・明示 NULL・UPDATE の SET は `428C9`（HTTP 400。型の束縛より前で、SEQUENCE を進めない）、`BY DEFAULT` は
+  明示値を受け付ける。COPY は IDENTITY 列へ入力値をそのまま書く。`OVERRIDING`・ALTER の IDENTITY 操作・IDENTITY 列の
+  型変更・一時表・生成列は `0A000`、`DEFAULT` との併記は `42601`。公開 API は `ColumnDefault::Identity`・`IdentityKind`・
+  `ValidatedCreateTable::identity_columns`（pub フィールド追加）・`IdentityColumn`・`SequenceOptions`・
+  `SqlSurfaceError::GeneratedAlways`・`ErrorClass::GeneratedAlways`（`428C9`）の追加。カタログの列 `default` に新タグ
+  `a`／`b` を足す（旧バイナリは未知タグを `CorruptSchema` で拒否する）。
 - `SERIAL` 系型（Issue #1694・TABLE-24）: `CREATE TABLE` の `SERIAL`／`BIGSERIAL`／`SMALLSERIAL`（別名 `SERIAL4`・
   `SERIAL8`・`SERIAL2`）を受理する（従来は ENUM 型名候補として `42704`）。基底の整数型・`NOT NULL`・暗黙 SEQUENCE
   （`<table>_<col>_seq`・列が所有・MAXVALUE は列型の上限）・`DEFAULT nextval` へ展開し、表と同じ write txn で作る。

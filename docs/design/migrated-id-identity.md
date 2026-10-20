@@ -92,8 +92,9 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
 - 列と SEQUENCE の結び付きは、RENAME に耐えるよう内部 ID で持つ方式を推奨する。現状の
   `ColumnDefault::Sequence` は名前で保持するため、sequence ADR §9.2 の「依存する DEFAULT が
   あれば RENAME は `0A000`」が掛かる。名前か内部 ID かは #1698 で確定する
-- #1695（`GENERATED … AS IDENTITY`）と表現を共有する。#1695 が先に着地した場合はその表現へ
-  合わせ、本案は「#1695 未着地時の暫定」とする
+- #1695（`GENERATED … AS IDENTITY`）と表現を共有する。#1695 は `ColumnDefault::Identity` を採用して着地した
+  （[sequence-namespace-and-ledger.md](sequence-namespace-and-ledger.md) §13）。#1698 はこの表現へ合わせ、
+  本案の独自表現は採らない
 - 保留案: 新しい列属性 `identity`（BY DEFAULT／ALWAYS と sequence_id）。ALWAYS や `OVERRIDING` を
   扱う #1695 の判断に委ねる
 

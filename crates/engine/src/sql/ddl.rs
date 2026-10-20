@@ -167,7 +167,11 @@ pub(crate) fn build_table_schema(
     // SERIAL 列の暗黙 `DEFAULT nextval` は展開が後段（カタログ側）で付くため、上の検査では
     // 見えない。`INTEGER DEFAULT nextval(...)` と同じく `SET DEFAULT` の対象にできず `0A000`
     // で拒否する（ON DELETE／ON UPDATE 双方。Issue #1694）。
-    reject_serial_set_default(&validated.serial_columns, &validated.foreign_keys)?;
+    reject_serial_set_default(
+        &validated.serial_columns,
+        &validated.identity_columns,
+        &validated.foreign_keys,
+    )?;
     let mut schema = TableSchema::new(validated.table_name.clone(), columns);
     // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`validated.primary_key` は
     // `sql::allowlist::finalize_primary_key` が `id` 単独宣言を `None` へ既に
@@ -250,11 +254,7 @@ pub(crate) fn execute_create_table(
     // SERIAL 系の列（TABLE-24・Issue #1694）があれば、暗黙 SEQUENCE の作成・所有者設定・
     // `DEFAULT nextval` の付与を表の作成と同じ write txn で行う（部分的な成功を残さない）。
     // SERIAL 列の無い表は従来の `create_table` のままで、挙動・カタログのバイト列は変わらない。
-    let serials: Vec<(String, i64)> = validated
-        .serial_columns
-        .iter()
-        .map(|s| (s.column.clone(), s.kind.max_value()))
-        .collect();
+    let serials = implicit_sequences_in_column_order(&schema, validated)?;
     let created = if serials.is_empty() {
         storage.create_table(&schema)
     } else {
@@ -407,14 +407,20 @@ pub(crate) fn execute_create_temp_table(
             "serial columns are not supported for temporary tables",
         ));
     }
+    // IDENTITY 列も同じ理由で一時表では未対応（TABLE-24・Issue #1695）。
+    if !table.identity_columns.is_empty() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "identity columns are not supported for temporary tables",
+        ));
+    }
     let schema = build_table_schema(None, table, schema_limits)?;
     // 一時表は永続 DB の SEQUENCE カタログを参照できないため、`DEFAULT nextval(...)` は
     // 作成時に `0A000` で拒否する（INSERT 時に `42P01` へ化けさせない。TABLE-24・TABLE-44）。
     if schema.columns.iter().any(|c| {
-        matches!(
-            c.default_expr,
-            Some(crate::catalog::ColumnDefault::Sequence(_))
-        )
+        c.default_expr
+            .as_ref()
+            .and_then(crate::catalog::ColumnDefault::sequence_name)
+            .is_some()
     }) {
         return Err(SqlSurfaceError::feature_not_supported(
             "DEFAULT nextval is not supported for temporary tables",
@@ -2027,22 +2033,126 @@ fn reject_time_default_set_default(
     Ok(())
 }
 
+/// SERIAL 系と IDENTITY 列の暗黙 SEQUENCE 宣言を、列の宣言順の 1 本のリストへ組み立てる
+/// （`<table>_<col>_seq` の衝突番号〔`seq1`…〕が列順に決まるようにするため。TABLE-24・
+/// Issue #1694／#1695）。IDENTITY のオプションは列型の境界つきで意味検証する（`22023`）。
+/// `execute_create_table` が `Storage::create_table_with_implicit_sequences` へ渡す。
+fn implicit_sequences_in_column_order(
+    schema: &TableSchema,
+    validated: &ValidatedCreateTable,
+) -> Result<Vec<crate::catalog::sequence::ImplicitSequence>, SqlSurfaceError> {
+    use crate::catalog::sequence::{ImplicitSequence, SequenceParams};
+    let mut out = Vec::with_capacity(
+        validated
+            .serial_columns
+            .len()
+            .saturating_add(validated.identity_columns.len()),
+    );
+    for column in &schema.columns {
+        if let Some(s) = validated
+            .serial_columns
+            .iter()
+            .find(|s| s.column == column.name)
+        {
+            out.push(ImplicitSequence {
+                column: s.column.clone(),
+                params: SequenceParams {
+                    increment: 1,
+                    min_value: 1,
+                    max_value: s.kind.max_value(),
+                    start: 1,
+                    cycle: false,
+                },
+                identity: None,
+            });
+        } else if let Some(i) = validated
+            .identity_columns
+            .iter()
+            .find(|i| i.column == column.name)
+        {
+            out.push(ImplicitSequence {
+                column: i.column.clone(),
+                params: resolve_identity_sequence_params(&column.ty, &i.options)?,
+                identity: Some(i.kind),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// IDENTITY 列の暗黙 SEQUENCE 定義の意味検証と既定値の補完（TABLE-24・Issue #1695）。
+/// 型は列型（`SMALLINT`／`INTEGER`／`BIGINT`）から決まり、既定の境界は列型の範囲になる
+/// （昇順: `MINVALUE 1`・`MAXVALUE` は型上限・`START = MINVALUE`。降順: `MINVALUE` は型下限・
+/// `MAXVALUE -1`・`START = MAXVALUE`）。利用者指定が列型の範囲外なら `22023`
+/// （固定文言。値を含めない）。判定順は [`resolve_sequence_params`] と同じ。
+fn resolve_identity_sequence_params(
+    ty: &ColumnType,
+    options: &crate::sql::allowlist::SequenceOptions,
+) -> Result<crate::catalog::sequence::SequenceParams, SqlSurfaceError> {
+    let invalid = |detail: &'static str| SqlSurfaceError::InvalidParameterValue { detail };
+    let (type_min, type_max) = crate::sql::ddl_column_type::identity_type_bounds(ty).ok_or(
+        invalid("identity column type must be smallint, integer, or bigint"),
+    )?;
+    let increment = options.increment.unwrap_or(1);
+    if increment == 0 {
+        return Err(invalid("INCREMENT must not be zero"));
+    }
+    let ascending = increment > 0;
+    let min_value = options
+        .min_value
+        .unwrap_or(if ascending { 1 } else { type_min });
+    let max_value = options
+        .max_value
+        .unwrap_or(if ascending { type_max } else { -1 });
+    if min_value < type_min || min_value > type_max {
+        return Err(invalid(
+            "MINVALUE is out of range for the identity column type",
+        ));
+    }
+    if max_value < type_min || max_value > type_max {
+        return Err(invalid(
+            "MAXVALUE is out of range for the identity column type",
+        ));
+    }
+    if min_value >= max_value {
+        return Err(invalid("MINVALUE must be less than MAXVALUE"));
+    }
+    let start = options
+        .start
+        .unwrap_or(if ascending { min_value } else { max_value });
+    if start < min_value {
+        return Err(invalid("START value cannot be less than MINVALUE"));
+    }
+    if start > max_value {
+        return Err(invalid("START value cannot be greater than MAXVALUE"));
+    }
+    Ok(crate::catalog::sequence::SequenceParams {
+        increment,
+        min_value,
+        max_value,
+        start,
+        cycle: options.cycle.unwrap_or(false),
+    })
+}
+
 /// SERIAL 列を `ON DELETE／UPDATE SET DEFAULT` の対象にする FK 宣言を `0A000` で拒否する
 /// （暗黙 `DEFAULT nextval` は連鎖更新で評価できないため。時刻 DEFAULT と同じ契約）。
 fn reject_serial_set_default(
     serial_columns: &[crate::sql::allowlist::SerialColumn],
+    identity_columns: &[crate::sql::allowlist::IdentityColumn],
     foreign_keys: &[crate::catalog::ForeignKeyDef],
 ) -> Result<(), SqlSurfaceError> {
     for fk in foreign_keys {
         if fk.uses_set_default()
-            && fk
-                .columns()
-                .iter()
-                .any(|name| serial_columns.iter().any(|s| &s.column == name))
+            && fk.columns().iter().any(|name| {
+                serial_columns.iter().any(|s| &s.column == name)
+                    || identity_columns.iter().any(|i| &i.column == name)
+            })
         {
             return Err(SqlSurfaceError::FeatureNotSupported {
-                detail: "SET DEFAULT referential action on a SERIAL column is not supported"
-                    .to_string(),
+                detail:
+                    "SET DEFAULT referential action on a SERIAL or identity column is not supported"
+                        .to_string(),
             });
         }
     }
@@ -3357,6 +3467,7 @@ mod tests {
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
+            identity_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3550,6 +3661,7 @@ mod tests {
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
+            identity_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new(
@@ -3580,6 +3692,7 @@ mod tests {
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
+            identity_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3629,6 +3742,7 @@ mod tests {
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
+            identity_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -3657,6 +3771,7 @@ mod tests {
             alias_type_names: Vec::new(),
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
+            identity_columns: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new("a", crate::catalog::ColumnType::Vector(4), false),

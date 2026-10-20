@@ -1297,10 +1297,10 @@ fn check_volatile_columns(
                 )
             }),
             VolatileColumn::DefaultSequence(_) => schema.columns.get(idx).is_some_and(|c| {
-                matches!(
-                    c.default_expr,
-                    Some(crate::catalog::ColumnDefault::Sequence(_))
-                )
+                c.default_expr
+                    .as_ref()
+                    .and_then(crate::catalog::ColumnDefault::sequence_name)
+                    .is_some()
             }),
         };
         let is_vector = schema
@@ -1506,11 +1506,13 @@ fn assign_sequence_values(
             })?;
             let (seq_name, func): (&str, SequenceFunc) = match mark {
                 VolatileColumn::Sequence(_, func, name) => (name.as_str(), *func),
-                _ => match &column.default_expr {
-                    Some(crate::catalog::ColumnDefault::Sequence(name)) => {
-                        (name.as_str(), SequenceFunc::Nextval)
-                    }
-                    _ => {
+                _ => match column
+                    .default_expr
+                    .as_ref()
+                    .and_then(crate::catalog::ColumnDefault::sequence_name)
+                {
+                    Some(name) => (name, SequenceFunc::Nextval),
+                    None => {
                         return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                             "sequence DEFAULT does not match the table schema".to_string(),
                         )))

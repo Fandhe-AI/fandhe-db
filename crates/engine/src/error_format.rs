@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 76;
+    count = 77;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -259,6 +259,10 @@ define_error_classes! {
     /// 予約名（`pg_` 接頭辞）の SCHEMA 作成を拒否した（`42939`。TABLE-27・ERR-6、Issue #1713）。
     /// [`crate::sql::allowlist::SqlSurfaceError::ReservedName`] の写像。
     ReservedName => ("42939", "RESERVED_NAME"),
+    /// `GENERATED ALWAYS AS IDENTITY` 列へ利用者が値を書こうとした（`428C9`。TABLE-24・ERR-6、
+    /// Issue #1695）。スキーマだけで決まる拒否で、テナントの状態に依存しない（存在オラクルにならない）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::GeneratedAlways`] の写像。
+    GeneratedAlways => ("428C9", "GENERATED_ALWAYS"),
     /// `CREATE TABLE` が指定したテーブル名が既に存在する（`42P07`）。TABLE-4・
     /// TASK-85（Issue #899）が追加。上書きしない設計（既存スキーマは変更されない）。
     /// `CREATE VIEW`（TABLE-18・SQL-23・TASK-205、Issue #909）が既存のテーブル

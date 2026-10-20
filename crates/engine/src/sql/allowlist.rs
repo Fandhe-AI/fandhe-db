@@ -735,6 +735,9 @@ pub enum SqlSurfaceError {
     InvalidSchemaName { name: String },
     /// 予約名（`pg_` 接頭辞）の SCHEMA 名の指定（TABLE-27・ERR-6、Issue #1713）。`42939`。
     ReservedName { name: String },
+    /// `GENERATED ALWAYS AS IDENTITY` 列への明示値の書き込み（INSERT／UPDATE。TABLE-24・ERR-6、
+    /// Issue #1695）。`428C9`。列名は利用者自身が書いた識別子のみ。
+    GeneratedAlways { column: String },
     /// `ALTER TABLE ... ADD [CONSTRAINT <name>] {CHECK|FOREIGN KEY}` の明示名が
     /// 同一テーブルの既存制約名と衝突した（TABLE-22、Issue #1195）。
     /// ERR-6: `42710`。UNIQUE の名前衝突は `DuplicateTable`（`42P07`）のまま。
@@ -1293,6 +1296,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateSchema { .. } => ErrorClass::DuplicateSchema,
             SqlSurfaceError::InvalidSchemaName { .. } => ErrorClass::InvalidSchemaName,
             SqlSurfaceError::ReservedName { .. } => ErrorClass::ReservedName,
+            SqlSurfaceError::GeneratedAlways { .. } => ErrorClass::GeneratedAlways,
             SqlSurfaceError::DuplicateObject { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::DuplicateType { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::InvalidTableDefinition { .. }
@@ -1484,6 +1488,10 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::ReservedName { name } => {
                 write!(f, "unacceptable schema name: {name}")
+            }
+            // 列名は利用者自身が書いた識別子のみ（値・他テナントの情報は含めない。Issue #1695）。
+            SqlSurfaceError::GeneratedAlways { column } => {
+                write!(f, "cannot insert a non-DEFAULT value into column {column}")
             }
             // 制約名はクライアント自身が指定した識別子。テーブル名・テナントは含めない。
             SqlSurfaceError::DuplicateObject { name } => {
@@ -3245,6 +3253,9 @@ struct ColumnConstraints {
     /// `DEFAULT` 句を 1 つでも書いたか（`DEFAULT NULL`・時刻 DEFAULT を含む。`default` が `None`
     /// になる `DEFAULT NULL` と区別するため）。SERIAL 列への `DEFAULT` 併記の拒否に使う（Issue #1694）。
     default_declared: bool,
+    /// 列制約 `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(<SEQUENCE オプション>)]`
+    /// （TABLE-24・Issue #1695）。`CREATE TABLE` だけが受理し、`ALTER TABLE ADD COLUMN` は `0A000`。
+    identity: Option<(crate::catalog::IdentityKind, SequenceOptions)>,
 }
 
 /// `CREATE TABLE` の列 1 個ぶんの構文解析結果（[`Parser::parse_create_table_column`]
@@ -3273,6 +3284,9 @@ struct ParsedCreateTableColumn {
     /// SERIAL 系の列宣言だった場合の種別（TABLE-24・Issue #1694）。`column` は基底型・`NOT NULL`
     /// へ展開済みで、`DEFAULT nextval` は暗黙 SEQUENCE の名前が決まる書き込み txn 内で付く。
     serial: Option<crate::sql::ddl_column_type::SerialKind>,
+    /// IDENTITY 列だった場合の種別と SEQUENCE オプション（TABLE-24・Issue #1695）。`column` は
+    /// `NOT NULL`・`DEFAULT` なしで、`DEFAULT` は暗黙 SEQUENCE の名前が決まる書き込み txn 内で付く。
+    identity: Option<(crate::catalog::IdentityKind, SequenceOptions)>,
 }
 
 /// `REFERENCES` 句（列制約・表制約の双方で共有。TABLE-17・TASK-205、
@@ -3754,6 +3768,40 @@ pub struct ValidatedCreateTable {
     ///
     /// BREAKING CHANGE: 公開フィールドの追加（構造体リテラルで生成する外部コードは追随が必要）。
     pub serial_columns: Vec<SerialColumn>,
+    /// IDENTITY 列の宣言（宣言順。TABLE-24・Issue #1695）。該当列は `columns` で整数型・`NOT NULL`・
+    /// `DEFAULT` なしへ展開済みで、実行段（`sql::ddl::execute_create_table`）が SERIAL と同じ宣言順の
+    /// 1 本のリストにして暗黙 SEQUENCE の作成・所有者設定・`ColumnDefault::Identity` の付与を
+    /// 表の作成と同じ write txn で行う。
+    ///
+    /// BREAKING CHANGE: 公開フィールドの追加（構造体リテラルで生成する外部コードは追随が必要）。
+    pub identity_columns: Vec<IdentityColumn>,
+}
+
+/// IDENTITY 列の宣言 1 件（[`ValidatedCreateTable::identity_columns`]。TABLE-24・Issue #1695）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityColumn {
+    /// 列名（`ValidatedCreateTable::columns` に存在する）。
+    pub column: String,
+    /// `ALWAYS`／`BY DEFAULT` の別。
+    pub kind: crate::catalog::IdentityKind,
+    /// 括弧内の SEQUENCE オプション（解釈済みの i64。範囲の意味検証〔22023〕は実行段が列型の
+    /// 境界つきで行う）。
+    pub options: SequenceOptions,
+}
+
+/// SEQUENCE オプション列（`START`／`INCREMENT`／`MINVALUE`／`MAXVALUE`／`CYCLE`）の構文解析結果。
+/// `CREATE SEQUENCE` と IDENTITY 列の括弧内が共有する（TABLE-24・Issue #1688／#1695）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SequenceOptions {
+    pub(crate) start: Option<i64>,
+    pub(crate) increment: Option<i64>,
+    pub(crate) min_value: Option<i64>,
+    pub(crate) max_value: Option<i64>,
+    pub(crate) cycle: Option<bool>,
+    /// `NO MINVALUE` が指定されたか（既定値と同義。同種オプションの重複判定にだけ使う）。
+    pub(crate) no_min_value: bool,
+    /// `NO MAXVALUE` が指定されたか（同上）。
+    pub(crate) no_max_value: bool,
 }
 
 /// SERIAL 系の列宣言 1 件（[`ValidatedCreateTable::serial_columns`]）。
@@ -8902,6 +8950,13 @@ impl<'a> Parser<'a> {
         }
         self.expect_punct(')')?;
 
+        // `OVERRIDING { SYSTEM | USER } VALUE`（TABLE-24・Issue #1695）は未対応。`42601` ではなく
+        // `0A000` で明示する（fail-closed。内容照合ハッシュへの反映設計が要るため後続 Issue）。
+        if self.peek_ident_matches("OVERRIDING") {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "INSERT ... OVERRIDING is not supported",
+            ));
+        }
         self.expect_contextual_keyword("VALUES")?;
         let mut rows: Vec<Vec<InsertLiteral>> = vec![self.parse_insert_values_row(&columns)?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
@@ -9560,6 +9615,13 @@ impl<'a> Parser<'a> {
                         "UNIQUE is not supported in ALTER TABLE ADD COLUMN",
                     ));
                 }
+                // IDENTITY 列は既存行への採番補完が要るため未対応（SERIAL と同じ理由。Issue #1695）。
+                if constraints.identity.is_some() {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "identity column is not supported in ALTER TABLE ADD COLUMN"
+                            .to_string(),
+                    });
+                }
                 // 時刻値関数の DEFAULT は既存行の補完値を固定できないため拒否する
                 // （fail-closed。設計 D10・SQL-37・Issue #1587）。
                 if constraints.time_default.is_some() {
@@ -9705,6 +9767,14 @@ impl<'a> Parser<'a> {
             self.expect_contextual_keyword("COLUMN")?;
             let column_name = self.expect_ident()?;
             reject_reserved_alter_column_name(&column_name)?;
+            // IDENTITY 列の変更（`ADD GENERATED`・`SET GENERATED`・`DROP IDENTITY`・`RESTART`・
+            // `SET <SEQUENCE オプション>`。TABLE-24・Issue #1695）は未対応。黙って `42601` にせず
+            // `0A000` で明示する（fail-closed。カタログを見ない判定のため存在オラクルにならない）。
+            if self.is_alter_column_identity_action() {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "ALTER COLUMN identity actions are not supported",
+                ));
+            }
             // `ALTER COLUMN <col> SET NOT NULL`（TABLE-39 (3)、Issue #1631）・
             // `SET DEFAULT <式>`（TABLE-39 (1)、Issue #1628）。`SET DATA TYPE` は `TYPE` と
             // 同義（TABLE-40、Issue #1635）で下の `TYPE` 処理へ合流する。それ以外は `42601`。
@@ -9957,6 +10027,7 @@ impl<'a> Parser<'a> {
         let mut alias_type_names: Vec<String> = Vec::new();
         let mut array_len_defaulted: Vec<String> = Vec::new();
         let mut serial_columns: Vec<SerialColumn> = Vec::new();
+        let mut identity_columns: Vec<IdentityColumn> = Vec::new();
         // `PRIMARY KEY` 宣言（列制約・表制約のいずれか一方のみ。TABLE-16・
         // TASK-204、Issue #903）。列名の存在検証・`id` 混在検査・nullable の
         // 強制は列リスト全体の構文判定を終えた後（このループを抜けた後）に
@@ -10138,6 +10209,13 @@ impl<'a> Parser<'a> {
                         kind,
                     });
                 }
+                if let Some((kind, options)) = parsed.identity {
+                    identity_columns.push(IdentityColumn {
+                        column: parsed.column.name.clone(),
+                        kind,
+                        options,
+                    });
+                }
                 if parsed.array_len_defaulted {
                     array_len_defaulted.push(parsed.column.name.clone());
                 }
@@ -10219,6 +10297,7 @@ impl<'a> Parser<'a> {
             foreign_keys,
             primary_key_name,
             serial_columns,
+            identity_columns,
         })
     }
 
@@ -10415,6 +10494,22 @@ impl<'a> Parser<'a> {
                 "multiple default values specified for column {name:?}"
             )));
         }
+        // IDENTITY 列（TABLE-24・Issue #1695）。`DEFAULT` との併記・SERIAL 型との併用は `42601`
+        // （PostgreSQL の "both default and identity specified" 相当）、整数 3 型以外は `22023`。
+        // いずれも構文段（カタログ非参照）で判定するため、存在オラクルにならない。
+        let identity = constraints.identity.clone();
+        if identity.is_some() {
+            if constraints.default_declared || serial.is_some() {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "both default and identity specified for column {name:?}"
+                )));
+            }
+            if crate::sql::ddl_column_type::identity_type_bounds(&ty).is_none() {
+                return Err(SqlSurfaceError::InvalidParameterValue {
+                    detail: "identity column type must be smallint, integer, or bigint",
+                });
+            }
+        }
         let unique = constraints.unique;
         let unique_name = constraints.unique_name.clone();
         let column = if let ColumnType::Vector(_) = ty {
@@ -10447,8 +10542,12 @@ impl<'a> Parser<'a> {
                 // 時刻 DEFAULT は評価せず列型との適合だけを検査する（SQL-37・Issue #1587）。
                 (None, Some(t)) => Some(crate::sql::ddl::time_column_default(&name, &ty, t)?),
             };
-            // SERIAL 列は常に `NOT NULL`（`NOT NULL` の明示は冗長だが受理する）。
-            let mut column = ColumnDef::new(name, ty, !constraints.not_null && serial.is_none());
+            // SERIAL・IDENTITY 列は常に `NOT NULL`（`NOT NULL` の明示は冗長だが受理する）。
+            let mut column = ColumnDef::new(
+                name,
+                ty,
+                !constraints.not_null && serial.is_none() && identity.is_none(),
+            );
             if let Some(default) = default {
                 column = column.with_default(default);
             }
@@ -10532,6 +10631,7 @@ impl<'a> Parser<'a> {
             alias_type_name,
             array_len_defaulted,
             serial,
+            identity,
         })
     }
 
@@ -10894,7 +10994,20 @@ impl<'a> Parser<'a> {
         let mut unique = false;
         let mut unique_name: Option<String> = None;
         let mut collation: Option<crate::collation::Collation> = None;
+        let mut identity: Option<(crate::catalog::IdentityKind, SequenceOptions)> = None;
         loop {
+            // `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(<オプション>)]`（TABLE-24・
+            // Issue #1695）。生成列 `GENERATED ALWAYS AS (<式>) STORED` は未対応で `0A000`。
+            if self.peek_ident_matches("GENERATED") {
+                self.advance();
+                if identity.is_some() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "multiple identity specifications for a column",
+                    ));
+                }
+                identity = Some(self.parse_identity_clause()?);
+                continue;
+            }
             // `COLLATE <name>`（TABLE-28。Issue #1609）。順序自由・1 回まで。
             if self.peek_ident_matches("COLLATE") {
                 self.advance();
@@ -10974,7 +11087,46 @@ impl<'a> Parser<'a> {
             unique_name,
             collation,
             default_declared: seen_default,
+            identity,
         })
+    }
+
+    /// `GENERATED` 直後から IDENTITY 句の残り（`{ALWAYS | BY DEFAULT} AS IDENTITY [(<オプション>)]`）
+    /// を読む（TABLE-24・Issue #1695）。`GENERATED ALWAYS AS (<式>) STORED`（生成列）は黙って受理せず
+    /// `0A000`。IDENTITY オプションのうち `AS`／`CACHE`／`OWNED BY`／`SEQUENCE NAME`／`RESTART` は
+    /// `CREATE SEQUENCE` と同じく `0A000`（fail-closed）。
+    fn parse_identity_clause(
+        &mut self,
+    ) -> Result<(crate::catalog::IdentityKind, SequenceOptions), SqlSurfaceError> {
+        use crate::catalog::IdentityKind;
+        let kind = if self.peek_ident_matches("ALWAYS") {
+            self.advance();
+            IdentityKind::Always
+        } else if matches!(self.peek(), Some(Token::Keyword(Keyword::By)))
+            && self.peek_ident_matches_at(1, "DEFAULT")
+        {
+            self.advance();
+            self.advance();
+            IdentityKind::ByDefault
+        } else {
+            return Err(SqlSurfaceError::unsupported(
+                "expected ALWAYS or BY DEFAULT after GENERATED",
+            ));
+        };
+        self.expect_contextual_keyword("AS")?;
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "generated columns are not supported",
+            ));
+        }
+        self.expect_contextual_keyword("IDENTITY")?;
+        let mut options = SequenceOptions::default();
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            self.advance();
+            self.parse_sequence_option_list(&mut options, true, "identity column")?;
+            self.expect_punct(')')?;
+        }
+        Ok((kind, options))
     }
 
     /// `COLLATE` 直後の照合名を読み、許可リスト（[`crate::collation::Collation`]）で解決する
@@ -13410,6 +13562,148 @@ impl Parser<'_> {
             .map_err(|_| SqlSurfaceError::numeric_out_of_range("sequence option out of range"))
     }
 
+    /// SEQUENCE オプション列（`START [WITH]`・`INCREMENT [BY]`・`MINVALUE`／`NO MINVALUE`・
+    /// `MAXVALUE`／`NO MAXVALUE`・`CYCLE`／`NO CYCLE` の任意順）を `out` へ読む。`CREATE SEQUENCE`
+    /// （文末まで。`in_paren = false`）と IDENTITY 列の括弧内（`)` の手前まで。`in_paren = true`）が
+    /// 共有する（TABLE-24・Issue #1688／#1695）。同種の重複は `42601`、`AS`・`CACHE`・`OWNED BY`・
+    /// `RESTART`・`SEQUENCE NAME`・`IF` は黙って無視せず `0A000`（fail-closed）。`ctx` は
+    /// エラー文言用の固定ラベルで、利用者入力を含めない。
+    fn parse_sequence_option_list(
+        &mut self,
+        out: &mut SequenceOptions,
+        in_paren: bool,
+        ctx: &str,
+    ) -> Result<(), SqlSurfaceError> {
+        let p = self;
+        let dup = || SqlSurfaceError::unsupported("conflicting or redundant sequence options");
+        loop {
+            let at_end = if in_paren {
+                matches!(p.peek(), Some(Token::Punct(')')))
+            } else {
+                matches!(p.peek(), None | Some(Token::Punct(';')))
+            };
+            if at_end {
+                return Ok(());
+            }
+            let Some(word) = p.peek_upper_ident() else {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "unexpected token in {ctx}"
+                )));
+            };
+            p.advance();
+            match word.as_str() {
+                "START" => {
+                    if p.peek_ident_matches("WITH") {
+                        p.advance();
+                    }
+                    if out.start.is_some() {
+                        return Err(dup());
+                    }
+                    out.start = Some(p.expect_signed_i64()?);
+                }
+                "INCREMENT" => {
+                    // `BY` は字句解析で予約語（`Keyword::By`）になっている。
+                    if matches!(p.peek(), Some(Token::Keyword(Keyword::By))) {
+                        p.advance();
+                    }
+                    if out.increment.is_some() {
+                        return Err(dup());
+                    }
+                    out.increment = Some(p.expect_signed_i64()?);
+                }
+                "MINVALUE" => {
+                    if out.min_value.is_some() || out.no_min_value {
+                        return Err(dup());
+                    }
+                    out.min_value = Some(p.expect_signed_i64()?);
+                }
+                "MAXVALUE" => {
+                    if out.max_value.is_some() || out.no_max_value {
+                        return Err(dup());
+                    }
+                    out.max_value = Some(p.expect_signed_i64()?);
+                }
+                "CYCLE" => {
+                    if out.cycle.is_some() {
+                        return Err(dup());
+                    }
+                    out.cycle = Some(true);
+                }
+                "NO" => {
+                    let next = p.peek_upper_ident();
+                    p.advance();
+                    match next.as_deref() {
+                        Some("MINVALUE") => {
+                            if out.min_value.is_some() || out.no_min_value {
+                                return Err(dup());
+                            }
+                            out.no_min_value = true;
+                        }
+                        Some("MAXVALUE") => {
+                            if out.max_value.is_some() || out.no_max_value {
+                                return Err(dup());
+                            }
+                            out.no_max_value = true;
+                        }
+                        Some("CYCLE") => {
+                            if out.cycle.is_some() {
+                                return Err(dup());
+                            }
+                            out.cycle = Some(false);
+                        }
+                        _ => {
+                            return Err(SqlSurfaceError::unsupported(format!(
+                                "unexpected token after NO in {ctx}"
+                            )))
+                        }
+                    }
+                }
+                "AS" | "CACHE" | "OWNED" | "RESTART" | "SEQUENCE" | "IF" => {
+                    return Err(SqlSurfaceError::feature_not_supported(format!(
+                        "unsupported option in {ctx}"
+                    )));
+                }
+                _ => {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "unexpected token in {ctx}"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// `ALTER COLUMN <col>` 直後が IDENTITY 列の操作（`ADD GENERATED`／`SET GENERATED`／
+    /// `DROP IDENTITY`／`RESTART`／`SET {INCREMENT|START|MINVALUE|MAXVALUE|CYCLE|NO ...}`）か
+    /// 判定する（消費しない。TABLE-24・Issue #1695）。
+    fn is_alter_column_identity_action(&self) -> bool {
+        if self.peek_ident_matches("RESTART") {
+            return true;
+        }
+        if self.peek_ident_matches("ADD") && self.peek_ident_matches_at(1, "GENERATED") {
+            return true;
+        }
+        if self.peek_ident_matches("DROP") && self.peek_ident_matches_at(1, "IDENTITY") {
+            return true;
+        }
+        if self.peek_ident_matches("SET") {
+            return [
+                "GENERATED",
+                "INCREMENT",
+                "START",
+                "MINVALUE",
+                "MAXVALUE",
+                "CYCLE",
+            ]
+            .iter()
+            .any(|w| self.peek_ident_matches_at(1, w))
+                || (self.peek_ident_matches_at(1, "NO")
+                    && ["MINVALUE", "MAXVALUE", "CYCLE"]
+                        .iter()
+                        .any(|w| self.peek_ident_matches_at(2, w)));
+        }
+        false
+    }
+
     /// 次のトークンが識別子ならその大文字化を返す（消費しない）。
     fn peek_upper_ident(&self) -> Option<String> {
         match self.peek() {
@@ -13451,103 +13745,18 @@ pub(crate) fn validate_create_sequence_tokens(
     let name = p.expect_ident()?;
     crate::catalog::validate_identifier(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name in CREATE SEQUENCE"))?;
-    let mut out = ValidatedCreateSequence {
+    let mut options = SequenceOptions::default();
+    p.parse_sequence_option_list(&mut options, false, "CREATE SEQUENCE")?;
+    let out = ValidatedCreateSequence {
         name,
-        start: None,
-        increment: None,
-        min_value: None,
-        max_value: None,
-        cycle: None,
-        no_min_value: false,
-        no_max_value: false,
+        start: options.start,
+        increment: options.increment,
+        min_value: options.min_value,
+        max_value: options.max_value,
+        cycle: options.cycle,
+        no_min_value: options.no_min_value,
+        no_max_value: options.no_max_value,
     };
-    let dup = || SqlSurfaceError::unsupported("conflicting or redundant sequence options");
-    while !matches!(p.peek(), None | Some(Token::Punct(';'))) {
-        let Some(word) = p.peek_upper_ident() else {
-            return Err(SqlSurfaceError::unsupported(
-                "unexpected token in CREATE SEQUENCE",
-            ));
-        };
-        p.advance();
-        match word.as_str() {
-            "START" => {
-                if p.peek_ident_matches("WITH") {
-                    p.advance();
-                }
-                if out.start.is_some() {
-                    return Err(dup());
-                }
-                out.start = Some(p.expect_signed_i64()?);
-            }
-            "INCREMENT" => {
-                // `BY` は字句解析で予約語（`Keyword::By`）になっている。
-                if matches!(p.peek(), Some(Token::Keyword(Keyword::By))) {
-                    p.advance();
-                }
-                if out.increment.is_some() {
-                    return Err(dup());
-                }
-                out.increment = Some(p.expect_signed_i64()?);
-            }
-            "MINVALUE" => {
-                if out.min_value.is_some() || out.no_min_value {
-                    return Err(dup());
-                }
-                out.min_value = Some(p.expect_signed_i64()?);
-            }
-            "MAXVALUE" => {
-                if out.max_value.is_some() || out.no_max_value {
-                    return Err(dup());
-                }
-                out.max_value = Some(p.expect_signed_i64()?);
-            }
-            "CYCLE" => {
-                if out.cycle.is_some() {
-                    return Err(dup());
-                }
-                out.cycle = Some(true);
-            }
-            "NO" => {
-                let next = p.peek_upper_ident();
-                p.advance();
-                match next.as_deref() {
-                    Some("MINVALUE") => {
-                        if out.min_value.is_some() || out.no_min_value {
-                            return Err(dup());
-                        }
-                        out.no_min_value = true;
-                    }
-                    Some("MAXVALUE") => {
-                        if out.max_value.is_some() || out.no_max_value {
-                            return Err(dup());
-                        }
-                        out.no_max_value = true;
-                    }
-                    Some("CYCLE") => {
-                        if out.cycle.is_some() {
-                            return Err(dup());
-                        }
-                        out.cycle = Some(false);
-                    }
-                    _ => {
-                        return Err(SqlSurfaceError::unsupported(
-                            "unexpected token after NO in CREATE SEQUENCE",
-                        ))
-                    }
-                }
-            }
-            "AS" | "CACHE" | "OWNED" | "RESTART" | "SEQUENCE" | "IF" => {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "unsupported CREATE SEQUENCE option",
-                ));
-            }
-            _ => {
-                return Err(SqlSurfaceError::unsupported(
-                    "unexpected token in CREATE SEQUENCE",
-                ))
-            }
-        }
-    }
     p.expect_end_of_statement()?;
     Ok(out)
 }
@@ -25511,6 +25720,86 @@ mod tests {
     fn parse_create_table_ok(sql: &str) -> ValidatedCreateTable {
         let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
         validate_create_table_tokens(&tokens).unwrap_or_else(|e| panic!("expected ok, got {e:?}"))
+    }
+
+    /// IDENTITY 列は整数型・`NOT NULL`・`DEFAULT` なしへ展開され、`identity_columns` に宣言順で
+    /// 種別と SEQUENCE オプションつきで載る（TABLE-24・Issue #1695）。
+    #[test]
+    fn create_table_identity_columns_are_collected_in_order() {
+        use crate::catalog::IdentityKind;
+        let v = parse_create_table_ok(
+            "CREATE TABLE t (a INTEGER GENERATED ALWAYS AS IDENTITY, b TEXT, \
+             c BIGINT GENERATED BY DEFAULT AS IDENTITY (START WITH 10 INCREMENT BY -2 NO CYCLE))",
+        );
+        assert_eq!(v.identity_columns.len(), 2);
+        assert_eq!(v.identity_columns[0].column, "a");
+        assert_eq!(v.identity_columns[0].kind, IdentityKind::Always);
+        assert_eq!(v.identity_columns[0].options, SequenceOptions::default());
+        assert_eq!(v.identity_columns[1].column, "c");
+        assert_eq!(v.identity_columns[1].kind, IdentityKind::ByDefault);
+        assert_eq!(v.identity_columns[1].options.start, Some(10));
+        assert_eq!(v.identity_columns[1].options.increment, Some(-2));
+        assert_eq!(v.identity_columns[1].options.cycle, Some(false));
+        for n in ["a", "c"] {
+            let col = v.columns.iter().find(|c| c.name == n).expect("column");
+            assert!(!col.nullable, "{n}");
+            assert!(col.default_expr.is_none(), "{n}");
+        }
+        assert!(parse_create_table_ok("CREATE TABLE t (a TEXT)")
+            .identity_columns
+            .is_empty());
+    }
+
+    /// IDENTITY 句の拒否形（`42601`／`22023`／`0A000`）。いずれも構文段（カタログ非参照）で決まる。
+    #[test]
+    fn create_table_identity_clause_rejections() {
+        for (sql, code) in [
+            (
+                "CREATE TABLE t (a INTEGER DEFAULT 1 GENERATED ALWAYS AS IDENTITY)",
+                "42601",
+            ),
+            (
+                "CREATE TABLE t (a INTEGER GENERATED ALWAYS AS IDENTITY DEFAULT 1)",
+                "42601",
+            ),
+            (
+                "CREATE TABLE t (a SERIAL GENERATED ALWAYS AS IDENTITY)",
+                "42601",
+            ),
+            ("CREATE TABLE t (a INTEGER GENERATED ALWAYS)", "42601"),
+            (
+                "CREATE TABLE t (a INTEGER GENERATED BY AS IDENTITY)",
+                "42601",
+            ),
+            (
+                "CREATE TABLE t (a INTEGER GENERATED ALWAYS AS IDENTITY (START 1 START 2))",
+                "42601",
+            ),
+            (
+                "CREATE TABLE t (a INTEGER GENERATED ALWAYS AS IDENTITY (START 1",
+                "42601",
+            ),
+            (
+                "CREATE TABLE t (a TEXT GENERATED ALWAYS AS IDENTITY)",
+                "22023",
+            ),
+            (
+                "CREATE TABLE t (a BOOLEAN GENERATED BY DEFAULT AS IDENTITY)",
+                "22023",
+            ),
+            (
+                "CREATE TABLE t (a INTEGER GENERATED ALWAYS AS IDENTITY (CACHE 5))",
+                "0A000",
+            ),
+            (
+                "CREATE TABLE t (a INTEGER GENERATED ALWAYS AS (1) STORED)",
+                "0A000",
+            ),
+        ] {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            let err = validate_create_table_tokens(&tokens).expect_err(sql);
+            assert_eq!(err.wire_code(), code, "{sql}");
+        }
     }
 
     /// SERIAL 系の列は基底型・`NOT NULL`・`DEFAULT` なしへ展開され、`serial_columns` に宣言順で載る
