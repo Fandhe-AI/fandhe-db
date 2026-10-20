@@ -51,6 +51,7 @@ use crate::sql::parser::{
 };
 use crate::sql::plan::ExecutionPlan;
 use crate::sql::udf_call;
+use crate::storage::rowid::hit_id_for_response;
 use crate::storage::StorageError;
 
 /// 疎コーパス側へ集約する候補プールの既定深さ。`hybrid::hybrid_search` の
@@ -2504,7 +2505,7 @@ pub(crate) fn execute_statement_with_cache(
                 let Some(embedding) = arena.vector(slot) else {
                     continue;
                 };
-                let Some(row_id) = arena.ids().get(slot).copied() else {
+                let Some(row_id) = arena.row_id(slot).map(hit_id_for_response) else {
                     continue;
                 };
                 let mut expr_ok = true;
@@ -3033,12 +3034,14 @@ fn project_rows(
         // クライアントへ返す id は本来の行 `id`（スロット番号ではない）。`decoded`
         // の取得元によっては（`Deferred(Redb)`）行の再取得キーとしても使うため
         // `decoded` の前に確定させる。
-        let id = *arena
-            .ids()
-            .get(slot)
-            .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "candidate arena index out of range".to_string(),
-            })?;
+        let id =
+            hit_id_for_response(
+                arena
+                    .row_id(slot)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "candidate arena index out of range".to_string(),
+                    })?,
+            );
         // Issue #453: `Eager` は `on_visible_row` が全可視行分あらかじめ複製して
         // おいた値を借用するだけ（従来どおり）。`Deferred` はここで初めて
         // metadata を取得し、投影に必要な列だけをデコードする（Top-k 確定後の
@@ -3661,12 +3664,14 @@ pub fn project_id_only_rows(
         let slot = usize::try_from(slot_id).map_err(|_| SqlSurfaceError::Internal {
             detail: "candidate slot index out of range".to_string(),
         })?;
-        let id = *arena
-            .ids()
-            .get(slot)
-            .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "candidate arena index out of range".to_string(),
-            })?;
+        let id =
+            hit_id_for_response(
+                arena
+                    .row_id(slot)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "candidate arena index out of range".to_string(),
+                    })?,
+            );
         rows.push(ResultRow {
             id,
             score,

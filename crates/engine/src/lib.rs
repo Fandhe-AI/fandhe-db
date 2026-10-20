@@ -273,6 +273,7 @@ pub mod scan_limits;
 pub mod schema_limits;
 pub mod scoring_boost;
 pub mod search_engine;
+pub(crate) mod search_order;
 pub mod sparse;
 pub(crate) mod sq8;
 pub mod sql;

@@ -32,6 +32,18 @@ impl RowId {
         self.0
     }
 
+    /// 検索系 arena が保持する生値（行ストアの物理キー要素）から rowid を作る入口
+    /// （Issue #2195。`arena::VectorArena` が行スキャンで受け取った値を格納する側と、
+    /// 取り出す側 [`crate::arena::VectorArena::row_id`] の双方がここを通る）。
+    pub(crate) const fn from_arena_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// arena の内部格納用に生値を取り出す（`arena.rs` の `push_row` 専用）。
+    pub(crate) const fn raw_for_arena(self) -> u64 {
+        self.0
+    }
+
     /// 採番器（`catalog::rowid_alloc`）が払い出した値から rowid を作る。
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn from_allocated(raw: u64) -> Self {
@@ -43,6 +55,17 @@ impl RowId {
     pub(crate) const fn raw_for_state(self) -> u64 {
         self.0
     }
+}
+
+/// 検索結果（公開型 `SearchHit.id` 等）へ詰める応答 `id` を rowid から得る**唯一の境界**
+/// （Issue #2195。ビヘイビア: TABLE-23・SEARCH-1。設計記録: ADR D8）。
+///
+/// 現状は従来方式（`RowIdentity::LegacyId`）の表でしか到達しない（採番方式の表は
+/// 読み取りゲートで拒否される）ため、`id` 列値＝rowid の生値を返す。採番方式のゲートを
+/// 外す後続 sub-issue（#2197）は、本関数を「主キー列値を返す」実装へ差し替える。
+/// 検索経路が rowid を応答へ直接詰める箇所をここ 1 箇所に集約する。
+pub(crate) const fn hit_id_for_response(rowid: RowId) -> u64 {
+    rowid.legacy_id()
 }
 
 /// 行ストアの物理キーを組み立てる唯一の生成点。
@@ -68,6 +91,14 @@ mod tests {
         assert_eq!(t, "t");
         assert_eq!(back, r);
         assert_eq!(back.legacy_id(), 42);
+    }
+
+    #[test]
+    fn arena_raw_roundtrip_and_response_boundary() {
+        let r = RowId::from_arena_raw(7);
+        assert_eq!(r.raw_for_arena(), 7);
+        assert_eq!(hit_id_for_response(r), 7);
+        assert_eq!(r, RowId::from_legacy_id(7));
     }
 
     #[test]
