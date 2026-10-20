@@ -705,6 +705,7 @@ fn scalar_plan_token(plan: ScalarPlan) -> &'static str {
         ScalarPlan::IndexInList => "index_in_list",
         ScalarPlan::IndexConjunction => "index_conjunction",
         ScalarPlan::IndexPartial => "index_partial",
+        ScalarPlan::IndexPrimaryKey => "index_primary_key",
     }
 }
 
@@ -732,6 +733,9 @@ pub(crate) enum AccessPath {
     /// 上記のいずれにも該当しない（`VECTOR` 列なしテーブルの集計・非索引の
     /// 式述語を含む集計・広域取得は常にこれ）。
     FullScan,
+    /// 広域取得で宣言 PRIMARY KEY の全構成列へのリテラル等価が AND 連言にあり、永続一意索引の
+    /// 点検索で候補を解決する（Issue #2198。`sql::pk_point::classify_pk_point`）。
+    PrimaryKeyLookup,
 }
 
 fn access_path_token(path: AccessPath) -> &'static str {
@@ -740,6 +744,7 @@ fn access_path_token(path: AccessPath) -> &'static str {
         AccessPath::ScalarIndexCandidates => "scalar_index_candidates",
         AccessPath::ScalarIndexGroupEnumeration => "scalar_index_group_enumeration",
         AccessPath::FullScan => "full_scan",
+        AccessPath::PrimaryKeyLookup => "primary_key_lookup",
     }
 }
 

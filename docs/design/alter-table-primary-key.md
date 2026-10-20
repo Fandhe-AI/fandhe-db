@@ -107,3 +107,10 @@ Issue #1364 で `ErrorClass::InvalidTableDefinition`・`SqlSurfaceError::Invalid
   主キーの二重宣言（`42P16`）。
 - 解消済み（Issue #1632）: 主キー削除後に NOT NULL を外す手段（`ALTER COLUMN ... DROP NOT NULL`）。主キーの構成列への発行は `42P16`。
 - NoSQL（HTTP）表層からの追加・削除は未対応。
+
+## Issue #2198: ADD／DROP 後の読み取り経路
+
+広域取得の PK 点検索（[primary-key-point-lookup.md](primary-key-point-lookup.md)）は、分類を常に現在の
+スキーマから導く。`ADD PRIMARY KEY` の直後は永続一意索引が無効化されているため、実行時はテナント単位で
+範囲走査へ縮退し（結果は全走査と同一）、そのテナントの次の書き込みで索引が再構築されて索引経路へ移る。
+主キーの `DROP CONSTRAINT` の後は PK が無いので全走査になる。`tests/sql_scan_pk_point.rs` が固定する。
