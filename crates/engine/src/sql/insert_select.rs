@@ -551,6 +551,7 @@ mod bind_tests {
                 operation_id: None,
             },
             Statement::ShowTimeZone,
+            crate::recovery::content_hash::for_insert_select(&[]).expect("hash"),
         )
     }
 

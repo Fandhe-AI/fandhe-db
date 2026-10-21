@@ -1288,7 +1288,6 @@ pub(crate) fn for_view_write(view_name: &str, inner: &ContentHash) -> ContentHas
 /// 同一ハッシュになる（`23505`）。識別子の大小・数値表記は畳まない（差があれば `22023` 側へ倒す）。
 /// 未束縛の [`Token::Param`] が残っていれば `Err`（fail-closed）。呼び出し元は #1733 の
 /// INSERT ... SELECT 実行経路（台帳記録は内側 SELECT 実体化より前に 1 回だけ行う）。
-#[cfg_attr(not(test), allow(dead_code))] // #1733 が結線する
 pub(crate) fn for_insert_select(
     statement_tokens: &[crate::sql::lexer::Token],
 ) -> Result<ContentHash, StorageError> {
@@ -1371,7 +1370,6 @@ fn push_token_str(b: &mut HashInputBuilder, tag: u8, s: &str) -> Result<(), Stor
 /// 文のトークン列から末尾の `;` と末尾の `USING OPERATION_ID <文字列リテラル | NULL>` を除く
 /// （operation_id は台帳のキーであり内容照合の材料にしない。Issue #1734）。句が無ければ入力のまま返す。
 /// 内側 SELECT の `USING MODE ...` 等は末尾でも `OPERATION_ID` を伴わないため剥がさない。
-#[cfg_attr(not(test), allow(dead_code))] // #1733 が結線する
 pub(crate) fn strip_operation_id_clause(
     tokens: &[crate::sql::lexer::Token],
 ) -> &[crate::sql::lexer::Token] {

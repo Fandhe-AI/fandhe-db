@@ -18424,8 +18424,8 @@ pub(crate) enum ParsedInsertTokens {
 }
 
 /// 検証済みの `INSERT INTO <表> (<列>...) <SELECT> [RETURNING ...] [USING OPERATION_ID ...]`
-/// （SQL-51・Issue #1732）。内側 SELECT は既存の SELECT 検証器を通過済みで、行の実体化・RLS・挿入は
-/// 後続 Issue（親 #1731 の実行側）が担う。現状の実行腕は束縛（列数・型）の後に `0A000` を返す。
+/// （SQL-51・Issue #1732）。内側 SELECT は既存の SELECT 検証器を通過済みで、実行腕は束縛（列数・型）の後に
+/// `core/insert_select_exec.rs` の実行本体（Issue #1733）へ渡す。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedInsertSelect {
     pub(crate) table_name: String,
@@ -18434,11 +18434,18 @@ pub struct ValidatedInsertSelect {
     pub(crate) query_tokens: Vec<Token>,
     pub(crate) returning: Option<Projection>,
     pub(crate) operation_id: Option<OperationId>,
+    /// 台帳の内容照合ハッシュ（`recovery::content_hash::for_insert_select`。送られた文のトークン列から
+    /// `USING OPERATION_ID` 句と末尾 `;` を除いて算出。内側 SELECT の結果行は材料にしない。Issue #1734）。
+    pub(crate) statement_hash: crate::recovery::content_hash::ContentHash,
 }
 
 impl ValidatedInsertSelect {
-    /// 構文段の結果と検証済みの内側 SELECT から作る（`core.rs::parse_tokens_in` が呼ぶ）。
-    pub(crate) fn new(shape: InsertSelectShape, query: Statement) -> Self {
+    /// 構文段の結果・検証済みの内側 SELECT・文の台帳ハッシュから作る（`core.rs::parse_insert_select` が呼ぶ）。
+    pub(crate) fn new(
+        shape: InsertSelectShape,
+        query: Statement,
+        statement_hash: crate::recovery::content_hash::ContentHash,
+    ) -> Self {
         Self {
             table_name: shape.table_name,
             columns: shape.columns,
@@ -18446,6 +18453,7 @@ impl ValidatedInsertSelect {
             query_tokens: shape.query_tokens,
             returning: shape.returning,
             operation_id: shape.operation_id,
+            statement_hash,
         }
     }
 

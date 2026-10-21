@@ -4756,7 +4756,7 @@ impl EngineCore {
                 // `INSERT ... SELECT`（SQL-51・Issue #1732）。内側 SELECT の検証は SELECT 経路と同じ
                 // `storage_lookup`（一時カタログ・ビューの解決込み）で行う。
                 crate::sql::allowlist::ParsedInsertTokens::Select(shape) => {
-                    return self.parse_insert_select(shape, &lookup, &storage_lookup);
+                    return self.parse_insert_select(shape, &tokens, &lookup, &storage_lookup);
                 }
             };
             if crate::sql::allowlist::TableLookup::table_exists(&lookup, &stmt.table_name)? {
@@ -5111,6 +5111,7 @@ impl EngineCore {
     fn parse_insert_select(
         &self,
         shape: crate::sql::allowlist::InsertSelectShape,
+        statement_tokens: &[crate::sql::lexer::Token],
         lookup: &impl crate::sql::allowlist::TableLookup,
         storage_lookup: &impl crate::sql::allowlist::TableLookup,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
@@ -5171,8 +5172,17 @@ impl EngineCore {
                 ));
             }
         }
+        // 台帳の内容照合ハッシュは送られた文のトークン列（`USING OPERATION_ID` 句・末尾 `;` を除く）から
+        // 算出する（Issue #1734）。未束縛の `$n` が残る形は上流で拒否済みだが、残っていればここでも
+        // 固定文言で拒否する（fail-closed）。
+        let statement_hash = crate::recovery::content_hash::for_insert_select(
+            crate::recovery::content_hash::strip_operation_id_clause(statement_tokens),
+        )
+        .map_err(|_| SqlSurfaceError::Internal {
+            detail: "internal error".to_string(),
+        })?;
         Ok(ParsedSql::InsertSelect(
-            crate::sql::allowlist::ValidatedInsertSelect::new(shape, query),
+            crate::sql::allowlist::ValidatedInsertSelect::new(shape, query, statement_hash),
         ))
     }
 
@@ -5962,17 +5972,14 @@ impl EngineCore {
                 )?;
                 Ok(crate::sql::SqlOutcome::Insert(outcome))
             }
-            // SQL-51・Issue #1732: 構文・内側 SELECT の検証・列数／型の束縛まで。行の実体化・RLS・
-            // 挿入・台帳は後続 Issue の担当のため、束縛を通った形も `0A000` で拒否する（行・台帳・
-            // 世代に触れない fail-closed）。列数・型の不一致は `0A000` より先に報告する。
-            ParsedSql::InsertSelect(stmt) => {
-                self.bind_insert_select(session, stmt, &self.result_limits)?;
-                Err(
-                    crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                        "INSERT ... SELECT is not supported yet",
-                    ),
-                )
-            }
+            // SQL-51・Issue #1732・#1733: 束縛（列数・型。不一致は挿入より前に拒否）の後、内側 SELECT を
+            // 書き込むセッションの `PolicyContext` で評価して挿入する（`core/insert_select_exec.rs`）。
+            ParsedSql::InsertSelect(stmt) => self.execute_parsed_insert_select(
+                crate::core::insert_select_exec::InsertSelectTxn::Autocommit,
+                ctx,
+                session,
+                stmt,
+            ),
             ParsedSql::ViewInsert(stmt) => self
                 .execute_view_insert(
                     || crate::tenant::WriteTarget::Autocommit(&self.storage),
@@ -6847,12 +6854,20 @@ impl EngineCore {
                 }
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
-            // SQL-51・Issue #1732: autocommit と同じく、束縛（列数・型）の後に `0A000` で拒否する。
+            // SQL-51・Issue #1732・#1733: autocommit と同じ実行本体へ共有 write txn を渡す
+            // （読み取り源にも書き込み先にもなる）。台帳・世代の単位は挿入先の表。
             ParsedSql::InsertSelect(stmt) => {
-                self.bind_insert_select(session, stmt, &self.result_limits)?;
-                Err(SqlSurfaceError::feature_not_supported(
-                    "INSERT ... SELECT is not supported yet",
-                ))
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let outcome = self.execute_parsed_insert_select(
+                    crate::core::insert_select_exec::InsertSelectTxn::InTxn(write_txn),
+                    ctx,
+                    session,
+                    stmt,
+                )?;
+                txn.mark_written(ctx.tenant_id(), &stmt.table_name);
+                Ok(outcome)
             }
             // COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。

@@ -1,8 +1,8 @@
 //! `INSERT ... SELECT` の parser と束縛（SQL-51・Issue #1732）の結合テスト。
 //!
 //! 構文・内側 SELECT の検証・列数／型の束縛が `EngineCore` の入口（`parse_sql`・Describe・
-//! autocommit／明示トランザクションの実行）で一貫して働くこと、および実行側（#1733）が未実装の間は
-//! 束縛を通った形も `0A000` で拒否され行が増えないこと（fail-closed）を固定する。
+//! autocommit／明示トランザクションの実行）で一貫して働くこと、および束縛エラーでは挿入より前に
+//! 拒否され行が増えないこと（fail-closed）を固定する。実行本体の e2e は `sql51_insert_select_exec.rs`。
 //! `sql45_insert_const_expr.rs` と同じ流儀（`unique_db_path`／`CleanupGuard`）。
 //! ポインタ: `docs/design/insert-select.md`。
 
@@ -193,22 +193,11 @@ fn describe_binds_column_count_and_types() {
 }
 
 #[test]
-fn execution_is_fail_closed_and_moves_no_rows() {
+fn execution_binds_before_inserting_and_moves_no_rows_on_bind_error() {
     let (core, path, mut session) = setup("sql51-exec");
     let _g = CleanupGuard(path);
     let before = count_rows(&core, &mut session, "dst");
-    // 正しい形でも実行は未実装（0A000）で、行は増えない
-    assert_eq!(
-        code(core.execute_sql_in_session(
-            &ctx("alice"),
-            &mut session,
-            "INSERT INTO dst (id, a, t) SELECT id, a, t FROM src LIMIT 10 \
-             USING OPERATION_ID 'op-x'",
-        )),
-        "0A000"
-    );
-    assert_eq!(count_rows(&core, &mut session, "dst"), before);
-    // 列数不一致は 0A000 より先に 42601
+    // 列数不一致は挿入より前に 42601 で拒否され、行は増えない（autocommit）
     assert_eq!(
         code(core.execute_sql_in_session(
             &ctx("alice"),
@@ -218,18 +207,21 @@ fn execution_is_fail_closed_and_moves_no_rows() {
         )),
         "42601"
     );
-    // 明示トランザクションでも同様に行は増えない
+    assert_eq!(count_rows(&core, &mut session, "dst"), before);
+    // 明示トランザクションでも同様に拒否され、行は増えない
     let mut txn = core.new_session_transaction();
     let mut tsession = SessionState::default();
     core.execute_sql_in_txn(&ctx("alice"), &mut tsession, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core.execute_sql_in_txn(
-        &ctx("alice"),
-        &mut tsession,
-        &mut txn,
-        "INSERT INTO dst (id, a, t) SELECT id, a, t FROM src LIMIT 10 USING OPERATION_ID 'op-z'",
+    assert_eq!(
+        code(core.execute_sql_in_txn(
+            &ctx("alice"),
+            &mut tsession,
+            &mut txn,
+            "INSERT INTO dst (id, a) SELECT id, a, t FROM src LIMIT 10 USING OPERATION_ID 'op-z'",
+        )),
+        "42601"
     );
-    assert!(err.is_err());
     let _ = core.execute_sql_in_txn(&ctx("alice"), &mut tsession, &mut txn, "ROLLBACK");
     assert_eq!(count_rows(&core, &mut session, "dst"), before);
 }
