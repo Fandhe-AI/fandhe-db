@@ -327,7 +327,15 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
             is_index: false,
         });
     }
-    out.extend(object_ddl.into_iter().map(|(_, r)| r));
+    // `DROP`／`ALTER`／`REFRESH` の対象名にも位置走査と同じ除外を掛ける。Bind・Describe は書き換え後の
+    // トークンでゲートを再実行するため、`public.` 修飾を外した位置（`skip`）と解決済みの内部キー
+    // （`#<id>.<name>`）は修飾済みの参照であり、未修飾名として数えない。
+    out.extend(
+        object_ddl
+            .into_iter()
+            .filter(|(i, r)| !skip.contains(i) && !r.name.starts_with('#'))
+            .map(|(_, r)| r),
+    );
     out
 }
 

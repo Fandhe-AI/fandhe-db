@@ -2141,7 +2141,8 @@ pub struct PreparedSql {
 
 /// 解決済みトークンから再 parse した `DROP TABLE` に、Parse 時に外した `public.` 修飾の
 /// 表名を戻す（TABLE-27・Issue #1714）。実行時の粗いゲートが同名の一時表との衝突を拒否する。
-/// `CREATE TABLE` には作成対象名の `public.` 修飾の有無を戻す（Issue #1715）。
+/// `CREATE TABLE`・`CREATE [MATERIALIZED] VIEW`・`CREATE SEQUENCE` には作成対象名の `public.` 修飾の
+/// 有無を戻す（Issue #1715）。
 fn attach_public_qualified(
     parsed: &mut ParsedSql,
     public_qualified: &[String],
@@ -2150,6 +2151,9 @@ fn attach_public_qualified(
     match parsed {
         ParsedSql::DropTable(stmt) => stmt.public_qualified = public_qualified.to_vec(),
         ParsedSql::CreateTable(stmt) => stmt.public_qualified = create_public,
+        ParsedSql::CreateView(stmt) => stmt.public_qualified = create_public,
+        ParsedSql::CreateMaterializedView(stmt) => stmt.public_qualified = create_public,
+        ParsedSql::CreateSequence(stmt) => stmt.public_qualified = create_public,
         _ => {}
     }
 }
@@ -4961,7 +4965,9 @@ impl EngineCore {
         // 構造検証のみでカタログを照会しない（`CreateView` と同じ設計）。`CREATE OR REPLACE
         // MATERIALIZED` は下の `CREATE VIEW` 経路が `OR REPLACE` の後の `VIEW` を要求して `42601`。
         if crate::sql::allowlist::is_create_materialized_view_statement(&tokens) {
-            let stmt = crate::sql::allowlist::validate_create_materialized_view_tokens(&tokens)?;
+            let mut stmt =
+                crate::sql::allowlist::validate_create_materialized_view_tokens(&tokens)?;
+            stmt.public_qualified = create_public;
             return Ok(ParsedSql::CreateMaterializedView(stmt));
         }
         // TABLE-42・Issue #1665: `REFRESH MATERIALIZED VIEW`。構造検証のみでカタログを照会しない。
@@ -4981,7 +4987,8 @@ impl EngineCore {
             // `is_create_function_statement`〔`sql::allowlist::validate_sql_tokens`
             // 内〕より前にここで分岐するため、`CREATE VIEW` のトークン列が
             // `parse_create_function` へ渡ることはない）。
-            let stmt = crate::sql::allowlist::validate_create_view_tokens(&tokens)?;
+            let mut stmt = crate::sql::allowlist::validate_create_view_tokens(&tokens)?;
+            stmt.public_qualified = create_public;
             return Ok(ParsedSql::CreateView(stmt));
         }
 
@@ -4997,7 +5004,8 @@ impl EngineCore {
             return Ok(ParsedSql::CreateSchema(stmt));
         }
         if crate::sql::allowlist::is_create_sequence_statement(&tokens) {
-            let stmt = crate::sql::allowlist::validate_create_sequence_tokens(&tokens)?;
+            let mut stmt = crate::sql::allowlist::validate_create_sequence_tokens(&tokens)?;
+            stmt.public_qualified = create_public;
             return Ok(ParsedSql::CreateSequence(stmt));
         }
         if crate::sql::allowlist::is_create_type_statement(&tokens) {
@@ -6016,7 +6024,7 @@ impl EngineCore {
             // 順序（DDL 実行権限ゲート → カタログ照会を含む実行本体）。
             ParsedSql::CreateView(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
-                self.require_creation_target(ctx, session, false, stmt.name())?;
+                self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 crate::sql::schema_dependency::check_view_body(stmt.name(), stmt.body_sql())?;
                 // TABLE-41 (1)・Issue #1659: 列別名リストと本文の出力列数の突合は、カタログを
                 // 照会するため DDL 権限ゲートの後に行う（権限の無い主体へ列構成を返さない）。
@@ -6063,7 +6071,7 @@ impl EngineCore {
             // 列の確定・本文の評価・定義と実体の原子的な作成を行う。
             ParsedSql::CreateMaterializedView(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
-                self.require_creation_target(ctx, session, false, stmt.name())?;
+                self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 crate::sql::schema_dependency::check_view_body(stmt.name(), stmt.body_sql())?;
                 let outcome = self.execute_create_materialized_view(ctx, session, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateMaterializedView(outcome))
@@ -6121,7 +6129,7 @@ impl EngineCore {
             // 実行本体）。SEQUENCE の定義は全テナント共有カタログで `ctx` は取らない。
             ParsedSql::CreateSequence(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
-                self.require_creation_target(ctx, session, false, stmt.name())?;
+                self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 let outcome = crate::sql::ddl::execute_create_sequence(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateSequence(outcome))
             }

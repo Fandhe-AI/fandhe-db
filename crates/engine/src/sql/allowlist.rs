@@ -12633,6 +12633,10 @@ pub struct ValidatedCreateView {
     /// 修飾子の省略は `Cascaded`。更新可能性の検査（宣言先が自動更新できない形なら `0A000`）は
     /// 構造段（評価後射影形本文。[`validate_create_view_tokens`]）と実行段（`core`）が担う。
     pub(crate) check_option: crate::catalog::ViewCheckOption,
+    /// 作成対象名が `public.` で明示修飾されていたか（TABLE-27・Issue #1715）。真なら実行段は
+    /// `search_path` による作成先の判定を行わず `public` へ作る。構文段は常に `false` で、
+    /// `core::EngineCore` が名前解決（`sql::relation_name`）の結果から設定する。
+    pub(crate) public_qualified: bool,
 }
 
 impl ValidatedCreateView {
@@ -12748,6 +12752,7 @@ pub(crate) fn validate_create_view_tokens(
         column_aliases,
         or_replace,
         check_option,
+        public_qualified: false,
     })
 }
 
@@ -12861,6 +12866,10 @@ pub struct ValidatedCreateMaterializedView {
     pub(crate) base_relations: Vec<String>,
     /// `WITH DATA`（省略時の既定）なら真、`WITH NO DATA` なら偽。
     pub(crate) with_data: bool,
+    /// 作成対象名が `public.` で明示修飾されていたか（TABLE-27・Issue #1715）。真なら実行段は
+    /// `search_path` による作成先の判定を行わず `public` へ作る。構文段は常に `false` で、
+    /// `core::EngineCore` が名前解決（`sql::relation_name`）の結果から設定する。
+    pub(crate) public_qualified: bool,
 }
 
 impl ValidatedCreateMaterializedView {
@@ -12938,6 +12947,7 @@ pub(crate) fn validate_create_materialized_view_tokens(
         body_sql,
         base_relations,
         with_data,
+        public_qualified: false,
     })
 }
 
@@ -13839,6 +13849,10 @@ pub struct ValidatedCreateSequence {
     pub(crate) no_min_value: bool,
     /// `NO MAXVALUE` が指定されたか（同上）。
     pub(crate) no_max_value: bool,
+    /// 作成対象名が `public.` で明示修飾されていたか（TABLE-27・Issue #1715）。真なら実行段は
+    /// `search_path` による作成先の判定を行わず `public` へ作る。構文段は常に `false` で、
+    /// `core::EngineCore` が名前解決（`sql::relation_name`）の結果から設定する。
+    pub(crate) public_qualified: bool,
 }
 
 impl ValidatedCreateSequence {
@@ -14102,6 +14116,7 @@ pub(crate) fn validate_create_sequence_tokens(
         cycle: options.cycle,
         no_min_value: options.no_min_value,
         no_max_value: options.no_max_value,
+        public_qualified: false,
     };
     p.expect_end_of_statement()?;
     Ok(out)

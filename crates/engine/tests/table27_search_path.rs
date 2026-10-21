@@ -698,3 +698,103 @@ fn quoted_expression_word_does_not_hide_the_relation_after_an_introducer() {
     // 拒否された `CREATE INDEX` は索引を作っていない（同名で作れる）。
     ok(&core, &mut s, "CREATE INDEX \"is\" ON a (name)");
 }
+
+/// `public.` 修飾の CREATE VIEW／MATERIALIZED VIEW／SEQUENCE は作成先が文中で確定しているので、
+/// `search_path` に `public` が無くても、`"$user"` と同名の SCHEMA があっても作れる。DROP も修飾
+/// 名なら参照ゲートを通る。未修飾の同じ文は従来どおり拒否される（簡易クエリ）。
+#[test]
+fn public_qualified_object_ddl_ignores_the_path_in_simple_queries() {
+    let (core, _g, mut s) = with_table("sp-obj-simple");
+    ok(&core, &mut s, "SET search_path = nosuch");
+    ok(&core, &mut s, "CREATE SEQUENCE public.q");
+    ok(
+        &core,
+        &mut s,
+        "CREATE VIEW public.v AS SELECT id FROM public.t",
+    );
+    ok(
+        &core,
+        &mut s,
+        "CREATE MATERIALIZED VIEW public.m AS SELECT id FROM public.t",
+    );
+    assert_eq!(code(&core, &mut s, "CREATE SEQUENCE q9"), "3F000");
+    assert_eq!(code(&core, &mut s, "DROP SEQUENCE q"), "42P01");
+    assert_eq!(code(&core, &mut s, "DROP VIEW v"), "42P01");
+    ok(&core, &mut s, "DROP SEQUENCE public.q");
+    ok(&core, &mut s, "DROP VIEW public.v");
+    ok(&core, &mut s, "DROP MATERIALIZED VIEW public.m");
+
+    // 自 username と同名の SCHEMA がある既定の path でも、明示修飾の作成は `0A000` にならない。
+    ok(&core, &mut s, "RESET search_path");
+    ok(&core, &mut s, "CREATE SCHEMA bob");
+    s.set_session_user("bob");
+    assert_eq!(code(&core, &mut s, "CREATE SEQUENCE q2"), "0A000");
+    ok(&core, &mut s, "CREATE SEQUENCE public.q2");
+    ok(
+        &core,
+        &mut s,
+        "CREATE VIEW public.v2 AS SELECT id FROM public.t",
+    );
+}
+
+/// 拡張クエリ（Parse／Bind／Describe／Execute）でも、`public.` 修飾した CREATE／DROP は
+/// 書き換え後のトークンでゲートを再実行されても `search_path` に影響されない。
+#[test]
+fn public_qualified_object_ddl_ignores_the_path_in_extended_queries() {
+    let (core, _g, mut s) = with_table("sp-obj-ext");
+    let c = ctx(TENANT);
+    ok(&core, &mut s, "SET search_path = nosuch");
+    for sql in [
+        "CREATE SEQUENCE public.q",
+        "CREATE VIEW public.v AS SELECT id FROM public.t",
+        "CREATE MATERIALIZED VIEW public.m AS SELECT id FROM public.t",
+    ] {
+        let p = core
+            .parse_sql_prepared_with_declared_in_session(&s, sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}: parse {e}"));
+        let b = core
+            .bind_prepared_in_session(&s, &p, &[])
+            .unwrap_or_else(|e| panic!("{sql}: bind {e}"));
+        core.execute_parsed_in_session(&c, &mut s, &b)
+            .unwrap_or_else(|e| panic!("{sql}: execute {} {e}", e.wire_code()));
+    }
+    for sql in [
+        "DROP SEQUENCE public.q",
+        "DROP VIEW public.v",
+        "DROP MATERIALIZED VIEW public.m",
+    ] {
+        let p = core
+            .parse_sql_prepared_with_declared_in_session(&s, sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}: parse {e}"));
+        // Describe も Bind と同じ再ゲートを通る。
+        let _ = core.describe_prepared_in_session(&s, &p);
+        let b = core
+            .bind_prepared_in_session(&s, &p, &[])
+            .unwrap_or_else(|e| panic!("{sql}: bind {e}"));
+        core.execute_parsed_in_session(&c, &mut s, &b)
+            .unwrap_or_else(|e| panic!("{sql}: execute {} {e}", e.wire_code()));
+    }
+    // 未修飾の同じ文は（DROP は Parse で、CREATE は作成先の判定で）拒否される。
+    for (sql, want) in [
+        ("CREATE SEQUENCE q9", "3F000"),
+        ("DROP SEQUENCE q", "42P01"),
+    ] {
+        let e = core
+            .parse_sql_prepared_with_declared_in_session(&s, sql, &[])
+            .and_then(|p| core.bind_prepared_in_session(&s, &p, &[]))
+            .and_then(|b| core.execute_parsed_in_session(&c, &mut s.clone(), &b))
+            .expect_err(sql);
+        assert_eq!(e.wire_code(), want, "{sql}");
+    }
+
+    // 自 username と同名の SCHEMA がある既定の path でも明示修飾の作成は通る。
+    ok(&core, &mut s, "RESET search_path");
+    ok(&core, &mut s, "CREATE SCHEMA bob");
+    s.set_session_user("bob");
+    let p = core
+        .parse_sql_prepared_with_declared_in_session(&s, "CREATE SEQUENCE public.q2", &[])
+        .expect("parse");
+    let b = core.bind_prepared_in_session(&s, &p, &[]).expect("bind");
+    core.execute_parsed_in_session(&c, &mut s, &b)
+        .expect("execute explicit public create");
+}
