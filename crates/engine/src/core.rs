@@ -7640,6 +7640,11 @@ impl EngineCore {
             // SQL-43（Issue #1531）: `FROM` なし定数式 SELECT。評価は行わず束縛結果の
             // 列だけを返す（ストレージにも触れない）。
             ParsedSql::Statement(Statement::ConstSelect(validated)) => {
+                // `current_schema` 系は型だけ公告する（Describe は `PolicyContext` を持たず、
+                // SCHEMA の照会をしない。TABLE-27 (7)・Issue #1718）。
+                let _schema_fn = crate::sql::search_path::SchemaFnScope::enter(
+                    crate::sql::search_path::SchemaFnMode::TypesOnly,
+                );
                 let bound = crate::sql::const_select::bind(validated, session.udfs())?;
                 Ok(Some(bound.columns()))
             }
@@ -8102,6 +8107,24 @@ impl EngineCore {
             // ショットに触れず、`PolicyContext` を要する本入口からのみ到達する。
             // `execute_read_statement` には渡さない（読み取り源を持たない）。
             crate::sql::allowlist::Statement::ConstSelect(validated) => {
+                // `current_schema` 系を含む文だけ、呼び出し元テナントの SCHEMA 実在を path の要素数
+                // 以下の get で確かめてからスコープを張る（含まない文は照会コストゼロ。
+                // 他テナントの SCHEMA は不在と同じ扱い。TABLE-27 (7)・Issue #1718）。
+                let _schema_fn = if crate::sql::const_select::uses_schema_fn(&validated) {
+                    let probe = |schema: &str| {
+                        self.storage
+                            .schema_id(ctx.tenant_id(), schema)
+                            .map(|id| id.is_some())
+                            .map_err(crate::catalog::table_lookup_error)
+                    };
+                    let values =
+                        crate::sql::search_path::resolve_schema_functions(session, &probe)?;
+                    Some(crate::sql::search_path::SchemaFnScope::enter(
+                        crate::sql::search_path::SchemaFnMode::Values(values),
+                    ))
+                } else {
+                    None
+                };
                 let result = crate::sql::const_select::run(&validated, session.udfs())?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
