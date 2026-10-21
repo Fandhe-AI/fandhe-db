@@ -492,3 +492,18 @@ TABLE-27 (3) のポインタ。セッション変数 `search_path` を engine �
 - **対象外**: システムカタログと psql の `\dn`・`FROM` あり／INSERT／DEFAULT／CHECK／索引／ビュー本文での
   `current_schema` 系・修飾つき `pg_catalog.current_schema()`・`current_setting('search_path')`・
   StartupMessage の `search_path` と `ParameterStatus`・`name` 型の導入・`pg_temp.x` の結線
+
+## 12. Issue #1719 実装記録
+
+SCHEMA 導入（#1713〜#1717）後もテナント境界が保たれることの横断回帰テスト。ポインタ: TABLE-27（関連: RLS-7・RLS-10・ERR-6）。**テストのみの追加**で、engine 本体・公開 API・依存は不変。
+
+- **新設**: `crates/engine/tests/table27_tenant_boundary.rs`。各 `table27_*.rs` の機能別テストとは重複させず、まだ無い軸を足す（3 テナントの回転、可視性 2 モード、テナントごとの別セッション、独立オラクル、複数の入口、試行総数の固定、負の対照）
+- **存在の秘匿（D4）**: 他テナントの SCHEMA（表・ビュー・索引・SEQUENCE・名前付き制約・UDF）がある DB と、どこにも無い DB の「双子」で、閲覧側が同じ文を実行し、SQLSTATE と文言が**完全一致**することを確かめる。入口は autocommit・明示トランザクション（失敗後の文と `ROLLBACK` を含む）・拡張クエリ（Parse／Describe／Bind／Execute のどの段で失敗したかも含む）・`COPY`。加えて応答に `#`・他テナントだけが知る名前・閲覧側が書いていない数字が出ないことを検査する。`CREATE SCHEMA` は他テナントの同名があっても成功し、互いに独立する
+- **search_path（D5・D11）**: 他テナントの SCHEMA 名を path に置く／username と同名にする（`$user`）／`ROLLBACK` で戻す／Parse 後に変更する、のいずれも双子と一致し、閲覧側自身の行だけが見える
+- **暗黙 RLS（D3）**: 3 テナント × 可視性 2 モード × 参照形（未修飾・`public.`・`s.`・ビュー・JOIN・IN・UNION・EXISTS・COUNT・索引経由）の結果 id 集合を、`PolicyContext` の判定を呼ばないテスト側の真実値で照合する。書き込み（UPDATE・DELETE・UPSERT・TRUNCATE）は autocommit と明示トランザクションの両方で、他テナントの事後状態が不変であることを確かめる。Public 行は SQL 表が採番方式で Rust API から書けないため、Rust API で作った従来方式の共有表を使って別に検査する
+- **内部 ID の接頭辞**: 内部 ID `#1.` と `#10.` 以上の物理表が両方ある並びで、DROP CASCADE・RENAME・TRUNCATE・SEQUENCE の操作が別テナントの SCHEMA に及ばない。物理表名の存在は raw redb の表名で前提確認する
+- **名前の衝突**: 3 テナントが同名の SCHEMA に同名のオブジェクトを作れ（`42P07`／`42710` にならない）、どれかの DROP／RENAME が他テナントに影響しない。UDF はセッション単位で保持される
+- **試行総数の固定と負の対照**: 各テストの末尾で検査した組の数を `assert_eq!` で固定し、検査器（漏えい検出・オラクル・双子比較）へ捏造した違反を与えて検出されることを確かめる
+- **現状の挙動として固定したもの（fail-closed）**: `search_path` に自テナントの SCHEMA だけを置いた未修飾名の解決・作成は未対応（`42P01`／`0A000`）、テナント SCHEMA 間の `SET SCHEMA` は `42501`。受理されるようになったら本テストの期待を更新する
+- **未カバー**: 物理表へ他テナントの行を直接差し込む多層防御（D3）の検査。SQL 表は採番方式で、`tenant::insert_row` などの公開 API が拒否するため再現できず、raw redb での行エンコードが要る。処理時間の差による存在の推測（D4 の時間的な側面）は決定的に検査できない
+- **対象外**: wire-server の応答（#1718）、SCHEMA 単位の GRANT（#2234）、利用者定義の RLS ポリシー、crash テストの新設
