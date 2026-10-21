@@ -1992,6 +1992,11 @@ fn push_dml_assignments(
             InsertLiteral::SequenceCall { .. } => {
                 return Err(crate::sql::parser::reject_sequence_call_literal());
             }
+            // `DEFAULT` キーワード（SQL-50・Issue #1730）は `INSERT ... VALUES` の要素に限り、
+            // UPDATE の `SET` には現れない（構文段が `42601` で拒否済み）。到達は fail-closed で拒否する。
+            InsertLiteral::Default => {
+                return Err(crate::sql::parser::reject_default_keyword_literal());
+            }
         }
     }
     Ok(())

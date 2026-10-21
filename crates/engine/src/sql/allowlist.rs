@@ -3471,6 +3471,17 @@ pub enum InsertLiteral {
         func: SequenceFunc,
         name: String,
     },
+    /// `INSERT ... VALUES` の要素に単独で書かれた `DEFAULT` キーワード（SQL-50・Issue #1730）。
+    /// `Parser::expect_insert_value` の先頭だけが生成する（直後が `,` または `)` のときのみ。
+    /// `DEFAULT + 1`・`UPDATE ... SET`・`ON CONFLICT ... DO UPDATE SET`・DDL の列 DEFAULT は
+    /// この variant を作らず従来どおり `42601`）。
+    ///
+    /// 束縛段（`sql::parser::bind_insert_row`）では「その列を省略した」ものとして扱い、
+    /// 列 DEFAULT の適用（`fill_omitted_columns`）と内容照合ハッシュの材料除外
+    /// （RECOVER-10・RECOVER-11。`VolatileColumn` の既存規則）を省略列と共有する。
+    /// 他の束縛経路（UPDATE・UPSERT の SET・ファイル形・内容照合ハッシュの材料化）へ到達した
+    /// 場合は fail-closed で `0A000` に拒否する。
+    Default,
 }
 
 /// [`InsertLiteral::SequenceCall`] の関数種別（許可リスト。TABLE-24・Issue #1690）。
@@ -3550,6 +3561,11 @@ pub struct ValidatedInsert {
     /// 列リストの宣言順（`columns[i]` は `rows[r][i]` に対応する。個数は
     /// `parse_insert` が行ごとに一致を確認済み）。
     pub columns: Vec<String>,
+    /// 列リストが省略された（`INSERT INTO t VALUES (...)`）形か（SQL-50・Issue #1730）。
+    /// 真のとき `columns` は空で、`sql::parser::bind_insert_form` が表の宣言順の列
+    /// （`SELECT *` と同じ順。疑似 `id` を先頭に置く）へ束縛段で展開する。`DEFAULT VALUES` は
+    /// 偽（`columns = []`・`rows = [[]]`）。NoSQL 表層など列を明示する構築元は常に偽。
+    pub columns_omitted: bool,
     /// `VALUES` 句の行の宣言順（`rows.len() >= 1`。単一行形も `rows.len() == 1`
     /// として同じ形で保持する。SQL-16、TASK-190）。
     pub rows: Vec<Vec<InsertLiteral>>,
@@ -9110,7 +9126,7 @@ impl<'a> Parser<'a> {
     /// 列数と一致する必要がある（不一致は行ごとに検出して拒否）。RETURNING・
     /// 可視性ラベル指定は引き続き構造的に受理しない。
     fn parse_insert(&mut self) -> Result<ParsedInsertShape, SqlSurfaceError> {
-        let (table_name, columns) = self.parse_insert_head()?;
+        let (table_name, columns, columns_omitted, default_values) = self.parse_insert_head()?;
         // `INSERT ... SELECT`（SQL-51・Issue #1732）は内側 SELECT の検証にカタログ照会が要るため、
         // 本入口（`VALUES` 専用）では受理せず `0A000` で明示する（SELECT 形を `VALUES` 必須の
         // `42601` と取り違えない・黙って落とさない fail-closed）。受理するのは
@@ -9120,35 +9136,54 @@ impl<'a> Parser<'a> {
                 "INSERT ... SELECT is not supported on this entry point",
             ));
         }
-        self.parse_insert_values_tail(table_name, columns)
+        self.parse_insert_values_tail(table_name, columns, columns_omitted, default_values)
     }
 
     /// `INSERT INTO <table> (<col>[, <col>]*)` の見出し部（`OVERRIDING` の拒否まで）を解析する。
     /// `VALUES` 形・`SELECT` 形が共有する（SQL-50・SQL-51）。
-    fn parse_insert_head(&mut self) -> Result<(String, Vec<String>), SqlSurfaceError> {
+    fn parse_insert_head(&mut self) -> Result<(String, Vec<String>, bool, bool), SqlSurfaceError> {
         self.expect_contextual_keyword("INSERT")?;
         self.expect_contextual_keyword("INTO")?;
         let table_name = self.expect_ident()?;
 
-        self.expect_punct('(')?;
-        let mut columns = vec![self.expect_ident()?];
-        while matches!(self.peek(), Some(Token::Punct(','))) {
+        // 表名の直後は 3 通り（SQL-50・Issue #1730）: `DEFAULT VALUES`・`(<列>, ...)` 付き・
+        // 列リスト省略（`VALUES` が直接続く）。引用付き `"DEFAULT"` は `quoted_null` に位置が残り
+        // キーワード扱いにならない（`INSERT INTO t "DEFAULT" VALUES` 等は `42601`）。
+        let default_values =
+            self.peek_ident_matches("DEFAULT") && !self.quoted_null.contains(&self.pos);
+        let mut columns: Vec<String> = Vec::new();
+        let mut columns_omitted = false;
+        if default_values {
             self.advance();
-            if columns.len() >= MAX_COLUMN_COUNT {
-                return Err(SqlSurfaceError::unsupported("too many INSERT columns"));
+            // `OVERRIDING` はどの形でも未対応（下の判定と同じ理由）。`DEFAULT VALUES` の
+            // `VALUES` は必須で、続けて行は書けない（`DEFAULT VALUES (1)` は余剰トークンで `42601`）。
+            self.expect_contextual_keyword("VALUES")?;
+        } else {
+            if matches!(self.peek(), Some(Token::Punct('('))) {
+                self.advance();
+                columns.push(self.expect_ident()?);
+                while matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    if columns.len() >= MAX_COLUMN_COUNT {
+                        return Err(SqlSurfaceError::unsupported("too many INSERT columns"));
+                    }
+                    columns.push(self.expect_ident()?);
+                }
+                self.expect_punct(')')?;
+            } else {
+                columns_omitted = true;
             }
-            columns.push(self.expect_ident()?);
-        }
-        self.expect_punct(')')?;
 
-        // `OVERRIDING { SYSTEM | USER } VALUE`（TABLE-24・Issue #1695）は未対応。`42601` ではなく
-        // `0A000` で明示する（fail-closed。内容照合ハッシュへの反映設計が要るため後続 Issue）。
-        if self.peek_ident_matches("OVERRIDING") {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "INSERT ... OVERRIDING is not supported",
-            ));
+            // `OVERRIDING { SYSTEM | USER } VALUE`（TABLE-24・Issue #1695）は未対応。`42601` ではなく
+            // `0A000` で明示する（fail-closed。内容照合ハッシュへの反映設計が要るため後続 Issue）。
+            // 列リストの有無に関わらず判定する。
+            if self.peek_ident_matches("OVERRIDING") {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "INSERT ... OVERRIDING is not supported",
+                ));
+            }
         }
-        Ok((table_name, columns))
+        Ok((table_name, columns, columns_omitted, default_values))
     }
 
     /// 列リストの後ろが問い合わせ（`SELECT`・`(SELECT`・`WITH`）の先頭か。`VALUES` 形との分岐に使う。
@@ -9181,6 +9216,18 @@ impl<'a> Parser<'a> {
                 | Token::QuotedNull(_)
                 | Token::Punct(')' | ']'),
             ) => true,
+            // `AS` 直後の別名として消費された語は、綴りが演算子語と同じでも式の終端として扱う
+            // （`SELECT 1 AS desc RETURNING a`、`AS "desc"` 等。引用付き識別子は字句解析後に
+            // 裸の語と区別できないため、構文上の位置〔`AS` の直後〕で判定する）。
+            Some(Token::Ident(_))
+                if idx >= start.saturating_add(2)
+                    && matches!(
+                        self.tokens.get(idx.saturating_sub(2)),
+                        Some(Token::Ident(a)) if a.eq_ignore_ascii_case("AS")
+                    ) =>
+            {
+                true
+            }
             Some(Token::Ident(p)) => ![
                 "AS", "ON", "JOIN", "USING", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE",
                 "BETWEEN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "OUTER",
@@ -9211,6 +9258,11 @@ impl<'a> Parser<'a> {
         table_name: String,
         columns: Vec<String>,
     ) -> Result<ParsedInsertSelectShape, SqlSurfaceError> {
+        if columns.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "INSERT ... SELECT requires an explicit column list",
+            ));
+        }
         let start = self.pos;
         let mut depth: usize = 0;
         let mut pending_joins: usize = 0;
@@ -9281,10 +9333,31 @@ impl<'a> Parser<'a> {
         &mut self,
         table_name: String,
         columns: Vec<String>,
+        columns_omitted: bool,
+        default_values: bool,
     ) -> Result<ParsedInsertShape, SqlSurfaceError> {
-        self.expect_contextual_keyword("VALUES")?;
-        let mut rows: Vec<Vec<InsertLiteral>> = vec![self.parse_insert_values_row(&columns)?];
-        while matches!(self.peek(), Some(Token::Punct(','))) {
+        if !default_values {
+            self.expect_contextual_keyword("VALUES")?;
+        }
+        // 明示列リストは行ごとに列数と照合する。列リスト省略は先頭行の長さを後続行の基準にする
+        // （PostgreSQL の "VALUES lists must all be the same length" 相当。展開後の列数との
+        // 照合は束縛段の責務）。
+        let first_row_len = if columns_omitted {
+            None
+        } else {
+            Some(columns.len())
+        };
+        let mut rows: Vec<Vec<InsertLiteral>> = if default_values {
+            vec![Vec::new()]
+        } else {
+            vec![self.parse_insert_values_row(first_row_len)?]
+        };
+        let expected_row_len = if columns_omitted {
+            rows.first().map(Vec::len)
+        } else {
+            first_row_len
+        };
+        while !default_values && matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
             if let Some(max_insert_rows) = self.max_insert_rows {
                 if rows.len() >= max_insert_rows.get() {
@@ -9293,7 +9366,7 @@ impl<'a> Parser<'a> {
                     )));
                 }
             }
-            rows.push(self.parse_insert_values_row(&columns)?);
+            rows.push(self.parse_insert_values_row(expected_row_len)?);
         }
 
         // `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・TASK-193、
@@ -9323,6 +9396,7 @@ impl<'a> Parser<'a> {
         Ok(ParsedInsertShape {
             table_name,
             columns,
+            columns_omitted,
             returning,
             rows,
             operation_id,
@@ -9431,6 +9505,18 @@ impl<'a> Parser<'a> {
     /// `VALUES` 要素 1 個。要素全体が単独の時刻関数なら [`InsertLiteral::CurrentTime`]
     /// （SQL-37・Issue #2188）、それ以外は従来の [`Self::expect_literal_or_const_expr`]。
     fn expect_insert_value(&mut self) -> Result<InsertLiteral, SqlSurfaceError> {
+        // 単独の `DEFAULT` キーワード（SQL-50・Issue #1730）。直後が `,` または `)` のときだけ
+        // 受理し、`DEFAULT + 1` 等は従来の経路（`42601`）へ落とす。引用付き `"DEFAULT"` は対象外。
+        if self.peek_ident_matches("DEFAULT")
+            && !self.quoted_null.contains(&self.pos)
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::Punct(',' | ')'))
+            )
+        {
+            self.advance();
+            return Ok(InsertLiteral::Default);
+        }
         if let Some(t) = self.try_parse_time_default()? {
             return Ok(InsertLiteral::CurrentTime(t));
         }
@@ -9445,7 +9531,7 @@ impl<'a> Parser<'a> {
     /// 呼ばれる共有ヘルパ。
     fn parse_insert_values_row(
         &mut self,
-        columns: &[String],
+        expected_len: Option<usize>,
     ) -> Result<Vec<InsertLiteral>, SqlSurfaceError> {
         self.expect_punct('(')?;
         let mut values = vec![self.expect_insert_value()?];
@@ -9458,12 +9544,14 @@ impl<'a> Parser<'a> {
         }
         self.expect_punct(')')?;
 
-        if columns.len() != values.len() {
-            return Err(SqlSurfaceError::unsupported(format!(
-                "INSERT column count {} does not match value count {}",
-                columns.len(),
-                values.len()
-            )));
+        if let Some(expected) = expected_len {
+            if expected != values.len() {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "INSERT column count {} does not match value count {}",
+                    expected,
+                    values.len()
+                )));
+            }
         }
 
         Ok(values)
@@ -17978,6 +18066,7 @@ struct ParsedInsertSelectShape {
 struct ParsedInsertShape {
     table_name: String,
     columns: Vec<String>,
+    columns_omitted: bool,
     rows: Vec<Vec<InsertLiteral>>,
     operation_id: Option<OperationId>,
     returning: Option<Projection>,
@@ -18307,6 +18396,7 @@ pub(crate) fn parse_insert_shape_tokens_with_limit(
     Ok(ValidatedInsert {
         table_name: shape.table_name,
         columns: shape.columns,
+        columns_omitted: shape.columns_omitted,
         rows: shape.rows,
         operation_id: shape.operation_id,
         returning: shape.returning,
@@ -18389,7 +18479,7 @@ pub(crate) fn parse_insert_any_shape_tokens_with_limit(
     max_insert_rows: Option<std::num::NonZeroUsize>,
 ) -> Result<ParsedInsertTokens, SqlSurfaceError> {
     let mut p = Parser::new(tokens).with_max_insert_rows(max_insert_rows);
-    let (table_name, columns) = p.parse_insert_head()?;
+    let (table_name, columns, columns_omitted, default_values) = p.parse_insert_head()?;
     if p.at_insert_query_start() {
         let shape = p.parse_insert_select_tail(table_name, columns)?;
         p.expect_end_of_statement()?;
@@ -18409,12 +18499,13 @@ pub(crate) fn parse_insert_any_shape_tokens_with_limit(
             operation_id: shape.operation_id,
         }));
     }
-    let shape = p.parse_insert_values_tail(table_name, columns)?;
+    let shape = p.parse_insert_values_tail(table_name, columns, columns_omitted, default_values)?;
     p.expect_end_of_statement()?;
     mode.require(shape.operation_id.as_ref())?;
     Ok(ParsedInsertTokens::Values(ValidatedInsert {
         table_name: shape.table_name,
         columns: shape.columns,
+        columns_omitted: shape.columns_omitted,
         rows: shape.rows,
         operation_id: shape.operation_id,
         returning: shape.returning,
@@ -24049,6 +24140,16 @@ mod tests {
         for sql in [
             "INSERT INTO t (a) SELECT ARRAY[1, 2] RETURNING a",
             "INSERT INTO t (a) SELECT b[1] FROM x RETURNING a",
+        ] {
+            let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect(sql) else {
+                panic!("expected Select shape: {sql}");
+            };
+            assert!(shape.returning.is_some(), "{sql}");
+        }
+        // `AS` 直後の別名が演算子語と同じ綴りでも `RETURNING` は句境界になる。
+        for sql in [
+            "INSERT INTO t (a) SELECT 1 AS desc RETURNING a",
+            "INSERT INTO t (a) SELECT a AS asc FROM x RETURNING a",
         ] {
             let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect(sql) else {
                 panic!("expected Select shape: {sql}");
