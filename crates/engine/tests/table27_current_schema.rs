@@ -240,6 +240,38 @@ fn temp_schema_is_visible_only_with_temp_tables() {
     assert!(t.find("pg_catalog") < t.find("public"), "{t}");
 }
 
+/// 明示 path に `pg_temp` があっても、暗黙の一時スキーマは `pg_catalog` より前に 1 件だけ並ぶ。
+#[test]
+fn explicit_pg_temp_keeps_temp_before_pg_catalog_without_duplicate() {
+    let (core, _g) = new_core("cs-temp-explicit");
+    let mut s = ddl_session();
+    ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE tmp (id BIGINT PRIMARY KEY)",
+    );
+    ok(&core, &mut s, "SET search_path = pg_temp, public");
+    let t = schemas(&core, &mut s, "true");
+    assert_eq!(t.matches("pg_temp").count(), 1, "{t}");
+    assert!(t.find("pg_temp") < t.find("pg_catalog"), "{t}");
+    assert!(t.find("pg_catalog") < t.find("public"), "{t}");
+}
+
+/// FROM なし HAVING の裸の `current_schema` も関数として解決される（42703 にならない）。
+#[test]
+fn bare_current_schema_in_fromless_having() {
+    let (core, _g) = new_core("cs-having");
+    let mut s = ddl_session();
+    assert_eq!(
+        one(
+            &core,
+            &mut s,
+            "SELECT count(*) HAVING current_schema = 'public'"
+        ),
+        "SignedInteger(1)"
+    );
+}
+
 #[test]
 fn values_follow_set_reset_and_rollback() {
     let (core, _g) = new_core("cs-follow");

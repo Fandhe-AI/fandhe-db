@@ -3920,8 +3920,11 @@ pub(super) fn bind_expr_any(
                 return Ok((bound.clone(), *ty));
             }
             // 裸の `current_schema`（Rails 等が送る括弧なし形）。列を持たない FROM なし SELECT の
-            // 束縛（`env.schema` なし）かつスコープがあるときだけ関数呼び出しと同じに扱う。
-            if env.schema.is_none()
+            // 束縛（`env.schema` なし、または FROM なし HAVING の合成 schema のように同名列を
+            // 持たない場合）かつスコープがあるときだけ関数呼び出しと同じに扱う。
+            if env
+                .schema
+                .is_none_or(|s| !s.columns.iter().any(|c| &c.name == name))
                 && name.eq_ignore_ascii_case("current_schema")
                 && crate::sql::search_path::current_schema_fn_mode().is_some()
             {

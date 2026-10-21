@@ -525,14 +525,24 @@ impl SchemaFnValues {
         let mut out = Vec::with_capacity(self.explicit.len().saturating_add(2));
         if include_implicit {
             let has = |n: &str| self.explicit.iter().any(|e| e == n);
-            if self.temp_visible && !has("pg_temp") {
+            // 暗黙の一時スキーマは明示リストの `pg_temp` の有無によらず常に先頭へ置く
+            // （明示側の `pg_temp` は下で除去して重複させない）。
+            if self.temp_visible {
                 out.push("pg_temp".to_string());
             }
             if !has("pg_catalog") {
                 out.push("pg_catalog".to_string());
             }
+            let skip_temp = self.temp_visible;
+            out.extend(
+                self.explicit
+                    .iter()
+                    .filter(|e| !(skip_temp && e.as_str() == "pg_temp"))
+                    .cloned(),
+            );
+        } else {
+            out.extend(self.explicit.iter().cloned());
         }
-        out.extend(self.explicit.iter().cloned());
         out
     }
 }
