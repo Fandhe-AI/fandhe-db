@@ -157,23 +157,31 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
 - 確定（#1699。単一行分。自動運転下の判断で、人間の確認が要る）: `OpTag::InsertIdentity = 21`
   （通常形）と `OpTag::InsertIdentityExpr = 22`（`VALUES` に単独の時刻関数・`nextval` を含む形）を追加した。
   材料は明示 `id` の文（`Insert`・`InsertExpr`）から `id` を除いたもの（visibility → embedding → 列）。
-  明示 `id` の文のバイト列は不変（golden）。複数行・UPSERT・NoSQL は #1700 が同じ系列で拡張する
+  明示 `id` の文のバイト列は不変（golden）。複数行・COPY・NoSQL は #1700 が同じ系列で拡張した
+  （下の「確定（#1700）」）。UPSERT は `id` 省略を受理しない
 - operation_id を指定した再送は `23505` で再実行せず、SEQUENCE を進めない（同じ `id` を再現しない）
 - operation_id を省略した書き込みは台帳に記録せず、再送すれば別の値を採番する
 - `--require-operation-id` の構成で省略すると、値を消費せずに `23502`
-- 複数行 INSERT は [multi-row-dml-operation-id.md](multi-row-dml-operation-id.md) の方式で、
-  行ごとに採番する
+- 複数行 INSERT は [multi-row-dml-operation-id.md](multi-row-dml-operation-id.md) の方式
+  （1 文 = 1 台帳エントリ）で、行ごとに採番する
+- 確定（#1700。自動運転下の判断で、人間の確認が要る）: `OpTag::InsertIdentityBatch = 23`・
+  `InsertIdentityBatchExpr = 24` を追加した。材料は明示 `id` のバッチ（`InsertBatch`・
+  `InsertBatchExpr`）から行ごとの `id` を除いたもの（件数プレフィクスと行ごとの列数
+  プレフィクスは維持）。SQL 複数行・COPY・NoSQL が同じ関数を共有し、全行が明示 `id` のバッチは
+  従来のタグ・バイト列のまま（golden 不変）。省略行と明示行の混在バッチは `0A000`（SQL・COPY は
+  列リストを共有するため表現できず、NoSQL の行ごとの有無だけが該当。ハッシュに行ごとの有無を
+  持ち込まない）
 
 ### D9. 影響する表層（各 sub-issue が着地するまで fail-closed）
 
 | 表層 | 現状 | 担当 |
 | ---- | ---- | ---- |
 | SQL 単一行 INSERT | `id` 省略を受理（#1699 で着地。従来方式の表は `22000`） | #1699 |
-| SQL 複数行 INSERT | `id` 省略は `0A000`（束縛段と実行段の両方で拒否） | #1700 |
+| SQL 複数行 INSERT | `id` 省略を受理（#1700 で着地。全行一様。混在は `0A000`） | #1700 |
 | `RETURNING id` | 採番値で投影し直す（#1699 で着地。sequence ADR §8.4） | #1699 |
-| UPSERT（`ON CONFLICT`） | `DEFAULT nextval` は `0A000` | #1700 で受理範囲を明記。それまで `0A000` |
-| COPY FROM | `id` 必須。`DEFAULT nextval` は `0A000` | #1700 |
-| NoSQL HTTP insert | `id` 必須 | #1700（`returning` は NOSQL-22 で対象外） |
+| UPSERT（`ON CONFLICT`） | `id` 省略・`DEFAULT nextval` とも `0A000`（#1700 の結論: 受理しない。衝突時の欠番と `DO UPDATE` の意味が未設計） | #1700 |
+| COPY FROM | 移行済み表は `id` 列を省略可（#1700 で着地。`\N` の `id` は `22000`）。`DEFAULT nextval` は `0A000` | #1700 |
+| NoSQL HTTP insert | 移行済み表は `id` キーを省略可（#1700 で着地。`"id": null` は `22000`）。`returning` は NOSQL-22 で対象外 | #1700 |
 | ファイル形 INSERT（path/body） | `0A000` | 対象外のまま |
 | 更新可能ビュー経由の INSERT | [create-view.md](create-view.md) | #1699 の結論: 基表の `id` を省略する形は `0A000` のまま（`WITH CHECK OPTION` の検査時点と採番値の関係を検証し切れていないため）。受理は後続 Issue |
 | 分割実行 DML・一時表・matview | INSERT を伴わない／適用外 | 対象外 |
@@ -223,3 +231,28 @@ Issue #1711／#1717（SCHEMA への追随）。着地順が前後した場合は
 - 未知の blob 版・タグは `CorruptSchema`
 - 移行の走査は既存データの量に比例する一度きりの処理で、外部入力では起動しない
 - 依存は追加しない
+
+## 8. Issue #1700 実装記録（複数行・COPY・NoSQL への拡張）
+
+ポインタ: TABLE-23・TABLE-24・RECOVER-1・RECOVER-10〜12・RLS-9・RLS-10・NOSQL-6。
+自動運転下の判断を含むため、人間の確認が要る（下の D-b・D-c・D-d）。
+
+- 受入: operation_id 付きの再送は文全体が `23505` で再実行せず、SEQUENCE も進まない。operation_id
+  省略の書き込みは台帳に残らず、再送すれば新しい値を採番する。クラッシュしても二重採番は無い
+- Issue 題名にある「台帳に保存し再送で同じ値を返す」は採用しない（§1.1。#1699・#1692 と同じ解釈）
+- D-a ハッシュ: D8 の確定（#1700）のとおり、タグ 23・24 と、全行明示のバッチの不変
+- D-b 混在バッチ: `0A000`。SQL・COPY は列リストを共有するため表現できず、NoSQL だけが該当する
+- D-c 採番順: 台帳照合 → NOT NULL 検査 → 列の SEQUENCE（`nextval`・`DEFAULT nextval`）→ `id`（行順）→
+  行書き込み → 制約検査。PostgreSQL との差は、`VALUES` で `nextval('<table>_id_seq')` を併用した
+  場合に限り観測できる。所有 SEQUENCE が無い表は値を消費せずに `23502`
+- D-d UPSERT: `0A000` のまま（D9）
+- COPY: `schema.is_migrated_id()` の表に限り `id` 列の省略を受理する。session 付きの完了処理
+  （`commit_copy_in_txn_in_session`）が INSERT と同じ採番文脈を張るため、autocommit・明示 txn の
+  どちらも採番でき `currval` も更新される。session を持たない公開入口の明示 txn は `0A000`
+- NoSQL: `bind_insert_identity`（公開束縛）が `id` キー欠落を受理する。`bind_insert` の署名・契約は不変
+- テスト: `table24_migrated_id_batch.rs`（複数行・COPY・再送・衝突・必須構成）・
+  `wire-server/tests/http_insert_migrated_id.rs`・content_hash の golden・
+  `crash-test-sequence` の identity 段（`n` の順に `id` が狭義単調増加、再送 `23505`・内容違い
+  `22023`・値を消費しない）
+- 対象外: UPSERT・ビュー経由・`VALUES (DEFAULT, …)`・NoSQL `returning`・COPY の `DEFAULT nextval`・
+  混在バッチの受理・CACHE・補強 txn

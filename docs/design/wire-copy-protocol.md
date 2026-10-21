@@ -216,3 +216,10 @@
   `split_first`／イテレータで処理する。
 - **spec の機密保持**: 本 doc・コード・コミットは TASK-220・WIRE-17・
   INDEX-4 のポインタのみを使い、spec 本文を転記しない。
+
+## 移行済み表での `id` 列の省略（Issue #1700）
+
+移行済み表（[migrated-id-identity.md](migrated-id-identity.md)）への `COPY FROM STDIN` は列リストから
+`id` を省略でき、行順に所有 SEQUENCE から採番する（`\N` を渡した `id` 列は `22000`。従来方式の表は
+`id` 必須のまま）。採番は session 付きの完了処理で INSERT と同じ文脈を張って行い、autocommit・
+明示トランザクションの両方で動く。

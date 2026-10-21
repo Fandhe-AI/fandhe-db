@@ -11,7 +11,7 @@
 //!   自動で次の値へ飛ばない
 //! - `USING OPERATION_ID` の再送は値を消費せず `23505`、内容違いは `22023`
 //! - テナント間で採番が独立し、他テナントの最大値・件数が採番値にもエラーにも現れない
-//! - 範囲外の形（複数行・UPSERT・ビュー経由）と従来方式のままの表は固定のエラーで拒否される
+//! - 範囲外の形（UPSERT・ビュー経由）と従来方式のままの表は固定のエラーで拒否される
 
 use engine::core::EngineCore;
 use engine::policy::PolicyContext;
@@ -268,16 +268,19 @@ fn legacy_table_still_requires_id() {
     );
 }
 
-/// 範囲外の形（複数行 VALUES・UPSERT）で `id` を省略すると固定の `0A000`。行は書かれない。
+/// 範囲外の形（UPSERT）で `id` を省略すると固定の `0A000`。行は書かれない。複数行 VALUES は
+/// Issue #1700 で受理に変わった（`table24_migrated_id_batch.rs` が検証する）。
 #[test]
 fn out_of_scope_shapes_reject_omitted_id() {
     let (_g, core) = fixture("t24-mig-shapes");
-    for sql in [
-        "INSERT INTO items (n) VALUES (1), (2)",
-        "INSERT INTO items (n) VALUES (1) ON CONFLICT (id) DO NOTHING",
-    ] {
-        assert_eq!(code(&core, "tenant-a", sql), "0A000", "{sql}");
-    }
+    assert_eq!(
+        code(
+            &core,
+            "tenant-a",
+            "INSERT INTO items (n) VALUES (1) ON CONFLICT (id) DO NOTHING"
+        ),
+        "0A000"
+    );
     assert_eq!(count(&core, "tenant-a"), 2);
     // 明示 id の複数行は従来どおり。
     ok(

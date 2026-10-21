@@ -130,7 +130,7 @@ crash-test-temp-table: ## 一時表の異常終了後残骸・crash 耐性回帰
 crash-test-view-write: ## ビュー書き込みの crash 耐性・台帳再送の回帰テスト
 	scripts/crash_test_view_write.sh
 
-# 採番状態・operation_id 台帳の crash 耐性回帰テスト（Issue #1692・TABLE-24 (3)(4) ポインタ。scripts/crash_test_sequence.sh を実行）
+# 採番状態・operation_id 台帳の crash 耐性回帰テスト（Issue #1692・#1700・TABLE-24 (3)(4) ポインタ。scripts/crash_test_sequence.sh を実行）
 .PHONY: crash-test-sequence
 crash-test-sequence: ## 採番状態・operation_id 台帳の crash 耐性回帰テスト
 	scripts/crash_test_sequence.sh

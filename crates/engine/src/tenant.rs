@@ -1552,12 +1552,15 @@ fn nextval_recorded(
 /// NOT NULL 列を省略した場合と同じ `23502`（列名 `id`）で固定文言拒否する。判定はカタログ（全テナント
 /// 共有）だけで決まりテナントの状態を引かないので、他テナントの存在オラクルにならない。
 /// 払い出し値は MINVALUE 1 の `i64` で、`u64` へは checked に変換する（失敗は fail-closed）。
+/// `row_idx` は複数行 INSERT・COPY での行番号（`RETURNING id` の行ごとの投影用。Issue #1700。
+/// 単一行は 0）。
 /// 既存行との衝突は自動で次の値へ飛ばさず、行挿入が `IdConflict`（`23505`）を返す。
 fn assign_pseudo_id(
     target: &WriteTarget<'_>,
     write_txn: &redb::WriteTransaction,
     tenant_id: &str,
     table: &str,
+    row_idx: usize,
 ) -> Result<u64, TenantWriteError> {
     let (allocator, session) = sequence_runtime(target)?;
     let Some((_, def)) = crate::catalog::sequence::migrated_id_sequence_in_txn(write_txn, table)?
@@ -1581,7 +1584,7 @@ fn assign_pseudo_id(
         ))
     })?;
     crate::sql::sequence_scope::record_assigned(
-        0,
+        row_idx,
         crate::sql::sequence_scope::PSEUDO_ID_COLUMN,
         value,
     );
@@ -1966,7 +1969,7 @@ fn insert_typed_row_impl(
         // 移行済み表の `id` 省略は、台帳照合・NOT NULL 検査の後に所有 SEQUENCE から払い出す
         // （Issue #1699。再送の `23505` で値を消費しない。TABLE-24 (3)）。
         let id = if id_omitted {
-            assign_pseudo_id(&target, write_txn, ctx.tenant_id(), table)?
+            assign_pseudo_id(&target, write_txn, ctx.tenant_id(), table, 0)?
         } else {
             id
         };
@@ -2087,6 +2090,7 @@ pub(crate) fn insert_typed_rows_unchecked(
     ctx: &PolicyContext,
     visibility: crate::storage::Visibility,
     rows: &[(u64, &[crate::row_codec::Value])],
+    id_omitted: bool,
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: VolatileDefaultColumns<'_>,
@@ -2100,6 +2104,13 @@ pub(crate) fn insert_typed_rows_unchecked(
     target.with_txn(|write_txn| {
         let row_ids: Vec<RowId> = {
             let schema = require_table_schema_write_any_identity(write_txn, table)?;
+            // `id` 省略（Issue #1700。全行一様）は移行済み表だけが受理できる。束縛段の判定を、
+            // 書き込み txn 内で取得したスキーマで再確認する（仮値 `id` を書かない fail-closed）。
+            if id_omitted && !schema.is_migrated_id() {
+                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                    "table schema changed after the insert values were bound".to_string(),
+                )));
+            }
             if let Some(expected) = expected_schema {
                 if expected != &schema {
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
@@ -2111,7 +2122,7 @@ pub(crate) fn insert_typed_rows_unchecked(
             // 固定の仮値。重複検出は従来方式の表だけが対象で、ハッシュ材料には行の位置を使う
             // （rowid は再送前に分からないため、再送判定を決定的に保つ）。
             let allocated = schema.is_allocated();
-            if !allocated {
+            if !allocated && !id_omitted {
                 // バッチ内 id 重複検出（`insert_rows_unchecked` と同じ設計。確保はフォールブルに
                 // する。coding-rust.md）。行ストアへ触れる前・台帳へ書く前に検出する。
                 let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -2191,12 +2202,29 @@ pub(crate) fn insert_typed_rows_unchecked(
                 let named_columns = named_value_columns(&schema, values, vector_idx, row_volatile)?;
                 hash_rows.push((hash_id, visibility, embedding, named_columns));
             }
+            // `id` を省略したバッチは `id` を材料にしない別ドメイン（タグ 23・24。Issue #1700・D8）。
+            // 明示 `id` のバッチのハッシュはバイト不変。
             let content_hash = if use_expr {
-                let expr_input: Vec<content_hash::TypedInsertExprBatchRow<'_>> = expr_rows
+                if id_omitted {
+                    let expr_input: Vec<content_hash::TypedInsertIdentityExprBatchRow<'_>> =
+                        expr_rows
+                            .iter()
+                            .map(|(_, vis, emb, cols)| (*vis, *emb, cols.as_slice()))
+                            .collect();
+                    content_hash::for_typed_insert_identity_batch_expr(&expr_input)?
+                } else {
+                    let expr_input: Vec<content_hash::TypedInsertExprBatchRow<'_>> = expr_rows
+                        .iter()
+                        .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
+                        .collect();
+                    content_hash::for_typed_insert_batch_expr(&expr_input)?
+                }
+            } else if id_omitted {
+                let hash_input: Vec<content_hash::TypedInsertIdentityBatchRow<'_>> = hash_rows
                     .iter()
-                    .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
+                    .map(|(_, vis, emb, cols)| (*vis, *emb, cols.as_slice()))
                     .collect();
-                content_hash::for_typed_insert_batch_expr(&expr_input)?
+                content_hash::for_typed_insert_identity_batch(&hash_input)?
             } else {
                 let hash_input: Vec<content_hash::TypedInsertBatchRow<'_>> = hash_rows
                     .iter()
@@ -2233,6 +2261,21 @@ pub(crate) fn insert_typed_rows_unchecked(
             // まとめて払い出す（Issue #2199。従来方式の表は呼び出し元の `id` をそのまま使う）。
             let row_ids: Vec<RowId> = if allocated {
                 allocate_rowids(write_txn, ctx.tenant_id(), table, rows.len())?
+            } else if id_omitted {
+                // 移行済み表の `id` 省略（Issue #1700）: 台帳照合・NOT NULL 検査・列の SEQUENCE
+                // 採番の後に、所有 SEQUENCE から行順に払い出す（再送の `23505` で値を消費しない。
+                // 所有 SEQUENCE が無ければ最初の行で `23502` となり値は消費されない）。
+                let mut ids: Vec<RowId> = Vec::new();
+                ids.try_reserve_exact(rows.len()).map_err(|_| {
+                    TenantWriteError::Storage(StorageError::Codec(
+                        "failed to reserve row id batch".to_string(),
+                    ))
+                })?;
+                for row_idx in 0..rows.len() {
+                    let id = assign_pseudo_id(&target, write_txn, ctx.tenant_id(), table, row_idx)?;
+                    ids.push(RowId::from_legacy_id(id));
+                }
+                ids
             } else {
                 rows.iter()
                     .map(|(id, _)| RowId::from_legacy_id(*id))
@@ -8932,6 +8975,7 @@ mod tests {
             &ctx,
             Visibility::Public,
             &[(5, &row_values([0.0, 2.0], "b.txt", "body-b"))],
+            false,
             ledger_write,
             None,
             &[],
@@ -9851,6 +9895,7 @@ mod tests {
             &ctx_all,
             Visibility::Private,
             &[(1, &seed)],
+            false,
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
             &[],
@@ -9915,6 +9960,7 @@ mod tests {
             &ctx_all,
             Visibility::Private,
             &[(1, &seed)],
+            false,
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
             &[],
@@ -9998,6 +10044,7 @@ mod tests {
             &ctx_all,
             Visibility::Private,
             &[(1, &seed)],
+            false,
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
             &[],

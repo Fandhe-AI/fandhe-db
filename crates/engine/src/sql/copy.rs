@@ -518,8 +518,14 @@ fn bind_copy_record(
 ) -> Result<BoundInsert, SqlSurfaceError> {
     // 疑似列 `id` を持つのは従来方式の表だけ（TABLE-23・Issue #2199）。採番方式の表では行の識別子は
     // 書き込み段が払い出し、`BoundInsert.id` は使われない固定値 0。
+    //
+    // 移行済み表（`MigratedId`）は列リストからの `id` 省略を受理する（Issue #1700。採番は書き込み段が
+    // 所有 SEQUENCE から行う）。列リストに `id` を含めて `\N` を渡す形は従来どおり `22000`。
     let has_pseudo_id = schema.has_pseudo_id();
-    let id: u64 = if has_pseudo_id {
+    let id_omitted = has_pseudo_id && schema.is_migrated_id() && !columns.iter().any(|c| c == "id");
+    let id: u64 = if id_omitted {
+        0
+    } else if has_pseudo_id {
         let id_pos = columns.iter().position(|c| c == "id").ok_or_else(|| {
             SqlSurfaceError::invalid_input("COPY column list must include the id pseudo-column")
         })?;
@@ -644,7 +650,7 @@ fn bind_copy_record(
         values: bound_values,
         operation_id: operation_id.clone(),
         volatile_default_columns,
-        id_omitted: false,
+        id_omitted,
     })
 }
 
@@ -776,8 +782,10 @@ impl CopyInSession {
         columns: &[String],
         schema: &TableSchema,
     ) -> Result<(), SqlSurfaceError> {
-        // 従来方式の表は疑似列 `id` が必須（採番方式の表は `id` を要求しない。Issue #2199）。
-        if schema.has_pseudo_id() && !columns.iter().any(|c| c == "id") {
+        // 従来方式の表は疑似列 `id` が必須（採番方式の表は `id` を要求しない。Issue #2199。移行済み表は
+        // 省略でき、書き込み段が所有 SEQUENCE から採番する。Issue #1700）。
+        if schema.has_pseudo_id() && !schema.is_migrated_id() && !columns.iter().any(|c| c == "id")
+        {
             return Err(SqlSurfaceError::invalid_input(
                 "COPY column list must include the id pseudo-column",
             ));

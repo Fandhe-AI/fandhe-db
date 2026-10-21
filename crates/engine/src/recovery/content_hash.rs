@@ -171,11 +171,19 @@ enum OpTag {
     /// （TABLE-24・Issue #1699。設計記録 `docs/design/migrated-id-identity.md` D8）。`id` は
     /// サーバーが払い出すためハッシュ材料に含めない。明示 `id` の INSERT（[`OpTag::Insert`]）とは
     /// 別ドメインに分離し、省略した文が `id = 0` を明示した文と衝突しないようにする。
-    /// [`for_typed_insert_identity`] 参照。複数行・UPSERT は #1700 が同じ系列で拡張する。
+    /// [`for_typed_insert_identity`] 参照。複数行・COPY・NoSQL は [`OpTag::InsertIdentityBatch`]
+    /// （Issue #1700）が同じ系列で拡張する（UPSERT は `id` 省略を受理しない）。
     InsertIdentity = 21,
     /// `VALUES` 内の単独時刻関数・`nextval` 等を含む、`id` 省略の単一行 INSERT 用
     /// （[`OpTag::InsertIdentity`] の式つき版。[`for_typed_insert_identity_expr`] 参照）。
     InsertIdentityExpr = 22,
+    /// `id` を省略した複数行 INSERT・COPY FROM STDIN・NoSQL `insert` 用（TABLE-24・Issue #1700。
+    /// 設計 D8）。[`OpTag::InsertBatch`] のレイアウトから行ごとの `id` を除いたもの。全行が明示
+    /// `id` のバッチは従来の [`OpTag::InsertBatch`] をバイト不変で使う。
+    /// [`for_typed_insert_identity_batch`] 参照。
+    InsertIdentityBatch = 23,
+    /// [`OpTag::InsertIdentityBatch`] の式つき版（[`for_typed_insert_identity_batch_expr`] 参照）。
+    InsertIdentityBatchExpr = 24,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -799,6 +807,57 @@ pub(crate) fn for_typed_insert_identity_expr(
     push_expr_row_body(&mut b, visibility, embedding, columns)?;
     Ok(b.finish())
 }
+
+/// [`for_typed_insert_identity_batch`] が受け取る 1 行分の材料（[`TypedInsertBatchRow`] から
+/// `id` を除いたもの）。
+pub(crate) type TypedInsertIdentityBatchRow<'a> =
+    (Visibility, &'a [f32], &'a [(&'a str, &'a Value)]);
+
+/// `id` を省略したバッチ INSERT 用（TABLE-24・Issue #1700、設計 D8）。タグは
+/// [`OpTag::InsertIdentityBatch`]、レイアウトは [`for_typed_insert_batch`] から行ごとの
+/// `push_u64(id)` を除いたもの（件数プレフィクス・行ごとの非 NULL 列数プレフィクスは維持）。
+/// 採番した `id` は材料にしない（再送で値が変わっても同一ハッシュ）。
+pub(crate) fn for_typed_insert_identity_batch(
+    rows: &[TypedInsertIdentityBatchRow<'_>],
+) -> Result<ContentHash, StorageError> {
+    let count = u32::try_from(rows.len())
+        .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
+    let mut b = HashInputBuilder::new(OpTag::InsertIdentityBatch);
+    b.push_raw(&count.to_le_bytes());
+    for (visibility, embedding, columns) in rows {
+        b.push_u8(visibility.to_byte());
+        push_vector(&mut b, embedding)?;
+        let non_null_columns = columns
+            .iter()
+            .filter(|(_, value)| !matches!(value, Value::Null))
+            .count();
+        let non_null_columns = u32::try_from(non_null_columns).map_err(|_| {
+            StorageError::Codec("content hash batch row column count too large".to_string())
+        })?;
+        b.push_raw(&non_null_columns.to_le_bytes());
+        push_named_scalar_columns(&mut b, columns)?;
+    }
+    Ok(b.finish())
+}
+
+/// [`for_typed_insert_identity_batch`] の式つき版（タグ [`OpTag::InsertIdentityBatchExpr`]。
+/// 行は [`push_expr_row_body`]）。
+pub(crate) fn for_typed_insert_identity_batch_expr(
+    rows: &[TypedInsertIdentityExprBatchRow<'_>],
+) -> Result<ContentHash, StorageError> {
+    let count = u32::try_from(rows.len())
+        .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
+    let mut b = HashInputBuilder::new(OpTag::InsertIdentityBatchExpr);
+    b.push_raw(&count.to_le_bytes());
+    for (visibility, embedding, columns) in rows {
+        push_expr_row_body(&mut b, *visibility, embedding, columns)?;
+    }
+    Ok(b.finish())
+}
+
+/// [`for_typed_insert_identity_batch_expr`] 用の 1 行分の材料（`id` なし）。
+pub(crate) type TypedInsertIdentityExprBatchRow<'a> =
+    (Visibility, &'a [f32], &'a [(&'a str, HashColumnInput<'a>)]);
 
 /// [`for_typed_insert_batch`]・`tenant::insert_typed_rows_unchecked` が共有する
 /// 1 行分のハッシュ材料（`(id, visibility, embedding, 非 VECTOR 列の列名付き
@@ -3904,6 +3963,50 @@ mod tests {
                     .as_bytes()
             ),
             "3430c25e760c5c1c5fc94538d0efaf312fba2773ac0052cadde806468e73853d"
+        );
+    }
+
+    /// Issue #1700（D8）: `id` 省略のバッチ INSERT のハッシュは別ドメイン（タグ 23・24）で、
+    /// 明示 `id` のバッチ・単一行の省略形・`id = 0` 明示のバッチのいずれとも一致しない。
+    #[test]
+    fn omitted_id_batch_hash_is_a_separate_domain() {
+        fn to_hex(bytes: &[u8; 32]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let v = Value::Text("x".to_string());
+        let cols: [(&str, &Value); 1] = [("a", &v)];
+        let vis = Visibility::Private;
+        let one: [TypedInsertIdentityBatchRow<'_>; 1] = [(vis, &[], &cols)];
+        let two: [TypedInsertIdentityBatchRow<'_>; 2] = [(vis, &[], &cols), (vis, &[], &cols)];
+        let h1 = for_typed_insert_identity_batch(&one).expect("hash");
+        let h2 = for_typed_insert_identity_batch(&two).expect("hash");
+        assert_ne!(h1, h2);
+        assert_eq!(h1, for_typed_insert_identity_batch(&one).expect("hash"));
+        // 単一行の省略形（タグ 21）とも別。
+        assert_ne!(
+            h1,
+            for_typed_insert_identity(vis, &[], &cols).expect("hash")
+        );
+        // 全行 id=0 明示のバッチとも別。
+        let explicit: [TypedInsertBatchRow<'_>; 2] = [(0, vis, &[], &cols), (0, vis, &[], &cols)];
+        assert_ne!(h2, for_typed_insert_batch(&explicit).expect("hash"));
+        // 式つき版。
+        let expr_cols = [("a", HashColumnInput::Value(&v))];
+        let expr_rows: [TypedInsertIdentityExprBatchRow<'_>; 1] = [(vis, &[], &expr_cols)];
+        let he = for_typed_insert_identity_batch_expr(&expr_rows).expect("hash");
+        assert_ne!(h1, he);
+        // golden（レイアウトの固定。更新しない）。
+        assert_eq!(
+            to_hex(h1.as_bytes()),
+            "bb11d13d4faa260d52603d51e3fd74af4dc3290dc7e85f133e62a167a21ad66c"
+        );
+        assert_eq!(
+            to_hex(h2.as_bytes()),
+            "d5e75babe6aee53482cb43feb7ed76d244a818bfa372cbde535a04410265a67e"
+        );
+        assert_eq!(
+            to_hex(he.as_bytes()),
+            "8e75e83a72a52a46712840412feb934a383a9b907ff3eeea7b2ca6f693ffffd3"
         );
     }
 
