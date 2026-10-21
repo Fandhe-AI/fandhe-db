@@ -160,6 +160,8 @@ pub(crate) fn cell_to_insert_value(
             Ok(v) => Ok(v),
             // 同じ型族の組以外は固定文言の `0A000` に写す（matview 用の文言を外へ出さない）。
             Err(SqlSurfaceError::Internal { .. }) => Err(unsupported_pair()),
+            // 範囲外も matview 用の文言ではなく本文の固定文言へ写す。
+            Err(SqlSurfaceError::NumericOutOfRange { .. }) => Err(out_of_range()),
             Err(e) => Err(e),
         },
     }

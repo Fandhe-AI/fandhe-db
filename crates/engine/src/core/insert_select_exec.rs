@@ -105,16 +105,43 @@ impl EngineCore {
             })?;
         let limits = ResultLimits::new(fetch);
 
-        // 内側 SELECT を書き込むセッションの文脈で評価する（RLS 暗黙適用）。
-        let outcome = match &mode {
-            InsertSelectTxn::Autocommit => {
-                let read_txn = self.begin_read_txn()?;
-                self.execute_read_statement_with_limits(
-                    ctx, session, req.select, &read_txn, limits,
-                )?
+        // 時刻は文の先頭で 1 度だけ確定し、内側 SELECT の `now()` と省略列の `DEFAULT now()` で共有する
+        // （SQL-37・Issue #2188）。外側の式スコープ（明示トランザクション等）が確定済みならそれを使い、
+        // 無ければここで確定して式スコープを張る。ガードは台帳書き込みまで保持する。
+        let outer_clock = crate::sql::time_fn::current_clock();
+        let clock = match outer_clock {
+            Some(c) => c,
+            None => {
+                let now = crate::sql::time_fn::now_micros()?;
+                crate::sql::time_fn::StatementClock {
+                    txn_start_micros: now,
+                    stmt_start_micros: now,
+                }
             }
-            InsertSelectTxn::InTxn(write_txn) => self
-                .execute_read_statement_with_limits(ctx, session, req.select, *write_txn, limits)?,
+        };
+        let _expr_clock = if outer_clock.is_none() {
+            Some(crate::sql::time_fn::ClockScope::enter(clock))
+        } else {
+            None
+        };
+        let _default_clock = crate::sql::time_fn::DefaultClockScope::enter(clock);
+
+        // 内側 SELECT を書き込むセッションの文脈で評価する（RLS 暗黙適用）。
+        let outcome = if matches!(req.select, Statement::ConstSelect(_)) {
+            // `FROM` なしの定数式はテーブルを読まないため、読み取り経路ではなく定数式の実行本体へ渡す。
+            self.execute_validated_in_session(ctx, session, req.select)?
+        } else {
+            match &mode {
+                InsertSelectTxn::Autocommit => {
+                    let read_txn = self.begin_read_txn()?;
+                    self.execute_read_statement_with_limits(
+                        ctx, session, req.select, &read_txn, limits,
+                    )?
+                }
+                InsertSelectTxn::InTxn(write_txn) => self.execute_read_statement_with_limits(
+                    ctx, session, req.select, *write_txn, limits,
+                )?,
+            }
         };
         let SqlOutcome::Query(QueryResult { columns, rows }) = outcome else {
             return Err(SqlSurfaceError::Internal {
@@ -135,11 +162,6 @@ impl EngineCore {
         // 2 段目の上限の前に、行数だけで弾けるものを先に判定する（変換コストを払わない）。
         self.check_insert_row_count_limit(rows.len())?;
 
-        let stmt_start_micros = crate::sql::time_fn::now_micros()?;
-        let clock = crate::sql::time_fn::StatementClock {
-            txn_start_micros: stmt_start_micros,
-            stmt_start_micros,
-        };
         let bounds = rows_to_bound_inserts(
             req.table_name,
             &schema,
@@ -184,8 +206,6 @@ impl EngineCore {
             }
             _ => None,
         };
-        let _default_clock = crate::sql::time_fn::DefaultClockScope::enter(clock);
-
         let target = match &mode {
             InsertSelectTxn::Autocommit => WriteTarget::Autocommit(&self.storage),
             InsertSelectTxn::InTxn(write_txn) => WriteTarget::InTxn(write_txn),
@@ -303,6 +323,45 @@ mod tests {
                 has_on_conflict: false,
             },
         )
+    }
+
+    // 対象ビヘイビア: SQL-51（ポインタ）。`FROM` なしの定数式 SELECT も内部エラーにならず挿入できる。
+    #[test]
+    fn const_select_inner_is_accepted() {
+        let dir = tempdir();
+        let core = open(dir.path());
+        let a = ctx("tenant-a");
+        core.storage
+            .create_table(&TableSchema::new(
+                "plain",
+                vec![ColumnDef::new("lang", ColumnType::Text, false)],
+            ))
+            .expect("create plain");
+        let cols = vec!["id".to_string(), "lang".to_string()];
+        let mut s = SessionState::default();
+        let out = core
+            .execute_insert_select(
+                InsertSelectTxn::Autocommit,
+                &a,
+                &mut s,
+                InsertSelectRequest {
+                    table_name: "plain",
+                    columns: Some(&cols),
+                    select: select_stmt(&core, "SELECT 1, 'ja'"),
+                    operation_id: Some(OperationId::parse("op-const").expect("op id")),
+                    returning: None,
+                    has_on_conflict: false,
+                },
+            )
+            .expect("const select insert");
+        assert!(matches!(
+            out,
+            SqlOutcome::Insert(InsertOutcome {
+                rows_affected: 1,
+                ..
+            })
+        ));
+        assert_eq!(count(&core, &a, "plain"), 1);
     }
 
     // 対象ビヘイビア: SQL-51・RLS-7（ポインタ）。他テナントの Private 行は材料にならない。
