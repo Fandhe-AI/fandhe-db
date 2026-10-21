@@ -126,7 +126,6 @@ fn is_reserved_ctas_column_name(name: &str) -> bool {
 
 /// 導いた列定義から、制約なし・採番方式（暗黙の `id` を持たない）の [`ValidatedCreateTable`] を作る。
 /// `public_qualified` は呼び出し側の名前解決の結果。
-#[allow(dead_code)] // 呼び出し元は #1678 の実行腕（本 Issue では crate 内テストのみ）。
 pub(crate) fn ctas_validated_create_table(
     table_name: String,
     if_not_exists: bool,

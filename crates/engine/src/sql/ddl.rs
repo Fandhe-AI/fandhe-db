@@ -81,6 +81,39 @@ pub(crate) fn require_ddl_permission(session: &SessionState) -> Result<(), SqlSu
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CreateTableOutcome {}
 
+/// `CREATE TABLE ... AS`（CTAS。SQL-52・Issue #1678）の成功応答。
+///
+/// テナント境界（P0）: 件数は **この文を実行したセッション自身の文脈で挿入した行数**だけで、他テナントの
+/// 行数を含まない（内側の問い合わせは RLS を暗黙に適用する既存の読み取り経路でだけ評価する）。
+/// `wire-server::simple_query` は投入した場合 `SELECT <n>`、それ以外（`WITH NO DATA`・`IF NOT EXISTS` の
+/// no-op）は `CREATE TABLE AS` のタグへ写す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateTableAsOutcome {
+    /// `IF NOT EXISTS` で同名の関係が既にあり、何もしなかったか。
+    pub(crate) skipped: bool,
+    /// 内側の問い合わせを評価して行を投入する経路（`WITH DATA`）を通ったか。
+    pub(crate) populated: bool,
+    /// 投入した行数（`populated` のときだけ `Some`）。
+    pub(crate) rows: Option<u64>,
+}
+
+impl CreateTableAsOutcome {
+    /// `IF NOT EXISTS` の no-op か。
+    pub fn skipped(&self) -> bool {
+        self.skipped
+    }
+
+    /// `WITH DATA` で投入を行ったか。
+    pub fn populated(&self) -> bool {
+        self.populated
+    }
+
+    /// 投入した行数（自セッションの文脈で挿入した件数。投入しなかったときは `None`）。
+    pub fn rows(&self) -> Option<u64> {
+        self.rows
+    }
+}
+
 /// `CREATE TABLE`／`CREATE TEMP TABLE` が共有する、ストレージへ書く前のスキーマ構築
 /// （列数上限・配列要素数・ENUM 解決・COLLATE・既定値の正規化と束縛・各種制約）。
 /// 永続表の挙動とエラーの順序は切り出し前と同一。`storage` が `None` の場合
@@ -282,7 +315,14 @@ pub(crate) fn execute_create_table(
         }
         result => result,
     }
-    .map_err(|e| match e {
+    .map_err(map_create_table_catalog_error)?;
+    Ok(CreateTableOutcome {})
+}
+
+/// `CREATE TABLE`／`CREATE TABLE AS` が共有する、作成時の `CatalogError` から wire の
+/// SQLSTATE への写像（固定文言。内部詳細・他テナントの情報を含めない）。
+pub(crate) fn map_create_table_catalog_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::duplicate_table(name),
         // 暗黙 SEQUENCE の件数上限（名前の決定の打ち切りを含む）。`CREATE SEQUENCE` と同じ `54000`。
         CatalogError::ViewLimitExceeded(_) => {
@@ -370,8 +410,7 @@ pub(crate) fn execute_create_table(
         | CatalogError::NotNullConstraintViolation(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
-    })?;
-    Ok(CreateTableOutcome {})
+    }
 }
 
 /// 構造検証済みの `CREATE TEMP TABLE`（[`ValidatedCreateTempTable`]）をセッションの一時カタログへ
