@@ -745,10 +745,13 @@ fn tokenize_impl(
             if content.eq_ignore_ascii_case("true") || content.eq_ignore_ascii_case("false") {
                 tokens.push(Token::QuotedBoolWord(content.to_string()));
             } else if (mark_quoted_null
-                && (content.eq_ignore_ascii_case("NULL") || content.eq_ignore_ascii_case("ARRAY")))
+                && (content.eq_ignore_ascii_case("NULL")
+                    || content.eq_ignore_ascii_case("ARRAY")
+                    || content.eq_ignore_ascii_case("DEFAULT")))
                 || is_value_function_keyword(content)
             {
-                // 引用付きの `NULL`・`ARRAY`（配列コンストラクタと区別する。TABLE-35・Issue #1602）・
+                // 引用付きの `NULL`・`DEFAULT`（`VALUES` 要素の `DEFAULT` キーワードと区別する。
+                // SQL-50・Issue #1730）・`ARRAY`（配列コンストラクタと区別する。TABLE-35・Issue #1602）・
                 // SQL 値関数予約語（`"current_date"` 等。SQL-37・Issue #1586）は
                 // 裸のキーワードと区別するため専用トークンにする（`Parser::new` が `Ident` へ
                 // 戻しつつ位置を記録し、式項では列参照として扱う）。
@@ -1878,6 +1881,23 @@ mod tests {
         assert_eq!(
             demote_quoted_null(tokenize_marked("\"NULL\"").expect("tokenize")),
             vec![Token::Ident("NULL".to_string())]
+        );
+    }
+
+    /// 引用付き `"DEFAULT"` は `VALUES` 要素の `DEFAULT` キーワード（`Ident`）と区別される
+    /// 専用トークンになる（SQL-50・Issue #1730）。
+    #[test]
+    fn quoted_default_is_distinct_from_bare_default() {
+        assert_eq!(
+            tokenize_marked("\"DEFAULT\" default").expect("tokenize"),
+            vec![
+                Token::QuotedNull("DEFAULT".to_string()),
+                Token::Ident("default".to_string()),
+            ]
+        );
+        assert_eq!(
+            demote_quoted_null(tokenize_marked("\"DEFAULT\"").expect("tokenize")),
+            vec![Token::Ident("DEFAULT".to_string())]
         );
     }
 

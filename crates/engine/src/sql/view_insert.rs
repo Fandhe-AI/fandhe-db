@@ -59,6 +59,14 @@ pub(crate) fn rewrite_view_insert(
     stmt: &ValidatedViewInsert,
 ) -> Result<RewrittenViewInsert, SqlSurfaceError> {
     let shape = &stmt.shape;
+    // 列リストを省略したビュー INSERT（`INSERT INTO v VALUES (...)`。SQL-50・Issue #1730）は、
+    // ビューの公開列での展開が要るため未対応。基表の `*` へ黙って展開する fail-open を作らず、
+    // 展開前に固定の `0A000` で拒否する（`DEFAULT VALUES`・値位置の `DEFAULT` は下の名前写像を通る）。
+    if shape.columns_omitted {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "INSERT into a view without a column list is not supported",
+        ));
+    }
     match view_updatability(lookup, &shape.table_name)? {
         ViewUpdatability::AutoUpdatable => {}
         ViewUpdatability::NotAutoUpdatable(reason) => {
@@ -123,6 +131,7 @@ pub(crate) fn rewrite_view_insert(
         insert: ValidatedInsert {
             table_name: base_table,
             columns,
+            columns_omitted: false,
             rows: shape.rows.clone(),
             operation_id: shape.operation_id.clone(),
             returning,
