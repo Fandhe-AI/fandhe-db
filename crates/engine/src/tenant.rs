@@ -2059,6 +2059,36 @@ pub(crate) fn allocate_rowids(
     Ok(out)
 }
 
+/// 行を書かずに台帳だけを記録する（`INSERT ... SELECT` が 0 行だった場合。SQL-51 (5)・RECOVER-10/11・
+/// Issue #1733）。0 行の初回も台帳へ残し、同じ `operation_id` の後日の再送が新たに挿入される
+/// 事故を防ぐ。台帳ハッシュは `sql::insert_select_scope` が搬送する文ハッシュを
+/// [`ledger::record_in_txn`] が採用する（`content_hash` はスコープ外の呼び出しの保険）。
+/// `ledger_write` が記録しない種別（`Disabled`・`Omitted`）なら何も書かず（世代も進めず）戻る。
+/// 既存エントリがあれば `Duplicate`／`ContentMismatch` を返す。単一 write txn で完結する。
+pub(crate) fn record_ledger_only_unchecked(
+    target: WriteTarget<'_>,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+    content_hash: &content_hash::ContentHash,
+) -> Result<(), TenantWriteError> {
+    validate_relation_key(table)?;
+    target.with_txn(|write_txn| {
+        let outcome = ledger::record_in_txn(
+            write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            content_hash,
+        )?;
+        let effect = match outcome {
+            ledger::RecordOutcome::Recorded => TxnEffect::Wrote,
+            ledger::RecordOutcome::Skipped => TxnEffect::NoOp,
+        };
+        Ok(((), effect))
+    })
+}
+
 /// [`insert_typed_row_unchecked`] の複数行版（Issue #771・TASK-178・NOSQL-6）。
 /// NoSQL 表層（`wire-server::http::query::insert`）の `insert` op が 1 回の要求で
 /// `rows` 配列全体を 1 つの `operation_id` に対応づけて書き込むために必要とする
