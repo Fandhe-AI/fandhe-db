@@ -147,7 +147,7 @@ fn txn(core: &EngineCore, tenant: &str, stmts: &[String]) -> Res<()> {
     Ok(())
 }
 
-/// （行 id, doc 文字列）を `SCAN_LIMIT` 未満で全件読む。
+/// （行 id, doc 文字列）を `SCAN_LIMIT` 件に達しない範囲で全件読む。
 fn rows_of(core: &EngineCore, tenant: &str, sql: &str) -> Res<Vec<(u64, String)>> {
     match exec(core, tenant, sql)? {
         SqlOutcome::Query(q) => {
@@ -204,7 +204,7 @@ fn alive_and_max(core: &EngineCore) -> Res<(u64, u64)> {
         let rows = rows_of(
             core,
             t,
-            &format!("SELECT id, doc FROM {PLAIN_TABLE} LIMIT {}", SCAN_LIMIT - 1),
+            &format!("SELECT id, doc FROM {PLAIN_TABLE} LIMIT {SCAN_LIMIT}"),
         )?;
         alive += rows.len() as u64;
         max_id = max_id.max(rows.iter().map(|(id, _)| *id).max().unwrap_or(0));
@@ -353,13 +353,13 @@ fn check_reads(core: &EngineCore, tenant: &str, both_declared: bool) -> Res<usiz
     let all = rows_of(
         core,
         tenant,
-        &format!("SELECT id, doc FROM {PLAIN_TABLE} LIMIT {}", SCAN_LIMIT - 1),
+        &format!("SELECT id, doc FROM {PLAIN_TABLE} LIMIT {SCAN_LIMIT}"),
     )?;
     let max_id = all.iter().map(|(id, _)| *id).max().unwrap_or(0);
     let token = format!(r#""owner":"{tenant}""#);
     let mut n = 0;
     for w in read_queries(max_id) {
-        let lim = SCAN_LIMIT - 1;
+        let lim = SCAN_LIMIT;
         let sql_g = format!("SELECT id, doc FROM {GIN_TABLE} WHERE {w} LIMIT {lim}");
         let sql_p = format!("SELECT id, doc FROM {PLAIN_TABLE} WHERE {w} LIMIT {lim}");
         let on_g = rows_of(core, tenant, &sql_g)?;
@@ -389,12 +389,12 @@ fn check_rows(core: &EngineCore, tenant: &str) -> Res<usize> {
     let g = rows_of(
         core,
         tenant,
-        &format!("SELECT id, doc FROM {GIN_TABLE} LIMIT {}", SCAN_LIMIT - 1),
+        &format!("SELECT id, doc FROM {GIN_TABLE} LIMIT {SCAN_LIMIT}"),
     )?;
     let p = rows_of(
         core,
         tenant,
-        &format!("SELECT id, doc FROM {PLAIN_TABLE} LIMIT {}", SCAN_LIMIT - 1),
+        &format!("SELECT id, doc FROM {PLAIN_TABLE} LIMIT {SCAN_LIMIT}"),
     )?;
     let mut g_sorted = g.clone();
     let mut p_sorted = p;
