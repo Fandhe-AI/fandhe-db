@@ -352,6 +352,21 @@ fn expression_forms_and_argument_checks() {
         assert_eq!(code(&core, &mut s, sql), "42883", "{sql}");
     }
     assert_eq!(code(&core, &mut s, "SELECT current_schemas(x)"), "42703");
+    // text[] は配列値の規約どおり投影／CAST 専用。CASE・COALESCE へ流れる位置は fail-closed。
+    for sql in [
+        "SELECT coalesce(current_schemas(true), current_schemas(false))",
+        "SELECT CASE WHEN 1 = 1 THEN current_schemas(false) ELSE NULL END",
+    ] {
+        assert_eq!(code(&core, &mut s, sql), "0A000", "{sql}");
+    }
+    assert_eq!(
+        one(
+            &core,
+            &mut s,
+            "SELECT CASE WHEN 1 = 1 THEN current_schema() ELSE 'x' END"
+        ),
+        "public"
+    );
 }
 
 #[test]

@@ -467,8 +467,10 @@ TABLE-27 (3) のポインタ。セッション変数 `search_path` を engine �
 `current_schema()`・`current_schemas()`（TABLE-27 (7)）を psql／ドライバ互換の応答として返す。
 システムカタログ（`pg_namespace` 等）は D9 のとおり対象外のまま。
 
-- **受理範囲**: FROM なし SELECT（`ConstSelect`）の式の中だけ（投影・`WHERE`・`CASE`・`COALESCE` 等）。
-  `current_schema()`・裸の `current_schema`（ASCII 大小無視。Rails 形）・`current_schemas(true|false|NULL)`。
+- **受理範囲**: FROM なし SELECT（`ConstSelect`）の式の中だけ。`current_schema()`・裸の `current_schema`
+  （ASCII 大小無視。Rails 形。text 型のため投影・`WHERE`・`CASE`・`COALESCE` 等の式位置で使える）・
+  `current_schemas(true|false|NULL)`（配列型のため、既存の配列値の規約どおり投影と `CAST` の被演算子だけ。
+  `CASE`／`COALESCE` 等へ流すと `0A000`）。
   それ以外の文脈（`FROM` あり SELECT・`INSERT VALUES`・`DEFAULT`・CHECK・索引・ビュー本文・UDF 定義）は
   束縛のスコープが無いため `0A000`（固定文言）で fail-closed。引数の arity 違反と非 bool は `42883`
 - **解決規則**: path の各要素を展開（`$user` は handshake の username だけから。未設定なら飛ばす）し、
