@@ -759,7 +759,7 @@ impl ExpressionIndexMatcher {
             return Self::empty();
         }
         for decl in decls {
-            if crate::catalog::validate_identifier(&decl.index_name).is_err() {
+            if crate::catalog::validate_relation_key(&decl.index_name).is_err() {
                 continue;
             }
             let Ok(expr) = crate::sql::allowlist::parse_index_expression_text(&decl.sql) else {

@@ -2179,7 +2179,9 @@ pub fn define_function(
     params: &[String],
     body: &Expr,
 ) -> Result<(), SqlSurfaceError> {
-    catalog::validate_identifier(name)
+    // 関数名は relation キー（裸の名前、または SCHEMA 配下の内部キー `#<id>.<name>`。
+    // 名前解決器が `CREATE FUNCTION s.f(` を解決した出力。TABLE-27・Issue #1717）を受理する。
+    catalog::validate_relation_key(name)
         .map_err(|_| SqlSurfaceError::invalid_input(format!("invalid function name: {name}")))?;
     let lower = name.to_ascii_lowercase();
     if is_reserved_function_name(name) {

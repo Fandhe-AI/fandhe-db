@@ -176,9 +176,13 @@ impl ExplainIndexNames {
 fn normalize_index_names(mut names: Vec<String>) -> Vec<String> {
     if names
         .iter()
-        .any(|n| crate::catalog::validate_identifier(n).is_err())
+        .any(|n| crate::catalog::validate_relation_key(n).is_err())
     {
         return Vec::new();
+    }
+    // SCHEMA 配下の索引は内部キー `#<id>.<name>` で渡る。注記には公開名だけを出す（内部 ID を出さない）。
+    for n in &mut names {
+        *n = crate::catalog::namespace::relation_name_part(n).to_string();
     }
     names.sort();
     names.dedup();

@@ -166,7 +166,6 @@ fn syntax_table() {
         ("ALTER SEQUENCE s SET SCHEMA other", "0A000"),
         ("ALTER SEQUENCE s SET LOGGED", "0A000"),
         ("ALTER SEQUENCE s SET UNLOGGED", "0A000"),
-        ("ALTER SEQUENCE public.s CYCLE", "0A000"),
         ("ALTER SEQUENCE s RENAME TO public.x", "0A000"),
     ] {
         assert_eq!(code(&core, &mut s, sql), expect, "{sql}");

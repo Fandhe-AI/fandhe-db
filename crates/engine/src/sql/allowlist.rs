@@ -798,6 +798,16 @@ pub enum SqlSurfaceError {
     /// 存在情報を漏らさない」対応）。固定文言のみを保持し、テーブル名・
     /// ユーザー名を含めない。
     InsufficientPrivilege,
+    /// public のオブジェクト（表・ビュー・SEQUENCE 等）が、テナントの SCHEMA 配下のオブジェクトへ
+    /// 依存する定義の拒否（`42501`。TABLE-27・Issue #1717、ADR D7）。public は全テナント共有の
+    /// カタログのため、特定テナントの SCHEMA 配下を参照させない（SCHEMA の削除や他テナントの
+    /// 操作が public の定義を壊す・存在を漏らす経路になる）。逆向き（SCHEMA 配下から public）は
+    /// 許可する。固定文言のみで、オブジェクト名・SCHEMA 名・内部 ID を含めない。
+    /// `wire_code` は [`SqlSurfaceError::InsufficientPrivilege`] と同じ `42501`。
+    ///
+    /// **BREAKING CHANGE**（Issue #1717）: variant を追加した。`SqlSurfaceError` を網羅的に `match`
+    /// するクレート外のコードは追随が必要。
+    SchemaDependencyForbidden,
     /// UPSERT の `ON CONFLICT DO UPDATE` の衝突先が、呼び出しテナントが所有するが
     /// 可視ではない行だった（Issue #1254・RLS-10・RLS-11）。`42501`
     /// （`ErrorClass::ForbiddenTenantMismatch` を再利用。新規分類は追加しない）。
@@ -910,6 +920,52 @@ pub enum SqlSurfaceError {
 }
 
 impl SqlSurfaceError {
+    /// 名前・説明文を持つ variant の文字列へ `f` を適用した新しいエラーを返す（TABLE-27・Issue #1717、
+    /// ADR D2）。SCHEMA 配下の relation の内部キー（`#<id>.<name>`）が利用者向けのエラー文言へ
+    /// 出ないよう、`core::EngineCore` の ctx を持つ入口の出口で
+    /// [`crate::sql::relation_name::display_relation_keys`] を適用するための唯一の変換点。
+    /// 文字列を持たない variant・名前を含まない固定文言の variant は素通し。
+    pub(crate) fn map_text(self, f: &dyn Fn(&str) -> String) -> Self {
+        match self {
+            Self::UnsupportedSyntax { detail } => Self::UnsupportedSyntax { detail: f(&detail) },
+            Self::UndefinedTable { name } => Self::UndefinedTable { name: f(&name) },
+            Self::Internal { detail } => Self::Internal { detail: f(&detail) },
+            Self::InvalidInput { detail } => Self::InvalidInput { detail: f(&detail) },
+            Self::PayloadTooLarge { detail } => Self::PayloadTooLarge { detail: f(&detail) },
+            Self::TransactionFeatureNotSupported { detail } => {
+                Self::TransactionFeatureNotSupported { detail: f(&detail) }
+            }
+            Self::FeatureNotSupported { detail } => {
+                Self::FeatureNotSupported { detail: f(&detail) }
+            }
+            Self::DuplicateTable { name } => Self::DuplicateTable { name: f(&name) },
+            Self::DuplicateSchema { name } => Self::DuplicateSchema { name: f(&name) },
+            Self::InvalidSchemaName { name } => Self::InvalidSchemaName { name: f(&name) },
+            Self::DuplicateObject { name } => Self::DuplicateObject { name: f(&name) },
+            Self::DuplicateType { name } => Self::DuplicateType { name: f(&name) },
+            Self::InvalidTableDefinition { table } => {
+                Self::InvalidTableDefinition { table: f(&table) }
+            }
+            Self::InvalidViewReplacement { detail } => {
+                Self::InvalidViewReplacement { detail: f(&detail) }
+            }
+            Self::PartitionedJobBusy { detail } => Self::PartitionedJobBusy { detail: f(&detail) },
+            Self::DependentObjectsStillExist { name } => {
+                Self::DependentObjectsStillExist { name: f(&name) }
+            }
+            Self::WrongObjectType { name } => Self::WrongObjectType { name: f(&name) },
+            Self::UndefinedObject { name } => Self::UndefinedObject { name: f(&name) },
+            Self::UndefinedType { name } => Self::UndefinedType { name: f(&name) },
+            Self::UndefinedColumn { name } => Self::UndefinedColumn { name: f(&name) },
+            Self::AmbiguousColumn { name } => Self::AmbiguousColumn { name: f(&name) },
+            Self::InvalidForeignKey { detail } => Self::InvalidForeignKey { detail: f(&detail) },
+            Self::DatatypeMismatch { detail } => Self::DatatypeMismatch { detail: f(&detail) },
+            Self::UndefinedFunction { detail } => Self::UndefinedFunction { detail: f(&detail) },
+            Self::DuplicateFunction { detail } => Self::DuplicateFunction { detail: f(&detail) },
+            other => other,
+        }
+    }
+
     /// ERR-2（docs/spec/04-behavior/error-format.md）の wire_code 写像。
     /// TASK-152 で単一真実源化した [`ClassifiedError::wire_code`] へ委譲する
     /// （既存の返値は 1 つも変えない。委譲先は `error_class()` の `match` のみを
@@ -1317,9 +1373,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InvalidColumnReference => ErrorClass::InvalidColumnReference,
-            SqlSurfaceError::InsufficientPrivilege | SqlSurfaceError::ConflictTargetNotVisible => {
-                ErrorClass::ForbiddenTenantMismatch
-            }
+            SqlSurfaceError::InsufficientPrivilege
+            | SqlSurfaceError::ConflictTargetNotVisible
+            | SqlSurfaceError::SchemaDependencyForbidden => ErrorClass::ForbiddenTenantMismatch,
             SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
             SqlSurfaceError::DependentObjectsStillExist { .. } => {
                 ErrorClass::DependentObjectsStillExist
@@ -1558,6 +1614,10 @@ impl std::fmt::Display for SqlSurfaceError {
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
                 write!(f, "permission denied for DDL statement")
+            }
+            // オブジェクト名・SCHEMA 名・内部 ID を含めない固定文言（ADR D7・security.md P0）。
+            SqlSurfaceError::SchemaDependencyForbidden => {
+                write!(f, "public objects cannot depend on objects in a schema")
             }
             // id・列値・テナントを含めない固定文言（security.md P0）。
             SqlSurfaceError::ConflictTargetNotVisible => {
@@ -10056,7 +10116,7 @@ impl<'a> Parser<'a> {
     fn parse_create_table_name(&mut self) -> Result<(bool, String), SqlSurfaceError> {
         let if_not_exists = self.parse_optional_if_not_exists();
         let table_name = self.expect_ident()?;
-        crate::catalog::validate_identifier(&table_name)
+        crate::catalog::validate_relation_key(&table_name)
             .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
         Ok((if_not_exists, table_name))
     }
@@ -10816,7 +10876,7 @@ impl<'a> Parser<'a> {
     fn parse_references_clause(&mut self) -> Result<ParsedReferences, SqlSurfaceError> {
         self.expect_contextual_keyword("REFERENCES")?;
         let parent_table = self.expect_ident()?;
-        crate::catalog::validate_identifier(&parent_table).map_err(|e| {
+        crate::catalog::validate_relation_key(&parent_table).map_err(|e| {
             SqlSurfaceError::unsupported(format!("invalid referenced table name: {e}"))
         })?;
         let parent_columns = if matches!(self.peek(), Some(Token::Punct('('))) {
@@ -11423,7 +11483,7 @@ impl<'a> Parser<'a> {
         } else {
             return Ok(None);
         };
-        let (Some(Token::Punct('(')), Some(Token::StringLiteral(name)), Some(Token::Punct(')'))) = (
+        let (Some(Token::Punct('(')), Some(arg), Some(Token::Punct(')'))) = (
             self.tokens.get(pos + 1),
             self.tokens.get(pos + 2),
             self.tokens.get(pos + 3),
@@ -11433,14 +11493,7 @@ impl<'a> Parser<'a> {
         if !self.time_default_tail_is_terminal(pos + 4) {
             return Ok(None);
         }
-        if name.contains('.') || name.contains('"') {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "schema-qualified or quoted sequence names are not supported",
-            ));
-        }
-        crate::catalog::validate_identifier(name)
-            .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name"))?;
-        let name = name.clone();
+        let name = sequence_name_argument(arg)?;
         self.pos = pos + 4;
         Ok(Some(InsertLiteral::SequenceCall { func, name }))
     }
@@ -12357,7 +12410,7 @@ pub(crate) fn render_stored_simple_view_body(
     let mut sql = render_view_body(body);
     // 恒偽が残る本文には、複雑形と同じくマーカーを付け、旧版の列参照保存形式として
     // 再解析されるのを防ぐ（Issue #1526）。
-    let rendered_tokens = super::lexer::tokenize(&sql)
+    let rendered_tokens = super::lexer::tokenize_rendered(&sql)
         .map_err(|_| SqlSurfaceError::unsupported("view body is not supported"))?;
     if super::lexer::stored_body_needs_bool_literal_marker(&rendered_tokens) {
         sql.insert_str(0, super::lexer::STORED_BODY_BOOL_LITERAL_MARKER);
@@ -12444,7 +12497,13 @@ fn render_column_name(column: &str) -> String {
 /// と同じ規則）。lexer は引用付きでも SQL キーワード（`"order"` 等）を拒否するため、
 /// それらの名前はそもそも本文へ書けず、ここで扱う必要がない。それ以外は裸で出力する
 /// （保存形式を変えない）。
+///
+/// SCHEMA 配下の表の内部キー（`#<id>.<name>`。TABLE-27・Issue #1717）も引用形で出力する
+/// （保存済み本文の再読込 `lexer::tokenize_stored_view_body` だけが受理する）。
 fn render_table_name(table: &str) -> String {
+    if table.starts_with('#') {
+        return format!("\"{table}\"");
+    }
     render_column_name(table)
 }
 
@@ -13577,12 +13636,14 @@ impl ValidatedCreateSchema {
     }
 }
 
-/// `DROP SCHEMA [IF EXISTS] <name> [RESTRICT]` の許可形状構造検証結果（TABLE-27・TABLE-36 の
-/// ポインタ、Issue #1713）。
+/// `DROP SCHEMA [IF EXISTS] <name> [RESTRICT | CASCADE]` の許可形状構造検証結果（TABLE-27・TABLE-36 の
+/// ポインタ、Issue #1713・#1717）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedDropSchema {
     pub(crate) name: String,
     pub(crate) if_exists: bool,
+    /// `CASCADE`（SCHEMA 配下のオブジェクトと外部の依存を決定的な順序で削除する。ADR D8）。
+    pub(crate) cascade: bool,
 }
 
 impl ValidatedDropSchema {
@@ -13703,8 +13764,8 @@ pub(crate) fn validate_create_schema_tokens(
     })
 }
 
-/// [`ValidatedDropSchema`] の構造検証本体（TABLE-27・TABLE-36 のポインタ、Issue #1713）。
-/// `RESTRICT`（既定と同義）は受理し、`CASCADE`（#1717）と複数名は `0A000`。修飾名・不正な
+/// [`ValidatedDropSchema`] の構造検証本体（TABLE-27・TABLE-36 のポインタ、Issue #1713・#1717）。
+/// `RESTRICT`（既定と同義）・`CASCADE` は受理し、複数名は `0A000`。修飾名・不正な
 /// 識別子・余分なトークンは `42601`。
 pub(crate) fn validate_drop_schema_tokens(
     tokens: &[Token],
@@ -13721,18 +13782,18 @@ pub(crate) fn validate_drop_schema_tokens(
     let name = p.expect_ident()?;
     crate::catalog::validate_identifier(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid schema name in DROP SCHEMA"))?;
-    if p.parse_optional_drop_behavior() == DropBehavior::Cascade {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "DROP SCHEMA ... CASCADE is not supported",
-        ));
-    }
+    let cascade = p.parse_optional_drop_behavior() == DropBehavior::Cascade;
     if matches!(p.peek(), Some(Token::Punct(','))) {
         return Err(SqlSurfaceError::feature_not_supported(
             "DROP SCHEMA with multiple names is not supported",
         ));
     }
     p.expect_end_of_statement()?;
-    Ok(ValidatedDropSchema { name, if_exists })
+    Ok(ValidatedDropSchema {
+        name,
+        if_exists,
+        cascade,
+    })
 }
 
 /// `CREATE SEQUENCE <name> [option ...]` の許可形状構造検証結果（TABLE-24・SQL-23、Issue #1688）。
@@ -14000,7 +14061,7 @@ pub(crate) fn validate_create_sequence_tokens(
         ));
     }
     let name = p.expect_ident()?;
-    crate::catalog::validate_identifier(&name)
+    crate::catalog::validate_relation_key(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name in CREATE SEQUENCE"))?;
     let mut options = SequenceOptions::default();
     p.parse_sequence_option_list(&mut options, false, "CREATE SEQUENCE")?;
@@ -14037,7 +14098,7 @@ pub(crate) fn validate_drop_sequence_tokens(
         ));
     }
     let name = p.expect_ident()?;
-    crate::catalog::validate_identifier(&name)
+    crate::catalog::validate_relation_key(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name in DROP SEQUENCE"))?;
     if p.parse_optional_drop_behavior() == DropBehavior::Cascade {
         return Err(SqlSurfaceError::feature_not_supported(
@@ -14107,7 +14168,7 @@ pub(crate) fn validate_alter_sequence_tokens(
         ));
     }
     let name = p.expect_ident()?;
-    crate::catalog::validate_identifier(&name)
+    crate::catalog::validate_relation_key(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name in ALTER SEQUENCE"))?;
     if p.peek_ident_matches("RENAME") {
         p.advance();
@@ -14293,6 +14354,37 @@ impl ValidatedSequenceFunction {
     }
 }
 
+/// `nextval`／`currval`／`setval` の名前引数トークンを検証して relation キーを返す
+/// （TABLE-24・TABLE-27。Issue #1690・#1691・#1717）。
+///
+/// - `StringLiteral`: 利用者が書いた名前。修飾名（`.` を含む）・引用付き（`"` を含む）は `0A000`
+///   （テナント SCHEMA の修飾は解決器 `sql::relation_name` が先に内部キーの `Ident` へ置き換える。
+///   ここへ残るのは解決できない入口〔テナント不明〕・`public.`・組み込み SCHEMA の修飾）、識別子規則
+///   違反は `42601`。
+/// - `Ident`（`#` で始まる）: 解決器だけが作る内部キー。字句解析器は `#` を含む識別子を作らない
+///   ため利用者は直接指定できない。形式を `validate_relation_key` で再検証する。
+/// - それ以外は `42601`（呼び出し側が単独形でない場合を先に弾いているため通常は到達しない）。
+fn sequence_name_argument(arg: &Token) -> Result<String, SqlSurfaceError> {
+    match arg {
+        Token::StringLiteral(name) => {
+            if name.contains('.') || name.contains('"') {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "schema-qualified or quoted sequence names are not supported",
+                ));
+            }
+            crate::catalog::validate_identifier(name)
+                .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name"))?;
+            Ok(name.clone())
+        }
+        Token::Ident(key) if key.starts_with('#') => {
+            crate::catalog::validate_relation_key(key)
+                .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name"))?;
+            Ok(key.clone())
+        }
+        _ => Err(SqlSurfaceError::unsupported("invalid sequence name")),
+    }
+}
+
 /// 先頭が `SELECT setval (` または `SELECT lastval (` か（`core.rs::EngineCore::parse_tokens_in` の
 /// 分岐判定。`ConstSelect` の一般経路へ流さず、専用の検証器で受理か `0A000`／`42601` の拒否に
 /// 倒すために使う）。
@@ -14325,7 +14417,9 @@ pub(crate) fn validate_sequence_function_tokens(
     p.expect_punct('(')?;
     let kind = if func.eq_ignore_ascii_case("setval") {
         let name = match p.advance() {
-            Some(Token::StringLiteral(n)) => n.clone(),
+            Some(arg @ Token::StringLiteral(_)) => sequence_name_argument(arg)?,
+            // 解決器が作った内部キー（`#` で始まる `Ident`）。それ以外の `Ident` は名前リテラルではない。
+            Some(arg @ Token::Ident(k)) if k.starts_with('#') => sequence_name_argument(arg)?,
             Some(Token::Param(_)) => return Err(not_standalone()),
             _ => {
                 return Err(SqlSurfaceError::unsupported(
@@ -14333,13 +14427,6 @@ pub(crate) fn validate_sequence_function_tokens(
                 ))
             }
         };
-        if name.contains('.') || name.contains('"') {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "schema-qualified or quoted sequence names are not supported",
-            ));
-        }
-        crate::catalog::validate_identifier(&name)
-            .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name"))?;
         p.expect_punct(',')?;
         match p.peek() {
             Some(Token::Number(_) | Token::Punct('-' | '+')) => {}
@@ -14801,7 +14888,7 @@ impl<'a> Parser<'a> {
     /// 別名として誤って消費しない）。
     fn parse_join_relation(&mut self) -> Result<TableRef, SqlSurfaceError> {
         let table = self.expect_ident()?;
-        crate::catalog::validate_identifier(&table)
+        crate::catalog::validate_relation_key(&table)
             .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
         let alias = self.parse_relation_alias(is_join_reserved_word, "JOIN")?;
         Ok(match alias {
@@ -16668,21 +16755,6 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
     validate_sql_tokens(&tokens, lookup)
 }
 
-/// [`validate_sql`] のトップレベル読み取り SELECT／集計 SELECT 経路でのみ
-/// サブクエリ（`IN (SELECT ...)`／`EXISTS (SELECT ...)`）を許可するエントリ
-/// ポイント（Issue #927・SQL-29 (a)・TASK-213）。`sql::subquery` が内側の
-/// `Statement::Scan` を再検証する際にも、深さを 1 つ進めて
-/// [`validate_sql_tokens_with_subquery_ctx`] を直接呼ぶ（本関数は深さ 0 固定の
-/// トップレベル用薄いラッパー）。
-pub(crate) fn validate_sql_with_subquery_ctx(
-    sql: &str,
-    lookup: &impl TableLookup,
-    limits: crate::nesting_limits::NestingLimits,
-) -> Result<Statement, SqlSurfaceError> {
-    let tokens = super::relation_name::tokenize_resolved(sql, false)?;
-    validate_sql_tokens_with_subquery_ctx_limits(&tokens, lookup, 0, limits)
-}
-
 /// [`validate_sql`] の本体（Issue #939・WIRE-17。COPY プロトコル対応の一環）。
 /// トークン列を受け取ることで、`COPY (<SELECT>) TO STDOUT`
 /// （[`validate_copy_to_tokens`]）の内側 SELECT のように、外側の許可リストが
@@ -18416,7 +18488,8 @@ fn into_validated_alter_table(
 /// 書き込みトランザクション内で行う。
 pub fn validate_drop_table(sql: &str) -> Result<ValidatedDropTable, SqlSurfaceError> {
     let mut tokens = lexer::tokenize(sql)?;
-    let public_names = super::relation_name::rewrite_relation_names(&mut tokens, None)?;
+    let public_names =
+        super::relation_name::rewrite_relation_names(&mut tokens, None)?.public_names;
     let mut stmt = validate_drop_table_tokens(&tokens)?;
     // `public.` 修飾の情報を捨てない（実行時に一時表との衝突検査を通すため。Issue #1714）。
     stmt.public_qualified = public_names;

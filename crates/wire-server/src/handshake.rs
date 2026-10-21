@@ -1622,6 +1622,10 @@ fn run_authenticated_session<S: WireStream>(
     if store.is_ddl_allowed(&username) {
         session.allow_ddl();
     }
+    // TABLE-27・Issue #1717（ADR D6）: 拡張クエリの Parse は認証コンテキストを受け取らないため、
+    // `schema.name` の修飾を解決するテナントを、認証済みの `ctx` から接続に 1 回だけ束縛する
+    // （SQL 文経由で変更する経路は無い）。簡易クエリは実行ごとに `ctx` で解決する。
+    session.bind_resolution_tenant(ctx.tenant_id());
     // 接続単位の Parse 済みステートメント・portal 保持（Issue #933・#934・
     // TASK-71・WIRE-11）。`session` と同じく接続終了で破棄し、接続間・
     // テナント間で共有しない（`extended_query` モジュールドキュメント参照）。

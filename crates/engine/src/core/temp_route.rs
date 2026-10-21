@@ -251,6 +251,7 @@ impl EngineCore {
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
         session: &SessionState,
+        resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
     ) -> Result<ParsedSql, SqlSurfaceError> {
         let temp = session.temp_tables();
         let hits = crate::sql::temp_catalog::RelationHits::default();
@@ -262,6 +263,7 @@ impl EngineCore {
             temp,
             &hits,
             LedgerMode::CompareOnlyWithoutLedger,
+            resolver,
         )?;
         // 索引 DDL はカタログを引かず構造だけを検証するため、`hits` では判定できない。
         // 対象の表が一時表なら一時コアで実行し、そうでなければ（一時表の名前が現れる永続表の索引は）
@@ -305,8 +307,9 @@ impl EngineCore {
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
         session: &SessionState,
+        resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
     ) -> Result<ParsedSql, SqlSurfaceError> {
-        let parsed = self.parse_tokens(tokens)?;
+        let parsed = self.parse_tokens_r(tokens, resolver)?;
         if let (ParsedSql::DropIndex(stmt), Some(store)) = (&parsed, session.temp_rows_arc()) {
             let is_temp_index = store
                 .core()?
@@ -562,7 +565,7 @@ impl EngineCore {
     ) -> Result<super::PreparedSql, SqlSurfaceError> {
         let temp = session.temp_tables();
         if temp.is_empty() {
-            return self.parse_sql_prepared_with_declared(sql, declared);
+            return self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant());
         }
         let tokens = crate::sql::lexer::tokenize_with_params(sql)?;
         // `public.<一時表の名前>` は解決より前に拒否する（TABLE-27・Issue #1714）。
@@ -582,11 +585,12 @@ impl EngineCore {
             || crate::sql::allowlist::is_create_table_statement(&tokens)
             || crate::sql::allowlist::is_create_temp_table_statement(&tokens)
         {
-            return self.parse_sql_prepared_with_declared(sql, declared);
+            return self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant());
         }
         // `DROP INDEX <名前>` は一時表の名前が現れない。一時 DB の索引なら一時コアで検証する。
         if crate::sql::allowlist::is_drop_index_statement(&tokens) {
-            let plain = self.parse_sql_prepared_with_declared(sql, declared)?;
+            let plain =
+                self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant())?;
             if let (ParsedSql::DropIndex(stmt), Some(store)) =
                 (&plain.dummy_parsed, session.temp_rows_arc())
             {
@@ -605,7 +609,7 @@ impl EngineCore {
             return Ok(plain);
         }
         if !crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
-            return self.parse_sql_prepared_with_declared(sql, declared);
+            return self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant());
         }
         let store = session.temp_rows_arc().ok_or_else(internal)?;
         match store

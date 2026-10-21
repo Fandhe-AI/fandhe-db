@@ -4,6 +4,10 @@
 //! 意味論そのものは `crates/engine/tests/table27_qualified_names.rs` が確定オラクル。本ファイルは
 //! `wire_schema_ddl.rs` と同じ流儀で、`public.t` が簡易・拡張クエリの両方で未修飾の `t` と同じに
 //! 動くこと、および SQLSTATE（`3F000`／`42P01`／`0A000`）が wire へ届くことに徹する。
+//!
+//! Issue #1717 の追加: テナントの SCHEMA 配下の表・ビュー・SEQUENCE が簡易・拡張クエリで使えること、
+//! 別テナントの接続からは存在しない SCHEMA と同じ `3F000` になること、エラー本文に内部キー（`#`）が
+//! 出ないこと。自テナントの SCHEMA への作成は成功する（以前は `0A000`）。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -98,7 +102,6 @@ fn wire_simple_query_public_qualified_names() {
     for (sql, sqlstate) in [
         ("SELECT id FROM ghost.t LIMIT 1", "3F000"),
         ("SELECT id FROM s1.t LIMIT 1", "42P01"),
-        ("CREATE TABLE s1.t (name TEXT)", "0A000"),
         ("SELECT id FROM pg_catalog.t LIMIT 1", "0A000"),
         ("SELECT id FROM pg_temp.t LIMIT 1", "0A000"),
     ] {
@@ -153,4 +156,142 @@ fn wire_extended_query_public_qualified_names() {
     );
     send_length_prefixed_message(&mut stream, b'S', &[]);
     assert_eq!(read_message(&mut stream).0, b'Z');
+}
+
+/// ErrorResponse を読み、SQLSTATE が `sqlstate` で、本文に内部キーの印（`#`）を含まないことを確認する。
+fn expect_error_without_internal_keys(stream: &mut std::net::TcpStream, sqlstate: &str) {
+    let (kind, body) = read_message(stream);
+    assert_eq!(kind, b'E', "ErrorResponse");
+    let code = format!("C{sqlstate}");
+    assert!(
+        body.windows(code.len()).any(|w| w == code.as_bytes()),
+        "SQLSTATE {sqlstate} expected"
+    );
+    assert!(
+        !body.contains(&b'#'),
+        "internal key leaked into the message"
+    );
+}
+
+/// テナントの SCHEMA 配下のオブジェクト（表・ビュー・SEQUENCE。TABLE-27・Issue #1717）が簡易クエリで使え、
+/// 別テナントの接続からは存在しない SCHEMA と同じ `3F000` になる。エラー文言に内部キー（`#`）を含まない。
+#[test]
+fn wire_simple_query_tenant_schema_objects_and_isolation() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice", "bob"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+
+    assert_eq!(simple_ok(&mut alice, "CREATE SCHEMA a"), "CREATE SCHEMA");
+    assert_eq!(
+        simple_ok(
+            &mut alice,
+            "CREATE TABLE a.t (id BIGINT PRIMARY KEY, name TEXT)"
+        ),
+        "CREATE TABLE"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "INSERT INTO a.t (id, name) VALUES (1, 'x')"),
+        "INSERT 0 1"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "CREATE VIEW a.v AS SELECT id, name FROM a.t"),
+        "CREATE VIEW"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "CREATE SEQUENCE a.q"),
+        "CREATE SEQUENCE"
+    );
+    send_simple_query(&mut alice, "SELECT id, name FROM a.v LIMIT 10");
+    let _ = read_message(&mut alice); // RowDescription
+    let row = read_data_row(&mut alice);
+    assert_eq!(row.first().cloned().flatten().as_deref(), Some("1"));
+    assert_eq!(read_command_complete(&mut alice), "SELECT 1");
+    read_ready_for_query(&mut alice);
+
+    // 内部キーを含まない文言。
+    send_simple_query(&mut alice, "SELECT id FROM a.nope LIMIT 1");
+    expect_error_without_internal_keys(&mut alice, "42P01");
+    read_ready_for_query(&mut alice);
+
+    // bob からは alice の SCHEMA は存在しない（存在しない名前と同じ `3F000`）。
+    for sql in [
+        "SELECT id FROM a.t LIMIT 1",
+        "SELECT id FROM a.v LIMIT 1",
+        "INSERT INTO a.t (id, name) VALUES (2, 'y')",
+        "DROP TABLE a.t",
+        "DROP SCHEMA a CASCADE",
+    ] {
+        send_simple_query(&mut bob, sql);
+        expect_error_without_internal_keys(&mut bob, "3F000");
+        read_ready_for_query(&mut bob);
+    }
+
+    assert_eq!(
+        simple_ok(&mut alice, "DROP SCHEMA a CASCADE"),
+        "DROP SCHEMA"
+    );
+    send_simple_query(&mut alice, "SELECT id FROM a.t LIMIT 1");
+    expect_error_response_with_sqlstate(&mut alice, "3F000");
+    read_ready_for_query(&mut alice);
+}
+
+/// 拡張クエリ（Parse／Bind／Execute／Sync）でもテナントの SCHEMA 配下の表を参照できる。Parse の解決は
+/// 接続の認証済みテナントで行われ、別テナントの SCHEMA は `3F000`。
+#[test]
+fn wire_extended_query_tenant_schema_names() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice", "bob"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    simple_ok(&mut alice, "CREATE SCHEMA a");
+    simple_ok(
+        &mut alice,
+        "CREATE TABLE a.t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    simple_ok(&mut alice, "INSERT INTO a.t (id, name) VALUES (1, 'x')");
+
+    let sql = "SELECT id, name FROM a.t LIMIT 10";
+    send_length_prefixed_message(&mut alice, b'P', &parse_body("s1", sql, 0));
+    assert_eq!(read_message(&mut alice).0, b'1', "ParseComplete");
+    send_length_prefixed_message(&mut alice, b'B', &bind_body("p1", "s1"));
+    assert_eq!(read_message(&mut alice).0, b'2', "BindComplete");
+    send_length_prefixed_message(&mut alice, b'E', &execute_body("p1", 0));
+    let mut rows = 0;
+    loop {
+        let (kind, _) = read_message(&mut alice);
+        match kind {
+            b'D' => rows += 1,
+            b'C' => break,
+            other => panic!("unexpected message {}", other as char),
+        }
+    }
+    assert_eq!(rows, 1);
+    send_length_prefixed_message(&mut alice, b'S', &[]);
+    assert_eq!(read_message(&mut alice).0, b'Z');
+
+    // 別テナント（bob）の Parse は alice の SCHEMA を解決できない。
+    send_length_prefixed_message(&mut bob, b'P', &parse_body("s1", sql, 0));
+    let (kind, body) = read_message(&mut bob);
+    assert_eq!(kind, b'E', "ErrorResponse");
+    assert!(
+        body.windows(6).any(|w| w == b"C3F000"),
+        "SQLSTATE 3F000 expected"
+    );
+    send_length_prefixed_message(&mut bob, b'S', &[]);
+    assert_eq!(read_message(&mut bob).0, b'Z');
 }

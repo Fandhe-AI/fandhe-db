@@ -712,6 +712,9 @@ pub(crate) fn recompute_referenced_columns(
 /// `table` と列 `column`（`Some` のとき列制約・`None` のとき表制約）から
 /// PostgreSQL 風の既定制約名を導出する（`<table>_<col>_check`／`<table>_check`）。
 fn default_check_name(table: &str, column: Option<&str>) -> String {
+    // SCHEMA 配下の表（内部キー `#<id>.<name>`。Issue #1717）は名前部から導出する（制約名は識別子規則に
+    // 従い、内部 ID を含めない）。
+    let table = crate::catalog::namespace::relation_name_part(table);
     match column {
         Some(col) => format!("{table}_{col}_check"),
         None => format!("{table}_check"),

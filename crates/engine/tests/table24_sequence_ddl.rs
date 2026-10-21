@@ -233,7 +233,8 @@ fn syntax_table() {
     let (_p, _g, core) = open_fixture("seq-syntax");
     let mut s = allowed_session();
     let cases: &[(&str, &str)] = &[
-        // 未対応の句は 0A000（黙って無視しない）。
+        // 未対応の句は 0A000（黙って無視しない）。`public.x` の修飾は Issue #1717 で裸の名前と
+        // 同じ扱いになった（`table27_schema_objects.rs`）ため、ここには含めない。
         ("CREATE SEQUENCE IF NOT EXISTS x", "0A000"),
         ("CREATE SEQUENCE x CACHE 10", "0A000"),
         ("CREATE SEQUENCE x OWNED BY t.embedding", "0A000"),
@@ -241,11 +242,9 @@ fn syntax_table() {
         ("CREATE TEMP SEQUENCE x", "0A000"),
         ("CREATE TEMPORARY SEQUENCE x", "0A000"),
         ("CREATE UNLOGGED SEQUENCE x", "0A000"),
-        ("CREATE SEQUENCE public.x", "0A000"),
         ("DROP SEQUENCE IF EXISTS x", "0A000"),
         ("DROP SEQUENCE x CASCADE", "0A000"),
         ("DROP SEQUENCE a, b", "0A000"),
-        ("DROP SEQUENCE public.x", "0A000"),
         // 構文違反は 42601。
         ("CREATE SEQUENCE", "42601"),
         ("CREATE SEQUENCE x START 1 START 2", "42601"),

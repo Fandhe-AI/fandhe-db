@@ -7,7 +7,8 @@
 //!
 //! - `public.t` は未修飾の `t` と同じ結果になる（DDL・DML・SELECT・JOIN・サブクエリ・COPY・ビュー）
 //! - 存在しない SCHEMA は `3F000`（他テナントにしか無い名前も同じ応答）、自テナントの SCHEMA は
-//!   参照系 `42P01`・作成系 `0A000`（内部キー・内部 ID を文言に含まない）
+//!   参照系 `42P01`（内部キー・内部 ID を文言に含まない）。作成系はテナント SCHEMA 配下への
+//!   配置（Issue #1717。結合テストは `table27_schema_objects.rs`）
 //! - `pg_catalog`／`information_schema`／`pg_temp` は `0A000`、3 部名・引用付きは従来のコード
 //! - `public.<一時表>` は永続側へも一時表へも作用せず拒否される
 //! - 拡張クエリ（Parse／Bind）でも同じ解決になる
@@ -225,8 +226,12 @@ fn schema_of_another_tenant_is_indistinguishable_from_a_missing_one() {
     assert_eq!(e.wire_code(), "42P01");
 }
 
+/// Issue #1717 で契約を更新: 自テナントの SCHEMA 配下に表が無ければ参照系は `42P01`（文言は利用者が
+/// 書いた `s1.t` のままで、内部キー・内部 ID を含まない）、作成系は成功して SCHEMA 配下に表が
+/// できる（修飾した名前が裸の `t` に化けない。以前は `0A000` で固定していた）。オブジェクトの
+/// 作成・参照・削除の網羅は `table27_schema_objects.rs`。
 #[test]
-fn own_schema_gives_42p01_for_references_and_0a000_for_create() {
+fn own_schema_gives_42p01_for_missing_references_and_creates_in_schema() {
     let (core, _g) = new_core("t27-qualified-own");
     let mut s = ddl_session();
     ok(&core, &mut s, "CREATE SCHEMA s1");
@@ -245,12 +250,10 @@ fn own_schema_gives_42p01_for_references_and_0a000_for_create() {
         assert!(msg.contains("s1.t"), "{msg}");
         assert!(!msg.contains('#'), "{msg}");
     }
-    assert_eq!(
-        code(&core, &mut s, "CREATE TABLE s1.t (name TEXT)"),
-        "0A000"
-    );
-    // 修飾した名前が裸の `t` に化けていない（表は無変更）。
+    ok(&core, &mut s, "CREATE TABLE s1.t (name TEXT)");
+    // 修飾した名前が裸の `t` に化けていない（public の `t` は無変更）。
     assert_eq!(count(&core, &mut s, "t"), "Integer(0)");
+    assert_eq!(count(&core, &mut s, "s1.t"), "Integer(0)");
 }
 
 #[test]

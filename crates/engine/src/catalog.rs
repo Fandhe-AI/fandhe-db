@@ -728,7 +728,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema(format!("missing table for index {name}")))?
         .to_string();
-    validate_identifier(&table).map_err(|_| {
+    validate_relation_key(&table).map_err(|_| {
         CatalogError::CorruptSchema(format!("invalid table identifier for index {name}"))
     })?;
     let kind_tag = lines
@@ -1451,7 +1451,7 @@ pub(crate) fn explain_index_names_in_txn(
         }
         let (key, value) = entry?;
         let name = key.value();
-        validate_identifier(name).map_err(|_| {
+        validate_relation_key(name).map_err(|_| {
             CatalogError::CorruptSchema(format!("invalid index identifier for index {name}"))
         })?;
         let def = decode_index_def(name, value.value())?;
@@ -1681,10 +1681,15 @@ fn unique_index_def_for_table_in_txn(
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
         Err(e) => return Err(e.into()),
     };
-    let Some(guard) = index_table.get(name)? else {
+    // `name` は制約名（識別子）。一意索引の索引キーは表と同じ SCHEMA の `name`（SCHEMA 配下の表では
+    // `#<id>.<name>`。TABLE-27・Issue #1717）なので、表のキーから導出して引く。
+    let Ok(key) = namespace::sibling_key(table, name) else {
         return Ok(false);
     };
-    let def = decode_index_def(name, guard.value())?;
+    let Some(guard) = index_table.get(key.as_str())? else {
+        return Ok(false);
+    };
+    let def = decode_index_def(&key, guard.value())?;
     Ok(def.unique && def.table == table)
 }
 
@@ -1710,7 +1715,8 @@ fn unique_index_names_for_table_in_txn(
         let (key, value) = entry?;
         let def = decode_index_def(key.value(), value.value())?;
         if def.unique && def.table == table {
-            names.push(def.name);
+            // 一意索引の実体は索引名と同名の UNIQUE 制約（SCHEMA 配下では名前部。Issue #1717）。
+            names.push(namespace::relation_name_part(&def.name).to_string());
         }
     }
     Ok(names)
@@ -1736,7 +1742,8 @@ fn check_unique_index_gate(def: &IndexDef, schema: &TableSchema) -> Result<()> {
             )));
         }
     }
-    let name = def.name.as_str();
+    // 一意索引の実体は索引名と同名の UNIQUE 制約。SCHEMA 配下の索引（内部キー）は名前部が制約名になる。
+    let name = namespace::relation_name_part(&def.name);
     let collides = schema.unique_constraints.iter().any(|u| u.name() == name)
         || schema.checks.iter().any(|c| c.name == name)
         || schema.foreign_keys.iter().any(|f| f.name() == name)
@@ -1796,7 +1803,7 @@ fn build_unique_index_schema_in_txn(
     }
     let mut constraints = schema.unique_constraints.clone();
     constraints.push(UniqueConstraint::with_name(
-        def.name.clone(),
+        namespace::relation_name_part(&def.name).to_string(),
         def.columns.clone(),
     ));
     let updated =
@@ -1844,7 +1851,7 @@ fn drop_unique_index_constraint_in_txn(
     let target_index = schema
         .unique_constraints
         .iter()
-        .position(|u| u.name() == def.name)
+        .position(|u| u.name() == namespace::relation_name_part(&def.name))
         .ok_or_else(corrupt)?;
     let target_set: std::collections::HashSet<&str> = schema
         .unique_constraints
@@ -3272,6 +3279,9 @@ pub(crate) const MAX_PRIMARY_KEY_COLUMNS: usize = 32;
 /// 切り詰め、結果が常に妥当な識別子（ASCII・上限内）になるようにする。
 pub fn primary_key_constraint_name(table: &str) -> String {
     const SUFFIX: &str = "_pkey";
+    // SCHEMA 配下の表（内部キー `#<id>.<name>`。TABLE-27・Issue #1717）は名前部から導出する
+    // （制約名は識別子規則に従い、内部 ID を含めない。PostgreSQL も制約名に SCHEMA を含めない）。
+    let table = namespace::relation_name_part(table);
     let keep = MAX_IDENTIFIER_LEN.saturating_sub(SUFFIX.len());
     let head = table.get(..keep.min(table.len())).unwrap_or(table);
     format!("{head}{SUFFIX}")
@@ -5006,6 +5016,13 @@ fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
             deferred_expr: crate::sql::allowlist::top_level_body_has_expression_predicate(&stmt),
         },
     })
+}
+
+/// ビュー本文が読む relation 名（DROP の依存判定 `view_def_dependence_on` と同じ導出）。
+/// `sql::schema_dependency` が SCHEMA 配下のビューの参照先を調べるために使う（TABLE-27・Issue #1717）。
+/// 本文を検証できない場合は `Err`（呼び出し側は fail-closed で拒否する）。
+pub(crate) fn view_body_relations(body_sql: &str) -> Result<Vec<String>> {
+    Ok(view_body_shape(body_sql)?.relations)
 }
 
 /// ビュー定義の DDL 依存ゲート用の形状（Issue #1659）。列別名を持つビューは、列名の追随
@@ -6777,11 +6794,11 @@ impl ColumnDefault {
                 ('c', t.canonical_text())
             }
             ColumnDefault::Sequence(name) => {
-                validate_identifier(name)?;
+                validate_relation_key(name)?;
                 ('q', name.clone())
             }
             ColumnDefault::Identity { sequence, kind } => {
-                validate_identifier(sequence)?;
+                validate_relation_key(sequence)?;
                 let tag = match kind {
                     IdentityKind::Always => 'a',
                     IdentityKind::ByDefault => 'b',
@@ -6847,12 +6864,12 @@ impl ColumnDefault {
                 }),
             // SEQUENCE 名は識別子規則で検証する（不正な名前は fail-closed。TABLE-24・Issue #1690）。
             'q' => {
-                validate_identifier(&text)?;
+                validate_relation_key(&text)?;
                 Ok(Some(ColumnDefault::Sequence(text)))
             }
             // IDENTITY 列（TABLE-24・Issue #1695）。名前は識別子規則で検証する（fail-closed）。
             'a' | 'b' => {
-                validate_identifier(&text)?;
+                validate_relation_key(&text)?;
                 Ok(Some(ColumnDefault::Identity {
                     sequence: text,
                     kind: if tag == 'a' {
@@ -8096,6 +8113,18 @@ pub(crate) fn validate_identifier(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// relation 名（表・ビュー・索引・SEQUENCE のカタログキー）の検証（TABLE-27・Issue #1717。
+/// ADR `docs/design/schema-tenant-namespace.md` D2）。裸の識別子（`public`）に加え、解決器が作る
+/// 内部キー `#<schema_id>.<name>`（[`namespace::RelationKey`]）を受理する。
+///
+/// 差し替え対象は「解決器の出力」か「カタログに保存された値」を受ける位置だけで、列名・SCHEMA 名・
+/// 制約名・別名・利用者の生入力（HTTP の `table` 等）は [`validate_identifier`]（厳格）のまま。
+/// 利用者が内部キーを直接指定できないことは、字句解析器が `#` を含む識別子を作らないこと
+/// （`sql::lexer`）と、HTTP 表層の厳格な識別子検証で担保する。
+pub(crate) fn validate_relation_key(s: &str) -> Result<()> {
+    namespace::RelationKey::parse(s).map(|_| ())
+}
+
 /// `VARCHAR(n)`／`CHAR(n)` の n 検証（TABLE-31・Issue #1563）。0 と
 /// [`MAX_CHAR_TYPE_LENGTH`] 超過を encode・decode 両側で拒否する。
 pub(crate) fn validate_char_type_length(n: u32) -> Result<()> {
@@ -8291,7 +8320,7 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
 /// 同一 write txn 内に限って許すための経路で、全アクション適用後に呼び出し側が
 /// `require_live = true` 相当の検証を必ず行う（Issue #1633）。
 fn validate_schema_impl(schema: &TableSchema, require_live: bool) -> Result<()> {
-    validate_identifier(&schema.name)?;
+    validate_relation_key(&schema.name)?;
     if require_live && schema.columns.is_empty() {
         return Err(CatalogError::Invalid(
             "table must have at least one column".to_string(),
@@ -8494,7 +8523,7 @@ fn validate_foreign_keys(schema: &TableSchema, allow_unresolved: bool) -> Result
                 )));
             }
         }
-        validate_identifier(&fk.parent_table)?;
+        validate_relation_key(&fk.parent_table)?;
         if fk.columns.is_empty() {
             return Err(CatalogError::Invalid(
                 "foreign key must reference at least one column".to_string(),
@@ -9178,6 +9207,8 @@ fn derive_unique_constraint_names(
 ) -> Vec<String> {
     let mut used: Vec<String> = used.to_vec();
     let mut names = Vec::with_capacity(columns_per_constraint.len());
+    // 制約名は SCHEMA 配下の表でも名前部から導出する（内部キーを含めない。Issue #1717）。
+    let table = namespace::relation_name_part(table);
     for cols in columns_per_constraint {
         let candidate = format!("{table}_{}_key", cols.join("_"));
         let name = resolve_constraint_name(&candidate, &used, "key");
@@ -9226,7 +9257,7 @@ fn assign_unique_constraint_names_avoiding(
             used.push(uc.name.clone());
         }
     }
-    let table = schema.name.clone();
+    let table = namespace::relation_name_part(&schema.name).to_string();
     let mut new_unique = Vec::with_capacity(schema.unique_constraints.len());
     for uc in schema.unique_constraints.clone() {
         if uc.name.is_empty() {
@@ -9253,6 +9284,7 @@ fn derive_foreign_key_constraint_names(
 ) -> Vec<String> {
     let mut used: Vec<String> = used.to_vec();
     let mut names = Vec::with_capacity(columns_per_constraint.len());
+    let table = namespace::relation_name_part(table);
     for cols in columns_per_constraint {
         let candidate = format!("{table}_{}_fkey", cols.join("_"));
         let name = resolve_constraint_name(&candidate, &used, "fkey");
@@ -9297,7 +9329,7 @@ fn assign_foreign_key_constraint_names_avoiding(
             used.push(fk.name.clone());
         }
     }
-    let table = schema.name.clone();
+    let table = namespace::relation_name_part(&schema.name).to_string();
     let mut new_fks = Vec::with_capacity(schema.foreign_keys.len());
     for fk in schema.foreign_keys.clone() {
         if fk.name.is_empty() {
@@ -9690,7 +9722,7 @@ fn encode_foreign_key_section(
 ) -> Result<()> {
     out.push_str(&format!("fks:{}\n", foreign_keys.len()));
     for fk in foreign_keys {
-        validate_identifier(&fk.parent_table)?;
+        validate_relation_key(&fk.parent_table)?;
         for name in fk.columns.iter().chain(&fk.parent_columns) {
             validate_identifier(name)?;
         }
@@ -9915,7 +9947,7 @@ fn parse_foreign_key_section<'a>(
             )
         };
         let columns = parse_foreign_key_column_list(columns_field, line)?;
-        validate_identifier(parent_table)
+        validate_relation_key(parent_table)
             .map_err(|_| format!("malformed foreign key line: {line:?}"))?;
         let parent_columns = parse_foreign_key_column_list(parent_columns_field, line)?;
         // 参照先を要さない構造上の不変条件（`validate_foreign_keys` と同じ契約）を
@@ -9992,7 +10024,7 @@ fn encode_foreign_key_section_v12(out: &mut String, foreign_keys: &[ForeignKeyDe
     out.push_str(&format!("fks:{}\n", foreign_keys.len()));
     for fk in foreign_keys {
         validate_identifier(&fk.name)?;
-        validate_identifier(&fk.parent_table)?;
+        validate_relation_key(&fk.parent_table)?;
         for name in fk.columns.iter().chain(&fk.parent_columns) {
             validate_identifier(name)?;
         }
@@ -10089,7 +10121,7 @@ fn parse_foreign_key_section_v12<'a>(
         }
         seen_names.push(name.to_string());
         let columns = parse_foreign_key_column_list(columns_field, line)?;
-        validate_identifier(parent_table)
+        validate_relation_key(parent_table)
             .map_err(|_| format!("malformed foreign key line: {line:?}"))?;
         let parent_columns = parse_foreign_key_column_list(parent_columns_field, line)?;
         let has_duplicate = |names: &[String]| {
@@ -11867,6 +11899,7 @@ impl Storage {
         schema: &TableSchema,
         pre_encoded: Option<Vec<u8>>,
     ) -> Result<()> {
+        namespace::ensure_key_schema_alive_in_txn(write_txn, schema.name.as_str())?;
         // `DEFAULT nextval('<名前>')` は参照先 SEQUENCE がこの write txn の時点で存在すること
         // （TABLE-24・Issue #1690。未登録は `TableNotFound`＝`42P01`。名前はクライアント自身の入力）。
         for column in &schema.columns {
@@ -12094,7 +12127,7 @@ impl Storage {
     ) -> Result<(DropTablesReport, Vec<u64>)> {
         let mut targets: Vec<&str> = Vec::new();
         for name in table_names {
-            validate_identifier(name)?;
+            validate_relation_key(name)?;
             if !targets.contains(&name.as_str()) {
                 targets.push(name.as_str());
             }
@@ -12308,7 +12341,7 @@ impl Storage {
     /// 列単位の ALTER（DROP COLUMN／SET・DROP NOT NULL／SET・DROP DEFAULT）共通の txn 前検査
     /// （識別子・保護列名。Issue #1633 で複数アクション経路と共有するため切り出し）。
     pub(crate) fn validate_alter_column_target(table_name: &str, column_name: &str) -> Result<()> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         validate_identifier(column_name)?;
         if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()));
@@ -12324,7 +12357,7 @@ impl Storage {
         max_columns: usize,
     ) -> Result<usize> {
         let max_columns = max_columns.min(MAX_COLUMN_COUNT);
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         validate_column(column)?;
         // 時刻値関数の DEFAULT は既存行の補完値を固定できず、読み出し時補完が常に失敗して
         // テーブルを読めなくするため、Rust API 直接呼び出しでも拒否する（多層防御。SQL 表層は
@@ -12474,7 +12507,7 @@ impl Storage {
     /// 失効契約は他の DDL（`alter_table_add_column` 等）と同じくテーブル単位
     /// 世代カウンタへ一本化する（`bump_table_generation_in_txn`）。
     pub fn alter_table_drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         validate_identifier(column_name)?;
         if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()));
@@ -12731,7 +12764,7 @@ impl Storage {
         old_name: &str,
         new_name: &str,
     ) -> std::result::Result<(), AlterCheckError> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         validate_identifier(old_name)?;
         validate_identifier(new_name)?;
         // 予約列（`id`／`tenant_id`／`visibility`）の改名元・改名先は拒否する。改名先は
@@ -12908,8 +12941,8 @@ impl Storage {
         table_name: &str,
         new_table_name: &str,
     ) -> std::result::Result<(), AlterCheckError> {
-        validate_identifier(table_name)?;
-        validate_identifier(new_table_name)?;
+        validate_relation_key(table_name)?;
+        validate_relation_key(new_table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let mut schema = {
             let table = write_txn
@@ -13127,7 +13160,7 @@ impl Storage {
         name: Option<&str>,
         columns: &[&str],
     ) -> Result<String> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         if let Some(n) = name {
             validate_identifier(n)?;
         }
@@ -13265,7 +13298,7 @@ impl Storage {
         name: Option<&str>,
         columns: &[&str],
     ) -> Result<String> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         if let Some(n) = name {
             validate_identifier(n)?;
         }
@@ -13715,7 +13748,7 @@ impl Storage {
         table_name: &str,
         parsed: &crate::sql::allowlist::ParsedCheck,
     ) -> std::result::Result<String, AlterCheckError> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         if let Some(n) = &parsed.name {
             validate_identifier(n)?;
         }
@@ -13872,7 +13905,7 @@ impl Storage {
         name: Option<&str>,
         foreign_key: ForeignKeyDef,
     ) -> Result<String> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         if let Some(n) = name {
             validate_identifier(n)?;
         }
@@ -14024,7 +14057,7 @@ impl Storage {
     /// FK が参照しうるため）・FOREIGN KEY 削除時は親表の stale 索引を刈り込む
     /// (6) 世代を bump する。
     pub fn alter_table_drop_constraint(&self, table_name: &str, name: &str) -> Result<()> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         validate_identifier(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         // `CREATE UNIQUE INDEX` 由来の UNIQUE 制約は制約としては扱わない（Issue #1616・
@@ -14407,7 +14440,7 @@ impl Storage {
         )
             -> Result<(ColumnType, Option<crate::collation::Collation>, AlterPlan)>,
     ) -> std::result::Result<(), AlterCheckError> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         validate_identifier(column_name)?;
         if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()).into());
@@ -14657,6 +14690,7 @@ impl Storage {
         }
         let encoded = encode_enum_type_def(name, &labels)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
         {
             let mut table = write_txn.open_table(ENUM_TYPES_TABLE)?;
             if table.get(name)?.is_some() {
@@ -14822,7 +14856,7 @@ impl Storage {
         column_aliases: &[String],
         check_option: ViewCheckOption,
     ) -> Result<()> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
             return Err(CatalogError::ViewLimitExceeded(
                 "view body too large".to_string(),
@@ -14850,6 +14884,7 @@ impl Storage {
             check_option,
         })?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
         {
             let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             if catalog_table.get(name)?.is_some() {
@@ -14908,7 +14943,7 @@ impl Storage {
         name: &str,
         behavior: DropBehavior,
     ) -> Result<Vec<CascadedObject>> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
@@ -15017,8 +15052,8 @@ impl Storage {
         exprs: &[Option<Expr>],
         predicate: Option<&[WherePredicate]>,
     ) -> std::result::Result<(), CreateIndexError> {
-        validate_identifier(&def.name)?;
-        validate_identifier(&def.table)?;
+        validate_relation_key(&def.name)?;
+        validate_relation_key(&def.table)?;
         if def.has_expressions() || def.has_predicate() {
             // 式・述語の永続形は束縛で確定する。入力の生テキストは信用しない。
             return Err(CatalogError::Invalid(
@@ -15103,6 +15138,7 @@ impl Storage {
             return Err(CatalogError::Invalid(format!("duplicate index column: {dup}")).into());
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        namespace::ensure_key_schema_alive_in_txn(&*write_txn, &def.name)?;
         {
             let views_contains = |name: &str| -> Result<bool> {
                 match write_txn.open_table(VIEWS_TABLE) {
@@ -15338,7 +15374,7 @@ impl Storage {
     /// `Err(IndexNotFound)`（冪等に `Ok` へ丸めない。fail-closed）。成功時は
     /// 対象テーブルの世代を進める（[`Storage::create_index`] と同じ理由）。
     pub fn drop_index(&self, name: &str) -> Result<()> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let removed = {
             match write_txn.open_table(INDEX_CATALOG_TABLE) {
@@ -15467,7 +15503,12 @@ impl Storage {
                 )));
             }
             let (key, value) = entry?;
-            out.push(decode_index_def(key.value(), value.value())?);
+            let def = decode_index_def(key.value(), value.value())?;
+            // SCHEMA 配下の索引（内部キー `#<id>.<name>`。TABLE-27・Issue #1717）は一覧に含めない
+            // （`list_tables` と同じ理由。他テナントの SCHEMA の存在・名前を漏らさない）。
+            if !def.name.starts_with('#') {
+                out.push(def);
+            }
         }
         Ok(out)
     }
@@ -15523,7 +15564,7 @@ impl Storage {
         appends_columns: bool,
         check_option: ViewCheckOption,
     ) -> Result<()> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
             return Err(CatalogError::ViewLimitExceeded(
                 "view body too large".to_string(),
@@ -15551,6 +15592,7 @@ impl Storage {
             check_option,
         })?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
         {
             let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             // matview とも名前空間を共有する（TABLE-42 (2)、Issue #1663）。
@@ -15783,9 +15825,16 @@ impl Storage {
 
     /// 定義済みテーブル名の一覧をスナップショット読み取りで返す。件数上限
     /// （[`MAX_LIST_TABLES`]）を超える場合は `Err`（無制限 `Vec` 確保を防ぐ）。
+    ///
+    /// 返すのは `public`（裸の名前）の表だけで、SCHEMA 配下の表の内部キー（`#<id>.<name>`。
+    /// TABLE-27・Issue #1717）は含めない（他テナントの SCHEMA 配下の表名・内部 ID を、一覧を
+    /// 取得できる呼び出し元へ漏らさないため。P0）。カタログ全体の走査が要る内部処理は
+    /// `list_tables_in_txn` を直接使う。
     pub fn list_tables(&self) -> Result<Vec<String>> {
         let read_txn = self.db().begin_read()?;
-        list_tables_in_txn(&read_txn)
+        let mut names = list_tables_in_txn(&read_txn)?;
+        names.retain(|n| !n.starts_with('#'));
+        Ok(names)
     }
 
     /// テーブルスコープで 1 行挿入する（TASK-146、対象ビヘイビア: EXT-1, EXT-2）。
@@ -15821,7 +15870,7 @@ impl Storage {
         id: u64,
         row: &RowInput<'_>,
     ) -> Result<()> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
@@ -15867,7 +15916,7 @@ impl Storage {
         table_name: &str,
         rows: &[(u64, RowInput<'_>)],
     ) -> Result<()> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
@@ -15931,7 +15980,7 @@ impl Storage {
         visibility: Visibility,
         values: &[RowCodecValue],
     ) -> Result<()> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
@@ -15992,7 +16041,7 @@ impl Storage {
         tenant_id: &str,
         id: u64,
     ) -> Result<StorageRow> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         let read_txn = self.db().begin_read()?;
         require_legacy_row_identity_read(&read_txn, table_name)?;
         let row_table_name = user_rows_table_name(table_name);
@@ -16057,7 +16106,7 @@ impl Storage {
         limit: u32,
         allow_allocated: bool,
     ) -> Result<RowPage> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         let limit = limit.min(crate::storage::MAX_SCAN_PAGE_LIMIT) as usize;
 
         let read_txn = self.db().begin_read()?;
@@ -16328,7 +16377,7 @@ pub(crate) fn get_table_schema_in_txn_impl(
     // `alter_table_add_column` と同様、redb キーとして引く前に識別子を検証する。
     // 不正形式の名前は `TableNotFound`（存在しない）ではなく `Invalid`（形式不正）で
     // 拒否し、両 API 間でエラーバリアントを揃える。
-    validate_identifier(table_name)?;
+    validate_relation_key(table_name)?;
     let table = match read_txn.open_table(CATALOG_TABLE) {
         Ok(t) => t,
         // カタログテーブル未作成（1 テーブルも定義していない）は「存在しない」として扱う。
@@ -16368,7 +16417,7 @@ fn list_tables_in_txn(
         // すべて `create_table` の `validate_schema` を経ているため常に合法だが、
         // 手書きの不正データが直接 redb へ書き込まれていた場合に、そのまま
         // 一覧へ紛れ込ませない（`decode_schema` と同じ fail-closed 方針）。
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         names.push(name.to_string());
     }
     Ok(names)
