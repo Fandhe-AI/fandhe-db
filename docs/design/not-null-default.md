@@ -314,7 +314,7 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
   書き込み段へ運ぶ（ハッシュ材料からは除外）。`tenant` が台帳照合の後に `23502` で拒否するため、
   記録済みの同一文の再送は `23505`、新規の文は従来どおり `23502`（txn 破棄で台帳追記も残らない）。
   UPSERT・COPY・ファイル形・NoSQL の束縛は即時 `23502` のまま（これらの NOT NULL 列の再送は対象外）。
-- **範囲外**: `INSERT ... VALUES (DEFAULT)`（SQL-50）と `UPDATE ... SET c = DEFAULT` は未実装。
+- **範囲外**: `UPDATE ... SET c = DEFAULT` は未実装。`INSERT` の `DEFAULT VALUES`・値位置の `DEFAULT`・列リスト省略（SQL-50）は Issue #1730（本ファイル末尾の追記節）で実装した。
   実装時は DEFAULT キーワードを構文形としてハッシュし評価値を入れない。
 
 ## Issue #1632 追記: `ALTER COLUMN DROP NOT NULL`
@@ -343,3 +343,45 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
   クライアント指定の列名のみ。
 - **範囲外**: `COLUMN` 省略形・複数アクション、NoSQL 表層の `alter_table`、wire-server 側の結合テスト、
   NULL 許容 VECTOR（TABLE-26）。
+
+## Issue #1730 追記: `INSERT` の `DEFAULT VALUES`・値位置の `DEFAULT`・列リスト省略
+
+ポインタ: SQL-50・RECOVER-10・RECOVER-11・TABLE-16・TABLE-24・RLS-9・RLS-10。列 DEFAULT 自体
+（DDL・`fill_omitted_columns` による省略列補完）は #1629 までに実装済みで、本 Issue は構文と束縛の追加だけ。
+
+- **受理する形**: `INSERT INTO t DEFAULT VALUES`／`INSERT INTO t (a, b) VALUES (1, DEFAULT)`／
+  `INSERT INTO t VALUES (...)`（列リスト省略）。`ON CONFLICT`・`RETURNING`・`USING OPERATION_ID` は
+  従来どおり後ろに続けられる。`OVERRIDING` は列リストの有無に関わらず `0A000`。
+- **表現（D1）**: `InsertLiteral::Default` を追加し、生成は `Parser::expect_insert_value` の先頭だけ
+  （引用なしの `DEFAULT` が単独で、直後が `,` か `)` のとき）。`DEFAULT + 1`・`((DEFAULT))`・引用付き
+  `"DEFAULT"`・UPDATE の `SET`・`ON CONFLICT ... DO UPDATE SET`・DDL の列 DEFAULT は従来どおり
+  `42601`（UPDATE の `SET c = DEFAULT` は式の列参照として解釈され `42703`。UPDATE 対応は後続）。引用付き
+  `"DEFAULT"` の判別のため、字句段が `NULL`・`ARRAY` と同じ枠で `Token::QuotedNull` にする。
+  `ValidatedInsert` に `columns_omitted: bool` を追加（`DEFAULT VALUES` は `columns = []`・`rows = [[]]`、
+  列リスト省略は `columns_omitted = true`・`columns = []`）。公開 struct のフィールド追加のため
+  `feat(engine)!`（wire-server の構築箇所も同 PR で更新）。
+- **内容照合ハッシュ（D2）**: 値位置の `DEFAULT` は束縛段で「省略列」と同じ扱い（`provided` を立てない）に
+  する。`fill_omitted_columns` が DEFAULT を適用して `VolatileColumn` を付け、ハッシュ材料から外れる
+  （#1629 D1 の既存規則）。ハッシュのレイアウト・golden は変えない。したがって `(a, b) VALUES (1, DEFAULT)` と
+  `(a) VALUES (1)` は同一ハッシュで、DEFAULT の変更・削除・追加を挟んだ再送も `23505`。明示 `NULL` と
+  省略が同一ハッシュになるのは #1629 D3 の既存の設計で、本 Issue で新たに生じた衝突ではない。
+- **束縛（D3）**: 列リスト省略は `bind_insert_form`・`bind_insert_impl` の入口で `SELECT *` と同じ列順
+  （`lookup_star_columns_of`。疑似 `id` が先頭）の明示列リストへ展開する（束縛と同じスキーマで展開するため
+  TOCTOU が無い）。値が列数より多い場合は `42601`、少ない場合は先頭から当てて残りを DEFAULT 補完へ回す
+  （PG と同じ）。展開結果に `id` が 2 回現れる表は `0A000`。複数行で行長が揃わない列リスト省略は構文段で
+  `42601`。`DEFAULT` を指定した列も列の存在確認（`42703`）と重複検査は行い、`GENERATED ALWAYS` 列にも
+  指定できる（PG と同じ。明示値は従来どおり `428C9`）。疑似 `id` の位置が `DEFAULT` の場合は、移行済み表で
+  IDENTITY 採番（#1699）、UPSERT は `0A000`、従来方式の表は `22000`。従来方式の表への `DEFAULT VALUES` も
+  疑似 `id` が必須のため `22000` のまま（疑似 `id` は本リポ固有の概念で受理範囲を広げない）。ファイル形
+  INSERT の値位置 `DEFAULT` は `0A000`。複数行で `id` の明示値と `DEFAULT` が混在する形は既存の
+  `reject_mixed_id_omission`（`0A000`）に任せる（PG との差。後続候補）。
+- **ビュー経由（D4）**: `DEFAULT VALUES`・値位置の `DEFAULT` は名前写像をそのまま通り、基表の DEFAULT が
+  適用される。列リストを省略したビュー INSERT は公開列での展開が要るため `0A000`（展開前に拒否し、基表の
+  `*` へ黙って展開しない）。`insert_omits_pseudo_id` は `id = DEFAULT` も省略として扱い、ビュー経由の
+  採番を拒否する D9（migrated-id-identity.md）をすり抜けさせない。
+- **拡張クエリ（D5）**: `INSERT INTO t VALUES ($1, ...)` の `$n` は表のスキーマから宣言順の列型で推論する
+  （表でない・引けない場合は従来どおり `Text`）。`DEFAULT` は序数を 1 つ消費するだけ。
+- **fail-closed**: `InsertLiteral::Default` を想定外の束縛経路（数値・整数列の共通ヘルパー・UPSERT の
+  `DO UPDATE`・ファイル形・内容照合ハッシュの UPDATE 材料化）で受け取ったら固定文言の `0A000` で拒否する。
+- **後続候補（範囲外）**: ビューへの列リスト省略 INSERT、`UPDATE ... SET c = DEFAULT`、複数行 `id` 列の
+  明示値と `DEFAULT` の混在。

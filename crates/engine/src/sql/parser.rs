@@ -394,6 +394,17 @@ pub(crate) fn reject_sequence_call_literal() -> SqlSurfaceError {
     }
 }
 
+/// `InsertLiteral::Default`（`VALUES` 要素の単独 `DEFAULT` キーワード。SQL-50・Issue #1730）を
+/// 受理しない束縛経路（UPDATE のリテラル・UPSERT の `DO UPDATE`・ファイル形 INSERT・COPY・NoSQL・
+/// 数値／整数列の共通束縛ヘルパー）の共通拒否（`0A000`。fail-closed。パーサーは `bind_insert_row` が
+/// 処理する `INSERT ... VALUES` 以外へ `Default` を渡さないため、到達は内部の構築ミスのみ）。
+/// 黙って NULL や既定値へ丸めない。固定文言で値・列名を含めない。
+pub(crate) fn reject_default_keyword_literal() -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: "the DEFAULT keyword is not supported in this context".to_string(),
+    }
+}
+
 /// 定数式が TIMESTAMPTZ に評価された値（UTC マイクロ秒）を、代入先の列型へ束縛する
 /// （`bind_insert_row` から呼ぶ。Issue #1576 レビュー指摘）。TIMESTAMPTZ 列は範囲を再検証して
 /// そのまま、TIMESTAMP・DATE 列はセッション TZ の局所値へ変換する（PG の代入キャスト・
@@ -488,6 +499,7 @@ pub(crate) fn bind_numeric_literal(
             return Err(reject_current_time_literal(name))
         }
         InsertLiteral::SequenceCall { .. } => return Err(reject_sequence_call_literal()),
+        InsertLiteral::Default => return Err(reject_default_keyword_literal()),
         // 呼び出し元（`bind_insert`／`bind_set_assignments`／
         // `bind_upsert_assignments`）はいずれも `InsertLiteral::Null` を
         // 本関数へ渡すより前に nullable 判定込みで独自に処理するため実際には
@@ -636,6 +648,7 @@ pub(crate) fn bind_integer_literal(
             return Err(reject_current_time_literal(name))
         }
         InsertLiteral::SequenceCall { .. } => return Err(reject_sequence_call_literal()),
+        InsertLiteral::Default => return Err(reject_default_keyword_literal()),
         InsertLiteral::Bool(_) | InsertLiteral::Null | InsertLiteral::Vector(_) => {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "column {name:?} expects an integer literal, got a non-integer literal"
@@ -3122,6 +3135,9 @@ fn bind_insert_impl(
     defer_not_null: bool,
     omission: IdOmission,
 ) -> Result<BoundInsert, SqlSurfaceError> {
+    // 多層防御: 呼び出し元が展開していない列リスト省略もここで展開する（SQL-50・Issue #1730）。
+    let expanded = resolve_omitted_column_list(stmt, schema)?;
+    let stmt: &ValidatedInsert = &expanded;
     // 複数行 `VALUES`（SQL-16、TASK-190）は本関数の単一行契約外であり、2 行目
     // 以降を黙って無視する fail-open を避けるため明示的に拒否する（複数行の
     // 束縛は `bind_insert_form` の `RowBatch` 分岐を経由すること）。
@@ -3414,8 +3430,13 @@ fn bind_insert_row(
     // 作らず、判定はスキーマだけで決まる）。採番は書き込み段が同じ write txn 内で行う。
     let has_pseudo_id = schema.has_pseudo_id();
     let id_pos = columns.iter().position(|c| c == "id");
+    // 値位置の `DEFAULT`（SQL-50・Issue #1730）は列リストからの省略と同じ扱い（IDENTITY 採番）にする。
+    // 従来方式の表（`MigratedId` でない）は疑似 `id` の値を数値に限るため、下の値判定で拒否する。
+    let id_is_default = id_pos
+        .and_then(|pos| values.get(pos))
+        .is_some_and(|literal| matches!(literal, InsertLiteral::Default));
     let id_omitted =
-        has_pseudo_id && id_pos.is_none() && schema.is_migrated_id() && {
+        has_pseudo_id && (id_pos.is_none() || id_is_default) && schema.is_migrated_id() && {
             match omission {
                 IdOmission::Identity => true,
                 IdOmission::Unsupported => return Err(SqlSurfaceError::FeatureNotSupported {
@@ -3443,6 +3464,7 @@ fn bind_insert_row(
             | InsertLiteral::CurrentTime(_)
             | InsertLiteral::TimestampTz(_)
             | InsertLiteral::SequenceCall { .. }
+            | InsertLiteral::Default
             | InsertLiteral::Vector(_) => {
                 return Err(SqlSurfaceError::invalid_input(
                     "id pseudo-column value must be a number",
@@ -3476,6 +3498,13 @@ fn bind_insert_row(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
+        // 値位置の `DEFAULT`（SQL-50・Issue #1730）は「その列を省略した」扱い: `provided` を立てず
+        // `fill_omitted_columns` が列 DEFAULT を適用し、内容照合ハッシュの材料からも外れる
+        // （RECOVER-10・RECOVER-11）。PostgreSQL と同じく GENERATED ALWAYS 列でも受理するため
+        // `reject_generated_always_value` は通さない（列の存在確認は上で済み）。
+        if matches!(literal, InsertLiteral::Default) {
+            continue;
+        }
         reject_generated_always_value(column)?;
         if let InsertLiteral::CurrentTime(time) = literal {
             // 時刻関数の単独形（SQL-37・Issue #2188）。列型と構文形の適合を確認してから、
@@ -3525,6 +3554,9 @@ fn bind_insert_row(
             // `nextval`／`currval` の単独形も上で処理済み（到達しない）。fail-closed で拒否する。
             (_, InsertLiteral::SequenceCall { .. }) => {
                 return Err(reject_sequence_call_literal());
+            }
+            (_, InsertLiteral::Default) => {
+                return Err(reject_default_keyword_literal());
             }
             // 定数式の TIMESTAMPTZ 結果は代入先の列型で変換する（Issue #1576）。
             (ty, InsertLiteral::TimestampTz(micros)) => bind_tstz_literal(name, ty, *micros)?,
@@ -4017,6 +4049,9 @@ fn bind_set_assignments(
             }
             (_, InsertLiteral::SequenceCall { .. }) => {
                 return Err(reject_sequence_call_literal());
+            }
+            (_, InsertLiteral::Default) => {
+                return Err(reject_default_keyword_literal());
             }
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
@@ -4930,15 +4965,68 @@ fn is_file_form_shape(stmt: &ValidatedInsert, schema: &TableSchema) -> bool {
 /// 基表の `id` 省略を `0A000` で拒否する判定に使う（`WITH CHECK OPTION` の検査時点と採番値の関係を
 /// 検証し切れていないため、受理は後続 Issue。ADR `docs/design/migrated-id-identity.md` D9）。
 pub(crate) fn insert_omits_pseudo_id(stmt: &ValidatedInsert, schema: &TableSchema) -> bool {
+    // 値位置の `DEFAULT`（SQL-50・Issue #1730）も列リストからの省略と同じ採番を引き起こすため、
+    // どれかの行で `id` の位置が `DEFAULT` の場合も省略として扱う（D9 の拒否をすり抜けさせない）。
+    let id_pos = stmt.columns.iter().position(|c| c == "id");
+    let id_value_is_default = id_pos.is_some_and(|pos| {
+        stmt.rows
+            .iter()
+            .any(|row| matches!(row.get(pos), Some(InsertLiteral::Default)))
+    });
     schema.is_migrated_id()
-        && !stmt.columns.iter().any(|c| c == "id")
+        && (id_pos.is_none() || id_value_is_default)
         && !is_file_form_shape(stmt, schema)
+}
+
+/// 列リスト省略の `INSERT INTO t VALUES (...)`（[`ValidatedInsert::columns_omitted`]。SQL-50・
+/// Issue #1730）を、表の宣言順の明示列リストへ展開する。`bind_insert_form`・`bind_insert_impl` の
+/// 入口で呼び、以降の束縛は明示列リストの文と同じ経路になる（内容照合ハッシュも列名で材料化されるため
+/// 列を明示した文と同一になる）。展開は `SELECT *` と同じ [`crate::catalog::lookup_star_columns_of`]
+/// （疑似 `id` が先頭）で、束縛と同じスキーマのスナップショットを使うため TOCTOU が無い。
+///
+/// - 値の個数が展開後の列数より多い: `42601`。少ない場合は先頭から当て、残りは省略列として
+///   DEFAULT 補完へ回る（PostgreSQL と同じ）
+/// - 行の長さが揃わない: `42601`（構文段が検査済みの防御的再検査）
+/// - 展開結果に `id` が 2 回現れる（疑似 `id` と実カラム `id` の併存）: 曖昧なまま選ばず `0A000`
+fn resolve_omitted_column_list<'a>(
+    stmt: &'a ValidatedInsert,
+    schema: &TableSchema,
+) -> Result<std::borrow::Cow<'a, ValidatedInsert>, SqlSurfaceError> {
+    if !stmt.columns_omitted {
+        return Ok(std::borrow::Cow::Borrowed(stmt));
+    }
+    let star = crate::catalog::lookup_star_columns_of(schema);
+    if star.iter().filter(|c| c.as_str() == "id").count() > 1 {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "INSERT without a column list is not supported for a table with an id column \
+             besides the id pseudo-column",
+        ));
+    }
+    let width = stmt.rows.first().map_or(0, Vec::len);
+    if stmt.rows.iter().any(|row| row.len() != width) {
+        return Err(SqlSurfaceError::unsupported(
+            "VALUES lists must all be the same length",
+        ));
+    }
+    if width > star.len() {
+        return Err(SqlSurfaceError::unsupported(
+            "INSERT has more expressions than target columns",
+        ));
+    }
+    let mut expanded = stmt.clone();
+    expanded.columns = star.into_iter().take(width).collect();
+    expanded.columns_omitted = false;
+    Ok(std::borrow::Cow::Owned(expanded))
 }
 
 pub fn bind_insert_form(
     stmt: &ValidatedInsert,
     schema: &TableSchema,
 ) -> Result<BoundInsertForm, SqlSurfaceError> {
+    // 列リスト省略は最初に明示列リストへ展開する（SQL-50・Issue #1730）。以降の判別・束縛は
+    // 展開後の文だけを見る（展開後は疑似 `id` を含むため、ファイル形とは判定されない）。
+    let expanded = resolve_omitted_column_list(stmt, schema)?;
+    let stmt: &ValidatedInsert = &expanded;
     let is_file_form_shape = is_file_form_shape(stmt, schema);
 
     // `ON CONFLICT ...`（SQL-20・TASK-193、Issue #872）は判別規則より前に分岐
@@ -5283,6 +5371,9 @@ fn bind_upsert_assignments(
             (_, InsertLiteral::SequenceCall { .. }) => {
                 return Err(reject_sequence_call_literal());
             }
+            (_, InsertLiteral::Default) => {
+                return Err(reject_default_keyword_literal());
+            }
                     (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
                     }
@@ -5520,6 +5611,9 @@ fn bind_file_insert(
             }
             (_, InsertLiteral::SequenceCall { .. }) => {
                 return Err(reject_sequence_call_literal());
+            }
+            (_, InsertLiteral::Default) => {
+                return Err(reject_default_keyword_literal());
             }
             (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), InsertLiteral::String(s)) => {
                 bind_text_literal(&column.ty, s)?
