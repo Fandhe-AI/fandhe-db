@@ -9,6 +9,9 @@
 
 ### Breaking Changes
 
+- `WHERE` 省略の `UPDATE`／`DELETE`（Issue #1743・SQL-36）: `DELETE FROM t`・`UPDATE t SET ...` を受理する。
+  `validate_delete_statement`／`validate_update_form` が `42601` を返さなくなり、`where_predicates()` が空を返しうる。
+  単一行専用の入口（`validate_delete`・`validate_update`）・NoSQL 表層・恒真述語（`WHERE TRUE` 等）は不変。
 - 対象省略の `ON CONFLICT DO NOTHING`（Issue #1736・SQL-49）: `INSERT ... ON CONFLICT DO NOTHING` を受理し、行キー・
   PRIMARY KEY・UNIQUE 制約・UNIQUE 索引（式・部分を含む）のどれかに違反した行だけを飛ばす（`NOT NULL`・`CHECK`・`FOREIGN KEY`
   は従来どおりエラー）。公開 API の変更: `sql::allowlist::OnConflictClause::target` を `Vec<String>` から

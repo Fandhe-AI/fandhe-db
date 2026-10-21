@@ -3061,7 +3061,10 @@ pub fn bind_predicate_delete(
     // Issue #1526・SQL-41: `TRUE` 畳み込みで恒真になる形（`WHERE TRUE`・
     // `... OR TRUE` 等）も無条件 DML と同じく拒否する（fail-closed。`FALSE` は恒偽で
     // 0 行影響のため受理する）。
-    if metadata_filters.is_empty()
+    // SQL-36（Issue #1743）: `WHERE` 省略（述語列が空）だけはこの拒否から外す。
+    // 述語があって束縛後に空・恒真になる形は #1744 まで従来どおり拒否する。
+    if !stmt.where_predicates().is_empty()
+        && metadata_filters.is_empty()
         && expr_filters.is_empty()
         && or_filters
             .iter()
@@ -4809,7 +4812,10 @@ pub(crate) fn bind_predicate_update(
     // Issue #1526・SQL-41: `TRUE` 畳み込みで恒真になる形（`WHERE TRUE`・
     // `... OR TRUE` 等）も無条件 DML と同じく拒否する（fail-closed。`FALSE` は恒偽で
     // 0 行影響のため受理する）。
-    if metadata_filters.is_empty()
+    // SQL-36（Issue #1743）: `WHERE` 省略（述語列が空）だけはこの拒否から外す。
+    // 述語があって束縛後に空・恒真になる形は #1744 まで従来どおり拒否する。
+    if !predicate.where_predicates.is_empty()
+        && metadata_filters.is_empty()
         && expr_filters.is_empty()
         && or_filters
             .iter()
