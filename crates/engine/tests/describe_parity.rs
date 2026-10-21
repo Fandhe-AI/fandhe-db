@@ -63,6 +63,7 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         SqlOutcome::Returning(r) => Some(r.result.columns),
         SqlOutcome::SetSearchMode(_)
         | SqlOutcome::SetTimeZone
+        | SqlOutcome::SetSearchPath { .. }
         | SqlOutcome::Show(_)
         | SqlOutcome::CreateFunction { .. }
         | SqlOutcome::Insert(_)

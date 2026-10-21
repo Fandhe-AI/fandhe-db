@@ -767,6 +767,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::SetTimeZone => OutcomeResponse::Command {
             tag: "SET".to_string(),
         },
+        // TABLE-27・Issue #1715: `SET search_path`／`RESET search_path` は PG と同じ `SET`／`RESET` タグ。
+        SqlOutcome::SetSearchPath { reset } => OutcomeResponse::Command {
+            tag: if reset { "RESET" } else { "SET" }.to_string(),
+        },
         SqlOutcome::Show(result) => OutcomeResponse::Rows {
             result,
             shape: TagShape::Fixed("SHOW".to_string()),

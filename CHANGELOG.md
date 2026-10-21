@@ -9,6 +9,13 @@
 
 ### Breaking Changes
 
+- `search_path` の追加（Issue #1715・TABLE-27）: セッション変数 `search_path`（既定 `"$user", public`）の `SET`／`RESET`／`SHOW`
+  を受理する。実効 path に `public` が含まれないセッションでは、一時表以外の未修飾のテーブル参照が `42P01`、作成系 DDL の
+  作成先が `public` 以外になる文が `3F000`／`0A000` になる（既定の path の挙動は不変）。`"$user"` は handshake の username から
+  展開し、自分の username と同名の SCHEMA を持つテナントの未修飾 `CREATE TABLE` は `0A000`（テナント SCHEMA への作成は後続 Issue）。
+  公開 API は `Statement::SetSearchPath`・`ShowSearchPath`、`SqlOutcome::SetSearchPath`、`Token::QuotedDollarUser`、
+  `SqlSurfaceError::NoSchemaSelected`、`ValidatedCreateTable.public_qualified`（pub フィールド追加）、`sql::search_path` の追加。
+  BREAKING CHANGE: `Statement`・`SqlOutcome`・`Token`・`SqlSurfaceError` を網羅的に `match` するコードは variant の追従が必要。
 - GIN 相当索引の読み取り（Issue #2208・INDEX-8）: 広域取得で jsonb 列への `@>`・`?`・`?|`・`?&`（`jsonb_ops`）と
   `@>`・`@?`・`@@`（`jsonb_path_ops`）が GIN 相当索引のポスティングで候補を絞るようになった（候補は全走査と同じ可視性判定と
   WHERE 全体の再評価を通るため、結果の行・順序・`LIMIT`／`OFFSET` の数え方は不変）。`EXPLAIN` はこの形のときだけ

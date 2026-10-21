@@ -1434,6 +1434,8 @@ pub(crate) fn decode_bind_values_nullable(
             | Token::QuotedCollationName(s)
             | Token::StringLiteral(s)
             | Token::Number(s) => s.len(),
+            // `"$user"`（TABLE-27・Issue #1715）は固定 7 バイト。
+            Token::QuotedDollarUser => 7,
             Token::QualifiedIdent { qualifier, name } => {
                 qualifier.len().checked_add(name.len()).ok_or_else(|| {
                     SqlSurfaceError::payload_too_large(

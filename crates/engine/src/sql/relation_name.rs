@@ -63,35 +63,66 @@ struct Level {
     from_ok: bool,
     /// カンマの直後が表参照になるリスト（`FROM a, b`・`TRUNCATE a, b`）の中。
     list: bool,
+    /// `SELECT` の射影リスト内（`SELECT` 後〜この段の `FROM` 前）。射影の識別子（列 `"update"` と
+    /// その別名 `AS x` 等）は構文語に見えても表参照を導かない。
+    in_proj: bool,
 }
 
 fn ident_is(tok: Option<&Token>, word: &str) -> bool {
     matches!(tok, Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word))
 }
 
-/// `tokens` のテーブル参照位置にある `schema.name` を解決して `Token::Ident(name)` へ置き換える。
-/// `public.` は裸の名前へ、テナントの SCHEMA は内部キー（`#<id>.<name>`）へ置き換える。戻り値の
-/// [`Rewritten::public_names`] は `public.` で修飾されていた名前（一時表との衝突検査用）。
-/// 修飾が無ければ何もしない。`resolver` が `None`（テナント不明の入口）なら、public・組み込み
-/// SCHEMA 以外は `3F000`。
-pub(crate) fn rewrite_relation_names(
-    tokens: &mut [Token],
-    resolver: Option<SchemaResolver<'_>>,
-) -> Result<Rewritten, SqlSurfaceError> {
-    rewrite_sequence_name_literals(tokens, resolver)?;
-    if !tokens
-        .iter()
-        .any(|t| matches!(t, Token::QualifiedIdent { .. }))
-    {
-        return Ok(Rewritten::default());
+/// 識別子として表名になりうるトークンか（修飾あり・なし・二重引用符付きの `NULL`／`true`／`false` 等。
+/// 引用付きは構文解析が識別子位置で `Ident` へ戻して受理するため、参照ゲートも同じ範囲を見る）。
+pub(crate) fn is_ident_like(tok: &Token) -> bool {
+    matches!(
+        tok,
+        Token::QualifiedIdent { .. }
+            | Token::Ident(_)
+            | Token::QuotedNull(_)
+            | Token::QuotedBoolWord(_)
+    )
+}
+
+/// 未修飾の識別子トークン（`Ident`・引用付き）の名前。`QualifiedIdent` は `None`。
+pub(crate) fn unqualified_ident_name(tok: &Token) -> Option<&str> {
+    match tok {
+        Token::Ident(s) | Token::QuotedNull(s) | Token::QuotedBoolWord(s) => Some(s.as_str()),
+        _ => None,
     }
-    let head = tokens.get(..4).unwrap_or(&*tokens);
+}
+
+/// テーブル参照位置にあるトークン 1 件（[`relation_positions`] の戻り値の要素）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RelPos {
+    /// `tokens` 内の添字。
+    pub index: usize,
+    /// 作成対象名（`CREATE TABLE`／`CREATE [OR REPLACE] VIEW`／`CREATE SEQUENCE` の名前）の位置か。
+    pub create_name: bool,
+    /// MATERIALIZED VIEW の名前位置か（SCHEMA 配下への配置は未対応で `0A000`。Issue #1717）。
+    pub matview: bool,
+}
+
+/// [`relation_positions`] の結果。
+pub(crate) struct RelationWalk {
+    /// テーブル参照位置にある `Token::Ident`／`Token::QualifiedIdent`（出現順）。
+    pub positions: Vec<RelPos>,
+    /// テーブル参照位置ではない `Token::QualifiedIdent`（列修飾 `x.id` 等）が残っているか。
+    pub residual_column_qualifier: bool,
+}
+
+/// `tokens` を走査して、テーブル参照位置にある識別子（修飾あり・なし）の添字を集める。位置判定は
+/// 修飾名の解決（[`rewrite_relation_names`]）と `search_path` の未修飾名ゲート
+/// （`sql::search_path`。TABLE-27・Issue #1715）が共有する唯一の実装で、トークン列は書き換えない。
+/// 未修飾の `Token::Ident` には構文語・表関数名などの偽陽性があり得るため、呼び出し側が除外する。
+pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
+    let head = tokens.get(..4).unwrap_or(tokens);
     let head_create = ident_is(tokens.first(), "CREATE");
     let head_drop = ident_is(tokens.first(), "DROP");
     // 文頭付近（先頭 6 トークン）に現れる最初のオブジェクト種別語（`CREATE UNIQUE INDEX`・
     // `CREATE OR REPLACE VIEW`・`DROP SEQUENCE` 等）。`MATERIALIZED VIEW` は種別が VIEW になるため
     // `head_matview` で区別する。
-    let head6 = tokens.get(..6).unwrap_or(&*tokens);
+    let head6 = tokens.get(..6).unwrap_or(tokens);
     let ddl_obj: Option<&'static str> = head6.iter().find_map(|t| {
         ["TABLE", "VIEW", "INDEX", "SEQUENCE"]
             .into_iter()
@@ -102,8 +133,6 @@ pub(crate) fn rewrite_relation_names(
         .iter()
         .any(|k| ident_is(tokens.first(), k));
     let create_table = head_create && head.iter().any(|t| ident_is(Some(t), "TABLE"));
-    // `CREATE [GLOBAL|LOCAL] {TEMP|TEMPORARY} TABLE`（一時表 DDL として受理される全形）。
-    let create_temp_table = crate::sql::allowlist::is_create_temp_table_statement(tokens);
     let table_head = head.iter().any(|t| ident_is(Some(t), "TABLE"));
     // `TABLE` が表参照を導くのは DDL 文の先頭付近だけ（`SELECT table, t.id` の識別子 `table` と
     // 区別する）。
@@ -112,11 +141,11 @@ pub(crate) fn rewrite_relation_names(
         .any(|k| ident_is(tokens.first(), k));
     let mut index_on_pending = head_create && head.iter().any(|t| ident_is(Some(t), "INDEX"));
 
-    let cte_names = collect_cte_names(tokens);
     let mut levels: Vec<Level> = vec![Level::default()];
-    let mut public_names: Vec<String> = Vec::new();
-    let mut deferred: Option<SqlSurfaceError> = None;
-    let mut residual_column_qualifier = false;
+    let mut out = RelationWalk {
+        positions: Vec::new(),
+        residual_column_qualifier: false,
+    };
 
     for i in 0..tokens.len() {
         let prev = i.checked_sub(1).and_then(|p| tokens.get(p));
@@ -153,12 +182,16 @@ pub(crate) fn rewrite_relation_names(
                 }
                 continue;
             }
-            Token::Keyword(Keyword::Select) => next.from_ok = true,
+            Token::Keyword(Keyword::Select) => {
+                next.from_ok = true;
+                next.in_proj = true;
+            }
+            Token::Keyword(Keyword::From) if !ident_is(prev, "DISTINCT") => next.in_proj = false,
             Token::Keyword(Keyword::Where | Keyword::Order | Keyword::Limit) => next.list = false,
             Token::Ident(w) => {
                 if w.eq_ignore_ascii_case("UPDATE") || w.eq_ignore_ascii_case("DELETE") {
                     next.from_ok = true;
-                } else if w.eq_ignore_ascii_case("TRUNCATE")
+                } else if (w.eq_ignore_ascii_case("TRUNCATE") && i == 0)
                     || (w.eq_ignore_ascii_case("TABLE") && ddl_head && i < 4)
                     || (head_drop
                         && i < 4
@@ -166,82 +199,149 @@ pub(crate) fn rewrite_relation_names(
                             .iter()
                             .any(|k| w.eq_ignore_ascii_case(k)))
                 {
+                    // `TRUNCATE` は文頭のときだけ表参照リストを開く（`SELECT 1 AS truncate, id`
+                    // の別名を構文語と取り違えない）。
                     next.list = true;
-                } else if [
-                    "GROUP",
-                    "HAVING",
-                    "UNION",
-                    "INTERSECT",
-                    "EXCEPT",
-                    "WINDOW",
-                    "OFFSET",
-                    "FETCH",
-                    "RETURNING",
-                    "CONFLICT",
-                ]
-                .iter()
-                .any(|k| w.eq_ignore_ascii_case(k))
+                } else if !ident_is(prev, "AS")
+                    && [
+                        "GROUP",
+                        "HAVING",
+                        "UNION",
+                        "INTERSECT",
+                        "EXCEPT",
+                        "WINDOW",
+                        "OFFSET",
+                        "FETCH",
+                        "RETURNING",
+                        "CONFLICT",
+                    ]
+                    .iter()
+                    .any(|k| w.eq_ignore_ascii_case(k))
                 {
                     next.list = false;
                 }
             }
-            Token::QualifiedIdent { .. } => {
-                relation_pos = match prev {
-                    Some(Token::Keyword(Keyword::From)) => from_rel,
-                    Some(Token::Ident(w)) => {
-                        let is = |k: &str| w.eq_ignore_ascii_case(k);
-                        if is("TABLE") {
-                            is_create_name = create_table;
-                            ddl_head && i <= 4
-                        } else if is("VIEW") {
-                            // `CREATE [OR REPLACE] VIEW`・`DROP VIEW`・`ALTER VIEW`・
-                            // `{CREATE|DROP|ALTER|REFRESH} MATERIALIZED VIEW` の名前位置。
-                            if head_matview {
-                                kind = ObjKind::Matview;
-                            }
-                            is_create_name = head_create;
-                            obj_ddl_head && ddl_obj == Some("VIEW") && i <= 5
-                        } else if is("SEQUENCE") {
-                            is_create_name = head_create;
-                            obj_ddl_head && ddl_obj == Some("SEQUENCE") && i <= 3
-                        } else if is("INDEX") {
-                            // 索引名の修飾は `DROP INDEX` だけ受け付ける（`CREATE INDEX s.i` は PG と同じく
-                            // 構文エラー。索引は対象表の SCHEMA に置かれる）。
-                            head_drop && ddl_obj == Some("INDEX") && i <= 2
-                        } else if is("CONCURRENTLY") {
-                            head_drop && ddl_obj == Some("INDEX") && i <= 3
-                        } else if is("EXISTS") {
-                            let if_prefixed = ident_is(prev2, "IF") || ident_is(prev2, "NOT");
-                            if if_prefixed && head_matview && ddl_obj == Some("VIEW") {
-                                kind = ObjKind::Matview;
-                            }
-                            let ok = if_prefixed
-                                && match ddl_obj {
-                                    Some("TABLE") => table_head,
-                                    Some("VIEW" | "SEQUENCE") => obj_ddl_head,
-                                    Some("INDEX") => head_drop,
-                                    _ => false,
-                                };
-                            is_create_name = ok && create_table;
-                            ok
-                        } else if is("COPY") {
-                            i == 1
-                        } else if is("ON") {
-                            index_on_pending
-                        } else {
-                            is("JOIN")
-                                || is("INTO")
-                                || is("TRUNCATE")
-                                || is("UPDATE")
-                                || is("ONLY")
-                                || is("REFERENCES")
-                        }
-                    }
-                    Some(Token::Punct(',')) => level.list,
-                    _ => false,
-                };
-            }
             _ => {}
+        }
+        // 直前の識別子（`"update"` 等の引用付き列名は構文語と同じ `Ident` になる）が式の位置にある
+        // ときは、表参照を導く語ではなく式の一部なので表参照位置にしない。
+        let prev3 = i.checked_sub(3).and_then(|p| tokens.get(p));
+        let expr_ctx = match prev2 {
+            Some(Token::Keyword(
+                Keyword::Where
+                | Keyword::And
+                | Keyword::Select
+                | Keyword::Order
+                | Keyword::By
+                | Keyword::Limit,
+            )) => true,
+            Some(Token::Punct(c)) => match c {
+                '(' => {
+                    !(ident_is(prev, "UPDATE")
+                        && (ident_is(prev3, "AS") || ident_is(prev3, "MATERIALIZED")))
+                }
+                ',' | '=' | '+' | '-' | '/' | '>' | '<' | '%' | '*' | '#' | '[' | ':' => true,
+                _ => false,
+            },
+            Some(Token::Le | Token::Ge | Token::Concat | Token::TypeCast | Token::DistanceOp) => {
+                true
+            }
+            // `IF NOT EXISTS t`・`COMMENT ON TABLE t` の `NOT`／`ON` は表参照の文脈。
+            Some(Token::Ident(w))
+                if (w.eq_ignore_ascii_case("NOT") && ident_is(prev, "EXISTS"))
+                    || (w.eq_ignore_ascii_case("ON") && ident_is(prev, "TABLE")) =>
+            {
+                false
+            }
+            Some(Token::Ident(w)) => [
+                "AND", "OR", "NOT", "ON", "HAVING", "WHEN", "THEN", "ELSE", "IS", "IN", "LIKE",
+                "BETWEEN", "CASE", "BY",
+            ]
+            .iter()
+            .any(|k| w.eq_ignore_ascii_case(k)),
+            _ => false,
+        };
+        let prev_is_word = matches!(prev, Some(Token::Ident(_)));
+        // 関係参照を導入する語（`ONLY`・`JOIN`・`INTO`・`REFERENCES`・索引 DDL の `ON`）の直後は、
+        // 式の文脈判定（`expr_ctx`）で落とさない。直前の `prev2` が式の語に見えても、その語の
+        // 直後にこれらの導入語が構文上現れる形は無く、`prev2` の側が引用符付きの識別子（表名・
+        // 別名・索引名）か、導入語が本物の構文語である。判定に迷う位置は関係参照として扱う
+        // （fail-closed。`search_path` の参照ゲートを素通りさせない。Issue #1715）。
+        //  - `TRUNCATE a, ONLY b`・`FROM a, ONLY b`: カンマの直後でも、表参照リストの中なら `ONLY` は構文語
+        //  - `FROM "in" JOIN b`・`CREATE INDEX is ON t`: 直前が式の語に見える引用付き識別子
+        let introducer_keeps_relation = match prev {
+            Some(Token::Ident(w)) => {
+                let is = |k: &str| w.eq_ignore_ascii_case(k);
+                let after_comma = matches!(prev2, Some(Token::Punct(',')));
+                let after_word = matches!(prev2, Some(Token::Ident(_)));
+                (is("ONLY") && after_comma && level.list)
+                    || (after_word
+                        && ((is("ON") && index_on_pending)
+                            || is("INTO")
+                            || is("REFERENCES")
+                            || ((is("JOIN") || is("ONLY")) && level.list)))
+            }
+            _ => false,
+        };
+        if is_ident_like(cur)
+            && !level.in_proj
+            && !(prev_is_word && expr_ctx && !introducer_keeps_relation)
+        {
+            relation_pos = match prev {
+                Some(Token::Keyword(Keyword::From)) => from_rel,
+                Some(Token::Ident(w)) => {
+                    let is = |k: &str| w.eq_ignore_ascii_case(k);
+                    if is("TABLE") {
+                        is_create_name = create_table;
+                        ddl_head && i <= 4
+                    } else if is("VIEW") {
+                        // `CREATE [OR REPLACE] VIEW`・`DROP VIEW`・`ALTER VIEW`・
+                        // `{CREATE|DROP|ALTER|REFRESH} MATERIALIZED VIEW` の名前位置。
+                        if head_matview {
+                            kind = ObjKind::Matview;
+                        }
+                        is_create_name = head_create;
+                        obj_ddl_head && ddl_obj == Some("VIEW") && i <= 5
+                    } else if is("SEQUENCE") {
+                        is_create_name = head_create;
+                        obj_ddl_head && ddl_obj == Some("SEQUENCE") && i <= 3
+                    } else if is("INDEX") {
+                        // 索引名の修飾は `DROP INDEX` だけ受け付ける（`CREATE INDEX s.i` は PG と同じく
+                        // 構文エラー。索引は対象表の SCHEMA に置かれる）。
+                        head_drop && ddl_obj == Some("INDEX") && i <= 2
+                    } else if is("CONCURRENTLY") {
+                        head_drop && ddl_obj == Some("INDEX") && i <= 3
+                    } else if is("EXISTS") {
+                        let if_prefixed = ident_is(prev2, "IF") || ident_is(prev2, "NOT");
+                        if if_prefixed && head_matview && ddl_obj == Some("VIEW") {
+                            kind = ObjKind::Matview;
+                        }
+                        let ok = if_prefixed
+                            && match ddl_obj {
+                                Some("TABLE") => table_head,
+                                Some("VIEW" | "SEQUENCE") => obj_ddl_head,
+                                Some("INDEX") => head_drop,
+                                _ => false,
+                            };
+                        // 作成対象名（`CREATE TABLE|VIEW|SEQUENCE IF NOT EXISTS <名前>`）。
+                        is_create_name = ok && head_create && ddl_obj != Some("INDEX");
+                        ok
+                    } else if is("COPY") {
+                        i == 1
+                    } else if is("ON") {
+                        index_on_pending
+                    } else {
+                        is("JOIN")
+                            || is("INTO")
+                            || is("TRUNCATE")
+                            || is("UPDATE")
+                            || is("ONLY")
+                            || is("REFERENCES")
+                    }
+                }
+                Some(Token::Punct(',')) => level.list,
+                _ => false,
+            };
         }
         // 索引 DDL の最初の `ON` だけが表参照を導く（JOIN の `ON <条件>` と区別する）。
         if ident_is(prev, "ON") {
@@ -250,29 +350,132 @@ pub(crate) fn rewrite_relation_names(
         if let Some(l) = levels.last_mut() {
             *l = next;
         }
-        let Token::QualifiedIdent { qualifier, name } = cur else {
+        match cur {
+            Token::QualifiedIdent { .. } if !relation_pos => out.residual_column_qualifier = true,
+            t if relation_pos && is_ident_like(t) => {
+                out.positions.push(RelPos {
+                    index: i,
+                    create_name: is_create_name,
+                    matview: kind == ObjKind::Matview,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// [`rewrite_relation_names_full`] の結果。
+pub(crate) struct RewriteInfo {
+    /// `public.` で修飾されていた表名（一時表との衝突検査用）。
+    pub names: Vec<String>,
+    /// 修飾を外した（`public.` を裸の名前へ、テナントの SCHEMA を内部キーへ置き換えた）トークンの添字。
+    /// 準備済み文が未修飾名の `search_path` ゲートから除外するために使う（置換は 1 対 1 なので位置は
+    /// 保たれる。TABLE-27・Issue #1715）。
+    pub positions: Vec<usize>,
+    /// `CREATE TABLE` の作成対象名が `public.` で明示修飾されていたか。
+    pub create_public: bool,
+}
+
+/// `tokens` のテーブル参照位置にある `schema.name` を解決して `Token::Ident(name)` へ置き換える。
+/// `public.` は裸の名前へ、テナントの SCHEMA は内部キー（`#<id>.<name>`）へ置き換える。戻り値の
+/// [`Rewritten::public_names`] は `public.` で修飾されていた名前（一時表との衝突検査用）。
+/// 修飾が無ければ何もしない。`resolver` が `None`（テナント不明の入口）なら、public・組み込み
+/// SCHEMA 以外は `3F000`。
+pub(crate) fn rewrite_relation_names(
+    tokens: &mut [Token],
+    resolver: Option<SchemaResolver<'_>>,
+) -> Result<Rewritten, SqlSurfaceError> {
+    Ok(Rewritten {
+        public_names: rewrite_relation_names_full(tokens, resolver)?.names,
+    })
+}
+
+/// [`rewrite_relation_names`] の位置情報つき版。
+pub(crate) fn rewrite_relation_names_full(
+    tokens: &mut [Token],
+    resolver: Option<SchemaResolver<'_>>,
+) -> Result<RewriteInfo, SqlSurfaceError> {
+    rewrite_sequence_name_literals(tokens, resolver)?;
+    let mut info = RewriteInfo {
+        names: Vec::new(),
+        positions: Vec::new(),
+        create_public: false,
+    };
+    if !tokens
+        .iter()
+        .any(|t| matches!(t, Token::QualifiedIdent { .. }))
+    {
+        return Ok(info);
+    }
+    // 一時表 DDL として受理される全形（`CREATE [GLOBAL|LOCAL] {TEMP|TEMPORARY} TABLE`）。
+    let create_temp_table = crate::sql::allowlist::is_create_temp_table_statement(tokens);
+    let cte_names = collect_cte_names(tokens);
+    let walk = relation_positions(tokens);
+    let mut residual_column_qualifier = false;
+    let mut deferred: Option<SqlSurfaceError> = None;
+
+    // 解決の対象: 表参照位置に加え、関数名の位置（`CREATE FUNCTION s.f(`・式中の `s.f(x)`）にある
+    // テナントの SCHEMA 修飾（UDF の登録キー・呼び出しキー。Issue #1717）。`public.`・組み込み
+    // SCHEMA・`pg_temp` の修飾は、裸の名前へ化けて組み込み関数に当たる経路を作らないよう従来どおり
+    // 解決しない（構文エラーのまま）。出現順に処理して、最初の解決エラーを保留する。
+    struct Target {
+        index: usize,
+        create_name: bool,
+        matview: bool,
+        function_pos: bool,
+    }
+    let mut targets: Vec<Target> = walk
+        .positions
+        .iter()
+        .map(|p| Target {
+            index: p.index,
+            create_name: p.create_name,
+            matview: p.matview,
+            function_pos: false,
+        })
+        .collect();
+    for (i, t) in tokens.iter().enumerate() {
+        let Token::QualifiedIdent { qualifier, .. } = t else {
             continue;
         };
-        // 関数名の位置（`CREATE FUNCTION s.f(`・式中の `s.f(x)`）。テナントの SCHEMA で修飾された
-        // ものだけを内部キーへ解決する（UDF の登録キー・呼び出しキー。Issue #1717）。`public.`・
-        // 組み込み SCHEMA・`pg_temp` の修飾は、裸の名前へ化けて組み込み関数に当たる経路を作らない
-        // よう従来どおり解決しない（構文エラーのまま）。
-        let function_pos = !relation_pos
-            && resolver.is_some()
+        if walk.positions.iter().any(|p| p.index == i) {
+            continue;
+        }
+        let function_pos = resolver.is_some()
             && matches!(tokens.get(i + 1), Some(Token::Punct('(')))
             && !qualifier.eq_ignore_ascii_case("public")
             && !is_builtin_schema_name(qualifier)
             && !qualifier.eq_ignore_ascii_case("pg_temp");
-        if !relation_pos && !function_pos {
+        if function_pos {
+            targets.push(Target {
+                index: i,
+                create_name: false,
+                matview: false,
+                function_pos: true,
+            });
+        } else {
             residual_column_qualifier = true;
-            continue;
         }
+    }
+    targets.sort_by_key(|t| t.index);
+
+    for pos in &targets {
+        let i = pos.index;
+        let Some(Token::QualifiedIdent { qualifier, name }) = tokens.get(i) else {
+            continue;
+        };
         let (qualifier, name) = (qualifier.clone(), name.clone());
+        let kind = if pos.matview {
+            ObjKind::Matview
+        } else {
+            ObjKind::Plain
+        };
         match resolve(
             &qualifier,
             &name,
             // 一時表の作成対象名だけが対象（`REFERENCES public.u` 等の参照側は許可する）。
-            create_temp_table && is_create_name,
+            create_temp_table && pos.create_name,
             kind,
             resolver,
         ) {
@@ -289,7 +492,9 @@ pub(crate) fn rewrite_relation_names(
                         "qualified relation name collides with a syntax word",
                     ));
                 }
-                public_names.push(name.clone());
+                info.names.push(name.clone());
+                info.positions.push(i);
+                info.create_public |= pos.create_name;
                 if let Some(slot) = tokens.get_mut(i) {
                     *slot = Token::Ident(name);
                 }
@@ -302,13 +507,14 @@ pub(crate) fn rewrite_relation_names(
                         "qualified relation name collides with a syntax word",
                     ));
                 }
+                info.positions.push(i);
                 if let Some(slot) = tokens.get_mut(i) {
                     *slot = Token::Ident(key);
                 }
             }
             // 関数名の位置で SCHEMA が見つからない場合は、`x.lower(col)` のような関数呼び出し形の
             // 修飾を従来どおり構文エラー（`42601`。SQL-44 の範囲外の形）のままにする。
-            Err(SqlSurfaceError::InvalidSchemaName { .. }) if function_pos => {
+            Err(SqlSurfaceError::InvalidSchemaName { .. }) if pos.function_pos => {
                 residual_column_qualifier = true;
             }
             Err(e) => {
@@ -320,9 +526,9 @@ pub(crate) fn rewrite_relation_names(
     }
     match deferred {
         // 列修飾が残る文は従来の `42601`（パーサー判定）を保つため、保留した解決エラーは返さない。
-        Some(_) if residual_column_qualifier => Ok(Rewritten { public_names }),
+        Some(_) if residual_column_qualifier => Ok(info),
         Some(e) => Err(e),
-        None => Ok(Rewritten { public_names }),
+        None => Ok(info),
     }
 }
 
@@ -383,7 +589,7 @@ fn rewrite_sequence_name_literals(
 /// [, name ..]*` の構造に沿って定義名だけを拾う（表別名・列別名・`CAST(.. AS ..)` の `AS` は
 /// 対象外）。`WITH` を含まない文では空。構造が想定外の `WITH` はそこで打ち切る（その文は後段の
 /// パーサーが拒否する）。
-fn collect_cte_names(tokens: &[Token]) -> Vec<String> {
+pub(crate) fn collect_cte_names(tokens: &[Token]) -> Vec<String> {
     let mut out = Vec::new();
     for (start, t) in tokens.iter().enumerate() {
         if !ident_is(Some(t), "WITH") {
@@ -430,6 +636,96 @@ fn collect_cte_names(tokens: &[Token]) -> Vec<String> {
     out
 }
 
+/// CTE 1 件の可視範囲（[`collect_cte_scopes`] の要素）。
+#[derive(Debug, Clone)]
+pub(crate) struct CteScope {
+    /// CTE 名（利用者が書いたとおり）。
+    pub name: String,
+    /// 可視範囲の開始添字（自身の本文の `)` の直後。自身の本文と先行する CTE の本文は含まない）。
+    pub visible_from: usize,
+    /// 可視範囲の終了添字（排他。`WITH` を含む括弧の `)`、無ければ末尾）。
+    pub visible_to: usize,
+}
+
+impl CteScope {
+    /// 添字 `index` の位置から、この CTE の名前が見えるか。
+    pub(crate) fn covers(&self, index: usize) -> bool {
+        self.visible_from <= index && index < self.visible_to
+    }
+}
+
+/// [`collect_cte_names`] と同じ構造で CTE 定義を拾い、各 CTE の可視範囲を返す。非再帰 CTE は自身の
+/// 本文からは見えず（同名の実リレーションへ解決される。`sql::cte` の契約）、後続の CTE の本文と主
+/// クエリから見える。`search_path` の参照ゲートが「参照位置ごとに実際に可視な CTE だけ」を除外するために使う。
+pub(crate) fn collect_cte_scopes(tokens: &[Token]) -> Vec<CteScope> {
+    let mut out = Vec::new();
+    for (start, t) in tokens.iter().enumerate() {
+        if !ident_is(Some(t), "WITH") {
+            continue;
+        }
+        let scope_end = enclosing_scope_end(tokens, start);
+        let mut j = start + 1;
+        if ident_is(tokens.get(j), "RECURSIVE") {
+            j += 1;
+        }
+        while let Some(name) = tokens.get(j).and_then(unqualified_ident_name) {
+            j += 1;
+            if matches!(tokens.get(j), Some(Token::Punct('('))) {
+                match skip_group(tokens, j) {
+                    Some(next) => j = next,
+                    None => break,
+                }
+            }
+            if !ident_is(tokens.get(j), "AS") {
+                break;
+            }
+            j += 1;
+            if ident_is(tokens.get(j), "NOT") {
+                j += 1;
+            }
+            if ident_is(tokens.get(j), "MATERIALIZED") {
+                j += 1;
+            }
+            if !matches!(tokens.get(j), Some(Token::Punct('('))) {
+                break;
+            }
+            let Some(after) = skip_group(tokens, j) else {
+                break;
+            };
+            j = after;
+            out.push(CteScope {
+                name: name.to_string(),
+                visible_from: after,
+                visible_to: scope_end,
+            });
+            if matches!(tokens.get(j), Some(Token::Punct(','))) {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// `tokens[start]` を含む括弧の閉じ `)` の添字（無ければ末尾）。
+fn enclosing_scope_end(tokens: &[Token], start: usize) -> usize {
+    let mut depth = 0usize;
+    for k in start..tokens.len() {
+        match tokens.get(k) {
+            Some(Token::Punct('(')) => depth += 1,
+            Some(Token::Punct(')')) => {
+                if depth == 0 {
+                    return k;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    tokens.len()
+}
+
 /// `tokens[open]` の `(` に対応する `)` の次の添字を返す（対応が無ければ `None`）。
 fn skip_group(tokens: &[Token], open: usize) -> Option<usize> {
     let mut depth = 0usize;
@@ -451,7 +747,7 @@ fn skip_group(tokens: &[Token], open: usize) -> Option<usize> {
 /// 解決後の名前を裸の `Token::Ident` に置き換えると、後段の構文解析が構文語として
 /// 再解釈しうるか（`DROP TABLE public.if EXISTS x` の `if` 等）。予約語トークンになる語、
 /// または文脈依存の構文語に一致する名前は置き換えず拒否する（fail-closed）。
-fn collides_with_syntax_word(name: &str) -> bool {
+pub(crate) fn collides_with_syntax_word(name: &str) -> bool {
     const SYNTAX_WORDS: &[&str] = &[
         "IF",
         "NOT",
@@ -671,6 +967,17 @@ mod tests {
     }
 
     #[test]
+    fn quoted_keyword_column_in_expression_is_not_a_relation_position() {
+        let t = tokenize("SELECT id FROM public.t WHERE \"update\" IS NULL LIMIT 5").expect("lex");
+        let walk = relation_positions(&t);
+        assert_eq!(walk.positions.len(), 1);
+        assert!(matches!(
+            t.get(walk.positions[0].index),
+            Some(Token::QualifiedIdent { .. })
+        ));
+    }
+
+    #[test]
     fn public_is_rewritten_in_relation_positions() {
         same("SELECT * FROM public.t", "SELECT * FROM t");
         same("SELECT * FROM PUBLIC.t LIMIT 1", "SELECT * FROM t LIMIT 1");
@@ -687,6 +994,8 @@ mod tests {
         same("UPDATE public.t SET a = 1", "UPDATE t SET a = 1");
         same("DELETE FROM public.t", "DELETE FROM t");
         same("TRUNCATE public.a, public.b", "TRUNCATE a, b");
+        // カンマに続く `ONLY` の対象表（式の文脈と取り違えない）。
+        same("TRUNCATE public.a, ONLY public.b", "TRUNCATE a, ONLY b");
         same("DROP TABLE IF EXISTS public.t", "DROP TABLE IF EXISTS t");
         same(
             "CREATE TABLE public.t (id TEXT)",

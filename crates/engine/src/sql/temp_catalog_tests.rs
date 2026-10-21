@@ -444,3 +444,19 @@ fn table_44_quoted_null_temp_name_never_touches_the_persistent_table() {
     )
     .is_ok());
 }
+
+/// `SET`／`RESET`／`SHOW search_path` の値は関係名ではないため一時表参照と判定しない（Issue #1715）。
+#[test]
+fn search_path_statements_do_not_reference_temp() {
+    let mut cat = SessionTempCatalog::default();
+    cat.register(schema("tmp", &["x"]), TempOnCommit::PreserveRows, 4)
+        .expect("register");
+    for sql in [
+        "SET search_path = tmp",
+        "SET SESSION search_path TO tmp, public",
+        "SHOW search_path",
+    ] {
+        let toks = crate::sql::lexer::tokenize_marked(sql).expect("lex");
+        assert!(!tokens_reference_temp(&toks, &cat), "{sql}");
+    }
+}

@@ -191,7 +191,9 @@ enum TxnState<'e> {
     /// `expired` は、持続時間の上限超過（[`SessionTransaction::release_if_expired`]）
     /// で `Failed` へ遷移し、まだ `54000` をクライアントへ報告していないことを表す。
     Failed {
-        session_at_begin: SessionState,
+        /// 巻き戻し用の `BEGIN` 時点のセッション。`SessionState` が育ったため `Active` と同程度の大きさに
+        /// 揃えるよう `Box` で持つ（enum の variant 間のサイズ差を抑える）。
+        session_at_begin: Box<SessionState>,
         expired: bool,
     },
 }
@@ -571,7 +573,7 @@ impl<'e> SessionTransaction<'e> {
                     // `write_txn` を drop（abort）し、内包する permit を解放する。
                     drop(write_txn);
                     self.state = TxnState::Failed {
-                        session_at_begin,
+                        session_at_begin: Box::new(session_at_begin),
                         expired: false,
                     };
                     return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
@@ -628,7 +630,7 @@ impl<'e> SessionTransaction<'e> {
             TxnState::Failed {
                 session_at_begin, ..
             } => {
-                *session = session_at_begin;
+                *session = *session_at_begin;
                 self.state = TxnState::Idle;
                 Ok(())
             }
@@ -811,7 +813,7 @@ impl<'e> SessionTransaction<'e> {
         if let TxnState::Active(active) = std::mem::replace(&mut self.state, TxnState::Idle) {
             // `write_txn` は drop（abort）され、`permit` はその後に解放される。
             self.state = TxnState::Failed {
-                session_at_begin: active.session_at_begin,
+                session_at_begin: Box::new(active.session_at_begin),
                 expired: false,
             };
         }
@@ -838,7 +840,7 @@ impl<'e> SessionTransaction<'e> {
         }
         if let TxnState::Active(active) = std::mem::replace(&mut self.state, TxnState::Idle) {
             self.state = TxnState::Failed {
-                session_at_begin: active.session_at_begin,
+                session_at_begin: Box::new(active.session_at_begin),
                 expired: true,
             };
         }

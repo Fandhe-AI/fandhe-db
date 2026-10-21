@@ -1717,6 +1717,15 @@ fn show_time_zone_columns() -> Vec<crate::sql::exec::ColumnMeta> {
     }]
 }
 
+/// `SHOW search_path` の結果列（列名 `search_path`・text の 1 列。実行と Describe が共有する。
+/// TABLE-27・Issue #1715）。
+fn show_search_path_columns() -> Vec<crate::sql::exec::ColumnMeta> {
+    vec![crate::sql::exec::ColumnMeta::Computed {
+        name: "search_path".to_string(),
+        ty: Some(crate::catalog::ColumnType::Text),
+    }]
+}
+
 impl ParsedSql {
     /// セッションの一時カタログに対する振り分けの包み（[`ParsedSql::SessionRouted`]）を外した、
     /// 文そのものの構文形を返す。包まれていなければ自分自身。wire-server が、実行した文の種類
@@ -2121,13 +2130,31 @@ pub struct PreparedSql {
     /// Parse 時に `public.` 修飾を外した表名（TABLE-27・Issue #1714）。Parse 後に同名の一時表が
     /// 作られると未修飾名が一時表へ解決されるため、Bind・Describe の段で一時カタログと再照合する。
     public_qualified: Vec<String>,
+    /// Parse 時に `public.` 修飾を外したトークンの添字（TABLE-27・Issue #1715）。`search_path` から
+    /// `public` が外れたセッションの未修飾名ゲートが、これらの位置を除いて `tokens` を走査する
+    /// （置換は 1 対 1 のため位置は保たれる）。
+    qualified_positions: Vec<usize>,
+    /// `CREATE TABLE` の作成対象名が `public.` で明示修飾されていたか（TABLE-27・Issue #1715）。
+    /// 再 parse した `CREATE TABLE` へ戻し、作成先の判定（`search_path`）を飛ばすために使う。
+    create_public: bool,
 }
 
 /// 解決済みトークンから再 parse した `DROP TABLE` に、Parse 時に外した `public.` 修飾の
 /// 表名を戻す（TABLE-27・Issue #1714）。実行時の粗いゲートが同名の一時表との衝突を拒否する。
-fn attach_public_qualified(parsed: &mut ParsedSql, public_qualified: &[String]) {
-    if let ParsedSql::DropTable(stmt) = parsed {
-        stmt.public_qualified = public_qualified.to_vec();
+/// `CREATE TABLE`・`CREATE [MATERIALIZED] VIEW`・`CREATE SEQUENCE` には作成対象名の `public.` 修飾の
+/// 有無を戻す（Issue #1715）。
+fn attach_public_qualified(
+    parsed: &mut ParsedSql,
+    public_qualified: &[String],
+    create_public: bool,
+) {
+    match parsed {
+        ParsedSql::DropTable(stmt) => stmt.public_qualified = public_qualified.to_vec(),
+        ParsedSql::CreateTable(stmt) => stmt.public_qualified = create_public,
+        ParsedSql::CreateView(stmt) => stmt.public_qualified = create_public,
+        ParsedSql::CreateMaterializedView(stmt) => stmt.public_qualified = create_public,
+        ParsedSql::CreateSequence(stmt) => stmt.public_qualified = create_public,
+        _ => {}
     }
 }
 
@@ -3624,6 +3651,14 @@ impl EngineCore {
                     "SET/SHOW TimeZone requires a session-aware entry point",
                 ))
             }
+            // TABLE-27・Issue #1715: `search_path` もセッション変数のため、セッションを持たない入口では
+            // 値の妥当性に関わらず一律 `42601`（TimeZone と同じ決定的な契約）。
+            crate::sql::allowlist::Statement::SetSearchPath { .. }
+            | crate::sql::allowlist::Statement::ShowSearchPath => {
+                Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "SET/SHOW search_path requires a session-aware entry point",
+                ))
+            }
             // TASK-79（SQL-9）: UDF 定義はセッションへ登録する statement のため、
             // セッションを持たないこのエントリポイントでは受理しない（`SET` と同じ
             // 「値の妥当性に関わらず一律 `42601`」の決定的な契約を踏襲する）。
@@ -3645,6 +3680,7 @@ impl EngineCore {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::SetTimeZone
+                    | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -3698,6 +3734,7 @@ impl EngineCore {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::SetTimeZone
+                    | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -3748,6 +3785,7 @@ impl EngineCore {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::SetTimeZone
+                    | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -3805,6 +3843,7 @@ impl EngineCore {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::SetTimeZone
+                    | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -3868,6 +3907,7 @@ impl EngineCore {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::SetTimeZone
+                    | crate::sql::SqlOutcome::SetSearchPath { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4139,6 +4179,32 @@ impl EngineCore {
         }
     }
 
+    /// 永続オブジェクトを作る DDL の作成先を `search_path` から判定する（TABLE-27・Issue #1715）。
+    /// DDL 権限ゲートの直後・既存名の判定より前に呼ぶ（`42501` → `3F000`／`0A000` → `42P07` の順）。
+    /// `explicit_public` は `public.` で明示修飾された作成（判定を飛ばして `public` へ作る）。
+    /// SCHEMA の照会は `(呼び出し元テナント, 名前)` の get だけで、他テナントの SCHEMA は存在しない名前と
+    /// 同じに扱われる。
+    fn require_creation_target(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        explicit_public: bool,
+        created_name: &str,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        // `schema.name` で明示修飾された作成（解決済みの内部キー `#<id>.<name>`。キーを作れるのは
+        // 名前解決器だけ）は作成先が文中で確定しているので、`search_path` による作成先判定を飛ばす。
+        if explicit_public || created_name.starts_with('#') {
+            return Ok(());
+        }
+        let probe = |schema: &str| {
+            self.storage
+                .schema_id(ctx.tenant_id(), schema)
+                .map(|id| id.is_some())
+                .map_err(crate::catalog::table_lookup_error)
+        };
+        crate::sql::search_path::creation_target(session, &probe).map(|_| ())
+    }
+
     /// [`Self::reclassify_write_to_view_error`] の文種別つき版（TABLE-43 (3)・Issue #1670）。
     /// `op` が `Some`（`INSERT`／`UPDATE`／`DELETE`）で対象がビューのとき、自動更新可能性を
     /// `sql::view_updatable` で判定し、自動更新不可なら `55000`
@@ -4292,6 +4358,28 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        // 実効 `search_path` に `public` が含まれる既定のセッションは何も足さない（追加コストなし）。
+        if !session.search_path_hides_public() {
+            return self.parse_tokens_gated_inner(tokens, session, resolver);
+        }
+        // TABLE-27・Issue #1715: `public` が見えないセッションでは、一時表以外の未修飾のテーブル参照を
+        // `42P01` にする。判定順は構文エラー `42601` → 参照ゲート `42P01` → その他の検証エラー。
+        let gate = crate::sql::search_path::check_unqualified_refs(session, &tokens, &[]);
+        let parsed = self.parse_tokens_gated_inner(tokens, session, resolver);
+        match (parsed, gate) {
+            (Err(e), _) if e.wire_code() == "42601" => Err(e),
+            (_, Err(gate_err)) => Err(gate_err),
+            (parsed, Ok(())) => parsed,
+        }
+    }
+
+    /// [`Self::parse_tokens_gated`] の一時カタログ対応の本体（`search_path` の参照ゲートを持たない）。
+    fn parse_tokens_gated_inner(
+        &self,
+        tokens: Vec<crate::sql::lexer::Token>,
+        session: &crate::sql::mode::SessionState,
+        resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         let temp = session.temp_tables();
         if temp.is_empty() {
             return self.parse_tokens_r(tokens, resolver);
@@ -4358,6 +4446,12 @@ impl EngineCore {
         // 変わっていなければ通す。変わっていれば陳腐化として `0A000`（TABLE-44・Issue #1684）。
         if let ParsedSql::SessionRouted(routed) = parsed {
             return routed.require_current(session);
+        }
+        // TABLE-27・Issue #1715: `public` が見えない `search_path` のセッションでは、セッション対応の
+        // parse／Bind を通っていない（名前の解決結果が現在の path のものと分からない）文を
+        // 一律 `0A000` で拒否する（関係名を引かない免除文を除く。fail-closed）。既定の path では何もしない。
+        if session.search_path_hides_public() && !temp_route::is_search_path_exempt(parsed) {
+            return Err(temp_route::search_path_stale());
         }
         // TABLE-44・Issue #1683: トランザクション制御に加え、一時表の行を読み書きしない
         // `CREATE [TEMP] TABLE`・`DROP TABLE` を通す（実行段がセッションの一時カタログで
@@ -4501,8 +4595,10 @@ impl EngineCore {
         // 以降の検証は 1 個の名前として扱うため、修飾の有無で経路・エラー契約が変わらない。
         // 冪等（解決済みのトークン列には何もしない）。`resolver` が `None`（ctx を持たない入口）の
         // テナント SCHEMA の修飾は `3F000`。
-        let public_names =
-            crate::sql::relation_name::rewrite_relation_names(&mut tokens, resolver)?.public_names;
+        let rewrite =
+            crate::sql::relation_name::rewrite_relation_names_full(&mut tokens, resolver)?;
+        let public_names = rewrite.names;
+        let create_public = rewrite.create_public;
         let storage_lookup = crate::sql::temp_catalog::SessionRelationLookup::new(
             &self.storage,
             temp,
@@ -4567,6 +4663,12 @@ impl EngineCore {
         if crate::sql::allowlist::is_show_time_zone(&tokens) {
             return Ok(ParsedSql::Statement(
                 crate::sql::allowlist::Statement::ShowTimeZone,
+            ));
+        }
+        // TABLE-27・Issue #1715: `SHOW search_path` も同じ理由で厳密一致のみ先に取り出す。
+        if crate::sql::allowlist::is_show_search_path(&tokens) {
+            return Ok(ParsedSql::Statement(
+                crate::sql::allowlist::Statement::ShowSearchPath,
             ));
         }
 
@@ -4863,7 +4965,9 @@ impl EngineCore {
         // 構造検証のみでカタログを照会しない（`CreateView` と同じ設計）。`CREATE OR REPLACE
         // MATERIALIZED` は下の `CREATE VIEW` 経路が `OR REPLACE` の後の `VIEW` を要求して `42601`。
         if crate::sql::allowlist::is_create_materialized_view_statement(&tokens) {
-            let stmt = crate::sql::allowlist::validate_create_materialized_view_tokens(&tokens)?;
+            let mut stmt =
+                crate::sql::allowlist::validate_create_materialized_view_tokens(&tokens)?;
+            stmt.public_qualified = create_public;
             return Ok(ParsedSql::CreateMaterializedView(stmt));
         }
         // TABLE-42・Issue #1665: `REFRESH MATERIALIZED VIEW`。構造検証のみでカタログを照会しない。
@@ -4883,7 +4987,8 @@ impl EngineCore {
             // `is_create_function_statement`〔`sql::allowlist::validate_sql_tokens`
             // 内〕より前にここで分岐するため、`CREATE VIEW` のトークン列が
             // `parse_create_function` へ渡ることはない）。
-            let stmt = crate::sql::allowlist::validate_create_view_tokens(&tokens)?;
+            let mut stmt = crate::sql::allowlist::validate_create_view_tokens(&tokens)?;
+            stmt.public_qualified = create_public;
             return Ok(ParsedSql::CreateView(stmt));
         }
 
@@ -4899,7 +5004,8 @@ impl EngineCore {
             return Ok(ParsedSql::CreateSchema(stmt));
         }
         if crate::sql::allowlist::is_create_sequence_statement(&tokens) {
-            let stmt = crate::sql::allowlist::validate_create_sequence_tokens(&tokens)?;
+            let mut stmt = crate::sql::allowlist::validate_create_sequence_tokens(&tokens)?;
+            stmt.public_qualified = create_public;
             return Ok(ParsedSql::CreateSequence(stmt));
         }
         if crate::sql::allowlist::is_create_type_statement(&tokens) {
@@ -4916,7 +5022,8 @@ impl EngineCore {
         // の重複判定）を一切行わない。権限判定・実行本体は
         // `execute_parsed_in_session` の `CreateTable` 分岐が担う。
         if crate::sql::allowlist::is_create_table_statement(&tokens) {
-            let stmt = crate::sql::allowlist::validate_create_table_tokens(&tokens)?;
+            let mut stmt = crate::sql::allowlist::validate_create_table_tokens(&tokens)?;
+            stmt.public_qualified = create_public;
             return Ok(ParsedSql::CreateTable(stmt));
         }
         // TABLE-44・Issue #1683: `CREATE [GLOBAL|LOCAL] TEMP|TEMPORARY TABLE` は永続表の
@@ -5073,8 +5180,11 @@ impl EngineCore {
         };
         let resolver: Option<crate::sql::relation_name::SchemaResolver<'_>> =
             tenant.map(|_| &probe as crate::sql::relation_name::SchemaResolver<'_>);
-        let public_qualified =
-            crate::sql::relation_name::rewrite_relation_names(&mut tokens, resolver)?.public_names;
+        let rewrite =
+            crate::sql::relation_name::rewrite_relation_names_full(&mut tokens, resolver)?;
+        let public_qualified = rewrite.names;
+        let qualified_positions = rewrite.positions;
+        let create_public = rewrite.create_public;
         // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW`
         // は DDL であり、`sql::params` が受理する `$n` の許可位置一覧
         // （WHERE 等号右辺・VALUES 節等）はいずれも DML 向けの規範形のため、
@@ -5184,7 +5294,7 @@ impl EngineCore {
             let mut parsed = self.parse_tokens(dummy_tokens)?;
             // 解決済みトークンの再 parse は `public.` 修飾の情報を持たない。`$n` を含まない文の
             // 実行は `dummy_parsed` を複製するため、ここで保持して実行時の衝突検査を通す。
-            attach_public_qualified(&mut parsed, &public_qualified);
+            attach_public_qualified(&mut parsed, &public_qualified, create_public);
             parsed
         };
         // Issue #2437・WIRE-24 (1)(5): 宣言型と文脈の型の変換可否は、構造検証 parse の成功後に
@@ -5214,6 +5324,8 @@ impl EngineCore {
                 .collect(),
             session_tz_dependent,
             public_qualified,
+            qualified_positions,
+            create_public,
             route: temp_route::PreparedRoute::Plain,
         })
     }
@@ -5519,7 +5631,11 @@ impl EngineCore {
         let substituted =
             crate::sql::params::substitute_values_typed(&prepared.tokens, &decoded, &kinds)?;
         let mut parsed = self.parse_tokens(substituted)?;
-        attach_public_qualified(&mut parsed, &prepared.public_qualified);
+        attach_public_qualified(
+            &mut parsed,
+            &prepared.public_qualified,
+            prepared.create_public,
+        );
         Ok(parsed)
     }
 
@@ -5833,6 +5949,12 @@ impl EngineCore {
             // ため未使用のまま——`CREATE TABLE` はテナントスコープの操作ではない。
             ParsedSql::CreateTable(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
+                self.require_creation_target(
+                    ctx,
+                    session,
+                    stmt.public_qualified,
+                    &stmt.table_name,
+                )?;
                 // TABLE-44・Issue #1683: 永続表の FOREIGN KEY がこのセッションの一時表の名前に
                 // 解決される場合は `42P16`（永続表は一時表を参照できない）。同名の永続表を
                 // 黙って参照する fail-open を避ける。
@@ -5902,6 +6024,7 @@ impl EngineCore {
             // 順序（DDL 実行権限ゲート → カタログ照会を含む実行本体）。
             ParsedSql::CreateView(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
+                self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 crate::sql::schema_dependency::check_view_body(stmt.name(), stmt.body_sql())?;
                 // TABLE-41 (1)・Issue #1659: 列別名リストと本文の出力列数の突合は、カタログを
                 // 照会するため DDL 権限ゲートの後に行う（権限の無い主体へ列構成を返さない）。
@@ -5948,6 +6071,7 @@ impl EngineCore {
             // 列の確定・本文の評価・定義と実体の原子的な作成を行う。
             ParsedSql::CreateMaterializedView(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
+                self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 crate::sql::schema_dependency::check_view_body(stmt.name(), stmt.body_sql())?;
                 let outcome = self.execute_create_materialized_view(ctx, session, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateMaterializedView(outcome))
@@ -5991,6 +6115,7 @@ impl EngineCore {
             // `ctx` は取らない。権限の無い主体には型の有無を問わず常に `42501`。
             ParsedSql::CreateType(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
+                self.require_creation_target(ctx, session, false, stmt.name())?;
                 let outcome =
                     crate::sql::ddl::execute_create_type(&self.storage, stmt, &self.schema_limits)?;
                 Ok(crate::sql::SqlOutcome::CreateType(outcome))
@@ -6004,6 +6129,7 @@ impl EngineCore {
             // 実行本体）。SEQUENCE の定義は全テナント共有カタログで `ctx` は取らない。
             ParsedSql::CreateSequence(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
+                self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 let outcome = crate::sql::ddl::execute_create_sequence(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateSequence(outcome))
             }
@@ -6482,6 +6608,8 @@ impl EngineCore {
                 stmt @ (Statement::SetSearchMode { .. }
                 | Statement::SetTimeZone { .. }
                 | Statement::ShowTimeZone
+                | Statement::SetSearchPath { .. }
+                | Statement::ShowSearchPath
                 | Statement::CreateFunction { .. }),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
             // 検索・集計・広域取得・`EXPLAIN`・JOIN・評価後射影形ビュー・集合演算はすべて
@@ -6792,6 +6920,8 @@ impl EngineCore {
             Statement::SetSearchMode { .. }
             | Statement::SetTimeZone { .. }
             | Statement::ShowTimeZone
+            | Statement::SetSearchPath { .. }
+            | Statement::ShowSearchPath
             | Statement::CreateFunction { .. }
             | Statement::MaterializedView(_)
             | Statement::ConstSelect(_) => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
@@ -7397,6 +7527,10 @@ impl EngineCore {
             ParsedSql::Statement(Statement::SetTimeZone { .. }) => Ok(None),
             // `SHOW TimeZone` は列名 `TimeZone`（text）の 1 列固定（TABLE-33・Issue #1575）。
             ParsedSql::Statement(Statement::ShowTimeZone) => Ok(Some(show_time_zone_columns())),
+            // TABLE-27・Issue #1715: `SET search_path`／`RESET` は結果列なし、`SHOW search_path` は
+            // 列名 `search_path`（text）の 1 列固定。
+            ParsedSql::Statement(Statement::SetSearchPath { .. }) => Ok(None),
+            ParsedSql::Statement(Statement::ShowSearchPath) => Ok(Some(show_search_path_columns())),
             ParsedSql::Statement(Statement::CreateFunction { .. }) => Ok(None),
             // `EXPLAIN` は常に単一の `Computed` 列（`QUERY PLAN`）を返す
             // （`sql::explain::build_explain_result` と同一の列。中身の生成には
@@ -7632,6 +7766,36 @@ impl EngineCore {
                 }
                 Ok(crate::sql::SqlOutcome::SetTimeZone)
             }
+            // TABLE-27・Issue #1715: 検証（要素数・要素長・`pg_temp` の順序）に成功した場合に限り
+            // セッションへ代入する（失敗した `SET` は値を変えない）。`RESET`／`DEFAULT` は既定値へ戻す。
+            // SCHEMA の存在はここでは検査しない（存在しない名前は解決時に飛ばす。ADR D5）。
+            crate::sql::allowlist::Statement::SetSearchPath { value, reset } => {
+                match value {
+                    crate::sql::search_path::SearchPathSetting::Default => {
+                        session.reset_search_path()?
+                    }
+                    crate::sql::search_path::SearchPathSetting::List(elems) => {
+                        let path = crate::sql::search_path::SearchPath::new_for_user(
+                            elems,
+                            session.session_user(),
+                        )?;
+                        session.set_search_path(path)?;
+                    }
+                }
+                Ok(crate::sql::SqlOutcome::SetSearchPath { reset })
+            }
+            crate::sql::allowlist::Statement::ShowSearchPath => Ok(crate::sql::SqlOutcome::Show(
+                crate::sql::exec::QueryResult {
+                    columns: show_search_path_columns(),
+                    rows: vec![crate::sql::exec::ResultRow {
+                        id: 0,
+                        score: 0.0,
+                        cells: vec![crate::sql::exec::Cell::Text(
+                            session.search_path().display(),
+                        )],
+                    }],
+                },
+            )),
             crate::sql::allowlist::Statement::ShowTimeZone => Ok(crate::sql::SqlOutcome::Show(
                 crate::sql::exec::QueryResult {
                     columns: show_time_zone_columns(),
@@ -9949,6 +10113,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
+        Self::check_copy_search_path(session, sql)?;
         if let Some(plan) = self.begin_copy_temp(
             ctx,
             session,
@@ -9967,6 +10132,22 @@ impl EngineCore {
         )
         .map_err(|e| self.reclassify_matview_write_error(e))?;
         self.begin_copy_validated(ctx, session, stmt, None)
+    }
+
+    /// `COPY` の未修飾テーブル参照に対する `search_path` の参照ゲート（TABLE-27・Issue #1715）。
+    /// 実効 path に `public` が含まれる既定のセッションは字句解析もしない。字句解析に失敗する入力は
+    /// 通常の検証へ任せる。
+    fn check_copy_search_path(
+        session: &crate::sql::mode::SessionState,
+        sql: &str,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        if !session.search_path_hides_public() {
+            return Ok(());
+        }
+        let Ok(tokens) = crate::sql::lexer::tokenize_marked(sql) else {
+            return Ok(());
+        };
+        crate::sql::search_path::check_unqualified_refs(session, &tokens, &[])
     }
 
     /// `begin_copy_unscrubbed` の公開入口。判定順序・エラー契約・実行結果は同関数と同一で、
@@ -10084,6 +10265,7 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
+        Self::check_copy_search_path(session, sql)?;
         if let Some(plan) = self.begin_copy_temp(ctx, session, Some(&mut *txn), sql)? {
             return Ok(plan);
         }

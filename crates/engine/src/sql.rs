@@ -234,6 +234,7 @@ pub(crate) mod scalar_index;
 pub(crate) mod scalar_plan;
 pub mod scan;
 pub(crate) mod schema_dependency;
+pub mod search_path;
 pub(crate) mod sequence_fn;
 pub(crate) mod sequence_scope;
 pub(crate) mod set_op;
@@ -337,6 +338,14 @@ pub enum SqlOutcome {
     /// **Issue #1575 で追加した破壊的変更（BREAKING CHANGE）**: variant を追加した
     /// （既存の網羅的 `match` はワイルドカードアームの追加が必要）。
     SetTimeZone,
+    /// `SET [SESSION] search_path ...`／`RESET search_path` の成功応答（CommandComplete は `SET`・
+    /// `RESET`。TABLE-27・Issue #1715）。新しい値は `SessionState::search_path` が保持する。
+    /// `reset` は `RESET search_path` で実行された応答か（wire のタグの出し分け用）。
+    ///
+    /// **Issue #1715 で追加した破壊的変更（BREAKING CHANGE）**: variant を追加した。
+    SetSearchPath {
+        reset: bool,
+    },
     /// `SHOW timezone`／`SHOW TIME ZONE` の応答（列名 `TimeZone`・text の 1 行。CommandComplete
     /// タグは PG と同じ `SHOW`。TABLE-33・Issue #1575）。行の形は通常の検索 SELECT と同じで、
     /// タグだけが異なるため `Query` とは別 variant にしている。

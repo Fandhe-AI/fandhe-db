@@ -26,7 +26,8 @@
 //! 実体ストアと切断時の破棄は `temp_rows`（#1682）、`CREATE TEMP TABLE` と
 //! `ON COMMIT`（`SessionState::apply_temp_on_commit`）・一時表の `DROP` は #1683、
 //! 一時表への DML・索引・制約は #1684、テナント境界・crash 耐性の検査は #1685。
-//! 修飾名（`pg_temp.<名前>`）はスキーマ・`search_path`（TABLE-27）の実装へ申し送る。
+//! 修飾名（`pg_temp.<名前>`）の結線は別 Issue へ申し送る（`search_path`〔TABLE-27・Issue #1715〕は実装済みで、
+//! 一時表は path に関わらず先頭で解決する）。
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -320,10 +321,23 @@ impl<L: TableLookup + ?Sized> TableLookup for SessionRelationLookup<'_, L> {
     }
 }
 
+/// `SET`／`RESET`／`SHOW` の対象が `search_path` か（先頭 3 トークンの構造だけで判定する）。
+fn is_search_path_statement(tokens: &[Token]) -> bool {
+    let word = |i: usize, k: &str| matches!(tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+    (word(0, "SET") || word(0, "RESET") || word(0, "SHOW"))
+        && (word(1, "search_path")
+            || ((word(1, "SESSION") || word(1, "LOCAL")) && word(2, "search_path")))
+}
+
 /// トークン列に、一時表の名前と ASCII 大小無視で一致する識別子があるか。一致しすぎても
 /// 拒否側（fail-closed）に倒れるだけである。一時カタログが空なら常に `false`。
 pub(crate) fn tokens_reference_temp(tokens: &[Token], catalog: &SessionTempCatalog) -> bool {
     if catalog.is_empty() {
+        return false;
+    }
+    // `SET`／`RESET`／`SHOW [SESSION|LOCAL] search_path` の値は SCHEMA 名で関係名ではない。
+    // 一時表と同名の要素（や `set`・`to`）で誤って一時表参照と判定しない（TABLE-27・Issue #1715）。
+    if is_search_path_statement(tokens) {
         return false;
     }
     tokens.iter().any(|t| match t {

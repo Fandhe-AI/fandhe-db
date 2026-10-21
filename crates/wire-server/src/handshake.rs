@@ -1622,6 +1622,9 @@ fn run_authenticated_session<S: WireStream>(
     if store.is_ddl_allowed(&username) {
         session.allow_ddl();
     }
+    // TABLE-27・Issue #1715: `search_path` の `"$user"` は、認証成功後に確定した username から
+    // 展開する（接続ごとに 1 回だけ設定し、SQL 文から変える経路は持たない。ADR D6）。
+    session.set_session_user(&username);
     // TABLE-27・Issue #1717（ADR D6）: 拡張クエリの Parse は認証コンテキストを受け取らないため、
     // `schema.name` の修飾を解決するテナントを、認証済みの `ctx` から接続に 1 回だけ束縛する
     // （SQL 文経由で変更する経路は無い）。簡易クエリは実行ごとに `ctx` で解決する。
