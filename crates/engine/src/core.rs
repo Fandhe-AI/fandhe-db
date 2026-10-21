@@ -69,6 +69,7 @@ use redb::ReadableDatabase;
 mod temp_route;
 pub use temp_route::SessionRoutedSql;
 
+mod ctas_exec;
 mod matview_exec;
 
 // INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
