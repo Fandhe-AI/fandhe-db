@@ -8,7 +8,8 @@
 //! [`bind_rows`] が行ごとに [`super::typed_json::map_json_to_literal`]
 //! （NOSQL-17。Issue #896。JSON 値 → `InsertLiteral` の型別写像）で列値を
 //! `engine::sql::allowlist::ValidatedInsert`（1 行分）へ組み立て、
-//! `engine::sql::parser::bind_insert`（SQL 表層 `INSERT` と共有する公開束縛
+//! `engine::sql::parser::bind_insert_identity`（`bind_insert` と同じ束縛契約に、移行済み表の
+//! `id` キー省略の受理〔TABLE-24・Issue #1700。採番は engine〕を足した公開束縛
 //! 関数。整数のオーバーフロー・`NUMERIC` の桁あふれ・`DATE`／`TIMESTAMP` の
 //! 暦上妥当性・`UUID` の文法等はすべてここへ委譲する）で `BoundInsert` へ
 //! 束縛する。[`execute`] がその結果を
@@ -58,7 +59,7 @@ use engine::json::JsonValue;
 use engine::recovery::required_op_id::OperationId;
 use engine::sql::allowlist::{SqlSurfaceError, ValidatedInsert};
 use engine::sql::exec::InsertOutcome;
-use engine::sql::parser::{bind_insert, BoundInsert};
+use engine::sql::parser::{bind_insert_identity, BoundInsert};
 
 use crate::http::error_body::escape_json_string_into;
 use crate::http::response as http_response;
@@ -190,21 +191,25 @@ fn bind_row(
         // 払い出す。`id` キーは宣言した通常の列としてだけ扱う（要求も注入もしない）。
         None
     } else {
-        Some(match map.get("id") {
+        match map.get("id") {
             Some(JsonValue::Number(n)) => match n.as_exact_u64() {
-                Some(id) => id,
+                Some(id) => Some(id),
                 None => {
                     return Err(InsertError::Bind(invalid_input_error(
                         "INSERT row id must be a non-negative integer JSON number",
                     )))
                 }
             },
+            // 移行済み表（TABLE-24・Issue #1700）に限り `id` キーの欠落を受理する。engine が同じ write
+            // txn 内で所有 SEQUENCE から採番する（`bind_insert_identity` が省略の印を立てる）。
+            // 明示した `"id": null` や非整数は従来どおり下の分岐で `22000`。
+            None if schema.is_migrated_id() => None,
             _ => {
                 return Err(InsertError::Bind(invalid_input_error(
                     "INSERT row id must be a non-negative integer JSON number",
                 )))
             }
-        })
+        }
     };
 
     // `columns`／`literals` は宣言順に対応する 2 本の Vec として組み立て、
@@ -300,7 +305,8 @@ fn bind_row(
         returning: None,
         on_conflict: None,
     };
-    bind_insert(&validated, schema).map_err(InsertError::Bind)
+    // `id` 省略の受理は移行済み表だけ（`bind_insert_identity` が判定。従来方式の表は `bind_insert` と同じ）。
+    bind_insert_identity(&validated, schema).map_err(InsertError::Bind)
 }
 
 /// `rows`（[`Validated::required_array`]`("rows")` が返す形。要素の型は
