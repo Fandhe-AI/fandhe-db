@@ -71,6 +71,7 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::Delete(_)
         | SqlOutcome::Update(_)
         | SqlOutcome::CreateTable(_)
+        | SqlOutcome::CreateTableAs(_)
         | SqlOutcome::DropTable(_)
         | SqlOutcome::AlterTable(_)
         | SqlOutcome::CreateView(_)

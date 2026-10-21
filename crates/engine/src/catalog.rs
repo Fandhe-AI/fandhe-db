@@ -11864,6 +11864,18 @@ impl Storage {
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
+    /// 呼び出し側が開いた write txn の中で表を作る（commit・世代 bump を含まない。`CREATE TABLE AS` が
+    /// 表の作成と行の投入を 1 つの txn に載せるために使う。SQL-52・Issue #1678）。前処理
+    /// （[`Self::prepare_create_table`]）と txn 内本体（[`Self::create_table_in_txn`]）を束ね、
+    /// 世代 bump は呼び出し側が commit の直前に行う。`Err` の場合は呼び出し側が txn を破棄する。
+    pub(crate) fn create_table_in_write_txn(
+        write_txn: &redb::WriteTransaction,
+        schema: &TableSchema,
+    ) -> Result<()> {
+        let (schema, pre_encoded) = Self::prepare_create_table(schema)?;
+        Self::create_table_in_txn(write_txn, &schema, pre_encoded)
+    }
+
     /// [`Self::create_table`] の txn 前処理（UNIQUE 制約名の確定・スキーマ検証。write txn を開く前に
     /// fail-closed に拒否できる判定だけ）。暗黙 SEQUENCE 付きの作成
     /// （[`Self::create_table_with_implicit_sequences`]）も同じ処理を通す。FK を持たないスキーマは
