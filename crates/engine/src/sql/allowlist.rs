@@ -3678,6 +3678,12 @@ impl ValidatedViewUpdate {
     }
 }
 
+/// [`mark_explicit_where`] が注入する印の予約名。識別子として字句化できない NUL を含むため
+/// 利用者入力の `WHERE visible()` とは衝突せず、content_hash の直列化（`push_dml_where_predicates`）
+/// はこの印を除外する。これにより畳み込み後に恒真となる `WHERE` の台帳ハッシュは印の導入前と
+/// 同一に保たれ、明示 `WHERE visible()` とも区別される。
+pub(crate) const EXPLICIT_WHERE_MARKER: &str = "\u{0}explicit_where";
+
 /// `WHERE` が書かれているのに述語列が空になる形（`WHERE TRUE`・`(TRUE OR FALSE)` 等、構文段の
 /// 真偽リテラル畳み込み〔SQL-41〕で述語が消えるもの）に、RLS 述語 `visible()` を 1 件足して返す。
 /// 空の述語列は「`WHERE` 省略」（SQL-36・Issue #1743）の表現と同一であり、明示した恒真を省略と
@@ -3687,7 +3693,7 @@ impl ValidatedViewUpdate {
 fn mark_explicit_where(mut predicates: Vec<WherePredicate>) -> Vec<WherePredicate> {
     if predicates.is_empty() {
         predicates.push(WherePredicate::PredicateCall {
-            name: "visible".to_string(),
+            name: EXPLICIT_WHERE_MARKER.to_string(),
         });
     }
     predicates
