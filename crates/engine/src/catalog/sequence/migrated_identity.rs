@@ -11,9 +11,10 @@
 //! スキーマは書き換えず所有者 `(table, id)` の SEQUENCE だけで結び付ける（割り当て済みの判定も
 //! 所有者で行う）。宣言した `id` 列を持つ表（`Allocated`）は従来どおり列の DEFAULT も Identity にする。
 //!
-//! 呼び出し元: #2200 の移行 txn（結線は #2200 の範囲。本ファイルは SQL・NoSQL・公開 API のいずれにも
-//! 結線せず、外から見える挙動を変えない）。呼び出し先: 親モジュールの SEQUENCE 作成・命名・所有者
-//! 設定・状態行の書き込みと、`catalog.rs` のスキーマ保存。
+//! 呼び出し元: open 時の移行ドライバ（`catalog::legacy_id_migration` の 2 段目。Issue #1699 で結線）と、
+//! SQL INSERT の `id` 省略時の採番（`tenant` が [`migrated_id_sequence_in_txn`] で採番先を引く）。
+//! 呼び出し先: 親モジュールの SEQUENCE 作成・命名・所有者設定・状態行の書き込みと、`catalog.rs` の
+//! スキーマ保存。
 //!
 //! テナント境界（P0）: 状態行のキー先頭は `tenant_id` で、初期値は自テナントの最大 `id` だけから
 //! 決まる。他テナントの件数・最大値は採番値にも `2200H` の有無にもエラー文言にも現れない。DDL は
@@ -30,16 +31,18 @@ use redb::ReadableTable;
 
 use crate::catalog::{
     get_table_schema_in_txn_impl, map_row_table_error, user_rows_table_def, user_rows_table_name,
-    validate_identifier, CatalogError, ColumnDefault, ColumnType, IdentityKind, Result,
-    RowIdentity, Storage, TableSchema,
+    CatalogError, ColumnDefault, ColumnType, IdentityKind, Result, RowIdentity, Storage,
+    TableSchema,
 };
 use crate::row_codec::{scan_scalar_columns, ScalarRef};
 use crate::storage::read_source::ReadSource;
 
 use super::{
-    choose_implicit_sequence_name_in_txn, create_sequence_in_txn, decode_sequence_def_with_owner,
-    load_sequence_bytes_in_txn, owned_sequence_entries_in_txn, set_sequence_owner_in_txn,
-    write_state_in_txn, SeqCursor, SequenceOwner, SequenceParams, MAX_CURSORS,
+    choose_implicit_sequence_name_in_txn, corrupt_may_own_id_sequence, create_sequence_in_txn,
+    decode_sequence_def_with_owner, load_sequence_bytes_in_txn, make_object_name,
+    owned_sequence_entries_lenient, sequence_key, set_sequence_owner_in_txn, validate_relation_key,
+    write_state_in_txn, RelationKey, SeqCursor, SequenceDef, SequenceOwner, SequenceParams,
+    MAX_CURSORS, SEQUENCES_TABLE,
 };
 
 /// 移行する `id` 列の名前（ADR D2。PK 列名は移行後も `id`）。
@@ -75,9 +78,14 @@ fn check_pseudo_id_preconditions(
     write_txn: &redb::WriteTransaction,
     schema: &TableSchema,
 ) -> Result<Option<String>> {
-    let found = owned_sequence_entries_in_txn(write_txn, &|o| {
+    // 無関係な破損 SEQUENCE では失敗させない。ただし `id` 用の名前に当たる破損があれば
+    // 所有関係を判断できないため、拒否して割り当てを見送る（fail-closed）。
+    let (found, corrupt) = owned_sequence_entries_lenient(write_txn, &|o| {
         o.table == schema.name && o.column == ID_COLUMN
     })?;
+    if found.is_empty() && corrupt_may_own_id_sequence(&corrupt, &schema.name) {
+        return Err(invalid("migrated id sequence ownership is undecidable"));
+    }
     match found.as_slice() {
         [] => Ok(None),
         [(name, _, _)] => Ok(Some(name.clone())),
@@ -238,12 +246,11 @@ pub(crate) fn per_tenant_max_id_in_txn(
 /// 状態行なしで初回が START = 1 から始まる）。新しい SEQUENCE は内部 ID が新規で
 /// `SequenceAllocator` にカーソルが無いため、初回の払い出しは本 txn の状態行から始まる
 /// （メモリの破棄は不要）。
-#[cfg_attr(not(test), allow(dead_code))] // #2200 の移行 txn が呼ぶ（結線は #2200）。
 pub(crate) fn assign_migrated_id_identity_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
 ) -> Result<MigratedIdIdentityOutcome> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     let schema = get_table_schema_in_txn_impl(write_txn, table, true)?;
     if let Some(sequence) = check_preconditions(write_txn, &schema)? {
         return Ok(MigratedIdIdentityOutcome::AlreadyAssigned { sequence });
@@ -293,11 +300,87 @@ pub(crate) fn assign_migrated_id_identity_in_txn(
     Ok(MigratedIdIdentityOutcome::Assigned { sequence: name })
 }
 
+/// 移行済み表 `table` の `id` を所有する SEQUENCE を write txn 内で特定する（Issue #1699。
+/// 疑似列 `id` の省略 INSERT が書き込みと同じ txn で採番先を引く入口。束縛段では解決しない
+/// ことで、束縛から書き込みまでの間の DROP・再作成との TOCTOU を避ける）。
+///
+/// 通常は暗黙名 `<table>_id_seq`（[`choose_implicit_sequence_name_in_txn`] の最初の候補）を 1 件
+/// 引いて所有者が `(table, id)` かを確かめるだけで済む（O(1)）。暗黙名が衝突して接尾辞が付いた場合や
+/// 所有者が食い違う場合だけ所有者で全走査する。無ければ `None`、複数あれば不整合で `Invalid`。
+/// 判定はカタログ（全テナント共有）だけで決まり、テナントの状態は引かない（存在オラクルにしない）。
+pub(crate) fn migrated_id_sequence_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+) -> Result<Option<(String, SequenceDef)>> {
+    validate_relation_key(table)?;
+    let expected = SequenceOwner {
+        table: table.to_string(),
+        column: ID_COLUMN.to_string(),
+    };
+    let (prefix, base) = match RelationKey::parse(table)? {
+        RelationKey::Public(name) => (String::new(), name),
+        RelationKey::InSchema { schema_id, name } => (RelationKey::schema_prefix(schema_id), name),
+    };
+    let default_name = format!("{prefix}{}", make_object_name(&base, ID_COLUMN, "seq"));
+    if validate_relation_key(&default_name).is_ok() {
+        let found = {
+            match ReadSource::open_table(write_txn, SEQUENCES_TABLE) {
+                Ok(t) => match t.get(sequence_key(&default_name))? {
+                    // 破損した暗黙名は「所有者なし」として読み飛ばす（open 時の割り当てと同じ扱い）。
+                    // 以降の所有者走査（寛容版）へ進み、見つからなければ `None`（呼び出し側が 23502）。
+                    Some(g) => match decode_sequence_def_with_owner(g.value()) {
+                        Ok(v) => Some(v),
+                        Err(CatalogError::CorruptSchema(_)) => None,
+                        Err(e) => return Err(e),
+                    },
+                    None => None,
+                },
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        if let Some((def, Some(owner))) = found {
+            if owner == expected {
+                return Ok(Some((default_name, def)));
+            }
+        }
+    }
+    // 破損した無関係な SEQUENCE で INSERT を失敗させない（破損項目は所有者なしとして読み飛ばす）。
+    let (found, _corrupt) = owned_sequence_entries_lenient(write_txn, &|o| o == &expected)?;
+    match found.as_slice() {
+        [] => Ok(None),
+        [(name, def, _)] => Ok(Some((name.clone(), *def))),
+        _ => Err(invalid("migrated id sequence is inconsistent")),
+    }
+}
+
+/// `candidates`（移行済み表の名前）のうち、`id` を所有する SEQUENCE をまだ持たない表を返す
+/// （Issue #1699。open 時の移行ドライバが、割り当て対象の検出に読み取り txn から 1 回の走査で使う）。
+/// 走査は [`MAX_SEQUENCES`] 件で打ち切る。write txn を開かずに済ませるため `ReadSource` を取る。
+pub(crate) fn tables_missing_id_sequence<S: ReadSource>(
+    source: &S,
+    candidates: &[String],
+) -> Result<Vec<String>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 破損 SEQUENCE は読み飛ばす（無関係な 1 件で open を失敗させない）。所有関係を判断できない
+    // 表（破損名が暗黙名に当たる）は候補から外して割り当てを見送る。
+    let (owned, corrupt) = owned_sequence_entries_lenient(source, &|o| o.column == ID_COLUMN)?;
+    let have: std::collections::BTreeSet<&str> =
+        owned.iter().map(|(_, _, o)| o.table.as_str()).collect();
+    Ok(candidates
+        .iter()
+        .filter(|t| !have.contains(t.as_str()) && !corrupt_may_own_id_sequence(&corrupt, t))
+        .cloned()
+        .collect())
+}
+
 impl Storage {
     /// [`assign_migrated_id_identity_in_txn`] を単独の write txn で実行する（世代 bump・commit 込み）。
     /// 一時表の Storage は永続 DB の SEQUENCE を解決できないため `Invalid` で拒否する（移行の対象外）。
     /// 再実行は冪等で、`AlreadyAssigned` のときは commit せず世代も進めない。
-    #[cfg_attr(not(test), allow(dead_code))] // #2200 の移行 txn が in_txn 版を呼ぶ。テスト・結線の入口。
+    #[cfg_attr(not(test), allow(dead_code))] // 本番は in_txn 版を移行ドライバが呼ぶ。単独版はテストの入口。
     pub(crate) fn assign_migrated_id_identity(
         &self,
         table: &str,

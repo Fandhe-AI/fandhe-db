@@ -11760,6 +11760,16 @@ impl EngineCore {
             |(rewritten, _)| rewritten.insert.table_name.clone(),
             |(rewritten, _)| rewritten.check_predicates.clone(),
             |(rewritten, schema)| {
+                // 基表の疑似列 `id` を省略するビュー経由の INSERT は、`WITH CHECK OPTION` の検査時点と
+                // 採番値の関係が未検証のため受理せず `0A000` で拒否する（Issue #1699・ADR D9）。
+                if crate::sql::parser::insert_omits_pseudo_id(&rewritten.insert, &schema) {
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::FeatureNotSupported {
+                            detail: "omitting the id pseudo-column is not supported through a view"
+                                .to_string(),
+                        },
+                    );
+                }
                 let lookup = InsertSchemaLookup::with_schema(
                     &self.storage,
                     &rewritten.insert.table_name,
@@ -15424,6 +15434,7 @@ mod tests {
                     .expect("valid operation id"),
             ),
             volatile_default_columns: Vec::new(),
+            id_omitted: false,
         };
 
         let result = core.validate_insert_row_batch_limits(std::slice::from_ref(&bound));

@@ -99,7 +99,15 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
   本案の独自表現は採らない
 - 確定（#1698）: `ColumnDefault::Identity { sequence, kind: ByDefault }` を採用する。列と SEQUENCE は名前で
   結び付き、`ALTER SEQUENCE … RENAME` は sequence ADR §9.2 のとおり `0A000` のまま受け入れる。
-  部品は `assign_migrated_id_identity_in_txn`（#2200 の移行 txn が表ごとに呼ぶ）。#2200 が着地するまで SQL・NoSQL・公開 API には結線しない
+  部品は `assign_migrated_id_identity_in_txn`。
+- 結線（#1699。自動運転下の判断で、人間の確認が要る）: #2200 の移行と #1698 の部品は、それぞれの PR が
+  「結線は相手の担当」としたまま着地したため、本番経路の移行済み表に SEQUENCE が無かった。#1699 で
+  `legacy_id_migration` に 2 段目を足して埋めた。1 段目（印の書き換え）は不変で、2 段目は「移行済みなのに
+  `id` を所有する SEQUENCE が無い表」を読み取り txn で検出し、表ごとに 1 つの write txn で部品を呼ぶ
+  （世代 bump・commit まで同じ txn）。#2589 以降にすでに移行済みの DB も次の open で補完され、1・2 段目の
+  間のクラッシュも次の open で収束する。前提不一致などは、その表を見送る（SEQUENCE の無い移行済み表のまま。
+  下記 D6 の `23502`）。Backend の I/O エラーは open を失敗させる。副作用: 既存の全表に `<table>_id_seq` が
+  見えるようになる（PostgreSQL の IDENTITY 列と同じ。名前の衝突時は `seq1`… の接尾辞）
 - 保留案: 新しい列属性 `identity`（BY DEFAULT／ALWAYS と sequence_id）。ALWAYS や `OVERRIDING` を
   扱う #1695 の判断に委ねる
 
@@ -123,6 +131,14 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
   `23505` とは `error_class`／variant で区別する）。自動で飛ばして次の値を採ることはしない
 - 既存 SQL の互換を維持する: `INSERT … (id, …)`・`WHERE id = n`・`ON CONFLICT (id)`
 - `VALUES (DEFAULT, …)` による明示の省略は既存の DEFAULT 経路に従う
+- 確定（#1699）: 移行済み表の単一行 `INSERT` に限り、列リストの疑似列 `id` の省略を受理する
+  （束縛段はスキーマだけで判定し、SEQUENCE の有無は見ない）。採番は書き込み txn 内で、台帳照合と
+  NOT NULL 検査の後に所有 SEQUENCE（既定名 `<table>_id_seq` を優先し、所有者で検証。だめなら所有者で走査）
+  から払い出す。session の `currval` にも記録されるので `currval('<table>_id_seq')` が使える。
+  `RETURNING id` は払い出し値で投影し直す。SEQUENCE の無い移行済み表への省略は、DEFAULT の無い
+  NOT NULL 列を省略した場合と同じ `23502`（列名 `id`、値は消費しない）で、判定はカタログだけで決まり
+  他テナントの状態を引かない。従来方式のままの表（実行時に作った表は次の open まで）と、NoSQL の
+  公開 `bind_insert` は従来どおり `22000`
 
 ### D7. 欠番・並行採番
 
@@ -136,8 +152,12 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
 - 台帳には採番値を保存しない（§1.1）。内容照合ハッシュは送られた値（採番前）で計算し、
   省略した `id` は「省略列に適用した DEFAULT」として材料から除外する
 - 明示 `id` の文のハッシュはバイト単位で不変にする（golden を不変）。`id` を省略した文は、どの
-  明示 `id` の文ともハッシュが一致しないこと（省略を 0 として `push_u64` しない）。レイアウトの
-  選択と新しい OpTag の要否は #1700 で確定する。#2196 とはどちらが先に着地しても golden を保つ
+  明示 `id` の文ともハッシュが一致しないこと（省略を 0 として `push_u64` しない）。#2196 とは
+  どちらが先に着地しても golden を保つ
+- 確定（#1699。単一行分。自動運転下の判断で、人間の確認が要る）: `OpTag::InsertIdentity = 21`
+  （通常形）と `OpTag::InsertIdentityExpr = 22`（`VALUES` に単独の時刻関数・`nextval` を含む形）を追加した。
+  材料は明示 `id` の文（`Insert`・`InsertExpr`）から `id` を除いたもの（visibility → embedding → 列）。
+  明示 `id` の文のバイト列は不変（golden）。複数行・UPSERT・NoSQL は #1700 が同じ系列で拡張する
 - operation_id を指定した再送は `23505` で再実行せず、SEQUENCE を進めない（同じ `id` を再現しない）
 - operation_id を省略した書き込みは台帳に記録せず、再送すれば別の値を採番する
 - `--require-operation-id` の構成で省略すると、値を消費せずに `23502`
@@ -148,14 +168,14 @@ Issue #1697 の起票時の文言には「台帳へ採番値を保存する形�
 
 | 表層 | 現状 | 担当 |
 | ---- | ---- | ---- |
-| SQL 単一行 INSERT | `id` 必須 | #1699 |
-| SQL 複数行 INSERT | `id` 必須 | #1699・#1700 |
-| `RETURNING id` | 採番値で投影し直す（sequence ADR §8.4） | #1699 |
+| SQL 単一行 INSERT | `id` 省略を受理（#1699 で着地。従来方式の表は `22000`） | #1699 |
+| SQL 複数行 INSERT | `id` 省略は `0A000`（束縛段と実行段の両方で拒否） | #1700 |
+| `RETURNING id` | 採番値で投影し直す（#1699 で着地。sequence ADR §8.4） | #1699 |
 | UPSERT（`ON CONFLICT`） | `DEFAULT nextval` は `0A000` | #1700 で受理範囲を明記。それまで `0A000` |
 | COPY FROM | `id` 必須。`DEFAULT nextval` は `0A000` | #1700 |
 | NoSQL HTTP insert | `id` 必須 | #1700（`returning` は NOSQL-22 で対象外） |
 | ファイル形 INSERT（path/body） | `0A000` | 対象外のまま |
-| 更新可能ビュー経由の INSERT | [create-view.md](create-view.md) | 結論は #1699 で確定し、それまで `0A000` |
+| 更新可能ビュー経由の INSERT | [create-view.md](create-view.md) | #1699 の結論: 基表の `id` を省略する形は `0A000` のまま（`WITH CHECK OPTION` の検査時点と採番値の関係を検証し切れていないため）。受理は後続 Issue |
 | 分割実行 DML・一時表・matview | INSERT を伴わない／適用外 | 対象外 |
 
 ### D10. テナント境界とエラー契約

@@ -32,9 +32,10 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 mod migrated_identity;
 
 // #2200 の移行 txn（`catalog::legacy_id_migration`）が呼ぶ入口を親モジュールへ公開する。
-// 結線までは未使用のため unused_imports を許容する。
-#[allow(unused_imports)]
-pub(crate) use migrated_identity::{assign_migrated_id_identity_in_txn, MigratedIdIdentityOutcome};
+pub(crate) use migrated_identity::{
+    assign_migrated_id_identity_in_txn, migrated_id_sequence_in_txn, tables_missing_id_sequence,
+    MigratedIdIdentityOutcome,
+};
 
 use crate::storage::read_source::ReadSource;
 
@@ -1277,8 +1278,8 @@ pub(crate) fn drop_owned_sequences_in_txn(
 
 /// 所有者が `matches` を満たす SEQUENCE の `(名前, 定義, 所有者)` を列挙する
 /// （[`MAX_SEQUENCES`] 件で打ち切り。読み取りハンドルは返す前に解放する）。
-fn owned_sequence_entries_in_txn(
-    write_txn: &redb::WriteTransaction,
+fn owned_sequence_entries_in_txn<S: ReadSource>(
+    write_txn: &S,
     matches: &impl Fn(&SequenceOwner) -> bool,
 ) -> Result<Vec<(String, SequenceDef, SequenceOwner)>> {
     let table = match ReadSource::open_table(write_txn, SEQUENCES_TABLE) {
@@ -1297,6 +1298,54 @@ fn owned_sequence_entries_in_txn(
         }
     }
     Ok(out)
+}
+
+/// [`owned_sequence_entries_lenient`] の戻り値（所有者一致の項目, 破損した relation キー）。
+type LenientOwnedScan = (Vec<(String, SequenceDef, SequenceOwner)>, Vec<String>);
+
+/// [`owned_sequence_entries_in_txn`] の寛容版: 定義がデコードできない SEQUENCE は失敗にせず、
+/// その relation キーを 2 つ目の戻り値に集めて読み飛ばす（Issue #1699。壊れた無関係な 1 件が
+/// DB 全体の open を失敗させないための、移行ドライバ向け入口）。バックエンド（I/O）エラーは
+/// 従来どおり伝播する。破損項目の所有者は判断できないため、呼び出し側は
+/// [`corrupt_may_own_id_sequence`] で該当表の扱いを fail-closed に倒す。
+fn owned_sequence_entries_lenient<S: ReadSource>(
+    write_txn: &S,
+    matches: &impl Fn(&SequenceOwner) -> bool,
+) -> Result<LenientOwnedScan> {
+    let table = match ReadSource::open_table(write_txn, SEQUENCES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), Vec::new())),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    let mut corrupt = Vec::new();
+    for entry in table.iter()?.take(MAX_SEQUENCES) {
+        let (k, v) = entry?;
+        match decode_sequence_def_with_owner(v.value()) {
+            Ok((def, Some(owner))) if matches(&owner) => {
+                out.push((sequence_entry_name(k.value()), def, owner));
+            }
+            Ok(_) => {}
+            Err(CatalogError::CorruptSchema(_)) => corrupt.push(sequence_entry_name(k.value())),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((out, corrupt))
+}
+
+/// 破損した SEQUENCE の名前が、表 `table` の `id` 用の暗黙 SEQUENCE（`<table>_id_seq[N]`）に
+/// なり得るか。なり得るなら所有関係を安全に判断できないため、割り当てを見送る（fail-closed）。
+fn corrupt_may_own_id_sequence(corrupt: &[String], table: &str) -> bool {
+    let (prefix, base) = match RelationKey::parse(table) {
+        Ok(RelationKey::Public(name)) => (String::new(), name),
+        Ok(RelationKey::InSchema { schema_id, name }) => {
+            (RelationKey::schema_prefix(schema_id), name)
+        }
+        // 解釈できない表名は判断不能として見送り側に倒す。
+        Err(_) => return true,
+    };
+    let stem = format!("{prefix}{}", make_object_name(&base, "id", "seq"));
+    corrupt.iter().any(|c| c.starts_with(&stem))
 }
 
 /// 所有者が `rewrite` で書き換わる SEQUENCE の所有者を同じ write txn で付け替える

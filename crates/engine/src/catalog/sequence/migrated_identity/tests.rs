@@ -428,7 +428,7 @@ fn migrated_real(
         }
         txn.commit_raw_for_test().expect("commit");
     }
-    let n = crate::catalog::legacy_id_migration::migrate_legacy_ids(&s).expect("migrate");
+    let n = crate::catalog::legacy_id_migration::migrate_marks_only(&s).expect("migrate");
     assert_eq!(n, tables.len());
     (s, g)
 }
@@ -494,4 +494,45 @@ fn owner_only_sequence_rejects_standalone_drop_and_rename() {
     s.drop_table("plain").expect("drop table");
     assert!(definition_bytes(&s).is_empty());
     assert!(state_rows(&s).is_empty());
+}
+
+/// 定義 blob を壊して書き換える（デコード不能な破損 SEQUENCE の再現）。
+fn corrupt_definition(storage: &Storage, name: &str) {
+    let txn = storage.begin_write_txn().expect("txn");
+    {
+        let mut t = txn.open_table(SEQUENCES_TABLE).expect("open");
+        t.insert(sequence_key(name), [0xFFu8; 3].as_slice())
+            .expect("corrupt");
+    }
+    txn.commit_raw_for_test().expect("commit");
+}
+
+fn lookup(storage: &Storage, table: &str) -> Result<Option<(String, SequenceDef)>> {
+    let txn = storage.begin_write_txn().expect("txn");
+    migrated_id_sequence_in_txn(&txn, table)
+}
+
+/// Issue #1699: 暗黙名の SEQUENCE が破損していても INSERT 側の引き当ては失敗せず、
+/// 「所有者なし」（`None`。呼び出し側が 23502 にする）として扱う。
+#[test]
+fn insert_lookup_treats_corrupt_implicit_sequence_as_no_owner() {
+    let (s, _g) = migrated_real("mig-id-corrupt-impl", &[("items", None)]);
+    s.assign_migrated_id_identity("items").expect("assign");
+    assert!(lookup(&s, "items").expect("lookup").is_some());
+    corrupt_definition(&s, "items_id_seq");
+    assert!(lookup(&s, "items").expect("lenient").is_none());
+}
+
+/// Issue #1699: 無関係な破損 SEQUENCE があっても、接尾辞付きの実所有者は引き当てられる。
+#[test]
+fn insert_lookup_finds_suffixed_owner_despite_unrelated_corrupt_sequence() {
+    let (s, _g) = migrated_real("mig-id-corrupt-other", &[("items", None)]);
+    s.create_sequence("items_id_seq", &migrated_sequence_params())
+        .expect("preexisting");
+    s.create_sequence("unrelated_seq", &migrated_sequence_params())
+        .expect("unrelated");
+    s.assign_migrated_id_identity("items").expect("assign");
+    corrupt_definition(&s, "unrelated_seq");
+    let (name, _) = lookup(&s, "items").expect("lenient").expect("owner found");
+    assert_eq!(name, "items_id_seq1");
 }

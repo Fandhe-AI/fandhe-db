@@ -532,20 +532,20 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1717（修飾名・`DROP SCHEMA ... CASCADE` 用の `drop_sequence_in_txn` 切り出し等）で行番号が移動したための追随。
     // Issue #1698（`mod migrated_identity;` の追加。+2 行）で追随（旧: 1256〜）。
     // Issue #1698（`sequence_has_dependents_in_txn` の移行表依存判定の追加。+5 行）で追随（旧: 1275〜）。
-    ("catalog/sequence.rs", 1337),
-    ("catalog/sequence.rs", 1350),
-    ("catalog/sequence.rs", 1389),
+    ("catalog/sequence.rs", 1386),
+    ("catalog/sequence.rs", 1399),
     ("catalog/sequence.rs", 1438),
-    ("catalog/sequence.rs", 1477),
-    ("catalog/sequence.rs", 1497),
-    ("catalog/sequence.rs", 1618),
-    ("catalog/sequence.rs", 1892),
-    ("catalog/sequence.rs", 1982),
-    ("catalog/sequence.rs", 2022),
-    ("catalog/sequence.rs", 2075),
-    ("catalog/sequence.rs", 2343),
-    ("catalog/sequence.rs", 2388),
-    ("catalog/sequence.rs", 2655),
+    ("catalog/sequence.rs", 1487),
+    ("catalog/sequence.rs", 1526),
+    ("catalog/sequence.rs", 1546),
+    ("catalog/sequence.rs", 1667),
+    ("catalog/sequence.rs", 1941),
+    ("catalog/sequence.rs", 2031),
+    ("catalog/sequence.rs", 2071),
+    ("catalog/sequence.rs", 2124),
+    ("catalog/sequence.rs", 2392),
+    ("catalog/sequence.rs", 2437),
+    ("catalog/sequence.rs", 2704),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
 ];

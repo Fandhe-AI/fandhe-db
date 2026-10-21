@@ -5,8 +5,13 @@
 //! （[`RowIdentity::LegacyId`]）の永続表を、移行済みの印（[`RowIdentity::MigratedId`]、
 //! カタログ v15 の `rowmode:migrated`）が付いた表へ一方向に書き換える。
 //!
-//! 方式: 行・物理キー・索引・台帳は一切書き換えない（`id` は rowid の別名のまま）。書き換えるのは
-//! カタログ値 1 件だけで、表ごとに 1 つの write トランザクションで原子的に行う。各トランザクションは
+//! 方式: 行・物理キー・索引・台帳は一切書き換えない（`id` は rowid の別名のまま）。1 段目で書き換えるのは
+//! カタログ値 1 件だけで、表ごとに 1 つの write トランザクションで原子的に行う。続く 2 段目（Issue #1699）で、
+//! 移行済みなのに `id` を所有する SEQUENCE（`<table>_id_seq`）を持たない表へ IDENTITY 相当の SEQUENCE を
+//! 割り当てる（`catalog::sequence::assign_migrated_id_identity_in_txn`。SQL の `id` 省略 INSERT の採番先。
+//! 設計記録: `docs/design/migrated-id-identity.md` D4）。2 段目は 1 段目で移した表だけでなく、すでに
+//! 移行済みで SEQUENCE が無い表も補完する（1 段目と 2 段目の間のクラッシュ後も次回の open で収束する）。
+//! 各トランザクションは
 //! 先頭でスキーマを読み直して従来方式のままかを再確認するため、再実行・並行プロセスでも収束する
 //! （途中でクラッシュしても、各表は「移行済み」か「未移行」のどちらかで、次回の open が残りを移す）。
 //!
@@ -16,26 +21,37 @@
 //!   `CorruptSchema` で拒否される。1 表の破損で DB 全体を開けなくしない）。redb の I/O・
 //!   トランザクションのエラーは open を失敗させる。
 //! - 非露出: エラー文面に表名・テナント名・値を含めない（固定文言）。
-//! - DoS: 作業量はカタログの件数に比例し行数に依存しない。移行対象が無いときは write
+//! - DoS: 1 段目の作業量はカタログの件数に比例し行数に依存しない。2 段目は割り当て対象の表ごとに
+//!   テナント単位の最大 `id` を物理キーの飛ばし読みで求める（テナント数 × log n。`MAX_CURSORS` で
+//!   打ち切る）。どちらも open 時に一度だけ走り外部入力では起動しない。対象が無いときは write
 //!   トランザクションを開かない（新規 DB に catalog 表を作らない）。
+//! - 2 段目の失敗: redb の I/O エラーは open を失敗させる。前提の不一致・上限超過など
+//!   それ以外の失敗は、その表の txn を破棄して見送る（SEQUENCE の無い移行済み表のまま残り、
+//!   `id` 省略の INSERT は固定文言で拒否される。fail-closed）。
 //! - 世代表: 書き換えた表の世代を同じ txn で進める（open 中でキャッシュは未構築だが、カタログ変更と世代 bump を
 //!   常に組にする既存規約に従う）。
 
 use redb::{ReadableDatabase, ReadableTable};
 
 use super::{
-    decode_schema_with_resolver, encode_schema, get_enum_type_in_read_txn, validate_identifier,
+    decode_schema_with_resolver, encode_schema, get_enum_type_in_read_txn, validate_relation_key,
     CatalogError, RowIdentity, CATALOG_TABLE,
 };
 use crate::storage::{Result, Storage, StorageError};
 
 /// 故障注入の位置（テスト専用の `hook` が参照する。本番は常に中断しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// 1 段目・2 段目とも「commit の前後」を表すため、変種名の接尾辞が揃うのは意図どおり。
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum MigrationStage {
     /// 表の書き換え後・commit 前。`true` を返すと commit せずトランザクションを破棄する。
     BeforeCommit,
     /// 表の commit 後。`true` を返すとそこで open を失敗させる。
     AfterCommit,
+    /// 2 段目（SEQUENCE の割り当て）の表の書き込み後・commit 前。
+    IdentityBeforeCommit,
+    /// 2 段目の表の commit 後。
+    IdentityAfterCommit,
 }
 
 /// 中断時の固定文言。
@@ -60,7 +76,23 @@ pub(crate) fn migrate_legacy_ids_with(
     storage: &Storage,
     hook: &mut dyn FnMut(MigrationStage, usize) -> bool,
 ) -> Result<usize> {
-    let candidates = legacy_candidates(storage)?;
+    let migrated = migrate_marks_with(storage, hook)?;
+    assign_missing_identities(storage, hook)?;
+    Ok(migrated)
+}
+
+/// 1 段目だけ（`rowmode:migrated` の印の書き換え）。SEQUENCE の割り当てを単独で試すテストが、
+/// 2 段目を挟まない移行済み表を用意するために使う。
+#[cfg(test)]
+pub(crate) fn migrate_marks_only(storage: &Storage) -> Result<usize> {
+    migrate_marks_with(storage, &mut |_, _| false)
+}
+
+fn migrate_marks_with(
+    storage: &Storage,
+    hook: &mut dyn FnMut(MigrationStage, usize) -> bool,
+) -> Result<usize> {
+    let candidates = candidates_with(storage, RowIdentity::LegacyId)?;
     let mut migrated = 0usize;
     for name in candidates {
         let txn = storage.begin_write_txn()?;
@@ -119,9 +151,52 @@ pub(crate) fn migrate_legacy_ids_with(
     Ok(migrated)
 }
 
-/// 読み取り txn で従来方式の候補表名を集める（辞書順）。移行対象が無ければ空を返し、
+/// 2 段目: 移行済みで `id` の SEQUENCE を持たない表へ IDENTITY 相当の SEQUENCE を割り当てる
+/// （Issue #1699）。表ごとに 1 つの write txn（SEQUENCE 作成・状態行・世代 bump を同じ txn で
+/// 原子的に commit）。部品自体が冪等なので、再実行・並行プロセスでも収束する。
+fn assign_missing_identities(
+    storage: &Storage,
+    hook: &mut dyn FnMut(MigrationStage, usize) -> bool,
+) -> Result<()> {
+    let missing = identity_candidates(storage)?;
+    let mut assigned = 0usize;
+    for name in missing {
+        let txn = storage.begin_write_txn()?;
+        match super::sequence::assign_migrated_id_identity_in_txn(&txn, &name) {
+            Ok(super::sequence::MigratedIdIdentityOutcome::AlreadyAssigned { .. }) => continue,
+            Ok(super::sequence::MigratedIdIdentityOutcome::Assigned { .. }) => {}
+            Err(CatalogError::Backend(err)) => return Err(StorageError::Backend(err)),
+            // 前提の不一致・破損・上限超過は、その表を見送る（txn は破棄され何も残らない）。
+            Err(_) => continue,
+        }
+        if hook(MigrationStage::IdentityBeforeCommit, assigned) {
+            drop(txn);
+            return Err(StorageError::Codec(INTERRUPTED_MESSAGE.to_string()));
+        }
+        super::bump_table_generation_in_txn(&txn, &name).map_err(catalog_to_storage)?;
+        crate::recovery::commit_boundary::commit(txn)?;
+        assigned += 1;
+        if hook(MigrationStage::IdentityAfterCommit, assigned) {
+            return Err(StorageError::Codec(INTERRUPTED_MESSAGE.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// 2 段目の候補: 移行済みで `id` を所有する SEQUENCE が無い表（読み取り txn で検出する。
+/// 対象が無ければ write トランザクションを開かない）。
+fn identity_candidates(storage: &Storage) -> Result<Vec<String>> {
+    let migrated = candidates_with(storage, RowIdentity::MigratedId)?;
+    if migrated.is_empty() {
+        return Ok(migrated);
+    }
+    let read = storage.db().begin_read().map_err(StorageError::from)?;
+    super::sequence::tables_missing_id_sequence(&read, &migrated).map_err(catalog_to_storage)
+}
+
+/// 読み取り txn で、行識別方式が `identity` の表名を集める（辞書順）。対象が無ければ空を返し、
 /// write トランザクションを開かない。デコード不能な項目は候補に含めない。
-fn legacy_candidates(storage: &Storage) -> Result<Vec<String>> {
+fn candidates_with(storage: &Storage, identity: RowIdentity) -> Result<Vec<String>> {
     let read = storage.db().begin_read().map_err(StorageError::from)?;
     let table = match read.open_table(CATALOG_TABLE) {
         Ok(t) => t,
@@ -132,13 +207,13 @@ fn legacy_candidates(storage: &Storage) -> Result<Vec<String>> {
     for entry in table.iter().map_err(|e| catalog_to_storage(e.into()))? {
         let (key, value) = entry.map_err(|e| catalog_to_storage(e.into()))?;
         let name = key.value();
-        if validate_identifier(name).is_err() {
+        if validate_relation_key(name).is_err() {
             continue;
         }
         let bytes = value.value();
         let mut resolve = |n: &str| get_enum_type_in_read_txn(&read, n);
         match decode_schema_with_resolver(name, bytes, &mut resolve) {
-            Ok(s) if s.row_identity() == RowIdentity::LegacyId => names.push(name.to_string()),
+            Ok(s) if s.row_identity() == identity => names.push(name.to_string()),
             Err(CatalogError::Backend(err)) => return Err(StorageError::Backend(err)),
             _ => {}
         }
@@ -268,6 +343,174 @@ mod tests {
         for n in ["a", "b", "c"] {
             assert_eq!(identity(&s, n), RowIdentity::MigratedId);
         }
+    }
+
+    fn id_sequence_owner(
+        storage: &Storage,
+        table: &str,
+    ) -> Option<crate::catalog::sequence::SequenceOwner> {
+        storage
+            .sequence_owner(&format!("{table}_id_seq"))
+            .ok()
+            .flatten()
+    }
+
+    /// Issue #1699: 開くと 1 段目で移した表へ `<table>_id_seq` が割り当てられ（所有者 `(table, id)`）、
+    /// 3 回目の open は何も書かない。
+    #[test]
+    fn open_assigns_id_sequence_and_is_idempotent() {
+        let path = unique_db_path("legacy-id-assign");
+        let _g = CleanupGuard(path.clone());
+        {
+            let s = Storage::open(&path).expect("open");
+            s.create_table(&legacy("plain")).expect("create");
+            with_rows(&s, "plain");
+            assert!(id_sequence_owner(&s, "plain").is_none());
+        }
+        {
+            let s = Storage::open(&path).expect("reopen");
+            let owner = id_sequence_owner(&s, "plain").expect("owner");
+            assert_eq!(
+                (owner.table.as_str(), owner.column.as_str()),
+                ("plain", "id")
+            );
+        }
+        let s = Storage::open(&path).expect("third open");
+        assert_eq!(s.write_txn_creations(), 0);
+        assert!(id_sequence_owner(&s, "plain").is_some());
+    }
+
+    /// Issue #1699: 1 段目だけ済んで SEQUENCE が無い移行済み表（#2589 以降の DB）も、次の open が補完する。
+    #[test]
+    fn open_backfills_sequence_for_already_migrated_tables() {
+        let path = unique_db_path("legacy-id-backfill");
+        let _g = CleanupGuard(path.clone());
+        {
+            let s = Storage::open(&path).expect("open");
+            s.create_table(&legacy("old")).expect("create");
+            assert_eq!(migrate_marks_only(&s).expect("marks"), 1);
+            assert_eq!(identity(&s, "old"), RowIdentity::MigratedId);
+            assert!(id_sequence_owner(&s, "old").is_none());
+        }
+        let s = Storage::open(&path).expect("reopen");
+        assert!(id_sequence_owner(&s, "old").is_some());
+    }
+
+    /// Issue #1699: SCHEMA 配下（内部キー `#<id>.<name>`）の移行済み表も、次の open が所有 SEQUENCE を
+    /// 補完する（候補抽出と割り当てが relation キーに対応していること）。
+    #[test]
+    fn open_backfills_sequence_for_schema_scoped_migrated_tables() {
+        use crate::catalog::namespace::RelationKey;
+        let path = unique_db_path("legacy-id-backfill-schema");
+        let _g = CleanupGuard(path.clone());
+        let key;
+        {
+            let s = Storage::open(&path).expect("open");
+            s.create_schema("tenant-a", "s1", false).expect("schema");
+            let sid = s.schema_id("tenant-a", "s1").expect("id").expect("some");
+            key = format!("{}t", RelationKey::schema_prefix(sid));
+            s.create_table(&legacy(&key)).expect("create");
+            assert_eq!(migrate_marks_only(&s).expect("marks"), 1);
+            assert_eq!(identity(&s, &key), RowIdentity::MigratedId);
+            assert!(id_sequence_owner(&s, &key).is_none());
+        }
+        let s = Storage::open(&path).expect("reopen");
+        let sid = s.schema_id("tenant-a", "s1").expect("id").expect("some");
+        let seq = format!("{}t_id_seq", RelationKey::schema_prefix(sid));
+        let owner = s.sequence_owner(&seq).expect("lookup").expect("owner");
+        assert_eq!(
+            (owner.table.as_str(), owner.column.as_str()),
+            (key.as_str(), "id")
+        );
+    }
+
+    /// Issue #1699: 無関係な SEQUENCE が 1 件壊れていても open は成功し、他の表の割り当ては続く。
+    /// 壊れた名前が `id` 用の暗黙名に当たる表は所有関係を判断できないため見送る（fail-closed）。
+    #[test]
+    fn corrupt_sequence_does_not_block_open_or_other_assignments() {
+        let path = unique_db_path("legacy-id-corrupt-seq");
+        let _g = CleanupGuard(path.clone());
+        {
+            let s = Storage::open(&path).expect("open");
+            s.create_table(&legacy("good")).expect("create");
+            s.create_table(&legacy("risky")).expect("create");
+            let txn = s.begin_write_txn().expect("txn");
+            {
+                let mut t = txn
+                    .open_table(super::super::sequence::SEQUENCES_TABLE)
+                    .expect("sequences");
+                t.insert(("public", "unrelated_seq"), b"garbage".as_slice())
+                    .expect("insert");
+                t.insert(("public", "risky_id_seq"), b"garbage".as_slice())
+                    .expect("insert");
+            }
+            txn.commit_raw_for_test().expect("commit");
+        }
+        let s = Storage::open(&path).expect("open despite corrupt sequence");
+        assert!(id_sequence_owner(&s, "good").is_some());
+        assert!(id_sequence_owner(&s, "risky").is_none());
+    }
+
+    /// Issue #1699: 2 段目を commit 前・commit 後で中断しても、再実行で収束し二重に作らない。
+    #[test]
+    fn interrupted_identity_assignment_converges() {
+        let path = unique_db_path("legacy-id-assign-crash");
+        let _g = CleanupGuard(path.clone());
+        let s = Storage::open(&path).expect("open");
+        for n in ["a", "b"] {
+            s.create_table(&legacy(n)).expect("create");
+        }
+        let r =
+            migrate_legacy_ids_with(&s, &mut |st, _| st == MigrationStage::IdentityBeforeCommit);
+        assert!(r.is_err());
+        // 1 段目は commit 済み、2 段目は未 commit のため SEQUENCE は無い。
+        assert_eq!(identity(&s, "a"), RowIdentity::MigratedId);
+        assert!(id_sequence_owner(&s, "a").is_none());
+        let r = migrate_legacy_ids_with(&s, &mut |st, k| {
+            st == MigrationStage::IdentityAfterCommit && k == 1
+        });
+        assert!(r.is_err());
+        assert!(id_sequence_owner(&s, "a").is_some());
+        assert!(id_sequence_owner(&s, "b").is_none());
+        migrate_legacy_ids(&s).expect("rerun");
+        assert!(id_sequence_owner(&s, "b").is_some());
+        // 収束後は write txn を開かない。
+        let before = s.write_txn_creations();
+        migrate_legacy_ids(&s).expect("again");
+        assert_eq!(s.write_txn_creations(), before);
+    }
+
+    /// Issue #1699 (J5): 移行済みなのに所有 SEQUENCE が無い表（2 段目が見送った表）への `id` 省略 INSERT は、
+    /// 値も行も消費せず `23502` で拒否される。明示 `id` の INSERT は従来どおり通る。
+    #[test]
+    fn omitted_id_without_sequence_is_rejected_with_23502() {
+        let path = unique_db_path("legacy-id-noseq");
+        let _g = CleanupGuard(path.clone());
+        let s = Storage::open(&path).expect("open");
+        s.create_table(&legacy("t")).expect("create");
+        assert_eq!(migrate_marks_only(&s).expect("marks"), 1);
+        let core =
+            crate::core::EngineCore::from_storage(s, Box::new(crate::kernel::CpuScalarProvider));
+        let ctx = crate::policy::PolicyContext::with_visibilities(
+            "tenant-a",
+            [Visibility::Public, Visibility::Private],
+        )
+        .expect("ctx");
+        let mut session = crate::sql::mode::SessionState::default();
+        let err = core
+            .execute_sql_in_session(&ctx, &mut session, "INSERT INTO t (body) VALUES ('x')")
+            .expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "23502", "{err}");
+        core.execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "INSERT INTO t (id, body) VALUES (1, 'x')",
+        )
+        .expect("explicit id still works");
+        let rows = core
+            .execute_sql(&ctx, "SELECT id FROM t LIMIT 10")
+            .expect("select");
+        assert_eq!(rows.rows.len(), 1);
     }
 
     /// 採番方式の表は移行しない。壊れた項目は残したまま他の表を移行し、open は成功する。
