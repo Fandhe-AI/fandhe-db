@@ -434,15 +434,19 @@ fn verify(path: &str, mode: &str) -> Res<u64> {
     if total == 0 {
         return Err("no rows".to_string());
     }
-    // 宣言の有無: 監査が成功すれば宣言済み。
-    let declared: Vec<bool> = INDEXES
-        .iter()
-        .map(|(name, _)| {
-            ctx(TENANTS[0])
-                .map(|c| core.verify_gin_index_read_only(&c, name).is_ok())
-                .unwrap_or(false)
-        })
-        .collect();
+    // 宣言の有無: 監査が成功すれば宣言済み。`IndexNotFound` のみ「宣言なし」とみなし、
+    // それ以外のエラー（カタログ破損・読み取り失敗等）は検証失敗として伝播する（fail-closed）。
+    let mut declared: Vec<bool> = Vec::with_capacity(INDEXES.len());
+    for (name, _) in INDEXES.iter() {
+        let c = ctx(TENANTS[0])?;
+        match core.verify_gin_index_read_only(&c, name) {
+            Ok(_) => declared.push(true),
+            Err(engine::tenant::TenantWriteError::Catalog(
+                engine::catalog::CatalogError::IndexNotFound(_),
+            )) => declared.push(false),
+            Err(_) => return Err("declaration probe failed".to_string()),
+        }
+    }
     if mode == "dml" && declared.iter().any(|d| !d) {
         return Err("index declaration lost".to_string());
     }
