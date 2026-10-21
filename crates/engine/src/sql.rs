@@ -173,6 +173,7 @@ pub mod declarative_predicate;
 pub(crate) mod describe;
 #[cfg(test)]
 mod identity_column_tests;
+pub(crate) mod insert_select;
 pub(crate) mod interval_arith;
 pub(crate) mod matview;
 #[cfg(test)]

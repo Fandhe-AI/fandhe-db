@@ -71,6 +71,9 @@ pub use temp_route::SessionRoutedSql;
 
 mod matview_exec;
 
+// INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
+mod insert_select_exec;
+
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
 /// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は
 /// `OFFSET`・集合演算の枝行数・サブクエリ内側行数など他の内部上限として固定のまま残す。
