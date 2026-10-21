@@ -241,6 +241,14 @@ pub struct SessionState {
     /// `"$user"` の展開に使う、接続した主体の username。認証層（wire-server の handshake）が認証成功後に
     /// 1 回だけ設定する契約で、SQL 文から変える経路は持たない（`allow_ddl` と同じ。ADR D6）。
     session_user: Option<std::sync::Arc<str>>,
+    /// 拡張クエリの Parse が `schema.name` の修飾を解決するテナント（TABLE-27・Issue #1717、ADR D6）。
+    /// Parse には認証コンテキスト（`PolicyContext`）が渡らないため、接続の認証済みテナントを
+    /// 認証成功後に 1 回だけ束縛する（[`Self::bind_resolution_tenant`]）。SQL 文経由で変更する
+    /// 手段は無い。未束縛（既定）の Parse はテナント SCHEMA の修飾を `3F000` にする（fail-closed）。
+    ///
+    /// `Box<str>`: `SessionState` を抱える `sql::transaction::TxnState` の enum 内サイズ差（clippy
+    /// `large_enum_variant`）を増やさないため、`String` より小さい表現にする。
+    resolution_tenant: Option<Box<str>>,
 }
 
 /// `search_path` の世代の採番元。0 は採番されない。
@@ -450,6 +458,25 @@ impl SessionState {
     /// [`crate::sql::ddl::require_ddl_permission`] が唯一の判定点として参照する。
     pub fn ddl_allowed(&self) -> bool {
         self.ddl_allowed
+    }
+
+    /// 拡張クエリの Parse が SCHEMA 修飾の解決に使うテナント（未束縛なら `None`）。
+    pub fn resolution_tenant(&self) -> Option<&str> {
+        self.resolution_tenant.as_deref()
+    }
+
+    /// 拡張クエリの Parse が SCHEMA 修飾を解決するテナントを束縛する。wire-server の handshake が
+    /// 認証成功直後に 1 回だけ呼ぶ契約（[`Self::allow_ddl`] と同じ。SQL 文経由の経路は無い）。
+    /// 既に別のテナントへ束縛済みなら変更せず `false` を返す（接続の途中でテナントを差し替えて
+    /// 他テナントの SCHEMA を解決する経路を作らない）。
+    pub fn bind_resolution_tenant(&mut self, tenant: &str) -> bool {
+        match &self.resolution_tenant {
+            None => {
+                self.resolution_tenant = Some(tenant.into());
+                true
+            }
+            Some(existing) => &**existing == tenant,
+        }
     }
 
     /// このセッションへ DDL 実行権限を付与する。wire-server の handshake が

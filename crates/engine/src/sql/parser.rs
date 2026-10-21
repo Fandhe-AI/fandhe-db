@@ -1614,7 +1614,8 @@ fn bind_ranking(
 /// 式項目を作るため `name` は常に取得できる）。
 pub(crate) fn default_expr_alias(expr: &Expr) -> String {
     match expr {
-        Expr::Call { name, .. } => name.clone(),
+        // SCHEMA 修飾の UDF は内部キー `#<id>.f` で束縛されるため、公開名 `f` へ戻す（Issue #1717）。
+        Expr::Call { name, .. } => crate::catalog::namespace::relation_name_part(name).to_string(),
         // SQL/JSON 問い合わせ関数の既定列名は PostgreSQL と同じ小文字の関数名（Issue #2187）。
         Expr::SqlJsonQuery(q) => q.kind.as_str().to_string(),
         // PostgreSQL にならった既定エイリアス（対象ビヘイビア: SQL-26。

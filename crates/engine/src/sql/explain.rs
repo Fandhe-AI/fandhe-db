@@ -176,9 +176,13 @@ impl ExplainIndexNames {
 fn normalize_index_names(mut names: Vec<String>) -> Vec<String> {
     if names
         .iter()
-        .any(|n| crate::catalog::validate_identifier(n).is_err())
+        .any(|n| crate::catalog::validate_relation_key(n).is_err())
     {
         return Vec::new();
+    }
+    // SCHEMA 配下の索引は内部キー `#<id>.<name>` で渡る。注記には公開名だけを出す（内部 ID を出さない）。
+    for n in &mut names {
+        *n = crate::catalog::namespace::relation_name_part(n).to_string();
     }
     names.sort();
     names.dedup();
@@ -706,6 +710,7 @@ fn scalar_plan_token(plan: ScalarPlan) -> &'static str {
         ScalarPlan::IndexConjunction => "index_conjunction",
         ScalarPlan::IndexPartial => "index_partial",
         ScalarPlan::IndexPrimaryKey => "index_primary_key",
+        ScalarPlan::IndexGin => "index_gin",
     }
 }
 
@@ -736,6 +741,9 @@ pub(crate) enum AccessPath {
     /// 広域取得で宣言 PRIMARY KEY の全構成列へのリテラル等価が AND 連言にあり、永続一意索引の
     /// 点検索で候補を解決する（Issue #2198。`sql::pk_point::classify_pk_point`）。
     PrimaryKeyLookup,
+    /// 広域取得で jsonb 列への包含・キー存在・jsonpath 演算子が GIN 相当索引のポスティングで候補を解決する
+    /// （INDEX-8、Issue #2208。`sql::gin_scan::classify_gin_scan`）。
+    GinIndexCandidates,
 }
 
 fn access_path_token(path: AccessPath) -> &'static str {
@@ -745,6 +753,7 @@ fn access_path_token(path: AccessPath) -> &'static str {
         AccessPath::ScalarIndexGroupEnumeration => "scalar_index_group_enumeration",
         AccessPath::FullScan => "full_scan",
         AccessPath::PrimaryKeyLookup => "primary_key_lookup",
+        AccessPath::GinIndexCandidates => "gin_index_candidates",
     }
 }
 

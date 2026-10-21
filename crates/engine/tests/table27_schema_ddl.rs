@@ -226,8 +226,7 @@ fn syntax_table() {
         "CREATE SCHEMA s AUTHORIZATION bob",
         "CREATE SCHEMA IF NOT EXISTS s AUTHORIZATION bob",
         "CREATE SCHEMA s CREATE TABLE x (a INT)",
-        "DROP SCHEMA s CASCADE",
-        "DROP SCHEMA IF EXISTS s CASCADE",
+        // `DROP SCHEMA ... CASCADE` は Issue #1717 で対応した（`table27_schema_objects.rs`）。
         "DROP SCHEMA a, b",
     ] {
         assert_eq!(code_as(&core, "alice", &mut s, sql), "0A000", "{sql}");

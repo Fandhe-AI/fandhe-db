@@ -162,9 +162,11 @@ README の公開済み要点を超えて具体化しない。公開境界を広�
   `public` の表の FK・索引、`OWNED BY`、`DEFAULT nextval` から、テナントの SCHEMA の
   オブジェクトへの参照。共有オブジェクトを経由すると、他テナントのセッションが名前解決（D4）を
   通らずにテナント内のオブジェクトへ到達できてしまうため
-- 逆向き（テナントの SCHEMA から `public` への参照）は許可する。`public` の行には暗黙 RLS が
-  常に掛かる
-- 受理範囲は #1717 で確定する。それまでは拒否側に倒す
+- 逆向き（テナントの SCHEMA から `public` への参照）も、public 側の DDL（`DROP` の依存判定・
+  `CASCADE`）がテナント境界に対応するまでは拒否する（#1717 のレビューで確定）。`public` の `DROP` の
+  依存判定は全テナントを走査するため、許すと他テナントの非公開の依存の有無で結果（成功／`2BP01`）が
+  分かれて存在情報が漏れ、`CASCADE` では他テナントの定義まで消える。対応後に再検討する
+- 受理範囲は #1717 で確定した（同じ所属内の参照だけを許可する）
 
 ### D8. DROP SCHEMA と CASCADE の決定的順序（#1713・#1717）
 
@@ -305,7 +307,111 @@ TABLE-27 のポインタ。`schema.table` のテーブル参照を解決する�
 - **対象外**: `search_path`（#1715）、オブジェクト名の修飾、NoSQL 表層の `table`、
   `SHOW/CANCEL PARTITIONED DML .. ON <table>`、引用付き修飾名・3 部名（従来の `42601`）
 
-## 8. Issue #1715 実装記録
+## 8. Issue #1717 実装記録
+
+TABLE-27 のポインタ。テナントの SCHEMA 配下に表・ビュー・索引・SEQUENCE・UDF を置けるようにし、
+`DROP SCHEMA ... CASCADE` を入れた（本文は ADR D2・D5・D7・D8 に従う）。
+
+- **解決器**: #1714 の解決は bool（存在するか）から内部 ID（`Option<u64>`）を返す `SchemaResolver`
+  へ変えた。解決できたテナント SCHEMA の名前位置は `Token::Ident("#<id>.<name>")`（内部キー）へ
+  置き換わる。ctx を持つ入口（`execute_sql*`・`begin_copy*`）は `Storage::schema_id(tenant, schema)` の
+  1 回の get を渡し、ctx を持たない入口（`parse_sql`・文字列の検証器・Rust API）は `None` のまま
+  `3F000`。#1714 の「`3F000` を受けて後から精密化する」処理（`refine_*`）は不要になり削除した。
+  存在しない SCHEMA と他テナントの SCHEMA は同じ `3F000`・同じ文言
+- **名前位置**: #1714 の表参照に加え、`CREATE`／`DROP`／`ALTER` の `VIEW`・`SEQUENCE`、`DROP INDEX`、
+  `IF [NOT] EXISTS` の後、カンマ区切りの DROP 一覧、関数名の位置（`CREATE FUNCTION s.f(`・式中の
+  `s.f(x)`）、`nextval`／`currval`／`setval` の文字列引数（regclass 相当。解決後は文字列ではなく
+  `#` を含む `Ident` に置き換え、利用者が文字列で内部キーを直接指定できないようにする）。
+  `RENAME TO` の新しい名前・`CREATE INDEX` の索引名は修飾できない（PG と同じ。`42601`）。
+  関数名の位置で SCHEMA が見つからない場合は従来の `42601`（SQL-44 の範囲外の形）のまま
+- **内部キーを作れる者**: 名前解決器だけ。字句解析器は `#` を含む識別子を作らない（引用形でも拒否）。
+  保存済みビュー本文の再読込（`lexer::tokenize_stored_view_body`）と本実装自身の描画の再読込
+  （`tokenize_rendered`）だけが、正規形の引用形 `"#<id>.<name>"` を 1 個の `Ident` として受理する。
+  `render_tokens`・単純形ビュー本文の描画は内部キーを引用形で出力する
+- **検証器の二分**: `catalog::validate_relation_key`（裸の識別子または内部キー）を新設し、relation 名
+  （表・ビュー・索引・SEQUENCE のカタログキー、FK の参照先、`ColumnDefault::Sequence`、UDF の登録キー）の
+  位置だけを差し替えた。列名・SCHEMA 名・制約名・別名・利用者の生入力は厳格な `validate_identifier` の
+  まま。利用者の生の表名を受ける入口は厳格なまま: NoSQL（HTTP）の `table` は `check_identifier`、
+  Rust API の `EngineCore::insert_row`／`update_row`／`delete_row` は `validate_identifier` を先に通す。
+  下位の `tenant`・`catalog` モジュールの `pub` 関数は組み込み側（信頼できる呼び出し元）向けで、内部キーを
+  受理する
+- **派生名**: 制約の既定名（`<table>_pkey`・`_key`・`_fkey`・`_check`）・暗黙 SEQUENCE（SERIAL・IDENTITY）・
+  一意索引の実体の UNIQUE 制約名は、表の**名前部**から導出する（内部 ID を含めない）。暗黙 SEQUENCE と
+  索引は表と同じ SCHEMA に置く。`ALTER ... RENAME TO` は SCHEMA を変えない（`catalog::namespace::sibling_key`）。
+  行ストア・世代・台帳・分割実行ジョブ・rowid 採番状態・キャッシュは、カタログ水準のキー（内部キー）で
+  引くため public の同名と混ざらない（`tests/table27_schema_objects.rs` で固定）
+- **SEQUENCE**: 定義キーは `("#<id>", name)`（`sequence_key` は部分文字列を借用するだけ。`public` のバイト列は
+  不変）。表を走査して名前を取り出す箇所は `sequence_entry_name` を通す
+- **ビュー本文（D5）**: 作成時に解決した内部キーで保存する（早期束縛）。SCHEMA の削除・再作成で内部 ID は
+  再利用されないため、古い本文は `42P01` になる。格納形式の版は上げない。内部キーを含む本文を持つ DB を
+  旧バイナリで開くと decode の検証で `CorruptSchema`（fail-closed）になる
+- **D7（`42501`）**: public と SCHEMA 配下の間をまたぐ依存は両方向とも `SchemaDependencyForbidden`
+  （固定文言）で拒否する（`sql::schema_dependency`。DDL 権限ゲートの直後・カタログ書き込みの前）。
+  対象は表の FK の参照先・`DEFAULT nextval`（`ALTER` の追加 FK・`SET DEFAULT` を含む）とビュー・
+  materialized view の本文の参照先。ビューの SCHEMA 配下 → public は、DROP の依存判定と同じ導出
+  （`catalog::view_body_relations`）で調べる。同一 SCHEMA 内は許可。SCHEMA 配下 → public を拒否する理由は、
+  public 側の `DROP` の依存判定が全テナントを走査し、他テナントの非公開の依存の有無が成否に表れるため。
+  `OWNED BY` は構文上テナント表を指せない（3 部名）ため対象外
+- **UDF**: セッション単位の登録（永続化しない）は変えず、登録キー・呼び出しキーを内部キーにした。
+  SCHEMA の削除後は解決できず、作り直した SCHEMA は別の内部 ID のため古い登録に当たらない。
+  `public.f`・組み込み SCHEMA の修飾は解決しない（組み込み関数へ化けない）
+- **`DROP SCHEMA ... CASCADE`（D8）**: 単一の write txn・1 回の commit。(1) SCHEMA 配下の表・ビューを根に、
+  既存の依存列挙（`catalog::dependency`）で外部の依存（別 SCHEMA のビュー・FK）を求めて先に削除 →
+  (2) 配下のビュー（キー昇順）→ (3) 配下の表（既存の `DROP TABLE ... CASCADE` 本体。索引宣言・行ストア・
+  世代・台帳・所有 SEQUENCE を継承）→ (4) 残りの SEQUENCE（キー昇順）→ (5) SCHEMA 行。依存を正確に
+  判定できない場合、または外部の表が配下の SEQUENCE を `DEFAULT nextval` で参照している場合は
+  `2BP01`（DEFAULT は連鎖削除しない）。RESTRICT は従来どおり `2BP01`。ID カウンタは巻き戻さない
+- **表示変換（D2）**: ctx を持つ入口の出口で、エラー文言（`SqlSurfaceError::map_text`）と EXPLAIN の
+  計画テキストに現れる内部キーを、そのテナントの SCHEMA 名で `<schema>.<name>` へ戻す
+  （`relation_name::display_relation_keys`。逆引きできない ID は `#<id>.` を落とす）。修飾列参照の
+  公開名は名前部（`SELECT t.id FROM s.t` を受理）。成功応答の構造体（`AlterTableOutcome` 等）は
+  wire へ出ないため変換しない
+- **一覧 API**: `Storage::list_tables`・`list_indexes` は public の名前だけを返す（内部キーを返さない）
+- **拡張クエリ**: Parse は ctx を受け取らないため、接続の認証済みテナントを
+  `SessionState::bind_resolution_tenant` で認証成功後に 1 回だけ束縛し（wire-server の handshake。
+  SQL 文からは変更できない）、Parse の解決に使う。未束縛の Parse は従来どおり `3F000`。Bind は
+  Parse 時に解決済みのトークン列から再 parse する。束縛済みセッションを別テナントの ctx で使う実行入口
+  （`execute_*`・`begin_copy*`）は `XX000` で拒否する（実行時の再検証）。Bind・Describe・Parse の
+  エラー文言も、Parse に使ったテナントの SCHEMA 名へ戻す
+- **破壊的変更**: `SqlSurfaceError::SchemaDependencyForbidden` の追加（外部の網羅的 `match` は追随が必要）、
+  `Storage::list_tables`／`list_indexes` が SCHEMA 配下を返さなくなる、`ValidatedDropSchema` が `CASCADE` を保持
+- **対象外**: MATERIALIZED VIEW・ENUM 型の SCHEMA 配置（`0A000`／`42601` のまま。ADR D5 は ENUM 型の
+  修飾を #1717 としていたが、型名の解決位置〔列型・キャスト〕が加わり範囲が倍増するため見送った）、
+  NoSQL（HTTP）表層・Rust API の修飾名、`search_path`（#1715）、`SET SCHEMA`・SCHEMA の改名（#1716）、
+  `ALTER VIEW`（未実装）、UDF の永続化
+- **既知の制限**: 単独の `SELECT nextval('s.q')` は public の `SELECT nextval('q')` と同じく未対応だが、
+  SQLSTATE は `42703`（public は `0A000`）になる（どちらも拒否。内部キーは文言に出ない）。
+  解決（Parse）から書き込みまでの間に別セッションが同じ SCHEMA を削除する競合は、表・ビュー・索引・
+  SEQUENCE の作成 txn 内で `ensure_key_schema_alive_in_txn` が SCHEMA の存在を確認して拒否する
+  （削除済みの内部 ID へ作成できない）。UDF はセッション単位の登録で永続化しないため対象外。
+
+## 9. Issue #1716 実装記録
+
+親 #1711・TABLE-27 のポインタ。`ALTER SCHEMA ... RENAME TO` と `ALTER TABLE ... SET SCHEMA` を追加した。
+
+- **ALTER SCHEMA RENAME TO**: `schemas` 表の 1 行を付け替えるだけで、内部 ID は不変（D2）。中の
+  オブジェクト（表・索引・SEQUENCE・VIEW 等）は内部 ID のキーで格納されているため追随する
+  （単体テストで内部 ID の保持と中身を持つ SCHEMA の DROP 拒否を確認済み）。判定順は、旧名が
+  組み込み名（`42501`）→ 旧名の不在・他テナントの同名（`3F000`、同一応答）→ 新名が組み込み名・
+  既存・同名（`42P06`）→ 新名が予約名（`42939`）。`OWNER TO` は `0A000`（D10）。
+  1 回の write txn・1 回の commit で行う
+- **ALTER TABLE SET SCHEMA**: 判定順は、DDL 権限ゲート → 表の存在（`42P01`／`42809`）→ 移動先の
+  解決（`public` は ASCII の大小を無視。`pg_temp`・`pg_catalog`・`information_schema` は `0A000`。
+  それ以外は `(tenant, name)` の 1 回 get で、不在と他テナントの SCHEMA は同一の `3F000`）→
+  テナント境界（`public` の表をテナントの SCHEMA へ移す経路は `42501`。D7）→ `public` から
+  `public` は何も書かない成功。複数アクションとの併用は `42601`。一時表は従来どおり `0A000`
+- **スコープの制約（#1717 の取り込み後の確認事項）**: テナント SCHEMA に表を置く経路（`#<id>.` キーの書き込みと
+  decode 側の受理）が未実装のため、移動元は常に `public` の表になる。次は #1717 の取り込み後に
+  実装・検証する: テナント SCHEMA 間の実移動（表・索引・制約・`OWNED BY` SEQUENCE のキー付け替え、
+  移動先の名前衝突 `42P07`、ビューは移さない）、テナント SCHEMA から `public` への移動（`42501`）、
+  実移動後の索引と行の保持の検証
+- **既知の制限**: `ALTER TABLE t SET SCHEMA <一時表と同名の名前>` は一時表のトークン走査に当たり
+  `0A000` になる（拒否側に倒れるだけで境界は緩まない）
+- **対象外**: `ALTER SEQUENCE／VIEW／INDEX／MATERIALIZED VIEW／TYPE ... SET SCHEMA`（#1717。
+  `ALTER SEQUENCE ... SET SCHEMA` は従来の `0A000` を維持）、`ALTER TABLE IF EXISTS`（TABLE-36）、
+  `ALTER SCHEMA ... OWNER TO`（SQL-39）
+
+## 10. Issue #1715 実装記録
 
 TABLE-27 (3) のポインタ。セッション変数 `search_path` を engine に入れた（本文は ADR D5・D6・D11 に従う）。
 
@@ -355,29 +461,3 @@ TABLE-27 (3) のポインタ。セッション変数 `search_path` を engine �
   優先順（#1717）、`pg_temp.x` の結線、`current_schema()`（#1718）、StartupMessage の `search_path`・
   `ParameterStatus` 通知、`set_config('search_path', ..)`・`ALTER ROLE .. SET search_path`、NoSQL 表層
   （ステートレスで既定の path）
-
-## 9. Issue #1716 実装記録
-
-親 #1711・TABLE-27 のポインタ。`ALTER SCHEMA ... RENAME TO` と `ALTER TABLE ... SET SCHEMA` を追加した。
-
-- **ALTER SCHEMA RENAME TO**: `schemas` 表の 1 行を付け替えるだけで、内部 ID は不変（D2）。中の
-  オブジェクト（表・索引・SEQUENCE・VIEW 等）は内部 ID のキーで格納されているため追随する
-  （単体テストで内部 ID の保持と中身を持つ SCHEMA の DROP 拒否を確認済み）。判定順は、旧名が
-  組み込み名（`42501`）→ 旧名の不在・他テナントの同名（`3F000`、同一応答）→ 新名が組み込み名・
-  既存・同名（`42P06`）→ 新名が予約名（`42939`）。`OWNER TO` は `0A000`（D10）。
-  1 回の write txn・1 回の commit で行う
-- **ALTER TABLE SET SCHEMA**: 判定順は、DDL 権限ゲート → 表の存在（`42P01`／`42809`）→ 移動先の
-  解決（`public` は ASCII の大小を無視。`pg_temp`・`pg_catalog`・`information_schema` は `0A000`。
-  それ以外は `(tenant, name)` の 1 回 get で、不在と他テナントの SCHEMA は同一の `3F000`）→
-  テナント境界（`public` の表をテナントの SCHEMA へ移す経路は `42501`。D7）→ `public` から
-  `public` は何も書かない成功。複数アクションとの併用は `42601`。一時表は従来どおり `0A000`
-- **スコープの制約（#1717 への申し送り）**: テナント SCHEMA に表を置く経路（`#<id>.` キーの書き込みと
-  decode 側の受理）が未実装のため、移動元は常に `public` の表になる。次は #1717 の取り込み後に
-  実装・検証する: テナント SCHEMA 間の実移動（表・索引・制約・`OWNED BY` SEQUENCE のキー付け替え、
-  移動先の名前衝突 `42P07`、ビューは移さない）、テナント SCHEMA から `public` への移動（`42501`）、
-  実移動後の索引と行の保持の検証
-- **既知の制限**: `ALTER TABLE t SET SCHEMA <一時表と同名の名前>` は一時表のトークン走査に当たり
-  `0A000` になる（拒否側に倒れるだけで境界は緩まない）
-- **対象外**: `ALTER SEQUENCE／VIEW／INDEX／MATERIALIZED VIEW／TYPE ... SET SCHEMA`（#1717。
-  `ALTER SEQUENCE ... SET SCHEMA` は従来の `0A000` を維持）、`ALTER TABLE IF EXISTS`（TABLE-36）、
-  `ALTER SCHEMA ... OWNER TO`（SQL-39）

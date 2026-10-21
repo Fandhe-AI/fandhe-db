@@ -659,6 +659,15 @@ fn read_in_works_over_a_write_txn_snapshot() {
     assert!(s.materialized_view_definition("mv").unwrap().is_none());
 }
 
+/// 内部キー（`#` 始まり）は定義が無い扱い（`Ok(None)`＝未 populate と混同しない）。
+#[test]
+fn read_in_internal_key_is_view_not_found() {
+    let (_g, _p, s) = open("mv-read-in-internal");
+    let write_txn = s.begin_write_txn().expect("write");
+    let r = read_materialized_view_in(&*write_txn, "#1.mv", &ctx("a"));
+    assert!(matches!(r, Err(CatalogError::ViewNotFound(_))));
+}
+
 /// TABLE-42 (3)・Issue #1665: 逐次 REFRESH は commit すると旧実体を新しい文脈の実体で置き換える。
 #[test]
 fn streamed_refresh_replaces_all_contexts_on_commit() {

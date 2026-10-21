@@ -315,3 +315,39 @@ SQL-17・SQL-18・SQL-20・SQL-32）。契約の詳細は spec を正とし、�
   - NoSQL `create_table` を採番方式で作るかは破壊的変更のためオーナー判断（作成経路は据え置き。§12）。
   - NoSQL `aggregate`／`search` の採番方式の表への対応。
   - スカラー `ORDER BY` の同点順序を PK 値にする engine 横断の変更。
+
+## 14. Issue #2202 実装記録（PK 分離後の回帰テスト: RLS 境界・crash 耐性・既存 DB 移行）
+
+- **ポインタ**: TABLE-23（関連: TABLE-12・TABLE-16・TABLE-17・RLS-9・RLS-10・RECOVER-10〜12・PERSIST-1）。
+  本 Issue は **テストだけを追加し、engine 本体・公開 API は変更しない**。
+- **RLS 境界**（`crates/engine/tests/rls10_primary_key_paths.rs`）: 採番方式の表（単一 PK・複合 PK・宣言 `id`
+  の PK・PK なし・FK 各種）と移行済みの表について、PK 点検索・UPSERT（`ON CONFLICT (<PK 列>)`）・PK 値の変更・
+  FK（宣言キー参照。CASCADE／SET NULL 含む）を、閲覧テナント 3 つ×可視性 2 モード×実行経路 2 つ
+  （autocommit／明示トランザクション）の統一マトリクスで検査する（T0〜T7。`rls10_write_constraint_paths.rs` と
+  同じ構成）。flooded は他 2 テナントが同一 PK 値・同一 FK 親キーを持つ行を、閲覧テナントの INSERT の間に
+  挟んで入れる（rowid 採番がテナント間で混ざっても応答と自テナントの事後状態が変わらないことを固定する）。
+  - 可視性軸: 採番方式の表は SQL `INSERT` が可視性を Private に固定し、行 API は `0A000` で拒否するため
+    Public 行を作れない。採番方式の表は Private 込みモードを主軸にし、Public のみモードでは「読み取りが
+    0 行・書き込みが所有かつ可視の行に限られる（自テナントの Private 行への `DO UPDATE` は `42501`）」ことと
+    応答の不変性を確認する。Public 行は、Rust API で seed してから開き直して移行した表で検査する。
+  - 対象外: 採番方式の親への `id` 参照 FK（§11・§12）、他テナントの Public 行の読み取り可視性
+    （`rls10_relational_paths.rs` の担当）、NoSQL 表層（`table23_nosql_pk_row_address.rs` の担当）。
+- **crash 耐性**（`crates/engine/examples/crash_tool_unique_index.rs`）: 新しい CI ジョブ・スクリプトは作らず、
+  既存の `crash-test-unique-index` の対象表に、採番方式の `docs_pk`（複合 PK＋UNIQUE。各バッチ先頭行への
+  `ON CONFLICT (grp, k) DO UPDATE` を含む）と PK なしの `docs_nopk` を追加した（既存の Issue ごとの表追加と
+  同じ流儀で、スクリプトのロジックは変えない）。`verify` は、`k`／`seq` の 0 起点連続性・BATCH 整合
+  （rowid の再払い出しによる行の上書き・消失の検出を兼ねる）、PK／UNIQUE の重複再挿入が必ず `23505` に
+  なること、点検索、読み取り専用の一意索引検証を確かめる。あわせて、従来方式の表（反復ごとの再 open で
+  移行済み）の `id` 契約（点検索・既存 `id` の再挿入が `23505`・開き直しでの件数不変）を検査する。
+  独立ジョブ（例: `crash-test-primary-key`）の新設は必須チェックの登録を伴うためオーナー判断事項とし、
+  本 Issue では行わない。`open` 中の SIGKILL による移行の中断は着弾が不安定になるため、移行の中断
+  （commit 前破棄・commit 後中断）の網羅は `catalog/legacy_id_migration.rs` の故障注入単体テストに残す。
+- **既存 DB の移行**（`crates/engine/tests/table23_legacy_fixture_migration.rs`・
+  `tests/fixtures/table23_legacy_pre_rowid.redb`）: 物理キーを rowid へ切り替える前のコミット（`c42f7735`。
+  直後の `7af39885` が切り替え）のバイナリで生成した約 190 KiB のデータディレクトリをコミットし、コピーして
+  開いたときの移行を検査する。期待値は、同じ問い合わせを旧バイナリで実行して記録した結果で、現行側の
+  変更で期待値が一緒に動かないようにしている。再現手順（生成 SQL を含む）はテストファイルの冒頭に記録した。
+  カタログ版 v2〜v14 の網羅と、移行後にスキーマ本体が不変なことは `catalog/legacy_id_migration.rs` の単体テスト
+  が固定する（非空虚ゲート付き）。バイナリは `.editorconfig-checker.json` の `Exclude` に追加した。
+- **対象外・後続への申し送り**: 独立した crash ジョブの新設（オーナー判断）、NoSQL `aggregate`／`search` の採番方式対応、
+  移行後の `id` の IDENTITY 化。

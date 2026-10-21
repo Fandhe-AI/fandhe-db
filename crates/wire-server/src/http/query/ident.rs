@@ -79,6 +79,15 @@ mod tests {
         }
     }
 
+    /// TABLE-27・Issue #1717: NoSQL 表層の `table` は裸の識別子だけを受理する。SCHEMA 配下の
+    /// relation の内部キー（`#<id>.<name>`）を JSON から直接指定できない（テナント境界。ADR D2）。
+    #[test]
+    fn rejects_schema_internal_relation_keys() {
+        for raw in ["#1.t", "#12.docs", "#1", "1.t", "s.t", "\"#1.t\""] {
+            assert!(check_identifier(raw).is_err(), "raw={raw:?}");
+        }
+    }
+
     #[test]
     fn accepts_at_length_limit() {
         let raw = "a".repeat(MAX_IDENTIFIER_LEN);

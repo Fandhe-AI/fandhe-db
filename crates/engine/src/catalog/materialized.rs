@@ -657,6 +657,12 @@ pub(crate) fn create_matview_index_in_txn(
             "USING hnsw is not supported on materialized views".to_string(),
         ));
     }
+    // GIN 相当索引（Issue #2206・INDEX-8）も matview へは宣言しない（HNSW と同じ扱い）。
+    if matches!(def.kind, IndexKind::Gin(_)) {
+        return Err(CatalogError::IndexKindMismatch(
+            "USING gin is not supported on materialized views".to_string(),
+        ));
+    }
     let mut positions = Vec::with_capacity(def.columns.len());
     for col in &def.columns {
         let (pos, column) = mv
@@ -805,6 +811,7 @@ pub(crate) fn create_materialized_view_in_txn(
         None => Vec::new(),
     };
     let encoded = encode_materialized_view_def(&def)?;
+    super::namespace::ensure_key_schema_alive_in_txn(write_txn, &def.name)?;
     insert_def_in_txn(write_txn, &def, &encoded)?;
     if let Some(e) = entities {
         write_entities_in_txn(write_txn, &def.name, &def.columns, e, &keys)?;
@@ -963,6 +970,10 @@ pub(crate) fn read_materialized_view_in<R: ReadSource>(
     name: &str,
     ctx: &PolicyContext,
 ) -> Result<Option<MaterializedViewEntity>> {
+    if name.starts_with('#') {
+        // 内部キーは利用者が直接指せない。定義が無い扱い（`Ok(None)` は「未 populate」の意味）。
+        return Err(CatalogError::ViewNotFound(name.to_string()));
+    }
     validate_identifier(name)?;
     let def = {
         let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
@@ -1051,6 +1062,9 @@ impl Storage {
         &self,
         name: &str,
     ) -> Result<Option<MaterializedViewDef>> {
+        if name.starts_with('#') {
+            return Ok(None);
+        }
         validate_identifier(name)?;
         let read_txn = self.db().begin_read()?;
         let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
@@ -1070,6 +1084,10 @@ impl Storage {
         read_txn: &redb::ReadTransaction,
         name: &str,
     ) -> Result<Option<MaterializedViewDef>> {
+        if name.starts_with('#') {
+            // matview は public にしか置けない（内部キーの名前は存在しない。Issue #1717）。
+            return Ok(None);
+        }
         validate_identifier(name)?;
         let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
             Ok(t) => t,

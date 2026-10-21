@@ -105,7 +105,6 @@ fn wire_schema_ddl_lifecycle_and_sqlstates() {
         ("CREATE SCHEMA IF NOT EXISTS pg_x", "42939"),
         ("DROP SCHEMA public", "42501"),
         ("DROP SCHEMA ghost", "3F000"),
-        ("DROP SCHEMA s1 CASCADE", "0A000"),
         ("CREATE SCHEMA AUTHORIZATION bob", "0A000"),
         ("CREATE SCHEMA a.b", "42601"),
     ] {

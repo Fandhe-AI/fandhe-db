@@ -186,6 +186,27 @@ impl RelationKey {
     }
 }
 
+/// relation キーの名前部（`#<id>.<name>` の `<name>`。裸の名前はそのまま）。利用者向けの公開名
+/// （修飾列参照の照合・エラー文言）に使い、内部 ID を出さない（ADR D2）。
+pub(crate) fn relation_name_part(key: &str) -> &str {
+    match key.strip_prefix('#').and_then(|rest| rest.split_once('.')) {
+        Some((_, name)) => name,
+        None => key,
+    }
+}
+
+/// 既存の relation キー `existing` と同じ SCHEMA に属する、名前 `new_name`（裸の識別子）の
+/// relation キーを返す。`ALTER ... RENAME TO <new>` は PostgreSQL と同じく SCHEMA を変えない
+/// （新しい名前は修飾できない）ため、`s.t` の改名先は `#<id>.<new>` になる。`new_name` は
+/// 厳格な識別子検証を通す（内部キー形式の直接指定を許さない）。
+pub(crate) fn sibling_key(existing: &str, new_name: &str) -> Result<String> {
+    validate_identifier(new_name)?;
+    Ok(match RelationKey::parse(existing)? {
+        RelationKey::Public(_) => new_name.to_string(),
+        RelationKey::InSchema { schema_id, .. } => RelationKey::schema_prefix(schema_id) + new_name,
+    })
+}
+
 /// `SEQUENCE` 定義のキー第 1 要素（`"#<schema_id>"`。ドットなし。設計記録 D2）。
 fn sequence_schema_key(schema_id: u64) -> String {
     format!("#{schema_id}")
@@ -208,6 +229,35 @@ pub(crate) fn schema_id_in_txn<R: ReadSource>(
         Some(v) => Ok(Some(decode_schema_def(v.value())?)),
         None => Ok(None),
     }
+}
+
+/// relation キー `key` が SCHEMA 配下形（`#<id>.<name>`）なら、その SCHEMA が write txn の時点で
+/// 生存していることを確認する（Issue #1717。拡張クエリで Parse 後に `DROP SCHEMA` されると、
+/// Bind 済みの内部キーが削除済み ID を指したまま作成できてしまうため。作成と同じ txn で検査して
+/// TOCTOU を塞ぐ）。`public` の裸の名前は常に生存扱い。不在は `TableNotFound`（fail-closed。
+/// 他テナントの SCHEMA か否かを区別しない）。SCHEMA ID は再利用されないため、全テナントの定義を
+/// 走査して ID の一致を見る（DDL のみの経路。relation キーはテナントを持たないため行を直接引けず、
+/// 件数上限も設けない。真偽以外は何も返さない）。他テナントの行が壊れていても無関係な作成を
+/// 阻害しないよう、復号できない行は読み飛ばす（対象 SCHEMA 自身の行が壊れていれば一致せず
+/// `TableNotFound` になるため fail-closed は保たれる）。
+pub(crate) fn ensure_key_schema_alive_in_txn<R: ReadSource>(src: &R, key: &str) -> Result<()> {
+    let RelationKey::InSchema { schema_id, .. } = RelationKey::parse(key)? else {
+        return Ok(());
+    };
+    let table = match src.open_table(SCHEMAS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(CatalogError::TableNotFound(key.to_string()))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    for entry in table.iter()? {
+        let (_, v) = entry?;
+        if decode_schema_def(v.value()).is_ok_and(|id| id == schema_id) {
+            return Ok(());
+        }
+    }
+    Err(CatalogError::TableNotFound(key.to_string()))
 }
 
 /// `tenant_id` の SCHEMA 数を [`limit`] + 1 件で打ち切って数える。
@@ -286,6 +336,94 @@ pub(crate) fn schema_has_objects_in_txn<R: ReadSource>(src: &R, schema_id: u64) 
     };
     let first = seqs.range((seq_key.as_str(), "")..)?.next().transpose()?;
     Ok(first.is_some_and(|(k, _)| k.value().0 == seq_key))
+}
+
+/// SCHEMA 配下のオブジェクトの列挙結果（[`enumerate_schema_objects_in_txn`]。各リストは内部キーの
+/// 昇順で決定的）。
+#[derive(Debug, Default)]
+pub(crate) struct SchemaObjects {
+    /// 表（`#<id>.<name>`）。
+    pub(crate) tables: Vec<String>,
+    /// ビュー。
+    pub(crate) views: Vec<String>,
+    /// 索引（表と同じ SCHEMA に属する宣言。通常は表と一緒に消える）。
+    pub(crate) indexes: Vec<String>,
+    /// SEQUENCE（`#<id>.<name>`）。
+    pub(crate) sequences: Vec<String>,
+    /// 現状 SCHEMA 配下には置けない種別（matview・ENUM 型）が 1 件でもあるか。あれば
+    /// `DROP SCHEMA ... CASCADE` は不整合として拒否する（fail-closed）。
+    pub(crate) unsupported_kinds: bool,
+}
+
+/// `&str` キーの表の `[start, end)` のキーを上限つきで列挙する（表が無ければ空）。
+fn str_keys_in_range<R: ReadSource>(
+    src: &R,
+    def: TableDefinition<&str, &[u8]>,
+    start: &str,
+    end: &str,
+) -> Result<Vec<String>> {
+    let table = match src.open_table(def) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    for entry in table.range(start..end)? {
+        if out.len() >= MAX_LIST_TABLES {
+            return Err(CatalogError::Invalid(format!(
+                "too many objects in schema: exceeds {MAX_LIST_TABLES}"
+            )));
+        }
+        let (k, _) = entry?;
+        out.push(k.value().to_string());
+    }
+    Ok(out)
+}
+
+/// SCHEMA `schema_id` に属するオブジェクトを種別ごとに列挙する（`DROP SCHEMA ... CASCADE` の根集合。
+/// 設計記録 D8）。走査の形は [`schema_has_objects_in_txn`] と同じ（カタログ表は `#<id>.` 接頭辞の範囲、
+/// SEQUENCE はキー第 1 要素 `#<id>` のタプル範囲）。各種別は [`MAX_LIST_TABLES`] 件で打ち切る。
+pub(crate) fn enumerate_schema_objects_in_txn<R: ReadSource>(
+    src: &R,
+    schema_id: u64,
+) -> Result<SchemaObjects> {
+    let start = RelationKey::schema_prefix(schema_id);
+    let end = RelationKey::schema_prefix_end(schema_id);
+    let mut objects = SchemaObjects {
+        tables: str_keys_in_range(src, CATALOG_TABLE, &start, &end)?,
+        views: str_keys_in_range(src, VIEWS_TABLE, &start, &end)?,
+        indexes: str_keys_in_range(src, INDEX_CATALOG_TABLE, &start, &end)?,
+        ..SchemaObjects::default()
+    };
+    objects.unsupported_kinds = str_key_range_nonempty(
+        src,
+        super::materialized::MATERIALIZED_VIEWS_TABLE,
+        &start,
+        &end,
+    )? || str_key_range_nonempty(src, ENUM_TYPES_TABLE, &start, &end)?;
+    let seq_key = sequence_schema_key(schema_id);
+    match src.open_table(super::sequence::SEQUENCES_TABLE) {
+        Ok(seqs) => {
+            for entry in seqs.range((seq_key.as_str(), "")..)? {
+                let (k, _) = entry?;
+                let (schema, name) = k.value();
+                if schema != seq_key {
+                    break;
+                }
+                if objects.sequences.len() >= MAX_LIST_TABLES {
+                    return Err(CatalogError::Invalid(format!(
+                        "too many objects in schema: exceeds {MAX_LIST_TABLES}"
+                    )));
+                }
+                objects
+                    .sequences
+                    .push(super::sequence::sequence_entry_name((schema, name)));
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(objects)
 }
 
 impl Storage {
@@ -380,6 +518,99 @@ impl Storage {
         Ok(DropSchemaResult::Dropped)
     }
 
+    /// `tenant_id` の SCHEMA `name` を `CASCADE` で削除する（TABLE-27・Issue #1717、設計記録 D8）。
+    /// 判定順は [`Self::drop_schema`] の存在判定まで同じ。以降は**単一の write txn・1 回の commit**で、
+    /// (1) SCHEMA 配下の表・ビューを根として外部の依存（別 SCHEMA のビュー・外部キー。public からの
+    /// 依存は D7 で存在しない）を既存の依存列挙で求めて先に削除 → (2) 配下のビュー（キー昇順）→
+    /// (3) 配下の表（既存の `DROP TABLE ... CASCADE` 本体。索引宣言・行ストア・世代・台帳・キャッシュ
+    /// 世代・所有 SEQUENCE を継承）→ (4) 残りの SEQUENCE（キー昇順）→ (5) SCHEMA 行の順に消す。
+    /// 依存を正確に判定できない場合・外部の表が配下の SEQUENCE を `DEFAULT nextval` で参照している
+    /// 場合は `DependentObjectsStillExist`（不可逆な連鎖削除をしない。fail-closed）。ID カウンタは
+    /// 巻き戻さない。`sql::ddl::execute_drop_schema` から呼ばれる（権限ゲート通過後）。
+    pub(crate) fn drop_schema_cascade(
+        &self,
+        tenant_id: &str,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<DropSchemaResult> {
+        validate_tenant_id(tenant_id)?;
+        validate_identifier(name)?;
+        if is_builtin_schema_name(name) {
+            return Err(CatalogError::BuiltinSchema(name.to_string()));
+        }
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::convert_storage_error)?;
+        let Some(id) = schema_id_in_txn(&*write_txn, tenant_id, name)? else {
+            return if if_exists {
+                Ok(DropSchemaResult::NotFoundSkipped)
+            } else {
+                Err(CatalogError::SchemaNotFound(name.to_string()))
+            };
+        };
+        let objects = enumerate_schema_objects_in_txn(&*write_txn, id)?;
+        if objects.unsupported_kinds {
+            return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
+        }
+        // (1) 外部の依存（根集合に含まれない依存側）を求めて先に削除する。
+        let roots: Vec<super::dependency::DropTarget> = objects
+            .tables
+            .iter()
+            .map(|t| super::dependency::DropTarget::Table(t.clone()))
+            .chain(
+                objects
+                    .views
+                    .iter()
+                    .map(|v| super::dependency::DropTarget::View(v.clone())),
+            )
+            .collect();
+        if !roots.is_empty() {
+            let closure = super::dependency::enumerate_drop_dependents_in_txn(&write_txn, &roots)?;
+            if closure.conservative {
+                return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
+            }
+            super::apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
+        }
+        // (2) 配下のビュー。
+        for view in &objects.views {
+            super::drop_view_in_txn(&write_txn, view)?;
+        }
+        // (3) 配下の表（所有 SEQUENCE も道連れ）。
+        let mut dropped_sequence_ids: Vec<u64> = Vec::new();
+        if !objects.tables.is_empty() {
+            let (_, ids) = self.drop_tables_collecting_sequences(
+                &write_txn,
+                &objects.tables,
+                false,
+                super::DropBehavior::Cascade,
+            )?;
+            dropped_sequence_ids.extend(ids);
+        }
+        // (4) 残りの SEQUENCE（表に所有されていないもの）。
+        for seq in &objects.sequences {
+            if super::sequence::sequence_exists_in_txn(&write_txn, seq)? {
+                dropped_sequence_ids.push(super::sequence::drop_sequence_in_txn(&write_txn, seq)?);
+            }
+        }
+        // 配下に残った索引宣言（表を失った孤児。通常は無い）も消す。
+        let prefix = RelationKey::schema_prefix(id);
+        super::retain_index_defs_in_txn(&write_txn, |def| !def.name.starts_with(&prefix))?;
+        // (5) SCHEMA 行。
+        {
+            let mut table = write_txn.open_table(SCHEMAS_TABLE)?;
+            table.remove((tenant_id, name))?;
+        }
+        let allocator = self.sequence_allocator();
+        crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
+            for id in &dropped_sequence_ids {
+                allocator.evict(*id);
+            }
+            crate::recovery::commit_boundary::PostCommitResult::Ok
+        })
+        .map_err(super::convert_storage_error)?;
+        Ok(DropSchemaResult::Dropped)
+    }
+
     /// `tenant_id` の SCHEMA `old` を `new` へ改名する（TABLE-27 のポインタ、Issue #1716）。
     /// オブジェクトは内部 ID 経由で格納されるため、`schemas` 表の 1 行の付け替え（内部 ID は不変）
     /// だけで中のオブジェクトが追随する。判定順は識別子 → 旧名が組み込み名（`BuiltinSchema`）→
@@ -421,6 +652,40 @@ impl Storage {
         let rt = self.db().begin_read()?;
         schema_id_in_txn(&rt, tenant_id, name)
     }
+
+    /// `tenant_id` の SCHEMA の `内部 ID → 名前` 対応（エラー文言・EXPLAIN の表示変換用。読み取り専用。
+    /// 件数は [`MAX_SCHEMAS_PER_TENANT`] で打ち切る）。逆引き表を新設しない（格納形式を増やさない）
+    /// ため、冷えた経路（内部キーが利用者向けの文字列へ出る場合）だけが呼ぶ。
+    pub(crate) fn schema_names_for_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Result<std::collections::BTreeMap<u64, String>> {
+        let rt = self.db().begin_read()?;
+        schema_names_for_tenant_in_txn(&rt, tenant_id)
+    }
+}
+
+/// [`Storage::schema_names_for_tenant`] の本体。`(tenant_id, "")..` の範囲走査で、他テナントの行には
+/// 構造上触れない。
+pub(crate) fn schema_names_for_tenant_in_txn<R: ReadSource>(
+    src: &R,
+    tenant_id: &str,
+) -> Result<std::collections::BTreeMap<u64, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    let table = match src.open_table(SCHEMAS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in table.range((tenant_id, "")..)? {
+        let (k, v) = entry?;
+        let (tenant, name) = k.value();
+        if tenant != tenant_id || out.len() >= MAX_SCHEMAS_PER_TENANT {
+            break;
+        }
+        out.insert(decode_schema_def(v.value())?, name.to_string());
+    }
+    Ok(out)
 }
 
 /// `tenant_id` の形状検査（空は拒否。形式の詳細検証は `PolicyContext` が担うため多層防御の下限）。
@@ -771,6 +1036,71 @@ mod tests {
             );
             assert!(s.schema_id("alice", "s2").expect("id").is_some());
         }
+    }
+
+    /// 削除済み SCHEMA の ID を指す内部キーでは、表・SEQUENCE のいずれも作成できない
+    /// （Parse 後に `DROP SCHEMA` されても同一 txn の生存検査で拒否する。Issue #1717）。
+    #[test]
+    fn creating_objects_under_a_dropped_schema_is_rejected() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        let (s, _g) = tmp_storage("ns-dropped");
+        s.create_schema("alice", "a", false).expect("schema");
+        let id = s.schema_id("alice", "a").expect("id").expect("exists");
+        s.drop_schema("alice", "a", false).expect("drop");
+        let key = RelationKey::InSchema {
+            schema_id: id,
+            name: "t".to_string(),
+        }
+        .encode();
+        let cols = vec![ColumnDef::new("name", ColumnType::Text, true)];
+        assert!(matches!(
+            s.create_table(&TableSchema::new(key.clone(), cols)),
+            Err(CatalogError::TableNotFound(_))
+        ));
+        let params = crate::catalog::sequence::SequenceParams {
+            increment: 1,
+            min_value: 1,
+            max_value: 100,
+            start: 1,
+            cycle: false,
+        };
+        assert!(matches!(
+            s.create_sequence(&key, &params),
+            Err(CatalogError::TableNotFound(_))
+        ));
+    }
+
+    /// 一覧 API（`list_tables`・`list_indexes`）は public の名前だけを返し、SCHEMA 配下の内部キー・内部 ID を
+    /// 返さない（TABLE-27・Issue #1717。他テナントの SCHEMA の存在・名前を漏らさない）。
+    #[test]
+    fn list_apis_do_not_expose_schema_keys() {
+        use crate::catalog::{ColumnDef, ColumnType, IndexDef, IndexKind, TableSchema};
+        let (s, _g) = tmp_storage("ns-list");
+        s.create_schema("alice", "a", false).expect("schema");
+        let id = s.schema_id("alice", "a").expect("id").expect("exists");
+        let key = RelationKey::InSchema {
+            schema_id: id,
+            name: "t".to_string(),
+        }
+        .encode();
+        let cols = || vec![ColumnDef::new("name", ColumnType::Text, true)];
+        s.create_table(&TableSchema::new(key.clone(), cols()))
+            .expect("schema table");
+        s.create_table(&TableSchema::new("pubt", cols()))
+            .expect("public table");
+        s.create_index(&IndexDef::new(
+            RelationKey::InSchema {
+                schema_id: id,
+                name: "i".to_string(),
+            }
+            .encode(),
+            key,
+            IndexKind::Scalar,
+            vec!["name".to_string()],
+        ))
+        .expect("schema index");
+        assert_eq!(s.list_tables().expect("list"), vec!["pubt".to_string()]);
+        assert!(s.list_indexes().expect("list").is_empty());
     }
 
     /// 全 redb 表の (名前, 件数) と、型付きで読める SCHEMA 以外のカタログ表の全 key/value を dump する。

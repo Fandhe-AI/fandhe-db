@@ -369,10 +369,11 @@ pub(crate) fn reject_public_qualified_temp(
         return Ok(());
     }
     let mut resolved = tokens.to_vec();
-    let Ok(public_names) = crate::sql::relation_name::rewrite_relation_names(&mut resolved, None)
+    let Ok(rewritten) = crate::sql::relation_name::rewrite_relation_names(&mut resolved, None)
     else {
         return Ok(());
     };
+    let public_names = rewritten.public_names;
     let hit = public_names
         .iter()
         .any(|p| catalog.names().any(|n| n.eq_ignore_ascii_case(p)));

@@ -209,6 +209,13 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
                 Keyword::By => "BY",
                 Keyword::Limit => "LIMIT",
             }),
+            // 内部キー（`#<id>.<name>`）は引用形で描画する（保存済み本文の再読込
+            // `tokenize_stored_view_body` だけが受理する。Issue #1717）。
+            Token::Ident(s) if s.starts_with('#') => {
+                out.push('"');
+                out.push_str(s);
+                out.push('"');
+            }
             Token::Ident(s) | Token::Number(s) => out.push_str(s),
             Token::QuotedBoolWord(s) | Token::QuotedCollationName(s) => {
                 out.push('"');
@@ -343,7 +350,7 @@ pub(crate) fn requote_legacy_value_function_columns(tokens: &mut [Token]) {
 /// 未引用が真偽リテラルを意味する形式）は戻さない。`= true` のような値位置は対象外。
 /// 呼び出し元は `sql::view`（参照時）・カタログのビュー本文検査・作成時の自己検証。
 pub(crate) fn tokenize_stored_view_body(input: &str) -> Result<Vec<Token>, LexError> {
-    let mut tokens = tokenize(input)?;
+    let mut tokens = tokenize_impl(input, false, false, true)?;
     requote_legacy_value_function_columns(&mut tokens);
     if input.starts_with(STORED_BODY_BOOL_LITERAL_MARKER) {
         return Ok(tokens);
@@ -454,7 +461,14 @@ pub(crate) fn quoted_bool_word_in_leaf_position(tokens: &[Token], i: usize) -> b
 /// のみが受理する。両者は [`tokenize_impl`] を共有し、この関数の既存の受理・拒否
 /// 契約は一切変えない）。
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_impl(input, false, false)
+    tokenize_impl(input, false, false, false)
+}
+
+/// 本実装自身が描画した SQL（[`render_tokens`]・ビュー本文の正規化描画）の再字句解析。
+/// [`tokenize`] と同一だが、SCHEMA 配下の内部キーの引用形（`"#<id>.<name>"`）を受理する
+/// （利用者入力には使わない。Issue #1717）。
+pub(crate) fn tokenize_rendered(input: &str) -> Result<Vec<Token>, LexError> {
+    tokenize_impl(input, false, false, true)
 }
 
 /// 括弧なし SQL 値関数の予約語か（大小無視。SQL-37・Issue #1586。引用付きの同名識別子を
@@ -477,7 +491,7 @@ pub(crate) fn is_value_function_keyword(s: &str) -> bool {
 /// 返したトークン列を許可リストの `Parser` 以外へ渡す場合は [`demote_quoted_null`] で
 /// `Ident` へ戻す（識別子位置では従来どおり `Ident` として扱うため）。
 pub fn tokenize_marked(input: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_impl(input, false, true)
+    tokenize_impl(input, false, true, false)
 }
 
 /// 引用付き `NULL` の [`Token::QuotedNull`] を `Token::Ident` へ戻す（引用情報を捨てる。
@@ -504,7 +518,7 @@ pub fn demote_quoted_null(tokens: Vec<Token>) -> Vec<Token> {
 /// プロトコル・許可リスト構造検証（`sql::allowlist`）は引き続き [`tokenize`]
 /// （`$` を拒否する既定の字句解析）を使う。
 pub fn tokenize_with_params(input: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_impl(input, true, true)
+    tokenize_impl(input, true, true, false)
 }
 
 /// [`tokenize`]／[`tokenize_with_params`] が共有する走査本体。`allow_params` が
@@ -514,6 +528,7 @@ fn tokenize_impl(
     input: &str,
     allow_params: bool,
     mark_quoted_null: bool,
+    allow_internal_keys: bool,
 ) -> Result<Vec<Token>, LexError> {
     if input.len() > MAX_INPUT_LEN {
         return Err(LexError {
@@ -709,6 +724,15 @@ fn tokenize_impl(
             }
             if is_hyphenated_collation_name(content) {
                 tokens.push(Token::QuotedCollationName(content.to_string()));
+                advance_to(&mut chars, end);
+                continue;
+            }
+            // 保存済みビュー本文だけは、解決器が作った SCHEMA 配下の内部キー（`"#<id>.<name>"`。
+            // ADR D2・Issue #1717）を引用形の 1 個の `Ident` として受理する。利用者入力の字句解析
+            // （`allow_internal_keys == false`）は従来どおり拒否するため、内部キーを作れるのは
+            // 名前解決器（`sql::relation_name`）と保存済み本文の再読込だけになる。
+            if allow_internal_keys && is_internal_relation_key(content) {
+                tokens.push(Token::Ident(content.to_string()));
                 advance_to(&mut chars, end);
                 continue;
             }
@@ -986,6 +1010,16 @@ fn is_hyphenated_collation_name(content: &str) -> bool {
     content
         .split('-')
         .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// 内部キー（`#<10 進>.<識別子>`。[`crate::catalog::namespace::RelationKey`] の SCHEMA 配下形）の
+/// 文字列か。保存済み本文の引用形 `"#12.t"` を受理する判定にだけ使う。
+fn is_internal_relation_key(content: &str) -> bool {
+    content.starts_with('#')
+        && matches!(
+            crate::catalog::namespace::RelationKey::parse(content),
+            Ok(crate::catalog::namespace::RelationKey::InSchema { .. })
+        )
 }
 
 /// 二重引用符識別子の中身が、引用符なしで字句解析しても同じ 1 個の `Ident` に
@@ -1289,6 +1323,51 @@ mod tests {
     }
 
     /// TABLE-18・Issue #1192: 描画 → 再トークン化で同一トークン列に戻る。
+    /// Issue #1717（ADR D2）: SCHEMA 配下の relation の内部キー `#<id>.<name>` は、利用者入力の字句解析では
+    /// 引用形でも作れない。保存済みビュー本文の再読込（`tokenize_stored_view_body`）と本実装自身の描画の
+    /// 再読込（`tokenize_rendered`）だけが、正規形の引用形を 1 個の `Ident` として受理する。
+    #[test]
+    fn internal_relation_keys_are_only_readable_from_stored_text() {
+        for user in [
+            "SELECT * FROM \"#1.t\"",
+            "SELECT * FROM #1.t",
+            "SELECT \"#1.t\"",
+        ] {
+            assert!(
+                tokenize(user).is_err() || !tokenize(user).expect("lex").contains(&ident("#1.t"))
+            );
+            assert!(
+                tokenize_marked(user).map_or(true, |t| !t.contains(&ident("#1.t"))),
+                "{user}"
+            );
+            assert!(
+                tokenize_with_params(user).map_or(true, |t| !t.contains(&ident("#1.t"))),
+                "{user}"
+            );
+        }
+        let stored = tokenize_stored_view_body("SELECT id FROM \"#12.t\"").expect("stored");
+        assert!(stored.contains(&ident("#12.t")));
+        // 非正規形（先頭ゼロ・`#0`・名前部が不正・`.` なし）は保存済み本文でも拒否する。
+        for bad in [
+            "\"#01.t\"",
+            "\"#0.t\"",
+            "\"#1.1t\"",
+            "\"#1\"",
+            "\"#1.\"",
+            "\"#.t\"",
+        ] {
+            assert!(
+                tokenize_stored_view_body(&format!("SELECT id FROM {bad}")).is_err(),
+                "{bad}"
+            );
+        }
+        // 描画 → 再読込で同じトークン列に戻る。
+        let rendered = render_tokens(&stored).expect("render");
+        assert!(rendered.contains("\"#12.t\""), "{rendered}");
+        assert_eq!(tokenize_rendered(&rendered).expect("rendered"), stored);
+        assert!(tokenize(&rendered).is_err());
+    }
+
     #[test]
     fn render_tokens_round_trips() {
         let cases = [

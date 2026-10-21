@@ -258,6 +258,10 @@ pub(crate) fn execute_create_table(
     {
         return Ok(CreateTableOutcome {});
     }
+    // ADR D7（TABLE-27・Issue #1717）: public の表は SCHEMA 配下のオブジェクトへ依存しない。
+    // 検査は定義だけで決まる（カタログ非依存）ため、上の既存名 no-op を抜けた時点で必ず通す。
+    // 呼び出し元の事前存在判定が競合で古くなっても、実作成へ進む定義は常に検査済みになる。
+    crate::sql::schema_dependency::check_create_table(validated)?;
     let schema = build_table_schema(Some(storage), validated, limits)?;
     // 早期判定〔上〕と書き込みの間に他セッションが同名を作った場合の TOCTOU 対策。名前衝突は
     // commit・世代 bump の前に返るため、no-op は副作用を残さない。
@@ -1497,8 +1501,12 @@ pub(crate) fn execute_alter_table_rename_table(
     stmt: &ValidatedAlterTableRenameTable,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     ensure_table_exists(storage, &stmt.table_name)?;
+    // 改名先は同じ SCHEMA に置く（`s.t RENAME TO t2` は `s.t2`。新しい名前は修飾できない。
+    // TABLE-27・Issue #1717）。
+    let new_key = crate::catalog::namespace::sibling_key(&stmt.table_name, &stmt.new_table_name)
+        .map_err(crate::catalog::table_lookup_error)?;
     storage
-        .alter_table_rename(&stmt.table_name, &stmt.new_table_name)
+        .alter_table_rename(&stmt.table_name, &new_key)
         .map_err(|e| match e {
             AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
                 undefined_table_or_view(storage, &stmt.table_name)
@@ -1555,6 +1563,15 @@ pub(crate) fn execute_alter_table_set_schema(
             Err(e) => return Err(map_schema_error(e, "ALTER TABLE SET SCHEMA failed")),
         }
     };
+    if to_public {
+        // SCHEMA 配下の表を共有の `public` へ戻す経路は未実装。何も変えずに成功させず拒否する。
+        if matches!(
+            crate::catalog::namespace::RelationKey::parse(&stmt.table_name),
+            Ok(crate::catalog::namespace::RelationKey::InSchema { .. })
+        ) {
+            return Err(SqlSurfaceError::InsufficientPrivilege);
+        }
+    }
     if !to_public {
         // 共有の `public` の表の行をテナントの SCHEMA 側へ移さない（設計記録 D7）。
         return Err(SqlSurfaceError::InsufficientPrivilege);
@@ -3007,7 +3024,12 @@ pub(crate) fn execute_create_index(
     // 式要素そのものは `create_index_bound` が書き込み txn 内で束縛する。一意索引と式要素の組
     // （Issue #1651）は受理し、`create_index_bound` が強制の前提を同一 txn で整える。
     let has_expressions = validated.expression_keys().iter().any(Option::is_some);
-    if has_expressions && validated.is_hnsw() {
+    if has_expressions
+        && !matches!(
+            validated.method(),
+            crate::sql::allowlist::IndexMethod::Btree
+        )
+    {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "expression indexes are not supported for this index kind yet".to_string(),
         });
@@ -3017,19 +3039,34 @@ pub(crate) fn execute_create_index(
     // 列だけの索引を保存しない（fail-closed）。述語そのものは `create_index_bound` が書き込み txn 内で
     // 束縛して正規化テキストと参照列を確定する。
     if validated.predicate().is_some()
-        && (validated.is_hnsw() || validated.column_collations().iter().any(Option::is_some))
+        && (!matches!(
+            validated.method(),
+            crate::sql::allowlist::IndexMethod::Btree
+        ) || validated.column_collations().iter().any(Option::is_some))
     {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "partial indexes are not supported for this index definition yet".to_string(),
         });
     }
-    let kind = if validated.is_hnsw() {
-        IndexKind::Hnsw
-    } else {
-        IndexKind::Scalar
+    // 防御ゲート（Issue #2206・INDEX-8）: GIN と一意・照合の組み合わせは構文段で拒否済み。
+    if validated.gin_opclass().is_some()
+        && (validated.is_unique() || validated.column_collations().iter().any(Option::is_some))
+    {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "USING gin does not support this index definition".to_string(),
+        });
+    }
+    let kind = match validated.method() {
+        crate::sql::allowlist::IndexMethod::Hnsw => IndexKind::Hnsw,
+        crate::sql::allowlist::IndexMethod::Gin(opclass) => IndexKind::Gin(opclass),
+        crate::sql::allowlist::IndexMethod::Btree => IndexKind::Scalar,
     };
+    // 索引は対象表と同じ SCHEMA に置く（`CREATE INDEX i ON s.t` の索引は `s` の `i`。PG と同じく
+    // 索引名は修飾できない。TABLE-27・Issue #1717）。
+    let index_key = crate::catalog::namespace::sibling_key(validated.table(), validated.name())
+        .map_err(map_create_index_error)?;
     let def = IndexDef::new(
-        validated.name().to_string(),
+        index_key,
         validated.table().to_string(),
         kind,
         validated.columns().to_vec(),
@@ -3225,7 +3262,12 @@ pub(crate) fn execute_alter_sequence(
                 AlterSequenceError::Catalog(c) => map_sequence_error(c, "ALTER SEQUENCE failed"),
             })?,
         AlterSequenceAction::Rename { new_name } => storage
-            .rename_sequence(validated.name(), new_name)
+            .rename_sequence(
+                validated.name(),
+                // 改名先は同じ SCHEMA に置く（TABLE-27・Issue #1717）。
+                &crate::catalog::namespace::sibling_key(validated.name(), new_name)
+                    .map_err(|e| map_sequence_error(e, "ALTER SEQUENCE failed"))?,
+            )
             .map_err(|e| match e {
                 // 名前参照の DEFAULT が壊れるため RENAME は拒否する（fail-closed）。
                 CatalogError::DependentObjectsStillExist(_) => {
@@ -3307,9 +3349,12 @@ pub(crate) fn execute_drop_schema(
     tenant_id: &str,
     validated: &ValidatedDropSchema,
 ) -> Result<DropSchemaOutcome, SqlSurfaceError> {
-    storage
-        .drop_schema(tenant_id, validated.name(), validated.if_exists)
-        .map_err(|e| map_schema_error(e, "DROP SCHEMA failed"))?;
+    if validated.cascade {
+        storage.drop_schema_cascade(tenant_id, validated.name(), validated.if_exists)
+    } else {
+        storage.drop_schema(tenant_id, validated.name(), validated.if_exists)
+    }
+    .map_err(|e| map_schema_error(e, "DROP SCHEMA failed"))?;
     Ok(DropSchemaOutcome {})
 }
 
@@ -3435,6 +3480,29 @@ fn map_drop_type_error(e: CatalogError) -> SqlSurfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR D7（TABLE-27・Issue #1717）の回帰: 呼び出し元が「既存名」と判断して事前検査を省いた後に
+    /// 名前が消えた競合を模す（対象名が存在しない状態で `IF NOT EXISTS` を直接実行する）。
+    /// SCHEMA 配下のオブジェクトへ依存する public 表は、実作成へ進む前に必ず拒否される。
+    #[test]
+    fn create_if_not_exists_still_enforces_schema_dependency_when_name_vanished() {
+        let path = crate::test_util::temp_db::unique_db_path("ddl-ine-d7-race");
+        let _guard = crate::test_util::temp_db::CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let tokens = crate::sql::lexer::tokenize(
+            "CREATE TABLE IF NOT EXISTS c (id BIGINT PRIMARY KEY, n BIGINT)",
+        )
+        .expect("tokenize");
+        let mut validated =
+            crate::sql::allowlist::validate_create_table_tokens(&tokens).expect("validate");
+        // 名前解決器が作る SCHEMA 配下の内部キー（`#<id>.<name>`）への `DEFAULT nextval` 依存を与える。
+        let col = validated.columns.last_mut().expect("column");
+        col.default_expr = Some(crate::catalog::ColumnDefault::Sequence("#1.sq".to_string()));
+        let err = execute_create_table(&storage, &validated, &SchemaLimits::default())
+            .expect_err("D7 must reject");
+        assert_eq!(err.wire_code(), "42501");
+        assert!(!storage.relation_name_exists("c").expect("exists"));
+    }
 
     /// `IF EXISTS` の対象不在 no-op は全体世代・テーブル単位世代・索引カタログ世代を
     /// 進めない（Issue #1614・TABLE-36 ポインタ）。対照として実在する索引の DROP は
@@ -3836,7 +3904,7 @@ mod tests {
             name: "i".to_string(),
             if_not_exists: true,
             table: "docs".to_string(),
-            hnsw: false,
+            method: crate::sql::allowlist::IndexMethod::Btree,
             columns: vec!["body".to_string()],
             expressions: vec![None],
             collations: vec![None],

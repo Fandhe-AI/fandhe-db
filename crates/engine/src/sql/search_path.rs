@@ -1,5 +1,5 @@
 //! セッション変数 `search_path`（未修飾名の解決順と作成先 SCHEMA の決定）。TABLE-27・Issue #1715。
-//! 設計判断は ADR `docs/design/schema-tenant-namespace.md` の D5・D6・D11 と §8 のポインタ。
+//! 設計判断は ADR `docs/design/schema-tenant-namespace.md` の D5・D6・D11 と §10 のポインタ。
 //!
 //! # 責務境界
 //!
@@ -37,7 +37,7 @@ use crate::sql::mode::SessionState;
 pub const MAX_SEARCH_PATH_ELEMENTS: usize = 64;
 
 /// 要素 1 件の長さの上限（バイト。PostgreSQL の NAMEDATALEN-1）。PostgreSQL は超過分を切り詰めるが、
-/// 本実装は拒否する（意図的な差。ADR §8）。
+/// 本実装は拒否する（意図的な差。ADR §10）。
 pub const MAX_SEARCH_PATH_ELEMENT_BYTES: usize = 63;
 
 /// 不正な `search_path` 値の固定文言（`22023`。入力を反射しない）。
@@ -275,9 +275,15 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
 fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
     let walk = crate::sql::relation_name::relation_positions(tokens);
     let ctes = crate::sql::relation_name::collect_cte_scopes(tokens);
+    // `DROP`／`ALTER`／`REFRESH` のオブジェクト名は `object_ddl_names` が（索引かどうかの区別つきで）
+    // 数えるため、位置走査の側では二重に数えない。
+    let object_ddl = object_ddl_names(tokens);
     let mut out = Vec::new();
     for pos in walk.positions {
-        if pos.create_name || skip.contains(&pos.index) {
+        if pos.create_name
+            || skip.contains(&pos.index)
+            || object_ddl.iter().any(|(i, _)| *i == pos.index)
+        {
             continue;
         }
         let Some(name) = tokens
@@ -286,6 +292,12 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
         else {
             continue;
         };
+        // 名前解決器が `schema.name` の修飾を解決して置き換えた内部キー（`#<id>.<name>`）は修飾済みの
+        // 参照なので、`search_path` による未修飾名の判定対象にしない（キーを作れるのは解決器だけ。
+        // 字句解析器は `#` を含む識別子を作らない。Issue #1717）。
+        if name.starts_with('#') {
+            continue;
+        }
         // 構文語（`IF`・`ONLY`・`LATERAL` 等）は構文位置で判定する。CTE 名はその参照位置から実際に
         // 可視なものだけを除外する（非再帰 CTE は自身の本文から見えない。`sql::cte` の契約）。
         if is_syntax_keyword_here(tokens, pos.index)
@@ -315,14 +327,14 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
             is_index: false,
         });
     }
-    out.extend(object_ddl_names(tokens));
+    out.extend(object_ddl.into_iter().map(|(_, r)| r));
     out
 }
 
 /// `DROP`／`ALTER`／`REFRESH` の `[MATERIALIZED] VIEW`・`SEQUENCE`・`INDEX`・`TYPE` の対象名。
 /// `public` が見えないセッションが共有 `public` のビューなどを取り違えて落とさないよう、
-/// 参照として扱う（fail-closed。`IF EXISTS` でも拒否する。ADR §8 の意図的な差）。
-fn object_ddl_names(tokens: &[Token]) -> Vec<GateRef> {
+/// 参照として扱う（fail-closed。`IF EXISTS` でも拒否する。ADR §10 の意図的な差）。
+fn object_ddl_names(tokens: &[Token]) -> Vec<(usize, GateRef)> {
     let word = |i: usize| match tokens.get(i) {
         Some(Token::Ident(w)) => Some(w.as_str()),
         _ => None,
@@ -351,10 +363,13 @@ fn object_ddl_names(tokens: &[Token]) -> Vec<GateRef> {
         .get(i)
         .and_then(crate::sql::relation_name::unqualified_ident_name)
     {
-        out.push(GateRef {
-            name: name.to_string(),
-            is_index,
-        });
+        out.push((
+            i,
+            GateRef {
+                name: name.to_string(),
+                is_index,
+            },
+        ));
         if matches!(tokens.get(i + 1), Some(Token::Punct(','))) {
             i += 2;
         } else {

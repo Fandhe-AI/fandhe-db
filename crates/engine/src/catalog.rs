@@ -197,6 +197,11 @@ pub(crate) fn index_catalog_generation_in_txn(read_txn: &redb::ReadTransaction) 
 pub enum IndexKind {
     Scalar,
     Hnsw,
+    /// JSONB 列の包含・存在検索向け GIN 相当索引の宣言（Issue #2206・INDEX-8。格納形式と
+    /// 演算子クラスの設計は `docs/design/gin-jsonb-index.md` D2・D12）。演算子クラスを種別に
+    /// 持たせ、「演算子クラスの無い Gin」を型で作れなくする。本 Issue の範囲は宣言の受理と
+    /// カタログ永続化まで（ポスティングの生成・維持は後続 Issue）。
+    Gin(GinOpClass),
 }
 
 impl IndexKind {
@@ -204,6 +209,48 @@ impl IndexKind {
         match self {
             IndexKind::Scalar => "scalar",
             IndexKind::Hnsw => "hnsw",
+            IndexKind::Gin(_) => "gin",
+        }
+    }
+}
+
+/// GIN 相当索引の演算子クラス（Issue #2206・INDEX-8）。`jsonb_ops` が省略時の既定。
+/// 構文段（`sql::allowlist`）が固定の許可リストとの完全一致だけで解決し、カタログの永続形には
+/// [`GinOpClass::as_str`] のトークンだけを保存する（未検証の文字列を連結しない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GinOpClass {
+    /// キーと値の双方を索引化する既定の演算子クラス。
+    JsonbOps,
+    /// 値へ至るパスだけを索引化する演算子クラス。
+    JsonbPathOps,
+}
+
+impl GinOpClass {
+    /// カタログ永続形・診断に使う演算子クラス名（PostgreSQL と同じ綴り）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GinOpClass::JsonbOps => "jsonb_ops",
+            GinOpClass::JsonbPathOps => "jsonb_path_ops",
+        }
+    }
+
+    /// 演算子クラス名（大文字小文字を区別しない）から解決する。未知の名前は `None`。
+    pub fn from_name(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("jsonb_ops") {
+            Some(GinOpClass::JsonbOps)
+        } else if name.eq_ignore_ascii_case("jsonb_path_ops") {
+            Some(GinOpClass::JsonbPathOps)
+        } else {
+            None
+        }
+    }
+
+    /// 永続形のトークン（正準な小文字）から復元する。大文字などの非正準形は `None`（fail-closed）。
+    fn from_catalog_token(token: &str) -> Option<Self> {
+        match token {
+            "jsonb_ops" => Some(GinOpClass::JsonbOps),
+            "jsonb_path_ops" => Some(GinOpClass::JsonbPathOps),
+            _ => None,
         }
     }
 }
@@ -277,6 +324,10 @@ const INDEX_DEF_PARTIAL_VERSION: &str = "v6";
 /// の間に固定行 `unique` を挟む（`…参照列行 / unique / 述語 hex / 述語の参照列 CSV`）。`v1`〜`v6`
 /// のバイト列は変えない（旧バイナリは `v7` を未知の版として拒否する。前方互換はない）。
 const INDEX_DEF_PARTIAL_UNIQUE_VERSION: &str = "v7";
+/// GIN 相当索引の永続形の版（Issue #2206・INDEX-8）。行構成は
+/// `v8／テーブル／gin／列（ちょうど 1 個）／演算子クラス`。`v1`〜`v7` のバイト列は変えない
+/// （旧バイナリは `v8` を未知の版として拒否する。前方互換はない）。
+const INDEX_DEF_GIN_VERSION: &str = "v8";
 
 impl IndexDef {
     /// 照合指定なしの索引宣言を作る（`collations` はすべて `None`・式要素なし）。
@@ -377,7 +428,27 @@ impl IndexDef {
 /// 含み得ない）のため、区切り文字として安全に使える。
 fn encode_index_def(def: &IndexDef) -> Result<Vec<u8>> {
     let columns_csv = def.columns.join(",");
-    let text = if def.has_predicate() || def.has_expressions() {
+    let text = if let IndexKind::Gin(opclass) = def.kind {
+        // GIN 宣言（`v8`）。単一の素の列に限り、一意・照合・式・述語は持てない（構文段・
+        // 束縛段が拒否済みの組み合わせの多層防御。破れていれば保存せず拒否する）。
+        if def.unique
+            || def.has_predicate()
+            || def.has_expressions()
+            || def.collations.iter().any(Option::is_some)
+            || def.columns.len() != 1
+            || def.columns.iter().any(String::is_empty)
+        {
+            return Err(CatalogError::Invalid(
+                "gin index must be a single plain column without options".to_string(),
+            ));
+        }
+        format!(
+            "{INDEX_DEF_GIN_VERSION}\n{}\ngin\n{}\n{}",
+            def.table,
+            columns_csv,
+            opclass.as_str()
+        )
+    } else if def.has_predicate() || def.has_expressions() {
         // 部分索引（`v6`。INDEX-11、Issue #1654）も式索引（`v4`／`v5`）と同じ行構成の拡張で、
         // 版の選択は [`encode_expression_index_def`] が担う。
         encode_expression_index_def(def, &columns_csv)?
@@ -639,11 +710,13 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         && version != INDEX_DEF_EXPRESSION_UNIQUE_VERSION
         && version != INDEX_DEF_PARTIAL_VERSION
         && version != INDEX_DEF_PARTIAL_UNIQUE_VERSION
+        && version != INDEX_DEF_GIN_VERSION
     {
         return Err(CatalogError::CorruptSchema(format!(
             "unknown index catalog format version for index {name}"
         )));
     }
+    let is_v8 = version == INDEX_DEF_GIN_VERSION;
     let is_v2 = version == "v2";
     let is_v3 = version == "v3";
     let is_v5 = version == INDEX_DEF_EXPRESSION_UNIQUE_VERSION;
@@ -655,7 +728,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema(format!("missing table for index {name}")))?
         .to_string();
-    validate_identifier(&table).map_err(|_| {
+    validate_relation_key(&table).map_err(|_| {
         CatalogError::CorruptSchema(format!("invalid table identifier for index {name}"))
     })?;
     let kind_tag = lines
@@ -664,12 +737,19 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     let kind = match kind_tag {
         "scalar" => IndexKind::Scalar,
         "hnsw" => IndexKind::Hnsw,
+        // `gin` は `v8` だけが持てる。演算子クラスは下の `v8` 分岐が復元する（仮置き）。
+        "gin" if is_v8 => IndexKind::Gin(GinOpClass::JsonbOps),
         _ => {
             return Err(CatalogError::CorruptSchema(format!(
                 "unknown index kind for index {name}"
             )))
         }
     };
+    if is_v8 && !matches!(kind, IndexKind::Gin(_)) {
+        return Err(CatalogError::CorruptSchema(format!(
+            "invalid gin index record for index {name}"
+        )));
+    }
     let columns_csv = lines
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema(format!("missing columns for index {name}")))?;
@@ -680,6 +760,22 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     } else {
         None
     };
+    let mut kind = kind;
+    if is_v8 {
+        // `v8` は GIN 専用: 列はちょうど 1 個の素の列、5 行目は演算子クラス、以降の行は無い。
+        let opclass = lines
+            .next()
+            .and_then(GinOpClass::from_catalog_token)
+            .ok_or_else(|| {
+                CatalogError::CorruptSchema(format!("invalid gin operator class for index {name}"))
+            })?;
+        if columns_csv.is_empty() || columns_csv.contains(',') {
+            return Err(CatalogError::CorruptSchema(format!(
+                "gin index must have exactly one column for index {name}"
+            )));
+        }
+        kind = IndexKind::Gin(opclass);
+    }
     if is_v3 {
         // `v3` は一意索引専用: 種別は scalar、5 行目は固定フラグ `unique`（それ以外は破損）。
         if !matches!(kind, IndexKind::Scalar) || lines.next() != Some("unique") {
@@ -806,6 +902,11 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
                 "USING hnsw does not support COLLATE".to_string(),
             ));
         }
+        if matches!(def.kind, IndexKind::Gin(_)) {
+            return Err(CatalogError::IndexCollationNotSupported(
+                "USING gin does not support COLLATE".to_string(),
+            ));
+        }
         match schema.columns.iter().find(|c| &c.name == col) {
             Some(column) if crate::collation::is_collatable(&column.ty) => {}
             Some(_) => {
@@ -847,6 +948,32 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
             if !column.ty.is_vector() {
                 return Err(CatalogError::IndexKindMismatch(format!(
                     "USING hnsw requires a VECTOR column, column {col} is not VECTOR"
+                )));
+            }
+        }
+        IndexKind::Gin(_) => {
+            // GIN は単一の素の JSONB 列だけが対象（Issue #2206・INDEX-8）。`JSON` は含めない。
+            let col = match def.columns.as_slice() {
+                [only] if !only.is_empty() => only,
+                _ => {
+                    return Err(CatalogError::IndexKindMismatch(
+                        "USING gin requires exactly one column".to_string(),
+                    ))
+                }
+            };
+            if col == "id" && schema.has_pseudo_id() {
+                return Err(CatalogError::IndexKindMismatch(
+                    "USING gin requires a JSONB column, column id is not JSONB".to_string(),
+                ));
+            }
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| &c.name == col)
+                .ok_or_else(|| CatalogError::ColumnNotFound(col.clone()))?;
+            if !matches!(column.ty, ColumnType::Jsonb) {
+                return Err(CatalogError::IndexKindMismatch(format!(
+                    "USING gin requires a JSONB column, column {col} is not JSONB"
                 )));
             }
         }
@@ -1114,6 +1241,29 @@ pub(crate) struct DeclaredUniqueExpressionIndex {
     pub(crate) elements: Vec<UniqueElementDecl>,
 }
 
+/// GIN 相当索引 1 本の宣言（INDEX-8、Issue #2207）。DML 維持（`gin_index::maintain_rows_in_txn`）と
+/// 後片付け・TRUNCATE・診断が入力にする。索引名の昇順で [`TableExpressionDecls::gins`] に載る。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredGinIndex {
+    pub(crate) index_name: String,
+    pub(crate) column: String,
+    pub(crate) opclass: GinOpClass,
+}
+
+/// GIN 相当索引の診断結果（INDEX-8、Issue #2207。[`crate::core::EngineCore::verify_gin_index_read_only`]
+/// の戻り値）。自テナントの索引だけを読み取り専用で検証した件数で、他テナントの情報を含まない。
+/// 欠落（`missing`）は不変条件違反（偽陰性の原因）、`stale` は存在しない行・古い値を指すエントリで
+/// 衛生上の指標（正しさには影響しない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GinIndexAudit {
+    /// テナントのマーカーが現在の宣言・形式版に一致するか。
+    pub marker_valid: bool,
+    /// 生存行の抽出エントリのうちポスティングが無いものの件数。
+    pub missing: usize,
+    /// 生存行に対応しないポスティング・逆引きの件数。
+    pub stale: usize,
+}
+
 /// 対象テーブルの式索引の宣言一式（INDEX-10、Issue #1649・#1651）。`keys` は全式索引の式要素
 /// （索引名の昇順・索引内の要素順）、`uniques` はそのうち一意の索引（索引名の昇順）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1123,6 +1273,8 @@ pub(crate) struct TableExpressionDecls {
     /// 部分索引（INDEX-11、Issue #1654。索引名の昇順）。`keys`・`uniques` には混ぜない（部分索引の
     /// 式要素は述語 TRUE の行でだけ評価し、一意検査の対象にもならない）。
     pub(crate) partials: Vec<DeclaredPartialIndex>,
+    /// GIN 相当索引（INDEX-8、Issue #2207。索引名の昇順）。式索引・一意検査とは独立に維持する。
+    pub(crate) gins: Vec<DeclaredGinIndex>,
 }
 
 /// 索引カタログ表 `index_table` から対象テーブルの式索引の宣言を読む共通実装。write／read txn の
@@ -1152,7 +1304,25 @@ where
             continue;
         }
         let def = decode_index_def(key.value(), bytes)?;
-        if !matches!(def.kind, IndexKind::Scalar) || def.table != table {
+        if def.table != table {
+            continue;
+        }
+        if let IndexKind::Gin(opclass) = def.kind {
+            // GIN 宣言は列を 1 個だけ持つ（`decode_index_def` が検証済み）。無ければ破損として拒否する。
+            let Some(column) = def.columns.first() else {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "gin index has no column for index {}",
+                    def.name
+                )));
+            };
+            out.gins.push(DeclaredGinIndex {
+                index_name: def.name.clone(),
+                column: column.clone(),
+                opclass,
+            });
+            continue;
+        }
+        if !matches!(def.kind, IndexKind::Scalar) {
             continue;
         }
         if let Some(partial) = DeclaredPartialIndex::from_def(&def) {
@@ -1196,6 +1366,36 @@ pub(crate) fn table_expression_decls_in_txn(
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(TableExpressionDecls::default()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// 索引名 `index_name` が GIN 相当索引（INDEX-8、Issue #2207）として宣言済みなら、その表名と宣言を返す
+/// （[`crate::core::EngineCore::verify_gin_index_read_only`] 用の読み取り専用の引き当て）。索引が無い・
+/// GIN でない場合は `None`。破損は `Err`（fail-closed）。
+pub(crate) fn gin_decl_in_read_txn(
+    read_txn: &redb::ReadTransaction,
+    index_name: &str,
+) -> Result<Option<(String, DeclaredGinIndex)>> {
+    validate_identifier(index_name)?;
+    let table = match read_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(guard) = table.get(index_name)? else {
+        return Ok(None);
+    };
+    let def = decode_index_def(index_name, guard.value())?;
+    let (IndexKind::Gin(opclass), Some(column)) = (def.kind, def.columns.first()) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        def.table.clone(),
+        DeclaredGinIndex {
+            index_name: def.name.clone(),
+            column: column.clone(),
+            opclass,
+        },
+    )))
 }
 
 /// [`table_expression_decls_in_txn`] の read txn 版（クラッシュ耐性検証の読み取り専用診断が使う）。
@@ -1251,7 +1451,7 @@ pub(crate) fn explain_index_names_in_txn(
         }
         let (key, value) = entry?;
         let name = key.value();
-        validate_identifier(name).map_err(|_| {
+        validate_relation_key(name).map_err(|_| {
             CatalogError::CorruptSchema(format!("invalid index identifier for index {name}"))
         })?;
         let def = decode_index_def(name, value.value())?;
@@ -1262,6 +1462,8 @@ pub(crate) fn explain_index_names_in_txn(
         }
         match def.kind {
             IndexKind::Hnsw => decls.hnsw.push(def.name),
+            // GIN の EXPLAIN 表示は後続 Issue（プランナ接続）の担当。列被覆名には出さない。
+            IndexKind::Gin(_) => {}
             // 式要素は列被覆名に含めない（式索引名は #1650 の式一致で EXPLAIN 側が合流させる）。
             IndexKind::Scalar => {
                 let plain: Vec<String> = def.plain_columns().map(str::to_string).collect();
@@ -1479,10 +1681,15 @@ fn unique_index_def_for_table_in_txn(
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
         Err(e) => return Err(e.into()),
     };
-    let Some(guard) = index_table.get(name)? else {
+    // `name` は制約名（識別子）。一意索引の索引キーは表と同じ SCHEMA の `name`（SCHEMA 配下の表では
+    // `#<id>.<name>`。TABLE-27・Issue #1717）なので、表のキーから導出して引く。
+    let Ok(key) = namespace::sibling_key(table, name) else {
         return Ok(false);
     };
-    let def = decode_index_def(name, guard.value())?;
+    let Some(guard) = index_table.get(key.as_str())? else {
+        return Ok(false);
+    };
+    let def = decode_index_def(&key, guard.value())?;
     Ok(def.unique && def.table == table)
 }
 
@@ -1508,7 +1715,8 @@ fn unique_index_names_for_table_in_txn(
         let (key, value) = entry?;
         let def = decode_index_def(key.value(), value.value())?;
         if def.unique && def.table == table {
-            names.push(def.name);
+            // 一意索引の実体は索引名と同名の UNIQUE 制約（SCHEMA 配下では名前部。Issue #1717）。
+            names.push(namespace::relation_name_part(&def.name).to_string());
         }
     }
     Ok(names)
@@ -1534,7 +1742,8 @@ fn check_unique_index_gate(def: &IndexDef, schema: &TableSchema) -> Result<()> {
             )));
         }
     }
-    let name = def.name.as_str();
+    // 一意索引の実体は索引名と同名の UNIQUE 制約。SCHEMA 配下の索引（内部キー）は名前部が制約名になる。
+    let name = namespace::relation_name_part(&def.name);
     let collides = schema.unique_constraints.iter().any(|u| u.name() == name)
         || schema.checks.iter().any(|c| c.name == name)
         || schema.foreign_keys.iter().any(|f| f.name() == name)
@@ -1594,7 +1803,7 @@ fn build_unique_index_schema_in_txn(
     }
     let mut constraints = schema.unique_constraints.clone();
     constraints.push(UniqueConstraint::with_name(
-        def.name.clone(),
+        namespace::relation_name_part(&def.name).to_string(),
         def.columns.clone(),
     ));
     let updated =
@@ -1642,7 +1851,7 @@ fn drop_unique_index_constraint_in_txn(
     let target_index = schema
         .unique_constraints
         .iter()
-        .position(|u| u.name() == def.name)
+        .position(|u| u.name() == namespace::relation_name_part(&def.name))
         .ok_or_else(corrupt)?;
     let target_set: std::collections::HashSet<&str> = schema
         .unique_constraints
@@ -1755,6 +1964,7 @@ fn retain_index_defs_in_txn(
             Err(e) => return Err(e.into()),
         };
         let mut to_remove = Vec::new();
+        let mut removed_gin: Vec<IndexDef> = Vec::new();
         for (scanned, entry) in index_table.iter()?.enumerate() {
             if scanned >= MAX_INDEX_COUNT {
                 return Err(CatalogError::CorruptSchema(format!(
@@ -1766,10 +1976,18 @@ fn retain_index_defs_in_txn(
             let def = decode_index_def(&name, value.value())?;
             if !keep(&def) {
                 to_remove.push(name);
+                if matches!(def.kind, IndexKind::Gin(_)) {
+                    removed_gin.push(def);
+                }
             }
         }
         for name in &to_remove {
             index_table.remove(name.as_str())?;
+        }
+        // GIN の物理テーブルは索引カタログのハンドルを閉じてから消す（Issue #2206）。
+        drop(index_table);
+        for def in &removed_gin {
+            delete_gin_index_table_in_txn(write_txn, def)?;
         }
         !to_remove.is_empty()
     };
@@ -2391,6 +2609,11 @@ fn alter_column_type_rewrite_expr_in_txn(
     }
     invalidate_user_uniq_if_key_column_in_txn(write_txn, table_name, &schema, column_name)?;
     crate::key_index::drop_indexes_containing_column_in_txn(write_txn, table_name, column_name)?;
+    // GIN 相当索引（INDEX-8、Issue #2207・`docs/design/gin-jsonb-index.md` D4・D7・D8）。行を直接
+    // 書き換えるこの経路は `constraint::enforce_row_constraints_in_txn` を通らないため、変更列を対象と
+    // する GIN 索引を同一 write txn で新しい値から再構築する（完全性と抽出上限の契約を保つ）。
+    // 上限超過は `54000`（commit 前に返るため副作用ゼロ）。
+    rebuild_gin_indexes_on_column_in_txn(write_txn, table_name, &schema, column_name)?;
     if schema_check_references_column(old_schema, column_name) {
         revalidate_checks_after_type_change_in_txn(
             write_txn,
@@ -2408,6 +2631,35 @@ fn alter_column_type_rewrite_expr_in_txn(
         .insert(table_name, encoded.as_slice())
         .map_err(CatalogError::from)?;
     Ok(schema)
+}
+
+/// 変更列 `column_name` を対象とする GIN 相当索引を、新スキーマ `schema` の行から同一 write txn で
+/// 再構築する（`alter_column_type_rewrite_expr_in_txn` が行の書き換え後に呼ぶ。INDEX-8、Issue #2207）。
+/// 抽出上限超過は `54000` の固定文言（全テナントの行が対象のためテナント・値は含めない）。
+fn rebuild_gin_indexes_on_column_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    column_name: &str,
+) -> std::result::Result<(), AlterCheckError> {
+    let decls = table_expression_decls_in_txn(write_txn, table_name)?;
+    for decl in decls.gins.iter().filter(|d| d.column == column_name) {
+        crate::gin_index::build_all_tenants_in_txn(
+            write_txn,
+            table_name,
+            schema,
+            decl,
+            &crate::gin_index::GinLimits::default(),
+        )
+        .map_err(|e| match e {
+            crate::tenant::TenantWriteError::GinIndexEntryLimitExceeded => AlterCheckError::Sql(
+                SqlSurfaceError::payload_too_large("gin index entry limit exceeded"),
+            ),
+            crate::tenant::TenantWriteError::Catalog(c) => AlterCheckError::Catalog(c),
+            other => AlterCheckError::Catalog(CatalogError::CorruptSchema(other.to_string())),
+        })?;
+    }
+    Ok(())
 }
 
 /// 一般変換（`RewriteExpr`）の静的検証（行を読まない。TABLE-40 (3)・Issue #1637）。新しい型が
@@ -3027,6 +3279,9 @@ pub(crate) const MAX_PRIMARY_KEY_COLUMNS: usize = 32;
 /// 切り詰め、結果が常に妥当な識別子（ASCII・上限内）になるようにする。
 pub fn primary_key_constraint_name(table: &str) -> String {
     const SUFFIX: &str = "_pkey";
+    // SCHEMA 配下の表（内部キー `#<id>.<name>`。TABLE-27・Issue #1717）は名前部から導出する
+    // （制約名は識別子規則に従い、内部 ID を含めない。PostgreSQL も制約名に SCHEMA を含めない）。
+    let table = namespace::relation_name_part(table);
     let keep = MAX_IDENTIFIER_LEN.saturating_sub(SUFFIX.len());
     let head = table.get(..keep.min(table.len())).unwrap_or(table);
     format!("{head}{SUFFIX}")
@@ -3627,6 +3882,11 @@ fn map_index_validation_error(e: crate::tenant::TenantWriteError) -> CreateIndex
             CreateIndexError::Sql(crate::sql::alter_using::redact_row_conversion_error(inner))
         }
         crate::tenant::TenantWriteError::Catalog(c) => CreateIndexError::Catalog(c),
+        // GIN 索引の初回構築（INDEX-8、Issue #2207）で抽出上限を超えた行がある。`54000` の固定文言で、
+        // テナント・値・件数は含めない（全テナントの行が対象のため）。
+        crate::tenant::TenantWriteError::GinIndexEntryLimitExceeded => CreateIndexError::Sql(
+            SqlSurfaceError::payload_too_large("gin index entry limit exceeded"),
+        ),
         other => CreateIndexError::Catalog(CatalogError::CorruptSchema(other.to_string())),
     }
 }
@@ -4756,6 +5016,13 @@ fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
             deferred_expr: crate::sql::allowlist::top_level_body_has_expression_predicate(&stmt),
         },
     })
+}
+
+/// ビュー本文が読む relation 名（DROP の依存判定 `view_def_dependence_on` と同じ導出）。
+/// `sql::schema_dependency` が SCHEMA 配下のビューの参照先を調べるために使う（TABLE-27・Issue #1717）。
+/// 本文を検証できない場合は `Err`（呼び出し側は fail-closed で拒否する）。
+pub(crate) fn view_body_relations(body_sql: &str) -> Result<Vec<String>> {
+    Ok(view_body_shape(body_sql)?.relations)
 }
 
 /// ビュー定義の DDL 依存ゲート用の形状（Issue #1659）。列別名を持つビューは、列名の追随
@@ -6527,11 +6794,11 @@ impl ColumnDefault {
                 ('c', t.canonical_text())
             }
             ColumnDefault::Sequence(name) => {
-                validate_identifier(name)?;
+                validate_relation_key(name)?;
                 ('q', name.clone())
             }
             ColumnDefault::Identity { sequence, kind } => {
-                validate_identifier(sequence)?;
+                validate_relation_key(sequence)?;
                 let tag = match kind {
                     IdentityKind::Always => 'a',
                     IdentityKind::ByDefault => 'b',
@@ -6597,12 +6864,12 @@ impl ColumnDefault {
                 }),
             // SEQUENCE 名は識別子規則で検証する（不正な名前は fail-closed。TABLE-24・Issue #1690）。
             'q' => {
-                validate_identifier(&text)?;
+                validate_relation_key(&text)?;
                 Ok(Some(ColumnDefault::Sequence(text)))
             }
             // IDENTITY 列（TABLE-24・Issue #1695）。名前は識別子規則で検証する（fail-closed）。
             'a' | 'b' => {
-                validate_identifier(&text)?;
+                validate_relation_key(&text)?;
                 Ok(Some(ColumnDefault::Identity {
                     sequence: text,
                     kind: if tag == 'a' {
@@ -7846,6 +8113,18 @@ pub(crate) fn validate_identifier(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// relation 名（表・ビュー・索引・SEQUENCE のカタログキー）の検証（TABLE-27・Issue #1717。
+/// ADR `docs/design/schema-tenant-namespace.md` D2）。裸の識別子（`public`）に加え、解決器が作る
+/// 内部キー `#<schema_id>.<name>`（[`namespace::RelationKey`]）を受理する。
+///
+/// 差し替え対象は「解決器の出力」か「カタログに保存された値」を受ける位置だけで、列名・SCHEMA 名・
+/// 制約名・別名・利用者の生入力（HTTP の `table` 等）は [`validate_identifier`]（厳格）のまま。
+/// 利用者が内部キーを直接指定できないことは、字句解析器が `#` を含む識別子を作らないこと
+/// （`sql::lexer`）と、HTTP 表層の厳格な識別子検証で担保する。
+pub(crate) fn validate_relation_key(s: &str) -> Result<()> {
+    namespace::RelationKey::parse(s).map(|_| ())
+}
+
 /// `VARCHAR(n)`／`CHAR(n)` の n 検証（TABLE-31・Issue #1563）。0 と
 /// [`MAX_CHAR_TYPE_LENGTH`] 超過を encode・decode 両側で拒否する。
 pub(crate) fn validate_char_type_length(n: u32) -> Result<()> {
@@ -8041,7 +8320,7 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
 /// 同一 write txn 内に限って許すための経路で、全アクション適用後に呼び出し側が
 /// `require_live = true` 相当の検証を必ず行う（Issue #1633）。
 fn validate_schema_impl(schema: &TableSchema, require_live: bool) -> Result<()> {
-    validate_identifier(&schema.name)?;
+    validate_relation_key(&schema.name)?;
     if require_live && schema.columns.is_empty() {
         return Err(CatalogError::Invalid(
             "table must have at least one column".to_string(),
@@ -8244,7 +8523,7 @@ fn validate_foreign_keys(schema: &TableSchema, allow_unresolved: bool) -> Result
                 )));
             }
         }
-        validate_identifier(&fk.parent_table)?;
+        validate_relation_key(&fk.parent_table)?;
         if fk.columns.is_empty() {
             return Err(CatalogError::Invalid(
                 "foreign key must reference at least one column".to_string(),
@@ -8928,6 +9207,8 @@ fn derive_unique_constraint_names(
 ) -> Vec<String> {
     let mut used: Vec<String> = used.to_vec();
     let mut names = Vec::with_capacity(columns_per_constraint.len());
+    // 制約名は SCHEMA 配下の表でも名前部から導出する（内部キーを含めない。Issue #1717）。
+    let table = namespace::relation_name_part(table);
     for cols in columns_per_constraint {
         let candidate = format!("{table}_{}_key", cols.join("_"));
         let name = resolve_constraint_name(&candidate, &used, "key");
@@ -8976,7 +9257,7 @@ fn assign_unique_constraint_names_avoiding(
             used.push(uc.name.clone());
         }
     }
-    let table = schema.name.clone();
+    let table = namespace::relation_name_part(&schema.name).to_string();
     let mut new_unique = Vec::with_capacity(schema.unique_constraints.len());
     for uc in schema.unique_constraints.clone() {
         if uc.name.is_empty() {
@@ -9003,6 +9284,7 @@ fn derive_foreign_key_constraint_names(
 ) -> Vec<String> {
     let mut used: Vec<String> = used.to_vec();
     let mut names = Vec::with_capacity(columns_per_constraint.len());
+    let table = namespace::relation_name_part(table);
     for cols in columns_per_constraint {
         let candidate = format!("{table}_{}_fkey", cols.join("_"));
         let name = resolve_constraint_name(&candidate, &used, "fkey");
@@ -9047,7 +9329,7 @@ fn assign_foreign_key_constraint_names_avoiding(
             used.push(fk.name.clone());
         }
     }
-    let table = schema.name.clone();
+    let table = namespace::relation_name_part(&schema.name).to_string();
     let mut new_fks = Vec::with_capacity(schema.foreign_keys.len());
     for fk in schema.foreign_keys.clone() {
         if fk.name.is_empty() {
@@ -9440,7 +9722,7 @@ fn encode_foreign_key_section(
 ) -> Result<()> {
     out.push_str(&format!("fks:{}\n", foreign_keys.len()));
     for fk in foreign_keys {
-        validate_identifier(&fk.parent_table)?;
+        validate_relation_key(&fk.parent_table)?;
         for name in fk.columns.iter().chain(&fk.parent_columns) {
             validate_identifier(name)?;
         }
@@ -9665,7 +9947,7 @@ fn parse_foreign_key_section<'a>(
             )
         };
         let columns = parse_foreign_key_column_list(columns_field, line)?;
-        validate_identifier(parent_table)
+        validate_relation_key(parent_table)
             .map_err(|_| format!("malformed foreign key line: {line:?}"))?;
         let parent_columns = parse_foreign_key_column_list(parent_columns_field, line)?;
         // 参照先を要さない構造上の不変条件（`validate_foreign_keys` と同じ契約）を
@@ -9742,7 +10024,7 @@ fn encode_foreign_key_section_v12(out: &mut String, foreign_keys: &[ForeignKeyDe
     out.push_str(&format!("fks:{}\n", foreign_keys.len()));
     for fk in foreign_keys {
         validate_identifier(&fk.name)?;
-        validate_identifier(&fk.parent_table)?;
+        validate_relation_key(&fk.parent_table)?;
         for name in fk.columns.iter().chain(&fk.parent_columns) {
             validate_identifier(name)?;
         }
@@ -9839,7 +10121,7 @@ fn parse_foreign_key_section_v12<'a>(
         }
         seen_names.push(name.to_string());
         let columns = parse_foreign_key_column_list(columns_field, line)?;
-        validate_identifier(parent_table)
+        validate_relation_key(parent_table)
             .map_err(|_| format!("malformed foreign key line: {line:?}"))?;
         let parent_columns = parse_foreign_key_column_list(parent_columns_field, line)?;
         let has_duplicate = |names: &[String]| {
@@ -11231,6 +11513,35 @@ pub(crate) fn user_uniq_table_def(index_table_name: &str) -> UniqueIndexTableDef
     TableDefinition::new(index_table_name)
 }
 
+/// GIN 相当索引（Issue #2206・INDEX-8。`docs/design/gin-jsonb-index.md` D2）の物理テーブル名を
+/// 組み立てる。索引名単位で `user_gin/{index_name}`。`validate_identifier` を通った索引名は `/` を
+/// 含まないため、他の固定テーブル・行テーブル・一意索引テーブルと衝突しない（呼び出し元が事前に
+/// 検証する契約は [`user_uniq_table_name`] と同じ）。本 Issue はテーブルを作らず、`DROP INDEX`・
+/// `DROP TABLE`・`DROP COLUMN` での掃除だけを担う（作成とポスティングの維持は後続 Issue）。
+pub(crate) fn user_gin_table_name(index_name: &str) -> String {
+    format!("user_gin/{index_name}")
+}
+
+/// GIN 索引テーブルの物理キー型。第 1 要素はサーバー側導出テナント、第 2 要素は名前空間化済み
+/// サブキー（D3）。[`UniqueIndexTableDef`] と同じ形。
+pub(crate) type GinIndexTableDef<'a> =
+    TableDefinition<'a, (&'static str, &'static [u8]), &'static [u8]>;
+
+/// GIN 索引テーブル定義を組み立てる（[`GinIndexTableDef`] の唯一の生成点）。
+pub(crate) fn user_gin_table_def(gin_table_name: &str) -> GinIndexTableDef<'_> {
+    TableDefinition::new(gin_table_name)
+}
+
+/// 宣言が GIN のときだけ、その物理テーブルを同一 write txn で削除する（無ければ no-op）。
+/// `Storage::drop_index`・[`retain_index_defs_in_txn`]（`DROP TABLE`・`DROP COLUMN`・matview 削除）
+/// の唯一の掃除経路。
+fn delete_gin_index_table_in_txn(write_txn: &redb::WriteTransaction, def: &IndexDef) -> Result<()> {
+    if matches!(def.kind, IndexKind::Gin(_)) {
+        write_txn.delete_table(user_gin_table_def(&user_gin_table_name(&def.name)))?;
+    }
+    Ok(())
+}
+
 /// 行テーブル `open_table` のエラー写像（[`UserRowsTableDef`] 専用）。
 ///
 /// 旧フォーマット（物理キーが `id` のみ）の DB を開くと `redb` は
@@ -11353,6 +11664,20 @@ pub(crate) fn require_table_schema_write_any_identity(
     decode_schema_with_resolver(table_name, &bytes, &mut resolve)
 }
 
+/// 検証済みのスキーマを同じ write txn で [`CATALOG_TABLE`] へ書き戻す（`validate_schema` →
+/// `encode_schema` → 保存）。ALTER 系の個別処理と同じ手順を、他モジュール（`catalog::sequence` の
+/// 移行 IDENTITY 割り当て。Issue #1698）が共有するための入口。世代 bump・commit は含まない。
+pub(crate) fn write_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    schema: &TableSchema,
+) -> Result<()> {
+    validate_schema(schema)?;
+    let encoded = encode_schema(schema)?;
+    let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+    catalog_table.insert(schema.name.as_str(), encoded.as_slice())?;
+    Ok(())
+}
+
 /// `#[cfg(test)]` 限定の生書き込み API（`insert_row_into_table` /
 /// `insert_rows_into_table` / `insert_typed_row`。Issue #1078）の共通ガード。
 /// これら 3 API は [`crate::constraint::enforce_row_constraints_in_txn`]
@@ -11376,9 +11701,12 @@ fn reject_constrained_table_for_raw_write(
     // 式索引の宣言（INDEX-10、Issue #1649）・部分索引の述語（INDEX-11、Issue #1654）も検査点でしか
     // 強制できないため、同じく拒否する。
     let index_decls = table_expression_decls_in_txn(write_txn, table_name)?;
-    if !index_decls.keys.is_empty() || !index_decls.partials.is_empty() {
+    if !index_decls.keys.is_empty()
+        || !index_decls.partials.is_empty()
+        || !index_decls.gins.is_empty()
+    {
         return Err(CatalogError::Invalid(
-            "raw test-only write API does not support tables with expression or partial indexes; use crate::tenant write APIs".to_string(),
+            "raw test-only write API does not support tables with expression, partial or gin indexes; use crate::tenant write APIs".to_string(),
         ));
     }
     if schema.primary_key().is_some()
@@ -11571,6 +11899,7 @@ impl Storage {
         schema: &TableSchema,
         pre_encoded: Option<Vec<u8>>,
     ) -> Result<()> {
+        namespace::ensure_key_schema_alive_in_txn(write_txn, schema.name.as_str())?;
         // `DEFAULT nextval('<名前>')` は参照先 SEQUENCE がこの write txn の時点で存在すること
         // （TABLE-24・Issue #1690。未登録は `TableNotFound`＝`42P01`。名前はクライアント自身の入力）。
         for column in &schema.columns {
@@ -11798,7 +12127,7 @@ impl Storage {
     ) -> Result<(DropTablesReport, Vec<u64>)> {
         let mut targets: Vec<&str> = Vec::new();
         for name in table_names {
-            validate_identifier(name)?;
+            validate_relation_key(name)?;
             if !targets.contains(&name.as_str()) {
                 targets.push(name.as_str());
             }
@@ -12012,7 +12341,7 @@ impl Storage {
     /// 列単位の ALTER（DROP COLUMN／SET・DROP NOT NULL／SET・DROP DEFAULT）共通の txn 前検査
     /// （識別子・保護列名。Issue #1633 で複数アクション経路と共有するため切り出し）。
     pub(crate) fn validate_alter_column_target(table_name: &str, column_name: &str) -> Result<()> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         validate_identifier(column_name)?;
         if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()));
@@ -12028,7 +12357,7 @@ impl Storage {
         max_columns: usize,
     ) -> Result<usize> {
         let max_columns = max_columns.min(MAX_COLUMN_COUNT);
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         validate_column(column)?;
         // 時刻値関数の DEFAULT は既存行の補完値を固定できず、読み出し時補完が常に失敗して
         // テーブルを読めなくするため、Rust API 直接呼び出しでも拒否する（多層防御。SQL 表層は
@@ -12178,7 +12507,7 @@ impl Storage {
     /// 失効契約は他の DDL（`alter_table_add_column` 等）と同じくテーブル単位
     /// 世代カウンタへ一本化する（`bump_table_generation_in_txn`）。
     pub fn alter_table_drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         validate_identifier(column_name)?;
         if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()));
@@ -12435,7 +12764,7 @@ impl Storage {
         old_name: &str,
         new_name: &str,
     ) -> std::result::Result<(), AlterCheckError> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         validate_identifier(old_name)?;
         validate_identifier(new_name)?;
         // 予約列（`id`／`tenant_id`／`visibility`）の改名元・改名先は拒否する。改名先は
@@ -12612,8 +12941,8 @@ impl Storage {
         table_name: &str,
         new_table_name: &str,
     ) -> std::result::Result<(), AlterCheckError> {
-        validate_identifier(table_name)?;
-        validate_identifier(new_table_name)?;
+        validate_relation_key(table_name)?;
+        validate_relation_key(new_table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let mut schema = {
             let table = write_txn
@@ -12831,7 +13160,7 @@ impl Storage {
         name: Option<&str>,
         columns: &[&str],
     ) -> Result<String> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         if let Some(n) = name {
             validate_identifier(n)?;
         }
@@ -12969,7 +13298,7 @@ impl Storage {
         name: Option<&str>,
         columns: &[&str],
     ) -> Result<String> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         if let Some(n) = name {
             validate_identifier(n)?;
         }
@@ -13419,7 +13748,7 @@ impl Storage {
         table_name: &str,
         parsed: &crate::sql::allowlist::ParsedCheck,
     ) -> std::result::Result<String, AlterCheckError> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         if let Some(n) = &parsed.name {
             validate_identifier(n)?;
         }
@@ -13576,7 +13905,7 @@ impl Storage {
         name: Option<&str>,
         foreign_key: ForeignKeyDef,
     ) -> Result<String> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         if let Some(n) = name {
             validate_identifier(n)?;
         }
@@ -13728,7 +14057,7 @@ impl Storage {
     /// FK が参照しうるため）・FOREIGN KEY 削除時は親表の stale 索引を刈り込む
     /// (6) 世代を bump する。
     pub fn alter_table_drop_constraint(&self, table_name: &str, name: &str) -> Result<()> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         validate_identifier(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         // `CREATE UNIQUE INDEX` 由来の UNIQUE 制約は制約としては扱わない（Issue #1616・
@@ -14111,7 +14440,7 @@ impl Storage {
         )
             -> Result<(ColumnType, Option<crate::collation::Collation>, AlterPlan)>,
     ) -> std::result::Result<(), AlterCheckError> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         validate_identifier(column_name)?;
         if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()).into());
@@ -14361,6 +14690,7 @@ impl Storage {
         }
         let encoded = encode_enum_type_def(name, &labels)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
         {
             let mut table = write_txn.open_table(ENUM_TYPES_TABLE)?;
             if table.get(name)?.is_some() {
@@ -14526,7 +14856,7 @@ impl Storage {
         column_aliases: &[String],
         check_option: ViewCheckOption,
     ) -> Result<()> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
             return Err(CatalogError::ViewLimitExceeded(
                 "view body too large".to_string(),
@@ -14554,6 +14884,7 @@ impl Storage {
             check_option,
         })?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
         {
             let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             if catalog_table.get(name)?.is_some() {
@@ -14612,7 +14943,7 @@ impl Storage {
         name: &str,
         behavior: DropBehavior,
     ) -> Result<Vec<CascadedObject>> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
@@ -14721,8 +15052,8 @@ impl Storage {
         exprs: &[Option<Expr>],
         predicate: Option<&[WherePredicate]>,
     ) -> std::result::Result<(), CreateIndexError> {
-        validate_identifier(&def.name)?;
-        validate_identifier(&def.table)?;
+        validate_relation_key(&def.name)?;
+        validate_relation_key(&def.table)?;
         if def.has_expressions() || def.has_predicate() {
             // 式・述語の永続形は束縛で確定する。入力の生テキストは信用しない。
             return Err(CatalogError::Invalid(
@@ -14741,6 +15072,20 @@ impl Storage {
                 SqlSurfaceError::FeatureNotSupported {
                     detail: "partial indexes are not supported for this index definition yet"
                         .to_string(),
+                },
+            ));
+        }
+        // GIN 宣言（Issue #2206・INDEX-8）の未対応の組み合わせ（一意・述語・式・照合）は `0A000`。
+        // 構文段の最終ゲートの多層防御で、効かない宣言を残さない（fail-closed）。
+        if matches!(def.kind, IndexKind::Gin(_))
+            && (def.unique
+                || predicate.is_some()
+                || exprs.iter().any(Option::is_some)
+                || def.collations.iter().any(Option::is_some))
+        {
+            return Err(CreateIndexError::Sql(
+                SqlSurfaceError::FeatureNotSupported {
+                    detail: "USING gin does not support this index definition".to_string(),
                 },
             ));
         }
@@ -14793,6 +15138,7 @@ impl Storage {
             return Err(CatalogError::Invalid(format!("duplicate index column: {dup}")).into());
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        namespace::ensure_key_schema_alive_in_txn(&*write_txn, &def.name)?;
         {
             let views_contains = |name: &str| -> Result<bool> {
                 match write_txn.open_table(VIEWS_TABLE) {
@@ -14989,6 +15335,24 @@ impl Storage {
                 let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
                 catalog_table.insert(def.table.as_str(), encoded_schema.as_slice())?;
             }
+            // GIN 相当索引（INDEX-8、Issue #2207）の初回構築。同じ write txn で全テナント・全可視性の
+            // 既存行を 1 回だけ走査して抽出・上限検証・ポスティング書き込みを行う。上限超過は `54000`
+            // （commit 前に返るため宣言も索引も残らない）。
+            if let (IndexKind::Gin(opclass), Some(column)) = (def.kind, def.columns.first()) {
+                let decl = DeclaredGinIndex {
+                    index_name: def.name.clone(),
+                    column: column.clone(),
+                    opclass,
+                };
+                crate::gin_index::build_all_tenants_in_txn(
+                    &write_txn,
+                    &def.table,
+                    &schema,
+                    &decl,
+                    &crate::gin_index::GinLimits::default(),
+                )
+                .map_err(map_index_validation_error)?;
+            }
         }
         if def.unique {
             // 永続一意索引を無効化する（`ADD UNIQUE` と同じ二重の安全策。各テナントは
@@ -15010,7 +15374,7 @@ impl Storage {
     /// `Err(IndexNotFound)`（冪等に `Ok` へ丸めない。fail-closed）。成功時は
     /// 対象テーブルの世代を進める（[`Storage::create_index`] と同じ理由）。
     pub fn drop_index(&self, name: &str) -> Result<()> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let removed = {
             match write_txn.open_table(INDEX_CATALOG_TABLE) {
@@ -15046,6 +15410,7 @@ impl Storage {
             }
             return Err(CatalogError::IndexNotFound(name.to_string()));
         };
+        delete_gin_index_table_in_txn(&write_txn, &def)?;
         // matview の索引宣言（Issue #1667）は表の UNIQUE 制約を持たないので外す制約が無い。
         if def.unique && !materialized_view_exists_in_txn(&write_txn, &def.table)? {
             if def.has_expressions() || def.has_predicate() {
@@ -15138,7 +15503,12 @@ impl Storage {
                 )));
             }
             let (key, value) = entry?;
-            out.push(decode_index_def(key.value(), value.value())?);
+            let def = decode_index_def(key.value(), value.value())?;
+            // SCHEMA 配下の索引（内部キー `#<id>.<name>`。TABLE-27・Issue #1717）は一覧に含めない
+            // （`list_tables` と同じ理由。他テナントの SCHEMA の存在・名前を漏らさない）。
+            if !def.name.starts_with('#') {
+                out.push(def);
+            }
         }
         Ok(out)
     }
@@ -15194,7 +15564,7 @@ impl Storage {
         appends_columns: bool,
         check_option: ViewCheckOption,
     ) -> Result<()> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
             return Err(CatalogError::ViewLimitExceeded(
                 "view body too large".to_string(),
@@ -15222,6 +15592,7 @@ impl Storage {
             check_option,
         })?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
         {
             let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             // matview とも名前空間を共有する（TABLE-42 (2)、Issue #1663）。
@@ -15454,9 +15825,16 @@ impl Storage {
 
     /// 定義済みテーブル名の一覧をスナップショット読み取りで返す。件数上限
     /// （[`MAX_LIST_TABLES`]）を超える場合は `Err`（無制限 `Vec` 確保を防ぐ）。
+    ///
+    /// 返すのは `public`（裸の名前）の表だけで、SCHEMA 配下の表の内部キー（`#<id>.<name>`。
+    /// TABLE-27・Issue #1717）は含めない（他テナントの SCHEMA 配下の表名・内部 ID を、一覧を
+    /// 取得できる呼び出し元へ漏らさないため。P0）。カタログ全体の走査が要る内部処理は
+    /// `list_tables_in_txn` を直接使う。
     pub fn list_tables(&self) -> Result<Vec<String>> {
         let read_txn = self.db().begin_read()?;
-        list_tables_in_txn(&read_txn)
+        let mut names = list_tables_in_txn(&read_txn)?;
+        names.retain(|n| !n.starts_with('#'));
+        Ok(names)
     }
 
     /// テーブルスコープで 1 行挿入する（TASK-146、対象ビヘイビア: EXT-1, EXT-2）。
@@ -15492,7 +15870,7 @@ impl Storage {
         id: u64,
         row: &RowInput<'_>,
     ) -> Result<()> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
@@ -15538,7 +15916,7 @@ impl Storage {
         table_name: &str,
         rows: &[(u64, RowInput<'_>)],
     ) -> Result<()> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
@@ -15602,7 +15980,7 @@ impl Storage {
         visibility: Visibility,
         values: &[RowCodecValue],
     ) -> Result<()> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write_any_identity(&write_txn, table_name)?;
@@ -15663,7 +16041,7 @@ impl Storage {
         tenant_id: &str,
         id: u64,
     ) -> Result<StorageRow> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         let read_txn = self.db().begin_read()?;
         require_legacy_row_identity_read(&read_txn, table_name)?;
         let row_table_name = user_rows_table_name(table_name);
@@ -15728,7 +16106,7 @@ impl Storage {
         limit: u32,
         allow_allocated: bool,
     ) -> Result<RowPage> {
-        validate_identifier(table_name)?;
+        validate_relation_key(table_name)?;
         let limit = limit.min(crate::storage::MAX_SCAN_PAGE_LIMIT) as usize;
 
         let read_txn = self.db().begin_read()?;
@@ -15999,7 +16377,7 @@ pub(crate) fn get_table_schema_in_txn_impl(
     // `alter_table_add_column` と同様、redb キーとして引く前に識別子を検証する。
     // 不正形式の名前は `TableNotFound`（存在しない）ではなく `Invalid`（形式不正）で
     // 拒否し、両 API 間でエラーバリアントを揃える。
-    validate_identifier(table_name)?;
+    validate_relation_key(table_name)?;
     let table = match read_txn.open_table(CATALOG_TABLE) {
         Ok(t) => t,
         // カタログテーブル未作成（1 テーブルも定義していない）は「存在しない」として扱う。
@@ -16039,7 +16417,7 @@ fn list_tables_in_txn(
         // すべて `create_table` の `validate_schema` を経ているため常に合法だが、
         // 手書きの不正データが直接 redb へ書き込まれていた場合に、そのまま
         // 一覧へ紛れ込ませない（`decode_schema` と同じ fail-closed 方針）。
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         names.push(name.to_string());
     }
     Ok(names)
@@ -25347,5 +25725,168 @@ mod tests {
             explain.scalar.is_empty(),
             "partial index is not named: {explain:?}"
         );
+    }
+
+    // --- GIN 相当索引の宣言（Issue #2206・INDEX-8） -----------------------------------
+
+    fn gin_def(name: &str, col: &str, opclass: GinOpClass) -> IndexDef {
+        IndexDef::new(
+            name.to_string(),
+            "docs".to_string(),
+            IndexKind::Gin(opclass),
+            vec![col.to_string()],
+        )
+    }
+
+    /// `v8` の往復（2 つの演算子クラス）と、バイト列の固定形（`v1`〜`v7` と衝突しない）。
+    #[test]
+    fn gin_index_def_round_trips_as_v8() {
+        for opclass in [GinOpClass::JsonbOps, GinOpClass::JsonbPathOps] {
+            let def = gin_def("g", "doc", opclass);
+            let bytes = encode_index_def(&def).expect("encode");
+            assert_eq!(
+                std::str::from_utf8(&bytes).expect("utf8"),
+                format!("v8\ndocs\ngin\ndoc\n{}", opclass.as_str())
+            );
+            assert_eq!(decode_index_def("g", &bytes).expect("decode"), def);
+        }
+    }
+
+    /// 破損した `v8` と、`gin` を持てない旧版は `CorruptSchema` で fail-closed に拒否する。
+    #[test]
+    fn gin_index_def_rejects_corruption() {
+        for corrupt in [
+            &b"v8\ndocs\nscalar\ndoc\njsonb_ops"[..],
+            b"v8\ndocs\nhnsw\ndoc\njsonb_ops",
+            b"v8\ndocs\ngin\n\njsonb_ops",
+            b"v8\ndocs\ngin\na,b\njsonb_ops",
+            b"v8\ndocs\ngin\ndoc",
+            b"v8\ndocs\ngin\ndoc\narray_ops",
+            b"v8\ndocs\ngin\ndoc\nJSONB_OPS",
+            b"v8\ndocs\ngin\ndoc\njsonb_ops\nextra",
+            b"v8\n1docs\ngin\ndoc\njsonb_ops",
+            b"v1\ndocs\ngin\ndoc",
+            b"v2\ndocs\ngin\ndoc\n-",
+            b"v3\ndocs\ngin\ndoc\nunique",
+        ] {
+            assert!(
+                matches!(
+                    decode_index_def("g", corrupt),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "corrupt value must be rejected: {corrupt:?}"
+            );
+        }
+    }
+
+    /// 保存前の多層防御: GIN は単一の素の列で、一意・照合・式・述語を持てない。
+    #[test]
+    fn gin_index_def_encode_rejects_unsupported_combinations() {
+        let ok = gin_def("g", "doc", GinOpClass::JsonbOps);
+        assert!(encode_index_def(&ok).is_ok());
+        let mut multi = ok.clone();
+        multi.columns.push("other".to_string());
+        multi.collations.push(None);
+        multi.expressions.push(None);
+        let mut uniq = ok.clone();
+        uniq.unique = true;
+        let mut collated = ok.clone();
+        collated.collations = vec![Some(crate::collation::Collation::C)];
+        let mut predicate = ok.clone();
+        predicate.predicate = Some(IndexPredicateDef {
+            sql: "a = 1".to_string(),
+            referenced_columns: vec!["a".to_string()],
+        });
+        for bad in [multi, uniq, collated, predicate] {
+            assert!(matches!(
+                encode_index_def(&bad),
+                Err(CatalogError::Invalid(_))
+            ));
+        }
+    }
+
+    /// 対象列の検査: JSONB だけが受理され、JSON・TEXT・VECTOR・疑似列 `id`・不在列は拒否する。
+    #[test]
+    fn gin_index_requires_a_jsonb_column() {
+        let path = unique_db_path("index-gin-columns");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("doc", ColumnType::Jsonb, true),
+                    ColumnDef::new("raw", ColumnType::Json, true),
+                    ColumnDef::new("body", ColumnType::Text, true),
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ],
+            ))
+            .expect("create docs");
+        for col in ["raw", "body", "embedding", "id"] {
+            assert!(
+                matches!(
+                    storage.create_index(&gin_def("g", col, GinOpClass::JsonbOps)),
+                    Err(CatalogError::IndexKindMismatch(_))
+                ),
+                "{col}"
+            );
+        }
+        assert!(matches!(
+            storage.create_index(&gin_def("g", "missing", GinOpClass::JsonbOps)),
+            Err(CatalogError::ColumnNotFound(_))
+        ));
+        storage
+            .create_index(&gin_def("g_ok", "doc", GinOpClass::JsonbPathOps))
+            .expect("jsonb column is accepted");
+        let defs = storage.list_indexes().expect("list");
+        assert_eq!(
+            defs.iter().map(|d| d.kind).collect::<Vec<_>>(),
+            vec![IndexKind::Gin(GinOpClass::JsonbPathOps)]
+        );
+    }
+
+    /// GIN の物理テーブル（`user_gin/{索引名}`）は `DROP INDEX`・`DROP TABLE` で消える
+    /// （作成は後続 Issue。ここでは先に置いたテーブルが掃除経路で消えることを固定する）。
+    #[test]
+    fn gin_physical_table_is_removed_by_drop_index_and_drop_table() {
+        let path = unique_db_path("index-gin-cleanup");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("doc", ColumnType::Jsonb, true)],
+            ))
+            .expect("create docs");
+        let physical_exists = |name: &str| -> bool {
+            let read_txn = storage.db().begin_read().expect("read txn");
+            let exists = read_txn
+                .open_table(user_gin_table_def(&user_gin_table_name(name)))
+                .is_ok();
+            exists
+        };
+        let seed = |name: &str| {
+            let write_txn = storage.db().begin_write().expect("txn");
+            write_txn
+                .open_table(user_gin_table_def(&user_gin_table_name(name)))
+                .expect("open physical");
+            // テスト内の物理テーブル用意だけの commit（世代の bump 対象外）。
+            write_txn.commit().expect("commit");
+        };
+        storage
+            .create_index(&gin_def("g1", "doc", GinOpClass::JsonbOps))
+            .expect("create g1");
+        storage
+            .create_index(&gin_def("g2", "doc", GinOpClass::JsonbPathOps))
+            .expect("create g2");
+        seed("g1");
+        seed("g2");
+        assert!(physical_exists("g1") && physical_exists("g2"));
+        storage.drop_index("g1").expect("drop g1");
+        assert!(!physical_exists("g1"), "DROP INDEX removes the table");
+        assert!(physical_exists("g2"));
+        storage.drop_table("docs").expect("drop table");
+        assert!(!physical_exists("g2"), "DROP TABLE removes the table");
+        assert!(storage.list_indexes().expect("list").is_empty());
     }
 }

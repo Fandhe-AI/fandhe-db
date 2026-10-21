@@ -802,6 +802,16 @@ pub enum SqlSurfaceError {
     /// 存在情報を漏らさない」対応）。固定文言のみを保持し、テーブル名・
     /// ユーザー名を含めない。
     InsufficientPrivilege,
+    /// public のオブジェクト（表・ビュー・SEQUENCE 等）が、テナントの SCHEMA 配下のオブジェクトへ
+    /// 依存する定義の拒否（`42501`。TABLE-27・Issue #1717、ADR D7）。public は全テナント共有の
+    /// カタログのため、特定テナントの SCHEMA 配下を参照させない（SCHEMA の削除や他テナントの
+    /// 操作が public の定義を壊す・存在を漏らす経路になる）。逆向き（SCHEMA 配下から public）は
+    /// 許可する。固定文言のみで、オブジェクト名・SCHEMA 名・内部 ID を含めない。
+    /// `wire_code` は [`SqlSurfaceError::InsufficientPrivilege`] と同じ `42501`。
+    ///
+    /// **BREAKING CHANGE**（Issue #1717）: variant を追加した。`SqlSurfaceError` を網羅的に `match`
+    /// するクレート外のコードは追随が必要。
+    SchemaDependencyForbidden,
     /// UPSERT の `ON CONFLICT DO UPDATE` の衝突先が、呼び出しテナントが所有するが
     /// 可視ではない行だった（Issue #1254・RLS-10・RLS-11）。`42501`
     /// （`ErrorClass::ForbiddenTenantMismatch` を再利用。新規分類は追加しない）。
@@ -914,6 +924,52 @@ pub enum SqlSurfaceError {
 }
 
 impl SqlSurfaceError {
+    /// 名前・説明文を持つ variant の文字列へ `f` を適用した新しいエラーを返す（TABLE-27・Issue #1717、
+    /// ADR D2）。SCHEMA 配下の relation の内部キー（`#<id>.<name>`）が利用者向けのエラー文言へ
+    /// 出ないよう、`core::EngineCore` の ctx を持つ入口の出口で
+    /// [`crate::sql::relation_name::display_relation_keys`] を適用するための唯一の変換点。
+    /// 文字列を持たない variant・名前を含まない固定文言の variant は素通し。
+    pub(crate) fn map_text(self, f: &dyn Fn(&str) -> String) -> Self {
+        match self {
+            Self::UnsupportedSyntax { detail } => Self::UnsupportedSyntax { detail: f(&detail) },
+            Self::UndefinedTable { name } => Self::UndefinedTable { name: f(&name) },
+            Self::Internal { detail } => Self::Internal { detail: f(&detail) },
+            Self::InvalidInput { detail } => Self::InvalidInput { detail: f(&detail) },
+            Self::PayloadTooLarge { detail } => Self::PayloadTooLarge { detail: f(&detail) },
+            Self::TransactionFeatureNotSupported { detail } => {
+                Self::TransactionFeatureNotSupported { detail: f(&detail) }
+            }
+            Self::FeatureNotSupported { detail } => {
+                Self::FeatureNotSupported { detail: f(&detail) }
+            }
+            Self::DuplicateTable { name } => Self::DuplicateTable { name: f(&name) },
+            Self::DuplicateSchema { name } => Self::DuplicateSchema { name: f(&name) },
+            Self::InvalidSchemaName { name } => Self::InvalidSchemaName { name: f(&name) },
+            Self::DuplicateObject { name } => Self::DuplicateObject { name: f(&name) },
+            Self::DuplicateType { name } => Self::DuplicateType { name: f(&name) },
+            Self::InvalidTableDefinition { table } => {
+                Self::InvalidTableDefinition { table: f(&table) }
+            }
+            Self::InvalidViewReplacement { detail } => {
+                Self::InvalidViewReplacement { detail: f(&detail) }
+            }
+            Self::PartitionedJobBusy { detail } => Self::PartitionedJobBusy { detail: f(&detail) },
+            Self::DependentObjectsStillExist { name } => {
+                Self::DependentObjectsStillExist { name: f(&name) }
+            }
+            Self::WrongObjectType { name } => Self::WrongObjectType { name: f(&name) },
+            Self::UndefinedObject { name } => Self::UndefinedObject { name: f(&name) },
+            Self::UndefinedType { name } => Self::UndefinedType { name: f(&name) },
+            Self::UndefinedColumn { name } => Self::UndefinedColumn { name: f(&name) },
+            Self::AmbiguousColumn { name } => Self::AmbiguousColumn { name: f(&name) },
+            Self::InvalidForeignKey { detail } => Self::InvalidForeignKey { detail: f(&detail) },
+            Self::DatatypeMismatch { detail } => Self::DatatypeMismatch { detail: f(&detail) },
+            Self::UndefinedFunction { detail } => Self::UndefinedFunction { detail: f(&detail) },
+            Self::DuplicateFunction { detail } => Self::DuplicateFunction { detail: f(&detail) },
+            other => other,
+        }
+    }
+
     /// ERR-2（docs/spec/04-behavior/error-format.md）の wire_code 写像。
     /// TASK-152 で単一真実源化した [`ClassifiedError::wire_code`] へ委譲する
     /// （既存の返値は 1 つも変えない。委譲先は `error_class()` の `match` のみを
@@ -1323,9 +1379,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InvalidColumnReference => ErrorClass::InvalidColumnReference,
-            SqlSurfaceError::InsufficientPrivilege | SqlSurfaceError::ConflictTargetNotVisible => {
-                ErrorClass::ForbiddenTenantMismatch
-            }
+            SqlSurfaceError::InsufficientPrivilege
+            | SqlSurfaceError::ConflictTargetNotVisible
+            | SqlSurfaceError::SchemaDependencyForbidden => ErrorClass::ForbiddenTenantMismatch,
             SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
             SqlSurfaceError::DependentObjectsStillExist { .. } => {
                 ErrorClass::DependentObjectsStillExist
@@ -1567,6 +1623,10 @@ impl std::fmt::Display for SqlSurfaceError {
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
                 write!(f, "permission denied for DDL statement")
+            }
+            // オブジェクト名・SCHEMA 名・内部 ID を含めない固定文言（ADR D7・security.md P0）。
+            SqlSurfaceError::SchemaDependencyForbidden => {
+                write!(f, "public objects cannot depend on objects in a schema")
             }
             // id・列値・テナントを含めない固定文言（security.md P0）。
             SqlSurfaceError::ConflictTargetNotVisible => {
@@ -10083,7 +10143,7 @@ impl<'a> Parser<'a> {
     fn parse_create_table_name(&mut self) -> Result<(bool, String), SqlSurfaceError> {
         let if_not_exists = self.parse_optional_if_not_exists();
         let table_name = self.expect_ident()?;
-        crate::catalog::validate_identifier(&table_name)
+        crate::catalog::validate_relation_key(&table_name)
             .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
         Ok((if_not_exists, table_name))
     }
@@ -10844,7 +10904,7 @@ impl<'a> Parser<'a> {
     fn parse_references_clause(&mut self) -> Result<ParsedReferences, SqlSurfaceError> {
         self.expect_contextual_keyword("REFERENCES")?;
         let parent_table = self.expect_ident()?;
-        crate::catalog::validate_identifier(&parent_table).map_err(|e| {
+        crate::catalog::validate_relation_key(&parent_table).map_err(|e| {
             SqlSurfaceError::unsupported(format!("invalid referenced table name: {e}"))
         })?;
         let parent_columns = if matches!(self.peek(), Some(Token::Punct('('))) {
@@ -11451,7 +11511,7 @@ impl<'a> Parser<'a> {
         } else {
             return Ok(None);
         };
-        let (Some(Token::Punct('(')), Some(Token::StringLiteral(name)), Some(Token::Punct(')'))) = (
+        let (Some(Token::Punct('(')), Some(arg), Some(Token::Punct(')'))) = (
             self.tokens.get(pos + 1),
             self.tokens.get(pos + 2),
             self.tokens.get(pos + 3),
@@ -11461,14 +11521,7 @@ impl<'a> Parser<'a> {
         if !self.time_default_tail_is_terminal(pos + 4) {
             return Ok(None);
         }
-        if name.contains('.') || name.contains('"') {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "schema-qualified or quoted sequence names are not supported",
-            ));
-        }
-        crate::catalog::validate_identifier(name)
-            .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name"))?;
-        let name = name.clone();
+        let name = sequence_name_argument(arg)?;
         self.pos = pos + 4;
         Ok(Some(InsertLiteral::SequenceCall { func, name }))
     }
@@ -12385,7 +12438,7 @@ pub(crate) fn render_stored_simple_view_body(
     let mut sql = render_view_body(body);
     // 恒偽が残る本文には、複雑形と同じくマーカーを付け、旧版の列参照保存形式として
     // 再解析されるのを防ぐ（Issue #1526）。
-    let rendered_tokens = super::lexer::tokenize(&sql)
+    let rendered_tokens = super::lexer::tokenize_rendered(&sql)
         .map_err(|_| SqlSurfaceError::unsupported("view body is not supported"))?;
     if super::lexer::stored_body_needs_bool_literal_marker(&rendered_tokens) {
         sql.insert_str(0, super::lexer::STORED_BODY_BOOL_LITERAL_MARKER);
@@ -12472,7 +12525,13 @@ fn render_column_name(column: &str) -> String {
 /// と同じ規則）。lexer は引用付きでも SQL キーワード（`"order"` 等）を拒否するため、
 /// それらの名前はそもそも本文へ書けず、ここで扱う必要がない。それ以外は裸で出力する
 /// （保存形式を変えない）。
+///
+/// SCHEMA 配下の表の内部キー（`#<id>.<name>`。TABLE-27・Issue #1717）も引用形で出力する
+/// （保存済み本文の再読込 `lexer::tokenize_stored_view_body` だけが受理する）。
 fn render_table_name(table: &str) -> String {
+    if table.starts_with('#') {
+        return format!("\"{table}\"");
+    }
     render_column_name(table)
 }
 
@@ -12942,7 +13001,8 @@ pub(crate) fn validate_refresh_materialized_view_tokens(
     })
 }
 
-/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> [USING btree｜hnsw] (<col> [COLLATE <name>][, ...])` の許可形状構造
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> [USING btree｜hnsw｜gin] (<col> [COLLATE <name>][, ...])`
+/// （`gin` のみ列の直後に演算子クラス `jsonb_ops｜jsonb_path_ops` を任意で書ける）の許可形状構造
 /// 検証結果（TASK-206・INDEX-7・SQL-23、Issue #908）。[`ValidatedDropTable`] と
 /// 同じくカタログ照会を一切行わない（列の存在・型整合・名前衝突・対象の種別は
 /// `sql::ddl::execute_create_index` → `catalog::Storage::create_index` が単一の
@@ -12953,9 +13013,9 @@ pub struct ValidatedCreateIndex {
     /// `IF NOT EXISTS` 句の有無（TABLE-36、Issue #1613。名前付きのみ）。
     pub(crate) if_not_exists: bool,
     pub(crate) table: String,
-    /// `USING hnsw` 指定の有無（`btree` は省略時と同じ `false`。`hnsw`・`btree` 以外の
-    /// `USING` 値は構造検証段で `0A000` 拒否済み。Issue #1617）。
-    pub(crate) hnsw: bool,
+    /// `USING` の方式（省略・`btree` は [`IndexMethod::Btree`]。`hnsw`・`gin`・`btree` 以外の
+    /// `USING` 値は構造検証段で `0A000` 拒否済み。Issue #1617・#2206）。
+    pub(crate) method: IndexMethod,
     /// 列名。式要素の位置は空文字列（`expressions` が `Some` の位置。Issue #1647・#1648）。
     pub(crate) columns: Vec<String>,
     /// `columns` と同じ長さの式要素（`None` は列。INDEX-10、Issue #1647）。実行段
@@ -12999,7 +13059,20 @@ impl ValidatedCreateIndex {
     }
 
     pub fn is_hnsw(&self) -> bool {
-        self.hnsw
+        matches!(self.method, IndexMethod::Hnsw)
+    }
+
+    /// `USING` の方式。
+    pub fn method(&self) -> IndexMethod {
+        self.method
+    }
+
+    /// `USING gin` の演算子クラス（`gin` 以外は `None`。省略時は `jsonb_ops`。Issue #2206）。
+    pub fn gin_opclass(&self) -> Option<crate::catalog::GinOpClass> {
+        match self.method {
+            IndexMethod::Gin(opclass) => Some(opclass),
+            _ => None,
+        }
     }
 
     pub fn columns(&self) -> &[String] {
@@ -13015,6 +13088,18 @@ impl ValidatedCreateIndex {
     pub fn column_collations(&self) -> &[Option<crate::collation::Collation>] {
         &self.collations
     }
+}
+
+/// `CREATE INDEX ... USING <method>` の方式（構文段の分類。Issue #2206）。実行段
+/// （`sql::ddl::execute_create_index`）が `catalog::IndexKind` へ対応づける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMethod {
+    /// 省略時・`USING btree`（スカラー宣言）。
+    Btree,
+    /// `USING hnsw`。
+    Hnsw,
+    /// `USING gin`（JSONB 向け。演算子クラスは省略時 `jsonb_ops`。INDEX-8）。
+    Gin(crate::catalog::GinOpClass),
 }
 
 /// `DROP INDEX <name>` の許可形状構造検証結果（TASK-206・INDEX-7・SQL-23、
@@ -13056,8 +13141,11 @@ pub(crate) fn is_drop_index_statement(tokens: &[Token]) -> bool {
 /// [`ValidatedCreateIndex`] の構造検証本体（TASK-206・INDEX-7、Issue #908）。
 /// カタログを参照しない範囲の判定はここで完結させる（fail-closed。権限の無い
 /// 呼び出し元へ存在情報を漏らさないよう、カタログ照会を要する検査は一切行わない）:
-/// - `USING <ident>` が `hnsw`・`btree` 以外 → `0A000`（`FeatureNotSupported`）。
+/// - `USING <ident>` が `hnsw`・`gin`・`btree` 以外 → `0A000`（`FeatureNotSupported`）。
 ///   `USING btree` は省略時と同一のスカラー宣言（INDEX-9、Issue #1617）。
+/// - `USING gin`（Issue #2206・INDEX-8）: 列の直後の演算子クラスは `jsonb_ops`（省略時）・
+///   `jsonb_path_ops` の完全一致（大文字小文字不問）で、未知の名前は `42704`。列が複数・式要素・
+///   `UNIQUE`・`WHERE`・`COLLATE` は `0A000`。列の JSONB 型の検査はカタログ段が担う。
 /// - `USING hnsw` なのに列が複数 → `0A000`。
 /// - 列リストの要素: 式（`((<式>))`・関数呼び出し形 `(f(col))`）は先読み検査で集計 `42803`・
 ///   ウィンドウ `42P20`・部分クエリ／SRF `0A000`、決定性検査で非決定式 `42P17`・組み込み以外の
@@ -13096,23 +13184,29 @@ pub(crate) fn validate_create_index_tokens(
     let name = p.expect_ident()?;
     p.expect_ident_matching("ON")?;
     let table = p.expect_ident()?;
-    let hnsw = if p.peek_ident_matches("USING") {
+    let method = if p.peek_ident_matches("USING") {
         p.advance();
         let method = p.expect_ident()?;
         if method.eq_ignore_ascii_case("hnsw") {
-            true
+            IndexMethod::Hnsw
+        } else if method.eq_ignore_ascii_case("gin") {
+            // 演算子クラスは列リスト解析後に確定する（既定は `jsonb_ops`）。
+            IndexMethod::Gin(crate::catalog::GinOpClass::JsonbOps)
         } else if method.eq_ignore_ascii_case("btree") {
             // PG の既定方式の明示。`USING` 省略時と同一のスカラー宣言として扱う
             // （カタログ表現は変えない。INDEX-9、Issue #1617）。
-            false
+            IndexMethod::Btree
         } else {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: truncate_for_error(&format!("index method {method} is not supported")),
             });
         }
     } else {
-        false
+        IndexMethod::Btree
     };
+    let hnsw = matches!(method, IndexMethod::Hnsw);
+    let is_gin = matches!(method, IndexMethod::Gin(_));
+    let mut method = method;
     p.expect_punct('(')?;
     let mut columns = Vec::new();
     let mut expressions: Vec<Option<Expr>> = Vec::new();
@@ -13122,6 +13216,23 @@ pub(crate) fn validate_create_index_tokens(
             return Err(SqlSurfaceError::payload_too_large("too many index columns"));
         }
         let (column, expression, collation) = parse_index_column(&mut p)?;
+        // `USING gin` の演算子クラス（Issue #2206）。素の列要素の直後に識別子が続く形だけを
+        // 演算子クラスとして読む。`COLLATE` の後ろの演算子クラスは PG にも無い語順のため、
+        // 読まずに列リストの文法エラー（`42601`）へ落とす。
+        if is_gin
+            && expression.is_none()
+            && collation.is_none()
+            && matches!(p.peek(), Some(Token::Ident(_)))
+        {
+            let opclass_name = p.expect_ident()?;
+            let opclass =
+                crate::catalog::GinOpClass::from_name(&opclass_name).ok_or_else(|| {
+                    SqlSurfaceError::UndefinedObject {
+                        name: truncate_for_error(&opclass_name),
+                    }
+                })?;
+            method = IndexMethod::Gin(opclass);
+        }
         columns.push(column);
         expressions.push(expression);
         collations.push(collation);
@@ -13135,6 +13246,11 @@ pub(crate) fn validate_create_index_tokens(
     if hnsw && columns.len() != 1 {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "USING hnsw requires exactly one column".to_string(),
+        });
+    }
+    if is_gin && columns.len() != 1 {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "USING gin requires exactly one column".to_string(),
         });
     }
     let mut seen = std::collections::HashSet::new();
@@ -13156,6 +13272,17 @@ pub(crate) fn validate_create_index_tokens(
     if unique && collations.iter().any(Option::is_some) {
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "CREATE UNIQUE INDEX does not support COLLATE".to_string(),
+        });
+    }
+    if unique && is_gin {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "CREATE UNIQUE INDEX does not support USING gin".to_string(),
+        });
+    }
+    // GIN の列要素への `COLLATE` は PG では `42804` だが、本実装は設計 D12 に従い `0A000`。
+    if is_gin && collations.iter().any(Option::is_some) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "USING gin does not support COLLATE".to_string(),
         });
     }
     // 式要素の決定性（`42P17`／組み込み以外の関数は `0A000`。INDEX-10、Issue #1647）。判定順は
@@ -13184,18 +13311,18 @@ pub(crate) fn validate_create_index_tokens(
     };
     p.expect_end_of_statement()?;
     // 最終ゲート（INDEX-10、Issue #1647）。決定性検査は部分索引の `WHERE` 判定より前に済ませてある。
-    reject_unimplemented_expression_keys(&expressions, &collations, hnsw)?;
+    reject_unimplemented_expression_keys(&expressions, &collations, method)?;
     // 部分索引の最終ゲート（INDEX-11、Issue #1653・#1654）。述語の格納・DML 維持は Issue #1654、
     // 部分 UNIQUE の強制は Issue #1657 で実装済みのため、残すのは照合や hnsw の永続形が無い組み合わせ
     // だけ（宣言だけ残って効かない索引を作らない）。
     if predicate.is_some() {
-        reject_unimplemented_partial_index(hnsw, &collations, &expressions)?;
+        reject_unimplemented_partial_index(method, &collations, &expressions)?;
     }
     Ok(ValidatedCreateIndex {
         name,
         if_not_exists,
         table,
-        hnsw,
+        method,
         columns,
         expressions,
         collations,
@@ -13209,14 +13336,14 @@ pub(crate) fn validate_create_index_tokens(
 /// 部分 UNIQUE は Issue #1657 で受理に変わった（強制は `constraint::UniqueKeyPlan`）。matview への
 /// `WHERE` は対象の種別を知る書き込みトランザクション内（`Storage::create_index_bound`）で拒否する。
 fn reject_unimplemented_partial_index(
-    hnsw: bool,
+    method: IndexMethod,
     collations: &[Option<crate::collation::Collation>],
     expressions: &[Option<Expr>],
 ) -> Result<(), SqlSurfaceError> {
     let unsupported = |detail: &str| SqlSurfaceError::FeatureNotSupported {
         detail: detail.to_string(),
     };
-    if hnsw {
+    if !matches!(method, IndexMethod::Btree) {
         return Err(unsupported(
             "partial indexes are not supported for this index kind yet",
         ));
@@ -13244,15 +13371,24 @@ fn reject_unimplemented_partial_index(
 fn reject_unimplemented_expression_keys(
     expressions: &[Option<Expr>],
     collations: &[Option<crate::collation::Collation>],
-    hnsw: bool,
+    method: IndexMethod,
 ) -> Result<(), SqlSurfaceError> {
     if !expressions.iter().any(Option::is_some) {
         return Ok(());
     }
-    if hnsw {
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "USING hnsw does not support expression indexes".to_string(),
-        });
+    match method {
+        IndexMethod::Hnsw => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "USING hnsw does not support expression indexes".to_string(),
+            });
+        }
+        // GIN は素の JSONB 列だけが対象（Issue #2206）。
+        IndexMethod::Gin(_) => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "USING gin does not support expression indexes".to_string(),
+            });
+        }
+        IndexMethod::Btree => {}
     }
     // `UNIQUE` かつ式要素（INDEX-9・INDEX-10、Issue #1651）は受理する。強制は永続一意索引が担う。
     // 式要素を含む索引では、素の列要素の `COLLATE` も受理しない（v4 の永続形は照合を持たず、
@@ -13528,12 +13664,14 @@ impl ValidatedCreateSchema {
     }
 }
 
-/// `DROP SCHEMA [IF EXISTS] <name> [RESTRICT]` の許可形状構造検証結果（TABLE-27・TABLE-36 の
-/// ポインタ、Issue #1713）。
+/// `DROP SCHEMA [IF EXISTS] <name> [RESTRICT | CASCADE]` の許可形状構造検証結果（TABLE-27・TABLE-36 の
+/// ポインタ、Issue #1713・#1717）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedDropSchema {
     pub(crate) name: String,
     pub(crate) if_exists: bool,
+    /// `CASCADE`（SCHEMA 配下のオブジェクトと外部の依存を決定的な順序で削除する。ADR D8）。
+    pub(crate) cascade: bool,
 }
 
 impl ValidatedDropSchema {
@@ -13654,8 +13792,8 @@ pub(crate) fn validate_create_schema_tokens(
     })
 }
 
-/// [`ValidatedDropSchema`] の構造検証本体（TABLE-27・TABLE-36 のポインタ、Issue #1713）。
-/// `RESTRICT`（既定と同義）は受理し、`CASCADE`（#1717）と複数名は `0A000`。修飾名・不正な
+/// [`ValidatedDropSchema`] の構造検証本体（TABLE-27・TABLE-36 のポインタ、Issue #1713・#1717）。
+/// `RESTRICT`（既定と同義）・`CASCADE` は受理し、複数名は `0A000`。修飾名・不正な
 /// 識別子・余分なトークンは `42601`。
 pub(crate) fn validate_drop_schema_tokens(
     tokens: &[Token],
@@ -13672,18 +13810,18 @@ pub(crate) fn validate_drop_schema_tokens(
     let name = p.expect_ident()?;
     crate::catalog::validate_identifier(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid schema name in DROP SCHEMA"))?;
-    if p.parse_optional_drop_behavior() == DropBehavior::Cascade {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "DROP SCHEMA ... CASCADE is not supported",
-        ));
-    }
+    let cascade = p.parse_optional_drop_behavior() == DropBehavior::Cascade;
     if matches!(p.peek(), Some(Token::Punct(','))) {
         return Err(SqlSurfaceError::feature_not_supported(
             "DROP SCHEMA with multiple names is not supported",
         ));
     }
     p.expect_end_of_statement()?;
-    Ok(ValidatedDropSchema { name, if_exists })
+    Ok(ValidatedDropSchema {
+        name,
+        if_exists,
+        cascade,
+    })
 }
 
 /// `CREATE SEQUENCE <name> [option ...]` の許可形状構造検証結果（TABLE-24・SQL-23、Issue #1688）。
@@ -13951,7 +14089,7 @@ pub(crate) fn validate_create_sequence_tokens(
         ));
     }
     let name = p.expect_ident()?;
-    crate::catalog::validate_identifier(&name)
+    crate::catalog::validate_relation_key(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name in CREATE SEQUENCE"))?;
     let mut options = SequenceOptions::default();
     p.parse_sequence_option_list(&mut options, false, "CREATE SEQUENCE")?;
@@ -13988,7 +14126,7 @@ pub(crate) fn validate_drop_sequence_tokens(
         ));
     }
     let name = p.expect_ident()?;
-    crate::catalog::validate_identifier(&name)
+    crate::catalog::validate_relation_key(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name in DROP SEQUENCE"))?;
     if p.parse_optional_drop_behavior() == DropBehavior::Cascade {
         return Err(SqlSurfaceError::feature_not_supported(
@@ -14058,7 +14196,7 @@ pub(crate) fn validate_alter_sequence_tokens(
         ));
     }
     let name = p.expect_ident()?;
-    crate::catalog::validate_identifier(&name)
+    crate::catalog::validate_relation_key(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name in ALTER SEQUENCE"))?;
     if p.peek_ident_matches("RENAME") {
         p.advance();
@@ -14244,6 +14382,37 @@ impl ValidatedSequenceFunction {
     }
 }
 
+/// `nextval`／`currval`／`setval` の名前引数トークンを検証して relation キーを返す
+/// （TABLE-24・TABLE-27。Issue #1690・#1691・#1717）。
+///
+/// - `StringLiteral`: 利用者が書いた名前。修飾名（`.` を含む）・引用付き（`"` を含む）は `0A000`
+///   （テナント SCHEMA の修飾は解決器 `sql::relation_name` が先に内部キーの `Ident` へ置き換える。
+///   ここへ残るのは解決できない入口〔テナント不明〕・`public.`・組み込み SCHEMA の修飾）、識別子規則
+///   違反は `42601`。
+/// - `Ident`（`#` で始まる）: 解決器だけが作る内部キー。字句解析器は `#` を含む識別子を作らない
+///   ため利用者は直接指定できない。形式を `validate_relation_key` で再検証する。
+/// - それ以外は `42601`（呼び出し側が単独形でない場合を先に弾いているため通常は到達しない）。
+fn sequence_name_argument(arg: &Token) -> Result<String, SqlSurfaceError> {
+    match arg {
+        Token::StringLiteral(name) => {
+            if name.contains('.') || name.contains('"') {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "schema-qualified or quoted sequence names are not supported",
+                ));
+            }
+            crate::catalog::validate_identifier(name)
+                .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name"))?;
+            Ok(name.clone())
+        }
+        Token::Ident(key) if key.starts_with('#') => {
+            crate::catalog::validate_relation_key(key)
+                .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name"))?;
+            Ok(key.clone())
+        }
+        _ => Err(SqlSurfaceError::unsupported("invalid sequence name")),
+    }
+}
+
 /// 先頭が `SELECT setval (` または `SELECT lastval (` か（`core.rs::EngineCore::parse_tokens_in` の
 /// 分岐判定。`ConstSelect` の一般経路へ流さず、専用の検証器で受理か `0A000`／`42601` の拒否に
 /// 倒すために使う）。
@@ -14276,7 +14445,9 @@ pub(crate) fn validate_sequence_function_tokens(
     p.expect_punct('(')?;
     let kind = if func.eq_ignore_ascii_case("setval") {
         let name = match p.advance() {
-            Some(Token::StringLiteral(n)) => n.clone(),
+            Some(arg @ Token::StringLiteral(_)) => sequence_name_argument(arg)?,
+            // 解決器が作った内部キー（`#` で始まる `Ident`）。それ以外の `Ident` は名前リテラルではない。
+            Some(arg @ Token::Ident(k)) if k.starts_with('#') => sequence_name_argument(arg)?,
             Some(Token::Param(_)) => return Err(not_standalone()),
             _ => {
                 return Err(SqlSurfaceError::unsupported(
@@ -14284,13 +14455,6 @@ pub(crate) fn validate_sequence_function_tokens(
                 ))
             }
         };
-        if name.contains('.') || name.contains('"') {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "schema-qualified or quoted sequence names are not supported",
-            ));
-        }
-        crate::catalog::validate_identifier(&name)
-            .map_err(|_| SqlSurfaceError::unsupported("invalid sequence name"))?;
         p.expect_punct(',')?;
         match p.peek() {
             Some(Token::Number(_) | Token::Punct('-' | '+')) => {}
@@ -14752,7 +14916,7 @@ impl<'a> Parser<'a> {
     /// 別名として誤って消費しない）。
     fn parse_join_relation(&mut self) -> Result<TableRef, SqlSurfaceError> {
         let table = self.expect_ident()?;
-        crate::catalog::validate_identifier(&table)
+        crate::catalog::validate_relation_key(&table)
             .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
         let alias = self.parse_relation_alias(is_join_reserved_word, "JOIN")?;
         Ok(match alias {
@@ -16697,21 +16861,6 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
     validate_sql_tokens(&tokens, lookup)
 }
 
-/// [`validate_sql`] のトップレベル読み取り SELECT／集計 SELECT 経路でのみ
-/// サブクエリ（`IN (SELECT ...)`／`EXISTS (SELECT ...)`）を許可するエントリ
-/// ポイント（Issue #927・SQL-29 (a)・TASK-213）。`sql::subquery` が内側の
-/// `Statement::Scan` を再検証する際にも、深さを 1 つ進めて
-/// [`validate_sql_tokens_with_subquery_ctx`] を直接呼ぶ（本関数は深さ 0 固定の
-/// トップレベル用薄いラッパー）。
-pub(crate) fn validate_sql_with_subquery_ctx(
-    sql: &str,
-    lookup: &impl TableLookup,
-    limits: crate::nesting_limits::NestingLimits,
-) -> Result<Statement, SqlSurfaceError> {
-    let tokens = super::relation_name::tokenize_resolved(sql, false)?;
-    validate_sql_tokens_with_subquery_ctx_limits(&tokens, lookup, 0, limits)
-}
-
 /// [`validate_sql`] の本体（Issue #939・WIRE-17。COPY プロトコル対応の一環）。
 /// トークン列を受け取ることで、`COPY (<SELECT>) TO STDOUT`
 /// （[`validate_copy_to_tokens`]）の内側 SELECT のように、外側の許可リストが
@@ -18460,7 +18609,8 @@ fn into_validated_alter_table(
 /// 書き込みトランザクション内で行う。
 pub fn validate_drop_table(sql: &str) -> Result<ValidatedDropTable, SqlSurfaceError> {
     let mut tokens = lexer::tokenize(sql)?;
-    let public_names = super::relation_name::rewrite_relation_names(&mut tokens, None)?;
+    let public_names =
+        super::relation_name::rewrite_relation_names(&mut tokens, None)?.public_names;
     let mut stmt = validate_drop_table_tokens(&tokens)?;
     // `public.` 修飾の情報を捨てない（実行時に一時表との衝突検査を通すため。Issue #1714）。
     stmt.public_qualified = public_names;
@@ -19095,6 +19245,63 @@ mod tests {
         }
     }
 
+    /// `USING gin` の構文段（Issue #2206・INDEX-8）: 演算子クラスの解決（省略時 `jsonb_ops`・
+    /// 大文字小文字不問）と、未知の演算子クラス `42704`・未対応の組み合わせ `0A000`・
+    /// 非 gin 方式の演算子クラス風識別子 `42601`。
+    #[test]
+    fn create_index_using_gin_accepts_opclasses_and_rejects_unsupported_forms() {
+        use super::*;
+        use crate::catalog::GinOpClass;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            validate_create_index_tokens(&tokens)
+        };
+        for (sql, expected) in [
+            ("CREATE INDEX i ON t USING gin (d)", GinOpClass::JsonbOps),
+            (
+                "CREATE INDEX i ON t USING GIN (d jsonb_ops)",
+                GinOpClass::JsonbOps,
+            ),
+            (
+                "CREATE INDEX i ON t USING gin (d JSONB_PATH_OPS)",
+                GinOpClass::JsonbPathOps,
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS i ON t USING gin (\"d\" jsonb_path_ops)",
+                GinOpClass::JsonbPathOps,
+            ),
+        ] {
+            let v = parse(sql).expect(sql);
+            assert_eq!(v.gin_opclass(), Some(expected), "{sql}");
+            assert_eq!(v.columns(), ["d".to_string()], "{sql}");
+        }
+        for (sql, code) in [
+            ("CREATE INDEX i ON t USING gin (d array_ops)", "42704"),
+            ("CREATE INDEX i ON t USING gin (d foo)", "42704"),
+            ("CREATE INDEX i ON t USING gin (a, b)", "0A000"),
+            ("CREATE INDEX i ON t USING gin (a jsonb_ops, b)", "0A000"),
+            ("CREATE INDEX i ON t USING gin ((a || b))", "0A000"),
+            ("CREATE INDEX i ON t USING gin (lower(a))", "0A000"),
+            ("CREATE UNIQUE INDEX i ON t USING gin (a)", "0A000"),
+            ("CREATE INDEX i ON t USING gin (a) WHERE b = 1", "0A000"),
+            ("CREATE INDEX i ON t USING gin (a COLLATE \"C\")", "0A000"),
+            (
+                "CREATE INDEX i ON t USING gin (a jsonb_ops COLLATE \"C\")",
+                "42601",
+            ),
+            (
+                "CREATE INDEX i ON t USING gin (a jsonb_ops jsonb_ops)",
+                "42601",
+            ),
+            ("CREATE INDEX i ON t USING btree (a jsonb_ops)", "42601"),
+            ("CREATE INDEX i ON t USING hnsw (a jsonb_ops)", "42601"),
+            ("CREATE INDEX i ON t (a jsonb_ops)", "42601"),
+        ] {
+            let err = parse(sql).expect_err(sql);
+            assert_eq!(err.wire_code(), code, "{sql}");
+        }
+    }
+
     /// `USING btree` は省略形と同一の宣言で、`hnsw`・`btree` 以外の手法は `0A000`
     /// （INDEX-9、Issue #1617）。
     #[test]
@@ -19114,7 +19321,7 @@ mod tests {
         );
         let ine = parse("CREATE INDEX IF NOT EXISTS i ON t USING btree (a)").expect("ine");
         assert!(ine.if_not_exists());
-        for m in ["bm25", "hash", "gin", "gist"] {
+        for m in ["bm25", "hash", "gist"] {
             assert!(
                 matches!(
                     parse(&format!("CREATE INDEX i ON t USING {m} (a)")),

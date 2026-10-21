@@ -29,11 +29,20 @@
 
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
+mod migrated_identity;
+
+// #2200 の移行 txn（`catalog::legacy_id_migration`）が呼ぶ入口を親モジュールへ公開する。
+// 結線までは未使用のため unused_imports を許容する。
+#[allow(unused_imports)]
+pub(crate) use migrated_identity::{assign_migrated_id_identity_in_txn, MigratedIdIdentityOutcome};
+
 use crate::storage::read_source::ReadSource;
 
+use super::namespace::RelationKey;
 use super::{
     get_table_schema_in_txn, get_table_schema_in_txn_impl, list_tables_in_txn, validate_identifier,
-    CatalogError, ColumnDefault, Result, Storage, TableSchema, MAX_LIST_TABLES,
+    validate_relation_key, CatalogError, ColumnDefault, Result, Storage, TableSchema,
+    MAX_LIST_TABLES,
 };
 
 /// SEQUENCE 定義の専用カタログ表。キーは `(schema, name)`。#1711 より前の schema は
@@ -303,8 +312,32 @@ pub(crate) fn resolve_altered_definition(
 }
 
 /// 定義キー `(schema, name)` の唯一の組み立て点（#1711・#1717 での差し替え点）。
+///
+/// `name` は relation キー（[`super::namespace::RelationKey`]）。`public` は従来のキー
+/// `("public", name)`（既存のバイト列を変えない）、テナントの SCHEMA 配下の内部キー
+/// `#<id>.<name>` は `("#<id>", name)`（ADR D2。[`super::namespace`] の SCHEMA 内走査と同じ形）。
+/// どちらも `name` の部分文字列を借用するだけで確保しない。`#` で始まるが形式が不正な名前は、
+/// 呼び出し前の [`validate_relation_key`] が拒否している（ここでは `public` 側へ倒さず
+/// 空キーの組にして必ず「無い」ことになる）。
 fn sequence_key(name: &str) -> (&str, &str) {
+    if name.starts_with('#') {
+        return match name.split_once('.') {
+            Some((schema, rest)) => (schema, rest),
+            None => ("#", name),
+        };
+    }
     (DEFAULT_SEQUENCE_SCHEMA, name)
+}
+
+/// 定義キー `(schema, name)` を relation キー（[`sequence_key`] の逆）へ戻す。`public` は裸の名前、
+/// SCHEMA 配下（`schema == "#<id>"`）は `#<id>.<name>`。表を走査して名前を取り出す箇所は、第 2 要素
+/// だけを使わず必ず本関数を通す（SCHEMA 配下の SEQUENCE が `public` の同名に化けないため）。
+pub(crate) fn sequence_entry_name((schema, name): (&str, &str)) -> String {
+    if schema == DEFAULT_SEQUENCE_SCHEMA {
+        name.to_string()
+    } else {
+        format!("{schema}.{name}")
+    }
 }
 
 /// 定義 blob を符号化する（版バイト先頭）。所有者なしは固定長の版 2、あり（Issue #1645）は
@@ -348,7 +381,7 @@ fn decode_owner_trailer(trailer: &[u8]) -> Result<SequenceOwner> {
     let corrupt = || CatalogError::CorruptSchema("corrupt sequence definition".to_string());
     let mut rest = trailer;
     let mut names: Vec<String> = Vec::with_capacity(2);
-    for _ in 0..2 {
+    for is_relation in [true, false] {
         let len_raw: [u8; 2] = rest
             .get(..2)
             .and_then(|s| s.try_into().ok())
@@ -356,7 +389,13 @@ fn decode_owner_trailer(trailer: &[u8]) -> Result<SequenceOwner> {
         let len = usize::from(u16::from_le_bytes(len_raw));
         let name_bytes = rest.get(2..2 + len).ok_or_else(corrupt)?;
         let name = std::str::from_utf8(name_bytes).map_err(|_| corrupt())?;
-        validate_identifier(name).map_err(|_| corrupt())?;
+        // 書き込み側は表名に relation key（修飾名を含む）、列名に厳格な識別子検証を課すため、
+        // 復号側も同じ検証で揃える（列名に relation key 形式が入った blob は破損扱い）。
+        if is_relation {
+            validate_relation_key(name).map_err(|_| corrupt())?;
+        } else {
+            validate_identifier(name).map_err(|_| corrupt())?;
+        }
         names.push(name.to_string());
         rest = rest.get(2 + len..).ok_or_else(corrupt)?;
     }
@@ -746,7 +785,7 @@ pub(crate) fn sequence_definition_in_txn(
     write_txn: &redb::WriteTransaction,
     name: &str,
 ) -> Result<Option<SequenceDef>> {
-    validate_identifier(name)?;
+    validate_relation_key(name)?;
     match ReadSource::open_table(write_txn, SEQUENCES_TABLE) {
         Ok(t) => match t.get(sequence_key(name))? {
             Some(g) => Ok(Some(decode_sequence_def(g.value())?)),
@@ -774,6 +813,20 @@ fn column_default_references_sequence(default: &ColumnDefault, name: &str) -> bo
 /// SEQUENCE `name` を DEFAULT に使う列が 1 つでもあるか（2BP01 判定）。表数は
 /// [`MAX_LIST_TABLES`] で打ち切られる（`list_tables_in_txn` の上限）。
 fn sequence_has_dependents_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
+    // 移行済み表（MigratedId）の疑似列 `id` は列 DEFAULT を持たず所有者だけで結ばれるため、
+    // 所有者がその疑似列を指す SEQUENCE も依存ありとして扱う（単独 DROP・RENAME を拒否。#1698）。
+    let owned = owned_sequence_entries_in_txn(write_txn, &|o| o.column == "id")?;
+    for (seq_name, _, owner) in owned {
+        if seq_name != name {
+            continue;
+        }
+        if super::table_exists_in_txn(write_txn, &owner.table)? {
+            let schema = get_table_schema_in_txn_impl(write_txn, &owner.table, false)?;
+            if schema.row_identity() == crate::catalog::RowIdentity::MigratedId {
+                return Ok(true);
+            }
+        }
+    }
     for table_name in list_tables_in_txn(write_txn)? {
         // 依存走査はカタログ情報だけを見る。複数アクション `ALTER TABLE` の中間状態（DROP COLUMN
         // 直後で生存列 0 本）の表も読めるよう `require_live = false` で復号する（Issue #1694）。
@@ -895,7 +948,7 @@ pub(crate) fn setval_in_txn(
     admit: impl FnOnce(u64) -> bool,
     apply_now: bool,
 ) -> std::result::Result<u64, SetvalError> {
-    validate_identifier(args.name)?;
+    validate_relation_key(args.name)?;
     let bytes = load_sequence_bytes_in_txn(write_txn, args.name)?;
     let def = decode_sequence_def(&bytes)?;
     if args.value < def.params.min_value || args.value > def.params.max_value {
@@ -987,14 +1040,17 @@ pub(crate) fn set_sequence_owner_in_txn(
     name: &str,
     owner: Option<SequenceOwner>,
 ) -> Result<()> {
-    validate_identifier(name)?;
+    validate_relation_key(name)?;
     let bytes = load_sequence_bytes_in_txn(write_txn, name)?;
     let def = decode_sequence_def(&bytes)?;
     if let Some(o) = &owner {
-        validate_identifier(&o.table)?;
+        validate_relation_key(&o.table)?;
         validate_identifier(&o.column)?;
         let schema = get_table_schema_in_txn(write_txn, &o.table)?;
-        if !schema.columns.iter().any(|c| c.name == o.column) {
+        // 移行済み表（MigratedId）の `id` は列を持たない疑似列なので、所有者としてだけ許す（#1698）。
+        let pseudo_id =
+            o.column == "id" && schema.row_identity() == crate::catalog::RowIdentity::MigratedId;
+        if !pseudo_id && !schema.columns.iter().any(|c| c.name == o.column) {
             return Err(CatalogError::Invalid(
                 "sequence owner column does not exist".to_string(),
             ));
@@ -1026,8 +1082,9 @@ pub(crate) fn create_sequence_in_txn(
     name: &str,
     params: &SequenceParams,
 ) -> Result<u64> {
-    validate_identifier(name)?;
+    validate_relation_key(name)?;
     params.validate()?;
+    super::namespace::ensure_key_schema_alive_in_txn(write_txn, name)?;
     if relation_name_taken_in_txn(write_txn, name)? {
         return Err(CatalogError::TableAlreadyExists(name.to_string()));
     }
@@ -1142,27 +1199,51 @@ pub(crate) fn choose_implicit_sequence_name_in_txn(
     column: &str,
     reserved: &[String],
 ) -> Result<String> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     validate_identifier(column)?;
+    // SCHEMA 配下の表（`#<id>.<name>`）の暗黙 SEQUENCE は同じ SCHEMA に置く（名前部から
+    // 候補を作り、接頭辞 `#<id>.` を付け直す。TABLE-27・Issue #1717）。
+    let (prefix, base) = match RelationKey::parse(table)? {
+        RelationKey::Public(name) => (String::new(), name),
+        RelationKey::InSchema { schema_id, name } => (RelationKey::schema_prefix(schema_id), name),
+    };
     for pass in 0..=MAX_SEQUENCES {
         let label = if pass == 0 {
             "seq".to_string()
         } else {
             format!("seq{pass}")
         };
-        let candidate = make_object_name(table, column, &label);
+        let candidate = format!("{prefix}{}", make_object_name(&base, column, &label));
         if candidate == table
             || reserved.iter().any(|r| r == &candidate)
             || relation_name_taken_in_txn(write_txn, &candidate)?
         {
             continue;
         }
-        validate_identifier(&candidate)?;
+        validate_relation_key(&candidate)?;
         return Ok(candidate);
     }
     Err(CatalogError::ViewLimitExceeded(
         "too many sequences".to_string(),
     ))
+}
+
+/// SEQUENCE `name` を write txn 内で削除する（定義と全テナント分の状態行。[`Storage::drop_sequence`] と
+/// `DROP SCHEMA ... CASCADE`〔TABLE-27・Issue #1717〕が共有する本体）。無ければ `TableNotFound`、
+/// `DEFAULT nextval` で参照する列が残っていれば `DependentObjectsStillExist`。戻り値の内部 ID は、
+/// commit 成功後にメモリ上の現在値を [`SequenceAllocator::evict`] で捨てるために呼び出し側が使う。
+pub(crate) fn drop_sequence_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<u64> {
+    let bytes = load_sequence_bytes_in_txn(write_txn, name)?;
+    let id = decode_sequence_def(&bytes)?.id;
+    if sequence_has_dependents_in_txn(write_txn, name)? {
+        return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
+    }
+    {
+        let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
+        table.remove(sequence_key(name))?;
+    }
+    delete_sequence_state_in_txn(write_txn, id)?;
+    Ok(id)
 }
 
 /// 所有者が `matches` を満たす SEQUENCE を同じ write txn で削除する（定義と全テナント分の状態行）。
@@ -1211,7 +1292,7 @@ fn owned_sequence_entries_in_txn(
         let (def, owner) = decode_sequence_def_with_owner(v.value())?;
         if let Some(owner) = owner {
             if matches(&owner) {
-                out.push((k.value().1.to_string(), def, owner));
+                out.push((sequence_entry_name(k.value()), def, owner));
             }
         }
     }
@@ -1260,7 +1341,7 @@ impl Storage {
     /// 表・ビュー・索引・matview・SEQUENCE）→ 件数上限（`ViewLimitExceeded`）→ 保存。
     /// `sql::ddl::execute_create_sequence` から呼ばれる（権限ゲート通過後）。
     pub(crate) fn create_sequence(&self, name: &str, params: &SequenceParams) -> Result<()> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         params.validate()?;
         let write_txn = self
             .begin_write_txn()
@@ -1297,20 +1378,11 @@ impl Storage {
     /// 同一 write txn 内で依存 DEFAULT の検査（`DependentObjectsStillExist`）→ 定義の削除 →
     /// 全テナント分の状態行の削除を行う。
     pub(crate) fn drop_sequence(&self, name: &str) -> Result<()> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        let bytes = load_sequence_bytes_in_txn(&write_txn, name)?;
-        let id = decode_sequence_def(&bytes)?.id;
-        if sequence_has_dependents_in_txn(&write_txn, name)? {
-            return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
-        }
-        {
-            let mut table = write_txn.open_table(SEQUENCES_TABLE)?;
-            table.remove(sequence_key(name))?;
-        }
-        delete_sequence_state_in_txn(&write_txn, id)?;
+        let id = drop_sequence_in_txn(&write_txn, name)?;
         // commit 成功後にだけメモリ上の現在値を捨てる（内部 ID は再利用しないため、失敗時に
         // 残っても害はなく、成功時に残すと全テナント分が滞留する。設計記録 D3）。
         let allocator = self.sequence_allocator();
@@ -1333,7 +1405,7 @@ impl Storage {
         tenant_id: &str,
         alter: &SequenceAlter,
     ) -> std::result::Result<(), AlterSequenceError> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
@@ -1378,8 +1450,8 @@ impl Storage {
     /// （5 種の relation。同名への変更も `TableAlreadyExists`）→ 依存 DEFAULT の有無
     /// （`DependentObjectsStillExist`。名前参照の DEFAULT が壊れるのを防ぐ fail-closed）。
     pub(crate) fn rename_sequence(&self, old: &str, new: &str) -> Result<()> {
-        validate_identifier(old)?;
-        validate_identifier(new)?;
+        validate_relation_key(old)?;
+        validate_relation_key(new)?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
@@ -1415,7 +1487,7 @@ impl Storage {
         args: &SetvalArgs<'_>,
         admit: impl FnOnce(u64) -> bool,
     ) -> std::result::Result<u64, SetvalError> {
-        validate_identifier(args.name)?;
+        validate_relation_key(args.name)?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
@@ -1448,7 +1520,7 @@ impl Storage {
     /// 定義の所有者を取得する（テスト専用。SERIAL 展開・RENAME 追従・DROP の検証に使う）。
     #[cfg(test)]
     pub(crate) fn sequence_owner(&self, name: &str) -> Result<Option<SequenceOwner>> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let read_txn = self.db().begin_read()?;
         let table = match read_txn.open_table(SEQUENCES_TABLE) {
             Ok(t) => t,
@@ -1464,7 +1536,7 @@ impl Storage {
     /// 定義を `restart_value` 込みで取得する（スナップショット読み取り。無ければ `None`）。
     #[cfg_attr(not(test), allow(dead_code))] // #1690 が使う。
     pub(crate) fn sequence_definition_full(&self, name: &str) -> Result<Option<SequenceDef>> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let read_txn = self.db().begin_read()?;
         let table = match read_txn.open_table(SEQUENCES_TABLE) {
             Ok(t) => t,
@@ -1480,6 +1552,25 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
+    /// 所有者部の列名は厳格な識別子検証を通す（relation key 形式の列名は破損扱い）。
+    #[test]
+    fn owner_trailer_rejects_relation_key_column() {
+        let enc = |table: &str, column: &str| {
+            let mut v = Vec::new();
+            for n in [table, column] {
+                v.extend_from_slice(&(n.len() as u16).to_le_bytes());
+                v.extend_from_slice(n.as_bytes());
+            }
+            v
+        };
+        let ok = decode_owner_trailer(&enc("#1.t", "c")).expect("valid owner");
+        assert_eq!((ok.table.as_str(), ok.column.as_str()), ("#1.t", "c"));
+        assert!(matches!(
+            decode_owner_trailer(&enc("t", "#1.c")),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
     /// 暗黙 SEQUENCE の名前の切り詰め（PostgreSQL の `makeObjectName` 相当。Issue #1694）。
     #[test]
     fn make_object_name_fits_identifier_limit() {

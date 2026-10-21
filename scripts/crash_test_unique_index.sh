@@ -22,6 +22,10 @@
 # 持つ 4 つ目の表 `docs_pidx (n INTEGER, code TEXT)` を加えた（ツールが入退場の UPDATE を含めて書き、
 # verify が、再起動後も述語の評価失敗が `22012` で拒否され、コミット済みの全行で述語が評価でき、
 # 述語外の行が永続化されていることを確かめる。本スクリプトのロジックは変えない）。
+# Issue #2202（TABLE-23）で、採番方式の表（暗黙の `id` を持たず rowid を内部採番する SQL `CREATE TABLE`）
+# の `docs_pk`（複合 PRIMARY KEY＋UNIQUE。`ON CONFLICT` の UPSERT を含む）と PK なしの `docs_nopk` を
+# 加えた（verify が、`k`／`seq` の連続性・PK／UNIQUE 重複の `23505`・点検索を確かめ、従来方式から移行済みの
+# 表の `id` 契約も確かめる。本スクリプトのロジックは変えない）。
 # Makefile の crash-test-unique-index ターゲット・CI の crash-test-unique-index
 # ジョブから呼ばれる。
 #
