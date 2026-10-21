@@ -623,3 +623,78 @@ fn set_search_path_ignores_same_named_temp_table() {
     ok(&core, &mut s, "SET search_path = tmpx, public");
     assert_eq!(show(&core, &mut s), "tmpx, public");
 }
+
+/// 表 `name` の行数（`SELECT id FROM <name> LIMIT 100` の結果行数）。`search_path` が `public` を
+/// 含む状態のセッションで呼ぶ。
+fn row_count(core: &EngineCore, s: &mut SessionState, name: &str) -> usize {
+    match ok(core, s, &format!("SELECT id FROM {name} LIMIT 100")) {
+        SqlOutcome::Query(r) => r.rows.len(),
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+/// 表 `a`・`b`（各 1 行）と、構文語と同名の表 `"in"`（1 行）を持つコアとセッション。
+fn with_two_tables(label: &str) -> (EngineCore, CleanupGuard, SessionState) {
+    let (core, g) = new_core(label);
+    let mut s = ddl_session();
+    for t in ["a", "b", "\"in\""] {
+        ok(
+            &core,
+            &mut s,
+            &format!("CREATE TABLE {t} (id BIGINT PRIMARY KEY, name TEXT)"),
+        );
+        ok(
+            &core,
+            &mut s,
+            &format!("INSERT INTO {t} (id, name) VALUES (1, 'x')"),
+        );
+    }
+    (core, g, s)
+}
+
+/// `TRUNCATE` の表リストでカンマに続く `ONLY` の対象表も参照ゲートに掛かる（codex P1。
+/// 未修飾の永続表 `b` を `42P01` にせず削除してはならない）。拒否された文は表の内容を変えない。
+#[test]
+fn truncate_list_only_target_is_gated() {
+    let (core, _g, mut s) = with_two_tables("sp-trunc-only");
+    ok(&core, &mut s, "SET search_path = nosuch");
+    for sql in [
+        "TRUNCATE public.a, ONLY b",
+        "TRUNCATE a, ONLY b",
+        "TRUNCATE public.a, ONLY public.b, ONLY c",
+    ] {
+        assert_eq!(code(&core, &mut s, sql), "42P01", "{sql}");
+    }
+    ok(&core, &mut s, "RESET search_path");
+    for t in ["a", "b", "\"in\""] {
+        assert_eq!(row_count(&core, &mut s, t), 1, "{t} must be untouched");
+    }
+}
+
+/// `TRUNCATE public.a, ONLY public.b` は修飾の書き換え漏れなく両方の表へ解決される。
+#[test]
+fn truncate_list_only_qualified_names_are_rewritten() {
+    let (core, _g, mut s) = with_two_tables("sp-trunc-only-q");
+    ok(&core, &mut s, "SET search_path = nosuch");
+    ok(&core, &mut s, "TRUNCATE public.a, ONLY public.b");
+    ok(&core, &mut s, "RESET search_path");
+    assert_eq!(row_count(&core, &mut s, "a"), 0);
+    assert_eq!(row_count(&core, &mut s, "b"), 0);
+    assert_eq!(row_count(&core, &mut s, "\"in\""), 1);
+}
+
+/// 引用符付き識別子が式の語に見えても、索引 DDL の `ON` の直後の表名はゲートを素通りしない
+#[test]
+fn quoted_expression_word_does_not_hide_the_relation_after_an_introducer() {
+    let (core, _g, mut s) = with_two_tables("sp-quoted-introducer");
+    ok(&core, &mut s, "SET search_path = nosuch");
+    for sql in [
+        "CREATE INDEX \"is\" ON a (name)",
+        "CREATE INDEX \"in\" ON b (name)",
+    ] {
+        assert_eq!(code(&core, &mut s, sql), "42P01", "{sql}");
+    }
+    ok(&core, &mut s, "RESET search_path");
+    // 拒否された `CREATE INDEX` は索引を作っていない（同名で作れる）。
+    ok(&core, &mut s, "CREATE INDEX \"is\" ON a (name)");
+}

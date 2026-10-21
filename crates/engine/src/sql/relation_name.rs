@@ -122,7 +122,7 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
     // 文頭付近（先頭 6 トークン）に現れる最初のオブジェクト種別語（`CREATE UNIQUE INDEX`・
     // `CREATE OR REPLACE VIEW`・`DROP SEQUENCE` 等）。`MATERIALIZED VIEW` は種別が VIEW になるため
     // `head_matview` で区別する。
-    let head6 = tokens.get(..6).unwrap_or(&*tokens);
+    let head6 = tokens.get(..6).unwrap_or(tokens);
     let ddl_obj: Option<&'static str> = head6.iter().find_map(|t| {
         ["TABLE", "VIEW", "INDEX", "SEQUENCE"]
             .into_iter()
@@ -262,7 +262,31 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
             _ => false,
         };
         let prev_is_word = matches!(prev, Some(Token::Ident(_)));
-        if is_ident_like(cur) && !level.in_proj && !(prev_is_word && expr_ctx) {
+        // 関係参照を導入する語（`ONLY`・`JOIN`・`INTO`・`REFERENCES`・索引 DDL の `ON`）の直後は、
+        // 式の文脈判定（`expr_ctx`）で落とさない。直前の `prev2` が式の語に見えても、その語の
+        // 直後にこれらの導入語が構文上現れる形は無く、`prev2` の側が引用符付きの識別子（表名・
+        // 別名・索引名）か、導入語が本物の構文語である。判定に迷う位置は関係参照として扱う
+        // （fail-closed。`search_path` の参照ゲートを素通りさせない。Issue #1715）。
+        //  - `TRUNCATE a, ONLY b`・`FROM a, ONLY b`: カンマの直後でも、表参照リストの中なら `ONLY` は構文語
+        //  - `FROM "in" JOIN b`・`CREATE INDEX is ON t`: 直前が式の語に見える引用付き識別子
+        let introducer_keeps_relation = match prev {
+            Some(Token::Ident(w)) => {
+                let is = |k: &str| w.eq_ignore_ascii_case(k);
+                let after_comma = matches!(prev2, Some(Token::Punct(',')));
+                let after_word = matches!(prev2, Some(Token::Ident(_)));
+                (is("ONLY") && after_comma && level.list)
+                    || (after_word
+                        && ((is("ON") && index_on_pending)
+                            || is("INTO")
+                            || is("REFERENCES")
+                            || ((is("JOIN") || is("ONLY")) && level.list)))
+            }
+            _ => false,
+        };
+        if is_ident_like(cur)
+            && !level.in_proj
+            && !(prev_is_word && expr_ctx && !introducer_keeps_relation)
+        {
             relation_pos = match prev {
                 Some(Token::Keyword(Keyword::From)) => from_rel,
                 Some(Token::Ident(w)) => {
@@ -970,6 +994,8 @@ mod tests {
         same("UPDATE public.t SET a = 1", "UPDATE t SET a = 1");
         same("DELETE FROM public.t", "DELETE FROM t");
         same("TRUNCATE public.a, public.b", "TRUNCATE a, b");
+        // カンマに続く `ONLY` の対象表（式の文脈と取り違えない）。
+        same("TRUNCATE public.a, ONLY public.b", "TRUNCATE a, ONLY b");
         same("DROP TABLE IF EXISTS public.t", "DROP TABLE IF EXISTS t");
         same(
             "CREATE TABLE public.t (id TEXT)",

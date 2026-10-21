@@ -651,6 +651,35 @@ mod tests {
     }
 
     #[test]
+    fn introducer_words_after_quoted_expression_words_still_open_a_relation() {
+        // カンマの直後でも表参照リストの中の `ONLY` は構文語（対象表は参照）。
+        assert_eq!(names("TRUNCATE a, ONLY b"), vec!["a", "b"]);
+        assert_eq!(names("TRUNCATE public.a, ONLY b"), vec!["b"]);
+        assert_eq!(names("TRUNCATE a, ONLY b, ONLY c"), vec!["a", "b", "c"]);
+        assert_eq!(names("SELECT id FROM a, ONLY b LIMIT 5"), vec!["a", "b"]);
+        // 直前が式の語に見える引用付き識別子（表名・索引名・別名）でも、導入語の後の表名は残る。
+        assert_eq!(names("CREATE INDEX \"is\" ON t (a)"), vec!["t"]);
+        assert_eq!(names("CREATE INDEX \"in\" ON t (a)"), vec!["t"]);
+        assert_eq!(
+            names("SELECT id FROM \"in\" JOIN b ON x.id = b.id"),
+            vec!["in", "b"]
+        );
+        assert_eq!(
+            names("SELECT id FROM a \"is\" JOIN b ON x.id = b.id"),
+            vec!["a", "b"]
+        );
+        // 式の位置の引用付き構文語列名は従来どおり関係を導かない。
+        assert_eq!(
+            names("SELECT id FROM a WHERE \"join\" IS NULL AND \"only\" IS NULL LIMIT 5"),
+            vec!["a"]
+        );
+        assert_eq!(
+            names("SELECT id FROM a ORDER BY b, \"only\" DESC LIMIT 5"),
+            vec!["a"]
+        );
+    }
+
+    #[test]
     fn quoted_cte_names_are_excluded() {
         assert_eq!(
             marked_names("WITH \"null\" AS (SELECT 1) SELECT * FROM \"null\""),
